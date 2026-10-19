@@ -200,8 +200,10 @@ func resolveExecWorkspace(ctx context.Context, options *execOptions, rt execRunt
 	if err != nil || mount == nil {
 		return nil
 	}
-	if server := currentExecServer(rt); server != "" && mount.Server != "" && strings.TrimRight(server, "/") != strings.TrimRight(mount.Server, "/") {
-		// The mount belongs to another server; do not guess.
+	// Only infer from a mount known to belong to the current server; a mount
+	// whose server is not recorded (for example --no-persist-credentials)
+	// could belong to another tenant.
+	if server := currentExecServer(rt); server == "" || mount.Server == "" || strings.TrimRight(server, "/") != strings.TrimRight(mount.Server, "/") {
 		return nil
 	}
 	if rt.syncMount != nil {

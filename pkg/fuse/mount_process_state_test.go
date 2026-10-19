@@ -110,3 +110,31 @@ func TestMountCredentialErrorRedactsFailureAndPreservesExitCode(t *testing.T) {
 		t.Fatalf("redacted mount failure omitted redaction marker: %q", got)
 	}
 }
+
+func TestMountProcessStateRecordsLayer(t *testing.T) {
+	state := newMountProcessState(&MountOptions{LayerRef: "layer-123"}, "/mnt", 1, "", "", time.Unix(1, 0))
+	if state.Layer != "layer-123" {
+		t.Fatalf("layer = %q", state.Layer)
+	}
+}
+
+func TestExitReasonIsRedactedWithoutPersistentCredentials(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	const server = "https://signed-preview-secret.example"
+	mountPoint := t.TempDir()
+	opts := &MountOptions{Server: server, OmitProcessStateCredentials: true}
+	if err := writeMountExitReason(opts, mountPoint, mountstate.ExitReason{Reason: "drain_failed", Detail: "post " + server + "/v1/fs: reset"}); err != nil {
+		t.Fatal(err)
+	}
+	rec, _, err := mountstate.ReadExitReason(mountPoint)
+	if err != nil || strings.Contains(rec.Detail, server) || !strings.Contains(rec.Detail, "<redacted>") {
+		t.Fatalf("persisted detail = %q, %v", rec.Detail, err)
+	}
+	opts.OmitProcessStateCredentials = false
+	if err := writeMountExitReason(opts, mountPoint, mountstate.ExitReason{Reason: "drain_failed", Detail: server}); err != nil {
+		t.Fatal(err)
+	}
+	if rec, _, _ := mountstate.ReadExitReason(mountPoint); rec.Detail != server {
+		t.Fatalf("default detail = %q", rec.Detail)
+	}
+}

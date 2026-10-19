@@ -176,4 +176,12 @@ describe("runtime exec", () => {
     server.use(http.get("http://localhost:9009/v1/runtime/capabilities", () => new HttpResponse(null, { status: 404 })));
     await expect(new Client("http://localhost:9009", "test-key").runtimeCapabilities()).rejects.toBeInstanceOf(RuntimeNotEnabledError);
   });
+  it("treats a start-type error after started as an unknown outcome", async () => {
+    server.use(http.post("http://localhost:9009/v1/runtime/exec", () => new HttpResponse(
+      `{"type":"started","execution_id":"rex_12345678"}\n{"type":"error","execution_id":"rex_12345678","error_code":"start_failed","message":"failed"}\n`,
+      { headers: { "Content-Type": "application/x-ndjson" } },
+    )));
+    await expect(new Client("http://localhost:9009", "test-key").exec({ argv: ["true"] }))
+      .rejects.toBeInstanceOf(RuntimeOutcomeUnknownError);
+  });
 });

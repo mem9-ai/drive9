@@ -352,7 +352,7 @@ func Mount(opts *MountOptions) (err error) {
 			}
 			err = ExitPanicErr(detail, fmt.Errorf("panic: %v", r))
 			if mountPointCopy != "" {
-				_ = mountstate.WriteExitReason(mountPointCopy, mountstate.ExitReason{
+				_ = writeMountExitReason(opts, mountPointCopy, mountstate.ExitReason{
 					Reason: string(ExitReasonPanic),
 					Detail: detail,
 					Code:   ExitUnhealthy,
@@ -894,7 +894,7 @@ func Mount(opts *MountOptions) (err error) {
 			if pidFile != "" {
 				_ = os.Remove(pidFile)
 			}
-			_ = mountstate.WriteExitReason(opts.MountPoint, mountstate.ExitReason{
+			_ = writeMountExitReason(opts, opts.MountPoint, mountstate.ExitReason{
 				Reason: string(ExitReasonSignal),
 				Detail: "force quit after second signal",
 				Code:   ExitForceQuit,
@@ -975,7 +975,7 @@ func Mount(opts *MountOptions) (err error) {
 		exitRec.Reason = "drain_failed"
 		exitRec.Detail = shutdownErr.Error()
 		exitRec.Code = ExitForceQuit
-		_ = mountstate.WriteExitReason(opts.MountPoint, exitRec)
+		_ = writeMountExitReason(opts, opts.MountPoint, exitRec)
 		fmt.Fprintf(os.Stderr, "drive9: mount lifecycle event=exit code=%d reason=drain_failed mountpoint=%s\n", ExitForceQuit, opts.MountPoint)
 		return newMountExit(ExitForceQuit, MountExitReason("drain_failed"), "shutdown incomplete; local recovery state preserved", shutdownErr)
 	}
@@ -983,7 +983,7 @@ func Mount(opts *MountOptions) (err error) {
 	switch reason {
 	case ExitReasonSignal, ExitReasonExternalUnmount:
 		exitRec.Code = ExitOK
-		_ = mountstate.WriteExitReason(opts.MountPoint, exitRec)
+		_ = writeMountExitReason(opts, opts.MountPoint, exitRec)
 		fmt.Fprintf(os.Stderr, "drive9: mount lifecycle event=serve_end reason=%s mountpoint=%s pid=%d uptime=%s\n",
 			reason, opts.MountPoint, os.Getpid(), uptime)
 		fmt.Fprintf(os.Stderr, "drive9: mount lifecycle event=exit code=0 reason=%s mountpoint=%s\n", reason, opts.MountPoint)
@@ -1007,7 +1007,7 @@ func Mount(opts *MountOptions) (err error) {
 			fmt.Fprintf(os.Stderr, "drive9: mount lifecycle event=cleanup_skip mountpoint=%s reason=probe_indeterminate err=%v\n", opts.MountPoint, stillErr)
 		}
 		exitRec.Code = ExitServeAbnormal
-		_ = mountstate.WriteExitReason(opts.MountPoint, exitRec)
+		_ = writeMountExitReason(opts, opts.MountPoint, exitRec)
 		fmt.Fprintf(os.Stderr, "drive9: mount lifecycle event=exit code=%d reason=%s mountpoint=%s\n",
 			ExitServeAbnormal, reason, opts.MountPoint)
 		return ExitServeAbnormalErr(detail)
@@ -1026,6 +1026,7 @@ func newMountProcessState(opts *MountOptions, mountPoint string, creationTime ui
 		MountKind:           mountstate.MountKindFUSE,
 		MountPoint:          mountPoint,
 		RemoteRoot:          opts.RemoteRoot,
+		Layer:               opts.LayerRef,
 		Profile:             opts.Profile,
 		LocalRoot:           opts.LocalRoot,
 		Server:              server,
@@ -1080,6 +1081,16 @@ func redactMountCredentialError(err error, opts *MountOptions) error {
 		return &redacted
 	}
 	return redactedMountCause{message: message, cause: err}
+}
+
+// writeMountExitReason persists an exit record. Without persistent
+// credentials the detail is redacted first: errors from a credential-bearing
+// endpoint can contain the full URL.
+func writeMountExitReason(opts *MountOptions, mountPoint string, rec mountstate.ExitReason) error {
+	if opts != nil && opts.OmitProcessStateCredentials {
+		rec.Detail = redactMountCredentialText(rec.Detail, opts)
+	}
+	return mountstate.WriteExitReason(mountPoint, rec)
 }
 
 func redactMountCredentialText(text string, opts *MountOptions) string {

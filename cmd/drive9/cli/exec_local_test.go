@@ -14,10 +14,13 @@ func TestFindLocalMountMapsCurrentDirectory(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(mountPoint, "web", "src"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	creation, err := mountstate.ProcessCreationTime(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := mountstate.WriteProcessState(mountPoint, mountstate.ProcessState{
-		PID: os.Getpid(), MountKind: mountstate.MountKindFUSE, MountPoint: mountPoint,
-		RemoteRoot: "/repo", Server: "https://drive9.example", ControlSocket: "/tmp/sock",
-		Args: []string{"mount", "--layer", "fork-1", ":/repo", mountPoint},
+		PID: os.Getpid(), CreationTime: creation, MountKind: mountstate.MountKindFUSE, MountPoint: mountPoint,
+		RemoteRoot: "/repo", Layer: "fork-1", Server: "https://drive9.example", ControlSocket: "/tmp/sock",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -47,5 +50,46 @@ func TestFindLocalMountIgnoresDeadMounts(t *testing.T) {
 	}
 	if mount, err := findLocalMount(mountPoint); err != nil || mount != nil {
 		t.Fatalf("dead mount = %#v, %v", mount, err)
+	}
+}
+
+func TestFindLocalMountRejectsReusedPID(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	mountPoint := t.TempDir()
+	creation, err := mountstate.ProcessCreationTime(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, state := range map[string]mountstate.ProcessState{
+		"other process identity": {PID: os.Getpid(), CreationTime: creation + 1},
+		"no recorded identity":   {PID: os.Getpid()},
+	} {
+		state.MountKind, state.MountPoint, state.RemoteRoot = mountstate.MountKindFUSE, mountPoint, "/repo"
+		if _, err := mountstate.WriteProcessState(mountPoint, state); err != nil {
+			t.Fatal(err)
+		}
+		if mount, err := findLocalMount(mountPoint); err != nil || mount != nil {
+			t.Fatalf("%s: mount = %#v, %v", name, mount, err)
+		}
+	}
+}
+
+func TestFindLocalMountFallsBackToSupervisorArgsForLayer(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	mountPoint := t.TempDir()
+	creation, err := mountstate.ProcessCreationTime(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mountstate.WriteProcessState(mountPoint, mountstate.ProcessState{
+		SupervisorPID: os.Getpid(), SupervisorCreationTime: creation, PID: 1 << 30,
+		MountKind: mountstate.MountKindFUSE, MountPoint: mountPoint, RemoteRoot: "/repo",
+		Args: []string{"mount", "--layer=fork-2", ":/repo", mountPoint},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	mount, err := findLocalMount(mountPoint)
+	if err != nil || mount == nil || mount.Layer != "fork-2" {
+		t.Fatalf("mount = %#v, %v", mount, err)
 	}
 }

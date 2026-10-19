@@ -49,8 +49,13 @@ func findLocalMount(dir string) (*localMount, error) {
 			if relErr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 				return nil, nil
 			}
+			layer := strings.TrimSpace(state.Layer)
+			if layer == "" {
+				// Supervisor state records the original arguments instead.
+				layer = layerFromMountArgs(state.Args)
+			}
 			return &localMount{
-				MountPoint: candidate, RemoteRoot: state.RemoteRoot, Layer: layerFromMountArgs(state.Args),
+				MountPoint: candidate, RemoteRoot: state.RemoteRoot, Layer: layer,
 				Server: state.Server, Rel: filepath.ToSlash(rel), ControlSocket: strings.TrimSpace(state.ControlSocket),
 			}, nil
 		}
@@ -62,13 +67,12 @@ func findLocalMount(dir string) (*localMount, error) {
 	}
 }
 
+// mountLooksLive requires the recorded process identity (PID plus creation
+// time), so a stale state file whose PID was reused is not mistaken for a
+// live mount. State without a creation time is not trusted.
 func mountLooksLive(state mountstate.ProcessState) bool {
-	for _, pid := range []int{state.PID, state.WorkerPID, state.SupervisorPID} {
-		if pid > 0 && processAlive(pid) {
-			return true
-		}
-	}
-	return false
+	return processMatchesIdentity(state.PID, state.CreationTime) ||
+		processMatchesIdentity(state.SupervisorPID, state.SupervisorCreationTime)
 }
 
 func layerFromMountArgs(args []string) string {

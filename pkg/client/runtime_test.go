@@ -358,3 +358,19 @@ func TestExecRejectsOversizedFrame(t *testing.T) {
 		t.Fatalf("error = %v", err)
 	}
 }
+
+func TestExecStartErrorAfterStartIsUnknown(t *testing.T) {
+	for _, code := range []string{"invalid_request", "unavailable", "start_failed"} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/x-ndjson")
+			_, _ = fmt.Fprintln(w, `{"type":"started","execution_id":"rex_12345678"}`)
+			_, _ = fmt.Fprintf(w, `{"type":"error","execution_id":"rex_12345678","error_code":%q,"message":"failed"}`+"\n", code)
+		}))
+		_, err := New(server.URL, "secret").Exec(t.Context(), ExecRequest{Argv: []string{"true"}}, ExecOptions{})
+		server.Close()
+		var start *RuntimeStartError
+		if !IsRuntimeOutcomeUnknown(err) || errors.As(err, &start) {
+			t.Fatalf("%s after start = %T %v", code, err, err)
+		}
+	}
+}

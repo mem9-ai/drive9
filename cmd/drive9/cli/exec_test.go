@@ -285,9 +285,9 @@ func TestExecInsideLocalMountUsesItsWorkspaceAfterUploading(t *testing.T) {
 	synced := 0
 	rt := testExecRuntime(io.Discard, io.Discard)
 	rt.dir = "/home/me/drive9/web/src"
-	rt.server = func() string { return "" }
+	rt.server = func() string { return "https://drive9.example/" }
 	rt.findMount = func(string) (*localMount, error) {
-		return &localMount{MountPoint: "/home/me/drive9", RemoteRoot: "/repo", Layer: "fork-1", Rel: "web/src"}, nil
+		return &localMount{MountPoint: "/home/me/drive9", RemoteRoot: "/repo", Layer: "fork-1", Server: "https://drive9.example", Rel: "web/src"}, nil
 	}
 	rt.syncMount = func(context.Context, *localMount) error { synced++; return nil }
 	if err := runExec(t.Context(), []string{"npm", "test"}, rt); err != nil {
@@ -316,8 +316,9 @@ func TestExecReportsLocalUploadFailure(t *testing.T) {
 	execTestServer(t, execStarted, execExit0)
 	rt := testExecRuntime(io.Discard, io.Discard)
 	rt.dir = "/home/me/drive9"
+	rt.server = func() string { return "https://drive9.example" }
 	rt.findMount = func(string) (*localMount, error) {
-		return &localMount{MountPoint: "/home/me/drive9", RemoteRoot: "/", Rel: "."}, nil
+		return &localMount{MountPoint: "/home/me/drive9", RemoteRoot: "/", Server: "https://drive9.example", Rel: "."}, nil
 	}
 	rt.syncMount = func(context.Context, *localMount) error { return errors.New("upload stalled") }
 	err := runExec(t.Context(), []string{"true"}, rt)
@@ -445,8 +446,12 @@ type syncBuffer struct {
 	b  bytes.Buffer
 }
 
-func (b *syncBuffer) Write(p []byte) (int, error) { b.mu.Lock(); defer b.mu.Unlock(); return b.b.Write(p) }
-func (b *syncBuffer) String() string              { b.mu.Lock(); defer b.mu.Unlock(); return b.b.String() }
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.Write(p)
+}
+func (b *syncBuffer) String() string { b.mu.Lock(); defer b.mu.Unlock(); return b.b.String() }
 
 func TestLayerFromMountArgs(t *testing.T) {
 	for args, want := range map[string]string{
@@ -457,5 +462,23 @@ func TestLayerFromMountArgs(t *testing.T) {
 		if got := layerFromMountArgs(strings.Fields(args)); got != want {
 			t.Errorf("%q -> %q, want %q", args, got, want)
 		}
+	}
+}
+
+func TestExecIgnoresMountWithUnknownServer(t *testing.T) {
+	request, _ := execTestServer(t, execStarted, execExit0)
+	rt := testExecRuntime(io.Discard, io.Discard)
+	rt.dir = "/mnt/runtime"
+	rt.server = func() string { return "https://current.example" }
+	rt.findMount = func(string) (*localMount, error) {
+		// --no-persist-credentials mounts do not record their server.
+		return &localMount{MountPoint: "/mnt/runtime", RemoteRoot: "/x", Rel: "."}, nil
+	}
+	rt.syncMount = func(context.Context, *localMount) error { t.Fatal("synced a mount of unknown origin"); return nil }
+	if err := runExec(t.Context(), []string{"true"}, rt); err != nil {
+		t.Fatal(err)
+	}
+	if request.Workspace.Root != "/" {
+		t.Fatalf("workspace = %q", request.Workspace.Root)
 	}
 }

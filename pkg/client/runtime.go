@@ -257,7 +257,7 @@ func (c *Client) Exec(ctx context.Context, input ExecRequest, options ExecOption
 		case "exit":
 			return &ExecResult{ExecutionID: executionID, ExitCode: *wire.ExitCode, DurationMS: *wire.DurationMS, Sandbox: sandbox}, nil
 		case "error":
-			return nil, runtimeTerminalError(wire)
+			return nil, runtimeTerminalError(wire, started)
 		}
 		if atEOF {
 			return nil, c.runtimeObservationEnded(ctx, executionID, io.ErrUnexpectedEOF)
@@ -375,10 +375,16 @@ func runtimeHTTPStartError(resp *http.Response) error {
 	return &RuntimeStartError{RuntimeExecutionError: &RuntimeExecutionError{Code: code, Message: err.Error()}}
 }
 
-func runtimeTerminalError(wire runtimeWireFrame) error {
+// runtimeTerminalError maps a terminal error frame. A start-type code after
+// the command started is contradictory; it may have run, so it is reported
+// as an unknown outcome rather than a safe-to-retry start failure.
+func runtimeTerminalError(wire runtimeWireFrame, started bool) error {
 	execution := &RuntimeExecutionError{ExecutionID: wire.ExecutionID, Code: wire.ErrorCode, Message: wire.Message}
 	switch wire.ErrorCode {
 	case "invalid_request", "unavailable", "start_failed":
+		if started {
+			return runtimeUnknown(wire.ExecutionID, execution)
+		}
 		return &RuntimeStartError{RuntimeExecutionError: execution}
 	case "timed_out":
 		return &RuntimeTimeoutError{RuntimeExecutionError: execution}

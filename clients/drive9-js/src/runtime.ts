@@ -232,7 +232,7 @@ export async function exec(client: RuntimeClient, input: ExecRequest, options: E
         };
       }
       if (kind === "error") {
-        throw terminalError(wire);
+        throw terminalError(wire, executionId !== "");
       }
     }
   } catch (error) {
@@ -295,11 +295,16 @@ export async function cancelRuntimeExecution(client: RuntimeClient, executionId:
   }
 }
 
-function terminalError(wire: WireFrame): Error {
+// A start-type code after the command started is contradictory; it may have
+// run, so report an unknown outcome instead of a safe-to-retry start failure.
+function terminalError(wire: WireFrame, started: boolean): Error {
   const executionId = wire.execution_id === undefined ? "" : wire.execution_id as string;
   const code = wire.error_code as string;
   const message = wire.message as string;
   if (code === "invalid_request" || code === "unavailable" || code === "start_failed") {
+    if (started) {
+      return unknownOutcome(message, executionId, new RuntimeExecutionError(code, message, executionId));
+    }
     return new RuntimeStartError(code, message, executionId);
   }
   if (code === "timed_out") return new RuntimeTimeoutError(message, executionId);
