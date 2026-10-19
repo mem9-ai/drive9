@@ -293,45 +293,30 @@ func ExampleClient_migrationContract() {
 	})
 }
 
-func ExampleClient_oneShotRuntimeExec() {
+func ExampleClient_exec() {
 	ctx := context.Background()
-	c := drive9.New("https://drive9.example.com", "workspace-scoped-api-key")
+	c := drive9.New("https://drive9.example.com", "owner-api-key")
 
-	capabilities, err := c.GetRuntimeCapabilities(ctx)
-	if err != nil || !capabilities.Streaming {
-		return
-	}
-
+	// Command runs through /bin/sh -c in /workspace, which is the Drive9
+	// directory Workspace.Root. Use Argv instead to skip the shell.
 	var stdout, stderr bytes.Buffer
-	var started drive9.ExecStarted
 	result, err := c.Exec(ctx, drive9.ExecRequest{
-		Argv: []string{"go", "test", "./..."},
-		Cwd:  "/workspace",
-		Workspace: drive9.RuntimeWorkspace{
-			Root:        "/projects/example",
-			LayerID:     "pi-fork-42",
-			Persistence: drive9.RuntimePersistenceWorkspace,
-		},
+		Command:   "go test ./...",
+		Workspace: drive9.RuntimeWorkspace{Root: "/projects/example"},
 		TimeoutMS: int64((15 * time.Minute) / time.Millisecond),
-	}, drive9.ExecOptions{
-		Stdout: &stdout,
-		Stderr: &stderr,
-		OnStarted: func(value drive9.ExecStarted) error {
-			started = value
-			return nil
-		},
-	})
-	if err != nil {
-		if drive9.IsRuntimeOutcomeUnknown(err) {
-			// The process may have run. Reconcile instead of resubmitting.
-			return
-		}
+	}, drive9.ExecOptions{Stdout: &stdout, Stderr: &stderr})
+	switch {
+	case drive9.IsRuntimeBusy(err):
+		// Too many commands are running; nothing started, retry later.
+		return
+	case drive9.IsRuntimeOutcomeUnknown(err):
+		// The command may have run. Reconcile instead of resubmitting.
+		return
+	case err != nil:
 		return
 	}
-	_ = started.ExecutionID
 	_ = result.ExitCode // A nonzero exit code is a normal result.
-	_ = stdout.Bytes()
-	_ = stderr.Bytes()
+	_ = result.Sandbox  // "warm" when the previous command's sandbox was reused.
 }
 
 func ExampleClient_cancelRuntimeExecution() {

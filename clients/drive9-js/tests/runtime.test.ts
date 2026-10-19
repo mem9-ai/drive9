@@ -3,7 +3,9 @@ import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
 import {
   Client,
+  RuntimeBusyError,
   RuntimeCanceledError,
+  RuntimeNotEnabledError,
   RuntimeOutcomeUnknownError,
   RuntimeStartError,
   RuntimeTimeoutError,
@@ -21,12 +23,15 @@ describe("runtime exec", () => {
       const payload = await request.json() as Record<string, unknown>;
       expect(payload).toMatchObject({
         argv: ["sh", "-c", "exit 7"],
-        workspace: { root: "/project", layer_id: "pi-fork-layer", persistence: "workspace" },
+        workspace: { root: "/project", layer_id: "pi-fork-layer" },
       });
+      expect(payload.workspace).not.toHaveProperty("persistence");
       expect(payload).not.toHaveProperty("execution_class");
       expect(payload).not.toHaveProperty("resources");
       const body = [
-        `{"type":"started","execution_id":"rex_12345678"}`,
+        `{"type":"heartbeat"}`,
+        `{"type":"started","execution_id":"rex_12345678","cwd":"/workspace","sandbox":"new"}`,
+        `{"type":"heartbeat"}`,
         `{"type":"stdout","execution_id":"rex_12345678","data_base64":"aGVsbG8="}`,
         `{"type":"stderr","execution_id":"rex_12345678","data_base64":"d2Fybg=="}`,
         `{"type":"exit","execution_id":"rex_12345678","exit_code":7,"duration_ms":12}`,
@@ -37,12 +42,12 @@ describe("runtime exec", () => {
     const stdout: string[] = [];
     const stderr: string[] = [];
     const result = await new Client("http://localhost:9009", "test-key").exec({
-      argv: ["sh", "-c", "exit 7"], workspace: { root: "/project", layer_id: "pi-fork-layer", persistence: "workspace" },
+      argv: ["sh", "-c", "exit 7"], workspace: { root: "/project", layer_id: "pi-fork-layer" },
     }, {
       onStdout: (chunk) => { stdout.push(new TextDecoder().decode(chunk)); },
       onStderr: (chunk) => { stderr.push(new TextDecoder().decode(chunk)); },
     });
-    expect(result).toEqual({ executionId: "rex_12345678", exitCode: 7, durationMs: 12 });
+    expect(result).toEqual({ executionId: "rex_12345678", exitCode: 7, durationMs: 12, sandbox: "new" });
     expect(stdout).toEqual(["hello"]);
     expect(stderr).toEqual(["warn"]);
   });
@@ -84,7 +89,7 @@ describe("runtime exec", () => {
       `{"type":"error","error_code":"${code}","message":"failed"}\n`,
       { headers: { "Content-Type": "application/x-ndjson" } },
     )));
-    await expect(new Client("http://localhost:9009", "test-key").exec({ argv: [], workspace: { root: "/" } }))
+    await expect(new Client("http://localhost:9009", "test-key").exec({ argv: ["true"], workspace: { root: "/" } }))
       .rejects.toBeInstanceOf(expected);
   });
 
@@ -123,86 +128,52 @@ describe("runtime exec", () => {
     await expect(promise).rejects.toBeInstanceOf(RuntimeOutcomeUnknownError);
   });
 
-  it("validates capabilities and rejects duplicate providers", async () => {
-    server.use(http.get("http://localhost:9009/v1/runtime/capabilities", () => HttpResponse.json({
-      version: 1,
-      streaming: true,
-      separate_stdout_stderr: true,
-      cancel: true,
-      cancel_scope: "active_execution",
-      detached: false,
-      replay: false,
-      providers: [{ provider: "docker", profiles: ["default"], candidates: [{
-        profile: "default",
-        execution_class: "linux-full",
-        persistence: "full_root",
-        rootfs: {
-          driver: "user-union",
-          capability_version: "drive9_rootfs.user_union.extent.v6",
-          config_hash: "a".repeat(64),
-          lower_image_digest: `sha256:${"b".repeat(64)}`,
-        },
-        capabilities: {
-          "workspace_persistence": true,
-          "full_root_persistence": true,
-        },
-        production_eligible: true,
-        bounded_selection_eligible: true,
-      }] }, { provider: "daytona", profiles: ["preview"], candidates: [{
-        profile: "preview",
-        execution_class: "linux-full",
-        persistence: "workspace",
-        rootfs: {
-          driver: "workspace-mount",
-          capability_version: "drive9_workspace.mount.v1",
-          config_hash: "c".repeat(64),
-          lower_image_digest: `sha256:${"d".repeat(64)}`,
-        },
-        capabilities: { "workspace_persistence": true },
-        production_eligible: false,
-        bounded_selection_eligible: false,
-      }] }],
-    })));
-    await expect(new Client("http://localhost:9009", "test-key").runtimeCapabilities()).resolves.toMatchObject({ version: 1 });
+  it("runs a command line through the shell and reports the sandbox", async () => {
+    server.use(http.post("http://localhost:9009/v1/runtime/exec", async ({ request }) => {
+      const payload = await request.json() as Record<string, unknown>;
+      expect(payload).toMatchObject({ argv: ["/bin/sh", "-c", "npm ci && npm test"], cwd: "web", workspace: {} });
+      expect(payload).not.toHaveProperty("command");
+      const body = [
+        `{"type":"started","execution_id":"rex_12345678","cwd":"/workspace/web","sandbox":"warm"}`,
+        `{"type":"exit","execution_id":"rex_12345678","exit_code":0,"duration_ms":3}`,
+        "",
+      ].join("\n");
+      return new HttpResponse(body, { headers: { "Content-Type": "application/x-ndjson" } });
+    }));
+    let started: unknown;
+    const result = await new Client("http://localhost:9009", "test-key").exec(
+      { command: "npm ci && npm test", cwd: "web" },
+      { onStarted: (event) => { started = event; } },
+    );
+    expect(started).toEqual({ executionId: "rex_12345678", cwd: "/workspace/web", sandbox: "warm" });
+    expect(result.sandbox).toBe("warm");
+    await expect(new Client("http://localhost:9009", "test-key").exec({ command: "x", argv: ["y"] }))
+      .rejects.toBeInstanceOf(RuntimeStartError);
+  });
 
-    server.use(http.get("http://localhost:9009/v1/runtime/capabilities", () => HttpResponse.json({
-      version: 1,
-      streaming: true,
-      separate_stdout_stderr: true,
-      cancel: true,
-      cancel_scope: "active_execution",
-      detached: false,
-      replay: false,
-      providers: [{ provider: "docker", profiles: ["default"], candidates: [{
-        profile: "default",
-        execution_class: "linux-full",
-        persistence: "full_root",
-        rootfs: {
-          driver: "user-union",
-          capability_version: "drive9_rootfs.user_union.extent.v3",
-          config_hash: "a".repeat(64),
-          lower_image_digest: `sha256:${"b".repeat(64)}`,
-        },
-        capabilities: {
-          "workspace_persistence": true,
-          "full_root_persistence": true,
-        },
-        production_eligible: true,
-        bounded_selection_eligible: true,
-      }] }],
-    })));
-    await expect(new Client("http://localhost:9009", "test-key").runtimeCapabilities()).rejects.toThrow("candidate");
+  it("types busy and disabled servers", async () => {
+    server.use(http.post("http://localhost:9009/v1/runtime/exec", () =>
+      HttpResponse.json({ error: "too many commands are already running", code: "busy" }, { status: 429, headers: { "Retry-After": "7" } })));
+    const busy = new Client("http://localhost:9009", "test-key").exec({ argv: ["true"] });
+    await expect(busy).rejects.toBeInstanceOf(RuntimeBusyError);
+    await expect(busy).rejects.toMatchObject({ retryAfterMs: 7000 });
 
+    server.use(http.post("http://localhost:9009/v1/runtime/exec", () => new HttpResponse(null, { status: 404 })));
+    await expect(new Client("http://localhost:9009", "test-key").exec({ argv: ["true"] })).rejects.toBeInstanceOf(RuntimeNotEnabledError);
+  });
+
+  it("reads capabilities leniently and rejects old servers", async () => {
     server.use(http.get("http://localhost:9009/v1/runtime/capabilities", () => HttpResponse.json({
-      version: 1,
-      streaming: true,
-      separate_stdout_stderr: true,
-      cancel: true,
-      cancel_scope: "active_execution",
-      detached: false,
-      replay: false,
-      providers: [{ provider: "docker", profiles: ["default"] }, { provider: "docker", profiles: ["large"] }],
+      version: 2, provider: "daytona", persistence: "workspace", workspace_path: "/workspace", user: "agent",
+      streaming: true, cancel: true, max_active_per_tenant: 4, future_field: true,
     })));
-    await expect(new Client("http://localhost:9009", "test-key").runtimeCapabilities()).rejects.toThrow("duplicate");
+    await expect(new Client("http://localhost:9009", "test-key").runtimeCapabilities())
+      .resolves.toMatchObject({ provider: "daytona", workspace_path: "/workspace", user: "agent" });
+
+    server.use(http.get("http://localhost:9009/v1/runtime/capabilities", () => HttpResponse.json({ version: 1, streaming: true })));
+    await expect(new Client("http://localhost:9009", "test-key").runtimeCapabilities()).rejects.toThrow("too old");
+
+    server.use(http.get("http://localhost:9009/v1/runtime/capabilities", () => new HttpResponse(null, { status: 404 })));
+    await expect(new Client("http://localhost:9009", "test-key").runtimeCapabilities()).rejects.toBeInstanceOf(RuntimeNotEnabledError);
   });
 });

@@ -18,7 +18,7 @@
 //	git     git-aware drive9 workflows
 //	region list provisioning regions
 //	profile show mount profile configuration
-//	exec    run one remote process against a Drive9 workspace
+//	exec    run a command in a sandbox with the workspace mounted at /workspace
 //	mount   mount drive9 as a local filesystem, or mount vault secrets
 //	umount  unmount a drive9 local mount
 //	doctor  diagnose local drive9 runtime prerequisites
@@ -406,6 +406,18 @@ func fatal(cmd string, err error) {
 	if cliLogger != nil {
 		logger.Error(context.Background(), "cli_command_failed", zap.String("command", cmd), zap.Error(err))
 	}
+	type exitCoder interface{ ExitCode() int }
+	type silentExit interface{ SilentExit() bool }
+	// The error already speaks for itself (for example a remote command's
+	// own exit status after it printed its diagnostics): exit quietly.
+	if silent, ok := err.(silentExit); ok && silent.SilentExit() {
+		code := 1
+		if ec, ok := err.(exitCoder); ok {
+			code = ec.ExitCode()
+		}
+		exitWithCode(code)
+		return
+	}
 	msg := err.Error()
 	if strings.Contains(strings.ToLower(msg), "usage quota") {
 		if m := cli.QuotaExceededMessageForCurrentContext(); m != "" {
@@ -413,7 +425,6 @@ func fatal(cmd string, err error) {
 		}
 	}
 	fmt.Fprintf(os.Stderr, "%s: %v\n", cmd, msg)
-	type exitCoder interface{ ExitCode() int }
 	if ec, ok := err.(exitCoder); ok && ec.ExitCode() > 0 {
 		exitWithCode(ec.ExitCode())
 	}
@@ -462,8 +473,8 @@ func usage(code int) {
 			"                         restore a drive9 pack archive to a local overlay\n"+
 			"  profile show [profile]\n"+
 			"                         print mount profile configuration\n"+
-			"  exec [flags] -- command [arg...]\n"+
-			"                         run one process against a Drive9 workspace\n"+
+			"  exec [flags] [--] command [arg...] | 'shell line'\n"+
+			"                         run a command in a sandbox with the workspace at /workspace\n"+
 			"  mount [flags] [:/remote|s3://bucket/prefix/|gs://bucket/prefix/|az://container/prefix/] <mountpoint>\n"+
 			"                         mount drive9 or an object prefix (background FUSE by default)\n"+
 			"  mount drain [--timeout duration] [--json] <mountpoint>\n"+

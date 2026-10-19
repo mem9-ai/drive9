@@ -1,27 +1,37 @@
 const MAX_RUNTIME_FRAME_BYTES = 1 << 20;
 const RUNTIME_CANCEL_TIMEOUT_MS = 20_000;
 
-export type RuntimePersistence = "full_root" | "workspace";
+export type RuntimeSandbox = "new" | "warm";
 
+/** The Drive9 directory mounted at /workspace. */
 export interface RuntimeWorkspace {
-  root: string;
-  /** Selects one exact LayerFS view. Requires `persistence: "workspace"`. */
+  /** Drive9 directory such as "/repo". Defaults to "/". */
+  root?: string;
+  /** Selects one LayerFS view of the workspace. */
   layer_id?: string;
   read_only?: boolean;
-  /** Defaults to `full_root`, which cannot be combined with `layer_id`. */
-  persistence?: RuntimePersistence;
 }
 
+/**
+ * One command. Set `argv` to run it as-is, or `command` to run a shell command
+ * line through `/bin/sh -c`. Drive9 never retries a request automatically.
+ */
 export interface ExecRequest {
-  argv: string[];
+  argv?: string[];
+  command?: string;
+  /** Relative to /workspace unless absolute. Defaults to /workspace. */
   cwd?: string;
   env?: Record<string, string>;
-  workspace: RuntimeWorkspace;
+  workspace?: RuntimeWorkspace;
   timeout_ms?: number;
 }
 
 export interface ExecStarted {
   executionId: string;
+  /** Working directory inside the sandbox. */
+  cwd: string;
+  /** "warm" when the previous command's sandbox was reused. */
+  sandbox: RuntimeSandbox | "";
 }
 
 export interface ExecOptions {
@@ -35,40 +45,24 @@ export interface ExecResult {
   executionId: string;
   exitCode: number;
   durationMs: number;
+  sandbox: RuntimeSandbox | "";
 }
 
 export interface RuntimeCapabilities {
   version: number;
-  streaming: boolean;
-  separate_stdout_stderr: boolean;
-  cancel: boolean;
-  cancel_scope: string;
-  detached: boolean;
-  replay: boolean;
-  providers: RuntimeProviderCapability[];
-}
-
-export interface RuntimeProviderCapability {
   provider: string;
-  profiles: string[];
-  candidates?: RuntimeCandidateCapability[];
-}
-
-export interface RuntimeCandidateCapability {
-  profile: string;
-  execution_class: string;
-  persistence: RuntimePersistence;
-  rootfs: RuntimeRootFSIdentity;
-  capabilities: Record<string, boolean>;
-  production_eligible: boolean;
-  bounded_selection_eligible: boolean;
-}
-
-export interface RuntimeRootFSIdentity {
-  driver: string;
-  capability_version: string;
-  config_hash: string;
-  lower_image_digest: string;
+  /** Only files under workspace_path persist. */
+  persistence: string;
+  workspace_path: string;
+  user: string;
+  streaming: boolean;
+  cancel: boolean;
+  heartbeat_ms: number;
+  default_timeout_ms: number;
+  max_timeout_ms: number;
+  max_output_bytes: number;
+  max_active_per_tenant: number;
+  warm_sandbox_idle_ms: number;
 }
 
 export class RuntimeExecutionError extends Error {
@@ -104,6 +98,29 @@ export class RuntimeCanceledError extends RuntimeExecutionError {
   }
 }
 
+/** The owner or server is at its concurrency limit; nothing started. Safe to retry. */
+export class RuntimeBusyError extends Error {
+  readonly retryAfterMs: number;
+
+  constructor(message: string, retryAfterMs: number) {
+    super(message);
+    this.name = "RuntimeBusyError";
+    this.retryAfterMs = retryAfterMs;
+  }
+}
+
+/** The server does not offer remote exec. */
+export class RuntimeNotEnabledError extends Error {
+  constructor() {
+    super("remote exec is not enabled on this server");
+    this.name = "RuntimeNotEnabledError";
+  }
+}
+
+export function isRuntimeBusy(error: unknown): boolean {
+  return error instanceof RuntimeBusyError;
+}
+
 export class RuntimeOutcomeUnknownError extends Error {
   readonly executionId: string;
   override readonly cause: unknown;
@@ -128,6 +145,8 @@ interface RuntimeClient {
 interface WireFrame {
   type?: unknown;
   execution_id?: unknown;
+  cwd?: unknown;
+  sandbox?: unknown;
   data_base64?: unknown;
   exit_code?: unknown;
   duration_ms?: unknown;
@@ -136,20 +155,34 @@ interface WireFrame {
 }
 
 export async function exec(client: RuntimeClient, input: ExecRequest, options: ExecOptions = {}): Promise<ExecResult> {
+  const { command, argv, ...rest } = input;
+  if (command !== undefined && argv !== undefined) {
+    throw new RuntimeStartError("invalid_request", "set either argv or command, not both");
+  }
+  const resolvedArgv = command !== undefined ? ["/bin/sh", "-c", command] : argv;
+  if (!resolvedArgv || resolvedArgv.length === 0) {
+    throw new RuntimeStartError("invalid_request", "a command is required");
+  }
+  const body = { ...rest, argv: resolvedArgv, workspace: rest.workspace ?? {} };
   let response: Response;
   try {
     response = await fetch(`${client.baseUrl}/v1/runtime/exec`, {
       method: "POST",
       headers: client.authHeaders({ "Content-Type": "application/json", Accept: "application/x-ndjson" }),
-      body: JSON.stringify(input),
+      body: JSON.stringify(body),
       signal: options.signal,
       redirect: "error",
     });
   } catch (error) {
     throw unknownOutcome("runtime request ended before a terminal frame", "", error);
   }
+  if (response.status === 404) throw new RuntimeNotEnabledError();
   if (!response.ok) {
     const failure = await readRuntimeError(response);
+    if (response.status === 429) {
+      const seconds = Number.parseInt(response.headers.get("retry-after") ?? "", 10);
+      throw new RuntimeBusyError(failure.message || "too many commands are running", (Number.isFinite(seconds) && seconds > 0 ? seconds : 5) * 1000);
+    }
     throw new RuntimeStartError(failure.code || "http_error", failure.message || `HTTP ${response.status}`);
   }
   const contentType = response.headers.get("content-type")?.split(";", 1)[0].trim();
@@ -158,16 +191,19 @@ export async function exec(client: RuntimeClient, input: ExecRequest, options: E
   }
 
   let executionId = "";
+  let sandbox: RuntimeSandbox | "" = "";
   try {
     for await (const line of runtimeLines(response.body, options.signal)) {
       if (line.trim() === "") continue;
       const wire = parseWireFrame(line);
       const kind = requiredString(wire.type, "frame type");
       validateFrame(wire, kind, executionId);
+      if (kind === "heartbeat") continue;
       if (kind === "started") {
         executionId = wire.execution_id as string;
+        sandbox = (wire.sandbox ?? "") as RuntimeSandbox | "";
         try {
-          await options.onStarted?.({ executionId });
+          await options.onStarted?.({ executionId, cwd: (wire.cwd ?? "") as string, sandbox });
         } catch (error) {
           await cancelAfterLostObservation(client, executionId);
           throw unknownOutcome("runtime started callback failed", executionId, error);
@@ -190,6 +226,7 @@ export async function exec(client: RuntimeClient, input: ExecRequest, options: E
           executionId,
           exitCode: wire.exit_code as number,
           durationMs: wire.duration_ms as number,
+          sandbox,
         };
       }
       if (kind === "error") {
@@ -215,70 +252,19 @@ export async function getRuntimeCapabilities(client: RuntimeClient, signal?: Abo
     signal,
     redirect: "error",
   });
+  if (response.status === 404) throw new RuntimeNotEnabledError();
   if (!response.ok) {
     const failure = await readRuntimeError(response);
     throw new RuntimeExecutionError(failure.code || "http_error", failure.message || `HTTP ${response.status}`);
   }
   const value = await readRuntimeJSON(response);
   if (!isObject(value)) throw new Error("runtime capabilities must be an object");
-  const allowed = new Set(["version", "streaming", "separate_stdout_stderr", "cancel", "cancel_scope", "detached", "replay", "providers"]);
-  rejectUnknownFields(value, allowed, "runtime capabilities");
+  // Capabilities may grow; unknown fields are ignored.
   const capabilities = value as unknown as RuntimeCapabilities;
-  if (capabilities.version !== 1 || capabilities.streaming !== true || capabilities.separate_stdout_stderr !== true ||
-      typeof capabilities.cancel !== "boolean" || typeof capabilities.cancel_scope !== "string" ||
-      capabilities.detached !== false || capabilities.replay !== false || !Array.isArray(capabilities.providers)) {
-    throw new Error("server does not support the Runtime exec protocol");
-  }
-  if (capabilities.cancel && capabilities.cancel_scope !== "active_execution") {
-    throw new Error("server advertises an unsupported Runtime cancel scope");
-  }
-  for (const provider of capabilities.providers) {
-    if (!isObject(provider) || Object.keys(provider).some((key) => key !== "provider" && key !== "profiles" && key !== "candidates") ||
-        !nonemptyString(provider.provider) || !Array.isArray(provider.profiles) || provider.profiles.some((profile) => !nonemptyString(profile))) {
-      throw new Error("server returned invalid Runtime provider capabilities");
-    }
-    if (provider.candidates !== undefined) {
-      if (!Array.isArray(provider.candidates)) throw new Error("server returned invalid Runtime candidate capabilities");
-      const candidateProfiles = new Set<string>();
-      for (const candidate of provider.candidates) {
-        if (!validRuntimeCandidateCapability(candidate) || !provider.profiles.includes(candidate.profile) || candidateProfiles.has(candidate.profile)) {
-          throw new Error("server returned invalid Runtime candidate capabilities");
-        }
-        candidateProfiles.add(candidate.profile);
-      }
-    }
-  }
-  const providerNames = capabilities.providers.map((provider) => provider.provider);
-  if (new Set(providerNames).size !== providerNames.length || capabilities.providers.some((provider) => new Set(provider.profiles).size !== provider.profiles.length)) {
-    throw new Error("server returned duplicate Runtime provider capabilities");
+  if (typeof capabilities.version !== "number" || capabilities.version < 2 || capabilities.streaming !== true) {
+    throw new Error("server runtime is too old for this client; upgrade the server");
   }
   return capabilities;
-}
-
-function validRuntimeCandidateCapability(value: unknown): value is RuntimeCandidateCapability {
-  if (!isObject(value)) return false;
-  const allowed = new Set(["profile", "execution_class", "persistence", "rootfs", "capabilities", "production_eligible", "bounded_selection_eligible"]);
-  if (Object.keys(value).some((key) => !allowed.has(key)) || !nonemptyString(value.profile) || !nonemptyString(value.execution_class) ||
-      typeof value.production_eligible !== "boolean" || typeof value.bounded_selection_eligible !== "boolean" ||
-      !isObject(value.rootfs) || !isObject(value.capabilities)) return false;
-  const rootfsAllowed = new Set(["driver", "capability_version", "config_hash", "lower_image_digest"]);
-  if (Object.keys(value.rootfs).some((key) => !rootfsAllowed.has(key)) || value.execution_class !== "linux-full" ||
-      typeof value.rootfs.config_hash !== "string" || !/^[0-9a-f]{64}$/.test(value.rootfs.config_hash) ||
-      typeof value.rootfs.lower_image_digest !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value.rootfs.lower_image_digest) ||
-      Object.values(value.capabilities).some((capability) => typeof capability !== "boolean") ||
-      value.bounded_selection_eligible && !value.production_eligible) {
-    return false;
-  }
-  if (value.capabilities["workspace_persistence"] !== true) return false;
-  if (value.persistence === "full_root") {
-    return value.rootfs.driver === "user-union" && value.rootfs.capability_version === "drive9_rootfs.user_union.extent.v6" &&
-      value.capabilities["full_root_persistence"] === true;
-  }
-  if (value.persistence === "workspace") {
-    return value.rootfs.driver === "workspace-mount" && value.rootfs.capability_version === "drive9_workspace.mount.v1" &&
-      value.capabilities["full_root_persistence"] !== true;
-  }
-  return false;
 }
 
 export async function cancelRuntimeExecution(client: RuntimeClient, executionId: string, signal?: AbortSignal): Promise<void> {
@@ -323,8 +309,16 @@ function terminalError(wire: WireFrame): Error {
 }
 
 function validateFrame(wire: WireFrame, kind: string, executionId: string): void {
+  if (kind === "heartbeat") {
+    if (hasOutputOrTerminalFields(wire) || wire.cwd !== undefined || wire.sandbox !== undefined) {
+      throw new Error("invalid runtime heartbeat frame");
+    }
+    return;
+  }
   if (kind === "started") {
-    if (executionId || !validExecutionId(wire.execution_id) || hasOutputOrTerminalFields(wire)) {
+    if (executionId || !validExecutionId(wire.execution_id) || hasOutputOrTerminalFields(wire) ||
+        (wire.cwd !== undefined && typeof wire.cwd !== "string") ||
+        (wire.sandbox !== undefined && wire.sandbox !== "new" && wire.sandbox !== "warm")) {
       throw new Error("invalid runtime started frame");
     }
     return;
@@ -370,7 +364,7 @@ async function cancelAfterLostObservation(client: RuntimeClient, executionId: st
 async function runtimeAbortError(client: RuntimeClient, executionId: string, cause: unknown): Promise<Error> {
   try {
     await cancelRuntimeExecution(client, executionId, AbortSignal.timeout(RUNTIME_CANCEL_TIMEOUT_MS));
-    return new RuntimeCanceledError("runtime execution was canceled and stopped", executionId);
+    return new RuntimeCanceledError("the command was canceled", executionId);
   } catch (cancelError) {
     return unknownOutcome("runtime cancellation outcome is unknown", executionId, new AggregateError([cause, cancelError]));
   }
@@ -437,7 +431,7 @@ function concatBytes(left: Uint8Array, right: Uint8Array): Uint8Array {
 function parseWireFrame(line: string): WireFrame {
   const parsed = JSON.parse(line) as unknown;
   if (!isObject(parsed)) throw new Error("runtime frame must be an object");
-  rejectUnknownFields(parsed, new Set(["type", "execution_id", "data_base64", "exit_code", "duration_ms", "error_code", "message"]), "runtime frame");
+  rejectUnknownFields(parsed, new Set(["type", "execution_id", "cwd", "sandbox", "data_base64", "exit_code", "duration_ms", "error_code", "message"]), "runtime frame");
   return parsed as WireFrame;
 }
 

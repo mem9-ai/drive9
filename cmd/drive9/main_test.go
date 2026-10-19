@@ -1121,3 +1121,29 @@ func TestExitWithCodeStopsCPUProfile(t *testing.T) {
 		t.Fatalf("exit code = %d, want 7", exitCode)
 	}
 }
+
+type silentTestExit struct{ code int }
+
+func (e silentTestExit) Error() string    { return "exit status" }
+func (e silentTestExit) ExitCode() int    { return e.code }
+func (e silentTestExit) SilentExit() bool { return true }
+
+func TestFatalSilentExitKeepsStderrClean(t *testing.T) {
+	origExit := exitFunc
+	t.Cleanup(func() { exitFunc = origExit })
+	var code int
+	exitFunc = func(value int) { code = value }
+	originalStderr := os.Stderr
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = writer
+	fatal("exec", silentTestExit{code: 9})
+	os.Stderr = originalStderr
+	_ = writer.Close()
+	output, _ := io.ReadAll(reader)
+	if code != 9 || len(output) != 0 {
+		t.Fatalf("code=%d stderr=%q", code, output)
+	}
+}

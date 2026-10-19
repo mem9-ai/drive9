@@ -70,10 +70,18 @@ func TestMountProcessStateKeepsCredentialsByDefault(t *testing.T) {
 	}
 }
 
-func TestMountReadyMessageOmitsServer(t *testing.T) {
+func TestMountReadyMessageKeepsServerByDefault(t *testing.T) {
+	message := mountReadyMessage(&MountOptions{Server: "https://drive9.example", MountPoint: "/mnt"}, "actor-1", "/cache", "/shadow")
+	if !strings.Contains(message, "server: https://drive9.example") {
+		t.Fatalf("default mount ready message lost the server: %q", message)
+	}
+}
+
+func TestMountReadyMessageOmitsServerWithoutPersistentCredentials(t *testing.T) {
 	const server = "https://signed-preview-secret.example"
 	message := mountReadyMessage(&MountOptions{
 		Server: server, MountPoint: "/mnt/runtime", ReadOnly: true, WritePolicy: WritePolicyWriteSync,
+		OmitProcessStateCredentials: true,
 	}, "actor-1", "/cache", "/shadow")
 	if strings.Contains(message, server) || strings.Contains(message, "server:") {
 		t.Fatalf("mount ready message leaked server endpoint: %q", message)

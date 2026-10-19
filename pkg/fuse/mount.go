@@ -1045,8 +1045,14 @@ func newMountProcessState(opts *MountOptions, mountPoint string, creationTime ui
 }
 
 func mountReadyMessage(opts *MountOptions, actorID, cacheBase, shadowDir string) string {
-	return fmt.Sprintf("drive9: mounted on %s (actor: %s, readonly: %v, write_policy: %s, cache: %s, shadow: %s)\n",
-		opts.MountPoint, actorID, opts.ReadOnly, opts.WritePolicy, cacheBase, shadowDir)
+	// A non-persistent credential mount may run with a credential-bearing
+	// endpoint, so it omits the server from the log line.
+	if opts.OmitProcessStateCredentials {
+		return fmt.Sprintf("drive9: mounted on %s (actor: %s, readonly: %v, write_policy: %s, cache: %s, shadow: %s)\n",
+			opts.MountPoint, actorID, opts.ReadOnly, opts.WritePolicy, cacheBase, shadowDir)
+	}
+	return fmt.Sprintf("drive9: mounted on %s (server: %s, actor: %s, readonly: %v, write_policy: %s, cache: %s, shadow: %s)\n",
+		opts.MountPoint, opts.Server, actorID, opts.ReadOnly, opts.WritePolicy, cacheBase, shadowDir)
 }
 
 func redactMountCredentialError(err error, opts *MountOptions) error {

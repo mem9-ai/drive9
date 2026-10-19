@@ -1,93 +1,86 @@
-# One-shot Runtime exec
+# Remote exec
 
-Drive9 Runtime is an optional, non-durable adapter for running one process
-against an existing persistent Drive9 workspace. It does not own task state,
-retry, replay, history, artifacts, or recovery. Agent frameworks such as Pi
-remain authoritative for those decisions.
-
-Runtime has two explicit persistence scopes. `full_root` providers compose the
-sandbox's literal Linux `/` from an immutable provider image lower plus a
-Drive9-backed writable upper; writes under `/root`, `/home`, `/etc`, and
-`/workspace` survive a fresh sandbox while `/tmp` and `/run` remain ephemeral.
-`workspace` providers persist only the provider's official coding workspace.
-Their root filesystem, `/tmp`, `/run`, `/etc`, other home content, and system
-package installs are disposable. Runtime never silently downgrades a
-`full_root` request to `workspace`.
-
-Docker supplies `full_root`. Daytona profiles use the workspace path resolved
-by Daytona's API and supply `workspace` only. Runtime reports success
-only after confirmed process exit, Drive9 drain, and provider teardown.
-
-For Docker `full_root`, Drive9 persists the user change layer independently
-from the selected base image. If server policy later selects a different image
-or profile for the same workspace, prior copied-up files, deletion records,
-ownership, and permissions continue to overlay that new image; they are not
-reset or rejected. This is deliberate and may hide or replace same-path files
-from the newer image.
-
-## CLI
+`drive9 exec` runs a command in a sandbox with your Drive9 workspace mounted at
+`/workspace`. You do not create, mount, or clean up a sandbox yourself.
 
 ```bash
-drive9 exec \
-  --workspace :/repo \
-  --layer pi-fork-42 \
-  --persistence workspace \
-  --cwd . \
-  --timeout 10m \
-  --env NODE_ENV=test \
-  -- npm test
+drive9 exec npm test
+drive9 exec -w :/repo 'npm ci && npm test'
+drive9 exec -e CI=1 -e GITHUB_TOKEN -t 20m -- make -j8 test
 ```
 
-The command writes remote stdout and stderr to the matching local streams and
-returns the process exit status. `--workspace` defaults to `:/`.
-`--layer` selects one exact writable LayerFS view, such as a Pi conversation
-fork. Omitting it mounts the base workspace view. Base and layer views use
-independent execution mounts and may run concurrently. A layer view requires
-`--persistence workspace`; the server rejects `full_root + layer_id`, including
-the default omitted persistence value, because full-root-on-LayerFS composition
-is outside the current one-shot Runtime MVP.
-`--persistence` defaults to `full_root` for compatibility and safety; pass
-`workspace` only when persistence outside the coding workspace is unnecessary.
-CPU, memory, PID, disk, network, and execution class are backend-owned provider
-profile settings and are not client flags. `--timeout` is a caller cancellation
-deadline; the selected backend profile may enforce a shorter maximum.
+The server must have remote exec enabled. Otherwise the command reports
+`remote exec is not enabled on this server`.
 
-Interrupting the client requests remote cancellation. The CLI reports canceled
-only after the server confirms that the process stopped and bounded workspace
-cleanup completed; otherwise it reports that the outcome is unknown. It never
-retries.
+## What to expect
+
+- **Where it runs.** `/workspace` is the Drive9 directory given by `-w`
+  (default `:/`). Relative `-C` paths are inside it.
+- **Who it runs as.** A normal user, `agent`, with `HOME=/home/agent`, so git,
+  pip, npm, and go work as usual. It can edit any workspace file but cannot
+  become root.
+- **What persists.** Files under `/workspace` are in Drive9 when the command
+  exits. Everything else in the sandbox is disposable.
+- **Warm sandboxes.** Consecutive commands on the same workspace with the same
+  API key reuse the sandbox for a while (10 minutes idle by default). Packages
+  you installed, files in `/tmp`, and background processes are still there for
+  the next command. Use `-v` to see whether a command got a `new` or `warm`
+  sandbox.
+- **Output.** stdout and stderr stream live to your terminal, separately.
+- **Exit status.** `drive9 exec` exits with the command's status and adds no
+  message of its own. Other outcomes use shell conventions:
+
+  | Status | Meaning |
+  | --- | --- |
+  | 124 | `-t` timeout reached; the command was stopped |
+  | 126 / 127 | command not executable / not found |
+  | 130 | canceled with Ctrl-C |
+  | 255 | the connection was lost and the outcome is unknown |
+
+- **Ctrl-C.** The first Ctrl-C stops the remote command and waits for the
+  workspace to drain. A second Ctrl-C detaches immediately; the command may keep
+  running.
+- **Never retried.** If the outcome is unknown, the command may already have
+  run. Check the workspace before running it again.
+
+## Flags
+
+| Flag | Meaning |
+| --- | --- |
+| `-w, --workspace :/PATH` | Drive9 directory mounted at `/workspace` (default `:/`) |
+| `-C, --cwd DIR` | working directory, relative to `/workspace` |
+| `-e, --env KEY[=VALUE]` | set a variable; `KEY` alone copies it from your environment; repeatable |
+| `-t, --timeout DURATION` | stop the command after this long (the server may cap it) |
+| `--layer ID` | use a LayerFS layer view, for example one agent fork |
+| `--read-only` | mount the workspace read-only |
+| `-v, --verbose` | show the sandbox, working directory, and duration |
+
+A single argument that contains spaces or shell syntax runs through
+`/bin/sh -c`: `drive9 exec 'cd web && npm test'`. Anything else runs as-is,
+with or without `--`.
 
 ## Go SDK
 
 ```go
 result, err := c.Exec(ctx, client.ExecRequest{
-    Argv: []string{"go", "test", "./..."},
-    Workspace: client.RuntimeWorkspace{
-        Root:        "/repo",
-        LayerID:     "pi-fork-42",
-        Persistence: client.RuntimePersistenceWorkspace,
-    },
-}, client.ExecOptions{
-    Stdout: os.Stdout,
-    Stderr: os.Stderr,
-})
-if client.IsRuntimeOutcomeUnknown(err) {
-    // The process may have run. Reconcile instead of resubmitting blindly.
+    Command:   "go test ./...",           // or Argv: []string{"go", "test", "./..."}
+    Workspace: client.RuntimeWorkspace{Root: "/repo"},
+}, client.ExecOptions{Stdout: os.Stdout, Stderr: os.Stderr})
+switch {
+case client.IsRuntimeBusy(err):
+    // Too many commands are running; nothing started. Retry later.
+case client.IsRuntimeOutcomeUnknown(err):
+    // The command may have run. Reconcile instead of resubmitting.
+case err == nil:
+    fmt.Println("exit", result.ExitCode, "sandbox", result.Sandbox)
 }
 ```
-
-A nonzero process status is returned in `ExecResult.ExitCode`; it is not an SDK
-error. Start, timeout, confirmed cancellation, and unknown outcome have distinct
-typed errors.
 
 ## TypeScript SDK
 
 ```typescript
 const result = await client.exec(
-  {
-    argv: ["npm", "test"],
-    workspace: { root: "/repo", layer_id: "pi-fork-42", persistence: "workspace" },
-  },
+  { command: "npm test", workspace: { root: "/repo" } },
   {
     onStdout: chunk => process.stdout.write(chunk),
     onStderr: chunk => process.stderr.write(chunk),
@@ -95,24 +88,13 @@ const result = await client.exec(
 );
 ```
 
-Use `isRuntimeOutcomeUnknown(error)` for the same fail-closed rule. Both SDKs
-also expose capabilities and active-execution cancellation. Successful cancel
-means the server confirmed stop and workspace cleanup; an unconfirmed cancel
-is outcome-unknown.
+Both SDKs expose `runtimeCapabilities` / `GetRuntimeCapabilities` (limits such
+as the maximum timeout and concurrent commands) and cancellation of a running
+command.
 
-Provider capabilities include each profile's execution class, machine-readable
-`persistence`, rootfs/workspace identity, `workspace_persistence` and
-`full_root_persistence` flags, plus `production_eligible` /
-`bounded_selection_eligible`. Treat a candidate with either eligibility flag
-false as preview/manual-only for the corresponding use.
+## Credentials
 
-## Mount credentials
-
-The server launches a fresh extent-profile FUSE mount for each execution with
-`drive9 mount --no-supervise --no-persist-credentials`. The credential is
-available only to the live mount process, omitted from persistent mount state,
-and never passed to the application. Runtime gives the mount process isolated
-state directories, performs pre/post-exec drains, and removes the provider
-sandbox only after confirmed cleanup. The model process receives only the
-request's explicit environment plus a fixed safe `PATH`; it does not inherit
-server, provider, image, or mount-process environment variables.
+The server mounts the workspace inside the sandbox with your API key via
+`drive9 mount --no-persist-credentials`. The key lives only in the mount
+process's memory. It is not written to disk and is never visible to your
+command or its environment.

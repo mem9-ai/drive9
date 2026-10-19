@@ -3,11 +3,14 @@ export { Drive9Error, StatusError, ConflictError, checkError } from "./error.js"
 export { FSLayerCommitConflictError } from "./layer.js";
 export { StreamWriter } from "./stream.js";
 export {
+  RuntimeBusyError,
   RuntimeCanceledError,
   RuntimeExecutionError,
+  RuntimeNotEnabledError,
   RuntimeOutcomeUnknownError,
   RuntimeStartError,
   RuntimeTimeoutError,
+  isRuntimeBusy,
   isRuntimeOutcomeUnknown,
 } from "./runtime.js";
 export { MaxBatchReadSmallPaths, MaxBatchStatPaths } from "./models.js";
@@ -85,10 +88,7 @@ export type { ReadPartFn, ProgressFn } from "./patch.js";
 export type { ArchiveOptions } from "./archive.js";
 export type {
   RuntimeCapabilities,
-  RuntimeCandidateCapability,
-  RuntimePersistence,
-  RuntimeProviderCapability,
-  RuntimeRootFSIdentity,
+  RuntimeSandbox,
   ExecOptions,
   ExecRequest,
   ExecResult,

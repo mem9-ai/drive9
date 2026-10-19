@@ -76,7 +76,7 @@ func TestExecNeverRetriesUnknownOutcome(t *testing.T) {
 	}))
 	defer server.Close()
 
-	_, err := New(server.URL, "secret").Exec(t.Context(), ExecRequest{}, ExecOptions{})
+	_, err := New(server.URL, "secret").Exec(t.Context(), ExecRequest{Argv: []string{"true"}}, ExecOptions{})
 	if !IsRuntimeOutcomeUnknown(err) || calls.Load() != 1 {
 		t.Fatalf("error/calls = %v/%d", err, calls.Load())
 	}
@@ -97,7 +97,7 @@ func TestExecRejectsMalformedProtocolAsUnknown(t *testing.T) {
 				_, _ = fmt.Fprintln(w, body)
 			}))
 			defer server.Close()
-			_, err := New(server.URL, "secret").Exec(t.Context(), ExecRequest{}, ExecOptions{})
+			_, err := New(server.URL, "secret").Exec(t.Context(), ExecRequest{Argv: []string{"true"}}, ExecOptions{})
 			if !IsRuntimeOutcomeUnknown(err) {
 				t.Fatalf("error = %v", err)
 			}
@@ -125,7 +125,7 @@ func TestExecShortOutputWriteIsUnknownAndCancels(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	_, err := New(server.URL, "secret").Exec(t.Context(), ExecRequest{}, ExecOptions{Stdout: shortRuntimeWriter{}})
+	_, err := New(server.URL, "secret").Exec(t.Context(), ExecRequest{Argv: []string{"true"}}, ExecOptions{Stdout: shortRuntimeWriter{}})
 	if !IsRuntimeOutcomeUnknown(err) {
 		t.Fatalf("error = %v", err)
 	}
@@ -153,7 +153,7 @@ func TestExecReturnsTypedTerminalErrors(t *testing.T) {
 				_, _ = fmt.Fprintf(w, `{"type":"error","error_code":%q,"message":"failed"}`+"\n", test.code)
 			}))
 			defer server.Close()
-			_, err := New(server.URL, "secret").Exec(t.Context(), ExecRequest{}, ExecOptions{})
+			_, err := New(server.URL, "secret").Exec(t.Context(), ExecRequest{Argv: []string{"true"}}, ExecOptions{})
 			switch test.want.(type) {
 			case *RuntimeStartError:
 				var target *RuntimeStartError
@@ -204,7 +204,7 @@ func TestExecContextCancelRequestsAndConfirmsRemoteStop(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	result := make(chan error, 1)
 	go func() {
-		_, err := New(server.URL, "secret").Exec(ctx, ExecRequest{}, ExecOptions{OnStarted: func(ExecStarted) error {
+		_, err := New(server.URL, "secret").Exec(ctx, ExecRequest{Argv: []string{"true"}}, ExecOptions{OnStarted: func(ExecStarted) error {
 			close(clientStarted)
 			return nil
 		}})
@@ -246,80 +246,84 @@ func TestRuntimeCancelConfirmationAndUnknown(t *testing.T) {
 
 func TestRuntimeCapabilities(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(RuntimeCapabilities{
-			Version: 1, Streaming: true, SeparateIO: true, Cancel: true, CancelScope: "active_execution",
-		})
+		_, _ = w.Write([]byte(`{"version":2,"provider":"daytona","persistence":"workspace","workspace_path":"/workspace","user":"agent","streaming":true,"cancel":true,"max_active_per_tenant":4,"future_field":1}`))
 	}))
 	defer server.Close()
 	capabilities, err := New(server.URL, "secret").GetRuntimeCapabilities(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if capabilities.Version != 1 || !capabilities.Streaming || !capabilities.SeparateIO || !capabilities.Cancel {
+	if capabilities.Provider != "daytona" || capabilities.WorkspacePath != "/workspace" || capabilities.User != "agent" || capabilities.MaxActivePerTenant != 4 {
 		t.Fatalf("capabilities = %#v", capabilities)
 	}
+
+	old := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"version":1,"streaming":true}`))
+	}))
+	defer old.Close()
+	if _, err := New(old.URL, "secret").GetRuntimeCapabilities(context.Background()); err == nil {
+		t.Fatal("version 1 runtime accepted")
+	}
+
+	disabled := httptest.NewServer(http.NotFoundHandler())
+	defer disabled.Close()
+	if _, err := New(disabled.URL, "secret").GetRuntimeCapabilities(context.Background()); !errors.Is(err, ErrRuntimeNotEnabled) {
+		t.Fatalf("disabled runtime error = %v", err)
+	}
 }
 
-func TestRuntimeCapabilitiesRejectDuplicates(t *testing.T) {
-	err := validateRuntimeCapabilities(RuntimeCapabilities{
-		Version: 1, Streaming: true, SeparateIO: true,
-		Providers: []RuntimeProviderCapability{
-			{Provider: "docker", Profiles: []string{"default"}},
-			{Provider: "docker", Profiles: []string{"large"}},
-		},
+func TestExecCommandRunsThroughShellAndIgnoresHeartbeats(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		argv, _ := json.Marshal(request["argv"])
+		if string(argv) != `["/bin/sh","-c","npm ci \u0026\u0026 npm test"]` {
+			t.Fatalf("argv = %s", argv)
+		}
+		if _, ok := request["persistence"]; ok {
+			t.Fatal("client sent a persistence field")
+		}
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		_, _ = fmt.Fprintln(w, `{"type":"heartbeat"}`)
+		_, _ = fmt.Fprintln(w, `{"type":"started","execution_id":"rex_12345678","cwd":"/workspace/web","sandbox":"warm"}`)
+		_, _ = fmt.Fprintln(w, `{"type":"heartbeat"}`)
+		_, _ = fmt.Fprintln(w, `{"type":"exit","execution_id":"rex_12345678","exit_code":0,"duration_ms":3}`)
+	}))
+	defer server.Close()
+	var started ExecStarted
+	result, err := New(server.URL, "secret").Exec(t.Context(), ExecRequest{Command: "npm ci && npm test", Cwd: "web"}, ExecOptions{
+		OnStarted: func(info ExecStarted) error { started = info; return nil },
 	})
-	if err == nil {
-		t.Fatal("duplicate provider error = nil")
-	}
-}
-
-func TestRuntimeCapabilitiesAcceptsProviderAwareCandidates(t *testing.T) {
-	capabilities := RuntimeCapabilities{
-		Version: 1, Streaming: true, SeparateIO: true,
-		Providers: []RuntimeProviderCapability{{
-			Provider: "docker", Profiles: []string{"default", "workspace"},
-			Candidates: []RuntimeCandidateCapability{{
-				Profile: "default", ExecutionClass: "linux-full", Persistence: RuntimePersistenceFullRoot,
-				RootFS: RuntimeRootFSIdentity{
-					Driver: runtimeRootFSUserUnion, CapabilityVersion: runtimeRootFSCapabilityV6,
-					ConfigHash: strings.Repeat("a", 64), LowerImageDigest: "sha256:" + strings.Repeat("b", 64),
-				},
-				Capabilities: map[string]bool{
-					RuntimeCapabilityWorkspace: true, RuntimeCapabilityFullRoot: true,
-				},
-				ProductionEligible: true, BoundedSelectionEligible: true,
-			}, {
-				Profile: "workspace", ExecutionClass: "linux-full", Persistence: RuntimePersistenceWorkspace,
-				RootFS: RuntimeRootFSIdentity{
-					Driver: runtimeRootFSWorkspace, CapabilityVersion: runtimeWorkspaceCapability,
-					ConfigHash: strings.Repeat("c", 64), LowerImageDigest: "sha256:" + strings.Repeat("d", 64),
-				},
-				Capabilities:       map[string]bool{RuntimeCapabilityWorkspace: true},
-				ProductionEligible: false, BoundedSelectionEligible: false,
-			}},
-		}},
-	}
-	if err := validateRuntimeCapabilities(capabilities); err != nil {
+	if err != nil {
 		t.Fatal(err)
 	}
-	capabilities.Providers[0].Candidates[0].Persistence = ""
-	if err := validateRuntimeCapabilities(capabilities); err == nil {
-		t.Fatal("candidate without persistence error = nil")
+	if started.Cwd != "/workspace/web" || started.Sandbox != RuntimeSandboxWarm || result.Sandbox != RuntimeSandboxWarm {
+		t.Fatalf("started/result = %#v/%#v", started, result)
 	}
-	capabilities.Providers[0].Candidates[0].Persistence = RuntimePersistenceFullRoot
-	capabilities.Providers[0].Candidates[0].RootFS.CapabilityVersion = "drive9_rootfs.user_union.extent.v3"
-	if err := validateRuntimeCapabilities(capabilities); err == nil {
-		t.Fatal("v3 rootfs candidate error = nil")
+	if _, err := New(server.URL, "secret").Exec(t.Context(), ExecRequest{Command: "x", Argv: []string{"y"}}, ExecOptions{}); err == nil {
+		t.Fatal("Command and Argv together accepted")
 	}
-	capabilities.Providers[0].Candidates[0].RootFS.CapabilityVersion = runtimeRootFSCapabilityV6
-	capabilities.Providers[0].Candidates[0].Profile = "missing"
-	if err := validateRuntimeCapabilities(capabilities); err == nil {
-		t.Fatal("candidate outside provider profiles error = nil")
+}
+
+func TestExecBusyAndDisabledAreTyped(t *testing.T) {
+	busy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "7")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":"too many commands are already running (limit 4); try again shortly","code":"busy"}`))
+	}))
+	defer busy.Close()
+	_, err := New(busy.URL, "secret").Exec(t.Context(), ExecRequest{Argv: []string{"true"}}, ExecOptions{})
+	var busyErr *RuntimeBusyError
+	if !errors.As(err, &busyErr) || busyErr.RetryAfter != 7*time.Second || !IsRuntimeBusy(err) {
+		t.Fatalf("busy error = %T %v", err, err)
 	}
-	capabilities.Providers[0].Candidates[0].Profile = "default"
-	capabilities.Providers[0].Candidates[1].Capabilities[RuntimeCapabilityFullRoot] = true
-	if err := validateRuntimeCapabilities(capabilities); err == nil {
-		t.Fatal("workspace-only candidate with full-root capability error = nil")
+	disabled := httptest.NewServer(http.NotFoundHandler())
+	defer disabled.Close()
+	if _, err := New(disabled.URL, "secret").Exec(t.Context(), ExecRequest{Argv: []string{"true"}}, ExecOptions{}); !errors.Is(err, ErrRuntimeNotEnabled) {
+		t.Fatalf("disabled error = %v", err)
 	}
 }
 
@@ -334,7 +338,7 @@ func TestExecDoesNotFollowRedirect(t *testing.T) {
 		w.WriteHeader(http.StatusTemporaryRedirect)
 	}))
 	defer origin.Close()
-	_, err := New(origin.URL, "secret").Exec(t.Context(), ExecRequest{}, ExecOptions{})
+	_, err := New(origin.URL, "secret").Exec(t.Context(), ExecRequest{Argv: []string{"true"}}, ExecOptions{})
 	var start *RuntimeStartError
 	if !errors.As(err, &start) || redirected.Load() != 0 {
 		t.Fatalf("error/redirected = %T %v/%d", err, err, redirected.Load())
@@ -349,7 +353,7 @@ func TestExecRejectsOversizedFrame(t *testing.T) {
 	defer server.Close()
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
-	_, err := New(server.URL, "secret").Exec(ctx, ExecRequest{}, ExecOptions{})
+	_, err := New(server.URL, "secret").Exec(ctx, ExecRequest{Argv: []string{"true"}}, ExecOptions{})
 	if !IsRuntimeOutcomeUnknown(err) {
 		t.Fatalf("error = %v", err)
 	}
