@@ -174,7 +174,7 @@ drive9 journal verify run-42
 ### Run Commands Against a Workspace
 
 When the server enables it, `drive9 exec` runs a command in a sandbox with your
-workspace mounted at `/workspace`. Output streams live, writes are in Drive9
+drive mounted at `/workspace`. Output streams live, writes are in Drive9
 when it exits, and the exit status is the command's:
 
 ```bash
@@ -182,8 +182,8 @@ cd ~/drive9/repo && drive9 exec npm test   # inside a mount: your local edits, s
 drive9 exec -w repo 'npm ci && npm test'   # from anywhere
 ```
 
-Consecutive commands on the same workspace reuse a warm sandbox, so packages
-you install stay around between them; only `/workspace` is durable.
+Your consecutive commands reuse a warm sandbox, so packages you install stay
+around between them; only `/workspace` is durable.
 
 ## Architecture
 

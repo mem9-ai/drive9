@@ -140,7 +140,9 @@ try {
 ```
 
 - `command` runs through `/bin/sh -c`; use `argv` to skip the shell.
-- `cwd` is relative to `/workspace`. Only `/workspace` persists.
+- The whole drive is at `/workspace`; the command starts in
+  `/workspace/<workspace.root>` and `cwd` is relative to that. Only
+  `/workspace` persists.
 - Consecutive commands on the same workspace reuse a warm sandbox
   (`result.sandbox === "warm"`), so installed packages survive between them;
   processes do not. Pass `fresh: true` to start over in a new sandbox.

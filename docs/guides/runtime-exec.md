@@ -1,6 +1,6 @@
 # Remote exec
 
-`drive9 exec` runs a command in a sandbox with your Drive9 workspace mounted at
+`drive9 exec` runs a command in a sandbox with your Drive9 drive mounted at
 `/workspace`. You do not create, mount, or clean up a sandbox yourself.
 
 ```bash
@@ -14,18 +14,19 @@ The server must have remote exec enabled. Otherwise the command reports
 
 ## What to expect
 
-- **Where it runs.** Inside a local drive9 mount, `drive9 exec` uses that
-  mount's workspace and runs in the directory you are in, after uploading your
-  pending local changes so the command sees exactly your files. Elsewhere,
-  `/workspace` is the Drive9 directory given by `-w` (`repo`, `/repo`, and
-  `:/repo` all work; default `:/`). Relative `-C` paths are inside it.
+- **Where it runs.** Your whole drive is at `/workspace`. Inside a local
+  drive9 mount, the command runs in the matching directory, after your pending
+  local changes are uploaded so it sees exactly your files. Elsewhere, `-w`
+  picks the directory (`repo`, `/repo`, and `:/repo` all work, giving
+  `/workspace/repo`; default: the drive root). `-C` picks a subdirectory.
 - **Who it runs as.** A normal user, `agent`, with `HOME=/home/agent`, so git,
   pip, npm, and go work as usual. It can edit any workspace file but cannot
   become root.
 - **What persists.** Files under `/workspace` are in Drive9 when the command
   exits. Everything else in the sandbox is disposable.
-- **Warm sandboxes.** Consecutive commands on the same workspace with the same
-  API key reuse the sandbox for a while (10 minutes idle by default), so
+- **Warm sandboxes.** Your consecutive commands (same API key) reuse one
+  sandbox for a while, whichever directory they run in (10 minutes idle by
+  default), so
   packages you installed and files in `/tmp` are still there for the next
   command. Processes are not: each command starts with nothing left running
   from the previous one. `--fresh` starts over in a new sandbox; `-v` shows
@@ -54,8 +55,8 @@ The server must have remote exec enabled. Otherwise the command reports
 
 | Flag | Meaning |
 | --- | --- |
-| `-w, --workspace PATH` | Drive9 directory mounted at `/workspace` (default: the mount you are in, else `:/`) |
-| `-C, --cwd DIR` | working directory, relative to `/workspace` |
+| `-w, --workspace PATH` | Drive9 directory to run in (default: where you are in a local mount, else the drive root) |
+| `-C, --cwd DIR` | subdirectory of the workspace to run in |
 | `-e, --env KEY[=VALUE]` | set a variable; `KEY` alone copies it from your environment; repeatable |
 | `-t, --timeout DURATION` | stop the command after this long (the server may cap it) |
 | `--fresh` | start in a new sandbox instead of reusing the warm one |

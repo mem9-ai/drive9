@@ -3,7 +3,7 @@ const RUNTIME_CANCEL_TIMEOUT_MS = 20_000;
 
 export type RuntimeSandbox = "new" | "warm";
 
-/** The Drive9 directory mounted at /workspace. */
+/** Where the command runs: the whole drive is at /workspace, and the command starts in /workspace/<root>. */
 export interface RuntimeWorkspace {
   /** Drive9 directory such as "/repo". Defaults to "/". */
   root?: string;
@@ -19,7 +19,7 @@ export interface RuntimeWorkspace {
 export interface ExecRequest {
   argv?: string[];
   command?: string;
-  /** Relative to /workspace unless absolute. Defaults to /workspace. */
+  /** Relative to the root directory unless absolute. */
   cwd?: string;
   env?: Record<string, string>;
   workspace?: RuntimeWorkspace;

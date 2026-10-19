@@ -722,10 +722,10 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 		{
 			Name:    "exec",
 			Args:    "[flags] [--] command [arg...] | 'shell line'",
-			Summary: "run a command in a sandbox with your workspace at /workspace",
+			Summary: "run a command in a sandbox with your drive at /workspace",
 			Flags: []visualHelpFlag{
-				{Name: "-w, --workspace PATH", Desc: "Drive9 directory at /workspace; default: the drive9 mount you are in, else :/"},
-				{Name: "-C, --cwd DIR", Desc: "working directory, relative to /workspace"},
+				{Name: "-w, --workspace PATH", Desc: "Drive9 directory to run in; default: where you are in a local mount, else the drive root"},
+				{Name: "-C, --cwd DIR", Desc: "subdirectory of the workspace to run in"},
 				{Name: "-e, --env KEY[=VALUE]", Desc: "set a variable; KEY alone copies it from here; repeatable"},
 				{Name: "-t, --timeout DURATION", Desc: "stop the command after DURATION"},
 				{Name: "--fresh", Desc: "start in a new sandbox instead of reusing the warm one"},

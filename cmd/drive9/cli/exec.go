@@ -32,16 +32,16 @@ const execProgressDelay = 700 * time.Millisecond
 const execUsage = `usage: drive9 exec [flags] [--] command [arg...]
        drive9 exec [flags] 'shell command line'
 
-Run a command in a sandbox with your workspace mounted at /workspace.
+Run a command in a sandbox with your drive9 drive mounted at /workspace.
 Output streams live; the exit status is the command's.
 
-Inside a local drive9 mount, the command runs against that workspace in the
-matching directory, after your local changes are uploaded.
+Inside a local drive9 mount, the command runs in the matching directory,
+after your local changes are uploaded.
 
 flags:
-  -w, --workspace PATH     Drive9 directory mounted at /workspace (default: the
-                           mount you are in, else :/)
-  -C, --cwd DIR            working directory, relative to /workspace
+  -w, --workspace PATH     Drive9 directory to run in, e.g. repo (default: where
+                           you are in a local mount, else the drive root)
+  -C, --cwd DIR            subdirectory of the workspace to run in
   -e, --env KEY[=VALUE]    set an environment variable; KEY alone copies it from here
   -t, --timeout DURATION   stop the command after DURATION (default: server default)
       --fresh              start in a new sandbox instead of reusing the warm one

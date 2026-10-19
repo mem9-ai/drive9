@@ -29,7 +29,8 @@ const (
 // ErrRuntimeNotEnabled means the server does not offer remote exec.
 var ErrRuntimeNotEnabled = errors.New("remote exec is not enabled on this server")
 
-// RuntimeWorkspace selects the Drive9 directory mounted at /workspace.
+// RuntimeWorkspace selects where the command runs. The whole drive is at
+// /workspace; the command starts in /workspace/<Root>.
 type RuntimeWorkspace struct {
 	// Root is the Drive9 directory, for example "/repo". Empty means "/".
 	Root string `json:"root,omitempty"`
@@ -44,7 +45,7 @@ type RuntimeWorkspace struct {
 type ExecRequest struct {
 	Argv    []string `json:"argv"`
 	Command string   `json:"-"`
-	// Cwd is relative to /workspace unless absolute. Empty means /workspace.
+	// Cwd is relative to the Root directory unless absolute.
 	Cwd       string            `json:"cwd,omitempty"`
 	Env       map[string]string `json:"env,omitempty"`
 	Workspace RuntimeWorkspace  `json:"workspace"`
