@@ -134,7 +134,11 @@ func extentOpenFlags(keepCache bool) uint32 {
 		// defer upload errors to a Release that discards them.
 		return gofuse.FOPEN_KEEP_CACHE
 	}
-	return 0
+	// JuiceFS says the page cache must NOT survive the close: carry the
+	// facade-reserved marker so it stops ORing FOPEN_KEEP_CACHE back on
+	// (a plain 0 was indistinguishable from "plane had no opinion" and
+	// cancelled the close-to-open invalidation between mounts).
+	return fs.OpenFlagDropKernelCache
 }
 
 // juiceWriteOffset bumps O_APPEND kernel writes (which can arrive with
@@ -235,12 +239,17 @@ func (h *extentHandle) Sync(ctx context.Context) error {
 }
 
 func (h *extentHandle) Flush(ctx context.Context) error {
-	// Flush releases the FUSE lock owner and pushes the VFS flush.
+	// Flush releases the FUSE lock owner and pushes the VFS flush: the
+	// owner the kernel named in FLUSH (a close of one descriptor of a
+	// dup'ed fd) must reach VFS.Flush — JuiceFS only issues the close-time
+	// F_UNLCK for the owner it is given, and a hardcoded 0 left the
+	// original process's record locks held after close.
 	v := h.e.vfs()
 	if v == nil {
 		return nil
 	}
-	if errn := v.Flush(h.e.jfsCtx(h.callerOf(ctx)), h.ino, h.fh, 0); errn != 0 {
+	owner := fs.FlushOwnerOf(ctx)
+	if errn := v.Flush(h.e.jfsCtx(h.callerOf(ctx)), h.ino, h.fh, owner); errn != 0 {
 		return errno(errn)
 	}
 	return nil
@@ -338,7 +347,8 @@ func (e *Extent) openExtent(ctx context.Context, path string, ino uint64, flags 
 	e.rememberExtentIno(path, ino)
 	attr := &fs.Attr{Kind: fs.KindFile, Size: int64(length)}
 	if entry != nil && entry.Attr != nil {
-		attr.Mode = juiceTypeToStatMode(entry.Attr.Typ, entry.Attr.Mode) & 0o777
+		attr.Mode = juiceTypeToStatMode(entry.Attr.Typ, entry.Attr.Mode)
+		attr.Rdev = entry.Attr.Rdev
 		attr.Mtime = time.Unix(int64(entry.Attr.Atime), int64(entry.Attr.Atimensec))
 		attr.Nlink = entry.Attr.Nlink
 		attr.Uid = entry.Attr.Uid
@@ -348,6 +358,49 @@ func (e *Extent) openExtent(ctx context.Context, path string, ino uint64, flags 
 	h := &extentHandle{e: e, path: path, ino: jino, fh: vfsFh, flags: flags, openFlag: extentOpenFlags(keepCache), caller: caller}
 	e.trackLive(path)
 	return h, extentOpenFlags(keepCache), attr, nil
+}
+
+// adoptCreatedHandle builds a handle around the fh VFS.Create already
+// allocated (re-opening through Open would leak that reference).
+func (e *Extent) adoptCreatedHandle(path string, ino uint64, fh uint64, a *jfsmeta.Attr, flags uint32, caller fs.Caller) (fs.Handle, uint32, *fs.Attr, error) {
+	jino := jfsmeta.Ino(ino)
+	attr := &fs.Attr{Kind: fs.KindFile, Mode: 0o644}
+	keepCache := false
+	if a != nil {
+		e.vfs().UpdateLength(jino, a)
+		attr.Mode = juiceTypeToStatMode(a.Typ, a.Mode)
+		attr.Rdev = a.Rdev
+		attr.Size = int64(a.Length)
+		attr.Mtime = time.Unix(int64(a.Mtime), int64(a.Mtimensec))
+		attr.Nlink = a.Nlink
+		attr.Uid, attr.Gid, attr.HasOwner = a.Uid, a.Gid, true
+		keepCache = a.KeepCache
+	}
+	h := &extentHandle{e: e, path: path, ino: jino, fh: fh, flags: flags, openFlag: extentOpenFlags(keepCache), caller: caller}
+	e.trackLive(path)
+	return h, extentOpenFlags(keepCache), attr, nil
+}
+
+// extentHandleOf walks decorator wrappers to the extent's own handle
+// (FD-named setattr must reach the descriptor's BOUND inode — after a
+// rename replaced the path, the path-resolved inode is the replacement
+// file, and truncating it corrupted the new object).
+func extentHandleOf(h any) *extentHandle {
+	for range 8 {
+		if eh, ok := h.(*extentHandle); ok {
+			return eh
+		}
+		u, ok := h.(interface{ UnwrapHandle() fs.Handle })
+		if !ok {
+			return nil
+		}
+		inner := u.UnwrapHandle()
+		if inner == nil {
+			return nil
+		}
+		h = inner
+	}
+	return nil
 }
 
 func errno(e syscall.Errno) error {

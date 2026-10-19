@@ -40,8 +40,11 @@ func TestPortExtentOpenFlags(t *testing.T) {
 	if got := extentOpenFlags(true); got != gofuse.FOPEN_KEEP_CACHE {
 		t.Fatalf("keepCache open flags = %#x, want FOPEN_KEEP_CACHE", got)
 	}
-	if got := extentOpenFlags(false); got != 0 {
-		t.Fatalf("default open flags = %#x, want 0", got)
+	// Drop-cache is now an explicit facade marker (a plain 0 could not be
+	// distinguished from "no opinion" and cancelled close-to-open
+	// invalidation between mounts).
+	if got := extentOpenFlags(false); got != fs.OpenFlagDropKernelCache {
+		t.Fatalf("default open flags = %#x, want the drop-cache marker", got)
 	}
 }
 

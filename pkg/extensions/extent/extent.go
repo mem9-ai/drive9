@@ -12,6 +12,8 @@ import (
 	"sync"
 	"time"
 
+	jfsmeta "github.com/juicedata/juicefs/pkg/meta"
+
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/fs"
 )
@@ -156,9 +158,34 @@ func (e *Extent) rememberExtentIno(path string, ino uint64) {
 	e.inoMu.Unlock()
 }
 
-// trackLive/untrackLive maintain the open-handle registry.
-func (e *Extent) trackLive(path string)   { e.live.Store(path, struct{}{}) }
-func (e *Extent) untrackLive(path string) { e.live.Delete(path) }
+// trackLive/untrackLive maintain the open-handle registry by REFERENCE
+// COUNT: two handles on one path (two fds on the same -shm index) left a
+// single set entry, and either Release removed it — the survivor's open
+// state (WAL index mmap retention, unlink/rename opened hints) vanished
+// while the file was still in use.
+func (e *Extent) trackLive(path string) {
+	if n, ok := e.live.Load(path); ok {
+		if cnt, cok := n.(int); cok {
+			e.live.Store(path, cnt+1)
+			return
+		}
+	}
+	e.live.Store(path, 1)
+}
+
+func (e *Extent) untrackLive(path string) {
+	if n, ok := e.live.Load(path); ok {
+		if cnt, cok := n.(int); cok {
+			if cnt <= 1 {
+				e.live.Delete(path)
+			} else {
+				e.live.Store(path, cnt-1)
+			}
+			return
+		}
+	}
+	e.live.Delete(path)
+}
 
 // forgetIno drops a path's inode mapping and negative-cache entry: both
 // names around a mutation stop carrying evidence about the path.
@@ -178,8 +205,12 @@ func (e *Extent) retargetLive(oldPath, newPath string) {
 }
 
 func (e *Extent) hasLive(path string) bool {
-	_, ok := e.live.Load(path)
-	return ok
+	n, ok := e.live.Load(path)
+	if !ok {
+		return false
+	}
+	cnt, cok := n.(int)
+	return !cok || cnt > 0
 }
 
 func (e *Extent) cachedIno(path string) (uint64, bool) {
@@ -279,7 +310,17 @@ func (e *Extent) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, er
 	case fs.OpGetAttr, fs.OpLookup:
 		ino, ok := e.resolveIno(ctx, op.Path)
 		if !ok {
-			return next(ctx, op)
+			res, err := next(ctx, op)
+			// K12: a stat reply that already carries the extent identity
+			// routes the file even on mounts without ExtentPaths — the
+			// published inode costs no extra RPC, and dropping it left
+			// known extent files falling to the classic plane's plain GET
+			// (HTTP 422).
+			if err == nil && res.Attr != nil && res.Attr.ExtentIno != 0 {
+				e.rememberExtentIno(op.Path, res.Attr.ExtentIno)
+				return res, nil
+			}
+			return res, err
 		}
 		if e.rt.Load() == nil {
 			// Server says extent but the runtime is not built yet; build it
@@ -302,7 +343,18 @@ func (e *Extent) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, er
 			if err := e.ensureRuntime(); err != nil {
 				return fs.Result{}, err
 			}
-			ino, ok = e.createInVFS(ctx, op)
+			var fh uint64
+			var attr *jfsmeta.Attr
+			ino, fh, attr, ok = e.createInVFS(ctx, op)
+			if ok && fh != 0 {
+				// Reuse the fh VFS.Create allocated (a second Open leaked
+				// the first VFS file reference forever).
+				handle, openFlags, a, err := e.adoptCreatedHandle(op.Path, ino, fh, attr, op.Flags, op.Caller)
+				if err != nil {
+					return fs.Result{}, err
+				}
+				return fs.Result{Handle: handle, OpenFlags: openFlags, Attr: a}, nil
+			}
 		} else {
 			ino, ok = e.resolveIno(ctx, op.Path)
 		}
@@ -316,17 +368,26 @@ func (e *Extent) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, er
 		return fs.Result{Handle: handle, OpenFlags: openFlags, Attr: attr}, nil
 
 	case fs.OpSetAttr:
-		ino, ok := e.resolveIno(ctx, op.Path)
-		if !ok {
-			return next(ctx, op)
+		// FATTR_FH names a descriptor: use the handle's BOUND inode — the
+		// path may have been renamed over (its cache now holds the
+		// replacement's inode), and truncating through the path corrupted
+		// the new object instead of the caller's old fd.
+		ino := uint64(0)
+		if op.Handle != nil {
+			if eh := extentHandleOf(op.Handle); eh != nil {
+				ino = uint64(eh.ino)
+			}
 		}
-		if op.Size >= 0 {
-			return fs.Result{}, e.truncateIno(ctx, op.Path, ino, op.Size, op.Caller)
+		if ino == 0 {
+			var ok bool
+			ino, ok = e.resolveIno(ctx, op.Path)
+			if !ok {
+				return next(ctx, op)
+			}
 		}
-		// v1 extentSetAttr: mode/owner/times apply through the VFS in one
-		// call — falling through to the classic plane would chmod the
-		// file_nodes row while the jfs inode keeps its old mode, and every
-		// later stat (served from jfs) would report the chmod as a no-op.
+		// Size and the metadata fields apply TOGETHER: a truncate that
+		// early-returned dropped a same-request chmod/chown/mtime (the
+		// kernel merges kill-priv mode changes into truncates).
 		return e.setAttrViaVFS(ctx, op, ino)
 
 	case fs.OpMkdir:
@@ -384,13 +445,25 @@ func (e *Extent) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, er
 			break
 		}
 		if ino, ok := e.resolveIno(ctx, op.Path); ok {
-			if h, _, _, err := e.openExtent(ctx, op.Path, ino, 0, op.Caller); err == nil {
-				n, rerr := h.Read(ctx, op.Offset, make([]byte, op.Limit))
-				if rerr != nil {
+			if h, _, attr, err := e.openExtent(ctx, op.Path, ino, 0, op.Caller); err == nil {
+				// The adapter's contract returns Result.Data: Limit=0
+				// means the WHOLE file (localize's .gitignore reads rely
+				// on it), and the bytes read must actually ride the reply.
+				size := op.Limit
+				if size <= 0 && attr != nil && attr.Size > 0 {
+					size = attr.Size
+				}
+				if size < 0 {
+					size = 0
+				}
+				buf := make([]byte, size)
+				n, rerr := h.Read(ctx, op.Offset, buf)
+				if rerr != nil && n == 0 {
+					_ = h.Release(ctx)
 					return fs.Result{}, rerr
 				}
 				_ = h.Release(ctx)
-				return fs.Result{Written: uint32(n)}, nil
+				return fs.Result{Data: buf[:n], Written: uint32(n)}, nil
 			}
 		}
 	}

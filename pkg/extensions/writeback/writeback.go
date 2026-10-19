@@ -685,6 +685,15 @@ func (w *Writeback) nextMutSeq() uint64 {
 // Queue exposes the commit queue for the mount's queue-stats probe.
 func (w *Writeback) Queue() *CommitQueue { return w.queue }
 
+// QueuePendingStats reports the queue's pending depth and bytes for the
+// facade's drain snapshot (nil queue answers zero).
+func (w *Writeback) QueuePendingStats() (int, int64) {
+	if w.queue == nil {
+		return 0, 0
+	}
+	return w.queue.PendingStats()
+}
+
 // UploaderSnapshot reports the .dat/.meta track depths for the
 // continuous-perf queue sample (nil-safe).
 func (w *Writeback) UploaderSnapshot() (queued, inFlight int) {

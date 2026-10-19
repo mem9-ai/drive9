@@ -67,7 +67,11 @@ func isSQLiteWALIndexPath(localPath string) bool {
 
 func attrFromJuice(a *jfsmeta.Attr) fs.Attr {
 	attr := fs.Attr{
-		Mode:     juiceTypeToStatMode(a.Typ, a.Mode) & 0o777,
+		// The FULL mode survives (type bits for FIFO/device/socket nodes,
+		// SUID/SGID/sticky): truncating to 0777 retyped special nodes as
+		// regular files and dropped privilege bits from chmod replies.
+		Mode:     juiceTypeToStatMode(a.Typ, a.Mode),
+		Rdev:     a.Rdev,
 		Size:     int64(a.Length),
 		Mtime:    time.Unix(int64(a.Mtime), int64(a.Mtimensec)),
 		Nlink:    a.Nlink,
@@ -92,27 +96,30 @@ func attrFromJuice(a *jfsmeta.Attr) fs.Attr {
 // drive9 projection path so the engine publishes the file_nodes row (v1:
 // without it, the new extent file is invisible to listings, other mounts,
 // and re-mounts).
-func (e *Extent) createInVFS(ctx context.Context, op *fs.Op) (uint64, bool) {
+func (e *Extent) createInVFS(ctx context.Context, op *fs.Op) (uint64, uint64, *jfsmeta.Attr, bool) {
 	v := e.vfs()
 	if v == nil {
-		return 0, false
+		return 0, 0, nil, false
 	}
 	jctx := e.jfsCtxWithKeyedPath(op.Caller, e.remotePath(op.Path))
 	parent, errn := e.ensureParent(jctx, pathutil.DirOf(op.Path))
 	if errn != 0 {
-		return 0, false
+		return 0, 0, nil, false
 	}
 	mode := uint16(op.Mode & 0o777)
 	if mode == 0 {
 		mode = 0o644
 	}
-	entry, _, errn := v.Create(jctx, parent, pathutil.BaseName(op.Path), mode, 0, op.Flags)
+	// The VFS fh returned here is REUSED by the handle: dropping it and
+	// re-opening through openExtent leaked the first VFS file reference
+	// forever (Release only closed the second fh).
+	entry, fh, errn := v.Create(jctx, parent, pathutil.BaseName(op.Path), mode, 0, op.Flags)
 	if errn != 0 || entry == nil {
-		return 0, false
+		return 0, 0, nil, false
 	}
 	ino := uint64(entry.Inode)
 	e.rememberExtentIno(op.Path, ino)
-	return ino, true
+	return ino, fh, entry.Attr, true
 }
 
 // ensureParent walks from the extent mount root, creating missing
@@ -127,6 +134,11 @@ func (e *Extent) ensureParent(jctx vfs.LogContext, dirPath string) (jfsmeta.Ino,
 		return 0, syscall.EIO
 	}
 	root := jfsmeta.RootInode
+	// The walk starts from the TENANT root and follows the remote path
+	// (RemoteRoot prefix included): projecting the local path directly
+	// made every subdirectory mount resolve "/" to the tenant RootInode,
+	// so two mounts created/opened the SAME (parent=1, name) node.
+	dirPath = e.remotePath(dirPath)
 	if dirPath == "/" || dirPath == "" {
 		return root, 0
 	}
@@ -138,7 +150,7 @@ func (e *Extent) ensureParent(jctx vfs.LogContext, dirPath string) (jfsmeta.Ino,
 		acc += "/" + seg
 		entry, errn := v.Lookup(jctx, cur, seg)
 		if errn == syscall.ENOENT {
-			mode := uint16(e.mirroredDirMode(acc))
+			mode := uint16(e.mirroredDirMode(strings.TrimPrefix(acc, e.root)))
 			mkdirCtx := vfs.NewLogContext(e.jfsMetaCtx(caller).WithValue(jfsmeta.Drive9PathKey, e.remotePath(acc)+"/"))
 			newEntry, mkErrn := v.Mkdir(mkdirCtx, cur, seg, mode, 0)
 			if mkErrn != 0 && mkErrn != syscall.EEXIST {
@@ -263,7 +275,10 @@ func (e *Extent) mknodSpecialInVFS(ctx context.Context, op *fs.Op) (fs.Result, e
 	if errn != 0 {
 		return fs.Result{}, errno(errn)
 	}
-	mode := uint16(op.Mode & 0o7777)
+	// The FULL mode rides into the VFS (S_IFMT included): JuiceFS's
+	// get_filetype defaults a typeless mode to a regular file, so masking
+	// the type bits turned mkfifo/mknod into plain-file creates.
+	mode := uint16(op.Mode)
 	entry, errn := v.Mknod(jctx, parent, pathutil.BaseName(op.Path), mode, 0, op.Rdev)
 	if errn == syscall.EEXIST {
 		return fs.Result{}, syscall.EEXIST
@@ -345,6 +360,14 @@ func (e *Extent) setAttrViaVFS(ctx context.Context, op *fs.Op, ino uint64) (fs.R
 	mode, uid, gid := uint32(0), uint32(0), uint32(0)
 	atime, mtime := int64(0), int64(0)
 	atimens, mtimens := uint32(0), uint32(0)
+	size := uint64(0)
+	if op.Size >= 0 {
+		// Size rides the SAME SetAttr call: an early-return truncate
+		// dropped same-request chmod/chown/mtime fields while still
+		// reporting success.
+		set |= int(gofuse.FATTR_SIZE)
+		size = uint64(op.Size)
+	}
 	if op.HasMode {
 		set |= int(gofuse.FATTR_MODE)
 		mode = op.Mode & 0o7777
@@ -368,7 +391,7 @@ func (e *Extent) setAttrViaVFS(ctx context.Context, op *fs.Op, ino uint64) (fs.R
 		return e.statViaVFS(ctx, op.Path, ino)
 	}
 	jctx := e.jfsCtx(op.Caller)
-	entry, errn := v.SetAttr(jctx, jfsmeta.Ino(ino), set, 0, mode, uid, gid, atime, mtime, atimens, mtimens, 0)
+	entry, errn := v.SetAttr(jctx, jfsmeta.Ino(ino), set, 0, mode, uid, gid, atime, mtime, atimens, mtimens, size)
 	if errn != 0 {
 		return fs.Result{}, errno(errn)
 	}

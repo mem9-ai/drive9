@@ -128,7 +128,7 @@ type FS struct {
 	// only a SPONTANEOUS serve exit with the row still present is the
 	// abnormal /dev/fuse disconnect the supervisor restarts.
 	shutdownRequested atomic.Bool
-	started   bool
+	started           bool
 
 	uid uint32
 	gid uint32
@@ -791,20 +791,17 @@ func (f *FS) snapshotDrainPending(resp *mountcontrol.DrainResponse) {
 	}
 }
 
-// chainPendingStats asks the write plane for queue depths.
+// chainPendingStats asks the write plane for queue depths. The
+// capability is the stats method itself: matching on Queue()'s return
+// type can never succeed (Go return types are invariant, so the real
+// *CommitQueue does not implement an interface{} variant) and the drain
+// snapshot always answered zero.
 func (f *FS) chainPendingStats() (pending int, bytes int64, ok bool) {
 	for _, h := range f.chain.Handlers() {
 		if q, is := h.(interface {
-			Queue() interface {
-				Pending() int
-				PendingStats() (int, int64)
-			}
+			QueuePendingStats() (int, int64)
 		}); is {
-			queue := q.Queue()
-			if queue == nil {
-				return 0, 0, true
-			}
-			pending, bytes = queue.PendingStats()
+			pending, bytes = q.QueuePendingStats()
 			return pending, bytes, true
 		}
 	}
@@ -2271,7 +2268,12 @@ func (f *FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse.Open
 	// DIRECT_IO or a bypass window is armed — the two are mutually
 	// exclusive replies, never ORed together.
 	out.OpenFlags = res.OpenFlags
-	if !f.bypass.active(input.NodeId) && out.OpenFlags&gofuse.FOPEN_DIRECT_IO == 0 {
+	// A plane that explicitly requires the page cache dropped at close
+	// (JuiceFS KeepCache=false between mounts sharing a file) wins over
+	// the default: strip the marker and leave KEEP_CACHE off.
+	dropCache := out.OpenFlags&fs.OpenFlagDropKernelCache != 0
+	out.OpenFlags &^= fs.OpenFlagDropKernelCache
+	if !dropCache && !f.bypass.active(input.NodeId) && out.OpenFlags&gofuse.FOPEN_DIRECT_IO == 0 {
 		out.OpenFlags |= gofuse.FOPEN_KEEP_CACHE
 	}
 	if f.bypass.active(input.NodeId) {
@@ -2377,7 +2379,10 @@ func (f *FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) gofuse.Status 
 	}
 	if h := f.openHandle(input.Fh); h != nil {
 		unlock := f.pathLocks.HandleLock(input.Fh)
-		err := h.Flush(ctx)
+		// The kernel's lock owner rides the context: extent close-time
+		// F_UNLCK must target exactly this owner (dup + close of one
+		// descriptor), not whoever opened the handle.
+		err := h.Flush(fs.WithFlushOwner(ctx, input.LockOwner))
 		unlock()
 		return fs.StatusOf(err)
 	}

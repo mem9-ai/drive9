@@ -128,3 +128,29 @@ func TestPortRootAccessMaskPOSIXRule(t *testing.T) {
 		t.Fatalf("root O_RDWR of 0600 = %v, want OK", st)
 	}
 }
+
+// qiffang twentieth round: the facade honors an explicit drop-cache
+// request instead of ORing KEEP_CACHE back on.
+func TestPortFacadeHonorsDropCacheMarker(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/f", []byte("data"))
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	f, _ := facadeOverCore(t, ts)
+	entryOut := gofuse.EntryOut{}
+	if st := f.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "f", &entryOut); st != gofuse.OK {
+		t.Fatalf("lookup: %v", st)
+	}
+	// The core plane returns no flags: KEEP_CACHE applies (default).
+	hdr := gofuse.InHeader{NodeId: entryOut.NodeId}
+	out := gofuse.OpenOut{}
+	if st := f.Open(nil, &gofuse.OpenIn{InHeader: hdr, Flags: 0}, &out); st != gofuse.OK {
+		t.Fatalf("open: %v", st)
+	}
+	if out.OpenFlags&gofuse.FOPEN_KEEP_CACHE == 0 {
+		t.Fatalf("plain open flags = %#x, want KEEP_CACHE default", out.OpenFlags)
+	}
+	if out.OpenFlags&fs.OpenFlagDropKernelCache != 0 {
+		t.Fatalf("facade leaked the drop-cache marker to the kernel: %#x", out.OpenFlags)
+	}
+}

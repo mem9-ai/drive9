@@ -1,5 +1,7 @@
 package fs
 
+import "context"
+
 import (
 	"time"
 )
@@ -32,6 +34,23 @@ type Context struct {
 	// Bypass arms short per-inode kernel-cache bypass windows; nil leaves
 	// the slot empty.
 	Bypass CacheBypassArmer
+}
+
+// flushOwnerKey carries the FUSE FLUSH lock owner across the handle
+// boundary: extensions that own POSIX record locks need it at close time.
+type flushOwnerKey struct{}
+
+// WithFlushOwner attaches the kernel's FLUSH lock owner to the context.
+func WithFlushOwner(ctx context.Context, owner uint64) context.Context {
+	return context.WithValue(ctx, flushOwnerKey{}, owner)
+}
+
+// FlushOwnerOf extracts the FLUSH lock owner (0 = none carried).
+func FlushOwnerOf(ctx context.Context) uint64 {
+	if v, ok := ctx.Value(flushOwnerKey{}).(uint64); ok {
+		return v
+	}
+	return 0
 }
 
 // InodeTable is the identity authority shared by the kernel facade and the

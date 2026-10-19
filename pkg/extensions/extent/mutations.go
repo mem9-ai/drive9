@@ -14,26 +14,6 @@ import (
 	"github.com/mem9-ai/drive9/pkg/pathutil"
 )
 
-// truncateIno applies a size change through the VFS.
-func (e *Extent) truncateIno(ctx context.Context, path string, ino uint64, size int64, caller fs.Caller) error {
-	ctx = contextWithCaller(ctx, caller)
-	if err := e.ensureRuntime(); err != nil {
-		return syscall.EIO
-	}
-	v := e.vfs()
-	if v == nil {
-		return syscall.EIO
-	}
-	entry, errn := v.SetAttr(e.jfsCtx(callerFrom(ctx)), jfsmeta.Ino(ino), int(jfsmeta.SetAttrSize), 0, 0, 0, 0, 0, 0, 0, 0, uint64(size))
-	if errn != 0 {
-		return errno(errn)
-	}
-	if entry != nil && entry.Attr != nil {
-		e.rememberExtentIno(path, ino)
-	}
-	return nil
-}
-
 // unlinkIno removes the meta edge through the VFS, carrying the
 // still-open flag so the server keeps the projection for live handles.
 func (e *Extent) unlinkIno(ctx context.Context, path string, ino uint64, caller fs.Caller) error {

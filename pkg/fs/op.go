@@ -345,6 +345,13 @@ type FsStat struct {
 	NameLen   uint32 // maximum file name length
 }
 
+// OpenFlagDropKernelCache is a facade-reserved reply bit: the data plane
+// requires the kernel to drop the page cache at close (close-to-open
+// invalidation, e.g. JuiceFS KeepCache=false). The facade strips the bit
+// and must not OR FOPEN_KEEP_CACHE back on; a plain zero reply cannot
+// express this ("no opinion" and "drop" collapse).
+const OpenFlagDropKernelCache uint32 = 1 << 31
+
 // OpenFlags is the normalized open/create flag set for OpCreate and
 // Filesystem.Open.
 type OpenFlags uint32
