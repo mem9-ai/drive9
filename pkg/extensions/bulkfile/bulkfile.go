@@ -112,8 +112,11 @@ func (b *Bulkfile) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 		}
 		h := &streamHandle{
 			b: b, path: op.Path,
-			mode:  op.Mode & 0o777,
-			below: fs.HandlerFilesystem(next),
+			mode: op.Mode & 0o777,
+			// An O_CREAT open carries the request's mode, 000 included; a
+			// plain open of an existing file leaves it unknown.
+			modeKnown: op.Flags&uint32(syscall.O_CREAT) != 0 || op.Mode&0o7777 != 0,
+			below:     fs.HandlerFilesystem(next),
 		}
 		h.openFlags = op.Flags&^uint32(syscall.O_TRUNC|syscall.O_EXCL) | uint32(syscall.O_CREAT)
 		innerOp := *op

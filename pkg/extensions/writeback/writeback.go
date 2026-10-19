@@ -376,14 +376,18 @@ func New(opts Options) (*Writeback, error) {
 		}
 		up := NewWriteBackUploader(opts.Client, w.wbCache, workers, root)
 		up.OnSuccess = func(meta staging.WriteBackMeta, committedRev int64, gens StagingGens) {
-			// v1 onWriteBackUploadSuccess: seed the read cache with the
-			// landed image (same replica-lag reasoning as the queue path).
+			// meta.Path is ALREADY the write-back cache's local key (the
+			// uploader maps to the remote name only at the HTTP boundary).
+			// Running it through the remote→local translation again
+			// rewrote the settle target (root "/": "/team/f" became "/";
+			// root "/team": "/f"), so landedAt/inode-settle updated the
+			// wrong path and the uploaded file missed its own landing.
 			if committedRev > 0 {
-				w.landedAt(w.localPathOf(meta.Path), committedRev, meta.Size)
+				w.landedAt(meta.Path, committedRev, meta.Size)
 			}
 			if w.commitSeeder != nil && committedRev > 0 && meta.Size > 0 && w.commitSeedAllowed(meta.Size) {
 				if data, derr := w.wbCache.Get(meta.Path); derr && int64(len(data)) == meta.Size {
-					w.commitSeeder(w.localPathOf(meta.Path), data, committedRev)
+					w.commitSeeder(meta.Path, data, committedRev)
 				}
 			}
 			if opts.Events != nil {
@@ -391,8 +395,7 @@ func New(opts Options) (*Writeback, error) {
 				// the committed entry in place (inode size + dir cache via
 				// Landed carrying the size) — never the parent listing, the
 				// kernel view, or unrelated cached data.
-				local := w.localPathOf(meta.Path)
-				opts.Events.Emit(fs.Event{Kind: fs.EventLanded, Path: local, Rev: committedRev, Size: meta.Size})
+				opts.Events.Emit(fs.Event{Kind: fs.EventLanded, Path: meta.Path, Rev: committedRev, Size: meta.Size})
 			}
 		}
 		w.uploader = up
@@ -2448,14 +2451,6 @@ func (w *Writeback) remotePath(p string) string {
 		return w.root
 	}
 	return w.root + p
-}
-
-// localPathOf maps a remote (uploader/cache) path back onto the view.
-func (w *Writeback) localPathOf(rp string) string {
-	if w.root == "/" || rp == w.root {
-		return "/"
-	}
-	return strings.TrimPrefix(rp, w.root)
 }
 
 // track registers an open writer by path (newest wins, matching 's

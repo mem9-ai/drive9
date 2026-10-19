@@ -123,6 +123,8 @@ type Core struct {
 	// readFlight dedups concurrent remote reads of one range:
 	// thundering-herd FUSE reads on an uncached file collapse into a
 	// single HTTP fetch.
+	// bus announces view resets (401) to the facade.
+	bus        *fs.EventBus
 	readFlight *singleflight.SingleFlight
 	// readSlots bounds concurrent remote reads (default 24).
 	readSlots chan struct{}
@@ -180,6 +182,26 @@ func New(cl *client.Client, opts Options) (*Core, error) {
 		trustLocalEvents:             trustLocal}, nil
 }
 
+// AttachEvents wires the mount's event bus: an HTTP 401 means the
+// credential (or the tenant it points at) changed underneath the mount, so
+// the whole view is untrusted and the facade must reset it before the
+// caller sees EACCES.
+func (c *Core) AttachEvents(bus *fs.EventBus) {
+	c.bus = bus
+}
+
+// mapErr folds backend failures into fs identities, announcing a view
+// reset on 401.
+func (c *Core) mapErr(err error) error {
+	if err != nil && c.bus != nil {
+		var se *client.StatusError
+		if errors.As(err, &se) && se.StatusCode == http.StatusUnauthorized {
+			c.bus.Emit(fs.Event{Kind: fs.EventCheckout, Path: "/"})
+		}
+	}
+	return mapErr(err)
+}
+
 // Attach wires the facade-owned namespace cache into the terminal so
 // Lookups/GetAttrs resolve from fresh listings without a remote stat.
 func (c *Core) Attach(dirCache NamespaceCache) {
@@ -229,7 +251,7 @@ func (c *Core) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, erro
 	case fs.OpMkdir:
 		mode := op.Mode & 0o7777
 		if err := c.mkdirRemote(ctx, op.Path, mode); err != nil {
-			return fs.Result{}, mapErr(err)
+			return fs.Result{}, c.mapErr(err)
 		}
 		return fs.Result{Attr: &fs.Attr{Kind: fs.KindDir, Mode: mode}}, nil
 	case fs.OpRmdir:
@@ -239,7 +261,7 @@ func (c *Core) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, erro
 			if client.IsNotFound(err) {
 				return fs.Result{}, nil
 			}
-			return fs.Result{}, mapErr(err)
+			return fs.Result{}, c.mapErr(err)
 		}
 		return fs.Result{}, nil
 	case fs.OpUnlink:
@@ -247,17 +269,17 @@ func (c *Core) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, erro
 			if client.IsNotFound(err) {
 				return fs.Result{}, nil
 			}
-			return fs.Result{}, mapErr(err)
+			return fs.Result{}, c.mapErr(err)
 		}
 		return fs.Result{}, nil
 	case fs.OpRename:
 		if err := c.renameRemote(ctx, op.Path, op.Path2); err != nil {
-			return fs.Result{}, mapErr(err)
+			return fs.Result{}, c.mapErr(err)
 		}
 		return fs.Result{}, nil
 	case fs.OpSymlink:
 		if err := c.symlinkRemote(ctx, op.Target, op.Path); err != nil {
-			return fs.Result{}, mapErr(err)
+			return fs.Result{}, c.mapErr(err)
 		}
 		// Answer from the created row (v1 stats after create): the reply's
 		// mtime seeds the kernel entry, and a synthesized now() there
@@ -265,25 +287,25 @@ func (c *Core) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, erro
 		// served mtime backwards and git flags the link modified.
 		st, err := c.cl.StatCtx(ctx, c.remotePath(op.Path))
 		if err != nil {
-			return fs.Result{}, mapErr(err)
+			return fs.Result{}, c.mapErr(err)
 		}
 		return fs.Result{Attr: attrOf(st)}, nil
 	case fs.OpReadlink:
 		// drive9 stores a symlink's target as the link's file content.
 		data, err := c.fetchRemote(ctx, c.remotePath(op.Path), 0, 0)
 		if err != nil {
-			return fs.Result{}, mapErr(err)
+			return fs.Result{}, c.mapErr(err)
 		}
 		return fs.Result{Data: data}, nil
 	case fs.OpLink:
 		if err := c.hardlinkRemote(ctx, op.Path, op.Path2); err != nil {
-			return fs.Result{}, mapErr(err)
+			return fs.Result{}, c.mapErr(err)
 		}
 		// The kernel sizes the new name from this reply; a missing Attr
 		// reads as an empty file.
 		st, err := c.cl.StatCtx(ctx, c.remotePath(op.Path2))
 		if err != nil {
-			return fs.Result{}, mapErr(err)
+			return fs.Result{}, c.mapErr(err)
 		}
 		return fs.Result{Attr: attrOf(st)}, nil
 	case fs.OpMknod:
@@ -311,13 +333,13 @@ func (c *Core) WriteSync(ctx context.Context, path string, off int64, data []byt
 		st, err := c.cl.StatCtx(ctx, rp)
 		if err != nil {
 			if !client.IsNotFound(err) {
-				return mapErr(err)
+				return c.mapErr(err)
 			}
 			if off != 0 {
 				// write past EOF on a missing path: materialize an empty
 				// file first, then retry the stat
 				if _, cerr := c.cl.CreateFileCtx(ctx, rp); cerr != nil && !errors.Is(cerr, client.ErrConflict) {
-					return mapErr(cerr)
+					return c.mapErr(cerr)
 				}
 				continue
 			}
@@ -325,13 +347,13 @@ func (c *Core) WriteSync(ctx context.Context, path string, off int64, data []byt
 				if errors.Is(werr, client.ErrConflict) {
 					continue // lost the create race; retry as an existing file
 				}
-				return mapErr(werr)
+				return c.mapErr(werr)
 			}
 			if mode != 0 {
 				if err := retryPostUploadMode(ctx, func() error {
 					return c.cl.ChmodCtx(ctx, rp, mode&0o777)
 				}); err != nil {
-					return mapErr(err)
+					return c.mapErr(err)
 				}
 			}
 			return nil
@@ -346,7 +368,7 @@ func (c *Core) WriteSync(ctx context.Context, path string, off int64, data []byt
 				continue // revision moved under us; re-stat and re-patch
 			}
 			c.recordRemote("write", start, werr, uint64(len(content)))
-			return mapErr(werr)
+			return c.mapErr(werr)
 		}
 		c.recordRemote("write", start, nil, uint64(len(content)))
 		if mode == 0 && st.HasMode && st.Mode&0o7777 != 0o644 {
@@ -415,7 +437,7 @@ func (h *SyncHandle) RetargetTo(newPath string) {
 func (h *SyncHandle) Read(ctx context.Context, off int64, dest []byte) (int, error) {
 	data, err := h.core.fetchRemote(ctx, h.core.remotePath(h.path), off, int64(len(dest)))
 	if err != nil {
-		return 0, mapErr(err)
+		return 0, h.core.mapErr(err)
 	}
 	return copy(dest, data), nil
 }
@@ -474,7 +496,7 @@ func (c *Core) statOp(ctx context.Context, path string) (fs.Result, error) {
 		if attr, ok := c.statFromParentListing(ctx, path, err); ok {
 			return fs.Result{Attr: attr}, nil
 		}
-		return fs.Result{}, mapErr(err)
+		return fs.Result{}, c.mapErr(err)
 	}
 	return fs.Result{Attr: attrOf(st)}, nil
 }
@@ -609,7 +631,7 @@ func (c *Core) statWithTransientRetry(ctx context.Context, path string) (*client
 func (c *Core) listOp(ctx context.Context, dir string) (fs.Result, error) {
 	infos, err := c.cl.ListCtx(ctx, c.remotePath(dir))
 	if err != nil {
-		return fs.Result{}, mapErr(err)
+		return fs.Result{}, c.mapErr(err)
 	}
 	entries := make([]fs.Entry, 0, len(infos))
 	for _, fi := range infos {
@@ -682,7 +704,7 @@ func (c *Core) createOp(ctx context.Context, op *fs.Op) (fs.Result, error) {
 							if err == nil {
 								st, statErr := c.cl.StatCtx(ctx, rp)
 								if statErr != nil {
-									return fs.Result{}, mapErr(statErr)
+									return fs.Result{}, c.mapErr(statErr)
 								}
 								return fs.Result{Attr: attrOf(st), Handle: &SyncHandle{core: c, path: op.Path}}, nil
 							}
@@ -693,7 +715,7 @@ func (c *Core) createOp(ctx context.Context, op *fs.Op) (fs.Result, error) {
 						time.Sleep(250 * time.Millisecond)
 					}
 				}
-				return fs.Result{}, mapErr(err)
+				return fs.Result{}, c.mapErr(err)
 			}
 			// An explicit create mode is always meaningful (mode 0 must be
 			// applied, not skipped: pjdfstest creates 00-mode files); the
@@ -704,12 +726,12 @@ func (c *Core) createOp(ctx context.Context, op *fs.Op) (fs.Result, error) {
 					// wire (remoteChmodMode); SUID/SGID stays local.
 					return c.cl.ChmodCtx(ctx, rp, mode&0o777)
 				}); err != nil {
-					return fs.Result{}, mapErr(err)
+					return fs.Result{}, c.mapErr(err)
 				}
 			}
 			st, statErr = c.cl.StatCtx(ctx, rp)
 			if statErr != nil {
-				return fs.Result{}, mapErr(statErr)
+				return fs.Result{}, c.mapErr(statErr)
 			}
 		}
 	} else if !exists {
@@ -752,7 +774,7 @@ func (c *Core) setAttrOp(ctx context.Context, op *fs.Op) (fs.Result, error) {
 		})
 		cancel()
 		if err != nil && !c.chmodNotFoundCanStayLocal(rp, target, err) {
-			return fs.Result{}, mapErr(err)
+			return fs.Result{}, c.mapErr(err)
 		}
 		attr.Mode = mode
 		// The chmod bumps the remote revision; the probed (cached) rev is
@@ -784,7 +806,7 @@ func (c *Core) setAttrOp(ctx context.Context, op *fs.Op) (fs.Result, error) {
 			var err error
 			old, err = c.cl.ReadAtCtx(ctx, rp, 0, keep)
 			if err != nil {
-				return fs.Result{}, mapErr(err)
+				return fs.Result{}, c.mapErr(err)
 			}
 		}
 		next := make([]byte, op.Size)
@@ -817,11 +839,11 @@ func (c *Core) setAttrOp(ctx context.Context, op *fs.Op) (fs.Result, error) {
 				break
 			}
 			if !errors.Is(werr, client.ErrConflict) {
-				return fs.Result{}, mapErr(werr)
+				return fs.Result{}, c.mapErr(werr)
 			}
 		}
 		if werr != nil {
-			return fs.Result{}, mapErr(werr)
+			return fs.Result{}, c.mapErr(werr)
 		}
 		attr.Size = op.Size
 		if st, serr := c.remoteStatDetached(rp); serr == nil && st != nil {
@@ -852,7 +874,7 @@ func (c *Core) mknodRegular(ctx context.Context, op *fs.Op) (fs.Result, error) {
 	_, createErr := c.cl.CreateFileCtx(commitCtx, rp)
 	cancel()
 	if createErr != nil {
-		return fs.Result{}, mapErr(createErr)
+		return fs.Result{}, c.mapErr(createErr)
 	}
 	mode := op.Mode & 0o777
 	if mode == 0 {
@@ -864,13 +886,13 @@ func (c *Core) mknodRegular(ctx context.Context, op *fs.Op) (fs.Result, error) {
 			return c.cl.ChmodCtx(ctx, rp, mode)
 		}); err != nil {
 			rollback()
-			return fs.Result{}, mapErr(err)
+			return fs.Result{}, c.mapErr(err)
 		}
 	}
 	st, err := c.cl.StatCtx(ctx, rp)
 	if err != nil {
 		rollback()
-		return fs.Result{}, mapErr(err)
+		return fs.Result{}, c.mapErr(err)
 	}
 	return fs.Result{Attr: attrOf(st)}, nil
 }
@@ -880,7 +902,7 @@ func (c *Core) mknodRegular(ctx context.Context, op *fs.Op) (fs.Result, error) {
 func (c *Core) readOp(ctx context.Context, path string, off, limit int64) (fs.Result, error) {
 	data, err := c.fetchRemote(ctx, c.remotePath(path), off, limit)
 	if err != nil {
-		return fs.Result{}, mapErr(err)
+		return fs.Result{}, c.mapErr(err)
 	}
 	if limit <= 0 && off > 0 {
 		if off >= int64(len(data)) {
@@ -958,7 +980,7 @@ func (c *Core) mergeAt(ctx context.Context, rp string, st *client.StatResult, of
 	}
 	old, err := c.cl.ReadCtx(ctx, rp)
 	if err != nil {
-		return nil, mapErr(err)
+		return nil, c.mapErr(err)
 	}
 	end := off + int64(len(data))
 	if end > int64(len(old)) {
@@ -1226,7 +1248,7 @@ func (c *Core) renameMissingTargetFallback(ctx context.Context, oldP, newP strin
 	if derr := c.deleteRemote(ctx, oldP, false); derr != nil && !client.IsNotFound(derr) {
 		// v1: the create already committed; surface the delete failure
 		// instead of silently leaving the source behind.
-		return true, mapErr(derr)
+		return true, c.mapErr(derr)
 	}
 	return true, nil
 }

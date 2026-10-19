@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/client"
@@ -80,6 +81,9 @@ type Cache struct {
 	// retarget them (and their prefetchers) onto the new path — the
 	// handle keeps serving, but its block requests must follow the name.
 	open sync.Map // *cachingHandle → struct{}
+	// epoch advances on every whole-view reset: a read dispatched before a
+	// checkout must not admit its pre-reset bytes when it completes after.
+	epoch atomic.Uint64
 	// sidecars tracks open -wal/-journal handles (v1 sqlite routing).
 	sidecars sidecarTracker
 }
@@ -218,6 +222,7 @@ func New(opts Options) (*Cache, error) {
 // pre-reset image to live descriptors (v1 resetMountViewWithInitialSync
 // invalidated each handle's Prefetch, cancelling in-flight fetches).
 func (c *Cache) invalidateAllTiers() {
+	c.epoch.Add(1)
 	c.mem.InvalidateAll()
 	if c.dsk != nil {
 		c.dsk.InvalidateAll()
@@ -410,6 +415,7 @@ func (c *Cache) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 			}
 			return fs.Result{Data: data}, nil
 		}
+		epoch := c.epoch.Load()
 		res, err := next(ctx, op)
 		if err == nil && res.Attr == nil && len(res.Data) > 0 {
 			// Path-addressed reads carry no revision; event invalidation
@@ -417,7 +423,9 @@ func (c *Cache) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 			// returns the whole image — caching a 16KiB range read under
 			// the whole-file key made every later offset answer EOF
 			// (the layer staged-append read-back).
-			if op.Offset == 0 && op.Limit <= 0 && c.admits(res.Data) {
+			// The epoch fences a read that raced a checkout: its bytes
+			// describe the replaced view.
+			if op.Offset == 0 && op.Limit <= 0 && c.admits(res.Data) && c.epoch.Load() == epoch {
 				c.mem.Put(op.Path, res.Data, 0)
 			}
 		}

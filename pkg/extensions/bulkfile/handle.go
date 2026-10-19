@@ -25,6 +25,10 @@ type streamHandle struct {
 	unlinked    bool  // directory entry gone; boundary pushes are discarded
 	released    bool
 	passthrough bool // image overflowed the bound; the stream forwards to the plane below
+	// modeKnown distinguishes an explicit chmod(000) from "no mode
+	// recorded": attrLocked's 0644 default must not answer a 000 mode the
+	// caller just set.
+	modeKnown bool
 }
 
 // bulkfileMaxBufferedBytes bounds the claimed image retained in memory
@@ -43,6 +47,7 @@ func (h *streamHandle) applyAttr(ctx context.Context, op *fs.Op) (fs.Attr, error
 		mode := op.Mode & 0o777
 		h.mu.Lock()
 		h.mode = mode
+		h.modeKnown = true
 		h.mu.Unlock()
 		if err := h.below.SetAttr(ctx, h.path, fs.AttrPatch{Mode: &mode}); err != nil {
 			return fs.Attr{}, err
@@ -99,7 +104,9 @@ func (h *streamHandle) applyAttr(ctx context.Context, op *fs.Op) (fs.Attr, error
 			// Registry removal takes b.mu while every lookup takes
 			// (b.mu, h.mu) in that order — dropping h.mu first keeps one
 			// lock order (deadlock: a lookup racing this transition).
-			h.b.untrack(h)
+			// Retire only the CLAIM: the descriptor is still open and a
+			// later rename must follow it.
+			h.b.untrackClaim(h)
 			return attr, nil
 		} else {
 			grown := make([]byte, size)
@@ -193,8 +200,9 @@ func (h *streamHandle) Write(ctx context.Context, off int64, data []byte) error 
 	h.mu.Unlock()
 	// The claim no longer owns the freshest bytes: stop serving the
 	// path's lookups from this handle so new opens read the plane's
-	// pending state instead of a stale image.
-	h.b.untrack(h)
+	// pending state instead of a stale image. The DESCRIPTOR stays
+	// tracked: a suffix write must follow a rename.
+	h.b.untrackClaim(h)
 	inner, err := h.session(ctx)
 	if err != nil {
 		return err
@@ -359,7 +367,7 @@ func (h *streamHandle) Release(ctx context.Context) error {
 // attrLocked renders the handle's reply attributes; callers hold h.mu.
 func (h *streamHandle) attrLocked() fs.Attr {
 	mode := h.mode
-	if mode == 0 {
+	if !h.modeKnown {
 		mode = 0o644
 	}
 	size := int64(len(h.image))

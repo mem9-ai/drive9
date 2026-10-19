@@ -90,3 +90,65 @@ func TestPortSurrenderedDescriptorSurvivesUnlink(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// The over-limit handoff keeps the descriptor tracked: after a rename, a
+// path-level setattr through the original fd must hit the renamed file.
+func TestPortHandoffDescriptorFollowsRename(t *testing.T) {
+	b := testbackend.NewBackend()
+	ch := newWritebackStack(t, b)
+	ctx := context.Background()
+
+	first := openForWrite(t, ch, "/a")
+	if err := first.Write(ctx, 0, make([]byte, bulkfileMaxBufferedBytes+1)); err != nil {
+		t.Fatalf("over-limit write = %v", err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/a", Path2: "/b"}); err != nil {
+		t.Fatalf("rename = %v", err)
+	}
+	// Recreate the old name with different content.
+	other := openForWrite(t, ch, "/a")
+	if err := other.Write(ctx, 0, []byte("OTHER")); err != nil {
+		t.Fatal(err)
+	}
+	if err := other.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := other.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpSetAttr, Path: "/b", Size: 1, Handle: first}); err != nil {
+		t.Fatalf("ftruncate via original fd = %v", err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: "/b"}); err != nil {
+		t.Fatalf("getattr /b = %v", err)
+	}
+	if node, ok := b.Node("/a"); !ok || len(node.Data) != 5 {
+		t.Fatalf("/a = %q ok=%v, want the recreated OTHER untouched", node.Data, ok)
+	}
+	if err := first.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// chmod(000) on a live claim stays 000 in the reply and the overlay.
+func TestPortChmodZeroKeepsMode(t *testing.T) {
+	b := testbackend.NewBackend()
+	ch := newWritebackStack(t, b)
+	ctx := context.Background()
+
+	h := openForWrite(t, ch, "/z")
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpSetAttr, Path: "/z", HasMode: true, Mode: 0, Size: -1, Handle: h})
+	if err != nil {
+		t.Fatalf("chmod = %v", err)
+	}
+	if res.Attr == nil || res.Attr.Mode&0o777 != 0 {
+		t.Fatalf("chmod reply mode = %+v, want 000", res.Attr)
+	}
+	lres, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: "/z"})
+	if err != nil || lres.Attr == nil || lres.Attr.Mode&0o777 != 0 {
+		t.Fatalf("getattr mode = %+v err=%v, want 000", lres.Attr, err)
+	}
+	if err := h.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+}

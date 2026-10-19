@@ -109,8 +109,11 @@ type FS struct {
 	locks           *fuseLockTable
 	handles         *handleTable
 	dirs            *dirTable
-	pathLocks       *lockTable
-	events          *fs.EventBus
+	// viewGen fences listing installs across view resets: a READDIR that
+	// started before a checkout must not install its pre-reset page.
+	viewGen   atomic.Uint64
+	pathLocks *lockTable
+	events    *fs.EventBus
 
 	nextFh atomic.Uint64
 
@@ -303,8 +306,16 @@ func New(opts Options) (*FS, error) {
 	// markStatCacheUnverified cleared the dir cache): stale listings must
 	// not answer lookups after the view restarted.
 	f.events.On(fs.EventCheckout, func(fs.Event) {
+		// A checkout/reset replaces the whole remote view: every listing
+		// installed before it is stale. Bump the fence and drop the open
+		// directory handles' snapshots (a live enumeration would otherwise
+		// replay the pre-reset entries for the rest of its pages).
+		f.viewGen.Add(1)
 		if f.Ctx.DirCache != nil {
 			f.Ctx.DirCache.InvalidateAll()
+		}
+		for _, dh := range f.dirs.snapshot() {
+			dh.resetEntries()
 		}
 	})
 	return f, nil
@@ -1025,6 +1036,32 @@ type dirHandle struct {
 	entries   []fs.Entry // stable snapshot for one enumeration sequence
 }
 
+// resetEntries drops the enumeration snapshot. A page in flight keeps its
+// token (the caller may be the very goroutine that triggered the reset, so
+// blocking would deadlock): that page's install is fenced by viewGen and
+// the next enumeration refetches.
+func (dh *dirHandle) resetEntries() {
+	if !dh.tryLockRead() {
+		return
+	}
+	dh.entries = nil
+	dh.unlockRead()
+}
+
+// tryLockRead is lockRead without blocking.
+func (dh *dirHandle) tryLockRead() bool {
+	dh.readOnce.Do(func() {
+		dh.readToken = make(chan struct{}, 1)
+		dh.readToken <- struct{}{}
+	})
+	select {
+	case <-dh.readToken:
+		return true
+	default:
+		return false
+	}
+}
+
 // lockRead serializes READDIR/READDIRPLUS on one handle and honors kernel
 // interrupts (v1 DirHandle.lockRead -> EINTR).
 func (dh *dirHandle) lockRead(ctx context.Context) bool {
@@ -1060,6 +1097,17 @@ func (t *dirTable) put(fh uint64, d *dirHandle) {
 	t.mu.Lock()
 	t.m[fh] = d
 	t.mu.Unlock()
+}
+
+// snapshot returns the open directory handles for a reset sweep.
+func (t *dirTable) snapshot() []*dirHandle {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make([]*dirHandle, 0, len(t.m))
+	for _, d := range t.m {
+		out = append(out, d)
+	}
+	return out
 }
 
 func (t *dirTable) get(fh uint64) (*dirHandle, bool) {
@@ -2061,16 +2109,30 @@ func (f *FS) Access(cancel <-chan struct{}, input *gofuse.AccessIn) gofuse.Statu
 	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
-	res, st := f.dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: path, Mask: input.Mask, Ino: input.NodeId, Kernel: input, Caller: fs.CallerFrom(input.InHeader)})
-	if st != gofuse.OK {
-		return st
+	// Local directory attrs are owned by the inode entry (GetAttr's
+	// localDirAttrs rule): dispatching a remote stat for ACCESS on a
+	// directory some deployments reject/route elsewhere returned EACCES or
+	// ENOENT for a perfectly readable directory.
+	var attr fs.Attr
+	haveAttr := false
+	if f.localDirAttrs {
+		if entry, ok := f.inodes.GetEntry(input.NodeId); ok && (input.NodeId == 1 || entry.IsDir) {
+			attr, haveAttr = entryToAttr(entry), true
+		}
 	}
-	if res.Attr == nil {
-		return gofuse.EIO
+	if !haveAttr {
+		res, st := f.dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: path, Mask: input.Mask, Ino: input.NodeId, Kernel: input, Caller: fs.CallerFrom(input.InHeader)})
+		if st != gofuse.OK {
+			return st
+		}
+		if res.Attr == nil {
+			return gofuse.EIO
+		}
+		attr = *res.Attr
 	}
 	ownerUid, ownerGid := f.uid, f.gid
-	if res.Attr.HasOwner {
-		ownerUid, ownerGid = res.Attr.Uid, res.Attr.Gid
+	if attr.HasOwner {
+		ownerUid, ownerGid = attr.Uid, attr.Gid
 	}
 	if entry, ok := f.inodes.GetEntry(input.NodeId); ok {
 		if entry.HasUID {
@@ -2081,8 +2143,41 @@ func (f *FS) Access(cancel <-chan struct{}, input *gofuse.AccessIn) gofuse.Statu
 		}
 	}
 	caller := fs.CallerFrom(input.InHeader)
-	if !hasPOSIXAccess(caller, ownerUid, ownerGid, res.Attr.Mode&0o777, input.Mask) {
+	if !hasPOSIXAccess(caller, ownerUid, ownerGid, attr.Mode&0o777, input.Mask) {
 		return gofuse.EACCES
+	}
+	return gofuse.OK
+}
+
+// checkAncestorSearch verifies SEARCH (x) permission on every ancestor of
+// path for the caller, the base's pre-dispatch check.
+func (f *FS) checkAncestorSearch(ctx context.Context, path string, caller fs.Caller) gofuse.Status {
+	if path == "/" || path == "" {
+		return gofuse.OK
+	}
+	dir := parentDirOf(path)
+	for {
+		res, err := f.dispatchErr(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: dir, Caller: caller})
+		if err != nil {
+			if fs.IsNotFound(err) {
+				return gofuse.ENOENT
+			}
+			return fs.StatusOf(err)
+		}
+		if res.Attr == nil {
+			return gofuse.EIO
+		}
+		uid, gid := f.uid, f.gid
+		if res.Attr.HasOwner {
+			uid, gid = res.Attr.Uid, res.Attr.Gid
+		}
+		if !hasPOSIXAccess(caller, uid, gid, res.Attr.Mode&0o777, 0b001) {
+			return gofuse.EACCES
+		}
+		if dir == "/" {
+			break
+		}
+		dir = parentDirOf(dir)
 	}
 	return gofuse.OK
 }
@@ -2277,9 +2372,21 @@ func (f *FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse.Open
 			default: // O_RDWR (and O_ACCMODE's spare value)
 				mask = 0b110
 			}
+			if input.Flags&uint32(syscall.O_TRUNC) != 0 {
+				// O_RDONLY|O_TRUNC truncates: it needs W_OK even though the
+				// access mode says read-only (v1 openAccessMask added it).
+				mask |= 0b010
+			}
 			if !hasPOSIXAccess(caller, ownerUid, ownerGid, mode, mask) {
 				return gofuse.EACCES
 			}
+		}
+		// Every ancestor needs SEARCH permission: without
+		// default_permissions the kernel does not walk the prefix checks
+		// for us, so a caller could open a file it cannot traverse to
+		// (v1 checked each ancestor before dispatching the open).
+		if st := f.checkAncestorSearch(ctx, path, caller); st != gofuse.OK {
+			return st
 		}
 	}
 	start := time.Now()
@@ -2669,15 +2776,30 @@ func (f *FS) loadDirEntries(cancel <-chan struct{}, input *gofuse.ReadIn, dh *di
 	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
-	res, st := f.dispatch(ctx, &fs.Op{Kind: fs.OpList, Path: dh.path, Ino: input.NodeId, Fh: input.Fh, Kernel: input, Caller: fs.CallerFrom(input.InHeader)})
-	if st != gofuse.OK {
-		return st
+	// Fence against a view reset racing the dispatch: a listing fetched
+	// before a checkout describes the replaced view, so installing it (in
+	// the handle snapshot or the namespace cache) would serve pre-reset
+	// entries until the next invalidation.
+	for attempt := 0; ; attempt++ {
+		gen := f.viewGen.Load()
+		res, st := f.dispatch(ctx, &fs.Op{Kind: fs.OpList, Path: dh.path, Ino: input.NodeId, Fh: input.Fh, Kernel: input, Caller: fs.CallerFrom(input.InHeader)})
+		if st != gofuse.OK {
+			return st
+		}
+		if f.viewGen.Load() != gen {
+			if attempt < 2 {
+				continue
+			}
+			// A reset kept winning: report EAGAIN so the kernel retries
+			// instead of accepting a stale page.
+			return gofuse.EAGAIN
+		}
+		if f.Ctx.DirCache != nil {
+			f.Ctx.DirCache.Put(dh.path, dirEntriesFrom(res.Entries))
+		}
+		dh.entries = append([]fs.Entry(nil), res.Entries...)
+		return gofuse.OK
 	}
-	if f.Ctx.DirCache != nil {
-		f.Ctx.DirCache.Put(dh.path, dirEntriesFrom(res.Entries))
-	}
-	dh.entries = append([]fs.Entry(nil), res.Entries...)
-	return gofuse.OK
 }
 
 // childPathOf resolves the kernel path of a directory entry name relative
@@ -2942,7 +3064,18 @@ func dirEntriesFrom(entries []fs.Entry) []fs.DirEntryInfo {
 		if e.Attr.Kind == fs.KindSymlink {
 			mode = uint32(syscall.S_IFLNK) | mode&0o777
 		}
-		item := fs.DirEntryInfo{Name: e.Name, Size: e.Attr.Size, IsDir: e.Attr.IsDir(), Mode: mode, HasMode: true, Nlink: e.Attr.Nlink}
+		item := fs.DirEntryInfo{
+			Name: e.Name, Size: e.Attr.Size, IsDir: e.Attr.IsDir(),
+			Mode: mode, HasMode: true, Nlink: e.Attr.Nlink,
+			// The server's mtime/revision/identity ride the row too:
+			// dropping them made namespace-cache stats answer zero revs and
+			// split hardlink aliases (ResourceID) after a READDIR.
+			Mtime:         e.Attr.Mtime,
+			Rev:           e.Attr.Rev,
+			ResourceID:    e.Attr.ResourceID,
+			ExtentIno:     e.Attr.ExtentIno,
+			LocalMutation: e.Attr.Rev > 0 && false, // listing rows are remote-observed
+		}
 		if e.Attr.HasOwner {
 			item.Uid, item.Gid, item.HasUID, item.HasGID = e.Attr.Uid, e.Attr.Gid, true, true
 		}

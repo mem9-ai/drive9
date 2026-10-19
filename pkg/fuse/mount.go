@@ -593,6 +593,9 @@ func MountWithConfig(cfg MountConfig) error {
 		built["core"] = coreExt
 	}
 	bus := fs.NewEventBus()
+	if coreExt != nil {
+		coreExt.AttachEvents(bus)
+	}
 	var readCache *cache.Cache
 	if wantExt["cache"] {
 		// v1 always ran the in-memory read cache — it does not need a cache
@@ -650,7 +653,7 @@ func MountWithConfig(cfg MountConfig) error {
 	// needs none of it. The cache plugin stays regardless — its READ caches
 	// serve every policy; only its staging role is policy-bound.
 	var stagingLedger *staging.Staging
-	if (policy == writeback.PolicyWriteBack || policy == writeback.PolicyCloseSync) && cacheBase != "" && wantExt["writeback"] {
+	if !cfg.ReadOnly && (policy == writeback.PolicyWriteBack || policy == writeback.PolicyCloseSync) && cacheBase != "" && wantExt["writeback"] {
 		// wantExt gate: a core-only stack (--extensions core) keeps the
 		// default writeback policy but builds no writeback handler; the
 		// ledger would still be created, recovered, and compacted — a
@@ -842,7 +845,12 @@ func MountWithConfig(cfg MountConfig) error {
 	}
 
 	var wb *writeback.Writeback
-	if wantExt["writeback"] {
+	// A read-only mount serves reads only (the kernel's "ro" option
+	// rejects mutations): constructing the writeback plane here would
+	// RECOVER a previous mount's staging ledger, journal and uploader and
+	// start re-uploading its pending writes — data traffic a read-only
+	// mount must never produce.
+	if wantExt["writeback"] && !cfg.ReadOnly {
 		flushDebounce := cfg.FlushDebounce
 		if cfg.Profile == "interactive" {
 			// v1 ApplyInteractiveProfile disables the debouncer outright
@@ -1077,6 +1085,12 @@ func MountWithConfig(cfg MountConfig) error {
 
 	fuseOpts := newGoFuseMountOptions(cfg)
 
+	// The mount point must exist before go-fuse mounts over it: several
+	// platforms fail NewServer with ENOENT on a missing directory (v1
+	// created it up front).
+	if err := os.MkdirAll(cfg.MountPoint, 0o755); err != nil {
+		return fmt.Errorf("fuse: create mount point %s: %w", cfg.MountPoint, err)
+	}
 	server, err := gofuse.NewServer(f, cfg.MountPoint, fuseOpts)
 	if err != nil {
 		// v1 cleanupNewServerFailure: NewServer can fail after the kernel

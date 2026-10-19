@@ -634,6 +634,29 @@ func (g *Git) gitDirFor(root string) string {
 	return filepath.Join(g.localRoot, "overlay", local[1:], ".git")
 }
 
+// checkpointGitDir resolves the directory a checkpoint must archive. A
+// linked worktree's <root>/.git is a POINTER FILE: archiving gitDirFor(root)
+// walked a single file, skipped the root node and produced an empty archive
+// that then overwrote the server's checkpoint. The real admin dir lives
+// under the common repository.
+func (g *Git) checkpointGitDir(w *workspace) (string, bool) {
+	if w == nil {
+		return "", false
+	}
+	if !w.linked() {
+		return g.gitDirFor(w.rootPath()), true
+	}
+	common := g.workspaceByID(w.commonWorkspaceID())
+	if common == nil || common.id == w.id {
+		return "", false
+	}
+	target, err := linkedWorktreeGitDir(g.gitDirFor(common.rootPath()), w.gitDirRelPath())
+	if err != nil {
+		return "", false
+	}
+	return target, true
+}
+
 // scheduleGitStateCheckpoint debounces a checkpoint for the workspace
 // owning path.
 func (g *Git) scheduleGitStateCheckpoint(path string) {
@@ -644,7 +667,10 @@ func (g *Git) scheduleGitStateCheckpoint(path string) {
 	if !ok {
 		return
 	}
-	gitDir := g.gitDirFor(w.rootPath())
+	gitDir, ok := g.checkpointGitDir(w)
+	if !ok {
+		return
+	}
 	relSlash := filepath.ToSlash(rel)
 	if relSlash != ".git" && !strings.HasPrefix(relSlash, ".git/") {
 		return
@@ -664,11 +690,15 @@ func (g *Git) checkpointWorkspace(ctx context.Context, w *workspace, gitDir stri
 	if g.cl == nil {
 		return nil
 	}
-	if _, err := os.Stat(gitDir); err != nil {
+	if info, err := os.Stat(gitDir); err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
 		return err
+	} else if !info.IsDir() {
+		// A pointer file (a linked worktree rooted at an unresolved path)
+		// would archive nothing and overwrite a good checkpoint.
+		return fmt.Errorf("git: checkpoint %s: %s is not a git directory", w.id, gitDir)
 	}
 	g.ckptMu.Lock()
 	defer g.ckptMu.Unlock()
@@ -716,7 +746,11 @@ func (g *Git) checkpointAllGitWorkspaces() {
 	ctx, cancel := context.WithTimeout(context.Background(), gitCheckpointTimeout)
 	defer cancel()
 	for _, w := range workspaces {
-		if err := g.checkpointWorkspace(ctx, w, g.gitDirFor(w.rootPath())); err != nil {
+		gitDir, ok := g.checkpointGitDir(w)
+		if !ok {
+			continue
+		}
+		if err := g.checkpointWorkspace(ctx, w, gitDir); err != nil {
 			fmt.Fprintf(os.Stderr, "drive9: git state final checkpoint failed for workspace %s: %v\n", w.id, err)
 		}
 	}
@@ -763,13 +797,17 @@ func (g *Git) restoreWorkspaceState(ctx context.Context, w *workspace) error {
 	// back to the clone-time archive. Only a missing or unusable .git
 	// (a fresh-LocalRoot remount) downloads and swaps the state.
 	if gitDirLooksUsable(ctx, gitDir) {
-		if linkedCommonGitDir != "" {
-			// The common repository's archive also carries the worktree
-			// admin dir, but the LINKED root still needs its .git pointer
-			// file — git only finds the worktree through it.
+		if linkedCommonGitDir == "" {
+			return nil
+		}
+		if !g.wasFreshRestored(gitDir) {
+			// A LIVE local checkout built on this mount owns the truth; only
+			// the .git pointer file may be missing.
 			return writeWorktreeGitPointer(g, w.rootPath(), gitDir)
 		}
-		return nil
+		// The admin dir came from the COMMON repository's archive moments
+		// ago: it has a usable HEAD but not the linked workspace's own
+		// checkpoint or staged-object pack — fall through and restore them.
 	}
 	state, err := g.cl.GetGitState(ctx, w.id)
 	if err != nil {
@@ -839,7 +877,35 @@ func (g *Git) restoreWorkspaceState(ctx context.Context, w *workspace) error {
 	if linkedCommonGitDir != "" {
 		return writeWorktreeGitPointer(g, w.rootPath(), gitDir)
 	}
+	g.markFreshRestored(gitDir)
 	return nil
+}
+
+// markFreshRestored records the worktree admin dirs a restore just
+// materialized from the common repository's archive.
+func (g *Git) markFreshRestored(gitDir string) {
+	entries, err := os.ReadDir(filepath.Join(gitDir, "worktrees"))
+	if err != nil {
+		return
+	}
+	g.mu.Lock()
+	if g.freshRestored == nil {
+		g.freshRestored = map[string]bool{}
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			g.freshRestored[filepath.Clean(filepath.Join(gitDir, "worktrees", e.Name()))] = true
+		}
+	}
+	g.mu.Unlock()
+}
+
+// wasFreshRestored reports whether a restore in this process created the
+// worktree admin dir (as opposed to a live local checkout).
+func (g *Git) wasFreshRestored(dir string) bool {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.freshRestored[filepath.Clean(dir)]
 }
 
 // linkedWorktreeGitDir resolves a linked worktree's gitdir from the common

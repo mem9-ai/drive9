@@ -62,6 +62,11 @@ type Extent struct {
 	// while fds were still open).
 	liveMu sync.Mutex
 	live   map[string]int
+	// liveHandles indexes the OPEN descriptors so a rename can update
+	// their own path field: Release untracks by h.path, and migrating only
+	// the count left the handle releasing the OLD key (the new path stayed
+	// "live" forever — a zero-length -shm kept reporting its mapped size).
+	liveHandles map[*extentHandle]struct{}
 }
 
 // extentMissCap bounds the negative cache. It is a 2s hint, so throwing it
@@ -177,6 +182,33 @@ func (e *Extent) trackLive(path string) {
 	e.liveMu.Unlock()
 }
 
+// trackLiveHandle registers an open descriptor and its path in one step.
+func (e *Extent) trackLiveHandle(h *extentHandle) {
+	e.liveMu.Lock()
+	if e.live == nil {
+		e.live = map[string]int{}
+	}
+	if e.liveHandles == nil {
+		e.liveHandles = map[*extentHandle]struct{}{}
+	}
+	e.live[h.path]++
+	e.liveHandles[h] = struct{}{}
+	e.liveMu.Unlock()
+}
+
+// untrackLiveHandle retires an open descriptor: the caller's CURRENT path
+// (a rename may have moved it) keys the count.
+func (e *Extent) untrackLiveHandle(h *extentHandle) {
+	e.liveMu.Lock()
+	if e.live[h.path] <= 1 {
+		delete(e.live, h.path)
+	} else {
+		e.live[h.path]--
+	}
+	delete(e.liveHandles, h)
+	e.liveMu.Unlock()
+}
+
 func (e *Extent) untrackLive(path string) {
 	e.liveMu.Lock()
 	if e.live[path] <= 1 {
@@ -248,7 +280,24 @@ func (e *Extent) retargetLivePrefix(oldPath, newPath string) {
 	for p, n := range moves {
 		e.live[p] += n
 	}
+	// Keep every open descriptor's own path in step with the registry: its
+	// Release untracks by h.path under the handle lock.
+	var retargeted []*extentHandle
+	for h := range e.liveHandles {
+		retargeted = append(retargeted, h)
+	}
 	e.liveMu.Unlock()
+	for _, h := range retargeted {
+		h.mu.Lock()
+		p := h.path
+		switch {
+		case p == oldPath:
+			h.path = newPath
+		case strings.HasPrefix(p, oldPrefix):
+			h.path = newPrefix + strings.TrimPrefix(p, oldPrefix)
+		}
+		h.mu.Unlock()
+	}
 }
 
 // retargetLive moves the open-handle registry with a renamed path.

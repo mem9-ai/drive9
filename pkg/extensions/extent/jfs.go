@@ -295,7 +295,7 @@ func (h *extentHandle) Release(ctx context.Context) error {
 	}
 	h.closed = true
 	h.mu.Unlock()
-	h.e.untrackLive(h.path)
+	h.e.untrackLiveHandle(h)
 	v := h.e.vfs()
 	if v == nil {
 		return nil
@@ -356,7 +356,7 @@ func (e *Extent) openExtent(ctx context.Context, path string, ino uint64, flags 
 		attr.HasOwner = true
 	}
 	h := &extentHandle{e: e, path: path, ino: jino, fh: vfsFh, flags: flags, openFlag: extentOpenFlags(keepCache), caller: caller}
-	e.trackLive(path)
+	e.trackLiveHandle(h)
 	return h, extentOpenFlags(keepCache), attr, nil
 }
 
@@ -377,7 +377,7 @@ func (e *Extent) adoptCreatedHandle(path string, ino uint64, fh uint64, a *jfsme
 		keepCache = a.KeepCache
 	}
 	h := &extentHandle{e: e, path: path, ino: jino, fh: fh, flags: flags, openFlag: extentOpenFlags(keepCache), caller: caller}
-	e.trackLive(path)
+	e.trackLiveHandle(h)
 	return h, extentOpenFlags(keepCache), attr, nil
 }
 

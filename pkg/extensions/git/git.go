@@ -356,6 +356,13 @@ type Git struct {
 	// openHandles tracks every claimed descriptor (the live slot keeps
 	// only the newest per path).
 	openHandles sync.Map
+
+	// freshRestored marks worktree admin dirs materialized by a restore in
+	// THIS process: the common repository's archive carries
+	// .git/worktrees/<name>, which LOOKS usable but lacks the linked
+	// workspace's own checkpoint (its staged-object pack). A live local
+	// checkout is never listed here.
+	freshRestored map[string]bool
 }
 
 // trackWorkspace maintains the claimed-handle index.

@@ -171,4 +171,37 @@ func TestPortLocalSpecialNodeVisibleAndRemovable(t *testing.T) {
 	if err := mknod(); err != nil {
 		t.Fatalf("re-mkfifo = %v, want success (no stale EEXIST)", err)
 	}
+
+	// A local special is a real child of its directory: it lists, keeps
+	// rmdir non-empty, and takes chmod through the specials owner.
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMkdir, Path: "/repo/node_modules/d", Mode: 0o755}); err != nil {
+		t.Fatal(err)
+	}
+	child := "/repo/node_modules/d/fifo"
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMknod, Path: child, Mode: uint32(syscall.S_IFIFO) | 0o644}); err != nil {
+		t.Fatal(err)
+	}
+	lres, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpList, Path: "/repo/node_modules/d"})
+	if err != nil {
+		t.Fatalf("list = %v", err)
+	}
+	found := false
+	for _, e := range lres.Entries {
+		if e.Name == "fifo" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("listing = %+v, want the special child", lres.Entries)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpSetAttr, Path: child, HasMode: true, Mode: 0o600, Size: -1}); err != nil {
+		t.Fatalf("chmod special = %v", err)
+	}
+	ares, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: child})
+	if err != nil || ares.Attr == nil || ares.Attr.Mode&0o777 != 0o600 {
+		t.Fatalf("chmod'd special = %+v err=%v, want 0600", ares.Attr, err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRmdir, Path: "/repo/node_modules/d"}); err != syscall.ENOTEMPTY {
+		t.Fatalf("rmdir with a special child = %v, want ENOTEMPTY", err)
+	}
 }

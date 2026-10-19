@@ -186,6 +186,11 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 				}
 				out = append(out, fs.Entry{Name: e.Name(), Attr: attrOfLocalInfo(info)})
 			}
+			// Metadata-only local nodes (FIFO/device) live in
+			// localSpecials, not in the backing directory: a readdir that
+			// skipped them listed the parent as empty although lookups
+			// resolved the child.
+			out = append(out, f.localSpecialEntries(op.Path)...)
 			return fs.Result{Entries: out}, nil
 		}
 		// A remotely routed directory may still hold LOCAL children (a
@@ -245,6 +250,13 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 						merged = append(merged, fs.Entry{Name: e.Name(), Attr: attrOfLocalInfo(info)})
 					}
 				}
+			}
+			for _, e := range f.localSpecialEntries(op.Path) {
+				if _, dup := seen[e.Name]; dup {
+					continue
+				}
+				seen[e.Name] = struct{}{}
+				merged = append(merged, e)
 			}
 			for _, e := range res.Entries {
 				if _, shadowed := seen[e.Name]; shadowed {
@@ -467,6 +479,12 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 			if !info.IsDir() {
 				return fs.Result{}, syscall.ENOTDIR
 			}
+			if f.hasLocalSpecialUnder(op.Path) {
+				// The backing directory is empty but the local specials
+				// records are real children: removing the parent would
+				// leave them addressable under a deleted directory.
+				return fs.Result{}, syscall.ENOTEMPTY
+			}
 			if err := o.Remove(op.Path); err != nil {
 				return fs.Result{}, err
 			}
@@ -474,6 +492,19 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 		}
 
 	case fs.OpSetAttr:
+		if _, ok := f.localSpecial(op.Path); ok {
+			// The backing file does not exist: the specials plane owns the
+			// record (mode/owner/times). Forward, then re-read the record so
+			// later lookups answer the settled attrs.
+			res, err := next(ctx, op)
+			if err != nil {
+				return fs.Result{}, err
+			}
+			if got, gerr := next(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: op.Path}); gerr == nil && got.Attr != nil {
+				f.recordLocalSpecial(op.Path, *got.Attr)
+			}
+			return res, nil
+		}
 		if o := f.overlayFor(ctx, inner, op.Path, false); o != nil {
 			if !op.Mtime.IsZero() {
 				if err := f.chtimes(o, op.Path, op.Mtime); err != nil {
@@ -710,6 +741,40 @@ func (f *Localize) recordLocalSpecial(path string, attr fs.Attr) {
 	}
 	f.localSpecials[path] = attr
 	f.specialMu.Unlock()
+}
+
+// localSpecialEntries lists the metadata-only children recorded directly
+// under dir.
+func (f *Localize) localSpecialEntries(dir string) []fs.Entry {
+	prefix := strings.TrimSuffix(dir, "/") + "/"
+	f.specialMu.Lock()
+	defer f.specialMu.Unlock()
+	var out []fs.Entry
+	for p, attr := range f.localSpecials {
+		if !strings.HasPrefix(p, prefix) {
+			continue
+		}
+		name := strings.TrimPrefix(p, prefix)
+		if name == "" || strings.Contains(name, "/") {
+			continue
+		}
+		out = append(out, fs.Entry{Name: name, Attr: attr})
+	}
+	return out
+}
+
+// hasLocalSpecialUnder reports whether any local special node lives in the
+// directory's subtree.
+func (f *Localize) hasLocalSpecialUnder(dir string) bool {
+	prefix := strings.TrimSuffix(dir, "/") + "/"
+	f.specialMu.Lock()
+	defer f.specialMu.Unlock()
+	for p := range f.localSpecials {
+		if strings.HasPrefix(p, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func (f *Localize) localSpecial(path string) (fs.Attr, bool) {

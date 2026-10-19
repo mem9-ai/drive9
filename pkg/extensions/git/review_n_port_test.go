@@ -295,3 +295,92 @@ func TestPortBaseReadTailIsShortRead(t *testing.T) {
 		t.Fatalf("read = %q", buf[:n])
 	}
 }
+
+// A linked worktree's checkpoint must archive the ADMIN DIR under the
+// common repository (its <root>/.git is a pointer file whose archive is
+// empty), and a restore must apply the linked workspace's own staged
+// objects even when the common archive already supplied a usable admin
+// HEAD.
+func TestPortLinkedWorktreeCheckpointAndStagedRestore(t *testing.T) {
+	gitBin(t)
+	src := t.TempDir()
+	run(t, src, "init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(src, "f.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, src, "add", "f.txt")
+	run(t, src, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "one")
+	head := run(t, src, "rev-parse", "HEAD")
+
+	localRoot := t.TempDir()
+	repo := filepath.Join(localRoot, "overlay", "repo")
+	if err := os.MkdirAll(filepath.Dir(repo), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run(t, filepath.Dir(repo), "clone", "-q", "file://"+src, repo)
+	run(t, repo, "worktree", "add", "-q", "wt", "-b", "b1")
+	wtDir := filepath.Join(localRoot, "overlay", "repo", "wt")
+	wtGit := filepath.Join(repo, ".git", "worktrees", "wt")
+
+	b := testbackend.NewBackend()
+	b.SeedGitWorkspaceFull("main", "/repo", "file://"+src, head)
+	b.SeedGitWorktree("linked", "/repo/wt", "file://"+src, head, "main", ".git/worktrees/wt")
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	g, err := New(Options{Client: cl, LocalRoot: localRoot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mainWS := &workspace{id: "main", root: "/repo", headCommit: head, repoURL: "file://" + src}
+	linkedWS := &workspace{
+		id: "linked", root: "/repo/wt", headCommit: head, repoURL: "file://" + src,
+		workspaceKind: "linked", commonID: "main", gitDirRel: ".git/worktrees/wt",
+	}
+	g.workspaces = []*workspace{mainWS, linkedWS}
+	ctx := context.Background()
+
+	if got, ok := g.checkpointGitDir(linkedWS); !ok || got != wtGit {
+		t.Fatalf("checkpointGitDir = %q ok=%v, want the admin dir %q", got, ok, wtGit)
+	}
+	if err := g.checkpointWorkspace(ctx, mainWS, filepath.Join(repo, ".git")); err != nil {
+		t.Fatalf("main checkpoint = %v", err)
+	}
+	// Stage a NEW blob in the worktree only: it needs the linked pack.
+	if err := os.WriteFile(filepath.Join(wtDir, "staged.txt"), []byte("staged-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, wtDir, "add", "staged.txt")
+	blob := run(t, wtDir, "rev-parse", ":staged.txt")
+	if err := g.checkpointWorkspace(ctx, linkedWS, wtGit); err != nil {
+		t.Fatalf("linked checkpoint = %v", err)
+	}
+	if state, ok := b.GitState("linked"); !ok || len(state) == 0 {
+		t.Fatal("linked checkpoint archive is empty")
+	}
+
+	// Crash-equivalent: the whole overlay is gone.
+	if err := os.RemoveAll(filepath.Join(localRoot, "overlay")); err != nil {
+		t.Fatal(err)
+	}
+	g2, err := New(Options{Client: cl, LocalRoot: localRoot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	restoredMain := &workspace{id: "main", root: "/repo", headCommit: head, repoURL: "file://" + src}
+	restoredLinked := &workspace{
+		id: "linked", root: "/repo/wt", headCommit: head, repoURL: "file://" + src,
+		workspaceKind: "linked", commonID: "main", gitDirRel: ".git/worktrees/wt",
+	}
+	g2.workspaces = []*workspace{restoredMain, restoredLinked}
+	if err := g2.restoreWorkspaceState(ctx, restoredMain); err != nil {
+		t.Fatalf("main restore = %v", err)
+	}
+	if err := g2.restoreWorkspaceState(ctx, restoredLinked); err != nil {
+		t.Fatalf("linked restore = %v", err)
+	}
+	// The staged blob must exist in the shared object store.
+	if out := run(t, filepath.Join(localRoot, "overlay", "repo", "wt"), "cat-file", "-t", blob); out != "blob" {
+		t.Fatalf("staged blob %s = %q, want an object (linked pack restored into the common store)", blob, out)
+	}
+}
