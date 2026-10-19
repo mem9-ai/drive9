@@ -374,3 +374,25 @@ func TestExecStartErrorAfterStartIsUnknown(t *testing.T) {
 		}
 	}
 }
+
+func TestExecHTTPFailureClassification(t *testing.T) {
+	for _, tc := range []struct {
+		status  int
+		unknown bool
+	}{
+		{status: http.StatusBadRequest}, {status: http.StatusUnauthorized}, {status: http.StatusForbidden},
+		{status: http.StatusRequestTimeout, unknown: true},
+		{status: http.StatusInternalServerError, unknown: true}, {status: http.StatusBadGateway, unknown: true},
+		{status: http.StatusServiceUnavailable, unknown: true}, {status: http.StatusGatewayTimeout, unknown: true},
+	} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(tc.status)
+		}))
+		_, err := New(server.URL, "secret").Exec(t.Context(), ExecRequest{Argv: []string{"true"}}, ExecOptions{})
+		server.Close()
+		var start *RuntimeStartError
+		if IsRuntimeOutcomeUnknown(err) != tc.unknown || errors.As(err, &start) == tc.unknown {
+			t.Errorf("status %d: error = %T %v", tc.status, err, err)
+		}
+	}
+}

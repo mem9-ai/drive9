@@ -181,6 +181,11 @@ export async function exec(client: RuntimeClient, input: ExecRequest, options: E
   if (response.status === 404) throw new RuntimeNotEnabledError();
   if (!response.ok) {
     const failure = await readRuntimeError(response);
+    // Only a 4xx rejection proves the command never ran; a 5xx (for example
+    // a gateway 502/504 after the server accepted the request) is unknown.
+    if (response.status >= 500 || response.status === 408) {
+      throw unknownOutcome(failure.message || `HTTP ${response.status}`);
+    }
     if (response.status === 429) {
       const seconds = Number.parseInt(response.headers.get("retry-after") ?? "", 10);
       throw new RuntimeBusyError(failure.message || "too many commands are running", (Number.isFinite(seconds) && seconds > 0 ? seconds : 5) * 1000);

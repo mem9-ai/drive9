@@ -95,6 +95,7 @@ type execRuntime struct {
 	dir                  string
 	lookupEnv            func(string) (string, bool)
 	server               func() string
+	credential           func() string
 	findMount            func(string) (*localMount, error)
 	syncMount            func(context.Context, *localMount) error
 	client               func() *client.Client
@@ -106,7 +107,9 @@ func defaultExecRuntime(execID *execIDBox) execRuntime {
 	return execRuntime{
 		stdout: os.Stdout, stderr: os.Stderr,
 		stdoutTTY: term.IsTerminal(int(os.Stdout.Fd())), stderrTTY: term.IsTerminal(int(os.Stderr.Fd())),
-		dir: dir, lookupEnv: os.LookupEnv, server: func() string { return ResolveCredentials().Server },
+		dir: dir, lookupEnv: os.LookupEnv,
+		server:     func() string { return ResolveCredentials().Server },
+		credential: currentCredentialFingerprint,
 		findMount: findLocalMount, syncMount: syncLocalMount,
 		client: NewFromEnv, execID: execID,
 	}
@@ -200,11 +203,11 @@ func resolveExecWorkspace(ctx context.Context, options *execOptions, rt execRunt
 	if err != nil || mount == nil {
 		return nil
 	}
-	// Only infer from a mount known to belong to the current server; a mount
-	// whose server is not recorded (for example --no-persist-credentials)
-	// could belong to another tenant.
-	if server := currentExecServer(rt); server == "" || mount.Server == "" || strings.TrimRight(server, "/") != strings.TrimRight(mount.Server, "/") {
-		return nil
+	// One server hosts many tenants, so infer only from a mount that uses
+	// the same server and the same credential as this command. Inside a mount
+	// that cannot be matched, refuse instead of guessing a workspace.
+	if !mountMatchesCurrentAccount(mount, rt) {
+		return fmt.Errorf("%s is a drive9 mount of a different account, or its account cannot be verified; pass -w to choose a workspace", mount.MountPoint)
 	}
 	if rt.syncMount != nil {
 		progress := newExecProgressMessage(rt.stderr, rt.stderrTTY && !options.verbose, "drive9: uploading local changes…")
@@ -227,11 +230,23 @@ func resolveExecWorkspace(ctx context.Context, options *execOptions, rt execRunt
 	return nil
 }
 
-func currentExecServer(rt execRuntime) string {
-	if rt.server == nil {
-		return ""
+func mountMatchesCurrentAccount(mount *localMount, rt execRuntime) bool {
+	if rt.server == nil || rt.credential == nil {
+		return false
 	}
-	return rt.server()
+	server, credential := strings.TrimRight(rt.server(), "/"), rt.credential()
+	return server != "" && credential != "" &&
+		server == strings.TrimRight(mount.Server, "/") && credential == mount.Credential
+}
+
+// currentCredentialFingerprint fingerprints the credential `drive9 exec`
+// sends, the same one NewFromEnv uses.
+func currentCredentialFingerprint() string {
+	resolved := ResolveCredentials()
+	if resolved.Kind == CredentialOwner || resolved.Kind == CredentialFSScoped {
+		return credentialFingerprint(resolved.APIKey)
+	}
+	return credentialFingerprint(resolved.Token)
 }
 
 func sandboxLabel(sandbox string) string {

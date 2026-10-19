@@ -286,8 +286,9 @@ func TestExecInsideLocalMountUsesItsWorkspaceAfterUploading(t *testing.T) {
 	rt := testExecRuntime(io.Discard, io.Discard)
 	rt.dir = "/home/me/drive9/web/src"
 	rt.server = func() string { return "https://drive9.example/" }
+	rt.credential = func() string { return "fp-a" }
 	rt.findMount = func(string) (*localMount, error) {
-		return &localMount{MountPoint: "/home/me/drive9", RemoteRoot: "/repo", Layer: "fork-1", Server: "https://drive9.example", Rel: "web/src"}, nil
+		return &localMount{MountPoint: "/home/me/drive9", RemoteRoot: "/repo", Layer: "fork-1", Server: "https://drive9.example", Credential: "fp-a", Rel: "web/src"}, nil
 	}
 	rt.syncMount = func(context.Context, *localMount) error { synced++; return nil }
 	if err := runExec(t.Context(), []string{"npm", "test"}, rt); err != nil {
@@ -317,8 +318,9 @@ func TestExecReportsLocalUploadFailure(t *testing.T) {
 	rt := testExecRuntime(io.Discard, io.Discard)
 	rt.dir = "/home/me/drive9"
 	rt.server = func() string { return "https://drive9.example" }
+	rt.credential = func() string { return "fp-a" }
 	rt.findMount = func(string) (*localMount, error) {
-		return &localMount{MountPoint: "/home/me/drive9", RemoteRoot: "/", Server: "https://drive9.example", Rel: "."}, nil
+		return &localMount{MountPoint: "/home/me/drive9", RemoteRoot: "/", Server: "https://drive9.example", Credential: "fp-a", Rel: "."}, nil
 	}
 	rt.syncMount = func(context.Context, *localMount) error { return errors.New("upload stalled") }
 	err := runExec(t.Context(), []string{"true"}, rt)
@@ -327,20 +329,31 @@ func TestExecReportsLocalUploadFailure(t *testing.T) {
 	}
 }
 
-func TestExecIgnoresMountOfAnotherServer(t *testing.T) {
-	request, _ := execTestServer(t, execStarted, execExit0)
-	rt := testExecRuntime(io.Discard, io.Discard)
-	rt.dir = "/mnt/other"
-	rt.server = func() string { return "https://current.example" }
-	rt.findMount = func(string) (*localMount, error) {
-		return &localMount{MountPoint: "/mnt/other", RemoteRoot: "/x", Server: "https://other.example", Rel: "."}, nil
-	}
-	rt.syncMount = func(context.Context, *localMount) error { t.Fatal("synced a foreign mount"); return nil }
-	if err := runExec(t.Context(), []string{"true"}, rt); err != nil {
-		t.Fatal(err)
-	}
-	if request.Workspace.Root != "/" {
-		t.Fatalf("workspace = %q", request.Workspace.Root)
+func TestExecRefusesMountOfAnotherAccount(t *testing.T) {
+	execTestServer(t, execStarted, execExit0)
+	for name, mount := range map[string]localMount{
+		"another server":     {Server: "https://other.example", Credential: "fp-a"},
+		"another tenant key": {Server: "https://drive9.example", Credential: "fp-b"},
+		"unrecorded server":  {Credential: "fp-a"},
+		"unrecorded key":     {Server: "https://drive9.example"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			mount.MountPoint, mount.RemoteRoot, mount.Rel = "/mnt/x", "/x", "."
+			rt := testExecRuntime(io.Discard, io.Discard)
+			rt.dir = "/mnt/x"
+			rt.server = func() string { return "https://drive9.example" }
+			rt.credential = func() string { return "fp-a" }
+			rt.findMount = func(string) (*localMount, error) { return &mount, nil }
+			rt.syncMount = func(context.Context, *localMount) error { t.Fatal("synced an unverified mount"); return nil }
+			err := runExec(t.Context(), []string{"true"}, rt)
+			if err == nil || !strings.Contains(err.Error(), "pass -w") {
+				t.Fatalf("error = %v", err)
+			}
+			// -w still works from inside such a mount.
+			if err := runExec(t.Context(), []string{"-w", "repo", "true"}, rt); err != nil {
+				t.Fatalf("explicit -w: %v", err)
+			}
+		})
 	}
 }
 
@@ -462,23 +475,5 @@ func TestLayerFromMountArgs(t *testing.T) {
 		if got := layerFromMountArgs(strings.Fields(args)); got != want {
 			t.Errorf("%q -> %q, want %q", args, got, want)
 		}
-	}
-}
-
-func TestExecIgnoresMountWithUnknownServer(t *testing.T) {
-	request, _ := execTestServer(t, execStarted, execExit0)
-	rt := testExecRuntime(io.Discard, io.Discard)
-	rt.dir = "/mnt/runtime"
-	rt.server = func() string { return "https://current.example" }
-	rt.findMount = func(string) (*localMount, error) {
-		// --no-persist-credentials mounts do not record their server.
-		return &localMount{MountPoint: "/mnt/runtime", RemoteRoot: "/x", Rel: "."}, nil
-	}
-	rt.syncMount = func(context.Context, *localMount) error { t.Fatal("synced a mount of unknown origin"); return nil }
-	if err := runExec(t.Context(), []string{"true"}, rt); err != nil {
-		t.Fatal(err)
-	}
-	if request.Workspace.Root != "/" {
-		t.Fatalf("workspace = %q", request.Workspace.Root)
 	}
 }

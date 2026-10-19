@@ -21,6 +21,7 @@ func TestFindLocalMountMapsCurrentDirectory(t *testing.T) {
 	if _, err := mountstate.WriteProcessState(mountPoint, mountstate.ProcessState{
 		PID: os.Getpid(), CreationTime: creation, MountKind: mountstate.MountKindFUSE, MountPoint: mountPoint,
 		RemoteRoot: "/repo", Layer: "fork-1", Server: "https://drive9.example", ControlSocket: "/tmp/sock",
+		APIKey: "owner-key-a",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -28,7 +29,8 @@ func TestFindLocalMountMapsCurrentDirectory(t *testing.T) {
 	if err != nil || mount == nil {
 		t.Fatalf("mount = %#v, %v", mount, err)
 	}
-	if mount.workspace() != "/repo" || mount.remoteCwd() != "web/src" || mount.Layer != "fork-1" || mount.ControlSocket != "/tmp/sock" {
+	if mount.workspace() != "/repo" || mount.remoteCwd() != "web/src" || mount.Layer != "fork-1" || mount.ControlSocket != "/tmp/sock" ||
+		mount.Credential != credentialFingerprint("owner-key-a") || mount.Credential == "owner-key-a" {
 		t.Fatalf("mount = %#v", mount)
 	}
 	root, err := findLocalMount(mountPoint)

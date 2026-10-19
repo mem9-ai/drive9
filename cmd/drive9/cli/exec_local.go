@@ -2,6 +2,8 @@ package cli
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -26,6 +28,20 @@ type localMount struct {
 	// Rel is the current directory relative to MountPoint ("." at its root).
 	Rel           string
 	ControlSocket string
+	// Credential fingerprints the credential the mount uses; empty when the
+	// mount does not record it (for example --no-persist-credentials).
+	Credential string
+}
+
+// credentialFingerprint identifies a credential without keeping it around.
+// Two equal fingerprints mean the same API key, hence the same tenant.
+func credentialFingerprint(secret string) string {
+	secret = strings.TrimSpace(secret)
+	if secret == "" {
+		return ""
+	}
+	digest := sha256.Sum256([]byte(secret))
+	return hex.EncodeToString(digest[:])
 }
 
 // findLocalMount walks up from dir to the nearest live drive9 FUSE mount.
@@ -57,6 +73,7 @@ func findLocalMount(dir string) (*localMount, error) {
 			return &localMount{
 				MountPoint: candidate, RemoteRoot: state.RemoteRoot, Layer: layer,
 				Server: state.Server, Rel: filepath.ToSlash(rel), ControlSocket: strings.TrimSpace(state.ControlSocket),
+				Credential: credentialFingerprint(firstNonEmpty(state.APIKey, state.Token)),
 			}, nil
 		}
 		parent := filepath.Dir(candidate)

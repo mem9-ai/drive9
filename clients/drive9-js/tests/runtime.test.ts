@@ -184,4 +184,11 @@ describe("runtime exec", () => {
     await expect(new Client("http://localhost:9009", "test-key").exec({ argv: ["true"] }))
       .rejects.toBeInstanceOf(RuntimeOutcomeUnknownError);
   });
+  it("treats gateway failures as unknown and 4xx as start failures", async () => {
+    for (const [status, unknown] of [[502, true], [504, true], [500, true], [400, false], [403, false]] as const) {
+      server.use(http.post("http://localhost:9009/v1/runtime/exec", () => new HttpResponse(null, { status })));
+      const promise = new Client("http://localhost:9009", "test-key").exec({ argv: ["true"] });
+      await expect(promise).rejects.toBeInstanceOf(unknown ? RuntimeOutcomeUnknownError : RuntimeStartError);
+    }
+  });
 });
