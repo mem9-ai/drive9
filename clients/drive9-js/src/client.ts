@@ -404,7 +404,7 @@ export class Client {
   async hardlink(srcPath: string, dstPath: string): Promise<void> {
     const resp = await fetch(`${this.fsUrl(dstPath)}?hardlink=1`, {
       method: "POST",
-      headers: this.authHeaders({ "X-Dat9-Hardlink-Source": srcPath }),
+      headers: this.#sourcePathHeaders("X-Dat9-Hardlink-Source", srcPath),
     });
     await checkError(resp);
   }
@@ -583,15 +583,24 @@ export class Client {
   }
 
   async copy(srcPath: string, dstPath: string): Promise<void> {
-    const headers = this.authHeaders({ "X-Dat9-Copy-Source": srcPath });
+    const headers = this.#sourcePathHeaders("X-Dat9-Copy-Source", srcPath);
     const resp = await fetch(`${this.fsUrl(dstPath)}?copy`, { method: "POST", headers });
     await checkError(resp);
   }
 
   async rename(oldPath: string, newPath: string): Promise<void> {
-    const headers = this.authHeaders({ "X-Dat9-Rename-Source": oldPath });
+    const headers = this.#sourcePathHeaders("X-Dat9-Rename-Source", oldPath);
     const resp = await fetch(`${this.fsUrl(newPath)}?rename`, { method: "POST", headers });
     await checkError(resp);
+  }
+
+  #sourcePathHeaders(name: string, path: string): Record<string, string> {
+    // Fetch headers reject arbitrary UTF-8/control characters and trim edge
+    // whitespace. Keep ordinary ASCII compatible with older servers and use the server's
+    // explicit path encoding for other valid filenames.
+    return this.authHeaders(/[^\x20-\x7e]/.test(path) || path.trim() !== path
+      ? { [name]: Buffer.from(path, "utf8").toString("base64url"), "X-Dat9-Path-Encoding": "base64url" }
+      : { [name]: path });
   }
 
   async mkdir(path: string, mode = 0o755): Promise<void> {

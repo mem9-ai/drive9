@@ -31,6 +31,37 @@ async function main() {
 main().catch(console.error);
 ```
 
+## Just Bash
+
+`Drive9Fs` implements Just Bash's filesystem interface and persists shell file
+operations through this SDK. Import it from the optional `drive9/just-bash`
+entry point; the main SDK does not load Just Bash.
+
+```typescript
+import { Bash, InMemoryFs, MountableFs } from "just-bash";
+import { Client } from "drive9";
+import { Drive9Fs } from "drive9/just-bash";
+
+const client = Client.defaultClient();
+const fs = new MountableFs({ base: new InMemoryFs() });
+// /agent-work/ must already exist on Drive9.
+fs.mount("/workspace", new Drive9Fs(client, { root: "/agent-work" }));
+const bash = new Bash({ fs, cwd: "/workspace" });
+
+await bash.exec('echo "persistent notes" > notes.txt');
+console.log((await bash.exec("cat notes.txt")).stdout);
+```
+
+Requires Node.js >=20.19 and Just Bash 3.6.x. From this checkout, run
+`npm install` and `npm run example:just-bash -- --cleanup` with
+`DRIVE9_SERVER` and `DRIVE9_API_KEY` set. The example creates a unique remote
+directory, verifies persistence across fresh runtimes, and removes it with
+`--cleanup`; omit that flag to retain the files.
+
+See the [integration guide](../../docs/guides/just-bash-integration.md) for
+capabilities, limitations, credentials, and test commands, and the
+[runnable example](examples/just-bash.mjs).
+
 ## Config auto-loading
 
 `Client.defaultClient()` reads `~/.drive9/config` automatically:

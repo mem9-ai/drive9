@@ -339,7 +339,7 @@ run_ts() {
   else
     (cd "$pkgdir" && npm install >/dev/null 2>&1 || true)
   fi
-  if (cd "$pkgdir" && npx vitest run tests/integration.test.ts 2>&1); then
+  if (cd "$pkgdir" && npx vitest run tests/integration.test.ts tests/just-bash.integration.test.ts 2>&1); then
     RESULT_TS=pass
   else
     RESULT_TS=fail
