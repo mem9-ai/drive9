@@ -631,11 +631,11 @@ func TestPortStatReplyFencedByViewReset(t *testing.T) {
 				var aout gofuse.AttrOut
 				ino := f.inodes.EnsureInode("/f", false, 3, time.Now())
 				st := f.GetAttr(nil, &gofuse.GetAttrIn{InHeader: gofuse.InHeader{NodeId: ino}}, &aout)
-				done <- reply{st, aout.Attr.Mode & 0o777}
+				done <- reply{st, aout.Mode & 0o777}
 			default:
 				var out gofuse.EntryOut
 				st := f.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "f", &out)
-				done <- reply{st, out.Attr.Mode & 0o777}
+				done <- reply{st, out.Mode & 0o777}
 			}
 		}()
 		<-term.entered
