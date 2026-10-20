@@ -261,3 +261,98 @@ func TestPortPendingChmodUsesLocalKey(t *testing.T) {
 		t.Fatal("metadata was written under the remote key")
 	}
 }
+
+// A write continuing after the rename must commit on top of the LANDED
+// revision: the landing returned by UploadSync was not fed back to the live
+// handle, so its next flush CASed on the pre-rename revision and conflicted.
+func TestPortRenameSettlesHandleRevision(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/a", []byte("HELLO"))
+	ch, wb, _ := newWriteCacheStack(t, PolicyWriteBack, b)
+	ctx := context.Background()
+	h := open(t, ch, "/a")
+	if err := h.Write(ctx, 0, []byte("NEW!!")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/a", Path2: "/moved"}); err != nil {
+		t.Fatalf("rename = %v", err)
+	}
+	if err := h.Write(ctx, 5, []byte("AFTER")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := wb.Drain(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if node, ok := b.Node("/moved"); !ok || string(node.Data) != "NEW!!AFTER" {
+		t.Fatalf("/moved = %q ok=%v, want NEW!!AFTER", node.Data, ok)
+	}
+}
+
+// A rename OVER an open target keeps the target's descriptors on the OLD
+// object's bytes.
+func TestPortRenameOverOpenTargetKeepsItsImage(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/a", []byte("HELLO"))
+	b.Seed("/b", []byte("OTHER"))
+	ch, _, _ := newWriteCacheStack(t, PolicyWriteBack, b)
+	ctx := context.Background()
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/b", Flags: 0})
+	if err != nil || res.Handle == nil {
+		t.Fatalf("open target = %v", err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/a", Path2: "/b"}); err != nil {
+		t.Fatalf("rename = %v", err)
+	}
+	buf := make([]byte, 16)
+	n, err := res.Handle.Read(ctx, 0, buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(buf[:n]); got != "OTHER" {
+		t.Fatalf("overwritten target fd read %q, want OTHER", got)
+	}
+	_ = res.Handle.Release(ctx)
+}
+
+// The deferred-unlink snapshot survives the queue cancel: the anonymous fd
+// keeps reading the OLD object after a same-name recreate lands.
+func TestPortDeferredUnlinkSnapshotSurvivesRecreate(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/a", []byte("HELLO"))
+	ch, wb := newStagedStack(t, PolicyWriteBack, b)
+	ctx := context.Background()
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/a", Flags: 0})
+	if err != nil || res.Handle == nil {
+		t.Fatalf("open = %v", err)
+	}
+	wb.MarkPathUnlinked("/a")
+	// Recreate and commit a NEW file at the same name.
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/a"}); err != nil && !fs.IsNotFound(err) {
+		t.Fatalf("unlink = %v", err)
+	}
+	h2 := open(t, ch, "/a")
+	if err := h2.Write(ctx, 0, []byte("FRESH")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h2.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := h2.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 16)
+	n, err := res.Handle.Read(ctx, 0, buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(buf[:n]); got != "HELLO" {
+		t.Fatalf("anonymous fd read %q after recreate, want HELLO", got)
+	}
+	_ = res.Handle.Release(ctx)
+}

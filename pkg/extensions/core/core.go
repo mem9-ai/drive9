@@ -125,6 +125,12 @@ type Core struct {
 	// readFlight dedups concurrent remote reads of one range:
 	// thundering-herd FUSE reads on an uncached file collapse into a
 	// single HTTP fetch.
+	// viewEpoch advances on every checkout/reset (a 401 or an SSE
+	// reconnect). A stat dispatched before the reset must not publish its
+	// negative row into the namespace cache — the facade's reply fence
+	// comes too late, the pollution survives and hides the new view's file.
+	viewEpoch atomic.Uint64
+
 	// syncHandles tracks terminal handles so a rename can retarget them:
 	// without it a core-only chain (no writeback) left an open fd on the
 	// OLD name, so its next write recreated the old path and /moved kept
@@ -198,6 +204,9 @@ func New(cl *client.Client, opts Options) (*Core, error) {
 // caller sees EACCES.
 func (c *Core) AttachEvents(bus *fs.EventBus) {
 	c.bus = bus
+	if bus != nil {
+		bus.On(fs.EventCheckout, func(fs.Event) { c.viewEpoch.Add(1) })
+	}
 }
 
 // mapErr folds backend failures into fs identities, announcing a view
@@ -479,8 +488,16 @@ func (h *SyncHandle) Read(ctx context.Context, off int64, dest []byte) (int, err
 }
 
 // Write durably commits data at off.
+//
+// The handle lock is held for the WHOLE commit: a concurrent rename
+// retarget waits here, so the write either completes against the old name
+// before the move (which then carries the data) or starts against the new
+// one. Without it a write paused mid-PUT resumed after the rename and
+// recreated the old name from its retry.
 func (h *SyncHandle) Write(ctx context.Context, off int64, data []byte) error {
-	return h.core.WriteSync(ctx, h.Path(), off, data, 0)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.core.WriteSync(ctx, h.path, off, data, 0)
 }
 
 // Sync implements fs.Handle.
@@ -529,6 +546,7 @@ func (c *Core) retargetSyncHandles(oldPath, newPath string) {
 // and negative rows), then a remote stat with transient-retry absorption,
 // with the legacy parent-listing fallback as the last resort.
 func (c *Core) statOp(ctx context.Context, path string) (fs.Result, error) {
+	epoch := c.viewEpoch.Load()
 	if attr, ok := c.statFromNamespaceCache(path); ok {
 		if attr == nil {
 			// Cached-negative rows (negative entry, complete miss, session
@@ -545,6 +563,13 @@ func (c *Core) statOp(ctx context.Context, path string) (fs.Result, error) {
 			// v1 cacheRemoteNotFoundPath: a remote-observed miss seeds a
 			// short-lived negative row (the storm escalation rides along;
 			// lock files never seed).
+			if c.viewEpoch.Load() != epoch {
+				// The 404 belongs to a view a reset replaced: seeding the
+				// negative row would hide the new view's file for its TTL
+				// (the facade's generation fence only rejects the reply, not
+				// this cache write).
+				return fs.Result{}, fs.ErrNotFound
+			}
 			if rec, ok := c.dirCache.(interface {
 				RecordRemoteNotFound(parent, name string) bool
 			}); ok {

@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -152,5 +154,60 @@ func TestPortCoreRenameRetargetsOpenHandle(t *testing.T) {
 	}
 	if _, ok := b.Node("/a"); ok {
 		t.Fatal("old name was recreated by the open handle")
+	}
+}
+
+// A 404 that belongs to a REPLACED view must not seed the namespace cache:
+// the facade's reply fence comes too late, and the negative row would hide
+// the new view's file for its TTL.
+func TestPortStale404DoesNotSeedNegativeCache(t *testing.T) {
+	var heads atomic.Int32
+	gate := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead && strings.HasSuffix(r.URL.Path, "/f") {
+			if heads.Add(1) == 1 {
+				once.Do(func() { close(gate) })
+				<-release
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Length", "3")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "2")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(ts.Close)
+	bus := fs.NewEventBus()
+	c, err := New(client.New(ts.URL, ""), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.AttachEvents(bus)
+	c.Attach(dircache.NewNamespaceCache(time.Minute, time.Minute, 0))
+	done := make(chan error, 1)
+	go func() {
+		_, derr := c.Do(context.Background(), &fs.Op{Kind: fs.OpGetAttr, Path: "/f"}, nil)
+		done <- derr
+	}()
+	<-gate
+	// Another request's 401 reset: the in-flight 404 is now stale.
+	bus.Emit(fs.Event{Kind: fs.EventCheckout, Path: "/"})
+	close(release)
+	if err := <-done; !fs.IsNotFound(err) {
+		t.Fatalf("stale 404 = %v, want not-found", err)
+	}
+	// The retry must reach the server again — a polluted negative row would
+	// answer without a HEAD.
+	res, err := c.Do(context.Background(), &fs.Op{Kind: fs.OpGetAttr, Path: "/f"}, nil)
+	if err != nil || res.Attr == nil {
+		t.Fatalf("second stat = %+v err=%v, want the new view's file", res.Attr, err)
+	}
+	if heads.Load() < 2 {
+		t.Fatalf("HEAD count = %d, want the retried stat to revalidate", heads.Load())
 	}
 }

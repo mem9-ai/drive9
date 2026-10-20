@@ -607,7 +607,10 @@ func (w *Writeback) MarkPathUnlinked(p string) {
 				}
 			}
 		}
-		w.queue.CancelPath(p)
+		// CancelPathPreserveLocal: a plain CancelPath also deletes the
+		// shadow the snapshot above just wrote, so the anonymous fd fell
+		// through to the recreated same-name file's bytes.
+		w.queue.CancelPathPreserveLocal(p)
 	}
 	if w.wbCache != nil {
 		w.wbCache.Remove(p)
@@ -1232,26 +1235,37 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		// name's staged entry dies: a straggler landing after the remote
 		// rename resurrects the old name (git's lock→config rename left
 		// config.lock behind and the next lock create EEXISTs).
+		landedRev, landedSize := int64(0), int64(0)
+		land := func(p string) error {
+			if w.wbCache == nil || w.uploader == nil {
+				return nil
+			}
+			meta, ok := w.wbCache.GetMeta(p)
+			if !ok {
+				return nil
+			}
+			rev, err := w.uploader.UploadSyncWithRevision(ctx, p)
+			if err != nil {
+				return err
+			}
+			w.uploader.WaitPath(p)
+			w.wbCache.RemoveIfGeneration(p, meta.Generation)
+			if rev > 0 {
+				landedRev, landedSize = rev, meta.Size
+				w.landedAt(p, rev, meta.Size)
+			}
+			return nil
+		}
 		if w.uploader != nil {
 			w.uploader.WaitPath(op.Path)
 			w.uploader.WaitPath(op.Path2)
 		}
-		if w.wbCache != nil && w.uploader != nil {
-			if meta, ok := w.wbCache.GetMeta(op.Path); ok {
-				if err := w.uploader.UploadSync(ctx, op.Path); err != nil {
-					// The staged image is the acknowledged content of the
-					// old name; losing it to a failed upload and letting
-					// the rename move the stale remote image would drop
-					// the write with no retry source. Fail the rename —
-					// the staging stays for the retry.
-					return fs.Result{}, fmt.Errorf("land staged image before rename %s: %w", op.Path, err)
-				}
-				w.uploader.WaitPath(op.Path)
-				// Retire only the generation that uploaded: a fresher
-				// staging published during the upload still needs its own
-				// landing (or the retargeted writer's flush).
-				w.wbCache.RemoveIfGeneration(op.Path, meta.Generation)
-			}
+		if err := land(op.Path); err != nil {
+			// The staged image is the acknowledged content of the old name;
+			// losing it to a failed upload and letting the rename move the
+			// stale remote image would drop the write with no retry source.
+			// Fail the rename — the staging stays for the retry.
+			return fs.Result{}, fmt.Errorf("land staged image before rename %s: %w", op.Path, err)
 		}
 		// renames only after the old path's pending data landed:
 		// flush live writers (staging + enqueue), wait the queue out for
@@ -1274,14 +1288,8 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			w.waitPathCommit(op.Path)
 			w.waitPathCommit(op.Path2)
 		}
-		if w.wbCache != nil && w.uploader != nil {
-			if meta, ok := w.wbCache.GetMeta(op.Path); ok {
-				if err := w.uploader.UploadSync(ctx, op.Path); err != nil {
-					return fs.Result{}, fmt.Errorf("land flushed image before rename %s: %w", op.Path, err)
-				}
-				w.uploader.WaitPath(op.Path)
-				w.wbCache.RemoveIfGeneration(op.Path, meta.Generation)
-			}
+		if err := land(op.Path); err != nil {
+			return fs.Result{}, fmt.Errorf("land flushed image before rename %s: %w", op.Path, err)
 		}
 		// A lazy-created writer that never landed has no remote entry to
 		// rename: its buffer simply moves (PrepareRename's local
@@ -1297,12 +1305,28 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			w.retarget(op.Path, op.Path2)
 			return fs.Result{}, nil
 		}
+		// A rename over an OPEN target replaces the object its descriptors
+		// were reading: mark them anonymous BEFORE the remote rename (their
+		// clean images are snapshotted for post-overwrite reads), or they
+		// keep reading /b and silently see the source's bytes.
+		w.markUnlinked(op.Path2, false)
 		res, err := next(ctx, op)
 		if err != nil {
+			// The rename failed: the target's descriptors are still bound
+			// to its object, so restore their writable/visible state.
+			w.markLinked(op.Path2, false)
 			return res, err
 		}
 		w.forgetLanded(op.Path)
 		w.retarget(op.Path, op.Path2)
+		// The landed image's revision is the new base for every retargeted
+		// writer, and the new path's committed watermark: without it the
+		// next flush CASed on the pre-rename revision and the upload
+		// conflicted, silently dropping the acknowledged bytes.
+		if landedRev > 0 {
+			w.settleRenamedHandle(op.Path2, landedRev, landedSize)
+			w.landedAt(op.Path2, landedRev, landedSize)
+		}
 		// staged descendants migrate to the new
 		// prefix alongside the remote rename.
 		if w.wbCache != nil {
@@ -1597,6 +1621,33 @@ func (h *bufferingHandle) Read(ctx context.Context, off int64, dest []byte) (int
 		} else if ok {
 			return n, nil
 		}
+		// An ANONYMOUS fd (its name was unlinked or overwritten) reads its
+		// own unlink snapshot FIRST: the pending/shadow tiers below now
+		// describe the REPLACEMENT object that reused the name, and serving
+		// them handed the old fd the new file's bytes.
+		if h.unlinked {
+			if h.w.opts.Staging != nil && h.w.unlinkedShadowServed(h.path) {
+				// The snapshot is GENERATION-bound: a replacement that
+				// reused the name wrote a newer generation at the same
+				// path key, and reading the current one served its bytes.
+				gen := h.w.unlinkedShadowGeneration(h.path)
+				if gen != 0 {
+					n, rerr := h.w.opts.Staging.Shadow.ReadAtGen(gen, off, dest)
+					if rerr == nil || rerr == io.EOF {
+						return n, nil
+					}
+				} else if data, rerr := h.w.opts.Staging.Shadow.ReadAll(h.path); rerr == nil && data != nil {
+					if off >= int64(len(data)) {
+						return 0, nil
+					}
+					return copy(dest, data[off:]), nil
+				}
+			}
+			if h.inner == nil {
+				return 0, fs.ErrNotFound
+			}
+			return h.inner.Read(ctx, off, dest)
+		}
 		// Read-your-staged-writes (v1 pendingIndex overlay): a released handle's
 		// image lives in the shadow store until the queue lands it — the remote
 		// still 404s inside that window and the .dat/.meta entry is gone (the
@@ -1627,17 +1678,6 @@ func (h *bufferingHandle) Read(ctx context.Context, off int64, dest []byte) (int
 		// stale remote base underneath.
 		if n, ok := h.w.readAliasStagedImage(h, off, dest); ok {
 			return n, nil
-		}
-		// An anonymous clean fd of a deleted name reads its unlink snapshot
-		// (v1 survivor): the remote is about to lose the object at last
-		// close, and the fd must keep serving the pre-delete image.
-		if h.w.opts.Staging != nil && h.w.unlinkedShadowServed(h.path) {
-			if data, rerr := h.w.opts.Staging.Shadow.ReadAll(h.path); rerr == nil && data != nil {
-				if off >= int64(len(data)) {
-					return 0, nil
-				}
-				return copy(dest, data[off:]), nil
-			}
 		}
 		// A pending-overlay handle (read-only re-open of a not-yet-landed
 		// image) has no inner terminal: serve its PINNED shadow generation,
@@ -2673,6 +2713,12 @@ func (w *Writeback) markUnlinked(p string, under bool) {
 			// carries no pending entry, so nothing ever re-uploads it.
 			w.snapshotUnlinkedClean(h)
 		}
+	} else {
+		// No shadow plane (the .dat/.meta cache track): keep the image on
+		// the handle itself.
+		for _, h := range clean {
+			w.snapshotUnlinkedImage(h)
+		}
 	}
 }
 
@@ -2703,7 +2749,71 @@ func (w *Writeback) snapshotUnlinkedClean(h *bufferingHandle) {
 	if err := st.Shadow.WriteFull(h.path, buf, h.baseRev); err != nil {
 		return
 	}
-	w.recordUnlinkedSnapshot(h.path, st.Shadow.ActiveGeneration(h.path))
+	// Keep the bytes on the handle too: the store reuses the per-path
+	// shadow file for the replacement's generation, so a generation token
+	// alone can read the NEW file's bytes. A read-only fd serves this
+	// memory copy; a writable fd keeps its buffer semantics.
+	if h.flags&uint32(syscall.O_ACCMODE) == uint32(syscall.O_RDONLY) {
+		h.mu.Lock()
+		if h.pendingImage == nil {
+			h.pendingImage = buf
+		}
+		h.mu.Unlock()
+	}
+	// Pin the snapshot: the name may be re-created (and its staging write
+	// a NEW generation at the same key) before the anonymous fd closes,
+	// and an unpinned generation is retired within the store.
+	gen := st.Shadow.Pin(h.path)
+	w.recordUnlinkedSnapshot(h.path, gen)
+}
+
+// snapshotUnlinkedImage is the no-staging form of
+// snapshotUnlinkedClean: the clean fd's current image is captured into the
+// handle itself, so a rename-over or unlink keeps serving the OLD object's
+// bytes without a shadow plane.
+func (w *Writeback) snapshotUnlinkedImage(h *bufferingHandle) {
+	if h.inner == nil || h.baseSize <= 0 || h.baseSize > unlinkedSnapshotMaxBytes {
+		return
+	}
+	buf := make([]byte, h.baseSize)
+	ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
+	defer cancel()
+	n, err := h.inner.Read(ctx, 0, buf)
+	if err != nil || int64(n) != h.baseSize {
+		return
+	}
+	h.mu.Lock()
+	if h.pendingImage == nil {
+		h.pendingImage = buf
+	}
+	h.mu.Unlock()
+}
+
+// settleRenamedHandle rebases the writers retargeted onto path onto the
+// revision the rename landed: their next commit must CAS on it (the
+// pre-rename revision no longer exists server-side, so every commit
+// conflicted and the acknowledged bytes silently never landed).
+func (w *Writeback) settleRenamedHandle(path string, rev, size int64) {
+	if rev <= 0 {
+		return
+	}
+	w.liveSet.Range(func(key, _ any) bool {
+		h, ok := key.(*bufferingHandle)
+		if !ok {
+			return true
+		}
+		h.mu.Lock()
+		if h.path == path && !h.unlinked {
+			if rev > h.baseRev {
+				h.baseRev = rev
+			}
+			if size >= 0 {
+				h.baseSize = size
+			}
+		}
+		h.mu.Unlock()
+		return true
+	})
 }
 
 // recordUnlinkedSnapshot installs the unlink-snapshot marker with the
@@ -2726,6 +2836,14 @@ func (w *Writeback) recordUnlinkedSnapshot(path string, gen uint64) {
 
 // unlinkedShadowServed reports whether a path has an unlink snapshot in
 // the shadow (the read fallback for anonymous clean fds).
+// unlinkedShadowGeneration returns the shadow generation the unlink
+// snapshot captured (0 for a legacy marker).
+func (w *Writeback) unlinkedShadowGeneration(path string) uint64 {
+	w.unlinkedMu.Lock()
+	defer w.unlinkedMu.Unlock()
+	return w.unlinkedShadowGen[path]
+}
+
 func (w *Writeback) unlinkedShadowServed(path string) bool {
 	w.unlinkedMu.Lock()
 	defer w.unlinkedMu.Unlock()
@@ -2743,6 +2861,9 @@ func (w *Writeback) dropUnlinkedShadow(path string) {
 	w.unlinkedMu.Unlock()
 	if w.opts.Staging == nil {
 		return
+	}
+	if gen != 0 {
+		w.opts.Staging.Shadow.Unpin(gen)
 	}
 	// Generation-fenced removal: when the path was re-created after the
 	// unlink, its new staging replaced the snapshot's generation, and the
