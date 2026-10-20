@@ -128,6 +128,14 @@ func TestPortGetAttrServesTimeOverride(t *testing.T) {
 		switch {
 		case r.URL.Path == "/v1/status":
 			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/":
+			// The facade's ancestor search stats the root: report a real
+			// traversable directory (the fixture previously looked like a
+			// 0644 file, which no caller can search). The mode header is
+			// decimal, as the server writes it.
+			w.Header().Set("X-Dat9-IsDir", "true")
+			w.Header().Set("X-Dat9-Mode", "493") // 0o755
+			w.WriteHeader(http.StatusOK)
 		case r.Method == http.MethodHead:
 			w.Header().Set("Content-Length", "3")
 			w.Header().Set("X-Dat9-IsDir", "false")

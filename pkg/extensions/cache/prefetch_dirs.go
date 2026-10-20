@@ -61,6 +61,9 @@ type dirPrefetcher struct {
 	writing  map[string]time.Time
 	client   *client.Client
 	root     string
+	// genFn reports the cache's reset epoch: a background publish whose
+	// fetch crossed a checkout must not repopulate the cleared tiers.
+	genFn func() uint64
 
 	// namespace answers lookups from cached listings (facade attaches it).
 	namespace fs.DirListingCache
@@ -70,6 +73,19 @@ type dirPrefetcher struct {
 	contentMaxBytes int64
 	contentMaxFile  int64
 	contentTimeout  time.Duration
+}
+
+// generation returns the reset epoch (0 when no cache wired it).
+func (p *dirPrefetcher) generation() uint64 {
+	if p.genFn == nil {
+		return 0
+	}
+	return p.genFn()
+}
+
+// staleSince reports whether a reset replaced the view since gen.
+func (p *dirPrefetcher) staleSince(gen uint64) bool {
+	return p.generation() != gen
 }
 
 // SetNamespaceCache wires the facade-owned listing cache.
@@ -150,10 +166,14 @@ func (c *Cache) prefetchDirContents(ctx context.Context, dir string, entries []f
 		for i, cand := range chunk {
 			paths[i] = cand.remote
 		}
+		gen := p.generation()
 		pctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), p.contentTimeout)
 		results, err := p.client.BatchReadSmallCtx(pctx, paths, p.contentMaxFile)
 		cancel()
 		if err != nil {
+			return
+		}
+		if p.staleSince(gen) {
 			return
 		}
 		for i, result := range results {
@@ -301,8 +321,12 @@ func (p *dirPrefetcher) refreshSiblingMetadata(ctx context.Context, dir string) 
 	}
 	bctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), dirPrefetchTimeout)
 	defer cancel()
+	gen := p.generation()
 	results, err := p.client.BatchStatCtx(bctx, remote)
 	if err != nil {
+		return
+	}
+	if p.staleSince(gen) {
 		return
 	}
 	observer, canObserve := p.namespace.(interface {
@@ -396,13 +420,32 @@ func (p *dirPrefetcher) loadSiblingDirectory(load func(ctx context.Context, op *
 	defer p.finishDirLoad(dir)
 	ctx, cancel := context.WithTimeout(context.Background(), dirPrefetchTimeout)
 	defer cancel()
+	// A checkout may replace the view while this sibling LIST is in
+	// flight: publishing its pre-reset rows would repopulate the cleared
+	// namespace cache with the old names.
+	gen := p.generation()
 	res, err := load(ctx, &fs.Op{Kind: fs.OpList, Path: dir})
 	if err != nil {
 		return
 	}
 	items := make([]fs.DirEntryInfo, 0, len(res.Entries))
 	for _, e := range res.Entries {
-		items = append(items, fs.DirEntryInfo{Name: e.Name, IsDir: e.Attr.IsDir(), Size: e.Attr.Size, Mode: e.Attr.Mode, HasMode: true, Rev: e.Attr.Rev, Mtime: e.Attr.Mtime, Nlink: e.Attr.Nlink, ResourceID: e.Attr.ResourceID})
+		items = append(items, fs.DirEntryInfo{
+			Name: e.Name, IsDir: e.Attr.IsDir(), Size: e.Attr.Size,
+			Mode: e.Attr.Mode, HasMode: true, Rev: e.Attr.Rev, Mtime: e.Attr.Mtime, Nlink: e.Attr.Nlink,
+			// The sibling listing feeds the namespace cache that LOOKUP
+			// stats resolve from: dropping the identity fields degraded a
+			// cached extent row (ExtentIno) and its owner.
+			ResourceID: e.Attr.ResourceID,
+			ExtentIno:  e.Attr.ExtentIno,
+			Uid:        e.Attr.Uid,
+			Gid:        e.Attr.Gid,
+			HasUID:     e.Attr.HasOwner,
+			HasGID:     e.Attr.HasOwner,
+		})
+	}
+	if p.staleSince(gen) {
+		return
 	}
 	p.namespace.Put(dir, items)
 }

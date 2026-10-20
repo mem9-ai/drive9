@@ -542,9 +542,25 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 			if oldLocal != newLocal {
 				return fs.Result{}, syscall.EXDEV
 			}
+			// Metadata-only nodes under the source live in TWO registries:
+			// our localSpecials mirror and the specials plane's records.
+			// Move the records through the specials handler per node (its
+			// exact-record path stays local, so the remote namespace is not
+			// touched — a forwarding rename is not an option for a
+			// local-classified path), then migrate our mirror.
+			olds := f.localSpecialNodes(op.Path)
 			if err := f.overlay.Rename(op.Path, op.Path2); err != nil {
 				return fs.Result{}, err
 			}
+			for _, child := range olds {
+				from := child
+				to := op.Path2
+				if from != op.Path {
+					to = op.Path2 + from[len(op.Path):]
+				}
+				_, _ = next(ctx, &fs.Op{Kind: fs.OpRename, Path: from, Path2: to})
+			}
+			f.migrateLocalSpecialPrefix(op.Path, op.Path2)
 			return fs.Result{}, nil
 		}
 		// Remote rename: keep the backing coherent around the commit —
@@ -761,6 +777,43 @@ func (f *Localize) localSpecialEntries(dir string) []fs.Entry {
 		out = append(out, fs.Entry{Name: name, Attr: attr})
 	}
 	return out
+}
+
+// localSpecialNodes lists the recorded special paths at p or below it.
+func (f *Localize) localSpecialNodes(p string) []string {
+	prefix := strings.TrimSuffix(p, "/") + "/"
+	f.specialMu.Lock()
+	defer f.specialMu.Unlock()
+	var out []string
+	for path := range f.localSpecials {
+		if path == p || strings.HasPrefix(path, prefix) {
+			out = append(out, path)
+		}
+	}
+	return out
+}
+
+// migrateLocalSpecialPrefix moves the recorded special nodes of a renamed
+// path (a directory's descendants included) to the new prefix.
+func (f *Localize) migrateLocalSpecialPrefix(oldPath, newPath string) {
+	oldPrefix := strings.TrimSuffix(oldPath, "/") + "/"
+	newPrefix := strings.TrimSuffix(newPath, "/") + "/"
+	f.specialMu.Lock()
+	defer f.specialMu.Unlock()
+	moves := make(map[string]fs.Attr)
+	for p, attr := range f.localSpecials {
+		switch {
+		case p == oldPath:
+			moves[newPath] = attr
+			delete(f.localSpecials, p)
+		case strings.HasPrefix(p, oldPrefix):
+			moves[newPrefix+strings.TrimPrefix(p, oldPrefix)] = attr
+			delete(f.localSpecials, p)
+		}
+	}
+	for p, attr := range moves {
+		f.localSpecials[p] = attr
+	}
 }
 
 // hasLocalSpecialUnder reports whether any local special node lives in the

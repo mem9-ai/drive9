@@ -1616,6 +1616,19 @@ func (f *FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *gofus
 	}
 	entry, _ := f.inodes.GetEntry(input.NodeId)
 	caller := fs.CallerFrom(input.InHeader)
+	ctx, cf := fuseCtx(cancel)
+	defer cf()
+	// A path-level setattr (chmod/chown/truncate addressed by inode, no
+	// FATTR_FH) is a mutation of the name: without default_permissions the
+	// kernel does not check the path prefix, so the caller must hold SEARCH
+	// permission on every ancestor — a chmod previously succeeded for a
+	// caller that could not traverse the parent. Descriptor ops were gated
+	// at open and stay exempt.
+	if !f.defaultPermissions && input.Valid&gofuse.FATTR_FH == 0 && input.Fh == 0 {
+		if st := f.checkAncestorSearch(ctx, path, caller); st != gofuse.OK {
+			return st
+		}
+	}
 	// v1: times and ownership are mount-local (the backend derives mtimes
 	// from writes and has no chown verb). Apply them before anything else
 	// so utimensat/chown never wait behind remote work, arming the local
@@ -1643,8 +1656,6 @@ func (f *FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *gofus
 			})
 		}
 	}
-	ctx, cf := fuseCtx(cancel)
-	defer cf()
 	op := &fs.Op{Kind: fs.OpSetAttr, Path: path, Ino: input.NodeId, Fh: input.Fh, Kernel: input, Caller: fs.CallerFrom(input.InHeader), Size: -1}
 	if owner := f.openHandle(input.Fh); owner != nil {
 		// The owning plane's guards key on op.Handle; leaving it unset

@@ -1,8 +1,12 @@
 package fuse
 
 import (
-	"os"
 	"testing"
+	"time"
+
+	"github.com/hanwen/go-fuse/v2/fuse"
+
+	"github.com/mem9-ai/drive9/pkg/fs"
 )
 
 func TestParseOwner(t *testing.T) {
@@ -19,16 +23,43 @@ func TestParseOwner(t *testing.T) {
 	}
 }
 
+// The mount owner is the reply's fallback; an inode's stored owner (a
+// mount-local chown) wins — v1 DefaultOwner's "files without a stored
+// owner" rule.
 func TestDefaultOwnerAppliesOnlyToFilesWithoutStoredOwner(t *testing.T) {
-	fs := NewDat9FS(nil, &MountOptions{DefaultOwner: &Owner{UID: 1000, GID: 1001}})
-	if owner := fs.entryOwner(&InodeEntry{}); owner.Uid != 1000 || owner.Gid != 1001 {
-		t.Fatalf("default owner = %+v", owner)
+	core := newMemCore()
+	f := newTestFS(t, core)
+	f.uid, f.gid = 1000, 1001
+
+	var out fuse.Attr
+	f.fillAttr(fs.Attr{Kind: fs.KindFile, Mode: 0o644}, 1, &out)
+	if out.Uid != 1000 || out.Gid != 1001 {
+		t.Fatalf("default owner = %d:%d", out.Uid, out.Gid)
 	}
-	if owner := fs.entryOwner(&InodeEntry{Uid: 501, HasUID: true, Gid: 20, HasGID: true}); owner.Uid != 501 || owner.Gid != 20 {
-		t.Fatalf("stored owner = %+v", owner)
+	f.inodes.UpdateOwner(1, 501, 20, true, true)
+	f.fillAttr(fs.Attr{Kind: fs.KindFile, Mode: 0o644}, 1, &out)
+	if out.Uid != 501 || out.Gid != 20 {
+		t.Fatalf("stored owner = %d:%d", out.Uid, out.Gid)
 	}
-	plain := NewDat9FS(nil, &MountOptions{})
-	if owner := plain.entryOwner(&InodeEntry{}); owner.Uid != uint32(os.Getuid()) {
-		t.Fatalf("without --owner = %+v", owner)
+}
+
+// The public options carry the sandbox owner and the credential policy
+// into the internal config.
+func TestMountConfigCarriesOwnerAndCredentialPolicy(t *testing.T) {
+	owner := &Owner{UID: 1000, GID: 1001}
+	cfg := mountConfigFromOptions(&MountOptions{
+		Server: "https://drive9.example", DefaultOwner: owner, OmitProcessStateCredentials: true,
+	})
+	if cfg.DefaultOwner == nil || cfg.DefaultOwner.UID != 1000 || cfg.DefaultOwner.GID != 1001 {
+		t.Fatalf("DefaultOwner = %+v", cfg.DefaultOwner)
+	}
+	if !cfg.OmitProcessStateCredentials {
+		t.Fatal("OmitProcessStateCredentials not carried into the config")
+	}
+	state := newMountProcessState(&MountOptions{
+		Server: "https://drive9.example", OmitProcessStateCredentials: true,
+	}, "/mnt", 1, "api_key", "", time.Unix(1, 0).UTC())
+	if state.Server != "" {
+		t.Fatalf("process state server = %q, want empty", state.Server)
 	}
 }

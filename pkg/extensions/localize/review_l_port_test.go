@@ -205,3 +205,54 @@ func TestPortLocalSpecialNodeVisibleAndRemovable(t *testing.T) {
 		t.Fatalf("rmdir with a special child = %v, want ENOTEMPTY", err)
 	}
 }
+
+// A directory rename moves BOTH registries holding local metadata-only
+// nodes: our mirror and the specials plane's records.
+func TestPortLocalSpecialFollowsDirRename(t *testing.T) {
+	ts := httptest.NewServer(testbackend.NewBackend())
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	f, err := New(Options{LocalRoot: t.TempDir(), LocalOnlyPatterns: []string{"**/node_modules/**"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sp, err := specials.New(specials.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := fs.NewChain(f, sp, terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMkdir, Path: "/repo/node_modules/d", Mode: 0o755}); err != nil {
+		t.Fatal(err)
+	}
+	fifo := "/repo/node_modules/d/fifo"
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMknod, Path: fifo, Mode: uint32(syscall.S_IFIFO) | 0o644}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/repo/node_modules/d", Path2: "/repo/node_modules/moved"}); err != nil {
+		t.Fatalf("rename = %v", err)
+	}
+	moved := "/repo/node_modules/moved/fifo"
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: moved})
+	if err != nil || res.Attr == nil || res.Attr.Mode&syscall.S_IFMT != syscall.S_IFIFO {
+		t.Fatalf("lookup moved fifo = %v attr=%+v", err, res.Attr)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: fifo}); err == nil {
+		t.Fatal("old special path still resolves after the rename")
+	}
+	// The specials record moved too: a duplicate create at the new name is
+	// EEXIST, and a fresh mknod at the old name succeeds.
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMknod, Path: moved, Mode: uint32(syscall.S_IFIFO) | 0o644}); err != syscall.EEXIST {
+		t.Fatalf("duplicate at moved = %v, want EEXIST", err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMknod, Path: fifo, Mode: uint32(syscall.S_IFIFO) | 0o644}); err != nil {
+		t.Fatalf("mknod at the old name = %v, want success", err)
+	}
+}

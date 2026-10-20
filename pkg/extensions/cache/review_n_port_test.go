@@ -8,6 +8,8 @@ package cache
 import (
 	"bytes"
 	"context"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/mem9-ai/drive9/internal/testbackend"
@@ -150,5 +152,97 @@ func TestPortCheckoutFencesHandleReadAdmission(t *testing.T) {
 	<-done
 	if _, ok := c.ReadCached("/f", 7); ok {
 		t.Fatal("pre-reset bytes admitted into the read cache from a handle read")
+	}
+}
+
+// A per-path invalidated event drops the open handles' prefetched blocks
+// too (Read serves them ahead of the invalidated tiers).
+func TestPortInvalidatedDropsOpenHandlePrefetch(t *testing.T) {
+	const size = 5 << 20
+	b := testbackend.NewBackend()
+	b.Seed("/big.bin", bytes.Repeat([]byte("A"), size))
+	url := newTestServer(t, b)
+	cl := client.New(url, "")
+	bus := fs.NewEventBus()
+	c, err := New(Options{MaxSize: 64 << 20, MaxFileSize: 1 << 20, SequentialPrefetch: true, PrefetchClient: cl, Events: bus})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch := newChain(t, url, c)
+	res, err := ch.Dispatch(context.Background(), &fs.Op{Kind: fs.OpCreate, Path: "/big.bin", Flags: 0})
+	if err != nil || res.Handle == nil {
+		t.Fatalf("open = %v", err)
+	}
+	h := res.Handle
+	ctx := context.Background()
+	if _, err := h.Read(ctx, 0, make([]byte, 64<<10)); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.WriteCtx(ctx, "/big.bin", bytes.Repeat([]byte("B"), size)); err != nil {
+		t.Fatal(err)
+	}
+	bus.Emit(fs.Event{Kind: fs.EventInvalidated, Path: "/big.bin"})
+	next := make([]byte, 64<<10)
+	if _, err := h.Read(ctx, 64<<10, next); err != nil {
+		t.Fatal(err)
+	}
+	if next[0] != 'B' {
+		t.Fatalf("read after invalidate = %q..., want the new image", next[:4])
+	}
+}
+
+// recNamespace is a bare DirListingCache recording publications.
+type recNamespace struct {
+	mu      sync.Mutex
+	puts    map[string][]fs.DirEntryInfo
+	upserts []fs.DirEntryInfo
+}
+
+func (n *recNamespace) Get(string) ([]fs.DirEntryInfo, bool) { return nil, false }
+func (n *recNamespace) Put(dir string, entries []fs.DirEntryInfo) {
+	n.mu.Lock()
+	if n.puts == nil {
+		n.puts = map[string][]fs.DirEntryInfo{}
+	}
+	n.puts[dir] = append([]fs.DirEntryInfo(nil), entries...)
+	n.mu.Unlock()
+}
+func (n *recNamespace) Upsert(_ string, entry fs.DirEntryInfo) {
+	n.mu.Lock()
+	n.upserts = append(n.upserts, entry)
+	n.mu.Unlock()
+}
+func (n *recNamespace) Invalidate(string)       {}
+func (n *recNamespace) InvalidatePrefix(string) {}
+func (n *recNamespace) InvalidateAll()          {}
+
+// The sibling listing publication preserves the extent identity/ownership
+// and is fenced by the reset epoch.
+func TestPortSiblingPrefetchKeepsIdentityAndFencesReset(t *testing.T) {
+	var epoch atomic.Uint64
+	ns := &recNamespace{}
+	p := &dirPrefetcher{namespace: ns, genFn: func() uint64 { return epoch.Load() }}
+	entries := []fs.Entry{{
+		Name: "f", Attr: fs.Attr{Kind: fs.KindFile, Mode: 0o644, Size: 3, Rev: 7,
+			ResourceID: "res-1", ExtentIno: 77, Uid: 2000, Gid: 2000, HasOwner: true},
+	}}
+	load := func(ctx context.Context, op *fs.Op) (fs.Result, error) {
+		return fs.Result{Entries: entries}, nil
+	}
+	p.loadSiblingDirectory(load, "/d")
+	got := ns.puts["/d"]
+	if len(got) != 1 || got[0].ExtentIno != 77 || !got[0].HasUID || got[0].Uid != 2000 || got[0].ResourceID != "res-1" {
+		t.Fatalf("sibling row = %+v, want the extent identity/owner preserved", got)
+	}
+
+	// A reset while the LIST is in flight: the publish must be dropped.
+	epoch.Add(1)
+	racing := func(ctx context.Context, op *fs.Op) (fs.Result, error) {
+		epoch.Add(1)
+		return fs.Result{Entries: entries}, nil
+	}
+	p.loadSiblingDirectory(racing, "/reset")
+	if _, ok := ns.puts["/reset"]; ok {
+		t.Fatal("pre-reset sibling listing repopulated the cleared namespace cache")
 	}
 }

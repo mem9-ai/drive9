@@ -229,3 +229,33 @@ func TestPortBusyDirHandleRemembersReset(t *testing.T) {
 		t.Fatalf("entries = %+v, want the post-reset listing", dh.entries)
 	}
 }
+
+// A path-level setattr is a mutation of the name: the caller needs SEARCH
+// permission on every ancestor. A FATTR_FH descriptor op is exempt (it was
+// gated at open).
+func TestPortSetAttrRequiresAncestorSearch(t *testing.T) {
+	core := newMemCore()
+	core.paths["/locked"] = &memEntry{isDir: true, mode: 0o644}
+	core.paths["/locked/f"] = &memEntry{mode: 0o600}
+	f := newTestFS(t, core)
+	ino := lookupForTest(t, f, "/locked/f").NodeId
+
+	pathOp := &gofuse.SetAttrIn{}
+	pathOp.NodeId = ino
+	pathOp.Valid = gofuse.FATTR_MODE
+	pathOp.Mode = 0o600
+	pathOp.Caller = gofuse.Caller{Owner: gofuse.Owner{Uid: 1000, Gid: 1000}, Pid: 1}
+	var aout gofuse.AttrOut
+	if st := f.SetAttr(nil, pathOp, &aout); st != gofuse.EACCES {
+		t.Fatalf("path setattr without ancestor search = %v, want EACCES", st)
+	}
+	handleOp := &gofuse.SetAttrIn{}
+	handleOp.NodeId = ino
+	handleOp.Valid = gofuse.FATTR_MODE | gofuse.FATTR_FH
+	handleOp.Mode = 0o600
+	handleOp.Fh = 7
+	handleOp.Caller = gofuse.Caller{Owner: gofuse.Owner{Uid: 1000, Gid: 1000}, Pid: 1}
+	if st := f.SetAttr(nil, handleOp, &aout); st != gofuse.OK {
+		t.Fatalf("descriptor setattr = %v, want OK", st)
+	}
+}

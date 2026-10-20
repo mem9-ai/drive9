@@ -132,6 +132,9 @@ func New(opts Options) (*Cache, error) {
 		}
 	}
 	c.dirs = newDirPrefetcher(opts.PrefetchClient, opts.RemoteRoot)
+	// Background prefetch publications share the reset epoch: a fetch that
+	// raced a checkout must not repopulate the cleared caches.
+	c.dirs.genFn = func() uint64 { return c.epoch.Load() }
 	c.dirs.contentEnabled = opts.DirContentPrefetch
 	c.dirs.contentMaxFiles = opts.PrefetchMaxFiles
 	if c.dirs.contentMaxFiles <= 0 {
@@ -175,12 +178,7 @@ func New(opts Options) (*Cache, error) {
 			}
 		})
 		opts.Events.On(fs.EventDelete, func(e fs.Event) {
-			c.mem.Invalidate(e.Path)
-			c.mem.InvalidatePrefix(e.Path + "/")
-			if c.dsk != nil {
-				c.dsk.InvalidateFile(pathDiskReadCacheFileID(e.Path))
-				c.dsk.InvalidatePathPrefix(e.Path + "/")
-			}
+			c.invalidatePathTiers(e.Path)
 		})
 		// A remote-origin change invalidates that path's cached images (v1
 		// invalidateReadCacheAndTargets was per-path); only a checkout/reset
@@ -190,12 +188,7 @@ func New(opts Options) (*Cache, error) {
 				c.invalidateAllTiers()
 				return
 			}
-			c.mem.Invalidate(e.Path)
-			c.mem.InvalidatePrefix(e.Path + "/")
-			if c.dsk != nil {
-				c.dsk.InvalidateFile(pathDiskReadCacheFileID(e.Path))
-				c.dsk.InvalidatePathPrefix(e.Path + "/")
-			}
+			c.invalidatePathTiers(e.Path)
 		})
 		opts.Events.On(fs.EventCheckout, func(e fs.Event) {
 			c.invalidateAllTiers()
@@ -214,6 +207,36 @@ func New(opts Options) (*Cache, error) {
 		})
 	}
 	return c, nil
+}
+
+// invalidatePathTiers drops one path's (and its subtree's) images from the
+// memory/disk tiers AND invalidates the matching open handles' block
+// prefetchers — Read serves prefetched blocks ahead of the invalidated
+// tiers, so a per-file SSE change that skipped them kept answering the old
+// bytes until a full checkout.
+func (c *Cache) invalidatePathTiers(path string) {
+	c.mem.Invalidate(path)
+	c.mem.InvalidatePrefix(path + "/")
+	if c.dsk != nil {
+		c.dsk.InvalidateFile(pathDiskReadCacheFileID(path))
+		c.dsk.InvalidatePathPrefix(path + "/")
+	}
+	prefix := strings.TrimSuffix(path, "/") + "/"
+	c.open.Range(func(key, _ any) bool {
+		h, ok := key.(*cachingHandle)
+		if !ok {
+			return true
+		}
+		p := h.identity()
+		if p == path || strings.HasPrefix(p, prefix) {
+			h.mu.Lock()
+			if h.prefetch != nil {
+				h.prefetch.Invalidate()
+			}
+			h.mu.Unlock()
+		}
+		return true
+	})
 }
 
 // invalidateAllTiers drops the whole-file memory/disk caches AND every open
