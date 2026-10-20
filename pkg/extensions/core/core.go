@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -124,6 +125,12 @@ type Core struct {
 	// readFlight dedups concurrent remote reads of one range:
 	// thundering-herd FUSE reads on an uncached file collapse into a
 	// single HTTP fetch.
+	// syncHandles tracks terminal handles so a rename can retarget them:
+	// without it a core-only chain (no writeback) left an open fd on the
+	// OLD name, so its next write recreated the old path and /moved kept
+	// the stale bytes.
+	syncHandles sync.Map
+
 	// bus announces view resets (401) to the facade; resetPending coalesces
 	// a burst of 401s into one asynchronous reset.
 	bus          *fs.EventBus
@@ -291,6 +298,10 @@ func (c *Core) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, erro
 		if err := c.renameRemote(ctx, op.Path, op.Path2); err != nil {
 			return fs.Result{}, c.mapErr(err)
 		}
+		// Open terminal handles follow the name: a core-only chain has no
+		// writeback retarget hook, and a stale handle would write the old
+		// path back into existence.
+		c.retargetSyncHandles(op.Path, op.Path2)
 		return fs.Result{}, nil
 	case fs.OpSymlink:
 		if err := c.symlinkRemote(ctx, op.Target, op.Path); err != nil {
@@ -408,6 +419,7 @@ func (c *Core) WriteSync(ctx context.Context, path string, off int64, data []byt
 // whole-file commit. Sync/Flush/Release are no-ops — nothing is buffered.
 type SyncHandle struct {
 	core *Core
+	mu   sync.RWMutex
 	path string
 }
 
@@ -445,12 +457,21 @@ func (h *SyncHandle) IsRemoteNamespaceReadable() bool { return true }
 // path, and a name that is unlinked and later recreated belongs to a
 // different object by then.
 func (h *SyncHandle) RetargetTo(newPath string) {
+	h.mu.Lock()
 	h.path = newPath
+	h.mu.Unlock()
+}
+
+// Path returns the handle's current name.
+func (h *SyncHandle) Path() string {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.path
 }
 
 // Read fills dest with content at off.
 func (h *SyncHandle) Read(ctx context.Context, off int64, dest []byte) (int, error) {
-	data, err := h.core.fetchRemote(ctx, h.core.remotePath(h.path), off, int64(len(dest)))
+	data, err := h.core.fetchRemote(ctx, h.core.remotePath(h.Path()), off, int64(len(dest)))
 	if err != nil {
 		return 0, h.core.mapErr(err)
 	}
@@ -459,7 +480,7 @@ func (h *SyncHandle) Read(ctx context.Context, off int64, dest []byte) (int, err
 
 // Write durably commits data at off.
 func (h *SyncHandle) Write(ctx context.Context, off int64, data []byte) error {
-	return h.core.WriteSync(ctx, h.path, off, data, 0)
+	return h.core.WriteSync(ctx, h.Path(), off, data, 0)
 }
 
 // Sync implements fs.Handle.
@@ -469,7 +490,40 @@ func (h *SyncHandle) Sync(ctx context.Context) error { return nil }
 func (h *SyncHandle) Flush(ctx context.Context) error { return nil }
 
 // Release implements fs.Handle.
-func (h *SyncHandle) Release(ctx context.Context) error { return nil }
+func (h *SyncHandle) Release(ctx context.Context) error {
+	if h.core != nil {
+		h.core.syncHandles.Delete(h)
+	}
+	return nil
+}
+
+// newSyncHandle registers a terminal handle for rename retargeting.
+func (c *Core) newSyncHandle(path string) *SyncHandle {
+	h := &SyncHandle{core: c, path: path}
+	c.syncHandles.Store(h, struct{}{})
+	return h
+}
+
+// retargetSyncHandles moves every open terminal handle under a renamed path
+// (directory descendants included).
+func (c *Core) retargetSyncHandles(oldPath, newPath string) {
+	oldPrefix := strings.TrimSuffix(oldPath, "/") + "/"
+	newPrefix := strings.TrimSuffix(newPath, "/") + "/"
+	c.syncHandles.Range(func(key, _ any) bool {
+		h, ok := key.(*SyncHandle)
+		if !ok {
+			return true
+		}
+		p := h.Path()
+		switch {
+		case p == oldPath:
+			h.RetargetTo(newPath)
+		case strings.HasPrefix(p, oldPrefix):
+			h.RetargetTo(newPrefix + strings.TrimPrefix(p, oldPrefix))
+		}
+		return true
+	})
+}
 
 // statOp serves OpLookup / OpGetAttr: the namespace cache first (positive
 // and negative rows), then a remote stat with transient-retry absorption,
@@ -729,7 +783,7 @@ func (c *Core) createOp(ctx context.Context, op *fs.Op) (fs.Result, error) {
 								if statErr != nil {
 									return fs.Result{}, c.mapErr(statErr)
 								}
-								return fs.Result{Attr: attrOf(st), Handle: &SyncHandle{core: c, path: op.Path}}, nil
+								return fs.Result{Attr: attrOf(st), Handle: c.newSyncHandle(op.Path)}, nil
 							}
 							if !errors.Is(err, client.ErrConflict) {
 								break
@@ -764,7 +818,7 @@ func (c *Core) createOp(ctx context.Context, op *fs.Op) (fs.Result, error) {
 	// at a commit boundary above the terminal — PUTting the remote here
 	// would change crash semantics (an open that crashes before any write
 	// must leave the remote intact).
-	return fs.Result{Attr: attrOf(st), Handle: &SyncHandle{core: c, path: op.Path}}, nil
+	return fs.Result{Attr: attrOf(st), Handle: c.newSyncHandle(op.Path)}, nil
 }
 
 // setAttrOp serves OpSetAttr. The probe comes first: it yields the kind (directory chmod goes to the

@@ -165,3 +165,99 @@ func TestPortLiveWriterReadLoadsLazyParts(t *testing.T) {
 		t.Fatalf("read@8MiB = %v (n=%d), want %v", buf[:n], n, payload[8<<20:8<<20+4])
 	}
 }
+
+// The flush after the pre-rename upload can stage a NEW generation under the
+// OLD path; it must land before the remote rename, or the acknowledged bytes
+// are stranded and the rename moves the stale image.
+func TestPortRenameLandsFlushedImage(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/old", []byte("OLD!"))
+	ch, wb, cache := newWriteCacheStack(t, PolicyWriteBack, b)
+	ctx := context.Background()
+	h := open(t, ch, "/old")
+	if err := h.Write(ctx, 0, []byte("NEW!")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/old", Path2: "/new"}); err != nil {
+		t.Fatalf("rename = %v", err)
+	}
+	if err := h.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := wb.Drain(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if node, ok := b.Node("/new"); !ok || string(node.Data) != "NEW!" {
+		t.Fatalf("/new = %q ok=%v, want NEW!", node.Data, ok)
+	}
+	if _, ok := cache.GetMeta("/old"); ok {
+		t.Fatal("staging survived under the old path after the rename")
+	}
+}
+
+// A size-only SETATTR reply keeps the object's permissions.
+func TestPortFtruncateReplyKeepsMode(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/f", []byte("hello"))
+	ch, _, _ := newWriteCacheStack(t, PolicyWriteBack, b)
+	ctx := context.Background()
+	h := open(t, ch, "/f")
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpSetAttr, Path: "/f", Size: 2, Handle: h})
+	if err != nil {
+		t.Fatalf("ftruncate = %v", err)
+	}
+	if res.Attr == nil || res.Attr.Mode&0o777 != 0o644 || res.Attr.Size != 2 {
+		t.Fatalf("ftruncate reply = %+v, want size 2 and the permissions kept", res.Attr)
+	}
+	if err := h.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A pending chmod updates the write-back metadata under the LOCAL key even
+// on a subtree mount (no live writer: the image is staged in the cache).
+func TestPortPendingChmodUsesLocalKey(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/team/f", []byte("hello"))
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	cache, err := staging.NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wb, err := New(Options{Policy: PolicyWriteBack, Client: cl, RemoteRoot: "/team", WriteCache: cache})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := core.New(cl, core.Options{RemoteRoot: "/team"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := fs.NewChain(wb, terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	// Stage an image under the LOCAL key with the object's real permissions.
+	if err := cache.PutWithBaseRevAndMode("/f", []byte("EDIT"), 5, staging.PendingOverwrite, 1, 0o644, true); err != nil {
+		t.Fatal(err)
+	}
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpSetAttr, Path: "/f", HasMode: true, Mode: 0o600, Size: -1})
+	if err != nil || res.Attr == nil || res.Attr.Mode&0o777 != 0o600 {
+		t.Fatalf("chmod = %+v err=%v", res.Attr, err)
+	}
+	meta, ok := cache.GetMeta("/f")
+	if !ok || !meta.HasMode || meta.Mode&0o777 != 0o600 {
+		t.Fatalf("staged meta = %+v ok=%v, want the local key to carry mode 0600", meta, ok)
+	}
+	if _, ok := cache.GetMeta("/team/f"); ok {
+		t.Fatal("metadata was written under the remote key")
+	}
+}

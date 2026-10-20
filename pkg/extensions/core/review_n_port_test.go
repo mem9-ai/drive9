@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -110,5 +111,46 @@ func TestPortNamespaceStatKeepsSplitOwnerFlags(t *testing.T) {
 	}
 	if res.Attr == nil || res.Attr.HasUID || !res.Attr.HasGID || res.Attr.Gid != 2000 {
 		t.Fatalf("attr = %+v, want HasGID-only with gid 2000", res.Attr)
+	}
+}
+
+// A core-only chain (no writeback) must retarget open terminal handles on a
+// rename: the old fd's next write would otherwise recreate the old name and
+// leave /moved stale.
+func TestPortCoreRenameRetargetsOpenHandle(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/a", []byte("HELLO"))
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	c, err := New(client.New(ts.URL, ""), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := fs.NewChain(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/a", Flags: uint32(syscall.O_CREAT | syscall.O_RDWR)})
+	if err != nil || res.Handle == nil {
+		t.Fatalf("open = %v", err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/a", Path2: "/moved"}); err != nil {
+		t.Fatalf("rename = %v", err)
+	}
+	if err := res.Handle.Write(ctx, 0, []byte("X")); err != nil {
+		t.Fatalf("write after rename = %v", err)
+	}
+	if err := res.Handle.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := res.Handle.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if node, ok := b.Node("/moved"); !ok || string(node.Data) != "XELLO" {
+		t.Fatalf("/moved = %q ok=%v, want XELLO", node.Data, ok)
+	}
+	if _, ok := b.Node("/a"); ok {
+		t.Fatal("old name was recreated by the open handle")
 	}
 }

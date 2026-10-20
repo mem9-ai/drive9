@@ -1257,12 +1257,31 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		// flush live writers (staging + enqueue), wait the queue out for
 		// the old path, then rename remotely — otherwise a queued commit
 		// would resurrect the old name after the rename.
+		//
+		// The flush may create a NEW pending generation under the OLD path
+		// (the small-file .dat/.meta track stages without uploading and
+		// clears the buffer's dirty flag): that image must land here too,
+		// or the rename moves the stale remote image, retargets the handle,
+		// and every later fsync/release looks for staging under the NEW
+		// path and reports success without publishing the acknowledged
+		// write. Flush/landing failures abort the rename.
 		if h := w.handleFor(op.Path); h != nil {
-			_ = h.Flush(ctx)
+			if err := h.Flush(ctx); err != nil {
+				return fs.Result{}, fmt.Errorf("flush writer before rename %s: %w", op.Path, err)
+			}
 		}
 		if w.queue != nil {
 			w.waitPathCommit(op.Path)
 			w.waitPathCommit(op.Path2)
+		}
+		if w.wbCache != nil && w.uploader != nil {
+			if meta, ok := w.wbCache.GetMeta(op.Path); ok {
+				if err := w.uploader.UploadSync(ctx, op.Path); err != nil {
+					return fs.Result{}, fmt.Errorf("land flushed image before rename %s: %w", op.Path, err)
+				}
+				w.uploader.WaitPath(op.Path)
+				w.wbCache.RemoveIfGeneration(op.Path, meta.Generation)
+			}
 		}
 		// A lazy-created writer that never landed has no remote entry to
 		// rename: its buffer simply moves (PrepareRename's local
@@ -1375,7 +1394,11 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			// same attr-cache reason as the live-handle deferral above.
 			if w.wbCache != nil {
 				if meta, ok := w.wbCache.GetMeta(op.Path); ok {
-					if err := w.wbCache.UpdateMode(w.remotePath(op.Path), op.Mode&0o7777); err == nil {
+					// The write-back cache is keyed by the LOCAL path
+					// (GetMeta/staging writes); RemoteRoot applies only at
+					// the HTTP boundary. Updating the remote key silently
+					// missed and left the uploaded mode stale.
+					if err := w.wbCache.UpdateMode(op.Path, op.Mode&0o7777); err == nil {
 						return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Mode: op.Mode & 0o7777, Size: meta.Size}}, nil
 					}
 				}
@@ -1444,7 +1467,10 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 						// kernel's 30s attr cache with 0000 and every later
 						// open EACCESes under default_permissions.
 						if !hasMode {
-							mode = 0o644
+							// A size-only SETATTR must preserve the object's
+							// permissions: 0644 here overwrote a 0600 file's
+							// mode in the facade's inode write-back.
+							mode = w.currentModeOf(ctx, op.Path)
 						}
 						w.invalidate(op.Path, op.Size)
 						return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Mode: mode, Size: op.Size}}, nil
@@ -1483,7 +1509,10 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 						return fs.Result{}, mapErr(err)
 					}
 					w.invalidate(op.Path, op.Size)
-					return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Size: op.Size}}, nil
+					// Same rule on the streamed branch: a Mode-less reply
+					// let the facade record 0000 and the owner's next open
+					// fail with EACCES.
+					return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Mode: w.currentModeOf(ctx, op.Path), Size: op.Size}}, nil
 				}
 				// No remote entry (lazy-created or already gone): fall
 				// through and let the terminal answer.
@@ -2429,6 +2458,22 @@ func mapErr(err error) error {
 // statForTruncate resolves a path's remote size for the streaming-truncate
 // claim. ok=false (missing remote entry or a lookup error other than
 // not-found defers the decision) lets the op continue down the chain.
+// currentModeOf resolves a file's current permission bits for a size-only
+// SETATTR reply: the staged metadata wins (it carries a deferred chmod),
+// then a remote stat; a lazy-created file has no remote entry and keeps the
+// create default.
+func (w *Writeback) currentModeOf(ctx context.Context, path string) uint32 {
+	if w.wbCache != nil {
+		if meta, ok := w.wbCache.GetMeta(path); ok && meta.HasMode {
+			return meta.Mode & 0o7777
+		}
+	}
+	if st, err := w.opts.Client.StatCtx(ctx, w.remotePath(path)); err == nil && st != nil && st.HasMode {
+		return st.Mode & 0o7777
+	}
+	return 0o644
+}
+
 func (w *Writeback) statForTruncate(ctx context.Context, path string) (fs.Attr, bool) {
 	st, err := w.opts.Client.StatCtx(ctx, w.remotePath(path))
 	if err != nil || st == nil {

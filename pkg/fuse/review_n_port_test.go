@@ -790,3 +790,55 @@ func TestPortStatWriteBackKeepsSpecialBits(t *testing.T) {
 		t.Fatalf("lookup /f mode = %#o", fEntry.Mode)
 	}
 }
+
+// staleNotFoundTerminal: the first file stat answers (gated) NOT FOUND from
+// the old view; later stats see the file.
+type staleNotFoundTerminal struct {
+	calls   atomic.Int32
+	gate    chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (s *staleNotFoundTerminal) Do(ctx context.Context, op *fs.Op, _ fs.Next) (fs.Result, error) {
+	if op.Path == "/" {
+		return fs.Result{Attr: &fs.Attr{Kind: fs.KindDir, Mode: 0o755}}, nil
+	}
+	if s.calls.Add(1) == 1 {
+		s.once.Do(func() { close(s.gate) })
+		<-s.release
+		return fs.Result{}, fs.ErrNotFound
+	}
+	return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Mode: 0o644, Size: 3}}, nil
+}
+
+// A delayed 404 from the OLD view must not be cached as the new view's
+// answer: the retry sees the file.
+func TestPortStaleLookupMissIsRetried(t *testing.T) {
+	for _, kind := range []fs.OpKind{fs.OpLookup, fs.OpGetAttr} {
+		term := &staleNotFoundTerminal{gate: make(chan struct{}), release: make(chan struct{})}
+		bus := fs.NewEventBus()
+		f, err := New(Options{Extensions: []fs.Handler{term}, Uid: 1000, Gid: 1000, Events: bus})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ino := f.inodes.EnsureInode("/f", false, 3, time.Now())
+		done := make(chan gofuse.Status, 1)
+		go func() {
+			switch kind {
+			case fs.OpGetAttr:
+				var aout gofuse.AttrOut
+				done <- f.GetAttr(nil, &gofuse.GetAttrIn{InHeader: gofuse.InHeader{NodeId: ino}}, &aout)
+			default:
+				var out gofuse.EntryOut
+				done <- f.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "f", &out)
+			}
+		}()
+		<-term.gate
+		bus.Emit(fs.Event{Kind: fs.EventCheckout, Path: "/"})
+		close(term.release)
+		if st := <-done; st != gofuse.OK {
+			t.Fatalf("%v of a stale 404 = %v, want the retried current view", kind, st)
+		}
+	}
+}

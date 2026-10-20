@@ -1474,12 +1474,12 @@ func (f *FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name string
 	for attempt := 0; ; attempt++ {
 		gen := f.viewGen.Load()
 		res, err = f.dispatchErr(ctx, &fs.Op{Kind: fs.OpLookup, Path: child, Ino: header.NodeId, Kernel: header, Caller: fs.CallerFrom(*header)})
-		if err != nil {
-			break
-		}
 		if gen == f.viewGen.Load() {
 			break
 		}
+		// A stale reply is retried regardless of its status: a delayed 404
+		// from the replaced view must not be cached as a negative entry
+		// while the new view has the file.
 		if attempt >= 24 || (attempt >= statViewRetries && time.Now().After(deadline)) {
 			// The reply kept describing a replaced view: EAGAIN so the
 			// caller retries instead of caching pre-reset identity.
@@ -1533,19 +1533,20 @@ func (f *FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *gofus
 	for attempt := 0; ; attempt++ {
 		gen := f.viewGen.Load()
 		res, st = f.dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: path, Ino: input.NodeId, Fh: input.Fh(), Kernel: input, Caller: fs.CallerFrom(input.InHeader)})
-		if st != gofuse.OK {
-			// This attempt dispatched against the CURRENT view: its error
-			// (ENOENT/EACCES) is the answer. A previous attempt's stale
-			// state must not rewrite it into EAGAIN.
-			return st
-		}
 		if gen == f.viewGen.Load() {
+			// This attempt dispatched against the CURRENT view: its
+			// result OR error (ENOENT/EACCES) is the answer.
 			break
 		}
+		// A stale reply is retried regardless of its status: a delayed 404
+		// from the replaced view must not hide the new view's file.
 		if attempt >= 24 || (attempt >= statViewRetries && time.Now().After(deadline)) {
 			return gofuse.EAGAIN
 		}
 		time.Sleep(2 * time.Millisecond)
+	}
+	if st != gofuse.OK {
+		return st
 	}
 	if res.Attr == nil {
 		return gofuse.EIO
