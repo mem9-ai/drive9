@@ -119,10 +119,14 @@ func (g *RenameGuard) stat(ctx context.Context, next fs.Next, p string) (pathInf
 		uid, gid = res.Attr.Uid, res.Attr.Gid
 	}
 	return pathInfo{
-		path:      p,
-		exists:    true,
-		mode:      res.Attr.Mode,
-		hasMode:   res.Attr.Mode != 0,
+		path:   p,
+		exists: true,
+		mode:   res.Attr.Mode,
+		// A successful stat's mode is authoritative — including 000. The
+		// earlier `Mode != 0` test treated a chmod(000) directory as
+		// "unknown" and defaulted it to 0755, authorizing a rename the
+		// base refuses with EACCES.
+		hasMode:   true,
 		isDir:     res.Attr.IsDir(),
 		isSymlink: res.Attr.IsSymlink() || res.Attr.Mode&syscall.S_IFMT == syscall.S_IFLNK,
 		uid:       uid,

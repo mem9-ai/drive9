@@ -403,3 +403,105 @@ func TestPortLocalSpecialAliasSharesAttrs(t *testing.T) {
 		}
 	}
 }
+
+// A recreated name gets a FRESH node identity: a surviving alias keeps the
+// old node's metadata.
+func TestPortLocalSpecialCreateAfterUnlinkIsIndependent(t *testing.T) {
+	ch, _ := newLocalizeSpecialStack(t)
+	ctx := context.Background()
+	a := "/repo/node_modules/a.tmp"
+	b := "/repo/node_modules/b.tmp"
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMknod, Path: a, Mode: uint32(syscall.S_IFIFO) | 0o600}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpLink, Path: a, Path2: b}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: a}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMknod, Path: a, Mode: uint32(syscall.S_IFIFO) | 0o644}); err != nil {
+		t.Fatal(err)
+	}
+	// b keeps the OLD node (0600); a is the NEW node (0644).
+	bAttr, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: b})
+	if err != nil || bAttr.Attr == nil || bAttr.Attr.Mode&0o777 != 0o600 {
+		t.Fatalf("b attr = %+v err=%v, want 0600", bAttr.Attr, err)
+	}
+	aAttr, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: a})
+	if err != nil || aAttr.Attr == nil || aAttr.Attr.Mode&0o777 != 0o644 {
+		t.Fatalf("a attr = %+v err=%v, want 0644", aAttr.Attr, err)
+	}
+	// A chmod on the old node must not leak into the new one.
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpSetAttr, Path: b, HasMode: true, Mode: 0o400, Size: -1}); err != nil {
+		t.Fatal(err)
+	}
+	aAttr, err = ch.Dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: a})
+	if err != nil || aAttr.Attr == nil || aAttr.Attr.Mode&0o777 != 0o644 {
+		t.Fatalf("a after chmod(b) = %+v err=%v, want 0644", aAttr.Attr, err)
+	}
+}
+
+// Unlinking one alias refreshes the surviving node's link count.
+func TestPortLocalSpecialUnlinkRefreshesNlink(t *testing.T) {
+	ch, _ := newLocalizeSpecialStack(t)
+	ctx := context.Background()
+	a := "/repo/node_modules/a.tmp"
+	b := "/repo/node_modules/b.tmp"
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMknod, Path: a, Mode: uint32(syscall.S_IFIFO) | 0o644}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpLink, Path: a, Path2: b}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: a}); err != nil {
+		t.Fatal(err)
+	}
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: b})
+	if err != nil || res.Attr == nil || res.Attr.Nlink != 1 {
+		t.Fatalf("b after unlink(a) = %+v err=%v, want nlink 1", res.Attr, err)
+	}
+}
+
+// A REMOTE-parent directory rename moves the local special-node index too.
+func TestPortRemoteParentRenameMigratesLocalSpecials(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/repo/x", []byte("x"))
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	f, err := New(Options{LocalRoot: t.TempDir(), LocalOnlyPatterns: []string{"**/node_modules/**"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sp, err := specials.New(specials.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := fs.NewChain(f, sp, terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMkdir, Path: "/repo/node_modules/d", Mode: 0o755}); err != nil {
+		t.Fatal(err)
+	}
+	fifo := "/repo/node_modules/d/fifo"
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMknod, Path: fifo, Mode: uint32(syscall.S_IFIFO) | 0o644}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/repo", Path2: "/moved"}); err != nil {
+		t.Fatalf("remote-parent rename = %v", err)
+	}
+	moved := "/moved/node_modules/d/fifo"
+	if res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: moved}); err != nil || res.Attr == nil {
+		t.Fatalf("moved special = %+v err=%v", res.Attr, err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: fifo}); err == nil {
+		t.Fatal("old special path still resolves after the remote-parent rename")
+	}
+}

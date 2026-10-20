@@ -17,6 +17,7 @@ import (
 	"io"
 	iofs "io/fs"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -79,6 +80,10 @@ type Localize struct {
 	// its siblings (and the stale copy then wrote back through Lookup).
 	specialNode  map[string]string
 	specialAttrs map[string]fs.Attr
+	// specialNextID mints monotonic node ids. A pathname is NOT a stable
+	// identity: unlink(a) then create a again must not overwrite the node
+	// a surviving alias (b) still references.
+	specialNextID uint64
 }
 
 // token is an open overlay file: the terminal data-plane handle for a
@@ -428,7 +433,7 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 			return res, err
 		}
 		if metadataOnlyLocalMode(op.Mode) {
-			f.recordLocalSpecial(op.Path, fs.Attr{Kind: fs.KindFile, Mode: op.Mode, Rdev: op.Rdev, Nlink: 1})
+			f.createLocalSpecial(op.Path, fs.Attr{Kind: fs.KindFile, Mode: op.Mode, Rdev: op.Rdev, Nlink: 1})
 		}
 		return res, nil
 
@@ -451,6 +456,7 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 
 	case fs.OpUnlink:
 		if _, ok := f.localSpecial(op.Path); ok {
+			node, _ := f.localSpecialNodeID(op.Path)
 			// A metadata-only local node owns no backing file: let the
 			// specials plane drop its record, then retire ours (a duplicate
 			// mkfifo must not answer EEXIST afterwards).
@@ -459,6 +465,9 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 				return fs.Result{}, err
 			}
 			f.forgetLocalSpecial(op.Path)
+			// A surviving hardlink keeps the node: re-read its link count
+			// from the specials plane (the shared attr still said 2).
+			f.refreshLocalSpecialNode(ctx, next, node)
 			return res, nil
 		}
 		if o := f.overlayFor(ctx, inner, op.Path, false); o != nil {
@@ -596,6 +605,10 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 				return fs.Result{}, err
 			}
 		}
+		// The rename may have moved local-only special nodes under a REMOTE
+		// parent: the specials plane's records follow the remote rename,
+		// so our index must follow too or the two split.
+		f.migrateLocalSpecialPrefix(op.Path, op.Path2)
 		return res, nil
 
 	case fs.OpLink:
@@ -797,6 +810,11 @@ func metadataOnlyLocalMode(mode uint32) bool {
 
 func (f *Localize) recordLocalSpecial(path string, attr fs.Attr) {
 	f.specialMu.Lock()
+	f.recordLocalSpecialLocked(path, attr)
+	f.specialMu.Unlock()
+}
+
+func (f *Localize) recordLocalSpecialLocked(path string, attr fs.Attr) {
 	if f.specialNode == nil {
 		f.specialNode = map[string]string{}
 	}
@@ -805,9 +823,30 @@ func (f *Localize) recordLocalSpecial(path string, attr fs.Attr) {
 	}
 	node, ok := f.specialNode[path]
 	if !ok {
-		node = path
+		node = f.nextSpecialNodeLocked()
 		f.specialNode[path] = node
 	}
+	f.specialAttrs[node] = attr
+}
+
+func (f *Localize) nextSpecialNodeLocked() string {
+	f.specialNextID++
+	return "s" + strconv.FormatUint(f.specialNextID, 10)
+}
+
+// createLocalSpecial registers a NEWLY created node under a fresh identity —
+// even when the pathname was used before (a live alias may still reference
+// the old node).
+func (f *Localize) createLocalSpecial(path string, attr fs.Attr) {
+	f.specialMu.Lock()
+	if f.specialNode == nil {
+		f.specialNode = map[string]string{}
+	}
+	if f.specialAttrs == nil {
+		f.specialAttrs = map[string]fs.Attr{}
+	}
+	node := f.nextSpecialNodeLocked()
+	f.specialNode[path] = node
 	f.specialAttrs[node] = attr
 	f.specialMu.Unlock()
 }
@@ -908,6 +947,45 @@ func (f *Localize) localSpecial(path string) (fs.Attr, bool) {
 	}
 	attr, ok := f.specialAttrs[node]
 	return attr, ok
+}
+
+// localSpecialNodeID returns the shared node id behind path.
+func (f *Localize) localSpecialNodeID(path string) (string, bool) {
+	f.specialMu.Lock()
+	defer f.specialMu.Unlock()
+	node, ok := f.specialNode[path]
+	return node, ok
+}
+
+// refreshLocalSpecialNode re-reads a surviving node's authoritative attr
+// (link count included) from the specials plane after one alias was
+// removed.
+func (f *Localize) refreshLocalSpecialNode(ctx context.Context, next fs.Next, node string) {
+	if node == "" {
+		return
+	}
+	f.specialMu.Lock()
+	var survivor string
+	for p, n := range f.specialNode {
+		if n == node {
+			survivor = p
+			break
+		}
+	}
+	_, alive := f.specialAttrs[node]
+	f.specialMu.Unlock()
+	if survivor == "" || !alive {
+		return
+	}
+	got, err := next(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: survivor})
+	if err != nil || got.Attr == nil {
+		return
+	}
+	f.specialMu.Lock()
+	if _, ok := f.specialAttrs[node]; ok {
+		f.specialAttrs[node] = *got.Attr
+	}
+	f.specialMu.Unlock()
 }
 
 func (f *Localize) forgetLocalSpecial(path string) {

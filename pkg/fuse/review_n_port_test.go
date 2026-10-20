@@ -11,6 +11,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -709,5 +710,83 @@ func TestPortDirChmodZeroClosesAncestorSearch(t *testing.T) {
 	// must consult it (not an older 0755).
 	if st := f.Open(nil, &gofuse.OpenIn{InHeader: gofuse.InHeader{NodeId: fEntry.NodeId, Caller: gofuse.Caller{Owner: gofuse.Owner{Uid: 1000, Gid: 1000}, Pid: 1}}}, &gofuse.OpenOut{}); st != gofuse.EACCES {
 		t.Fatalf("open under 000 directory = %v, want EACCES (dir ino %d)", st, dEntry.NodeId)
+	}
+}
+
+// seqStatTerminal: the first file stat is gated (old view), the second
+// answers ENOENT (the reset view).
+type seqStatTerminal struct {
+	calls   atomic.Int32
+	gate    chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (s *seqStatTerminal) Do(ctx context.Context, op *fs.Op, _ fs.Next) (fs.Result, error) {
+	if op.Path == "/" {
+		return fs.Result{Attr: &fs.Attr{Kind: fs.KindDir, Mode: 0o755}}, nil
+	}
+	if s.calls.Add(1) == 1 {
+		s.once.Do(func() { close(s.gate) })
+		<-s.release
+		return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Mode: 0o644, Size: 3}}, nil
+	}
+	return fs.Result{}, fs.ErrNotFound
+}
+
+// An error confirmed in the CURRENT view is preserved: a previous attempt's
+// stale flag must not rewrite ENOENT into EAGAIN.
+func TestPortStatRetryPreservesCurrentViewError(t *testing.T) {
+	for _, kind := range []fs.OpKind{fs.OpGetAttr, fs.OpLookup} {
+		term := &seqStatTerminal{gate: make(chan struct{}), release: make(chan struct{})}
+		bus := fs.NewEventBus()
+		f, err := New(Options{Extensions: []fs.Handler{term}, Uid: 1000, Gid: 1000, Events: bus})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ino := f.inodes.EnsureInode("/f", false, 3, time.Now())
+		done := make(chan gofuse.Status, 1)
+		go func() {
+			switch kind {
+			case fs.OpGetAttr:
+				var aout gofuse.AttrOut
+				done <- f.GetAttr(nil, &gofuse.GetAttrIn{InHeader: gofuse.InHeader{NodeId: ino}}, &aout)
+			default:
+				var out gofuse.EntryOut
+				done <- f.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "f", &out)
+			}
+		}()
+		<-term.gate
+		bus.Emit(fs.Event{Kind: fs.EventCheckout, Path: "/"})
+		close(term.release)
+		if st := <-done; st != gofuse.ENOENT {
+			t.Fatalf("%v after reset = %v, want the current view's ENOENT", kind, st)
+		}
+	}
+}
+
+// Recording a successful stat's mode keeps sticky/setuid/setgid bits.
+func TestPortStatWriteBackKeepsSpecialBits(t *testing.T) {
+	core := newMemCore()
+	core.paths["/d"] = &memEntry{isDir: true, mode: 0o1777}
+	core.paths["/f"] = &memEntry{mode: 0o4755, data: []byte("x")}
+	f, err := New(Options{Extensions: []fs.Handler{core}, Uid: 1000, Gid: 1000, LocalDirAttrs: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dEntry := lookupForTest(t, f, "/d")
+	if dEntry.Attr.Mode != gofuse.S_IFDIR|0o1777 {
+		t.Fatalf("lookup /d mode = %#o", dEntry.Attr.Mode)
+	}
+	var dout gofuse.AttrOut
+	if st := f.GetAttr(nil, &gofuse.GetAttrIn{InHeader: gofuse.InHeader{NodeId: dEntry.NodeId}}, &dout); st != gofuse.OK {
+		t.Fatalf("getattr /d = %v", st)
+	}
+	if dout.Mode != gofuse.S_IFDIR|0o1777 {
+		t.Fatalf("getattr /d mode = %#o, want the sticky bits preserved", dout.Mode)
+	}
+	fEntry := lookupForTest(t, f, "/f")
+	if fEntry.Attr.Mode != gofuse.S_IFREG|0o4755 {
+		t.Fatalf("lookup /f mode = %#o", fEntry.Attr.Mode)
 	}
 }

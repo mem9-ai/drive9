@@ -1379,14 +1379,14 @@ func (f *FS) fillEntryOut(path string, a *fs.Attr, isDir bool, out *gofuse.Entry
 			// set included: the ancestor SEARCH check reads the entry, and
 			// skipping 000 kept the old 0755 authorizing traversal after a
 			// remote chmod(000). Keep the directory type.
-			f.inodes.UpdateMode(ino, syscall.S_IFDIR|mode&0o777)
+			f.inodes.UpdateMode(ino, syscall.S_IFDIR|mode&0o7777)
 		} else {
 			// Regular files record their permission bits too — a ZERO set
 			// included: the open access gate (no default_permissions) keys
 			// on entry.HasMode, and skipping 000 left the old 0644
 			// authorizing an open after a remote chmod(000). The terminal
 			// only answers a zero mode when it is authoritative.
-			f.inodes.UpdateMode(ino, syscall.S_IFREG|mode&0o777)
+			f.inodes.UpdateMode(ino, syscall.S_IFREG|mode&0o7777)
 		}
 	} else {
 		out.Ino = ino
@@ -1473,6 +1473,7 @@ func (f *FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name string
 	stale := false
 	for attempt := 0; ; attempt++ {
 		gen := f.viewGen.Load()
+		stale = false
 		res, err = f.dispatchErr(ctx, &fs.Op{Kind: fs.OpLookup, Path: child, Ino: header.NodeId, Kernel: header, Caller: fs.CallerFrom(*header)})
 		if err != nil {
 			break
@@ -1531,8 +1532,12 @@ func (f *FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *gofus
 	stale := false
 	for attempt := 0; ; attempt++ {
 		gen := f.viewGen.Load()
+		stale = false
 		res, st = f.dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: path, Ino: input.NodeId, Fh: input.Fh(), Kernel: input, Caller: fs.CallerFrom(input.InHeader)})
 		if st != gofuse.OK {
+			// This attempt dispatched against the CURRENT view: its error
+			// (ENOENT/EACCES) is the answer. A previous attempt's stale
+			// flag must not rewrite it into EAGAIN.
 			return st
 		}
 		stale = gen != f.viewGen.Load()

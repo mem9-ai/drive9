@@ -142,3 +142,28 @@ func TestRenamePreflightSymlinkParentELOOP(t *testing.T) {
 		t.Fatalf("rename via symlinked new parent = %v, want ELOOP", err)
 	}
 }
+
+// A successful stat's 000 directory mode is authoritative: it must not be
+// defaulted to 0755 and authorize the rename.
+func TestZeroParentModeIsAuthoritative(t *testing.T) {
+	g, err := New(Options{Uid: 1000, Gid: 1000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := func(ctx context.Context, op *fs.Op) (fs.Result, error) {
+		return fs.Result{Attr: &fs.Attr{Kind: fs.KindDir, Mode: 0}}, nil
+	}
+	info, err := g.stat(context.Background(), next, "/d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.hasMode || info.mode != 0 {
+		t.Fatalf("stat mode = %#o hasMode=%v, want the authoritative 000", info.mode, info.hasMode)
+	}
+	if got := info.modeOrDefault() & 0o777; got != 0 {
+		t.Fatalf("modeOrDefault = %#o, want 0 (not the 0755 default)", got)
+	}
+	if err := checkParentAccess(fs.Caller{Uid: 2000, Gid: 2000}, 1000, 1000, info); !errnoIs(err, syscall.EACCES) {
+		t.Fatalf("checkParentAccess = %v, want EACCES", err)
+	}
+}
