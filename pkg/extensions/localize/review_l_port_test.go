@@ -264,3 +264,49 @@ func TestPortLocalSpecialFollowsDirRename(t *testing.T) {
 		t.Fatalf("mknod at the old name = %v, want success", err)
 	}
 }
+
+// A hardlink of a metadata-only node is created by the specials plane (the
+// alias record), never by os.Link on a nonexistent backing file.
+func TestPortLocalSpecialHardlink(t *testing.T) {
+	ts := httptest.NewServer(testbackend.NewBackend())
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	f, err := New(Options{LocalRoot: t.TempDir(), LocalOnlyPatterns: []string{"**/node_modules/**"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sp, err := specials.New(specials.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := fs.NewChain(f, sp, terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	src := "/repo/node_modules/a.tmp"
+	dst := "/repo/node_modules/b.tmp"
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMknod, Path: src, Mode: uint32(syscall.S_IFIFO) | 0o644}); err != nil {
+		t.Fatalf("mknod = %v", err)
+	}
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpLink, Path: src, Path2: dst})
+	if err != nil {
+		t.Fatalf("link special = %v", err)
+	}
+	if res.Attr == nil || res.Attr.Mode&syscall.S_IFMT != syscall.S_IFIFO {
+		t.Fatalf("link reply = %+v, want a FIFO attr", res.Attr)
+	}
+	if a, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: dst}); err != nil || a.Attr == nil || a.Attr.Mode&syscall.S_IFMT != syscall.S_IFIFO {
+		t.Fatalf("alias lookup = %v attr=%+v", err, a.Attr)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: dst}); err != nil {
+		t.Fatalf("unlink alias = %v", err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: src}); err != nil {
+		t.Fatalf("source after alias unlink = %v", err)
+	}
+}

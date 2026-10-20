@@ -599,6 +599,21 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 			if srcLocal != dstLocal {
 				return fs.Result{}, syscall.EXDEV
 			}
+			if attr, ok := f.localSpecial(op.Path); ok {
+				// A metadata-only node has no backing file: the specials
+				// plane owns the record and creates the alias itself (its
+				// OpLink checks the target and registers the alias without
+				// touching the remote namespace).
+				res, err := next(ctx, &fs.Op{Kind: fs.OpLink, Path: op.Path, Path2: op.Path2})
+				if err != nil {
+					return fs.Result{}, err
+				}
+				if got, gerr := next(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: op.Path2}); gerr == nil && got.Attr != nil {
+					attr = *got.Attr
+				}
+				f.recordLocalSpecial(op.Path2, attr)
+				return res, nil
+			}
 			if err := f.overlay.Link(op.Path, op.Path2); err != nil {
 				return fs.Result{}, err
 			}

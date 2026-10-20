@@ -1365,14 +1365,12 @@ func (f *FS) fillEntryOut(path string, a *fs.Attr, isDir bool, out *gofuse.Entry
 			// plain regular mode — a retyped reply makes the kernel mark
 			// the live inode bad (the lchown EIO class).
 			f.inodes.UpdateMode(ino, mode)
-		} else if mode&0o777 != 0 {
-			// Regular files record their permission bits too: the open
-			// access gate (no default_permissions) keys on entry.HasMode,
-			// and leaving regular files unrecorded skipped the gate
-			// entirely — a fresh O_RDONLY of a mode-000 file read the
-			// contents. A zero mode is ambiguous at the chain boundary
-			// (chmod 000 vs "unknown"), so those fall to the gate's
-			// fresh-stat path instead of being recorded as 0000.
+		} else if mode&0o777 != 0 || !isDir {
+			// Regular files record their permission bits too — a ZERO set
+			// included: the open access gate (no default_permissions) keys
+			// on entry.HasMode, and skipping 000 left the old 0644
+			// authorizing an open after a remote chmod(000). The terminal
+			// only answers a zero mode when it is authoritative.
 			f.inodes.UpdateMode(ino, syscall.S_IFREG|mode&0o777)
 		}
 	} else {
@@ -1509,9 +1507,23 @@ func (f *FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *gofus
 	if res.Attr.Rev > 0 {
 		f.inodes.UpdateRevision(input.NodeId, res.Attr.Rev)
 	}
-	if res.Attr.Mode != 0 && res.Attr.Mode&syscall.S_IFMT != 0 {
-		f.inodes.UpdateMode(input.NodeId, res.Attr.Mode)
+	// A stat's permissions are authoritative, a zero permission set
+	// included: skipping 000 here left a stale 0644 entry keeping the open
+	// gate open after a remote chmod(000). The reply may carry permission
+	// bits only, so restore the inode's immutable type.
+	mode := res.Attr.Mode
+	if mode&syscall.S_IFMT == 0 {
+		if entry, eok := f.inodes.GetEntry(input.NodeId); eok && entry.HasMode && entry.Mode&syscall.S_IFMT != 0 {
+			mode |= entry.Mode & syscall.S_IFMT
+		} else if res.Attr.IsDir() {
+			mode |= syscall.S_IFDIR
+		} else if res.Attr.Kind == fs.KindSymlink {
+			mode |= syscall.S_IFLNK
+		} else {
+			mode |= syscall.S_IFREG
+		}
 	}
+	f.inodes.UpdateMode(input.NodeId, mode)
 	if res.Attr.ResourceID != "" || res.Attr.Nlink > 0 {
 		f.inodes.SetIdentityWithKind(input.NodeId, res.Attr.ResourceID, res.Attr.Nlink, res.Attr.IsDir())
 	}
@@ -2528,18 +2540,18 @@ func (f *FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte) (gof
 		if err != nil && !errors.Is(err, io.EOF) {
 			return nil, fs.StatusOf(err)
 		}
-		if n > 0 {
-			if f.viewGen.Load() != gen {
-				// The bytes were produced from a view a reset replaced while
-				// the read was in flight: EAGAIN makes the kernel retry
-				// instead of pinning pre-reset content in its page cache.
-				return nil, gofuse.EAGAIN
-			}
-			return gofuse.ReadResultData(buf[:n]), gofuse.OK
+		// EVERY successful reply is fenced — a zero-byte EOF included: an
+		// old-view EOF makes the kernel stop reading where the new view has
+		// data.
+		if f.viewGen.Load() != gen {
+			// The bytes were produced from a view a reset replaced while the
+			// read was in flight: EAGAIN makes the kernel retry instead of
+			// pinning pre-reset content in its page cache.
+			return nil, gofuse.EAGAIN
 		}
-		if err != nil {
-			return nil, fs.StatusOf(err)
-		}
+		// The result must be NON-NIL even at EOF: go-fuse only adjusts
+		// outPayload when ReadResult != nil, so a nil result (with OK)
+		// ships the whole request buffer as zero bytes instead of EOF.
 		return gofuse.ReadResultData(buf[:n]), gofuse.OK
 	}
 	path, ok := f.inodes.GetPath(input.NodeId)
@@ -2551,7 +2563,8 @@ func (f *FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte) (gof
 	if st != gofuse.OK {
 		return nil, st
 	}
-	if len(res.Data) > 0 && f.viewGen.Load() != gen {
+	if f.viewGen.Load() != gen {
+		// Empty (EOF) replies are fenced too: see the handle path.
 		return nil, gofuse.EAGAIN
 	}
 	return gofuse.ReadResultData(res.Data), gofuse.OK

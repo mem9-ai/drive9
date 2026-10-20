@@ -7,6 +7,7 @@ package fuse
 
 import (
 	"context"
+	"io"
 	"os"
 	"strings"
 	"sync"
@@ -443,5 +444,135 @@ func TestPortDispatchReadReplyFencedByViewReset(t *testing.T) {
 	close(ext.release)
 	if st := <-done; st != gofuse.EAGAIN {
 		t.Fatalf("stale dispatch read status = %v, want EAGAIN", st)
+	}
+}
+
+// eofHandle reports a zero-byte EOF.
+type eofHandle struct{ data []byte }
+
+func (e *eofHandle) Read(ctx context.Context, off int64, dest []byte) (int, error) {
+	if off >= int64(len(e.data)) {
+		return 0, io.EOF
+	}
+	return copy(dest, e.data[off:]), nil
+}
+func (e *eofHandle) Write(context.Context, int64, []byte) error { return nil }
+func (e *eofHandle) Sync(context.Context) error                 { return nil }
+func (e *eofHandle) Flush(context.Context) error                { return nil }
+func (e *eofHandle) Release(context.Context) error              { return nil }
+
+// A zero-byte EOF must be a NON-NIL empty result: a nil result with OK makes
+// go-fuse ship the whole request buffer as zeros.
+func TestPortReadEOFReturnsEmptyResult(t *testing.T) {
+	core := newMemCore()
+	core.paths["/f"] = &memEntry{data: []byte("hello"), mode: 0o644}
+	f := newTestFS(t, core)
+	entry := lookupForTest(t, f, "/f")
+	f.handles.put(7, &fileHandle{ino: entry.NodeId, path: "/f", h: &eofHandle{data: []byte("hello")}})
+	defer f.handles.drop(7)
+	res, st := f.Read(nil, &gofuse.ReadIn{InHeader: gofuse.InHeader{NodeId: entry.NodeId}, Fh: 7, Offset: 5, Size: 64}, make([]byte, 64))
+	if st != gofuse.OK {
+		t.Fatalf("EOF read status = %v", st)
+	}
+	if res == nil {
+		t.Fatal("EOF read returned a nil result (kernel would receive a full zero buffer)")
+	}
+	data, _ := res.Bytes(make([]byte, 64))
+	if len(data) != 0 {
+		t.Fatalf("EOF read returned %d bytes, want 0", len(data))
+	}
+}
+
+// The generation fence applies to empty replies too.
+func TestPortEOFReadFencedByViewReset(t *testing.T) {
+	core := newMemCore()
+	core.paths["/f"] = &memEntry{data: []byte("hello"), mode: 0o644}
+	bus := fs.NewEventBus()
+	f, err := New(Options{Extensions: []fs.Handler{core}, Uid: 1000, Gid: 1000, Events: bus})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := lookupForTest(t, f, "/f")
+	gh := &gatedEOFHandle{gate: make(chan struct{}), release: make(chan struct{})}
+	f.handles.put(7, &fileHandle{ino: entry.NodeId, path: "/f", h: gh})
+	defer f.handles.drop(7)
+	done := make(chan gofuse.Status, 1)
+	go func() {
+		_, st := f.Read(nil, &gofuse.ReadIn{InHeader: gofuse.InHeader{NodeId: entry.NodeId}, Fh: 7, Offset: 5, Size: 64}, make([]byte, 64))
+		done <- st
+	}()
+	<-gh.gate
+	bus.Emit(fs.Event{Kind: fs.EventCheckout, Path: "/"})
+	close(gh.release)
+	if st := <-done; st != gofuse.EAGAIN {
+		t.Fatalf("stale EOF read status = %v, want EAGAIN", st)
+	}
+}
+
+type gatedEOFHandle struct {
+	gate    chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (g *gatedEOFHandle) Read(ctx context.Context, off int64, dest []byte) (int, error) {
+	g.once.Do(func() { close(g.gate) })
+	<-g.release
+	return 0, io.EOF
+}
+func (g *gatedEOFHandle) Write(context.Context, int64, []byte) error { return nil }
+func (g *gatedEOFHandle) Sync(context.Context) error                 { return nil }
+func (g *gatedEOFHandle) Flush(context.Context) error                { return nil }
+func (g *gatedEOFHandle) Release(context.Context) error              { return nil }
+
+// mutableModeTerminal serves one file whose permission set can change.
+type mutableModeTerminal struct {
+	mu   sync.Mutex
+	mode uint32
+}
+
+func (m *mutableModeTerminal) set(mode uint32) {
+	m.mu.Lock()
+	m.mode = mode
+	m.mu.Unlock()
+}
+
+func (m *mutableModeTerminal) Do(ctx context.Context, op *fs.Op, _ fs.Next) (fs.Result, error) {
+	switch op.Kind {
+	case fs.OpLookup, fs.OpGetAttr:
+		if op.Path == "/" {
+			return fs.Result{Attr: &fs.Attr{Kind: fs.KindDir, Mode: 0o755, Size: 0}}, nil
+		}
+		m.mu.Lock()
+		mode := m.mode
+		m.mu.Unlock()
+		return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Mode: mode, Size: 7}}, nil
+	case fs.OpRead:
+		return fs.Result{Data: []byte("private")}, nil
+	}
+	return fs.Result{}, nil
+}
+
+// A remote chmod(000) must close the open gate: the authoritative stat's
+// permission set (including 000) is written back to the inode.
+func TestPortRemoteChmodZeroClosesOpenGate(t *testing.T) {
+	term := &mutableModeTerminal{mode: 0o644}
+	f, err := New(Options{Extensions: []fs.Handler{term}, Uid: 1000, Gid: 1000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := lookupForTest(t, f, "/f")
+	if st := f.Open(nil, &gofuse.OpenIn{InHeader: gofuse.InHeader{NodeId: entry.NodeId, Caller: gofuse.Caller{Owner: gofuse.Owner{Uid: 1000, Gid: 1000}, Pid: 1}}}, &gofuse.OpenOut{}); st != gofuse.OK {
+		t.Fatalf("pre-chmod open = %v", st)
+	}
+	// Remote chmod(000): the next authoritative stat and lookup must both
+	// record the new permissions.
+	term.set(0)
+	var aout gofuse.AttrOut
+	if st := f.GetAttr(nil, &gofuse.GetAttrIn{InHeader: gofuse.InHeader{NodeId: entry.NodeId, Caller: gofuse.Caller{Owner: gofuse.Owner{Uid: 1000, Gid: 1000}, Pid: 1}}}, &aout); st != gofuse.OK {
+		t.Fatalf("getattr = %v", st)
+	}
+	if st := f.Open(nil, &gofuse.OpenIn{InHeader: gofuse.InHeader{NodeId: entry.NodeId, Caller: gofuse.Caller{Owner: gofuse.Owner{Uid: 1000, Gid: 1000}, Pid: 1}}}, &gofuse.OpenOut{}); st != gofuse.EACCES {
+		t.Fatalf("post-chmod open = %v, want EACCES", st)
 	}
 }
