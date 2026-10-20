@@ -1468,11 +1468,23 @@ func (f *FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name string
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 	start := time.Now()
-	gen := f.viewGen.Load()
-	res, err := f.dispatchErr(ctx, &fs.Op{Kind: fs.OpLookup, Path: child, Ino: header.NodeId, Kernel: header, Caller: fs.CallerFrom(*header)})
+	var res fs.Result
+	var err error
+	stale := false
+	for attempt := 0; ; attempt++ {
+		gen := f.viewGen.Load()
+		res, err = f.dispatchErr(ctx, &fs.Op{Kind: fs.OpLookup, Path: child, Ino: header.NodeId, Kernel: header, Caller: fs.CallerFrom(*header)})
+		if err != nil {
+			break
+		}
+		stale = gen != f.viewGen.Load()
+		if !stale || attempt >= statViewRetries {
+			break
+		}
+	}
 	f.recordHandleOp(fs.OpLookup, start, err, 0)
-	if gen != f.viewGen.Load() {
-		// The reply describes a view a reset replaced: EAGAIN so the kernel
+	if stale {
+		// The reply kept describing a replaced view: EAGAIN so the caller
 		// retries instead of caching pre-reset attributes/identity.
 		return gofuse.EAGAIN
 	}
@@ -1514,12 +1526,21 @@ func (f *FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *gofus
 	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
-	gen := f.viewGen.Load()
-	res, st := f.dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: path, Ino: input.NodeId, Fh: input.Fh(), Kernel: input, Caller: fs.CallerFrom(input.InHeader)})
-	if st != gofuse.OK {
-		return st
+	var res fs.Result
+	var st gofuse.Status
+	stale := false
+	for attempt := 0; ; attempt++ {
+		gen := f.viewGen.Load()
+		res, st = f.dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: path, Ino: input.NodeId, Fh: input.Fh(), Kernel: input, Caller: fs.CallerFrom(input.InHeader)})
+		if st != gofuse.OK {
+			return st
+		}
+		stale = gen != f.viewGen.Load()
+		if !stale || attempt >= statViewRetries {
+			break
+		}
 	}
-	if gen != f.viewGen.Load() {
+	if stale {
 		return gofuse.EAGAIN
 	}
 	if res.Attr == nil {
@@ -2242,6 +2263,13 @@ func (f *FS) Access(cancel <-chan struct{}, input *gofuse.AccessIn) gofuse.Statu
 	}
 	return gofuse.OK
 }
+
+// statViewRetries bounds a namespace read's re-dispatch after losing the
+// view-generation race. A reset is common right after mount (the SSE stream
+// reconnects) and the kernel does NOT retry LOOKUP/GETATTR on EAGAIN, so a
+// single stale answer must not surface as an application error: the retry
+// fetches the NEW view. Only a view that keeps resetting answers EAGAIN.
+const statViewRetries = 3
 
 // checkAncestorSearch verifies SEARCH (x) permission on every ancestor of
 // path for the caller, the base's pre-dispatch check.

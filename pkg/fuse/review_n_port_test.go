@@ -577,14 +577,13 @@ func TestPortRemoteChmodZeroClosesOpenGate(t *testing.T) {
 	}
 }
 
-// gatedStatTerminal blocks the N-th stat so a reset can interleave.
+// gatedStatTerminal blocks every stat until released, then serves the
+// post-reset mode.
 type gatedStatTerminal struct {
 	mu      sync.Mutex
-	calls   int
-	blockAt int
 	mode    uint32
-	gate    chan struct{}
 	release chan struct{}
+	entered chan struct{}
 	once    sync.Once
 }
 
@@ -593,47 +592,66 @@ func (g *gatedStatTerminal) Do(ctx context.Context, op *fs.Op, _ fs.Next) (fs.Re
 		return fs.Result{Attr: &fs.Attr{Kind: fs.KindDir, Mode: 0o755}}, nil
 	}
 	g.mu.Lock()
-	g.calls++
-	block := g.calls == g.blockAt
+	block := g.mode == 0o644 // pre-reset view answers block; post-reset ones pass
 	g.mu.Unlock()
 	if block {
-		g.once.Do(func() { close(g.gate) })
+		g.once.Do(func() { close(g.entered) })
 		<-g.release
 	}
-	return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Mode: g.mode, Size: 3}}, nil
+	g.mu.Lock()
+	mode := g.mode
+	g.mu.Unlock()
+	return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Mode: mode, Size: 3}}, nil
 }
 
-// A stat/lookup reply crossing a reset is EAGAIN instead of repopulating the
-// inode with pre-reset attributes.
+// A stat/lookup that loses the view-generation race is re-dispatched
+// against the NEW view (the kernel does not retry namespace ops on EAGAIN);
+// it must never answer the pre-reset attributes.
 func TestPortStatReplyFencedByViewReset(t *testing.T) {
 	for _, kind := range []fs.OpKind{fs.OpGetAttr, fs.OpLookup} {
-		term := &gatedStatTerminal{blockAt: 0, mode: 0o644, gate: make(chan struct{}), release: make(chan struct{})}
+		term := &gatedStatTerminal{mode: 0o644, entered: make(chan struct{}), release: make(chan struct{})}
 		bus := fs.NewEventBus()
 		f, err := New(Options{Extensions: []fs.Handler{term}, Uid: 1000, Gid: 1000, Events: bus})
 		if err != nil {
 			t.Fatal(err)
 		}
-		entry := lookupForTest(t, f, "/f") // first stat seeds the inode
+		// Seed the inode without blocking: "/" answers locally and the file
+		// stat below is the first blocked one.
 		term.mu.Lock()
-		term.calls = 0
-		term.blockAt = 1
+		term.mode = 0o644
 		term.mu.Unlock()
-		done := make(chan gofuse.Status, 1)
+		type reply struct {
+			st   gofuse.Status
+			mode uint32
+		}
+		done := make(chan reply, 1)
 		go func() {
 			switch kind {
 			case fs.OpGetAttr:
 				var aout gofuse.AttrOut
-				done <- f.GetAttr(nil, &gofuse.GetAttrIn{InHeader: gofuse.InHeader{NodeId: entry.NodeId}}, &aout)
+				ino := f.inodes.EnsureInode("/f", false, 3, time.Now())
+				st := f.GetAttr(nil, &gofuse.GetAttrIn{InHeader: gofuse.InHeader{NodeId: ino}}, &aout)
+				done <- reply{st, aout.Attr.Mode & 0o777}
 			default:
 				var out gofuse.EntryOut
-				done <- f.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "f", &out)
+				st := f.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "f", &out)
+				done <- reply{st, out.Attr.Mode & 0o777}
 			}
 		}()
-		<-term.gate
+		<-term.entered
+		// The reset lands while the old stat is in flight; the NEW view
+		// answers 0700 from then on.
+		term.mu.Lock()
+		term.mode = 0o700
+		term.mu.Unlock()
 		bus.Emit(fs.Event{Kind: fs.EventCheckout, Path: "/"})
 		close(term.release)
-		if st := <-done; st != gofuse.EAGAIN {
-			t.Fatalf("%v crossing reset = %v, want EAGAIN", kind, st)
+		got := <-done
+		if got.st != gofuse.OK {
+			t.Fatalf("%v after reset = %v, want the retried current view", kind, got.st)
+		}
+		if got.mode != 0o700 {
+			t.Fatalf("%v after reset served mode %#o, want the post-reset 0700", kind, got.mode)
 		}
 	}
 }
