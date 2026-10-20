@@ -775,8 +775,8 @@ func TestPortStatWriteBackKeepsSpecialBits(t *testing.T) {
 		t.Fatal(err)
 	}
 	dEntry := lookupForTest(t, f, "/d")
-	if dEntry.Attr.Mode != gofuse.S_IFDIR|0o1777 {
-		t.Fatalf("lookup /d mode = %#o", dEntry.Attr.Mode)
+	if dEntry.Mode != gofuse.S_IFDIR|0o1777 {
+		t.Fatalf("lookup /d mode = %#o", dEntry.Mode)
 	}
 	var dout gofuse.AttrOut
 	if st := f.GetAttr(nil, &gofuse.GetAttrIn{InHeader: gofuse.InHeader{NodeId: dEntry.NodeId}}, &dout); st != gofuse.OK {
@@ -786,7 +786,7 @@ func TestPortStatWriteBackKeepsSpecialBits(t *testing.T) {
 		t.Fatalf("getattr /d mode = %#o, want the sticky bits preserved", dout.Mode)
 	}
 	fEntry := lookupForTest(t, f, "/f")
-	if fEntry.Attr.Mode != gofuse.S_IFREG|0o4755 {
-		t.Fatalf("lookup /f mode = %#o", fEntry.Attr.Mode)
+	if fEntry.Mode != gofuse.S_IFREG|0o4755 {
+		t.Fatalf("lookup /f mode = %#o", fEntry.Mode)
 	}
 }

@@ -1470,25 +1470,25 @@ func (f *FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name string
 	start := time.Now()
 	var res fs.Result
 	var err error
-	stale := false
+	deadline := time.Now().Add(namespaceViewQuietWait)
 	for attempt := 0; ; attempt++ {
 		gen := f.viewGen.Load()
-		stale = false
 		res, err = f.dispatchErr(ctx, &fs.Op{Kind: fs.OpLookup, Path: child, Ino: header.NodeId, Kernel: header, Caller: fs.CallerFrom(*header)})
 		if err != nil {
 			break
 		}
-		stale = gen != f.viewGen.Load()
-		if !stale || attempt >= statViewRetries {
+		if gen == f.viewGen.Load() {
 			break
 		}
+		if attempt >= 24 || (attempt >= statViewRetries && time.Now().After(deadline)) {
+			// The reply kept describing a replaced view: EAGAIN so the
+			// caller retries instead of caching pre-reset identity.
+			f.recordHandleOp(fs.OpLookup, start, nil, 0)
+			return gofuse.EAGAIN
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 	f.recordHandleOp(fs.OpLookup, start, err, 0)
-	if stale {
-		// The reply kept describing a replaced view: EAGAIN so the caller
-		// retries instead of caching pre-reset attributes/identity.
-		return gofuse.EAGAIN
-	}
 	if err != nil {
 		// v1 cached the negative entry only for genuine misses; other
 		// failures must not poison the name for the negative TTL.
@@ -1529,24 +1529,23 @@ func (f *FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *gofus
 	defer cf()
 	var res fs.Result
 	var st gofuse.Status
-	stale := false
+	deadline := time.Now().Add(namespaceViewQuietWait)
 	for attempt := 0; ; attempt++ {
 		gen := f.viewGen.Load()
-		stale = false
 		res, st = f.dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: path, Ino: input.NodeId, Fh: input.Fh(), Kernel: input, Caller: fs.CallerFrom(input.InHeader)})
 		if st != gofuse.OK {
 			// This attempt dispatched against the CURRENT view: its error
 			// (ENOENT/EACCES) is the answer. A previous attempt's stale
-			// flag must not rewrite it into EAGAIN.
+			// state must not rewrite it into EAGAIN.
 			return st
 		}
-		stale = gen != f.viewGen.Load()
-		if !stale || attempt >= statViewRetries {
+		if gen == f.viewGen.Load() {
 			break
 		}
-	}
-	if stale {
-		return gofuse.EAGAIN
+		if attempt >= 24 || (attempt >= statViewRetries && time.Now().After(deadline)) {
+			return gofuse.EAGAIN
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 	if res.Attr == nil {
 		return gofuse.EIO
@@ -2275,6 +2274,14 @@ func (f *FS) Access(cancel <-chan struct{}, input *gofuse.AccessIn) gofuse.Statu
 // single stale answer must not surface as an application error: the retry
 // fetches the NEW view. Only a view that keeps resetting answers EAGAIN.
 const statViewRetries = 3
+
+// namespaceViewQuietWait bounds how long a namespace read waits for a QUIET
+// view generation before giving up. Resets cluster around mount time (SSE
+// reconnects); an EAGAIN from LOOKUP/GETATTR is not retried by the kernel
+// and surfaces as an application error (a write_text() failing with
+// BlockingIOError), so the wait is generous and a lost race retries after a
+// short pause instead of hammering the chain.
+const namespaceViewQuietWait = 100 * time.Millisecond
 
 // checkAncestorSearch verifies SEARCH (x) permission on every ancestor of
 // path for the caller, the base's pre-dispatch check.
