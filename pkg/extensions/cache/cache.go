@@ -84,6 +84,10 @@ type Cache struct {
 	// epoch advances on every whole-view reset: a read dispatched before a
 	// checkout must not admit its pre-reset bytes when it completes after.
 	epoch atomic.Uint64
+	// resetMu orders the epoch check with the tier sweep: a publication
+	// that passed the check must not land after a reset cleared the cache
+	// (the plain Load/Put pair had exactly that window).
+	resetMu sync.RWMutex
 	// sidecars tracks open -wal/-journal handles (v1 sqlite routing).
 	sidecars sidecarTracker
 }
@@ -135,6 +139,7 @@ func New(opts Options) (*Cache, error) {
 	// Background prefetch publications share the reset epoch: a fetch that
 	// raced a checkout must not repopulate the cleared caches.
 	c.dirs.genFn = func() uint64 { return c.epoch.Load() }
+	c.dirs.publishFn = c.publishIfCurrent
 	c.dirs.contentEnabled = opts.DirContentPrefetch
 	c.dirs.contentMaxFiles = opts.PrefetchMaxFiles
 	if c.dirs.contentMaxFiles <= 0 {
@@ -245,6 +250,7 @@ func (c *Cache) invalidatePathTiers(path string) {
 // pre-reset image to live descriptors (v1 resetMountViewWithInitialSync
 // invalidated each handle's Prefetch, cancelling in-flight fetches).
 func (c *Cache) invalidateAllTiers() {
+	c.resetMu.Lock()
 	c.epoch.Add(1)
 	c.mem.InvalidateAll()
 	if c.dsk != nil {
@@ -260,6 +266,19 @@ func (c *Cache) invalidateAllTiers() {
 		}
 		return true
 	})
+	c.resetMu.Unlock()
+}
+
+// publishIfCurrent runs fn iff no reset has landed since gen, atomically
+// with the reset's sweep (the read side of resetMu).
+func (c *Cache) publishIfCurrent(gen uint64, fn func()) bool {
+	c.resetMu.RLock()
+	defer c.resetMu.RUnlock()
+	if c.epoch.Load() != gen {
+		return false
+	}
+	fn()
+	return true
 }
 
 // ReadCached returns whole-file cached bytes for path at revision, if
@@ -448,8 +467,8 @@ func (c *Cache) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 			// (the layer staged-append read-back).
 			// The epoch fences a read that raced a checkout: its bytes
 			// describe the replaced view.
-			if op.Offset == 0 && op.Limit <= 0 && c.admits(res.Data) && c.epoch.Load() == epoch {
-				c.mem.Put(op.Path, res.Data, 0)
+			if op.Offset == 0 && op.Limit <= 0 && c.admits(res.Data) {
+				c.publishIfCurrent(epoch, func() { c.mem.Put(op.Path, res.Data, 0) })
 			}
 		}
 		return res, err
@@ -507,12 +526,12 @@ func (h *cachingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 			// A checkout may have replaced the view while this fetch was
 			// in flight: its bytes describe the OLD view and must not be
 			// admitted (the OpRead path already carries this fence).
-			if h.cache.epoch.Load() == epoch {
+			h.cache.publishIfCurrent(epoch, func() {
 				h.cache.mem.PutOwned(path, whole, h.rev)
 				if h.cache.dsk != nil {
 					h.cache.dsk.PutAsync(key, whole)
 				}
-			}
+			})
 			return copyReadRange(dest, whole, off), nil
 		}
 		// Fetch error or short image: fall through to the direct read.
@@ -530,8 +549,10 @@ func (h *cachingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 		// 4096-byte prefix of an 8MiB file under the whole-file key made
 		// the next larger read serve a premature EOF.
 		if err == nil && int64(n) == int64(len(dest)) && h.size > 0 && int64(n) == h.size &&
-			h.cache.admits(dest[:n]) && h.rev > 0 && h.cache.epoch.Load() == epoch {
-			h.cache.mem.PutOwned(path, append([]byte(nil), dest[:n]...), h.rev)
+			h.cache.admits(dest[:n]) && h.rev > 0 {
+			h.cache.publishIfCurrent(epoch, func() {
+				h.cache.mem.PutOwned(path, append([]byte(nil), dest[:n]...), h.rev)
+			})
 		}
 		return n, err
 	}
@@ -587,9 +608,7 @@ func (c *Cache) readDiskCachedRange(ctx context.Context, h *cachingHandle, off i
 		return 0, false
 	}
 	if int64(n) == length {
-		if c.epoch.Load() == epoch {
-			c.dsk.PutOwned(key, buf)
-		}
+		c.publishIfCurrent(epoch, func() { c.dsk.PutOwned(key, buf) })
 		return copyReadRange(dest, buf, 0), true
 	}
 	// Short fetch (EOF tail): serve directly; a truncated entry must not

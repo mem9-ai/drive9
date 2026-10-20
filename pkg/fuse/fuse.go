@@ -111,7 +111,11 @@ type FS struct {
 	dirs            *dirTable
 	// viewGen fences listing installs across view resets: a READDIR that
 	// started before a checkout must not install its pre-reset page.
+	// viewMu makes the generation CHECK and the cache publication ATOMIC
+	// with respect to the reset: a plain Load before Put let a reset clear
+	// the cache in between and the old listing land afterwards.
 	viewGen   atomic.Uint64
+	viewMu    sync.RWMutex
 	pathLocks *lockTable
 	events    *fs.EventBus
 
@@ -310,10 +314,12 @@ func New(opts Options) (*FS, error) {
 		// installed before it is stale. Bump the fence and drop the open
 		// directory handles' snapshots (a live enumeration would otherwise
 		// replay the pre-reset entries for the rest of its pages).
+		f.viewMu.Lock()
 		f.viewGen.Add(1)
 		if f.Ctx.DirCache != nil {
 			f.Ctx.DirCache.InvalidateAll()
 		}
+		f.viewMu.Unlock()
 		for _, dh := range f.dirs.snapshot() {
 			dh.resetEntries()
 		}
@@ -2193,12 +2199,20 @@ func (f *FS) checkAncestorSearch(ctx context.Context, path string, caller fs.Cal
 		// entry; a remote stat does not carry it (the server still has the
 		// old owner), so the entry is authoritative when it has one.
 		uid, gid := f.uid, f.gid
+		uidSet, gidSet := false, false
 		mode := uint32(0o755)
 		known := false
 		if ino, iok := f.inodes.GetInode(dir); iok {
 			if entry, eok := f.inodes.GetEntry(ino); eok {
-				if entry.HasUID && entry.HasGID {
-					uid, gid = entry.Uid, entry.Gid
+				// A chown may set only one of UID/GID: apply each presence
+				// flag independently (Access/fillAttr do), or a UID-only
+				// chown's owner override is dropped and the mount's uid
+				// picks the wrong permission class.
+				if entry.HasUID {
+					uid, uidSet = entry.Uid, true
+				}
+				if entry.HasGID {
+					gid, gidSet = entry.Gid, true
 				}
 				if entry.HasMode {
 					mode, known = entry.Mode&0o777, true
@@ -2217,7 +2231,12 @@ func (f *FS) checkAncestorSearch(ctx context.Context, path string, caller fs.Cal
 				return gofuse.EIO
 			}
 			if res.Attr.HasOwner {
-				uid, gid = res.Attr.Uid, res.Attr.Gid
+				if !uidSet {
+					uid = res.Attr.Uid
+				}
+				if !gidSet {
+					gid = res.Attr.Gid
+				}
 			}
 			mode = res.Attr.Mode & 0o777
 		}
@@ -2848,7 +2867,12 @@ func (f *FS) loadDirEntries(cancel <-chan struct{}, input *gofuse.ReadIn, dh *di
 		if st != gofuse.OK {
 			return st
 		}
+		// Check and publish under the read side of viewMu: a reset cannot
+		// clear the cache between the generation check and the Put, so a
+		// pre-reset page can never be re-installed after the sweep.
+		f.viewMu.RLock()
 		if f.viewGen.Load() != gen {
+			f.viewMu.RUnlock()
 			if attempt < 2 {
 				continue
 			}
@@ -2860,6 +2884,7 @@ func (f *FS) loadDirEntries(cancel <-chan struct{}, input *gofuse.ReadIn, dh *di
 			f.Ctx.DirCache.Put(dh.path, dirEntriesFrom(res.Entries))
 		}
 		dh.entries = append([]fs.Entry(nil), res.Entries...)
+		f.viewMu.RUnlock()
 		return gofuse.OK
 	}
 }

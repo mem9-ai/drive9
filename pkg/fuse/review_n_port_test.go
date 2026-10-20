@@ -159,6 +159,80 @@ func TestPortAncestorSearchUsesInodeOwnership(t *testing.T) {
 	if st := f.Open(nil, &gofuse.OpenIn{InHeader: gofuse.InHeader{NodeId: fEntry.NodeId, Caller: gofuse.Caller{Owner: gofuse.Owner{Uid: 1000, Gid: 1000}, Pid: 1}}}, &gofuse.OpenOut{}); st != gofuse.EACCES {
 		t.Fatalf("old owner open = %v, want EACCES", st)
 	}
+	// A UID-only chown leaves HasGID false: the UID override still applies
+	// (the presence flags are independent).
+	f.inodes.UpdateOwner(dEntry.NodeId, 3000, 0, true, false)
+	bus.Emit(fs.Event{Kind: fs.EventCheckout, Path: "/"})
+	if st := f.Open(nil, &gofuse.OpenIn{InHeader: gofuse.InHeader{NodeId: fEntry.NodeId, Caller: gofuse.Caller{Owner: gofuse.Owner{Uid: 3000, Gid: 1000}, Pid: 1}}}, &gofuse.OpenOut{}); st != gofuse.OK {
+		t.Fatalf("UID-only chown owner open = %v, want OK", st)
+	}
+	if st := f.Open(nil, &gofuse.OpenIn{InHeader: gofuse.InHeader{NodeId: fEntry.NodeId, Caller: gofuse.Caller{Owner: gofuse.Owner{Uid: 2000, Gid: 2000}, Pid: 1}}}, &gofuse.OpenOut{}); st != gofuse.EACCES {
+		t.Fatalf("previous owner open after UID-only chown = %v, want EACCES", st)
+	}
+}
+
+// blockingDirCache pauses inside Put so a concurrent reset can interleave.
+type blockingDirCache struct {
+	inner   fs.DirListingCache
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (b *blockingDirCache) Get(dir string) ([]fs.DirEntryInfo, bool) { return b.inner.Get(dir) }
+func (b *blockingDirCache) Put(dir string, entries []fs.DirEntryInfo) {
+	close(b.entered)
+	<-b.release
+	b.inner.Put(dir, entries)
+}
+func (b *blockingDirCache) Upsert(parent string, e fs.DirEntryInfo) { b.inner.Upsert(parent, e) }
+func (b *blockingDirCache) Invalidate(dir string)                   { b.inner.Invalidate(dir) }
+func (b *blockingDirCache) InvalidatePrefix(dir string)             { b.inner.InvalidatePrefix(dir) }
+func (b *blockingDirCache) InvalidateAll()                          { b.inner.InvalidateAll() }
+
+// The generation check and the cache publication are atomic against a
+// reset: a listing whose Put was in flight cannot land AFTER the reset's
+// sweep.
+func TestPortListingPublishIsAtomicWithReset(t *testing.T) {
+	core := newMemCore()
+	core.paths["/d"] = &memEntry{isDir: true, mode: 0o755}
+	core.paths["/d/f"] = &memEntry{mode: 0o644}
+	bus := fs.NewEventBus()
+	f, err := New(Options{Extensions: []fs.Handler{core}, Uid: 1000, Gid: 1000, Events: bus})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bc := &blockingDirCache{
+		inner:   dircache.NewNamespaceCache(time.Minute, time.Second, 0),
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	f.Ctx.DirCache = bc
+	dEntry := lookupForTest(t, f, "/d")
+	dh := &dirHandle{path: "/d", ino: dEntry.NodeId}
+
+	loaded := make(chan gofuse.Status, 1)
+	go func() {
+		loaded <- f.loadDirEntries(nil, &gofuse.ReadIn{InHeader: gofuse.InHeader{NodeId: dEntry.NodeId}}, dh)
+	}()
+	<-bc.entered
+	resetDone := make(chan struct{})
+	go func() {
+		bus.Emit(fs.Event{Kind: fs.EventCheckout, Path: "/"})
+		close(resetDone)
+	}()
+	select {
+	case <-resetDone:
+		t.Fatal("reset completed while a listing publish was in flight")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(bc.release)
+	if st := <-loaded; st != gofuse.OK {
+		t.Fatalf("load = %v", st)
+	}
+	<-resetDone
+	if rows, ok := f.Ctx.DirCache.Get("/d"); ok && len(rows) > 0 {
+		t.Fatalf("pre-reset listing survived the reset: %+v", rows)
+	}
 }
 
 // A cached READDIR row round-trips the full identity.

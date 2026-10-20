@@ -64,6 +64,9 @@ type dirPrefetcher struct {
 	// genFn reports the cache's reset epoch: a background publish whose
 	// fetch crossed a checkout must not repopulate the cleared tiers.
 	genFn func() uint64
+	// publishFn runs a publication atomically with the reset sweep (the
+	// cache wires publishIfCurrent); nil falls back to a check-then-run.
+	publishFn func(uint64, func()) bool
 
 	// namespace answers lookups from cached listings (facade attaches it).
 	namespace fs.DirListingCache
@@ -81,6 +84,19 @@ func (p *dirPrefetcher) generation() uint64 {
 		return 0
 	}
 	return p.genFn()
+}
+
+// publish runs fn under the cache's reset protocol (or the plain check
+// when no cache wired it).
+func (p *dirPrefetcher) publish(gen uint64, fn func()) bool {
+	if p.publishFn == nil {
+		if p.staleSince(gen) {
+			return false
+		}
+		fn()
+		return true
+	}
+	return p.publishFn(gen, fn)
 }
 
 // staleSince reports whether a reset replaced the view since gen.
@@ -190,7 +206,8 @@ func (c *Cache) prefetchDirContents(ctx context.Context, dir string, entries []f
 			if result.Revision > 0 {
 				rev = result.Revision
 			}
-			c.mem.PutOwned(chunk[i].local, result.Data, rev)
+			local, data := chunk[i].local, result.Data
+			c.publishIfCurrent(gen, func() { c.mem.PutOwned(local, data, rev) })
 		}
 	}
 }
@@ -344,11 +361,14 @@ func (p *dirPrefetcher) refreshSiblingMetadata(ctx context.Context, dir string) 
 			item.Mode = r.Mode
 			item.HasMode = true
 		}
-		if canObserve {
-			observer.ObserveRemote(dir, item)
-			continue
-		}
-		p.namespace.Upsert(dir, item)
+		pubItem := item
+		p.publish(gen, func() {
+			if canObserve {
+				observer.ObserveRemote(dir, pubItem)
+				return
+			}
+			p.namespace.Upsert(dir, pubItem)
+		})
 	}
 }
 
@@ -444,8 +464,5 @@ func (p *dirPrefetcher) loadSiblingDirectory(load func(ctx context.Context, op *
 			HasGID:     e.Attr.HasOwner,
 		})
 	}
-	if p.staleSince(gen) {
-		return
-	}
-	p.namespace.Put(dir, items)
+	p.publish(gen, func() { p.namespace.Put(dir, items) })
 }
