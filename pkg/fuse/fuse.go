@@ -1243,7 +1243,16 @@ func (f *FS) fillAttr(a fs.Attr, ino uint64, out *gofuse.Attr) {
 		}
 	}
 	out.Uid, out.Gid = f.uid, f.gid
-	if a.HasOwner {
+	if a.HasUID || a.HasGID {
+		// The kernel's chown may set only one field; the other keeps the
+		// mount/entry fallback instead of the request's preserve sentinel.
+		if a.HasUID {
+			out.Uid = a.Uid
+		}
+		if a.HasGID {
+			out.Gid = a.Gid
+		}
+	} else if a.HasOwner {
 		out.Uid, out.Gid = a.Uid, a.Gid
 	}
 	if entry != nil {
@@ -1365,7 +1374,13 @@ func (f *FS) fillEntryOut(path string, a *fs.Attr, isDir bool, out *gofuse.Entry
 			// plain regular mode — a retyped reply makes the kernel mark
 			// the live inode bad (the lchown EIO class).
 			f.inodes.UpdateMode(ino, mode)
-		} else if mode&0o777 != 0 || !isDir {
+		} else if isDir {
+			// A directory's permission set is authoritative too, a ZERO
+			// set included: the ancestor SEARCH check reads the entry, and
+			// skipping 000 kept the old 0755 authorizing traversal after a
+			// remote chmod(000). Keep the directory type.
+			f.inodes.UpdateMode(ino, syscall.S_IFDIR|mode&0o777)
+		} else {
 			// Regular files record their permission bits too — a ZERO set
 			// included: the open access gate (no default_permissions) keys
 			// on entry.HasMode, and skipping 000 left the old 0644
@@ -1453,8 +1468,14 @@ func (f *FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name string
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 	start := time.Now()
+	gen := f.viewGen.Load()
 	res, err := f.dispatchErr(ctx, &fs.Op{Kind: fs.OpLookup, Path: child, Ino: header.NodeId, Kernel: header, Caller: fs.CallerFrom(*header)})
 	f.recordHandleOp(fs.OpLookup, start, err, 0)
+	if gen != f.viewGen.Load() {
+		// The reply describes a view a reset replaced: EAGAIN so the kernel
+		// retries instead of caching pre-reset attributes/identity.
+		return gofuse.EAGAIN
+	}
 	if err != nil {
 		// v1 cached the negative entry only for genuine misses; other
 		// failures must not poison the name for the negative TTL.
@@ -1493,9 +1514,13 @@ func (f *FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *gofus
 	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
+	gen := f.viewGen.Load()
 	res, st := f.dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: path, Ino: input.NodeId, Fh: input.Fh(), Kernel: input, Caller: fs.CallerFrom(input.InHeader)})
 	if st != gofuse.OK {
 		return st
+	}
+	if gen != f.viewGen.Load() {
+		return gofuse.EAGAIN
 	}
 	if res.Attr == nil {
 		return gofuse.EIO
@@ -1549,7 +1574,7 @@ func entryToAttr(e *InodeEntry) fs.Attr {
 	}
 	return fs.Attr{Kind: kind, Mode: mode & 0o7777, Size: e.Size, Rev: e.Revision, Mtime: e.Mtime,
 		Atime: e.Atime, Rdev: e.Rdev, Nlink: e.Nlink,
-		Uid: e.Uid, Gid: e.Gid, HasOwner: e.HasUID || e.HasGID}
+		Uid: e.Uid, Gid: e.Gid, HasOwner: e.HasUID || e.HasGID, HasUID: e.HasUID, HasGID: e.HasGID}
 }
 
 // posixNameMax is the kernel NAME_MAX the facade enforces (v1).
@@ -2193,7 +2218,14 @@ func (f *FS) Access(cancel <-chan struct{}, input *gofuse.AccessIn) gofuse.Statu
 		attr = *res.Attr
 	}
 	ownerUid, ownerGid := f.uid, f.gid
-	if attr.HasOwner {
+	if attr.HasUID || attr.HasGID {
+		if attr.HasUID {
+			ownerUid = attr.Uid
+		}
+		if attr.HasGID {
+			ownerGid = attr.Gid
+		}
+	} else if attr.HasOwner {
 		ownerUid, ownerGid = attr.Uid, attr.Gid
 	}
 	if entry, ok := f.inodes.GetEntry(input.NodeId); ok {
@@ -2254,7 +2286,14 @@ func (f *FS) checkAncestorSearch(ctx context.Context, path string, caller fs.Cal
 			if res.Attr == nil {
 				return gofuse.EIO
 			}
-			if res.Attr.HasOwner {
+			if res.Attr.HasUID || res.Attr.HasGID {
+				if res.Attr.HasUID && !uidSet {
+					uid = res.Attr.Uid
+				}
+				if res.Attr.HasGID && !gidSet {
+					gid = res.Attr.Gid
+				}
+			} else if res.Attr.HasOwner {
 				if !uidSet {
 					uid = res.Attr.Uid
 				}
@@ -2446,8 +2485,17 @@ func (f *FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse.Open
 				if !modeKnown {
 					mode, modeKnown = st.Attr.Mode&0o777, true
 				}
-				if !ownerKnown && st.Attr.HasOwner {
-					ownerUid, ownerGid = st.Attr.Uid, st.Attr.Gid
+				if !ownerKnown {
+					if st.Attr.HasUID || st.Attr.HasGID {
+						if st.Attr.HasUID {
+							ownerUid = st.Attr.Uid
+						}
+						if st.Attr.HasGID {
+							ownerGid = st.Attr.Gid
+						}
+					} else if st.Attr.HasOwner {
+						ownerUid, ownerGid = st.Attr.Uid, st.Attr.Gid
+					}
 				}
 			}
 		}
@@ -3199,13 +3247,17 @@ func dirEntriesFrom(entries []fs.Entry) []fs.DirEntryInfo {
 			// The server's mtime/revision/identity ride the row too:
 			// dropping them made namespace-cache stats answer zero revs and
 			// split hardlink aliases (ResourceID) after a READDIR.
-			Mtime:         e.Attr.Mtime,
-			Rev:           e.Attr.Rev,
-			ResourceID:    e.Attr.ResourceID,
-			ExtentIno:     e.Attr.ExtentIno,
-			LocalMutation: e.Attr.Rev > 0 && false, // listing rows are remote-observed
+			Mtime:      e.Attr.Mtime,
+			Rev:        e.Attr.Rev,
+			ResourceID: e.Attr.ResourceID,
+			ExtentIno:  e.Attr.ExtentIno,
+			// Listing rows are remote-observed, never this mount's own
+			// mutation.
+			LocalMutation: false,
 		}
-		if e.Attr.HasOwner {
+		if e.Attr.HasUID || e.Attr.HasGID {
+			item.Uid, item.Gid, item.HasUID, item.HasGID = e.Attr.Uid, e.Attr.Gid, e.Attr.HasUID, e.Attr.HasGID
+		} else if e.Attr.HasOwner {
 			item.Uid, item.Gid, item.HasUID, item.HasGID = e.Attr.Uid, e.Attr.Gid, true, true
 		}
 		out = append(out, item)

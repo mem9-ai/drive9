@@ -612,7 +612,11 @@ func (c *Core) statFromNamespaceCache(path string) (*fs.Attr, bool) {
 			// with; projecting the cached row without it sent an extent
 			// file's open to the ordinary HTTP data plane (422 there).
 			ExtentIno: item.ExtentIno,
-			Uid:       item.Uid, Gid: item.Gid, HasOwner: item.HasUID || item.HasGID}, true
+			Uid:       item.Uid, Gid: item.Gid,
+			// Keep the two presence flags apart: a row written by a
+			// single-field chown carries the other field's preserve
+			// sentinel, which must never surface as an actual owner.
+			HasOwner: item.HasUID || item.HasGID, HasUID: item.HasUID, HasGID: item.HasGID}, true
 	case fs.LookupNegative, fs.LookupCompleteMiss, fs.LookupSessionMiss:
 		return nil, true // known absent: ENOENT without a remote stat
 	}

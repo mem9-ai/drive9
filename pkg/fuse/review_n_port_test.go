@@ -576,3 +576,120 @@ func TestPortRemoteChmodZeroClosesOpenGate(t *testing.T) {
 		t.Fatalf("post-chmod open = %v, want EACCES", st)
 	}
 }
+
+// gatedStatTerminal blocks the N-th stat so a reset can interleave.
+type gatedStatTerminal struct {
+	mu      sync.Mutex
+	calls   int
+	blockAt int
+	mode    uint32
+	gate    chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (g *gatedStatTerminal) Do(ctx context.Context, op *fs.Op, _ fs.Next) (fs.Result, error) {
+	if op.Path == "/" {
+		return fs.Result{Attr: &fs.Attr{Kind: fs.KindDir, Mode: 0o755}}, nil
+	}
+	g.mu.Lock()
+	g.calls++
+	block := g.calls == g.blockAt
+	g.mu.Unlock()
+	if block {
+		g.once.Do(func() { close(g.gate) })
+		<-g.release
+	}
+	return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Mode: g.mode, Size: 3}}, nil
+}
+
+// A stat/lookup reply crossing a reset is EAGAIN instead of repopulating the
+// inode with pre-reset attributes.
+func TestPortStatReplyFencedByViewReset(t *testing.T) {
+	for _, kind := range []fs.OpKind{fs.OpGetAttr, fs.OpLookup} {
+		term := &gatedStatTerminal{blockAt: 0, mode: 0o644, gate: make(chan struct{}), release: make(chan struct{})}
+		bus := fs.NewEventBus()
+		f, err := New(Options{Extensions: []fs.Handler{term}, Uid: 1000, Gid: 1000, Events: bus})
+		if err != nil {
+			t.Fatal(err)
+		}
+		entry := lookupForTest(t, f, "/f") // first stat seeds the inode
+		term.mu.Lock()
+		term.calls = 0
+		term.blockAt = 1
+		term.mu.Unlock()
+		done := make(chan gofuse.Status, 1)
+		go func() {
+			switch kind {
+			case fs.OpGetAttr:
+				var aout gofuse.AttrOut
+				done <- f.GetAttr(nil, &gofuse.GetAttrIn{InHeader: gofuse.InHeader{NodeId: entry.NodeId}}, &aout)
+			default:
+				var out gofuse.EntryOut
+				done <- f.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "f", &out)
+			}
+		}()
+		<-term.gate
+		bus.Emit(fs.Event{Kind: fs.EventCheckout, Path: "/"})
+		close(term.release)
+		if st := <-done; st != gofuse.EAGAIN {
+			t.Fatalf("%v crossing reset = %v, want EAGAIN", kind, st)
+		}
+	}
+}
+
+// fillAttr must not project an unset chown field (the preserve sentinel).
+func TestPortSingleFieldChownKeepsOtherField(t *testing.T) {
+	core := newMemCore()
+	f := newTestFS(t, core)
+	var out gofuse.Attr
+	f.fillAttr(fs.Attr{Kind: fs.KindFile, Mode: 0o600, Size: 3, Uid: ^uint32(0), Gid: 2000, HasOwner: true, HasGID: true}, 1, &out)
+	if out.Uid != 1000 {
+		t.Fatalf("uid = %d, want the mount uid (the unset field must not take the sentinel)", out.Uid)
+	}
+	if out.Gid != 2000 {
+		t.Fatalf("gid = %d, want 2000", out.Gid)
+	}
+}
+
+// mapModeTerminal serves per-path modes.
+type mapModeTerminal struct {
+	mu    sync.Mutex
+	modes map[string]uint32
+}
+
+func (m *mapModeTerminal) Do(ctx context.Context, op *fs.Op, _ fs.Next) (fs.Result, error) {
+	if op.Kind == fs.OpRead {
+		return fs.Result{Data: []byte("private")}, nil
+	}
+	m.mu.Lock()
+	mode, ok := m.modes[op.Path]
+	m.mu.Unlock()
+	if !ok {
+		if op.Path == "/" || op.Path == "/d" {
+			return fs.Result{Attr: &fs.Attr{Kind: fs.KindDir, Mode: 0o755}}, nil
+		}
+		return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Mode: 0o644, Size: 7}}, nil
+	}
+	kind := fs.KindFile
+	if op.Path == "/" || op.Path == "/d" {
+		kind = fs.KindDir
+	}
+	return fs.Result{Attr: &fs.Attr{Kind: kind, Mode: mode, Size: 7}}, nil
+}
+
+// A directory's authoritative zero permissions close ancestor search.
+func TestPortDirChmodZeroClosesAncestorSearch(t *testing.T) {
+	term := &mapModeTerminal{modes: map[string]uint32{"/d": 0}}
+	f, err := New(Options{Extensions: []fs.Handler{term}, Uid: 1000, Gid: 1000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dEntry := lookupForTest(t, f, "/d")
+	fEntry := lookupForTest(t, f, "/d/f")
+	// The fresh Lookup recorded /d's authoritative 000; the ancestor gate
+	// must consult it (not an older 0755).
+	if st := f.Open(nil, &gofuse.OpenIn{InHeader: gofuse.InHeader{NodeId: fEntry.NodeId, Caller: gofuse.Caller{Owner: gofuse.Owner{Uid: 1000, Gid: 1000}, Pid: 1}}}, &gofuse.OpenOut{}); st != gofuse.EACCES {
+		t.Fatalf("open under 000 directory = %v, want EACCES (dir ino %d)", st, dEntry.NodeId)
+	}
+}

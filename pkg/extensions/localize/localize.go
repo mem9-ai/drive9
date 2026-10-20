@@ -72,8 +72,13 @@ type Localize struct {
 	// and unlinks answer from the record instead of falling through to a
 	// plane that only knows the remote view (a local-only node_modules
 	// FIFO disappeared from lookups right after mkfifo).
-	specialMu     sync.Mutex
-	localSpecials map[string]fs.Attr
+	specialMu sync.Mutex
+	// specialNode maps every recorded path (aliases included) to a shared
+	// node id; specialAttrs holds the node's authoritative metadata. A
+	// per-path attr copy let a chmod on one hardlink alias diverge from
+	// its siblings (and the stale copy then wrote back through Lookup).
+	specialNode  map[string]string
+	specialAttrs map[string]fs.Attr
 }
 
 // token is an open overlay file: the terminal data-plane handle for a
@@ -95,15 +100,16 @@ type token struct {
 // route).
 func New(opts Options) (*Localize, error) {
 	f := &Localize{
-		opts:          opts,
-		overlay:       NewOverlay(opts.LocalRoot),
-		policy:        NewPolicy(opts.Profile, opts.LocalOnlyPatterns, opts.LocalGitignoreAwarePatterns, opts.RemoteOnlyPatterns, opts.ApplyBuiltinDefaults),
-		openDBs:       map[string]int{},
-		unlinked:      map[string]bool{},
-		repoRoots:     map[string]string{},
-		ignoreSets:    map[string]*ignoreRuleset{},
-		localSpecials: map[string]fs.Attr{},
-		transient:     NewOverlay(opts.TransientRoot),
+		opts:         opts,
+		overlay:      NewOverlay(opts.LocalRoot),
+		policy:       NewPolicy(opts.Profile, opts.LocalOnlyPatterns, opts.LocalGitignoreAwarePatterns, opts.RemoteOnlyPatterns, opts.ApplyBuiltinDefaults),
+		openDBs:      map[string]int{},
+		unlinked:     map[string]bool{},
+		repoRoots:    map[string]string{},
+		ignoreSets:   map[string]*ignoreRuleset{},
+		specialNode:  map[string]string{},
+		specialAttrs: map[string]fs.Attr{},
+		transient:    NewOverlay(opts.TransientRoot),
 	}
 	if f.overlay != nil && f.policy.Enabled() {
 		if err := f.overlay.EnsureRoot(); err != nil {
@@ -600,10 +606,20 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 				return fs.Result{}, syscall.EXDEV
 			}
 			if attr, ok := f.localSpecial(op.Path); ok {
+				// The specials plane's target probe reaches only the REMOTE
+				// view: a local backing file or a recorded special on the
+				// destination must refuse the link here (the remote 404
+				// proved nothing about the local namespace).
+				if _, lerr := f.overlay.Lstat(op.Path2); lerr == nil {
+					return fs.Result{}, syscall.EEXIST
+				}
+				if _, ok := f.localSpecial(op.Path2); ok {
+					return fs.Result{}, syscall.EEXIST
+				}
 				// A metadata-only node has no backing file: the specials
 				// plane owns the record and creates the alias itself (its
-				// OpLink checks the target and registers the alias without
-				// touching the remote namespace).
+				// OpLink registers the alias without touching the remote
+				// namespace).
 				res, err := next(ctx, &fs.Op{Kind: fs.OpLink, Path: op.Path, Path2: op.Path2})
 				if err != nil {
 					return fs.Result{}, err
@@ -611,11 +627,17 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 				if got, gerr := next(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: op.Path2}); gerr == nil && got.Attr != nil {
 					attr = *got.Attr
 				}
-				f.recordLocalSpecial(op.Path2, attr)
+				f.recordLocalSpecial(op.Path, attr)
+				f.linkLocalSpecial(op.Path2, op.Path)
 				return res, nil
 			}
 			if err := f.overlay.Link(op.Path, op.Path2); err != nil {
 				return fs.Result{}, err
+			}
+			// Reply with the link's REAL attributes: an empty result made
+			// the facade answer size=0/0644/nlink=1 for an existing file.
+			if attr, claimed, serr := f.StatLocal(ctx, inner, op.Path2); serr == nil && claimed {
+				return fs.Result{Attr: &attr}, nil
 			}
 			return fs.Result{}, nil
 		}
@@ -775,10 +797,34 @@ func metadataOnlyLocalMode(mode uint32) bool {
 
 func (f *Localize) recordLocalSpecial(path string, attr fs.Attr) {
 	f.specialMu.Lock()
-	if f.localSpecials == nil {
-		f.localSpecials = map[string]fs.Attr{}
+	if f.specialNode == nil {
+		f.specialNode = map[string]string{}
 	}
-	f.localSpecials[path] = attr
+	if f.specialAttrs == nil {
+		f.specialAttrs = map[string]fs.Attr{}
+	}
+	node, ok := f.specialNode[path]
+	if !ok {
+		node = path
+		f.specialNode[path] = node
+	}
+	f.specialAttrs[node] = attr
+	f.specialMu.Unlock()
+}
+
+// linkLocalSpecial makes dst an alias of src's node: both paths then answer
+// the SAME authoritative attr.
+func (f *Localize) linkLocalSpecial(dst, src string) {
+	f.specialMu.Lock()
+	if f.specialNode == nil {
+		f.specialNode = map[string]string{}
+	}
+	node, ok := f.specialNode[src]
+	if !ok {
+		node = src
+		f.specialNode[src] = node
+	}
+	f.specialNode[dst] = node
 	f.specialMu.Unlock()
 }
 
@@ -789,7 +835,7 @@ func (f *Localize) localSpecialEntries(dir string) []fs.Entry {
 	f.specialMu.Lock()
 	defer f.specialMu.Unlock()
 	var out []fs.Entry
-	for p, attr := range f.localSpecials {
+	for p, node := range f.specialNode {
 		if !strings.HasPrefix(p, prefix) {
 			continue
 		}
@@ -797,7 +843,7 @@ func (f *Localize) localSpecialEntries(dir string) []fs.Entry {
 		if name == "" || strings.Contains(name, "/") {
 			continue
 		}
-		out = append(out, fs.Entry{Name: name, Attr: attr})
+		out = append(out, fs.Entry{Name: name, Attr: f.specialAttrs[node]})
 	}
 	return out
 }
@@ -808,7 +854,7 @@ func (f *Localize) localSpecialNodes(p string) []string {
 	f.specialMu.Lock()
 	defer f.specialMu.Unlock()
 	var out []string
-	for path := range f.localSpecials {
+	for path := range f.specialNode {
 		if path == p || strings.HasPrefix(path, prefix) {
 			out = append(out, path)
 		}
@@ -823,19 +869,19 @@ func (f *Localize) migrateLocalSpecialPrefix(oldPath, newPath string) {
 	newPrefix := strings.TrimSuffix(newPath, "/") + "/"
 	f.specialMu.Lock()
 	defer f.specialMu.Unlock()
-	moves := make(map[string]fs.Attr)
-	for p, attr := range f.localSpecials {
+	moves := make(map[string]string)
+	for p, node := range f.specialNode {
 		switch {
 		case p == oldPath:
-			moves[newPath] = attr
-			delete(f.localSpecials, p)
+			moves[newPath] = node
+			delete(f.specialNode, p)
 		case strings.HasPrefix(p, oldPrefix):
-			moves[newPrefix+strings.TrimPrefix(p, oldPrefix)] = attr
-			delete(f.localSpecials, p)
+			moves[newPrefix+strings.TrimPrefix(p, oldPrefix)] = node
+			delete(f.specialNode, p)
 		}
 	}
-	for p, attr := range moves {
-		f.localSpecials[p] = attr
+	for p, node := range moves {
+		f.specialNode[p] = node
 	}
 }
 
@@ -845,7 +891,7 @@ func (f *Localize) hasLocalSpecialUnder(dir string) bool {
 	prefix := strings.TrimSuffix(dir, "/") + "/"
 	f.specialMu.Lock()
 	defer f.specialMu.Unlock()
-	for p := range f.localSpecials {
+	for p := range f.specialNode {
 		if strings.HasPrefix(p, prefix) {
 			return true
 		}
@@ -856,13 +902,32 @@ func (f *Localize) hasLocalSpecialUnder(dir string) bool {
 func (f *Localize) localSpecial(path string) (fs.Attr, bool) {
 	f.specialMu.Lock()
 	defer f.specialMu.Unlock()
-	attr, ok := f.localSpecials[path]
+	node, ok := f.specialNode[path]
+	if !ok {
+		return fs.Attr{}, false
+	}
+	attr, ok := f.specialAttrs[node]
 	return attr, ok
 }
 
 func (f *Localize) forgetLocalSpecial(path string) {
 	f.specialMu.Lock()
-	delete(f.localSpecials, path)
+	node, ok := f.specialNode[path]
+	delete(f.specialNode, path)
+	if ok {
+		// The node's metadata goes away with its LAST alias; a sibling
+		// hardlink keeps it.
+		shared := false
+		for _, n := range f.specialNode {
+			if n == node {
+				shared = true
+				break
+			}
+		}
+		if !shared {
+			delete(f.specialAttrs, node)
+		}
+	}
 	f.specialMu.Unlock()
 }
 

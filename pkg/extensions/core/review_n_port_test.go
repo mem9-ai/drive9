@@ -86,3 +86,29 @@ func TestPortNamespaceStatKeepsExtentIno(t *testing.T) {
 		t.Fatalf("attr = %+v, want ExtentIno 77 from the namespace row", res.Attr)
 	}
 }
+
+// A namespace row written by a single-field chown keeps the two presence
+// flags apart: the unset field's preserve sentinel never becomes an owner.
+func TestPortNamespaceStatKeepsSplitOwnerFlags(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/f", []byte("hello"))
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	c, err := New(client.New(ts.URL, ""), Options{TrustLocalEvents: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nc := dircache.NewNamespaceCache(time.Minute, time.Second, 0)
+	nc.Put("/", []fs.DirEntryInfo{{
+		Name: "f", Size: 5, Rev: 7, HasMode: true, Mode: 0o600,
+		Uid: ^uint32(0), Gid: 2000, HasGID: true,
+	}})
+	c.Attach(nc)
+	res, derr := c.Do(context.Background(), &fs.Op{Kind: fs.OpGetAttr, Path: "/f"}, nil)
+	if derr != nil {
+		t.Fatalf("getattr = %v", derr)
+	}
+	if res.Attr == nil || res.Attr.HasUID || !res.Attr.HasGID || res.Attr.Gid != 2000 {
+		t.Fatalf("attr = %+v, want HasGID-only with gid 2000", res.Attr)
+	}
+}

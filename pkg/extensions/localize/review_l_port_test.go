@@ -310,3 +310,96 @@ func TestPortLocalSpecialHardlink(t *testing.T) {
 		t.Fatalf("source after alias unlink = %v", err)
 	}
 }
+
+func newLocalizeSpecialStack(t *testing.T) (*fs.Chain, func() *testbackend.Backend) {
+	t.Helper()
+	b := testbackend.NewBackend()
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	f, err := New(Options{LocalRoot: t.TempDir(), LocalOnlyPatterns: []string{"**/node_modules/**"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sp, err := specials.New(specials.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := fs.NewChain(f, sp, terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ch, func() *testbackend.Backend { return b }
+}
+
+// The local backing-file hardlink replies with the link's REAL attributes.
+func TestPortLocalHardlinkReturnsRealAttrs(t *testing.T) {
+	ch, _ := newLocalizeSpecialStack(t)
+	ctx := context.Background()
+	h, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/repo/node_modules/a.tmp", Flags: uint32(syscall.O_CREAT | syscall.O_RDWR), Mode: 0o600})
+	if err != nil || h.Handle == nil {
+		t.Fatalf("create = %v", err)
+	}
+	if err := h.Handle.Write(ctx, 0, []byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Handle.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpLink, Path: "/repo/node_modules/a.tmp", Path2: "/repo/node_modules/b.tmp"})
+	if err != nil {
+		t.Fatalf("link = %v", err)
+	}
+	if res.Attr == nil || res.Attr.Size != 5 || res.Attr.Mode&0o777 != 0o600 {
+		t.Fatalf("link attrs = %+v, want size=5 mode=0600", res.Attr)
+	}
+}
+
+// A special alias must refuse a destination that already exists locally.
+func TestPortLocalSpecialLinkRefusesLocalTarget(t *testing.T) {
+	ch, _ := newLocalizeSpecialStack(t)
+	ctx := context.Background()
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMknod, Path: "/repo/node_modules/a.tmp", Mode: uint32(syscall.S_IFIFO) | 0o644}); err != nil {
+		t.Fatal(err)
+	}
+	h, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/repo/node_modules/b.tmp", Flags: uint32(syscall.O_CREAT | syscall.O_RDWR), Mode: 0o600})
+	if err != nil || h.Handle == nil {
+		t.Fatalf("create target = %v", err)
+	}
+	if err := h.Handle.Write(ctx, 0, []byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Handle.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpLink, Path: "/repo/node_modules/a.tmp", Path2: "/repo/node_modules/b.tmp"}); err != syscall.EEXIST {
+		t.Fatalf("link onto a local file = %v, want EEXIST", err)
+	}
+}
+
+// A chmod on one alias of a metadata-only node is visible on every alias.
+func TestPortLocalSpecialAliasSharesAttrs(t *testing.T) {
+	ch, _ := newLocalizeSpecialStack(t)
+	ctx := context.Background()
+	src := "/repo/node_modules/a.tmp"
+	dst := "/repo/node_modules/b.tmp"
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMknod, Path: src, Mode: uint32(syscall.S_IFIFO) | 0o644}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpLink, Path: src, Path2: dst}); err != nil {
+		t.Fatalf("link = %v", err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpSetAttr, Path: src, HasMode: true, Mode: 0o600, Size: -1}); err != nil {
+		t.Fatalf("chmod = %v", err)
+	}
+	for _, p := range []string{src, dst} {
+		res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: p})
+		if err != nil || res.Attr == nil || res.Attr.Mode&0o777 != 0o600 {
+			t.Fatalf("%s attr = %+v err=%v, want 0600", p, res.Attr, err)
+		}
+	}
+}

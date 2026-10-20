@@ -65,8 +65,14 @@ type Attr struct {
 	Uid      uint32
 	Gid      uint32
 	HasOwner bool
-	Rdev     uint32
-	Atime    time.Time
+	// HasUID/HasGID carry the two presence flags INDEPENDENTLY: a chown
+	// may set only one of them, and projecting the unset one (the kernel's
+	// preserve sentinel) as an authoritative owner corrupted the other
+	// field. HasOwner stays the coarse "either flag" form.
+	HasUID bool
+	HasGID bool
+	Rdev   uint32
+	Atime  time.Time
 	// ExtentIno is the object-store inode the server reports for
 	// extent-layout listing rows (0 = not an extent object). A listing row
 	// is the only layout signal readdir gets: when the row carries the
