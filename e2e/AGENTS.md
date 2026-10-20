@@ -111,7 +111,7 @@ RUN_JOURNAL_SMOKE=1 RUN_POSIX_SMOKE=1 RUN_GIT_WORKSPACE_SMOKE=1 bash e2e/smoke-a
 RUN_TOKENS_SMOKE=1 bash e2e/tokens-smoke-test.sh
 RUN_SSE_SMOKE=1 bash e2e/sse-retention-smoke-test.sh
 
-# Object-store CLI + mount against a local MinIO (docker/podman).
+# Object-store CLI + mount against a local S3-compatible object store (docker/podman).
 # Does not need drive9-server. OBJECT_STRICT_MOUNT=1 fails if FUSE is missing.
 # This suite injects --auth=local; it does not exercise server mint.
 bash e2e/object-store-smoke-test.sh
@@ -235,24 +235,25 @@ Object store for that local server (also used by `make run-server-local`,
 blackbox `--server-mode local`, and `make sdk-integration-tests`):
 
 ```bash
-# default: real MinIO on 127.0.0.1:19000, else filesystem mock
+# default: RustFS on 127.0.0.1:19000, else filesystem mock
 make e2e-local
-DRIVE9_S3_BACKEND=minio make e2e-local   # require MinIO
+DRIVE9_S3_BACKEND=s3 make e2e-local   # require S3
 DRIVE9_S3_BACKEND=mock make e2e-local    # filesystem mock
 # already have a bucket:
 DRIVE9_S3_BUCKET=... DRIVE9_S3_ENDPOINT=http://127.0.0.1:19000 \
   DRIVE9_S3_FORCE_PATH_STYLE=true DRIVE9_S3_ACCESS_KEY_ID=... \
   DRIVE9_S3_SECRET_ACCESS_KEY=... make e2e-local
-bash scripts/local-minio.sh status
-bash scripts/local-minio.sh stop         # named container / recorded pid only
+bash scripts/local-object-store.sh status
+bash scripts/local-object-store.sh stop         # named container / recorded pid only
 ```
 
-MinIO is reused across runs (like the local TiDB container). Orb/VMs can bind
-`DRIVE9_MINIO_BIND=0.0.0.0` and advertise `DRIVE9_S3_ENDPOINT` for presign.
-The `minio/minio` image and `dl.min.io` binary downloads were removed upstream
-(the community edition went source-only), so MinIO is pulled from
-`cgr.dev/chainguard/minio` by default; override with `DRIVE9_MINIO_IMAGE`
-(first candidate) and `DRIVE9_MINIO_FALLBACK_IMAGE` (empty disables it).
+The object store is reused across runs (like the local TiDB container). Orb/VMs
+can bind `DRIVE9_OBJECT_STORE_BIND=0.0.0.0` and advertise `DRIVE9_S3_ENDPOINT`
+for presign. The default is a pinned RustFS image with no alternate image.
+Use `DRIVE9_OBJECT_STORE_IMAGE` / `DRIVE9_OBJECT_STORE_FALLBACK_IMAGE` to
+configure candidates; an explicitly empty fallback disables it. See
+[local object-store configuration](../docs/guides/local-object-store.md) for
+binary, readiness, credentials and migration settings.
 
 FUSE suites honor `FUSE_PROFILE` (`drive9 mount --profile`). Example:
 
@@ -296,7 +297,7 @@ export DRIVE9_LOCAL_DSN='root@tcp(127.0.0.1:4000)/drive9_local?parseTime=true'  
 make run-server-local
 ```
 
-`make run-server-local` sets `DRIVE9_TENANT_PROVIDER=local`, bootstraps MinIO
+`make run-server-local` sets `DRIVE9_TENANT_PROVIDER=local`, bootstraps RustFS
 unless `DRIVE9_S3_BUCKET` is already set, and stays attached to the foreground.
 Export any `DRIVE9_*` overrides before invoking it, then run the smoke scripts
 from a second terminal after the server is healthy.

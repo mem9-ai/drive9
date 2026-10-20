@@ -478,7 +478,7 @@ func (s *Store) AcquireTiDBCloudFreeQuotaLock(ctx context.Context, organizationI
 	}
 	lockName := tenantPoolDatabaseLockName(tidbCloudFreeQuotaLockName(organizationID), databaseName.String)
 	var got sql.NullInt64
-	if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK(?, ?)", lockName, tidbCloudFreeQuotaLockTimeoutSeconds).Scan(&got); err != nil {
+	if err := conn.QueryRowContext(ctx, "SELECT /*+ IGNORE_PLAN_CACHE() */ GET_LOCK(?, ?)", lockName, tidbCloudFreeQuotaLockTimeoutSeconds).Scan(&got); err != nil {
 		return nil, err
 	}
 	if !got.Valid {
@@ -500,7 +500,7 @@ func (s *Store) AcquireTiDBCloudFreeQuotaLock(ctx context.Context, organizationI
 			releaseCtx, cancel := context.WithTimeout(context.Background(), tidbCloudFreeQuotaReleaseLockTimeout)
 			defer cancel()
 			var released sql.NullInt64
-			if err := conn.QueryRowContext(releaseCtx, "SELECT RELEASE_LOCK(?)", lockName).Scan(&released); err != nil {
+			if err := conn.QueryRowContext(releaseCtx, "SELECT /*+ IGNORE_PLAN_CACHE() */ RELEASE_LOCK(?)", lockName).Scan(&released); err != nil {
 				releaseErr = err
 				return
 			}

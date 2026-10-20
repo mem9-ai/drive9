@@ -97,6 +97,8 @@ type mountFuseOptions struct {
 	PerfMaxSampleFiles           int
 	PerfMaxProfileFiles          int
 	Supervised                   bool
+	OmitProcessStateCredentials  bool
+	DefaultOwner                 string
 }
 
 type vaultMountOptions struct {

@@ -955,6 +955,32 @@ func TestDispatchProfileVerbReachesHandler(t *testing.T) {
 	}
 }
 
+func TestDispatchExecVerbReachesHandler(t *testing.T) {
+	origHandler := execHandler
+	origExit := exitFunc
+	t.Cleanup(func() {
+		execHandler = origHandler
+		exitFunc = origExit
+	})
+	exitFunc = func(int) {}
+
+	var gotArgs []string
+	execHandler = func(args []string) error {
+		gotArgs = append([]string(nil), args...)
+		return nil
+	}
+	want := []string{"--workspace", ":/repo", "--", "go", "test", "./..."}
+	dispatch("exec", want)
+	if len(gotArgs) != len(want) {
+		t.Fatalf("args = %v, want %v", gotArgs, want)
+	}
+	for index := range want {
+		if gotArgs[index] != want[index] {
+			t.Fatalf("args[%d] = %q, want %q", index, gotArgs[index], want[index])
+		}
+	}
+}
+
 // V2b hard-cut (G-V2b-1 / G-V2b-3): `drive9 secret <sub>` MUST NOT reach the
 // vault handler and MUST NOT get a bespoke rename hint — it falls into the
 // generic `unknown command` path shared with any typo. This pins the "no
@@ -1093,5 +1119,31 @@ func TestExitWithCodeStopsCPUProfile(t *testing.T) {
 	}
 	if exitCode != 7 {
 		t.Fatalf("exit code = %d, want 7", exitCode)
+	}
+}
+
+type silentTestExit struct{ code int }
+
+func (e silentTestExit) Error() string    { return "exit status" }
+func (e silentTestExit) ExitCode() int    { return e.code }
+func (e silentTestExit) SilentExit() bool { return true }
+
+func TestFatalSilentExitKeepsStderrClean(t *testing.T) {
+	origExit := exitFunc
+	t.Cleanup(func() { exitFunc = origExit })
+	var code int
+	exitFunc = func(value int) { code = value }
+	originalStderr := os.Stderr
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = writer
+	fatal("exec", silentTestExit{code: 9})
+	os.Stderr = originalStderr
+	_ = writer.Close()
+	output, _ := io.ReadAll(reader)
+	if code != 9 || len(output) != 0 {
+		t.Fatalf("code=%d stderr=%q", code, output)
 	}
 }

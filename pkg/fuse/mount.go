@@ -128,6 +128,16 @@ type MountConfig struct {
 	// SkipProcessState skips the mount pid/process state file (independent of
 	// Supervised — v1 had both knobs).
 	SkipProcessState bool
+	// OmitProcessStateCredentials keeps API keys, delegated tokens, and the
+	// potentially credential-bearing server endpoint out of the process-state
+	// file while retaining the PID and control socket needed by drain and
+	// unmount. Callers using this mode cannot use credential-backed post-unmount
+	// helpers such as auto-pack.
+	OmitProcessStateCredentials bool
+	// DefaultOwner, when set, is the uid/gid reported for files that carry
+	// no stored owner (normally the mounting process). A sandbox uses it to
+	// present the workspace as owned by its unprivileged application user.
+	DefaultOwner *Owner
 
 	PerfCounters bool
 
@@ -342,6 +352,10 @@ type MountOptions struct {
 	RemoteCommitWaitTimeout time.Duration
 	// SkipProcessState skips writing the mount pid/process state file.
 	SkipProcessState bool
+	// OmitProcessStateCredentials blanks secrets from the process state and
+	// exit records; DefaultOwner overrides the mount's reported uid/gid.
+	OmitProcessStateCredentials bool
+	DefaultOwner                *Owner
 	// Supervised marks this worker as managed by an external supervisor.
 	Supervised bool
 	// Extensions lists the extensions to wire in build-up order (core first).
@@ -368,7 +382,13 @@ func Mount(opts *MountOptions) error {
 	if opts == nil {
 		return fmt.Errorf("fuse: nil MountOptions")
 	}
-	return MountWithConfig(MountConfig{
+	return MountWithConfig(mountConfigFromOptions(opts))
+}
+
+// mountConfigFromOptions is the public-options to internal-config
+// conversion; kept separate so tests pin new option wiring.
+func mountConfigFromOptions(opts *MountOptions) MountConfig {
+	return MountConfig{
 		Server:                        opts.Server,
 		APIKey:                        opts.APIKey,
 		Token:                         opts.Token,
@@ -442,9 +462,11 @@ func Mount(opts *MountOptions) error {
 		PerfMaxProfileFiles:           opts.Profiling.PerfMaxProfileFiles,
 		RemoteCommitWaitTimeout:       opts.RemoteCommitWaitTimeout,
 		SkipProcessState:              opts.SkipProcessState,
+		OmitProcessStateCredentials:   opts.OmitProcessStateCredentials,
+		DefaultOwner:                  opts.DefaultOwner,
 		Supervised:                    opts.Supervised,
 		Extensions:                    opts.Extensions,
-	})
+	}
 }
 
 // resolveKernelTTLDefaults ports v1 setDefaults' profile-dependent kernel
@@ -492,6 +514,147 @@ func resolveWriteCacheSizeMB(sizeMB int64) int64 {
 // serves until unmounted. Mount(MountOptions) is the stable entry; this form
 // exists for the CLI bridge and white-box tests that already hold a config.
 func MountWithConfig(cfg MountConfig) error {
+	err := mountWithConfig(cfg)
+	if err != nil && cfg.OmitProcessStateCredentials {
+		err = redactCredentialError(err, cfg)
+	}
+	return err
+}
+
+// buildMountProcessState assembles the pidfile record, blanking the
+// credential-bearing fields when the caller asked them to stay out of the
+// process state.
+func buildMountProcessState(remoteRoot, profile, localRoot, server, apiKey, token string,
+	packPaths []string, prof ProfilingOptions, supervised, omit bool,
+	mountPoint string, creationTime uint64, credentialKind, controlSock string, startedAt time.Time) mountstate.ProcessState {
+	if omit {
+		server, apiKey, token = "", "", ""
+	}
+	return mountstate.ProcessState{
+		PID:                 os.Getpid(),
+		CreationTime:        creationTime,
+		Component:           "drive9-fuse",
+		MountKind:           mountstate.MountKindFUSE,
+		MountPoint:          mountPoint,
+		RemoteRoot:          remoteRoot,
+		Profile:             profile,
+		LocalRoot:           localRoot,
+		Server:              server,
+		PackPaths:           append([]string(nil), packPaths...),
+		CredentialKind:      credentialKind,
+		APIKey:              apiKey,
+		Token:               token,
+		ProfileDir:          prof.ProfileDir,
+		PerfSamplesPath:     prof.PerfSamplesPath,
+		PerfInterval:        prof.PerfSampleInterval.String(),
+		PerfMaxSamples:      prof.PerfMaxSamples,
+		PerfMaxSampleFiles:  prof.PerfMaxSampleFiles,
+		PerfMaxProfileFiles: prof.PerfMaxProfileFiles,
+		PprofAddr:           prof.PprofAddr,
+		StartedAt:           startedAt.Format(time.RFC3339Nano),
+		HeapProfilePath:     prof.HeapProfilePath,
+		ControlSocket:       controlSock,
+		Role:                mountstate.RoleWorker,
+		Supervise:           supervised,
+	}
+}
+
+// newMountProcessState is the MountOptions form of the builder (the mount
+// entry and its white-box tests use it).
+func newMountProcessState(opts *MountOptions, mountPoint string, creationTime uint64, credentialKind, controlSock string, startedAt time.Time) mountstate.ProcessState {
+	return buildMountProcessState(opts.RemoteRoot, opts.Profile, opts.LocalRoot, opts.Server, opts.APIKey, opts.Token,
+		opts.PackPaths, opts.Profiling, opts.Supervised, opts.OmitProcessStateCredentials,
+		mountPoint, creationTime, credentialKind, controlSock, startedAt)
+}
+
+// readyMessage renders the mounted line; a non-persistent credential mount
+// may run with a credential-bearing endpoint, so it omits the server.
+func readyMessage(mountPoint, server, actorID string, readonly bool, policy, cacheBase, shadowDir string, omit bool) string {
+	if omit {
+		return fmt.Sprintf("drive9: mounted on %s (actor: %s, readonly: %v, write_policy: %s, cache: %s, shadow: %s)\n",
+			mountPoint, actorID, readonly, policy, cacheBase, shadowDir)
+	}
+	return fmt.Sprintf("drive9: mounted on %s (server: %s, actor: %s, readonly: %v, write_policy: %s, cache: %s, shadow: %s)\n",
+		mountPoint, server, actorID, readonly, policy, cacheBase, shadowDir)
+}
+
+// mountReadyMessage is the MountOptions form (used by tests).
+func mountReadyMessage(opts *MountOptions, actorID, cacheBase, shadowDir string) string {
+	return readyMessage(opts.MountPoint, opts.Server, actorID, opts.ReadOnly, opts.WritePolicy.String(), cacheBase, shadowDir, opts.OmitProcessStateCredentials)
+}
+
+// policyString renders the write policy for the ready line (the enum's
+// zero value is writeback).
+func policyString(policy writeback.Policy) string {
+	switch policy {
+	case writeback.PolicyWriteSync:
+		return "write-sync"
+	case writeback.PolicyCloseSync:
+		return "close-sync"
+	default:
+		return "writeback"
+	}
+}
+
+// redactCredentialError strips the endpoint/key/token from an error chain,
+// preserving the MountExitError classification (exit code/reason survive).
+func redactCredentialError(err error, cfg MountConfig) error {
+	if err == nil {
+		return nil
+	}
+	message := redactCredentialText(err.Error(), cfg)
+	if message == err.Error() {
+		return err
+	}
+	var exitErr *MountExitError
+	if errors.As(err, &exitErr) {
+		redacted := *exitErr
+		redacted.Detail = redactCredentialText(exitErr.Detail, cfg)
+		if exitErr.Cause != nil {
+			redacted.Cause = redactedMountCause{
+				message: redactCredentialText(exitErr.Cause.Error(), cfg),
+				cause:   exitErr.Cause,
+			}
+		}
+		return &redacted
+	}
+	return redactedMountCause{message: message, cause: err}
+}
+
+// redactMountCredentialError is the MountOptions form (used by the mount
+// entry's white-box tests and by callers holding the public options).
+func redactMountCredentialError(err error, opts *MountOptions) error {
+	return redactCredentialError(err, MountConfig{Server: opts.Server, APIKey: opts.APIKey, Token: opts.Token})
+}
+
+// writeMountExitReason persists an exit record, redacting the detail when
+// credentials must not leave the process.
+func writeMountExitReason(opts *MountOptions, mountPoint string, rec mountstate.ExitReason) error {
+	if opts != nil && opts.OmitProcessStateCredentials {
+		rec.Detail = redactCredentialText(rec.Detail, MountConfig{Server: opts.Server, APIKey: opts.APIKey, Token: opts.Token})
+	}
+	return mountstate.WriteExitReason(mountPoint, rec)
+}
+
+// redactCredentialText replaces every secret the mount carries.
+func redactCredentialText(text string, cfg MountConfig) string {
+	for _, secret := range []string{cfg.Server, cfg.APIKey, cfg.Token} {
+		if secret != "" {
+			text = strings.ReplaceAll(text, secret, "<redacted>")
+		}
+	}
+	return text
+}
+
+type redactedMountCause struct {
+	message string
+	cause   error
+}
+
+func (e redactedMountCause) Error() string { return e.message }
+func (e redactedMountCause) Unwrap() error { return e.cause }
+
+func mountWithConfig(cfg MountConfig) error {
 	if cfg.APIKey != "" && cfg.Token != "" {
 		return fmt.Errorf("fuse: APIKey and Token are mutually exclusive")
 	}
@@ -695,14 +858,22 @@ func MountWithConfig(cfg MountConfig) error {
 	}
 	fmt.Fprintf(os.Stderr, "drive9: sync mode: %s\n", syncMode)
 
+	// A sandbox presents the workspace as owned by its unprivileged
+	// application user (v1 DefaultOwner); everything else reports the
+	// mounting process.
+	uid, gid := uint32(os.Getuid()), uint32(os.Getgid())
+	if cfg.DefaultOwner != nil {
+		uid, gid = cfg.DefaultOwner.UID, cfg.DefaultOwner.GID
+	}
+
 	// The POSIX rename preflight sits early so its attribute lookups see
 	// the view handlers below it (lazy-create overlays answer for
 	// not-yet-committed files).
 	var renameGuard *renameguard.RenameGuard
 	if wantExt["renameguard"] {
 		renameGuard, err = renameguard.New(renameguard.Options{
-			Uid: uint32(os.Getuid()),
-			Gid: uint32(os.Getgid()),
+			Uid: uid,
+			Gid: gid,
 		})
 		if err != nil {
 			return fmt.Errorf("fuse: renameguard extension: %w", err)
@@ -949,6 +1120,8 @@ func MountWithConfig(cfg MountConfig) error {
 		PerfCounters:       sharedCounters,
 		Debug:              cfg.Debug,
 		GVisorCompat:       cfg.GVisorCompat,
+		Uid:                uid,
+		Gid:                gid,
 	})
 	if err != nil {
 		return fmt.Errorf("fuse: assemble facade: %w", err)
@@ -1020,7 +1193,7 @@ func MountWithConfig(cfg MountConfig) error {
 	// `drive9 mount drain/umount/status` find this worker and its control
 	// socket; a supervised worker skips it — the supervisor owns the state
 	// file (v1 SkipProcessState: opts.Supervised).
-	ctrl, cerr := startMountControlServer(cfg.MountPoint, f)
+	ctrl, cerr := startMountControlServer(cfg.MountPoint, cfg.LayerRef, f)
 	if cerr != nil {
 		fmt.Fprintf(os.Stderr, "drive9: mount control server failed: %v (continuing)\n", cerr)
 	} else {
@@ -1046,33 +1219,11 @@ func MountWithConfig(cfg MountConfig) error {
 		if ctrl != nil {
 			controlSock = ctrl.SocketPath()
 		}
-		pidFile, pidErr := mountstate.WriteProcessState(cfg.MountPoint, mountstate.ProcessState{
-			PID:                 os.Getpid(),
-			CreationTime:        creationTime,
-			Component:           "drive9-fuse",
-			MountKind:           mountstate.MountKindFUSE,
-			MountPoint:          stateMountPoint,
-			RemoteRoot:          cfg.RemoteRoot,
-			Profile:             cfg.Profile,
-			LocalRoot:           cfg.LocalRoot,
-			Server:              cfg.Server,
-			PackPaths:           append([]string(nil), cfg.PackPaths...),
-			CredentialKind:      credentialKind,
-			APIKey:              cfg.APIKey,
-			Token:               cfg.Token,
-			ProfileDir:          prof.ProfileDir,
-			PerfSamplesPath:     prof.PerfSamplesPath,
-			PerfInterval:        prof.PerfSampleInterval.String(),
-			PerfMaxSamples:      prof.PerfMaxSamples,
-			PerfMaxSampleFiles:  prof.PerfMaxSampleFiles,
-			PerfMaxProfileFiles: prof.PerfMaxProfileFiles,
-			PprofAddr:           prof.PprofAddr,
-			StartedAt:           time.Now().UTC().Format(time.RFC3339Nano),
-			HeapProfilePath:     prof.HeapProfilePath,
-			ControlSocket:       controlSock,
-			Role:                mountstate.RoleWorker,
-			Supervise:           cfg.Supervised,
-		})
+		pidFile, pidErr := mountstate.WriteProcessState(cfg.MountPoint, buildMountProcessState(
+			cfg.RemoteRoot, cfg.Profile, cfg.LocalRoot, cfg.Server, cfg.APIKey, cfg.Token,
+			cfg.PackPaths, prof, cfg.Supervised, cfg.OmitProcessStateCredentials,
+			stateMountPoint, creationTime, credentialKind, controlSock, time.Now().UTC(),
+		))
 		if pidErr != nil {
 			return fmt.Errorf("fuse: write mount pid file: %w", pidErr)
 		}
@@ -1171,8 +1322,7 @@ func MountWithConfig(cfg MountConfig) error {
 			shadowDesc = cfg.CacheDir + "/staging/shadow"
 		}
 	}
-	fmt.Fprintf(os.Stderr, "drive9: mounted on %s (server: %s, actor: %s, readonly: %v, write_policy: %s, cache: %s, shadow: %s)\n",
-		cfg.MountPoint, cfg.Server, actorID, cfg.ReadOnly, policy, cacheDesc, shadowDesc)
+	fmt.Fprint(os.Stderr, readyMessage(cfg.MountPoint, cfg.Server, actorID, cfg.ReadOnly, policyString(policy), cacheDesc, shadowDesc, cfg.OmitProcessStateCredentials))
 
 	// Graceful shutdown (v1 mount.go): on the first SIGINT/SIGTERM flush
 	// open handles, drain the chain, and Unmount with retries (EBUSY is

@@ -1908,8 +1908,10 @@ func (s *Store) withTiDBCloudOrgBindingLock(ctx context.Context, organizationID,
 	}
 	lockName = tenantPoolDatabaseLockName(lockName, databaseName.String)
 
+	// These parameterized operations own connection-local locks; TiDB must
+	// execute them each time instead of reusing a folded prepared plan.
 	var got sql.NullInt64
-	if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK(?, ?)", lockName, tidbCloudOrgBindingLockTimeoutSeconds).Scan(&got); err != nil {
+	if err := conn.QueryRowContext(ctx, "SELECT /*+ IGNORE_PLAN_CACHE() */ GET_LOCK(?, ?)", lockName, tidbCloudOrgBindingLockTimeoutSeconds).Scan(&got); err != nil {
 		return err
 	}
 	if !got.Valid {
@@ -1922,7 +1924,7 @@ func (s *Store) withTiDBCloudOrgBindingLock(ctx context.Context, organizationID,
 		releaseCtx, cancel := context.WithTimeout(context.Background(), tidbCloudOrgBindingReleaseLockTimeout)
 		defer cancel()
 		var released sql.NullInt64
-		releaseErr := conn.QueryRowContext(releaseCtx, "SELECT RELEASE_LOCK(?)", lockName).Scan(&released)
+		releaseErr := conn.QueryRowContext(releaseCtx, "SELECT /*+ IGNORE_PLAN_CACHE() */ RELEASE_LOCK(?)", lockName).Scan(&released)
 		if releaseErr != nil {
 			err = errors.Join(err, releaseErr)
 			return
@@ -2756,8 +2758,10 @@ func (s *Store) WithTenantPoolLock(ctx context.Context, poolID string, fn func(c
 	}
 	lockName = tenantPoolDatabaseLockName(lockName, databaseName.String)
 
+	// These parameterized operations own connection-local locks; TiDB must
+	// execute them each time instead of reusing a folded prepared plan.
 	var got sql.NullInt64
-	if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK(?, ?)", lockName, tenantPoolLockTimeoutSeconds).Scan(&got); err != nil {
+	if err := conn.QueryRowContext(ctx, "SELECT /*+ IGNORE_PLAN_CACHE() */ GET_LOCK(?, ?)", lockName, tenantPoolLockTimeoutSeconds).Scan(&got); err != nil {
 		return err
 	}
 	if !got.Valid {
@@ -2770,7 +2774,7 @@ func (s *Store) WithTenantPoolLock(ctx context.Context, poolID string, fn func(c
 		releaseCtx, cancel := context.WithTimeout(context.Background(), tenantPoolReleaseLockTimeout)
 		defer cancel()
 		var released sql.NullInt64
-		releaseErr := conn.QueryRowContext(releaseCtx, "SELECT RELEASE_LOCK(?)", lockName).Scan(&released)
+		releaseErr := conn.QueryRowContext(releaseCtx, "SELECT /*+ IGNORE_PLAN_CACHE() */ RELEASE_LOCK(?)", lockName).Scan(&released)
 		if releaseErr != nil {
 			err = errors.Join(err, releaseErr)
 			return

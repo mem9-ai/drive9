@@ -18,7 +18,7 @@
 #   FUSE_PROFILE=coding-agent-extent \
 #     DRIVE9_LOCAL_E2E_SMOKE_SCRIPT=e2e/fuse-sqlite-correctness.sh make e2e-local
 #   DRIVE9_S3_BACKEND=mock make e2e-local
-#   DRIVE9_S3_BACKEND=minio make e2e-local
+#   DRIVE9_S3_BACKEND=s3 make e2e-local
 #
 # Defaults:
 #   RUN_API_ONLY=0              full local-e2e.yml PR set (api/cli + pack + FUSE)
@@ -30,8 +30,8 @@
 #   RUN_TOKENS_SMOKE=0          /v1/tokens management smoke (set 1 to enable)
 #   RUN_SSE_SMOKE=0             /v1/events retention smoke (set 1 to enable)
 #   FUSE_PROFILE=               optional --profile for FUSE suites (e.g. coding-agent-extent)
-#   DRIVE9_S3_BACKEND=auto      try real MinIO, else local filesystem mock
-#                               minio = require MinIO; mock = filesystem mock
+#   DRIVE9_S3_BACKEND=auto      try real object store, else local filesystem mock
+#                               s3 = require object store; mock = filesystem mock
 #                               skip bootstrap when DRIVE9_S3_BUCKET is already set
 #
 # Compatible with macOS bash 3.2.
@@ -275,7 +275,7 @@ start_server() {
   export DRIVE9_LISTEN_ADDR="$LISTEN_ADDR"
   export DRIVE9_PUBLIC_URL="${DRIVE9_PUBLIC_URL:-http://$LISTEN_ADDR}"
   export DRIVE9_TENANT_PROVIDER="${DRIVE9_TENANT_PROVIDER:-local}"
-  # A local MinIO has no STS, so the extent data plane needs the static-key
+  # A local object store has no STS, so the extent data plane needs the static-key
   # fallback; the server refuses it without this explicit opt-in.
   export DRIVE9_EXTENT_ALLOW_STATIC_CREDENTIALS="${DRIVE9_EXTENT_ALLOW_STATIC_CREDENTIALS:-1}"
   export DRIVE9_LOCAL_DSN="${DRIVE9_LOCAL_DSN:-$DEFAULT_DSN}"
@@ -301,7 +301,7 @@ apply_s3_backend() {
     export DRIVE9_S3_DIR
   fi
   local s3_env
-  s3_env="$(bash "$ROOT/scripts/local-minio.sh" apply)" || return 1
+  s3_env="$(bash "$ROOT/scripts/local-object-store.sh" apply)" || return 1
   eval "$s3_env"
   if [ -n "${DRIVE9_S3_DIR:-}" ]; then
     S3_DIR="$DRIVE9_S3_DIR"
