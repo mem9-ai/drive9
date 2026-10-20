@@ -246,3 +246,25 @@ func TestPortSiblingPrefetchKeepsIdentityAndFencesReset(t *testing.T) {
 		t.Fatal("pre-reset sibling listing repopulated the cleared namespace cache")
 	}
 }
+
+// The disk-hit promotion runs through the same reset protocol as every
+// other publication: an epoch captured before a reset can no longer
+// repopulate the memory tier.
+func TestPortDiskHitPromotionFencesReset(t *testing.T) {
+	c, err := New(Options{MaxSize: 1 << 20, MaxFileSize: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	epoch := c.epoch.Load()
+	c.invalidateAllTiers()
+	called := false
+	if c.publishIfCurrent(epoch, func() { called = true }) {
+		t.Fatal("stale publication reported current")
+	}
+	if called {
+		t.Fatal("disk-hit promotion ran after the reset")
+	}
+	if !c.publishIfCurrent(c.epoch.Load(), func() { called = true }) || !called {
+		t.Fatal("current publication was refused")
+	}
+}

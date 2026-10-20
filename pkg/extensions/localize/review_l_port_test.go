@@ -209,7 +209,12 @@ func TestPortLocalSpecialNodeVisibleAndRemovable(t *testing.T) {
 // A directory rename moves BOTH registries holding local metadata-only
 // nodes: our mirror and the specials plane's records.
 func TestPortLocalSpecialFollowsDirRename(t *testing.T) {
-	ts := httptest.NewServer(testbackend.NewBackend())
+	b := testbackend.NewBackend()
+	// A remote object squats on the target name: the local registry move
+	// must not probe or delete it (the ordinary specials rename would
+	// unlink the target).
+	b.Seed("/repo/node_modules/moved/fifo", []byte("remote"))
+	ts := httptest.NewServer(b)
 	t.Cleanup(ts.Close)
 	cl := client.New(ts.URL, "")
 	f, err := New(Options{LocalRoot: t.TempDir(), LocalOnlyPatterns: []string{"**/node_modules/**"}})
@@ -246,6 +251,9 @@ func TestPortLocalSpecialFollowsDirRename(t *testing.T) {
 	}
 	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: fifo}); err == nil {
 		t.Fatal("old special path still resolves after the rename")
+	}
+	if node, ok := b.Node("/repo/node_modules/moved/fifo"); !ok || string(node.Data) != "remote" {
+		t.Fatalf("remote target = %q ok=%v, want the backing object untouched", node.Data, ok)
 	}
 	// The specials record moved too: a duplicate create at the new name is
 	// EEXIST, and a fresh mknod at the old name succeeds.

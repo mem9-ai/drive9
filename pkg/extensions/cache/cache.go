@@ -513,15 +513,18 @@ func (h *cachingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 		}
 		h.cache.noteHit("read", false)
 		key := DiskReadCacheKey{FileID: pathDiskReadCacheFileID(path), Path: path, Revision: h.rev, Offset: 0, Length: h.size}
+		// The capture PRECEDES the disk read: a blocking disk fetch that
+		// completes after a reset must not promote its pre-reset bytes.
+		epoch := h.cache.epoch.Load()
 		if h.cache.dsk != nil {
 			if cached, ok := h.cache.dsk.Get(key); ok && int64(len(cached)) == h.size {
 				h.cache.noteHit("read", true)
-				h.cache.mem.PutOwned(path, cached, h.rev)
+				h.cache.publishIfCurrent(epoch, func() { h.cache.mem.PutOwned(path, cached, h.rev) })
 				return copyReadRange(dest, cached, off), nil
 			}
 		}
 		whole := make([]byte, h.size)
-		epoch := h.cache.epoch.Load()
+		epoch = h.cache.epoch.Load()
 		if n, err := h.inner.Read(ctx, 0, whole); err == nil && int64(n) == h.size {
 			// A checkout may have replaced the view while this fetch was
 			// in flight: its bytes describe the OLD view and must not be

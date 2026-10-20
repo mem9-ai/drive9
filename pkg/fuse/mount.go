@@ -1107,6 +1107,7 @@ func mountWithConfig(cfg MountConfig) error {
 		}
 	}
 	f, err := New(Options{
+		OwnerSet:           cfg.DefaultOwner != nil,
 		Extensions:         chainHandlers,
 		Events:             bus,
 		AttrTTL:            attrTTL,

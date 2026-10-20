@@ -173,6 +173,20 @@ func (s *Specials) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 		s.dropSubtree(op.Path)
 		return res, nil
 	case fs.OpRename:
+		if op.RegistryOnly {
+			// A local namespace move (localize migrating metadata-only
+			// nodes): move the records only. The ordinary path below
+			// preflights/deletes the TARGET through next() and would wipe a
+			// backing remote object the local view never meant to touch.
+			if _, ok := s.get(op.Path2); ok {
+				s.drop(op.Path2)
+			}
+			s.renameSubtree(op.Path, op.Path2)
+			if _, ok := s.get(op.Path2); ok {
+				return s.attrResult(op.Path2)
+			}
+			return fs.Result{}, nil
+		}
 		if _, ok := s.get(op.Path); ok {
 			// An exact special record has no remote entry to move, so the
 			// rename itself stays local. Forwarding it would remotely rename

@@ -558,7 +558,15 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 				if from != op.Path {
 					to = op.Path2 + from[len(op.Path):]
 				}
-				_, _ = next(ctx, &fs.Op{Kind: fs.OpRename, Path: from, Path2: to})
+				// RegistryOnly: the specials plane moves its record without
+				// probing or deleting the remote target (its ordinary rename
+				// unlinks whatever squats on the name).
+				if _, err := next(ctx, &fs.Op{Kind: fs.OpRename, Path: from, Path2: to, RegistryOnly: true}); err != nil {
+					// The backing directory already moved; a record that did
+					// not follow would answer at the old path. Report it
+					// rather than leaving the two registries divergent.
+					return fs.Result{}, err
+				}
 			}
 			f.migrateLocalSpecialPrefix(op.Path, op.Path2)
 			return fs.Result{}, nil

@@ -259,12 +259,17 @@ type Op struct {
 	// HasSize marks an explicitly requested truncation in a combined
 	// SETATTR (Size's zero value is ambiguous otherwise).
 	HasSize bool
-	Flags   uint32    // OpenFlags for OpCreate
-	Target  string    // symlink target
-	Rdev    uint32    // mknod device number (specials carry it in their records)
-	Path2   string    // destination path (rename/link/copy_file_range)
-	Data    []byte    // write payload or xattr value
-	Mtime   time.Time // setattr modification time
+	Flags   uint32 // OpenFlags for OpCreate
+	Target  string // symlink target
+	Rdev    uint32 // mknod device number (specials carry it in their records)
+	// RegistryOnly marks a namespace move that must NOT touch the remote
+	// (localize migrating metadata-only special-node records): subscribers
+	// move their bookkeeping and return without probing or deleting the
+	// backing namespace.
+	RegistryOnly bool
+	Path2        string    // destination path (rename/link/copy_file_range)
+	Data         []byte    // write payload or xattr value
+	Mtime        time.Time // setattr modification time
 	// Setattr owner change (v1 chown): pointer semantics — nil/absent
 	// means "do not change"; &^uint32(0) is the kernel's preserve sentinel,
 	// normalized away by the facade before dispatch.

@@ -34,6 +34,10 @@ import (
 
 // Options configures a facade.
 type Options struct {
+	// OwnerSet marks Uid/Gid as explicitly configured: an explicit 0:0 is
+	// a valid (root) identity and must not fall back to the mounting
+	// process.
+	OwnerSet bool
 	// Extensions wrap the core in registration order: Extensions[0] is
 	// the outermost handler.
 	Extensions []fs.Handler
@@ -189,7 +193,9 @@ func New(opts Options) (*FS, error) {
 		return nil, fmt.Errorf("fuse: assemble chain: %w", err)
 	}
 	uid, gid := opts.Uid, opts.Gid
-	if uid == 0 && gid == 0 {
+	if !opts.OwnerSet && uid == 0 && gid == 0 {
+		// Zero/zero is the "unset" default only when the caller did not
+		// configure an owner: `--owner 0:0` is a real sandbox identity.
 		uid, gid = uint32(os.Getuid()), uint32(os.Getgid())
 	}
 	f := &FS{
@@ -309,7 +315,13 @@ func New(opts Options) (*FS, error) {
 	// namespace view too (v1 resetMountViewWithInitialSync /
 	// markStatCacheUnverified cleared the dir cache): stale listings must
 	// not answer lookups after the view restarted.
-	f.events.On(fs.EventCheckout, func(fs.Event) {
+	f.events.On(fs.EventCheckout, func(e fs.Event) {
+		if e.KernelInvalidate {
+			// A revoked credential may address a different namespace:
+			// userspace-only invalidation left the same fd serving the old
+			// bytes from the kernel page cache.
+			f.InvalidateAll()
+		}
 		// A checkout/reset replaces the whole remote view: every listing
 		// installed before it is stale. Bump the fence and drop the open
 		// directory handles' snapshots (a live enumeration would otherwise
@@ -2510,12 +2522,19 @@ func (f *FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte) (gof
 	defer cf()
 	if h := f.openHandle(input.Fh); h != nil {
 		start := time.Now()
+		gen := f.viewGen.Load()
 		n, err := h.Read(ctx, int64(input.Offset), buf)
 		f.recordHandleOp(fs.OpRead, start, err, uint64(n))
 		if err != nil && !errors.Is(err, io.EOF) {
 			return nil, fs.StatusOf(err)
 		}
 		if n > 0 {
+			if f.viewGen.Load() != gen {
+				// The bytes were produced from a view a reset replaced while
+				// the read was in flight: EAGAIN makes the kernel retry
+				// instead of pinning pre-reset content in its page cache.
+				return nil, gofuse.EAGAIN
+			}
 			return gofuse.ReadResultData(buf[:n]), gofuse.OK
 		}
 		if err != nil {
@@ -2527,9 +2546,13 @@ func (f *FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte) (gof
 	if !ok {
 		return nil, gofuse.ENOENT
 	}
+	gen := f.viewGen.Load()
 	res, st := f.dispatch(ctx, &fs.Op{Kind: fs.OpRead, Path: path, Ino: input.NodeId, Fh: input.Fh, Offset: int64(input.Offset), Limit: int64(input.Size), Kernel: input, Caller: fs.CallerFrom(input.InHeader)})
 	if st != gofuse.OK {
 		return nil, st
+	}
+	if len(res.Data) > 0 && f.viewGen.Load() != gen {
+		return nil, gofuse.EAGAIN
 	}
 	return gofuse.ReadResultData(res.Data), gofuse.OK
 }

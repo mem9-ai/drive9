@@ -7,7 +7,9 @@ package fuse
 
 import (
 	"context"
+	"os"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -331,5 +333,115 @@ func TestPortSetAttrRequiresAncestorSearch(t *testing.T) {
 	handleOp.Caller = gofuse.Caller{Owner: gofuse.Owner{Uid: 1000, Gid: 1000}, Pid: 1}
 	if st := f.SetAttr(nil, handleOp, &aout); st != gofuse.OK {
 		t.Fatalf("descriptor setattr = %v, want OK", st)
+	}
+}
+
+// gatedReadHandle blocks its Read until released.
+type gatedReadHandle struct {
+	gate    chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (g *gatedReadHandle) Read(ctx context.Context, off int64, dest []byte) (int, error) {
+	g.once.Do(func() { close(g.gate) })
+	<-g.release
+	return copy(dest, []byte("OLD")), nil
+}
+func (g *gatedReadHandle) Write(context.Context, int64, []byte) error { return nil }
+func (g *gatedReadHandle) Sync(context.Context) error                 { return nil }
+func (g *gatedReadHandle) Flush(context.Context) error                { return nil }
+func (g *gatedReadHandle) Release(context.Context) error              { return nil }
+
+// A READ reply produced from a view a reset replaced must be EAGAIN (the
+// kernel retries) instead of handing the old bytes to the page cache.
+func TestPortReadReplyFencedByViewReset(t *testing.T) {
+	core := newMemCore()
+	core.paths["/f"] = &memEntry{data: []byte("OLD"), mode: 0o644}
+	bus := fs.NewEventBus()
+	f, err := New(Options{Extensions: []fs.Handler{core}, Uid: 1000, Gid: 1000, Events: bus})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := lookupForTest(t, f, "/f")
+	gh := &gatedReadHandle{gate: make(chan struct{}), release: make(chan struct{})}
+	f.handles.put(7, &fileHandle{ino: entry.NodeId, path: "/f", h: gh})
+
+	type result struct {
+		res gofuse.ReadResult
+		st  gofuse.Status
+	}
+	done := make(chan result, 1)
+	go func() {
+		res, st := f.Read(nil, &gofuse.ReadIn{InHeader: gofuse.InHeader{NodeId: entry.NodeId}, Fh: 7, Size: 4}, make([]byte, 4))
+		done <- result{res, st}
+	}()
+	<-gh.gate
+	bus.Emit(fs.Event{Kind: fs.EventCheckout, Path: "/"})
+	close(gh.release)
+	got := <-done
+	if got.st != gofuse.EAGAIN {
+		t.Fatalf("stale read status = %v, want EAGAIN", got.st)
+	}
+	f.handles.drop(7)
+}
+
+// An explicit owner of 0:0 is a real identity, not the unset default.
+func TestPortExplicitZeroOwnerIsPreserved(t *testing.T) {
+	core := newMemCore()
+	f, err := New(Options{Extensions: []fs.Handler{core}, Uid: 0, Gid: 0, OwnerSet: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out gofuse.Attr
+	f.fillAttr(fs.Attr{Kind: fs.KindFile, Mode: 0o644}, 1, &out)
+	if out.Uid != 0 || out.Gid != 0 {
+		t.Fatalf("explicit owner = %d:%d, want 0:0", out.Uid, out.Gid)
+	}
+	plain, err := New(Options{Extensions: []fs.Handler{core}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain.fillAttr(fs.Attr{Kind: fs.KindFile, Mode: 0o644}, 1, &out)
+	if out.Uid != uint32(os.Getuid()) {
+		t.Fatalf("default owner = %d, want the mounting uid", out.Uid)
+	}
+}
+
+// The DISPATCH read path carries the same fence.
+type blockReadExt struct {
+	gate    chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (b *blockReadExt) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error) {
+	if op.Kind == fs.OpRead {
+		b.once.Do(func() { close(b.gate) })
+		<-b.release
+	}
+	return next(ctx, op)
+}
+
+func TestPortDispatchReadReplyFencedByViewReset(t *testing.T) {
+	core := newMemCore()
+	core.paths["/f"] = &memEntry{data: []byte("OLD"), mode: 0o644}
+	bus := fs.NewEventBus()
+	ext := &blockReadExt{gate: make(chan struct{}), release: make(chan struct{})}
+	f, err := New(Options{Extensions: []fs.Handler{ext, core}, Uid: 1000, Gid: 1000, Events: bus})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := lookupForTest(t, f, "/f")
+	done := make(chan gofuse.Status, 1)
+	go func() {
+		_, st := f.Read(nil, &gofuse.ReadIn{InHeader: gofuse.InHeader{NodeId: entry.NodeId}, Size: 4}, make([]byte, 4))
+		done <- st
+	}()
+	<-ext.gate
+	bus.Emit(fs.Event{Kind: fs.EventCheckout, Path: "/"})
+	close(ext.release)
+	if st := <-done; st != gofuse.EAGAIN {
+		t.Fatalf("stale dispatch read status = %v, want EAGAIN", st)
 	}
 }

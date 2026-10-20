@@ -207,7 +207,10 @@ func (c *Core) mapErr(err error) error {
 		if errors.As(err, &se) && se.StatusCode == http.StatusUnauthorized && c.resetPending.CompareAndSwap(false, true) {
 			go func() {
 				defer c.resetPending.Store(false)
-				c.bus.Emit(fs.Event{Kind: fs.EventCheckout, Path: "/"})
+				// A revoked credential may now address a DIFFERENT
+				// namespace: userspace caches AND the kernel's page/dentry
+				// caches must be flushed (plain SSE resets leave pages).
+				c.bus.Emit(fs.Event{Kind: fs.EventCheckout, Path: "/", KernelInvalidate: true})
 			}()
 		}
 	}

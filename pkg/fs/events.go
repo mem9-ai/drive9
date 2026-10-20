@@ -45,15 +45,20 @@ func (k EventKind) String() string {
 
 // Event is the typed notification delivered over the EventBus.
 type Event struct {
-	Kind      EventKind // event discriminator
+	Kind EventKind // event discriminator
 	// RenamedTo carries the destination of a successful rename (the
 	// rename's EventWrite emission): lets plane-local stores follow the
 	// move without intercepting the dispatch.
 	RenamedTo string
-	Path  string    // canonical absolute path the event concerns
-	Rev   int64     // EventLanded: the revision the remote acknowledged
-	Size  int64     // EventLanded: the landed size
-	Epoch uint64    // mutation epoch captured at handoff (see InodeTable)
+	Path      string // canonical absolute path the event concerns
+	Rev       int64  // EventLanded: the revision the remote acknowledged
+	Size      int64  // EventLanded: the landed size
+	Epoch     uint64 // mutation epoch captured at handoff (see InodeTable)
+	// KernelInvalidate asks the facade to flush the KERNEL caches for every
+	// inode in addition to the userspace tiers (a 401 view reset: the
+	// credential may now address a different namespace). A plain SSE
+	// reconnect/reset leaves it false — pages stay valid there.
+	KernelInvalidate bool
 }
 
 // EventBus delivers typed events between plugins and the kernel facade.

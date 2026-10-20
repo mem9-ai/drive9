@@ -32,7 +32,9 @@ func TestPortUnauthorizedResetsView(t *testing.T) {
 	t.Cleanup(ts.Close)
 	bus := fs.NewEventBus()
 	reset := make(chan struct{}, 1)
-	bus.On(fs.EventCheckout, func(fs.Event) {
+	var kernelInvalidate bool
+	bus.On(fs.EventCheckout, func(e fs.Event) {
+		kernelInvalidate = e.KernelInvalidate
 		select {
 		case reset <- struct{}{}:
 		default:
@@ -56,6 +58,9 @@ func TestPortUnauthorizedResetsView(t *testing.T) {
 	case <-reset:
 	case <-time.After(2 * time.Second):
 		t.Fatal("401 did not emit a view reset")
+	}
+	if !kernelInvalidate {
+		t.Fatal("401 reset did not ask for kernel-cache invalidation")
 	}
 }
 
