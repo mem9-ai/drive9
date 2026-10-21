@@ -26,6 +26,9 @@ type streamHandle struct {
 	// bound: a sparse/multi-GiB offset must not allocate the whole hole.
 	spill     *os.File
 	spillSize int64
+	// logicalSize is the newest size this descriptor observed; `pushed` only
+	// advances at push boundaries and is stale for passthrough writes.
+	logicalSize int64
 	// refs counts the claim plus every live claimReadHandle: the spill (and
 	// the anonymous image) must outlive the WRITE descriptor while a
 	// read-only re-open still serves it.
@@ -112,6 +115,9 @@ func (h *streamHandle) applyAttr(ctx context.Context, op *fs.Op) (fs.Attr, error
 	h.mu.Unlock()
 	if op.Size >= 0 && op.Size != int64(len(h.image)) {
 		size := op.Size
+		h.mu.Lock()
+		h.logicalSize = size
+		h.mu.Unlock()
 		h.mu.Lock()
 		if size < int64(len(h.image)) {
 			h.image = h.image[:size]
@@ -333,7 +339,8 @@ func (h *streamHandle) dropRef() {
 	h.mu.Lock()
 	h.refs--
 	var toRelease fs.Handle
-	if h.released && h.refs <= 0 {
+	lastRef := h.released && h.refs <= 0
+	if lastRef {
 		if h.spill != nil {
 			_ = h.spill.Close()
 			h.spill = nil
@@ -348,6 +355,9 @@ func (h *streamHandle) dropRef() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		_ = toRelease.Release(ctx)
 		cancel()
+	}
+	if lastRef && h.b != nil {
+		h.b.untrack(h)
 	}
 }
 
@@ -395,6 +405,9 @@ func (h *streamHandle) Write(ctx context.Context, off int64, data []byte) error 
 	}
 	end := off + int64(len(data))
 	if h.passthrough {
+		if end > h.logicalSize {
+			h.logicalSize = end
+		}
 		h.mu.Unlock()
 		inner, err := h.session(ctx)
 		if err != nil {
@@ -406,6 +419,9 @@ func (h *streamHandle) Write(ctx context.Context, off int64, data []byte) error 
 	// (bounded); a large/sparse one spills to a temp file so a multi-GiB
 	// offset cannot allocate the whole hole on the heap.
 	if h.unlinked && (h.spill != nil || end > bulkfileMaxBufferedBytes) {
+		if end > h.logicalSize {
+			h.logicalSize = end
+		}
 		if err := h.spillImageLocked(off, data, end); err != nil {
 			h.mu.Unlock()
 			return err
@@ -415,6 +431,9 @@ func (h *streamHandle) Write(ctx context.Context, off int64, data []byte) error 
 		return nil
 	}
 	if h.unlinked || end <= bulkfileMaxBufferedBytes {
+		if end > h.logicalSize {
+			h.logicalSize = end
+		}
 		switch {
 		case off == int64(len(h.image)):
 			h.image = append(h.image, data...)
@@ -606,7 +625,11 @@ func (h *streamHandle) Release(ctx context.Context) error {
 	// stale remote rows while the freshest bytes exist only on this
 	// handle (read-your-writes across close).
 	pushErr := h.push(ctx)
-	if release && h.b != nil {
+	keepTracked := false
+	h.mu.Lock()
+	keepTracked = h.refs > 1
+	h.mu.Unlock()
+	if release && h.b != nil && !keepTracked {
 		h.b.untrack(h)
 	}
 	inner, serr := h.session(ctx)
@@ -620,11 +643,23 @@ func (h *streamHandle) Release(ctx context.Context) error {
 	// a same-name replacement).
 	h.mu.Lock()
 	backing := h.inner
-	needReaderImage := h.refs > 1 && backing != nil && h.passthrough
-	size := h.attrLocked().Size
+	// Freeze a reader image ONLY for a detached object (unlinked or about
+	// to be replaced): a still-linked object must stay visible to the
+	// reader through the shared state (later legitimate writes must be
+	// seen), not a private snapshot.
+	needReaderImage := h.refs > 1 && backing != nil && h.passthrough && h.unlinked
+	size := h.logicalSize
+	if size <= 0 {
+		size = h.attrLocked().Size
+	}
 	h.mu.Unlock()
 	if needReaderImage {
-		_ = h.captureReaderImage(ctx, backing, size)
+		if cerr := h.captureReaderImage(ctx, backing, size); cerr != nil {
+			// The handover failed: KEEP the bound session for the reader
+			// instead of silently switching it to the reused pathname.
+			h.dropRef()
+			return cerr
+		}
 	}
 	h.mu.Lock()
 	h.inner = nil
@@ -659,10 +694,15 @@ func (h *streamHandle) attrLocked() fs.Attr {
 		size = h.spillSize
 	}
 	if h.passthrough && h.image == nil {
-		// The stream lives in the plane below now: the authoritative size
-		// is the pushed one (the emptied image would answer 0, and the
-		// facade copies that into the inode and the SETATTR reply).
+		// The stream lives in the plane below now: prefer the size this
+		// descriptor observed (pushed only advances at push boundaries).
 		size = h.pushed
+		if h.logicalSize > size {
+			size = h.logicalSize
+		}
+	}
+	if h.logicalSize > size && h.spill == nil && !h.passthrough {
+		size = h.logicalSize
 	}
 	return fs.Attr{Kind: fs.KindFile, Mode: mode, Size: size}
 }

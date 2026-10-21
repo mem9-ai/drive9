@@ -454,7 +454,7 @@ func TestPortReaderKeepsBoundObjectAtWriterClose(t *testing.T) {
 		}
 		return fs.Result{Data: []byte("FRESH")}, nil
 	})
-	h := &streamHandle{inner: inner, below: below, passthrough: true, refs: 1, pushed: 5}
+	h := &streamHandle{inner: inner, below: below, passthrough: true, refs: 1, pushed: 5, unlinked: true}
 	rh := &claimReadHandle{claim: h}
 	h.addRef()
 	ctx := context.Background()
@@ -481,5 +481,102 @@ func TestPortSurrenderReleasesOldSession(t *testing.T) {
 	inner.releaseMu.Unlock()
 	if released != 1 {
 		t.Fatalf("surrender released the old session %d times, want 1", released)
+	}
+}
+
+// A still-linked object is NOT frozen into a private snapshot at writer
+// close: the reader keeps seeing the shared object.
+func TestPortLinkedReaderNotFrozen(t *testing.T) {
+	inner := &fakeInnerHandle{data: []byte("OTHER")}
+	below := fs.HandlerFilesystem(func(ctx context.Context, op *fs.Op) (fs.Result, error) {
+		if op.Kind == fs.OpGetAttr {
+			return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Size: 5}}, nil
+		}
+		return fs.Result{Data: []byte("OTHER")}, nil
+	})
+	h := &streamHandle{inner: inner, below: below, passthrough: true, refs: 1, pushed: 5, logicalSize: 5}
+	rh := &claimReadHandle{claim: h}
+	h.addRef()
+	if err := h.Release(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	h.mu.Lock()
+	frozen := h.spill != nil
+	h.mu.Unlock()
+	if frozen {
+		t.Fatal("a linked object was frozen into a private reader snapshot")
+	}
+	if n, err := rh.Read(context.Background(), 0, make([]byte, 5)); err != nil || n != 5 {
+		t.Fatalf("reader = %d, %v", n, err)
+	}
+	_ = rh.Release(context.Background())
+}
+
+// The claim stays in the namespace registry while a reader is open, so a
+// later unlink still marks it anonymous.
+func TestPortClaimTrackedWhileReaderOpen(t *testing.T) {
+	b := &Bulkfile{fds: map[*streamHandle]struct{}{}, live: map[*streamHandle]struct{}{}}
+	inner := &fakeInnerHandle{data: []byte("OTHER")}
+	h := &streamHandle{b: b, inner: inner, passthrough: true, refs: 1, pushed: 5, logicalSize: 5}
+	b.track(h)
+	rh := &claimReadHandle{claim: h}
+	h.addRef()
+	if err := h.Release(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	b.mu.Lock()
+	_, tracked := b.fds[h]
+	b.mu.Unlock()
+	if !tracked {
+		t.Fatal("claim untracked while a reader is still open")
+	}
+	_ = rh.Release(context.Background())
+	b.mu.Lock()
+	_, tracked = b.fds[h]
+	b.mu.Unlock()
+	if tracked {
+		t.Fatal("claim still tracked after the last reference")
+	}
+}
+
+// A rename over a surrendered fd binds it to the OLD object: its later
+// writes stay in the claim instead of re-opening the replacement path.
+func TestPortOverwriteRenameBindsSurrenderedFd(t *testing.T) {
+	inner := &fakeInnerHandle{data: []byte("OTHER")}
+	var pathWrites int
+	below := fs.HandlerFilesystem(func(ctx context.Context, op *fs.Op) (fs.Result, error) {
+		switch op.Kind {
+		case fs.OpGetAttr:
+			return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Size: 5}}, nil
+		case fs.OpRead:
+			return fs.Result{Data: []byte("HELLO")}, nil
+		case fs.OpWrite:
+			pathWrites++
+			return fs.Result{}, nil
+		}
+		return fs.Result{}, nil
+	})
+	b := &Bulkfile{fds: map[*streamHandle]struct{}{}, live: map[*streamHandle]struct{}{}}
+	h := &streamHandle{b: b, path: "/b", below: below, inner: inner, passthrough: true, refs: 1, pushed: 5, logicalSize: 5, openFlags: 2}
+	b.track(h)
+	rollback := b.bindOverwriteTarget(context.Background(), "/b")
+	h.mu.Lock()
+	anon := h.unlinked
+	h.mu.Unlock()
+	if !anon {
+		t.Fatal("overwritten target fd was not anonymized")
+	}
+	if err := h.Write(context.Background(), 0, []byte("BAD!!")); err != nil {
+		t.Fatal(err)
+	}
+	if pathWrites != 0 {
+		t.Fatalf("write reached the replacement path %d times", pathWrites)
+	}
+	rollback()
+	h.mu.Lock()
+	anon = h.unlinked
+	h.mu.Unlock()
+	if anon {
+		t.Fatal("rollback did not restore the fd")
 	}
 }

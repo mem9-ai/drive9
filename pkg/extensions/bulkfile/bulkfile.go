@@ -282,11 +282,17 @@ func (b *Bulkfile) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 		}
 		return res, nil
 	case fs.OpRename:
+		// The overwritten target's live descriptors keep the OLD object:
+		// bind their session (a surrendered fd has none) and mark them
+		// anonymous BEFORE the move, or a later write re-opens the new
+		// name and persists into the replacement.
+		rollbackTarget := b.bindOverwriteTarget(ctx, op.Path2)
 		// Same lazy rule as unlink: a never-committed claim renames only
 		// its in-memory image (the plane below renames its own pending
 		// state for the path).
 		if _, statErr := b.cl.StatCtx(ctx, b.remotePath(op.Path)); statErr != nil {
 			if !client.IsNotFound(statErr) {
+				rollbackTarget()
 				return fs.Result{}, statErr
 			}
 			res, err := next(ctx, op)
@@ -297,9 +303,11 @@ func (b *Bulkfile) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 				return res, nil
 			}
 			if !fs.IsNotFound(err) {
+				rollbackTarget()
 				return res, err
 			}
 			if !b.hasLiveHandleAt(op.Path, false) {
+				rollbackTarget()
 				return fs.Result{}, fs.ErrNotFound
 			}
 			b.retarget(ctx, op.Path, op.Path2)
@@ -307,12 +315,57 @@ func (b *Bulkfile) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 		}
 		res, err := next(ctx, op)
 		if err != nil {
+			rollbackTarget()
 			return res, err
 		}
 		b.retarget(ctx, op.Path, op.Path2)
 		return res, nil
 	}
 	return next(ctx, op)
+}
+
+// bindOverwriteTarget freezes the target path's open descriptors onto the
+// object they currently reference (opening a session when a surrender left
+// none) and marks them anonymous. A failed move calls the returned rollback.
+func (b *Bulkfile) bindOverwriteTarget(ctx context.Context, target string) func() {
+	var bound []*streamHandle
+	b.mu.Lock()
+	for h := range b.fds {
+		h.mu.Lock()
+		if h.path != target || h.unlinked {
+			h.mu.Unlock()
+			continue
+		}
+		size := h.logicalSize
+		if size <= 0 {
+			size = h.attrLocked().Size
+		}
+		if h.inner == nil {
+			if inner, err := b.belowOpen(ctx, h); err == nil {
+				h.inner = inner
+			}
+		}
+		inner := h.inner
+		h.unlinked = true
+		h.mu.Unlock()
+		if inner != nil {
+			_ = h.captureReaderImage(ctx, inner, size)
+		}
+		bound = append(bound, h)
+	}
+	b.mu.Unlock()
+	return func() {
+		for _, h := range bound {
+			h.mu.Lock()
+			h.unlinked = false
+			h.mu.Unlock()
+		}
+	}
+}
+
+// belowOpen opens a fresh session for h's path through the plane below.
+func (b *Bulkfile) belowOpen(ctx context.Context, h *streamHandle) (fs.Handle, error) {
+	return h.below.Open(ctx, h.path, fs.OpenFlags(h.openFlags))
 }
 
 // hasLiveHandleAt reports whether a live (unreleased, un-anonymized) claim
