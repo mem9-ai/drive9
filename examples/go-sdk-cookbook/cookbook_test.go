@@ -479,6 +479,23 @@ func ExampleClient_quota() {
 		TiDBCloudSpendingLimit: &spendingLimit,
 	})
 
+	// Tenant logs: the server fills the environment, organization and tenant
+	// filters; the caller only chooses the keyword and the window.
+	logs, logErr := credentialClient.AdminGetTenantLogs(ctx, drive9.AdminTenantLogsRequest{
+		TenantID:   tenantID,
+		PublicKey:  tidbCloudPublicKey,
+		PrivateKey: tidbCloudPrivateKey,
+		Keyword:    "connection timed out",
+		TimeRange:  "20m",
+		Limit:      100,
+	})
+	if logErr == nil {
+		for _, entry := range logs.Entries {
+			_ = entry.Timestamp
+			_ = entry.Line
+		}
+	}
+
 	poolSize := 10
 	_, _ = credentialClient.AdminCreateTenantPool(ctx, drive9.AdminTenantPoolRequest{
 		PublicKey:  tidbCloudPublicKey,
@@ -731,6 +748,7 @@ var coveredClientMethods = map[string]bool{
 	"AdminDeleteTenantPool":                true,
 	"AdminGetTenant":                       true,
 	"AdminGetTenantEmbeddingConfig":        true,
+	"AdminGetTenantLogs":                   true,
 	"AdminGetTenantPool":                   true,
 	"AdminListTenants":                     true,
 	"AdminSetTenantQuota":                  true,
