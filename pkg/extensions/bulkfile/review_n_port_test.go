@@ -358,7 +358,7 @@ func TestPortPassthroughTruncateUsesBoundHandle(t *testing.T) {
 		return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Size: op.Size}}, nil
 	})
 	h := &streamHandle{below: below, inner: inner, passthrough: true, refs: 1}
-	attr, err := h.applyAttr(context.Background(), &fs.Op{Kind: fs.OpSetAttr, Size: 2})
+	attr, err := h.applyAttr(context.Background(), &fs.Op{Kind: fs.OpSetAttr, Size: 2, HasSize: true, HasMode: true, Mode: 0o600, Handle: &wrapProbe{inner: h}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -368,16 +368,54 @@ func TestPortPassthroughTruncateUsesBoundHandle(t *testing.T) {
 	if got == nil || got.Handle != inner {
 		t.Fatalf("truncate forwarded with handle %v, want the bound inner handle", got)
 	}
+	if !got.HasSize {
+		t.Fatal("forwarded combined setattr lost HasSize (the truncate would be skipped)")
+	}
 	if got.Path != "" && got.Size != 2 {
 		t.Fatalf("forwarded op = %+v", got)
 	}
 }
 
-// The passthrough backing must outlive the write descriptor while a
-// claimReadHandle is open (its Read falls through the claim).
-func TestPortPassthroughBackingOutlivesWriter(t *testing.T) {
+// An anonymous grow keeps the claim's own writes: it must migrate the image
+// into the spill, not discard it by switching to passthrough.
+func TestPortAnonymousGrowKeepsImage(t *testing.T) {
+	h := &streamHandle{unlinked: true, refs: 1}
+	ctx := context.Background()
+	if err := h.Write(ctx, 0, []byte("AFTER")); err != nil {
+		t.Fatal(err)
+	}
+	const size = 16 << 20
+	attr, err := h.applyAttr(ctx, &fs.Op{Kind: fs.OpSetAttr, Size: size, HasSize: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attr.Size != size {
+		t.Fatalf("attr size = %d, want %d", attr.Size, size)
+	}
+	buf := make([]byte, 5)
+	if n, rerr := h.Read(ctx, 0, buf); rerr != nil || string(buf[:n]) != "AFTER" {
+		t.Fatalf("image after anonymous grow = %q err=%v, want AFTER", buf[:n], rerr)
+	}
+	h.mu.Lock()
+	spilled := h.spill != nil && h.image == nil
+	h.mu.Unlock()
+	if !spilled {
+		t.Fatal("anonymous grow did not keep the image in the spill")
+	}
+	h.mu.Lock()
+	_ = h.spill.Close()
+	h.mu.Unlock()
+}
+
+// The write descriptor's close COMMITS (releases the below handle) even
+// while a claim reader is open; the reader keeps working off the below path.
+func TestPortWriterCloseCommitsWithReaders(t *testing.T) {
 	inner := &fakeInnerHandle{data: []byte("OTHER")}
-	h := &streamHandle{inner: inner, passthrough: true, refs: 1}
+	below := fs.HandlerFilesystem(func(ctx context.Context, op *fs.Op) (fs.Result, error) {
+		_ = ctx
+		return fs.Result{Data: []byte("OTHER")}, nil
+	})
+	h := &streamHandle{inner: inner, below: below, passthrough: true, refs: 1}
 	rh := &claimReadHandle{claim: h}
 	h.addRef()
 	ctx := context.Background()
@@ -385,10 +423,10 @@ func TestPortPassthroughBackingOutlivesWriter(t *testing.T) {
 		t.Fatal(err)
 	}
 	inner.releaseMu.Lock()
-	premature := inner.released
+	committed := inner.released
 	inner.releaseMu.Unlock()
-	if premature {
-		t.Fatal("backing released while a claim reader is still open")
+	if !committed {
+		t.Fatal("writer close did not release the below handle (upload deferred)")
 	}
 	buf := make([]byte, 5)
 	if n, err := rh.Read(ctx, 0, buf); err != nil || string(buf[:n]) != "OTHER" {
@@ -398,9 +436,9 @@ func TestPortPassthroughBackingOutlivesWriter(t *testing.T) {
 		t.Fatal(err)
 	}
 	inner.releaseMu.Lock()
-	released := inner.released
+	releaseN := inner.releaseN
 	inner.releaseMu.Unlock()
-	if !released {
-		t.Fatal("backing leaked after the last reference")
+	if releaseN != 1 {
+		t.Fatalf("backing released %d times, want exactly once", releaseN)
 	}
 }

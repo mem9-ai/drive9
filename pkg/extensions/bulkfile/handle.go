@@ -117,6 +117,24 @@ func (h *streamHandle) applyAttr(ctx context.Context, op *fs.Op) (fs.Attr, error
 			h.image = h.image[:size]
 			h.dirty = true
 			h.mu.Unlock()
+		} else if h.unlinked && (h.spill != nil || size > bulkfileMaxBufferedBytes) {
+			// An anonymous grow stays on the claim's own disk image: the
+			// below plane has no object for this name, and switching to
+			// passthrough discarded the writes buffered here.
+			if err := h.spillImageLocked(0, nil, int64(len(h.image))); err != nil {
+				h.mu.Unlock()
+				return fs.Attr{}, err
+			}
+			if err := h.spill.Truncate(size); err != nil {
+				h.mu.Unlock()
+				return fs.Attr{}, err
+			}
+			h.spillSize = size
+			h.image = nil
+			h.dirty = true
+			attr := h.attrLocked()
+			h.mu.Unlock()
+			return attr, nil
 		} else if size > bulkfileMaxBufferedBytes {
 			// A zero-fill grow past the bound must not allocate the hole:
 			// land the buffered prefix and express the truncation in the
@@ -179,11 +197,20 @@ func (h *streamHandle) Anonymous() bool {
 func (h *streamHandle) Read(ctx context.Context, off int64, dest []byte) (int, error) {
 	h.mu.Lock()
 	passthrough := h.passthrough
+	inner := h.inner
 	h.mu.Unlock()
+	// A released writer may have handed its stream below and committed:
+	// readers fall back to the claim's own image/spill, then the path.
+	if inner == nil && h.hasOwnImage() {
+		passthrough = false
+	}
 	if passthrough {
-		inner, err := h.session(ctx)
-		if err != nil {
-			return 0, err
+		if inner == nil {
+			data, err := h.below.Read(ctx, h.path, off, int64(len(dest)))
+			if err != nil {
+				return 0, err
+			}
+			return copy(dest, data), nil
 		}
 		return inner.Read(ctx, off, dest)
 	}
@@ -209,22 +236,36 @@ func (h *streamHandle) Read(ctx context.Context, off int64, dest []byte) (int, e
 	return n, nil
 }
 
+// hasOwnImage reports whether the claim still holds readable bytes of its
+// own (image or spill).
+func (h *streamHandle) hasOwnImage() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.spill != nil || len(h.image) > 0
+}
+
 // setAttrBound forwards a FD-directed attribute change to the BOUND handle
 // below. Re-addressing the path would act on whatever object now owns the
 // name (an anonymous fd's truncate landed on a same-name replacement).
 func (h *streamHandle) setAttrBound(ctx context.Context, op *fs.Op) (fs.Attr, bool, error) {
+	if op.Handle == nil {
+		// A path-directed request has no descriptor identity to preserve;
+		// the caller's path-based fallback is correct.
+		return fs.Attr{}, false, nil
+	}
 	h.mu.Lock()
 	inner := h.inner
 	h.mu.Unlock()
-	if inner == nil {
-		return fs.Attr{}, false, nil
-	}
 	do, ok := h.below.(fs.HandlerFilesystem)
-	if !ok {
+	if !ok || inner == nil {
 		return fs.Attr{}, false, nil
 	}
-	bound := &fs.Op{Kind: fs.OpSetAttr, Path: h.path, Handle: inner, Size: op.Size, HasMode: op.HasMode, Mode: op.Mode}
-	res, err := do(ctx, bound)
+	// Copy the WHOLE request and only replace the handle: a combined
+	// MODE+SIZE setattr must keep HasSize, or the write plane splits the
+	// request, returns on the mode branch, and silently drops the truncate.
+	bound := *op
+	bound.Handle = inner
+	res, err := do(ctx, &bound)
 	if err != nil {
 		return fs.Attr{}, true, err
 	}
@@ -283,8 +324,10 @@ func (h *streamHandle) spillImageLocked(off int64, data []byte, end int64) error
 		h.spillSize = int64(len(h.image))
 		h.image = nil
 	}
-	if _, err := h.spill.WriteAt(data, off); err != nil {
-		return err
+	if len(data) > 0 {
+		if _, err := h.spill.WriteAt(data, off); err != nil {
+			return err
+		}
 	}
 	if end > h.spillSize {
 		h.spillSize = end
@@ -513,22 +556,30 @@ func (h *streamHandle) Release(ctx context.Context) error {
 	if serr != nil && pushErr == nil {
 		pushErr = serr
 	}
-	// Keep the passthrough backing readable for an outstanding
-	// claimReadHandle: the last reference releases it.
+	// The write descriptor's close COMMITS: the below handle's Release is
+	// what submits the writeback snapshot, so it must run now — deferring
+	// it to the last claim reader left a closed file unpublished. Readers
+	// fall back to the claim's own image/spill (or a path read).
 	h.mu.Lock()
 	backing := h.inner
-	lastRef := h.refs <= 1
-	if lastRef {
-		h.inner = nil
-	}
+	h.inner = nil
 	h.mu.Unlock()
-	if backing != nil && lastRef {
+	released := map[fs.Handle]bool{}
+	if backing != nil {
+		released[backing] = true
 		if err := backing.Release(ctx); err != nil && pushErr == nil {
 			pushErr = err
 		}
 	}
+	if inner != nil && !released[inner] {
+		// A session opened during Release after a retarget cleared h.inner:
+		// it was never stored, so this is its only release (leaking it kept
+		// the below registry entry alive after every fd closed).
+		if err := inner.Release(ctx); err != nil && pushErr == nil {
+			pushErr = err
+		}
+	}
 	h.dropRef()
-	_ = inner
 	return pushErr
 }
 
