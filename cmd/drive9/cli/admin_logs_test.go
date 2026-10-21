@@ -168,8 +168,8 @@ func TestAdminTenantLogsSurfacesAPIError(t *testing.T) {
 	clearProvisionEnv(t)
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusBadRequest)
-		_ = json.NewEncoder(w).Encode(map[string]any{"error": "time_range must be at most 30m", "code": "invalid_request"})
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(map[string]any{"error": "tenant not found", "code": "not_found"})
 	}))
 	defer ts.Close()
 
@@ -178,7 +178,7 @@ func TestAdminTenantLogsSurfacesAPIError(t *testing.T) {
 			"tenant", "logs",
 			"--server", ts.URL,
 			"--tenant-id", "tenant-1",
-			"--time-range", "31m",
+			"--time-range", "10m",
 			"--tidbcloud-public-key", "public-1",
 			"--tidbcloud-private-key", "private-1",
 		})
@@ -186,7 +186,7 @@ func TestAdminTenantLogsSurfacesAPIError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected an error")
 	}
-	for _, want := range []string{"HTTP 400", "time_range must be at most 30m"} {
+	for _, want := range []string{"HTTP 404", "tenant not found"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("error = %q, want it to contain %q", err, want)
 		}
@@ -203,7 +203,11 @@ func TestAdminTenantLogsRejectsBadFlags(t *testing.T) {
 		wantErr string
 	}{
 		{name: "zero limit", args: []string{"--tenant-id", "t", "--limit", "0"}, wantErr: "--limit must be a positive integer"},
+		{name: "oversized limit", args: []string{"--tenant-id", "t", "--limit", "1001"}, wantErr: "--limit must be at most 1000"},
 		{name: "bad duration", args: []string{"--tenant-id", "t", "--time-range", "20"}, wantErr: "--time-range"},
+		{name: "zero duration", args: []string{"--tenant-id", "t", "--time-range", "0s"}, wantErr: "--time-range must be positive"},
+		{name: "negative duration", args: []string{"--tenant-id", "t", "--time-range", "-5m"}, wantErr: "--time-range must be positive"},
+		{name: "oversized window", args: []string{"--tenant-id", "t", "--time-range", "31m"}, wantErr: "--time-range must be at most 30m0s"},
 		{name: "unknown flag", args: []string{"--tenant-id", "t", "--nope"}, wantErr: "unknown flag"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

@@ -14,6 +14,13 @@ import (
 	"github.com/mem9-ai/drive9/pkg/client"
 )
 
+// The server owns these bounds; the CLI mirrors them so an over-limit flag
+// fails locally instead of costing a round-trip.
+const (
+	adminLogMaxTimeRange = 30 * time.Minute
+	adminLogMaxLimit     = 1000
+)
+
 // adminTenantLogs implements `drive9 admin tenant logs`, which queries one
 // tenant's logs through the admin API.
 func adminTenantLogs(args []string) error {
@@ -109,8 +116,15 @@ func parseAdminTenantLogsCommand(args []string) (client.AdminTenantLogsRequest, 
 			}
 			i++
 			timeRange = strings.TrimSpace(args[i])
-			if _, err := time.ParseDuration(timeRange); err != nil {
+			duration, err := time.ParseDuration(timeRange)
+			if err != nil {
 				return client.AdminTenantLogsRequest{}, "", false, fmt.Errorf("--time-range %q is invalid: use a duration such as 20m", args[i])
+			}
+			if duration <= 0 {
+				return client.AdminTenantLogsRequest{}, "", false, fmt.Errorf("--time-range must be positive")
+			}
+			if duration > adminLogMaxTimeRange {
+				return client.AdminTenantLogsRequest{}, "", false, fmt.Errorf("--time-range must be at most %s", adminLogMaxTimeRange)
 			}
 		case "--limit":
 			if i+1 >= len(args) {
@@ -120,6 +134,9 @@ func parseAdminTenantLogsCommand(args []string) (client.AdminTenantLogsRequest, 
 			v, err := strconv.Atoi(strings.TrimSpace(args[i]))
 			if err != nil || v <= 0 {
 				return client.AdminTenantLogsRequest{}, "", false, fmt.Errorf("--limit must be a positive integer")
+			}
+			if v > adminLogMaxLimit {
+				return client.AdminTenantLogsRequest{}, "", false, fmt.Errorf("--limit must be at most %d", adminLogMaxLimit)
 			}
 			limit = v
 		case "--json":
