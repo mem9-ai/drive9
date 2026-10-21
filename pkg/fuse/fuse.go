@@ -1480,7 +1480,7 @@ func (f *FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name string
 		// A stale reply is retried regardless of its status: a delayed 404
 		// from the replaced view must not be cached as a negative entry
 		// while the new view has the file.
-		if attempt >= 24 || (attempt >= statViewRetries && time.Now().After(deadline)) {
+		if attempt >= 120 || (attempt >= statViewRetries && time.Now().After(deadline)) {
 			// The reply kept describing a replaced view: EAGAIN so the
 			// caller retries instead of caching pre-reset identity.
 			f.recordHandleOp(fs.OpLookup, start, nil, 0)
@@ -1540,7 +1540,7 @@ func (f *FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *gofus
 		}
 		// A stale reply is retried regardless of its status: a delayed 404
 		// from the replaced view must not hide the new view's file.
-		if attempt >= 24 || (attempt >= statViewRetries && time.Now().After(deadline)) {
+		if attempt >= 120 || (attempt >= statViewRetries && time.Now().After(deadline)) {
 			return gofuse.EAGAIN
 		}
 		time.Sleep(2 * time.Millisecond)
@@ -2282,7 +2282,7 @@ const statViewRetries = 3
 // and surfaces as an application error (a write_text() failing with
 // BlockingIOError), so the wait is generous and a lost race retries after a
 // short pause instead of hammering the chain.
-const namespaceViewQuietWait = 100 * time.Millisecond
+const namespaceViewQuietWait = 500 * time.Millisecond
 
 // checkAncestorSearch verifies SEARCH (x) permission on every ancestor of
 // path for the caller, the base's pre-dispatch check.
