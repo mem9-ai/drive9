@@ -89,6 +89,7 @@ func (h *streamHandle) applyAttr(ctx context.Context, op *fs.Op) (fs.Attr, error
 			}
 			h.mu.Lock()
 			h.pushed = size
+			h.logicalSize = size
 			a := h.attrLocked()
 			h.mu.Unlock()
 			return a, nil
@@ -136,6 +137,7 @@ func (h *streamHandle) applyAttr(ctx context.Context, op *fs.Op) (fs.Attr, error
 				return fs.Attr{}, err
 			}
 			h.spillSize = size
+			h.logicalSize = size
 			h.image = nil
 			h.dirty = true
 			attr := h.attrLocked()
@@ -160,6 +162,7 @@ func (h *streamHandle) applyAttr(ctx context.Context, op *fs.Op) (fs.Attr, error
 			h.passthrough = true
 			h.image = nil
 			h.pushed = size
+			h.logicalSize = size
 			h.dirty = false
 			attr := h.attrLocked()
 			h.mu.Unlock()
@@ -465,6 +468,9 @@ func (h *streamHandle) Write(ctx context.Context, off int64, data []byte) error 
 	h.mu.Lock()
 	h.passthrough = true
 	h.image = nil // the bytes now live in the plane below
+	if end > h.logicalSize {
+		h.logicalSize = end
+	}
 	h.mu.Unlock()
 	// The claim no longer owns the freshest bytes: stop serving the
 	// path's lookups from this handle so new opens read the plane's

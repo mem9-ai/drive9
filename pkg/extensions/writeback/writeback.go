@@ -1305,8 +1305,28 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			}
 		}
 		if w.queue != nil {
-			w.waitPathCommit(op.Path)
-			w.waitPathCommit(op.Path2)
+			// A wait failure means the queue still owns the old path (or a
+			// descendant): renaming now would let that commit resurrect the
+			// OLD name after the move, so fail the rename retryably.
+			if !w.waitPathCommit(op.Path) || !w.waitPathCommit(op.Path2) {
+				return fs.Result{}, &fs.StatusError{Path: op.Path, Status: gofuse.EAGAIN}
+			}
+			// A DIRECTORY rename must drain its descendants too: a child's
+			// in-flight commit would otherwise re-create the old subtree
+			// after the move.
+			prefix := strings.TrimSuffix(op.Path, "/") + "/"
+			if !w.queue.WaitPrefixTimeout(prefix, 10*time.Second) {
+				return fs.Result{}, &fs.StatusError{Path: op.Path, Status: gofuse.EAGAIN}
+			}
+			// Land staged descendant images BEFORE the move so the rename
+			// carries their committed bytes.
+			if w.wbCache != nil && w.uploader != nil {
+				for _, entry := range w.wbCache.ListByPrefix(prefix) {
+					if err := land(entry.Path); err != nil {
+						return fs.Result{}, fmt.Errorf("land descendant %s before rename: %w", entry.Path, err)
+					}
+				}
+			}
 		}
 		if err := land(op.Path); err != nil {
 			return fs.Result{}, fmt.Errorf("land flushed image before rename %s: %w", op.Path, err)
@@ -1358,7 +1378,11 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		if w.wbCache != nil {
 			prefix := strings.TrimSuffix(op.Path, "/") + "/"
 			for _, entry := range w.wbCache.ListByPrefix(prefix) {
-				_ = w.wbCache.RenamePending(entry.Path, strings.Replace(entry.Path, op.Path, op.Path2, 1))
+				target := op.Path2 + strings.TrimPrefix(entry.Path, op.Path)
+				_ = w.wbCache.RenamePending(entry.Path, target)
+				if w.opts.Staging != nil {
+					_ = w.opts.Staging.Shadow.Rename(entry.Path, target)
+				}
 			}
 		}
 		return res, nil

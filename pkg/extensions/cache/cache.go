@@ -90,6 +90,11 @@ type Cache struct {
 	resetMu sync.RWMutex
 	// sidecars tracks open -wal/-journal handles (v1 sqlite routing).
 	sidecars sidecarTracker
+	// dirty counts paths with an unflushed write through ANY descriptor:
+	// stable tiers must not answer for them, or a second fd keeps reading
+	// the pre-write disk/mem image.
+	dirtyMu sync.Mutex
+	dirty   map[string]int
 }
 
 // SetCacheHitRecorder wires the facade-owned hit/miss perf feed.
@@ -123,7 +128,8 @@ type cachingHandle struct {
 // New constructs the read-plane cache.
 func New(opts Options) (*Cache, error) {
 	c := &Cache{opts: opts,
-		mem: NewReadCacheWithMaxFileSize(opts.MaxSize, opts.TTL, opts.MaxFileSize),
+		dirty: map[string]int{},
+		mem:   NewReadCacheWithMaxFileSize(opts.MaxSize, opts.TTL, opts.MaxFileSize),
 	}
 	if opts.Disk.Dir != "" {
 		d, err := NewDiskReadCache(opts.Disk)
@@ -262,11 +268,59 @@ func (c *Cache) invalidateAllTiers() {
 			if h.prefetch != nil {
 				h.prefetch.Invalidate()
 			}
+			// The open-time size/revision describe the OLD view: keeping
+			// them made a whole-file read re-cache the stale prefix as the
+			// complete image (a grown remote file read as its old length,
+			// with the tail answering EOF).
+			h.size, h.rev = 0, 0
+			h.grown = false
 			h.mu.Unlock()
 		}
 		return true
 	})
 	c.resetMu.Unlock()
+}
+
+// remotePathOf maps a view path to the path the client addresses (the
+// prefetcher must read the SAME file the terminal does; a view path with a
+// RemoteRoot mixed another file's blocks into the stream).
+func (c *Cache) remotePathOf(p string) string {
+	root := strings.TrimSpace(c.opts.RemoteRoot)
+	if root == "" || root == "/" {
+		return p
+	}
+	root = "/" + strings.Trim(root, "/")
+	if p == "/" {
+		return root
+	}
+	return root + p
+}
+
+// noteDirty/clearDirty track paths with unflushed writes across descriptors.
+func (c *Cache) noteDirty(path string) {
+	c.dirtyMu.Lock()
+	if c.dirty == nil {
+		c.dirty = map[string]int{}
+	}
+	c.dirty[path]++
+	c.dirtyMu.Unlock()
+}
+
+func (c *Cache) clearDirty(path string) {
+	c.dirtyMu.Lock()
+	if n := c.dirty[path]; n > 1 {
+		c.dirty[path] = n - 1
+	} else {
+		delete(c.dirty, path)
+	}
+	c.dirtyMu.Unlock()
+}
+
+func (c *Cache) dirtyPath(path string) bool {
+	c.dirtyMu.Lock()
+	_, ok := c.dirty[path]
+	c.dirtyMu.Unlock()
+	return ok
 }
 
 // publishIfCurrent runs fn iff no reset has landed since gen, atomically
@@ -403,7 +457,7 @@ func (c *Cache) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 				// exceeds the whole-file cache admission limit: smaller
 				// files are served by the mem cache itself and need no
 				// block read-ahead.
-				p := NewPrefetcher(c.opts.PrefetchClient, op.Path, size)
+				p := NewPrefetcher(c.opts.PrefetchClient, c.remotePathOf(op.Path), size)
 				p.SetParallelRead(c.opts.ParallelReadConcurrency, c.opts.ParallelReadBlockSize)
 				h.prefetch = p
 				h.prefetchArmed = true
@@ -482,6 +536,13 @@ func (c *Cache) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 func (h *cachingHandle) Unwrap() fs.Handle { return h.inner }
 
 func (h *cachingHandle) Read(ctx context.Context, off int64, dest []byte) (int, error) {
+	// A dirty sibling's bytes are the CURRENT image: the mem/disk tiers
+	// hold a pre-write copy, so this read must go to the plane below
+	// (which serves read-your-writers) instead of a stable cache hit.
+	if path := h.identity(); h.cache.dirtyPath(path) {
+		h.cache.mem.Invalidate(path)
+		return h.inner.Read(ctx, off, dest)
+	}
 	// An ANONYMOUS fd (its name was unlinked or overwritten) reads a private
 	// snapshot of the OLD object: every tier below is path-keyed and would
 	// serve the replacement's pending/remote bytes, so bypass them all.
@@ -646,6 +707,7 @@ func copyReadRange(dest, data []byte, off int64) int {
 func (h *cachingHandle) Write(ctx context.Context, off int64, data []byte) error {
 	err := h.inner.Write(ctx, off, data)
 	if err == nil {
+		h.cache.noteDirty(h.identity())
 		h.cache.mem.Invalidate(h.identity())
 		if h.prefetch != nil {
 			h.prefetch.Invalidate()
@@ -662,10 +724,18 @@ func (h *cachingHandle) Write(ctx context.Context, off int64, data []byte) error
 }
 
 // Sync implements fs.Handle.
-func (h *cachingHandle) Sync(ctx context.Context) error { return h.inner.Sync(ctx) }
+func (h *cachingHandle) Sync(ctx context.Context) error {
+	err := h.inner.Sync(ctx)
+	h.cache.clearDirty(h.identity())
+	return err
+}
 
 // Flush implements fs.Handle.
-func (h *cachingHandle) Flush(ctx context.Context) error { return h.inner.Flush(ctx) }
+func (h *cachingHandle) Flush(ctx context.Context) error {
+	err := h.inner.Flush(ctx)
+	h.cache.clearDirty(h.identity())
+	return err
+}
 
 // Release implements fs.Handle.
 func (h *cachingHandle) Release(ctx context.Context) error {
@@ -673,6 +743,10 @@ func (h *cachingHandle) Release(ctx context.Context) error {
 	if h.isSidecar {
 		h.cache.sidecars.remove(h.identity())
 	}
+	// The descriptor's close is a durability boundary for its writes (the
+	// below plane commits them): stop forcing sibling reads around the
+	// stable tiers.
+	h.cache.clearDirty(h.identity())
 	return h.inner.Release(ctx)
 }
 

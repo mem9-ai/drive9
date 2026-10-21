@@ -270,6 +270,7 @@ func New(opts Options) (*Layer, error) {
 	} else {
 		root = "/" + strings.Trim(root, "/")
 	}
+	pinnedRef := strings.TrimSpace(opts.LayerRef)
 	// v1 mount state gate: non-checkpoint mounts only accept active layers;
 	// checkpoint mounts also accept sealed/committed ones. Mounting a
 	// rolled-back or otherwise unusable layer fails fast instead of serving
@@ -284,6 +285,12 @@ func New(opts Options) (*Layer, error) {
 		state := ""
 		if lr != nil {
 			state = lr.State
+			// PIN the resolved id: the ref may name a tag (or a name a
+			// later layer shadows), and every request resolves it again —
+			// two syncs of the same fd could land in different layers.
+			if lr.LayerID != "" {
+				pinnedRef = lr.LayerID
+			}
 		}
 		allowed := state == "active"
 		if opts.CheckpointRef != "" {
@@ -301,7 +308,7 @@ func New(opts Options) (*Layer, error) {
 	}
 	return &Layer{
 		cl:                opts.Client,
-		layerRef:          strings.TrimSpace(opts.LayerRef),
+		layerRef:          pinnedRef,
 		checkpoint:        opts.CheckpointRef,
 		root:              root,
 		events:            opts.Events,

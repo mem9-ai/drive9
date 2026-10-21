@@ -8,6 +8,7 @@ package cache
 import (
 	"bytes"
 	"context"
+	"net/http/httptest"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -327,4 +328,49 @@ func TestPortAnonymousFdBypassesPendingCache(t *testing.T) {
 	}
 	_ = src.Handle.Release(ctx)
 	_ = target.Handle.Release(ctx)
+}
+
+// A dirty sibling's write must not be shadowed by a stable tier hit on the
+// same path.
+func TestPortSiblingWriteBypassesStableTiers(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/f", []byte("OOOOO"))
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	c, err := New(Options{MaxSize: 1 << 20, MaxFileSize: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := fs.NewChain(c, terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	reader, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/f", Flags: 0})
+	if err != nil || reader.Handle == nil {
+		t.Fatalf("open reader = %v", err)
+	}
+	// Warm the stable tiers through the reader.
+	buf := make([]byte, 5)
+	if n, rerr := reader.Handle.Read(ctx, 0, buf); rerr != nil || n != 5 {
+		t.Fatalf("warm read = %d err=%v", n, rerr)
+	}
+	writer, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/f", Flags: uint32(syscall.O_RDWR)})
+	if err != nil || writer.Handle == nil {
+		t.Fatalf("open writer = %v", err)
+	}
+	if err := writer.Handle.Write(ctx, 0, []byte("AFTER")); err != nil {
+		t.Fatal(err)
+	}
+	after := make([]byte, 5)
+	if n, rerr := reader.Handle.Read(ctx, 0, after); rerr != nil || string(after[:n]) != "AFTER" {
+		t.Fatalf("reader after sibling write = %q err=%v, want AFTER", after[:n], rerr)
+	}
+	_ = writer.Handle.Release(ctx)
+	_ = reader.Handle.Release(ctx)
 }

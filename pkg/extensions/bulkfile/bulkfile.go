@@ -17,6 +17,7 @@ package bulkfile
 
 import (
 	"context"
+	"os"
 	"strings"
 	"sync"
 	"syscall"
@@ -328,7 +329,16 @@ func (b *Bulkfile) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 // object they currently reference (opening a session when a surrender left
 // none) and marks them anonymous. A failed move calls the returned rollback.
 func (b *Bulkfile) bindOverwriteTarget(ctx context.Context, target string) func() {
-	var bound []*streamHandle
+	type saved struct {
+		h             *streamHandle
+		unlinked      bool
+		passthrough   bool
+		image         []byte
+		spill         *os.File
+		spillSize     int64
+		openedSession fs.Handle
+	}
+	var bound []saved
 	b.mu.Lock()
 	for h := range b.fds {
 		h.mu.Lock()
@@ -340,25 +350,46 @@ func (b *Bulkfile) bindOverwriteTarget(ctx context.Context, target string) func(
 		if size <= 0 {
 			size = h.attrLocked().Size
 		}
-		if h.inner == nil {
+		// The claim's OWN image/spill is newer than the last push: use it
+		// as the snapshot source and only read the below backing when the
+		// stream already handed off (passthrough, empty image).
+		needBacking := h.passthrough && h.image == nil && h.spill == nil
+		opened := fs.Handle(nil)
+		if needBacking && h.inner == nil {
 			if inner, err := b.belowOpen(ctx, h); err == nil {
 				h.inner = inner
+				opened = inner
 			}
 		}
 		inner := h.inner
+		bound = append(bound, saved{
+			h: h, unlinked: h.unlinked, passthrough: h.passthrough,
+			image: h.image, spill: h.spill, spillSize: h.spillSize,
+			openedSession: opened,
+		})
 		h.unlinked = true
 		h.mu.Unlock()
-		if inner != nil {
+		if needBacking && inner != nil {
 			_ = h.captureReaderImage(ctx, inner, size)
 		}
-		bound = append(bound, h)
 	}
 	b.mu.Unlock()
 	return func() {
-		for _, h := range bound {
-			h.mu.Lock()
-			h.unlinked = false
-			h.mu.Unlock()
+		for _, sv := range bound {
+			sv.h.mu.Lock()
+			sv.h.unlinked = sv.unlinked
+			sv.h.passthrough = sv.passthrough
+			sv.h.image = sv.image
+			if sv.h.spill != nil && sv.h.spill != sv.spill {
+				_ = sv.h.spill.Close()
+			}
+			sv.h.spill = sv.spill
+			sv.h.spillSize = sv.spillSize
+			if sv.openedSession != nil && sv.h.inner == sv.openedSession {
+				_ = sv.openedSession.Release(context.Background())
+				sv.h.inner = nil
+			}
+			sv.h.mu.Unlock()
 		}
 	}
 }
@@ -414,7 +445,10 @@ func (b *Bulkfile) prepareUnlinkSurvivors(ctx context.Context, p string, under b
 	for h := range b.fds {
 		h.mu.Lock()
 		path := h.path
-		match := !h.released && (path == p || (under && strings.HasPrefix(path, prefix)))
+		// A released WRITE fd can still own reader references (refs > 1):
+		// its readers need the bound backing just as much, so the writer's
+		// released flag must not filter the claim out.
+		match := (!h.released || h.refs > 1) && (path == p || (under && strings.HasPrefix(path, prefix)))
 		passthrough := h.passthrough && h.inner == nil
 		h.mu.Unlock()
 		if match && passthrough {
@@ -460,7 +494,10 @@ func (b *Bulkfile) markUnlinked(p string) {
 	defer b.mu.Unlock()
 	for h := range b.fds {
 		h.mu.Lock()
-		if h.path == p && !h.released {
+		// A released WRITE fd can still own readers (refs > 1): the claim
+		// must be anonymized for them too, not filtered by the writer's
+		// released flag.
+		if h.path == p && (!h.released || h.refs > 1) {
 			h.unlinked = true
 		}
 		h.mu.Unlock()

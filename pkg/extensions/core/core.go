@@ -1258,12 +1258,12 @@ func (c *Core) mknodRegular(ctx context.Context, op *fs.Op) (fs.Result, error) {
 	if createErr != nil {
 		return fs.Result{}, c.mapErr(createErr)
 	}
+	// mknod carries the caller's permission bits explicitly:
+	// mknod(S_IFREG|0000) must create an inaccessible file, not silently
+	// widen it to 0644.
 	mode := op.Mode & 0o777
-	if mode == 0 {
-		mode = 0o644
-	}
 	rollback := func() { _ = c.cl.DeleteFileCtx(context.WithoutCancel(ctx), rp) }
-	if mode != 0o644 {
+	if mode != 0o644 || op.Mode&0o777 == 0 {
 		if err := retryPostUploadMode(ctx, func() error {
 			return c.cl.ChmodCtx(ctx, rp, mode)
 		}); err != nil {
