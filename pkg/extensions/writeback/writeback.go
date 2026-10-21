@@ -237,6 +237,12 @@ type bufferingHandle struct {
 	// pendingImage is an immutable captured pending image: reads of a
 	// pending-overlay handle serve exactly these bytes.
 	pendingImage []byte
+	// pendingFile backs a snapshot larger than the memory bound: the old
+	// object's bytes are streamed to a temp file (closed with the handle),
+	// so a 65MiB anonymous fd keeps its identity instead of falling back
+	// to the reused pathname.
+	pendingFile     *os.File
+	pendingFileSize int64
 	// flags is the open mode: O_APPEND writes track the buffer tail.
 	flags uint32
 	// pendingMode defers a chmod past a dirty handle to its commit (
@@ -1320,7 +1326,12 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		// were reading: mark them anonymous BEFORE the remote rename (their
 		// clean images are snapshotted for post-overwrite reads), or they
 		// keep reading /b and silently see the source's bytes.
-		w.markUnlinked(op.Path2, false)
+		if serr := w.markUnlinkedSnapshot(op.Path2, false); serr != nil {
+			// The overwritten target's descriptors have no read source:
+			// abort instead of switching them to the source's bytes.
+			w.markLinked(op.Path2, false)
+			return fs.Result{}, serr
+		}
 		res, err := next(ctx, op)
 		if err != nil {
 			// The rename failed: the target's descriptors are still bound
@@ -1582,6 +1593,14 @@ func (h *bufferingHandle) Read(ctx context.Context, off int64, dest []byte) (int
 		n := copy(dest, h.pendingImage[off:])
 		h.mu.Unlock()
 		return n, nil
+	}
+	if h.pendingFile != nil {
+		f, size := h.pendingFile, h.pendingFileSize
+		h.mu.Unlock()
+		if off < 0 || off >= size {
+			return 0, nil
+		}
+		return f.ReadAt(dest, off)
 	}
 	if h.buf == nil {
 		isNew := h.isNew
@@ -2110,15 +2129,25 @@ func (h *bufferingHandle) Release(ctx context.Context) error {
 	// unregistering first let a concurrent rename conclude "no live
 	// writer", move the remote name, and then publish this Release's
 	// captured image right back under the old name.
-	defer h.w.untrack(h)
+
 	if h.w.debounce != nil {
 		h.w.debounce.Cancel(path)
 	}
 	// The last handle of an unlinked name releases its snapshot (v1
-	// survivor cleanup): no OTHER tracked handle still holds the name.
-	if h.w.unlinkedShadowServed(path) && !h.w.hasOtherTrackedHandle(path, h) {
+	// survivor cleanup). The selection happens ATOMICALLY with this
+	// handle's untrack inside the registry: two concurrent Releases both
+	// seeing each other skipped the drop and nobody reclaimed it.
+	last := h.w.untrackAndLast(h)
+	if last && h.w.unlinkedShadowServed(path) {
 		h.w.dropUnlinkedShadow(path)
 	}
+	// A file-backed anonymous snapshot dies with its descriptor.
+	h.mu.Lock()
+	if h.pendingFile != nil {
+		_ = h.pendingFile.Close()
+		h.pendingFile = nil
+	}
+	h.mu.Unlock()
 	// An O_CREAT claim that never landed must still materialize as a remote
 	// file (stages it in pendingIndex at Create): git probes the
 	// filesystem by creating and unlinking `.git/ä` with no writes, and a
@@ -2603,23 +2632,20 @@ func (h *bufferingHandle) infoSnapshot() *handleInfo {
 	return &handleInfo{path: h.path, ino: h.ino}
 }
 
-func (w *Writeback) untrack(h *bufferingHandle) {
-	// The path index maps the path to its newest tracked handle — which
-	// need not be THIS one (a recreate tracked a newer writer over it).
-	// Dropping the entry unconditionally hid the surviving writer from
-	// handleFor: its bytes could no longer be flushed or served.
-	//
-	// The whole release-side registry update runs under regMu with the
-	// identity snapshotted under the handle's own lock (a bare h.path
-	// read races a concurrent retarget write) and the slot cleared by
-	// compare-and-delete: only an actually-removed OWN slot re-selects a
-	// survivor (a failed CAS means a newer claim — an open that landed
-	// between the check and the delete, or three fds sharing the path —
-	// and promoting an older handle here would overwrite it). Candidate
-	// identity and lifetime are verified under the candidate's lock, read
-	// from the lock-free info snapshot first.
+// untrackAndLast removes h from the registry and reports whether it was
+// the LAST tracked handle at its path (the whole decision under regMu, so
+// concurrent Releases elect exactly one closer).
+func (w *Writeback) untrackAndLast(h *bufferingHandle) bool {
+	path := h.infoSnapshot().path
 	w.regMu.Lock()
-	defer w.regMu.Unlock()
+	w.retireLocked(h)
+	last := !w.hasOtherTrackedHandle(path, h)
+	w.regMu.Unlock()
+	return last
+}
+
+// retireLocked is untrack's body; the caller holds regMu.
+func (w *Writeback) retireLocked(h *bufferingHandle) {
 	// Identity is captured INSIDE the registry lock: a retarget that moved
 	// the fd between an outside snapshot and this lock would strand the
 	// slot it actually owns (the snapshot's path no longer maps us, the
@@ -2658,6 +2684,19 @@ func (w *Writeback) untrack(h *bufferingHandle) {
 		})
 	}
 	w.liveSet.Delete(h)
+}
+
+func (w *Writeback) untrack(h *bufferingHandle) {
+	// The path index maps the path to its newest tracked handle — which
+	// need not be THIS one (a recreate tracked a newer writer over it).
+	// Dropping the entry unconditionally hid the surviving writer from
+	// handleFor: its bytes could no longer be flushed or served. The whole
+	// release-side registry update runs under regMu with the slot cleared
+	// by compare-and-delete and the survivor promoted only into an ABSENT
+	// slot (a newer claim is never overwritten).
+	w.regMu.Lock()
+	defer w.regMu.Unlock()
+	w.retireLocked(h)
 }
 
 // retireDirty clears the handle's dirty state only when the write
@@ -2702,6 +2741,15 @@ const unlinkedSnapshotMaxBytes = 64 << 20
 // so Release cannot resurrect the path. Per-handle, so a re-created p stays
 // committable by its new writer (fh.Unlinked).
 func (w *Writeback) markUnlinked(p string, under bool) {
+	_ = w.markUnlinkedSnapshot(p, under)
+}
+
+// markUnlinkedSnapshot marks the descriptors anonymous and snapshots their
+// clean images, returning the first snapshot failure. A CALLER that is
+// about to replace the name (rename-over) must use the error to abort and
+// roll back: otherwise the descriptors silently switch to the replacement's
+// bytes.
+func (w *Writeback) markUnlinkedSnapshot(p string, under bool) error {
 	prefix := strings.TrimSuffix(p, "/") + "/"
 	var clean []*bufferingHandle
 	w.liveSet.Range(func(key, _ any) bool {
@@ -2716,71 +2764,139 @@ func (w *Writeback) markUnlinked(p string, under bool) {
 		h.mu.Unlock()
 		return true
 	})
-	if w.opts.Staging != nil {
-		for _, h := range clean {
-			// v1 snapshotUnlinkedRemoteToShadow: a clean read-only fd of
-			// the deleted name keeps a snapshot in the shadow — its reads
-			// must survive the remote DELETE at last close. The snapshot
-			// carries no pending entry, so nothing ever re-uploads it.
-			w.snapshotUnlinkedClean(h)
+	var firstErr error
+	for _, h := range clean {
+		var err error
+		if w.opts.Staging != nil {
+			// v1 snapshotUnlinkedRemoteToShadow: a clean fd of the deleted
+			// name keeps a snapshot — its reads must survive the remote
+			// DELETE at last close.
+			err = w.snapshotUnlinkedClean(h)
+		} else {
+			// No shadow plane (the .dat/.meta cache track): keep the image
+			// on the handle itself.
+			err = w.snapshotUnlinkedImage(h)
 		}
-	} else {
-		// No shadow plane (the .dat/.meta cache track): keep the image on
-		// the handle itself.
-		for _, h := range clean {
-			w.snapshotUnlinkedImage(h)
+		if err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
+	return firstErr
+}
+
+// liveObjectSize is the size the snapshot must capture: the staged image
+// when the path has one (it can be newer than the remote), else the CURRENT
+// remote stat — never the handle's open-time baseSize, which a sibling
+// write may have outgrown.
+func (w *Writeback) liveObjectSize(ctx context.Context, h *bufferingHandle) int64 {
+	if meta, ok := w.pendingMeta(h.path); ok && meta != nil {
+		return meta.Size
+	}
+	if st, err := w.opts.Client.StatCtx(ctx, w.remotePath(h.path)); err == nil && st != nil {
+		return st.Size
+	}
+	return h.baseSize
+}
+
+// captureSnapshot streams size bytes of the handle's object into memory or
+// a temp file. A read failure is returned so the caller can ABORT the
+// namespace operation: replacing a name whose descriptors have no read
+// source silently switches them to the replacement's bytes.
+func (w *Writeback) captureSnapshot(h *bufferingHandle, size int64) ([]byte, *os.File, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
+	defer cancel()
+	if size <= unlinkedSnapshotMaxBytes {
+		buf := make([]byte, size)
+		if size > 0 {
+			n, err := h.inner.Read(ctx, 0, buf)
+			if err != nil || int64(n) != size {
+				if err == nil {
+					err = io.ErrUnexpectedEOF
+				}
+				return nil, nil, err
+			}
+		}
+		return buf, nil, nil
+	}
+	tmp, err := os.CreateTemp("", "drive9-anon-*")
+	if err != nil {
+		return nil, nil, err
+	}
+	_ = os.Remove(tmp.Name()) // the open fd is the only reference
+	for off := int64(0); off < size; {
+		chunk := int64(4 << 20)
+		if off+chunk > size {
+			chunk = size - off
+		}
+		part := make([]byte, chunk)
+		n, rerr := h.inner.Read(ctx, off, part)
+		if int64(n) != chunk || (rerr != nil && rerr != io.EOF) {
+			_ = tmp.Close()
+			if rerr != nil {
+				return nil, nil, rerr
+			}
+			return nil, nil, io.ErrUnexpectedEOF
+		}
+		if _, werr := tmp.WriteAt(part, off); werr != nil {
+			_ = tmp.Close()
+			return nil, nil, werr
+		}
+		off += chunk
+	}
+	return nil, tmp, nil
 }
 
 // snapshotUnlinkedClean stages one clean handle's remote image into the
 // shadow for post-delete reads.
-func (w *Writeback) snapshotUnlinkedClean(h *bufferingHandle) {
+func (w *Writeback) snapshotUnlinkedClean(h *bufferingHandle) error {
 	st := w.opts.Staging
 	if st.Pending.HasPending(h.path) {
-		return // a staged image already serves post-delete reads
+		return nil // a staged image already serves post-delete reads
 	}
 	if h.inner == nil {
-		// A pending-overlay handle (read-only re-open of a not-yet-landed
-		// image) has no terminal to fetch from; its post-delete reads are
-		// served by the pending tracks above.
-		return
+		return nil
 	}
-	size := h.baseSize
-	if size < 0 || size > unlinkedSnapshotMaxBytes {
-		return
+	size := w.liveObjectSize(context.Background(), h)
+	if size < 0 {
+		return nil
 	}
-	buf := make([]byte, 0)
-	if size > 0 {
-		buf = make([]byte, size)
-		ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
-		defer cancel()
-		n, err := h.inner.Read(ctx, 0, buf)
-		if err != nil || int64(n) != size {
-			return
-		}
-	}
-	// Keep the bytes on the handle itself: the store reuses the per-path
-	// shadow file for the replacement, so a generation token can read the
-	// NEW file's bytes. This applies to writable fds too — their first
-	// buffer preload adopts the snapshot (see ensureBufferLocked).
 	h.mu.Lock()
-	if h.pendingImage == nil {
+	seq, clean := h.mutSeq, h.buf == nil && !h.dirty
+	h.mu.Unlock()
+	if !clean {
+		return nil
+	}
+	buf, file, err := w.captureSnapshot(h, size)
+	if err != nil {
+		return err
+	}
+	// A write may have completed during the unlocked read: installing the
+	// pre-write image over a dirty buffer would hide it (Read prefers the
+	// snapshot), so re-validate before publishing.
+	h.mu.Lock()
+	if h.buf != nil || h.dirty || h.mutSeq != seq {
+		h.mu.Unlock()
+		if file != nil {
+			_ = file.Close()
+		}
+		return nil
+	}
+	if file != nil {
+		h.pendingFile, h.pendingFileSize = file, size
+	} else if h.pendingImage == nil {
 		h.pendingImage = buf
 	}
 	h.mu.Unlock()
-	if size == 0 {
-		// An EMPTY image is authoritative (EOF), not "no snapshot": the
-		// marker alone is enough, and there is no shadow content to pin.
+	if size == 0 || file != nil {
+		// Empty image (marker only) or a file-backed snapshot: nothing is
+		// written to the shadow.
 		w.recordUnlinkedSnapshot(h.path, 0, 0)
-		return
+		return nil
 	}
 	if err := st.Shadow.WriteFull(h.path, buf, h.baseRev); err != nil {
-		return
+		return err
 	}
 	contentGen := st.Shadow.ActiveGeneration(h.path)
-	// Pin ONCE per path: every clean fd of the same name shares the
-	// snapshot, and a per-fd Pin leaked one reference per descriptor.
 	w.unlinkedMu.Lock()
 	pin, pinned := w.unlinkedShadowPin[h.path]
 	w.unlinkedMu.Unlock()
@@ -2788,31 +2904,41 @@ func (w *Writeback) snapshotUnlinkedClean(h *bufferingHandle) {
 		pin = st.Shadow.Pin(h.path)
 	}
 	w.recordUnlinkedSnapshot(h.path, contentGen, pin)
+	return nil
 }
 
 // snapshotUnlinkedImage is the no-staging form of
 // snapshotUnlinkedClean: the clean fd's current image is captured into the
 // handle itself, so a rename-over or unlink keeps serving the OLD object's
 // bytes without a shadow plane.
-func (w *Writeback) snapshotUnlinkedImage(h *bufferingHandle) {
-	if h.inner == nil || h.baseSize < 0 || h.baseSize > unlinkedSnapshotMaxBytes {
-		return
+func (w *Writeback) snapshotUnlinkedImage(h *bufferingHandle) error {
+	if h.inner == nil {
+		return nil
 	}
-	buf := make([]byte, h.baseSize)
-	if h.baseSize > 0 {
-		ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
-		defer cancel()
-		n, err := h.inner.Read(ctx, 0, buf)
-		if err != nil || int64(n) != h.baseSize {
-			return
-		}
+	size := w.liveObjectSize(context.Background(), h)
+	if size < 0 {
+		return nil
+	}
+	buf, file, err := w.captureSnapshot(h, size)
+	if err != nil {
+		return err
 	}
 	h.mu.Lock()
-	if h.pendingImage == nil {
+	if h.buf != nil || h.dirty {
+		h.mu.Unlock()
+		if file != nil {
+			_ = file.Close()
+		}
+		return nil
+	}
+	if file != nil {
+		h.pendingFile, h.pendingFileSize = file, size
+	} else if h.pendingImage == nil {
 		h.pendingImage = buf
 	}
 	h.mu.Unlock()
 	w.recordUnlinkedSnapshot(h.path, 0, 0)
+	return nil
 }
 
 // settleRenamedHandle rebases the writers retargeted onto path onto the
@@ -3478,6 +3604,28 @@ func (h *bufferingHandle) ensureBufferLocked(ctx context.Context) error {
 			h.buf = nil
 		}
 	}()
+	if h.pendingFile != nil {
+		f, size := h.pendingFile, h.pendingFileSize
+		for off := int64(0); off < size; {
+			chunk := int64(1 << 20)
+			if off+chunk > size {
+				chunk = size - off
+			}
+			part := make([]byte, chunk)
+			if _, rerr := f.ReadAt(part, off); rerr != nil && rerr != io.EOF {
+				return rerr
+			}
+			if _, werr := h.buf.Write(off, part); werr != nil {
+				return werr
+			}
+			off += chunk
+		}
+		h.buf.ClearDirty()
+		h.baseLoaded = true
+		_ = h.pendingFile.Close()
+		h.pendingFile = nil
+		return nil
+	}
 	if h.pendingImage != nil {
 		// An anonymous fd's snapshot (read-only OR writable) is its base:
 		// a writable fd that had not written yet adopts the OLD object's

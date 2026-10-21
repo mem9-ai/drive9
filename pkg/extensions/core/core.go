@@ -15,7 +15,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -310,6 +312,13 @@ func (c *Core) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, erro
 		}
 		return fs.Result{}, nil
 	case fs.OpUnlink:
+		// POSIX unlink-of-open-file: the descriptors keep their object.
+		c.moveMu.Lock()
+		serr := c.snapshotSyncHandlesForPath(ctx, op.Path)
+		c.moveMu.Unlock()
+		if serr != nil {
+			return fs.Result{}, serr
+		}
 		if err := c.deleteRemote(ctx, op.Path, false); err != nil {
 			if client.IsNotFound(err) {
 				return fs.Result{}, nil
@@ -323,11 +332,21 @@ func (c *Core) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, erro
 		// rename then carries its data), and a write starting after the
 		// move sees the new path.
 		c.moveMu.Lock()
-		err := c.renameRemote(ctx, op.Path, op.Path2)
-		if err == nil {
-			c.retargetSyncHandles(op.Path, op.Path2)
+		// The overwritten target's descriptors keep the OLD object's bytes.
+		serr := c.snapshotSyncHandlesForPath(ctx, op.Path2)
+		var err error
+		if serr != nil {
+			err = serr
+		} else {
+			err = c.renameRemote(ctx, op.Path, op.Path2)
+			if err == nil {
+				c.retargetSyncHandles(op.Path, op.Path2)
+			}
 		}
 		c.moveMu.Unlock()
+		if serr != nil {
+			return fs.Result{}, serr
+		}
 		if err != nil {
 			return fs.Result{}, c.mapErr(err)
 		}
@@ -450,6 +469,68 @@ type SyncHandle struct {
 	core *Core
 	mu   sync.RWMutex
 	path string
+	// snap preserves the OLD object's bytes once its name is replaced or
+	// removed (a core-only chain has no writeback snapshot plane): reads
+	// serve it, and writes compose into it anonymously.
+	snap *anonSnapshot
+}
+
+// anonSnapshot is a bounded in-memory or temp-file image of an object whose
+// name is going away.
+type anonSnapshot struct {
+	mu   sync.Mutex
+	data []byte
+	file *os.File
+	size int64
+}
+
+func (s *anonSnapshot) ReadAt(p []byte, off int64) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if off < 0 || off >= s.size {
+		return 0, io.EOF
+	}
+	if s.file != nil {
+		return s.file.ReadAt(p, off)
+	}
+	n := copy(p, s.data[off:])
+	if int64(n) < int64(len(p)) && off+int64(n) >= s.size {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+func (s *anonSnapshot) WriteAt(off int64, p []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	end := off + int64(len(p))
+	if s.file == nil && end > int64(len(s.data)) {
+		grown := make([]byte, end)
+		copy(grown, s.data)
+		s.data = grown
+	}
+	if s.file != nil {
+		if _, err := s.file.WriteAt(p, off); err != nil {
+			return err
+		}
+	}
+	if s.file == nil {
+		copy(s.data[off:], p)
+	}
+	if end > s.size {
+		s.size = end
+	}
+	return nil
+}
+
+func (s *anonSnapshot) Close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.file != nil {
+		_ = s.file.Close()
+		s.file = nil
+	}
+	s.data = nil
 }
 
 // detachedNamespaceDeadline bounds detached namespace ops (mutations and
@@ -500,6 +581,16 @@ func (h *SyncHandle) Path() string {
 
 // Read fills dest with content at off.
 func (h *SyncHandle) Read(ctx context.Context, off int64, dest []byte) (int, error) {
+	h.mu.RLock()
+	snap := h.snap
+	h.mu.RUnlock()
+	if snap != nil {
+		n, err := snap.ReadAt(dest, off)
+		if err == io.EOF {
+			err = nil
+		}
+		return n, err
+	}
 	data, err := h.core.fetchRemote(ctx, h.core.remotePath(h.Path()), off, int64(len(dest)))
 	if err != nil {
 		return 0, h.core.mapErr(err)
@@ -522,6 +613,11 @@ func (h *SyncHandle) Write(ctx context.Context, off int64, data []byte) error {
 	defer h.core.moveMu.RUnlock()
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.snap != nil {
+		// The name is gone/replaced: the write updates the anonymous
+		// object only (its bytes stay readable through this fd).
+		return h.snap.WriteAt(off, data)
+	}
 	return h.core.WriteSync(ctx, h.path, off, data, 0)
 }
 
@@ -536,6 +632,12 @@ func (h *SyncHandle) Release(ctx context.Context) error {
 	if h.core != nil {
 		h.core.syncHandles.Delete(h)
 	}
+	h.mu.Lock()
+	if h.snap != nil {
+		h.snap.Close()
+		h.snap = nil
+	}
+	h.mu.Unlock()
 	return nil
 }
 
@@ -544,6 +646,89 @@ func (c *Core) newSyncHandle(path string) *SyncHandle {
 	h := &SyncHandle{core: c, path: path}
 	c.syncHandles.Store(h, struct{}{})
 	return h
+}
+
+// maxAnonSnapshotBytes bounds the in-memory anonymous snapshot; larger
+// objects stream to a temp file.
+const maxAnonSnapshotBytes = 64 << 20
+
+// snapshotSyncHandlesForPath preserves the object currently at path for its
+// open terminal handles. A failure aborts the namespace operation: replacing
+// the name without a read source would silently switch the descriptors to
+// the replacement's bytes.
+func (c *Core) snapshotSyncHandlesForPath(ctx context.Context, path string) error {
+	var targets []*SyncHandle
+	c.syncHandles.Range(func(key, _ any) bool {
+		h, ok := key.(*SyncHandle)
+		if ok && h.Path() == path {
+			targets = append(targets, h)
+		}
+		return true
+	})
+	if len(targets) == 0 {
+		return nil
+	}
+	st, err := c.cl.StatCtx(ctx, c.remotePath(path))
+	if err != nil {
+		if client.IsNotFound(err) {
+			return nil
+		}
+		return c.mapErr(err)
+	}
+	size := st.Size
+	for _, h := range targets {
+		snap, serr := c.captureAnonSnapshot(ctx, path, size)
+		if serr != nil {
+			return serr
+		}
+		h.mu.Lock()
+		if h.snap == nil {
+			h.snap = snap
+		} else {
+			snap.Close()
+		}
+		h.mu.Unlock()
+	}
+	return nil
+}
+
+func (c *Core) captureAnonSnapshot(ctx context.Context, path string, size int64) (*anonSnapshot, error) {
+	if size <= maxAnonSnapshotBytes {
+		data, err := c.fetchRemote(ctx, c.remotePath(path), 0, size)
+		if err != nil {
+			return nil, c.mapErr(err)
+		}
+		if int64(len(data)) < size {
+			return nil, io.ErrUnexpectedEOF
+		}
+		return &anonSnapshot{data: data[:size], size: size}, nil
+	}
+	tmp, err := os.CreateTemp("", "drive9-anon-*")
+	if err != nil {
+		return nil, err
+	}
+	_ = os.Remove(tmp.Name())
+	for off := int64(0); off < size; {
+		chunk := int64(4 << 20)
+		if off+chunk > size {
+			chunk = size - off
+		}
+		part, rerr := c.fetchRemote(ctx, c.remotePath(path), off, chunk)
+		if rerr != nil {
+			_ = tmp.Close()
+			return nil, c.mapErr(rerr)
+		}
+		if int64(len(part)) != chunk {
+			_ = tmp.Close()
+			return nil, io.ErrUnexpectedEOF
+		}
+		if _, werr := tmp.WriteAt(part, off); werr != nil {
+			_ = tmp.Close()
+			return nil, werr
+		}
+		off += chunk
+	}
+	return &anonSnapshot{file: tmp, size: size}, nil
 }
 
 // retargetSyncHandles moves every open terminal handle under a renamed path

@@ -482,3 +482,72 @@ func TestPortWritableAnonymousFdKeepsOldImage(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// The snapshot must capture the CURRENT object size: a sibling write that
+// grew the target after the fd was opened is part of the old object.
+func TestPortOverwrittenTargetUsesCurrentSize(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/a", []byte("HELLO"))
+	b.Seed("/b", []byte{})
+	ch, wb, _ := newWriteCacheStack(t, PolicyWriteBack, b)
+	ctx := context.Background()
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/b", Flags: 0})
+	if err != nil || res.Handle == nil {
+		t.Fatalf("open target = %v", err)
+	}
+	h2 := open(t, ch, "/b")
+	if err := h2.Write(ctx, 0, []byte("LONGER-OBJECT")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h2.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := h2.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := wb.Drain(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/a", Path2: "/b"}); err != nil {
+		t.Fatalf("rename = %v", err)
+	}
+	buf := make([]byte, 32)
+	n, rerr := res.Handle.Read(ctx, 0, buf)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if got := string(buf[:n]); got != "LONGER-OBJECT" {
+		t.Fatalf("old target fd read %q, want LONGER-OBJECT", got)
+	}
+	_ = res.Handle.Release(ctx)
+}
+
+// Concurrent last closes elect exactly one snapshot reclaimer.
+func TestPortConcurrentLastCloseReclaimsSnapshot(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/a", []byte("HELLO"))
+	ch, wb := newStagedStack(t, PolicyWriteBack, b)
+	ctx := context.Background()
+	openOne := func() fs.Handle {
+		r, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/a", Flags: 0})
+		if err != nil || r.Handle == nil {
+			t.Fatalf("open = %v", err)
+		}
+		return r.Handle
+	}
+	h1, h2 := openOne(), openOne()
+	wb.MarkPathUnlinked("/a")
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/a"}); err != nil && !fs.IsNotFound(err) {
+		t.Fatalf("unlink = %v", err)
+	}
+	start := make(chan struct{})
+	done := make(chan struct{}, 2)
+	go func() { <-start; _ = h1.Release(ctx); done <- struct{}{} }()
+	go func() { <-start; _ = h2.Release(ctx); done <- struct{}{} }()
+	close(start)
+	<-done
+	<-done
+	if wb.opts.Staging.Shadow.Has("/a") {
+		t.Fatal("snapshot shadow survived concurrent last closes")
+	}
+}

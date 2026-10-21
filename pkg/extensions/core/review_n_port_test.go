@@ -296,3 +296,75 @@ func TestPortNegativePublishAtomicWithReset(t *testing.T) {
 		t.Fatalf("HEAD count = %d, want revalidation", heads.Load())
 	}
 }
+
+// A core-only chain preserves the OLD object's bytes for descriptors whose
+// name is replaced or removed: the terminal handle serves its anonymous
+// snapshot.
+func TestPortCorePreservesOverwrittenTarget(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/a", []byte("HELLO"))
+	b.Seed("/b", []byte("OTHER"))
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	c, err := New(client.New(ts.URL, ""), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := fs.NewChain(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/b", Flags: 0})
+	if err != nil || res.Handle == nil {
+		t.Fatalf("open target = %v", err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/a", Path2: "/b"}); err != nil {
+		t.Fatalf("rename = %v", err)
+	}
+	buf := make([]byte, 16)
+	n, rerr := res.Handle.Read(ctx, 0, buf)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if got := string(buf[:n]); got != "OTHER" {
+		t.Fatalf("overwritten target fd read %q, want OTHER", got)
+	}
+	_ = res.Handle.Release(ctx)
+}
+
+// The same for unlink + same-name recreate.
+func TestPortCorePreservesUnlinkedObject(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/a", []byte("HELLO"))
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	c, err := New(client.New(ts.URL, ""), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := fs.NewChain(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/a", Flags: 0})
+	if err != nil || res.Handle == nil {
+		t.Fatalf("open = %v", err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/a"}); err != nil {
+		t.Fatalf("unlink = %v", err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/a", Flags: uint32(syscall.O_CREAT | syscall.O_RDWR)}); err != nil {
+		t.Fatalf("recreate = %v", err)
+	}
+	buf := make([]byte, 16)
+	n, rerr := res.Handle.Read(ctx, 0, buf)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if got := string(buf[:n]); got != "HELLO" {
+		t.Fatalf("unlinked fd read %q after recreate, want HELLO", got)
+	}
+	_ = res.Handle.Release(ctx)
+}
