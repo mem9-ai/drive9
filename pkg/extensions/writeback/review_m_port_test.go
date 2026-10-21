@@ -551,3 +551,72 @@ func TestPortConcurrentLastCloseReclaimsSnapshot(t *testing.T) {
 		t.Fatal("snapshot shadow survived concurrent last closes")
 	}
 }
+
+// A pending staged image newer than the remote is the snapshot CONTENT: the
+// size and the bytes must come from the same version.
+func TestPortSnapshotReadsStagedImage(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/a", []byte("HELLO"))
+	b.Seed("/b", []byte("OTHER"))
+	ch, _, _ := newWriteCacheStack(t, PolicyWriteBack, b)
+	ctx := context.Background()
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/b", Flags: 0})
+	if err != nil || res.Handle == nil {
+		t.Fatalf("open target = %v", err)
+	}
+	h2 := open(t, ch, "/b")
+	if err := h2.Write(ctx, 0, []byte("LONGER-OBJECT")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h2.Flush(ctx); err != nil { // staged, NOT uploaded
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/a", Path2: "/b"}); err != nil {
+		t.Fatalf("rename = %v", err)
+	}
+	buf := make([]byte, 32)
+	n, rerr := res.Handle.Read(ctx, 0, buf)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if got := string(buf[:n]); got != "LONGER-OBJECT" {
+		t.Fatalf("old target fd read %q, want the staged LONGER-OBJECT", got)
+	}
+	_ = h2.Release(ctx)
+	_ = res.Handle.Release(ctx)
+}
+
+// A large anonymous fd loads its disk snapshot lazily: a small write does
+// not materialize the whole image, and untouched ranges still read the old
+// bytes.
+func TestPortLargeAnonymousSnapshotLoadsLazily(t *testing.T) {
+	const size = 128 << 20
+	b := testbackend.NewBackend()
+	old := bytes.Repeat([]byte("A"), size)
+	b.Seed("/big", old)
+	ch, wb := newStagedStack(t, PolicyWriteBack, b)
+	ctx := context.Background()
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/big", Flags: uint32(syscall.O_RDWR)})
+	if err != nil || res.Handle == nil {
+		t.Fatalf("open = %v", err)
+	}
+	wb.MarkPathUnlinked("/big")
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/big"}); err != nil && !fs.IsNotFound(err) {
+		t.Fatalf("unlink = %v", err)
+	}
+	if err := res.Handle.Write(ctx, 0, []byte("X")); err != nil {
+		t.Fatalf("write = %v", err)
+	}
+	buf := make([]byte, 16)
+	n, rerr := res.Handle.Read(ctx, 0, buf)
+	if rerr != nil || n != 16 || buf[0] != 'X' || buf[1] != 'A' {
+		t.Fatalf("read at 0 = %q err=%v, want the write over the old image", buf[:n], rerr)
+	}
+	// A range in another part still serves the OLD object's bytes through
+	// the lazy loader (not the replacement's, and not zeros).
+	tail := make([]byte, 16)
+	if n, rerr := res.Handle.Read(ctx, size-16, tail); rerr != nil || n != 16 || tail[0] != 'A' {
+		t.Fatalf("tail read = %q (%d) err=%v", tail[:n], n, rerr)
+	}
+	_ = res.Handle.Release(ctx)
+}

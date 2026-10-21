@@ -368,3 +368,48 @@ func TestPortCorePreservesUnlinkedObject(t *testing.T) {
 	}
 	_ = res.Handle.Release(ctx)
 }
+
+// A FAILED overwrite rename rolls the anonymous snapshots back: the target
+// keeps its name, and its descriptors keep writing to the remote object.
+func TestPortFailedRenameRestoresTargetHandle(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/a", []byte("HELLO"))
+	b.Seed("/b", []byte("OTHER"))
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/b") && r.URL.Query().Has("rename") {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		b.ServeHTTP(w, r)
+	}))
+	t.Cleanup(ts.Close)
+	c, err := New(client.New(ts.URL, ""), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := fs.NewChain(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/b", Flags: uint32(syscall.O_RDWR)})
+	if err != nil || res.Handle == nil {
+		t.Fatalf("open = %v", err)
+	}
+	// The remote rename is rejected: the target keeps its name.
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/a", Path2: "/b"}); err == nil {
+		t.Fatal("rejected rename succeeded")
+	}
+	if err := res.Handle.Write(ctx, 0, []byte("AFTER")); err != nil {
+		t.Fatalf("write after failed rename = %v", err)
+	}
+	if err := res.Handle.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := res.Handle.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if node, ok := b.Node("/b"); !ok || string(node.Data) != "AFTER" {
+		t.Fatalf("/b = %q ok=%v, want AFTER (the failed rename must not anonymize it)", node.Data, ok)
+	}
+}

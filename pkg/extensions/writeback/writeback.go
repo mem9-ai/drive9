@@ -243,6 +243,9 @@ type bufferingHandle struct {
 	// to the reused pathname.
 	pendingFile     *os.File
 	pendingFileSize int64
+	// snapshotFile keeps a disk snapshot alive for the buffer's lazy part
+	// loader after the snapshot itself stopped serving reads directly.
+	snapshotFile *os.File
 	// flags is the open mode: O_APPEND writes track the buffer tail.
 	flags uint32
 	// pendingMode defers a chmod past a dirty handle to its commit (
@@ -2147,6 +2150,10 @@ func (h *bufferingHandle) Release(ctx context.Context) error {
 		_ = h.pendingFile.Close()
 		h.pendingFile = nil
 	}
+	if h.snapshotFile != nil {
+		_ = h.snapshotFile.Close()
+		h.snapshotFile = nil
+	}
 	h.mu.Unlock()
 	// An O_CREAT claim that never landed must still materialize as a remote
 	// file (stages it in pendingIndex at Create): git probes the
@@ -2798,11 +2805,32 @@ func (w *Writeback) liveObjectSize(ctx context.Context, h *bufferingHandle) int6
 	return h.baseSize
 }
 
+// stagedImage returns the pending/staged image for path when it matches
+// size (the same version liveObjectSize measured).
+func (w *Writeback) stagedImage(path string, size int64) ([]byte, bool) {
+	if w.opts.Staging != nil {
+		if data, ok := readShadowGenerationFenced(w.opts.Staging.Shadow, path, size); ok {
+			return data, true
+		}
+	}
+	if w.wbCache != nil {
+		if data, ok := w.wbCache.Get(path); ok && int64(len(data)) == size {
+			return data, true
+		}
+	}
+	return nil, false
+}
+
 // captureSnapshot streams size bytes of the handle's object into memory or
-// a temp file. A read failure is returned so the caller can ABORT the
-// namespace operation: replacing a name whose descriptors have no read
-// source silently switches them to the replacement's bytes.
+// a temp file. The CONTENT source must be the same version whose size was
+// measured: a staged pending image is read from the staging/shadow (the
+// inner terminal still holds the OLD remote bytes, and reading size bytes
+// from it failed a legitimate rename with EIO). A read failure is returned
+// so the caller can ABORT the namespace operation.
 func (w *Writeback) captureSnapshot(h *bufferingHandle, size int64) ([]byte, *os.File, error) {
+	if data, ok := w.stagedImage(h.path, size); ok {
+		return data, nil, nil
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
 	defer cancel()
 	if size <= unlinkedSnapshotMaxBytes {
@@ -3605,25 +3633,30 @@ func (h *bufferingHandle) ensureBufferLocked(ctx context.Context) error {
 		}
 	}()
 	if h.pendingFile != nil {
+		// Keep the snapshot on DISK and load parts on demand: materializing
+		// a 128MiB (or multi-GiB) anonymous file on the first small write
+		// exhausted the mount's heap. The file is closed with the handle.
 		f, size := h.pendingFile, h.pendingFileSize
-		for off := int64(0); off < size; {
-			chunk := int64(1 << 20)
-			if off+chunk > size {
-				chunk = size - off
-			}
-			part := make([]byte, chunk)
-			if _, rerr := f.ReadAt(part, off); rerr != nil && rerr != io.EOF {
-				return rerr
-			}
-			if _, werr := h.buf.Write(off, part); werr != nil {
-				return werr
-			}
-			off += chunk
-		}
-		h.buf.ClearDirty()
-		h.baseLoaded = true
-		_ = h.pendingFile.Close()
+		h.snapshotFile = f
 		h.pendingFile = nil
+		h.buf.SeedRemote(size)
+		h.buf.LoadPart = func(partNum int) ([]byte, error) {
+			partSize := h.buf.PartSize()
+			start := int64(partNum-1) * partSize
+			end := start + partSize
+			if end > size {
+				end = size
+			}
+			if end <= start {
+				return nil, nil
+			}
+			part := make([]byte, end-start)
+			if _, rerr := f.ReadAt(part, start); rerr != nil && rerr != io.EOF {
+				return nil, rerr
+			}
+			return part, nil
+		}
+		h.baseLoaded = true
 		return nil
 	}
 	if h.pendingImage != nil {

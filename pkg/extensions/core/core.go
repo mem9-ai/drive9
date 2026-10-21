@@ -314,16 +314,21 @@ func (c *Core) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, erro
 	case fs.OpUnlink:
 		// POSIX unlink-of-open-file: the descriptors keep their object.
 		c.moveMu.Lock()
-		serr := c.snapshotSyncHandlesForPath(ctx, op.Path)
-		c.moveMu.Unlock()
+		rollback, serr := c.snapshotSyncHandlesForPath(ctx, op.Path)
 		if serr != nil {
+			c.moveMu.Unlock()
 			return fs.Result{}, serr
 		}
-		if err := c.deleteRemote(ctx, op.Path, false); err != nil {
-			if client.IsNotFound(err) {
-				return fs.Result{}, nil
-			}
-			return fs.Result{}, c.mapErr(err)
+		delErr := c.deleteRemote(ctx, op.Path, false)
+		if delErr != nil && !client.IsNotFound(delErr) {
+			// The name survives: the descriptors must keep writing to it.
+			rollback()
+			c.moveMu.Unlock()
+			return fs.Result{}, c.mapErr(delErr)
+		}
+		c.moveMu.Unlock()
+		if delErr != nil {
+			return fs.Result{}, nil
 		}
 		return fs.Result{}, nil
 	case fs.OpRename:
@@ -333,7 +338,7 @@ func (c *Core) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, erro
 		// move sees the new path.
 		c.moveMu.Lock()
 		// The overwritten target's descriptors keep the OLD object's bytes.
-		serr := c.snapshotSyncHandlesForPath(ctx, op.Path2)
+		rollback, serr := c.snapshotSyncHandlesForPath(ctx, op.Path2)
 		var err error
 		if serr != nil {
 			err = serr
@@ -341,6 +346,11 @@ func (c *Core) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, erro
 			err = c.renameRemote(ctx, op.Path, op.Path2)
 			if err == nil {
 				c.retargetSyncHandles(op.Path, op.Path2)
+			} else {
+				// The rename failed and the target KEEPS its name: restore
+				// the descriptors' writable identity (an anonymous snapshot
+				// would swallow every later write).
+				rollback()
 			}
 		}
 		c.moveMu.Unlock()
@@ -656,7 +666,7 @@ const maxAnonSnapshotBytes = 64 << 20
 // open terminal handles. A failure aborts the namespace operation: replacing
 // the name without a read source would silently switch the descriptors to
 // the replacement's bytes.
-func (c *Core) snapshotSyncHandlesForPath(ctx context.Context, path string) error {
+func (c *Core) snapshotSyncHandlesForPath(ctx context.Context, path string) (func(), error) {
 	var targets []*SyncHandle
 	c.syncHandles.Range(func(key, _ any) bool {
 		h, ok := key.(*SyncHandle)
@@ -665,31 +675,47 @@ func (c *Core) snapshotSyncHandlesForPath(ctx context.Context, path string) erro
 		}
 		return true
 	})
+	noop := func() {}
 	if len(targets) == 0 {
-		return nil
+		return noop, nil
 	}
 	st, err := c.cl.StatCtx(ctx, c.remotePath(path))
 	if err != nil {
 		if client.IsNotFound(err) {
-			return nil
+			return noop, nil
 		}
-		return c.mapErr(err)
+		return noop, c.mapErr(err)
 	}
 	size := st.Size
+	installed := make([]*SyncHandle, 0, len(targets))
+	rollback := func() {
+		for _, h := range installed {
+			h.mu.Lock()
+			if h.snap != nil {
+				h.snap.Close()
+				h.snap = nil
+			}
+			h.mu.Unlock()
+		}
+	}
 	for _, h := range targets {
 		snap, serr := c.captureAnonSnapshot(ctx, path, size)
 		if serr != nil {
-			return serr
+			// A partial capture must not leave earlier handles anonymous:
+			// the namespace operation is about to fail and the name stays.
+			rollback()
+			return noop, serr
 		}
 		h.mu.Lock()
 		if h.snap == nil {
 			h.snap = snap
+			installed = append(installed, h)
 		} else {
 			snap.Close()
 		}
 		h.mu.Unlock()
 	}
-	return nil
+	return rollback, nil
 }
 
 func (c *Core) captureAnonSnapshot(ctx context.Context, path string, size int64) (*anonSnapshot, error) {
