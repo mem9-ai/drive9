@@ -23,8 +23,12 @@ type streamHandle struct {
 	image []byte
 	// spill backs an unlinked claim's image once it exceeds the memory
 	// bound: a sparse/multi-GiB offset must not allocate the whole hole.
-	spill       *os.File
-	spillSize   int64
+	spill     *os.File
+	spillSize int64
+	// refs counts the claim plus every live claimReadHandle: the spill (and
+	// the anonymous image) must outlive the WRITE descriptor while a
+	// read-only re-open still serves it.
+	refs        int
 	mode        uint32
 	pushed      int64 // image size already expressed below; a shorter image needs a truncation
 	dirty       bool  // image differs from the state expressed below
@@ -82,6 +86,21 @@ func (h *streamHandle) applyAttr(ctx context.Context, op *fs.Op) (fs.Attr, error
 		h.mu.Unlock()
 		return a, nil
 	}
+	h.mu.Lock()
+	if h.spill != nil {
+		if op.Size >= 0 && op.Size != h.spillSize {
+			if err := h.spill.Truncate(op.Size); err != nil {
+				h.mu.Unlock()
+				return fs.Attr{}, err
+			}
+			h.spillSize = op.Size
+			h.dirty = true
+		}
+		attr := h.attrLocked()
+		h.mu.Unlock()
+		return attr, nil
+	}
+	h.mu.Unlock()
 	if op.Size >= 0 && op.Size != int64(len(h.image)) {
 		size := op.Size
 		h.mu.Lock()
@@ -177,6 +196,25 @@ func (h *streamHandle) Read(ctx context.Context, off int64, dest []byte) (int, e
 	return n, nil
 }
 
+// addRef/dropRef keep the anonymous image alive while a read-only re-open
+// still serves it (the write descriptor's Release is not the last reference).
+func (h *streamHandle) addRef() {
+	h.mu.Lock()
+	h.refs++
+	h.mu.Unlock()
+}
+
+func (h *streamHandle) dropRef() {
+	h.mu.Lock()
+	h.refs--
+	closeSpill := h.released && h.refs <= 0 && h.spill != nil
+	if closeSpill {
+		_ = h.spill.Close()
+		h.spill = nil
+	}
+	h.mu.Unlock()
+}
+
 // spillImageLocked moves the buffered image into a temp file and writes the
 // new range there. The caller holds h.mu.
 func (h *streamHandle) spillImageLocked(off int64, data []byte, end int64) error {
@@ -229,7 +267,7 @@ func (h *streamHandle) Write(ctx context.Context, off int64, data []byte) error 
 	// An unlinked claim has nowhere to forward. Small images stay in memory
 	// (bounded); a large/sparse one spills to a temp file so a multi-GiB
 	// offset cannot allocate the whole hole on the heap.
-	if h.unlinked && end > bulkfileMaxBufferedBytes {
+	if h.unlinked && (h.spill != nil || end > bulkfileMaxBufferedBytes) {
 		if err := h.spillImageLocked(off, data, end); err != nil {
 			h.mu.Unlock()
 			return err
@@ -428,11 +466,8 @@ func (h *streamHandle) Release(ctx context.Context) error {
 	}
 	h.mu.Lock()
 	h.inner = nil
-	if h.spill != nil {
-		_ = h.spill.Close()
-		h.spill = nil
-	}
 	h.mu.Unlock()
+	h.dropRef()
 	if inner != nil {
 		if err := inner.Release(ctx); err != nil && pushErr == nil {
 			pushErr = err
@@ -510,6 +545,12 @@ func (c *claimReadHandle) Write(ctx context.Context, off int64, data []byte) err
 	return syscall.EROFS
 }
 
-func (c *claimReadHandle) Sync(ctx context.Context) error    { return nil }
-func (c *claimReadHandle) Flush(ctx context.Context) error   { return nil }
-func (c *claimReadHandle) Release(ctx context.Context) error { return nil }
+func (c *claimReadHandle) Sync(ctx context.Context) error  { return nil }
+func (c *claimReadHandle) Flush(ctx context.Context) error { return nil }
+func (c *claimReadHandle) Release(ctx context.Context) error {
+	if c.claim != nil {
+		c.claim.dropRef()
+		c.claim = nil
+	}
+	return nil
+}

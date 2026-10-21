@@ -781,6 +781,10 @@ func (h *dbAccountingHandle) Anonymous() bool {
 	return false
 }
 
+// Unwrap exposes the decorated handle to extensions that resolve their own
+// handle type for FD-directed operations.
+func (h *dbAccountingHandle) Unwrap() fs.Handle { return h.inner }
+
 func (h *dbAccountingHandle) Read(ctx context.Context, off int64, dest []byte) (int, error) {
 	return h.inner.Read(ctx, off, dest)
 }

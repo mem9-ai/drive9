@@ -477,6 +477,10 @@ func (c *Cache) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 }
 
 // Read implements fs.Handle.
+// Unwrap exposes the decorated handle so inner extensions can resolve their
+// own handle type for FD-directed operations.
+func (h *cachingHandle) Unwrap() fs.Handle { return h.inner }
+
 func (h *cachingHandle) Read(ctx context.Context, off int64, dest []byte) (int, error) {
 	// An ANONYMOUS fd (its name was unlinked or overwritten) reads a private
 	// snapshot of the OLD object: every tier below is path-keyed and would

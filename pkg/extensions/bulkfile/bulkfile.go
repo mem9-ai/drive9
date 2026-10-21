@@ -44,6 +44,26 @@ type Options struct {
 	Policy string
 }
 
+// resolveStreamHandle finds our claim behind decorator wrappers: a
+// FD-directed setattr must act on the DESCRIPTOR's object, and the default
+// chain hands us the cache's (or localize's) wrapper, whose direct type is
+// not *streamHandle. Without the unwrap the request fell back to the PATH
+// and truncated a same-name replacement.
+func (b *Bulkfile) resolveStreamHandle(handle any) *streamHandle {
+	h, _ := handle.(fs.Handle)
+	for depth := 0; h != nil && depth < 16; depth++ {
+		if sh, ok := h.(*streamHandle); ok {
+			return sh
+		}
+		u, ok := h.(interface{ Unwrap() fs.Handle })
+		if !ok {
+			return nil
+		}
+		h = u.Unwrap()
+	}
+	return nil
+}
+
 // Bulkfile is the handler claiming fresh truncate-writers. Everything else
 // passes to the next handler untouched.
 type Bulkfile struct {
@@ -112,6 +132,8 @@ func (b *Bulkfile) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 		}
 		h := &streamHandle{
 			b: b, path: op.Path,
+			// The claim itself is the first reference to the image.
+			refs: 1,
 			mode: op.Mode & 0o777,
 			// An O_CREAT open carries the request's mode, 000 included; a
 			// plain open of an existing file leaves it unknown.
@@ -158,6 +180,7 @@ func (b *Bulkfile) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 		if hit := b.liveHandleAt(op.Path); hit != nil {
 			if attr, ok := hit.overlayAttr(); ok {
 				if !writeIntent(op.Flags) {
+					hit.addRef()
 					return fs.Result{Attr: &attr, Handle: &claimReadHandle{claim: hit}}, nil
 				}
 				if ferr := hit.Flush(ctx); ferr != nil {
@@ -193,7 +216,7 @@ func (b *Bulkfile) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 		// boundary; sending it below would truncate or chmod the stale
 		// remote state instead. A mode change is forwarded to the write
 		// plane's pending handle directly.
-		if h, ok := op.Handle.(*streamHandle); ok {
+		if h := b.resolveStreamHandle(op.Handle); h != nil {
 			attr, err := h.applyAttr(ctx, op)
 			if err != nil {
 				return fs.Result{}, err

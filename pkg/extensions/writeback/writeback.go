@@ -1586,7 +1586,15 @@ func (w *Writeback) KeepForgotten(path string) bool {
 	return w.queue != nil && w.queue.HasPath(path)
 }
 
-// Anonymous reports that the handle's name is gone/replaced and its bytes
+// Unwrap exposes the terminal handle below so inner extensions can resolve
+// their own handle type for FD-directed operations.
+func (h *bufferingHandle) Unwrap() fs.Handle {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.inner
+}
+
+// Anonymous reports that the handle's name is gone/replaced and its bytes// Anonymous reports that the handle's name is gone/replaced and its bytes
 // come from a private snapshot: outer path-keyed caches must not answer for
 // it.
 func (h *bufferingHandle) Anonymous() bool {
