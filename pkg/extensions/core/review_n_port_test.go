@@ -454,3 +454,87 @@ func TestPortAnonSnapshotCloseDuringReadIsSafe(t *testing.T) {
 	snap2.Close()
 	<-done
 }
+
+// A sparse write far beyond the captured size must spill to disk instead of
+// growing the heap without bound.
+func TestPortAnonSnapshotSparseWriteSpills(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/x", []byte("HELLO"))
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	c, err := New(client.New(ts.URL, ""), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	snap, err := c.captureAnonSnapshot(ctx, "/x", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snap.Close()
+	if err := snap.WriteAt(128<<20, []byte("Z")); err != nil {
+		t.Fatalf("sparse write = %v", err)
+	}
+	snap.mu.Lock()
+	spilled := snap.file != nil && snap.data == nil
+	snap.mu.Unlock()
+	if !spilled {
+		t.Fatal("sparse write kept the snapshot in memory")
+	}
+	got := make([]byte, 1)
+	if _, err := snap.ReadAt(got, 128<<20); err != nil || got[0] != 'Z' {
+		t.Fatalf("read back = %q err=%v", got, err)
+	}
+}
+
+// A delete must not read the REPLACEMENT object just because an old fd still
+// holds an anonymous snapshot: its GET failure must not block the unlink.
+func TestPortUnlinkSkipsAnonymousTargetReads(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/a", []byte("HELLO"))
+	var gets atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The FIRST unlink may read /a (the old fd's snapshot); after that
+		// the name belongs to a NEW object that nothing references.
+		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/a") && gets.Add(1) > 1 {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		b.ServeHTTP(w, r)
+	}))
+	t.Cleanup(ts.Close)
+	c, err := New(client.New(ts.URL, ""), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := fs.NewChain(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	old, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/a", Flags: 0})
+	if err != nil || old.Handle == nil {
+		t.Fatalf("open = %v", err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/a"}); err != nil {
+		t.Fatalf("first unlink = %v", err)
+	}
+	// Recreate a NEW object at the same name; the anonymous old fd must not
+	// force a read of it.
+	fresh, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/a", Flags: uint32(syscall.O_CREAT | syscall.O_RDWR)})
+	if err != nil || fresh.Handle == nil {
+		t.Fatalf("recreate = %v", err)
+	}
+	if err := fresh.Handle.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/a"}); err != nil {
+		t.Fatalf("second unlink = %v (the anonymous fd read the replacement)", err)
+	}
+	buf := make([]byte, 8)
+	n, rerr := old.Handle.Read(ctx, 0, buf)
+	if rerr != nil || string(buf[:n]) != "HELLO" {
+		t.Fatalf("old fd read = %q err=%v", buf[:n], rerr)
+	}
+	_ = old.Handle.Release(ctx)
+}

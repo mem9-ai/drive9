@@ -771,6 +771,16 @@ type dbAccountingHandle struct {
 	close func(path string)
 }
 
+// Anonymous propagates the inner handle's anonymous identity: outer
+// decorators (the cache's path-keyed tiers) must be able to see it through
+// this wrapper.
+func (h *dbAccountingHandle) Anonymous() bool {
+	if a, ok := h.inner.(interface{ Anonymous() bool }); ok {
+		return a.Anonymous()
+	}
+	return false
+}
+
 func (h *dbAccountingHandle) Read(ctx context.Context, off int64, dest []byte) (int, error) {
 	return h.inner.Read(ctx, off, dest)
 }

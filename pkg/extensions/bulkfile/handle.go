@@ -122,6 +122,18 @@ func (h *streamHandle) applyAttr(ctx context.Context, op *fs.Op) (fs.Attr, error
 	return attr, nil
 }
 
+// Anonymous propagates the inner handle's anonymous identity through the
+// bulk claim wrapper.
+func (h *streamHandle) Anonymous() bool {
+	h.mu.Lock()
+	inner := h.inner
+	h.mu.Unlock()
+	if a, ok := inner.(interface{ Anonymous() bool }); ok {
+		return a.Anonymous()
+	}
+	return false
+}
+
 func (h *streamHandle) Read(ctx context.Context, off int64, dest []byte) (int, error) {
 	h.mu.Lock()
 	passthrough := h.passthrough

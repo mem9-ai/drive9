@@ -515,6 +515,23 @@ func (s *anonSnapshot) WriteAt(off int64, p []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	end := off + int64(len(p))
+	if s.file == nil && end > maxAnonSnapshotBytes {
+		// A sparse/large write must not grow the heap without bound: move
+		// the captured bytes to a temp file and continue there.
+		tmp, err := os.CreateTemp("", "drive9-anon-*")
+		if err != nil {
+			return err
+		}
+		_ = os.Remove(tmp.Name())
+		if len(s.data) > 0 {
+			if _, werr := tmp.WriteAt(s.data, 0); werr != nil {
+				_ = tmp.Close()
+				return werr
+			}
+		}
+		s.file = tmp
+		s.data = nil
+	}
 	if s.file == nil && end > int64(len(s.data)) {
 		grown := make([]byte, end)
 		copy(grown, s.data)
@@ -687,7 +704,10 @@ func (c *Core) snapshotSyncHandlesForPath(ctx context.Context, path string) (fun
 	var targets []*SyncHandle
 	c.syncHandles.Range(func(key, _ any) bool {
 		h, ok := key.(*SyncHandle)
-		if ok && h.Path() == path {
+		// Handles that already own a snapshot are anonymous: they must not
+		// make this operation stat/read the REPLACEMENT object (a failing
+		// GET on an unreferenced new file blocked its own delete).
+		if ok && h.Path() == path && !h.Anonymous() {
 			targets = append(targets, h)
 		}
 		return true

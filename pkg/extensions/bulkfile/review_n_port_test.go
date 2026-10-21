@@ -152,3 +152,16 @@ func TestPortChmodZeroKeepsMode(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+type anonProbeHandle struct{ fs.Handle }
+
+func (anonProbeHandle) Anonymous() bool { return true }
+
+// The bulk claim wrapper forwards the inner handle's anonymous identity so
+// outer path-keyed caches bypass for it.
+func TestPortBulkfileForwardsAnonymous(t *testing.T) {
+	h := &streamHandle{inner: anonProbeHandle{}}
+	if !h.Anonymous() {
+		t.Fatal("streamHandle dropped the Anonymous identity")
+	}
+}
