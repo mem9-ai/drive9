@@ -6,6 +6,7 @@ package bulkfile
 
 import (
 	"context"
+	"sync"
 	"syscall"
 	"testing"
 
@@ -320,5 +321,86 @@ func TestPortSpillOutlivesWriteDescriptor(t *testing.T) {
 	h.mu.Unlock()
 	if !closed {
 		t.Fatal("spill leaked after the last reference closed")
+	}
+}
+
+type fakeInnerHandle struct {
+	fs.Handle
+	data      []byte
+	released  bool
+	releaseN  int
+	releaseMu sync.Mutex
+}
+
+func (f *fakeInnerHandle) Read(ctx context.Context, off int64, dest []byte) (int, error) {
+	if off >= int64(len(f.data)) {
+		return 0, nil
+	}
+	return copy(dest, f.data[off:]), nil
+}
+func (f *fakeInnerHandle) Write(context.Context, int64, []byte) error { return nil }
+func (f *fakeInnerHandle) Sync(context.Context) error                 { return nil }
+func (f *fakeInnerHandle) Flush(context.Context) error                { return nil }
+func (f *fakeInnerHandle) Release(context.Context) error {
+	f.releaseMu.Lock()
+	f.released = true
+	f.releaseN++
+	f.releaseMu.Unlock()
+	return nil
+}
+
+// A passthrough truncate must reach the BOUND handle, not the path.
+func TestPortPassthroughTruncateUsesBoundHandle(t *testing.T) {
+	inner := &fakeInnerHandle{data: []byte("OTHER")}
+	var got *fs.Op
+	below := fs.HandlerFilesystem(func(ctx context.Context, op *fs.Op) (fs.Result, error) {
+		got = op
+		return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Size: op.Size}}, nil
+	})
+	h := &streamHandle{below: below, inner: inner, passthrough: true, refs: 1}
+	attr, err := h.applyAttr(context.Background(), &fs.Op{Kind: fs.OpSetAttr, Size: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attr.Size != 2 {
+		t.Fatalf("attr size = %d, want 2", attr.Size)
+	}
+	if got == nil || got.Handle != inner {
+		t.Fatalf("truncate forwarded with handle %v, want the bound inner handle", got)
+	}
+	if got.Path != "" && got.Size != 2 {
+		t.Fatalf("forwarded op = %+v", got)
+	}
+}
+
+// The passthrough backing must outlive the write descriptor while a
+// claimReadHandle is open (its Read falls through the claim).
+func TestPortPassthroughBackingOutlivesWriter(t *testing.T) {
+	inner := &fakeInnerHandle{data: []byte("OTHER")}
+	h := &streamHandle{inner: inner, passthrough: true, refs: 1}
+	rh := &claimReadHandle{claim: h}
+	h.addRef()
+	ctx := context.Background()
+	if err := h.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	inner.releaseMu.Lock()
+	premature := inner.released
+	inner.releaseMu.Unlock()
+	if premature {
+		t.Fatal("backing released while a claim reader is still open")
+	}
+	buf := make([]byte, 5)
+	if n, err := rh.Read(ctx, 0, buf); err != nil || string(buf[:n]) != "OTHER" {
+		t.Fatalf("reader after writer close = %q err=%v", buf[:n], err)
+	}
+	if err := rh.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	inner.releaseMu.Lock()
+	released := inner.released
+	inner.releaseMu.Unlock()
+	if !released {
+		t.Fatal("backing leaked after the last reference")
 	}
 }

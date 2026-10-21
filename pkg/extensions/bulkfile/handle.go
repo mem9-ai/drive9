@@ -6,6 +6,7 @@ import (
 	"os"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/mem9-ai/drive9/pkg/fs"
 )
@@ -72,6 +73,14 @@ func (h *streamHandle) applyAttr(ctx context.Context, op *fs.Op) (fs.Attr, error
 		// len(nil) would compare equal to 0 and skip the shrink).
 		if op.Size >= 0 {
 			size := op.Size
+			if attr, ok, berr := h.setAttrBound(ctx, op); berr != nil {
+				return fs.Attr{}, berr
+			} else if ok {
+				h.mu.Lock()
+				h.pushed = size
+				h.mu.Unlock()
+				return attr, nil
+			}
 			if err := h.below.SetAttr(ctx, h.path, fs.AttrPatch{Size: &size}); err != nil {
 				return fs.Attr{}, err
 			}
@@ -116,8 +125,12 @@ func (h *streamHandle) applyAttr(ctx context.Context, op *fs.Op) (fs.Attr, error
 			if err := h.push(ctx); err != nil {
 				return fs.Attr{}, err
 			}
-			if err := h.below.SetAttr(ctx, h.path, fs.AttrPatch{Size: &size}); err != nil {
-				return fs.Attr{}, err
+			if _, ok, berr := h.setAttrBound(ctx, op); berr != nil {
+				return fs.Attr{}, berr
+			} else if !ok {
+				if err := h.below.SetAttr(ctx, h.path, fs.AttrPatch{Size: &size}); err != nil {
+					return fs.Attr{}, err
+				}
 			}
 			h.mu.Lock()
 			h.passthrough = true
@@ -196,6 +209,31 @@ func (h *streamHandle) Read(ctx context.Context, off int64, dest []byte) (int, e
 	return n, nil
 }
 
+// setAttrBound forwards a FD-directed attribute change to the BOUND handle
+// below. Re-addressing the path would act on whatever object now owns the
+// name (an anonymous fd's truncate landed on a same-name replacement).
+func (h *streamHandle) setAttrBound(ctx context.Context, op *fs.Op) (fs.Attr, bool, error) {
+	h.mu.Lock()
+	inner := h.inner
+	h.mu.Unlock()
+	if inner == nil {
+		return fs.Attr{}, false, nil
+	}
+	do, ok := h.below.(fs.HandlerFilesystem)
+	if !ok {
+		return fs.Attr{}, false, nil
+	}
+	bound := &fs.Op{Kind: fs.OpSetAttr, Path: h.path, Handle: inner, Size: op.Size, HasMode: op.HasMode, Mode: op.Mode}
+	res, err := do(ctx, bound)
+	if err != nil {
+		return fs.Attr{}, true, err
+	}
+	if res.Attr != nil {
+		return *res.Attr, true, nil
+	}
+	return fs.Attr{}, true, nil
+}
+
 // addRef/dropRef keep the anonymous image alive while a read-only re-open
 // still serves it (the write descriptor's Release is not the last reference).
 func (h *streamHandle) addRef() {
@@ -207,12 +245,23 @@ func (h *streamHandle) addRef() {
 func (h *streamHandle) dropRef() {
 	h.mu.Lock()
 	h.refs--
-	closeSpill := h.released && h.refs <= 0 && h.spill != nil
-	if closeSpill {
-		_ = h.spill.Close()
-		h.spill = nil
+	var toRelease fs.Handle
+	if h.released && h.refs <= 0 {
+		if h.spill != nil {
+			_ = h.spill.Close()
+			h.spill = nil
+		}
+		// The passthrough backing may still be serving the last reader:
+		// release it only when the LAST reference goes away.
+		toRelease = h.inner
+		h.inner = nil
 	}
 	h.mu.Unlock()
+	if toRelease != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		_ = toRelease.Release(ctx)
+		cancel()
+	}
 }
 
 // spillImageLocked moves the buffered image into a temp file and writes the
@@ -457,22 +506,29 @@ func (h *streamHandle) Release(ctx context.Context) error {
 	// stale remote rows while the freshest bytes exist only on this
 	// handle (read-your-writes across close).
 	pushErr := h.push(ctx)
-	if release {
+	if release && h.b != nil {
 		h.b.untrack(h)
 	}
 	inner, serr := h.session(ctx)
 	if serr != nil && pushErr == nil {
 		pushErr = serr
 	}
+	// Keep the passthrough backing readable for an outstanding
+	// claimReadHandle: the last reference releases it.
 	h.mu.Lock()
-	h.inner = nil
+	backing := h.inner
+	lastRef := h.refs <= 1
+	if lastRef {
+		h.inner = nil
+	}
 	h.mu.Unlock()
-	h.dropRef()
-	if inner != nil {
-		if err := inner.Release(ctx); err != nil && pushErr == nil {
+	if backing != nil && lastRef {
+		if err := backing.Release(ctx); err != nil && pushErr == nil {
 			pushErr = err
 		}
 	}
+	h.dropRef()
+	_ = inner
 	return pushErr
 }
 
