@@ -413,3 +413,44 @@ func TestPortFailedRenameRestoresTargetHandle(t *testing.T) {
 		t.Fatalf("/b = %q ok=%v, want AFTER (the failed rename must not anonymize it)", node.Data, ok)
 	}
 }
+
+// A snapshot closed by a rollback while a read is in flight must not panic:
+// readers keep the handle lock so Close waits, and the snapshot itself
+// answers EOF once closed.
+func TestPortAnonSnapshotCloseDuringReadIsSafe(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/x", []byte("HELLO-WORLD"))
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	c, err := New(client.New(ts.URL, ""), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	snap, err := c.captureAnonSnapshot(ctx, "/x", 11)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &SyncHandle{core: c, path: "/x", snap: snap}
+	snap.Close()
+	buf := make([]byte, 4)
+	if n, rerr := h.Read(ctx, 6, buf); n != 0 || rerr != nil {
+		t.Fatalf("read after close = %d, %v; want EOF", n, rerr)
+	}
+	// Concurrent close while reading repeatedly (no panic, no race).
+	snap2, err := c.captureAnonSnapshot(ctx, "/x", 11)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h2 := &SyncHandle{core: c, path: "/x", snap: snap2}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		small := make([]byte, 4)
+		for i := 0; i < 200; i++ {
+			_, _ = h2.Read(ctx, 2, small)
+		}
+	}()
+	snap2.Close()
+	<-done
+}

@@ -478,6 +478,12 @@ func (c *Cache) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 
 // Read implements fs.Handle.
 func (h *cachingHandle) Read(ctx context.Context, off int64, dest []byte) (int, error) {
+	// An ANONYMOUS fd (its name was unlinked or overwritten) reads a private
+	// snapshot of the OLD object: every tier below is path-keyed and would
+	// serve the replacement's pending/remote bytes, so bypass them all.
+	if a, ok := h.inner.(interface{ Anonymous() bool }); ok && a.Anonymous() {
+		return h.inner.Read(ctx, off, dest)
+	}
 	// One stable identity for the whole read (cache keys stay coherent
 	// across a concurrent retarget).
 	path := h.identity()

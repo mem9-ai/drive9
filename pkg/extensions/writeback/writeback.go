@@ -1585,6 +1585,15 @@ func (w *Writeback) KeepForgotten(path string) bool {
 	return w.queue != nil && w.queue.HasPath(path)
 }
 
+// Anonymous reports that the handle's name is gone/replaced and its bytes
+// come from a private snapshot: outer path-keyed caches must not answer for
+// it.
+func (h *bufferingHandle) Anonymous() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.unlinked
+}
+
 // Read implements fs.Handle.
 func (h *bufferingHandle) Read(ctx context.Context, off int64, dest []byte) (int, error) {
 	h.mu.Lock()

@@ -10,10 +10,13 @@ import (
 	"context"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 
 	"github.com/mem9-ai/drive9/internal/testbackend"
 	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/extensions/core"
+	"github.com/mem9-ai/drive9/pkg/extensions/writeback"
 	"github.com/mem9-ai/drive9/pkg/fs"
 )
 
@@ -267,4 +270,61 @@ func TestPortDiskHitPromotionFencesReset(t *testing.T) {
 	if !c.publishIfCurrent(c.epoch.Load(), func() { called = true }) || !called {
 		t.Fatal("current publication was refused")
 	}
+}
+
+// An anonymous fd bypasses the cache's path-keyed tiers: after a rename-over
+// the old target fd must read its OLD object, not the replacement's pending
+// image.
+func TestPortAnonymousFdBypassesPendingCache(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/a", []byte("HELLO"))
+	b.Seed("/b", []byte("OTHER"))
+	url := newTestServer(t, b)
+	cl := client.New(url, "")
+	c, err := New(Options{MaxSize: 1 << 20, MaxFileSize: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wb, err := writeback.New(writeback.Options{Policy: writeback.PolicyWriteBack, Client: cl})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := fs.NewChain(c, wb, terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	// The old target's read-only fd.
+	target, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/b", Flags: 0})
+	if err != nil || target.Handle == nil {
+		t.Fatalf("open target = %v", err)
+	}
+	// The source writer, kept open across the rename.
+	src, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/a", Flags: uint32(syscall.O_CREAT | syscall.O_RDWR)})
+	if err != nil || src.Handle == nil {
+		t.Fatalf("open source = %v", err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/a", Path2: "/b"}); err != nil {
+		t.Fatalf("rename = %v", err)
+	}
+	if err := src.Handle.Write(ctx, 0, []byte("FRESH")); err != nil {
+		t.Fatal(err)
+	}
+	if err := src.Handle.Flush(ctx); err != nil { // staged under the new name
+		t.Fatal(err)
+	}
+	buf := make([]byte, 16)
+	n, rerr := target.Handle.Read(ctx, 0, buf)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if got := string(buf[:n]); got != "OTHER" {
+		t.Fatalf("old target fd read %q, want the OLD object OTHER", got)
+	}
+	_ = src.Handle.Release(ctx)
+	_ = target.Handle.Release(ctx)
 }

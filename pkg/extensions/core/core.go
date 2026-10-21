@@ -488,16 +488,17 @@ type SyncHandle struct {
 // anonSnapshot is a bounded in-memory or temp-file image of an object whose
 // name is going away.
 type anonSnapshot struct {
-	mu   sync.Mutex
-	data []byte
-	file *os.File
-	size int64
+	mu     sync.Mutex
+	data   []byte
+	file   *os.File
+	size   int64
+	closed bool
 }
 
 func (s *anonSnapshot) ReadAt(p []byte, off int64) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if off < 0 || off >= s.size {
+	if s.closed || off < 0 || off >= s.size {
 		return 0, io.EOF
 	}
 	if s.file != nil {
@@ -536,6 +537,8 @@ func (s *anonSnapshot) WriteAt(off int64, p []byte) error {
 func (s *anonSnapshot) Close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.closed = true
+	s.size = 0
 	if s.file != nil {
 		_ = s.file.Close()
 		s.file = nil
@@ -582,6 +585,15 @@ func (h *SyncHandle) RetargetTo(newPath string) {
 	h.mu.Unlock()
 }
 
+// Anonymous reports that the handle's name is gone/replaced and its bytes
+// come from a private snapshot: outer path-keyed caches must not answer for
+// it.
+func (h *SyncHandle) Anonymous() bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.snap != nil
+}
+
 // Path returns the handle's current name.
 func (h *SyncHandle) Path() string {
 	h.mu.RLock()
@@ -593,14 +605,19 @@ func (h *SyncHandle) Path() string {
 func (h *SyncHandle) Read(ctx context.Context, off int64, dest []byte) (int, error) {
 	h.mu.RLock()
 	snap := h.snap
-	h.mu.RUnlock()
 	if snap != nil {
+		// Keep the read lock for the WHOLE snapshot read: a rollback closes
+		// the snapshot under the write lock, so Close cannot run between
+		// the pointer fetch and ReadAt (a closed snapshot used to panic on
+		// a non-zero offset).
+		defer h.mu.RUnlock()
 		n, err := snap.ReadAt(dest, off)
 		if err == io.EOF {
 			err = nil
 		}
 		return n, err
 	}
+	h.mu.RUnlock()
 	data, err := h.core.fetchRemote(ctx, h.core.remotePath(h.Path()), off, int64(len(dest)))
 	if err != nil {
 		return 0, h.core.mapErr(err)
