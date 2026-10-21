@@ -236,6 +236,52 @@ func (h *streamHandle) Read(ctx context.Context, off int64, dest []byte) (int, e
 	return n, nil
 }
 
+// captureReaderImage copies the bound object's bytes into the claim's own
+// spill so a surviving reader keeps the OLD object after the writer's
+// session is released (re-addressing the path would read a replacement).
+func (h *streamHandle) captureReaderImage(ctx context.Context, backing fs.Handle, size int64) error {
+	if size <= 0 {
+		if st, err := h.below.GetAttr(ctx, h.path); err == nil {
+			size = st.Size
+		}
+	}
+	if size <= 0 {
+		return nil
+	}
+	tmp, err := os.CreateTemp("", "drive9-bulk-read-*")
+	if err != nil {
+		return err
+	}
+	_ = os.Remove(tmp.Name())
+	for off := int64(0); off < size; {
+		chunk := int64(4 << 20)
+		if off+chunk > size {
+			chunk = size - off
+		}
+		part := make([]byte, chunk)
+		n, rerr := backing.Read(ctx, off, part)
+		if int64(n) != chunk || (rerr != nil && rerr != io.EOF) {
+			_ = tmp.Close()
+			return io.ErrUnexpectedEOF
+		}
+		if _, werr := tmp.WriteAt(part, off); werr != nil {
+			_ = tmp.Close()
+			return werr
+		}
+		off += chunk
+	}
+	h.mu.Lock()
+	if h.spill == nil {
+		h.spill, h.spillSize = tmp, size
+		// The claim's own image is authoritative for its readers now.
+		h.passthrough = false
+	} else {
+		_ = tmp.Close()
+	}
+	h.mu.Unlock()
+	return nil
+}
+
 // hasOwnImage reports whether the claim still holds readable bytes of its
 // own (image or spill).
 func (h *streamHandle) hasOwnImage() bool {
@@ -454,9 +500,18 @@ func (h *streamHandle) surrenderToBelow() {
 	h.passthrough = true
 	h.image = nil
 	h.dirty = false
+	old := h.inner
 	h.inner = nil // re-opened lazily at the CURRENT shared state
 	h.pushed = 0
 	h.mu.Unlock()
+	if old != nil {
+		// The replaced session is still tracked by the plane below (the
+		// writeback liveSet): dropping it without a Release left a ghost
+		// writer that later deferred a chmod onto a handle nobody closes.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		_ = old.Release(ctx)
+		cancel()
+	}
 	// The flushed write-plane handle below keeps serving its own landed
 	// buffer (read-your-writes prefers it), which would answer the
 	// original descriptor's reads with the pre-handoff image forever.
@@ -466,7 +521,9 @@ func (h *streamHandle) surrenderToBelow() {
 	// later rename must retarget it (untracking it here left the fd
 	// re-opening the OLD name — a surrendered fd recreated /a with its
 	// O_CREAT flags after /a had moved to /b).
-	h.b.untrackClaim(h)
+	if h.b != nil {
+		h.b.untrackClaim(h)
+	}
 }
 
 // session returns the below handle, opening it at the current path when a
@@ -559,9 +616,17 @@ func (h *streamHandle) Release(ctx context.Context) error {
 	// The write descriptor's close COMMITS: the below handle's Release is
 	// what submits the writeback snapshot, so it must run now — deferring
 	// it to the last claim reader left a closed file unpublished. Readers
-	// fall back to the claim's own image/spill (or a path read).
+	// get a BOUND copy of the object's bytes first (a path read would bind
+	// a same-name replacement).
 	h.mu.Lock()
 	backing := h.inner
+	needReaderImage := h.refs > 1 && backing != nil && h.passthrough
+	size := h.attrLocked().Size
+	h.mu.Unlock()
+	if needReaderImage {
+		_ = h.captureReaderImage(ctx, backing, size)
+	}
+	h.mu.Lock()
 	h.inner = nil
 	h.mu.Unlock()
 	released := map[fs.Handle]bool{}

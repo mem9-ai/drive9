@@ -442,3 +442,44 @@ func TestPortWriterCloseCommitsWithReaders(t *testing.T) {
 		t.Fatalf("backing released %d times, want exactly once", releaseN)
 	}
 }
+
+// A surviving reader keeps the OLD object after the writer's session is
+// released: the close captures a BOUND copy instead of re-addressing the
+// path (which now names a replacement).
+func TestPortReaderKeepsBoundObjectAtWriterClose(t *testing.T) {
+	inner := &fakeInnerHandle{data: []byte("OTHER")}
+	below := fs.HandlerFilesystem(func(ctx context.Context, op *fs.Op) (fs.Result, error) {
+		if op.Kind == fs.OpGetAttr {
+			return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Size: 5}}, nil
+		}
+		return fs.Result{Data: []byte("FRESH")}, nil
+	})
+	h := &streamHandle{inner: inner, below: below, passthrough: true, refs: 1, pushed: 5}
+	rh := &claimReadHandle{claim: h}
+	h.addRef()
+	ctx := context.Background()
+	if err := h.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 5)
+	if n, err := rh.Read(ctx, 0, buf); err != nil || string(buf[:n]) != "OTHER" {
+		t.Fatalf("reader after writer close = %q err=%v, want the OLD object OTHER", buf[:n], err)
+	}
+	if err := rh.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Surrender releases the replaced session instead of leaking it: a ghost
+// writer in the plane below deferred later chmods forever.
+func TestPortSurrenderReleasesOldSession(t *testing.T) {
+	inner := &fakeInnerHandle{data: []byte("OTHER")}
+	h := &streamHandle{inner: inner, refs: 1}
+	h.surrenderToBelow()
+	inner.releaseMu.Lock()
+	released := inner.releaseN
+	inner.releaseMu.Unlock()
+	if released != 1 {
+		t.Fatalf("surrender released the old session %d times, want 1", released)
+	}
+}
