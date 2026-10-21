@@ -174,11 +174,13 @@ type Writeback struct {
 	// snapshotUnlinkedRemoteToShadow).
 	unlinkedMu     sync.Mutex
 	unlinkedShadow map[string]struct{}
-	// unlinkedShadowGen fences each snapshot's drop by the shadow
-	// generation it captured: a re-created path stages new bytes at a new
-	// generation, and the old object's last-fd cleanup must not remove
-	// them (#918's replacement-detach, ported).
+	// unlinkedShadowGen is the CONTENT generation the snapshot captured:
+	// `RemoveIfGeneration` compares write generations, so the drop must use
+	// this value (not the pin token).
 	unlinkedShadowGen map[string]uint64
+	// unlinkedShadowPin is the shadow LIFECYCLE token returned by
+	// Shadow.Pin (pinned once per path; every snapshot shares it).
+	unlinkedShadowPin map[string]uint64
 	// lazy mirrors Options.LazyStaging; syncerCancel stops the background
 	// WAL syncer that bounds the lazy staging power-loss window.
 	lazy         bool
@@ -603,7 +605,16 @@ func (w *Writeback) MarkPathUnlinked(p string) {
 		if meta, ok := w.pendingMeta(p); ok && meta != nil {
 			if data, kok := readShadowGenerationFenced(w.opts.Staging.Shadow, p, meta.Size); kok {
 				if err := w.opts.Staging.Shadow.WriteFull(p, data, 0); err == nil {
-					w.recordUnlinkedSnapshot(p, w.opts.Staging.Shadow.ActiveGeneration(p))
+					contentGen := w.opts.Staging.Shadow.ActiveGeneration(p)
+					pin := uint64(0)
+					w.unlinkedMu.Lock()
+					if _, pinned := w.unlinkedShadowPin[p]; !pinned {
+						w.unlinkedMu.Unlock()
+						pin = w.opts.Staging.Shadow.Pin(p)
+					} else {
+						w.unlinkedMu.Unlock()
+					}
+					w.recordUnlinkedSnapshot(p, contentGen, pin)
 				}
 			}
 		}
@@ -2736,35 +2747,47 @@ func (w *Writeback) snapshotUnlinkedClean(h *bufferingHandle) {
 		return
 	}
 	size := h.baseSize
-	if size <= 0 || size > unlinkedSnapshotMaxBytes {
+	if size < 0 || size > unlinkedSnapshotMaxBytes {
 		return
 	}
-	buf := make([]byte, size)
-	ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
-	defer cancel()
-	n, err := h.inner.Read(ctx, 0, buf)
-	if err != nil || int64(n) != size {
+	buf := make([]byte, 0)
+	if size > 0 {
+		buf = make([]byte, size)
+		ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
+		defer cancel()
+		n, err := h.inner.Read(ctx, 0, buf)
+		if err != nil || int64(n) != size {
+			return
+		}
+	}
+	// Keep the bytes on the handle itself: the store reuses the per-path
+	// shadow file for the replacement, so a generation token can read the
+	// NEW file's bytes. This applies to writable fds too — their first
+	// buffer preload adopts the snapshot (see ensureBufferLocked).
+	h.mu.Lock()
+	if h.pendingImage == nil {
+		h.pendingImage = buf
+	}
+	h.mu.Unlock()
+	if size == 0 {
+		// An EMPTY image is authoritative (EOF), not "no snapshot": the
+		// marker alone is enough, and there is no shadow content to pin.
+		w.recordUnlinkedSnapshot(h.path, 0, 0)
 		return
 	}
 	if err := st.Shadow.WriteFull(h.path, buf, h.baseRev); err != nil {
 		return
 	}
-	// Keep the bytes on the handle too: the store reuses the per-path
-	// shadow file for the replacement's generation, so a generation token
-	// alone can read the NEW file's bytes. A read-only fd serves this
-	// memory copy; a writable fd keeps its buffer semantics.
-	if h.flags&uint32(syscall.O_ACCMODE) == uint32(syscall.O_RDONLY) {
-		h.mu.Lock()
-		if h.pendingImage == nil {
-			h.pendingImage = buf
-		}
-		h.mu.Unlock()
+	contentGen := st.Shadow.ActiveGeneration(h.path)
+	// Pin ONCE per path: every clean fd of the same name shares the
+	// snapshot, and a per-fd Pin leaked one reference per descriptor.
+	w.unlinkedMu.Lock()
+	pin, pinned := w.unlinkedShadowPin[h.path]
+	w.unlinkedMu.Unlock()
+	if !pinned {
+		pin = st.Shadow.Pin(h.path)
 	}
-	// Pin the snapshot: the name may be re-created (and its staging write
-	// a NEW generation at the same key) before the anonymous fd closes,
-	// and an unpinned generation is retired within the store.
-	gen := st.Shadow.Pin(h.path)
-	w.recordUnlinkedSnapshot(h.path, gen)
+	w.recordUnlinkedSnapshot(h.path, contentGen, pin)
 }
 
 // snapshotUnlinkedImage is the no-staging form of
@@ -2772,21 +2795,24 @@ func (w *Writeback) snapshotUnlinkedClean(h *bufferingHandle) {
 // handle itself, so a rename-over or unlink keeps serving the OLD object's
 // bytes without a shadow plane.
 func (w *Writeback) snapshotUnlinkedImage(h *bufferingHandle) {
-	if h.inner == nil || h.baseSize <= 0 || h.baseSize > unlinkedSnapshotMaxBytes {
+	if h.inner == nil || h.baseSize < 0 || h.baseSize > unlinkedSnapshotMaxBytes {
 		return
 	}
 	buf := make([]byte, h.baseSize)
-	ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
-	defer cancel()
-	n, err := h.inner.Read(ctx, 0, buf)
-	if err != nil || int64(n) != h.baseSize {
-		return
+	if h.baseSize > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
+		defer cancel()
+		n, err := h.inner.Read(ctx, 0, buf)
+		if err != nil || int64(n) != h.baseSize {
+			return
+		}
 	}
 	h.mu.Lock()
 	if h.pendingImage == nil {
 		h.pendingImage = buf
 	}
 	h.mu.Unlock()
+	w.recordUnlinkedSnapshot(h.path, 0, 0)
 }
 
 // settleRenamedHandle rebases the writers retargeted onto path onto the
@@ -2819,18 +2845,24 @@ func (w *Writeback) settleRenamedHandle(path string, rev, size int64) {
 // recordUnlinkedSnapshot installs the unlink-snapshot marker with the
 // shadow generation the snapshot captured, so a later drop only removes
 // bytes that are still the snapshot's own.
-func (w *Writeback) recordUnlinkedSnapshot(path string, gen uint64) {
+func (w *Writeback) recordUnlinkedSnapshot(path string, contentGen, pin uint64) {
 	w.unlinkedMu.Lock()
 	defer w.unlinkedMu.Unlock()
 	if w.unlinkedShadow == nil {
 		w.unlinkedShadow = map[string]struct{}{}
 	}
 	w.unlinkedShadow[path] = struct{}{}
-	if gen != 0 {
+	if contentGen != 0 {
 		if w.unlinkedShadowGen == nil {
 			w.unlinkedShadowGen = map[string]uint64{}
 		}
-		w.unlinkedShadowGen[path] = gen
+		w.unlinkedShadowGen[path] = contentGen
+	}
+	if pin != 0 {
+		if w.unlinkedShadowPin == nil {
+			w.unlinkedShadowPin = map[string]uint64{}
+		}
+		w.unlinkedShadowPin[path] = pin
 	}
 }
 
@@ -2856,29 +2888,30 @@ func (w *Writeback) unlinkedShadowServed(path string) bool {
 func (w *Writeback) dropUnlinkedShadow(path string) {
 	w.unlinkedMu.Lock()
 	delete(w.unlinkedShadow, path)
-	gen := w.unlinkedShadowGen[path]
+	contentGen := w.unlinkedShadowGen[path]
 	delete(w.unlinkedShadowGen, path)
+	pin := w.unlinkedShadowPin[path]
+	delete(w.unlinkedShadowPin, path)
 	w.unlinkedMu.Unlock()
 	if w.opts.Staging == nil {
 		return
 	}
-	if gen != 0 {
-		w.opts.Staging.Shadow.Unpin(gen)
+	// The pin token and the content generation are DIFFERENT values:
+	// Unpin takes the token, RemoveIfGeneration the content generation.
+	if pin != 0 {
+		w.opts.Staging.Shadow.Unpin(pin)
 	}
 	// Generation-fenced removal: when the path was re-created after the
 	// unlink, its new staging replaced the snapshot's generation, and the
 	// old object's cleanup must leave the new bytes for their own commit
 	// (a plain Remove here rejected the replacement's upload as a stale
-	// payload and terminally conflicted it).
-	if gen != 0 {
-		if w.opts.Staging.Shadow.RemoveIfGeneration(path, gen) {
-			return
-		}
-		// A newer generation owns the shadow now; the snapshot's bytes are
-		// gone with the overwrite — nothing of the old object remains.
+	// payload and terminally conflicted it). A zero content generation
+	// means nothing was ever written (empty snapshot): leave the store
+	// alone.
+	if contentGen == 0 {
 		return
 	}
-	w.opts.Staging.Shadow.Remove(path)
+	w.opts.Staging.Shadow.RemoveIfGeneration(path, contentGen)
 }
 
 // DrainPending reports undrained write-side work after a drain (v1
@@ -3445,6 +3478,19 @@ func (h *bufferingHandle) ensureBufferLocked(ctx context.Context) error {
 			h.buf = nil
 		}
 	}()
+	if h.pendingImage != nil {
+		// An anonymous fd's snapshot (read-only OR writable) is its base:
+		// a writable fd that had not written yet adopts the OLD object's
+		// image, so its first commit and reads compose on those bytes
+		// instead of the replacement that reused the name.
+		if _, err := h.buf.Write(0, h.pendingImage); err != nil {
+			return err
+		}
+		h.buf.ClearDirty()
+		h.baseLoaded = true
+		h.pendingImage = nil
+		return nil
+	}
 	if h.unlinked && h.w.opts.Staging != nil && h.w.unlinkedShadowServed(h.path) {
 		// v1 survivor: an anonymous fd's base is its unlink snapshot, not
 		// the deleted remote — post-unlink writes keep building on the

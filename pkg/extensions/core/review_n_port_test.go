@@ -211,3 +211,88 @@ func TestPortStale404DoesNotSeedNegativeCache(t *testing.T) {
 		t.Fatalf("HEAD count = %d, want the retried stat to revalidate", heads.Load())
 	}
 }
+
+// blockingNegativeCache pauses inside RecordRemoteNotFound so a reset can be
+// attempted mid-publication.
+type blockingNegativeCache struct {
+	inner   *dircache.DirCache
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (b *blockingNegativeCache) LookupNamespace(parent, name string) (fs.DirEntryInfo, fs.LookupKind) {
+	return b.inner.LookupNamespace(parent, name)
+}
+
+func (b *blockingNegativeCache) RecordRemoteNotFound(parent, name string) bool {
+	b.once.Do(func() { close(b.entered) })
+	<-b.release
+	return b.inner.RecordRemoteNotFound(parent, name)
+}
+
+// The negative-row publication and the view reset share one boundary: a
+// reset cannot sweep the cache between the epoch check and the insertion.
+func TestPortNegativePublishAtomicWithReset(t *testing.T) {
+	var heads atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead && strings.HasSuffix(r.URL.Path, "/f") {
+			if heads.Add(1) == 1 {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Length", "3")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "2")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(ts.Close)
+	bus := fs.NewEventBus()
+	c, err := New(client.New(ts.URL, ""), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.AttachEvents(bus)
+	bc := &blockingNegativeCache{
+		inner:   dircache.NewNamespaceCache(time.Minute, time.Minute, 0),
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	c.Attach(bc)
+	done := make(chan error, 1)
+	go func() {
+		_, derr := c.Do(context.Background(), &fs.Op{Kind: fs.OpGetAttr, Path: "/f"}, nil)
+		done <- derr
+	}()
+	<-bc.entered
+	resetDone := make(chan struct{})
+	go func() {
+		// The facade's checkout handler: bump the epoch AND sweep the
+		// namespace cache.
+		bus.Emit(fs.Event{Kind: fs.EventCheckout, Path: "/"})
+		bc.inner.InvalidateAll()
+		close(resetDone)
+	}()
+	select {
+	case <-resetDone:
+		t.Fatal("reset completed while the negative row was being published")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(bc.release)
+	if err := <-done; !fs.IsNotFound(err) {
+		t.Fatalf("stale 404 = %v, want not-found", err)
+	}
+	<-resetDone
+	if item, kind := bc.LookupNamespace("/", "f"); kind == fs.LookupNegative {
+		t.Fatalf("negative row survived the reset: %+v", item)
+	}
+	if _, err := c.Do(context.Background(), &fs.Op{Kind: fs.OpGetAttr, Path: "/f"}, nil); err != nil {
+		t.Fatalf("second stat = %v, want the new view's file", err)
+	}
+	if heads.Load() < 2 {
+		t.Fatalf("HEAD count = %d, want revalidation", heads.Load())
+	}
+}

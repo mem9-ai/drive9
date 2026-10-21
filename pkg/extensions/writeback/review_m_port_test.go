@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"net/http/httptest"
+	"syscall"
 	"testing"
 
 	"github.com/mem9-ai/drive9/internal/testbackend"
@@ -355,4 +356,129 @@ func TestPortDeferredUnlinkSnapshotSurvivesRecreate(t *testing.T) {
 		t.Fatalf("anonymous fd read %q after recreate, want HELLO", got)
 	}
 	_ = res.Handle.Release(ctx)
+}
+
+// A single open→unlink→release cycle must retire the snapshot: the drop
+// has to unpin with the LIFECYCLE token and remove by the CONTENT
+// generation (they are different values).
+func TestPortUnlinkSnapshotRetiresCleanly(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/a", []byte("HELLO"))
+	ch, wb := newStagedStack(t, PolicyWriteBack, b)
+	ctx := context.Background()
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/a", Flags: 0})
+	if err != nil || res.Handle == nil {
+		t.Fatalf("open = %v", err)
+	}
+	wb.MarkPathUnlinked("/a")
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/a"}); err != nil && !fs.IsNotFound(err) {
+		t.Fatalf("unlink = %v", err)
+	}
+	if err := res.Handle.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if wb.opts.Staging.Shadow.Has("/a") {
+		t.Fatal("snapshot shadow survived the last close")
+	}
+	if wb.opts.Staging.Shadow.Has("/a") {
+		t.Fatal("snapshot shadow still present")
+	}
+}
+
+// Two clean fds of the same name share ONE snapshot pin: the last close
+// retires it without leaking a reference.
+func TestPortUnlinkSnapshotSharedPinRetires(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/a", []byte("HELLO"))
+	ch, wb := newStagedStack(t, PolicyWriteBack, b)
+	ctx := context.Background()
+	open := func() fs.Handle {
+		r, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/a", Flags: 0})
+		if err != nil || r.Handle == nil {
+			t.Fatalf("open = %v", err)
+		}
+		return r.Handle
+	}
+	h1, h2 := open(), open()
+	wb.MarkPathUnlinked("/a")
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/a"}); err != nil && !fs.IsNotFound(err) {
+		t.Fatalf("unlink = %v", err)
+	}
+	if err := h1.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := h2.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if wb.opts.Staging.Shadow.Has("/a") {
+		t.Fatal("snapshot shadow survived the last close of two fds")
+	}
+}
+
+// An EMPTY overwritten target is an authoritative empty image, not "no
+// snapshot".
+func TestPortRenameOverEmptyTargetServesEOF(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/a", []byte("HELLO"))
+	b.Seed("/b", []byte{})
+	ch, _, _ := newWriteCacheStack(t, PolicyWriteBack, b)
+	ctx := context.Background()
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/b", Flags: 0})
+	if err != nil || res.Handle == nil {
+		t.Fatalf("open target = %v", err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/a", Path2: "/b"}); err != nil {
+		t.Fatalf("rename = %v", err)
+	}
+	buf := make([]byte, 16)
+	n, err := res.Handle.Read(ctx, 0, buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("empty overwritten target read %d bytes (%q), want EOF", n, buf[:n])
+	}
+	_ = res.Handle.Release(ctx)
+}
+
+// A writable anonymous fd (no buffer yet) keeps the OLD object's image for
+// reads and for its first buffer preload.
+func TestPortWritableAnonymousFdKeepsOldImage(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/a", []byte("HELLO"))
+	ch, wb := newStagedStack(t, PolicyWriteBack, b)
+	ctx := context.Background()
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/a", Flags: uint32(syscall.O_RDWR)})
+	if err != nil || res.Handle == nil {
+		t.Fatalf("open = %v", err)
+	}
+	wb.MarkPathUnlinked("/a")
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/a"}); err != nil && !fs.IsNotFound(err) {
+		t.Fatalf("unlink = %v", err)
+	}
+	h2 := open(t, ch, "/a")
+	if err := h2.Write(ctx, 0, []byte("FRESH")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h2.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := h2.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 16)
+	n, err := res.Handle.Read(ctx, 0, buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(buf[:n]); got != "HELLO" {
+		t.Fatalf("writable anonymous fd read %q, want HELLO", got)
+	}
+	// Its first write composes on the old image (discarded anonymously).
+	if err := res.Handle.Write(ctx, 5, []byte("!")); err != nil {
+		t.Fatal(err)
+	}
+	if err := res.Handle.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
 }

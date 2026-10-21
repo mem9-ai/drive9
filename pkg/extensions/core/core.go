@@ -129,7 +129,17 @@ type Core struct {
 	// reconnect). A stat dispatched before the reset must not publish its
 	// negative row into the namespace cache — the facade's reply fence
 	// comes too late, the pollution survives and hides the new view's file.
+	// viewMu makes the epoch check and the negative publication atomic
+	// against the reset (a plain Load left a window where the old 404
+	// re-seeded the row after the sweep).
 	viewEpoch atomic.Uint64
+	viewMu    sync.RWMutex
+
+	// moveMu serializes a remote namespace move with terminal writes: a
+	// write holds the read side for its WHOLE commit (the per-handle lock
+	// alone only protects the retarget that follows the move), and the
+	// rename holds the write side across the remote call + retarget.
+	moveMu sync.RWMutex
 
 	// syncHandles tracks terminal handles so a rename can retarget them:
 	// without it a core-only chain (no writeback) left an open fd on the
@@ -205,7 +215,11 @@ func New(cl *client.Client, opts Options) (*Core, error) {
 func (c *Core) AttachEvents(bus *fs.EventBus) {
 	c.bus = bus
 	if bus != nil {
-		bus.On(fs.EventCheckout, func(fs.Event) { c.viewEpoch.Add(1) })
+		bus.On(fs.EventCheckout, func(fs.Event) {
+			c.viewMu.Lock()
+			c.viewEpoch.Add(1)
+			c.viewMu.Unlock()
+		})
 	}
 }
 
@@ -304,13 +318,19 @@ func (c *Core) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, erro
 		}
 		return fs.Result{}, nil
 	case fs.OpRename:
-		if err := c.renameRemote(ctx, op.Path, op.Path2); err != nil {
+		// The move and the retarget are ONE boundary with terminal writes:
+		// an in-flight commit finishes against the old name first (the
+		// rename then carries its data), and a write starting after the
+		// move sees the new path.
+		c.moveMu.Lock()
+		err := c.renameRemote(ctx, op.Path, op.Path2)
+		if err == nil {
+			c.retargetSyncHandles(op.Path, op.Path2)
+		}
+		c.moveMu.Unlock()
+		if err != nil {
 			return fs.Result{}, c.mapErr(err)
 		}
-		// Open terminal handles follow the name: a core-only chain has no
-		// writeback retarget hook, and a stale handle would write the old
-		// path back into existence.
-		c.retargetSyncHandles(op.Path, op.Path2)
 		return fs.Result{}, nil
 	case fs.OpSymlink:
 		if err := c.symlinkRemote(ctx, op.Target, op.Path); err != nil {
@@ -495,6 +515,11 @@ func (h *SyncHandle) Read(ctx context.Context, off int64, dest []byte) (int, err
 // one. Without it a write paused mid-PUT resumed after the rename and
 // recreated the old name from its retry.
 func (h *SyncHandle) Write(ctx context.Context, off int64, data []byte) error {
+	// Lock order: moveMu -> h.mu (the rename takes moveMu.Lock then the
+	// handle lock in RetargetTo). A rename therefore waits for this whole
+	// commit; a write starting after it reads the already-retargeted path.
+	h.core.moveMu.RLock()
+	defer h.core.moveMu.RUnlock()
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.core.WriteSync(ctx, h.path, off, data, 0)
@@ -563,13 +588,20 @@ func (c *Core) statOp(ctx context.Context, path string) (fs.Result, error) {
 			// v1 cacheRemoteNotFoundPath: a remote-observed miss seeds a
 			// short-lived negative row (the storm escalation rides along;
 			// lock files never seed).
+			// The check and the row insertion share the reset's write
+			// side: a reset that already swept the cache blocks here until
+			// the publish finishes (and the publish sees the new epoch), so
+			// a superseded 404 can never re-seed the cleared cache.
+			c.viewMu.RLock()
 			if c.viewEpoch.Load() != epoch {
+				c.viewMu.RUnlock()
 				// The 404 belongs to a view a reset replaced: seeding the
 				// negative row would hide the new view's file for its TTL
 				// (the facade's generation fence only rejects the reply, not
 				// this cache write).
 				return fs.Result{}, fs.ErrNotFound
 			}
+			defer c.viewMu.RUnlock()
 			if rec, ok := c.dirCache.(interface {
 				RecordRemoteNotFound(parent, name string) bool
 			}); ok {
