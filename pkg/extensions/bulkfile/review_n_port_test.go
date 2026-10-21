@@ -165,3 +165,48 @@ func TestPortBulkfileForwardsAnonymous(t *testing.T) {
 		t.Fatal("streamHandle dropped the Anonymous identity")
 	}
 }
+
+// An unlinked claim's large/sparse write spills instead of allocating the
+// hole, and the image stays readable.
+func TestPortUnlinkedClaimSpillsSparseWrite(t *testing.T) {
+	h := &streamHandle{unlinked: true}
+	ctx := context.Background()
+	if err := h.Write(ctx, 0, []byte("HELLO")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Write(ctx, 128<<20, []byte("Z")); err != nil {
+		t.Fatalf("sparse write = %v", err)
+	}
+	h.mu.Lock()
+	spilled := h.spill != nil && h.image == nil
+	size := h.spillSize
+	h.mu.Unlock()
+	if !spilled {
+		t.Fatal("sparse unlinked write kept the whole image in memory")
+	}
+	if size != 128<<20+1 {
+		t.Fatalf("image size = %d, want %d", size, 128<<20+1)
+	}
+	buf := make([]byte, 5)
+	if n, err := h.Read(ctx, 0, buf); err != nil || string(buf[:n]) != "HELLO" {
+		t.Fatalf("head read = %q err=%v", buf[:n], err)
+	}
+	one := make([]byte, 1)
+	if n, err := h.Read(ctx, 128<<20, one); err != nil || n != 1 || one[0] != 'Z' {
+		t.Fatalf("tail read = %q err=%v", one[:n], err)
+	}
+	h.mu.Lock()
+	if h.spill != nil {
+		_ = h.spill.Close()
+	}
+	h.mu.Unlock()
+}
+
+// A read-only claim re-open forwards the anonymous identity.
+func TestPortClaimReadHandleForwardsAnonymous(t *testing.T) {
+	claim := &streamHandle{unlinked: true}
+	rh := &claimReadHandle{claim: claim}
+	if !rh.Anonymous() {
+		t.Fatal("claimReadHandle dropped the Anonymous identity")
+	}
+}

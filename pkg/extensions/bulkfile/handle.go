@@ -2,6 +2,8 @@ package bulkfile
 
 import (
 	"context"
+	"io"
+	"os"
 	"sync"
 	"syscall"
 
@@ -17,8 +19,12 @@ type streamHandle struct {
 	below     fs.Filesystem
 	openFlags uint32 // claim flags for re-opening the session below after a rename
 
-	mu          sync.Mutex
-	image       []byte
+	mu    sync.Mutex
+	image []byte
+	// spill backs an unlinked claim's image once it exceeds the memory
+	// bound: a sparse/multi-GiB offset must not allocate the whole hole.
+	spill       *os.File
+	spillSize   int64
 	mode        uint32
 	pushed      int64 // image size already expressed below; a shorter image needs a truncation
 	dirty       bool  // image differs from the state expressed below
@@ -126,8 +132,12 @@ func (h *streamHandle) applyAttr(ctx context.Context, op *fs.Op) (fs.Attr, error
 // bulk claim wrapper.
 func (h *streamHandle) Anonymous() bool {
 	h.mu.Lock()
+	unlinked := h.unlinked
 	inner := h.inner
 	h.mu.Unlock()
+	if unlinked {
+		return true
+	}
 	if a, ok := inner.(interface{ Anonymous() bool }); ok {
 		return a.Anonymous()
 	}
@@ -147,11 +157,52 @@ func (h *streamHandle) Read(ctx context.Context, off int64, dest []byte) (int, e
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.spill != nil {
+		if off < 0 || off >= h.spillSize {
+			return 0, nil
+		}
+		if want := h.spillSize - off; int64(len(dest)) > want {
+			dest = dest[:want]
+		}
+		n, rerr := h.spill.ReadAt(dest, off)
+		if rerr == io.EOF {
+			rerr = nil
+		}
+		return n, rerr
+	}
 	if off >= int64(len(h.image)) {
 		return 0, nil
 	}
 	n := copy(dest, h.image[off:])
 	return n, nil
+}
+
+// spillImageLocked moves the buffered image into a temp file and writes the
+// new range there. The caller holds h.mu.
+func (h *streamHandle) spillImageLocked(off int64, data []byte, end int64) error {
+	if h.spill == nil {
+		tmp, err := os.CreateTemp("", "drive9-bulk-anon-*")
+		if err != nil {
+			return err
+		}
+		_ = os.Remove(tmp.Name())
+		if len(h.image) > 0 {
+			if _, werr := tmp.WriteAt(h.image, 0); werr != nil {
+				_ = tmp.Close()
+				return werr
+			}
+		}
+		h.spill = tmp
+		h.spillSize = int64(len(h.image))
+		h.image = nil
+	}
+	if _, err := h.spill.WriteAt(data, off); err != nil {
+		return err
+	}
+	if end > h.spillSize {
+		h.spillSize = end
+	}
+	return nil
 }
 
 func (h *streamHandle) Write(ctx context.Context, off int64, data []byte) error {
@@ -175,8 +226,18 @@ func (h *streamHandle) Write(ctx context.Context, off int64, data []byte) error 
 		}
 		return inner.Write(ctx, off, data)
 	}
-	// An unlinked claim has nowhere to forward: the below plane holds no
-	// entry, so the stream stays buffered regardless of the bound.
+	// An unlinked claim has nowhere to forward. Small images stay in memory
+	// (bounded); a large/sparse one spills to a temp file so a multi-GiB
+	// offset cannot allocate the whole hole on the heap.
+	if h.unlinked && end > bulkfileMaxBufferedBytes {
+		if err := h.spillImageLocked(off, data, end); err != nil {
+			h.mu.Unlock()
+			return err
+		}
+		h.dirty = true
+		h.mu.Unlock()
+		return nil
+	}
 	if h.unlinked || end <= bulkfileMaxBufferedBytes {
 		switch {
 		case off == int64(len(h.image)):
@@ -367,6 +428,10 @@ func (h *streamHandle) Release(ctx context.Context) error {
 	}
 	h.mu.Lock()
 	h.inner = nil
+	if h.spill != nil {
+		_ = h.spill.Close()
+		h.spill = nil
+	}
 	h.mu.Unlock()
 	if inner != nil {
 		if err := inner.Release(ctx); err != nil && pushErr == nil {
@@ -383,6 +448,9 @@ func (h *streamHandle) attrLocked() fs.Attr {
 		mode = 0o644
 	}
 	size := int64(len(h.image))
+	if h.spill != nil {
+		size = h.spillSize
+	}
 	if h.passthrough && h.image == nil {
 		// The stream lives in the plane below now: the authoritative size
 		// is the pushed one (the emptied image would answer 0, and the
@@ -410,11 +478,22 @@ type claimReadHandle struct {
 	claim *streamHandle
 }
 
+// Anonymous forwards the claim's anonymous identity: an outer path-keyed
+// cache must bypass for a read-only re-open of an unlinked/overwritten
+// object.
+func (c *claimReadHandle) Anonymous() bool {
+	return c.claim.Anonymous()
+}
+
 func (c *claimReadHandle) Read(ctx context.Context, off int64, dest []byte) (int, error) {
 	c.claim.mu.Lock()
 	image := c.claim.image
+	spill := c.claim.spill
 	passthrough := c.claim.passthrough
 	c.claim.mu.Unlock()
+	if spill != nil {
+		return c.claim.Read(ctx, off, dest)
+	}
 	if passthrough {
 		// The claim handed its stream to the plane below (the bounded
 		// forward); the pending bytes now live there, and the emptied

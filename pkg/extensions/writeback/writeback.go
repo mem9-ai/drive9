@@ -1329,17 +1329,18 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		// were reading: mark them anonymous BEFORE the remote rename (their
 		// clean images are snapshotted for post-overwrite reads), or they
 		// keep reading /b and silently see the source's bytes.
-		if serr := w.markUnlinkedSnapshot(op.Path2, false); serr != nil {
+		marked, serr := w.markUnlinkedSnapshot(op.Path2, false)
+		if serr != nil {
 			// The overwritten target's descriptors have no read source:
 			// abort instead of switching them to the source's bytes.
-			w.markLinked(op.Path2, false)
+			restoreMarked(marked)
 			return fs.Result{}, serr
 		}
 		res, err := next(ctx, op)
 		if err != nil {
 			// The rename failed: the target's descriptors are still bound
 			// to its object, so restore their writable/visible state.
-			w.markLinked(op.Path2, false)
+			restoreMarked(marked)
 			return res, err
 		}
 		w.forgetLanded(op.Path)
@@ -2757,7 +2758,18 @@ const unlinkedSnapshotMaxBytes = 64 << 20
 // so Release cannot resurrect the path. Per-handle, so a re-created p stays
 // committable by its new writer (fh.Unlinked).
 func (w *Writeback) markUnlinked(p string, under bool) {
-	_ = w.markUnlinkedSnapshot(p, under)
+	_, _ = w.markUnlinkedSnapshot(p, under)
+}
+
+// restoreMarked revives only the handles THIS operation marked: a previously
+// anonymous descriptor that was already serving another object's snapshot
+// must stay anonymous.
+func restoreMarked(marked []*bufferingHandle) {
+	for _, h := range marked {
+		h.mu.Lock()
+		h.unlinked = false
+		h.mu.Unlock()
+	}
 }
 
 // markUnlinkedSnapshot marks the descriptors anonymous and snapshots their
@@ -2765,14 +2777,18 @@ func (w *Writeback) markUnlinked(p string, under bool) {
 // about to replace the name (rename-over) must use the error to abort and
 // roll back: otherwise the descriptors silently switch to the replacement's
 // bytes.
-func (w *Writeback) markUnlinkedSnapshot(p string, under bool) error {
+func (w *Writeback) markUnlinkedSnapshot(p string, under bool) ([]*bufferingHandle, error) {
 	prefix := strings.TrimSuffix(p, "/") + "/"
-	var clean []*bufferingHandle
+	var clean, marked []*bufferingHandle
 	w.liveSet.Range(func(key, _ any) bool {
 		h := key.(*bufferingHandle)
 		h.mu.Lock()
-		if h.path == p || (under && strings.HasPrefix(h.path, prefix)) {
+		// A descriptor that is ALREADY anonymous serves another object's
+		// snapshot: it must not be re-marked (and its stale, shorter
+		// snapshot must not make this operation's target look read-only).
+		if (h.path == p || (under && strings.HasPrefix(h.path, prefix))) && !h.unlinked {
 			h.unlinked = true
+			marked = append(marked, h)
 			if h.buf == nil && !h.isNew && !h.dirty {
 				clean = append(clean, h)
 			}
@@ -2797,7 +2813,7 @@ func (w *Writeback) markUnlinkedSnapshot(p string, under bool) error {
 			firstErr = err
 		}
 	}
-	return firstErr
+	return marked, firstErr
 }
 
 // liveObjectSize is the size the snapshot must capture: the staged image

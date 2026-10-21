@@ -620,3 +620,50 @@ func TestPortLargeAnonymousSnapshotLoadsLazily(t *testing.T) {
 	}
 	_ = res.Handle.Release(ctx)
 }
+
+// An old anonymous fd (from a PREVIOUS overwrite) must not be captured again:
+// its stale, shorter snapshot made an unrelated rename read the new target's
+// size from a different version and fail with EIO.
+func TestPortRenameSkipsAlreadyAnonymousTargets(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/a", []byte("HELLO"))
+	b.Seed("/b", []byte("OTHER"))
+	b.Seed("/c", []byte("CEE"))
+	ch, wb, _ := newWriteCacheStack(t, PolicyWriteBack, b)
+	ctx := context.Background()
+	oldTarget, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/b", Flags: 0})
+	if err != nil || oldTarget.Handle == nil {
+		t.Fatalf("open target = %v", err)
+	}
+	// First overwrite: the old /b fd becomes anonymous.
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/a", Path2: "/b"}); err != nil {
+		t.Fatalf("first rename = %v", err)
+	}
+	// A NEW fd grows the current /b and lands it.
+	h2 := open(t, ch, "/b")
+	if err := h2.Write(ctx, 0, []byte("LONGER-OBJECT")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h2.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := h2.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := wb.Drain(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// A second overwrite must NOT try to snapshot the anonymous old fd.
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/c", Path2: "/b"}); err != nil {
+		t.Fatalf("second rename = %v (the anonymous old fd was re-captured)", err)
+	}
+	buf := make([]byte, 16)
+	n, rerr := oldTarget.Handle.Read(ctx, 0, buf)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if got := string(buf[:n]); got != "OTHER" {
+		t.Fatalf("old anonymous fd read %q, want OTHER", got)
+	}
+	_ = oldTarget.Handle.Release(ctx)
+}
