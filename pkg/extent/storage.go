@@ -8,6 +8,7 @@ import (
 	"math/rand/v2"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -194,6 +195,53 @@ func resolveRegionalEndpoint(region string) string {
 	return strings.TrimRight(ep.URI.String(), "/")
 }
 
+// awsStandardEndpointHost matches the plain S3 endpoints the region resolver
+// generates: s3.<region>.amazonaws.com[.cn], the China/eusc suffixes, the legacy
+// s3-<region> spelling, and the bare global s3.amazonaws.com. Deliberately not
+// matched: dual-stack, FIPS, S3 Express, VPC and custom hosts, whose addressing
+// the region resolver would not reproduce.
+var awsStandardEndpointHost = regexp.MustCompile(`^s3(?:[.-][a-z0-9-]+)?\.amazonaws\.(?:com|com\.cn|eu)$`)
+
+// isStandardAWSEndpoint reports whether raw is a plain AWS S3 regional endpoint
+// (including the legacy global one). Such an endpoint carries no information
+// beyond its region, so it must not outvote the region the credential was minted
+// for: JuiceFS parses the signer region out of the host before it reads
+// AWS_REGION, and a stale global host would make a us-west-2 filesystem sign for
+// us-east-1 again.
+func isStandardAWSEndpoint(raw string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Host == "" {
+		return false
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return false
+	}
+	if u.Port() != "" || u.RawQuery != "" || (u.Path != "" && u.Path != "/") {
+		return false
+	}
+	return awsStandardEndpointHost.MatchString(u.Hostname())
+}
+
+// s3EndpointForCredential picks the endpoint to hand JuiceFS: the credential's
+// own endpoint unless it is empty or a plain AWS regional endpoint, in which
+// case the endpoint resolved from the credential's region wins. Custom,
+// dual-stack, FIPS and VPC hosts are preserved.
+func s3EndpointForCredential(endpoint, region string) string {
+	endpoint = strings.TrimSpace(endpoint)
+	region = strings.TrimSpace(region)
+	if region == "" {
+		return endpoint
+	}
+	resolved := resolveRegionalEndpoint(region)
+	if resolved == "" {
+		return endpoint
+	}
+	if endpoint == "" || isStandardAWSEndpoint(endpoint) {
+		return resolved
+	}
+	return endpoint
+}
+
 // createS3Storage builds the JuiceFS s3 storage for one credential. JuiceFS
 // picks path style vs virtual-host style from JFS_S3_VHOST_STYLE alone and
 // reads it once while constructing the SDK client, so the variable is set for
@@ -274,14 +322,14 @@ func openInner(cred *Credential, src CredentialSource) (object.ObjectStorage, er
 		}
 		return st, st.Create(context.Background())
 	case SchemeS3:
-		ep := strings.TrimSpace(cred.Endpoint)
-		if ep == "" {
-			// No endpoint in the credential: derive the regional one from the
-			// minted region instead of letting JuiceFS call GetBucketLocation
-			// (which the tenant-prefix session policy does not allow).
-			ep = resolveRegionalEndpoint(cred.Region)
-		}
-		ep = endpointWithBucket(ep, cred.Bucket)
+		// The minted region is authoritative over a plain AWS endpoint: JuiceFS
+		// parses the signer region out of such a host before it reads
+		// AWS_REGION, so a stale global or wrong-region endpoint would sign for
+		// the wrong region again. An endpoint-less credential gets the region's
+		// endpoint instead of a GetBucketLocation call, which the tenant-prefix
+		// session policy does not grant. Custom/dual-stack/FIPS/VPC endpoints are
+		// preserved.
+		ep := endpointWithBucket(s3EndpointForCredential(cred.Endpoint, cred.Region), cred.Bucket)
 		return createS3Storage(ep, cred.AccessKeyID, cred.SecretAccessKey, cred.SessionToken, cred.Region, cred.ForcePathStyle)
 	case SchemeGCS:
 		// canonicalExtentScheme folds the object-backend/objectfs "gs" spelling

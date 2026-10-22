@@ -28,6 +28,9 @@ func TestResolveRegionalEndpoint(t *testing.T) {
 
 func TestWithS3EnvScopesRegionAndRestores(t *testing.T) {
 	t.Setenv("AWS_REGION", "eu-west-1")
+	// t.Setenv first so the framework restores whatever the process had, even
+	// though the test itself needs the variable unset.
+	t.Setenv("AWS_DEFAULT_REGION", "")
 	if err := os.Unsetenv("AWS_DEFAULT_REGION"); err != nil {
 		t.Fatal(err)
 	}
@@ -96,11 +99,46 @@ func TestS3StorageSignsWithCredentialRegion(t *testing.T) {
 	}
 }
 
+// TestS3EndpointForCredential pins which endpoint the mount hands JuiceFS: the
+// credential's region must win over a plain AWS host (the legacy global
+// endpoint is exactly the incident this guards against), while endpoints whose
+// addressing the region resolver would not reproduce are preserved.
+func TestS3EndpointForCredential(t *testing.T) {
+	for _, tc := range []struct{ name, endpoint, region, want string }{
+		{"no endpoint uses the region", "", "us-west-2", "https://s3.us-west-2.amazonaws.com"},
+		{"legacy global endpoint yields to the region", "https://s3.amazonaws.com", "us-west-2", "https://s3.us-west-2.amazonaws.com"},
+		{"wrong regional endpoint yields to the region", "https://s3.us-east-1.amazonaws.com", "us-west-2", "https://s3.us-west-2.amazonaws.com"},
+		{"legacy hyphen spelling yields to the region", "https://s3-us-east-1.amazonaws.com", "us-west-2", "https://s3.us-west-2.amazonaws.com"},
+		{"trailing slash is still the standard host", "https://s3.amazonaws.com/", "us-west-2", "https://s3.us-west-2.amazonaws.com"},
+		{"endpoint with a bucket path is kept", "https://s3.us-west-2.amazonaws.com/bucket", "us-west-2", "https://s3.us-west-2.amazonaws.com/bucket"},
+		{"compatible endpoint is kept", "https://minio.example:9000", "us-west-2", "https://minio.example:9000"},
+		{"dual-stack endpoint is kept", "https://s3.dualstack.us-east-1.amazonaws.com", "us-west-2", "https://s3.dualstack.us-east-1.amazonaws.com"},
+		{"fips endpoint is kept", "https://s3-fips.us-east-1.amazonaws.com", "us-west-2", "https://s3-fips.us-east-1.amazonaws.com"},
+		{"no region keeps the endpoint", "https://s3.amazonaws.com", "", "https://s3.amazonaws.com"},
+		{"no region and no endpoint stays empty", "", "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := s3EndpointForCredential(tc.endpoint, tc.region); got != tc.want {
+				t.Fatalf("s3EndpointForCredential(%q, %q) = %q, want %q", tc.endpoint, tc.region, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestOpenStorageDerivesEndpointFromRegion proves a credential that carries no
 // endpoint but does carry a region still opens: the client resolves the
 // regional endpoint itself instead of making JuiceFS call GetBucketLocation,
 // which the minted session policy does not grant.
 func TestOpenStorageDerivesEndpointFromRegion(t *testing.T) {
+	// The mount runs with the operator's environment: isolate the AWS knobs so
+	// the "did construction leak?" assertions are meaningful, and let t.Setenv
+	// restore whatever the runner had.
+	for _, k := range append([]string{jfsS3VHostStyleEnv}, jfsS3RegionEnvs...) {
+		t.Setenv(k, "")
+		if err := os.Unsetenv(k); err != nil {
+			t.Fatal(err)
+		}
+	}
 	st, err := OpenStorage(&Credential{
 		Scheme:          SchemeS3,
 		Bucket:          "drive9-local",
@@ -116,10 +154,9 @@ func TestOpenStorageDerivesEndpointFromRegion(t *testing.T) {
 	if st == nil {
 		t.Fatal("storage = nil")
 	}
-	if _, ok := os.LookupEnv("AWS_REGION"); ok {
-		t.Fatal("AWS_REGION leaked into the process")
-	}
-	if _, ok := os.LookupEnv(jfsS3VHostStyleEnv); ok {
-		t.Fatal("JFS_S3_VHOST_STYLE leaked into the process")
+	for _, k := range append([]string{jfsS3VHostStyleEnv}, jfsS3RegionEnvs...) {
+		if _, ok := os.LookupEnv(k); ok {
+			t.Fatalf("%s leaked into the process", k)
+		}
 	}
 }
