@@ -641,7 +641,7 @@ func (h *cachingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 		// last block smaller than the request buffer) cannot lock the file
 		// out of the caches. The disk tier below the mem tier survives the
 		// mem TTL/eviction, serving warm re-reads across mounts.
-		if data, ok := h.cache.mem.Get(path, h.rev); ok {
+		if data, ok := h.cache.mem.Get(path, rev); ok {
 			h.cache.noteHit("read", true)
 			return copyReadRange(dest, data, off), nil
 		}
