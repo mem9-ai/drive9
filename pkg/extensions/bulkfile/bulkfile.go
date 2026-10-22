@@ -467,8 +467,19 @@ func (b *Bulkfile) prepareUnlinkSurvivors(ctx context.Context, p string, under b
 		if err != nil || inner == nil {
 			continue
 		}
+		// Bind the session to the claim even when its WRITE fd already
+		// closed: the surviving readers are the reason this survivor set
+		// exists, and `session()` refuses to store for a released handle.
+		h.mu.Lock()
+		if h.inner == nil {
+			h.inner = inner
+		}
+		h.mu.Unlock()
 		st, serr := b.cl.StatCtx(ctx, b.remotePath(h.path))
 		if serr != nil || st == nil || st.Size > bulkfileMaxBufferedBytes {
+			// Beyond the buffered bound the bound SESSION is the reader's
+			// backing (the below plane marks it anonymous on unlink); a
+			// path re-open after the delete would bind the replacement.
 			continue
 		}
 		snapshot := make([]byte, st.Size)

@@ -210,15 +210,18 @@ func New(opts Options) (*Cache, error) {
 		})
 		opts.Events.On(fs.EventLanded, func(e fs.Event) {
 			// A local commit settle (onCommitQueueSuccess /
-			// onWriteBackUploadSuccess) updates the committed entry in
-			// place — seeded the read cache with the committed image
-			// and never invalidated on local commits. A rev-keyed seed
-			// supersedes the old image on its own (a mismatched-rev Get
-			// evicts), so only unknown-revision commits conservatively
-			// drop the path.
-			if e.Rev <= 0 {
-				c.mem.Invalidate(e.Path)
+			// onWriteBackUploadSuccess) replaces the file's image. Same
+			// path readers still hold their OPEN-TIME revision, so the
+			// previous disk blocks look current to them (a sibling fsync
+			// made a reader fall back from the writer's bytes to the old
+			// image). Revoke the path's cached identity and blocks; the
+			// seeder/plane below serves the committed bytes.
+			if e.Path == "/" || e.Path == "" {
+				c.invalidateAllTiers()
+				return
 			}
+			c.invalidatePathTiers(e.Path)
+			c.mem.Invalidate(e.Path)
 		})
 	}
 	return c, nil
@@ -595,10 +598,14 @@ func (h *cachingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 	// the inner plane serve its own staged bytes. The same applies while
 	// the path has local write state — its authoritative image is staging,
 	// not the remote revision this handle pinned.
+	// ONE identity snapshot for the whole read: an invalidation can clear
+	// or replace size/rev concurrently, and mixing values from before and
+	// after (length, revision key, whole-image test) split one read across
+	// two images.
 	h.mu.Lock()
-	grown := h.grown
+	size, rev, grown := h.size, h.rev, h.grown
 	h.mu.Unlock()
-	if h.rev > 0 && h.size > 0 && h.size <= h.cache.mem.MaxFileSize() && !grown && !h.cache.dirs.hasLocalWriteState(path) && !h.cache.sqliteBypassStableCaches(path) {
+	if rev > 0 && size > 0 && size <= h.cache.mem.MaxFileSize() && !grown && !h.cache.dirs.hasLocalWriteState(path) && !h.cache.sqliteBypassStableCaches(path) {
 		// v1 small-file tier: any offset slices one whole-file image; a
 		// miss fetches the WHOLE file so a short final read (the kernel's
 		// last block smaller than the request buffer) cannot lock the file
@@ -609,25 +616,25 @@ func (h *cachingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 			return copyReadRange(dest, data, off), nil
 		}
 		h.cache.noteHit("read", false)
-		key := DiskReadCacheKey{FileID: pathDiskReadCacheFileID(path), Path: path, Revision: h.rev, Offset: 0, Length: h.size}
+		key := DiskReadCacheKey{FileID: pathDiskReadCacheFileID(path), Path: path, Revision: rev, Offset: 0, Length: size}
 		// The capture PRECEDES the disk read: a blocking disk fetch that
 		// completes after a reset must not promote its pre-reset bytes.
 		epoch := h.cache.epoch.Load()
 		if h.cache.dsk != nil {
-			if cached, ok := h.cache.dsk.Get(key); ok && int64(len(cached)) == h.size {
+			if cached, ok := h.cache.dsk.Get(key); ok && int64(len(cached)) == size {
 				h.cache.noteHit("read", true)
-				h.cache.publishIfCurrent(epoch, func() { h.cache.mem.PutOwned(path, cached, h.rev) })
+				h.cache.publishIfCurrent(epoch, func() { h.cache.mem.PutOwned(path, cached, rev) })
 				return copyReadRange(dest, cached, off), nil
 			}
 		}
-		whole := make([]byte, h.size)
+		whole := make([]byte, size)
 		epoch = h.cache.epoch.Load()
-		if n, err := h.inner.Read(ctx, 0, whole); err == nil && int64(n) == h.size {
+		if n, err := h.inner.Read(ctx, 0, whole); err == nil && int64(n) == size {
 			// A checkout may have replaced the view while this fetch was
 			// in flight: its bytes describe the OLD view and must not be
 			// admitted (the OpRead path already carries this fence).
 			h.cache.publishIfCurrent(epoch, func() {
-				h.cache.mem.PutOwned(path, whole, h.rev)
+				h.cache.mem.PutOwned(path, whole, rev)
 				if h.cache.dsk != nil {
 					h.cache.dsk.PutAsync(key, whole)
 				}
@@ -637,8 +644,8 @@ func (h *cachingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 		// Fetch error or short image: fall through to the direct read.
 		return h.inner.Read(ctx, off, dest)
 	}
-	if off == 0 && h.rev > 0 && !grown && h.cache.admits(dest) && !h.cache.sqliteBypassStableCaches(path) {
-		if data, ok := h.cache.mem.Get(path, h.rev); ok && int64(len(data)) <= int64(len(dest)) {
+	if off == 0 && rev > 0 && !grown && h.cache.admits(dest) && !h.cache.sqliteBypassStableCaches(path) {
+		if data, ok := h.cache.mem.Get(path, rev); ok && int64(len(data)) <= int64(len(dest)) {
 			n := copy(dest, data)
 			return n, nil
 		}
@@ -648,8 +655,8 @@ func (h *cachingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 		// size), not merely that the request buffer filled: caching a
 		// 4096-byte prefix of an 8MiB file under the whole-file key made
 		// the next larger read serve a premature EOF.
-		if err == nil && int64(n) == int64(len(dest)) && h.size > 0 && int64(n) == h.size &&
-			h.cache.admits(dest[:n]) && h.rev > 0 {
+		if err == nil && int64(n) == int64(len(dest)) && size > 0 && int64(n) == size &&
+			h.cache.admits(dest[:n]) && rev > 0 {
 			h.cache.publishIfCurrent(epoch, func() {
 				h.cache.mem.PutOwned(path, append([]byte(nil), dest[:n]...), h.rev)
 			})
@@ -659,7 +666,7 @@ func (h *cachingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 	// v1 range disk tier for large files: the request's own (offset,
 	// size-clipped) range is fetched once and served from local disk on
 	// repeat — including across mounts (the key carries the revision).
-	if h.cache.dsk != nil && h.rev > 0 && !grown && !h.cache.dirs.hasLocalWriteState(path) && !h.cache.sqliteBypassStableCaches(path) {
+	if h.cache.dsk != nil && rev > 0 && !grown && !h.cache.dirs.hasLocalWriteState(path) && !h.cache.sqliteBypassStableCaches(path) {
 		// grown handles share the whole-file tiers' bypass: the disk
 		// range key and clip encode the stale open-time size/revision.
 		if n, ok := h.cache.readDiskCachedRange(ctx, h, off, dest); ok {
@@ -676,6 +683,10 @@ func (h *cachingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 // direct read.
 func (c *Cache) readDiskCachedRange(ctx context.Context, h *cachingHandle, off int64, dest []byte) (int, bool) {
 	path := h.identity()
+	// One identity snapshot: an invalidation may reset size/rev mid-read.
+	h.mu.Lock()
+	size, rev := h.size, h.rev
+	h.mu.Unlock()
 	block := c.opts.ParallelReadBlockSize
 	if block <= 0 {
 		block = defaultParallelReadBlockSize
@@ -684,18 +695,18 @@ func (c *Cache) readDiskCachedRange(ctx context.Context, h *cachingHandle, off i
 	if length <= 0 || length > block {
 		return 0, false // never split (kernel reads stay under MaxWrite)
 	}
-	if off < 0 || h.size > 0 && off >= h.size {
+	if off < 0 || size > 0 && off >= size {
 		return 0, true // EOF
 	}
-	if h.size > 0 {
-		if end := off + length; end > h.size {
-			length = h.size - off
+	if size > 0 {
+		if end := off + length; end > size {
+			length = size - off
 		}
 	}
 	if length <= 0 {
 		return 0, true
 	}
-	key := DiskReadCacheKey{FileID: pathDiskReadCacheFileID(path), Path: path, Revision: h.rev, Offset: off, Length: length}
+	key := DiskReadCacheKey{FileID: pathDiskReadCacheFileID(path), Path: path, Revision: rev, Offset: off, Length: length}
 	if data, ok := c.dsk.Get(key); ok && int64(len(data)) == length {
 		c.noteHit("read", true)
 		return copyReadRange(dest, data, 0), true
@@ -752,20 +763,33 @@ func (h *cachingHandle) Write(ctx context.Context, off int64, data []byte) error
 // Sync implements fs.Handle.
 func (h *cachingHandle) Sync(ctx context.Context) error {
 	err := h.inner.Sync(ctx)
-	h.cache.clearDirty(h.identity(), h)
+	if err == nil {
+		// Only a SUCCESSFUL commit boundary releases the dirty ownership:
+		// a rejected upload leaves the bytes uncommitted and their cache
+		// bypass must stay in force.
+		h.cache.clearDirty(h.identity(), h)
+	}
 	return err
 }
 
 // Flush implements fs.Handle.
 func (h *cachingHandle) Flush(ctx context.Context) error {
 	err := h.inner.Flush(ctx)
-	h.cache.clearDirty(h.identity(), h)
+	if err == nil {
+		h.cache.clearDirty(h.identity(), h)
+	}
 	return err
 }
 
 // Release implements fs.Handle.
 func (h *cachingHandle) Release(ctx context.Context) error {
 	h.cache.open.Delete(h)
+	// The prefetcher runs on its own background context: dropping the
+	// handle without closing it left requests running for a closed file
+	// (and a later global sweep could no longer find them).
+	if h.prefetch != nil {
+		h.prefetch.Close()
+	}
 	if h.isSidecar {
 		h.cache.sidecars.remove(h.identity())
 	}

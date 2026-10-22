@@ -8,6 +8,7 @@ package cache
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net/http/httptest"
 	"sync"
 	"sync/atomic"
@@ -413,5 +414,50 @@ func TestPortDirtyOwnershipIsPerHandle(t *testing.T) {
 	c.clearDirty("/f", writer)
 	if c.dirtyPath("/f") {
 		t.Fatal("the writer's own commit boundary did not clear the mark")
+	}
+}
+
+type failingSyncHandle struct{ fs.Handle }
+
+func (failingSyncHandle) Sync(context.Context) error  { return errors.New("commit rejected") }
+func (failingSyncHandle) Flush(context.Context) error { return errors.New("commit rejected") }
+
+// A FAILED commit boundary keeps the writer's dirty ownership.
+func TestPortFailedSyncKeepsDirtyOwnership(t *testing.T) {
+	c, err := New(Options{MaxSize: 1 << 20, MaxFileSize: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &cachingHandle{cache: c, path: "/f", inner: failingSyncHandle{}}
+	c.noteDirty("/f", h)
+	if err := h.Sync(context.Background()); err == nil {
+		t.Fatal("sync unexpectedly succeeded")
+	}
+	if !c.dirtyPath("/f") {
+		t.Fatal("a FAILED sync released the dirty ownership")
+	}
+	if err := h.Flush(context.Background()); err == nil {
+		t.Fatal("flush unexpectedly succeeded")
+	}
+	if !c.dirtyPath("/f") {
+		t.Fatal("a FAILED flush released the dirty ownership")
+	}
+}
+
+// A landed commit revokes same-path readers' open-time identity.
+func TestPortLandedRevokesReaderIdentity(t *testing.T) {
+	bus := fs.NewEventBus()
+	c, err := New(Options{MaxSize: 1 << 20, MaxFileSize: 1 << 20, Events: bus})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &cachingHandle{cache: c, path: "/f", size: 5, rev: 3, grown: true}
+	c.open.Store(h, struct{}{})
+	bus.Emit(fs.Event{Kind: fs.EventLanded, Path: "/f", Rev: 4})
+	h.mu.Lock()
+	size, rev, grown := h.size, h.rev, h.grown
+	h.mu.Unlock()
+	if size != 0 || rev != 0 || grown {
+		t.Fatalf("identity = size %d rev %d grown %v, want a clean slate", size, rev, grown)
 	}
 }
