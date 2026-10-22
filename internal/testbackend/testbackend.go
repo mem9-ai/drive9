@@ -1304,6 +1304,21 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if n != nil {
 			delete(b.files, src)
 			b.files[p] = n
+			if n.IsDir {
+				// The real server moves a directory's whole subtree; the
+				// harness must too, or a rename test would 404 every child.
+				prefix := strings.TrimSuffix(src, "/") + "/"
+				moved := make(map[string]*Node)
+				for k, v := range b.files {
+					if strings.HasPrefix(k, prefix) {
+						moved[strings.TrimSuffix(p, "/")+"/"+strings.TrimPrefix(k, prefix)] = v
+						delete(b.files, k)
+					}
+				}
+				for k, v := range moved {
+					b.files[k] = v
+				}
+			}
 		}
 		b.mu.Unlock()
 		if n == nil {

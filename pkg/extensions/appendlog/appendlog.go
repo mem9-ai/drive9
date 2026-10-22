@@ -115,7 +115,15 @@ func New(opts Options) (*AppendLog, error) {
 // intercepts size- and mode-changing SetAttr on live protocol handles, and
 // defers the remote delete of unlinked-but-open paths to their last close.
 func (a *AppendLog) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error) {
-	if a.cl == nil || !a.matcher.Matches(op.Path) {
+	if a.cl == nil {
+		return next(ctx, op)
+	}
+	// A DIRECTORY rename does not match the file pattern itself, but it
+	// must still retarget the tracked append handles under it: skipping the
+	// op left their fsync committing to the old subtree (EAGAIN) while the
+	// namespace had already moved. Unlink is likewise handled for tracked
+	// handles only (a no-op otherwise).
+	if !a.matcher.Matches(op.Path) && op.Kind != fs.OpRename && op.Kind != fs.OpUnlink {
 		return next(ctx, op)
 	}
 	switch op.Kind {
@@ -207,6 +215,30 @@ func (a *AppendLog) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 
 	case fs.OpUnlink:
 		if h := a.handleFor(op.Path); h != nil {
+			h.mu.Lock()
+			already := h.unlinked
+			pending := h.unlinkAtRelease
+			if already {
+				h.unlinkAtRelease = nil
+			}
+			h.mu.Unlock()
+			if already {
+				// The facade already deferred this delete and is landing it
+				// NOW (before a same-name create). Deferring a second time
+				// kept the remote name alive and the recreate hit EEXIST;
+				// the old fd keeps its local image either way.
+				if pending != nil {
+					if err := pending(ctx); err != nil && !fs.IsNotFound(err) {
+						h.mu.Lock()
+						if h.unlinkAtRelease == nil {
+							h.unlinkAtRelease = pending
+						}
+						h.mu.Unlock()
+						return fs.Result{}, err
+					}
+				}
+				return fs.Result{}, nil
+			}
 			// POSIX unlink-while-open: the name disappears now, the image
 			// lives in the open handle, and the remote delete is deferred
 			// to the last close.
@@ -352,7 +384,7 @@ func (a *AppendLog) tryGenerationReset(ctx context.Context, h *Handle) error {
 	if err := h.applyPendingMode(ctx); err != nil {
 		return err
 	}
-	a.emit(fs.Event{Kind: fs.EventLanded, Path: h.path, Rev: revision, Size: sqliteWALHeaderSize})
+	a.emit(fs.Event{Kind: fs.EventLanded, Path: h.path, Rev: revision, Size: sqliteWALHeaderSize, HasSize: true})
 	return nil
 }
 
@@ -484,7 +516,7 @@ func (a *AppendLog) tryTailAppend(ctx context.Context, h *Handle) error {
 	if err := h.applyPendingMode(ctx); err != nil {
 		return err
 	}
-	a.emit(fs.Event{Kind: fs.EventLanded, Path: h.path, Rev: result.Revision, Size: result.Size})
+	a.emit(fs.Event{Kind: fs.EventLanded, Path: h.path, Rev: result.Revision, Size: result.Size, HasSize: true})
 	return nil
 }
 
@@ -592,7 +624,7 @@ func (a *AppendLog) fullRewrite(ctx context.Context, h *Handle) error {
 	if err := h.applyPendingMode(ctx); err != nil {
 		return err
 	}
-	a.emit(fs.Event{Kind: fs.EventLanded, Path: h.path, Rev: revision, Size: size})
+	a.emit(fs.Event{Kind: fs.EventLanded, Path: h.path, Rev: revision, Size: size, HasSize: true})
 	return nil
 }
 
@@ -814,7 +846,7 @@ func (a *AppendLog) truncatePath(ctx context.Context, path string, size int64) (
 		return true, mapErr(werr)
 	}
 	a.committed.Store(path, landedGeneration{seq: pathTruncateSeq, rev: revision, size: size})
-	a.emit(fs.Event{Kind: fs.EventLanded, Path: path, Rev: revision, Size: size})
+	a.emit(fs.Event{Kind: fs.EventLanded, Path: path, Rev: revision, Size: size, HasSize: true})
 	return true, nil
 }
 
@@ -956,8 +988,19 @@ func (h *Handle) Write(ctx context.Context, off int64, data []byte) error {
 		// A synchronous write acknowledges only after the protocol commit
 		// (generation/tail/rewrite upload) completes — RAM-only
 		// acknowledgment violated --durability=write-sync and O_SYNC.
-		if _, err := h.a.routeFlush(ctx, h); err != nil {
+		published, err := h.a.routeFlush(ctx, h)
+		if err != nil {
 			return err
+		}
+		// The write ALREADY published the payload: hand publication
+		// ownership over to this plane. Otherwise the forwarded Flush saw a
+		// clean append handle, still considered the lower create pending,
+		// and materialized its empty image over the upload (O_SYNC write
+		// followed by close wiped the file).
+		if published && h.inner != nil {
+			if mp, ok := unwrapMarkPublished(h.inner); ok {
+				mp.MarkPublished()
+			}
 		}
 	}
 	return nil
