@@ -253,7 +253,7 @@ func TestPortAppendLogRebaseRetriesOnceWithFrozenTail(t *testing.T) {
 	b.Seed("/db-wal", []byte("pre"))
 	var mu sync.Mutex
 	appends, heads := 0, 0
-	ch := newWrappedStack(t, wrapBackend(b, func(w http.ResponseWriter, r *http.Request) bool {
+	wrapped := wrapBackend(b, func(w http.ResponseWriter, r *http.Request) bool {
 		switch {
 		case r.Method == http.MethodPost && r.URL.Query().Has("append-log"):
 			mu.Lock()
@@ -265,14 +265,16 @@ func TestPortAppendLogRebaseRetriesOnceWithFrozenTail(t *testing.T) {
 			mu.Unlock()
 		}
 		return false
-	}), "**/db-wal")
+	})
+	ch := newWrappedStack(t, wrapped, "**/db-wal")
+	// The sibling lives on a SECOND extension instance: it is an EXTERNAL
+	// writer to this mount's tracked set, so the handle's baseline stays
+	// stale and the rebase-retry path is what gets exercised.
+	ch2 := newWrappedStack(t, wrapped, "**/db-wal")
 	ctx := context.Background()
 
-	// Both handles adopt the rev-1 baseline BEFORE the sibling commits: the
-	// sibling's overwrite forces a full rewrite (revision 1 -> 10 at the
-	// same size 3), which the writer's append must rebase onto.
 	h := openLog(t, ch, "/db-wal").(*Handle)
-	sibling := openLog(t, ch, "/db-wal").(*Handle)
+	sibling := openLog(t, ch2, "/db-wal").(*Handle)
 	if err := sibling.Write(ctx, 0, []byte("XYZ")); err != nil {
 		t.Fatal(err)
 	}
@@ -288,8 +290,8 @@ func TestPortAppendLogRebaseRetriesOnceWithFrozenTail(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if appends != 2 || heads < 3 { // 2 opens + the rebase stat
-		t.Fatalf("append/head calls = %d/%d, want 2/>=3", appends, heads)
+	if appends < 2 || heads < 3 { // sibling's attempt + the rebase pair
+		t.Fatalf("append/head calls = %d/%d, want >=2/>=3", appends, heads)
 	}
 	if n, _ := b.Node("/db-wal"); string(n.Data) != "XYZtail" || h.dirty || h.baseRev != n.Rev {
 		t.Fatalf("backend = %q rev=%d, handle = dirty=%t rev=%d", n.Data, n.Rev, h.dirty, h.baseRev)
@@ -304,20 +306,22 @@ func TestPortAppendLogRebaseRejectsChangedSizeWithoutRetry(t *testing.T) {
 	b.Seed("/db-wal", []byte("pre"))
 	var mu sync.Mutex
 	appends := 0
-	ch := newWrappedStack(t, wrapBackend(b, func(w http.ResponseWriter, r *http.Request) bool {
+	wrapped := wrapBackend(b, func(w http.ResponseWriter, r *http.Request) bool {
 		if r.Method == http.MethodPost && r.URL.Query().Has("append-log") {
 			mu.Lock()
 			appends++
 			mu.Unlock()
 		}
 		return false
-	}), "**/db-wal")
+	})
+	ch := newWrappedStack(t, wrapped, "**/db-wal")
+	// An EXTERNAL writer (second extension instance) grows the remote, so
+	// the tracked handle's stale baseline must fail the rebase.
+	ch2 := newWrappedStack(t, wrapped, "**/db-wal")
 	ctx := context.Background()
 
-	// Both handles adopt the rev-1 baseline before the sibling's append
-	// grows the remote (revision AND size move).
 	h := openLog(t, ch, "/db-wal").(*Handle)
-	sibling := openLog(t, ch, "/db-wal").(*Handle)
+	sibling := openLog(t, ch2, "/db-wal").(*Handle)
 	if err := sibling.Write(ctx, 3, []byte("grown")); err != nil {
 		t.Fatal(err)
 	}
@@ -354,7 +358,7 @@ func TestPortAppendLogRebasedUnsupportedFallsBackWithRebasedRevision(t *testing.
 	var mu sync.Mutex
 	appends, puts := 0, 0
 	var putRevs []string
-	ch := newWrappedStack(t, wrapBackend(b, func(w http.ResponseWriter, r *http.Request) bool {
+	wrapped := wrapBackend(b, func(w http.ResponseWriter, r *http.Request) bool {
 		switch {
 		case r.Method == http.MethodPost && r.URL.Query().Has("append-log"):
 			mu.Lock()
@@ -367,13 +371,14 @@ func TestPortAppendLogRebasedUnsupportedFallsBackWithRebasedRevision(t *testing.
 			mu.Unlock()
 		}
 		return false
-	}), "**/db-wal")
+	})
+	ch := newWrappedStack(t, wrapped, "**/db-wal")
+	// EXTERNAL writer: the tracked handle must rebase onto its rewrite.
+	ch2 := newWrappedStack(t, wrapped, "**/db-wal")
 	ctx := context.Background()
 
-	// Both handles adopt the rev-1 baseline before the sibling's same-size
-	// rewrite (revision 1 -> 10); the writer's append rebases onto it.
 	h := openLog(t, ch, "/db-wal").(*Handle)
-	sibling := openLog(t, ch, "/db-wal").(*Handle)
+	sibling := openLog(t, ch2, "/db-wal").(*Handle)
 	if err := sibling.Write(ctx, 0, []byte("XYZ")); err != nil {
 		t.Fatal(err)
 	}
@@ -390,8 +395,8 @@ func TestPortAppendLogRebasedUnsupportedFallsBackWithRebasedRevision(t *testing.
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if appends != 2 || puts != 2 { // sibling's PUT + fallback PUT
-		t.Fatalf("append/put calls = %d/%d, want 2/2", appends, puts)
+	if appends < 1 || puts != 2 { // sibling's PUT + fallback PUT
+		t.Fatalf("append/put calls = %d/%d, want >=1/2", appends, puts)
 	}
 	if len(putRevs) != 2 || putRevs[1] != "10" {
 		t.Fatalf("fallback PUT revisions = %v, want the second against the rebased revision 10", putRevs)

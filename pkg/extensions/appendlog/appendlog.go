@@ -22,6 +22,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 
@@ -87,6 +88,10 @@ type AppendLog struct {
 	// unlinked hides paths whose name is gone but whose open handle still
 	// holds the image; the deferred remote delete runs at Release.
 	unlinked sync.Map
+	// facadeDeferred records names whose delete the FACADE already
+	// deferred (MarkPathUnlinked): the later flush dispatch must land the
+	// remote delete instead of deferring a second time.
+	facadeDeferred sync.Map
 	// committed remembers the last landed generation per path.
 	committed sync.Map
 	// incarnation mints a fresh file identity for every NEW handle claim
@@ -124,7 +129,13 @@ func (a *AppendLog) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 	// namespace had already moved. Unlink is likewise handled for tracked
 	// handles only (a no-op otherwise).
 	if !a.matcher.Matches(op.Path) && op.Kind != fs.OpRename && op.Kind != fs.OpUnlink {
-		return next(ctx, op)
+		// A claimed FD keeps its data-plane ownership even after a rename
+		// moved the name OUT of the pattern (e.g. `/app.log` →
+		// `/app.txt`): a FD-directed setattr must truncate THIS plane's
+		// buffer, not fall through to the lower write plane.
+		if op.Kind != fs.OpSetAttr || appendLogHandleOf(op.Handle) == nil {
+			return next(ctx, op)
+		}
 	}
 	switch op.Kind {
 	case fs.OpLookup, fs.OpGetAttr:
@@ -215,6 +226,24 @@ func (a *AppendLog) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 
 	case fs.OpUnlink:
 		if h := a.handleFor(op.Path); h != nil {
+			if _, deferred := a.facadeDeferred.LoadAndDelete(op.Path); deferred {
+				// The facade already deferred this delete (MarkPathUnlinked)
+				// and is landing it now, before a same-name create: the
+				// name must go NOW. The old fd keeps a local image.
+				if err := h.ensureBuffer(ctx); err != nil {
+					return fs.Result{}, err
+				}
+				h.mu.Lock()
+				h.unlinked = true
+				h.unlinkAtRelease = nil
+				h.mu.Unlock()
+				a.unlinked.Store(op.Path, struct{}{})
+				_, derr := next(ctx, &fs.Op{Kind: fs.OpUnlink, Path: op.Path})
+				if derr != nil && !fs.IsNotFound(derr) {
+					return fs.Result{}, derr
+				}
+				return fs.Result{}, nil
+			}
 			h.mu.Lock()
 			already := h.unlinked
 			pending := h.unlinkAtRelease
@@ -516,6 +545,7 @@ func (a *AppendLog) tryTailAppend(ctx context.Context, h *Handle) error {
 	if err := h.applyPendingMode(ctx); err != nil {
 		return err
 	}
+	a.refreshCleanSiblings(h.path, result.Revision, result.Size, h)
 	a.emit(fs.Event{Kind: fs.EventLanded, Path: h.path, Rev: result.Revision, Size: result.Size, HasSize: true})
 	return nil
 }
@@ -624,6 +654,7 @@ func (a *AppendLog) fullRewrite(ctx context.Context, h *Handle) error {
 	if err := h.applyPendingMode(ctx); err != nil {
 		return err
 	}
+	a.refreshCleanSiblings(h.path, revision, size, h)
 	a.emit(fs.Event{Kind: fs.EventLanded, Path: h.path, Rev: revision, Size: size, HasSize: true})
 	return nil
 }
@@ -725,6 +756,50 @@ func (a *AppendLog) remotePath(p string) string {
 func (a *AppendLog) emit(e fs.Event) {
 	if a.events != nil {
 		a.events.Emit(e)
+	}
+}
+
+// MarkPathUnlinked implements the facade's deferred-unlink handshake: the
+// facade has ALREADY postponed the remote delete (the name is gone from its
+// view), so the later flush dispatch performs it instead of deferring a
+// second time.
+func (a *AppendLog) MarkPathUnlinked(p string) {
+	if a.cl == nil {
+		return
+	}
+	a.facadeDeferred.Store(p, struct{}{})
+}
+
+// refreshCleanSiblings adopts a committed generation in every CLEAN sibling
+// of the same path: their stale revision/size would CAS the next write on
+// the pre-commit revision (EAGAIN), and a loaded buffer would serve (and
+// re-cache) the pre-commit image under the new revision. Dirty siblings
+// keep their own CAS base (their composition still owns the tail).
+func (a *AppendLog) refreshCleanSiblings(path string, rev, size int64, self *Handle) {
+	v, ok := a.live.Load(path)
+	if !ok {
+		return
+	}
+	set := v.(*liveHandleSet)
+	set.mu.Lock()
+	candidates := make([]*Handle, 0, len(set.set))
+	for other := range set.set {
+		candidates = append(candidates, other)
+	}
+	set.mu.Unlock()
+	for _, other := range candidates {
+		if other == self {
+			continue
+		}
+		other.mu.Lock()
+		if !other.dirty && !other.unlinked {
+			other.isNew = false
+			other.baseRev = rev
+			other.origSize = size
+			other.buf = nil // re-read lazily from the committed image
+			other.observeLayoutLocked(client.ContentLayoutAppendLog, rev, size)
+		}
+		other.mu.Unlock()
 	}
 }
 
@@ -1520,7 +1595,12 @@ func (h *Handle) ensureBuffer(ctx context.Context) error {
 			return nil, nil
 		}
 		part := make([]byte, end-start)
-		if _, err := inner.Read(ctx, start, part); err != nil {
+		// The loader outlives the write that installed it (its ctx is
+		// canceled when that FUSE request returns): a later Read/Write
+		// loading an untouched part must use its OWN live context.
+		loadCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if _, err := inner.Read(loadCtx, start, part); err != nil {
 			return nil, err
 		}
 		return part, nil

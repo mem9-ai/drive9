@@ -177,8 +177,11 @@ func TestPortAppendLogFullRewriteRejectsBaselineDriftWithEEXIST(t *testing.T) {
 	ch := newWrappedStack(t, wrapBackend(b, rec.intercept), "**/db-wal")
 	ctx := context.Background()
 
+	// An EXTERNAL writer (second extension instance) drifts the baseline;
+	// a tracked sibling's commit would be adopted by this handle instead.
+	ch2 := newWrappedStack(t, wrapBackend(b, rec.intercept), "**/db-wal")
 	h := openLog(t, ch, "/db-wal").(*Handle)
-	sibling := openLog(t, ch, "/db-wal").(*Handle)
+	sibling := openLog(t, ch2, "/db-wal").(*Handle)
 	if err := sibling.Write(ctx, 0, []byte("XYZ")); err != nil {
 		t.Fatal(err)
 	}

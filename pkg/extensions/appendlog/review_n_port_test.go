@@ -165,3 +165,60 @@ func TestPortSyncAppendRetiresPendingCreate(t *testing.T) {
 	}
 	_ = res.Handle.Release(ctx)
 }
+
+// A tracked sibling's commit is adopted by the other clean FD: its next
+// write does not CAS against the pre-commit revision.
+func TestPortSiblingCommitAdoptedByCleanFd(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/app.log", []byte("abcdef"))
+	ch := newStack(t, b, "**/*.log")
+	ctx := context.Background()
+	h1 := openLog(t, ch, "/app.log")
+	h2 := openLog(t, ch, "/app.log")
+	if err := h1.Write(ctx, 0, []byte("X")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h1.Sync(ctx); err != nil {
+		t.Fatalf("first fsync = %v", err)
+	}
+	if err := h2.Write(ctx, 1, []byte("Y")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h2.Sync(ctx); err != nil {
+		t.Fatalf("second fsync = %v (stale baseline was not adopted)", err)
+	}
+	if node, ok := b.Node("/app.log"); !ok || string(node.Data) != "XYcdef" {
+		t.Fatalf("/app.log = %q ok=%v, want XYcdef", node.Data, ok)
+	}
+	// A loaded clean sibling re-reads the committed image, not its old copy.
+	buf := make([]byte, 6)
+	if n, rerr := h2.Read(ctx, 0, buf); rerr != nil || string(buf[:n]) != "XYcdef" {
+		t.Fatalf("sibling read = %q err=%v", buf[:n], rerr)
+	}
+}
+
+// A rename out of the pattern keeps the claimed FD's setattr on this plane.
+func TestPortSetAttrBypassesPatternAfterRename(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/app.log", []byte("abcdef"))
+	ch := newStack(t, b, "**/*.log")
+	ctx := context.Background()
+	h := openLog(t, ch, "/app.log")
+	if err := h.Write(ctx, 0, []byte("X")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/app.log", Path2: "/app.txt"}); err != nil {
+		t.Fatalf("rename = %v", err)
+	}
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpSetAttr, Path: "/app.txt", Handle: h, Size: 2, HasSize: true})
+	if err != nil {
+		t.Fatalf("ftruncate = %v", err)
+	}
+	_ = res
+	if err := h.Sync(ctx); err != nil {
+		t.Fatalf("fsync after rename+truncate = %v", err)
+	}
+	if node, ok := b.Node("/app.txt"); !ok || string(node.Data) != "Xb" {
+		t.Fatalf("/app.txt = %q ok=%v, want Xb", node.Data, ok)
+	}
+}
