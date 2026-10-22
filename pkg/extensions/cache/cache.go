@@ -211,17 +211,47 @@ func New(opts Options) (*Cache, error) {
 		opts.Events.On(fs.EventLanded, func(e fs.Event) {
 			// A local commit settle (onCommitQueueSuccess /
 			// onWriteBackUploadSuccess) replaces the file's image. Same
-			// path readers still hold their OPEN-TIME revision, so the
-			// previous disk blocks look current to them (a sibling fsync
-			// made a reader fall back from the writer's bytes to the old
-			// image). Revoke the path's cached identity and blocks; the
-			// seeder/plane below serves the committed bytes.
+			// path readers still hold their OPEN-TIME revision, so the old
+			// disk blocks look current to them (a sibling fsync made a
+			// reader fall back from the writer's bytes to the old image).
+			// Drop the stale blocks and move the readers onto the LANDED
+			// revision — but KEEP the just-seeded committed image: it
+			// covers backend replica lag for this mount's own writes, and
+			// sweeping it made a fresh commit read back as the stale
+			// remote row (git's refs after clone).
 			if e.Path == "/" || e.Path == "" {
 				c.invalidateAllTiers()
 				return
 			}
-			c.invalidatePathTiers(e.Path)
-			c.mem.Invalidate(e.Path)
+			if e.Rev <= 0 {
+				// No trustworthy revision to keep: drop the path's image
+				// (v1 settle) — a rev-keyed seed below supersedes it.
+				c.mem.Invalidate(e.Path)
+			}
+			if c.dsk != nil {
+				c.dsk.InvalidateFile(pathDiskReadCacheFileID(e.Path))
+			}
+			prefix := strings.TrimSuffix(e.Path, "/") + "/"
+			c.open.Range(func(key, _ any) bool {
+				h, ok := key.(*cachingHandle)
+				if !ok {
+					return true
+				}
+				p := h.identity()
+				if p != e.Path && !strings.HasPrefix(p, prefix) {
+					return true
+				}
+				h.mu.Lock()
+				if h.prefetch != nil {
+					h.prefetch.Invalidate()
+				}
+				if e.Rev > 0 {
+					h.rev = e.Rev
+				}
+				h.grown = false
+				h.mu.Unlock()
+				return true
+			})
 		})
 	}
 	return c, nil
@@ -658,7 +688,7 @@ func (h *cachingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 		if err == nil && int64(n) == int64(len(dest)) && size > 0 && int64(n) == size &&
 			h.cache.admits(dest[:n]) && rev > 0 {
 			h.cache.publishIfCurrent(epoch, func() {
-				h.cache.mem.PutOwned(path, append([]byte(nil), dest[:n]...), h.rev)
+				h.cache.mem.PutOwned(path, append([]byte(nil), dest[:n]...), rev)
 			})
 		}
 		return n, err

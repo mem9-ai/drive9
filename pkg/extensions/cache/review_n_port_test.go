@@ -455,9 +455,9 @@ func TestPortLandedRevokesReaderIdentity(t *testing.T) {
 	c.open.Store(h, struct{}{})
 	bus.Emit(fs.Event{Kind: fs.EventLanded, Path: "/f", Rev: 4})
 	h.mu.Lock()
-	size, rev, grown := h.size, h.rev, h.grown
+	rev, grown := h.rev, h.grown
 	h.mu.Unlock()
-	if size != 0 || rev != 0 || grown {
-		t.Fatalf("identity = size %d rev %d grown %v, want a clean slate", size, rev, grown)
+	if rev != 4 || grown {
+		t.Fatalf("identity = rev %d grown %v, want the landed revision and a clear grown flag", rev, grown)
 	}
 }
