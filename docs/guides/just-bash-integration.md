@@ -39,6 +39,30 @@ Fresh runtime read: beta
 Remote directory removed: /just-bash-example-...
 ```
 
+### Use TiDB Cloud Filesystem
+
+Set `DRIVE9_SERVER` to the endpoint for your filesystem's region and
+`DRIVE9_API_KEY` to its **filesystem token**. For example, for `aws-us-east-1`:
+
+```bash
+export DRIVE9_SERVER=https://aws-us-east-1.drive9.ai
+export DRIVE9_API_KEY='<filesystem owner token>'
+npm run example:just-bash -- --cleanup
+DRIVE9_INTEGRATION=1 npx vitest run tests/just-bash.integration.test.ts
+```
+
+The SDK does not automatically read credentials saved by `ti`. TiDB Cloud API
+public/private keys are for managing filesystem resources; they are not
+filesystem tokens. Use the [official region endpoint table](https://docs.pingcap.com/tidbcloud-filesystem/filesystem-sdks/)
+when choosing a server URL. The SDK's default `https://api.drive9.ai` is a
+different service and does not accept TiDB Cloud Filesystem tokens.
+
+The live suite needs an owner token to create and revoke its temporary scoped
+token. Both the suite and the example create unique directories and clean up
+their files. They can reuse an existing free-tier filesystem without changing
+its quotas; the largest test file is 9 MiB, within the
+[free-tier limits](https://docs.pingcap.com/tidbcloud-filesystem/manage-filesystem-limits/).
+
 ## Mount an existing remote directory
 
 ```typescript
