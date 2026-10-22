@@ -374,3 +374,44 @@ func TestPortSiblingWriteBypassesStableTiers(t *testing.T) {
 	_ = writer.Handle.Release(ctx)
 	_ = reader.Handle.Release(ctx)
 }
+
+// A single-path invalidation revokes the reader's open-time identity.
+func TestPortPathInvalidationRevokesReaderIdentity(t *testing.T) {
+	c, err := New(Options{MaxSize: 1 << 20, MaxFileSize: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &cachingHandle{cache: c, path: "/f", size: 5, rev: 7, grown: true}
+	c.open.Store(h, struct{}{})
+	c.invalidatePathTiers("/f")
+	h.mu.Lock()
+	size, rev, grown := h.size, h.rev, h.grown
+	h.mu.Unlock()
+	if size != 0 || rev != 0 || grown {
+		t.Fatalf("identity = size %d rev %d grown %v, want a clean slate", size, rev, grown)
+	}
+}
+
+// Dirty ownership: an unrelated reader's boundary must not un-dirty the
+// writer's path.
+func TestPortDirtyOwnershipIsPerHandle(t *testing.T) {
+	c, err := New(Options{MaxSize: 1 << 20, MaxFileSize: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer := &cachingHandle{cache: c, path: "/f"}
+	reader := &cachingHandle{cache: c, path: "/f"}
+	c.noteDirty("/f", writer)
+	c.noteDirty("/f", writer) // repeated writes keep ONE mark
+	if !c.dirtyPath("/f") {
+		t.Fatal("write did not mark the path dirty")
+	}
+	c.clearDirty("/f", reader)
+	if !c.dirtyPath("/f") {
+		t.Fatal("a reader's boundary cleared the writer's dirty mark")
+	}
+	c.clearDirty("/f", writer)
+	if c.dirtyPath("/f") {
+		t.Fatal("the writer's own commit boundary did not clear the mark")
+	}
+}

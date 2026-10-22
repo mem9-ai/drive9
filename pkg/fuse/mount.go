@@ -949,6 +949,13 @@ func mountWithConfig(cfg MountConfig) error {
 			return fmt.Errorf("fuse: layer extension: %w", err)
 		}
 		built["layer"] = layerExt
+		// Control/session consumers resolve the layer AGAIN (drive9 exec
+		// on the mount directory): report the PINNED id, or a name/tag
+		// that later points elsewhere sends them to a different layer
+		// than the one this mount reads/writes.
+		if pinned := layerExt.PinnedRef(); pinned != "" {
+			cfg.LayerRef = pinned
+		}
 	}
 
 	// The extent plane claims ahead of the classic data path (cache and

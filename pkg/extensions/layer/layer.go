@@ -325,6 +325,16 @@ func New(opts Options) (*Layer, error) {
 	}, nil
 }
 
+// PinnedRef reports the layer reference the mount was resolved to (the
+// LayerID when the mount used a name/tag). Control/session consumers must
+// use it, not the caller's mutable ref.
+func (l *Layer) PinnedRef() string {
+	if l == nil {
+		return ""
+	}
+	return l.layerRef
+}
+
 func (l *Layer) remotePath(p string) string {
 	if l.root == "/" {
 		return p

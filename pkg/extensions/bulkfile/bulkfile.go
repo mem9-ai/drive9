@@ -448,7 +448,7 @@ func (b *Bulkfile) prepareUnlinkSurvivors(ctx context.Context, p string, under b
 		// A released WRITE fd can still own reader references (refs > 1):
 		// its readers need the bound backing just as much, so the writer's
 		// released flag must not filter the claim out.
-		match := (!h.released || h.refs > 1) && (path == p || (under && strings.HasPrefix(path, prefix)))
+		match := (!h.released || h.refs > 0) && (path == p || (under && strings.HasPrefix(path, prefix)))
 		passthrough := h.passthrough && h.inner == nil
 		h.mu.Unlock()
 		if match && passthrough {
@@ -497,7 +497,7 @@ func (b *Bulkfile) markUnlinked(p string) {
 		// A released WRITE fd can still own readers (refs > 1): the claim
 		// must be anonymized for them too, not filtered by the writer's
 		// released flag.
-		if h.path == p && (!h.released || h.refs > 1) {
+		if h.path == p && (!h.released || h.refs > 0) {
 			h.unlinked = true
 		}
 		h.mu.Unlock()

@@ -90,9 +90,10 @@ type Cache struct {
 	resetMu sync.RWMutex
 	// sidecars tracks open -wal/-journal handles (v1 sqlite routing).
 	sidecars sidecarTracker
-	// dirty counts paths with an unflushed write through ANY descriptor:
-	// stable tiers must not answer for them, or a second fd keeps reading
-	// the pre-write disk/mem image.
+	// dirty counts HANDLES with unflushed writes per path: stable tiers
+	// must not answer for them, and only the OWNING descriptor clears its
+	// own mark at its commit boundary (an unrelated reader's Flush/Release
+	// must not un-dirty a writer's path).
 	dirtyMu sync.Mutex
 	dirty   map[string]int
 }
@@ -122,7 +123,10 @@ type cachingHandle struct {
 	// its open-time size/rev are stale and whole-file cache admission
 	// under that identity would serve the old image.
 	grown bool
-	mu    sync.Mutex
+	// dirtyOwned marks THIS handle as a dirty-path owner; only it clears
+	// its mark.
+	dirtyOwned bool
+	mu         sync.Mutex
 }
 
 // New constructs the read-plane cache.
@@ -244,6 +248,12 @@ func (c *Cache) invalidatePathTiers(path string) {
 			if h.prefetch != nil {
 				h.prefetch.Invalidate()
 			}
+			// The SSE change replaced this file's remote image: the
+			// handle's open-time size/rev describe the OLD one, and a
+			// whole-file read under it re-cached the stale prefix as the
+			// complete image (the grown tail answered EOF).
+			h.size, h.rev = 0, 0
+			h.grown = false
 			h.mu.Unlock()
 		}
 		return true
@@ -296,8 +306,17 @@ func (c *Cache) remotePathOf(p string) string {
 	return root + p
 }
 
-// noteDirty/clearDirty track paths with unflushed writes across descriptors.
-func (c *Cache) noteDirty(path string) {
+// noteDirty/clearDirty track a HANDLE's unflushed writes. The caller passes
+// the handle so the pair is ownership-based: N writes by one descriptor
+// leave exactly one mark, and another descriptor's boundary is a no-op.
+func (c *Cache) noteDirty(path string, h *cachingHandle) {
+	h.mu.Lock()
+	already := h.dirtyOwned
+	h.dirtyOwned = true
+	h.mu.Unlock()
+	if already {
+		return
+	}
 	c.dirtyMu.Lock()
 	if c.dirty == nil {
 		c.dirty = map[string]int{}
@@ -306,7 +325,14 @@ func (c *Cache) noteDirty(path string) {
 	c.dirtyMu.Unlock()
 }
 
-func (c *Cache) clearDirty(path string) {
+func (c *Cache) clearDirty(path string, h *cachingHandle) {
+	h.mu.Lock()
+	owned := h.dirtyOwned
+	h.dirtyOwned = false
+	h.mu.Unlock()
+	if !owned {
+		return
+	}
 	c.dirtyMu.Lock()
 	if n := c.dirty[path]; n > 1 {
 		c.dirty[path] = n - 1
@@ -707,7 +733,7 @@ func copyReadRange(dest, data []byte, off int64) int {
 func (h *cachingHandle) Write(ctx context.Context, off int64, data []byte) error {
 	err := h.inner.Write(ctx, off, data)
 	if err == nil {
-		h.cache.noteDirty(h.identity())
+		h.cache.noteDirty(h.identity(), h)
 		h.cache.mem.Invalidate(h.identity())
 		if h.prefetch != nil {
 			h.prefetch.Invalidate()
@@ -726,14 +752,14 @@ func (h *cachingHandle) Write(ctx context.Context, off int64, data []byte) error
 // Sync implements fs.Handle.
 func (h *cachingHandle) Sync(ctx context.Context) error {
 	err := h.inner.Sync(ctx)
-	h.cache.clearDirty(h.identity())
+	h.cache.clearDirty(h.identity(), h)
 	return err
 }
 
 // Flush implements fs.Handle.
 func (h *cachingHandle) Flush(ctx context.Context) error {
 	err := h.inner.Flush(ctx)
-	h.cache.clearDirty(h.identity())
+	h.cache.clearDirty(h.identity(), h)
 	return err
 }
 
@@ -746,7 +772,7 @@ func (h *cachingHandle) Release(ctx context.Context) error {
 	// The descriptor's close is a durability boundary for its writes (the
 	// below plane commits them): stop forcing sibling reads around the
 	// stable tiers.
-	h.cache.clearDirty(h.identity())
+	h.cache.clearDirty(h.identity(), h)
 	return h.inner.Release(ctx)
 }
 
@@ -765,7 +791,10 @@ func (h *cachingHandle) SetPath(p string) {
 	h.path = p
 	h.mu.Unlock()
 	if h.prefetch != nil {
-		h.prefetch.SetPath(p)
+		// The prefetcher addresses the REMOTE namespace: a retarget that
+		// handed it the view path mixed a same-named file outside the
+		// mount subtree into the stream.
+		h.prefetch.SetPath(h.cache.remotePathOf(p))
 	}
 }
 

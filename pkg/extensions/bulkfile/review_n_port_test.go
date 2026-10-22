@@ -580,3 +580,18 @@ func TestPortOverwriteRenameBindsSurrenderedFd(t *testing.T) {
 		t.Fatal("rollback did not restore the fd")
 	}
 }
+
+// A released claim with ONE remaining reader is still a survivor: the
+// writer's dropRef left refs at 1, which must not exclude it.
+func TestPortReaderOnlyClaimAnonymized(t *testing.T) {
+	b := &Bulkfile{fds: map[*streamHandle]struct{}{}, live: map[*streamHandle]struct{}{}}
+	h := &streamHandle{b: b, path: "/a", refs: 1, released: true}
+	b.track(h)
+	b.markUnlinked("/a")
+	h.mu.Lock()
+	anon := h.unlinked
+	h.mu.Unlock()
+	if !anon {
+		t.Fatal("a reader-only claim was filtered out of unlink handling")
+	}
+}
