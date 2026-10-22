@@ -269,24 +269,33 @@ func withS3StyleEnv(forcePathStyle bool, create func() (object.ObjectStorage, er
 
 // withS3Env sets the style variable and, when the credential carries a region,
 // the region variables for the construction window, then restores the previous
-// values. An empty region leaves the process environment untouched (older
-// servers do not mint one).
+// values. An empty region leaves the region variables untouched (older servers
+// do not mint one).
+//
+// The restore is deferred so it also runs when construction panics: these are
+// process-wide variables shared by every mount under s3StyleMu, so a leak would
+// outlive the failed mount and sign every later one with the wrong region/style.
 func withS3Env(region string, forcePathStyle bool, create func() (object.ObjectStorage, error)) (object.ObjectStorage, error) {
 	s3StyleMu.Lock()
 	defer s3StyleMu.Unlock()
-	prevStyle, hadStyle := os.LookupEnv(jfsS3VHostStyleEnv)
-	_ = os.Setenv(jfsS3VHostStyleEnv, vhostStyleValue(forcePathStyle))
 	region = strings.TrimSpace(region)
+	prevStyle, hadStyle := os.LookupEnv(jfsS3VHostStyleEnv)
 	prevRegion := make(map[string]string, len(jfsS3RegionEnvs))
 	hadRegion := make(map[string]bool, len(jfsS3RegionEnvs))
 	if region != "" {
 		for _, k := range jfsS3RegionEnvs {
 			prevRegion[k], hadRegion[k] = os.LookupEnv(k)
-			_ = os.Setenv(k, region)
 		}
 	}
-	st, err := create()
-	if region != "" {
+	defer func() {
+		if hadStyle {
+			_ = os.Setenv(jfsS3VHostStyleEnv, prevStyle)
+		} else {
+			_ = os.Unsetenv(jfsS3VHostStyleEnv)
+		}
+		if region == "" {
+			return
+		}
 		for _, k := range jfsS3RegionEnvs {
 			if hadRegion[k] {
 				_ = os.Setenv(k, prevRegion[k])
@@ -294,13 +303,14 @@ func withS3Env(region string, forcePathStyle bool, create func() (object.ObjectS
 				_ = os.Unsetenv(k)
 			}
 		}
+	}()
+	_ = os.Setenv(jfsS3VHostStyleEnv, vhostStyleValue(forcePathStyle))
+	if region != "" {
+		for _, k := range jfsS3RegionEnvs {
+			_ = os.Setenv(k, region)
+		}
 	}
-	if hadStyle {
-		_ = os.Setenv(jfsS3VHostStyleEnv, prevStyle)
-	} else {
-		_ = os.Unsetenv(jfsS3VHostStyleEnv)
-	}
-	return st, err
+	return create()
 }
 
 func openInner(cred *Credential, src CredentialSource) (object.ObjectStorage, error) {

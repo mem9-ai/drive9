@@ -160,3 +160,41 @@ func TestOpenStorageDerivesEndpointFromRegion(t *testing.T) {
 		}
 	}
 }
+
+// TestWithS3EnvRestoresOnPanic proves the env restore is deferred: a panicking
+// construction must not leave the process-wide variables overridden, or every
+// later mount in this process would sign with the wrong region/style.
+func TestWithS3EnvRestoresOnPanic(t *testing.T) {
+	t.Setenv("AWS_REGION", "eu-west-1")
+	t.Setenv("AWS_DEFAULT_REGION", "")
+	if err := os.Unsetenv("AWS_DEFAULT_REGION"); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(jfsS3VHostStyleEnv, "")
+	if err := os.Unsetenv(jfsS3VHostStyleEnv); err != nil {
+		t.Fatal(err)
+	}
+	func() {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatal("create did not panic")
+			}
+		}()
+		_, _ = withS3Env("us-west-2", true, func() (object.ObjectStorage, error) {
+			panic("construction failed")
+		})
+	}()
+	if got := os.Getenv("AWS_REGION"); got != "eu-west-1" {
+		t.Fatalf("AWS_REGION after panic = %q, want the previous value", got)
+	}
+	if _, ok := os.LookupEnv("AWS_DEFAULT_REGION"); ok {
+		t.Fatal("AWS_DEFAULT_REGION must stay unset after panic")
+	}
+	if _, ok := os.LookupEnv(jfsS3VHostStyleEnv); ok {
+		t.Fatal("JFS_S3_VHOST_STYLE must stay unset after panic")
+	}
+	// The mutex must have been released as well, or the next mount deadlocks.
+	if _, err := withS3Env("", false, func() (object.ObjectStorage, error) { return nil, nil }); err != nil {
+		t.Fatal(err)
+	}
+}
