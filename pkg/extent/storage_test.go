@@ -204,7 +204,7 @@ func TestCreateS3StorageHonoursForcePathStyle(t *testing.T) {
 	if _, ok := os.LookupEnv(jfsS3VHostStyleEnv); ok {
 		t.Fatal("test precondition: JFS_S3_VHOST_STYLE must be unset")
 	}
-	st, err := createS3Storage("http://127.0.0.1:19000/drive9-local", "drive9minio", "drive9minio", "", true)
+	st, err := createS3Storage("http://127.0.0.1:19000/drive9-local", "drive9minio", "drive9minio", "", "", true)
 	if err != nil {
 		t.Fatalf("path-style storage: %v", err)
 	}
@@ -214,7 +214,7 @@ func TestCreateS3StorageHonoursForcePathStyle(t *testing.T) {
 	if got := os.Getenv(jfsS3VHostStyleEnv); got != "" {
 		t.Fatalf("JFS_S3_VHOST_STYLE after construction = %q, want unset", got)
 	}
-	vhost, err := createS3Storage("http://127.0.0.1:19000/drive9-local", "drive9minio", "drive9minio", "", false)
+	vhost, err := createS3Storage("http://127.0.0.1:19000/drive9-local", "drive9minio", "drive9minio", "", "", false)
 	if err != nil {
 		t.Fatalf("virtual-host storage: %v", err)
 	}

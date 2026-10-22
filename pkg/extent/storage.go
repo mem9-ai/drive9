@@ -8,11 +8,14 @@ import (
 	"math/rand/v2"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/juicedata/juicefs/pkg/object"
 	"go.uber.org/zap"
 
@@ -164,8 +167,80 @@ func vhostStyleValue(forcePathStyle bool) string {
 	return "1"
 }
 
-// s3StyleMu serializes JFS_S3_VHOST_STYLE mutation; see createS3Storage.
+// s3StyleMu serializes the process-wide env mutation around s3 storage
+// construction; see createS3Storage.
 var s3StyleMu sync.Mutex
+
+// jfsS3RegionEnvs are the variables JuiceFS's s3 backend reads the signing
+// region from when the endpoint host does not encode one (compatible-S3
+// endpoints, ISO partitions). AWS_REGION wins over AWS_DEFAULT_REGION, so both
+// are set for the construction window.
+var jfsS3RegionEnvs = []string{"AWS_REGION", "AWS_DEFAULT_REGION"}
+
+// resolveRegionalEndpoint returns the endpoint JuiceFS reaches for region on the
+// standard AWS branch, resolved through the AWS SDK so partition suffixes
+// (amazonaws.com.cn, amazonaws.eu, the ISO domains) come from the same source
+// the server uses instead of a hand-maintained table. Empty when the region is
+// unknown; callers then keep whatever endpoint the credential carried.
+func resolveRegionalEndpoint(region string) string {
+	region = strings.TrimSpace(region)
+	if region == "" {
+		return ""
+	}
+	ep, err := s3.NewDefaultEndpointResolverV2().ResolveEndpoint(context.Background(),
+		s3.EndpointParameters{Region: aws.String(region)})
+	if err != nil {
+		return ""
+	}
+	return strings.TrimRight(ep.URI.String(), "/")
+}
+
+// awsStandardEndpointHost matches the plain S3 endpoints the region resolver
+// generates: s3.<region>.amazonaws.com[.cn], the China/eusc suffixes, the legacy
+// s3-<region> spelling, and the bare global s3.amazonaws.com. Deliberately not
+// matched: dual-stack, FIPS, S3 Express, VPC and custom hosts, whose addressing
+// the region resolver would not reproduce.
+var awsStandardEndpointHost = regexp.MustCompile(`^s3(?:[.-][a-z0-9-]+)?\.amazonaws\.(?:com|com\.cn|eu)$`)
+
+// isStandardAWSEndpoint reports whether raw is a plain AWS S3 regional endpoint
+// (including the legacy global one). Such an endpoint carries no information
+// beyond its region, so it must not outvote the region the credential was minted
+// for: JuiceFS parses the signer region out of the host before it reads
+// AWS_REGION, and a stale global host would make a us-west-2 filesystem sign for
+// us-east-1 again.
+func isStandardAWSEndpoint(raw string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Host == "" {
+		return false
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return false
+	}
+	if u.Port() != "" || u.RawQuery != "" || (u.Path != "" && u.Path != "/") {
+		return false
+	}
+	return awsStandardEndpointHost.MatchString(u.Hostname())
+}
+
+// s3EndpointForCredential picks the endpoint to hand JuiceFS: the credential's
+// own endpoint unless it is empty or a plain AWS regional endpoint, in which
+// case the endpoint resolved from the credential's region wins. Custom,
+// dual-stack, FIPS and VPC hosts are preserved.
+func s3EndpointForCredential(endpoint, region string) string {
+	endpoint = strings.TrimSpace(endpoint)
+	region = strings.TrimSpace(region)
+	if region == "" {
+		return endpoint
+	}
+	resolved := resolveRegionalEndpoint(region)
+	if resolved == "" {
+		return endpoint
+	}
+	if endpoint == "" || isStandardAWSEndpoint(endpoint) {
+		return resolved
+	}
+	return endpoint
+}
 
 // createS3Storage builds the JuiceFS s3 storage for one credential. JuiceFS
 // picks path style vs virtual-host style from JFS_S3_VHOST_STYLE alone and
@@ -173,8 +248,15 @@ var s3StyleMu sync.Mutex
 // exactly that window and restored afterwards. Honouring the credential keeps
 // the data plane consistent with the control plane: a bucket the server
 // reaches with virtual-host URLs is reached the same way from the mount.
-func createS3Storage(endpoint, accessKey, secretKey, token string, forcePathStyle bool) (object.ObjectStorage, error) {
-	return withS3StyleEnv(forcePathStyle, func() (object.ObjectStorage, error) {
+//
+// The credential's region is authoritative as well: the JuiceFS backend derives
+// it from the endpoint host only for *.amazonaws.com[.cn]; for compatible
+// endpoints (ISO partitions, MinIO/OSS/COS style hosts) it falls back to
+// AWS_REGION. Setting that for the construction window makes the mount sign with
+// the region the server minted the credential for, whatever host the endpoint
+// names — which is what lets a credential carry no endpoint at all.
+func createS3Storage(endpoint, accessKey, secretKey, token, region string, forcePathStyle bool) (object.ObjectStorage, error) {
+	return withS3Env(region, forcePathStyle, func() (object.ObjectStorage, error) {
 		return object.CreateStorage("s3", endpoint, accessKey, secretKey, token)
 	})
 }
@@ -182,17 +264,53 @@ func createS3Storage(endpoint, accessKey, secretKey, token string, forcePathStyl
 // withS3StyleEnv runs create with JFS_S3_VHOST_STYLE set to the value the
 // credential asks for, then restores the previous value.
 func withS3StyleEnv(forcePathStyle bool, create func() (object.ObjectStorage, error)) (object.ObjectStorage, error) {
+	return withS3Env("", forcePathStyle, create)
+}
+
+// withS3Env sets the style variable and, when the credential carries a region,
+// the region variables for the construction window, then restores the previous
+// values. An empty region leaves the region variables untouched (older servers
+// do not mint one).
+//
+// The restore is deferred so it also runs when construction panics: these are
+// process-wide variables shared by every mount under s3StyleMu, so a leak would
+// outlive the failed mount and sign every later one with the wrong region/style.
+func withS3Env(region string, forcePathStyle bool, create func() (object.ObjectStorage, error)) (object.ObjectStorage, error) {
 	s3StyleMu.Lock()
 	defer s3StyleMu.Unlock()
-	prev, had := os.LookupEnv(jfsS3VHostStyleEnv)
-	_ = os.Setenv(jfsS3VHostStyleEnv, vhostStyleValue(forcePathStyle))
-	st, err := create()
-	if had {
-		_ = os.Setenv(jfsS3VHostStyleEnv, prev)
-	} else {
-		_ = os.Unsetenv(jfsS3VHostStyleEnv)
+	region = strings.TrimSpace(region)
+	prevStyle, hadStyle := os.LookupEnv(jfsS3VHostStyleEnv)
+	prevRegion := make(map[string]string, len(jfsS3RegionEnvs))
+	hadRegion := make(map[string]bool, len(jfsS3RegionEnvs))
+	if region != "" {
+		for _, k := range jfsS3RegionEnvs {
+			prevRegion[k], hadRegion[k] = os.LookupEnv(k)
+		}
 	}
-	return st, err
+	defer func() {
+		if hadStyle {
+			_ = os.Setenv(jfsS3VHostStyleEnv, prevStyle)
+		} else {
+			_ = os.Unsetenv(jfsS3VHostStyleEnv)
+		}
+		if region == "" {
+			return
+		}
+		for _, k := range jfsS3RegionEnvs {
+			if hadRegion[k] {
+				_ = os.Setenv(k, prevRegion[k])
+			} else {
+				_ = os.Unsetenv(k)
+			}
+		}
+	}()
+	_ = os.Setenv(jfsS3VHostStyleEnv, vhostStyleValue(forcePathStyle))
+	if region != "" {
+		for _, k := range jfsS3RegionEnvs {
+			_ = os.Setenv(k, region)
+		}
+	}
+	return create()
 }
 
 func openInner(cred *Credential, src CredentialSource) (object.ObjectStorage, error) {
@@ -214,8 +332,15 @@ func openInner(cred *Credential, src CredentialSource) (object.ObjectStorage, er
 		}
 		return st, st.Create(context.Background())
 	case SchemeS3:
-		ep := endpointWithBucket(cred.Endpoint, cred.Bucket)
-		return createS3Storage(ep, cred.AccessKeyID, cred.SecretAccessKey, cred.SessionToken, cred.ForcePathStyle)
+		// The minted region is authoritative over a plain AWS endpoint: JuiceFS
+		// parses the signer region out of such a host before it reads
+		// AWS_REGION, so a stale global or wrong-region endpoint would sign for
+		// the wrong region again. An endpoint-less credential gets the region's
+		// endpoint instead of a GetBucketLocation call, which the tenant-prefix
+		// session policy does not grant. Custom/dual-stack/FIPS/VPC endpoints are
+		// preserved.
+		ep := endpointWithBucket(s3EndpointForCredential(cred.Endpoint, cred.Region), cred.Bucket)
+		return createS3Storage(ep, cred.AccessKeyID, cred.SecretAccessKey, cred.SessionToken, cred.Region, cred.ForcePathStyle)
 	case SchemeGCS:
 		// canonicalExtentScheme folds the object-backend/objectfs "gs" spelling
 		// onto the extent wire value "gcs". An endpoint is honoured for an
