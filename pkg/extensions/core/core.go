@@ -409,6 +409,18 @@ func (c *Core) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, erro
 	return fs.Result{}, fs.ErrUnsupported
 }
 
+// emitLanded publishes a terminal commit so read-side planes can refresh
+// the identity of other open descriptors. The terminal is the only
+// component that ALWAYS sees the commit (writeback is optional): without
+// this, a core-only mount cleared its dirty bypass at fsync while readers
+// still held the pre-write revision.
+func (c *Core) emitLanded(path string, rev, size int64) {
+	if c.bus == nil {
+		return
+	}
+	c.bus.Emit(fs.Event{Kind: fs.EventLanded, Path: path, Rev: rev, Size: size, HasSize: true})
+}
+
 // WriteSync durably writes data at off: it returns only after the server
 // has committed the whole file image (write-sync durability).
 func (c *Core) WriteSync(ctx context.Context, path string, off int64, data []byte, mode uint32) error {
@@ -440,6 +452,11 @@ func (c *Core) WriteSync(ctx context.Context, path string, off int64, data []byt
 					return c.mapErr(err)
 				}
 			}
+			rev := int64(0)
+			if st, serr := c.remoteStatDetached(rp); serr == nil && st != nil {
+				rev = st.Revision
+			}
+			c.emitLanded(path, rev, int64(len(data)))
 			return nil
 		}
 		content, merr := c.mergeAt(ctx, rp, st, off, data)
@@ -447,7 +464,8 @@ func (c *Core) WriteSync(ctx context.Context, path string, off int64, data []byt
 			return merr
 		}
 		start := time.Now()
-		if werr := c.cl.WriteStreamConditional(ctx, rp, bytes.NewReader(content), int64(len(content)), nil, st.Revision); werr != nil {
+		committed, werr := c.cl.WriteStreamConditionalWithChecksum(ctx, rp, bytes.NewReader(content), int64(len(content)), nil, st.Revision, "")
+		if werr != nil {
 			if errors.Is(werr, client.ErrConflict) {
 				continue // revision moved under us; re-stat and re-patch
 			}
@@ -455,6 +473,11 @@ func (c *Core) WriteSync(ctx context.Context, path string, off int64, data []byt
 			return c.mapErr(werr)
 		}
 		c.recordRemote("write", start, nil, uint64(len(content)))
+		if committed != nil {
+			c.emitLanded(path, committed.Revision, committed.Size)
+		} else {
+			c.emitLanded(path, 0, int64(len(content)))
+		}
 		if mode == 0 && st.HasMode && st.Mode&0o7777 != 0o644 {
 			// The server resets permissions on whole-image PUTs; an
 			// explicitly chmod'd file keeps its mode across writes. The
@@ -1231,6 +1254,7 @@ func (c *Core) setAttrOp(ctx context.Context, op *fs.Op) (fs.Result, error) {
 		if st, serr := c.remoteStatDetached(rp); serr == nil && st != nil {
 			attr.Rev = st.Revision
 		}
+		c.emitLanded(op.Path, attr.Rev, op.Size)
 	}
 	// op.Mtime: the backend derives mtimes from writes and has no mtime
 	// verb, so timestamp changes are accepted as no-ops rather than lying

@@ -453,11 +453,35 @@ func TestPortLandedRevokesReaderIdentity(t *testing.T) {
 	}
 	h := &cachingHandle{cache: c, path: "/f", size: 5, rev: 3, grown: true}
 	c.open.Store(h, struct{}{})
-	bus.Emit(fs.Event{Kind: fs.EventLanded, Path: "/f", Rev: 4})
+	bus.Emit(fs.Event{Kind: fs.EventLanded, Path: "/f", Rev: 4, Size: 12, HasSize: true})
 	h.mu.Lock()
-	rev, grown := h.rev, h.grown
+	size, rev, grown := h.size, h.rev, h.grown
 	h.mu.Unlock()
-	if rev != 4 || grown {
-		t.Fatalf("identity = rev %d grown %v, want the landed revision and a clear grown flag", rev, grown)
+	if rev != 4 || size != 12 || grown {
+		t.Fatalf("identity = size %d rev %d grown %v, want the LANDED size/revision", size, rev, grown)
+	}
+	if _, ok := c.mem.Get("/f", 4); ok {
+		t.Fatal("a rev-keyed seed was swept by its own landing")
+	}
+}
+
+// A renamed dirty writer carries its ownership to the new name.
+func TestPortRenameMigratesDirtyOwnership(t *testing.T) {
+	c, err := New(Options{MaxSize: 1 << 20, MaxFileSize: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &cachingHandle{cache: c, path: "/f"}
+	c.noteDirty("/f", h)
+	h.SetPath("/g")
+	if c.dirtyPath("/f") {
+		t.Fatal("the old name kept the writer's dirty mark")
+	}
+	if !c.dirtyPath("/g") {
+		t.Fatal("the new name did not inherit the dirty mark")
+	}
+	c.clearDirty("/g", h)
+	if c.dirtyPath("/g") {
+		t.Fatal("the writer's boundary did not clear its mark")
 	}
 }

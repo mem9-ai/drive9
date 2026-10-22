@@ -406,7 +406,7 @@ func New(opts Options) (*Writeback, error) {
 				// the committed entry in place (inode size + dir cache via
 				// Landed carrying the size) — never the parent listing, the
 				// kernel view, or unrelated cached data.
-				opts.Events.Emit(fs.Event{Kind: fs.EventLanded, Path: meta.Path, Rev: committedRev, Size: meta.Size})
+				opts.Events.Emit(fs.Event{Kind: fs.EventLanded, Path: meta.Path, Rev: committedRev, Size: meta.Size, HasSize: true})
 			}
 		}
 		w.uploader = up
@@ -445,7 +445,7 @@ func New(opts Options) (*Writeback, error) {
 			if opts.Events != nil {
 				// a local async commit completion is not an external
 				// change — no kernel notify, no listing invalidation.
-				opts.Events.Emit(fs.Event{Kind: fs.EventLanded, Path: entry.Path, Rev: committedRev, Size: entry.Size})
+				opts.Events.Emit(fs.Event{Kind: fs.EventLanded, Path: entry.Path, Rev: committedRev, Size: entry.Size, HasSize: true})
 			}
 		}
 		q.PathLock = w.pathLocks.lock
@@ -3452,7 +3452,7 @@ func (w *Writeback) invalidateRev(path string, rev, size int64) {
 		// listing caches update the entry (cacheFileForPath) instead of
 		// serving the pre-commit image's attributes; the committed revision
 		// keys the read-cache seed (rev>0 commits settle in place).
-		w.opts.Events.Emit(fs.Event{Kind: fs.EventLanded, Path: path, Rev: rev, Size: size})
+		w.opts.Events.Emit(fs.Event{Kind: fs.EventLanded, Path: path, Rev: rev, Size: size, HasSize: true})
 	}
 }
 

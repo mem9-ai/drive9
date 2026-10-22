@@ -538,3 +538,47 @@ func TestPortUnlinkSkipsAnonymousTargetReads(t *testing.T) {
 	}
 	_ = old.Handle.Release(ctx)
 }
+
+// The terminal publishes its own landed commits, so read-side planes can
+// refresh sibling readers without the optional writeback extension.
+func TestPortCorePublishesLandedCommit(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/f", []byte("hello"))
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	bus := fs.NewEventBus()
+	c, err := New(client.New(ts.URL, ""), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.AttachEvents(bus)
+	var got []fs.Event
+	var mu sync.Mutex
+	bus.On(fs.EventLanded, func(e fs.Event) {
+		mu.Lock()
+		got = append(got, e)
+		mu.Unlock()
+	})
+	ch, err := fs.NewChain(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/f", Flags: uint32(syscall.O_RDWR)})
+	if err != nil || res.Handle == nil {
+		t.Fatalf("open = %v", err)
+	}
+	if err := res.Handle.Write(ctx, 0, []byte("HELLO")); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	events := append([]fs.Event(nil), got...)
+	mu.Unlock()
+	if len(events) == 0 {
+		t.Fatal("a successful terminal write published no landed event")
+	}
+	last := events[len(events)-1]
+	if !last.HasSize || last.Size != 5 || last.Rev <= 0 {
+		t.Fatalf("landed = %+v, want HasSize with the committed size/revision", last)
+	}
+}

@@ -53,7 +53,11 @@ type Event struct {
 	Path      string // canonical absolute path the event concerns
 	Rev       int64  // EventLanded: the revision the remote acknowledged
 	Size      int64  // EventLanded: the landed size
-	Epoch     uint64 // mutation epoch captured at handoff (see InodeTable)
+	// HasSize distinguishes a landed image of size 0 (an emptied file) from
+	// an event that carries no size at all: readers adopt Size as their new
+	// identity only when this is set.
+	HasSize bool
+	Epoch   uint64 // mutation epoch captured at handoff (see InodeTable)
 	// KernelInvalidate asks the facade to flush the KERNEL caches for every
 	// inode in addition to the userspace tiers (a 401 view reset: the
 	// credential may now address a different namespace). A plain SSE

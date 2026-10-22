@@ -248,6 +248,12 @@ func New(opts Options) (*Cache, error) {
 				if e.Rev > 0 {
 					h.rev = e.Rev
 				}
+				if e.HasSize {
+					// Adopt the LANDED size: a reader that kept its
+					// open-time size answered EOF past the old end after
+					// the file grew (a disk range key clips against it).
+					h.size = e.Size
+				}
 				h.grown = false
 				h.mu.Unlock()
 				return true
@@ -355,6 +361,28 @@ func (c *Cache) noteDirty(path string, h *cachingHandle) {
 		c.dirty = map[string]int{}
 	}
 	c.dirty[path]++
+	c.dirtyMu.Unlock()
+}
+
+// moveDirty migrates the mark a handle owns from oldPath to newPath (rename
+// retarget). A no-op when the handle owns nothing.
+func (c *Cache) moveDirty(oldPath, newPath string, h *cachingHandle) {
+	h.mu.Lock()
+	owned := h.dirtyOwned
+	h.mu.Unlock()
+	if !owned || oldPath == newPath {
+		return
+	}
+	c.dirtyMu.Lock()
+	if n := c.dirty[oldPath]; n > 1 {
+		c.dirty[oldPath] = n - 1
+	} else {
+		delete(c.dirty, oldPath)
+	}
+	if c.dirty == nil {
+		c.dirty = map[string]int{}
+	}
+	c.dirty[newPath]++
 	c.dirtyMu.Unlock()
 }
 
@@ -842,8 +870,16 @@ func (h *cachingHandle) identity() string {
 // SetPath retargets the handle (and its prefetcher) onto the renamed path.
 func (h *cachingHandle) SetPath(p string) {
 	h.mu.Lock()
+	old := h.path
 	h.path = p
 	h.mu.Unlock()
+	if old != p {
+		// The dirty mark is ownership-based and keyed by path: leaving it
+		// on the old name bypassed caches for a later same-name file
+		// forever, while the writer's own boundary now cleared the new
+		// name (a no-op) and never the old one.
+		h.cache.moveDirty(old, p, h)
+	}
 	if h.prefetch != nil {
 		// The prefetcher addresses the REMOTE namespace: a retarget that
 		// handed it the view path mixed a same-named file outside the
