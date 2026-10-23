@@ -97,6 +97,14 @@ type AppendLog struct {
 	// incarnation mints a fresh file identity for every NEW handle claim
 	// (dedup must never bridge a deleted file and its recreation).
 	incarnation atomic.Uint64
+	// objGen mints the identity of the OBJECT behind a name: every fd
+	// opened while the same object holds the name shares one generation,
+	// and a name rebound by an unlink + recreate gets a new one. Cross-fd
+	// sharing (read-your-writes, append baselines, truncate visibility)
+	// is scoped to one generation — an anonymous fd of a deleted object
+	// and a live fd of its same-name successor never see each other's
+	// bytes.
+	objGen atomic.Uint64
 }
 
 func New(opts Options) (*AppendLog, error) {
@@ -194,10 +202,28 @@ func (a *AppendLog) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			// mint an identity the landed-generation dedup cannot bridge
 			// across an unlink + recreate of the same name.
 			incarnation: a.incarnation.Add(1),
+			// A recreated name is a new object even if a stale remote
+			// entry survived; otherwise the fd joins the object its live
+			// siblings already hold.
+			objGen: a.claimObjectGen(op.Path, tombstoned),
 		}
 		if !isNew && st != nil {
 			h.baseRev, h.origSize = st.Revision, st.Size
 			h.observeLayoutLocked(st.ContentLayout, st.Revision, st.Size)
+			if op.Flags&uint32(syscall.O_TRUNC) != 0 &&
+				op.Flags&(uint32(syscall.O_WRONLY)|uint32(syscall.O_RDWR)) != 0 {
+				// open(O_TRUNC): the image starts EMPTY. Seeding the buffer
+				// with the pre-open size composed the first write over the
+				// old bytes (X over abcdef published Xbcdef) while the lower
+				// plane still owed a truncation; the committed baseline
+				// stays the CAS fence of the rewrite (recordTruncate), and
+				// the truncation is pending from the claim so a write-less
+				// close still publishes size 0.
+				if err := h.truncateLocked(0); err != nil {
+					return fs.Result{}, err
+				}
+				a.dropCleanSiblingImages(a.sameObjectSiblings(h))
+			}
 		}
 		a.track(h)
 		res.Handle = h
@@ -1103,15 +1129,18 @@ type Handle struct {
 	inner fs.Handle
 	flags uint32
 
-	mu             sync.Mutex
-	buf            *writebuffer.WriteBuffer
-	st             appendLogHandleState
-	dirty          bool
-	isNew          bool
-	baseRev        int64
-	origSize       int64
-	seq            int64
-	incarnation    uint64
+	mu          sync.Mutex
+	buf         *writebuffer.WriteBuffer
+	st          appendLogHandleState
+	dirty       bool
+	isNew       bool
+	baseRev     int64
+	origSize    int64
+	seq         int64
+	incarnation uint64
+	// objGen is the object generation this fd belongs to (AppendLog.objGen);
+	// immutable after the claim, so it is read without h.mu.
+	objGen         uint64
 	unlinked       bool
 	pendingMode    uint32
 	hasPendingMode bool
@@ -1263,15 +1292,14 @@ func (a *AppendLog) readLiveAppendBuffer(ctx context.Context, reader *Handle, of
 	// both raced and could miss the newest local image. TryLock keeps the
 	// caller's h.mu from deadlocking against a sibling mid-refresh.
 	//
-	// The caller holds reader.mu, so its anonymity is stable here: an
-	// anonymous fd may still see its deleted object's other anonymous fds,
-	// but a live-name fd (e.g. opened after a same-name recreate) must not
-	// read the OLD object's buffered image through the shared path.
-	readerAnon := reader.unlinked
+	// Only fds of the SAME object generation share an image: an anonymous
+	// fd of a deleted object and a live fd of its same-name successor (or
+	// two anonymous fds of two deleted generations) must never read each
+	// other's buffered bytes.
 	var candidates []*Handle
 	set.mu.Lock()
 	for h := range set.set {
-		if h != reader {
+		if h != reader && h.objGen == reader.objGen {
 			candidates = append(candidates, h)
 		}
 	}
@@ -1281,7 +1309,7 @@ func (a *AppendLog) readLiveAppendBuffer(ctx context.Context, reader *Handle, of
 		if !h.mu.TryLock() {
 			continue
 		}
-		ready := h.dirty && h.buf != nil && (readerAnon || !h.unlinked)
+		ready := h.dirty && h.buf != nil
 		h.mu.Unlock()
 		if ready {
 			served = h
@@ -1333,28 +1361,24 @@ func (h *Handle) refreshAppendBaselineLocked(ctx context.Context) error {
 	set.mu.Lock()
 	candidates := make([]*Handle, 0, len(set.set))
 	for other := range set.set {
-		candidates = append(candidates, other)
+		// Same object generation only: a sibling of a deleted (or
+		// recreated) same-name object is not a baseline source.
+		if other != h && other.objGen == h.objGen {
+			candidates = append(candidates, other)
+		}
 	}
 	set.mu.Unlock()
-	// An anonymous sibling's buffered bytes belong to the deleted object:
-	// a live-name handle (e.g. opened after a same-name recreate) must not
-	// adopt them as its append baseline. Anonymous handles among
-	// themselves still merge (same deleted object).
 	for _, other := range candidates {
-		if other == h {
-			continue
-		}
 		if !other.mu.TryLock() {
 			continue
 		}
 		size := int64(-1)
 		dirty := other.dirty
-		otherAnon := other.unlinked
 		if other.buf != nil {
 			size = other.buf.Size()
 		}
 		other.mu.Unlock()
-		if dirty && (h.unlinked || !otherAnon) && size > newestSize {
+		if dirty && size > newestSize {
 			newest, newestSize = other, size
 		}
 	}
@@ -1416,11 +1440,38 @@ func (h *Handle) Release(ctx context.Context) error {
 	return err
 }
 
-// Truncate applies a local truncation through the state machine (used by
-// SetAttr interception on live paths).
+// Truncate applies an fd-truncate through the state machine (SetAttr
+// interception on live paths). The truncation is the OBJECT's image from
+// now on, for every fd: a clean sibling drops its loaded copy so its reads
+// route through this handle's dirty buffer until the truncation lands,
+// while a sibling that still holds unflushed bytes is a conflict the two
+// fds cannot reconcile locally — EAGAIN (v1), never a truncate that the
+// sibling's larger pending image immediately contradicts.
 func (h *Handle) Truncate(size int64) error {
+	siblings := h.a.sameObjectSiblings(h)
+	for _, o := range siblings {
+		o.mu.Lock()
+		busy := o.dirty && o.buf != nil
+		o.mu.Unlock()
+		if busy {
+			return syscall.EAGAIN
+		}
+	}
 	h.mu.Lock()
-	defer h.mu.Unlock()
+	if err := h.truncateLocked(size); err != nil {
+		h.mu.Unlock()
+		return err
+	}
+	h.mu.Unlock()
+	h.a.dropCleanSiblingImages(siblings)
+	return nil
+}
+
+// truncateLocked is the owner-side truncate: the local image shrinks or
+// zero-grows, tail appends and the WAL reset are fenced for this
+// generation, and the committed baseline is captured as the rewrite's CAS
+// base. Caller holds h.mu.
+func (h *Handle) truncateLocked(size int64) error {
 	if err := h.ensureBuffer(context.Background()); err != nil {
 		return err
 	}
@@ -1431,6 +1482,48 @@ func (h *Handle) Truncate(size int64) error {
 	h.seq++
 	h.dirty = true
 	return nil
+}
+
+// sameObjectSiblings lists the OTHER live fds of h's object generation.
+func (a *AppendLog) sameObjectSiblings(h *Handle) []*Handle {
+	var out []*Handle
+	for _, o := range a.liveHandles(h.path) {
+		if o != h && o.objGen == h.objGen {
+			out = append(out, o)
+		}
+	}
+	return out
+}
+
+// dropCleanSiblingImages discards the loaded image of every clean sibling
+// so their next read routes through the truncating fd's dirty buffer
+// (read-your-writes) instead of the pre-truncate copy they loaded.
+func (a *AppendLog) dropCleanSiblingImages(siblings []*Handle) {
+	for _, o := range siblings {
+		o.mu.Lock()
+		if !o.dirty {
+			o.buf = nil
+		}
+		o.mu.Unlock()
+	}
+}
+
+// claimObjectGen resolves the object generation of a new claim: a
+// recreated name (fresh) is always a new object; otherwise the fd joins
+// the generation its live, non-anonymous siblings hold, and mints one when
+// there is none.
+func (a *AppendLog) claimObjectGen(path string, fresh bool) uint64 {
+	if !fresh {
+		for _, o := range a.liveHandles(path) {
+			o.mu.Lock()
+			anon := o.unlinked
+			o.mu.Unlock()
+			if !anon {
+				return o.objGen
+			}
+		}
+	}
+	return a.objGen.Add(1)
 }
 
 // setPendingMode defers a chmod to the next successful commit.

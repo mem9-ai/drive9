@@ -3240,13 +3240,18 @@ func modeOr644(mode uint32, hasMode bool) uint32 {
 // MarkPublished retires a pending creation whose publication another
 // plane owns (the append-log plane uploading the payload itself):
 // forwarding later Flush/Sync/Release to this handle must not
-// materialize its empty image over the committed upload.
+// materialize its empty image over the committed upload. An open(O_TRUNC)
+// truncation is retired with it — the owning plane's image started empty,
+// so its upload already published the truncation, and materializing the
+// zero base here CAS-ed the pre-upload revision (EAGAIN after the upload
+// had landed).
 func (h *bufferingHandle) MarkPublished() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.buf == nil || h.buf.Size() == 0 {
 		h.dirty = false
 		h.visTrunc = false
+		h.trunc = false
 		h.stagedToCache = false
 		h.landed = true
 		h.isNew = false
