@@ -216,11 +216,13 @@ func (a *AppendLog) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 				// plane still owed a truncation; the committed baseline
 				// stays the CAS fence of the rewrite (recordTruncate), and
 				// the truncation is pending from the claim so a write-less
-				// close still publishes size 0.
+				// close still publishes size 0. Every other fd of the object
+				// is truncated with it (POSIX): a sibling's uncommitted
+				// bytes are discarded, not reported as the size of record.
 				if err := h.truncateLocked(0); err != nil {
 					return fs.Result{}, err
 				}
-				a.dropCleanSiblingImages(a.sameObjectSiblings(h))
+				a.discardSiblingImages(a.sameObjectSiblings(h))
 			}
 		}
 		a.track(h)
@@ -844,12 +846,22 @@ func (a *AppendLog) refreshCleanSiblings(path string, rev, size int64, self *Han
 			continue
 		}
 		other.mu.Lock()
-		if !other.dirty && !other.unlinked {
+		// A PURE truncator (an uncommitted truncation with no bytes of its
+		// own beyond it) is superseded by a landing that composed over that
+		// truncation: the object already embodies it, and publishing the
+		// bare truncation afterwards would only CAS-conflict at its close.
+		supersededTruncator := other.dirty && other.truncPending && other.buf != nil &&
+			other.buf.Size() == other.truncTo && size >= other.truncTo && other.objGen == self.objGen
+		if (!other.dirty || supersededTruncator) && !other.unlinked {
 			other.isNew = false
 			other.baseRev = rev
 			other.origSize = size
 			other.buf = nil // re-read lazily from the committed image
+			other.dirty = false
 			other.observeLayoutLocked(client.ContentLayoutAppendLog, rev, size)
+			if supersededTruncator {
+				other.adoptCommittedBaselineLocked(rev, size)
+			}
 		}
 		other.mu.Unlock()
 	}
@@ -934,24 +946,34 @@ func (a *AppendLog) pathHasAnonymousHandle(path string) bool {
 }
 
 // pendingLiveSize reports the path's size of record while a live append
-// buffer holds uncommitted changes: path-level stats take the largest
-// dirty buffer (read-your-writes across fds). Anonymous fds never speak
-// for the name — after a recreate they belong to the deleted object.
+// buffer holds uncommitted changes: when an uncommitted truncation is
+// pending, only images that embody it count (they supersede every older
+// pending image, e.g. a sibling's larger pre-truncation append); else
+// path-level stats take the largest dirty buffer (read-your-writes across
+// fds). Anonymous fds never speak for the name — after a recreate they
+// belong to the deleted object.
 func (a *AppendLog) pendingLiveSize(path string) (int64, bool) {
-	best := int64(-1)
+	best, bestTrunc := int64(-1), int64(-1)
 	for _, h := range a.liveHandles(path) {
 		h.mu.Lock()
 		if h.dirty && h.buf != nil && !h.unlinked {
-			if s := h.buf.Size(); s > best {
+			s := h.buf.Size()
+			if s > best {
 				best = s
+			}
+			if h.truncPending && s > bestTrunc {
+				bestTrunc = s
 			}
 		}
 		h.mu.Unlock()
 	}
-	if best < 0 {
-		return 0, false
+	switch {
+	case bestTrunc >= 0:
+		return bestTrunc, true
+	case best >= 0:
+		return best, true
 	}
-	return best, true
+	return 0, false
 }
 
 // pendingLiveMode reports the path's mode of record while a live handle
@@ -1179,6 +1201,14 @@ type Handle struct {
 	unlinked       bool
 	pendingMode    uint32
 	hasPendingMode bool
+	// truncPending/truncTo record an uncommitted truncation this fd's image
+	// embodies (its own ftruncate/open(O_TRUNC), or a sibling's that it
+	// composed over). While pending it is the OBJECT's size of record:
+	// siblings seed their write buffers at truncTo instead of the remote's
+	// pre-truncation size, and stats report it over larger stale images.
+	// Cleared when a committed baseline is adopted.
+	truncPending bool
+	truncTo      int64
 	// unlinkAtRelease performs the deferred remote delete of an
 	// unlinked-but-open path at the last close.
 	unlinkAtRelease func(ctx context.Context) error
@@ -1218,10 +1248,28 @@ func (h *Handle) Read(ctx context.Context, off int64, dest []byte) (int, error) 
 }
 
 func (h *Handle) Write(ctx context.Context, off int64, data []byte) error {
+	// A sibling's confirmed-but-uncommitted truncation is the object's image
+	// this write composes over. Resolved BEFORE taking h.mu (sibling locks
+	// are never nested under it): ensureBuffer below seeds from this fd's
+	// pre-truncation origSize, which resurrected the truncated-away tail
+	// (truncate to 2 on h2, write Y at 1 on h1 published aYcdef instead of
+	// aY; an O_APPEND write landed at the stale 6 instead of 2).
+	siblingTrunc, hasSiblingTrunc := h.a.siblingPendingTruncation(h)
 	h.mu.Lock()
 	if err := h.ensureBuffer(ctx); err != nil {
 		h.mu.Unlock()
 		return err
+	}
+	if hasSiblingTrunc && !h.truncPending {
+		if h.buf.Size() != siblingTrunc {
+			if err := h.buf.Truncate(siblingTrunc); err != nil {
+				h.mu.Unlock()
+				return err
+			}
+		}
+		h.recordTruncate()
+		h.truncPending, h.truncTo = true, siblingTrunc
+		h.seq++
 	}
 	// O_APPEND: the kernel may deliver off=0; the write lands at the
 	// buffer tail. First re-derive that tail from the newest same-path
@@ -1514,6 +1562,7 @@ func (h *Handle) truncateLocked(size int64) error {
 		return err
 	}
 	h.recordTruncate()
+	h.truncPending, h.truncTo = true, size
 	h.seq++
 	h.dirty = true
 	return nil
@@ -1541,6 +1590,41 @@ func (a *AppendLog) dropCleanSiblingImages(siblings []*Handle) {
 		}
 		o.mu.Unlock()
 	}
+}
+
+// discardSiblingImages is open(O_TRUNC)'s sibling coordination: POSIX
+// truncates the file for every fd at once, so a sibling's uncommitted bytes
+// are gone too (the truncator's image is the object's). Dirty siblings lose
+// their pending image; every sibling drops its loaded copy and re-derives
+// its base on the next touch — from the pending truncation while it is
+// uncommitted (siblingPendingTruncation), from the landed image after
+// (refreshCleanSiblings).
+func (a *AppendLog) discardSiblingImages(siblings []*Handle) {
+	for _, o := range siblings {
+		o.mu.Lock()
+		if o.dirty {
+			o.dirty = false
+			o.truncPending, o.truncTo = false, 0
+			o.seq++
+		}
+		o.buf = nil
+		o.mu.Unlock()
+	}
+}
+
+// siblingPendingTruncation reports the uncommitted truncation held by a
+// dirty sibling of h's object, the size this fd's image must compose over.
+// Caller must not hold h.mu (sibling locks are taken one at a time).
+func (a *AppendLog) siblingPendingTruncation(h *Handle) (int64, bool) {
+	size, ok := int64(0), false
+	for _, o := range a.sameObjectSiblings(h) {
+		o.mu.Lock()
+		if o.dirty && o.truncPending && (!ok || o.truncTo < size) {
+			size, ok = o.truncTo, true
+		}
+		o.mu.Unlock()
+	}
+	return size, ok
 }
 
 // claimObjectGen resolves the object generation of a new claim: a
@@ -1821,6 +1905,7 @@ func (h *Handle) adoptCommittedBaselineLocked(revision, size int64) {
 	h.st.rewriteBaseSize = 0
 	h.st.sqliteWALTruncated = false
 	h.st.clearSQLiteWALHeaderWrite()
+	h.truncPending, h.truncTo = false, 0
 	if h.st.layout != "" && revision > 0 && size >= 0 {
 		h.st.revision = revision
 		h.st.size = size
