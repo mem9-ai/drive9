@@ -142,9 +142,34 @@ func (a *AppendLog) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		if _, hidden := a.unlinked.Load(op.Path); hidden {
 			return fs.Result{}, fs.ErrNotFound
 		}
-		return next(ctx, op)
+		res, err := next(ctx, op)
+		if err != nil {
+			return res, err
+		}
+		// A live handle's uncommitted truncate/append is the path's size of
+		// record: answering the lower plane's last committed size let the
+		// stale value reach the SETATTR reply, the inode entry, and the
+		// kernel attribute cache.
+		if res.Attr != nil {
+			if size, ok := a.pendingLiveSize(op.Path); ok {
+				res.Attr.Size = size
+			}
+		}
+		return res, nil
 
 	case fs.OpCreate:
+		// A previous unlink's tombstone must neither hide nor collide with
+		// the recreated name: land the deferred remote delete now (the old
+		// fds' anonymity is per-handle and survives the recreate) and drop
+		// the tombstone once the create succeeds. Keeping it made Lookup of
+		// the NEW file answer ENOENT until the last old fd closed.
+		tombstoned := false
+		if _, hidden := a.unlinked.Load(op.Path); hidden {
+			if err := a.landDeferredUnlink(ctx, op.Path); err != nil {
+				return fs.Result{}, err
+			}
+			tombstoned = true
+		}
 		// Resolve the authoritative baseline before claiming: isNew means
 		// the file does not exist yet, not just O_CREAT.
 		st, statErr := a.cl.StatCtx(ctx, a.remotePath(op.Path))
@@ -155,6 +180,9 @@ func (a *AppendLog) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		res, err := next(ctx, op)
 		if err != nil {
 			return res, err
+		}
+		if tombstoned {
+			a.unlinked.Delete(op.Path)
 		}
 		h := &Handle{
 			a:     a,
@@ -214,7 +242,17 @@ func (a *AppendLog) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 				if err := h.Truncate(op.Size); err != nil {
 					return fs.Result{}, err
 				}
-				return fs.Result{}, nil
+				// The truncated Attr must ride the reply: an empty Result
+				// made the facade fall back to a passthrough GetAttr that
+				// still reported the lower plane's pre-truncate committed
+				// size.
+				attr := &fs.Attr{Kind: fs.KindFile, Mode: syscall.S_IFREG | 0o644, Size: op.Size}
+				if gr, gerr := next(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: op.Path, Ino: op.Ino, Fh: op.Fh, Kernel: op.Kernel, Caller: op.Caller}); gerr == nil && gr.Attr != nil {
+					merged := *gr.Attr
+					merged.Size = op.Size
+					attr = &merged
+				}
+				return fs.Result{Attr: attr}, nil
 			}
 			handled, err := a.truncatePath(ctx, op.Path, op.Size)
 			if !handled {
@@ -228,15 +266,17 @@ func (a *AppendLog) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		if h := a.handleFor(op.Path); h != nil {
 			if _, deferred := a.facadeDeferred.LoadAndDelete(op.Path); deferred {
 				// The facade already deferred this delete (MarkPathUnlinked)
-				// and is landing it now, before a same-name create: the
-				// name must go NOW. The old fd keeps a local image.
-				if err := h.ensureBuffer(ctx); err != nil {
+				// and is landing it now, before a same-name create: the name
+				// must go NOW. EVERY open fd of the deleted object goes
+				// anonymous — anonymizing only the newest claim left older
+				// fds live on the path, and after a same-name recreate their
+				// commits published the old image over the new object.
+				if err := a.anonymizeHandles(ctx, op.Path); err != nil {
 					return fs.Result{}, err
 				}
-				h.mu.Lock()
-				h.unlinked = true
-				h.unlinkAtRelease = nil
-				h.mu.Unlock()
+				// The delete lands now: no fd may re-delete the name later
+				// (it could have been recreated in the meantime).
+				a.retirePendingUnlinks(op.Path)
 				a.unlinked.Store(op.Path, struct{}{})
 				_, derr := next(ctx, &fs.Op{Kind: fs.OpUnlink, Path: op.Path})
 				if derr != nil && !fs.IsNotFound(derr) {
@@ -413,6 +453,11 @@ func (a *AppendLog) tryGenerationReset(ctx context.Context, h *Handle) error {
 	if err := h.applyPendingMode(ctx); err != nil {
 		return err
 	}
+	// The rotation re-published the object at a fresh revision: a clean
+	// sibling still CAS-es against the pre-rotation baseline, so its next
+	// frame append fails with EAGAIN — adopt the new generation in it just
+	// like the tail/rewrite landings do.
+	a.refreshCleanSiblings(h.path, revision, sqliteWALHeaderSize, h)
 	a.emit(fs.Event{Kind: fs.EventLanded, Path: h.path, Rev: revision, Size: sqliteWALHeaderSize, HasSize: true})
 	return nil
 }
@@ -776,17 +821,7 @@ func (a *AppendLog) MarkPathUnlinked(p string) {
 // re-cache) the pre-commit image under the new revision. Dirty siblings
 // keep their own CAS base (their composition still owns the tail).
 func (a *AppendLog) refreshCleanSiblings(path string, rev, size int64, self *Handle) {
-	v, ok := a.live.Load(path)
-	if !ok {
-		return
-	}
-	set := v.(*liveHandleSet)
-	set.mu.Lock()
-	candidates := make([]*Handle, 0, len(set.set))
-	for other := range set.set {
-		candidates = append(candidates, other)
-	}
-	set.mu.Unlock()
+	candidates := a.liveHandles(path)
 	for _, other := range candidates {
 		if other == self {
 			continue
@@ -801,6 +836,105 @@ func (a *AppendLog) refreshCleanSiblings(path string, rev, size int64, self *Han
 		}
 		other.mu.Unlock()
 	}
+}
+
+// liveHandles snapshots the path's open protocol handles (set mutex only
+// while copying; handle state is the caller's business).
+func (a *AppendLog) liveHandles(path string) []*Handle {
+	v, ok := a.live.Load(path)
+	if !ok {
+		return nil
+	}
+	set := v.(*liveHandleSet)
+	set.mu.Lock()
+	candidates := make([]*Handle, 0, len(set.set))
+	for h := range set.set {
+		candidates = append(candidates, h)
+	}
+	set.mu.Unlock()
+	return candidates
+}
+
+// anonymizeHandles anonymizes EVERY live handle of the path: only the
+// newest claim used to be anonymized, leaving earlier fds live on the
+// path — after a same-name recreate their clean state adopted the new
+// object's revision and their next commit published the OLD image over the
+// new file.
+func (a *AppendLog) anonymizeHandles(ctx context.Context, path string) error {
+	for _, h := range a.liveHandles(path) {
+		if err := h.anonymize(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// landDeferredUnlink runs and retires every pending deferred delete of the
+// path before a same-name create: the old object's remote entry must be
+// gone (a create would collide or compose over it), while the old fds keep
+// their anonymous local images.
+func (a *AppendLog) landDeferredUnlink(ctx context.Context, path string) error {
+	for _, o := range a.liveHandles(path) {
+		o.mu.Lock()
+		pending := o.unlinkAtRelease
+		o.mu.Unlock()
+		if pending == nil {
+			continue
+		}
+		if err := pending(ctx); err != nil && !fs.IsNotFound(err) {
+			return err
+		}
+		o.mu.Lock()
+		o.unlinkAtRelease = nil
+		o.mu.Unlock()
+	}
+	return nil
+}
+
+// retirePendingUnlinks drops every pending deferred delete of the path
+// without running it (the delete landed through another path; a later
+// Release must not remove whatever object holds the name by then).
+func (a *AppendLog) retirePendingUnlinks(path string) {
+	for _, o := range a.liveHandles(path) {
+		o.mu.Lock()
+		o.unlinkAtRelease = nil
+		o.mu.Unlock()
+	}
+}
+
+// pathHasAnonymousHandle reports whether any open fd of the path still
+// holds an unlinked image.
+func (a *AppendLog) pathHasAnonymousHandle(path string) bool {
+	for _, o := range a.liveHandles(path) {
+		o.mu.Lock()
+		anon := o.unlinked
+		o.mu.Unlock()
+		if anon {
+			return true
+		}
+	}
+	return false
+}
+
+// pendingLiveSize reports the path's size of record while a live append
+// buffer holds uncommitted changes: path-level stats take the largest
+// dirty buffer (read-your-writes across fds). Anonymous fds never speak
+// for the name — after a recreate they belong to the deleted object.
+func (a *AppendLog) pendingLiveSize(path string) (int64, bool) {
+	best := int64(-1)
+	for _, h := range a.liveHandles(path) {
+		h.mu.Lock()
+		if h.dirty && h.buf != nil && !h.unlinked {
+			if s := h.buf.Size(); s > best {
+				best = s
+			}
+		}
+		h.mu.Unlock()
+	}
+	if best < 0 {
+		return 0, false
+	}
+	return best, true
 }
 
 // track/untrack maintain the live-handle index.
@@ -1128,6 +1262,12 @@ func (a *AppendLog) readLiveAppendBuffer(ctx context.Context, reader *Handle, of
 	// targeted -race probe flagged it), and locking only after selection
 	// both raced and could miss the newest local image. TryLock keeps the
 	// caller's h.mu from deadlocking against a sibling mid-refresh.
+	//
+	// The caller holds reader.mu, so its anonymity is stable here: an
+	// anonymous fd may still see its deleted object's other anonymous fds,
+	// but a live-name fd (e.g. opened after a same-name recreate) must not
+	// read the OLD object's buffered image through the shared path.
+	readerAnon := reader.unlinked
 	var candidates []*Handle
 	set.mu.Lock()
 	for h := range set.set {
@@ -1141,7 +1281,7 @@ func (a *AppendLog) readLiveAppendBuffer(ctx context.Context, reader *Handle, of
 		if !h.mu.TryLock() {
 			continue
 		}
-		ready := h.dirty && h.buf != nil
+		ready := h.dirty && h.buf != nil && (readerAnon || !h.unlinked)
 		h.mu.Unlock()
 		if ready {
 			served = h
@@ -1196,6 +1336,10 @@ func (h *Handle) refreshAppendBaselineLocked(ctx context.Context) error {
 		candidates = append(candidates, other)
 	}
 	set.mu.Unlock()
+	// An anonymous sibling's buffered bytes belong to the deleted object:
+	// a live-name handle (e.g. opened after a same-name recreate) must not
+	// adopt them as its append baseline. Anonymous handles among
+	// themselves still merge (same deleted object).
 	for _, other := range candidates {
 		if other == h {
 			continue
@@ -1205,11 +1349,12 @@ func (h *Handle) refreshAppendBaselineLocked(ctx context.Context) error {
 		}
 		size := int64(-1)
 		dirty := other.dirty
+		otherAnon := other.unlinked
 		if other.buf != nil {
 			size = other.buf.Size()
 		}
 		other.mu.Unlock()
-		if dirty && size > newestSize {
+		if dirty && (h.unlinked || !otherAnon) && size > newestSize {
 			newest, newestSize = other, size
 		}
 	}
@@ -1244,15 +1389,22 @@ func (h *Handle) Release(ctx context.Context) error {
 	unlinked := h.unlinked
 	unlink := h.unlinkAtRelease
 	path := h.path
+	h.unlinkAtRelease = nil
 	h.mu.Unlock()
 	var err error
 	if unlinked {
-		// Last close of an unlinked path: publish the deferred delete and
-		// unhide any successor created at the same name meanwhile.
+		// Last close of an unlinked path: publish the deferred delete. The
+		// path tombstone outlives only fds of the SAME unlinked generation —
+		// a name rebound by a recreate (or a second unlink) owns a tombstone
+		// this fd must not clear.
 		if unlink != nil {
-			err = unlink(ctx)
+			if uerr := unlink(ctx); uerr != nil && !fs.IsNotFound(uerr) {
+				err = uerr
+			}
 		}
-		h.a.unlinked.Delete(path)
+		if err == nil && !h.a.pathHasAnonymousHandle(path) {
+			h.a.unlinked.Delete(path)
+		}
 	} else {
 		err = h.Flush(ctx)
 	}
@@ -1405,29 +1557,47 @@ func (a *AppendLog) moveUnlinkedPrefix(oldPath, newPath string) {
 	}
 }
 
-// markUnlinked hides the path and keeps the image in the open handle; the
-// remote delete is deferred to Release. A clean handle preloads its base
-// first so post-unlink reads keep serving the image.
+// markUnlinked hides the path and keeps the image in EVERY open handle of
+// the object; the remote delete is deferred to a close of the newest claim.
+// Clean handles preload their base first so post-unlink reads keep serving
+// the image.
 func (h *Handle) markUnlinked(ctx context.Context, next fs.Next) error {
+	if err := h.a.anonymizeHandles(ctx, h.path); err != nil {
+		return err
+	}
 	h.mu.Lock()
-	if h.unlinked {
-		h.mu.Unlock()
-		return nil
-	}
-	if h.buf == nil && !h.isNew {
-		if err := h.ensureBuffer(ctx); err != nil {
-			h.mu.Unlock()
-			return err
-		}
-	}
-	h.unlinked = true
 	path := h.path
 	h.unlinkAtRelease = func(ctx context.Context) error {
-		_, err := next(ctx, &fs.Op{Kind: fs.OpUnlink, Path: path})
+		// Resolve the name at execution time: a rename of an ancestor moves
+		// both the tombstone and the handle, and the deferred delete must
+		// follow them.
+		h.mu.Lock()
+		p := h.path
+		h.mu.Unlock()
+		_, err := next(ctx, &fs.Op{Kind: fs.OpUnlink, Path: p})
 		return err
 	}
 	h.mu.Unlock()
 	h.a.unlinked.Store(path, struct{}{})
+	return nil
+}
+
+// anonymize decouples this fd from its name: reads keep serving the local
+// image, writes buffer but never publish (routeFlush skips unlinked
+// handles), and the handle never adopts a later generation of the path
+// (refreshCleanSiblings skips it). Caller must not hold h.mu.
+func (h *Handle) anonymize(ctx context.Context) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.unlinked {
+		return nil
+	}
+	if h.buf == nil && !h.isNew {
+		if err := h.ensureBuffer(ctx); err != nil {
+			return err
+		}
+	}
+	h.unlinked = true
 	return nil
 }
 
