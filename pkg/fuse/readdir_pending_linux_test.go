@@ -1,9 +1,12 @@
 package fuse
 
+// #918's kernel-level regression, ported to the extension-stack facade: a
+// READDIRPLUS that races un-landed writes must publish the pending sizes
+// (and not the remote's stale rows), and draining must land every payload.
+
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,28 +21,122 @@ import (
 	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
+
+	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/extensions/core"
+	"github.com/mem9-ai/drive9/pkg/extensions/writeback"
+	"github.com/mem9-ai/drive9/pkg/fs"
+	"github.com/mem9-ai/drive9/pkg/fusecomp/staging"
 )
 
-type readdirPendingKernelFS struct {
-	*Dat9FS
-	plusCalls     atomic.Int32
-	beforeRelease func(uint64)
-	afterRelease  func(uint64)
+// countingFS counts READDIRPLUS dispatches so the test can prove the kernel
+// actually exercised the PLUS path.
+type countingFS struct {
+	*FS
+	plusCalls atomic.Int32
 }
 
-func (fs *readdirPendingKernelFS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
-	if fs.beforeRelease != nil {
-		fs.beforeRelease(input.Fh)
-	}
-	fs.Dat9FS.Release(cancel, input)
-	if fs.afterRelease != nil {
-		fs.afterRelease(input.Fh)
-	}
+func (c *countingFS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out *gofuse.DirEntryList) gofuse.Status {
+	c.plusCalls.Add(1)
+	return c.FS.ReadDirPlus(cancel, input, out)
 }
 
-func (fs *readdirPendingKernelFS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out *gofuse.DirEntryList) gofuse.Status {
-	fs.plusCalls.Add(1)
-	return fs.Dat9FS.ReadDirPlus(cancel, input, out)
+// pendingKernelStack is the writeback+core facade mounted on a real Linux
+// FUSE mount — the minimal stack the #918 readdir rows need.
+type pendingKernelStack struct {
+	f      *countingFS
+	server *gofuse.Server
+	wb     *writeback.Writeback
+	mp     string
+}
+
+// mountPendingKernelStack mounts the facade (writeback over core) on a
+// kernel mountpoint. It skips when Linux FUSE is unavailable unless
+// DRIVE9_REQUIRE_KERNEL_FUSE pins the run.
+func mountPendingKernelStack(t *testing.T, tsURL, syncMode string) *pendingKernelStack {
+	t.Helper()
+	cl := client.New(tsURL, "")
+	cl.SetSmallFileThresholdForTests(1 << 20)
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bus := fs.NewEventBus()
+	ledger, lerr := staging.NewStaging(t.TempDir())
+	if lerr != nil {
+		t.Fatal(lerr)
+	}
+	t.Cleanup(func() { ledger.Close() })
+	wbcache, werr := staging.NewWriteBackCache(t.TempDir())
+	if werr != nil {
+		t.Fatal(werr)
+	}
+	wb, err := writeback.New(writeback.Options{
+		Policy:     writeback.PolicyWriteBack,
+		SyncMode:   syncMode,
+		Client:     cl,
+		Staging:    ledger,
+		WriteCache: wbcache,
+		Events:     bus,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := New(Options{
+		Extensions:  []fs.Handler{wb, terminal},
+		Events:      bus,
+		AttrTTL:     30 * time.Second,
+		EntryTTL:    30 * time.Second,
+		NegEntryTTL: time.Second,
+		DirTTL:      30 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Production wiring (mount.go): the terminal resolves fresh lookups
+	// from the facade's namespace cache, so this mount's own creates answer
+	// locally instead of racing a remote stat on every LOOKUP.
+	if dc, ok := f.Ctx.DirCache.(core.NamespaceCache); ok {
+		terminal.Attach(dc)
+	}
+	cf := &countingFS{FS: f}
+	mp := t.TempDir()
+	server, err := gofuse.NewServer(cf, mp, &gofuse.MountOptions{
+		FsName:             "drive9",
+		Name:               "drive9",
+		MaxReadAhead:       8 << 20,
+		MaxWrite:           1024 * 1024,
+		MaxBackground:      32,
+		EnableLocks:        true,
+		EnableDirectIoMmap: true,
+		DirectMountStrict:  os.Geteuid() == 0,
+	})
+	if err != nil {
+		if os.Getenv("DRIVE9_REQUIRE_KERNEL_FUSE") == "1" {
+			t.Fatal(err)
+		}
+		t.Skipf("cannot mount Linux FUSE: %v", err)
+	}
+	f.Init2(context.Background())
+	go server.Serve()
+	t.Cleanup(func() {
+		if err := server.Unmount(); err != nil {
+			t.Error(err)
+		}
+	})
+	if err := server.WaitMount(); err != nil {
+		t.Fatal(err)
+	}
+	return &pendingKernelStack{f: cf, server: server, wb: wb, mp: mp}
+}
+
+func (s *pendingKernelStack) drain(t *testing.T) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := s.wb.Drain(ctx); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
 }
 
 func TestReadDirPlusPendingKernel(t *testing.T) {
@@ -49,16 +146,14 @@ func TestReadDirPlusPendingKernel(t *testing.T) {
 		}
 		t.Skipf("Linux FUSE unavailable: %v", err)
 	}
-	for _, profile := range []string{MountProfileNone, MountProfileCodingAgent} {
-		for _, mode := range []SyncMode{SyncInteractive, SyncStrict} {
-			t.Run(profile+"/"+mode.String(), func(t *testing.T) {
-				testReadDirPlusPendingKernel(t, profile, mode)
-			})
-		}
+	for _, mode := range []string{"interactive", "strict"} {
+		t.Run(mode, func(t *testing.T) {
+			testReadDirPlusPendingKernel(t, mode)
+		})
 	}
 }
 
-func testReadDirPlusPendingKernel(t *testing.T, profile string, mode SyncMode) {
+func testReadDirPlusPendingKernel(t *testing.T, mode string) {
 	t.Helper()
 	const fileCount = 4
 	payload := bytes.Repeat([]byte("917!"), 1024)
@@ -66,7 +161,7 @@ func testReadDirPlusPendingKernel(t *testing.T, profile string, mode SyncMode) {
 	started := make(chan string, fileCount)
 	var releaseOnce sync.Once
 	release := func() { releaseOnce.Do(func() { close(allowCommit) }) }
-	if mode == SyncStrict {
+	if mode == "strict" {
 		release()
 	}
 	var mu sync.Mutex
@@ -75,15 +170,24 @@ func testReadDirPlusPendingKernel(t *testing.T, profile string, mode SyncMode) {
 		p := strings.TrimPrefix(r.URL.Path, "/v1/fs")
 		switch {
 		case r.URL.Path == "/v1/status":
-			_ = json.NewEncoder(w).Encode(map[string]any{"inline_threshold": 1 << 20})
+			_, _ = w.Write([]byte(`{"inline_threshold":1048576}`))
 		case r.Method == http.MethodGet && r.URL.Query().Get("list") == "1":
 			mu.Lock()
-			entries := make([]map[string]any, 0, len(remote))
-			for name, data := range remote {
-				entries = append(entries, map[string]any{"name": strings.TrimPrefix(name, "/"), "size": len(data), "revision": 1})
+			names := make([]string, 0, len(remote))
+			for name := range remote {
+				names = append(names, name)
 			}
 			mu.Unlock()
-			_ = json.NewEncoder(w).Encode(map[string]any{"entries": entries})
+			var b strings.Builder
+			b.WriteString(`{"entries":[`)
+			for i, name := range names {
+				if i > 0 {
+					b.WriteByte(',')
+				}
+				fmt.Fprintf(&b, `{"name":%q,"size":%d,"revision":1}`, strings.TrimPrefix(name, "/"), len(payload))
+			}
+			b.WriteString(`]}`)
+			_, _ = w.Write([]byte(b.String()))
 		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/v1/fs/"):
 			data, err := io.ReadAll(r.Body)
 			if err != nil {
@@ -104,7 +208,7 @@ func testReadDirPlusPendingKernel(t *testing.T, profile string, mode SyncMode) {
 			mu.Lock()
 			remote[p] = data
 			mu.Unlock()
-			_ = json.NewEncoder(w).Encode(map[string]any{"revision": 1})
+			_, _ = w.Write([]byte(`{"revision":1}`))
 		case r.Method == http.MethodHead:
 			mu.Lock()
 			data, found := remote[p]
@@ -117,27 +221,10 @@ func testReadDirPlusPendingKernel(t *testing.T, profile string, mode SyncMode) {
 			}
 			w.Header().Set("Content-Length", strconv.Itoa(len(data)))
 			w.Header().Set("X-Dat9-Revision", "1")
-		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs:batch-stat":
-			var request struct {
-				Paths []string `json:"paths"`
-			}
-			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-				t.Errorf("decode batch stat: %v", err)
-				w.WriteHeader(http.StatusBadRequest)
-				return
-			}
-			results := make([]map[string]any, 0, len(request.Paths))
+		case r.Method == http.MethodDelete:
 			mu.Lock()
-			for _, path := range request.Paths {
-				if data, ok := remote[path]; ok {
-					results = append(results, map[string]any{"path": path, "status": http.StatusOK, "size": len(data), "revision": 1})
-				} else {
-					results = append(results, map[string]any{"path": path, "status": http.StatusNotFound})
-				}
-			}
+			delete(remote, p)
 			mu.Unlock()
-			_ = json.NewEncoder(w).Encode(map[string]any{"results": results})
-		case r.Method == http.MethodPost && r.URL.Query().Has("chmod"):
 			w.WriteHeader(http.StatusOK)
 		default:
 			t.Errorf("unexpected request: %s %s", r.Method, r.URL)
@@ -146,61 +233,11 @@ func testReadDirPlusPendingKernel(t *testing.T, profile string, mode SyncMode) {
 	}))
 	t.Cleanup(ts.Close)
 	t.Cleanup(release)
-	opts := &MountOptions{
-		Profile: profile, LocalRoot: t.TempDir(), MountPoint: t.TempDir(),
-		SyncMode: mode, WritePolicy: WritePolicyWriteBack,
-		DirTTL: 30 * time.Second, AttrTTL: 30 * time.Second, EntryTTL: 30 * time.Second,
-		FlushDebounce:     0,
-		DirectMountStrict: os.Geteuid() == 0,
-	}
-	opts.setDefaults()
-	fs := NewDat9FS(newTestClient(ts.URL), opts)
-	fs.client.SetSmallFileThresholdForTests(1 << 20)
-	var err error
-	fs.shadowStore, err = NewShadowStore(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(fs.shadowStore.Close)
-	fs.pendingIndex, err = NewPendingIndex(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	fs.writeBack, err = NewWriteBackCache(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	queue := NewCommitQueue(fs.client, fs.shadowStore, fs.pendingIndex, nil, fileCount, 16)
-	queue.PathLock = fs.lockRemoteCommitPath
-	queue.DurableWatermark = fs.latestCommittedRevision
-	queue.OnSuccess = fs.onCommitQueueSuccess
-	queue.OnCleanup = fs.onCommitQueueCleanup
-	fs.commitQueue = queue
-	t.Cleanup(func() { release(); queue.DrainAll() })
-	fs.dirCache.Put("/", []CachedFileInfo{})
-	kernelFS := &readdirPendingKernelFS{Dat9FS: fs}
-	server, err := gofuse.NewServer(kernelFS, opts.MountPoint, newGoFuseMountOptions(opts))
-	if err != nil {
-		if os.Getenv("DRIVE9_REQUIRE_KERNEL_FUSE") == "1" {
-			t.Fatal(err)
-		}
-		t.Skipf("cannot mount Linux FUSE: %v", err)
-	}
-	go server.Serve()
-	t.Cleanup(func() {
-		release()
-		queue.DrainAll()
-		fs.notifyWg.Wait()
-		if err := server.Unmount(); err != nil {
-			t.Error(err)
-		}
-	})
-	if err := server.WaitMount(); err != nil {
-		t.Fatal(err)
-	}
+	st := mountPendingKernelStack(t, ts.URL, mode)
+
 	for i := range fileCount {
 		name := fmt.Sprintf("file-%d.dat", i)
-		f, err := os.Create(filepath.Join(opts.MountPoint, name))
+		f, err := os.Create(filepath.Join(st.mp, name))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -220,13 +257,7 @@ func testReadDirPlusPendingKernel(t *testing.T, profile string, mode SyncMode) {
 			t.Fatal("uploads did not reach the controlled commit boundary")
 		}
 	}
-	if mode == SyncInteractive {
-		for i := range fileCount {
-			meta, ok := fs.pendingIndex.GetMeta(fmt.Sprintf("/file-%d.dat", i))
-			if !ok || meta.Size != int64(len(payload)) {
-				t.Fatalf("pending metadata: %+v, found=%v", meta, ok)
-			}
-		}
+	if mode == "interactive" {
 		mu.Lock()
 		committed := len(remote)
 		mu.Unlock()
@@ -237,7 +268,7 @@ func testReadDirPlusPendingKernel(t *testing.T, profile string, mode SyncMode) {
 	assertSizes := func(phase string) {
 		t.Helper()
 		for i := range fileCount {
-			info, err := os.Stat(filepath.Join(opts.MountPoint, fmt.Sprintf("file-%d.dat", i)))
+			info, err := os.Stat(filepath.Join(st.mp, fmt.Sprintf("file-%d.dat", i)))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -247,26 +278,33 @@ func testReadDirPlusPendingKernel(t *testing.T, profile string, mode SyncMode) {
 		}
 	}
 	assertSizes("before listdir")
-	entries, err := os.ReadDir(opts.MountPoint)
+	// Force the chain path: drop the facade's namespace cache so the
+	// kernel's next READDIRPLUS answers from a fresh OpList — the listing
+	// must resolve pending state instead of publishing remote rows the
+	// gated commits have not produced yet.
+	st.f.Ctx.DirCache.InvalidateAll()
+	entries, err := os.ReadDir(st.mp)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(entries) != fileCount {
 		t.Fatalf("listdir returned %d entries, want %d", len(entries), fileCount)
 	}
-	for i, entry := range entries {
-		if entry.Name() != fmt.Sprintf("file-%d.dat", i) {
-			t.Errorf("unexpected name %q", entry.Name())
+	got := make(map[string]bool, len(entries))
+	for _, entry := range entries {
+		got[entry.Name()] = true
+	}
+	for i := range fileCount {
+		if !got[fmt.Sprintf("file-%d.dat", i)] {
+			t.Errorf("listdir missing file-%d.dat (got %v)", i, got)
 		}
 	}
-	if kernelFS.plusCalls.Load() == 0 {
+	if st.f.plusCalls.Load() == 0 {
 		t.Fatal("kernel did not exercise READDIRPLUS")
 	}
 	assertSizes("after listdir, before commit")
 	release()
-	if drained := fs.Drain(ctx); !drained.OK {
-		t.Fatalf("drain failed: %+v", drained)
-	}
+	st.drain(t)
 	assertSizes("immediately after drain")
 	mu.Lock()
 	defer mu.Unlock()

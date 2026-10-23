@@ -3,119 +3,130 @@ package fuse
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
-	"runtime/debug"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/extensions/appendlog"
+	"github.com/mem9-ai/drive9/pkg/extensions/bulkfile"
+	"github.com/mem9-ai/drive9/pkg/extensions/cache"
+	"github.com/mem9-ai/drive9/pkg/extensions/core"
+	"github.com/mem9-ai/drive9/pkg/extensions/extent"
+	"github.com/mem9-ai/drive9/pkg/extensions/git"
+	"github.com/mem9-ai/drive9/pkg/extensions/layer"
+	"github.com/mem9-ai/drive9/pkg/extensions/localize"
+	"github.com/mem9-ai/drive9/pkg/extensions/renameguard"
+	"github.com/mem9-ai/drive9/pkg/extensions/specials"
+	"github.com/mem9-ai/drive9/pkg/extensions/sse"
+	"github.com/mem9-ai/drive9/pkg/extensions/writeback"
+	"github.com/mem9-ai/drive9/pkg/extensions/xattr"
+	"github.com/mem9-ai/drive9/pkg/fs"
+	"github.com/mem9-ai/drive9/pkg/fusecomp/perf"
+	"github.com/mem9-ai/drive9/pkg/fusecomp/staging"
 	"github.com/mem9-ai/drive9/pkg/mountpath"
 	"github.com/mem9-ai/drive9/pkg/mountstate"
 )
 
-// MountOptions configures the FUSE mount.
-//
-// Credential kind: APIKey and Token are mutually exclusive. APIKey is an
-// owner tenant API key (full management + data plane); Token is a delegated
-// capability JWT (read-path only). Exactly one must be non-empty at
-// Mount() time — the running mount is bound to that single credential for
-// its entire lifetime (Invariant #3). To change credentials, umount and
-// remount; there is no in-process rebind.
-type MountOptions struct {
-	Server                      string        // drive9 server URL
-	APIKey                      string        // owner API key (mutually exclusive with Token)
-	Token                       string        // delegated capability JWT (mutually exclusive with APIKey)
-	MountPoint                  string        // local mount point
-	RemoteRoot                  string        // remote subtree root (default "/"); set via "drive9 mount :/path /local"
-	CacheDir                    string        // write-back cache directory (default ~/.cache/drive9); empty string uses default
-	CacheSize                   int64         // ReadCache max size in bytes (default 128MB)
-	ReadCacheMaxFileBytes       int64         // largest single file admitted to ReadCache and fetched whole-file in one request (default 4MiB)
-	ReadCacheTTL                time.Duration // ReadCache TTL (default 30s; negative disables time-based expiry)
-	DiskReadCacheSize           int64         // disk-backed read cache max size in bytes (default 1GiB)
-	DiskReadCacheFreeRatio      float64       // minimum filesystem free-space ratio before disk read cache evicts (default 0.10)
-	DirTTL                      time.Duration // DirCache TTL (default 10s)
-	AttrTTL                     time.Duration // kernel attr cache TTL (default 60s; coding-agent 30s)
-	EntryTTL                    time.Duration // kernel entry cache TTL (default 60s)
-	NegativeEntryTTL            time.Duration // kernel negative entry cache TTL (default 1s)
-	FlushDebounce               time.Duration // debounce window for small-file flush coalescing (default 2s, 0 disables); set to -1 to use default
-	SyncMode                    SyncMode      // interactive, strict, or auto (default auto)
-	WritePolicy                 WritePolicy   // writeback, close-sync, or write-sync (default writeback)
-	Profile                     string        // mount profile: "interactive", "coding-agent", "none", or a custom profile name
-	LayerRef                    string        // optional writable fs layer ref (layer_id, name, or tag ref)
-	CheckpointRef               string        // optional checkpoint ref to restore as the layer view baseline
-	LocalRoot                   string        // local-only overlay root for overlay-profile mounts
-	LocalOnlyPatterns           []string      // local-only path patterns overlaid unconditionally for overlay-profile mounts
-	LocalGitignoreAwarePatterns []string      // local-only path patterns overlaid only when the repository's Git ignore rules also ignore them
-	RemoteOnlyPatterns          []string      // remote-persistent override path patterns for overlay-profile mounts
-	// DisableBuiltinOverlayDefaults stops the built-in local-only defaults for
-	// Profile from being added on top of the given patterns. The CLI resolves
-	// the effective (builtin or custom) profile itself and sets this, so a
-	// custom profile that reuses a builtin name is not silently merged with the
-	// builtins. Direct library callers leave it false and keep the defaults.
-	DisableBuiltinOverlayDefaults bool
-	AppendLogPatterns             []string      // remote-persistent files eligible for append-log synchronization
-	PackPaths                     []string      // local overlay paths auto-packed after unmount
-	ExtentPaths                   []string      // path globs created as content_layout=extent
-	CommitQueueMaxPending         int           // maximum pending entries in CommitQueue before backpressure (default 100); 0 uses default
-	WriteBackBatchWindow          time.Duration // writeback-only small-file batch window (default 0 disabled)
-	WriteBackBatchMaxFiles        int           // maximum files in one writeback batch (default 64 when enabled)
-	WriteBackBatchMaxBytes        int64         // maximum bytes in one writeback batch (default 4MiB when enabled)
-	WriteCacheFreeRatio           float64       // minimum free-space ratio on cache-dir partition before write-back refuses writes (default 0.10); negative disables
-	WriteCacheSizeMB              int64         // current-process shadow data quota in MiB (default 1024); negative disables
-	UploadConcurrency             int           // number of background upload workers (default 4)
-	ReadConcurrency               int           // maximum concurrent backend reads issued by FUSE (default 24)
-	ParallelReadConcurrency       int           // maximum concurrent block reads for one large FUSE read (default 4)
-	ParallelReadBlockSize         int64         // block size for parallel large-file reads in bytes (default 1MiB)
-	SyncRead                      bool          // disable kernel async read dispatch; at most one read in flight per file handle
-	DirectMountStrict             bool          // Linux only: mount with mount(2) and do not fall back to fusermount
-	GVisorCompat                  bool          // enable gVisor-specific FUSE compatibility behavior
-	LegacyInterruptibleMutations  bool          // restore legacy behavior where a FUSE interrupt cancels in-flight remote commits — idempotent namespace mutations AND synchronous data commits (write-sync writes, close-sync/fsync/release flushes and releases, git checkpoint flushes); default false: commits run detached and finish once started, and unmount waits for them up to their request deadlines (data commits: up to the 15min releaseTimeout); --gvisor-compat takes precedence and always keeps commits detached
-	LookupRetryCount              int           // detached retries after transient Lookup/GetAttr stat failures (default 2)
-	LookupRetryTimeout            time.Duration // timeout per detached stat retry after interrupt/transient errors (default 250ms)
-	LegacyDirStatFallback         bool          // on Lookup stat 404, list parent to support legacy servers without directory stat
-	ReadDirPrefetch               bool          // prefetch small files after readdir into ReadCache (default false)
-	PrefetchMaxFiles              int           // maximum files prefetched per directory read (default 32 when enabled)
-	PrefetchMaxFileBytes          int64         // maximum individual file size prefetched (default 50KB)
-	PrefetchMaxBytes              int64         // maximum aggregate bytes prefetched per directory read (default 1MB)
-	PrefetchTimeout               time.Duration // timeout for one readdir prefetch batch (default 1s)
-	DirCacheMaxEntries            int           // maximum entries per directory in DirCache (default 200000); directories exceeding this limit are not cached as complete
-	TrustLocalEvents              bool          // allow revision-bound GetAttr hits from DirCache using process-local SSE freshness; safe only for single-server/sticky or cluster-wide event streams
-	AllowOther                    bool          // allow other users to access mount
-	ReadOnly                      bool          // mount as read-only
-	Debug                         bool          // enable FUSE debug logging
-	PerfCounters                  bool          // print low-overhead FUSE perf counter summary on shutdown
-	EnableGitWorkspaces           bool          // enable fast-clone git workspace overlay discovery
-	Profiling                     ProfilingOptions
-	// WritebackLazyStaging switches write-back close staging from fsynced
-	// local writes (power-loss safe) to plain writes (issue #964): staged
-	// data lands in the kernel page cache of the cache volume — ext4's
-	// durability ladder (daemon-crash safe, not power-loss safe) — and a
-	// background WAL syncer / fsync(2) / umount make it durable.
+// ProfilingOptions is the profiling knob bundle (perf.ProfilingOptions),
+// kept as a named type for the stable MountOptions API.
+type ProfilingOptions = perf.ProfilingOptions
+
+// MountConfig carries the mount inputs the fuse stack accepts.
+type MountConfig struct {
+	Server     string
+	APIKey     string
+	Token      string
+	MountPoint string
+	RemoteRoot string
+
+	CacheDir               string
+	CacheSize              int64
+	ReadCacheMaxFileBytes  int64
+	ReadCacheTTL           time.Duration
+	DiskReadCacheSize      int64
+	DiskReadCacheFreeRatio float64
+
+	DirTTL           time.Duration
+	AttrTTL          time.Duration
+	EntryTTL         time.Duration
+	NegativeEntryTTL time.Duration
+
+	FlushDebounce         time.Duration
+	LookupRetryCount      int
+	LookupRetryTimeout    time.Duration
+	LegacyDirStatFallback bool
+	ReadDirPrefetch       bool
+	PrefetchMaxFiles      int
+	PrefetchMaxFileBytes  int64
+	PrefetchMaxBytes      int64
+	PrefetchTimeout       time.Duration
+
+	TrustLocalEvents bool
+	SyncMode         string
+	WritePolicy      string
+
 	WritebackLazyStaging bool
-	// WritebackSyncWindow bounds the power-loss exposure when
-	// WritebackLazyStaging is on: the WAL syncer fsyncs at this interval.
-	// 0 disables the syncer (only fsync(2)/umount pay).
-	WritebackSyncWindow time.Duration
-	// RemoteCommitWaitTimeout bounds how long a FUSE write/flush handler waits
-	// for a background commit to finish before proceeding anyway. This prevents
-	// the FUSE daemon from hanging indefinitely when a backend upload is slow.
-	// Default 5s; 0 uses default; negative disables the timeout (legacy behavior).
+	WritebackSyncWindow  time.Duration
+
+	Profile       string
+	LayerRef      string
+	CheckpointRef string
+
+	LocalRoot                   string
+	LocalOnlyPatterns           []string
+	LocalGitignoreAwarePatterns []string
+	RemoteOnlyPatterns          []string
+
+	AppendLogPatterns []string
+	PackPaths         []string
+	ExtentPaths       []string
+
+	UploadConcurrency     int
+	DirCacheMaxEntries    int
+	CommitQueueMaxPending int
+
+	WriteBackBatchWindow   time.Duration
+	WriteBackBatchMaxFiles int
+	WriteBackBatchMaxBytes int64
+	WriteCacheFreeRatio    float64
+	WriteCacheSizeMB       int64
+
+	ReadConcurrency         int
+	ParallelReadConcurrency int
+	ParallelReadBlockSize   int64
+	SyncRead                bool
+
+	DirectMountStrict            bool
+	GVisorCompat                 bool
+	LegacyInterruptibleMutations bool
+
+	AllowOther bool
+	ReadOnly   bool
+	Debug      bool
+
+	// EnableGitWorkspaces gates the git extension's workspace discovery
+	// (v1 default: off; overlay mounts turn it on).
+	EnableGitWorkspaces bool
+	// DisableBuiltinOverlayDefaults stops the profile's built-in local-only
+	// defaults from being merged into the pattern lists (v1 parity).
+	DisableBuiltinOverlayDefaults bool
+	// RemoteCommitWaitTimeout bounds metadata-op waits for background commits
+	// (default 5s; 0 uses default; negative disables the bound).
 	RemoteCommitWaitTimeout time.Duration
-	// SkipProcessState skips writing the mount pid/process state file. Used when
-	// a supervisor owns the authoritative process state.
+	// SkipProcessState skips the mount pid/process state file (independent of
+	// Supervised — v1 had both knobs).
 	SkipProcessState bool
 	// OmitProcessStateCredentials keeps API keys, delegated tokens, and the
 	// potentially credential-bearing server endpoint out of the process-state
@@ -127,140 +138,1287 @@ type MountOptions struct {
 	// no stored owner (normally the mounting process). A sandbox uses it to
 	// present the workspace as owned by its unprivileged application user.
 	DefaultOwner *Owner
-	// Supervised marks this worker as managed by an external supervisor (logging only).
+
+	PerfCounters bool
+
+	ProfileCPUDuration  time.Duration
+	ProfileCPUInterval  time.Duration
+	ProfileHeap         string
+	ProfileDir          string
+	ProfileHeapInterval time.Duration
+	PprofAddr           string
+	PerfSamplesPath     string
+	PerfSampleInterval  time.Duration
+	PerfMaxSamples      int
+	PerfMaxSampleFiles  int
+	PerfMaxProfileFiles int
+
 	Supervised bool
+
+	// Extensions lists the extensions to wire in build-up order: core
+	// first, each subsequent entry wrapping the ones before it — the chain
+	// assembly order is the reverse, ending with core as the terminal (the
+	// caller guarantees core is present). Nil/empty wires the default full
+	// set, byte-identical to the pre-flag behavior.
+	Extensions []string
 }
 
-const defaultUploadConcurrency = 16
+func (cfg MountConfig) toProfilingOptions() perf.ProfilingOptions {
+	return perf.ProfilingOptions{
+		CPUProfileDuration:  cfg.ProfileCPUDuration,
+		CPUProfileInterval:  cfg.ProfileCPUInterval,
+		HeapProfilePath:     cfg.ProfileHeap,
+		ProfileDir:          cfg.ProfileDir,
+		HeapProfileInterval: cfg.ProfileHeapInterval,
+		PprofAddr:           cfg.PprofAddr,
+		PerfSamplesPath:     cfg.PerfSamplesPath,
+		PerfSampleInterval:  cfg.PerfSampleInterval,
+		PerfMaxSamples:      cfg.PerfMaxSamples,
+		PerfMaxSampleFiles:  cfg.PerfMaxSampleFiles,
+		PerfMaxProfileFiles: cfg.PerfMaxProfileFiles,
+	}
+}
 
-// gvisorWriteBackRequiresCommitQueue rejects the legacy write-back uploader
-// path for gVisor-compatible write-back mounts. That uploader persists only
-// path-owned metadata, so it cannot enforce the inode mutation ordering that
-// GVisorCompat requires.
-func gvisorWriteBackRequiresCommitQueue(opts *MountOptions, writeBack *WriteBackCache, commitQueue *CommitQueue) bool {
+// defaultExtensionOrder is the default --extensions value, in build-up
+// order: core first, each subsequent entry wrapping the ones before it, so
+// the chain assembly order (outermost first) is the reverse of this list.
+// It is the exact reverse of the historical wired chain, so the default
+// wires byte-identically to the pre-flag code.
+var defaultExtensionOrder = []string{
+	"core", "sse", "writeback", "xattr", "specials", "bulkfile",
+	"appendlog", "extent", "git", "layer", "localize", "renameguard", "cache",
+}
+
+// knownExtensionNames guards --extensions against typos (an unknown name
+// would otherwise silently not wire).
+var knownExtensionNames = map[string]bool{
+	"core": true, "sse": true, "writeback": true, "xattr": true,
+	"specials": true, "bulkfile": true, "appendlog": true, "extent": true,
+	"git": true, "layer": true, "localize": true, "renameguard": true,
+	"cache": true,
+}
+
+// parseExtensionOrder validates the --extensions list and returns it in
+// flag order (build-up; the chain is assembled as its reverse, with core as
+// the terminal — the caller guarantees core is present). Empty input means
+// the default full set.
+func parseExtensionOrder(list []string) ([]string, error) {
+	if len(list) == 0 {
+		return defaultExtensionOrder, nil
+	}
+	out := make([]string, 0, len(list))
+	seen := map[string]bool{}
+	for _, raw := range list {
+		name := strings.TrimSpace(raw)
+		if name == "" {
+			continue
+		}
+		if !knownExtensionNames[name] {
+			return nil, fmt.Errorf("fuse: unknown extension %q (valid: %s)", name, strings.Join(defaultExtensionOrder, ","))
+		}
+		if seen[name] {
+			return nil, fmt.Errorf("fuse: duplicate extension %q", name)
+		}
+		seen[name] = true
+		out = append(out, name)
+	}
+	if len(out) == 0 {
+		return defaultExtensionOrder, nil
+	}
+	// Reverse assembly requires core as the FIRST build-up entry so it
+	// becomes the terminal handler; a list like "cache,core" assembles
+	// [core, cache] and core never calls next — the cache is silently
+	// unreachable.
+	if out[0] != "core" {
+		return nil, fmt.Errorf("fuse: --extensions must start with core (the chain terminal), got %q first", out[0])
+	}
+	return out, nil
+}
+
+// SyncMode controls when Fsync is considered durable.
+type SyncMode int
+
+const (
+	// SyncAuto measures RTT at mount time. RTT > 10ms → interactive, else strict.
+	SyncAuto SyncMode = iota
+	// SyncInteractive: Fsync = local journal durable only. Remote commit is async.
+	SyncInteractive
+	// SyncStrict: Fsync = remote durable. Blocks until remote PUT succeeds.
+	SyncStrict
+)
+
+// WritePolicy controls when ordinary writes become remote-durable.
+type WritePolicy string
+
+const (
+	// WritePolicyWriteBack preserves the existing behavior: writes are staged
+	// locally and remote upload may happen asynchronously after close.
+	WritePolicyWriteBack WritePolicy = "writeback"
+	// WritePolicyCloseSync makes close remote-durable by forcing cloud upload
+	// from Flush, the FUSE operation whose status propagates to close(2).
+	WritePolicyCloseSync WritePolicy = "close-sync"
+	// WritePolicyWriteSync makes each Write operation remote-durable before
+	// returning success. This is intentionally expensive.
+	WritePolicyWriteSync WritePolicy = "write-sync"
+)
+
+// String returns the write policy name for CLI/logging.
+func (p WritePolicy) String() string {
+	switch p {
+	case WritePolicyWriteBack:
+		return string(WritePolicyWriteBack)
+	case WritePolicyCloseSync:
+		return string(WritePolicyCloseSync)
+	case WritePolicyWriteSync:
+		return string(WritePolicyWriteSync)
+	default:
+		return string(WritePolicyWriteBack)
+	}
+}
+
+// MountOptions is the stable mount API (the pre-extensions pkg/fuse shape,
+// byte-for-byte compatible with main), plus Extensions for the chain's
+// build-up ordering. Mount converts it to the internal MountConfig — the
+// wire-level semantics are unchanged.
+type MountOptions struct {
+	Server                      string        // drive9 server URL
+	APIKey                      string        // owner API key (mutually exclusive with Token)
+	Token                       string        // delegated capability JWT (mutually exclusive with APIKey)
+	MountPoint                  string        // local mount point
+	RemoteRoot                  string        // remote subtree root (default "/")
+	CacheDir                    string        // write-back cache directory (default ~/.cache/drive9)
+	CacheSize                   int64         // ReadCache max size in bytes (default 128MB)
+	ReadCacheMaxFileBytes       int64         // largest single file admitted to ReadCache (default 4MiB)
+	ReadCacheTTL                time.Duration // ReadCache TTL (default 30s)
+	DiskReadCacheSize           int64         // disk read cache max size in bytes (default 1GiB)
+	DiskReadCacheFreeRatio      float64       // min free-space ratio before disk read cache evicts (default 0.10)
+	DirTTL                      time.Duration // DirCache TTL (default 10s)
+	AttrTTL                     time.Duration // kernel attr cache TTL (default 60s)
+	EntryTTL                    time.Duration // kernel entry cache TTL (default 60s)
+	NegativeEntryTTL            time.Duration // kernel negative entry cache TTL (default 1s)
+	FlushDebounce               time.Duration // debounce window for small-file flush coalescing (default 2s; -1 uses default)
+	SyncMode                    SyncMode      // interactive, strict, or auto (default auto)
+	WritePolicy                 WritePolicy   // writeback, close-sync, or write-sync (default writeback)
+	Profile                     string        // mount profile name
+	LayerRef                    string        // writable fs layer ref
+	CheckpointRef               string        // checkpoint ref for the layer view baseline
+	LocalRoot                   string        // local-only overlay root
+	LocalOnlyPatterns           []string      // local-only path patterns
+	LocalGitignoreAwarePatterns []string      // local-only patterns gated by Git ignore rules
+	RemoteOnlyPatterns          []string      // remote-persistent override patterns
+	// DisableBuiltinOverlayDefaults stops the built-in local-only defaults for
+	// Profile from being added on top of the given patterns. The CLI resolves
+	// the effective profile itself and sets this; direct library callers leave
+	// it false and keep the defaults.
+	DisableBuiltinOverlayDefaults bool
+	AppendLogPatterns             []string // remote-persistent files eligible for append-log synchronization
+	PackPaths                     []string // local overlay paths auto-packed after unmount
+	ExtentPaths                   []string // path globs created as content_layout=extent
+	CommitQueueMaxPending         int      // CommitQueue backpressure bound (default 100; 0 default)
+	WriteBackBatchWindow          time.Duration
+	WriteBackBatchMaxFiles        int
+	WriteBackBatchMaxBytes        int64
+	WriteCacheFreeRatio           float64
+	WriteCacheSizeMB              int64
+	UploadConcurrency             int           // background upload workers (default 16)
+	ReadConcurrency               int           // concurrent backend reads (default 24)
+	ParallelReadConcurrency       int           // concurrent block reads per large FUSE read (default 4)
+	ParallelReadBlockSize         int64         // block size for parallel reads (default 1MiB)
+	SyncRead                      bool          // disable kernel async read dispatch
+	DirectMountStrict             bool          // Linux only: mount(2) without fusermount fallback
+	GVisorCompat                  bool          // gVisor FUSE compatibility behavior
+	LegacyInterruptibleMutations  bool          // FUSE interrupt cancels in-flight remote commits (legacy)
+	LookupRetryCount              int           // detached retries after transient stat failures (default 2)
+	LookupRetryTimeout            time.Duration // timeout per detached stat retry (default 250ms)
+	LegacyDirStatFallback         bool          // list parent when directory stat 404s (legacy servers)
+	ReadDirPrefetch               bool
+	PrefetchMaxFiles              int
+	PrefetchMaxFileBytes          int64
+	PrefetchMaxBytes              int64
+	PrefetchTimeout               time.Duration
+	DirCacheMaxEntries            int
+	TrustLocalEvents              bool
+	AllowOther                    bool
+	ReadOnly                      bool
+	Debug                         bool
+	PerfCounters                  bool
+	EnableGitWorkspaces           bool // enable git workspace overlay discovery (default off)
+	Profiling                     ProfilingOptions
+	WritebackLazyStaging          bool
+	WritebackSyncWindow           time.Duration
+	// RemoteCommitWaitTimeout bounds how long a FUSE write/flush handler waits
+	// for a background commit before proceeding anyway (default 5s; 0 uses
+	// default; negative disables the timeout).
+	RemoteCommitWaitTimeout time.Duration
+	// SkipProcessState skips writing the mount pid/process state file.
+	SkipProcessState bool
+	// OmitProcessStateCredentials blanks secrets from the process state and
+	// exit records; DefaultOwner overrides the mount's reported uid/gid.
+	OmitProcessStateCredentials bool
+	DefaultOwner                *Owner
+	// Supervised marks this worker as managed by an external supervisor.
+	Supervised bool
+	// Extensions lists the extensions to wire in build-up order (core first).
+	// Nil/empty wires the default full set.
+	Extensions []string
+}
+
+// syncModeString maps the typed SyncMode onto the internal config value.
+func (m SyncMode) configString() string {
+	switch m {
+	case SyncInteractive:
+		return "interactive"
+	case SyncStrict:
+		return "strict"
+	default:
+		return "auto"
+	}
+}
+
+// Mount assembles the fuse stack from the stable MountOptions and serves
+// until unmounted. It only converts options into the internal MountConfig
+// (see MountWithConfig) — behavior is byte-identical.
+func Mount(opts *MountOptions) error {
 	if opts == nil {
-		return false
+		return fmt.Errorf("fuse: nil MountOptions")
 	}
-	policy := opts.WritePolicy
-	if policy == "" {
-		policy = WritePolicyWriteBack
-	}
-	return opts.GVisorCompat && policy == WritePolicyWriteBack && writeBack != nil && commitQueue == nil
+	return MountWithConfig(mountConfigFromOptions(opts))
 }
 
-func (o *MountOptions) setDefaults() {
-	// Apply profile defaults before generic defaults so profile-specific
-	// zero-value options can take effect while explicit non-zero values win.
-	if o.Profile == MountProfileInteractive {
-		ApplyInteractiveProfile(o)
-	}
-	if o.CacheSize <= 0 {
-		o.CacheSize = defaultReadCacheMaxSize
-	}
-	if o.ReadCacheMaxFileBytes <= 0 {
-		o.ReadCacheMaxFileBytes = defaultReadCacheMaxFileSize
-	}
-	if o.ReadCacheTTL == 0 {
-		o.ReadCacheTTL = defaultReadCacheTTL
-	}
-	if o.DiskReadCacheSize <= 0 {
-		o.DiskReadCacheSize = defaultDiskReadCacheMaxSize
-	}
-	if o.DiskReadCacheFreeRatio <= 0 {
-		o.DiskReadCacheFreeRatio = defaultDiskReadCacheFreeRatio
-	}
-	attrTTL := defaultPositiveKernelCacheTTL
-	if o.Profile == MountProfileCodingAgent {
-		attrTTL = defaultCodingAgentAttrCacheTTL
-	}
-	if o.DirTTL <= 0 {
-		o.DirTTL = defaultDirCacheTTL
-	}
-	if o.AttrTTL <= 0 {
-		o.AttrTTL = attrTTL
-	}
-	if o.EntryTTL <= 0 {
-		o.EntryTTL = defaultPositiveKernelCacheTTL
-	}
-	if o.NegativeEntryTTL <= 0 {
-		o.NegativeEntryTTL = time.Second
-	}
-	// FlushDebounce: 0 means disabled, negative means unset (use default).
-	if o.FlushDebounce < 0 {
-		o.FlushDebounce = defaultFlushDebounce
-	}
-	if o.UploadConcurrency <= 0 {
-		o.UploadConcurrency = defaultUploadConcurrency
-	}
-	if o.ReadConcurrency <= 0 {
-		o.ReadConcurrency = defaultRemoteReadConcurrency
-	}
-	if o.ParallelReadConcurrency <= 0 {
-		o.ParallelReadConcurrency = defaultParallelReadConcurrency
-	}
-	if o.ParallelReadBlockSize <= 0 {
-		o.ParallelReadBlockSize = defaultParallelReadBlockSize
-	}
-	if o.WriteCacheFreeRatio < 0 {
-		// Negative values explicitly disable the write-back free-ratio guard.
-		o.WriteCacheFreeRatio = 0
-	} else if o.WriteCacheFreeRatio == 0 {
-		o.WriteCacheFreeRatio = defaultWriteCacheFreeRatio
-	}
-	if o.WriteCacheSizeMB < 0 {
-		// Negative values explicitly disable the write-back byte quota.
-		o.WriteCacheSizeMB = 0
-	} else if o.WriteCacheSizeMB == 0 {
-		o.WriteCacheSizeMB = defaultWriteCacheSizeMB
-	}
-	if o.LookupRetryCount < 0 {
-		// Negative values are CLI-internal sentinels meaning retries were
-		// explicitly disabled by the operator.
-		o.LookupRetryCount = 0
-	} else if o.LookupRetryCount == 0 {
-		o.LookupRetryCount = lookupTransientRetryCount
-	}
-	if o.LookupRetryTimeout <= 0 {
-		o.LookupRetryTimeout = lookupTransientRetryTimeout
-	}
-	if o.PrefetchMaxFiles <= 0 {
-		o.PrefetchMaxFiles = defaultReadDirPrefetchMaxFiles
-	}
-	if o.PrefetchMaxFileBytes <= 0 || o.PrefetchMaxFileBytes > defaultSmallFileThreshold {
-		o.PrefetchMaxFileBytes = defaultSmallFileThreshold
-	}
-	if o.PrefetchMaxBytes <= 0 {
-		o.PrefetchMaxBytes = defaultReadDirPrefetchMaxBytes
-	}
-	if o.PrefetchTimeout <= 0 {
-		o.PrefetchTimeout = defaultReadDirPrefetchTimeout
-	}
-	if o.Profiling.PerfSamplesPath != "" && o.Profiling.PerfSampleInterval <= 0 {
-		o.Profiling.PerfSampleInterval = 10 * time.Second
-	}
-	if o.Profiling.PerfSamplesPath != "" && o.Profiling.PerfMaxSamples <= 0 {
-		o.Profiling.PerfMaxSamples = defaultPerfMaxSamples
-	}
-	if o.Profiling.PerfSamplesPath != "" && o.Profiling.PerfMaxSampleFiles <= 0 {
-		o.Profiling.PerfMaxSampleFiles = defaultPerfMaxSampleFiles
-	}
-	if o.Profiling.ProfileDir != "" && o.Profiling.CPUProfileDuration <= 0 {
-		o.Profiling.CPUProfileDuration = defaultCPUProfileDuration
-	}
-	if o.Profiling.ProfileDir != "" && o.Profiling.CPUProfileInterval <= 0 {
-		o.Profiling.CPUProfileInterval = defaultCPUProfileInterval
-	}
-	if o.Profiling.ProfileDir != "" && o.Profiling.HeapProfileInterval <= 0 {
-		o.Profiling.HeapProfileInterval = defaultHeapProfileInterval
-	}
-	if o.Profiling.ProfileDir != "" && o.Profiling.PerfMaxProfileFiles <= 0 {
-		o.Profiling.PerfMaxProfileFiles = defaultPerfMaxProfileFiles
-	}
-	if o.RemoteCommitWaitTimeout == 0 {
-		o.RemoteCommitWaitTimeout = 5 * time.Second
+// mountConfigFromOptions is the public-options to internal-config
+// conversion; kept separate so tests pin new option wiring.
+func mountConfigFromOptions(opts *MountOptions) MountConfig {
+	return MountConfig{
+		Server:                        opts.Server,
+		APIKey:                        opts.APIKey,
+		Token:                         opts.Token,
+		MountPoint:                    opts.MountPoint,
+		RemoteRoot:                    opts.RemoteRoot,
+		CacheDir:                      opts.CacheDir,
+		CacheSize:                     opts.CacheSize,
+		ReadCacheMaxFileBytes:         opts.ReadCacheMaxFileBytes,
+		ReadCacheTTL:                  opts.ReadCacheTTL,
+		DiskReadCacheSize:             opts.DiskReadCacheSize,
+		DiskReadCacheFreeRatio:        opts.DiskReadCacheFreeRatio,
+		DirTTL:                        opts.DirTTL,
+		AttrTTL:                       opts.AttrTTL,
+		EntryTTL:                      opts.EntryTTL,
+		NegativeEntryTTL:              opts.NegativeEntryTTL,
+		FlushDebounce:                 opts.FlushDebounce,
+		LookupRetryCount:              opts.LookupRetryCount,
+		LookupRetryTimeout:            opts.LookupRetryTimeout,
+		LegacyDirStatFallback:         opts.LegacyDirStatFallback,
+		ReadDirPrefetch:               opts.ReadDirPrefetch,
+		PrefetchMaxFiles:              opts.PrefetchMaxFiles,
+		PrefetchMaxFileBytes:          opts.PrefetchMaxFileBytes,
+		PrefetchMaxBytes:              opts.PrefetchMaxBytes,
+		PrefetchTimeout:               opts.PrefetchTimeout,
+		TrustLocalEvents:              opts.TrustLocalEvents,
+		SyncMode:                      opts.SyncMode.configString(),
+		WritePolicy:                   opts.WritePolicy.String(),
+		WritebackLazyStaging:          opts.WritebackLazyStaging,
+		WritebackSyncWindow:           opts.WritebackSyncWindow,
+		Profile:                       opts.Profile,
+		LayerRef:                      opts.LayerRef,
+		CheckpointRef:                 opts.CheckpointRef,
+		LocalRoot:                     opts.LocalRoot,
+		LocalOnlyPatterns:             opts.LocalOnlyPatterns,
+		LocalGitignoreAwarePatterns:   opts.LocalGitignoreAwarePatterns,
+		RemoteOnlyPatterns:            opts.RemoteOnlyPatterns,
+		DisableBuiltinOverlayDefaults: opts.DisableBuiltinOverlayDefaults,
+		AppendLogPatterns:             opts.AppendLogPatterns,
+		PackPaths:                     opts.PackPaths,
+		ExtentPaths:                   opts.ExtentPaths,
+		UploadConcurrency:             opts.UploadConcurrency,
+		DirCacheMaxEntries:            opts.DirCacheMaxEntries,
+		CommitQueueMaxPending:         opts.CommitQueueMaxPending,
+		WriteBackBatchWindow:          opts.WriteBackBatchWindow,
+		WriteBackBatchMaxFiles:        opts.WriteBackBatchMaxFiles,
+		WriteBackBatchMaxBytes:        opts.WriteBackBatchMaxBytes,
+		WriteCacheFreeRatio:           opts.WriteCacheFreeRatio,
+		WriteCacheSizeMB:              opts.WriteCacheSizeMB,
+		ReadConcurrency:               opts.ReadConcurrency,
+		ParallelReadConcurrency:       opts.ParallelReadConcurrency,
+		ParallelReadBlockSize:         opts.ParallelReadBlockSize,
+		SyncRead:                      opts.SyncRead,
+		DirectMountStrict:             opts.DirectMountStrict,
+		GVisorCompat:                  opts.GVisorCompat,
+		LegacyInterruptibleMutations:  opts.LegacyInterruptibleMutations,
+		AllowOther:                    opts.AllowOther,
+		ReadOnly:                      opts.ReadOnly,
+		Debug:                         opts.Debug,
+		PerfCounters:                  opts.PerfCounters,
+		EnableGitWorkspaces:           opts.EnableGitWorkspaces,
+		ProfileCPUDuration:            opts.Profiling.CPUProfileDuration,
+		ProfileCPUInterval:            opts.Profiling.CPUProfileInterval,
+		ProfileHeap:                   opts.Profiling.HeapProfilePath,
+		ProfileDir:                    opts.Profiling.ProfileDir,
+		ProfileHeapInterval:           opts.Profiling.HeapProfileInterval,
+		PprofAddr:                     opts.Profiling.PprofAddr,
+		PerfSamplesPath:               opts.Profiling.PerfSamplesPath,
+		PerfSampleInterval:            opts.Profiling.PerfSampleInterval,
+		PerfMaxSamples:                opts.Profiling.PerfMaxSamples,
+		PerfMaxSampleFiles:            opts.Profiling.PerfMaxSampleFiles,
+		PerfMaxProfileFiles:           opts.Profiling.PerfMaxProfileFiles,
+		RemoteCommitWaitTimeout:       opts.RemoteCommitWaitTimeout,
+		SkipProcessState:              opts.SkipProcessState,
+		OmitProcessStateCredentials:   opts.OmitProcessStateCredentials,
+		DefaultOwner:                  opts.DefaultOwner,
+		Supervised:                    opts.Supervised,
+		Extensions:                    opts.Extensions,
 	}
 }
 
+// resolveKernelTTLDefaults ports v1 setDefaults' profile-dependent kernel
+// cache TTLs (kept as a named function so white-box tests pin the profile
+// rows): 60s attr/entry, 30s attr on coding-agent, interactive drops
+// attr/entry to 1s and listings to 2s; explicit (positive) values win.
+func resolveKernelTTLDefaults(profile string, attrTTL, entryTTL, dirTTL time.Duration) (time.Duration, time.Duration, time.Duration) {
+	if attrTTL <= 0 {
+		attrTTL = 60 * time.Second
+		if profile == "coding-agent" {
+			attrTTL = 30 * time.Second
+		}
+		if profile == "interactive" {
+			attrTTL = 1 * time.Second
+		}
+	}
+	if entryTTL <= 0 {
+		entryTTL = 60 * time.Second
+		if profile == "interactive" {
+			entryTTL = 1 * time.Second
+		}
+	}
+	if dirTTL <= 0 {
+		dirTTL = 10 * time.Second
+		if profile == "interactive" {
+			dirTTL = 2 * time.Second
+		}
+	}
+	return attrTTL, entryTTL, dirTTL
+}
+
+// resolveWriteCacheSizeMB ports the v1 write-cache quota knob semantics:
+// zero uses the 1024 MiB default, negative disables the byte quota (0).
+func resolveWriteCacheSizeMB(sizeMB int64) int64 {
+	if sizeMB == 0 {
+		return 1024
+	}
+	if sizeMB < 0 {
+		return 0
+	}
+	return sizeMB
+}
+
+// MountWithConfig assembles the fuse stack from the raw internal config and
+// serves until unmounted. Mount(MountOptions) is the stable entry; this form
+// exists for the CLI bridge and white-box tests that already hold a config.
+func MountWithConfig(cfg MountConfig) error {
+	err := mountWithConfig(cfg)
+	if err != nil && cfg.OmitProcessStateCredentials {
+		err = redactCredentialError(err, cfg)
+	}
+	return err
+}
+
+// buildMountProcessState assembles the pidfile record, blanking the
+// credential-bearing fields when the caller asked them to stay out of the
+// process state.
+func buildMountProcessState(remoteRoot, profile, localRoot, server, apiKey, token string,
+	packPaths []string, prof ProfilingOptions, supervised, omit bool,
+	mountPoint string, creationTime uint64, credentialKind, controlSock string, startedAt time.Time) mountstate.ProcessState {
+	if omit {
+		server, apiKey, token = "", "", ""
+	}
+	return mountstate.ProcessState{
+		PID:                 os.Getpid(),
+		CreationTime:        creationTime,
+		Component:           "drive9-fuse",
+		MountKind:           mountstate.MountKindFUSE,
+		MountPoint:          mountPoint,
+		RemoteRoot:          remoteRoot,
+		Profile:             profile,
+		LocalRoot:           localRoot,
+		Server:              server,
+		PackPaths:           append([]string(nil), packPaths...),
+		CredentialKind:      credentialKind,
+		APIKey:              apiKey,
+		Token:               token,
+		ProfileDir:          prof.ProfileDir,
+		PerfSamplesPath:     prof.PerfSamplesPath,
+		PerfInterval:        prof.PerfSampleInterval.String(),
+		PerfMaxSamples:      prof.PerfMaxSamples,
+		PerfMaxSampleFiles:  prof.PerfMaxSampleFiles,
+		PerfMaxProfileFiles: prof.PerfMaxProfileFiles,
+		PprofAddr:           prof.PprofAddr,
+		StartedAt:           startedAt.Format(time.RFC3339Nano),
+		HeapProfilePath:     prof.HeapProfilePath,
+		ControlSocket:       controlSock,
+		Role:                mountstate.RoleWorker,
+		Supervise:           supervised,
+	}
+}
+
+// newMountProcessState is the MountOptions form of the builder (the mount
+// entry and its white-box tests use it).
+func newMountProcessState(opts *MountOptions, mountPoint string, creationTime uint64, credentialKind, controlSock string, startedAt time.Time) mountstate.ProcessState {
+	return buildMountProcessState(opts.RemoteRoot, opts.Profile, opts.LocalRoot, opts.Server, opts.APIKey, opts.Token,
+		opts.PackPaths, opts.Profiling, opts.Supervised, opts.OmitProcessStateCredentials,
+		mountPoint, creationTime, credentialKind, controlSock, startedAt)
+}
+
+// readyMessage renders the mounted line; a non-persistent credential mount
+// may run with a credential-bearing endpoint, so it omits the server.
+func readyMessage(mountPoint, server, actorID string, readonly bool, policy, cacheBase, shadowDir string, omit bool) string {
+	if omit {
+		return fmt.Sprintf("drive9: mounted on %s (actor: %s, readonly: %v, write_policy: %s, cache: %s, shadow: %s)\n",
+			mountPoint, actorID, readonly, policy, cacheBase, shadowDir)
+	}
+	return fmt.Sprintf("drive9: mounted on %s (server: %s, actor: %s, readonly: %v, write_policy: %s, cache: %s, shadow: %s)\n",
+		mountPoint, server, actorID, readonly, policy, cacheBase, shadowDir)
+}
+
+// mountReadyMessage is the MountOptions form (used by tests).
+func mountReadyMessage(opts *MountOptions, actorID, cacheBase, shadowDir string) string {
+	return readyMessage(opts.MountPoint, opts.Server, actorID, opts.ReadOnly, opts.WritePolicy.String(), cacheBase, shadowDir, opts.OmitProcessStateCredentials)
+}
+
+// policyString renders the write policy for the ready line (the enum's
+// zero value is writeback).
+func policyString(policy writeback.Policy) string {
+	switch policy {
+	case writeback.PolicyWriteSync:
+		return "write-sync"
+	case writeback.PolicyCloseSync:
+		return "close-sync"
+	default:
+		return "writeback"
+	}
+}
+
+// redactCredentialError strips the endpoint/key/token from an error chain,
+// preserving the MountExitError classification (exit code/reason survive).
+func redactCredentialError(err error, cfg MountConfig) error {
+	if err == nil {
+		return nil
+	}
+	message := redactCredentialText(err.Error(), cfg)
+	if message == err.Error() {
+		return err
+	}
+	var exitErr *MountExitError
+	if errors.As(err, &exitErr) {
+		redacted := *exitErr
+		redacted.Detail = redactCredentialText(exitErr.Detail, cfg)
+		if exitErr.Cause != nil {
+			redacted.Cause = redactedMountCause{
+				message: redactCredentialText(exitErr.Cause.Error(), cfg),
+				cause:   exitErr.Cause,
+			}
+		}
+		return &redacted
+	}
+	return redactedMountCause{message: message, cause: err}
+}
+
+// redactMountCredentialError is the MountOptions form (used by the mount
+// entry's white-box tests and by callers holding the public options).
+func redactMountCredentialError(err error, opts *MountOptions) error {
+	return redactCredentialError(err, MountConfig{Server: opts.Server, APIKey: opts.APIKey, Token: opts.Token})
+}
+
+// writeMountExitReason persists an exit record, redacting the detail when
+// credentials must not leave the process.
+func writeMountExitReason(opts *MountOptions, mountPoint string, rec mountstate.ExitReason) error {
+	if opts != nil && opts.OmitProcessStateCredentials {
+		rec.Detail = redactCredentialText(rec.Detail, MountConfig{Server: opts.Server, APIKey: opts.APIKey, Token: opts.Token})
+	}
+	return mountstate.WriteExitReason(mountPoint, rec)
+}
+
+// redactCredentialText replaces every secret the mount carries.
+func redactCredentialText(text string, cfg MountConfig) string {
+	for _, secret := range []string{cfg.Server, cfg.APIKey, cfg.Token} {
+		if secret != "" {
+			text = strings.ReplaceAll(text, secret, "<redacted>")
+		}
+	}
+	return text
+}
+
+type redactedMountCause struct {
+	message string
+	cause   error
+}
+
+func (e redactedMountCause) Error() string { return e.message }
+func (e redactedMountCause) Unwrap() error { return e.cause }
+
+func mountWithConfig(cfg MountConfig) error {
+	if cfg.APIKey != "" && cfg.Token != "" {
+		return fmt.Errorf("fuse: APIKey and Token are mutually exclusive")
+	}
+	if cfg.APIKey == "" && cfg.Token == "" {
+		return fmt.Errorf("fuse: either APIKey or Token is required")
+	}
+	remoteRoot, err := mountpath.NormalizeRoot(cfg.RemoteRoot)
+	if err != nil {
+		return fmt.Errorf("fuse: normalize remote root: %w", err)
+	}
+
+	var cl *client.Client
+	if cfg.Token != "" {
+		cl = client.NewWithToken(cfg.Server, cfg.Token)
+	} else {
+		cl = client.New(cfg.Server, cfg.APIKey)
+	}
+	cl.Warm(context.Background())
+	// v1: one actor id tags this mount's own writes AND filters its SSE
+	// echo — separate ids would make every local commit look like a remote
+	// change and trigger needless kernel invalidations.
+	actorID := generateMountID()
+	cl.SetActor(actorID)
+
+	// v1 validateRemoteRoot: refuse to mount a remote source that does not
+	// exist (startup-permanent) before any kernel mount is established, and
+	// surface connectivity/auth trouble as startup-transient for the
+	// supervisor's retry ladder.
+	if err := validateRemoteRoot(context.Background(), cl, remoteRoot); err != nil {
+		return err
+	}
+	// A checkpoint without a layer is meaningless (the layer plane carries
+	// the checkpoint view) and previously passed silently: the layer
+	// extension was skipped, the checkpoint ignored, and an ordinary
+	// writable filesystem mounted instead.
+	if strings.TrimSpace(cfg.CheckpointRef) != "" && strings.TrimSpace(cfg.LayerRef) == "" {
+		return fmt.Errorf("fuse: checkpoint %q requires --layer (the layer plane owns the checkpoint view)", cfg.CheckpointRef)
+	}
+
+	extOrder, err := parseExtensionOrder(cfg.Extensions)
+	if err != nil {
+		return err
+	}
+	// sharedCounters exists before the extension chain: the git
+	// extension's refresh accounting needs the same instance the FS
+	// summary prints.
+	sharedCounters := perf.NewCounters(cfg.PerfCounters || cfg.PerfSamplesPath != "")
+	wantExt := make(map[string]bool, len(extOrder))
+	for _, name := range extOrder {
+		wantExt[name] = true
+	}
+	// Each extension constructs independently into a registry; assembly
+	// walks the flag order in reverse below.
+	built := map[string]fs.Handler{}
+
+	// v1 cache base: an explicit cache dir, else the per-user default, so
+	// cache-backed components stay enabled without explicit configuration.
+	cacheBase := cfg.CacheDir
+	if cacheBase == "" {
+		if home, herr := os.UserHomeDir(); herr == nil {
+			cacheBase = filepath.Join(home, ".cache", "drive9")
+		}
+	}
+	// v1 mount-scoped cache namespaces: writeback-side state keys on the
+	// mount identity (layer mounts fold their refs into it), while the
+	// read-side caches also key on the credential because their entries
+	// hold remote bytes that survive remounts.
+	mountHash := ""
+	readCacheHash := ""
+	if cacheBase != "" {
+		mountHash = MountHash(cfg.Server, cfg.MountPoint, cfg.RemoteRoot)
+		if cfg.LayerRef != "" {
+			mountHash = MountLayerHash(cfg.Server, cfg.MountPoint, cfg.RemoteRoot, cfg.LayerRef, cfg.CheckpointRef)
+		}
+		readCacheHash = MountReadCacheHash(cfg.Server, cfg.MountPoint, cfg.RemoteRoot, mountCredentialKind(&cfg), mountCredentialSecret(&cfg))
+	}
+
+	// core constructs into the same registry as every other extension; the
+	// flag order places it (first entry = innermost terminal).
+	var coreExt *core.Core
+	if wantExt["core"] {
+		coreExt, err = core.New(cl, core.Options{
+			RemoteRoot:            remoteRoot,
+			StatRetryCount:        cfg.LookupRetryCount,
+			StatRetryTimeout:      cfg.LookupRetryTimeout,
+			ReadConcurrency:       cfg.ReadConcurrency,
+			LegacyDirStatFallback: cfg.LegacyDirStatFallback,
+			// Process-local trust only on single-server mounts that asked
+			// for it: default false keeps the remote revalidation that
+			// observes other servers' writes.
+			TrustLocalEvents: cfg.TrustLocalEvents,
+			// gvisor-compat takes precedence and always keeps commits
+			// detached (v1).
+			LegacyInterruptibleMutations: cfg.LegacyInterruptibleMutations && !cfg.GVisorCompat,
+		})
+		if err != nil {
+			return fmt.Errorf("fuse: core terminal: %w", err)
+		}
+		built["core"] = coreExt
+	}
+	bus := fs.NewEventBus()
+	if coreExt != nil {
+		coreExt.AttachEvents(bus)
+	}
+	var readCache *cache.Cache
+	if wantExt["cache"] {
+		// v1 always ran the in-memory read cache — it does not need a cache
+		// directory; the on-disk block cache rides --cache-dir. Zero limits
+		// fall back to the ported defaults (128MB / 30s / 4MB per file).
+		// The cache extension owns everything under the cache directory
+		// (landlord); for now that is the read cache; the staging ledger
+		// joins when writeback lands.
+		rc, cerr := cache.New(cache.Options{
+			Events:             bus,
+			MaxSize:            cfg.CacheSize,
+			TTL:                cfg.ReadCacheTTL,
+			MaxFileSize:        cfg.ReadCacheMaxFileBytes,
+			SequentialPrefetch: true,
+			PrefetchClient:     cl,
+			RemoteRoot:         remoteRoot,
+			// v1 --parallel-read-concurrency/block-size (defaults 4 x 1MiB).
+			ParallelReadConcurrency: cfg.ParallelReadConcurrency,
+			ParallelReadBlockSize:   cfg.ParallelReadBlockSize,
+			// v1 readdir content prefetch: --readdir-prefetch only (default
+			// off — the max-files knob alone does not enable it).
+			DirContentPrefetch:   cfg.ReadDirPrefetch,
+			PrefetchMaxFiles:     cfg.PrefetchMaxFiles,
+			PrefetchMaxFileBytes: cfg.PrefetchMaxFileBytes,
+			PrefetchMaxBytes:     cfg.PrefetchMaxBytes,
+			PrefetchTimeout:      cfg.PrefetchTimeout,
+			Disk:                 diskCacheOpts(cacheScopedDir(cacheBase, readCacheHash, "read"), cfg.DiskReadCacheSize, cfg.DiskReadCacheFreeRatio),
+		})
+		if cerr != nil {
+			return fmt.Errorf("fuse: cache extension: %w", cerr)
+		}
+		readCache = rc
+		built["cache"] = readCache
+	}
+
+	var policy writeback.Policy
+	switch cfg.WritePolicy {
+	case "write-sync":
+		policy = writeback.PolicyWriteSync
+	case "writeback", "":
+		policy = writeback.PolicyWriteBack
+	case "close-sync":
+		policy = writeback.PolicyCloseSync
+	default:
+		return fmt.Errorf("fuse: unknown write policy %q", cfg.WritePolicy)
+	}
+
+	// The v1 small-file writeback track (.dat/.meta + 16-worker uploader)
+	// rides the mount-scoped cache namespace under its own name.
+	writeCacheDir := cacheScopedDir(cacheBase, mountHash, "writecache")
+	// The staging ledger + commit queue serve the async writeback policy
+	// (shadow/pending/journal machinery); close-sync ALSO gets the ledger
+	// for its v1 shadow-backed large-file close uploads (bounded-memory
+	// staging + streamed landing). Write-sync commits inline per Write and
+	// needs none of it. The cache plugin stays regardless — its READ caches
+	// serve every policy; only its staging role is policy-bound.
+	var stagingLedger *staging.Staging
+	if !cfg.ReadOnly && (policy == writeback.PolicyWriteBack || policy == writeback.PolicyCloseSync) && cacheBase != "" && wantExt["writeback"] {
+		// wantExt gate: a core-only stack (--extensions core) keeps the
+		// default writeback policy but builds no writeback handler; the
+		// ledger would still be created, recovered, and compacted — a
+		// corrupt or unwritable cache dir failing a mount that never
+		// uses it.
+		// v1 write-cache quota (defaults freeRatio 0.10, 1024 MiB): the
+		// shadow store refuses writes past the budget with ENOSPC.
+		// v1 knobs: zero uses the default, negative disables the check.
+		freeRatio := cfg.WriteCacheFreeRatio
+		if freeRatio == 0 {
+			freeRatio = 0.10
+		} else if freeRatio < 0 {
+			freeRatio = 0
+		}
+		cacheSizeMB := resolveWriteCacheSizeMB(cfg.WriteCacheSizeMB)
+		// The ledger's internal layout (shadow/, pending/, journal.wal) is
+		// the v1 mount-scoped one: root it at the mount hash directly.
+		stagingLedger, err = staging.NewStagingWithQuota(filepath.Join(cacheBase, mountHash), freeRatio, cacheSizeMB)
+		if err != nil {
+			return fmt.Errorf("fuse: staging ledger: %w", err)
+		}
+		defer stagingLedger.Close()
+		if err := stagingLedger.Recover(); err != nil {
+			return fmt.Errorf("fuse: staging recovery: %w", err)
+		}
+		_ = stagingLedger.Compact()
+	}
+
+	// v1 sync-mode resolution: auto probes the server RTT (HEAD /, 5s
+	// bound); >10ms (or an unreachable probe) resolves interactive — fsync
+	// served by the local staging ledger — otherwise strict.
+	syncMode := strings.TrimSpace(cfg.SyncMode)
+	switch syncMode {
+	case "", "auto":
+		syncMode = resolveSyncModeByRTT(cfg.Server)
+	case "strict", "interactive":
+	default:
+		return fmt.Errorf("fuse: unknown sync mode %q", cfg.SyncMode)
+	}
+	fmt.Fprintf(os.Stderr, "drive9: sync mode: %s\n", syncMode)
+
+	// A sandbox presents the workspace as owned by its unprivileged
+	// application user (v1 DefaultOwner); everything else reports the
+	// mounting process.
+	uid, gid := uint32(os.Getuid()), uint32(os.Getgid())
+	if cfg.DefaultOwner != nil {
+		uid, gid = cfg.DefaultOwner.UID, cfg.DefaultOwner.GID
+	}
+
+	// The POSIX rename preflight sits early so its attribute lookups see
+	// the view handlers below it (lazy-create overlays answer for
+	// not-yet-committed files).
+	var renameGuard *renameguard.RenameGuard
+	if wantExt["renameguard"] {
+		renameGuard, err = renameguard.New(renameguard.Options{
+			Uid: uid,
+			Gid: gid,
+		})
+		if err != nil {
+			return fmt.Errorf("fuse: renameguard extension: %w", err)
+		}
+		built["renameguard"] = renameGuard
+	}
+
+	// v1 EnableGitWorkspaces (default off): the git extension's workspace
+	// discovery is opt-in — overlay mounts (LocalRoot) arm it via the CLI.
+	// Constructed before localize so its declarative routing (a workspace's
+	// .git stays local, v1 gitDirShouldBeLocalOverlay) wires into the
+	// overlay router.
+	var gitExt *git.Git
+	if wantExt["git"] && cfg.EnableGitWorkspaces {
+		var gerr error
+		gitExt, gerr = git.New(git.Options{Client: cl, Events: bus, LocalRoot: cfg.LocalRoot, RemoteRoot: remoteRoot, SyncPolicy: string(cfg.WritePolicy),
+			OnWorkspaceRefresh: sharedCounters.RecordGitWorkspaceRefresh})
+		if gerr != nil {
+			return fmt.Errorf("fuse: git extension: %w", gerr)
+		}
+		built["git"] = gitExt
+	}
+
+	// localize routes declared local-only paths to the local overlay
+	// (v1 local_overlay/local_policy semantics).
+	if wantExt["localize"] && cfg.LocalRoot != "" {
+		localizeOpts := localize.Options{
+			LocalRoot:                   cfg.LocalRoot,
+			LocalOnlyPatterns:           cfg.LocalOnlyPatterns,
+			LocalGitignoreAwarePatterns: cfg.LocalGitignoreAwarePatterns,
+			RemoteOnlyPatterns:          cfg.RemoteOnlyPatterns,
+			Profile:                     cfg.Profile,
+			ApplyBuiltinDefaults:        !cfg.DisableBuiltinOverlayDefaults,
+		}
+		if gitExt != nil {
+			// v1 gitDirShouldBeLocalOverlay: a discovered workspace's .git
+			// routes to the local overlay (the restored .git state backs
+			// git's own file traffic, not the remote).
+			localizeOpts.DeclarativeLocal = gitExt.RoutesLocal
+		}
+		if cacheBase != "" && !cfg.ReadOnly {
+			// SQLite WAL-index sidecars (-shm) are mount-local scratch:
+			// they live in the read-cache namespace in a fresh per-mount
+			// directory, so a crashed mount's leftovers are never reused.
+			// Creation failure only disables that plane (sidecars then
+			// stay on their classified route).
+			transientRoot := transientOverlayRoot(cacheBase, readCacheHash)
+			if err := os.MkdirAll(transientRoot, 0o700); err != nil {
+				fmt.Fprintf(os.Stderr, "drive9: transient local overlay init failed: %v (continuing without)\n", err)
+			} else {
+				localizeOpts.TransientRoot = transientRoot
+			}
+		}
+		localizeExt, lerr := localize.New(localizeOpts)
+		if lerr != nil {
+			return fmt.Errorf("fuse: localize extension: %w", lerr)
+		}
+		built["localize"] = localizeExt
+	}
+
+	// The layer view sits outermost (v1: layer over base), git next.
+	var layerExt *layer.Layer
+	if wantExt["layer"] && strings.TrimSpace(cfg.LayerRef) != "" {
+		layerExt, err = layer.New(layer.Options{
+			Policy:        cfg.WritePolicy,
+			LayerRef:      cfg.LayerRef,
+			CheckpointRef: cfg.CheckpointRef,
+			RemoteRoot:    remoteRoot,
+			Client:        cl,
+			Events:        bus,
+		})
+		if err != nil {
+			return fmt.Errorf("fuse: layer extension: %w", err)
+		}
+		built["layer"] = layerExt
+		// Control/session consumers resolve the layer AGAIN (drive9 exec
+		// on the mount directory): report the PINNED id, or a name/tag
+		// that later points elsewhere sends them to a different layer
+		// than the one this mount reads/writes.
+		if pinned := layerExt.PinnedRef(); pinned != "" {
+			cfg.LayerRef = pinned
+		}
+	}
+
+	// The extent plane claims ahead of the classic data path (cache and
+	// writeback never see extent files). Gated on the --extent paths /
+	// profile [extent] section only: the cache dir falls back to the
+	// per-user default like every other cache-backed component, so it is
+	// never the enabling condition.
+	var extentExt *extent.Extent
+	// Build the extent reader whenever the stack requests it, even with
+	// no local ExtentPaths: files created by another extent-enabled mount
+	// still carry ExtentIno in listings/stats, and the server answers
+	// their reads with 422 unless the JuiceFS-backed reader routes them.
+	// An empty ExtentPaths only skips the JuiceFS runtime discovery.
+	if wantExt["extent"] {
+		extentExt, err = extent.New(extent.Options{
+			ExtentPaths: cfg.ExtentPaths,
+			Client:      cl,
+			RemoteRoot:  remoteRoot,
+			CacheDir:    cacheScopedDir(cacheBase, mountHash, "jfs"),
+			// v1: write-sync mounts pay a per-Write VFS flush on the extent
+			// plane too.
+			Policy: cfg.WritePolicy,
+		})
+		if err != nil {
+			return fmt.Errorf("fuse: extent extension: %w", err)
+		}
+		built["extent"] = extentExt
+	}
+
+	var appendExt *appendlog.AppendLog
+	if wantExt["appendlog"] && len(cfg.AppendLogPatterns) > 0 && strings.TrimSpace(cfg.LayerRef) == "" {
+		appendExt, err = appendlog.New(appendlog.Options{Patterns: cfg.AppendLogPatterns, Client: cl, RemoteRoot: remoteRoot, Events: bus, TempDir: appendLogSnapshotDir(cacheBase, mountHash), SyncPolicy: string(cfg.WritePolicy)})
+		if err != nil {
+			return fmt.Errorf("fuse: appendlog extension: %w", err)
+		}
+		built["appendlog"] = appendExt
+	}
+
+	// The bulk data plane claims fresh truncate-writers (S3 multipart for
+	// large images) only after the view/routing handlers have had their
+	// claim, and before the buffered write path. A write-sync mount commits
+	// every write inline below — the buffered-image claim stays out.
+	if wantExt["bulkfile"] {
+		bulkExt, berr := bulkfile.New(bulkfile.Options{Client: cl, RemoteRoot: remoteRoot, Events: bus, Policy: cfg.WritePolicy})
+		if berr != nil {
+			return fmt.Errorf("fuse: bulkfile extension: %w", berr)
+		}
+		built["bulkfile"] = bulkExt
+	}
+
+	if wantExt["specials"] {
+		specialsExt, sperr := specials.New(specials.Options{Events: bus})
+		if sperr != nil {
+			return fmt.Errorf("fuse: specials extension: %w", sperr)
+		}
+		built["specials"] = specialsExt
+	}
+
+	if wantExt["xattr"] {
+		xattrExt, xerr := xattr.New(xattr.Options{Events: bus})
+		if xerr != nil {
+			return fmt.Errorf("fuse: xattr extension: %w", xerr)
+		}
+		built["xattr"] = xattrExt
+	}
+
+	var wb *writeback.Writeback
+	// A read-only mount serves reads only (the kernel's "ro" option
+	// rejects mutations): constructing the writeback plane here would
+	// RECOVER a previous mount's staging ledger, journal and uploader and
+	// start re-uploading its pending writes — data traffic a read-only
+	// mount must never produce.
+	if wantExt["writeback"] && !cfg.ReadOnly {
+		flushDebounce := cfg.FlushDebounce
+		if cfg.Profile == "interactive" {
+			// v1 ApplyInteractiveProfile disables the debouncer outright
+			// ("replaced by shadow writes").
+			flushDebounce = 0
+		}
+		var werr error
+		wb, werr = writeback.New(writeback.Options{
+			Policy:                policy,
+			SyncMode:              syncMode,
+			WriteCacheDir:         writeCacheDir,
+			Client:                cl,
+			RemoteRoot:            remoteRoot,
+			Events:                bus,
+			Staging:               stagingLedger,
+			FlushDebounce:         flushDebounce,
+			UploadConcurrency:     cfg.UploadConcurrency,
+			CommitQueueMaxPending: cfg.CommitQueueMaxPending,
+			BatchWindow:           cfg.WriteBackBatchWindow,
+			BatchMaxFiles:         cfg.WriteBackBatchMaxFiles,
+			BatchMaxBytes:         cfg.WriteBackBatchMaxBytes,
+			// gvisor-compat takes precedence and always keeps commits
+			// detached (v1).
+			InterruptibleCommits:    cfg.LegacyInterruptibleMutations && !cfg.GVisorCompat,
+			RemoteCommitWaitTimeout: cfg.RemoteCommitWaitTimeout,
+			// v1 --writeback-lazy-staging / --writeback-sync-window.
+			LazyStaging: cfg.WritebackLazyStaging,
+			SyncWindow:  cfg.WritebackSyncWindow,
+		})
+		if werr != nil {
+			return fmt.Errorf("fuse: writeback extension: %w", werr)
+		}
+		built["writeback"] = wb
+	}
+
+	if readCache != nil && wb != nil {
+		// v1 seeded the read cache with the committed image at every
+		// inline-commit settle, and read its write-side base preloads
+		// through the same cache: reads racing backend replica lag then see
+		// this mount's own writes (read-your-writes), and preloads cannot
+		// 404 inside the lag window.
+		wb.SetCommitSeeder(readCache.SeedCommit)
+		wb.SetCommitSeedLimit(readCache.MaxFileSize())
+		wb.SetPendingSeeder(readCache.SeedPending)
+		wb.SetBaseReader(func(path string) ([]byte, bool) {
+			return readCache.ReadCached(path, 0)
+		})
+	}
+
+	var sseExt *sse.SSE
+	if wantExt["sse"] {
+		var serr error
+		sseExt, serr = sse.New(sse.Options{Client: cl, Actor: actorID, RemoteRoot: remoteRoot, Events: bus})
+		if serr != nil {
+			return fmt.Errorf("fuse: sse extension: %w", serr)
+		}
+		built["sse"] = sseExt
+	}
+
+	// v1 setDefaults: kernel attr/entry caches default to 60s (30s attr on
+	// the coding-agent profile), negative entries 1s, listings 10s. The
+	// interactive profile (v1 ApplyInteractiveProfile) drops attr/entry to
+	// 1s, listings to 2s, and disables the flush debounce — zero values
+	// only, so explicit flags still win.
+	attrTTL, entryTTL, dirTTL := resolveKernelTTLDefaults(cfg.Profile, cfg.AttrTTL, cfg.EntryTTL, cfg.DirTTL)
+	// View extensions that own directories (localize overlays, layer
+	// view) must see dir GetAttrs go through the chain; every other stack
+	// serves root/dir attrs from the inode table (v1).
+	localDirAttrs := cfg.LocalRoot == "" && strings.TrimSpace(cfg.LayerRef) == ""
+	// The kernel enforces permissions when default_permissions is on;
+	// otherwise the daemon's open gate carries the mode contract.
+	defaultPermissions := cfg.AllowOther
+	// Assemble the chain as the REVERSE of the flag order: the flag lists
+	// extensions in build-up order (core first, each subsequent entry
+	// wrapping the previous ones), so the last flag entry is the outermost
+	// handler and core is the terminal. Entries whose config prerequisites
+	// are absent (cache without --cache-dir, layer without --layer, ...)
+	// construct nothing and are skipped.
+	var chainHandlers []fs.Handler
+	for i := len(extOrder) - 1; i >= 0; i-- {
+		if h := built[extOrder[i]]; h != nil {
+			chainHandlers = append(chainHandlers, h)
+		}
+	}
+	f, err := New(Options{
+		OwnerSet:           cfg.DefaultOwner != nil,
+		Extensions:         chainHandlers,
+		Events:             bus,
+		AttrTTL:            attrTTL,
+		EntryTTL:           entryTTL,
+		NegEntryTTL:        cfg.NegativeEntryTTL,
+		DirTTL:             dirTTL,
+		DirCacheMaxEntries: cfg.DirCacheMaxEntries,
+		LocalDirAttrs:      localDirAttrs,
+		DefaultPermissions: defaultPermissions,
+		Perf:               cfg.PerfCounters || cfg.PerfSamplesPath != "",
+		PerfCounters:       sharedCounters,
+		Debug:              cfg.Debug,
+		GVisorCompat:       cfg.GVisorCompat,
+		Uid:                uid,
+		Gid:                gid,
+	})
+	if err != nil {
+		return fmt.Errorf("fuse: assemble facade: %w", err)
+	}
+	// The POSIX rename preflight compares sticky ownership against the
+	// facade's inode table (mount-local chown authority, v1), not the chain's
+	// stat view.
+	if renameGuard != nil {
+		renameGuard.SetOwnerLookup(f.OwnerOf)
+	}
+	// Hand the facade-owned namespace cache to the terminal: fresh listings
+	// answer Lookups/GetAttrs without a remote stat (v1 lookupFromDirCache).
+	if coreExt != nil {
+		if dc, ok := f.Ctx.DirCache.(core.NamespaceCache); ok {
+			coreExt.Attach(dc)
+		}
+	}
+	f.mountPt, f.rootTag, f.srvTag = cfg.MountPoint, remoteRoot, cfg.Server
+
+	profiler, err := perf.StartProfiler(cfg.toProfilingOptions())
+	if err != nil {
+		return fmt.Errorf("fuse: profiler: %w", err)
+	}
+	defer profiler.Stop()
+
+	perfRecorder, err := perf.StartContinuousPerf(cfg.toProfilingOptions())
+	if err != nil {
+		return fmt.Errorf("fuse: continuous perf: %w", err)
+	}
+	perfRecorder.SetEnv(&perf.ContinuousPerfEnv{
+		MountPoint: f.mountPoint(), RemoteRoot: f.remoteRootTag(), Server: f.serverTag(),
+		SyncMode: syncMode, WritePolicy: cfg.WritePolicy, Profile: cfg.Profile,
+	})
+	perfRecorder.SetPerf(f.perf)
+	if wb != nil {
+		perfRecorder.SetQueueStats(func() *perf.QueueStats {
+			stats := &perf.QueueStats{
+				OpenFileHandles:      f.HandleCount(),
+				OpenDirectoryHandles: f.DirCount(),
+			}
+			if q := wb.Queue(); q != nil {
+				stats.CommitPending = q.Pending()
+				_, stats.CommitPendingBytes = q.PendingStats()
+			}
+			stats.UploaderQueued, stats.UploaderInFlight = wb.UploaderSnapshot()
+			stats.DirtyInodes = wb.DirtyHandleCount()
+			return stats
+		})
+	}
+	defer perfRecorder.Stop()
+	if sseExt != nil {
+		sseExt.Attach(f.Ctx.Inodes, f.Ctx.Notify)
+	}
+	if layerExt != nil {
+		// The layer event watcher resets the kernel view after a remote
+		// refresh (v1 resetMountView on fs_layer_events).
+		layerExt.Attach(f.Ctx.Notify)
+		// A layer rollback fences the write plane: the commit queue halts
+		// and later inline commits fail with the rolled-back error.
+		if wb != nil {
+			layerExt.OnRollback(wb.AbandonLayerForRollback)
+		}
+	}
+
+	// Control server + mount process state (v1 mount.go) run BEFORE the
+	// FUSE mount: the pidfile's EvalSymlinks stats the mountpoint, which
+	// after NewServer is served by a serve loop that does not exist yet —
+	// the daemon would deadlock on its own mount. The pidfile is how
+	// `drive9 mount drain/umount/status` find this worker and its control
+	// socket; a supervised worker skips it — the supervisor owns the state
+	// file (v1 SkipProcessState: opts.Supervised).
+	ctrl, cerr := startMountControlServer(cfg.MountPoint, cfg.LayerRef, f)
+	if cerr != nil {
+		fmt.Fprintf(os.Stderr, "drive9: mount control server failed: %v (continuing)\n", cerr)
+	} else {
+		defer ctrl.Close()
+	}
+	// v1 had SkipProcessState as an independent knob (the supervisor passes
+	// it explicitly); Supervised alone is only a logging marker.
+	if !cfg.SkipProcessState {
+		stateMountPoint := cfg.MountPoint
+		if absMountPoint, absErr := filepath.Abs(stateMountPoint); absErr == nil {
+			stateMountPoint = absMountPoint
+		}
+		if resolvedMountPoint, resolveErr := filepath.EvalSymlinks(stateMountPoint); resolveErr == nil {
+			stateMountPoint = resolvedMountPoint
+		}
+		credentialKind := mountstate.CredentialKindAPIKey
+		if cfg.Token != "" {
+			credentialKind = mountstate.CredentialKindToken
+		}
+		prof := cfg.toProfilingOptions()
+		creationTime, _ := mountstate.ProcessCreationTime(os.Getpid())
+		controlSock := ""
+		if ctrl != nil {
+			controlSock = ctrl.SocketPath()
+		}
+		pidFile, pidErr := mountstate.WriteProcessState(cfg.MountPoint, buildMountProcessState(
+			cfg.RemoteRoot, cfg.Profile, cfg.LocalRoot, cfg.Server, cfg.APIKey, cfg.Token,
+			cfg.PackPaths, prof, cfg.Supervised, cfg.OmitProcessStateCredentials,
+			stateMountPoint, creationTime, credentialKind, controlSock, time.Now().UTC(),
+		))
+		if pidErr != nil {
+			return fmt.Errorf("fuse: write mount pid file: %w", pidErr)
+		}
+		defer func() {
+			if removeErr := os.Remove(pidFile); removeErr != nil && !os.IsNotExist(removeErr) {
+				fmt.Fprintf(os.Stderr, "drive9: remove mount pid file %s: %v\n", pidFile, removeErr)
+			}
+		}()
+	}
+
+	fuseOpts := newGoFuseMountOptions(cfg)
+
+	// The mount point must exist before go-fuse mounts over it: several
+	// platforms fail NewServer with ENOENT on a missing directory (v1
+	// created it up front).
+	if err := os.MkdirAll(cfg.MountPoint, 0o755); err != nil {
+		return fmt.Errorf("fuse: create mount point %s: %w", cfg.MountPoint, err)
+	}
+	server, err := gofuse.NewServer(f, cfg.MountPoint, fuseOpts)
+	if err != nil {
+		// v1 cleanupNewServerFailure: NewServer can fail after the kernel
+		// mount came up (post-mount INIT failure) with no Server handle to
+		// unmount through — detach the mountpoint ourselves so the failed
+		// attempt does not leave a dead endpoint behind.
+		if shouldForceUnmountAfterNewServerError(err) {
+			fmt.Fprintf(os.Stderr, "drive9: mount startup failed during fuse server initialization failure at %s: %v\n", cfg.MountPoint, err)
+			forceUnmount(cfg.MountPoint)
+		}
+		return ExitStartupTransientErr("fuse mount", err)
+	}
+	// Bound plugin Start (go-fuse runs Init inside the serve loop; a slow
+	// plugin must never stall the mount).
+	startCtx, startCancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer startCancel()
+	f.Init2(startCtx)
+
+	// Serve must be reading /dev/fuse before WaitMount's pollHack opens the
+	// mountpoint: that open is a FUSE OPENDIR and would deadlock against a
+	// daemon that has not entered its read loop (Linux).
+	serveDone := make(chan struct{})
+	go func() {
+		defer close(serveDone)
+		server.Serve()
+	}()
+	// A plugin that failed its Start leaves the stack degraded (a layer
+	// checkpoint that could not restore serves an empty/read-only view):
+	// the mount must fail instead of reporting success (review: Init2's
+	// startErr was saved but never checked).
+	if err := f.StartErr(); err != nil {
+		fmt.Fprintf(os.Stderr, "drive9: mount startup failed during extension start at %s: %v\n", cfg.MountPoint, err)
+		if uerr := server.Unmount(); uerr != nil {
+			fmt.Fprintf(os.Stderr, "drive9: cleanup after extension start failure: unmount failed: %v\n", uerr)
+			forceUnmount(cfg.MountPoint)
+		}
+		select {
+		case <-serveDone:
+		case <-time.After(10 * time.Second):
+		}
+		return ExitStartupTransientErr("extension start", err)
+	}
+	if err := server.WaitMount(); err != nil {
+		// v1 shouldContinueAfterWaitMountPermissionError: Linux pollHack can
+		// surface EACCES/EPERM for a mount that is actually serving; the
+		// readiness probe decides whether to keep serving.
+		if ok, probeErr := shouldContinueAfterWaitMountPermissionError(err, cfg.MountPoint, probeMountPointReady); ok {
+			fmt.Fprintf(os.Stderr, "drive9: fuse wait mount permission error ignored after readiness probe passed at %s: %v\n", cfg.MountPoint, err)
+		} else {
+			if probeErr != nil {
+				fmt.Fprintf(os.Stderr, "drive9: fuse wait mount permission fallback probe failed at %s: %v\n", cfg.MountPoint, probeErr)
+			}
+			// v1 cleanupMountStartFailure: NewServer succeeded and Serve is
+			// running, so drain the write plane before detaching the kernel
+			// mount; an unmount failure falls back to a forced detach so the
+			// mountpoint is never left wedged (ENOTCONN) behind a failed
+			// startup.
+			fmt.Fprintf(os.Stderr, "drive9: mount startup failed during fuse wait mount failure at %s: %v\n", cfg.MountPoint, err)
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			_ = f.flushOpenHandles(cleanupCtx)
+			_ = f.chain.Drain(cleanupCtx)
+			cleanupCancel()
+			if uerr := server.Unmount(); uerr != nil {
+				fmt.Fprintf(os.Stderr, "drive9: cleanup after fuse wait mount failure: unmount failed: %v\n", uerr)
+				forceUnmount(cfg.MountPoint)
+			}
+			select {
+			case <-serveDone:
+			case <-time.After(10 * time.Second):
+			}
+			return ExitStartupTransientErr("fuse wait mount", err)
+		}
+	}
+	cacheDesc, shadowDesc := "none", "none"
+	if cfg.CacheDir != "" {
+		cacheDesc = cfg.CacheDir + "/read"
+		if policy == writeback.PolicyWriteBack {
+			shadowDesc = cfg.CacheDir + "/staging/shadow"
+		}
+	}
+	fmt.Fprint(os.Stderr, readyMessage(cfg.MountPoint, cfg.Server, actorID, cfg.ReadOnly, policyString(policy), cacheDesc, shadowDesc, cfg.OmitProcessStateCredentials))
+
+	// Graceful shutdown (v1 mount.go): on the first SIGINT/SIGTERM flush
+	// open handles, drain the chain, and Unmount with retries (EBUSY is
+	// transient); a second signal force-unmounts. Without this the worker
+	// waits for the kernel to drop the connection and the supervisor's
+	// stop window expires into a kill.
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+	go func() {
+		<-sigCh
+		f.shutdownRequested.Store(true)
+		fmt.Fprintf(os.Stderr, "\ndrive9: unmounting %s...\n", cfg.MountPoint)
+		go func() {
+			<-sigCh
+			fmt.Fprintf(os.Stderr, "drive9: force-quit\n")
+			ForceUnmount(cfg.MountPoint)
+		}()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_ = f.flushOpenHandles(shutdownCtx)
+		_ = f.chain.Drain(shutdownCtx)
+		for attempt := 0; attempt < 5; attempt++ {
+			if err := server.Unmount(); err == nil {
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		ForceUnmount(cfg.MountPoint)
+	}()
+	<-serveDone
+	// A shutdown WE initiated (signal handler: flush → drain → Unmount,
+	// with ForceUnmount as the busy fallback) is a clean worker exit —
+	// the lazy fallback can leave the mountinfo row past the serve end,
+	// and classifying that as abnormal failed the CLI's umount.
+	if f.shutdownRequested.Load() {
+		return nil
+	}
+	// Classify the serve end by the KERNEL mount, not by the OnUnmount
+	// callback: the pinned go-fuse fork invokes OnUnmount unconditionally
+	// after the read loop — including error exits — so the callback is a
+	// teardown notification, never proof of a clean umount(2) handshake
+	// (an abnormal /dev/fuse disconnect set it too, and the abnormal-exit
+	// branch below was unreachable). The mountinfo row is independent: a
+	// clean external unmount removes it; a hung mount keeps it after the
+	// serve loop dies. Give the row a short settling window — the loop can
+	// exit marginally before the umount(2) that triggered it completes.
+	return classifyServeExit(cfg.MountPoint, unmountedKernel)
+}
+
+// classifyServeExit classifies a serve-loop exit by the KERNEL mount row
+// alone (mountStillPresent reports whether the mountinfo entry survives).
+// The go-fuse fork's OnUnmount callback fires unconditionally — clean
+// umount(2) and abnormal /dev/fuse disconnect alike — so no callback-side
+// signal participates here. A row that survives the settle window marks
+// a hung mount: the supervisor's ExitServeAbnormal recovery path.
+func classifyServeExit(mountPoint string, mountStillPresent func(string) bool) error {
+	if !mountStillPresent(mountPoint) {
+		return nil
+	}
+	for deadline := time.Now().Add(300 * time.Millisecond); time.Now().Before(deadline); {
+		time.Sleep(100 * time.Millisecond)
+		if !mountStillPresent(mountPoint) {
+			return nil
+		}
+	}
+	return ExitServeAbnormalErr(fmt.Sprintf("serve loop ended at %s with the kernel mount still present", mountPoint))
+}
+
+// unmountedKernel reports whether the mountpoint is no longer a FUSE mount.
+func unmountedKernel(mountPoint string) bool {
+	mnts, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		// Non-Linux or unreadable: fall back to the handshake flag only.
+		return true
+	}
+	for _, line := range strings.Split(string(mnts), "\n") {
+		if strings.Contains(line, " "+mountPoint+" ") && strings.Contains(line, "fuse") {
+			return false
+		}
+	}
+	return true
+}
+
+// validateRemoteRoot ports v1's startup preflight: the remote source must
+// exist (and be a directory) before the FUSE mount is established, so a typo
+// in the source path fails fast instead of wedging the mountpoint. Scoped
+// tokens that grant list-without-read fall back to List.
 func validateRemoteRoot(ctx context.Context, c *client.Client, remoteRoot string) error {
 	if remoteRoot == "/" {
 		if _, err := c.ListCtx(ctx, remoteRoot); err != nil {
@@ -320,1002 +1478,147 @@ func remoteRootValidationError(remoteRoot string, err error) *MountExitError {
 	return ExitStartupTransientErr(fmt.Sprintf("remote root %q", remoteRoot), err)
 }
 
-// Mount creates and serves a FUSE mount. It blocks until the filesystem
-// is unmounted or a signal (SIGINT, SIGTERM) is received.
-func Mount(opts *MountOptions) (err error) {
-	if opts == nil {
-		return fmt.Errorf("mount: options are required")
+// diskCacheOpts builds the on-disk read-cache options; an empty cache
+// directory disables the disk layer (memory-only, v1 default).
+func diskCacheOpts(dir string, sizeMB int64, freeRatio float64) cache.DiskReadCacheOptions {
+	if dir == "" {
+		return cache.DiskReadCacheOptions{}
 	}
-	opts.setDefaults()
-	if err := validateMountOptionsProfile(opts); err != nil {
-		return ExitStartupPermanentErr("invalid mount profile", err)
+	return cache.DiskReadCacheOptions{
+		Dir:       dir,
+		MaxSize:   sizeMB,
+		FreeRatio: freeRatio,
 	}
-	var (
-		mountBecameActive bool
-		// Assign before deferred recover so panics in overlay setup still
-		// write exit reason under the real mountpoint hash (not empty string).
-		mountPointCopy = opts.MountPoint
-	)
-	defer func() {
-		if r := recover(); r != nil {
-			stack := string(debug.Stack())
-			detail := redactMountCredentialText(fmt.Sprintf("%v", r), opts)
-			fmt.Fprintf(os.Stderr, "drive9: mount lifecycle event=panic mountpoint=%s detail=%s\n%s\n", mountPointCopy, detail, stack)
-			// Prefer live mount check over flag: panic may occur after NewServer
-			// before mountBecameActive is set, or the flag may lag.
-			if mountPointCopy != "" {
-				if mountBecameActive {
-					forceUnmountLazy(mountPointCopy)
-				} else if active, _ := activeMountPointBounded(mountPointCopy); active {
-					forceUnmountLazy(mountPointCopy)
-				}
-			}
-			err = ExitPanicErr(detail, fmt.Errorf("panic: %v", r))
-			if mountPointCopy != "" {
-				_ = writeMountExitReason(opts, mountPointCopy, mountstate.ExitReason{
-					Reason: string(ExitReasonPanic),
-					Detail: detail,
-					Code:   ExitUnhealthy,
-					PID:    os.Getpid(),
-					At:     time.Now().UTC(),
-				})
-			}
-		}
-		if opts.OmitProcessStateCredentials {
-			err = redactMountCredentialError(err, opts)
-		}
-	}()
-	if localOverlay := NewLocalOverlay(opts.LocalRoot); localOverlay != nil {
-		if err := localOverlay.EnsureRoot(); err != nil {
-			return ExitStartupPermanentErr("prepare LocalRoot", err)
-		}
-	}
+}
 
-	if err := os.MkdirAll(opts.MountPoint, 0o755); err != nil {
-		return ExitStartupTransientErr("create mount point", err)
-	}
-
-	// Validate credential inputs. MountOptions.APIKey and MountOptions.Token
-	// are mutually exclusive (Invariant #3 — one mount, one principal).
-	// Both empty is caller error; both non-empty would let a silent
-	// priority rule override what the caller wrote, which we refuse.
-	if opts.APIKey != "" && opts.Token != "" {
-		return ExitStartupPermanentErr("APIKey and Token are mutually exclusive", nil)
-	}
-	if opts.APIKey == "" && opts.Token == "" {
-		return ExitStartupPermanentErr("either APIKey (owner) or Token (delegated) is required", nil)
-	}
-	opts.LayerRef = strings.TrimSpace(opts.LayerRef)
-	opts.CheckpointRef = strings.TrimSpace(opts.CheckpointRef)
-	if opts.CheckpointRef != "" && opts.LayerRef == "" {
-		return ExitStartupPermanentErr("CheckpointRef requires LayerRef", nil)
-	}
-	// D10: checkpoint mount is read-only; writable restore is fork --checkpoint.
-	if opts.CheckpointRef != "" {
-		opts.ReadOnly = true
-	}
-
-	// Generate per-mount actor ID for SSE self-filtering.
-	actorID := generateMountID()
-
-	// Create client and verify connectivity. The constructor choice binds
-	// the mount's principal kind for its entire lifetime (see Invariant #3
-	// and Invariant #6 — running mount credential change requires umount
-	// and remount).
-	var c *client.Client
-	if opts.Token != "" {
-		c = client.NewWithToken(opts.Server, opts.Token)
-	} else {
-		c = client.New(opts.Server, opts.APIKey)
-	}
-	c.SetActor(actorID)
-
-	// Validate remote root (or server connectivity for root mounts).
-	remoteRoot, err := mountpath.NormalizeRoot(opts.RemoteRoot)
-	if err != nil {
-		return ExitStartupPermanentErr("normalize remote root", err)
-	}
-	opts.RemoteRoot = remoteRoot
-	if err := validateRemoteRoot(context.Background(), c, remoteRoot); err != nil {
-		return err
-	}
-	if opts.LayerRef != "" {
-		layer, err := c.GetFSLayer(context.Background(), opts.LayerRef)
-		if err != nil {
-			// Not-found / invalid ref is permanent; network/5xx is transient so
-			// the supervisor can retry instead of circuit-opening immediately.
-			if client.IsNotFound(err) {
-				return ExitStartupPermanentErr(fmt.Sprintf("resolve fs layer %q", opts.LayerRef), err)
-			}
-			return ExitStartupTransientErr(fmt.Sprintf("resolve fs layer %q", opts.LayerRef), err)
-		}
-		if !fsLayerMountStateAllowed(layer.State, opts.CheckpointRef != "") {
-			if opts.CheckpointRef != "" {
-				return ExitStartupPermanentErr(fmt.Sprintf("fs layer %q is %s, checkpoint mount requires active, sealed, or committed", opts.LayerRef, layer.State), nil)
-			}
-			return ExitStartupPermanentErr(fmt.Sprintf("fs layer %q is %s, want active", opts.LayerRef, layer.State), nil)
-		}
-		opts.LayerRef = layer.LayerID
-		fmt.Fprintf(os.Stderr, "drive9: fs layer: %s\n", layer.LayerID)
-	}
-
-	// Build FUSE filesystem
-	dat9fs := NewDat9FS(c, opts)
-	layerEventWatcherStop := func() {}
-
-	profiler, err := StartProfiler(opts.Profiling)
-	if err != nil {
-		return ExitStartupTransientErr("start profiler", err)
-	}
-	opts.Profiling.PprofAddr = profiler.PprofAddr()
-	defer profiler.Stop()
-
-	// Resolve sync mode (auto-detect RTT if needed).
-	resolved := ResolveMode(context.Background(), opts.SyncMode, opts.Server)
-	dat9fs.syncMode = resolved
-	fmt.Fprintf(os.Stderr, "drive9: sync mode: %s\n", resolved)
-	perfRecorder, err := StartContinuousPerf(opts.Profiling, dat9fs)
-	if err != nil {
-		return ExitStartupTransientErr("start continuous perf", err)
-	}
-	defer perfRecorder.Stop()
-
-	cacheBase := opts.CacheDir
+// cacheScopedDir joins a named cache subtree under the mount-scoped
+// namespace; an unavailable cache base disables the subtree (empty).
+func cacheScopedDir(cacheBase, hash, name string) string {
 	if cacheBase == "" {
-		home, err := os.UserHomeDir()
-		if err == nil {
-			cacheBase = filepath.Join(home, ".cache", "drive9")
-		}
+		return ""
 	}
-	mountHash := ""
-	if cacheBase != "" {
-		mountHash = MountHash(opts.Server, opts.MountPoint, opts.RemoteRoot)
-		if opts.LayerRef != "" {
-			mountHash = MountLayerHash(opts.Server, opts.MountPoint, opts.RemoteRoot, opts.LayerRef, opts.CheckpointRef)
-		}
-		dat9fs.appendLogSnapshotRoot = filepath.Join(cacheBase, mountHash, "append-log-snapshots")
-		// The extent data plane keeps its own JuiceFS read block cache under
-		// the same mount-scoped root (jfs/ inside it), so an extent mount gets
-		// a persistent block cache even when --cache-dir is not passed. This
-		// is a read cache: chunk-store staging is off, so nothing dirty lives
-		// here.
-		dat9fs.extentCacheDir = filepath.Join(cacheBase, mountHash)
-		readCacheHash := MountReadCacheHash(opts.Server, opts.MountPoint, opts.RemoteRoot, mountCredentialKind(opts), mountCredentialSecret(opts))
-		readCacheDir := filepath.Join(cacheBase, readCacheHash, "read")
-		diskReadCache, err := NewDiskReadCache(DiskReadCacheOptions{
-			Dir:       readCacheDir,
-			MaxSize:   opts.DiskReadCacheSize,
-			FreeRatio: opts.DiskReadCacheFreeRatio,
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "drive9: disk read cache init failed: %v (continuing without)\n", err)
-		} else {
-			dat9fs.diskReadCache = diskReadCache
-		}
-		if !opts.ReadOnly {
-			transientRoot := transientOverlayRoot(cacheBase, readCacheHash)
-			if err := os.MkdirAll(transientRoot, 0o700); err != nil {
-				fmt.Fprintf(os.Stderr, "drive9: transient local overlay init failed: %v (continuing without)\n", err)
-			} else {
-				transientOverlay := NewLocalOverlay(transientRoot)
-				if err := transientOverlay.EnsureRoot(); err != nil {
-					fmt.Fprintf(os.Stderr, "drive9: transient local overlay init failed: %v (continuing without)\n", err)
-				} else {
-					dat9fs.transientLocalOverlay = transientOverlay
-				}
-			}
-		}
-	}
-
-	// Initialize write-back cache, shadow store, and pending index.
-	var shadowDir string
-	if !opts.ReadOnly {
-		if cacheBase != "" {
-			pendingDir := filepath.Join(cacheBase, mountHash, "pending")
-			shadowDir = filepath.Join(cacheBase, mountHash, "shadow")
-
-			// Initialize PendingIndex (in-memory authoritative metadata).
-			pendingIdx, err := NewPendingIndex(pendingDir)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "drive9: pending index init failed: %v (continuing without)\n", err)
-			} else {
-				if err := pendingIdx.RecoverFromDisk(); err != nil {
-					fmt.Fprintf(os.Stderr, "drive9: pending index recovery: %v\n", err)
-				}
-				dat9fs.pendingIndex = pendingIdx
-			}
-
-			// Initialize ShadowStore with write-back disk protection.
-			var writeCacheMaxBytes int64
-			if opts.WriteCacheSizeMB > 0 {
-				writeCacheMaxBytes = opts.WriteCacheSizeMB << 20
-			}
-			shadowStore, err := NewShadowStoreWithQuota(shadowDir, opts.WriteCacheFreeRatio, writeCacheMaxBytes)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "drive9: shadow store init failed: %v (continuing without)\n", err)
-			} else {
-				dat9fs.shadowStore = shadowStore
-			}
-
-			pendingIdx.setShadowStore(shadowStore)
-
-			// Initialize Journal WAL.
-			journalPath := filepath.Join(cacheBase, mountHash, "journal.wal")
-			journal, err := NewJournal(journalPath)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "drive9: journal init failed: %v (continuing without)\n", err)
-			} else {
-				dat9fs.journal = journal
-				// Route durable pending-meta publication through the WAL
-				// (group-committed fsync) instead of per-entry atomicWrite.
-				pendingIdx.SetJournal(journal)
-				if opts.WritebackLazyStaging {
-					// Issue #964: close stages into the page cache; the
-					// background syncer bounds the power-loss window.
-					pendingIdx.SetJournalSyncOnPut(false)
-					if opts.WritebackSyncWindow > 0 {
-						syncerCtx, syncerCancel := context.WithCancel(context.Background())
-						dat9fs.journalSyncerCancel = syncerCancel
-						go journal.SyncLoop(syncerCtx, opts.WritebackSyncWindow)
-					}
-				}
-				// Replay journal for crash recovery. Preserve the original kind
-				// and base revision so CommitQueue.RecoverPending can re-enqueue.
-				if err := replayJournalIntoPending(journal, pendingIdx, shadowStore); err != nil {
-					closeFailedMountStaging(dat9fs)
-					return fmt.Errorf("mount: journal replay: %w", err)
-				}
-				// Drop frames already covered by commit markers so the WAL does
-				// not grow unboundedly across mounts. Safe here: mount init is
-				// single-threaded, no concurrent Append yet.
-				if err := journal.Compact(); err != nil {
-					fmt.Fprintf(os.Stderr, "drive9: journal compact: %v\n", err)
-				}
-			}
-
-			// Initialize WriteBackCache before CommitQueue so that legacy
-			// pending entries can be migrated to shadow files. Without this,
-			// RecoverPending would prune them as orphans (shadow missing).
-			wbCache, err := NewWriteBackCache(pendingDir)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "drive9: write-back cache init failed: %v (continuing without)\n", err)
-			}
-
-			// Migrate legacy writeBack entries to shadow store so
-			// CommitQueue.RecoverPending sees them and doesn't prune.
-			if err := migrateLegacyWriteBack(shadowStore, wbCache, pendingIdx); err != nil {
-				closeFailedMountStaging(dat9fs)
-				return fmt.Errorf("mount: %w", err)
-			}
-
-			// Initialize CommitQueue for background remote commits.
-			if shadowStore != nil && pendingIdx != nil {
-				cqMaxPending := maxCommitQueuePending
-				if opts.CommitQueueMaxPending > 0 {
-					cqMaxPending = opts.CommitQueueMaxPending
-				}
-				cq := NewCommitQueue(c, shadowStore, pendingIdx, journal, opts.UploadConcurrency, cqMaxPending, opts.RemoteRoot)
-				dat9fs.commitQueue = cq
-				cq.SetLayerRef(opts.LayerRef)
-				cq.SetPerfCounters(dat9fs.perf)
-				cq.OnSuccess = dat9fs.onCommitQueueSuccess
-				cq.OnUploaded = dat9fs.onCommitQueueUploaded
-				cq.OnCleanup = dat9fs.onCommitQueueCleanup
-				cq.OnDiscard = dat9fs.onCommitQueueDiscard
-				cq.IsSuperseded = dat9fs.commitEntrySuperseded
-				cq.serializeMutationInodes = opts.GVisorCompat
-				cq.PathLock = dat9fs.lockRemoteCommitPath
-				cq.DurableWatermark = dat9fs.latestCommittedRevision
-				if opts.WritePolicy == WritePolicyWriteBack && opts.WriteBackBatchWindow > 0 {
-					cq.ConfigureBatchWrite(opts.WriteBackBatchWindow, opts.WriteBackBatchMaxFiles, opts.WriteBackBatchMaxBytes)
-				}
-				if opts.LayerRef != "" {
-					if err := restoreLayerEntries(context.Background(), c, opts, shadowStore, pendingIdx, dat9fs); err != nil {
-						closeFailedMountStaging(dat9fs)
-						return fmt.Errorf("mount: restore fs layer entries: %w", err)
-					}
-					layerEventWatcherStop = StartLayerEventWatcher(dat9fs, c, opts, shadowStore, pendingIdx)
-				}
-				cq.RecoverPending()
-			}
-			if gvisorWriteBackRequiresCommitQueue(opts, wbCache, dat9fs.commitQueue) {
-				closeFailedMountStaging(dat9fs)
-				return errors.New("mount: gvisor compat write-back requires pending index and shadow store")
-			}
-
-			if wbCache != nil {
-				uploader := NewWriteBackUploader(c, wbCache, opts.UploadConcurrency, opts.RemoteRoot)
-				uploader.SetPerfCounters(dat9fs.perf)
-				uploader.OnSuccess = dat9fs.onWriteBackUploadSuccess
-				uploader.OnDataCommitted = dat9fs.onWriteBackDataCommitted
-				uploader.SnapshotStagingGens = dat9fs.snapshotStagingGens
-				dat9fs.SetWriteBack(wbCache, uploader)
-				// Recover pending uploads only when the newer commit queue is
-				// unavailable. Otherwise commitQueue owns shadow-backed recovery.
-				if dat9fs.commitQueue == nil {
-					uploader.RecoverPending()
-				}
-			}
-		}
-	}
-
-	// D10: checkpoint / explicit RO still needs overlay restore (read-only view),
-	// but must not start a commit queue. Membership check lives in restoreLayerEntries.
-	if opts.ReadOnly && opts.LayerRef != "" && cacheBase != "" && mountHash != "" {
-		pendingDir := filepath.Join(cacheBase, mountHash, "pending-ro")
-		shadowDir = filepath.Join(cacheBase, mountHash, "shadow-ro")
-		pendingIdx, pErr := NewPendingIndex(pendingDir)
-		if pErr != nil {
-			return fmt.Errorf("mount: read-only pending index: %w", pErr)
-		}
-		if err := pendingIdx.RecoverFromDisk(); err != nil {
-			fmt.Fprintf(os.Stderr, "drive9: read-only pending recovery: %v\n", err)
-		}
-		shadowStore, sErr := NewShadowStoreWithQuota(shadowDir, opts.WriteCacheFreeRatio, 0)
-		if sErr != nil {
-			return fmt.Errorf("mount: read-only shadow store: %w", sErr)
-		}
-		dat9fs.pendingIndex = pendingIdx
-		dat9fs.shadowStore = shadowStore
-		pendingIdx.setShadowStore(shadowStore)
-		if err := restoreLayerEntries(context.Background(), c, opts, shadowStore, pendingIdx, dat9fs); err != nil {
-			closeFailedMountStaging(dat9fs)
-			return fmt.Errorf("mount: restore fs layer entries: %w", err)
-		}
-	}
-
-	// Configure FUSE mount options
-	fuseOpts := newGoFuseMountOptions(opts)
-
-	// Create FUSE server
-	server, err := gofuse.NewServer(dat9fs, opts.MountPoint, fuseOpts)
-	if err != nil {
-		cleanupNewServerFailure(opts.MountPoint, err, layerEventWatcherStop, dat9fs.FlushAll, forceUnmount, nil)
-		return ExitStartupTransientErr("fuse mount", err)
-	}
-	// Kernel mount may already be live after NewServer; track for panic cleanup.
-	mountBecameActive = true
-
-	// Start SSE watcher after WaitMount. The initial stream reset invalidates
-	// kernel/user-space caches; if it races go-fuse's WaitMount pollHack open
-	// on Linux, the kernel can reject .go-fuse-epoll-hack with EACCES/EPERM.
-	//
-	// The layer event watcher (started earlier) is deliberately left running:
-	// it does no initial blanket cache invalidation and its first poll only
-	// fires after a 1s tick on real remote events, so it cannot race pollHack.
-	var sseWatcher *SSEWatcher
-	dat9fs.markStatCacheUnverified()
-	stopWatchers := func() {
-		if sseWatcher != nil {
-			sseWatcher.Stop()
-		}
-		layerEventWatcherStop()
-	}
-
-	// serveDone closes when the Serve goroutine has fully finished: go-fuse
-	// closes the /dev/fuse fd (aborting the connection) only after the read
-	// loops exit, and an open connection keeps a detached mount listed in the
-	// kernel mount table. Mount must not return while our own fd is still the
-	// last live reference (#928).
-	serveDone := make(chan struct{})
-	err = serveWaitMountThenStartWatchers(func() {
-		defer close(serveDone)
-		server.Serve()
-	}, server.WaitMount, func() {
-		sseWatcher = StartSSEWatcher(dat9fs, c, actorID)
-		// After SSE is up, asynchronously probe the remote git-workspace index
-		// (one FS Stat — not ListGitWorkspaces) so sandbox remounts arm when
-		// prior --fast registrations exist.
-		dat9fs.probeGitWorkspaceIndexAsync()
-	}, func(err error) error {
-		ok, probeErr := shouldContinueAfterWaitMountPermissionError(err, opts.MountPoint, probeMountPointReady)
-		if ok {
-			fmt.Fprintf(os.Stderr, "drive9: fuse wait mount permission error ignored after readiness probe passed at %s: %v\n", opts.MountPoint, err)
-			return nil
-		}
-		if probeErr != nil {
-			fmt.Fprintf(os.Stderr, "drive9: fuse wait mount permission fallback probe failed at %s: %v\n", opts.MountPoint, probeErr)
-		}
-		// NewServer succeeded and Serve is running, so cleanup can drain Drive9-side
-		// workers before asking go-fuse to detach any partially mounted kernel state.
-		cleanupMountStartFailure(mountStartCleanup{
-			reason:       "fuse wait mount failure",
-			mountPoint:   opts.MountPoint,
-			cause:        err,
-			stopWatchers: stopWatchers,
-			flushAll:     dat9fs.FlushAll,
-			closeRuntime: dat9fs.closeExtentRuntime,
-			unmount:      server.Unmount,
-			forceUnmount: forceUnmount,
-		})
-		return ExitStartupTransientErr("fuse wait mount", err)
-	})
-	if err != nil {
-		return err
-	}
-	// opts.LayerRef holds the resolved layer ID by now.
-	controlServer, err := startMountControlServer(opts.MountPoint, opts.LayerRef, dat9fs)
-	if err != nil {
-		cleanupMountStartFailure(mountStartCleanup{
-			reason:       "mount control socket failure",
-			mountPoint:   opts.MountPoint,
-			cause:        err,
-			stopWatchers: stopWatchers,
-			flushAll:     dat9fs.FlushAll,
-			closeRuntime: dat9fs.closeExtentRuntime,
-			unmount:      server.Unmount,
-			forceUnmount: forceUnmount,
-		})
-		return ExitStartupTransientErr("start mount control socket", err)
-	}
-	if controlServer != nil {
-		defer controlServer.Close()
-	}
-	stateMountPoint := opts.MountPoint
-	if absMountPoint, absErr := filepath.Abs(stateMountPoint); absErr == nil {
-		stateMountPoint = absMountPoint
-	}
-	if resolvedMountPoint, resolveErr := filepath.EvalSymlinks(stateMountPoint); resolveErr == nil {
-		stateMountPoint = resolvedMountPoint
-	}
-	credentialKind := mountstate.CredentialKindAPIKey
-	if opts.Token != "" {
-		credentialKind = mountstate.CredentialKindToken
-	}
-	var pidFile string
-	if !opts.SkipProcessState {
-		creationTime, _ := mountstate.ProcessCreationTime(os.Getpid())
-		controlSock := ""
-		if controlServer != nil {
-			controlSock = controlServer.SocketPath()
-		}
-		pidFile, err = mountstate.WriteProcessState(opts.MountPoint, newMountProcessState(
-			opts, stateMountPoint, creationTime, credentialKind, controlSock, time.Now().UTC(),
-		))
-		if err != nil {
-			if controlServer != nil {
-				controlServer.Close()
-			}
-			cleanupMountStartFailure(mountStartCleanup{
-				reason:       "mount process state failure",
-				mountPoint:   opts.MountPoint,
-				cause:        err,
-				stopWatchers: stopWatchers,
-				flushAll:     dat9fs.FlushAll,
-				closeRuntime: dat9fs.closeExtentRuntime,
-				unmount:      server.Unmount,
-				forceUnmount: forceUnmount,
-			})
-			return ExitStartupTransientErr("write mount pid file", err)
-		}
-		defer func() {
-			if pidFile == "" {
-				return
-			}
-			if removeErr := os.Remove(pidFile); removeErr != nil && !os.IsNotExist(removeErr) {
-				fmt.Fprintf(os.Stderr, "drive9: remove mount pid file %s: %v\n", pidFile, removeErr)
-			}
-		}()
-	}
-
-	var shutdownErr error
-	shutdown := newMountShutdown(stopWatchers, func() { shutdownErr = dat9fs.flushAll() })
-	var unmountRequested atomic.Bool
-	mountStartedAt := time.Now()
-
-	// Signal handling for graceful shutdown.
-	//
-	// First SIGINT/SIGTERM:
-	//   1. Start a progress reporter goroutine that prints commit-queue
-	//      depth every 2s so the user knows we're not hung.
-	//   2. Call shutdown() — flushes open fds, drains commit queue.
-	//   3. Retry server.Unmount() up to 5 times (EBUSY is transient).
-	//   4. Fall back to forceUnmount on retry exhaustion.
-	//
-	// Second SIGINT/SIGTERM during step 1-3:
-	//   - Tell the user how much work is being abandoned (count + bytes).
-	//   - Surface where local state is preserved so they can recover or
-	//     inspect it. Do NOT promise automatic resume — recovery is
-	//     best-effort: ShadowSpill (large) files take the terminal-failure
-	//     branch on conflict (commit_queue.go:716-722) to avoid OOMing
-	//     during full-file byte comparison.
-	//   - forceUnmount the mountpoint so re-mount doesn't fail with
-	//     "Permission denied" (the FUSE endpoint must be released).
-	//   - Exit with code 1.
-	//
-	// Buffer size 2: outer goroutine consumes the first signal, inner
-	// goroutine the second. Buffer ≥ 2 ensures signals delivered between
-	// the outer's <-sigCh return and the inner goroutine being scheduled
-	// don't get dropped by signal.Notify.
-	//
-	// Headless/daemon limitation: if shutdown() blocks indefinitely on a
-	// stuck commit-queue worker (no context cancellation), an interactive
-	// user can press Ctrl+C twice; daemon operators must send a second
-	// SIGTERM (e.g. via systemd's TimeoutStopSec) to trigger force-quit.
-	sigCh := make(chan os.Signal, 2)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
-	go func() {
-		<-sigCh
-		unmountRequested.Store(true)
-		fmt.Fprintf(os.Stderr, "\ndrive9: unmounting %s...\n", opts.MountPoint)
-
-		// Periodic progress reporter — stops when progressDone is closed.
-		// Distinguishes commit-queue uploads (where we have stats) from
-		// other drain phases (debouncer flush, per-fd flush, write-back
-		// drain) so users don't see "still uploading 0 files" and assume
-		// the process is hung.
-		progressDone := make(chan struct{})
-		go func() {
-			ticker := time.NewTicker(2 * time.Second)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-progressDone:
-					return
-				case <-ticker.C:
-					var n int
-					var b int64
-					if dat9fs.commitQueue != nil {
-						n, b = dat9fs.commitQueue.PendingStats()
-					}
-					if n > 0 {
-						fmt.Fprintf(os.Stderr,
-							"drive9: still uploading %d files (%s) — Ctrl+C again to force-quit\n",
-							n, humanizeBytes(b))
-					} else {
-						fmt.Fprintf(os.Stderr,
-							"drive9: still draining — Ctrl+C again to force-quit\n")
-					}
-				}
-			}
-		}()
-
-		// Forced-exit handler for the second signal.
-		go func() {
-			<-sigCh
-			n, b := 0, int64(0)
-			if dat9fs.commitQueue != nil {
-				n, b = dat9fs.commitQueue.PendingStats()
-			}
-			if n > 0 {
-				stateLoc := cacheBase
-				if stateLoc == "" {
-					stateLoc = "<cache disabled>"
-				}
-				fmt.Fprintf(os.Stderr,
-					"drive9: force-quit — abandoning %d files (%s); local state preserved in %s, but recovery is best-effort\n",
-					n, humanizeBytes(b), stateLoc)
-			} else {
-				fmt.Fprintf(os.Stderr, "drive9: force-quit\n")
-			}
-			forceUnmountLazy(opts.MountPoint)
-			if controlServer != nil {
-				controlServer.Close()
-			}
-			if pidFile != "" {
-				_ = os.Remove(pidFile)
-			}
-			_ = writeMountExitReason(opts, opts.MountPoint, mountstate.ExitReason{
-				Reason: string(ExitReasonSignal),
-				Detail: "force quit after second signal",
-				Code:   ExitForceQuit,
-				PID:    os.Getpid(),
-				At:     time.Now().UTC(),
-			})
-			fmt.Fprintf(os.Stderr, "drive9: mount lifecycle event=exit code=%d reason=force_quit mountpoint=%s\n", ExitForceQuit, opts.MountPoint)
-			os.Exit(ExitForceQuit)
-		}()
-
-		shutdown()
-		close(progressDone)
-
-		// Retry unmount up to 5 times — EBUSY is transient (Spotlight, Finder).
-		const maxRetries = 5
-		var unmountErr error
-		for i := 0; i < maxRetries; i++ {
-			if unmountErr = server.Unmount(); unmountErr == nil {
-				return
-			}
-			fmt.Fprintf(os.Stderr, "drive9: unmount attempt %d/%d failed: %v\n", i+1, maxRetries, unmountErr)
-			if i < maxRetries-1 {
-				time.Sleep(500 * time.Millisecond)
-			}
-		}
-
-		// All retries exhausted — force unmount via OS tool.
-		fmt.Fprintf(os.Stderr, "drive9: retries exhausted, force-unmounting %s\n", opts.MountPoint)
-		forceUnmountLazy(opts.MountPoint)
-	}()
-
-	fmt.Fprint(os.Stderr, mountReadyMessage(opts, actorID, cacheBase, shadowDir))
-	server.Wait()
-	// Classify serve-end *before* shutdown drains. Drain can take a long time
-	// for a large commit queue; an external umount completing mid-drain would
-	// make an abnormal exit look like ExitReasonExternalUnmount.
-	unmountWasRequested := unmountRequested.Load()
-	reason, detail := classifyServeEnd(unmountWasRequested, opts.MountPoint)
-	shutdown()
-	waitServeClosed(serveDone, opts.MountPoint)
-	// Closing here is safe even though go-fuse does not join handler goroutines
-	// on every platform: closeExtentRuntime refuses new metadata RPCs and waits
-	// for the in-flight ones to drain; an object operation that already resolved
-	// its client survives Client.Close (it errors rather than panicking, because
-	// the inner httpStorageClient fields are untouched); and FlushAll stopped and
-	// joined the compaction loop. Handler goroutines therefore cannot use a
-	// closed session.
-	dat9fs.closeExtentRuntime()
-
-	uptime := time.Since(mountStartedAt).Round(time.Second)
-	pendingFiles, pendingBytes := 0, int64(0)
-	if dat9fs.commitQueue != nil {
-		pendingFiles, pendingBytes = dat9fs.commitQueue.PendingStats()
-	}
-
-	exitRec := mountstate.ExitReason{
-		Reason:       string(reason),
-		Detail:       detail,
-		PID:          os.Getpid(),
-		PendingFiles: pendingFiles,
-		PendingBytes: pendingBytes,
-		At:           time.Now().UTC(),
-	}
-
-	if reason == ExitReasonSignal || reason == ExitReasonExternalUnmount {
-		// Do not exit while the kernel mount-table entry is still listed:
-		// a lazy (MNT_DETACH) detach leaves the entry in place until the
-		// mount's last reference is reaped, and callers treat mount-process
-		// exit as "mountpoint clean" (#928). Bounded wait; a foreign holder
-		// (open files, cwd) can keep the entry alive past our control.
-		if !WaitMountTableClear(opts.MountPoint, mountExitEntryClearTimeout) {
-			fmt.Fprintf(os.Stderr, "drive9: mount lifecycle event=mount_entry_linger mountpoint=%s timeout=%s\n",
-				opts.MountPoint, mountExitEntryClearTimeout)
-		}
-	}
-
-	if shutdownErr != nil {
-		exitRec.Reason = "drain_failed"
-		exitRec.Detail = shutdownErr.Error()
-		exitRec.Code = ExitForceQuit
-		_ = writeMountExitReason(opts, opts.MountPoint, exitRec)
-		fmt.Fprintf(os.Stderr, "drive9: mount lifecycle event=exit code=%d reason=drain_failed mountpoint=%s\n", ExitForceQuit, opts.MountPoint)
-		return newMountExit(ExitForceQuit, MountExitReason("drain_failed"), "shutdown incomplete; uncommitted handle data may remain only in memory", shutdownErr)
-	}
-
-	switch reason {
-	case ExitReasonSignal, ExitReasonExternalUnmount:
-		exitRec.Code = ExitOK
-		_ = writeMountExitReason(opts, opts.MountPoint, exitRec)
-		fmt.Fprintf(os.Stderr, "drive9: mount lifecycle event=serve_end reason=%s mountpoint=%s pid=%d uptime=%s\n",
-			reason, opts.MountPoint, os.Getpid(), uptime)
-		fmt.Fprintf(os.Stderr, "drive9: mount lifecycle event=exit code=0 reason=%s mountpoint=%s\n", reason, opts.MountPoint)
-		return nil
-	default:
-		// Serve ended without intentional stop — clean stale mount and fail non-zero.
-		fmt.Fprintf(os.Stderr, "drive9: mount lifecycle event=serve_end reason=%s detail=%s mountpoint=%s pid=%d uptime=%s\n",
-			reason, detail, opts.MountPoint, os.Getpid(), uptime)
-		stillActive, stillErr := activeMountPointBounded(opts.MountPoint)
-		if shouldForceUnmountAfterAbnormalServe(stillActive, stillErr) {
-			fmt.Fprintf(os.Stderr, "drive9: mount lifecycle event=force_unmount mountpoint=%s reason=serve_abnormal\n", opts.MountPoint)
-			if unmountErr := server.Unmount(); unmountErr != nil {
-				forceUnmountLazy(opts.MountPoint)
-			} else if isTransportBroken(stillErr) {
-				// Unmount may report success while the endpoint is still broken.
-				forceUnmountLazy(opts.MountPoint)
-			}
-		} else if stillErr != nil && !os.IsNotExist(stillErr) {
-			// Indeterminate (bounded-probe timeout / unknown): never blind-detach;
-			// supervisor restart cleanup owns destructive recovery.
-			fmt.Fprintf(os.Stderr, "drive9: mount lifecycle event=cleanup_skip mountpoint=%s reason=probe_indeterminate err=%v\n", opts.MountPoint, stillErr)
-		}
-		exitRec.Code = ExitServeAbnormal
-		_ = writeMountExitReason(opts, opts.MountPoint, exitRec)
-		fmt.Fprintf(os.Stderr, "drive9: mount lifecycle event=exit code=%d reason=%s mountpoint=%s\n",
-			ExitServeAbnormal, reason, opts.MountPoint)
-		return ExitServeAbnormalErr(detail)
-	}
+	return filepath.Join(cacheBase, hash, name)
 }
 
-func newMountProcessState(opts *MountOptions, mountPoint string, creationTime uint64, credentialKind, controlSock string, startedAt time.Time) mountstate.ProcessState {
-	apiKey, token, server := opts.APIKey, opts.Token, opts.Server
-	if opts.OmitProcessStateCredentials {
-		apiKey, token, server = "", "", ""
+// appendLogSnapshotDir resolves the append-log snapshot spill directory,
+// created eagerly so the spill (which does not create parents) finds it.
+func appendLogSnapshotDir(cacheBase, mountHash string) string {
+	if cacheBase == "" {
+		return ""
 	}
-	return mountstate.ProcessState{
-		PID:                 os.Getpid(),
-		CreationTime:        creationTime,
-		Component:           "drive9-fuse",
-		MountKind:           mountstate.MountKindFUSE,
-		MountPoint:          mountPoint,
-		RemoteRoot:          opts.RemoteRoot,
-		Profile:             opts.Profile,
-		LocalRoot:           opts.LocalRoot,
-		Server:              server,
-		PackPaths:           append([]string(nil), opts.PackPaths...),
-		CredentialKind:      credentialKind,
-		APIKey:              apiKey,
-		Token:               token,
-		ProfileDir:          opts.Profiling.ProfileDir,
-		PerfSamplesPath:     opts.Profiling.PerfSamplesPath,
-		PerfInterval:        opts.Profiling.PerfSampleInterval.String(),
-		PerfMaxSamples:      opts.Profiling.PerfMaxSamples,
-		PerfMaxSampleFiles:  opts.Profiling.PerfMaxSampleFiles,
-		PerfMaxProfileFiles: opts.Profiling.PerfMaxProfileFiles,
-		PprofAddr:           opts.Profiling.PprofAddr,
-		StartedAt:           startedAt.Format(time.RFC3339Nano),
-		HeapProfilePath:     opts.Profiling.HeapProfilePath,
-		ControlSocket:       controlSock,
-		Role:                mountstate.RoleWorker,
-		Supervise:           opts.Supervised,
+	dir := filepath.Join(cacheBase, mountHash, "append-log-snapshots")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		fmt.Fprintf(os.Stderr, "drive9: append-log snapshot dir init failed: %v (continuing without)\n", err)
+		return ""
 	}
+	return dir
 }
 
-func mountReadyMessage(opts *MountOptions, actorID, cacheBase, shadowDir string) string {
-	// A non-persistent credential mount may run with a credential-bearing
-	// endpoint, so it omits the server from the log line.
-	if opts.OmitProcessStateCredentials {
-		return fmt.Sprintf("drive9: mounted on %s (actor: %s, readonly: %v, write_policy: %s, cache: %s, shadow: %s)\n",
-			opts.MountPoint, actorID, opts.ReadOnly, opts.WritePolicy, cacheBase, shadowDir)
+// mountCredentialKind names the credential type backing the mount.
+func mountCredentialKind(cfg *MountConfig) string {
+	if cfg.Token != "" {
+		return "token"
 	}
-	return fmt.Sprintf("drive9: mounted on %s (server: %s, actor: %s, readonly: %v, write_policy: %s, cache: %s, shadow: %s)\n",
-		opts.MountPoint, opts.Server, actorID, opts.ReadOnly, opts.WritePolicy, cacheBase, shadowDir)
+	return "api_key"
 }
 
-func redactMountCredentialError(err error, opts *MountOptions) error {
-	if err == nil {
-		return nil
+// mountCredentialSecret returns the credential secret backing the mount.
+func mountCredentialSecret(cfg *MountConfig) string {
+	if cfg.Token != "" {
+		return cfg.Token
 	}
-	message := redactMountCredentialText(err.Error(), opts)
-	if message == err.Error() {
-		return err
-	}
-	var exitErr *MountExitError
-	if errors.As(err, &exitErr) {
-		redacted := *exitErr
-		redacted.Detail = redactMountCredentialText(exitErr.Detail, opts)
-		if exitErr.Cause != nil {
-			redacted.Cause = redactedMountCause{
-				message: redactMountCredentialText(exitErr.Cause.Error(), opts),
-				cause:   exitErr.Cause,
-			}
-		}
-		return &redacted
-	}
-	return redactedMountCause{message: message, cause: err}
+	return cfg.APIKey
 }
 
-// writeMountExitReason persists an exit record. Without persistent
-// credentials the detail is redacted first: errors from a credential-bearing
-// endpoint can contain the full URL.
-func writeMountExitReason(opts *MountOptions, mountPoint string, rec mountstate.ExitReason) error {
-	if opts != nil && opts.OmitProcessStateCredentials {
-		rec.Detail = redactMountCredentialText(rec.Detail, opts)
+// MountHash computes the writeback-side mount namespace.
+func MountHash(serverURL, mountPoint string, remoteRoot ...string) string {
+	root := "/"
+	if len(remoteRoot) > 0 && remoteRoot[0] != "" {
+		root = remoteRoot[0]
 	}
-	return mountstate.WriteExitReason(mountPoint, rec)
-}
-
-func redactMountCredentialText(text string, opts *MountOptions) string {
-	if opts == nil {
-		return text
-	}
-	for _, secret := range []string{opts.Server, opts.APIKey, opts.Token} {
-		if secret != "" {
-			text = strings.ReplaceAll(text, secret, "<redacted>")
-		}
-	}
-	return text
-}
-
-type redactedMountCause struct {
-	message string
-	cause   error
-}
-
-func (e redactedMountCause) Error() string { return e.message }
-func (e redactedMountCause) Unwrap() error { return e.cause }
-
-// classifyServeEnd decides why the FUSE serve loop ended.
-func classifyServeEnd(unmountRequested bool, mountPoint string) (MountExitReason, string) {
-	if unmountRequested {
-		return ExitReasonSignal, "stop requested by signal"
-	}
-	// Re-probe to avoid racing external umount teardown. Bounded: wedged FUSE
-	// must not hang worker exit / supervisor recovery forever.
-	active, err := activeMountPointBounded(mountPoint)
-	if err != nil {
-		if isTransportBroken(err) {
-			return ExitReasonServeAbnormal, "mountpoint unreadable after serve end: " + err.Error()
-		}
-		// Path gone after external umount is a clean end.
-		if os.IsNotExist(err) {
-			return ExitReasonExternalUnmount, "mountpoint gone after serve end"
-		}
-		// Timeout / unknown: conservative — never misreport as external_unmount.
-		return ExitReasonServeAbnormal, "active mount check failed: " + err.Error()
-	}
-	if !active {
-		return ExitReasonExternalUnmount, "kernel unmounted mountpoint"
-	}
-	// Brief settle, then re-check (external umount race).
-	time.Sleep(250 * time.Millisecond)
-	active, err = activeMountPointBounded(mountPoint)
-	if err != nil {
-		if isTransportBroken(err) {
-			return ExitReasonServeAbnormal, "mount still broken after serve end: " + err.Error()
-		}
-		if os.IsNotExist(err) {
-			return ExitReasonExternalUnmount, "mountpoint gone after serve end"
-		}
-	}
-	if err == nil && !active {
-		return ExitReasonExternalUnmount, "kernel unmounted mountpoint"
-	}
-	probeDetail := "serve loop ended while mount still active"
-	if probeErr := probeMountPointReady(mountPoint); probeErr != nil {
-		probeDetail = probeErr.Error()
-	}
-	return ExitReasonServeAbnormal, probeDetail
-}
-
-// shouldForceUnmountAfterAbnormalServe reports whether to attempt unmount after
-// an abnormal serve end. Indeterminate probe results (bounded-probe timeout /
-// unknown errors) are conservative: never detach on uncertainty — the
-// supervisor's bounded restart cleanup owns destructive recovery.
-func shouldForceUnmountAfterAbnormalServe(active bool, err error) bool {
-	return active || isTransportBroken(err)
-}
-
-// serveCloseWaitTimeout bounds how long Mount waits for the Serve goroutine's
-// post-loop cleanup (fd close + OnUnmount) after the read loops exited.
-const serveCloseWaitTimeout = 10 * time.Second
-
-// mountExitEntryClearTimeout bounds how long the clean exit path waits for the
-// kernel mount-table entry to disappear before exiting (#928).
-const mountExitEntryClearTimeout = 5 * time.Second
-
-// waitServeClosed waits for the Serve goroutine to finish so the /dev/fuse fd
-// is closed before Mount returns; a timeout is logged, never fatal.
-func waitServeClosed(serveDone <-chan struct{}, mountPoint string) {
-	select {
-	case <-serveDone:
-	case <-time.After(serveCloseWaitTimeout):
-		fmt.Fprintf(os.Stderr, "drive9: mount lifecycle event=serve_close_timeout mountpoint=%s timeout=%s\n",
-			mountPoint, serveCloseWaitTimeout)
-	}
-}
-
-type mountStartCleanup struct {
-	reason       string
-	mountPoint   string
-	cause        error
-	stopWatchers func()
-	flushAll     func()
-	// closeRuntime releases the extent runtime (session + store) that may have
-	// been built during the brief serving window before this failure.
-	closeRuntime func()
-	unmount      func() error
-	forceUnmount func(string)
-	// forceUnmountWithoutServer is for the go-fuse NewServer post-mount/pre-server
-	// INIT failure path, where no Server exists to call Unmount on.
-	forceUnmountWithoutServer bool
-	logf                      func(string, ...any)
-}
-
-func cleanupMountStartFailure(cleanup mountStartCleanup) {
-	reason := strings.TrimSpace(cleanup.reason)
-	if reason == "" {
-		reason = "mount start failure"
-	}
-	mountPoint := strings.TrimSpace(cleanup.mountPoint)
-	mountPointLabel := mountPoint
-	if mountPointLabel == "" {
-		mountPointLabel = "<unknown>"
-	}
-	logf := cleanup.logf
-	if logf == nil {
-		logf = func(format string, args ...any) {
-			fmt.Fprintf(os.Stderr, format, args...)
-		}
-	}
-	if cleanup.cause != nil {
-		logf("drive9: mount startup failed during %s at %s: %v\n", reason, mountPointLabel, cleanup.cause)
+	var input string
+	if root == "/" {
+		// Backward-compatible: same hash as pre-subtree-mount versions.
+		input = serverURL + "\x00" + mountPoint
 	} else {
-		logf("drive9: mount startup failed during %s at %s\n", reason, mountPointLabel)
+		input = serverURL + "\x00" + mountPoint + "\x00" + root
 	}
-	if cleanup.stopWatchers != nil {
-		cleanup.stopWatchers()
-	}
-	if cleanup.flushAll != nil {
-		cleanup.flushAll()
-	}
-	if cleanup.closeRuntime != nil {
-		cleanup.closeRuntime()
-	}
-	if cleanup.unmount == nil {
-		if cleanup.forceUnmountWithoutServer && cleanup.forceUnmount != nil && mountPoint != "" {
-			logf("drive9: cleanup after %s: forcing unmount of %s after partial init failure\n", reason, mountPoint)
-			cleanup.forceUnmount(mountPoint)
-		}
-		return
-	}
-	if err := cleanup.unmount(); err != nil {
-		logf("drive9: cleanup after %s: unmount failed: %v\n", reason, err)
-		if cleanup.forceUnmount != nil && mountPoint != "" {
-			cleanup.forceUnmount(mountPoint)
-		}
-		return
-	}
-	if mountPoint != "" {
-		logf("drive9: cleanup after %s: unmounted %s\n", reason, mountPoint)
-	} else {
-		logf("drive9: cleanup after %s: unmounted mountpoint\n", reason)
-	}
+	h := sha256.Sum256([]byte(input))
+	return hex.EncodeToString(h[:8]) // 16 hex chars
 }
 
-// cleanupNewServerFailure is the one startup-failure path with no closeRuntime:
-// it is reached only when go-fuse's NewServer failed, before Serve, so no FUSE
-// handler — and therefore no lazily-built extent runtime — can exist yet.
-func cleanupNewServerFailure(
-	mountPoint string,
-	cause error,
-	stopWatchers func(),
-	flushAll func(),
-	forceUnmount func(string),
-	logf func(string, ...any),
-) {
-	cleanupMountStartFailure(mountStartCleanup{
-		reason:                    "fuse server initialization failure",
-		mountPoint:                mountPoint,
-		cause:                     cause,
-		stopWatchers:              stopWatchers,
-		flushAll:                  flushAll,
-		forceUnmount:              forceUnmount,
-		forceUnmountWithoutServer: shouldForceUnmountAfterNewServerError(cause),
-		logf:                      logf,
-	})
+// MountLayerHash folds the layer and checkpoint refs into the mount
+// namespace: a layer mount's writeback state is not interchangeable with
+// the base mount's.
+func MountLayerHash(serverURL, mountPoint, remoteRoot, layerRef, checkpointRef string) string {
+	base := MountHash(serverURL, mountPoint, remoteRoot)
+	input := base + "\x00layer\x00" + strings.TrimSpace(layerRef) + "\x00checkpoint\x00" + strings.TrimSpace(checkpointRef)
+	h := sha256.Sum256([]byte(input))
+	return hex.EncodeToString(h[:8])
 }
 
-// shouldForceUnmountAfterNewServerError targets go-fuse's post-mount INIT
-// failure. In github.com/mornyx/go-fuse/v2, NewServer calls mount(), then
-// handleInit(), and returns fmt.Errorf("init: %s", code) if INIT fails after
-// closing the mount fd. That path has no Server handle for Unmount, so Drive9
-// must detach the mountpoint itself. Re-check this predicate when go-fuse is
-// upgraded or replaced.
-func shouldForceUnmountAfterNewServerError(err error) bool {
-	return err != nil && strings.HasPrefix(err.Error(), "init:")
-}
-
-func serveWaitMountThenStartWatchers(
-	serve func(),
-	waitMount func() error,
-	startWatchers func(),
-	handleWaitMountError func(error) error,
-) error {
-	// Serve must be running before WaitMount can proceed. On macOS,
-	// mount_macfuse waits for STATFS before signalling ready, and that STATFS
-	// is handled by the serve loop.
-	//
-	// WaitMount then runs go-fuse's pollHack, which opens
-	// .go-fuse-epoll-hack inside the mountpoint to trigger _OP_POLL so
-	// go-fuse can reply ENOSYS. Without this, macOS may later send _OP_POLL
-	// and deadlock the Go runtime. Start watchers only after this readiness
-	// probe finishes so an initial remote reset cannot invalidate the mount
-	// while go-fuse is still proving readiness.
-	go serve()
-	if err := waitMount(); err != nil {
-		if handleWaitMountError == nil {
-			return err
-		}
-		if err := handleWaitMountError(err); err != nil {
-			return err
-		}
+// MountReadCacheHash computes the persistent read-cache namespace. Unlike
+// the write-back cache namespace, it includes a credential digest because
+// read-cache entries contain remote file bytes and can survive remounts.
+func MountReadCacheHash(serverURL, mountPoint, remoteRoot, credentialKind, credential string) string {
+	if remoteRoot == "" {
+		remoteRoot = "/"
 	}
-	if startWatchers != nil {
-		startWatchers()
-	}
-	return nil
+	credentialDigest := sha256.Sum256([]byte(credentialKind + "\x00" + credential))
+	input := serverURL + "\x00" + mountPoint + "\x00" + remoteRoot + "\x00" + credentialKind + "\x00" + hex.EncodeToString(credentialDigest[:])
+	h := sha256.Sum256([]byte(input))
+	return hex.EncodeToString(h[:8])
 }
 
+// resolveSyncModeByRTT ports v1 MeasureRTT + ResolveMode: rttThreshold of
+// 10ms, probe failure assumes WAN (interactive).
+func resolveSyncModeByRTT(serverURL string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, serverURL+"/", nil)
+	if err != nil {
+		return "interactive"
+	}
+	start := time.Now()
+	resp, err := http.DefaultClient.Do(req)
+	rtt := time.Since(start)
+	if err != nil {
+		return "interactive"
+	}
+	_ = resp.Body.Close()
+	if rtt > 10*time.Millisecond {
+		return "interactive"
+	}
+	return "strict"
+}
+
+func generateMountID() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "mount-unknown"
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// transientOverlayRoot anchors the mount-local SQLite sidecar plane in the
+// read-cache namespace, in a fresh per-mount directory.
+func transientOverlayRoot(cacheBase, readCacheHash string) string {
+	return filepath.Join(cacheBase, readCacheHash, "transient", transientOverlayMountID())
+}
+
+// transientOverlayMountID identifies one mount's transient plane. The
+// fallback keeps pid uniqueness when the system entropy source fails.
+func transientOverlayMountID() string {
+	var suffix [8]byte
+	if _, err := rand.Read(suffix[:]); err == nil {
+		return fmt.Sprintf("%d-%s", os.Getpid(), hex.EncodeToString(suffix[:]))
+	}
+	return fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())
+}
+
+// shouldContinueAfterWaitMountPermissionError ports v1: on Linux the pollHack
+// open can fail with EACCES/EPERM for a mount that is otherwise serving fine;
+// the readiness probe decides whether to keep serving.
 func shouldContinueAfterWaitMountPermissionError(err error, mountPoint string, probe func(string) error) (bool, error) {
 	if err == nil || !isWaitMountPermissionError(err) {
 		return false, nil
@@ -1341,191 +1644,20 @@ func isWaitMountPermissionError(err error) bool {
 	}
 	// Some go-fuse WaitMount paths surface the kernel errno as a plain text
 	// error that does not unwrap to a syscall.Errno, so fall back to matching
-	// the canonical EACCES/EPERM strings. Keep this even though errors.Is above
-	// covers the wrapped case.
+	// the canonical EACCES/EPERM strings.
 	errText := strings.ToLower(err.Error())
 	return strings.Contains(errText, "permission denied") || strings.Contains(errText, "operation not permitted")
 }
 
-// probeMountPointReadyTimeout bounds the readiness probe so a half-broken serve
-// loop cannot hang startup forever on the fallback path.
-const probeMountPointReadyTimeout = 5 * time.Second
-
-// probeMountPointReady confirms the mountpoint is an active, usable mount after
-// a Linux permission-like WaitMount error. The active-mount check prevents the
-// probe from accepting the plain directory that Mount creates before go-fuse
-// mounts over it; once the mount is active, stat/open/readdir are served through
-// go-fuse and a passing probe means the kernel<->serve-loop path works despite
-// WaitMount's pollHack hitting EACCES/EPERM.
-// The stat/open/readdir below can block on a wedged serve loop, so the work runs
-// under a timeout (see probeMountPointReadyTimeout).
-func probeMountPointReady(mountPoint string) error {
-	mountPoint = strings.TrimSpace(mountPoint)
-	if mountPoint == "" {
-		return fmt.Errorf("empty mountpoint")
-	}
-
-	done := make(chan error, 1)
-	go func() {
-		done <- probeMountPointReadyOnce(mountPoint)
-	}()
-	select {
-	case err := <-done:
-		return err
-	case <-time.After(probeMountPointReadyTimeout):
-		return fmt.Errorf("mountpoint readiness probe timed out after %s", probeMountPointReadyTimeout)
-	}
+// shouldForceUnmountAfterNewServerError targets go-fuse's post-mount INIT
+// failure: NewServer calls mount(), then handleInit(), and returns
+// fmt.Errorf("init: %s", code) if INIT fails after closing the mount fd. That
+// path has no Server handle for Unmount, so the mountpoint must be detached
+// directly (v1 comment: re-check when go-fuse is upgraded or replaced).
+func shouldForceUnmountAfterNewServerError(err error) bool {
+	return err != nil && strings.HasPrefix(err.Error(), "init:")
 }
 
-func probeMountPointReadyOnce(mountPoint string) error {
-	return probeMountPointReadyOnceWithMountCheck(mountPoint, activeMountPoint)
-}
-
-func probeMountPointReadyOnceWithMountCheck(mountPoint string, isActiveMountPoint func(string) (bool, error)) error {
-	info, err := os.Stat(mountPoint)
-	if err != nil {
-		return err
-	}
-	if !info.IsDir() {
-		return fmt.Errorf("mountpoint is not a directory")
-	}
-	mounted, err := isActiveMountPoint(mountPoint)
-	if err != nil {
-		return err
-	}
-	if !mounted {
-		return fmt.Errorf("mountpoint is not an active mount")
-	}
-	dir, err := os.Open(mountPoint)
-	if err != nil {
-		return err
-	}
-	var readErr error
-	if _, err := dir.Readdirnames(1); err != nil && !errors.Is(err, io.EOF) {
-		readErr = err
-	}
-	if err := dir.Close(); err != nil {
-		return err
-	}
-	return readErr
-}
-
-func validateMountOptionsProfile(opts *MountOptions) error {
-	if !validMountProfile(opts.Profile) {
-		return fmt.Errorf("mount: unknown profile %q", opts.Profile)
-	}
-	opts.LocalRoot = strings.TrimSpace(opts.LocalRoot)
-	if err := validateAppendLogPatterns(opts.AppendLogPatterns); err != nil {
-		return fmt.Errorf("mount: %w", err)
-	}
-	if opts.EnableGitWorkspaces && opts.LocalRoot == "" {
-		return fmt.Errorf("mount: EnableGitWorkspaces requires LocalRoot")
-	}
-	if opts.WriteBackBatchWindow < 0 {
-		return fmt.Errorf("mount: WriteBackBatchWindow must be >= 0")
-	}
-	if opts.WriteBackBatchMaxFiles < 0 {
-		return fmt.Errorf("mount: WriteBackBatchMaxFiles must be >= 0")
-	}
-	if opts.WriteBackBatchMaxBytes < 0 {
-		return fmt.Errorf("mount: WriteBackBatchMaxBytes must be >= 0")
-	}
-	if opts.WriteBackBatchWindow > 0 && opts.WritePolicy != WritePolicyWriteBack {
-		return fmt.Errorf("mount: WriteBackBatchWindow requires writeback policy")
-	}
-	hasOverlayOptions := opts.LocalRoot != "" || len(opts.LocalOnlyPatterns) > 0 ||
-		len(opts.LocalGitignoreAwarePatterns) > 0 || len(opts.RemoteOnlyPatterns) > 0 || len(opts.PackPaths) > 0
-	if !profileAllowsLocalPolicy(opts.Profile) {
-		if hasOverlayOptions {
-			return fmt.Errorf("mount: overlay options require an overlay profile")
-		}
-		return nil
-	}
-	if opts.LocalRoot == "" {
-		return fmt.Errorf("mount: profile %q requires LocalRoot", opts.Profile)
-	}
-	if !filepath.IsAbs(opts.LocalRoot) {
-		return fmt.Errorf("mount: LocalRoot must be an absolute path")
-	}
-	if err := validateLocalPolicyPatterns(opts.LocalOnlyPatterns, opts.LocalGitignoreAwarePatterns, opts.RemoteOnlyPatterns); err != nil {
-		return fmt.Errorf("mount: %w", err)
-	}
-	return nil
-}
-
-func mountCredentialKind(opts *MountOptions) string {
-	if opts.Token != "" {
-		return "token"
-	}
-	return "api_key"
-}
-
-func mountCredentialSecret(opts *MountOptions) string {
-	if opts.Token != "" {
-		return opts.Token
-	}
-	return opts.APIKey
-}
-
-func transientOverlayRoot(cacheBase, readCacheHash string) string {
-	return filepath.Join(cacheBase, readCacheHash, "transient", transientOverlayMountID())
-}
-
-func transientOverlayMountID() string {
-	var suffix [8]byte
-	if _, err := rand.Read(suffix[:]); err == nil {
-		return fmt.Sprintf("%d-%s", os.Getpid(), hex.EncodeToString(suffix[:]))
-	}
-	return fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())
-}
-
-func newGoFuseMountOptions(opts *MountOptions) *gofuse.MountOptions {
-	fuseOpts := &gofuse.MountOptions{
-		FsName:             "drive9",
-		Name:               "drive9",
-		MaxReadAhead:       8 * 1024 * 1024, // 8MB — larger readahead reduces FUSE kernel↔userspace switches
-		MaxWrite:           128 * 1024,      // 128KB per write request (default 64KB)
-		MaxBackground:      32,              // concurrent background FUSE requests (default 12)
-		SyncRead:           opts.SyncRead,   // disables FUSE_CAP_ASYNC_READ; one read in flight per file handle
-		DirectMountStrict:  opts.DirectMountStrict,
-		EnableLocks:        true,
-		Debug:              opts.Debug,
-		AllowOther:         opts.AllowOther,
-		EnableDirectIoMmap: true, // allow mmap on FOPEN_DIRECT_IO handles (e.g. SQLite *.db with mmap_size>0); no-op on kernels without CAP_DIRECT_IO_ALLOW_MMAP
-	}
-	if runtime.GOOS == "linux" {
-		fuseOpts.MaxWrite = 1024 * 1024 // 1MiB — Linux FUSE supports this natively
-		if opts.AllowOther {
-			fuseOpts.Options = append(fuseOpts.Options, "default_permissions")
-		}
-	}
-	if runtime.GOOS == "darwin" {
-		// macFUSE can reject open/readdir before requests reach the daemon if
-		// it performs local permission checks or treats the volume as a
-		// privacy-gated network volume. drive9 authorization is remote, so
-		// defer permission decisions to the filesystem handlers and present the
-		// mount as local to ordinary CLI tools.
-		fuseOpts.Options = append(fuseOpts.Options, "defer_permissions", "local")
-	}
-	if opts.ReadOnly {
-		fuseOpts.Options = append(fuseOpts.Options, "ro")
-	}
-	return fuseOpts
-}
-
-func newMountShutdown(stopWatcher func(), flushAll func()) func() {
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			stopWatcher()
-			flushAll()
-		})
-	}
-}
-
-// forceUnmount shells out to OS-specific tools to force-unmount a FUSE mount.
-// Uses a 5-second timeout so that the forced-exit path can't itself hang
-// on a wedged FUSE endpoint.
 func forceUnmount(mountpoint string) {
 	if runtime.GOOS == "darwin" {
 		if err := runUnmountCmd(5*time.Second, "diskutil", "unmount", "force", mountpoint); err != nil {
@@ -1553,81 +1685,34 @@ func forceUnmount(mountpoint string) {
 	fmt.Fprintf(os.Stderr, "drive9: force unmount: no fusermount/umount available\n")
 }
 
-// humanizeBytes formats a byte count as a human-readable string (e.g. "1.5 MB").
-// Uses 1024-base (matches du -h, df -h, kernel reporting).
-func humanizeBytes(b int64) string {
-	if b < 0 {
-		b = 0
+// newGoFuseMountOptions renders the kernel mount options from the config
+// (v1 newGoFuseMountOptions). Linux allow-other mounts bind
+// default_permissions — the ext4-parity EACCES contract from #1006.
+func newGoFuseMountOptions(cfg MountConfig) *gofuse.MountOptions {
+	opts := &gofuse.MountOptions{
+		FsName:             "drive9",
+		Name:               "drive9",
+		MaxReadAhead:       8 * 1024 * 1024,
+		MaxWrite:           128 * 1024,
+		MaxBackground:      32,
+		EnableLocks:        true,
+		Debug:              cfg.Debug,
+		AllowOther:         cfg.AllowOther,
+		EnableDirectIoMmap: true,
+		SyncRead:           cfg.SyncRead,
+		DirectMountStrict:  cfg.DirectMountStrict,
 	}
-	const unit = 1024
-	if b < unit {
-		return fmt.Sprintf("%d B", b)
-	}
-	div, exp := int64(unit), 0
-	for n := b / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
-}
-
-// generateMountID creates a random 16-byte hex ID for this mount instance.
-func generateMountID() string {
-	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
-		// Fallback to timestamp if crypto/rand fails (shouldn't happen).
-		return fmt.Sprintf("mount-%d", time.Now().UnixNano())
-	}
-	return hex.EncodeToString(b)
-}
-
-// migrateLegacyWriteBack runs before pending recovery binds shadow sources.
-// An existing shadow may be newer than a best-effort .dat snapshot, even when
-// the surviving .meta belongs to that older snapshot. Repair a missing or short
-// shadow only from the snapshot selected by recovery; preserve complete shadows
-// and never substitute an older snapshot for a selected newer WAL publication.
-func migrateLegacyWriteBack(shadows *ShadowStore, cache *WriteBackCache, pending *PendingIndex) error {
-	if shadows == nil || cache == nil {
-		return nil
-	}
-	for _, entry := range cache.ListPending() {
-		if size, ok := shadows.ContentSize(entry.Meta.Path); ok && size >= entry.Meta.Size {
-			continue
-		}
-		if entry.Meta.ShadowSpill {
-			continue // this metadata explicitly owns the shadow payload
-		}
-		if pending != nil {
-			if current, ok := pending.GetMeta(entry.Meta.Path); ok &&
-				(current.Generation != entry.Meta.Generation || !current.Mtime.Equal(entry.Meta.Mtime)) {
-				continue // WAL replay selected a different pending publication
-			}
-		}
-		if int64(len(entry.Data)) < entry.Meta.Size {
-			continue // an incomplete snapshot cannot repair another payload
-		}
-		if err := shadows.WriteFull(entry.Meta.Path, entry.Data, entry.Meta.BaseRev); err != nil {
-			return fmt.Errorf("migrate legacy entry %s to shadow: %w", entry.Meta.Path, err)
+	if runtime.GOOS == "linux" {
+		opts.MaxWrite = 1024 * 1024
+		if cfg.AllowOther {
+			opts.Options = append(opts.Options, "default_permissions")
 		}
 	}
-	return nil
-}
-
-// closeFailedMountStaging releases staging resources when initialization fails
-// before a mount takes ownership. Workers may still use staging during failed
-// layer restore, so drain them before closing the journal and shadow descriptors.
-func closeFailedMountStaging(fs *Dat9FS) {
-	if fs.journalSyncerCancel != nil {
-		fs.journalSyncerCancel()
+	if runtime.GOOS == "darwin" {
+		opts.Options = append(opts.Options, "defer_permissions", "local")
 	}
-	if fs.commitQueue != nil {
-		fs.commitQueue.DrainAll()
+	if cfg.ReadOnly {
+		opts.Options = append(opts.Options, "ro")
 	}
-	if fs.journal != nil {
-		_ = fs.journal.FsyncShared()
-		_ = fs.journal.Close()
-	}
-	if fs.shadowStore != nil {
-		fs.shadowStore.Close()
-	}
+	return opts
 }

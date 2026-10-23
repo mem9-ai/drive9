@@ -4,7 +4,7 @@ package fuse
 
 type mountControlServer struct{}
 
-func startMountControlServer(mountPoint, layer string, fs *Dat9FS) (*mountControlServer, error) {
+func startMountControlServer(mountPoint, layer string, fs *FS) (*mountControlServer, error) {
 	return nil, nil
 }
 

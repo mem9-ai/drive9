@@ -53,6 +53,7 @@ type mountFuseOptions struct {
 	TrustLocalEvents             bool
 	SyncMode                     fuseSyncMode
 	WritePolicy                  fuseWritePolicy
+	Extensions                   []string
 	WritebackLazyStaging         bool
 	WritebackSyncWindow          time.Duration
 	Profile                      string

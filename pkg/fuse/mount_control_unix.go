@@ -22,7 +22,7 @@ import (
 )
 
 type mountControlServer struct {
-	fs         *Dat9FS
+	fs         *FS
 	listener   net.Listener
 	socketPath string
 	layer      string
@@ -31,7 +31,7 @@ type mountControlServer struct {
 	drainMu    sync.Mutex
 }
 
-func startMountControlServer(mountPoint, layer string, fs *Dat9FS) (*mountControlServer, error) {
+func startMountControlServer(mountPoint, layer string, fs *FS) (*mountControlServer, error) {
 	socketPath := mountstate.ControlSocketPath(mountPoint)
 	socketDir := filepath.Dir(socketPath)
 	if err := os.MkdirAll(socketDir, 0o700); err != nil {
@@ -126,12 +126,13 @@ func (s *mountControlServer) handleConn(conn net.Conn) {
 	if resp.MountPoint == "" {
 		resp.MountPoint = s.mountPoint()
 	}
+	_ = resp
 	_ = json.NewEncoder(conn).Encode(resp)
 }
 
 func (s *mountControlServer) mountPoint() string {
-	if s == nil || s.fs == nil || s.fs.opts == nil {
+	if s == nil || s.fs == nil {
 		return ""
 	}
-	return s.fs.opts.MountPoint
+	return s.fs.mountPoint()
 }
