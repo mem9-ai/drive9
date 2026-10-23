@@ -158,11 +158,13 @@ never take the presign/multipart path:
   server transaction), the buffered image is written through the VFS, and
   every later operation serves through the extent handle.
 - A claim that stays below the cutoff keeps the small-file path (one
-  whole-object PUT, db9 inline). A claim whose promotion cannot build a
-  runtime (a server without the extent plane; one probe per minute parks
-  the takeover) — **falls back to the classic plane** at its durability
-  boundaries, so behavior degrades to the previous presign/multipart path
-  instead of failing.
+  whole-object PUT, db9 inline). A **sparse jump** past the claim's
+  in-memory window promotes too — the VFS writes sparsely, a hole costs
+  nothing — with the jump's bytes landing through the extent handle. A
+  claim whose promotion cannot build a runtime (a server without the
+  extent plane; one probe per minute parks the takeover) **falls back to
+  the classic plane** at its durability boundaries, so behavior degrades
+  to the previous presign/multipart path instead of failing.
 - A fresh `O_APPEND` create is claimed too (the claim owns the file from
   byte zero). An `O_APPEND` open — or any edit open without `O_TRUNC` —
   of an EXISTING file is not: the claim image is built from byte zero and
@@ -177,8 +179,11 @@ never take the presign/multipart path:
   (`TestLegacyLargeFileStaysClassicReadWrite` locks the contract).
 
 The takeover is unconditional (no flag): every fresh writer above the
-inline cutoff lands on the extent plane, and a server without the extent
-plane degrades to the classic presign/multipart path automatically.
+inline cutoff — sequential, appending, or sparse — lands on the extent
+plane, and a server without the extent plane degrades to the classic
+presign/multipart path automatically. Multipart is legacy-only: it
+remains for existing S3 files (updates through the presign link) and for
+the degraded no-runtime fallback, never for new files.
 
 Paths claimed by the append-log plane (its declarations) are exempt from
 the takeover; explicit `--extent` declarations still win over everything.

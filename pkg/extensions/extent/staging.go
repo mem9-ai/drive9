@@ -166,10 +166,40 @@ func (h *stagingHandle) applyAttr(ctx context.Context, op *fs.Op) (fs.Attr, erro
 			h.image = h.image[:size]
 			h.dirty = true
 		} else if size > h.memBoundLocked() {
-			// A zero-fill grow past the bound must not allocate the hole:
-			// land the buffered prefix and express the truncation in the
-			// plane below (its SetAttr holds the size without the bytes).
-			// The promotion window is gone — the claim parks classically.
+			// A zero-fill grow past the bound must not allocate the hole.
+			// A promotable claim promotes instead — the VFS SetAttr
+			// expresses the size sparsely (a hole costs nothing); only a
+			// failed promotion parks classically (push + below SetAttr +
+			// passthrough), the legacy multipart path. Every path below
+			// returns with h.mu held: the function's defer unlocks once.
+			if h.promotable && !h.promoting {
+				h.mu.Unlock()
+				perr := h.promote(ctx)
+				h.mu.Lock()
+				if perr != nil {
+					return fs.Attr{}, perr
+				}
+				if promoted := h.promoted; promoted != nil {
+					h.mu.Unlock()
+					res, aerr := h.e.setAttrViaVFS(ctx, op, uint64(promoted.ino), promoted.fh)
+					h.mu.Lock()
+					if aerr != nil {
+						return fs.Attr{}, aerr
+					}
+					if res.Attr != nil {
+						return *res.Attr, nil
+					}
+					h.mu.Unlock()
+					a, prerr := h.e.promotedAttr(ctx, promoted)
+					h.mu.Lock()
+					if prerr != nil {
+						return fs.Attr{}, prerr
+					}
+					return a, nil
+				}
+				// The promotion parked classically (runtime unavailable):
+				// the classic forward below takes over, lock held.
+			}
 			h.mu.Unlock()
 			if err := h.push(ctx); err != nil {
 				h.mu.Lock()
@@ -303,8 +333,11 @@ func (h *stagingHandle) Write(ctx context.Context, off int64, data []byte) error
 	}
 	// A write that crosses the inline cutoff takes the promotion (the
 	// crossing write itself may exceed the cutoff by one chunk); a write
-	// landing far beyond it is a sparse jump — the promotion window is
-	// gone and the claim forwards below instead of allocating the hole.
+	// landing far beyond it is a sparse jump — it takes the promotion TOO
+	// (the VFS writes sparsely, a hole costs nothing) and the jump's bytes
+	// land on the promoted handle. Only a promotion that cannot build the
+	// runtime falls back to the classic forward below (the legacy
+	// multipart path).
 	threshold := h.e.inlineThreshold()
 	crossing := h.promotable && !h.promoting && end >= threshold &&
 		end <= threshold+stagingMaxBufferedBytes
@@ -336,15 +369,43 @@ func (h *stagingHandle) Write(ctx context.Context, off int64, data []byte) error
 		h.mu.Unlock()
 		return nil
 	}
-	h.mu.Unlock()
-	// The image would exceed the memory bound: land what is buffered and
-	// hand the stream to the write plane below — its buffering spills to
-	// parts/shadow files instead of one slice. Failures keep the claim
-	// dirty so the next boundary retries the landing.
+	if h.promotable && !h.promoting {
+		// The sparse jump: promote the buffered prefix first (the image
+		// may be empty — the inode is created regardless), then land the
+		// jump's bytes sparsely through the extent handle.
+		h.mu.Unlock()
+		if err := h.promote(ctx); err != nil {
+			return err
+		}
+		h.mu.Lock()
+		promoted := h.promoted
+		h.mu.Unlock()
+		if promoted != nil {
+			return promoted.Write(ctx, off, data)
+		}
+		// The promotion parked classically (runtime unavailable): the
+		// classic forward below takes over — the legacy multipart path.
+	} else {
+		h.mu.Unlock()
+	}
+	// The image would exceed the memory bound and no extent plane could be
+	// built: land what is buffered and hand the stream to the write plane
+	// below — its buffering spills to parts/shadow files instead of one
+	// slice. Failures keep the claim dirty so the next boundary retries
+	// the landing.
 	if err := h.push(ctx); err != nil {
 		return err
 	}
 	h.mu.Lock()
+	if promoted := h.promoted; promoted != nil {
+		// A concurrent promotion landed while this write was between its
+		// decision and the landing (h.mu serializes the two — at this
+		// point the promotion's outcome is settled): route the bytes
+		// through the extent handle instead of re-creating a classic file
+		// beside the projection.
+		h.mu.Unlock()
+		return promoted.Write(ctx, off, data)
+	}
 	h.passthrough = true
 	h.promotable = false
 	h.image = nil // the bytes now live in the plane below

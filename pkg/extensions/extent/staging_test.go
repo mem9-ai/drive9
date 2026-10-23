@@ -925,9 +925,12 @@ func newClaimHandle(t *testing.T) *stagingHandle {
 	return h
 }
 
-// A sparse write past the memory bound forwards to the plane below instead
-// of allocating the whole logical image (one byte at 64 MiB must not
-// allocate 67 MB).
+// A sparse write past the memory bound PROMOTES to the extent plane (the
+// VFS writes sparsely — one byte at 64 MiB must not allocate 67 MB). This
+// stack has no extent runtime (the test backend serves no credential
+// endpoint), so the promotion attempt parks and the write falls back to
+// the classic forward below: the legacy multipart path, locked here in
+// its degraded direction.
 func TestSparseWriteForwardsPastBound(t *testing.T) {
 	h := newClaimHandle(t)
 	if err := h.Write(context.Background(), 64<<20, []byte("x")); err != nil {
@@ -936,16 +939,22 @@ func TestSparseWriteForwardsPastBound(t *testing.T) {
 	h.mu.Lock()
 	buf := len(h.image)
 	pt := h.passthrough
+	promotable := h.promotable
 	h.mu.Unlock()
 	if !pt {
 		t.Fatalf("write past the bound did not forward (passthrough=false)")
+	}
+	if promotable {
+		t.Fatal("a failed promotion attempt must park the claim classically")
 	}
 	if buf != 0 {
 		t.Fatalf("image retained %d bytes after forwarding", buf)
 	}
 }
 
-// A large ftruncate expresses the size below instead of allocating zeros.
+// A large ftruncate expresses the size through the extent plane's sparse
+// SetAttr when it can promote; against a runtime-less server (this stack)
+// it degrades to expressing the size below instead of allocating zeros.
 func TestLargeTruncateForwardsPastBound(t *testing.T) {
 	h := newClaimHandle(t)
 	if err := h.Write(context.Background(), 0, []byte("head")); err != nil {
