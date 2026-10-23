@@ -285,6 +285,27 @@ func (e *Extent) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, er
 
 	case fs.OpRename:
 		if ino, ok := e.resolveIno(ctx, op.Path); ok {
+			// The destination may be a CLASSIC file the planes below own
+			// (the takeover mounts mix planes: a VFS special or a promoted
+			// file renamed over a small file). The VFS rename RPC replaces
+			// only the server projection — the planes below never hear
+			// about it and keep serving the overwritten name from their
+			// local state (writeback landed records, dir cache, kernel
+			// dentries): the target "resurrects" with its old identity.
+			// Retire the classic target THROUGH the chain first (the same
+			// move promotion uses for the below lazy create). The facade
+			// refuses renameat2 flags, so every rename here replaces.
+			if _, dstIsExtent := e.resolveIno(ctx, op.Path2); !dstIsExtent {
+				if res, derr := next(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: op.Path2, Caller: op.Caller}); derr == nil && res.Attr != nil {
+					kind := fs.OpUnlink
+					if res.Attr.Kind == fs.KindDir {
+						kind = fs.OpRmdir
+					}
+					if _, uerr := next(ctx, &fs.Op{Kind: kind, Path: op.Path2, Caller: op.Caller}); uerr != nil && !fs.IsNotFound(uerr) {
+						return fs.Result{}, uerr
+					}
+				}
+			}
 			if err := e.renameIno(ctx, op, ino); err != nil {
 				return fs.Result{}, err
 			}
@@ -296,6 +317,13 @@ func (e *Extent) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, er
 		if err != nil {
 			return res, err
 		}
+		// A classic rename REPLACED the destination: whatever extent
+		// identity the destination path carried (a VFS special, a promoted
+		// file) is gone, and its cached inode would answer lookups with
+		// the overwritten object. (The destination's live staging claims
+		// were already anonymized inside mutateStaging, BEFORE the source
+		// claims moved onto the path.)
+		e.paths.forgetIno(op.Path2)
 		// A directory (or an uncached file) moved on the plane below: the
 		// path→inode cache must follow the namespace, or a cached /d/f.db
 		// still resolved through a RECREATED empty /d and openExtent used
