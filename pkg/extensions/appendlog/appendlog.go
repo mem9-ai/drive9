@@ -1605,6 +1605,15 @@ func (a *AppendLog) discardSiblingImages(siblings []*Handle) {
 		if o.dirty {
 			o.dirty = false
 			o.truncPending, o.truncTo = false, 0
+			// The discarded image's fences go with it: a rewrite base its own
+			// uncommitted truncate captured would otherwise outlive the
+			// re-base onto the landed truncation and fail the next flush
+			// with EEXIST against a revision that no longer exists.
+			o.st.hasRewriteBase = false
+			o.st.rewriteBaseRevision = 0
+			o.st.rewriteBaseSize = 0
+			o.st.sqliteWALTruncated = false
+			o.st.clearSQLiteWALHeaderWrite()
 			o.seq++
 		}
 		o.buf = nil

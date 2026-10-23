@@ -178,3 +178,35 @@ func TestPortOpenTruncDiscardedSiblingRebasesAfterLanding(t *testing.T) {
 		t.Fatalf("/app.log = %q, want X (the discarded sibling re-seeded from its pre-truncation size)", node.Data)
 	}
 }
+
+// A sibling whose OWN uncommitted truncate is discarded by open(O_TRUNC)
+// must not keep that truncate's rewrite base: after the truncating fd
+// lands, the sibling re-bases onto the landed image and its next flush
+// commits against the live revision, not the vanished pre-truncate one.
+func TestPortOpenTruncDiscardsSiblingTruncateFence(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/app.log", []byte("abcdef"))
+	ch := newStack(t, b, "**/*.log")
+	ctx := context.Background()
+
+	h1 := openLog(t, ch, "/app.log")
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpSetAttr, Path: "/app.log", Handle: h1, Size: 3, HasSize: true}); err != nil {
+		t.Fatalf("h1 ftruncate(3) = %v", err)
+	}
+	h2 := openFlags(t, ch, "/app.log", syscall.O_WRONLY|syscall.O_TRUNC)
+	if err := h2.Release(ctx); err != nil {
+		t.Fatalf("truncator release = %v", err)
+	}
+	if node, _ := b.Node("/app.log"); len(node.Data) != 0 {
+		t.Fatalf("/app.log after O_TRUNC close = %q, want empty", node.Data)
+	}
+	if err := h1.Write(ctx, 0, []byte("X")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h1.Sync(ctx); err != nil {
+		t.Fatalf("h1 fsync after its truncate was discarded = %v (stale rewrite base)", err)
+	}
+	if node, _ := b.Node("/app.log"); string(node.Data) != "X" {
+		t.Fatalf("/app.log = %q, want X", node.Data)
+	}
+}
