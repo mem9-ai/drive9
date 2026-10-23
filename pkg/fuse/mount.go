@@ -91,10 +91,6 @@ type MountConfig struct {
 	AppendLogPatterns []string
 	PackPaths         []string
 	ExtentPaths       []string
-	// ExtentLargeFileThreshold is the buffered size at which the extent
-	// plane claims a fresh truncate-writer (0 disables the takeover; the
-	// CLI defaults it, "off"/0 disables).
-	ExtentLargeFileThreshold int64
 
 	UploadConcurrency     int
 	DirCacheMaxEntries    int
@@ -317,7 +313,6 @@ type MountOptions struct {
 	AppendLogPatterns             []string // remote-persistent files eligible for append-log synchronization
 	PackPaths                     []string // local overlay paths auto-packed after unmount
 	ExtentPaths                   []string // path globs created as content_layout=extent
-	ExtentLargeFileThreshold      int64    // buffered size claiming a fresh truncate-writer for the extent plane (0 off)
 	CommitQueueMaxPending         int      // CommitQueue backpressure bound (default 100; 0 default)
 	WriteBackBatchWindow          time.Duration
 	WriteBackBatchMaxFiles        int
@@ -433,7 +428,6 @@ func mountConfigFromOptions(opts *MountOptions) MountConfig {
 		AppendLogPatterns:             opts.AppendLogPatterns,
 		PackPaths:                     opts.PackPaths,
 		ExtentPaths:                   opts.ExtentPaths,
-		ExtentLargeFileThreshold:      opts.ExtentLargeFileThreshold,
 		UploadConcurrency:             opts.UploadConcurrency,
 		DirCacheMaxEntries:            opts.DirCacheMaxEntries,
 		CommitQueueMaxPending:         opts.CommitQueueMaxPending,
@@ -992,11 +986,13 @@ func mountWithConfig(cfg MountConfig) error {
 			// v1: write-sync mounts pay a per-Write VFS flush on the extent
 			// plane too.
 			Policy: cfg.WritePolicy,
-			// Large-file takeover: fresh truncate-writers promote onto the
-			// extent plane at the threshold, replacing the presign/multipart
-			// direct-upload link (0 disables).
-			LargeFileThreshold: cfg.ExtentLargeFileThreshold,
-			LargeFileExempt:    largeFileExempt,
+			// Takeover of new files: a claimed image that grows past the
+			// server's inline cutoff — the size at which the classic plane
+			// would fall back to presign/multipart — promotes onto the
+			// extent plane instead. The cutoff comes from the server status
+			// (cached by the client); 0 falls back to the package default.
+			InlineThreshold:   cl.SmallFileThreshold(context.Background()),
+			LargeFileExempt:   largeFileExempt,
 		})
 		if err != nil {
 			return fmt.Errorf("fuse: extent extension: %w", err)

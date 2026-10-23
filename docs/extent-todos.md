@@ -21,7 +21,7 @@ audience: engineer or agent picking up the remaining work
 kernel FUSE ──> Dat9FS (drive9's FUSE frontend)
                   ├─ non-extent files → existing drive9 paths (single / append_log)
                   ├─ extent files (basename matches a profile [extent] glob, or a fresh
-                  │  truncate-writer promoted at the large-file takeover threshold)
+                  │  creating writer promoted past the server inline cutoff)
                         ├─ Create/Unlink/Lookup/Rename/Locks → JuiceFS meta driver (one RPC)
                         └─ Read/Write/Flush/Fsync/Truncate → vfs.DataReader/DataWriter
                                                       │

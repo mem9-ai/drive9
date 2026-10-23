@@ -74,7 +74,6 @@ func mountFuseImpl(opts *mountFuseOptions) error {
 		AppendLogPatterns:             opts.AppendLogPatterns,
 		PackPaths:                     opts.PackPaths,
 		ExtentPaths:                   opts.ExtentPaths,
-		ExtentLargeFileThreshold:      opts.ExtentLargeFileThresholdMB << 20,
 		UploadConcurrency:             opts.UploadConcurrency,
 		DirCacheMaxEntries:            opts.DirCacheMaxEntries,
 		CommitQueueMaxPending:         opts.CommitQueueMaxPending,

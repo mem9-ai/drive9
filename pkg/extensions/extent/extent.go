@@ -5,14 +5,18 @@
 // session instead of the classic whole-file plane. Discovery is
 // layout-based, never name-based.
 //
-// Large-file takeover: with a non-zero LargeFileThreshold (the default
-// mount configuration), fresh truncate-writers are claimed before the
-// classic buffered-write plane, buffered in memory, and promoted to the
-// extent plane once their image crosses the threshold — replacing the
-// presign/multipart direct-upload link for large files. Claims that stay
-// below the threshold (and claims whose promotion cannot build a runtime)
-// fall back to the classic plane below at their durability boundaries,
-// exactly like the bulk data plane they subsume.
+// Takeover of new files: every creating writer (except under write-sync)
+// is claimed before the classic buffered-write plane and buffered in
+// memory. An image that grows past the server's inline cutoff — the size
+// at which the classic plane would fall back to the presign/multipart
+// direct-upload link — promotes onto the extent plane instead, so NEW
+// files never take the multipart path. Claims that stay below the cutoff
+// keep the small-file path (whole-object PUT, db9 inline); claims whose
+// promotion cannot build a runtime fall back to the classic plane at
+// their durability boundaries. Existing files are never converted: a
+// plain re-open or an append keeps serving through the classic plane
+// (legacy multipart/S3 files keep updating through presign), and only a
+// truncation rewrite is buffered-and-landed classically by a claim.
 package extent
 
 import (
@@ -40,12 +44,12 @@ type Options struct {
 	// CacheDir is the JuiceFS block-cache root (mount cache subtree).
 	CacheDir string
 
-	// LargeFileThreshold is the buffered size at which a fresh
-	// truncate-writer is promoted to the extent plane. Zero disables the
-	// takeover (extent files still route here through discovery and the
-	// declarations above).
-	LargeFileThreshold int64
-	// LargeFileExempt names paths the default large-file claim must leave
+	// InlineThreshold is the server's DB-inline vs S3 cutoff (bytes): a
+	// claimed image that grows past it would land through the multipart
+	// direct-upload link, so it promotes onto the extent plane instead.
+	// Zero falls back to defaultInlineThreshold.
+	InlineThreshold int64
+	// LargeFileExempt names paths the default takeover must leave
 	// to the planes inside this one (the append-log declarations); nil
 	// exempts nothing. Explicit ExtentPaths declarations still win.
 	LargeFileExempt func(path string) bool
@@ -149,9 +153,12 @@ func (e *Extent) discoveryEnabled() bool {
 	return e.enabled() || e.vfs() != nil
 }
 
-// largeFileEnabled reports whether the default large-file takeover is on.
+// largeFileEnabled reports whether the default takeover is on. It is
+// unconditional by design (new files never take the multipart link);
+// write-sync mounts are the one exclusion — their durability belongs to
+// every Write, not to a boundary.
 func (e *Extent) largeFileEnabled() bool {
-	return e.opts.LargeFileThreshold > 0 && e.opts.Policy != policyWriteSync
+	return e.opts.Policy != policyWriteSync
 }
 
 func (e *Extent) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error) {

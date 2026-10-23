@@ -32,7 +32,7 @@ func newTakeoverStack(t *testing.T, b *testbackend.Backend, threshold int64) (*f
 	t.Cleanup(ts.Close)
 	cl := client.New(ts.URL, "")
 	cl.Warm(context.Background())
-	ext, err := New(Options{Client: cl, LargeFileThreshold: threshold})
+	ext, err := New(Options{Client: cl, InlineThreshold: threshold})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +55,7 @@ func newWritebackStack(t *testing.T, b *testbackend.Backend, threshold int64) *f
 	t.Cleanup(ts.Close)
 	cl := client.New(ts.URL, "")
 	cl.Warm(context.Background())
-	ext, err := New(Options{Client: cl, LargeFileThreshold: threshold})
+	ext, err := New(Options{Client: cl, InlineThreshold: threshold})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -469,18 +469,37 @@ func TestSyncOpenNotClaimed(t *testing.T) {
 	}
 }
 
-// TestAppendOpenNotClaimed: an appender's offset discipline belongs to the
-// plane that owns the existing bytes.
-func TestAppendOpenNotClaimed(t *testing.T) {
+// TestAppendOpenClaim semantics split on existence: a FRESH O_APPEND
+// create is claimed (the claim owns the file from byte zero), while an
+// appender of an EXISTING file keeps its bytes on the classic plane —
+// the claim image is built from byte zero and cannot own existing bytes.
+func TestAppendOpenClaim(t *testing.T) {
 	b := testbackend.NewBackend()
 	ch, _ := newTakeoverStack(t, b, 64)
+	ctx := context.Background()
 
-	res, err := ch.Dispatch(context.Background(), &fs.Op{Kind: fs.OpCreate, Path: "/app.txt", Flags: uint32(syscall.O_CREAT | syscall.O_RDWR | syscall.O_TRUNC | syscall.O_APPEND), Mode: 0o644})
+	// Fresh path: the O_APPEND create claims.
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/app.txt", Flags: uint32(syscall.O_CREAT | syscall.O_RDWR | syscall.O_APPEND), Mode: 0o644})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, isStaging := res.Handle.(*stagingHandle); isStaging {
-		t.Fatal("O_APPEND open must not be claimed")
+	if _, isStaging := res.Handle.(*stagingHandle); !isStaging {
+		t.Fatal("a fresh O_APPEND create must be claimed")
+	}
+	if err := res.Handle.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Existing file: the appender stays on the classic plane.
+	res2, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/app.txt", Flags: uint32(syscall.O_CREAT | syscall.O_RDWR | syscall.O_APPEND), Mode: 0o644})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, isStaging := res2.Handle.(*stagingHandle); isStaging {
+		t.Fatal("an O_APPEND open of an existing file must not be claimed")
+	}
+	if err := res2.Handle.Release(ctx); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -492,7 +511,7 @@ func TestWriteSyncPolicyNotClaimed(t *testing.T) {
 	t.Cleanup(ts.Close)
 	cl := client.New(ts.URL, "")
 	cl.Warm(context.Background())
-	ext, err := New(Options{Client: cl, LargeFileThreshold: 64, Policy: "write-sync"})
+	ext, err := New(Options{Client: cl, InlineThreshold: 64, Policy: "write-sync"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -516,23 +535,42 @@ func TestWriteSyncPolicyNotClaimed(t *testing.T) {
 // TestClaimsLargeFileDecision locks the takeover claim decision.
 func TestClaimsLargeFileDecision(t *testing.T) {
 	fresh := uint32(syscall.O_CREAT | syscall.O_RDWR | syscall.O_TRUNC)
-	ext := &Extent{opts: Options{LargeFileThreshold: 4096}}
+	ext := &Extent{opts: Options{InlineThreshold: 4096}}
 	if !ext.claimsLargeFile(&fs.Op{Path: "/a.bin", Flags: fresh}) {
 		t.Fatal("fresh truncate-writer must be claimed")
 	}
-	ext = &Extent{opts: Options{LargeFileThreshold: 0}}
-	if ext.claimsLargeFile(&fs.Op{Path: "/a.bin", Flags: fresh}) {
-		t.Fatal("zero threshold disables the takeover")
+	// The takeover is unconditional (no threshold knob): an unset inline
+	// cutoff falls back to the package default and still claims.
+	ext = &Extent{opts: Options{}}
+	if !ext.claimsLargeFile(&fs.Op{Path: "/a.bin", Flags: fresh}) {
+		t.Fatal("zero inline threshold must fall back to the default cutoff, not disable the takeover")
 	}
-	ext = &Extent{opts: Options{LargeFileThreshold: 4096, Policy: "write-sync"}}
+	// A creating O_APPEND writer on a FRESH path is claimed: the claim owns
+	// the file from byte zero. (An existing file opened without O_TRUNC is
+	// released back to the classic plane by claimStaging's stat.)
+	appendFresh := uint32(syscall.O_CREAT | syscall.O_RDWR | syscall.O_APPEND)
+	if !ext.claimsLargeFile(&fs.Op{Path: "/log.txt", Flags: appendFresh}) {
+		t.Fatal("a fresh O_APPEND create must be claimed")
+	}
+	// No write intent: nothing to claim.
+	readonly := uint32(syscall.O_CREAT | syscall.O_RDONLY)
+	if ext.claimsLargeFile(&fs.Op{Path: "/a.bin", Flags: readonly}) {
+		t.Fatal("a read-only create must not be claimed")
+	}
+	// Per-write sync demand: durability belongs to every Write below.
+	synced := fresh | uint32(syscall.O_DSYNC)
+	if ext.claimsLargeFile(&fs.Op{Path: "/a.bin", Flags: synced}) {
+		t.Fatal("a sync-flagged create must not be claimed")
+	}
+	ext = &Extent{opts: Options{InlineThreshold: 4096, Policy: "write-sync"}}
 	if ext.claimsLargeFile(&fs.Op{Path: "/a.bin", Flags: fresh}) {
 		t.Fatal("write-sync disables the takeover")
 	}
-	ext = &Extent{opts: Options{LargeFileThreshold: 4096, ExtentPaths: []string{"*.bin"}}}
+	ext = &Extent{opts: Options{InlineThreshold: 4096, ExtentPaths: []string{"*.bin"}}}
 	if ext.claimsLargeFile(&fs.Op{Path: "/a.bin", Flags: fresh}) {
 		t.Fatal("a declared path takes the byte-zero extent claim, not the takeover")
 	}
-	ext = &Extent{opts: Options{LargeFileThreshold: 4096, LargeFileExempt: func(p string) bool { return p == "/wal.db-wal" }}}
+	ext = &Extent{opts: Options{InlineThreshold: 4096, LargeFileExempt: func(p string) bool { return p == "/wal.db-wal" }}}
 	if ext.claimsLargeFile(&fs.Op{Path: "/wal.db-wal", Flags: fresh}) {
 		t.Fatal("an exempt path belongs to the plane inside")
 	}
@@ -935,7 +973,7 @@ func TestClaimReopenServesPendingImage(t *testing.T) {
 	t.Cleanup(ts.Close)
 	cl := client.New(ts.URL, "")
 	cl.Warm(context.Background())
-	ext, err := New(Options{Client: cl, Policy: "writeback", LargeFileThreshold: noThreshold})
+	ext, err := New(Options{Client: cl, Policy: "writeback", InlineThreshold: noThreshold})
 	if err != nil {
 		t.Fatal(err)
 	}
