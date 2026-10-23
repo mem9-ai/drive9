@@ -88,7 +88,7 @@ func (m *InodeToPath) LookupWithIdentity(path, resourceID string, nlink uint32, 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if ino, ok := m.byPath[path]; ok {
+	if ino := m.reusableInoAtLocked(path, isDir); ino != 0 {
 		entry := m.byInode[ino]
 		entry.Nlookup++
 		m.updateEntryLocked(entry, path, resourceID, nlink, isDir, size, mtime)
@@ -142,7 +142,7 @@ func (m *InodeToPath) EnsureInodeWithIdentity(path, resourceID string, nlink uin
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if ino, ok := m.byPath[path]; ok {
+	if ino := m.reusableInoAtLocked(path, isDir); ino != 0 {
 		entry := m.byInode[ino]
 		m.updateEntryLocked(entry, path, resourceID, nlink, isDir, size, mtime)
 		return ino
@@ -188,7 +188,7 @@ func (m *InodeToPath) EnsureInodeNoUpdate(path string, isDir bool, size int64, m
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if ino, ok := m.byPath[path]; ok {
+	if ino := m.reusableInoAtLocked(path, isDir); ino != 0 {
 		return ino
 	}
 
@@ -299,7 +299,11 @@ func shouldKeepForgetMapping(entry *InodeEntry) bool {
 		return false
 	}
 	if entry.IsDir || entry.ResourceID != "" {
-		return true
+		// A pathless entry (a rmdir'd directory whose name a different-kind
+		// object now owns) has nothing left to serve once the kernel's last
+		// reference is forgotten — release it instead of leaking one entry
+		// per replaced directory.
+		return entry.Path != ""
 	}
 	if entry.HasUID || entry.HasGID {
 		return true
@@ -997,6 +1001,47 @@ func inodeResourceKey(resourceID string, isDir bool) string {
 		return ""
 	}
 	return resourceID
+}
+
+// reusableInoAtLocked returns the inode a path's current mapping may be
+// reused for, or 0 when the mapping is stale or must not be reused for an
+// object of the requested kind. A kind change means a different object owns
+// the name now (create/mknod/symlink after rmdir, mkdir after a preserved
+// unlink): the kernel keeps the old nodeid alive until FORGET, and a
+// CREATE/MKNOD/SYMLINK/MKDIR reply that hands that nodeid back with a
+// different file type is rejected with EIO — so the name is detached from
+// the old entry and the caller allocates a fresh inode.
+func (m *InodeToPath) reusableInoAtLocked(path string, isDir bool) uint64 {
+	ino, ok := m.byPath[path]
+	if !ok {
+		return 0
+	}
+	entry, ok := m.byInode[ino]
+	if !ok {
+		delete(m.byPath, path)
+		return 0
+	}
+	if ino != 1 && entry.IsDir != isDir {
+		m.detachPathLocked(entry, path)
+		return 0
+	}
+	return ino
+}
+
+// detachPathLocked removes one path→inode binding while keeping the inode
+// entry itself: the kernel may still hold lookup references on the old
+// object (a rmdir'd directory is only FORGETten later), so the entry must
+// keep answering inode→path for them — it just no longer owns the name.
+func (m *InodeToPath) detachPathLocked(entry *InodeEntry, path string) {
+	delete(m.byPath, path)
+	delete(entry.Paths, path)
+	if entry.Path == path {
+		entry.Path = ""
+		for p := range entry.Paths {
+			entry.Path = p
+			break
+		}
+	}
 }
 
 func (m *InodeToPath) addPathLocked(entry *InodeEntry, path string) {

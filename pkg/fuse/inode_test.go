@@ -319,3 +319,77 @@ func TestPortFindByExtentInoReusesFuseInode(t *testing.T) {
 		t.Fatal("missing juicefs ino must not match")
 	}
 }
+
+// A rmdir'd directory keeps its path→inode mapping until the kernel's last
+// reference is forgotten. A later create/mknod/symlink of a FILE at that
+// path must not reuse the directory's nodeid: the kernel still holds the
+// old inode alive and rejects a reply that retypes a live nodeid with EIO
+// (pjdfstest chmod/11, rmdir/01, rename/21, unlink/00 all hit this through
+// create-after-rmdir).
+func TestLookupKindConflictAllocatesFreshInode(t *testing.T) {
+	m := NewInodeToPath()
+	dirIno := m.Lookup("/d", true, 0, time.Now())
+
+	fileIno := m.Lookup("/d", false, 0, time.Now())
+	if fileIno == dirIno {
+		t.Fatalf("create after rmdir reused the directory inode %d", dirIno)
+	}
+	if got, ok := m.GetInode("/d"); !ok || got != fileIno {
+		t.Fatalf("path mapping = %d/%v, want %d/true", got, ok, fileIno)
+	}
+	if e, ok := m.GetEntry(dirIno); ok && e.IsDir != true {
+		t.Fatalf("old directory entry retyped: IsDir=%v", e.IsDir)
+	}
+
+	// mkdir over the fresh file's name likewise gets its own inode.
+	dirIno2 := m.Lookup("/d", true, 0, time.Now())
+	if dirIno2 == fileIno || dirIno2 == dirIno {
+		t.Fatalf("mkdir after create reused inode %d", dirIno2)
+	}
+}
+
+// EnsureInode (readdir reseeds) and EnsureInodeNoUpdate (snapshot recovery)
+// share the kind-conflict rule with Lookup.
+func TestEnsureInodeKindConflictAllocatesFreshInode(t *testing.T) {
+	m := NewInodeToPath()
+	dirIno := m.EnsureInode("/d", true, 0, time.Now())
+
+	fileIno := m.EnsureInode("/d", false, 0, time.Now())
+	if fileIno == dirIno {
+		t.Fatalf("EnsureInode reused the directory inode %d", dirIno)
+	}
+	if got := m.EnsureInodeNoUpdate("/d", true, 0, time.Now()); got == fileIno {
+		t.Fatalf("EnsureInodeNoUpdate reused the file inode %d", fileIno)
+	}
+}
+
+// The detached directory entry survives until its kernel references drain,
+// then Forget releases it instead of keeping a pathless entry forever.
+func TestForgetReleasesDetachedDirectoryEntry(t *testing.T) {
+	m := NewInodeToPath()
+	dirIno := m.Lookup("/d", true, 0, time.Now())
+	m.Lookup("/d", false, 0, time.Now()) // kind conflict detaches the path
+
+	m.Forget(dirIno, 2)
+	if _, ok := m.GetEntry(dirIno); ok {
+		t.Fatal("Forget kept a pathless directory entry")
+	}
+	if got, ok := m.GetInode("/d"); !ok || got == dirIno {
+		t.Fatalf("path mapping = %d/%v, want a fresh inode", got, ok)
+	}
+}
+
+// A hardlink alias keeps the entry's other paths when one alias's name is
+// taken over by a directory.
+func TestDetachKeepsSiblingAliases(t *testing.T) {
+	m := NewInodeToPath()
+	ino := m.LookupWithIdentity("/a", "res-1", 2, false, 0, time.Now())
+	m.AddAlias(ino, "/b", "res-1", 2, false, 0, time.Now())
+
+	if got := m.Lookup("/b", true, 0, time.Now()); got == ino {
+		t.Fatalf("mkdir over alias reused file inode %d", ino)
+	}
+	if got, ok := m.GetInode("/a"); !ok || got != ino {
+		t.Fatalf("sibling alias /a = %d/%v, want %d/true", got, ok, ino)
+	}
+}
