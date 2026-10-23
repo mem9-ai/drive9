@@ -93,7 +93,7 @@ export class Drive9Fs implements IFileSystem {
       await this.stat(path);
       return true;
     } catch (error) {
-      if (isCode(error, "ENOENT")) return false;
+      if (isCode(error, "ENOENT") || isCode(error, "ENOTDIR")) return false;
       throw error;
     }
   }
@@ -222,8 +222,12 @@ export class Drive9Fs implements IFileSystem {
         await this.chmod(target.path, source.info!.mode);
       }
     } else if (isSymlink(source.info!)) {
-      if (target.info) throw new Drive9FsError("EEXIST", `copy destination exists '${dest}'`);
-      await this.symlink(await this.readlink(source.path), target.path);
+      if (target.info?.isDir) throw new Drive9FsError("EISDIR", `is a directory '${dest}'`);
+      const link = await this.readlink(source.path);
+      // Validate before removing an existing destination, without following it.
+      this.linkTarget(target.path, link);
+      if (target.info) await this.rm(target.path);
+      await this.symlink(link, target.path);
     } else {
       const fileTarget = await this.resolve(dest, true, true);
       if (source.info!.resource_id && source.info!.resource_id === fileTarget.info?.resource_id) {
@@ -278,8 +282,9 @@ export class Drive9Fs implements IFileSystem {
 
   async link(existingPath: string, newPath: string): Promise<void> {
     this.writable(newPath);
-    const source = await this.resolve(existingPath);
+    const source = await this.resolve(existingPath, false);
     this.requireFile(source.info!, existingPath);
+    if (isSymlink(source.info!)) throw new Drive9FsError("EPERM", `cannot hardlink a symbolic link '${existingPath}'`);
     const target = await this.resolve(newPath, false, true);
     if (target.info) throw new Drive9FsError("EEXIST", `path already exists '${newPath}'`);
     await this.io(newPath, () => this.client.hardlink(this.remote(source.path), this.remote(target.path)));

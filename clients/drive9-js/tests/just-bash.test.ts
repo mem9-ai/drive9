@@ -68,6 +68,13 @@ describe("Drive9Fs over HTTP", () => {
     expect(fixture.nodes.has("/tenant/work/missing")).toBe(false);
   });
 
+  it("returns false for existence checks below files, including through symlinks", async () => {
+    await fs.symlink("seed.txt", "/link");
+    for (const path of ["/seed.txt/child", "/seed.txt/", "/link/child", "/link/"]) {
+      expect(await fs.exists(path)).toBe(false);
+    }
+  });
+
   it("implements recursive/idempotent mkdir and empty-directory removal", async () => {
     await fs.mkdir("/a/b", { recursive: true });
     await fs.mkdir("/a/b", { recursive: true });
@@ -93,6 +100,41 @@ describe("Drive9Fs over HTTP", () => {
     await fs.rm("/tree", { recursive: true });
     expect(await fs.exists("/tree")).toBe(false);
     expect(await fs.readFile("/out/nested/file")).toBe("payload");
+  });
+
+  it("copies symlinks over files and links without modifying their referents", async () => {
+    await fs.symlink("seed.txt", "/source");
+    await fs.writeFile("/old", "keep");
+    await fs.writeFile("/file", "replace");
+    await fs.symlink("old", "/link");
+    await fs.symlink("missing", "/dangling");
+    await fs.mkdir("/dir");
+    await fs.symlink("dir", "/dir-link");
+    for (const path of ["/file", "/link", "/dangling", "/dir-link"]) {
+      await fs.cp("/source", path);
+      expect((await fs.lstat(path)).isSymbolicLink).toBe(true);
+      expect(await fs.readlink(path)).toBe("seed.txt");
+    }
+    expect(await fs.readFile("/old")).toBe("keep");
+    expect(await fs.readFile("/seed.txt")).toBe("hello");
+    expect(await fs.exists("/missing")).toBe(false);
+    expect((await fs.stat("/dir")).isDirectory).toBe(true);
+  });
+
+  it("preserves copy destinations when a symlink cannot be copied", async () => {
+    await fs.symlink("seed.txt", "/source");
+    await fs.mkdir("/dir");
+    await fs.writeFile("/dir/keep", "keep");
+    await expect(fs.cp("/source", "/dir")).rejects.toMatchObject({ code: "EISDIR" });
+    await expect(fs.cp("/source", "/source")).rejects.toMatchObject({ code: "EINVAL" });
+    await fs.symlink("../seed.txt", "/dir/relative");
+    await fs.writeFile("/target", "keep");
+    await expect(fs.cp("/dir/relative", "/target")).rejects.toMatchObject({ code: "EACCES" });
+    server.use(http.get(`${fixture.base}/v1/fs/tenant/work/source`, () => new HttpResponse(null, { status: 403 })));
+    await expect(fs.cp("/source", "/target")).rejects.toMatchObject({ code: "EACCES" });
+    expect(await fs.readFile("/target")).toBe("keep");
+    expect(await fs.readFile("/dir/keep")).toBe("keep");
+    expect(await fs.readlink("/dir/relative")).toBe("../seed.txt");
   });
 
   it("rejects copying/moving a tree into itself, including through a symlink", async () => {
@@ -233,6 +275,22 @@ describe("Drive9Fs over HTTP", () => {
     await expect(fs.utimes("/hard", new Date(), new Date())).rejects.toMatchObject({ code: "ENOTSUP" });
   });
 
+  it("rejects hardlinking symlinks while still resolving parent symlinks", async () => {
+    await fs.symlink("seed.txt", "/link");
+    await fs.symlink("missing", "/dangling");
+    for (const path of ["/link", "/dangling"]) {
+      await expect(fs.link(path, "/hard")).rejects.toMatchObject({ code: "EPERM" });
+      expect(await fs.exists("/hard")).toBe(false);
+    }
+    expect(fixture.calls.some((call) => call.query.includes("hardlink"))).toBe(false);
+    expect(await fs.readFile("/seed.txt")).toBe("hello");
+    await fs.mkdir("/dir");
+    await fs.writeFile("/dir/file", "content");
+    await fs.symlink("dir", "/dir-link");
+    await fs.link("/dir-link/file", "/hard");
+    expect((await fs.stat("/hard")).identity).toBe((await fs.stat("/dir/file")).identity);
+  });
+
   it("protects the root and refuses a file as the configured root", async () => {
     await expect(fs.rm("/", { recursive: true })).rejects.toMatchObject({ code: "EBUSY" });
     await expect(fs.mv("/", "/gone")).rejects.toMatchObject({ code: "EBUSY" });
@@ -334,6 +392,31 @@ describe.skipIf(!supportsJustBash)("Just Bash commands over Drive9 HTTP (Node >=
     await fs.writeFile("/binary", new Uint8Array([0, 255, 128, 10]));
     expect(await bash.exec("cat binary | cat > roundtrip")).toMatchObject({ stderr: "", exitCode: 0 });
     expect(await fs.readFileBuffer("/roundtrip")).toEqual(new Uint8Array([0, 255, 128, 10]));
+  });
+
+  it("rejects shell hardlinks to symlinks without creating an alias of the referent", async () => {
+    const result = await shell().exec("ln -s seed.txt sym; ln sym hard");
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("ln:");
+    expect(await fs.exists("/hard")).toBe(false);
+    expect(await fs.readlink("/sym")).toBe("seed.txt");
+  });
+
+  it("treats an existence check below a file as a false condition", async () => {
+    expect(await shell().exec("test -e seed.txt/child; echo status=$?")).toMatchObject({
+      stdout: "status=1\n", stderr: "", exitCode: 0,
+    });
+  });
+
+  it("repeats recursive copies containing symlinks", async () => {
+    const bash = shell();
+    expect(await bash.exec("mkdir src; ln -s ../seed.txt src/link; cp -r src dst")).toMatchObject({
+      stderr: "", exitCode: 0,
+    });
+    expect(await bash.exec("cp -r src/. dst")).toMatchObject({ stderr: "", exitCode: 0 });
+    expect(await fs.readlink("/dst/link")).toBe("../seed.txt");
+    expect(await fs.readFile("/dst/link")).toBe("hello");
+    expect(await fs.readlink("/src/link")).toBe("../seed.txt");
   });
 
   it("surfaces command errors and rejected redirects", async () => {
