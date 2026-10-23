@@ -138,10 +138,22 @@ func (a *AppendLog) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 	// handles only (a no-op otherwise).
 	if !a.matcher.Matches(op.Path) && op.Kind != fs.OpRename && op.Kind != fs.OpUnlink {
 		// A claimed FD keeps its data-plane ownership even after a rename
-		// moved the name OUT of the pattern (e.g. `/app.log` →
-		// `/app.txt`): a FD-directed setattr must truncate THIS plane's
-		// buffer, not fall through to the lower write plane.
-		if op.Kind != fs.OpSetAttr || appendLogHandleOf(op.Handle) == nil {
+		// moved the name OUT of the pattern (e.g. `/app.log` → `/app.txt`):
+		// a FD-directed setattr must truncate THIS plane's buffer, not fall
+		// through to the lower write plane — and the claimed object's
+		// attribute queries must report this plane's pending size/mode, not
+		// the lower plane's committed values.
+		claimed := a.hasLiveHandles(op.Path)
+		switch op.Kind {
+		case fs.OpSetAttr:
+			if !claimed && appendLogHandleOf(op.Handle) == nil {
+				return next(ctx, op)
+			}
+		case fs.OpLookup, fs.OpGetAttr:
+			if !claimed {
+				return next(ctx, op)
+			}
+		default:
 			return next(ctx, op)
 		}
 	}
@@ -476,7 +488,7 @@ func (a *AppendLog) tryGenerationReset(ctx context.Context, h *Handle) error {
 	// sibling still CAS-es against the pre-rotation baseline, so its next
 	// frame append fails with EAGAIN — adopt the new generation in it just
 	// like the tail/rewrite landings do.
-	a.refreshCleanSiblings(h.path, revision, sqliteWALHeaderSize, h)
+	a.refreshCleanSiblings(h.path, revision, sqliteWALHeaderSize, h, landedTruncation{})
 	a.emit(fs.Event{Kind: fs.EventLanded, Path: h.path, Rev: revision, Size: sqliteWALHeaderSize, HasSize: true})
 	return nil
 }
@@ -609,7 +621,7 @@ func (a *AppendLog) tryTailAppend(ctx context.Context, h *Handle) error {
 	if err := h.applyPendingMode(ctx); err != nil {
 		return err
 	}
-	a.refreshCleanSiblings(h.path, result.Revision, result.Size, h)
+	a.refreshCleanSiblings(h.path, result.Revision, result.Size, h, landedTruncation{})
 	a.emit(fs.Event{Kind: fs.EventLanded, Path: h.path, Rev: result.Revision, Size: result.Size, HasSize: true})
 	return nil
 }
@@ -668,6 +680,9 @@ func (a *AppendLog) fullRewrite(ctx context.Context, h *Handle) error {
 	h.mu.Lock()
 	snapshotSeq := h.seq
 	snapshotIsNew := h.isNew
+	// The truncation THIS image embodies rides the landing: it decides how
+	// same-generation siblings reconcile against it (see refreshCleanSiblings).
+	landed := landedTruncation{has: h.truncPending, pure: h.truncPending && !h.hasUserBytes, truncTo: h.truncTo}
 	// The whole image becomes an immutable snapshot (memory below 1MiB,
 	// temp file above); untouched base parts load first so the image is
 	// complete.
@@ -718,7 +733,7 @@ func (a *AppendLog) fullRewrite(ctx context.Context, h *Handle) error {
 	if err := h.applyPendingMode(ctx); err != nil {
 		return err
 	}
-	a.refreshCleanSiblings(h.path, revision, size, h)
+	a.refreshCleanSiblings(h.path, revision, size, h, landed)
 	a.emit(fs.Event{Kind: fs.EventLanded, Path: h.path, Rev: revision, Size: size, HasSize: true})
 	return nil
 }
@@ -834,34 +849,61 @@ func (a *AppendLog) MarkPathUnlinked(p string) {
 	a.facadeDeferred.Store(p, struct{}{})
 }
 
+// landedTruncation describes the truncation a landing embodied: has when the
+// lander held a pending truncation, pure when it carried no user bytes of
+// its own (its image IS the truncated base), truncTo the truncation size.
+type landedTruncation struct {
+	has, pure bool
+	truncTo   int64
+}
+
 // refreshCleanSiblings adopts a committed generation in every CLEAN sibling
 // of the same path: their stale revision/size would CAS the next write on
 // the pre-commit revision (EAGAIN), and a loaded buffer would serve (and
 // re-cache) the pre-commit image under the new revision. Dirty siblings
-// keep their own CAS base (their composition still owns the tail).
-func (a *AppendLog) refreshCleanSiblings(path string, rev, size int64, self *Handle) {
+// keep their own CAS base (their composition still owns the tail), with
+// two truncation-aware exceptions among fds of the same object generation:
+//
+//   - a dirty PURE truncator (no user bytes) whose truncation this landing
+//     composed over is retired — the object already embodies it, and
+//     publishing the bare truncation afterwards would only CAS-conflict;
+//   - when the LANDING itself was a pure truncator, a dirty sibling that
+//     composed over the same truncation re-bases its CAS onto the landed
+//     revision and keeps its bytes: the landed image is exactly the base
+//     it composed over, so its own flush publishes its composition instead
+//     of conflicting on the vanished pre-truncation revision.
+func (a *AppendLog) refreshCleanSiblings(path string, rev, size int64, self *Handle, landed landedTruncation) {
 	candidates := a.liveHandles(path)
 	for _, other := range candidates {
 		if other == self {
 			continue
 		}
 		other.mu.Lock()
-		// A PURE truncator (an uncommitted truncation with no bytes of its
-		// own beyond it) is superseded by a landing that composed over that
-		// truncation: the object already embodies it, and publishing the
-		// bare truncation afterwards would only CAS-conflict at its close.
-		supersededTruncator := other.dirty && other.truncPending && other.buf != nil &&
-			other.buf.Size() == other.truncTo && size >= other.truncTo && other.objGen == self.objGen
-		if (!other.dirty || supersededTruncator) && !other.unlinked {
+		if other.unlinked {
+			other.mu.Unlock()
+			continue
+		}
+		sameTrunc := landed.has && other.dirty && other.truncPending &&
+			other.truncTo == landed.truncTo && other.objGen == self.objGen
+		switch {
+		case !other.dirty || (sameTrunc && !other.hasUserBytes):
 			other.isNew = false
 			other.baseRev = rev
 			other.origSize = size
 			other.buf = nil // re-read lazily from the committed image
-			other.dirty = false
 			other.observeLayoutLocked(client.ContentLayoutAppendLog, rev, size)
-			if supersededTruncator {
+			if other.dirty {
+				other.dirty = false
 				other.adoptCommittedBaselineLocked(rev, size)
 			}
+		case sameTrunc && landed.pure:
+			other.isNew = false
+			other.baseRev = rev
+			other.origSize = size
+			other.st.rewriteBaseRevision = rev
+			other.st.rewriteBaseSize = size
+			other.st.hasRewriteBase = true
+			other.observeLayoutLocked(client.ContentLayoutAppendLog, rev, size)
 		}
 		other.mu.Unlock()
 	}
@@ -882,6 +924,12 @@ func (a *AppendLog) liveHandles(path string) []*Handle {
 	}
 	set.mu.Unlock()
 	return candidates
+}
+
+// hasLiveHandles reports whether this plane still holds the object behind
+// the path (e.g. an append-log claim renamed out of the pattern).
+func (a *AppendLog) hasLiveHandles(path string) bool {
+	return len(a.liveHandles(path)) > 0
 }
 
 // anonymizeHandles anonymizes EVERY live handle of the path: only the
@@ -1209,6 +1257,14 @@ type Handle struct {
 	// Cleared when a committed baseline is adopted.
 	truncPending bool
 	truncTo      int64
+	// hasUserBytes marks an image that carries the user's own writes (any
+	// write since the last landing that a truncate to 0 did not discard).
+	// A pending truncation WITHOUT user bytes is a pure truncator: a
+	// sibling's landing that composed over the same truncation retires it,
+	// and its own landing is exactly the base such siblings composed over.
+	// Length is no proxy — an overwrite inside the truncated range keeps
+	// the size equal to truncTo.
+	hasUserBytes bool
 	// unlinkAtRelease performs the deferred remote delete of an
 	// unlinked-but-open path at the last close.
 	unlinkAtRelease func(ctx context.Context) error
@@ -1298,6 +1354,7 @@ func (h *Handle) Write(ctx context.Context, off int64, data []byte) error {
 		return err
 	}
 	h.recordUserWrite(pre, off, int64(len(data)))
+	h.hasUserBytes = h.hasUserBytes || len(data) > 0
 	h.seq++
 	h.dirty = true
 	syncIntent := h.flags&uint32(syscall.O_SYNC) != 0 ||
@@ -1563,6 +1620,9 @@ func (h *Handle) truncateLocked(size int64) error {
 	}
 	h.recordTruncate()
 	h.truncPending, h.truncTo = true, size
+	if size == 0 {
+		h.hasUserBytes = false // nothing of the user's survives an empty image
+	}
 	h.seq++
 	h.dirty = true
 	return nil
@@ -1605,6 +1665,7 @@ func (a *AppendLog) discardSiblingImages(siblings []*Handle) {
 		if o.dirty {
 			o.dirty = false
 			o.truncPending, o.truncTo = false, 0
+			o.hasUserBytes = false
 			// The discarded image's fences go with it: a rewrite base its own
 			// uncommitted truncate captured would otherwise outlive the
 			// re-base onto the landed truncation and fail the next flush
@@ -1915,6 +1976,7 @@ func (h *Handle) adoptCommittedBaselineLocked(revision, size int64) {
 	h.st.sqliteWALTruncated = false
 	h.st.clearSQLiteWALHeaderWrite()
 	h.truncPending, h.truncTo = false, 0
+	h.hasUserBytes = false
 	if h.st.layout != "" && revision > 0 && size >= 0 {
 		h.st.revision = revision
 		h.st.size = size
