@@ -304,10 +304,14 @@ func (e *Extent) createOp(ctx context.Context, op *fs.Op, next fs.Next) (fs.Resu
 	return next(ctx, op)
 }
 
-// claimStaging takes a fresh truncate-writer: it stats the path once (the
+// claimStaging takes a creating writer: it stats the path once (the
 // existence answer the boundary push and the layout the routing both
 // need), then wraps the below session in a buffering handle that promotes
-// to the extent plane at the threshold.
+// to the extent plane at the inline cutoff. Existing files only stay
+// claimed for a truncation rewrite (the image is built from byte zero);
+// a plain re-open or an append of an existing file keeps its bytes on the
+// classic plane below — legacy multipart/S3 files keep updating through
+// the presign link, and layouts never convert.
 func (e *Extent) claimStaging(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error) {
 	st, statErr := e.opts.Client.StatCtx(ctx, e.remotePath(op.Path))
 	if statErr != nil && !client.IsNotFound(statErr) {
@@ -326,6 +330,14 @@ func (e *Extent) claimStaging(ctx context.Context, op *fs.Op, next fs.Next) (fs.
 		}
 		return fs.Result{Handle: handle, OpenFlags: openFlags, Attr: attr}, nil
 	}
+	if statErr == nil && op.Flags&uint32(syscall.O_TRUNC) == 0 {
+		// An existing file opened WITHOUT truncation keeps its bytes on the
+		// plane below: the claim's image is built from byte zero, so it can
+		// only own a whole-file rewrite. A plain re-open or an append of a
+		// legacy multipart/S3 file serves and updates through the classic
+		// plane (the presign link) exactly as before.
+		return next(ctx, op)
+	}
 	h := &stagingHandle{
 		e: e, path: op.Path, caller: op.Caller,
 		mode:  op.Mode & 0o777,
@@ -338,19 +350,22 @@ func (e *Extent) claimStaging(ctx context.Context, op *fs.Op, next fs.Next) (fs.
 		if op.Flags&uint32(syscall.O_EXCL) != 0 {
 			return fs.Result{}, syscall.EEXIST
 		}
-		// Existing classic file: open it plainly below (no create/truncate
-		// flags — the write plane takes its existing-file branch with a
-		// real revision base) and this handle commits the truncated image
-		// against it. The truncation is pending until the first boundary
-		// pushes the (shorter) image; an existing layout never converts.
+		// Existing classic file under a truncation rewrite: open it plainly
+		// below (no create/truncate flags — the write plane takes its
+		// existing-file branch with a real revision base) and this handle
+		// commits the truncated image against it. The truncation is pending
+		// until the first boundary pushes the (shorter) image; an existing
+		// layout never converts.
 		innerOp.Flags &^= uint32(syscall.O_CREAT)
 		h.pushed = st.Size
 		h.dirty = st.Size > 0
 	} else {
-		// Fresh path: promotable to the extent plane at the threshold, and
-		// O_CREAT kept so the plane below answers with its lazy create (no
-		// remote effect until the boundary); even `: > newfile`, which
-		// closes without a single write, materializes at Release.
+		// Fresh path: promotable to the extent plane at the inline cutoff
+		// (a fresh O_APPEND create included — the claim owns the file from
+		// byte zero), and O_CREAT kept so the plane below answers with its
+		// lazy create (no remote effect until the boundary); even
+		// `: > newfile`, which closes without a single write, materializes
+		// at Release.
 		h.promotable = true
 	}
 	res, err := next(ctx, &innerOp)

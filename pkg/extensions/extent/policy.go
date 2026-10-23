@@ -93,24 +93,42 @@ func writeIntent(flags uint32) bool {
 	return flags&(uint32(syscall.O_WRONLY)|uint32(syscall.O_RDWR)) != 0
 }
 
-// claimFreshWriter reports whether the create flags describe the fresh
-// truncate-writer the large-file takeover claims: a create with truncation
-// and write intent, no append (an appender's offset discipline belongs to
-// the plane that owns the existing bytes) and no per-write sync demand.
-func claimFreshWriter(flags uint32) bool {
+// claimCreateWriter reports whether the create flags describe a writer the
+// takeover may claim: a create with write intent and no per-write sync
+// demand. Whether the EXISTING bytes (if any) can be claimed is a stat-time
+// decision in claimStaging — only a truncation rewrite owns the whole
+// image, so a plain re-open or an append of an existing file stays on the
+// plane below. A fresh O_APPEND create IS claimed: the claim owns the file
+// from byte zero, and the kernel feeds appends at the growing EOF.
+func claimCreateWriter(flags uint32) bool {
 	return writeIntent(flags) &&
 		flags&uint32(syscall.O_CREAT) != 0 &&
-		flags&uint32(syscall.O_TRUNC) != 0 &&
-		flags&uint32(syscall.O_APPEND) == 0 &&
 		!hasSyncOpenFlag(flags)
 }
 
+// defaultInlineThreshold mirrors backend.DefaultInlineThreshold: the
+// server-side DB-inline vs S3 cutoff used when the mount could not
+// negotiate one (older servers omit the field from GET /v1/status).
+const defaultInlineThreshold int64 = 50_000
+
+// inlineThreshold is the promotion line of the takeover: a claimed image
+// that grows past the server's inline cutoff would otherwise land through
+// the multipart/presign direct-upload link, so it promotes onto the extent
+// plane instead. Below the line the claim keeps the small-file path
+// (single whole-object PUT, db9 inline) exactly as before.
+func (e *Extent) inlineThreshold() int64 {
+	if e.opts.InlineThreshold > 0 {
+		return e.opts.InlineThreshold
+	}
+	return defaultInlineThreshold
+}
+
 // claimsLargeFile reports whether the default takeover claims this create:
-// enabled, a fresh truncate-writer, not already declared for the extent
-// plane (the declaration claims from byte zero), and not exempted to a
-// plane inside this one (the append-log declarations).
+// enabled, a creating writer, not already declared for the extent plane
+// (the declaration claims from byte zero), and not exempted to a plane
+// inside this one (the append-log declarations).
 func (e *Extent) claimsLargeFile(op *fs.Op) bool {
-	if !e.largeFileEnabled() || !claimFreshWriter(op.Flags) {
+	if !e.largeFileEnabled() || !claimCreateWriter(op.Flags) {
 		return false
 	}
 	if ShouldUseExtentPath(e.opts.ExtentPaths, op.Path) {

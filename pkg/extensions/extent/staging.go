@@ -1,15 +1,17 @@
-// The staging handle: the large-file takeover's claim on a fresh
-// truncate-writer. The image is buffered in memory (read-your-writes, no
-// network during Write) while it stays below the promotion threshold; the
-// durability boundaries — Flush, Fsync, Release — push it into the write
-// plane below and delegate to it. Crossing the threshold promotes the
-// claim onto the extent plane: the below session is discarded (its lazy
-// create is unlinked so its Release cannot materialize an empty classic
-// file next to the extent projection), the buffered image is created and
-// written through the JuiceFS VFS in one step, and every later operation
-// serves through the promoted extent handle. A promotion that cannot
-// build the runtime falls back to the classic plane for good — the claim
-// behaves exactly like a pure buffering claim from then on.
+// The staging handle: the takeover's claim on a creating writer. The
+// image is buffered in memory (read-your-writes, no network during Write)
+// while it stays below the promotion line — the server's inline cutoff,
+// the size at which the classic plane would fall back to the
+// multipart/presign direct-upload link; the durability boundaries —
+// Flush, Fsync, Release — push it into the write plane below and delegate
+// to it. Crossing the line promotes the claim onto the extent plane: the
+// below session is discarded (its lazy create is unlinked so its Release
+// cannot materialize an empty classic file next to the extent
+// projection), the buffered image is created and written through the
+// JuiceFS VFS in one step, and every later operation serves through the
+// promoted extent handle. A promotion that cannot build the runtime falls
+// back to the classic plane for good — the claim behaves exactly like a
+// pure buffering claim from then on.
 package extent
 
 import (
@@ -197,19 +199,14 @@ func (h *stagingHandle) applyAttr(ctx context.Context, op *fs.Op) (fs.Attr, erro
 
 // stagingMaxBufferedBytes bounds the claimed image retained in memory
 // before the claim hands the stream to the plane below (whose own
-// buffering spills to parts/shadow files) — or, for a promotable claim,
-// before the takeover threshold takes over as the effective bound. A write
-// ending far beyond must not allocate the full logical image (one byte at
-// 64 MiB must not allocate 64 MiB).
+// buffering spills to parts/shadow files). The promotion line (the inline
+// cutoff) sits far below this bound, so a promotable claim promotes well
+// before the bound; a write ending far beyond either must not allocate
+// the full logical image (one byte at 64 MiB must not allocate 64 MiB).
 const stagingMaxBufferedBytes = 8 << 20
 
-// memBoundLocked is the image bound while the caller holds h.mu: the
-// takeover threshold when it sits above the generic bound (promotion
-// replaces the forward), the generic bound otherwise.
+// memBoundLocked is the image bound while the caller holds h.mu.
 func (h *stagingHandle) memBoundLocked() int64 {
-	if h.promotable && h.e.opts.LargeFileThreshold > stagingMaxBufferedBytes {
-		return h.e.opts.LargeFileThreshold
-	}
 	return stagingMaxBufferedBytes
 }
 
@@ -304,11 +301,11 @@ func (h *stagingHandle) Write(ctx context.Context, off int64, data []byte) error
 		}
 		return inner.Write(ctx, off, data)
 	}
-	// A write that crosses the takeover threshold takes the promotion (the
-	// crossing write itself may exceed the threshold by one chunk); a
-	// write landing far beyond it is a sparse jump — the promotion window
-	// is gone and the claim forwards below instead of allocating the hole.
-	threshold := h.e.opts.LargeFileThreshold
+	// A write that crosses the inline cutoff takes the promotion (the
+	// crossing write itself may exceed the cutoff by one chunk); a write
+	// landing far beyond it is a sparse jump — the promotion window is
+	// gone and the claim forwards below instead of allocating the hole.
+	threshold := h.e.inlineThreshold()
 	crossing := h.promotable && !h.promoting && end >= threshold &&
 		end <= threshold+stagingMaxBufferedBytes
 	if crossing || h.unlinked || end <= h.memBoundLocked() {

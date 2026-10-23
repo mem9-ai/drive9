@@ -82,7 +82,7 @@ Layout is chosen by the FUSE client at **create** time, by matching the new file
 
 Directories are never extent objects. Patterns are matched against the **basename only**: a directory component is not used, so `sub/*.db` behaves like `*.db` and `sub/x.db` matches nothing. The server never infers a layout from the path; the client decides and the server records the decision in the same transaction that creates the inode (§6.2).
 
-Besides the declarations, the extent plane **claims large files by default**: a fresh truncate-writer whose buffered image crosses the takeover threshold is promoted to the extent plane (§2.5), replacing the presign/multipart direct-upload link the classic plane used for large files.
+Besides the declarations, the extent plane **claims every new file by default**: a creating writer whose buffered image grows past the server's inline cutoff — the size at which the classic plane would use the presign/multipart direct-upload link — is promoted to the extent plane (§2.5), so multipart is gone for fresh writes.
 
 ## 2.2 Built-in profiles
 
@@ -139,26 +139,35 @@ DRIVE9_MOUNT_EXTENT_PATTERNS=$'*.db\n*.db-wal' drive9 mount :/workspace ./mnt
 
 `--extent` is the direct analogue of `--append-log`; the difference is that extent needs no server capability probe, because the extent data plane is available on every deployment, while append-log depends on an object store that supports append.
 
-## 2.5 Large-file takeover (the default for big files)
+## 2.5 Takeover of new files (multipart is gone for fresh writes)
 
-With a non-zero takeover threshold — the default mount configuration — the
-extent extension also claims **fresh truncate-writers** (`O_CREAT|O_TRUNC`
-with write intent, no `O_APPEND`, no `O_SYNC`/`O_DSYNC`, and not a
-write-sync mount) that the declarations do not already cover:
+The extent extension claims **every creating writer** (`O_CREAT` with
+write intent, no `O_SYNC`/`O_DSYNC`, and not a write-sync mount) that the
+declarations do not already cover — there is no threshold knob: new files
+never take the presign/multipart path:
 
 - The claim buffers the image in memory with no network traffic during
   writes and answers lookups from the buffer, exactly like the bulk
   buffering plane it subsumed (the `bulkfile` extension is gone).
-- When the image crosses the threshold, the claim **promotes** onto the
-  extent plane: the buffered plane's pending create is discarded, the file
-  is created through the JuiceFS VFS (with the classic projection written
-  in the same server transaction), the buffered image is written through
-  the VFS, and every later operation serves through the extent handle.
-- A claim that stays below the threshold — or whose promotion cannot build
-  a runtime (a server without the extent plane; one probe per minute parks
+- When the image grows past the server's inline cutoff (the DB-inline vs
+  S3 boundary reported by the server status; ~50 KB by default) — the
+  size at which the classic plane would fall back to the presign/multipart
+  direct-upload link — the claim **promotes** onto the extent plane: the
+  buffered plane's pending create is discarded, the file is created
+  through the JuiceFS VFS (with the classic projection written in the same
+  server transaction), the buffered image is written through the VFS, and
+  every later operation serves through the extent handle.
+- A claim that stays below the cutoff keeps the small-file path (one
+  whole-object PUT, db9 inline). A claim whose promotion cannot build a
+  runtime (a server without the extent plane; one probe per minute parks
   the takeover) — **falls back to the classic plane** at its durability
   boundaries, so behavior degrades to the previous presign/multipart path
   instead of failing.
+- A fresh `O_APPEND` create is claimed too (the claim owns the file from
+  byte zero). An `O_APPEND` open — or any edit open without `O_TRUNC` —
+  of an EXISTING file is not: the claim image is built from byte zero and
+  cannot own existing bytes, so those opens serve and update through the
+  classic plane below.
 - An existing classic file is never converted: `> existing-classic-file`
   keeps the classic layout and commits the truncated image below. Legacy
   large files (created through the presign/multipart direct-upload plane
@@ -167,11 +176,9 @@ write-sync mount) that the declarations do not already cover:
   travels the classic multipart protocol with the layout unchanged
   (`TestLegacyLargeFileStaysClassicReadWrite` locks the contract).
 
-```bash
-drive9 mount --extent-large-file-threshold-mb 10 :/workspace ./mnt  # default
-drive9 mount --extent-large-file-threshold-mb 0  :/workspace ./mnt  # off
-DRIVE9_MOUNT_EXTENT_LARGE_FILE_THRESHOLD_MB=off drive9 mount ...
-```
+The takeover is unconditional (no flag): every fresh writer above the
+inline cutoff lands on the extent plane, and a server without the extent
+plane degrades to the classic presign/multipart path automatically.
 
 Paths claimed by the append-log plane (its declarations) are exempt from
 the takeover; explicit `--extent` declarations still win over everything.
@@ -210,8 +217,9 @@ drive9 mount --extent '*.db' --extent '*.db-*' :/workspace ./mnt
 # inspect the resolved profile
 drive9 profile show coding-agent-extent
 
-# big fresh writers go to the extent plane by default (10 MiB threshold)
-# --extent-large-file-threshold-mb 0 disables that takeover
+# every fresh writer past the inline cutoff lands on the extent plane
+# (unconditional — no threshold flag; existing multipart/S3 files keep
+# updating through the presign link)
 
 # operate on files exactly as before
 drive9 fs ls /workspace
