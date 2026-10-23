@@ -105,6 +105,11 @@ type AppendLog struct {
 	// and a live fd of its same-name successor never see each other's
 	// bytes.
 	objGen atomic.Uint64
+	// mutSeq orders every local mutation of every handle (write, truncate,
+	// truncation inherited from a sibling): a reader picking the image to
+	// serve across fds takes the dirty sibling with the highest stamp —
+	// the object's newest pending image — rather than an arbitrary one.
+	mutSeq atomic.Uint64
 }
 
 func New(opts Options) (*AppendLog, error) {
@@ -1274,6 +1279,9 @@ type Handle struct {
 	// Length is no proxy — an overwrite inside the truncated range keeps
 	// the size equal to truncTo.
 	hasUserBytes bool
+	// lastMut is the AppendLog.mutSeq stamp of this image's latest local
+	// mutation (0 = never mutated).
+	lastMut uint64
 	// unlinkAtRelease performs the deferred remote delete of an
 	// unlinked-but-open path at the last close.
 	unlinkAtRelease func(ctx context.Context) error
@@ -1281,19 +1289,26 @@ type Handle struct {
 
 func (h *Handle) Read(ctx context.Context, off int64, dest []byte) (int, error) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	if h.buf == nil {
 		// Read-your-writes across fds (v1 readActiveAppendVisibleRange /
 		// readSamePathDirtyHandle): another live handle's unflushed buffer
-		// is visible to this fd — serve it instead of the stale remote.
+		// is visible to this fd — serve it instead of the stale remote. The
+		// scan runs WITHOUT this handle's lock so it can wait for a busy
+		// sibling (a writer mid part-load) instead of skipping the only
+		// dirty source and regressing to the remote's pre-write bytes; no
+		// cross-handle lock is ever taken while holding one's own, so the
+		// wait cannot deadlock.
+		inner := h.inner
+		h.mu.Unlock()
 		if n, ok := h.a.readLiveAppendBuffer(ctx, h, off, dest); ok {
 			return n, nil
 		}
-		if h.inner != nil {
-			return h.inner.Read(ctx, off, dest)
+		if inner != nil {
+			return inner.Read(ctx, off, dest)
 		}
 		return 0, nil
 	}
+	defer h.mu.Unlock()
 	// Load every part the read touches before serving: ReadAt zero-fills
 	// unloaded parts, which is only correct beyond the remote base.
 	if err := h.buf.EnsurePartsForWrite(off, int64(len(dest))); err != nil {
@@ -1345,6 +1360,7 @@ func (h *Handle) Write(ctx context.Context, off int64, data []byte) error {
 		h.recordTruncate()
 		h.truncPending, h.truncTo, h.truncFloor = true, siblingTrunc.to, siblingTrunc.floor
 		h.seq++
+		h.lastMut = h.a.mutSeq.Add(1)
 	}
 	// O_APPEND: the kernel may deliver off=0; the write lands at the
 	// buffer tail. First re-derive that tail from the newest same-path
@@ -1376,6 +1392,7 @@ func (h *Handle) Write(ctx context.Context, off int64, data []byte) error {
 	h.hasUserBytes = h.hasUserBytes || len(data) > 0
 	h.seq++
 	h.dirty = true
+	h.lastMut = h.a.mutSeq.Add(1)
 	syncIntent := h.flags&uint32(syscall.O_SYNC) != 0 ||
 		h.flags&uint32(syscall.O_DSYNC) != 0 ||
 		h.a.syncPolicy == "write-sync" ||
@@ -1437,20 +1454,19 @@ func (h *Handle) Flush(ctx context.Context) error {
 
 // readLiveAppendBuffer serves one read from any OTHER live handle's dirty
 // buffer of the same path (v1 read-your-writes across fds). ok=false lets
-// the caller fall through to the inner (remote) tier.
+// the caller fall through to the inner (remote) tier. The caller must NOT
+// hold reader.mu: candidates are locked blocking, so a writer that is busy
+// (mid part-load under its own lock) is waited for, not skipped — skipping
+// the only dirty source silently regressed a read to the remote's
+// pre-write bytes. Among several dirty siblings the NEWEST pending image
+// wins (the latest mutation of the object), never an arbitrary map-order
+// pick that could answer an EOF a later append already superseded.
 func (a *AppendLog) readLiveAppendBuffer(ctx context.Context, reader *Handle, off int64, dest []byte) (int, bool) {
 	v, ok := a.live.Load(reader.path)
 	if !ok {
 		return 0, false
 	}
 	set := v.(*liveHandleSet)
-	// Snapshot the candidates under the SET mutex, then inspect each
-	// handle's dirty/buffer state under ITS OWN mutex: the old forEach
-	// body read h.dirty/h.buf while another fd's Write mutated them (a
-	// targeted -race probe flagged it), and locking only after selection
-	// both raced and could miss the newest local image. TryLock keeps the
-	// caller's h.mu from deadlocking against a sibling mid-refresh.
-	//
 	// Only fds of the SAME object generation share an image: an anonymous
 	// fd of a deleted object and a live fd of its same-name successor (or
 	// two anonymous fds of two deleted generations) must never read each
@@ -1464,15 +1480,13 @@ func (a *AppendLog) readLiveAppendBuffer(ctx context.Context, reader *Handle, of
 	}
 	set.mu.Unlock()
 	var served *Handle
+	var newest uint64
 	for _, h := range candidates {
-		if !h.mu.TryLock() {
-			continue
-		}
-		ready := h.dirty && h.buf != nil
+		h.mu.Lock()
+		ready, mut := h.dirty && h.buf != nil, h.lastMut
 		h.mu.Unlock()
-		if ready {
-			served = h
-			break
+		if ready && (served == nil || mut > newest) {
+			served, newest = h, mut
 		}
 	}
 	if served == nil {
@@ -1647,6 +1661,7 @@ func (h *Handle) truncateLocked(size int64) error {
 	}
 	h.seq++
 	h.dirty = true
+	h.lastMut = h.a.mutSeq.Add(1)
 	return nil
 }
 
