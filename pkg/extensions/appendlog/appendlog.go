@@ -154,14 +154,12 @@ func (a *AppendLog) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		if err != nil {
 			return res, err
 		}
-		// A live handle's uncommitted truncate/append is the path's size of
-		// record: answering the lower plane's last committed size let the
-		// stale value reach the SETATTR reply, the inode entry, and the
-		// kernel attribute cache.
+		// A live handle's uncommitted truncate/append/chmod is the path's
+		// state of record: answering the lower plane's last committed
+		// size/mode let stale values reach the SETATTR reply, the inode
+		// entry, the open-permission gate, and the kernel attribute cache.
 		if res.Attr != nil {
-			if size, ok := a.pendingLiveSize(op.Path); ok {
-				res.Attr.Size = size
-			}
+			a.applyLiveOverrides(op.Path, res.Attr)
 		}
 		return res, nil
 
@@ -250,12 +248,15 @@ func (a *AppendLog) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			}
 		}
 		if op.HasMode {
-			// A chmod on a live handle defers to the next successful
-			// commit; handle-less paths pass the mode through the chain.
+			// A chmod on a live handle defers its REMOTE publication to the
+			// next successful commit, but it is effective locally at once:
+			// the reply (and every later stat) carries the pending mode, or
+			// the facade re-stats the lower plane's 0644 and a revoked
+			// permission (fchmod 0000) keeps the open gate open.
 			if h != nil {
 				h.setPendingMode(op.Mode)
 				if op.Size < 0 {
-					return fs.Result{}, nil
+					return fs.Result{Attr: a.liveSetAttrReply(ctx, next, op, -1)}, nil
 				}
 			}
 		}
@@ -268,17 +269,7 @@ func (a *AppendLog) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 				if err := h.Truncate(op.Size); err != nil {
 					return fs.Result{}, err
 				}
-				// The truncated Attr must ride the reply: an empty Result
-				// made the facade fall back to a passthrough GetAttr that
-				// still reported the lower plane's pre-truncate committed
-				// size.
-				attr := &fs.Attr{Kind: fs.KindFile, Mode: syscall.S_IFREG | 0o644, Size: op.Size}
-				if gr, gerr := next(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: op.Path, Ino: op.Ino, Fh: op.Fh, Kernel: op.Kernel, Caller: op.Caller}); gerr == nil && gr.Attr != nil {
-					merged := *gr.Attr
-					merged.Size = op.Size
-					attr = &merged
-				}
-				return fs.Result{Attr: attr}, nil
+				return fs.Result{Attr: a.liveSetAttrReply(ctx, next, op, op.Size)}, nil
 			}
 			handled, err := a.truncatePath(ctx, op.Path, op.Size)
 			if !handled {
@@ -963,6 +954,50 @@ func (a *AppendLog) pendingLiveSize(path string) (int64, bool) {
 	return best, true
 }
 
+// pendingLiveMode reports the path's mode of record while a live handle
+// holds an uncommitted chmod. A newer chmod retires every older pending
+// mode of the same object (setPendingMode), so at most one live fd speaks;
+// anonymous fds never speak for the name.
+func (a *AppendLog) pendingLiveMode(path string) (uint32, bool) {
+	for _, h := range a.liveHandles(path) {
+		h.mu.Lock()
+		has, mode := h.hasPendingMode && !h.unlinked, h.pendingMode
+		h.mu.Unlock()
+		if has {
+			return mode, true
+		}
+	}
+	return 0, false
+}
+
+// applyLiveOverrides patches a stat reply with the path's uncommitted
+// size and permission bits.
+func (a *AppendLog) applyLiveOverrides(path string, attr *fs.Attr) {
+	if size, ok := a.pendingLiveSize(path); ok {
+		attr.Size = size
+	}
+	if mode, ok := a.pendingLiveMode(path); ok {
+		attr.Mode = attr.Mode&^0o7777 | mode
+	}
+}
+
+// liveSetAttrReply builds the SETATTR reply of a live protocol handle: the
+// lower plane's attributes with the uncommitted size/mode applied (and the
+// explicit truncation size when size >= 0). An empty Result made the
+// facade re-stat the lower plane, which still carried the pre-setattr
+// committed values.
+func (a *AppendLog) liveSetAttrReply(ctx context.Context, next fs.Next, op *fs.Op, size int64) *fs.Attr {
+	attr := fs.Attr{Kind: fs.KindFile, Mode: syscall.S_IFREG | 0o644}
+	if gr, gerr := next(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: op.Path, Ino: op.Ino, Fh: op.Fh, Kernel: op.Kernel, Caller: op.Caller}); gerr == nil && gr.Attr != nil {
+		attr = *gr.Attr
+	}
+	a.applyLiveOverrides(op.Path, &attr)
+	if size >= 0 {
+		attr.Size = size
+	}
+	return &attr
+}
+
 // track/untrack maintain the live-handle index.
 // liveHandleSet is one path's open protocol handles. The table supports
 // MULTIPLE concurrent handles of one path (v1 openHandles): the current
@@ -1526,12 +1561,21 @@ func (a *AppendLog) claimObjectGen(path string, fresh bool) uint64 {
 	return a.objGen.Add(1)
 }
 
-// setPendingMode defers a chmod to the next successful commit.
+// setPendingMode defers a chmod's remote publication to the next successful
+// commit. The chmod supersedes every older pending chmod of the SAME object
+// held by sibling fds: each fd used to keep its own, so a sibling's later
+// fsync/close republished a mode the caller had already replaced (chmod
+// 0644 on h1, chmod 0000 on h2, fsync h2 then h1 → remote back at 0644).
 func (h *Handle) setPendingMode(mode uint32) {
 	h.mu.Lock()
 	h.pendingMode = mode & 0o777
 	h.hasPendingMode = true
 	h.mu.Unlock()
+	for _, o := range h.a.sameObjectSiblings(h) {
+		o.mu.Lock()
+		o.hasPendingMode = false
+		o.mu.Unlock()
+	}
 }
 
 // applyPendingMode publishes a deferred chmod once the image it describes
