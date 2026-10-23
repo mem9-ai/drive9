@@ -1,8 +1,8 @@
-package extent
-
 // This file owns the extent runtime's lifecycle: single-flight
-// construction, the in-flight metadata gate, the compaction loop, and the
-// teardown that stops it and releases the JuiceFS session.
+// construction, the mount-level promotion hold, the in-flight metadata
+// gate, the compaction loop, and the teardown that stops it and releases
+// the JuiceFS session.
+package extent
 
 import (
 	"context"
@@ -21,6 +21,34 @@ import (
 // errExtentTornDown is returned when an extent operation races unmount: the
 // runtime has been torn down and must not be re-created.
 var errExtentTornDown = errors.New("extent runtime: mount is tearing down")
+
+// promotionHoldWindow parks the large-file promotion after a failed
+// runtime build: a server without the extent plane (or a transient
+// outage) then costs one build attempt per window instead of one per
+// claimed writer. The claims fall back to the classic plane meanwhile.
+const promotionHoldWindow = time.Minute
+
+// errPromotionHeld reports the hold window; the claim falls back to the
+// classic plane.
+var errPromotionHeld = errors.New("extent promotion: held after a failed build")
+
+// beginPromotion admits one promotion attempt: outside the hold window it
+// ensures the runtime, parking the window on a build failure.
+func (e *Extent) beginPromotion() error {
+	e.extentMu.Lock()
+	held := time.Now().Before(e.promoHoldUntil)
+	e.extentMu.Unlock()
+	if held {
+		return errPromotionHeld
+	}
+	if err := e.ensureRuntime(); err != nil {
+		e.extentMu.Lock()
+		e.promoHoldUntil = time.Now().Add(promotionHoldWindow)
+		e.extentMu.Unlock()
+		return err
+	}
+	return nil
+}
 
 // extentMetaDrainTimeout bounds closeExtentRuntime's wait for in-flight
 // metadata RPCs before it releases the session anyway (logged).
@@ -100,6 +128,24 @@ type extentBuildState struct {
 	cond     *sync.Cond
 	gen      uint64
 	err      error
+}
+
+// atomicPointer is a minimal generic atomic pointer.
+type atomicPointer[T any] struct {
+	mu sync.Mutex
+	p  *T
+}
+
+func (a *atomicPointer[T]) Load() *T {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.p
+}
+
+func (a *atomicPointer[T]) Store(p *T) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.p = p
 }
 
 type extentRuntime struct {

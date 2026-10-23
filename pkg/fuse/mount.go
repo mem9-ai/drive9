@@ -20,7 +20,6 @@ import (
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/extensions/appendlog"
-	"github.com/mem9-ai/drive9/pkg/extensions/bulkfile"
 	"github.com/mem9-ai/drive9/pkg/extensions/cache"
 	"github.com/mem9-ai/drive9/pkg/extensions/core"
 	"github.com/mem9-ai/drive9/pkg/extensions/extent"
@@ -185,7 +184,7 @@ func (cfg MountConfig) toProfilingOptions() perf.ProfilingOptions {
 // It is the exact reverse of the historical wired chain, so the default
 // wires byte-identically to the pre-flag code.
 var defaultExtensionOrder = []string{
-	"core", "sse", "writeback", "xattr", "specials", "bulkfile",
+	"core", "sse", "writeback", "xattr", "specials",
 	"appendlog", "extent", "git", "layer", "localize", "renameguard", "cache",
 }
 
@@ -193,7 +192,7 @@ var defaultExtensionOrder = []string{
 // would otherwise silently not wire).
 var knownExtensionNames = map[string]bool{
 	"core": true, "sse": true, "writeback": true, "xattr": true,
-	"specials": true, "bulkfile": true, "appendlog": true, "extent": true,
+	"specials": true, "appendlog": true, "extent": true,
 	"git": true, "layer": true, "localize": true, "renameguard": true,
 	"cache": true,
 }
@@ -970,6 +969,15 @@ func mountWithConfig(cfg MountConfig) error {
 	// their reads with 422 unless the JuiceFS-backed reader routes them.
 	// An empty ExtentPaths only skips the JuiceFS runtime discovery.
 	if wantExt["extent"] {
+		// The default large-file claim leaves the append-log declarations
+		// to the append-log plane inside this one (the takeover subsumed
+		// the bulk data plane, which sat below appendlog); explicit extent
+		// declarations still win.
+		var largeFileExempt func(path string) bool
+		if wantExt["appendlog"] && len(cfg.AppendLogPatterns) > 0 && strings.TrimSpace(cfg.LayerRef) == "" {
+			m := appendlog.NewAppendLogMatcher(cfg.AppendLogPatterns)
+			largeFileExempt = m.Matches
+		}
 		extentExt, err = extent.New(extent.Options{
 			ExtentPaths: cfg.ExtentPaths,
 			Client:      cl,
@@ -978,6 +986,13 @@ func mountWithConfig(cfg MountConfig) error {
 			// v1: write-sync mounts pay a per-Write VFS flush on the extent
 			// plane too.
 			Policy: cfg.WritePolicy,
+			// Takeover of new files: a claimed image that grows past the
+			// server's inline cutoff — the size at which the classic plane
+			// would fall back to presign/multipart — promotes onto the
+			// extent plane instead. The cutoff comes from the server status
+			// (cached by the client); 0 falls back to the package default.
+			InlineThreshold:   cl.SmallFileThreshold(context.Background()),
+			LargeFileExempt:   largeFileExempt,
 		})
 		if err != nil {
 			return fmt.Errorf("fuse: extent extension: %w", err)
@@ -998,14 +1013,6 @@ func mountWithConfig(cfg MountConfig) error {
 	// large images) only after the view/routing handlers have had their
 	// claim, and before the buffered write path. A write-sync mount commits
 	// every write inline below — the buffered-image claim stays out.
-	if wantExt["bulkfile"] {
-		bulkExt, berr := bulkfile.New(bulkfile.Options{Client: cl, RemoteRoot: remoteRoot, Events: bus, Policy: cfg.WritePolicy})
-		if berr != nil {
-			return fmt.Errorf("fuse: bulkfile extension: %w", berr)
-		}
-		built["bulkfile"] = bulkExt
-	}
-
 	if wantExt["specials"] {
 		specialsExt, sperr := specials.New(specials.Options{Events: bus})
 		if sperr != nil {

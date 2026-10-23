@@ -229,7 +229,7 @@ func TestPortEntryTTLHintAndDirKeepCache(t *testing.T) {
 	if ttl, ok := e.EntryTTLHint("/app/app.db"); !ok || ttl != clampExtentTTL(juiceFSAttrTimeout, juiceFSAttrTimeout) {
 		t.Fatalf("matching path hint = (%v,%v), want the JuiceFS attr timeout", ttl, ok)
 	}
-	e.rememberExtentIno("/bound", 9)
+	e.paths.rememberIno("/bound", 9)
 	if ttl, ok := e.EntryTTLHint("/bound"); !ok || ttl != juiceFSAttrTimeout {
 		t.Fatalf("bound path hint = (%v,%v), want the JuiceFS attr timeout", ttl, ok)
 	}
@@ -302,7 +302,7 @@ func TestPortKeepOpenWALIndexSize(t *testing.T) {
 	if attr.Size != 0 {
 		t.Fatalf("closed shm size = %d, want 0", attr.Size)
 	}
-	e.trackLive(shm)
+	e.paths.trackLive(shm)
 	e.keepOpenWALIndexSize(shm, &attr)
 	if attr.Size != sqliteWALIndexMinSize {
 		t.Fatalf("open empty shm size = %d, want %d", attr.Size, sqliteWALIndexMinSize)
@@ -346,15 +346,15 @@ func TestPortInoAndMissBookkeeping(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e.missRemember("/f")
-	if !e.missCached("/f") {
+	e.paths.missRemember("/f")
+	if !e.paths.missCached("/f") {
 		t.Fatal("miss not cached")
 	}
-	e.rememberExtentIno("/f", 7)
-	if e.missCached("/f") {
+	e.paths.rememberIno("/f", 7)
+	if e.paths.missCached("/f") {
 		t.Fatal("remembered ino must clear the miss")
 	}
-	if ino, ok := e.cachedIno("/f"); !ok || ino != 7 {
+	if ino, ok := e.paths.cachedIno("/f"); !ok || ino != 7 {
 		t.Fatalf("cached ino = %d %v, want 7", ino, ok)
 	}
 	if !e.subtreeMirrored("/f/child/grand") {
@@ -363,26 +363,26 @@ func TestPortInoAndMissBookkeeping(t *testing.T) {
 	if e.subtreeMirrored("/other/child") {
 		t.Fatal("unrelated subtree reported mirrored")
 	}
-	e.missRemember("/g")
-	e.forgetIno("/f")
-	if _, ok := e.cachedIno("/f"); ok {
+	e.paths.missRemember("/g")
+	e.paths.forgetIno("/f")
+	if _, ok := e.paths.cachedIno("/f"); ok {
 		t.Fatal("forgetIno must drop the ino mapping")
 	}
 	if e.subtreeMirrored("/f/child") {
 		t.Fatal("subtree still mirrored after forgetIno")
 	}
 
-	e.trackLive("/a")
-	e.retargetLivePrefix("/a", "/b")
-	if e.hasLive("/a") || !e.hasLive("/b") {
+	e.paths.trackLive("/a")
+	e.paths.retargetLivePrefix("/a", "/b")
+	if e.paths.hasLive("/a") || !e.paths.hasLive("/b") {
 		t.Fatal("retargetLive must move the open-handle marker")
 	}
 
-	for i := 0; i < extentMissCap; i++ {
-		e.missRemember("/miss" + strconv.Itoa(i))
+	for i := 0; i < missCap; i++ {
+		e.paths.missRemember("/miss" + strconv.Itoa(i))
 	}
-	if got := len(e.misses); got >= extentMissCap {
-		t.Fatalf("negative cache unbounded: %d entries (cap %d)", got, extentMissCap)
+	if got := len(e.paths.misses); got >= missCap {
+		t.Fatalf("negative cache unbounded: %d entries (cap %d)", got, missCap)
 	}
 }
 

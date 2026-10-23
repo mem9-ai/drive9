@@ -1,4 +1,4 @@
-package extent
+package server
 
 import (
 	"bytes"
@@ -48,7 +48,7 @@ func newPutRecorder(t *testing.T) *recordingPutS3 {
 
 func TestS3WrapPutStreamsSeekableBodyWithoutBuffering(t *testing.T) {
 	rec := newPutRecorder(t)
-	st, err := WrapS3(rec, "t/tenant-a/")
+	st, err := wrapS3(rec, "t/tenant-a/")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +77,7 @@ func TestS3WrapPutStreamsSeekableBodyWithoutBuffering(t *testing.T) {
 
 func TestS3WrapPutMeasuresFromCurrentOffset(t *testing.T) {
 	rec := newPutRecorder(t)
-	st, err := WrapS3(rec, "")
+	st, err := wrapS3(rec, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +99,7 @@ func TestS3WrapPutMeasuresFromCurrentOffset(t *testing.T) {
 
 func TestS3WrapPutSpoolsNonSeekableBody(t *testing.T) {
 	rec := newPutRecorder(t)
-	st, err := WrapS3(rec, "t/tenant-a/")
+	st, err := wrapS3(rec, "t/tenant-a/")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +122,7 @@ func TestS3WrapPutSpoolsNonSeekableBody(t *testing.T) {
 
 func TestS3WrapPutRejectsNilBody(t *testing.T) {
 	rec := newPutRecorder(t)
-	st, err := WrapS3(rec, "t/tenant-a/")
+	st, err := wrapS3(rec, "t/tenant-a/")
 	if err != nil {
 		t.Fatal(err)
 	}
