@@ -11,14 +11,21 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
       "require": "./dist/index.cjs"
+    },
+    "./just-bash": {
+      "types": "./dist/just-bash.d.ts",
+      "import": "./dist/just-bash.js",
+      "require": "./dist/just-bash.cjs"
     }
   },
   "files": [
     "dist"
   ],
   "scripts": {
-    "build": "tsup src/index.ts --format cjs,esm --dts --clean --platform node",
-    "test": "vitest run",
+    "build": "tsup src/index.ts src/just-bash.ts --format cjs,esm --dts --clean --platform node --splitting",
+    "example:just-bash": "npm run build && node examples/just-bash.mjs",
+    "test": "vitest run && npm run test:package",
+    "test:package": "npm run build && node --test tests/package-smoke.mjs",
     "test:watch": "vitest",
     "lint": "tsc --noEmit"
   },
@@ -28,8 +35,17 @@
     "sdk"
   ],
   "license": "Apache-2.0",
+  "peerDependencies": {
+    "just-bash": "^3.6.0"
+  },
+  "peerDependenciesMeta": {
+    "just-bash": {
+      "optional": true
+    }
+  },
   "devDependencies": {
     "@types/node": "^25.6.0",
+    "just-bash": "3.6.0",
     "msw": "^2.7",
     "tsup": "^8.4",
     "typescript": "^5.8",
