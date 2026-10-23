@@ -140,16 +140,18 @@ func (a *AppendLog) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		// A claimed FD keeps its data-plane ownership even after a rename
 		// moved the name OUT of the pattern (e.g. `/app.log` → `/app.txt`):
 		// a FD-directed setattr must truncate THIS plane's buffer, not fall
-		// through to the lower write plane — and the claimed object's
-		// attribute queries must report this plane's pending size/mode, not
-		// the lower plane's committed values.
+		// through to the lower write plane; the claimed object's attribute
+		// queries must report this plane's pending size/mode, not the lower
+		// plane's committed values; and a NEW open of the renamed name must
+		// join the same data plane (a passthrough fd read the lower plane's
+		// pre-truncation bytes and published them over the claimed image).
 		claimed := a.hasLiveHandles(op.Path)
 		switch op.Kind {
 		case fs.OpSetAttr:
 			if !claimed && appendLogHandleOf(op.Handle) == nil {
 				return next(ctx, op)
 			}
-		case fs.OpLookup, fs.OpGetAttr:
+		case fs.OpLookup, fs.OpGetAttr, fs.OpCreate:
 			if !claimed {
 				return next(ctx, op)
 			}
@@ -682,7 +684,7 @@ func (a *AppendLog) fullRewrite(ctx context.Context, h *Handle) error {
 	snapshotIsNew := h.isNew
 	// The truncation THIS image embodies rides the landing: it decides how
 	// same-generation siblings reconcile against it (see refreshCleanSiblings).
-	landed := landedTruncation{has: h.truncPending, pure: h.truncPending && !h.hasUserBytes, truncTo: h.truncTo}
+	landed := landedTruncation{has: h.truncPending, pure: h.truncPending && !h.hasUserBytes, truncTo: h.truncTo, truncFloor: h.truncFloor}
 	// The whole image becomes an immutable snapshot (memory below 1MiB,
 	// temp file above); untouched base parts load first so the image is
 	// complete.
@@ -853,8 +855,9 @@ func (a *AppendLog) MarkPathUnlinked(p string) {
 // lander held a pending truncation, pure when it carried no user bytes of
 // its own (its image IS the truncated base), truncTo the truncation size.
 type landedTruncation struct {
-	has, pure bool
-	truncTo   int64
+	has, pure  bool
+	truncTo    int64
+	truncFloor int64
 }
 
 // refreshCleanSiblings adopts a committed generation in every CLEAN sibling
@@ -884,7 +887,7 @@ func (a *AppendLog) refreshCleanSiblings(path string, rev, size int64, self *Han
 			continue
 		}
 		sameTrunc := landed.has && other.dirty && other.truncPending &&
-			other.truncTo == landed.truncTo && other.objGen == self.objGen
+			other.truncTo == landed.truncTo && other.truncFloor == landed.truncFloor && other.objGen == self.objGen
 		switch {
 		case !other.dirty || (sameTrunc && !other.hasUserBytes):
 			other.isNew = false
@@ -1257,6 +1260,12 @@ type Handle struct {
 	// Cleared when a committed baseline is adopted.
 	truncPending bool
 	truncTo      int64
+	// truncFloor is the smallest size the truncation sequence reached
+	// (ftruncate(0) then ftruncate(6) is floor 0, truncTo 6): everything
+	// beyond the floor is zero fill, not remote bytes, so a sibling
+	// composing over the truncation shrinks to the floor first and
+	// zero-grows to truncTo.
+	truncFloor int64
 	// hasUserBytes marks an image that carries the user's own writes (any
 	// write since the last landing that a truncate to 0 did not discard).
 	// A pending truncation WITHOUT user bytes is a pure truncator: a
@@ -1317,14 +1326,24 @@ func (h *Handle) Write(ctx context.Context, off int64, data []byte) error {
 		return err
 	}
 	if hasSiblingTrunc && !h.truncPending {
-		if h.buf.Size() != siblingTrunc {
-			if err := h.buf.Truncate(siblingTrunc); err != nil {
+		// Inherit the truncation's whole geometry, not its final length: a
+		// shrink-then-extend (ftruncate(0), ftruncate(6)) leaves zero fill
+		// beyond the floor, so the image shrinks to the floor first and
+		// zero-grows to the final size — always, even when the final size
+		// equals the remote's (the bytes in between are no longer remote
+		// bytes).
+		if err := h.buf.Truncate(siblingTrunc.floor); err != nil {
+			h.mu.Unlock()
+			return err
+		}
+		if siblingTrunc.to != siblingTrunc.floor {
+			if err := h.buf.Truncate(siblingTrunc.to); err != nil {
 				h.mu.Unlock()
 				return err
 			}
 		}
 		h.recordTruncate()
-		h.truncPending, h.truncTo = true, siblingTrunc
+		h.truncPending, h.truncTo, h.truncFloor = true, siblingTrunc.to, siblingTrunc.floor
 		h.seq++
 	}
 	// O_APPEND: the kernel may deliver off=0; the write lands at the
@@ -1619,6 +1638,9 @@ func (h *Handle) truncateLocked(size int64) error {
 		return err
 	}
 	h.recordTruncate()
+	if !h.truncPending || size < h.truncFloor {
+		h.truncFloor = size
+	}
 	h.truncPending, h.truncTo = true, size
 	if size == 0 {
 		h.hasUserBytes = false // nothing of the user's survives an empty image
@@ -1664,7 +1686,7 @@ func (a *AppendLog) discardSiblingImages(siblings []*Handle) {
 		o.mu.Lock()
 		if o.dirty {
 			o.dirty = false
-			o.truncPending, o.truncTo = false, 0
+			o.truncPending, o.truncTo, o.truncFloor = false, 0, 0
 			o.hasUserBytes = false
 			// The discarded image's fences go with it: a rewrite base its own
 			// uncommitted truncate captured would otherwise outlive the
@@ -1682,19 +1704,24 @@ func (a *AppendLog) discardSiblingImages(siblings []*Handle) {
 	}
 }
 
+// truncGeometry is a pending truncation's shape: the floor it shrank to
+// and the final size it was extended to.
+type truncGeometry struct{ floor, to int64 }
+
 // siblingPendingTruncation reports the uncommitted truncation held by a
-// dirty sibling of h's object, the size this fd's image must compose over.
-// Caller must not hold h.mu (sibling locks are taken one at a time).
-func (a *AppendLog) siblingPendingTruncation(h *Handle) (int64, bool) {
-	size, ok := int64(0), false
+// dirty sibling of h's object, the geometry this fd's image must compose
+// over (the deepest floor among the siblings embodying it). Caller must not
+// hold h.mu (sibling locks are taken one at a time).
+func (a *AppendLog) siblingPendingTruncation(h *Handle) (truncGeometry, bool) {
+	g, ok := truncGeometry{}, false
 	for _, o := range a.sameObjectSiblings(h) {
 		o.mu.Lock()
-		if o.dirty && o.truncPending && (!ok || o.truncTo < size) {
-			size, ok = o.truncTo, true
+		if o.dirty && o.truncPending && (!ok || o.truncFloor < g.floor) {
+			g, ok = truncGeometry{floor: o.truncFloor, to: o.truncTo}, true
 		}
 		o.mu.Unlock()
 	}
-	return size, ok
+	return g, ok
 }
 
 // claimObjectGen resolves the object generation of a new claim: a
@@ -1975,7 +2002,7 @@ func (h *Handle) adoptCommittedBaselineLocked(revision, size int64) {
 	h.st.rewriteBaseSize = 0
 	h.st.sqliteWALTruncated = false
 	h.st.clearSQLiteWALHeaderWrite()
-	h.truncPending, h.truncTo = false, 0
+	h.truncPending, h.truncTo, h.truncFloor = false, 0, 0
 	h.hasUserBytes = false
 	if h.st.layout != "" && revision > 0 && size >= 0 {
 		h.st.revision = revision
