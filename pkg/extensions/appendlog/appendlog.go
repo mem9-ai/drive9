@@ -1298,10 +1298,24 @@ func (h *Handle) Read(ctx context.Context, off int64, dest []byte) (int, error) 
 		// dirty source and regressing to the remote's pre-write bytes; no
 		// cross-handle lock is ever taken while holding one's own, so the
 		// wait cannot deadlock.
-		inner := h.inner
+		// The path is snapshotted under the lock: retarget() rewrites it
+		// under h.mu, so reading it from the unlocked scan raced a
+		// concurrent rename. A scan that found nothing re-validates the
+		// snapshot once — a rename in between moved the siblings to the
+		// new name's live set.
+		inner, path := h.inner, h.path
 		h.mu.Unlock()
-		if n, ok := h.a.readLiveAppendBuffer(ctx, h, off, dest); ok {
-			return n, nil
+		for attempt := 0; attempt < 2; attempt++ {
+			if n, ok := h.a.readLiveAppendBuffer(ctx, h, path, off, dest); ok {
+				return n, nil
+			}
+			h.mu.Lock()
+			moved := h.path != path
+			path = h.path
+			h.mu.Unlock()
+			if !moved {
+				break
+			}
 		}
 		if inner != nil {
 			return inner.Read(ctx, off, dest)
@@ -1454,15 +1468,17 @@ func (h *Handle) Flush(ctx context.Context) error {
 
 // readLiveAppendBuffer serves one read from any OTHER live handle's dirty
 // buffer of the same path (v1 read-your-writes across fds). ok=false lets
-// the caller fall through to the inner (remote) tier. The caller must NOT
-// hold reader.mu: candidates are locked blocking, so a writer that is busy
+// the caller fall through to the inner (remote) tier. path is the reader's
+// name snapshotted under its lock (the field itself moves under a rename).
+// The caller must NOT hold reader.mu: candidates are locked blocking, so a
+// writer that is busy
 // (mid part-load under its own lock) is waited for, not skipped — skipping
 // the only dirty source silently regressed a read to the remote's
 // pre-write bytes. Among several dirty siblings the NEWEST pending image
 // wins (the latest mutation of the object), never an arbitrary map-order
 // pick that could answer an EOF a later append already superseded.
-func (a *AppendLog) readLiveAppendBuffer(ctx context.Context, reader *Handle, off int64, dest []byte) (int, bool) {
-	v, ok := a.live.Load(reader.path)
+func (a *AppendLog) readLiveAppendBuffer(ctx context.Context, reader *Handle, path string, off int64, dest []byte) (int, bool) {
+	v, ok := a.live.Load(path)
 	if !ok {
 		return 0, false
 	}

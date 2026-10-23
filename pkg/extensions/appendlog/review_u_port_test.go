@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/mem9-ai/drive9/internal/testbackend"
+	"github.com/mem9-ai/drive9/pkg/fs"
 )
 
 // Two O_APPEND writers append X then Y; a third, read-only fd must always
@@ -119,5 +120,50 @@ func TestPortReaderWaitsForBusyWriterInsteadOfRegressing(t *testing.T) {
 		}
 	case <-time.After(15 * time.Second):
 		t.Fatal("the read never completed")
+	}
+}
+
+// A concurrent Read (served through a sibling's pending image) and Rename
+// of the same append-log must not race on the reader's path: the scan uses
+// the name snapshotted under the handle lock, never the field a retarget
+// rewrites.
+func TestPortConcurrentReadAndRenameNoRace(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/app.log", []byte("abcdef"))
+	ch := newStack(t, b, "**/*.log")
+	ctx := context.Background()
+
+	writer := openLog(t, ch, "/app.log")
+	reader := openLog(t, ch, "/app.log")
+	if err := writer.Write(ctx, 6, []byte("!")); err != nil {
+		t.Fatal(err)
+	}
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, 8)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_, _ = reader.Read(ctx, 0, buf)
+		}
+	}()
+	names := []string{"/app.log", "/moved.log"}
+	for i := 0; i < 40; i++ {
+		if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: names[i%2], Path2: names[(i+1)%2]}); err != nil {
+			close(stop)
+			wg.Wait()
+			t.Fatalf("rename %d = %v", i, err)
+		}
+	}
+	close(stop)
+	wg.Wait()
+	if got := mustRead(t, reader, ctx, 0, 8); got != "abcdef!" {
+		t.Fatalf("read after the renames = %q, want abcdef!", got)
 	}
 }
