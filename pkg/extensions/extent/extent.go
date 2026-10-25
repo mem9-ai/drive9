@@ -146,6 +146,14 @@ func (e *Extent) enabled() bool {
 	return len(e.opts.ExtentPaths) > 0 || e.largeFileEnabled() || e.rt.Load() != nil
 }
 
+// declared reports whether the mount carries explicit extent declarations
+// (--extent globs / the [extent] profile section): the namespace mirroring
+// that puts specials on the VFS is opted in by declaration only, never by
+// the default takeover.
+func (e *Extent) declared() bool {
+	return len(e.opts.ExtentPaths) > 0
+}
+
 // discoveryEnabled mirrors enabled: only opted-in mounts pay for probes; a
 // stat reply carrying ContentLayout/ExtentIno still routes extent files on
 // standard mounts because it costs nothing.
@@ -252,9 +260,13 @@ func (e *Extent) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, er
 
 	case fs.OpMknod:
 		// v1: metadata-only specials (FIFO/CHR/BLK/SOCK) become persistent
-		// JuiceFS nodes on extent mounts — cross-mount visible, surviving
-		// restarts — instead of session-local records.
-		if e.enabled() && metadataOnlySpecialMode(op.Mode) {
+		// JuiceFS nodes on DECLARED extent mounts — cross-mount visible,
+		// surviving restarts — instead of session-local records. The
+		// takeover alone does not opt specials in: a VFS special beside
+		// classic files mixes the two planes in one directory, and the
+		// server's jfs engine has no hardlink op (link(2) on such a FIFO
+		// answered EPERM where the classic plane links it fine).
+		if e.declared() && metadataOnlySpecialMode(op.Mode) {
 			return e.mknodSpecialInVFS(ctx, op)
 		}
 		return next(ctx, op)
@@ -272,6 +284,15 @@ func (e *Extent) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, er
 			if target, err := e.readlinkIno(ctx, op.Path, ino, op.Caller); err == nil {
 				return fs.Result{Data: []byte(target)}, nil
 			}
+		}
+
+	case fs.OpLink:
+		// A hardlink to an extent inode (a VFS special, a promoted file)
+		// adds a second edge in the JuiceFS namespace; the classic link RPC
+		// below has no object to link (the projection row is not the
+		// data) and answered EIO.
+		if ino, ok := e.resolveIno(ctx, op.Path); ok {
+			return e.linkIno(ctx, op, ino, next)
 		}
 
 	case fs.OpUnlink, fs.OpRmdir:
@@ -313,16 +334,38 @@ func (e *Extent) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, er
 			e.paths.retargetLivePrefix(op.Path, op.Path2)
 			return fs.Result{}, nil
 		}
+		// The mirror image: a CLASSIC source renamed over an EXTENT
+		// destination (a VFS special, a promoted file). The classic rename
+		// below replaces only the server projection row; the destination's
+		// JuiceFS edge would linger in the namespace — the next mknod/create
+		// of that name answers EEXIST from the VFS while the projection
+		// says ENOENT. Retire the extent destination through the VFS first
+		// (the request's caller: the outer sticky/ownership checks already
+		// admitted the replacement).
+		if dstIno, ok := e.resolveIno(ctx, op.Path2); ok {
+			kind := fs.KindFile
+			if st, serr := e.statViaVFS(ctx, op.Path2, dstIno); serr == nil && st.Attr != nil {
+				kind = st.Attr.Kind
+			}
+			var uerr error
+			if kind == fs.KindDir {
+				uerr = e.removeDirIno(ctx, op.Path2, dstIno, op.Caller)
+			} else {
+				uerr = e.unlinkIno(ctx, op.Path2, dstIno, op.Caller)
+			}
+			if uerr != nil && !fs.IsNotFound(uerr) {
+				return fs.Result{}, uerr
+			}
+		}
 		res, err := e.mutateStaging(ctx, op, next)
 		if err != nil {
 			return res, err
 		}
-		// A classic rename REPLACED the destination: whatever extent
-		// identity the destination path carried (a VFS special, a promoted
-		// file) is gone, and its cached inode would answer lookups with
-		// the overwritten object. (The destination's live staging claims
-		// were already anonymized inside mutateStaging, BEFORE the source
-		// claims moved onto the path.)
+		// Whatever extent identity the destination path still carried is
+		// gone with the replacement; a cached inode would answer lookups
+		// with the overwritten object. (The destination's live staging
+		// claims were already anonymized inside mutateStaging, BEFORE the
+		// source claims moved onto the path.)
 		e.paths.forgetIno(op.Path2)
 		// A directory (or an uncached file) moved on the plane below: the
 		// path→inode cache must follow the namespace, or a cached /d/f.db

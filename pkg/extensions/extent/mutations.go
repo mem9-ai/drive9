@@ -61,6 +61,40 @@ func (e *Extent) removeDirIno(ctx context.Context, path string, ino uint64, call
 	return nil
 }
 
+// linkIno adds a hardlink to an extent inode through the VFS: the new edge
+// carries its drive9 projection path so the server writes the second
+// file_nodes row in the same transaction (both names share one
+// extent_ino). A name the classic plane already owns must answer EEXIST
+// here — the VFS knows nothing about classic rows and would happily add
+// an edge beside one.
+func (e *Extent) linkIno(ctx context.Context, op *fs.Op, ino uint64, next fs.Next) (fs.Result, error) {
+	if res, derr := next(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: op.Path2, Caller: op.Caller}); derr == nil && res.Attr != nil {
+		return fs.Result{}, syscall.EEXIST
+	}
+	if err := e.ensureRuntime(); err != nil {
+		return fs.Result{}, syscall.EIO
+	}
+	v := e.vfs()
+	if v == nil {
+		return fs.Result{}, syscall.EIO
+	}
+	jctx := e.jfsCtxWithKeyedPath(op.Caller, e.remotePath(op.Path2))
+	parent, errn := e.ensureParent(jctx, pathutil.DirOf(op.Path2))
+	if errn != 0 {
+		return fs.Result{}, errno(errn)
+	}
+	entry, errn := v.Link(jctx, jfsmeta.Ino(ino), parent, pathutil.BaseName(op.Path2))
+	if errn != 0 {
+		return fs.Result{}, errno(errn)
+	}
+	e.paths.rememberIno(op.Path2, ino)
+	attr := fs.Attr{Kind: fs.KindFile, Nlink: 1}
+	if entry != nil && entry.Attr != nil {
+		attr = attrFromJuice(entry.Attr)
+	}
+	return fs.Result{Attr: &attr}, nil
+}
+
 // renameIno moves an extent inode: one RPC moves the meta edge and the
 // server-side projection together, with the still-open flag of the
 // destination so a live handle there keeps its bytes.
