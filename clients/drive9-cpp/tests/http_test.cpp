@@ -7,11 +7,12 @@ using namespace std::chrono_literals;
 template <class Fn> void Fails(Fn fn) { try { fn(); } catch (const Error &) { return; } throw Error("Expected HTTP failure"); }
 int main(int argc, char **argv) {
     try {
-        if (argc != 2) throw Error("Expected fixture endpoint");
+        if (argc != 3) throw Error("Expected HTTP and untrusted TLS fixture endpoints");
         std::string base = argv[1]; auto transport = MakeHttpTransport(2);
         Client client({base, "control-secret", 500ms, transport});
         auto deadline = [] { return std::chrono::steady_clock::now() + 2s; };
         Fails([&] { client.Request("GET", "/redirect"); });
+        Fails([&] { transport->Request("GET", std::string(argv[2]) + "/ok", {}, {}, deadline()); });
         Fails([&] { transport->Request("GET", base + "/large", {}, {}, deadline(), 32); });
         Fails([&] { client.Request("POST", "/drop", {}, "mutation"); });
         auto start = std::chrono::steady_clock::now();

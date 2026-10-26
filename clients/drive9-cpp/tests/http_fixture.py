@@ -1,9 +1,12 @@
 """Network-level transport checks, including a lost mutation acknowledgement."""
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import subprocess
+import ssl
 import sys
+import tempfile
 import threading
 import time
+from pathlib import Path
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -49,12 +52,24 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
 
-with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    result = subprocess.run([sys.argv[1], f"http://127.0.0.1:{server.server_port}"], timeout=30)
-    server.shutdown()
-    thread.join()
-    assert Handler.dropped == 1, "transport replayed a mutation after losing its acknowledgement"
-    assert Handler.redirected == 0, "transport followed a credential-bearing redirect"
-    sys.exit(result.returncode)
+with tempfile.TemporaryDirectory(prefix="drive9-cpp-tls-") as tmp:
+    cert, key = Path(tmp, "cert.pem"), Path(tmp, "key.pem")
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+                    "-subj", "/CN=localhost", "-keyout", str(key), "-out", str(cert)],
+                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server, ThreadingHTTPServer(("127.0.0.1", 0), Handler) as tls:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(cert, key)
+        tls.socket = context.wrap_socket(tls.socket, server_side=True)
+        threads = [threading.Thread(target=s.serve_forever, daemon=True) for s in (server, tls)]
+        for thread in threads:
+            thread.start()
+        result = subprocess.run([sys.argv[1], f"http://127.0.0.1:{server.server_port}",
+                                 f"https://127.0.0.1:{tls.server_port}"], timeout=30)
+        for s in (server, tls):
+            s.shutdown()
+        for thread in threads:
+            thread.join()
+        assert Handler.dropped == 1, "transport replayed a mutation after losing its acknowledgement"
+        assert Handler.redirected == 0, "transport followed a credential-bearing redirect"
+        sys.exit(result.returncode)

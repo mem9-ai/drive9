@@ -13,7 +13,7 @@ FetchContent_Declare(utf8proc
   URL https://codeload.github.com/JuliaStrings/utf8proc/tar.gz/refs/tags/v2.10.0
   URL_HASH SHA256=6f4f1b639daa6dca9f80bc5db1233e9cbaa31a67790887106160b33ef743f136)
 FetchContent_MakeAvailable(utf8proc)
-set_target_properties(utf8proc PROPERTIES POSITION_INDEPENDENT_CODE ON)
+set_target_properties(utf8proc PROPERTIES POSITION_INDEPENDENT_CODE ON C_VISIBILITY_PRESET hidden)
 function(drive9_header name url sha)
   set(path "${CMAKE_CURRENT_BINARY_DIR}/deps/${name}")
   if(EXISTS "${path}")
