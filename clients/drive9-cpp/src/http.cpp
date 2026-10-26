@@ -19,6 +19,10 @@ void AcknowledgeRead(int socket) {
         receive_buffer < 64 * 1024) {
         int restored = 1024 * 1024;
         if (::setsockopt(socket, SOL_SOCKET, SO_RCVBUF, &restored, sizeof(restored)) == 0) {
+            // Linux can also clamp the advertised window when the receive
+            // allocation collapses. Enlarging sk_rcvbuf alone leaves that
+            // clamp in place, so the connection still advances 2 KiB/RTO.
+            (void)::setsockopt(socket, IPPROTO_TCP, TCP_WINDOW_CLAMP, &restored, sizeof(restored));
             int enabled = 1;
             (void)::setsockopt(socket, IPPROTO_TCP, TCP_QUICKACK, &enabled, sizeof(enabled));
         }
