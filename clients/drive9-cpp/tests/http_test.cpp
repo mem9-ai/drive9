@@ -114,6 +114,10 @@ int main(int argc, char **argv) {
         auto start = std::chrono::steady_clock::now();
         Fails([&] { transport->Request("GET", base + "/slow", {}, {}, start + 180ms); });
         if (std::chrono::steady_clock::now() - start > 1s) throw Error("Slow body escaped overall deadline");
+        start = std::chrono::steady_clock::now();
+        Fails([&] { transport->Request("GET", base + "/late-body", {}, {}, start + 400ms); });
+        if (std::chrono::steady_clock::now() - start > 550ms)
+            throw Error("Header and body reads did not share the overall HTTP deadline");
         auto a = std::async(std::launch::async, [&] { transport->Request("GET", base + "/hold", {}, {}, deadline()); });
         auto b = std::async(std::launch::async, [&] { transport->Request("GET", base + "/hold", {}, {}, deadline()); });
         std::this_thread::sleep_for(30ms);

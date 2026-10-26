@@ -93,11 +93,16 @@ class Handler(BaseHTTPRequestHandler):
             data = bytes(range(256)) * 1024
         if self.path == "/slow":
             data = b"x" * 5
+        if self.path == "/late-body":
+            time.sleep(0.3)
         self.send_response(200)
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         try:
-            if self.path == "/slow":
+            if self.path == "/late-body":
+                time.sleep(0.3)
+                self.wfile.write(data)
+            elif self.path == "/slow":
                 for c in data:
                     self.wfile.write(bytes([c]))
                     self.wfile.flush()
