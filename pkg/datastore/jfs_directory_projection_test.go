@@ -26,7 +26,7 @@ func TestExtentDirectoryProjectionLifecycle(t *testing.T) {
 			}
 			mkdir := func(parent, ino uint64, name, path string) {
 				t.Helper()
-				meta("mknod", map[string]any{"parent": parent, "inode": ino, "name": name, "type": 2, "mode": 0700, "proj_path": path, "attr": ExtentAttr{Typ: 2, Mode: 0700, Nlink: 2, Parent: parent, Full: true}})
+				meta("mknod", map[string]any{"parent": parent, "inode": ino, "name": name, "type": 2, "mode": 0700, "create_projection": true, "proj_path": path, "attr": ExtentAttr{Typ: 2, Mode: 0700, Nlink: 2, Parent: parent, Full: true}})
 			}
 			mkdir(1, 200, "empty", "/empty/")
 			node, err := s.GetNode(ctx, "/empty/")
@@ -45,7 +45,7 @@ func TestExtentDirectoryProjectionLifecycle(t *testing.T) {
 				t.Fatalf("empty directory=%+v mode=%o extent=%d", node, mode, extentIno)
 			}
 			mkdir(200, 201, "nested", "/empty/nested/")
-			meta("mknod", map[string]any{"parent": 201, "inode": 202, "name": "file", "type": 1, "mode": 0600, "proj_path": "/empty/nested/file", "attr": ExtentAttr{Typ: 1, Mode: 0600, Nlink: 1, Parent: 201, Full: true}})
+			meta("mknod", map[string]any{"parent": 201, "inode": 202, "name": "file", "type": 1, "mode": 0600, "create_projection": true, "proj_path": "/empty/nested/file", "attr": ExtentAttr{Typ: 1, Mode: 0600, Nlink: 1, Parent: 201, Full: true}})
 			meta("rename", map[string]any{"src_parent": 1, "src_name": "empty", "dst_parent": 1, "dst_name": "moved", "src_path": source, "dst_path": "/moved"})
 			for _, path := range []string{"/empty/", "/empty/nested/", "/empty/nested/file"} {
 				if _, err := s.GetNode(ctx, path); err == nil {
@@ -90,7 +90,7 @@ func TestExtentDirectoryProjectionRejectsForeignHintAndClassicChildren(t *testin
 		return errno
 	}
 	for i, name := range []string{"a", "b"} {
-		if eno := meta("mknod", map[string]any{"parent": 1, "inode": 300 + i, "name": name, "type": 2, "mode": 0700, "proj_path": "/" + name + "/", "attr": ExtentAttr{Typ: 2, Mode: 0700, Parent: 1, Nlink: 2, Full: true}}); eno != 0 {
+		if eno := meta("mknod", map[string]any{"parent": 1, "inode": 300 + i, "name": name, "type": 2, "mode": 0700, "create_projection": true, "proj_path": "/" + name + "/", "attr": ExtentAttr{Typ: 2, Mode: 0700, Parent: 1, Nlink: 2, Full: true}}); eno != 0 {
 			t.Fatal(eno)
 		}
 	}
@@ -108,7 +108,7 @@ func TestExtentDirectoryProjectionRejectsForeignHintAndClassicChildren(t *testin
 	if eno := meta("rmdir", map[string]any{"parent": 1, "name": "a", "proj_path": "/b/"}); eno != int(syscall.EINVAL) {
 		t.Fatalf("foreign rmdir hint errno=%d", eno)
 	}
-	if eno := meta("mknod", map[string]any{"parent": 300, "inode": 302, "name": "nested", "type": 2, "mode": 0700, "proj_path": "/a/nested/", "attr": ExtentAttr{Typ: 2, Mode: 0700, Parent: 300, Nlink: 2, Full: true}}); eno != 0 {
+	if eno := meta("mknod", map[string]any{"parent": 300, "inode": 302, "name": "nested", "type": 2, "mode": 0700, "create_projection": true, "proj_path": "/a/nested/", "attr": ExtentAttr{Typ: 2, Mode: 0700, Parent: 300, Nlink: 2, Full: true}}); eno != 0 {
 		t.Fatal(eno)
 	}
 	if eno := meta("rename", map[string]any{"src_parent": 1, "src_name": "a", "dst_parent": 302, "dst_name": "inside"}); eno != int(syscall.EINVAL) {
@@ -145,7 +145,7 @@ func TestExtentDirectoryProjectionLockIsLocal(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 	for i, name := range []string{"a", "b"} {
-		raw, _ := json.Marshal(map[string]any{"parent": 1, "inode": 400 + i, "name": name, "type": 2, "mode": 0700, "proj_path": "/" + name + "/", "attr": ExtentAttr{Typ: 2, Mode: 0700, Parent: 1, Nlink: 2, Full: true}})
+		raw, _ := json.Marshal(map[string]any{"parent": 1, "inode": 400 + i, "name": name, "type": 2, "mode": 0700, "create_projection": true, "proj_path": "/" + name + "/", "attr": ExtentAttr{Typ: 2, Mode: 0700, Parent: 1, Nlink: 2, Full: true}})
 		if _, eno, err := s.RunExtentMetaOp(ctx, "mknod", raw, nil); err != nil || eno != 0 {
 			t.Fatalf("mkdir errno=%d err=%v", eno, err)
 		}
@@ -257,5 +257,99 @@ func TestExtentDirectoryProjectionConcurrentCycleRejection(t *testing.T) {
 	}
 	if a == 601 && b == 600 {
 		t.Fatal("opposite moves committed a directory cycle")
+	}
+}
+
+// Existing Go/FUSE clients intentionally follow metadata mkdir with classic
+// mkdir. The default must not pre-create the row consumed by that second call.
+func TestExtentDirectoryProjectionLegacyTwoPhaseMkdir(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	create, _ := json.Marshal(map[string]any{"parent": 1, "inode": 700, "name": "legacy", "type": 2, "mode": 0700, "proj_path": "/legacy/", "attr": ExtentAttr{Typ: 2, Mode: 0700, Parent: 1, Nlink: 2, Full: true}})
+	if _, eno, err := s.RunExtentMetaOp(ctx, "mknod", create, nil); err != nil || eno != 0 {
+		t.Fatalf("mknod errno=%d err=%v", eno, err)
+	}
+	if _, err := s.GetNode(ctx, "/legacy/"); err == nil {
+		t.Fatal("legacy mknod pre-created the classic directory")
+	}
+	now := time.Now().UTC()
+	if err := s.InsertInode(ctx, &Inode{InodeID: "legacy-inode", Mode: 0700, Revision: 1, Status: StatusConfirmed, CreatedAt: now, Mtime: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(ctx, &FileNode{NodeID: "legacy-node", InodeID: "legacy-inode", Path: "/legacy/", ParentPath: "/", Name: "legacy", IsDirectory: true, CreatedAt: now}); err != nil {
+		t.Fatalf("classic second phase: %v", err)
+	}
+	// Opting in must preserve ordinary mkdir's exclusive-create semantics,
+	// roll back the attempted metadata node, and retain the original mode/ID.
+	conflict, _ := json.Marshal(map[string]any{"parent": 1, "inode": 701, "name": "legacy", "type": 2, "mode": 0755, "create_projection": true, "proj_path": "/legacy/", "attr": ExtentAttr{Typ: 2, Mode: 0755, Parent: 1, Nlink: 2, Full: true}})
+	if _, eno, err := s.RunExtentMetaOp(ctx, "mknod", conflict, nil); err != nil || eno != int(syscall.EEXIST) {
+		t.Fatalf("exclusive create errno=%d err=%v", eno, err)
+	}
+	var count int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM jfs_node WHERE `+s.scope.And(`inode = ?`), s.scope.Args(701)...).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("conflict left metadata node count=%d err=%v", count, err)
+	}
+	if node, err := s.GetNode(ctx, "/legacy/"); err != nil || node.InodeID != "legacy-inode" {
+		t.Fatalf("conflict replaced classic identity node=%+v err=%v", node, err)
+	}
+
+	rename, _ := json.Marshal(map[string]any{"src_parent": 1, "src_name": "legacy", "dst_parent": 1, "dst_name": "moved", "src_path": "/legacy/", "dst_path": "/moved/"})
+	if _, eno, err := s.RunExtentMetaOp(ctx, "rename", rename, nil); err != nil || eno != 0 {
+		t.Fatalf("legacy rename errno=%d err=%v", eno, err)
+	}
+	remove, _ := json.Marshal(map[string]any{"parent": 1, "name": "moved", "proj_path": "/moved/"})
+	if _, eno, err := s.RunExtentMetaOp(ctx, "rmdir", remove, nil); err != nil || eno != 0 {
+		t.Fatalf("legacy rmdir errno=%d err=%v", eno, err)
+	}
+	if _, err := s.GetNode(ctx, "/moved/"); err == nil {
+		t.Fatal("legacy rmdir left projection")
+	}
+}
+
+func TestExtentDirectoryProjectionOptInRejectsInvalidPaths(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	for _, path := range []string{"", "/different/", "/missing-parent/child/"} {
+		raw, _ := json.Marshal(map[string]any{"parent": 1, "inode": 800, "name": "child", "type": 2, "mode": 0700, "create_projection": true, "proj_path": path, "attr": ExtentAttr{Typ: 2, Mode: 0700, Parent: 1, Nlink: 2, Full: true}})
+		if _, eno, err := s.RunExtentMetaOp(ctx, "mknod", raw, nil); err != nil || eno != int(syscall.EINVAL) {
+			t.Fatalf("path %q errno=%d err=%v", path, eno, err)
+		}
+	}
+	lookup, _ := json.Marshal(map[string]any{"parent": 1, "name": "child"})
+	if _, eno, err := s.RunExtentMetaOp(ctx, "lookup", lookup, nil); err != nil || eno != int(syscall.ENOENT) {
+		t.Fatalf("invalid projection mutated namespace errno=%d err=%v", eno, err)
+	}
+}
+
+func TestExtentDirectoryProjectionRejectsClassicOnlyConflict(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := s.InsertInode(ctx, &Inode{InodeID: "classic-only-inode", Mode: 0700, Revision: 1, Status: StatusConfirmed, CreatedAt: now, Mtime: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(ctx, &FileNode{NodeID: "classic-only-node", InodeID: "classic-only-inode", Path: "/classic-only/", ParentPath: "/", Name: "classic-only", IsDirectory: true, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(ctx, &FileNode{NodeID: "occupied-file-node", InodeID: "classic-only-inode", Path: "/occupied", ParentPath: "/", Name: "occupied", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	occupied, _ := json.Marshal(map[string]any{"parent": 1, "inode": 901, "name": "occupied", "type": 2, "mode": 0700, "create_projection": true, "proj_path": "/occupied/", "attr": ExtentAttr{Typ: 2, Mode: 0700, Parent: 1, Nlink: 2, Full: true}})
+	if _, eno, err := s.RunExtentMetaOp(ctx, "mknod", occupied, nil); err != nil || eno != int(syscall.EEXIST) {
+		t.Fatalf("classic file conflict errno=%d err=%v", eno, err)
+	}
+
+	raw, _ := json.Marshal(map[string]any{"parent": 1, "inode": 900, "name": "classic-only", "type": 2, "mode": 0755, "create_projection": true, "proj_path": "/classic-only/", "attr": ExtentAttr{Typ: 2, Mode: 0755, Parent: 1, Nlink: 2, Full: true}})
+	for i := 0; i < 2; i++ {
+		if _, eno, err := s.RunExtentMetaOp(ctx, "mknod", raw, nil); err != nil || eno != int(syscall.EEXIST) {
+			t.Fatalf("classic conflict errno=%d err=%v", eno, err)
+		}
+	}
+	var count int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM jfs_node WHERE `+s.scope.And(`inode = ?`), s.scope.Args(900)...).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("rejected create left node count=%d err=%v", count, err)
+	}
+	if node, err := s.GetNode(ctx, "/classic-only/"); err != nil || node.InodeID != "classic-only-inode" {
+		t.Fatalf("rejected create replaced classic identity node=%+v err=%v", node, err)
 	}
 }

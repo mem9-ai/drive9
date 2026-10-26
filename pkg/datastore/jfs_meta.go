@@ -161,6 +161,7 @@ func (q *ExtentQuotaLimit) admit(oldLen, newLen uint64) int {
 	}
 	return 0
 }
+
 func (s *Store) RunExtentMetaOp(ctx context.Context, op string, raw json.RawMessage, quota *ExtentQuotaLimit) (json.RawMessage, int, error) {
 	opStart := time.Now()
 	defer func() { observeStoreOp(ctx, "extent_"+op, opStart, nil) }()
@@ -501,7 +502,7 @@ func (s *Store) dispatchExtentOp(ctx context.Context, tx *sql.Tx, op string, raw
 		if err := s.jfsUpsertSessionTx(tx, in.Sid, in.Expire, in.Info, in.Update); err != nil {
 			return nil, int(syscall.EIO), err
 		}
-		return map[string]any{"errno": 0}, 0, nil
+		return map[string]any{"errno": 0, "directory_projection": true}, 0, nil
 	case "refresh_session":
 		var in struct {
 			Sid    uint64 `json:"sid"`
@@ -562,19 +563,20 @@ func (s *Store) dispatchExtentOp(ctx context.Context, tx *sql.Tx, op string, raw
 		}, eno, nil
 	case "mknod":
 		var in struct {
-			Parent   uint64     `json:"parent"`
-			Name     string     `json:"name"`
-			Type     uint8      `json:"type"`
-			Mode     uint16     `json:"mode"`
-			Cumask   uint16     `json:"cumask"`
-			Path     string     `json:"path"`
-			Inode    uint64     `json:"inode"`
-			Attr     ExtentAttr `json:"attr"`
-			ProjPath string     `json:"proj_path"`
-			Uid      uint32     `json:"uid"`
-			Gid      uint32     `json:"gid"`
-			Indx     uint32     `json:"indx"`
-			Parts    []struct {
+			Parent           uint64     `json:"parent"`
+			Name             string     `json:"name"`
+			Type             uint8      `json:"type"`
+			Mode             uint16     `json:"mode"`
+			Cumask           uint16     `json:"cumask"`
+			Path             string     `json:"path"`
+			Inode            uint64     `json:"inode"`
+			Attr             ExtentAttr `json:"attr"`
+			CreateProjection bool       `json:"create_projection"`
+			ProjPath         string     `json:"proj_path"`
+			Uid              uint32     `json:"uid"`
+			Gid              uint32     `json:"gid"`
+			Indx             uint32     `json:"indx"`
+			Parts            []struct {
 				Off   uint32      `json:"off"`
 				Slice ExtentSlice `json:"slice"`
 			} `json:"parts"`
@@ -583,8 +585,13 @@ func (s *Store) dispatchExtentOp(ctx context.Context, tx *sql.Tx, op string, raw
 		if err := json.Unmarshal(raw, &in); err != nil {
 			return nil, int(syscall.EINVAL), err
 		}
-		ino, attr, eno, err := s.jfsMknodTx(ctx, tx, in.Parent, in.Name, in.Type, in.Mode, in.Cumask, in.Inode, in.Attr, in.ProjPath, in.Uid, in.Gid, in.Path)
+		ino, attr, eno, err := s.jfsMknodWithProjectionTx(ctx, tx, in.Parent, in.Name, in.Type, in.Mode, in.Cumask, in.Inode, in.Attr, in.ProjPath, in.Uid, in.Gid, in.Path, in.CreateProjection)
 		if err != nil {
+			// The transaction must roll back, while preserving expected
+			// namespace conflicts rather than converting them to EIO.
+			if eno != 0 {
+				return map[string]any{"errno": eno}, eno, err
+			}
 			return nil, int(syscall.EIO), err
 		}
 		if eno == 0 && len(in.Parts) > 0 {

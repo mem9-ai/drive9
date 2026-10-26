@@ -1582,17 +1582,16 @@ func deterministicNodeID(path string) string {
 // parent cannot leak orphan inodes, even on TiDB which does not support gap
 // locking for SELECT ... FOR UPDATE on non-existing rows.
 func (s *Store) ensureParentDirsWithExecer(ctx context.Context, db execer, path string, genID func() string) error {
-	_, err := s.ensureDirectoryTreeWithExecer(ctx, db, parentPath(path), genID)
-	return err
-}
-
-func (s *Store) ensureDirectoryTreeWithExecer(ctx context.Context, db execer, dir string, genID func() string) ([]string, error) {
-	var created []string
 	var ancestors []string
-	for cur := dir; cur != "/"; cur = parentPath(cur) {
-		ancestors = append(ancestors, cur)
+	cur := path
+	for {
+		parent := parentPath(cur)
+		if parent == cur || parent == "/" {
+			break
+		}
+		ancestors = append(ancestors, parent)
+		cur = parent
 	}
-
 	now := time.Now().UTC()
 	for i := len(ancestors) - 1; i >= 0; i-- {
 		dirPath := ancestors[i]
@@ -1609,7 +1608,7 @@ func (s *Store) ensureDirectoryTreeWithExecer(ctx context.Context, db execer, di
 			continue
 		}
 		if selectErr != nil && !errors.Is(selectErr, sql.ErrNoRows) {
-			return nil, fmt.Errorf("check parent dir %s: %w", dirPath, selectErr)
+			return fmt.Errorf("check parent dir %s: %w", dirPath, selectErr)
 		}
 
 		// Use a deterministic ID so concurrent creators for the same missing
@@ -1622,7 +1621,7 @@ func (s *Store) ensureDirectoryTreeWithExecer(ctx context.Context, db execer, di
 			VALUES (`+s.scope.InsVals(`?, 0, 1, ?, 'CONFIRMED', ?, ?`)+`)`,
 			s.scope.Args(nodeID, 0o755, now, now)...)
 		if err != nil {
-			return nil, fmt.Errorf("ensure parent inode %s: %w", dirPath, err)
+			return fmt.Errorf("ensure parent inode %s: %w", dirPath, err)
 		}
 
 		if selectErr == nil && !existingInodeID.Valid {
@@ -1632,27 +1631,22 @@ func (s *Store) ensureDirectoryTreeWithExecer(ctx context.Context, db execer, di
 				`UPDATE file_nodes SET inode_id = ? WHERE `+s.scope.And(`path_hash = ? AND path = ? AND is_directory = 1`),
 				append([]any{nodeID}, s.scope.Args(fileNodePathHash(dirPath), dirPath)...)...)
 			if err != nil {
-				return nil, fmt.Errorf("backfill parent inode_id %s: %w", dirPath, err)
+				return fmt.Errorf("backfill parent inode_id %s: %w", dirPath, err)
 			}
 			continue
 		}
 
 		// Directory does not exist — insert the dentry.
-		res, err := db.ExecContext(ctx, `INSERT INTO file_nodes
+		_, err = db.ExecContext(ctx, `INSERT INTO file_nodes
 			(`+s.scope.InsCols(`node_id, path, path_hash, parent_path, parent_path_hash, name, is_directory, inode_id, created_at`)+`)
 			VALUES (`+s.scope.InsVals(`?, ?, ?, ?, ?, ?, 1, ?, ?`)+`)
 			ON DUPLICATE KEY UPDATE node_id = node_id`,
 			s.scope.Args(nodeID, dirPath, fileNodePathHash(dirPath), pp, fileNodePathHash(pp), name, nodeID, now)...)
 		if err != nil && !isUniqueViolation(err) {
-			return nil, fmt.Errorf("ensure parent %s: %w", dirPath, err)
-		}
-		if err == nil {
-			if n, _ := res.RowsAffected(); n == 1 {
-				created = append(created, nodeID)
-			}
+			return fmt.Errorf("ensure parent %s: %w", dirPath, err)
 		}
 	}
-	return created, nil
+	return nil
 }
 
 func (s *Store) InsertNodeTx(db execer, n *FileNode) error {
