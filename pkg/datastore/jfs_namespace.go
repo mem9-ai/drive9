@@ -955,10 +955,30 @@ func (s *Store) jfsRenameTx(ctx context.Context, tx *sql.Tx, srcParent uint64, s
 	var exist uint64
 	err = tx.QueryRow(`SELECT inode FROM jfs_edge WHERE parent = ? AND name = ? FOR UPDATE`,
 		dstParent, []byte(dstName)).Scan(&exist)
-	if err == nil {
-		if exist == ino {
-			return ino, exist, attr, attr, 0, nil
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return 0, 0, nil, nil, 0, err
+	}
+	if err == nil && exist == ino {
+		return ino, exist, attr, attr, 0, nil
+	}
+	// A classic-only destination has no jfs edge. Check both spellings in the
+	// projection namespace before either tree changes, including when the RPC
+	// omitted its optional path hint. Client-side lookup alone cannot protect
+	// against a destination changing before this transaction starts.
+	projection := dstPath
+	if projection == "" {
+		var perr error
+		projection, perr = s.jfsProjectionPathTx(tx, dstParent, dstName)
+		if perr != nil && !errors.Is(perr, sql.ErrNoRows) {
+			return 0, 0, nil, nil, 0, perr
 		}
+	}
+	if projection != "" {
+		if eno, perr := s.jfsCheckRenameProjectionTx(ctx, tx, projection, attr.Typ, flags); perr != nil || eno != 0 {
+			return 0, exist, attr, nil, eno, perr
+		}
+	}
+	if err == nil {
 		if flags&jfsRenameNoReplace != 0 {
 			return 0, exist, attr, nil, int(syscall.EEXIST), nil
 		}
@@ -994,40 +1014,6 @@ func (s *Store) jfsRenameTx(ctx context.Context, tx *sql.Tx, srcParent uint64, s
 		}
 	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return 0, 0, nil, nil, 0, err
-	} else if errors.Is(err, sql.ErrNoRows) && dstPath != "" {
-		// A classic-only destination has no edge to trigger the checks above.
-		// Check both path spellings under this same transaction before moving
-		// any edge or projection; never merge a nonempty directory subtree.
-		base := strings.TrimSuffix(dstPath, "/")
-		for _, path := range []string{base, base + "/"} {
-			var directory bool
-			err := tx.QueryRowContext(ctx, `SELECT is_directory FROM file_nodes WHERE `+s.scope.And(`path_hash = ? AND path = ?`)+` FOR UPDATE`,
-				s.scope.Args(fileNodePathHash(path), path)...).Scan(&directory)
-			if errors.Is(err, sql.ErrNoRows) {
-				continue
-			}
-			if err != nil {
-				return 0, 0, nil, nil, 0, err
-			}
-			if flags&jfsRenameNoReplace != 0 {
-				return 0, 0, attr, nil, int(syscall.EEXIST), nil
-			}
-			if directory && attr.Typ != jfsTypeDir {
-				return 0, 0, attr, nil, int(syscall.EISDIR), nil
-			}
-			if !directory && attr.Typ == jfsTypeDir {
-				return 0, 0, attr, nil, int(syscall.ENOTDIR), nil
-			}
-			if directory {
-				occupied, err := s.dirHasChildrenTx(ctx, tx, path)
-				if err != nil {
-					return 0, 0, nil, nil, 0, err
-				}
-				if occupied {
-					return 0, 0, attr, nil, int(syscall.ENOTEMPTY), nil
-				}
-			}
-		}
 	}
 	res, err := tx.Exec(`DELETE FROM jfs_edge WHERE parent = ? AND name = ?`, srcParent, []byte(srcName))
 	if err != nil {
@@ -1073,6 +1059,50 @@ func (s *Store) jfsRenameTx(ctx context.Context, tx *sql.Tx, srcParent uint64, s
 	}
 	return ino, 0, attr, nil, 0, nil
 }
+
+// jfsCheckRenameProjectionTx applies rename's type and emptiness rules to
+// classic entries even when they have not been mirrored into jfs_edge.
+func (s *Store) jfsCheckRenameProjectionTx(ctx context.Context, tx *sql.Tx, path string, typ uint8, flags uint32) (int, error) {
+	filePath, err := pathutil.Canonicalize(path)
+	if err != nil {
+		return int(syscall.EINVAL), nil
+	}
+	dirPath, err := pathutil.CanonicalizeDir(path)
+	if err != nil {
+		return int(syscall.EINVAL), nil
+	}
+	for _, candidate := range []string{filePath, dirPath} {
+		var isDir bool
+		err := tx.QueryRowContext(ctx, `SELECT is_directory FROM file_nodes WHERE `+s.scope.And(`path_hash = ? AND path = ?`)+` FOR UPDATE`,
+			s.scope.Args(fileNodePathHash(candidate), candidate)...).Scan(&isDir)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return 0, err
+		}
+		if flags&jfsRenameNoReplace != 0 {
+			return int(syscall.EEXIST), nil
+		}
+		if typ == jfsTypeDir && !isDir {
+			return int(syscall.ENOTDIR), nil
+		}
+		if typ != jfsTypeDir && isDir {
+			return int(syscall.EISDIR), nil
+		}
+		if isDir {
+			occupied, err := s.dirHasChildrenTx(ctx, tx, candidate)
+			if err != nil {
+				return 0, err
+			}
+			if occupied {
+				return int(syscall.ENOTEMPTY), nil
+			}
+		}
+	}
+	return 0, nil
+}
+
 func (s *Store) jfsMoveProjectionTx(tx *sql.Tx, extentIno uint64, srcPath, srcName, dstPath string) error {
 	dstParent := pathutil.ParentPath(dstPath)
 	dstName := pathutil.BaseName(dstPath)

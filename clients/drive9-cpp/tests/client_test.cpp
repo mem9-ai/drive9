@@ -394,9 +394,83 @@ void DirectoryProjectionCapability() {
     OpenOptions writer; writer.create = writer.write = true;
     auto file = fs.Open("/regular", writer); fs.WriteAt(file, "ok", 2, 0); fs.Close(file);
 }
+
+void RenameNamespaceValidation() {
+    struct NamespaceFixture : Fixture {
+        std::map<std::string, int> entries;
+        std::map<std::string, int> classic_dirs;
+        Json rename;
+        int lookup_error = 0;
+        bool omit_capability = false;
+        Response Request(const std::string &method, const std::string &url, const Headers &headers,
+                         std::string_view body, Deadline deadline, size_t limit) override {
+            if (method == "HEAD") {
+                auto found = classic_dirs.find(url);
+                if (found != classic_dirs.end()) return {200, {{"x-dat9-isdir", "true"}, {"x-dat9-mode", "493"}}, {}};
+            }
+            if (url == "http://fs.test/v1/extent/meta") {
+                auto op = headers.at("X-Drive9-Extent-Op");
+                auto request = Json::parse(body);
+                if (op == "lookup") {
+                    auto name = request.at("name").get<std::string>();
+                    if (name == "target" && lookup_error) return {200, {}, Json({{"errno", lookup_error}}).dump()};
+                    auto found = entries.find(name);
+                    if (found == entries.end()) return {200, {}, "{\"errno\":2}"};
+                    return {200, {}, Json({{"errno", 0}, {"inode", name == "source" ? 42 : 43},
+                        {"attr", {{"Typ", found->second}, {"Length", 0}}}}).dump()};
+                }
+                if (op == "mknod") {
+                    Check(!request.value("create_projection", false), "lookup must only mirror an existing directory");
+                    entries[request.at("name")] = 2;
+                    return {200, {}, Json({{"errno", 0}, {"inode", request.at("inode")},
+                        {"attr", {{"Typ", 2}, {"Length", 4096}}}}).dump()};
+                }
+                if (op == "rename") { rename = request; return {200, {}, "{\"errno\":0}"}; }
+                auto result = Fixture::Request(method, url, headers, body, deadline, limit);
+                if (op == "new_session" && omit_capability) {
+                    auto response = Json::parse(result.body); response.erase("directory_projection"); result.body = response.dump();
+                }
+                return result;
+            }
+            return Fixture::Request(method, url, headers, body, deadline, limit);
+        }
+    };
+    auto expect_errno = [](auto fn, int code) {
+        try { fn(); } catch (const Error &error) { Check(error.code == code, "rename returned the wrong errno"); return; }
+        throw std::runtime_error("unsafe rename succeeded");
+    };
+    for (bool omitted : {false, true}) {
+        NamespaceFixture f; f.directory_projection = false; f.omit_capability = omitted;
+        // Lookup is still allowed to mirror a classic source on old servers.
+        f.classic_dirs["http://fs.test/v1/fs/source/"] = 2;
+        ExtentFileSystem fs(f.ClientFor());
+        expect_errno([&] { fs.Rename("/source/", "/target/"); }, 95);
+        Check(f.rename.is_null(), "legacy directory rename sent a mutation");
+        f.entries["source"] = 1;
+        fs.Rename("/source", "/target");
+        Check(f.rename.at("src_path") == "/source" && f.rename.at("dst_path") == "/target", "legacy file rename stopped working");
+    }
+    for (bool capable : {false, true}) {
+        NamespaceFixture f; f.directory_projection = capable; f.entries["source"] = 1;
+        f.classic_dirs["http://fs.test/v1/fs/target/"] = 2;
+        ExtentFileSystem fs(f.ClientFor());
+        expect_errno([&] { fs.Rename("/source", "/target"); }, 21);
+        Check(f.entries.count("target") == 1 && f.rename.is_null(), "classic directory destination was not validated");
+    }
+    NamespaceFixture f; f.entries = {{"source", 2}, {"target", 1}};
+    ExtentFileSystem fs(f.ClientFor());
+    expect_errno([&] { fs.Rename("/source", "/target"); }, 20);
+    Check(f.rename.is_null(), "directory replaced a regular file");
+    f.lookup_error = 13;
+    expect_errno([&] { fs.Rename("/source", "/target"); }, 13);
+    Check(f.rename.is_null(), "destination lookup error was ignored");
+    f.lookup_error = 0; f.entries.erase("target");
+    fs.Rename("/source", "/target");
+    Check(f.rename.at("src_path") == "/source/" && f.rename.at("dst_path") == "/target/", "capable directory rename lost its paths");
+}
 int main() {
     try {
-        DirectoryProjectionCapability(); LegacyDirectoryRenameIsRejected();
+        DirectoryProjectionCapability(); LegacyDirectoryRenameIsRejected(); RenameNamespaceValidation();
         PathsAndSlices(); DurableSparseAndReferences(); CompatibleIDReservations(); LostPublicationAck(); MalformedAcknowledgement(); UploadFailure(); LatePutRejected();
         ParallelReadsAndClose(); SyncDoesNotWaitForDownloads(); CredentialBindingAndRefresh(); LeaseAndLegacy(); MaintenanceDoesNotRevokeOwnership();
         RefreshLengthAndRejectSymlinks(); GCSScopedTransport(); DefaultCloudCredentials();

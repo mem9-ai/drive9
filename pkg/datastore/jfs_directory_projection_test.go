@@ -3,10 +3,155 @@ package datastore
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/mem9-ai/drive9/pkg/pathutil"
 )
+
+func TestExtentRenameValidatesClassicDestination(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		sourceDir bool
+		targetDir bool
+		child     bool
+		mirrored  bool
+		noReplace bool
+		wantErrno syscall.Errno
+	}{
+		{name: "file_over_directory", targetDir: true, wantErrno: syscall.EISDIR},
+		{name: "directory_over_file", sourceDir: true, wantErrno: syscall.ENOTDIR},
+		{name: "directory_over_nonempty_directory", sourceDir: true, targetDir: true, child: true, wantErrno: syscall.ENOTEMPTY},
+		{name: "directory_over_mirrored_classic_children", sourceDir: true, targetDir: true, child: true, mirrored: true, wantErrno: syscall.ENOTEMPTY},
+		{name: "directory_over_empty_directory", sourceDir: true, targetDir: true},
+		{name: "file_over_file"},
+		{name: "no_replace_classic_file", noReplace: true, wantErrno: syscall.EEXIST},
+		{name: "no_replace_classic_directory", sourceDir: true, targetDir: true, noReplace: true, wantErrno: syscall.EEXIST},
+	} {
+		for _, hint := range []string{"canonical", "noncanonical", "omitted"} {
+			t.Run(tc.name+"/"+hint, func(t *testing.T) {
+				s := newTestStore(t)
+				ctx := context.Background()
+				meta := func(op string, args map[string]any, want syscall.Errno) json.RawMessage {
+					t.Helper()
+					raw, err := json.Marshal(args)
+					if err != nil {
+						t.Fatal(err)
+					}
+					body, eno, err := s.RunExtentMetaOp(ctx, op, raw, nil)
+					if err != nil || eno != int(want) {
+						t.Fatalf("%s: errno=%d want=%d err=%v body=%s", op, eno, want, err, body)
+					}
+					return body
+				}
+				mknod := func(parent, ino uint64, name, path string, typ uint8, create bool) {
+					t.Helper()
+					meta("mknod", map[string]any{"parent": parent, "inode": ino, "name": name, "type": typ, "mode": 0700,
+						"create_projection": create, "proj_path": path, "attr": ExtentAttr{Typ: typ, Mode: 0700, Parent: parent, Full: true}}, 0)
+				}
+				// A nested destination exercises inode-based path resolution when
+				// the caller omits the projection hint.
+				mknod(1, 900, "container", "/container/", jfsTypeDir, true)
+				sourcePath, targetPath := "/source", "/container/target"
+				typ := uint8(jfsTypeFile)
+				if tc.sourceDir {
+					sourcePath += "/"
+					typ = jfsTypeDir
+				}
+				if tc.targetDir {
+					targetPath += "/"
+				}
+				mknod(1, 901, "source", sourcePath, typ, true)
+				if tc.sourceDir {
+					mknod(901, 902, "child", sourcePath+"child", jfsTypeFile, true)
+				}
+				source, err := s.GetNode(ctx, sourcePath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				classic := func(path string, isDir bool) {
+					t.Helper()
+					now := time.Now().UTC()
+					id := fmt.Sprintf("classic-%s", path)
+					if err := s.InsertInode(ctx, &Inode{InodeID: id, Mode: 0600, Revision: 1, Status: StatusConfirmed, CreatedAt: now, Mtime: now}); err != nil {
+						t.Fatal(err)
+					}
+					if err := s.InsertNode(ctx, &FileNode{NodeID: id, InodeID: id, Path: path, ParentPath: pathutil.ParentPath(path), Name: pathutil.BaseName(path), IsDirectory: isDir, CreatedAt: now}); err != nil {
+						t.Fatal(err)
+					}
+				}
+				classic(targetPath, tc.targetDir)
+				if tc.child {
+					classic(targetPath+"keep", false)
+				}
+				if tc.mirrored {
+					mknod(900, 903, "target", targetPath, jfsTypeDir, false)
+				}
+				args := map[string]any{"src_parent": 1, "src_name": "source", "dst_parent": 900, "dst_name": "target"}
+				if hint != "omitted" {
+					destination := "/container/target"
+					if tc.sourceDir {
+						destination += "/"
+					}
+					if hint == "noncanonical" {
+						destination = "//container//target/"
+					}
+					args["src_path"], args["dst_path"] = sourcePath, destination
+				}
+				if tc.noReplace {
+					args["flags"] = jfsRenameNoReplace
+				}
+				// File rename historically needs a destination projection hint.
+				// Omitted hints are still checked for rejection; successful file
+				// replacement uses the canonical wire contract.
+				if !tc.sourceDir && tc.wantErrno == 0 {
+					args["dst_path"] = targetPath
+				}
+				meta("rename", args, tc.wantErrno)
+				if tc.wantErrno != 0 {
+					meta("lookup", map[string]any{"parent": 1, "name": "source"}, 0)
+					for path, id := range map[string]string{sourcePath: source.NodeID, targetPath: "classic-" + targetPath} {
+						node, err := s.GetNode(ctx, path)
+						if err != nil || node.NodeID != id {
+							t.Fatalf("failed rename changed %s: node=%+v err=%v", path, node, err)
+						}
+					}
+					want := syscall.ENOENT
+					if tc.mirrored {
+						want = 0
+					}
+					meta("lookup", map[string]any{"parent": 900, "name": "target"}, want)
+				} else {
+					meta("lookup", map[string]any{"parent": 1, "name": "source"}, syscall.ENOENT)
+					meta("lookup", map[string]any{"parent": 900, "name": "target"}, 0)
+					node, err := s.GetNode(ctx, targetPath)
+					if err != nil || node.NodeID != source.NodeID {
+						t.Fatalf("rename did not move source projection: node=%+v err=%v", node, err)
+					}
+					if _, err := s.GetNode(ctx, sourcePath); err == nil {
+						t.Fatal("rename retained source projection")
+					}
+				}
+				if tc.child {
+					if _, err := s.GetNode(ctx, targetPath+"keep"); err != nil {
+						t.Fatalf("target child lost: %v", err)
+					}
+				}
+				if tc.sourceDir {
+					path := sourcePath + "child"
+					if tc.wantErrno == 0 {
+						path = targetPath + "child"
+					}
+					if _, err := s.GetNode(ctx, path); err != nil {
+						t.Fatalf("source child lost: %v", err)
+					}
+				}
+			})
+		}
+	}
+}
 
 // Both HTTP views must observe one namespace transaction, including empty dirs.
 func TestExtentDirectoryProjectionLifecycle(t *testing.T) {
