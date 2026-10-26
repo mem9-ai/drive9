@@ -261,15 +261,20 @@ Response ObjectStore::Request(const std::string &method, const std::string &key,
             }
         }
         headers["Content-Type"] = "application/octet-stream";
+        Response response;
         try {
-            auto response = client_->Transport()->Request(http_method, url, headers, data, deadline, max_response);
-            if (response.status >= 200 && response.status < 300) return response;
-            if (response.status != 401 && response.status != 403 && response.status != 408 && response.status != 429 && response.status < 500)
-                throw Error("Object storage request rejected", 0, response.status);
-            if (attempt == 2) throw Error("Object storage request rejected", 0, response.status);
+            response = client_->Transport()->Request(http_method, url, headers, data, deadline, max_response);
         } catch (const Error &error) {
-            if (error.status != 0 || attempt == 2 || std::chrono::steady_clock::now() >= deadline) throw;
+            if (attempt == 2 || std::chrono::steady_clock::now() >= deadline) throw;
+            if (error.status == 0) continue;
+            // Headers can identify an HTTP failure even when its error body
+            // exceeds the read cap. Apply the same retry policy as a full body.
+            response.status = error.status;
         }
+        if (response.status >= 200 && response.status < 300) return response;
+        if (response.status != 401 && response.status != 403 && response.status != 408 && response.status != 429 && response.status < 500)
+            throw Error("Object storage request rejected", 0, response.status);
+        if (attempt == 2) throw Error("Object storage request rejected", 0, response.status);
         // Only immutable object PUT/GET is retried. Metadata publication is not.
     }
     throw Error("Object storage retry exhausted");

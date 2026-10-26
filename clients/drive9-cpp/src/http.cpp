@@ -115,7 +115,11 @@ public:
         bool ok = client->send(request, response, error);
         if (!ok || std::chrono::steady_clock::now() >= deadline) {
             client.reset(); // never reuse a stream with an incomplete response
-            throw Error("HTTP request failed or exceeded its deadline");
+            // A short object's size cap may abort a much larger error document.
+            // Its parsed HTTP status is still authoritative (notably 404 after
+            // compaction); an incomplete successful response remains an error.
+            throw Error("HTTP request failed or exceeded its deadline", 0,
+                        response.status >= 400 ? response.status : 0);
         }
         result.status = response.status;
         for (auto &header : response.headers) {
