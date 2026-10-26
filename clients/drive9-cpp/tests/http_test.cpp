@@ -1,4 +1,4 @@
-#include "drive9/client.hpp"
+#include "../src/internal.hpp"
 #include <httplib.h>
 #include <future>
 #include <iostream>
@@ -40,6 +40,36 @@ int main(int argc, char **argv) {
         auto first = std::async(std::launch::async, download);
         auto second = std::async(std::launch::async, download);
         first.get(); second.get();
+#if defined(__linux__) && defined(TCP_QUICKACK)
+        // A real tiny TCP receive window reproduces the 2 KiB / delayed-ACK
+        // cadence seen in concurrent Linux scans. Exercise the same ACK hook
+        // without capping production receive buffers or disabling keep-alive.
+        for (bool acknowledge : {false, true}) {
+            httplib::Client constrained(base);
+            constrained.set_socket_options([](int socket) {
+                int size = 1024;
+                if (::setsockopt(socket, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size)))
+                    throw Error("Unable to constrain the fixture receive window");
+            });
+            constrained.set_read_timeout(2s);
+            constrained.set_max_timeout(2s);
+            std::string received;
+            httplib::Request request; request.method = "GET"; request.path = "/block";
+            request.content_receiver = [&](const char *data, size_t length, uint64_t, uint64_t) {
+                received.append(data, length);
+                if (acknowledge) detail::AcknowledgeRead(constrained.socket());
+                return true;
+            };
+            httplib::Response response; httplib::Error error;
+            auto before = std::chrono::steady_clock::now();
+            bool ok = constrained.send(request, response, error);
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - before).count();
+            std::cout << "Constrained TCP window, quick acknowledgements=" << acknowledge
+                      << ": " << elapsed << " ms, " << received.size() << " bytes\n";
+            if (acknowledge && (!ok || received != block))
+                throw Error("Quick acknowledgements did not recover a constrained receive window");
+        }
+#endif
         // Force close_notify after the server applies the request but before
         // cpp-httplib's post-write peer check. The out-of-band HTTP barrier
         // removes timing guesses from this TLS acknowledgement-loss window.

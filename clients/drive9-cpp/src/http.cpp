@@ -1,10 +1,22 @@
-#include "drive9/client.hpp"
+#include "internal.hpp"
 #include <httplib.h>
 #include <algorithm>
 #include <condition_variable>
 #include <mutex>
 
 namespace drive9 {
+namespace detail {
+void AcknowledgeRead(int socket) {
+#if defined(__linux__) && defined(TCP_QUICKACK)
+    int enabled = 1;
+    // QUICKACK is temporary. Re-arm after consuming each response fragment;
+    // this retains kernel receive-buffer autotuning and HTTP keep-alive.
+    (void)::setsockopt(socket, IPPROTO_TCP, TCP_QUICKACK, &enabled, sizeof(enabled));
+#else
+    (void)socket;
+#endif
+}
+} // namespace detail
 namespace {
 struct URL {
     std::string origin, path;
@@ -95,6 +107,7 @@ public:
         request.content_receiver = [&](const char *data, size_t length, uint64_t, uint64_t) {
             if (std::chrono::steady_clock::now() >= deadline || length > max_response - result.body.size()) return false;
             result.body.append(data, length);
+            detail::AcknowledgeRead(client->socket());
             return true;
         };
         httplib::Response response;

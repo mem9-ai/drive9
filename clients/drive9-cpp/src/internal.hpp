@@ -3,6 +3,8 @@
 #include <mutex>
 
 namespace drive9::detail {
+// Linux delayed acknowledgements can stall a small receive window repeatedly.
+void AcknowledgeRead(int socket);
 std::string DecodeBase64(const Json &value);
 std::string EncodeBase64(std::string_view value);
 std::string Timestamp();
