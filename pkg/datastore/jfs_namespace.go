@@ -266,10 +266,22 @@ func (s *Store) jfsMknodTx(ctx context.Context, tx *sql.Tx, parent uint64, name 
 		}
 	}
 	if typ == jfsTypeDir && projPath != "" {
-		dirPath := projPath
-		if !strings.HasSuffix(dirPath, "/") {
-			dirPath += "/"
+		dirPath, err := pathutil.CanonicalizeDir(projPath)
+		if err != nil {
+			return 0, nil, int(syscall.EINVAL), err
 		}
+		created, err := s.ensureDirectoryTreeWithExecer(ctx, tx, dirPath, func() string { return strings.ToLower(ulid.Make().String()) })
+		if err != nil {
+			return 0, nil, 0, err
+		}
+		for _, id := range created {
+			if id == deterministicNodeID(dirPath) {
+				if _, err := tx.Exec(`UPDATE inodes SET mode = ? WHERE `+s.scope.And(`inode_id = ?`), append([]any{mode}, s.scope.Args(id)...)...); err != nil {
+					return 0, nil, 0, err
+				}
+			}
+		}
+
 		// Recording the directory's jfs inode is what lets a later recursive
 		// delete find and drop its subtree, so a failure here must abort.
 		if _, err := tx.Exec(`UPDATE file_nodes SET extent_ino = ? WHERE `+s.scope.And(`path_hash = ? AND path = ?`),
@@ -752,6 +764,12 @@ func (s *Store) jfsRmdirTx(tx *sql.Tx, parent uint64, name, projPath string) (ui
 	if _, err := tx.Exec(`DELETE FROM jfs_edge WHERE parent = ? AND name = ?`, parent, []byte(name)); err != nil {
 		return 0, nil, 0, err
 	}
+	// The projection must disappear in the same transaction as the extent edge.
+	if projPath != "" {
+		if _, err := tx.Exec(`DELETE FROM file_nodes WHERE `+s.scope.And(`path_hash = ? AND path = ?`), s.scope.Args(fileNodePathHash(projPath), projPath)...); err != nil {
+			return 0, nil, 0, err
+		}
+	}
 	if _, err := tx.Exec(`DELETE FROM jfs_node WHERE inode = ?`, ino); err != nil {
 		return 0, nil, 0, err
 	}
@@ -772,6 +790,27 @@ func (s *Store) jfsRenameTx(ctx context.Context, tx *sql.Tx, srcParent uint64, s
 	ino, attr, eno, err := s.jfsLookupForUpdateTx(tx, srcParent, srcName)
 	if err != nil || eno != 0 {
 		return 0, 0, nil, nil, eno, err
+	}
+	if attr.Typ == jfsTypeDir {
+		// Recover the source projection before moving it when callers omit
+		// the optional path hint. Never interpret an absent source as root.
+		if srcPath == "" {
+			var path string
+			err := tx.QueryRow(`SELECT path FROM file_nodes WHERE `+s.scope.And(`extent_ino = ? AND is_directory = 1`)+` LIMIT 1 FOR UPDATE`, s.scope.Args(ino)...).Scan(&path)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return 0, 0, nil, nil, 0, err
+			}
+			srcPath = path
+		}
+		for _, path := range []*string{&srcPath, &dstPath} {
+			if *path != "" {
+				canonical, err := pathutil.CanonicalizeDir(*path)
+				if err != nil {
+					return 0, 0, nil, nil, int(syscall.EINVAL), err
+				}
+				*path = canonical
+			}
+		}
 	}
 	if flags&jfsRenameExchange != 0 {
 		return 0, 0, attr, nil, int(syscall.ENOTSUP), nil
@@ -864,6 +903,11 @@ func (s *Store) jfsRenameTx(ctx context.Context, tx *sql.Tx, srcParent uint64, s
 		if err := s.jfsMoveProjectionTx(tx, ino, srcPath, srcName, dstPath); err != nil {
 			return 0, 0, nil, nil, 0, err
 		}
+		if attr.Typ == jfsTypeDir && srcPath != "" {
+			if err := s.jfsMoveProjectionSubtreeTx(tx, srcPath, dstPath); err != nil {
+				return 0, 0, nil, nil, 0, err
+			}
+		}
 	}
 	return ino, 0, attr, nil, 0, nil
 }
@@ -934,6 +978,45 @@ func (s *Store) jfsMoveProjectionTx(tx *sql.Tx, extentIno uint64, srcPath, srcNa
 // most expensive op in the data plane. It also dropped the per-child errno, so
 // an edge whose node row had gone missing produced a dirent with no attributes
 // instead of being skipped.
+func (s *Store) jfsMoveProjectionSubtreeTx(tx *sql.Tx, srcPath, dstPath string) error {
+	oldPrefix := strings.TrimSuffix(srcPath, "/") + "/"
+	newPrefix := strings.TrimSuffix(dstPath, "/") + "/"
+	if oldPrefix == newPrefix {
+		return nil
+	}
+	rows, err := tx.Query(`SELECT path FROM file_nodes WHERE `+
+		s.scope.And(`(path = ? OR path LIKE ?)`)+` ORDER BY path FOR UPDATE`,
+		s.scope.Args(oldPrefix, likeLiteralPrefixPattern(oldPrefix))...)
+	if err != nil {
+		return err
+	}
+	var paths []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		paths = append(paths, p)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, p := range paths {
+		np := newPrefix + strings.TrimPrefix(p, oldPrefix)
+		setArgs := []any{np, fileNodePathHash(np), pathutil.ParentPath(np), fileNodePathHash(pathutil.ParentPath(np)), pathutil.BaseName(np)}
+		if _, err := tx.Exec(`UPDATE file_nodes SET path = ?, path_hash = ?, parent_path = ?, parent_path_hash = ?, name = ? WHERE `+
+			s.scope.And(`path_hash = ? AND path = ?`),
+			append(setArgs, s.scope.Args(fileNodePathHash(p), p)...)...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Store) jfsReaddirTx(db execer, ino uint64, limit int) ([]map[string]any, error) {
 	q := `SELECT e.name, e.inode, n.type, n.mode, n.uid, n.gid,
 			n.atime, n.mtime, n.ctime, n.atimensec, n.mtimensec, n.ctimensec,
