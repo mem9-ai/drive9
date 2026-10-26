@@ -37,6 +37,8 @@ public:
     bool exists = false, guarded = true, fail_ack = false, fail_put = false, removed = false;
     bool gate_put = false, put_entered = false, gate_get = false, get_entered = false;
     bool binding_change = false, refresh_auth = false;
+    std::string corrupt_op;
+    Json corrupt_errno;
     Json credential = {{"scheme", "s3"}, {"endpoint", "http://object.test"}, {"bucket", "bucket"},
                        {"prefix", "tenant/"}, {"access_key_id", "test-access"}, {"secret_access_key", "test-secret"},
                        {"region", "us-east-1"}, {"force_path_style", true}};
@@ -102,6 +104,7 @@ public:
                 if (fail_ack) throw Error("write committed but acknowledgement was lost");
             }
         } else if (op == "truncate") { attr["Length"] = request.at("length"); response["attr"] = attr; maps.clear(); }
+        if (op == corrupt_op) response["errno"] = corrupt_errno;
         return {200, {}, response.dump()};
     }
     std::shared_ptr<Client> ClientFor() {
@@ -141,6 +144,14 @@ void LostPublicationAck() {
     Fails([&] { fs.WriteAt(file, "abc", 3, 0); }, "failed session replayed a mutation");
     Check(f.publications == 1 && f.puts == 1, "ambiguous mutation was replayed");
     Fails([&] { fs.Sync(file); }, "sync succeeded after ambiguous write");
+}
+void MalformedAcknowledgement() {
+    for (auto bad : {Json(uint64_t(1) << 32), Json(-1), Json("0"), Json(nullptr), Json(1.5)}) {
+        Fixture f; ExtentFileSystem fs(f.ClientFor()); auto file = fs.Open("/data", {true, true});
+        f.corrupt_op = "getattr"; f.corrupt_errno = bad;
+        Fails([&] { fs.Stat("/data"); }, "malformed errno acknowledgement was accepted");
+        Fails([&] { fs.Sync(file); }, "malformed metadata acknowledgement did not fail the session");
+    }
 }
 void UploadFailure() {
     Fixture f; ExtentFileSystem fs(f.ClientFor()); auto file = fs.Open("/data", {true, true});
@@ -238,7 +249,7 @@ void GCSScopedTransport() {
 }
 int main() {
     try {
-        PathsAndSlices(); DurableSparseAndReferences(); LostPublicationAck(); UploadFailure(); LatePutRejected();
+        PathsAndSlices(); DurableSparseAndReferences(); LostPublicationAck(); MalformedAcknowledgement(); UploadFailure(); LatePutRejected();
         ParallelReadsAndClose(); CredentialBindingAndRefresh(); LeaseAndLegacy(); GCSScopedTransport();
         std::cout << "C++ SDK protocol and fault tests passed\n";
     } catch (const std::exception &error) { std::cerr << error.what() << '\n'; return 1; }

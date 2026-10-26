@@ -74,6 +74,10 @@ Json Client::ExtentMeta(const std::string &op, const Json &body, Deadline deadli
         auto result = Json::parse(response.body);
         if (!result.is_object() || !result.contains("errno") || !result.at("errno").is_number_integer())
             throw Error("Invalid extent metadata acknowledgement");
+        const auto &code = result.at("errno");
+        if ((code.is_number_unsigned() && code.get<uint64_t>() > 4095) ||
+            (!code.is_number_unsigned() && (code.get<int64_t>() < 0 || code.get<int64_t>() > 4095)))
+            throw Error("Invalid extent metadata errno");
         return result;
     } catch (const Json::exception &) { throw Error("Invalid extent metadata acknowledgement"); }
 }
