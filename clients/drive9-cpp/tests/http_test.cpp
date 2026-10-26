@@ -139,10 +139,9 @@ int main(int argc, char **argv) {
         auto second = std::async(std::launch::async, download);
         first.get(); second.get();
 #if defined(__linux__) && defined(TCP_QUICKACK)
-        // Deliberately disable receive autotuning and shrink an established
-        // window below its negotiated MSS. This is a deadline/recovery fault,
-        // not a throughput contract: QUICKACK cannot override TCP flow control.
-        // Exercise both modes so neither can escape the request deadline.
+        // Reproduce receive-window starvation by shrinking an established
+        // connection below its negotiated MSS. The unprotected stream remains
+        // deadline-bounded; the receive-buffer repair must deliver every byte.
         for (bool acknowledge : {false, true}) {
             httplib::Client constrained(base);
             constrained.set_keep_alive(true);
@@ -150,6 +149,14 @@ int main(int argc, char **argv) {
             constrained.set_max_timeout(2s);
             auto ready = constrained.Get("/ok");
             if (!ready || ready->body != "ok") throw Error("Unable to establish the fixture connection");
+            int original = 0, unchanged = 0;
+            socklen_t option_length = sizeof(original);
+            if (::getsockopt(constrained.socket(), SOL_SOCKET, SO_RCVBUF, &original, &option_length))
+                throw Error("Unable to read the initial receive buffer");
+            detail::AcknowledgeRead(constrained.socket());
+            option_length = sizeof(unchanged);
+            if (::getsockopt(constrained.socket(), SOL_SOCKET, SO_RCVBUF, &unchanged, &option_length) ||
+                original != unchanged) throw Error("Normal receive-buffer autotuning was changed");
             // Shrink after SYN negotiation to retain the original large
             // MSS/window scale and force slow window updates.
             int window = 1024;
@@ -167,12 +174,14 @@ int main(int argc, char **argv) {
             auto before = std::chrono::steady_clock::now();
             bool ok = constrained.send(request, response, error);
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - before).count();
-            std::cout << "Constrained TCP window, quick acknowledgements=" << acknowledge
+            std::cout << "Constrained TCP window, buffer repair=" << acknowledge
                       << ": " << elapsed << " ms, " << received.size() << " bytes\n";
             if (elapsed > 2500 || (!ok && elapsed < 1800))
                 throw Error("Constrained receive window escaped its request deadline");
             if (ok && received != block)
                 throw Error("Constrained receive window accepted a partial block");
+            if (acknowledge && (!ok || received != block))
+                throw Error("Receive-buffer repair did not recover the constrained connection");
             constrained.stop();
             auto recovered = transport->Request("GET", base + "/block", {}, {}, deadline(), block.size());
             if (recovered.body != block) throw Error("Download failed after a constrained-window timeout");

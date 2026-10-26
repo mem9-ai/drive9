@@ -8,10 +8,21 @@ namespace drive9 {
 namespace detail {
 void AcknowledgeRead(int socket) {
 #if defined(__linux__) && defined(TCP_QUICKACK)
-    int enabled = 1;
-    // QUICKACK is temporary. Re-arm after consuming each response fragment;
-    // this retains kernel receive-buffer autotuning and HTTP keep-alive.
-    (void)::setsockopt(socket, IPPROTO_TCP, TCP_QUICKACK, &enabled, sizeof(enabled));
+    // Affected Linux loopback connections have been observed with sk_rcvbuf
+    // collapsed to 1371 bytes, advertising only 2 KiB and retransmitting every
+    // ~208 ms. ACK hints alone cannot repair that receive-window starvation.
+    // Preserve normal autotuning; only pin a buffer on an abnormally small
+    // connection. SO_RCVBUF remains subject to the host's rmem_max limit.
+    int receive_buffer = 0;
+    socklen_t length = sizeof(receive_buffer);
+    if (::getsockopt(socket, SOL_SOCKET, SO_RCVBUF, &receive_buffer, &length) == 0 &&
+        receive_buffer < 64 * 1024) {
+        int restored = 1024 * 1024;
+        if (::setsockopt(socket, SOL_SOCKET, SO_RCVBUF, &restored, sizeof(restored)) == 0) {
+            int enabled = 1;
+            (void)::setsockopt(socket, IPPROTO_TCP, TCP_QUICKACK, &enabled, sizeof(enabled));
+        }
+    }
 #else
     (void)socket;
 #endif

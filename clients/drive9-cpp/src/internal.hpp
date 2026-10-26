@@ -10,7 +10,7 @@ struct ExtentTestAccess {
 }
 
 namespace drive9::detail {
-// Linux delayed acknowledgements can stall a small receive window repeatedly.
+// Repair an abnormally shrunken Linux receive buffer, then advertise its window.
 void AcknowledgeRead(int socket);
 std::string DecodeBase64(const Json &value);
 std::string EncodeBase64(std::string_view value);
