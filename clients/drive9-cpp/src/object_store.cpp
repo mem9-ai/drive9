@@ -160,7 +160,7 @@ Response ObjectStore::Request(const std::string &method, const std::string &key,
             return response;
         }
         Headers headers;
-        std::string url;
+        std::string url, http_method = method;
         if (scheme == "s3") {
             while (endpoint.back() == '/') endpoint.pop_back();
             auto start = endpoint.find("://") + 3, split = endpoint.find('/', start);
@@ -194,13 +194,14 @@ Response ObjectStore::Request(const std::string &method, const std::string &key,
             if (method == "GET") url = endpoint + "b/" + bucket + "/o/" + UrlEncode(object) + "?alt=media";
             else {
                 // JSON API media upload, not a filesystem-specific protocol.
+                http_method = "POST";
                 endpoint.replace(endpoint.size() - 12, 12, "/upload/storage/v1/");
                 url = endpoint + "b/" + bucket + "/o?name=" + UrlEncode(object) + "&uploadType=media";
             }
         }
         headers["Content-Type"] = "application/octet-stream";
         try {
-            auto response = client_->Transport()->Request(method, url, headers, data, deadline, max_response);
+            auto response = client_->Transport()->Request(http_method, url, headers, data, deadline, max_response);
             if (response.status >= 200 && response.status < 300) return response;
             if (response.status != 401 && response.status != 403 && response.status != 408 && response.status != 429 && response.status < 500)
                 throw Error("Object storage request rejected", 0, response.status);

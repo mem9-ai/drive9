@@ -314,8 +314,12 @@ struct ExtentFileSystem::Impl {
     }
 };
 
-ExtentFileSystem::ExtentFileSystem(std::shared_ptr<Client> client, ExtentOptions options)
-    : impl_(std::make_unique<Impl>(std::move(client), options)) {}
+ExtentFileSystem::ExtentFileSystem(std::shared_ptr<Client> client, ExtentOptions options) {
+    if (!client) throw Error("Extent filesystem requires an HTTP client");
+    if (options.heartbeat < std::chrono::seconds(1) || options.heartbeat > std::chrono::minutes(10) || options.mapping_ttl.count() < 0)
+        throw Error("Invalid extent heartbeat or cache configuration");
+    impl_ = std::make_unique<Impl>(std::move(client), options);
+}
 ExtentFileSystem::~ExtentFileSystem() = default;
 uint64_t ExtentFileSystem::SessionID() const { return impl_->sid; }
 bool ExtentFileSystem::SessionGuardSupported() const { return impl_->guard_supported; }

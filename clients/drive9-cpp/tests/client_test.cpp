@@ -190,19 +190,56 @@ void CredentialBindingAndRefresh() {
     Check(success.mints == 2 && success.publications == 1, "scoped credentials were not renewed");
 }
 void LeaseAndLegacy() {
+    Fixture invalid;
+    Fails([&] { ExtentFileSystem fs(invalid.ClientFor(), ExtentOptions{999ms}); }, "invalid heartbeat accepted");
+    Check(invalid.mints == 0, "invalid heartbeat contacted the server");
+    Fails([] { ExtentFileSystem fs(nullptr); }, "null client accepted");
     Fixture legacy; legacy.guarded = false;
     Fails([&] { ExtentFileSystem fs(legacy.ClientFor(), ExtentOptions{1000ms}); }, "short legacy lease accepted");
     Fixture expired; ExtentFileSystem fs(expired.ClientFor(), ExtentOptions{1000ms});
     auto file = fs.Open("/data", {true, true});
     { std::lock_guard<std::mutex> lock(expired.mu); expired.removed = true; }
-    std::this_thread::sleep_for(1200ms);
+    auto deadline = std::chrono::steady_clock::now() + 4s;
+    bool stopped = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+        try { fs.Sync(file); }
+        catch (const Error &) { stopped = true; break; }
+        std::this_thread::sleep_for(5ms);
+    }
+    Check(stopped, "session did not stop after failed renewal");
     Fails([&] { fs.WriteAt(file, "x", 1, 0); }, "failed renewal allowed writes");
     Check(expired.puts == 0, "write uploaded after losing its session");
+}
+void GCSScopedTransport() {
+    struct GCS : HttpTransport {
+        std::vector<std::string> urls;
+        int mints = 0;
+        Response Request(const std::string &method, const std::string &url, const Headers &headers,
+                         std::string_view body, Deadline, size_t) override {
+            if (url == "http://fs.test/v1/data-credential") {
+                ++mints;
+                return {200, {}, Json({{"scheme", "gcs"}, {"endpoint", "https://storage.test/storage/v1/"},
+                    {"bucket", "my-bucket"}, {"prefix", "tenant/"}, {"access_token", "scoped-object-token"}}).dump()};
+            }
+            Check(headers.at("Authorization") == "Bearer scoped-object-token", "GCS used the control-plane token");
+            urls.push_back(url);
+            if (url.find("/upload/") != std::string::npos)
+                Check(method == "POST" && body == std::string_view("binary\0bytes", 12), "GCS media upload method/body mismatch");
+            return {200, {}, method == "GET" ? std::string("binary\0bytes", 12) : "{}"};
+        }
+    };
+    auto transport = std::make_shared<GCS>();
+    auto client = std::make_shared<Client>(ClientOptions{"http://fs.test", "control-secret", 30000ms, transport});
+    detail::ObjectStore store(client);
+    store.Put("chunks/a+b", std::string_view("binary\0bytes", 12), std::chrono::steady_clock::now() + 1s);
+    Check(store.Get("chunks/a+b", 12, std::chrono::steady_clock::now() + 1s) == std::string("binary\0bytes", 12), "GCS download changed bytes");
+    Check(transport->urls.at(0) == "https://storage.test/upload/storage/v1/b/my-bucket/o?name=tenant%2Fchunks%2Fa%2Bb&uploadType=media", "GCS upload URL mismatch");
+    Check(transport->urls.at(1) == "https://storage.test/storage/v1/b/my-bucket/o/tenant%2Fchunks%2Fa%2Bb?alt=media", "GCS download URL mismatch");
 }
 int main() {
     try {
         PathsAndSlices(); DurableSparseAndReferences(); LostPublicationAck(); UploadFailure(); LatePutRejected();
-        ParallelReadsAndClose(); CredentialBindingAndRefresh(); LeaseAndLegacy();
+        ParallelReadsAndClose(); CredentialBindingAndRefresh(); LeaseAndLegacy(); GCSScopedTransport();
         std::cout << "C++ SDK protocol and fault tests passed\n";
     } catch (const std::exception &error) { std::cerr << error.what() << '\n'; return 1; }
 }

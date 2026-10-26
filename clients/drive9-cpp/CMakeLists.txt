@@ -7,6 +7,7 @@ option(DRIVE9_CPP_TESTS "Build the standalone C++ SDK tests" ON)
 find_package(OpenSSL REQUIRED)
 find_package(Threads REQUIRED)
 include(FetchContent)
+set(BUILD_SHARED_LIBS OFF) # utf8proc must stay inside the consumer's native library
 set(UTF8PROC_INSTALL OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(utf8proc
   URL https://codeload.github.com/JuliaStrings/utf8proc/tar.gz/refs/tags/v2.10.0
