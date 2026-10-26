@@ -9,6 +9,7 @@ package fuse
 // here alongside.
 
 import (
+	"errors"
 	"syscall"
 	"testing"
 	"time"
@@ -415,5 +416,69 @@ func TestDetachKeepsSiblingAliases(t *testing.T) {
 	}
 	if got, ok := m.GetInode("/a"); !ok || got != ino {
 		t.Fatalf("sibling alias /a = %d/%v, want %d/true", got, ok, ino)
+	}
+}
+
+// A hardlink-identity rejoin of a detached entry (a tombstone whose name a
+// different-kind object now owns) must adopt the NEW path as its primary,
+// clear the unlinked marker, and never seed the stale tombstone path back
+// into its alias set — inode-addressed operations would otherwise keep
+// dispatching through the dead name.
+func TestReattachDetachedEntryAdoptsLivePath(t *testing.T) {
+	m := NewInodeToPath()
+	ino := m.LookupWithIdentity("/a", "res-1", 1, false, 0, time.Now())
+	m.Lookup("/a", true, 0, time.Now()) // kind conflict detaches /a
+
+	if got := m.LookupWithIdentity("/b", "res-1", 1, false, 0, time.Now()); got != ino {
+		t.Fatalf("identity rejoin = %d, want %d", got, ino)
+	}
+	if p, ok := m.GetPath(ino); !ok || p != "/b" {
+		t.Fatalf("reattached Path = %q/%v, want /b", p, ok)
+	}
+	e, ok := m.GetEntry(ino)
+	if !ok || e.Unlinked {
+		t.Fatal("reattached entry still marked unlinked")
+	}
+	if _, stale := e.Paths["/a"]; stale {
+		t.Fatal("stale tombstone path seeded into the alias set")
+	}
+}
+
+// An open descriptor whose dentry was already forgotten (Nlookup 0 via
+// ForgetKeepMapping) still resolves through its nodeid: detaching its path
+// must keep the entry until the descriptor closes (HasLiveUse veto).
+func TestDetachKeepsEntryWhileDescriptorLive(t *testing.T) {
+	m := NewInodeToPath()
+	m.HasLiveUse = func(ino uint64) bool { return true }
+	dirIno := m.EnsureInode("/d", true, 0, time.Now())
+
+	fileIno := m.Lookup("/d", false, 0, time.Now())
+	if fileIno == dirIno {
+		t.Fatalf("kind conflict reused the seeded inode %d", dirIno)
+	}
+	if _, ok := m.GetEntry(dirIno); !ok {
+		t.Fatal("entry released while a live descriptor still resolves it")
+	}
+}
+
+// A path-level setattr (no descriptor) on a detached inode has no name to
+// mutate: it must answer ENOENT without dispatching through the tombstone
+// path, which a later reclaim can point at a NEW object at that name.
+func TestSetAttrOnDetachedInodeWithoutHandleIsENOENT(t *testing.T) {
+	f, err := New(Options{Extensions: []fs.Handler{&errCore{err: errors.New("dispatched on detached path")}}, Uid: 1000, Gid: 1000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dirIno := f.inodes.Lookup("/d", true, 0, time.Now())
+	f.inodes.Lookup("/d", false, 0, time.Now()) // kind conflict detaches /d
+
+	var out gofuse.AttrOut
+	input := &gofuse.SetAttrIn{}
+	input.NodeId = dirIno
+	input.Uid = 1000
+	input.Valid = gofuse.FATTR_MODE
+	input.Mode = 0o755
+	if st := f.SetAttr(nil, input, &out); st != gofuse.ENOENT {
+		t.Fatalf("SetAttr on detached inode = %v, want ENOENT", st)
 	}
 }

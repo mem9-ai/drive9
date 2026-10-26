@@ -54,6 +54,13 @@ type InodeToPath struct {
 	byPath  map[string]uint64
 	byID    map[string]uint64
 	nextIno uint64
+
+	// HasLiveUse, when set, vetoes releasing a detached unreferenced entry
+	// while something still resolves through the inode: an open descriptor
+	// whose dentry was already forgotten (Nlookup 0 via ForgetKeepMapping)
+	// keeps dispatching by nodeid and needs GetPath until it closes. Nil
+	// disables the veto (no descriptor tracking).
+	HasLiveUse func(ino uint64) bool
 }
 
 // NewInodeToPath creates a new InodeToPath initialized with the root inode
@@ -1059,8 +1066,11 @@ func (m *InodeToPath) detachPathLocked(entry *InodeEntry, path string) {
 		}
 		entry.Unlinked = true
 		// A READDIR-seeded entry (EnsureInode*, Nlookup == 0) never gets a
-		// FORGET: release it here instead of leaking a pathless entry.
-		if entry.Nlookup <= 0 && !shouldKeepForgetMapping(entry) {
+		// FORGET: release it here instead of leaking a pathless entry —
+		// unless a live descriptor still resolves through the inode (its
+		// dentry can be forgotten, Nlookup 0, while the fd stays open).
+		if entry.Nlookup <= 0 && !shouldKeepForgetMapping(entry) &&
+			(m.HasLiveUse == nil || !m.HasLiveUse(entry.Ino)) {
 			m.removeEntryLocked(entry.Ino, entry)
 		}
 		return
@@ -1077,14 +1087,21 @@ func (m *InodeToPath) detachPathLocked(entry *InodeEntry, path string) {
 func (m *InodeToPath) addPathLocked(entry *InodeEntry, path string) {
 	if entry.Paths == nil {
 		entry.Paths = make(map[string]struct{})
-		if entry.Path != "" {
+		if entry.Path != "" && !entry.Unlinked {
+			// Seed with the primary path only while it is a live alias; a
+			// detached entry's Path is a tombstone name it no longer owns.
 			entry.Paths[entry.Path] = struct{}{}
 		}
 	}
 	entry.Paths[path] = struct{}{}
 	m.byPath[path] = entry.Ino
-	if entry.Path == "" {
+	if entry.Path == "" || (entry.Unlinked && len(entry.Paths) == 1) {
+		// Reattaching a detached entry (tombstone or preserved-unlinked):
+		// the path just added is its only live name — adopt it as the
+		// primary and clear the detached marker, or inode-addressed
+		// operations keep dispatching through the stale tombstone path.
 		entry.Path = path
+		entry.Unlinked = false
 	}
 }
 

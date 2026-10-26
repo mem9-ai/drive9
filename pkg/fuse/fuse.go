@@ -219,6 +219,12 @@ func New(opts Options) (*FS, error) {
 	}
 	f.bypass = newKernelCacheBypassTable()
 	f.openIdx = NewOpenHandleIndex()
+	// A detached unreferenced entry must survive while an open descriptor
+	// still resolves through its nodeid (a forgotten dentry with a live fd
+	// holds no Nlookup reference the release check could see).
+	f.inodes.HasLiveUse = func(ino uint64) bool {
+		return len(f.openIdx.SnapshotInode(ino)) > 0
+	}
 	f.perf = perf.NewCounters(false)
 	f.attrTTL = opts.AttrTTL
 	if f.attrTTL <= 0 {
@@ -1699,6 +1705,15 @@ func (f *FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *gofus
 	caller := fs.CallerFrom(input.InHeader)
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
+	// A detached inode (its name was taken over by a different-kind
+	// object) has no name to mutate: a path-level setattr without a
+	// descriptor answers ENOENT right here instead of dispatching through
+	// the tombstone path, which a later reclaim can point at a NEW object
+	// at that name. Descriptor setattrs (FATTR_FH) stay on their handle.
+	if input.Valid&gofuse.FATTR_FH == 0 && input.Fh == 0 &&
+		entry != nil && entry.Unlinked && len(entry.Paths) == 0 {
+		return gofuse.ENOENT
+	}
 	// A path-level setattr (chmod/chown/truncate addressed by inode, no
 	// FATTR_FH) is a mutation of the name: without default_permissions the
 	// kernel does not check the path prefix, so the caller must hold SEARCH
