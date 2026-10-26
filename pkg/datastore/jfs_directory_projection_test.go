@@ -204,3 +204,58 @@ func TestExtentDirectoryProjectionRejectsMetadataOnlyCycle(t *testing.T) {
 		t.Fatalf("cycle rejection changed root edge errno=%d", eno)
 	}
 }
+
+func TestExtentDirectoryProjectionConcurrentCycleRejection(t *testing.T) {
+	s := newTestStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	for i, name := range []string{"a", "b"} {
+		raw, _ := json.Marshal(map[string]any{"parent": 1, "inode": 600 + i, "name": name, "type": 2, "mode": 0700, "attr": ExtentAttr{Typ: 2, Mode: 0700, Parent: 1, Nlink: 2, Full: true}})
+		if _, eno, err := s.RunExtentMetaOp(ctx, "mknod", raw, nil); err != nil || eno != 0 {
+			t.Fatalf("mkdir errno=%d err=%v", eno, err)
+		}
+	}
+	type result struct {
+		errno int
+		err   error
+	}
+	done := make(chan result, 2)
+	start := make(chan struct{})
+	for i, name := range []string{"a", "b"} {
+		go func(i int, name string) {
+			<-start
+			raw, _ := json.Marshal(map[string]any{"src_parent": 1, "src_name": name, "dst_parent": 601 - i, "dst_name": name})
+			_, eno, err := s.RunExtentMetaOp(ctx, "rename", raw, nil)
+			done <- result{eno, err}
+		}(i, name)
+	}
+	close(start)
+	successes, rejected := 0, 0
+	for i := 0; i < 2; i++ {
+		r := <-done
+		if r.err != nil {
+			t.Fatal(r.err)
+		}
+		switch r.errno {
+		case 0:
+			successes++
+		case int(syscall.EINVAL):
+			rejected++
+		default:
+			t.Fatalf("rename errno=%d", r.errno)
+		}
+	}
+	if successes != 1 || rejected != 1 {
+		t.Fatalf("opposite moves successes=%d rejected=%d", successes, rejected)
+	}
+	var a, b uint64
+	if err := s.db.QueryRowContext(ctx, `SELECT parent FROM jfs_node WHERE `+s.scope.And(`inode = ?`), s.scope.Args(600)...).Scan(&a); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT parent FROM jfs_node WHERE `+s.scope.And(`inode = ?`), s.scope.Args(601)...).Scan(&b); err != nil {
+		t.Fatal(err)
+	}
+	if a == 601 && b == 600 {
+		t.Fatal("opposite moves committed a directory cycle")
+	}
+}
