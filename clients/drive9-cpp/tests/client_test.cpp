@@ -28,7 +28,8 @@ class Fixture : public HttpTransport {
 public:
     std::mutex mu;
     std::condition_variable cv;
-    uint64_t counter = (1ULL << 53), sid = 0;
+    uint64_t counter = (1ULL << 53), sid = 0, inode = 42;
+    std::map<std::string, std::vector<std::pair<uint64_t, uint64_t>>> reservations;
     Json attr = {{"Typ", 1}, {"Length", 0}, {"Mtime", 0}};
     std::map<uint32_t, std::string> maps;
     std::map<std::string, std::string> objects;
@@ -76,17 +77,21 @@ public:
             Check(request.at("caller_sid").get<uint64_t>() == sid, "caller_sid lost 64-bit identity");
         Json response = {{"errno", 0}};
         if (op == "load") response["format"] = detail::EncodeBase64(Json({{"BlockSize", 4194304}}).dump());
-        else if (op == "incr_counter") response["value"] = ++counter;
+        else if (op == "incr_counter") {
+            auto delta = request.at("value").get<uint64_t>();
+            counter += delta; response["value"] = counter;
+            reservations[request.at("name").get<std::string>()].push_back({counter, delta});
+        }
         else if (op == "new_session") { sid = request.at("sid"); response["session_guard"] = guarded; }
         else if (op == "refresh_session" && removed) response["errno"] = 116;
         else if (op == "find_stale_sessions") response["sids"] = Json::array();
         else if (op == "getattr" || op == "lookup") {
             if (op == "lookup" && !exists) response["errno"] = 2;
             else {
-                response["inode"] = op == "getattr" ? request.at("inode") : Json(uint64_t(42));
+                response["inode"] = op == "getattr" ? request.at("inode") : Json(inode);
                 response["attr"] = response["inode"] == 1 ? Json({{"Typ", 2}, {"Length", 4096}}) : attr;
             }
-        } else if (op == "mknod") { exists = true; response["inode"] = 42; response["attr"] = attr; }
+        } else if (op == "mknod") { exists = true; inode = request.value("inode", uint64_t(42)); response["inode"] = inode; response["attr"] = attr; }
         else if (op == "open_ref") ++refs;
         else if (op == "delete_sustained") --refs;
         else if (op == "read") response["slices"] = detail::EncodeBase64(maps[request.at("indx").get<uint32_t>()]);
@@ -144,6 +149,20 @@ void LostPublicationAck() {
     Fails([&] { fs.WriteAt(file, "abc", 3, 0); }, "failed session replayed a mutation");
     Check(f.publications == 1 && f.puts == 1, "ambiguous mutation was replayed");
     Fails([&] { fs.Sync(file); }, "sync succeeded after ambiguous write");
+}
+void CompatibleIDReservations() {
+    Fixture f; auto client = f.ClientFor(); ExtentFileSystem fs(client); auto file = fs.Open("/data", {true, true});
+    const auto inodes = f.reservations.at("nextInode").at(0);
+    Check(fs.Info(file).inode == inodes.first - inodes.second, "mknod did not use a reserved inode");
+    fs.WriteAt(file, "one", 3, 0); fs.WriteAt(file, "two", 3, 3);
+    const auto slices = f.reservations.at("nextChunk");
+    Check(slices.size() == 1 && slices[0].second == 4096, "slice allocation was not amortized");
+    std::vector<uint64_t> ids;
+    for (auto &call : f.calls) if (call.at("op") == "write") ids.push_back(call.at("body").at("slice").at("Id"));
+    Check(ids.size() == 2 && ids[0] == slices[0].first - 4096 && ids[1] == ids[0] + 1, "slice IDs escaped the half-open reservation");
+    auto next = client->ExtentMeta("incr_counter", {{"name", "nextChunk"}, {"value", 4096}, {"caller_sid", fs.SessionID()}});
+    auto next_begin = next.at("value").get<uint64_t>() - 4096;
+    Check(ids.back() < next_begin, "IDs overlap the next Go/SDK allocation");
 }
 void MalformedAcknowledgement() {
     for (auto bad : {Json(uint64_t(1) << 32), Json(-1), Json("0"), Json(nullptr), Json(1.5)}) {
@@ -249,7 +268,7 @@ void GCSScopedTransport() {
 }
 int main() {
     try {
-        PathsAndSlices(); DurableSparseAndReferences(); LostPublicationAck(); MalformedAcknowledgement(); UploadFailure(); LatePutRejected();
+        PathsAndSlices(); DurableSparseAndReferences(); CompatibleIDReservations(); LostPublicationAck(); MalformedAcknowledgement(); UploadFailure(); LatePutRejected();
         ParallelReadsAndClose(); CredentialBindingAndRefresh(); LeaseAndLegacy(); GCSScopedTransport();
         std::cout << "C++ SDK protocol and fault tests passed\n";
     } catch (const std::exception &error) { std::cerr << error.what() << '\n'; return 1; }

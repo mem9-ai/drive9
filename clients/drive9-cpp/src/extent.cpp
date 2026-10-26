@@ -72,6 +72,7 @@ struct ExtentFileSystem::Impl {
     ExtentOptions options;
     detail::ObjectStore objects;
     uint64_t sid = 0, next_handle = 0;
+    uint64_t next_slice = 0, slice_limit = 0, next_inode = 0, inode_limit = 0;
     bool guard_supported = false, hash_prefix = false, closed = false;
     std::atomic<bool> failed{false};
     std::atomic<int64_t> expiry_ticks{INT64_MAX};
@@ -238,6 +239,25 @@ struct ExtentFileSystem::Impl {
     void DropRef(const std::shared_ptr<Node> &node) {
         if (--node->refs == 0) Meta("delete_sustained", {{"inode", node->info.inode}, {"sid", sid}});
     }
+    uint64_t Allocate(const char *name, uint64_t batch, uint64_t &next, uint64_t &limit) {
+        if (next == limit) {
+            auto result = Meta("incr_counter", {{"name", name}, {"value", batch}});
+            const auto &value = result.at("value");
+            if (!value.is_number_integer() || (!value.is_number_unsigned() && value.get<int64_t>() < 0)) {
+                failed.store(true); throw Error("Invalid allocated ID range");
+            }
+            limit = value.get<uint64_t>();
+            if (limit <= batch || limit > uint64_t(INT64_MAX)) {
+                failed.store(true); throw Error("Invalid allocated ID range");
+            }
+            // Exactly the existing JuiceFS/drive9 reservation convention:
+            // incr_counter returns the EXCLUSIVE upper bound, not an ID.
+            next = limit - batch;
+        }
+        return next++;
+    }
+    uint64_t NewInode() { return Allocate("nextInode", 1024, next_inode, inode_limit); }
+    uint64_t NewSlice() { return Allocate("nextChunk", 4096, next_slice, slice_limit); }
     std::string Key(uint64_t id, uint32_t block, uint32_t size) const {
         auto key = std::to_string(id / 1000000) + "/" + std::to_string(id / 1000) + "/" +
                    std::to_string(id) + "_" + std::to_string(block) + "_" + std::to_string(size);
@@ -340,7 +360,7 @@ uint64_t ExtentFileSystem::Open(const std::string &input, OpenOptions options) {
     if (info.exists && options.exclusive) throw Error("File already exists", 17);
     if (!info.exists && options.create) {
         try {
-            info = ParseInfo(s.Meta("mknod", {{"parent", parent.first}, {"name", parent.second}, {"type", 1},
+            info = ParseInfo(s.Meta("mknod", {{"parent", parent.first}, {"name", parent.second}, {"type", 1}, {"inode", s.NewInode()},
                                               {"mode", 0600}, {"proj_path", path}, {"attr", Json::object()}}));
         } catch (const Error &error) {
             if (error.code != 17 || options.exclusive) throw;
@@ -422,8 +442,7 @@ void ExtentFileSystem::WriteAt(uint64_t handle, const void *buffer, size_t lengt
         for (size_t done = 0; done < length;) {
             auto index = uint32_t((offset + done) / ChunkSize), pos = uint32_t((offset + done) % ChunkSize);
             auto count = uint32_t(std::min<uint64_t>(length - done, ChunkSize - pos));
-            auto id = s.Meta("incr_counter", {{"name", "nextChunk"}, {"value", 1}}).at("value").get<uint64_t>();
-            if (!id) throw Error("Invalid allocated slice ID");
+            auto id = s.NewSlice();
             for (uint32_t block = 0, at = 0; at < count; ++block) {
                 auto n = std::min(BlockSize, count - at);
                 s.objects.Put(s.Key(id, block, n), std::string_view(static_cast<const char *>(buffer) + done + at, n), s.DeadlineFor(std::chrono::seconds(60)));
@@ -458,7 +477,7 @@ void ExtentFileSystem::Close(uint64_t handle) {
 void ExtentFileSystem::Mkdir(const std::string &input) {
     auto &s = *impl_; std::unique_lock<std::shared_mutex> lock(s.lifetime); s.Ready();
     auto path = CanonicalPath(input); auto parent = s.Parent(path);
-    s.Meta("mknod", {{"parent", parent.first}, {"name", parent.second}, {"type", 2}, {"mode", 0700},
+    s.Meta("mknod", {{"parent", parent.first}, {"name", parent.second}, {"type", 2}, {"mode", 0700}, {"inode", s.NewInode()},
                       {"proj_path", path + "/"}, {"attr", Json::object()}});
 }
 void ExtentFileSystem::Remove(const std::string &input) {

@@ -62,6 +62,10 @@ Legacy servers remain usable with the default 12-second heartbeat, subject to
 their weaker stale-writer protection.
 
 Writes upload immutable 4 MiB blocks, then publish the existing slice metadata.
+Inodes and slice IDs use the existing batched `incr_counter` reservations:
+the returned value is the exclusive upper bound of the reserved range. This
+allows C++, Go and other extent clients to alternate writes without reusing
+an immutable object's ID. The client supplies its reserved inode to `mknod`.
 `WriteAt` returns only after both are acknowledged; `Sync` waits behind preceding
 writes. There is no background writeback. Shutdown waits for active reads and
 writes, stops heartbeats, expires its own session and invokes normal server
