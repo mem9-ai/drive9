@@ -30,6 +30,12 @@ type InodeEntry struct {
 	Rdev       uint32
 	Revision   int64 // server-side revision for cache validation
 	Unlinked   bool  // path was removed while open handles still reference this inode
+	// Detached marks a name taken over by a different-kind object while
+	// this inode may still be referenced (tombstone). Pathname resolution
+	// refuses the entry: the recorded Path names an object this inode no
+	// longer owns, and a later reclaim can point it at yet another one.
+	// Only descriptor-served operations may continue through their handle.
+	Detached bool
 	// ExtentIno is the JuiceFS inode for content_layout=extent files.
 	// Shared across hardlink aliases of the same FUSE inode.
 	ExtentIno uint64
@@ -54,6 +60,13 @@ type InodeToPath struct {
 	byPath  map[string]uint64
 	byID    map[string]uint64
 	nextIno uint64
+
+	// HasLiveUse, when set, vetoes releasing a detached unreferenced entry
+	// while something still resolves through the inode: an open descriptor
+	// whose dentry was already forgotten (Nlookup 0 via ForgetKeepMapping)
+	// keeps dispatching by nodeid and needs GetPath until it closes. Nil
+	// disables the veto (no descriptor tracking).
+	HasLiveUse func(ino uint64) bool
 }
 
 // NewInodeToPath creates a new InodeToPath initialized with the root inode
@@ -88,7 +101,7 @@ func (m *InodeToPath) LookupWithIdentity(path, resourceID string, nlink uint32, 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if ino, ok := m.byPath[path]; ok {
+	if ino := m.reusableInoAtLocked(path, isDir); ino != 0 {
 		entry := m.byInode[ino]
 		entry.Nlookup++
 		m.updateEntryLocked(entry, path, resourceID, nlink, isDir, size, mtime)
@@ -142,7 +155,7 @@ func (m *InodeToPath) EnsureInodeWithIdentity(path, resourceID string, nlink uin
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if ino, ok := m.byPath[path]; ok {
+	if ino := m.reusableInoAtLocked(path, isDir); ino != 0 {
 		entry := m.byInode[ino]
 		m.updateEntryLocked(entry, path, resourceID, nlink, isDir, size, mtime)
 		return ino
@@ -188,7 +201,7 @@ func (m *InodeToPath) EnsureInodeNoUpdate(path string, isDir bool, size int64, m
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if ino, ok := m.byPath[path]; ok {
+	if ino := m.reusableInoAtLocked(path, isDir); ino != 0 {
 		return ino
 	}
 
@@ -234,7 +247,40 @@ func (m *InodeToPath) GetPath(ino uint64) (string, bool) {
 	if !ok {
 		return "", false
 	}
+	// Shared path-resolution contract for every inode-addressed operation:
+	// a detached tombstone owns no name — its recorded Path names an object
+	// it no longer owns (and a later reclaim can hand that name to yet
+	// another object). Name-level callers answer ENOENT; only operations
+	// served through a live descriptor may continue, via the handle's own
+	// recorded path.
+	if entry.Detached {
+		return "", false
+	}
 	return entry.Path, true
+}
+
+// CollectDetached releases an already-detached entry once its kernel
+// lookup references AND live descriptor references have both ended. The
+// descriptor release paths (FS.Release / FS.ReleaseDir) call it: the final
+// FORGET may have arrived before the detach, so nothing else would reap
+// the tombstone.
+func (m *InodeToPath) CollectDetached(ino uint64) {
+	if ino == 1 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entry, ok := m.byInode[ino]
+	if !ok || !entry.Detached || entry.Nlookup > 0 {
+		return
+	}
+	if shouldKeepForgetMapping(entry) {
+		return
+	}
+	if m.HasLiveUse != nil && m.HasLiveUse(ino) {
+		return
+	}
+	m.removeEntryLocked(ino, entry)
 }
 
 // GetInode returns the inode number associated with the given path. The second
@@ -294,12 +340,27 @@ func (m *InodeToPath) Forget(ino uint64, nlookup uint64) {
 	}
 }
 
+// shouldKeepForgetMapping reports whether an entry whose last kernel lookup
+// reference is being forgotten must stay in the table anyway: it still owns
+// a name (a later LOOKUP on that path must find the same identity), or a
+// retention flag deliberately pins it.
 func shouldKeepForgetMapping(entry *InodeEntry) bool {
 	if entry == nil {
 		return false
 	}
+	// A tombstone — its last name was detached to a different-kind object
+	// (detachPathLocked) or removed under live handles — owns no name
+	// anymore. Once the kernel's last reference is forgotten nothing can
+	// reach it: release it instead of keeping a pathless entry forever.
+	// JuiceFS-backed inodes keep their identity mapping (rule below).
+	if entry.Unlinked && len(entry.Paths) == 0 && entry.ExtentIno == 0 {
+		return false
+	}
 	if entry.IsDir || entry.ResourceID != "" {
-		return true
+		// A pathless entry has nothing left to serve once the kernel's last
+		// reference is forgotten — release it instead of leaking one entry
+		// per replaced directory.
+		return entry.Path != ""
 	}
 	if entry.HasUID || entry.HasGID {
 		return true
@@ -999,17 +1060,89 @@ func inodeResourceKey(resourceID string, isDir bool) string {
 	return resourceID
 }
 
+// reusableInoAtLocked returns the inode a path's current mapping may be
+// reused for, or 0 when the mapping is stale or must not be reused for an
+// object of the requested kind. A kind change means a different object owns
+// the name now (create/mknod/symlink after rmdir, mkdir after a preserved
+// unlink): the kernel keeps the old nodeid alive until FORGET, and a
+// CREATE/MKNOD/SYMLINK/MKDIR reply that hands that nodeid back with a
+// different file type is rejected with EIO — so the name is detached from
+// the old entry and the caller allocates a fresh inode.
+func (m *InodeToPath) reusableInoAtLocked(path string, isDir bool) uint64 {
+	ino, ok := m.byPath[path]
+	if !ok {
+		return 0
+	}
+	entry, ok := m.byInode[ino]
+	if !ok {
+		delete(m.byPath, path)
+		return 0
+	}
+	if ino != 1 && entry.IsDir != isDir {
+		m.detachPathLocked(entry, path)
+		return 0
+	}
+	return ino
+}
+
+// detachPathLocked removes one path→inode binding while keeping the inode
+// entry itself: the kernel may still hold lookup references on the old
+// object (a rmdir'd directory is only FORGETten later), so the entry must
+// keep answering inode→path for them — it just no longer owns the name.
+func (m *InodeToPath) detachPathLocked(entry *InodeEntry, path string) {
+	delete(m.byPath, path)
+	delete(entry.Paths, path)
+	if len(entry.Paths) == 0 {
+		if entry.Path == path {
+			// Tombstone: the kernel may still hold references on the old
+			// nodeid (open fds on the removed directory), and an EMPTY
+			// Path must never surface as a dispatch path — pathutil
+			// canonicalizes "" to the mount root, redirecting descriptor
+			// operations there. Keep the old path so those operations
+			// answer for the gone name (ENOENT), and let Forget release
+			// the tombstone.
+			entry.Path = path
+		}
+		entry.Unlinked = true
+		entry.Detached = true
+		// A READDIR-seeded entry (EnsureInode*, Nlookup == 0) never gets a
+		// FORGET: release it here instead of leaking a pathless entry —
+		// unless a live descriptor still resolves through the inode (its
+		// dentry can be forgotten, Nlookup 0, while the fd stays open).
+		if entry.Nlookup <= 0 && !shouldKeepForgetMapping(entry) &&
+			(m.HasLiveUse == nil || !m.HasLiveUse(entry.Ino)) {
+			m.removeEntryLocked(entry.Ino, entry)
+		}
+		return
+	}
+	if entry.Path == path {
+		entry.Path = ""
+		for p := range entry.Paths {
+			entry.Path = p
+			break
+		}
+	}
+}
+
 func (m *InodeToPath) addPathLocked(entry *InodeEntry, path string) {
 	if entry.Paths == nil {
 		entry.Paths = make(map[string]struct{})
-		if entry.Path != "" {
+		if entry.Path != "" && !entry.Unlinked {
+			// Seed with the primary path only while it is a live alias; a
+			// detached entry's Path is a tombstone name it no longer owns.
 			entry.Paths[entry.Path] = struct{}{}
 		}
 	}
 	entry.Paths[path] = struct{}{}
 	m.byPath[path] = entry.Ino
-	if entry.Path == "" {
+	if entry.Path == "" || (entry.Unlinked && len(entry.Paths) == 1) {
+		// Reattaching a detached entry (tombstone or preserved-unlinked):
+		// the path just added is its only live name — adopt it as the
+		// primary and clear the detached marker, or inode-addressed
+		// operations keep dispatching through the stale tombstone path.
 		entry.Path = path
+		entry.Unlinked = false
+		entry.Detached = false
 	}
 }
 
