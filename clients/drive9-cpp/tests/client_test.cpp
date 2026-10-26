@@ -38,6 +38,8 @@ public:
     bool exists = false, guarded = true, fail_ack = false, fail_put = false, removed = false;
     bool gate_put = false, put_entered = false, gate_get = false, get_entered = false;
     bool binding_change = false, refresh_auth = false;
+    bool fail_cleanup = false;
+    int cleanup_calls = 0;
     std::string corrupt_op;
     Json corrupt_errno;
     Json credential = {{"scheme", "s3"}, {"endpoint", "http://object.test"}, {"bucket", "bucket"},
@@ -53,6 +55,7 @@ public:
             if (binding_change && mints > 1) c["prefix"] = "another-tenant/";
             return {200, {}, c.dump()};
         }
+        if (url.compare(0, std::string("http://fs.test/v1/fs/").size(), "http://fs.test/v1/fs/") == 0) return {404, {}, {}};
         if (url.compare(0, 18, "http://object.test") == 0) {
             Check(headers.at("Authorization").find("AWS4-HMAC-SHA256 ") == 0, "S3 SigV4 authorization absent");
             if (refresh_auth && mints == 1) return {403, {}, {}};
@@ -72,6 +75,9 @@ public:
         Check(url == "http://fs.test/v1/extent/meta", "unexpected API path");
         auto request = Json::parse(body);
         auto op = headers.at("X-Drive9-Extent-Op");
+        if (op == "find_stale_sessions" && fail_cleanup) {
+            ++cleanup_calls; cv.notify_all(); return {503, {}, {}};
+        }
         calls.push_back({{"op", op}, {"body", request}});
         if (sid && op != "new_session" && op != "clean_stale_session" && !(op == "refresh_session" && request.value("expire", int64_t(0)) == 1))
             Check(request.at("caller_sid").get<uint64_t>() == sid, "caller_sid lost 64-bit identity");
@@ -240,6 +246,29 @@ void LeaseAndLegacy() {
     Fails([&] { fs.WriteAt(file, "x", 1, 0); }, "failed renewal allowed writes");
     Check(expired.puts == 0, "write uploaded after losing its session");
 }
+void MaintenanceDoesNotRevokeOwnership() {
+    Fixture f; f.fail_cleanup = true;
+    ExtentFileSystem fs(f.ClientFor(), ExtentOptions{1000ms}); auto h = fs.Open("/data", {true, true});
+    {
+        std::unique_lock<std::mutex> lock(f.mu);
+        Check(f.cv.wait_for(lock, 4s, [&] { return f.cleanup_calls >= 2; }), "maintenance failure stopped lease renewal");
+    }
+    fs.WriteAt(h, "still-owned", 11, 0); fs.Sync(h);
+}
+void RefreshLengthAndRejectSymlinks() {
+    Fixture f; ExtentOptions options; options.mapping_ttl = 0ms;
+    ExtentFileSystem fs(f.ClientFor(), options); auto h = fs.Open("/data", {true, true});
+    fs.WriteAt(h, "abc", 3, 0);
+    { std::lock_guard<std::mutex> lock(f.mu); f.attr["Length"] = 8; }
+    char data[8]; std::memset(data, 0xa5, 8);
+    Check(fs.ReadAt(h, data, 8, 0) == 8 && std::string(data, 8) == std::string("abc\0\0\0\0\0", 8), "external growth remained hidden behind cached EOF");
+    { std::lock_guard<std::mutex> lock(f.mu); f.attr["Length"] = 1; }
+    Check(fs.Info(h).size == 1 && fs.ReadAt(h, data, 8, 0) == 1, "external truncate retained bytes past EOF");
+    Fixture link; link.exists = true; link.attr["Typ"] = 3; link.attr["Length"] = 9;
+    ExtentFileSystem links(link.ClientFor());
+    Fails([&] { links.Open("/symlink"); }, "symlink was accepted as a sparse regular file");
+    Check(link.refs == 0, "unsupported node acquired an open reference");
+}
 void GCSScopedTransport() {
     struct GCS : HttpTransport {
         std::vector<std::string> urls;
@@ -318,7 +347,8 @@ void DefaultCloudCredentials() {
 int main() {
     try {
         PathsAndSlices(); DurableSparseAndReferences(); CompatibleIDReservations(); LostPublicationAck(); MalformedAcknowledgement(); UploadFailure(); LatePutRejected();
-        ParallelReadsAndClose(); CredentialBindingAndRefresh(); LeaseAndLegacy(); GCSScopedTransport(); DefaultCloudCredentials();
+        ParallelReadsAndClose(); CredentialBindingAndRefresh(); LeaseAndLegacy(); MaintenanceDoesNotRevokeOwnership();
+        RefreshLengthAndRejectSymlinks(); GCSScopedTransport(); DefaultCloudCredentials();
         std::cout << "C++ SDK protocol and fault tests passed\n";
     } catch (const std::exception &error) { std::cerr << error.what() << '\n'; return 1; }
 }

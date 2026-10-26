@@ -78,7 +78,11 @@ boundary. Unsupported compression/encryption formats are rejected before opening
 files; existing format settings are never overwritten. Credential renewal is
 bound to the original tenant, namespace, bucket, endpoint and encryption policy.
 Control-plane bearer tokens are never attached to object requests. Redirects
-are disabled and TLS peer verification is enabled.
+are disabled and TLS peer verification is enabled. A checked patch to the pinned
+HTTP header disables its implicit TLS reconnect/replay for mutation methods;
+a close-notify-after-application test verifies one application, even when the
+response is lost. Explicit private HTTP endpoints remain supported; use HTTPS
+for bearer tokens across untrusted networks.
 
 Omitted cloud endpoints resolve as in the existing SDK: GCS uses its standard
 JSON API root, and a plain/global S3 endpoint follows the minted signing region.
@@ -92,7 +96,16 @@ Concurrent positional reads share immutable blocks through a bounded 64 MiB
 LRU cache and coalesce simultaneous downloads. Slice overlays are decoded in
 `O(n log n)` time. Slice maps expire after one second; missing objects trigger one
 mapping refresh for server compaction. Acquiring a file lock invalidates cached
-maps and reloads authoritative attributes before returning ownership.
+maps and reloads authoritative attributes before returning ownership. File length
+also follows this TTL, including unlocked append/truncate readers. Non-regular
+files are rejected rather than treating symlinks as sparse regular data.
+
+Empty extent directories are projected in the existing server mknod transaction.
+Directory rename preserves descendants in both the extent and `/v1/fs` views;
+preexisting classic directories are mirrored using that same mknod operation.
+These are generic namespace repairs, with no extra endpoint, table or lease.
+Stale-session sweeping is best-effort maintenance and does not revoke a healthy
+client when an unrelated expired session cannot be cleaned.
 
 ## Validation
 

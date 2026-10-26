@@ -64,7 +64,7 @@ int64_t Ticks(Deadline value) { return std::chrono::duration_cast<std::chrono::n
 FileInfo ParseInfo(const Json &response) {
     const auto &attr = response.at("attr");
     return {true, attr.at("Typ").get<int>() == 2, response.at("inode").get<uint64_t>(),
-            attr.at("Length").get<uint64_t>(), attr.value("Mtime", int64_t(0))};
+            attr.at("Length").get<uint64_t>(), attr.value("Mtime", int64_t(0)), attr.at("Typ").get<uint8_t>()};
 }
 } // namespace
 struct ExtentFileSystem::Impl {
@@ -73,6 +73,7 @@ struct ExtentFileSystem::Impl {
     detail::ObjectStore objects;
     uint64_t sid = 0, next_handle = 0;
     uint64_t next_slice = 0, slice_limit = 0, next_inode = 0, inode_limit = 0;
+    std::mutex allocation_mu;
     bool guard_supported = false, hash_prefix = false, closed = false;
     std::atomic<bool> failed{false};
     std::atomic<int64_t> expiry_ticks{INT64_MAX};
@@ -85,7 +86,10 @@ struct ExtentFileSystem::Impl {
     std::thread heartbeat;
     struct Mapping { Deadline expires; std::shared_ptr<const std::vector<detail::Slice>> slices; };
     struct Node {
+        uint64_t inode = 0;
         FileInfo info;
+        std::mutex info_mu;
+        Deadline info_expires = Deadline::min();
         size_t refs = 0;
         std::mutex map_mu;
         std::map<uint32_t, Mapping> maps;
@@ -170,10 +174,18 @@ struct ExtentFileSystem::Impl {
                 auto expire = NewExpiry();
                 Meta("refresh_session", {{"sid", sid}, {"expire", expire}});
                 Confirm(expire);
-                auto stale = Meta("find_stale_sessions", {{"limit", 16}});
-                for (auto &old : stale.at("sids")) {
-                    if (old.get<uint64_t>() != sid) Meta("clean_stale_session", {{"sid", old}});
-                }
+                // Cleanup does not establish our ownership. Bound the entire
+                // best-effort batch so it cannot stall the next renewal.
+                try {
+                    auto budget = std::min(std::chrono::milliseconds(1000), options.heartbeat / 4);
+                    auto until = std::min(DeadlineFor(), std::chrono::steady_clock::now() + budget);
+                    auto stale = client->ExtentMeta("find_stale_sessions", {{"limit", 16}, {"caller_sid", sid}}, until);
+                    if (stale.at("errno") == 0) for (auto &old : stale.at("sids")) {
+                        auto target = old.get<uint64_t>();
+                        if (target && target != sid)
+                            client->ExtentMeta("clean_stale_session", {{"sid", target}, {"caller_sid", sid}}, until);
+                    }
+                } catch (...) { /* Another session's cleanup must not poison this lease. */ }
             } catch (...) { failed.store(true); }
             lock.lock();
             if (failed.load()) break;
@@ -204,11 +216,33 @@ struct ExtentFileSystem::Impl {
         result["inode"] = 1;
         if (path == "/") return ParseInfo(result);
         auto info = ParseInfo(result);
+        std::string resolved;
         for (size_t start = 1; start < path.size();) {
             if (!info.directory) throw Error("Path component is not a directory", 20);
             auto end = path.find('/', start);
             if (end == std::string::npos) end = path.size();
-            info = ParseInfo(Meta("lookup", {{"parent", info.inode}, {"name", path.substr(start, end - start)}}));
+            auto name = path.substr(start, end - start);
+            resolved += "/" + name;
+            auto parent = info.inode;
+            try { info = ParseInfo(Meta("lookup", {{"parent", parent}, {"name", name}})); }
+            catch (const Error &error) {
+                if (error.code != 2) throw;
+                // Existing classic directories are mirrored through the same
+                // mknod transaction; regular files are never auto-converted.
+                Response stat;
+                try { stat = client->Request("HEAD", "/v1/fs" + UrlEncode(resolved + "/", true), {}, {}, DeadlineFor()); }
+                catch (const Error &head) { if (head.status == 404) throw Error("Extent entry does not exist", 2); throw; }
+                Healthy();
+                if (stat.headers["x-dat9-isdir"] != "true") throw Error("Extent entry does not exist", 2);
+                auto mode = stat.headers.count("x-dat9-mode") ? std::stoul(stat.headers.at("x-dat9-mode")) : 0755UL;
+                try {
+                    info = ParseInfo(Meta("mknod", {{"parent", parent}, {"name", name}, {"type", 2}, {"mode", mode},
+                        {"inode", NewInode()}, {"proj_path", resolved + "/"}, {"attr", Json::object()}}));
+                } catch (const Error &race) {
+                    if (race.code != 17) throw;
+                    info = ParseInfo(Meta("lookup", {{"parent", parent}, {"name", name}}));
+                }
+            }
             start = end + 1;
         }
         return info;
@@ -226,6 +260,20 @@ struct ExtentFileSystem::Impl {
         if (found == handles.end()) throw Error("Extent handle is closed", 9);
         return found->second;
     }
+    FileInfo CurrentInfo(Node &node) {
+        std::lock_guard<std::mutex> lock(node.info_mu);
+        if (std::chrono::steady_clock::now() >= node.info_expires) {
+            auto result = Meta("getattr", {{"inode", node.inode}}); result["inode"] = node.inode;
+            auto current = ParseInfo(result);
+            if (current.size != node.info.size) {
+                std::lock_guard<std::mutex> maps(node.map_mu);
+                node.maps.clear();
+            }
+            node.info = current;
+            node.info_expires = std::chrono::steady_clock::now() + options.mapping_ttl;
+        }
+        return node.info;
+    }
     void SetLock(uint64_t inode, uint64_t handle, Lock lock, bool unlock = false) {
         try {
             Meta("setlk", {{"inode", inode}, {"sid", sid}, {"owner", handle},
@@ -237,9 +285,10 @@ struct ExtentFileSystem::Impl {
         }
     }
     void DropRef(const std::shared_ptr<Node> &node) {
-        if (--node->refs == 0) Meta("delete_sustained", {{"inode", node->info.inode}, {"sid", sid}});
+        if (--node->refs == 0) Meta("delete_sustained", {{"inode", node->inode}, {"sid", sid}});
     }
     uint64_t Allocate(const char *name, uint64_t batch, uint64_t &next, uint64_t &limit) {
+        std::lock_guard<std::mutex> lock(allocation_mu);
         if (next == limit) {
             auto result = Meta("incr_counter", {{"name", name}, {"value", batch}});
             const auto &value = result.at("value");
@@ -317,7 +366,7 @@ struct ExtentFileSystem::Impl {
         std::lock_guard<std::mutex> lock(node.map_mu);
         auto &mapping = node.maps[index];
         if (refresh || !mapping.slices || std::chrono::steady_clock::now() >= mapping.expires) {
-            auto response = Meta("read", {{"inode", node.info.inode}, {"indx", index}});
+            auto response = Meta("read", {{"inode", node.inode}, {"indx", index}});
             mapping.slices = std::make_shared<const std::vector<detail::Slice>>(detail::DecodeSlices(response.at("slices")));
             mapping.expires = std::chrono::steady_clock::now() + options.mapping_ttl;
         }
@@ -327,8 +376,9 @@ struct ExtentFileSystem::Impl {
         if (!handle.write) throw Error("Extent handle is read only", 13);
         if (length > MaxFileSize || length > uint64_t(INT64_MAX)) throw Error("Extent size overflow", 22);
         try {
-            auto result = Meta("truncate", {{"inode", handle.node->info.inode}, {"length", length}});
+            auto result = Meta("truncate", {{"inode", handle.node->inode}, {"length", length}});
             handle.node->info.size = result.at("attr").at("Length").get<uint64_t>();
+            handle.node->info_expires = std::chrono::steady_clock::now() + options.mapping_ttl;
             handle.node->maps.clear();
         } catch (...) { failed.store(true); throw; }
     }
@@ -369,9 +419,11 @@ uint64_t ExtentFileSystem::Open(const std::string &input, OpenOptions options) {
     }
     if (!info.exists) throw Error("Extent file does not exist", 2);
     if (info.directory) throw Error("Extent file is a directory", 21);
+    if (info.type != 1) throw Error("Extent node is not a supported regular file", 95);
     auto node = s.nodes[info.inode].lock();
-    if (!node) { node = std::make_shared<Impl::Node>(); s.nodes[info.inode] = node; }
+    if (!node) { node = std::make_shared<Impl::Node>(); node->inode = info.inode; s.nodes[info.inode] = node; }
     node->info = info;
+    node->info_expires = std::chrono::steady_clock::now() + s.options.mapping_ttl;
     if (!node->refs) s.Meta("open_ref", {{"sid", s.sid}, {"inode", info.inode}});
     ++node->refs;
     auto id = ++s.next_handle;
@@ -395,13 +447,14 @@ uint64_t ExtentFileSystem::Open(const std::string &input, OpenOptions options) {
     }
 }
 FileInfo ExtentFileSystem::Info(uint64_t handle) {
-    auto &s = *impl_; std::shared_lock<std::shared_mutex> lock(s.lifetime); return s.Get(handle).node->info;
+    auto &s = *impl_; std::shared_lock<std::shared_mutex> lock(s.lifetime); return s.CurrentInfo(*s.Get(handle).node);
 }
 size_t ExtentFileSystem::ReadAt(uint64_t handle, void *buffer, size_t length, uint64_t offset) {
     auto &s = *impl_; std::shared_lock<std::shared_mutex> lock(s.lifetime); auto &h = s.Get(handle);
     if (offset > MaxFileSize || length > MaxFileSize - offset || (!buffer && length)) throw Error("Invalid extent read bounds", 22);
-    if (offset >= h.node->info.size || !length) return 0;
-    length = size_t(std::min<uint64_t>(length, h.node->info.size - offset));
+    auto info = s.CurrentInfo(*h.node);
+    if (offset >= info.size || !length) return 0;
+    length = size_t(std::min<uint64_t>(length, info.size - offset));
     std::memset(buffer, 0, length); // holes must clear a reused DuckDB buffer
     for (size_t done = 0; done < length;) {
         auto index = uint32_t((offset + done) / ChunkSize), pos = uint32_t((offset + done) % ChunkSize);
@@ -449,10 +502,11 @@ void ExtentFileSystem::WriteAt(uint64_t handle, const void *buffer, size_t lengt
                 s.Healthy();
                 at += n;
             }
-            auto response = s.Meta("write", {{"inode", h.node->info.inode}, {"indx", index}, {"off", pos},
+            auto response = s.Meta("write", {{"inode", h.node->inode}, {"indx", index}, {"off", pos},
                                              {"slice", {{"Id", id}, {"Size", count}, {"Off", 0}, {"Len", count}}},
                                              {"mtime", detail::Timestamp()}});
             h.node->info.size = response.at("attr").at("Length").get<uint64_t>();
+            h.node->info_expires = std::chrono::steady_clock::now() + s.options.mapping_ttl;
             if (response.contains("slices"))
                 h.node->maps[index] = {std::chrono::steady_clock::now() + s.options.mapping_ttl,
                     std::make_shared<const std::vector<detail::Slice>>(detail::DecodeSlices(response.at("slices")))};
@@ -470,7 +524,7 @@ void ExtentFileSystem::Sync(uint64_t handle) {
 }
 void ExtentFileSystem::Close(uint64_t handle) {
     auto &s = *impl_; std::unique_lock<std::shared_mutex> lock(s.lifetime); auto h = s.Get(handle);
-    if (h.lock != Lock::None) s.SetLock(h.node->info.inode, handle, h.lock, true);
+    if (h.lock != Lock::None) s.SetLock(h.node->inode, handle, h.lock, true);
     s.handles.erase(handle);
     s.DropRef(h.node);
 }
@@ -489,6 +543,8 @@ void ExtentFileSystem::Remove(const std::string &input) {
 void ExtentFileSystem::Rename(const std::string &source, const std::string &target) {
     auto &s = *impl_; std::unique_lock<std::shared_mutex> lock(s.lifetime); s.Ready();
     auto from = CanonicalPath(source), to = CanonicalPath(target); auto a = s.Parent(from), b = s.Parent(to);
+    auto info = s.Lookup(from);
+    if (info.directory) { from += '/'; to += '/'; }
     s.Meta("rename", {{"src_parent", a.first}, {"src_name", a.second}, {"dst_parent", b.first}, {"dst_name", b.second},
                       {"flags", 0}, {"src_path", from}, {"dst_path", to}, {"sid", s.sid}, {"dst_opened", false}});
 }

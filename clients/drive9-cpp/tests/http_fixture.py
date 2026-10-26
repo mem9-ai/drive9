@@ -13,17 +13,46 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     dropped = 0
     redirected = 0
+    tls_applied = 0
+    tls_closed = threading.Condition()
 
     def log_message(self, *args):
         pass
+
+    def handle(self):
+        try:
+            super().handle()
+        except (ConnectionResetError, BrokenPipeError):
+            pass
 
     def do_POST(self):
         self.rfile.read(int(self.headers.get("Content-Length", "0")))
         if self.path == "/drop":
             type(self).dropped += 1
             self.close_connection = True
+        elif self.path == "/tls-drop":
+            # Nonblocking unwrap emits close_notify before asking for its peer's
+            # alert. Signal only after the alert is queued and the socket closes.
+            self.connection.setblocking(False)
+            try:
+                self.connection.unwrap()
+            except (ssl.SSLWantReadError, ssl.SSLError, OSError):
+                pass
+            self.connection.close()
+            self.close_connection = True
+            with type(self).tls_closed:
+                type(self).tls_applied += 1
+                type(self).tls_closed.notify_all()
 
     def do_GET(self):
+        if self.path.startswith("/await-tls-drop?count="):
+            count = int(self.path.split("=", 1)[1])
+            with type(self).tls_closed:
+                applied = type(self).tls_closed.wait_for(lambda: type(self).tls_applied >= count, timeout=2)
+            self.send_response(200 if applied else 504)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if self.path == "/redirect":
             self.send_response(302)
             self.send_header("Location", "/must-not-follow")
@@ -55,7 +84,8 @@ class Handler(BaseHTTPRequestHandler):
 with tempfile.TemporaryDirectory(prefix="drive9-cpp-tls-") as tmp:
     cert, key = Path(tmp, "cert.pem"), Path(tmp, "key.pem")
     subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
-                    "-subj", "/CN=localhost", "-keyout", str(key), "-out", str(cert)],
+                    "-subj", "/CN=localhost", "-addext", "subjectAltName=IP:127.0.0.1,DNS:localhost",
+                    "-keyout", str(key), "-out", str(cert)],
                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server, ThreadingHTTPServer(("127.0.0.1", 0), Handler) as tls:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -65,11 +95,12 @@ with tempfile.TemporaryDirectory(prefix="drive9-cpp-tls-") as tmp:
         for thread in threads:
             thread.start()
         result = subprocess.run([sys.argv[1], f"http://127.0.0.1:{server.server_port}",
-                                 f"https://127.0.0.1:{tls.server_port}"], timeout=30)
+                                 f"https://127.0.0.1:{tls.server_port}", str(cert)], timeout=30)
         for s in (server, tls):
             s.shutdown()
         for thread in threads:
             thread.join()
         assert Handler.dropped == 1, "transport replayed a mutation after losing its acknowledgement"
         assert Handler.redirected == 0, "transport followed a credential-bearing redirect"
+        assert Handler.tls_applied == 1, f"TLS mutation applied {Handler.tls_applied} times"
         sys.exit(result.returncode)

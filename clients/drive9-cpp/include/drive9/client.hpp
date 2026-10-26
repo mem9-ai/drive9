@@ -15,8 +15,8 @@ using Json = nlohmann::json;
 using Deadline = std::chrono::steady_clock::time_point;
 using Headers = std::map<std::string, std::string>;
 
-// Codes from extent metadata are the server's errno values (Linux wire values),
-// not the host's errno enum. HTTP errors carry status; transport errors use 0.
+// Extent codes are the server's errno values, not the client's host enum.
+// HTTP errors carry status; transport errors use 0.
 class Error : public std::runtime_error {
 public:
     Error(std::string message, int code = 0, int status = 0)
@@ -34,7 +34,7 @@ struct Response {
 class HttpTransport {
 public:
     virtual ~HttpTransport() = default;
-    // No implicit redirects or retries: mutating metadata has an ambiguous
+    // No redirects or implicit mutation retries: metadata has an ambiguous
     // outcome on disconnect and must never be replayed automatically.
     virtual Response Request(const std::string &method, const std::string &url,
                              const Headers &headers, std::string_view body,
@@ -87,6 +87,7 @@ struct FileInfo {
     uint64_t inode = 0;
     uint64_t size = 0;
     int64_t modified = 0;
+    uint8_t type = 0; // existing extent node type: regular=1, directory=2, symlink=3
 };
 struct DirectoryEntry { std::string name; FileInfo info; };
 struct ExtentOptions {
