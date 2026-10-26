@@ -139,9 +139,10 @@ int main(int argc, char **argv) {
         auto second = std::async(std::launch::async, download);
         first.get(); second.get();
 #if defined(__linux__) && defined(TCP_QUICKACK)
-        // A real tiny TCP receive window reproduces the 2 KiB / delayed-ACK
-        // cadence seen in concurrent Linux scans. Exercise the same ACK hook
-        // without capping production receive buffers or disabling keep-alive.
+        // Deliberately disable receive autotuning and shrink an established
+        // window below its negotiated MSS. This is a deadline/recovery fault,
+        // not a throughput contract: QUICKACK cannot override TCP flow control.
+        // Exercise both modes so neither can escape the request deadline.
         for (bool acknowledge : {false, true}) {
             httplib::Client constrained(base);
             constrained.set_keep_alive(true);
@@ -149,8 +150,8 @@ int main(int argc, char **argv) {
             constrained.set_max_timeout(2s);
             auto ready = constrained.Get("/ok");
             if (!ready || ready->body != "ok") throw Error("Unable to establish the fixture connection");
-            // Shrink after SYN negotiation so the original large MSS/window
-            // scale remains, matching the stalled keep-alive connection.
+            // Shrink after SYN negotiation to retain the original large
+            // MSS/window scale and force slow window updates.
             int window = 1024;
             if (::setsockopt(constrained.socket(), SOL_SOCKET, SO_RCVBUF, &window, sizeof(window)))
                 throw Error("Unable to constrain the established receive window");
@@ -168,8 +169,13 @@ int main(int argc, char **argv) {
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - before).count();
             std::cout << "Constrained TCP window, quick acknowledgements=" << acknowledge
                       << ": " << elapsed << " ms, " << received.size() << " bytes\n";
-            if (acknowledge && (!ok || received != block))
-                throw Error("Quick acknowledgements did not recover a constrained receive window");
+            if (elapsed > 2500 || (!ok && elapsed < 1800))
+                throw Error("Constrained receive window escaped its request deadline");
+            if (ok && received != block)
+                throw Error("Constrained receive window accepted a partial block");
+            constrained.stop();
+            auto recovered = transport->Request("GET", base + "/block", {}, {}, deadline(), block.size());
+            if (recovered.body != block) throw Error("Download failed after a constrained-window timeout");
         }
 #endif
         // Force close_notify after the server applies the request but before

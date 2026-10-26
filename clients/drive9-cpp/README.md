@@ -85,6 +85,14 @@ a close-notify-after-application test verifies one application, even when the
 response is lost. Explicit private HTTP endpoints remain supported; use HTTPS
 for bearer tokens across untrusted networks.
 
+Requests share one monotonic deadline across headers and body. Failed or partial
+responses discard their connection; oversized HTTP error documents retain their
+status for object recovery and retry policy. On Linux, the transport requests
+quick acknowledgements after each received fragment while preserving socket
+receive autotuning. This is a TCP hint, not a latency guarantee. Tests constrain
+an established receive window to verify bounded failure and subsequent recovery;
+normal pooled downloads and Quack integration stress cover throughput behavior.
+
 Omitted cloud endpoints resolve as in the existing SDK: GCS uses its standard
 JSON API root, and a plain/global S3 endpoint follows the minted signing region.
 Custom, dual-stack, FIPS and VPC endpoints are preserved. S3 partition DNS data

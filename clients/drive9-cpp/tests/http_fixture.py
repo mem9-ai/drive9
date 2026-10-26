@@ -132,6 +132,8 @@ with tempfile.TemporaryDirectory(prefix="drive9-cpp-tls-") as tmp:
             s.shutdown()
         for thread in threads:
             thread.join()
+        if result.returncode:
+            sys.exit(result.returncode)
         assert Handler.dropped == 1, "transport replayed a mutation after losing its acknowledgement"
         assert Handler.redirected == 0, "transport followed a credential-bearing redirect"
         assert Handler.tls_applied == 1, f"TLS mutation applied {Handler.tls_applied} times"
