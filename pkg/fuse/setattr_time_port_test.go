@@ -21,7 +21,9 @@ import (
 // v1 TestLocalTimeOverrideLifecycle: override arming, derived-update
 // immunity, listing-reseed preservation, user-mutation clearing,
 // delete+recreate freshness, identity-replacement adoption, and
-// kind-change handling — the inodes table kept the v1 semantics verbatim.
+// kind-change handling. Every row keeps the v1 semantics except the
+// kind-change one: a kind change now allocates a fresh inode instead of
+// retyping the live entry (reusableInoAtLocked).
 func TestPortLocalTimeOverrideLifecycle(t *testing.T) {
 	inodes := NewInodeToPath()
 
@@ -101,20 +103,28 @@ func TestPortLocalTimeOverrideLifecycle(t *testing.T) {
 		t.Fatal("atime override survived identity replacement")
 	}
 
-	// A kind change at the same path is a different object: overrides drop,
-	// the listing time is adopted, and the stale byID mapping must not
-	// rejoin the kind-changed inode.
+	// A kind change at the same path is a different object: the name moves
+	// to a fresh inode (the kernel still holds the old nodeid alive and
+	// rejects a reply that retypes it — the create-after-rmdir EIO), while
+	// the replaced entry keeps its override and hardlink identity for its
+	// remaining references (open fds, aliases at other paths).
 	inodes.SetLocalMtime(ino2, requested)
-	inodes.Lookup("/a.txt", true, 0, time.Unix(7777777777, 0))
-	if inodes.HasMtimeOverride(ino2) {
-		t.Fatal("kind change inherited the mtime override")
+	dirIno := inodes.Lookup("/a.txt", true, 0, time.Unix(7777777777, 0))
+	if dirIno == ino2 {
+		t.Fatal("kind change reused the replaced object's inode")
 	}
-	entry, _ = inodes.GetEntry(ino2)
+	if inodes.HasMtimeOverride(dirIno) {
+		t.Fatal("fresh inode inherited the mtime override")
+	}
+	entry, _ = inodes.GetEntry(dirIno)
 	if !entry.Mtime.Equal(time.Unix(7777777777, 0)) {
 		t.Fatalf("kind-change mtime = %v, want listing mtime", entry.Mtime)
 	}
-	if rejoined := inodes.LookupWithIdentity("/elsewhere.txt", "res-2", 1, false, 5, time.Unix(1000, 0)); rejoined == ino2 {
-		t.Fatal("stale byID mapping rejoined the kind-changed inode")
+	if !inodes.HasMtimeOverride(ino2) {
+		t.Fatal("detached entry lost the override its remaining references still serve")
+	}
+	if rejoined := inodes.LookupWithIdentity("/elsewhere.txt", "res-2", 1, false, 5, time.Unix(1000, 0)); rejoined != ino2 {
+		t.Fatal("replaced object lost its byID identity for surviving aliases")
 	}
 }
 
