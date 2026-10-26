@@ -521,7 +521,11 @@ void ExtentFileSystem::Truncate(uint64_t handle, uint64_t length) {
     auto &s = *impl_; std::unique_lock<std::shared_mutex> lock(s.lifetime); s.Truncate(s.Get(handle), length);
 }
 void ExtentFileSystem::Sync(uint64_t handle) {
-    auto &s = *impl_; std::unique_lock<std::shared_mutex> lock(s.lifetime); s.Get(handle); // writes are synchronous
+    // Writes publish synchronously under the exclusive lifetime lock. Taking a
+    // shared lock waits for an active write without waiting for immutable reads.
+    // A global exclusive Sync can starve behind scans while DuckDB holds its
+    // commit mutex, preventing both query completion and the WAL flush.
+    auto &s = *impl_; std::shared_lock<std::shared_mutex> lock(s.lifetime); s.Get(handle);
 }
 void ExtentFileSystem::Close(uint64_t handle) {
     auto &s = *impl_; std::unique_lock<std::shared_mutex> lock(s.lifetime); auto h = s.Get(handle);

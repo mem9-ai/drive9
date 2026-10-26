@@ -216,6 +216,33 @@ void ParallelReadsAndClose() {
     read.get(); close.get();
     char data; Fails([&] { fs.ReadAt(file, &data, 1, 0); }, "read after close accepted");
 }
+void SyncDoesNotWaitForDownloads() {
+    Fixture f; ExtentFileSystem fs(f.ClientFor()); auto file = fs.Open("/data", {true, true});
+    fs.WriteAt(file, "data", 4, 0);
+    f.gate_get = true;
+    auto reader = std::async(std::launch::async, [&] {
+        char data[4]; Check(fs.ReadAt(file, data, 4, 0) == 4, "gated read failed");
+    });
+    { std::unique_lock<std::mutex> lock(f.mu); f.cv.wait(lock, [&] { return f.get_entered; }); }
+    auto synced = std::async(std::launch::async, [&] { fs.Sync(file); });
+    auto status = synced.wait_for(1s);
+    // Release the read even on failure so future destruction cannot deadlock.
+    { std::lock_guard<std::mutex> lock(f.mu); f.gate_get = false; } f.cv.notify_all();
+    reader.get(); synced.get();
+    Check(status == std::future_status::ready, "Sync waited for an unrelated immutable download");
+
+    f.gate_put = true; f.put_entered = false;
+    auto writer = std::async(std::launch::async, [&] { fs.WriteAt(file, "next", 4, 0); });
+    { std::unique_lock<std::mutex> lock(f.mu); f.cv.wait(lock, [&] { return f.put_entered; }); }
+    std::promise<void> started;
+    auto waiting = std::async(std::launch::async, [&] { started.set_value(); fs.Sync(file); });
+    started.get_future().wait();
+    status = waiting.wait_for(50ms);
+    { std::lock_guard<std::mutex> lock(f.mu); f.gate_put = false; } f.cv.notify_all();
+    writer.get(); waiting.get();
+    Check(status == std::future_status::timeout, "Sync overtook an unpublished write");
+    Check(f.publications == 2, "Sync returned before the active write was published");
+}
 void CredentialBindingAndRefresh() {
     Fixture f; f.refresh_auth = true; f.binding_change = true;
     ExtentFileSystem fs(f.ClientFor()); auto file = fs.Open("/data", {true, true});
@@ -357,7 +384,7 @@ int main() {
     try {
         DirectoryProjectionCapability();
         PathsAndSlices(); DurableSparseAndReferences(); CompatibleIDReservations(); LostPublicationAck(); MalformedAcknowledgement(); UploadFailure(); LatePutRejected();
-        ParallelReadsAndClose(); CredentialBindingAndRefresh(); LeaseAndLegacy(); MaintenanceDoesNotRevokeOwnership();
+        ParallelReadsAndClose(); SyncDoesNotWaitForDownloads(); CredentialBindingAndRefresh(); LeaseAndLegacy(); MaintenanceDoesNotRevokeOwnership();
         RefreshLengthAndRejectSymlinks(); GCSScopedTransport(); DefaultCloudCredentials();
         std::cout << "C++ SDK protocol and fault tests passed\n";
     } catch (const std::exception &error) { std::cerr << error.what() << '\n'; return 1; }
