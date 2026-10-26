@@ -25,6 +25,36 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  cpp:
+    name: C++ SDK (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install OpenSSL headers
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      - name: Configure Linux with address and undefined-behavior sanitizers
+        if: runner.os == 'Linux'
+        run: >-
+          cmake -S clients/drive9-cpp -B build/drive9-cpp -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_C_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer'
+          -DCMAKE_CXX_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer'
+          -DCMAKE_EXE_LINKER_FLAGS='-fsanitize=address,undefined'
+      - name: Configure macOS
+        if: runner.os == 'macOS'
+        run: cmake -S clients/drive9-cpp -B build/drive9-cpp -DCMAKE_BUILD_TYPE=Debug -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)"
+      - name: Build and test without Go
+        run: |
+          cmake --build build/drive9-cpp --parallel 2
+          ctest --test-dir build/drive9-cpp --output-on-failure
+
   python:
     name: Python SDK
     runs-on: ubuntu-latest
