@@ -294,13 +294,24 @@ func (m *InodeToPath) Forget(ino uint64, nlookup uint64) {
 	}
 }
 
+// shouldKeepForgetMapping reports whether an entry whose last kernel lookup
+// reference is being forgotten must stay in the table anyway: it still owns
+// a name (a later LOOKUP on that path must find the same identity), or a
+// retention flag deliberately pins it.
 func shouldKeepForgetMapping(entry *InodeEntry) bool {
 	if entry == nil {
 		return false
 	}
+	// A tombstone — its last name was detached to a different-kind object
+	// (detachPathLocked) or removed under live handles — owns no name
+	// anymore. Once the kernel's last reference is forgotten nothing can
+	// reach it: release it instead of keeping a pathless entry forever.
+	// JuiceFS-backed inodes keep their identity mapping (rule below).
+	if entry.Unlinked && len(entry.Paths) == 0 && entry.ExtentIno == 0 {
+		return false
+	}
 	if entry.IsDir || entry.ResourceID != "" {
-		// A pathless entry (a rmdir'd directory whose name a different-kind
-		// object now owns) has nothing left to serve once the kernel's last
+		// A pathless entry has nothing left to serve once the kernel's last
 		// reference is forgotten — release it instead of leaking one entry
 		// per replaced directory.
 		return entry.Path != ""
@@ -1035,6 +1046,25 @@ func (m *InodeToPath) reusableInoAtLocked(path string, isDir bool) uint64 {
 func (m *InodeToPath) detachPathLocked(entry *InodeEntry, path string) {
 	delete(m.byPath, path)
 	delete(entry.Paths, path)
+	if len(entry.Paths) == 0 {
+		if entry.Path == path {
+			// Tombstone: the kernel may still hold references on the old
+			// nodeid (open fds on the removed directory), and an EMPTY
+			// Path must never surface as a dispatch path — pathutil
+			// canonicalizes "" to the mount root, redirecting descriptor
+			// operations there. Keep the old path so those operations
+			// answer for the gone name (ENOENT), and let Forget release
+			// the tombstone.
+			entry.Path = path
+		}
+		entry.Unlinked = true
+		// A READDIR-seeded entry (EnsureInode*, Nlookup == 0) never gets a
+		// FORGET: release it here instead of leaking a pathless entry.
+		if entry.Nlookup <= 0 && !shouldKeepForgetMapping(entry) {
+			m.removeEntryLocked(entry.Ino, entry)
+		}
+		return
+	}
 	if entry.Path == path {
 		entry.Path = ""
 		for p := range entry.Paths {

@@ -365,17 +365,41 @@ func TestEnsureInodeKindConflictAllocatesFreshInode(t *testing.T) {
 
 // The detached directory entry survives until its kernel references drain,
 // then Forget releases it instead of keeping a pathless entry forever.
+// While it survives it answers GetPath with the OLD path — never an empty
+// string, which dispatch would canonicalize to the mount root.
 func TestForgetReleasesDetachedDirectoryEntry(t *testing.T) {
 	m := NewInodeToPath()
 	dirIno := m.Lookup("/d", true, 0, time.Now())
 	m.Lookup("/d", false, 0, time.Now()) // kind conflict detaches the path
 
+	if p, ok := m.GetPath(dirIno); !ok || p != "/d" {
+		t.Fatalf("tombstone GetPath = %q/%v, want the old path %q", p, ok, "/d")
+	}
 	m.Forget(dirIno, 2)
 	if _, ok := m.GetEntry(dirIno); ok {
 		t.Fatal("Forget kept a pathless directory entry")
 	}
 	if got, ok := m.GetInode("/d"); !ok || got == dirIno {
 		t.Fatalf("path mapping = %d/%v, want a fresh inode", got, ok)
+	}
+}
+
+// A READDIR-seeded entry (EnsureInode, Nlookup == 0) never receives a
+// FORGET: detaching it must release the entry immediately instead of
+// leaking a pathless row per readdir->rmdir->create cycle.
+func TestDetachReleasesUnreferencedSeededEntry(t *testing.T) {
+	m := NewInodeToPath()
+	dirIno := m.EnsureInode("/d", true, 0, time.Now())
+
+	fileIno := m.Lookup("/d", false, 0, time.Now())
+	if fileIno == dirIno {
+		t.Fatalf("kind conflict reused the seeded inode %d", dirIno)
+	}
+	if _, ok := m.GetEntry(dirIno); ok {
+		t.Fatal("unreferenced detached entry was not released")
+	}
+	if got, ok := m.GetInode("/d"); !ok || got != fileIno {
+		t.Fatalf("path mapping = %d/%v, want %d/true", got, ok, fileIno)
 	}
 }
 
