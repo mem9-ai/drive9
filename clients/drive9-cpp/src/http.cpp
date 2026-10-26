@@ -93,6 +93,9 @@ public:
         client->set_max_timeout(remaining);
         client->set_payload_max_length(max_response);
         httplib::Request request;
+        // The low-level send overload does not initialize the request clock.
+        // max_timeout must measure from now, never time_point::min().
+        request.start_time_ = std::chrono::steady_clock::now();
         request.method = method;
         request.path = address.path;
         for (const auto &header : headers) request.headers.insert(header);

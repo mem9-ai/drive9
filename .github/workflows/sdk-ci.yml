@@ -51,6 +51,8 @@ jobs:
         if: runner.os == 'macOS'
         run: cmake -S clients/drive9-cpp -B build/drive9-cpp -DCMAKE_BUILD_TYPE=Debug -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)"
       - name: Build and test without Go
+        env:
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: |
           cmake --build build/drive9-cpp --parallel 2
           ctest --test-dir build/drive9-cpp --verbose --output-on-failure

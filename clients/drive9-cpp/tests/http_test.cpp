@@ -58,6 +58,7 @@ int main(int argc, char **argv) {
                 throw Error("Unable to constrain the established receive window");
             std::string received;
             httplib::Request request; request.method = "GET"; request.path = "/block";
+            request.start_time_ = std::chrono::steady_clock::now();
             request.content_receiver = [&](const char *data, size_t length, uint64_t, uint64_t) {
                 received.append(data, length);
                 if (acknowledge) detail::AcknowledgeRead(constrained.socket());
@@ -88,6 +89,7 @@ int main(int argc, char **argv) {
         tls.set_keep_alive(true);
         httplib::Request mutation;
         mutation.method = "POST"; mutation.path = "/tls-drop";
+        mutation.start_time_ = std::chrono::steady_clock::now();
         mutation.content_length_ = 8;
         int applications = 0;
         auto after_write = [&] {
