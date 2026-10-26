@@ -725,7 +725,25 @@ func (s *Store) jfsProjectionPathTx(tx *sql.Tx, parent uint64, name string) (str
 	}
 	return strings.TrimSuffix(p.String, "/") + "/" + name, nil
 }
-func (s *Store) jfsRmdirTx(tx *sql.Tx, parent uint64, name, projPath string) (uint64, *ExtentAttr, int, error) {
+
+// jfsDirectoryProjectionTx treats the inode binding as authoritative. Path
+// hints can be absent or noncanonical, but must not select another directory.
+func (s *Store) jfsDirectoryProjectionTx(ctx context.Context, tx *sql.Tx, ino uint64, hint string) (string, int, error) {
+	var path string
+	err := tx.QueryRowContext(ctx, `SELECT path FROM file_nodes WHERE `+s.scope.And(`extent_ino = ? AND is_directory = 1`)+` LIMIT 1 FOR UPDATE`, s.scope.Args(ino)...).Scan(&path)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return "", 0, err
+	}
+	if hint != "" {
+		canonical, err := pathutil.CanonicalizeDir(hint)
+		if err != nil || canonical != path {
+			return "", int(syscall.EINVAL), nil
+		}
+	}
+	return path, 0, nil
+}
+
+func (s *Store) jfsRmdirTx(ctx context.Context, tx *sql.Tx, parent uint64, name, projPath string) (uint64, *ExtentAttr, int, error) {
 	var ino uint64
 	var typ uint8
 	// Locking read, matching jfsUnlinkTx: one dentry can be addressed by two
@@ -757,6 +775,19 @@ func (s *Store) jfsRmdirTx(tx *sql.Tx, parent uint64, name, projPath string) (ui
 	if children > 0 {
 		return 0, nil, int(syscall.ENOTEMPTY), nil
 	}
+	path, eno, err := s.jfsDirectoryProjectionTx(ctx, tx, ino, projPath)
+	if err != nil || eno != 0 {
+		return 0, nil, eno, err
+	}
+	if path != "" {
+		occupied, err := s.dirHasChildrenTx(ctx, tx, path)
+		if err != nil {
+			return 0, nil, 0, err
+		}
+		if occupied {
+			return 0, nil, int(syscall.ENOTEMPTY), nil
+		}
+	}
 	attr, _, err := s.jfsGetAttrTx(tx, ino)
 	if err != nil {
 		return 0, nil, 0, err
@@ -765,8 +796,8 @@ func (s *Store) jfsRmdirTx(tx *sql.Tx, parent uint64, name, projPath string) (ui
 		return 0, nil, 0, err
 	}
 	// The projection must disappear in the same transaction as the extent edge.
-	if projPath != "" {
-		if _, err := tx.Exec(`DELETE FROM file_nodes WHERE `+s.scope.And(`path_hash = ? AND path = ?`), s.scope.Args(fileNodePathHash(projPath), projPath)...); err != nil {
+	if path != "" {
+		if _, err := tx.Exec(`DELETE FROM file_nodes WHERE `+s.scope.And(`path_hash = ? AND path = ?`), s.scope.Args(fileNodePathHash(path), path)...); err != nil {
 			return 0, nil, 0, err
 		}
 	}
@@ -792,24 +823,28 @@ func (s *Store) jfsRenameTx(ctx context.Context, tx *sql.Tx, srcParent uint64, s
 		return 0, 0, nil, nil, eno, err
 	}
 	if attr.Typ == jfsTypeDir {
-		// Recover the source projection before moving it when callers omit
-		// the optional path hint. Never interpret an absent source as root.
-		if srcPath == "" {
-			var path string
-			err := tx.QueryRow(`SELECT path FROM file_nodes WHERE `+s.scope.And(`extent_ino = ? AND is_directory = 1`)+` LIMIT 1 FOR UPDATE`, s.scope.Args(ino)...).Scan(&path)
-			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		path, eno, err := s.jfsDirectoryProjectionTx(ctx, tx, ino, srcPath)
+		if err != nil || eno != 0 {
+			return 0, 0, nil, nil, eno, err
+		}
+		srcPath = path
+		if dstPath != "" {
+			canonical, err := pathutil.CanonicalizeDir(dstPath)
+			if err != nil {
+				return 0, 0, nil, nil, int(syscall.EINVAL), nil
+			}
+			dstPath = canonical
+		}
+		if srcPath != "" {
+			projected, err := s.jfsProjectionPathTx(tx, dstParent, dstName)
+			if err != nil {
 				return 0, 0, nil, nil, 0, err
 			}
-			srcPath = path
-		}
-		for _, path := range []*string{&srcPath, &dstPath} {
-			if *path != "" {
-				canonical, err := pathutil.CanonicalizeDir(*path)
-				if err != nil {
-					return 0, 0, nil, nil, int(syscall.EINVAL), err
-				}
-				*path = canonical
+			expected, err := pathutil.CanonicalizeDir(projected)
+			if err != nil || (dstPath != "" && dstPath != expected) {
+				return 0, 0, nil, nil, int(syscall.EINVAL), nil
 			}
+			dstPath = expected
 		}
 	}
 	if flags&jfsRenameExchange != 0 {
@@ -857,7 +892,7 @@ func (s *Store) jfsRenameTx(ctx context.Context, tx *sql.Tx, srcParent uint64, s
 				// (another client's unlink): there is nothing to replace, so the
 				// rename proceeds.
 			case dstAttr.Typ == jfsTypeDir && ueno == int(syscall.EPERM):
-				if _, _, reno, rerr := s.jfsRmdirTx(tx, dstParent, dstName, dstPath); rerr != nil || reno != 0 {
+				if _, _, reno, rerr := s.jfsRmdirTx(ctx, tx, dstParent, dstName, dstPath); rerr != nil || reno != 0 {
 					return 0, exist, attr, dstAttr, reno, rerr
 				}
 			default:

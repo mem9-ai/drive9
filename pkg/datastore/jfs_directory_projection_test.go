@@ -3,7 +3,9 @@ package datastore
 import (
 	"context"
 	"encoding/json"
+	"syscall"
 	"testing"
+	"time"
 )
 
 // Both HTTP views must observe one namespace transaction, including empty dirs.
@@ -63,11 +65,67 @@ func TestExtentDirectoryProjectionLifecycle(t *testing.T) {
 			meta("lookup", map[string]any{"parent": 201, "name": "file"})
 			meta("unlink", map[string]any{"parent": 201, "name": "file", "proj_path": "/moved/nested/file"})
 			meta("rmdir", map[string]any{"parent": 200, "name": "nested", "proj_path": "/moved/nested/"})
-			meta("rmdir", map[string]any{"parent": 1, "name": "moved", "proj_path": "/moved/"})
+			meta("rmdir", map[string]any{"parent": 1, "name": "moved", "proj_path": map[string]string{"/empty/": "/moved/", "/empty": "/moved", "": ""}[source]})
 			if _, err := s.GetNode(ctx, "/moved/"); err == nil {
 				t.Fatal("rmdir left projection")
 			}
 
 		})
+	}
+}
+
+func TestExtentDirectoryProjectionRejectsForeignHintAndClassicChildren(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	meta := func(op string, args map[string]any) int {
+		t.Helper()
+		body, err := json.Marshal(args)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, errno, err := s.RunExtentMetaOp(ctx, op, body, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return errno
+	}
+	for i, name := range []string{"a", "b"} {
+		if eno := meta("mknod", map[string]any{"parent": 1, "inode": 300 + i, "name": name, "type": 2, "mode": 0700, "proj_path": "/" + name + "/", "attr": ExtentAttr{Typ: 2, Mode: 0700, Parent: 1, Nlink: 2, Full: true}}); eno != 0 {
+			t.Fatal(eno)
+		}
+	}
+	if eno := meta("rename", map[string]any{"src_parent": 1, "src_name": "a", "dst_parent": 1, "dst_name": "moved", "src_path": "/b/", "dst_path": "/moved/"}); eno != int(syscall.EINVAL) {
+		t.Fatalf("foreign rename hint errno=%d", eno)
+	}
+	if eno := meta("rename", map[string]any{"src_parent": 1, "src_name": "a", "dst_parent": 1, "dst_name": "moved", "src_path": "/a/", "dst_path": "/b/"}); eno != int(syscall.EINVAL) {
+		t.Fatalf("foreign destination hint errno=%d", eno)
+	}
+	for _, path := range []string{"/a/", "/b/"} {
+		if _, err := s.GetNode(ctx, path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if eno := meta("rmdir", map[string]any{"parent": 1, "name": "a", "proj_path": "/b/"}); eno != int(syscall.EINVAL) {
+		t.Fatalf("foreign rmdir hint errno=%d", eno)
+	}
+	// A classic-only child has no jfs_edge and must still make the directory nonempty.
+	now := time.Now().UTC()
+	if err := s.InsertNode(ctx, &FileNode{NodeID: "classic-child", Path: "/a/classic", ParentPath: "/a/", Name: "classic", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if eno := meta("rmdir", map[string]any{"parent": 1, "name": "a"}); eno != int(syscall.ENOTEMPTY) {
+		t.Fatalf("classic child removal errno=%d", eno)
+	}
+	if _, err := s.GetNode(ctx, "/a/"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteNode(ctx, "/a/classic"); err != nil {
+		t.Fatal(err)
+	}
+	if eno := meta("rmdir", map[string]any{"parent": 1, "name": "a"}); eno != 0 {
+		t.Fatal(eno)
+	}
+	if _, err := s.GetNode(ctx, "/a/"); err == nil {
+		t.Fatal("omitted hint left directory projection")
 	}
 }
