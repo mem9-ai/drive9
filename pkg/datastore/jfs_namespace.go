@@ -823,6 +823,29 @@ func (s *Store) jfsRenameTx(ctx context.Context, tx *sql.Tx, srcParent uint64, s
 		return 0, 0, nil, nil, eno, err
 	}
 	if attr.Typ == jfsTypeDir {
+		// Lock the current destination ancestry, including metadata-only dirs.
+		// This rejects moving a directory beneath itself and serializes a
+		// competing ancestor move without introducing another locking scheme.
+		seen := make(map[uint64]bool)
+		for parent := dstParent; parent != 0 && parent != jfsRootIno; {
+			if parent == ino || seen[parent] {
+				return 0, 0, nil, nil, int(syscall.EINVAL), nil
+			}
+			seen[parent] = true
+			var next uint64
+			var typ uint8
+			err := tx.QueryRowContext(ctx, `SELECT parent, type FROM jfs_node WHERE `+s.scope.And(`inode = ?`)+` FOR UPDATE`, s.scope.Args(parent)...).Scan(&next, &typ)
+			if errors.Is(err, sql.ErrNoRows) {
+				return 0, 0, nil, nil, int(syscall.ENOENT), nil
+			}
+			if err != nil {
+				return 0, 0, nil, nil, 0, err
+			}
+			if typ != jfsTypeDir {
+				return 0, 0, nil, nil, int(syscall.ENOTDIR), nil
+			}
+			parent = next
+		}
 		path, eno, err := s.jfsDirectoryProjectionTx(ctx, tx, ino, srcPath)
 		if err != nil || eno != 0 {
 			return 0, 0, nil, nil, eno, err

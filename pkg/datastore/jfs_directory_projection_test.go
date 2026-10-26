@@ -108,6 +108,15 @@ func TestExtentDirectoryProjectionRejectsForeignHintAndClassicChildren(t *testin
 	if eno := meta("rmdir", map[string]any{"parent": 1, "name": "a", "proj_path": "/b/"}); eno != int(syscall.EINVAL) {
 		t.Fatalf("foreign rmdir hint errno=%d", eno)
 	}
+	if eno := meta("mknod", map[string]any{"parent": 300, "inode": 302, "name": "nested", "type": 2, "mode": 0700, "proj_path": "/a/nested/", "attr": ExtentAttr{Typ: 2, Mode: 0700, Parent: 300, Nlink: 2, Full: true}}); eno != 0 {
+		t.Fatal(eno)
+	}
+	if eno := meta("rename", map[string]any{"src_parent": 1, "src_name": "a", "dst_parent": 302, "dst_name": "inside"}); eno != int(syscall.EINVAL) {
+		t.Fatalf("directory cycle errno=%d", eno)
+	}
+	if eno := meta("rmdir", map[string]any{"parent": 300, "name": "nested"}); eno != 0 {
+		t.Fatal(eno)
+	}
 	// A classic-only child has no jfs_edge and must still make the directory nonempty.
 	now := time.Now().UTC()
 	if err := s.InsertNode(ctx, &FileNode{NodeID: "classic-child", Path: "/a/classic", ParentPath: "/a/", Name: "classic", CreatedAt: now}); err != nil {
@@ -165,5 +174,33 @@ func TestExtentDirectoryProjectionLockIsLocal(t *testing.T) {
 	defer func() { _ = second.Rollback() }()
 	if _, eno, err := s.jfsDirectoryProjectionTx(deadline, second, other, ""); err != nil || eno != 0 {
 		t.Fatalf("unrelated projection blocked errno=%d err=%v", eno, err)
+	}
+}
+
+func TestExtentDirectoryProjectionRejectsMetadataOnlyCycle(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	meta := func(op string, args map[string]any) int {
+		t.Helper()
+		raw, _ := json.Marshal(args)
+		_, eno, err := s.RunExtentMetaOp(ctx, op, raw, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return eno
+	}
+	for _, entry := range []struct {
+		parent, ino uint64
+		name        string
+	}{{1, 500, "parent"}, {500, 501, "child"}} {
+		if eno := meta("mknod", map[string]any{"parent": entry.parent, "inode": entry.ino, "name": entry.name, "type": 2, "mode": 0700, "attr": ExtentAttr{Typ: 2, Mode: 0700, Parent: entry.parent, Nlink: 2, Full: true}}); eno != 0 {
+			t.Fatal(eno)
+		}
+	}
+	if eno := meta("rename", map[string]any{"src_parent": 1, "src_name": "parent", "dst_parent": 501, "dst_name": "inside"}); eno != int(syscall.EINVAL) {
+		t.Fatalf("metadata-only cycle errno=%d", eno)
+	}
+	if eno := meta("lookup", map[string]any{"parent": 1, "name": "parent"}); eno != 0 {
+		t.Fatalf("cycle rejection changed root edge errno=%d", eno)
 	}
 }
