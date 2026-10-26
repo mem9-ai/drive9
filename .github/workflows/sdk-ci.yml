@@ -53,7 +53,7 @@ jobs:
       - name: Build and test without Go
         run: |
           cmake --build build/drive9-cpp --parallel 2
-          ctest --test-dir build/drive9-cpp --output-on-failure
+          ctest --test-dir build/drive9-cpp --verbose --output-on-failure
 
   python:
     name: Python SDK

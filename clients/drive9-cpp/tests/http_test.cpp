@@ -46,13 +46,16 @@ int main(int argc, char **argv) {
         // without capping production receive buffers or disabling keep-alive.
         for (bool acknowledge : {false, true}) {
             httplib::Client constrained(base);
-            constrained.set_socket_options([](int socket) {
-                int size = 1024;
-                if (::setsockopt(socket, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size)))
-                    throw Error("Unable to constrain the fixture receive window");
-            });
+            constrained.set_keep_alive(true);
             constrained.set_read_timeout(2s);
             constrained.set_max_timeout(2s);
+            auto ready = constrained.Get("/ok");
+            if (!ready || ready->body != "ok") throw Error("Unable to establish the fixture connection");
+            // Shrink after SYN negotiation so the original large MSS/window
+            // scale remains, matching the stalled keep-alive connection.
+            int window = 1024;
+            if (::setsockopt(constrained.socket(), SOL_SOCKET, SO_RCVBUF, &window, sizeof(window)))
+                throw Error("Unable to constrain the established receive window");
             std::string received;
             httplib::Request request; request.method = "GET"; request.path = "/block";
             request.content_receiver = [&](const char *data, size_t length, uint64_t, uint64_t) {
