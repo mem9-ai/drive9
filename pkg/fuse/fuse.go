@@ -1710,16 +1710,21 @@ func (f *FS) checkSetAttrModeForCaller(caller fs.Caller, entry *InodeEntry, inpu
 }
 
 func (f *FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *gofuse.AttrOut) gofuse.Status {
-	// A detached inode has no name to mutate: pathname resolution refuses
-	// it (ENOENT) unless a descriptor carries the operation, in which case
-	// the fd's own recorded path identifies the object — never the
-	// tombstone path, which a later reclaim can point at a NEW object.
+	// A detached inode has no name to mutate, and the backend has no
+	// object-bound metadata capability: a descriptor's recorded path names
+	// the REPLACEMENT object at best (Core.setAttrOp dispatches by op.Path
+	// even with a handle), so executing the mutation could chmod the
+	// directory that took the name. Reject instead — ESTALE for the
+	// descriptor form, ENOENT for the pathname form.
 	setattrFH := uint64(0)
 	if input.Valid&gofuse.FATTR_FH != 0 {
 		setattrFH = input.Fh
 	}
-	path, ok := f.dispatchPath(input.NodeId, setattrFH)
+	path, ok := f.inodes.GetPath(input.NodeId)
 	if !ok {
+		if setattrFH != 0 {
+			return gofuse.Status(syscall.ESTALE)
+		}
 		return gofuse.ENOENT
 	}
 	entry, _ := f.inodes.GetEntry(input.NodeId)
@@ -2631,12 +2636,17 @@ func (f *FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse.Open
 
 // openHandle returns the handle chain head for fh, or nil to fall back to
 // path-addressed dispatch.
-// dispatchPath resolves the path an inode-addressed DATA operation should
-// dispatch with. It is the GetPath escape hatch for live descriptors: a
-// detached inode (its name taken over by a different-kind object) refuses
-// pathname resolution, but the descriptor's own recorded path still
-// identifies the object the fd was opened on, keeping fd reads/writes and
-// their final flush functional.
+// dispatchPath resolves the path an inode-addressed DATA-plane operation
+// should dispatch with. It is the GetPath escape hatch for live
+// descriptors: a detached inode (its name taken over by a different-kind
+// object) refuses pathname resolution, but the descriptor's own recorded
+// path still keys the write plane's ORIGINAL-object handle (its buffer,
+// flush and deferred delete), keeping fd reads/writes and their final
+// release functional. Mutating operations that the backend executes
+// PATH-side (SetAttr, Fallocate, CopyFileRange) must NOT use this
+// fallback: the path can name the replacement object, and the backend has
+// no object-bound capability for them — they resolve through GetPath
+// alone and reject when it refuses.
 func (f *FS) dispatchPath(nodeid, fh uint64) (string, bool) {
 	if path, ok := f.inodes.GetPath(nodeid); ok {
 		return path, true
@@ -2921,8 +2931,14 @@ func (f *FS) SetLkw(cancel <-chan struct{}, input *gofuse.LkIn) gofuse.Status {
 }
 
 func (f *FS) Fallocate(cancel <-chan struct{}, input *gofuse.FallocateIn) gofuse.Status {
-	path, ok := f.dispatchPath(input.NodeId, input.Fh)
+	// Mutating op: a detached inode's descriptor cannot preserve the
+	// opened object's identity (see SetAttr) — reject, never mutate the
+	// replacement the old path may name now.
+	path, ok := f.inodes.GetPath(input.NodeId)
 	if !ok {
+		if input.Fh != 0 {
+			return gofuse.Status(syscall.ESTALE)
+		}
 		return gofuse.ENOENT
 	}
 	ctx, cf := fuseCtx(cancel)
@@ -2936,12 +2952,21 @@ func (f *FS) Fallocate(cancel <-chan struct{}, input *gofuse.FallocateIn) gofuse
 }
 
 func (f *FS) CopyFileRange(cancel <-chan struct{}, input *gofuse.CopyFileRangeIn) (uint32, gofuse.Status) {
-	srcPath, ok := f.dispatchPath(input.NodeId, input.FhIn)
+	// Mutating op (see SetAttr): a detached endpoint's descriptor cannot
+	// preserve the opened object's identity — reject rather than copy
+	// through a path that may name the replacement object.
+	srcPath, ok := f.inodes.GetPath(input.NodeId)
 	if !ok {
+		if input.FhIn != 0 {
+			return 0, gofuse.Status(syscall.ESTALE)
+		}
 		return 0, gofuse.ENOENT
 	}
-	dstPath, ok := f.dispatchPath(input.NodeIdOut, input.FhOut)
+	dstPath, ok := f.inodes.GetPath(input.NodeIdOut)
 	if !ok {
+		if input.FhOut != 0 {
+			return 0, gofuse.Status(syscall.ESTALE)
+		}
 		return 0, gofuse.ENOENT
 	}
 	ctx, cf := fuseCtx(cancel)

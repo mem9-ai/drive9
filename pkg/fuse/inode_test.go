@@ -590,3 +590,61 @@ func TestGetAttrByDirHandleOnDetachedInodeServesEntry(t *testing.T) {
 		t.Fatalf("GetAttr without descriptor on detached inode = %v, want ENOENT", st)
 	}
 }
+
+// The reviewer's descriptor-identity probe, end to end through the real
+// facade flow: create a file, keep its descriptor, let a directory take
+// over the name, then SETATTR(mode) with the old nodeid + FATTR_FH. The
+// backend executes setattr path-side (no object-bound capability), so the
+// operation must be rejected (ESTALE) and the replacement directory's
+// mode must never change.
+func TestSetAttrByHandleAfterKindReplacementNeverMutatesReplacement(t *testing.T) {
+	core := newMemCore()
+	f, err := New(Options{Extensions: []fs.Handler{core}, Uid: 1000, Gid: 1000})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Real create: allocates the kernel nodeid and a file descriptor.
+	createIn := &gofuse.CreateIn{}
+	createIn.NodeId = 1
+	createIn.Mode = 0o644
+	createIn.Flags = uint32(syscall.O_CREAT | syscall.O_WRONLY)
+	var cout gofuse.CreateOut
+	if st := f.Create(nil, createIn, "gone", &cout); st != gofuse.OK {
+		t.Fatalf("create /gone = %v", st)
+	}
+	nodeid, fh := cout.NodeId, cout.Fh
+	if fh == 0 {
+		t.Fatal("create returned no file handle")
+	}
+
+	// Sanity: a descriptor chmod on the LIVE file applies.
+	setIn := &gofuse.SetAttrIn{}
+	setIn.NodeId = nodeid
+	setIn.Fh = fh
+	setIn.Valid = gofuse.FATTR_FH | gofuse.FATTR_MODE
+	setIn.Mode = 0o600
+	var aout gofuse.AttrOut
+	if st := f.SetAttr(nil, setIn, &aout); st != gofuse.OK {
+		t.Fatalf("live descriptor chmod = %v", st)
+	}
+
+	// The name is taken over by a directory (another client's view); the
+	// next lookup of the path observes the kind change and detaches the
+	// old file inode.
+	core.mu.Lock()
+	core.paths["/gone"] = &memEntry{isDir: true, mode: 0o755}
+	core.mu.Unlock()
+	f.inodes.Lookup("/gone", true, 0, time.Now())
+
+	setIn.Mode = 0o700
+	if st := f.SetAttr(nil, setIn, &aout); st != gofuse.Status(syscall.ESTALE) {
+		t.Fatalf("descriptor chmod on detached inode = %v, want ESTALE", st)
+	}
+	core.mu.Lock()
+	replacement := core.paths["/gone"]
+	core.mu.Unlock()
+	if replacement == nil || !replacement.isDir || replacement.mode != 0o755 {
+		t.Fatalf("replacement object mutated: %+v", replacement)
+	}
+}
