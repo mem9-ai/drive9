@@ -303,7 +303,7 @@ func (u *WriteBackUploader) RecoverPending() {
 }
 
 // UploadSync synchronously uploads a single path from the cache to the server.
-// Waits for any in-flight background upload to finish first, then uploads with
+// Serializes with other uploads of the same path, then uploads with
 // generation protection. Used by Fsync/Rename which require the data to be
 // persisted remotely before returning.
 func (u *WriteBackUploader) UploadSync(ctx context.Context, localPath string) error {
@@ -314,8 +314,11 @@ func (u *WriteBackUploader) UploadSync(ctx context.Context, localPath string) er
 // UploadSyncWithRevision uploads one path synchronously and reports
 // the committed revision.
 func (u *WriteBackUploader) UploadSyncWithRevision(ctx context.Context, localPath string) (int64, error) {
-	// Wait for any in-flight background upload to complete first.
-	u.WaitPath(localPath)
+	// Own the gate through cache cleanup, just like uploadOne. A wait alone
+	// leaves a gap in which a background or second synchronous upload can
+	// publish the same generation and trigger a false revision conflict.
+	release := u.acquirePath(localPath)
+	defer release()
 
 	// staging.PendingChmod entries have no .dat file (data already uploaded, only
 	// chmod remains). Read meta first so we can handle chmod without loading
