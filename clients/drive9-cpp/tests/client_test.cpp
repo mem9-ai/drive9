@@ -167,11 +167,17 @@ void ParallelReadsAndClose() {
         char bytes[8]; Check(fs.ReadAt(file, bytes, 8, 0) == 8 && std::string(bytes, 8) == "abcdefgh", "parallel read mismatch");
     }));
     { std::unique_lock<std::mutex> lock(f.mu); f.cv.wait(lock, [&] { return f.get_entered; }); }
+    { std::lock_guard<std::mutex> lock(f.mu); f.gate_get = false; } f.cv.notify_all();
+    for (auto &reader : readers) reader.get();
+    Check(f.gets == 1, "concurrent cache misses duplicated downloads");
+    fs.WriteAt(file, "new data", 8, 0);
+    { std::lock_guard<std::mutex> lock(f.mu); f.gate_get = true; f.get_entered = false; }
+    auto read = std::async(std::launch::async, [&] { char bytes[8]; fs.ReadAt(file, bytes, 8, 0); });
+    { std::unique_lock<std::mutex> lock(f.mu); f.cv.wait(lock, [&] { return f.get_entered; }); }
     auto close = std::async(std::launch::async, [&] { fs.Close(file); });
     Check(close.wait_for(20ms) == std::future_status::timeout, "close overtook a read");
     { std::lock_guard<std::mutex> lock(f.mu); f.gate_get = false; } f.cv.notify_all();
-    for (auto &reader : readers) reader.get(); close.get();
-    Check(f.gets == 1, "concurrent cache misses duplicated downloads");
+    read.get(); close.get();
     char data; Fails([&] { fs.ReadAt(file, &data, 1, 0); }, "read after close accepted");
 }
 void CredentialBindingAndRefresh() {
