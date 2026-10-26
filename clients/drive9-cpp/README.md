@@ -38,6 +38,7 @@ clients. Locks require cooperation from every application accessing a file.
 ## Capability audit
 
 No new endpoint, schema, lock table or database-specific protocol is introduced.
+One additive, opt-in directory projection option is documented below.
 
 | Client capability | Existing public API |
 | --- | --- |
@@ -100,7 +101,12 @@ maps and reloads authoritative attributes before returning ownership. File lengt
 also follows this TTL, including unlocked append/truncate readers. Non-regular
 files are rejected rather than treating symlinks as sparse regular data.
 
-Empty extent directories are projected in the existing server mknod transaction.
+The confirmed API gap is closed with the generic optional `mknod.create_projection`
+field; `new_session.directory_projection` advertises support. Empty directories
+are projected in that same existing transaction. The flag defaults to false,
+preserving Go/FUSE clients that follow metadata mkdir with classic mkdir. C++
+`Mkdir` requires the advertised capability and fails before mutating older servers.
+Existing file operations and mirroring existing classic directories remain usable.
 Directory rename preserves descendants in both the extent and `/v1/fs` views;
 preexisting classic directories are mirrored using that same mknod operation.
 These are generic namespace repairs, with no extra endpoint, table or lease.

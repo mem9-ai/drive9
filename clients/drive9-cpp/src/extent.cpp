@@ -74,7 +74,7 @@ struct ExtentFileSystem::Impl {
     uint64_t sid = 0, next_handle = 0;
     uint64_t next_slice = 0, slice_limit = 0, next_inode = 0, inode_limit = 0;
     std::mutex allocation_mu;
-    bool guard_supported = false, hash_prefix = false, closed = false;
+    bool guard_supported = false, directory_projection = false, hash_prefix = false, closed = false;
     std::atomic<bool> failed{false};
     std::atomic<int64_t> expiry_ticks{INT64_MAX};
     // Lifetime gate: positional reads share it; writes/close/shutdown exclude
@@ -124,6 +124,7 @@ struct ExtentFileSystem::Impl {
         auto registration = Meta("new_session", {{"sid", sid}, {"expire", expire}, {"update", false},
                                                   {"info", detail::EncodeBase64(Json({{"Version", "drive9-cpp/0.1.0"}}).dump())}});
         guard_supported = registration.value("session_guard", false);
+        directory_projection = registration.value("directory_projection", false);
         Confirm(expire);
         if (options.heartbeat < std::chrono::seconds(12) && !guard_supported) {
             ExpireSession();
@@ -530,9 +531,11 @@ void ExtentFileSystem::Close(uint64_t handle) {
 }
 void ExtentFileSystem::Mkdir(const std::string &input) {
     auto &s = *impl_; std::unique_lock<std::shared_mutex> lock(s.lifetime); s.Ready();
-    auto path = CanonicalPath(input); auto parent = s.Parent(path);
+    auto path = CanonicalPath(input);
+    if (!s.directory_projection) throw Error("Server lacks transactional directory projection support", 95);
+    auto parent = s.Parent(path);
     s.Meta("mknod", {{"parent", parent.first}, {"name", parent.second}, {"type", 2}, {"mode", 0700}, {"inode", s.NewInode()},
-                      {"proj_path", path + "/"}, {"attr", Json::object()}});
+                      {"create_projection", true}, {"proj_path", path + "/"}, {"attr", Json::object()}});
 }
 void ExtentFileSystem::Remove(const std::string &input) {
     auto &s = *impl_; std::unique_lock<std::shared_mutex> lock(s.lifetime); s.Ready();

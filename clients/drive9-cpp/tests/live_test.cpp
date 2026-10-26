@@ -55,7 +55,8 @@ int main() {
         client->Request("HEAD", "/v1/fs" + root + "/moved/nested/file");
         char tree[4]; Check(a.ReadAt(nested, tree, 4, 0) == 4 && std::string(tree, 4) == "tree", "directory rename invalidated open file");
         a.Close(nested); a.Remove(root + "/moved/nested/file"); a.Remove(root + "/moved/nested"); a.Remove(root + "/moved");
-        client->Request("POST", "/v1/fs" + root + "/classic?mkdir=1&mode=750");
+        client->Request("POST", "/v1/fs" + root + "/classic?mkdir=1&mode=488");
+        Fails([&] { a.Mkdir(root + "/classic"); }, "mkdir replaced an existing classic directory");
         auto classic = a.Open(root + "/classic/child", create);
         a.WriteAt(classic, "classic", 7, 0); a.Close(classic);
         client->Request("HEAD", "/v1/fs" + root + "/classic/child");
@@ -68,6 +69,24 @@ int main() {
         a.Truncate(growing, 2);
         Check(observer.Info(watching).size == 2 && observer.ReadAt(watching, growth, 8, 0) == 2, "unlocked reader retained stale truncate size");
         observer.Close(watching); a.Close(growing); a.Remove(root + "/growing");
+        // Replay the existing Go/FUSE mkdir sequence through real HTTP.
+        auto allocation = client->ExtentMeta("incr_counter", {{"name", "nextInode"}, {"value", 1}});
+        auto legacy_inode = allocation.at("value").get<uint64_t>() - 1;
+        auto legacy = client->ExtentMeta("mknod", {{"parent", a.Stat(root).inode}, {"name", "legacy"}, {"inode", legacy_inode},
+            {"type", 2}, {"mode", 0700}, {"proj_path", root + "/legacy/"}, {"attr", Json::object()}, {"caller_sid", a.SessionID()}});
+        Check(legacy.at("errno") == 0, "legacy metadata mkdir failed");
+        try { client->Request("POST", "/v1/fs" + root + "/legacy?mkdir=1&mode=448"); }
+        catch (const Error &error) { throw Error("Legacy classic mkdir after metadata mkdir rejected (HTTP " + std::to_string(error.status) + ")"); }
+        a.Mkdir(root + "/move-into-legacy");
+        a.Rename(root + "/move-into-legacy", root + "/legacy/child");
+        a.Remove(root + "/legacy/child");
+        a.Rename(root + "/legacy", root + "/legacy-moved");
+        client->Request("HEAD", "/v1/fs" + root + "/legacy-moved/");
+        a.Remove(root + "/legacy-moved");
+        client->WriteFile(root + "/classic-file", "preserved");
+        Fails([&] { a.Mkdir(root + "/classic-file"); }, "mkdir hid an existing classic file");
+        Check(client->ReadFile(root + "/classic-file").body == "preserved", "mkdir modified a classic file");
+        client->Request("DELETE", "/v1/fs" + root + "/classic-file");
         auto path = root + "/binary";
         OpenOptions writer; writer.create = writer.write = true; writer.lock = Lock::Exclusive;
         OpenOptions reader; reader.lock = Lock::Shared;

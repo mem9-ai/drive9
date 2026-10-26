@@ -35,7 +35,7 @@ public:
     std::map<std::string, std::string> objects;
     std::vector<Json> calls;
     int refs = 0, puts = 0, gets = 0, publications = 0, mints = 0;
-    bool exists = false, guarded = true, fail_ack = false, fail_put = false, removed = false;
+    bool exists = false, guarded = true, directory_projection = true, fail_ack = false, fail_put = false, removed = false;
     bool gate_put = false, put_entered = false, gate_get = false, get_entered = false;
     bool binding_change = false, refresh_auth = false;
     bool fail_cleanup = false;
@@ -88,7 +88,7 @@ public:
             counter += delta; response["value"] = counter;
             reservations[request.at("name").get<std::string>()].push_back({counter, delta});
         }
-        else if (op == "new_session") { sid = request.at("sid"); response["session_guard"] = guarded; }
+        else if (op == "new_session") { sid = request.at("sid"); response["session_guard"] = guarded; response["directory_projection"] = directory_projection; }
         else if (op == "refresh_session" && removed) response["errno"] = 116;
         else if (op == "find_stale_sessions") response["sids"] = Json::array();
         else if (op == "getattr" || op == "lookup") {
@@ -344,8 +344,18 @@ void DefaultCloudCredentials() {
     provider->credential["endpoint"] = "http://127.0.0.1:8080/storage/v1/";
     { detail::ObjectStore store(client); }
 }
+void DirectoryProjectionCapability() {
+    auto fixture = std::make_shared<Fixture>(); fixture->directory_projection = false;
+    auto client = std::make_shared<Client>(ClientOptions{"http://fs.test", "token", 30s, fixture});
+    ExtentFileSystem fs(client);
+    Fails([&] { fs.Mkdir("/unsupported"); }, "legacy server silently created an unprojected directory");
+    for (auto &call : fixture->calls) Check(call.at("op") != "mknod", "unsupported mkdir mutated the legacy namespace");
+    OpenOptions writer; writer.create = writer.write = true;
+    auto file = fs.Open("/regular", writer); fs.WriteAt(file, "ok", 2, 0); fs.Close(file);
+}
 int main() {
     try {
+        DirectoryProjectionCapability();
         PathsAndSlices(); DurableSparseAndReferences(); CompatibleIDReservations(); LostPublicationAck(); MalformedAcknowledgement(); UploadFailure(); LatePutRejected();
         ParallelReadsAndClose(); CredentialBindingAndRefresh(); LeaseAndLegacy(); MaintenanceDoesNotRevokeOwnership();
         RefreshLengthAndRejectSymlinks(); GCSScopedTransport(); DefaultCloudCredentials();
