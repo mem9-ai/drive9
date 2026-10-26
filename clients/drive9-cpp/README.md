@@ -105,10 +105,13 @@ The confirmed API gap is closed with the generic optional `mknod.create_projecti
 field; `new_session.directory_projection` advertises support. Empty directories
 are projected in that same existing transaction. The flag defaults to false,
 preserving Go/FUSE clients that follow metadata mkdir with classic mkdir. C++
-`Mkdir` requires the advertised capability and fails before mutating older servers.
+Directory creation, removal and rename require the advertised capability; unsafe
+directory mutations are rejected on older servers.
 Existing file operations and mirroring existing classic directories remain usable.
 Directory rename preserves descendants in both the extent and `/v1/fs` views;
 preexisting classic directories are mirrored using that same mknod operation.
+Rename validates target type and emptiness in the existing server transaction,
+including classic-only targets that have not yet acquired an extent edge.
 These are generic namespace repairs, with no extra endpoint, table or lease.
 Stale-session sweeping is best-effort maintenance and does not revoke a healthy
 client when an unrelated expired session cannot be cleaned.

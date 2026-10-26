@@ -371,6 +371,20 @@ void DefaultCloudCredentials() {
     provider->credential["endpoint"] = "http://127.0.0.1:8080/storage/v1/";
     { detail::ObjectStore store(client); }
 }
+void LegacyDirectoryRenameIsRejected() {
+    Fixture f; f.directory_projection = false; f.exists = true; f.attr["Typ"] = 2;
+    ExtentFileSystem fs(f.ClientFor());
+    bool rejected = false;
+    try { fs.Rename("/source", "/target"); }
+    catch (const Error &error) { rejected = error.code == 95; }
+    Check(rejected, "legacy server accepted an unsafe directory rename");
+    rejected = false;
+    try { fs.Remove("/source"); }
+    catch (const Error &error) { rejected = error.code == 95; }
+    Check(rejected, "legacy server accepted an unsafe directory removal");
+    for (auto &call : f.calls)
+        Check(call.at("op") != "rename" && call.at("op") != "rmdir", "legacy directory mutation reached the server");
+}
 void DirectoryProjectionCapability() {
     auto fixture = std::make_shared<Fixture>(); fixture->directory_projection = false;
     auto client = std::make_shared<Client>(ClientOptions{"http://fs.test", "token", 30s, fixture});
@@ -382,7 +396,7 @@ void DirectoryProjectionCapability() {
 }
 int main() {
     try {
-        DirectoryProjectionCapability();
+        DirectoryProjectionCapability(); LegacyDirectoryRenameIsRejected();
         PathsAndSlices(); DurableSparseAndReferences(); CompatibleIDReservations(); LostPublicationAck(); MalformedAcknowledgement(); UploadFailure(); LatePutRejected();
         ParallelReadsAndClose(); SyncDoesNotWaitForDownloads(); CredentialBindingAndRefresh(); LeaseAndLegacy(); MaintenanceDoesNotRevokeOwnership();
         RefreshLengthAndRejectSymlinks(); GCSScopedTransport(); DefaultCloudCredentials();

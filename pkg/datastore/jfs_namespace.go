@@ -994,6 +994,40 @@ func (s *Store) jfsRenameTx(ctx context.Context, tx *sql.Tx, srcParent uint64, s
 		}
 	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return 0, 0, nil, nil, 0, err
+	} else if errors.Is(err, sql.ErrNoRows) && dstPath != "" {
+		// A classic-only destination has no edge to trigger the checks above.
+		// Check both path spellings under this same transaction before moving
+		// any edge or projection; never merge a nonempty directory subtree.
+		base := strings.TrimSuffix(dstPath, "/")
+		for _, path := range []string{base, base + "/"} {
+			var directory bool
+			err := tx.QueryRowContext(ctx, `SELECT is_directory FROM file_nodes WHERE `+s.scope.And(`path_hash = ? AND path = ?`)+` FOR UPDATE`,
+				s.scope.Args(fileNodePathHash(path), path)...).Scan(&directory)
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			if err != nil {
+				return 0, 0, nil, nil, 0, err
+			}
+			if flags&jfsRenameNoReplace != 0 {
+				return 0, 0, attr, nil, int(syscall.EEXIST), nil
+			}
+			if directory && attr.Typ != jfsTypeDir {
+				return 0, 0, attr, nil, int(syscall.EISDIR), nil
+			}
+			if !directory && attr.Typ == jfsTypeDir {
+				return 0, 0, attr, nil, int(syscall.ENOTDIR), nil
+			}
+			if directory {
+				occupied, err := s.dirHasChildrenTx(ctx, tx, path)
+				if err != nil {
+					return 0, 0, nil, nil, 0, err
+				}
+				if occupied {
+					return 0, 0, attr, nil, int(syscall.ENOTEMPTY), nil
+				}
+			}
+		}
 	}
 	res, err := tx.Exec(`DELETE FROM jfs_edge WHERE parent = ? AND name = ?`, srcParent, []byte(srcName))
 	if err != nil {

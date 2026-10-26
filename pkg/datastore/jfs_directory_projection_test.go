@@ -353,3 +353,69 @@ func TestExtentDirectoryProjectionRejectsClassicOnlyConflict(t *testing.T) {
 		t.Fatalf("rejected create replaced classic identity node=%+v err=%v", node, err)
 	}
 }
+
+func TestExtentRenameRejectsClassicOnlyDestinationConflicts(t *testing.T) {
+	for _, test := range []struct {
+		name                        string
+		sourceDir, targetDir, child bool
+		errno                       int
+	}{
+		{"file_over_directory", false, true, false, int(syscall.EISDIR)},
+		{"directory_over_file", true, false, false, int(syscall.ENOTDIR)},
+		{"directory_over_nonempty_directory", true, true, true, int(syscall.ENOTEMPTY)},
+		{"directory_over_empty_directory", true, true, false, 0},
+		{"file_over_file", false, false, false, 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s := newTestStore(t)
+			ctx := context.Background()
+			typ, source, target := 1, "/source", "/target"
+			if test.sourceDir {
+				typ = 2
+				source += "/"
+			}
+			if test.targetDir {
+				target += "/"
+			}
+			raw, _ := json.Marshal(map[string]any{"parent": 1, "inode": 950, "name": "source", "type": typ, "mode": 0700, "create_projection": true, "proj_path": source, "attr": ExtentAttr{Typ: uint8(typ), Mode: 0700, Parent: 1, Nlink: 1, Full: true}})
+			if _, eno, err := s.RunExtentMetaOp(ctx, "mknod", raw, nil); err != nil || eno != 0 {
+				t.Fatalf("source errno=%d err=%v", eno, err)
+			}
+			now := time.Now().UTC()
+			if err := s.InsertInode(ctx, &Inode{InodeID: "classic-target", Mode: 0700, Revision: 1, Status: StatusConfirmed, CreatedAt: now, Mtime: now}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.InsertNode(ctx, &FileNode{NodeID: "classic-target-node", InodeID: "classic-target", Path: target, ParentPath: "/", Name: "target", IsDirectory: test.targetDir, CreatedAt: now}); err != nil {
+				t.Fatal(err)
+			}
+			if test.child {
+				if err := s.InsertNode(ctx, &FileNode{NodeID: "classic-child-node", InodeID: "classic-target", Path: "/target/child", ParentPath: "/target/", Name: "child", CreatedAt: now}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// Raw metadata clients cannot depend on a C++/Go preflight or mirroring.
+			raw, _ = json.Marshal(map[string]any{"src_parent": 1, "src_name": "source", "dst_parent": 1, "dst_name": "target", "src_path": source, "dst_path": map[bool]string{true: "/target/", false: "/target"}[test.sourceDir]})
+			if _, eno, err := s.RunExtentMetaOp(ctx, "rename", raw, nil); err != nil || eno != test.errno {
+				t.Fatalf("rename errno=%d want=%d err=%v", eno, test.errno, err)
+			}
+			if test.errno == 0 {
+				if _, err := s.GetNode(ctx, source); err == nil {
+					t.Fatal("successful rename retained source")
+				}
+				if _, err := s.GetNode(ctx, target); err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+			for _, path := range []string{source, target} {
+				if _, err := s.GetNode(ctx, path); err != nil {
+					t.Fatalf("rejected rename changed %s: %v", path, err)
+				}
+			}
+			lookup, _ := json.Marshal(map[string]any{"parent": 1, "name": "source"})
+			if _, eno, err := s.RunExtentMetaOp(ctx, "lookup", lookup, nil); err != nil || eno != 0 {
+				t.Fatalf("source edge changed errno=%d err=%v", eno, err)
+			}
+		})
+	}
+}

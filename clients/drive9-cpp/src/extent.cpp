@@ -544,13 +544,23 @@ void ExtentFileSystem::Mkdir(const std::string &input) {
 void ExtentFileSystem::Remove(const std::string &input) {
     auto &s = *impl_; std::unique_lock<std::shared_mutex> lock(s.lifetime); s.Ready();
     auto path = CanonicalPath(input); auto parent = s.Parent(path); auto info = s.Lookup(path);
+    if (info.directory && !s.directory_projection)
+        throw Error("Server lacks consistent directory removal support", 95);
     s.Meta(info.directory ? "rmdir" : "unlink", {{"parent", parent.first}, {"name", parent.second},
                {"proj_path", info.directory ? path + "/" : path}, {"sid", s.sid}, {"opened", false}});
 }
 void ExtentFileSystem::Rename(const std::string &source, const std::string &target) {
     auto &s = *impl_; std::unique_lock<std::shared_mutex> lock(s.lifetime); s.Ready();
-    auto from = CanonicalPath(source), to = CanonicalPath(target); auto a = s.Parent(from), b = s.Parent(to);
+    auto from = CanonicalPath(source), to = CanonicalPath(target);
     auto info = s.Lookup(from);
+    if (info.directory && !s.directory_projection)
+        throw Error("Server lacks consistent directory rename support", 95);
+    try {
+        auto destination = s.Lookup(to);
+        if (info.directory != destination.directory)
+            throw Error("Rename destination has a different type", destination.directory ? 21 : 20);
+    } catch (const Error &error) { if (error.code != 2) throw; }
+    auto a = s.Parent(from), b = s.Parent(to);
     if (info.directory) { from += '/'; to += '/'; }
     s.Meta("rename", {{"src_parent", a.first}, {"src_name", a.second}, {"dst_parent", b.first}, {"dst_name", b.second},
                       {"flags", 0}, {"src_path", from}, {"dst_path", to}, {"sid", s.sid}, {"dst_opened", false}});

@@ -87,6 +87,18 @@ int main() {
         Fails([&] { a.Mkdir(root + "/classic-file"); }, "mkdir hid an existing classic file");
         Check(client->ReadFile(root + "/classic-file").body == "preserved", "mkdir modified a classic file");
         client->Request("DELETE", "/v1/fs" + root + "/classic-file");
+        // Classic-only targets must obey the same POSIX rename rules.
+        a.Mkdir(root + "/rename-source");
+        client->Request("POST", "/v1/fs" + root + "/rename-target?mkdir=1");
+        client->WriteFile(root + "/rename-target/child", "keep");
+        Fails([&] { a.Rename(root + "/rename-source", root + "/rename-target"); }, "rename merged a nonempty classic directory");
+        Check(client->ReadFile(root + "/rename-target/child").body == "keep", "rejected rename changed a classic child");
+        auto regular = a.Open(root + "/rename-file", create); a.Close(regular);
+        Fails([&] { a.Rename(root + "/rename-file", root + "/rename-target"); }, "file replaced a classic directory");
+        Fails([&] { a.Rename(root + "/rename-source", root + "/rename-file"); }, "directory replaced a regular file");
+        client->Request("DELETE", "/v1/fs" + root + "/rename-target/child");
+        a.Rename(root + "/rename-source", root + "/rename-target");
+        a.Remove(root + "/rename-target"); a.Remove(root + "/rename-file");
         auto path = root + "/binary";
         OpenOptions writer; writer.create = writer.write = true; writer.lock = Lock::Exclusive;
         OpenOptions reader; reader.lock = Lock::Shared;
