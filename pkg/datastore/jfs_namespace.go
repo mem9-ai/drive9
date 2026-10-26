@@ -180,11 +180,7 @@ func (s *Store) jfsRequireDirTx(tx *sql.Tx, ino uint64) (int, error) {
 	return 0, nil
 }
 
-func (s *Store) jfsMknodTx(ctx context.Context, tx *sql.Tx, parent uint64, name string, typ uint8, mode, cumask uint16, inode uint64, attr ExtentAttr, projPath string, uid, gid uint32, symlinkTarget string) (uint64, *ExtentAttr, int, error) {
-	return s.jfsMknodWithProjectionTx(ctx, tx, parent, name, typ, mode, cumask, inode, attr, projPath, uid, gid, symlinkTarget, false)
-}
-
-func (s *Store) jfsMknodWithProjectionTx(ctx context.Context, tx *sql.Tx, parent uint64, name string, typ uint8, mode, cumask uint16, inode uint64, attr ExtentAttr, projPath string, uid, gid uint32, symlinkTarget string, createProjection bool) (uint64, *ExtentAttr, int, error) {
+func (s *Store) jfsMknodTx(ctx context.Context, tx *sql.Tx, parent uint64, name string, typ uint8, mode, cumask uint16, inode uint64, attr ExtentAttr, projPath string, uid, gid uint32, symlinkTarget string, createProjection bool) (uint64, *ExtentAttr, int, error) {
 	if createProjection && typ == jfsTypeDir {
 		canonical, err := pathutil.CanonicalizeDir(projPath)
 		if projPath == "" || err != nil || pathutil.BaseName(canonical) != name {

@@ -585,7 +585,7 @@ func (s *Store) dispatchExtentOp(ctx context.Context, tx *sql.Tx, op string, raw
 		if err := json.Unmarshal(raw, &in); err != nil {
 			return nil, int(syscall.EINVAL), err
 		}
-		ino, attr, eno, err := s.jfsMknodWithProjectionTx(ctx, tx, in.Parent, in.Name, in.Type, in.Mode, in.Cumask, in.Inode, in.Attr, in.ProjPath, in.Uid, in.Gid, in.Path, in.CreateProjection)
+		ino, attr, eno, err := s.jfsMknodTx(ctx, tx, in.Parent, in.Name, in.Type, in.Mode, in.Cumask, in.Inode, in.Attr, in.ProjPath, in.Uid, in.Gid, in.Path, in.CreateProjection)
 		if err != nil {
 			// The transaction must roll back, while preserving expected
 			// namespace conflicts rather than converting them to EIO.
