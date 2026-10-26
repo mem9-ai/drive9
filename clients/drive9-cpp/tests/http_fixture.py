@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -45,6 +46,30 @@ class Handler(BaseHTTPRequestHandler):
                 type(self).tls_closed.notify_all()
 
     def do_GET(self):
+        if self.path.startswith("/error/"):
+            # Error documents can be far larger than a one-byte immutable
+            # block. Cover both header and streaming response-size limits.
+            _, _, status, framing = urlsplit(self.path).path.split("/")
+            self.send_response(int(status))
+            self.send_header("X-Fixture-Error", "object")
+            data = b"<Error><Code>NoSuchKey</Code>" + b"x" * 65536 + b"</Error>"
+            if framing == "length":
+                self.send_header("Content-Length", str(len(data)))
+            else:
+                self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            if framing == "length":
+                self.wfile.write(data)
+            else:
+                self.wfile.write(b"1\r\n<\r\n")
+                self.wfile.write(f"{len(data) - 1:x}\r\n".encode() + data[1:] + b"\r\n0\r\n\r\n")
+            return
+        if self.path in ("/byte", "/old-byte"):
+            self.send_response(200)
+            self.send_header("Content-Length", "1")
+            self.end_headers()
+            self.wfile.write(b"A" if self.path == "/old-byte" else b"B")
+            return
         if self.path.startswith("/await-tls-drop?count="):
             count = int(self.path.split("=", 1)[1])
             with type(self).tls_closed:

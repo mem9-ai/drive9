@@ -4,12 +4,119 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/pathutil"
 )
+
+func TestExtentDirectoryRenameUsesBinarySubtree(t *testing.T) {
+	for _, collation := range []string{"utf8mb4_bin", "utf8mb4_general_ci"} {
+		t.Run(collation, func(t *testing.T) {
+			s := newTestStore(t)
+			ctx := context.Background()
+			var original string
+			if err := s.db.QueryRowContext(ctx, `SELECT COLLATION_NAME FROM information_schema.COLUMNS
+				WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'file_nodes' AND COLUMN_NAME = 'path'`).Scan(&original); err != nil {
+				t.Fatal(err)
+			}
+			// Exercise inherited case/accent-insensitive schemas, then restore the
+			// shared test table even when a regression aborts the test.
+			t.Cleanup(func() {
+				if _, err := s.db.ExecContext(ctx, `ALTER TABLE file_nodes MODIFY path TEXT COLLATE `+original+` NOT NULL`); err != nil {
+					t.Error(err)
+				}
+			})
+			if _, err := s.db.ExecContext(ctx, `ALTER TABLE file_nodes MODIFY path TEXT COLLATE `+collation+` NOT NULL`); err != nil {
+				t.Fatal(err)
+			}
+			meta := func(op string, args map[string]any) {
+				t.Helper()
+				raw, err := json.Marshal(args)
+				if err != nil {
+					t.Fatal(err)
+				}
+				body, eno, err := s.RunExtentMetaOp(ctx, op, raw, nil)
+				if err != nil || eno != 0 {
+					t.Fatalf("%s(%s): errno=%d err=%v body=%s", op, raw, eno, err, body)
+				}
+			}
+			for i, tc := range []struct{ source, neighbor string }{
+				{"a", "A"}, {"cafe", "café"}, {"x_y", "xay"}, {"p%q", "pZZq"}, {"prefix", "prefix-long"},
+			} {
+				t.Run(tc.source, func(t *testing.T) {
+					before := make(map[string]*FileNode)
+					extentInodes := make(map[string]uint64)
+					// Both the directory itself and nested children must stay bound
+					// to their original extent inode and classic projection identity.
+					for j, name := range []string{tc.source, tc.neighbor} {
+						ino := uint64(1000 + i*10 + j*3)
+						for _, node := range []struct {
+							parent, inode uint64
+							name, path    string
+							typ           uint8
+						}{
+							{1, ino, name, "/" + name + "/", jfsTypeDir},
+							{ino, ino + 1, "nested", "/" + name + "/nested/", jfsTypeDir},
+							{ino + 1, ino + 2, "child", "/" + name + "/nested/child", jfsTypeFile},
+						} {
+							meta("mknod", map[string]any{"parent": node.parent, "inode": node.inode, "name": node.name,
+								"type": node.typ, "mode": 0700, "create_projection": true, "proj_path": node.path,
+								"attr": ExtentAttr{Typ: node.typ, Mode: 0700, Parent: node.parent, Full: true}})
+							got, err := s.GetNode(ctx, node.path)
+							if err != nil {
+								t.Fatal(err)
+							}
+							before[node.path] = got
+							extentInodes[got.NodeID] = node.inode
+						}
+					}
+					from, to := "/"+tc.source+"/", fmt.Sprintf("/moved-%d/", i)
+					meta("rename", map[string]any{"src_parent": 1, "src_name": tc.source, "dst_parent": 1,
+						"dst_name": pathutil.BaseName(to), "src_path": from, "dst_path": to})
+					for path, want := range before {
+						destination := path
+						if strings.HasPrefix(path, from) {
+							destination = to + strings.TrimPrefix(path, from)
+							if _, err := s.GetNode(ctx, path); err == nil {
+								t.Errorf("old source projection remains: %s", path)
+							}
+						}
+						got, err := s.GetNode(ctx, destination)
+						if err != nil {
+							t.Errorf("projection %s: %v", destination, err)
+							continue
+						}
+						if got.NodeID != want.NodeID || got.InodeID != want.InodeID ||
+							got.ParentPath != pathutil.ParentPath(destination) || got.Name != pathutil.BaseName(destination) {
+							t.Errorf("projection %s changed identity or has stale path metadata: %+v, before %+v", destination, got, want)
+						}
+						var pathHash, parentHash string
+						var extentIno uint64
+						if err := s.db.QueryRowContext(ctx, `SELECT path_hash, parent_path_hash, extent_ino FROM file_nodes WHERE `+
+							s.scope.And(`node_id = ?`), s.scope.Args(want.NodeID)...).Scan(&pathHash, &parentHash, &extentIno); err != nil {
+							t.Fatal(err)
+						}
+						if pathHash != fileNodePathHash(destination) || parentHash != fileNodePathHash(pathutil.ParentPath(destination)) {
+							t.Errorf("projection %s has stale path hashes", destination)
+						}
+						if extentIno != extentInodes[want.NodeID] {
+							t.Errorf("projection %s changed extent inode to %d", destination, extentIno)
+						}
+					}
+					meta("lookup", map[string]any{"parent": 1, "name": tc.neighbor})
+					meta("lookup", map[string]any{"parent": 1, "name": pathutil.BaseName(to)})
+					for _, ino := range []uint64{uint64(1000 + i*10), uint64(1003 + i*10)} {
+						meta("lookup", map[string]any{"parent": ino, "name": "nested"})
+						meta("lookup", map[string]any{"parent": ino + 1, "name": "child"})
+					}
+				})
+			}
+		})
+	}
+}
 
 func TestExtentRenameValidatesClassicDestination(t *testing.T) {
 	for _, tc := range []struct {

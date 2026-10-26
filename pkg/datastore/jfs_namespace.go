@@ -1176,9 +1176,12 @@ func (s *Store) jfsMoveProjectionSubtreeTx(tx *sql.Tx, srcPath, dstPath string) 
 	if oldPrefix == newPrefix {
 		return nil
 	}
+	// The trailing-slash prefix includes the directory itself. Match its bytes
+	// exactly, even when file_nodes.path inherits a case/accent-insensitive
+	// collation, and treat wildcard characters in directory names literally.
+	predicate, args := pathPrefixPredicate("path", oldPrefix)
 	rows, err := tx.Query(`SELECT path FROM file_nodes WHERE `+
-		s.scope.And(`(path = ? OR path LIKE ?)`)+` ORDER BY path FOR UPDATE`,
-		s.scope.Args(oldPrefix, likeLiteralPrefixPattern(oldPrefix))...)
+		s.scope.And(predicate)+` ORDER BY path FOR UPDATE`, s.scope.Args(args...)...)
 	if err != nil {
 		return err
 	}

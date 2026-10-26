@@ -4,9 +4,103 @@
 #include <iostream>
 #include <thread>
 #include <poll.h>
+#include <atomic>
 using namespace drive9;
 using namespace std::chrono_literals;
 template <class Fn> void Fails(Fn fn) { try { fn(); } catch (const Error &) { return; } throw Error("Expected HTTP failure"); }
+
+// Only metadata is synthetic: signed S3/GCS object requests use the real
+// transport and HTTP fixture, including its response-size enforcement.
+class CompactionFixture : public HttpTransport {
+public:
+    std::shared_ptr<HttpTransport> network = MakeHttpTransport(1);
+    std::string base, scheme, framing;
+    int status;
+    std::atomic<int> mappings{0}, old_gets{0}, new_gets{0}, mints{0};
+    CompactionFixture(std::string base, std::string scheme, std::string framing, int status)
+        : base(std::move(base)), scheme(std::move(scheme)), framing(std::move(framing)), status(status) {}
+    Response Request(const std::string &method, const std::string &url, const Headers &headers,
+                     std::string_view body, Deadline deadline, size_t max_response) override {
+        if (url == "http://fs.test/v1/data-credential") {
+            ++mints;
+            Json credential = {{"scheme", scheme}, {"endpoint", base + (scheme == "gcs" ? "/storage/v1/" : "")},
+                {"bucket", "bucket"}, {"prefix", "tenant/"}, {"force_path_style", true},
+                {"access_key_id", "test-access"}, {"secret_access_key", "test-secret"},
+                {"access_token", "scoped-token"}, {"region", "us-east-1"}};
+            return {200, {}, credential.dump()};
+        }
+        if (url == "http://fs.test/v1/extent/meta") {
+            auto op = headers.at("X-Drive9-Extent-Op");
+            auto args = Json::parse(body);
+            Json result = {{"errno", 0}};
+            if (op == "load") result["format"] = detail::EncodeBase64(Json({{"BlockSize", 4194304}}).dump());
+            else if (op == "incr_counter") result["value"] = 1;
+            else if (op == "new_session") result["session_guard"] = true;
+            else if (op == "find_stale_sessions") result["sids"] = Json::array();
+            else if (op == "lookup" || op == "getattr") {
+                auto inode = op == "lookup" ? uint64_t(42) : args.at("inode").get<uint64_t>();
+                result["inode"] = inode;
+                result["attr"] = {{"Typ", inode == 1 ? 2 : 1}, {"Length", 1}};
+            } else if (op == "read") {
+                // A second metadata read observes the compactor's replacement.
+                auto id = ++mappings == 1 ? uint64_t(1) : uint64_t(2);
+                std::string slice;
+                auto put = [&](uint64_t value, int bytes) {
+                    for (int i = bytes - 1; i >= 0; --i) slice += char(value >> (i * 8));
+                };
+                put(0, 4); put(id, 8); put(1, 4); put(0, 4); put(1, 4);
+                result["slices"] = detail::EncodeBase64(slice);
+            }
+            return {200, {}, result.dump()};
+        }
+        if (url.compare(0, base.size(), base) != 0 || method != "GET") throw Error("Unexpected object request");
+        auto old = url.find("1_0_1") != std::string::npos;
+        std::string path = "/byte";
+        if (old) path = ++old_gets == 1 ? "/old-byte" : "/error/" + std::to_string(status) + "/" + framing;
+        else ++new_gets;
+        return network->Request(method, base + path, headers, body, deadline, max_response);
+    }
+};
+
+void ShortObjectErrors(const std::string &base) {
+    for (const auto &scheme : {"s3", "gcs"}) {
+        for (const auto &framing : {"length", "chunked"}) {
+            for (int status : {200, 400, 401, 403, 404, 429, 503}) {
+                auto fixture = std::make_shared<CompactionFixture>(base, scheme, framing, status);
+                auto client = std::make_shared<Client>(ClientOptions{"http://fs.test", "control-secret", 2s, fixture});
+                ExtentOptions options;
+                options.mapping_ttl = 1h; // Recovery must not depend on TTL expiry.
+                options.cache_bytes = 0; // Keep the mapping, evict the old block.
+                ExtentFileSystem fs(client, options);
+                auto handle = fs.Open("/data");
+                char byte = 0;
+                if (fs.ReadAt(handle, &byte, 1, 0) != 1 || byte != 'A') throw Error("Unable to warm old mapping");
+                if (status == 404) {
+                    if (fs.ReadAt(handle, &byte, 1, 0) != 1 || byte != 'B' || fixture->mappings != 2 ||
+                        fixture->old_gets != 2 || fixture->new_gets != 1 || fixture->mints != 1)
+                        throw Error("Short-object 404 did not refresh exactly once");
+                    fs.ReadAt(handle, &byte, 1, 0);
+                    if (fixture->mappings != 2 || fixture->old_gets != 2) throw Error("Refreshed mapping was not retained");
+                } else {
+                    bool rejected = false;
+                    try { fs.ReadAt(handle, &byte, 1, 0); }
+                    catch (const Error &error) { rejected = error.status == (status == 200 ? 0 : status); }
+                    // An oversized 200 must fail rather than expose a partial
+                    // block; permanent 400s must not refresh or retry mappings.
+                    int attempts = status == 400 ? 1 : 3;
+                    if (!rejected || fixture->mappings != 1 || fixture->new_gets != 0 ||
+                        fixture->old_gets != attempts + 1 || fixture->mints != attempts)
+                        throw Error("Bounded HTTP error changed object retry or refresh policy");
+                }
+                fs.Close(handle);
+                // An aborted error body must not poison the next pooled request.
+                if (fixture->network->Request("GET", base + "/ok", {}, {}, std::chrono::steady_clock::now() + 2s).body != "ok")
+                    throw Error("Error response poisoned pooled connection");
+            }
+        }
+    }
+}
+
 int main(int argc, char **argv) {
     try {
         if (argc != 4) throw Error("Expected HTTP/TLS endpoints and fixture CA");
@@ -112,6 +206,7 @@ int main(int argc, char **argv) {
         httplib::Response response; httplib::Error error;
         if (tls.send(mutation, response, error)) throw Error("Lost TLS acknowledgement was accepted");
         if (applications != 1) throw Error("TLS mutation was replayed after acknowledgement loss");
+        ShortObjectErrors(base);
         std::cout << "HTTP deadline, pooling, redirect and acknowledgement-loss tests passed\n";
     } catch (const std::exception &error) { std::cerr << error.what() << '\n'; return 1; }
 }
