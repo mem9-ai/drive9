@@ -2642,8 +2642,16 @@ func (f *FS) dispatchPath(nodeid, fh uint64) (string, bool) {
 		return path, true
 	}
 	if fh != 0 {
-		if h, ok := f.handles.get(fh); ok {
+		// The inode guard keeps a number from one handle table from
+		// answering for the other when the two fh spaces collide.
+		if h, ok := f.handles.get(fh); ok && h.ino == nodeid {
 			return h.path, true
+		}
+		// Directory descriptors (opendir handles) resolve the same way:
+		// an fstat by dirfd on a detached directory keeps answering from
+		// its handle.
+		if d, ok := f.dirs.get(fh); ok && d.ino == nodeid {
+			return d.path, true
 		}
 	}
 	return "", false

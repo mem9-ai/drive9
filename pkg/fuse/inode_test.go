@@ -562,3 +562,31 @@ func TestDirectoryHandleKeepsDetachedEntryAlive(t *testing.T) {
 		t.Fatal("detached entry not reaped after the directory handle closed")
 	}
 }
+
+// fstat through a directory handle on a detached directory keeps serving
+// the entry attrs: the dirfd's recorded path resolves through dispatchPath
+// like a file descriptor's.
+func TestGetAttrByDirHandleOnDetachedInodeServesEntry(t *testing.T) {
+	f, err := New(Options{Extensions: []fs.Handler{&errCore{err: errors.New("dispatched on detached path")}}, Uid: 1000, Gid: 1000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dirIno := f.inodes.Lookup("/d", true, 0, time.Now())
+	f.dirs.put(7, &dirHandle{ino: dirIno, path: "/d"})
+	f.inodes.Lookup("/d", false, 0, time.Now()) // kind conflict detaches /d
+
+	input := &gofuse.GetAttrIn{}
+	input.NodeId = dirIno
+	input.Flags_ = gofuse.FUSE_GETATTR_FH
+	input.Fh_ = 7
+	var out gofuse.AttrOut
+	if st := f.GetAttr(nil, input, &out); st != gofuse.OK {
+		t.Fatalf("GetAttr by dir handle on detached inode = %v, want OK (entry attrs)", st)
+	}
+	// Without the descriptor the tombstone still answers ENOENT.
+	bare := &gofuse.GetAttrIn{}
+	bare.NodeId = dirIno
+	if st := f.GetAttr(nil, bare, &out); st != gofuse.ENOENT {
+		t.Fatalf("GetAttr without descriptor on detached inode = %v, want ENOENT", st)
+	}
+}
