@@ -129,3 +129,41 @@ func TestExtentDirectoryProjectionRejectsForeignHintAndClassicChildren(t *testin
 		t.Fatal("omitted hint left directory projection")
 	}
 }
+
+// A tiny analyzed table may otherwise choose a locking table scan. A directory
+// operation must not hold unrelated projection rows while waiting on its inode.
+func TestExtentDirectoryProjectionLockIsLocal(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	for i, name := range []string{"a", "b"} {
+		raw, _ := json.Marshal(map[string]any{"parent": 1, "inode": 400 + i, "name": name, "type": 2, "mode": 0700, "proj_path": "/" + name + "/", "attr": ExtentAttr{Typ: 2, Mode: 0700, Parent: 1, Nlink: 2, Full: true}})
+		if _, eno, err := s.RunExtentMetaOp(ctx, "mknod", raw, nil); err != nil || eno != 0 {
+			t.Fatalf("mkdir errno=%d err=%v", eno, err)
+		}
+	}
+	if _, err := s.db.ExecContext(ctx, "ANALYZE TABLE file_nodes"); err != nil {
+		t.Fatal(err)
+	}
+	ino, other := uint64(400), uint64(401)
+	if deterministicNodeID("/a/") < deterministicNodeID("/b/") {
+		ino, other = other, ino
+	}
+	first, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = first.Rollback() }()
+	if _, eno, err := s.jfsDirectoryProjectionTx(ctx, first, ino, ""); err != nil || eno != 0 {
+		t.Fatalf("first projection errno=%d err=%v", eno, err)
+	}
+	deadline, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	second, err := s.db.BeginTx(deadline, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = second.Rollback() }()
+	if _, eno, err := s.jfsDirectoryProjectionTx(deadline, second, other, ""); err != nil || eno != 0 {
+		t.Fatalf("unrelated projection blocked errno=%d err=%v", eno, err)
+	}
+}

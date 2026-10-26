@@ -730,7 +730,7 @@ func (s *Store) jfsProjectionPathTx(tx *sql.Tx, parent uint64, name string) (str
 // hints can be absent or noncanonical, but must not select another directory.
 func (s *Store) jfsDirectoryProjectionTx(ctx context.Context, tx *sql.Tx, ino uint64, hint string) (string, int, error) {
 	var path string
-	err := tx.QueryRowContext(ctx, `SELECT path FROM file_nodes WHERE `+s.scope.And(`extent_ino = ? AND is_directory = 1`)+` LIMIT 1 FOR UPDATE`, s.scope.Args(ino)...).Scan(&path)
+	err := tx.QueryRowContext(ctx, `SELECT path FROM file_nodes FORCE INDEX (idx_file_nodes_extent_ino) WHERE `+s.scope.And(`extent_ino = ? AND is_directory = 1`)+` LIMIT 1 FOR UPDATE`, s.scope.Args(ino)...).Scan(&path)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return "", 0, err
 	}
