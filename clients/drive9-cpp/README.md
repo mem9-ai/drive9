@@ -80,6 +80,14 @@ bound to the original tenant, namespace, bucket, endpoint and encryption policy.
 Control-plane bearer tokens are never attached to object requests. Redirects
 are disabled and TLS peer verification is enabled.
 
+Omitted cloud endpoints resolve as in the existing SDK: GCS uses its standard
+JSON API root, and a plain/global S3 endpoint follows the minted signing region.
+Custom, dual-stack, FIPS and VPC endpoints are preserved. S3 partition DNS data
+is generated from the checksum-pinned AWS SDK v2 v1.41.5 model, without linking
+that SDK or running Go. Regenerate it with `tools/update_aws_partitions.py`;
+its Apache license is retained under `third_party/`. Dotted S3 buckets use path
+addressing over TLS. GCS bearer tokens require HTTPS except on loopback.
+
 Concurrent positional reads share immutable blocks through a bounded 64 MiB
 LRU cache and coalesce simultaneous downloads. Slice overlays are decoded in
 `O(n log n)` time. Slice maps expire after one second; missing objects trigger one

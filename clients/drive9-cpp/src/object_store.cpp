@@ -8,10 +8,51 @@
 #include <fstream>
 #include <iomanip>
 #include <sstream>
+#include <regex>
+#include <arpa/inet.h>
 #include <fcntl.h>
 #include <unistd.h>
 
 namespace drive9::detail {
+Json NormalizeCredential(Json credential) {
+    auto scheme = credential.value("scheme", "file");
+    std::transform(scheme.begin(), scheme.end(), scheme.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+    if (scheme == "gs") scheme = "gcs";
+    credential["scheme"] = scheme;
+    auto prefix = credential.value("prefix", "");
+    if (!prefix.empty() && prefix.back() != '/') credential["prefix"] = prefix + "/";
+    auto endpoint = credential.value("endpoint", "");
+    auto region = credential.value("region", "");
+    if (region == "aws-global") region = "us-east-1";
+    if (scheme == "gcs" && endpoint.empty()) endpoint = "https://storage.googleapis.com/storage/v1/";
+    if (scheme == "gcs" && !endpoint.empty() && endpoint.back() != '/') endpoint += '/';
+    if (scheme == "s3") {
+        // Use the same generated AWS partition model as the existing SDK;
+        // custom, dual-stack, FIPS and VPC endpoints retain their full identity.
+        static const Json partitions = Json::parse(
+#include "aws_partitions.inc"
+        );
+        static const std::regex standard(R"(^https?://s3([.-][a-z0-9-]+)?\.amazonaws\.(com|com\.cn|eu)/?$)");
+        if (endpoint.empty() || std::regex_match(endpoint, standard)) {
+            if (region.empty()) region = "us-east-1";
+            if (region.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789-") != std::string::npos)
+                throw Error("Invalid S3 signing region");
+            auto suffix = std::string("amazonaws.com");
+            for (const auto &partition : partitions) {
+                auto &regions = partition.at("regions");
+                if (std::find(regions.begin(), regions.end(), Json(region)) != regions.end() ||
+                    std::regex_match(region, std::regex(partition.at("regionRegex").get<std::string>()))) {
+                    suffix = partition.at("dnsSuffix").get<std::string>(); break;
+                }
+            }
+            endpoint = "https://s3." + region + "." + suffix;
+        } else if (endpoint.find("://") == std::string::npos) endpoint = "https://" + endpoint;
+        credential["region"] = region.empty() ? "us-east-1" : region;
+        credential["force_path_style"] = credential.value("force_path_style", false);
+    }
+    credential["endpoint"] = endpoint;
+    return credential;
+}
 std::string EncodeBase64(std::string_view data) {
     if (data.size() > size_t(INT_MAX)) throw Error("Base64 input too large");
     std::string out(4 * ((data.size() + 2) / 3), '\0');
@@ -92,8 +133,20 @@ void Validate(const Json &c) {
     if (scheme == "s3") {
         if (c.value("access_key_id", "").empty() || c.value("secret_access_key", "").empty())
             throw Error("S3 credential is incomplete");
-    } else if (endpoint.size() < 12 || endpoint.substr(endpoint.size() - 12) != "/storage/v1/" ||
-               c.value("access_token", "").empty()) throw Error("GCS requires a JSON API base and scoped OAuth token");
+    } else {
+        auto origin = endpoint.find('/', endpoint.find("://") + 3);
+        if (origin == std::string::npos || endpoint.substr(origin) != "/storage/v1/" || c.value("access_token", "").empty())
+            throw Error("GCS requires a JSON API root and scoped OAuth token");
+        if (endpoint.compare(0, 7, "http://") == 0) {
+            auto authority = endpoint.substr(7, origin - 7);
+            auto host = authority.front() == '[' ? authority.substr(1, authority.find(']') - 1) : authority.substr(0, authority.find(':'));
+            std::transform(host.begin(), host.end(), host.begin(), [](unsigned char ch) { return char(std::tolower(ch)); });
+            in_addr ipv4{}; in6_addr ipv6{};
+            bool loopback = host == "localhost" || (inet_pton(AF_INET, host.c_str(), &ipv4) == 1 && (ntohl(ipv4.s_addr) >> 24) == 127) ||
+                            (inet_pton(AF_INET6, host.c_str(), &ipv6) == 1 && IN6_IS_ADDR_LOOPBACK(&ipv6));
+            if (!loopback) throw Error("GCS OAuth requires HTTPS except on loopback");
+        }
+    }
 }
 } // namespace
 ObjectStore::ObjectStore(std::shared_ptr<Client> client) : client_(std::move(client)) {
@@ -102,7 +155,7 @@ ObjectStore::ObjectStore(std::shared_ptr<Client> client) : client_(std::move(cli
 Json ObjectStore::Credential(bool force, Deadline deadline) {
     std::lock_guard<std::mutex> guard(mu_);
     if (!force && std::chrono::steady_clock::now() < refresh_) return credential_;
-    auto credential = client_->DataCredential(deadline);
+    auto credential = NormalizeCredential(client_->DataCredential(deadline));
     Validate(credential);
     auto identity = Identity(credential);
     if (!identity_.empty() && identity != identity_) throw Error("Extent storage binding changed during credential refresh");
@@ -167,7 +220,15 @@ Response ObjectStore::Request(const std::string &method, const std::string &key,
             auto host = endpoint.substr(start, split - start);
             auto base = split == std::string::npos ? std::string() : endpoint.substr(split);
             auto bucket = credential.at("bucket").get<std::string>();
-            bool path_style = credential.value("force_path_style", true);
+            bool path_style = credential.value("force_path_style", false);
+            // Match AWS's DNS/TLS fallback: a dotted bucket cannot be covered
+            // by the wildcard certificate of a virtual-host S3 endpoint.
+            static const std::regex dns_bucket("^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$");
+            in_addr ipv4{};
+            if (!path_style && (!std::regex_match(bucket, dns_bucket) || bucket.find("..") != std::string::npos ||
+                bucket.find(".-") != std::string::npos || bucket.find("-.") != std::string::npos ||
+                inet_pton(AF_INET, bucket.c_str(), &ipv4) == 1 ||
+                (endpoint.compare(0, 8, "https://") == 0 && bucket.find('.') != std::string::npos))) path_style = true;
             if (!path_style) host = bucket + "." + host;
             auto path = UrlEncode(base + "/" + (path_style ? bucket + "/" : "") + object, true);
             url = endpoint.substr(0, start) + host + path;

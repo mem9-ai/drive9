@@ -266,10 +266,59 @@ void GCSScopedTransport() {
     Check(transport->urls.at(0) == "https://storage.test/upload/storage/v1/b/my-bucket/o?name=tenant%2Fchunks%2Fa%2Bb&uploadType=media", "GCS upload URL mismatch");
     Check(transport->urls.at(1) == "https://storage.test/storage/v1/b/my-bucket/o/tenant%2Fchunks%2Fa%2Bb?alt=media", "GCS download URL mismatch");
 }
+void DefaultCloudCredentials() {
+    struct Provider : HttpTransport {
+        Json credential;
+        std::string object_url;
+        Headers object_headers;
+        Response Request(const std::string &, const std::string &url, const Headers &headers,
+                         std::string_view, Deadline, size_t) override {
+            if (url == "http://fs.test/v1/data-credential") return {200, {}, credential.dump()};
+            object_url = url; object_headers = headers;
+            return {200, {}, "{}"};
+        }
+    };
+    for (const auto &test : std::vector<std::pair<std::string, std::string>>{
+             {"us-west-2", "amazonaws.com"}, {"cn-north-1", "amazonaws.com.cn"},
+             {"eusc-de-east-1", "amazonaws.eu"}, {"us-gov-west-1", "amazonaws.com"},
+             {"us-iso-east-1", "c2s.ic.gov"}, {"us-isob-east-1", "sc2s.sgov.gov"},
+             {"eu-isoe-west-1", "cloud.adc-e.uk"}, {"us-isof-east-1", "csp.hci.ic.gov"}}) {
+        auto provider = std::make_shared<Provider>();
+        provider->credential = {{"scheme", "s3"}, {"bucket", "bucket"}, {"prefix", "tenant"}, {"region", test.first},
+                                 {"access_key_id", "test-access"}, {"secret_access_key", "test-secret"}};
+        auto client = std::make_shared<Client>(ClientOptions{"http://fs.test", "control-secret", 30000ms, provider});
+        detail::ObjectStore store(client); store.Put("chunks/key", "data", std::chrono::steady_clock::now() + 1s);
+        Check(provider->object_url == "https://bucket.s3." + test.first + "." + test.second + "/tenant/chunks/key", "default S3 partition or bucket style mismatch");
+        Check(provider->object_headers.at("Authorization").find("/" + test.first + "/s3/aws4_request") != std::string::npos, "S3 signer ignored minted region");
+        auto raw = provider->credential; raw["endpoint"] = "https://s3.amazonaws.com";
+        Check(detail::NormalizeCredential(raw).at("endpoint") == "https://s3." + test.first + "." + test.second, "global endpoint overrode minted region");
+    }
+    auto provider = std::make_shared<Provider>();
+    provider->credential = {{"scheme", "s3"}, {"endpoint", "https://custom.test"}, {"bucket", "dotted.bucket"},
+        {"prefix", "tenant/"}, {"region", "eu-west-1"}, {"access_key_id", "test-access"}, {"secret_access_key", "test-secret"}};
+    auto client = std::make_shared<Client>(ClientOptions{"http://fs.test", "control-secret", 30000ms, provider});
+    for (auto endpoint : {"https://s3.dualstack.us-west-2.amazonaws.com", "https://s3-fips.us-west-2.amazonaws.com",
+                          "https://vpce-001.s3.us-west-2.vpce.amazonaws.com", "https://custom.example:9000/root/"}) {
+        auto c = provider->credential; c["endpoint"] = endpoint;
+        Check(detail::NormalizeCredential(c).at("endpoint") == endpoint, "custom S3 endpoint was relocated");
+    }
+    { detail::ObjectStore store(client); store.Put("chunks/key", "data", std::chrono::steady_clock::now() + 1s); }
+    Check(provider->object_url == "https://custom.test/dotted.bucket/tenant/chunks/key", "dotted bucket did not use TLS-safe path addressing");
+    provider->credential = {{"scheme", "gcs"}, {"bucket", "bucket"}, {"prefix", "tenant/"}, {"access_token", "scoped-token"}};
+    { detail::ObjectStore store(client); store.Put("chunks/key", "data", std::chrono::steady_clock::now() + 1s); }
+    Check(provider->object_url == "https://storage.googleapis.com/upload/storage/v1/b/bucket/o?name=tenant%2Fchunks%2Fkey&uploadType=media", "default GCS JSON API endpoint mismatch");
+    Check(provider->object_headers.at("Authorization") == "Bearer scoped-token", "GCS used control-plane credentials");
+    for (auto endpoint : {"http://remote.test/storage/v1/", "https://remote.test/proxy/storage/v1/", "https://remote.test"}) {
+        provider->credential["endpoint"] = endpoint;
+        Fails([&] { detail::ObjectStore store(client); }, "unsafe GCS endpoint accepted");
+    }
+    provider->credential["endpoint"] = "http://127.0.0.1:8080/storage/v1/";
+    { detail::ObjectStore store(client); }
+}
 int main() {
     try {
         PathsAndSlices(); DurableSparseAndReferences(); CompatibleIDReservations(); LostPublicationAck(); MalformedAcknowledgement(); UploadFailure(); LatePutRejected();
-        ParallelReadsAndClose(); CredentialBindingAndRefresh(); LeaseAndLegacy(); GCSScopedTransport();
+        ParallelReadsAndClose(); CredentialBindingAndRefresh(); LeaseAndLegacy(); GCSScopedTransport(); DefaultCloudCredentials();
         std::cout << "C++ SDK protocol and fault tests passed\n";
     } catch (const std::exception &error) { std::cerr << error.what() << '\n'; return 1; }
 }

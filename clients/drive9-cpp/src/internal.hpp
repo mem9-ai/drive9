@@ -6,6 +6,7 @@ namespace drive9::detail {
 std::string DecodeBase64(const Json &value);
 std::string EncodeBase64(std::string_view value);
 std::string Timestamp();
+Json NormalizeCredential(Json credential);
 struct Slice {
     uint32_t pos, size, off, length;
     uint64_t id;
