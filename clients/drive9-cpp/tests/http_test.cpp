@@ -162,12 +162,31 @@ int main(int argc, char **argv) {
             int window = 1024;
             if (::setsockopt(constrained.socket(), SOL_SOCKET, SO_RCVBUF, &window, sizeof(window)))
                 throw Error("Unable to constrain the established receive window");
+            auto snapshot = [&](const char *phase) {
+                int buffer = -1, clamp = -1;
+                socklen_t size = sizeof(buffer);
+                int buffer_rc = ::getsockopt(constrained.socket(), SOL_SOCKET, SO_RCVBUF, &buffer, &size);
+                size = sizeof(clamp);
+                int clamp_rc = ::getsockopt(constrained.socket(), IPPROTO_TCP, TCP_WINDOW_CLAMP, &clamp, &size);
+                tcp_info info{}; size = sizeof(info);
+                int info_rc = ::getsockopt(constrained.socket(), IPPROTO_TCP, TCP_INFO, &info, &size);
+                std::cout << phase << ": fd=" << constrained.socket()
+                          << " rcvbuf=" << buffer << " clamp=" << clamp
+                          << " ssthresh=" << info.tcpi_rcv_ssthresh
+                          << " space=" << info.tcpi_rcv_space
+                          << " rc=" << buffer_rc << ',' << clamp_rc << ',' << info_rc << '\n';
+            };
+            snapshot("Before body");
             std::string received;
             httplib::Request request; request.method = "GET"; request.path = "/block";
             request.start_time_ = std::chrono::steady_clock::now();
             request.content_receiver = [&](const char *data, size_t length, uint64_t, uint64_t) {
                 received.append(data, length);
-                if (acknowledge) detail::AcknowledgeRead(constrained.socket());
+                if (acknowledge) {
+                    if (received.size() == length) snapshot("Before repair");
+                    detail::AcknowledgeRead(constrained.socket());
+                    if (received.size() == length) snapshot("After repair");
+                }
                 return true;
             };
             httplib::Response response; httplib::Error error;
