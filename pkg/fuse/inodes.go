@@ -30,6 +30,12 @@ type InodeEntry struct {
 	Rdev       uint32
 	Revision   int64 // server-side revision for cache validation
 	Unlinked   bool  // path was removed while open handles still reference this inode
+	// Detached marks a name taken over by a different-kind object while
+	// this inode may still be referenced (tombstone). Pathname resolution
+	// refuses the entry: the recorded Path names an object this inode no
+	// longer owns, and a later reclaim can point it at yet another one.
+	// Only descriptor-served operations may continue through their handle.
+	Detached bool
 	// ExtentIno is the JuiceFS inode for content_layout=extent files.
 	// Shared across hardlink aliases of the same FUSE inode.
 	ExtentIno uint64
@@ -241,7 +247,40 @@ func (m *InodeToPath) GetPath(ino uint64) (string, bool) {
 	if !ok {
 		return "", false
 	}
+	// Shared path-resolution contract for every inode-addressed operation:
+	// a detached tombstone owns no name — its recorded Path names an object
+	// it no longer owns (and a later reclaim can hand that name to yet
+	// another object). Name-level callers answer ENOENT; only operations
+	// served through a live descriptor may continue, via the handle's own
+	// recorded path.
+	if entry.Detached {
+		return "", false
+	}
 	return entry.Path, true
+}
+
+// CollectDetached releases an already-detached entry once its kernel
+// lookup references AND live descriptor references have both ended. The
+// descriptor release paths (FS.Release / FS.ReleaseDir) call it: the final
+// FORGET may have arrived before the detach, so nothing else would reap
+// the tombstone.
+func (m *InodeToPath) CollectDetached(ino uint64) {
+	if ino == 1 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entry, ok := m.byInode[ino]
+	if !ok || !entry.Detached || entry.Nlookup > 0 {
+		return
+	}
+	if shouldKeepForgetMapping(entry) {
+		return
+	}
+	if m.HasLiveUse != nil && m.HasLiveUse(ino) {
+		return
+	}
+	m.removeEntryLocked(ino, entry)
 }
 
 // GetInode returns the inode number associated with the given path. The second
@@ -1065,6 +1104,7 @@ func (m *InodeToPath) detachPathLocked(entry *InodeEntry, path string) {
 			entry.Path = path
 		}
 		entry.Unlinked = true
+		entry.Detached = true
 		// A READDIR-seeded entry (EnsureInode*, Nlookup == 0) never gets a
 		// FORGET: release it here instead of leaking a pathless entry —
 		// unless a live descriptor still resolves through the inode (its
@@ -1102,6 +1142,7 @@ func (m *InodeToPath) addPathLocked(entry *InodeEntry, path string) {
 		// operations keep dispatching through the stale tombstone path.
 		entry.Path = path
 		entry.Unlinked = false
+		entry.Detached = false
 	}
 }
 

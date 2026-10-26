@@ -373,8 +373,11 @@ func TestForgetReleasesDetachedDirectoryEntry(t *testing.T) {
 	dirIno := m.Lookup("/d", true, 0, time.Now())
 	m.Lookup("/d", false, 0, time.Now()) // kind conflict detaches the path
 
-	if p, ok := m.GetPath(dirIno); !ok || p != "/d" {
-		t.Fatalf("tombstone GetPath = %q/%v, want the old path %q", p, ok, "/d")
+	// Shared path-resolution contract: the tombstone owns no name — GetPath
+	// refuses it so every inode-addressed pathname operation answers
+	// ENOENT instead of dispatching through the stale path.
+	if p, ok := m.GetPath(dirIno); ok {
+		t.Fatalf("tombstone GetPath = %q/true, want not-found", p)
 	}
 	m.Forget(dirIno, 2)
 	if _, ok := m.GetEntry(dirIno); ok {
@@ -480,5 +483,82 @@ func TestSetAttrOnDetachedInodeWithoutHandleIsENOENT(t *testing.T) {
 	input.Mode = 0o755
 	if st := f.SetAttr(nil, input, &out); st != gofuse.ENOENT {
 		t.Fatalf("SetAttr on detached inode = %v, want ENOENT", st)
+	}
+}
+
+// Shared path-resolution contract, facade level: a mutation arriving by
+// inode on a detached directory (SetXAttr here, the reviewer's probe)
+// must answer ENOENT without any dispatch — the tombstone path names an
+// object the inode no longer owns, and a later reclaim can point it at a
+// NEW object, so dispatching would mutate the replacement.
+func TestDetachedInodeMutationsDoNotDispatch(t *testing.T) {
+	f, err := New(Options{Extensions: []fs.Handler{&errCore{err: errors.New("dispatched on detached path")}}, Uid: 1000, Gid: 1000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dirIno := f.inodes.Lookup("/d", true, 0, time.Now())
+	f.inodes.Lookup("/d", false, 0, time.Now()) // kind conflict detaches /d
+
+	input := &gofuse.SetXAttrIn{}
+	input.NodeId = dirIno
+	if st := f.SetXAttr(nil, input, "user.probe", []byte("x")); st != gofuse.ENOENT {
+		t.Fatalf("SetXAttr on detached inode = %v, want ENOENT", st)
+	}
+	// A child lookup through the stale directory nodeid must not resolve
+	// against the mount root either: pathname resolution refuses the
+	// tombstone before childOf can join "/victim".
+	var out gofuse.EntryOut
+	if st := f.Lookup(nil, &gofuse.InHeader{NodeId: dirIno}, "victim", &out); st != gofuse.ENOENT {
+		t.Fatalf("Lookup under detached directory = %v, want ENOENT", st)
+	}
+}
+
+// End-to-end detached lifecycle: open a descriptor, let the kernel forget
+// the inode (Nlookup 0 while the fd lives), detach the name via a kind
+// conflict (the live-use veto retains the entry), then close the last
+// descriptor — the tombstone must be reaped exactly then.
+func TestDetachedEntryReapedWhenLastLiveUseEnds(t *testing.T) {
+	f, err := New(Options{Extensions: []fs.Handler{&errCore{err: errors.New("unused")}}, Uid: 1000, Gid: 1000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dirIno := f.inodes.Lookup("/d", true, 0, time.Now())
+	h := &fileHandle{ino: dirIno, path: "/d"}
+	f.openIdx.Add(h)
+	f.inodes.ForgetKeepMapping(dirIno, 2) // kernel refs drained, fd open
+
+	f.inodes.Lookup("/d", false, 0, time.Now()) // kind conflict detaches /d
+	if _, ok := f.inodes.GetEntry(dirIno); !ok {
+		t.Fatal("detached entry released while its descriptor was live")
+	}
+
+	f.openIdx.Remove(h)
+	f.inodes.CollectDetached(dirIno)
+	if _, ok := f.inodes.GetEntry(dirIno); ok {
+		t.Fatal("detached entry not reaped after the last live use ended")
+	}
+}
+
+// A directory descriptor (opendir handle) counts as a live use exactly
+// like a file descriptor: the veto retains the detached entry until the
+// directory handle is released.
+func TestDirectoryHandleKeepsDetachedEntryAlive(t *testing.T) {
+	f, err := New(Options{Extensions: []fs.Handler{&errCore{err: errors.New("unused")}}, Uid: 1000, Gid: 1000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dirIno := f.inodes.Lookup("/d", true, 0, time.Now())
+	f.dirs.put(1, &dirHandle{ino: dirIno, path: "/d"})
+	f.inodes.ForgetKeepMapping(dirIno, 2)
+
+	f.inodes.Lookup("/d", false, 0, time.Now())
+	if _, ok := f.inodes.GetEntry(dirIno); !ok {
+		t.Fatal("detached entry released while a directory handle was live")
+	}
+
+	f.dirs.drop(1)
+	f.inodes.CollectDetached(dirIno)
+	if _, ok := f.inodes.GetEntry(dirIno); ok {
+		t.Fatal("detached entry not reaped after the directory handle closed")
 	}
 }

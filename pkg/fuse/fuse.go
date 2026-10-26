@@ -223,7 +223,17 @@ func New(opts Options) (*FS, error) {
 	// still resolves through its nodeid (a forgotten dentry with a live fd
 	// holds no Nlookup reference the release check could see).
 	f.inodes.HasLiveUse = func(ino uint64) bool {
-		return len(f.openIdx.SnapshotInode(ino)) > 0
+		if f.openIdx.HasOpenInode(ino) {
+			return true
+		}
+		// Directory descriptors (opendir handles) resolve through their
+		// nodeid exactly like file descriptors do.
+		for _, d := range f.dirs.snapshot() {
+			if d.ino == ino {
+				return true
+			}
+		}
+		return false
 	}
 	f.perf = perf.NewCounters(false)
 	f.attrTTL = opts.AttrTTL
@@ -1509,7 +1519,10 @@ func (f *FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name string
 }
 
 func (f *FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *gofuse.AttrOut) gofuse.Status {
-	path, ok := f.inodes.GetPath(input.NodeId)
+	// dispatchPath: a detached inode answers by descriptor only — the fd's
+	// fstat keeps serving the entry attrs (Unlinked branch below); without
+	// a descriptor the tombstone answers ENOENT like every pathname op.
+	path, ok := f.dispatchPath(input.NodeId, input.Fh())
 	if !ok {
 		return gofuse.ENOENT
 	}
@@ -1697,7 +1710,15 @@ func (f *FS) checkSetAttrModeForCaller(caller fs.Caller, entry *InodeEntry, inpu
 }
 
 func (f *FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *gofuse.AttrOut) gofuse.Status {
-	path, ok := f.inodes.GetPath(input.NodeId)
+	// A detached inode has no name to mutate: pathname resolution refuses
+	// it (ENOENT) unless a descriptor carries the operation, in which case
+	// the fd's own recorded path identifies the object — never the
+	// tombstone path, which a later reclaim can point at a NEW object.
+	setattrFH := uint64(0)
+	if input.Valid&gofuse.FATTR_FH != 0 {
+		setattrFH = input.Fh
+	}
+	path, ok := f.dispatchPath(input.NodeId, setattrFH)
 	if !ok {
 		return gofuse.ENOENT
 	}
@@ -1705,15 +1726,6 @@ func (f *FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *gofus
 	caller := fs.CallerFrom(input.InHeader)
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
-	// A detached inode (its name was taken over by a different-kind
-	// object) has no name to mutate: a path-level setattr without a
-	// descriptor answers ENOENT right here instead of dispatching through
-	// the tombstone path, which a later reclaim can point at a NEW object
-	// at that name. Descriptor setattrs (FATTR_FH) stay on their handle.
-	if input.Valid&gofuse.FATTR_FH == 0 && input.Fh == 0 &&
-		entry != nil && entry.Unlinked && len(entry.Paths) == 0 {
-		return gofuse.ENOENT
-	}
 	// A path-level setattr (chmod/chown/truncate addressed by inode, no
 	// FATTR_FH) is a mutation of the name: without default_permissions the
 	// kernel does not check the path prefix, so the caller must hold SEARCH
@@ -2619,6 +2631,24 @@ func (f *FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse.Open
 
 // openHandle returns the handle chain head for fh, or nil to fall back to
 // path-addressed dispatch.
+// dispatchPath resolves the path an inode-addressed DATA operation should
+// dispatch with. It is the GetPath escape hatch for live descriptors: a
+// detached inode (its name taken over by a different-kind object) refuses
+// pathname resolution, but the descriptor's own recorded path still
+// identifies the object the fd was opened on, keeping fd reads/writes and
+// their final flush functional.
+func (f *FS) dispatchPath(nodeid, fh uint64) (string, bool) {
+	if path, ok := f.inodes.GetPath(nodeid); ok {
+		return path, true
+	}
+	if fh != 0 {
+		if h, ok := f.handles.get(fh); ok {
+			return h.path, true
+		}
+	}
+	return "", false
+}
+
 func (f *FS) openHandle(fh uint64) fs.Handle {
 	if fh == 0 {
 		return nil
@@ -2658,7 +2688,7 @@ func (f *FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte) (gof
 		// ships the whole request buffer as zero bytes instead of EOF.
 		return gofuse.ReadResultData(buf[:n]), gofuse.OK
 	}
-	path, ok := f.inodes.GetPath(input.NodeId)
+	path, ok := f.dispatchPath(input.NodeId, input.Fh)
 	if !ok {
 		return nil, gofuse.ENOENT
 	}
@@ -2743,7 +2773,7 @@ func (f *FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) gofuse.Status 
 		f.recordHandleOp(fs.OpFlush, start, err, 0)
 		return fs.StatusOf(err)
 	}
-	path, _ := f.inodes.GetPath(input.NodeId)
+	path, _ := f.dispatchPath(input.NodeId, input.Fh)
 	_, st := f.dispatch(ctx, &fs.Op{Kind: fs.OpFlush, Path: path, Ino: input.NodeId, Fh: input.Fh, Kernel: input, Caller: fs.CallerFrom(input.InHeader)})
 	return st
 }
@@ -2759,7 +2789,7 @@ func (f *FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) gofuse.Status 
 		f.recordHandleOp(fs.OpFsync, start, err, 0)
 		return fs.StatusOf(err)
 	}
-	path, _ := f.inodes.GetPath(input.NodeId)
+	path, _ := f.dispatchPath(input.NodeId, input.Fh)
 	_, st := f.dispatch(ctx, &fs.Op{Kind: fs.OpFsync, Path: path, Ino: input.NodeId, Fh: input.Fh, Kernel: input, Caller: fs.CallerFrom(input.InHeader)})
 	return st
 }
@@ -2781,14 +2811,17 @@ func (f *FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 		}
 		f.recordHandleOp(fs.OpRelease, start, rerr, 0)
 		f.maybeRunDeferredUnlink(h.ino)
+		// The final descriptor may be the last live reference to an
+		// already-detached inode whose FORGET arrived before the detach.
+		f.inodes.CollectDetached(h.ino)
 		return
 	}
-	path, _ := f.inodes.GetPath(input.NodeId)
+	path, _ := f.dispatchPath(input.NodeId, input.Fh)
 	_, _ = f.dispatch(ctx, &fs.Op{Kind: fs.OpRelease, Path: path, Ino: input.NodeId, Fh: input.Fh, Kernel: input, Caller: fs.CallerFrom(input.InHeader)})
 }
 
 func (f *FS) Lseek(cancel <-chan struct{}, in *gofuse.LseekIn, out *gofuse.LseekOut) gofuse.Status {
-	path, ok := f.inodes.GetPath(in.NodeId)
+	path, ok := f.dispatchPath(in.NodeId, in.Fh)
 	if !ok {
 		return gofuse.ENOENT
 	}
@@ -2880,7 +2913,7 @@ func (f *FS) SetLkw(cancel <-chan struct{}, input *gofuse.LkIn) gofuse.Status {
 }
 
 func (f *FS) Fallocate(cancel <-chan struct{}, input *gofuse.FallocateIn) gofuse.Status {
-	path, ok := f.inodes.GetPath(input.NodeId)
+	path, ok := f.dispatchPath(input.NodeId, input.Fh)
 	if !ok {
 		return gofuse.ENOENT
 	}
@@ -2895,11 +2928,11 @@ func (f *FS) Fallocate(cancel <-chan struct{}, input *gofuse.FallocateIn) gofuse
 }
 
 func (f *FS) CopyFileRange(cancel <-chan struct{}, input *gofuse.CopyFileRangeIn) (uint32, gofuse.Status) {
-	srcPath, ok := f.inodes.GetPath(input.NodeId)
+	srcPath, ok := f.dispatchPath(input.NodeId, input.FhIn)
 	if !ok {
 		return 0, gofuse.ENOENT
 	}
-	dstPath, ok := f.inodes.GetPath(input.NodeIdOut)
+	dstPath, ok := f.dispatchPath(input.NodeIdOut, input.FhOut)
 	if !ok {
 		return 0, gofuse.ENOENT
 	}
@@ -3244,6 +3277,9 @@ func validDirEntryName(name string) bool {
 
 func (f *FS) ReleaseDir(input *gofuse.ReleaseIn) {
 	f.dirs.drop(input.Fh)
+	// Mirror FS.Release: a released directory descriptor may be the last
+	// live reference to a detached tombstone no FORGET will reap.
+	f.inodes.CollectDetached(input.NodeId)
 }
 
 func (f *FS) FsyncDir(cancel <-chan struct{}, input *gofuse.FsyncIn) gofuse.Status {
