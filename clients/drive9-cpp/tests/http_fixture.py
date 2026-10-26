@@ -64,6 +64,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/hold":
             time.sleep(0.3)
         data = b"x" * 100 if self.path == "/large" else b"ok"
+        if self.path == "/block":
+            data = bytes(range(256)) * 1024
         if self.path == "/slow":
             data = b"x" * 5
         self.send_response(200)

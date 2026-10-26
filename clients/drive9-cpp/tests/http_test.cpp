@@ -26,6 +26,20 @@ int main(int argc, char **argv) {
         Fails([&] { transport->Request("GET", base + "/ok", {}, {}, std::chrono::steady_clock::now() + 30ms); });
         a.get(); b.get();
         if (client.Request("GET", "/ok").body != "ok") throw Error("Pool failed to recover from error");
+        // Reuse pooled HTTP/1.1 sockets for binary blocks larger than the
+        // stream buffer, including coexisting downloads on another connection.
+        std::string block;
+        for (int i = 0; i < 262144; ++i) block += char(i % 256);
+        auto download = [&] {
+            for (int i = 0; i < 16; ++i) {
+                auto response = transport->Request("GET", base + "/block", {}, {}, deadline(), block.size());
+                if (response.body != block) throw Error("Pooled binary block download changed bytes");
+            }
+        };
+        download();
+        auto first = std::async(std::launch::async, download);
+        auto second = std::async(std::launch::async, download);
+        first.get(); second.get();
         // Force close_notify after the server applies the request but before
         // cpp-httplib's post-write peer check. The out-of-band HTTP barrier
         // removes timing guesses from this TLS acknowledgement-loss window.
