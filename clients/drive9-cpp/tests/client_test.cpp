@@ -270,6 +270,81 @@ void ParallelReadsAndClose() {
     read.get(); close.get();
     char data; Fails([&] { fs.ReadAt(file, &data, 1, 0); }, "read after close accepted");
 }
+
+void ShutdownRenewsActiveWrite() {
+    struct RenewingFixture : Fixture {
+        bool uploading = false;
+        Response Request(const std::string &method, const std::string &url, const Headers &headers,
+                         std::string_view body, Deadline deadline, size_t maximum) override {
+            if (method == "PUT" && url.compare(0, 18, "http://object.test") == 0) {
+                std::unique_lock<std::mutex> lock(mu);
+                uploading = true; cv.notify_all();
+                auto next = renewals + 1;
+                // Each block must span a renewal, without sleeping past the
+                // individual request's deadline. Four blocks exceed the lease
+                // remaining when Shutdown begins.
+                if (!cv.wait_until(lock, std::min(deadline, std::chrono::steady_clock::now() + 3s),
+                                   [&] { return renewals >= next; }))
+                    throw Error("Heartbeat stopped while write was draining");
+            }
+            return Fixture::Request(method, url, headers, body, deadline, maximum);
+        }
+    };
+    for (bool concurrent_shutdown : {false, true}) {
+        RenewingFixture f;
+        ExtentFileSystem fs(f.ClientFor(), ExtentOptions{1000ms});
+        auto file = fs.Open("/data", {true, true});
+        std::string data(16 << 20, 'W');
+        auto writer = std::async(std::launch::async, [&] { fs.WriteAt(file, data.data(), data.size(), 0); });
+        {
+            std::unique_lock<std::mutex> lock(f.mu);
+            Check(f.cv.wait_for(lock, 2s, [&] { return f.uploading; }), "write did not reach object storage");
+        }
+        std::future<void> closing;
+        if (concurrent_shutdown) closing = std::async(std::launch::async, [&] { fs.Shutdown(); });
+        auto write_error = std::exception_ptr();
+        try { writer.get(); } catch (...) { write_error = std::current_exception(); }
+        if (concurrent_shutdown) closing.get(); else fs.Shutdown();
+        if (write_error) std::rethrow_exception(write_error);
+        Check(f.puts == 4 && f.publications == 1 && f.attr["Length"] == data.size(), "shutdown lost the active write");
+        size_t published = f.calls.size(), expired = f.calls.size();
+        int expirations = 0;
+        for (size_t i = 0; i < f.calls.size(); ++i) {
+            if (f.calls[i]["op"] == "write") published = i;
+            if (f.calls[i]["op"] == "refresh_session" && f.calls[i]["body"]["expire"] == 1) {
+                expired = i; ++expirations;
+            }
+        }
+        Check(published < expired && expirations == 1, "session expired before publication or more than once");
+        fs.Shutdown();
+        Fails([&] { fs.WriteAt(file, "x", 1, 0); }, "write accepted after shutdown");
+    }
+}
+
+void ConcurrentShutdownDrainsRead() {
+    Fixture f;
+    ExtentFileSystem fs(f.ClientFor());
+    auto file = fs.Open("/data", {true, true}); fs.WriteAt(file, "data", 4, 0);
+    f.gate_get = true;
+    auto reader = std::async(std::launch::async, [&] {
+        char data[4];
+        Check(fs.ReadAt(file, data, 4, 0) == 4 && std::string(data, 4) == "data", "shutdown interrupted read");
+    });
+    { std::unique_lock<std::mutex> lock(f.mu); f.cv.wait(lock, [&] { return f.get_entered; }); }
+    std::promise<void> started_a, started_b;
+    auto a = std::async(std::launch::async, [&] { started_a.set_value(); fs.Shutdown(); });
+    auto b = std::async(std::launch::async, [&] { started_b.set_value(); fs.Shutdown(); });
+    started_a.get_future().wait(); started_b.get_future().wait();
+    auto status_a = a.wait_for(50ms), status_b = b.wait_for(50ms);
+    { std::lock_guard<std::mutex> lock(f.mu); f.gate_get = false; } f.cv.notify_all();
+    reader.get(); a.get(); b.get();
+    Check(status_a == std::future_status::timeout && status_b == std::future_status::timeout, "shutdown overtook a reader");
+    int expirations = 0;
+    for (const auto &call : f.calls)
+        if (call["op"] == "refresh_session" && call["body"]["expire"] == 1) ++expirations;
+    Check(expirations == 1, "concurrent shutdown expired the session twice");
+    Fails([&] { fs.Info(file); }, "closed handle survived shutdown");
+}
 void SyncDoesNotWaitForDownloads() {
     Fixture f; ExtentFileSystem fs(f.ClientFor()); auto file = fs.Open("/data", {true, true});
     fs.WriteAt(file, "data", 4, 0);
@@ -524,6 +599,7 @@ void RenameNamespaceValidation() {
 }
 int main() {
     try {
+        ShutdownRenewsActiveWrite(); ConcurrentShutdownDrainsRead();
         DirectoryProjectionCapability(); LegacyDirectoryRenameIsRejected(); RenameNamespaceValidation();
         PathsAndSlices(); DurableSparseAndReferences(); CompatibleIDReservations(); LostPublicationAck(); MalformedAcknowledgement(); UploadFailure(); LatePutRejected();
         ShutdownKeepsRenewingActiveWrites(); ClosedAndFailedOpenNodesAreReleased();
