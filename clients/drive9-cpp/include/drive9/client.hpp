@@ -120,6 +120,7 @@ public:
     uint64_t SessionID() const;
     bool SessionGuardSupported() const;
 private:
+    friend struct ExtentTestAccess;
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

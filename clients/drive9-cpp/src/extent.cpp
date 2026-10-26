@@ -199,16 +199,19 @@ struct ExtentFileSystem::Impl {
         client->ExtentMeta("clean_stale_session", {{"sid", sid}});
     }
     void Shutdown() {
+        // Keep renewing ownership while existing I/O drains. This gate also
+        // serializes concurrent shutdown calls before joining the thread.
+        std::unique_lock<std::shared_mutex> lock(lifetime);
+        if (closed) return;
         {
             std::lock_guard<std::mutex> lock(heartbeat_mu);
             stopping = true;
         }
         heartbeat_cv.notify_all();
         if (heartbeat.joinable()) heartbeat.join();
-        std::unique_lock<std::shared_mutex> lock(lifetime);
-        if (closed) return;
         closed = true;
         handles.clear();
+        nodes.clear();
         ExpireSession();
     }
     void Ready() { if (closed) throw Error("Extent filesystem is closed"); Healthy(); }
@@ -286,7 +289,12 @@ struct ExtentFileSystem::Impl {
         }
     }
     void DropRef(const std::shared_ptr<Node> &node) {
-        if (--node->refs == 0) Meta("delete_sustained", {{"inode", node->inode}, {"sid", sid}});
+        if (--node->refs == 0) {
+            // Erase before the RPC, including when teardown fails closed.
+            // An expired weak_ptr retains make_shared's combined allocation.
+            nodes.erase(node->inode);
+            Meta("delete_sustained", {{"inode", node->inode}, {"sid", sid}});
+        }
     }
     uint64_t Allocate(const char *name, uint64_t batch, uint64_t &next, uint64_t &limit) {
         std::lock_guard<std::mutex> lock(allocation_mu);
@@ -393,6 +401,10 @@ ExtentFileSystem::ExtentFileSystem(std::shared_ptr<Client> client, ExtentOptions
 }
 ExtentFileSystem::~ExtentFileSystem() = default;
 uint64_t ExtentFileSystem::SessionID() const { return impl_->sid; }
+size_t ExtentTestAccess::NodeCount(ExtentFileSystem &fs) {
+    std::shared_lock<std::shared_mutex> lock(fs.impl_->lifetime);
+    return fs.impl_->nodes.size();
+}
 bool ExtentFileSystem::SessionGuardSupported() const { return impl_->guard_supported; }
 void ExtentFileSystem::Shutdown() { impl_->Shutdown(); }
 FileInfo ExtentFileSystem::Stat(const std::string &input) {
@@ -421,8 +433,9 @@ uint64_t ExtentFileSystem::Open(const std::string &input, OpenOptions options) {
     if (!info.exists) throw Error("Extent file does not exist", 2);
     if (info.directory) throw Error("Extent file is a directory", 21);
     if (info.type != 1) throw Error("Extent node is not a supported regular file", 95);
-    auto node = s.nodes[info.inode].lock();
-    if (!node) { node = std::make_shared<Impl::Node>(); node->inode = info.inode; s.nodes[info.inode] = node; }
+    auto entry = s.nodes.find(info.inode);
+    auto node = entry == s.nodes.end() ? nullptr : entry->second.lock();
+    if (!node) { node = std::make_shared<Impl::Node>(); node->inode = info.inode; }
     node->info = info;
     node->info_expires = std::chrono::steady_clock::now() + s.options.mapping_ttl;
     if (!node->refs) s.Meta("open_ref", {{"sid", s.sid}, {"inode", info.inode}});
@@ -430,6 +443,8 @@ uint64_t ExtentFileSystem::Open(const std::string &input, OpenOptions options) {
     auto id = ++s.next_handle;
     bool acquired = false;
     try {
+        // A rejected open_ref must not leave an expired registry entry.
+        s.nodes[info.inode] = node;
         if (options.lock != Lock::None) {
             s.SetLock(info.inode, id, options.lock);
             acquired = true;
@@ -443,7 +458,8 @@ uint64_t ExtentFileSystem::Open(const std::string &input, OpenOptions options) {
         return id;
     } catch (...) {
         auto error = std::current_exception();
-        try { if (acquired) s.SetLock(info.inode, id, options.lock, true); s.DropRef(node); } catch (...) {}
+        try { if (acquired) s.SetLock(info.inode, id, options.lock, true); } catch (...) {}
+        try { s.DropRef(node); } catch (...) {}
         std::rethrow_exception(error);
     }
 }

@@ -2,6 +2,13 @@
 #include "drive9/client.hpp"
 #include <mutex>
 
+namespace drive9 {
+// Private test peer: observe retention without allocator/RSS timing noise.
+struct ExtentTestAccess {
+    static size_t NodeCount(ExtentFileSystem &fs);
+};
+}
+
 namespace drive9::detail {
 // Linux delayed acknowledgements can stall a small receive window repeatedly.
 void AcknowledgeRead(int socket);

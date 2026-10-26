@@ -39,7 +39,7 @@ public:
     bool gate_put = false, put_entered = false, gate_get = false, get_entered = false;
     bool binding_change = false, refresh_auth = false;
     bool fail_cleanup = false;
-    int cleanup_calls = 0;
+    int cleanup_calls = 0, renewals = 0;
     std::string corrupt_op;
     Json corrupt_errno;
     Json credential = {{"scheme", "s3"}, {"endpoint", "http://object.test"}, {"bucket", "bucket"},
@@ -89,7 +89,10 @@ public:
             reservations[request.at("name").get<std::string>()].push_back({counter, delta});
         }
         else if (op == "new_session") { sid = request.at("sid"); response["session_guard"] = guarded; response["directory_projection"] = directory_projection; }
-        else if (op == "refresh_session" && removed) response["errno"] = 116;
+        else if (op == "refresh_session") {
+            if (removed) response["errno"] = 116;
+            if (request.value("expire", int64_t(0)) > 1) { ++renewals; cv.notify_all(); }
+        }
         else if (op == "find_stale_sessions") response["sids"] = Json::array();
         else if (op == "getattr" || op == "lookup") {
             if (op == "lookup" && !exists) response["errno"] = 2;
@@ -98,7 +101,7 @@ public:
                 response["attr"] = response["inode"] == 1 ? Json({{"Typ", 2}, {"Length", 4096}}) : attr;
             }
         } else if (op == "mknod") { exists = true; inode = request.value("inode", uint64_t(42)); response["inode"] = inode; response["attr"] = attr; }
-        else if (op == "open_ref") ++refs;
+        else if (op == "open_ref" && op != corrupt_op) ++refs;
         else if (op == "delete_sustained") --refs;
         else if (op == "read") response["slices"] = detail::EncodeBase64(maps[request.at("indx").get<uint32_t>()]);
         else if (op == "write") {
@@ -155,6 +158,57 @@ void LostPublicationAck() {
     Fails([&] { fs.WriteAt(file, "abc", 3, 0); }, "failed session replayed a mutation");
     Check(f.publications == 1 && f.puts == 1, "ambiguous mutation was replayed");
     Fails([&] { fs.Sync(file); }, "sync succeeded after ambiguous write");
+}
+void ClosedAndFailedOpenNodesAreReleased() {
+    Fixture f; ExtentOptions options; options.cache_bytes = 0;
+    ExtentFileSystem fs(f.ClientFor(), options);
+    auto first = fs.Open("/data", {true, true});
+    auto second = fs.Open("/data");
+    fs.Close(first);
+    Check(ExtentTestAccess::NodeCount(fs) == 1, "close discarded another handle's inode");
+    fs.Close(second);
+    Check(ExtentTestAccess::NodeCount(fs) == 0, "last close retained an expired inode allocation");
+    for (int i = 0; i < 1000; ++i) {
+        f.inode = 10000 + i;
+        f.corrupt_op = "setlk"; f.corrupt_errno = 11;
+        OpenOptions locked; locked.lock = Lock::Exclusive;
+        Fails([&] { fs.Open("/data", locked); }, "conflicting lock was accepted");
+        Check(f.refs == 0 && ExtentTestAccess::NodeCount(fs) == 0, "failed lock retained an inode/open reference");
+        f.corrupt_op = "open_ref"; f.corrupt_errno = 13;
+        Fails([&] { fs.Open("/data"); }, "rejected open reference was accepted");
+        Check(ExtentTestAccess::NodeCount(fs) == 0, "failed open_ref retained an inode allocation");
+        f.corrupt_op.clear();
+        auto reopened = fs.Open("/data"); fs.Close(reopened);
+        Check(f.refs == 0 && ExtentTestAccess::NodeCount(fs) == 0, "distinct inode registry grew after close");
+        f.calls.clear();
+    }
+    auto rejected_close = fs.Open("/data");
+    f.corrupt_op = "delete_sustained"; f.corrupt_errno = 13;
+    Fails([&] { fs.Close(rejected_close); }, "rejected reference release was accepted");
+    Check(ExtentTestAccess::NodeCount(fs) == 0, "failed reference release retained an inode allocation");
+}
+void ShutdownKeepsRenewingActiveWrites() {
+    Fixture f; ExtentFileSystem fs(f.ClientFor(), ExtentOptions{1000ms});
+    auto file = fs.Open("/data", {true, true}); f.gate_put = true;
+    auto writer = std::async(std::launch::async, [&] { fs.WriteAt(file, "durable", 7, 0); });
+    { std::unique_lock<std::mutex> lock(f.mu); f.cv.wait(lock, [&] { return f.put_entered; }); }
+    std::promise<void> started;
+    auto shutdown = std::async(std::launch::async, [&] { started.set_value(); fs.Shutdown(); });
+    started.get_future().wait();
+    auto concurrent_shutdown = std::async(std::launch::async, [&] { fs.Shutdown(); });
+    bool renewed;
+    {
+        std::unique_lock<std::mutex> lock(f.mu);
+        auto target = f.renewals + 2;
+        renewed = f.cv.wait_for(lock, 3s, [&] { return f.renewals >= target; });
+        f.gate_put = false;
+    }
+    f.cv.notify_all();
+    writer.get(); shutdown.get(); concurrent_shutdown.get();
+    Check(renewed, "shutdown stopped lease renewal before active I/O drained");
+    Check(f.publications == 1, "shutdown returned before the active write was published");
+    fs.Shutdown(); // repeated teardown is safe
+    Check(ExtentTestAccess::NodeCount(fs) == 0, "shutdown retained inode allocations");
 }
 void CompatibleIDReservations() {
     Fixture f; auto client = f.ClientFor(); ExtentFileSystem fs(client); auto file = fs.Open("/data", {true, true});
@@ -472,6 +526,7 @@ int main() {
     try {
         DirectoryProjectionCapability(); LegacyDirectoryRenameIsRejected(); RenameNamespaceValidation();
         PathsAndSlices(); DurableSparseAndReferences(); CompatibleIDReservations(); LostPublicationAck(); MalformedAcknowledgement(); UploadFailure(); LatePutRejected();
+        ShutdownKeepsRenewingActiveWrites(); ClosedAndFailedOpenNodesAreReleased();
         ParallelReadsAndClose(); SyncDoesNotWaitForDownloads(); CredentialBindingAndRefresh(); LeaseAndLegacy(); MaintenanceDoesNotRevokeOwnership();
         RefreshLengthAndRejectSymlinks(); GCSScopedTransport(); DefaultCloudCredentials();
         std::cout << "C++ SDK protocol and fault tests passed\n";
