@@ -223,15 +223,23 @@ func (e *Extent) createOp(ctx context.Context, op *fs.Op, next fs.Next) (fs.Resu
 	// A live claim owns the file's current image: a read-only re-open
 	// serves those bytes — falling through to the plane below would read
 	// the not-yet-pushed remote state (a checksum spanning the landing
-	// mixes the old and new images). A writer first lands the claim.
-	if op.Flags&uint32(syscall.O_CREAT) == 0 {
-		if hit := e.paths.stagingAt(op.Path); hit != nil {
-			if attr, ok := hit.overlayAttr(); ok {
-				if !writeIntent(op.Flags) {
-					return fs.Result{Attr: &attr, Handle: &claimReadHandle{claim: hit}}, nil
-				}
-				_ = hit.Flush(ctx)
+	// mixes the old and new images). A WRITER takes over the path instead:
+	// the claim surrenders (its image lands below and its descriptor joins
+	// the lower plane's shared per-path state), because two private
+	// full-image buffers over one path would clobber each other's committed
+	// bytes — the surrendered fd must read and write the SAME image the
+	// second writer commits. This covers every second open: with or without
+	// O_CREAT, truncate or not.
+	if hit := e.paths.stagingAt(op.Path); hit != nil {
+		if attr, ok := hit.overlayAttr(); ok {
+			if !writeIntent(op.Flags) {
+				return fs.Result{Attr: &attr, Handle: &claimReadHandle{claim: hit}}, nil
 			}
+			if err := hit.surrender(ctx); err != nil {
+				return fs.Result{}, err
+			}
+			// The path is the plane below's now: forward the open plainly.
+			return next(ctx, op)
 		}
 	}
 	// (1) declared creation.
@@ -359,6 +367,13 @@ func (e *Extent) claimStaging(ctx context.Context, op *fs.Op, next fs.Next) (fs.
 		innerOp.Flags &^= uint32(syscall.O_CREAT)
 		h.pushed = st.Size
 		h.dirty = st.Size > 0
+		if st.HasMode {
+			// The truncation rewrite keeps the existing file's mode —
+			// open(O_TRUNC) never changes it — and the claim answers
+			// lookups until its first boundary, so overlay attrs must
+			// report the real mode, not the create-mode fallback.
+			h.mode = st.Mode & 0o777
+		}
 	} else {
 		// Fresh path: promotable to the extent plane at the inline cutoff
 		// (a fresh O_APPEND create included — the claim owns the file from

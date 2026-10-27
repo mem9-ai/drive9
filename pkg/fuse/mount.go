@@ -195,6 +195,17 @@ var knownExtensionNames = map[string]bool{
 	"specials": true, "appendlog": true, "extent": true,
 	"git": true, "layer": true, "localize": true, "renameguard": true,
 	"cache": true,
+	// "bulkfile" is accepted as a DEPRECATED no-op: pre-upgrade
+	// --extensions values and profiles that name it must keep mounting on
+	// the new chain (the takeover subsumed the bulk data plane). It never
+	// resolves to a builder, so it contributes nothing to the order.
+	"bulkfile": true,
+}
+
+// deprecatedExtensionAliases maps accepted-but-ignored extension names to
+// the extension that subsumed them, for the mount-time warning.
+var deprecatedExtensionAliases = map[string]string{
+	"bulkfile": "extent",
 }
 
 // parseExtensionOrder validates the --extensions list and returns it in
@@ -219,6 +230,14 @@ func parseExtensionOrder(list []string) ([]string, error) {
 			return nil, fmt.Errorf("fuse: duplicate extension %q", name)
 		}
 		seen[name] = true
+		if _, dep := deprecatedExtensionAliases[name]; dep {
+			// Accepted for compatibility, dropped from the order: the
+			// subsuming extension (or the default chain) already covers
+			// it. parseExtensionOrder stays a pure function, so the
+			// deprecation is documented here and locked by tests rather
+			// than logged.
+			continue
+		}
 		out = append(out, name)
 	}
 	if len(out) == 0 {
@@ -957,6 +976,9 @@ func mountWithConfig(cfg MountConfig) error {
 		}
 	}
 
+	// wb is the write plane; it is constructed further below but the
+	// extent plane's invalidation hook needs the (possibly nil) reference.
+	var wb *writeback.Writeback
 	// The extent plane claims ahead of the classic data path (cache and
 	// writeback never see extent files). Gated on the --extent paths /
 	// profile [extent] section only: the cache dir falls back to the
@@ -991,8 +1013,13 @@ func mountWithConfig(cfg MountConfig) error {
 			// would fall back to presign/multipart — promotes onto the
 			// extent plane instead. The cutoff comes from the server status
 			// (cached by the client); 0 falls back to the package default.
-			InlineThreshold:   cl.SmallFileThreshold(context.Background()),
-			LargeFileExempt:   largeFileExempt,
+			InlineThreshold: cl.SmallFileThreshold(context.Background()),
+			LargeFileExempt: largeFileExempt,
+			DropClassicPathState: func(path string) {
+				if wb != nil {
+					wb.DropPathState(path)
+				}
+			},
 		})
 		if err != nil {
 			return fmt.Errorf("fuse: extent extension: %w", err)
@@ -1029,7 +1056,6 @@ func mountWithConfig(cfg MountConfig) error {
 		built["xattr"] = xattrExt
 	}
 
-	var wb *writeback.Writeback
 	// A read-only mount serves reads only (the kernel's "ro" option
 	// rejects mutations): constructing the writeback plane here would
 	// RECOVER a previous mount's staging ledger, journal and uploader and

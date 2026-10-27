@@ -58,6 +58,15 @@ type Options struct {
 	// buffered claim stays out — durability belongs to every Write, not to
 	// a boundary.
 	Policy string
+	// DropClassicPathState retires the planes-below CACHED state for a
+	// path (writeback landed records, queued lazy creates) without a
+	// server call. The extent plane uses it after a VFS rename replaces a
+	// classic destination: the planes below never heard about the rename,
+	// but the path now names the moved extent file, so the classic unlink
+	// they would understand would delete it. Wired by the mount to the
+	// writeback plane; nil is a no-op (stale classic state then serves the
+	// overwritten name until its own expiry).
+	DropClassicPathState func(path string)
 }
 
 // Extent is the fs.Handler middleware claiming extent-plane paths. It
@@ -306,29 +315,22 @@ func (e *Extent) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, er
 
 	case fs.OpRename:
 		if ino, ok := e.resolveIno(ctx, op.Path); ok {
-			// The destination may be a CLASSIC file the planes below own
-			// (the takeover mounts mix planes: a VFS special or a promoted
-			// file renamed over a small file). The VFS rename RPC replaces
-			// only the server projection — the planes below never hear
-			// about it and keep serving the overwritten name from their
-			// local state (writeback landed records, dir cache, kernel
-			// dentries): the target "resurrects" with its old identity.
-			// Retire the classic target THROUGH the chain first (the same
-			// move promotion uses for the below lazy create). The facade
-			// refuses renameat2 flags, so every rename here replaces.
-			if _, dstIsExtent := e.resolveIno(ctx, op.Path2); !dstIsExtent {
-				if res, derr := next(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: op.Path2, Caller: op.Caller}); derr == nil && res.Attr != nil {
-					kind := fs.OpUnlink
-					if res.Attr.Kind == fs.KindDir {
-						kind = fs.OpRmdir
-					}
-					if _, uerr := next(ctx, &fs.Op{Kind: kind, Path: op.Path2, Caller: op.Caller}); uerr != nil && !fs.IsNotFound(uerr) {
-						return fs.Result{}, uerr
-					}
-				}
-			}
+			// Rename FIRST: an upfront retirement of a classic destination
+			// would lose it whenever renameIno later fails (runtime build,
+			// parent resolution, the RPC itself). After success the
+			// destination names the MOVED source, so a classic unlink of
+			// the path would delete it — the old destination's client-side
+			// state (writeback landed records, queued lazy creates, live
+			// staging claims, the cached extent identity of whatever it
+			// used to be) is dropped through invalidation instead, without
+			// touching the server object the rename just replaced.
 			if err := e.renameIno(ctx, op, ino); err != nil {
 				return fs.Result{}, err
+			}
+			e.paths.markStagingUnlinked(op.Path2, false)
+			e.paths.forgetIno(op.Path2)
+			if e.opts.DropClassicPathState != nil {
+				e.opts.DropClassicPathState(op.Path2)
 			}
 			e.paths.migrateInoPrefix(op.Path, op.Path2)
 			e.paths.retargetLivePrefix(op.Path, op.Path2)

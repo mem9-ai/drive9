@@ -253,20 +253,26 @@ func (r *pathRouter) retargetLivePrefix(oldPath, newPath string) {
 	r.mu.Unlock()
 }
 
-// trackStaging / untrackStaging maintain the buffered-claim registry.
+// trackStaging / untrackStaging maintain the buffered-claim registry. The
+// map key is the router-owned routerPath (assigned here, under r.mu, and
+// moved only by retargetStaging under the same lock): reading h.path under
+// r.mu raced the rename path's h.mu-guarded update and could untrack the
+// wrong key, leaking the claim and its image.
 func (r *pathRouter) trackStaging(h *stagingHandle) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.staging == nil {
 		r.staging = map[string][]*stagingHandle{}
 	}
-	r.staging[h.path] = append(r.staging[h.path], h)
+	h.routerPath = h.path
+	r.staging[h.routerPath] = append(r.staging[h.routerPath], h)
 }
 
 func (r *pathRouter) untrackStaging(h *stagingHandle) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	hs := r.staging[h.path]
+	key := h.routerPath
+	hs := r.staging[key]
 	for i, cur := range hs {
 		if cur == h {
 			hs = append(hs[:i], hs[i+1:]...)
@@ -274,9 +280,9 @@ func (r *pathRouter) untrackStaging(h *stagingHandle) {
 		}
 	}
 	if len(hs) == 0 {
-		delete(r.staging, h.path)
+		delete(r.staging, key)
 	} else {
-		r.staging[h.path] = hs
+		r.staging[key] = hs
 	}
 }
 
@@ -385,6 +391,10 @@ func (r *pathRouter) retargetStaging(ctx context.Context, oldPath, newPath strin
 	}
 	for h, np := range moves {
 		r.staging[np] = append(r.staging[np], h)
+		// The router key moves WITH the map entry, still under r.mu: a
+		// concurrent untrackStaging then removes the right key however the
+		// rename interleaves with the release.
+		h.routerPath = np
 	}
 	r.mu.Unlock()
 	for h, np := range moves {

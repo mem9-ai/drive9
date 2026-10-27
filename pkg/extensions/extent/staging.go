@@ -33,12 +33,21 @@ import (
 // handles first and probe them after releasing, keeping the order strictly
 // h.mu → router.mu.
 type stagingHandle struct {
-	e         *Extent
-	path      string
-	caller    fs.Caller
-	below     fs.Filesystem
-	inner     fs.Handle
-	openFlags uint32 // claim flags for re-opening the session below after a rename
+	e *Extent
+	// path is the below-plane path (kept for the session and pushes); the
+	// ROUTER's key is routerPath, owned and mutated under pathRouter.mu so
+	// map operations never read a path field another lock guards.
+	path string
+	// routerPath is the pathRouter staging-map key: set under router.mu at
+	// claim time, moved under router.mu by retargetStaging. untrackStaging
+	// reads it under the same lock, so a Release racing a rename can never
+	// miss its entry and leak the claim (and its image) for the mount's
+	// lifetime.
+	routerPath string
+	caller     fs.Caller
+	below      fs.Filesystem
+	inner      fs.Handle
+	openFlags  uint32 // claim flags for re-opening the session below after a rename
 
 	mu     sync.Mutex
 	image  []byte
@@ -227,6 +236,46 @@ func (h *stagingHandle) applyAttr(ctx context.Context, op *fs.Op) (fs.Attr, erro
 	return h.attrLocked(), nil
 }
 
+// surrender hands the path to the planes below for a SECOND writable open:
+// the buffered image lands there (one push, synchronous) and this
+// descriptor switches to passthrough, so every fd of the path shares the
+// lower plane's coherent per-path state instead of holding a private full
+// image whose later push would overwrite the other writer's committed
+// bytes. The claim settles classically from here on (promotion is off): a
+// file written through two descriptors at once is exactly the shape the
+// buffered single-writer claim is not. This is the handoff the bulk data
+// plane (bulkfile) implemented before the takeover subsumed it.
+func (h *stagingHandle) surrender(ctx context.Context) error {
+	h.mu.Lock()
+	if h.released || h.unlinked || h.promoted != nil || h.passthrough {
+		h.mu.Unlock()
+		return nil
+	}
+	h.mu.Unlock()
+	// A full Flush, not a bare push: the bytes must be in the lower
+	// plane's PENDING state (staged/queued), which is what a second open
+	// of the path reads while the landing is in flight.
+	if err := h.Flush(ctx); err != nil {
+		return err
+	}
+	// Release the private below session: every later access re-enters the
+	// lower plane BY PATH (or through a freshly opened handle), so this
+	// descriptor sees the second writer's committed bytes instead of a
+	// session-local buffer snapshot.
+	if inner := h.detachBelowLocked(); inner != nil {
+		_ = inner.Release(ctx)
+	}
+	h.mu.Lock()
+	h.passthrough = true
+	h.promotable = false
+	h.image = nil // the bytes now live in the plane below
+	h.mu.Unlock()
+	// The claim no longer owns the path's freshest state: stop answering
+	// its lookups from this handle.
+	h.e.paths.untrackStaging(h)
+	return nil
+}
+
 // stagingMaxBufferedBytes bounds the claimed image retained in memory
 // before the claim hands the stream to the plane below (whose own
 // buffering spills to parts/shadow files). The promotion line (the inline
@@ -341,7 +390,14 @@ func (h *stagingHandle) Write(ctx context.Context, off int64, data []byte) error
 	threshold := h.e.inlineThreshold()
 	crossing := h.promotable && !h.promoting && end >= threshold &&
 		end <= threshold+stagingMaxBufferedBytes
-	if crossing || h.unlinked || end <= h.memBoundLocked() {
+	// An open-unlinked claim buffers like any other, but only within the
+	// memory bound: a sparse jump on an anonymous fd must not allocate the
+	// hole (nothing can be gained — the boundary pushes are discarded and
+	// promotion refuses unlinked claims). Past the bound the write forwards
+	// to the below session when one exists (its buffering spills to shadow
+	// files) and fails ENOSPC when it does not.
+	unlinkedBounded := h.unlinked && end <= h.memBoundLocked()
+	if crossing || unlinkedBounded || end <= h.memBoundLocked() {
 		switch {
 		case off == int64(len(h.image)):
 			h.image = append(h.image, data...)
@@ -387,6 +443,26 @@ func (h *stagingHandle) Write(ctx context.Context, off int64, data []byte) error
 		// classic forward below takes over — the legacy multipart path.
 	} else {
 		h.mu.Unlock()
+	}
+	if h.unlinked {
+		// Nothing to land (pushes are discarded for anonymous claims) and
+		// nowhere to re-open: forward to the detached session if the claim
+		// ever got one, otherwise refuse — allocating the hole is the one
+		// outcome the bound exists to prevent. (Entered with h.mu already
+		// released by the routing above.)
+		inner, serr := h.session(ctx)
+		if serr != nil {
+			return serr
+		}
+		if inner == nil {
+			return syscall.ENOSPC
+		}
+		h.mu.Lock()
+		h.passthrough = true
+		h.promotable = false
+		h.image = nil
+		h.mu.Unlock()
+		return inner.Write(ctx, off, data)
 	}
 	// The image would exceed the memory bound and no extent plane could be
 	// built: land what is buffered and hand the stream to the write plane
@@ -497,6 +573,16 @@ func (h *stagingHandle) Release(ctx context.Context) error {
 		}
 	}
 	return pushErr
+}
+
+// detachBelowLocked drops the private below session (the bytes stay in the
+// lower plane's per-path pending state) and returns the released handle.
+func (h *stagingHandle) detachBelowLocked() fs.Handle {
+	h.mu.Lock()
+	inner := h.inner
+	h.inner = nil
+	h.mu.Unlock()
+	return inner
 }
 
 // session returns the below handle, opening it at the current path when a

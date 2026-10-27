@@ -1117,3 +1117,223 @@ func TestRenameOverLiveClaimAnonymizesDestination(t *testing.T) {
 		t.Fatal("source path resurrected")
 	}
 }
+
+// TestSecondWriterHandoffKeepsCommittedBytes is the committed-data
+// regression from the review (deterministic 3/3 under -race on the head,
+// passing on main): a second writable open of a claimed path must hand the
+// path to the shared lower state — the first descriptor reads and then
+// extends what the SECOND writer committed, instead of pushing its stale
+// private image over it.
+func TestSecondWriterHandoffKeepsCommittedBytes(t *testing.T) {
+	b := testbackend.NewBackend()
+	ch := newWritebackStack(t, b, 64*1024)
+	ctx := context.Background()
+
+	fd1 := openForWrite(t, ch, "/shared")
+	if err := fd1.Write(ctx, 0, []byte("abc")); err != nil {
+		t.Fatal(err)
+	}
+	// fd2 opens the SAME path with a plain O_RDWR (no O_CREAT, no O_TRUNC)
+	// and commits an extension of fd1's image.
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/shared", Flags: uint32(syscall.O_RDWR)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fd2 := res.Handle
+	if err := fd2.Write(ctx, 3, []byte("def")); err != nil {
+		t.Fatal(err)
+	}
+	if err := fd2.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := backendData(t, b, "/shared"); !ok || got != "abcdef" {
+		t.Fatalf("backend after fd2 flush = %q ok=%v, want abcdef", got, ok)
+	}
+	// fd1 must now read the SHARED state, not its stale private image.
+	buf := make([]byte, 6)
+	if n, err := fd1.Read(ctx, 0, buf); err != nil || string(buf[:n]) != "abcdef" {
+		t.Fatalf("fd1 read after fd2 flush = %q n=%d err=%v, want abcdef", buf[:n], n, err)
+	}
+	// fd1's own write must compose over the committed bytes, not replace
+	// them with the stale image.
+	if err := fd1.Write(ctx, 0, []byte("X")); err != nil {
+		t.Fatal(err)
+	}
+	if err := fd1.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := backendData(t, b, "/shared"); !ok || got != "Xbcdef" {
+		t.Fatalf("backend after fd1 flush = %q ok=%v, want Xbcdef (committed suffix dropped)", got, ok)
+	}
+	if err := fd1.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := fd2.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestSecondOpenWithCreateAlsoHandsOff pins the O_CREAT (no O_TRUNC)
+// variant: a second creator of a claimed path must not spawn a second
+// private claim; both descriptors share the lower state.
+func TestSecondOpenWithCreateAlsoHandsOff(t *testing.T) {
+	b := testbackend.NewBackend()
+	ch := newWritebackStack(t, b, 64*1024)
+	ctx := context.Background()
+
+	fd1 := openForWrite(t, ch, "/both")
+	if err := fd1.Write(ctx, 0, []byte("abc")); err != nil {
+		t.Fatal(err)
+	}
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/both",
+		Flags: uint32(syscall.O_CREAT | syscall.O_RDWR), Mode: 0o644})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fd2 := res.Handle
+	if err := fd2.Write(ctx, 3, []byte("def")); err != nil {
+		t.Fatal(err)
+	}
+	if err := fd2.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := fd1.Write(ctx, 0, []byte("X")); err != nil {
+		t.Fatal(err)
+	}
+	if err := fd1.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := backendData(t, b, "/both"); !ok || got != "Xbcdef" {
+		t.Fatalf("backend = %q ok=%v, want Xbcdef", got, ok)
+	}
+	_ = fd1.Release(ctx)
+	_ = fd2.Release(ctx)
+}
+
+// TestTruncateClaimReportsExistingMode: an O_TRUNC claim on an existing
+// classic file answers lookups with the file's REAL mode until its first
+// boundary — open(O_TRUNC) never changes the mode.
+func TestTruncateClaimReportsExistingMode(t *testing.T) {
+	b := testbackend.NewBackend()
+	ch := newWritebackStack(t, b, noThreshold)
+	ctx := context.Background()
+
+	// Create the file and land it with mode 0755 through the chain.
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/script.sh",
+		Flags: uint32(syscall.O_CREAT | syscall.O_WRONLY | syscall.O_TRUNC), Mode: 0o755})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := res.Handle.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	mode := uint32(0o755)
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpSetAttr, Path: "/script.sh", HasMode: true, Mode: mode}); err != nil {
+		t.Fatal(err)
+	}
+
+	// `> script.sh`: the claim window must still report 0755.
+	res, err = ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/script.sh",
+		Flags: uint32(syscall.O_CREAT | syscall.O_WRONLY | syscall.O_TRUNC), Mode: 0o644})
+	if err != nil {
+		t.Fatal(err)
+	}
+	attr, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: "/script.sh"})
+	if err != nil || attr.Attr == nil {
+		t.Fatalf("getattr during claim: %v %+v", err, attr.Attr)
+	}
+	if attr.Attr.Mode&0o777 != 0o755 {
+		t.Fatalf("mode during claim = %#o, want 0755 (existing file mode)", attr.Attr.Mode&0o777)
+	}
+	if err := res.Handle.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestUnlinkedClaimSparseWriteIsBounded: after an unlink of an open claim
+// with no below session, a sparse write past the memory bound must fail
+// ENOSPC instead of allocating the hole.
+func TestUnlinkedClaimSparseWriteIsBounded(t *testing.T) {
+	b := testbackend.NewBackend()
+	ch := newWritebackStack(t, b, noThreshold)
+	ctx := context.Background()
+
+	h := openForWrite(t, ch, "/u")
+	if err := h.Write(ctx, 0, []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	// Never flushed: no below session exists yet, and the unlink discards
+	// the pending image anyway.
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/u"}); err != nil {
+		t.Fatal(err)
+	}
+	sh, ok := h.(*stagingHandle)
+	if !ok {
+		t.Fatalf("handle is %T, want *stagingHandle", h)
+	}
+	sh.mu.Lock()
+	if !sh.unlinked {
+		sh.mu.Unlock()
+		t.Fatal("claim not marked unlinked after the chain unlink")
+	}
+	sh.mu.Unlock()
+	// The claim holds its below session from the very open, so the sparse
+	// write must FORWARD there (the anonymous writeback handle spills to
+	// bounded shadow files) — not allocate the 64MiB hole in the image.
+	if err := h.Write(ctx, 64<<20, []byte("y")); err != nil {
+		t.Fatalf("sparse write on an unlinked claim with a session = %v, want forwarded success", err)
+	}
+	if err := h.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestUnlinkedClaimSparseWriteNoSessionRefused pins the no-session half:
+// with no below handle to forward to, a write past the bound fails ENOSPC
+// instead of allocating the hole.
+func TestUnlinkedClaimSparseWriteNoSessionRefused(t *testing.T) {
+	ext, err := New(Options{InlineThreshold: noThreshold})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &stagingHandle{e: ext, path: "/gone.bin",
+		below: fs.HandlerFilesystem(func(ctx context.Context, op *fs.Op) (fs.Result, error) {
+			return fs.Result{}, fs.ErrNotFound
+		}),
+		openFlags: uint32(syscall.O_CREAT | syscall.O_RDWR)}
+	h.unlinked = true // anonymous fd, detached below (never had a session)
+	ext.paths.trackStaging(h)
+	t.Cleanup(func() { ext.paths.untrackStaging(h) })
+	if err := h.Write(context.Background(), 64<<20, []byte("y")); err != syscall.ENOSPC {
+		t.Fatalf("sparse write error = %v, want ENOSPC (nothing to forward to)", err)
+	}
+}
+
+// TestRouterKeySurvivesReleaseRenameRace locks the router-owned staging
+// key: after a rename moves a claim's map entry, a Release must remove
+// exactly that entry — the map ends empty however the two interleaved.
+func TestRouterKeySurvivesReleaseRenameRace(t *testing.T) {
+	ext, err := New(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &stagingHandle{e: ext, path: "/d/f"}
+	ext.paths.trackStaging(h)
+	if len(ext.paths.staging) != 1 {
+		t.Fatalf("staging map = %v, want one entry", ext.paths.staging)
+	}
+	// The rename's router move happens (under r.mu) and only afterwards
+	// does the handle learn its new path: a release in between must still
+	// untrack the moved entry via the router key.
+	ext.paths.mu.Lock()
+	hs := ext.paths.staging["/d/f"]
+	delete(ext.paths.staging, "/d/f")
+	ext.paths.staging["/moved/f"] = hs
+	h.routerPath = "/moved/f"
+	ext.paths.mu.Unlock()
+	h.retarget(context.Background(), "/moved/f")
+	ext.paths.untrackStaging(h)
+	if len(ext.paths.staging) != 0 {
+		t.Fatalf("staging map after release = %v, want empty (leaked claim)", ext.paths.staging)
+	}
+}

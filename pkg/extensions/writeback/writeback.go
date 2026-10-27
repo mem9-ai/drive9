@@ -3349,6 +3349,24 @@ func (w *Writeback) landedAt(path string, rev, size int64) {
 	w.landedMu.Unlock()
 }
 
+// DropPathState retires every piece of THIS plane's cached state for a
+// path with no server call: queued and staged entries die, the
+// recently-landed table forgets it, and live descriptors go anonymous (a
+// clean one gets its unlink snapshot). It is the invalidation hook for
+// planes ABOVE that replace a path out-of-band (the extent plane's VFS
+// rename over a classic destination): the classic planes never heard the
+// replacement, but a classic unlink would now delete the moved object.
+func (w *Writeback) DropPathState(path string) {
+	w.markUnlinked(path, false)
+	if w.queue != nil {
+		w.queue.CancelPath(path)
+	}
+	if w.wbCache != nil {
+		w.wbCache.Remove(path)
+	}
+	w.forgetLanded(path)
+}
+
 func (w *Writeback) forgetLanded(path string) {
 	w.landedMu.Lock()
 	delete(w.landed, path)
