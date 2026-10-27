@@ -81,6 +81,7 @@ EXTENT_E2E_SMALL_KB="${EXTENT_E2E_SMALL_KB:-4}"
 EXTENT_E2E_COMPACT_WRITES="${EXTENT_E2E_COMPACT_WRITES:-2600}"
 EXTENT_E2E_COMPACT_SPAN_MB="${EXTENT_E2E_COMPACT_SPAN_MB:-32}"
 EXTENT_E2E_GC_WAIT_S="${EXTENT_E2E_GC_WAIT_S:-240}"
+EXTENT_E2E_LAND_WAIT_S="${EXTENT_E2E_LAND_WAIT_S:-60}"
 EXTENT_E2E_S3_DIR="${EXTENT_E2E_S3_DIR:-}"
 EXTENT_E2E_SQL_CHECK="${EXTENT_E2E_SQL_CHECK:-0}"
 EXTENT_E2E_KEEP_ARTIFACTS="${EXTENT_E2E_KEEP_ARTIFACTS:-0}"
@@ -387,6 +388,38 @@ sha256_stream() {
 
 mount_sha() { sha256_stream <"$1"; }
 remote_sha() { drive9 fs cat "$1" | sha256_stream; }
+
+# expect_remote_sha: the write plane commits asynchronously under the
+# writeback policy (the mount serves the pending image, the server catches
+# up). CLI-side reads wait for the landing instead of racing it; a timeout
+# is a FAIL, not a retry.
+expect_remote_sha() {
+  local desc="$1" remote="$2" want="$3"
+  local deadline=$(( $(date +%s) + EXTENT_E2E_LAND_WAIT_S ))
+  local got=""
+  while :; do
+    got="$(remote_sha "$remote")"
+    if [ "$got" = "$want" ]; then
+      check_eq "$desc" "$got" "$want"
+      return 0
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      check_eq "$desc (waited ${EXTENT_E2E_LAND_WAIT_S}s)" "$got" "$want"
+      return 1
+    fi
+    sleep 1
+  done
+}
+
+# wait_remote_landed: block until the path's committed bytes match the
+# mount's current view — call before mv/rm of a just-written file so the
+# mutation does not race the queued commit.
+wait_remote_landed() {
+  local remote="$1" local_file="$2" want
+  want="$(mount_sha "$local_file")"
+  wait_until "remote landing of $remote" "$EXTENT_E2E_LAND_WAIT_S" \
+    bash -c "[ \"\$(drive9 fs cat \"$remote\" | sha256_stream)\" = \"$want\" ]" || true
+}
 
 file_size() {
   python3 -c 'import os,sys; print(os.stat(sys.argv[1]).st_size)' "$1"
@@ -773,28 +806,30 @@ drive9_retry fs cp "$RUN_ROOT/legacy-src.bin" ":$ROOT_REMOTE/legacy/big.bin" >/d
 expect_layout "A: CLI-uploaded big file is content_layout=single" "$ROOT_REMOTE/legacy/big.bin" "single"
 expect_extent_ino "A: legacy big file has no extent_ino" "$ROOT_REMOTE/legacy/big.bin" ""
 check_eq "A: mount reads the legacy bytes" "$(mount_sha "$M/legacy/big.bin")" "$LEG_SHA"
-check_eq "A: CLI cat agrees with the mount" "$(remote_sha "$ROOT_REMOTE/legacy/big.bin")" "$LEG_SHA"
+expect_remote_sha "A: CLI cat agrees with the mount" "$ROOT_REMOTE/legacy/big.bin" "$LEG_SHA"
 
 append_bytes "$M/legacy/big.bin" 4096 "alpha"
 check_eq "A: append keeps layout single" "$(layout_of "$ROOT_REMOTE/legacy/big.bin")" "single"
-check_eq "A: mount vs CLI after append" "$(mount_sha "$M/legacy/big.bin")" "$(remote_sha "$ROOT_REMOTE/legacy/big.bin")"
+expect_remote_sha "A: CLI agrees after append" "$ROOT_REMOTE/legacy/big.bin" "$(mount_sha "$M/legacy/big.bin")"
 check_eq "A: append grew the file" "$(file_size "$M/legacy/big.bin")" "$((BIG_BYTES + 4096))"
 
 overwrite_at "$M/legacy/big.bin" 1024 4096
 check_eq "A: partial overwrite keeps layout single" "$(layout_of "$ROOT_REMOTE/legacy/big.bin")" "single"
-check_eq "A: mount vs CLI after overwrite" "$(mount_sha "$M/legacy/big.bin")" "$(remote_sha "$ROOT_REMOTE/legacy/big.bin")"
+expect_remote_sha "A: CLI agrees after overwrite" "$ROOT_REMOTE/legacy/big.bin" "$(mount_sha "$M/legacy/big.bin")"
 
 TR_SHA="$(make_payload "$RUN_ROOT/legacy-src2.bin" "$BIG_KB" 2)"
 cat "$RUN_ROOT/legacy-src2.bin" > "$M/legacy/big.bin"
 sync
 check_eq "A: truncate-rewrite keeps layout single (no conversion)" "$(layout_of "$ROOT_REMOTE/legacy/big.bin")" "single"
 check_eq "A: truncate-rewrite bytes" "$(mount_sha "$M/legacy/big.bin")" "$TR_SHA"
-check_eq "A: CLI sees rewritten bytes" "$(remote_sha "$ROOT_REMOTE/legacy/big.bin")" "$TR_SHA"
+expect_remote_sha "A: CLI sees rewritten bytes" "$ROOT_REMOTE/legacy/big.bin" "$TR_SHA"
+wait_remote_landed "$ROOT_REMOTE/legacy/big.bin" "$M/legacy/big.bin"
 
 chmod 600 "$M/legacy/big.bin"
 check_eq "A: chmod visible through the mount" "$(python3 -c 'import os,sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777))' "$M/legacy/big.bin")" "0o600"
 
 mkdir -p "$M/legacy-mv"
+wait_remote_landed "$ROOT_REMOTE/legacy/big.bin" "$M/legacy/big.bin"
 mv "$M/legacy/big.bin" "$M/legacy-mv/big.bin"
 expect_layout "A: renamed legacy file stays single" "$ROOT_REMOTE/legacy-mv/big.bin" "single"
 check_eq "A: renamed legacy bytes" "$(mount_sha "$M/legacy-mv/big.bin")" "$TR_SHA"
@@ -812,20 +847,20 @@ sync
 expect_layout "B: same path rewritten past the cutoff becomes extent" "$ROOT_REMOTE/rewrite.bin" "extent"
 check_ne "B: promoted file has an extent_ino" "$(extent_ino_of "$ROOT_REMOTE/rewrite.bin")" ""
 check_eq "B: mount bytes of promoted file" "$(mount_sha "$M/rewrite.bin")" "$BIG_SHA1"
-check_eq "B: CLI reads the promoted file through the extent reader" "$(remote_sha "$ROOT_REMOTE/rewrite.bin")" "$BIG_SHA1"
+expect_remote_sha "B: CLI reads the promoted file through the extent reader" "$ROOT_REMOTE/rewrite.bin" "$BIG_SHA1"
 PROMOTED_INO="$(extent_ino_of "$ROOT_REMOTE/rewrite.bin")"
 
 GROW_SHA="$(write_growing "$M/grow.bin" "$((INLINE_THRESHOLD / 2))" "$((INLINE_THRESHOLD * 3))")"
 expect_layout "B: one-fd grow across the cutoff promotes" "$ROOT_REMOTE/grow.bin" "extent"
 check_eq "B: grow image bytes" "$(mount_sha "$M/grow.bin")" "$GROW_SHA"
-check_eq "B: CLI agrees on grown image" "$(remote_sha "$ROOT_REMOTE/grow.bin")" "$GROW_SHA"
+expect_remote_sha "B: CLI agrees on grown image" "$ROOT_REMOTE/grow.bin" "$GROW_SHA"
 
 # An fsync between the two payloads is a durability boundary: the claim
 # settles on the classic plane and the layout stays single from then on.
 SETTLE_SHA="$(write_fsync_settles "$M/settle.bin" "$((INLINE_THRESHOLD / 2))" "$((INLINE_THRESHOLD * 3))")"
 expect_layout "B: fsync mid-grow settles the claim classically" "$ROOT_REMOTE/settle.bin" "single"
 check_eq "B: settled image bytes" "$(mount_sha "$M/settle.bin")" "$SETTLE_SHA"
-check_eq "B: CLI agrees on settled image" "$(remote_sha "$ROOT_REMOTE/settle.bin")" "$SETTLE_SHA"
+expect_remote_sha "B: CLI agrees on settled image" "$ROOT_REMOTE/settle.bin" "$SETTLE_SHA"
 
 write_append_only "$M/app.log" "$((INLINE_THRESHOLD * 3))"
 expect_layout "B: O_APPEND writer past the cutoff promotes" "$ROOT_REMOTE/app.log" "extent"
@@ -875,7 +910,7 @@ expect_layout "C: tree/sub/big2.bin promoted" "$ROOT_REMOTE/tree/sub/big2.bin" "
 BIG2_INO="$(extent_ino_of "$ROOT_REMOTE/tree/sub/big2.bin")"
 BIG2_SHA="$(mount_sha "$M/tree/sub/big2.bin")"
 expect_layout "C: tree/small.txt stays single" "$ROOT_REMOTE/tree/small.txt" "single"
-check_eq "C: small child bytes" "$(mount_sha "$M/tree/small.txt")" "$(remote_sha "$ROOT_REMOTE/tree/small.txt")"
+expect_remote_sha "C: small child bytes (CLI agrees)" "$ROOT_REMOTE/tree/small.txt" "$(mount_sha "$M/tree/small.txt")"
 
 mount_ls="$(ls -1A "$M/tree" | sort)"
 remote_ls="$(drive9_retry fs ls "$ROOT_REMOTE/tree" | sed 's:/$::' | sort)"
@@ -962,7 +997,7 @@ MOUNT_PID="$(start_mount_at "$M" "$MOUNT_LOG" "${mount_profile_args[@]}")"
 check_cmd "D: remount is up" is_mounted "$M"
 expect_layout "D: CLI-renamed dir keeps child extent" "$ROOT_REMOTE/tree4/big2.bin" "extent"
 expect_extent_ino "D: CLI-renamed dir keeps child ino" "$ROOT_REMOTE/tree4/big2.bin" "$BIG2_INO"
-check_eq "D: CLI-renamed child bytes (mount vs CLI)" "$(mount_sha "$M/tree4/big2.bin")" "$(remote_sha "$ROOT_REMOTE/tree4/big2.bin")"
+expect_remote_sha "D: CLI-renamed child bytes" "$ROOT_REMOTE/tree4/big2.bin" "$(mount_sha "$M/tree4/big2.bin")"
 check_cmd "D: CLI-renamed child is statable" test -e "$M/tree4/big2.bin"
 check_cmd_fail "D: CLI-removed tree absent in the fresh mount" test -e "$M/tree5"
 mkdir "$M/tree5"
@@ -1005,7 +1040,7 @@ if [ "$EXTENT_E2E_COMPACT_WRITES" -gt 0 ]; then
   expect_layout "F: fsync-cycled file is extent" "$ROOT_REMOTE/comp.bin" "extent"
   COMPACT_INO="$(extent_ino_of "$ROOT_REMOTE/comp.bin")"
   check_eq "F: bytes before compaction" "$(mount_sha "$M/comp.bin")" "$COMPACT_SHA"
-  check_eq "F: CLI reads the same bytes" "$(remote_sha "$ROOT_REMOTE/comp.bin")" "$COMPACT_SHA"
+  expect_remote_sha "F: CLI reads the same bytes" "$ROOT_REMOTE/comp.bin" "$COMPACT_SHA"
   OBJ_BEFORE_F="$(s3_object_count)"
   # The merged chunk lands immediately, but reclaiming ~N superseded block
   # objects is batched (32/pass) — far beyond any CI window. Report only;
@@ -1028,7 +1063,7 @@ if [ "$EXTENT_E2E_COMPACT_WRITES" -gt 0 ]; then
       "$(sql_scalar "SELECT COUNT(*) AS n FROM jfs_chunk WHERE inode = $COMPACT_INO AND LENGTH(slices)/24 >= 2500")" "0"
   fi
   check_eq "F: bytes after compaction window" "$(mount_sha "$M/comp.bin")" "$COMPACT_SHA"
-  check_eq "F: CLI bytes after compaction window" "$(remote_sha "$ROOT_REMOTE/comp.bin")" "$COMPACT_SHA"
+  expect_remote_sha "F: CLI bytes after compaction window" "$ROOT_REMOTE/comp.bin" "$COMPACT_SHA"
   stop_mount_at "$M" "$MOUNT_PID"
   MOUNT_PID="$(start_mount_at "$M" "$MOUNT_LOG" "${mount_profile_args[@]}")"
   check_cmd "F: remount is up" is_mounted "$M"

@@ -147,6 +147,13 @@
       "product_promise": "write-sync FUSE keeps forward progress under concurrency",
       "owner_hint": "fs",
       "failure_class": "correctness"
+    },
+    "extent-takeover-e2e": {
+      "title": "Extent takeover e2e (merge gate)",
+      "product_area": "fuse",
+      "product_promise": "the default-mount extent takeover keeps legacy multipart files compatible, promotes new files past the inline cutoff, and keeps mixed single+extent trees correct",
+      "owner_hint": "fs",
+      "failure_class": "correctness"
     }
   }
 }
