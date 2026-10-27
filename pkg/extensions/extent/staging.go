@@ -16,6 +16,8 @@ package extent
 
 import (
 	"context"
+	"io"
+	"os"
 	"sync"
 	"syscall"
 
@@ -45,21 +47,33 @@ type stagingHandle struct {
 	// lifetime.
 	routerPath string
 	caller     fs.Caller
-	below      fs.Filesystem
+	below      fs.HandlerFilesystem
 	inner      fs.Handle
 	openFlags  uint32 // claim flags for re-opening the session below after a rename
 
-	mu     sync.Mutex
-	image  []byte
-	mode   uint32
-	pushed int64 // image size already expressed below; a shorter image needs a truncation
-	dirty  bool  // image differs from the state expressed below
+	mu    sync.Mutex
+	image []byte
+	mode  uint32
+	// modeKnown records that mode carries an EXPLICIT mode (create or
+	// chmod): an absent mode defaults to 0644, an explicit 000 or a setuid
+	// bit is reported and applied as-is.
+	modeKnown bool
+	pushed    int64 // image size already expressed below; a shorter image needs a truncation
+	dirty     bool  // image differs from the state expressed below
 	// promoted serves every operation once the claim moved to the extent
 	// plane; image is released with the swap.
 	promoted *extentHandle
 	// promoting single-flights the promotion against writers that cross
 	// the threshold while the move is between its phases.
 	promoting bool
+	// surrendering marks the second-writer handoff between its phases
+	// (flush + below-session release while h.mu is released). A Write
+	// that arrives in the window must NOT append to the image — the
+	// handoff clears it — so it waits on handoffCond until the claim is
+	// fully passthrough, and only then routes its bytes (nothing
+	// acknowledged is discarded).
+	surrendering bool
+	handoffCond  *sync.Cond
 	// passthrough marks an image that overflowed the memory bound: the
 	// buffered prefix landed below and the stream forwards to the plane
 	// under it (whose own buffering spills to parts/shadow files).
@@ -73,6 +87,16 @@ type stagingHandle struct {
 
 	unlinked bool // directory entry gone; boundary pushes are discarded
 	released bool
+	// spill serves an open-unlinked claim with no below session: a local
+	// temporary file keeps the descriptor writable without buffering the
+	// logical hole in memory.
+	spill     *os.File
+	spillSize int64
+
+	// testHookFlush, when set, runs at the top of Flush (with NO locks
+	// held): tests use it to hold the surrender's flush phase open and
+	// place a write inside the handoff window deterministically.
+	testHookFlush func()
 }
 
 // claimLive reports whether the claim still owns its name and has not
@@ -136,9 +160,10 @@ func (h *stagingHandle) applyAttr(ctx context.Context, op *fs.Op) (fs.Attr, erro
 		return h.e.promotedAttr(ctx, promoted)
 	}
 	if op.HasMode {
-		mode := op.Mode & 0o777
+		mode := op.Mode & 0o7777
 		h.mu.Lock()
 		h.mode = mode
+		h.modeKnown = true
 		h.mu.Unlock()
 		if err := h.below.SetAttr(ctx, h.path, fs.AttrPatch{Mode: &mode}); err != nil {
 			return fs.Attr{}, err
@@ -148,20 +173,28 @@ func (h *stagingHandle) applyAttr(ctx context.Context, op *fs.Op) (fs.Attr, erro
 	passthrough := h.passthrough
 	h.mu.Unlock()
 	if passthrough {
-		// The stream lives in the plane below now; the emptied image is
-		// not the file. Delegate size changes there (a truncate against
-		// len(nil) would compare equal to 0 and skip the shrink).
-		if op.Size >= 0 {
-			size := op.Size
-			if err := h.below.SetAttr(ctx, h.path, fs.AttrPatch{Size: &size}); err != nil {
-				return fs.Attr{}, err
-			}
-			h.mu.Lock()
-			h.pushed = size
-			a := h.attrLocked()
-			h.mu.Unlock()
-			return a, nil
+		// The stream lives in the plane below now. The setattr must be
+		// DESCRIPTOR-bound: forwarded with the below session's handle, so
+		// an ftruncate on this fd truncates the opened object even after a
+		// rename moved the path and a replacement took the old name (a
+		// path-bound SetAttr would truncate the replacement instead).
+		inner, serr := h.session(ctx)
+		if serr != nil {
+			return fs.Attr{}, serr
 		}
+		if inner != nil {
+			fop := *op
+			fop.Handle = inner
+			res, ferr := h.below(ctx, &fop)
+			if ferr != nil {
+				return fs.Attr{}, ferr
+			}
+			if res.Attr != nil {
+				return *res.Attr, nil
+			}
+		}
+		// No session (anonymous claim): the image is empty; a size change
+		// has nothing local to edit — report the current attributes.
 		h.mu.Lock()
 		a := h.attrLocked()
 		h.mu.Unlock()
@@ -251,13 +284,32 @@ func (h *stagingHandle) surrender(ctx context.Context) error {
 		h.mu.Unlock()
 		return nil
 	}
+	// From here on, concurrent Writes must not take the image path: the
+	// handoff flushes the image and then clears it. They wait on the cond
+	// until the claim is fully passthrough, so an acknowledged write in
+	// the window can never be discarded (the previous race: append under
+	// passthrough=false, then image=nil dropped the bytes and the next
+	// push truncated the shared file to the stale image's length).
+	h.surrendering = true
 	h.mu.Unlock()
+
 	// A full Flush, not a bare push: the bytes must be in the lower
 	// plane's PENDING state (staged/queued), which is what a second open
-	// of the path reads while the landing is in flight.
-	if err := h.Flush(ctx); err != nil {
-		return err
+	// of the path reads while the landing is in flight. A write that
+	// raced the first flush's unlocked window appended to the image and
+	// made it dirty again — flush a second time (the window is closed to
+	// new writers now) so the second writer opens onto every acknowledged
+	// byte.
+	for range 2 {
+		if err := h.Flush(ctx); err != nil {
+			h.mu.Lock()
+			h.surrendering = false
+			h.handoffCond.Broadcast()
+			h.mu.Unlock()
+			return err
+		}
 	}
+
 	// Release the private below session: every later access re-enters the
 	// lower plane BY PATH (or through a freshly opened handle), so this
 	// descriptor sees the second writer's committed bytes instead of a
@@ -269,9 +321,13 @@ func (h *stagingHandle) surrender(ctx context.Context) error {
 	h.passthrough = true
 	h.promotable = false
 	h.image = nil // the bytes now live in the plane below
+	h.dirty = false
+	h.pushed = 0
+	h.surrendering = false
+	h.handoffCond.Broadcast()
 	h.mu.Unlock()
 	// The claim no longer owns the path's freshest state: stop answering
-	// its lookups from this handle.
+	// the path's lookups from this handle.
 	h.e.paths.untrackStaging(h)
 	return nil
 }
@@ -306,6 +362,16 @@ func (h *stagingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.spill != nil {
+		if off < 0 || off >= h.spillSize {
+			return 0, nil
+		}
+		n, err := h.spill.ReadAt(dest, off)
+		if err == io.EOF {
+			err = nil
+		}
+		return n, err
+	}
 	if off >= int64(len(h.image)) {
 		return 0, nil
 	}
@@ -320,7 +386,7 @@ func (h *stagingHandle) readAll(ctx context.Context, off, limit int64) ([]byte, 
 	promoted := h.promoted
 	h.mu.Unlock()
 	if promoted != nil {
-		return h.e.readViaVFS(ctx, h.path, uint64(promoted.ino), off, limit)
+		return h.e.readViaVFS(ctx, h.path, uint64(promoted.ino), off, limit, h.caller)
 	}
 	h.mu.Lock()
 	passthrough := h.passthrough
@@ -372,6 +438,13 @@ func (h *stagingHandle) Write(ctx context.Context, off int64, data []byte) error
 		return nil
 	}
 	end := off + int64(len(data))
+	for h.surrendering {
+		// A handoff is mid-flight (flush/session-release with h.mu
+		// released): the image is about to be cleared, so appending here
+		// would discard acknowledged bytes. Wait for the passthrough
+		// switch and route through the plane below instead.
+		h.handoffCond.Wait()
+	}
 	if h.passthrough {
 		h.mu.Unlock()
 		inner, err := h.session(ctx)
@@ -447,22 +520,23 @@ func (h *stagingHandle) Write(ctx context.Context, off int64, data []byte) error
 	if h.unlinked {
 		// Nothing to land (pushes are discarded for anonymous claims) and
 		// nowhere to re-open: forward to the detached session if the claim
-		// ever got one, otherwise refuse — allocating the hole is the one
-		// outcome the bound exists to prevent. (Entered with h.mu already
-		// released by the routing above.)
+		// ever got one. With NO session the claim spills to a local
+		// temporary file instead of refusing — POSIX keeps an open-unlinked
+		// descriptor writable — and never allocates the hole in memory.
+		// (Entered with h.mu already released by the routing above.)
 		inner, serr := h.session(ctx)
 		if serr != nil {
 			return serr
 		}
-		if inner == nil {
-			return syscall.ENOSPC
+		if inner != nil {
+			h.mu.Lock()
+			h.passthrough = true
+			h.promotable = false
+			h.image = nil
+			h.mu.Unlock()
+			return inner.Write(ctx, off, data)
 		}
-		h.mu.Lock()
-		h.passthrough = true
-		h.promotable = false
-		h.image = nil
-		h.mu.Unlock()
-		return inner.Write(ctx, off, data)
+		return h.spillWrite(ctx, off, data)
 	}
 	// The image would exceed the memory bound and no extent plane could be
 	// built: land what is buffered and hand the stream to the write plane
@@ -517,6 +591,9 @@ func (h *stagingHandle) Sync(ctx context.Context) error {
 }
 
 func (h *stagingHandle) Flush(ctx context.Context) error {
+	if hook := h.testHookFlush; hook != nil {
+		hook()
+	}
 	h.mu.Lock()
 	promoted := h.promoted
 	h.mu.Unlock()
@@ -566,6 +643,7 @@ func (h *stagingHandle) Release(ctx context.Context) error {
 	}
 	h.mu.Lock()
 	h.inner = nil
+	h.closeSpillLocked()
 	h.mu.Unlock()
 	if inner != nil {
 		if err := inner.Release(ctx); err != nil && pushErr == nil {
@@ -573,6 +651,46 @@ func (h *stagingHandle) Release(ctx context.Context) error {
 		}
 	}
 	return pushErr
+}
+
+// spillWrite lands a write on the claim's local spill file, creating it
+// (seeded with the buffered image) on first use. Only open-unlinked claims
+// without a below session reach here: the spill keeps the descriptor
+// writable without allocating sparse holes in memory.
+func (h *stagingHandle) spillWrite(ctx context.Context, off int64, data []byte) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.spill == nil {
+		tmp, err := os.CreateTemp("", "drive9-claim-spill-*")
+		if err != nil {
+			return err
+		}
+		_ = os.Remove(tmp.Name()) // keep the fd anonymous like every other spill
+		if len(h.image) > 0 {
+			if _, err := tmp.WriteAt(h.image, 0); err != nil {
+				_ = tmp.Close()
+				return err
+			}
+			h.spillSize = int64(len(h.image))
+		}
+		h.spill = tmp
+		h.image = nil
+	}
+	if _, err := h.spill.WriteAt(data, off); err != nil {
+		return err
+	}
+	if end := off + int64(len(data)); end > h.spillSize {
+		h.spillSize = end
+	}
+	return nil
+}
+
+// closeSpillLocked releases the spill file (callers hold h.mu).
+func (h *stagingHandle) closeSpillLocked() {
+	if h.spill != nil {
+		_ = h.spill.Close()
+		h.spill = nil
+	}
 }
 
 // detachBelowLocked drops the private below session (the bytes stay in the
@@ -729,11 +847,17 @@ const createFlagMask uint32 = syscall.O_CREAT | syscall.O_EXCL | syscall.O_TRUNC
 
 // attrLocked renders the handle's reply attributes; callers hold h.mu.
 func (h *stagingHandle) attrLocked() fs.Attr {
+	// An explicit mode is reported as-is — 000 included; only an ABSENT
+	// mode falls back to the 0644 default.
 	mode := h.mode
-	if mode == 0 {
+	if mode == 0 && !h.modeKnown {
 		mode = 0o644
 	}
-	return fs.Attr{Kind: fs.KindFile, Mode: mode, Size: int64(len(h.image))}
+	size := int64(len(h.image))
+	if h.spill != nil {
+		size = h.spillSize
+	}
+	return fs.Attr{Kind: fs.KindFile, Mode: mode, Size: size}
 }
 
 // overlayAttr renders the lookup reply for a live claim: the buffered image
@@ -747,28 +871,52 @@ func (h *stagingHandle) overlayAttr() (fs.Attr, bool) {
 	return h.attrLocked(), true
 }
 
+// newClaimReadHandle builds the read-only re-open with a snapshot of the
+// image at open time: the descriptor keeps those bytes readable after the
+// writer surrenders, releases or is unlinked.
+func newClaimReadHandle(h *stagingHandle) *claimReadHandle {
+	h.mu.Lock()
+	image := append([]byte(nil), h.image...)
+	h.mu.Unlock()
+	return &claimReadHandle{claim: h, image: image}
+}
+
 // claimReadHandle serves reads of a live claim's pending image (a
-// read-only re-open before the boundary push).
+// read-only re-open before the boundary push). It carries a SNAPSHOT of
+// the image at open time: if the writer later surrenders, releases or is
+// unlinked, the still-open reader keeps reading the bytes that were
+// visible when it opened instead of hitting EOF on the emptied claim.
 type claimReadHandle struct {
 	claim *stagingHandle
+	image []byte
 }
 
 func (c *claimReadHandle) Read(ctx context.Context, off int64, dest []byte) (int, error) {
 	c.claim.mu.Lock()
-	if c.claim.passthrough || c.claim.promoted != nil {
-		// The claim handed its stream to the plane below (the bounded
-		// forward) or onto the extent plane (promotion): the pending bytes
-		// now live there, and the emptied image would answer (0, nil)
-		// forever. Delegation runs without the claim lock — claim.Read
-		// takes it itself.
+	// A live buffered claim serves from its (growing) image — the reader
+	// sees the writer's newest bytes, matching two fds on one inode.
+	if !c.claim.released && !c.claim.unlinked && c.claim.promoted == nil && !c.claim.passthrough {
+		image := c.claim.image
+		c.claim.mu.Unlock()
+		if off < 0 || off >= int64(len(image)) {
+			return 0, nil
+		}
+		return copy(dest, image[off:]), nil
+	}
+	if c.claim.promoted != nil && !c.claim.released {
+		// Promotion moved the object to the extent plane and the handle is
+		// still live: serve through it (no snapshot copy needed).
 		c.claim.mu.Unlock()
 		return c.claim.Read(ctx, off, dest)
 	}
-	defer c.claim.mu.Unlock()
-	if off < 0 || off >= int64(len(c.claim.image)) {
+	// The writer surrendered, released or was unlinked: the opened
+	// descriptor keeps reading its OWN snapshot (the bytes visible at open
+	// time), never EOF-from-emptied-state.
+	c.claim.mu.Unlock()
+	if off < 0 || off >= int64(len(c.image)) {
 		return 0, nil
 	}
-	return copy(dest, c.claim.image[off:]), nil
+	return copy(dest, c.image[off:]), nil
 }
 
 // UnwrapHandle exposes the promoted extent handle for the facade's

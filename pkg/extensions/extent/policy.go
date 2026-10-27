@@ -127,8 +127,18 @@ func (e *Extent) inlineThreshold() int64 {
 // enabled, a creating writer, not already declared for the extent plane
 // (the declaration claims from byte zero), and not exempted to a plane
 // inside this one (the append-log declarations).
+// stagingClaimCap bounds the number of simultaneously buffered claims per
+// mount: each holds up to stagingMaxBufferedBytes in memory, so the cap is
+// the aggregate bound (64 claims ≈ 512 MiB worst case). Past it, new
+// writers fall straight through to the classic plane — correctness over
+// buffering.
+const stagingClaimCap = 64
+
 func (e *Extent) claimsLargeFile(op *fs.Op) bool {
 	if !e.largeFileEnabled() || !claimCreateWriter(op.Flags) {
+		return false
+	}
+	if e.paths.stagingCount() >= stagingClaimCap {
 		return false
 	}
 	if ShouldUseExtentPath(e.opts.ExtentPaths, op.Path) {

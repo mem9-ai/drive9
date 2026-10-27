@@ -190,7 +190,7 @@ func (e *Extent) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, er
 			return fs.Result{Attr: &attr}, nil
 		}
 		if ino, ok := e.resolveIno(ctx, op.Path); ok {
-			res, err := e.statViaVFS(ctx, op.Path, ino)
+			res, err := e.statViaVFS(ctx, op.Path, ino, op.Caller)
 			if err != nil {
 				return next(ctx, op)
 			}
@@ -338,27 +338,16 @@ func (e *Extent) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, er
 		}
 		// The mirror image: a CLASSIC source renamed over an EXTENT
 		// destination (a VFS special, a promoted file). The classic rename
-		// below replaces only the server projection row; the destination's
-		// JuiceFS edge would linger in the namespace — the next mknod/create
-		// of that name answers EEXIST from the VFS while the projection
-		// says ENOENT. Retire the extent destination through the VFS first
-		// (the request's caller: the outer sticky/ownership checks already
-		// admitted the replacement).
-		if dstIno, ok := e.resolveIno(ctx, op.Path2); ok {
-			kind := fs.KindFile
-			if st, serr := e.statViaVFS(ctx, op.Path2, dstIno); serr == nil && st.Attr != nil {
-				kind = st.Attr.Kind
-			}
-			var uerr error
-			if kind == fs.KindDir {
-				uerr = e.removeDirIno(ctx, op.Path2, dstIno, op.Caller)
-			} else {
-				uerr = e.unlinkIno(ctx, op.Path2, dstIno, op.Caller)
-			}
-			if uerr != nil && !fs.IsNotFound(uerr) {
-				return fs.Result{}, uerr
-			}
-		}
+		// runs FIRST: retiring the destination's jfs inode before a
+		// fallible rename would destroy it whenever the rename then
+		// failed, leaving neither name. After the rename succeeds the
+		// destination's server projection names the classic source; the
+		// old destination's client-side state (cached extent identity,
+		// writeback landed records, live staging claims) is dropped
+		// WITHOUT any server call after the rename — a name-keyed jfs
+		// unlink there would delete the moved-in file (the projection row
+		// rides the name), which the EC2 e2e caught as the destination
+		// vanishing server-side.
 		res, err := e.mutateStaging(ctx, op, next)
 		if err != nil {
 			return res, err
@@ -389,7 +378,7 @@ func (e *Extent) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, er
 			return fs.Result{Data: data}, nil
 		}
 		if ino, ok := e.resolveIno(ctx, op.Path); ok {
-			if data, err := e.readViaVFS(ctx, op.Path, ino, op.Offset, op.Limit); err == nil {
+			if data, err := e.readViaVFS(ctx, op.Path, ino, op.Offset, op.Limit, op.Caller); err == nil {
 				return fs.Result{Data: data}, nil
 			}
 			// A transient VFS failure serves the read through the classic

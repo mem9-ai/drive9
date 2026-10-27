@@ -9,6 +9,7 @@ import (
 	"context"
 	"path"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -24,12 +25,19 @@ import (
 // statViaVFS projects one VFS.GetAttr on the resolved inode, mapped
 // through juiceTypeToStatMode. A VFS error (including ENOENT) is reported
 // to the caller, which then falls back to the classic plane below.
-func (e *Extent) statViaVFS(ctx context.Context, path string, ino uint64) (fs.Result, error) {
+func (e *Extent) statViaVFS(ctx context.Context, path string, ino uint64, caller fs.Caller) (fs.Result, error) {
 	v := e.vfs()
 	if v == nil {
 		return fs.Result{}, syscall.EIO
 	}
-	entry, errn := v.GetAttr(e.jfsCtx(callerFrom(ctx)), jfsmeta.Ino(ino), 0)
+	// Production dispatch contexts do not carry the caller (the private
+	// context key is never planted on the FUSE path): the requester's
+	// identity must come from the op, or every path-based stat runs as
+	// root and bypasses requester permission semantics.
+	if caller == (fs.Caller{}) {
+		caller = callerFrom(ctx)
+	}
+	entry, errn := v.GetAttr(e.jfsCtx(caller), jfsmeta.Ino(ino), 0)
 	if errn != 0 || entry == nil || entry.Attr == nil {
 		if errn == syscall.ENOENT {
 			e.paths.missRemember(path)
@@ -233,7 +241,7 @@ func (e *Extent) createOp(ctx context.Context, op *fs.Op, next fs.Next) (fs.Resu
 	if hit := e.paths.stagingAt(op.Path); hit != nil {
 		if attr, ok := hit.overlayAttr(); ok {
 			if !writeIntent(op.Flags) {
-				return fs.Result{Attr: &attr, Handle: &claimReadHandle{claim: hit}}, nil
+				return fs.Result{Attr: &attr, Handle: newClaimReadHandle(hit)}, nil
 			}
 			if err := hit.surrender(ctx); err != nil {
 				return fs.Result{}, err
@@ -348,8 +356,14 @@ func (e *Extent) claimStaging(ctx context.Context, op *fs.Op, next fs.Next) (fs.
 	}
 	h := &stagingHandle{
 		e: e, path: op.Path, caller: op.Caller,
-		mode:  op.Mode & 0o777,
+		mode:  op.Mode & 0o7777,
 		below: fs.HandlerFilesystem(next),
+	}
+	h.handoffCond = sync.NewCond(&h.mu)
+	{
+		h.mu.Lock()
+		h.modeKnown = op.HasMode
+		h.mu.Unlock()
 	}
 	h.openFlags = op.Flags&^uint32(syscall.O_TRUNC|syscall.O_EXCL) | uint32(syscall.O_CREAT)
 	innerOp := *op
@@ -371,8 +385,10 @@ func (e *Extent) claimStaging(ctx context.Context, op *fs.Op, next fs.Next) (fs.
 			// The truncation rewrite keeps the existing file's mode —
 			// open(O_TRUNC) never changes it — and the claim answers
 			// lookups until its first boundary, so overlay attrs must
-			// report the real mode, not the create-mode fallback.
-			h.mode = st.Mode & 0o777
+			// report the real mode (special bits included), not the
+			// create-mode fallback.
+			h.mode = st.Mode & 0o7777
+			h.modeKnown = true
 		}
 	} else {
 		// Fresh path: promotable to the extent plane at the inline cutoff
@@ -466,8 +482,11 @@ func (e *Extent) adoptCreatedHandle(path string, ino uint64, fh uint64, a *jfsme
 }
 
 // readViaVFS serves a path-addressed read through a transient VFS session.
-func (e *Extent) readViaVFS(ctx context.Context, path string, ino uint64, off, limit int64) ([]byte, error) {
-	h, _, attr, err := e.openExtent(ctx, path, ino, 0, callerFrom(ctx))
+func (e *Extent) readViaVFS(ctx context.Context, path string, ino uint64, off, limit int64, caller fs.Caller) ([]byte, error) {
+	if caller == (fs.Caller{}) {
+		caller = callerFrom(ctx)
+	}
+	h, _, attr, err := e.openExtent(ctx, path, ino, 0, caller)
 	if err != nil {
 		return nil, err
 	}
@@ -735,7 +754,7 @@ func (e *Extent) setAttrViaVFS(ctx context.Context, op *fs.Op, ino uint64, vfsFh
 	if set == 0 {
 		// Nothing VFS-side to apply (times are mount-local on the classic
 		// plane): answer from the current jfs attrs.
-		return e.statViaVFS(ctx, op.Path, ino)
+		return e.statViaVFS(ctx, op.Path, ino, op.Caller)
 	}
 	jctx := e.jfsCtx(op.Caller)
 	entry, errn := v.SetAttr(jctx, jfsmeta.Ino(ino), set, vfsFh, mode, uid, gid, atime, mtime, atimens, mtimens, size)

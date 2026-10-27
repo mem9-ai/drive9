@@ -411,14 +411,25 @@ expect_remote_sha() {
   done
 }
 
-# wait_remote_landed: block until the path's committed bytes match the
+remote_sha_is() {
+  # Same shell as wait_until: the predicate must see the script's own
+  # functions (a `bash -c` child cannot, so the old predicate silently
+  # failed every poll and the `|| true` swallowed the timeout).
+  [ "$(remote_sha "$1")" = "$2" ]
+}
+
+# wait_remote_landed blocks until the path's committed bytes match the
 # mount's current view — call before mv/rm of a just-written file so the
-# mutation does not race the queued commit.
+# mutation does not race the queued commit. A timeout is a FAIL: the
+# destructive caller must not proceed on an unproven landing.
 wait_remote_landed() {
-  local remote="$1" local_file="$2" want
+  local desc="$1" remote="$2" local_file="$3" want
   want="$(mount_sha "$local_file")"
-  wait_until "remote landing of $remote" "$EXTENT_E2E_LAND_WAIT_S" \
-    bash -c "[ \"\$(drive9 fs cat \"$remote\" | sha256_stream)\" = \"$want\" ]" || true
+  if wait_until "remote landing of $remote" "$EXTENT_E2E_LAND_WAIT_S" remote_sha_is "$remote" "$want"; then
+    return 0
+  fi
+  check_eq "$desc (remote landing within ${EXTENT_E2E_LAND_WAIT_S}s)" "$(remote_sha "$remote")" "$want"
+  return 1
 }
 
 file_size() {
@@ -823,13 +834,13 @@ sync
 check_eq "A: truncate-rewrite keeps layout single (no conversion)" "$(layout_of "$ROOT_REMOTE/legacy/big.bin")" "single"
 check_eq "A: truncate-rewrite bytes" "$(mount_sha "$M/legacy/big.bin")" "$TR_SHA"
 expect_remote_sha "A: CLI sees rewritten bytes" "$ROOT_REMOTE/legacy/big.bin" "$TR_SHA"
-wait_remote_landed "$ROOT_REMOTE/legacy/big.bin" "$M/legacy/big.bin"
+wait_remote_landed "A: pre-mv landing" "$ROOT_REMOTE/legacy/big.bin" "$M/legacy/big.bin"
 
 chmod 600 "$M/legacy/big.bin"
 check_eq "A: chmod visible through the mount" "$(python3 -c 'import os,sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777))' "$M/legacy/big.bin")" "0o600"
 
 mkdir -p "$M/legacy-mv"
-wait_remote_landed "$ROOT_REMOTE/legacy/big.bin" "$M/legacy/big.bin"
+wait_remote_landed "A: pre-mv landing" "$ROOT_REMOTE/legacy/big.bin" "$M/legacy/big.bin"
 mv "$M/legacy/big.bin" "$M/legacy-mv/big.bin"
 expect_layout "A: renamed legacy file stays single" "$ROOT_REMOTE/legacy-mv/big.bin" "single"
 check_eq "A: renamed legacy bytes" "$(mount_sha "$M/legacy-mv/big.bin")" "$TR_SHA"
@@ -1070,6 +1081,24 @@ if [ "$EXTENT_E2E_COMPACT_WRITES" -gt 0 ]; then
   check_eq "F: bytes after remount" "$(mount_sha "$M/comp.bin")" "$COMPACT_SHA"
 else
   echo "SKIP F: EXTENT_E2E_COMPACT_WRITES=0"
+fi
+
+
+# Negative control for the landing predicates (review finding): a value
+# that will never land must FAIL expect_remote_sha instead of timing out
+# green. Verified cheaply: 2s budget, impossible sha.
+NEG_SAVED_WAIT="$EXTENT_E2E_LAND_WAIT_S"
+EXTENT_E2E_LAND_WAIT_S=2
+neg_out="$(expect_remote_sha "predicate negative control" "$ROOT_REMOTE/rewrite.bin" "0000000000000000000000000000000000000000000000000000000000000000" 2>&1 || true)"
+EXTENT_E2E_LAND_WAIT_S="$NEG_SAVED_WAIT"
+TOTAL=$((TOTAL + 1))
+if [[ "$neg_out" == *"FAIL predicate negative control"* ]]; then
+  echo "PASS landing-predicate negative control rejects a non-landing value"
+  PASS=$((PASS + 1))
+else
+  echo "FAIL landing-predicate negative control rejected a non-landing value"
+  echo "  output: $neg_out"
+  FAIL=$((FAIL + 1))
 fi
 
 echo

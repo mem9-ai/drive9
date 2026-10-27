@@ -32,6 +32,12 @@ type pathRouter struct {
 	inoByPath map[string]uint64
 	missTTL   time.Duration
 	misses    map[string]time.Time
+	// mutEpoch fences stale discovery responses: every namespace mutation
+	// of a path bumps its epoch, and a stat reply may only install an
+	// inode mapping when the epoch it started under still holds. Without
+	// the fence, a stat that raced an unlink/rename could resurrect the
+	// removed mapping after the mutation's forgetIno already ran.
+	mutEpoch map[string]uint64
 
 	// live tracks open extent handles by path: the SQLite -shm index of an
 	// open database reports its mapped size even at 0, and unlink/rename
@@ -64,11 +70,46 @@ func (r *pathRouter) rememberIno(path string, ino uint64) {
 }
 
 // forgetIno drops a path's inode mapping and negative-cache entry: both
-// names around a mutation stop carrying evidence about the path.
+// names around a mutation stop carrying evidence about the path. The
+// mutation epoch advances so an in-flight stat reply for the OLD object
+// cannot reinstall the mapping after this point.
 func (r *pathRouter) forgetIno(path string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.inoByPath, path)
+	delete(r.misses, path)
+	r.bumpEpochLocked(path)
+}
+
+func (r *pathRouter) bumpEpochLocked(path string) {
+	if r.mutEpoch == nil {
+		r.mutEpoch = map[string]uint64{}
+	}
+	r.mutEpoch[path]++
+}
+
+// epochOf reads the path's current mutation epoch (callers compare it
+// against rememberInoIfFresh's view to detect races).
+func (r *pathRouter) epochOf(path string) uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.mutEpoch[path]
+}
+
+// rememberInoIfFresh installs an inode mapping only when no namespace
+// mutation of the path happened since `epoch` was read: a stale stat
+// reply (started before an unlink/rename completed) is dropped instead of
+// resurrecting the removed mapping.
+func (r *pathRouter) rememberInoIfFresh(path string, ino uint64, epoch uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.mutEpoch[path] != epoch {
+		return
+	}
+	if r.inoByPath == nil {
+		r.inoByPath = map[string]uint64{}
+	}
+	r.inoByPath[path] = ino
 	delete(r.misses, path)
 }
 
@@ -199,6 +240,14 @@ func (r *pathRouter) migrateInoPrefix(oldPath, newPath string) {
 			delete(r.misses, p)
 		}
 	}
+	// The moved keys and both exact names changed identity: bump their
+	// epochs so in-flight stats for the old objects cannot resurrect them
+	// at the new or old names.
+	for p := range moves {
+		r.bumpEpochLocked(p)
+	}
+	r.bumpEpochLocked(oldPath)
+	r.bumpEpochLocked(newPath)
 	r.mu.Unlock()
 }
 
@@ -251,6 +300,18 @@ func (r *pathRouter) retargetLivePrefix(oldPath, newPath string) {
 		r.live[p] += n
 	}
 	r.mu.Unlock()
+}
+
+// stagingCount reports how many claims are currently buffered (the
+// mount-level aggregate-memory bound's input).
+func (r *pathRouter) stagingCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	for _, hs := range r.staging {
+		n += len(hs)
+	}
+	return n
 }
 
 // trackStaging / untrackStaging maintain the buffered-claim registry. The
@@ -348,10 +409,16 @@ func (r *pathRouter) markStagingUnlinked(p string, under bool) {
 	}
 	r.mu.Lock()
 	var targets []*stagingHandle
+	targetPaths := map[string]struct{}{}
 	for path, hs := range r.staging {
 		if path == p || (under && strings.HasPrefix(path, prefix)) {
 			targets = append(targets, hs...)
+			targetPaths[path] = struct{}{}
 		}
+	}
+	_ = targetPaths
+	for p := range targetPaths {
+		r.bumpEpochLocked(p)
 	}
 	r.mu.Unlock()
 	for _, h := range targets {
@@ -429,10 +496,11 @@ func (e *Extent) resolveIno(ctx context.Context, path string) (uint64, bool) {
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
+	epoch := e.paths.epochOf(path)
 	ino, ok := e.statIno(probeCtx, path)
 	if ok {
-		e.paths.rememberIno(path, ino)
-	} else {
+		e.paths.rememberInoIfFresh(path, ino, epoch)
+	} else if e.paths.epochOf(path) == epoch {
 		e.paths.missRemember(path)
 	}
 	return ino, ok
