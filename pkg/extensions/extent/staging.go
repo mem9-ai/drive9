@@ -992,9 +992,18 @@ func (c *claimReadHandle) Read(ctx context.Context, off int64, dest []byte) (int
 		c.claim.mu.Unlock()
 		return c.claim.Read(ctx, off, dest)
 	}
-	// The writer surrendered, released or was unlinked: the opened
-	// descriptor keeps the LAST bytes it observed — the still-intact claim
-	// image first (release keeps it), then the refreshed snapshot — never
+	if c.claim.passthrough || c.claim.spill != nil {
+		// The claim surrendered to the lower plane (or spilled): its image
+		// is cleared by design, so a reader WITHOUT a private snapshot
+		// (budget exhausted) must read through the claim's own passthrough
+		// session / spill — a valid backing for the whole descriptor
+		// lifetime, never EOF-from-no-backing.
+		c.claim.mu.Unlock()
+		return c.claim.Read(ctx, off, dest)
+	}
+	// The writer released or was unlinked: the opened descriptor keeps
+	// the LAST bytes it observed — the still-intact claim image first
+	// (release and unlink keep it), then the refreshed snapshot — never
 	// EOF-from-emptied-state and never an earlier version.
 	image := c.claim.image
 	if len(image) == 0 {

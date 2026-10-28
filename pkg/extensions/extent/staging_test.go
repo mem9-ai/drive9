@@ -1969,3 +1969,56 @@ func TestUnlinkedFlushSyncNoPanic(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestOverBudgetReaderSurvivesSurrender is the review probe: with the
+// reader snapshot budget exhausted, a reader opened on a live claim must
+// stay readable across a second-writer surrender (the claim image is
+// cleared by the handoff; the reader reads through the passthrough
+// session instead of hitting EOF).
+func TestOverBudgetReaderSurvivesSurrender(t *testing.T) {
+	b := testbackend.NewBackend()
+	ch := newWritebackStack(t, b, 64*1024)
+	ctx := context.Background()
+
+	fd1 := openForWrite(t, ch, "/budget")
+	if err := fd1.Write(ctx, 0, []byte("abc")); err != nil {
+		t.Fatal(err)
+	}
+	sh := fd1.(*stagingHandle)
+
+	// Exhaust the snapshot budget: the reader opens with no private copy.
+	sh.e.readerBytes.Add(readerBytesCap)
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/budget", Flags: uint32(syscall.O_RDONLY)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := res.Handle
+	cr, ok := r.(*claimReadHandle)
+	if !ok {
+		t.Fatalf("reader is %T", r)
+	}
+	cr.claim.mu.Lock()
+	snapLen := len(cr.image)
+	cr.claim.mu.Unlock()
+	if snapLen != 0 {
+		t.Fatalf("reader got a snapshot (%d bytes) despite an exhausted budget", snapLen)
+	}
+	buf := make([]byte, 3)
+	if n, err := r.Read(ctx, 0, buf); err != nil || string(buf[:n]) != "abc" {
+		t.Fatalf("live read = %q n=%d err=%v, want abc", buf[:n], n, err)
+	}
+
+	// Second writable open triggers the surrender (clears claim.image).
+	res2, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/budget", Flags: uint32(syscall.O_RDWR)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fd2 := res2.Handle
+	buf = make([]byte, 3)
+	if n, err := r.Read(ctx, 0, buf); err != nil || n == 0 || string(buf[:n]) != "abc" {
+		t.Fatalf("read after surrender = %q n=%d err=%v, want abc (still-open fd must not hit EOF)", buf[:n], n, err)
+	}
+	_ = fd2.Release(ctx)
+	_ = r.Release(ctx)
+	_ = fd1.Release(ctx)
+}
