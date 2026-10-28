@@ -159,6 +159,34 @@ func (h *stagingHandle) applyAttr(ctx context.Context, op *fs.Op) (fs.Attr, erro
 		}
 		return h.e.promotedAttr(ctx, promoted)
 	}
+
+	h.mu.Lock()
+	spilled := h.spill
+	h.mu.Unlock()
+	if spilled != nil {
+		// The spill is the object (anonymous claim, no below session):
+		// size changes truncate/extend the spill directly, and mode
+		// changes only adjust the reported mode — an image edit would be
+		// invisible to reads and attrs.
+		if op.Size >= 0 {
+			if err := spilled.Truncate(op.Size); err != nil {
+				return fs.Attr{}, err
+			}
+			h.mu.Lock()
+			h.spillSize = op.Size
+			h.mu.Unlock()
+		}
+		if op.HasMode {
+			h.mu.Lock()
+			h.mode = op.Mode & 0o7777
+			h.modeKnown = true
+			h.mu.Unlock()
+		}
+		h.mu.Lock()
+		a := h.attrLocked()
+		h.mu.Unlock()
+		return a, nil
+	}
 	if op.HasMode {
 		mode := op.Mode & 0o7777
 		h.mu.Lock()
@@ -372,7 +400,7 @@ func (h *stagingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 		}
 		return n, err
 	}
-	if off >= int64(len(h.image)) {
+	if off < 0 || off >= int64(len(h.image)) {
 		return 0, nil
 	}
 	n := copy(dest, h.image[off:])
@@ -444,6 +472,13 @@ func (h *stagingHandle) Write(ctx context.Context, off int64, data []byte) error
 		// would discard acknowledged bytes. Wait for the passthrough
 		// switch and route through the plane below instead.
 		h.handoffCond.Wait()
+	}
+	if h.spill != nil {
+		// The anonymous claim spilled: from here the spill file IS the
+		// object — every later write lands on it (the in-memory image is
+		// gone), so overwrites and rewrites stay visible to reads.
+		h.mu.Unlock()
+		return h.spillWrite(ctx, off, data)
 	}
 	if h.passthrough {
 		h.mu.Unlock()
@@ -574,9 +609,16 @@ func (h *stagingHandle) Write(ctx context.Context, off int64, data []byte) error
 func (h *stagingHandle) Sync(ctx context.Context) error {
 	h.mu.Lock()
 	promoted := h.promoted
+	spill := h.spill
 	h.mu.Unlock()
 	if promoted != nil {
 		return promoted.Sync(ctx)
+	}
+	if spill != nil {
+		// The anonymous claim's bytes live in the local spill: its fsync
+		// IS the durability boundary (there is no below session to carry
+		// one — session() returns nil, nil for a detached claim).
+		return spill.Sync()
 	}
 	if err := h.push(ctx); err != nil {
 		return err
@@ -584,6 +626,12 @@ func (h *stagingHandle) Sync(ctx context.Context) error {
 	inner, err := h.session(ctx)
 	if err != nil {
 		return err
+	}
+	if inner == nil {
+		// An unlinked claim with no below session: the image is the whole
+		// object and nothing remote to sync — the boundary is a no-op.
+		// (Previously this dereferenced the nil session and panicked.)
+		return nil
 	}
 	// Passthrough claims: the push no-ops (dirty was cleared at the
 	// forward) and the inner session carries the boundary.
@@ -606,6 +654,17 @@ func (h *stagingHandle) Flush(ctx context.Context) error {
 	inner, err := h.session(ctx)
 	if err != nil {
 		return err
+	}
+	if inner == nil {
+		h.mu.Lock()
+		spill := h.spill
+		h.mu.Unlock()
+		if spill != nil {
+			return spill.Sync()
+		}
+		// Detached anonymous claim with nothing to flush: a no-op, never
+		// a nil-deref panic on the absent below session.
+		return nil
 	}
 	// Passthrough claims: same shape — the push no-ops and the inner
 	// session carries the durability boundary.
@@ -733,6 +792,11 @@ func (h *stagingHandle) session(ctx context.Context) (fs.Handle, error) {
 func (h *stagingHandle) push(ctx context.Context) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.spill != nil {
+		// The spill owns the object; there is no below session to push
+		// to (and opening one by the recycled path would be wrong).
+		return nil
+	}
 	if !h.dirty {
 		return nil
 	}
@@ -894,14 +958,17 @@ type claimReadHandle struct {
 func (c *claimReadHandle) Read(ctx context.Context, off int64, dest []byte) (int, error) {
 	c.claim.mu.Lock()
 	// A live buffered claim serves from its (growing) image — the reader
-	// sees the writer's newest bytes, matching two fds on one inode.
+	// sees the writer's newest bytes, matching two fds on one inode. The
+	// copy runs UNDER the claim lock: the writer mutates the same backing
+	// array under this lock, and copying after unlocking raced it.
 	if !c.claim.released && !c.claim.unlinked && c.claim.promoted == nil && !c.claim.passthrough {
-		image := c.claim.image
-		c.claim.mu.Unlock()
-		if off < 0 || off >= int64(len(image)) {
+		if off < 0 || off >= int64(len(c.claim.image)) {
+			c.claim.mu.Unlock()
 			return 0, nil
 		}
-		return copy(dest, image[off:]), nil
+		n := copy(dest, c.claim.image[off:])
+		c.claim.mu.Unlock()
+		return n, nil
 	}
 	if c.claim.promoted != nil && !c.claim.released {
 		// Promotion moved the object to the extent plane and the handle is

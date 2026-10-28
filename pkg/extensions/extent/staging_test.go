@@ -1688,3 +1688,145 @@ func TestClassicRenameOverExtentKeepsDestination(t *testing.T) {
 	_ = w2.Release(ctx)
 	_, _ = ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: p + "-big"})
 }
+
+// TestClaimReaderWriterRace: the reader copies the image UNDER the claim
+// lock (the writer mutates the same backing array under it); the pairing
+// must be race-detector clean.
+func TestClaimReaderWriterRace(t *testing.T) {
+	b := testbackend.NewBackend()
+	ch := newWritebackStack(t, b, noThreshold)
+	ctx := context.Background()
+
+	w := openForWrite(t, ch, "/rw")
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/rw", Flags: uint32(syscall.O_RDONLY)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := res.Handle
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, 512)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_, _ = r.Read(ctx, 0, buf)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		chunk := make([]byte, 512)
+		for i := 0; i < 2000; i++ {
+			if err := w.Write(ctx, int64(i*256)%4096, chunk[:256]); err != nil {
+				return
+			}
+		}
+		close(stop)
+	}()
+	wg.Wait()
+	_ = w.Release(ctx)
+	_ = r.Release(ctx)
+}
+
+// TestSpillIsCompleteBackend locks the anonymous-sparse-spill contract on
+// the real chain: after a rename + unlink + sparse write creates the
+// spill, EVERY later operation serves from it — overwrites are visible,
+// truncations change the size, boundaries succeed, and the release cleans
+// up (previously: post-spill writes edited the emptied image, reads and
+// attrs kept the stale spill, ftruncate reported success but did nothing).
+func TestSpillIsCompleteBackend(t *testing.T) {
+	b := testbackend.NewBackend()
+	ch := newWritebackStack(t, b, noThreshold)
+	ctx := context.Background()
+
+	w := openForWrite(t, ch, "/spilled")
+	if err := w.Write(ctx, 0, []byte("head")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/spilled", Path2: "/gone"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/gone"}); err != nil {
+		t.Fatal(err)
+	}
+	// Sparse jump creates the spill.
+	if err := w.Write(ctx, 64<<20, []byte("y")); err != nil {
+		t.Fatalf("sparse write: %v", err)
+	}
+	// Overwrite at offset 0 must be visible to reads.
+	if err := w.Write(ctx, 0, []byte("H")); err != nil {
+		t.Fatalf("post-spill overwrite: %v", err)
+	}
+	buf := make([]byte, 4)
+	if n, err := w.Read(ctx, 0, buf); err != nil || string(buf[:n]) != "Head" {
+		t.Fatalf("read after overwrite = %q n=%d err=%v, want Head", buf[:n], n, err)
+	}
+	// FD truncate to 2 must change the size and the data.
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpSetAttr, Path: "/gone", Handle: w, Size: 2}); err != nil {
+		t.Fatalf("truncate on spilled fd: %v", err)
+	}
+	sh := w.(*stagingHandle)
+	sh.mu.Lock()
+	size := sh.attrLocked().Size
+	sh.mu.Unlock()
+	if size != 2 {
+		t.Fatalf("size after truncate = %d, want 2", size)
+	}
+	if n, err := w.Read(ctx, 0, buf); err != nil || string(buf[:n]) != "He" {
+		t.Fatalf("read after truncate = %q n=%d err=%v, want He", buf[:n], n, err)
+	}
+	one := make([]byte, 1)
+	if n, _ := w.Read(ctx, 2, one); n != 0 {
+		t.Fatalf("read at the truncated EOF returned %d bytes, want 0", n)
+	}
+	// Boundaries succeed (no nil-session panic, spill fsynced).
+	if err := w.Flush(ctx); err != nil {
+		t.Fatalf("flush on spilled fd: %v", err)
+	}
+	if err := w.Sync(ctx); err != nil {
+		t.Fatalf("sync on spilled fd: %v", err)
+	}
+	if err := w.Release(ctx); err != nil {
+		t.Fatalf("release on spilled fd: %v", err)
+	}
+}
+
+// TestUnlinkedFlushSyncNoPanic: rename → unlink on an open writer leaves
+// no below session; Flush and Sync on the still-open descriptor must be
+// safe no-ops instead of nil-deref panics.
+func TestUnlinkedFlushSyncNoPanic(t *testing.T) {
+	b := testbackend.NewBackend()
+	ch := newWritebackStack(t, b, noThreshold)
+	ctx := context.Background()
+
+	w := openForWrite(t, ch, "/fu")
+	if err := w.Write(ctx, 0, []byte("bytes")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/fu", Path2: "/fmoved"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/fmoved"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Flush(ctx); err != nil {
+		t.Fatalf("flush after unlink: %v", err)
+	}
+	if err := w.Sync(ctx); err != nil {
+		t.Fatalf("sync after unlink: %v", err)
+	}
+	// Reads still serve the anonymous image; release is clean.
+	buf := make([]byte, 5)
+	if n, err := w.Read(ctx, 0, buf); err != nil || string(buf[:n]) != "bytes" {
+		t.Fatalf("read after unlink = %q n=%d err=%v", buf[:n], n, err)
+	}
+	if err := w.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
