@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -1592,18 +1593,156 @@ func TestResolveInoFencedByMutation(t *testing.T) {
 
 	// Simulate the racing probe: read the epoch, the unlink's forgetIno
 	// runs, then the (stale) reply tries to install the mapping.
-	epoch := ext.paths.epochOf("/fenced")
+	gen := ext.paths.fenceOf()
 	ext.paths.forgetIno("/fenced")
-	ext.paths.rememberInoIfFresh("/fenced", 42, epoch)
+	ext.paths.installInoIfFresh("/fenced", 42, gen)
 	if _, ok := ext.paths.cachedIno("/fenced"); ok {
 		t.Fatal("stale stat reply resurrected the removed inode mapping")
 	}
 
-	// A reply under the CURRENT epoch still installs normally.
-	epoch2 := ext.paths.epochOf("/fenced")
-	ext.paths.rememberInoIfFresh("/fenced", 43, epoch2)
+	// A reply under the CURRENT fence still installs normally.
+	gen2 := ext.paths.fenceOf()
+	ext.paths.installInoIfFresh("/fenced", 43, gen2)
 	if ino, ok := ext.paths.cachedIno("/fenced"); !ok || ino != 43 {
 		t.Fatalf("fresh reply not installed: %d %v", ino, ok)
+	}
+}
+
+// TestDirectoryRenameFencesOldDescendants is the review probe: a stat of
+// /old/child that captured the fence before /old -> /new must not
+// reinstall the old-path mapping afterwards — including children that
+// were never cached at migration time.
+func TestDirectoryRenameFencesOldDescendants(t *testing.T) {
+	ext, err := New(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ext.paths.rememberIno("/old/child", 7)
+	ext.paths.rememberIno("/old/other", 8)
+
+	// Cached old descendant: capture, rename, delayed reply.
+	gen := ext.paths.fenceOf()
+	ext.paths.migrateInoPrefix("/old", "/new")
+	ext.paths.installInoIfFresh("/old/child", 7, gen)
+	if _, ok := ext.paths.cachedIno("/old/child"); ok {
+		t.Fatal("stale reply resurrected the OLD cached descendant")
+	}
+
+	// Never-cached old descendant: same interleaving.
+	gen2 := ext.paths.fenceOf()
+	ext.paths.forgetIno("/gone/leaf") // any mutation advances the fence
+	ext.paths.installInoIfFresh("/gone/leaf", 9, gen2)
+	if _, ok := ext.paths.cachedIno("/gone/leaf"); ok {
+		t.Fatal("stale reply resurrected a never-cached old descendant")
+	}
+
+	// Fresh replies still install under the current fence.
+	gen3 := ext.paths.fenceOf()
+	ext.paths.installInoIfFresh("/new/child", 7, gen3)
+	if ino, ok := ext.paths.cachedIno("/new/child"); !ok || ino != 7 {
+		t.Fatalf("fresh reply not installed: %d %v", ino, ok)
+	}
+}
+
+// TestReaderKeepsBytesAfterWriterRelease: the reader must never move
+// backward — it opens at "abc", observes the writer's "abcdef", and after
+// the writer releases it still reads "abcdef" (not the open-time "abc").
+func TestReaderKeepsBytesAfterWriterRelease(t *testing.T) {
+	b := testbackend.NewBackend()
+	ch := newWritebackStack(t, b, noThreshold)
+	ctx := context.Background()
+
+	w := openForWrite(t, ch, "/mono")
+	if err := w.Write(ctx, 0, []byte("abc")); err != nil {
+		t.Fatal(err)
+	}
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/mono", Flags: uint32(syscall.O_RDONLY)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := res.Handle
+	buf := make([]byte, 6)
+	if n, err := r.Read(ctx, 0, buf); err != nil || string(buf[:n]) != "abc" {
+		t.Fatalf("reader at open = %q n=%d err=%v", buf[:n], n, err)
+	}
+	if err := w.Write(ctx, 3, []byte("def")); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := r.Read(ctx, 0, buf); err != nil || string(buf[:n]) != "abcdef" {
+		t.Fatalf("reader after append = %q n=%d err=%v, want abcdef", buf[:n], n, err)
+	}
+	if err := w.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := r.Read(ctx, 0, buf); err != nil || string(buf[:n]) != "abcdef" {
+		t.Fatalf("reader after writer release = %q n=%d err=%v, want abcdef (descriptor moved backward)", buf[:n], n, err)
+	}
+	if err := r.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestClaimAdmissionIsAtomicUnderConcurrency: N concurrent creators
+// against a mount cap of 64 must never register more than 64 claims.
+func TestClaimAdmissionIsAtomicUnderConcurrency(t *testing.T) {
+	ext, err := New(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const n = 256
+	var wg sync.WaitGroup
+	var admitted atomic.Int64
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			h := &stagingHandle{e: ext, path: "/c" + strconv.Itoa(i)}
+			if ext.paths.trackStaging(h) {
+				admitted.Add(1)
+			}
+		}(i)
+	}
+	wg.Wait()
+	if got := admitted.Load(); got > stagingClaimCap {
+		t.Fatalf("admitted %d claims, cap is %d (admission not atomic)", got, stagingClaimCap)
+	}
+	if got := ext.paths.stagingCount(); int64(got) != admitted.Load() {
+		t.Fatalf("registered %d but admitted %d", got, admitted.Load())
+	}
+}
+
+// TestReaderSnapshotBudgetBounded: many readers over one large claim
+// cannot reserve unbounded snapshot memory — the aggregate stays under
+// readerBytesCap and the accounting refunds on release.
+func TestReaderSnapshotBudgetBounded(t *testing.T) {
+	ext, err := New(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := &stagingHandle{e: ext, path: "/big"}
+	w.handoffCond = sync.NewCond(&w.mu)
+	ctx := context.Background()
+	w.mu.Lock()
+	w.image = make([]byte, stagingMaxBufferedBytes/8) // 1 MiB image
+	w.mu.Unlock()
+
+	const readers = 200
+	hs := make([]*claimReadHandle, readers)
+	for i := range hs {
+		hs[i] = newClaimReadHandle(w)
+		buf := make([]byte, 16)
+		_, _ = hs[i].Read(ctx, 0, buf) // each refreshes its snapshot
+	}
+	if got := ext.readerBytes.Load(); got > readerBytesCap {
+		t.Fatalf("reader snapshot bytes = %d, cap %d", got, readerBytesCap)
+	}
+	for _, h := range hs {
+		if err := h.Release(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := ext.readerBytes.Load(); got != 0 {
+		t.Fatalf("reader bytes after releases = %d, want 0 (refund leak)", got)
 	}
 }
 

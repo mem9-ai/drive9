@@ -939,10 +939,14 @@ func (h *stagingHandle) overlayAttr() (fs.Attr, bool) {
 // image at open time: the descriptor keeps those bytes readable after the
 // writer surrenders, releases or is unlinked.
 func newClaimReadHandle(h *stagingHandle) *claimReadHandle {
+	c := &claimReadHandle{claim: h}
 	h.mu.Lock()
-	image := append([]byte(nil), h.image...)
+	image := h.image
+	if c.trySnapshot(int64(len(image))) {
+		c.image = append(c.image[:0], image...)
+	}
 	h.mu.Unlock()
-	return &claimReadHandle{claim: h, image: image}
+	return c
 }
 
 // claimReadHandle serves reads of a live claim's pending image (a
@@ -953,6 +957,11 @@ func newClaimReadHandle(h *stagingHandle) *claimReadHandle {
 type claimReadHandle struct {
 	claim *stagingHandle
 	image []byte
+	// reserved is the byte count currently held in the mount-level reader
+	// budget for this handle's snapshot (the copy may shrink or grow; the
+	// budget tracks what was actually reserved, so refunds never exceed
+	// the reservation).
+	reserved int64
 }
 
 func (c *claimReadHandle) Read(ctx context.Context, off int64, dest []byte) (int, error) {
@@ -960,13 +969,20 @@ func (c *claimReadHandle) Read(ctx context.Context, off int64, dest []byte) (int
 	// A live buffered claim serves from its (growing) image — the reader
 	// sees the writer's newest bytes, matching two fds on one inode. The
 	// copy runs UNDER the claim lock: the writer mutates the same backing
-	// array under this lock, and copying after unlocking raced it.
+	// array under this lock, and copying after unlocking raced it. The
+	// snapshot refreshes to the bytes just served, so the descriptor can
+	// never move BACKWARD when the writer later releases or surrenders
+	// (open at "abc", observe "abcdef", writer close — the fd must keep
+	// answering "abcdef", not revert to the open-time "abc").
 	if !c.claim.released && !c.claim.unlinked && c.claim.promoted == nil && !c.claim.passthrough {
-		if off < 0 || off >= int64(len(c.claim.image)) {
-			c.claim.mu.Unlock()
-			return 0, nil
+		image := c.claim.image
+		n := 0
+		if off >= 0 && off < int64(len(image)) {
+			n = copy(dest, image[off:])
 		}
-		n := copy(dest, c.claim.image[off:])
+		if c.trySnapshot(int64(len(image))) {
+			c.image = append(c.image[:0], image...)
+		}
 		c.claim.mu.Unlock()
 		return n, nil
 	}
@@ -977,13 +993,46 @@ func (c *claimReadHandle) Read(ctx context.Context, off int64, dest []byte) (int
 		return c.claim.Read(ctx, off, dest)
 	}
 	// The writer surrendered, released or was unlinked: the opened
-	// descriptor keeps reading its OWN snapshot (the bytes visible at open
-	// time), never EOF-from-emptied-state.
+	// descriptor keeps the LAST bytes it observed — the still-intact claim
+	// image first (release keeps it), then the refreshed snapshot — never
+	// EOF-from-emptied-state and never an earlier version.
+	image := c.claim.image
+	if len(image) == 0 {
+		image = c.image
+	}
 	c.claim.mu.Unlock()
-	if off < 0 || off >= int64(len(c.image)) {
+	if off < 0 || off >= int64(len(image)) {
 		return 0, nil
 	}
-	return copy(dest, c.image[off:]), nil
+	return copy(dest, image[off:]), nil
+}
+
+// trySnapshot reserves size bytes of the mount-level reader budget (and
+// refunds the reservation this handle previously held). The budget bounds
+// aggregate snapshot memory — many readers over one large claim would
+// otherwise bypass the mount cap. Readers past it keep serving the
+// claim's own image (which release preserves) and lose only their private
+// fallback copy.
+func (c *claimReadHandle) trySnapshot(size int64) bool {
+	if size <= 0 {
+		return false
+	}
+	if c.reserved == size {
+		return true // already holding exactly this reservation
+	}
+	e := c.claim.e
+	prev := c.reserved
+	for {
+		cur := e.readerBytes.Load()
+		next := cur - prev + size
+		if next > readerBytesCap {
+			return false
+		}
+		if e.readerBytes.CompareAndSwap(cur, next) {
+			c.reserved = size
+			return true
+		}
+	}
 }
 
 // UnwrapHandle exposes the promoted extent handle for the facade's
@@ -1006,6 +1055,17 @@ func (c *claimReadHandle) Write(ctx context.Context, off int64, data []byte) err
 	return syscall.EROFS
 }
 
-func (c *claimReadHandle) Sync(ctx context.Context) error    { return nil }
-func (c *claimReadHandle) Flush(ctx context.Context) error   { return nil }
-func (c *claimReadHandle) Release(ctx context.Context) error { return nil }
+func (c *claimReadHandle) Sync(ctx context.Context) error  { return nil }
+func (c *claimReadHandle) Flush(ctx context.Context) error { return nil }
+
+func (c *claimReadHandle) Release(ctx context.Context) error {
+	c.claim.mu.Lock()
+	c.image = nil
+	n := c.reserved
+	c.reserved = 0
+	c.claim.mu.Unlock()
+	if n > 0 {
+		c.claim.e.readerBytes.Add(-n)
+	}
+	return nil
+}

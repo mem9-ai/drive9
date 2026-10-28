@@ -32,12 +32,17 @@ type pathRouter struct {
 	inoByPath map[string]uint64
 	missTTL   time.Duration
 	misses    map[string]time.Time
-	// mutEpoch fences stale discovery responses: every namespace mutation
-	// of a path bumps its epoch, and a stat reply may only install an
-	// inode mapping when the epoch it started under still holds. Without
-	// the fence, a stat that raced an unlink/rename could resurrect the
-	// removed mapping after the mutation's forgetIno already ran.
-	mutEpoch map[string]uint64
+	// fenceGen fences stale discovery responses: every namespace mutation
+	// (unlink/rmdir/rename of any path, claim anonymization) advances it,
+	// and a stat reply may only install an inode mapping when the
+	// generation it captured before its probe still holds. A GLOBAL
+	// generation (not per-path epochs) is what makes directory renames
+	// safe: a renamed directory removes unboundedly many OLD descendant
+	// paths — cached and never-cached alike — and only invalidating
+	// everything in flight closes the resurrect-the-old-path window. It
+	// also keeps the fence state O(1) instead of one permanent map entry
+	// per distinct mutated path.
+	fenceGen uint64
 
 	// live tracks open extent handles by path: the SQLite -shm index of an
 	// open database reports its mapped size even at 0, and unlink/rename
@@ -78,32 +83,30 @@ func (r *pathRouter) forgetIno(path string) {
 	defer r.mu.Unlock()
 	delete(r.inoByPath, path)
 	delete(r.misses, path)
-	r.bumpEpochLocked(path)
+	r.bumpFenceLocked()
 }
 
-func (r *pathRouter) bumpEpochLocked(path string) {
-	if r.mutEpoch == nil {
-		r.mutEpoch = map[string]uint64{}
-	}
-	r.mutEpoch[path]++
+func (r *pathRouter) bumpFenceLocked() {
+	r.fenceGen++
 }
 
-// epochOf reads the path's current mutation epoch (callers compare it
-// against rememberInoIfFresh's view to detect races).
-func (r *pathRouter) epochOf(path string) uint64 {
+// fenceOf reads the current discovery fence generation (callers compare
+// it against installInoIfFresh's view to detect races).
+func (r *pathRouter) fenceOf() uint64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.mutEpoch[path]
+	return r.fenceGen
 }
 
-// rememberInoIfFresh installs an inode mapping only when no namespace
-// mutation of the path happened since `epoch` was read: a stale stat
-// reply (started before an unlink/rename completed) is dropped instead of
-// resurrecting the removed mapping.
-func (r *pathRouter) rememberInoIfFresh(path string, ino uint64, epoch uint64) {
+// installInoIfFresh installs an inode mapping only when no namespace
+// mutation happened anywhere since `gen` was read: a stale stat reply
+// (started before an unlink/rename/anonymization completed) is dropped
+// instead of resurrecting a removed mapping — including old descendants
+// of a renamed directory that were never cached at migration time.
+func (r *pathRouter) installInoIfFresh(path string, ino uint64, gen uint64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.mutEpoch[path] != epoch {
+	if r.fenceGen != gen {
 		return
 	}
 	if r.inoByPath == nil {
@@ -240,14 +243,11 @@ func (r *pathRouter) migrateInoPrefix(oldPath, newPath string) {
 			delete(r.misses, p)
 		}
 	}
-	// The moved keys and both exact names changed identity: bump their
-	// epochs so in-flight stats for the old objects cannot resurrect them
-	// at the new or old names.
-	for p := range moves {
-		r.bumpEpochLocked(p)
-	}
-	r.bumpEpochLocked(oldPath)
-	r.bumpEpochLocked(newPath)
+	// The moved keys, both exact names, and every REMOVED old descendant
+	// changed identity. A stale in-flight stat for any of them (including
+	// old descendants that were never cached here) must not reinstall its
+	// mapping, so the whole fence advances once.
+	r.bumpFenceLocked()
 	r.mu.Unlock()
 }
 
@@ -319,14 +319,28 @@ func (r *pathRouter) stagingCount() int {
 // moved only by retargetStaging under the same lock): reading h.path under
 // r.mu raced the rename path's h.mu-guarded update and could untrack the
 // wrong key, leaking the claim and its image.
-func (r *pathRouter) trackStaging(h *stagingHandle) {
+// trackStaging registers a claim ATOMICALLY with the mount-level cap: the
+// count check and the insertion share one critical section, so N
+// concurrent creators cannot all observe N-1 < cap and register N claims
+// (the previous non-atomic stagingCount-then-track pair could). It
+// reports whether the claim was admitted; a refused creator falls to the
+// classic plane.
+func (r *pathRouter) trackStaging(h *stagingHandle) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	n := 0
+	for _, hs := range r.staging {
+		n += len(hs)
+	}
+	if n >= stagingClaimCap {
+		return false
+	}
 	if r.staging == nil {
 		r.staging = map[string][]*stagingHandle{}
 	}
 	h.routerPath = h.path
 	r.staging[h.routerPath] = append(r.staging[h.routerPath], h)
+	return true
 }
 
 func (r *pathRouter) untrackStaging(h *stagingHandle) {
@@ -409,17 +423,12 @@ func (r *pathRouter) markStagingUnlinked(p string, under bool) {
 	}
 	r.mu.Lock()
 	var targets []*stagingHandle
-	targetPaths := map[string]struct{}{}
 	for path, hs := range r.staging {
 		if path == p || (under && strings.HasPrefix(path, prefix)) {
 			targets = append(targets, hs...)
-			targetPaths[path] = struct{}{}
 		}
 	}
-	_ = targetPaths
-	for p := range targetPaths {
-		r.bumpEpochLocked(p)
-	}
+	r.bumpFenceLocked()
 	r.mu.Unlock()
 	for _, h := range targets {
 		h.markUnlinked()
@@ -496,11 +505,11 @@ func (e *Extent) resolveIno(ctx context.Context, path string) (uint64, bool) {
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	epoch := e.paths.epochOf(path)
+	gen := e.paths.fenceOf()
 	ino, ok := e.statIno(probeCtx, path)
 	if ok {
-		e.paths.rememberInoIfFresh(path, ino, epoch)
-	} else if e.paths.epochOf(path) == epoch {
+		e.paths.installInoIfFresh(path, ino, gen)
+	} else if e.paths.fenceOf() == gen {
 		e.paths.missRemember(path)
 	}
 	return ino, ok

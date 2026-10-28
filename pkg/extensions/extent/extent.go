@@ -23,6 +23,7 @@ import (
 	"context"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/client"
@@ -87,7 +88,18 @@ type Extent struct {
 	// rt holds the *extentRuntime (typed pointer, swapped on build/teardown).
 	rt    atomicPointer[extentRuntime]
 	paths pathRouter
+
+	// readerBytes counts bytes reserved by live claim-reader snapshot
+	// fallbacks (see claimReadHandle.trySnapshot); atomic so readers never
+	// serialize on the claims.
+	readerBytes atomic.Int64
 }
+
+// readerBytesCap bounds the aggregate memory of reader snapshots — the
+// same order as the whole claim-buffer ceiling (stagingClaimCap claims ×
+// stagingMaxBufferedBytes each): snapshots are the shadow copy of the
+// same bytes.
+const readerBytesCap = int64(stagingClaimCap) * stagingMaxBufferedBytes
 
 // New builds the extension.
 func New(opts Options) (*Extent, error) {

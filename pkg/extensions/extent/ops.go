@@ -407,7 +407,13 @@ func (e *Extent) claimStaging(ctx context.Context, op *fs.Op, next fs.Next) (fs.
 		return res, nil
 	}
 	h.inner = res.Handle
-	e.paths.trackStaging(h)
+	if !e.paths.trackStaging(h) {
+		// Mount-level cap: too many concurrent claims already buffer.
+		// Leave the plain below-plane handle with the caller (unwrapped,
+		// still open — the abandoned claim never registered, so nothing
+		// tracks or releases it twice); correctness over buffering.
+		return res, nil
+	}
 	res.Handle = h
 	return res, nil
 }

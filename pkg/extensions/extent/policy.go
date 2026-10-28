@@ -138,9 +138,8 @@ func (e *Extent) claimsLargeFile(op *fs.Op) bool {
 	if !e.largeFileEnabled() || !claimCreateWriter(op.Flags) {
 		return false
 	}
-	if e.paths.stagingCount() >= stagingClaimCap {
-		return false
-	}
+	// (The authoritative cap check runs atomically at trackStaging —
+	// a non-atomic precheck here would be a second, racy gate.)
 	if ShouldUseExtentPath(e.opts.ExtentPaths, op.Path) {
 		return false
 	}
