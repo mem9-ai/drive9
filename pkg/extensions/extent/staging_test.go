@@ -2022,3 +2022,259 @@ func TestOverBudgetReaderSurvivesSurrender(t *testing.T) {
 	_ = r.Release(ctx)
 	_ = fd1.Release(ctx)
 }
+
+// TestReaderNeverLeaksHandlesAfterWriterRelease (review row 1): after a
+// surrender and BOTH writers closing, five reader reads must not open
+// below handles they do not release. The writeback below-session count
+// is asserted through the backend request tally (no path-addressed
+// below.Open may run for reads).
+func TestReaderNeverLeaksHandlesAfterWriterRelease(t *testing.T) {
+	b := testbackend.NewBackend()
+	ch := newWritebackStack(t, b, 64*1024)
+	ctx := context.Background()
+
+	fd1 := openForWrite(t, ch, "/leak")
+	if err := fd1.Write(ctx, 0, []byte("abc")); err != nil {
+		t.Fatal(err)
+	}
+	res2, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/leak", Flags: uint32(syscall.O_RDWR)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fd2 := res2.Handle
+	if err := fd2.Write(ctx, 3, []byte("def")); err != nil {
+		t.Fatal(err)
+	}
+	readerRes, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/leak", Flags: uint32(syscall.O_RDONLY)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := readerRes.Handle
+	if err := fd1.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := fd2.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	before := len(b.Requests())
+	for i := 0; i < 5; i++ {
+		buf := make([]byte, 6)
+		if n, rerr := r.Read(ctx, 0, buf); rerr != nil || string(buf[:n]) != "abcdef" {
+			t.Fatalf("read %d after writers closed = %q n=%d err=%v", i, buf[:n], n, rerr)
+		}
+	}
+	if got := len(b.Requests()) - before; got != 0 {
+		t.Fatalf("reader reads issued %d backend requests after the writers closed (handle leak / by-path open)", got)
+	}
+	if err := r.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestReaderSurvivesUnlinkAfterWriterRelease (review row 2): unlink then
+// read — the reader keeps its bytes and the deleted name stays deleted.
+func TestReaderSurvivesUnlinkAfterWriterRelease(t *testing.T) {
+	b := testbackend.NewBackend()
+	ch := newWritebackStack(t, b, 64*1024)
+	ctx := context.Background()
+
+	fd1 := openForWrite(t, ch, "/u3")
+	if err := fd1.Write(ctx, 0, []byte("abc")); err != nil {
+		t.Fatal(err)
+	}
+	res2, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/u3", Flags: uint32(syscall.O_RDWR)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fd2 := res2.Handle
+	readerRes, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/u3", Flags: uint32(syscall.O_RDONLY)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := readerRes.Handle
+	if err := fd1.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := fd2.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/u3"}); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 3)
+	if n, rerr := r.Read(ctx, 0, buf); rerr != nil || string(buf[:n]) != "abc" {
+		t.Fatalf("read after unlink = %q n=%d err=%v", buf[:n], n, rerr)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: "/u3"}); err == nil {
+		t.Fatal("deleted name resurrected by the reader's backing")
+	}
+	if err := r.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestReaderIgnoresReplacementAfterRename (review row 3): after the
+// surrendered path is renamed and a replacement is created at the old
+// name, the reader still answers the ORIGINAL bytes, not the newcomer's.
+func TestReaderIgnoresReplacementAfterRename(t *testing.T) {
+	b := testbackend.NewBackend()
+	ch := newWritebackStack(t, b, 64*1024)
+	ctx := context.Background()
+
+	fd1 := openForWrite(t, ch, "/f3")
+	if err := fd1.Write(ctx, 0, []byte("abc")); err != nil {
+		t.Fatal(err)
+	}
+	res2, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/f3", Flags: uint32(syscall.O_RDWR)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fd2 := res2.Handle
+	readerRes, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/f3", Flags: uint32(syscall.O_RDONLY)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := readerRes.Handle
+	if err := fd1.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := fd2.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/f3", Path2: "/g3"}); err != nil {
+		t.Fatal(err)
+	}
+	nres, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/f3",
+		Flags: uint32(syscall.O_CREAT | syscall.O_WRONLY | syscall.O_TRUNC), Mode: 0o644})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := nres.Handle.Write(ctx, 0, []byte("XYZ")); err != nil {
+		t.Fatal(err)
+	}
+	if err := nres.Handle.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 3)
+	if n, rerr := r.Read(ctx, 0, buf); rerr != nil || string(buf[:n]) != "abc" {
+		t.Fatalf("read after rename+replacement = %q n=%d err=%v, want the ORIGINAL abc", buf[:n], n, rerr)
+	}
+	if err := r.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestOverBudgetReaderKeepsBackingAcrossTransitions (review rows 1-3 for
+// the snapshot-less reader): with the budget exhausted, the reader keeps
+// a valid backing through surrender + writer release + unlink — no EOF,
+// no namespace writes, no replacement reads.
+func TestOverBudgetReaderKeepsBackingAcrossTransitions(t *testing.T) {
+	b := testbackend.NewBackend()
+	ch := newWritebackStack(t, b, 64*1024)
+	ctx := context.Background()
+
+	fd1 := openForWrite(t, ch, "/ob")
+	if err := fd1.Write(ctx, 0, []byte("abc")); err != nil {
+		t.Fatal(err)
+	}
+	sh := fd1.(*stagingHandle)
+	sh.e.readerBytes.Add(readerBytesCap) // exhaust the snapshot budget
+
+	// The reader opens while the claim is STILL live (snapshot-less: the
+	// budget is saturated); the surrender below then hands it the shared
+	// final image.
+	readerRes, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/ob", Flags: uint32(syscall.O_RDONLY)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := readerRes.Handle
+	cr, ok := r.(*claimReadHandle)
+	if !ok {
+		t.Fatalf("reader is %T, want *claimReadHandle", r)
+	}
+	cr.claim.mu.Lock()
+	preShared := cr.shared
+	cr.claim.mu.Unlock()
+	if preShared {
+		t.Fatal("reader adopted a shared image before any transition")
+	}
+	res2, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/ob", Flags: uint32(syscall.O_RDWR)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fd2 := res2.Handle // triggers surrender; the shared final image lands
+	cr.claim.mu.Lock()
+	shared := cr.shared
+	cr.claim.mu.Unlock()
+	if !shared {
+		t.Fatal("over-budget reader did not adopt the shared final image")
+	}
+	if err := fd1.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := fd2.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	before := len(b.Requests())
+	buf := make([]byte, 3)
+	if n, rerr := r.Read(ctx, 0, buf); rerr != nil || string(buf[:n]) != "abc" {
+		t.Fatalf("over-budget read after writers closed = %q n=%d err=%v, want abc", buf[:n], n, rerr)
+	}
+	if got := len(b.Requests()) - before; got != 0 {
+		t.Fatalf("read issued %d backend requests (by-path open after release)", got)
+	}
+	if err := r.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := sh.e.readerBytes.Load(); got != readerBytesCap {
+		t.Fatalf("reader bytes after release = %d, want the saturated %d (shared image not refunded)", got, readerBytesCap)
+	}
+}
+
+// TestReaderKeepsSpillBytesAcrossWriterClose (review row 4): a reader on
+// an unlinked-then-spilled claim keeps the LAST observed bytes after the
+// writer closes (HEAD + the jump byte), never moving backward.
+func TestReaderKeepsSpillBytesAcrossWriterClose(t *testing.T) {
+	b := testbackend.NewBackend()
+	ch := newWritebackStack(t, b, noThreshold)
+	ctx := context.Background()
+
+	w := openForWrite(t, ch, "/sp4")
+	if err := w.Write(ctx, 0, []byte("head")); err != nil {
+		t.Fatal(err)
+	}
+	// The reader opens while the path still exists (an unlinked path
+	// cannot be opened); the claim it binds survives the rename+unlink.
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/sp4", Flags: uint32(syscall.O_RDONLY)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := res.Handle
+	buf := make([]byte, 4)
+	if n, err := r.Read(ctx, 0, buf); err != nil || string(buf[:n]) != "head" {
+		t.Fatalf("live read = %q n=%d err=%v", buf[:n], n, err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/sp4", Path2: "/sp4x"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/sp4x"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Write(ctx, 64<<20, []byte("y")); err != nil {
+		t.Fatalf("spill write: %v", err)
+	}
+	// While the writer is alive, reads see the spill (both planes).
+	at := make([]byte, 1)
+	if n, err := r.Read(ctx, 64<<20, at); err != nil || n != 1 || at[0] != 'y' {
+		t.Fatalf("read at the jump = %q n=%d err=%v (spill not visible)", at[:n], n, err)
+	}
+	if err := w.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := r.Read(ctx, 0, buf); err != nil || string(buf[:n]) != "head" {
+		t.Fatalf("post-close read = %q n=%d err=%v, want head", buf[:n], n, err)
+	}
+	if err := r.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+}

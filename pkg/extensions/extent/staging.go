@@ -93,6 +93,16 @@ type stagingHandle struct {
 	spill     *os.File
 	spillSize int64
 
+	// finalImage is the claim's image FROZEN at the transition that
+	// cleared it (surrender, spill, promotion, writer release): every
+	// reader still open on the claim shares this one backing by
+	// reference — zero per-reader copies, never re-opened by path, never
+	// touching the namespace after the writer is gone.
+	finalImage []byte
+	// readers tracks the open claimReadHandles so transitions can hand
+	// snapshot-less readers the shared final image (guard: h.mu).
+	readers map[*claimReadHandle]struct{}
+
 	// testHookFlush, when set, runs at the top of Flush (with NO locks
 	// held): tests use it to hold the surrender's flush phase open and
 	// place a write inside the handoff window deterministically.
@@ -348,6 +358,7 @@ func (h *stagingHandle) surrender(ctx context.Context) error {
 	h.mu.Lock()
 	h.passthrough = true
 	h.promotable = false
+	h.publishFinalImageLocked(h.image)
 	h.image = nil // the bytes now live in the plane below
 	h.dirty = false
 	h.pushed = 0
@@ -382,9 +393,51 @@ func (h *stagingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 		return promoted.Read(ctx, off, dest)
 	}
 	if passthrough {
-		inner, err := h.session(ctx)
-		if err != nil {
-			return 0, err
+		h.mu.Lock()
+		inner := h.inner
+		final := h.finalImage
+		released := h.released
+		h.mu.Unlock()
+		if inner == nil {
+			if released {
+				// The writer is GONE: never re-open by path — a replacement
+				// may own the name, and the read would leak or misread.
+				// The frozen final image is the descriptor's backing.
+				if off < 0 || off >= int64(len(final)) {
+					return 0, nil
+				}
+				return copy(dest, final[off:]), nil
+			}
+			// The writer itself is still open: the shared lower state is
+			// the object — open (and cache) a session for it.
+			serr := func() error {
+				h.mu.Lock()
+				defer h.mu.Unlock()
+				if h.inner != nil || h.unlinked {
+					return nil
+				}
+				opened, err := h.below.Open(ctx, h.path, fs.OpenFlags(h.openFlags))
+				if err != nil {
+					return err
+				}
+				if !h.released {
+					h.inner = opened
+					inner = opened
+				} else {
+					_ = opened.Release(ctx)
+				}
+				return nil
+			}()
+			_ = serr
+			h.mu.Lock()
+			inner = h.inner
+			h.mu.Unlock()
+			if inner == nil {
+				if off < 0 || off >= int64(len(final)) {
+					return 0, nil
+				}
+				return copy(dest, final[off:]), nil
+			}
 		}
 		return inner.Read(ctx, off, dest)
 	}
@@ -695,6 +748,9 @@ func (h *stagingHandle) Release(ctx context.Context) error {
 	pushErr := h.push(ctx)
 	if release {
 		h.e.paths.untrackStaging(h)
+		h.mu.Lock()
+		h.publishFinalImageLocked(h.image)
+		h.mu.Unlock()
 	}
 	inner, serr := h.session(ctx)
 	if serr != nil && pushErr == nil {
@@ -733,6 +789,7 @@ func (h *stagingHandle) spillWrite(ctx context.Context, off int64, data []byte) 
 			h.spillSize = int64(len(h.image))
 		}
 		h.spill = tmp
+		h.publishFinalImageLocked(h.image)
 		h.image = nil
 	}
 	if _, err := h.spill.WriteAt(data, off); err != nil {
@@ -898,6 +955,7 @@ func (h *stagingHandle) promote(ctx context.Context) error {
 		}
 	}
 	h.promoted = handle
+	h.publishFinalImageLocked(h.image)
 	h.image = nil
 	h.dirty = false
 	h.promotable = false
@@ -908,6 +966,26 @@ func (h *stagingHandle) promote(ctx context.Context) error {
 // carries before its image is opened on the extent plane (a typed constant:
 // the flag bits are constants and the mask never narrows a runtime value).
 const createFlagMask uint32 = syscall.O_CREAT | syscall.O_EXCL | syscall.O_TRUNC
+
+// publishFinalImageLocked freezes image as the shared reader backing at a
+// transition (surrender/spill/promotion/release). Readers that hold their
+// own budgeted snapshot keep it; snapshot-less readers (budget exhausted)
+// adopt the shared reference — one copy for all of them, so a valid
+// backing never depends on the budget again. Callers hold h.mu.
+func (h *stagingHandle) publishFinalImageLocked(image []byte) {
+	if len(image) == 0 && len(h.finalImage) > 0 {
+		return // keep the earlier (richer) backing
+	}
+	if len(image) > 0 {
+		h.finalImage = image
+	}
+	for r := range h.readers {
+		if len(r.image) == 0 && len(h.finalImage) > 0 {
+			r.image = h.finalImage
+			r.shared = true
+		}
+	}
+}
 
 // attrLocked renders the handle's reply attributes; callers hold h.mu.
 func (h *stagingHandle) attrLocked() fs.Attr {
@@ -941,10 +1019,18 @@ func (h *stagingHandle) overlayAttr() (fs.Attr, bool) {
 func newClaimReadHandle(h *stagingHandle) *claimReadHandle {
 	c := &claimReadHandle{claim: h}
 	h.mu.Lock()
-	image := h.image
-	if c.trySnapshot(int64(len(image))) {
+	if len(h.finalImage) > 0 {
+		// The claim already froze its backing (writer gone): adopt the
+		// shared reference directly.
+		c.image = h.finalImage
+		c.shared = true
+	} else if image := h.image; c.trySnapshot(int64(len(image))) {
 		c.image = append(c.image[:0], image...)
 	}
+	if h.readers == nil {
+		h.readers = map[*claimReadHandle]struct{}{}
+	}
+	h.readers[c] = struct{}{} // transition bookkeeping (shared final image)
 	h.mu.Unlock()
 	return c
 }
@@ -962,6 +1048,10 @@ type claimReadHandle struct {
 	// budget tracks what was actually reserved, so refunds never exceed
 	// the reservation).
 	reserved int64
+	// shared marks an image adopted BY REFERENCE from the claim's frozen
+	// final image: one copy for every snapshot-less reader, not counted
+	// against the reader budget, and never refunded (the claim owns it).
+	shared bool
 }
 
 func (c *claimReadHandle) Read(ctx context.Context, off int64, dest []byte) (int, error) {
@@ -986,28 +1076,41 @@ func (c *claimReadHandle) Read(ctx context.Context, off int64, dest []byte) (int
 		c.claim.mu.Unlock()
 		return n, nil
 	}
-	if c.claim.promoted != nil && !c.claim.released {
-		// Promotion moved the object to the extent plane and the handle is
-		// still live: serve through it (no snapshot copy needed).
-		c.claim.mu.Unlock()
-		return c.claim.Read(ctx, off, dest)
+	// From here the claim is no longer a live buffered writer. Delegation
+	// to the claim's live backings happens ONLY while the writer still
+	// owns them — once it released, a read must never open a below handle
+	// by path again (it would leak per read, re-create an unlinked name,
+	// or read whatever REPLACEMENT now owns the path).
+	if !c.claim.released {
+		if c.claim.promoted != nil {
+			// Promotion moved the object to the extent plane and the
+			// writer's handle is still live: serve through it.
+			c.claim.mu.Unlock()
+			return c.claim.Read(ctx, off, dest)
+		}
+		if c.claim.spill != nil {
+			// The anonymous writer spilled: the spill file is the live
+			// backing while it is open.
+			c.claim.mu.Unlock()
+			return c.claim.Read(ctx, off, dest)
+		}
+		if c.claim.passthrough && c.claim.inner != nil {
+			// The claim surrendered to the lower plane and the session is
+			// still cached: read the shared lower state (same object).
+			c.claim.mu.Unlock()
+			return c.claim.Read(ctx, off, dest)
+		}
 	}
-	if c.claim.passthrough || c.claim.spill != nil {
-		// The claim surrendered to the lower plane (or spilled): its image
-		// is cleared by design, so a reader WITHOUT a private snapshot
-		// (budget exhausted) must read through the claim's own passthrough
-		// session / spill — a valid backing for the whole descriptor
-		// lifetime, never EOF-from-no-backing.
-		c.claim.mu.Unlock()
-		return c.claim.Read(ctx, off, dest)
-	}
-	// The writer released or was unlinked: the opened descriptor keeps
-	// the LAST bytes it observed — the still-intact claim image first
-	// (release and unlink keep it), then the refreshed snapshot — never
-	// EOF-from-emptied-state and never an earlier version.
+	// Writer released (or its live backing is gone): the descriptor keeps
+	// the LAST bytes it observed — its refreshed snapshot or the claim's
+	// frozen final image (both bound to the opened object) — never a
+	// by-path re-open and never an earlier version.
 	image := c.claim.image
 	if len(image) == 0 {
 		image = c.image
+	}
+	if len(image) == 0 {
+		image = c.claim.finalImage
 	}
 	c.claim.mu.Unlock()
 	if off < 0 || off >= int64(len(image)) {
@@ -1025,6 +1128,12 @@ func (c *claimReadHandle) Read(ctx context.Context, off int64, dest []byte) (int
 func (c *claimReadHandle) trySnapshot(size int64) bool {
 	if size <= 0 {
 		return false
+	}
+	if c.shared {
+		// Holding the claim's shared final image: keep it; a new private
+		// reservation is only needed if the claim comes back to life
+		// (it cannot — final images are terminal).
+		return true
 	}
 	if c.reserved == size {
 		return true // already holding exactly this reservation
@@ -1072,6 +1181,8 @@ func (c *claimReadHandle) Release(ctx context.Context) error {
 	c.image = nil
 	n := c.reserved
 	c.reserved = 0
+	c.shared = false
+	delete(c.claim.readers, c)
 	c.claim.mu.Unlock()
 	if n > 0 {
 		c.claim.e.readerBytes.Add(-n)
