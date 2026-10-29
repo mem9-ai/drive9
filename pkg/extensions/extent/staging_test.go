@@ -2226,8 +2226,11 @@ func TestOverBudgetReaderKeepsBackingAcrossTransitions(t *testing.T) {
 	if err := r.Release(ctx); err != nil {
 		t.Fatal(err)
 	}
+	sh.mu.Lock()
+	rel, readers := sh.released, len(sh.readers)
+	sh.mu.Unlock()
 	if got := sh.e.readerBytes.Load(); got != readerBytesCap {
-		t.Fatalf("reader bytes after release = %d, want the saturated %d (shared image not refunded)", got, readerBytesCap)
+		t.Fatalf("reader bytes after release = %d, want the saturated %d (released=%v readers=%d)", got, readerBytesCap, rel, readers)
 	}
 }
 
@@ -2274,7 +2277,109 @@ func TestReaderKeepsSpillBytesAcrossWriterClose(t *testing.T) {
 	if n, err := r.Read(ctx, 0, buf); err != nil || string(buf[:n]) != "head" {
 		t.Fatalf("post-close read = %q n=%d err=%v, want head", buf[:n], n, err)
 	}
+	// The tail must survive the close too: the spill (held for readers)
+	// carries the post-transition byte the frozen image never had.
+	at = make([]byte, 1)
+	if n, err := r.Read(ctx, 64<<20, at); err != nil || n != 1 || at[0] != 'y' {
+		t.Fatalf("post-close read at the jump = %q n=%d err=%v, want y (stale frozen image served)", at[:n], n, err)
+	}
 	if err := r.Release(ctx); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestPreSurrenderReaderTracksSecondWriter is review finding 2: a reader
+// opened BEFORE the surrender keeps observing the second writer's
+// committed updates while the writers are open (the surrendered claim has
+// no cached inner session, so the reader reads the shared lower state).
+func TestPreSurrenderReaderTracksSecondWriter(t *testing.T) {
+	b := testbackend.NewBackend()
+	ch := newWritebackStack(t, b, 64*1024)
+	ctx := context.Background()
+
+	fd1 := openForWrite(t, ch, "/track")
+	if err := fd1.Write(ctx, 0, []byte("abc")); err != nil {
+		t.Fatal(err)
+	}
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/track", Flags: uint32(syscall.O_RDONLY)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := res.Handle
+	res2, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/track", Flags: uint32(syscall.O_RDWR)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fd2 := res2.Handle // surrender: fd1's claim detaches its session
+	if err := fd2.Write(ctx, 3, []byte("def")); err != nil {
+		t.Fatal(err)
+	}
+	if err := fd2.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 6)
+	if n, err := r.Read(ctx, 0, buf); err != nil || string(buf[:n]) != "abcdef" {
+		t.Fatalf("reader after second-writer flush = %q n=%d err=%v, want abcdef (frozen pre-surrender bytes served)", buf[:n], n, err)
+	}
+	_ = fd1.Release(ctx)
+	_ = fd2.Release(ctx)
+	_ = r.Release(ctx)
+}
+
+// TestFinalImageAccountingAcrossClaims is review finding 3: each retained
+// frozen image is COUNTED in the mount reader budget (one claim-wide
+// reservation), and the reservation refunds when the claim fully drains —
+// repeated claim-per-reader retention cannot accumulate invisibly.
+func TestFinalImageAccountingAcrossClaims(t *testing.T) {
+	b := testbackend.NewBackend()
+	ch := newWritebackStack(t, b, noThreshold)
+	ctx := context.Background()
+
+	type held struct {
+		w *stagingHandle
+		r *claimReadHandle
+	}
+	var helds []held
+	for i := 0; i < 8; i++ {
+		p := "/acc" + strconv.Itoa(i)
+		w := openForWrite(t, ch, p).(*stagingHandle)
+		if err := w.Write(ctx, 0, []byte("1234")); err != nil {
+			t.Fatal(err)
+		}
+		res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: p, Flags: uint32(syscall.O_RDONLY)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := res.Handle.(*claimReadHandle)
+		// Writer release with a live reader: the frozen image publishes
+		// and is retained (counted) until the reader releases.
+		if err := w.Release(ctx); err != nil {
+			t.Fatal(err)
+		}
+		helds = append(helds, held{w: w, r: r})
+	}
+	// Per claim: the reader's budgeted private snapshot (4) plus the
+	// claim-wide frozen-image reservation (4) — both counted, both
+	// refunding at drain.
+	want := int64(8 * 8)
+	if got := helds[0].w.e.readerBytes.Load(); got != want {
+		t.Fatalf("retained reader memory = %d bytes, want %d (unaccounted retention)", got, want)
+	}
+	// Drain half: their reservations refund.
+	for i := 0; i < 4; i++ {
+		if err := helds[i].r.Release(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := helds[0].w.e.readerBytes.Load(); got != want/2 {
+		t.Fatalf("after draining half = %d bytes, want %d (refund missing)", got, want/2)
+	}
+	for i := 4; i < 8; i++ {
+		if err := helds[i].r.Release(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := helds[0].w.e.readerBytes.Load(); got != 0 {
+		t.Fatalf("after full drain = %d bytes, want 0", got)
 	}
 }

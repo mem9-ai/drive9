@@ -97,10 +97,20 @@ type stagingHandle struct {
 	// cleared it (surrender, spill, promotion, writer release): every
 	// reader still open on the claim shares this one backing by
 	// reference — zero per-reader copies, never re-opened by path, never
-	// touching the namespace after the writer is gone.
+	// touching the namespace after the writer is gone. While ANY live
+	// backing (promoted handle, spill file, cached below session) is
+	// held open for readers, that backing — not this image — is what
+	// readers read: the frozen image is the last-resort fallback only,
+	// so post-transition bytes (spill writes, VFS writes after
+	// promotion) stay visible until the backing drains.
 	finalImage []byte
+	// finalReserved is the reader-budget byte reservation held for
+	// finalImage (one per claim, not per reader); refunded when the
+	// claim fully drains (writer released AND no readers left).
+	finalReserved int64
 	// readers tracks the open claimReadHandles so transitions can hand
-	// snapshot-less readers the shared final image (guard: h.mu).
+	// snapshot-less readers the shared final image and the last reader
+	// can close the retained backing (guard: h.mu).
 	readers map[*claimReadHandle]struct{}
 
 	// testHookFlush, when set, runs at the top of Flush (with NO locks
@@ -646,6 +656,7 @@ func (h *stagingHandle) Write(ctx context.Context, off int64, data []byte) error
 	}
 	h.passthrough = true
 	h.promotable = false
+	h.publishFinalImageLocked(h.image)
 	h.image = nil // the bytes now live in the plane below
 	h.mu.Unlock()
 	// The claim no longer owns the freshest bytes: stop serving the
@@ -733,8 +744,23 @@ func (h *stagingHandle) Release(ctx context.Context) error {
 	if promoted != nil {
 		if release {
 			h.e.paths.untrackStaging(h)
+			h.mu.Lock()
+			h.publishFinalImageLocked(h.image)
+			h.mu.Unlock()
 		}
-		return promoted.Release(ctx)
+		h.mu.Lock()
+		drain := release && len(h.readers) == 0
+		h.mu.Unlock()
+		if drain {
+			h.mu.Lock()
+			h.closeBackingLocked(ctx)
+			h.refundFinalImageLocked()
+			h.mu.Unlock()
+		}
+		// Readers still open: the promoted handle stays alive (pinned by
+		// inode — its reads are the object's real contents, including
+		// post-promotion writes) until the last reader releases.
+		return nil
 	}
 	// The boundary push happens before the inner release so a fresh create
 	// materializes the image (never an empty file) and a detached session
@@ -750,7 +776,25 @@ func (h *stagingHandle) Release(ctx context.Context) error {
 		h.e.paths.untrackStaging(h)
 		h.mu.Lock()
 		h.publishFinalImageLocked(h.image)
+		drain := len(h.readers) == 0
+		if drain {
+			h.closeBackingLocked(ctx)
+			h.refundFinalImageLocked()
+		}
+		deferBacking := !drain
 		h.mu.Unlock()
+		if deferBacking {
+			// Readers still open: the below session (and spill) stays
+			// alive as their live backing — releasing it here would hand
+			// them a dangling handle. The last reader's Release drains it.
+			h.mu.Lock()
+			inner := h.inner
+			h.mu.Unlock()
+			if inner != nil {
+				_ = inner.Flush(ctx)
+			}
+			return pushErr
+		}
 	}
 	inner, serr := h.session(ctx)
 	if serr != nil && pushErr == nil {
@@ -977,6 +1021,21 @@ func (h *stagingHandle) publishFinalImageLocked(image []byte) {
 		return // keep the earlier (richer) backing
 	}
 	if len(image) > 0 {
+		if h.finalReserved == 0 {
+			// First publication: reserve ONE claim-wide slot in the
+			// mount reader budget. The reservation overflows the cap if
+			// it must (a reader without this backing would read stale
+			// bytes or EOF — correctness over budget), but it is counted,
+			// so retained frozen images are visible in the accounting and
+			// the multiplicative factor stays capped: per-READER copies
+			// remain hard-gated by trySnapshot.
+			h.e.readerBytes.Add(int64(len(image)))
+			h.finalReserved = int64(len(image))
+		} else {
+			delta := int64(len(image)) - h.finalReserved
+			h.e.readerBytes.Add(delta)
+			h.finalReserved = int64(len(image))
+		}
 		h.finalImage = image
 	}
 	for r := range h.readers {
@@ -984,6 +1043,37 @@ func (h *stagingHandle) publishFinalImageLocked(image []byte) {
 			r.image = h.finalImage
 			r.shared = true
 		}
+	}
+}
+
+// refundFinalImageLocked releases the frozen image's budget reservation
+// (the claim fully drained: writer released, no readers left) and drops
+// the bytes.
+func (h *stagingHandle) refundFinalImageLocked() {
+	if h.finalReserved > 0 {
+		h.e.readerBytes.Add(-h.finalReserved)
+		h.finalReserved = 0
+	}
+	h.finalImage = nil
+}
+
+// closeBackingLocked releases the claim's live backings: the promoted VFS
+// handle, the spill file and the cached below session. Called when the
+// claim fully drains (writer released and the last reader released).
+func (h *stagingHandle) closeBackingLocked(ctx context.Context) {
+	if h.spill != nil {
+		_ = h.spill.Close()
+		h.spill = nil
+	}
+	promoted := h.promoted
+	h.promoted = nil
+	inner := h.inner
+	h.inner = nil
+	if promoted != nil {
+		_ = promoted.Release(ctx)
+	}
+	if inner != nil {
+		_ = inner.Release(ctx)
 	}
 }
 
@@ -1076,35 +1166,36 @@ func (c *claimReadHandle) Read(ctx context.Context, off int64, dest []byte) (int
 		c.claim.mu.Unlock()
 		return n, nil
 	}
-	// From here the claim is no longer a live buffered writer. Delegation
-	// to the claim's live backings happens ONLY while the writer still
-	// owns them — once it released, a read must never open a below handle
-	// by path again (it would leak per read, re-create an unlinked name,
-	// or read whatever REPLACEMENT now owns the path).
-	if !c.claim.released {
-		if c.claim.promoted != nil {
-			// Promotion moved the object to the extent plane and the
-			// writer's handle is still live: serve through it.
+	// Backing-first: a LIVE backing always wins over the frozen image,
+	// because it carries post-transition bytes (spill writes, VFS writes
+	// after promotion) and stays pinned to the OPENED object.
+	if c.claim.promoted != nil || c.claim.spill != nil {
+		// The promoted handle is pinned by inode; the spill is a local
+		// fd. Both survive the writer's release (held for readers) and
+		// close only when the claim fully drains.
+		c.claim.mu.Unlock()
+		return c.claim.Read(ctx, off, dest)
+	}
+	if c.claim.passthrough {
+		if c.claim.inner != nil {
+			// Cached below session: the shared lower state (the second
+			// writer's committed bytes included).
 			c.claim.mu.Unlock()
 			return c.claim.Read(ctx, off, dest)
 		}
-		if c.claim.spill != nil {
-			// The anonymous writer spilled: the spill file is the live
-			// backing while it is open.
-			c.claim.mu.Unlock()
-			return c.claim.Read(ctx, off, dest)
-		}
-		if c.claim.passthrough && c.claim.inner != nil {
-			// The claim surrendered to the lower plane and the session is
-			// still cached: read the shared lower state (same object).
+		if !c.claim.released {
+			// Surrendered claim without a cached session while writers
+			// are still OPEN: re-open by path once through claim.Read
+			// (the path still names the shared object) — the same rule
+			// the writer's own fd reads under.
 			c.claim.mu.Unlock()
 			return c.claim.Read(ctx, off, dest)
 		}
 	}
-	// Writer released (or its live backing is gone): the descriptor keeps
-	// the LAST bytes it observed — its refreshed snapshot or the claim's
-	// frozen final image (both bound to the opened object) — never a
-	// by-path re-open and never an earlier version.
+	// No live backing, and no by-path re-open after the writer released
+	// (leak / deleted-name recreation / replacement reads): the
+	// descriptor keeps the LAST bytes it observed — its refreshed
+	// snapshot or the frozen final image — never an earlier version.
 	image := c.claim.image
 	if len(image) == 0 {
 		image = c.image
@@ -1183,6 +1274,13 @@ func (c *claimReadHandle) Release(ctx context.Context) error {
 	c.reserved = 0
 	c.shared = false
 	delete(c.claim.readers, c)
+	if len(c.claim.readers) == 0 && c.claim.released {
+		// The writer is gone and this was the final reader: the retained
+		// backing (promoted handle / spill / cached session) and the
+		// frozen image drain now.
+		c.claim.closeBackingLocked(ctx)
+		c.claim.refundFinalImageLocked()
+	}
 	c.claim.mu.Unlock()
 	if n > 0 {
 		c.claim.e.readerBytes.Add(-n)
