@@ -586,6 +586,45 @@ so only matching names become extent and everything else stays single.
     `jfs_edge` holds no leftover edge for the deleted name
 12. Preserve run root and mount log on failure or `EXTENT_E2E_KEEP_ARTIFACTS=1`
 
+### `extent-takeover-mixed-tree.sh`
+
+Host support: Linux and macOS only. Manual-only, same live-extent-data-plane
+requirement as `extent-rename-mixed-dir.sh` (both run under `RUN_EXTENT_E2E=1`
+in `smoke-all.sh`). It mounts with the PLAIN default profile (no `[extent]`
+declarations) so the takeover itself is what is under test:
+
+1. Provision tenant unless `DRIVE9_API_KEY` is set; read `inline_threshold`
+   from `/v1/status` and size the big/small payloads around it
+2. A: a CLI-uploaded (`fs cp`, multipart) big file is `single` and stays
+   `single` through mount read, append, partial overwrite, truncate-rewrite,
+   chmod, rename, and delete — layout never converts
+3. B: the deleted legacy path rewritten past the cutoff becomes `extent`
+   (fresh `extent_ino`, mount and CLI bytes agree); a one-fd grow with NO
+   fsync at the boundary promotes, while an fsync at the boundary settles
+   `single` (durability settles the claim classically); O_APPEND growth,
+   a 64MiB sparse truncate, and a far sparse seek all promote; small files
+   stay `single`; remount keeps the layout and the inode
+4. C: a mixed single+extent tree survives ls (mount vs CLI), stat sizes,
+   extent→extent / extent-over-classic / classic-over-extent / cross-directory
+   renames (layout, inode, bytes, and path reusability after each), directory
+   rename, `cp -r`, `rm -r`, and a hardlink that either links or fails cleanly
+5. D: CLI-channel `fs mv` / `fs rm -r` with the mount down stays consistent
+   after a fresh remount (children readable/writable, paths reusable)
+6. E: deleting an extent file 404s, the path is reusable, and (when
+   `EXTENT_E2E_S3_DIR` points at a filesystem S3 mock) its block objects are
+   reclaimed; `EXTENT_E2E_SQL_CHECK=1` adds jfs_node/jfs_delfile/jfs_chunk
+   assertions via `POST /v1/sql`
+7. F: thousands of fsynced random 4KiB writes into one extent file trigger
+   slice compaction (server enqueues at 2500 slices/chunk, the mount's loop
+   claims within seconds); bytes are identical before/after the window and
+   after remount, and with SQL on, every chunk settles under the enqueue
+   threshold with fewer slices than there were writes
+8. G: a second concurrent mount of the same tenant agrees on bytes and
+   layouts in both directions
+9. H: a file held open mid-write is statable/readable from other processes
+   and lands as extent after close
+10. Preserve run root and mount logs on failure or `EXTENT_E2E_KEEP_ARTIFACTS=1`
+
 ### `fuse-s3-express-append-log.sh`
 
 Manual-only hosted validation for the S3 Express append-log FUSE contract. It
@@ -981,7 +1020,15 @@ Manual-only: requires TiDB Cloud API credentials. Not wired into CI.
 | `EXTENT_E2E_PAYLOAD_KB` | `256` | `extent-rename-mixed-dir.sh` |
 | `EXTENT_E2E_DURABILITY` | *(CLI default)* | `extent-rename-mixed-dir.sh` |
 | `EXTENT_E2E_SQL_ORPHAN_CHECK` | `0` | `extent-rename-mixed-dir.sh` |
-| `EXTENT_E2E_KEEP_ARTIFACTS` | `0` | `extent-rename-mixed-dir.sh` |
+| `EXTENT_E2E_KEEP_ARTIFACTS` | `0` | `extent-rename-mixed-dir.sh`, `extent-takeover-mixed-tree.sh` |
+| `EXTENT_E2E_PROVISION_BODY` | `{}` | `extent-takeover-mixed-tree.sh` |
+| `EXTENT_E2E_TAKEOVER_PROFILE` | `none` | `extent-takeover-mixed-tree.sh` |
+| `EXTENT_E2E_BIG_KB` / `EXTENT_E2E_SMALL_KB` | auto from `inline_threshold` / `4` | `extent-takeover-mixed-tree.sh` |
+| `EXTENT_E2E_COMPACT_WRITES` | `2600` (`0` skips) | `extent-takeover-mixed-tree.sh` |
+| `EXTENT_E2E_COMPACT_SPAN_MB` | `32` | `extent-takeover-mixed-tree.sh` |
+| `EXTENT_E2E_GC_WAIT_S` | `240` | `extent-takeover-mixed-tree.sh` |
+| `EXTENT_E2E_S3_DIR` | unset | `extent-takeover-mixed-tree.sh` |
+| `EXTENT_E2E_SQL_CHECK` | `0` | `extent-takeover-mixed-tree.sh` |
 | `FUSE_CONCURRENCY_WORKERS` | `4` | `fuse-concurrency-stress.sh` |
 | `FUSE_CONCURRENCY_FILES_PER_WORKER` | `8` | `fuse-concurrency-stress.sh` |
 | `FUSE_CONCURRENCY_READER_WORKERS` | `2` | `fuse-concurrency-stress.sh` |

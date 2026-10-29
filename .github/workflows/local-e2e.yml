@@ -505,6 +505,20 @@ jobs:
         continue-on-error: true
         run: bash e2e/fuse-posix-fsx-gate.sh
 
+      # Merge gate for the default extent takeover: a no-skip, exact-head run
+      # of the takeover suite against the local extent-enabled stack
+      # (provider=local, static extent credentials). Missing prerequisites
+      # FAIL instead of skipping; the SQL assertions (jfs_* tables) are on.
+      - name: Run extent takeover e2e (merge gate)
+        id: extent-takeover-e2e
+        if: always()
+        continue-on-error: true
+        env:
+          FUSE_STRICT_PREREQS: "1"
+          EXTENT_E2E_SQL_CHECK: "1"
+          EXTENT_E2E_KEEP_ARTIFACTS: "1"
+        run: bash e2e/extent-takeover-mixed-tree.sh
+
       - name: Run full smoke-all suite
         id: smoke-all
         if: always() && env.RUN_E2E_SMOKE_ALL == '1'
@@ -550,6 +564,7 @@ jobs:
             echo "| FUSE concurrency stress | ${{ steps.fuse-concurrency-stress.outcome || 'skipped' }} |"
             echo "| FUSE concurrency stress (write-sync, opt-in) | ${{ steps.fuse-concurrency-stress-write-sync.outcome || 'skipped' }} |"
             echo "| FUSE POSIX/fsx gate | ${{ steps.fuse-posix-fsx.outcome || 'skipped' }} |"
+            echo "| Extent takeover e2e (merge gate) | ${{ steps.extent-takeover-e2e.outcome || 'skipped' }} |"
             echo "| Full smoke-all suite | ${{ steps.smoke-all.outcome || 'skipped' }} |"
             echo "| Git feature smoke | ${{ steps.git-feature-smoke.outcome || 'skipped' }} |"
             echo
@@ -599,6 +614,7 @@ jobs:
             "fuse-concurrency-stress-write-sync": "${{ steps.fuse-concurrency-stress-write-sync.outcome }}",
             "fuse-posix-fsx": "${{ steps.fuse-posix-fsx.outcome }}",
             "smoke-all": "${{ steps.smoke-all.outcome }}",
+            "extent-takeover-e2e": "${{ steps.extent-takeover-e2e.outcome }}",
             "git-feature-smoke": "${{ steps.git-feature-smoke.outcome }}"
           }
           JSON
@@ -709,6 +725,7 @@ jobs:
           if [ "${RUN_FUSE_POSIX_FSX}" = "1" ]; then
             check_required "FUSE POSIX/fsx gate" "${{ steps.fuse-posix-fsx.outcome }}"
           fi
+          check_required "Extent takeover e2e (merge gate)" "${{ steps.extent-takeover-e2e.outcome }}"
           if [ "${RUN_E2E_SMOKE_ALL}" = "1" ]; then
             check_required "Full smoke-all suite" "${{ steps.smoke-all.outcome }}"
           fi

@@ -3,7 +3,6 @@ package extent
 import (
 	"syscall"
 	"testing"
-	"time"
 
 	jfsmeta "github.com/juicedata/juicefs/pkg/meta"
 )
@@ -53,17 +52,5 @@ func TestJuiceTypeToStatMode(t *testing.T) {
 	}
 	if m := juiceTypeToStatMode(jfsmeta.TypeFile, 0o644); m != syscall.S_IFREG|0o644 {
 		t.Fatalf("file mode = %o", m)
-	}
-}
-
-func TestClampExtentTTL(t *testing.T) {
-	if got := clampExtentTTL(juiceFSAttrTimeout, 5*time.Second); got != juiceFSAttrTimeout {
-		t.Fatalf("clamp = %v", got)
-	}
-	if got := clampExtentTTL(juiceFSAttrTimeout, 100*time.Millisecond); got != 100*time.Millisecond {
-		t.Fatalf("configured below extent ttl must win: %v", got)
-	}
-	if got := clampExtentTTL(0, time.Second); got != 0 {
-		t.Fatalf("deliberate zero must stay zero: %v", got)
 	}
 }

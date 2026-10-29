@@ -16,7 +16,7 @@ func TestParseExtensionOrder(t *testing.T) {
 	if !reflect.DeepEqual(got, defaultExtensionOrder) {
 		t.Fatalf("empty input = %v, want default", got)
 	}
-	if len(defaultExtensionOrder) != 13 || defaultExtensionOrder[0] != "core" {
+	if len(defaultExtensionOrder) != 12 || defaultExtensionOrder[0] != "core" {
 		t.Fatalf("default order = %v", defaultExtensionOrder)
 	}
 
@@ -35,6 +35,17 @@ func TestParseExtensionOrder(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, []string{"core", "sse"}) {
 		t.Fatalf("trimmed = %v", got)
+	}
+
+	// "bulkfile" is an accepted deprecated no-op: pre-upgrade explicit
+	// --extensions values and profiles that still name it must keep
+	// mounting, on the chain without it.
+	got, err = parseExtensionOrder([]string{"core", "writeback", "bulkfile", "cache"})
+	if err != nil {
+		t.Fatalf("pre-upgrade list with bulkfile rejected: %v", err)
+	}
+	if !reflect.DeepEqual(got, []string{"core", "writeback", "cache"}) {
+		t.Fatalf("pre-upgrade list dropped to %v, want the chain without bulkfile", got)
 	}
 
 	if _, err := parseExtensionOrder([]string{"core", "writebak"}); err == nil {

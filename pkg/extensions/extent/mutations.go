@@ -1,6 +1,8 @@
-// Mutations on claimed extent inodes: truncate through the VFS SetAttr,
-// unlink/rmdir against the resolved parent, and the rename RPC that moves
-// both the meta edge and the server-side projection in one transaction.
+// Mutations on claimed paths: unlink and rmdir against the resolved
+// parent, the rename RPC that moves both the meta edge and the
+// server-side projection in one transaction — and the staging-claim
+// bookkeeping that keeps unlinks and renames of never-committed buffered
+// writers local.
 package extent
 
 import (
@@ -10,6 +12,7 @@ import (
 	jfsmeta "github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/vfs"
 
+	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/fs"
 	"github.com/mem9-ai/drive9/pkg/pathutil"
 )
@@ -25,7 +28,7 @@ func (e *Extent) unlinkIno(ctx context.Context, path string, ino uint64, caller 
 		return syscall.EIO
 	}
 	metaCtx := e.jfsMetaCtx(caller).
-		WithValue(jfsmeta.Drive9OpenedKey, e.hasLive(path)).
+		WithValue(jfsmeta.Drive9OpenedKey, e.paths.hasLive(path)).
 		WithValue(jfsmeta.Drive9PathKey, e.remotePath(path))
 	parent, errn := e.ensureParent(e.jfsCtx(caller), pathutil.DirOf(path))
 	if errn != 0 {
@@ -34,7 +37,7 @@ func (e *Extent) unlinkIno(ctx context.Context, path string, ino uint64, caller 
 	if errn := v.Unlink(vfs.NewLogContext(metaCtx), parent, pathutil.BaseName(path)); errn != 0 && errn != syscall.ENOENT {
 		return errno(errn)
 	}
-	e.forgetIno(path)
+	e.paths.forgetIno(path)
 	return nil
 }
 
@@ -54,8 +57,42 @@ func (e *Extent) removeDirIno(ctx context.Context, path string, ino uint64, call
 	if errn := v.Rmdir(e.jfsCtx(caller), parent, pathutil.BaseName(path)); errn != 0 && errn != syscall.ENOENT {
 		return errno(errn)
 	}
-	e.forgetIno(path)
+	e.paths.forgetIno(path)
 	return nil
+}
+
+// linkIno adds a hardlink to an extent inode through the VFS: the new edge
+// carries its drive9 projection path so the server writes the second
+// file_nodes row in the same transaction (both names share one
+// extent_ino). A name the classic plane already owns must answer EEXIST
+// here — the VFS knows nothing about classic rows and would happily add
+// an edge beside one.
+func (e *Extent) linkIno(ctx context.Context, op *fs.Op, ino uint64, next fs.Next) (fs.Result, error) {
+	if res, derr := next(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: op.Path2, Caller: op.Caller}); derr == nil && res.Attr != nil {
+		return fs.Result{}, syscall.EEXIST
+	}
+	if err := e.ensureRuntime(); err != nil {
+		return fs.Result{}, syscall.EIO
+	}
+	v := e.vfs()
+	if v == nil {
+		return fs.Result{}, syscall.EIO
+	}
+	jctx := e.jfsCtxWithKeyedPath(op.Caller, e.remotePath(op.Path2))
+	parent, errn := e.ensureParent(jctx, pathutil.DirOf(op.Path2))
+	if errn != 0 {
+		return fs.Result{}, errno(errn)
+	}
+	entry, errn := v.Link(jctx, jfsmeta.Ino(ino), parent, pathutil.BaseName(op.Path2))
+	if errn != 0 {
+		return fs.Result{}, errno(errn)
+	}
+	e.paths.rememberIno(op.Path2, ino)
+	attr := fs.Attr{Kind: fs.KindFile, Nlink: 1}
+	if entry != nil && entry.Attr != nil {
+		attr = attrFromJuice(entry.Attr)
+	}
+	return fs.Result{Attr: &attr}, nil
 }
 
 // renameIno moves an extent inode: one RPC moves the meta edge and the
@@ -89,7 +126,7 @@ func (e *Extent) renameIno(ctx context.Context, op *fs.Op, ino uint64) error {
 		"flags":      op.Flags,
 		"src_path":   e.remotePath(op.Path),
 		"dst_path":   e.remotePath(op.Path2),
-		"dst_opened": e.hasLive(op.Path2),
+		"dst_opened": e.paths.hasLive(op.Path2),
 		"sid":        er.rt.SessionID,
 	}, &resp)
 	if call != 0 {
@@ -98,11 +135,69 @@ func (e *Extent) renameIno(ctx context.Context, op *fs.Op, ino uint64) error {
 	if resp.Errno != 0 {
 		return syscall.Errno(resp.Errno)
 	}
-	e.forgetIno(op.Path)
-	e.forgetIno(op.Path2)
-	e.rememberExtentIno(op.Path2, ino)
-	e.retargetLivePrefix(op.Path, op.Path2)
+	e.paths.forgetIno(op.Path)
+	e.paths.forgetIno(op.Path2)
+	e.paths.rememberIno(op.Path2, ino)
+	e.paths.retargetLivePrefix(op.Path, op.Path2)
 	return nil
+}
+
+// mutateStaging serves unlink, rmdir and rename for paths the large-file
+// takeover buffers: the op is forwarded so the plane below drops its own
+// pending state for the path, then the claim's handles go anonymous (or
+// move with a rename). A never-committed claim has nothing remote to
+// delete — the op succeeds locally when a live claim owns the path and the
+// plane below knew nothing of the name either.
+//
+// The leading stat is load-bearing, not bookkeeping: it settles the
+// window after close(2) in which the write plane's queued background
+// upload of the just-closed image is still landing (its WaitPath covers
+// in-flight work only). Without it, a rename that follows close
+// immediately can double-upload the staged image and CAS a stale
+// revision — git's lock→config cycle failed deterministically until the
+// stat was restored. Removing it needs the write plane to gain
+// queued-aware path waits first.
+func (e *Extent) mutateStaging(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error) {
+	if _, statErr := e.opts.Client.StatCtx(ctx, e.remotePath(op.Path)); statErr != nil {
+		if !client.IsNotFound(statErr) {
+			return fs.Result{}, statErr
+		}
+		res, err := next(ctx, op)
+		if err == nil {
+			e.finishStagingMutation(ctx, op)
+			return res, nil
+		}
+		if !fs.IsNotFound(err) {
+			return res, err
+		}
+		if !e.paths.hasLiveStagingAt(op.Path, op.Kind == fs.OpRmdir) {
+			return fs.Result{}, fs.ErrNotFound
+		}
+		e.finishStagingMutation(ctx, op)
+		return fs.Result{}, nil
+	}
+	res, err := next(ctx, op)
+	if err != nil {
+		return res, err
+	}
+	e.finishStagingMutation(ctx, op)
+	return res, nil
+}
+
+// finishStagingMutation retargets a rename's claims and flags an unlink's
+// (or removed directory's) claims anonymous.
+func (e *Extent) finishStagingMutation(ctx context.Context, op *fs.Op) {
+	if op.Kind == fs.OpRename {
+		// The rename replaced the destination: its open claims go
+		// anonymous before the source claims move onto that path — an
+		// un-anonymized destination claim would keep answering lookups
+		// from its stale image and its boundary push would clobber the
+		// renamed-in file.
+		e.paths.markStagingUnlinked(op.Path2, false)
+		e.paths.retargetStaging(ctx, op.Path, op.Path2)
+		return
+	}
+	e.paths.markStagingUnlinked(op.Path, op.Kind == fs.OpRmdir)
 }
 
 // setUIDPermissionBit / setGIDPermissionBit are the privilege bits a

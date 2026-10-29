@@ -63,17 +63,17 @@ func TestPortLivePathsReferenceCounted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e.trackLive("/db/x-shm")
-	e.trackLive("/db/x-shm")
-	if !e.hasLive("/db/x-shm") {
+	e.paths.trackLive("/db/x-shm")
+	e.paths.trackLive("/db/x-shm")
+	if !e.paths.hasLive("/db/x-shm") {
 		t.Fatal("live path missing with two references")
 	}
-	e.untrackLive("/db/x-shm")
-	if !e.hasLive("/db/x-shm") {
+	e.paths.untrackLive("/db/x-shm")
+	if !e.paths.hasLive("/db/x-shm") {
 		t.Fatal("live path dropped while one reference remains")
 	}
-	e.untrackLive("/db/x-shm")
-	if e.hasLive("/db/x-shm") {
+	e.paths.untrackLive("/db/x-shm")
+	if e.paths.hasLive("/db/x-shm") {
 		t.Fatal("live path survived the last reference")
 	}
 }

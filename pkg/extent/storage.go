@@ -84,6 +84,21 @@ type CredentialSource interface {
 	GetDataCredential(ctx context.Context) (*Credential, error)
 }
 
+// blockObj is the minimal object.Object reply the block stores need.
+type blockObj struct {
+	key   string
+	size  int64
+	mtime time.Time
+}
+
+func (o *blockObj) Key() string          { return o.key }
+func (o *blockObj) Size() int64          { return o.size }
+func (o *blockObj) Mtime() time.Time     { return o.mtime }
+func (o *blockObj) IsDir() bool          { return false }
+func (o *blockObj) IsSymlink() bool      { return false }
+func (o *blockObj) StorageClass() string { return "" }
+func (o *blockObj) Status() string       { return "" }
+
 // errExtentStoreClosed is returned by every I/O entry point after Shutdown.
 var errExtentStoreClosed = errors.New("extent storage is closed")
 
