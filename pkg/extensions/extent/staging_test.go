@@ -2383,3 +2383,90 @@ func TestFinalImageAccountingAcrossClaims(t *testing.T) {
 		t.Fatalf("after full drain = %d bytes, want 0", got)
 	}
 }
+
+// TestClassicReleaseDoesNotReopenBelowPath (release-gate regression,
+// c0bf38f05): the classic Release path drained the push's below session
+// and then re-opened the path through session() to release it again. That
+// re-open binds a fresh below handle to a name whose only existence is
+// the just-staged writeback image; on the live mount that handle's own
+// close superseded the staged content and the acknowledged write landed
+// EMPTY — git's .git/HEAD and .git/config read back zero bytes right
+// after git init (the release gate failed "git config lockfile updates
+// succeed" and git clone with 'origin' does not appear to be a git
+// repository). Release must reuse the push's session: exactly ONE
+// below O_CREAT open for the path across the claim's whole life.
+func TestClassicReleaseDoesNotReopenBelowPath(t *testing.T) {
+	b := testbackend.NewBackend()
+	ctx := context.Background()
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	cl.Warm(ctx)
+	ext, err := New(Options{Client: cl, InlineThreshold: 64 * 1024})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wb, err := writeback.New(writeback.Options{Policy: writeback.PolicyWriteBack, Client: cl})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The spy sits between the extent layer and the writeback plane: it
+	// counts O_CREAT opens of the claim's path issued by the layer above
+	// (the claim's push and — under the bug — Release's re-open).
+	var creatOpens int
+	spy := fs.HandlerFunc(func(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error) {
+		if op.Kind == fs.OpCreate && op.Path == "/release-reopen" && op.Flags&uint32(syscall.O_CREAT) != 0 {
+			creatOpens++
+		}
+		return next(ctx, op)
+	})
+	ch, err := fs.NewChain(ext, spy, wb, terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fd := openForWrite(t, ch, "/release-reopen")
+	if err := fd.Write(ctx, 0, []byte("ref: refs/heads/master\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := fd.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if creatOpens != 1 {
+		t.Fatalf("below O_CREAT opens of /release-reopen = %d, want 1 (the push's session only; Release must not re-open the path by name)", creatOpens)
+	}
+
+	// The written bytes are the acknowledged content of the closed name:
+	// the async upload must land exactly them, and a fresh reader (the
+	// close-then-reopen pattern git uses constantly) sees them.
+	var data string
+	landed := false
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); {
+		if d, ok := backendData(t, b, "/release-reopen"); ok {
+			data, landed = d, true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !landed {
+		t.Fatal("file never landed at the backend after release")
+	}
+	if data != "ref: refs/heads/master\n" {
+		t.Fatalf("async-landed data = %q, want the written bytes", data)
+	}
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/release-reopen", Flags: uint32(syscall.O_RDONLY)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 32)
+	if n, rerr := res.Handle.Read(ctx, 0, buf); rerr != nil || string(buf[:n]) != "ref: refs/heads/master\n" {
+		t.Fatalf("re-opened read = %q n=%d err=%v, want the written bytes", buf[:n], n, rerr)
+	}
+	if err := res.Handle.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+}

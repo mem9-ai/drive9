@@ -776,14 +776,9 @@ func (h *stagingHandle) Release(ctx context.Context) error {
 		h.e.paths.untrackStaging(h)
 		h.mu.Lock()
 		h.publishFinalImageLocked(h.image)
-		drain := len(h.readers) == 0
-		if drain {
-			h.closeBackingLocked(ctx)
-			h.refundFinalImageLocked()
-		}
-		deferBacking := !drain
+		drained := len(h.readers) == 0
 		h.mu.Unlock()
-		if deferBacking {
+		if !drained {
 			// Readers still open: the below session (and spill) stays
 			// alive as their live backing — releasing it here would hand
 			// them a dangling handle. The last reader's Release drains it.
@@ -796,6 +791,15 @@ func (h *stagingHandle) Release(ctx context.Context) error {
 			return pushErr
 		}
 	}
+	// The tail releases the push's below session ONCE through session():
+	// with a session in hand it returns the cached h.inner without
+	// touching the namespace. Releasing h.inner earlier and re-opening
+	// the path here would bind a fresh below handle to a name whose only
+	// existence is the just-staged writeback image; that handle's own
+	// release re-stages its (empty) buffer as a NEW generation, which
+	// races the staged content and can supersede it — the file lands
+	// empty (the release gate caught it as git's .git/HEAD and config
+	// reading back zero bytes after git init).
 	inner, serr := h.session(ctx)
 	if serr != nil && pushErr == nil {
 		pushErr = serr
@@ -803,6 +807,11 @@ func (h *stagingHandle) Release(ctx context.Context) error {
 	h.mu.Lock()
 	h.inner = nil
 	h.closeSpillLocked()
+	if release {
+		// Full drain (release with no readers): the frozen image is dead
+		// state — refund the reader-budget reservation it holds.
+		h.refundFinalImageLocked()
+	}
 	h.mu.Unlock()
 	if inner != nil {
 		if err := inner.Release(ctx); err != nil && pushErr == nil {
