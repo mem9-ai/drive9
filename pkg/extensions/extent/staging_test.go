@@ -3407,7 +3407,7 @@ func TestRemovalServesTerminalStateNotStaleBytes(t *testing.T) {
 		if n, rerr := r.Read(ctx, 0, buf); rerr != nil || n != 0 {
 			t.Fatalf("read after truncate-to-zero+unlink = %q n=%d err=%v, want EOF (deleted bytes must not outlive the name)", buf[:n], n, rerr)
 		}
-		r.Release(ctx)
+		_ = r.Release(ctx)
 	})
 	t.Run("exhausted frozen budget", func(t *testing.T) {
 		b := testbackend.NewBackend()
@@ -3461,7 +3461,7 @@ func TestTransientReadNeverBindsReplacement(t *testing.T) {
 	_ = fd1.Write(ctx, 0, []byte("abcdef"))
 	readerRes, _ := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/win", Flags: uint32(syscall.O_RDONLY)})
 	r := readerRes.Handle
-	fd1.Release(ctx) // released+registered: transient by-path reads
+	_ = fd1.Release(ctx) // released+registered: transient by-path reads
 
 	other := openForWrite(t, ch, "/other")
 	_ = other.Write(ctx, 0, []byte("REPLACEMENT"))
