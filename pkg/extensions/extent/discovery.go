@@ -438,6 +438,41 @@ func (r *pathRouter) refreshRegisteredForRemoval(ctx context.Context, p string, 
 	}
 }
 
+// markStagingUnlinkedCollect flags every claim at p (or under p) exactly
+// like markStagingUnlinked and returns the claims whose flag it CHANGED —
+// the set a failed mutation must restore. Rename-over flagging runs
+// BEFORE the namespace change so an in-flight reader's post-read fence
+// check cannot miss the replacement window.
+func (r *pathRouter) markStagingUnlinkedCollect(p string, under bool) []*stagingHandle {
+	prefix := p
+	if !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+	r.mu.Lock()
+	var targets, flagged []*stagingHandle
+	for path, hs := range r.staging {
+		if path == p || (under && strings.HasPrefix(path, prefix)) {
+			targets = append(targets, hs...)
+		}
+	}
+	r.bumpFenceLocked()
+	r.mu.Unlock()
+	for _, h := range targets {
+		if h.setUnlinkedIfClear() {
+			flagged = append(flagged, h)
+		}
+	}
+	return flagged
+}
+
+// restoreUnlinked rolls back a pre-mutation flagging when the mutation
+// failed and the names survive unchanged.
+func (r *pathRouter) restoreUnlinked(flagged []*stagingHandle) {
+	for _, h := range flagged {
+		h.clearUnlinked()
+	}
+}
+
 // markStagingUnlinked flags every live claim at p (or under p, for a
 // removed directory) anonymous: the fd keeps serving reads from the image,
 // but the boundary push must not resurrect the path. Per-path, so a
@@ -498,6 +533,10 @@ func (r *pathRouter) retargetStaging(ctx context.Context, oldPath, newPath strin
 		// rename interleaves with the release.
 		h.routerPath = np
 	}
+	// A retarget changes every moved claim's path identity: readers that
+	// captured a path (or an in-flight transient read) before the move
+	// must revalidate against the fence, exactly like a replacement.
+	r.bumpFenceLocked()
 	r.mu.Unlock()
 	for h, np := range moves {
 		h.retarget(ctx, np)

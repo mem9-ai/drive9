@@ -363,7 +363,12 @@ func (e *Extent) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, er
 			// bytes captured first (the write plane below re-keys the name at
 			// the rename — reading after it would serve the REPLACEMENT).
 			e.paths.refreshRegisteredForRemoval(ctx, op.Path2, false)
+			// Flag the destination claims BEFORE the namespace changes —
+			// an in-flight reader's post-read fence check must never miss
+			// the replacement window. A failed rename rolls them back.
+			flagged := e.paths.markStagingUnlinkedCollect(op.Path2, false)
 			if err := e.renameIno(ctx, op, ino); err != nil {
+				e.paths.restoreUnlinked(flagged)
 				return fs.Result{}, err
 			}
 			e.paths.markStagingUnlinked(op.Path2, false)
@@ -391,8 +396,13 @@ func (e *Extent) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, er
 		// source: their readers get the destination object's CURRENT bytes
 		// captured first — after the rename the name serves the REPLACEMENT.
 		e.paths.refreshRegisteredForRemoval(ctx, op.Path2, false)
+		// Flag the destination claims BEFORE the namespace changes so an
+		// in-flight reader cannot bind the replacement; a failed rename
+		// rolls the flags back.
+		flagged := e.paths.markStagingUnlinkedCollect(op.Path2, false)
 		res, err := e.mutateStaging(ctx, op, next)
 		if err != nil {
+			e.paths.restoreUnlinked(flagged)
 			return res, err
 		}
 		// Whatever extent identity the destination path still carried is
