@@ -3384,21 +3384,21 @@ func TestRemovalServesTerminalStateNotStaleBytes(t *testing.T) {
 		ctx := context.Background()
 
 		fd1 := openForWrite(t, ch, "/tz")
-		fd1.Write(ctx, 0, []byte("abc"))
+		_ = fd1.Write(ctx, 0, []byte("abc"))
 		readerRes, _ := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/tz", Flags: uint32(syscall.O_RDONLY)})
 		r := readerRes.Handle
 		res2, _ := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/tz", Flags: uint32(syscall.O_RDWR)})
 		fd2 := res2.Handle // surrender
-		fd2.Write(ctx, 3, []byte("def"))
-		fd2.Flush(ctx)
-		fd1.Release(ctx)
-		fd2.Release(ctx)
+		_ = fd2.Write(ctx, 3, []byte("def"))
+		_ = fd2.Flush(ctx)
+		_ = fd1.Release(ctx)
+		_ = fd2.Release(ctx)
 		// A later writer truncates the object to nothing and flushes.
 		res3, _ := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/tz", Flags: uint32(syscall.O_RDWR)})
 		fd3 := res3.Handle
-		ch.Dispatch(ctx, &fs.Op{Kind: fs.OpSetAttr, Path: "/tz", HasSize: true, Size: 0, Handle: fd3})
-		fd3.Flush(ctx)
-		fd3.Release(ctx)
+		_, _ = ch.Dispatch(ctx, &fs.Op{Kind: fs.OpSetAttr, Path: "/tz", HasSize: true, Size: 0, Handle: fd3})
+		_ = fd3.Flush(ctx)
+		_ = fd3.Release(ctx)
 
 		if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/tz"}); err != nil {
 			t.Fatal(err)
@@ -3415,7 +3415,7 @@ func TestRemovalServesTerminalStateNotStaleBytes(t *testing.T) {
 		ctx := context.Background()
 
 		fd1 := openForWrite(t, ch, "/eb")
-		fd1.Write(ctx, 0, []byte("abc"))
+		_ = fd1.Write(ctx, 0, []byte("abc"))
 		sh := fd1.(*stagingHandle)
 		sh.e.frozenBytes.Add(readerBytesCap)
 		t.Cleanup(func() { sh.e.frozenBytes.Add(-readerBytesCap) })
@@ -3423,10 +3423,10 @@ func TestRemovalServesTerminalStateNotStaleBytes(t *testing.T) {
 		r := readerRes.Handle
 		res2, _ := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/eb", Flags: uint32(syscall.O_RDWR)})
 		fd2 := res2.Handle
-		fd2.Write(ctx, 3, []byte("def"))
-		fd2.Flush(ctx)
-		fd1.Release(ctx)
-		fd2.Release(ctx)
+		_ = fd2.Write(ctx, 3, []byte("def"))
+		_ = fd2.Flush(ctx)
+		_ = fd1.Release(ctx)
+		_ = fd2.Release(ctx)
 
 		if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/eb"}); err != nil {
 			t.Fatal(err)
@@ -3458,14 +3458,14 @@ func TestTransientReadNeverBindsReplacement(t *testing.T) {
 	ctx := context.Background()
 
 	fd1 := openForWrite(t, ch, "/win")
-	fd1.Write(ctx, 0, []byte("abcdef"))
+	_ = fd1.Write(ctx, 0, []byte("abcdef"))
 	readerRes, _ := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/win", Flags: uint32(syscall.O_RDONLY)})
 	r := readerRes.Handle
 	fd1.Release(ctx) // released+registered: transient by-path reads
 
 	other := openForWrite(t, ch, "/other")
-	other.Write(ctx, 0, []byte("REPLACEMENT"))
-	other.Release(ctx)
+	_ = other.Write(ctx, 0, []byte("REPLACEMENT"))
+	_ = other.Release(ctx)
 
 	sh := fd1.(*stagingHandle)
 	hookDone := make(chan struct{})
@@ -3513,16 +3513,16 @@ func TestFrozenShrinkAndDrainReturnsBudget(t *testing.T) {
 	ctx := context.Background()
 
 	fd1 := openForWrite(t, ch, "/shrink")
-	fd1.Write(ctx, 0, []byte("abcdef"))
+	_ = fd1.Write(ctx, 0, []byte("abcdef"))
 	sh := fd1.(*stagingHandle)
 	readerRes, _ := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/shrink", Flags: uint32(syscall.O_RDONLY)})
 	r := readerRes.Handle
 	res2, _ := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/shrink", Flags: uint32(syscall.O_RDWR)})
 	fd2 := res2.Handle // surrender: publishes the 6-byte frozen image
-	fd2.Write(ctx, 6, []byte("gh"))
-	fd2.Flush(ctx)
-	fd1.Release(ctx)
-	fd2.Release(ctx)
+	_ = fd2.Write(ctx, 6, []byte("gh"))
+	_ = fd2.Flush(ctx)
+	_ = fd1.Release(ctx)
+	_ = fd2.Release(ctx)
 
 	sh.mu.Lock()
 	reserved := sh.finalReserved
@@ -3539,9 +3539,9 @@ func TestFrozenShrinkAndDrainReturnsBudget(t *testing.T) {
 	// the 1-byte terminal image — the SHRINK must return 7 bytes.
 	res3, _ := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/shrink", Flags: uint32(syscall.O_RDWR)})
 	fd3 := res3.Handle
-	ch.Dispatch(ctx, &fs.Op{Kind: fs.OpSetAttr, Path: "/shrink", HasSize: true, Size: 1, Handle: fd3})
-	fd3.Flush(ctx)
-	fd3.Release(ctx)
+	_, _ = ch.Dispatch(ctx, &fs.Op{Kind: fs.OpSetAttr, Path: "/shrink", HasSize: true, Size: 1, Handle: fd3})
+	_ = fd3.Flush(ctx)
+	_ = fd3.Release(ctx)
 	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/shrink"}); err != nil {
 		t.Fatal(err)
 	}
