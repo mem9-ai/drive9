@@ -19,6 +19,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/mem9-ai/drive9/pkg/fs"
@@ -87,6 +88,15 @@ type stagingHandle struct {
 
 	unlinked bool // directory entry gone; boundary pushes are discarded
 	released bool
+	// registered mirrors membership in the router's staging map (set under
+	// router.mu by trackStaging, cleared by untrackStaging; read without
+	// locks). While set, the router keeps the claim's path identity
+	// current — retargetStaging follows renames, markStagingUnlinked
+	// flags unlink/replacement — so readers of a surrendered or
+	// writer-released claim may still reach the SAME object by path
+	// (read-only; never re-creating names). Claims without readers leave
+	// the registry at surrender/release exactly as before.
+	registered atomic.Bool
 	// spill serves an open-unlinked claim with no below session: a local
 	// temporary file keeps the descriptor writable without buffering the
 	// logical hole in memory.
@@ -374,10 +384,19 @@ func (h *stagingHandle) surrender(ctx context.Context) error {
 	h.pushed = 0
 	h.surrendering = false
 	h.handoffCond.Broadcast()
+	keepRegistered := len(h.readers) > 0
 	h.mu.Unlock()
 	// The claim no longer owns the path's freshest state: stop answering
-	// the path's lookups from this handle.
-	h.e.paths.untrackStaging(h)
+	// the path's lookups from this handle (claimLive is false from here
+	// on). With readers still open it STAYS registered: their reads reach
+	// the object by path, so the claim's path identity must keep
+	// following renames and die on unlink/replacement — the router's
+	// maintenance does exactly that for registered claims. The last
+	// reader's drain untracks it; a reader-less claim untracks now, as
+	// before.
+	if !keepRegistered {
+		h.e.paths.untrackStaging(h)
+	}
 	return nil
 }
 
@@ -409,33 +428,44 @@ func (h *stagingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 		released := h.released
 		h.mu.Unlock()
 		if inner == nil {
-			if released {
-				// The writer is GONE: never re-open by path — a replacement
-				// may own the name, and the read would leak or misread.
-				// The frozen final image is the descriptor's backing.
+			// A by-path re-open is legitimate only while the claim's path
+			// identity is GUARANTEED: the writer still owns the name, or
+			// the claim is registered and the router keeps the name
+			// following the object (renames retarget it, unlink/replacement
+			// flag it). Anything else — an unregistered released claim —
+			// must never touch the namespace again (replacement binding,
+			// deleted-name recreation): the frozen final image is the
+			// descriptor's backing.
+			if h.unlinked || (released && !h.registered.Load()) {
 				if off < 0 || off >= int64(len(final)) {
 					return 0, nil
 				}
 				return copy(dest, final[off:]), nil
 			}
-			// The writer itself is still open: the shared lower state is
-			// the object — open (and cache) a session for it.
+			// The open is READ-ONLY for a passthrough (surrendered or
+			// overflowed) or released claim: a create would re-materialize
+			// a name that a racing unlink removed. A live buffered claim
+			// keeps its own flags — its lazy create may be the only
+			// materialization of the object.
+			flags := h.openFlags
+			if h.passthrough || released {
+				flags &^= uint32(syscall.O_CREAT)
+			}
 			serr := func() error {
 				h.mu.Lock()
 				defer h.mu.Unlock()
 				if h.inner != nil || h.unlinked {
 					return nil
 				}
-				opened, err := h.below.Open(ctx, h.path, fs.OpenFlags(h.openFlags))
+				opened, err := h.below.Open(ctx, h.path, fs.OpenFlags(flags))
 				if err != nil {
 					return err
 				}
-				if !h.released {
-					h.inner = opened
-					inner = opened
-				} else {
-					_ = opened.Release(ctx)
-				}
+				// Cache for released claims too: the retained handle is
+				// the readers' live backing and drains with the claim (one
+				// open per claim, never per read).
+				h.inner = opened
+				inner = opened
 				return nil
 			}()
 			_ = serr
@@ -773,20 +803,37 @@ func (h *stagingHandle) Release(ctx context.Context) error {
 	// handle (read-your-writes across close).
 	pushErr := h.push(ctx)
 	if release {
-		h.e.paths.untrackStaging(h)
 		h.mu.Lock()
 		h.publishFinalImageLocked(h.image)
 		drained := len(h.readers) == 0
+		// With readers open and NO retained below session to carry their
+		// backing (a surrendered claim detached it), the claim STAYS
+		// registered: the router keeps its path identity current so the
+		// readers' read-only re-opens reach the same object. The last
+		// reader's drain untracks; every other shape untracks now.
+		retainIdentity := !drained && h.inner == nil
 		h.mu.Unlock()
+		if !retainIdentity {
+			h.e.paths.untrackStaging(h)
+		}
 		if !drained {
 			// Readers still open: the below session (and spill) stays
 			// alive as their live backing — releasing it here would hand
 			// them a dangling handle. The last reader's Release drains it.
 			h.mu.Lock()
 			inner := h.inner
+			path := h.path
 			h.mu.Unlock()
 			if inner != nil {
 				_ = inner.Flush(ctx)
+				// The writer's CLOSE must not gate on the readers: the
+				// write plane below submits a handle's upload at ITS
+				// release, and that release is deferred until the last
+				// reader — submit the staged close image now (the handle
+				// itself stays retained).
+				if h.e.opts.SubmitClassicUpload != nil {
+					h.e.opts.SubmitClassicUpload(ctx, path)
+				}
 			}
 			return pushErr
 		}
@@ -1030,19 +1077,29 @@ func (h *stagingHandle) publishFinalImageLocked(image []byte) {
 		return // keep the earlier (richer) backing
 	}
 	if len(image) > 0 {
+		// Bounded retention: every publication site holds a live backing
+		// for readers — the spill fd, the promoted VFS handle, the kept
+		// below session, or (while the writer lives) the path itself —
+		// and reads are backing-first, so a frozen copy the mount cannot
+		// afford costs only the last-resort fallback, never correctness.
+		// Refusing past the cap is what keeps retained frozen images of
+		// retired claims (writer released, claim untracked, staging slot
+		// freed) from accumulating without bound.
+		delta := int64(len(image))
+		if h.finalReserved > 0 {
+			delta -= h.finalReserved
+		}
+		if delta > 0 && h.e.frozenBytes.Load()+delta > readerBytesCap {
+			return
+		}
 		if h.finalReserved == 0 {
-			// First publication: reserve ONE claim-wide slot in the
-			// mount reader budget. The reservation overflows the cap if
-			// it must (a reader without this backing would read stale
-			// bytes or EOF — correctness over budget), but it is counted,
-			// so retained frozen images are visible in the accounting and
-			// the multiplicative factor stays capped: per-READER copies
-			// remain hard-gated by trySnapshot.
+			h.e.frozenBytes.Add(int64(len(image)))
 			h.e.readerBytes.Add(int64(len(image)))
 			h.finalReserved = int64(len(image))
 		} else {
-			delta := int64(len(image)) - h.finalReserved
-			h.e.readerBytes.Add(delta)
+			d := int64(len(image)) - h.finalReserved
+			h.e.frozenBytes.Add(d)
+			h.e.readerBytes.Add(d)
 			h.finalReserved = int64(len(image))
 		}
 		h.finalImage = image
@@ -1055,11 +1112,36 @@ func (h *stagingHandle) publishFinalImageLocked(image []byte) {
 	}
 }
 
+// refreshFinalFromLivePath captures the object's current bytes (the name
+// still resolves — a removal is about to destroy it) as the claim's frozen
+// reader backing. Post-removal reads answer the frozen image, so it must
+// carry the final content — a second writer may have flushed past the
+// claim's open-time prefix. Bounded: a name grown past the staging bound
+// keeps its existing image (the bytes live on in the plane below; only
+// the in-memory fallback copy is skipped). Readers with their own
+// snapshot never move backward: their copy outranks the frozen image.
+func (h *stagingHandle) refreshFinalFromLivePath(ctx context.Context) {
+	h.mu.Lock()
+	need := h.passthrough && h.promoted == nil && h.spill == nil && !h.unlinked && len(h.readers) > 0
+	h.mu.Unlock()
+	if !need {
+		return
+	}
+	data, err := h.readAll(ctx, 0, stagingMaxBufferedBytes+1)
+	if err != nil || len(data) == 0 || int64(len(data)) > stagingMaxBufferedBytes {
+		return
+	}
+	h.mu.Lock()
+	h.publishFinalImageLocked(data)
+	h.mu.Unlock()
+}
+
 // refundFinalImageLocked releases the frozen image's budget reservation
 // (the claim fully drained: writer released, no readers left) and drops
 // the bytes.
 func (h *stagingHandle) refundFinalImageLocked() {
 	if h.finalReserved > 0 {
+		h.e.frozenBytes.Add(-h.finalReserved)
 		h.e.readerBytes.Add(-h.finalReserved)
 		h.finalReserved = 0
 	}
@@ -1200,6 +1282,18 @@ func (c *claimReadHandle) Read(ctx context.Context, off int64, dest []byte) (int
 			c.claim.mu.Unlock()
 			return c.claim.Read(ctx, off, dest)
 		}
+		if !c.claim.unlinked && c.claim.registered.Load() {
+			// The writer released but the claim is still REGISTERED: the
+			// router kept its path identity current (renames retargeted
+			// it, unlink/replacement would have flagged it), so the same
+			// read-only re-open reaches the SAME object and serves the
+			// bytes every later writer committed — the first read after
+			// ALL writers closed sees the final content, not the frozen
+			// prefix. Unregistered released claims keep the images-only
+			// rule (replacement binding / name recreation).
+			c.claim.mu.Unlock()
+			return c.claim.Read(ctx, off, dest)
+		}
 	}
 	// No live backing, and no by-path re-open after the writer released
 	// (leak / deleted-name recreation / replacement reads): the
@@ -1283,14 +1377,19 @@ func (c *claimReadHandle) Release(ctx context.Context) error {
 	c.reserved = 0
 	c.shared = false
 	delete(c.claim.readers, c)
-	if len(c.claim.readers) == 0 && c.claim.released {
+	drained := len(c.claim.readers) == 0 && c.claim.released
+	if drained {
 		// The writer is gone and this was the final reader: the retained
 		// backing (promoted handle / spill / cached session) and the
-		// frozen image drain now.
+		// frozen image drain now, and the claim leaves the registry (a
+		// surrendered claim stayed registered for exactly this reader).
 		c.claim.closeBackingLocked(ctx)
 		c.claim.refundFinalImageLocked()
 	}
 	c.claim.mu.Unlock()
+	if drained {
+		c.claim.e.paths.untrackStaging(c.claim)
+	}
 	if n > 0 {
 		c.claim.e.readerBytes.Add(-n)
 	}

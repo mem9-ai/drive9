@@ -339,6 +339,7 @@ func (r *pathRouter) trackStaging(h *stagingHandle) bool {
 		r.staging = map[string][]*stagingHandle{}
 	}
 	h.routerPath = h.path
+	h.registered.Store(true)
 	r.staging[h.routerPath] = append(r.staging[h.routerPath], h)
 	return true
 }
@@ -346,6 +347,7 @@ func (r *pathRouter) trackStaging(h *stagingHandle) bool {
 func (r *pathRouter) untrackStaging(h *stagingHandle) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	h.registered.Store(false)
 	key := h.routerPath
 	hs := r.staging[key]
 	for i, cur := range hs {
@@ -410,6 +412,30 @@ func (r *pathRouter) stagingOverlay(p string) (fs.Attr, bool) {
 		return fs.Attr{}, false
 	}
 	return h.overlayAttr()
+}
+
+// refreshRegisteredForRemoval captures the CURRENT bytes of the name —
+// still live, the removal has not run yet — into every registered claim
+// at or under p whose readers depend on the path (a surrendered or
+// released claim without another backing): once the name is destroyed
+// their reads answer the frozen image, so it must carry the final
+// content, not just the claim's open-time prefix.
+func (r *pathRouter) refreshRegisteredForRemoval(ctx context.Context, p string, under bool) {
+	prefix := p
+	if !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+	r.mu.Lock()
+	var targets []*stagingHandle
+	for path, hs := range r.staging {
+		if path == p || (under && strings.HasPrefix(path, prefix)) {
+			targets = append(targets, hs...)
+		}
+	}
+	r.mu.Unlock()
+	for _, h := range targets {
+		h.refreshFinalFromLivePath(ctx)
+	}
 }
 
 // markStagingUnlinked flags every live claim at p (or under p, for a

@@ -68,6 +68,15 @@ type Options struct {
 	// writeback plane; nil is a no-op (stale classic state then serves the
 	// overwritten name until its own expiry).
 	DropClassicPathState func(path string)
+	// SubmitClassicUpload submits the staged close image of the live
+	// below-plane handle at path WITHOUT releasing the handle. The extent
+	// layer retains a writer's below session past its Release while claim
+	// readers are still open, but the close upload must not wait for the
+	// last reader: the write plane below submits at handle release, so the
+	// retained-close calls this at the writer's Release instead. Wired by
+	// the mount to the writeback plane; nil is a no-op (the upload then
+	// rides the eventual drain).
+	SubmitClassicUpload func(ctx context.Context, path string)
 }
 
 // Extent is the fs.Handler middleware claiming extent-plane paths. It
@@ -93,6 +102,13 @@ type Extent struct {
 	// fallbacks (see claimReadHandle.trySnapshot); atomic so readers never
 	// serialize on the claims.
 	readerBytes atomic.Int64
+	// frozenBytes counts the claim-wide frozen-image reservations (see
+	// stagingHandle.publishFinalImageLocked): unlike reader snapshots,
+	// frozen images of RETIRED claims (writer released, claim untracked)
+	// can outlive the staging admission slot, so they carry their own
+	// hard cap — publication is refused past it (a live backing exists at
+	// every publication site; reads are backing-first).
+	frozenBytes atomic.Int64
 }
 
 // readerBytesCap bounds the aggregate memory of reader snapshots — the
@@ -323,6 +339,12 @@ func (e *Extent) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, er
 			}
 			return fs.Result{}, e.unlinkIno(ctx, op.Path, ino, op.Caller)
 		}
+		// Registered claims whose readers reach the object by path lose
+		// the name in a moment: this is their last chance to observe the
+		// object's CURRENT bytes (a second writer may have flushed past
+		// the claim's frozen prefix), so the frozen image is refreshed
+		// from the still-live name BEFORE the removal runs.
+		e.paths.refreshRegisteredForRemoval(ctx, op.Path, op.Kind == fs.OpRmdir)
 		return e.mutateStaging(ctx, op, next)
 
 	case fs.OpRename:

@@ -2228,40 +2228,13 @@ func (h *bufferingHandle) Release(ctx context.Context) error {
 	// empty buffer.
 	h.mu.Lock()
 	materialize := h.isNew && !h.landed && !h.unlinked
-	staged, unlinked := h.stagedToCache, h.unlinked
-	dirty := h.dirty
-	isNew := h.isNew
-	h.stagedToCache = false
 	h.mu.Unlock()
-	if staged && !unlinked && h.w.uploader != nil && h.w.wbCache != nil {
-		if _, ok := h.w.wbCache.GetMeta(path); ok {
-			if dirty {
-				// A write landed between Flush and Release: the staged
-				// snapshot is stale — refresh it from the current buffer
-				// before submitting (v1: the latest image always wins;
-				// submitting the stale snapshot loses the newer write).
-				if err := h.stageToWriteCache(ctx, isNew); err != nil {
-					return err
-				}
-			}
-			// v1 write-back cache fast path at Release: the Flush snapshot
-			// owns the close upload — submit it exactly once instead of
-			// re-committing (commitLocked would publish a second image and
-			// race the uploader's CAS on the same base).
-			h.w.uploader.Submit(path)
-			h.mu.Lock()
-			h.dirty = false
-			h.visTrunc = false
-			if h.buf != nil {
-				h.buf.ClearDirty()
-			}
-			h.landed = true
-			h.mu.Unlock()
-			if h.inner != nil {
-				_ = h.inner.Release(ctx)
-			}
-			return nil
-		}
+	submitted, submitErr := h.submitCloseUpload(ctx, path, true)
+	if submitErr != nil {
+		return submitErr
+	}
+	if submitted {
+		return nil
 	}
 	if materialize {
 		if err := h.ensureBuffer(ctx); err == nil {
@@ -2277,6 +2250,70 @@ func (h *bufferingHandle) Release(ctx context.Context) error {
 		}
 	}
 	return err
+}
+
+// submitCloseUpload submits the staged close image for this handle on
+// the write-back cache fast path — the exact contract a close owns:
+// consume the staged flag, refresh the staged snapshot when a write
+// landed after the last Flush (the latest image always wins), then Submit
+// exactly once (a second commit would publish another image and race the
+// uploader's CAS on the same base) and mark the handle clean/landed.
+// releaseInner releases the underlying backend session (Release's own
+// tail); a caller RETAINING the handle past the writer's close (the
+// extent layer holds below sessions open for claim readers) passes false
+// so the handle stays usable while the upload is already on its way.
+// Reports whether the fast path applied.
+func (h *bufferingHandle) submitCloseUpload(ctx context.Context, path string, releaseInner bool) (bool, error) {
+	h.mu.Lock()
+	staged := h.stagedToCache
+	unlinked := h.unlinked
+	dirty, isNew := h.dirty, h.isNew
+	h.stagedToCache = false
+	h.mu.Unlock()
+	if !staged || unlinked || h.w.uploader == nil || h.w.wbCache == nil {
+		return false, nil
+	}
+	if _, ok := h.w.wbCache.GetMeta(path); !ok {
+		return false, nil
+	}
+	if dirty {
+		// A write landed between Flush and close: the staged snapshot is
+		// stale — refresh it from the current buffer before submitting.
+		if err := h.stageToWriteCache(ctx, isNew); err != nil {
+			return false, err
+		}
+	}
+	// v1 write-back cache fast path at close: the Flush snapshot owns the
+	// close upload — submit it exactly once.
+	h.w.uploader.Submit(path)
+	h.mu.Lock()
+	h.dirty = false
+	h.visTrunc = false
+	if h.buf != nil {
+		h.buf.ClearDirty()
+	}
+	h.landed = true
+	inner := h.inner
+	h.mu.Unlock()
+	if releaseInner && inner != nil {
+		_ = inner.Release(ctx)
+	}
+	return true, nil
+}
+
+// SubmitCloseUploadFor submits the staged close image of the LIVE handle
+// at path WITHOUT releasing the handle: a caller that retains a writer's
+// handle past its close (the extent layer holds below sessions open for
+// claim readers) still owes the upload at close time — reader lifetime
+// must not gate the close upload's submission (other mounts would see the
+// old or missing remote image until an unrelated reader closes). No-op
+// when no live handle exists at path.
+func (w *Writeback) SubmitCloseUploadFor(ctx context.Context, path string) {
+	h := w.handleFor(path)
+	if h == nil {
+		return
+	}
+	_, _ = h.submitCloseUpload(ctx, path, false)
 }
 
 // pendingServeMaterializeBytes bounds the images a pending-overlay open

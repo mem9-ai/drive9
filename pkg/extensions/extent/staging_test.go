@@ -2220,8 +2220,22 @@ func TestOverBudgetReaderKeepsBackingAcrossTransitions(t *testing.T) {
 	if n, rerr := r.Read(ctx, 0, buf); rerr != nil || string(buf[:n]) != "abc" {
 		t.Fatalf("over-budget read after writers closed = %q n=%d err=%v, want abc", buf[:n], n, rerr)
 	}
-	if got := len(b.Requests()) - before; got != 0 {
-		t.Fatalf("read issued %d backend requests (by-path open after release)", got)
+	// The claim stayed REGISTERED through the surrender and the writers'
+	// releases, so the reader may reach the object by path — read-only,
+	// ONCE (cached into the claim's retained backing; round-3 contract:
+	// the first read after every writer closed serves the object's
+	// current bytes, not just the frozen prefix).
+	first := len(b.Requests()) - before
+	if first > 1 {
+		t.Fatalf("first read issued %d backend requests, want at most one cached by-path open", first)
+	}
+	for i := 0; i < 3; i++ {
+		if n, rerr := r.Read(ctx, 0, buf); rerr != nil || string(buf[:n]) != "abc" {
+			t.Fatalf("over-budget read %d after writers closed = %q n=%d err=%v, want abc", i, buf[:n], n, rerr)
+		}
+	}
+	if got := len(b.Requests()) - before - first; got != 0 {
+		t.Fatalf("subsequent reads issued %d backend requests (the by-path open must be cached once, not per read)", got)
 	}
 	if err := r.Release(ctx); err != nil {
 		t.Fatal(err)
@@ -2468,5 +2482,355 @@ func TestClassicReleaseDoesNotReopenBelowPath(t *testing.T) {
 	}
 	if err := res.Handle.Release(ctx); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// --- round-3 review (5693020914): reader identity and freshness ---
+
+// newProdWritebackStack builds the PRODUCTION small-file configuration —
+// PolicyWriteBack plus a real write cache — with the extent layer wired to
+// the writeback plane exactly like the mount (SubmitClassicUpload close
+// hook included): a claim writer's Release retains its below session for
+// readers, and the close upload must submit through the hook anyway.
+func newProdWritebackStack(t *testing.T, b *testbackend.Backend, threshold int64) *fs.Chain {
+	t.Helper()
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	cl.Warm(context.Background())
+	wb, err := writeback.New(writeback.Options{Policy: writeback.PolicyWriteBack, Client: cl, WriteCacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = wb.Stop(context.Background()) })
+	ext, err := New(Options{Client: cl, InlineThreshold: threshold, SubmitClassicUpload: wb.SubmitCloseUploadFor})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := fs.NewChain(ext, wb, terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ch
+}
+
+// TestSurrenderedReaderFollowsObjectNotName (round-3 finding 1, rename
+// half): a reader open on a surrendered claim must read the OBJECT it
+// opened — following the rename onto the new name — and never bind the
+// replacement that reuses the old name, while the writer is still open or
+// after every writer closed.
+func TestSurrenderedReaderFollowsObjectNotName(t *testing.T) {
+	b := testbackend.NewBackend()
+	ch := newWritebackStack(t, b, 64*1024)
+	ctx := context.Background()
+
+	fd1 := openForWrite(t, ch, "/obj")
+	if err := fd1.Write(ctx, 0, []byte("abc")); err != nil {
+		t.Fatal(err)
+	}
+	readerRes, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/obj", Flags: uint32(syscall.O_RDONLY)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := readerRes.Handle
+	res2, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/obj", Flags: uint32(syscall.O_RDWR)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fd2 := res2.Handle // triggers the surrender
+	if err := fd2.Write(ctx, 3, []byte("def")); err != nil {
+		t.Fatal(err)
+	}
+	if err := fd2.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// The object moves; a replacement takes the old name.
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/obj", Path2: "/moved"}); err != nil {
+		t.Fatal(err)
+	}
+	rep := openForWrite(t, ch, "/obj")
+	if err := rep.Write(ctx, 0, []byte("XYZ")); err != nil {
+		t.Fatal(err)
+	}
+	if err := rep.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// While writer 1 is STILL OPEN: the reader answers the object's bytes
+	// (abcdef), never the replacement's.
+	buf := make([]byte, 6)
+	if n, rerr := r.Read(ctx, 0, buf); rerr != nil || string(buf[:n]) != "abcdef" {
+		t.Fatalf("read after rename+replacement = %q n=%d err=%v, want abcdef (the opened object, not the replacement)", buf[:n], n, rerr)
+	}
+	if err := fd1.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := fd2.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n, rerr := r.Read(ctx, 0, buf); rerr != nil || string(buf[:n]) != "abcdef" {
+		t.Fatalf("read after writers closed = %q n=%d err=%v, want abcdef", buf[:n], n, rerr)
+	}
+	// The replacement owns the old name untouched.
+	repRes, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/obj", Flags: uint32(syscall.O_RDONLY)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rbuf := make([]byte, 3)
+	if n, rerr := repRes.Handle.Read(ctx, 0, rbuf); rerr != nil || string(rbuf[:n]) != "XYZ" {
+		t.Fatalf("replacement read = %q n=%d err=%v, want XYZ", rbuf[:n], n, rerr)
+	}
+	if err := repRes.Handle.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestReaderFirstReadAfterWritersReleaseSeesFinalBytes (round-3 finding 1,
+// first-read-after-release half): a reader that never read before both
+// writers closed must still observe the FINAL committed bytes — the second
+// writer's flush included — not the frozen open-time prefix. Both reader
+// budget states are covered: a snapshotted reader (whose own copy would
+// otherwise pin the prefix) and a snapshot-less one (frozen-image-only).
+func TestReaderFirstReadAfterWritersReleaseSeesFinalBytes(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		exhaus bool
+	}{
+		{"snapshotted reader", false},
+		{"snapshotless reader", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := testbackend.NewBackend()
+			ch := newWritebackStack(t, b, 64*1024)
+			ctx := context.Background()
+
+			fd1 := openForWrite(t, ch, "/fr")
+			if err := fd1.Write(ctx, 0, []byte("abc")); err != nil {
+				t.Fatal(err)
+			}
+			sh := fd1.(*stagingHandle)
+			if tc.exhaus {
+				sh.e.readerBytes.Add(readerBytesCap)
+				t.Cleanup(func() { sh.e.readerBytes.Add(-readerBytesCap) })
+			}
+			readerRes, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/fr", Flags: uint32(syscall.O_RDONLY)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			r := readerRes.Handle
+			res2, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/fr", Flags: uint32(syscall.O_RDWR)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			fd2 := res2.Handle // surrender
+			if err := fd2.Write(ctx, 3, []byte("def")); err != nil {
+				t.Fatal(err)
+			}
+			if err := fd2.Flush(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := fd1.Release(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := fd2.Release(ctx); err != nil {
+				t.Fatal(err)
+			}
+
+			// The FIRST read happens only now.
+			buf := make([]byte, 6)
+			if n, rerr := r.Read(ctx, 0, buf); rerr != nil || string(buf[:n]) != "abcdef" {
+				t.Fatalf("first read after all writers closed = %q n=%d err=%v, want abcdef", buf[:n], n, rerr)
+			}
+			if err := r.Release(ctx); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+// TestSurrenderedReaderDoesNotRecreateUnlinkedName (round-3 finding 1,
+// unlink half): unlinking the name must not let a surrendered claim's
+// reader re-create it, and the reader answers the object's FINAL bytes
+// (captured while the name was still live), not the open-time prefix.
+func TestSurrenderedReaderDoesNotRecreateUnlinkedName(t *testing.T) {
+	b := testbackend.NewBackend()
+	ch := newWritebackStack(t, b, 64*1024)
+	ctx := context.Background()
+
+	fd1 := openForWrite(t, ch, "/gone")
+	if err := fd1.Write(ctx, 0, []byte("abc")); err != nil {
+		t.Fatal(err)
+	}
+	readerRes, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/gone", Flags: uint32(syscall.O_RDONLY)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := readerRes.Handle
+	res2, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/gone", Flags: uint32(syscall.O_RDWR)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fd2 := res2.Handle // surrender
+	if err := fd2.Write(ctx, 3, []byte("def")); err != nil {
+		t.Fatal(err)
+	}
+	if err := fd2.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/gone"}); err != nil {
+		t.Fatal(err)
+	}
+	// (The unlink op itself legitimately touches the name — the DELETE, its
+	// stat fences and the pre-removal refresh that captures the reader's
+	// final bytes all run inside it.)
+
+	// The reader keeps the object's final bytes; the deleted name is never
+	// re-opened or re-created.
+	postUnlink := map[string]int{}
+	for k, n := range b.Requests() {
+		postUnlink[k] = n
+	}
+	buf := make([]byte, 6)
+	if n, rerr := r.Read(ctx, 0, buf); rerr != nil || string(buf[:n]) != "abcdef" {
+		t.Fatalf("read after unlink = %q n=%d err=%v, want abcdef (final bytes, captured pre-removal)", buf[:n], n, rerr)
+	}
+	if err := fd1.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := fd2.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n, rerr := r.Read(ctx, 0, buf); rerr != nil || string(buf[:n]) != "abcdef" {
+		t.Fatalf("read after unlink+writers closed = %q n=%d err=%v, want abcdef", buf[:n], n, rerr)
+	}
+	if err := r.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// No backend traffic for the deleted name after the unlink op itself
+	// completed (the op's own pre-removal refresh read is expected): the
+	// dead name is never re-opened or re-created.
+	for k, n := range b.Requests() {
+		if n <= postUnlink[k] {
+			continue
+		}
+		if strings.HasPrefix(k, "GET /v1/fs/gone") || strings.HasPrefix(k, "POST /v1/fs/gone") {
+			t.Fatalf("backend saw +%d %q after the unlink completed — the dead name was re-opened or re-created", n-postUnlink[k], k)
+		}
+	}
+	if _, ok := backendData(t, b, "/gone"); ok {
+		t.Fatal("the deleted name exists at the backend after the drain")
+	}
+}
+
+// TestRetainedReaderDoesNotGateCloseUpload (round-3 finding 2): under the
+// production small-file configuration, a close stages the image locally
+// and submits the upload at Release. The extent layer retains the writer's
+// below session while claim readers are open — the close upload must be
+// submitted at the writer's Release (through the SubmitClassicUpload
+// hook), not postponed to the last reader: other mounts would otherwise
+// see the old or missing remote image until an unrelated reader closes.
+func TestRetainedReaderDoesNotGateCloseUpload(t *testing.T) {
+	b := testbackend.NewBackend()
+	ch := newProdWritebackStack(t, b, 64*1024)
+	ctx := context.Background()
+
+	payload := []byte("close-submits-while-reader-open")
+	fd := openForWrite(t, ch, "/submit")
+	if err := fd.Write(ctx, 0, payload); err != nil {
+		t.Fatal(err)
+	}
+	readerRes, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/submit", Flags: uint32(syscall.O_RDONLY)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := readerRes.Handle
+	if err := fd.Release(ctx); err != nil { // writer closes; reader stays open
+		t.Fatal(err)
+	}
+
+	// The upload lands at the backend WHILE the reader is still open.
+	var data string
+	landed := false
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); {
+		if d, ok := backendData(t, b, "/submit"); ok {
+			data, landed = d, true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !landed {
+		t.Fatal("the close upload never landed while the reader was open — reader lifetime gated the writer's close upload")
+	}
+	if data != string(payload) {
+		t.Fatalf("landed data = %q, want %q", data, string(payload))
+	}
+	buf := make([]byte, len(payload))
+	if n, rerr := r.Read(ctx, 0, buf); rerr != nil || string(buf[:n]) != string(payload) {
+		t.Fatalf("reader read = %q n=%d err=%v, want the written bytes", buf[:n], n, rerr)
+	}
+	if err := r.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestFrozenImagesAreBoundedAcrossRetiredClaims (round-3 finding 3):
+// frozen-image retention is hard-capped: with the mount's frozen budget
+// saturated by retired claims, a new claim's publication is REFUSED — the
+// aggregate never grows past the cap — and the refused reader keeps
+// reading the correct bytes through its live backing (the retained below
+// session), never an invalidation.
+func TestFrozenImagesAreBoundedAcrossRetiredClaims(t *testing.T) {
+	b := testbackend.NewBackend()
+	ch := newWritebackStack(t, b, 64*1024)
+	ctx := context.Background()
+
+	fd := openForWrite(t, ch, "/bounded")
+	payload := []byte("bounded-data")
+	if err := fd.Write(ctx, 0, payload); err != nil {
+		t.Fatal(err)
+	}
+	sh := fd.(*stagingHandle)
+	// Saturation by RETIRED claims: their writers released, only retained
+	// readers keep their frozen images alive.
+	sh.e.frozenBytes.Add(readerBytesCap)
+	t.Cleanup(func() { sh.e.frozenBytes.Add(-readerBytesCap) })
+
+	readerRes, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/bounded", Flags: uint32(syscall.O_RDONLY)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := readerRes.Handle
+	if err := fd.Release(ctx); err != nil { // readers open: retained close
+		t.Fatal(err)
+	}
+	sh.mu.Lock()
+	frozen, reserved := len(sh.finalImage), sh.finalReserved
+	sh.mu.Unlock()
+	if frozen != 0 || reserved != 0 {
+		t.Fatalf("frozen image = %d bytes (reserved %d) despite a saturated budget, want refused (0/0)", frozen, reserved)
+	}
+	if got := sh.e.frozenBytes.Load(); got != readerBytesCap {
+		t.Fatalf("frozen budget moved to %d, want the saturated %d (publication must be refused past the cap)", got, readerBytesCap)
+	}
+	// The refused reader still reads the CORRECT bytes through the live
+	// backing — refusal costs only the fallback copy.
+	buf := make([]byte, len(payload))
+	if n, rerr := r.Read(ctx, 0, buf); rerr != nil || string(buf[:n]) != string(payload) {
+		t.Fatalf("read with refused frozen image = %q n=%d err=%v, want %q via the live backing", buf[:n], n, rerr, string(payload))
+	}
+	if err := r.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := sh.e.frozenBytes.Load(); got != readerBytesCap {
+		t.Fatalf("frozen budget after drain = %d, want the saturated %d (nothing was reserved, nothing refunded)", got, readerBytesCap)
 	}
 }

@@ -1020,6 +1020,11 @@ func mountWithConfig(cfg MountConfig) error {
 					wb.DropPathState(path)
 				}
 			},
+			SubmitClassicUpload: func(ctx context.Context, path string) {
+				if wb != nil {
+					wb.SubmitCloseUploadFor(ctx, path)
+				}
+			},
 		})
 		if err != nil {
 			return fmt.Errorf("fuse: extent extension: %w", err)
