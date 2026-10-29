@@ -426,6 +426,7 @@ func (h *stagingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 		inner := h.inner
 		final := h.finalImage
 		released := h.released
+		unlinked := h.unlinked
 		h.mu.Unlock()
 		if inner == nil {
 			// A by-path re-open is legitimate only while the claim's path
@@ -436,7 +437,7 @@ func (h *stagingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 			// must never touch the namespace again (replacement binding,
 			// deleted-name recreation): the frozen final image is the
 			// descriptor's backing.
-			if h.unlinked || (released && !h.registered.Load()) {
+			if unlinked || (released && !h.registered.Load()) {
 				if off < 0 || off >= int64(len(final)) {
 					return 0, nil
 				}
@@ -451,6 +452,29 @@ func (h *stagingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 			if h.passthrough || released {
 				flags &^= uint32(syscall.O_CREAT)
 			}
+			if released {
+				// The writer is gone but the claim is REGISTERED: read the
+				// object's CURRENT state through a TRANSIENT read-only
+				// handle — opened and released per read, so nothing leaks
+				// and (unlike a cached handle, whose buffer freezes at its
+				// last materialization) every read observes the freshest
+				// staged state: a later writer's append, a truncate.
+				opened, oerr := h.below.Open(ctx, h.path, fs.OpenFlags(flags))
+				if oerr != nil {
+					if off < 0 || off >= int64(len(final)) {
+						return 0, nil
+					}
+					return copy(dest, final[off:]), nil
+				}
+				n, rerr := opened.Read(ctx, off, dest)
+				_ = opened.Release(ctx)
+				if rerr != nil && rerr != io.EOF {
+					return 0, rerr
+				}
+				return n, nil
+			}
+			// The writer itself is still open: the shared lower state is
+			// the object — open (and cache) a session for it.
 			serr := func() error {
 				h.mu.Lock()
 				defer h.mu.Unlock()
@@ -461,9 +485,6 @@ func (h *stagingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 				if err != nil {
 					return err
 				}
-				// Cache for released claims too: the retained handle is
-				// the readers' live backing and drains with the claim (one
-				// open per claim, never per read).
 				h.inner = opened
 				inner = opened
 				return nil
@@ -805,34 +826,54 @@ func (h *stagingHandle) Release(ctx context.Context) error {
 	if release {
 		h.mu.Lock()
 		h.publishFinalImageLocked(h.image)
+		// The buffered image is dead state from here: the bytes live in
+		// the plane below (pushed) and the readers' backings carry them.
+		// Keeping h.image allocated past the close would retain the whole
+		// buffer through every surviving reader, OUTSIDE the frozen-image
+		// budget and the staging admission (the claim untracks below) —
+		// repeated close-with-reader claims would accumulate without
+		// bound. Publication above captured what the budget admits; the
+		// refused overflow is served by the live backings.
+		h.image = nil
 		drained := len(h.readers) == 0
-		// With readers open and NO retained below session to carry their
-		// backing (a surrendered claim detached it), the claim STAYS
-		// registered: the router keeps its path identity current so the
-		// readers' read-only re-opens reach the same object. The last
-		// reader's drain untracks; every other shape untracks now.
-		retainIdentity := !drained && h.inner == nil
+		// Readers still open: the claim STAYS REGISTERED — the router
+		// keeps its path identity current (renames retarget it,
+		// unlink/replacement flag it) so the readers' read-only re-opens
+		// reach the SAME object. The last reader's drain untracks; a
+		// drained release untracks now.
+		retainIdentity := !drained
 		h.mu.Unlock()
 		if !retainIdentity {
 			h.e.paths.untrackStaging(h)
 		}
 		if !drained {
-			// Readers still open: the below session (and spill) stays
-			// alive as their live backing — releasing it here would hand
-			// them a dangling handle. The last reader's Release drains it.
 			h.mu.Lock()
 			inner := h.inner
 			path := h.path
+			// The claim has handed its stream to the plane below at this
+			// close (passthrough routes every later read through it). A
+			// SPILLED claim keeps its local spill fd as the backing —
+			// its own Read path checks passthrough ahead of the spill and
+			// must not be rerouted.
+			if h.spill == nil {
+				h.passthrough = true
+				h.inner = nil
+			}
 			h.mu.Unlock()
 			if inner != nil {
 				_ = inner.Flush(ctx)
 				// The writer's CLOSE must not gate on the readers: the
 				// write plane below submits a handle's upload at ITS
-				// release, and that release is deferred until the last
-				// reader — submit the staged close image now (the handle
-				// itself stays retained).
+				// release — submit the staged close image now, then
+				// release the session: surviving readers read the
+				// object's CURRENT state by path (a later writer's
+				// append, a truncate), which a retained session handle
+				// would freeze at its own last materialization.
 				if h.e.opts.SubmitClassicUpload != nil {
 					h.e.opts.SubmitClassicUpload(ctx, path)
+				}
+				if h.spill == nil {
+					_ = inner.Release(ctx)
 				}
 			}
 			return pushErr
@@ -1089,17 +1130,29 @@ func (h *stagingHandle) publishFinalImageLocked(image []byte) {
 		if h.finalReserved > 0 {
 			delta -= h.finalReserved
 		}
-		if delta > 0 && h.e.frozenBytes.Load()+delta > readerBytesCap {
-			return
+		if delta > 0 {
+			// Atomic admission: concurrent publications on OTHER claims
+			// hold different mutexes, so a Load-check-Add pair could both
+			// observe room and both admit. The CAS loop makes each
+			// admission claim its slot against the value it observed;
+			// refunds are plain decrements (per-claim serialized by h.mu,
+			// never past zero). Refusal keeps the earlier (smaller)
+			// frozen image — the live backings carry the tail bytes.
+			for {
+				cur := h.e.frozenBytes.Load()
+				if cur+delta > readerBytesCap {
+					return
+				}
+				if h.e.frozenBytes.CompareAndSwap(cur, cur+delta) {
+					break
+				}
+			}
 		}
 		if h.finalReserved == 0 {
-			h.e.frozenBytes.Add(int64(len(image)))
 			h.e.readerBytes.Add(int64(len(image)))
 			h.finalReserved = int64(len(image))
 		} else {
-			d := int64(len(image)) - h.finalReserved
-			h.e.frozenBytes.Add(d)
-			h.e.readerBytes.Add(d)
+			h.e.readerBytes.Add(int64(len(image)) - h.finalReserved)
 			h.finalReserved = int64(len(image))
 		}
 		h.finalImage = image
@@ -1113,13 +1166,21 @@ func (h *stagingHandle) publishFinalImageLocked(image []byte) {
 }
 
 // refreshFinalFromLivePath captures the object's current bytes (the name
-// still resolves — a removal is about to destroy it) as the claim's frozen
-// reader backing. Post-removal reads answer the frozen image, so it must
-// carry the final content — a second writer may have flushed past the
-// claim's open-time prefix. Bounded: a name grown past the staging bound
-// keeps its existing image (the bytes live on in the plane below; only
-// the in-memory fallback copy is skipped). Readers with their own
-// snapshot never move backward: their copy outranks the frozen image.
+// still resolves — a removal or replacement is about to destroy its claim
+// to it) as the claim's frozen reader backing. Post-removal reads answer
+// the frozen image, so it must carry the final content — a later writer
+// may have flushed past every reader's last observation. The read runs
+// through a TRANSIENT read-only below handle (never cached — a released
+// claim's session() would return an uncached handle that nothing later
+// releases — and never creating: the name is about to die). The captured
+// bytes are COPIED to their exact length: publishing a prefix of the
+// bounded read buffer would retain the whole staging-bound allocation
+// under a small reservation. Every reader then adopts the refreshed image
+// as its own (private snapshots and their budget reservations are
+// refunded): this is the object's terminal state — nothing fresher can
+// exist — so no descriptor keeps an older prefix. Bounded: a name grown
+// past the staging bound keeps its existing image (the bytes live on in
+// the plane below; only the in-memory fallback copy is skipped).
 func (h *stagingHandle) refreshFinalFromLivePath(ctx context.Context) {
 	h.mu.Lock()
 	need := h.passthrough && h.promoted == nil && h.spill == nil && !h.unlinked && len(h.readers) > 0
@@ -1127,13 +1188,34 @@ func (h *stagingHandle) refreshFinalFromLivePath(ctx context.Context) {
 	if !need {
 		return
 	}
-	data, err := h.readAll(ctx, 0, stagingMaxBufferedBytes+1)
-	if err != nil || len(data) == 0 || int64(len(data)) > stagingMaxBufferedBytes {
+	opened, err := h.below.Open(ctx, h.path, fs.OpenFlags(uint32(syscall.O_RDONLY)))
+	if err != nil {
 		return
 	}
+	buf := make([]byte, stagingMaxBufferedBytes+1)
+	n, rerr := opened.Read(ctx, 0, buf)
+	_ = opened.Release(ctx)
+	if rerr != nil && rerr != io.EOF {
+		return
+	}
+	if n <= 0 || int64(n) > stagingMaxBufferedBytes {
+		return
+	}
+	image := append([]byte(nil), buf[:n]...)
 	h.mu.Lock()
-	h.publishFinalImageLocked(data)
-	h.mu.Unlock()
+	defer h.mu.Unlock()
+	h.publishFinalImageLocked(image)
+	if len(h.finalImage) == 0 {
+		return // refused (budget): readers keep their own backings
+	}
+	for r := range h.readers {
+		if r.reserved > 0 {
+			h.e.readerBytes.Add(-r.reserved)
+			r.reserved = 0
+		}
+		r.image = h.finalImage
+		r.shared = true
+	}
 }
 
 // refundFinalImageLocked releases the frozen image's budget reservation

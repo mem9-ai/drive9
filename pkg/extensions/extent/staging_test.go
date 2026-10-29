@@ -8,6 +8,7 @@ package extent
 
 import (
 	"context"
+	"fmt"
 	"net/http/httptest"
 	"os"
 	"strconv"
@@ -2832,5 +2833,387 @@ func TestFrozenImagesAreBoundedAcrossRetiredClaims(t *testing.T) {
 	}
 	if got := sh.e.frozenBytes.Load(); got != readerBytesCap {
 		t.Fatalf("frozen budget after drain = %d, want the saturated %d (nothing was reserved, nothing refunded)", got, readerBytesCap)
+	}
+}
+
+// --- round-4 review (5693425715): removal-after-release, rename-over,
+// ordinary-close freshness, retained memory, synchronized guard ---
+
+// TestUnlinkAfterWritersReleaseKeepsCurrentBytes (round-4 finding 1): the
+// removal happens AFTER both writers released, with no intervening reader
+// read — the pre-removal refresh must still capture the object's CURRENT
+// bytes (the second writer's flush) and every reader must answer them,
+// both snapshot-budget states included. The refresh's transient handle
+// must leave nothing behind (released claim ⇒ nothing cached, nothing
+// leaked at drain).
+func TestUnlinkAfterWritersReleaseKeepsCurrentBytes(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		exhaus bool
+	}{
+		{"snapshotted reader", false},
+		{"snapshotless reader", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := testbackend.NewBackend()
+			ch := newWritebackStack(t, b, 64*1024)
+			ctx := context.Background()
+
+			fd1 := openForWrite(t, ch, "/cu")
+			if err := fd1.Write(ctx, 0, []byte("abc")); err != nil {
+				t.Fatal(err)
+			}
+			sh := fd1.(*stagingHandle)
+			if tc.exhaus {
+				sh.e.readerBytes.Add(readerBytesCap)
+				t.Cleanup(func() { sh.e.readerBytes.Add(-readerBytesCap) })
+			}
+			readerRes, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/cu", Flags: uint32(syscall.O_RDONLY)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			r := readerRes.Handle
+			res2, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/cu", Flags: uint32(syscall.O_RDWR)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			fd2 := res2.Handle // surrender
+			if err := fd2.Write(ctx, 3, []byte("def")); err != nil {
+				t.Fatal(err)
+			}
+			if err := fd2.Flush(ctx); err != nil {
+				t.Fatal(err)
+			}
+			// Both writers close with NO intervening reader read.
+			if err := fd1.Release(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := fd2.Release(ctx); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/cu"}); err != nil {
+				t.Fatal(err)
+			}
+
+			// The FIRST read happens only now — the object's final bytes.
+			buf := make([]byte, 6)
+			if n, rerr := r.Read(ctx, 0, buf); rerr != nil || string(buf[:n]) != "abcdef" {
+				t.Fatalf("first read after unlink-then-release = %q n=%d err=%v, want abcdef", buf[:n], n, rerr)
+			}
+			if err := r.Release(ctx); err != nil {
+				t.Fatal(err)
+			}
+			// Complete lower-handle cleanup: nothing retained at drain.
+			sh.mu.Lock()
+			inner := sh.inner
+			sh.mu.Unlock()
+			if inner != nil {
+				t.Fatal("a below handle survived the full drain — the refresh leaked a session")
+			}
+		})
+	}
+}
+
+// TestRenameOverReaderFileKeepsCurrentBytes (round-4 finding 2): a reader
+// open on the DESTINATION of a rename must answer the overwritten object's
+// CURRENT bytes (the second writer's flush included), captured before the
+// name is re-keyed — not the surrender-time prefix. The moved-in file owns
+// the name untouched afterwards.
+func TestRenameOverReaderFileKeepsCurrentBytes(t *testing.T) {
+	b := testbackend.NewBackend()
+	ch := newWritebackStack(t, b, 64*1024)
+	ctx := context.Background()
+
+	src := openForWrite(t, ch, "/src")
+	if err := src.Write(ctx, 0, []byte("SRC-CONTENT")); err != nil {
+		t.Fatal(err)
+	}
+	if err := src.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	fd1 := openForWrite(t, ch, "/dst")
+	if err := fd1.Write(ctx, 0, []byte("abc")); err != nil {
+		t.Fatal(err)
+	}
+	readerRes, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/dst", Flags: uint32(syscall.O_RDONLY)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := readerRes.Handle
+	res2, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/dst", Flags: uint32(syscall.O_RDWR)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fd2 := res2.Handle // surrender
+	if err := fd2.Write(ctx, 3, []byte("def")); err != nil {
+		t.Fatal(err)
+	}
+	if err := fd2.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/src", Path2: "/dst"}); err != nil {
+		t.Fatal(err)
+	}
+
+	buf := make([]byte, 6)
+	if n, rerr := r.Read(ctx, 0, buf); rerr != nil || string(buf[:n]) != "abcdef" {
+		t.Fatalf("read after rename-over = %q n=%d err=%v, want abcdef (the overwritten object's final bytes)", buf[:n], n, rerr)
+	}
+	if err := fd1.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := fd2.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n, rerr := r.Read(ctx, 0, buf); rerr != nil || string(buf[:n]) != "abcdef" {
+		t.Fatalf("read after rename-over+writers closed = %q n=%d err=%v, want abcdef", buf[:n], n, rerr)
+	}
+	if err := r.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// The moved-in file owns the destination name.
+	dstRes, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/dst", Flags: uint32(syscall.O_RDONLY)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbuf := make([]byte, 11)
+	if n, rerr := dstRes.Handle.Read(ctx, 0, dbuf); rerr != nil || string(dbuf[:n]) != "SRC-CONTENT" {
+		t.Fatalf("destination after rename = %q n=%d err=%v, want SRC-CONTENT", dbuf[:n], n, rerr)
+	}
+	if err := dstRes.Handle.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestOrdinaryCloseReaderTracksLaterWriters (round-4 finding 3): an
+// ordinary classic close (no surrender, no spill, no promotion) retains
+// the descriptor for its readers — and those reads must observe the
+// file's CURRENT state: a later writer's append AND a later truncate,
+// while the original reader stays open.
+func TestOrdinaryCloseReaderTracksLaterWriters(t *testing.T) {
+	b := testbackend.NewBackend()
+	ch := newWritebackStack(t, b, 64*1024)
+	ctx := context.Background()
+
+	fd1 := openForWrite(t, ch, "/oc")
+	if err := fd1.Write(ctx, 0, []byte("abc")); err != nil {
+		t.Fatal(err)
+	}
+	readerRes, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/oc", Flags: uint32(syscall.O_RDONLY)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := readerRes.Handle
+	if err := fd1.Release(ctx); err != nil { // ordinary close, readers open
+		t.Fatal(err)
+	}
+
+	// A later writable descriptor appends and flushes.
+	res2, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/oc", Flags: uint32(syscall.O_RDWR)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fd2 := res2.Handle
+	if err := fd2.Write(ctx, 3, []byte("def")); err != nil {
+		t.Fatal(err)
+	}
+	if err := fd2.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 6)
+	if n, rerr := r.Read(ctx, 0, buf); rerr != nil || string(buf[:n]) != "abcdef" {
+		t.Fatalf("read after later append = %q n=%d err=%v, want abcdef", buf[:n], n, rerr)
+	}
+
+	// A later truncate (ftruncate through the second descriptor) shrinks
+	// the object; the reader answers the NEW state (bytes past the new
+	// EOF read as zero bytes).
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpSetAttr, Path: "/oc", HasSize: true, Size: 1, Handle: fd2}); err != nil {
+		t.Fatal(err)
+	}
+	// The truncating descriptor restages (any real second process closes
+	// or flushes after ftruncate): the claim reader must catch up to the
+	// committed state — never stay frozen at the pre-truncate bytes.
+	if err := fd2.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n, rerr := r.Read(ctx, 0, buf); rerr != nil || n != 1 || string(buf[:n]) != "a" {
+		t.Fatalf("read after truncate = %q n=%d err=%v, want a", buf[:n], n, rerr)
+	}
+	if n, rerr := r.Read(ctx, 1, buf); rerr != nil || n != 0 {
+		t.Fatalf("read past new EOF = n=%d err=%v, want 0", n, rerr)
+	}
+	if err := fd2.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestRetiredClaimMemoryIsBoundedAndCleared (round-4 finding 4): repeated
+// create → retain reader → close claims must not accumulate memory once
+// both budgets are exhausted — each retired claim's buffered image is
+// CLEARED at close (nothing escapes the accounting through c.claim), the
+// frozen budget never crosses the cap under CONCURRENT publication, and
+// every refused reader still reads its exact bytes by path.
+func TestRetiredClaimMemoryIsBoundedAndCleared(t *testing.T) {
+	b := testbackend.NewBackend()
+	ch := newWritebackStack(t, b, 64*1024)
+	ctx := context.Background()
+
+	// Exhaust the frozen budget exactly at the cap, like a history of
+	// retired claims with retained readers.
+	probe := openForWrite(t, ch, "/probe-ext")
+	ext := probe.(*stagingHandle).e
+	if err := probe.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	ext.frozenBytes.Add(readerBytesCap)
+	t.Cleanup(func() { ext.frozenBytes.Add(-readerBytesCap) })
+
+	// Repeated retired claims: images cleared, publications refused,
+	// readers exact.
+	var readers []fs.Handle
+	var claims []*stagingHandle
+	for i := 0; i < 8; i++ {
+		p := fmt.Sprintf("/acc%d", i)
+		fd := openForWrite(t, ch, p)
+		payload := []byte(fmt.Sprintf("payload-%02d", i))
+		if err := fd.Write(ctx, 0, payload); err != nil {
+			t.Fatal(err)
+		}
+		sh := fd.(*stagingHandle)
+		readerRes, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: p, Flags: uint32(syscall.O_RDONLY)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := fd.Release(ctx); err != nil {
+			t.Fatal(err)
+		}
+		sh.mu.Lock()
+		imgLen, frozenLen := len(sh.image), len(sh.finalImage)
+		sh.mu.Unlock()
+		if imgLen != 0 {
+			t.Fatalf("claim %d kept its buffered image (%d bytes) past the close — retained outside every budget", i, imgLen)
+		}
+		if frozenLen != 0 {
+			t.Fatalf("claim %d published a frozen image (%d bytes) past the saturated budget", i, frozenLen)
+		}
+		if got := ext.frozenBytes.Load(); got != readerBytesCap {
+			t.Fatalf("frozen budget moved to %d, want the saturated %d", got, readerBytesCap)
+		}
+		readers = append(readers, readerRes.Handle)
+		claims = append(claims, sh)
+	}
+	for i, r := range readers {
+		want := fmt.Sprintf("payload-%02d", i)
+		buf := make([]byte, len(want))
+		if n, rerr := r.Read(ctx, 0, buf); rerr != nil || string(buf[:n]) != want {
+			t.Fatalf("refused reader %d read = %q n=%d err=%v, want %q via the live path", i, buf[:n], n, rerr, want)
+		}
+	}
+
+	// Concurrent publication just under the cap: leave room for exactly
+	// ONE seven-byte publication and race eight — the CAS admission must
+	// keep the aggregate at or under the cap no matter the interleaving.
+	ext.frozenBytes.Add(-10)
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			sh := claims[i]
+			sh.mu.Lock()
+			sh.publishFinalImageLocked([]byte(fmt.Sprintf("race-%02d", i))) // 7 bytes
+			sh.mu.Unlock()
+		}(i)
+	}
+	wg.Wait()
+	if got := ext.frozenBytes.Load(); got > readerBytesCap-10+7 || got < readerBytesCap-10 {
+		t.Fatalf("frozen budget after concurrent publication = %d, want within [%d, %d] (CAS keeps the cap)", got, readerBytesCap-10, readerBytesCap-10+7)
+	}
+	for _, r := range readers {
+		_ = r.Release(ctx)
+	}
+}
+
+// TestConcurrentReadsDuringRemoval (round-4 finding 5): a passthrough
+// reader read racing unlink / rename-overwrite must be race-free (the
+// identity guard reads synchronized state) and every observed answer must
+// be one of the coherent states, never garbage.
+func TestConcurrentReadsDuringRemoval(t *testing.T) {
+	for _, op := range []string{"unlink", "rename-over"} {
+		t.Run(op, func(t *testing.T) {
+			b := testbackend.NewBackend()
+			ch := newWritebackStack(t, b, 64*1024)
+			ctx := context.Background()
+
+			fd1 := openForWrite(t, ch, "/race")
+			if err := fd1.Write(ctx, 0, []byte("abc")); err != nil {
+				t.Fatal(err)
+			}
+			readerRes, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/race", Flags: uint32(syscall.O_RDONLY)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			r := readerRes.Handle
+			res2, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/race", Flags: uint32(syscall.O_RDWR)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			fd2 := res2.Handle // surrender: passthrough claim
+			if err := fd2.Write(ctx, 3, []byte("def")); err != nil {
+				t.Fatal(err)
+			}
+			_ = fd2.Flush(ctx)
+
+			stop := make(chan struct{})
+			var wg sync.WaitGroup
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				buf := make([]byte, 6)
+				for {
+					select {
+					case <-stop:
+						return
+					default:
+					}
+					n, _ := r.Read(ctx, 0, buf)
+					got := string(buf[:n])
+					if got != "abc" && got != "abcdef" && got != "" {
+						t.Errorf("incoherent read during removal: %q", got)
+						return
+					}
+				}
+			}()
+			if op == "unlink" {
+				if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/race"}); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				other := openForWrite(t, ch, "/other")
+				if err := other.Write(ctx, 0, []byte("OTHER")); err != nil {
+					t.Fatal(err)
+				}
+				if err := other.Release(ctx); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/other", Path2: "/race"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			close(stop)
+			wg.Wait()
+			_ = fd1.Release(ctx)
+			_ = fd2.Release(ctx)
+			if err := r.Release(ctx); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }

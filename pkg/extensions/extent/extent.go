@@ -358,6 +358,11 @@ func (e *Extent) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, er
 			// staging claims, the cached extent identity of whatever it
 			// used to be) is dropped through invalidation instead, without
 			// touching the server object the rename just replaced.
+			// The destination's registered claims lose their name to the
+			// moved object: their readers get the destination object's CURRENT
+			// bytes captured first (the write plane below re-keys the name at
+			// the rename — reading after it would serve the REPLACEMENT).
+			e.paths.refreshRegisteredForRemoval(ctx, op.Path2, false)
 			if err := e.renameIno(ctx, op, ino); err != nil {
 				return fs.Result{}, err
 			}
@@ -382,6 +387,10 @@ func (e *Extent) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, er
 		// unlink there would delete the moved-in file (the projection row
 		// rides the name), which the EC2 e2e caught as the destination
 		// vanishing server-side.
+		// The destination's registered claims lose their name to the moved
+		// source: their readers get the destination object's CURRENT bytes
+		// captured first — after the rename the name serves the REPLACEMENT.
+		e.paths.refreshRegisteredForRemoval(ctx, op.Path2, false)
 		res, err := e.mutateStaging(ctx, op, next)
 		if err != nil {
 			return res, err
