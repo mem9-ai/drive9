@@ -20,7 +20,6 @@ import (
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/extensions/appendlog"
-	"github.com/mem9-ai/drive9/pkg/extensions/bulkfile"
 	"github.com/mem9-ai/drive9/pkg/extensions/cache"
 	"github.com/mem9-ai/drive9/pkg/extensions/core"
 	"github.com/mem9-ai/drive9/pkg/extensions/extent"
@@ -91,7 +90,11 @@ type MountConfig struct {
 
 	AppendLogPatterns []string
 	PackPaths         []string
-	ExtentPaths       []string
+	// ExtentFullMode routes every fresh create through the JuiceFS engine
+	// plane (extent layout for all sizes). Set by the builtin "extent"
+	// mount profile; default mounts stay hybrid — creation on the classic
+	// plane, large files promoted to extent at the inline cutoff.
+	ExtentFullMode bool
 
 	UploadConcurrency     int
 	DirCacheMaxEntries    int
@@ -185,15 +188,15 @@ func (cfg MountConfig) toProfilingOptions() perf.ProfilingOptions {
 // It is the exact reverse of the historical wired chain, so the default
 // wires byte-identically to the pre-flag code.
 var defaultExtensionOrder = []string{
-	"core", "sse", "writeback", "xattr", "specials", "bulkfile",
-	"appendlog", "extent", "git", "layer", "localize", "renameguard", "cache",
+	"core", "sse", "writeback", "xattr", "specials", "extent",
+	"appendlog", "git", "layer", "localize", "renameguard", "cache",
 }
 
 // knownExtensionNames guards --extensions against typos (an unknown name
 // would otherwise silently not wire).
 var knownExtensionNames = map[string]bool{
-	"core": true, "sse": true, "writeback": true, "xattr": true,
-	"specials": true, "bulkfile": true, "appendlog": true, "extent": true,
+	"core": true, "sse": true, "extent": true, "writeback": true,
+	"xattr": true, "specials": true, "appendlog": true,
 	"git": true, "layer": true, "localize": true, "renameguard": true,
 	"cache": true,
 }
@@ -313,7 +316,7 @@ type MountOptions struct {
 	DisableBuiltinOverlayDefaults bool
 	AppendLogPatterns             []string // remote-persistent files eligible for append-log synchronization
 	PackPaths                     []string // local overlay paths auto-packed after unmount
-	ExtentPaths                   []string // path globs created as content_layout=extent
+	ExtentFullMode                bool     // builtin "extent" profile: every create rides the engine plane
 	CommitQueueMaxPending         int      // CommitQueue backpressure bound (default 100; 0 default)
 	WriteBackBatchWindow          time.Duration
 	WriteBackBatchMaxFiles        int
@@ -428,7 +431,7 @@ func mountConfigFromOptions(opts *MountOptions) MountConfig {
 		DisableBuiltinOverlayDefaults: opts.DisableBuiltinOverlayDefaults,
 		AppendLogPatterns:             opts.AppendLogPatterns,
 		PackPaths:                     opts.PackPaths,
-		ExtentPaths:                   opts.ExtentPaths,
+		ExtentFullMode:                opts.ExtentFullMode,
 		UploadConcurrency:             opts.UploadConcurrency,
 		DirCacheMaxEntries:            opts.DirCacheMaxEntries,
 		CommitQueueMaxPending:         opts.CommitQueueMaxPending,
@@ -958,31 +961,30 @@ func mountWithConfig(cfg MountConfig) error {
 		}
 	}
 
-	// The extent plane claims ahead of the classic data path (cache and
-	// writeback never see extent files). Gated on the --extent paths /
-	// profile [extent] section only: the cache dir falls back to the
-	// per-user default like every other cache-backed component, so it is
-	// never the enabling condition.
-	var extentExt *extent.Extent
-	// Build the extent reader whenever the stack requests it, even with
-	// no local ExtentPaths: files created by another extent-enabled mount
-	// still carry ExtentIno in listings/stats, and the server answers
-	// their reads with 422 unless the JuiceFS-backed reader routes them.
-	// An empty ExtentPaths only skips the JuiceFS runtime discovery.
+	// The extent plane: the community JuiceFS engine (vfs + chunk store)
+	// on the v2 wire protocol, claiming extent files above the write
+	// plane — claimed handles own their buffering through the engine, not
+	// writeback. Armed by default: fresh creates ride the classic write
+	// plane, which promotes large images to extent layout at the inline
+	// cutoff (files that used to become multipart become extent instead);
+	// the engine serves them from the next open. Legacy servers degrade
+	// the promotion to classic multipart silently.
 	if wantExt["extent"] {
-		extentExt, err = extent.New(extent.Options{
-			ExtentPaths: cfg.ExtentPaths,
-			Client:      cl,
-			RemoteRoot:  remoteRoot,
-			CacheDir:    cacheScopedDir(cacheBase, mountHash, "jfs"),
-			// v1: write-sync mounts pay a per-Write VFS flush on the extent
-			// plane too.
-			Policy: cfg.WritePolicy,
+		engine := extent.NewEngine(extent.EngineConfig{
+			Client:     cl,
+			RemoteRoot: remoteRoot,
+			CacheDir:   cacheScopedDir(cacheBase, mountHash, "jfs-engine"),
 		})
-		if err != nil {
-			return fmt.Errorf("fuse: extent extension: %w", err)
+		engineThreshold := int64(1) // hybrid: creation stays on the classic plane
+		if cfg.ExtentFullMode {
+			engineThreshold = 0 // the builtin "extent" profile: engine from byte zero
 		}
-		built["extent"] = extentExt
+		built["extent"] = extent.New(extent.Options{
+			Engine:     engine,
+			Threshold:  engineThreshold,
+			SyncPolicy: cfg.WritePolicy,
+			Events:     bus,
+		})
 	}
 
 	var appendExt *appendlog.AppendLog
@@ -992,18 +994,6 @@ func mountWithConfig(cfg MountConfig) error {
 			return fmt.Errorf("fuse: appendlog extension: %w", err)
 		}
 		built["appendlog"] = appendExt
-	}
-
-	// The bulk data plane claims fresh truncate-writers (S3 multipart for
-	// large images) only after the view/routing handlers have had their
-	// claim, and before the buffered write path. A write-sync mount commits
-	// every write inline below — the buffered-image claim stays out.
-	if wantExt["bulkfile"] {
-		bulkExt, berr := bulkfile.New(bulkfile.Options{Client: cl, RemoteRoot: remoteRoot, Events: bus, Policy: cfg.WritePolicy})
-		if berr != nil {
-			return fmt.Errorf("fuse: bulkfile extension: %w", berr)
-		}
-		built["bulkfile"] = bulkExt
 	}
 
 	if wantExt["specials"] {
@@ -1050,6 +1040,10 @@ func mountWithConfig(cfg MountConfig) error {
 			BatchWindow:           cfg.WriteBackBatchWindow,
 			BatchMaxFiles:         cfg.WriteBackBatchMaxFiles,
 			BatchMaxBytes:         cfg.WriteBackBatchMaxBytes,
+			// The extent plane and its write-plane branch arm together:
+			// the engine serves extent reads, the commit queue promotes
+			// fresh large files (multipart's successor).
+			ExtentTakeover: wantExt["extent"],
 			// gvisor-compat takes precedence and always keeps commits
 			// detached (v1).
 			InterruptibleCommits:    cfg.LegacyInterruptibleMutations && !cfg.GVisorCompat,

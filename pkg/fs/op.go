@@ -73,12 +73,6 @@ type Attr struct {
 	HasGID bool
 	Rdev   uint32
 	Atime  time.Time
-	// ExtentIno is the object-store inode the server reports for
-	// extent-layout listing rows (0 = not an extent object). A listing row
-	// is the only layout signal readdir gets: when the row carries the
-	// inode the facade stamps it; when it does not, nothing may be invented
-	// and stale routing must be cleared.
-	ExtentIno uint64
 	// ResourceID is the server's object identity for the path: two paths
 	// sharing one are hardlinks of the same object and share a FUSE inode
 	// (v1 LookupWithIdentity). Empty = unknown.

@@ -67,12 +67,23 @@ type presignedPart struct {
 	ChecksumSHA256 string            `json:"checksum_sha256,omitempty"`
 	Headers        map[string]string `json:"headers,omitempty"`
 	ExpiresAt      time.Time         `json:"expires_at"`
+	// SkipUpload marks an extent block whose content the object store
+	// already holds (dedupe): the PUT is skipped and complete carries the
+	// checksum alone.
+	SkipUpload bool `json:"skip_upload,omitempty"`
 }
 
 // completePart is sent to the v2 complete endpoint.
 type completePart struct {
 	Number int    `json:"number"`
 	ETag   string `json:"etag"`
+	// Extent-layout sessions only: the slice this part published. Zero
+	// values on a sequential session derive from the part number, the
+	// session's part size, and its total size.
+	Chunk uint32 `json:"chunk,omitempty"`
+	Off   uint32 `json:"off,omitempty"`
+	BOff  uint32 `json:"boff,omitempty"`
+	Size  int64  `json:"size,omitempty"`
 }
 
 // ProgressFunc is called after each part upload completes.
@@ -705,6 +716,34 @@ func runPreCompleteCheck(ctx context.Context, check func() error) error {
 	return ctx.Err()
 }
 
+// uploadClassicSession drives the classic v2 pipeline on an
+// already-initiated session. Used by WriteExtentStreamConditional when a
+// legacy server ignored the layout field and answered a classic plan.
+func (c *Client) uploadClassicSession(ctx context.Context, plan *uploadPlanV2, ra io.ReaderAt, progress ProgressFunc) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	parallelism := boundedUploadParallelism(plan.PartSize, plan.TotalParts)
+	presignCh := make(chan presignedPart, parallelism)
+	presignErrCh := make(chan error, 1)
+	presignRecorder := &uploadDurationRecorder{}
+
+	go func() {
+		c.presignPipeline(ctx, plan, parallelism, presignCh, presignErrCh, presignRecorder)
+	}()
+
+	parts, err := c.uploadPartsV2(ctx, plan, ra, presignCh, presignErrCh, presignRecorder, progress)
+	if err != nil {
+		c.abortUploadV2BestEffort(ctx, plan.UploadID)
+		return err
+	}
+	if err := c.completeUploadV2WithOptions(ctx, plan.UploadID, parts, nil, ""); err != nil {
+		c.abortUploadV2BestEffort(ctx, plan.UploadID)
+		return err
+	}
+	return nil
+}
+
 type uploadInitiateRequest struct {
 	Path             string   `json:"path"`
 	TotalSize        int64    `json:"total_size"`
@@ -1001,6 +1040,13 @@ func (c *Client) completeUploadWithOptions(ctx context.Context, uploadID string,
 // initiateUploadV2 calls POST /v2/uploads/initiate.
 // Returns errV2NotAvailable if the server responds with 404.
 func (c *Client) initiateUploadV2(ctx context.Context, path string, size int64, expectedRevision int64, description string) (*uploadPlanV2, error) {
+	return c.initiateUploadV2WithLayout(ctx, path, size, expectedRevision, description, "")
+}
+
+// initiateUploadV2WithLayout starts a v2 upload session; layout "extent"
+// asks for an extent sequential session. Servers that predate the field
+// ignore it and answer a classic plan (Key != "").
+func (c *Client) initiateUploadV2WithLayout(ctx context.Context, path string, size int64, expectedRevision int64, description, layout string) (*uploadPlanV2, error) {
 	if err := validateFSPath(path); err != nil {
 		return nil, err
 	}
@@ -1009,7 +1055,8 @@ func (c *Client) initiateUploadV2(ctx context.Context, path string, size int64, 
 		TotalSize        int64  `json:"total_size"`
 		ExpectedRevision *int64 `json:"expected_revision,omitempty"`
 		Description      string `json:"description,omitempty"`
-	}{Path: path, TotalSize: size, ExpectedRevision: expectedRevisionField(expectedRevision), Description: description})
+		Layout           string `json:"layout,omitempty"`
+	}{Path: path, TotalSize: size, ExpectedRevision: expectedRevisionField(expectedRevision), Description: description, Layout: layout})
 	if err != nil {
 		return nil, err
 	}
@@ -1386,14 +1433,9 @@ func (c *Client) ReadStream(ctx context.Context, path string) (io.ReadCloser, er
 	}
 
 	switch {
-	case resp.StatusCode == http.StatusUnprocessableEntity:
-		ino, length, ok := extentHintFromResponse(resp)
-		if !ok {
-			defer func() { _ = resp.Body.Close() }()
-			return nil, readError(resp)
-		}
-		_ = resp.Body.Close()
-		return c.openExtentStream(ctx, ino, length, 0, 0)
+	case resp.StatusCode < 300 && ContentLayout(resp.Header.Get("X-Dat9-Content-Layout")) == ContentLayoutExtent:
+		// Extent layout: the body is a JSON block read plan, not bytes.
+		return c.serveExtentPlan(ctx, path, resp)
 
 	case resp.StatusCode == http.StatusFound || resp.StatusCode == http.StatusTemporaryRedirect:
 		// Large file: follow presigned URL
@@ -1465,9 +1507,6 @@ func (c *Client) resolveReadTarget(ctx context.Context, path string) (*ReadTarge
 		return &ReadTarget{ObjectURL: location}, nil
 
 	case resp.StatusCode == http.StatusUnprocessableEntity:
-		if _, _, ok := extentHintFromResponse(resp); ok {
-			return nil, errReadTargetNoRedirect
-		}
 		return nil, readError(resp)
 
 	case resp.StatusCode >= 300:
@@ -1525,14 +1564,9 @@ func (c *Client) ReadStreamRange(ctx context.Context, path string, offset, lengt
 	}
 
 	switch {
-	case resp.StatusCode == http.StatusUnprocessableEntity:
-		ino, fileLen, ok := extentHintFromResponse(resp)
-		if !ok {
-			defer func() { _ = resp.Body.Close() }()
-			return nil, readError(resp)
-		}
-		_ = resp.Body.Close()
-		return c.openExtentStream(ctx, ino, fileLen, offset, length)
+	case resp.StatusCode < 300 && ContentLayout(resp.Header.Get("X-Dat9-Content-Layout")) == ContentLayoutExtent:
+		// Extent layout: the plan tiles exactly the requested window.
+		return c.serveExtentPlan(ctx, path, resp)
 
 	case resp.StatusCode == http.StatusFound || resp.StatusCode == http.StatusTemporaryRedirect:
 		_ = resp.Body.Close()

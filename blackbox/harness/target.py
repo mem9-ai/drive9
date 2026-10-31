@@ -573,7 +573,7 @@ class Drive9FuseTargetProvider:
             command.extend(["--profile", effective_profile])
         if durability:
             command.extend(["--durability", durability])
-        if effective_profile and effective_profile not in ("none", "extent", "interactive"):
+        if effective_profile and effective_profile not in ("none", "interactive"):
             command.extend(["--local-root", str(local_root)])
         if read_only:
             command.append("--read-only")
