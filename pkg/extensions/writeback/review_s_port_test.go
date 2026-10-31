@@ -63,6 +63,12 @@ func TestPortPostCASOpenKeepsOwnership(t *testing.T) {
 // read observes the replaced backend image; dirty accounting sees the
 // dirty writer.
 func TestPortCheckoutSweepAndDirtyCountUseHandleKeys(t *testing.T) {
+	for _, event := range []fs.EventKind{fs.EventCheckout, fs.EventUnverified} {
+		t.Run(event.String(), func(t *testing.T) { testPortCheckoutSweepAndDirtyCountUseHandleKeys(t, event) })
+	}
+}
+
+func testPortCheckoutSweepAndDirtyCountUseHandleKeys(t *testing.T, event fs.EventKind) {
 	b := testbackend.NewBackend()
 	b.Seed("/f", []byte("AAAA"))
 	ts := httptest.NewServer(b)
@@ -92,7 +98,7 @@ func TestPortCheckoutSweepAndDirtyCountUseHandleKeys(t *testing.T) {
 	}
 	// Replace the backend image and reset the view.
 	b.Seed("/f", []byte("BBBB"))
-	bus.Emit(fs.Event{Kind: fs.EventCheckout, Path: "/"})
+	bus.Emit(fs.Event{Kind: event, Path: "/"})
 	// The clean-buffer sweep ran (keyed iteration): the dirty buffer is
 	// this mount's own data and survives the checkout.
 	h.mu.Lock()
@@ -130,4 +136,48 @@ func TestPortFDTruncateNamedDescriptorWriteback(t *testing.T) {
 		t.Fatalf("named descriptor read = %q (%d) err=%v, want he", got[:n], n, err)
 	}
 	_ = h2
+}
+
+// A clean buffered image must not hide a remote change after continuity
+// is lost. Dirty images are covered by the paired sweep test above.
+func TestUnverifiedDropsCleanBuffer(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/f", []byte("OLD"))
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	bus := fs.NewEventBus()
+	wb, err := New(Options{Policy: PolicyWriteBack, Client: cl, Events: bus})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chain, err := fs.NewChain(wb, terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	res, err := chain.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/f", Flags: uint32(syscall.O_RDWR)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := writebackHandleOf(res.Handle)
+	t.Cleanup(func() { _ = h.Release(ctx) })
+	h.mu.Lock()
+	err = h.ensureBufferLocked(ctx)
+	hasCleanBuffer := h.buf != nil && !h.dirty
+	h.mu.Unlock()
+	if err != nil || !hasCleanBuffer {
+		t.Fatalf("clean preload: %v, ready=%v", err, hasCleanBuffer)
+	}
+	b.Seed("/f", []byte("NEW"))
+	bus.Emit(fs.Event{Kind: fs.EventUnverified, Path: "/"})
+	buf := make([]byte, 3)
+	n, err := h.Read(ctx, 0, buf)
+	if err != nil || string(buf[:n]) != "NEW" {
+		t.Fatalf("read=%q err=%v want NEW", buf[:n], err)
+	}
 }

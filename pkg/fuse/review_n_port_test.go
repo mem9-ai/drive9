@@ -115,6 +115,12 @@ func (e *errStatTerminal) Do(ctx context.Context, op *fs.Op, _ fs.Next) (fs.Resu
 
 // A checkout reset drops the open directory handles' snapshots.
 func TestPortCheckoutResetsOpenDirSnapshots(t *testing.T) {
+	for _, event := range []fs.EventKind{fs.EventCheckout, fs.EventUnverified} {
+		t.Run(event.String(), func(t *testing.T) { testPortCheckoutResetsOpenDirSnapshots(t, event) })
+	}
+}
+
+func testPortCheckoutResetsOpenDirSnapshots(t *testing.T, event fs.EventKind) {
 	core := newMemCore()
 	core.paths["/d"] = &memEntry{isDir: true, mode: 0o755}
 	core.paths["/d/f"] = &memEntry{mode: 0o644}
@@ -133,7 +139,7 @@ func TestPortCheckoutResetsOpenDirSnapshots(t *testing.T) {
 		t.Fatal("dir handle missing")
 	}
 	dh.entries = []fs.Entry{{Name: "stale"}}
-	bus.Emit(fs.Event{Kind: fs.EventCheckout, Path: "/"})
+	bus.Emit(fs.Event{Kind: event, Path: "/"})
 	if dh.entries != nil {
 		t.Fatal("checkout left the open dir snapshot in place")
 	}
@@ -197,6 +203,12 @@ func (b *blockingDirCache) InvalidateAll()                          { b.inner.In
 // reset: a listing whose Put was in flight cannot land AFTER the reset's
 // sweep.
 func TestPortListingPublishIsAtomicWithReset(t *testing.T) {
+	for _, event := range []fs.EventKind{fs.EventCheckout, fs.EventUnverified} {
+		t.Run(event.String(), func(t *testing.T) { testPortListingPublishIsAtomicWithReset(t, event) })
+	}
+}
+
+func testPortListingPublishIsAtomicWithReset(t *testing.T, event fs.EventKind) {
 	core := newMemCore()
 	core.paths["/d"] = &memEntry{isDir: true, mode: 0o755}
 	core.paths["/d/f"] = &memEntry{mode: 0o644}
@@ -221,7 +233,7 @@ func TestPortListingPublishIsAtomicWithReset(t *testing.T) {
 	<-bc.entered
 	resetDone := make(chan struct{})
 	go func() {
-		bus.Emit(fs.Event{Kind: fs.EventCheckout, Path: "/"})
+		bus.Emit(fs.Event{Kind: event, Path: "/"})
 		close(resetDone)
 	}()
 	select {

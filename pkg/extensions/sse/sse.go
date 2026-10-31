@@ -29,11 +29,11 @@ type Options struct {
 // SSE is the watcher service. It implements fs.Lifecycle: the chain starts
 // it at mount and stops it at unmount.
 type SSE struct {
-	opts    Options
-	root    string
-	cancel  context.CancelFunc
-	doneCh  chan struct{}
-	current bool
+	opts       Options
+	root       string
+	cancel     context.CancelFunc
+	doneCh     chan struct{}
+	unverified bool // caches may have filled while the stream was disconnected
 }
 
 func New(opts Options) (*SSE, error) {
@@ -62,20 +62,30 @@ func (w *SSE) Start(ctx context.Context) error {
 	go func() {
 		defer close(w.doneCh)
 		w.opts.Client.WatchEventsWithLifecycle(ctx, w.opts.Actor, w.handleEvent, client.EventLifecycle{
-			OnCurrent:      func(uint64) { w.current = true },
+			OnCurrent:      func(uint64) { w.handleCurrent() },
 			OnDisconnected: func(error) { w.handleDisconnect() },
 		})
 	}()
 	return nil
 }
 
-// handleDisconnect ports v1 OnDisconnected -> markStatCacheUnverified:
-// while the stream is down, remote changes arrive unobserved, so the local
-// caches that would mask them drop (the kernel-side caches stay — v1 never
-// kernel-invalidated on disconnect).
+// handleDisconnect drops caches whose freshness depended on the stream.
+// Losing the stream does not replace the file view: in-flight reads can
+// complete. Replayed changes or a server reset reconcile the missed events.
+// Kernel caches retain their existing bounded TTLs.
 func (w *SSE) handleDisconnect() {
-	w.current = false
-	w.emit(fs.Event{Kind: fs.EventCheckout, Path: "/"})
+	w.unverified = true
+	w.emit(fs.Event{Kind: fs.EventUnverified, Path: "/"})
+}
+
+// handleCurrent is called after replay has caught up. Drop any images
+// cached during the gap, including clean write buffers; subsequent
+// heartbeats need no invalidation. A real reset already swept them.
+func (w *SSE) handleCurrent() {
+	if w.unverified {
+		w.emit(fs.Event{Kind: fs.EventUnverified, Path: "/"})
+		w.unverified = false
+	}
 }
 
 // Drain is a no-op: the stream carries no durable work.
@@ -168,5 +178,5 @@ func (w *SSE) handleReset(reset *client.ResetEvent) {
 	if w.opts.Notify != nil {
 		w.opts.Notify.InvalidateAll()
 	}
-	w.current = true
+	w.unverified = false
 }

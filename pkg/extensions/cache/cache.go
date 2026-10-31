@@ -205,9 +205,9 @@ func New(opts Options) (*Cache, error) {
 			}
 			c.invalidatePathTiers(e.Path)
 		})
-		opts.Events.On(fs.EventCheckout, func(e fs.Event) {
-			c.invalidateAllTiers()
-		})
+		for _, kind := range []fs.EventKind{fs.EventCheckout, fs.EventUnverified} {
+			opts.Events.On(kind, func(fs.Event) { c.invalidateAllTiers() })
+		}
 		opts.Events.On(fs.EventLanded, func(e fs.Event) {
 			// A local commit settle (onCommitQueueSuccess /
 			// onWriteBackUploadSuccess) replaces the file's image. Same
