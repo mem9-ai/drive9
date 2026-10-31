@@ -76,17 +76,17 @@ func TestPortOpenRequiresAncestorSearch(t *testing.T) {
 	}
 }
 
-// READDIR rows keep mtime/revision/resource/extent identity.
+// READDIR rows keep mtime/revision/resource identity.
 func TestPortDirEntriesKeepServerIdentity(t *testing.T) {
 	rows := dirEntriesFrom([]fs.Entry{{Name: "f", Attr: fs.Attr{
 		Kind: fs.KindFile, Mode: 0o644, Size: 3, Nlink: 2,
-		Rev: 7, ResourceID: "res-1", ExtentIno: 42,
+		Rev: 7, ResourceID: "res-1",
 	}}})
 	if len(rows) != 1 {
 		t.Fatalf("rows = %d", len(rows))
 	}
 	row := rows[0]
-	if row.Rev != 7 || row.ResourceID != "res-1" || row.ExtentIno != 42 || row.Nlink != 2 {
+	if row.Rev != 7 || row.ResourceID != "res-1" || row.Nlink != 2 {
 		t.Fatalf("row = %+v, want the server identity preserved", row)
 	}
 }
@@ -248,7 +248,7 @@ func TestPortDirCacheRoundTripsIdentity(t *testing.T) {
 	f.Ctx.DirCache = dircache.NewNamespaceCache(time.Minute, time.Second, 0)
 	f.Ctx.DirCache.Put("/d", []fs.DirEntryInfo{{
 		Name: "f", Size: 3, Mode: 0o644, HasMode: true, Nlink: 2,
-		Rev: 7, ResourceID: "res-1", ExtentIno: 42,
+		Rev: 7, ResourceID: "res-1",
 		Uid: 2000, Gid: 2000, HasUID: true, HasGID: true,
 	}})
 	dEntry := lookupForTest(t, f, "/d")
@@ -264,7 +264,7 @@ func TestPortDirCacheRoundTripsIdentity(t *testing.T) {
 		t.Fatalf("entries = %d", len(dh.entries))
 	}
 	a := dh.entries[0].Attr
-	if a.Rev != 7 || a.ResourceID != "res-1" || a.ExtentIno != 42 || !a.HasOwner || a.Uid != 2000 {
+	if a.Rev != 7 || a.ResourceID != "res-1" || !a.HasOwner || a.Uid != 2000 {
 		t.Fatalf("entry attr = %+v, want the cached identity preserved", a)
 	}
 }

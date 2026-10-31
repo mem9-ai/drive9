@@ -1,6 +1,0 @@
-//go:build windows
-
-package bulkfile
-
-// hasSyncOpenFlag reports O_SYNC/O_DSYNC opens; Windows has none.
-func hasSyncOpenFlag(flags uint32) bool { return false }

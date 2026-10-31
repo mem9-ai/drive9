@@ -21,8 +21,6 @@
 #  - RUN_TOKENS_SMOKE=1 / RUN_SSE_SMOKE=1 — HTTP tokens + SSE retention
 #    extras; off by default (not even post-merge). Enable from an integrator
 #    that points DRIVE9_SERVER_BIN at a server with those surfaces.
-#  - RUN_EXTENT_E2E=1 — content_layout=extent rename/mixed-directory suite;
-#    off by default because it needs a live extent data plane.
 #  - RUN_TASKS_SMOKE=1 — `fs tasks` (?tasks) wire-contract extra; off by
 #    default. Enable from an integrator whose server build implements ?tasks.
 
@@ -46,7 +44,6 @@ RUN_POSIX_SMOKE="${RUN_POSIX_SMOKE:-0}"
 RUN_GIT_WORKSPACE_SMOKE="${RUN_GIT_WORKSPACE_SMOKE:-0}"
 RUN_TOKENS_SMOKE="${RUN_TOKENS_SMOKE:-0}"
 RUN_SSE_SMOKE="${RUN_SSE_SMOKE:-0}"
-RUN_EXTENT_E2E="${RUN_EXTENT_E2E:-0}"
 RUN_TASKS_SMOKE="${RUN_TASKS_SMOKE:-0}"
 
 if [ "$RUN_FUSE_SMOKE" = "1" ]; then
@@ -153,9 +150,6 @@ if [ "$RUN_TOKENS_SMOKE" = "1" ]; then
 fi
 if [ "$RUN_SSE_SMOKE" = "1" ]; then
   run_case "sse-retention" "e2e/sse-retention-smoke-test.sh"
-fi
-if [ "$RUN_EXTENT_E2E" = "1" ]; then
-  run_fuse_case "extent-rename-mixed-dir" "e2e/extent-rename-mixed-dir.sh"
 fi
 if [ "$RUN_TASKS_SMOKE" = "1" ]; then
   run_case "tasks" "e2e/tasks-smoke-test.sh"

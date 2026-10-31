@@ -22,6 +22,15 @@ func CompressLevel(dst, src []byte, level int) ([]byte, error) {
 	return enc.EncodeAll(src, dst[:0]), nil
 }
 
+// DecompressInto decompresses src into dst and reports the written count.
+func DecompressInto(dst, src []byte) (int, error) {
+	out, err := Decompress(dst, src)
+	if err != nil {
+		return 0, err
+	}
+	return len(out), nil
+}
+
 func Decompress(dst, src []byte) ([]byte, error) {
 	dec, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1))
 	if err != nil {

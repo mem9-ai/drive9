@@ -722,23 +722,45 @@ func Example_localFileTransferShape() {
 	_, _ = io.Copy(io.Discard, rc)
 }
 
-func ExampleClient_extentDataPlane() {
+// Extent content layout v2: the server owns the block layout; reads fetch a
+// block read plan (presigned GETs) and writes declare dirty 4 MiB blocks.
+func ExampleClient_extentBlockDataPlane() {
 	ctx := context.Background()
 	c := drive9.New("https://drive9.example.com", "api-key")
 
-	// POST /v1/data-credential returns the tenant-prefix object-store session
-	// the extent data plane uses for its JuiceFS chunks.
-	cred, err := c.GetDataCredential(ctx)
+	// Read: a ranged GET returns the plan covering [start, end] (end < 0 is
+	// open-ended). Non-extent files fail with ErrExtentNotServed.
+	plan, err := c.GetExtentReadPlan(ctx, "/workspace/large.bin", 0, -1)
 	if err == nil {
-		_ = cred.Prefix
+		for _, block := range plan.Blocks {
+			if block.Zero {
+				continue // hole
+			}
+			body, berr := c.FetchExtentBlockRange(ctx, block.URL, block.BlockOffset, block.Length)
+			if berr == nil {
+				_ = body.Close()
+			}
+		}
 	}
 
-	// POST /v1/extent/meta runs one JuiceFS metadata operation; op travels in
-	// X-Drive9-Extent-Op and the body is operation specific.
-	raw, err := c.ExtentMeta(ctx, "lookup", map[string]any{"path": "/workspace/a.db"})
-	if err == nil {
-		_ = json.Valid(raw)
+	// Patch: declare one dirty block, upload it, and commit in one call.
+	// The block's checksum is the sha256 of its bytes.
+	buf := make([]byte, drive9.ExtentBlockSize)
+	sum := sha256.Sum256(buf)
+	chunk, off, _ := drive9.ChunkOffset(0)
+	writePlan, err := c.InitiateExtentPatch(ctx, "/workspace/large.bin", int64(len(buf)),
+		[]drive9.ExtentDirtyBlock{{Chunk: chunk, Off: off, Size: int64(len(buf)), Checksum: hex.EncodeToString(sum[:])}},
+		-1)
+	if err == nil && writePlan != nil {
+		_ = writePlan.UploadID
 	}
+	_ = c.CommitExtentPatch(ctx, "/workspace/large.bin", int64(len(buf)),
+		[]drive9.ExtentBlockWrite{{Chunk: chunk, Off: off, Data: buf}}, -1)
+
+	// Fresh large extent file: one-call streaming upload with the same
+	// revision contract as the classic write plane.
+	data := bytes.NewReader(bytes.Repeat([]byte("z"), 9<<20))
+	_ = c.WriteExtentStreamConditional(ctx, "/workspace/new.bin", data, int64(data.Len()), nil, -1)
 }
 
 var coveredClientMethods = map[string]bool{
@@ -796,9 +818,9 @@ var coveredClientMethods = map[string]bool{
 	"DeleteGitWorkspace":                   true,
 	"DeleteVaultSecret":                    true,
 	"DiffFSLayer":                          true,
-	"ExtentMeta":                           true,
+	"CommitExtentPatch":                    true,
 	"Exec":                                 true,
-	"GetDataCredential":                    true,
+	"FetchExtentBlockRange":                true,
 	"ForkFSLayer":                          true,
 	"DiffFSLayerAtSeq":                     true,
 	"DownloadDir":                          true,
@@ -812,6 +834,7 @@ var coveredClientMethods = map[string]bool{
 	"GetFSLayerCheckpoint":                 true,
 	"GetFSLayerEntry":                      true,
 	"GetFSLayerEntryAtSeq":                 true,
+	"GetExtentReadPlan":                    true,
 	"GetGitObjectPack":                     true,
 	"GetGitOverlayEntry":                   true,
 	"GetGitState":                          true,
@@ -926,6 +949,8 @@ var coveredClientMethods = map[string]bool{
 	"WriteStreamWithSummaryAndDescription": true,
 	"WriteStreamWithSummaryAndTags":        true,
 	"WriteStreamWithTags":                  true,
+	"InitiateExtentPatch":                  true,
+	"WriteExtentStreamConditional":         true,
 
 	// Migration V1 client contract.
 	"BatchStatWithOptionsCtx":                               true,

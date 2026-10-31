@@ -35,8 +35,9 @@ type AWSS3Client struct {
 	forcePathStyle bool
 	roleARN        string
 	// staticAccessKeyID/staticSecretAccessKey are the keys the server itself
-	// uses. When STS is not configured they are minted to extent clients as a
-	// stand-in session (local MinIO). They are never a tenant-scoped IAM policy.
+	// uses. When STS is not configured they are minted to tenant-prefix
+	// credential consumers as a stand-in session (local MinIO). They are never
+	// a tenant-scoped IAM policy.
 	staticAccessKeyID     string
 	staticSecretAccessKey string
 	staticSessionToken    string
@@ -293,17 +294,16 @@ func (c *AWSS3Client) MintStaticPrefix(tenantID string) (*TenantPrefixCreds, err
 }
 
 // tenantPrefixSessionPolicy is the inline session policy attached to a
-// tenant-prefix AssumeRole. It is the only IAM scoping the extent data plane
-// gets, and its granularity is the tenant (= one JuiceFS volume): a fork is a
-// new tenant with a new prefix.
+// tenant-prefix AssumeRole. It is the only IAM scoping a minted tenant-prefix
+// credential gets, and its granularity is the tenant: a fork is a new tenant
+// with a new prefix.
 //
 // Two deliberate choices:
-//   - no s3:DeleteObject. Block GC runs server-side on the tenant's behalf
-//     (pkg/server/extent_meta.go runExtentBlockGC), so a mount credential that
-//     leaks cannot delete objects.
-//   - the multipart actions are granted even though JuiceFS's Put is a single
-//     PutObject today, so enabling multipart upload does not start failing
-//     with AccessDenied.
+//   - no s3:DeleteObject. Object deletion runs server-side on the tenant's
+//     behalf, so a minted credential that leaks cannot delete objects.
+//   - the multipart actions are granted even though the client's Put is a
+//     single PutObject today, so enabling multipart upload does not start
+//     failing with AccessDenied.
 func tenantPrefixSessionPolicy(bucket, prefix string) string {
 	return fmt.Sprintf(`{"Version":"2012-10-17","Statement":[`+
 		`{"Effect":"Allow","Action":["s3:GetObject","s3:PutObject","s3:AbortMultipartUpload","s3:ListMultipartUploadParts"],"Resource":"arn:aws:s3:::%s/%s*"},`+

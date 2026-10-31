@@ -98,6 +98,14 @@ type Options struct {
 	// already applied).
 	InterruptibleCommits bool
 
+	// ExtentTakeover arms the extent content-layout commit branch: fresh
+	// large files are created through extent sequential sessions and
+	// existing extent files commit incrementally through PATCH dirty
+	// blocks (one layout-probing stat per commit). Classic targets keep
+	// the multipart path. The mount wires this together with the extent
+	// extension; zero keeps the classic routing only.
+	ExtentTakeover bool
+
 	// SyncMode selects fsync durability: "strict" (default) waits the
 	// remote commit; "interactive" (RTT > 10ms mounts) serves fsync
 	// from the local staging ledger — stage + async enqueue, no queue wait.
@@ -418,6 +426,7 @@ func New(opts Options) (*Writeback, error) {
 			workers = defaultUploadConcurrency
 		}
 		q := NewCommitQueue(opts.Client, opts.Staging.Shadow, opts.Staging.Pending, opts.Staging.Journal, workers, opts.CommitQueueMaxPending, root)
+		q.SetExtentTakeover(opts.ExtentTakeover)
 		q.SetPerfCounters(w.perfShim)
 		if opts.BatchWindow > 0 || opts.BatchMaxFiles > 0 || opts.BatchMaxBytes > 0 {
 			q.ConfigureBatchWrite(opts.BatchWindow, opts.BatchMaxFiles, opts.BatchMaxBytes)
@@ -4009,6 +4018,12 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 		ShadowSpill:      spill,
 		SnapshotID:       snapshotID,
 		ParentSnapshotID: parentSnapshotID,
+	}
+	// Capture this commit's delta before ClearDirty: extent-layout commits
+	// upload only these ranges as dirty blocks. Spilled entries lose
+	// per-part dirty tracking, so they carry no ranges and re-upload whole.
+	if !spill {
+		entry.DirtyRanges = dirtyPartRanges(h.buf, size)
 	}
 	if w.opts.Events != nil {
 		w.opts.Events.Emit(fs.Event{Kind: fs.EventStaged, Path: h.path, Size: entry.Size})

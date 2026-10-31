@@ -1,8 +1,8 @@
 // v1 drain_test.go rows: the errno mapping for drain failure kinds, and
 // the pending-work failure judgment (dirty handles, conflicted queue
-// entries, uploader-cached snapshots each fail the drain). The extent and
-// handle-table rows are v1-coupled (FileHandle/extentFh were deleted with
-// the monolith); their new-plane equivalents live in the writeback
+// entries, uploader-cached snapshots each fail the drain). The
+// handle-table rows are v1-coupled (FileHandle was deleted with
+// the monolith); the new-plane equivalents live in the writeback
 // extension's DrainFlush and DrainPending rows.
 package fuse
 

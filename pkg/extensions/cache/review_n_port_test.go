@@ -221,7 +221,7 @@ func (n *recNamespace) Invalidate(string)       {}
 func (n *recNamespace) InvalidatePrefix(string) {}
 func (n *recNamespace) InvalidateAll()          {}
 
-// The sibling listing publication preserves the extent identity/ownership
+// The sibling listing publication preserves the identity/ownership fields
 // and is fenced by the reset epoch.
 func TestPortSiblingPrefetchKeepsIdentityAndFencesReset(t *testing.T) {
 	var epoch atomic.Uint64
@@ -229,15 +229,15 @@ func TestPortSiblingPrefetchKeepsIdentityAndFencesReset(t *testing.T) {
 	p := &dirPrefetcher{namespace: ns, genFn: func() uint64 { return epoch.Load() }}
 	entries := []fs.Entry{{
 		Name: "f", Attr: fs.Attr{Kind: fs.KindFile, Mode: 0o644, Size: 3, Rev: 7,
-			ResourceID: "res-1", ExtentIno: 77, Uid: 2000, Gid: 2000, HasOwner: true},
+			ResourceID: "res-1", Uid: 2000, Gid: 2000, HasOwner: true},
 	}}
 	load := func(ctx context.Context, op *fs.Op) (fs.Result, error) {
 		return fs.Result{Entries: entries}, nil
 	}
 	p.loadSiblingDirectory(load, "/d")
 	got := ns.puts["/d"]
-	if len(got) != 1 || got[0].ExtentIno != 77 || !got[0].HasUID || got[0].Uid != 2000 || got[0].ResourceID != "res-1" {
-		t.Fatalf("sibling row = %+v, want the extent identity/owner preserved", got)
+	if len(got) != 1 || !got[0].HasUID || got[0].Uid != 2000 || got[0].ResourceID != "res-1" {
+		t.Fatalf("sibling row = %+v, want the identity/owner preserved", got)
 	}
 
 	// A reset while the LIST is in flight: the publish must be dropped.

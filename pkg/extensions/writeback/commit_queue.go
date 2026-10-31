@@ -71,6 +71,11 @@ type CommitEntry struct {
 	// based on an older revision are stale and must fail instead of overwriting
 	// that watermark through Release/CommitQueue.
 	DurableWatermarkRev int64
+	// DirtyRanges carries the write buffer's dirty part ranges at enqueue
+	// time, coalesced and clipped to Size. Extent-layout commits upload only
+	// these ranges as dirty blocks (incremental PATCH); classic commits
+	// ignore them and send the whole image.
+	DirtyRanges []ByteRange
 	// DisableAutoResolveLWW forces conflicts for fenced entries to stay
 	// terminal. Re-basing old bytes with a new BaseRev is exactly the silent
 	// rollback class this fence prevents.
@@ -171,9 +176,12 @@ type CommitQueue struct {
 	workCh chan *CommitEntry
 
 	zeroTruncateDelay time.Duration
-	batchWindow       time.Duration
-	batchMaxItems     int
-	batchMaxBytes     int64
+	// extentTakeover arms the extent content-layout commit branch
+	// (SetExtentTakeover).
+	extentTakeover bool
+	batchWindow    time.Duration
+	batchMaxItems  int
+	batchMaxBytes  int64
 
 	perf *fusePerfCounters
 }
@@ -238,6 +246,19 @@ func NewCommitQueue(c *client.Client, shadows *staging.ShadowStore, index *stagi
 // SetPerfCounters attaches the commit counters shim.
 func (cq *CommitQueue) SetPerfCounters(perf *fusePerfCounters) {
 	cq.perf = perf
+}
+
+// SetExtentTakeover arms the extent content-layout branch: large commits
+// are probed (one stat per commit) and routed to extent block sessions.
+// It is the v2 cutover kill-switch; queues without it keep the classic
+// direct-PUT/multipart routing byte-for-byte.
+func (cq *CommitQueue) SetExtentTakeover(enabled bool) {
+	if cq == nil {
+		return
+	}
+	cq.mu.Lock()
+	cq.extentTakeover = enabled
+	cq.mu.Unlock()
 }
 
 // ConfigureBatchWrite enables a small writeback-only direct-PUT batch window.
@@ -2208,6 +2229,14 @@ func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) (int
 	expectedRevision := entry.BaseRev
 	if entry.Kind == staging.PendingOverwrite && expectedRevision <= 0 {
 		return 0, fmt.Errorf("missing base revision for overwrite: %s", entry.Path)
+	}
+
+	// Extent content layout: route large commits through the extent block
+	// plane before the classic direct-PUT/multipart decision. Fresh
+	// large files are taken over by extent sessions here; existing extent
+	// files commit incrementally through PATCH dirty blocks.
+	if committedRev, handled, err := cq.uploadExtentEntry(ctx, entry, apiPath, expectedRevision); handled {
+		return committedRev, err
 	}
 
 	// ShadowSpill entries: stream directly from shadow file to avoid loading
