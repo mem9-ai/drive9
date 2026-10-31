@@ -510,8 +510,6 @@ func NewWithConfig(cfg Config) *Server {
 	mux.Handle("/v1/layers/", business)
 	mux.Handle("/v1/layer-checkpoints/", business)
 	mux.Handle("/v1/object-credentials", business)
-	mux.Handle("/v1/extent/meta", business)
-	mux.Handle("/v1/data-credential", business)
 	// Vault management API goes through tenant auth.
 	mux.Handle("/v1/vault/secrets", business)
 	mux.Handle("/v1/vault/secrets/", business)
@@ -742,9 +740,8 @@ func (s *Server) startNotifyInfrastructure(cfg Config) {
 
 	// Shard resolver: refresh the active pod ring synchronously before the
 	// poller starts so ownsTenant has a valid ring on startup. The tenant worker
-	// gets the same resolver so the extent quota report — the one extent job
-	// that is a read-modify-write of shared state rather than a database-claimed
-	// queue item — runs on the owner only.
+	// gets the same resolver so jobs that are read-modify-writes of shared
+	// state rather than database-claimed queue items run on the owner only.
 	resolver := newSemanticShardResolver(s.meta, cfg.PodID, cfg.TenantShardRefreshInterval)
 	resolver.Start(context.Background())
 	s.shardResolver = resolver
@@ -1580,10 +1577,6 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 		s.handleFSLayers(w, r)
 	case r.URL.Path == "/v1/object-credentials":
 		s.handleObjectCredentials(w, r)
-	case r.URL.Path == "/v1/extent/meta":
-		s.handleExtentMeta(w, r)
-	case r.URL.Path == "/v1/data-credential":
-		s.handleDataCredential(w, r)
 	case strings.HasPrefix(r.URL.Path, "/v1/vault/secrets"), strings.HasPrefix(r.URL.Path, "/v1/vault/tokens"), strings.HasPrefix(r.URL.Path, "/v1/vault/grants"), strings.HasPrefix(r.URL.Path, "/v1/vault/audit"):
 		s.handleVault(w, r)
 	default:
@@ -2190,17 +2183,6 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, path string)
 		return
 	}
 
-	if plan.ExtentIno != 0 {
-		w.Header().Set("X-Dat9-Content-Layout", "extent")
-		w.Header().Set("X-Dat9-Storage-Type", "extent")
-		w.Header().Set("X-Dat9-Extent-Ino", strconv.FormatUint(plan.ExtentIno, 10))
-		w.Header().Set("X-Dat9-Extent-Length", strconv.FormatInt(plan.Size, 10))
-		logger.Info(r.Context(), "server_event", eventFields(r.Context(), "read_extent_hint", "path", path, "extent_ino", plan.ExtentIno, "size", plan.Size)...)
-		metricEvent(r.Context(), "fs_read", "result", "ok")
-		errJSON(w, http.StatusUnprocessableEntity, "extent content is not served inline")
-		return
-	}
-
 	if plan.PresignURL != "" {
 		logger.InfoBenchTiming(r.Context(), "server_read_timing",
 			zap.String("path", path),
@@ -2278,9 +2260,6 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string)
 		HasMode    bool   `json:"hasMode"`
 		ResourceID string `json:"resource_id,omitempty"`
 		Nlink      uint32 `json:"nlink,omitempty"`
-		// ExtentIno lets a client route an entry to the extent data plane
-		// straight from the listing; 0 means single-layout (or an old server).
-		ExtentIno uint64 `json:"extent_ino,omitempty"`
 	}
 	out := make([]entry, 0, len(entries))
 	for _, e := range entries {
@@ -2301,12 +2280,6 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string)
 				revision = parsed
 			}
 		}
-		var extentIno uint64
-		if raw := e.Meta.Content["extent_ino"]; raw != "" {
-			if parsed, err := strconv.ParseUint(raw, 10, 64); err == nil {
-				extentIno = parsed
-			}
-		}
 		out = append(out, entry{
 			Name:       e.Name,
 			Size:       e.Size,
@@ -2317,7 +2290,6 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string)
 			HasMode:    hasMode,
 			ResourceID: e.Meta.Content["resource_id"],
 			Nlink:      nlink,
-			ExtentIno:  extentIno,
 		})
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -3443,15 +3415,6 @@ func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, path string)
 	}
 	if nlink > 0 {
 		w.Header().Set("X-Dat9-Nlink", strconv.FormatUint(uint64(nlink), 10))
-	}
-	// The layout rides along on the stat row itself (file_nodes.content_layout
-	// + extent_ino are selected by the stat query), so a normal mount pays no
-	// extra query to learn that an ordinary file is not an extent file.
-	if nf.ContentLayout != "" {
-		w.Header().Set("X-Dat9-Content-Layout", string(nf.ContentLayout))
-		if nf.ExtentIno != 0 {
-			w.Header().Set("X-Dat9-Extent-Ino", strconv.FormatUint(nf.ExtentIno, 10))
-		}
 	}
 	if nf.File != nil {
 		w.Header().Set("X-Dat9-Revision", strconv.FormatInt(nf.File.Revision, 10))

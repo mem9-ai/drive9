@@ -21,12 +21,11 @@ import (
 
 // Node is one in-memory filesystem entry.
 type Node struct {
-	Data      []byte
-	IsDir     bool
-	Mode      uint32 // full mode, including S_IFMT for symlinks
-	Rev       int64
-	Mtime     int64
-	ExtentIno uint64 // nonzero: stat advertises content_layout=extent
+	Data  []byte
+	IsDir bool
+	Mode  uint32 // full mode, including S_IFMT for symlinks
+	Rev   int64
+	Mtime int64
 
 	// ContentLayout overrides the stat-advertised layout ("append_log",
 	// "single", "" = none). Seeded by tests to model server-side append-log
@@ -282,14 +281,6 @@ func (b *Backend) Requests() map[string]int {
 	return out
 }
 
-// SeedExtent installs a file whose stat advertises the extent layout with
-// the given extent object-store inode.
-func (b *Backend) SeedExtent(path string, data []byte, extentIno uint64) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.files[path] = &Node{Data: data, Mode: 0o644, Rev: 1, Mtime: 1, ExtentIno: extentIno}
-}
-
 // DelayLayerEntriesForTest slows layer-entry POSTs (mutation-lock rows).
 func (b *Backend) DelayLayerEntriesForTest(d time.Duration) {
 	b.mu.Lock()
@@ -310,14 +301,6 @@ func (b *Backend) ForceLayerEntryFailure(path string, n int) {
 	b.mu.Lock()
 	b.failLayerEntry[path] = n
 	b.mu.Unlock()
-}
-
-// ReplaceWithClassic swaps an extent-seeded file for a classic
-// single-layout node (identity/layout change rows).
-func (b *Backend) ReplaceWithClassic(path string, data []byte) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.files[path] = &Node{Data: data, Mode: 0o644, Rev: 2, Mtime: 2}
 }
 
 // ForceConflict arms N forced 409s for conditional writes to path.
@@ -363,14 +346,13 @@ func (b *Backend) writeJSON(w http.ResponseWriter, v any) {
 }
 
 type listEntry struct {
-	Name      string `json:"name"`
-	Size      int64  `json:"size"`
-	IsDir     bool   `json:"isDir"`
-	Revision  int64  `json:"revision"`
-	Mtime     int64  `json:"mtime"`
-	Mode      uint32 `json:"mode"`
-	HasMode   bool   `json:"hasMode"`
-	ExtentIno uint64 `json:"extent_ino,omitempty"`
+	Name     string `json:"name"`
+	Size     int64  `json:"size"`
+	IsDir    bool   `json:"isDir"`
+	Revision int64  `json:"revision"`
+	Mtime    int64  `json:"mtime"`
+	Mode     uint32 `json:"mode"`
+	HasMode  bool   `json:"hasMode"`
 }
 
 func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -1042,12 +1024,11 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		var rev, mtime int64
 		var mode uint32
 		var contentLayout string
-		var extentIno uint64
 		if n != nil {
 			isDir = n.IsDir
 			dataLen = len(n.Data)
 			rev, mtime, mode = n.Rev, n.Mtime, n.Mode
-			contentLayout, extentIno = n.ContentLayout, n.ExtentIno
+			contentLayout = n.ContentLayout
 		}
 		b.mu.Unlock()
 		if n == nil {
@@ -1068,10 +1049,6 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Dat9-Storage-Type", storageType)
 		if contentLayout != "" {
 			w.Header().Set("X-Dat9-Content-Layout", contentLayout)
-		}
-		if extentIno != 0 {
-			w.Header().Set("X-Dat9-Content-Layout", "extent")
-			w.Header().Set("X-Dat9-Extent-Ino", strconv.FormatUint(extentIno, 10))
 		}
 		w.WriteHeader(http.StatusOK)
 
@@ -1113,7 +1090,7 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				if mode == 0 {
 					mode = 0o644
 				}
-				out = append(out, listEntry{Name: name, Size: int64(len(child.Data)), IsDir: isDir, Revision: child.Rev, Mtime: child.Mtime, Mode: mode, HasMode: true, ExtentIno: child.ExtentIno})
+				out = append(out, listEntry{Name: name, Size: int64(len(child.Data)), IsDir: isDir, Revision: child.Rev, Mtime: child.Mtime, Mode: mode, HasMode: true})
 			}
 		}
 		b.mu.Unlock()

@@ -387,7 +387,7 @@ def build_ltp_runner_cmd(runner: str, scenario: str, work_dir: Path, session_dir
 
     For kirk: ``kirk --no-colors --run-suite <scenario> --sut default --tmp-dir <session>``
     kirk's --tmp-dir is its session directory (it creates a ``latest`` symlink
-    there). That bookkeeping must not live on the FUSE mount: extent FUSE
+    there). That bookkeeping must not live on the FUSE mount: the FUSE plane
     reports EEXIST when kirk replaces ``latest``. LTP binaries still use
     TMPDIR=work_dir on the mount. runltp ``-d`` stays on work_dir.
     """

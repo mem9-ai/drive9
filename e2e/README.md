@@ -21,8 +21,7 @@ including local validation via `drive9-server` with `DRIVE9_TENANT_PROVIDER=loca
 | `fuse-smoke-test.sh` | FUSE mount lifecycle, file/dir/symlink/hardlink/rename/stat semantics, cross-channel consistency, `mount drain`/native `sync -f` drain checks, mounted 10KiB→8MiB→10KiB tier-transition parity, read-only and error-path checks |
 | `fuse-correctness-workload.sh` | Real read-only FUSE workload over a manifest fixture: `find`, `grep`, `stat`, `cat`, `sha256`, symlink, hardlink, unicode/space paths, empty files, binary files, and 8MiB+ files |
 | `fuse-sqlite-correctness.sh` | Real writable FUSE SQLite correctness workload with rollback-journal mode, `PRAGMA integrity_check`, unmount/remount parity, and remote snapshot verification; set `RUN_FUSE_SQLITE_WAL=1` for WAL, `RUN_FUSE_SQLITE_CHURN=1` for repeated large-DB rewrite churn, and `RUN_FUSE_SQLITE_CONCURRENCY=1` for the bounded readers/writer detector |
-| `fuse-sqlite-commit-sequence.sh` | Generic FUSE SQLite WAL sequence: 1000 independent `COMMIT`s with `synchronous=FULL`, same-mount reopen, remount, and remote snapshot fingerprints. Honors `FUSE_PROFILE` (default FS or `coding-agent-extent`). Does not require S3 Express / append-log |
-| `extent-rename-mixed-dir.sh` | `content_layout=extent` rename and directory semantics under a mixed profile (only some names match `[extent]`): single renamed onto an `[extent]` pattern stays single, extent renamed off the pattern keeps its `extent_ino`, a directory holding extent + single children survives ls/rename/rm -r, unlink+create allocates a new `extent_ino`, and a CLI-side directory rename/recursive delete stays usable from a fresh mount (orphan JuiceFS dir-edge guard). Needs a server with a working extent data plane (`POST /v1/data-credential`); manual-only |
+| `fuse-sqlite-commit-sequence.sh` | Generic FUSE SQLite WAL sequence: 1000 independent `COMMIT`s with `synchronous=FULL`, same-mount reopen, remount, and remote snapshot fingerprints. Honors `FUSE_PROFILE` (default FS or a profile mount). Does not require S3 Express / append-log |
 | `fuse-concurrency-stress.sh` | Real writable FUSE concurrency workload with parallel writers/readers, atomic rename, unlink churn, open-handle rename reads, and deterministic final manifest checks |
 | `fuse-posix-fsx-gate.sh` | Opt-in JuiceFS-style POSIX/fsx subset over real writable FUSE: deterministic random write/read/truncate, atomic rename replacement, unlink-open reads, directory fsync, final model hash, unmount, and remote snapshot parity |
 | `fuse-performance-baseline.sh` | Opt-in real writable FUSE baseline that records small-file, large-file, repeated large-read, and SQLite transaction/read metrics as JSON artifacts without hardcoded throughput thresholds; SQLite reads verify stored row payload bytes against row checksums |
@@ -35,6 +34,7 @@ including local validation via `drive9-server` with `DRIVE9_TENANT_PROVIDER=loca
 | `fuse-write-perf-budget-test.sh` | FUSE write-path perf budgets: fsync-heavy workload with deterministic op-count budgets (remote writes/stats/lists/mutations, commit retries/failures) plus an fsync latency ceiling, asserted from mount perf counters |
 | `fuse-patch-storage-class.sh` | PATCH-vs-storage-class mismatch (`patch_unsupported_target`) regression: seeds a db9-stored file above the restarted server's inline threshold, then partially overwrites it through a FUSE mount. Default `fixed` scenario asserts zero PATCH attempts, correct committed bytes, and storage heal to S3; `SCENARIO=repro`/`fallback` with `DRIVE9_SERVER_BIN`/`DRIVE9_CLI_BIN` overrides replay the pre-fix EINVAL loop and the old-server fallback locally |
 | `git-workspace-smoke-test.sh` | Git workspace fast-blobless clone with coding-agent local overlay, batched tracked-file edits, ignored local-only paths, `git add`/`commit`, `git apply`, and remount restore |
+| `extent-takeover-mixed-tree.sh` | Extent takeover e2e (content layout v2): legacy multipart files never convert (read/append/overwrite/truncate-rewrite/chmod/rename/delete), fresh large files promote to the extent (JuiceFS engine) plane at the inline cutoff, mixed trees survive renames in every plane combination + cp -r + rm -r, cross-channel CLI changes persist across remounts, server-side compaction and block GC settle without byte changes, dual mounts agree, and held-open writers stay visible. Opt-in `RUN_EXTENT_E2E=1`; needs a server with the extent v2 protocol and FUSE; `EXTENT_E2E_SQL_CHECK=1` adds server-table assertions via `/v1/sql` |
 | `posix-permission-smoke-test.sh` | POSIX permission coverage: API mkdir/chmod mode propagation, CLI `fs chmod`, FUSE `chmod`/`mkdir -m` with remote and local stat parity |
 | `tokens-smoke-test.sh` | `/v1/tokens` management: dispatcher, scoped lifecycle/refresh, pseudoroot projected listing and hidden siblings, scoped gate, control-plane generate/list/status (needs `provider=local` mock IAM). Off in default `smoke-all.sh`; set `RUN_TOKENS_SMOKE=1` |
 | `sse-retention-smoke-test.sh` | SSE `/v1/events` initial sync, live `file_changed` delivery + cursor replay, >1000-event backlog drain; optional long-window replay and short-retention sweep (`SSE_SWEEP_TEST=1`). Off in default `smoke-all.sh`; set `RUN_SSE_SMOKE=1` |
@@ -49,7 +49,7 @@ including local validation via `drive9-server` with `DRIVE9_TENANT_PROVIDER=loca
 | `object-auth-cos-hosted-test.sh` | Same 44-check hosted coverage as S3, against Tencent COS (`tccli`). Needs a dedicated test bucket + CAM user; never point at prod COS. Set `DRIVE9_E2E_OBJECT_REGION` and `DRIVE9_E2E_OBJECT_ACCOUNT_ID` (APPID) |
 | `object-auth-tos-hosted-test.sh` | Same hosted coverage against Volcengine TOS (`tosutil`). AssumeRole only: `DRIVE9_E2E_OBJECT_ROLE_ARN` is required, plus region |
 | `native-smoke-test.sh` | TiDB Cloud Native tenant lifecycle: CLI provision with credentials, status poll, basic fs ops (mkdir/cp/cat/ls/rm), delete + verification, trap cleanup on failure |
-| `smoke-all.sh` | PR-gate aggregator aligned with `local-e2e.yml`: api, cli, layer-fs, fuse-release-gate, fuse-patch-storage-class, git-ops, git-workspace-ondemand, pack, fuse-crash-recovery, fuse-supervision, fuse-write-perf-budget. Re-exports `DRIVE9_API_KEY` for existing-tenant mode. `RUN_FUSE_SMOKE=0` skips FUSE-related suites; `RUN_API_ONLY=1` keeps only api + cli; `RUN_JOURNAL_SMOKE=1` / `RUN_POSIX_SMOKE=1` / `RUN_GIT_WORKSPACE_SMOKE=1` add post-merge extras; `RUN_TOKENS_SMOKE=1` / `RUN_SSE_SMOKE=1` add HTTP tokens and SSE retention (off even on post-merge); `RUN_TASKS_SMOKE=1` adds the `fs tasks` wire-contract smoke (off even on post-merge) |
+| `smoke-all.sh` | PR-gate aggregator aligned with `local-e2e.yml`: api, cli, layer-fs, fuse-release-gate, fuse-patch-storage-class, git-ops, git-workspace-ondemand, pack, fuse-crash-recovery, fuse-supervision, fuse-write-perf-budget. Re-exports `DRIVE9_API_KEY` for existing-tenant mode. `RUN_FUSE_SMOKE=0` skips FUSE-related suites; `RUN_API_ONLY=1` keeps only api + cli; `RUN_JOURNAL_SMOKE=1` / `RUN_POSIX_SMOKE=1` / `RUN_GIT_WORKSPACE_SMOKE=1` add post-merge extras; `RUN_TOKENS_SMOKE=1` / `RUN_SSE_SMOKE=1` add HTTP tokens and SSE retention (off even on post-merge); `RUN_EXTENT_E2E=1` adds the extent takeover suite (needs an extent-v2 server); `RUN_TASKS_SMOKE=1` adds the `fs tasks` wire-contract smoke (off even on post-merge) |
 
 ## CI automation tiers
 
@@ -63,7 +63,7 @@ without adding it to `.github/workflows/local-e2e.yml`.
 | Post-merge | `push` to `main` (local-e2e, coalesced via concurrency group) | PR gate + concurrency stress, POSIX/fsx, sqlite WAL/churn/concurrency, sqlite 1000-commit WAL FULL sequence, `smoke-all.sh` extras (journal, posix-permission, git-workspace), git feature smoke |
 | Nightly | cron 20:17 UTC (local-e2e) | Post-merge set + FUSE performance baseline/archive/compare (compare is report-only; hosted-runner noise) |
 | Manual all | Local E2E `workflow_dispatch` with `run_all_e2e=1` | Everything above |
-| Manual only | not wired, run by hand | `description-smoke-test.sh` (Docker + Ollama/stub embedder), `native-smoke-test.sh` (TiDB Cloud Native — requires credentials), `image-extract-config-smoke-test.sh` / `video-extract-config-smoke-test.sh` (hosted control-plane + billable vision provider), `embedding-config-smoke-test.sh` (hosted control-plane + billable embedding provider), `object-auth-smoke-test.sh` (tidbcloud-native + real object-store STS mint; `--auth=server` cannot run in local-e2e), `object-auth-s3-hosted-test.sh` / `object-auth-cos-hosted-test.sh` / `object-auth-tos-hosted-test.sh` (hosted S3/COS/TOS isolation/mount/refresh; same reason), `s3-express-append-log-smoke-test.sh` (hosted Directory Bucket HTTP smoke), `fuse-s3-express-append-log.sh` (hosted Directory Bucket + real FUSE; macOS/local provider cannot exercise S3 Express), `tokens-smoke-test.sh` (opt-in HTTP; needs `provider=local` mock IAM), `sse-retention-smoke-test.sh` (opt-in HTTP; needs `/v1/events` and a short retention), `tasks-smoke-test.sh` (opt-in HTTP; the handler lives in the external server repository, so the local CI build cannot exercise it), and `extent-rename-mixed-dir.sh` (`content_layout=extent` rename/directory semantics; needs a server whose extent data plane is live and is opt-in via `RUN_EXTENT_E2E=1`, not part of the PR gate) |
+| Manual only | not wired, run by hand | `description-smoke-test.sh` (Docker + Ollama/stub embedder), `native-smoke-test.sh` (TiDB Cloud Native — requires credentials), `image-extract-config-smoke-test.sh` / `video-extract-config-smoke-test.sh` (hosted control-plane + billable vision provider), `embedding-config-smoke-test.sh` (hosted control-plane + billable embedding provider), `object-auth-smoke-test.sh` (tidbcloud-native + real object-store STS mint; `--auth=server` cannot run in local-e2e), `object-auth-s3-hosted-test.sh` / `object-auth-cos-hosted-test.sh` / `object-auth-tos-hosted-test.sh` (hosted S3/COS/TOS isolation/mount/refresh; same reason), `s3-express-append-log-smoke-test.sh` (hosted Directory Bucket HTTP smoke), `fuse-s3-express-append-log.sh` (hosted Directory Bucket + real FUSE; macOS/local provider cannot exercise S3 Express), `tokens-smoke-test.sh` (opt-in HTTP; needs `provider=local` mock IAM), `sse-retention-smoke-test.sh` (opt-in HTTP; needs `/v1/events` and a short retention), `tasks-smoke-test.sh` (opt-in HTTP; the handler lives in the external server repository, so the local CI build cannot exercise it) |
 
 Scheduled and post-merge failures auto-file/append to a `ci-e2e-failure`
 GitHub issue, since GitHub only notifies the workflow author otherwise.
@@ -155,14 +155,8 @@ bash e2e/fuse-correctness-workload.sh
 bash e2e/fuse-sqlite-correctness.sh
 
 # 1000 sequential WAL FULL commits, reopen, remount, remote snapshot.
-# Works on the default FS and with FUSE_PROFILE=coding-agent-extent.
+# Works on the default FS and with a FUSE_PROFILE mount.
 bash e2e/fuse-sqlite-commit-sequence.sh
-FUSE_PROFILE=coding-agent-extent bash e2e/fuse-sqlite-commit-sequence.sh
-
-# content_layout=extent rename + mixed-directory semantics under a partial
-# [extent] profile. Needs a server with the extent data plane (local provider
-# with the filesystem S3 mock, or MinIO/static keys). Manual-only.
-DRIVE9_BASE=http://127.0.0.1:9009 bash e2e/extent-rename-mixed-dir.sh
 
 # Bounded concurrency stress on a real writable FUSE mount.
 bash e2e/fuse-concurrency-stress.sh
@@ -329,15 +323,15 @@ Useful knobs for existing-tenant runs:
 `--server-mode local` uses `--local-server`, which defaults to
 `DRIVE9_SERVER_BIN`.
 
-To run FUSE suites with `coding-agent-extent` (all files `content_layout=extent`):
+To run FUSE suites with a specific profile:
 
 ```bash
-FUSE_PROFILE=coding-agent-extent make e2e-local
-FUSE_PROFILE=coding-agent-extent \
+FUSE_PROFILE=coding-agent make e2e-local
+FUSE_PROFILE=coding-agent \
   DRIVE9_LOCAL_E2E_SMOKE_SCRIPT=e2e/fuse-sqlite-correctness.sh make e2e-local
-# full extent sweep (every optional workload + POSIX + the extent e2e):
-FUSE_PROFILE=coding-agent-extent RUN_FUSE_ALL_WORKLOADS=1 \
-  RUN_FUSE_SQLITE_COMMIT_SEQUENCE=1 RUN_POSIX_SMOKE=1 RUN_EXTENT_E2E=1 make e2e-local
+# full optional sweep (every optional workload + POSIX):
+FUSE_PROFILE=coding-agent RUN_FUSE_ALL_WORKLOADS=1 \
+  RUN_FUSE_SQLITE_COMMIT_SEQUENCE=1 RUN_POSIX_SMOKE=1 make e2e-local
 ```
 
 `fuse-patch-storage-class.sh` ignores `FUSE_PROFILE`. CLI smoke does not mount.
@@ -417,7 +411,6 @@ FUSE_PROFILE=coding-agent-extent RUN_FUSE_ALL_WORKLOADS=1 \
 - Set `compare_fuse_performance_metrics=1` on manual `local-e2e` runs, or use the daily scheduled run, to compare current metrics against the latest Drive9 archive before archiving the current run. By default, `FUSE_PERF_COMPARE_FAIL_ON_REGRESSION=1` makes any metric below `1 - FUSE_PERF_COMPARE_WARN_RATIO` fail the compare step after writing JSON/Markdown reports. Missing historical baselines, parameter mismatches, and legacy baselines missing newly added workloads still produce non-failing warnings; invalid current metrics, broken Drive9 compare configuration, malformed archived manifests, and structurally invalid baseline metrics fail closed.
 - The daily local-e2e gate intentionally covers the local CI-safe SQLite/Git/FUSE scripts. `description-smoke-test.sh` remains a manual environment-specific run (Docker + Ollama or stub embedder). Full pjdfstest lives under `blackbox` (`community.pjdfstest`).
 - FUSE release-gate knobs are `FUSE_STRICT_PREREQS`, `RUN_FUSE_GIT_CLONE`, `FUSE_GIT_CLONE_URL`, `FUSE_GIT_CLONE_TIMEOUT_S`, `RUN_FUSE_UMOUNT_DURABLE`, `FUSE_UMOUNT_TIMEOUT`, `RUN_FUSE_LOG_AUDIT`, `RUN_FUSE_ALL_WORKLOADS`, `RUN_FUSE_SQLITE_CORRECTNESS`, `RUN_FUSE_SQLITE_COMMIT_SEQUENCE`, `RUN_FUSE_CONCURRENCY_STRESS`, `RUN_FUSE_POSIX_FSX`, `RUN_FUSE_PERFORMANCE_BASELINE`, and the FUSE correctness/SQLite/concurrency/POSIX/fsx/performance workload knobs. Set `RUN_FUSE_ALL_WORKLOADS=1` to default concurrency stress, POSIX/fsx, and performance baseline to enabled in one release-gate command; explicit per-workload env vars still take precedence. `local-e2e.yml` intentionally overrides `RUN_FUSE_CONCURRENCY_STRESS=0` and `RUN_FUSE_POSIX_FSX=0` for its release-gate step, then runs `fuse-concurrency-stress.sh`, `fuse-posix-fsx-gate.sh`, and `fuse-sqlite-commit-sequence.sh` separately after metrics artifact/archive steps.
-- `extent-rename-mixed-dir.sh` knobs are `EXTENT_E2E_PROFILE`, `EXTENT_E2E_PATTERNS`, `EXTENT_E2E_PAYLOAD_KB`, `EXTENT_E2E_DURABILITY`, `EXTENT_E2E_SQL_ORPHAN_CHECK`, and `EXTENT_E2E_KEEP_ARTIFACTS`. It is opt-in via `RUN_EXTENT_E2E=1` in `smoke-all.sh`.
 - Git workspace smoke defaults to `drive9`, `kimi-cli`, and `kimi-code`. Override with `GIT_WORKSPACE_REPOS='slug=https://example/repo.git,...'`.
 - Git workspace scenarios default to `agent_edit_add_commit,agent_patch_apply,sandbox_restore`; tune with `GIT_WORKSPACE_SCENARIOS`.
 - Git workspace file-count knobs are `GIT_WORKSPACE_EXISTING_FILES`, `GIT_WORKSPACE_NEW_FILES`, and `GIT_WORKSPACE_PATCH_FILES`.

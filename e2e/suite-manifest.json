@@ -147,6 +147,13 @@
       "product_promise": "write-sync FUSE keeps forward progress under concurrency",
       "owner_hint": "fs",
       "failure_class": "correctness"
+    },
+    "extent-takeover-mixed-tree": {
+      "title": "Extent takeover mixed tree e2e (content layout v2)",
+      "product_area": "fs",
+      "product_promise": "large files promote from multipart to the extent (JuiceFS engine) plane transparently; legacy multipart files never convert; mixed trees, cross-channel namespace changes, server compaction and dual mounts stay consistent",
+      "owner_hint": "fs",
+      "failure_class": "correctness"
     }
   }
 }

@@ -20,7 +20,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/mem9-ai/drive9/pkg/extent"
 	"github.com/mem9-ai/drive9/pkg/tagutil"
 )
 
@@ -46,9 +45,6 @@ type Client struct {
 	// raced with concurrent uploads.
 	statusMax    atomic.Int64 // tenant max_upload_bytes from /v1/status; 0 if unavailable
 	statusInline atomic.Int64 // server inline_threshold from /v1/status; 0 if unavailable
-
-	extentMu sync.Mutex
-	extentRT *extent.Runtime
 }
 
 // tenantStatusResponse mirrors the server's TenantStatusResponse JSON shape.
@@ -271,10 +267,6 @@ type FileInfo struct {
 	HasMode    bool   `json:"hasMode"`
 	ResourceID string `json:"resource_id,omitempty"`
 	Nlink      uint32 `json:"nlink,omitempty"`
-	// ExtentIno is the JuiceFS inode for content_layout=extent entries,
-	// discovered from the listing itself. 0 means single-layout, or a server
-	// that predates the field; callers must fall back to a stat probe.
-	ExtentIno uint64 `json:"extent_ino,omitempty"`
 }
 
 // ErrListResponseTooLarge reports that a bounded directory listing exceeded
@@ -336,8 +328,6 @@ type StatResult struct {
 	// ContentLayout is the server-authoritative physical layout from
 	// X-Dat9-Content-Layout. Empty means the server omitted the header.
 	ContentLayout ContentLayout
-	// ExtentIno is the JuiceFS inode for content_layout=extent files.
-	ExtentIno uint64
 }
 
 // MaxBatchStatPaths is the maximum number of paths accepted by BatchStatCtx.
@@ -1282,9 +1272,6 @@ func (c *Client) StatCtx(ctx context.Context, path string) (*StatResult, error) 
 	s.ResourceID = resp.Header.Get("X-Dat9-Resource-ID")
 	s.StorageType = StorageType(resp.Header.Get("X-Dat9-Storage-Type"))
 	s.ContentLayout = ContentLayout(resp.Header.Get("X-Dat9-Content-Layout"))
-	if ino := resp.Header.Get("X-Dat9-Extent-Ino"); ino != "" {
-		s.ExtentIno, _ = strconv.ParseUint(ino, 10, 64)
-	}
 	s.ChecksumSHA256 = resp.Header.Get("X-Dat9-Checksum-SHA256")
 	if nlink := resp.Header.Get("X-Dat9-Nlink"); nlink != "" {
 		if n, err := strconv.ParseUint(nlink, 10, 32); err == nil {

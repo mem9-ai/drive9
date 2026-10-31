@@ -396,7 +396,7 @@ start_layer_mount() {
   local profile="${FUSE_PROFILE:-coding-agent}"
   local args=(mount --foreground --mode=fuse --profile="$profile" --durability="$durability" --flush-debounce=0 --layer "$layer_ref")
   case "$profile" in
-    none|extent|interactive) ;;
+    none|interactive) ;;
     *) args+=(--local-root "$local_root") ;;
   esac
   if [ -n "$checkpoint_ref" ]; then

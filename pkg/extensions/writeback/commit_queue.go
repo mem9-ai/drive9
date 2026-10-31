@@ -71,6 +71,11 @@ type CommitEntry struct {
 	// based on an older revision are stale and must fail instead of overwriting
 	// that watermark through Release/CommitQueue.
 	DurableWatermarkRev int64
+	// DirtyRanges carries the write buffer's dirty part ranges at enqueue
+	// time, coalesced and clipped to Size. Extent-layout commits upload only
+	// these ranges as dirty blocks (incremental PATCH); classic commits
+	// ignore them and send the whole image.
+	DirtyRanges []ByteRange
 	// DisableAutoResolveLWW forces conflicts for fenced entries to stay
 	// terminal. Re-basing old bytes with a new BaseRev is exactly the silent
 	// rollback class this fence prevents.
@@ -171,9 +176,16 @@ type CommitQueue struct {
 	workCh chan *CommitEntry
 
 	zeroTruncateDelay time.Duration
-	batchWindow       time.Duration
-	batchMaxItems     int
-	batchMaxBytes     int64
+	// extentTakeover arms the extent content-layout commit branch
+	// (SetExtentTakeover).
+	extentTakeover bool
+	// pathCommitErr remembers the last terminal commit failure per path so
+	// close-sync waits can report the outcome instead of mere idleness
+	// (WaitPathOutcome).
+	pathCommitErr map[string]error
+	batchWindow   time.Duration
+	batchMaxItems int
+	batchMaxBytes int64
 
 	perf *fusePerfCounters
 }
@@ -227,6 +239,7 @@ func NewCommitQueue(c *client.Client, shadows *staging.ShadowStore, index *stagi
 		landed:            make(map[string]pathCommitLandmark),
 		workCh:            make(chan *CommitEntry, bufSize),
 		zeroTruncateDelay: zeroTruncateCommitQueueDelay,
+		pathCommitErr:     make(map[string]error),
 	}
 	for i := 0; i < numWorkers; i++ {
 		cq.wg.Add(1)
@@ -238,6 +251,19 @@ func NewCommitQueue(c *client.Client, shadows *staging.ShadowStore, index *stagi
 // SetPerfCounters attaches the commit counters shim.
 func (cq *CommitQueue) SetPerfCounters(perf *fusePerfCounters) {
 	cq.perf = perf
+}
+
+// SetExtentTakeover arms the extent content-layout branch: large commits
+// are probed (one stat per commit) and routed to extent block sessions.
+// It is the v2 cutover kill-switch; queues without it keep the classic
+// direct-PUT/multipart routing byte-for-byte.
+func (cq *CommitQueue) SetExtentTakeover(enabled bool) {
+	if cq == nil {
+		return
+	}
+	cq.mu.Lock()
+	cq.extentTakeover = enabled
+	cq.mu.Unlock()
 }
 
 // ConfigureBatchWrite enables a small writeback-only direct-PUT batch window.
@@ -545,6 +571,44 @@ func (cq *CommitQueue) WaitPathDeadline(path string, timeout time.Duration) bool
 		time.Sleep(50 * time.Millisecond)
 	}
 	return true
+}
+
+// errCommitTerminalNoDiagnostic surfaces terminal conflicts that carry no
+// error value (finishResolveFailure(..., nil) paths) to outcome-aware
+// waiters.
+var errCommitTerminalNoDiagnostic = errors.New("commit terminated without a diagnostic error")
+
+// rememberPathCommitErr records (or clears, on success) the latest commit
+// outcome for a path. Success clears: a later re-enqueued commit that
+// lands must not surface the old failure.
+func (cq *CommitQueue) rememberPathCommitErr(entry *CommitEntry, err error) {
+	if cq == nil || entry == nil {
+		return
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	if cq.pathCommitErr == nil {
+		cq.pathCommitErr = make(map[string]error)
+	}
+	if err == nil {
+		delete(cq.pathCommitErr, entry.Path)
+	} else {
+		cq.pathCommitErr[entry.Path] = err
+	}
+}
+
+// WaitPathOutcome waits like WaitPathDeadline and then reports whether the
+// path's last commit actually succeeded. A path can be idle because its
+// entry terminally failed (the queue removed it) — close-style durability
+// callers need that distinction.
+func (cq *CommitQueue) WaitPathOutcome(path string, timeout time.Duration) error {
+	if !cq.WaitPathDeadline(path, timeout) {
+		return fmt.Errorf("commit for %s still in flight after %s", path, timeout)
+	}
+	cq.mu.Lock()
+	err := cq.pathCommitErr[path]
+	cq.mu.Unlock()
+	return err
 }
 
 // HasPath reports whether a path is queued or currently in flight.
@@ -2210,6 +2274,14 @@ func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) (int
 		return 0, fmt.Errorf("missing base revision for overwrite: %s", entry.Path)
 	}
 
+	// Extent content layout: route large commits through the extent block
+	// plane before the classic direct-PUT/multipart decision. Fresh
+	// large files are taken over by extent sessions here; existing extent
+	// files commit incrementally through PATCH dirty blocks.
+	if committedRev, handled, err := cq.uploadExtentEntry(ctx, entry, apiPath, expectedRevision); handled {
+		return committedRev, err
+	}
+
 	// ShadowSpill entries: stream directly from shadow file to avoid loading
 	// multi-GiB files into memory. Uses io.SectionReader over the shadow fd.
 	if entry.ShadowSpill {
@@ -2390,6 +2462,7 @@ func (cq *CommitQueue) rebuildQueuedIndexLocked() {
 }
 
 func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry, expectedRevision, committedRev int64) error {
+	cq.rememberPathCommitErr(entry, nil)
 	return cq.onCommitSuccessWithOptions(entry, expectedRevision, committedRev, false)
 }
 
@@ -2900,6 +2973,7 @@ func (cq *CommitQueue) onCommitPostUploadFailure(entry *CommitEntry, err error) 
 		cq.perf.commitFailure.add(1)
 	}
 	cq.removeFromQueue(entry)
+	cq.rememberPathCommitErr(entry, err)
 	safeLogPrintf("commit queue: post-upload failure for %s; local pending state preserved for retry: %v", entry.Path, err)
 }
 
@@ -2955,6 +3029,14 @@ func (cq *CommitQueue) recordCommitTerminalFailure(entry *CommitEntry, lastErr e
 		cq.perf.commitFailure.add(1)
 		cq.perf.commitTerminalFailure.add(1)
 	}
+	// Every exit that funnels here is terminal: WaitPathOutcome must
+	// observe a non-success outcome even when the diagnostic error is nil
+	// (finishResolveFailure's nil conflicts) — rememberPathCommitErr treats
+	// nil as success and would have cleared it.
+	if lastErr == nil {
+		lastErr = errCommitTerminalNoDiagnostic
+	}
+	cq.rememberPathCommitErr(entry, lastErr)
 	// Alertable FUSE-local error. Collectors should match
 	// "drive9: error event=commit_terminal_failure" on stderr / mount-log
 	// files (typically ~/.cache/drive9/mount-logs/). The drive9 server never

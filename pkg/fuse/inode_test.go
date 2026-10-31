@@ -1,12 +1,11 @@
 package fuse
 
 // Ports of v1 pkg/fuse/inode_test.go for the chain facade's InodeToPath
-// table: extent-ino bindings survive Forget and never shrink on reseeds,
-// hardlink aliases share one FUSE inode, rename consumes the replaced
-// target's link, and fillAttr serves the entry's mode/nlink rows. The v1
-// fillAttr rows moved to the new (fs.Attr, ino) signature; the zero-mode
-// default (0644 file / 0755 dir) now lives in entryToAttr and is pinned
-// here alongside.
+// table: listing reseeds never shrink a live inode's size, hardlink aliases
+// share one FUSE inode, rename consumes the replaced target's link, and
+// fillAttr serves the entry's mode/nlink rows. The v1 fillAttr rows moved
+// to the new (fs.Attr, ino) signature; the zero-mode default (0644 file /
+// 0755 dir) now lives in entryToAttr and is pinned here alongside.
 
 import (
 	"errors"
@@ -19,10 +18,9 @@ import (
 	"github.com/mem9-ai/drive9/pkg/fs"
 )
 
-func TestEnsureInodeDoesNotShrinkExtentSize(t *testing.T) {
+func TestEnsureInodeDoesNotShrinkSizeOnReseed(t *testing.T) {
 	m := NewInodeToPath()
 	ino := m.Lookup("/final/w0/file-000.txt", false, 32820, time.Now())
-	m.SetExtentIno(ino, 9)
 	got := m.EnsureInodeWithIdentity("/final/w0/file-000.txt", "", 0, false, 0, time.Now())
 	if got != ino {
 		t.Fatalf("ino=%d, want %d", got, ino)
@@ -32,46 +30,7 @@ func TestEnsureInodeDoesNotShrinkExtentSize(t *testing.T) {
 		t.Fatal("missing entry")
 	}
 	if entry.Size != 32820 {
-		t.Fatalf("listing size=0 shrank extent inode to %d", entry.Size)
-	}
-}
-
-func TestForgetKeepsExtentInodeMapping(t *testing.T) {
-	m := NewInodeToPath()
-	ino := m.Lookup("/final/w0/file-000.txt", false, 32768, time.Now())
-	m.SetExtentIno(ino, 42)
-	m.Forget(ino, 1)
-	entry, ok := m.GetEntry(ino)
-	if !ok {
-		t.Fatal("Forget dropped juicefs inode mapping")
-	}
-	if entry.ExtentIno != 42 {
-		t.Fatalf("ExtentIno=%d, want 42", entry.ExtentIno)
-	}
-	if entry.Size != 32768 {
-		t.Fatalf("size=%d, want 32768 after Forget", entry.Size)
-	}
-	got, ok := m.GetInode("/final/w0/file-000.txt")
-	if !ok || got != ino {
-		t.Fatalf("path mapping = %d/%v, want %d/true", got, ok, ino)
-	}
-}
-
-func TestSetExtentIno(t *testing.T) {
-	m := NewInodeToPath()
-	ino := m.Lookup("/test.txt", false, 100, time.Now())
-	m.SetExtentIno(ino, 99)
-	entry, ok := m.GetEntry(ino)
-	if !ok {
-		t.Fatal("entry not found")
-	}
-	if entry.ExtentIno != 99 {
-		t.Fatalf("ExtentIno=%d, want 99", entry.ExtentIno)
-	}
-	m.SetExtentIno(ino, 0) // ignored
-	entry, _ = m.GetEntry(ino)
-	if entry.ExtentIno != 99 {
-		t.Fatalf("zero ExtentIno overwrote cache: %d", entry.ExtentIno)
+		t.Fatalf("listing size=0 shrank the live inode to %d", entry.Size)
 	}
 }
 
@@ -303,21 +262,6 @@ func TestFillAttrDirNlink(t *testing.T) {
 	f.fillAttr(fs.Attr{Kind: fs.KindDir, Nlink: 4}, 0, &out)
 	if out.Nlink != 4 {
 		t.Fatalf("dir nlink = %d, want 4", out.Nlink)
-	}
-}
-
-// v1 TestFindByExtentInoReusesFuseInode: the extent-ino reverse index
-// resolves back to the FUSE inode (hardlink aliasing across paths).
-func TestPortFindByExtentInoReusesFuseInode(t *testing.T) {
-	m := NewInodeToPath()
-	ino := m.Lookup("/a.txt", false, 1, time.Now())
-	m.SetExtentIno(ino, 77)
-	got, ok := m.FindByExtentIno(77)
-	if !ok || got != ino {
-		t.Fatalf("FindByExtentIno = %d/%v, want %d", got, ok, ino)
-	}
-	if _, ok := m.FindByExtentIno(78); ok {
-		t.Fatal("missing juicefs ino must not match")
 	}
 }
 

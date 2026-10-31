@@ -14,8 +14,8 @@
 #   RUN_API_ONLY=1 bash scripts/e2e-local.sh
 #   RUN_FUSE_SMOKE=0 bash scripts/e2e-local.sh
 #   DRIVE9_SERVER_BIN=/path/to/drive9-server bash scripts/e2e-local.sh --no-build
-#   FUSE_PROFILE=coding-agent-extent make e2e-local
-#   FUSE_PROFILE=coding-agent-extent \
+#   FUSE_PROFILE=coding-agent make e2e-local
+#   FUSE_PROFILE=coding-agent \
 #     DRIVE9_LOCAL_E2E_SMOKE_SCRIPT=e2e/fuse-sqlite-correctness.sh make e2e-local
 #   DRIVE9_S3_BACKEND=mock make e2e-local
 #   DRIVE9_S3_BACKEND=s3 make e2e-local
@@ -29,7 +29,7 @@
 #   RUN_CLI_FORK_CHECKS=0       cli tenant fork (set 1 to enable)
 #   RUN_TOKENS_SMOKE=0          /v1/tokens management smoke (set 1 to enable)
 #   RUN_SSE_SMOKE=0             /v1/events retention smoke (set 1 to enable)
-#   FUSE_PROFILE=               optional --profile for FUSE suites (e.g. coding-agent-extent)
+#   FUSE_PROFILE=               optional --profile for FUSE suites (e.g. coding-agent)
 #   DRIVE9_S3_BACKEND=auto      try real object store, else local filesystem mock
 #                               s3 = require object store; mock = filesystem mock
 #                               skip bootstrap when DRIVE9_S3_BUCKET is already set
@@ -275,9 +275,6 @@ start_server() {
   export DRIVE9_LISTEN_ADDR="$LISTEN_ADDR"
   export DRIVE9_PUBLIC_URL="${DRIVE9_PUBLIC_URL:-http://$LISTEN_ADDR}"
   export DRIVE9_TENANT_PROVIDER="${DRIVE9_TENANT_PROVIDER:-local}"
-  # A local object store has no STS, so the extent data plane needs the static-key
-  # fallback; the server refuses it without this explicit opt-in.
-  export DRIVE9_EXTENT_ALLOW_STATIC_CREDENTIALS="${DRIVE9_EXTENT_ALLOW_STATIC_CREDENTIALS:-1}"
   export DRIVE9_LOCAL_DSN="${DRIVE9_LOCAL_DSN:-$DEFAULT_DSN}"
   export DRIVE9_META_DSN="${DRIVE9_META_DSN:-$DRIVE9_LOCAL_DSN}"
   export DRIVE9_LOCAL_MYSQL_DSN="${DRIVE9_LOCAL_MYSQL_DSN:-$DRIVE9_LOCAL_DSN}"

@@ -98,6 +98,19 @@ type Options struct {
 	// already applied).
 	InterruptibleCommits bool
 
+	// ExtentMinSize is the extent promotion threshold in bytes: staged
+	// images at or above it route to the commit queue (whose extent branch
+	// promotes them to the extent plane) instead of the small-file
+	// writeback cache track. 0 disables.
+	ExtentMinSize int64
+	// ExtentTakeover arms the extent content-layout commit branch: fresh
+	// large files are created through extent sequential sessions and
+	// existing extent files commit incrementally through PATCH dirty
+	// blocks (one layout-probing stat per commit). Classic targets keep
+	// the multipart path. The mount wires this together with the extent
+	// extension; zero keeps the classic routing only.
+	ExtentTakeover bool
+
 	// SyncMode selects fsync durability: "strict" (default) waits the
 	// remote commit; "interactive" (RTT > 10ms mounts) serves fsync
 	// from the local staging ledger — stage + async enqueue, no queue wait.
@@ -420,6 +433,7 @@ func New(opts Options) (*Writeback, error) {
 			workers = defaultUploadConcurrency
 		}
 		q := NewCommitQueue(opts.Client, opts.Staging.Shadow, opts.Staging.Pending, opts.Staging.Journal, workers, opts.CommitQueueMaxPending, root)
+		q.SetExtentTakeover(opts.ExtentTakeover)
 		q.SetPerfCounters(w.perfShim)
 		if opts.BatchWindow > 0 || opts.BatchMaxFiles > 0 || opts.BatchMaxBytes > 0 {
 			q.ConfigureBatchWrite(opts.BatchWindow, opts.BatchMaxFiles, opts.BatchMaxBytes)
@@ -652,6 +666,13 @@ func (w *Writeback) SetInodeTable(t fs.InodeTable) { w.inodes = t }
 // counters (v1 perfRecordRemote).
 func (w *Writeback) SetRemoteOpRecorder(fn func(name string, err error, dur time.Duration, bytes uint64)) {
 	w.perfShim.setForward(fn)
+}
+
+// extentRoute reports whether a staged image of this size should bypass
+// the small-file writeback cache track and land through the commit queue,
+// where the extent branch promotes it to the extent plane.
+func (w *Writeback) extentRoute(size int64) bool {
+	return w.opts.ExtentMinSize > 0 && size >= w.opts.ExtentMinSize && w.queue != nil && w.opts.Staging != nil
 }
 
 // smallFileShadowThreshold is the cached-I/O cutoff (v1): handles of bases
@@ -2017,6 +2038,17 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 		// from the FUSE cancel channel under interrupt-safe mutations (v1
 		// syncDataCommitContext): a kernel interrupt after the PUT hit the
 		// wire must not cancel it into an ambiguous server-side state.
+		if h.w.extentRoute(size) {
+			if err := h.stageAndEnqueueOpt(ctx, true, false); err != nil {
+				return err
+			}
+			if err := h.w.queue.WaitPathOutcome(h.path, uploadTimeout); err != nil {
+				// Idle is not success: a terminally failed queued upload
+				// must surface at the close(2) durability boundary.
+				return fs.StatusErrorOf(gofuse.Status(syscall.EIO))
+			}
+			return nil
+		}
 		if h.w.uploader != nil && h.w.wbCache != nil {
 			if !h.w.opts.InterruptibleCommits {
 				var detachCancel context.CancelFunc
@@ -2085,6 +2117,24 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 		}
 		h.mu.Unlock()
 		if !dirty || unlinked {
+			return nil
+		}
+		if h.w.extentRoute(size) {
+			// Promotion-sized image: the commit queue's extent branch
+			// turns it into an extent sequential session — never the
+			// small-file classic track. Stage durably and wait for THIS
+			// path's landing (the close-sync large-file contract): the name
+			// must be visible as extent at close(2), and Release must not
+			// double-commit a classic image beside the queued one.
+			if err := h.stageAndEnqueueOpt(ctx, true, false); err != nil {
+				return err
+			}
+			if err := h.w.queue.WaitPathOutcome(h.path, uploadTimeout); err != nil {
+				return fs.StatusErrorOf(gofuse.Status(syscall.EIO))
+			}
+			h.mu.Lock()
+			h.dirty = false
+			h.mu.Unlock()
 			return nil
 		}
 		if size < commitInlineStreamThreshold {
@@ -4011,6 +4061,12 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 		ShadowSpill:      spill,
 		SnapshotID:       snapshotID,
 		ParentSnapshotID: parentSnapshotID,
+	}
+	// Capture this commit's delta before ClearDirty: extent-layout commits
+	// upload only these ranges as dirty blocks. Spilled entries lose
+	// per-part dirty tracking, so they carry no ranges and re-upload whole.
+	if !spill {
+		entry.DirtyRanges = dirtyPartRanges(h.buf, size)
 	}
 	if w.opts.Events != nil {
 		w.opts.Events.Emit(fs.Event{Kind: fs.EventStaged, Path: h.path, Size: entry.Size})

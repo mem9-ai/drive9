@@ -36,9 +36,6 @@ type InodeEntry struct {
 	// longer owns, and a later reclaim can point it at yet another one.
 	// Only descriptor-served operations may continue through their handle.
 	Detached bool
-	// ExtentIno is the JuiceFS inode for content_layout=extent files.
-	// Shared across hardlink aliases of the same FUSE inode.
-	ExtentIno uint64
 	// MtimeOverride/AtimeOverride hold times explicitly set by a time-only
 	// SetAttr (utimensat/futimens), including while the file's content commit
 	// is still pending. While armed, derived refreshes (async commit
@@ -352,8 +349,7 @@ func shouldKeepForgetMapping(entry *InodeEntry) bool {
 	// (detachPathLocked) or removed under live handles — owns no name
 	// anymore. Once the kernel's last reference is forgotten nothing can
 	// reach it: release it instead of keeping a pathless entry forever.
-	// JuiceFS-backed inodes keep their identity mapping (rule below).
-	if entry.Unlinked && len(entry.Paths) == 0 && entry.ExtentIno == 0 {
+	if entry.Unlinked && len(entry.Paths) == 0 {
 		return false
 	}
 	if entry.IsDir || entry.ResourceID != "" {
@@ -363,12 +359,6 @@ func shouldKeepForgetMapping(entry *InodeEntry) bool {
 		return entry.Path != ""
 	}
 	if entry.HasUID || entry.HasGID {
-		return true
-	}
-	// JuiceFS uses the juicefs inode as the FUSE nodeid, so Forget cannot
-	// drop the identity. Dat9FS allocates its own nodeids and must keep the
-	// juicefs Ino mapping (and last known length) across kernel Forget.
-	if entry.ExtentIno != 0 {
 		return true
 	}
 	// Metadata-only special nodes (FIFO/CHR/BLK/SOCK) have no other
@@ -450,48 +440,6 @@ func (m *InodeToPath) AddAliasIfAbsent(ino uint64, path, resourceID string, nlin
 	entry.Nlookup++
 	m.updateEntryLocked(entry, path, resourceID, nlink, isDir, size, mtime)
 	return true
-}
-
-// SetExtentIno records the JuiceFS inode for a FUSE inode. Hardlink aliases
-// share the FUSE inode, so one update covers every path.
-func (m *InodeToPath) SetExtentIno(ino uint64, extentIno uint64) {
-	if m == nil || extentIno == 0 {
-		return
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if entry, ok := m.byInode[ino]; ok {
-		entry.ExtentIno = extentIno
-	}
-}
-
-// ClearExtentIno drops the JuiceFS inode recorded for a FUSE inode. Callers
-// use it when the path stops being the extent file that inode belonged to.
-func (m *InodeToPath) ClearExtentIno(ino uint64) {
-	if m == nil || ino == 0 {
-		return
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if entry, ok := m.byInode[ino]; ok {
-		entry.ExtentIno = 0
-	}
-}
-
-// FindByExtentIno returns the FUSE inode that already owns this JuiceFS
-// inode, so Lookup after rename/hardlink reuses the same nodeid.
-func (m *InodeToPath) FindByExtentIno(extentIno uint64) (uint64, bool) {
-	if m == nil || extentIno == 0 {
-		return 0, false
-	}
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	for ino, entry := range m.byInode {
-		if entry != nil && !entry.IsDir && entry.ExtentIno == extentIno {
-			return ino, true
-		}
-	}
-	return 0, false
 }
 
 // FindPathInDir locates a child by basename under dir, ignoring extra slashes
@@ -1150,10 +1098,8 @@ func (m *InodeToPath) updateEntryLocked(entry *InodeEntry, path, resourceID stri
 	m.addPathLocked(entry, path)
 	// A kind change means a different object owns this path now. setIdentityLocked
 	// below cannot see it (its key is "" for a directory), so drop the old
-	// JuiceFS routing here rather than leave a file inode's routing on a
-	// directory.
+	// identity index entry here.
 	if entry.IsDir != isDir {
-		entry.ExtentIno = 0
 		// The new object must not inherit the previous object's explicitly
 		// SetAttr'd times, and the old identity index entry must go too:
 		// the replacement (a directory here) has an empty identity key, so
@@ -1163,10 +1109,11 @@ func (m *InodeToPath) updateEntryLocked(entry *InodeEntry, path, resourceID stri
 		clearTimeOverridesLocked(entry)
 	}
 	entry.IsDir = isDir
-	// Listing/create-cache often still has size=0 after JuiceFS writes.
-	// Shrinking an extent inode here makes ReadDirPlus publish i_size=0 so
-	// the kernel returns EOF without FUSE READ. Truncate uses UpdateSize.
-	if entry.ExtentIno == 0 || isDir || size >= entry.Size {
+	// A listing reseed must not shrink the known size: the create cache can
+	// still report size=0 right after a local write, and ReadDirPlus would
+	// publish i_size=0 so the kernel returns EOF without FUSE READ.
+	// Truncate uses UpdateSize.
+	if isDir || size >= entry.Size {
 		entry.Size = size
 	}
 	// Clear the previous object's time overrides BEFORE the mtime line
@@ -1217,18 +1164,13 @@ func (m *InodeToPath) setIdentityLocked(entry *InodeEntry, resourceID string) {
 	if entry.ResourceID != "" && m.byID[entry.ResourceID] == entry.Ino {
 		delete(m.byID, entry.ResourceID)
 	}
-	// A *different* drive9 file now owns this path, so a JuiceFS inode recorded
-	// for the previous one is stale and would route later opens to a replaced
-	// (possibly drained) extent inode. Only clear when both identities are
-	// known: create-shaped entries carry no resource id yet and must keep the
-	// routing this mount just stamped.
+	// A *different* drive9 file now owns this path: the new object must not
+	// inherit the previous one's explicitly SetAttr'd times, so drop the
+	// local time overrides and adopt the incoming listing/stat metadata.
+	// (updateEntryLocked clears these before applying a listing mtime; this
+	// covers identity updates that arrive through SetIdentity/stat
+	// refreshes.)
 	if identityReplacedLocked(entry, key) {
-		entry.ExtentIno = 0
-		// The new object also must not inherit the previous object's
-		// explicitly SetAttr'd times: drop the local time overrides so the
-		// incoming listing/stat metadata is adopted instead. (updateEntryLocked
-		// clears these before applying a listing mtime; this covers identity
-		// updates that arrive through SetIdentity/stat refreshes.)
 		clearTimeOverridesLocked(entry)
 	}
 	entry.ResourceID = key

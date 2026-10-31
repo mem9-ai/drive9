@@ -30,7 +30,7 @@ func TestProfileAppendLogRoundTrip(t *testing.T) {
 
 func TestProfileAppendLogDefaults(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	for _, name := range []string{"", "coding-agent", "portable", "none", "extent", "interactive"} {
+	for _, name := range []string{"", "coding-agent", "portable", "none", "interactive"} {
 		cfg, err := loadProfileConfig(name)
 		if err != nil {
 			t.Fatal(err)
@@ -77,17 +77,6 @@ func TestProfileAppendLogFormattingDoesNotMutateConfig(t *testing.T) {
 	}
 }
 
-func TestLoadProfileConfigCodingAgentExtent(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-	cfg, err := loadProfileConfig("coding-agent-extent")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(cfg.ExtentPatterns, []string{"*"}) {
-		t.Fatalf("ExtentPatterns = %v, want [*]", cfg.ExtentPatterns)
-	}
-}
-
 func TestLoadProfileConfigDefaultCodingAgentHasNoPackPaths(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
@@ -103,23 +92,6 @@ func TestLoadProfileConfigDefaultCodingAgentHasNoPackPaths(t *testing.T) {
 	}
 	if len(cfg.PackPaths) != 0 {
 		t.Fatalf("PackPaths = %v, want no default pack paths", cfg.PackPaths)
-	}
-}
-
-func TestLoadProfileConfigExtentIsNonePlusAllFilesExtent(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-	cfg, err := loadProfileConfig("extent")
-	if err != nil {
-		t.Fatalf("loadProfileConfig: %v", err)
-	}
-	if cfg.Name != "extent" || cfg.Source != "builtin:extent" {
-		t.Fatalf("extent profile = %#v", cfg)
-	}
-	if len(cfg.LocalOnlyPatterns) != 0 || len(cfg.RemoteOnlyPatterns) != 0 || len(cfg.PackPaths) != 0 || len(cfg.AppendLogPatterns) != 0 {
-		t.Fatalf("extent profile should match none except [extent]: %#v", cfg)
-	}
-	if !reflect.DeepEqual(cfg.ExtentPatterns, []string{"*"}) {
-		t.Fatalf("ExtentPatterns = %v, want [*]", cfg.ExtentPatterns)
 	}
 }
 
@@ -150,7 +122,7 @@ func TestProfileLocalGitignoreAwareSectionRoundTrip(t *testing.T) {
 
 func TestBuiltinProfilesSeparateGatedPatterns(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	for _, name := range []string{"", "coding-agent", "portable", "coding-agent-extent"} {
+	for _, name := range []string{"", "coding-agent", "portable"} {
 		cfg, err := loadProfileConfig(name)
 		if err != nil {
 			t.Fatalf("loadProfileConfig(%q): %v", name, err)
@@ -197,7 +169,7 @@ func TestCustomCodingAgentNameDoesNotInjectBuiltins(t *testing.T) {
 
 func TestBuiltinProfilesAreMarkedBuiltin(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	for _, name := range []string{"", "coding-agent", "portable", "coding-agent-extent"} {
+	for _, name := range []string{"", "coding-agent", "portable"} {
 		cfg, err := loadProfileConfig(name)
 		if err != nil {
 			t.Fatalf("loadProfileConfig(%q): %v", name, err)
@@ -215,15 +187,12 @@ func TestProfileRejectsUnknownSection(t *testing.T) {
 	}
 }
 
-func TestProfileAllowsOverlayExtentLikeNone(t *testing.T) {
-	if profileAllowsOverlay("extent") {
-		t.Fatal("extent must not require --local-root (same as none)")
-	}
+func TestProfileAllowsOverlayNoneLikeNone(t *testing.T) {
 	if profileAllowsOverlay("none") {
 		t.Fatal("none must not require --local-root")
 	}
-	if !profileAllowsOverlay("coding-agent-extent") {
-		t.Fatal("coding-agent-extent keeps the coding-agent overlay")
+	if !profileAllowsOverlay("coding-agent") {
+		t.Fatal("coding-agent keeps its overlay")
 	}
 }
 
@@ -348,5 +317,15 @@ func TestProfileShowPrintsCustomConfig(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Fatalf("profile show output = %q, want %q", out, want)
 		}
+	}
+}
+
+func TestBuiltinExtentProfile(t *testing.T) {
+	cfg, err := loadProfileConfig("extent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Builtin || !cfg.ExtentFull {
+		t.Fatalf("builtin extent profile = %+v", cfg)
 	}
 }

@@ -615,6 +615,19 @@ func (s *ShadowStore) WriteExtents(remotePath string, wb *writebuffer.WriteBuffe
 // if the generation is unknown.
 // The read is performed under RLock to prevent WriteStream from swapping
 // the fd mid-read on active generations.
+// HasGeneration reports whether a shadow generation has live backing
+// (active or retired-but-present). Truncate-only files may carry a
+// bookkeeping generation with no staged bytes.
+func (s *ShadowStore) HasGeneration(gen uint64) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if _, ok := s.genFile[gen]; ok {
+		return true
+	}
+	_, ok := s.retired[gen]
+	return ok
+}
+
 func (s *ShadowStore) ReadAtGen(gen uint64, offset int64, buf []byte) (int, error) {
 	s.mu.RLock()
 	if sf, ok := s.genFile[gen]; ok {
