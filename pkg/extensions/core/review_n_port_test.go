@@ -161,6 +161,12 @@ func TestPortCoreRenameRetargetsOpenHandle(t *testing.T) {
 // the facade's reply fence comes too late, and the negative row would hide
 // the new view's file for its TTL.
 func TestPortStale404DoesNotSeedNegativeCache(t *testing.T) {
+	for _, event := range []fs.EventKind{fs.EventCheckout, fs.EventUnverified} {
+		t.Run(event.String(), func(t *testing.T) { testPortStale404DoesNotSeedNegativeCache(t, event) })
+	}
+}
+
+func testPortStale404DoesNotSeedNegativeCache(t *testing.T, event fs.EventKind) {
 	var heads atomic.Int32
 	gate := make(chan struct{})
 	release := make(chan struct{})
@@ -196,7 +202,7 @@ func TestPortStale404DoesNotSeedNegativeCache(t *testing.T) {
 	}()
 	<-gate
 	// Another request's 401 reset: the in-flight 404 is now stale.
-	bus.Emit(fs.Event{Kind: fs.EventCheckout, Path: "/"})
+	bus.Emit(fs.Event{Kind: event, Path: "/"})
 	close(release)
 	if err := <-done; !fs.IsNotFound(err) {
 		t.Fatalf("stale 404 = %v, want not-found", err)

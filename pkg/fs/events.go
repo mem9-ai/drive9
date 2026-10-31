@@ -20,6 +20,7 @@ const (
 	EventLanded                       // a staged mutation was acknowledged by the remote
 	EventConflicted                   // a commit lost a revision race
 	EventInvalidated                  // remote-origin change invalidated local knowledge
+	EventUnverified                   // event stream lost continuity; invalidate caches without replacing the file view
 )
 
 // String returns the event kind's name.
@@ -39,6 +40,8 @@ func (k EventKind) String() string {
 		return "conflicted"
 	case EventInvalidated:
 		return "invalidated"
+	case EventUnverified:
+		return "unverified"
 	}
 	return fmt.Sprintf("event(%d)", uint8(k))
 }

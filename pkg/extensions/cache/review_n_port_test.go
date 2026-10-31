@@ -23,6 +23,12 @@ import (
 )
 
 func TestPortCheckoutDropsOpenHandlePrefetch(t *testing.T) {
+	for _, event := range []fs.EventKind{fs.EventCheckout, fs.EventUnverified} {
+		t.Run(event.String(), func(t *testing.T) { testPortCheckoutDropsOpenHandlePrefetch(t, event) })
+	}
+}
+
+func testPortCheckoutDropsOpenHandlePrefetch(t *testing.T, event fs.EventKind) {
 	const size = 5 << 20
 	base := bytes.Repeat([]byte("A"), size)
 	b := testbackend.NewBackend()
@@ -56,7 +62,7 @@ func TestPortCheckoutDropsOpenHandlePrefetch(t *testing.T) {
 	if err := cl.WriteCtx(ctx, "/big.bin", bytes.Repeat([]byte("B"), size)); err != nil {
 		t.Fatal(err)
 	}
-	bus.Emit(fs.Event{Kind: fs.EventCheckout, Path: "/"})
+	bus.Emit(fs.Event{Kind: event, Path: "/"})
 
 	next := make([]byte, 64<<10)
 	if _, err := h.Read(ctx, 64<<10, next); err != nil {
@@ -70,6 +76,12 @@ func TestPortCheckoutDropsOpenHandlePrefetch(t *testing.T) {
 // A read dispatched before a checkout must not admit its pre-reset bytes
 // when it completes afterwards.
 func TestPortCheckoutFencesInFlightReadAdmission(t *testing.T) {
+	for _, event := range []fs.EventKind{fs.EventCheckout, fs.EventUnverified} {
+		t.Run(event.String(), func(t *testing.T) { testPortCheckoutFencesInFlightReadAdmission(t, event) })
+	}
+}
+
+func testPortCheckoutFencesInFlightReadAdmission(t *testing.T, event fs.EventKind) {
 	gate := make(chan struct{})
 	release := make(chan struct{})
 	inner := terminalFunc(func(ctx context.Context, op *fs.Op) (fs.Result, error) {
@@ -95,7 +107,7 @@ func TestPortCheckoutFencesInFlightReadAdmission(t *testing.T) {
 		done <- rerr
 	}()
 	<-gate
-	bus.Emit(fs.Event{Kind: fs.EventCheckout, Path: "/"})
+	bus.Emit(fs.Event{Kind: event, Path: "/"})
 	close(release)
 	if err := <-done; err != nil {
 		t.Fatalf("read = %v", err)
