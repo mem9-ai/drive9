@@ -251,9 +251,10 @@ func TestRewriteAzureSASRequestHostMismatch(t *testing.T) {
 
 func TestRcloneTransportIsFilterable(t *testing.T) {
 	rt := fshttp.NewTransport(context.Background())
-	if _, ok := rt.(*fshttp.Transport); !ok {
-		t.Fatalf("rclone fshttp.NewTransport type %T; Azure SAS refresh filter will not install", rt)
-	}
+	// rclone >= 1.75 returns a concrete *fshttp.Transport, so installing the
+	// Azure SAS refresh filter is now a compile-time guarantee; this call keeps
+	// the regression that the filter hook still exists.
+	rt.SetRequestFilter(rewriteAzureSASRequest)
 }
 
 func TestRewriteAzureSASRequestHostMatch(t *testing.T) {

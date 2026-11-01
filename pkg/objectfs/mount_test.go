@@ -40,7 +40,7 @@ func testVFS(t *testing.T) (*rcloneFUSE, string) {
 	}
 	opt := vfscommon.Opt
 	opt.CacheMode = vfscommon.CacheModeOff
-	return newRcloneFUSE(vfs.New(f, &opt), false), dir
+	return newRcloneFUSE(vfs.New(context.Background(), f, &opt), false), dir
 }
 
 func TestRcloneFUSELookupRead(t *testing.T) {
@@ -88,7 +88,7 @@ func testWriteVFS(t *testing.T) (*rcloneFUSE, string) {
 	opt := vfscommon.Opt
 	opt.CacheMode = vfscommon.CacheModeWrites
 	opt.WriteBack = 0
-	return newRcloneFUSE(vfs.New(f, &opt), false), dir
+	return newRcloneFUSE(vfs.New(context.Background(), f, &opt), false), dir
 }
 
 func TestRcloneFUSECreateFlushThenWrite(t *testing.T) {
@@ -142,7 +142,7 @@ func TestRcloneFUSEFlushReportsPutFailure(t *testing.T) {
 	opt := vfscommon.Opt
 	opt.CacheMode = vfscommon.CacheModeWrites
 	opt.WriteBack = 0
-	ofs := newRcloneFUSE(vfs.New(failPutFs{inner}, &opt), false)
+	ofs := newRcloneFUSE(vfs.New(context.Background(), failPutFs{inner}, &opt), false)
 	var createOut gofuse.CreateOut
 	st := ofs.Create(nil, &gofuse.CreateIn{
 		InHeader: gofuse.InHeader{NodeId: 1},
