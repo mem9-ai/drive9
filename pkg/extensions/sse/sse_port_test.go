@@ -51,7 +51,7 @@ func TestPortSSEForeignResetClearsCaches(t *testing.T) {
 	if notify.all == 0 {
 		t.Error("foreign structural reset must InvalidateAll")
 	}
-	if !w.current {
+	if w.unverified {
 		t.Error("reset must mark the stream current")
 	}
 }
@@ -147,7 +147,7 @@ func startStreamSSE(t *testing.T, actor, root string, serve func(w http.Response
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, kind := range []fs.EventKind{fs.EventInvalidated, fs.EventDelete, fs.EventCheckout} {
+	for _, kind := range []fs.EventKind{fs.EventInvalidated, fs.EventDelete, fs.EventCheckout, fs.EventUnverified} {
 		bus.On(kind, log.record)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -273,10 +273,10 @@ func TestPortStreamOwnActorNonStructuralResetSweeps(t *testing.T) {
 }
 
 // v1 disconnect semantics (OnDisconnected -> markStatCacheUnverified): after
-// the stream drops the watcher emits EventCheckout — local caches that would
+// the stream drops the watcher emits EventUnverified — local caches that would
 // mask unobserved remote changes drop — but never kernel-invalidates
 // wholesale, and the stream is no longer current.
-func TestPortStreamDisconnectEmitsCheckoutWithoutKernelSweep(t *testing.T) {
+func TestPortStreamDisconnectInvalidatesWithoutCheckout(t *testing.T) {
 	var connections atomic.Int32
 	_, log, notify := startStreamSSE(t, "me", "/", func(hw http.ResponseWriter, hr *http.Request, flush func()) {
 		if connections.Add(1) > 1 {
@@ -290,8 +290,11 @@ func TestPortStreamDisconnectEmitsCheckoutWithoutKernelSweep(t *testing.T) {
 		// disconnect.
 		time.Sleep(300 * time.Millisecond)
 	})
-	if !waitForLog(t, 3*time.Second, func() bool { return len(log.of(fs.EventCheckout)) >= 1 }) {
-		t.Fatal("disconnect did not emit checkout")
+	if !waitForLog(t, 3*time.Second, func() bool { return len(log.of(fs.EventUnverified)) >= 1 }) {
+		t.Fatal("disconnect did not invalidate caches")
+	}
+	if got := len(log.of(fs.EventCheckout)); got != 0 {
+		t.Fatalf("disconnect emitted %d checkouts", got)
 	}
 	if _, _, all := notify.snapshot(); all != 0 {
 		t.Fatalf("InvalidateAll calls after disconnect = %d, want 0 (kernel caches stay)", all)
@@ -336,7 +339,7 @@ func TestPortStreamRemoteRootFilteringAndRebase(t *testing.T) {
 }
 
 // v1 TestSSEWatcherStreamCurrentVerifiesStatCache / heartbeat rows: the
-// stream-current heartbeat marker sweeps nothing. (The current flag itself is
+// initial stream-current heartbeat marker sweeps nothing. (The state itself is
 // written on the watcher goroutine; asserting it from the test goroutine
 // would race, so the ordered assertions stay with the synchronous tests.)
 func TestPortStreamHeartbeatDoesNotSweep(t *testing.T) {

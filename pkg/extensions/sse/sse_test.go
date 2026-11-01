@@ -123,7 +123,7 @@ func TestResetSweepsEverything(t *testing.T) {
 	if len(checkout) != 1 || notify.all != 1 {
 		t.Fatalf("checkout=%v all=%d", checkout, notify.all)
 	}
-	if !w.current {
+	if w.unverified {
 		t.Fatal("reset did not mark stream current")
 	}
 }

@@ -339,12 +339,12 @@ jobs:
           LAYER_FUSE_STRICT_PREREQS: "1"
         run: bash e2e/layer-fs-smoke-test.sh
 
-      - name: Test pending READDIRPLUS attributes through Linux FUSE
+      - name: Test READDIRPLUS and SSE disconnects through Linux FUSE
         id: fuse-readdir-pending
         continue-on-error: true
         env:
           DRIVE9_REQUIRE_KERNEL_FUSE: "1"
-        run: make test TEST_PKGS=./pkg/fuse TEST_RUN='^TestReadDirPlus(PendingKernel|ReplacedInodeKernel)$' TEST_TIMEOUT=2m
+        run: make test TEST_PKGS=./pkg/fuse TEST_RUN='^Test(ReadDirPlus(PendingKernel|ReplacedInodeKernel)|SSEDisconnectReadKernel)$' TEST_TIMEOUT=2m
 
       - name: Run FUSE release gate
         id: fuse-smoke

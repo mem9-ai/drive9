@@ -346,7 +346,7 @@ func New(opts Options) (*Writeback, error) {
 	// from the new base; DIRTY buffers keep their local writes (they are
 	// this mount's own acknowledged data and still commit) — review.
 	if opts.Events != nil {
-		opts.Events.On(fs.EventCheckout, func(e fs.Event) {
+		dropCleanBuffers := func(fs.Event) {
 			// liveSet keys on the handle; the value is the identity
 			// snapshot — asserting the value never matched a handle, so
 			// the sweep silently visited nothing and clean buffers kept
@@ -357,7 +357,9 @@ func New(opts Options) (*Writeback, error) {
 				}
 				return true
 			})
-		})
+		}
+		opts.Events.On(fs.EventCheckout, dropCleanBuffers)
+		opts.Events.On(fs.EventUnverified, dropCleanBuffers)
 	}
 	// FlushDebounce semantics: 0 disables, negative means unset (2s
 	// default — the CLI's default -1 must land on the default, not on 0).

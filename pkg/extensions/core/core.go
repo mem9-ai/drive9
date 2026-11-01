@@ -217,11 +217,13 @@ func New(cl *client.Client, opts Options) (*Core, error) {
 func (c *Core) AttachEvents(bus *fs.EventBus) {
 	c.bus = bus
 	if bus != nil {
-		bus.On(fs.EventCheckout, func(fs.Event) {
-			c.viewMu.Lock()
-			c.viewEpoch.Add(1)
-			c.viewMu.Unlock()
-		})
+		for _, kind := range []fs.EventKind{fs.EventCheckout, fs.EventUnverified} {
+			bus.On(kind, func(fs.Event) {
+				c.viewMu.Lock()
+				c.viewEpoch.Add(1)
+				c.viewMu.Unlock()
+			})
+		}
 	}
 }
 

@@ -118,10 +118,13 @@ type FS struct {
 	// viewMu makes the generation CHECK and the cache publication ATOMIC
 	// with respect to the reset: a plain Load before Put let a reset clear
 	// the cache in between and the old listing land afterwards.
-	viewGen   atomic.Uint64
-	viewMu    sync.RWMutex
-	pathLocks *lockTable
-	events    *fs.EventBus
+	viewGen atomic.Uint64
+	// readViewGen fences file replies only when the file view is replaced,
+	// not when event-stream continuity is lost and caches need revalidation.
+	readViewGen atomic.Uint64
+	viewMu      sync.RWMutex
+	pathLocks   *lockTable
+	events      *fs.EventBus
 
 	nextFh atomic.Uint64
 
@@ -331,19 +334,22 @@ func New(opts Options) (*FS, error) {
 	// namespace view too (v1 resetMountViewWithInitialSync /
 	// markStatCacheUnverified cleared the dir cache): stale listings must
 	// not answer lookups after the view restarted.
-	f.events.On(fs.EventCheckout, func(e fs.Event) {
+	invalidateView := func(e fs.Event) {
 		if e.KernelInvalidate {
 			// A revoked credential may address a different namespace:
 			// userspace-only invalidation left the same fd serving the old
 			// bytes from the kernel page cache.
 			f.InvalidateAll()
 		}
-		// A checkout/reset replaces the whole remote view: every listing
-		// installed before it is stale. Bump the fence and drop the open
+		// A reset or loss of event continuity makes cached listings
+		// unverified. Bump the fence and drop the open
 		// directory handles' snapshots (a live enumeration would otherwise
 		// replay the pre-reset entries for the rest of its pages).
 		f.viewMu.Lock()
 		f.viewGen.Add(1)
+		if e.Kind == fs.EventCheckout {
+			f.readViewGen.Add(1)
+		}
 		if f.Ctx.DirCache != nil {
 			f.Ctx.DirCache.InvalidateAll()
 		}
@@ -351,7 +357,9 @@ func New(opts Options) (*FS, error) {
 		for _, dh := range f.dirs.snapshot() {
 			dh.resetEntries()
 		}
-	})
+	}
+	f.events.On(fs.EventCheckout, invalidateView)
+	f.events.On(fs.EventUnverified, invalidateView)
 	return f, nil
 }
 
@@ -2686,7 +2694,7 @@ func (f *FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte) (gof
 	defer cf()
 	if h := f.openHandle(input.Fh); h != nil {
 		start := time.Now()
-		gen := f.viewGen.Load()
+		gen := f.readViewGen.Load()
 		n, err := h.Read(ctx, int64(input.Offset), buf)
 		f.recordHandleOp(fs.OpRead, start, err, uint64(n))
 		if err != nil && !errors.Is(err, io.EOF) {
@@ -2695,10 +2703,9 @@ func (f *FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte) (gof
 		// EVERY successful reply is fenced — a zero-byte EOF included: an
 		// old-view EOF makes the kernel stop reading where the new view has
 		// data.
-		if f.viewGen.Load() != gen {
-			// The bytes were produced from a view a reset replaced while the
-			// read was in flight: EAGAIN makes the kernel retry instead of
-			// pinning pre-reset content in its page cache.
+		if f.readViewGen.Load() != gen {
+			// Reject bytes from the replaced view rather than install them
+			// in the kernel page cache. Applications may observe EAGAIN.
 			return nil, gofuse.EAGAIN
 		}
 		// The result must be NON-NIL even at EOF: go-fuse only adjusts
@@ -2710,12 +2717,12 @@ func (f *FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte) (gof
 	if !ok {
 		return nil, gofuse.ENOENT
 	}
-	gen := f.viewGen.Load()
+	gen := f.readViewGen.Load()
 	res, st := f.dispatch(ctx, &fs.Op{Kind: fs.OpRead, Path: path, Ino: input.NodeId, Fh: input.Fh, Offset: int64(input.Offset), Limit: int64(input.Size), Kernel: input, Caller: fs.CallerFrom(input.InHeader)})
 	if st != gofuse.OK {
 		return nil, st
 	}
-	if f.viewGen.Load() != gen {
+	if f.readViewGen.Load() != gen {
 		// Empty (EOF) replies are fenced too: see the handle path.
 		return nil, gofuse.EAGAIN
 	}
