@@ -71,20 +71,29 @@ jobs:
         env:
           D9_FSTEST_BIN: ''
 
-      - name: Run pr-gate tier (embedded mock backend + rustfs)
-        timeout-minutes: 25
+      - name: Run pr-gate tier — server-surface cases (no mount)
         run: |
           export PATH="$PWD/bin:$PATH"
-          export D9_FSTEST_BIN="$(ls -d ~/.cache/drive9-simulator/fstest/main/target/release/fstest)"
           simulator/target/release/drive9-simulator run-suite simulator/suites.toml \
             --tier pr-gate --stack mock --stop-on-fail \
             --home /tmp/d9-suite-home
+
+      - name: Run pr-gate-mount tier (FUSE cases, hard-bounded)
+        # GNU timeout with SIGKILL grace: a wedged FUSE daemon cannot hold
+        # the step (or the job) hostage; the step log still shows per-case
+        # progress lines from run-suite
+        run: |
+          export PATH="$PWD/bin:$PATH"
+          export D9_FSTEST_BIN="$(ls -d ~/.cache/drive9-simulator/fstest/main/target/release/fstest)"
+          timeout -k 15 1200 simulator/target/release/drive9-simulator run-suite simulator/suites.toml \
+            --tier pr-gate-mount --stack mock \
+            --home /tmp/d9-suite-mount-home
 
       - name: pjdfstest gate (no-skip, merge-blocking)
         run: |
           export PATH="$PWD/bin:$PATH"
           export D9_FSTEST_BIN="$(ls -d ~/.cache/drive9-simulator/fstest/main/target/release/fstest)"
-          sudo -E simulator/target/release/drive9-simulator run \
+          sudo -E timeout -k 15 1800 simulator/target/release/drive9-simulator run \
             simulator/cases/community/fstest-pjdfstest.t \
             --stack mock --allow-other --timeout 30m
 
@@ -92,7 +101,7 @@ jobs:
         run: |
           export PATH="$PWD/bin:$PATH"
           export D9_FSTEST_BIN="$(ls -d ~/.cache/drive9-simulator/fstest/main/target/release/fstest)"
-          simulator/target/release/drive9-simulator run-suite simulator/suites.toml \
+          timeout -k 15 1500 simulator/target/release/drive9-simulator run-suite simulator/suites.toml \
             --tier bench --stack mock --home /tmp/d9-bench-home
           python3 simulator/scripts/perf_baseline.py \
             --artifacts /tmp/d9-bench-home \
@@ -115,5 +124,6 @@ jobs:
           name: simulator-e2e-artifacts
           path: |
             /tmp/d9-suite-home
+            /tmp/d9-suite-mount-home
             /tmp/drive9-simulator-suite-*
           if-no-files-found: ignore

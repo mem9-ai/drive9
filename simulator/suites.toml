@@ -3,31 +3,6 @@
 # Case paths resolve as simulator/cases/<name>.t.
 
 # ---- pr-gate: fast core (mock backend friendly) ----
-[[case]]
-name = "community/fstest-sqlite"
-tier = "pr-gate"
-timeout = "10m"
-
-[[case]]
-name = "community/fstest-fsx"
-tier = "pr-gate"
-timeout = "10m"
-
-[[case]]
-name = "webdev/save-then-read"
-tier = "pr-gate"
-
-[[case]]
-name = "webdev/exclusive-create"
-tier = "pr-gate"
-
-[[case]]
-name = "juicefs/rmr"
-tier = "pr-gate"
-
-[[case]]
-name = "juicefs/cache-consistency"
-tier = "pr-gate"
 
 [[case]]
 name = "drive9/api-fs"
@@ -40,6 +15,32 @@ tier = "pr-gate"
 no_mount = true
 
 # ---- nightly: bigger / root-requiring community suites ----
+[[case]]
+name = "community/fstest-sqlite"
+tier = "pr-gate-mount"
+timeout = "10m"
+
+[[case]]
+name = "community/fstest-fsx"
+tier = "pr-gate-mount"
+timeout = "10m"
+
+[[case]]
+name = "webdev/save-then-read"
+tier = "pr-gate-mount"
+
+[[case]]
+name = "webdev/exclusive-create"
+tier = "pr-gate-mount"
+
+[[case]]
+name = "juicefs/rmr"
+tier = "pr-gate-mount"
+
+[[case]]
+name = "juicefs/cache-consistency"
+tier = "pr-gate-mount"
+
 [[case]]
 name = "community/fstest-pjdfstest"
 tier = "nightly"

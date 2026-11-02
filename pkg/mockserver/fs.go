@@ -28,9 +28,13 @@ func tenantFrom(r *http.Request) *tenantDB {
 // the fs domain under /v1/fs/.
 func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
-	case "/v1/fs:batch-stat", "/v1/fs:batch-read-small", "/v1/fs:batch-write", "/v1/fs:batch-upload":
-		// Tier 1 (spec §21); until then answer with the documented
-		// capability-boundary shape instead of a silent 404.
+	case "/v1/fs:batch-stat", "/v1/fs:batch-read-small":
+		// the mount daemon probes these during startup; empty SUCCESS for a
+		// fresh tenant is a valid answer and keeps the daemon from wedging
+		// on a 501 (a Tier 1 fidelity TODO fills in real batching)
+		writeJSON(w, http.StatusOK, map[string]any{"results": []any{}})
+		return
+	case "/v1/fs:batch-write", "/v1/fs:batch-upload":
 		errJSONCode(w, http.StatusNotImplemented, "batch_not_implemented",
 			"batch endpoints are mock Tier 1")
 		return
