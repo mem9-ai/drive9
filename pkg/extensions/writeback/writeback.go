@@ -714,15 +714,22 @@ func extOf(base string) string {
 
 // openDirectIO reports whether a freshly opened handle should reply
 // FOPEN_DIRECT_IO (v1 remoteOpenFlagsForHandle): sqlite-coherent paths,
-// shadow-backed staged images, and bases at or above the 64MB threshold.
-func (w *Writeback) openDirectIO(path string, baseSize int64) bool {
+// shadow-backed staged images, and WRITABLE opens that truncate or start
+// from a base at or above the 64MB threshold. v1 gated the size rule on a
+// buffer-backed handle (fh.Dirty != nil); applying it to read-only opens
+// too dropped the page cache for every large file, so a kernel-warm
+// re-read went through FUSE instead of the page cache.
+func (w *Writeback) openDirectIO(path string, flags uint32, baseSize int64) bool {
 	if w.isSQLiteDirectIOPath(path) {
 		return true
 	}
 	if w.opts.Staging != nil && w.opts.Staging.Pending.HasPending(path) {
 		return true
 	}
-	return baseSize >= smallFileShadowThreshold
+	if flags&(uint32(syscall.O_WRONLY)|uint32(syscall.O_RDWR)) == 0 {
+		return false
+	}
+	return flags&uint32(syscall.O_TRUNC) != 0 || baseSize >= smallFileShadowThreshold
 }
 
 // nextMutSeq stamps a handle mutation with the mount-wide ordering epoch
@@ -1013,10 +1020,10 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			}
 			w.track(h)
 			res.Handle = h
-			if w.openDirectIO(op.Path, h.baseSize) {
-				// v1 remoteOpenFlagsForHandle: shadow-backed/sqlite/large
-				// bases reply DIRECT_IO; the facade keeps the flag and skips
-				// KEEP_CACHE.
+			if w.openDirectIO(op.Path, flags, h.baseSize) {
+				// v1 remoteOpenFlagsForHandle: shadow-backed/sqlite paths and
+				// large writable bases reply DIRECT_IO; the facade keeps the
+				// flag and skips KEEP_CACHE.
 				res.OpenFlags |= gofuse.FOPEN_DIRECT_IO
 			}
 			if trunc && res.Attr != nil {
@@ -1090,7 +1097,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			}
 			w.track(h)
 			res.Handle = h
-			if w.openDirectIO(op.Path, h.baseSize) {
+			if w.openDirectIO(op.Path, flags, h.baseSize) {
 				res.OpenFlags |= gofuse.FOPEN_DIRECT_IO
 			}
 			if trunc && res.Attr != nil {
@@ -1627,6 +1634,67 @@ func (h *bufferingHandle) Anonymous() bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.unlinked
+}
+
+// IsRemoteNamespaceReadable reports whether a read through this handle
+// serves the ORDINARY remote namespace right now — the claim the outer
+// cache needs before its sequential prefetcher fetches blocks from the
+// remote behind the handle (v1 armed it for clean read-only opens and
+// served every local tier before a prefetch hit). It is false whenever a
+// tier of Read would answer from local bytes: this descriptor's buffer or
+// snapshot, or a path-level image (a live dirty writer, a staged or
+// pending image on the path or a hardlink alias). Otherwise the terminal's
+// own claim is forwarded, so a plane that does not read the remote
+// namespace (an overlay token, an extent handle) stays excluded.
+func (h *bufferingHandle) IsRemoteNamespaceReadable() bool {
+	h.mu.Lock()
+	inner := h.inner
+	local := inner == nil || h.buf != nil || h.dirty || h.isNew || h.trunc || h.unlinked ||
+		h.pendingImage != nil || h.pendingFile != nil || h.pendingShadowGen != 0
+	h.mu.Unlock()
+	if local || h.w.pathHasLocalImage(h) {
+		return false
+	}
+	r, ok := inner.(interface{ IsRemoteNamespaceReadable() bool })
+	return ok && r.IsRemoteNamespaceReadable()
+}
+
+// pathHasLocalImage reports whether a clean descriptor's read would be
+// answered by a local tier of Read instead of the remote namespace — the
+// path-level state no handle field records: a staged .dat/.meta image, a
+// dirty buffer on any live sibling of the inode (same-path fds and
+// hardlink aliases, the set readLiveWriter/readVisibleSiblingImage serve
+// from), or a pending (released, not yet landed) image on the path or an
+// alias (readAliasStagedImage). A sibling mid-mutation (its lock held) is
+// treated as a local image: fail closed, the tier below decides.
+func (w *Writeback) pathHasLocalImage(h *bufferingHandle) bool {
+	ino, path := w.identityOf(h)
+	if w.wbCache != nil {
+		if _, ok := w.wbCache.GetMeta(path); ok {
+			return true
+		}
+	}
+	for _, sib := range w.inodeHandles(ino, path) {
+		if sib == h {
+			continue
+		}
+		if !sib.mu.TryLock() {
+			return true
+		}
+		dirty := sib.dirty && sib.buf != nil && !sib.unlinked
+		sib.mu.Unlock()
+		if dirty {
+			return true
+		}
+	}
+	if w.opts.Staging != nil {
+		for _, alias := range w.inodeAliasPaths(ino, path) {
+			if w.opts.Staging.Pending.HasPending(alias) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // Read implements fs.Handle.

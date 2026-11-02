@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/client"
@@ -535,15 +536,17 @@ func (c *Cache) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 		// arm behind a claim whose bytes EQUAL that namespace — an
 		// explicit capability on the terminal (core's SyncHandle), not a
 		// decorator-shape inference (localize's token has no UnwrapHandle
-		// and passed the old check, mixing local and remote images).
-		if plainInner, ok := res.Handle.(interface {
-			IsRemoteNamespaceReadable() bool
-		}); ok && plainInner.IsRemoteNamespaceReadable() {
+		// and passed the old check, mixing local and remote images). A
+		// decorator that serves the remote bytes unchanged (writeback's
+		// clean descriptor of a path without local images) forwards the
+		// terminal's claim; one that serves its own bytes withholds it.
+		if remoteNamespaceReadable(res.Handle) && op.Flags&(uint32(syscall.O_WRONLY)|uint32(syscall.O_RDWR)) == 0 {
 			if c.opts.SequentialPrefetch && c.opts.PrefetchClient != nil && size > c.mem.MaxFileSize() {
-				// v1 armed the prefetcher only for handles whose size
-				// exceeds the whole-file cache admission limit: smaller
-				// files are served by the mem cache itself and need no
-				// block read-ahead.
+				// v1 armed the prefetcher only for READ-ONLY opens of files
+				// whose size exceeds the whole-file cache admission limit:
+				// smaller files are served by the mem cache itself and need
+				// no block read-ahead, and a writable descriptor's first
+				// write would only invalidate it.
 				p := NewPrefetcher(c.opts.PrefetchClient, c.remotePathOf(op.Path), size)
 				p.SetParallelRead(c.opts.ParallelReadConcurrency, c.opts.ParallelReadBlockSize)
 				h.prefetch = p
@@ -646,9 +649,18 @@ func (h *cachingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 		return copy(dest, data[off:]), nil
 	}
 	if h.prefetch != nil {
-		h.prefetch.OnRead(off, len(dest))
-		if data, ok := h.prefetch.Get(off, len(dest)); ok {
-			return copy(dest, data), nil
+		if remoteNamespaceReadable(h.inner) {
+			h.prefetch.OnRead(off, len(dest))
+			if data, ok := h.prefetch.Get(off, len(dest)); ok {
+				return copy(dest, data), nil
+			}
+		} else {
+			// The path acquired a local image after the open armed the
+			// prefetcher (a sibling's released image still landing, a
+			// staged write): its blocks describe the remote base, not the
+			// bytes the plane below serves now. Drop them instead of
+			// answering stale; a later clean read re-arms from the remote.
+			h.prefetch.Invalidate()
 		}
 	}
 	// h.rev <= 0 means the open could not pin a trustworthy revision (the
@@ -796,6 +808,18 @@ func copyReadRange(dest, data []byte, off int64) int {
 		end = int64(len(data))
 	}
 	return copy(dest, data[off:end])
+}
+
+// remoteNamespaceReadable reports the plane's claim that reads through h
+// serve the ordinary remote namespace: core's SyncHandle states it, and a
+// decorator forwards it only while its own bytes equal the terminal's
+// (writeback: a clean descriptor of a path with no local image). It is
+// consulted when the prefetcher is armed and again on every read it could
+// answer, since the path can acquire a local image while the handle is
+// open.
+func remoteNamespaceReadable(h fs.Handle) bool {
+	r, ok := h.(interface{ IsRemoteNamespaceReadable() bool })
+	return ok && r.IsRemoteNamespaceReadable()
 }
 
 // Write implements fs.Handle.
