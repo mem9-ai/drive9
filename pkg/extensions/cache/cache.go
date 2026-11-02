@@ -965,6 +965,11 @@ func (h *cachingHandle) revalidateRevision(ctx context.Context, path string) (pi
 	}
 	h.mu.Lock()
 	if h.identityGen != gen {
+		// Unconditional, not only when the mover itself flags: an identity
+		// change from EventLanded, a retarget or a concurrent write does not
+		// set the flag, and a gap-mode revalidation runs with it unset —
+		// one extra stat after a raced revalidation is cheaper than
+		// trusting an identity that moved under an in-flight stat.
 		h.revalidate = true
 		h.mu.Unlock()
 		return false, nil

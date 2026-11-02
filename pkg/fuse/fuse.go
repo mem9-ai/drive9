@@ -2760,14 +2760,17 @@ func (f *FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []byte) (
 		// truncate/commit boundaries; a same-size overwrite changes nothing.
 		f.publishWriteLength(input.NodeId, int64(input.Offset)+int64(len(data)))
 		// Mixed page-cache modes on one inode: this descriptor's open replied
-		// DIRECT_IO (a large writable base) while a read-only sibling of the
-		// same file keeps the kernel page cache. A direct write bypasses
-		// those pages, and kernels before the 2026 "invalidate the page
-		// cache after FOPEN_DIRECT_IO write" fix leave them stale. Drop the
-		// written range for the siblings' benefit; a lone writer pays
-		// nothing. The notify runs off the request goroutine (the kernel's
-		// page locks are not reentrant from the request that holds them).
-		if hnd, ok := f.handles.get(input.Fh); ok && hnd.direct && len(f.openIdx.SnapshotInode(input.NodeId)) > 1 {
+		// DIRECT_IO (a large writable base) while read-only opens keep the
+		// kernel page cache — including pages left behind by a descriptor
+		// that has since closed. A direct write bypasses those pages, and
+		// kernels before the 2026 "fuse: invalidate the page cache after
+		// FOPEN_DIRECT_IO write" fix leave them stale for the next reader.
+		// Drop the written range unconditionally, as that fix does: without
+		// cached readers it is one async notify, and the open-handle count
+		// proves nothing about pages a closed KEEP_CACHE open left behind.
+		// The notify runs off the request goroutine (the kernel's page locks
+		// are not reentrant from the request that holds them).
+		if hnd, ok := f.handles.get(input.Fh); ok && hnd.direct {
 			f.InvalidateRange(input.NodeId, int64(input.Offset), int64(len(data)))
 		}
 		// v1's Write never stamps a local mtime: the clock advances only
