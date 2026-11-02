@@ -782,7 +782,7 @@ func TestCommitQueueCancellationInvalidatesLandedLandmarks(t *testing.T) {
 		cq.rememberLanded(path, 1, 1, "checksum", "snapshot-"+path)
 	}
 
-	cq.CancelPathPreserveLocal("/one.db")
+	_ = cq.CancelPathPreserveLocal("/one.db")
 	cq.CancelPrefix("/dir/")
 
 	if got := cq.landedCommit("/one.db"); got.snapshotID != "" {
@@ -871,7 +871,7 @@ func TestCommitQueueCancelDuringConflictLineageProofDoesNotMarkConflict(t *testi
 	c.SetSmallFileThresholdForTests(1 << 20)
 	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
 	defer cq.DrainAll()
-	defer cq.CancelPathPreserveLocal(path)
+	defer func() { _ = cq.CancelPathPreserveLocal(path) }()
 	cq.DurableWatermark = func(string) int64 { return watermark.Load() }
 	cq.rememberLanded(path, 1, int64(len(parent)), payloadChecksum(parent), parentSnapshot)
 	if err := cq.Enqueue(&CommitEntry{
@@ -886,7 +886,7 @@ func TestCommitQueueCancelDuringConflictLineageProofDoesNotMarkConflict(t *testi
 	case <-time.After(2 * time.Second):
 		t.Fatal("conflict lineage HEAD did not start")
 	}
-	cq.CancelPathPreserveLocal(path)
+	_ = cq.CancelPathPreserveLocal(path)
 	drained := make(chan struct{})
 	go func() {
 		cq.WaitPath(path)
@@ -1495,7 +1495,7 @@ func TestCommitQueueSpillConflictReadsHonorCancellation(t *testing.T) {
 			t.Cleanup(ts.Close)
 			cq := newLineageQueue(t, ts.URL)
 			// Cleanup must unblock the handler before draining, including on assertion failure.
-			t.Cleanup(func() { close(release); cq.CancelPathPreserveLocal(path) })
+			t.Cleanup(func() { close(release); _ = cq.CancelPathPreserveLocal(path) })
 			entry := stageLineageEntry(t, cq, path, payload, "B", "A", true)
 			// No watermark: the actual initial PUT hits 409 and enters spill resolution.
 			if err := cq.Enqueue(entry); err != nil {
@@ -1506,7 +1506,7 @@ func TestCommitQueueSpillConflictReadsHonorCancellation(t *testing.T) {
 			case <-time.After(2 * time.Second):
 				t.Fatal("conflict read did not start")
 			}
-			cq.CancelPathPreserveLocal(path)
+			_ = cq.CancelPathPreserveLocal(path)
 			drained := make(chan struct{})
 			go func() { cq.WaitPath(path); close(drained) }()
 			select {

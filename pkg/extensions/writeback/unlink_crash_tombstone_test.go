@@ -194,7 +194,9 @@ func TestUnlinkOfOpenFileInsideFsyncWindowDoesNotResurrectAfterCrash(t *testing.
 
 	// close(2) returned; RELEASE is still in flight, so unlink(2) takes the
 	// unlink-of-open-file branch: the queued upload is canceled mid-flight.
-	s.wb.MarkPathUnlinked(path)
+	if err := s.wb.MarkPathUnlinked(path); err != nil {
+		t.Fatalf("unlink-of-open-file marking: %v", err)
+	}
 
 	// kill -9 here.
 	if s.crashAndReplay(t, path) {
@@ -289,8 +291,9 @@ func TestFsyncRacingUnlinkOfOpenFileStagesNothing(t *testing.T) {
 	syncErr := make(chan error, 1)
 	go func() { syncErr <- h.Sync(ctx) }()
 	marked := make(chan struct{})
+	markErr := make(chan error, 1)
 	go func() {
-		s.wb.MarkPathUnlinked(path)
+		markErr <- s.wb.MarkPathUnlinked(path)
 		close(marked)
 	}()
 	// Wait for the unlink marking (it precedes the cancel's lock wait), so
@@ -323,6 +326,9 @@ func TestFsyncRacingUnlinkOfOpenFileStagesNothing(t *testing.T) {
 	case <-marked:
 	case <-time.After(10 * time.Second):
 		t.Fatal("MarkPathUnlinked never returned")
+	}
+	if err := <-markErr; err != nil {
+		t.Fatalf("racing unlink marking: %v", err)
 	}
 	if err := h.Release(ctx); err != nil {
 		t.Fatal(err)

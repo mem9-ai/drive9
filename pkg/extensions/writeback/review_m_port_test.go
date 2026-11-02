@@ -332,7 +332,7 @@ func TestPortDeferredUnlinkSnapshotSurvivesRecreate(t *testing.T) {
 	if err != nil || res.Handle == nil {
 		t.Fatalf("open = %v", err)
 	}
-	wb.MarkPathUnlinked("/a")
+	_ = wb.MarkPathUnlinked("/a")
 	// Recreate and commit a NEW file at the same name.
 	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/a"}); err != nil && !fs.IsNotFound(err) {
 		t.Fatalf("unlink = %v", err)
@@ -370,7 +370,7 @@ func TestPortUnlinkSnapshotRetiresCleanly(t *testing.T) {
 	if err != nil || res.Handle == nil {
 		t.Fatalf("open = %v", err)
 	}
-	wb.MarkPathUnlinked("/a")
+	_ = wb.MarkPathUnlinked("/a")
 	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/a"}); err != nil && !fs.IsNotFound(err) {
 		t.Fatalf("unlink = %v", err)
 	}
@@ -400,7 +400,7 @@ func TestPortUnlinkSnapshotSharedPinRetires(t *testing.T) {
 		return r.Handle
 	}
 	h1, h2 := open(), open()
-	wb.MarkPathUnlinked("/a")
+	_ = wb.MarkPathUnlinked("/a")
 	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/a"}); err != nil && !fs.IsNotFound(err) {
 		t.Fatalf("unlink = %v", err)
 	}
@@ -452,7 +452,7 @@ func TestPortWritableAnonymousFdKeepsOldImage(t *testing.T) {
 	if err != nil || res.Handle == nil {
 		t.Fatalf("open = %v", err)
 	}
-	wb.MarkPathUnlinked("/a")
+	_ = wb.MarkPathUnlinked("/a")
 	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/a"}); err != nil && !fs.IsNotFound(err) {
 		t.Fatalf("unlink = %v", err)
 	}
@@ -536,7 +536,7 @@ func TestPortConcurrentLastCloseReclaimsSnapshot(t *testing.T) {
 		return r.Handle
 	}
 	h1, h2 := openOne(), openOne()
-	wb.MarkPathUnlinked("/a")
+	_ = wb.MarkPathUnlinked("/a")
 	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/a"}); err != nil && !fs.IsNotFound(err) {
 		t.Fatalf("unlink = %v", err)
 	}
@@ -600,7 +600,7 @@ func TestPortLargeAnonymousSnapshotLoadsLazily(t *testing.T) {
 	if err != nil || res.Handle == nil {
 		t.Fatalf("open = %v", err)
 	}
-	wb.MarkPathUnlinked("/big")
+	_ = wb.MarkPathUnlinked("/big")
 	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/big"}); err != nil && !fs.IsNotFound(err) {
 		t.Fatalf("unlink = %v", err)
 	}
