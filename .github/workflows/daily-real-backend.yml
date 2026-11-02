@@ -1,0 +1,177 @@
+name: daily-real-backend
+
+# G5 of simulator/ROADMAP.md: the REAL-backend run (TiDB + rustfs +
+# drive9-server, provider=local) — daily, manually dispatchable, and
+# reusable as a release gate (`workflow_call`: a release workflow requiring
+# this workflow's success blocks the release until it passes). Also runs
+# the benchmark tier with baseline comparison against the previous run
+# (G6). The blackbox workflows this replaces were removed with it.
+
+on:
+  schedule:
+    - cron: '23 3 * * *'
+  workflow_dispatch:
+  workflow_call:
+
+concurrency:
+  group: daily-real-backend
+  cancel-in-progress: false
+
+jobs:
+  real-backend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      DRIVE9_TENANT_PROVIDER: local
+      DRIVE9_S3_BACKEND: s3
+      DRIVE9_EXTENT_ALLOW_STATIC_CREDENTIALS: '1'
+      DRIVE9_BASE: http://127.0.0.1:9009
+      D9_REPO: ${{ github.workspace }}
+      TIDB_VERSION: v8.5.5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y default-mysql-client fuse3 fio
+
+      - name: Enable user_allow_other for FUSE
+        run: |
+          grep -q '^user_allow_other' /etc/fuse.conf || \
+            echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
+
+      - name: Install TiUP
+        run: |
+          if [ ! -x "$HOME/.tiup/bin/tiup" ]; then
+            curl --proto '=https' --tlsv1.2 -sSf https://tiup-mirrors.pingcap.com/install.sh | sh
+          fi
+          echo "$HOME/.tiup/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.tiup/bin:$PATH"
+          tiup telemetry disable || true
+          tiup install playground
+          tiup install "tidb:${TIDB_VERSION}" "pd:${TIDB_VERSION}" "tikv:${TIDB_VERSION}"
+
+      - name: Start TiDB playground
+        run: |
+          export PATH="$HOME/.tiup/bin:$PATH"
+          nohup tiup playground "${TIDB_VERSION}" --tiflash 0 --without-monitor > /tmp/tiup-playground.log 2>&1 &
+          echo $! > /tmp/tiup-playground.pid
+
+      - name: Wait for TiDB and create database
+        run: |
+          for _ in {1..60}; do
+            if curl -sf http://127.0.0.1:10080/status > /dev/null \
+              && mysql --protocol=tcp -h 127.0.0.1 -P 4000 -u root \
+                -e "CREATE DATABASE IF NOT EXISTS drive9_local;"; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "TiDB playground did not become ready in time" >&2
+          tail -50 /tmp/tiup-playground.log >&2 || true
+          exit 1
+
+      - name: Start local object store (rustfs)
+        run: |
+          s3_env=$(bash scripts/local-object-store.sh apply)
+          eval "$s3_env"
+          python3 - <<'PY'
+          import os
+          names = ('DIR', 'BUCKET', 'REGION', 'ENDPOINT', 'FORCE_PATH_STYLE', 'ACCESS_KEY_ID', 'SECRET_ACCESS_KEY')
+          with open(os.environ['GITHUB_ENV'], 'a') as output:
+              for suffix in names:
+                  name = 'DRIVE9_S3_' + suffix
+                  output.write(name + '=' + os.environ.get(name, '') + '\n')
+          PY
+
+      - name: Build and start drive9-server
+        run: |
+          CGO_ENABLED=0 go build -o bin/drive9-server ./cmd/drive9-server
+          CGO_ENABLED=0 go build -o bin/drive9 ./cmd/drive9
+          echo "$PWD/bin" >> "$GITHUB_PATH"
+          nohup "$PWD/bin/drive9-server" > /tmp/drive9-server.log 2>&1 &
+          echo $! > /tmp/drive9-server.pid
+
+      - name: Wait for drive9-server readiness
+        run: |
+          for _ in {1..60}; do
+            if curl -sf "$DRIVE9_BASE/healthz"; then exit 0; fi
+            sleep 2
+          done
+          echo "drive9-server did not become ready" >&2
+          tail -50 /tmp/drive9-server.log >&2 || true
+          exit 1
+
+      - name: Build simulator
+        run: cargo build --release --manifest-path simulator/Cargo.toml
+
+      - name: Ensure fstest
+        run: simulator/target/release/drive9-simulator tools --ensure-fstest main
+
+      - name: Run pr-gate + nightly tiers (real backend)
+        run: |
+          export PATH="$PWD/bin:$PATH"
+          export D9_FSTEST_BIN="$(ls -d ~/.cache/drive9-simulator/fstest/main/target/release/fstest)"
+          simulator/target/release/drive9-simulator run-suite simulator/suites.toml \
+            --tier pr-gate --server "$DRIVE9_BASE" --home /tmp/d9-daily-pr
+          simulator/target/release/drive9-simulator run-suite simulator/suites.toml \
+            --tier nightly --server "$DRIVE9_BASE" --home /tmp/d9-daily-nightly
+
+      - name: pjdfstest gate (no-skip, real backend)
+        run: |
+          export PATH="$PWD/bin:$PATH"
+          export D9_FSTEST_BIN="$(ls -d ~/.cache/drive9-simulator/fstest/main/target/release/fstest)"
+          sudo -E simulator/target/release/drive9-simulator run \
+            simulator/cases/community/fstest-pjdfstest.t \
+            --server "$DRIVE9_BASE" --allow-other --timeout 30m
+
+      - name: Restore perf baseline
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/perf-baseline.json
+          key: perf-baseline-real-${{ github.run_id }}
+          restore-keys: perf-baseline-real-
+
+      - name: Benchmark tier + baseline comparison (G6)
+        run: |
+          export PATH="$PWD/bin:$PATH"
+          export D9_FSTEST_BIN="$(ls -d ~/.cache/drive9-simulator/fstest/main/target/release/fstest)"
+          simulator/target/release/drive9-simulator run-suite simulator/suites.toml \
+            --tier bench --server "$DRIVE9_BASE" --home /tmp/d9-daily-bench
+          python3 simulator/scripts/perf_baseline.py \
+            --artifacts /tmp/d9-daily-bench \
+            --baseline /tmp/perf-baseline.json \
+            --out /tmp/perf-baseline.json.new \
+            --threshold-pct 15
+          mv /tmp/perf-baseline.json.new /tmp/perf-baseline.json
+
+      - name: Save perf baseline
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/perf-baseline.json
+          key: perf-baseline-real-${{ github.run_id }}
+
+      - name: Stop server and object store
+        if: always()
+        run: |
+          bash scripts/local-object-store.sh stop || true
+          [ -f /tmp/drive9-server.pid ] && kill "$(cat /tmp/drive9-server.pid)" || true
+
+      - name: Upload run artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-real-backend-artifacts
+          path: |
+            /tmp/d9-daily-*
+            /tmp/drive9-server.log
+            /tmp/tiup-playground.log
+          if-no-files-found: ignore

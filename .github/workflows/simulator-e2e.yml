@@ -47,6 +47,16 @@ jobs:
           grep -q '^user_allow_other' /etc/fuse.conf || \
             echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
 
+      - name: Install benchmark prerequisites
+        run: sudo apt-get update && sudo apt-get install -y fio
+
+      - name: Restore perf baseline
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/perf-baseline.json
+          key: perf-baseline-mock-${{ github.run_id }}
+          restore-keys: perf-baseline-mock-
+
       - name: Build drive9 CLI + mock server
         run: |
           CGO_ENABLED=0 go build -o bin/drive9 ./cmd/drive9
@@ -76,6 +86,26 @@ jobs:
           sudo -E simulator/target/release/drive9-simulator run \
             simulator/cases/community/fstest-pjdfstest.t \
             --stack mock --allow-other --timeout 30m
+
+      - name: Benchmark tier + baseline comparison (G6, red on regression)
+        run: |
+          export PATH="$PWD/bin:$PATH"
+          export D9_FSTEST_BIN="$(ls -d ~/.cache/drive9-simulator/fstest/main/target/release/fstest)"
+          simulator/target/release/drive9-simulator run-suite simulator/suites.toml \
+            --tier bench --stack mock --home /tmp/d9-bench-home
+          python3 simulator/scripts/perf_baseline.py \
+            --artifacts /tmp/d9-bench-home \
+            --baseline /tmp/perf-baseline.json \
+            --out /tmp/perf-baseline.json.new \
+            --threshold-pct 15
+          mv /tmp/perf-baseline.json.new /tmp/perf-baseline.json
+
+      - name: Save perf baseline
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/perf-baseline.json
+          key: perf-baseline-mock-${{ github.run_id }}
 
       - name: Upload run artifacts
         if: failure()

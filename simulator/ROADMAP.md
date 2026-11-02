@@ -137,19 +137,30 @@ Delete `blackbox/` and `e2e/` only after G4 (CI cut-over) lands.
 
 ## G5 — Daily real-backend action + release gate
 
-- [ ] Remove blackbox workflows (.github/workflows/blackbox*.yml).
-- [ ] Daily action: real backend (TiDB + rustfs + drive9-server, provider=local
-      first; hosted later) runs the full tier set; same perf-baseline gating as
-      G6; wired as a required release gate.
+- [x] Removed .github/workflows/blackbox{,-daily,-weekly}.yml.
+- [x] `.github/workflows/daily-real-backend.yml`: cron daily + dispatch +
+      `workflow_call` (release workflows can gate on it). Real backend =
+      TiDB playground + rustfs via local-object-store.sh + built
+      drive9-server (provider=local, static extent credentials); runs
+      pr-gate + nightly tiers, no-skip pjdfstest gate, benchmark tier with
+      baseline comparison; artifacts on failure.
+- [ ] Wire the release workflow to require this one (release-cli.yml edit
+      when the first daily run is green).
 
 ## G6 — Perf suites as regression gates
 
-- [ ] fstest benchmark suites (fio, smallfile, mdtest, fsmark, mdworkbench) in
-      PR gate (mock backend + `latency` shaping) and daily (real backend).
-- [ ] Baseline store: last run's JSON per suite/params; compare, mark red when
-      worse than threshold %; report p50/p95/p99 deltas in the job summary.
-- [ ] fstest prerequisites: pin by git ref (add a --version flag upstream),
-      musl static build in the tools layer, system fio for the fio wrapper.
+- [x] Benchmark cases (tier "bench"): community/fstest-fio, fstest-smallfile,
+      fstest-mdtest — each shapes backend latency via the `latency` primitive
+      (e.g. 2ms-8ms on PUT/GET /v1/fs) before running the suite.
+- [x] `simulator/scripts/perf_baseline.py`: extracts per-suite metrics from
+      the run's fstest-*.json artifacts (fio bwBytes per direction, smallfile
+      filesPerSec per phase, mdtest totalRate per op), compares against the
+      previous baseline, RED (exit 1) beyond --threshold-pct, writes the new
+      baseline. Verified with synthetic data (OK +2.5%, RED -30%).
+- [x] Both gates wired: simulator-e2e.yml (PR, mock backend, cache key
+      perf-baseline-mock-) and daily-real-backend.yml (real backend,
+      perf-baseline-real-) via actions/cache save/restore.
+- [ ] First real baselines land after the first CI runs; tune thresholds.
 
 ## Housekeeping
 
