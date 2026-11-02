@@ -714,11 +714,11 @@ func extOf(base string) string {
 
 // openDirectIO reports whether a freshly opened handle should reply
 // FOPEN_DIRECT_IO (v1 remoteOpenFlagsForHandle): sqlite-coherent paths,
-// shadow-backed staged images, and WRITABLE opens that truncate or start
-// from a base at or above the 64MB threshold. v1 gated the size rule on a
-// buffer-backed handle (fh.Dirty != nil); applying it to read-only opens
-// too dropped the page cache for every large file, so a kernel-warm
-// re-read went through FUSE instead of the page cache.
+// shadow-backed staged images, and WRITABLE opens of a base at or above
+// the 64MB threshold. v1 gated the size rule on a buffer-backed handle
+// (fh.Dirty != nil); applying it to read-only opens too dropped the page
+// cache for every large file, so a kernel-warm re-read went through FUSE
+// instead of the page cache.
 func (w *Writeback) openDirectIO(path string, flags uint32, baseSize int64) bool {
 	if w.isSQLiteDirectIOPath(path) {
 		return true
@@ -729,7 +729,7 @@ func (w *Writeback) openDirectIO(path string, flags uint32, baseSize int64) bool
 	if flags&(uint32(syscall.O_WRONLY)|uint32(syscall.O_RDWR)) == 0 {
 		return false
 	}
-	return flags&uint32(syscall.O_TRUNC) != 0 || baseSize >= smallFileShadowThreshold
+	return baseSize >= smallFileShadowThreshold
 }
 
 // nextMutSeq stamps a handle mutation with the mount-wide ordering epoch

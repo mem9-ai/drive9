@@ -14,10 +14,11 @@ import (
 	"github.com/mem9-ai/drive9/pkg/fs"
 )
 
-// v1 remoteOpenFlagsForHandle replied DIRECT_IO for a large or truncating
-// base only on a buffer-backed (writable) handle; a read-only open of a
-// large file kept the kernel page cache. The port applied the size rule to
-// every open, so a kernel-warm re-read of a 1 GiB file went through FUSE.
+// v1 remoteOpenFlagsForHandle replied DIRECT_IO for a large base only on a
+// buffer-backed (writable) handle; a read-only open of a large file kept the
+// kernel page cache. The port applied the size rule to every open, so a
+// kernel-warm re-read of a 1 GiB file went through FUSE. O_TRUNC alone does
+// not select DIRECT_IO (unchanged from the port).
 func TestOpenDirectIOGatesSizeRuleOnWritableOpens(t *testing.T) {
 	w, err := New(Options{Policy: PolicyWriteBack, Client: client.New("http://127.0.0.1:1", "")})
 	if err != nil {
@@ -35,8 +36,9 @@ func TestOpenDirectIOGatesSizeRuleOnWritableOpens(t *testing.T) {
 		{"read-only with O_TRUNC bit, large", uint32(syscall.O_RDONLY | syscall.O_TRUNC), big, false},
 		{"rdwr large", uint32(syscall.O_RDWR), big, true},
 		{"wronly large", uint32(syscall.O_WRONLY), big, true},
+		{"wronly trunc large", uint32(syscall.O_WRONLY | syscall.O_TRUNC), big, true},
 		{"rdwr small", uint32(syscall.O_RDWR), 4096, false},
-		{"wronly trunc small", uint32(syscall.O_WRONLY | syscall.O_TRUNC), 4096, true},
+		{"wronly trunc small", uint32(syscall.O_WRONLY | syscall.O_TRUNC), 4096, false},
 	}
 	for _, tc := range cases {
 		if got := w.openDirectIO("/f", tc.flags, tc.size); got != tc.want {
