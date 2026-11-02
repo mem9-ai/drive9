@@ -25,6 +25,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -417,6 +418,12 @@ func TestUnlinkMarkerFailureDropsPreservedState(t *testing.T) {
 // because the durable staging now correctly describes a file that was never
 // unlinked.
 func TestUnlinkMarkerAndCleanupFailureFailsUnlink(t *testing.T) {
+	// The failure injection is a directory without write permission: root
+	// ignores the bits and Windows has no POSIX permission semantics, and
+	// under either the cleanup succeeds and this row would false-fail.
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("directory permission bits cannot block the shadow removal on this platform/user")
+	}
 	const path = "/bothdown.txt"
 	s := newUnlinkWindowStack(t, path)
 	s.hold.Store(true)
