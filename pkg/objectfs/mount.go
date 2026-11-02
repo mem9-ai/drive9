@@ -63,7 +63,7 @@ func Mount(opts Options) error {
 	if cacheDir != "" {
 		_ = config.SetCacheDir(cacheDir)
 	}
-	v := vfs.New(f, &vopt)
+	v := vfs.New(context.Background(), f, &vopt)
 	var pidFile string
 	defer func() {
 		shutdownObjectVFS(v, cacheDir)
