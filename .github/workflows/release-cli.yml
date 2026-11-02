@@ -56,24 +56,12 @@ jobs:
         run: |
           echo "${{ env.VERSION }}" > dist/version
 
-      - name: Push to drive9-fe
-        run: |
-          git clone --depth 1 "https://x-access-token:${{ secrets.DRIVE9_FE_DEPLOY_TOKEN }}@github.com/mem9-ai/drive9-fe.git" /tmp/drive9-fe
-          mkdir -p /tmp/drive9-fe/site/releases
-          cp dist/* /tmp/drive9-fe/site/releases/
-          cd /tmp/drive9-fe
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add site/releases/
-          git diff --cached --quiet && echo "No changes to commit" && exit 0
-          git commit -m "release: drive9 CLIs ${{ env.VERSION }}"
-          git pull --rebase
-          git push
-
       - name: Generate SHA256SUMS
         run: |
           cd dist
           sha256sum drive9-* kubectl-drive9-migration-* > SHA256SUMS
+          sha256sum --check checksums.txt
+          sha256sum --check migration-kube-plugin-checksums.txt
           cat SHA256SUMS
 
       - name: Configure AWS credentials
@@ -89,6 +77,8 @@ jobs:
             --include "drive9-*" \
             --include "kubectl-drive9-migration-*" \
             --include "SHA256SUMS" \
+            --include "checksums.txt" \
+            --include "migration-kube-plugin-checksums.txt" \
             --include "version" \
             --cache-control "public, max-age=300" \
             --content-type "application/octet-stream" \
