@@ -78,33 +78,66 @@ jobs:
             --tier pr-gate --stack mock --stop-on-fail \
             --home /tmp/d9-suite-home
 
-      - name: Run pr-gate-mount tier (FUSE cases, hard-bounded)
-        # GNU timeout with SIGKILL grace: a wedged FUSE daemon cannot hold
-        # the step (or the job) hostage; the step log still shows per-case
-        # progress lines from run-suite
+      - name: Run pr-gate-mount tier (FUSE cases inside a bounded container)
+        # The mount tier runs inside a fuse-enabled container: identical to
+        # the locally-verified environment, artifacts land on the host via
+        # the volume, and a wedged FUSE daemon is contained by
+        # `docker kill` (proven reliable) instead of holding the job
+        # hostage (a D-state process survives even job cancellation).
         run: |
-          export PATH="$PWD/bin:$PATH"
-          export D9_FSTEST_BIN="$(ls -d ~/.cache/drive9-simulator/fstest/main/target/release/fstest)"
-          timeout -k 15 1200 simulator/target/release/drive9-simulator run-suite simulator/suites.toml \
-            --tier pr-gate-mount --stack mock \
-            --home /tmp/d9-suite-mount-home
+          mkdir -p /tmp/d9-mount-out
+          timeout -k 15 1500 docker run --rm --name sim-mount-tier \
+            --device /dev/fuse --cap-add SYS_ADMIN \
+            -v "$PWD:/repo" -v /tmp/d9-mount-out:/out \
+            -v ~/.cache/drive9-simulator:/root/.cache/drive9-simulator \
+            ubuntu:24.04 bash -ec '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq && apt-get install -y -qq fuse3 curl >/dev/null
+              export D9_MOCK_SERVER_BIN=/repo/bin/drive9-mock-server D9_REPO=/repo
+              cd /repo
+              timeout -k 10 1350 simulator/target/release/drive9-simulator run-suite simulator/suites.toml \
+                --tier pr-gate-mount --stack mock --bin /repo/bin/drive9 --home /out/home
+            ' || rc=$?
+          if [ -n "${rc:-}" ] && [ "$rc" != 0 ]; then docker kill sim-mount-tier 2>/dev/null; exit $rc; fi
 
-      - name: pjdfstest gate (no-skip, merge-blocking)
+      - name: pjdfstest gate (no-skip, merge-blocking, containerized)
         run: |
-          export PATH="$PWD/bin:$PATH"
-          export D9_FSTEST_BIN="$(ls -d ~/.cache/drive9-simulator/fstest/main/target/release/fstest)"
-          sudo -E timeout -k 15 1800 simulator/target/release/drive9-simulator run \
-            simulator/cases/community/fstest-pjdfstest.t \
-            --stack mock --allow-other --timeout 30m
+          mkdir -p /tmp/d9-pjdf-out
+          timeout -k 15 1800 docker run --rm --name sim-pjdfstest \
+            --device /dev/fuse --cap-add SYS_ADMIN \
+            -v "$PWD:/repo" -v /tmp/d9-pjdf-out:/out \
+            -v ~/.cache/drive9-simulator:/root/.cache/drive9-simulator \
+            ubuntu:24.04 bash -ec '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq && apt-get install -y -qq fuse3 curl >/dev/null
+              export D9_MOCK_SERVER_BIN=/repo/bin/drive9-mock-server D9_REPO=/repo
+              export D9_FSTEST_BIN=/root/.cache/drive9-simulator/fstest/main/target/release/fstest
+              cd /repo
+              timeout -k 10 1650 simulator/target/release/drive9-simulator run \
+                simulator/cases/community/fstest-pjdfstest.t \
+                --stack mock --allow-other --bin /repo/bin/drive9 --home /out/home
+            ' || rc=$?
+          if [ -n "${rc:-}" ] && [ "$rc" != 0 ]; then docker kill sim-pjdfstest 2>/dev/null; exit $rc; fi
 
       - name: Benchmark tier + baseline comparison (G6, red on regression)
         run: |
-          export PATH="$PWD/bin:$PATH"
-          export D9_FSTEST_BIN="$(ls -d ~/.cache/drive9-simulator/fstest/main/target/release/fstest)"
-          timeout -k 15 1500 simulator/target/release/drive9-simulator run-suite simulator/suites.toml \
-            --tier bench --stack mock --home /tmp/d9-bench-home
+          mkdir -p /tmp/d9-bench-out
+          timeout -k 15 1800 docker run --rm --name sim-bench-tier \
+            --device /dev/fuse --cap-add SYS_ADMIN \
+            -v "$PWD:/repo" -v /tmp/d9-bench-out:/out \
+            -v ~/.cache/drive9-simulator:/root/.cache/drive9-simulator \
+            ubuntu:24.04 bash -ec '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq && apt-get install -y -qq fuse3 curl fio >/dev/null
+              export D9_MOCK_SERVER_BIN=/repo/bin/drive9-mock-server D9_REPO=/repo
+              export D9_FSTEST_BIN=/root/.cache/drive9-simulator/fstest/main/target/release/fstest
+              cd /repo
+              timeout -k 10 1650 simulator/target/release/drive9-simulator run-suite simulator/suites.toml \
+                --tier bench --stack mock --bin /repo/bin/drive9 --home /out/home
+            ' || rc=$?
+          if [ -n "${rc:-}" ] && [ "$rc" != 0 ]; then docker kill sim-bench-tier 2>/dev/null; exit $rc; fi
           python3 simulator/scripts/perf_baseline.py \
-            --artifacts /tmp/d9-bench-home \
+            --artifacts /tmp/d9-bench-out \
             --baseline /tmp/perf-baseline.json \
             --out /tmp/perf-baseline.json.new \
             --threshold-pct 15
@@ -124,6 +157,8 @@ jobs:
           name: simulator-e2e-artifacts
           path: |
             /tmp/d9-suite-home
-            /tmp/d9-suite-mount-home
+            /tmp/d9-mount-out
+            /tmp/d9-pjdf-out
+            /tmp/d9-bench-out
             /tmp/drive9-simulator-suite-*
           if-no-files-found: ignore

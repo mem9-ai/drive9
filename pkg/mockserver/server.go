@@ -102,7 +102,22 @@ func (s *Server) Close() error {
 }
 
 // Handler returns the routed HTTP handler.
-func (s *Server) Handler() http.Handler { return s.mux }
+func (s *Server) Handler() http.Handler { return s.logRequests(s.mux) }
+
+// logRequests records method, path and duration per request — the mock's
+// equivalent of an access log, which makes backend-side stalls visible
+// (a hung client request shows up as the last line with no completion).
+func (s *Server) logRequests(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		next.ServeHTTP(w, r)
+		s.log.Info("request",
+			zap.String("method", r.Method),
+			zap.String("path", r.URL.Path),
+			zap.Duration("dur", time.Since(start)),
+		)
+	})
+}
 
 func (s *Server) routes() {
 	mux := http.NewServeMux()
