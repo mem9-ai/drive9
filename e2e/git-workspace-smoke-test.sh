@@ -434,11 +434,19 @@ setup_ignored_local_only_probe() {
   local repo="$1"
   local marker="$2"
   # The coding-agent overlay only routes a Rust `target/` directory to the local
-  # overlay, and only when a .gitignore in the same directory ignores it. The
-  # fixture's committed root .gitignore carries `target/`, so the probe lives
-  # directly under the repo root.
+  # overlay, and only when a .gitignore ignores it, so the probe lives directly
+  # under the repo root.
+  #
+  # The fixtures are cloned from their live default branches, which do not all
+  # ignore `target/` (mem9-ai/drive9 and MoonshotAI/kimi-code do not list it in
+  # their root .gitignore). Relying on the fixture's committed file made this
+  # check assert the upstream repo's .gitignore content instead of the ignore
+  # behaviour under test, so supply the rule when the clone lacks it.
   mkdir -p "$repo/target/local-only" || return
   printf 'ignored local-only %s\n' "$marker" > "$repo/target/local-only/cache.txt" || return
+  if ! git_cmd -C "$repo" check-ignore -q target/local-only/cache.txt; then
+    printf '\n# drive9 e2e: keep the local-only probe out of the commit\ntarget/\n' >>"$repo/.gitignore" || return
+  fi
   git_cmd -C "$repo" check-ignore -q target/local-only/cache.txt
 }
 
