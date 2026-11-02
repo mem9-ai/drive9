@@ -492,6 +492,24 @@ fn run_once(
         .env("D9_MOUNT", &ws)
         .env("D9_RUN_DIR", run_dir)
         .env("D9_CONTROL", &sock_path);
+    // server channel: lets migrated e2e-style cases call the CLI / curl the
+    // API directly. D9_SERVER points through the injector proxy when one is
+    // up, so case-issued server traffic rides the same faults/latency as the
+    // mount's. Deliberately NOT set in the control replay: control is a
+    // local-dir oracle and must not mutate server state — scripts needing
+    // control compatibility guard with [ -n "${D9_SERVER:-}" ].
+    {
+        let r = runner.lock().unwrap();
+        cmd.env("D9_SERVER", &r.server_for_mount)
+            .env("D9_API_KEY", &r.api_key)
+            .env("D9_CLI", &r.bin);
+        if let Ok(t) = std::fs::read_to_string(run_dir.join("tenant.json"))
+            && let Ok(v) = serde_json::from_str::<Value>(&t)
+            && let Some(id) = v["tenant_id"].as_str()
+        {
+            cmd.env("D9_TENANT", id);
+        }
+    }
     if let Some(p) = &a.payload_dir {
         cmd.env("PAYLOAD_DIR", p);
     }

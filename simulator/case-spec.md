@@ -102,6 +102,10 @@ The engine MUST have the drive9 mount ready before starting the script. At scrip
 | `D9_MOUNT` | absolute path of the mount point. After `halt client` / `remount` the cwd and open fds may go stale; scripts SHOULD re-resolve via `$D9_MOUNT/...` and `cd "$D9_MOUNT"` after a remount |
 | `PATH` | carries all `*` commands at the front |
 | `D9_CONTROL` | engine control channel (used internally by injected commands; scripts MUST NOT touch it) |
+| `D9_SERVER` | server address for direct CLI/API calls from the case (`drive9 fs …`, `curl`). Points through the injector proxy when one is up, so case-issued traffic rides the same faults/latency as the mount's. Absent in the control replay — scripts that must stay control-compatible guard with `[ -n "${D9_SERVER:-}" ]` |
+| `D9_API_KEY` | this run's tenant API key (pairs with `D9_SERVER`) |
+| `D9_TENANT` | this run's tenant id |
+| `D9_CLI` | absolute path of the drive9 CLI under test |
 
 Case-level environment configuration does **not** live in the script: which environment this run executes on (`--durability` / `--overlay` / `--write-cache-size-mb`) and the wall-clock limit (`--timeout`) are all `drive9-simulator run` CLI flags (§6). The script carries logical correctness only and MUST NOT depend on these values.
 
@@ -377,7 +381,7 @@ check    <kind> [kind args…] --req T [--claim ID] [--accept S1,S2]
 latency  <300ms | 80ms-400ms> [--pattern 'PUT /v1/fs']   |   latency off [--pattern P]
 
 run CLI  --timeout  --durability  --overlay  --write-cache-size-mb  --payload-dir   (environment knobs, never in-script)
-env      D9_MOUNT  D9_CONTROL  PAYLOAD_DIR (§4.2, optional custom workload file set)
+env      D9_MOUNT  D9_CONTROL  PAYLOAD_DIR (§4.2)  D9_SERVER  D9_API_KEY  D9_TENANT  D9_CLI (server channel; no control replay)
 ```
 
 (`vm` kill target = reserved, unimplemented.)
