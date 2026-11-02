@@ -3665,12 +3665,13 @@ pub fn run_suite(a: RunSuiteArgs) -> Result<i32> {
         bail!("no cases selected (tier {:?})", a.tier);
     }
     // one shared embedded backend for the whole suite (per-case --stack
-    // would respawn it for every case)
+    // would respawn it for every case); its state lives in its own
+    // directory because every case run wipes its home
     let suite_home = a.home.clone().unwrap_or_else(|| {
         std::env::temp_dir().join(format!("drive9-simulator-suite-{}", std::process::id()))
     });
     let _mock_stack = match a.stack.as_deref() {
-        Some("mock") => Some(crate::stack::start(&suite_home, None)?),
+        Some("mock") => Some(crate::stack::start(&suite_home.join("stack"), None)?),
         Some(other) => bail!("--stack {other:?} unknown (mock)"),
         None => None,
     };
@@ -3685,11 +3686,14 @@ pub fn run_suite(a: RunSuiteArgs) -> Result<i32> {
             bail!("case file missing: {}", case_path.display());
         }
         eprintln!("=== suite case {} ===", c.name);
-        let code = run(RunArgs {
+        // per-case home: run() wipes home at start, so cases must not share
+        // one directory (and never the suite stack's)
+        let case_home = suite_home.join("cases").join(c.name.replace('/', "_"));
+        let code = match run(RunArgs {
             case: case_path,
             stack: None,
             sandbox: "host".into(),
-            home: a.home.clone(),
+            home: Some(case_home),
             server: server.clone(),
             bin: a.bin.clone(),
             repeat: 1,
@@ -3705,8 +3709,13 @@ pub fn run_suite(a: RunSuiteArgs) -> Result<i32> {
             payload_dir: None,
             seed_dir: None,
             no_mount: c.no_mount,
-        })
-        .unwrap_or(1);
+        }) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("case {} errored: {e:#}", c.name);
+                1
+            }
+        };
         results.push((c.name.clone(), code));
         if a.stop_on_fail && code != 0 {
             break;
