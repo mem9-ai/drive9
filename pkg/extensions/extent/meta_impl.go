@@ -1190,7 +1190,15 @@ func (b *Bridge) DropDeletedOpen(sentinel string) {
 		b.mu.Unlock()
 		return
 	}
+	if b.pins[sentinel] > 0 {
+		// Retained across an unresolved operation: the drop runs when the
+		// last pin releases (or is discarded if the file is put back).
+		b.dropDeferred[sentinel] = true
+		b.mu.Unlock()
+		return
+	}
 	delete(b.sentinels, sentinel)
+	delete(b.dropDeferred, sentinel)
 	delete(b.replacements, b.fullPath(sentinel))
 	delete(b.moved, heldIno)
 	b.forgetInoLocked(heldIno)
@@ -1198,21 +1206,59 @@ func (b *Bridge) DropDeletedOpen(sentinel string) {
 	_ = b.cfg.Client.RemoveAllCtx(context.Background(), b.fullPath(sentinel))
 }
 
-// RestoreDeletedOpen undoes KeepDeletedOpen when the operation that needed
-// it failed (a rename that would have replaced the retained file never
-// happened): the incarnation returns to its name and its mappings follow,
-// and the registration is dropped WITHOUT deleting the object. If the
-// move back itself fails the registration is dropped too — a stranded
-// hidden file is recoverable, a deleted one is not.
+// PinDeletedOpen retains a sentinel's object while an operation that
+// displaced it is unresolved: a last close meanwhile defers the drop
+// instead of deleting what a failed operation would have to put back.
+func (b *Bridge) PinDeletedOpen(sentinel string) {
+	b.mu.Lock()
+	b.pins[sentinel]++
+	b.mu.Unlock()
+}
+
+// UnpinDeletedOpen releases a retention; a drop deferred while pinned runs
+// now if this was the last pin and the sentinel is still registered.
+func (b *Bridge) UnpinDeletedOpen(sentinel string) {
+	b.mu.Lock()
+	if b.pins[sentinel]--; b.pins[sentinel] <= 0 {
+		delete(b.pins, sentinel)
+	}
+	_, pinned := b.pins[sentinel]
+	run := !pinned && b.dropDeferred[sentinel]
+	if run {
+		delete(b.dropDeferred, sentinel)
+	}
+	b.mu.Unlock()
+	if run {
+		b.DropDeletedOpen(sentinel)
+	}
+}
+
+// RestoreDeletedOpen undoes KeepDeletedOpen once the operation that needed
+// it is KNOWN not to have landed and the name is vacant: the incarnation
+// returns to its name, its mappings follow, and the registration (with any
+// deferred drop) is dropped WITHOUT deleting the object. The caller must
+// have established that nothing else occupies the name — this is a
+// replacing rename. If the move back fails the registration is dropped
+// anyway: a stranded hidden file is recoverable, a deleted one is not.
 func (b *Bridge) RestoreDeletedOpen(sentinel, local string) error {
 	err := b.cfg.Client.RenameCtx(context.Background(), b.fullPath(sentinel), b.fullPath(local))
 	if err == nil {
 		b.RemapLocal(sentinel, local)
 	}
+	b.StrandDeletedOpen(sentinel)
+	return err
+}
+
+// StrandDeletedOpen forgets a sentinel's registration WITHOUT deleting its
+// object: the retained file stays on the server as a hidden name that no
+// last close will remove, and live descriptors keep addressing it. Used
+// when an operation's outcome cannot be established and overwriting
+// anything would risk the only remaining copy of a file.
+func (b *Bridge) StrandDeletedOpen(sentinel string) {
 	b.mu.Lock()
 	delete(b.sentinels, sentinel)
+	delete(b.dropDeferred, sentinel)
 	b.mu.Unlock()
-	return err
 }
 
 // heldInoForLocked reports the held (moved or sentinel-bound) path-hash

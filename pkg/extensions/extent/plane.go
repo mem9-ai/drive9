@@ -5,6 +5,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/vfs"
@@ -259,8 +260,14 @@ func (h *Handler) tryClaimOpen(ctx context.Context, op *fs.Op) (fs.Result, error
 // would PATCH the file just moved into it. The displaced incarnation is
 // moved to its own sentinel FIRST (exactly like unlink-while-open), the
 // rename then lands on a name no live descriptor owns, and the sentinel
-// drops at the displaced file's last close. A rename that fails puts the
-// displaced file back under its name.
+// drops at the displaced file's last close.
+//
+// The retained object is PINNED until the rename's outcome is resolved: a
+// last close meanwhile must not delete what a failed rename has to put
+// back. And an error from the chain is not proof the rename did not
+// commit (a committed rename can lose its response; core's probes can be
+// inconclusive), so rollback first establishes the destination's state and
+// never overwrites a file whose identity it has not confirmed.
 func (h *Handler) tryRenameOverOpen(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error, bool) {
 	if h.opts.Engine == nil || op.Path2 == "" || op.Path2 == op.Path {
 		return fs.Result{}, nil, false
@@ -271,23 +278,83 @@ func (h *Handler) tryRenameOverOpen(ctx context.Context, op *fs.Op, next fs.Next
 	if !destOpen {
 		return fs.Result{}, nil, false
 	}
-	sentinel, err := h.opts.Engine.Bridge.KeepDeletedOpen(op.Path2)
+	br := h.opts.Engine.Bridge
+	// The source's identity, to recognize a rename that committed without
+	// a response.
+	srcID := ""
+	if st, err := br.StatLocal(ctx, op.Path); err == nil {
+		srcID = st.ResourceID
+	}
+	sentinel, err := br.KeepDeletedOpen(op.Path2)
 	if err != nil {
 		return fs.Result{}, err, true
 	}
 	if sentinel == "" {
 		return fs.Result{}, nil, false
 	}
+	br.PinDeletedOpen(sentinel)
+	defer br.UnpinDeletedOpen(sentinel)
 	h.retarget(op.Path2, sentinel)
 	res, err := next(ctx, op)
-	if err != nil {
-		// The destination was never replaced: put the displaced file back.
-		if rerr := h.opts.Engine.Bridge.RestoreDeletedOpen(sentinel, op.Path2); rerr == nil {
+	if err == nil {
+		return res, nil, true
+	}
+	switch h.probeRenameOutcome(op.Path2, srcID) {
+	case renameDestVacant:
+		// Nothing landed at the name: put the displaced file back.
+		if rerr := br.RestoreDeletedOpen(sentinel, op.Path2); rerr == nil {
 			h.retarget(sentinel, op.Path2)
 		}
-		return res, err, true
+	case renameDestIsSource:
+		// The rename committed after all: the source lives at the name and
+		// the displaced file stays retained at its sentinel (the ordinary
+		// rename-over lifecycle). Follow the source so its descriptors
+		// commit to where its bytes are.
+		h.retarget(op.Path, op.Path2)
+	default:
+		// Someone else's file at the name, or unknowable: never overwrite
+		// it. The displaced object stays as a hidden name nothing deletes —
+		// recoverable, unlike an overwritten file.
+		br.StrandDeletedOpen(sentinel)
 	}
-	return res, nil, true
+	return res, err, true
+}
+
+// renameOutcome is what the destination of a failed rename turned out to
+// hold.
+type renameOutcome int
+
+const (
+	renameDestUnknown  renameOutcome = iota // probes could not establish it
+	renameDestVacant                        // nothing at the name
+	renameDestIsSource                      // the source landed there: the rename committed
+	renameDestForeign                       // a file that is not the source
+)
+
+// renameOutcomeProbeDelays paces the detached probes of a failed rename's
+// destination (the error that got us here was likely transient).
+var renameOutcomeProbeDelays = []time.Duration{0, 200 * time.Millisecond, 500 * time.Millisecond}
+
+// probeRenameOutcome establishes, detached from the failed request's
+// context, what the destination holds: absent, the source itself (same
+// resource identity), or another file. Unknown when every probe fails or
+// the source's identity was never captured.
+func (h *Handler) probeRenameOutcome(dest, srcID string) renameOutcome {
+	for _, delay := range renameOutcomeProbeDelays {
+		time.Sleep(delay)
+		pctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		st, err := h.opts.Engine.Bridge.StatLocal(pctx, dest)
+		cancel()
+		switch {
+		case err == nil && srcID != "" && st.ResourceID == srcID:
+			return renameDestIsSource
+		case err == nil:
+			return renameDestForeign
+		case client.IsNotFound(err):
+			return renameDestVacant
+		}
+	}
+	return renameDestUnknown
 }
 
 // tryTruncate routes a size change on an open engine file into the bridge;

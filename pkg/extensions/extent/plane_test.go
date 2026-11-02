@@ -29,8 +29,12 @@ type fakeV2 struct {
 	dirs       map[string]bool
 	blocks     map[string][]byte // sha256 hex -> bytes
 	creates    []string
+	ids        map[string]string // path -> resource identity (X-Dat9-Resource-ID)
+	nextID     int
+	statFail   map[string]bool // paths whose HEAD answers 500 (probe injection)
 	patches    int
 	patchPaths []string   // every PATCH target, in order
+	deletes    []string   // every DELETE target, in order
 	lastPatch  *fakePatch // the open PATCH session, applied at /complete
 }
 
@@ -72,7 +76,7 @@ func (f *fakeV2) applyPatchLocked() {
 
 func newFakeV2(t *testing.T) *fakeV2 {
 	t.Helper()
-	f := &fakeV2{extent: map[string]string{}, classic: map[string]string{}, dirs: map[string]bool{"/": true}, blocks: map[string][]byte{}}
+	f := &fakeV2{extent: map[string]string{}, classic: map[string]string{}, dirs: map[string]bool{"/": true}, blocks: map[string][]byte{}, ids: map[string]string{}, statFail: map[string]bool{}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/obj/", func(w http.ResponseWriter, r *http.Request) {
 		key := strings.TrimPrefix(r.URL.Path, "/obj/")
@@ -114,6 +118,10 @@ func newFakeV2(t *testing.T) *fakeV2 {
 		case http.MethodHead:
 			f.mu.Lock()
 			defer f.mu.Unlock()
+			if f.statFail[path] {
+				http.Error(w, "probe refused", http.StatusInternalServerError)
+				return
+			}
 			switch {
 			case f.dirs[path]:
 				w.Header().Set("X-Dat9-IsDir", "true")
@@ -121,9 +129,11 @@ func newFakeV2(t *testing.T) *fakeV2 {
 			case f.extent[path] != "":
 				w.Header().Set("X-Dat9-Content-Layout", "extent")
 				w.Header().Set("X-Dat9-Revision", "3")
+				w.Header().Set("X-Dat9-Resource-ID", f.ids[path])
 				w.Header().Set("Content-Length", fmt.Sprint(len(f.extent[path])))
 				w.WriteHeader(200)
 			case f.classic[path] != "":
+				w.Header().Set("X-Dat9-Resource-ID", f.ids[path])
 				w.Header().Set("Content-Length", fmt.Sprint(len(f.classic[path])))
 				w.WriteHeader(200)
 			default:
@@ -178,8 +188,10 @@ func newFakeV2(t *testing.T) *fakeV2 {
 			w.WriteHeader(200)
 		case http.MethodDelete:
 			f.mu.Lock()
+			f.deletes = append(f.deletes, path)
 			delete(f.extent, path)
 			delete(f.classic, path)
+			delete(f.ids, path)
 			f.mu.Unlock()
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte("{}"))
@@ -266,6 +278,8 @@ func (f *fakeV2) seedExtent(t *testing.T, path, content string) {
 	defer f.mu.Unlock()
 	f.extent[path] = content
 	f.blocks[sum] = []byte(content)
+	f.nextID++
+	f.ids[path] = fmt.Sprintf("res-%d", f.nextID)
 }
 
 // move renames src onto dst, replacing any existing dst (the caller holds
@@ -274,13 +288,23 @@ func (f *fakeV2) move(src, dst string) bool {
 	if c, ok := f.extent[src]; ok {
 		delete(f.extent, src)
 		delete(f.classic, dst)
+		delete(f.ids, dst)
 		f.extent[dst] = c
+		if id, ok := f.ids[src]; ok {
+			delete(f.ids, src)
+			f.ids[dst] = id // the identity moves with the object
+		}
 		return true
 	}
 	if c, ok := f.classic[src]; ok {
 		delete(f.classic, src)
 		delete(f.extent, dst)
+		delete(f.ids, dst)
 		f.classic[dst] = c
+		if id, ok := f.ids[src]; ok {
+			delete(f.ids, src)
+			f.ids[dst] = id
+		}
 		return true
 	}
 	return false
@@ -322,6 +346,19 @@ func (f *fakeV2) remove(path string) {
 	defer f.mu.Unlock()
 	delete(f.extent, path)
 	delete(f.classic, path)
+	delete(f.ids, path)
+}
+
+// setStatFail injects (on=true) or clears (on=false) HEAD failures for a
+// path, modeling unreachable probes.
+func (f *fakeV2) setStatFail(path string, on bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if on {
+		f.statFail[path] = true
+		return
+	}
+	delete(f.statFail, path)
 }
 
 func dispatchCreate(ctx context.Context, h *Handler, path string, flags uint32) (fs.Result, error, bool) {
