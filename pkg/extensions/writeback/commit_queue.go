@@ -1296,9 +1296,16 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) error {
 			cq.shadows.Remove(path)
 		}
 	}
+	// The pending entry dies only once the recovery source is CONFIRMED
+	// gone: it is the overlay lookups serve from, and a failed unlink must
+	// leave the fsynced publication discoverable and retryable.
+	pendingHad := false
 	if cq.index != nil && cq.index.HasPending(path) {
 		hadLocal = true
-		if !preserveLocal {
+		pendingHad = true
+	}
+	dropPending := func() {
+		if !preserveLocal && pendingHad && cq.index != nil {
 			cq.index.Remove(path)
 		}
 	}
@@ -1312,7 +1319,8 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) error {
 	// fsync'd frames and re-committed the unlinked file (#1065).
 	// No WAL (or nothing staged): without frames there is nothing to fence,
 	// and a journal-less queue keeps the preserve-local contract verbatim.
-	if !hadLocal || cq.journal == nil {
+	if cq.journal == nil || !hadLocal {
+		dropPending()
 		return nil
 	}
 	appendErr := cq.journal.Append(staging.JournalEntry{
@@ -1321,33 +1329,45 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) error {
 	})
 	if appendErr == nil {
 		// The marker fences every frame published before it — the path
-		// cannot replay even if a removal above silently failed.
+		// cannot replay even if the removal above silently failed.
+		dropPending()
 		return nil
 	}
 	safeLogPrintf("commit queue: journal cancel marker failed for %s: %v", path, appendErr)
 	if preserveLocal {
 		// The retained shadow/index are safe only while the marker fences
 		// their WAL frames: without it a crash replays them. Fall back to
-		// the non-preserving cleanup — the anonymous fd loses its staged
-		// image on a failing WAL, but the unlink cannot resurrect.
+		// the non-preserving cleanup below.
 		if cq.shadows != nil {
 			cq.shadows.Remove(path)
 		}
-		if cq.index != nil {
-			cq.index.Remove(path)
-		}
 	}
 	// ShadowStore.Remove and PendingIndex.Remove discard their disk errors,
-	// but Has is disk-truthful (it stats when the memory index misses): a
-	// read-only or failing cache filesystem can reject the marker AND leave
-	// the durable shadow behind, and replay would then upload the deleted
-	// name after a restart. Verify instead of assuming the void removals
-	// did their job — the caller must not acknowledge the unlink when the
-	// recovery source provably survived.
-	if cq.shadows != nil && cq.shadows.Has(path) {
-		return fmt.Errorf("commit queue: unlink of %s is not crash-durable: WAL marker failed (%v) and the staged image could not be removed", path, appendErr)
+	// so verify with evidence instead of assuming: a read-only or failing
+	// cache filesystem can reject the marker AND leave the durable shadow
+	// behind, and replay would then upload the deleted name after a restart.
+	if cq.shadows == nil || cq.shadows.VerifyRemoved(path) == nil {
+		// Confirmed gone — finish the degrade-to-non-preserving cleanup
+		// (the anonymous fd loses its staged image on a failing WAL, but
+		// the unlink cannot resurrect).
+		if pendingHad && cq.index != nil {
+			cq.index.Remove(path)
+		}
+		return nil
 	}
-	return nil
+	// The recovery source survived or its absence cannot be proven. Keep the
+	// pending entry (the overlay stays discoverable), re-drive the upload
+	// when the shadow is still stat-able so the fsynced publication is
+	// retryable without a restart, and report the unlink as failed — the
+	// caller must not acknowledge a deletion a restart would undo.
+	if cq.shadows.Has(path) {
+		if entry := cq.recoveredEntry(path); entry != nil {
+			if enqErr := cq.Enqueue(entry); enqErr != nil {
+				safeLogPrintf("commit queue: re-driving %s after the failed unlink rollback failed: %v", path, enqErr)
+			}
+		}
+	}
+	return fmt.Errorf("commit queue: unlink of %s is not crash-durable: WAL marker failed (%v) and the staged image could not be confirmed removed", path, appendErr)
 }
 
 // isEntryCanceled checks whether this specific entry was canceled by

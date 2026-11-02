@@ -18,6 +18,7 @@
 package writeback
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -84,19 +85,33 @@ func newUnlinkWindowStack(t *testing.T, holdPath string) *unlinkWindowStack {
 		target := strings.HasSuffix(r.URL.Path, holdPath)
 		switch {
 		case target && s.hold.Load() && (r.Method == http.MethodPut || r.Method == http.MethodPost):
-			// Drain the body first: net/http only arms the client-gone
-			// detection (request context cancel) once the body is consumed.
-			_, _ = io.Copy(io.Discard, r.Body)
+			// Buffer the body (net/http only arms the client-gone detection
+			// once it is consumed) so a parked upload that is later released
+			// can still fall through to the backend intact.
+			var body bytes.Buffer
+			_, _ = io.Copy(&body, r.Body)
+			r.Body = io.NopCloser(bytes.NewReader(body.Bytes()))
 			select {
 			case s.putStarted <- struct{}{}:
 			default:
 			}
-			select {
-			case <-r.Context().Done():
-			case <-s.release:
+			// Park while held; re-check so a test that lifts the hold later
+			// lets a parked upload continue to the backend instead of
+			// waiting for the whole server teardown.
+			timer := time.NewTimer(20 * time.Millisecond)
+			defer timer.Stop()
+			for s.hold.Load() {
+				select {
+				case <-r.Context().Done():
+					http.Error(w, "canceled", http.StatusRequestTimeout)
+					return
+				case <-s.release:
+					http.Error(w, "canceled", http.StatusRequestTimeout)
+					return
+				case <-timer.C:
+					timer.Reset(20 * time.Millisecond)
+				}
 			}
-			http.Error(w, "canceled", http.StatusRequestTimeout)
-			return
 		case target && r.Method == http.MethodDelete:
 			s.deletes.Add(1)
 		}
@@ -411,65 +426,127 @@ func TestUnlinkMarkerFailureDropsPreservedState(t *testing.T) {
 	}
 }
 
-// When the WAL cannot take the marker AND the fallback cleanup cannot remove
-// the staged image (a read-only or failing cache filesystem), the unlink must
-// be reported as failed instead of acknowledged on the assumption that the
-// void removal APIs did their job — and the anonymous marking must roll back,
-// because the durable staging now correctly describes a file that was never
-// unlinked.
+// When the WAL cannot take the marker AND the fallback cleanup cannot make
+// the staged image provably gone (a read-only or failing cache filesystem),
+// the unlink must be reported as failed instead of acknowledged on the
+// assumption that the void removal APIs did their job. The failure must not
+// strand the fsynced publication either: while the shadow is still stat-able
+// the upload is re-driven once the filesystem recovers, and when even the
+// stat fails the pending entry stays so the overlay keeps serving the file.
 func TestUnlinkMarkerAndCleanupFailureFailsUnlink(t *testing.T) {
-	// The failure injection is a directory without write permission: root
-	// ignores the bits and Windows has no POSIX permission semantics, and
-	// under either the cleanup succeeds and this row would false-fail.
+	// The failure injection is directory permission bits: root ignores them
+	// and Windows has no POSIX permission semantics, and under either the
+	// cleanup succeeds and these rows would false-fail.
 	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
 		t.Skip("directory permission bits cannot block the shadow removal on this platform/user")
 	}
-	const path = "/bothdown.txt"
-	s := newUnlinkWindowStack(t, path)
-	s.hold.Store(true)
-	ctx := context.Background()
+	for _, tc := range []struct {
+		name  string
+		mode  os.FileMode
+		statd bool // the shadow stays stat-able through the fault
+	}{
+		{"removal fails, stat works", 0o500, true},
+		{"removal and stat both fail", 0o400, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const path = "/bothdown.txt"
+			s := newUnlinkWindowStack(t, path)
+			s.hold.Store(true)
+			ctx := context.Background()
 
-	h := open(t, s.ch, path).(*bufferingHandle)
-	if err := h.Write(ctx, 0, []byte("both-down")); err != nil {
-		t.Fatal(err)
-	}
-	if err := h.Sync(ctx); err != nil {
-		t.Fatal(err)
-	}
-	s.waitPutStarted(t)
+			h := open(t, s.ch, path).(*bufferingHandle)
+			if err := h.Write(ctx, 0, []byte("both-down")); err != nil {
+				t.Fatal(err)
+			}
+			if err := h.Sync(ctx); err != nil {
+				t.Fatal(err)
+			}
+			s.waitPutStarted(t)
 
-	// Break the WAL, then make the shadow store unremovable: a directory
-	// without write permission rejects the retirement rename and the
-	// fallback remove alike.
-	if err := s.ledger.Journal.Close(); err != nil {
-		t.Fatal(err)
-	}
-	shadowDir := filepath.Join(s.dir, "shadow")
-	if err := os.Chmod(shadowDir, 0o500); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(shadowDir, 0o700) })
+			// Break the WAL, then make the shadow store unremovable: a
+			// directory without write permission rejects the retirement
+			// rename and the fallback remove; without search permission it
+			// rejects the verification stat as well.
+			if err := s.ledger.Journal.Close(); err != nil {
+				t.Fatal(err)
+			}
+			shadowDir := filepath.Join(s.dir, "shadow")
+			if err := os.Chmod(shadowDir, tc.mode); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.Chmod(shadowDir, 0o700) })
 
-	err := s.wb.MarkPathUnlinked(path)
-	if err == nil {
-		t.Fatal("marker + cleanup both failing must fail the unlink instead of acknowledging it")
-	}
+			err := s.wb.MarkPathUnlinked(path)
+			if err == nil {
+				t.Fatal("marker + cleanup both failing must fail the unlink instead of acknowledging it")
+			}
+			// The recovery source did not provably disappear — that is what
+			// the error reports (Has alone cannot tell a survivor from an
+			// unstat-able one, so ask the verifier).
+			if verr := s.ledger.Shadow.VerifyRemoved(path); verr == nil {
+				t.Fatal("precondition: the shadow must still be present or unverifiable")
+			}
+			// Rollback: the descriptor goes on serving its name, not an
+			// anonymous snapshot of a file the unlink never removed.
+			h.mu.Lock()
+			unlinked := h.unlinked
+			h.mu.Unlock()
+			if unlinked {
+				t.Fatal("a failed unlink must restore the handle to its name")
+			}
+			if !s.ledger.Pending.HasPending(path) {
+				t.Fatal("a failed unlink must keep the pending entry discoverable")
+			}
 
-	// The recovery source provably survived — that is what the error reports.
-	if !s.ledger.Shadow.Has(path) {
-		t.Fatal("precondition: the durable shadow should still be present (Has is disk-truthful)")
-	}
-	// Rollback: the descriptor goes on serving its name, not an anonymous
-	// snapshot of a file the unlink never removed.
-	h.mu.Lock()
-	unlinked := h.unlinked
-	h.mu.Unlock()
-	if unlinked {
-		t.Fatal("a failed unlink must restore the handle to its name")
-	}
-	// The in-process upload stays canceled either way (the writer's next
-	// durability boundary re-stages from the live handle).
-	if err := h.Release(ctx); err != nil {
-		t.Fatal(err)
+			// Repair the fault and lift the upload hold.
+			if err := os.Chmod(shadowDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			s.hold.Store(false)
+
+			if tc.statd {
+				// The re-driven upload lands the fsynced bytes: the failed
+				// unlink did not strand the publication.
+				deadline := time.Now().Add(10 * time.Second)
+				for {
+					if n, ok := s.backend.Node(path); ok {
+						if string(n.Data) != "both-down" {
+							t.Fatalf("re-driven upload landed %q, want the fsynced image", n.Data)
+						}
+						break
+					}
+					if time.Now().After(deadline) {
+						t.Fatal("the re-driven upload never landed after the fault was repaired")
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+			}
+
+			// The file must still be reachable through the chain after the
+			// last handle closes: pending overlay while staged, the landed
+			// remote image once the re-drive completes.
+			if err := h.Release(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.wb.WaitCommitQueueIdle(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if !tc.statd {
+				if _, ok := s.backend.Node(path); ok {
+					t.Fatal("nothing may upload while the shadow cannot even be stat-ed")
+				}
+				if !s.ledger.Pending.HasPending(path) {
+					t.Fatal("the pending entry must survive an unverifiable cleanup")
+				}
+				return
+			}
+			res, err := s.ch.Dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: path})
+			if err != nil {
+				t.Fatalf("lookup after the recovered fault: %v", err)
+			}
+			if res.Attr == nil || res.Attr.Kind != fs.KindFile {
+				t.Fatalf("lookup after the recovered fault = %+v, want a file", res.Attr)
+			}
+		})
 	}
 }
