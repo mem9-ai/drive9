@@ -87,7 +87,7 @@ jobs:
         run: |
           mkdir -p /tmp/d9-mount-out
           timeout -k 15 1500 docker run --rm --name sim-mount-tier \
-            --device /dev/fuse --cap-add SYS_ADMIN --security-opt seccomp=unconfined \
+            --privileged --device /dev/fuse \
             -v "$PWD:/repo" -v /tmp/d9-mount-out:/out \
             -v ~/.cache/drive9-simulator:/root/.cache/drive9-simulator \
             ubuntu:24.04 bash -c '
@@ -109,7 +109,7 @@ jobs:
         run: |
           mkdir -p /tmp/d9-pjdf-out
           timeout -k 15 1800 docker run --rm --name sim-pjdfstest \
-            --device /dev/fuse --cap-add SYS_ADMIN --security-opt seccomp=unconfined \
+            --privileged --device /dev/fuse \
             -v "$PWD:/repo" -v /tmp/d9-pjdf-out:/out \
             -v ~/.cache/drive9-simulator:/root/.cache/drive9-simulator \
             ubuntu:24.04 bash -c '
@@ -132,7 +132,7 @@ jobs:
         run: |
           mkdir -p /tmp/d9-bench-out
           timeout -k 15 1800 docker run --rm --name sim-bench-tier \
-            --device /dev/fuse --cap-add SYS_ADMIN --security-opt seccomp=unconfined \
+            --privileged --device /dev/fuse \
             -v "$PWD:/repo" -v /tmp/d9-bench-out:/out \
             -v ~/.cache/drive9-simulator:/root/.cache/drive9-simulator \
             ubuntu:24.04 bash -c '
