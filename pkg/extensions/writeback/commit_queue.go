@@ -639,9 +639,10 @@ func (cq *CommitQueue) CancelPath(path string) {
 }
 
 // CancelPathPreserveLocal cancels queued or in-flight uploads for path without
-// removing the local shadow/index state. Rename uses this for Git's loose-object
-// temp files: the temp upload must stop, but the bytes must survive while the
-// pending entry moves to the content-addressed final path.
+// removing the local shadow/index state. Unlink uses this when an open fd
+// still serves the staged image: the upload must stop, but the bytes survive
+// until the last close. The WAL done marker is still journaled (the name is
+// gone) so a crash before that close cannot replay the staged frames.
 func (cq *CommitQueue) CancelPathPreserveLocal(path string) {
 	cq.cancelPath(path, true)
 }
@@ -1263,27 +1264,33 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) {
 	for _, cancel := range cancels {
 		cancel()
 	}
-	if preserveLocal {
-		return
-	}
 	hadLocal := false
 	if cq.shadows != nil && cq.shadows.Has(path) {
 		hadLocal = true
-		cq.shadows.Remove(path)
+		if !preserveLocal {
+			cq.shadows.Remove(path)
+		}
 	}
 	if cq.index != nil && cq.index.HasPending(path) {
 		hadLocal = true
-		cq.index.Remove(path)
+		if !preserveLocal {
+			cq.index.Remove(path)
+		}
 	}
 	// staging.Journal a "done" marker so crash recovery does not resurrect the
 	// unlinked path from earlier fsync frames, and so those frames compact.
 	// Only when local pending state existed, to avoid a WAL frame per unlink.
+	// A preserve-local cancel journals it too: the in-memory shadow/index stay
+	// for the anonymous fd's reads, but the name is gone. The facade's
+	// unlink-of-open-file path defers the non-preserving cancel to the last
+	// close plus a remote HEAD, and a crash inside that window replayed the
+	// fsync'd frames and re-committed the unlinked file (#1065).
 	if hadLocal && cq.journal != nil {
 		// Best effort: a lost marker only means recovery re-checks a path
 		// whose shadow/.meta are already gone, which the pending-index
 		// prune discards. Log so persistent WAL write failures surface.
 		if err := cq.journal.Append(staging.JournalEntry{
-			Op:   staging.JournalCommit,
+			Op:   staging.JournalUnlink,
 			Path: path,
 		}); err != nil {
 			safeLogPrintf("commit queue: journal cancel marker failed for %s: %v", path, err)
