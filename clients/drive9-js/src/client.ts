@@ -8,7 +8,9 @@ import {
   commitFSLayer,
   createFSLayer,
   checkpointFSLayer,
+  deleteFSLayer,
   diffFSLayer,
+  forkFSLayer,
   getFSLayer,
   getFSLayerCheckpoint,
   getFSLayerEntry,
@@ -56,9 +58,11 @@ import type {
   FSLayerCheckpointRequest,
   FSLayerCommit,
   FSLayerCreateRequest,
+  FSLayerDeleteOptions,
   FSLayerEntry,
   FSLayerEntryRequest,
   FSLayerEvent,
+  FSLayerForkRequest,
   GitObjectPack,
   GitObjectPackRequest,
   GitOverlayEntry,
@@ -119,6 +123,15 @@ import {
 } from "./vault.js";
 import { watchEvents, watchEventsWithLifecycle } from "./events.js";
 import { archiveImpl, archiveToFileImpl, type ArchiveOptions } from "./archive.js";
+import {
+  cancelRuntimeExecution,
+  exec,
+  getRuntimeCapabilities,
+  type RuntimeCapabilities,
+  type ExecOptions,
+  type ExecRequest,
+  type ExecResult,
+} from "./runtime.js";
 
 const DEFAULT_SMALL_FILE_THRESHOLD = 50_000;
 const DEFAULT_SERVER = "https://api.drive9.ai";
@@ -340,6 +353,18 @@ export class Client {
     return resp;
   }
 
+  async exec(input: ExecRequest, options?: ExecOptions): Promise<ExecResult> {
+    return exec(this, input, options);
+  }
+
+  async runtimeCapabilities(signal?: AbortSignal): Promise<RuntimeCapabilities> {
+    return getRuntimeCapabilities(this, signal);
+  }
+
+  async cancelRuntimeExecution(executionId: string, signal?: AbortSignal): Promise<void> {
+    return cancelRuntimeExecution(this, executionId, signal);
+  }
+
   async write(path: string, data: Uint8Array, options?: number | WriteOptions): Promise<void> {
     await this.writeWithRevision(path, data, options);
   }
@@ -379,7 +404,7 @@ export class Client {
   async hardlink(srcPath: string, dstPath: string): Promise<void> {
     const resp = await fetch(`${this.fsUrl(dstPath)}?hardlink=1`, {
       method: "POST",
-      headers: this.authHeaders({ "X-Dat9-Hardlink-Source": srcPath }),
+      headers: this.#sourcePathHeaders("X-Dat9-Hardlink-Source", srcPath),
     });
     await checkError(resp);
   }
@@ -558,15 +583,24 @@ export class Client {
   }
 
   async copy(srcPath: string, dstPath: string): Promise<void> {
-    const headers = this.authHeaders({ "X-Dat9-Copy-Source": srcPath });
+    const headers = this.#sourcePathHeaders("X-Dat9-Copy-Source", srcPath);
     const resp = await fetch(`${this.fsUrl(dstPath)}?copy`, { method: "POST", headers });
     await checkError(resp);
   }
 
   async rename(oldPath: string, newPath: string): Promise<void> {
-    const headers = this.authHeaders({ "X-Dat9-Rename-Source": oldPath });
+    const headers = this.#sourcePathHeaders("X-Dat9-Rename-Source", oldPath);
     const resp = await fetch(`${this.fsUrl(newPath)}?rename`, { method: "POST", headers });
     await checkError(resp);
+  }
+
+  #sourcePathHeaders(name: string, path: string): Record<string, string> {
+    // Fetch headers reject arbitrary UTF-8/control characters and trim edge
+    // whitespace. Keep ordinary ASCII compatible with older servers and use the server's
+    // explicit path encoding for other valid filenames.
+    return this.authHeaders(/[^\x20-\x7e]/.test(path) || path.trim() !== path
+      ? { [name]: Buffer.from(path, "utf8").toString("base64url"), "X-Dat9-Path-Encoding": "base64url" }
+      : { [name]: path });
   }
 
   async mkdir(path: string, mode = 0o755): Promise<void> {
@@ -915,6 +949,14 @@ export class Client {
 
   async getFSLayer(layerId: string): Promise<FSLayer> {
     return getFSLayer(this, layerId);
+  }
+
+  async forkFSLayer(parentRef: string, req: FSLayerForkRequest = {}): Promise<FSLayer> {
+    return forkFSLayer(this, parentRef, req);
+  }
+
+  async deleteFSLayer(layerId: string, options: FSLayerDeleteOptions = {}): Promise<void> {
+    return deleteFSLayer(this, layerId, options);
   }
 
   async diffFSLayer(layerId: string, maxSeq?: number): Promise<FSLayerEntry[]> {

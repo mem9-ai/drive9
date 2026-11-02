@@ -55,6 +55,8 @@ func adminTenant(args []string) error {
 		return adminTenantEmbeddingConfig(args[1:])
 	case "object-namespace":
 		return adminTenantObjectNamespace(args[1:])
+	case "logs":
+		return adminTenantLogs(args[1:])
 	case "pool":
 		return adminTenantPool(args[1:])
 	default:
@@ -683,6 +685,7 @@ commands:
   tenant extract-config <get|set>   get or update media extract config
   tenant embedding-config <get|set>  get or replace embedding config
   tenant object-namespace <get|set|clear>  bind a customer object prefix id
+  tenant logs --tenant-id ID        query one tenant's logs
   object-backend <add|get|ls|update|rm>  org object-store credentials
   pool <command> [flags]            manage the tenant pool
 
@@ -739,13 +742,17 @@ commands:
   extract-config <get|set>         get or update media extract config
   embedding-config <get|set>       get or replace embedding config
   object-namespace <get|set|clear> bind customer object prefix id
+  logs --tenant-id ID              query one tenant's logs
 
 flags:
   --server URL                     server URL (default: active context server)
   --region-code CODE               TiDBCloud Mode region code; ignored when --server is set
-  --tenant-id ID                   drive9 tenant id for get/delete/set-quota/extract-config/embedding-config/object-namespace
+  --tenant-id ID                   drive9 tenant id for get/delete/set-quota/extract-config/embedding-config/object-namespace/logs
   --tidbcloud-public-key KEY       TiDB Cloud public key
   --tidbcloud-private-key KEY      TiDB Cloud private key
+  --keyword TEXT                   logs: only lines containing this text
+  --time-range DURATION            logs: lookback window such as 20m (default 5m, max 30m)
+  --limit N                        logs: maximum entries (default 100, max 1000)
   --max-storage-size Mi            set-quota: max confirmed+reserved storage size in Mi
   --max-file-size Mi               set-quota: max single file size in Mi
   --max-file-count N               set-quota: max confirmed file count; 0 means unlimited

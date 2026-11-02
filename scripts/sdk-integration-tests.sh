@@ -21,7 +21,7 @@
 #   bash scripts/sdk-integration-tests.sh --port 19009         # override listen port
 #   bash scripts/sdk-integration-tests.sh --no-build           # reuse bin/drive9-server
 #   DRIVE9_SERVER_BIN=/path/to/drive9-server bash scripts/sdk-integration-tests.sh --no-build
-#   DRIVE9_S3_BACKEND=minio|mock|auto bash scripts/sdk-integration-tests.sh
+#   DRIVE9_S3_BACKEND=s3|mock|auto bash scripts/sdk-integration-tests.sh
 #
 # Exit code is non-zero if any enabled SDK suite fails.
 #
@@ -287,7 +287,7 @@ start_server() {
     export DRIVE9_S3_DIR
   fi
   local s3_env
-  s3_env="$(bash "$ROOT/scripts/local-minio.sh" apply)"
+  s3_env="$(bash "$ROOT/scripts/local-object-store.sh" apply)"
   eval "$s3_env"
   if [ -n "${DRIVE9_S3_DIR:-}" ]; then
     S3_DIR="$DRIVE9_S3_DIR"
@@ -339,7 +339,7 @@ run_ts() {
   else
     (cd "$pkgdir" && npm install >/dev/null 2>&1 || true)
   fi
-  if (cd "$pkgdir" && npx vitest run tests/integration.test.ts 2>&1); then
+  if (cd "$pkgdir" && npx vitest run tests/integration.test.ts tests/just-bash.integration.test.ts 2>&1); then
     RESULT_TS=pass
   else
     RESULT_TS=fail

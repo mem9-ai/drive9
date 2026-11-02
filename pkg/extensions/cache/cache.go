@@ -1,0 +1,1197 @@
+// Package cache is the read-plane cache extension. It wraps handles
+// opened through the chain with a caching decorator (in-memory LRU+TTL
+// keyed by path/revision, optional on-disk block cache), serves
+// path-addressed reads from the cache, and invalidates on bus events.
+// The directory-neighborhood prefetcher (sibling metadata, sibling
+// directories, readdir content) rides the same events.
+package cache
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/fs"
+	"github.com/mem9-ai/drive9/pkg/fusecomp/writebuffer"
+)
+
+// MaxPreloadSize re-exports the write-buffer preload cap for callers that
+// still reach for it through this package.
+const MaxPreloadSize = writebuffer.MaxPreloadSize
+
+// Options configures the read caches. Zero values take the ported
+// defaults (128MB / 30s / 4MB per file).
+type Options struct {
+	MaxSize     int64
+	TTL         time.Duration
+	MaxFileSize int64
+	Disk        DiskReadCacheOptions // Dir empty disables the disk cache
+
+	// Events, when set, subscribes this cache to mutation events: every
+	// mutation invalidates the cached image, directory-level events sweep
+	// the subtree prefix, and staged/written paths stay unprefetched until
+	// their commit lands.
+	Events *fs.EventBus
+	// SequentialPrefetch arms the ported Prefetcher on cached handles:
+	// sequential reads trigger parallel read-ahead of upcoming blocks.
+	// v1 armed the prefetcher for every handle whose size exceeds the
+	// whole-file cache admission limit — there was no separate knob.
+	SequentialPrefetch bool
+	// PrefetchClient backs the Prefetcher's parallel fetches (the mount's
+	// client); nil disables arming.
+	PrefetchClient *client.Client
+	// ParallelReadConcurrency/ParallelReadBlockSize bound the prefetcher's
+	// parallel block fetches (v1 --parallel-read-concurrency/block-size;
+	// defaults 4 x 1MiB).
+	ParallelReadConcurrency int
+	ParallelReadBlockSize   int64
+
+	// RemoteRoot prefixes namespace paths before they reach the client
+	// (the prefetch trio's remote paths).
+	RemoteRoot string
+
+	// DirContentPrefetch arms the readdir content prefetch (
+	// ReadDirPrefetch; sibling metadata and sibling directory prefetch are
+	// always-on machinery like).
+	DirContentPrefetch bool
+	// PrefetchMaxFiles/PrefetchMaxFileBytes/PrefetchMaxBytes/PrefetchTimeout
+	// bound the content prefetch (defaults 32 / per-file cap / 1MiB / 1s).
+	PrefetchMaxFiles     int
+	PrefetchMaxFileBytes int64
+	PrefetchMaxBytes     int64
+	PrefetchTimeout      time.Duration
+}
+
+// Cache is the fs.Handler middleware composing the read caches into the
+// chain.
+type Cache struct {
+	mem  *ReadCache
+	dsk  *DiskReadCache
+	opts Options
+	// dirs is the directory-neighborhood prefetcher (trio).
+	dirs *dirPrefetcher
+	// hitRecorder feeds the read-tier hit/miss counters (facade-attached).
+	hitRecorder func(kind string, hit bool)
+	// open tracks live caching handles by pointer so a rename can
+	// retarget them (and their prefetchers) onto the new path — the
+	// handle keeps serving, but its block requests must follow the name.
+	open sync.Map // *cachingHandle → struct{}
+	// epoch advances on every whole-view reset: a read dispatched before a
+	// checkout must not admit its pre-reset bytes when it completes after.
+	epoch atomic.Uint64
+	// resetMu orders the epoch check with the tier sweep: a publication
+	// that passed the check must not land after a reset cleared the cache
+	// (the plain Load/Put pair had exactly that window).
+	resetMu sync.RWMutex
+	// sidecars tracks open -wal/-journal handles (v1 sqlite routing).
+	sidecars sidecarTracker
+	// dirty counts HANDLES with unflushed writes per path: stable tiers
+	// must not answer for them, and only the OWNING descriptor clears its
+	// own mark at its commit boundary (an unrelated reader's Flush/Release
+	// must not un-dirty a writer's path).
+	dirtyMu sync.Mutex
+	dirty   map[string]int
+	// unverified is set while the event stream has lost continuity
+	// (EventUnverified) and cleared when it catches up (EventVerified):
+	// in between, a read re-pins its revision against the remote before
+	// the revision-keyed tiers may answer (v1 statCacheUnverified +
+	// revalidateReadCacheEntryIfUntrusted), because a remote change in
+	// the gap arrives with no event.
+	unverified atomic.Bool
+	// inodes is the facade's table, attached before the mount serves:
+	// hardlink aliases share the object, so invalidation and sibling
+	// prefetch hygiene must reach every name bound to the inode.
+	inodes fs.InodeTable
+}
+
+// SetCacheHitRecorder wires the facade-owned hit/miss perf feed.
+func (c *Cache) SetCacheHitRecorder(fn func(kind string, hit bool)) { c.hitRecorder = fn }
+
+// SetInodeTable is called by the facade before the mount serves.
+func (c *Cache) SetInodeTable(t fs.InodeTable) { c.inodes = t }
+
+// aliasSet returns every known name bound to the same inode as path: the
+// path itself plus its hardlink aliases. A hardlink alias names the same
+// remote object, so a write or landing through one name is a change to them
+// all. Without the table it is the path alone.
+func (c *Cache) aliasSet(path string) map[string]struct{} {
+	set := map[string]struct{}{path: {}}
+	if c.inodes == nil {
+		return set
+	}
+	ino, ok := c.inodes.Ino(path)
+	if !ok || ino == 0 {
+		return set
+	}
+	if aliaser, ok := c.inodes.(interface{ Aliases(ino uint64) []string }); ok {
+		for _, a := range aliaser.Aliases(ino) {
+			set[a] = struct{}{}
+		}
+	}
+	return set
+}
+
+func (c *Cache) noteHit(kind string, hit bool) {
+	if c.hitRecorder != nil {
+		c.hitRecorder(kind, hit)
+	}
+}
+
+// cachingHandle decorates an inner handle with the whole-file read cache
+// and the on-disk block tier.
+type cachingHandle struct {
+	cache         *Cache
+	inner         fs.Handle
+	path          string
+	rev           int64
+	size          int64 // open-time size; 0 = unknown
+	prefetch      *Prefetcher
+	prefetchArmed bool
+	// isSidecar marks an open -wal/-journal handle (tracker cleanup).
+	isSidecar bool
+	// grown marks a handle whose file changed through this descriptor:
+	// its open-time size/rev are stale and whole-file cache admission
+	// under that identity would serve the old image.
+	grown bool
+	// dirtyOwned marks THIS handle as a dirty-path owner; only it clears
+	// its mark.
+	dirtyOwned bool
+	// revalidate asks the next read to re-pin rev/size against the remote
+	// before the revision-keyed tiers answer: set when the stream lost
+	// continuity (the pinned revision may be stale) or a remote change
+	// replaced the image (the revision is known stale and zeroed). A
+	// checkout does not set it: its descriptors stay off the tiers.
+	revalidate bool
+	// identityGen counts changes to the handle's identity (rev/size/path/
+	// grown, including the invalidations that zero or flag them). A
+	// revalidation stats the remote without the lock; a result that arrives
+	// after the identity moved describes an older world and is discarded.
+	identityGen uint64
+	mu          sync.Mutex
+}
+
+// New constructs the read-plane cache.
+func New(opts Options) (*Cache, error) {
+	c := &Cache{opts: opts,
+		dirty: map[string]int{},
+		mem:   NewReadCacheWithMaxFileSize(opts.MaxSize, opts.TTL, opts.MaxFileSize),
+	}
+	if opts.Disk.Dir != "" {
+		d, err := NewDiskReadCache(opts.Disk)
+		if err != nil {
+			// v1: a failed disk-cache init warns and continues without the
+			// tier — the mount itself must not fail on it.
+			fmt.Fprintf(os.Stderr, "drive9: disk read cache init failed: %v (continuing without)\n", err)
+		} else {
+			c.dsk = d
+		}
+	}
+	c.dirs = newDirPrefetcher(opts.PrefetchClient, opts.RemoteRoot)
+	// Background prefetch publications share the reset epoch: a fetch that
+	// raced a checkout must not repopulate the cleared caches.
+	c.dirs.genFn = func() uint64 { return c.epoch.Load() }
+	c.dirs.publishFn = c.publishIfCurrent
+	c.dirs.contentEnabled = opts.DirContentPrefetch
+	c.dirs.contentMaxFiles = opts.PrefetchMaxFiles
+	if c.dirs.contentMaxFiles <= 0 {
+		c.dirs.contentMaxFiles = contentPrefetchMaxFilesDefault
+	}
+	c.dirs.contentMaxFile = opts.PrefetchMaxFileBytes
+	if c.dirs.contentMaxFile <= 0 || c.dirs.contentMaxFile > writebuffer.SmallFileThreshold {
+		// v1: the per-file prefetch cap defaults to (and never exceeds) the
+		// small-file threshold — 50KB, not a 512KB guess.
+		c.dirs.contentMaxFile = writebuffer.SmallFileThreshold
+	}
+	c.dirs.contentMaxBytes = opts.PrefetchMaxBytes
+	if c.dirs.contentMaxBytes <= 0 {
+		c.dirs.contentMaxBytes = contentPrefetchMaxBytesDefault
+	}
+	c.dirs.contentTimeout = opts.PrefetchTimeout
+	if c.dirs.contentTimeout <= 0 {
+		c.dirs.contentTimeout = contentPrefetchTimeoutDefault
+	}
+	if opts.Events != nil {
+		// Local-write-state approximation for the prefetch trio (
+		// hasLocalWriteState): staged/written paths stay unprefetched until
+		// their commit lands.
+		opts.Events.On(fs.EventStaged, func(e fs.Event) {
+			if c.dirs != nil {
+				c.dirs.noteWrite(e.Path)
+			}
+		})
+		opts.Events.On(fs.EventLanded, func(e fs.Event) {
+			if c.dirs != nil {
+				c.dirs.noteLanded(e.Path)
+			}
+		})
+		opts.Events.On(fs.EventWrite, func(e fs.Event) {
+			if c.dirs != nil {
+				c.dirs.noteWrite(e.Path)
+			}
+			c.mem.Invalidate(e.Path)
+			if c.dsk != nil {
+				c.dsk.InvalidateFile(pathDiskReadCacheFileID(e.Path))
+			}
+		})
+		opts.Events.On(fs.EventDelete, func(e fs.Event) {
+			c.invalidatePathTiers(e.Path)
+		})
+		// A remote-origin change invalidates that path's cached images (v1
+		// invalidateReadCacheAndTargets was per-path); only a checkout/reset
+		// sweeps the whole cache.
+		opts.Events.On(fs.EventInvalidated, func(e fs.Event) {
+			if e.Path == "/" {
+				c.invalidateAllTiers()
+				return
+			}
+			c.invalidatePathTiers(e.Path)
+		})
+		opts.Events.On(fs.EventCheckout, func(fs.Event) { c.invalidateAllTiers() })
+		// Loss of stream continuity is not a view change: the revision-keyed
+		// tiers stay and open descriptors re-pin their revision before
+		// answering from them (v1 kept the read cache and revalidated).
+		opts.Events.On(fs.EventUnverified, func(fs.Event) { c.markUnverified() })
+		opts.Events.On(fs.EventVerified, func(fs.Event) { c.unverified.Store(false) })
+		opts.Events.On(fs.EventLanded, func(e fs.Event) {
+			// A local commit settle (onCommitQueueSuccess /
+			// onWriteBackUploadSuccess) replaces the file's image. Same
+			// path readers still hold their OPEN-TIME revision, so the old
+			// disk blocks look current to them (a sibling fsync made a
+			// reader fall back from the writer's bytes to the old image).
+			// Drop the stale blocks and move the readers onto the LANDED
+			// revision — but KEEP the just-seeded committed image: it
+			// covers backend replica lag for this mount's own writes, and
+			// sweeping it made a fresh commit read back as the stale
+			// remote row (git's refs after clone).
+			if e.Path == "/" || e.Path == "" {
+				c.invalidateAllTiers()
+				return
+			}
+			// A hardlink alias names the same object: the landing replaces
+			// the image its readers hold under their open-time revision too.
+			aliases := c.aliasSet(e.Path)
+			for alias := range aliases {
+				if e.Rev <= 0 {
+					// No trustworthy revision to keep: drop the alias's
+					// image (v1 settle) — a rev-keyed seed below supersedes it.
+					c.mem.Invalidate(alias)
+				}
+				if c.dsk != nil {
+					c.dsk.InvalidateFile(pathDiskReadCacheFileID(alias))
+				}
+			}
+			prefix := strings.TrimSuffix(e.Path, "/") + "/"
+			c.open.Range(func(key, _ any) bool {
+				h, ok := key.(*cachingHandle)
+				if !ok {
+					return true
+				}
+				p := h.identity()
+				if _, aliased := aliases[p]; !aliased && p != e.Path && !strings.HasPrefix(p, prefix) {
+					return true
+				}
+				h.mu.Lock()
+				if h.prefetch != nil {
+					// The prefetcher clips its last block to ITS file size:
+					// left at the open-time length, a reader crossing the
+					// old EOF after the file grew got a short block that
+					// Get took for EOF. Move it onto the landed size too.
+					if e.HasSize {
+						h.prefetch.invalidateWithSize(e.Size)
+					} else {
+						h.prefetch.Invalidate()
+					}
+				}
+				if e.Rev > 0 {
+					h.rev = e.Rev
+				}
+				if e.HasSize {
+					// Adopt the LANDED size: a reader that kept its
+					// open-time size answered EOF past the old end after
+					// the file grew (a disk range key clips against it).
+					h.size = e.Size
+				}
+				h.grown = false
+				h.identityGen++
+				h.mu.Unlock()
+				return true
+			})
+		})
+	}
+	return c, nil
+}
+
+// invalidatePathTiers drops one path's (and its subtree's) images from the
+// memory/disk tiers AND invalidates the matching open handles' block
+// prefetchers — Read serves prefetched blocks ahead of the invalidated
+// tiers, so a per-file SSE change that skipped them kept answering the old
+// bytes until a full checkout.
+func (c *Cache) invalidatePathTiers(path string) {
+	// Hardlink aliases name the same object: the change is theirs too.
+	aliases := c.aliasSet(path)
+	for alias := range aliases {
+		c.mem.Invalidate(alias)
+		if c.dsk != nil {
+			c.dsk.InvalidateFile(pathDiskReadCacheFileID(alias))
+		}
+	}
+	c.mem.InvalidatePrefix(path + "/")
+	if c.dsk != nil {
+		c.dsk.InvalidatePathPrefix(path + "/")
+	}
+	prefix := strings.TrimSuffix(path, "/") + "/"
+	c.open.Range(func(key, _ any) bool {
+		h, ok := key.(*cachingHandle)
+		if !ok {
+			return true
+		}
+		p := h.identity()
+		if _, aliased := aliases[p]; aliased || p == path || strings.HasPrefix(p, prefix) {
+			h.mu.Lock()
+			if h.prefetch != nil {
+				h.prefetch.Invalidate()
+			}
+			// The SSE change replaced this file's remote image: the
+			// handle's open-time size/rev describe the OLD one, and a
+			// whole-file read under it re-cached the stale prefix as the
+			// complete image (the grown tail answered EOF). The next read
+			// re-pins them against the remote instead of leaving the
+			// descriptor off the tiers for the rest of its life.
+			h.size, h.rev = 0, 0
+			h.grown = false
+			h.revalidate = true
+			h.identityGen++
+			h.mu.Unlock()
+		}
+		return true
+	})
+}
+
+// markUnverified handles a loss of event-stream continuity (an SSE
+// disconnect, and the catch-up that ends it): a remote change in the gap
+// arrives with no event, so nothing pinned before it can be trusted blindly
+// — but nothing is known to have changed either. v1 kept the read cache and
+// revalidated reads while the stat cache was unverified; a full sweep here
+// (#1026) dropped up to a GiB of disk tier per blip and zeroed every open
+// descriptor's revision with no path back onto the tiers (#1064).
+//
+//   - The revision-keyed disk tier stays: it is read only through handles,
+//     and every handle re-pins its revision before answering from it.
+//   - The whole-file memory tier is still swept: writeback's base preload
+//     reads it revision-blind (ReadCached with revision 0), and a stale
+//     base under a partial write would commit the old bytes.
+//   - Open handles keep rev/size as CANDIDATES and are flagged to
+//     revalidate; their prefetched blocks (offset-keyed, fetched under the
+//     candidate revision) are dropped. The epoch bump fences fetches still
+//     in flight from being admitted under a revision that may have moved.
+//
+// Without a client to stat with, the sweep is the only safe answer.
+func (c *Cache) markUnverified() {
+	if c.opts.PrefetchClient == nil {
+		c.invalidateAllTiers()
+		return
+	}
+	c.resetMu.Lock()
+	c.epoch.Add(1)
+	c.unverified.Store(true)
+	c.mem.InvalidateAll()
+	c.open.Range(func(key, _ any) bool {
+		if h, ok := key.(*cachingHandle); ok {
+			h.mu.Lock()
+			if h.prefetch != nil {
+				h.prefetch.Invalidate()
+			}
+			h.revalidate = true
+			h.identityGen++
+			h.mu.Unlock()
+		}
+		return true
+	})
+	c.resetMu.Unlock()
+}
+
+// invalidateAllTiers drops the whole-file memory/disk caches AND every open
+// handle's block prefetcher: Read serves prefetched blocks ahead of the
+// invalidated tiers, so a checkout/reset that skipped them kept feeding the
+// pre-reset image to live descriptors (v1 resetMountViewWithInitialSync
+// invalidated each handle's Prefetch, cancelling in-flight fetches).
+func (c *Cache) invalidateAllTiers() {
+	c.resetMu.Lock()
+	c.epoch.Add(1)
+	// A checkout/reset re-synchronizes the whole view: every tier is swept
+	// and every handle re-pins through a fresh open, so the stream is
+	// continuous again from here. SSE's reset path clears its own
+	// unverified flag without a catch-up, so no EventVerified follows it —
+	// left set, gap mode would stat every warm read for the rest of the
+	// session.
+	c.unverified.Store(false)
+	c.mem.InvalidateAll()
+	if c.dsk != nil {
+		c.dsk.InvalidateAll()
+	}
+	c.open.Range(func(key, _ any) bool {
+		if h, ok := key.(*cachingHandle); ok {
+			h.mu.Lock()
+			if h.prefetch != nil {
+				h.prefetch.Invalidate()
+			}
+			// The open-time size/revision describe the OLD view: keeping
+			// them made a whole-file read re-cache the stale prefix as the
+			// complete image (a grown remote file read as its old length,
+			// with the tail answering EOF). No revalidation either: the
+			// view changed, and the facade fences these descriptors' reads.
+			h.size, h.rev = 0, 0
+			h.grown = false
+			h.revalidate = false
+			h.identityGen++
+			h.mu.Unlock()
+		}
+		return true
+	})
+	c.resetMu.Unlock()
+}
+
+// remotePathOf maps a view path to the path the client addresses (the
+// prefetcher must read the SAME file the terminal does; a view path with a
+// RemoteRoot mixed another file's blocks into the stream).
+func (c *Cache) remotePathOf(p string) string {
+	root := strings.TrimSpace(c.opts.RemoteRoot)
+	if root == "" || root == "/" {
+		return p
+	}
+	root = "/" + strings.Trim(root, "/")
+	if p == "/" {
+		return root
+	}
+	return root + p
+}
+
+// noteDirty/clearDirty track a HANDLE's unflushed writes. The caller passes
+// the handle so the pair is ownership-based: N writes by one descriptor
+// leave exactly one mark, and another descriptor's boundary is a no-op.
+func (c *Cache) noteDirty(path string, h *cachingHandle) {
+	h.mu.Lock()
+	already := h.dirtyOwned
+	h.dirtyOwned = true
+	h.mu.Unlock()
+	if already {
+		return
+	}
+	c.dirtyMu.Lock()
+	if c.dirty == nil {
+		c.dirty = map[string]int{}
+	}
+	c.dirty[path]++
+	c.dirtyMu.Unlock()
+}
+
+// moveDirty migrates the mark a handle owns from oldPath to newPath (rename
+// retarget). A no-op when the handle owns nothing.
+func (c *Cache) moveDirty(oldPath, newPath string, h *cachingHandle) {
+	h.mu.Lock()
+	owned := h.dirtyOwned
+	h.mu.Unlock()
+	if !owned || oldPath == newPath {
+		return
+	}
+	c.dirtyMu.Lock()
+	if n := c.dirty[oldPath]; n > 1 {
+		c.dirty[oldPath] = n - 1
+	} else {
+		delete(c.dirty, oldPath)
+	}
+	if c.dirty == nil {
+		c.dirty = map[string]int{}
+	}
+	c.dirty[newPath]++
+	c.dirtyMu.Unlock()
+}
+
+func (c *Cache) clearDirty(path string, h *cachingHandle) {
+	h.mu.Lock()
+	owned := h.dirtyOwned
+	h.dirtyOwned = false
+	h.mu.Unlock()
+	if !owned {
+		return
+	}
+	c.dirtyMu.Lock()
+	if n := c.dirty[path]; n > 1 {
+		c.dirty[path] = n - 1
+	} else {
+		delete(c.dirty, path)
+	}
+	c.dirtyMu.Unlock()
+}
+
+func (c *Cache) dirtyPath(path string) bool {
+	c.dirtyMu.Lock()
+	_, ok := c.dirty[path]
+	c.dirtyMu.Unlock()
+	return ok
+}
+
+// publishIfCurrent runs fn iff no reset has landed since gen, atomically
+// with the reset's sweep (the read side of resetMu).
+func (c *Cache) publishIfCurrent(gen uint64, fn func()) bool {
+	c.resetMu.RLock()
+	defer c.resetMu.RUnlock()
+	if c.epoch.Load() != gen {
+		return false
+	}
+	fn()
+	return true
+}
+
+// ReadCached returns whole-file cached bytes for path at revision, if
+// admitted.
+func (c *Cache) ReadCached(path string, revision int64) ([]byte, bool) {
+	return c.mem.Get(path, revision)
+}
+
+// MaxFileSize reports the read cache's per-file admission bound (the commit
+// seeder checks it before materializing an image).
+func (c *Cache) MaxFileSize() int64 {
+	return c.mem.MaxFileSize()
+}
+
+// SeedCommit caches the just-committed image (readCache.Put at commit
+// settle) so reads racing backend replica lag see this mount's own writes.
+func (c *Cache) SeedCommit(path string, data []byte, rev int64) {
+	if rev <= 0 || !c.admits(data) || sqliteJournalPath(path) {
+		return
+	}
+	c.mem.PutOwned(path, data, rev)
+}
+
+// UnwrapHandle exposes the terminal handle (the facade's optional
+// capability probes — distributed locks, lseek — must reach the terminal
+// plane, not stop at this wrapper).
+func (h *cachingHandle) UnwrapHandle() fs.Handle { return h.inner }
+
+// SeedPending plants the path's pending seed: the flush-time staged image
+// served to this mount's readers until a newer staging replaces it or a
+// write/remote-change event drops it.
+func (c *Cache) SeedPending(path string, data []byte) {
+	c.mem.PutPendingOwned(path, data)
+}
+
+// StoreOwned caches whole-file bytes for path at revision without cloning.
+func (c *Cache) StoreOwned(path string, data []byte, revision int64) {
+	c.mem.PutOwned(path, data, revision)
+}
+
+// Invalidate drops one path's cached image.
+func (c *Cache) Invalidate(path string) { c.mem.Invalidate(path) }
+
+// InvalidatePrefix drops every cached image under a prefix.
+func (c *Cache) InvalidatePrefix(prefix string) { c.mem.InvalidatePrefix(prefix) }
+
+// InvalidateAll drops every cached image.
+func (c *Cache) InvalidateAll() { c.mem.InvalidateAll() }
+
+// Start implements fs.Lifecycle (the cache runs no background workers).
+func (c *Cache) Start(ctx context.Context) error { return nil }
+
+// Drain implements fs.Lifecycle.
+func (c *Cache) Drain(ctx context.Context) error { return nil }
+
+// Stop implements fs.Lifecycle: the on-disk block cache flushes its pending
+// writes and closes its index (v1 detachAll at unmount/reload).
+func (c *Cache) Stop(ctx context.Context) error {
+	if c.dsk != nil {
+		c.dsk.Close()
+	}
+	return nil
+}
+
+// Do implements fs.Handler.
+func (c *Cache) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error) {
+	switch op.Kind {
+	case fs.OpLookup, fs.OpGetAttr:
+		res, err := next(ctx, op)
+		if err != nil {
+			// attribute-prefetch trigger: a lookup miss counts toward
+			// the directory's miss window; two misses within a second
+			// batch-stat the siblings into the namespace cache.
+			if fs.IsNotFound(err) {
+				c.dirs.noteMiss(ctx, op.Path)
+			}
+			return res, err
+		}
+		return res, nil
+	case fs.OpList:
+		res, err := next(ctx, op)
+		if err != nil {
+			return res, err
+		}
+		// trio triggers after a listing: sibling directory listings load
+		// in the background, and (gated) small file contents batch-read
+		// into the read cache.
+		if c.dirs.namespace != nil {
+			go func() {
+				c.dirs.maybePrefetchSiblingDirectories(next, op.Path)
+			}()
+			c.prefetchDirContents(ctx, op.Path, res.Entries)
+		}
+		return res, nil
+	case fs.OpCreate:
+		res, err := next(ctx, op)
+		if err != nil || res.Handle == nil {
+			return res, err
+		}
+		rev := int64(0)
+		size := int64(0)
+		if res.Attr != nil {
+			rev = res.Attr.Rev
+			size = res.Attr.Size
+		}
+		h := &cachingHandle{cache: c, inner: res.Handle, path: op.Path, rev: rev, size: size}
+		c.open.Store(h, struct{}{})
+		if sqliteJournalPath(op.Path) {
+			c.trackSidecarOpen(op.Path)
+			h.isSidecar = true
+		}
+		// The prefetcher reads the ORDINARY remote namespace: it may only
+		// arm behind a claim whose bytes EQUAL that namespace — an
+		// explicit capability on the terminal (core's SyncHandle), not a
+		// decorator-shape inference (localize's token has no UnwrapHandle
+		// and passed the old check, mixing local and remote images). A
+		// decorator that serves the remote bytes unchanged (writeback's
+		// clean descriptor of a path without local images) forwards the
+		// terminal's claim; one that serves its own bytes withholds it.
+		if remoteNamespaceReadable(res.Handle) && op.Flags&(uint32(syscall.O_WRONLY)|uint32(syscall.O_RDWR)) == 0 {
+			if c.opts.SequentialPrefetch && c.opts.PrefetchClient != nil && size > c.mem.MaxFileSize() {
+				// v1 armed the prefetcher only for READ-ONLY opens of files
+				// whose size exceeds the whole-file cache admission limit:
+				// smaller files are served by the mem cache itself and need
+				// no block read-ahead, and a writable descriptor's first
+				// write would only invalidate it.
+				p := NewPrefetcher(c.opts.PrefetchClient, c.remotePathOf(op.Path), size)
+				p.SetParallelRead(c.opts.ParallelReadConcurrency, c.opts.ParallelReadBlockSize)
+				h.prefetch = p
+				h.prefetchArmed = true
+			}
+		}
+		res.Handle = h
+		return res, nil
+
+	case fs.OpRename:
+		res, err := next(ctx, op)
+		if err != nil {
+			return res, err
+		}
+		// Retarget open handles and their prefetchers: the inner writeback
+		// plane already moved its writers, and a caching handle still
+		// keyed on the old path would fetch blocks for whatever replaces
+		// the old name after a re-create. Cached whole-file images move
+		// with the name (same content, same revision).
+		c.open.Range(func(k, _ any) bool {
+			if h, ok := k.(*cachingHandle); ok {
+				p := h.identity()
+				if p == op.Path {
+					h.SetPath(op.Path2)
+				} else if strings.HasPrefix(p, strings.TrimSuffix(op.Path, "/")+"/") {
+					h.SetPath(op.Path2 + strings.TrimPrefix(p, op.Path))
+				}
+			}
+			return true
+		})
+		c.mem.Rename(op.Path, op.Path2)
+		return res, nil
+
+	case fs.OpRead:
+		if op.Handle != nil || op.Fh != 0 {
+			break // handle reads go through the decorator
+		}
+		if data, ok := c.mem.Get(op.Path, 0); ok {
+			if op.Offset > 0 || op.Limit > 0 {
+				off := op.Offset
+				if off < 0 {
+					off = 0
+				}
+				if off >= int64(len(data)) {
+					return fs.Result{}, nil
+				}
+				end := int64(len(data))
+				if op.Limit > 0 && off+op.Limit < end {
+					end = off + op.Limit
+				}
+				data = data[off:end]
+			}
+			return fs.Result{Data: data}, nil
+		}
+		epoch := c.epoch.Load()
+		res, err := next(ctx, op)
+		if err == nil && res.Attr == nil && len(res.Data) > 0 {
+			// Path-addressed reads carry no revision; event invalidation
+			// keeps this coherent. Only an UNLIMITED offset-0 request
+			// returns the whole image — caching a 16KiB range read under
+			// the whole-file key made every later offset answer EOF
+			// (the layer staged-append read-back).
+			// The epoch fences a read that raced a checkout: its bytes
+			// describe the replaced view.
+			if op.Offset == 0 && op.Limit <= 0 && c.admits(res.Data) {
+				c.publishIfCurrent(epoch, func() { c.mem.Put(op.Path, res.Data, 0) })
+			}
+		}
+		return res, err
+	}
+	return next(ctx, op)
+}
+
+// Read implements fs.Handle.
+// Unwrap exposes the decorated handle so inner extensions can resolve their
+// own handle type for FD-directed operations.
+func (h *cachingHandle) Unwrap() fs.Handle { return h.inner }
+
+func (h *cachingHandle) Read(ctx context.Context, off int64, dest []byte) (int, error) {
+	// A dirty sibling's bytes are the CURRENT image: the mem/disk tiers
+	// hold a pre-write copy, so this read must go to the plane below
+	// (which serves read-your-writers) instead of a stable cache hit.
+	if path := h.identity(); h.cache.dirtyPath(path) {
+		h.cache.mem.Invalidate(path)
+		return h.inner.Read(ctx, off, dest)
+	}
+	// An ANONYMOUS fd (its name was unlinked or overwritten) reads a private
+	// snapshot of the OLD object: every tier below is path-keyed and would
+	// serve the replacement's pending/remote bytes, so bypass them all.
+	if a, ok := h.inner.(interface{ Anonymous() bool }); ok && a.Anonymous() {
+		return h.inner.Read(ctx, off, dest)
+	}
+	// One stable identity for the whole read (cache keys stay coherent
+	// across a concurrent retarget).
+	path := h.identity()
+	if data, ok := h.cache.mem.GetPending(path); ok {
+		if off < 0 || off >= int64(len(data)) {
+			return 0, nil
+		}
+		return copy(dest, data[off:]), nil
+	}
+	// The plane's claim that this descriptor reads the remote namespace is
+	// evaluated once per read, and only when a tier below depends on it
+	// (it walks the inode's live handles).
+	remote, remoteKnown := false, false
+	remoteReadable := func() bool {
+		if !remoteKnown {
+			remote, remoteKnown = remoteNamespaceReadable(h.inner), true
+		}
+		return remote
+	}
+	// Re-pin rev/size against the remote before any revision-keyed tier
+	// answers: once per loss of continuity or remote change, and on every
+	// read while the stream is down (v1 revalidateReadCacheEntryIfUntrusted).
+	if h.revalidationDue() {
+		if !remoteReadable() {
+			// The pinned revision is stale but this plane cannot re-pin it
+			// (an inner decorator that does not read the remote namespace):
+			// trust nothing revision-keyed, prefetched blocks included, and
+			// let the plane below answer.
+			if h.prefetch != nil {
+				h.prefetch.Invalidate()
+			}
+			return h.inner.Read(ctx, off, dest)
+		}
+		pinned, err := h.revalidateRevision(ctx, path)
+		if err != nil {
+			return 0, err
+		}
+		if !pinned {
+			// The identity moved under the stat: nothing revision-keyed
+			// (prefetched blocks included) can answer this read.
+			return h.inner.Read(ctx, off, dest)
+		}
+	}
+	if h.prefetch != nil {
+		if remoteReadable() {
+			h.prefetch.OnRead(off, len(dest))
+			if data, ok := h.prefetch.Get(off, len(dest)); ok {
+				return copy(dest, data), nil
+			}
+		} else {
+			// The path acquired a local image after the open armed the
+			// prefetcher (a sibling's released image still landing, a
+			// staged write): its blocks describe the remote base, not the
+			// bytes the plane below serves now. Drop them instead of
+			// answering stale; a later clean read re-arms from the remote.
+			h.prefetch.Invalidate()
+		}
+	}
+	// h.rev <= 0 means the open could not pin a trustworthy revision (the
+	// path is mid-landing locally): skip the revision-keyed tiers and let
+	// the inner plane serve its own staged bytes. The same applies while
+	// the path has local write state — its authoritative image is staging,
+	// not the remote revision this handle pinned.
+	// ONE identity snapshot for the whole read: an invalidation can clear
+	// or replace size/rev concurrently, and mixing values from before and
+	// after (length, revision key, whole-image test) split one read across
+	// two images.
+	h.mu.Lock()
+	size, rev, grown := h.size, h.rev, h.grown
+	h.mu.Unlock()
+	if rev > 0 && size > 0 && size <= h.cache.mem.MaxFileSize() && !grown && !h.cache.dirs.hasLocalWriteState(path) && !h.cache.sqliteBypassStableCaches(path) {
+		// v1 small-file tier: any offset slices one whole-file image; a
+		// miss fetches the WHOLE file so a short final read (the kernel's
+		// last block smaller than the request buffer) cannot lock the file
+		// out of the caches. The disk tier below the mem tier survives the
+		// mem TTL/eviction, serving warm re-reads across mounts.
+		if data, ok := h.cache.mem.Get(path, rev); ok {
+			h.cache.noteHit("read", true)
+			return copyReadRange(dest, data, off), nil
+		}
+		h.cache.noteHit("read", false)
+		key := DiskReadCacheKey{FileID: pathDiskReadCacheFileID(path), Path: path, Revision: rev, Offset: 0, Length: size}
+		// The capture PRECEDES the disk read: a blocking disk fetch that
+		// completes after a reset must not promote its pre-reset bytes.
+		epoch := h.cache.epoch.Load()
+		if h.cache.dsk != nil {
+			if cached, ok := h.cache.dsk.Get(key); ok && int64(len(cached)) == size {
+				h.cache.noteHit("read", true)
+				h.cache.publishIfCurrent(epoch, func() { h.cache.mem.PutOwned(path, cached, rev) })
+				return copyReadRange(dest, cached, off), nil
+			}
+		}
+		whole := make([]byte, size)
+		epoch = h.cache.epoch.Load()
+		if n, err := h.inner.Read(ctx, 0, whole); err == nil && int64(n) == size {
+			// A checkout may have replaced the view while this fetch was
+			// in flight: its bytes describe the OLD view and must not be
+			// admitted (the OpRead path already carries this fence).
+			h.cache.publishIfCurrent(epoch, func() {
+				h.cache.mem.PutOwned(path, whole, rev)
+				if h.cache.dsk != nil {
+					h.cache.dsk.PutAsync(key, whole)
+				}
+			})
+			return copyReadRange(dest, whole, off), nil
+		}
+		// Fetch error or short image: fall through to the direct read.
+		return h.inner.Read(ctx, off, dest)
+	}
+	if off == 0 && rev > 0 && !grown && h.cache.admits(dest) && !h.cache.sqliteBypassStableCaches(path) {
+		if data, ok := h.cache.mem.Get(path, rev); ok && int64(len(data)) <= int64(len(dest)) {
+			n := copy(dest, data)
+			return n, nil
+		}
+		epoch := h.cache.epoch.Load()
+		n, err := h.inner.Read(ctx, off, dest)
+		// Admission proves the COMPLETE image was read (n == the file
+		// size), not merely that the request buffer filled: caching a
+		// 4096-byte prefix of an 8MiB file under the whole-file key made
+		// the next larger read serve a premature EOF.
+		if err == nil && int64(n) == int64(len(dest)) && size > 0 && int64(n) == size &&
+			h.cache.admits(dest[:n]) && rev > 0 {
+			h.cache.publishIfCurrent(epoch, func() {
+				h.cache.mem.PutOwned(path, append([]byte(nil), dest[:n]...), rev)
+			})
+		}
+		return n, err
+	}
+	// v1 range disk tier for large files: the request's own (offset,
+	// size-clipped) range is fetched once and served from local disk on
+	// repeat — including across mounts (the key carries the revision).
+	if h.cache.dsk != nil && rev > 0 && !grown && !h.cache.dirs.hasLocalWriteState(path) && !h.cache.sqliteBypassStableCaches(path) {
+		// grown handles share the whole-file tiers' bypass: the disk
+		// range key and clip encode the stale open-time size/revision.
+		if n, ok := h.cache.readDiskCachedRange(ctx, h, off, dest); ok {
+			return n, nil
+		}
+	}
+	return h.inner.Read(ctx, off, dest)
+}
+
+// readDiskCachedRange serves one read through the on-disk block tier (v1
+// readDiskCachedRange/diskReadCacheReadSize): the range is clipped to the
+// open-time size, keyed by its exact bounds, fetched on miss, and cached
+// only when the fetch came back whole. ok=false defers to the caller's
+// direct read.
+func (c *Cache) readDiskCachedRange(ctx context.Context, h *cachingHandle, off int64, dest []byte) (int, bool) {
+	path := h.identity()
+	// One identity snapshot: an invalidation may reset size/rev mid-read.
+	h.mu.Lock()
+	size, rev := h.size, h.rev
+	h.mu.Unlock()
+	block := c.opts.ParallelReadBlockSize
+	if block <= 0 {
+		block = defaultParallelReadBlockSize
+	}
+	length := int64(len(dest))
+	if length <= 0 || length > block {
+		return 0, false // never split (kernel reads stay under MaxWrite)
+	}
+	if off < 0 || size > 0 && off >= size {
+		return 0, true // EOF
+	}
+	if size > 0 {
+		if end := off + length; end > size {
+			length = size - off
+		}
+	}
+	if length <= 0 {
+		return 0, true
+	}
+	key := DiskReadCacheKey{FileID: pathDiskReadCacheFileID(path), Path: path, Revision: rev, Offset: off, Length: length}
+	if data, ok := c.dsk.Get(key); ok && int64(len(data)) == length {
+		c.noteHit("read", true)
+		return copyReadRange(dest, data, 0), true
+	}
+	c.noteHit("read", false)
+	buf := make([]byte, length)
+	epoch := c.epoch.Load()
+	n, err := h.inner.Read(ctx, off, buf)
+	if err != nil {
+		return 0, false
+	}
+	if int64(n) == length {
+		c.publishIfCurrent(epoch, func() { c.dsk.PutOwned(key, buf) })
+		return copyReadRange(dest, buf, 0), true
+	}
+	// Short fetch (EOF tail): serve directly; a truncated entry must not
+	// poison the tier.
+	copy(dest, buf[:n])
+	return n, true
+}
+
+// copyReadRange copies data[off:] into dest, clipped at both ends.
+func copyReadRange(dest, data []byte, off int64) int {
+	if off < 0 || off >= int64(len(data)) {
+		return 0
+	}
+	end := off + int64(len(dest))
+	if end > int64(len(data)) {
+		end = int64(len(data))
+	}
+	return copy(dest, data[off:end])
+}
+
+// remoteNamespaceReadable reports the plane's claim that reads through h
+// serve the ordinary remote namespace: core's SyncHandle states it, and a
+// decorator forwards it only while its own bytes equal the terminal's
+// (writeback: a clean descriptor of a path with no local image). It is
+// consulted when the prefetcher is armed and again on every read it could
+// answer, since the path can acquire a local image while the handle is
+// open.
+func remoteNamespaceReadable(h fs.Handle) bool {
+	r, ok := h.(interface{ IsRemoteNamespaceReadable() bool })
+	return ok && r.IsRemoteNamespaceReadable()
+}
+
+// revalidationDue reports whether the next read must re-pin the handle's
+// revision before a revision-keyed tier may answer: once for a flagged
+// handle (the stream lost continuity, or a remote change replaced the
+// image), and on every read of a handle with a pinned revision while the
+// stream is down. Without a client to stat with there is nothing to
+// revalidate against — markUnverified sweeps instead, and never flags.
+func (h *cachingHandle) revalidationDue() bool {
+	if h.cache.opts.PrefetchClient == nil {
+		return false
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.revalidate || (h.cache.unverified.Load() && h.rev > 0)
+}
+
+// revalidateRevision re-pins rev/size against the remote namespace (v1
+// revalidateReadCacheEntryIfUntrusted): a matching revision keeps the
+// revision-keyed tiers serving; a different one moves the handle onto it,
+// drops the path's stale image and prefetched blocks, and clips the
+// prefetcher to the new length. The stat runs without the handle lock: when
+// the identity moved meanwhile (an invalidation, a landed commit, a
+// retarget), the result describes an older world and is discarded —
+// pinned=false, the handle stays flagged, and the caller serves this read
+// from the plane below. A failed stat takes the same exit: a read that could
+// not verify its revision answers from nothing revision-keyed, and the plane
+// below reports whether the object is still there (a rename that retargeted
+// the descriptor mid-stat makes the old name 404 while the fd stays valid).
+func (h *cachingHandle) revalidateRevision(ctx context.Context, path string) (pinned bool, err error) {
+	c := h.cache
+	h.mu.Lock()
+	gen := h.identityGen
+	h.mu.Unlock()
+	st, err := c.opts.PrefetchClient.StatCtx(ctx, c.remotePathOf(path))
+	h.mu.Lock()
+	if err != nil || h.identityGen != gen {
+		// Unconditional, not only when the mover itself flags: an identity
+		// change from EventLanded, a retarget or a concurrent write does not
+		// set the flag, and a gap-mode revalidation runs with it unset —
+		// one extra stat after a raced revalidation is cheaper than
+		// trusting an identity that moved under an in-flight stat.
+		h.revalidate = true
+		h.mu.Unlock()
+		return false, nil
+	}
+	moved := st.Revision <= 0 || st.Revision != h.rev
+	if moved && h.prefetch != nil {
+		h.prefetch.invalidateWithSize(st.Size)
+	}
+	if st.Revision > 0 {
+		h.rev, h.size = st.Revision, st.Size
+	} else {
+		// An old server reports no revision: nothing keys the tiers safely.
+		h.rev, h.size = 0, 0
+	}
+	h.revalidate = false
+	h.mu.Unlock()
+	if moved {
+		c.mem.Invalidate(path)
+		if c.dsk != nil {
+			c.dsk.InvalidateFile(pathDiskReadCacheFileID(path))
+		}
+	}
+	return true, nil
+}
+
+// invalidateSiblingPrefetch drops the prefetched blocks of every OTHER open
+// descriptor of path once a write through writer succeeded: a block fetched
+// before the write describes the pre-write remote image, and a reader that
+// does not read again until the write has landed never sees the dirty
+// window that would make it drop the block itself (nor, without an event
+// bus, an EventLanded). The cancellation also fails a Get parked on an
+// in-flight fetch, so a block completing after the write is not answered.
+// Hardlink aliases count as siblings: a write through /b invalidates the
+// blocks a reader of /a prefetched for the same object.
+func (c *Cache) invalidateSiblingPrefetch(path string, writer *cachingHandle) {
+	aliases := c.aliasSet(path)
+	c.open.Range(func(key, _ any) bool {
+		h, ok := key.(*cachingHandle)
+		if !ok || h == writer {
+			return true
+		}
+		if _, sibling := aliases[h.identity()]; !sibling {
+			return true
+		}
+		h.mu.Lock()
+		if h.prefetch != nil {
+			h.prefetch.Invalidate()
+		}
+		h.mu.Unlock()
+		return true
+	})
+}
+
+// Write implements fs.Handle.
+func (h *cachingHandle) Write(ctx context.Context, off int64, data []byte) error {
+	err := h.inner.Write(ctx, off, data)
+	if err == nil {
+		path := h.identity()
+		h.cache.noteDirty(path, h)
+		h.cache.mem.Invalidate(path)
+		if h.prefetch != nil {
+			h.prefetch.Invalidate()
+		}
+		h.cache.invalidateSiblingPrefetch(path, h)
+		// The open-time size/rev no longer describe this file: the image
+		// grew (or changed) through this descriptor. Later reads must not
+		// admit whole-file cache entries under the stale identity — a
+		// 4096-byte read then returned only the open-time prefix forever.
+		h.mu.Lock()
+		h.grown = true
+		h.identityGen++
+		h.mu.Unlock()
+	}
+	return err
+}
+
+// Sync implements fs.Handle.
+func (h *cachingHandle) Sync(ctx context.Context) error {
+	err := h.inner.Sync(ctx)
+	if err == nil {
+		// Only a SUCCESSFUL commit boundary releases the dirty ownership:
+		// a rejected upload leaves the bytes uncommitted and their cache
+		// bypass must stay in force.
+		h.cache.clearDirty(h.identity(), h)
+	}
+	return err
+}
+
+// Flush implements fs.Handle.
+func (h *cachingHandle) Flush(ctx context.Context) error {
+	err := h.inner.Flush(ctx)
+	if err == nil {
+		h.cache.clearDirty(h.identity(), h)
+	}
+	return err
+}
+
+// Release implements fs.Handle.
+func (h *cachingHandle) Release(ctx context.Context) error {
+	h.cache.open.Delete(h)
+	// The prefetcher runs on its own background context: dropping the
+	// handle without closing it left requests running for a closed file
+	// (and a later global sweep could no longer find them).
+	if h.prefetch != nil {
+		h.prefetch.Close()
+	}
+	if h.isSidecar {
+		h.cache.sidecars.remove(h.identity())
+	}
+	// The descriptor's close is a durability boundary for its writes (the
+	// below plane commits them): stop forcing sibling reads around the
+	// stable tiers.
+	h.cache.clearDirty(h.identity(), h)
+	return h.inner.Release(ctx)
+}
+
+// identity snapshots the handle's path under its mutex: rename/survivor
+// retargeting rewrites it concurrently, and a bare read both races and
+// can split one cache operation across two identities.
+func (h *cachingHandle) identity() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.path
+}
+
+// SetPath retargets the handle (and its prefetcher) onto the renamed path.
+func (h *cachingHandle) SetPath(p string) {
+	h.mu.Lock()
+	old := h.path
+	h.path = p
+	h.identityGen++
+	h.mu.Unlock()
+	if old != p {
+		// The dirty mark is ownership-based and keyed by path: leaving it
+		// on the old name bypassed caches for a later same-name file
+		// forever, while the writer's own boundary now cleared the new
+		// name (a no-op) and never the old one.
+		h.cache.moveDirty(old, p, h)
+	}
+	if h.prefetch != nil {
+		// The prefetcher addresses the REMOTE namespace: a retarget that
+		// handed it the view path mixed a same-named file outside the
+		// mount subtree into the stream.
+		h.prefetch.SetPath(h.cache.remotePathOf(p))
+	}
+}
+
+// RetargetPath rebinds open read-plane handles keyed at oldPath onto
+// newPath — the facade's deferred-unlink survivor hook (#1029). The write
+// plane already moved its writers; a caching handle still keyed at the
+// doomed name would seed pending reads and prefetch blocks for whatever
+// replaces the name after the re-create. Cached whole-file images move
+// with the name (same content, same revision), so the recycled name
+// starts without a cached image of the old object.
+func (c *Cache) RetargetPath(oldPath, newPath string) {
+	prefix := strings.TrimSuffix(oldPath, "/") + "/"
+	c.open.Range(func(k, _ any) bool {
+		if h, ok := k.(*cachingHandle); ok {
+			p := h.identity()
+			if p == oldPath {
+				h.SetPath(newPath)
+			} else if strings.HasPrefix(p, prefix) {
+				h.SetPath(newPath + strings.TrimPrefix(p, oldPath))
+			}
+		}
+		return true
+	})
+	c.mem.Rename(oldPath, newPath)
+}
+
+func (c *Cache) admits(data []byte) bool {
+	return int64(len(data)) <= c.mem.MaxFileSize()
+}

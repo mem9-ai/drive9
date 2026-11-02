@@ -4,6 +4,7 @@ package client
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -37,6 +38,85 @@ func TestFileTasksCtxDecodesResponse(t *testing.T) {
 	}
 	if got.Tasks[0].LastError != "embedding_provider_auth_rejected: provider rejected the credentials (HTTP 401)" {
 		t.Fatalf("last_error = %q", got.Tasks[0].LastError)
+	}
+}
+
+func TestFileTasksCtxDecodesUsageAndPendingReason(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(fileTasksMarkerHeader, "1")
+		_, _ = w.Write([]byte(`{"path":"/doc.txt","tasks":[` +
+			`{"task_type":"embed","status":"failed","usage":{"input_tokens":109,"output_tokens":51,"total_tokens":160,"llm_calls":2,"audio_duration_seconds":0}},` +
+			`{"task_type":"audio_extract_text","status":"pending","pending_reason":"quota_exceeded","usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0,"llm_calls":0,"audio_duration_seconds":12.5}}]}`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	got, err := c.FileTasksCtx(context.Background(), "/doc.txt")
+	if err != nil {
+		t.Fatalf("FileTasksCtx: %v", err)
+	}
+	if len(got.Tasks) != 2 {
+		t.Fatalf("got %d tasks, want 2", len(got.Tasks))
+	}
+	embed := got.Tasks[0].Usage
+	if embed == nil || embed.InputTokens != 109 || embed.OutputTokens != 51 ||
+		embed.TotalTokens != 160 || embed.LLMCalls != 2 || embed.AudioDurationSeconds != 0 {
+		t.Fatalf("embed usage = %+v", got.Tasks[0].Usage)
+	}
+	if reason := got.Tasks[1].PendingReason; reason == nil || *reason != "quota_exceeded" {
+		t.Fatalf("pending_reason = %v", reason)
+	}
+	if audio := got.Tasks[1].Usage; audio == nil || audio.AudioDurationSeconds != 12.5 {
+		t.Fatalf("audio usage = %+v", audio)
+	}
+}
+
+// A server that does not project usage omits the object; the client must keep
+// it absent so `-o json` stays a faithful passthrough instead of inventing
+// zeroes that a caller would read as "consumed nothing".
+func TestFileTasksCtxLeavesAbsentUsageNil(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(fileTasksMarkerHeader, "1")
+		_, _ = w.Write([]byte(`{"path":"/doc.txt","tasks":[{"task_type":"embed","status":"succeeded"}]}`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	got, err := c.FileTasksCtx(context.Background(), "/doc.txt")
+	if err != nil {
+		t.Fatalf("FileTasksCtx: %v", err)
+	}
+	if len(got.Tasks) != 1 {
+		t.Fatalf("got %d tasks, want 1", len(got.Tasks))
+	}
+	if got.Tasks[0].Usage != nil || got.Tasks[0].PendingReason != nil {
+		t.Fatalf("task = %+v, want nil usage and nil pending_reason", got.Tasks[0])
+	}
+}
+
+// Presence, not just content, has to survive a decode/encode round trip: a
+// server that sends an empty reason must not be reported as one that sent none.
+func TestFileTasksPresenceSurvivesJSONRoundTrip(t *testing.T) {
+	// An explicit empty reason stays present; a missing one stays missing.
+	var out FileTasksResult
+	raw := `{"path":"/doc.txt","tasks":[` +
+		`{"task_type":"embed","status":"failed","pending_reason":""},` +
+		`{"task_type":"embed","status":"queued"}]}`
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		t.Fatal(err)
+	}
+	if reason := out.Tasks[0].PendingReason; reason == nil || *reason != "" {
+		t.Fatalf("explicit empty pending_reason = %v, want a present empty string", reason)
+	}
+	if out.Tasks[1].PendingReason != nil {
+		t.Fatalf("absent pending_reason = %q, want nil", *out.Tasks[1].PendingReason)
+	}
+	encoded, err := json.Marshal(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), `"pending_reason":""`) {
+		t.Fatalf("encoded %s: an explicit empty reason must stay present", encoded)
 	}
 }
 

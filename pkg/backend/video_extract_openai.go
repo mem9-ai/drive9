@@ -49,16 +49,16 @@ const (
 // OpenAIVideoTextExtractorConfig configures an OpenAI-compatible vision endpoint
 // for video frame extraction.
 type OpenAIVideoTextExtractorConfig struct {
-	BaseURL        string
-	APIKey         string
-	Model          string
-	Prompt         string
-	MaxTokens      int
-	Timeout        time.Duration
-	Client         *http.Client
-	FrameInterval  int // seconds between sampled frames
-	MaxFrames      int // max frames to send to vision model
-	FFmpegPath     string
+	BaseURL       string
+	APIKey        string
+	Model         string
+	Prompt        string
+	MaxTokens     int
+	Timeout       time.Duration
+	Client        *http.Client
+	FrameInterval int // seconds between sampled frames
+	MaxFrames     int // max frames to send to vision model
+	FFmpegPath    string
 }
 
 // OpenAIVideoTextExtractor extracts searchable text from video bytes by:

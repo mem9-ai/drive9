@@ -180,7 +180,24 @@ func (s *Store) jfsRequireDirTx(tx *sql.Tx, ino uint64) (int, error) {
 	return 0, nil
 }
 
-func (s *Store) jfsMknodTx(ctx context.Context, tx *sql.Tx, parent uint64, name string, typ uint8, mode, cumask uint16, inode uint64, attr ExtentAttr, projPath string, uid, gid uint32, symlinkTarget string) (uint64, *ExtentAttr, int, error) {
+func (s *Store) jfsMknodTx(ctx context.Context, tx *sql.Tx, parent uint64, name string, typ uint8, mode, cumask uint16, inode uint64, attr ExtentAttr, projPath string, uid, gid uint32, symlinkTarget string, createProjection bool) (uint64, *ExtentAttr, int, error) {
+	if createProjection && typ == jfsTypeDir {
+		canonical, err := pathutil.CanonicalizeDir(projPath)
+		if projPath == "" || err != nil || pathutil.BaseName(canonical) != name {
+			return 0, nil, int(syscall.EINVAL), nil
+		}
+		projPath = canonical
+		var existing int
+		filePath := strings.TrimSuffix(canonical, "/")
+		err = tx.QueryRowContext(ctx, `SELECT 1 FROM file_nodes WHERE `+s.scope.And(`path_hash = ? AND path = ?`)+` FOR UPDATE`, s.scope.Args(fileNodePathHash(filePath), filePath)...).Scan(&existing)
+		if err == nil {
+			return 0, nil, int(syscall.EEXIST), nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return 0, nil, 0, err
+		}
+
+	}
 	if parent == 0 {
 		parent = jfsRootIno
 	}
@@ -202,6 +219,11 @@ func (s *Store) jfsMknodTx(ctx context.Context, tx *sql.Tx, parent uint64, name 
 	// paths.
 	if eno, err := s.jfsRequireDirTx(tx, parent); err != nil || eno != 0 {
 		return 0, nil, eno, err
+	}
+	if createProjection && typ == jfsTypeDir {
+		if _, eno, err := s.jfsDirectoryProjectionTx(ctx, tx, parent, pathutil.ParentPath(projPath)); err != nil || eno != 0 {
+			return 0, nil, eno, err
+		}
 	}
 	var exist uint64
 	err := tx.QueryRow(`SELECT inode FROM jfs_edge WHERE parent = ? AND name = ?`, parent, []byte(name)).Scan(&exist)
@@ -266,12 +288,28 @@ func (s *Store) jfsMknodTx(ctx context.Context, tx *sql.Tx, parent uint64, name 
 		}
 	}
 	if typ == jfsTypeDir && projPath != "" {
-		dirPath := projPath
-		if !strings.HasSuffix(dirPath, "/") {
-			dirPath += "/"
+		dirPath, err := pathutil.CanonicalizeDir(projPath)
+		if err != nil {
+			return 0, nil, int(syscall.EINVAL), err
 		}
-		// Recording the directory's jfs inode is what lets a later recursive
-		// delete find and drop its subtree, so a failure here must abort.
+		if createProjection {
+			err := s.ensureParentDirsWithExecer(ctx, tx, dirPath, func() string { return strings.ToLower(ulid.Make().String()) })
+			if err != nil {
+				return 0, nil, 0, err
+			}
+			now := time.Now().UTC()
+			id := strings.ToLower(ulid.Make().String())
+			if err := s.InsertInodeTx(tx, &Inode{InodeID: id, Mode: uint32(mode), Revision: 1, Status: StatusConfirmed, CreatedAt: now, Mtime: now}); err != nil {
+				return 0, nil, 0, err
+			}
+			if err := s.InsertNodeTx(tx, &FileNode{NodeID: id, InodeID: id, Path: dirPath, ParentPath: pathutil.ParentPath(dirPath), Name: pathutil.BaseName(dirPath), IsDirectory: true, CreatedAt: now}); err != nil {
+				if errors.Is(err, ErrPathConflict) {
+					return 0, nil, int(syscall.EEXIST), err
+				}
+				return 0, nil, 0, err
+			}
+		}
+		// Keep legacy mknod update-only unless projection creation was requested.
 		if _, err := tx.Exec(`UPDATE file_nodes SET extent_ino = ? WHERE `+s.scope.And(`path_hash = ? AND path = ?`),
 			append([]any{inode}, s.scope.Args(fileNodePathHash(dirPath), dirPath)...)...); err != nil {
 			return 0, nil, 0, err
@@ -713,7 +751,63 @@ func (s *Store) jfsProjectionPathTx(tx *sql.Tx, parent uint64, name string) (str
 	}
 	return strings.TrimSuffix(p.String, "/") + "/" + name, nil
 }
-func (s *Store) jfsRmdirTx(tx *sql.Tx, parent uint64, name, projPath string) (uint64, *ExtentAttr, int, error) {
+
+// jfsDirectoryProjectionTx treats the inode binding as authoritative. Path
+// hints can be absent or noncanonical, but must not select another directory.
+func (s *Store) jfsDirectoryProjectionTx(ctx context.Context, tx *sql.Tx, ino uint64, hint string) (string, int, error) {
+	var path string
+	err := tx.QueryRowContext(ctx, `SELECT path FROM file_nodes FORCE INDEX (idx_file_nodes_extent_ino) WHERE `+s.scope.And(`extent_ino = ? AND is_directory = 1`)+` LIMIT 1 FOR UPDATE`, s.scope.Args(ino)...).Scan(&path)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return "", 0, err
+	}
+	if errors.Is(err, sql.ErrNoRows) && hint != "" {
+		canonical, err := pathutil.CanonicalizeDir(hint)
+		if err != nil {
+			return "", int(syscall.EINVAL), nil
+		}
+		current := jfsRootIno
+		for _, name := range strings.Split(strings.Trim(canonical, "/"), "/") {
+			if name == "" {
+				continue
+			}
+			next, attr, eno, err := s.jfsLookupForUpdateTx(tx, current, name)
+			if err != nil {
+				return "", 0, err
+			}
+			if eno != 0 || attr.Typ != jfsTypeDir {
+				return "", int(syscall.EINVAL), nil
+			}
+			current = next
+		}
+		if current != ino {
+			return "", int(syscall.EINVAL), nil
+		}
+		var bound sql.NullInt64
+		err = tx.QueryRowContext(ctx, `SELECT extent_ino FROM file_nodes WHERE `+s.scope.And(`path_hash = ? AND path = ? AND is_directory = 1`)+` FOR UPDATE`, s.scope.Args(fileNodePathHash(canonical), canonical)...).Scan(&bound)
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", 0, nil
+		}
+		if err != nil {
+			return "", 0, err
+		}
+		if bound.Valid && uint64(bound.Int64) != ino {
+			return "", int(syscall.EINVAL), nil
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE file_nodes SET extent_ino = ? WHERE `+s.scope.And(`path_hash = ? AND path = ?`), append([]any{ino}, s.scope.Args(fileNodePathHash(canonical), canonical)...)...); err != nil {
+			return "", 0, err
+		}
+		path = canonical
+	}
+	if hint != "" {
+		canonical, err := pathutil.CanonicalizeDir(hint)
+		if err != nil || canonical != path {
+			return "", int(syscall.EINVAL), nil
+		}
+	}
+	return path, 0, nil
+}
+
+func (s *Store) jfsRmdirTx(ctx context.Context, tx *sql.Tx, parent uint64, name, projPath string) (uint64, *ExtentAttr, int, error) {
 	var ino uint64
 	var typ uint8
 	// Locking read, matching jfsUnlinkTx: one dentry can be addressed by two
@@ -745,12 +839,31 @@ func (s *Store) jfsRmdirTx(tx *sql.Tx, parent uint64, name, projPath string) (ui
 	if children > 0 {
 		return 0, nil, int(syscall.ENOTEMPTY), nil
 	}
+	path, eno, err := s.jfsDirectoryProjectionTx(ctx, tx, ino, projPath)
+	if err != nil || eno != 0 {
+		return 0, nil, eno, err
+	}
+	if path != "" {
+		occupied, err := s.dirHasChildrenTx(ctx, tx, path)
+		if err != nil {
+			return 0, nil, 0, err
+		}
+		if occupied {
+			return 0, nil, int(syscall.ENOTEMPTY), nil
+		}
+	}
 	attr, _, err := s.jfsGetAttrTx(tx, ino)
 	if err != nil {
 		return 0, nil, 0, err
 	}
 	if _, err := tx.Exec(`DELETE FROM jfs_edge WHERE parent = ? AND name = ?`, parent, []byte(name)); err != nil {
 		return 0, nil, 0, err
+	}
+	// The projection must disappear in the same transaction as the extent edge.
+	if path != "" {
+		if _, err := tx.Exec(`DELETE FROM file_nodes WHERE `+s.scope.And(`path_hash = ? AND path = ?`), s.scope.Args(fileNodePathHash(path), path)...); err != nil {
+			return 0, nil, 0, err
+		}
 	}
 	if _, err := tx.Exec(`DELETE FROM jfs_node WHERE inode = ?`, ino); err != nil {
 		return 0, nil, 0, err
@@ -773,6 +886,60 @@ func (s *Store) jfsRenameTx(ctx context.Context, tx *sql.Tx, srcParent uint64, s
 	if err != nil || eno != 0 {
 		return 0, 0, nil, nil, eno, err
 	}
+	if attr.Typ == jfsTypeDir {
+		// Lock the current destination ancestry, including metadata-only dirs.
+		// This rejects moving a directory beneath itself and serializes a
+		// competing ancestor move without introducing another locking scheme.
+		seen := make(map[uint64]bool)
+		for parent := dstParent; parent != 0 && parent != jfsRootIno; {
+			if parent == ino || seen[parent] {
+				return 0, 0, nil, nil, int(syscall.EINVAL), nil
+			}
+			seen[parent] = true
+			var next uint64
+			var typ uint8
+			err := tx.QueryRowContext(ctx, `SELECT parent, type FROM jfs_node WHERE `+s.scope.And(`inode = ?`)+` FOR UPDATE`, s.scope.Args(parent)...).Scan(&next, &typ)
+			if errors.Is(err, sql.ErrNoRows) {
+				return 0, 0, nil, nil, int(syscall.ENOENT), nil
+			}
+			if err != nil {
+				return 0, 0, nil, nil, 0, err
+			}
+			if typ != jfsTypeDir {
+				return 0, 0, nil, nil, int(syscall.ENOTDIR), nil
+			}
+			parent = next
+		}
+		path, eno, err := s.jfsDirectoryProjectionTx(ctx, tx, ino, srcPath)
+		if err != nil || eno != 0 {
+			return 0, 0, nil, nil, eno, err
+		}
+		srcPath = path
+		if dstPath != "" {
+			canonical, err := pathutil.CanonicalizeDir(dstPath)
+			if err != nil {
+				return 0, 0, nil, nil, int(syscall.EINVAL), nil
+			}
+			dstPath = canonical
+		}
+		if srcPath != "" {
+			projected, err := s.jfsProjectionPathTx(tx, dstParent, dstName)
+			if errors.Is(err, sql.ErrNoRows) && dstPath != "" {
+				if _, eno, bindErr := s.jfsDirectoryProjectionTx(ctx, tx, dstParent, pathutil.ParentPath(dstPath)); bindErr != nil || eno != 0 {
+					return 0, 0, nil, nil, eno, bindErr
+				}
+				projected, err = s.jfsProjectionPathTx(tx, dstParent, dstName)
+			}
+			if err != nil {
+				return 0, 0, nil, nil, 0, err
+			}
+			expected, err := pathutil.CanonicalizeDir(projected)
+			if err != nil || (dstPath != "" && dstPath != expected) {
+				return 0, 0, nil, nil, int(syscall.EINVAL), nil
+			}
+			dstPath = expected
+		}
+	}
 	if flags&jfsRenameExchange != 0 {
 		return 0, 0, attr, nil, int(syscall.ENOTSUP), nil
 	}
@@ -788,10 +955,30 @@ func (s *Store) jfsRenameTx(ctx context.Context, tx *sql.Tx, srcParent uint64, s
 	var exist uint64
 	err = tx.QueryRow(`SELECT inode FROM jfs_edge WHERE parent = ? AND name = ? FOR UPDATE`,
 		dstParent, []byte(dstName)).Scan(&exist)
-	if err == nil {
-		if exist == ino {
-			return ino, exist, attr, attr, 0, nil
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return 0, 0, nil, nil, 0, err
+	}
+	if err == nil && exist == ino {
+		return ino, exist, attr, attr, 0, nil
+	}
+	// A classic-only destination has no jfs edge. Check both spellings in the
+	// projection namespace before either tree changes, including when the RPC
+	// omitted its optional path hint. Client-side lookup alone cannot protect
+	// against a destination changing before this transaction starts.
+	projection := dstPath
+	if projection == "" {
+		var perr error
+		projection, perr = s.jfsProjectionPathTx(tx, dstParent, dstName)
+		if perr != nil && !errors.Is(perr, sql.ErrNoRows) {
+			return 0, 0, nil, nil, 0, perr
 		}
+	}
+	if projection != "" {
+		if eno, perr := s.jfsCheckRenameProjectionTx(ctx, tx, projection, attr.Typ, flags); perr != nil || eno != 0 {
+			return 0, exist, attr, nil, eno, perr
+		}
+	}
+	if err == nil {
 		if flags&jfsRenameNoReplace != 0 {
 			return 0, exist, attr, nil, int(syscall.EEXIST), nil
 		}
@@ -818,7 +1005,7 @@ func (s *Store) jfsRenameTx(ctx context.Context, tx *sql.Tx, srcParent uint64, s
 				// (another client's unlink): there is nothing to replace, so the
 				// rename proceeds.
 			case dstAttr.Typ == jfsTypeDir && ueno == int(syscall.EPERM):
-				if _, _, reno, rerr := s.jfsRmdirTx(tx, dstParent, dstName, dstPath); rerr != nil || reno != 0 {
+				if _, _, reno, rerr := s.jfsRmdirTx(ctx, tx, dstParent, dstName, dstPath); rerr != nil || reno != 0 {
 					return 0, exist, attr, dstAttr, reno, rerr
 				}
 			default:
@@ -864,9 +1051,58 @@ func (s *Store) jfsRenameTx(ctx context.Context, tx *sql.Tx, srcParent uint64, s
 		if err := s.jfsMoveProjectionTx(tx, ino, srcPath, srcName, dstPath); err != nil {
 			return 0, 0, nil, nil, 0, err
 		}
+		if attr.Typ == jfsTypeDir && srcPath != "" {
+			if err := s.jfsMoveProjectionSubtreeTx(tx, srcPath, dstPath); err != nil {
+				return 0, 0, nil, nil, 0, err
+			}
+		}
 	}
 	return ino, 0, attr, nil, 0, nil
 }
+
+// jfsCheckRenameProjectionTx applies rename's type and emptiness rules to
+// classic entries even when they have not been mirrored into jfs_edge.
+func (s *Store) jfsCheckRenameProjectionTx(ctx context.Context, tx *sql.Tx, path string, typ uint8, flags uint32) (int, error) {
+	filePath, err := pathutil.Canonicalize(path)
+	if err != nil {
+		return int(syscall.EINVAL), nil
+	}
+	dirPath, err := pathutil.CanonicalizeDir(path)
+	if err != nil {
+		return int(syscall.EINVAL), nil
+	}
+	for _, candidate := range []string{filePath, dirPath} {
+		var isDir bool
+		err := tx.QueryRowContext(ctx, `SELECT is_directory FROM file_nodes WHERE `+s.scope.And(`path_hash = ? AND path = ?`)+` FOR UPDATE`,
+			s.scope.Args(fileNodePathHash(candidate), candidate)...).Scan(&isDir)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return 0, err
+		}
+		if flags&jfsRenameNoReplace != 0 {
+			return int(syscall.EEXIST), nil
+		}
+		if typ == jfsTypeDir && !isDir {
+			return int(syscall.ENOTDIR), nil
+		}
+		if typ != jfsTypeDir && isDir {
+			return int(syscall.EISDIR), nil
+		}
+		if isDir {
+			occupied, err := s.dirHasChildrenTx(ctx, tx, candidate)
+			if err != nil {
+				return 0, err
+			}
+			if occupied {
+				return int(syscall.ENOTEMPTY), nil
+			}
+		}
+	}
+	return 0, nil
+}
+
 func (s *Store) jfsMoveProjectionTx(tx *sql.Tx, extentIno uint64, srcPath, srcName, dstPath string) error {
 	dstParent := pathutil.ParentPath(dstPath)
 	dstName := pathutil.BaseName(dstPath)
@@ -934,6 +1170,48 @@ func (s *Store) jfsMoveProjectionTx(tx *sql.Tx, extentIno uint64, srcPath, srcNa
 // most expensive op in the data plane. It also dropped the per-child errno, so
 // an edge whose node row had gone missing produced a dirent with no attributes
 // instead of being skipped.
+func (s *Store) jfsMoveProjectionSubtreeTx(tx *sql.Tx, srcPath, dstPath string) error {
+	oldPrefix := strings.TrimSuffix(srcPath, "/") + "/"
+	newPrefix := strings.TrimSuffix(dstPath, "/") + "/"
+	if oldPrefix == newPrefix {
+		return nil
+	}
+	// The trailing-slash prefix includes the directory itself. Match its bytes
+	// exactly, even when file_nodes.path inherits a case/accent-insensitive
+	// collation, and treat wildcard characters in directory names literally.
+	predicate, args := pathPrefixPredicate("path", oldPrefix)
+	rows, err := tx.Query(`SELECT path FROM file_nodes WHERE `+
+		s.scope.And(predicate)+` ORDER BY path FOR UPDATE`, s.scope.Args(args...)...)
+	if err != nil {
+		return err
+	}
+	var paths []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		paths = append(paths, p)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, p := range paths {
+		np := newPrefix + strings.TrimPrefix(p, oldPrefix)
+		setArgs := []any{np, fileNodePathHash(np), pathutil.ParentPath(np), fileNodePathHash(pathutil.ParentPath(np)), pathutil.BaseName(np)}
+		if _, err := tx.Exec(`UPDATE file_nodes SET path = ?, path_hash = ?, parent_path = ?, parent_path_hash = ?, name = ? WHERE `+
+			s.scope.And(`path_hash = ? AND path = ?`),
+			append(setArgs, s.scope.Args(fileNodePathHash(p), p)...)...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Store) jfsReaddirTx(db execer, ino uint64, limit int) ([]map[string]any, error) {
 	q := `SELECT e.name, e.inode, n.type, n.mode, n.uid, n.gid,
 			n.atime, n.mtime, n.ctime, n.atimensec, n.mtimensec, n.ctimensec,

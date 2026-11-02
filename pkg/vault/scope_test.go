@@ -8,10 +8,10 @@ func TestCheckScope(t *testing.T) {
 	scope := []string{"aws-prod", "db-prod/password", "github-token"}
 
 	tests := []struct {
-		name      string
-		secret    string
-		field     string
-		want      bool
+		name   string
+		secret string
+		field  string
+		want   bool
 	}{
 		{"full secret access", "aws-prod", "", true},
 		{"full secret with field", "aws-prod", "access-key", true},

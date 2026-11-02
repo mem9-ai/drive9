@@ -6,9 +6,23 @@ import (
 	"fmt"
 
 	drive9fuse "github.com/mem9-ai/drive9/pkg/fuse"
+	"github.com/mem9-ai/drive9/pkg/vaultfs"
 )
 
 func mountFuseImpl(opts *mountFuseOptions) error {
+	if opts.OmitProcessStateCredentials {
+		if err := hardenMountCredentialProcess(); err != nil {
+			return fmt.Errorf("protect non-persistent mount credential: %w", err)
+		}
+	}
+	var defaultOwner *drive9fuse.Owner
+	if opts.DefaultOwner != "" {
+		owner, err := drive9fuse.ParseOwner(opts.DefaultOwner)
+		if err != nil {
+			return err
+		}
+		defaultOwner = owner
+	}
 	mode, err := toDrive9FuseSyncMode(opts.SyncMode)
 	if err != nil {
 		return err
@@ -80,6 +94,7 @@ func mountFuseImpl(opts *mountFuseOptions) error {
 		Debug:                         opts.Debug,
 		PerfCounters:                  opts.PerfCounters,
 		EnableGitWorkspaces:           opts.LocalRoot != "",
+		Extensions:                    opts.Extensions,
 		Profiling: drive9fuse.ProfilingOptions{
 			CPUProfileDuration:  opts.ProfileCPUDuration,
 			CPUProfileInterval:  opts.ProfileCPUInterval,
@@ -95,12 +110,14 @@ func mountFuseImpl(opts *mountFuseOptions) error {
 		},
 		Supervised: opts.Supervised,
 		// Supervised workers do not own the global pidfile; the supervisor does.
-		SkipProcessState: opts.Supervised,
+		SkipProcessState:            opts.Supervised,
+		OmitProcessStateCredentials: opts.OmitProcessStateCredentials,
+		DefaultOwner:                defaultOwner,
 	})
 }
 
 func mountVaultImpl(opts *vaultMountOptions) error {
-	return drive9fuse.MountVault(&drive9fuse.VaultMountOptions{
+	return vaultfs.MountVault(&vaultfs.VaultMountOptions{
 		Server:     opts.Server,
 		APIKey:     opts.APIKey,
 		Token:      opts.Token,

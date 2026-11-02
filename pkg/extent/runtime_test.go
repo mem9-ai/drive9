@@ -29,6 +29,67 @@ func TestJuiceMetaConfOpenCacheForHTTP(t *testing.T) {
 	}
 }
 
+func TestRuntimeHeartbeatRejectsUnsafeIntervalsAndReleasesStorage(t *testing.T) {
+	for _, heartbeat := range []time.Duration{-time.Second, time.Millisecond, 10*time.Minute + time.Second} {
+		t.Run(heartbeat.String(), func(t *testing.T) {
+			inner, err := object.CreateStorage("file", t.TempDir(), "", "", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			store := &runtimeShutdownRecorder{ObjectStorage: inner}
+			_, err = NewRuntime(RuntimeConfig{Transport: deadTransport{}, Storage: store, Heartbeat: heartbeat})
+			if err == nil || !strings.Contains(err.Error(), "heartbeat") || store.shutdowns.Load() != 1 {
+				t.Fatalf("invalid heartbeat: err=%v shutdowns=%d", err, store.shutdowns.Load())
+			}
+		})
+	}
+}
+
+func TestRuntimeHeartbeatSetsRegisteredSessionExpiry(t *testing.T) {
+	for _, heartbeat := range []time.Duration{0, time.Second, 2 * time.Second} {
+		t.Run(heartbeat.String(), func(t *testing.T) {
+			format, _ := json.Marshal(&jfsmeta.Format{Name: "drive9", UUID: "drive9-extent", Storage: "file", BlockSize: 4 << 20})
+			loadBody, _ := json.Marshal(map[string][]byte{"format": format})
+			var expiry int64
+			tr := NewTransport(func(ctx context.Context, op string, raw json.RawMessage) (json.RawMessage, int, error) {
+				switch op {
+				case jfsmeta.Drive9OpLoad:
+					return loadBody, 0, nil
+				case jfsmeta.Drive9OpIncrCounter:
+					return []byte(`{"value":1}`), 0, nil
+				case jfsmeta.Drive9OpNewSession:
+					var input struct {
+						Expire int64 `json:"expire"`
+					}
+					if err := json.Unmarshal(raw, &input); err != nil {
+						return nil, 0, err
+					}
+					expiry = input.Expire
+					return nil, 0, errors.New("stop after capturing session registration")
+				default:
+					return []byte(`{}`), 0, nil
+				}
+			})
+			store, err := object.CreateStorage("file", t.TempDir(), "", "", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			start := time.Now().Unix()
+			_, err = NewRuntime(RuntimeConfig{Transport: tr, Storage: store, Heartbeat: heartbeat})
+			if err == nil || expiry == 0 {
+				t.Fatalf("registration not captured: %v", err)
+			}
+			if heartbeat == 0 {
+				heartbeat = 12 * time.Second
+			}
+			ttl := int64(5 * heartbeat / time.Second)
+			if expiry < start+ttl || expiry > time.Now().Unix()+ttl {
+				t.Fatalf("expiry=%d start=%d ttl=%d", expiry, start, ttl)
+			}
+		})
+	}
+}
+
 func TestApplyChunkCacheDirJfsSubdir(t *testing.T) {
 	conf := chunk.Config{BufferSize: 32 << 20}
 	applyChunkCacheDir(&conf, "/mnt/cache")

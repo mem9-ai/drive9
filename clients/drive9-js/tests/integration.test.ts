@@ -420,6 +420,24 @@ describeIntegration("TypeScript SDK integration", () => {
     expect(ch.checkpoint_id).toBeTruthy();
     await c.getFSLayerCheckpoint(ch.checkpoint_id);
 
+    // fork from the exact checkpoint, then delete the child generation
+    const child = await c.forkFSLayer(layer.layer_id, {
+      layer_id: `it-ts-child-${Date.now()}-${Math.floor(Math.random() * 1e6)}`,
+      name: "it-ts-layer-child",
+      checkpoint_id: ch.checkpoint_id,
+    });
+    let childDeleted = false;
+    try {
+      expect(child.parent_layer_id).toBe(layer.layer_id);
+      expect(child.origin_checkpoint_id).toBe(ch.checkpoint_id);
+      await c.deleteFSLayer(child.layer_id, { cascade: true });
+      childDeleted = true;
+    } finally {
+      if (!childDeleted) {
+        await c.deleteFSLayer(child.layer_id, { cascade: true }).catch(() => {});
+      }
+    }
+
     // rollback + commit (best-effort)
     try {
       await c.rollbackFSLayer(layer.layer_id);

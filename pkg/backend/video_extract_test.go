@@ -294,9 +294,9 @@ func TestVideoLLMQuotaDefault(t *testing.T) {
 		TenantID:              "test-tenant",
 		DatabaseAutoEmbedding: true,
 		AsyncVideoExtract: AsyncVideoExtractOptions{
-			Enabled:         true,
-			AllTenants:      true,
-			Extractor:       &staticVideoExtractor{text: "test"},
+			Enabled:    true,
+			AllTenants: true,
+			Extractor:  &staticVideoExtractor{text: "test"},
 			// MaxVideoLLMFiles not set → should use default 50
 		},
 	})
@@ -360,11 +360,11 @@ func TestVideoLLMQuotaEnforcementUsesCentralConfig(t *testing.T) {
 
 func TestParseVideoExtractTenantAllowlist(t *testing.T) {
 	tests := []struct {
-		name       string
-		raw        string
-		wantAll    bool
-		wantList   map[string]struct{}
-		wantErr    bool
+		name     string
+		raw      string
+		wantAll  bool
+		wantList map[string]struct{}
+		wantErr  bool
 	}{
 		{"empty", "", false, nil, false},
 		{"whitespace only", "  ", false, nil, false},

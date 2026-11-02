@@ -130,14 +130,14 @@ def _unquote_shell(raw: str) -> str:
 
 
 def apply_s3_backend(env: dict[str, str], *, mock_dir: Path) -> dict[str, str]:
-    """Resolve local S3 via scripts/local-minio.sh (MinIO by default, mock fallback)."""
+    """Resolve local S3 via scripts/local-object-store.sh (object store by default, mock fallback)."""
     out = dict(env)
     if out.get("DRIVE9_S3_BUCKET", "").strip():
         progress(f"setup: using existing DRIVE9_S3_BUCKET={out['DRIVE9_S3_BUCKET']}")
         return out
     if not out.get("DRIVE9_S3_DIR", "").strip():
         out["DRIVE9_S3_DIR"] = str(mock_dir)
-    script = REPO_ROOT / "scripts" / "local-minio.sh"
+    script = REPO_ROOT / "scripts" / "local-object-store.sh"
     result = subprocess.run(
         ["bash", str(script), "apply"],
         cwd=str(REPO_ROOT),
@@ -151,7 +151,7 @@ def apply_s3_backend(env: dict[str, str], *, mock_dir: Path) -> dict[str, str]:
         for line in note.splitlines():
             progress(f"setup: {line}")
     if result.returncode != 0:
-        detail = f"scripts/local-minio.sh apply failed (exit {result.returncode})"
+        detail = f"scripts/local-object-store.sh apply failed (exit {result.returncode})"
         if note:
             detail += f"\n{note}"
         raise BlackboxError(detail)

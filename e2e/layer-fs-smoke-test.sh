@@ -18,12 +18,13 @@ CLI_HOME="${DRIVE9_E2E_CLI_HOME:-$(mktemp -d)}"
 RUN_LAYER_FUSE_SMOKE="${RUN_LAYER_FUSE_SMOKE:-0}"
 LAYER_FUSE_STRICT_PREREQS="${LAYER_FUSE_STRICT_PREREQS:-$RUN_LAYER_FUSE_SMOKE}"
 FUSE_MOUNT_ROOT="${FUSE_MOUNT_ROOT:-/tmp}"
-FUSE_UMOUNT_TIMEOUT="${FUSE_UMOUNT_TIMEOUT:-60s}"
+FUSE_UMOUNT_TIMEOUT="${FUSE_UMOUNT_TIMEOUT:-15s}"
+LAYER_CLEAN_UMOUNT_MAX_S="${LAYER_CLEAN_UMOUNT_MAX_S:-10}"
 MOUNT_READY_TIMEOUT_S="${MOUNT_READY_TIMEOUT_S:-20}"
 MOUNT_READY_INTERVAL_S="${MOUNT_READY_INTERVAL_S:-1}"
 LAYER_DIFF_TIMEOUT_S="${LAYER_DIFF_TIMEOUT_S:-20}"
 LAYER_DIFF_INTERVAL_S="${LAYER_DIFF_INTERVAL_S:-1}"
-LAYER_FUSE_LOG_AUDIT_PATTERN="${LAYER_FUSE_LOG_AUDIT_PATTERN:-panic|fatal error|Resource temporarily unavailable|restore fs layer entries failed}"
+LAYER_FUSE_LOG_AUDIT_PATTERN="${LAYER_FUSE_LOG_AUDIT_PATTERN:-panic|fatal error|Resource temporarily unavailable|restore fs layer entries failed|force-quit|event=exit code=[1-9]|shutdown incomplete}"
 LAYER_CLI_LARGE_FILE_MB="${LAYER_CLI_LARGE_FILE_MB:-100}"
 
 PASS=0
@@ -379,6 +380,7 @@ start_layer_mount() {
   local mount_point="$4"
   local local_root="$5"
   local mount_log="$6"
+  local durability="${7:-write-sync}"
   MOUNT_POINT="$mount_point"
   MOUNT_LOG="$mount_log"
   mkdir -p "$MOUNT_POINT" "$local_root"
@@ -391,15 +393,23 @@ start_layer_mount() {
     echo "local_root=$local_root"
   } >>"$MOUNT_LOG"
 
-  local args=(mount --foreground --mode=fuse --profile="${FUSE_PROFILE:-coding-agent}" --local-root "$local_root" --durability=write-sync --flush-debounce=0 --layer "$layer_ref")
+  local profile="${FUSE_PROFILE:-coding-agent}"
+  local args=(mount --foreground --mode=fuse --profile="$profile" --durability="$durability" --flush-debounce=0 --layer "$layer_ref")
+  case "$profile" in
+    none|extent|interactive) ;;
+    *) args+=(--local-root "$local_root") ;;
+  esac
   if [ -n "$checkpoint_ref" ]; then
     args+=(--checkpoint "$checkpoint_ref")
   fi
   args+=(":$remote_root" "$MOUNT_POINT")
   drive9 "${args[@]}" >>"$MOUNT_LOG" 2>&1 &
   MOUNT_PID="$!"
-  wait_mount_state mounted
-  wait_mount_log_ready "$MOUNT_LOG"
+  if ! wait_mount_state mounted || ! wait_mount_log_ready "$MOUNT_LOG"; then
+    echo "FAIL layer mount did not become ready: $MOUNT_POINT" >&2
+    tail -n 80 "$MOUNT_LOG" >&2
+    return 1
+  fi
 }
 
 expect_layer_mount_fail() {
@@ -461,19 +471,34 @@ expect_layer_mount_fail() {
 }
 
 unmount_layer_mount() {
-  if [ -z "${MOUNT_POINT:-}" ]; then
-    return 0
-  fi
-  if is_mounted_path "$MOUNT_POINT"; then
-    drive9 umount --timeout "$FUSE_UMOUNT_TIMEOUT" "$MOUNT_POINT"
-  fi
-  wait_mount_state unmounted
-  if [ -n "${MOUNT_PID:-}" ]; then
-    set +e
-    wait "$MOUNT_PID" >/dev/null 2>&1
-    MOUNT_PID=""
-    set -e
-  fi
+	local cli_status=0 worker_status=0 started=$SECONDS deadline
+	if [[ -z "${MOUNT_POINT:-}" ]]; then
+		return 0
+	fi
+	if is_mounted_path "$MOUNT_POINT"; then
+		drive9 umount --timeout "$FUSE_UMOUNT_TIMEOUT" "$MOUNT_POINT" || cli_status=$?
+	fi
+	wait_mount_state unmounted || return 1
+	if [[ -n "${MOUNT_PID:-}" ]]; then
+		deadline=$((SECONDS + LAYER_CLEAN_UMOUNT_MAX_S))
+		while kill -0 "$MOUNT_PID" 2>/dev/null; do
+			if ((SECONDS >= deadline)); then
+				echo "layer worker did not exit after unmount" >&2
+				return 1
+			fi
+			sleep 0.1
+		done
+		wait "$MOUNT_PID" || worker_status=$?
+		MOUNT_PID=""
+	fi
+	if ((cli_status != 0 || worker_status != 0)); then
+		echo "layer unmount failed: cli=$cli_status worker=$worker_status" >&2
+		return 1
+	fi
+	if ((SECONDS - started >= LAYER_CLEAN_UMOUNT_MAX_S)); then
+		echo "clean layer unmount exceeded ${LAYER_CLEAN_UMOUNT_MAX_S}s" >&2
+		return 1
+	fi
 }
 
 audit_mount_log() {
@@ -560,6 +585,30 @@ wait_layer_diff_entries() {
     fi
     sleep "$LAYER_DIFF_INTERVAL_S"
   done
+}
+
+wait_mounted_layer_file() {
+	python3 - "$1" "$2" "$LAYER_DIFF_TIMEOUT_S" <<'PY_LAYER_REFRESH'
+import subprocess
+import sys
+import time
+
+path, expected, timeout = sys.argv[1:]
+deadline = time.monotonic() + float(timeout)
+while time.monotonic() < deadline:
+    command = ["test", "-e", path] if expected == "absent" else ["cat", path]
+    try:
+        result = subprocess.run(command, capture_output=True, timeout=2)
+        if expected == "absent":
+            if result.returncode == 1:
+                sys.exit(0)
+        elif result.returncode == 0 and result.stdout.decode().rstrip("\n") == expected:
+            sys.exit(0)
+    except subprocess.TimeoutExpired:
+        pass
+    time.sleep(0.1)
+raise SystemExit(f"mounted Layer did not refresh {path}: expected {expected!r}")
+PY_LAYER_REFRESH
 }
 
 wait_layer_diff_file_mode() {
@@ -1216,7 +1265,9 @@ if require_layer_fuse_prereqs; then
   start_layer_mount "tag:fuse_run=$ts" "" "$fuse_root" "$mount_a" "$local_a" "$log_a"
   check_eq "layer mount reads base before edit" "$(cat "$mount_a/base.txt")" "$(cat "$fuse_base_local")"
   printf 'fuse base edited in layer %s\n' "$ts" >"$mount_a/base.txt"
-  printf 'fuse new file %s\n' "$ts" >"$mount_a/new.txt"
+  # Redirection closes a duplicate fd before printf writes. Both publications
+  # must retain the restrictive create mode, including across checkpoint restore.
+  (umask 077; printf 'fuse new file %s\n' "$ts" >"$mount_a/new.txt")
   chmod 0600 "$mount_a/new.txt"
   mkdir "$mount_a/dir"
   printf 'fuse nested file %s\n' "$ts" >"$mount_a/dir/nested.txt"
@@ -1246,6 +1297,79 @@ if require_layer_fuse_prereqs; then
     "${fuse_root}/moved.txt" "upsert" \
     "${fuse_root}/link" "symlink" \
     "${fuse_root}/after.txt" "upsert")" "9"
+  check_cmd "fsync layer write before unmount" python3 - "$mount_a/new.txt" <<'PY_FSYNC'
+import os
+import sys
+with open(sys.argv[1], "r+b") as f:
+    os.fsync(f.fileno())
+PY_FSYNC
+  printf 'external original %s\n' "$ts" >"$mount_a/external.txt"
+  check_eq "layer mount caches original content" "$(cat "$mount_a/external.txt")" "external original ${ts}"
+  put_layer_entry "$fuse_layer_name" "${fuse_root}/external.txt" "upsert" "file" "external changed ${ts}"
+  check_cmd "layer event refresh replaces clean cached content" wait_mounted_layer_file "$mount_a/external.txt" "external changed ${ts}"
+  put_layer_entry "$fuse_layer_name" "${fuse_root}/external.txt" "whiteout" "file" ""
+  check_cmd "layer event refresh removes clean cached file" wait_mounted_layer_file "$mount_a/external.txt" "absent"
+  DRIVE9_LAYER_TEST_KEY="$API_KEY" check_cmd \
+    "open writable handle follows external update and deletion" \
+    python3 - "$BASE" "$fuse_layer_id" "$fuse_root" "$mount_a" <<'PY_OPEN_REFRESH'
+import base64
+import errno
+import json
+import os
+import signal
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+signal.alarm(60)
+base, layer, remote_root, mount = sys.argv[1:]
+path = remote_root + "/open-refresh.txt"
+url = base + "/v1/layers/" + urllib.parse.quote(layer) + "/entries"
+headers = {"Authorization": "Bearer " + os.environ["DRIVE9_LAYER_TEST_KEY"],
+           "Content-Type": "application/json"}
+
+def mutate(op, data=b""):
+    body = {"path": path, "op": op, "kind": "file", "size_bytes": len(data)}
+    if data:
+        body["content"] = base64.b64encode(data).decode()
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers)
+    with urllib.request.urlopen(req, timeout=10) as response:
+        assert response.status in (200, 201)
+
+fd = os.open(mount + "/open-refresh.txt", os.O_CREAT | os.O_RDWR, 0o600)
+try:
+    assert os.write(fd, b"old") == 3
+    os.fsync(fd)
+    expected = b"external longer content"
+    mutate("upsert", expected)
+    deadline = time.monotonic() + 15
+    while os.pread(fd, 64, 0) != expected:
+        assert time.monotonic() < deadline, "O_RDWR handle kept old content"
+        time.sleep(0.1)
+    assert os.pwrite(fd, b"X", 0) == 1
+    os.fsync(fd)
+    req = urllib.request.Request(url + "?" + urllib.parse.urlencode({"path": path}), headers=headers)
+    with urllib.request.urlopen(req, timeout=10) as response:
+        entry = json.load(response)
+    assert base64.b64decode(entry["content"]) == b"X" + expected[1:]
+    mutate("whiteout")
+    deadline = time.monotonic() + 15
+    while True:
+        try:
+            os.pread(fd, 64, 0)
+        except FileNotFoundError:
+            break
+        assert time.monotonic() < deadline, "O_RDWR handle kept deleted content"
+        time.sleep(0.1)
+finally:
+    try:
+        os.close(fd)
+    except OSError as error:
+        if error.errno != errno.ENOENT:
+            raise
+PY_OPEN_REFRESH
+  check_cmd "drain layer before unmount" drive9 mount drain --timeout 10s "$mount_a"
   check_cmd "unmount first layer mount" unmount_layer_mount
   check_cmd "first layer mount log clean" audit_mount_log "$log_a"
 
@@ -1274,22 +1398,90 @@ if require_layer_fuse_prereqs; then
   local_c="/tmp/drive9-layer-local-c-${ts}"
   log_c="/tmp/drive9-layer-c-${ts}.log"
   start_layer_mount "tag:fuse_run=$ts" "" "$fuse_root" "$mount_c" "$local_c" "$log_c"
+  # Restoring a nonempty layer creates clean overlay metadata before any read.
+  check_cmd "unmount nonempty restored layer without file IO" unmount_layer_mount
+  check_cmd "no-IO restore mount log clean" audit_mount_log "$log_c"
+  start_layer_mount "tag:fuse_run=$ts" "" "$fuse_root" "$mount_c" "$local_c" "$log_c"
   check_eq "fresh restore includes post-checkpoint write" "$(cat "$mount_c/after.txt")" "fuse after checkpoint ${ts}"
+  check_cmd_fail "external deletion survives remount" test -e "$mount_c/external.txt"
+  check_cmd "delete and rename durable new layer files" python3 - "$mount_c" <<'PY_NAMESPACE'
+import os
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+for name in ("durable-delete.txt", "durable-rename.txt"):
+    with (root / name).open("wb") as f:
+        f.write(b"durable layer content\n")
+        f.flush()
+        os.fsync(f.fileno())
+(root / "durable-delete.txt").unlink()
+(root / "durable-rename.txt").rename(root / "durable-renamed.txt")
+PY_NAMESPACE
   check_cmd "unmount full restore mount" unmount_layer_mount
   check_cmd "full restore mount log clean" audit_mount_log "$log_c"
+  start_layer_mount "tag:fuse_run=$ts" "" "$fuse_root" "$mount_c" "$local_c" "$log_c"
+  check_cmd_fail "deleted durable layer file stays absent after remount" test -e "$mount_c/durable-delete.txt"
+  check_cmd_fail "renamed durable layer source stays absent after remount" test -e "$mount_c/durable-rename.txt"
+  check_eq "durable layer rename target survives remount" "$(cat "$mount_c/durable-renamed.txt")" "durable layer content"
+  check_cmd "unmount namespace restore mount" unmount_layer_mount
+  check_cmd "namespace restore mount log clean" audit_mount_log "$log_c"
 
-  fuse_commit_out=$(drive9_retry fs layer commit "tag:fuse_run=$ts")
-  case "$fuse_commit_out" in
-    committed\ layer="$fuse_layer_id"\ applied=*)
-      fuse_commit_applied="${fuse_commit_out##*applied=}"
-      if [ "$fuse_commit_applied" -ge 9 ] 2>/dev/null; then
-        fuse_commit_status="ok"
-      else
-        fuse_commit_status="$fuse_commit_out"
-      fi
-      ;;
-    *) fuse_commit_status="$fuse_commit_out" ;;
-  esac
+  # A dup close issues Flush without Release. Strict fsync must replace the
+  # earlier staged length before acknowledging the appended shadow as clean.
+  FUSE_PROFILE=none start_layer_mount "tag:fuse_run=$ts" "" "$fuse_root" \
+    "$mount_c" "$local_c" "$log_c" fsync
+  check_cmd "duplicate close then append and strict fsync" \
+    python3 - "$mount_c/staged-append.bin" <<'PY_STAGED_FSYNC'
+import os
+import signal
+import sys
+
+signal.alarm(90)
+fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR, 0o600)
+other = os.dup(fd)
+try:
+    for _ in range(20):
+        assert os.write(fd, b"p" * (1024 * 1024)) == 1024 * 1024
+    os.close(other)
+    other = -1
+    assert os.write(fd, b"t" * (1024 * 1024)) == 1024 * 1024
+    os.fsync(fd)
+    assert os.fstat(fd).st_size == 21 * 1024 * 1024
+    assert os.stat(sys.argv[1]).st_size == 21 * 1024 * 1024
+finally:
+    if other != -1:
+        os.close(other)
+    os.close(fd)
+PY_STAGED_FSYNC
+  check_cmd "unmount staged append" unmount_layer_mount
+  FUSE_PROFILE=none start_layer_mount "tag:fuse_run=$ts" "" "$fuse_root" \
+    "$mount_c" "$local_c" "$log_c" fsync
+  check_cmd "staged append size and content survive same-cache remount" \
+    python3 - "$mount_c/staged-append.bin" <<'PY_STAGED_READ'
+import os
+import signal
+import sys
+
+signal.alarm(60)
+expected = b"p" * (20 * 1024 * 1024) + b"t" * (1024 * 1024)
+assert os.stat(sys.argv[1]).st_size == len(expected)
+with open(sys.argv[1], "rb") as f:
+    assert f.read() == expected
+PY_STAGED_READ
+  check_cmd "unmount staged append restore" unmount_layer_mount
+  check_cmd "staged append mount log clean" audit_mount_log "$log_c"
+
+  # Keep the response body on failure: the CLI's generic conflict error hides
+  # the path and reason needed to diagnose a failed commit in CI.
+  resp=$(curl_body_code POST "$BASE/v1/layers/$(url_escape "$fuse_layer_id")/commit" "$API_KEY" "{}")
+  body=$(json_body "$resp")
+  fuse_commit_status="HTTP $(http_code "$resp"): $body"
+  if [ "$(http_code "$resp")" = 200 ] && \
+      printf '%s' "$body" | jq -e --arg id "$fuse_layer_id" \
+        '.status == "committed" and .layer_id == $id and .applied >= 9' >/dev/null; then
+    fuse_commit_status="ok"
+  fi
   check_eq "commit FUSE layer after restore succeeds" "$fuse_commit_status" "ok"
   check_eq "committed FUSE base visible" "$(drive9_retry fs cat "${fuse_root}/base.txt")" "fuse base edited in layer ${ts}"
   check_eq "committed FUSE after file visible" "$(drive9_retry fs cat "${fuse_root}/after.txt")" "fuse after checkpoint ${ts}"
@@ -1326,6 +1518,9 @@ if require_layer_fuse_prereqs; then
   # Write a file through the layer mount — it should be visible via the overlay.
   printf 'rollback fuse new file %s\n' "$ts" >"$mount_rb/new.txt"
   check_eq "rollback fuse new file visible in layer mount" "$(cat "$mount_rb/new.txt")" "rollback fuse new file ${ts}"
+  printf 'rollback fuse changed base %s\n' "$ts" >"$mount_rb/base.txt"
+  check_eq "rollback fuse changed base visible in layer mount" "$(cat "$mount_rb/base.txt")" "rollback fuse changed base ${ts}"
+  check_cmd "drain layer writes before rollback" drive9 mount drain --timeout 10s "$mount_rb"
 
   # Roll back the layer from a separate CLI call (not through the mount).
   check_eq "rollback fuse command returns ok" "$(drive9_retry fs layer rollback "tag:rollback_fuse_run=$ts")" "ok"
@@ -1352,6 +1547,11 @@ if require_layer_fuse_prereqs; then
 
   # Base file should still be visible after rollback.
   check_eq "rollback fuse base still visible after hot refresh" "$(cat "$mount_rb/base.txt")" "$(cat "$rollback_fuse_base_local")"
+  check_cmd "rollback fuse directory excludes abandoned file" python3 - "$mount_rb" <<'PY_ROLLBACK'
+import os
+import sys
+assert "new.txt" not in os.listdir(sys.argv[1])
+PY_ROLLBACK
 
   # A new write through the now-abandoned mount should fail with ESTALE.
   rollback_write_err=""

@@ -37,16 +37,16 @@ type SecretField struct {
 
 // CapToken is the server-side state for a capability token.
 type CapToken struct {
-	TokenID     string     `json:"token_id"`
-	TenantID    string     `json:"tenant_id"`
-	AgentID     string     `json:"agent_id"`
-	TaskID      string     `json:"task_id,omitempty"`
-	Scope       []string   `json:"scope"`
-	IssuedAt    time.Time  `json:"issued_at"`
-	ExpiresAt   time.Time  `json:"expires_at"`
-	RevokedAt   *time.Time `json:"revoked_at,omitempty"`
-	RevokedBy   string     `json:"revoked_by,omitempty"`
-	RevokeReason string    `json:"revoke_reason,omitempty"`
+	TokenID      string     `json:"token_id"`
+	TenantID     string     `json:"tenant_id"`
+	AgentID      string     `json:"agent_id"`
+	TaskID       string     `json:"task_id,omitempty"`
+	Scope        []string   `json:"scope"`
+	IssuedAt     time.Time  `json:"issued_at"`
+	ExpiresAt    time.Time  `json:"expires_at"`
+	RevokedAt    *time.Time `json:"revoked_at,omitempty"`
+	RevokedBy    string     `json:"revoked_by,omitempty"`
+	RevokeReason string     `json:"revoke_reason,omitempty"`
 }
 
 // CapTokenClaims is the payload signed into the bearer token.
@@ -63,17 +63,17 @@ type CapTokenClaims struct {
 
 // AuditEvent is an append-only audit log entry.
 type AuditEvent struct {
-	EventID    string     `json:"event_id"`
-	TenantID   string     `json:"tenant_id"`
-	EventType  string     `json:"event_type"`
-	TokenID    string     `json:"token_id,omitempty"`
-	AgentID    string     `json:"agent_id,omitempty"`
-	TaskID     string     `json:"task_id,omitempty"`
-	SecretName string     `json:"secret_name,omitempty"`
-	FieldName  string     `json:"field_name,omitempty"`
-	Adapter    string     `json:"adapter,omitempty"`
-	Detail     any        `json:"detail,omitempty"`
-	Timestamp  time.Time  `json:"timestamp"`
+	EventID    string    `json:"event_id"`
+	TenantID   string    `json:"tenant_id"`
+	EventType  string    `json:"event_type"`
+	TokenID    string    `json:"token_id,omitempty"`
+	AgentID    string    `json:"agent_id,omitempty"`
+	TaskID     string    `json:"task_id,omitempty"`
+	SecretName string    `json:"secret_name,omitempty"`
+	FieldName  string    `json:"field_name,omitempty"`
+	Adapter    string    `json:"adapter,omitempty"`
+	Detail     any       `json:"detail,omitempty"`
+	Timestamp  time.Time `json:"timestamp"`
 }
 
 // TenantDEK holds the wrapped (encrypted) data encryption key for a tenant.

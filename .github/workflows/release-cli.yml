@@ -13,6 +13,9 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
 
     steps:
       - name: Checkout
@@ -66,3 +69,39 @@ jobs:
           git commit -m "release: drive9 CLIs ${{ env.VERSION }}"
           git pull --rebase
           git push
+
+      - name: Generate SHA256SUMS
+        run: |
+          cd dist
+          sha256sum drive9-* kubectl-drive9-migration-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-west-2
+
+      - name: Upload CLI binaries to S3 (latest)
+        run: |
+          aws s3 sync dist/ s3://drive9-releases/latest/ \
+            --exclude "*" \
+            --include "drive9-*" \
+            --include "kubectl-drive9-migration-*" \
+            --include "SHA256SUMS" \
+            --include "version" \
+            --cache-control "public, max-age=300" \
+            --content-type "application/octet-stream" \
+            --no-progress
+          echo "Uploaded ${{ env.VERSION }} to s3://drive9-releases/latest/"
+          aws s3 ls s3://drive9-releases/latest/
+
+      - name: Invalidate CloudFront cache
+        run: |
+          INVALIDATION_ID=$(aws cloudfront create-invalidation \
+            --distribution-id "${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}" \
+            --paths "/latest/*" \
+            --query 'Invalidation.Id' --output text)
+          echo "Created invalidation ${INVALIDATION_ID} for /latest/*"
+          # Don't block the workflow on propagation (30-60s typical, but can spike).
+          # The invalidation is queued globally and will finish in the background.

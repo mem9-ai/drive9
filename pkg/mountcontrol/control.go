@@ -26,7 +26,10 @@ type StatusResponse struct {
 	Op         string    `json:"op,omitempty"`
 	PID        int       `json:"pid,omitempty"`
 	StartedAt  time.Time `json:"started_at,omitempty"`
-	Error      string    `json:"error,omitempty"`
+	// Layer is the resolved fs layer ID the mount serves ("" for the base
+	// workspace). Nil means the mount predates layer reporting.
+	Layer *string `json:"layer,omitempty"`
+	Error string  `json:"error,omitempty"`
 }
 
 func (r DrainRequest) Timeout() time.Duration {

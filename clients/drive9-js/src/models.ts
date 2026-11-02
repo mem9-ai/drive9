@@ -286,9 +286,26 @@ export interface FSLayer {
   durability_mode: string;
   actor_id: string;
   durable_seq: number;
+  parent_layer_id?: string;
+  origin_seq?: number;
+  origin_checkpoint_id?: string;
+  root_layer_id?: string;
+  depth?: number;
+  origin?: string;
   created_at: string;
   updated_at: string;
   sealed_at?: string;
+}
+
+export interface FSLayerForkRequest {
+  layer_id?: string;
+  name?: string;
+  actor_id?: string;
+  checkpoint_id?: string;
+}
+
+export interface FSLayerDeleteOptions {
+  cascade?: boolean;
 }
 
 export type FSLayerEntryOp = "upsert" | "whiteout" | "mkdir" | "symlink" | "chmod" | "rename";
