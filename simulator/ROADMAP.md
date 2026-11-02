@@ -148,19 +148,35 @@ Delete `blackbox/` and `e2e/` only after G4 (CI cut-over) lands.
   theory (D-state daemon) was disproven by local docker repro — mock+mount
   startup, file IO, SQLite WAL+mmap+concurrency and the full engine all
   passed locally; the mock's new request access log made that conclusive.
-- [ ] Remaining pr-gate-mount failures are SUBSTANTIVE (run 41533971193,
-  all diagnostics in artifacts):
-  - fstest-sqlite: mptest scripts report "broken (0 errors out of 0 tests)"
-    — clients fail to start on the mount (investigate: noexec? mptest
-    coordinator cwd?);
-  - fstest-fsx + drain: `drain did not reach ok` (sync-0.json) on several
-    cases — inspect what `drive9 mount drain --json` reports against the
-    mock (likely a drain dependency the mock 501s or misreports);
-  - juicefs/cache-consistency: observer vantage misses visible/visible.txt —
-    cross-mount visibility against the mock (second mount's list/read path);
-  - webdev/save-then-read + exclusive-create: check checks.json for the
-    failing entries (control-run/manifest related per local repro).
-- [ ] TAP → e2e-aggregate adapter (Feishu/signature plumbing) at cutover.
+- [ ] Remaining pr-gate-mount failures are SUBSTANTIVE. Progress this round:
+  - mock inline-threshold mirrored to the production 50000 (the 1GiB Tier-0
+    value diverted .db commits from the multipart path into a direct-PUT
+    overwrite bookkeeping corner of the commit queue →
+    "missing base revision for overwrite" terminal failures);
+  - engine CLI invocations now carry explicit credentials + isolated HOME
+    (cli_env): the drain/vantage CLIs resolve active-context > env, so
+    ambient config absence made drain fail credential resolution instantly;
+  - drain failures now capture rc + stderr tail into the step log; empty
+    mount walks retry bounded with a readdir probe diagnostic.
+  OPEN (precisely narrowed): after the above, drain in the ENGINE context
+  still fails with `lstat /tmp/drive9-mount-<hash>.pid: ENOENT` — the
+  foreground worker never writes its pid state file when spawned by the
+  engine, while the identical daemon invocation from a shell probe in the
+  SAME container writes it and drain succeeds. NOTE: hash mismatch is
+  RULED OUT — a 64s watcher on ALL of /tmp saw zero `.pid` files during
+  the engine run (the observed `.stop` token is umount-teardown noise), so
+  the WriteProcessState call itself does not happen (or its guard
+  `!cfg.SkipProcessState` is false) in the engine-spawned context. rmr+drain
+  DID pass in one earlier tier run — flaky or invocation-dependent. Next
+  session: strace both daemons (engine-spawned vs probe-spawned) around
+  startup and diff which flags/env make the CLI set SkipProcessState or
+  skip the write; also dump the daemon's parsed flags via `drive9 mount
+  --help` diff between the two spawn contexts.
+  - fstest-sqlite: mptest "broken (0 errors out of 0 tests)" — likely falls
+    out once drain/commit paths are healthy (terminal commit failures were
+    killing the db files); recheck after the drain fix.
+  - cache-consistency observer/manifest emptiness — recheck after the same
+    fix (samples ran while commit state was broken).
 
 ## G5 — Daily real-backend action + release gate
 

@@ -66,7 +66,7 @@ func New(cfg Config) (*Server, error) {
 		cfg.Logger = zap.NewNop()
 	}
 	if cfg.InlineThreshold <= 0 {
-		cfg.InlineThreshold = 1 << 30 // Tier 0: keep every PUT inline
+		cfg.InlineThreshold = 50_000 // mirror the production default: same direct-PUT vs multipart decision shape
 	}
 	if cfg.MaxUploadBytes <= 0 {
 		cfg.MaxUploadBytes = 1 << 32

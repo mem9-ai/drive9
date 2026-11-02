@@ -1624,7 +1624,25 @@ impl Runner {
                 self.unmount_vantage(&mut proc, &rws);
                 entries
             }
-            _ => walk(self.ws.clone())?,
+            _ => {
+                // an empty walk right after drain can be a transient view
+                // (cache invalidation window); retry bounded before
+                // accepting it, and leave a diagnostic when it persists
+                let mut entries = walk(self.ws.clone())?;
+                for attempt in 0..5 {
+                    if !entries.is_empty() {
+                        break;
+                    }
+                    let probe = std::fs::read_dir(&self.ws).map(|i| i.count()).unwrap_or(0);
+                    eprintln!(
+                        "sample {name}: walk of {} returned 0 entries (readdir probe={probe}, attempt {attempt})",
+                        self.ws.display()
+                    );
+                    std::thread::sleep(Duration::from_millis(500));
+                    entries = walk(self.ws.clone())?;
+                }
+                entries
+            }
         };
         let path = self
             .run_dir
@@ -1640,9 +1658,23 @@ impl Runner {
         Ok(())
     }
 
+    /// Uniform env for every drive9 CLI invocation the engine makes:
+    /// explicit credentials (the CLI resolves active-context > env, so
+    /// without these an ambient ~/.drive9/config hijacks drain/vantage
+    /// traffic — or, with no config at all, drain fails credential
+    /// resolution instantly) and an isolated HOME for the same reason.
+    fn cli_env(&self, cmd: &mut Command) {
+        cmd.env("DRIVE9_SERVER", &self.server_for_mount)
+            .env("DRIVE9_API_KEY", &self.api_key)
+            .env("HOME", self.run_dir.join("home"));
+        let _ = std::fs::create_dir_all(self.run_dir.join("home"));
+    }
+
     pub fn drain(&mut self, mode: &str, timeout: Duration) -> (bool, bool, String) {
         let to = format!("{}s", timeout.as_secs().max(1));
-        let out = Command::new(&self.bin)
+        let mut cli = Command::new(&self.bin);
+        self.cli_env(&mut cli);
+        let out = cli
             .args([
                 "mount",
                 "drain",
@@ -1652,7 +1684,7 @@ impl Runner {
                 &self.ws.to_string_lossy(),
             ])
             .output();
-        let (exit_ok, stdout) = match out {
+        let (exit_ok, stdout) = match &out {
             Ok(o) => (
                 o.status.success(),
                 String::from_utf8_lossy(&o.stdout).into_owned(),
@@ -1664,7 +1696,24 @@ impl Runner {
         let path = self.run_dir.join(format!("sync-{idx}.json"));
         let _ = std::fs::write(&path, &stdout);
         self.syncs.push((mode.to_string(), ok, pending_clear));
-        self.journal(json!({"ts": now_ms(), "kind":"drain", "mode": mode, "ok": ok, "pending_clear": pending_clear, "file": path.display().to_string()}));
+        self.journal(json!({
+            "ts": now_ms(), "kind":"drain", "mode": mode, "ok": ok,
+            "pending_clear": pending_clear, "file": path.display().to_string(),
+            "stdout_len": stdout.len(),
+        }));
+        if !ok {
+            let err_tail = match &out {
+                Ok(o) => {
+                    let e = String::from_utf8_lossy(&o.stderr);
+                    let rc = o.status.code();
+                    e.chars().rev().take(400).collect::<Vec<_>>().into_iter().rev().collect::<String>()
+                        .replace('\n', " | ")
+                        + &format!(" (rc={rc:?})")
+                }
+                Err(e) => format!("spawn: {e}"),
+            };
+            eprintln!("drain failed: stdout_len={} stderr_tail: {}", stdout.len(), err_tail);
+        }
         (ok, pending_clear, format!("sync-{idx}.json"))
     }
 

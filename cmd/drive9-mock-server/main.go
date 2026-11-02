@@ -20,7 +20,7 @@ func main() {
 	addr := flag.String("addr", "127.0.0.1:9009", "listen address (port 0 = kernel-assigned)")
 	portFile := flag.String("port-file", "", "write the chosen listen address here once bound (for stack supervision)")
 	dir := flag.String("dir", "", "state directory (meta.db, tenant-*.db, objects/); required")
-	inline := flag.Int64("inline-threshold", 1<<30, "advertised inline cutoff (Tier 0 accepts every PUT inline)")
+	inline := flag.Int64("inline-threshold", 50000, "advertised inline cutoff (Tier 0 accepts every PUT inline)")
 	maxUpload := flag.Int64("max-upload-bytes", 1<<32, "max upload total_size")
 	s3Endpoint := flag.String("s3-endpoint", "", "external S3 endpoint advertised by /v1/data-credential (e.g. embedded rustfs); empty = built-in file scheme")
 	s3Bucket := flag.String("s3-bucket", "drive9-mock", "S3 bucket advertised with --s3-endpoint")
