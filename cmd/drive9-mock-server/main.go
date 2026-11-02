@@ -7,6 +7,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 
@@ -16,7 +17,8 @@ import (
 )
 
 func main() {
-	addr := flag.String("addr", "127.0.0.1:9009", "listen address")
+	addr := flag.String("addr", "127.0.0.1:9009", "listen address (port 0 = kernel-assigned)")
+	portFile := flag.String("port-file", "", "write the chosen listen address here once bound (for stack supervision)")
 	dir := flag.String("dir", "", "state directory (meta.db, tenant-*.db, objects/); required")
 	inline := flag.Int64("inline-threshold", 1<<30, "advertised inline cutoff (Tier 0 accepts every PUT inline)")
 	maxUpload := flag.Int64("max-upload-bytes", 1<<32, "max upload total_size")
@@ -45,8 +47,17 @@ func main() {
 		log.Fatal("mock server init failed", zap.Error(err))
 	}
 	defer srv.Close()
-	log.Info("drive9-mock-server listening", zap.String("addr", *addr), zap.String("dir", *dir))
-	if err := http.ListenAndServe(*addr, srv.Handler()); err != nil {
+	ln, err := net.Listen("tcp", *addr)
+	if err != nil {
 		log.Fatal("listen failed", zap.Error(err))
+	}
+	if *portFile != "" {
+		if err := os.WriteFile(*portFile, []byte(ln.Addr().String()), 0o644); err != nil {
+			log.Fatal("write port file failed", zap.Error(err))
+		}
+	}
+	log.Info("drive9-mock-server listening", zap.String("addr", ln.Addr().String()), zap.String("dir", *dir))
+	if err := http.Serve(ln, srv.Handler()); err != nil {
+		log.Fatal("serve failed", zap.Error(err))
 	}
 }

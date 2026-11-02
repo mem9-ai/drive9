@@ -21,6 +21,14 @@ tier = "pr-gate"
 name = "webdev/exclusive-create"
 tier = "pr-gate"
 
+[[case]]
+name = "juicefs/rmr"
+tier = "pr-gate"
+
+[[case]]
+name = "juicefs/cache-consistency"
+tier = "pr-gate"
+
 # ---- nightly: bigger / root-requiring community suites ----
 [[case]]
 name = "community/fstest-pjdfstest"
@@ -48,4 +56,16 @@ tier = "nightly"
 
 [[case]]
 name = "webdev/cache-threshold"
+tier = "nightly"
+
+[[case]]
+name = "juicefs/random-rw"
+tier = "nightly"
+
+[[case]]
+name = "juicefs/random-stress"
+tier = "nightly"
+
+[[case]]
+name = "juicefs/fsrand"
 tier = "nightly"

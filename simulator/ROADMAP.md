@@ -19,7 +19,9 @@ cases/community/   [~] fstest-backed suites — 4 cases landed (sqlite, fsx,
                     pjdfstest, ltp) via the new `check fstest` kind; fio/
                     mdtest/smallfile benchmarks next (G6 perf gating)
 cases/custom/      [ ] customer benchmark scenarios (case1/case2 invariants)
-cases/juicefs/     [ ] JuiceFS-inspired deterministic workloads (fsrand, random_rw, …)
+cases/juicefs/     [x] all 5 ported (rmr, random-rw, random-stress, fsrand,
+                    cache-consistency via the observer vantage); python
+                    helpers beside the cases per case-spec §2
 cases/git/         [ ] upstream git t/ suites (superseded by community/git — prefer fstest git)
 ```
 
@@ -77,9 +79,18 @@ Delete `blackbox/` and `e2e/` only after G4 (CI cut-over) lands.
    - embedded S3-compatible endpoint on /s3/ (PUT/GET/DELETE object, bucket
      create, ListObjectsV2 XML, no SigV4 verification) used when no external
      endpoint is configured
-   Still open: rustfs process management in a stack layer; simulator
-   `--stack mock` flavor (today: run drive9-mock-server and point
-   `drive9-simulator run --server` at it); conformance diff vs real server.
+   Still open: JuiceFS full-semantics port (slice interpretation, flock,
+   compaction ops) before the real extent mount runs against the mock;
+   conformance diff vs real server.
+   LANDED since: [x] rustfs integration + `--stack mock` —
+   `simulator/src/stack.rs` spawns drive9-mock-server (port 0 + --port-file +
+   /healthz wait; binary via D9_MOCK_SERVER_BIN or PATH) and reuses
+   scripts/local-object-store.sh apply for rustfs (container/binary
+   fallback + DRIVE9_S3_* credential convention; degrades to the mock's
+   builtin /s3/ endpoint when rustfs cannot start). Verified end-to-end:
+   real rustfs 1.0.3 container up, mock's /v1/data-credential minted the
+   s3-scheme credential against it, `run --stack mock` provisioned and tore
+   down cleanly.
    Design notes: reuses pkg/pathutil (not a Rust reimpl — the contract's
    source of truth is Go); snapshot/restore = tenant db file copy; mock
    reimplements the HTTP surface against SQLite, it does NOT reuse server
@@ -115,10 +126,14 @@ Delete `blackbox/` and `e2e/` only after G4 (CI cut-over) lands.
 
 ## G4 — CI cut-over (simulator e2e replaces local-e2e.yml)
 
-- [ ] `run-suite` batch runner + tier manifest (pr-gate / nightly / manual).
-- [ ] New workflow: PR gate = embedded mock backend + core cases + pjdfstest
-  as hard gate; TAP → e2e-aggregate adapter (keep Feishu/signature plumbing).
-- [ ] Retire local-e2e.yml steps as suites migrate; keep Go unit tests as-is.
+- [x] `run-suite` batch runner + tier manifest (pr-gate / nightly seeded).
+- [x] `.github/workflows/simulator-e2e.yml`: PR gate = build CLI+mock+simulator
+  → tools ensure-fstest → `run-suite --tier pr-gate --stack mock --stop-on-fail`
+  → no-skip pjdfstest gate (sudo) → artifacts on failure. local-e2e.yml stays
+  until the simulator gate is proven green on Linux (first PR run), then
+  retires step by step.
+- [ ] First green Linux run of the workflow; fix platform fallout.
+- [ ] TAP → e2e-aggregate adapter (Feishu/signature plumbing) at cutover.
 
 ## G5 — Daily real-backend action + release gate
 

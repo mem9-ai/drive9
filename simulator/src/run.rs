@@ -64,6 +64,9 @@ fn class_tolerates_failure(class: &str) -> bool {
 #[derive(Clone)]
 pub struct RunArgs {
     pub case: PathBuf,
+    /// backend flavor: None = use --server as-is; "mock" = spawn the
+    /// embedded mock server (+ rustfs when bootstrappable) for this run
+    pub stack: Option<String>,
     pub sandbox: String,
     pub home: Option<PathBuf>,
     pub server: String,
@@ -238,6 +241,18 @@ pub fn run(a: RunArgs) -> Result<i32> {
             .join(format!("{stamp}-{name}"))
     });
     fs_extra_clean(&home);
+
+    // embedded backend: --stack mock spawns drive9-mock-server (+ rustfs
+    // via scripts/local-object-store.sh when available) and replaces the
+    // case server for the whole run; the handle tears the stack down on drop
+    let _mock_stack = match a.stack.as_deref() {
+        Some("mock") => Some(crate::stack::start(&home, None)?),
+        Some(other) => bail!("--stack {other:?} unknown (mock)"),
+        None => None,
+    };
+    if let Some(st) = &_mock_stack {
+        a.server = st.server_addr.clone();
+    }
 
     let mut worst = Outcome::Pass;
     let mut lines = Vec::new();
@@ -3588,6 +3603,7 @@ pub struct RunSuiteArgs {
     pub manifest: PathBuf,
     pub tier: Option<String>,
     pub server: String,
+    pub stack: Option<String>,
     pub bin: String,
     pub home: Option<PathBuf>,
     pub fstest: Option<String>,
@@ -3619,6 +3635,20 @@ pub fn run_suite(a: RunSuiteArgs) -> Result<i32> {
     if selected.is_empty() {
         bail!("no cases selected (tier {:?})", a.tier);
     }
+    // one shared embedded backend for the whole suite (per-case --stack
+    // would respawn it for every case)
+    let suite_home = a.home.clone().unwrap_or_else(|| {
+        std::env::temp_dir().join(format!("drive9-simulator-suite-{}", std::process::id()))
+    });
+    let _mock_stack = match a.stack.as_deref() {
+        Some("mock") => Some(crate::stack::start(&suite_home, None)?),
+        Some(other) => bail!("--stack {other:?} unknown (mock)"),
+        None => None,
+    };
+    let server = _mock_stack
+        .as_ref()
+        .map(|s| s.server_addr.clone())
+        .unwrap_or_else(|| a.server.clone());
     let mut results: Vec<(String, i32)> = Vec::new();
     for c in &selected {
         let case_path = cases_root.join(format!("{}.t", c.name));
@@ -3628,9 +3658,10 @@ pub fn run_suite(a: RunSuiteArgs) -> Result<i32> {
         eprintln!("=== suite case {} ===", c.name);
         let code = run(RunArgs {
             case: case_path,
+            stack: None,
             sandbox: "host".into(),
             home: a.home.clone(),
-            server: a.server.clone(),
+            server: server.clone(),
             bin: a.bin.clone(),
             repeat: 1,
             budgets: vec![],
