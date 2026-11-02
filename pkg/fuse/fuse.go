@@ -1035,6 +1035,10 @@ type fileHandle struct {
 	path  string // view path as known to the kernel
 	flags uint32
 	h     fs.Handle // decorator chain head
+	// direct records an open that replied FOPEN_DIRECT_IO: its writes
+	// bypass the kernel page cache, so pages a KEEP_CACHE sibling of the
+	// inode holds must be dropped by the facade (see Write).
+	direct bool
 }
 
 type handleTable struct {
@@ -2617,9 +2621,10 @@ func (f *FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse.Open
 	if err != nil {
 		return fs.StatusOf(err)
 	}
+	var hnd *fileHandle
 	if res.Handle != nil {
 		fh := f.nextFh.Add(1)
-		hnd := &fileHandle{ino: input.NodeId, path: path, flags: input.Flags, h: res.Handle}
+		hnd = &fileHandle{ino: input.NodeId, path: path, flags: input.Flags, h: res.Handle}
 		f.handles.put(fh, hnd)
 		f.openIdx.Add(hnd)
 		out.Fh = fh
@@ -2638,6 +2643,11 @@ func (f *FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse.Open
 	}
 	if f.bypass.active(input.NodeId) {
 		out.OpenFlags = (out.OpenFlags &^ gofuse.FOPEN_KEEP_CACHE) | gofuse.FOPEN_DIRECT_IO
+	}
+	if hnd != nil {
+		// The kernel learns fh from this reply, so no Write can observe the
+		// field before it is set.
+		hnd.direct = out.OpenFlags&gofuse.FOPEN_DIRECT_IO != 0
 	}
 	return gofuse.OK
 }
@@ -2749,6 +2759,20 @@ func (f *FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []byte) (
 		// pre-write size for the attr TTL. Shrinks publish at their own
 		// truncate/commit boundaries; a same-size overwrite changes nothing.
 		f.publishWriteLength(input.NodeId, int64(input.Offset)+int64(len(data)))
+		// Mixed page-cache modes on one inode: this descriptor's open replied
+		// DIRECT_IO (a large writable base) while read-only opens keep the
+		// kernel page cache — including pages left behind by a descriptor
+		// that has since closed. A direct write bypasses those pages, and
+		// kernels before the 2026 "fuse: invalidate the page cache after
+		// FOPEN_DIRECT_IO write" fix leave them stale for the next reader.
+		// Drop the written range unconditionally, as that fix does: without
+		// cached readers it is one async notify, and the open-handle count
+		// proves nothing about pages a closed KEEP_CACHE open left behind.
+		// The notify runs off the request goroutine (the kernel's page locks
+		// are not reentrant from the request that holds them).
+		if hnd, ok := f.handles.get(input.Fh); ok && hnd.direct {
+			f.InvalidateRange(input.NodeId, int64(input.Offset), int64(len(data)))
+		}
 		// v1's Write never stamps a local mtime: the clock advances only
 		// through the server's post-landing stat (ConfirmedAt). A local
 		// now() outruns the row and every later cache-expiry stat flips
@@ -3586,6 +3610,21 @@ func (f *FS) InvalidateContent(ino uint64, size uint64) {
 			defer f.notifyWg.Done()
 			_ = s.InodeNotify(ino, -1, 0) // attributes only (empty range)
 			_ = s.InodeNotify(ino, 0, int64(size))
+		}()
+	}
+}
+
+// InvalidateRange drops the kernel's cached data for [off, off+length) of
+// ino, leaving its attributes and the rest of its pages alone.
+func (f *FS) InvalidateRange(ino uint64, off, length int64) {
+	if length <= 0 {
+		return
+	}
+	if s := f.currentServer(); s != nil {
+		f.notifyWg.Add(1)
+		go func() {
+			defer f.notifyWg.Done()
+			_ = s.InodeNotify(ino, off, length)
 		}()
 	}
 }

@@ -80,11 +80,14 @@ func (w *SSE) handleDisconnect() {
 
 // handleCurrent is called after replay has caught up. Drop any images
 // cached during the gap, including clean write buffers; subsequent
-// heartbeats need no invalidation. A real reset already swept them.
+// heartbeats need no invalidation. A real reset already swept them. The
+// EventVerified that follows tells revision-keyed tiers the stream is
+// continuous again: reads stop revalidating their revision per request.
 func (w *SSE) handleCurrent() {
 	if w.unverified {
 		w.emit(fs.Event{Kind: fs.EventUnverified, Path: "/"})
 		w.unverified = false
+		w.emit(fs.Event{Kind: fs.EventVerified, Path: "/"})
 	}
 }
 
