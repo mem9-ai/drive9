@@ -56,8 +56,13 @@ pub fn start(home: &Path, repo: Option<&Path>) -> Result<MockStack> {
     .arg(&port_file)
     .arg("--dir")
     .arg(&state)
-    .stdout(Stdio::null())
-    .stderr(Stdio::null());
+    .stdout(Stdio::from(std::fs::File::create(state.join("mock.log")).unwrap_or_else(|_| {
+        eprintln!("stack(mock): cannot create mock.log; logs to null");
+        std::fs::File::create("/dev/null").unwrap()
+    })))
+    .stderr(Stdio::from(std::fs::OpenOptions::new().append(true).open(state.join("mock.log")).unwrap_or_else(|_| {
+        std::fs::File::create("/dev/null").unwrap()
+    })));
     if let Some(r) = &rustfs {
         cmd.arg("--s3-endpoint").arg(&r.endpoint);
         if let Some(b) = &r.bucket {

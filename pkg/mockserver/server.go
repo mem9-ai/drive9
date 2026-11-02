@@ -114,6 +114,7 @@ func (s *Server) logRequests(next http.Handler) http.Handler {
 		s.log.Info("request",
 			zap.String("method", r.Method),
 			zap.String("path", r.URL.Path),
+			zap.String("query", r.URL.RawQuery),
 			zap.Duration("dur", time.Since(start)),
 		)
 	})
@@ -135,6 +136,7 @@ func (s *Server) routes() {
 	mux.HandleFunc("/v1/extent/meta", s.auth(s.handleExtentMeta))
 	mux.HandleFunc("/v1/data-credential", s.auth(s.handleDataCredential))
 	mux.HandleFunc("/v1/sql", s.auth(s.handleSQL))
+	mux.HandleFunc("/v1/events", s.auth(s.handleEvents))
 	// embedded S3-compatible endpoint (dir-backed, no SigV4 verification —
 	// mock only; swap to rustfs via Config.S3Endpoint for the data plane)
 	if s.cfg.S3Endpoint == "" {

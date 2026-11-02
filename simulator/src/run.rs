@@ -1448,6 +1448,23 @@ impl Runner {
                 return Ok(false);
             }
             if crate::utils::mount_alive(&self.ws).unwrap_or(false) {
+                // the daemon writes its /tmp pid state file around the FUSE
+                // mount — observed as landing a few ms AFTER mount-aliveness
+                // — while `mount drain`/`umount` resolve the daemon through
+                // exactly that file. Gate the script on it (bounded) or the
+                // first drain races the write and fails with ENOENT.
+                let pid_state = crate::utils::mount_state_pid_path(&self.ws);
+                let state_deadline = Instant::now() + Duration::from_secs(10);
+                while !pid_state.exists() {
+                    if Instant::now() >= state_deadline {
+                        eprintln!(
+                            "mount: pid state file {} did not appear within 10s (drain/umount may race)",
+                            pid_state.display()
+                        );
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
                 self.mount = Some(proc);
                 return Ok(true);
             }
@@ -1603,7 +1620,7 @@ impl Runner {
                 if !self.ensure_observer()? {
                     bail!("observer vantage unavailable");
                 }
-                walk(self.run_dir.join("observer"))?
+                Self::walk_settled(self.run_dir.join("observer"), name)?
             }
             "remote" => {
                 self.remote_idx += 1;
@@ -1620,29 +1637,11 @@ impl Runner {
                     self.unmount_vantage(&mut proc, &rws);
                     bail!("remote vantage mount failed");
                 }
-                let entries = walk(rws.clone())?;
+                let entries = Self::walk_settled(rws.clone(), name)?;
                 self.unmount_vantage(&mut proc, &rws);
                 entries
             }
-            _ => {
-                // an empty walk right after drain can be a transient view
-                // (cache invalidation window); retry bounded before
-                // accepting it, and leave a diagnostic when it persists
-                let mut entries = walk(self.ws.clone())?;
-                for attempt in 0..5 {
-                    if !entries.is_empty() {
-                        break;
-                    }
-                    let probe = std::fs::read_dir(&self.ws).map(|i| i.count()).unwrap_or(0);
-                    eprintln!(
-                        "sample {name}: walk of {} returned 0 entries (readdir probe={probe}, attempt {attempt})",
-                        self.ws.display()
-                    );
-                    std::thread::sleep(Duration::from_millis(500));
-                    entries = walk(self.ws.clone())?;
-                }
-                entries
-            }
+            _ => Self::walk_settled(self.ws.clone(), name)?,
         };
         let path = self
             .run_dir
@@ -1718,6 +1717,28 @@ impl Runner {
     }
 
     // ---- check evaluation ----
+
+/// Walk a mount vantage, retrying bounded when the result is empty: a
+/// freshly started (or just-drained) daemon's readdir can transiently
+/// return nothing while its view settles; an empty manifest from such a
+/// window is not evidence. Diagnostics on every retry.
+fn walk_settled(root: PathBuf, name: &str) -> Result<Vec<Entry>> {
+    let mut entries = walk(root.clone())?;
+    for attempt in 0..10 {
+        if !entries.is_empty() {
+            return Ok(entries);
+        }
+        let probe = std::fs::read_dir(&root).map(|i| i.count()).unwrap_or(0);
+        eprintln!(
+            "sample {name}: walk of {} returned 0 entries (readdir probe={probe}, attempt {attempt})",
+            root.display()
+        );
+        std::thread::sleep(Duration::from_millis(500));
+        entries = walk(root.clone())?;
+    }
+    Ok(entries)
+}
+
 
     fn resolve_ref(&self, r: &str) -> Result<Vec<Entry>, String> {
         match r {
