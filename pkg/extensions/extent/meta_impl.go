@@ -1078,13 +1078,24 @@ func (b *Bridge) RemapLocal(oldPath, newPath string) {
 		delete(b.replacements, oldFull)
 	} else if ino := inoFor(oldFull); b.paths[ino] == oldFull {
 		b.paths[ino] = newFull
-		b.paths[newIno] = newFull
-		// The engine descriptor keeps USING the original inode: mirror the
-		// length under both keys. Deleting the original made a later 4 KiB
-		// overwrite PATCH new_size=4096 and truncate the untouched tail.
-		b.sizes[newIno] = b.sizes[ino]
+		// Record the move so a recreated OLD pathname gets a synthetic key
+		// instead of overwriting the live mapping, and register the moved
+		// inode as the owner of its new name so every later open of that
+		// name converges on the descriptor's inode (one JuiceFS identity
+		// per object: a second key would split cache invalidation).
 		b.moved[ino] = newFull
 		b.replacements[newFull] = ino
+		// The destination's hash key may still be HELD by a moved-open
+		// incarnation that merely vacated this name (its descriptor keeps
+		// using that key): installing the mirror would hijack its mapping
+		// and length, and its next commit would PATCH the newly arrived
+		// file. The owner registration above already resolves the new
+		// name; only mirror the natural key when no live descriptor holds
+		// it.
+		if _, held := b.moved[newIno]; !held {
+			b.paths[newIno] = newFull
+			b.sizes[newIno] = b.sizes[ino]
+		}
 	}
 	// Descendants (a directory move arrives as ONE event for the
 	// directory) follow with their bookkeeping: each child's key is
