@@ -569,7 +569,7 @@ func TestCheckoutEndsGapMode(t *testing.T) {
 			t.Fatalf("%s: read n=%d err=%v", step, n, err)
 		}
 	}
-	gets := func() int  { return requests(b, "GET", "/big") }
+	gets := func() int { return requests(b, "GET", "/big") }
 	heads := func() int { return requests(b, "HEAD", "/big") }
 
 	bus.Emit(fs.Event{Kind: fs.EventUnverified, Path: "/"})
