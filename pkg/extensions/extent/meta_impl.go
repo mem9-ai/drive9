@@ -1198,6 +1198,23 @@ func (b *Bridge) DropDeletedOpen(sentinel string) {
 	_ = b.cfg.Client.RemoveAllCtx(context.Background(), b.fullPath(sentinel))
 }
 
+// RestoreDeletedOpen undoes KeepDeletedOpen when the operation that needed
+// it failed (a rename that would have replaced the retained file never
+// happened): the incarnation returns to its name and its mappings follow,
+// and the registration is dropped WITHOUT deleting the object. If the
+// move back itself fails the registration is dropped too — a stranded
+// hidden file is recoverable, a deleted one is not.
+func (b *Bridge) RestoreDeletedOpen(sentinel, local string) error {
+	err := b.cfg.Client.RenameCtx(context.Background(), b.fullPath(sentinel), b.fullPath(local))
+	if err == nil {
+		b.RemapLocal(sentinel, local)
+	}
+	b.mu.Lock()
+	delete(b.sentinels, sentinel)
+	b.mu.Unlock()
+	return err
+}
+
 // heldInoForLocked reports the held (moved or sentinel-bound) path-hash
 // inode for a full path, if any; the caller holds b.mu. Mknod/ResolveLocal
 // consult this so a replacement incarnation gets a synthetic key instead

@@ -174,6 +174,10 @@ func (h *Handler) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, e
 		if res, err, claimed := h.tryClaimOpen(ctx, op); claimed {
 			return res, err
 		}
+	case fs.OpRename:
+		if res, err, handled := h.tryRenameOverOpen(ctx, op, next); handled {
+			return res, err
+		}
 	case fs.OpSetAttr:
 		if op.HasSize {
 			if res, err, handled := h.tryTruncate(ctx, op, next); handled {
@@ -247,6 +251,43 @@ func (h *Handler) tryClaimOpen(ctx context.Context, op *fs.Op) (fs.Result, error
 	}
 	handle := h.register(op.Path, ino, fh, op.Caller)
 	return fs.Result{Handle: handle}, nil, true
+}
+
+// tryRenameOverOpen preserves an OPEN engine file that a rename is about
+// to replace. The server's rename overwrites the destination object while
+// the displaced descriptors keep addressing the name, so their next commit
+// would PATCH the file just moved into it. The displaced incarnation is
+// moved to its own sentinel FIRST (exactly like unlink-while-open), the
+// rename then lands on a name no live descriptor owns, and the sentinel
+// drops at the displaced file's last close. A rename that fails puts the
+// displaced file back under its name.
+func (h *Handler) tryRenameOverOpen(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error, bool) {
+	if h.opts.Engine == nil || op.Path2 == "" || op.Path2 == op.Path {
+		return fs.Result{}, nil, false
+	}
+	h.mu.Lock()
+	_, destOpen := h.handles[op.Path2]
+	h.mu.Unlock()
+	if !destOpen {
+		return fs.Result{}, nil, false
+	}
+	sentinel, err := h.opts.Engine.Bridge.KeepDeletedOpen(op.Path2)
+	if err != nil {
+		return fs.Result{}, err, true
+	}
+	if sentinel == "" {
+		return fs.Result{}, nil, false
+	}
+	h.retarget(op.Path2, sentinel)
+	res, err := next(ctx, op)
+	if err != nil {
+		// The destination was never replaced: put the displaced file back.
+		if rerr := h.opts.Engine.Bridge.RestoreDeletedOpen(sentinel, op.Path2); rerr == nil {
+			h.retarget(sentinel, op.Path2)
+		}
+		return res, err, true
+	}
+	return res, nil, true
 }
 
 // tryTruncate routes a size change on an open engine file into the bridge;
