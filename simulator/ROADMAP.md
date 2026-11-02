@@ -49,17 +49,39 @@ Delete `blackbox/` and `e2e/` only after G4 (CI cut-over) lands.
    stable codes + errno), limits table, and mock-server tiering (§21).
    Refresh inputs if contract code changes: tidbcloud/fs openapi_registry.go +
    this repo's extent_meta.go/jfs_meta.go/server.go.
-2. [ ] Embedded mock server in the simulator:
-   - Go program (reuses pkg/client types + pkg/pathutil; NOT a Rust reimpl —
-     contract source of truth is Go) exposed as a stack flavor.
-   - Embedded SQLite as metadb + per-tenant tenantdb (snapshot/restore = file
-     copy; /v1/sql reads the mock's own tables).
-   - Embedded rustfs as the S3-compatible endpoint (extent data plane minted
-     via the file/s3 credential paths from the spec).
-   - Anti-drift: nightly conformance diff of mock vs real server responses.
-   - Note: pkg/datastore is a concrete type with MySQL-dialect SQL
-     (ON DUPLICATE KEY ×17, FOR UPDATE ×91) — mock reimplements the HTTP
-     surface against SQLite, it does NOT reuse server handlers.
+2. [~] Embedded mock server — Tier 0 skeleton LANDED
+   (`pkg/mockserver` + `cmd/drive9-mock-server`, pure-Go modernc.org/sqlite,
+   CGO_ENABLED=0 build verified; tests in pkg/mockserver/mockserver_test.go):
+   - lifecycle: /healthz, /v1/provision (202), /v1/status (v1 shape +
+     inline_threshold), DELETE /v1/tenant (key invalidation covered)
+   - fs domain: read (single Range + 416 + Content-Range), stat (X-Dat9-Mtime/
+     Btime), list, HEAD (X-Dat9-*), PUT (X-Dat9-Expected-Revision CAS),
+     mkdir, rename (409 conflict), copy, recursive delete (409 non-empty),
+     append-log (expected-size/revision checks); grep/find/tasks return
+     documented empty shapes; PATCH/batch → 501 Tier 1 markers
+   - uploads V1: initiate (part_checksums required) / part PUT / complete
+     (assembles inline) / resume / abort (+410 semantics)
+   - extent v1: /v1/extent/meta dispatch with wire shapes mirroring
+     pkg/datastore/jfs_meta.go (counters, sessions, lookup/getattr/setattr/
+     mknod/unlink/rmdir/rename/readdir/write/read/truncate; unknown op →
+     ENOSYS; errno + EIO→500 rule) against simplified jfs_* SQLite tables —
+     FIDELITY TODO: port full JuiceFS semantics (slice interpretation,
+     flock/getlk/setlk, compaction ops) before the real extent mount runs
+     against the mock
+   - /v1/data-credential: file scheme (objects dir) + s3 scheme
+     (--s3-endpoint, e.g. rustfs managed by the stack layer; static keys,
+     mock trust boundary = the process)
+   - /v1/sql: read-only handle on the tenant's SQLite (black-box checks)
+   - embedded S3-compatible endpoint on /s3/ (PUT/GET/DELETE object, bucket
+     create, ListObjectsV2 XML, no SigV4 verification) used when no external
+     endpoint is configured
+   Still open: rustfs process management in a stack layer; simulator
+   `--stack mock` flavor (today: run drive9-mock-server and point
+   `drive9-simulator run --server` at it); conformance diff vs real server.
+   Design notes: reuses pkg/pathutil (not a Rust reimpl — the contract's
+   source of truth is Go); snapshot/restore = tenant db file copy; mock
+   reimplements the HTTP surface against SQLite, it does NOT reuse server
+   handlers (pkg/datastore is a concrete type with MySQL-dialect SQL).
 
 ## G3 — Case language v2 (this branch, first slice landed)
 
