@@ -104,10 +104,38 @@ type Cache struct {
 	// revalidateReadCacheEntryIfUntrusted), because a remote change in
 	// the gap arrives with no event.
 	unverified atomic.Bool
+	// inodes is the facade's table, attached before the mount serves:
+	// hardlink aliases share the object, so invalidation and sibling
+	// prefetch hygiene must reach every name bound to the inode.
+	inodes fs.InodeTable
 }
 
 // SetCacheHitRecorder wires the facade-owned hit/miss perf feed.
 func (c *Cache) SetCacheHitRecorder(fn func(kind string, hit bool)) { c.hitRecorder = fn }
+
+// SetInodeTable is called by the facade before the mount serves.
+func (c *Cache) SetInodeTable(t fs.InodeTable) { c.inodes = t }
+
+// aliasSet returns every known name bound to the same inode as path: the
+// path itself plus its hardlink aliases. A hardlink alias names the same
+// remote object, so a write or landing through one name is a change to them
+// all. Without the table it is the path alone.
+func (c *Cache) aliasSet(path string) map[string]struct{} {
+	set := map[string]struct{}{path: {}}
+	if c.inodes == nil {
+		return set
+	}
+	ino, ok := c.inodes.Ino(path)
+	if !ok || ino == 0 {
+		return set
+	}
+	if aliaser, ok := c.inodes.(interface{ Aliases(ino uint64) []string }); ok {
+		for _, a := range aliaser.Aliases(ino) {
+			set[a] = struct{}{}
+		}
+	}
+	return set
+}
 
 func (c *Cache) noteHit(kind string, hit bool) {
 	if c.hitRecorder != nil {
@@ -245,13 +273,18 @@ func New(opts Options) (*Cache, error) {
 				c.invalidateAllTiers()
 				return
 			}
-			if e.Rev <= 0 {
-				// No trustworthy revision to keep: drop the path's image
-				// (v1 settle) — a rev-keyed seed below supersedes it.
-				c.mem.Invalidate(e.Path)
-			}
-			if c.dsk != nil {
-				c.dsk.InvalidateFile(pathDiskReadCacheFileID(e.Path))
+			// A hardlink alias names the same object: the landing replaces
+			// the image its readers hold under their open-time revision too.
+			aliases := c.aliasSet(e.Path)
+			for alias := range aliases {
+				if e.Rev <= 0 {
+					// No trustworthy revision to keep: drop the alias's
+					// image (v1 settle) — a rev-keyed seed below supersedes it.
+					c.mem.Invalidate(alias)
+				}
+				if c.dsk != nil {
+					c.dsk.InvalidateFile(pathDiskReadCacheFileID(alias))
+				}
 			}
 			prefix := strings.TrimSuffix(e.Path, "/") + "/"
 			c.open.Range(func(key, _ any) bool {
@@ -260,7 +293,7 @@ func New(opts Options) (*Cache, error) {
 					return true
 				}
 				p := h.identity()
-				if p != e.Path && !strings.HasPrefix(p, prefix) {
+				if _, aliased := aliases[p]; !aliased && p != e.Path && !strings.HasPrefix(p, prefix) {
 					return true
 				}
 				h.mu.Lock()
@@ -300,10 +333,16 @@ func New(opts Options) (*Cache, error) {
 // tiers, so a per-file SSE change that skipped them kept answering the old
 // bytes until a full checkout.
 func (c *Cache) invalidatePathTiers(path string) {
-	c.mem.Invalidate(path)
+	// Hardlink aliases name the same object: the change is theirs too.
+	aliases := c.aliasSet(path)
+	for alias := range aliases {
+		c.mem.Invalidate(alias)
+		if c.dsk != nil {
+			c.dsk.InvalidateFile(pathDiskReadCacheFileID(alias))
+		}
+	}
 	c.mem.InvalidatePrefix(path + "/")
 	if c.dsk != nil {
-		c.dsk.InvalidateFile(pathDiskReadCacheFileID(path))
 		c.dsk.InvalidatePathPrefix(path + "/")
 	}
 	prefix := strings.TrimSuffix(path, "/") + "/"
@@ -313,7 +352,7 @@ func (c *Cache) invalidatePathTiers(path string) {
 			return true
 		}
 		p := h.identity()
-		if p == path || strings.HasPrefix(p, prefix) {
+		if _, aliased := aliases[p]; aliased || p == path || strings.HasPrefix(p, prefix) {
 			h.mu.Lock()
 			if h.prefetch != nil {
 				h.prefetch.Invalidate()
@@ -385,6 +424,13 @@ func (c *Cache) markUnverified() {
 func (c *Cache) invalidateAllTiers() {
 	c.resetMu.Lock()
 	c.epoch.Add(1)
+	// A checkout/reset re-synchronizes the whole view: every tier is swept
+	// and every handle re-pins through a fresh open, so the stream is
+	// continuous again from here. SSE's reset path clears its own
+	// unverified flag without a catch-up, so no EventVerified follows it —
+	// left set, gap mode would stat every warm read for the rest of the
+	// session.
+	c.unverified.Store(false)
 	c.mem.InvalidateAll()
 	if c.dsk != nil {
 		c.dsk.InvalidateAll()
@@ -741,7 +787,17 @@ func (h *cachingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 	// Re-pin rev/size against the remote before any revision-keyed tier
 	// answers: once per loss of continuity or remote change, and on every
 	// read while the stream is down (v1 revalidateReadCacheEntryIfUntrusted).
-	if h.revalidationDue() && remoteReadable() {
+	if h.revalidationDue() {
+		if !remoteReadable() {
+			// The pinned revision is stale but this plane cannot re-pin it
+			// (an inner decorator that does not read the remote namespace):
+			// trust nothing revision-keyed, prefetched blocks included, and
+			// let the plane below answer.
+			if h.prefetch != nil {
+				h.prefetch.Invalidate()
+			}
+			return h.inner.Read(ctx, off, dest)
+		}
 		pinned, err := h.revalidateRevision(ctx, path)
 		if err != nil {
 			return 0, err
@@ -945,26 +1001,22 @@ func (h *cachingHandle) revalidationDue() bool {
 // revalidateReadCacheEntryIfUntrusted): a matching revision keeps the
 // revision-keyed tiers serving; a different one moves the handle onto it,
 // drops the path's stale image and prefetched blocks, and clips the
-// prefetcher to the new length. The read fails closed when the stat does —
-// a read that cannot verify its revision must not answer from caches. The
-// stat runs without the handle lock: when the identity moved meanwhile (an
-// invalidation, a landed commit, a retarget), the result describes an older
-// world and is discarded — pinned=false, the handle stays flagged, and the
-// caller serves this read from the plane below.
+// prefetcher to the new length. The stat runs without the handle lock: when
+// the identity moved meanwhile (an invalidation, a landed commit, a
+// retarget), the result describes an older world and is discarded —
+// pinned=false, the handle stays flagged, and the caller serves this read
+// from the plane below. A failed stat takes the same exit: a read that could
+// not verify its revision answers from nothing revision-keyed, and the plane
+// below reports whether the object is still there (a rename that retargeted
+// the descriptor mid-stat makes the old name 404 while the fd stays valid).
 func (h *cachingHandle) revalidateRevision(ctx context.Context, path string) (pinned bool, err error) {
 	c := h.cache
 	h.mu.Lock()
 	gen := h.identityGen
 	h.mu.Unlock()
 	st, err := c.opts.PrefetchClient.StatCtx(ctx, c.remotePathOf(path))
-	if err != nil {
-		if client.IsNotFound(err) {
-			return false, fs.ErrNotFound
-		}
-		return false, err
-	}
 	h.mu.Lock()
-	if h.identityGen != gen {
+	if err != nil || h.identityGen != gen {
 		// Unconditional, not only when the mover itself flags: an identity
 		// change from EventLanded, a retarget or a concurrent write does not
 		// set the flag, and a gap-mode revalidation runs with it unset —
@@ -1002,10 +1054,16 @@ func (h *cachingHandle) revalidateRevision(ctx context.Context, path string) (pi
 // window that would make it drop the block itself (nor, without an event
 // bus, an EventLanded). The cancellation also fails a Get parked on an
 // in-flight fetch, so a block completing after the write is not answered.
+// Hardlink aliases count as siblings: a write through /b invalidates the
+// blocks a reader of /a prefetched for the same object.
 func (c *Cache) invalidateSiblingPrefetch(path string, writer *cachingHandle) {
+	aliases := c.aliasSet(path)
 	c.open.Range(func(key, _ any) bool {
 		h, ok := key.(*cachingHandle)
-		if !ok || h == writer || h.identity() != path {
+		if !ok || h == writer {
+			return true
+		}
+		if _, sibling := aliases[h.identity()]; !sibling {
 			return true
 		}
 		h.mu.Lock()

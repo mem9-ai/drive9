@@ -345,3 +345,245 @@ func TestRevalidationDiscardsStatThatRacedAnIdentityChange(t *testing.T) {
 		t.Fatalf("stale stat applied over the identity change: rev=%d revalidate=%v, want rev=0 and still flagged", rev, flagged)
 	}
 }
+
+// A flagged handle whose inner plane cannot re-pin its revision (a decorator
+// that does not state IsRemoteNamespaceReadable, e.g. localize's accounting
+// wrapper) must not fall back to the revision-keyed tiers with the retained
+// revision after the tiers stopped being swept: without this, a handle that
+// warmed the disk tier before a disconnect kept answering old bytes across
+// remote changes in the gap.
+func TestFlaggedHandleWithoutRemoteClaimBypassesTiers(t *testing.T) {
+	c, err := New(Options{MaxSize: 1 << 20, MaxFileSize: 1 << 20,
+		PrefetchClient: client.New("http://127.0.0.1:1", ""), // never contacted: no claim to re-pin through
+		Disk:           DiskReadCacheOptions{Dir: t.TempDir()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Stop(context.Background()) })
+	inner := &stubInner{body: func(int32) []byte { return []byte("BELOW--") }}
+	h := &cachingHandle{cache: c, inner: inner, path: "/f", rev: 3, size: 8 << 20}
+	c.open.Store(h, struct{}{})
+	// Off 0 with a small buffer takes the whole-image fast path straight to
+	// the plane below; an interior offset is what the disk range tier serves.
+	const off = 4096
+	c.dsk.PutOwned(DiskReadCacheKey{FileID: pathDiskReadCacheFileID("/f"), Path: "/f", Revision: 3, Offset: off, Length: 7}, []byte("STALE!!"))
+	c.markUnverified()
+	buf := make([]byte, 7)
+	n, err := h.Read(context.Background(), off, buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(buf[:n]); got != "BELOW--" {
+		t.Fatalf("read %q from the retained disk tier, want the plane below's bytes", got)
+	}
+}
+
+// aliasTable is a minimal inode table where /a and /b are hardlink aliases
+// of one object.
+type aliasTable struct{}
+
+func (aliasTable) Ino(p string) (uint64, bool) {
+	if p == "/a" || p == "/b" {
+		return 7, true
+	}
+	return 0, false
+}
+func (aliasTable) Path(ino uint64) (string, bool) {
+	if ino == 7 {
+		return "/a", true
+	}
+	return "", false
+}
+func (aliasTable) Epoch(string) uint64     { return 0 }
+func (aliasTable) NextEpoch(string) uint64 { return 0 }
+func (aliasTable) Aliases(ino uint64) []string {
+	if ino == 7 {
+		return []string{"/a", "/b"}
+	}
+	return nil
+}
+
+// A prefetched block must not survive a write through a hardlink alias: the
+// object is the same, so the pre-write block is stale for the other name's
+// readers as soon as the write lands, dirty window or no dirty window.
+func TestSiblingWriteThroughAliasInvalidatesReaderPrefetch(t *testing.T) {
+	b := testbackend.NewBackend()
+	const size = 2 << 20
+	b.Seed("/a", bytes.Repeat([]byte("A"), size))
+	b.SeedHardlink("/a", "/b")
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	c, err := New(Options{MaxSize: 1 << 20, MaxFileSize: 1 << 20, SequentialPrefetch: true, PrefetchClient: cl})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.SetInodeTable(aliasTable{})
+	wb, err := writeback.New(writeback.Options{Policy: writeback.PolicyWriteBack, Client: cl})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := fs.NewChain(c, wb, terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	reader, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/a", Flags: 0})
+	if err != nil || reader.Handle == nil {
+		t.Fatalf("open reader = %v", err)
+	}
+	rh := reader.Handle.(*cachingHandle)
+	t.Cleanup(func() { _ = rh.Release(ctx) })
+	const block = 128 << 10
+	ready := make(chan struct{})
+	close(ready)
+	rh.prefetch.mu.Lock()
+	rh.prefetch.cache[block] = &prefetchBlock{offset: block, data: bytes.Repeat([]byte("A"), block), ready: ready}
+	rh.prefetch.mu.Unlock()
+
+	writer, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/b", Flags: uint32(syscall.O_RDWR)})
+	if err != nil || writer.Handle == nil {
+		t.Fatalf("open writer = %v", err)
+	}
+	t.Cleanup(func() { _ = writer.Handle.Release(ctx) })
+	if err := writer.Handle.Write(ctx, block, bytes.Repeat([]byte("N"), block)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Handle.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, block)
+	n, err := rh.Read(ctx, block, got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != block || bytes.IndexByte(got, 'A') >= 0 {
+		t.Fatalf("reader answered the pre-write block through the alias (n=%d, first=%q)", n, got[:1])
+	}
+}
+
+// A stat that fails after the identity moved (a rename retargets the
+// descriptor mid-stat; the old name is 404 by the time the HEAD lands) must
+// not fail the read: the fd is valid and the plane below can still answer.
+func TestRevalidationStatFailureAfterIdentityChangeFallsThrough(t *testing.T) {
+	b := testbackend.NewBackend()
+	data := bytes.Repeat([]byte("0123456789abcdef"), 1<<17) // 2 MiB
+	b.Seed("/f", data)
+	var gate atomic.Bool
+	blocked := make(chan struct{}, 1)
+	release := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead && strings.HasSuffix(r.URL.Path, "/f") && gate.Load() {
+			select {
+			case blocked <- struct{}{}:
+			default:
+			}
+			<-release
+			w.WriteHeader(http.StatusNotFound) // the old name after the rename
+			return
+		}
+		b.ServeHTTP(w, r)
+	}))
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	bus := fs.NewEventBus()
+	c, err := New(Options{MaxSize: 1 << 20, MaxFileSize: 1 << 20, PrefetchClient: cl, Events: bus})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch := newChain(t, ts.URL, c)
+	ctx := context.Background()
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/f", Flags: 0})
+	if err != nil || res.Handle == nil {
+		t.Fatalf("open = %v", err)
+	}
+	h := res.Handle.(*cachingHandle)
+	t.Cleanup(func() { _ = h.Release(ctx) })
+	bus.Emit(fs.Event{Kind: fs.EventUnverified, Path: "/"})
+	gate.Store(true)
+	buf := make([]byte, 64<<10)
+	done := make(chan error, 1)
+	go func() {
+		n, err := h.Read(ctx, 0, buf)
+		if err == nil && !bytes.Equal(buf[:n], data[:n]) {
+			err = fmt.Errorf("read served wrong bytes (n=%d)", n)
+		}
+		done <- err
+	}()
+	select {
+	case <-blocked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the revalidation stat never reached the server")
+	}
+	h.SetPath("/g") // a rename retargets the descriptor while the stat is parked
+	gate.Store(false)
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("read failed on a valid descriptor: %v", err)
+	}
+}
+
+// A reset (retention gap) sweeps every tier and re-synchronizes the view —
+// and SSE's reset path clears its own unverified flag without a catch-up, so
+// no EventVerified follows it. Gap mode must end with the sweep: left set,
+// every warm read of a handle with a pinned revision pays a remote HEAD for
+// the rest of the session.
+func TestCheckoutEndsGapMode(t *testing.T) {
+	b := testbackend.NewBackend()
+	data := bytes.Repeat([]byte("0123456789abcdef"), 1<<19) // 8 MiB
+	b.Seed("/big", data)
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	bus := fs.NewEventBus()
+	c, err := New(Options{MaxSize: 1 << 20, MaxFileSize: 1 << 20, PrefetchClient: cl, Events: bus,
+		Disk: DiskReadCacheOptions{Dir: t.TempDir()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Stop(context.Background()) })
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := fs.NewChain(c, terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	const off = 2 << 20
+	read := func(step string) {
+		t.Helper()
+		res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/big", Flags: 0})
+		if err != nil || res.Handle == nil {
+			t.Fatalf("open (%s) = %v", step, err)
+		}
+		t.Cleanup(func() { _ = res.Handle.Release(ctx) })
+		buf := make([]byte, 1<<20)
+		n, err := res.Handle.Read(ctx, off, buf)
+		if err != nil || !bytes.Equal(buf[:n], data[off:off+int64(len(buf))]) {
+			t.Fatalf("%s: read n=%d err=%v", step, n, err)
+		}
+	}
+	gets := func() int  { return requests(b, "GET", "/big") }
+	heads := func() int { return requests(b, "HEAD", "/big") }
+
+	bus.Emit(fs.Event{Kind: fs.EventUnverified, Path: "/"})
+	read("in the gap")
+	g0, h0 := gets(), heads()
+	if h0 == 0 {
+		t.Fatal("gap-mode read did not revalidate")
+	}
+	bus.Emit(fs.Event{Kind: fs.EventCheckout, Path: "/"}) // reset: sweep, no EventVerified
+	read("after the reset")
+	read("warm after the reset")
+	// Each read() opens fresh, and an open stats once by itself: exactly one
+	// HEAD per read means gap mode is over; one more per read means it is not.
+	if g, hd := gets(), heads(); hd != h0+2 {
+		t.Fatalf("reads after the reset kept paying revalidation HEADs: %d -> %d, want %d (GET %d -> %d)", h0, hd, h0+2, g0, g)
+	}
+}
