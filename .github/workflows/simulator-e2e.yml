@@ -47,8 +47,8 @@ jobs:
           grep -q '^user_allow_other' /etc/fuse.conf || \
             echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
 
-      - name: Install benchmark prerequisites
-        run: sudo apt-get update && sudo apt-get install -y fio
+      - name: Install prerequisites
+        run: sudo apt-get update && sudo apt-get install -y fuse3 fio
 
       - name: Restore perf baseline
         uses: actions/cache/restore@v4
@@ -72,6 +72,7 @@ jobs:
           D9_FSTEST_BIN: ''
 
       - name: Run pr-gate tier (embedded mock backend + rustfs)
+        timeout-minutes: 25
         run: |
           export PATH="$PWD/bin:$PATH"
           export D9_FSTEST_BIN="$(ls -d ~/.cache/drive9-simulator/fstest/main/target/release/fstest)"
@@ -108,7 +109,7 @@ jobs:
           key: perf-baseline-mock-${{ github.run_id }}
 
       - name: Upload run artifacts
-        if: failure()
+        if: ${{ !success() }}
         uses: actions/upload-artifact@v4
         with:
           name: simulator-e2e-artifacts
