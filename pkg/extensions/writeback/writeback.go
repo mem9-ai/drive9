@@ -606,9 +606,9 @@ func (w *Writeback) Stop(ctx context.Context) error {
 // deletion to the last close of an open file.
 func (w *Writeback) MarkPathUnlinked(p string) {
 	w.markUnlinked(p, false)
-	// The name is going away NOW (the syscall already returned OK): the
-	// pending overlays must stop answering lookups for it, or a
-	// re-creator racing the deferred remote DELETE reads the old entry
+	// The name is going away NOW (the facade invokes this before FS.Unlink
+	// replies OK): the pending overlays must stop answering lookups for it,
+	// or a re-creator racing the deferred remote DELETE reads the old entry
 	// (unlink/14 row 4's EEXIST against the resurrected name). The open
 	// fds keep their image: the staged bytes move to the unlink
 	// snapshot before the pending entries die.
