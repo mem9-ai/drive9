@@ -31,7 +31,8 @@ type fakeV2 struct {
 	creates    []string
 	ids        map[string]string // path -> resource identity (X-Dat9-Resource-ID)
 	nextID     int
-	statFail   map[string]bool // paths whose HEAD answers 500 (probe injection)
+	statFail   map[string]bool   // paths whose HEAD answers 500 (probe injection)
+	afterHead  func(path string) // runs (under f.mu) after a HEAD was answered
 	patches    int
 	patchPaths []string   // every PATCH target, in order
 	deletes    []string   // every DELETE target, in order
@@ -71,6 +72,15 @@ func (f *fakeV2) applyPatchLocked() {
 		content = append(content, 0)
 	}
 	f.extent[p.path] = string(content)
+	if id := f.ids[p.path]; id != "" {
+		for q, qid := range f.ids { // hardlinks share the object
+			if qid == id {
+				if _, isExtent := f.extent[q]; isExtent {
+					f.extent[q] = string(content)
+				}
+			}
+		}
+	}
 	f.blocks[sha256Hex(content)] = append([]byte(nil), content...)
 }
 
@@ -118,6 +128,9 @@ func newFakeV2(t *testing.T) *fakeV2 {
 		case http.MethodHead:
 			f.mu.Lock()
 			defer f.mu.Unlock()
+			if hook := f.afterHead; hook != nil {
+				defer hook(path)
+			}
 			if f.statFail[path] {
 				http.Error(w, "probe refused", http.StatusInternalServerError)
 				return
@@ -170,6 +183,32 @@ func newFakeV2(t *testing.T) *fakeV2 {
 			w.WriteHeader(http.StatusAccepted)
 			_ = json.NewEncoder(w).Encode(client.ExtentWritePlan{UploadID: "u1", NewSize: body.NewSize, Blocks: blocks})
 		case http.MethodPost:
+			if _, isLink := r.URL.Query()["hardlink"]; isLink {
+				// POST <dst>?hardlink=1 with X-Dat9-Hardlink-Source: like the
+				// real server, an existing destination is REFUSED (409) and
+				// the new name shares the source's object and identity.
+				src := r.Header.Get("X-Dat9-Hardlink-Source")
+				f.mu.Lock()
+				defer f.mu.Unlock()
+				if f.dirs[path] || f.extent[path] != "" || f.classic[path] != "" {
+					http.Error(w, "exists", http.StatusConflict)
+					return
+				}
+				if c, ok := f.extent[src]; ok {
+					f.extent[path] = c
+					f.ids[path] = f.ids[src]
+					w.WriteHeader(200)
+					return
+				}
+				if c, ok := f.classic[src]; ok {
+					f.classic[path] = c
+					f.ids[path] = f.ids[src]
+					w.WriteHeader(200)
+					return
+				}
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
 			// POST <new>?rename with X-Dat9-Rename-Source: like the real
 			// server (RenameFileReplacingTarget), an existing target is
 			// REPLACED — that is exactly what a shared sentinel name would
@@ -347,6 +386,15 @@ func (f *fakeV2) remove(path string) {
 	delete(f.extent, path)
 	delete(f.classic, path)
 	delete(f.ids, path)
+}
+
+// setAfterHead installs (or clears, with nil) a callback that runs under
+// f.mu right after any HEAD was answered — the moment between a probe's
+// response and the caller's next request.
+func (f *fakeV2) setAfterHead(fn func(path string)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.afterHead = fn
 }
 
 // setStatFail injects (on=true) or clears (on=false) HEAD failures for a

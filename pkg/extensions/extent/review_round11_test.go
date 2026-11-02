@@ -16,16 +16,17 @@ func renameWith(h *Handler, from, to string, next fs.Next) error {
 	return err
 }
 
-func sentinelsLeft(b *Bridge) (registered, deferred int) {
+func registeredSentinels(b *Bridge) int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return len(b.sentinels), len(b.dropDeferred)
+	return len(b.sentinels)
 }
 
 // Round-11 P1 (retention): the displaced destination must survive its own
-// last close while the source rename is still pending. B's last descriptor
-// closes while the chain is blocked; the rename then fails without moving
-// the source; B must be back at /b with its contents — nothing deleted.
+// last close while the source rename is still pending. With link-based
+// retention the file never leaves its name, so B's last close during the
+// window only drops the extra alias; the rename then fails and /b is
+// simply still B — nothing was ever at risk of deletion.
 func TestRenameOverOpenTargetSurvivesLastCloseDuringRename(t *testing.T) {
 	f := newFakeV2(t)
 	f.seedExtent(t, "/a", "AAAA")
@@ -52,15 +53,17 @@ func TestRenameOverOpenTargetSurvivesLastCloseDuringRename(t *testing.T) {
 	}
 	sentinel := ehB.path
 	if sentinel == "/b" {
-		t.Fatal("displaced target was not set aside before the chain ran")
+		t.Fatal("displaced target was not retained before the chain ran")
 	}
-	// B's last close while the rename is pending: the drop must be
-	// deferred, not executed.
+	if got := f.contentOf("/b"); got != "BBBBBBBB" {
+		t.Fatalf("/b = %q during the pending rename, want B still in place", got)
+	}
+	// B's last close while the rename is pending.
 	if err := ehB.Release(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if got := f.contentOf(b.fullPath(sentinel)); got != "BBBBBBBB" {
-		t.Fatalf("retained object deleted by last close during the pending rename: %q", got)
+	if got := f.contentOf("/b"); got != "BBBBBBBB" {
+		t.Fatalf("/b = %q after B's close during the pending rename, want BBBBBBBB", got)
 	}
 	close(release)
 	select {
@@ -77,26 +80,19 @@ func TestRenameOverOpenTargetSurvivesLastCloseDuringRename(t *testing.T) {
 	if got := f.contentOf("/a"); got != "AAAA" {
 		t.Fatalf("/a = %q, want AAAA", got)
 	}
-	if got := f.contentOf(b.fullPath(sentinel)); got != "" {
-		t.Fatalf("sentinel still holds %q after the restore", got)
+	if left := hiddenNames(f); len(left) != 0 {
+		t.Fatalf("aliases left behind: %v", left)
 	}
-	f.mu.Lock()
-	deletes := append([]string(nil), f.deletes...)
-	f.mu.Unlock()
-	for _, d := range deletes {
-		if d == b.fullPath(sentinel) {
-			t.Fatal("the retained object was DELETEd while the rename was unresolved")
-		}
-	}
-	if reg, def := sentinelsLeft(b); reg != 0 || def != 0 {
-		t.Fatalf("registrations=%d deferred=%d left behind", reg, def)
+	if reg := registeredSentinels(b); reg != 0 {
+		t.Fatalf("%d registrations left behind", reg)
 	}
 }
 
 // Round-11 P1 (rollback): an error from the chain is not proof the rename
 // did not commit. Here the server applied mv /a /b and the response was
-// lost; rollback must recognize the source at /b by identity and leave it
-// — never move B back over it — while following the source's descriptors.
+// lost; the plane must recognize the source at /b by identity and leave it
+// — B stays retained at its alias — while following the source's
+// descriptors.
 func TestRenameOverOpenTargetAppliedThenErrorKeepsSource(t *testing.T) {
 	f := newFakeV2(t)
 	f.seedExtent(t, "/a", "AAAA")
@@ -116,7 +112,7 @@ func TestRenameOverOpenTargetAppliedThenErrorKeepsSource(t *testing.T) {
 	}
 	sentinel := ehB.path
 	if got := f.contentOf("/b"); got != "AAAA" {
-		t.Fatalf("/b = %q: rollback overwrote the moved source (want AAAA)", got)
+		t.Fatalf("/b = %q: the moved source was overwritten (want AAAA)", got)
 	}
 	if got := f.contentOf("/a"); got != "" {
 		t.Fatalf("/a = %q, the source should have moved", got)
@@ -143,18 +139,19 @@ func TestRenameOverOpenTargetAppliedThenErrorKeepsSource(t *testing.T) {
 	if got := f.contentOf(b.fullPath(sentinel)); got != "BBBBBBBB" {
 		t.Fatalf("displaced object = %q after A's write, want BBBBBBBB", got)
 	}
-	// Ordinary rename-over lifecycle: B's last close drops its sentinel.
+	// Ordinary rename-over lifecycle: B's last close drops its alias.
 	if err := ehB.Release(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if got := f.contentOf(b.fullPath(sentinel)); got != "" {
-		t.Fatalf("sentinel survived B's last close: %q", got)
+		t.Fatalf("alias survived B's last close: %q", got)
 	}
 }
 
-// Round-11 P1 (rollback): a different file at the destination — created
-// by another client while the rename was failing — is never overwritten;
-// the displaced object is stranded as a hidden name that no close deletes.
+// Round-11 P1 (rollback): a different file at the destination — the name
+// was replaced by another client while the rename was failing — is never
+// touched; the displaced object stays alive at its alias until its own
+// last close (the rename-over lifecycle), since its name is gone.
 func TestRenameOverOpenTargetForeignDestinationNeverOverwritten(t *testing.T) {
 	f := newFakeV2(t)
 	f.seedExtent(t, "/a", "AAAA")
@@ -166,7 +163,7 @@ func TestRenameOverOpenTargetForeignDestinationNeverOverwritten(t *testing.T) {
 
 	boom := errors.New("server failure")
 	err := renameWith(h, "/a", "/b", func(ctx context.Context, op *fs.Op) (fs.Result, error) {
-		f.seedExtent(t, "/b", "CCCC") // another client took the vacated name
+		f.seedExtent(t, "/b", "CCCC") // another client replaced the name
 		return fs.Result{}, boom
 	})
 	if !errors.Is(err, boom) {
@@ -174,26 +171,26 @@ func TestRenameOverOpenTargetForeignDestinationNeverOverwritten(t *testing.T) {
 	}
 	sentinel := ehB.path
 	if got := f.contentOf("/b"); got != "CCCC" {
-		t.Fatalf("/b = %q: rollback overwrote another client's file (want CCCC)", got)
+		t.Fatalf("/b = %q: another client's file was overwritten (want CCCC)", got)
 	}
 	if got := f.contentOf(b.fullPath(sentinel)); got != "BBBBBBBB" {
 		t.Fatalf("displaced object = %q, want BBBBBBBB", got)
 	}
-	if reg, _ := sentinelsLeft(b); reg != 0 {
-		t.Fatalf("stranded sentinel still registered (%d): its last close would delete it", reg)
+	if got := readFront(t, ehB, 16); got != "BBBBBBBB" {
+		t.Fatalf("B reads %q, want BBBBBBBB", got)
 	}
 	if err := ehB.Release(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if got := f.contentOf(b.fullPath(sentinel)); got != "BBBBBBBB" {
-		t.Fatalf("stranded object = %q after B's close, want it preserved", got)
+	if got := f.contentOf("/b"); got != "CCCC" {
+		t.Fatalf("/b = %q after B's close, want CCCC", got)
 	}
 }
 
 // Round-11 P1 (rollback): when the destination cannot be probed at all the
-// outcome is unknown — nothing is overwritten and the displaced object is
-// stranded, recoverable.
-func TestRenameOverOpenTargetUnknownOutcomeStrands(t *testing.T) {
+// outcome is unknown — nothing is written anywhere; the displaced object
+// stays alive at its alias until its own last close.
+func TestRenameOverOpenTargetUnknownOutcomeKeepsRetention(t *testing.T) {
 	f := newFakeV2(t)
 	f.seedExtent(t, "/a", "AAAA")
 	f.seedExtent(t, "/b", "BBBBBBBB")
@@ -214,18 +211,15 @@ func TestRenameOverOpenTargetUnknownOutcomeStrands(t *testing.T) {
 	f.setStatFail("/b", false)
 	sentinel := ehB.path
 	if got := f.contentOf("/b"); got != "AAAA" {
-		t.Fatalf("/b = %q: rollback touched an unestablished destination (want AAAA)", got)
+		t.Fatalf("/b = %q: an unestablished destination was touched (want AAAA)", got)
 	}
 	if got := f.contentOf(b.fullPath(sentinel)); got != "BBBBBBBB" {
 		t.Fatalf("displaced object = %q, want BBBBBBBB", got)
 	}
-	if reg, _ := sentinelsLeft(b); reg != 0 {
-		t.Fatalf("stranded sentinel still registered (%d)", reg)
-	}
 	if err := ehB.Release(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if got := f.contentOf(b.fullPath(sentinel)); got != "BBBBBBBB" {
-		t.Fatalf("stranded object = %q after B's close, want it preserved", got)
+	if got := f.contentOf("/b"); got != "AAAA" {
+		t.Fatalf("/b = %q after B's close, want AAAA", got)
 	}
 }

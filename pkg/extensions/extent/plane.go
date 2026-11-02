@@ -89,6 +89,13 @@ func New(opts Options) *Handler {
 // create at the old child name registers next to (and aliases with) the
 // retained descriptor.
 func (h *Handler) retarget(oldPath, newPath string) {
+	h.retargetHandles(oldPath, newPath)
+	h.opts.Engine.Bridge.RemapLocal(oldPath, newPath)
+}
+
+// retargetHandles moves only the handle bookkeeping (see retarget); used
+// where the caller manages the bridge mappings itself.
+func (h *Handler) retargetHandles(oldPath, newPath string) {
 	type moved struct{ from, to string }
 	var moves []moved
 	h.mu.Lock()
@@ -109,7 +116,6 @@ func (h *Handler) retarget(oldPath, newPath string) {
 		h.handles[m.to] = append(h.handles[m.to], list...)
 	}
 	h.mu.Unlock()
-	h.opts.Engine.Bridge.RemapLocal(oldPath, newPath)
 }
 
 func (h *Handler) drop(path string) {
@@ -257,17 +263,13 @@ func (h *Handler) tryClaimOpen(ctx context.Context, op *fs.Op) (fs.Result, error
 // tryRenameOverOpen preserves an OPEN engine file that a rename is about
 // to replace. The server's rename overwrites the destination object while
 // the displaced descriptors keep addressing the name, so their next commit
-// would PATCH the file just moved into it. The displaced incarnation is
-// moved to its own sentinel FIRST (exactly like unlink-while-open), the
-// rename then lands on a name no live descriptor owns, and the sentinel
-// drops at the displaced file's last close.
-//
-// The retained object is PINNED until the rename's outcome is resolved: a
-// last close meanwhile must not delete what a failed rename has to put
-// back. And an error from the chain is not proof the rename did not
-// commit (a committed rename can lose its response; core's probes can be
-// inconclusive), so rollback first establishes the destination's state and
-// never overwrites a file whose identity it has not confirmed.
+// would PATCH the file just moved into it. RetainOpenAlias adds a HARDLINK
+// of the displaced file under a fresh sentinel name first (non-replacing;
+// the file never leaves its name) and its descriptors are retargeted to
+// the alias; the chain's rename then replaces only the dentry while the
+// alias keeps the displaced object alive. No outcome ever needs a
+// replacing rollback: the alias is one extra reference, deleted at the
+// displaced file's last close.
 func (h *Handler) tryRenameOverOpen(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error, bool) {
 	if h.opts.Engine == nil || op.Path2 == "" || op.Path2 == op.Path {
 		return fs.Result{}, nil, false
@@ -279,45 +281,60 @@ func (h *Handler) tryRenameOverOpen(ctx context.Context, op *fs.Op, next fs.Next
 		return fs.Result{}, nil, false
 	}
 	br := h.opts.Engine.Bridge
-	// The source's identity, to recognize a rename that committed without
-	// a response.
-	srcID := ""
-	if st, err := br.StatLocal(ctx, op.Path); err == nil {
-		srcID = st.ResourceID
-	}
-	sentinel, err := br.KeepDeletedOpen(op.Path2)
+	// Identities before anything moves, to establish the rename's outcome
+	// afterwards: the source's, and the displaced file's own.
+	srcID := resourceIDOf(ctx, br, op.Path)
+	dstID := resourceIDOf(ctx, br, op.Path2)
+	sentinel, err := br.RetainOpenAlias(op.Path2)
 	if err != nil {
+		// Retention failed: refuse the rename rather than risk the open
+		// file (nothing has changed yet).
 		return fs.Result{}, err, true
 	}
 	if sentinel == "" {
 		return fs.Result{}, nil, false
 	}
-	br.PinDeletedOpen(sentinel)
-	defer br.UnpinDeletedOpen(sentinel)
-	h.retarget(op.Path2, sentinel)
+	h.retargetHandles(op.Path2, sentinel)
 	res, err := next(ctx, op)
 	if err == nil {
+		// The name is the source's now: it must stop resolving to the
+		// displaced inode (the facade's rename event registers the source
+		// there only if the source had a mapping of its own).
+		br.DisownPath(op.Path2, sentinel)
 		return res, nil, true
 	}
-	switch h.probeRenameOutcome(op.Path2, srcID) {
-	case renameDestVacant:
-		// Nothing landed at the name: put the displaced file back.
-		if rerr := br.RestoreDeletedOpen(sentinel, op.Path2); rerr == nil {
-			h.retarget(sentinel, op.Path2)
-		}
+	// An error is not proof the rename did not apply (a committed rename
+	// can lose its response; core's probes can be inconclusive): establish
+	// what the name holds before acting, and never replace anything.
+	switch h.probeRenameOutcome(op.Path2, srcID, dstID) {
+	case renameDestIsDisplaced:
+		// The rename never applied and the displaced file still occupies
+		// its name: drop the alias and point the descriptors back.
+		br.UnretainOpenAlias(sentinel, op.Path2)
+		h.retargetHandles(sentinel, op.Path2)
 	case renameDestIsSource:
-		// The rename committed after all: the source lives at the name and
-		// the displaced file stays retained at its sentinel (the ordinary
-		// rename-over lifecycle). Follow the source so its descriptors
-		// commit to where its bytes are.
+		// The rename committed after all: the source lives at the name.
+		// The alias keeps the displaced object until its own last close;
+		// follow the source so its descriptors commit to the name.
+		br.DisownPath(op.Path2, sentinel)
 		h.retarget(op.Path, op.Path2)
 	default:
-		// Someone else's file at the name, or unknowable: never overwrite
-		// it. The displaced object stays as a hidden name nothing deletes —
-		// recoverable, unlike an overwritten file.
-		br.StrandDeletedOpen(sentinel)
+		// Vacant (someone removed the name), a foreign file, or
+		// unknowable: the name no longer provably holds the displaced
+		// file. Its object stays alive at the alias until its last close;
+		// nothing is written anywhere.
+		br.DisownPath(op.Path2, sentinel)
 	}
 	return res, err, true
+}
+
+// resourceIDOf stats a path for its server-side identity ("" when absent
+// or unreachable).
+func resourceIDOf(ctx context.Context, br *Bridge, local string) string {
+	if st, err := br.StatLocal(ctx, local); err == nil {
+		return st.ResourceID
+	}
+	return ""
 }
 
 // renameOutcome is what the destination of a failed rename turned out to
@@ -325,10 +342,11 @@ func (h *Handler) tryRenameOverOpen(ctx context.Context, op *fs.Op, next fs.Next
 type renameOutcome int
 
 const (
-	renameDestUnknown  renameOutcome = iota // probes could not establish it
-	renameDestVacant                        // nothing at the name
-	renameDestIsSource                      // the source landed there: the rename committed
-	renameDestForeign                       // a file that is not the source
+	renameDestUnknown     renameOutcome = iota // probes could not establish it
+	renameDestVacant                           // nothing at the name
+	renameDestIsSource                         // the source landed there: the rename committed
+	renameDestIsDisplaced                      // the displaced file still occupies its own name
+	renameDestForeign                          // a file that is neither
 )
 
 // renameOutcomeProbeDelays paces the detached probes of a failed rename's
@@ -336,10 +354,11 @@ const (
 var renameOutcomeProbeDelays = []time.Duration{0, 200 * time.Millisecond, 500 * time.Millisecond}
 
 // probeRenameOutcome establishes, detached from the failed request's
-// context, what the destination holds: absent, the source itself (same
-// resource identity), or another file. Unknown when every probe fails or
-// the source's identity was never captured.
-func (h *Handler) probeRenameOutcome(dest, srcID string) renameOutcome {
+// context, what the destination holds: the source itself (the rename
+// committed), the displaced file (it did not apply), something else, or
+// nothing. Unknown when every probe fails or an identity was never
+// captured.
+func (h *Handler) probeRenameOutcome(dest, srcID, dstID string) renameOutcome {
 	for _, delay := range renameOutcomeProbeDelays {
 		time.Sleep(delay)
 		pctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -348,6 +367,8 @@ func (h *Handler) probeRenameOutcome(dest, srcID string) renameOutcome {
 		switch {
 		case err == nil && srcID != "" && st.ResourceID == srcID:
 			return renameDestIsSource
+		case err == nil && dstID != "" && st.ResourceID == dstID:
+			return renameDestIsDisplaced
 		case err == nil:
 			return renameDestForeign
 		case client.IsNotFound(err):

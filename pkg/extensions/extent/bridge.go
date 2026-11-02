@@ -86,12 +86,6 @@ type Bridge struct {
 	// (silly-rename); only registered names may be deleted at last close —
 	// a user filename that merely contains ".d9open-" is never ours.
 	sentinels map[string]meta.Ino // sentinel LOCAL path -> held engine ino
-	// pins retains a sentinel's object across an operation whose outcome
-	// is still unresolved (a rename that displaced it): a last close
-	// meanwhile defers the drop instead of deleting what a failed rename
-	// would have to put back.
-	pins         map[string]int  // sentinel LOCAL path -> retention count
-	dropDeferred map[string]bool // sentinel LOCAL path -> drop requested while pinned
 	// moved records engine inodes whose pathname changed (rename) or was
 	// unlinked (sentinel) while a descriptor still holds them; a NEW
 	// incarnation at the old path must not reuse the key. Keyed by the
@@ -142,8 +136,6 @@ func NewBridge(cfg Config) *Bridge {
 		truncs:       make(map[meta.Ino]int64),
 		modes:        make(map[meta.Ino]uint32),
 		sentinels:    make(map[string]meta.Ino),
-		pins:         make(map[string]int),
-		dropDeferred: make(map[string]bool),
 		nextHeldIno:  heldInoBase,
 		moved:        make(map[meta.Ino]string),
 		replacements: make(map[string]meta.Ino),

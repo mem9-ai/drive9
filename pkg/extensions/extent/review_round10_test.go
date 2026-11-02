@@ -3,6 +3,7 @@ package extent
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/mem9-ai/drive9/pkg/fs"
@@ -24,9 +25,22 @@ func renameThrough(t *testing.T, h *Handler, f *fakeV2, from, to string, fail er
 	return passed, err
 }
 
+// hiddenNames lists the sentinel-looking names the fake currently holds.
+func hiddenNames(f *fakeV2) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []string
+	for p := range f.extent {
+		if strings.Contains(p, ".d9open-") {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 // Round-10 P1: renaming onto a still-open engine file must preserve the
 // displaced descriptor's original object. A at /a and B at /b both open;
-// mv /a /b: B moves to its own sentinel BEFORE the server replaces /b, so a
+// mv /a /b: B gains a hardlink alias BEFORE the server replaces /b, so a
 // write through B lands on B's retained object and never on A.
 func TestRenameOverOpenTargetPreservesDisplacedDescriptor(t *testing.T) {
 	f := newFakeV2(t)
@@ -45,7 +59,7 @@ func TestRenameOverOpenTargetPreservesDisplacedDescriptor(t *testing.T) {
 
 	sentinel := ehB.path
 	if sentinel == "/b" {
-		t.Fatal("displaced open target was not moved to a sentinel")
+		t.Fatal("displaced open target was not given a retained alias")
 	}
 	if got := f.contentOf(b.fullPath(sentinel)); got != "BBBBBBBB" {
 		t.Fatalf("displaced object = %q, want BBBBBBBB", got)
@@ -74,7 +88,7 @@ func TestRenameOverOpenTargetPreservesDisplacedDescriptor(t *testing.T) {
 	}
 	for _, p := range patched {
 		if p != b.fullPath(sentinel) {
-			t.Fatalf("B's commit targeted %q, want its sentinel %q", p, b.fullPath(sentinel))
+			t.Fatalf("B's commit targeted %q, want its alias %q", p, b.fullPath(sentinel))
 		}
 	}
 	if got := f.contentOf("/b"); got != "AAAA" {
@@ -86,21 +100,22 @@ func TestRenameOverOpenTargetPreservesDisplacedDescriptor(t *testing.T) {
 	if got := readFront(t, ehB, 16); got != "ZZZZBBBB" {
 		t.Fatalf("B reads %q, want ZZZZBBBB", got)
 	}
-	// B's last close drops its sentinel; /b (A) stays.
+	// B's last close drops its alias — the last reference; /b (A) stays.
 	if err := ehB.Release(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if got := f.contentOf(b.fullPath(sentinel)); got != "" {
-		t.Fatalf("sentinel survived B's last close: %q", got)
+		t.Fatalf("alias survived B's last close: %q", got)
 	}
 	if got := f.contentOf("/b"); got != "AAAA" {
 		t.Fatalf("/b = %q after B's close, want AAAA", got)
 	}
 }
 
-// Round-10: a rename that fails after the displaced target was set aside
-// puts it back under its name, with no sentinel registration left behind.
-func TestRenameOverOpenTargetRestoresOnFailure(t *testing.T) {
+// Round-10: a rename the chain refuses (nothing applied) leaves the
+// displaced file exactly where it was — it never left its name — with the
+// extra alias removed and no registration left behind.
+func TestRenameOverOpenTargetUnretainsOnFailure(t *testing.T) {
 	f := newFakeV2(t)
 	f.seedExtent(t, "/a", "AAAA")
 	f.seedExtent(t, "/b", "BBBBBBBB")
@@ -115,13 +130,16 @@ func TestRenameOverOpenTargetRestoresOnFailure(t *testing.T) {
 		t.Fatalf("rename: err=%v passed=%v, want the chain's error", err, passed)
 	}
 	if ehB.path != "/b" {
-		t.Fatalf("displaced target not restored: handle at %q", ehB.path)
+		t.Fatalf("displaced target's descriptor not pointed back: handle at %q", ehB.path)
 	}
 	if got := f.contentOf("/b"); got != "BBBBBBBB" {
 		t.Fatalf("/b = %q after the failed rename, want BBBBBBBB", got)
 	}
 	if got := f.contentOf("/a"); got != "AAAA" {
 		t.Fatalf("/a = %q, want AAAA", got)
+	}
+	if left := hiddenNames(f); len(left) != 0 {
+		t.Fatalf("alias left behind after the failed rename: %v", left)
 	}
 	b.mu.Lock()
 	left := len(b.sentinels)
