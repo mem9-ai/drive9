@@ -93,8 +93,8 @@ jobs:
 
       - name: Build and start drive9-server
         run: |
-          CGO_ENABLED=0 go build -o bin/drive9-server ./cmd/drive9-server
-          CGO_ENABLED=0 go build -o bin/drive9 ./cmd/drive9
+          make build-server SERVER_BIN=bin/drive9-server
+          make build-cli CLI_BIN=bin/drive9
           echo "$PWD/bin" >> "$GITHUB_PATH"
           nohup "$PWD/bin/drive9-server" > /tmp/drive9-server.log 2>&1 &
           echo $! > /tmp/drive9-server.pid

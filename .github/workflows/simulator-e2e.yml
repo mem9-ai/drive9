@@ -59,7 +59,7 @@ jobs:
 
       - name: Build drive9 CLI + mock server
         run: |
-          CGO_ENABLED=0 go build -o bin/drive9 ./cmd/drive9
+          make build-cli CLI_BIN=bin/drive9
           CGO_ENABLED=0 go build -o bin/drive9-mock-server ./cmd/drive9-mock-server
 
       - name: Build simulator
