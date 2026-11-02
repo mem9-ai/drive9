@@ -4002,6 +4002,24 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 	// its own remoteRoot (same convention as the terminal).
 	unlock := w.pathLocks.lock(h.path)
 	defer unlock()
+	// An anonymous handle must not publish under its dead name (commitLocked
+	// discards the same way). Checked under the path lock: the unlink's
+	// cancel+marker runs under it too (cancelPath), so a racing fsync either
+	// sees the marking here and stages nothing, or completed its publication
+	// and Enqueue first — and that entry dies with the marker (#1065).
+	h.mu.Lock()
+	unlinked := h.unlinked
+	if unlinked {
+		h.dirty = false
+		h.visTrunc = false
+		if h.buf != nil {
+			h.buf.ClearDirty()
+		}
+	}
+	h.mu.Unlock()
+	if unlinked {
+		return nil
+	}
 	var image []byte
 	if spill {
 		// v1 stageLargeAtClose + shadow-spill staging: bounded memory — each

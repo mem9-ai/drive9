@@ -10,6 +10,11 @@
 // asynchronous, so close(2)+unlink(2) races it) defers that to the last
 // close plus a remote HEAD. A kill -9 inside that window replayed the
 // frames and re-committed the unlinked file.
+//
+// The marker is serialized with the staging publication through the
+// same-path lock (a racing fsync stages nothing under the dead name), and
+// a WAL that cannot take the marker falls back to dropping the preserved
+// state instead of leaving it replayable.
 package writeback
 
 import (
@@ -52,6 +57,7 @@ type unlinkWindowStack struct {
 	ledger  *staging.Staging
 	dir     string
 	backend *testbackend.Backend
+	ts      *httptest.Server
 
 	putStarted chan struct{}
 	release    chan struct{}
@@ -67,7 +73,7 @@ func newUnlinkWindowStack(t *testing.T, holdPath string) *unlinkWindowStack {
 		release:    make(chan struct{}),
 		dir:        t.TempDir(),
 	}
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	s.ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v1/status" {
 			w.WriteHeader(http.StatusOK)
 			return
@@ -93,10 +99,10 @@ func newUnlinkWindowStack(t *testing.T, holdPath string) *unlinkWindowStack {
 		}
 		s.backend.ServeHTTP(w, r)
 	}))
-	t.Cleanup(ts.Close)
+	t.Cleanup(s.ts.Close)
 	t.Cleanup(func() { close(s.release) })
 
-	cl := client.New(ts.URL, "")
+	cl := client.New(s.ts.URL, "")
 	cl.SetSmallFileThresholdForTests(1 << 20)
 	ledger, err := staging.NewStaging(s.dir)
 	if err != nil {
@@ -257,5 +263,139 @@ func TestUnlinkWithQueuedOverwriteDoesNotResurrectAfterCrash(t *testing.T) {
 	// kill -9 here.
 	if s.crashAndReplay(t, path) {
 		t.Fatal("deleted path's queued overwrite resurrected from the WAL: purgeStaging must journal a done marker")
+	}
+}
+
+// An interactive fsync racing the unlink-of-open-file marking (the handle
+// passed its dirty check, the unlink marked it anonymous, neither side has
+// published) must not stage, enqueue, or upload under the dead name, and
+// the WAL must stay non-replayable for it. Serialized by the same-path lock
+// cancelPath and stageAndEnqueueOpt share.
+func TestFsyncRacingUnlinkOfOpenFileStagesNothing(t *testing.T) {
+	const path = "/raced.txt"
+	s := newUnlinkWindowStack(t, path)
+	ctx := context.Background()
+
+	h := open(t, s.ch, path).(*bufferingHandle)
+	if err := h.Write(ctx, 0, []byte("race")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Park both sides on the same-path lock the unlink's cancel and the
+	// fsync's staging publication serialize on.
+	unlock := s.wb.pathLocks.lock(path)
+	syncErr := make(chan error, 1)
+	go func() { syncErr <- h.Sync(ctx) }()
+	marked := make(chan struct{})
+	go func() {
+		s.wb.MarkPathUnlinked(path)
+		close(marked)
+	}()
+	// Wait for the unlink marking (it precedes the cancel's lock wait), so
+	// whichever goroutine wins the lock, the fsync's post-lock check sees it.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		h.mu.Lock()
+		unlinked := h.unlinked
+		h.mu.Unlock()
+		if unlinked {
+			break
+		}
+		if time.Now().After(deadline) {
+			unlock()
+			t.Fatal("unlink marking never happened")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	unlock()
+
+	select {
+	case err := <-syncErr:
+		if err != nil {
+			t.Fatalf("racing fsync: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("racing fsync never returned")
+	}
+	select {
+	case <-marked:
+	case <-time.After(10 * time.Second):
+		t.Fatal("MarkPathUnlinked never returned")
+	}
+	if err := h.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.wb.WaitCommitQueueIdle(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.backend.Node(path); ok {
+		t.Fatal("racing fsync uploaded the unlinked name")
+	}
+	if s.crashAndReplay(t, path) {
+		t.Fatal("racing fsync left replayable frames for the unlinked name")
+	}
+}
+
+// When the WAL cannot take the unlink marker (a full or failing cache disk),
+// the preserve-local cancel must not leave the retained shadow/index as
+// replayable state: it falls back to the non-preserving cleanup, and the
+// recovery mount prunes the WAL-resurrected entry instead of re-uploading.
+func TestUnlinkMarkerFailureDropsPreservedState(t *testing.T) {
+	const path = "/waldown.txt"
+	s := newUnlinkWindowStack(t, path)
+	s.hold.Store(true)
+	ctx := context.Background()
+
+	h := open(t, s.ch, path).(*bufferingHandle)
+	if err := h.Write(ctx, 0, []byte("wal-down")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	s.waitPutStarted(t)
+
+	// Break the WAL the way a full disk would.
+	if err := s.ledger.Journal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s.wb.MarkPathUnlinked(path)
+
+	if s.ledger.Shadow.Has(path) {
+		t.Fatal("marker failure must drop the retained shadow")
+	}
+	if s.ledger.Pending.HasPending(path) {
+		t.Fatal("marker failure must drop the retained pending entry")
+	}
+
+	// Full recovery-mount shape: replay + queue RecoverPending. The replayed
+	// fsync frame re-adds an index entry, but the missing shadow makes
+	// recoveredEntry prune it — nothing re-uploads.
+	s.hold.Store(false)
+	recovered, err := staging.NewStaging(s.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(recovered.Close)
+	if err := recovered.Recover(); err != nil {
+		t.Fatal(err)
+	}
+	cl := client.New(s.ts.URL, "")
+	cl.SetSmallFileThresholdForTests(1 << 20)
+	wb2, err := New(Options{Policy: PolicyWriteBack, SyncMode: "interactive", Client: cl, Staging: recovered})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wb2.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := wb2.WaitCommitQueueIdle(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.backend.Node(path); ok {
+		t.Fatal("recovery re-uploaded the unlinked name")
+	}
+	if err := h.Release(ctx); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -1203,7 +1203,10 @@ func (cq *CommitQueue) hasImmediatePrefixLocked(prefix string) bool {
 	return false
 }
 
-func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) {
+// cancelPathEntries marks every queued, immediate, or in-flight entry for
+// path canceled, drops the queued ones, and returns their cancel funcs for
+// the caller to fire outside cq.mu.
+func (cq *CommitQueue) cancelPathEntries(path string) []context.CancelFunc {
 	var cancels []context.CancelFunc
 	seen := make(map[*CommitEntry]struct{})
 	markCanceled := func(e *CommitEntry) {
@@ -1225,6 +1228,7 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) {
 	}
 
 	cq.mu.Lock()
+	defer cq.mu.Unlock()
 	delete(cq.landed, path)
 	if e, ok := cq.inFlight[path]; ok {
 		markCanceled(e)
@@ -1259,9 +1263,24 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) {
 		cq.queue = remaining
 		delete(cq.queuedByPath, path)
 	}
-	cq.mu.Unlock()
+	return cancels
+}
 
-	for _, cancel := range cancels {
+func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) {
+	// First pass without the path lock: an in-flight upload holds that lock
+	// for its whole transfer, and aborting it here is what releases it.
+	for _, cancel := range cq.cancelPathEntries(path) {
+		cancel()
+	}
+	// Second pass under the same-path lock the staging path holds across
+	// its shadow/pending publication and Enqueue: an entry that slipped in
+	// between the two passes is canceled too, and the marker below lands at
+	// a higher Seq than every frame published before it. A staging that
+	// takes the lock after this returns sees the handle's unlink marking and
+	// publishes nothing (stageAndEnqueueOpt).
+	unlock := cq.lockPath(path)
+	defer unlock()
+	for _, cancel := range cq.cancelPathEntries(path) {
 		cancel()
 	}
 	hadLocal := false
@@ -1285,16 +1304,32 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) {
 	// unlink-of-open-file path defers the non-preserving cancel to the last
 	// close plus a remote HEAD, and a crash inside that window replayed the
 	// fsync'd frames and re-committed the unlinked file (#1065).
-	if hadLocal && cq.journal != nil {
-		// Best effort: a lost marker only means recovery re-checks a path
-		// whose shadow/.meta are already gone, which the pending-index
-		// prune discards. Log so persistent WAL write failures surface.
-		if err := cq.journal.Append(staging.JournalEntry{
-			Op:   staging.JournalUnlink,
-			Path: path,
-		}); err != nil {
-			safeLogPrintf("commit queue: journal cancel marker failed for %s: %v", path, err)
-		}
+	if !hadLocal || cq.journal == nil {
+		return
+	}
+	err := cq.journal.Append(staging.JournalEntry{
+		Op:   staging.JournalUnlink,
+		Path: path,
+	})
+	if err == nil {
+		return
+	}
+	safeLogPrintf("commit queue: journal cancel marker failed for %s: %v", path, err)
+	if !preserveLocal {
+		// Best effort: the shadow/.meta are already gone, so a lost marker
+		// only means recovery re-checks a path the pending-index prune
+		// discards.
+		return
+	}
+	// The retained shadow/index are safe only while the marker fences their
+	// WAL frames: without it a crash replays them. Fall back to the
+	// non-preserving cleanup — the anonymous fd loses its staged image on a
+	// failing WAL, but the unlink cannot resurrect.
+	if cq.shadows != nil {
+		cq.shadows.Remove(path)
+	}
+	if cq.index != nil {
+		cq.index.Remove(path)
 	}
 }
 
