@@ -146,13 +146,13 @@ done
 echo "batch final state exact"
 
 # ---- Final-state sampling and sync confirmation [scenario2-step5] ----
-drive9-test-sample final
-drive9-test-drain --mode require-ok --timeout 120s
-drive9-test-sample remote-final --as remote
+sample final
+drain --mode require-ok --timeout 120s
+sample remote-final --as remote
 
 # ---- Verdicts: each assertion below is one case entry in the statistics ----
-drive9-test-check manifest-equals --this control --against @final \
+check manifest-equals --this control --against @final \
     --ignore '.sim/**'                                               --req 'scenario2-check4'
-drive9-test-check manifest-equals --this @remote-final --against @final \
+check manifest-equals --this @remote-final --against @final \
     --ignore '.sim/**'                                               --req 'scenario2-check4'
-drive9-test-check sync-ok                                            --req 'scenario2-step5'
+check sync-ok                                            --req 'scenario2-step5'

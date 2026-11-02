@@ -86,11 +86,11 @@ cmp /tmp/got-x1 /tmp/exp-x1
 [ "$(ls incoming 2>/dev/null | wc -l)" -eq 0 ]
 echo "replay converged full"
 
-drive9-test-sample final
-drive9-test-drain --mode require-ok --timeout 120s
+sample final
+drain --mode require-ok --timeout 120s
 
 # --- Verdicts ---
-drive9-test-check artifact-contains --artifact journal \
+check artifact-contains --artifact journal \
     --pattern 'worker-normal-exit:'                                      --req 'X1'
-drive9-test-check manifest-equals --this control --against @final \
+check manifest-equals --this control --against @final \
     --ignore '.sim/**,incoming/**'                                       --req 'scenario4-check4'

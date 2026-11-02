@@ -134,13 +134,13 @@ echo "rename install verified n=$ASSETS w=$WORKERS"
 
 # --- Final: full-tree sample + drain -> manifest sampled via a separate remote
 #     entry [scenario4-step5] ---
-drive9-test-sample final
-drive9-test-drain --mode require-ok --timeout 300s
-drive9-test-sample remote-final --as remote
+sample final
+drain --mode require-ok --timeout 300s
+sample remote-final --as remote
 
 # --- Verdicts: each assertion = one case entry in the stats ---
-drive9-test-check manifest-equals --this control --against @final \
+check manifest-equals --this control --against @final \
     --ignore '.sim/**,incoming/**'                                 --req 'scenario4-check1'
-drive9-test-check manifest-equals --this @remote-final --against @final \
+check manifest-equals --this @remote-final --against @final \
     --ignore '.sim/**,incoming/**'                                 --req 'scenario4-step4'
-drive9-test-check sync-ok                                          --req 'scenario4-step4'
+check sync-ok                                          --req 'scenario4-step4'

@@ -39,7 +39,7 @@ set -eu
 # --- Control file batch: write to disk, drain-confirm, never modify again [D-step1] ---
 mkdir -p data
 printf 'prior confirmed control\n' > data/prior-control.txt
-drive9-test-drain --mode require-ok --timeout 120s
+drain --mode require-ok --timeout 120s
 
 # --- This round's fixed changes: 2 additions (fsynced) / 1 overwrite (fsynced)
 #      / 1 rename / 1 delete + 1 non-fsynced volatile file [D-step1] ---
@@ -53,17 +53,17 @@ head -c 65536 /dev/zero | tr '\0' 'V' > data/volatile.bin
 printf 'deleted before exit\n' > data/doomed.txt
 mv data/control-2.bin data/renamed.bin
 rm data/doomed.txt
-drive9-test-sample pre-exit
+sample pre-exit
 
 # --- D1: no remote sync confirmation at all; SIGKILL the mounted client
 #     directly [D1-step3/D-step3] ---
-drive9-test-kill client
+halt client
 
 # --- Remount into a fresh environment with no prior cache, then compare file
 #     by file [D-step5] ---
-drive9-test-remount --cache fresh
+remount --cache fresh
 cd "$D9_MOUNT"
-drive9-test-sample recovered
+sample recovered
 
 # --- Recovery inventory (bare checks): unchanged controls and fsynced changes
 #     survive; the volatile file is recorded per the commitment, not judged
@@ -82,12 +82,12 @@ fi
 #     operations) [D-step6/D-check4] ---
 printf 'new round\n' > data/next.txt
 printf 'new round\n' | cmp - data/next.txt
-drive9-test-drain --mode require-ok --timeout 120s
+drain --mode require-ok --timeout 120s
 
 # --- Assertions ---
-drive9-test-check manifest-contains --this @recovered --against @pre-exit \
+check manifest-contains --this @recovered --against @pre-exit \
     --paths 'data/prior-control.txt,data/control-1.txt,data/renamed.bin' --req 'D-check1'
-drive9-test-check manifest-absent --this @recovered \
+check manifest-absent --this @recovered \
     --paths 'data/doomed.txt'                                           --req 'D-check2'
-drive9-test-check artifact-contains --artifact journal \
+check artifact-contains --artifact journal \
     --pattern 'volatile-outcome:'                                       --req 'D-check2'

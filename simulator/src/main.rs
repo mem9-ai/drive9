@@ -26,9 +26,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// run one shell case (.test file) against a drive9 deployment
+    /// run one shell case (.t file) against a drive9 deployment
     Run {
-        /// path to the case file (must end in .test)
+        /// path to the case file (must end in .t)
         case: PathBuf,
         #[arg(long, default_value = "host")]
         sandbox: String,
@@ -79,7 +79,7 @@ enum Commands {
         #[arg(long)]
         seed: Option<PathBuf>,
     },
-    /// statically validate .test case files (lint)
+    /// statically validate .t case files (lint)
     Validate {
         files: Vec<PathBuf>,
         #[arg(long)]
@@ -94,15 +94,15 @@ enum Commands {
 
 fn main() -> Result<()> {
     init_logger();
-    // builtin dispatch: symlinked as drive9-test-<cmd>, argv[0] decides
+    // builtin dispatch: symlinked as the bare command name, argv[0] decides
     let argv0 = std::env::args().next().unwrap_or_default();
     let base = PathBuf::from(&argv0)
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
-    if let Some(name) = base.strip_prefix("drive9-test-") {
+    if run::COMMANDS.contains(&base.as_str()) {
         let args: Vec<String> = std::env::args().skip(1).collect();
-        let code = run::builtin_main(name, args);
+        let code = run::builtin_main(&base, args);
         std::process::exit(code);
     }
 

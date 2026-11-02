@@ -79,15 +79,15 @@ if node -e 'require("tiny")' 2>/dev/null; then echo REMOVED-PACKAGE-STILL-LOADAB
 echo "remove reflected in enumeration"
 
 # ---- scenario6-step1: final drain (T3), then re-verification through an independent entry point (T4, scoped by the directory configuration) ----
-drive9-test-sample final
-drive9-test-drain --mode require-ok --timeout 180s
-drive9-test-sample remote-final --as remote
+sample final
+drain --mode require-ok --timeout 180s
+sample remote-final --as remote
 
 # ---- Verdicts: each assertion below is one case entry in the statistics ----
 # The remote side only checks remote files (node_modules belongs to the local
 # overlay and does not take part in persistence comparisons)
-drive9-test-check manifest-equals --this @remote-final --against @final \
+check manifest-equals --this @remote-final --against @final \
     --ignore '.sim/**,node_modules/**'                             --req 'scenario6-check1'
-drive9-test-check manifest-absent --this @remote-final \
+check manifest-absent --this @remote-final \
     --paths 'node_modules/tiny/index.js'                           --req 'section2-1'
-drive9-test-check sync-ok                                          --req 'scenario6-step2'
+check sync-ok                                          --req 'scenario6-step2'

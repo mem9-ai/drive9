@@ -25,7 +25,7 @@ set -eu
 #     [D-step1] ---
 mkdir -p data
 printf 'prior confirmed control\n' > data/prior-control.txt
-drive9-test-drain --mode require-ok --timeout 120s
+drain --mode require-ok --timeout 120s
 
 # --- This round's fixed change set: 2 adds (fsync) / 1 overwrite (fsync) /
 #     1 rename / 1 delete [D-step1] ---
@@ -39,20 +39,20 @@ printf 'deleted before exit\n' > data/doomed.txt
 if command -v fsync >/dev/null 2>&1; then fsync data/doomed.txt; fi
 mv data/control-2.bin data/renamed.bin
 rm data/doomed.txt
-drive9-test-sample pre-exit
+sample pre-exit
 
 # --- Synced exit: drain must return a success verdict with no pending items before
 #     the exit step is allowed [D-step2/D-step4] ---
-drive9-test-drain --mode require-ok --timeout 120s
+drain --mode require-ok --timeout 120s
 
 # --- Stop the client suddenly at exactly this state (SIGKILL; no extra graceful
 #     exit-sync round) [D-step3] ---
-drive9-test-kill client
+halt client
 
 # --- Remount fresh with no prior cache -> compare file by file [D-step5] ---
-drive9-test-remount --cache fresh
+remount --cache fresh
 cd "$D9_MOUNT"
-drive9-test-sample recovered
+sample recovered
 
 # --- Recovery recount (bare checks): everything confirmed this round is preserved
 #      exactly; deleted files do not resurrect [D-step5/D-check1] ---
@@ -68,8 +68,8 @@ printf 'post-d3\n' > data/next.txt
 printf 'post-d3\n' | cmp - data/next.txt
 
 # --- Verdicts ---
-drive9-test-check no-pending                                            --req 'D-step4'
-drive9-test-check manifest-equals --this @recovered --against @pre-exit \
+check no-pending                                            --req 'D-step4'
+check manifest-equals --this @recovered --against @pre-exit \
     --ignore '.sim/**'                                                  --req 'D-check1'
-drive9-test-check manifest-absent --this @recovered \
+check manifest-absent --this @recovered \
     --paths 'data/doomed.txt'                                           --req 'D-check2'

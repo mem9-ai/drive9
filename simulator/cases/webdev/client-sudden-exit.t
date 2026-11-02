@@ -25,7 +25,7 @@ export FILES
 rm -f /tmp/x5-progress.log
 
 # --- Bulk import (getting SIGKILLed mid-import is the scenario) [X5 step1] ---
-drive9-test-async --timeout 10m -- sh -c '
+async --timeout 10m -- sh -c '
 mkdir -p src
 i=0
 while [ $i -lt "$FILES" ]; do
@@ -40,18 +40,18 @@ while [ $i -lt "$FILES" ]; do
   i=$((i+1))
 done
 '
-drive9-test-hold --for 8s
+hold --for 8s
 
 # --- After 8s, SIGKILL the mounted client (sudden exit, no chance to clean up)
 #     [X5 step2] ---
-drive9-test-kill client
+halt client
 
 # --- Harvest the still-running import payload (the client is dead; the remaining
 #      iterations fail and exit immediately) ---
-drive9-test-wait --expect interrupted --timeout 60s
+await --expect interrupted --timeout 60s
 
 # --- Remount in a fresh environment with no prior cache [X5 step3] ---
-drive9-test-remount --cache fresh
+remount --cache fresh
 cd "$D9_MOUNT"
 
 # --- Fresh recount: every entry in the progress log must be present and
@@ -85,10 +85,10 @@ printf 'life goes on\n' > after-recovery.txt
 printf 'life goes on\n' | cmp - after-recovery.txt
 echo "post-kill io ok"
 
-drive9-test-sample final
-drive9-test-drain --mode require-ok --timeout 180s
+sample final
+drain --mode require-ok --timeout 180s
 
 # --- Verdicts ---
-drive9-test-check artifact-contains --artifact journal --pattern 'OK='    --req 'X5'
-drive9-test-check manifest-equals --this control --against @final \
+check artifact-contains --artifact journal --pattern 'OK='    --req 'X5'
+check manifest-equals --this control --against @final \
     --ignore '.sim/**'                                                    --req 'X5'

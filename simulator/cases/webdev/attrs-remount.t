@@ -41,7 +41,7 @@ set -eu
 mkdir -p attrs
 printf '#!/bin/sh\necho attr-exec\n' > attrs/exec.sh
 printf 'mtime pinned\n'             > attrs/timed.txt
-drive9-test-drain --mode require-ok --timeout 120s
+drain --mode require-ok --timeout 120s
 
 # ---- E-step2/check1 - set the four attribute kinds one by one and read back
 # immediately: 0755 / mtime=2020-01-01T00:00:00Z (+/-60s) / symlink / xattr
@@ -59,20 +59,20 @@ else
 fi
 m=$(stat -c %Y attrs/timed.txt)
 if [ "$m" -ge 1577836800 ] && [ "$m" -le 1577836860 ]; then
-  drive9-test-check shell --req 'E-check1' -- test "$m" -le 1577836860
+  check shell --req 'E-check1' -- test "$m" -le 1577836860
 else
   # an attribute not declared supported that was set but reads back wrong ->
   # mark unconfirmed (rc=3) and list the before/after values
   echo "MTIME-SET-NOT-EFFECTIVE set=1577836800..1577836860 got=$m"
-  drive9-test-check shell --req 'E-check1' -- sh -c 'exit 3'
+  check shell --req 'E-check1' -- sh -c 'exit 3'
 fi
 echo "attrs set + immediate readback done"
-drive9-test-sample attrs-set
+sample attrs-set
 
 # ---- E-step4 leg 1 - client restart (same cache): SIGKILL the client ->
 # remount with the original cache ----
-drive9-test-kill client
-drive9-test-remount --cache same
+halt client
+remount --cache same
 cd "$D9_MOUNT"
 
 # ---- E-step4 - per-attribute verification after the same-cache remount (a
@@ -82,12 +82,12 @@ rc=0
 [ "$(readlink attrs/exec-link)" = "../attrs/exec.sh" ] || { echo "LINK-LOST"; rc=1; }
 m=$(stat -c %Y attrs/timed.txt)
 if [ "$m" -ge 1577836800 ] && [ "$m" -le 1577836860 ]; then
-  drive9-test-check shell --req 'E-check2' -- test "$m" -le 1577836860
+  check shell --req 'E-check2' -- test "$m" -le 1577836860
 else
   # an attribute not explicitly promised to survive remotely -> mark
   # unconfirmed (rc=3), listing the before/after values
   echo "MTIME-NOT-PRESERVED set=1577836800..1577836860 got=$m"
-  drive9-test-check shell --req 'E-check2' -- sh -c 'exit 3'
+  check shell --req 'E-check2' -- sh -c 'exit 3'
 fi
 if getfattr -n user.drive9sim.test --only-values attrs/timed.txt >/dev/null 2>&1; then
   [ "$(getfattr -n user.drive9sim.test --only-values attrs/timed.txt)" = "v1" ] || { echo "XATTR-VALUE-DIFF"; rc=1; }
@@ -99,10 +99,10 @@ echo "attrs preserved after remount"
 
 # ---- E-step4 leg 2 - remount with no original cache: SIGKILL again ->
 # remount with a brand-new cache directory ----
-drive9-test-kill client
-drive9-test-remount --cache fresh
+halt client
+remount --cache fresh
 cd "$D9_MOUNT"
-drive9-test-sample fresh
+sample fresh
 
 # ---- E-step4 - per-attribute verification after the no-original-cache
 # remount (permissions / type / link target / mtime at declared precision /
@@ -112,12 +112,12 @@ rc=0
 [ "$(readlink attrs/exec-link)" = "../attrs/exec.sh" ] || { echo "LINK-LOST"; rc=1; }
 m=$(stat -c %Y attrs/timed.txt)
 if [ "$m" -ge 1577836800 ] && [ "$m" -le 1577836860 ]; then
-  drive9-test-check shell --req 'E-check2' -- test "$m" -le 1577836860
+  check shell --req 'E-check2' -- test "$m" -le 1577836860
 else
   # an attribute not explicitly promised to survive remotely -> mark
   # unconfirmed (rc=3), listing the before/after values
   echo "MTIME-NOT-PRESERVED set=1577836800..1577836860 got=$m"
-  drive9-test-check shell --req 'E-check2' -- sh -c 'exit 3'
+  check shell --req 'E-check2' -- sh -c 'exit 3'
 fi
 if getfattr -n user.drive9sim.test --only-values attrs/timed.txt >/dev/null 2>&1; then
   [ "$(getfattr -n user.drive9sim.test --only-values attrs/timed.txt)" = "v1" ] || { echo "XATTR-VALUE-DIFF"; rc=1; }
@@ -133,8 +133,8 @@ printf 'mtime pinned\n'              | cmp - attrs/timed.txt
 printf '#!/bin/sh\necho attr-exec\n' | cmp - attrs/exec.sh
 
 # ---- Verdicts: each assertion = one case entry in the statistics ----
-drive9-test-check manifest-equals --this @fresh --against @attrs-set \
+check manifest-equals --this @fresh --against @attrs-set \
     --ignore '.sim/**'                                              --req 'E-check2'
-drive9-test-check artifact-contains --artifact journal \
+check artifact-contains --artifact journal \
     --pattern 'xattr:'                                              --req 'E-evidence'
-drive9-test-check sync-ok                                           --req 'E-step3'
+check sync-ok                                           --req 'E-step3'

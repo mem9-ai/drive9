@@ -25,7 +25,7 @@
 #
 # Fault model: all four faults are declared up front as one-shot wire anchors
 # with effect=drop-response and expect=one-shot-ambiguous; each segment's
-# ambiguous step runs inside drive9-test-window --expect one-shot-ambiguous
+# ambiguous step runs inside window --expect one-shot-ambiguous
 # while its fault is armed. An unexpected failure inside a retry segment
 # aborts the script under set -e and fails the run.
 set -eu
@@ -38,13 +38,13 @@ set -eu
 
 # ---- Fault declarations: drop-response (upstream executed, success response
 # swallowed, one-shot) [C-step2] ----
-drive9-test-fault drop-write drop-response --pattern 'PUT' --count 3 \
+fault drop-write drop-response --pattern 'PUT' --count 3 \
     --expect one-shot-ambiguous
-drive9-test-fault drop-hardlink drop-response --pattern 'POST /v1/fs' --count 1 \
+fault drop-hardlink drop-response --pattern 'POST /v1/fs' --count 1 \
     --expect one-shot-ambiguous
-drive9-test-fault drop-rename drop-response --pattern 'POST /v1/fs' --count 1 \
+fault drop-rename drop-response --pattern 'POST /v1/fs' --count 1 \
     --expect one-shot-ambiguous
-drive9-test-fault drop-unlink drop-response --pattern 'DELETE' --count 1 \
+fault drop-unlink drop-response --pattern 'DELETE' --count 1 \
     --expect one-shot-ambiguous
 
 # ---- Segment 1 - write: normal control (no injection; record the normal
@@ -55,8 +55,8 @@ echo "write normal control ok"
 
 # ---- write original call: success and failure both acceptable
 # (one-shot-ambiguous); record verbatim [C-step3] ----
-drive9-test-arm drop-write
-drive9-test-window --expect one-shot-ambiguous -- sh -c '
+arm drop-write
+window --expect one-shot-ambiguous -- sh -c '
 i=0
 while [ $i -lt 8 ]; do
   k=$((i+1))
@@ -68,7 +68,7 @@ while [ $i -lt 8 ]; do
   i=$((i+1))
 done
 '
-drive9-test-disarm drop-write
+disarm drop-write
 
 # ---- Ambiguity evidence [C-step3]: no application-level retry or cleanup;
 # record the mount's actual state, path by path ----
@@ -85,7 +85,7 @@ while [ $i -lt 8 ]; do
 done
 # ---- Recovery window [C-step4]: wait out the agreed recovery time, re-check,
 # then perform the explicit retry ----
-drive9-test-hold --for 10s
+hold --for 10s
 
 # ---- write explicit retry: idempotent replay converges (files that already
 # succeeded are rewritten with identical content) [C-step4] ----
@@ -105,17 +105,17 @@ echo "write retry converged"
 
 # ---- Segment 2 - hardlink: the original ln may succeed or fail; record
 # verbatim [C-step3] ----
-drive9-test-arm drop-hardlink
-drive9-test-window --expect one-shot-ambiguous -- sh -c '
+arm drop-hardlink
+window --expect one-shot-ambiguous -- sh -c '
 if ln out/ctl.bin out/ctl.link 2>/tmp/lnerr; then
   echo "orig-hardlink ok"
 else
   echo "orig-hardlink FAILED: $(cat /tmp/lnerr)"
 fi
 '
-drive9-test-disarm drop-hardlink
+disarm drop-hardlink
 echo "post-ambiguity state hardlink: $(ls -la out/ctl.link 2>/dev/null || echo absent)"
-drive9-test-hold --for 10s
+hold --for 10s
 
 # ---- hardlink explicit retry: EEXIST is legitimate when the first call
 # already created the link (the two calls are recorded separately); the final
@@ -133,17 +133,17 @@ cmp out/ctl.link out/ctl.bin
 printf 'rename-payload\n' > out/renamesrc.bin
 
 # ---- rename original call: mv may succeed or fail; record verbatim [C-step3] ----
-drive9-test-arm drop-rename
-drive9-test-window --expect one-shot-ambiguous -- sh -c '
+arm drop-rename
+window --expect one-shot-ambiguous -- sh -c '
 if mv out/renamesrc.bin out/renamed.bin 2>/tmp/mverr; then
   echo "orig-rename ok"
 else
   echo "orig-rename FAILED: $(cat /tmp/mverr)"
 fi
 '
-drive9-test-disarm drop-rename
+disarm drop-rename
 echo "post-ambiguity state rename: src=$([ -e out/renamesrc.bin ] && echo present || echo absent) dst=$([ -e out/renamed.bin ] && echo present || echo absent)"
-drive9-test-hold --for 10s
+hold --for 10s
 
 # ---- rename explicit retry: if already moved, record it as such; the source
 # is gone and the content is correct [C-step4] ----
@@ -160,9 +160,9 @@ n=0
 while [ -e out/renamesrc.bin ] && [ $n -lt 18 ]; do n=$((n+1)); sleep 5; done
 if [ -e out/renamesrc.bin ]; then
   echo "NOT-CONVERGED: out/renamesrc.bin still present after $((n*5))s"
-  drive9-test-check shell --req 'C-step4' -- sh -c 'exit 3'
+  check shell --req 'C-step4' -- sh -c 'exit 3'
 else
-  drive9-test-check shell --req 'C-step4' -- test ! -e out/renamesrc.bin
+  check shell --req 'C-step4' -- test ! -e out/renamesrc.bin
 fi
 printf 'rename-payload\n' | cmp - out/renamed.bin
 
@@ -171,11 +171,11 @@ printf 'rename-payload\n' | cmp - out/renamed.bin
 # Precondition: doomed.bin must already be persisted remotely (otherwise rm
 # produces no DELETE and there is nothing to inject)
 printf 'unlink-me\n' > out/doomed.bin
-drive9-test-drain --mode best-effort --timeout 60s
+drain --mode best-effort --timeout 60s
 
 # ---- unlink original call: rm may succeed or fail; record verbatim [C-step3] ----
-drive9-test-arm drop-unlink
-drive9-test-window --expect one-shot-ambiguous -- sh -c '
+arm drop-unlink
+window --expect one-shot-ambiguous -- sh -c '
 if rm out/doomed.bin 2>/tmp/rmerr; then
   echo "orig-unlink ok"
 else
@@ -184,10 +184,10 @@ fi
 '
 # the server-side DELETE for unlink may be delayed until the queue flushes:
 # drain while armed so that it reaches the wire
-drive9-test-drain --mode best-effort --timeout 60s
-drive9-test-disarm drop-unlink
+drain --mode best-effort --timeout 60s
+disarm drop-unlink
 echo "post-ambiguity state unlink: doomed=$([ -e out/doomed.bin ] && echo present || echo absent)"
-drive9-test-hold --for 10s
+hold --for 10s
 
 # ---- unlink explicit retry: the first delete may already have taken effect
 # remotely; the retry reporting "not found" is interface semantics [C-step4] ----
@@ -207,11 +207,11 @@ fi
 # the retry the multiple entrypoints no longer disagree long-term and the
 # remount is consistent (carried by the remount + post-drain samples below);
 # the drain runs best-effort and is recorded, not used as a verdict.
-drive9-test-hold --for 15s
-drive9-test-drain --mode best-effort --timeout 120s
-drive9-test-hold --for 10s
-drive9-test-kill client --method kill
-drive9-test-remount --cache fresh
+hold --for 15s
+drain --mode best-effort --timeout 120s
+hold --for 10s
+halt client --method kill
+remount --cache fresh
 cd "$D9_MOUNT"
 # a fresh remount must first digest the retained entries before it is readable
 # (no public visibility guarantee -> bounded wait; on timeout record as
@@ -219,17 +219,17 @@ cd "$D9_MOUNT"
 n=0
 while ! ls out >/dev/null 2>&1 && [ $n -lt 36 ]; do n=$((n+1)); sleep 5; done
 echo "fresh-remount readable after $((n*5))s (unreadable -> sample recorded missed, check recorded unconfirmed)"
-drive9-test-sample post-drain --optional
+sample post-drain --optional
 
 # ---- Verdicts: each assertion = one case entry in the statistics ----
-drive9-test-check fault-fired --fault drop-write                              --req 'C-step2'
-drive9-test-check fault-fired --fault drop-hardlink                           --req 'C-step2'
-drive9-test-check fault-fired --fault drop-rename                             --req 'C-step2'
+check fault-fired --fault drop-write                              --req 'C-step2'
+check fault-fired --fault drop-hardlink                           --req 'C-step2'
+check fault-fired --fault drop-rename                             --req 'C-step2'
 # the unlink server-side DELETE is a product-internal delayed path that never
 # reaches the wire at runtime -> the injection cannot trigger. If the
 # injection did not fire, mark it uncovered: not a pass, and not a fake fail
 # -- record blocked.
-drive9-test-check fault-fired --fault drop-unlink --accept pass,blocked        --req 'C-step2'
-drive9-test-check manifest-absent --this @post-drain --paths 'out/doomed.bin' --req 'C-check2'
-drive9-test-check manifest-equals --this control --against @post-drain \
+check fault-fired --fault drop-unlink --accept pass,blocked        --req 'C-step2'
+check manifest-absent --this @post-drain --paths 'out/doomed.bin' --req 'C-check2'
+check manifest-equals --this control --against @post-drain \
     --ignore '.sim/**,out/doomed.bin,.d9-probe'                               --req 'C-check1'

@@ -50,7 +50,7 @@ printf 'local control below\n' > /tmp/localctl.txt
 echo "local-control: below ok"
 echo "state-below five-ops ok"
 
-drive9-test-drain --mode require-ok --timeout 120s
+drain --mode require-ok --timeout 120s
 
 # ---- Controlled fill to ~80%: write ~13MB of unsynced data through the mount
 # (no fsync; it stays in the write cache) ----
@@ -61,7 +61,7 @@ while [ $i -lt 13 ]; do
   i=$((i+1))
 done
 echo "fill-80 written=${i}MiB"
-drive9-test-hold --idle 10s
+hold --idle 10s
 
 # ---- State 2 - threshold band: a 20MiB large write -> expect ENOSPC (exactly
 # that errno); boundary small writes (1B/10B), in-place overwrite, atomic
@@ -98,7 +98,7 @@ grep -q 'ovr\|below' below.txt 2>/dev/null || head -c 3 below.txt >/dev/null || 
 echo "immediate-state checked: no fake file, no zero-byte success"
 [ $rc -eq 0 ]
 
-drive9-test-drain --mode best-effort --timeout 120s
+drain --mode best-effort --timeout 120s
 
 # ---- Fill to full (genuine exhaustion): alternate writes and probes until a
 # 1MiB probe is refused (no gaps; alternating avoids the timing window where
@@ -119,7 +119,7 @@ if head -c 1048576 /dev/zero | tr '\0' 'E' > nope.bin 2>/tmp/ex-err; then
   # a soft quota freed by async uploads is product semantics (best-effort
   # pre-check): record faithfully as unconfirmed (rc=3)
   echo "EXHAUSTED-STATE-NOT-STABLE (soft quota freed in background, exhausted state did not hold)"
-  drive9-test-check shell --req 'F-check2' -- sh -c 'exit 3'
+  check shell --req 'F-check2' -- sh -c 'exit 3'
   rc=0
 else
   grep -q "No space left" /tmp/ex-err && echo "exhausted ENOSPC as-expected" \
@@ -140,14 +140,14 @@ echo "local-control: exhausted ok (local dir still writable, drive9 refusal repo
 # Quiesce first: let the in-flight uploads of refused writes land (otherwise
 # the delete races their queued upload -> server-side revival), then explicit
 # cleanup (F-step6)
-drive9-test-drain --mode best-effort --timeout 120s
+drain --mode best-effort --timeout 120s
 rm -f fill/chunk-*.bin
 rmdir fill 2>/dev/null || true
 # leftover files from refused writes (partial writes / 0 bytes) are also in
 # explicit-cleanup scope (F-step6)
 rm -f huge.bin nope.bin
 echo "released fill files + refusal leftovers"
-drive9-test-hold --for 5s
+hold --for 5s
 
 # ---- State 4 - after release: retry the five operation classes on the same
 # mount (no client restart); record recovery conditions and elapsed time ----
@@ -164,10 +164,10 @@ echo "recovery-conditions: same-mount, no-restart, seconds=$((t1-t0))"
 
 # ---- Wrap-up: final sample -> drain -> clean-environment recheck with none
 # of the original cache [F-step5] ----
-drive9-test-sample final
-drive9-test-drain --mode require-ok --timeout 120s
-drive9-test-kill client --method kill
-drive9-test-remount --cache fresh
+sample final
+drain --mode require-ok --timeout 120s
+halt client --method kill
+remount --cache fresh
 cd "$D9_MOUNT"
 # late background uploads may revive leftover paths of refused writes:
 # re-delete explicitly, sync, and re-verify; the revival itself is recorded
@@ -175,16 +175,16 @@ cd "$D9_MOUNT"
 if [ -e huge.bin ] || [ -e nope.bin ]; then
   echo "REVIVAL-AFTER-CLEANUP: huge=$([ -e huge.bin ] && echo yes || echo no) nope=$([ -e nope.bin ] && echo yes || echo no)"
   rm -f huge.bin nope.bin
-  drive9-test-drain --mode require-ok --timeout 120s
+  drain --mode require-ok --timeout 120s
 fi
-drive9-test-sample clean-verify
+sample clean-verify
 
 # ---- Verdicts: each assertion = one case entry in the statistics ----
-drive9-test-check artifact-contains --artifact journal --pattern 'ENOSPC' --req 'F-check2'
-drive9-test-check artifact-contains --artifact journal --pattern 'local-control:' --req 'F-step4'
-drive9-test-check manifest-contains --this @clean-verify --against @final \
+check artifact-contains --artifact journal --pattern 'ENOSPC' --req 'F-check2'
+check artifact-contains --artifact journal --pattern 'local-control:' --req 'F-step4'
+check manifest-contains --this @clean-verify --against @final \
     --paths 'keep/'                                                       --req 'F-check3'
-drive9-test-check manifest-absent --this @clean-verify \
+check manifest-absent --this @clean-verify \
     --paths 'huge.bin,nope.bin,fill/'                                     --req 'F-check2'
-drive9-test-check sync-ok                                                  --req 'F-step6'
-drive9-test-check artifact-contains --artifact journal --pattern 'recovery-conditions:' --req 'F-check5'
+check sync-ok                                                  --req 'F-step6'
+check artifact-contains --artifact journal --pattern 'recovery-conditions:' --req 'F-check5'

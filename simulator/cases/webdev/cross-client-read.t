@@ -55,26 +55,26 @@ rt sh -c 'printf "observer registers early\n" > live/init.txt'
 
 # ---- observer second mount in place (before any measured write; the first
 # sample starts it and pins the baseline) ----
-drive9-test-sample observer-open --as observer
+sample observer-open --as observer
 
 # ---- Group 1 - create: the writer executes and confirms the returns ----
 rt sh -c 'printf "app v1\n" > live/src/app.js'
 rt sh -c 'head -c 65536 /dev/zero | tr "\0" "p" > live/assets/pic.bin'
 # immediate observer / remote read records (mid-run: evidence only, no verdicts)
-drive9-test-sample obs-create --as observer --optional
-drive9-test-sample rem-create --as remote
+sample obs-create --as observer --optional
+sample rem-create --as remote
 
 # ---- Group 2 - overwrite ----
 rt sh -c 'printf "app v2 only version\n" > live/src/app.js'
 printf 'app v2 only version\n' | cmp - live/src/app.js
-drive9-test-sample obs-overwrite --as observer --optional
-drive9-test-sample rem-overwrite --as remote
+sample obs-overwrite --as observer --optional
+sample rem-overwrite --as remote
 
 # ---- Group 3 - rename ----
 rt sh -c 'mv live/src/app.js live/src/index.js'
 [ ! -e live/src/app.js ] && [ -e live/src/index.js ]
-drive9-test-sample obs-rename --as observer --optional
-drive9-test-sample rem-rename --as remote
+sample obs-rename --as observer --optional
+sample rem-rename --as remote
 
 # ---- Group 4 - create then delete (after deleting the file, remove the
 # now-empty directory too: cross-entry empty-directory persistence is out of
@@ -84,30 +84,30 @@ rt sh -c 'mkdir -p live/tmp && printf "doomed\n" > live/tmp/draft.txt'
 rm live/tmp/draft.txt
 rmdir live/tmp
 [ ! -e live/tmp/draft.txt ]
-drive9-test-sample obs-delete --as observer --optional
-drive9-test-sample rem-delete --as remote
+sample obs-delete --as observer --optional
+sample rem-delete --as remote
 
 # ---- Post-drain convergence check: pin the writer's final state -> compare
 # a full remote-tree inventory against the writer's final state ----
-drive9-test-sample final
-drive9-test-drain --mode require-ok --timeout 120s
-drive9-test-sample rem-final --as remote
+sample final
+drain --mode require-ok --timeout 120s
+sample rem-final --as remote
 
 # ---- Independent reads after the writer's death: kill the writer's mount
 # daemon -> the remote goes on listing directories / reading source / reading
 # assets -> consistent with the post-drain final state [scenario11-step5] ----
-drive9-test-kill client
-drive9-test-sample rem-after-death --as remote
+halt client
+sample rem-after-death --as remote
 
 # ---- Verdicts: each assertion = one case entry in the statistics ----
 # Non-interference: the seed file the observer saw early still exists intact
 # after all write operations.
-drive9-test-check manifest-contains --this @final --against @observer-open \
+check manifest-contains --this @final --against @observer-open \
     --paths 'live/init.txt'                                        --req 'scenario11-step2'
-drive9-test-check manifest-equals --this @rem-final --against @final \
+check manifest-equals --this @rem-final --against @final \
     --ignore '.sim/**'                                             --req 'scenario11-check2'
-drive9-test-check manifest-absent --this @rem-final \
+check manifest-absent --this @rem-final \
     --paths 'live/tmp/draft.txt,live/src/app.js'                   --req 'scenario11-check2'
-drive9-test-check manifest-equals --this @rem-after-death --against @rem-final \
+check manifest-equals --this @rem-after-death --against @rem-final \
     --ignore '.sim/**'                                             --req 'scenario11-check3'
-drive9-test-check sync-ok                                          --req 'scenario11-step3'
+check sync-ok                                          --req 'scenario11-step3'

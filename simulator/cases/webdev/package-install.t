@@ -82,11 +82,11 @@ if node -e 'require("tiny")' 2>/dev/null; then echo REMOVED-PACKAGE-STILL-LOADAB
 echo "remove reflected in enumeration"
 
 # ---- scenario6-step1: final drain (T3), then re-verification through an independent entry point (T4) ----
-drive9-test-sample final
-drive9-test-drain --mode require-ok --timeout 180s
-drive9-test-sample remote-final --as remote
+sample final
+drain --mode require-ok --timeout 180s
+sample remote-final --as remote
 
 # ---- Verdicts: each assertion below is one case entry in the statistics ----
-drive9-test-check manifest-equals --this @remote-final --against @final \
+check manifest-equals --this @remote-final --against @final \
     --ignore '.sim/**,node_modules/**'                             --req 'scenario6-step2'
-drive9-test-check sync-ok                                          --req 'scenario6-step2'
+check sync-ok                                          --req 'scenario6-step2'

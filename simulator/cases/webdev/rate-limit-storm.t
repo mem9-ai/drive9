@@ -21,13 +21,13 @@ FILES=${FILES:-80}
 export FILES
 
 # --- Declare the fault: HTTP-layer throttling (429/503 + Retry-After) [X3] ---
-drive9-test-fault throttle http-limit --pattern 'PUT /v1/fs' --count 30 \
+fault throttle http-limit --pattern 'PUT /v1/fs' --count 30 \
     --hold 6s --expect may-fail-inflight
 
 # --- Bulk import inside the throttle window: errors surface explicitly and are
 #     logged one by one; the payload layer does not retry [X3] ---
-drive9-test-arm throttle
-drive9-test-window --expect may-fail-inflight --timeout 10m -- sh -c '
+arm throttle
+window --expect may-fail-inflight --timeout 10m -- sh -c '
 mkdir -p src
 i=0
 while [ $i -lt "$FILES" ]; do
@@ -42,7 +42,7 @@ while [ $i -lt "$FILES" ]; do
   i=$((i+1))
 done
 '
-drive9-test-disarm throttle
+disarm throttle
 
 # --- Once the throttle is lifted, replay explicitly: converge to the exact final
 #     state [X3] ---
@@ -72,19 +72,19 @@ while [ $i -lt $FILES ]; do
 done
 echo "tree verified after window"
 
-drive9-test-sample final
+sample final
 # Before verifying sync, wait for background task processing to finish: conflict
 #      items auto-resolved from the throttle window carry their own 60s retry
 #      window, and the wait must cover it; conflicts still present after 60s are a
 #      genuine convergence finding.
-drive9-test-hold --for 15s
-drive9-test-drain --mode best-effort --timeout 180s
+hold --for 15s
+drain --mode best-effort --timeout 180s
 
 # --- Verdicts: each assertion = one case entry in the stats ---
-drive9-test-check fault-fired --fault throttle                        --req 'X3'
+check fault-fired --fault throttle                        --req 'X3'
 # The evidence must be recognizable as HTTP-layer throttling (429/503/Retry-After),
 # not a connection-layer RST.
-drive9-test-check artifact-contains --artifact injector/proxy.jsonl \
+check artifact-contains --artifact injector/proxy.jsonl \
     --pattern '429|503|Retry-After'                                   --req 'X3'
-drive9-test-check manifest-equals --this control --against @final \
+check manifest-equals --this control --against @final \
     --ignore '.sim/**'                                                --req 'X3'

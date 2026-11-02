@@ -111,17 +111,17 @@ cp /tmp/watch-metrics.jsonl ./watch-metrics.jsonl
 echo "watch sequence complete"
 
 # --- Final-state sampling and sync confirmation [latter part of scenario3-step2] ---
-drive9-test-sample final
-drive9-test-drain --mode require-ok --timeout 120s
+sample final
+drain --mode require-ok --timeout 120s
 
 # --- Assertions: each assert is one case entry in the run statistics ---
-drive9-test-check artifact-contains --artifact journal \
+check artifact-contains --artifact journal \
     --pattern 'watch-mode:'                                          --req 'scenario3-step1'
-drive9-test-check artifact-contains --artifact journal \
+check artifact-contains --artifact journal \
     --pattern 'final-state-verified'                                 --req 'scenario3-check2'
-drive9-test-check artifact-contains --artifact journal \
+check artifact-contains --artifact journal \
     --pattern 'cross-client-notify:'                                 --req 'scenario3-check4'
-drive9-test-check metrics --metric lag.save-to-notify.p95 --budget save-to-notify \
+check metrics --metric lag.save-to-notify.p95 --budget save-to-notify \
                                                                      --req 'scenario3-check3'
-drive9-test-check manifest-equals --this control --against @final \
+check manifest-equals --this control --against @final \
     --ignore '.sim/**,watch-metrics.jsonl'                           --req 'scenario3-check2'

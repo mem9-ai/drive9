@@ -107,11 +107,11 @@ echo "deliverable copied byte-exact"
 
 # --- Final whole-tree sample + drain, then sample through the independent
 #     (remote) entry point ---
-drive9-test-sample final
-drive9-test-drain --mode require-ok --timeout 120s
-drive9-test-sample remote-final --as remote
+sample final
+drain --mode require-ok --timeout 120s
+sample remote-final --as remote
 
 # --- Assertions: each assert is one case entry in the run statistics ---
-drive9-test-check manifest-equals --this @remote-final --against @final \
+check manifest-equals --this @remote-final --against @final \
     --ignore '.sim/**,site-v*.SHA256SUMS'                          --req 'scenario10-step5'
-drive9-test-check sync-ok                                          --req 'scenario10-step5'
+check sync-ok                                          --req 'scenario10-step5'

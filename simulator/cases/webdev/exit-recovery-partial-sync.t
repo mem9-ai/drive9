@@ -24,9 +24,9 @@
 #   script does not reference control.
 #
 # Notes:
-#   - The concurrent writer runs as a drive9-test-async workload; the kill
+#   - The concurrent writer runs as a async workload; the kill
 #     targets the client, not the workload. The async payload is reaped by the
-#     drive9-test-wait at the end.
+#     await at the end.
 #   - After kill client, both the main line and the variant do
 #     remount --cache fresh and cd "$D9_MOUNT".
 #   - Any unexpected failure inside a segment aborts the script via set -e and
@@ -42,17 +42,17 @@ printf 'confirmed-1\n' > data/control-1.txt.part
 if command -v fsync >/dev/null 2>&1; then fsync data/control-1.txt.part; fi
 mv data/control-1.txt.part data/control-1.txt
 head -c 8388608 /dev/zero | tr '\0' 'B' > data/bulk-payload.bin
-drive9-test-sample pre-exit
+sample pre-exit
 
 # --- Start a drain with a 1s budget only (best-effort: started != completed,
 #     output preserved verbatim) [D2-step3] ---
-drive9-test-drain --mode best-effort --timeout 1s
+drain --mode best-effort --timeout 1s
 
 # --- SIGKILL the mounted client immediately, then remount with no prior cache [D-step3/D-step5] ---
-drive9-test-kill client
-drive9-test-remount --cache fresh
+halt client
+remount --cache fresh
 cd "$D9_MOUNT"
-drive9-test-sample recovered
+sample recovered
 
 # --- Recovery inventory: the control survives; the volatile bulk is recorded
 #     as observed, not judged [D-step5/D-check3] ---
@@ -74,7 +74,7 @@ mv data2/control.txt.part data2/control.txt
 
 # --- Continuous writes (never stops): writes are still in flight when the
 #     drain is started ---
-drive9-test-async --timeout 10m -- sh -c '
+async --timeout 10m -- sh -c '
 i=0
 while [ $i -lt 200 ]; do
   k=$((i+1))
@@ -82,9 +82,9 @@ while [ $i -lt 200 ]; do
   i=$((i+1))
 done
 '
-drive9-test-drain --mode best-effort --timeout 1s
-drive9-test-kill client
-drive9-test-remount --cache fresh
+drain --mode best-effort --timeout 1s
+halt client
+remount --cache fresh
 cd "$D9_MOUNT"
 
 # --- Variant recovery inventory: the control survives; streamed writes are
@@ -95,11 +95,11 @@ echo "variant bulk-outcome: survived-stream-count=$n"
 
 # --- Reap the still-running async write payload (no kill workload in the
 #     variant segment; reaped at the end) ---
-drive9-test-wait --expect interrupted --timeout 60s
+await --expect interrupted --timeout 60s
 
 # --- Assertions ---
-drive9-test-check manifest-contains --this @recovered --against @pre-exit \
+check manifest-contains --this @recovered --against @pre-exit \
     --paths 'data/control-1.txt'                                         --req 'D-check3'
-drive9-test-check artifact-contains --artifact sync-0.json --pattern '.' --req 'D-step4'
-drive9-test-check artifact-contains --artifact journal \
+check artifact-contains --artifact sync-0.json --pattern '.' --req 'D-step4'
+check artifact-contains --artifact journal \
     --pattern 'bulk-outcome:'                                            --req 'D-check3'

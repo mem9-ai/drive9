@@ -102,13 +102,13 @@ done
 echo "search + full read ok"
 
 # ---- Final-state sampling and sync confirmation [scenario8-step5] ----
-drive9-test-sample final
-drive9-test-drain --mode require-ok --timeout 180s
-drive9-test-sample remote-final --as remote
+sample final
+drain --mode require-ok --timeout 180s
+sample remote-final --as remote
 
 # ---- Verdicts: each assertion below is one case entry in the statistics ----
-drive9-test-check manifest-equals --this @remote-final --against @final \
+check manifest-equals --this @remote-final --against @final \
     --ignore '.git/**,.sim/**'                                       --req 'scenario8-step5'
-drive9-test-check manifest-absent --this @remote-final \
+check manifest-absent --this @remote-final \
     --paths 'tools/run.sh,styles.css,assets/img.bin'                 --req 'scenario8-check2'
-drive9-test-check sync-ok                                            --req 'scenario8-step5'
+check sync-ok                                            --req 'scenario8-step5'

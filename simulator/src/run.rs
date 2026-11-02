@@ -1,6 +1,7 @@
 // shell case engine (case-spec v2): one case = one POSIX sh script.
-// The engine mounts drive9, injects drive9-test-* commands via PATH + a unix
-// control socket, runs the script, and aggregates check verdicts into TAP.
+// The engine mounts drive9, injects the bare case commands (fault, arm,
+// check, …) via PATH + a unix control socket, runs the script, and
+// aggregates check verdicts into TAP.
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Write as _};
@@ -28,9 +29,13 @@ use crate::utils::{
 /// replay, and integrity-checked at run end from a remote vantage.
 pub const SEED_DIR: &str = "__payload__";
 
+// Reserved case-command vocabulary. Bare names are injected at the front of
+// the script PATH; two upstream names are deliberately NOT used because they
+// are POSIX shell builtins the PATH cannot override: `wait` → `await`,
+// `kill` → `halt`.
 pub const COMMANDS: &[&str] = &[
-    "fault", "arm", "disarm", "window", "async", "wait", "kill", "remount", "hold", "sample",
-    "drain", "check",
+    "fault", "arm", "disarm", "window", "async", "await", "halt", "remount", "hold", "sample",
+    "drain", "check", "latency",
 ];
 
 const RESULT_CLASSES: &[&str] = &[
@@ -134,8 +139,8 @@ pub fn run(a: RunArgs) -> Result<i32> {
         bail!("--sandbox {:?} unknown (host | firecracker)", a.sandbox);
     }
     let script = a.case.canonicalize()?;
-    if script.extension().and_then(|e| e.to_str()) != Some("test") {
-        bail!("{}: case file must end in .test", script.display());
+    if script.extension().and_then(|e| e.to_str()) != Some("t") {
+        bail!("{}: case file must end in .t", script.display());
     }
     let name = script
         .file_stem()
@@ -305,9 +310,10 @@ fn run_once(
         "127.0.0.1"
     };
 
-    // proxy fronts the server whenever the case declares faults so wire
-    // effects are possible; faultless cases connect directly
-    let proxy = if declared_faults.is_empty() {
+    // proxy fronts the server whenever the case declares faults or latency
+    // shaping so wire effects are possible; plain cases connect directly
+    let uses_latency = lint_uses_latency(script).unwrap_or(false);
+    let proxy = if declared_faults.is_empty() && !uses_latency {
         None
     } else {
         match Proxy::start_bind(&a.server, run_dir, bind_host) {
@@ -415,12 +421,12 @@ fn run_once(
         });
     }
 
-    // bindir with drive9-test-* symlinks
+    // bindir with bare-name command symlinks
     let bindir = run_dir.join("bin");
     let _ = std::fs::create_dir_all(&bindir);
     let self_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("drive9-simulator"));
     for cmd in COMMANDS {
-        let link = bindir.join(format!("drive9-test-{cmd}"));
+        let link = bindir.join(cmd);
         let _ = std::fs::remove_file(&link);
         let _ = std::os::unix::fs::symlink(&self_exe, &link);
     }
@@ -657,7 +663,7 @@ fn run_once(
     };
     let mut reasons: Vec<String> = Vec::new();
     if es.is_empty() {
-        reasons.push("no case entries recorded (script must call drive9-test-check)".into());
+        reasons.push("no case entries recorded (script must call check)".into());
     }
     for e in es.iter() {
         // aggregate over the raw verdict; --accept only annotates (spec §5.2)
@@ -798,6 +804,10 @@ fn handle_ctl(
         "fault" => {
             let mut r = runner.lock().unwrap();
             r.op_fault(&req)
+        }
+        "latency" => {
+            let mut r = runner.lock().unwrap();
+            r.op_latency(&req)
         }
         "arm" => {
             let mut r = runner.lock().unwrap();
@@ -1119,6 +1129,34 @@ impl Runner {
         }
         self.disarmed.push((name.clone(), now_ms()));
         self.journal(json!({"ts": now_ms(), "kind":"disarm", "fault": name}));
+        json!({"ok": true})
+    }
+
+    /// Route latency shaping (case command `latency`): arms/clears ambient
+    /// per-request delays on the injector proxy. Requires the proxy — the
+    /// engine starts it whenever the case uses `latency`, so a missing proxy
+    /// here is an engine failure, reported loudly.
+    pub fn op_latency(&mut self, req: &Value) -> Value {
+        let mode = req["mode"].as_str().unwrap_or("set").to_string();
+        let pattern = req["pattern"].as_str().map(|s| s.to_string());
+        let Some(proxy) = self.proxy.as_ref() else {
+            return json!({"ok": false, "error": "latency requires the injector proxy, which the engine failed to start"});
+        };
+        if mode == "clear" {
+            proxy.clear_latency(pattern.clone());
+            self.journal(json!({"ts": now_ms(), "kind":"latency", "event":"clear", "pattern": pattern}));
+            return json!({"ok": true});
+        }
+        let (lo, hi) = match (req["lo_ms"].as_u64(), req["hi_ms"].as_u64()) {
+            (Some(lo), Some(hi)) => (Duration::from_millis(lo), Duration::from_millis(hi.max(lo))),
+            _ => return json!({"ok": false, "error": "latency needs lo_ms and hi_ms"}),
+        };
+        proxy.set_latency(pattern.clone(), lo, hi);
+        self.journal(json!({
+            "ts": now_ms(), "kind":"latency", "event":"set",
+            "pattern": pattern,
+            "lo_ms": lo.as_millis() as u64, "hi_ms": hi.as_millis() as u64,
+        }));
         json!({"ok": true})
     }
 
@@ -1974,7 +2012,7 @@ fn parse_args(
     })
 }
 
-/// Entry point when argv[0] is drive9-test-<name>.
+/// Entry point when argv[0] is a bare injected command name.
 pub fn builtin_main(name: &str, args: Vec<String>) -> i32 {
     let stub = std::env::var("D9_STUB").is_ok();
     match name {
@@ -1982,14 +2020,15 @@ pub fn builtin_main(name: &str, args: Vec<String>) -> i32 {
         "arm" | "disarm" => bi_arm_disarm(name, &args),
         "window" => bi_window(&args, stub),
         "async" => bi_async(&args, stub),
-        "wait" => bi_wait(&args, stub),
-        "kill" => bi_kill(&args, stub),
+        "await" => bi_await(&args, stub),
+        "halt" => bi_halt(&args, stub),
         "remount" => bi_remount(&args, stub),
         "hold" => bi_hold(&args, stub),
         "sample" => bi_sample(&args, stub),
         "drain" => bi_drain(&args, stub),
         "check" => bi_check(&args, stub),
-        other => die(&format!("unknown drive9-test command {other:?}")),
+        "latency" => bi_latency(&args),
+        other => die(&format!("unknown case command {other:?}")),
     }
 }
 
@@ -2008,7 +2047,7 @@ fn bi_fault(args: &[String]) -> i32 {
         Err(e) => return die(&format!("fault: {e}")),
     };
     if fp.positional.len() < 2 {
-        return die("fault: usage: drive9-test-fault <name> <effect> <anchor…>");
+        return die("fault: usage: fault <name> <effect> <anchor…>");
     }
     let mut req = json!({
         "op": "fault",
@@ -2034,7 +2073,7 @@ fn bi_arm_disarm(name: &str, args: &[String]) -> i32 {
         return 0;
     }
     if args.len() != 1 {
-        return die(&format!("{name}: usage: drive9-test-{name} <fault-name>"));
+        return die(&format!("{name}: usage: {name} <fault-name>"));
     }
     let req = json!({"op": name, "name": args[0]});
     match ctl_call(&req) {
@@ -2050,7 +2089,7 @@ fn bi_window(args: &[String], stub: bool) -> i32 {
         Err(e) => return die(&format!("window: {e}")),
     };
     if fp.payload.is_empty() {
-        return die("window: usage: drive9-test-window [--expect C] [--timeout D] -- <payload…>");
+        return die("window: usage: window [--expect C] [--timeout D] -- <payload…>");
     }
     if stub {
         return exec_payload(&fp.payload);
@@ -2118,7 +2157,7 @@ fn bi_async(args: &[String], stub: bool) -> i32 {
         Err(e) => return die(&format!("async: {e}")),
     };
     if fp.payload.is_empty() {
-        return die("async: usage: drive9-test-async [--timeout D] -- <payload…>");
+        return die("async: usage: async [--timeout D] -- <payload…>");
     }
     if stub {
         // control replay: run the payload synchronously
@@ -2162,7 +2201,7 @@ fn bi_async(args: &[String], stub: bool) -> i32 {
     0
 }
 
-fn bi_wait(args: &[String], stub: bool) -> i32 {
+fn bi_await(args: &[String], stub: bool) -> i32 {
     let fp = match parse_args(args, &["expect", "timeout"], false) {
         Ok(p) => p,
         Err(e) => return die(&format!("wait: {e}")),
@@ -2224,13 +2263,13 @@ fn bi_wait(args: &[String], stub: bool) -> i32 {
     }
 }
 
-fn bi_kill(args: &[String], stub: bool) -> i32 {
+fn bi_halt(args: &[String], stub: bool) -> i32 {
     let fp = match parse_args(args, &["method"], false) {
         Ok(p) => p,
         Err(e) => return die(&format!("kill: {e}")),
     };
     if fp.positional.len() != 1 {
-        return die("kill: usage: drive9-test-kill <client|workload> [--method kill|term]");
+        return die("kill: usage: kill <client|workload> [--method kill|term]");
     }
     if stub {
         return 0;
@@ -2298,7 +2337,7 @@ fn bi_hold(args: &[String], stub: bool) -> i32 {
             Err(e) => return die(&format!("hold: {e:#}")),
         }
     }
-    die("hold: usage: drive9-test-hold --for D | --idle D")
+    die("hold: usage: hold --for D | --idle D")
 }
 
 fn bi_sample(args: &[String], stub: bool) -> i32 {
@@ -2308,7 +2347,7 @@ fn bi_sample(args: &[String], stub: bool) -> i32 {
     };
     if fp.positional.len() != 1 {
         return die(
-            "sample: usage: drive9-test-sample <name> [--as mount|observer|remote] [--optional]",
+            "sample: usage: sample <name> [--as mount|observer|remote] [--optional]",
         );
     }
     if stub {
@@ -2349,6 +2388,69 @@ fn bi_sample(args: &[String], stub: bool) -> i32 {
         return 0;
     }
     die(&format!("sample: {last_err}"))
+}
+
+/// `latency <range> [--pattern 'PUT /v1/fs']` arms an ambient per-request
+/// delay sampled uniformly from the range; `latency off [--pattern P]`
+/// clears (all profiles, or only the matching one). The range is `300ms`
+/// (fixed) or `80ms-400ms` (uniform inclusive). This is workload shaping for
+/// benchmark suites (fio/mdtest/…), not a fault: no result classes, no
+/// firing adjudication.
+fn bi_latency(args: &[String]) -> i32 {
+    if std::env::var("D9_STUB").is_ok() {
+        return 0;
+    }
+    let lp = match parse_args(args, &["pattern"], false) {
+        Ok(p) => p,
+        Err(e) => return die(&format!("latency: {e}")),
+    };
+    let pattern = lp.map.get("pattern").cloned();
+    if lp.positional.first().map(|s| s.as_str()) == Some("off") {
+        if lp.positional.len() > 1 {
+            return die("latency: usage: latency off [--pattern P]");
+        }
+        return match ctl_call(&json!({"op": "latency", "mode": "clear", "pattern": pattern})) {
+            Ok(v) if v["ok"] == json!(true) => 0,
+            Ok(v) => die(v["error"].as_str().unwrap_or("latency rejected")),
+            Err(e) => die(&format!("latency: {e:#}")),
+        };
+    }
+    let Some(range) = lp.positional.first() else {
+        return die("latency: usage: latency <300ms | 80ms-400ms> [--pattern 'PUT /v1/fs']  |  latency off [--pattern P]");
+    };
+    let (lo, hi) = match parse_ms_range(range) {
+        Ok(v) => v,
+        Err(e) => return die(&format!("latency: {e:#}")),
+    };
+    match ctl_call(&json!({
+        "op": "latency", "mode": "set", "pattern": pattern,
+        "lo_ms": lo.as_millis() as u64, "hi_ms": hi.as_millis() as u64,
+    })) {
+        Ok(v) if v["ok"] == json!(true) => 0,
+        Ok(v) => die(v["error"].as_str().unwrap_or("latency rejected")),
+        Err(e) => die(&format!("latency: {e:#}")),
+    }
+}
+
+/// Parse "300ms" → (300ms, 300ms) or "80ms-400ms" → (80ms, 400ms).
+/// Both endpoints carry a unit (ms|s|m|…), parsed by `parse_duration`.
+fn parse_ms_range(s: &str) -> Result<(Duration, Duration)> {
+    let s = s.trim();
+    let (lo_s, hi_s) = match s.split_once('-') {
+        Some((a, b)) => (a, Some(b)),
+        None => (s, None),
+    };
+    let lo = parse_duration(lo_s.trim())
+        .with_context(|| format!("latency range endpoint {lo_s:?} is not a duration"))?;
+    let hi = match hi_s {
+        Some(b) => parse_duration(b.trim())
+            .with_context(|| format!("latency range endpoint {b:?} is not a duration"))?,
+        None => lo,
+    };
+    if hi < lo {
+        bail!("latency range hi {hi:?} < lo {lo:?}");
+    }
+    Ok((lo, hi))
 }
 
 fn bi_drain(args: &[String], stub: bool) -> i32 {
@@ -2400,7 +2502,7 @@ fn bi_check(args: &[String], stub: bool) -> i32 {
         return 0;
     }
     if fp.positional.is_empty() {
-        return die("check: usage: drive9-test-check <kind> [args…] --req T");
+        return die("check: usage: check <kind> [args…] --req T");
     }
     let kind = fp.positional[0].clone();
     let mut req = json!({"op": "check", "kind": kind});
@@ -2425,7 +2527,7 @@ fn bi_check(args: &[String], stub: bool) -> i32 {
     match kind.as_str() {
         "shell" => {
             if fp.payload.is_empty() {
-                return die("check shell: usage: drive9-test-check shell -- <cmd…> --req T");
+                return die("check shell: usage: check shell -- <cmd…> --req T");
             }
             let out = Command::new(&fp.payload[0]).args(&fp.payload[1..]).output();
             let (rc, text) = match out {
@@ -2682,7 +2784,7 @@ pub fn lint_faults(path: &Path) -> Result<Vec<String>> {
         let tokens = tokenize(&line);
         if tokens
             .first()
-            .map(|x| x == "drive9-test-fault")
+            .map(|x| x == "fault")
             .unwrap_or(false)
             && tokens.len() >= 2
         {
@@ -2690,6 +2792,23 @@ pub fn lint_faults(path: &Path) -> Result<Vec<String>> {
         }
     }
     Ok(out)
+}
+
+/// Whether the case uses `latency` (the run then fronts the server with the
+/// injector proxy even when no fault is declared).
+pub fn lint_uses_latency(path: &Path) -> Result<bool> {
+    let src = std::fs::read_to_string(path)?;
+    for (_, line) in join_continuations(&src) {
+        let tokens = tokenize(&line);
+        if tokens
+            .first()
+            .map(|x| x == "latency")
+            .unwrap_or(false)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub fn lint_file(path: &Path) -> Result<Vec<String>> {
@@ -2739,34 +2858,27 @@ pub fn lint_file(path: &Path) -> Result<Vec<String>> {
         }
         let first = tokens[0].clone();
 
-        // shadowing / definitions of the reserved prefix
+        // shadowing / definitions of the reserved command vocabulary: the
+        // bare names are injected at the front of PATH, so defining a
+        // function or alias with one of these names hijacks the engine
         for tok in &tokens {
             let stripped = tok
                 .trim_start_matches("$(")
                 .trim_start_matches('{')
                 .to_string();
-            if stripped.starts_with("drive9-test-")
+            let bare = stripped.trim_end_matches('(').trim();
+            if COMMANDS.contains(&bare)
                 && (stripped.contains('(') || stripped.contains('='))
             {
-                let is_call = COMMANDS.iter().any(|c| {
-                    stripped.starts_with(&format!("drive9-test-{c} "))
-                        || stripped.trim_end_matches('(').trim() == format!("drive9-test-{c}")
-                });
-                if !is_call {
-                    errs.push(format!("line {lineno}: reserved prefix drive9-test- must not be defined or shadowed: {tok:?}"));
-                }
+                errs.push(format!(
+                    "line {lineno}: reserved command name must not be defined or shadowed: {tok:?}"
+                ));
             }
         }
-        if !first.starts_with("drive9-test-") {
+        if !COMMANDS.contains(&first.as_str()) {
             continue;
         }
-        let cmd = first.trim_start_matches("drive9-test-").to_string();
-        if !COMMANDS.contains(&cmd.as_str()) {
-            errs.push(format!(
-                "line {lineno}: unknown drive9-test command {cmd:?}"
-            ));
-            continue;
-        }
+        let cmd = first;
         let rest = &tokens[1..];
         match cmd.as_str() {
             "fault" => {
@@ -2849,35 +2961,53 @@ pub fn lint_file(path: &Path) -> Result<Vec<String>> {
                 }
                 if cmd == "async" {
                     if async_open {
-                        errs.push(format!("line {lineno}: a second async while another is live (wait/kill required between asyncs)"));
+                        errs.push(format!("line {lineno}: a second async while another is live (await/halt required between asyncs)"));
                     }
                     async_open = true;
                 }
                 let _ = payload_started;
             }
-            "wait" => {
+            "await" => {
                 async_open = false;
                 if let Some(i) = rest.iter().position(|x| x == "--expect")
                     && let Some(v) = rest.get(i + 1)
                     && !matches!(v.as_str(), "ok" | "interrupted")
                 {
                     errs.push(format!(
-                        "line {lineno}: wait --expect must be ok|interrupted"
+                        "line {lineno}: await --expect must be ok|interrupted"
                     ));
                 }
             }
-            "kill" => {
+            "halt" => {
                 if let Some(first_arg) = rest.first() {
                     if !matches!(first_arg.as_str(), "client" | "workload" | "vm") {
                         errs.push(format!(
-                            "line {lineno}: kill target must be client|workload|vm"
+                            "line {lineno}: halt target must be client|workload|vm"
                         ));
                     }
                     if first_arg == "workload" {
                         async_open = false;
                     }
                 } else {
-                    errs.push(format!("line {lineno}: kill needs a target"));
+                    errs.push(format!("line {lineno}: halt needs a target"));
+                }
+            }
+            "latency" => {
+                let mut it = rest.iter();
+                let mut prev_flag = String::new();
+                for x in it.by_ref() {
+                    if x == "--" {
+                        break;
+                    }
+                    if x.starts_with("--") {
+                        prev_flag = x.trim_start_matches('-').to_string();
+                    } else if prev_flag == "pattern" {
+                        prev_flag.clear();
+                    } else if prev_flag.is_empty() && x.contains('=') {
+                        errs.push(format!("line {lineno}: latency range must not be an assignment"));
+                    } else {
+                        prev_flag.clear();
+                    }
                 }
             }
             "hold" => {
@@ -3005,7 +3135,7 @@ pub fn lint_file(path: &Path) -> Result<Vec<String>> {
         }
     }
     if check_count == 0 {
-        errs.push("case must contain at least one drive9-test-check".into());
+        errs.push("case must contain at least one check".into());
     }
     Ok(errs)
 }
@@ -3036,7 +3166,7 @@ pub fn validate(paths: Vec<PathBuf>, trace: Option<PathBuf>) -> Result<i32> {
                 let tokens = tokenize(&line);
                 if tokens
                     .first()
-                    .map(|t| t == "drive9-test-check")
+                    .map(|t| t == "check")
                     .unwrap_or(false)
                     && let Some(i) = tokens.iter().position(|t| t == "--req")
                     && let Some(r) = tokens.get(i + 1)

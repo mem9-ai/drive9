@@ -77,13 +77,13 @@ cp /tmp/new-button modules/ui/Button.vue.new && mv modules/ui/Button.vue.new mod
 tail -c +21 <&3 > /tmp/fd-rest
 tail -c +21 /tmp/old-button > /tmp/exp-rest
 if cmp -s /tmp/fd-rest /tmp/exp-rest; then
-  drive9-test-check shell --req 'scenario7-check2' -- test -s /tmp/fd-rest
+  check shell --req 'scenario7-check2' -- test -s /tmp/fd-rest
 else
   # old-handle semantics are checked against what is declared; when no POSIX
   # handle semantics are declared, record unconfirmed (rc=3) and keep the
   # evidence
   echo "OPEN-HANDLE-AFTER-RENAME: fd-rest=$(wc -c < /tmp/fd-rest)B exp-rest=$(wc -c < /tmp/exp-rest)B"
-  drive9-test-check shell --req 'scenario7-check2' -- sh -c 'exit 3'
+  check shell --req 'scenario7-check2' -- sh -c 'exit 3'
 fi
 cat modules/ui/Button.vue > /tmp/reopen
 cmp /tmp/reopen /tmp/new-button
@@ -114,11 +114,11 @@ fi
 echo "cross-region exdev recorded, copy exact"
 
 # ---- Final-state sampling and sync confirmation [scenario7-step6] ----
-drive9-test-sample final
-drive9-test-drain --mode require-ok --timeout 120s
-drive9-test-sample remote-final --as remote
+sample final
+drain --mode require-ok --timeout 120s
+sample remote-final --as remote
 
 # ---- Verdicts: each assertion = one case entry in the statistics ----
-drive9-test-check manifest-equals --this @remote-final --against @final \
+check manifest-equals --this @remote-final --against @final \
     --ignore '.sim/**,noreplace/**'                                  --req 'scenario7-step2'
-drive9-test-check sync-ok                                            --req 'scenario7-step2'
+check sync-ok                                            --req 'scenario7-step2'

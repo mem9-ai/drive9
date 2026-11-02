@@ -141,11 +141,61 @@ struct FaultState {
     matched: u64,
 }
 
+/// Route-level latency shaping: an ambient profile (not a fault) that delays
+/// each matching request before it is forwarded upstream, sampling uniformly
+/// from [lo, hi] — the "real backend is slow" shape benchmark suites run
+/// against. No result classes, no ground-truth adjudication: latency never
+/// breaks anything, it only slows requests down.
+#[derive(Clone)]
+pub struct LatencyProfile {
+    pub pattern: Option<String>,
+    pub lo: Duration,
+    pub hi: Duration,
+}
+
+impl LatencyProfile {
+    fn matches(&self, method: &str, path: &str) -> bool {
+        match &self.pattern {
+            Some(p) => pattern_matches(p, method, path),
+            None => true,
+        }
+    }
+
+    fn sample(&self) -> Duration {
+        if self.hi <= self.lo {
+            return self.lo;
+        }
+        let span = (self.hi - self.lo).as_millis() as u64;
+        let r = next_rand_u64() % (span + 1);
+        self.lo + Duration::from_millis(r)
+    }
+}
+
+/// SplitMix64, dependency-free: seeded from the clock on first use.
+fn next_rand_u64() -> u64 {
+    use std::sync::atomic::AtomicU64;
+    static STATE: AtomicU64 = AtomicU64::new(0);
+    let mut z = STATE.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed);
+    if z == 0 {
+        let t = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x1234_5678);
+        STATE.store(t.wrapping_add(0x9E37_79B9_7F4A_7C15), Ordering::Relaxed);
+        z = t;
+    }
+    z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
 /// Firecracker sandbox callback invoked when a vm-* effect fires.
 type VmHook = Arc<dyn Fn(&str) + Send + Sync>;
 
 struct Shared {
     faults: HashMap<String, FaultState>,
+    latencies: Vec<LatencyProfile>,
     armed_log: PathBuf,
     proxy_log: PathBuf,
     vm_hook: Option<VmHook>,
@@ -171,6 +221,7 @@ impl Proxy {
         fs::create_dir_all(dir.join("injector"))?;
         let shared = Arc::new(Mutex::new(Shared {
             faults: HashMap::new(),
+            latencies: Vec::new(),
             armed_log: dir.join("injector").join("armed.jsonl"),
             proxy_log: dir.join("injector").join("proxy.jsonl"),
             vm_hook: None,
@@ -252,6 +303,54 @@ impl Proxy {
                 }
             });
         }
+    }
+
+    /// Arm a route latency profile; a profile with the same pattern replaces
+    /// the previous one. `pattern` uses the fault anchor syntax
+    /// ("METHOD" or "METHOD /path-prefix"); None applies to every request.
+    pub fn set_latency(&self, pattern: Option<String>, lo: Duration, hi: Duration) {
+        let mut sh = self.shared.lock().unwrap();
+        let log_path = sh.armed_log.clone();
+        let pat = pattern.clone().unwrap_or_else(|| "*".into());
+        sh.latencies.retain(|p| p.pattern != pattern);
+        sh.latencies.push(LatencyProfile { pattern, lo, hi });
+        drop(sh);
+        append(
+            &log_path,
+            &format!(
+                "{{\"ts\":{},\"kind\":\"latency\",\"event\":\"set\",\"pattern\":\"{}\",\"lo_ms\":{},\"hi_ms\":{}}}\n",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0),
+                pat,
+                lo.as_millis(),
+                hi.as_millis()
+            ),
+        );
+    }
+
+    /// Remove latency profiles: all of them, or only those matching `pattern`.
+    pub fn clear_latency(&self, pattern: Option<String>) {
+        let mut sh = self.shared.lock().unwrap();
+        let log_path = sh.armed_log.clone();
+        let pat = pattern.clone().unwrap_or_else(|| "*".into());
+        match &pattern {
+            Some(p) => sh.latencies.retain(|l| &l.pattern != &Some(p.clone())),
+            None => sh.latencies.clear(),
+        }
+        drop(sh);
+        append(
+            &log_path,
+            &format!(
+                "{{\"ts\":{},\"kind\":\"latency\",\"event\":\"clear\",\"pattern\":\"{}\"}}\n",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0),
+                pat
+            ),
+        );
     }
 
     pub fn disarm(&self, name: &str) {
@@ -577,6 +676,19 @@ fn handle_conn(
                 return Ok(());
             }
             _ => {
+                // ambient route latency (not a fault): sleep the sampled
+                // delay before the request reaches the upstream — the shape
+                // a slow-but-healthy backend presents to the client
+                let latency = {
+                    let s0 = sh.lock().unwrap();
+                    s0.latencies
+                        .iter()
+                        .find(|p| p.matches(&method, &path))
+                        .map(|p| p.sample())
+                };
+                if let Some(d) = latency {
+                    std::thread::sleep(d);
+                }
                 {
                     let s0 = sh.lock().unwrap();
                     append(
@@ -1092,5 +1204,97 @@ mod proxy_tests {
             String::from_utf8_lossy(&out.stderr)
         );
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ok");
+    }
+
+    #[test]
+    fn latency_profiles_delay_matching_requests_only() {
+        // upstream answers every request with an empty 200
+        let up = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let up_addr = up.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in up.incoming() {
+                let mut s = stream.unwrap();
+                std::thread::spawn(move || {
+                    let mut buf: Vec<u8> = Vec::new();
+                    let head_end = loop {
+                        if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break p;
+                        }
+                        let mut c = [0u8; 4096];
+                        let n = s.read(&mut c).unwrap();
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&c[..n]);
+                    };
+                    let head = String::from_utf8_lossy(&buf[..head_end]).to_lowercase();
+                    let cl: usize = head
+                        .find("content-length:")
+                        .and_then(|i| {
+                            head[i + 15..]
+                                .chars()
+                                .take_while(|c| c.is_ascii_digit())
+                                .collect::<String>()
+                                .parse()
+                                .ok()
+                        })
+                        .unwrap_or(0);
+                    let total = head_end + 4 + cl;
+                    while buf.len() < total {
+                        let mut c = [0u8; 4096];
+                        let n = s.read(&mut c).unwrap();
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&c[..n]);
+                    }
+                    let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                });
+            }
+        });
+        let dir = std::env::temp_dir().join("d9-proxy-test-latency");
+        let _ = std::fs::create_dir_all(&dir);
+        let proxy = Proxy::start_bind(&format!("http://{}", up_addr), &dir, "127.0.0.1").unwrap();
+
+        let get = |path: &str| {
+            let t0 = Instant::now();
+            let out = std::process::Command::new("curl")
+                .args(["-sS", "--max-time", "10", &format!("{}{}", proxy.addr, path)])
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "GET {path} through proxy failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            t0.elapsed()
+        };
+
+        // before any profile: everything is fast
+        let fast0 = get("/v1/fs/fast");
+        // arm a 200ms profile for GET /v1/fs/slow only
+        proxy.set_latency(
+            Some("GET /v1/fs/slow".into()),
+            Duration::from_millis(200),
+            Duration::from_millis(200),
+        );
+        let slow = get("/v1/fs/slow");
+        let fast = get("/v1/fs/fast");
+        // clear: slow path is fast again
+        proxy.clear_latency(Some("GET /v1/fs/slow".into()));
+        let slow2 = get("/v1/fs/slow");
+
+        assert!(
+            slow >= Duration::from_millis(180),
+            "matching request not delayed (slow={fast0:?} fast={fast:?} slow={slow:?})"
+        );
+        assert!(
+            fast < Duration::from_millis(150),
+            "non-matching request delayed (fast={fast:?})"
+        );
+        assert!(
+            slow2 < Duration::from_millis(150),
+            "cleared profile still delays (slow2={slow2:?})"
+        );
     }
 }

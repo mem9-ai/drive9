@@ -121,13 +121,13 @@ echo "scan done fail=$fail"
 [ $fail -eq 0 ]
 
 # ---- Sync confirmation and independent entry-point sampling [scenario1-step5] ----
-drive9-test-sample after-import
-drive9-test-drain --mode require-ok --timeout 180s
-drive9-test-sample remote-final --as remote
+sample after-import
+drain --mode require-ok --timeout 180s
+sample remote-final --as remote
 
 # ---- Verdicts: each assertion below is one case entry in the statistics ----
-drive9-test-check manifest-equals --this control --against @after-import \
+check manifest-equals --this control --against @after-import \
     --ignore 'by-git/.git/**,.sim/**'                                --req 'scenario1-check1'
-drive9-test-check manifest-equals --this @remote-final --against @after-import \
+check manifest-equals --this @remote-final --against @after-import \
     --ignore 'by-git/.git/**,.sim/**'                                --req 'scenario1-check4'
-drive9-test-check sync-ok                                            --req 'scenario1-step5'
+check sync-ok                                            --req 'scenario1-step5'

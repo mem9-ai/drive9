@@ -17,7 +17,7 @@ export FILES
 rm -f /tmp/x4-cancel-status
 
 # ---- Batch publish writes (being cancelled by an orchestrated SIGTERM is the scenario) [X4-step1] ----
-drive9-test-async --timeout 20m -- sh -c '
+async --timeout 20m -- sh -c '
 mkdir -p bulk
 i=0
 while [ $i -lt "$FILES" ]; do
@@ -31,11 +31,11 @@ while [ $i -lt "$FILES" ]; do
   i=$((i+1))
 done
 '
-drive9-test-hold --for 3s
+hold --for 3s
 
 # ---- After 3s, send SIGTERM to the writing process (cancellation semantics, not SIGKILL) [X4-step2] ----
-drive9-test-kill workload --method term
-drive9-test-wait --expect interrupted --timeout 60s
+halt workload --method term
+await --expect interrupted --timeout 60s
 
 # ---- Audit immediately after the cancel: everything "present" must be byte-for-byte
 #      complete; missing files are counted honestly; no zero-byte impostors [X4-step3] ----
@@ -74,10 +74,10 @@ while [ $i -lt $FILES ]; do
 done
 echo "replay converged"
 
-drive9-test-sample final
-drive9-test-drain --mode require-ok --timeout 180s
+sample final
+drain --mode require-ok --timeout 180s
 
 # ---- Verdicts ----
-drive9-test-check artifact-contains --artifact journal --pattern 'PRESENT=' --req 'X4'
-drive9-test-check manifest-equals --this control --against @final \
+check artifact-contains --artifact journal --pattern 'PRESENT=' --req 'X4'
+check manifest-equals --this control --against @final \
     --ignore '.sim/**,bulk/**/*.tmp,bulk/**/*.part'                          --req 'X4'

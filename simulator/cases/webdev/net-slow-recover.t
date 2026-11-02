@@ -28,13 +28,13 @@ FILES=${FILES:-80}
 export FILES
 
 # ---- Fault declarations (two profiles, outcomes reported separately) [X2] ----
-drive9-test-fault slow-link delay --pattern 'PUT' --count 20 \
+fault slow-link delay --pattern 'PUT' --count 20 \
     --hold 20s --expect slower-not-broken --delay 2s
-drive9-test-fault cut-variant blackhole --pattern 'PUT' --count 20 \
+fault cut-variant blackhole --pattern 'PUT' --count 20 \
     --hold 8s --expect may-fail-inflight
 
 # ---- Primary profile (slow-link): arm, then batch-import 80 files; all must succeed, only slower [X2] ----
-drive9-test-arm slow-link
+arm slow-link
 mkdir -p src
 i=0
 while [ $i -lt $FILES ]; do
@@ -45,7 +45,7 @@ while [ $i -lt $FILES ]; do
   i=$((i+1))
 done
 echo "import under slow link complete"
-drive9-test-disarm slow-link
+disarm slow-link
 
 # ---- Primary profile final-state check: compare every surviving file byte for byte [X2] ----
 i=0
@@ -57,8 +57,8 @@ done
 echo "tree verified after window"
 
 # ---- Cut variant (cut-variant): import inside the blackout window; failures may surface explicitly (may-fail-inflight) [X2] ----
-drive9-test-arm cut-variant
-drive9-test-window --expect may-fail-inflight --timeout 10m -- sh -c '
+arm cut-variant
+window --expect may-fail-inflight --timeout 10m -- sh -c '
 i=0
 while [ $i -lt "$FILES" ]; do
   k=$((i+1))
@@ -75,7 +75,7 @@ while [ $i -lt "$FILES" ]; do
   i=$((i+1))
 done
 '
-drive9-test-disarm cut-variant
+disarm cut-variant
 
 # ---- Replay the import after the window closes; it must converge [X2] ----
 mkdir -p src
@@ -103,12 +103,12 @@ printf 'life after net events\n' > after.txt
 printf 'life after net events\n' | cmp - after.txt
 echo "post-recovery io ok"
 
-drive9-test-sample final
-drive9-test-drain --mode require-ok --timeout 180s
+sample final
+drain --mode require-ok --timeout 180s
 
 # ---- Verdicts: each assertion below is one case entry in the statistics ----
-drive9-test-check fault-fired --fault slow-link                       --req 'X2'
-drive9-test-check fault-fired --fault cut-variant                     --req 'X2'
-drive9-test-check manifest-equals --this control --against @final \
+check fault-fired --fault slow-link                       --req 'X2'
+check fault-fired --fault cut-variant                     --req 'X2'
+check manifest-equals --this control --against @final \
     --ignore '.sim/**'                                                --req 'X2'
-drive9-test-check metrics --metric op.write-fsync.p95 --budget write-fsync --req 'section5-latency'
+check metrics --metric op.write-fsync.p95 --budget write-fsync --req 'section5-latency'

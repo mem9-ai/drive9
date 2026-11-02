@@ -61,8 +61,8 @@ printf 'app dirty edit\n'             > proj/case-seed/src/app.js
 printf 'doomed legacy\n'              > proj/case-seed/src/legacy.js
 mv proj/case-seed/src/util.js proj/case-seed/src/helpers.js
 rm proj/case-seed/src/legacy.js
-drive9-test-drain --mode require-ok --timeout 120s
-drive9-test-sample pre-exit
+drain --mode require-ok --timeout 120s
+sample pre-exit
 
 # ---- Leg 1 - pause then resume in place (processes not killed): SIGSTOP the
 # mount daemon -> hold -> SIGCONT (plain process control inside the script) ----
@@ -70,7 +70,7 @@ pids=$(pgrep -f 'drive9.*mount' || true)
 [ -n "$pids" ] || { echo "MOUNT-DAEMON-NOT-FOUND"; exit 1; }
 echo "$pids" | xargs kill -STOP
 echo "paused mount daemon: $pids"
-drive9-test-hold --for 3s
+hold --for 3s
 # resume: SIGCONT; the mount should keep serving afterwards
 pids=$(pgrep -f 'drive9.*mount' || true)
 [ -n "$pids" ] && echo "$pids" | xargs kill -CONT
@@ -91,8 +91,8 @@ printf 'uncommitted new feature\n'  | cmp - proj/case-seed/src/new-feature.js
 echo "tree verified bare"
 
 # ---- Leg 2 - client restart (same cache) ----
-drive9-test-kill client
-drive9-test-remount --cache same
+halt client
+remount --cache same
 cd "$D9_MOUNT"
 
 # ---- Leg 2 - bare verification (same as above) ----
@@ -106,12 +106,12 @@ echo "tree verified bare"
 # ---- Leg 3 - clean environment (no original cache); first write only one
 # new file (no old-data rebuild triggered) ----
 printf 'written after recovery\n' > proj/case-seed/src/after-recovery.js
-drive9-test-drain --mode require-ok --timeout 120s
-drive9-test-sample pre-exit-2
-drive9-test-kill client
-drive9-test-remount --cache fresh
+drain --mode require-ok --timeout 120s
+sample pre-exit-2
+halt client
+remount --cache fresh
 cd "$D9_MOUNT"
-drive9-test-sample recovered-fresh
+sample recovered-fresh
 
 # ---- Continue read/write + sync after recovery (no pending tasks affect
 # subsequent operations) [scenario12-step6] ----
@@ -119,15 +119,15 @@ printf 'next round after recovery\n' > proj/case-seed/src/next-round.js
 printf 'next round after recovery\n' | cmp - proj/case-seed/src/next-round.js
 printf 'app dirty edit\n'            | cmp - proj/case-seed/src/app.js
 echo "post-recovery readwrite ok"
-drive9-test-sample final
-drive9-test-drain --mode require-ok --timeout 120s
-drive9-test-sample remote-final --as remote
+sample final
+drain --mode require-ok --timeout 120s
+sample remote-final --as remote
 
 # ---- Verdicts: each assertion = one case entry in the statistics ----
-drive9-test-check manifest-equals --this @recovered-fresh --against @pre-exit-2 \
+check manifest-equals --this @recovered-fresh --against @pre-exit-2 \
     --ignore '.git/**,.sim/**'                                     --req 'scenario12-check1'
-drive9-test-check manifest-absent --this @recovered-fresh \
+check manifest-absent --this @recovered-fresh \
     --paths 'proj/case-seed/src/legacy.js,proj/case-seed/src/util.js'                  --req 'scenario12-check2'
-drive9-test-check manifest-contains --this @remote-final --against @final \
+check manifest-contains --this @remote-final --against @final \
     --paths 'proj/case-seed/src/after-recovery.js,proj/case-seed/src/next-round.js'    --req 'scenario12-check4'
-drive9-test-check sync-ok                                          --req 'scenario12-step6'
+check sync-ok                                          --req 'scenario12-step6'

@@ -19,29 +19,29 @@ set -eu
 #     (preparation for B-step4) ---
 mkdir -p identity
 printf 'workspace identity marker\n' > identity/marker.txt
-drive9-test-drain --mode require-ok --timeout 120s
-drive9-test-sample seeded
+drain --mode require-ok --timeout 120s
+sample seeded
 
 # --- Stop the mounted client with a clean exit ---
-drive9-test-kill client
+halt client
 
 # --- Fault: reset (immediate RST on new connections) / mount phase / hold 6s /
 #     may-fail-inflight [B-step1] ---
 #     Anchored at the moment the mount check needs remote access; it must not merely
 #     prove that some unrelated request got disconnected.
-drive9-test-fault mount-rst reset --phase mount \
+fault mount-rst reset --phase mount \
     --hold 6s --expect may-fail-inflight
-drive9-test-arm mount-rst
+arm mount-rst
 
 # --- Remount inside the fault window: must fail and leave a trace (the failure is
 #     the scenario) [B-step2/B-check1] ---
-drive9-test-window --expect may-fail-inflight --timeout 120s -- drive9-test-remount
-drive9-test-hold --for 8s
+window --expect may-fail-inflight --timeout 120s -- remount
+hold --for 8s
 
 # --- Disarm the fault, then retry with the fixed sequence until it succeeds
 #     [B-step3/B-check2] ---
-drive9-test-disarm mount-rst
-drive9-test-window --expect may-fail-inflight --timeout 300s -- drive9-test-remount
+disarm mount-rst
+window --expect may-fail-inflight --timeout 300s -- remount
 
 # --- Right after the mount succeeds, verify workspace identity + first read/write
 #     [B-step4/B-check2] ---
@@ -51,12 +51,12 @@ printf 'after a failed first mount\n' > identity/first-write.txt
 printf 'after a failed first mount\n' | cmp - identity/first-write.txt
 echo "first-io after recovery ok"
 
-drive9-test-sample recovered
+sample recovered
 
 # --- Verdicts ---
-drive9-test-check fault-fired --fault mount-rst                          --req 'B-step1'
-drive9-test-check artifact-contains --artifact mount.log \
+check fault-fired --fault mount-rst                          --req 'B-step1'
+check artifact-contains --artifact mount.log \
     --pattern 'failed|refused|unreachable|reset'                         --req 'B-check1'
-drive9-test-check manifest-contains --this @recovered --against @seeded \
+check manifest-contains --this @recovered --against @seeded \
     --paths 'identity/'                                                  --req 'B-step4'
-drive9-test-check sync-ok                                                --req 'B-step4'
+check sync-ok                                                --req 'B-step4'

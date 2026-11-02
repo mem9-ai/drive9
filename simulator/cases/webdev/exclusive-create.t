@@ -127,8 +127,8 @@ echo "exactly-one-winner rename-noreplace"
 )
 
 # ---- Final-state sampling and sync confirmation [scenario5-step5] ----
-drive9-test-sample final
-drive9-test-drain --mode require-ok --timeout 120s
+sample final
+drain --mode require-ok --timeout 120s
 
 # ---- Verdicts: each assertion = one case entry in the statistics ----
 # Entries under noreplace/ depend on whether renameat2(RENAME_NOREPLACE) is
@@ -140,5 +140,5 @@ drive9-test-drain --mode require-ok --timeout 120s
 # runs), so a cross-run manifest comparison does not apply; the in-segment
 # exactly-one-winner check plus the winner-content comparison already cover
 # the scenario 5 semantics.
-drive9-test-check manifest-equals --this control --against @final \
+check manifest-equals --this control --against @final \
     --ignore '.sim/**,noreplace/**,contended.bin,installed/**'      --req 'scenario5-step5'

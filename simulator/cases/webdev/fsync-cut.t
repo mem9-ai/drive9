@@ -41,20 +41,20 @@ while [ $i -lt 10 ]; do
   mv "settled/formal-$k.txt.part" "settled/formal-$k.txt"
   i=$((i+1))
 done
-drive9-test-sample settled
+sample settled
 
 # --- Declare and arm the fault: blackhole / from the 40th PUT / hold 8s /
 #     may-fail-inflight [A-step2] ---
-drive9-test-fault cut blackhole --pattern 'PUT' --count 40 \
+fault cut blackhole --pattern 'PUT' --count 40 \
     --hold 8s --expect may-fail-inflight
-drive9-test-arm cut
+arm cut
 
 # --- Per-file import inside the fault window [A-step2]:
 #      in-window failures are absorbed per may-fail-inflight (any explicit errno
 #      reaching the caller is legitimate);
 #      when fsync fails the rename is skipped for that file: the .part temp and the
 #      existing final file stay as they are.
-drive9-test-window --expect may-fail-inflight --timeout 10m -- sh -c '
+window --expect may-fail-inflight --timeout 10m -- sh -c '
 mkdir -p src
 i=0
 while [ $i -lt "$FILES" ]; do
@@ -76,8 +76,8 @@ while [ $i -lt "$FILES" ]; do
 done
 echo "import-cut segment ended (fault window)"
 '
-drive9-test-disarm cut
-drive9-test-hold --for 5s
+disarm cut
+hold --for 5s
 
 # --- Verify right after the cut [A-step3/A-check3]: existing final files stay
 #      intact; in-window failures must not fabricate files; afterwards temp files
@@ -110,16 +110,16 @@ leftover=$(find src settled -name '*.part' -o -name '*.tmp' 2>/dev/null | wc -l)
 echo "retry converged leftover=$leftover"
 
 # --- Late-upload check window and final-state sampling [A-step5/A-check4] ---
-drive9-test-sample final
-drive9-test-drain --mode require-ok --timeout 120s
-drive9-test-hold --for 10s
-drive9-test-sample post-drain
+sample final
+drain --mode require-ok --timeout 120s
+hold --for 10s
+sample post-drain
 
 # --- Verdicts: each assertion = one case entry in the stats ---
-drive9-test-check fault-fired --fault cut                                --req 'A-step2'
-drive9-test-check manifest-contains --this @post-drain --against @settled \
+check fault-fired --fault cut                                --req 'A-step2'
+check manifest-contains --this @post-drain --against @settled \
     --paths 'settled/'                                                   --req 'A-check4'
-drive9-test-check manifest-absent --this @post-drain --paths 'src/*.tmp' --req 'A-check4'
-drive9-test-check manifest-equals --this control --against @final \
+check manifest-absent --this @post-drain --paths 'src/*.tmp' --req 'A-check4'
+check manifest-equals --this control --against @final \
     --ignore '.sim/**,settled/'                                          --req 'A-check5'
-drive9-test-check sync-ok                                                --req 'A-check5'
+check sync-ok                                                --req 'A-check5'

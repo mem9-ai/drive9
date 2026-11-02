@@ -101,10 +101,10 @@ echo "build outputs verified"
 
 # --- Interrupted build: start with a 400ms per-file delay, then SIGTERM the build
 #      process mid-run (the interruption is the scenario itself) [scenario9-step5] ---
-drive9-test-async --timeout 10m -- sh -c 'SLOW=400 node build.js'
-drive9-test-hold --for 2s
-drive9-test-kill workload --method term
-drive9-test-wait --expect interrupted --timeout 60s
+async --timeout 10m -- sh -c 'SLOW=400 node build.js'
+hold --for 2s
+halt workload --method term
+await --expect interrupted --timeout 60s
 
 # --- After the interruption: fixed cleanup command + re-run until it converges
 #      [scenario9-step5/check4] ---
@@ -116,10 +116,10 @@ rm -rf dist
 node build.js
 echo "cleanup + rebuild converged"
 
-drive9-test-sample final
-drive9-test-drain --mode require-ok --timeout 180s
+sample final
+drain --mode require-ok --timeout 180s
 
 # --- Verdicts ---
-drive9-test-check manifest-equals --this now --against control \
+check manifest-equals --this now --against control \
     --ignore '.sim/**'                                                   --req 'scenario9-check1'
-drive9-test-check sync-ok                                                --req 'scenario9-step2'
+check sync-ok                                                --req 'scenario9-step2'
