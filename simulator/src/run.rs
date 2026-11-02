@@ -3717,11 +3717,22 @@ pub fn run_suite(a: RunSuiteArgs) -> Result<i32> {
             }
         };
         results.push((c.name.clone(), code));
-        if code != 0
-            && let Ok(tap) = std::fs::read_to_string(case_home.join("runs").join("r0").join("report.tap"))
-        {
-            for line in tap.lines().filter(|l| l.starts_with("not ok")) {
-                eprintln!("  {}: {}", c.name, line);
+        if code != 0 {
+            if let Ok(tap) = std::fs::read_to_string(case_home.join("runs").join("r0").join("report.tap")) {
+                for line in tap.lines().filter(|l| l.starts_with("not ok")) {
+                    eprintln!("  {}: {}", c.name, line);
+                }
+            }
+            for (label, file) in [
+                ("script.out", "logs/script.out"),
+                ("mount.log", "mount.log"),
+            ] {
+                if let Ok(txt) = std::fs::read_to_string(case_home.join("runs").join("r0").join(file)) {
+                    let tail: String = txt.lines().rev().take(15).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+                    if !tail.trim().is_empty() {
+                        eprintln!("  {} {}: --- tail ---\n{}", c.name, label, tail);
+                    }
+                }
             }
         }
         if a.stop_on_fail && code != 0 {

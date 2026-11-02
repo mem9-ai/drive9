@@ -90,14 +90,15 @@ jobs:
             --device /dev/fuse --cap-add SYS_ADMIN \
             -v "$PWD:/repo" -v /tmp/d9-mount-out:/out \
             -v ~/.cache/drive9-simulator:/root/.cache/drive9-simulator \
-            ubuntu:24.04 bash -ec '
+            ubuntu:24.04 bash -c '
+              set -x
               export DEBIAN_FRONTEND=noninteractive
               apt-get update -qq && apt-get install -y -qq fuse3 curl >/dev/null
               export D9_MOCK_SERVER_BIN=/repo/bin/drive9-mock-server D9_REPO=/repo
               cd /repo
+              rc=0
               timeout -k 10 1350 simulator/target/release/drive9-simulator run-suite simulator/suites.toml \
-                --tier pr-gate-mount --stack mock --bin /repo/bin/drive9 --home /out/home
-              rc=$?
+                --tier pr-gate-mount --stack mock --bin /repo/bin/drive9 --home /out/home || rc=$?
               chmod -R a+rX /out/home 2>/dev/null || true
               exit $rc
             ' || rc=$?
@@ -110,16 +111,17 @@ jobs:
             --device /dev/fuse --cap-add SYS_ADMIN \
             -v "$PWD:/repo" -v /tmp/d9-pjdf-out:/out \
             -v ~/.cache/drive9-simulator:/root/.cache/drive9-simulator \
-            ubuntu:24.04 bash -ec '
+            ubuntu:24.04 bash -c '
+              set -x
               export DEBIAN_FRONTEND=noninteractive
               apt-get update -qq && apt-get install -y -qq fuse3 curl >/dev/null
               export D9_MOCK_SERVER_BIN=/repo/bin/drive9-mock-server D9_REPO=/repo
               export D9_FSTEST_BIN=/root/.cache/drive9-simulator/fstest/main/target/release/fstest
               cd /repo
+              rc=0
               timeout -k 10 1650 simulator/target/release/drive9-simulator run \
                 simulator/cases/community/fstest-pjdfstest.t \
-                --stack mock --allow-other --bin /repo/bin/drive9 --home /out/home
-              rc=$?
+                --stack mock --allow-other --bin /repo/bin/drive9 --home /out/home || rc=$?
               chmod -R a+rX /out/home 2>/dev/null || true
               exit $rc
             ' || rc=$?
@@ -132,15 +134,16 @@ jobs:
             --device /dev/fuse --cap-add SYS_ADMIN \
             -v "$PWD:/repo" -v /tmp/d9-bench-out:/out \
             -v ~/.cache/drive9-simulator:/root/.cache/drive9-simulator \
-            ubuntu:24.04 bash -ec '
+            ubuntu:24.04 bash -c '
+              set -x
               export DEBIAN_FRONTEND=noninteractive
               apt-get update -qq && apt-get install -y -qq fuse3 curl fio >/dev/null
               export D9_MOCK_SERVER_BIN=/repo/bin/drive9-mock-server D9_REPO=/repo
               export D9_FSTEST_BIN=/root/.cache/drive9-simulator/fstest/main/target/release/fstest
               cd /repo
+              rc=0
               timeout -k 10 1650 simulator/target/release/drive9-simulator run-suite simulator/suites.toml \
-                --tier bench --stack mock --bin /repo/bin/drive9 --home /out/home
-              rc=$?
+                --tier bench --stack mock --bin /repo/bin/drive9 --home /out/home || rc=$?
               chmod -R a+rX /out/home 2>/dev/null || true
               exit $rc
             ' || rc=$?
