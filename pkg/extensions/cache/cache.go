@@ -140,7 +140,12 @@ type cachingHandle struct {
 	// replaced the image (the revision is known stale and zeroed). A
 	// checkout does not set it: its descriptors stay off the tiers.
 	revalidate bool
-	mu         sync.Mutex
+	// identityGen counts changes to the handle's identity (rev/size/path/
+	// grown, including the invalidations that zero or flag them). A
+	// revalidation stats the remote without the lock; a result that arrives
+	// after the identity moved describes an older world and is discarded.
+	identityGen uint64
+	mu          sync.Mutex
 }
 
 // New constructs the read-plane cache.
@@ -280,6 +285,7 @@ func New(opts Options) (*Cache, error) {
 					h.size = e.Size
 				}
 				h.grown = false
+				h.identityGen++
 				h.mu.Unlock()
 				return true
 			})
@@ -321,6 +327,7 @@ func (c *Cache) invalidatePathTiers(path string) {
 			h.size, h.rev = 0, 0
 			h.grown = false
 			h.revalidate = true
+			h.identityGen++
 			h.mu.Unlock()
 		}
 		return true
@@ -362,6 +369,7 @@ func (c *Cache) markUnverified() {
 				h.prefetch.Invalidate()
 			}
 			h.revalidate = true
+			h.identityGen++
 			h.mu.Unlock()
 		}
 		return true
@@ -395,6 +403,7 @@ func (c *Cache) invalidateAllTiers() {
 			h.size, h.rev = 0, 0
 			h.grown = false
 			h.revalidate = false
+			h.identityGen++
 			h.mu.Unlock()
 		}
 		return true
@@ -733,8 +742,14 @@ func (h *cachingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 	// answers: once per loss of continuity or remote change, and on every
 	// read while the stream is down (v1 revalidateReadCacheEntryIfUntrusted).
 	if h.revalidationDue() && remoteReadable() {
-		if err := h.revalidateRevision(ctx, path); err != nil {
+		pinned, err := h.revalidateRevision(ctx, path)
+		if err != nil {
 			return 0, err
+		}
+		if !pinned {
+			// The identity moved under the stat: nothing revision-keyed
+			// (prefetched blocks included) can answer this read.
+			return h.inner.Read(ctx, off, dest)
 		}
 	}
 	if h.prefetch != nil {
@@ -931,17 +946,29 @@ func (h *cachingHandle) revalidationDue() bool {
 // revision-keyed tiers serving; a different one moves the handle onto it,
 // drops the path's stale image and prefetched blocks, and clips the
 // prefetcher to the new length. The read fails closed when the stat does —
-// a read that cannot verify its revision must not answer from caches.
-func (h *cachingHandle) revalidateRevision(ctx context.Context, path string) error {
+// a read that cannot verify its revision must not answer from caches. The
+// stat runs without the handle lock: when the identity moved meanwhile (an
+// invalidation, a landed commit, a retarget), the result describes an older
+// world and is discarded — pinned=false, the handle stays flagged, and the
+// caller serves this read from the plane below.
+func (h *cachingHandle) revalidateRevision(ctx context.Context, path string) (pinned bool, err error) {
 	c := h.cache
+	h.mu.Lock()
+	gen := h.identityGen
+	h.mu.Unlock()
 	st, err := c.opts.PrefetchClient.StatCtx(ctx, c.remotePathOf(path))
 	if err != nil {
 		if client.IsNotFound(err) {
-			return fs.ErrNotFound
+			return false, fs.ErrNotFound
 		}
-		return err
+		return false, err
 	}
 	h.mu.Lock()
+	if h.identityGen != gen {
+		h.revalidate = true
+		h.mu.Unlock()
+		return false, nil
+	}
 	moved := st.Revision <= 0 || st.Revision != h.rev
 	if moved && h.prefetch != nil {
 		h.prefetch.invalidateWithSize(st.Size)
@@ -960,7 +987,7 @@ func (h *cachingHandle) revalidateRevision(ctx context.Context, path string) err
 			c.dsk.InvalidateFile(pathDiskReadCacheFileID(path))
 		}
 	}
-	return nil
+	return true, nil
 }
 
 // invalidateSiblingPrefetch drops the prefetched blocks of every OTHER open
@@ -1002,6 +1029,7 @@ func (h *cachingHandle) Write(ctx context.Context, off int64, data []byte) error
 		// 4096-byte read then returned only the open-time prefix forever.
 		h.mu.Lock()
 		h.grown = true
+		h.identityGen++
 		h.mu.Unlock()
 	}
 	return err
@@ -1061,6 +1089,7 @@ func (h *cachingHandle) SetPath(p string) {
 	h.mu.Lock()
 	old := h.path
 	h.path = p
+	h.identityGen++
 	h.mu.Unlock()
 	if old != p {
 		// The dirty mark is ownership-based and keyed by path: leaving it

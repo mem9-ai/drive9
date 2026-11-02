@@ -3,10 +3,14 @@ package cache
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/mem9-ai/drive9/internal/testbackend"
 	"github.com/mem9-ai/drive9/pkg/client"
@@ -268,5 +272,76 @@ func TestPrefetchTracksLandedSizeAcrossOldEOF(t *testing.T) {
 				t.Fatalf("byte %d = %q, want %q", off+int64(i), buf[i], exp)
 			}
 		}
+	}
+}
+
+// revalidateRevision stats the remote without the handle lock. When the
+// handle's identity moves while that stat is in flight (here a per-path
+// remote-change invalidation), the stat describes the older world: applying
+// it would re-pin the stale revision, clear the flag, and let the read admit
+// current bytes under that revision. The result is discarded, the handle
+// stays flagged, and the read is served from the plane below.
+func TestRevalidationDiscardsStatThatRacedAnIdentityChange(t *testing.T) {
+	b := testbackend.NewBackend()
+	data := bytes.Repeat([]byte("0123456789abcdef"), 1<<17) // 2 MiB
+	b.Seed("/f", data)
+	var gate atomic.Bool
+	blocked := make(chan struct{}, 1)
+	release := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead && strings.HasSuffix(r.URL.Path, "/f") && gate.Load() {
+			select {
+			case blocked <- struct{}{}:
+			default:
+			}
+			<-release
+		}
+		b.ServeHTTP(w, r)
+	}))
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	bus := fs.NewEventBus()
+	c, err := New(Options{MaxSize: 1 << 20, MaxFileSize: 1 << 20, PrefetchClient: cl, Events: bus})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch := newChain(t, ts.URL, c)
+	ctx := context.Background()
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/f", Flags: 0})
+	if err != nil || res.Handle == nil {
+		t.Fatalf("open = %v", err)
+	}
+	h := res.Handle.(*cachingHandle)
+	t.Cleanup(func() { _ = h.Release(ctx) })
+
+	bus.Emit(fs.Event{Kind: fs.EventUnverified, Path: "/"}) // flags the handle, keeps rev=1
+	gate.Store(true)
+	buf := make([]byte, 64<<10)
+	done := make(chan error, 1)
+	go func() {
+		n, err := h.Read(ctx, 0, buf)
+		if err == nil && !bytes.Equal(buf[:n], data[:n]) {
+			err = fmt.Errorf("read served wrong bytes (n=%d)", n)
+		}
+		done <- err
+	}()
+	select {
+	case <-blocked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the revalidation stat never reached the server")
+	}
+	// A remote change lands while the stat is parked: the handle's identity
+	// moves (revision zeroed, flagged, generation bumped).
+	c.invalidatePathTiers("/f")
+	gate.Store(false)
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	h.mu.Lock()
+	rev, flagged := h.rev, h.revalidate
+	h.mu.Unlock()
+	if rev != 0 || !flagged {
+		t.Fatalf("stale stat applied over the identity change: rev=%d revalidate=%v, want rev=0 and still flagged", rev, flagged)
 	}
 }
