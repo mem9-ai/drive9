@@ -77,6 +77,9 @@ pub struct RunArgs {
     pub allow_other: bool,
     pub tidbcloud_public_key: Option<String>,
     pub tidbcloud_private_key: Option<String>,
+    /// Path to the fstest binary exported to the script as D9_FSTEST_BIN
+    /// for `check fstest` (None = resolve from env/PATH at check time).
+    pub fstest: Option<String>,
     /// External workload file set handed to the case via the PAYLOAD_DIR
     /// script variable (see case-spec §4.2). None = the case's default
     /// synthetic payload generation runs.
@@ -512,6 +515,9 @@ fn run_once(
     }
     if let Some(p) = &a.payload_dir {
         cmd.env("PAYLOAD_DIR", p);
+    }
+    if let Some(f) = &a.fstest {
+        cmd.env("D9_FSTEST_BIN", f);
     }
     #[cfg(unix)]
     {
@@ -1804,6 +1810,26 @@ impl Runner {
                     format!("metric {metric:?}: engine op-granularity metrics not wired"),
                 )
             }
+            "fstest" => {
+                // verdict computed where the fstest binary ran (bi_check);
+                // the engine only records it (one case entry per expanded
+                // test/file/script, plus the summary entry)
+                match c["fstest_outcome"].as_str().unwrap_or("") {
+                    "pass" => (Outcome::Pass, String::new()),
+                    "fail" => (
+                        Outcome::Fail,
+                        c["fstest_detail"].as_str().unwrap_or("").to_string(),
+                    ),
+                    "skip" => (
+                        Outcome::Unsupported,
+                        c["fstest_detail"].as_str().unwrap_or("skipped").to_string(),
+                    ),
+                    other => (
+                        Outcome::Blocked,
+                        format!("fstest entry has no outcome ({other:?})"),
+                    ),
+                }
+            }
             "artifact-contains" => {
                 let (Some(art), Some(pat)) = (c["artifact"].as_str(), c["pattern"].as_str()) else {
                     return (
@@ -2508,7 +2534,7 @@ fn bi_check(args: &[String], stub: bool) -> i32 {
         args,
         &[
             "req", "claim", "accept", "this", "against", "ignore", "paths", "fault", "drain",
-            "metric", "budget", "artifact", "pattern",
+            "metric", "budget", "artifact", "pattern", "suite", "args",
         ],
         true,
     ) {
@@ -2597,6 +2623,111 @@ fn bi_check(args: &[String], stub: bool) -> i32 {
             if req["artifact"].is_null() || req["pattern"].is_null() {
                 return die("check artifact-contains: --artifact and --pattern are required");
             }
+        }
+        "fstest" => {
+            // run the pinned fstest binary against the mount and expand its
+            // JSON envelope into per-test case entries (files for pjdfstest,
+            // tests for ltp, scripts for git, failures for sqlite/fsx) plus
+            // one summary entry; the raw JSON is kept as a run artifact
+            let Some(suite) = fp.map.get("suite").cloned() else {
+                return die("check fstest: usage: check fstest --suite <name> [--args '…'] --req T");
+            };
+            let mount = match std::env::var("D9_MOUNT") {
+                Ok(m) => m,
+                Err(_) => return die("check fstest: D9_MOUNT not set"),
+            };
+            let bin = fstest_binary();
+            let run_dir = std::env::var("D9_RUN_DIR").unwrap_or_else(|_| ".".into());
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let json_path = std::path::Path::new(&run_dir).join(format!("fstest-{suite}-{now}.json"));
+            let extra: Vec<String> = fp
+                .map
+                .get("args")
+                .map(|a| a.split_whitespace().map(|s| s.to_string()).collect())
+                .unwrap_or_default();
+            let mut argv = vec![suite.clone()];
+            argv.extend(extra);
+            argv.push("--json".into());
+            argv.push(json_path.display().to_string());
+            argv.push(mount);
+            let out = Command::new(&bin).args(&argv).output();
+            let (rc, text) = match out {
+                Ok(o) => (
+                    o.status.code().unwrap_or(1),
+                    format!(
+                        "{}{}",
+                        String::from_utf8_lossy(&o.stderr),
+                        String::from_utf8_lossy(&o.stdout)
+                    ),
+                ),
+                Err(e) => (
+                    1,
+                    format!(
+                        "fstest binary {bin:?} not executable: {e} (set D9_FSTEST_BIN or use `drive9-simulator tools ensure-fstest`)"
+                    ),
+                ),
+            };
+            if !text.trim().is_empty() {
+                println!("{}", text.trim_end());
+            }
+            let report = std::fs::read_to_string(&json_path)
+                .ok()
+                .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+            let entries = match &report {
+                Some(v) => fstest_extract(v, &suite),
+                None => vec![FstestEntry {
+                    suffix: "report".into(),
+                    outcome: "blocked".into(),
+                    detail: format!(
+                        "no parsable fstest JSON report (rc={rc}): {}",
+                        tail_chars(&text, 400)
+                    ),
+                }],
+            };
+            let base_claim = fp.map.get("claim").cloned().unwrap_or_default();
+            let mut worst_rc = 0;
+            for e in &entries {
+                let mut creq = json!({
+                    "op": "check",
+                    "kind": "fstest",
+                    "suite": suite,
+                    "fstest_outcome": e.outcome,
+                    "fstest_detail": e.detail,
+                });
+                for k in ["req", "accept"] {
+                    if let Some(v) = fp.map.get(k) {
+                        creq[k] = if k == "accept" {
+                            json!(v.split(',').map(|x| x.trim().to_string()).collect::<Vec<_>>())
+                        } else {
+                            json!(v)
+                        };
+                    }
+                }
+                if base_claim.is_empty() {
+                    creq["claim"] = json!(format!("fstest-{}-{}", suite, e.suffix));
+                } else {
+                    creq["claim"] = json!(format!("{}-{}", base_claim, e.suffix));
+                }
+                match ctl_call(&creq) {
+                    Ok(v) if v["ok"] == json!(true) => {}
+                    Ok(v) => {
+                        worst_rc = 1;
+                        eprintln!(
+                            "check fstest: entry {} not recorded: {}",
+                            e.suffix,
+                            v["error"].as_str().unwrap_or("?")
+                        );
+                    }
+                    Err(e2) => {
+                        worst_rc = 1;
+                        eprintln!("check fstest: control channel error: {e2:#}");
+                    }
+                }
+            }
+            return worst_rc;
         }
         other => return die(&format!("check: unknown kind {other:?}")),
     }
@@ -3065,6 +3196,7 @@ pub fn lint_file(path: &Path) -> Result<Vec<String>> {
                         | "fault-fired"
                         | "metrics"
                         | "artifact-contains"
+                        | "fstest"
                 ) {
                     errs.push(format!("line {lineno}: unknown check kind {kind:?}"));
                 }
@@ -3208,4 +3340,397 @@ pub fn validate(paths: Vec<PathBuf>, trace: Option<PathBuf>) -> Result<i32> {
         }
     }
     Ok(if any_err { 1 } else { 0 })
+}
+
+// ---------------------------------------------------------------- fstest
+
+/// One expanded verdict row from a fstest JSON envelope: per failed
+/// file/test/script plus the summary row. `outcome` ∈ pass|fail|skip|blocked.
+pub struct FstestEntry {
+    pub suffix: String,
+    pub outcome: String,
+    pub detail: String,
+}
+
+fn tail_chars(s: &str, n: usize) -> String {
+    s.chars().rev().take(n).collect::<Vec<_>>().into_iter().rev().collect()
+}
+
+fn fstest_binary() -> String {
+    if let Ok(b) = std::env::var("D9_FSTEST_BIN")
+        && !b.trim().is_empty()
+    {
+        return b;
+    }
+    "fstest".into()
+}
+
+/// Expand a fstest report envelope into case entries. Layouts, per suite
+/// family (see the fstest README / src):
+/// - pjdfstest: `summary {files,tests,passed,failed,todoPassed}` + `files[]
+///   {name, tests, passed, failed, bail, timedOut, failures[]}` → one entry
+///   per failed/bailed/timed-out file + the summary
+/// - ltp: `results.summary {total,passed,failed,broken,skipped,…}` +
+///   `results.tests[] {name,result,exitCode,timedOut}` → per non-pass test
+///   (skip=TCONF → unsupported) + summary
+/// - git: per-script rows `{name,status,…}` under `tests[]`/`scripts[]` →
+///   per failed script + summary
+/// - sqlite / fsx: `failures[]` / `failure` → per failure + summary
+/// - everything else (benchmarks): summary entry only; the full JSON stays
+///   an artifact for the perf-baseline tooling
+pub fn fstest_extract(v: &Value, suite: &str) -> Vec<FstestEntry> {
+    let mut out = Vec::new();
+    let ok = v["status"].as_str() == Some("ok");
+    let mut failed_any = !ok;
+
+    // per-file granularity (pjdfstest)
+    if let Some(files) = v["files"].as_array() {
+        for f in files {
+            let name = f["name"].as_str().unwrap_or("?");
+            let failed = f["failed"].as_i64().unwrap_or(0);
+            let tests = f["tests"].as_i64().unwrap_or(0);
+            let bail = f["bail"].as_bool().unwrap_or(false);
+            let timed_out = f["timedOut"].as_bool().unwrap_or(false);
+            if failed > 0 || bail || timed_out {
+                failed_any = true;
+                let first = f["failures"]
+                    .as_array()
+                    .and_then(|a| a.first())
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("");
+                out.push(FstestEntry {
+                    suffix: name.replace('/', "_"),
+                    outcome: "fail".into(),
+                    detail: format!(
+                        "{}/{} failed{}{}: {}",
+                        failed,
+                        tests,
+                        if bail { ", BAIL OUT" } else { "" },
+                        if timed_out { ", TIMED OUT" } else { "" },
+                        tail_chars(first, 200)
+                    ),
+                });
+            }
+        }
+    }
+    // per-test granularity (ltp)
+    if let Some(tests) = v["results"]["tests"].as_array() {
+        for t in tests {
+            let name = t["name"].as_str().unwrap_or("?");
+            let result = t["result"].as_str().unwrap_or("");
+            if result == "pass" {
+                continue;
+            }
+            let (outcome, label) = match result {
+                // TCONF = 32: the environment declares a capability
+                // boundary, not a product failure
+                "skip" => ("skip", "TCONF skip"),
+                r => ("fail", r),
+            };
+            if outcome == "fail" {
+                failed_any = true;
+            }
+            out.push(FstestEntry {
+                suffix: name.to_string(),
+                outcome: outcome.into(),
+                detail: format!(
+                    "{label} exit={}{}",
+                    t["exitCode"].as_i64().unwrap_or(-1),
+                    if t["timedOut"].as_bool().unwrap_or(false) { " TIMED OUT" } else { "" }
+                ),
+            });
+        }
+    }
+    // per-script granularity (git t/): rows with name+status
+    for key in ["tests", "scripts"] {
+        if let Some(rows) = v[key].as_array() {
+            for t in rows {
+                let (Some(name), Some(status)) = (t["name"].as_str(), t["status"].as_str()) else {
+                    continue;
+                };
+                if status == "failed" || status == "error" {
+                    failed_any = true;
+                    out.push(FstestEntry {
+                        suffix: name.to_string(),
+                        outcome: "fail".into(),
+                        detail: format!(
+                            "{}",
+                            t["failures"]
+                                .as_array()
+                                .and_then(|a| a.first())
+                                .map(|f| f["detail"].clone())
+                                .unwrap_or(json!(""))
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    // failures list (sqlite) / failure string (fsx)
+    if let Some(fails) = v["failures"].as_array()
+        && !fails.is_empty()
+    {
+        failed_any = true;
+        for f in fails {
+            out.push(FstestEntry {
+                suffix: format!("failure-{}", out.len()),
+                outcome: "fail".into(),
+                detail: f.to_string(),
+            });
+        }
+    }
+    if let Some(f) = v["failure"].as_str()
+        && !f.is_empty()
+    {
+        failed_any = true;
+        out.push(FstestEntry {
+            suffix: "failure".into(),
+            outcome: "fail".into(),
+            detail: tail_chars(f, 300),
+        });
+    }
+
+    // summary entry
+    let detail = match &v["summary"] {
+        s if s.is_object() => s.to_string(),
+        _ => format!("status={}", v["status"].as_str().unwrap_or("?")),
+    };
+    out.push(FstestEntry {
+        suffix: "summary".into(),
+        outcome: if failed_any { "fail".into() } else { "pass".into() },
+        detail: tail_chars(&detail, 300),
+    });
+    let _ = suite;
+    out
+}
+
+#[cfg(test)]
+mod fstest_tests {
+    use super::*;
+
+    #[test]
+    fn extracts_pjdfstest_failures_per_file() {
+        let v = json!({
+            "suite": "pjdfstest", "status": "failed",
+            "summary": {"files": 3, "tests": 10, "passed": 8, "failed": 2},
+            "files": [
+                {"name": "chmod/01.t", "tests": 4, "passed": 4, "failed": 0, "bail": false, "timedOut": false},
+                {"name": "link/02.t", "tests": 3, "passed": 1, "failed": 2, "bail": false, "timedOut": false,
+                 "failures": ["not ok 2 - link counts"]},
+                {"name": "open/07.t", "tests": 3, "passed": 3, "failed": 0, "bail": true, "timedOut": false}
+            ]
+        });
+        let e = fstest_extract(&v, "pjdfstest");
+        let fails: Vec<&FstestEntry> = e.iter().filter(|x| x.outcome == "fail").collect();
+        assert_eq!(fails.len(), 3, "two failed files + summary");
+        assert!(e.iter().any(|x| x.suffix == "link_02.t" && x.detail.contains("link counts")));
+        assert!(e.iter().any(|x| x.suffix == "open_07.t" && x.detail.contains("BAIL")));
+        assert!(e.iter().any(|x| x.suffix == "summary" && x.outcome == "fail"));
+    }
+
+    #[test]
+    fn extracts_ltp_skip_vs_fail() {
+        let v = json!({
+            "suite": "ltp", "status": "failed",
+            "results": {"summary": {"total": 3, "passed": 1},
+                "tests": [
+                    {"name": "access01", "result": "pass", "exitCode": 0},
+                    {"name": "acct02", "result": "skip", "exitCode": 32},
+                    {"name": "chmod01", "result": "fail", "exitCode": 1, "timedOut": true}
+                ]}
+        });
+        let e = fstest_extract(&v, "ltp");
+        assert!(e.iter().any(|x| x.suffix == "acct02" && x.outcome == "skip" && x.detail.contains("TCONF")));
+        assert!(e.iter().any(|x| x.suffix == "chmod01" && x.outcome == "fail" && x.detail.contains("TIMED OUT")));
+        assert!(e.iter().any(|x| x.suffix == "summary" && x.outcome == "fail"));
+    }
+
+    #[test]
+    fn ok_report_yields_only_passing_summary() {
+        let v = json!({
+            "suite": "fsx", "status": "ok",
+            "summary": {"ops": 1000}, "opsExecuted": 1000, "finalFileSize": 65536
+        });
+        let e = fstest_extract(&v, "fsx");
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].suffix, "summary");
+        assert_eq!(e[0].outcome, "pass");
+    }
+
+    #[test]
+    fn fsx_failure_string_expands() {
+        let v = json!({"suite": "fsx", "status": "failed", "failure": "DATA MISCOMPARE at op 412"});
+        let e = fstest_extract(&v, "fsx");
+        assert!(e.iter().any(|x| x.suffix == "failure" && x.detail.contains("MISCOMPARE")));
+    }
+}
+
+// ---------------------------------------------------------------- run-suite
+
+#[derive(Clone, serde::Deserialize)]
+struct SuiteCase {
+    name: String,
+    tier: Option<String>,
+    timeout: Option<String>,
+    durability: Option<String>,
+    fstest: Option<String>,
+    #[serde(default)]
+    allow_other: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct SuiteManifest {
+    #[serde(default, rename = "case")]
+    cases: Vec<SuiteCase>,
+}
+
+pub struct RunSuiteArgs {
+    pub manifest: PathBuf,
+    pub tier: Option<String>,
+    pub server: String,
+    pub bin: String,
+    pub home: Option<PathBuf>,
+    pub fstest: Option<String>,
+    pub stop_on_fail: bool,
+}
+
+/// Batch runner: execute every manifest case whose tier matches (or all when
+/// no --tier), sequentially, reusing the single-case engine. Prints a TAP-ish
+/// summary line per case, writes <home>/suite-summary.json, exits with the
+/// worst case code.
+pub fn run_suite(a: RunSuiteArgs) -> Result<i32> {
+    let raw = std::fs::read_to_string(&a.manifest)
+        .with_context(|| format!("reading manifest {}", a.manifest.display()))?;
+    let manifest: SuiteManifest =
+        toml::from_str(&raw).context("parsing suites manifest (expected [[case]] tables)")?;
+    let cases_root = a
+        .manifest
+        .parent()
+        .map(|p| p.join("cases"))
+        .unwrap_or_else(|| PathBuf::from("cases"));
+    let selected: Vec<&SuiteCase> = manifest
+        .cases
+        .iter()
+        .filter(|c| match &a.tier {
+            Some(t) => c.tier.as_deref() == Some(t.as_str()),
+            None => true,
+        })
+        .collect();
+    if selected.is_empty() {
+        bail!("no cases selected (tier {:?})", a.tier);
+    }
+    let mut results: Vec<(String, i32)> = Vec::new();
+    for c in &selected {
+        let case_path = cases_root.join(format!("{}.t", c.name));
+        if !case_path.exists() {
+            bail!("case file missing: {}", case_path.display());
+        }
+        eprintln!("=== suite case {} ===", c.name);
+        let code = run(RunArgs {
+            case: case_path,
+            sandbox: "host".into(),
+            home: a.home.clone(),
+            server: a.server.clone(),
+            bin: a.bin.clone(),
+            repeat: 1,
+            budgets: vec![],
+            timeout: c.timeout.clone(),
+            durability: c.durability.clone().unwrap_or_else(|| "fsync".into()),
+            overlay: None,
+            write_cache_size_mb: None,
+            allow_other: c.allow_other,
+            tidbcloud_public_key: None,
+            tidbcloud_private_key: None,
+            fstest: c.fstest.clone().or_else(|| a.fstest.clone()),
+            payload_dir: None,
+            seed_dir: None,
+        })
+        .unwrap_or(1);
+        results.push((c.name.clone(), code));
+        if a.stop_on_fail && code != 0 {
+            break;
+        }
+    }
+    let worst = results.iter().map(|(_, c)| *c).max().unwrap_or(0);
+    let passed = results.iter().filter(|(_, c)| *c == 0).count();
+    for (name, code) in &results {
+        println!("{} {} (rc={})", if *code == 0 { "ok" } else { "NOT OK" }, name, code);
+    }
+    println!("# suite: {}/{} cases passed (tier {:?})", passed, results.len(), a.tier);
+    if let Some(home) = &a.home {
+        let _ = std::fs::create_dir_all(home);
+        let summary = json!({
+            "tier": a.tier,
+            "server": a.server,
+            "cases": results.iter()
+                .map(|(n, c)| json!({"name": n, "rc": c}))
+                .collect::<Vec<_>>(),
+        });
+        let _ = std::fs::write(home.join("suite-summary.json"), summary.to_string());
+    }
+    Ok(worst)
+}
+
+// ---------------------------------------------------------------- tools
+
+/// Ensure the fstest binary is resolvable: existing D9_FSTEST_BIN, PATH, or
+/// clone+build the requested git ref into the tools cache. Prints the path
+/// (and an export line when it built something). Pinning note: fstest has no
+/// tags yet — CI should pass an explicit commit sha until it versions.
+pub fn tools_ensure_fstest(git_ref: String) -> Result<i32> {
+    if let Ok(b) = std::env::var("D9_FSTEST_BIN")
+        && !b.trim().is_empty()
+    {
+        println!("D9_FSTEST_BIN already set: {b}");
+        return Ok(0);
+    }
+    if let Ok(out) = Command::new("which").arg("fstest").output()
+        && out.status.success()
+    {
+        println!(
+            "fstest on PATH: {}",
+            String::from_utf8_lossy(&out.stdout).trim()
+        );
+        return Ok(0);
+    }
+    let cache = home_cache_dir().join("fstest").join(&git_ref);
+    let binary = cache.join("target/release/fstest");
+    if binary.exists() {
+        println!("cached build: {}", binary.display());
+        println!("export D9_FSTEST_BIN={}", binary.display());
+        return Ok(0);
+    }
+    if cache.exists() {
+        std::fs::remove_dir_all(&cache).context("clearing stale fstest cache")?;
+    }
+    let url = "https://github.com/mornyx/fstest";
+    let st = Command::new("git")
+        .args(["clone", "--depth", "1", "--branch"])
+        .arg(&git_ref)
+        .arg(url)
+        .arg(&cache)
+        .status()
+        .context("spawning git clone")?;
+    if !st.success() {
+        bail!("git clone {url}@{git_ref} failed");
+    }
+    let st = Command::new("cargo")
+        .args(["build", "--release"])
+        .current_dir(&cache)
+        .status()
+        .context("spawning cargo build (needs a Rust toolchain)")?;
+    if !st.success() {
+        bail!("cargo build --release failed in {}", cache.display());
+    }
+    println!("built: {}", binary.display());
+    println!("export D9_FSTEST_BIN={}", binary.display());
+    Ok(0)
+}
+
+fn home_cache_dir() -> PathBuf {
+    std::env::var("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .unwrap_or_else(|_| PathBuf::from("/tmp"))
+        .join("drive9-simulator")
 }

@@ -15,7 +15,9 @@ Case tree (mirrors the blackbox grouping; spec: `case-spec.md` §2):
 ```
 cases/webdev/      [x] the 27 former simulator cases (.test → .t)   DONE
 cases/drive9/      [ ] ex-e2e suites (api/cli/fuse-*/git-*/extent-*/pack/…)
-cases/community/   [ ] fstest-backed suites (pjdfstest, fio, ltp, fsx, mdtest, git t/)
+cases/community/   [~] fstest-backed suites — 4 cases landed (sqlite, fsx,
+                    pjdfstest, ltp) via the new `check fstest` kind; fio/
+                    mdtest/smallfile benchmarks next (G6 perf gating)
 cases/custom/      [ ] customer benchmark scenarios (case1/case2 invariants)
 cases/juicefs/     [ ] JuiceFS-inspired deterministic workloads (fsrand, random_rw, …)
 cases/git/         [ ] upstream git t/ suites (superseded by community/git — prefer fstest git)
@@ -98,9 +100,18 @@ Delete `blackbox/` and `e2e/` only after G4 (CI cut-over) lands.
   `latency_profiles_delay_matching_requests_only`.
 - [x] case-spec.md updated (vocabulary, layout, latency primitive, rules).
 - Still open under this umbrella (needed by G1 migrations, from the earlier
-  framework-gap analysis): `fstest` check kind (per-test TAP expansion),
-  tools/deps layer, D9_SERVER/D9_API_KEY export, remount extensions,
-  metrics-kind wiring, no-mount mode, batch runner + suites manifest.
+  framework-gap analysis):
+  [x] `fstest` check kind — per-test/file/script expansion into case entries
+      (extractor + 4 unit tests; runs the pinned binary, keeps the JSON
+      report as a run artifact; ltp TCONF → unsupported)
+  [x] tools/deps layer — `tools ensure-fstest [--ensure-fstest <ref>]`
+      (PATH / D9_FSTEST_BIN / clone+build into ~/.cache; verified end-to-end:
+      cloned, built, ran sqlite against a plain dir, envelope parsed)
+  [x] batch runner — `run-suite <manifest> --tier <t>` + simulator/suites.toml
+      (pr-gate / nightly tiers seeded; suite-summary.json; worst-rc exit)
+  [ ] remount --pack/--unpack extensions, metrics-kind wiring, no-mount mode
+  [x] D9_SERVER/D9_API_KEY/D9_TENANT/D9_CLI server-channel export (landed
+      earlier on this branch)
 
 ## G4 — CI cut-over (simulator e2e replaces local-e2e.yml)
 

@@ -1,0 +1,51 @@
+# Simulator suite manifest: which cases run in which tier.
+# Run: drive9-simulator run-suite --manifest simulator/suites.toml --tier pr-gate --server …
+# Case paths resolve as simulator/cases/<name>.t.
+
+# ---- pr-gate: fast core (mock backend friendly) ----
+[[case]]
+name = "community/fstest-sqlite"
+tier = "pr-gate"
+timeout = "10m"
+
+[[case]]
+name = "community/fstest-fsx"
+tier = "pr-gate"
+timeout = "10m"
+
+[[case]]
+name = "webdev/save-then-read"
+tier = "pr-gate"
+
+[[case]]
+name = "webdev/exclusive-create"
+tier = "pr-gate"
+
+# ---- nightly: bigger / root-requiring community suites ----
+[[case]]
+name = "community/fstest-pjdfstest"
+tier = "nightly"
+timeout = "30m"
+allow_other = true
+
+[[case]]
+name = "community/fstest-ltp"
+tier = "nightly"
+timeout = "45m"
+allow_other = true
+
+[[case]]
+name = "webdev/fsync-cut"
+tier = "nightly"
+
+[[case]]
+name = "webdev/response-lost"
+tier = "nightly"
+
+[[case]]
+name = "webdev/cross-client-read"
+tier = "nightly"
+
+[[case]]
+name = "webdev/cache-threshold"
+tier = "nightly"

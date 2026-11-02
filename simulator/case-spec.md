@@ -278,7 +278,7 @@ Common fields:
 | `--claim` | ✗ | assertion semantic id; defaults to a derived `<kind>-<n>`. Key assertions SHOULD be written by hand |
 | `--accept` | ✗ | accepted verdict set, values ⊆ `pass / fail / unsupported / unconfirmed`; default `["pass"]`. Typical: `--accept pass,unsupported` (a legal record of a capability boundary). Acceptance annotates only; it never changes a verdict or the aggregation |
 
-Kind list (closed set, 9 kinds):
+Kind list (closed set, 10 kinds):
 
 | kind | args | verdict |
 |---|---|---|
@@ -291,6 +291,7 @@ Kind list (closed set, 9 kinds):
 | `fault-fired` | `--fault <name>` | injector ground truth proves the fault actually fired |
 | `metrics` | `--metric M --budget B` | journal / telemetry aggregated by `metric` (e.g. `op.write-fsync.p95`) judged against the run's named budget (`--budget <name>=<threshold>`); without the budget → unconfirmed + data |
 | `artifact-contains` | `--artifact A --pattern RE` | a named artifact (`mount.log` / `journal` / `sync-*.json` / `injector/proxy.jsonl`) matches |
+| `fstest` | `--suite S [--args '…']` | runs the pinned fstest binary (`D9_FSTEST_BIN` or PATH; see `drive9-simulator tools ensure-fstest`) as `fstest <suite> <args…> --json <run_dir artifact> $D9_MOUNT`, then expands the JSON envelope into MULTIPLE case entries: one per failed file (pjdfstest) / non-pass test (ltp; TCONF skip → unsupported) / failed script (git t/) / failure row (sqlite, fsx), plus one summary entry. The raw JSON report is kept as a run artifact for perf-baseline tooling |
 
 - Reference syntax: `R` ∈ `@<snapshot name>` / `now` (walk the mount at evaluation time) / `control` (the control run's terminal state). Manifest checks MUST pass `--this` and `--against` explicitly.
 - **Evaluation time = call time** (inline, in script order); a `@name` snapshot MUST be collected earlier in file order than the check referencing it (lint-enforced). "Before recovery" verdicts are expressed by placing the check before the recovery step. `now` requires the mount to be up; with the mount down (client killed and not remounted) the assertion records unconfirmed.
@@ -378,10 +379,13 @@ drain    [--mode require-ok|best-effort] [--timeout D]
 check    <kind> [kind args…] --req T [--claim ID] [--accept S1,S2]
                      kind: shell | manifest-equals | manifest-contains | manifest-absent
                          | sync-ok | no-pending | fault-fired | metrics | artifact-contains
+                         | fstest
 latency  <300ms | 80ms-400ms> [--pattern 'PUT /v1/fs']   |   latency off [--pattern P]
 
-run CLI  --timeout  --durability  --overlay  --write-cache-size-mb  --payload-dir   (environment knobs, never in-script)
+run CLI  --timeout  --durability  --overlay  --write-cache-size-mb  --payload-dir  --fstest   (environment knobs, never in-script)
 env      D9_MOUNT  D9_CONTROL  PAYLOAD_DIR (§4.2)  D9_SERVER  D9_API_KEY  D9_TENANT  D9_CLI (server channel; no control replay)
+         D9_FSTEST_BIN (fstest binary for `check fstest`)
+batch    drive9-simulator run-suite --manifest simulator/suites.toml --tier <pr-gate|nightly|…>
 ```
 
 (`vm` kill target = reserved, unimplemented.)

@@ -78,6 +78,35 @@ enum Commands {
         /// survival; case-spec §4.2)
         #[arg(long)]
         seed: Option<PathBuf>,
+        /// Path to the fstest binary for `check fstest` (exported to the
+        /// script as D9_FSTEST_BIN; see `drive9-simulator tools ensure-fstest`)
+        #[arg(long)]
+        fstest: Option<String>,
+    },
+    /// run a tier of cases from a manifest (batch runner)
+    RunSuite {
+        /// path to suites.toml (cases resolve as <manifest dir>/cases/<name>.t)
+        manifest: PathBuf,
+        /// only cases whose tier matches
+        #[arg(long)]
+        tier: Option<String>,
+        #[arg(long, default_value = "http://127.0.0.1:9009")]
+        server: String,
+        #[arg(long, default_value = "drive9")]
+        bin: String,
+        #[arg(long)]
+        home: Option<PathBuf>,
+        #[arg(long)]
+        fstest: Option<String>,
+        #[arg(long, default_value_t = false)]
+        stop_on_fail: bool,
+    },
+    /// test-tool dependency management
+    Tools {
+        /// ensure the fstest binary: PATH / D9_FSTEST_BIN, else clone+build
+        /// the given ref (fstest has no tags yet — CI should pin a sha)
+        #[arg(long, default_value = "main")]
+        ensure_fstest: String,
     },
     /// statically validate .t case files (lint)
     Validate {
@@ -125,6 +154,7 @@ fn main() -> Result<()> {
             tidbcloud_private_key,
             payload_dir,
             seed,
+            fstest,
         } => run::run(RunArgs {
             case,
             sandbox,
@@ -140,9 +170,28 @@ fn main() -> Result<()> {
             allow_other,
             tidbcloud_public_key,
             tidbcloud_private_key,
+            fstest,
             payload_dir,
             seed_dir: seed,
         })?,
+        Commands::RunSuite {
+            manifest,
+            tier,
+            server,
+            bin,
+            home,
+            fstest,
+            stop_on_fail,
+        } => run::run_suite(run::RunSuiteArgs {
+            manifest,
+            tier,
+            server,
+            bin,
+            home,
+            fstest,
+            stop_on_fail,
+        })?,
+        Commands::Tools { ensure_fstest } => run::tools_ensure_fstest(ensure_fstest)?,
         Commands::Validate { files, trace } => run::validate(files, trace)?,
         Commands::Workbench(a) => workbench::run(a)?,
         Commands::Agent { port } => {
