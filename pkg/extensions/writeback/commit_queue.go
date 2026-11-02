@@ -633,9 +633,10 @@ func (cq *CommitQueue) WaitPrefixTimeout(prefix string, timeout time.Duration) b
 // CancelPath marks currently queued or in-flight entries for path as canceled,
 // removes queued entries, and cleans up shadow/index state. Cancellation is
 // entry-scoped so future files that reuse the same path (for example git's
-// config.lock) are not poisoned by an old cancellation.
-func (cq *CommitQueue) CancelPath(path string) {
-	cq.cancelPath(path, false)
+// config.lock) are not poisoned by an old cancellation. It reports an error
+// only when the path's local state could not be made non-replayable.
+func (cq *CommitQueue) CancelPath(path string) error {
+	return cq.cancelPath(path, false)
 }
 
 // CancelPathPreserveLocal cancels queued or in-flight uploads for path without
@@ -643,8 +644,8 @@ func (cq *CommitQueue) CancelPath(path string) {
 // still serves the staged image: the upload must stop, but the bytes survive
 // until the last close. The WAL done marker is still journaled (the name is
 // gone) so a crash before that close cannot replay the staged frames.
-func (cq *CommitQueue) CancelPathPreserveLocal(path string) {
-	cq.cancelPath(path, true)
+func (cq *CommitQueue) CancelPathPreserveLocal(path string) error {
+	return cq.cancelPath(path, true)
 }
 
 // CancelPathIfInode cancels queued or in-flight uploads for path whose entries
@@ -1266,7 +1267,12 @@ func (cq *CommitQueue) cancelPathEntries(path string) []context.CancelFunc {
 	return cancels
 }
 
-func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) {
+// cancelPath is the shared Unlink/Rmdir cancel. It returns an error when the
+// path's local state provably stays replayable — the marker could not be
+// journaled AND the fallback cleanup could not remove the recovery source —
+// so the caller must not acknowledge a successful unlink on the assumption
+// that the void removal APIs below did their job.
+func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) error {
 	// First pass without the path lock: an in-flight upload holds that lock
 	// for its whole transfer, and aborting it here is what releases it.
 	for _, cancel := range cq.cancelPathEntries(path) {
@@ -1304,33 +1310,44 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) {
 	// unlink-of-open-file path defers the non-preserving cancel to the last
 	// close plus a remote HEAD, and a crash inside that window replayed the
 	// fsync'd frames and re-committed the unlinked file (#1065).
+	// No WAL (or nothing staged): without frames there is nothing to fence,
+	// and a journal-less queue keeps the preserve-local contract verbatim.
 	if !hadLocal || cq.journal == nil {
-		return
+		return nil
 	}
-	err := cq.journal.Append(staging.JournalEntry{
+	appendErr := cq.journal.Append(staging.JournalEntry{
 		Op:   staging.JournalUnlink,
 		Path: path,
 	})
-	if err == nil {
-		return
+	if appendErr == nil {
+		// The marker fences every frame published before it — the path
+		// cannot replay even if a removal above silently failed.
+		return nil
 	}
-	safeLogPrintf("commit queue: journal cancel marker failed for %s: %v", path, err)
-	if !preserveLocal {
-		// Best effort: the shadow/.meta are already gone, so a lost marker
-		// only means recovery re-checks a path the pending-index prune
-		// discards.
-		return
+	safeLogPrintf("commit queue: journal cancel marker failed for %s: %v", path, appendErr)
+	if preserveLocal {
+		// The retained shadow/index are safe only while the marker fences
+		// their WAL frames: without it a crash replays them. Fall back to
+		// the non-preserving cleanup — the anonymous fd loses its staged
+		// image on a failing WAL, but the unlink cannot resurrect.
+		if cq.shadows != nil {
+			cq.shadows.Remove(path)
+		}
+		if cq.index != nil {
+			cq.index.Remove(path)
+		}
 	}
-	// The retained shadow/index are safe only while the marker fences their
-	// WAL frames: without it a crash replays them. Fall back to the
-	// non-preserving cleanup — the anonymous fd loses its staged image on a
-	// failing WAL, but the unlink cannot resurrect.
-	if cq.shadows != nil {
-		cq.shadows.Remove(path)
+	// ShadowStore.Remove and PendingIndex.Remove discard their disk errors,
+	// but Has is disk-truthful (it stats when the memory index misses): a
+	// read-only or failing cache filesystem can reject the marker AND leave
+	// the durable shadow behind, and replay would then upload the deleted
+	// name after a restart. Verify instead of assuming the void removals
+	// did their job — the caller must not acknowledge the unlink when the
+	// recovery source provably survived.
+	if cq.shadows != nil && cq.shadows.Has(path) {
+		return fmt.Errorf("commit queue: unlink of %s is not crash-durable: WAL marker failed (%v) and the staged image could not be removed", path, appendErr)
 	}
-	if cq.index != nil {
-		cq.index.Remove(path)
-	}
+	return nil
 }
 
 // isEntryCanceled checks whether this specific entry was canceled by

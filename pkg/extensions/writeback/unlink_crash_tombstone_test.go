@@ -23,6 +23,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -359,7 +361,9 @@ func TestUnlinkMarkerFailureDropsPreservedState(t *testing.T) {
 	if err := s.ledger.Journal.Close(); err != nil {
 		t.Fatal(err)
 	}
-	s.wb.MarkPathUnlinked(path)
+	if err := s.wb.MarkPathUnlinked(path); err != nil {
+		t.Fatalf("marker failure with a working cleanup must not fail the unlink: %v", err)
+	}
 
 	if s.ledger.Shadow.Has(path) {
 		t.Fatal("marker failure must drop the retained shadow")
@@ -395,6 +399,63 @@ func TestUnlinkMarkerFailureDropsPreservedState(t *testing.T) {
 	if _, ok := s.backend.Node(path); ok {
 		t.Fatal("recovery re-uploaded the unlinked name")
 	}
+	if err := h.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// When the WAL cannot take the marker AND the fallback cleanup cannot remove
+// the staged image (a read-only or failing cache filesystem), the unlink must
+// be reported as failed instead of acknowledged on the assumption that the
+// void removal APIs did their job — and the anonymous marking must roll back,
+// because the durable staging now correctly describes a file that was never
+// unlinked.
+func TestUnlinkMarkerAndCleanupFailureFailsUnlink(t *testing.T) {
+	const path = "/bothdown.txt"
+	s := newUnlinkWindowStack(t, path)
+	s.hold.Store(true)
+	ctx := context.Background()
+
+	h := open(t, s.ch, path).(*bufferingHandle)
+	if err := h.Write(ctx, 0, []byte("both-down")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	s.waitPutStarted(t)
+
+	// Break the WAL, then make the shadow store unremovable: a directory
+	// without write permission rejects the retirement rename and the
+	// fallback remove alike.
+	if err := s.ledger.Journal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	shadowDir := filepath.Join(s.dir, "shadow")
+	if err := os.Chmod(shadowDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(shadowDir, 0o700) })
+
+	err := s.wb.MarkPathUnlinked(path)
+	if err == nil {
+		t.Fatal("marker + cleanup both failing must fail the unlink instead of acknowledging it")
+	}
+
+	// The recovery source provably survived — that is what the error reports.
+	if !s.ledger.Shadow.Has(path) {
+		t.Fatal("precondition: the durable shadow should still be present (Has is disk-truthful)")
+	}
+	// Rollback: the descriptor goes on serving its name, not an anonymous
+	// snapshot of a file the unlink never removed.
+	h.mu.Lock()
+	unlinked := h.unlinked
+	h.mu.Unlock()
+	if unlinked {
+		t.Fatal("a failed unlink must restore the handle to its name")
+	}
+	// The in-process upload stays canceled either way (the writer's next
+	// durability boundary re-stages from the live handle).
 	if err := h.Release(ctx); err != nil {
 		t.Fatal(err)
 	}
