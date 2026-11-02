@@ -69,6 +69,10 @@ type ExtentWritePlanBlock struct {
 	Size     int64  `json:"size"`
 	Checksum string `json:"checksum"`
 	URL      string `json:"url"`
+	// Headers are the request headers the PUT must carry verbatim: the
+	// server signs them into the URL (S3 checksum, GCS create-once
+	// precondition) or the store requires them (Azure blob type).
+	Headers map[string]string `json:"headers,omitempty"`
 	// Exists reports that the block content is already in the object store;
 	// the client skips the PUT and completes with the checksum alone.
 	Exists bool `json:"exists"`
@@ -394,18 +398,26 @@ func (c *Client) CommitExtentPatch(ctx context.Context, path string, newSize int
 	if err != nil {
 		return err
 	}
+	// Block objects are create-once: a PUT that finds the address already
+	// taken (a repeated block, an earlier interrupted attempt, a concurrent
+	// writer of the same bytes) is not a failure. Re-plan once — the server
+	// HEADs create-once stores and marks present blocks exists — and PUT only
+	// what is still missing.
+	for attempt := 0; ; attempt++ {
+		err := c.putExtentPlanBlocks(ctx, plan, dirty, blocks)
+		if err == nil {
+			break
+		}
+		c.abortUploadV2BestEffort(ctx, plan.UploadID)
+		if attempt > 0 || !isExtentBlockConflict(err) {
+			return err
+		}
+		if plan, err = c.InitiateExtentPatch(ctx, path, newSize, dirty, expectedRevision); err != nil {
+			return err
+		}
+	}
 	parts := make([]completePart, 0, len(blocks))
 	for i, b := range blocks {
-		wb := extentPlanBlockFor(plan, dirty[i])
-		if wb == nil {
-			return fmt.Errorf("extent patch plan lacks block %d/%d", dirty[i].Chunk, dirty[i].Off)
-		}
-		if !wb.Exists && wb.URL != "" {
-			if err := c.putExtentBlock(ctx, wb.URL, b.Data); err != nil {
-				c.abortUploadV2BestEffort(ctx, plan.UploadID)
-				return err
-			}
-		}
 		parts = append(parts, completePart{
 			Number: i + 1,
 			ETag:   dirty[i].Checksum,
@@ -420,6 +432,25 @@ func (c *Client) CommitExtentPatch(ctx context.Context, path string, newSize int
 	return nil
 }
 
+// putExtentPlanBlocks PUTs every block the plan does not already hold, in
+// plan order, with the headers the plan prescribes for each URL.
+func (c *Client) putExtentPlanBlocks(ctx context.Context, plan *ExtentWritePlan, dirty []ExtentDirtyBlock, blocks []ExtentBlockWrite) error {
+	for i, b := range blocks {
+		wb := extentPlanBlockFor(plan, dirty[i])
+		if wb == nil {
+			return fmt.Errorf("extent patch plan lacks block %d/%d", dirty[i].Chunk, dirty[i].Off)
+		}
+		if wb.Exists || wb.URL == "" {
+			continue
+		}
+		if err := c.putExtentBlock(ctx, wb.URL, wb.Headers, b.Data); err != nil {
+			return err
+		}
+		wb.Exists = true
+	}
+	return nil
+}
+
 func extentPlanBlockFor(plan *ExtentWritePlan, d ExtentDirtyBlock) *ExtentWritePlanBlock {
 	for i := range plan.Blocks {
 		if plan.Blocks[i].Chunk == d.Chunk && plan.Blocks[i].Off == d.Off {
@@ -429,18 +460,28 @@ func extentPlanBlockFor(plan *ExtentWritePlan, d ExtentDirtyBlock) *ExtentWriteP
 	return nil
 }
 
-// putExtentBlock PUTs one block object to its presigned URL. The URL is not
-// Range-bound and carries no signed checksum header; the body is the whole
-// block.
-func (c *Client) putExtentBlock(ctx context.Context, url string, data []byte) error {
+// putExtentBlock PUTs one whole block object to its presigned URL with the
+// headers the server prescribed for it: they are part of the signature (the
+// S3 checksum in its base64 wire form, GCS's if-generation-match: 0) or
+// required by the store (Azure's x-ms-blob-type), so the client sends
+// exactly these and nothing else that could be signed. A server that
+// prescribes none signs only the S3 flexible checksum, which the client can
+// derive from the bytes.
+func (c *Client) putExtentBlock(ctx context.Context, url string, headers map[string]string, data []byte) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(data))
 	if err != nil {
 		return err
 	}
-	// The presigned URL signs the flexible-checksum header (base64 digest,
-	// the S3 wire form); omitting it fails SigV4 on every validating store.
-	sum := sha256.Sum256(data)
-	req.Header.Set("x-amz-checksum-sha256", base64.StdEncoding.EncodeToString(sum[:]))
+	if len(headers) == 0 {
+		sum := sha256.Sum256(data)
+		req.Header.Set("x-amz-checksum-sha256", base64.StdEncoding.EncodeToString(sum[:]))
+	}
+	for k, v := range headers {
+		if isForbiddenPresignedHeader(k) {
+			continue
+		}
+		req.Header.Set(k, v)
+	}
 	req.ContentLength = int64(len(data))
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -449,9 +490,32 @@ func (c *Client) putExtentBlock(ctx context.Context, url string, data []byte) er
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
 		body := readPresignedErrorBody(resp)
-		return fmt.Errorf("extent block PUT: HTTP %d: %s", resp.StatusCode, string(body))
+		return fmt.Errorf("extent block PUT: %w", &presignedPutStatusError{Status: resp.StatusCode, Body: string(body)})
 	}
 	return nil
+}
+
+// isExtentBlockConflict reports whether a block PUT failed because the
+// create-once address is already taken rather than because the upload is
+// broken: GCS answers the signed if-generation-match: 0 precondition with
+// 412, Azure answers a Create-only SAS against an existing blob with 403
+// (AuthorizationPermissionMismatch), and an S3-compatible store may answer
+// 409. A 403 is also how an expired URL fails, which is why a conflict is
+// resolved by re-presigning rather than by guessing: the server HEADs
+// create-once stores and answers skip_upload / exists for a present object,
+// and hands back a fresh URL otherwise.
+func isExtentBlockConflict(err error) bool {
+	if errors.Is(err, errPresignExpired) {
+		return true
+	}
+	var se *presignedPutStatusError
+	if errors.As(err, &se) {
+		switch se.Status {
+		case http.StatusForbidden, http.StatusConflict, http.StatusPreconditionFailed:
+			return true
+		}
+	}
+	return false
 }
 
 // WriteExtentStreamConditional uploads a whole file as an extent sequential
@@ -505,7 +569,23 @@ func (c *Client) uploadExtentSequential(ctx context.Context, plan *uploadPlanV2,
 				return derr
 			}
 			if _, err := c.uploadOnePartV2(ctx, p.part, data); err != nil {
-				return err
+				if !isExtentBlockConflict(err) {
+					return err
+				}
+				// The create-once address is already taken — this file
+				// repeats the block, an interrupted earlier session landed
+				// it, or a concurrent writer did — or the URL expired.
+				// Re-presign this part: the server answers skip_upload when
+				// the object is present and a fresh URL otherwise.
+				fresh, perr := c.presignExtentBatch(ctx, plan, ra, size, p.number, p.number)
+				if perr != nil {
+					return perr
+				}
+				if !fresh[0].skipUpload {
+					if _, err := c.uploadOnePartV2(ctx, fresh[0].part, data); err != nil {
+						return err
+					}
+				}
 			}
 			if progress != nil {
 				progress(p.number, plan.TotalParts, int64(len(data)))

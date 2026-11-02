@@ -1316,10 +1316,22 @@ func (c *Client) uploadOnePartV2(ctx context.Context, part presignedPart, data [
 	}
 	if resp.StatusCode >= 300 {
 		body := readPresignedErrorBody(resp)
-		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+		return "", &presignedPutStatusError{Status: resp.StatusCode, Body: string(body)}
 	}
 
 	return resp.Header.Get("ETag"), nil
+}
+
+// presignedPutStatusError is a non-2xx answer to a presigned PUT, keeping
+// the status so callers can tell a create-once conflict (409/412 on an
+// extent block address that is already taken) from a broken upload.
+type presignedPutStatusError struct {
+	Status int
+	Body   string
+}
+
+func (e *presignedPutStatusError) Error() string {
+	return fmt.Sprintf("HTTP %d: %s", e.Status, e.Body)
 }
 
 // presignOnePart fetches a fresh presigned URL for a single part via
