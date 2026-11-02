@@ -39,20 +39,16 @@ Delete `blackbox/` and `e2e/` only after G4 (CI cut-over) lands.
 
 ## G2 — Server API spec + embedded mock backend
 
-1. [~] `drive9-server-api-spec.md` — full production-backend contract.
-   Source material (inventory done):
-   - tidbcloud/fs has machine-generated OpenAPI 3.0.3 (`make swagger`):
-     `docs/api/data-plane.openapi.json` (74 paths/92 schemas) + two control-plane
-     variants — use as the skeleton, then extract code-only details:
-     per-handler error branches, limit constants (maxBatchStatPaths=256,
-     MaxPresignBatch=500, MaxDescriptionLen=2000 …), scoped-token route
-     whitelist matrix, X-Dat9-* header encodings (base64url path encoding,
-     X-Dat9-Part-Checksums), SSE heartbeat/reset semantics, control-plane
-     stable error codes (control_plane_error.go), quota/provision contract.
-   - `/v1/extent/meta` (32-op JuiceFS protocol) + `/v1/data-credential` are
-     implemented in THIS repo (pkg/server/extent_meta.go, pkg/datastore/jfs_meta.go),
-     not tidbcloud/fs (whose v2 design drops them) — spec must cover the
-     mem9-ai v1 protocol and mark the v2 divergence.
+1. [x] `drive9-server-api-spec.md` — DONE (`simulator/drive9-server-api-spec.md`).
+   Provenance-tagged ([prod]=tidbcloud/fs, [v1]=this repo, [both]); covers
+   conventions/auth, lifecycle, fs domain (per-selector params/headers/errors),
+   batch limits, uploads V1/V2 + presign rules, extent v1 protocol (op registry
+   + credential branches + errno conventions), /v1/sql, SSE, journals,
+   git-workspaces, layers, object-credentials, quota, tokens, vault,
+   runtime/exec, control plane, error model (envelopes + status table +
+   stable codes + errno), limits table, and mock-server tiering (§21).
+   Refresh inputs if contract code changes: tidbcloud/fs openapi_registry.go +
+   this repo's extent_meta.go/jfs_meta.go/server.go.
 2. [ ] Embedded mock server in the simulator:
    - Go program (reuses pkg/client types + pkg/pathutil; NOT a Rust reimpl —
      contract source of truth is Go) exposed as a stack flavor.
