@@ -132,7 +132,21 @@ Delete `blackbox/` and `e2e/` only after G4 (CI cut-over) lands.
   → no-skip pjdfstest gate (sudo) → artifacts on failure. local-e2e.yml stays
   until the simulator gate is proven green on Linux (first PR run), then
   retires step by step.
-- [ ] First green Linux run of the workflow; fix platform fallout.
+- [x] PR #1071: first Linux runs. Fallout fixed across 5 iterations: gspt
+  build tags (make build-cli carries GO_TAGS), run-suite shared-home wipe +
+  swallowed errors, missing fuse3 apt, mock batch-stat 501 → empty success,
+  tier split (pr-gate = no-mount only) + GNU `timeout -k` guards.
+- [x] **pr-gate tier GREEN on Linux CI** (build + fstest + api-fs + cli-fs).
+- [ ] OPEN BLOCKER — pr-gate-mount wedges the runner: a FUSE daemon enters
+  uninterruptible D-state against the mock backend; immune to step timeout,
+  `timeout -k` (it blocks reaping an unkillable child), job timeout AND
+  cancellation (two runs had to be abandoned). Repro/debug next: docker with
+  `--device /dev/fuse --cap-add SYS_ADMIN` running engine+mock+mount with
+  strace; prime suspects: mount-daemon startup path against the mock —
+  /v1/events SSE route missing (404 retry loop?), further batch/initial-sync
+  dependencies, or a daemon-side deadlock on a never-answered request.
+  The wedge must be PREVENTED (serve what startup needs / bound the daemon),
+  not out-killed.
 - [ ] TAP → e2e-aggregate adapter (Feishu/signature plumbing) at cutover.
 
 ## G5 — Daily real-backend action + release gate
