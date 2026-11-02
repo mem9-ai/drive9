@@ -137,16 +137,29 @@ Delete `blackbox/` and `e2e/` only after G4 (CI cut-over) lands.
   swallowed errors, missing fuse3 apt, mock batch-stat 501 → empty success,
   tier split (pr-gate = no-mount only) + GNU `timeout -k` guards.
 - [x] **pr-gate tier GREEN on Linux CI** (build + fstest + api-fs + cli-fs).
-- [ ] OPEN BLOCKER — pr-gate-mount wedges the runner: a FUSE daemon enters
-  uninterruptible D-state against the mock backend; immune to step timeout,
-  `timeout -k` (it blocks reaping an unkillable child), job timeout AND
-  cancellation (two runs had to be abandoned). Repro/debug next: docker with
-  `--device /dev/fuse --cap-add SYS_ADMIN` running engine+mock+mount with
-  strace; prime suspects: mount-daemon startup path against the mock —
-  /v1/events SSE route missing (404 retry loop?), further batch/initial-sync
-  dependencies, or a daemon-side deadlock on a never-answered request.
-  The wedge must be PREVENTED (serve what startup needs / bound the daemon),
-  not out-killed.
+- [x] WEDGE RESOLVED: the runner hang was environmental, not product —
+  FUSE mounts inside containers on GH runners need `--privileged`
+  (`--cap-add SYS_ADMIN` + `seccomp=unconfined` still got fusermount EPERM;
+  Docker Desktop's permissive defaults masked this locally). All FUSE tiers
+  (mount/pjdfstest/bench) now run inside privileged, bounded containers:
+  artifacts volume-mounted out, outer `timeout -k`, `docker kill` fallback.
+  Runs complete normally; per-case diagnostics (TAP not-ok lines +
+  script.out/mount.log tails) echo into the step log. The original "wedge"
+  theory (D-state daemon) was disproven by local docker repro — mock+mount
+  startup, file IO, SQLite WAL+mmap+concurrency and the full engine all
+  passed locally; the mock's new request access log made that conclusive.
+- [ ] Remaining pr-gate-mount failures are SUBSTANTIVE (run 41533971193,
+  all diagnostics in artifacts):
+  - fstest-sqlite: mptest scripts report "broken (0 errors out of 0 tests)"
+    — clients fail to start on the mount (investigate: noexec? mptest
+    coordinator cwd?);
+  - fstest-fsx + drain: `drain did not reach ok` (sync-0.json) on several
+    cases — inspect what `drive9 mount drain --json` reports against the
+    mock (likely a drain dependency the mock 501s or misreports);
+  - juicefs/cache-consistency: observer vantage misses visible/visible.txt —
+    cross-mount visibility against the mock (second mount's list/read path);
+  - webdev/save-then-read + exclusive-create: check checks.json for the
+    failing entries (control-run/manifest related per local repro).
 - [ ] TAP → e2e-aggregate adapter (Feishu/signature plumbing) at cutover.
 
 ## G5 — Daily real-backend action + release gate
