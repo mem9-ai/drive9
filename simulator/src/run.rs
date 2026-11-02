@@ -3693,7 +3693,7 @@ pub fn run_suite(a: RunSuiteArgs) -> Result<i32> {
             case: case_path,
             stack: None,
             sandbox: "host".into(),
-            home: Some(case_home),
+            home: Some(case_home.clone()),
             server: server.clone(),
             bin: a.bin.clone(),
             repeat: 1,
@@ -3717,6 +3717,13 @@ pub fn run_suite(a: RunSuiteArgs) -> Result<i32> {
             }
         };
         results.push((c.name.clone(), code));
+        if code != 0
+            && let Ok(tap) = std::fs::read_to_string(case_home.join("runs").join("r0").join("report.tap"))
+        {
+            for line in tap.lines().filter(|l| l.starts_with("not ok")) {
+                eprintln!("  {}: {}", c.name, line);
+            }
+        }
         if a.stop_on_fail && code != 0 {
             break;
         }

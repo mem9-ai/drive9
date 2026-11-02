@@ -97,6 +97,9 @@ jobs:
               cd /repo
               timeout -k 10 1350 simulator/target/release/drive9-simulator run-suite simulator/suites.toml \
                 --tier pr-gate-mount --stack mock --bin /repo/bin/drive9 --home /out/home
+              rc=$?
+              chmod -R a+rX /out/home 2>/dev/null || true
+              exit $rc
             ' || rc=$?
           if [ -n "${rc:-}" ] && [ "$rc" != 0 ]; then docker kill sim-mount-tier 2>/dev/null; exit $rc; fi
 
@@ -116,6 +119,9 @@ jobs:
               timeout -k 10 1650 simulator/target/release/drive9-simulator run \
                 simulator/cases/community/fstest-pjdfstest.t \
                 --stack mock --allow-other --bin /repo/bin/drive9 --home /out/home
+              rc=$?
+              chmod -R a+rX /out/home 2>/dev/null || true
+              exit $rc
             ' || rc=$?
           if [ -n "${rc:-}" ] && [ "$rc" != 0 ]; then docker kill sim-pjdfstest 2>/dev/null; exit $rc; fi
 
@@ -134,6 +140,9 @@ jobs:
               cd /repo
               timeout -k 10 1650 simulator/target/release/drive9-simulator run-suite simulator/suites.toml \
                 --tier bench --stack mock --bin /repo/bin/drive9 --home /out/home
+              rc=$?
+              chmod -R a+rX /out/home 2>/dev/null || true
+              exit $rc
             ' || rc=$?
           if [ -n "${rc:-}" ] && [ "$rc" != 0 ]; then docker kill sim-bench-tier 2>/dev/null; exit $rc; fi
           python3 simulator/scripts/perf_baseline.py \
