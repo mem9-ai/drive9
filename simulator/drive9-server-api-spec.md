@@ -189,7 +189,11 @@ btime. 404 semantics: plain `404`.
 | `?symlink=1` | `{target}` | |
 | `?hardlink=1` | header `X-Dat9-Hardlink-Source` | |
 
-Unknown selector → `400`.
+Unknown selector → `400`. Selector matching is by KEY PRESENCE: the real
+Go client sends bare selectors (`?rename`, `?mkdir`, `?copy`), while the
+documented form is `?selector=1`; a backend must accept both. `?mkdir`
+auto-creates missing ancestors (the backend's EnsureParentDirs semantics)
+and so do first writes into fresh trees (PUT/rename/copy destinations).
 
 ### 4.10 `DELETE`
 

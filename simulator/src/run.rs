@@ -83,6 +83,11 @@ pub struct RunArgs {
     /// Path to the fstest binary exported to the script as D9_FSTEST_BIN
     /// for `check fstest` (None = resolve from env/PATH at check time).
     pub fstest: Option<String>,
+    /// Server-surface cases (api/cli): skip the FUSE mount entirely — the
+    /// script cwd is a plain directory and the case exercises the backend
+    /// through the D9_SERVER/D9_API_KEY channel. drain/remount/vantage
+    /// primitives are unavailable (operational errors).
+    pub no_mount: bool,
     /// External workload file set handed to the case via the PAYLOAD_DIR
     /// script variable (see case-spec §4.2). None = the case's default
     /// synthetic payload generation runs.
@@ -389,6 +394,7 @@ fn run_once(
         allow_other: a.allow_other,
         write_cache_mb: a.write_cache_size_mb,
         sandbox_fc: sb.is_fc(),
+        no_mount: a.no_mount,
         blocked_reason: None,
     };
     runner.journal(json!({
@@ -510,6 +516,13 @@ fn run_once(
         .env("D9_MOUNT", &ws)
         .env("D9_RUN_DIR", run_dir)
         .env("D9_CONTROL", &sock_path);
+    // isolate HOME: the drive9 CLI resolves credentials as active-context >
+    // env, so an ambient ~/.drive9/config would silently hijack case traffic
+    // away from the case backend. Cases get a fresh HOME under the run dir
+    // (no case may depend on $HOME workload paths — case-spec §4.1).
+    let isolated_home = run_dir.join("home");
+    let _ = std::fs::create_dir_all(&isolated_home);
+    cmd.env("HOME", &isolated_home);
     // server channel: lets migrated e2e-style cases call the CLI / curl the
     // API directly. D9_SERVER points through the injector proxy when one is
     // up, so case-issued server traffic rides the same faults/latency as the
@@ -985,13 +998,17 @@ fn handle_ctl(
         }
         "drain" => {
             let mut r = runner.lock().unwrap();
-            let mode = req["mode"].as_str().unwrap_or("require-ok");
-            let secs = req["timeout_secs"].as_u64().unwrap_or(120);
+            if r.no_mount {
+                json!({"ok": false, "error": "drain is unavailable in no-mount mode (no mount daemon to flush)"})
+            } else {
+                let mode = req["mode"].as_str().unwrap_or("require-ok");
+                let secs = req["timeout_secs"].as_u64().unwrap_or(120);
             let (ok, pending_clear, file) = r.drain(mode, Duration::from_secs(secs));
             if mode == "require-ok" && !ok {
                 json!({"ok": false, "error": format!("drain did not reach ok (artifact {file})")})
             } else {
                 json!({"ok": true, "drain_ok": ok, "pending_clear": pending_clear, "artifact": file})
+            }
             }
         }
         "check" => {
@@ -1071,6 +1088,8 @@ pub struct Runner {
     pub allow_other: bool,
     pub write_cache_mb: Option<u64>,
     pub sandbox_fc: bool,
+    /// server-surface mode: no FUSE mount, plain-dir cwd, no drain/remount
+    pub no_mount: bool,
     pub blocked_reason: Option<String>,
 }
 
@@ -1348,6 +1367,14 @@ impl Runner {
     // ---- mount / vantages / drain ----
 
     pub fn mount(&mut self, cache_fresh: bool) -> Result<bool> {
+        if self.no_mount {
+            // server-surface case: the "mount" is a plain directory; the
+            // workload talks to the backend via D9_SERVER/D9_API_KEY
+            let _ = std::fs::create_dir_all(&self.ws);
+            self.mount_idx += 1;
+            self.journal(json!({"ts": now_ms(), "kind": "mount", "no_mount": true}));
+            return Ok(true);
+        }
         self.unmount_quiet();
         let _ = std::fs::create_dir_all(&self.ws);
         let _ = Command::new("fusermount3")
@@ -3591,6 +3618,8 @@ struct SuiteCase {
     fstest: Option<String>,
     #[serde(default)]
     allow_other: bool,
+    #[serde(default)]
+    no_mount: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -3675,6 +3704,7 @@ pub fn run_suite(a: RunSuiteArgs) -> Result<i32> {
             fstest: c.fstest.clone().or_else(|| a.fstest.clone()),
             payload_dir: None,
             seed_dir: None,
+            no_mount: c.no_mount,
         })
         .unwrap_or(1);
         results.push((c.name.clone(), code));

@@ -29,6 +29,16 @@ tier = "pr-gate"
 name = "juicefs/cache-consistency"
 tier = "pr-gate"
 
+[[case]]
+name = "drive9/api-fs"
+tier = "pr-gate"
+no_mount = true
+
+[[case]]
+name = "drive9/cli-fs"
+tier = "pr-gate"
+no_mount = true
+
 # ---- nightly: bigger / root-requiring community suites ----
 [[case]]
 name = "community/fstest-pjdfstest"
@@ -68,4 +78,8 @@ tier = "nightly"
 
 [[case]]
 name = "juicefs/fsrand"
+tier = "nightly"
+
+[[case]]
+name = "drive9/git-ops-fast-clone"
 tier = "nightly"

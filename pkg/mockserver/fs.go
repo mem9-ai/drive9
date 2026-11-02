@@ -118,8 +118,30 @@ func (t *tenantDB) ensureParent(p string) error {
 	return nil
 }
 
+// ensureParentDirs mirrors the production backend's EnsureParentDirs: every
+// missing ancestor of p is created (mkdir -p semantics — the CLI and the
+// mount rely on it for first writes into fresh trees).
+func (t *tenantDB) ensureParentDirs(p string) error {
+	parent := pathutil.ParentPath(p)
+	if parent == p {
+		return nil
+	}
+	if err := t.ensureParentDirs(parent); err != nil {
+		return err
+	}
+	if _, err := t.getNode(parent); err == ErrNotFound {
+		now := time.Now().UnixNano()
+		if _, err2 := t.db.Exec(
+			`INSERT INTO file_nodes (path, kind, size, revision, mode, mtime_ns, btime_ns)
+			 VALUES (?, 'dir', 0, 1, 493, ?, ?)`, parent, now, now); err2 != nil {
+			return err2
+		}
+	}
+	return nil
+}
+
 func (t *tenantDB) putFile(p string, data []byte, expectedRevision int64) (int64, error) {
-	if err := t.ensureParent(p); err != nil {
+	if err := t.ensureParentDirs(p); err != nil {
 		return 0, err
 	}
 	now := time.Now().UnixNano()
@@ -155,7 +177,7 @@ func (t *tenantDB) putFile(p string, data []byte, expectedRevision int64) (int64
 }
 
 func (t *tenantDB) mkdir(p string, mode int64) error {
-	if err := t.ensureParent(p); err != nil {
+	if err := t.ensureParentDirs(p); err != nil {
 		return err
 	}
 	if _, err := t.getNode(p); err == nil {
@@ -213,20 +235,20 @@ func (s *Server) handleFS(w http.ResponseWriter, r *http.Request) {
 	rawPath := r.URL.Path
 	query := r.URL.Query()
 
-	if v := query.Get("stat"); r.Method == http.MethodGet && v == "1" {
+	if r.Method == http.MethodGet && query.Has("stat") {
 		s.fsStat(w, r, tdb, rawPath)
 		return
 	}
-	if v := query.Get("list"); r.Method == http.MethodGet && v == "1" {
+	if r.Method == http.MethodGet && query.Has("list") {
 		s.fsList(w, r, tdb, rawPath)
 		return
 	}
-	if query.Get("grep") != "" || query.Get("find") == "1" || query.Get("tasks") == "1" {
+	if query.Get("grep") != "" || query.Has("find") || query.Has("tasks") {
 		// Tier 1 selectors: return the documented empty shapes.
 		switch {
-		case query.Get("tasks") == "1":
+		case query.Has("tasks"):
 			writeJSON(w, http.StatusOK, map[string]any{"tasks": []any{}})
-		case query.Get("find") == "1":
+		case query.Has("find"):
 			writeJSON(w, http.StatusOK, map[string]any{"results": []any{}})
 		default:
 			writeJSON(w, http.StatusOK, map[string]any{"matches": []any{}})
@@ -461,6 +483,12 @@ func (s *Server) fsPost(w http.ResponseWriter, r *http.Request, t *tenantDB, raw
 		}
 		return ""
 	}
+	// The real client sends bare selectors (`?rename`, `?mkdir`); the spec
+	// documents the `=1` form. Presence of the key means the selector is on.
+	has := func(name string) bool {
+		_, ok := q[name]
+		return ok
+	}
 	// headerOrQuery resolves the source path header with optional base64url
 	// encoding (spec §1 / §4.9).
 	headerOrQuery := func(name string) string {
@@ -476,7 +504,7 @@ func (s *Server) fsPost(w http.ResponseWriter, r *http.Request, t *tenantDB, raw
 		return v
 	}
 	switch {
-	case get("mkdir") == "1":
+	case has("mkdir"):
 		p, err := fsPath(raw, true)
 		if err != nil {
 			errJSON(w, http.StatusBadRequest, "invalid path")
@@ -497,7 +525,7 @@ func (s *Server) fsPost(w http.ResponseWriter, r *http.Request, t *tenantDB, raw
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-	case get("rename") == "1":
+	case has("rename"):
 		dst, err := fsPath(raw, false)
 		if err != nil {
 			errJSON(w, http.StatusBadRequest, "invalid path")
@@ -522,7 +550,7 @@ func (s *Server) fsPost(w http.ResponseWriter, r *http.Request, t *tenantDB, raw
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "revision": rev})
-	case get("copy") == "1":
+	case has("copy"):
 		dst, err := fsPath(raw, false)
 		if err != nil {
 			errJSON(w, http.StatusBadRequest, "invalid path")
@@ -543,12 +571,18 @@ func (s *Server) fsPost(w http.ResponseWriter, r *http.Request, t *tenantDB, raw
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "revision": rev})
-	case get("append-log") == "1":
+	case has("append-log"):
 		s.fsAppendLog(w, r, t, raw)
-	case get("append") == "1", get("setmeta") == "1", get("chmod") == "1",
-		get("create") == "1", get("symlink") == "1", get("hardlink") == "1":
+	case has("append"), has("setmeta"), has("chmod"),
+		has("create"), has("symlink"), has("hardlink"):
+		tier1 := []string{}
+		for _, sel := range []string{"append", "setmeta", "chmod", "create", "symlink", "hardlink"} {
+			if has(sel) {
+				tier1 = append(tier1, sel)
+			}
+		}
 		errJSONCode(w, http.StatusNotImplemented, "selector_not_implemented",
-			"fs POST selector is mock Tier 1: "+get("append")+get("setmeta")+get("chmod")+get("create")+get("symlink")+get("hardlink"))
+			"fs POST selector is mock Tier 1: "+strings.Join(tier1, ","))
 	default:
 		errJSON(w, http.StatusBadRequest, "unknown selector")
 	}
@@ -610,8 +644,8 @@ func (t *tenantDB) rename(src, dst string) (int64, error) {
 	if _, err := t.getNode(dst); err == nil {
 		return 0, ErrPathConflict
 	}
-	if err := t.ensureParent(dst); err != nil {
-		return 0, ErrNotFound
+	if err := t.ensureParentDirs(dst); err != nil {
+		return 0, err
 	}
 	now := time.Now().UnixNano()
 	if sn.isDir() {

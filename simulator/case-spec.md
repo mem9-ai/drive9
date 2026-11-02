@@ -105,7 +105,8 @@ The engine MUST have the drive9 mount ready before starting the script. At scrip
 | `D9_SERVER` | server address for direct CLI/API calls from the case (`drive9 fs …`, `curl`). Points through the injector proxy when one is up, so case-issued traffic rides the same faults/latency as the mount's. Absent in the control replay — scripts that must stay control-compatible guard with `[ -n "${D9_SERVER:-}" ]` |
 | `D9_API_KEY` | this run's tenant API key (pairs with `D9_SERVER`) |
 | `D9_TENANT` | this run's tenant id |
-| `D9_CLI` | absolute path of the drive9 CLI under test |
+| `D9_CLI` | absolute path of the drive9 CLI under test. Map to the CLI's own env (`export DRIVE9_SERVER="$D9_SERVER" DRIVE9_API_KEY="$D9_API_KEY"`) in server-channel cases |
+| `HOME` | an isolated per-run directory — the ambient `~/.drive9/config` (whose active context outranks env vars in CLI credential resolution) must never hijack case traffic. Scripts MUST NOT use `$HOME` as a workload path; take scratch space from `/tmp` or `$D9_RUN_DIR` |
 
 Case-level environment configuration does **not** live in the script: which environment this run executes on (`--durability` / `--overlay` / `--write-cache-size-mb`) and the wall-clock limit (`--timeout`) are all `drive9-simulator run` CLI flags (§6). The script carries logical correctness only and MUST NOT depend on these values.
 

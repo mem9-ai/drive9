@@ -88,6 +88,10 @@ enum Commands {
         /// script as D9_FSTEST_BIN; see `drive9-simulator tools ensure-fstest`)
         #[arg(long)]
         fstest: Option<String>,
+        /// server-surface case: skip the FUSE mount; the script runs in a
+        /// plain directory and exercises the backend via D9_SERVER/D9_API_KEY
+        #[arg(long, default_value_t = false)]
+        no_mount: bool,
     },
     /// run a tier of cases from a manifest (batch runner)
     RunSuite {
@@ -165,9 +169,11 @@ fn main() -> Result<()> {
             payload_dir,
             seed,
             fstest,
+            no_mount,
         } => run::run(RunArgs {
             case,
             stack,
+            no_mount,
             sandbox,
             home,
             server,
