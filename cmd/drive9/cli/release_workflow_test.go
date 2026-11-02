@@ -47,6 +47,13 @@ func TestCLIReleasePublishesLegacyManifests(t *testing.T) {
 	}
 	for _, failure := range []string{"none", "checksum mismatch", "missing manifest"} {
 		t.Run(failure, func(t *testing.T) {
+			// The workflow runs on Ubuntu; keep its structural checks above
+			// available on developer machines without these Unix tools.
+			for _, tool := range []string{"bash", "sha256sum"} {
+				if _, err := exec.LookPath(tool); err != nil {
+					t.Skipf("release shell validation requires %s: %v", tool, err)
+				}
+			}
 			root := t.TempDir()
 			dist := filepath.Join(root, "dist")
 			if err := os.Mkdir(dist, 0700); err != nil {
