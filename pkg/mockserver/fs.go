@@ -336,8 +336,8 @@ func (s *Server) fsHead(w http.ResponseWriter, r *http.Request, t *tenantDB, raw
 		}
 	}
 	w.Header().Set("X-Dat9-Revision", fmt.Sprint(n.Revision))
-	w.Header().Set("X-Dat9-Mtime", fmt.Sprint(n.MtimeNS))
-	w.Header().Set("X-Dat9-Btime", fmt.Sprint(n.BtimeNS))
+	w.Header().Set("X-Dat9-Mtime", fmt.Sprint(n.MtimeNS/1e9))
+	w.Header().Set("X-Dat9-Btime", fmt.Sprint(n.BtimeNS/1e9))
 	w.Header().Set("Accept-Ranges", "bytes")
 	w.WriteHeader(http.StatusOK)
 }
@@ -353,8 +353,8 @@ func (s *Server) fsStat(w http.ResponseWriter, r *http.Request, t *tenantDB, raw
 		errJSON(w, http.StatusNotFound, "not found")
 		return
 	}
-	w.Header().Set("X-Dat9-Mtime", fmt.Sprint(n.MtimeNS))
-	w.Header().Set("X-Dat9-Btime", fmt.Sprint(n.BtimeNS))
+	w.Header().Set("X-Dat9-Mtime", fmt.Sprint(n.MtimeNS/1e9))
+	w.Header().Set("X-Dat9-Btime", fmt.Sprint(n.BtimeNS/1e9))
 	if !n.isDir() {
 		if data, _, err := t.readFile(p); err == nil {
 			sum := sha256.Sum256(data)
@@ -367,8 +367,8 @@ func (s *Server) fsStat(w http.ResponseWriter, r *http.Request, t *tenantDB, raw
 		"resource_id": n.Path,
 		"nlink":       1,
 		"revision":    n.Revision,
-		"mtime":       n.MtimeNS,
-		"btime":       n.BtimeNS,
+		"mtime":       n.MtimeNS / 1e9,
+		"btime":       n.BtimeNS / 1e9,
 		"tags":        parseTags(n.Tags),
 		"description": n.Description,
 	})
@@ -413,7 +413,7 @@ func (s *Server) fsList(w http.ResponseWriter, r *http.Request, t *tenantDB, raw
 			"name":        pathutil.BaseName(c.Path),
 			"size":        c.Size,
 			"isDir":       c.isDir(),
-			"mtime":       c.MtimeNS,
+			"mtime":       c.MtimeNS / 1e9,
 			"revision":    c.Revision,
 			"mode":        c.Mode,
 			"hasMode":     true,
