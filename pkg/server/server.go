@@ -5916,12 +5916,15 @@ func (s *Server) cleanupProvisionedClusterAfterProvisionFailure(ctx context.Cont
 // has its certificate verified. The DBTLS flag only distinguishes "verified
 // TLS" from "TLS without certificate verification", which is the explicit
 // DRIVE9_DB_TLS_SKIP_VERIFY opt-out; it never means "no TLS" for a non-local
-// provider.
+// provider (MySQLTLSParam enforces TLS for every non-loopback host). The
+// opt-out is recorded only for the provider whose endpoint it can apply to;
+// other providers keep DBTLS=true, and the DSN still uses skip-verify for a
+// non-loopback host when the operator set the variable.
 func dbTLSForProvisionedTenant(provider string) bool {
 	if provider == tenant.ProviderLocal {
 		return false
 	}
-	if tenant.DBTLSSkipVerifyRequested() {
+	if tenant.UsesTiDBCloudNativeCredentials(provider) && tenant.DBTLSSkipVerifyRequested() {
 		return false
 	}
 	return true

@@ -203,3 +203,59 @@ func TestSanitizeGitCheckpointDirStripsWorktreeConfig(t *testing.T) {
 		t.Fatalf("config.worktree kept executable keys:\n%s", got)
 	}
 }
+
+// git config tolerates a key on the section-header line; the sanitizer must not
+// write one back, or it would bypass the per-section policy.
+func TestSanitizeGitCheckpointConfigDropsHeaderLineKeys(t *testing.T) {
+	dir := t.TempDir()
+	cfg := "[core] fsmonitor = /tmp/evil\n[remote \"origin\"] url = ext::sh -c 'touch /tmp/pwned'\n[core]\n\trepositoryformatversion = 0\n"
+	path := filepath.Join(dir, "config")
+	if err := os.WriteFile(path, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := sanitizeGitCheckpointConfig(path); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(data)
+	for _, banned := range []string{"fsmonitor", "ext::"} {
+		if strings.Contains(got, banned) {
+			t.Fatalf("header-line key survived (%q):\n%s", banned, got)
+		}
+	}
+	if !strings.Contains(got, "repositoryformatversion = 0") {
+		t.Fatalf("safe section lost:\n%s", got)
+	}
+}
+
+// The archive skip applies to the top-level hooks/ and objects/ directories, not
+// to a ref or file that happens to be named "hooks".
+func TestCheckpointArchiveKeepsRefsNamedHooks(t *testing.T) {
+	gitDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(gitDir, "refs", "heads", "hooks"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(gitDir, "refs", "heads", "hooks", "branch"), []byte("sha\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(gitDir, "hooks"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(gitDir, "hooks", "post-checkout"), []byte("#!/bin/sh\ntrue\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, rel := range []string{"objects", "hooks", "hooks/post-checkout"} {
+		if !shouldSkipGitObjectStatePath(rel, nil) {
+			t.Errorf("shouldSkipGitObjectStatePath(%q) = false, want true", rel)
+		}
+	}
+	for _, rel := range []string{"refs/heads/hooks", "refs/heads/hooks/branch", "config", "HEAD"} {
+		if shouldSkipGitObjectStatePath(rel, nil) {
+			t.Errorf("shouldSkipGitObjectStatePath(%q) = true, want false", rel)
+		}
+	}
+}

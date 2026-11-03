@@ -178,16 +178,20 @@ func NewProvisionerFromEnv(providerType string) (*Provisioner, error) {
 			return nil, err
 		}
 		p.clusters = localAPI
-		// The local control plane authenticates exactly one pair. In-process
-		// cluster operations must spend that pair; it is generated per process
-		// when the deployment does not pin one.
+		// The local control plane authenticates exactly one pair, so in-process
+		// cluster operations must spend that pair even when
+		// DRIVE9_TIDBCLOUD_NATIVE_*_KEY is set: a different env pair would pass
+		// the generic credential plumbing and then be rejected by the local API
+		// with 401. The pair is generated per process when the deployment does
+		// not pin one.
 		localPublic, localPrivate := localAPI.Credentials()
-		if p.defaultPublicKey == "" {
-			p.defaultPublicKey = localPublic
+		if p.defaultPublicKey != "" && p.defaultPublicKey != localPublic ||
+			p.defaultPrivateKey != "" && p.defaultPrivateKey != localPrivate {
+			logger.Warn(context.Background(), "tidbcloud_local_backend_credentials_overridden",
+				zap.String("hint", "DRIVE9_TIDBCLOUD_NATIVE_PUBLIC_KEY/_PRIVATE_KEY are ignored for the local clusters backend; it authenticates only its own pair"))
 		}
-		if p.defaultPrivateKey == "" {
-			p.defaultPrivateKey = localPrivate
-		}
+		p.defaultPublicKey = localPublic
+		p.defaultPrivateKey = localPrivate
 		return p, nil
 	case "http":
 		apiURL := strings.TrimSpace(os.Getenv(EnvTiDBCloudNativeAPIURL))

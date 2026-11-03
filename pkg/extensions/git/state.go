@@ -466,13 +466,13 @@ func collectStagedObjectSet(ctx context.Context, gitDir string) (map[string]stru
 // mounting host could run: uploading them would ship code to the server and the
 // restore path strips them anyway.
 func shouldSkipGitObjectStatePath(rel string, _ fs.DirEntry) bool {
-	for _, part := range strings.Split(filepath.ToSlash(rel), "/") {
-		switch part {
-		case "objects", "hooks":
-			return true
-		}
+	parts := strings.Split(filepath.ToSlash(rel), "/")
+	if len(parts) == 0 {
+		return false
 	}
-	return false
+	// objects/ and hooks/ are top-level .git directories. Matching the name at
+	// any depth used to drop legitimate content such as refs/heads/hooks.
+	return parts[0] == "objects" || parts[0] == "hooks"
 }
 
 // archiveLocalGitStateDir tars+gzips the .git tree without objects/.
@@ -1148,7 +1148,6 @@ var gitCheckpointSafeConfigSections = map[string]bool{
 	"branch": true,
 	"tag":    true,
 	"user":   true,
-	"init":   true,
 }
 
 // gitCheckpointUnsafeRemoteKeys are remote-section keys that make git run a
@@ -1218,18 +1217,23 @@ func sanitizeGitCheckpointConfig(path string) error {
 			}
 			continue
 		}
-		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
-			section := strings.ToLower(strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(trimmed, "["), "]")))
-			sectionName = section
-			if i := strings.IndexAny(sectionName, " \t\""); i >= 0 {
-				sectionName = sectionName[:i]
+		if strings.HasPrefix(trimmed, "[") {
+			if end := strings.IndexByte(trimmed, ']'); end > 0 {
+				raw := strings.TrimSpace(trimmed[1:end])
+				sectionName = strings.ToLower(raw)
+				if i := strings.IndexAny(sectionName, " \t\""); i >= 0 {
+					sectionName = sectionName[:i]
+				}
+				sectionKept = gitCheckpointSafeConfigSections[sectionName] || sectionName == "core" ||
+					sectionName == "extensions" || sectionName == "gc"
+				// Anything after the closing bracket is dropped: git config
+				// tolerates a key on the header line, and writing it back would
+				// smuggle a key past the per-section policy below.
+				if sectionKept && end == len(trimmed)-1 {
+					out.WriteString(line)
+				}
+				continue
 			}
-			sectionKept = gitCheckpointSafeConfigSections[sectionName] || sectionName == "core" ||
-				sectionName == "extensions" || sectionName == "gc"
-			if sectionKept {
-				out.WriteString(line)
-			}
-			continue
 		}
 		if !sectionKept {
 			continue

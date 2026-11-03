@@ -27,6 +27,9 @@ const (
 	// metrics carry tenant and organization labels.
 	defaultLocalMetricsListenAddr = "127.0.0.1:9090"
 	metricsReadHeaderTimeout      = 10 * time.Second
+	metricsReadTimeout            = 30 * time.Second
+	metricsWriteTimeout           = 30 * time.Second
+	metricsIdleTimeout            = 60 * time.Second
 	metricsShutdownTimeout        = 5 * time.Second
 )
 
@@ -91,6 +94,11 @@ func serveMetrics(ctx context.Context, ln net.Listener) error {
 	srv := &http.Server{
 		Handler:           metricsHandler(),
 		ReadHeaderTimeout: metricsReadHeaderTimeout,
+		// A scrape is small and short-lived: bound the whole exchange so a
+		// client cannot hold a connection (or a goroutine) open indefinitely.
+		ReadTimeout:  metricsReadTimeout,
+		WriteTimeout: metricsWriteTimeout,
+		IdleTimeout:  metricsIdleTimeout,
 	}
 	logger.Info(ctx, "metrics_server_start", zap.String("addr", ln.Addr().String()))
 	go func() {

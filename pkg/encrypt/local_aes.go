@@ -59,9 +59,19 @@ func (e *LocalAESEncryptor) Decrypt(_ context.Context, ciphertext []byte) ([]byt
 }
 
 // NewLocalAESEncryptorWithPrevious creates a rotating encryptor: writes use
-// primary, reads also try previous (retired) keys. Rotation is then a two-step
-// deployment — add the old key to the previous list, then drop it once every
-// stored value has been rewritten.
+// primary, reads also try previous (retired) keys.
+//
+// Rotation across a rolling deployment takes three phases, because a pod can
+// only read values written with a key it was started with:
+//
+//  1. Stage: restart every pod with the CURRENT key as primary and the FUTURE
+//     key appended to previous. Nothing is written with the future key yet, but
+//     every pod can now decrypt values it writes.
+//  2. Promote: restart with the future key as primary and the current key in
+//     previous. Pods still on the old configuration in phase 1 can read the new
+//     values, so no read fails mid-rollout.
+//  3. Retire: once every stored value has been rewritten with the new primary,
+//     drop the old key from previous.
 func NewLocalAESEncryptorWithPrevious(primary []byte, previous [][]byte) (*LocalAESEncryptor, error) {
 	enc, err := NewLocalAESEncryptor(primary)
 	if err != nil {

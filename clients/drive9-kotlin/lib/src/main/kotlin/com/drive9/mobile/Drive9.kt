@@ -53,6 +53,10 @@ private const val REMOVE_ALL_MAX_RETRIES = 4
 // caller for days.
 private const val REMOVE_ALL_MAX_RETRY_DELAY_SECS = 60L
 
+// RAW_HTTP_READ_TIMEOUT_MS bounds the raw-socket transport, covering the TLS
+// handshake, the write and the response read.
+private const val RAW_HTTP_READ_TIMEOUT_MS = 120_000
+
 /** Idiomatic Kotlin Drive9 client implemented with platform-native HTTP. */
 public class Drive9Client(
     baseUrl: String,
@@ -812,13 +816,16 @@ public class Drive9Client(
         val uri = URI(url)
         val secure = uri.scheme.equals("https", ignoreCase = true)
         if (secure) return
-        val host = uri.host ?: return
-        if (isLoopbackHost(host)) return
+        // Fail closed: an http authority the URI parser cannot resolve to a host
+        // (opaque authority, userinfo-only, malformed) must not be treated as
+        // loopback just because there is nothing to compare.
+        val host = uri.host
+        if (host != null && isLoopbackHost(host)) return
         // A bearer token on a plaintext connection is a credential in the clear.
         throw Drive9Exception.Drive9(
             "request",
             null,
-            "refusing to send the API key over plaintext HTTP to $host; use https",
+            "refusing to send the API key over plaintext HTTP to ${host ?: url}; use https",
             null,
         )
     }
@@ -917,20 +924,30 @@ public class Drive9Client(
         requireSecureForApiKey(url)
         val socket: Socket = if (ssl) {
             val sslSocket = SSLSocketFactory.getDefault().createSocket(host, port) as SSLSocket
-            // createSocket returns an unconnected-handshake socket with no
-            // identity check: without these two settings the certificate chain
-            // is validated against nothing in particular and a MITM with any
-            // valid certificate would receive the bearer token.
-            sslSocket.sslParameters = sslSocket.sslParameters.apply {
-                endpointIdentificationAlgorithm = "HTTPS"
+            // A peer that accepts the connection but stalls the handshake must
+            // not hang the caller: set the read timeout before handshaking, and
+            // close the socket if the handshake fails so the descriptor is not
+            // leaked.
+            sslSocket.soTimeout = RAW_HTTP_READ_TIMEOUT_MS
+            try {
+                // createSocket returns an unconnected-handshake socket with no
+                // identity check: without these two settings the certificate
+                // chain is validated against nothing in particular and a MITM
+                // with any valid certificate would receive the bearer token.
+                sslSocket.sslParameters = sslSocket.sslParameters.apply {
+                    endpointIdentificationAlgorithm = "HTTPS"
+                }
+                sslSocket.startHandshake()
+            } catch (t: Throwable) {
+                runCatching { sslSocket.close() }
+                throw t
             }
-            sslSocket.startHandshake()
             sslSocket
         } else {
             Socket(host, port)
         }
         socket.use { s ->
-            s.soTimeout = 120_000
+            s.soTimeout = RAW_HTTP_READ_TIMEOUT_MS
             val target = buildString {
                 append(uri.rawPath.ifEmpty { "/" })
                 if (!uri.rawQuery.isNullOrEmpty()) append("?").append(uri.rawQuery)

@@ -44,6 +44,14 @@ func NewMasterKey(key []byte) (*MasterKey, error) {
 
 // NewMasterKeyWithPrevious creates a rotating master key: wrapping uses
 // primary, unwrapping also tries previous (retired) keys.
+//
+// Unlike the data encryptor, a vault key change is not transparent to clients:
+// DeriveCSK follows the primary, so capability tokens and grants signed under
+// the retired key stop verifying the moment the new key is promoted. Rotate in
+// the same three phases as the data key (stage, promote, retire) and expect
+// outstanding capability tokens to be re-issued after the promote step; a
+// rolling deployment where old and new primaries serve at once will reject
+// roughly half of the freshly minted tokens until every pod is promoted.
 func NewMasterKeyWithPrevious(primary []byte, previous [][]byte) (*MasterKey, error) {
 	mk, err := NewMasterKey(primary)
 	if err != nil {
