@@ -183,10 +183,14 @@ func newFakeV2(t *testing.T) *fakeV2 {
 				f.mu.Unlock()
 				w.Header().Set("Content-Length", fmt.Sprint(len(classic)))
 				if fail {
-					// Deliver a valid prefix, then kill the connection:
-					// io.ReadAll must see the truncation.
+					// Deliver a valid prefix, then end the response short of
+					// Content-Length (and close the connection): the
+					// client's io.ReadAll sees the truncation, and the
+					// closed connection can never be reused for a later,
+					// recovered request.
+					w.Header().Set("Connection", "close")
 					_, _ = w.Write([]byte(classic[:min(2, len(classic))]))
-					panic(http.ErrAbortHandler)
+					return
 				}
 				_, _ = w.Write([]byte(classic))
 				return
@@ -3427,5 +3431,138 @@ func TestDeferredExtentOverlayWriteOrder(t *testing.T) {
 	}
 	if got := readFront(t, eh, 8); got != "BBBBBBBB" {
 		t.Fatalf("overlaid read = %q, want BBBBBBBB (the later write wins)", got)
+	}
+}
+
+// Round-21: three deferred writes whose offsets move BACKWARDS — every
+// later write shadows all earlier fragments, including heads emitted
+// around an earlier shadow.
+func TestDeferredOverlayThreeWritesBackwards(t *testing.T) {
+	f := newFakeV2(t)
+	f.seedExtent(t, "/big.bin", "AAAAAAAAAAAA")
+	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: engineCacheDir(t)})
+	h := New(Options{Engine: eng, Threshold: 1 << 20, SyncMode: "interactive"})
+	eh := claimOpen(t, h, "/big.bin")
+	for _, w := range []struct {
+		off  int64
+		data string
+	}{{0, "AAAAAAAAAAAA"}, {8, "BB"}, {2, "CC"}} {
+		if err := eh.Write(context.Background(), w.off, []byte(w.data)); err != nil {
+			t.Fatal(err)
+		}
+		if err := eh.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := readFront(t, eh, 12); got != "AACCAAAABBAA" {
+		t.Fatalf("overlaid read = %q, want AACCAAAABBAA", got)
+	}
+}
+
+// Round-21: the staged bytes survive a failed commit AND the retry can
+// re-upload them (payload, not just the queue entry).
+func TestClassicRecoveryRetainsPayload(t *testing.T) {
+	f := newFakeV2(t)
+	f.setLegacy(true)
+	f.setDir("/d", true)
+	h := newTestHandler(t, f, 0)
+	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
+	eh := res.Handle.(*engineHandle)
+	if err := eh.Write(context.Background(), 0, []byte("AAAA")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	f.setFailBody(true)
+	if err := eh.Write(context.Background(), 4, []byte("BBBB")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Sync(context.Background()); err == nil {
+		t.Fatal("commit succeeded despite the truncated base read")
+	}
+	f.setFailBody(false)
+	// The RETRY must find the staged payload and land it.
+	if err := eh.Sync(context.Background()); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if got := f.contentOf("/d/f.bin"); got != "AAAABBBB" {
+		t.Fatalf("server content = %q, want AAAABBBB", got)
+	}
+}
+
+// Round-21: classic staging stays bounded under a scan of DISTINCT
+// chunks (no time-based amnesty), with byte-level verification.
+func TestClassicReadCacheBoundedUnderScan(t *testing.T) {
+	oldBudget, oldProtect := classicReadCacheBytes, classicReadProtect
+	classicReadCacheBytes = 8 << 10
+	classicReadProtect = 1
+	defer func() { classicReadCacheBytes, classicReadProtect = oldBudget, oldProtect }()
+
+	f := newFakeV2(t)
+	f.setLegacy(true)
+	f.setDir("/d", true)
+	h := newTestHandler(t, f, 0)
+	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
+	eh := res.Handle.(*engineHandle)
+	// Sparse content in several DISTINCT chunks (64 MiB apart).
+	const n = 4
+	for i := 0; i < n; i++ {
+		blk := []byte{byte('A' + i), byte('A' + i), byte('A' + i), byte('A' + i)}
+		if err := eh.Write(context.Background(), int64(i)*meta.ChunkSize, blk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := eh.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < n; i++ {
+		buf := make([]byte, 4)
+		if _, err := eh.Read(context.Background(), int64(i)*meta.ChunkSize, buf); err != nil {
+			t.Fatalf("read chunk %d: %v", i, err)
+		}
+		want := string([]byte{byte('A' + i), byte('A' + i), byte('A' + i), byte('A' + i)})
+		if string(buf) != want {
+			t.Fatalf("read chunk %d = %q, want %q", i, string(buf), want)
+		}
+	}
+	br := h.opts.Engine.Bridge
+	br.mu.Lock()
+	held := br.classicBytes
+	records := len(br.classicLRU)
+	br.mu.Unlock()
+	// Bound: the budget plus the protected newest records.
+	if held > classicReadCacheBytes+int64(classicReadProtect)*4096 || records > classicReadProtect {
+		t.Fatalf("classic staging holds %d bytes in %d records, want <= %d + %d protected", held, records, classicReadCacheBytes, classicReadProtect)
+	}
+}
+
+// Round-21: a same-inode write that survives another commit's cleanup
+// keeps its staged bytes (the reference scan counts it).
+func TestSameInodeSurvivorKeepsBytes(t *testing.T) {
+	f := newFakeV2(t)
+	f.seedExtent(t, "/big.bin", "AAAA")
+	h := newTestHandler(t, f, 1<<20)
+	b := h.opts.Engine.Bridge
+	eh := claimOpen(t, h, "/big.bin")
+	ino := eh.ino
+
+	shared := sha256Hex([]byte("SHARED"))
+	b.mu.Lock()
+	b.pending[ino] = []pendingWrite{{chunk: 0, off: 0, checksum: shared, size: 4}}
+	b.blocks.stagePinned(shared, []byte("SHARED"), true)
+	b.sizes[ino] = 1 << 20
+	b.mu.Unlock()
+
+	// A's commit snapshots [shared]; B appends the SAME checksum while the
+	// commit holds the lock — modeled by running the cleanup explicitly.
+	b.mu.Lock()
+	b.pending[ino] = append(b.pending[ino], pendingWrite{chunk: 1, off: 0, checksum: shared, size: 4})
+	b.mu.Unlock()
+	b.surgicalDeletePending(ino, []pendingWrite{{chunk: 0, off: 0, checksum: shared, size: 4}})
+	b.releaseCommitted(ino, []pendingWrite{{chunk: 0, off: 0, checksum: shared, size: 4}})
+
+	if data, ok := b.blocks.stagedBytes(shared); !ok || string(data) != "SHARED" {
+		t.Fatalf("survivor's staged bytes lost: ok=%v data=%q", ok, data)
 	}
 }

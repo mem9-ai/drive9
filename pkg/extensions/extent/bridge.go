@@ -81,6 +81,20 @@ type Bridge struct {
 	classicLRU   []classicRef
 	classicBytes int64
 
+	// layoutPending marks a fresh upload of OURS whose landed layout
+	// could not be classified (stat outage) — proof of ownership that a
+	// foreign replacement can never carry. verifyBase carries an
+	// identity-verified recovery's expected revision/resource, consumed
+	// by the next commit as its CAS base.
+	// commitErr remembers the last landing failure for an inode so the
+	// flush/close boundary (FlushFile) surfaces it — Bridge.Write itself
+	// returns success to keep the community writer clean (its sticky
+	// fileWriter.err otherwise stranded the handle after recovery).
+	commitErr map[meta.Ino]error
+
+	layoutPending map[meta.Ino]bool
+	verifyBase    map[meta.Ino]verifyBase
+
 	// classicOwned marks files whose fresh extent session silently
 	// degraded to a CLASSIC upload on a legacy server: the handle stays
 	// owned by this bridge, so commits and reads keep serving it through
@@ -148,23 +162,26 @@ func NewBridge(cfg Config) *Bridge {
 		root = "/"
 	}
 	br := &Bridge{
-		cfg:          cfg,
-		format:       meta.Format{Name: "drive9", UUID: "drive9-extent-v2", Storage: "drive9-presign", BlockSize: blockSizeMiB << 20, TrashDays: 0, DirStats: false},
-		nextID:       uint64(1) << 63,
-		stagedSlices: make(map[uint64]*stagedSlice),
-		blocks:       newBlockRegistry(),
-		paths:        map[meta.Ino]string{rootIno: root},
-		sizes:        make(map[meta.Ino]int64),
-		revs:         make(map[meta.Ino]int64),
-		pending:      make(map[meta.Ino][]pendingWrite),
-		truncs:       make(map[meta.Ino]int64),
-		modes:        make(map[meta.Ino]uint32),
-		sentinels:    make(map[string]meta.Ino),
-		nextHeldIno:  heldInoBase,
-		moved:        make(map[meta.Ino]string),
-		replacements: make(map[string]meta.Ino),
-		commitLocks:  make(map[meta.Ino]*sync.Mutex),
-		classicOwned: make(map[meta.Ino]bool),
+		cfg:           cfg,
+		format:        meta.Format{Name: "drive9", UUID: "drive9-extent-v2", Storage: "drive9-presign", BlockSize: blockSizeMiB << 20, TrashDays: 0, DirStats: false},
+		nextID:        uint64(1) << 63,
+		stagedSlices:  make(map[uint64]*stagedSlice),
+		blocks:        newBlockRegistry(),
+		paths:         map[meta.Ino]string{rootIno: root},
+		sizes:         make(map[meta.Ino]int64),
+		revs:          make(map[meta.Ino]int64),
+		pending:       make(map[meta.Ino][]pendingWrite),
+		truncs:        make(map[meta.Ino]int64),
+		modes:         make(map[meta.Ino]uint32),
+		sentinels:     make(map[string]meta.Ino),
+		nextHeldIno:   heldInoBase,
+		moved:         make(map[meta.Ino]string),
+		replacements:  make(map[string]meta.Ino),
+		commitLocks:   make(map[meta.Ino]*sync.Mutex),
+		classicOwned:  make(map[meta.Ino]bool),
+		layoutPending: make(map[meta.Ino]bool),
+		commitErr:     make(map[meta.Ino]error),
+		verifyBase:    make(map[meta.Ino]verifyBase),
 	}
 	// Provenance refetch resolves through the inode's CURRENT mapping:
 	// open files move under renames and retention aliases, and a stale
@@ -176,6 +193,12 @@ func NewBridge(cfg Config) *Bridge {
 		return p, ok
 	}
 	return br
+}
+
+// verifyBase is an identity-verified recovery's publication constraint.
+type verifyBase struct {
+	rev   int64
+	resID string
 }
 
 // classicRef is one staged classic chunk read on the bounded LRU.
