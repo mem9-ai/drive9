@@ -267,9 +267,14 @@ func (h *Handler) tryClaimOpen(ctx context.Context, op *fs.Op) (fs.Result, error
 // of the displaced file under a fresh sentinel name first (non-replacing;
 // the file never leaves its name) and its descriptors are retargeted to
 // the alias; the chain's rename then replaces only the dentry while the
-// alias keeps the displaced object alive. No outcome ever needs a
-// replacing rollback: the alias is one extra reference, deleted at the
-// displaced file's last close.
+// alias keeps the displaced object alive. The alias is one extra reference
+// under every outcome and drops at the displaced file's own last close, so
+// NOTHING is ever put back, deleted, or decided from an unreserved
+// observation: after an error the only action is the purely observational
+// check whether the source actually landed (a committed rename can lose
+// its response; core's probes can be inconclusive) — if so, the source's
+// descriptors follow it; in every other case the displaced descriptor
+// simply keeps using its alias.
 func (h *Handler) tryRenameOverOpen(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error, bool) {
 	if h.opts.Engine == nil || op.Path2 == "" || op.Path2 == op.Path {
 		return fs.Result{}, nil, false
@@ -281,10 +286,9 @@ func (h *Handler) tryRenameOverOpen(ctx context.Context, op *fs.Op, next fs.Next
 		return fs.Result{}, nil, false
 	}
 	br := h.opts.Engine.Bridge
-	// Identities before anything moves, to establish the rename's outcome
-	// afterwards: the source's, and the displaced file's own.
+	// The source's identity, to recognize a rename that committed without
+	// a response.
 	srcID := resourceIDOf(ctx, br, op.Path)
-	dstID := resourceIDOf(ctx, br, op.Path2)
 	sentinel, err := br.RetainOpenAlias(op.Path2)
 	if err != nil {
 		// Retention failed: refuse the rename rather than risk the open
@@ -297,33 +301,13 @@ func (h *Handler) tryRenameOverOpen(ctx context.Context, op *fs.Op, next fs.Next
 	h.retargetHandles(op.Path2, sentinel)
 	res, err := next(ctx, op)
 	if err == nil {
-		// The name is the source's now: it must stop resolving to the
-		// displaced inode (the facade's rename event registers the source
-		// there only if the source had a mapping of its own).
-		br.DisownPath(op.Path2, sentinel)
 		return res, nil, true
 	}
-	// An error is not proof the rename did not apply (a committed rename
-	// can lose its response; core's probes can be inconclusive): establish
-	// what the name holds before acting, and never replace anything.
-	switch h.probeRenameOutcome(op.Path2, srcID, dstID) {
-	case renameDestIsDisplaced:
-		// The rename never applied and the displaced file still occupies
-		// its name: drop the alias and point the descriptors back.
-		br.UnretainOpenAlias(sentinel, op.Path2)
-		h.retargetHandles(sentinel, op.Path2)
-	case renameDestIsSource:
+	if h.destHoldsSource(op.Path2, srcID) {
 		// The rename committed after all: the source lives at the name.
-		// The alias keeps the displaced object until its own last close;
-		// follow the source so its descriptors commit to the name.
-		br.DisownPath(op.Path2, sentinel)
+		// Follow it so its descriptors commit to where its bytes are; the
+		// displaced file keeps its alias until its own last close.
 		h.retarget(op.Path, op.Path2)
-	default:
-		// Vacant (someone removed the name), a foreign file, or
-		// unknowable: the name no longer provably holds the displaced
-		// file. Its object stays alive at the alias until its last close;
-		// nothing is written anywhere.
-		br.DisownPath(op.Path2, sentinel)
 	}
 	return res, err, true
 }
@@ -337,45 +321,28 @@ func resourceIDOf(ctx context.Context, br *Bridge, local string) string {
 	return ""
 }
 
-// renameOutcome is what the destination of a failed rename turned out to
-// hold.
-type renameOutcome int
+// destHoldsSourceProbes paces the detached probes after a failed rename
+// (the error that got us here was likely transient).
+var destHoldsSourceProbes = []time.Duration{0, 200 * time.Millisecond, 500 * time.Millisecond}
 
-const (
-	renameDestUnknown     renameOutcome = iota // probes could not establish it
-	renameDestVacant                           // nothing at the name
-	renameDestIsSource                         // the source landed there: the rename committed
-	renameDestIsDisplaced                      // the displaced file still occupies its own name
-	renameDestForeign                          // a file that is neither
-)
-
-// renameOutcomeProbeDelays paces the detached probes of a failed rename's
-// destination (the error that got us here was likely transient).
-var renameOutcomeProbeDelays = []time.Duration{0, 200 * time.Millisecond, 500 * time.Millisecond}
-
-// probeRenameOutcome establishes, detached from the failed request's
-// context, what the destination holds: the source itself (the rename
-// committed), the displaced file (it did not apply), something else, or
-// nothing. Unknown when every probe fails or an identity was never
-// captured.
-func (h *Handler) probeRenameOutcome(dest, srcID, dstID string) renameOutcome {
-	for _, delay := range renameOutcomeProbeDelays {
+// destHoldsSource reports — detached from the failed request's context —
+// whether the destination now holds the SOURCE's identity, i.e. the
+// rename committed after all. An observation, never a reservation: the
+// caller must only use it for actions on the source's own descriptors.
+func (h *Handler) destHoldsSource(dest, srcID string) bool {
+	if srcID == "" {
+		return false
+	}
+	for _, delay := range destHoldsSourceProbes {
 		time.Sleep(delay)
 		pctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		st, err := h.opts.Engine.Bridge.StatLocal(pctx, dest)
 		cancel()
-		switch {
-		case err == nil && srcID != "" && st.ResourceID == srcID:
-			return renameDestIsSource
-		case err == nil && dstID != "" && st.ResourceID == dstID:
-			return renameDestIsDisplaced
-		case err == nil:
-			return renameDestForeign
-		case client.IsNotFound(err):
-			return renameDestVacant
+		if err == nil && st.ResourceID == srcID {
+			return true
 		}
 	}
-	return renameDestUnknown
+	return false
 }
 
 // tryTruncate routes a size change on an open engine file into the bridge;

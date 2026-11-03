@@ -112,10 +112,12 @@ func TestRenameOverOpenTargetPreservesDisplacedDescriptor(t *testing.T) {
 	}
 }
 
-// Round-10: a rename the chain refuses (nothing applied) leaves the
-// displaced file exactly where it was — it never left its name — with the
-// extra alias removed and no registration left behind.
-func TestRenameOverOpenTargetUnretainsOnFailure(t *testing.T) {
+// Round-10 (round-13 semantics): a rename the chain refuses (nothing
+// applied) leaves the displaced file attached to its alias — the file
+// never left its name, so the alias shares the object and a write through
+// the descriptor is visible at /b — and the alias drops at its own last
+// close, leaving /b exactly as it was.
+func TestRenameOverOpenTargetFailedRenameKeepsAlias(t *testing.T) {
 	f := newFakeV2(t)
 	f.seedExtent(t, "/a", "AAAA")
 	f.seedExtent(t, "/b", "BBBBBBBB")
@@ -129,8 +131,9 @@ func TestRenameOverOpenTargetUnretainsOnFailure(t *testing.T) {
 	if !passed || !errors.Is(err, boom) {
 		t.Fatalf("rename: err=%v passed=%v, want the chain's error", err, passed)
 	}
-	if ehB.path != "/b" {
-		t.Fatalf("displaced target's descriptor not pointed back: handle at %q", ehB.path)
+	sentinel := ehB.path
+	if sentinel == "/b" {
+		t.Fatal("displaced descriptor was pulled back onto the replaceable name")
 	}
 	if got := f.contentOf("/b"); got != "BBBBBBBB" {
 		t.Fatalf("/b = %q after the failed rename, want BBBBBBBB", got)
@@ -138,23 +141,31 @@ func TestRenameOverOpenTargetUnretainsOnFailure(t *testing.T) {
 	if got := f.contentOf("/a"); got != "AAAA" {
 		t.Fatalf("/a = %q, want AAAA", got)
 	}
-	if left := hiddenNames(f); len(left) != 0 {
-		t.Fatalf("alias left behind after the failed rename: %v", left)
-	}
-	b.mu.Lock()
-	left := len(b.sentinels)
-	pathB := b.paths[ehB.ino]
-	b.mu.Unlock()
-	if left != 0 || pathB != "/b" {
-		t.Fatalf("sentinels=%d paths[B]=%q, want 0 and /b", left, pathB)
-	}
+	// The alias shares the object: a write through the displaced descriptor
+	// lands on the alias and is the same bytes /b shows.
 	if err := ehB.Write(context.Background(), 0, []byte("ZZZZ")); err != nil {
 		t.Fatal(err)
 	}
 	if err := ehB.Sync(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	if got := f.contentOf(b.fullPath(sentinel)); got != "ZZZZBBBB" {
+		t.Fatalf("alias = %q after B's write, want ZZZZBBBB", got)
+	}
 	if got := f.contentOf("/b"); got != "ZZZZBBBB" {
-		t.Fatalf("/b = %q after B's write, want ZZZZBBBB", got)
+		t.Fatalf("/b = %q after B's write (the object is shared), want ZZZZBBBB", got)
+	}
+	// The alias drops at B's own last close; /b keeps the file.
+	if err := ehB.Release(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if left := hiddenNames(f); len(left) != 0 {
+		t.Fatalf("alias left behind after B's close: %v", left)
+	}
+	if got := f.contentOf("/b"); got != "ZZZZBBBB" {
+		t.Fatalf("/b = %q after B's close, want ZZZZBBBB", got)
+	}
+	if reg := registeredSentinels(b); reg != 0 {
+		t.Fatalf("%d registrations left behind", reg)
 	}
 }

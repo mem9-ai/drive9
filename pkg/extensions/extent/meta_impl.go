@@ -1189,13 +1189,17 @@ func (b *Bridge) KeepDeletedOpen(local string) (string, error) {
 // RetainOpenAlias retains an OPEN extent file that a rename is about to
 // replace WITHOUT vacating its name: a hardlink is added under a fresh
 // sentinel name (non-replacing — the server refuses an existing
-// destination), the live incarnation's mapping is pointed at it so its
-// descriptors read and commit through the alias, the pathname keeps
-// resolving to the same inode while it still names the file, and the
-// sentinel is registered. Whatever the rename's outcome, the sentinel is
-// only ever one extra reference to the file: deleting it at the last close
-// is correct in every history, and nothing ever has to be put back with a
-// replacing operation. "" when the file is already gone remotely.
+// destination) and the live incarnation's mapping is pointed at the alias,
+// so its descriptors read and commit through a name nothing else touches.
+// The retained name itself stops resolving to the inode: a resolution of
+// the name re-points the inode's mapping at it (remember), which would
+// drag the retained descriptor back onto the replaceable name mid-rename.
+// The alias is one extra reference in every history — dropping it at the
+// retained file's last close is always correct (an extra link while the
+// file still holds its name, its last reference once the name was
+// replaced) — so no outcome ever needs a rollback, and nothing is ever
+// put back, deleted or decided from an unreserved observation. "" when
+// the file is already gone remotely.
 func (b *Bridge) RetainOpenAlias(local string) (string, error) {
 	full := b.fullPath(local)
 	b.mu.Lock()
@@ -1215,51 +1219,12 @@ func (b *Bridge) RetainOpenAlias(local string) (string, error) {
 	b.mu.Lock()
 	b.paths[live] = sentinelFull
 	b.replacements[sentinelFull] = live
-	b.replacements[full] = live
+	if b.replacements[full] == live {
+		delete(b.replacements, full)
+	}
 	b.sentinels[sentinel] = live
 	b.mu.Unlock()
 	return sentinel, nil
-}
-
-// UnretainOpenAlias undoes RetainOpenAlias once the rename is KNOWN not to
-// have applied (the file still occupies its name): the mapping returns to
-// the name, the registration is dropped and the extra link removed. The
-// file itself was never moved, so nothing is restored and nothing can be
-// overwritten. A registration that already went away (the last descriptor
-// closed meanwhile and dropped the alias) leaves nothing to undo.
-func (b *Bridge) UnretainOpenAlias(sentinel, local string) {
-	full := b.fullPath(local)
-	sentinelFull := b.fullPath(sentinel)
-	b.mu.Lock()
-	live, ours := b.sentinels[sentinel]
-	if ours {
-		delete(b.sentinels, sentinel)
-		delete(b.replacements, sentinelFull)
-		b.paths[live] = full
-	}
-	b.mu.Unlock()
-	if !ours {
-		return
-	}
-	if err := b.cfg.Client.RemoveAllCtx(context.Background(), sentinelFull); err != nil && !client.IsNotFound(err) {
-		// The extra link lingers as a hidden name; the file is intact at
-		// its own name. Nothing to escalate.
-		_ = err
-	}
-}
-
-// DisownPath drops the pathname's owner registration if it still points at
-// the sentinel's retained incarnation: the name no longer (provably) holds
-// that file, so later opens of the name must resolve whatever is there now
-// as a new incarnation instead of converging on the retained descriptor.
-func (b *Bridge) DisownPath(local, sentinel string) {
-	full := b.fullPath(local)
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	live, ours := b.sentinels[sentinel]
-	if ours && b.replacements[full] == live {
-		delete(b.replacements, full)
-	}
 }
 
 // DropDeletedOpen removes a REGISTERED sentinel after the last handle
