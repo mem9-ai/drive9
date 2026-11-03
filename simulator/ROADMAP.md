@@ -202,3 +202,13 @@ Delete `blackbox/` and `e2e/` only after G4 (CI cut-over) lands.
   removal list — "failures are product bugs, not harness filters"); commit or
   restore it before pinning a ref for CI.
 - firecracker sandbox remains a skeleton (not needed for this roadmap).
+
+  CI run 41559544421 (mtime fix landed) vs local divergence log:
+  - exclusive-create PASSES locally (arm64 container) but fails in CI at
+    section 4 (renameat2 RENAME_NOREPLACE race: RN-WINNERS=00, both
+    renames fail) — x86_64 CI + mock rename path to compare next;
+  - rmr's 30s reuse retry WORKS in CI (script completes, drain ok) — but
+    an echoed not-ok-2 needs a re-read of its report.tap;
+  - save-then-read TORN-READ persists (rename-path seed variant);
+  - fstest-fsx: suite passes, post-suite drain leaves 1 LWW conflict;
+  - fstest-sqlite: mptest broken 0/0 (fstest-internal).
