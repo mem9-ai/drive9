@@ -328,6 +328,19 @@ func (h *Handler) tryClaimOpen(ctx context.Context, op *fs.Op) (fs.Result, error
 	// without O_CREAT — the classic plane would answer ENOENT for a
 	// successfully created, still-open file.
 	if ino, local := h.opts.Engine.Bridge.LocalResolve(op.Path); local {
+		if op.Flags&syscall.O_CREAT != 0 && op.Flags&syscall.O_EXCL != 0 {
+			// The folded OpCreate contract includes create/open flags: an
+			// exclusive create of an existing (still-local) file is EEXIST.
+			return fs.Result{}, syscall.EEXIST, true
+		}
+		if op.Flags&syscall.O_TRUNC != 0 {
+			if errno := h.opts.Engine.VFS.Truncate(vfsCtx(op.Caller), ino, 0, 0, nil); errno != 0 {
+				return fs.Result{}, errno, true
+			}
+			if err := h.opts.Engine.Bridge.TruncateLocal(ctx, op.Path, 0); err != nil {
+				return fs.Result{}, err, true
+			}
+		}
 		_, fh, errno := h.opts.Engine.VFS.Open(vfsCtx(op.Caller), ino, op.Flags)
 		if errno != 0 {
 			return fs.Result{}, errno, true
@@ -613,17 +626,28 @@ func (e *engineHandle) Write(ctx context.Context, off int64, data []byte) error 
 }
 
 func (e *engineHandle) Sync(ctx context.Context) error {
-	if errno := e.plane.opts.Engine.VFS.Fsync(e.vctx, e.ino, 0, e.fh); errno != 0 {
+	errno := e.plane.opts.Engine.VFS.Fsync(e.vctx, e.ino, 0, e.fh)
+	if errno != 0 && !e.plane.opts.Engine.Bridge.HasPending(e.ino) {
 		return errno
 	}
-	if e.plane.opts.SyncMode == "interactive" {
+	// A failed VFS-level flush may itself be a failed COMMIT attempt
+	// whose state the bridge preserved: FlushFile below retries it, and
+	// success resolves the fsync. (With nothing pending the errno above
+	// already returned.)
+	if errno == 0 && e.plane.opts.SyncMode == "interactive" {
 		// fsync is a local durability barrier on RTT-bound mounts, exactly
 		// like the classic plane's staging ledger: spill the pending blocks
 		// durably and return; the remote commit lands at the flush/close
 		// boundary or the next mount's replay of the staged record.
 		return e.plane.opts.Engine.Bridge.StagePendingLocal(e.ino)
 	}
-	return e.plane.opts.Engine.FlushFile(ctx, uint64(e.ino))
+	if err := e.plane.opts.Engine.FlushFile(ctx, uint64(e.ino)); err != nil {
+		if errno != 0 {
+			return errno // the VFS-level failure still stands
+		}
+		return err
+	}
+	return nil
 }
 
 func (e *engineHandle) Flush(ctx context.Context) error {

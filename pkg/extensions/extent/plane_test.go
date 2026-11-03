@@ -39,6 +39,7 @@ type fakeV2 struct {
 	nextID     int
 	statFail   map[string]bool          // paths whose HEAD answers 500 (probe injection)
 	legacy     bool                     // classic-only server: extent sessions degrade to classic
+	failBody   bool                     // abort classic GET bodies mid-stream (2 bytes delivered)
 	presigns   int                      // presign-batch calls
 	completes  int                      // complete calls
 	upSize     int64                    // last initiate's total size (part sizing)
@@ -178,8 +179,15 @@ func newFakeV2(t *testing.T) *fakeV2 {
 			f.mu.Lock()
 			if classic := f.classic[path]; classic != "" && f.extent[path] == "" {
 				// A classic (legacy) file: the raw byte stream, not a plan.
+				fail := f.failBody
 				f.mu.Unlock()
 				w.Header().Set("Content-Length", fmt.Sprint(len(classic)))
+				if fail {
+					// Deliver a valid prefix, then kill the connection:
+					// io.ReadAll must see the truncation.
+					_, _ = w.Write([]byte(classic[:min(2, len(classic))]))
+					panic(http.ErrAbortHandler)
+				}
 				_, _ = w.Write([]byte(classic))
 				return
 			}
@@ -212,6 +220,20 @@ func newFakeV2(t *testing.T) *fakeV2 {
 			w.WriteHeader(http.StatusAccepted)
 			_ = json.NewEncoder(w).Encode(client.ExtentWritePlan{UploadID: "u1", NewSize: body.NewSize, Blocks: blocks})
 		case http.MethodPost:
+			if _, isCreate := r.URL.Query()["create"]; isCreate {
+				// POST <path>?create=1: materialize an empty classic file.
+				f.mu.Lock()
+				defer f.mu.Unlock()
+				if f.extent[path] != "" || f.classic[path] != "" || f.dirs[path] {
+					http.Error(w, "exists", http.StatusConflict)
+					return
+				}
+				f.classic[path] = ""
+				f.nextID++
+				f.ids[path] = fmt.Sprintf("res-%d", f.nextID)
+				_ = json.NewEncoder(w).Encode(map[string]any{"revision": 1})
+				return
+			}
 			if _, isLink := r.URL.Query()["hardlink"]; isLink {
 				// POST <dst>?hardlink=1 with X-Dat9-Hardlink-Source: like the
 				// real server, an existing destination is REFUSED (409) and
@@ -476,6 +498,22 @@ func (f *fakeV2) gateWaiting(path string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.gateHits[path]
+}
+
+// setFailBody aborts (on=true) classic GET bodies after a 2-byte prefix.
+func (f *fakeV2) setFailBody(on bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failBody = on
+}
+
+// existsOf reports whether any entry (extent, classic or dir) holds the
+// path.
+func (f *fakeV2) existsOf(path string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, hasID := f.ids[path]
+	return hasID || f.dirs[path]
 }
 
 // setLegacy switches the fake to a pre-extent (classic-only) server.
@@ -2973,5 +3011,239 @@ func TestLocalLookupKeepsRecordedZeroMode(t *testing.T) {
 	}
 	if res.Attr.Mode != 0 {
 		t.Fatalf("mode = %o, want the recorded 0000", res.Attr.Mode)
+	}
+}
+
+// Round-19: a classic base read that dies mid-body must not publish a
+// damaged image — the commit fails visibly, the pending state survives,
+// and the retry after recovery lands the correct bytes.
+func TestClassicBaseReadFailurePreservesPending(t *testing.T) {
+	f := newFakeV2(t)
+	f.setLegacy(true)
+	f.setDir("/d", true)
+	h := newTestHandler(t, f, 0)
+	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
+	eh := res.Handle.(*engineHandle)
+	if err := eh.Write(context.Background(), 0, []byte("AAAA")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// The second commit's base download dies after a valid prefix.
+	f.setFailBody(true)
+	if err := eh.Write(context.Background(), 4, []byte("BBBB")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Sync(context.Background()); err == nil {
+		t.Fatal("the commit succeeded despite the truncated base read")
+	}
+	if got := f.contentOf("/d/f.bin"); got != "AAAA" {
+		t.Fatalf("server content after the failed commit = %q, want AAAA untouched", got)
+	}
+	// The pending write survives: a read through the handle still shows it.
+	f.setFailBody(false)
+	if err := eh.Sync(context.Background()); err != nil {
+		t.Fatalf("retry after recovery: %v", err)
+	}
+	if got := f.contentOf("/d/f.bin"); got != "AAAABBBB" {
+		t.Fatalf("server content after the retry = %q, want AAAABBBB", got)
+	}
+}
+
+// Round-19: reads through a classic-owned handle overlay the deferred
+// (interactive) writes — read-after-write holds before publication.
+func TestInteractiveClassicReadAfterWrite(t *testing.T) {
+	f := newFakeV2(t)
+	f.setLegacy(true)
+	f.setDir("/d", true)
+	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: engineCacheDir(t)})
+	h := New(Options{Engine: eng, Threshold: 0, SyncMode: "interactive"})
+	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
+	eh := res.Handle.(*engineHandle)
+	if err := eh.Write(context.Background(), 0, []byte("AAAA")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Write(context.Background(), 0, []byte("ZZ")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := readFront(t, eh, 8); got != "ZZAA" {
+		t.Fatalf("deferred read through the classic handle = %q, want ZZAA", got)
+	}
+	if err := eh.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.contentOf("/d/f.bin"); got != "ZZAA" {
+		t.Fatalf("server content after flush = %q, want ZZAA", got)
+	}
+}
+
+// Round-19: a pure truncation on a classic-owned handle persists through
+// the durability barrier instead of silently resurrecting the tail.
+func TestClassicOwnedTruncatePersists(t *testing.T) {
+	f := newFakeV2(t)
+	f.setLegacy(true)
+	f.setDir("/d", true)
+	h := newTestHandler(t, f, 0)
+	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
+	eh := res.Handle.(*engineHandle)
+	if err := eh.Write(context.Background(), 0, []byte("AAAA BBBB")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.Do(context.Background(), &fs.Op{Kind: fs.OpSetAttr, Path: "/d/f.bin", HasSize: true, Size: 4, Caller: fs.Caller{Pid: 1}}, fs.Next(func(ctx context.Context, op *fs.Op) (fs.Result, error) {
+		return fs.Result{}, nil
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.contentOf("/d/f.bin"); got != "AAAA" {
+		t.Fatalf("server content after the truncation barrier = %q, want AAAA", got)
+	}
+}
+
+// Round-19: degraded-layout ownership survives the durable recovery — the
+// manifest carries the classic flag and the replaying bridge keeps
+// committing through the classic surface.
+func TestClassicOwnershipSurvivesRecovery(t *testing.T) {
+	f := newFakeV2(t)
+	f.setLegacy(true)
+	f.setDir("/d", true)
+	dir := engineCacheDir(t)
+	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: dir})
+	h := New(Options{Engine: eng, Threshold: 0, SyncMode: "interactive"})
+	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
+	eh := res.Handle.(*engineHandle)
+	if err := eh.Write(context.Background(), 0, []byte("AAAA")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Write(context.Background(), 0, []byte("ZZ")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	eng2 := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: dir})
+	_ = eng2
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := f.contentOf("/d/f.bin"); got == "ZZAA" {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("recovery never landed the classic-owned barrier; server has %q", f.contentOf("/d/f.bin"))
+}
+
+// Round-19: the staged classic-read buffers stay bounded — successive
+// distinct reads retire the oldest beyond the budget.
+func TestClassicReadCacheBounded(t *testing.T) {
+	old := classicReadCacheBytes
+	classicReadCacheBytes = 4096
+	defer func() { classicReadCacheBytes = old }()
+
+	f := newFakeV2(t)
+	f.setLegacy(true)
+	f.setDir("/d", true)
+	h := newTestHandler(t, f, 0)
+	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
+	eh := res.Handle.(*engineHandle)
+	payload := make([]byte, 16<<10)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	if err := eh.Write(context.Background(), 0, payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 4096)
+	for off := 0; off < 12<<10; off += 4096 {
+		if _, err := eh.Read(context.Background(), int64(off), buf); err != nil {
+			t.Fatalf("read at %d: %v", off, err)
+		}
+	}
+	eng := h.opts.Engine
+	eng.Bridge.mu.Lock()
+	held := eng.Bridge.classicBytes
+	entries := len(eng.Bridge.classicLRU)
+	eng.Bridge.mu.Unlock()
+	// The bound is the budget plus ONE in-flight chunk staging (the
+	// engine fetches a returned slice's bytes right after meta.Read, so
+	// the newest entry cannot be retired mid-flight).
+	if held > classicReadCacheBytes+int64(len(payload)) || entries > 1 {
+		t.Fatalf("classic staging holds %d bytes in %d entries, want bounded (%d + one chunk, 1 entry)", held, entries, classicReadCacheBytes)
+	}
+}
+
+// Round-19: an empty-file barrier materializes the acknowledged name at
+// recovery instead of deleting its record into nothing.
+func TestEmptyBarrierReplayCreatesFile(t *testing.T) {
+	f := newFakeV2(t)
+	f.setLegacy(false)
+	f.setDir("/d", true)
+	dir := engineCacheDir(t)
+	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: dir})
+	h := New(Options{Engine: eng, Threshold: 0, SyncMode: "interactive"})
+	res, _, passed := dispatchCreate(context.Background(), h, "/d/empty.bin", syscall.O_RDWR|syscall.O_CREAT)
+	if passed {
+		t.Fatal("full-mode create must be claimed")
+	}
+	if err := res.Handle.(*engineHandle).Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// A zero-barrier fsync: no bytes, but the name is acknowledged.
+	eng2 := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: dir})
+	_ = eng2
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if f.existsOf("/d/empty.bin") {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("recovery never materialized the acknowledged empty file")
+}
+
+// Round-19: the folded OpCreate flag contract holds for still-local files —
+// O_CREAT|O_EXCL answers EEXIST and O_TRUNC truncates.
+func TestLocalClaimFlagSemantics(t *testing.T) {
+	f := newFakeV2(t)
+	f.setDir("/d", true)
+	h := newTestHandler(t, f, 0)
+	if _, _, passed := dispatchCreate(context.Background(), h, "/d/x.bin", syscall.O_RDWR|syscall.O_CREAT); passed {
+		t.Fatal("full-mode create must be claimed")
+	}
+	_, err, _ := dispatchCreate(context.Background(), h, "/d/x.bin", syscall.O_RDWR|syscall.O_CREAT|syscall.O_EXCL)
+	if err == nil {
+		t.Fatal("an exclusive create of the existing local file must fail")
+	}
+	res, rerr, passed := dispatchCreate(context.Background(), h, "/d/x.bin", syscall.O_WRONLY|syscall.O_TRUNC)
+	if rerr != nil || passed {
+		t.Fatalf("O_TRUNC reopen: err=%v passed=%v", rerr, passed)
+	}
+	eh := res.Handle.(*engineHandle)
+	if err := eh.Write(context.Background(), 0, []byte("DATA")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.contentOf("/d/x.bin"); got != "DATA" {
+		t.Fatalf("content after O_TRUNC + write = %q, want DATA (the truncate cleared nothing)", got)
 	}
 }

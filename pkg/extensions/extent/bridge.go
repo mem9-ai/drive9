@@ -76,6 +76,11 @@ type Bridge struct {
 	// blocks maps deterministic ids (content sha256, or the zero-block ids)
 	// to their URL registry entry.
 	blocks *blockRegistry
+	// classicLRU bounds the staging bytes retained for classic-owned
+	// reads (oldest-first retirement beyond classicReadCacheBytes).
+	classicLRU   []classicRef
+	classicBytes int64
+
 	// classicOwned marks files whose fresh extent session silently
 	// degraded to a CLASSIC upload on a legacy server: the handle stays
 	// owned by this bridge, so commits and reads keep serving it through
@@ -173,6 +178,13 @@ func NewBridge(cfg Config) *Bridge {
 	return br
 }
 
+// classicRef is one staged classic chunk read on the bounded LRU.
+type classicRef struct {
+	sum   string
+	id    uint64
+	bytes int64
+}
+
 // newBridgeFinish installs cross-referencing hooks that need the assembled
 // Bridge (the block registry resolves provenance inodes through the
 // bridge's CURRENT path mappings — open files move under renames and
@@ -260,8 +272,9 @@ func detID(sum []byte) uint64 {
 // object URLs (with expiry), and the file provenance needed to refetch a
 // plan when a URL goes stale.
 type blockRegistry struct {
-	mu sync.Mutex
-	m  map[uint64]*blockEntry
+	mu   sync.Mutex
+	m    map[uint64]*blockEntry
+	pins map[string]int // checksum -> pending-commit references
 	// currentPath resolves an inode to the remote path it maps to NOW.
 	currentPath func(ino meta.Ino) (string, bool)
 }
@@ -277,7 +290,9 @@ type blockEntry struct {
 	cached          []byte
 }
 
-func newBlockRegistry() *blockRegistry { return &blockRegistry{m: make(map[uint64]*blockEntry)} }
+func newBlockRegistry() *blockRegistry {
+	return &blockRegistry{m: make(map[uint64]*blockEntry), pins: make(map[string]int)}
+}
 
 // ctxOf adapts a meta.Context to a context.Context (meta.Context embeds
 // context.Context).

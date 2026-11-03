@@ -260,10 +260,51 @@ func (r *blockRegistry) registerLocal(sha string, length int64) uint64 {
 	return detID(sum)
 }
 
-func (r *blockRegistry) stageBytes(sha string, data []byte) {
+// stagePinned stores staged bytes with an optional pending-commit pin;
+// pinned entries are never retired by the classic-read LRU.
+func (r *blockRegistry) stagePinned(sha string, data []byte, pinned bool) uint64 {
+	id := r.stageBytes(sha, data)
+	if pinned {
+		r.pin(sha)
+	}
+	return id
+}
+
+// pin marks a checksum as referenced by a pending commit.
+func (r *blockRegistry) pin(sha string) {
+	r.mu.Lock()
+	r.pins[sha]++
+	r.mu.Unlock()
+}
+
+// unpin releases a pending-commit reference.
+func (r *blockRegistry) unpin(sha string) {
+	r.mu.Lock()
+	if r.pins[sha] > 0 {
+		r.pins[sha]--
+	}
+	r.mu.Unlock()
+}
+
+// releaseIfUnpinned drops a staged entry nothing references.
+func (r *blockRegistry) releaseIfUnpinned(sha string) {
 	sum, err := hex.DecodeString(sha)
 	if err != nil || len(sum) < 8 {
 		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.pins[sha] > 0 {
+		return
+	}
+	delete(r.pins, sha)
+	delete(r.m, detID(sum))
+}
+
+func (r *blockRegistry) stageBytes(sha string, data []byte) uint64 {
+	sum, err := hex.DecodeString(sha)
+	if err != nil || len(sum) < 8 {
+		return 0
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -272,9 +313,10 @@ func (r *blockRegistry) stageBytes(sha string, data []byte) {
 		if e.cached == nil {
 			e.cached = data
 		}
-		return
+		return id
 	}
 	r.m[id] = &blockEntry{sha256: sha, size: int64(len(data)), cached: data}
+	return id
 }
 
 // release drops a block's staged bytes. Called after a successful commit —

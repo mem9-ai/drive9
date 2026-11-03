@@ -696,8 +696,9 @@ func (b *Bridge) Write(ctx meta.Context, ino meta.Ino, indx uint32, off uint32, 
 	sum := sha256Hex(data)
 	delete(b.stagedSlices, slice.Id)
 	// Make the bytes findable by checksum for the commit path
-	// (assembleImage / blockBytes refetch).
-	b.blocks.stageBytes(sum, data)
+	// (assembleImage / blockBytes refetch), pinned against the classic
+	// read LRU: a pending commit still needs them.
+	b.blocks.stagePinned(sum, data, true)
 	b.pending[ino] = append(b.pending[ino], pendingWrite{chunk: indx, off: off, checksum: sum, size: int64(slice.Len)})
 	end := int64(indx)*meta.ChunkSize + int64(off) + int64(slice.Len)
 	if end > b.sizes[ino] {
@@ -804,17 +805,34 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 		// creator asked for.
 		_ = b.cfg.Client.ChmodCtx(ctx, path, uint32(mode))
 	}
-	// Refresh the revision so the next commit CASes against reality.
+	// Refresh the revision so the next commit CASes against reality, and
+	// classify a fresh session's landed layout. The stat is retried: a
+	// transient failure after a successful upload must not leave the
+	// layout unknown — the next write through the same handle would then
+	// fail on a target it actually owns.
+	if fresh {
+		for _, delay := range []time.Duration{0, 200 * time.Millisecond, 500 * time.Millisecond} {
+			time.Sleep(delay)
+			nst, serr := b.cfg.Client.StatCtx(ctx, path)
+			if serr != nil {
+				if client.IsNotFound(serr) {
+					continue // landed under a different view; keep retrying
+				}
+				continue
+			}
+			b.mu.Lock()
+			b.revs[ino] = nst.Revision
+			if nst.ContentLayout != client.ContentLayoutExtent {
+				b.classicOwned[ino] = true // the session degraded to classic
+			}
+			b.mu.Unlock()
+			return nil
+		}
+		return fmt.Errorf("verify landed layout of %s: stat unavailable", path)
+	}
 	if nst, err := b.cfg.Client.StatCtx(ctx, path); err == nil {
 		b.mu.Lock()
 		b.revs[ino] = nst.Revision
-		if !fresh || nst.ContentLayout == client.ContentLayoutExtent {
-			// (non-fresh targets were extent above; fresh sessions normally
-			// land extent — anything else means the server degraded the
-			// session to a classic upload.)
-		} else {
-			b.classicOwned[ino] = true
-		}
 		b.mu.Unlock()
 	}
 	return nil
@@ -836,8 +854,15 @@ func (b *Bridge) isClassicOwned(ino meta.Ino) bool {
 func (b *Bridge) commitClassic(ctx context.Context, ino meta.Ino, path string, pending []pendingWrite, size, rev int64) error {
 	var image []byte
 	if rc, err := b.cfg.Client.ReadStream(ctx, path); err == nil {
-		image, _ = io.ReadAll(rc)
+		var rerr error
+		// The body must be fully consumed before the image is trusted: a
+		// truncated download with a discarded error would zero-pad the
+		// missing tail and upload a damaged image under a valid revision.
+		image, rerr = io.ReadAll(rc)
 		_ = rc.Close()
+		if rerr != nil {
+			return fmt.Errorf("read classic base %s: %w", path, rerr)
+		}
 	} else if !client.IsNotFound(err) {
 		return err
 	}
@@ -937,6 +962,12 @@ func (b *Bridge) flushTruncateOnly(ctx context.Context, ino meta.Ino, size int64
 			return nil
 		}
 		return err
+	}
+	if b.isClassicOwned(ino) && st.ContentLayout != client.ContentLayoutExtent {
+		// A degraded (classic) target: compose the truncated image and
+		// re-upload through the classic surface — a silent success would
+		// resurrect the discarded tail on the next open.
+		return b.commitClassic(ctx, ino, path, nil, size, st.Revision)
 	}
 	if st.Size == size || st.ContentLayout != client.ContentLayoutExtent {
 		if st.Size == size {
@@ -1251,6 +1282,7 @@ type stagedManifest struct {
 	Path       string `json:"path"`
 	Ino        uint64 `json:"ino"`
 	ResourceID string `json:"resource_id,omitempty"`
+	Classic    bool   `json:"classic,omitempty"` // the handle owns a degraded classic target
 	Size       int64  `json:"size"`
 	Trunc      int64  `json:"trunc,omitempty"`
 	HasTrunc   bool   `json:"has_trunc,omitempty"`
@@ -1312,8 +1344,11 @@ func (b *Bridge) StagePendingLocal(ino meta.Ino) error {
 			_ = os.RemoveAll(dir)
 		}
 	}()
+	b.mu.Lock()
+	classic := b.classicOwned[ino]
+	b.mu.Unlock()
 	var m stagedManifest
-	m.Path, m.Ino, m.ResourceID = path, uint64(ino), resID
+	m.Path, m.Ino, m.ResourceID, m.Classic = path, uint64(ino), resID, classic
 	m.Size, m.Trunc, m.HasTrunc = size, trunc, hasTrunc
 	ctx := context.Background()
 	for i, p := range pending {
@@ -1420,10 +1455,28 @@ func (b *Bridge) ReplayStagedLocal(ctx context.Context) {
 		if m.HasTrunc {
 			b.truncs[ino] = m.Trunc
 		}
+		if m.Classic {
+			// The handle owned a degraded classic target: recovery keeps
+			// committing through the classic surface.
+			b.classicOwned[ino] = true
+		}
 		b.mu.Unlock()
 		err = b.flushPendingLocked(ctx, ino)
 		if err == nil && m.HasTrunc && len(pending) == 0 {
 			err = b.flushTruncateOnly(ctx, ino, m.Size)
+		}
+		if err == nil && m.Size == 0 && len(pending) == 0 && !m.HasTrunc {
+			// An empty-file barrier must still materialize the NAME: a
+			// successful fsync acknowledged the file's existence, and
+			// dropping the record without creating it would make the
+			// acknowledged file disappear.
+			if st, serr := b.StatLocal(ctx, m.Path); serr != nil && client.IsNotFound(serr) {
+				_, err = b.cfg.Client.CreateFileCtx(ctx, m.Path)
+			} else if serr != nil {
+				err = serr
+			} else {
+				_ = st
+			}
 		}
 		unlock()
 		if err == nil {
@@ -1512,6 +1565,7 @@ func (b *Bridge) lockCommit(ino meta.Ino) func() {
 func (b *Bridge) readClassic(ctx context.Context, ino meta.Ino, path string, start, chunkEnd int64, slices *[]meta.Slice) syscall.Errno {
 	b.mu.Lock()
 	size := b.sizes[ino]
+	pending := append([]pendingWrite(nil), b.pending[ino]...)
 	b.mu.Unlock()
 	length := chunkEnd + 1 - start
 	if size > 0 && start+length > size {
@@ -1525,13 +1579,72 @@ func (b *Bridge) readClassic(ctx context.Context, ino meta.Ino, path string, sta
 	if err != nil {
 		return errnoOf(err)
 	}
-	data, _ := io.ReadAll(rc)
+	data, rerr := io.ReadAll(rc)
 	_ = rc.Close()
+	if rerr != nil {
+		// A partial body must never publish as a successful read.
+		return syscall.EIO
+	}
+	// Deferred (interactive) writes overlay the remote base so
+	// read-after-write holds while publication is deferred.
+	for _, p := range pending {
+		off := int64(p.chunk)*meta.ChunkSize + int64(p.off)
+		end := off + p.size
+		if end <= start || off >= start+int64(len(data)) {
+			continue
+		}
+		pdata, err := b.blockBytes(ctx, p, path)
+		if err != nil {
+			return syscall.EIO
+		}
+		if off < start {
+			pdata = pdata[start-off:]
+			off = start
+		}
+		if end > start+int64(len(data)) {
+			data = append(data, make([]byte, end-start-int64(len(data)))...)
+		}
+		copy(data[off-start:], pdata)
+	}
 	sum := sha256Hex(data)
-	b.blocks.stageBytes(sum, data)
-	id := b.blocks.registerLocal(sum, int64(len(data)))
+	id := b.stageClassicChunk(sum, data)
 	*slices = []meta.Slice{{Id: id, Size: uint32(len(data)), Len: uint32(len(data))}}
 	return 0
+}
+
+// classicReadCacheBytes bounds the staged bytes retained for reads of
+// classic-owned (degraded) files. A var so tests can shrink it.
+var classicReadCacheBytes int64 = 64 << 20
+
+// stageClassicChunk publishes a classic chunk read under its deterministic
+// id and retires the OLDEST classic-sourced entries beyond the budget —
+// pinned entries (a pending commit still references their checksum) are
+// never retired, so a scan through a large degraded file cannot grow the
+// staging registry without bound.
+func (b *Bridge) stageClassicChunk(sum string, data []byte) uint64 {
+	id := b.blocks.stagePinned(sum, data, false)
+	b.mu.Lock()
+	b.classicLRU = append(b.classicLRU, classicRef{sum: sum, id: id, bytes: int64(len(data))})
+	b.classicBytes += int64(len(data))
+	var retire []classicRef
+	for b.classicBytes > classicReadCacheBytes && len(b.classicLRU) > 1 {
+		oldest := b.classicLRU[0]
+		b.classicLRU = b.classicLRU[1:]
+		b.classicBytes -= oldest.bytes
+		retire = append(retire, oldest)
+	}
+	b.mu.Unlock()
+	for _, r := range retire {
+		b.blocks.releaseIfUnpinned(r.sum)
+	}
+	return id
+}
+
+// HasPending reports whether un-committed writes remain for the inode.
+func (b *Bridge) HasPending(ino meta.Ino) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.pending[ino]) > 0
 }
 
 // EnableDeferredCommits arms interactive durability: writer flushes stage
@@ -1602,6 +1715,7 @@ func (b *Bridge) releaseCommitted(ino meta.Ino, pending []pendingWrite) {
 			continue
 		}
 		b.blocks.release(p.checksum)
+		b.blocks.unpin(p.checksum)
 	}
 }
 
