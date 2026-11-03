@@ -451,7 +451,7 @@ func New(opts Options) (*Writeback, error) {
 			// comes from the server's completion echo, so the handle's
 			// base revision advances on exactly this publication.
 			if v, ok := w.live.Load(entry.Path); ok {
-				if h, ok := v.(*bufferingHandle); ok {
+				if h, ok := v.(*bufferingHandle); ok && h.stagedSnapshotIs(entry.SnapshotID) {
 					h.markLanded(committedRev)
 				}
 			}
@@ -2697,6 +2697,18 @@ func (w *Writeback) armBypass(path string, rev, size int64, reason string) {
 // write touching an evicted part failed with 'shadow file not found' and
 // surfaced as EIO on write(2). After a landing the remote image is
 // authoritative and complete, so it becomes the fallback restore source.
+// stagedSnapshotIs reports whether this handle's current staged snapshot is
+// exactly id AND nothing has been staged since (a newer staging replaced
+// the image this landing acknowledges).
+func (h *bufferingHandle) stagedSnapshotIs(id string) bool {
+	if id == "" {
+		return false
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.stagedSnapshotID == id && h.stagedSnapshotSeq == h.stageSeq
+}
+
 func (h *bufferingHandle) armRemoteRestore() {
 	h.mu.Lock()
 	buf, cli, path := h.buf, h.w.opts.Client, h.path

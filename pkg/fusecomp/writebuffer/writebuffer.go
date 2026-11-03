@@ -81,13 +81,17 @@ type WriteBuffer struct {
 	// truncated-away remote bytes (#984).
 	remoteSize int64
 
-	// remoteAuthoritative records that the CURRENT remote image holds
-	// every retained byte of this buffer (the owning handle armed the
-	// loader after its commit landed). Only then may an evicted part fall
-	// back to LoadPart when the shadow spill is gone: without the landing
-	// the remote holds a STALE image, and restoring from it would silently
-	// discard locally staged (fsync-acknowledged) modifications.
+	// remoteAuthoritative records that the remote image holds the bytes
+	// this buffer had at its last landing (the owning handle armed the
+	// loader then). The proof is PART-SCOPED and generation-scoped: any
+	// part this buffer mutates afterwards diverges from that landed image
+	// again (an interactive staging may sit un-uploaded), so restoring it
+	// from the remote would silently discard acknowledged modifications.
+	// remoteTainted tracks those divergent parts; remoteTaintedAll covers
+	// whole-image divergences (truncate/reset).
 	remoteAuthoritative bool
+	remoteTaintedAll    bool
+	remoteTainted       map[int]bool
 
 	// Memory tracking
 	curMemory int64 // current bytes held in parts map
@@ -221,6 +225,7 @@ func (wb *WriteBuffer) Write(offset int64, data []byte) (uint32, error) {
 
 		copy(part[partOff:partOff+canWrite], data[dataOff:dataOff+int(canWrite)])
 		wb.dirtyParts[partIdx] = true
+		wb.taintRemoteRange(int64(partIdx)*wb.partSize, int64(partIdx)*wb.partSize+canWrite)
 
 		pos += canWrite
 		dataOff += int(canWrite)
@@ -316,6 +321,7 @@ func (wb *WriteBuffer) writeSmallFile(offset int64, data []byte) (uint32, error)
 	}
 	wb.touched = true
 	wb.dirtyParts[0] = true // small files map to a single logical part
+	wb.taintRemoteAll() // the single image diverges as a whole
 
 	// Sequential write detection
 	if offset == wb.appendCursor {
@@ -455,7 +461,7 @@ func (wb *WriteBuffer) restoreEvictedPart(partIdx int) ([]byte, bool, error) {
 			return data, true, nil
 		}
 	}
-	if !wb.remoteAuthoritative || wb.LoadPart == nil {
+	if !wb.remoteAuthoritative || wb.LoadPart == nil || wb.remoteTaintedAll || wb.remoteTainted[partIdx] {
 		return nil, false, shadowErr
 	}
 	data, err := wb.LoadPart(partIdx + 1)
@@ -477,6 +483,7 @@ func (wb *WriteBuffer) restoreEvictedPart(partIdx int) ([]byte, bool, error) {
 
 // markDirty marks all parts that overlap with [start, end) as dirty.
 func (wb *WriteBuffer) markDirty(start, end int64) {
+	wb.taintRemoteRange(start, end)
 	firstPart := int(start / wb.partSize)
 	lastPart := int((end - 1) / wb.partSize)
 	if end <= start {
@@ -510,6 +517,7 @@ func (wb *WriteBuffer) Truncate(size int64) error {
 	if size < 0 {
 		size = 0
 	}
+	wb.taintRemoteAll()
 	wb.contentVersion++
 	wb.prefixRevision, wb.prefixEnd = 0, 0
 	wb.touched = true
@@ -636,8 +644,36 @@ func (wb *WriteBuffer) SetRemoteSize(size int64) {
 // every retained byte of this buffer — the owning handle's commit landed
 // and armed the remote loader. Only then may an evicted part fall back to
 // LoadPart when the shadow spill is gone.
+// taintRemoteRange marks every part overlapping [start, end) as diverged
+// from the landed remote image.
+func (wb *WriteBuffer) taintRemoteRange(start, end int64) {
+	if !wb.remoteAuthoritative || wb.partSize <= 0 {
+		return
+	}
+	if start < 0 {
+		start = 0
+	}
+	first := int(start / wb.partSize)
+	last := int((end - 1) / wb.partSize)
+	if wb.remoteTainted == nil {
+		wb.remoteTainted = make(map[int]bool)
+	}
+	for i := first; i <= last; i++ {
+		wb.remoteTainted[i] = true
+	}
+}
+
+// taintRemoteAll drops the landed-image proof for the whole buffer.
+func (wb *WriteBuffer) taintRemoteAll() {
+	if wb.remoteAuthoritative {
+		wb.remoteTaintedAll = true
+	}
+}
+
 func (wb *WriteBuffer) MarkRemoteAuthoritative() {
 	wb.remoteAuthoritative = true
+	wb.remoteTaintedAll = false
+	wb.remoteTainted = nil
 }
 
 // SeedRemote installs a lazy base: the buffer logically spans size bytes
@@ -934,6 +970,7 @@ func (wb *WriteBuffer) LoadMissingParts() error {
 
 // Reset clears the buffer, releasing the underlying memory.
 func (wb *WriteBuffer) Reset() {
+	wb.taintRemoteAll()
 	wb.contentVersion++
 	wb.prefixRevision, wb.prefixEnd = 0, 0
 	wb.parts = make(map[int][]byte)
