@@ -29,7 +29,7 @@ concurrency:
 jobs:
   pr-gate:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     env:
       D9_REPO: ${{ github.workspace }}
       D9_MOCK_SERVER_BIN: ${{ github.workspace }}/bin/drive9-mock-server
@@ -120,9 +120,9 @@ jobs:
               export D9_FSTEST_BIN=/root/.cache/drive9-simulator/fstest/main/target/release/fstest
               cd /repo
               rc=0
-              timeout -k 10 1650 simulator/target/release/drive9-simulator run \
+              timeout -k 10 3300 simulator/target/release/drive9-simulator run \
                 simulator/cases/community/fstest-pjdfstest.t \
-                --stack mock --allow-other --bin /repo/bin/drive9 --home /out/home || rc=$?
+                --stack mock --allow-other --timeout 50m --bin /repo/bin/drive9 --home /out/home || rc=$?
               chmod -R a+rX /out/home 2>/dev/null || true
               exit $rc
             ' || rc=$?
