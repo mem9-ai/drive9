@@ -179,6 +179,14 @@ func main() {
 			zap.Bool("path_style", s3cfg.ForcePathStyle),
 			zap.String("credentials", s3client.CredentialLogValue(s3cfg.AccessKeyID)),
 			zap.String("role", s3client.RoleLogValue(s3cfg.RoleARN)))
+		// Objects are stored unencrypted at rest unless the bucket default or
+		// this policy says otherwise; say so once at startup for a real bucket
+		// so a deployment cannot end up storing tenant data in the clear
+		// without noticing.
+		if s3cfg.EncryptionPolicy.Mode == meta.S3EncryptionModeNone {
+			logger.Warn(context.Background(), "s3_encryption_disabled",
+				zap.String("hint", "set DRIVE9_S3_ENCRYPTION_MODE=sse-kms (with DRIVE9_S3_KMS_KEY_ID) or sse-s3 to encrypt objects at rest"))
+		}
 	}
 
 	encryptType := envOr("DRIVE9_ENCRYPT_TYPE", "local_aes")
@@ -765,9 +773,7 @@ environment:
   DRIVE9_S3_SESSION_TOKEN static S3 session token (optional; requires DRIVE9_S3_ACCESS_KEY_ID and DRIVE9_S3_SECRET_ACCESS_KEY)
   DRIVE9_S3_ROLE_ARN IAM role ARN to assume via STS (optional)
   DRIVE9_S3_DIR      local s3 mock root directory (default: ./s3, only used without DRIVE9_S3_BUCKET)
-  DRIVE9_S3_ENCRYPTION_MODE none|sse-s3|sse-kms|dsse-kms (default: sse-s3). Objects are
-                        encrypted at rest unless this is set to none explicitly; sse-kms (with
-                        DRIVE9_S3_KMS_KEY_ID) is recommended for production.
+  DRIVE9_S3_ENCRYPTION_MODE none|sse-s3|sse-kms|dsse-kms (default: none; recommend sse-kms for production)
   DRIVE9_S3_KMS_KEY_ID KMS key ARN/id required for sse-kms/dsse-kms
   DRIVE9_S3_BUCKET_KEY_ENABLED true|false for SSE-KMS bucket keys (default: true)
 

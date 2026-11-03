@@ -617,10 +617,8 @@ func TestS3ConfigFromEnv(t *testing.T) {
 	if cfg.Bucket != "" {
 		t.Fatalf("default bucket = %q, want empty", cfg.Bucket)
 	}
-	// The zero-config default encrypts objects at rest; a deployment that wants
-	// plaintext for an SSE-hostile backend must say so explicitly.
-	if cfg.EncryptionPolicy.Mode != meta.S3EncryptionModeSSES3 {
-		t.Fatalf("default encryption mode = %q, want %q", cfg.EncryptionPolicy.Mode, meta.S3EncryptionModeSSES3)
+	if cfg.EncryptionPolicy.Mode != meta.S3EncryptionModeNone {
+		t.Fatalf("default encryption mode = %q, want none", cfg.EncryptionPolicy.Mode)
 	}
 	if !cfg.EncryptionPolicy.BucketKeyEnabled {
 		t.Fatal("default bucket key enabled = false, want true")
