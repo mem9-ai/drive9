@@ -441,7 +441,7 @@ func newFakeV2(t *testing.T) *fakeV2 {
 			if os.Getenv("EXTENT_DBG_ID") != "" {
 				fmt.Println("FAKE COMPLETE echo:", landedID, "path:", landedPath)
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"status": "completed", "resource_id": landedID})
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "completed", "resource_id": landedID, "revision": f.completes})
 			return
 		}
 		http.Error(w, "bad upload route", http.StatusNotFound)

@@ -109,23 +109,22 @@ func (cq *CommitQueue) uploadExtentEntry(ctx context.Context, entry *CommitEntry
 	if err != nil {
 		return 0, true, err
 	}
+	// The revision reported on success must be attributable to THIS
+	// publication: a follow-up stat can observe a foreign writer's later
+	// landing and would poison the lineage (checksums recorded under a
+	// revision that never held them). The only trustworthy source is the
+	// server's own completion echo, captured through the sink; servers
+	// that do not echo one leave the revision unknown (0), and a base-0
+	// entry against an existing target keeps its absence-CAS conflict
+	// instead of adopting the routing Stat's revision.
+	var landedRev int64
+	ectx := client.WithCompletedRevisionSink(ctx, &landedRev)
 	start := time.Now()
 	var upErr error
 	if extentTarget && len(entry.DirtyRanges) > 0 {
-		upErr = cq.commitExtentPatch(ctx, apiPath, entry, ra, st.Size)
+		upErr = cq.commitExtentPatch(ectx, apiPath, entry, ra, st.Size)
 	} else {
-		streamRev := expectedRevision
-		if streamRev <= 0 && extentTarget {
-			// A base-0 entry racing an unpropagated landing (the extent
-			// publication carries no revision home, so the journal still
-			// believes the target is absent): CAS against the revision the
-			// routing Stat JUST observed instead of the stale zero. The
-			// whole image is the entry's own content — last-writer-wins
-			// against exactly that revision — and a concurrent change
-			// still fails the CAS into the ordinary conflict resolution.
-			streamRev = st.Revision
-		}
-		upErr = cq.client.WriteExtentStreamConditional(ctx, apiPath, ra, entry.Size, nil, streamRev)
+		upErr = cq.client.WriteExtentStreamConditional(ectx, apiPath, ra, entry.Size, nil, expectedRevision)
 	}
 	if cq.perf != nil {
 		cq.perf.recordRemoteOp(perfRemoteWrite, upErr, time.Since(start), uint64(entry.Size))
@@ -133,17 +132,7 @@ func (cq *CommitQueue) uploadExtentEntry(ctx context.Context, entry *CommitEntry
 	if upErr != nil {
 		return 0, true, upErr
 	}
-	// The extent publication surfaces no revision on its wire responses,
-	// and the queue's next enqueue for this path CASes against whatever
-	// landed: returning 0 here left every extent-plane commit invisible to
-	// the revision lineage, so the next flush re-enqueued as a base-0
-	// create and the whole-image initiate 409'd against the existing
-	// target. Fetch the landed revision; a stat failure degrades to the
-	// old behavior instead of failing a commit that already landed.
-	if nst, nerr := cq.client.StatCtx(ctx, apiPath); nerr == nil {
-		return nst.Revision, true, nil
-	}
-	return 0, true, nil
+	return landedRev, true, nil
 }
 
 // commitExtentPatch uploads the entry's dirty ranges as extent blocks and

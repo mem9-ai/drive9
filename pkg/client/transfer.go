@@ -414,6 +414,22 @@ func completedResourceSinkOf(ctx context.Context) *string {
 	return v
 }
 
+type completedRevisionSinkKey struct{}
+
+// WithCompletedRevisionSink installs a sink receiving the revision the
+// SERVER attributes to this context's completed upload (when the server
+// echoes one). Unlike a follow-up stat — which can observe a foreign
+// writer's later publication — the echoed revision is attributable to
+// exactly the publication the completion acknowledges.
+func WithCompletedRevisionSink(ctx context.Context, sink *int64) context.Context {
+	return context.WithValue(ctx, completedRevisionSinkKey{}, sink)
+}
+
+func completedRevisionSinkOf(ctx context.Context) *int64 {
+	v, _ := ctx.Value(completedRevisionSinkKey{}).(*int64)
+	return v
+}
+
 // WithExpectedResource binds a context's publications to the object's
 // resource identity: every upload initiate (and extent PATCH) under the
 // context carries X-Dat9-Expected-Resource, so the server can refuse a
@@ -1101,7 +1117,7 @@ func (c *Client) completeUploadWithOptions(ctx context.Context, uploadID string,
 	// The server may echo the landed object's resource identity: publish
 	// it to any bound writer so a post-upload stat outage cannot lose the
 	// ownership proof.
-	if id := resourceIDOf(resp); id != "" {
+	if id, _ := completedEchoOf(resp); id != "" {
 		if out := completedResourceSinkOf(ctx); out != nil {
 			*out = id
 		}
@@ -1111,11 +1127,20 @@ func (c *Client) completeUploadWithOptions(ctx context.Context, uploadID string,
 
 // resourceIDOf extracts an echoed resource identity from a response.
 func resourceIDOf(resp *http.Response) string {
+	id, _ := completedEchoOf(resp)
+	return id
+}
+
+// completedEchoOf decodes a completion response's echo block once: the
+// landed object's resource identity and, when the server attributes one,
+// the revision of exactly this publication.
+func completedEchoOf(resp *http.Response) (resourceID string, revision int64) {
 	var body struct {
 		ResourceID string `json:"resource_id"`
+		Revision   int64  `json:"revision"`
 	}
 	_ = json.NewDecoder(resp.Body).Decode(&body)
-	return body.ResourceID
+	return body.ResourceID, body.Revision
 }
 
 // --- v2 upload methods ---
@@ -1492,10 +1517,18 @@ func (c *Client) completeUploadV2WithOptions(ctx context.Context, uploadID strin
 	// The server may echo the landed object's resource identity: publish
 	// it to any bound writer (the extent session AND the degraded classic
 	// session both complete here) so a post-upload stat outage cannot
-	// lose the ownership proof.
-	if id := resourceIDOf(resp); id != "" {
+	// lose the ownership proof. The echoed revision, when present, is
+	// likewise attributable to THIS publication — the only revision a
+	// success callback may report as its own.
+	id, rev := completedEchoOf(resp)
+	if id != "" {
 		if out := completedResourceSinkOf(ctx); out != nil {
 			*out = id
+		}
+	}
+	if rev > 0 {
+		if out := completedRevisionSinkOf(ctx); out != nil {
+			*out = rev
 		}
 	}
 	return nil
