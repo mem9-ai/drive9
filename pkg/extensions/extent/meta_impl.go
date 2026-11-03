@@ -1,6 +1,7 @@
 package extent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -467,6 +468,9 @@ func (b *Bridge) Read(ctx meta.Context, ino meta.Ino, indx uint32, slices *[]met
 	}
 	start := int64(indx) * meta.ChunkSize
 	chunkEnd := start + meta.ChunkSize - 1
+	if b.isClassicOwned(ino) {
+		return b.readClassic(ctx, ino, path, start, chunkEnd, slices)
+	}
 	plan, err := b.cfg.Client.GetExtentReadPlan(ctxOf(ctx), path, start, chunkEnd)
 	if err != nil {
 		if client.IsNotFound(err) {
@@ -726,6 +730,12 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 		return err
 	}
 	if !fresh && st.ContentLayout != client.ContentLayoutExtent {
+		if b.isClassicOwned(ino) {
+			// A fresh session of ours degraded to a classic upload on a
+			// legacy server: keep the open handle usable — commit through
+			// the classic surface instead of rejecting the layout.
+			return b.commitClassic(ctx, ino, path, pending, size, st.Revision)
+		}
 		if st.Size == 0 {
 			// An empty file materialized as classic (empty extent files
 			// cannot exist server-side yet); replace it and treat this as
@@ -773,6 +783,68 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 		_ = b.cfg.Client.ChmodCtx(ctx, path, uint32(mode))
 	}
 	// Refresh the revision so the next commit CASes against reality.
+	if nst, err := b.cfg.Client.StatCtx(ctx, path); err == nil {
+		b.mu.Lock()
+		b.revs[ino] = nst.Revision
+		if !fresh || nst.ContentLayout == client.ContentLayoutExtent {
+			// (non-fresh targets were extent above; fresh sessions normally
+			// land extent — anything else means the server degraded the
+			// session to a classic upload.)
+		} else {
+			b.classicOwned[ino] = true
+		}
+		b.mu.Unlock()
+	}
+	return nil
+}
+
+// isClassicOwned reports whether this bridge owns a file whose extent
+// session degraded to a classic upload (legacy server).
+func (b *Bridge) isClassicOwned(ino meta.Ino) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.classicOwned[ino]
+}
+
+// commitClassic continues a degraded fresh create: the composed image
+// (current remote content with the pending fragments shadowed, truncated
+// or grown to the local size) re-uploads through the classic conditional
+// write. A compatibility path for legacy servers; it materializes the
+// image — the engine plane is not the promotion path there.
+func (b *Bridge) commitClassic(ctx context.Context, ino meta.Ino, path string, pending []pendingWrite, size, rev int64) error {
+	var image []byte
+	if rc, err := b.cfg.Client.ReadStream(ctx, path); err == nil {
+		image, _ = io.ReadAll(rc)
+		_ = rc.Close()
+	} else if !client.IsNotFound(err) {
+		return err
+	}
+	for _, p := range pending {
+		off := int64(p.chunk)*meta.ChunkSize + int64(p.off)
+		end := off + p.size
+		if int64(len(image)) < end {
+			image = append(image, make([]byte, end-int64(len(image)))...)
+		}
+		data, err := b.blockBytes(ctx, p, path)
+		if err != nil {
+			return err
+		}
+		copy(image[off:end], data)
+	}
+	if int64(len(image)) > size {
+		image = image[:size]
+	}
+	for int64(len(image)) < size {
+		image = append(image, 0)
+	}
+	if err := b.cfg.Client.WriteStreamConditional(ctx, path, bytes.NewReader(image), int64(len(image)), nil, rev); err != nil {
+		return err
+	}
+	b.mu.Lock()
+	delete(b.pending, ino)
+	delete(b.truncs, ino)
+	b.mu.Unlock()
+	b.releaseCommitted(ino, pending)
 	if nst, err := b.cfg.Client.StatCtx(ctx, path); err == nil {
 		b.mu.Lock()
 		b.revs[ino] = nst.Revision
@@ -1323,6 +1395,34 @@ func (b *Bridge) lockCommit(ino meta.Ino) func() {
 	return mu.Unlock
 }
 
+// readClassic serves a chunk of a file whose extent session degraded to
+// a classic upload: fetch the raw range and expose it as one staged slice
+// (the extent plan surface cannot describe this file).
+func (b *Bridge) readClassic(ctx context.Context, ino meta.Ino, path string, start, chunkEnd int64, slices *[]meta.Slice) syscall.Errno {
+	b.mu.Lock()
+	size := b.sizes[ino]
+	b.mu.Unlock()
+	length := chunkEnd + 1 - start
+	if size > 0 && start+length > size {
+		length = size - start
+	}
+	if length <= 0 {
+		*slices = nil
+		return 0
+	}
+	rc, err := b.cfg.Client.ReadStreamRange(ctx, path, start, length)
+	if err != nil {
+		return errnoOf(err)
+	}
+	data, _ := io.ReadAll(rc)
+	_ = rc.Close()
+	sum := sha256Hex(data)
+	b.blocks.stageBytes(sum, data)
+	id := b.blocks.registerLocal(sum, int64(len(data)))
+	*slices = []meta.Slice{{Id: id, Size: uint32(len(data)), Len: uint32(len(data))}}
+	return 0
+}
+
 // EnableDeferredCommits arms interactive durability: writer flushes stage
 // slices locally (reads overlay them) and the remote commit defers to the
 // flush/close boundary or the next mount's replay of a staged barrier.
@@ -1338,6 +1438,7 @@ func (b *Bridge) ModeOf(ino meta.Ino) (uint32, bool) {
 
 // forgetInoLocked drops one inode's cached state; the caller holds b.mu.
 func (b *Bridge) forgetInoLocked(ino meta.Ino) {
+	delete(b.classicOwned, ino)
 	delete(b.paths, ino)
 	delete(b.sizes, ino)
 	delete(b.revs, ino)

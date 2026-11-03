@@ -38,6 +38,10 @@ type fakeV2 struct {
 	ids        map[string]string // path -> resource identity (X-Dat9-Resource-ID)
 	nextID     int
 	statFail   map[string]bool          // paths whose HEAD answers 500 (probe injection)
+	legacy     bool                     // classic-only server: extent sessions degrade to classic
+	presigns   int                      // presign-batch calls
+	completes  int                      // complete calls
+	upSize     int64                    // last initiate's total size (part sizing)
 	gateOnce   map[string]chan struct{} // first HEAD for a path waits on the channel
 	gateHits   map[string]int           // HEADs currently paused on a gate
 	afterHead  func(path string)        // runs (under f.mu) after a HEAD was answered
@@ -121,10 +125,12 @@ func newFakeV2(t *testing.T) *fakeV2 {
 			_, _ = w.Write(data)
 		case http.MethodPut:
 			body, _ := io.ReadAll(r.Body)
+			sum := sha256Hex(body)
 			f.mu.Lock()
 			f.blocks[key] = body
-			f.blocks[sha256Hex(body)] = body // content-addressed, as the server stores it
+			f.blocks[sum] = body // content-addressed, as the server stores it
 			f.mu.Unlock()
+			w.Header().Set("ETag", sum) // the v2 complete keys parts by this checksum
 			w.WriteHeader(200)
 		default:
 			http.Error(w, "bad method", http.StatusMethodNotAllowed)
@@ -170,6 +176,13 @@ func newFakeV2(t *testing.T) *fakeV2 {
 			}
 		case http.MethodGet:
 			f.mu.Lock()
+			if classic := f.classic[path]; classic != "" && f.extent[path] == "" {
+				// A classic (legacy) file: the raw byte stream, not a plan.
+				f.mu.Unlock()
+				w.Header().Set("Content-Length", fmt.Sprint(len(classic)))
+				_, _ = w.Write([]byte(classic))
+				return
+			}
 			content := f.extent[path]
 			f.mu.Unlock()
 			w.Header().Set("X-Dat9-Content-Layout", "extent")
@@ -259,8 +272,19 @@ func newFakeV2(t *testing.T) *fakeV2 {
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		f.mu.Lock()
 		f.creates = append(f.creates, body["path"].(string))
+		legacy := f.legacy
+		f.upSize = int64(body["total_size"].(float64))
 		f.mu.Unlock()
 		w.WriteHeader(http.StatusAccepted)
+		if legacy {
+			// A pre-extent server ignores the layout field and answers a
+			// CLASSIC multipart plan (Key != "").
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"upload_id": "s1", "key": "classic-key", "part_size": 4 << 20,
+				"total_parts": int(body["total_size"].(float64)/(4<<20)) + 1,
+			})
+			return
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"upload_id": "s1", "key": "", "part_size": 4 << 20,
 			"total_parts":       int(body["total_size"].(float64)/(4<<20)) + 1,
@@ -269,6 +293,9 @@ func newFakeV2(t *testing.T) *fakeV2 {
 	})
 	mux.HandleFunc("/v2/uploads/", func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/presign-batch") {
+			f.mu.Lock()
+			f.presigns++
+			f.mu.Unlock()
 			var body struct {
 				Parts []struct {
 					Number   int    `json:"part_number"`
@@ -276,12 +303,23 @@ func newFakeV2(t *testing.T) *fakeV2 {
 				} `json:"parts"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&body)
+			f.mu.Lock()
+			upSize := f.upSize
+			f.mu.Unlock()
+			const partSize = int64(4 << 20)
 			out := make([]map[string]any, 0, len(body.Parts))
 			for _, p := range body.Parts {
 				f.mu.Lock()
 				exists := len(f.blocks[p.Checksum]) > 0
 				f.mu.Unlock()
-				m := map[string]any{"number": p.Number, "url": fmt.Sprintf("%s/obj/%s", f.URL, p.Checksum)}
+				size := partSize
+				if rem := upSize - int64(p.Number-1)*partSize; rem < size {
+					size = rem
+				}
+				if size < 0 {
+					size = 0
+				}
+				m := map[string]any{"number": p.Number, "url": fmt.Sprintf("%s/obj/%s", f.URL, p.Checksum), "size": size}
 				if exists {
 					m["skip_upload"] = true
 				}
@@ -291,6 +329,9 @@ func newFakeV2(t *testing.T) *fakeV2 {
 			return
 		}
 		if strings.HasSuffix(r.URL.Path, "/complete") {
+			f.mu.Lock()
+			f.completes++
+			f.mu.Unlock()
 			var body struct {
 				Parts []struct {
 					Number int    `json:"number"`
@@ -312,7 +353,11 @@ func newFakeV2(t *testing.T) *fakeV2 {
 					content = append(content, f.blocks[p.ETag]...)
 				}
 				if path != "" && len(content) > 0 {
-					f.extent[path] = string(content)
+					if f.legacy {
+						f.classic[path] = string(content) // degraded session
+					} else {
+						f.extent[path] = string(content)
+					}
 				}
 			}
 			f.mu.Unlock()
@@ -376,11 +421,15 @@ func (f *fakeV2) rename(t *testing.T, src, dst string) {
 	}
 }
 
-// contentOf reports the extent content stored at path ("" when absent).
+// contentOf reports the content stored at path, extent or classic (""
+// when absent).
 func (f *fakeV2) contentOf(path string) string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.extent[path]
+	if c := f.extent[path]; c != "" {
+		return c
+	}
+	return f.classic[path]
 }
 
 // setDir creates (on) or removes (off) a directory entry.
@@ -427,6 +476,13 @@ func (f *fakeV2) gateWaiting(path string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.gateHits[path]
+}
+
+// setLegacy switches the fake to a pre-extent (classic-only) server.
+func (f *fakeV2) setLegacy(on bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.legacy = on
 }
 
 // setStatFail injects (on=true) or clears (on=false) HEAD failures for a
@@ -2607,4 +2663,46 @@ func TestInteractiveFsyncLocalBarrierAndReplay(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("replay never landed the staged commit; server has %q", f.contentOf("/big.bin"))
+}
+
+// Round-17: a fresh create whose extent session silently degraded to a
+// CLASSIC upload (legacy server) keeps the open handle usable — write →
+// fsync → write → fsync commits through the classic surface and reads
+// serve the composed content.
+func TestClassicFallbackKeepsHandleUsable(t *testing.T) {
+	f := newFakeV2(t)
+	f.setLegacy(true)
+	f.setDir("/d", true)
+	h := newTestHandler(t, f, 0) // full mode claims the create
+	res, err, passed := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
+	if err != nil || passed {
+		t.Fatalf("create: err=%v passed=%v", err, passed)
+	}
+	eh := res.Handle.(*engineHandle)
+
+	if err := eh.Write(context.Background(), 0, []byte("AAAA")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Sync(context.Background()); err != nil {
+		t.Fatalf("first fsync after the degraded session: %v", err)
+	}
+	f.mu.Lock()
+	classicLen := len(f.classic["/d/f.bin"])
+	f.mu.Unlock()
+	if classicLen != 4 {
+		t.Fatalf("degraded session landed %d classic bytes, want 4", classicLen)
+	}
+	// The second round must not error on the layout.
+	if err := eh.Write(context.Background(), 4, []byte("BBBB")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Sync(context.Background()); err != nil {
+		t.Fatalf("second fsync on the classic-owned handle: %v", err)
+	}
+	if got := f.contentOf("/d/f.bin"); got != "AAAABBBB" {
+		t.Fatalf("classic content = %q, want AAAABBBB", got)
+	}
+	if got := readFront(t, eh, 16); got != "AAAABBBB" {
+		t.Fatalf("read through the classic-owned handle = %q, want AAAABBBB", got)
+	}
 }

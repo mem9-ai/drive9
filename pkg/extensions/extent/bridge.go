@@ -76,6 +76,12 @@ type Bridge struct {
 	// blocks maps deterministic ids (content sha256, or the zero-block ids)
 	// to their URL registry entry.
 	blocks *blockRegistry
+	// classicOwned marks files whose fresh extent session silently
+	// degraded to a CLASSIC upload on a legacy server: the handle stays
+	// owned by this bridge, so commits and reads keep serving it through
+	// the classic wire surface instead of erroring on the layout.
+	classicOwned map[meta.Ino]bool
+
 	// deferred (interactive durability): meta.Write keeps slices pending
 	// locally instead of committing remotely at every writer flush; reads
 	// overlay the pending state and the remote commit lands at the
@@ -153,6 +159,7 @@ func NewBridge(cfg Config) *Bridge {
 		moved:        make(map[meta.Ino]string),
 		replacements: make(map[string]meta.Ino),
 		commitLocks:  make(map[meta.Ino]*sync.Mutex),
+		classicOwned: make(map[meta.Ino]bool),
 	}
 	// Provenance refetch resolves through the inode's CURRENT mapping:
 	// open files move under renames and retention aliases, and a stale
