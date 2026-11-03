@@ -2706,3 +2706,272 @@ func TestClassicFallbackKeepsHandleUsable(t *testing.T) {
 		t.Fatalf("read through the classic-owned handle = %q, want AAAABBBB", got)
 	}
 }
+
+// Round-18: two interactive barriers without an intervening Flush leave ONE
+// superseding record (pending is cumulative), and a crash replays it whole.
+func TestInteractiveTwoBarriersCrashReplay(t *testing.T) {
+	f := newFakeV2(t)
+	f.seedExtent(t, "/big.bin", "ABCDEFGH")
+	dir := engineCacheDir(t)
+	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: dir})
+	h := New(Options{Engine: eng, Threshold: 1 << 20, SyncMode: "interactive"})
+	eh := claimOpen(t, h, "/big.bin")
+
+	if err := eh.Write(context.Background(), 2, []byte("ZZ")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	stagingRoot := filepath.Join(dir, "commit-staging")
+	if n := countDirs(t, stagingRoot); n != 1 {
+		t.Fatalf("staged dirs after the first barrier = %d, want 1", n)
+	}
+	if err := eh.Write(context.Background(), 4, []byte("QQ")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if n := countDirs(t, stagingRoot); n != 1 {
+		t.Fatalf("staged dirs after the second barrier = %d, want 1 (superseded)", n)
+	}
+	// Crash: a fresh engine replays the (single, cumulative) barrier.
+	eng2 := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: dir})
+	_ = eng2
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := f.contentOf("/big.bin"); got == "ABZZQQGH" {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("replay never landed the superseding barrier; server has %q", f.contentOf("/big.bin"))
+}
+
+func countDirs(t *testing.T, root string) int {
+	t.Helper()
+	ents, err := os.ReadDir(root)
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, e := range ents {
+		if e.IsDir() {
+			n++
+		}
+	}
+	return n
+}
+
+// Round-18: a later pending write that covers only the MIDDLE of an
+// earlier one keeps the earlier write's suffix; the merged read shows the
+// composed bytes before any remote commit.
+func TestInteractiveOverlappingWritesKeepSuffix(t *testing.T) {
+	f := newFakeV2(t)
+	f.seedExtent(t, "/big.bin", "XXXXXXXX")
+	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: engineCacheDir(t)})
+	h2 := New(Options{Engine: eng, Threshold: 1 << 20, SyncMode: "interactive"})
+	eh := claimOpen(t, h2, "/big.bin")
+
+	if err := eh.Write(context.Background(), 0, []byte("ABCDEFGH")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Write(context.Background(), 2, []byte("ZZ")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := readFront(t, eh, 16); got != "ABZZEFGH" {
+		t.Fatalf("overlaid read = %q, want ABZZEFGH (the suffix must survive)", got)
+	}
+	if got := f.contentOf("/big.bin"); got != "XXXXXXXX" {
+		t.Fatalf("remote changed before flush: %q", got)
+	}
+}
+
+// Round-18: a fresh file with no remote representation reads its pending
+// (fsynced) bytes — with the leading hole — instead of zeros.
+func TestInteractiveFreshFilePendingRead(t *testing.T) {
+	f := newFakeV2(t)
+	f.setDir("/d", true)
+	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: engineCacheDir(t)})
+	h := New(Options{Engine: eng, Threshold: 0, SyncMode: "interactive"})
+	if _, _, passed := dispatchCreate(context.Background(), h, "/d/new.bin", syscall.O_RDWR|syscall.O_CREAT); passed {
+		t.Fatal("full-mode create must be claimed")
+	}
+	// Reopen WITHOUT O_CREAT: the bridge-only file must still claim.
+	res, err, passed := dispatchCreate(context.Background(), h, "/d/new.bin", syscall.O_RDWR)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if passed {
+		t.Fatal("an ordinary reopen of the bridge-only file fell through to the classic plane")
+	}
+	eh := res.Handle.(*engineHandle)
+	if err := eh.Write(context.Background(), 8, []byte("ABCD")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 12)
+	n, rerr := eh.Read(context.Background(), 0, buf)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	want := "\x00\x00\x00\x00\x00\x00\x00\x00ABCD"
+	if string(buf[:n]) != want {
+		t.Fatalf("pending read = %q, want the leading hole + ABCD", string(buf[:n]))
+	}
+}
+
+// Round-18: recovery refuses to adopt whichever object occupies the saved
+// path — a renamed-away file's barrier is left in place, nothing is
+// resurrected or patched.
+func TestReplaySkipsOnIdentityMismatch(t *testing.T) {
+	f := newFakeV2(t)
+	f.seedExtent(t, "/a", "AAAA")
+	dir := engineCacheDir(t)
+	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: dir})
+	h := New(Options{Engine: eng, Threshold: 1 << 20, SyncMode: "interactive"})
+	eh := claimOpen(t, h, "/a")
+	if err := eh.Write(context.Background(), 0, []byte("ZZ")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	patchesBefore := f.patches
+	f.mu.Unlock()
+	// The file is renamed away (and a DIFFERENT file takes /a) while the
+	// barrier is outstanding.
+	f.rename(t, "/a", "/b")
+	f.seedExtent(t, "/a", "OTHER")
+
+	eng2 := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: dir})
+	_ = eng2
+	time.Sleep(500 * time.Millisecond)
+	f.mu.Lock()
+	patchesAfter := f.patches
+	f.mu.Unlock()
+	if patchesAfter != patchesBefore {
+		t.Fatal("recovery mutated the remote despite an identity mismatch")
+	}
+	if got := f.contentOf("/b"); got != "AAAA" {
+		t.Fatalf("/b = %q, want AAAA untouched", got)
+	}
+	if got := f.contentOf("/a"); got != "OTHER" {
+		t.Fatalf("/a = %q, want OTHER untouched", got)
+	}
+	if n := countDirs(t, filepath.Join(dir, "commit-staging")); n != 1 {
+		t.Fatalf("staged records = %d, want the skipped one preserved", n)
+	}
+}
+
+// Round-18: one unreadable block aborts the whole recovery unit — no
+// partial commit, no record deletion.
+func TestReplayAbortsOnMissingBlock(t *testing.T) {
+	f := newFakeV2(t)
+	f.seedExtent(t, "/big.bin", "ABCDEFGH")
+	dir := engineCacheDir(t)
+	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: dir})
+	h := New(Options{Engine: eng, Threshold: 1 << 20, SyncMode: "interactive"})
+	eh := claimOpen(t, h, "/big.bin")
+	if err := eh.Write(context.Background(), 0, []byte("ZZZZ")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	patchesBefore := f.patches
+	f.mu.Unlock()
+	// Corrupt the record: remove one block file.
+	root := filepath.Join(dir, "commit-staging")
+	ents, _ := os.ReadDir(root)
+	for _, e := range ents {
+		files, _ := os.ReadDir(filepath.Join(root, e.Name()))
+		for _, bf := range files {
+			name := bf.Name()
+			if name != "manifest.json" {
+				_ = os.Remove(filepath.Join(root, e.Name(), name))
+				break
+			}
+		}
+	}
+	eng2 := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: dir})
+	_ = eng2
+	time.Sleep(500 * time.Millisecond)
+	f.mu.Lock()
+	patchesAfter := f.patches
+	f.mu.Unlock()
+	if patchesAfter != patchesBefore {
+		t.Fatal("a partial recovery committed despite the missing block")
+	}
+	if got := f.contentOf("/big.bin"); got != "ABCDEFGH" {
+		t.Fatalf("server content = %q, want ABCDEFGH untouched", got)
+	}
+	if n := countDirs(t, root); n != 1 {
+		t.Fatalf("staged records = %d, want the failed unit preserved", n)
+	}
+}
+
+// Round-18: a read-only mount never runs recovery.
+func TestReadOnlyMountSkipsReplay(t *testing.T) {
+	f := newFakeV2(t)
+	f.seedExtent(t, "/big.bin", "ABCDEFGH")
+	dir := engineCacheDir(t)
+	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: dir})
+	h := New(Options{Engine: eng, Threshold: 1 << 20, SyncMode: "interactive"})
+	eh := claimOpen(t, h, "/big.bin")
+	if err := eh.Write(context.Background(), 0, []byte("ZZZZ")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	patchesBefore := f.patches
+	f.mu.Unlock()
+	eng2 := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: dir, ReadOnly: true})
+	_ = eng2
+	time.Sleep(500 * time.Millisecond)
+	f.mu.Lock()
+	patchesAfter := f.patches
+	f.mu.Unlock()
+	if patchesAfter != patchesBefore {
+		t.Fatal("a read-only mount replayed a barrier (mutating the remote)")
+	}
+	if got := f.contentOf("/big.bin"); got != "ABCDEFGH" {
+		t.Fatalf("server content = %q, want ABCDEFGH", got)
+	}
+}
+
+// Round-18: a recorded creation mode of 0000 is authoritative in local
+// lookups (not silently replaced with 0644).
+func TestLocalLookupKeepsRecordedZeroMode(t *testing.T) {
+	f := newFakeV2(t)
+	f.setDir("/d", true)
+	h := newTestHandler(t, f, 0)
+	_, err := h.Do(context.Background(), &fs.Op{Kind: fs.OpCreate, Path: "/d/m.bin", Flags: syscall.O_RDWR | syscall.O_CREAT, Mode: 0, HasMode: true, Caller: fs.Caller{Pid: 1}}, fs.Next(func(ctx context.Context, op *fs.Op) (fs.Result, error) {
+		return fs.Result{Handle: &stubCore{}}, nil
+	}))
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	res, lerr := h.Do(context.Background(), &fs.Op{Kind: fs.OpLookup, Path: "/d/m.bin", Caller: fs.Caller{Pid: 1}}, fs.Next(func(ctx context.Context, op *fs.Op) (fs.Result, error) {
+		return fs.Result{}, syscall.ENOENT
+	}))
+	if lerr != nil || res.Attr == nil {
+		t.Fatalf("lookup: err=%v attr=%+v", lerr, res.Attr)
+	}
+	if res.Attr.Mode != 0 {
+		t.Fatalf("mode = %o, want the recorded 0000", res.Attr.Mode)
+	}
+}

@@ -806,7 +806,16 @@ func mountWithConfig(cfg MountConfig) error {
 			PrefetchMaxFileBytes: cfg.PrefetchMaxFileBytes,
 			PrefetchMaxBytes:     cfg.PrefetchMaxBytes,
 			PrefetchTimeout:      cfg.PrefetchTimeout,
-			Disk:                 diskCacheOpts(cacheScopedDir(cacheBase, readCacheHash, "read"), cfg.DiskReadCacheSize, cfg.DiskReadCacheFreeRatio),
+			Disk: func() cache.DiskReadCacheOptions {
+				// With the extent engine armed the mount runs two
+				// independently evicted disk caches; each gets half the
+				// configured budget so the AGGREGATE stays at the limit.
+				budget := cfg.DiskReadCacheSize
+				if wantExt["extent"] && budget > 0 {
+					budget /= 2
+				}
+				return diskCacheOpts(cacheScopedDir(cacheBase, readCacheHash, "read"), budget, cfg.DiskReadCacheFreeRatio)
+			}(),
 		})
 		if cerr != nil {
 			return fmt.Errorf("fuse: cache extension: %w", cerr)
@@ -992,14 +1001,13 @@ func mountWithConfig(cfg MountConfig) error {
 			Client:     cl,
 			RemoteRoot: remoteRoot,
 			CacheDir:   cacheScopedDir(cacheBase, mountHash, "jfs-engine"),
+			ReadOnly:   cfg.ReadOnly,
 		}
 		if cfg.DiskReadCacheSize > 0 {
-			// The classic read cache already holds the full configured
-			// budget; granting the engine the same amount again would let
-			// a mixed mount retain roughly twice the limit. Split the
-			// budget between the two independently evicted caches instead
-			// (the engine's block cache carries the large-file plane, so
-			// it gets the majority share of the split).
+			// AGGREGATE budget: the classic read cache below is capped at
+			// half the configured bytes when the engine is armed (see the
+			// cache extension), so this half keeps the mount's total disk
+			// cache at exactly the configured limit across both planes.
 			engineConf.CacheSize = uint64(cfg.DiskReadCacheSize / 2)
 		}
 		engine := extent.NewEngine(engineConf)

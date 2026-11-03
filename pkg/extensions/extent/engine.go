@@ -24,6 +24,9 @@ type EngineConfig struct {
 	CacheDir string
 	// CacheSize bounds the disk cache in bytes (0 = default).
 	CacheSize uint64
+	// ReadOnly mounts never mutate the remote: staged interactive
+	// barriers are NOT replayed (their commits are writes).
+	ReadOnly bool
 }
 
 // Engine bundles the bridge, chunk store and VFS — the construction the
@@ -44,7 +47,7 @@ func NewEngine(cfg EngineConfig) *Engine {
 		bcfg.StagingDir = filepath.Join(cfg.CacheDir, "commit-staging")
 	}
 	b := NewBridge(bcfg)
-	if bcfg.StagingDir != "" {
+	if bcfg.StagingDir != "" && !cfg.ReadOnly {
 		// Barriers a previous mount spilled but never landed: re-commit
 		// them in the background; staged bytes are in the registry either
 		// way, so an open of the file can serve and commit them.

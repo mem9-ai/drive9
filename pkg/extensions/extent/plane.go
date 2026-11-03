@@ -323,6 +323,23 @@ func (h *Handler) tryClaimOpen(ctx context.Context, op *fs.Op) (fs.Result, error
 	if !client.IsNotFound(err) {
 		return fs.Result{}, nil, false
 	}
+	// A file that exists ONLY in the bridge (a fresh engine create whose
+	// remote materialization is pending) opens through the engine even
+	// without O_CREAT — the classic plane would answer ENOENT for a
+	// successfully created, still-open file.
+	if ino, local := h.opts.Engine.Bridge.LocalResolve(op.Path); local {
+		_, fh, errno := h.opts.Engine.VFS.Open(vfsCtx(op.Caller), ino, op.Flags)
+		if errno != 0 {
+			return fs.Result{}, errno, true
+		}
+		handle := h.register(op.Path, uint64(ino), fh, op.Caller)
+		attr := &fs.Attr{Kind: fs.KindFile, Nlink: 1}
+		if size, mode, ok := h.opts.Engine.Bridge.LocalView(ino); ok {
+			attr.Size = size
+			attr.Mode = mode
+		}
+		return fs.Result{Handle: handle, Attr: attr}, nil, true
+	}
 	// Fresh path: claim creates in full JuiceJS mode, or when the path
 	// matches an explicit --extent / [extent] pattern; otherwise creation
 	// stays on the classic plane (hybrid promotion).
@@ -371,9 +388,10 @@ func (h *Handler) lookupLocalOnly(ctx context.Context, path string) (*fs.Attr, b
 	} else if !client.IsNotFound(err) {
 		return nil, false // undecided: do not shadow the classic plane
 	}
-	size, mode, _ := br.LocalView(ino)
-	if mode == 0 {
-		mode = 0o644
+	size, _, _ := br.LocalView(ino)
+	mode := uint32(0o644)
+	if m, ok := br.ModeOf(ino); ok {
+		mode = m // a recorded mode is authoritative, including 0000
 	}
 	return &fs.Attr{Kind: fs.KindFile, Mode: mode, Size: size, Nlink: 1}, true
 }
