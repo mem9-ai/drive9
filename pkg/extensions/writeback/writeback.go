@@ -603,12 +603,16 @@ func (w *Writeback) Stop(ctx context.Context) error {
 
 // MarkPathUnlinked marks every live handle of p anonymous (survivor
 // bookkeeping) without touching the remote: the facade defers the actual
-// deletion to the last close of an open file.
-func (w *Writeback) MarkPathUnlinked(p string) {
-	w.markUnlinked(p, false)
-	// The name is going away NOW (the syscall already returned OK): the
-	// pending overlays must stop answering lookups for it, or a
-	// re-creator racing the deferred remote DELETE reads the old entry
+// deletion to the last close of an open file. It reports an error when the
+// path's staged state provably stays replayable (WAL marker failed AND the
+// fallback cleanup could not remove the recovery source): the facade must
+// then fail the unlink instead of acknowledging a deletion that a restart
+// would undo. The anonymous marking is rolled back on that path.
+func (w *Writeback) MarkPathUnlinked(p string) error {
+	marked, _ := w.markUnlinkedSnapshot(p, false)
+	// The name is going away NOW (the facade invokes this before FS.Unlink
+	// replies OK): the pending overlays must stop answering lookups for it,
+	// or a re-creator racing the deferred remote DELETE reads the old entry
 	// (unlink/14 row 4's EEXIST against the resurrected name). The open
 	// fds keep their image: the staged bytes move to the unlink
 	// snapshot before the pending entries die.
@@ -632,13 +636,21 @@ func (w *Writeback) MarkPathUnlinked(p string) {
 		// CancelPathPreserveLocal: a plain CancelPath also deletes the
 		// shadow the snapshot above just wrote, so the anonymous fd fell
 		// through to the recreated same-name file's bytes.
-		w.queue.CancelPathPreserveLocal(p)
+		if err := w.queue.CancelPathPreserveLocal(p); err != nil {
+			// The unlink is failing: the descriptors must go on serving
+			// their name, and — the failed premise being that the durable
+			// staging survived — the replayable frames now correctly
+			// describe a file that was never unlinked.
+			restoreMarked(marked)
+			return err
+		}
 	}
 	if w.wbCache != nil {
 		w.wbCache.Remove(p)
 	}
 	// The landed table's rescue window must not resurrect it either.
 	w.forgetLanded(p)
+	return nil
 }
 
 // SetSurvivorLookup wires the facade's hardlink-alias probe.
@@ -1177,7 +1189,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		// retry source (the closed writer's overwrite vanished with it).
 		// The queue cancel (when it runs) precedes the survivor snapshot:
 		// CancelPath also removes the shadow an anonymous clean fd reads.
-		purgeStaging := func() {
+		purgeStaging := func() error {
 			if w.wbCache != nil {
 				if under {
 					for _, entry := range w.wbCache.ListByPrefix(prefix) {
@@ -1190,11 +1202,18 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 				// Preserve-local: the anonymous fd's unlink snapshot lives
 				// in the shadow and must survive the cancel (plain
 				// CancelPath removed it, and post-delete reads ENOENT'd).
-				w.queue.CancelPathPreserveLocal(op.Path)
+				if err := w.queue.CancelPathPreserveLocal(op.Path); err != nil {
+					// The remote DELETE already succeeded, so the handles
+					// stay anonymous — but a replayable local image would
+					// re-create the name after a crash: report the unlink
+					// as failed rather than acknowledge that.
+					return err
+				}
 				if under {
 					w.queue.CancelPrefix(prefix)
 				}
 			}
+			return nil
 		}
 		w.markUnlinked(op.Path, under)
 		rollback := func() {
@@ -1218,7 +1237,14 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			// nothing remote; a lazy-created path never landed. Local
 			// discard is enough, but queued entries must still die.
 			if w.queue != nil {
-				w.queue.CancelPath(op.Path)
+				if err := w.queue.CancelPath(op.Path); err != nil {
+					// The local image provably stayed replayable (WAL and
+					// cleanup both failed): fail the unlink and put the
+					// writers back on their name instead of acknowledging a
+					// deletion a restart would undo.
+					rollback()
+					return fs.Result{}, err
+				}
 				if under {
 					w.queue.CancelPrefix(prefix)
 				}
@@ -1234,7 +1260,9 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			rollback()
 			return res, err
 		}
-		purgeStaging()
+		if err := purgeStaging(); err != nil {
+			return res, err
+		}
 		w.forgetLanded(op.Path)
 		return res, nil
 	case fs.OpLink:
@@ -4002,6 +4030,24 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 	// its own remoteRoot (same convention as the terminal).
 	unlock := w.pathLocks.lock(h.path)
 	defer unlock()
+	// An anonymous handle must not publish under its dead name (commitLocked
+	// discards the same way). Checked under the path lock: the unlink's
+	// cancel+marker runs under it too (cancelPath), so a racing fsync either
+	// sees the marking here and stages nothing, or completed its publication
+	// and Enqueue first — and that entry dies with the marker (#1065).
+	h.mu.Lock()
+	unlinked := h.unlinked
+	if unlinked {
+		h.dirty = false
+		h.visTrunc = false
+		if h.buf != nil {
+			h.buf.ClearDirty()
+		}
+	}
+	h.mu.Unlock()
+	if unlinked {
+		return nil
+	}
 	var image []byte
 	if spill {
 		// v1 stageLargeAtClose + shadow-spill staging: bounded memory — each

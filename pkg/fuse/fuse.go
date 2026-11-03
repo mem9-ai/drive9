@@ -1955,6 +1955,7 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 		// the open fd keeps reading its data, and the remote entry dies with
 		// the last close — deferring the delete keeps fd reads working in a
 		// sync core with no local data plane.
+		handles := f.openIdx.SnapshotPath(child)
 		f.openIdx.UnlinkPath(child)
 		// Capture the ino and a surviving alias before the preserve drops
 		// the byPath mapping: handles of a hardlinked inode may have been
@@ -1977,10 +1978,24 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 				}
 			}
 		}
+		var markErr error
 		for _, h := range f.chain.Handlers() {
-			if mu, ok := h.(interface{ MarkPathUnlinked(string) }); ok {
-				mu.MarkPathUnlinked(child)
+			if mu, ok := h.(interface {
+				MarkPathUnlinked(string) error
+			}); ok {
+				if err := mu.MarkPathUnlinked(child); err != nil && markErr == nil {
+					markErr = err
+				}
 			}
+		}
+		if markErr != nil {
+			// A handler could not make the path's staged state
+			// non-replayable (failing WAL plus failing cleanup): fail the
+			// unlink now, before any namespace mutation, and restore the
+			// open-path bookkeeping — the writeback rolls its own marking
+			// back.
+			f.openIdx.RelinkPath(child, handles)
+			return fs.StatusOf(markErr)
 		}
 		f.inodes.RemoveLinkPreserve(child)
 		if iok {

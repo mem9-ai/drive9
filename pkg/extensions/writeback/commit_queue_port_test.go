@@ -1304,7 +1304,7 @@ func TestCommitQueueCancelPathDoesNotPoisonFutureSamePath(t *testing.T) {
 	cq.queue = append(cq.queue, oldEntry)
 	cq.workCh <- oldEntry
 
-	cq.CancelPath(path)
+	_ = cq.CancelPath(path)
 	if !cq.isEntryCanceled(oldEntry) {
 		t.Fatal("old queued entry should be canceled")
 	}
@@ -1387,7 +1387,7 @@ func TestCommitQueueCancelPathCancelsRetryBackoff(t *testing.T) {
 	}
 
 	start := time.Now()
-	cq.CancelPath(path)
+	_ = cq.CancelPath(path)
 	done := make(chan struct{})
 	go func() {
 		cq.WaitPath(path)
@@ -1424,7 +1424,7 @@ func TestCommitQueueQueuedPathIndexTracksCancelAndRemove(t *testing.T) {
 	if !cq.HasPath(path) {
 		t.Fatal("HasPath should find queued entries through index")
 	}
-	cq.CancelPath(path)
+	_ = cq.CancelPath(path)
 	if cq.HasPath(path) {
 		t.Fatal("CancelPath should remove all queued entries for path from index")
 	}
@@ -3099,7 +3099,7 @@ func TestCommitQueueCancelPathJournalsCommitMarker(t *testing.T) {
 	}
 
 	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, journal, 1, 8)
-	cq.CancelPath("/gone.txt") // Unlink flow
+	_ = cq.CancelPath("/gone.txt") // Unlink flow
 	cq.DrainAll()
 
 	if shadow.Has("/gone.txt") || pending.HasPending("/gone.txt") {
@@ -3720,7 +3720,7 @@ func TestCommitQueueCancelPathStopsDelayedZeroTruncateAndCleansLocal(t *testing.
 	if err := cq.Enqueue(entry); err != nil {
 		t.Fatal(err)
 	}
-	cq.CancelPath("/unlink.txt")
+	_ = cq.CancelPath("/unlink.txt")
 	cq.DrainAll()
 	if !entry.canceled {
 		t.Fatal("CancelPath did not mark delayed zero truncate canceled")
@@ -3808,7 +3808,7 @@ func TestCommitQueueCanceledInFlightDoesNotRemoveNewerStagedData(t *testing.T) {
 	}
 
 	// Cancel the in-flight commit for this path.
-	cq.CancelPath(path)
+	_ = cq.CancelPath(path)
 
 	// Now stage newer data (simulating the newer writer proceeding after timeout).
 	// The newer writer writes new content to the same shadow path.
