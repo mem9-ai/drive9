@@ -323,6 +323,7 @@ type blockEntry struct {
 	provenanceStart int64
 	provenanceIno   meta.Ino // whose mapping the provenance path belongs to
 	classicRange    int64    // >0: classic-read provenance of this many bytes (re-fetch via ReadStreamRange)
+	localOverlay    bool     // cached bytes include local-only writes: never demote to the remote range
 	cached          []byte
 }
 

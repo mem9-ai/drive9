@@ -343,18 +343,38 @@ func (r *blockRegistry) releaseIssuePin(id uint64) bool {
 	return true
 }
 
-// demoteToProvenance drops a classic entry's cached bytes while keeping
-// the id fetchable: the remote range is the usable source for any
-// outstanding reader's later block fetches.
-func (r *blockRegistry) demoteToProvenance(id uint64, path string, start int64) {
+// markLocalOverlay flags an entry whose cached bytes include local-only
+// writes (a deferred overlay): demotion would replace them with the older
+// remote image, so the bytes are irreducible.
+func (r *blockRegistry) markLocalOverlay(id uint64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if e, ok := r.m[id]; ok && e.cached != nil {
-		e.cached = nil
-		e.path = path
-		e.provenanceStart = start
-		e.classicRange = e.size
+	if e, ok := r.m[id]; ok {
+		e.localOverlay = true
 	}
+}
+
+// demoteToProvenance drops a classic entry's cached bytes while keeping
+// the id fetchable: the remote range is the usable source for any
+// outstanding reader's later block fetches. Entries whose bytes are NOT
+// reproducible from the remote range — locally overlaid slices (deferred
+// writes only exist here) or checksums a pending commit still references
+// — are NOT demoted; their bytes stay (accounted by the LRU re-append in
+// the caller).
+func (r *blockRegistry) demoteToProvenance(id uint64, sum, path string, start int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.m[id]
+	if !ok || e.cached == nil {
+		return
+	}
+	if r.pins[sum] > 0 || e.localOverlay {
+		return // not reproducible remotely / still committed-pending
+	}
+	e.cached = nil
+	e.path = path
+	e.provenanceStart = start
+	e.classicRange = e.size
 }
 
 // trimIssued is a no-op retained for call-site symmetry: pins belonging

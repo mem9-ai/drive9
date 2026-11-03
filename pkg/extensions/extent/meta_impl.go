@@ -1039,11 +1039,7 @@ func (b *Bridge) commitClassic(ctx context.Context, ino meta.Ino, path string, p
 	// when a recovery constraint is active: the request carries the
 	// expected resource (header), so a replacement whose revision merely
 	// equals the saved one cannot receive the staged bytes.
-	expRes := ""
-	if v, bounded := b.peekVerifyBase(ino); bounded {
-		expRes = v.resID
-	}
-	if err := b.cfg.Client.WriteStreamConditionalExpectedResource(ctx, path, bytes.NewReader(image), int64(len(image)), nil, rev, expRes); err != nil {
+	if err := b.cfg.Client.WriteStreamConditionalExpectedResource(ctx, path, bytes.NewReader(image), int64(len(image)), nil, rev, b.publicationIdentity(ino)); err != nil {
 		if errors.Is(err, client.ErrResourceMismatch) {
 			b.abandonIno(ino)
 		}
@@ -1063,10 +1059,7 @@ func (b *Bridge) commitClassic(ctx context.Context, ino meta.Ino, path string, p
 }
 
 func (b *Bridge) commitWithRetry(ctx context.Context, ino meta.Ino, path string, blocks []client.ExtentBlockWrite, size, rev int64) error {
-	expRes := ""
-	if v, bounded := b.peekVerifyBase(ino); bounded {
-		expRes = v.resID
-	}
+	expRes := b.publicationIdentity(ino)
 	err := b.cfg.Client.CommitExtentPatchExpectedResource(ctx, path, size, blocks, rev, expRes)
 	if err == nil {
 		return nil
@@ -1083,15 +1076,15 @@ func (b *Bridge) commitWithRetry(ctx context.Context, ino meta.Ino, path string,
 	if serr != nil {
 		return err
 	}
-	if v, bounded := b.peekVerifyBase(ino); bounded && st.ResourceID != v.resID {
+	// The re-stat must still hold OUR object — a layout-pending upload's
+	// captured identity constrains conflict retries exactly like a
+	// verified recovery's.
+	id2 := b.publicationIdentity(ino)
+	if id2 != "" && st.ResourceID != id2 {
 		b.abandonIno(ino)
-		return fmt.Errorf("recovery target %s no longer holds the staged object", path)
+		return fmt.Errorf("target %s no longer holds the staged object", path)
 	}
-	expRes2 := ""
-	if v, bounded := b.peekVerifyBase(ino); bounded {
-		expRes2 = v.resID
-	}
-	err2 := b.cfg.Client.CommitExtentPatchExpectedResource(ctx, path, size, blocks, st.Revision, expRes2)
+	err2 := b.cfg.Client.CommitExtentPatchExpectedResource(ctx, path, size, blocks, st.Revision, id2)
 	if errors.Is(err2, client.ErrResourceMismatch) {
 		b.abandonIno(ino)
 	}
@@ -1822,7 +1815,7 @@ func (b *Bridge) readClassic(ctx context.Context, ino meta.Ino, path string, sta
 		copy(data[off-start:], pdata)
 	}
 	sum := sha256Hex(data)
-	id := b.stageClassicChunk(sum, data, path, start)
+	id := b.stageClassicChunk(sum, data, path, start, len(pending) > 0)
 	*slices = []meta.Slice{{Id: id, Size: uint32(len(data)), Len: uint32(len(data))}}
 	return 0
 }
@@ -1846,8 +1839,11 @@ var classicReadProtect = 4
 // handed), records inside the grace window are immune (in-flight fetches),
 // and pinned entries (a pending commit still references their checksum)
 // are never retired.
-func (b *Bridge) stageClassicChunk(sum string, data []byte, path string, start int64) uint64 {
+func (b *Bridge) stageClassicChunk(sum string, data []byte, path string, start int64, overlaid bool) uint64 {
 	id := b.blocks.stagePinned(sum, data, false)
+	if overlaid {
+		b.blocks.markLocalOverlay(id)
+	}
 	b.mu.Lock()
 	now := time.Now()
 	// Refresh an existing record for this id instead of appending a
@@ -1892,7 +1888,7 @@ func (b *Bridge) stageClassicChunk(sum string, data []byte, path string, start i
 			// id stays fetchable through the classic remote range, the
 			// usable source for the reader's later block fetches. The LRU
 			// record goes with the bytes; a re-read simply re-stages.
-			b.blocks.demoteToProvenance(r.id, r.path, r.start)
+			b.blocks.demoteToProvenance(r.id, r.sum, r.path, r.start)
 			continue
 		}
 		b.blocks.releaseIfUnpinned(r.sum)
@@ -1970,6 +1966,19 @@ func (b *Bridge) layoutPendingMatches(ino meta.Ino, occupantID string) bool {
 		return id == occupantID
 	}
 	return true // fresh upload of ours created the occupant
+}
+
+// publicationIdentity returns the resource identity this inode's next
+// publication must be bound to: a verified recovery's constraint, or a
+// still-unclassified upload's captured (echoed) identity. Empty when
+// neither applies.
+func (b *Bridge) publicationIdentity(ino meta.Ino) string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if v, ok := b.verifyBase[ino]; ok {
+		return v.resID
+	}
+	return b.layoutPendingID[ino]
 }
 
 // peekVerifyBase reads the recovery constraint without consuming it.

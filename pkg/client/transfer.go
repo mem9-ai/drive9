@@ -1581,10 +1581,6 @@ func (c *Client) ReadStream(ctx context.Context, path string) (io.ReadCloser, er
 	}
 }
 
-func (c *Client) readWithoutRedirect(ctx context.Context, path, rangeHeader string) (*http.Response, error) {
-	return c.readWithoutRedirectOptIn(ctx, path, rangeHeader, false)
-}
-
 // readWithoutRedirectOptIn additionally declares support for the extent
 // block-plan representation (X-Dat9-Extent-Read-Plan): extent reads MUST
 // opt in or the server answers 422; classic reads leave it off.
@@ -1615,7 +1611,10 @@ func (c *Client) ResolveReadTarget(ctx context.Context, path string) (*ReadTarge
 }
 
 func (c *Client) resolveReadTarget(ctx context.Context, path string) (*ReadTarget, error) {
-	resp, err := c.readWithoutRedirect(ctx, path, "")
+	// Opt in to the extent plan representation: without the header an
+	// extent file answers 422 here and the download would abort with the
+	// destination already created.
+	resp, err := c.readWithoutRedirectOptIn(ctx, path, "", true)
 	if err != nil {
 		return nil, err
 	}
@@ -1629,13 +1628,13 @@ func (c *Client) resolveReadTarget(ctx context.Context, path string) (*ReadTarge
 		}
 		return &ReadTarget{ObjectURL: location}, nil
 
-	case resp.StatusCode == http.StatusUnprocessableEntity:
-		return nil, readError(resp)
-
 	case resp.StatusCode >= 300:
 		return nil, readError(resp)
 
 	default:
+		// A 200 (classic inline bytes, or an extent block PLAN with the
+		// opt-in) has no single object URL for the parallel range path —
+		// fall back to the sequential streaming reader, which serves both.
 		return nil, errReadTargetNoRedirect
 	}
 }

@@ -3637,14 +3637,14 @@ func TestIssuedSliceSurvivesEviction(t *testing.T) {
 
 	// Hand out a slice (stage + issue pin, as readClassic does).
 	data := []byte("FIRST")
-	id1 := br.stageClassicChunk(sha256Hex(data), data, "/d/f.bin", 0)
+	id1 := br.stageClassicChunk(sha256Hex(data), data, "/d/f.bin", 0, false)
 	if !br.blocks.isIssued(id1) {
 		t.Fatal("staged classic slice was not issue-pinned")
 	}
 	// Stage many distinct chunks to force LRU pressure.
 	for i := 0; i < 32; i++ {
 		d := []byte{byte(i), byte(i), byte(i), byte(i)}
-		br.stageClassicChunk(sha256Hex(d), d, "/d/f.bin", int64(i+1)<<20)
+		br.stageClassicChunk(sha256Hex(d), d, "/d/f.bin", int64(i+1)<<20, false)
 	}
 	// The issued id must still be fetchable (objectStorage.Get consumes
 	// the pin and serves the bytes).
@@ -3946,7 +3946,7 @@ func TestDemotedSliceRefetchesRemotely(t *testing.T) {
 	for i := 0; i < 8; i++ {
 		d := make([]byte, 4096)
 		_, _ = rand.Read(d)
-		br.stageClassicChunk(sha256Hex(d), d, "/d/f.bin", int64(i)*4096)
+		br.stageClassicChunk(sha256Hex(d), d, "/d/f.bin", int64(i)*4096, false)
 	}
 	// The first read's entry was demoted: its bytes are gone, provenance
 	// remains. A later fetch of the SAME range re-reads the remote.
@@ -3986,5 +3986,80 @@ func TestExtentReplacementRejectedUnderLayoutPending(t *testing.T) {
 	}
 	if got := f.contentOf("/d/f.bin"); got != "EXTREPL" {
 		t.Fatalf("replacement content = %q, want EXTREPL untouched", got)
+	}
+}
+
+// Round-27: the captured identity binds BOTH publication attempts — a
+// replacement arriving between the retry's Stat and the PATCH (or on the
+// conflict re-stat) is refused by the header, not just by the pre-check.
+func TestIdentityBindsPublicationWindow(t *testing.T) {
+	f := newFakeV2(t)
+	f.setDir("/d", true)
+	h := newTestHandler(t, f, 0)
+	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
+	eh := res.Handle.(*engineHandle)
+	f.setStatGone(true)
+	if err := eh.Write(context.Background(), 0, []byte("AAAA")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Sync(context.Background()); err == nil {
+		t.Fatal("the commit succeeded despite the stat outage")
+	}
+	// Stats recover and see OUR file (the pre-check passes); a replacement
+	// with an EQUAL revision lands before the publication attempt.
+	f.setStatGone(false)
+	f.mu.Lock()
+	ourRev := f.ids["/d/f.bin"]
+	f.extent["/d/f.bin"] = "BBBB"
+	f.nextID++
+	f.ids["/d/f.bin"] = "same-revision-replacement"
+	f.mu.Unlock()
+	_ = ourRev
+	if err := eh.Sync(context.Background()); err == nil {
+		t.Fatal("the publication succeeded into a replacement inside the Stat→PATCH window")
+	}
+	if got := f.contentOf("/d/f.bin"); got != "BBBB" {
+		t.Fatalf("replacement content = %q, want BBBB untouched", got)
+	}
+}
+
+// Round-27: a locally OVERLAID slice is never demoted — cache pressure
+// cannot replace deferred local bytes with the older remote image.
+func TestOverlaidSliceNeverDemoted(t *testing.T) {
+	f := newFakeV2(t)
+	f.setLegacy(true)
+	f.setDir("/d", true)
+	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: engineCacheDir(t)})
+	h := New(Options{Engine: eng, Threshold: 0, SyncMode: "interactive"})
+	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
+	eh := res.Handle.(*engineHandle)
+	if err := eh.Write(context.Background(), 0, []byte("AAAA")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// Deferred overwrite (local-only bytes), then read to stage an OVERLAID
+	// slice, then pressure the LRU hard.
+	if err := eh.Write(context.Background(), 0, []byte("ZZZZ")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	old := classicReadCacheBytes
+	classicReadCacheBytes = 1 // everything is beyond budget
+	defer func() { classicReadCacheBytes = old }()
+	if got := readFront(t, eh, 4); got != "ZZZZ" {
+		t.Fatalf("pre-pressure read = %q, want ZZZZ", got)
+	}
+	br := eng.Bridge
+	for i := 0; i < 8; i++ {
+		d := make([]byte, 4096)
+		_, _ = rand.Read(d)
+		br.stageClassicChunk(sha256Hex(d), d, "/d/f.bin", int64(i+1)<<20, false)
+	}
+	if got := readFront(t, eh, 4); got != "ZZZZ" {
+		t.Fatalf("post-pressure read = %q, want ZZZZ (an overlaid slice must not demote to the remote image)", got)
 	}
 }
