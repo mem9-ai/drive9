@@ -104,6 +104,9 @@ type Bridge struct {
 	// owned by this bridge, so commits and reads keep serving it through
 	// the classic wire surface instead of erroring on the layout.
 	classicOwned map[meta.Ino]bool
+	// classicSeen remembers the resource identity each classic-owned
+	// inode last read from (the demotion provenance binds to it).
+	classicSeen map[meta.Ino]string
 
 	// deferred (interactive durability): meta.Write keeps slices pending
 	// locally instead of committing remotely at every writer flush; reads
@@ -183,6 +186,7 @@ func NewBridge(cfg Config) *Bridge {
 		replacements:    make(map[string]meta.Ino),
 		commitLocks:     make(map[meta.Ino]*sync.Mutex),
 		classicOwned:    make(map[meta.Ino]bool),
+		classicSeen:     make(map[meta.Ino]string),
 		layoutPending:   make(map[meta.Ino]bool),
 		layoutPendingID: make(map[meta.Ino]string),
 		commitErr:       make(map[meta.Ino]error),
@@ -214,6 +218,7 @@ type classicRef struct {
 	at    time.Time
 	path  string // classic remote source (provenance fallback)
 	start int64
+	resID string // the source object's identity when staged
 }
 
 // newBridgeFinish installs cross-referencing hooks that need the assembled
@@ -324,6 +329,7 @@ type blockEntry struct {
 	provenanceIno   meta.Ino // whose mapping the provenance path belongs to
 	classicRange    int64    // >0: classic-read provenance of this many bytes (re-fetch via ReadStreamRange)
 	localOverlay    bool     // cached bytes include local-only writes: never demote to the remote range
+	provResID       string   // classic provenance: the source object's identity (refetch verifies)
 	cached          []byte
 }
 

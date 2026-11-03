@@ -361,20 +361,61 @@ func (r *blockRegistry) markLocalOverlay(id uint64) {
 // writes only exist here) or checksums a pending commit still references
 // — are NOT demoted; their bytes stay (accounted by the LRU re-append in
 // the caller).
-func (r *blockRegistry) demoteToProvenance(id uint64, sum, path string, start int64) {
+func (r *blockRegistry) demoteToProvenance(id uint64, sum, path string, start int64, resID string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	e, ok := r.m[id]
 	if !ok || e.cached == nil {
-		return
+		return true // nothing to keep
 	}
-	if r.pins[sum] > 0 || e.localOverlay {
-		return // not reproducible remotely / still committed-pending
+	if r.pins[sum] > 0 {
+		return false // a pending commit still references these bytes
+	}
+	if e.localOverlay {
+		// Local-only bytes are irreducible: keep them RESIDENT (the
+		// reader must see them) — the CALLER re-appends the LRU record so
+		// they stay accounted, and the entry self-clears the overlay flag
+		// once a flush's releaseCommitted retires its pending fragments
+		// (the then-pure-remote image becomes demotable again).
+		return false
+	}
+	if resID == "" {
+		// No identity for the source: the pathname is REUSABLE (renames,
+		// replacements) and cannot be trusted as this slice's source —
+		// keep the bytes resident instead of risking cross-file service.
+		return false
 	}
 	e.cached = nil
 	e.path = path
 	e.provenanceStart = start
 	e.classicRange = e.size
+	e.provResID = resID
+	return true
+}
+
+// setProvenanceIdentity records the source object's identity on a staged
+// classic entry (the demotion refetch verifies it).
+func (r *blockRegistry) setProvenanceIdentity(id uint64, resID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if e, ok := r.m[id]; ok {
+		e.provResID = resID
+	}
+}
+
+// overlayResolved clears an entry's local-overlay flag: after the flush
+// that landed its pending fragments, the (unchanged) cached image matches
+// the remote object and the entry may demote again.
+func (r *blockRegistry) overlayResolved(sum string) {
+	raw, err := hex.DecodeString(sum)
+	if err != nil || len(raw) < 8 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if e, ok := r.m[detID(raw)]; ok {
+		e.localOverlay = false
+	}
 }
 
 // trimIssued is a no-op retained for call-site symmetry: pins belonging
@@ -509,12 +550,18 @@ func (r *blockRegistry) fetch(ctx context.Context, c fetchClient, id uint64, off
 	}
 	if snap.classicRange > 0 {
 		// Classic-read provenance: the bytes were dropped under cache
-		// pressure while a reader still held the id — re-read the exact
-		// remote range instead of failing.
-		type ranger interface {
-			ReadStreamRange(ctx context.Context, path string, offset, length int64) (io.ReadCloser, error)
+		// pressure while a reader still held the id. The refetch is
+		// IDENTITY-VERIFIED — the pathname alone is reusable (renames,
+		// replacements) and must never serve another file's bytes under
+		// this id; on mismatch the fetch errors (never wrong bytes).
+		if snap.provResID == "" {
+			return nil, fmt.Errorf("classic slice %d has no verified source", id)
 		}
-		rc, rerr := c.(ranger).ReadStreamRange(ctx, path, snap.provenanceStart+off, limit)
+		curID, serr := c.StatResourceID(ctx, path)
+		if serr != nil || curID != snap.provResID {
+			return nil, fmt.Errorf("classic slice %d source no longer holds the staged object", id)
+		}
+		rc, rerr := c.ReadStreamRange(ctx, path, snap.provenanceStart+off, limit)
 		if rerr != nil {
 			return nil, rerr
 		}
@@ -542,6 +589,8 @@ func (r *blockRegistry) fetch(ctx context.Context, c fetchClient, id uint64, off
 type fetchClient interface {
 	FetchExtentBlockRange(ctx context.Context, url string, offset, length int64) (io.ReadCloser, error)
 	GetExtentReadPlan(ctx context.Context, path string, start, end int64) (*client.ExtentReadPlan, error)
+	ReadStreamRange(ctx context.Context, path string, offset, length int64) (io.ReadCloser, error)
+	StatResourceID(ctx context.Context, path string) (string, error)
 }
 
 func sha256Hex(b []byte) string {

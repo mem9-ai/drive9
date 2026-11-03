@@ -1247,6 +1247,15 @@ func (c *Client) Stat(path string) (*StatResult, error) {
 //
 // StatCtx is the context-aware form of the lightweight HEAD-based Stat
 // interface. Use StatMetadataCompatCtx when enriched metadata is required.
+// StatResourceID stats a path for its resource identity only.
+func (c *Client) StatResourceID(ctx context.Context, path string) (string, error) {
+	st, err := c.StatCtx(ctx, path)
+	if err != nil {
+		return "", err
+	}
+	return st.ResourceID, nil
+}
+
 func (c *Client) StatCtx(ctx context.Context, path string) (*StatResult, error) {
 	req, err := c.newFSRequest(ctx, http.MethodHead, path, "", nil)
 	if err != nil {

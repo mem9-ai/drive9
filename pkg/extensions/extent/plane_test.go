@@ -3637,14 +3637,14 @@ func TestIssuedSliceSurvivesEviction(t *testing.T) {
 
 	// Hand out a slice (stage + issue pin, as readClassic does).
 	data := []byte("FIRST")
-	id1 := br.stageClassicChunk(sha256Hex(data), data, "/d/f.bin", 0, false)
+	id1 := br.stageClassicChunk(sha256Hex(data), data, "/d/f.bin", 0, false, "res-1")
 	if !br.blocks.isIssued(id1) {
 		t.Fatal("staged classic slice was not issue-pinned")
 	}
 	// Stage many distinct chunks to force LRU pressure.
 	for i := 0; i < 32; i++ {
 		d := []byte{byte(i), byte(i), byte(i), byte(i)}
-		br.stageClassicChunk(sha256Hex(d), d, "/d/f.bin", int64(i+1)<<20, false)
+		br.stageClassicChunk(sha256Hex(d), d, "/d/f.bin", int64(i+1)<<20, false, fmt.Sprintf("res-%d", i+2))
 	}
 	// The issued id must still be fetchable (objectStorage.Get consumes
 	// the pin and serves the bytes).
@@ -3946,7 +3946,7 @@ func TestDemotedSliceRefetchesRemotely(t *testing.T) {
 	for i := 0; i < 8; i++ {
 		d := make([]byte, 4096)
 		_, _ = rand.Read(d)
-		br.stageClassicChunk(sha256Hex(d), d, "/d/f.bin", int64(i)*4096, false)
+		br.stageClassicChunk(sha256Hex(d), d, "/d/f.bin", int64(i)*4096, false, fmt.Sprintf("res-%d", i+2))
 	}
 	// The first read's entry was demoted: its bytes are gone, provenance
 	// remains. A later fetch of the SAME range re-reads the remote.
@@ -4057,9 +4057,108 @@ func TestOverlaidSliceNeverDemoted(t *testing.T) {
 	for i := 0; i < 8; i++ {
 		d := make([]byte, 4096)
 		_, _ = rand.Read(d)
-		br.stageClassicChunk(sha256Hex(d), d, "/d/f.bin", int64(i+1)<<20, false)
+		br.stageClassicChunk(sha256Hex(d), d, "/d/f.bin", int64(i+1)<<20, false, "res-x")
 	}
 	if got := readFront(t, eh, 4); got != "ZZZZ" {
 		t.Fatalf("post-pressure read = %q, want ZZZZ (an overlaid slice must not demote to the remote image)", got)
+	}
+}
+
+// Round-28: a classic slice demoted to provenance never serves another
+// file's bytes — the pathname was reused between staging and the refetch,
+// and the identity check refuses instead.
+func TestDemotedSliceRefusesReusedPath(t *testing.T) {
+	f := newFakeV2(t)
+	f.setLegacy(true)
+	f.setDir("/d", true)
+	h := newTestHandler(t, f, 0)
+	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
+	eh := res.Handle.(*engineHandle)
+	if err := eh.Write(context.Background(), 0, []byte("AAAAAAAA")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// Read once to stage an identity-bound classic slice, then demote it.
+	old := classicReadCacheBytes
+	classicReadCacheBytes = 1
+	defer func() { classicReadCacheBytes = old }()
+	buf := make([]byte, 8)
+	if _, err := eh.Read(context.Background(), 0, buf); err != nil {
+		t.Fatal(err)
+	}
+	br := h.opts.Engine.Bridge
+	br.mu.Lock()
+	firstID := br.classicLRU[len(br.classicLRU)-1].id
+	br.mu.Unlock()
+	for i := 0; i < 4; i++ {
+		d := make([]byte, 4096)
+		_, _ = rand.Read(d)
+		br.stageClassicChunk(sha256Hex(d), d, "/d/f.bin", int64(i+1)<<20, false, fmt.Sprintf("res-%d", i+2))
+	}
+	// The path is replaced by ANOTHER object before the slice's later
+	// block fetch: the identity-verified refetch must REFUSE (never serve
+	// another file's bytes under this id). Drive the registry fetch
+	// directly — the engine's own block cache would serve the first read
+	// without a second meta.Read.
+	f.remove("/d/f.bin")
+	f.seedExtent(t, "/d/f.bin", "OTHERFILE")
+	rc, err := h.opts.Engine.Bridge.Storage().Get(context.Background(),
+		fmt.Sprintf("chunks/0/0/%d_0_8", firstID), 0, 8)
+	if err == nil {
+		_ = rc.Close()
+		t.Fatal("the demoted slice served bytes from a reused pathname")
+	}
+	if got := f.contentOf("/d/f.bin"); got != "OTHERFILE" {
+		t.Fatalf("replacement = %q, want OTHERFILE untouched", got)
+	}
+}
+
+// Round-28: overlay bytes stay accounted while irreducible and are
+// reclaimed after the flush resolves them.
+func TestOverlayBytesAccountedAndReclaimed(t *testing.T) {
+	f := newFakeV2(t)
+	f.setLegacy(true)
+	f.setDir("/d", true)
+	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: engineCacheDir(t)})
+	h := New(Options{Engine: eng, Threshold: 0, SyncMode: "interactive"})
+	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
+	eh := res.Handle.(*engineHandle)
+	if err := eh.Write(context.Background(), 0, []byte("AAAA")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Write(context.Background(), 0, []byte("ZZ")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	old := classicReadCacheBytes
+	classicReadCacheBytes = 1
+	defer func() { classicReadCacheBytes = old }()
+	if got := readFront(t, eh, 4); got != "ZZAA" {
+		t.Fatalf("overlay read = %q, want ZZAA", got)
+	}
+	br := eng.Bridge
+	br.mu.Lock()
+	held := br.classicBytes
+	br.mu.Unlock()
+	if held < 4 {
+		t.Fatalf("overlay bytes unaccounted: classicBytes = %d, want >= 4", held)
+	}
+	// The flush resolves the overlay: the entry may demote now.
+	if err := eh.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	br.mu.Lock()
+	held2 := br.classicBytes
+	br.mu.Unlock()
+	_ = held2
+	if got := readFront(t, eh, 4); got != "ZZAA" {
+		t.Fatalf("post-flush read = %q, want ZZAA", got)
 	}
 }

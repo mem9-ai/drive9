@@ -1815,7 +1815,7 @@ func (b *Bridge) readClassic(ctx context.Context, ino meta.Ino, path string, sta
 		copy(data[off-start:], pdata)
 	}
 	sum := sha256Hex(data)
-	id := b.stageClassicChunk(sum, data, path, start, len(pending) > 0)
+	id := b.stageClassicChunk(sum, data, path, start, len(pending) > 0, b.remoteIdentity(ino, path))
 	*slices = []meta.Slice{{Id: id, Size: uint32(len(data)), Len: uint32(len(data))}}
 	return 0
 }
@@ -1839,10 +1839,13 @@ var classicReadProtect = 4
 // handed), records inside the grace window are immune (in-flight fetches),
 // and pinned entries (a pending commit still references their checksum)
 // are never retired.
-func (b *Bridge) stageClassicChunk(sum string, data []byte, path string, start int64, overlaid bool) uint64 {
+func (b *Bridge) stageClassicChunk(sum string, data []byte, path string, start int64, overlaid bool, resID string) uint64 {
 	id := b.blocks.stagePinned(sum, data, false)
 	if overlaid {
 		b.blocks.markLocalOverlay(id)
+	}
+	if resID != "" {
+		b.blocks.setProvenanceIdentity(id, resID)
 	}
 	b.mu.Lock()
 	now := time.Now()
@@ -1868,7 +1871,7 @@ func (b *Bridge) stageClassicChunk(sum string, data []byte, path string, start i
 			return id
 		}
 	}
-	b.classicLRU = append(b.classicLRU, classicRef{sum: sum, id: id, bytes: int64(len(data)), at: now, path: path, start: start})
+	b.classicLRU = append(b.classicLRU, classicRef{sum: sum, id: id, bytes: int64(len(data)), at: now, path: path, start: start, resID: resID})
 	b.classicBytes += int64(len(data))
 	var retire []classicRef
 	for b.classicBytes > classicReadCacheBytes {
@@ -1881,17 +1884,31 @@ func (b *Bridge) stageClassicChunk(sum string, data []byte, path string, start i
 		retire = append(retire, oldest)
 	}
 	b.mu.Unlock()
+	var retained []classicRef
 	for _, r := range retire {
 		if b.blocks.isIssued(r.id) {
 			// An outstanding reader still holds this slice: DEMOTE it —
 			// the cached bytes are dropped (freeing the budget) while the
-			// id stays fetchable through the classic remote range, the
-			// usable source for the reader's later block fetches. The LRU
-			// record goes with the bytes; a re-read simply re-stages.
-			b.blocks.demoteToProvenance(r.id, r.sum, r.path, r.start)
+			// id stays fetchable through the IDENTITY-VERIFIED classic
+			// remote range. Entries that cannot demote (local-only bytes,
+			// a pending reference, or no recorded source identity) KEEP
+			// their bytes and are re-appended so they stay ACCOUNTED and
+			// reclaimable (the overlay flag self-clears at the flush).
+			if b.blocks.demoteToProvenance(r.id, r.sum, r.path, r.start, r.resID) {
+				continue
+			}
+			retained = append(retained, r)
 			continue
 		}
 		b.blocks.releaseIfUnpinned(r.sum)
+	}
+	if len(retained) > 0 {
+		b.mu.Lock()
+		b.classicLRU = append(b.classicLRU, retained...)
+		for _, r := range retained {
+			b.classicBytes += r.bytes
+		}
+		b.mu.Unlock()
 	}
 	// One pin per BLOCK the reader may fetch: a 64 MiB slice is consumed
 	// by sixteen separate 4 MiB Gets, and pins are NOT consumed by any
@@ -1966,6 +1983,28 @@ func (b *Bridge) layoutPendingMatches(ino meta.Ino, occupantID string) bool {
 		return id == occupantID
 	}
 	return true // fresh upload of ours created the occupant
+}
+
+// remoteIdentity returns the identity the bridge last saw for the file a
+// classic read was served from (empty when unknown).
+func (b *Bridge) remoteIdentity(ino meta.Ino, path string) string {
+	// The identity of whatever object CURRENTLY occupies the mapping (a
+	// rename means the mapping moved with the file; a replacement means a
+	// new id). Stat; on failure fall back to the last one seen for this
+	// inode's CURRENT mapping path.
+	if cur, ok := b.remotePath(ino); ok {
+		path = cur
+	}
+	if st, err := b.cfg.Client.StatCtx(context.Background(), path); err == nil {
+		b.mu.Lock()
+		b.classicSeen[ino] = st.ResourceID
+		b.mu.Unlock()
+		return st.ResourceID
+	}
+	b.mu.Lock()
+	id := b.classicSeen[ino]
+	b.mu.Unlock()
+	return id
 }
 
 // publicationIdentity returns the resource identity this inode's next
@@ -2103,6 +2142,9 @@ func (b *Bridge) releaseCommitted(ino meta.Ino, pending []pendingWrite) {
 		// after the last reference completed, and pinned entries are never
 		// retired by the classic-read LRU.
 		b.blocks.unpin(p.checksum)
+		// The landed fragment makes any whole-chunk overlay image
+		// reproducible from the remote again — its entry may demote.
+		b.blocks.overlayResolved(p.checksum)
 		if refs[p.checksum] > 0 {
 			continue
 		}

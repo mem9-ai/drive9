@@ -774,6 +774,10 @@ func ExampleClient_extentBlockDataPlane() {
 		-1, "resource-id-of-large.bin")
 	_ = c.CommitExtentPatchExpectedResource(bound, "/workspace/large.bin", int64(len(buf)),
 		[]drive9.ExtentBlockWrite{{Chunk: chunk, Off: off, Data: buf}}, -1, "resource-id-of-large.bin")
+
+	// Identity-only stat: the resource ID of whatever currently occupies
+	// the path (cheap fencing check before a bound publication).
+	_, _ = c.StatResourceID(ctx, "/workspace/large.bin")
 }
 
 var coveredClientMethods = map[string]bool{
@@ -835,6 +839,7 @@ var coveredClientMethods = map[string]bool{
 	"CommitExtentPatchExpectedResource":      true,
 	"InitiateExtentPatchExpectedResource":    true,
 	"WriteStreamConditionalExpectedResource": true,
+	"StatResourceID":                         true,
 	"Exec":                                   true,
 	"FetchExtentBlockRange":                  true,
 	"ForkFSLayer":                            true,
