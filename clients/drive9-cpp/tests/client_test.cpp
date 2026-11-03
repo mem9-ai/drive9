@@ -41,6 +41,7 @@ public:
     bool fail_cleanup = false;
     int cleanup_calls = 0, renewals = 0;
     std::string corrupt_op;
+    Json clone_override;
     Json corrupt_errno;
     Json credential = {{"scheme", "s3"}, {"endpoint", "http://object.test"}, {"bucket", "bucket"},
                        {"prefix", "tenant/"}, {"access_key_id", "test-access"}, {"secret_access_key", "test-secret"},
@@ -120,6 +121,7 @@ public:
         } else if (op == "clone") {
             response["inode"] = request.at("new_inode"); response["attr"] = attr;
             if (clone_bad_ack) response["inode"] = 42;
+            if (!clone_override.is_null()) response.merge_patch(clone_override);
             if (clone_lost_ack) throw Error("clone committed but acknowledgement was lost");
         } else if (op == "truncate") { attr["Length"] = request.at("length"); response["attr"] = attr; maps.clear(); }
         if (op == corrupt_op) response["errno"] = corrupt_errno;
@@ -651,9 +653,25 @@ void CloneCapabilityAndFailures() {
     Check(fs.Clone(h, "/target", 101).exists, "definite conflict poisoned the session");
     fs.Close(h);
 }
+void MalformedCloneAttributes() {
+    for (const auto &patch : std::vector<Json>{
+        {{"attr", {{"Typ", 257}}}}, {{"attr", {{"Typ", -255}}}}, {{"attr", {{"Typ", 1.5}}}},
+        {{"attr", {{"Length", -1}}}}, {{"attr", {{"Length", (1ULL << 58) + 1}}}},
+        {{"attr", {{"Length", 1.5}}}}, {{"attr", {{"Length", nullptr}}}}, {{"inode", 42.5}}
+    }) {
+        Fixture f; f.exists = true; f.clone_override = patch;
+        ExtentFileSystem fs(f.ClientFor());
+        OpenOptions options; options.write = true; options.lock = Lock::Exclusive;
+        auto h = fs.Open("/source", options);
+        Fails([&] { fs.Clone(h, "/target"); }, "malformed clone attributes accepted");
+        Fails([&] { fs.WriteAt(h, "x", 1, 0); }, "malformed clone allowed later writes");
+        int clones = 0; for (auto &call : f.calls) if (call.at("op") == "clone") ++clones;
+        Check(clones == 1 && f.puts == 0, "malformed clone was replayed");
+    }
+}
 int main() {
     try {
-        AtomicCloneProtocol(); CloneCapabilityAndFailures();
+        AtomicCloneProtocol(); CloneCapabilityAndFailures(); MalformedCloneAttributes();
         ShutdownRenewsActiveWrite(); ConcurrentShutdownDrainsRead();
         DirectoryProjectionCapability(); LegacyDirectoryRenameIsRejected(); RenameNamespaceValidation();
         PathsAndSlices(); DurableSparseAndReferences(); CompatibleIDReservations(); LostPublicationAck(); MalformedAcknowledgement(); UploadFailure(); LatePutRejected();

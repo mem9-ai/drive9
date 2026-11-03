@@ -596,6 +596,15 @@ FileInfo ExtentFileSystem::Clone(uint64_t handle, const std::string &target, uin
                                   {"name", parent.second}, {"proj_path", path}, {"new_inode", inode},
                                   {"expected_inode", expected_inode}});
     try {
+        auto integer = [](const Json &value) -> uint64_t {
+            if (!value.is_number_integer() || (!value.is_number_unsigned() && value.get<int64_t>() < 0))
+                throw Error("Malformed extent clone acknowledgement");
+            return value.get<uint64_t>();
+        };
+        const auto &attr = result.at("attr");
+        if (integer(result.at("inode")) != inode || integer(attr.at("Typ")) != 1 ||
+            integer(attr.at("Length")) > MaxFileSize)
+            throw Error("Malformed extent clone acknowledgement");
         auto info = ParseInfo(result);
         if (info.inode != inode || info.type != 1) throw Error("Malformed extent clone acknowledgement");
         return info;
