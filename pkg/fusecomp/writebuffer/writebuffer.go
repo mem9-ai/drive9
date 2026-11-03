@@ -447,11 +447,20 @@ func (wb *WriteBuffer) restoreEvictedPart(partIdx int) ([]byte, bool, error) {
 	if wb.LoadPart != nil {
 		if partStart < wb.remoteSize || shadowErr != nil {
 			data, err := wb.LoadPart(partIdx + 1)
-			if err == nil {
+			// An error-free EMPTY result is not a restore: the production
+			// loader answers (nil, nil) for any part starting beyond the
+			// base size it captured at open — treating that as a zero hole
+			// zero-fills a part whose retained bytes exist (the landed
+			// image holds them) and silently publishes the loss. Only
+			// bytes actually supplied by the loader count.
+			if err == nil && len(data) > 0 {
 				return data, true, nil
 			}
 			if shadowErr == nil {
-				return nil, false, err
+				if err != nil {
+					return nil, false, err
+				}
+				return nil, false, fmt.Errorf("loaded evicted part %d of %s is empty", partIdx+1, wb.path)
 			}
 		}
 	}

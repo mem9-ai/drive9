@@ -285,4 +285,27 @@ func TestEvictedPartFallsBackToRemoteWhenShadowIsGone(t *testing.T) {
 	if err := wb.EnsurePartsForWrite(0, 4); err == nil {
 		t.Fatal("both restore sources gone must fail, not zero-fill")
 	}
+
+	// The PRODUCTION loader shape: an error-free (nil, nil) for a part
+	// beyond the base size it captured at open. That is not a zero hole —
+	// the landed image holds the bytes — so the restore must refuse
+	// instead of growing a zero-filled part that silently loses them.
+	wb2 := partModeBuffer(4)
+	wb2.SetSmallFileMax(1)
+	if _, err := wb2.Write(0, []byte("aaaa")); err != nil {
+		t.Fatal(err)
+	}
+	wb2.RestorePart = func(partNum int) ([]byte, error) {
+		return nil, syscall.ENOENT // the queue reclaimed the shadow
+	}
+	wb2.LoadPart = func(partNum int) ([]byte, error) {
+		return nil, nil // boundary captured before the landing
+	}
+	wb2.EvictPart(0)
+	if err := wb2.EnsurePartsForWrite(0, 4); err == nil {
+		t.Fatal("an empty error-free fallback restored a part and would zero-fill it")
+	}
+	if err := wb2.EnsureLoaded(0); err == nil {
+		t.Fatal("a later full read must not silently serve the zero-filled part")
+	}
 }
