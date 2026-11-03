@@ -129,6 +129,11 @@ type CommitQueue struct {
 	remoteRoot  string
 	layerRef    string
 	shadows     *staging.ShadowStore
+	// retainedShadows marks a path whose landed entry must NOT have its
+	// shadow reclaimed: the staging handle refused certification (its
+	// buffer moved on), but the shadow is still the only restore source for
+	// the landing's unchanged evicted parts. Consumed by the cleanup pass.
+	retainedShadows sync.Map
 	index       *staging.PendingIndex
 	journal     *staging.Journal
 	wg          sync.WaitGroup
@@ -264,6 +269,18 @@ func (cq *CommitQueue) SetExtentTakeover(enabled bool) {
 	cq.mu.Lock()
 	cq.extentTakeover = enabled
 	cq.mu.Unlock()
+}
+
+// RetainShadowForLanding asks the success cleanup to keep this path's
+// shadow generation: the handle that staged the landed image refused
+// certification (newer local mutations), and its unchanged evicted parts
+// still reference the shadow as their only restore source. The next
+// staging overwrites the shadow and the next landing reclaims it.
+func (cq *CommitQueue) RetainShadowForLanding(path string, gen uint64) {
+	if cq == nil {
+		return
+	}
+	cq.retainedShadows.Store(path, gen)
 }
 
 // ConfigureBatchWrite enables a small writeback-only direct-PUT batch window.
@@ -2542,6 +2559,13 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 	// the local metadata source, and shadowStore remains the local data source
 	// for large files that are not admitted to readCache.
 	if cq.shadows != nil && cq.layerRefSnapshot() == "" {
+		if keep, ok := cq.retainedShadows.LoadAndDelete(entry.Path); ok && keep == entry.ShadowGen {
+			// The staging handle kept newer local bytes: the shadow stays
+			// as the restore source for this landing's evicted parts.
+			cq.index.RemoveIfGeneration(entry.Path, entry.PendingIndexGen)
+			cq.removeFromQueue(entry)
+			return nil
+		}
 		if entry.ShadowGen != 0 {
 			cq.shadows.RemoveIfGeneration(entry.Path, entry.ShadowGen)
 		}

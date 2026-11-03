@@ -473,7 +473,14 @@ func New(opts Options) (*Writeback, error) {
 				if v, ok := w.liveSnapshots.Load(entry.SnapshotID); ok {
 					w.liveSnapshots.Delete(entry.SnapshotID)
 					if h, ok := v.(*bufferingHandle); ok {
-						h.markLandedImage(committedRev, entry.Size, entry.SnapshotID)
+						if !h.markLandedImage(committedRev, entry.Size, entry.SnapshotID) {
+							// The buffer moved past the staged image, but
+							// its still-unchanged evicted parts reference
+							// THIS shadow generation and have no other
+							// restore source until their own landing: the
+							// queue's cleanup must keep the shadow.
+							w.queue.RetainShadowForLanding(entry.Path, entry.ShadowGen)
+						}
 					}
 				}
 			}
@@ -2083,8 +2090,13 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 			}
 			// The landing retires isNew (later writes stage as overwrites
 			// of whatever landed) and re-bases evicted-part recovery on
-			// the remote image before the queue reclaims the shadow.
-			h.markLanded(0)
+			// the remote image before the queue reclaims the shadow —
+			// but only when the buffer still holds the staged image: a
+			// write accepted while the upload was pending stays
+			// unpublished dirty state.
+			if h.landingCertified() {
+				h.markLanded(0)
+			}
 			return nil
 		}
 		if h.w.uploader != nil && h.w.wbCache != nil {
@@ -2170,10 +2182,17 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 			if err := h.w.queue.WaitPathOutcome(h.path, uploadTimeout); err != nil {
 				return fs.StatusErrorOf(gofuse.Status(syscall.EIO))
 			}
-			h.markLanded(0)
-			h.mu.Lock()
-			h.dirty = false
-			h.mu.Unlock()
+			// Post-wait completion: retire the fresh-create view and drop
+			// the dirty flag only when the buffer still holds the staged
+			// image. A write accepted while the upload was pending (the
+			// drain path runs without the FUSE per-handle lock) must keep
+			// its dirty flag so a later Flush/Release publishes it.
+			if h.landingCertified() {
+				h.markLanded(0)
+				h.mu.Lock()
+				h.dirty = false
+				h.mu.Unlock()
+			}
 			return nil
 		}
 		if size < commitInlineStreamThreshold {
@@ -2490,20 +2509,33 @@ func (h *bufferingHandle) markLanded(rev int64) {
 // (visTrunc cleared, remote restore armed) only when it still holds
 // exactly the staged image the landing acknowledged: newer mutations,
 // such as an unstaged truncate-regrow, keep their own state.
-func (h *bufferingHandle) markLandedImage(rev, size int64, snapshotID string) {
+func (h *bufferingHandle) markLandedImage(rev, size int64, snapshotID string) (certified bool) {
 	h.mu.Lock()
 	h.landed = true
 	h.isNew = false
 	if rev > 0 {
 		h.baseRev = rev
 	}
-	certified := snapshotID != "" && h.stagedSnapshotID == snapshotID &&
+	certified = snapshotID != "" && h.stagedSnapshotID == snapshotID &&
 		(h.buf == nil || h.buf.ContentVersion() == h.stagedContentVersion)
 	if certified {
 		h.visTrunc = false
 		h.armRemoteRestoreLocked(size)
 	}
 	h.mu.Unlock()
+	return certified
+}
+
+// landingCertified reports whether the buffer still holds the image of its
+// last staging (content generation unchanged). A landing completion — the
+// queue callback or a post-wait continuation — may only clear the dirty
+// flag, retire the fresh-create view, or arm the remote restore when this
+// holds: a write or truncate accepted after that staging must survive as
+// unpublished dirty state.
+func (h *bufferingHandle) landingCertified() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.buf == nil || h.buf.ContentVersion() == h.stagedContentVersion
 }
 
 func attrSize(res fs.Result) int64 {
@@ -4403,7 +4435,9 @@ func (h *bufferingHandle) commitLocked(ctx context.Context) error {
 		if err := h.w.queue.WaitPathOutcome(h.path, uploadTimeout); err != nil {
 			return fs.StatusErrorOf(gofuse.Status(syscall.EIO))
 		}
-		h.markLanded(0)
+		if h.landingCertified() {
+			h.markLanded(0)
+		}
 		return nil
 	}
 	// Commit dispatch: a partial edit of an existing large file patches
