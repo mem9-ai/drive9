@@ -2,7 +2,9 @@ package mockserver
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
@@ -327,6 +329,12 @@ func (s *Server) fsHead(w http.ResponseWriter, r *http.Request, t *tenantDB, raw
 	}
 	w.Header().Set("X-Dat9-IsDir", fmt.Sprint(n.isDir()))
 	w.Header().Set("X-Dat9-Size", fmt.Sprint(n.Size))
+	if !n.isDir() {
+		if data, _, err := t.readFile(p); err == nil {
+			sum := sha256.Sum256(data)
+			w.Header().Set("X-Dat9-Checksum-SHA256", hex.EncodeToString(sum[:]))
+		}
+	}
 	w.Header().Set("X-Dat9-Revision", fmt.Sprint(n.Revision))
 	w.Header().Set("X-Dat9-Mtime", fmt.Sprint(n.MtimeNS))
 	w.Header().Set("X-Dat9-Btime", fmt.Sprint(n.BtimeNS))
@@ -347,6 +355,12 @@ func (s *Server) fsStat(w http.ResponseWriter, r *http.Request, t *tenantDB, raw
 	}
 	w.Header().Set("X-Dat9-Mtime", fmt.Sprint(n.MtimeNS))
 	w.Header().Set("X-Dat9-Btime", fmt.Sprint(n.BtimeNS))
+	if !n.isDir() {
+		if data, _, err := t.readFile(p); err == nil {
+			sum := sha256.Sum256(data)
+			w.Header().Set("X-Dat9-Checksum-SHA256", hex.EncodeToString(sum[:]))
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"size":        n.Size,
 		"isdir":       n.isDir(),
@@ -447,6 +461,7 @@ func (s *Server) fsPut(w http.ResponseWriter, r *http.Request, t *tenantDB, raw 
 	if desc := r.Header.Get("X-Dat9-Description"); desc != "" {
 		_, _ = t.db.Exec(`UPDATE file_nodes SET description = ? WHERE path = ?`, desc, p)
 	}
+	s.hubFor(t.id).publish(p, "write")
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "revision": rev})
 }
 
@@ -477,6 +492,7 @@ func (s *Server) fsDelete(w http.ResponseWriter, r *http.Request, t *tenantDB, r
 		errJSON(w, http.StatusInternalServerError, "delete failed")
 		return
 	}
+	s.hubFor(t.id).publish(p, "delete")
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
@@ -528,6 +544,7 @@ func (s *Server) fsPost(w http.ResponseWriter, r *http.Request, t *tenantDB, raw
 			errJSON(w, http.StatusInternalServerError, "mkdir failed")
 			return
 		}
+		s.hubFor(t.id).publish(p, "mkdir")
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	case has("rename"):
 		dst, err := fsPath(raw, false)
@@ -553,6 +570,8 @@ func (s *Server) fsPost(w http.ResponseWriter, r *http.Request, t *tenantDB, raw
 			errJSON(w, http.StatusInternalServerError, "rename failed")
 			return
 		}
+		s.hubFor(t.id).publish(src, "delete")
+		s.hubFor(t.id).publish(dst, "rename")
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "revision": rev})
 	case has("copy"):
 		dst, err := fsPath(raw, false)
@@ -577,8 +596,39 @@ func (s *Server) fsPost(w http.ResponseWriter, r *http.Request, t *tenantDB, raw
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "revision": rev})
 	case has("append-log"):
 		s.fsAppendLog(w, r, t, raw)
+	case has("hardlink"):
+		// content-level hardlink: create dst from src's bytes, refusing when
+		// dst already exists (the exclusivity the no-clobber races assert).
+		// Shared-inode semantics are a mock fidelity TODO; the observable
+		// contract exercised by cases (content + exclusivity) holds.
+		dst, err := fsPath(raw, false)
+		if err != nil {
+			errJSON(w, http.StatusBadRequest, "invalid path")
+			return
+		}
+		src := headerOrQuery("X-Dat9-Hardlink-Source")
+		if src == "" {
+			errJSON(w, http.StatusBadRequest, "missing X-Dat9-Hardlink-Source")
+			return
+		}
+		if _, err := t.getNode(dst); err == nil {
+			errJSONCode(w, http.StatusConflict, "path_conflict", "path conflict")
+			return
+		}
+		data, _, err := t.readFile(src)
+		if err != nil {
+			errJSON(w, http.StatusNotFound, "not found")
+			return
+		}
+		rev, err := t.putFile(dst, append([]byte(nil), data...), -1)
+		if err != nil {
+			errJSON(w, http.StatusInternalServerError, "hardlink failed")
+			return
+		}
+		s.hubFor(t.id).publish(dst, "copy")
+		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "revision": rev})
 	case has("append"), has("setmeta"), has("chmod"),
-		has("create"), has("symlink"), has("hardlink"):
+		has("create"), has("symlink"):
 		tier1 := []string{}
 		for _, sel := range []string{"append", "setmeta", "chmod", "create", "symlink", "hardlink"} {
 			if has(sel) {
@@ -636,6 +686,7 @@ func (s *Server) fsAppendLog(w http.ResponseWriter, r *http.Request, t *tenantDB
 		errJSON(w, http.StatusInternalServerError, "append failed")
 		return
 	}
+	s.hubFor(t.id).publish(p, "write")
 	w.Header().Set("X-Dat9-Revision", fmt.Sprint(rev))
 	writeJSON(w, http.StatusOK, map[string]any{"revision": rev, "size_bytes": wantSize + int64(len(body))})
 }

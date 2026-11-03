@@ -2,7 +2,6 @@ package mockserver
 
 import (
 	"fmt"
-	"time"
 	"io"
 	"net/http"
 	"net/url"
@@ -127,43 +126,4 @@ func writeS3Error(w http.ResponseWriter, status int, code, key string) {
 	w.Header().Set("Content-Type", "application/xml")
 	w.WriteHeader(status)
 	fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?><Error><Code>%s</Code><Key>%s</Key></Error>`, code, key)
-}
-
-// handleEvents is the minimal Tier-0 SSE stream (spec §9): a subscribed
-// client gets an open text/event-stream with heartbeats and no resets for
-// a quiet tenant. Without this the mount daemons treat the missing stream
-// as a broken subscription and periodically invalidate their whole
-// directory cache (observed as flapping readdirs on second mounts).
-func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		errJSON(w, http.StatusInternalServerError, "streaming unsupported")
-		return
-	}
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
-	// a stable head seq: no events are ever generated, so every client's
-	// cursor (since) is <= 1 and the stream never resets it. A heartbeat
-	// carrying seq 0 would read as seq_too_old for any since > 0 and cause
-	// a reset storm.
-	_, _ = fmt.Fprintf(w, "event: reset\ndata: {\"seq\":1,\"reason\":\"initial_sync\"}\n\n")
-	flusher.Flush()
-	heartbeat := func() {
-		_, _ = fmt.Fprintf(w, "event: heartbeat\ndata: {\"seq\":1}\n\n")
-		flusher.Flush()
-	}
-	heartbeat()
-	ticker := time.NewTicker(15 * time.Second)
-	defer ticker.Stop()
-	ctx := r.Context()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			heartbeat()
-		}
-	}
 }

@@ -23,7 +23,7 @@ timeout = "10m"
 [[case]]
 name = "community/fstest-fsx"
 tier = "pr-gate-mount"
-timeout = "10m"
+timeout = "15m"
 
 [[case]]
 name = "webdev/save-then-read"

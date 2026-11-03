@@ -56,8 +56,20 @@ type Server struct {
 	meta  *metaStore
 	mu    sync.Mutex
 	tenants map[string]*tenantDB // tenant_id -> open handle
+	hubs  map[string]*eventHub   // tenant_id -> change bus
 	log   *zap.Logger
 	mux   *http.ServeMux
+}
+
+func (s *Server) hubFor(tenant string) *eventHub {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if h, ok := s.hubs[tenant]; ok {
+		return h
+	}
+	h := newEventHub()
+	s.hubs[tenant] = h
+	return h
 }
 
 // New opens (creating if needed) the mock backend under cfg.Dir.
@@ -79,6 +91,7 @@ func New(cfg Config) (*Server, error) {
 		cfg:     cfg,
 		meta:    meta,
 		tenants: map[string]*tenantDB{},
+		hubs:    map[string]*eventHub{},
 		log:     cfg.Logger,
 	}
 	s.routes()
