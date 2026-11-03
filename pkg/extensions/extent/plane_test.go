@@ -51,6 +51,10 @@ type fakeV2 struct {
 	patchPaths []string   // every PATCH target, in order
 	deletes    []string   // every DELETE target, in order
 	lastPatch  *fakePatch // the open PATCH session, applied at /complete
+
+	readEchoOff      bool   // classic GETs omit the identity echo (redirect shape); HEADs keep it
+	readEchoOverride string // classic GETs echo this instead of the stored id
+	readBodyOverride string // classic GETs serve these bytes instead of the stored content
 }
 
 // fakePatch is one initiated PATCH session: applied to the target's content
@@ -195,9 +199,16 @@ func newFakeV2(t *testing.T) *fakeV2 {
 				// which object it just served).
 				fail := f.failBody
 				id := f.ids[path]
+				echoOff, echoOverride := f.readEchoOff, f.readEchoOverride
+				bodyOverride := f.readBodyOverride
 				f.mu.Unlock()
-				if id != "" {
+				if echoOverride != "" {
+					w.Header().Set("X-Dat9-Resource-ID", echoOverride)
+				} else if id != "" && !echoOff {
 					w.Header().Set("X-Dat9-Resource-ID", id)
+				}
+				if bodyOverride != "" {
+					classic = bodyOverride
 				}
 				w.Header().Set("Content-Length", fmt.Sprint(len(classic)))
 				if fail {
@@ -4118,6 +4129,89 @@ func TestDemotedSliceRefusesReusedPath(t *testing.T) {
 	}
 	if got := f.contentOf("/d/f.bin"); got != "OTHERFILE" {
 		t.Fatalf("replacement = %q, want OTHERFILE untouched", got)
+	}
+}
+
+// Round-32: the headerless classic refetch fallback binds the BODY it
+// publishes. The post-stat re-read's own echo is checked, and an echo-less
+// re-read is verified against the staged slice's content checksum — a
+// replacement's bytes never publish under the staged id.
+func TestHeaderlessFallbackBindsBody(t *testing.T) {
+	f := newFakeV2(t)
+	f.setLegacy(true)
+	f.setDir("/d", true)
+	h := newTestHandler(t, f, 0)
+	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
+	eh := res.Handle.(*engineHandle)
+	if err := eh.Write(context.Background(), 0, []byte("AAAAAAAA")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// Stage an identity-bound classic slice, then demote it under pressure.
+	old := classicReadCacheBytes
+	classicReadCacheBytes = 1
+	defer func() { classicReadCacheBytes = old }()
+	buf := make([]byte, 8)
+	if _, err := eh.Read(context.Background(), 0, buf); err != nil {
+		t.Fatal(err)
+	}
+	br := h.opts.Engine.Bridge
+	br.mu.Lock()
+	rec := br.classicLRU[len(br.classicLRU)-1]
+	firstID, wantRes := rec.id, rec.resID
+	br.mu.Unlock()
+	if wantRes == "" {
+		t.Fatal("staged slice carries no identity")
+	}
+	for i := 0; i < 4; i++ {
+		d := make([]byte, 4096)
+		_, _ = rand.Read(d)
+		br.stageClassicChunk(sha256Hex(d), d, "/d/f.bin", int64(i+1)<<20, false, fmt.Sprintf("res-h%d", i+2), 1)
+	}
+	// The refetch GET is headerless (redirect shape): the stat fence alone
+	// no longer publishes anything — the re-read must be bound itself.
+	f.mu.Lock()
+	f.readEchoOff = true
+	f.mu.Unlock()
+	key := fmt.Sprintf("chunks/0/0/%d_0_8", firstID)
+
+	// (1) the re-read carries a DIFFERENT identity echo: refuse.
+	f.mu.Lock()
+	f.readEchoOverride = "res-OTHER"
+	f.mu.Unlock()
+	if rc, err := br.Storage().Get(context.Background(), key, 0, 8); err == nil {
+		_ = rc.Close()
+		t.Fatal("fallback published bytes under a mismatched re-read identity")
+	}
+
+	// (2) the re-read is echo-less but serves a replacement's content: the
+	// content checksum must refuse it.
+	f.mu.Lock()
+	f.readEchoOverride = ""
+	f.readBodyOverride = "BBBBBBBB"
+	f.mu.Unlock()
+	if rc, err := br.Storage().Get(context.Background(), key, 0, 8); err == nil {
+		_ = rc.Close()
+		t.Fatal("fallback published unverified replacement bytes")
+	}
+
+	// (3) an echo-less re-read whose bytes hash to the staged image: serve.
+	f.mu.Lock()
+	f.readBodyOverride = ""
+	f.mu.Unlock()
+	rc, err := br.Storage().Get(context.Background(), key, 0, 8)
+	if err != nil {
+		t.Fatalf("verified fallback refused: %v", err)
+	}
+	got, gerr := io.ReadAll(rc)
+	_ = rc.Close()
+	if gerr != nil {
+		t.Fatal(gerr)
+	}
+	if string(got) != "AAAAAAAA" {
+		t.Fatalf("fallback body = %q, want AAAAAAAA", got)
 	}
 }
 

@@ -569,26 +569,51 @@ func (r *blockRegistry) fetch(ctx context.Context, c fetchClient, id uint64, off
 		if rerr != nil {
 			return nil, rerr
 		}
-		if got := rcHeaderResourceID(rc); got == "" {
-			// Redirected (302/307) and legacy-inline reads carry no echo.
-			// Fall back to an identity STAT fenced against the same
-			// replacement risk as before the read: close the unverified
-			// body, verify, then re-read. A mismatch errors (never wrong
-			// bytes); the residual race is identical to the pre-read stat.
-			_ = rc.Close()
-			curID, serr := c.StatResourceID(ctx, path)
-			if serr != nil || curID != snap.provResID {
+		if got := rcHeaderResourceID(rc); got != "" {
+			if got != snap.provResID {
+				_ = rc.Close()
 				return nil, fmt.Errorf("classic slice %d source no longer holds the staged object", id)
 			}
-			rc, rerr = c.ReadStreamRange(ctx, path, snap.provenanceStart+off, limit)
-			if rerr != nil {
-				return nil, rerr
-			}
-		} else if got != snap.provResID {
-			_ = rc.Close()
+			return rc, nil
+		}
+		// Redirected (302/307) and legacy-inline reads carry no echo. A
+		// stat fence alone cannot bind the BODY of the re-read that
+		// follows it — the pathname can be replaced between the stat and
+		// the response, and the re-read's own echo (when it carries one)
+		// must not go unchecked either. The fallback therefore re-reads
+		// the WHOLE slice and verifies it against the entry's content
+		// checksum: only bytes hashing to the staged image are published
+		// under this id (a replacement's bytes never match), regardless
+		// of what the intermediate stat observed.
+		_ = rc.Close()
+		curID, serr := c.StatResourceID(ctx, path)
+		if serr != nil || curID != snap.provResID {
 			return nil, fmt.Errorf("classic slice %d source no longer holds the staged object", id)
 		}
-		return rc, nil
+		frc, ferr := c.ReadStreamRange(ctx, path, snap.provenanceStart, snap.size)
+		if ferr != nil {
+			return nil, ferr
+		}
+		if got := rcHeaderResourceID(frc); got != "" && got != snap.provResID {
+			_ = frc.Close()
+			return nil, fmt.Errorf("classic slice %d source no longer holds the staged object", id)
+		}
+		data, derr := io.ReadAll(frc)
+		_ = frc.Close()
+		if derr != nil {
+			return nil, derr
+		}
+		if sha256Hex(data) != snap.sha256 {
+			return nil, fmt.Errorf("classic slice %d refetch content mismatch", id)
+		}
+		if off > int64(len(data)) {
+			return io.NopCloser(bytes.NewReader(nil)), nil
+		}
+		end := off + limit
+		if end > int64(len(data)) {
+			end = int64(len(data))
+		}
+		return io.NopCloser(bytes.NewReader(data[off:end])), nil
 	}
 	plan, err := c.GetExtentReadPlan(ctx, path, snap.provenanceStart, snap.provenanceStart+snap.size)
 	if err != nil {
