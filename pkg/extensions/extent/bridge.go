@@ -219,6 +219,7 @@ type classicRef struct {
 	path  string // classic remote source (provenance fallback)
 	start int64
 	resID string // the source object's identity when staged
+	ino   meta.Ino
 }
 
 // newBridgeFinish installs cross-referencing hooks that need the assembled

@@ -191,8 +191,14 @@ func newFakeV2(t *testing.T) *fakeV2 {
 			}
 			if classic := f.classic[path]; classic != "" && f.extent[path] == "" {
 				// A classic (legacy) file: the raw byte stream, not a plan.
+				// The identity rides the SAME response (the server knows
+				// which object it just served).
 				fail := f.failBody
+				id := f.ids[path]
 				f.mu.Unlock()
+				if id != "" {
+					w.Header().Set("X-Dat9-Resource-ID", id)
+				}
 				w.Header().Set("Content-Length", fmt.Sprint(len(classic)))
 				if fail {
 					// Deliver a valid prefix, then end the response short of
@@ -3637,14 +3643,14 @@ func TestIssuedSliceSurvivesEviction(t *testing.T) {
 
 	// Hand out a slice (stage + issue pin, as readClassic does).
 	data := []byte("FIRST")
-	id1 := br.stageClassicChunk(sha256Hex(data), data, "/d/f.bin", 0, false, "res-1")
+	id1 := br.stageClassicChunk(sha256Hex(data), data, "/d/f.bin", 0, false, "res-1", 1)
 	if !br.blocks.isIssued(id1) {
 		t.Fatal("staged classic slice was not issue-pinned")
 	}
 	// Stage many distinct chunks to force LRU pressure.
 	for i := 0; i < 32; i++ {
 		d := []byte{byte(i), byte(i), byte(i), byte(i)}
-		br.stageClassicChunk(sha256Hex(d), d, "/d/f.bin", int64(i+1)<<20, false, fmt.Sprintf("res-%d", i+2))
+		br.stageClassicChunk(sha256Hex(d), d, "/d/f.bin", int64(i+1)<<20, false, fmt.Sprintf("res-%d", i+2), 1)
 	}
 	// The issued id must still be fetchable (objectStorage.Get consumes
 	// the pin and serves the bytes).
@@ -3946,7 +3952,7 @@ func TestDemotedSliceRefetchesRemotely(t *testing.T) {
 	for i := 0; i < 8; i++ {
 		d := make([]byte, 4096)
 		_, _ = rand.Read(d)
-		br.stageClassicChunk(sha256Hex(d), d, "/d/f.bin", int64(i)*4096, false, fmt.Sprintf("res-%d", i+2))
+		br.stageClassicChunk(sha256Hex(d), d, "/d/f.bin", int64(i)*4096, false, fmt.Sprintf("res-%d", i+2), 1)
 	}
 	// The first read's entry was demoted: its bytes are gone, provenance
 	// remains. A later fetch of the SAME range re-reads the remote.
@@ -4057,7 +4063,7 @@ func TestOverlaidSliceNeverDemoted(t *testing.T) {
 	for i := 0; i < 8; i++ {
 		d := make([]byte, 4096)
 		_, _ = rand.Read(d)
-		br.stageClassicChunk(sha256Hex(d), d, "/d/f.bin", int64(i+1)<<20, false, "res-x")
+		br.stageClassicChunk(sha256Hex(d), d, "/d/f.bin", int64(i+1)<<20, false, "res-x", 1)
 	}
 	if got := readFront(t, eh, 4); got != "ZZZZ" {
 		t.Fatalf("post-pressure read = %q, want ZZZZ (an overlaid slice must not demote to the remote image)", got)
@@ -4095,7 +4101,7 @@ func TestDemotedSliceRefusesReusedPath(t *testing.T) {
 	for i := 0; i < 4; i++ {
 		d := make([]byte, 4096)
 		_, _ = rand.Read(d)
-		br.stageClassicChunk(sha256Hex(d), d, "/d/f.bin", int64(i+1)<<20, false, fmt.Sprintf("res-%d", i+2))
+		br.stageClassicChunk(sha256Hex(d), d, "/d/f.bin", int64(i+1)<<20, false, fmt.Sprintf("res-%d", i+2), 1)
 	}
 	// The path is replaced by ANOTHER object before the slice's later
 	// block fetch: the identity-verified refetch must REFUSE (never serve
@@ -4150,15 +4156,89 @@ func TestOverlayBytesAccountedAndReclaimed(t *testing.T) {
 	if held < 4 {
 		t.Fatalf("overlay bytes unaccounted: classicBytes = %d, want >= 4", held)
 	}
-	// The flush resolves the overlay: the entry may demote now.
+	// The flush resolves the overlay: the entry may demote now. Pressure
+	// again and verify the bytes actually leave the accounting (the LRU
+	// re-append is gone once the entry demotes).
 	if err := eh.Flush(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	for i := 0; i < 4; i++ {
+		d := make([]byte, 4096)
+		_, _ = rand.Read(d)
+		br.stageClassicChunk(sha256Hex(d), d, "/d/f.bin", int64(i+8)<<20, false, fmt.Sprintf("res-r%d", i), 1)
+	}
+	// One more round retires the previous four; whatever remains must not
+	// include the historical overlay images.
+	for i := 0; i < 2; i++ {
+		d := make([]byte, 4096)
+		_, _ = rand.Read(d)
+		br.stageClassicChunk(sha256Hex(d), d, "/d/f.bin", int64(i+64)<<20, false, fmt.Sprintf("res-s%d", i), 1)
+	}
 	br.mu.Lock()
 	held2 := br.classicBytes
+	overlayLeft := 0
+	for _, r := range br.classicLRU {
+		if r.bytes == 4 { // the ZZAA whole-chunk overlay image
+			overlayLeft++
+		}
+	}
 	br.mu.Unlock()
-	_ = held2
+	if overlayLeft > 0 {
+		t.Fatalf("the historical overlay image is still resident after the flush (LRU keeps it)")
+	}
+	if held2 > int64(classicReadProtect)*4096 {
+		t.Fatalf("historical images not reclaimed after the flush: before=%d after=%d (want <= %d protected chunks)", held, held2, classicReadProtect*4096)
+	}
 	if got := readFront(t, eh, 4); got != "ZZAA" {
 		t.Fatalf("post-flush read = %q, want ZZAA", got)
+	}
+}
+
+// Round-29: a demoted classic slice still serves the ORIGINAL object after a
+// successful rename — the provenance follows the inode's current mapping.
+func TestDemotedSliceSurvivesRename(t *testing.T) {
+	f := newFakeV2(t)
+	f.setLegacy(true)
+	f.setDir("/d", true)
+	h := newTestHandler(t, f, 0)
+	res2, _, _ := dispatchCreate(context.Background(), h, "/d/a.bin", syscall.O_RDWR|syscall.O_CREAT)
+	eh2 := res2.Handle.(*engineHandle)
+	if err := eh2.Write(context.Background(), 0, []byte("AAAAAAAA")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh2.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	old := classicReadCacheBytes
+	classicReadCacheBytes = 1
+	defer func() { classicReadCacheBytes = old }()
+	if got := readFront(t, eh2, 8); got != "AAAAAAAA" {
+		t.Fatalf("pre-rename read = %q", got)
+	}
+	// Rename the file through the plane (the descriptor stays on the alias).
+	f.rename(t, "/d/a.bin", "/d/b.bin")
+	renameEvent(h, "/d/a.bin", "/d/b.bin")
+	// Pressure: stage many distinct chunks to demote A's slice.
+	br := h.opts.Engine.Bridge
+	br.mu.Lock()
+	firstID := br.classicLRU[len(br.classicLRU)-1].id
+	firstIno := br.classicLRU[len(br.classicLRU)-1].ino
+	br.mu.Unlock()
+	for i := 0; i < 4; i++ {
+		d := make([]byte, 4096)
+		_, _ = rand.Read(d)
+		br.stageClassicChunk(sha256Hex(d), d, "/d/b.bin", int64(i+1)<<20, false, fmt.Sprintf("res-%d", i+2), 1)
+	}
+	_ = firstIno
+	// The demoted slice refetches through the CURRENT mapping (/d/b.bin)
+	// and serves the original bytes.
+	rc, err := br.Storage().Get(context.Background(), fmt.Sprintf("chunks/0/0/%d_0_8", firstID), 0, 8)
+	if err != nil {
+		t.Fatalf("post-rename fetch of the demoted slice: %v", err)
+	}
+	data, _ := io.ReadAll(rc)
+	_ = rc.Close()
+	if string(data) != "AAAAAAAA" {
+		t.Fatalf("post-rename bytes = %q, want AAAAAAAA", data)
 	}
 }

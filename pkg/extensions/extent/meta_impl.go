@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path"
 	"path/filepath"
@@ -1780,6 +1781,10 @@ func (b *Bridge) readClassic(ctx context.Context, ino meta.Ino, path string, sta
 	if err != nil {
 		return errnoOf(err)
 	}
+	// The identity is taken from the READ's own response headers when the
+	// server provides one (same-request binding); a separate later Stat
+	// could describe a replacement installed in between.
+	hdrID := rcHeaderResourceID(rc)
 	data, rerr := io.ReadAll(rc)
 	_ = rc.Close()
 	if rerr != nil {
@@ -1815,7 +1820,7 @@ func (b *Bridge) readClassic(ctx context.Context, ino meta.Ino, path string, sta
 		copy(data[off-start:], pdata)
 	}
 	sum := sha256Hex(data)
-	id := b.stageClassicChunk(sum, data, path, start, len(pending) > 0, b.remoteIdentity(ino, path))
+	id := b.stageClassicChunk(sum, data, path, start, len(pending) > 0, firstNonEmpty(hdrID, b.remoteIdentity(ino, path)), ino)
 	*slices = []meta.Slice{{Id: id, Size: uint32(len(data)), Len: uint32(len(data))}}
 	return 0
 }
@@ -1839,13 +1844,13 @@ var classicReadProtect = 4
 // handed), records inside the grace window are immune (in-flight fetches),
 // and pinned entries (a pending commit still references their checksum)
 // are never retired.
-func (b *Bridge) stageClassicChunk(sum string, data []byte, path string, start int64, overlaid bool, resID string) uint64 {
+func (b *Bridge) stageClassicChunk(sum string, data []byte, path string, start int64, overlaid bool, resID string, ino meta.Ino) uint64 {
 	id := b.blocks.stagePinned(sum, data, false)
 	if overlaid {
-		b.blocks.markLocalOverlay(id)
+		b.blocks.markLocalOverlay(id, ino)
 	}
 	if resID != "" {
-		b.blocks.setProvenanceIdentity(id, resID)
+		b.blocks.setProvenanceIdentity(id, resID, ino)
 	}
 	b.mu.Lock()
 	now := time.Now()
@@ -1871,7 +1876,7 @@ func (b *Bridge) stageClassicChunk(sum string, data []byte, path string, start i
 			return id
 		}
 	}
-	b.classicLRU = append(b.classicLRU, classicRef{sum: sum, id: id, bytes: int64(len(data)), at: now, path: path, start: start, resID: resID})
+	b.classicLRU = append(b.classicLRU, classicRef{sum: sum, id: id, bytes: int64(len(data)), at: now, path: path, start: start, resID: resID, ino: ino})
 	b.classicBytes += int64(len(data))
 	var retire []classicRef
 	for b.classicBytes > classicReadCacheBytes {
@@ -1886,17 +1891,17 @@ func (b *Bridge) stageClassicChunk(sum string, data []byte, path string, start i
 	b.mu.Unlock()
 	var retained []classicRef
 	for _, r := range retire {
+		// DEMOTE first whenever a provenance exists (issued or not): the
+		// cached bytes are dropped (freeing the budget) while the id stays
+		// fetchable through the IDENTITY-VERIFIED, rename-following
+		// source. Entries that cannot demote (local-only bytes, a pending
+		// reference, or no recorded source identity) KEEP their bytes and
+		// are re-appended so they stay ACCOUNTED and reclaimable (the
+		// overlay flag self-clears at the flush).
+		if b.blocks.demoteToProvenance(r.id, r.sum, r.path, r.start, r.resID, r.ino) {
+			continue
+		}
 		if b.blocks.isIssued(r.id) {
-			// An outstanding reader still holds this slice: DEMOTE it —
-			// the cached bytes are dropped (freeing the budget) while the
-			// id stays fetchable through the IDENTITY-VERIFIED classic
-			// remote range. Entries that cannot demote (local-only bytes,
-			// a pending reference, or no recorded source identity) KEEP
-			// their bytes and are re-appended so they stay ACCOUNTED and
-			// reclaimable (the overlay flag self-clears at the flush).
-			if b.blocks.demoteToProvenance(r.id, r.sum, r.path, r.start, r.resID) {
-				continue
-			}
 			retained = append(retained, r)
 			continue
 		}
@@ -1983,6 +1988,23 @@ func (b *Bridge) layoutPendingMatches(ino meta.Ino, occupantID string) bool {
 		return id == occupantID
 	}
 	return true // fresh upload of ours created the occupant
+}
+
+// rcHeaderResourceID extracts an identity echoed by a read response, when
+// the server provides one on the same request that supplied the bytes.
+func rcHeaderResourceID(rc io.ReadCloser) string {
+	type headerer interface{ Header() http.Header }
+	if h, ok := rc.(headerer); ok {
+		return h.Header().Get("X-Dat9-Resource-ID")
+	}
+	return ""
+}
+
+func firstNonEmpty(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
 }
 
 // remoteIdentity returns the identity the bridge last saw for the file a
@@ -2144,7 +2166,7 @@ func (b *Bridge) releaseCommitted(ino meta.Ino, pending []pendingWrite) {
 		b.blocks.unpin(p.checksum)
 		// The landed fragment makes any whole-chunk overlay image
 		// reproducible from the remote again — its entry may demote.
-		b.blocks.overlayResolved(p.checksum)
+		b.blocks.resolveOverlaysFor(ino)
 		if refs[p.checksum] > 0 {
 			continue
 		}

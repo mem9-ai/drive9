@@ -151,8 +151,9 @@ func (s objectStorage) Get(ctx context.Context, key string, off, limit int64, ge
 		// block boundary would strip protection mid-slice and from other
 		// readers. Handout pins drain when the entry is re-staged fresh
 		// (the reader set turned over) or stay accounted until then.
-		s.bridge.blocks.issuePin(id)
-		defer s.bridge.blocks.releaseIssuePin(id)
+		s.bridge.blocks.issuePin(id)              // transient: acquire-to-snapshot
+		defer s.bridge.blocks.releaseIssuePin(id) // transient out
+		s.bridge.blocks.releaseIssuePin(id)       // drain one handout pin
 	}
 	if sl != nil {
 		staged := sl.join()
@@ -346,11 +347,14 @@ func (r *blockRegistry) releaseIssuePin(id uint64) bool {
 // markLocalOverlay flags an entry whose cached bytes include local-only
 // writes (a deferred overlay): demotion would replace them with the older
 // remote image, so the bytes are irreducible.
-func (r *blockRegistry) markLocalOverlay(id uint64) {
+func (r *blockRegistry) markLocalOverlay(id uint64, ino meta.Ino) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if e, ok := r.m[id]; ok {
 		e.localOverlay = true
+		if ino != 0 {
+			e.provenanceIno = ino
+		}
 	}
 }
 
@@ -361,7 +365,7 @@ func (r *blockRegistry) markLocalOverlay(id uint64) {
 // writes only exist here) or checksums a pending commit still references
 // — are NOT demoted; their bytes stay (accounted by the LRU re-append in
 // the caller).
-func (r *blockRegistry) demoteToProvenance(id uint64, sum, path string, start int64, resID string) bool {
+func (r *blockRegistry) demoteToProvenance(id uint64, sum, path string, start int64, resID string, ino meta.Ino) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	e, ok := r.m[id]
@@ -390,31 +394,35 @@ func (r *blockRegistry) demoteToProvenance(id uint64, sum, path string, start in
 	e.provenanceStart = start
 	e.classicRange = e.size
 	e.provResID = resID
+	e.provenanceIno = ino // rename-following: fetch resolves the CURRENT mapping
 	return true
 }
 
 // setProvenanceIdentity records the source object's identity on a staged
 // classic entry (the demotion refetch verifies it).
-func (r *blockRegistry) setProvenanceIdentity(id uint64, resID string) {
+func (r *blockRegistry) setProvenanceIdentity(id uint64, resID string, ino meta.Ino) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if e, ok := r.m[id]; ok {
 		e.provResID = resID
+		if ino != 0 {
+			e.provenanceIno = ino
+		}
 	}
 }
 
-// overlayResolved clears an entry's local-overlay flag: after the flush
-// that landed its pending fragments, the (unchanged) cached image matches
-// the remote object and the entry may demote again.
-func (r *blockRegistry) overlayResolved(sum string) {
-	raw, err := hex.DecodeString(sum)
-	if err != nil || len(raw) < 8 {
-		return
-	}
+// resolveOverlaysFor clears the local-overlay flag of every classic
+// entry staged from one inode: after the flush landed that inode's
+// pending fragments, the whole-chunk overlay images (whose checksums
+// differ from the fragment checksums) match the remote object again and
+// may demote.
+func (r *blockRegistry) resolveOverlaysFor(ino meta.Ino) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if e, ok := r.m[detID(raw)]; ok {
-		e.localOverlay = false
+	for _, e := range r.m {
+		if e.provenanceIno == ino && e.localOverlay {
+			e.localOverlay = false
+		}
 	}
 }
 
