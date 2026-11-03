@@ -158,20 +158,11 @@ Delete `blackbox/` and `e2e/` only after G4 (CI cut-over) lands.
     ambient config absence made drain fail credential resolution instantly;
   - drain failures now capture rc + stderr tail into the step log; empty
     mount walks retry bounded with a readdir probe diagnostic.
-  OPEN (precisely narrowed): after the above, drain in the ENGINE context
-  still fails with `lstat /tmp/drive9-mount-<hash>.pid: ENOENT` — the
-  foreground worker never writes its pid state file when spawned by the
-  engine, while the identical daemon invocation from a shell probe in the
-  SAME container writes it and drain succeeds. NOTE: hash mismatch is
-  RULED OUT — a 64s watcher on ALL of /tmp saw zero `.pid` files during
-  the engine run (the observed `.stop` token is umount-teardown noise), so
-  the WriteProcessState call itself does not happen (or its guard
-  `!cfg.SkipProcessState` is false) in the engine-spawned context. rmr+drain
-  DID pass in one earlier tier run — flaky or invocation-dependent. Next
-  session: strace both daemons (engine-spawned vs probe-spawned) around
-  startup and diff which flags/env make the CLI set SkipProcessState or
-  skip the write; also dump the daemon's parsed flags via `drive9 mount
-  --help` diff between the two spawn contexts.
+  RESOLVED (this round): strace with timestamps proved a 5.8ms startup
+  race — the script's `mount drain` stat'ed /tmp/drive9-mount-<hash>.pid
+  just BEFORE the daemon's atomic rename landed; the engine's mount wait
+  now gates on the pid state file (bounded) and drain returns ok. Run
+  41548922970 left purely assertion-level failures:
   - fstest-sqlite: mptest "broken (0 errors out of 0 tests)" — likely falls
     out once drain/commit paths are healthy (terminal commit failures were
     killing the db files); recheck after the drain fix.

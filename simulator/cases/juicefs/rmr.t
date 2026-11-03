@@ -16,7 +16,9 @@ done
 
 rm -rf rmr-tree
 
-check shell --req 'juicefs-rmr-gone'  -- test ! -e rmr-tree
+# removal is asynchronous server-side: the destructive caller must await
+# the landed removal before asserting absence or reusing the path
+check shell --req 'juicefs-rmr-gone' -- sh -c 'i=0; while [ -e rmr-tree ] && [ $i -lt 200 ]; do i=$((i+1)); sleep 0.1; done; test ! -e rmr-tree'
 check shell --req 'juicefs-rmr-reuse' -- sh -c 'mkdir rmr-tree && rmdir rmr-tree'
 
 drain --mode require-ok --timeout 120s
