@@ -3,6 +3,7 @@ package writeback
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/fusecomp/staging"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/writebuffer"
 )
 
@@ -253,4 +255,149 @@ func (c clientReaderAt) ReadAt(p []byte, off int64) (int, error) {
 		return n, io.EOF
 	}
 	return n, nil
+}
+
+// The extent commit branch must report the revision the publication landed
+// at (fetched by a post-commit stat: the extent wire responses carry none).
+// Returning 0 left every extent-plane commit invisible to the revision
+// lineage — the next flush of the same path enqueued as a base-0 create and
+// its whole-image initiate 409'd against the existing target.
+func TestExtentCommitPropagatesLandedRevision(t *testing.T) {
+	var mu sync.Mutex
+	rev := int64(0)
+	exists := false
+	staleRejects := 0
+
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/ok.bin":
+			mu.Lock()
+			up, rv := exists, rev
+			mu.Unlock()
+			if !up {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+			w.Header().Set("X-Dat9-Content-Layout", "extent")
+			w.Header().Set("X-Dat9-Revision", fmt.Sprint(rv))
+			w.Header().Set("X-Dat9-Resource-Id", "res-ok")
+			w.Header().Set("X-Dat9-Mode", "420")
+			w.Header().Set("Content-Length", "5242880")
+			w.WriteHeader(200)
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			mu.Lock()
+			cur, up := rev, exists
+			mu.Unlock()
+			if exp, ok := body["expected_revision"]; ok && up {
+				if int64(exp.(float64)) != cur {
+					mu.Lock()
+					staleRejects++
+					mu.Unlock()
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusConflict)
+					_, _ = w.Write([]byte(`{"error":"revision conflict"}`))
+					return
+				}
+			}
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"upload_id": "e1", "key": "", "part_size": 4 << 20,
+				"total_parts":       int(body["total_size"].(float64)/(4<<20)) + 1,
+				"checksum_contract": map[string]any{"supported": []string{"SHA-256"}, "required": true},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/e1/presign-batch":
+			var body struct {
+				Parts []struct {
+					Number   int    `json:"part_number"`
+					Checksum string `json:"checksum"`
+				} `json:"parts"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			out := make([]map[string]any, 0, len(body.Parts))
+			for _, p := range body.Parts {
+				out = append(out, map[string]any{"number": p.Number, "url": ts.URL + "/obj/" + p.Checksum, "size": 4 << 20, "skip_upload": true})
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"parts": out})
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/e1/complete":
+			mu.Lock()
+			rev++
+			exists = true
+			rv := rev
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "completed", "resource_id": fmt.Sprintf("res-%d", rv)})
+		default:
+			http.Error(w, "bad request", http.StatusBadRequest)
+		}
+	}))
+	defer ts.Close()
+
+	shadow, err := staging.NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := staging.NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var successRevs []int64
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	cq.SetExtentTakeover(true)
+	cq.OnSuccess = func(entry *CommitEntry, committedRev int64) {
+		successRevs = append(successRevs, committedRev)
+	}
+
+	// First commit: a fresh large create through the extent stream branch.
+	if err := shadow.WriteFull("/ok.bin", make([]byte, 5*1024*1024), 0); err != nil {
+		t.Fatal(err)
+	}
+	gen := shadow.ActiveGeneration("/ok.bin")
+	pgen, err := pending.PutWithBaseRev("/ok.bin", 0, staging.PendingNew, 5*1024*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cq.Enqueue(&CommitEntry{
+		Path: "/ok.bin", BaseRev: 0, Size: 5 * 1024 * 1024,
+		Kind: staging.PendingNew, ShadowGen: gen, PendingIndexGen: pgen,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cq.DrainAll()
+	if len(successRevs) != 1 || successRevs[0] != 1 {
+		t.Fatalf("first extent commit reported rev %v, want [1] (the landed revision, not 0)", successRevs)
+	}
+	// The next flush arrives with the landed base revision: its initiate
+	// carries the CAS and must not trip the exists-with-rev-0 conflict.
+	// (DrainAll stops the queue, so the follow-up flush rides a fresh one
+	// over the same shadow/pending state.)
+	if err := shadow.WriteFull("/ok.bin", make([]byte, 5*1024*1024), 1); err != nil {
+		t.Fatal(err)
+	}
+	gen2 := shadow.ActiveGeneration("/ok.bin")
+	pgen2, err := pending.PutWithBaseRev("/ok.bin", 1, staging.PendingOverwrite, 5*1024*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cq2 := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	cq2.SetExtentTakeover(true)
+	cq2.OnSuccess = func(entry *CommitEntry, committedRev int64) {
+		successRevs = append(successRevs, committedRev)
+	}
+	if err := cq2.Enqueue(&CommitEntry{
+		Path: "/ok.bin", BaseRev: 1, Size: 5 * 1024 * 1024,
+		Kind: staging.PendingOverwrite, ShadowGen: gen2, PendingIndexGen: pgen2,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cq2.DrainAll()
+	if len(successRevs) != 2 || successRevs[1] != 2 {
+		t.Fatalf("second extent commit reported rev %v, want [1 2]", successRevs)
+	}
+	if staleRejects != 0 {
+		t.Fatalf("stale initiate CAS rejections = %d, want 0", staleRejects)
+	}
 }

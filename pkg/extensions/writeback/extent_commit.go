@@ -122,6 +122,16 @@ func (cq *CommitQueue) uploadExtentEntry(ctx context.Context, entry *CommitEntry
 	if upErr != nil {
 		return 0, true, upErr
 	}
+	// The extent publication surfaces no revision on its wire responses,
+	// and the queue's next enqueue for this path CASes against whatever
+	// landed: returning 0 here left every extent-plane commit invisible to
+	// the revision lineage, so the next flush re-enqueued as a base-0
+	// create and the whole-image initiate 409'd against the existing
+	// target. Fetch the landed revision; a stat failure degrades to the
+	// old behavior instead of failing a commit that already landed.
+	if nst, nerr := cq.client.StatCtx(ctx, apiPath); nerr == nil {
+		return nst.Revision, true, nil
+	}
 	return 0, true, nil
 }
 
