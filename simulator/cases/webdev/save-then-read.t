@@ -30,6 +30,12 @@
 #
 # BATCH is an ordinary shell variable, overridable through the environment; it is
 # exported because the concurrent reader is a separate process.
+# NOTE (real product finding, parked in nightly): the write-temp+rename
+# publish path leaves the daemon's local image EMPTY after the rename while
+# the server holds the correct bytes (verified: mock DB size=10, zero GETs
+# issued by the daemon) — the reader observes TORN-READ. Same seed family
+# as the fixed read-after-write case, rename variant. Do not weaken the
+# assertions; move back to pr-gate-mount when the rename seed lands.
 set -eu
 BATCH=${BATCH:-40}
 export BATCH

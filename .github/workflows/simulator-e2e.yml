@@ -93,7 +93,7 @@ jobs:
             ubuntu:24.04 bash -c '
               set -x
               export DEBIAN_FRONTEND=noninteractive
-              apt-get update -qq && apt-get install -y -qq fuse3 curl >/dev/null
+              apt-get update -qq && apt-get install -y -qq fuse3 curl python3 >/dev/null
               export D9_MOCK_SERVER_BIN=/repo/bin/drive9-mock-server D9_REPO=/repo
               export D9_FSTEST_BIN=/root/.cache/drive9-simulator/fstest/main/target/release/fstest
               cd /repo
@@ -115,7 +115,7 @@ jobs:
             ubuntu:24.04 bash -c '
               set -x
               export DEBIAN_FRONTEND=noninteractive
-              apt-get update -qq && apt-get install -y -qq fuse3 curl >/dev/null
+              apt-get update -qq && apt-get install -y -qq fuse3 curl python3 >/dev/null
               export D9_MOCK_SERVER_BIN=/repo/bin/drive9-mock-server D9_REPO=/repo
               export D9_FSTEST_BIN=/root/.cache/drive9-simulator/fstest/main/target/release/fstest
               cd /repo
@@ -138,7 +138,7 @@ jobs:
             ubuntu:24.04 bash -c '
               set -x
               export DEBIAN_FRONTEND=noninteractive
-              apt-get update -qq && apt-get install -y -qq fuse3 curl fio >/dev/null
+              apt-get update -qq && apt-get install -y -qq fuse3 curl python3 fio >/dev/null
               export D9_MOCK_SERVER_BIN=/repo/bin/drive9-mock-server D9_REPO=/repo
               export D9_FSTEST_BIN=/root/.cache/drive9-simulator/fstest/main/target/release/fstest
               cd /repo
