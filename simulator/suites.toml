@@ -23,8 +23,9 @@ tier = "nightly"
 timeout = "10m"
 
 [[case]]
+# real finding: permanent commit-queue conflict blocks drain (case header)
 name = "community/fstest-fsx"
-tier = "pr-gate-mount"
+tier = "nightly"
 timeout = "15m"
 
 [[case]]

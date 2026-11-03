@@ -5,13 +5,10 @@ set -eu
 
 check fstest --suite fsx --args '-N 1000' --req 'community-fsx'
 
-# fsx's rapid same-file commits can leave a transient LWW conflict in the
-# commit queue; the queue settles asynchronously — bounded retry before
-# declaring failure
-i=0
-until drain --mode require-ok --timeout 120s; do
-  i=$((i+1))
-  [ $i -ge 3 ] && exit 1
-  sleep 2
-done
+# REAL PRODUCT FINDING (parked in nightly via suites.toml): fsx PASSES its
+# own verification, but the workload leaves ONE commit-queue entry in a
+# PERMANENT conflict state — three require-ok drains over ~6 minutes all
+# report commit_queue_conflicts:1 and mount.log shows ZERO auto-resolve
+# attempts. A conflict entry that never retries blocks drain forever.
+drain --mode require-ok --timeout 120s
 check sync-ok --req 'community-fsx-sync'
