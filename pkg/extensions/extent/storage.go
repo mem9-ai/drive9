@@ -143,11 +143,15 @@ func (s objectStorage) Get(ctx context.Context, key string, off, limit int64, ge
 	s.bridge.mu.Unlock()
 	if sl == nil {
 		// Transient pin for THIS fetch (a concurrent stage cannot retire
-		// the entry between the pin and the snapshot), and the handout pin
-		// drains on the first Get.
+		// the entry between the pin and the snapshot — retirement checks
+		// issued under the same registry lock). The block's handout pin
+		// drains here too; a fetch that reaches the entry's END drains
+		// every remaining pin — that reader is done with the slice.
 		s.bridge.blocks.issuePin(id)
 		defer s.bridge.blocks.releaseIssuePin(id)
-		s.bridge.blocks.releaseIssuePin(id)
+		if off+limit >= size {
+			s.bridge.blocks.dropIssuePins(id)
+		}
 	}
 	if sl != nil {
 		staged := sl.join()
@@ -329,6 +333,17 @@ func (r *blockRegistry) releaseIssuePin(id uint64) bool {
 	return true
 }
 
+// dropIssuePins clears every remaining pin for an id (the reader that
+// reached the slice's end is finished with it).
+func (r *blockRegistry) dropIssuePins(id uint64) {
+	if id == 0 {
+		return
+	}
+	r.mu.Lock()
+	delete(r.issued, id)
+	r.mu.Unlock()
+}
+
 // isIssued reports whether an outstanding reader holds the staged id.
 func (r *blockRegistry) isIssued(id uint64) bool {
 	r.mu.Lock()
@@ -336,7 +351,9 @@ func (r *blockRegistry) isIssued(id uint64) bool {
 	return r.issued[id] > 0
 }
 
-// releaseIfUnpinned drops a staged entry nothing references.
+// releaseIfUnpinned drops a staged entry nothing references — pinned by
+// neither a pending commit NOR an outstanding reader (one critical
+// section: the issued check and the deletion are atomic).
 func (r *blockRegistry) releaseIfUnpinned(sha string) {
 	sum, err := hex.DecodeString(sha)
 	if err != nil || len(sum) < 8 {
@@ -344,7 +361,7 @@ func (r *blockRegistry) releaseIfUnpinned(sha string) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.pins[sha] > 0 {
+	if r.pins[sha] > 0 || r.issued[detID(sum)] > 0 {
 		return
 	}
 	delete(r.pins, sha)

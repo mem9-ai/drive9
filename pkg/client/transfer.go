@@ -401,6 +401,19 @@ var ErrResourceMismatch = errors.New("path occupant is not the expected resource
 
 type expectedResourceCtxKey struct{}
 
+type completedResourceSinkKey struct{}
+
+// WithCompletedResourceSink installs a sink receiving the resource
+// identity echoed by a completed upload (when the server sends one).
+func WithCompletedResourceSink(ctx context.Context, sink *string) context.Context {
+	return context.WithValue(ctx, completedResourceSinkKey{}, sink)
+}
+
+func completedResourceSinkOf(ctx context.Context) *string {
+	v, _ := ctx.Value(completedResourceSinkKey{}).(*string)
+	return v
+}
+
 // WithExpectedResource binds a context's publications to the object's
 // resource identity: every upload initiate (and extent PATCH) under the
 // context carries X-Dat9-Expected-Resource, so the server can refuse a
@@ -428,7 +441,10 @@ func (c *Client) WriteStreamConditionalExpectedResource(ctx context.Context, pat
 		return nil
 	}
 	var se *StatusError
-	if expectedResourceID != "" && errors.As(err, &se) && se.StatusCode == http.StatusConflict {
+	// 412 (precondition) is the identity refusal; 409 stays an ordinary
+	// revision conflict on the SAME object — conflating them abandoned
+	// recoverable state on a normal CAS retry.
+	if expectedResourceID != "" && errors.As(err, &se) && se.StatusCode == http.StatusPreconditionFailed {
 		return fmt.Errorf("%s: %w", path, ErrResourceMismatch)
 	}
 	return err
@@ -1071,7 +1087,24 @@ func (c *Client) completeUploadWithOptions(ctx context.Context, uploadID string,
 	if resp.StatusCode >= 300 {
 		return markCommitAttempt(readError(resp))
 	}
+	// The server may echo the landed object's resource identity: publish
+	// it to any bound writer so a post-upload stat outage cannot lose the
+	// ownership proof.
+	if id := resourceIDOf(resp); id != "" {
+		if out := completedResourceSinkOf(ctx); out != nil {
+			*out = id
+		}
+	}
 	return nil
+}
+
+// resourceIDOf extracts an echoed resource identity from a response.
+func resourceIDOf(resp *http.Response) string {
+	var body struct {
+		ResourceID string `json:"resource_id"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&body)
+	return body.ResourceID
 }
 
 // --- v2 upload methods ---
@@ -1113,7 +1146,7 @@ func (c *Client) initiateUploadV2WithLayout(ctx context.Context, path string, si
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode == http.StatusConflict && expectedResourceOf(ctx) != "" {
+	if resp.StatusCode == http.StatusPreconditionFailed && expectedResourceOf(ctx) != "" {
 		return nil, fmt.Errorf("%s: %w", path, ErrResourceMismatch)
 	}
 	if resp.StatusCode == http.StatusNotFound {

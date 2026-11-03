@@ -900,6 +900,12 @@ func (c *Client) writeCtxConditionalFull(ctx context.Context, path string, data 
 	req.Header.Set("Content-Type", "application/octet-stream")
 	if expectedRevision >= 0 {
 		req.Header.Set("X-Dat9-Expected-Revision", strconv.FormatInt(expectedRevision, 10))
+		if id := expectedResourceOf(ctx); id != "" {
+			// The identity precondition rides EVERY bound publication
+			// route, direct PUT included: a same-revision replacement at
+			// the path must not receive the bytes.
+			req.Header.Set("X-Dat9-Expected-Resource", id)
+		}
 	}
 	if err := setTagHeaders(req, tags); err != nil {
 		return 0, err
@@ -916,6 +922,11 @@ func (c *Client) writeCtxConditionalFull(ctx context.Context, path string, data 
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
+		if resp.StatusCode == http.StatusPreconditionFailed && expectedResourceOf(ctx) != "" {
+			// Identity refusal (not an ordinary revision conflict): the
+			// path's occupant is not the bound object.
+			return 0, fmt.Errorf("%s: %w", path, ErrResourceMismatch)
+		}
 		err := readError(resp)
 		if expectedRevision >= 0 {
 			err = markCommitAttempt(err)

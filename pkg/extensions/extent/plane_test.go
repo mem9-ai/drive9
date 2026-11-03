@@ -304,8 +304,9 @@ func newFakeV2(t *testing.T) *fakeV2 {
 		f.mu.Unlock()
 		if exp := r.Header.Get("X-Dat9-Expected-Resource"); exp != "" && occupant != "" && occupant != exp {
 			// The publication is bound to a DIFFERENT object than the one
-			// occupying the path: refuse it.
-			http.Error(w, "resource mismatch", http.StatusConflict)
+			// occupying the path: refuse it (412: identity, not a revision
+			// conflict).
+			http.Error(w, "resource mismatch", http.StatusPreconditionFailed)
 			return
 		}
 		w.WriteHeader(http.StatusAccepted)
@@ -393,8 +394,15 @@ func newFakeV2(t *testing.T) *fakeV2 {
 					}
 				}
 			}
+			landedPath := ""
+			if len(f.creates) > 0 {
+				landedPath = f.creates[len(f.creates)-1]
+			}
+			landedID := f.ids[landedPath]
 			f.mu.Unlock()
-			_ = json.NewEncoder(w).Encode(map[string]any{"status": "completed"})
+			// Echo the landed object's identity: the client captures it
+			// as the ownership proof for post-upload stat outages.
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "completed", "resource_id": landedID})
 			return
 		}
 		http.Error(w, "bad upload route", http.StatusNotFound)
@@ -3742,5 +3750,76 @@ func TestClassicRecoveryResourceBinding(t *testing.T) {
 	}
 	if got := f.contentOf("/a"); got != "OTHER" {
 		t.Fatalf("replacement content = %q, want OTHER untouched", got)
+	}
+}
+
+// Round-24: a fresh upload's identity survives a TOTAL post-upload stat
+// outage (echoed by the complete response) — a replacement installed
+// during the outage is rejected on retry instead of receiving the staged
+// bytes.
+func TestBlindLayoutPendingRejectsReplacement(t *testing.T) {
+	f := newFakeV2(t)
+	f.setLegacy(true)
+	f.setDir("/d", true)
+	h := newTestHandler(t, f, 0)
+	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
+	eh := res.Handle.(*engineHandle)
+	if err := eh.Write(context.Background(), 0, []byte("AAAA")); err != nil {
+		t.Fatal(err)
+	}
+	// Fail every HEAD AFTER the upload lands: the classification cannot
+	// see the object (gate the HEAD only once content exists).
+	f.setStatFail("/d/f.bin", true)
+	if err := eh.Sync(context.Background()); err == nil {
+		t.Fatal("the commit succeeded despite the stat outage")
+	}
+	// A replacement takes the path during the outage.
+	f.mu.Lock()
+	f.classic["/d/f.bin"] = "REPL"
+	f.nextID++
+	f.ids["/d/f.bin"] = "replacement-id"
+	f.mu.Unlock()
+	f.setStatFail("/d/f.bin", false)
+	if err := eh.Sync(context.Background()); err == nil {
+		t.Fatal("the retry adopted the replacement installed during the outage")
+	}
+	if got := f.contentOf("/d/f.bin"); got != "REPL" {
+		t.Fatalf("replacement content = %q, want REPL untouched", got)
+	}
+}
+
+// Round-24: an ordinary SAME-OBJECT revision conflict on a bound
+// publication stays an ordinary conflict — the staged data survives for
+// the retry instead of being abandoned.
+func TestBoundPublicationOrdinaryConflictKeepsState(t *testing.T) {
+	f := newFakeV2(t)
+	f.seedExtent(t, "/a", "AAAAAAAA")
+	h := newTestHandler(t, f, 1<<20)
+	br := h.opts.Engine.Bridge
+	st, err := br.StatLocal(context.Background(), "/a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ino, errno := br.ResolveLocal(context.Background(), "/a")
+	if errno != 0 {
+		t.Fatal(errno)
+	}
+	br.setVerifyBase(ino, st.Revision, st.ResourceID)
+	br.mu.Lock()
+	br.pending[ino] = []pendingWrite{{chunk: 0, off: 0, checksum: sha256Hex([]byte("ZZZZ")), size: 4}}
+	br.blocks.stagePinned(sha256Hex([]byte("ZZZZ")), []byte("ZZZZ"), true)
+	br.sizes[ino] = 8
+	br.mu.Unlock()
+
+	// Another writer advances the SAME object's revision: an ordinary 409
+	// (the fake bumps the revision on a classic write).
+	f.mu.Lock()
+	f.extent["/a"] = "AAAAAAAA" // same identity; revision bumps via write
+	f.mu.Unlock()
+	if err := br.FlushFile(context.Background(), ino); err != nil {
+		t.Fatalf("an ordinary same-object conflict must retry and land, got: %v", err)
+	}
+	if got := f.contentOf("/a"); got != "ZZZZAAAA" {
+		t.Fatalf("server content = %q, want ZZZZAAAA", got)
 	}
 }

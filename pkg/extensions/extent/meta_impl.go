@@ -856,10 +856,21 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 
 	if fresh {
 		// Sparse: holes are synthesized on demand — a small write at a
-		// huge offset must not materialize the whole logical image.
+		// huge offset must not materialize the whole logical image. The
+		// completed upload's echoed resource identity is captured even if
+		// every post-upload Stat fails: it is the ownership proof the
+		// retry matches against (a replacement then rejects instead of
+		// receiving the staged bytes).
+		landed := ""
+		upctx := client.WithCompletedResourceSink(ctx, &landed)
 		ra := &sparseImageAt{bridge: b, ctx: ctx, path: path, size: size, writes: pending}
-		if err := b.cfg.Client.WriteExtentStreamConditional(ctx, path, ra, size, nil, -1); err != nil {
+		if err := b.cfg.Client.WriteExtentStreamConditional(upctx, path, ra, size, nil, -1); err != nil {
 			return err
+		}
+		if landed != "" {
+			b.mu.Lock()
+			b.layoutPendingID[ino] = landed
+			b.mu.Unlock()
 		}
 	} else {
 		blocks := make([]client.ExtentBlockWrite, 0, len(pending))
@@ -1821,7 +1832,8 @@ func (b *Bridge) stageClassicChunk(sum string, data []byte) uint64 {
 	b.mu.Lock()
 	now := time.Now()
 	// Refresh an existing record for this id instead of appending a
-	// duplicate.
+	// duplicate — and RE-PIN it: the second reader carries its own
+	// outstanding lifetime.
 	for i := range b.classicLRU {
 		if b.classicLRU[i].id == id {
 			rec := b.classicLRU[i]
@@ -1829,6 +1841,12 @@ func (b *Bridge) stageClassicChunk(sum string, data []byte) uint64 {
 			b.classicLRU = append(b.classicLRU[:i], b.classicLRU[i+1:]...)
 			b.classicLRU = append(b.classicLRU, rec)
 			b.mu.Unlock()
+			// A refreshed handout restarts the pin accounting at one
+			// handout's worth (the previous reader's pins are stale).
+			b.blocks.dropIssuePins(id)
+			for issued := (rec.bytes + client.ExtentBlockSize - 1) / client.ExtentBlockSize; issued > 0; issued-- {
+				b.blocks.issuePin(id)
+			}
 			return id
 		}
 	}
@@ -1858,9 +1876,14 @@ func (b *Bridge) stageClassicChunk(sum string, data []byte) uint64 {
 		}
 		b.blocks.releaseIfUnpinned(r.sum)
 	}
-	// One pin per handout; the reader's first Get releases it (later
-	// blocks of a multi-block slice ride the Get-time transient pin).
-	b.blocks.issuePin(id)
+	// One pin per BLOCK the reader may fetch: a 64 MiB slice is consumed
+	// by sixteen separate 4 MiB Gets, and each Get releases exactly one —
+	// the slice stays protected across the gaps between its block
+	// fetches. (A partially fetched slice keeps its remaining pins, and
+	// the entries stay accounted — see the retirement re-append.)
+	for issued := (int64(len(data)) + client.ExtentBlockSize - 1) / client.ExtentBlockSize; issued > 0; issued-- {
+		b.blocks.issuePin(id)
+	}
 	return id
 }
 

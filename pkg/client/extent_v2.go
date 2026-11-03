@@ -366,7 +366,7 @@ func (c *Client) InitiateExtentPatchExpectedResource(ctx context.Context, path s
 	if err != nil {
 		return nil, err
 	}
-	if resp.StatusCode == http.StatusConflict && expectedResourceID != "" {
+	if resp.StatusCode == http.StatusPreconditionFailed && expectedResourceID != "" {
 		_ = resp.Body.Close()
 		return nil, fmt.Errorf("%s: %w", path, ErrResourceMismatch)
 	}
