@@ -183,6 +183,14 @@ func inoFor(path string) meta.Ino {
 
 func (b *Bridge) remember(ino meta.Ino, path string) {
 	b.mu.Lock()
+	if cur, ok := b.paths[ino]; ok && cur != path {
+		// The inode's mapping moved while this resolution was in flight
+		// (a rename retargeted it, or a retention set it on an alias):
+		// keep the newer destination. Overwriting it would drag the
+		// descriptor back onto a name that no longer holds the file.
+		b.mu.Unlock()
+		return
+	}
 	b.paths[ino] = path
 	b.mu.Unlock()
 }

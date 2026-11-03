@@ -2,6 +2,7 @@ package extent
 
 import (
 	"context"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -38,8 +39,9 @@ type Options struct {
 type Handler struct {
 	opts Options
 
-	mu      sync.Mutex
-	handles map[string][]*engineHandle
+	mu        sync.Mutex
+	handles   map[string][]*engineHandle
+	pathLocks sync.Map // mount-local path -> *sync.Mutex
 }
 
 // New builds the engine-plane handler.
@@ -81,6 +83,35 @@ func New(opts Options) *Handler {
 		})
 	}
 	return h
+}
+
+// lockPaths takes the per-path serialization locks for the given paths (a
+// rename touches two), in a fixed order. Path-addressed plane operations —
+// claiming an open, truncating, unlink retention, rename-over retention —
+// must not interleave for the same name: an open straddling a retention
+// boundary would attach a descriptor for the retained file onto the
+// replaceable name, and nothing afterwards can tell that descriptor from
+// the arriving file's own.
+func (h *Handler) lockPaths(paths ...string) func() {
+	uniq := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if p != "" {
+			uniq = append(uniq, p)
+		}
+	}
+	sort.Strings(uniq)
+	var held []*sync.Mutex
+	for _, p := range uniq {
+		any, _ := h.pathLocks.LoadOrStore(p, &sync.Mutex{})
+		mu := any.(*sync.Mutex)
+		mu.Lock()
+		held = append(held, mu)
+	}
+	return func() {
+		for i := len(held) - 1; i >= 0; i-- {
+			held[i].Unlock()
+		}
+	}
 }
 
 // retarget moves every open handle (and the bridge mapping) from the old
@@ -162,21 +193,27 @@ func (h *Handler) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, e
 		// Silly-rename instead: move the remote name to a hidden sentinel
 		// the bridge keeps using, and delete the sentinel when the last
 		// handle closes (the plane's unlink never reaches the chain).
+		// Serialized against concurrent claims of the same name.
+		unlock := h.lockPaths(op.Path)
 		h.mu.Lock()
 		_, open := h.handles[op.Path]
 		h.mu.Unlock()
-		if open {
-			sentinel, err := h.opts.Engine.Bridge.KeepDeletedOpen(op.Path)
-			if err != nil {
-				return fs.Result{}, err
-			}
-			if sentinel != "" {
-				// Follow the descriptor to the sentinel so the last
-				// release can delete the registered keep-alive name.
-				h.retarget(op.Path, sentinel)
-			}
-			return fs.Result{}, nil
+		if !open {
+			unlock()
+			break
 		}
+		sentinel, err := h.opts.Engine.Bridge.KeepDeletedOpen(op.Path)
+		if err != nil {
+			unlock()
+			return fs.Result{}, err
+		}
+		if sentinel != "" {
+			// Follow the descriptor to the sentinel so the last
+			// release can delete the registered keep-alive name.
+			h.retarget(op.Path, sentinel)
+		}
+		unlock()
+		return fs.Result{}, nil
 	case fs.OpCreate:
 		if res, err, claimed := h.tryClaimOpen(ctx, op); claimed {
 			return res, err
@@ -219,6 +256,11 @@ func (h *Handler) tryClaimOpen(ctx context.Context, op *fs.Op) (fs.Result, error
 		if st.ContentLayout != client.ContentLayoutExtent {
 			return fs.Result{}, nil, false
 		}
+		// Serialized against retention for this name (unlink or
+		// rename-over): a claim straddling a retention boundary would
+		// attach a descriptor for the retained file onto the replaceable
+		// name.
+		defer h.lockPaths(op.Path)()
 		ino, errno := h.opts.Engine.ResolvePath(ctx, op.Path)
 		if errno != 0 {
 			return fs.Result{}, errno, false
@@ -237,6 +279,7 @@ func (h *Handler) tryClaimOpen(ctx context.Context, op *fs.Op) (fs.Result, error
 	if h.opts.Threshold != 0 || op.Flags&syscall.O_CREAT == 0 {
 		return fs.Result{}, nil, false
 	}
+	defer h.lockPaths(op.Path)()
 	parent, name := SplitParent(op.Path)
 	parentIno, errno := h.opts.Engine.ResolvePath(ctx, parent)
 	if errno != 0 {
@@ -285,6 +328,10 @@ func (h *Handler) tryRenameOverOpen(ctx context.Context, op *fs.Op, next fs.Next
 	if !destOpen {
 		return fs.Result{}, nil, false
 	}
+	// Serialized against concurrent claims, truncates, unlinks and other
+	// renames touching either name, across the retention, the chain call
+	// and the outcome resolution.
+	defer h.lockPaths(op.Path, op.Path2)()
 	br := h.opts.Engine.Bridge
 	// The source's identity, to recognize a rename that committed without
 	// a response.
@@ -348,6 +395,8 @@ func (h *Handler) destHoldsSource(dest, srcID string) bool {
 // tryTruncate routes a size change on an open engine file into the bridge;
 // other setattr facets fall through to the classic plane.
 func (h *Handler) tryTruncate(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error, bool) {
+	unlock := h.lockPaths(op.Path)
+	defer unlock()
 	h.mu.Lock()
 	_, open := h.handles[op.Path]
 	h.mu.Unlock()

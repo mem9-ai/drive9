@@ -155,7 +155,13 @@ func TestRenameOverOpenTargetFailedRenameKeepsAlias(t *testing.T) {
 	if got := f.contentOf("/b"); got != "ZZZZBBBB" {
 		t.Fatalf("/b = %q after B's write (the object is shared), want ZZZZBBBB", got)
 	}
-	// The alias drops at B's own last close; /b keeps the file.
+	// A later descriptor opens the same file through the name; closing the
+	// ORIGINAL descriptor then drops the alias but must not discard B
+	// while the later descriptor is still open (B still holds /b).
+	ehB2 := claimOpen(t, h, "/b")
+	if ehB2.ino == ehB.ino {
+		t.Fatal("the post-failure open reused the retained inode")
+	}
 	if err := ehB.Release(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -164,6 +170,18 @@ func TestRenameOverOpenTargetFailedRenameKeepsAlias(t *testing.T) {
 	}
 	if got := f.contentOf("/b"); got != "ZZZZBBBB" {
 		t.Fatalf("/b = %q after B's close, want ZZZZBBBB", got)
+	}
+	if got := readFront(t, ehB2, 16); got != "ZZZZBBBB" {
+		t.Fatalf("the later descriptor reads %q, want ZZZZBBBB", got)
+	}
+	if err := ehB2.Write(context.Background(), 0, []byte("YYYY")); err != nil {
+		t.Fatal(err)
+	}
+	if err := ehB2.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.contentOf("/b"); got != "YYYYBBBB" {
+		t.Fatalf("/b = %q after the later descriptor's write, want YYYYBBBB", got)
 	}
 	if reg := registeredSentinels(b); reg != 0 {
 		t.Fatalf("%d registrations left behind", reg)

@@ -31,8 +31,10 @@ type fakeV2 struct {
 	creates    []string
 	ids        map[string]string // path -> resource identity (X-Dat9-Resource-ID)
 	nextID     int
-	statFail   map[string]bool   // paths whose HEAD answers 500 (probe injection)
-	afterHead  func(path string) // runs (under f.mu) after a HEAD was answered
+	statFail   map[string]bool          // paths whose HEAD answers 500 (probe injection)
+	gateOnce   map[string]chan struct{} // first HEAD for a path waits on the channel
+	gateHits   map[string]int           // HEADs currently paused on a gate
+	afterHead  func(path string)        // runs (under f.mu) after a HEAD was answered
 	patches    int
 	patchPaths []string   // every PATCH target, in order
 	deletes    []string   // every DELETE target, in order
@@ -86,7 +88,7 @@ func (f *fakeV2) applyPatchLocked() {
 
 func newFakeV2(t *testing.T) *fakeV2 {
 	t.Helper()
-	f := &fakeV2{extent: map[string]string{}, classic: map[string]string{}, dirs: map[string]bool{"/": true}, blocks: map[string][]byte{}, ids: map[string]string{}, statFail: map[string]bool{}}
+	f := &fakeV2{extent: map[string]string{}, classic: map[string]string{}, dirs: map[string]bool{"/": true}, blocks: map[string][]byte{}, ids: map[string]string{}, statFail: map[string]bool{}, gateOnce: map[string]chan struct{}{}, gateHits: map[string]int{}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/obj/", func(w http.ResponseWriter, r *http.Request) {
 		key := strings.TrimPrefix(r.URL.Path, "/obj/")
@@ -128,6 +130,13 @@ func newFakeV2(t *testing.T) *fakeV2 {
 		case http.MethodHead:
 			f.mu.Lock()
 			defer f.mu.Unlock()
+			if ch, gated := f.gateOnce[path]; gated {
+				delete(f.gateOnce, path)
+				f.gateHits[path] = f.gateHits[path] + 1
+				f.mu.Unlock()
+				<-ch // one-shot: pause exactly one HEAD for this path
+				f.mu.Lock()
+			}
 			if hook := f.afterHead; hook != nil {
 				defer hook(path)
 			}
@@ -395,6 +404,22 @@ func (f *fakeV2) setAfterHead(fn func(path string)) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.afterHead = fn
+}
+
+// gateHead pauses exactly ONE future HEAD for the path until the channel
+// closes (a later stat for the same path passes through).
+func (f *fakeV2) gateHead(path string, ch chan struct{}) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.gateOnce[path] = ch
+}
+
+// gateWaiting reports how many HEADs for the path are currently paused on
+// a gate.
+func (f *fakeV2) gateWaiting(path string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.gateHits[path]
 }
 
 // setStatFail injects (on=true) or clears (on=false) HEAD failures for a

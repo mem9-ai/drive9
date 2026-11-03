@@ -3,6 +3,8 @@ package extent
 import (
 	"context"
 	"errors"
+	"fmt"
+	"syscall"
 	"testing"
 	"time"
 
@@ -80,12 +82,12 @@ func TestRenameOverOpenTargetDisplacedProbeIsNotAReservation(t *testing.T) {
 	}
 }
 
-// Round-13 P1: reopening the destination while the rename is pending must
-// not drag the retained inode's mapping back onto the replaceable name.
-// The later open resolves the name as its own incarnation; after the
-// rename succeeds, a write/fsync through B's original descriptor still
-// targets B's retained alias, never the source now at /b.
-func TestOpenDuringPendingRenameKeepsRetainedMapping(t *testing.T) {
+// Round-13/14 P1: an Open of the destination while the rename is pending
+// must not attach a descriptor for B onto the replaceable name. It is
+// serialized behind the rename; when the rename lands, that open (and only
+// that open) resolves the source now at the name. Writes through BOTH the
+// retained B descriptor and the later one land on their own objects.
+func TestOpenDuringPendingRenameWaitsForOutcome(t *testing.T) {
 	f := newFakeV2(t)
 	f.seedExtent(t, "/a", "AAAA")
 	f.seedExtent(t, "/b", "BBBBBBBB")
@@ -110,14 +112,31 @@ func TestOpenDuringPendingRenameKeepsRetainedMapping(t *testing.T) {
 		t.Fatal("rename never reached the chain")
 	}
 	sentinel := ehB.path
-	// Another Open of /b while the rename is pending: it must get its own
-	// incarnation, not B's retained inode.
-	ehC := claimOpen(t, h, "/b")
-	if ehC.ino == ehB.ino {
-		t.Fatal("an open of the pending destination reused the retained inode")
+
+	type openResult struct {
+		eh  *engineHandle
+		err error
 	}
-	if ehB.path != sentinel {
-		t.Fatalf("B's mapping moved to %q during the pending rename, want its alias", ehB.path)
+	opened := make(chan openResult, 1)
+	go func() {
+		res, err, passed := dispatchCreate(context.Background(), h, "/b", syscall.O_RDWR)
+		if err != nil || passed {
+			opened <- openResult{nil, fmt.Errorf("claim /b: err=%v passed=%v", err, passed)}
+			return
+		}
+		eh, ok := res.Handle.(*engineHandle)
+		if !ok {
+			opened <- openResult{nil, fmt.Errorf("handle type = %T", res.Handle)}
+			return
+		}
+		opened <- openResult{eh, nil}
+	}()
+	// The open must NOT complete while the rename is unresolved: no
+	// descriptor for B may land on the replaceable name.
+	select {
+	case r := <-opened:
+		t.Fatalf("open of the pending destination completed early: %+v", r)
+	case <-time.After(300 * time.Millisecond):
 	}
 	close(release)
 	select {
@@ -130,11 +149,25 @@ func TestOpenDuringPendingRenameKeepsRetainedMapping(t *testing.T) {
 	}
 	renameEvent(h, "/a", "/b")
 
+	var later openResult
+	select {
+	case later = <-opened:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the pending open never completed after the rename resolved")
+	}
+	if later.err != nil {
+		t.Fatal(later.err)
+	}
+	ehC := later.eh
+	if ehC.ino == ehB.ino {
+		t.Fatal("the post-rename open reused B's retained inode")
+	}
+	// B stays attached to its alias; a write/fsync through B never touches A.
 	b.mu.Lock()
 	pathB := b.paths[ehB.ino]
 	b.mu.Unlock()
 	if pathB != b.fullPath(sentinel) {
-		t.Fatalf("B's mapping = %q after the rename, want its alias %q", pathB, b.fullPath(sentinel))
+		t.Fatalf("B's mapping = %q, want its alias %q", pathB, b.fullPath(sentinel))
 	}
 	if err := ehB.Write(context.Background(), 0, []byte("ZZZZ")); err != nil {
 		t.Fatal(err)
@@ -148,7 +181,23 @@ func TestOpenDuringPendingRenameKeepsRetainedMapping(t *testing.T) {
 	if got := f.contentOf(b.fullPath(sentinel)); got != "ZZZZBBBB" {
 		t.Fatalf("B's alias = %q after its write, want ZZZZBBBB", got)
 	}
-	if got := readFront(t, ehA, 16); got != "AAAA" {
-		t.Fatalf("A reads %q, want AAAA", got)
+	if got := readFront(t, ehB, 16); got != "ZZZZBBBB" {
+		t.Fatalf("B reads %q, want ZZZZBBBB", got)
+	}
+	// The later descriptor opened the source: its write lands on /b.
+	if err := ehC.Write(context.Background(), 0, []byte("QQQQ")); err != nil {
+		t.Fatal(err)
+	}
+	if err := ehC.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.contentOf("/b"); got != "QQQQ" {
+		t.Fatalf("/b = %q after the later descriptor's write, want QQQQ", got)
+	}
+	if got := f.contentOf(b.fullPath(sentinel)); got != "ZZZZBBBB" {
+		t.Fatalf("B's alias = %q after the later descriptor's write, want ZZZZBBBB", got)
+	}
+	if got := readFront(t, ehA, 16); got != "QQQQ" {
+		t.Fatalf("A reads %q, want QQQQ", got)
 	}
 }
