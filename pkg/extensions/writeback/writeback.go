@@ -443,6 +443,18 @@ func New(opts Options) (*Writeback, error) {
 		// size for the inode/dir-cache refresh, onCommitQueueSuccess);
 		// PathLock keeps queue cleanup serialized with same-path staging.
 		q.OnSuccess = func(entry *CommitEntry, committedRev int64) {
+			// The landing retires isNew and re-bases the open handle's
+			// evicted-part recovery on the remote image — here, not only
+			// at the strict wait points, because interactive fsync returns
+			// from durable staging while the upload is still pending and
+			// the queue's shadow cleanup follows this success. committedRev
+			// comes from the server's completion echo, so the handle's
+			// base revision advances on exactly this publication.
+			if v, ok := w.live.Load(entry.Path); ok {
+				if h, ok := v.(*bufferingHandle); ok {
+					h.markLanded(committedRev)
+				}
+			}
 			if w.opts.Policy == PolicyWriteSync || w.opts.Policy == PolicyCloseSync {
 				w.armBypass(entry.Path, committedRev, entry.Size, "sync-commit")
 			}
