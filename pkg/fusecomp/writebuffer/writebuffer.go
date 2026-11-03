@@ -640,6 +640,14 @@ func (wb *WriteBuffer) SetRemoteSize(size int64) {
 	wb.remoteSize = size
 }
 
+// ContentVersion returns the buffer's content generation: every Write,
+// Truncate, or Reset increments it, so an unchanged version together with
+// an unchanged snapshot ID proves the live buffer still holds exactly the
+// staged image a landing acknowledged.
+func (wb *WriteBuffer) ContentVersion() uint64 {
+	return wb.contentVersion
+}
+
 // MarkRemoteAuthoritative declares that the current remote image holds
 // every retained byte of this buffer — the owning handle's commit landed
 // and armed the remote loader. Only then may an evicted part fall back to

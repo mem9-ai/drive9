@@ -169,6 +169,12 @@ type Writeback struct {
 	// liveSet tracks every open bufferingHandle so unlink/rename can walk
 	// them; keeps this per-handle on FileHandle.
 	liveSet sync.Map
+	// liveSnapshots maps staged snapshot ID → the handle that staged it,
+	// so a queued landing notifies exactly the submitting descriptor (the
+	// path index only keeps the newest handle, which may be an unrelated
+	// writer). Entries are consumed by the landing and dropped on
+	// untrack.
+	liveSnapshots sync.Map
 	// landedMu/landed is the recently-landed table (landedAt).
 	landedMu sync.Mutex
 	landed   map[string]landedInfo
@@ -323,6 +329,16 @@ type bufferingHandle struct {
 	stageSeq          int64
 	stagedSnapshotID  string
 	stagedParentID    string
+	// stagedContentVersion is the buffer's content generation when the
+	// current staged snapshot was minted. A landing may only arm the
+	// remote restore for a buffer whose generation is unchanged: any
+	// later Write/Truncate/Reset (including an unstaged truncate-regrow)
+	// makes the live image diverge from what landed.
+	stagedContentVersion uint64
+	// stagedSnapshotReg is the snapshot ID this handle last registered
+	// under w.liveSnapshots (atomic string) — replaced at each staging,
+	// dropped at untrack.
+	stagedSnapshotReg atomic.Value
 	stagedSnapshotSeq int64
 	contentSnapshotID string
 }
@@ -450,9 +466,15 @@ func New(opts Options) (*Writeback, error) {
 			// the queue's shadow cleanup follows this success. committedRev
 			// comes from the server's completion echo, so the handle's
 			// base revision advances on exactly this publication.
-			if v, ok := w.live.Load(entry.Path); ok {
-				if h, ok := v.(*bufferingHandle); ok && h.stagedSnapshotIs(entry.SnapshotID) {
-					h.markLandedImage(committedRev, entry.Size)
+			// Deliver to the handle that staged this image: the newest
+			// handle at the path may be an unrelated writer, and the
+			// staging handle must learn its shadow is being reclaimed.
+			if entry.SnapshotID != "" {
+				if v, ok := w.liveSnapshots.Load(entry.SnapshotID); ok {
+					w.liveSnapshots.Delete(entry.SnapshotID)
+					if h, ok := v.(*bufferingHandle); ok {
+						h.markLandedImage(committedRev, entry.Size, entry.SnapshotID)
+					}
 				}
 			}
 			if w.opts.Policy == PolicyWriteSync || w.opts.Policy == PolicyCloseSync {
@@ -2462,16 +2484,25 @@ func (h *bufferingHandle) markLanded(rev int64) {
 
 // markLandedImage is markLanded for a landing whose committed image size
 // is known (the queue's entry): the remote-restore boundary is that
-// landed size, not whatever the buffer has accumulated since.
-func (h *bufferingHandle) markLandedImage(rev, size int64) {
+// landed size, not whatever the buffer has accumulated since. The
+// metadata (landed / isNew retirement / base revision) always advances —
+// the server really holds that revision — but the buffer is certified
+// (visTrunc cleared, remote restore armed) only when it still holds
+// exactly the staged image the landing acknowledged: newer mutations,
+// such as an unstaged truncate-regrow, keep their own state.
+func (h *bufferingHandle) markLandedImage(rev, size int64, snapshotID string) {
 	h.mu.Lock()
 	h.landed = true
 	h.isNew = false
-	h.visTrunc = false
 	if rev > 0 {
 		h.baseRev = rev
 	}
-	h.armRemoteRestoreLocked(size)
+	certified := snapshotID != "" && h.stagedSnapshotID == snapshotID &&
+		(h.buf == nil || h.buf.ContentVersion() == h.stagedContentVersion)
+	if certified {
+		h.visTrunc = false
+		h.armRemoteRestoreLocked(size)
+	}
 	h.mu.Unlock()
 }
 
@@ -2715,18 +2746,21 @@ func (w *Writeback) armBypass(path string, rev, size int64, reason string) {
 // write touching an evicted part failed with 'shadow file not found' and
 // surfaced as EIO on write(2). After a landing the remote image is
 // authoritative and complete, so it becomes the fallback restore source.
-// stagedSnapshotIs reports whether this handle's current staged snapshot is
-// exactly id: a newer staging mints a fresh snapshot ID, so ID equality
-// alone establishes that no image replaced the one this landing
-// acknowledges (the seq fields intentionally differ right after a staging
-// — stageSeq is incremented past the snapshot it just minted).
+// stagedSnapshotIs reports whether the landing acknowledged the image this
+// buffer still holds: the snapshot ID matches (a newer staging mints a
+// fresh one) AND the content generation is unchanged since that staging —
+// a truncate-regrow without a new staging keeps the ID but diverges the
+// bytes.
 func (h *bufferingHandle) stagedSnapshotIs(id string) bool {
 	if id == "" {
 		return false
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return h.stagedSnapshotID == id
+	if h.stagedSnapshotID != id {
+		return false
+	}
+	return h.buf == nil || h.buf.ContentVersion() == h.stagedContentVersion
 }
 
 func (h *bufferingHandle) armRemoteRestoreLocked(size int64) {
@@ -2888,6 +2922,9 @@ func (w *Writeback) retireLocked(h *bufferingHandle) {
 			}
 			return true
 		})
+	}
+	if prev, ok := h.stagedSnapshotReg.Load().(string); ok && prev != "" {
+		w.liveSnapshots.Delete(prev)
 	}
 	w.liveSet.Delete(h)
 }
@@ -4075,6 +4112,21 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 	}
 	h.stageSeq++
 	snapshotID, parentSnapshotID := h.stagedSnapshotID, h.stagedParentID
+	// Still under h.mu here (the staging section holds it through the
+	// buffer hand-off below): read the generation directly.
+	stagedContentVersion := uint64(0)
+	if h.buf != nil {
+		stagedContentVersion = h.buf.ContentVersion()
+	}
+	h.stagedContentVersion = stagedContentVersion
+	// The landing of THIS image must find THIS handle even when a newer
+	// writer has since opened the same path. Replace any earlier
+	// registration of this handle (superseded snapshot).
+	if prev, ok := h.stagedSnapshotReg.Load().(string); ok && prev != "" && prev != snapshotID {
+		h.w.liveSnapshots.Delete(prev)
+	}
+	h.stagedSnapshotReg.Store(snapshotID)
+	h.w.liveSnapshots.Store(snapshotID, h)
 	buf := h.buf
 	h.mu.Unlock()
 
