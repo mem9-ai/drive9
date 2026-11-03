@@ -1,0 +1,110 @@
+# Simulator suite manifest: which cases run in which tier.
+# Run: drive9-simulator run-suite --manifest simulator/suites.toml --tier pr-gate --server …
+# Case paths resolve as simulator/cases/<name>.t.
+
+# ---- pr-gate: fast core (server-surface cases, no mount) ----
+
+[[case]]
+name = "drive9/api-fs"
+tier = "pr-gate"
+no_mount = true
+
+[[case]]
+name = "drive9/cli-fs"
+tier = "pr-gate"
+no_mount = true
+
+# ---- nightly: bigger / root-requiring community suites ----
+[[case]]
+# mptest coordinator reports broken 0/0 on FUSE (fstest-internal
+# startup behavior) — nightly until understood
+name = "community/fstest-sqlite"
+tier = "nightly"
+timeout = "10m"
+
+[[case]]
+# real finding: permanent commit-queue conflict blocks drain (case header)
+name = "community/fstest-fsx"
+tier = "nightly"
+timeout = "15m"
+
+[[case]]
+# real finding: rename-path seed gap (see the case header) — nightly
+name = "webdev/save-then-read"
+tier = "nightly"
+
+[[case]]
+name = "webdev/exclusive-create"
+tier = "pr-gate-mount"
+
+[[case]]
+name = "juicefs/rmr"
+tier = "pr-gate-mount"
+
+[[case]]
+# real failing finding: observer cache flaps empty (last seen against the
+# former mock backend; see the case header) — nightly, not a PR blocker
+name = "juicefs/cache-consistency"
+tier = "nightly"
+
+[[case]]
+name = "community/fstest-pjdfstest"
+tier = "nightly"
+timeout = "30m"
+allow_other = true
+
+[[case]]
+name = "community/fstest-ltp"
+tier = "nightly"
+timeout = "45m"
+allow_other = true
+
+[[case]]
+name = "webdev/fsync-cut"
+tier = "nightly"
+
+[[case]]
+name = "webdev/response-lost"
+tier = "nightly"
+
+[[case]]
+name = "webdev/cross-client-read"
+tier = "nightly"
+
+[[case]]
+name = "webdev/cache-threshold"
+tier = "nightly"
+
+[[case]]
+name = "juicefs/random-rw"
+tier = "nightly"
+
+[[case]]
+name = "juicefs/random-stress"
+tier = "nightly"
+
+[[case]]
+name = "juicefs/fsrand"
+tier = "nightly"
+
+[[case]]
+name = "drive9/git-ops-fast-clone"
+tier = "nightly"
+
+# ---- bench: fstest benchmark suites against the real backend (G6); metrics
+# land in the run's fstest-*.json artifacts and perf_baseline.py compares
+# them against the previous run's baseline ----
+[[case]]
+name = "community/fstest-fio"
+tier = "bench"
+timeout = "15m"
+
+[[case]]
+name = "community/fstest-smallfile"
+tier = "bench"
+timeout = "15m"
+
+[[case]]
+name = "community/fstest-mdtest"
+tier = "bench"
+timeout = "15m"

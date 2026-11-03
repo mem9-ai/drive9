@@ -174,7 +174,8 @@ func validateClaimsForSign(c *VaultGrantClaims) error {
 // validateClaimsForVerify enforces every fail-closed check listed in §16.
 // Every failure here becomes EACCES at the HTTP boundary. The ordering matches
 // docs/specs/pr-a-jwt-implementation.md §4:
-//   1. enum principal_type  2. enum perm  3. scope validity  4. exp with leeway.
+//  1. enum principal_type  2. enum perm  3. scope validity  4. exp with leeway.
+//
 // iss / grant_id presence are checked implicitly via JSON unmarshal + emptiness
 // (JSON unmarshal leaves empty strings for absent fields, which fail the checks).
 func validateClaimsForVerify(c *VaultGrantClaims, now time.Time) error {

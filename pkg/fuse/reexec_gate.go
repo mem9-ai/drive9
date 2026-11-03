@@ -1,13 +1,14 @@
 package fuse
 
 import (
+	"encoding/json"
 	"os"
 	"sync"
+
+	"github.com/mem9-ai/drive9/pkg/fs"
 )
 
 // ReexecProtocolVersion is the wire protocol version for the reexec handshake.
-// Both old and new processes must advertise the same version.
-// Consumed by the fd handoff protocol in Phase 3.
 const ReexecProtocolVersion = 1
 
 // ReexecRefusal describes a single reason why reexec was refused.
@@ -45,258 +46,60 @@ func (g *reexecGuard) release() {
 	g.active = false
 }
 
-func (g *reexecGuard) isActive() bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.active
-}
-
-// ReexecPreflight checks all V0 gates and returns structured refusal reasons.
-// It does NOT acquire the reexec guard or install a quiesce barrier — those
-// are the caller's responsibility during the actual handshake.
-//
-// This function is only valid for normal FUSE mounts. Vault and WebDAV mounts
-// have separate codepaths and are excluded from V0 reexec by design.
-func (fs *Dat9FS) ReexecPreflight() ReexecPreflightResult {
+// ReexecPreflight runs every gate against the facade state. It does NOT
+// acquire the guard or install a quiesce barrier (caller's job).
+func (f *FS) ReexecPreflight() ReexecPreflightResult {
 	var refusals []ReexecRefusal
 	refuse := func(gate, reason string, count int) {
 		refusals = append(refusals, ReexecRefusal{Gate: gate, Reason: reason, Count: count})
 	}
 
-	// --- Static scope checks ---
-
-	if fs.localOverlay != nil {
-		refuse("local_overlay", "user/profile local overlay is enabled", 0)
+	if n := f.handles.len(); n > 0 {
+		refuse("file_handles", "open file handles exist", n)
 	}
-
-	if n := fs.transientOverlayEntryCount(); n != 0 {
-		if n < 0 {
-			refuse("transient_overlay", "transient local overlay root cannot be read", 0)
-		} else {
-			refuse("transient_overlay", "transient local overlay has entries", n)
-		}
+	if n := f.dirs.len(); n > 0 {
+		refuse("dir_handles", "open directory handles exist", n)
 	}
-
-	if fs.git != nil {
-		refuse("git_workspace", "git workspace layer is enabled", 0)
-	}
-
-	if fs.hasLayerOverlayState() {
-		refuse("layer_overlay", "FS layer overlay state is active", 0)
-	}
-
-	// --- Runtime clean-state checks ---
-
-	if fs.fileHandles != nil {
-		if n := fs.fileHandles.Len(); n > 0 {
-			refuse("file_handles", "open file handles exist", n)
-		}
-	}
-
-	if fs.dirHandles != nil {
-		if n := fs.dirHandles.Len(); n > 0 {
-			refuse("dir_handles", "open directory handles exist", n)
-		}
-	}
-
-	if n := fs.nonRootKernelLookupCount(); n > 0 {
+	if n := f.nonRootKernelLookupCount(); n > 0 {
 		refuse("inode_nlookup", "non-root inodes have positive kernel lookup refs", n)
 	}
-
-	if n := fs.heldLockCount(); n > 0 {
+	if n := f.heldLockCount(); n > 0 {
 		refuse("fuse_locks", "FUSE locks are held", n)
 	}
-
-	if n := fs.xattrCount(); n > 0 {
-		refuse("xattrs", "in-memory xattrs exist", n)
-	}
-
-	if fs.commitQueue != nil {
-		snap := fs.commitQueue.Snapshot()
-		if snap.Pending > 0 {
-			refuse("commit_queue_pending", "commit queue has pending entries", snap.Pending)
-		}
-		if snap.InFlight > 0 {
-			refuse("commit_queue_inflight", "commit queue has in-flight entries", snap.InFlight)
-		}
-		if snap.Delayed > 0 {
-			refuse("commit_queue_delayed", "commit queue has delayed entries", snap.Delayed)
-		}
-		if snap.Conflicts > 0 {
-			refuse("commit_queue_conflicts", "commit queue has conflicts", snap.Conflicts)
-		}
-	}
-
-	if fs.uploader != nil {
-		snap := fs.uploader.Snapshot()
-		if snap.Queued > 0 {
-			refuse("uploader_queued", "uploader has queued entries", snap.Queued)
-		}
-		if snap.InFlight > 0 {
-			refuse("uploader_inflight", "uploader has in-flight entries", snap.InFlight)
-		}
-		if snap.Cached > 0 {
-			refuse("uploader_cached", "uploader has cached entries", snap.Cached)
-		}
-	}
-
-	if fs.pendingIndex != nil {
-		if n := fs.pendingIndex.Count(); n > 0 {
-			refuse("pending_index", "pending index has entries", n)
-		}
-	}
-
-	if fs.shadowStore != nil {
-		if n := fs.shadowStore.PendingBytes(); n > 0 {
-			refuse("shadow_store", "shadow store has pending bytes", int(n))
-		}
-	}
-
-	if fs.journal != nil {
-		if n := fs.journal.UncommittedFrameCount(); n > 0 {
-			refuse("journal", "journal has replay-required frames", n)
-		}
-	}
-
-	return ReexecPreflightResult{
-		OK:       len(refusals) == 0,
-		Refusals: refusals,
-	}
-}
-
-// --- Count helpers for types that don't have them yet ---
-
-func (fs *Dat9FS) nonRootKernelLookupCount() int {
-	if fs.inodes == nil {
-		return 0
-	}
-	return fs.inodes.nonRootLookupCount()
-}
-
-// nonRootLookupCount returns the number of non-root inodes with positive
-// kernel lookup references (Nlookup > 0).
-func (m *InodeToPath) nonRootLookupCount() int {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	count := 0
-	for ino, entry := range m.byInode {
-		if ino != 1 && entry.Nlookup > 0 {
-			count++
-		}
-	}
-	return count
-}
-
-func (fs *Dat9FS) heldLockCount() int {
-	if fs.locks == nil {
-		return 0
-	}
-	return fs.locks.totalCount()
-}
-
-// totalCount returns the total number of held locks across all inodes.
-func (t *fuseLockTable) totalCount() int {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	count := 0
-	for _, locks := range t.locks {
-		count += len(locks)
-	}
-	return count
-}
-
-func (fs *Dat9FS) xattrCount() int {
-	if fs.xattrs == nil {
-		return 0
-	}
-	return fs.xattrs.totalCount()
-}
-
-// totalCount returns the total number of xattr entries across all paths.
-func (s *XAttrStore) totalCount() int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	count := 0
-	for _, attrs := range s.data {
-		count += len(attrs)
-	}
-	return count
-}
-
-func (fs *Dat9FS) transientOverlayEntryCount() int {
-	if fs.transientLocalOverlay == nil {
-		return 0
-	}
-	return localOverlayEntryCount(fs.transientLocalOverlay)
-}
-
-// localOverlayEntryCount returns the number of filesystem entries under the
-// overlay root directory. Returns 0 if the overlay is nil, empty, or the root
-// does not exist. Returns -1 if the root exists but cannot be read (permission
-// error, etc.) — the caller must treat -1 as a refusal, not a clean pass.
-func localOverlayEntryCount(o *LocalOverlay) int {
-	if o == nil || o.root == "" {
-		return 0
-	}
-	entries, err := os.ReadDir(o.root)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return 0
-		}
-		return -1
-	}
-	return len(entries)
-}
-
-func (fs *Dat9FS) hasLayerOverlayState() bool {
-	fs.layerMu.RLock()
-	defer fs.layerMu.RUnlock()
-	return len(fs.layerWhiteouts) > 0 || len(fs.layerFiles) > 0 ||
-		len(fs.layerDirs) > 0 || len(fs.layerSymlinks) > 0
-}
-
-// UncommittedFrameCount returns the number of paths that have replay-required
-// journal state: a JournalFsync entry not superseded by a later
-// JournalCommit/JournalUnlink. This mirrors the classification logic of
-// replayJournalIntoPending so that preflight and crash recovery agree on
-// what constitutes dirty journal state.
-//
-// It acquires j.mu to prevent races with concurrent Append calls.
-// The caller should drain (Drain + Fsync) before calling so all buffered
-// writes are on disk.
-func (j *Journal) UncommittedFrameCount() int {
-	j.mu.Lock()
-	defer j.mu.Unlock()
-
-	if j.path == "" {
-		return 0
-	}
-	data, err := os.ReadFile(j.path)
-	if err != nil || len(data) == 0 {
-		return 0
-	}
-
-	latestData := make(map[string]uint64) // path → latest JournalFsync seq
-	latestDone := make(map[string]uint64) // path → latest JournalCommit/Unlink seq
-	scanJournalFrames(data, func(entry JournalEntry, _ []byte) {
-		switch entry.Op {
-		case JournalCommit, JournalUnlink:
-			if entry.Seq > latestDone[entry.Path] {
-				latestDone[entry.Path] = entry.Seq
-			}
-		case JournalFsync:
-			if entry.Seq > latestData[entry.Path] {
-				latestData[entry.Path] = entry.Seq
+	// Extensions hold their own in-memory state (session xattrs, lazy
+	// buffers); ask each through the framework's ReexecGater capability.
+	for _, h := range f.chain.Handlers() {
+		if g, ok := h.(fs.ReexecGater); ok {
+			if reason, n := g.ReexecRefusal(); n > 0 {
+				refuse("extension_state", reason, n)
 			}
 		}
-	})
+	}
+	return ReexecPreflightResult{OK: len(refusals) == 0, Refusals: refusals}
+}
 
-	count := 0
-	for path, dataSeq := range latestData {
-		if doneSeq, ok := latestDone[path]; ok && doneSeq > dataSeq {
+// nonRootKernelLookupCount sums positive lookup refs below the root.
+func (f *FS) nonRootKernelLookupCount() int {
+	n := 0
+	f.inodes.mu.RLock()
+	for ino, e := range f.inodes.byInode {
+		if ino == 1 {
 			continue
 		}
-		count++
+		if e.Nlookup > 0 {
+			n += int(e.Nlookup)
+		}
 	}
-	return count
+	f.inodes.mu.RUnlock()
+	return n
 }
+
+// heldLockCount reports held POSIX locks (v1: locks map length).
+func (f *FS) heldLockCount() int {
+	return f.locks.count()
+}
+
+var (
+	_ = os.Getpid
+	_ = json.Marshal
+)

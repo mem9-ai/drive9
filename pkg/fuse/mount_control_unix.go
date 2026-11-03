@@ -22,15 +22,16 @@ import (
 )
 
 type mountControlServer struct {
-	fs         *Dat9FS
+	fs         *FS
 	listener   net.Listener
 	socketPath string
+	layer      string
 	startedAt  time.Time
 	done       chan struct{}
 	drainMu    sync.Mutex
 }
 
-func startMountControlServer(mountPoint string, fs *Dat9FS) (*mountControlServer, error) {
+func startMountControlServer(mountPoint, layer string, fs *FS) (*mountControlServer, error) {
 	socketPath := mountstate.ControlSocketPath(mountPoint)
 	socketDir := filepath.Dir(socketPath)
 	if err := os.MkdirAll(socketDir, 0o700); err != nil {
@@ -47,6 +48,7 @@ func startMountControlServer(mountPoint string, fs *Dat9FS) (*mountControlServer
 		fs:         fs,
 		listener:   ln,
 		socketPath: socketPath,
+		layer:      layer,
 		startedAt:  time.Now().UTC(),
 		done:       make(chan struct{}),
 	}
@@ -110,6 +112,7 @@ func (s *mountControlServer) handleConn(conn net.Conn) {
 			Op:         op,
 			PID:        os.Getpid(),
 			StartedAt:  started,
+			Layer:      &s.layer,
 		})
 		return
 	}
@@ -123,12 +126,13 @@ func (s *mountControlServer) handleConn(conn net.Conn) {
 	if resp.MountPoint == "" {
 		resp.MountPoint = s.mountPoint()
 	}
+	_ = resp
 	_ = json.NewEncoder(conn).Encode(resp)
 }
 
 func (s *mountControlServer) mountPoint() string {
-	if s == nil || s.fs == nil || s.fs.opts == nil {
+	if s == nil || s.fs == nil {
 		return ""
 	}
-	return s.fs.opts.MountPoint
+	return s.fs.mountPoint()
 }

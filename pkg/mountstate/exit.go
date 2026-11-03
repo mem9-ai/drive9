@@ -14,6 +14,7 @@ type ExitReason struct {
 	Detail       string    `json:"detail,omitempty"`
 	Code         int       `json:"code"`
 	PID          int       `json:"pid,omitempty"`
+	CreationTime uint64    `json:"creation_time,omitempty"`
 	PendingFiles int       `json:"pending_files,omitempty"`
 	PendingBytes int64     `json:"pending_bytes,omitempty"`
 	At           time.Time `json:"at"`
@@ -28,6 +29,9 @@ func exitReasonPathForCanonical(canonical string) string {
 }
 
 func WriteExitReason(mountPoint string, rec ExitReason) error {
+	if rec.PID == os.Getpid() && rec.CreationTime == 0 {
+		rec.CreationTime, _ = ProcessCreationTime(rec.PID)
+	}
 	if rec.At.IsZero() {
 		rec.At = time.Now().UTC()
 	} else {

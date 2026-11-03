@@ -26,8 +26,8 @@ MIGRATION_BIN ?= $(BIN_DIR)/$(MIGRATION_NAME)
 KUBE_PLUGIN_BIN ?= $(BIN_DIR)/$(KUBE_PLUGIN_NAME)
 
 VERSION ?=
-GIT_HASH ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
-GIT_BRANCH ?= $(shell git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)
+GIT_HASH ?= $(shell git rev-parse --verify HEAD 2>/dev/null || echo unknown)
+GIT_BRANCH ?= $(shell git rev-parse --abbrev-ref --verify HEAD 2>/dev/null || echo unknown)
 BUILD_TIME ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
 
 CLI_TARGETS ?= linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64
@@ -37,6 +37,26 @@ KUBE_PLUGIN_TARGETS ?= linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows
 GOLANGCI_LINT_VERSION ?= v2.5.0
 GOLANGCI_LINT_BIN ?= $(BIN_DIR)/golangci-lint
 GOLANGCI_LINT_GO_VERSION ?= $(shell $(GO) env GOVERSION)
+
+GITLEAKS_VERSION ?= v8.30.1
+GITLEAKS_BIN ?= $(BIN_DIR)/gitleaks
+# Optional `git log` range for the local `gitleaks` target (`main..HEAD`,
+# `--all`, ...). Empty scans the current branch.
+GITLEAKS_LOG_OPTS ?=
+# Range actually traversed, shared by the pre-flight check and the scan.
+GITLEAKS_RANGE = $(if $(GITLEAKS_LOG_OPTS),$(GITLEAKS_LOG_OPTS),HEAD)
+# Diff options forced on every traversal:
+#   --text                      a PR-controlled `.gitattributes` (`-diff`/`binary`)
+#                               must not hide a file's content from `git log -p`.
+#   --diff-merges=remerge       scan the merge result (so a credential introduced
+#                               while resolving a conflict is seen) without
+#                               re-reporting content inherited from the base branch,
+#                               which plain `-m` does. Needs git >= 2.36; an older
+#                               git fails the preflight below rather than passing.
+#                               `--diff-merges=remerge` emits no patch at all for merges
+#                               with three or more parents, so the preflight refuses to
+#                               scan a range containing one instead of reporting a pass.
+GITLEAKS_DIFF_OPTS ?= --text --diff-merges=remerge
 
 IMAGE_REPO ?= drive9-server
 IMAGE_TAG ?= latest
@@ -65,7 +85,7 @@ BUILDINFO_LDFLAGS = -X github.com/mem9-ai/drive9/pkg/buildinfo.Version=$(if $(VE
 	-X github.com/mem9-ai/drive9/pkg/buildinfo.GitBranch=$(GIT_BRANCH) \
 	-X github.com/mem9-ai/drive9/pkg/buildinfo.BuildTime=$(BUILD_TIME)
 
-.PHONY: mod test test-race test-failpoint test-podman test-minio-bootstrap fmt lint install-lint build build-server build-cli build-cli-release build-migration build-migration-release build-migration-kube-plugin build-migration-kube-plugin-release run-server-local e2e-local sdk-integration-tests docker-build docker-build-migration docker-push-migration-multi
+.PHONY: mod test test-race test-failpoint test-podman test-object-store-bootstrap test-minio-bootstrap fmt lint install-lint gitleaks install-gitleaks test-gitleaks-fail-closed test-gitleaks-scan-coverage build build-server build-cli build-cli-release build-migration build-migration-release build-migration-kube-plugin build-migration-kube-plugin-release run-server-local e2e-local sdk-integration-tests docker-build docker-build-migration docker-push-migration-multi
 
 mod:
 	$(GO) mod tidy
@@ -112,10 +132,13 @@ test-race:
 test-failpoint:
 	./scripts/run_failpoint_tests.py
 
-# Hermetic MinIO bootstrap regression (fake container runtime + real local
+# Hermetic object store bootstrap regression (fake container runtime + real local
 # health probes); no docker/podman required.
-test-minio-bootstrap:
-	bash scripts/test-minio-bootstrap.sh
+test-object-store-bootstrap:
+	bash scripts/test-object-store-bootstrap.sh
+
+# Deprecated compatibility alias.
+test-minio-bootstrap: test-object-store-bootstrap
 
 fmt:
 	$(MAKE) install-lint
@@ -135,6 +158,59 @@ install-lint:
 		echo "golangci-lint already installed at $(GOLANGCI_LINT_BIN)"; \
 	fi
 
+# Scan git history for committed credentials. The default covers the current
+# branch; pass GITLEAKS_LOG_OPTS for another range or "--all". Known non-secret
+# fixtures are allowlisted in .gitleaks.toml.
+# GITLEAKS_RANGE may hold several git-log arguments (gitleaks splits the value
+# on spaces, so the preflight does the same rather than quoting it as a
+# single revision).
+#
+# Fail closed: gitleaks exits 0 with "0 commits scanned" when git cannot read the
+# requested history (unknown revision, or a partial clone whose promisor remote
+# is unreachable), which would be a silent pass. The range is traversed with git
+# first, and any failure aborts the target. Regression:
+# `make test-gitleaks-fail-closed`.
+#
+# CI does not run this target: the workflow installs its own pinned scanner and
+# reads the allowlist from the pull request's merge base, so a pull request
+# cannot excuse the finding it is adding.
+gitleaks: install-gitleaks
+	@set -euo pipefail; \
+	if ! git log -p -U0 $(GITLEAKS_RANGE) $(GITLEAKS_DIFF_OPTS) >/dev/null 2>&1; then \
+		echo "gitleaks: cannot read the full history of '$(GITLEAKS_RANGE)'" >&2; \
+		echo "gitleaks: unknown revision, or a partial clone whose promisor remote is unreachable" >&2; \
+		exit 1; \
+	fi; \
+	octopus="$$(git rev-list --merges --min-parents=3 $(GITLEAKS_RANGE) 2>/dev/null || true)"; \
+	if [ -n "$$octopus" ]; then \
+		echo "gitleaks: octopus merge(s) in '$(GITLEAKS_RANGE)' cannot be remerge-diffed:" >&2; \
+		echo "$$octopus" >&2; \
+		echo "gitleaks: re-create the merge with two parents, or review its result manually" >&2; \
+		exit 1; \
+	fi; \
+	$(GITLEAKS_BIN) git . --no-banner --redact -v --log-opts="$(GITLEAKS_RANGE) $(GITLEAKS_DIFF_OPTS)"
+
+# Regression for the fail-closed behaviour of the target above. Runs in
+# code-ci.yml; it must not run inside the trusted Secret Scan workflow, which
+# never executes code from the pull request.
+test-gitleaks-fail-closed: install-gitleaks
+	./scripts/test-gitleaks-fail-closed.sh
+
+# Regression for the scan-coverage guards (`--text`, `-m`).
+test-gitleaks-scan-coverage: install-gitleaks
+	./scripts/test-gitleaks-scan-coverage.sh
+
+install-gitleaks:
+	@echo "Checking for gitleaks..."
+	@current="$$($(GO) version -m "$(GITLEAKS_BIN)" 2>/dev/null | awk '$$1 == "mod" { print $$3 }')"; \
+	if [ ! -x "$(GITLEAKS_BIN)" ] || [ "$$current" != "$(GITLEAKS_VERSION)" ]; then \
+		echo "Installing gitleaks $(GITLEAKS_VERSION) to $(BIN_DIR)..."; \
+		mkdir -p "$(BIN_DIR)"; \
+		GOBIN="$(BIN_DIR_ABS)" $(GO) install github.com/zricethezav/gitleaks/v8@$(GITLEAKS_VERSION); \
+	else \
+		echo "gitleaks already installed at $(GITLEAKS_BIN)"; \
+	fi
+
 build: build-server build-cli
 
 build-server:
@@ -142,15 +218,15 @@ build-server:
 	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build -tags "$(GO_TAGS)" -ldflags "$(BUILDINFO_LDFLAGS)" -o $(SERVER_BIN) ./cmd/drive9-server
 
 # Local server (provider=local). Object store:
-#   DRIVE9_S3_BACKEND=auto (default) — real MinIO via scripts/local-minio.sh, else filesystem mock
-#   DRIVE9_S3_BACKEND=minio|mock     — require MinIO, or force the mock
+#   DRIVE9_S3_BACKEND=auto (default) — real object store via scripts/local-object-store.sh, else filesystem mock
+#   DRIVE9_S3_BACKEND=s3|mock     — require object store, or force the mock
 #   DRIVE9_S3_BUCKET already set     — skip bootstrap (use that bucket)
-#   bash scripts/local-minio.sh stop — tear down the named local MinIO
+#   bash scripts/local-object-store.sh stop — tear down the named local object store
 run-server-local: build-server
 	@set -euo pipefail; \
 	export DRIVE9_TENANT_PROVIDER="$${DRIVE9_TENANT_PROVIDER:-local}"; \
 	export DRIVE9_EXTENT_ALLOW_STATIC_CREDENTIALS="$${DRIVE9_EXTENT_ALLOW_STATIC_CREDENTIALS:-1}"; \
-	s3_env="$$(bash scripts/local-minio.sh apply)"; \
+	s3_env="$$(bash scripts/local-object-store.sh apply)"; \
 	eval "$$s3_env"; \
 	exec "./$(SERVER_BIN)"
 
@@ -161,7 +237,7 @@ run-server-local: build-server
 #   RUN_API_ONLY=1 make e2e-local
 #   RUN_FUSE_SMOKE=0 make e2e-local
 #   FUSE_PROFILE=coding-agent-extent make e2e-local
-#   DRIVE9_S3_BACKEND=minio make e2e-local
+#   DRIVE9_S3_BACKEND=s3 make e2e-local
 #   DRIVE9_S3_BACKEND=mock make e2e-local
 e2e-local:
 	bash scripts/e2e-local.sh $(E2E_LOCAL_ARGS)

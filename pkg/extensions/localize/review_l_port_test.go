@@ -1,0 +1,507 @@
+package localize
+
+// qiffang twenty-first round: a local-only .git anchors gitignore routing,
+// transient sidecars join a remote parent's listing, and local attribute
+// replies keep the special mode bits.
+
+import (
+	"context"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"syscall"
+	"testing"
+
+	"github.com/mem9-ai/drive9/internal/testbackend"
+	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/extensions/core"
+	"github.com/mem9-ai/drive9/pkg/extensions/specials"
+	"github.com/mem9-ai/drive9/pkg/fs"
+)
+
+// The restored checkout lives ONLY in the local overlay: the inner chain
+// cannot answer .git, so the repository root must come from the overlay or
+// the negative answer caches and gitignore-aware rules shadow tracked files.
+func TestPortLocalGitRootFromOverlay(t *testing.T) {
+	inner := fs.HandlerFilesystem(func(ctx context.Context, op *fs.Op) (fs.Result, error) {
+		return fs.Result{}, fs.ErrNotFound
+	})
+	ctx := context.Background()
+
+	dirRepo := newTestRouter(t, nil, nil)
+	if err := os.MkdirAll(filepath.Join(dirRepo.overlay.Root(), "repo", ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if root, ok := dirRepo.repoRoot(ctx, inner, "/repo/sub"); !ok || root != "/repo" {
+		t.Fatalf(".git DIRECTORY root = %q ok=%v, want /repo", root, ok)
+	}
+
+	// A linked worktree/submodule records .git as a FILE.
+	fileRepo := newTestRouter(t, nil, nil)
+	gitFile := filepath.Join(fileRepo.overlay.Root(), "repo", ".git")
+	if err := os.MkdirAll(filepath.Dir(gitFile), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(gitFile, []byte("gitdir: /elsewhere/.git/worktrees/w\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if root, ok := fileRepo.repoRoot(ctx, inner, "/repo/sub"); !ok || root != "/repo" {
+		t.Fatalf(".git FILE root = %q ok=%v, want /repo", root, ok)
+	}
+
+	// No local .git anywhere: the negative answer stands.
+	empty := newTestRouter(t, nil, nil)
+	if root, ok := empty.repoRoot(ctx, inner, "/repo/sub"); ok || root != "" {
+		t.Fatalf("root without .git = %q ok=%v, want no repository", root, ok)
+	}
+}
+
+// A transient -shm sidecar created through transient storage must appear in
+// a fresh listing of its REMOTE-routed parent (the local overlay pass only
+// walked the persistent plane).
+func TestPortTransientChildrenJoinRemoteListing(t *testing.T) {
+	f, err := New(Options{LocalRoot: t.TempDir(), TransientRoot: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.transient == nil {
+		t.Fatal("transient plane disabled")
+	}
+	sidecar := filepath.Join(f.transient.Root(), "repo", "cache.db-shm")
+	if err := os.MkdirAll(filepath.Dir(sidecar), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sidecar, []byte("shm"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := remoteListOp(t, f, &fs.Op{Kind: fs.OpList, Path: "/repo"}, []fs.Entry{
+		{Name: "main.go", Attr: fs.Attr{Kind: fs.KindFile}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := map[string]bool{}
+	for _, e := range res.Entries {
+		names[e.Name] = true
+	}
+	if !names["main.go"] || !names["cache.db-shm"] {
+		t.Fatalf("listing = %v, want the remote row and the transient sidecar", names)
+	}
+}
+
+// A successful local chmod(01777/04755) must read back through Lookup/
+// GetAttr: FileMode.Perm() masks setuid/setgid/sticky, so the overlay's own
+// marks vanished from every reply (renameguard's sticky preflight included).
+func TestPortLocalAttrsKeepSpecialModeBits(t *testing.T) {
+	f := newTestRouter(t, []string{"**/node_modules/**"}, nil)
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpMkdir, Path: "/repo/node_modules/d", Mode: 0o755}); err != nil {
+		t.Fatalf("mkdir = %v", err)
+	}
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpSetAttr, Path: "/repo/node_modules/d", HasMode: true, Mode: 0o1777, Size: -1}); err != nil {
+		t.Fatalf("chmod dir = %v", err)
+	}
+	res, err := doOp(t, f, &fs.Op{Kind: fs.OpGetAttr, Path: "/repo/node_modules/d"})
+	if err != nil || res.Attr == nil {
+		t.Fatalf("getattr dir = %v attr=%v", err, res.Attr)
+	}
+	if res.Attr.Mode != 0o1777 {
+		t.Fatalf("dir mode = %#o, want 01777 (sticky lost)", res.Attr.Mode)
+	}
+
+	writeBacking(t, f, "repo/node_modules/suid", "x")
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpSetAttr, Path: "/repo/node_modules/suid", HasMode: true, Mode: 0o4755, Size: -1}); err != nil {
+		t.Fatalf("chmod file = %v", err)
+	}
+	res, err = doOp(t, f, &fs.Op{Kind: fs.OpGetAttr, Path: "/repo/node_modules/suid"})
+	if err != nil || res.Attr == nil {
+		t.Fatalf("getattr file = %v attr=%v", err, res.Attr)
+	}
+	if res.Attr.Mode != 0o4755 {
+		t.Fatalf("file mode = %#o, want 04755 (setuid lost)", res.Attr.Mode)
+	}
+}
+
+// A metadata-only node created on a local-only path stays visible (and
+// deletable) through the local overlay: the specials plane owns the record,
+// and the overlay must not answer ENOENT for a path it classifies local.
+func TestPortLocalSpecialNodeVisibleAndRemovable(t *testing.T) {
+	ts := httptest.NewServer(testbackend.NewBackend())
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	f, err := New(Options{LocalRoot: t.TempDir(), LocalOnlyPatterns: []string{"**/node_modules/**"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sp, err := specials.New(specials.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := fs.NewChain(f, sp, terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	node := "/repo/node_modules/fifo"
+
+	mknod := func() error {
+		_, merr := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMknod, Path: node, Mode: uint32(syscall.S_IFIFO) | 0o644})
+		return merr
+	}
+	if err := mknod(); err != nil {
+		t.Fatalf("mkfifo = %v", err)
+	}
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: node})
+	if err != nil || res.Attr == nil {
+		t.Fatalf("lookup = %v attr=%v", err, res.Attr)
+	}
+	if res.Attr.Mode&syscall.S_IFMT != syscall.S_IFIFO {
+		t.Fatalf("mode = %#o, want a FIFO type", res.Attr.Mode)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: node}); err != nil {
+		t.Fatalf("unlink = %v", err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: node}); err == nil {
+		t.Fatal("deleted special still resolves")
+	}
+	if err := mknod(); err != nil {
+		t.Fatalf("re-mkfifo = %v, want success (no stale EEXIST)", err)
+	}
+
+	// A local special is a real child of its directory: it lists, keeps
+	// rmdir non-empty, and takes chmod through the specials owner.
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMkdir, Path: "/repo/node_modules/d", Mode: 0o755}); err != nil {
+		t.Fatal(err)
+	}
+	child := "/repo/node_modules/d/fifo"
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMknod, Path: child, Mode: uint32(syscall.S_IFIFO) | 0o644}); err != nil {
+		t.Fatal(err)
+	}
+	lres, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpList, Path: "/repo/node_modules/d"})
+	if err != nil {
+		t.Fatalf("list = %v", err)
+	}
+	found := false
+	for _, e := range lres.Entries {
+		if e.Name == "fifo" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("listing = %+v, want the special child", lres.Entries)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpSetAttr, Path: child, HasMode: true, Mode: 0o600, Size: -1}); err != nil {
+		t.Fatalf("chmod special = %v", err)
+	}
+	ares, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: child})
+	if err != nil || ares.Attr == nil || ares.Attr.Mode&0o777 != 0o600 {
+		t.Fatalf("chmod'd special = %+v err=%v, want 0600", ares.Attr, err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRmdir, Path: "/repo/node_modules/d"}); err != syscall.ENOTEMPTY {
+		t.Fatalf("rmdir with a special child = %v, want ENOTEMPTY", err)
+	}
+}
+
+// A directory rename moves BOTH registries holding local metadata-only
+// nodes: our mirror and the specials plane's records.
+func TestPortLocalSpecialFollowsDirRename(t *testing.T) {
+	b := testbackend.NewBackend()
+	// A remote object squats on the target name: the local registry move
+	// must not probe or delete it (the ordinary specials rename would
+	// unlink the target).
+	b.Seed("/repo/node_modules/moved/fifo", []byte("remote"))
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	f, err := New(Options{LocalRoot: t.TempDir(), LocalOnlyPatterns: []string{"**/node_modules/**"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sp, err := specials.New(specials.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := fs.NewChain(f, sp, terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMkdir, Path: "/repo/node_modules/d", Mode: 0o755}); err != nil {
+		t.Fatal(err)
+	}
+	fifo := "/repo/node_modules/d/fifo"
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMknod, Path: fifo, Mode: uint32(syscall.S_IFIFO) | 0o644}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/repo/node_modules/d", Path2: "/repo/node_modules/moved"}); err != nil {
+		t.Fatalf("rename = %v", err)
+	}
+	moved := "/repo/node_modules/moved/fifo"
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: moved})
+	if err != nil || res.Attr == nil || res.Attr.Mode&syscall.S_IFMT != syscall.S_IFIFO {
+		t.Fatalf("lookup moved fifo = %v attr=%+v", err, res.Attr)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: fifo}); err == nil {
+		t.Fatal("old special path still resolves after the rename")
+	}
+	if node, ok := b.Node("/repo/node_modules/moved/fifo"); !ok || string(node.Data) != "remote" {
+		t.Fatalf("remote target = %q ok=%v, want the backing object untouched", node.Data, ok)
+	}
+	// The specials record moved too: a duplicate create at the new name is
+	// EEXIST, and a fresh mknod at the old name succeeds.
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMknod, Path: moved, Mode: uint32(syscall.S_IFIFO) | 0o644}); err != syscall.EEXIST {
+		t.Fatalf("duplicate at moved = %v, want EEXIST", err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMknod, Path: fifo, Mode: uint32(syscall.S_IFIFO) | 0o644}); err != nil {
+		t.Fatalf("mknod at the old name = %v, want success", err)
+	}
+}
+
+// A hardlink of a metadata-only node is created by the specials plane (the
+// alias record), never by os.Link on a nonexistent backing file.
+func TestPortLocalSpecialHardlink(t *testing.T) {
+	ts := httptest.NewServer(testbackend.NewBackend())
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	f, err := New(Options{LocalRoot: t.TempDir(), LocalOnlyPatterns: []string{"**/node_modules/**"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sp, err := specials.New(specials.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := fs.NewChain(f, sp, terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	src := "/repo/node_modules/a.tmp"
+	dst := "/repo/node_modules/b.tmp"
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMknod, Path: src, Mode: uint32(syscall.S_IFIFO) | 0o644}); err != nil {
+		t.Fatalf("mknod = %v", err)
+	}
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpLink, Path: src, Path2: dst})
+	if err != nil {
+		t.Fatalf("link special = %v", err)
+	}
+	if res.Attr == nil || res.Attr.Mode&syscall.S_IFMT != syscall.S_IFIFO {
+		t.Fatalf("link reply = %+v, want a FIFO attr", res.Attr)
+	}
+	if a, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: dst}); err != nil || a.Attr == nil || a.Attr.Mode&syscall.S_IFMT != syscall.S_IFIFO {
+		t.Fatalf("alias lookup = %v attr=%+v", err, a.Attr)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: dst}); err != nil {
+		t.Fatalf("unlink alias = %v", err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: src}); err != nil {
+		t.Fatalf("source after alias unlink = %v", err)
+	}
+}
+
+func newLocalizeSpecialStack(t *testing.T) (*fs.Chain, func() *testbackend.Backend) {
+	t.Helper()
+	b := testbackend.NewBackend()
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	f, err := New(Options{LocalRoot: t.TempDir(), LocalOnlyPatterns: []string{"**/node_modules/**"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sp, err := specials.New(specials.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := fs.NewChain(f, sp, terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ch, func() *testbackend.Backend { return b }
+}
+
+// The local backing-file hardlink replies with the link's REAL attributes.
+func TestPortLocalHardlinkReturnsRealAttrs(t *testing.T) {
+	ch, _ := newLocalizeSpecialStack(t)
+	ctx := context.Background()
+	h, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/repo/node_modules/a.tmp", Flags: uint32(syscall.O_CREAT | syscall.O_RDWR), Mode: 0o600})
+	if err != nil || h.Handle == nil {
+		t.Fatalf("create = %v", err)
+	}
+	if err := h.Handle.Write(ctx, 0, []byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Handle.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpLink, Path: "/repo/node_modules/a.tmp", Path2: "/repo/node_modules/b.tmp"})
+	if err != nil {
+		t.Fatalf("link = %v", err)
+	}
+	if res.Attr == nil || res.Attr.Size != 5 || res.Attr.Mode&0o777 != 0o600 {
+		t.Fatalf("link attrs = %+v, want size=5 mode=0600", res.Attr)
+	}
+}
+
+// A special alias must refuse a destination that already exists locally.
+func TestPortLocalSpecialLinkRefusesLocalTarget(t *testing.T) {
+	ch, _ := newLocalizeSpecialStack(t)
+	ctx := context.Background()
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMknod, Path: "/repo/node_modules/a.tmp", Mode: uint32(syscall.S_IFIFO) | 0o644}); err != nil {
+		t.Fatal(err)
+	}
+	h, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/repo/node_modules/b.tmp", Flags: uint32(syscall.O_CREAT | syscall.O_RDWR), Mode: 0o600})
+	if err != nil || h.Handle == nil {
+		t.Fatalf("create target = %v", err)
+	}
+	if err := h.Handle.Write(ctx, 0, []byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Handle.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpLink, Path: "/repo/node_modules/a.tmp", Path2: "/repo/node_modules/b.tmp"}); err != syscall.EEXIST {
+		t.Fatalf("link onto a local file = %v, want EEXIST", err)
+	}
+}
+
+// A chmod on one alias of a metadata-only node is visible on every alias.
+func TestPortLocalSpecialAliasSharesAttrs(t *testing.T) {
+	ch, _ := newLocalizeSpecialStack(t)
+	ctx := context.Background()
+	src := "/repo/node_modules/a.tmp"
+	dst := "/repo/node_modules/b.tmp"
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMknod, Path: src, Mode: uint32(syscall.S_IFIFO) | 0o644}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpLink, Path: src, Path2: dst}); err != nil {
+		t.Fatalf("link = %v", err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpSetAttr, Path: src, HasMode: true, Mode: 0o600, Size: -1}); err != nil {
+		t.Fatalf("chmod = %v", err)
+	}
+	for _, p := range []string{src, dst} {
+		res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: p})
+		if err != nil || res.Attr == nil || res.Attr.Mode&0o777 != 0o600 {
+			t.Fatalf("%s attr = %+v err=%v, want 0600", p, res.Attr, err)
+		}
+	}
+}
+
+// A recreated name gets a FRESH node identity: a surviving alias keeps the
+// old node's metadata.
+func TestPortLocalSpecialCreateAfterUnlinkIsIndependent(t *testing.T) {
+	ch, _ := newLocalizeSpecialStack(t)
+	ctx := context.Background()
+	a := "/repo/node_modules/a.tmp"
+	b := "/repo/node_modules/b.tmp"
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMknod, Path: a, Mode: uint32(syscall.S_IFIFO) | 0o600}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpLink, Path: a, Path2: b}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: a}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMknod, Path: a, Mode: uint32(syscall.S_IFIFO) | 0o644}); err != nil {
+		t.Fatal(err)
+	}
+	// b keeps the OLD node (0600); a is the NEW node (0644).
+	bAttr, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: b})
+	if err != nil || bAttr.Attr == nil || bAttr.Attr.Mode&0o777 != 0o600 {
+		t.Fatalf("b attr = %+v err=%v, want 0600", bAttr.Attr, err)
+	}
+	aAttr, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: a})
+	if err != nil || aAttr.Attr == nil || aAttr.Attr.Mode&0o777 != 0o644 {
+		t.Fatalf("a attr = %+v err=%v, want 0644", aAttr.Attr, err)
+	}
+	// A chmod on the old node must not leak into the new one.
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpSetAttr, Path: b, HasMode: true, Mode: 0o400, Size: -1}); err != nil {
+		t.Fatal(err)
+	}
+	aAttr, err = ch.Dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: a})
+	if err != nil || aAttr.Attr == nil || aAttr.Attr.Mode&0o777 != 0o644 {
+		t.Fatalf("a after chmod(b) = %+v err=%v, want 0644", aAttr.Attr, err)
+	}
+}
+
+// Unlinking one alias refreshes the surviving node's link count.
+func TestPortLocalSpecialUnlinkRefreshesNlink(t *testing.T) {
+	ch, _ := newLocalizeSpecialStack(t)
+	ctx := context.Background()
+	a := "/repo/node_modules/a.tmp"
+	b := "/repo/node_modules/b.tmp"
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMknod, Path: a, Mode: uint32(syscall.S_IFIFO) | 0o644}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpLink, Path: a, Path2: b}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: a}); err != nil {
+		t.Fatal(err)
+	}
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: b})
+	if err != nil || res.Attr == nil || res.Attr.Nlink != 1 {
+		t.Fatalf("b after unlink(a) = %+v err=%v, want nlink 1", res.Attr, err)
+	}
+}
+
+// A REMOTE-parent directory rename moves the local special-node index too.
+func TestPortRemoteParentRenameMigratesLocalSpecials(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/repo/x", []byte("x"))
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	f, err := New(Options{LocalRoot: t.TempDir(), LocalOnlyPatterns: []string{"**/node_modules/**"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sp, err := specials.New(specials.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := fs.NewChain(f, sp, terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMkdir, Path: "/repo/node_modules/d", Mode: 0o755}); err != nil {
+		t.Fatal(err)
+	}
+	fifo := "/repo/node_modules/d/fifo"
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMknod, Path: fifo, Mode: uint32(syscall.S_IFIFO) | 0o644}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/repo", Path2: "/moved"}); err != nil {
+		t.Fatalf("remote-parent rename = %v", err)
+	}
+	moved := "/moved/node_modules/d/fifo"
+	if res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: moved}); err != nil || res.Attr == nil {
+		t.Fatalf("moved special = %+v err=%v", res.Attr, err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: fifo}); err == nil {
+		t.Fatal("old special path still resolves after the remote-parent rename")
+	}
+}

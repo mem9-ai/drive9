@@ -9,22 +9,22 @@ import (
 // It is intentionally separate from HandleTable so FUSE fh lookup remains a
 // simple id table while hot path lifecycle checks can avoid full-table scans.
 type OpenHandleIndex struct {
-	mu           sync.RWMutex
-	byInode      map[uint64]map[*FileHandle]struct{}
-	byPath       map[string]map[*FileHandle]struct{}
-	pathByHandle map[*FileHandle]string
+	mu       sync.Mutex
+	byPath   map[string]map[*fileHandle]struct{}
+	byInode  map[uint64]map[*fileHandle]struct{}
+	unlinked map[*fileHandle]struct{}
 }
 
 func NewOpenHandleIndex() *OpenHandleIndex {
 	return &OpenHandleIndex{
-		byInode:      make(map[uint64]map[*FileHandle]struct{}),
-		byPath:       make(map[string]map[*FileHandle]struct{}),
-		pathByHandle: make(map[*FileHandle]string),
+		byPath:   make(map[string]map[*fileHandle]struct{}),
+		byInode:  make(map[uint64]map[*fileHandle]struct{}),
+		unlinked: make(map[*fileHandle]struct{}),
 	}
 }
 
-func (idx *OpenHandleIndex) Add(fh *FileHandle) {
-	if idx == nil || fh == nil {
+func (idx *OpenHandleIndex) Add(fh *fileHandle) {
+	if fh == nil {
 		return
 	}
 	idx.mu.Lock()
@@ -32,213 +32,142 @@ func (idx *OpenHandleIndex) Add(fh *FileHandle) {
 	idx.addLocked(fh)
 }
 
-// addLocked inserts fh into the indexes; the caller must hold idx.mu. It
-// exists so a registration can be made atomic with another check (see
-// allocateGitWorkspaceFileHandle).
-func (idx *OpenHandleIndex) addLocked(fh *FileHandle) {
-	addHandleToSet(idx.byInode, fh.Ino, fh)
-	addHandleToSet(idx.byPath, fh.Path, fh)
-	idx.pathByHandle[fh] = fh.Path
+func (idx *OpenHandleIndex) addLocked(fh *fileHandle) {
+	addHandleToSet(idx.byPath, fh.path, fh)
+	addHandleToSet(idx.byInode, fh.ino, fh)
+	delete(idx.unlinked, fh)
 }
 
-func (idx *OpenHandleIndex) Remove(fh *FileHandle) {
-	if idx == nil || fh == nil {
+func (idx *OpenHandleIndex) Remove(fh *fileHandle) {
+	if fh == nil {
 		return
 	}
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
-	removeHandleFromSet(idx.byInode, fh.Ino, fh)
-	if p, ok := idx.pathByHandle[fh]; ok {
-		removeHandleFromSet(idx.byPath, p, fh)
-		delete(idx.pathByHandle, fh)
-	} else {
-		for p := range idx.byPath {
-			removeHandleFromSet(idx.byPath, p, fh)
-		}
-	}
+	removeHandleFromSet(idx.byPath, fh.path, fh)
+	removeHandleFromSet(idx.byInode, fh.ino, fh)
+	delete(idx.unlinked, fh)
 }
 
-// UnlinkPath detaches currently open handles from a removed directory entry's
-// path while preserving inode-indexed lookup for fd lifetime operations.
+// HasOpenPath reports live handles on a path.
+func (idx *OpenHandleIndex) HasOpenPath(p string) bool {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	return len(idx.byPath[p]) > 0
+}
+
+// HasOpenInode reports live handles on an inode.
+func (idx *OpenHandleIndex) HasOpenInode(ino uint64) bool {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	return len(idx.byInode[ino]) > 0
+}
+
+// UnlinkPath marks every handle of p as anonymous (v1 semantics: the fd
+// stays usable but no longer owns the path).
 func (idx *OpenHandleIndex) UnlinkPath(p string) {
-	if idx == nil || p == "" {
-		return
-	}
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
-
-	handles := idx.byPath[p]
-	if len(handles) == 0 {
-		return
-	}
-	for fh := range handles {
-		delete(idx.pathByHandle, fh)
+	for fh := range idx.byPath[p] {
+		idx.unlinked[fh] = struct{}{}
 	}
 	delete(idx.byPath, p)
 }
 
-// RelinkPath re-attaches handles to the path index, reversing UnlinkPath.
-// Used to roll back a failed Unlink. Handles that are no longer open (absent
-// from the inode index, e.g. released in between) are skipped.
-func (idx *OpenHandleIndex) RelinkPath(p string, handles []*FileHandle) {
-	if idx == nil || p == "" {
-		return
-	}
+// RelinkPath rebinds handles onto a fresh incarnation of p.
+func (idx *OpenHandleIndex) RelinkPath(p string, handles []*fileHandle) {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
-
 	for _, fh := range handles {
-		if fh == nil {
-			continue
-		}
-		set, ok := idx.byInode[fh.Ino]
-		if !ok {
-			continue
-		}
-		if _, ok := set[fh]; !ok {
-			continue
-		}
-		addHandleToSet(idx.byPath, p, fh)
-		idx.pathByHandle[fh] = p
+		fh.path = p
+		idx.addLocked(fh)
 	}
 }
 
-// Has reports whether any open handle matches ino or p.
-// When both are supplied this intentionally uses OR semantics to preserve the
-// old conservative inode/path checks from the pre-index table scan.
 func (idx *OpenHandleIndex) Has(ino uint64, p string) bool {
-	if idx == nil {
-		return false
-	}
-	idx.mu.RLock()
-	defer idx.mu.RUnlock()
-	if ino != 0 && len(idx.byInode[ino]) > 0 {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	if handles := idx.byPath[p]; len(handles) > 0 {
 		return true
 	}
-	return p != "" && len(idx.byPath[p]) > 0
+	for fh := range idx.byInode[ino] {
+		if _, anon := idx.unlinked[fh]; !anon {
+			return true
+		}
+	}
+	return false
 }
 
-func (idx *OpenHandleIndex) SnapshotPath(p string) []*FileHandle {
-	if idx == nil || p == "" {
-		return nil
-	}
-	idx.mu.RLock()
-	defer idx.mu.RUnlock()
-	handles := idx.byPath[p]
-	if len(handles) == 0 {
-		return nil
-	}
-	out := make([]*FileHandle, 0, len(handles))
-	for fh := range handles {
-		out = append(out, fh)
-	}
-	return out
-}
-
-// SnapshotInode returns a point-in-time copy of handles currently indexed by inode.
-func (idx *OpenHandleIndex) SnapshotInode(ino uint64) []*FileHandle {
-	if idx == nil || ino == 0 {
-		return nil
-	}
-	idx.mu.RLock()
-	defer idx.mu.RUnlock()
-	handles := idx.byInode[ino]
-	if len(handles) == 0 {
-		return nil
-	}
-	out := make([]*FileHandle, 0, len(handles))
-	for fh := range handles {
-		out = append(out, fh)
-	}
-	return out
-}
-
-func (idx *OpenHandleIndex) RenamePathPrefix(oldPath, newPath string) map[*FileHandle]string {
-	if idx == nil || oldPath == "" || newPath == "" {
-		return nil
-	}
+func (idx *OpenHandleIndex) SnapshotPath(p string) []*fileHandle {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
-
-	oldPrefix := oldPath + "/"
-	type move struct {
-		from string
-		to   string
+	out := make([]*fileHandle, 0, len(idx.byPath[p]))
+	for fh := range idx.byPath[p] {
+		out = append(out, fh)
 	}
-	var moves []move
-	for p := range idx.byPath {
-		switch {
-		case p == oldPath:
-			moves = append(moves, move{from: p, to: newPath})
-		case strings.HasPrefix(p, oldPrefix):
-			moves = append(moves, move{from: p, to: newPath + strings.TrimPrefix(p, oldPath)})
-		}
-	}
-
-	retargeted := make(map[*FileHandle]string)
-	for _, mv := range moves {
-		handles := idx.byPath[mv.from]
-		delete(idx.byPath, mv.from)
-		for fh := range handles {
-			addHandleToSet(idx.byPath, mv.to, fh)
-			idx.pathByHandle[fh] = mv.to
-			retargeted[fh] = mv.to
-		}
-	}
-	if len(retargeted) == 0 {
-		return nil
-	}
-	return retargeted
+	return out
 }
 
-func (idx *OpenHandleIndex) Path(fh *FileHandle) (string, bool) {
-	if idx == nil || fh == nil {
+func (idx *OpenHandleIndex) SnapshotInode(ino uint64) []*fileHandle {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	out := make([]*fileHandle, 0, len(idx.byInode[ino]))
+	for fh := range idx.byInode[ino] {
+		out = append(out, fh)
+	}
+	return out
+}
+
+// RenamePathPrefix moves every handle under oldPath onto newPath,
+// returning the rebinding map (v1 semantics; caller applies path rewrites).
+func (idx *OpenHandleIndex) RenamePathPrefix(oldPath, newPath string) map[*fileHandle]string {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	renamed := make(map[*fileHandle]string)
+	prefix := strings.TrimSuffix(oldPath, "/") + "/"
+	for p, handles := range idx.byPath {
+		if p != oldPath && !strings.HasPrefix(p, prefix) {
+			continue
+		}
+		next := newPath + strings.TrimPrefix(p, oldPath)
+		for fh := range handles {
+			fh.path = next
+			renamed[fh] = next
+			delete(idx.byPath, p)
+			addHandleToSet(idx.byPath, next, fh)
+		}
+	}
+	return renamed
+}
+
+func (idx *OpenHandleIndex) Path(fh *fileHandle) (string, bool) {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	if _, anon := idx.unlinked[fh]; anon {
 		return "", false
 	}
-	idx.mu.RLock()
-	defer idx.mu.RUnlock()
-	p, ok := idx.pathByHandle[fh]
-	return p, ok
-}
-
-func addHandleToSet[K comparable](m map[K]map[*FileHandle]struct{}, key K, fh *FileHandle) {
-	handles := m[key]
-	if handles == nil {
-		handles = make(map[*FileHandle]struct{})
-		m[key] = handles
+	if _, ok := idx.byPath[fh.path][fh]; ok {
+		return fh.path, true
 	}
-	handles[fh] = struct{}{}
+	return "", false
 }
 
-func removeHandleFromSet[K comparable](m map[K]map[*FileHandle]struct{}, key K, fh *FileHandle) {
-	handles := m[key]
-	if handles == nil {
+func addHandleToSet[K comparable](m map[K]map[*fileHandle]struct{}, key K, fh *fileHandle) {
+	set, ok := m[key]
+	if !ok {
+		set = make(map[*fileHandle]struct{})
+		m[key] = set
+	}
+	set[fh] = struct{}{}
+}
+
+func removeHandleFromSet[K comparable](m map[K]map[*fileHandle]struct{}, key K, fh *fileHandle) {
+	set, ok := m[key]
+	if !ok {
 		return
 	}
-	delete(handles, fh)
-	if len(handles) == 0 {
+	delete(set, fh)
+	if len(set) == 0 {
 		delete(m, key)
 	}
-}
-
-func (fs *Dat9FS) allocateFileHandle(fh *FileHandle) uint64 {
-	if fh != nil && fh.extentFh != 0 && fs.fileHandles.PutIfAbsent(fh.extentFh, fh) {
-		fs.openHandles.Add(fh)
-		return fh.extentFh
-	}
-	fhID := fs.fileHandles.Allocate(fh)
-	fs.openHandles.Add(fh)
-	return fhID
-}
-
-func (fs *Dat9FS) deleteFileHandle(fhID uint64, fh *FileHandle) {
-	if fh == nil {
-		var ok bool
-		fh, ok = fs.fileHandles.Get(fhID)
-		if !ok {
-			return
-		}
-	}
-	fs.fileHandles.Delete(fhID)
-	fs.openHandles.Remove(fh)
 }

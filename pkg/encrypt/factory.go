@@ -13,10 +13,10 @@ import (
 type Type string
 
 const (
-	TypeLocalAES    Type = "local_aes"
-	TypeKMS         Type = "kms"
-	TypeAliyunKMS   Type = "aliyun_kms"
-	TypeTencentKMS  Type = "tencent_kms"
+	TypeLocalAES   Type = "local_aes"
+	TypeKMS        Type = "kms"
+	TypeAliyunKMS  Type = "aliyun_kms"
+	TypeTencentKMS Type = "tencent_kms"
 )
 
 type Config struct {

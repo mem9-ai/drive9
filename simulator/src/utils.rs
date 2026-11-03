@@ -283,3 +283,28 @@ pub fn pattern_hit(pattern: &str, hay: &str) -> bool {
         .split('|')
         .any(|alt| !alt.trim().is_empty() && hay.contains(alt.trim()))
 }
+
+/// Path of the mount daemon's pid state file for a workspace, mirroring
+/// pkg/mountstate: /$TMPDIR/drive9-mount-<hash8(canonical)>.pid where
+/// canonical is the cleaned absolute path and hash8 is the first 8 bytes
+/// of its sha256, hex-encoded.
+pub fn mount_state_pid_path(ws: &std::path::Path) -> std::path::PathBuf {
+    use sha2::{Digest, Sha256};
+    let canonical = ws
+        .to_string_lossy()
+        .trim_end_matches('/')
+        .to_string();
+    let canonical = if canonical.starts_with('/') {
+        canonical
+    } else {
+        format!(
+            "{}/{}",
+            std::env::current_dir().unwrap_or_default().display(),
+            canonical
+        )
+    };
+    let sum = Sha256::digest(canonical.as_bytes());
+    let hash8 = hex::encode(&sum[..8]);
+    let tmp = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
+    std::path::PathBuf::from(tmp).join(format!("drive9-mount-{hash8}.pid"))
+}

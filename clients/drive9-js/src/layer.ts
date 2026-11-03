@@ -6,10 +6,12 @@ import type {
   FSLayerCheckpoint,
   FSLayerCheckpointRequest,
   FSLayerCommit,
+  FSLayerDeleteOptions,
   FSLayerEntry,
   FSLayerEntryRequest,
   FSLayerEvent,
   FSLayerCreateRequest,
+  FSLayerForkRequest,
 } from "./models.js";
 
 export class FSLayerCommitConflictError extends StatusError {
@@ -57,6 +59,30 @@ export async function listFSLayers(client: Client): Promise<FSLayer[]> {
 
 export async function getFSLayer(client: Client, layerId: string): Promise<FSLayer> {
   return decodeJSON<FSLayer>(await fetch(layerURL(client, layerId), { headers: client.authHeaders() }));
+}
+
+export async function forkFSLayer(client: Client, parentRef: string, req: FSLayerForkRequest = {}): Promise<FSLayer> {
+  return decodeJSON<FSLayer>(
+    await fetch(layerURL(client, parentRef, "/fork"), {
+      method: "POST",
+      headers: client.authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify(req),
+    })
+  );
+}
+
+export async function deleteFSLayer(
+  client: Client,
+  layerId: string,
+  options: FSLayerDeleteOptions = {}
+): Promise<void> {
+  const query = options.cascade ? "?cascade=true" : "";
+  await checkError(
+    await fetch(`${layerURL(client, layerId)}${query}`, {
+      method: "DELETE",
+      headers: client.authHeaders(),
+    })
+  );
 }
 
 export async function diffFSLayer(client: Client, layerId: string, maxSeq?: number, replay = false): Promise<FSLayerEntry[]> {

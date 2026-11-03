@@ -1,24 +1,36 @@
 package fuse
 
+// Ports of v1 pkg/fuse/open_handles_test.go rows for the facade's
+// OpenHandleIndex. bypass_special_test.go already pins the
+// create/register/release lifecycle; these add the by-inode+by-path tracks
+// with shared paths, the conservative OR semantics of Has, the full
+// rename-prefix rebinding map, and the unlink-anonymization/relink round
+// trip (v1 unlink-survivor bookkeeping).
+//
+// Not ported: TestDat9FSFinishLocalRenameUpdatesOpenHandleIndex and the two
+// TestDat9FSClearReadTargetsForPath* rows — their subjects (FileHandle
+// streamer/prefetch/read-target rewiring) moved into the writeback
+// extension with the data plane; the facade's rename hook is the
+// openIdx.RenamePathPrefix call covered below, and read-target clearing is
+// event-driven inside the cache extension.
+
 import (
 	"testing"
-	"time"
-
-	gofuse "github.com/hanwen/go-fuse/v2/fuse"
-
-	"github.com/mem9-ai/drive9/pkg/client"
 )
 
 func TestOpenHandleIndexTracksByInodeAndPath(t *testing.T) {
 	idx := NewOpenHandleIndex()
-	fh1 := &FileHandle{Ino: 10, Path: "/a.txt"}
-	fh2 := &FileHandle{Ino: 11, Path: "/a.txt"}
+	fh1 := &fileHandle{ino: 10, path: "/a.txt"}
+	fh2 := &fileHandle{ino: 11, path: "/a.txt"}
 
 	idx.Add(fh1)
 	idx.Add(fh2)
 
 	if !idx.Has(10, "") {
 		t.Fatal("index missing inode 10")
+	}
+	if !idx.HasOpenInode(10) {
+		t.Fatal("HasOpenInode missing inode 10")
 	}
 	if !idx.Has(0, "/a.txt") {
 		t.Fatal("index missing /a.txt")
@@ -39,12 +51,15 @@ func TestOpenHandleIndexTracksByInodeAndPath(t *testing.T) {
 	if idx.Has(11, "/a.txt") {
 		t.Fatal("handle remained after final remove")
 	}
+	if idx.HasOpenPath("/a.txt") {
+		t.Fatal("HasOpenPath remained true after final remove")
+	}
 }
 
 func TestOpenHandleIndexHasUsesConservativeOR(t *testing.T) {
 	idx := NewOpenHandleIndex()
-	idx.Add(&FileHandle{Ino: 10, Path: "/a.txt"})
-	idx.Add(&FileHandle{Ino: 11, Path: "/b.txt"})
+	idx.Add(&fileHandle{ino: 10, path: "/a.txt"})
+	idx.Add(&fileHandle{ino: 11, path: "/b.txt"})
 
 	if !idx.Has(10, "/b.txt") {
 		t.Fatal("Has should match an open inode or an open path")
@@ -59,9 +74,9 @@ func TestOpenHandleIndexHasUsesConservativeOR(t *testing.T) {
 
 func TestOpenHandleIndexRenamePathPrefix(t *testing.T) {
 	idx := NewOpenHandleIndex()
-	file := &FileHandle{Ino: 10, Path: "/dir/a.txt"}
-	child := &FileHandle{Ino: 11, Path: "/dir/sub/b.txt"}
-	other := &FileHandle{Ino: 12, Path: "/dir-other/c.txt"}
+	file := &fileHandle{ino: 10, path: "/dir/a.txt"}
+	child := &fileHandle{ino: 11, path: "/dir/sub/b.txt"}
+	other := &fileHandle{ino: 12, path: "/dir-other/c.txt"}
 	idx.Add(file)
 	idx.Add(child)
 	idx.Add(other)
@@ -88,164 +103,36 @@ func TestOpenHandleIndexRenamePathPrefix(t *testing.T) {
 	}
 }
 
-func TestDat9FSFileHandleIndexLifecycle(t *testing.T) {
-	opts := &MountOptions{}
-	opts.setDefaults()
-	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+// v1 unlink-survivor rows: UnlinkPath anonymizes every handle of the path
+// (Has by path and by inode stop counting it; Path reports none) and
+// RelinkPath rebinds the survivors onto a fresh incarnation of the name.
+func TestOpenHandleIndexUnlinkAnonymizesAndRelinkRestores(t *testing.T) {
+	idx := NewOpenHandleIndex()
+	fh := &fileHandle{ino: 10, path: "/a.txt"}
+	idx.Add(fh)
 
-	fh := &FileHandle{Ino: 20, Path: "/b.txt"}
-	fhID := fs.allocateFileHandle(fh)
-	if !fs.hasOpenHandle(20, "/b.txt") {
-		t.Fatal("allocated file handle was not indexed")
+	idx.UnlinkPath("/a.txt")
+
+	if idx.HasOpenPath("/a.txt") {
+		t.Fatal("unlinked path still indexed by path")
+	}
+	if idx.Has(10, "") || idx.Has(10, "/a.txt") {
+		t.Fatal("anonymous handle still counted as open")
+	}
+	if p, ok := idx.Path(fh); ok || p != "" {
+		t.Fatalf("anonymous Path = %q %v, want empty/false", p, ok)
+	}
+	// The inode track itself is intact for a later rebind.
+	if got := idx.SnapshotInode(10); len(got) != 1 || got[0] != fh {
+		t.Fatalf("SnapshotInode after unlink = %v, want the survivor", got)
 	}
 
-	fs.deleteFileHandle(fhID, fh)
-	if fs.hasOpenHandle(20, "/b.txt") {
-		t.Fatal("deleted file handle remained indexed")
-	}
-	if _, ok := fs.fileHandles.Get(fhID); ok {
-		t.Fatal("deleted file handle remained in handle table")
-	}
-}
+	idx.RelinkPath("/a.txt", []*fileHandle{fh})
 
-func TestDat9FSFinishLocalRenameUpdatesOpenHandleIndex(t *testing.T) {
-	opts := &MountOptions{}
-	opts.setDefaults()
-	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
-
-	ino := fs.inodes.Lookup("/old.txt", false, 4, time.Now())
-	fh := &FileHandle{Ino: ino, Path: "/old.txt", Dirty: NewWriteBuffer("/old.txt", 0, 0)}
-	fh.Streamer = NewStreamUploader(fs.client, "/old.txt", -1, fs.remoteRoot())
-	fh.Prefetch = NewPrefetcher(fs.client, fs.remotePath("/old.txt"), 4)
-	fh.ReadTarget = &client.ReadTarget{ObjectURL: "http://old.example/object"}
-	fh.Prefetch.SetReadTarget(fh.ReadTarget)
-	fhID := fs.allocateFileHandle(fh)
-	defer fs.deleteFileHandle(fhID, fh)
-
-	fs.finishLocalRename(&gofuse.RenameIn{
-		InHeader: gofuse.InHeader{NodeId: 1},
-		Newdir:   1,
-	}, "/old.txt", "/new.txt")
-
-	if fs.hasOpenHandle(0, "/old.txt") {
-		t.Fatal("old path remained indexed after finishLocalRename")
+	if !idx.Has(10, "/a.txt") {
+		t.Fatal("relinked handle not indexed again")
 	}
-	if !fs.hasOpenHandle(0, "/new.txt") {
-		t.Fatal("new path was not indexed after finishLocalRename")
-	}
-	if fh.Path != "/new.txt" {
-		t.Fatalf("file handle path = %q, want /new.txt", fh.Path)
-	}
-	if fh.Dirty.path != "/new.txt" {
-		t.Fatalf("dirty buffer path = %q, want /new.txt", fh.Dirty.path)
-	}
-	if fh.Streamer.path != "/new.txt" {
-		t.Fatalf("streamer path = %q, want /new.txt", fh.Streamer.path)
-	}
-	if fh.Streamer.remotePath != "/new.txt" {
-		t.Fatalf("streamer remote path = %q, want /new.txt", fh.Streamer.remotePath)
-	}
-	if got := fh.Prefetch.pathString(); got != "/new.txt" {
-		t.Fatalf("prefetch path = %q, want /new.txt", got)
-	}
-	if fh.ReadTarget != nil {
-		t.Fatal("file handle read target was not cleared")
-	}
-	fh.Prefetch.mu.Lock()
-	prefetchTarget := fh.Prefetch.target
-	fh.Prefetch.mu.Unlock()
-	if prefetchTarget != nil {
-		t.Fatal("prefetch read target was not cleared")
-	}
-}
-
-func TestDat9FSClearReadTargetsForPath(t *testing.T) {
-	opts := &MountOptions{}
-	opts.setDefaults()
-	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
-
-	target := &client.ReadTarget{ObjectURL: "http://old.example/object"}
-	fh1 := &FileHandle{Ino: 10, Path: "/file.txt", ReadTarget: target}
-	fh1.Prefetch = NewPrefetcher(fs.client, fs.remotePath("/file.txt"), 4)
-	fh1.Prefetch.SetReadTarget(target)
-	fh2 := &FileHandle{Ino: 11, Path: "/other.txt", ReadTarget: target}
-	fh2.Prefetch = NewPrefetcher(fs.client, fs.remotePath("/other.txt"), 4)
-	fh2.Prefetch.SetReadTarget(target)
-	fs.allocateFileHandle(fh1)
-	fs.allocateFileHandle(fh2)
-
-	fs.clearReadTargetsForPath("/file.txt")
-
-	if fh1.ReadTarget != nil {
-		t.Fatal("matching handle read target was not cleared")
-	}
-	fh1.Prefetch.mu.Lock()
-	prefetchTarget := fh1.Prefetch.target
-	fh1.Prefetch.mu.Unlock()
-	if prefetchTarget != nil {
-		t.Fatal("matching prefetch read target was not cleared")
-	}
-	if fh2.ReadTarget == nil {
-		t.Fatal("non-matching handle read target was cleared")
-	}
-	fh2.Prefetch.mu.Lock()
-	prefetchTarget2 := fh2.Prefetch.target
-	fh2.Prefetch.mu.Unlock()
-	if prefetchTarget2 == nil {
-		t.Fatal("non-matching prefetch read target was cleared")
-	}
-}
-
-func TestDat9FSClearReadTargetsForPathSkipsLockedSibling(t *testing.T) {
-	opts := &MountOptions{}
-	opts.setDefaults()
-	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
-
-	target := &client.ReadTarget{ObjectURL: "http://old.example/object"}
-	current := &FileHandle{Ino: 10, Path: "/file.txt", ReadTarget: target}
-	lockedSibling := &FileHandle{Ino: 11, Path: "/file.txt", ReadTarget: target}
-	lockedSibling.Prefetch = NewPrefetcher(fs.client, fs.remotePath("/file.txt"), 4)
-	lockedSibling.Prefetch.SetReadTarget(target)
-	unlockedSibling := &FileHandle{Ino: 12, Path: "/file.txt", ReadTarget: target}
-	unlockedSibling.Prefetch = NewPrefetcher(fs.client, fs.remotePath("/file.txt"), 4)
-	unlockedSibling.Prefetch.SetReadTarget(target)
-	fs.allocateFileHandle(current)
-	fs.allocateFileHandle(lockedSibling)
-	fs.allocateFileHandle(unlockedSibling)
-
-	lockedSibling.Lock()
-	defer lockedSibling.Unlock()
-
-	done := make(chan struct{})
-	go func() {
-		fs.clearReadTargetsForPathExcept("/file.txt", current)
-		close(done)
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("clearReadTargetsForPathExcept blocked on a locked sibling handle")
-	}
-	if current.ReadTarget == nil {
-		t.Fatal("skipped current handle read target was cleared")
-	}
-	if lockedSibling.ReadTarget == nil {
-		t.Fatal("locked sibling read target was cleared")
-	}
-	lockedSibling.Prefetch.mu.Lock()
-	lockedPrefetchTarget := lockedSibling.Prefetch.target
-	lockedSibling.Prefetch.mu.Unlock()
-	if lockedPrefetchTarget == nil {
-		t.Fatal("locked sibling prefetch target was cleared")
-	}
-	if unlockedSibling.ReadTarget != nil {
-		t.Fatal("unlocked sibling read target was not cleared")
-	}
-	unlockedSibling.Prefetch.mu.Lock()
-	unlockedPrefetchTarget := unlockedSibling.Prefetch.target
-	unlockedSibling.Prefetch.mu.Unlock()
-	if unlockedPrefetchTarget != nil {
-		t.Fatal("unlocked sibling prefetch target was not cleared")
+	if p, ok := idx.Path(fh); !ok || p != "/a.txt" {
+		t.Fatalf("relinked Path = %q %v, want /a.txt true", p, ok)
 	}
 }

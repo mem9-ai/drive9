@@ -110,3 +110,32 @@ func IsDir(p string) bool {
 func Ext(p string) string {
 	return pathpkg.Ext(strings.TrimSuffix(p, "/"))
 }
+
+// DirOf answers the parent directory of a view path ("/" for top level).
+// View paths may carry a trailing slash for directories; path.Dir alone
+// would treat "/a/b/" as a file named "b" inside "/a".
+func DirOf(viewPath string) string {
+	t := strings.TrimSuffix(viewPath, "/")
+	if t == "" {
+		return "/"
+	}
+	return pathpkg.Dir(t)
+}
+
+// JoinPath appends name to a directory path. Delegates to path.Join, whose
+// cleaning also collapses any duplicate separators in dir.
+func JoinPath(dir, name string) string {
+	return pathpkg.Join(dir, name)
+}
+
+// SplitParent answers (parent, base) of a view path, tolerating the
+// trailing slash directory convention (path.Split would return an empty
+// base for "/a/b/").
+func SplitParent(p string) (parent, base string) {
+	parent, base = pathpkg.Split(strings.TrimSuffix(p, "/"))
+	parent = strings.TrimSuffix(parent, "/")
+	if parent == "" {
+		parent = "/"
+	}
+	return parent, base
+}

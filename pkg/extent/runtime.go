@@ -58,6 +58,11 @@ type RuntimeConfig struct {
 	CacheKey  string
 	Transport jfsmeta.Drive9Transport
 	Storage   object.ObjectStorage
+	// Heartbeat controls session renewal. Zero preserves the 12-second default.
+	// JuiceFS derives session expiry as five heartbeat intervals. Shorter
+	// intervals reduce stale-lock takeover time but tolerate less disruption
+	// and issue more metadata requests. Valid explicit values are 1s to 10m.
+	Heartbeat time.Duration
 }
 
 // extentChunkCacheBytes is the mount-side block cache cap: JuiceFS --cache-size
@@ -212,6 +217,12 @@ func NewRuntime(cfg RuntimeConfig) (rt *Runtime, err error) {
 	}
 	quietJuiceFSLogs()
 	conf := juiceMetaConf()
+	if cfg.Heartbeat != 0 {
+		if cfg.Heartbeat < time.Second || cfg.Heartbeat > 10*time.Minute {
+			return nil, fmt.Errorf("extent runtime: heartbeat must be between 1s and 10m")
+		}
+		conf.Heartbeat = cfg.Heartbeat
+	}
 	m := jfsmeta.NewDrive9Meta(conf, cfg.Transport)
 	format := &jfsmeta.Format{
 		Name:      "drive9",

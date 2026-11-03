@@ -1,0 +1,35 @@
+name: simulator-e2e
+
+# Simulator e2e PR gate (G4 of simulator/ROADMAP.md). The simulator only
+# talks to a real backend, so the gate calls the shared real-backend
+# workflow with profile=pr: it brings up TiDB playground + rustfs +
+# drive9-server on the runner and runs the pr-gate + pr-gate-mount tiers,
+# the no-skip pjdfstest gate, and the benchmark tier with baseline
+# comparison. Replaces local-e2e.yml as cases migrate.
+
+on:
+  pull_request:
+    paths:
+      - simulator/**
+      - cmd/**
+      - pkg/**
+      - internal/**
+      - scripts/**
+      - go.mod
+      - go.sum
+      - Makefile
+      - .github/workflows/simulator-e2e.yml
+      - .github/workflows/real-backend.yml
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: simulator-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pr-gate:
+    uses: ./.github/workflows/real-backend.yml
+    with:
+      profile: pr

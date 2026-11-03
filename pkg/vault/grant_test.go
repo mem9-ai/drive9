@@ -418,4 +418,3 @@ func TestAuditGrantRevokedDetailContract(t *testing.T) {
 		t.Errorf("reason = %v, want %q", got["reason"], reason)
 	}
 }
-

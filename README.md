@@ -171,6 +171,20 @@ echo '{"type":"tool.call.completed","summary":{"tool":"pytest"}}' \
 drive9 journal verify run-42
 ```
 
+### Run Commands Against a Workspace
+
+When the server enables it, `drive9 exec` runs a command in a sandbox with your
+drive mounted at `/workspace`. Output streams live, writes are in Drive9
+when it exits, and the exit status is the command's:
+
+```bash
+cd ~/drive9/repo && drive9 exec npm test   # inside a mount: your local edits, same directory
+drive9 exec -w repo 'npm ci && npm test'   # from anywhere
+```
+
+Your consecutive commands reuse a warm sandbox, so packages you install stay
+around between them; only `/workspace` is durable.
+
 ## Architecture
 
 ```mermaid
@@ -240,7 +254,8 @@ cat ~/drive9/run-42.txt
 
 ## Boundaries
 
-- Drive9 keeps workspace state; another system still runs the sandbox process.
+- Drive9 keeps workspace state. `drive9 exec` runs commands in sandboxes, but it
+  is not an agent loop or durable job system.
 - It does not preserve live processes, sockets, terminals, or in-memory model context.
 - It is not a Git replacement; Git remains the final review and history layer.
 - It targets agent workspace workloads, not full general-purpose POSIX compatibility.
@@ -255,6 +270,7 @@ cat ~/drive9/run-42.txt
 - [Go SDK integration guide](docs/guides/go-sdk-integration.md)
 - [Go SDK vs CLI parity notes](docs/guides/go-sdk-cli-parity.md)
 - [Vault quickstart](docs/guides/vault-quickstart.md)
+- [Remote exec](docs/guides/runtime-exec.md)
 
 ## Development
 

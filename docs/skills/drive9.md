@@ -155,9 +155,11 @@ Use `grep` to find files by what they contain. Use `find` to find files by name,
 
 ### Extract/embed task status
 
-`drive9 fs tasks <path>` reports the extract/embed pipeline state for a file's current revision: one entry per applicable task type (`embed`, `img_extract_text`, `audio_extract_text`, `video_extract_visual`). Status is one of `queued`, `processing`, `succeeded`, or `failed` (the server maps its internal terminal `dead_lettered` state to `failed`). A `last_error` appears when a task failed; a retryable failure stays `queued` and can carry a `last_error` while it is retried.
+`drive9 fs tasks <path>` reports the extract/embed pipeline state for a file's current revision: one entry per applicable task type (`embed`, `img_extract_text`, `audio_extract_text`, `video_extract_visual`). Status is one of `queued`, `processing`, `succeeded`, `failed`, or `pending` (the server maps its internal terminal `dead_lettered` state to `failed`). A `last_error` appears when a task failed; a retryable failure stays `queued` and can carry a `last_error` while it is retried. A `pending` task is not admitted yet: it waits on an operator-controlled condition such as a quota or a missing extraction config, and its `pending_reason` names that condition, which tells "not yet" apart from a failure.
 
-Text output always prints the `TASK_TYPE  STATUS  LAST_ERROR` header and one row per task, so an empty result prints the header alone. `-o json` emits `{"path": ..., "tasks": []}`. Task status is drive9-only; object-store URIs are rejected.
+Each row also reports the LLM usage the task consumed: `N calls, INPUT/OUTPUT tok`, plus `, Ds audio` when an audio provider reported a duration. Usage accumulates across attempts and covers failed and still-running tasks, because it is persisted at provider-call time rather than only on success, so treat it as consumed spend and not as proof the task finished. A `-` means the server does not report usage at all.
+
+Text output always prints the `TASK_TYPE  STATUS  USAGE  PENDING_REASON  LAST_ERROR` header and one row per task, so an empty result prints the header alone. `-o json` emits `{"path": ..., "tasks": []}` with the full `usage` object per task. Task status is drive9-only; object-store URIs are rejected.
 
 On a server older than this command, `fs tasks` returns an error matching `ErrFileTasksUnsupported` (`file tasks: server does not support fs tasks (?tasks)`) instead of an empty list; upgrade the server to use the command.
 
@@ -174,7 +176,7 @@ drive9 fs tasks -o json :/docs/report.pdf
 | `fs ls -l` | tab-separated: `type  size  name` (type: `d` or `-`) |
 | `fs cat` | raw file content to stdout |
 | `fs stat` | key-value metadata; use `-o json` for JSON |
-| `fs tasks` | aligned columns: `TASK_TYPE  STATUS  LAST_ERROR` (header always printed); use `-o json` for JSON |
+| `fs tasks` | aligned columns: `TASK_TYPE  STATUS  USAGE  PENDING_REASON  LAST_ERROR` (header always printed); use `-o json` for the full `usage` object |
 | `fs grep` | tab-separated: `path  score` per match |
 | `fs find` | one path per line |
 

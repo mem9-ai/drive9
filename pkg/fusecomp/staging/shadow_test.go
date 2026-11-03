@@ -1,0 +1,1781 @@
+package staging
+
+import (
+	"github.com/mem9-ai/drive9/pkg/fusecomp/writebuffer"
+
+	"bytes"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"syscall"
+	"testing"
+	"time"
+)
+
+func TestShadowStoreWriteExtentsReadAt(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Create a write buffer with some dirty data.
+	wb := writebuffer.NewWriteBuffer("/test/file.txt", 0, 0)
+	_, _ = wb.Write(0, []byte("hello world"))
+
+	// Write extents to shadow.
+	if err := ss.WriteExtents("/test/file.txt", wb, 42); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify size.
+	if sz := ss.Size("/test/file.txt"); sz != 11 {
+		t.Errorf("size = %d, want 11", sz)
+	}
+
+	// Read back.
+	buf := make([]byte, 11)
+	n, err := ss.ReadAt("/test/file.txt", 0, buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 11 {
+		t.Errorf("read n = %d, want 11", n)
+	}
+	if !bytes.Equal(buf, []byte("hello world")) {
+		t.Errorf("data = %q, want %q", buf, "hello world")
+	}
+
+	// Verify base rev.
+	if rev := ss.BaseRev("/test/file.txt"); rev != 42 {
+		t.Errorf("baseRev = %d, want 42", rev)
+	}
+}
+
+func TestShadowStorePartialWrite(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Write buffer with data in two separate parts.
+	wb := writebuffer.NewWriteBuffer("/partial.txt", 0, 1024) // 1KB part size
+	_, _ = wb.Write(0, bytes.Repeat([]byte("A"), 1024))       // Part 0 — full
+	_, _ = wb.Write(1024, bytes.Repeat([]byte("B"), 500))     // Part 1 — partial
+
+	if err := ss.WriteExtents("/partial.txt", wb, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	// Read part 0.
+	buf0 := make([]byte, 1024)
+	n, _ := ss.ReadAt("/partial.txt", 0, buf0)
+	if n != 1024 {
+		t.Errorf("read n = %d, want 1024", n)
+	}
+	if !bytes.Equal(buf0, bytes.Repeat([]byte("A"), 1024)) {
+		t.Error("part 0 data mismatch")
+	}
+
+	// Read part 1.
+	buf1 := make([]byte, 500)
+	n, _ = ss.ReadAt("/partial.txt", 1024, buf1)
+	if n != 500 {
+		t.Errorf("read n = %d, want 500", n)
+	}
+	if !bytes.Equal(buf1, bytes.Repeat([]byte("B"), 500)) {
+		t.Error("part 1 data mismatch")
+	}
+}
+
+func TestShadowStoreRemove(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	wb := writebuffer.NewWriteBuffer("/remove.txt", 0, 0)
+	_, _ = wb.Write(0, []byte("data"))
+	_ = ss.WriteExtents("/remove.txt", wb, 1)
+
+	if !ss.Has("/remove.txt") {
+		t.Error("expected shadow file to exist")
+	}
+
+	ss.Remove("/remove.txt")
+
+	if ss.Has("/remove.txt") {
+		t.Error("expected shadow file to be removed")
+	}
+}
+
+func TestShadowStoreRename(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	wb := writebuffer.NewWriteBuffer("/old.txt", 0, 0)
+	_, _ = wb.Write(0, []byte("renamed"))
+	_ = ss.WriteExtents("/old.txt", wb, 1)
+
+	ok := ss.Rename("/old.txt", "/new.txt")
+	if !ok {
+		t.Fatal("expected rename to succeed")
+	}
+
+	if ss.Has("/old.txt") {
+		t.Error("expected old path to be gone")
+	}
+
+	buf := make([]byte, 7)
+	n, err := ss.ReadAt("/new.txt", 0, buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 7 || !bytes.Equal(buf, []byte("renamed")) {
+		t.Errorf("read after rename = %q, want %q", buf[:n], "renamed")
+	}
+}
+
+func TestShadowStoreReadAll(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	wb := writebuffer.NewWriteBuffer("/readall.txt", 0, 0)
+	_, _ = wb.Write(0, []byte("full content"))
+	_ = ss.WriteExtents("/readall.txt", wb, 1)
+
+	data, err := ss.ReadAll("/readall.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(data, []byte("full content")) {
+		t.Errorf("ReadAll = %q, want %q", data, "full content")
+	}
+}
+
+func TestShadowStoreCheckDiskSpace(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Just verify the function doesn't panic.
+	_ = ss.CheckDiskSpace()
+}
+
+func TestShadowStorePinUnpinRemove(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Write some data.
+	wb := writebuffer.NewWriteBuffer("/pinned.txt", 0, 0)
+	_, _ = wb.Write(0, []byte("pinned data"))
+	_ = ss.WriteExtents("/pinned.txt", wb, 1)
+
+	// Pin the path — get generation token.
+	gen := ss.Pin("/pinned.txt")
+	if gen == 0 {
+		t.Fatal("expected non-zero generation token from Pin")
+	}
+
+	// Remove while pinned — shadow is retired (removed from active files
+	// but fd stays alive for the pinned reader).
+	ss.Remove("/pinned.txt")
+
+	// Active Has returns false (retired shadows are not active).
+	if ss.Has("/pinned.txt") {
+		t.Fatal("expected Has to return false after retire")
+	}
+
+	// ReadAtGen should work on the retired shadow.
+	buf := make([]byte, 11)
+	n, err := ss.ReadAtGen(gen, 0, buf)
+	if err != nil {
+		t.Fatalf("ReadAtGen on retired shadow: %v", err)
+	}
+	if n != 11 || !bytes.Equal(buf[:n], []byte("pinned data")) {
+		t.Errorf("ReadAtGen data = %q, want %q", buf[:n], "pinned data")
+	}
+
+	// SizeGen should return the retired size.
+	if sz := ss.SizeGen(gen); sz != 11 {
+		t.Errorf("SizeGen = %d, want 11", sz)
+	}
+
+	// Unpin — should trigger retired cleanup.
+	ss.Unpin(gen)
+
+	// ReadAtGen should fail after Unpin.
+	_, err = ss.ReadAtGen(gen, 0, buf)
+	if err == nil {
+		t.Error("expected ReadAtGen to fail after Unpin")
+	}
+
+	// SizeGen should return -1 after Unpin.
+	if sz := ss.SizeGen(gen); sz != -1 {
+		t.Errorf("SizeGen after Unpin = %d, want -1", sz)
+	}
+}
+
+func TestShadowStoreFinalUnpinWaitsForRetiredRename(t *testing.T) {
+	ss, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+	if err := ss.WriteFull("/retire-race", []byte("shadow"), 1); err != nil {
+		t.Fatal(err)
+	}
+	gen := ss.Pin("/retire-race")
+	pl := ss.acquirePathLock("/retire-race")
+	ss.mu.Lock()
+	cleanup, ok := ss.removeCoreLocked("/retire-race", 0, shadowRetiredInvalidated)
+	ss.mu.Unlock()
+	if !ok || !cleanup.retire {
+		ss.releasePathLock("/retire-race", pl)
+		t.Fatal("fixture did not retire pinned shadow")
+	}
+
+	unpinDone := make(chan struct{})
+	go func() {
+		ss.Unpin(gen)
+		close(unpinDone)
+	}()
+	select {
+	case <-unpinDone:
+		ss.releasePathLock("/retire-race", pl)
+		t.Fatal("final unpin completed before retired shadow rename")
+	case <-time.After(20 * time.Millisecond):
+	}
+	ss.runRemoveCleanup(cleanup)
+	ss.releasePathLock("/retire-race", pl)
+	select {
+	case <-unpinDone:
+	case <-time.After(time.Second):
+		t.Fatal("final unpin remained blocked after retired shadow rename")
+	}
+	if _, err := os.Stat(cleanup.retiredPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("retired shadow stat = %v, want not exist", err)
+	}
+}
+
+func TestShadowStorePinMultipleReaders(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	wb := writebuffer.NewWriteBuffer("/multi.txt", 0, 0)
+	_, _ = wb.Write(0, []byte("multi"))
+	_ = ss.WriteExtents("/multi.txt", wb, 1)
+
+	// Two pins (same generation).
+	gen1 := ss.Pin("/multi.txt")
+	gen2 := ss.Pin("/multi.txt")
+	if gen1 != gen2 {
+		t.Fatalf("expected same generation, got %d vs %d", gen1, gen2)
+	}
+
+	ss.Remove("/multi.txt")
+
+	// First unpin — still one ref on the retired entry.
+	ss.Unpin(gen1)
+	// Retired shadow exists but Has returns false (not active).
+	if ss.Has("/multi.txt") {
+		t.Fatal("expected Has to return false after retire")
+	}
+
+	// Second unpin — retired shadow cleaned up.
+	ss.Unpin(gen2)
+}
+
+func TestShadowStoreRemoveWithoutPin(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	wb := writebuffer.NewWriteBuffer("/nopins.txt", 0, 0)
+	_, _ = wb.Write(0, []byte("data"))
+	_ = ss.WriteExtents("/nopins.txt", wb, 1)
+
+	// Remove without pin — should remove immediately.
+	ss.Remove("/nopins.txt")
+	if ss.Has("/nopins.txt") {
+		t.Error("expected immediate removal when not pinned")
+	}
+}
+
+func TestShadowStoreRenamePinState(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	wb := writebuffer.NewWriteBuffer("/before.txt", 0, 0)
+	_, _ = wb.Write(0, []byte("rename"))
+	_ = ss.WriteExtents("/before.txt", wb, 1)
+
+	gen := ss.Pin("/before.txt")
+	ok := ss.Rename("/before.txt", "/after.txt")
+	if !ok {
+		t.Fatal("rename failed")
+	}
+
+	// Remove while pinned under new name — retires the shadow.
+	ss.Remove("/after.txt")
+	if ss.Has("/after.txt") {
+		t.Fatal("expected Has to return false after retire")
+	}
+
+	// Unpin triggers retired cleanup.
+	ss.Unpin(gen)
+}
+
+func TestShadowStoreRenameReplacesDestinationGeneration(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	dst := writebuffer.NewWriteBuffer("/final.txt", 0, 0)
+	_, _ = dst.Write(0, []byte("old-final"))
+	if err := ss.WriteExtents("/final.txt", dst, 1); err != nil {
+		t.Fatal(err)
+	}
+	oldGen := ss.Pin("/final.txt")
+	ss.Unpin(oldGen)
+
+	src := writebuffer.NewWriteBuffer("/tmp.txt", 0, 0)
+	_, _ = src.Write(0, []byte("new-final"))
+	if err := ss.WriteExtents("/tmp.txt", src, 2); err != nil {
+		t.Fatal(err)
+	}
+
+	if !ss.Rename("/tmp.txt", "/final.txt") {
+		t.Fatal("rename failed")
+	}
+
+	newGen, ok := ss.PinIfExists("/final.txt")
+	if !ok {
+		t.Fatal("expected renamed destination to be pinnable")
+	}
+	if newGen == oldGen {
+		t.Fatalf("renamed destination reused stale generation %d", oldGen)
+	}
+	buf := make([]byte, len("new-final"))
+	n, err := ss.ReadAtGen(newGen, 0, buf)
+	if err != nil {
+		t.Fatalf("ReadAtGen renamed destination: %v", err)
+	}
+	if n != len(buf) || !bytes.Equal(buf[:n], []byte("new-final")) {
+		t.Fatalf("ReadAtGen renamed destination = %q, want new-final", buf[:n])
+	}
+	ss.Unpin(newGen)
+}
+
+func TestShadowStoreRenameFailureRollbackPinState(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	wb := writebuffer.NewWriteBuffer("/rollback.txt", 0, 0)
+	_, _ = wb.Write(0, []byte("data"))
+	_ = ss.WriteExtents("/rollback.txt", wb, 1)
+
+	gen := ss.Pin("/rollback.txt")
+
+	// Delete the on-disk shadow file to force os.Rename failure.
+	sp := ss.shadowPath("/rollback.txt")
+	_ = os.Remove(sp)
+
+	ok := ss.Rename("/rollback.txt", "/target.txt")
+	if ok {
+		t.Fatal("expected rename to fail when disk file is missing")
+	}
+
+	// Generation should still be valid on old path.
+	// Remove retires, then Unpin cleans up.
+	ss.Remove("/rollback.txt")
+	ss.Unpin(gen)
+}
+
+func TestShadowStorePinIfExists(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// PinIfExists on a non-existent path should return false.
+	if _, ok := ss.PinIfExists("/missing.txt"); ok {
+		t.Fatal("expected PinIfExists to return false for missing path")
+	}
+
+	// Write some data.
+	wb := writebuffer.NewWriteBuffer("/exists.txt", 0, 0)
+	_, _ = wb.Write(0, []byte("data"))
+	_ = ss.WriteExtents("/exists.txt", wb, 1)
+
+	// PinIfExists on an existing path should return true.
+	gen, ok := ss.PinIfExists("/exists.txt")
+	if !ok {
+		t.Fatal("expected PinIfExists to return true for existing path")
+	}
+
+	// Remove while pinned — retires shadow.
+	ss.Remove("/exists.txt")
+	if ss.Has("/exists.txt") {
+		t.Fatal("expected Has to return false after retire")
+	}
+
+	// Unpin triggers retired cleanup.
+	ss.Unpin(gen)
+}
+
+func TestShadowStoreRemovePreventsPin(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	wb := writebuffer.NewWriteBuffer("/race.txt", 0, 0)
+	_, _ = wb.Write(0, []byte("data"))
+	_ = ss.WriteExtents("/race.txt", wb, 1)
+
+	// Remove with no pins — should delete immediately.
+	ss.Remove("/race.txt")
+
+	// PinIfExists after removal must return false.
+	if _, ok := ss.PinIfExists("/race.txt"); ok {
+		t.Fatal("expected PinIfExists to return false after Remove")
+	}
+}
+
+// TestShadowStoreRetireAllowsNewWriter verifies that after Remove retires a
+// pinned shadow, a new writer can create a fresh shadow at the same path
+// without interfering with the retired reader, and the retired reader's Unpin
+// does not affect the new shadow.
+func TestShadowStoreRetireAllowsNewWriter(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Old writer creates shadow.
+	wb1 := writebuffer.NewWriteBuffer("/file.txt", 0, 0)
+	_, _ = wb1.Write(0, []byte("old data"))
+	_ = ss.WriteExtents("/file.txt", wb1, 1)
+
+	// Reader pins it.
+	gen := ss.Pin("/file.txt")
+
+	// Commit queue succeeds, retires the shadow.
+	ss.Remove("/file.txt")
+
+	// New writer creates fresh shadow at same path.
+	wb2 := writebuffer.NewWriteBuffer("/file.txt", 0, 0)
+	_, _ = wb2.Write(0, []byte("new data!!!"))
+	if err := ss.WriteExtents("/file.txt", wb2, 2); err != nil {
+		t.Fatal(err)
+	}
+
+	// New shadow is readable.
+	buf := make([]byte, 11)
+	n, err := ss.ReadAt("/file.txt", 0, buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(buf[:n], []byte("new data!!!")) {
+		t.Errorf("new shadow data = %q, want %q", buf[:n], "new data!!!")
+	}
+
+	// Old reader unpins — should NOT delete the new shadow.
+	ss.Unpin(gen)
+
+	// New shadow must still exist.
+	if !ss.Has("/file.txt") {
+		t.Fatal("expected new shadow to survive old reader's Unpin")
+	}
+	buf2 := make([]byte, 11)
+	n2, err := ss.ReadAt("/file.txt", 0, buf2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(buf2[:n2], []byte("new data!!!")) {
+		t.Errorf("new shadow data after unpin = %q, want %q", buf2[:n2], "new data!!!")
+	}
+}
+
+// TestShadowStoreReadAtGenActive verifies that ReadAtGen and SizeGen work
+// for active (not yet retired) generations, covering the transition window
+// where Remove hasn't been called yet.
+func TestShadowStoreReadAtGenActive(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	wb := writebuffer.NewWriteBuffer("/active.txt", 0, 0)
+	_, _ = wb.Write(0, []byte("active data"))
+	_ = ss.WriteExtents("/active.txt", wb, 1)
+
+	gen := ss.Pin("/active.txt")
+
+	// SizeGen should work while shadow is still active (not retired).
+	if sz := ss.SizeGen(gen); sz != 11 {
+		t.Errorf("SizeGen on active gen = %d, want 11", sz)
+	}
+
+	// ReadAtGen should work while shadow is still active.
+	buf := make([]byte, 11)
+	n, err := ss.ReadAtGen(gen, 0, buf)
+	if err != nil {
+		t.Fatalf("ReadAtGen on active gen: %v", err)
+	}
+	if n != 11 || !bytes.Equal(buf, []byte("active data")) {
+		t.Errorf("ReadAtGen data = %q, want %q", buf[:n], "active data")
+	}
+
+	ss.Unpin(gen)
+}
+
+func TestShadowStoreUnpinZeroNoop(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Unpin(0) should be a no-op and not panic.
+	ss.Unpin(0)
+}
+
+// TestShadowStorePinIfExistsDiskOnly verifies that PinIfExists loads a shadow
+// file from disk when it is not in the in-memory files map (e.g. after
+// crash/restart recovery where pending shadows exist on disk only).
+func TestShadowStorePinIfExistsDiskOnly(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Write shadow data and then remove from in-memory map only (simulate
+	// crash recovery: disk file exists, files map does not).
+	wb := writebuffer.NewWriteBuffer("/disk-only.txt", 0, 0)
+	_, _ = wb.Write(0, []byte("disk data"))
+	_ = ss.WriteExtents("/disk-only.txt", wb, 1)
+
+	// Remove from in-memory map without deleting disk file.
+	ss.mu.Lock()
+	sf := ss.files["/disk-only.txt"]
+	_ = sf.fd.Close()
+	delete(ss.files, "/disk-only.txt")
+	ss.mu.Unlock()
+
+	// PinIfExists should load from disk and succeed.
+	gen, ok := ss.PinIfExists("/disk-only.txt")
+	if !ok {
+		t.Fatal("expected PinIfExists to load from disk and return true")
+	}
+	if gen == 0 {
+		t.Fatal("expected non-zero generation token")
+	}
+
+	// Read via generation should work.
+	buf := make([]byte, 9)
+	n, err := ss.ReadAtGen(gen, 0, buf)
+	if err != nil {
+		t.Fatalf("ReadAtGen after disk load: %v", err)
+	}
+	if n != 9 || !bytes.Equal(buf[:n], []byte("disk data")) {
+		t.Errorf("data = %q, want %q", buf[:n], "disk data")
+	}
+
+	ss.Unpin(gen)
+}
+
+// TestShadowStoreRemoveDiskOnly verifies that Remove cleans up a shadow file
+// that exists only on disk (not in the files map). This covers the recovery
+// scenario where commit queue uploads a disk-only shadow and then calls Remove.
+func TestShadowStoreRemoveDiskOnly(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Write a shadow and then remove it from in-memory map only.
+	wb := writebuffer.NewWriteBuffer("/disk-rm.txt", 0, 0)
+	_, _ = wb.Write(0, []byte("stale"))
+	_ = ss.WriteExtents("/disk-rm.txt", wb, 1)
+
+	// Simulate disk-only state: close fd, remove from files map.
+	ss.mu.Lock()
+	sf := ss.files["/disk-rm.txt"]
+	_ = sf.fd.Close()
+	delete(ss.files, "/disk-rm.txt")
+	ss.mu.Unlock()
+
+	// Verify shadow is visible on disk via Has().
+	if !ss.Has("/disk-rm.txt") {
+		t.Fatal("expected disk-only shadow to be visible via Has")
+	}
+
+	// Remove should clean up the disk file even though files map is empty.
+	ss.Remove("/disk-rm.txt")
+
+	// Has() should no longer find it.
+	if ss.Has("/disk-rm.txt") {
+		t.Fatal("expected disk-only shadow to be cleaned up after Remove")
+	}
+}
+
+func TestShadowStoreCheckDiskSpaceThrottled(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// First call should run the real check and cache result.
+	r1 := ss.CheckDiskSpaceThrottled()
+
+	// Second call within the interval should return cached result without syscall.
+	r2 := ss.CheckDiskSpaceThrottled()
+	if r1 != r2 {
+		t.Fatalf("throttled results differ: %v vs %v", r1, r2)
+	}
+
+	// Verify initial diskOK state matches the real check.
+	if r1 != ss.CheckDiskSpace() {
+		t.Fatal("throttled result does not match real check")
+	}
+}
+
+// TestNewShadowStoreSweepsRetiredFiles verifies that retired shadows leaked
+// by a crashed process (pinned readers never unpinned) are removed at store
+// construction, while live .shadow files are preserved.
+func TestNewShadowStoreSweepsRetiredFiles(t *testing.T) {
+	dir := t.TempDir()
+
+	ss, err := NewShadowStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ss.WriteFull("/keep.txt", []byte("keep"), 1); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a crash while a pinned reader held a retired shadow.
+	gen := ss.Pin("/keep.txt")
+	if gen == 0 {
+		t.Fatal("pin failed")
+	}
+	ss.Remove("/keep.txt") // pinned → retired on disk
+	if err := ss.WriteFull("/live.txt", []byte("live"), 1); err != nil {
+		t.Fatal(err)
+	}
+	ss.Close() // crash: Unpin never runs
+
+	leftover, err := filepath.Glob(filepath.Join(dir, "*.retired.*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(leftover) != 1 {
+		t.Fatalf("test setup: expected 1 leaked retired file, got %d", len(leftover))
+	}
+
+	// "Remount": construction sweeps the leak, keeps live shadows.
+	ss2, err := NewShadowStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss2.Close()
+
+	leftover, err = filepath.Glob(filepath.Join(dir, "*.retired.*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(leftover) != 0 {
+		t.Errorf("retired files not swept: %v", leftover)
+	}
+	if !ss2.Has("/live.txt") {
+		t.Error("live shadow was swept")
+	}
+}
+
+// --- Write-back disk protection tests (Issue #651) ---
+
+func TestCheckWriteBackQuotaByteQuotaAllowed(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 1024) // 1KB quota, no free ratio
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Writing 500 bytes with 0 pending should succeed.
+	if err := ss.CheckWriteBackQuota(500); err != nil {
+		t.Fatalf("expected write to be allowed, got %v", err)
+	}
+}
+
+func TestCheckWriteBackQuotaByteQuotaExceeded(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 1024) // 1KB quota, no free ratio
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Write an 800-byte shadow file to accumulate pending bytes internally.
+	if err := ss.WriteFull("/big.txt", make([]byte, 800), 1); err != nil {
+		t.Fatal(err)
+	}
+
+	// Writing 300 more bytes (total 1100 > 1024) should be rejected.
+	err = ss.CheckWriteBackQuota(300)
+	if err != syscall.ENOSPC {
+		t.Fatalf("expected ENOSPC, got %v", err)
+	}
+}
+
+func TestCheckWriteBackQuotaByteQuotaDisabled(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0) // both disabled
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Write a large shadow file; with quota disabled, any further write should pass.
+	if err := ss.WriteFull("/big.txt", make([]byte, 10000), 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := ss.CheckWriteBackQuota(999999999); err != nil {
+		t.Fatalf("expected write to be allowed with quota disabled, got %v", err)
+	}
+}
+
+func TestCheckWriteBackQuotaFreeRatioAllowed(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0.10, 0) // 10% free ratio, no byte quota
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// A small write should succeed (test machine has > 10% free space).
+	if err := ss.CheckWriteBackQuota(1); err != nil {
+		t.Fatalf("expected small write to be allowed, got %v", err)
+	}
+}
+
+func TestCheckWriteBackQuotaFreeRatioExceeded(t *testing.T) {
+	dir := t.TempDir()
+	// Use a free ratio of 0.9999 so any write triggers rejection
+	// (the test machine would need 99.99% free space after the write).
+	ss, err := NewShadowStoreWithQuota(dir, 0.9999, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// A large write should fail because it can't keep 99.99% free.
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(dir, &stat); err != nil {
+		t.Skip("cannot statfs temp dir")
+	}
+	totalBytes := int64(stat.Blocks) * int64(stat.Bsize)
+	err = ss.CheckWriteBackQuota(totalBytes / 2)
+	if err != syscall.ENOSPC {
+		t.Fatalf("expected ENOSPC for large write with 99.99%% free ratio, got %v", err)
+	}
+}
+
+func TestCheckWriteBackQuotaFreeRatioDisabled(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0) // both disabled
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// With free ratio disabled, write should pass.
+	if err := ss.CheckWriteBackQuota(1 << 30); err != nil {
+		t.Fatalf("expected write allowed with free ratio disabled, got %v", err)
+	}
+}
+
+func TestPendingBytesWriteFullAndRemove(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Initial pending should be 0.
+	if p := ss.PendingBytes(); p != 0 {
+		t.Fatalf("expected initial pending 0, got %d", p)
+	}
+
+	// WriteFull should increase pending bytes.
+	if err := ss.WriteFull("/a.txt", make([]byte, 1000), 1); err != nil {
+		t.Fatal(err)
+	}
+	if p := ss.PendingBytes(); p != 1000 {
+		t.Fatalf("expected pending 1000 after write, got %d", p)
+	}
+
+	// Overwriting with a smaller file should decrease pending.
+	if err := ss.WriteFull("/a.txt", make([]byte, 600), 2); err != nil {
+		t.Fatal(err)
+	}
+	if p := ss.PendingBytes(); p != 600 {
+		t.Fatalf("expected pending 600 after overwrite, got %d", p)
+	}
+
+	// Remove should bring it back to 0.
+	ss.Remove("/a.txt")
+	if p := ss.PendingBytes(); p != 0 {
+		t.Fatalf("expected pending 0 after remove, got %d", p)
+	}
+}
+
+func TestRecoverPendingBytesFromDisk(t *testing.T) {
+	dir := t.TempDir()
+
+	// Manually create shadow files on disk to simulate a crash scenario
+	// where the in-memory ShadowStore state is lost.
+	if err := os.WriteFile(filepath.Join(dir, "aaa.shadow"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "bbb.shadow"), []byte("world!!"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a new store and recover pending bytes.
+	ss, err := NewShadowStoreWithQuota(dir, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	ss.RecoverPendingBytes()
+	// Should recover 5 + 7 = 12 bytes.
+	if p := ss.PendingBytes(); p != 12 {
+		t.Fatalf("expected recovered pending 12, got %d", p)
+	}
+}
+
+func TestByteQuotaRecoveryAfterCommitCleanup(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 100) // 100 byte quota
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Stage an 80-byte shadow file.
+	if err := ss.WriteFull("/file.txt", make([]byte, 80), 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := ss.CheckWriteBackQuota(30); err != syscall.ENOSPC {
+		t.Fatalf("expected ENOSPC when 80+30>100, got %v", err)
+	}
+
+	// Simulate commit cleanup: Remove releases pending bytes.
+	ss.Remove("/file.txt")
+
+	// Now writing 30 should succeed again.
+	if err := ss.CheckWriteBackQuota(30); err != nil {
+		t.Fatalf("expected write to succeed after cleanup, got %v", err)
+	}
+}
+
+func TestPendingBytesNoDoubleCount(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Write a 500-byte shadow file.
+	if err := ss.WriteFull("/f.txt", make([]byte, 500), 1); err != nil {
+		t.Fatal(err)
+	}
+	if p := ss.PendingBytes(); p != 500 {
+		t.Fatalf("expected pending 500, got %d", p)
+	}
+
+	// Overwrite the same path with 500 bytes again — pending must stay 500, not 1000.
+	if err := ss.WriteFull("/f.txt", make([]byte, 500), 2); err != nil {
+		t.Fatal(err)
+	}
+	if p := ss.PendingBytes(); p != 500 {
+		t.Fatalf("expected pending 500 after re-stage, got %d (double-count bug)", p)
+	}
+
+	// A third stage that grows the file to 700 should bring pending to 700.
+	if err := ss.WriteFull("/f.txt", make([]byte, 700), 3); err != nil {
+		t.Fatal(err)
+	}
+	if p := ss.PendingBytes(); p != 700 {
+		t.Fatalf("expected pending 700 after grow, got %d", p)
+	}
+
+	// Shrink back to 200.
+	if err := ss.WriteFull("/f.txt", make([]byte, 200), 4); err != nil {
+		t.Fatal(err)
+	}
+	if p := ss.PendingBytes(); p != 200 {
+		t.Fatalf("expected pending 200 after shrink, got %d", p)
+	}
+}
+
+func TestReStageNoFalseENOSPC(t *testing.T) {
+	dir := t.TempDir()
+	// Quota is 1000 bytes.
+	ss, err := NewShadowStoreWithQuota(dir, 0, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Write 800 bytes — within quota.
+	if err := ss.WriteFull("/f.txt", make([]byte, 800), 1); err != nil {
+		t.Fatalf("first write should succeed: %v", err)
+	}
+
+	// Re-stage same path with same 800 bytes — delta is 0, should NOT reject.
+	if err := ss.WriteFull("/f.txt", make([]byte, 800), 2); err != nil {
+		t.Fatalf("re-stage same size should succeed (delta=0): %v", err)
+	}
+
+	// Re-stage with 900 bytes — delta is 100, total 900 < 1000, should succeed.
+	if err := ss.WriteFull("/f.txt", make([]byte, 900), 3); err != nil {
+		t.Fatalf("re-stage with 100 byte growth should succeed: %v", err)
+	}
+
+	// Re-stage with 1100 bytes — delta is 200, total 1100 > 1000, should ENOSPC.
+	err = ss.WriteFull("/f.txt", make([]byte, 1100), 4)
+	if err != syscall.ENOSPC {
+		t.Fatalf("re-stage exceeding quota should ENOSPC, got %v", err)
+	}
+
+	// Pending should still be 900 (last successful write).
+	if p := ss.PendingBytes(); p != 900 {
+		t.Fatalf("expected pending 900 after rejected write, got %d", p)
+	}
+}
+
+func TestWriteStreamQuotaEnforcement(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 100) // 100 byte quota
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// WriteStream within quota should succeed.
+	origData := bytes.Repeat([]byte("A"), 50)
+	n, err := ss.WriteStream("/f.txt", bytes.NewReader(origData), 1)
+	if err != nil {
+		t.Fatalf("WriteStream within quota should succeed: %v", err)
+	}
+	if n != 50 {
+		t.Fatalf("expected 50 bytes written, got %d", n)
+	}
+	if p := ss.PendingBytes(); p != 50 {
+		t.Fatalf("expected pending 50, got %d", p)
+	}
+
+	// WriteStream exceeding quota should ENOSPC and preserve original shadow.
+	_, err = ss.WriteStream("/f.txt", bytes.NewReader(make([]byte, 200)), 2)
+	if err != syscall.ENOSPC {
+		t.Fatalf("WriteStream exceeding quota should ENOSPC, got %v", err)
+	}
+	// Pending should still be 50 (original shadow untouched).
+	if p := ss.PendingBytes(); p != 50 {
+		t.Fatalf("expected pending 50 after failed stream, got %d", p)
+	}
+	// Original content must be preserved.
+	data, err := ss.ReadAll("/f.txt")
+	if err != nil {
+		t.Fatalf("ReadAll after failed stream: %v", err)
+	}
+	if !bytes.Equal(data, origData) {
+		t.Fatalf("shadow content corrupted: got %d bytes of %q, want 50 bytes of 'A'", len(data), data[:1])
+	}
+}
+
+func TestWriteStreamPeakDiskBounded(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 100) // 100 byte quota
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Attempt to stream 200 bytes which exceeds the 100-byte quota.
+	// The incremental quota check should abort mid-stream so the temp
+	// file never reaches 200 bytes.
+	_, err = ss.WriteStream("/f.txt", bytes.NewReader(make([]byte, 200)), 1)
+	if err != syscall.ENOSPC {
+		t.Fatalf("expected ENOSPC, got %v", err)
+	}
+
+	// Verify no temp file residue.
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if filepath.Ext(e.Name()) == ".tmp" {
+			t.Fatalf("temp file residue found: %s", e.Name())
+		}
+	}
+
+	// pendingBytes should be 0 (nothing was committed).
+	if p := ss.PendingBytes(); p != 0 {
+		t.Fatalf("expected pending 0, got %d", p)
+	}
+}
+
+func TestWriteStreamReplacementChargesNetCoverage(t *testing.T) {
+	ss := newRuntimeQuotaStore(t, 100)
+	if _, err := ss.WriteStream("/f.txt", bytes.NewReader(make([]byte, 50)), 1); err != nil {
+		t.Fatal(err)
+	}
+	// The byte quota covers the active replacement, not both generations.
+	// Physical temporary-file protection remains the free-ratio guard's job.
+	want := bytes.Repeat([]byte("B"), 100)
+	if _, err := ss.WriteStream("/f.txt", bytes.NewReader(want), 2); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ss.ReadAll("/f.txt")
+	if err != nil || !bytes.Equal(got, want) || ss.quotaBytes.Load() != 100 || ss.PendingBytes() != 100 {
+		t.Fatalf("replacement: quota=%d logical=%d err=%v", ss.quotaBytes.Load(), ss.PendingBytes(), err)
+	}
+}
+
+func TestFreeRatioThrottledReEvaluatesCachedCapacity(t *testing.T) {
+	dir := t.TempDir()
+	// free-ratio=0.50 (50% must remain free); no byte quota.
+	ss, err := NewShadowStoreWithQuota(dir, 0.50, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Directly prime the cached Statfs values to simulate a known disk geometry.
+	// Simulated: 1000 bytes total, 600 bytes free (60% free).
+	ss.cachedFreeBytes.Store(600)
+	ss.cachedTotalBytes.Store(1000)
+	// Set lastDiskCheck to now so throttled path uses cached values.
+	ss.lastDiskCheck.Store(time.Now().UnixNano())
+
+	// Small requiredBytes=100: freeAfter=500, ratio=0.50 → pass (barely).
+	if err := ss.checkFreeRatioThrottled(100); err != nil {
+		t.Fatalf("small requiredBytes should pass: %v", err)
+	}
+
+	// Large requiredBytes=200: freeAfter=400, ratio=0.40 < 0.50 → ENOSPC.
+	// This verifies that cached capacity is re-evaluated with the new
+	// requiredBytes, not just returning the cached bool from the first check.
+	err = ss.checkFreeRatioThrottled(200)
+	if err != syscall.ENOSPC {
+		t.Fatalf("large requiredBytes should ENOSPC with cached capacity, got %v", err)
+	}
+}
+
+func TestEnsureHolesDoNotConsumeRuntimeQuota(t *testing.T) {
+	ss := newRuntimeQuotaStore(t, 100)
+	if err := ss.Ensure("/f.txt", 200, 1); err != nil {
+		t.Fatal(err)
+	}
+	if ss.PendingBytes() != 200 || ss.quotaBytes.Load() != 0 {
+		t.Fatalf("Ensure: logical=%d quota=%d", ss.PendingBytes(), ss.quotaBytes.Load())
+	}
+	if _, err := ss.WriteAt("/f.txt", 0, make([]byte, 80), 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ss.WriteAt("/f.txt", 80, make([]byte, 30), 1); err != syscall.ENOSPC {
+		t.Fatalf("fill hole beyond quota: %v", err)
+	}
+	if ss.PendingBytes() != 200 || ss.quotaBytes.Load() != 80 {
+		t.Fatalf("fill hole: logical=%d quota=%d", ss.PendingBytes(), ss.quotaBytes.Load())
+	}
+}
+
+// TestWriteAtSparseDoesNotPoisonByteQuota verifies that holes contribute only
+// to logical pendingBytes, while the runtime quota charges written coverage.
+func TestWriteAtSparseDoesNotPoisonByteQuota(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 100) // 100 byte quota, no free-ratio
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Sparse write: 1 byte at offset 1<<20 (1 MiB).
+	_, err = ss.WriteAt("/sparse.txt", 1<<20, []byte("a"), 1)
+	if err != nil {
+		t.Fatalf("sparse WriteAt should succeed: %v", err)
+	}
+
+	// Subsequent small append at the next offset should also succeed,
+	// not be rejected because the first write inflated pendingBytes.
+	_, err = ss.WriteAt("/sparse.txt", (1<<20)+1, []byte("b"), 1)
+	if err != nil {
+		t.Fatalf("append after sparse WriteAt should succeed: %v", err)
+	}
+}
+
+func TestCheckWriteBackQuotaThrottled(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0.10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// First call should run the real check.
+	err1 := ss.CheckWriteBackQuotaThrottled(1)
+
+	// Second call within interval should return cached result.
+	err2 := ss.CheckWriteBackQuotaThrottled(1)
+	if (err1 == nil) != (err2 == nil) {
+		t.Fatalf("throttled results differ: %v vs %v", err1, err2)
+	}
+}
+
+// TestRenamePendingBytesReplacesTarget verifies that Rename subtracts the
+// replaced target's size from pendingBytes.
+func TestRenamePendingBytesReplacesTarget(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Write src=5B, dst=3B.
+	if err := ss.WriteFull("/src", []byte("hello"), 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := ss.WriteFull("/dst", []byte("bye"), 1); err != nil {
+		t.Fatal(err)
+	}
+	if pb := ss.PendingBytes(); pb != 8 {
+		t.Fatalf("before rename: pendingBytes=%d, want 8", pb)
+	}
+
+	// Rename /src → /dst replaces the 3B dst shadow.
+	if !ss.Rename("/src", "/dst") {
+		t.Fatal("Rename returned false")
+	}
+	if pb := ss.PendingBytes(); pb != 5 {
+		t.Fatalf("after rename: pendingBytes=%d, want 5", pb)
+	}
+}
+
+// TestWriteStreamConcurrentReadAt verifies no data race between WriteStream
+// and ReadAt on the same path. Run with -race to detect.
+func TestWriteStreamConcurrentReadAt(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Seed initial shadow.
+	if err := ss.WriteFull("/f", []byte("initial"), 1); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	// Concurrent reader.
+	go func() {
+		defer close(done)
+		buf := make([]byte, 64)
+		for i := 0; i < 200; i++ {
+			_, _ = ss.ReadAt("/f", 0, buf)
+		}
+	}()
+	// Concurrent writer.
+	for i := 0; i < 50; i++ {
+		data := bytes.Repeat([]byte("x"), i+1)
+		_, _ = ss.WriteStream("/f", bytes.NewReader(data), int64(i+2))
+	}
+	<-done
+}
+
+// TestWriteStreamConcurrentReadAtGen verifies no data race between WriteStream
+// and ReadAtGen on a pinned active generation. Run with -race to detect.
+func TestWriteStreamConcurrentReadAtGen(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Seed initial shadow and pin it.
+	if err := ss.WriteFull("/f", []byte("initial"), 1); err != nil {
+		t.Fatal(err)
+	}
+	gen := ss.Pin("/f")
+	defer ss.Unpin(gen)
+
+	done := make(chan struct{})
+	// Concurrent reader via pinned generation.
+	go func() {
+		defer close(done)
+		buf := make([]byte, 64)
+		for i := 0; i < 200; i++ {
+			_, _ = ss.ReadAtGen(gen, 0, buf)
+		}
+	}()
+	// Concurrent writer.
+	for i := 0; i < 50; i++ {
+		data := bytes.Repeat([]byte("x"), i+1)
+		_, _ = ss.WriteStream("/f", bytes.NewReader(data), int64(i+2))
+	}
+	<-done
+}
+
+// v1 asserted these through MountOptions.setDefaults; the byte-quota
+// conversion (MiB count -> bytes, negative disables) lives in
+// NewStagingWithQuota now, so the locks target the conversion directly.
+func TestStagingQuotaSizeMBConversion(t *testing.T) {
+	cases := []struct {
+		sizeMB    int64
+		wantBytes int64
+	}{
+		{1024, 1024 << 20},
+		{2048, 2048 << 20},
+		{-1, 0},
+		{0, 0},
+	}
+	for _, c := range cases {
+		s, err := NewStagingWithQuota(t.TempDir(), 0, c.sizeMB)
+		if err != nil {
+			t.Fatalf("sizeMB=%d: %v", c.sizeMB, err)
+		}
+		t.Cleanup(s.Close)
+		if s.Shadow.writeCacheMaxBytes != c.wantBytes {
+			t.Fatalf("sizeMB=%d -> quota=%d bytes, want %d", c.sizeMB, s.Shadow.writeCacheMaxBytes, c.wantBytes)
+		}
+	}
+}
+
+func TestDefaultByteQuotaEnforcesENOSPC(t *testing.T) {
+	dir := t.TempDir()
+	const defaultWriteCacheSizeMB = 1024 // v1 mount default
+	maxBytes := int64(defaultWriteCacheSizeMB) << 20
+	ss, err := NewShadowStoreWithQuota(dir, 0, maxBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Simulate pending bytes near the limit.
+	ss.quotaBytes.Store(maxBytes - 100)
+	oversize := bytes.Repeat([]byte("b"), 200)
+	err = ss.WriteFull("/over", oversize, 1)
+	if err != syscall.ENOSPC {
+		t.Fatalf("err=%v, want ENOSPC when exceeding default 1GB quota", err)
+	}
+}
+
+func TestByteQuotaDisabledAllowsUnlimitedWrites(t *testing.T) {
+	dir := t.TempDir()
+	// Quota disabled (0 maxBytes).
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Even with a large runtime charge, writes succeed when quota is disabled.
+	ss.quotaBytes.Store(1 << 40)
+	data := bytes.Repeat([]byte("x"), 1024)
+	if err := ss.WriteFull("/unlimited", data, 1); err != nil {
+		t.Fatalf("write with disabled quota: err=%v, want nil", err)
+	}
+}
+
+func TestFreeRatioIndependentOfByteQuota(t *testing.T) {
+	dir := t.TempDir()
+	// Large byte quota (won't trigger), but very high free-ratio requirement.
+	ss, err := NewShadowStoreWithQuota(dir, 0.9999, 1<<40)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+	ss.lastDiskCheck.Store(0)
+	// Force fresh disk stats by writing.
+	data := bytes.Repeat([]byte("x"), 1024)
+	err = ss.WriteFull("/ratiotest", data, 1)
+	// On most disks, 99.99% free ratio will fail. If the disk actually has
+	// that much free space, the test is still valid — it just shows both
+	// guards are evaluated independently.
+	if err == syscall.ENOSPC {
+		// Free-ratio guard triggered independently of byte quota — correct.
+		return
+	}
+	t.Logf("free-ratio guard did not trigger (disk has >99.99%% free): err=%v; this is acceptable on large disks", err)
+}
+
+// TestShadowStoreRemoveIfGenerationRaceStaleVsNewerWrite exercises the
+// interleaving qiffang flagged: a stale RemoveIfGeneration(oldGen) racing with
+// a concurrent same-path WriteFull. After the newer write bumps writeGen, the
+// stale removal must never delete the newer shadow.
+//
+// We deterministically force the worst-case ordering: (1) snapshot the old gen,
+// (2) perform the newer WriteFull (bumping writeGen to N+1) and wait for it to
+// finish, (3) then call RemoveIfGeneration(oldGen). The atomic generation recheck
+// inside removeCoreLocked must observe the bumped gen and refuse the removal,
+// so the newer shadow survives.
+func TestShadowStoreRemoveIfGenerationRaceStaleVsNewerWrite(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	const path = "/race/file.txt"
+	if err := ss.WriteFull(path, []byte("original"), 0); err != nil {
+		t.Fatal(err)
+	}
+	newest := []byte("newer-content")
+
+	// Snapshot the OLD generation (as the uploader would at upload start).
+	oldGen := ss.ActiveGeneration(path)
+	if oldGen == 0 {
+		t.Fatal("expected nonzero generation after initial WriteFull")
+	}
+
+	// Simulate a concurrent same-path write that bumps writeGen to N+1.
+	if err := ss.WriteFull(path, newest, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// The stale remote completion now calls RemoveIfGeneration with the OLD gen.
+	// The atomic recheck must observe N+1 and refuse, preserving the newer entry.
+	if ss.RemoveIfGeneration(path, oldGen) {
+		t.Fatal("stale RemoveIfGeneration(oldGen) must not succeed after a newer write bumped the generation")
+	}
+	if !ss.Has(path) {
+		t.Fatal("newer shadow must survive stale RemoveIfGeneration")
+	}
+
+	// Content must be the newer data, not corrupted/removed.
+	got, err := ss.ReadAll(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, newest) {
+		t.Fatalf("content = %q, want %q (newer content must survive)", got, newest)
+	}
+}
+
+func TestShadowStoreEnsureActiveGenerationKeepsExistingBaseRevision(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	const path = "/base-rev.txt"
+	if err := ss.WriteFull(path, []byte("payload"), 7); err != nil {
+		t.Fatal(err)
+	}
+	gen := ss.ActiveGeneration(path)
+	if gen == 0 {
+		t.Fatal("expected nonzero active generation")
+	}
+	if got := ss.BaseRev(path); got != 7 {
+		t.Fatalf("initial base revision = %d, want 7", got)
+	}
+
+	if gotGen := ss.EnsureActiveGeneration(path); gotGen != gen {
+		t.Fatalf("EnsureActiveGeneration returned gen %d, want existing gen %d", gotGen, gen)
+	}
+	if got := ss.BaseRev(path); got != 7 {
+		t.Fatalf("base revision after EnsureActiveGeneration = %d, want existing 7", got)
+	}
+
+	const recoveredPath = "/recovered-base-rev.txt"
+	if err := os.WriteFile(ss.shadowPath(recoveredPath), []byte("recovered"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	recoveredGen := ss.EnsureActiveGeneration(recoveredPath)
+	if recoveredGen == 0 {
+		t.Fatal("expected recovered shadow to get an active generation")
+	}
+	if got := ss.BaseRev(recoveredPath); got != 0 {
+		t.Fatalf("recovered base revision = %d, want unknown (0)", got)
+	}
+}
+
+// TestShadowStoreRemoveIfGenerationWriteFullRaceConsistency races replacement
+// WriteFulls against a stale-generation removal and asserts that whenever an
+// active shadow generation exists, its disk file is present and readable.
+// Without per-path serialization, the stale remove can delete/rename the
+// replacement's fresh shadow after the in-memory generation check passed.
+func TestShadowStoreRemoveIfGenerationWriteFullRaceConsistency(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+	const p = "/race/file.txt"
+
+	if err := ss.WriteFull(p, []byte("stale"), 0); err != nil {
+		t.Fatal(err)
+	}
+	staleGen := ss.ActiveGeneration(p)
+	if staleGen == 0 {
+		t.Fatal("no active generation after WriteFull")
+	}
+
+	const racers = 8
+	const rounds = 100
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < rounds; i++ {
+			ss.RemoveIfGeneration(p, staleGen)
+		}
+	}()
+	for r := 0; r < racers; r++ {
+		wg.Add(1)
+		go func(r int) {
+			defer wg.Done()
+			for i := 0; i < rounds; i++ {
+				if err := ss.WriteFull(p, []byte("gen"), 0); err != nil {
+					t.Errorf("WriteFull: %v", err)
+					return
+				}
+			}
+		}(r)
+	}
+	wg.Wait()
+
+	if gen := ss.ActiveGeneration(p); gen != 0 {
+		if _, err := ss.ReadAll(p); err != nil {
+			t.Fatalf("active generation %d present but shadow unreadable: %v", gen, err)
+		}
+		if _, err := os.Stat(ss.shadowPath(p)); err != nil {
+			t.Fatalf("active generation %d present but disk file missing: %v", gen, err)
+		}
+	}
+}
+
+// TestShadowStoreTwoPathLocksReverseOrder is the ShadowStore counterpart of
+// TestPendingIndexTwoPathLocksReverseOrder: a reverse-lexicographic
+// acquire/release pair must not split one path into two live mutexes.
+func TestShadowStoreTwoPathLocksReverseOrder(t *testing.T) {
+	ss, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	pla, plb := ss.acquireTwoPathLocks("/z", "/a")
+
+	waiterHeld := make(chan *shadowPathLock, 1)
+	waiterDone := make(chan struct{})
+	go func() {
+		defer close(waiterDone)
+		pl := ss.acquirePathLock("/a")
+		waiterHeld <- pl
+		time.Sleep(150 * time.Millisecond)
+		ss.releasePathLock("/a", pl)
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		ss.mu.Lock()
+		pl, ok := ss.pathLocks["/a"]
+		waiters := 0
+		if ok {
+			waiters = pl.waiters
+		}
+		ss.mu.Unlock()
+		if ok && waiters >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("waiter never queued on /a path lock")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	ss.releaseTwoPathLocks("/z", "/a", pla, plb)
+
+	select {
+	case <-waiterHeld:
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiter did not acquire /a lock after pair release")
+	}
+
+	secondAcquired := make(chan struct{})
+	go func() {
+		pl := ss.acquirePathLock("/a")
+		close(secondAcquired)
+		ss.releasePathLock("/a", pl)
+	}()
+	select {
+	case <-secondAcquired:
+		t.Fatal("second acquirer entered /a while the waiter still held it — path split into two locks")
+	case <-time.After(50 * time.Millisecond):
+	}
+	<-waiterDone
+	select {
+	case <-secondAcquired:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second acquirer never entered /a after waiter released")
+	}
+}
+
+func TestShadowResidentPinRejectsOldRevisionWithoutRemovingStaging(t *testing.T) {
+	ss, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(ss.Close)
+	const path = "/resident-wal"
+	if err := ss.WriteFull(path, []byte("old image"), 3); err != nil {
+		t.Fatal(err)
+	}
+	oldPin, ok := ss.PinResident(path, 3)
+	if !ok {
+		t.Fatal("current revision cannot be pinned")
+	}
+	defer ss.Unpin(oldPin)
+	// An Ensure at a higher revision cannot certify the untouched bytes.
+	if err := ss.Ensure(path, 9, 4); err != nil {
+		t.Fatal(err)
+	}
+	generation := ss.ActiveGeneration(path)
+	if pin, ok := ss.PinResident(path, 4); ok || pin != 0 {
+		t.Fatalf("pinned stale image: pin=%d ok=%t", pin, ok)
+	}
+	if info, err := os.Stat(ss.shadowPath(path)); err != nil || info.Size() != 9 {
+		t.Fatalf("rejected pin removed/resized the staging path: info=%v err=%v", info, err)
+	}
+	if data, err := ss.ReadAllIfGeneration(path, generation); err != nil || string(data) != "old image" {
+		t.Fatalf("rejecting a read pin removed staging: data=%q err=%v", data, err)
+	}
+	buf := make([]byte, 9)
+	if n, err := ss.ReadAtGen(oldPin, 0, buf); err != nil || n != len(buf) || string(buf) != "old image" {
+		t.Fatalf("existing pin lost its independent lifetime: n=%d data=%q err=%v", n, buf, err)
+	}
+	if err := ss.WriteFull(path, []byte("new image"), 4); err != nil {
+		t.Fatal(err)
+	}
+	pin, ok := ss.PinResident(path, 4)
+	if !ok {
+		t.Fatal("fresh replacement could not be pinned")
+	}
+	defer ss.Unpin(pin)
+	if n, err := ss.ReadAtGen(pin, 0, buf); err != nil || n != len(buf) || string(buf) != "new image" {
+		t.Fatalf("fresh pin read n=%d data=%q err=%v", n, buf, err)
+	}
+}
+
+func TestShadowRecoveredGenerationIsNotRevisionVerified(t *testing.T) {
+	for _, recoverHash := range []bool{false, true} {
+		name := "disk"
+		if recoverHash {
+			name = "hash"
+		}
+		t.Run(name, func(t *testing.T) {
+			ss, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(ss.Close)
+			const path = "/recovered-wal"
+			if err := os.WriteFile(ss.shadowPath(path), []byte("recovered"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if recoverHash {
+				if err := ss.RecoverFromDisk(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			gen := ss.EnsureActiveGeneration(path)
+			if gen == 0 || ss.BaseRev(path) != 0 {
+				t.Fatal("generation minting asserted a content revision")
+			}
+			for _, revision := range []int64{0, 11} {
+				if pin, ok := ss.PinResident(path, revision); ok || pin != 0 {
+					t.Errorf("recovered bytes accepted as verified cache at revision %d", revision)
+				}
+			}
+			// Pending recovery can still bind/read the bytes using its own
+			// metadata authority, without promoting them into a clean cache.
+			pin, ok := ss.PinIfExists(path)
+			if !ok {
+				t.Fatal("recovery lost its staging source")
+			}
+			defer ss.Unpin(pin)
+			// v1 canReadGeneration: the pin must bind to the path's pending
+			// generation (not to some other retired image).
+			if pin != ss.ActiveGeneration(path) {
+				t.Fatal("pending authority and committed-cache proof were conflated")
+			}
+			if got, err := ss.ReadAllIfGeneration(path, gen); err != nil || string(got) != "recovered" {
+				t.Fatalf("recovery data=%q err=%v", got, err)
+			}
+			if info, err := os.Stat(ss.shadowPath(path)); err != nil || info.Size() != 9 {
+				t.Fatalf("recovery path lost: info=%v err=%v", info, err)
+			}
+		})
+	}
+}
+
+func TestShadowLocalNewRevisionZeroAuthority(t *testing.T) {
+	for _, route := range []string{"ensure", "full", "stream"} {
+		t.Run(route, func(t *testing.T) {
+			ss, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(ss.Close)
+			const path = "/new-wal"
+			switch route {
+			case "ensure":
+				err = ss.Ensure(path, 3, 0)
+			case "full":
+				err = ss.WriteFull(path, []byte("new"), 0)
+			case "stream":
+				_, err = ss.WriteStream(path, strings.NewReader("new"), 0)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			pin, ok := ss.PinResident(path, 0)
+			if !ok {
+				t.Fatal("initialized local new-file staging must be readable")
+			}
+			defer ss.Unpin(pin)
+			// v1 canReadGeneration(pin, 1, 0): staging must not answer reads
+			// once revision 1 is known committed (no pending generation).
+			if _, ok := ss.PinResident(path, 1); ok {
+				t.Fatal("new-file staging ignored a known committed revision")
+			}
+			if pin, ok := ss.PinResident(path, 1); ok {
+				ss.Unpin(pin)
+				t.Fatal("new-file staging can be repinned past a commit")
+			}
+		})
+	}
+}
+
+func TestShadowLocalInitializationDoesNotBlessRecoveredBytes(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		initial  string
+		mutate   func(*ShadowStore, string) error
+		readable bool
+	}{
+		{"empty-reset", "old bytes", func(s *ShadowStore, p string) error { return s.Ensure(p, 0, 0) }, true},
+		{"ensure-empty-zeros", "", func(s *ShadowStore, p string) error { return s.Ensure(p, 3, 0) }, true},
+		{"ensure-retains-bytes", "old bytes", func(s *ShadowStore, p string) error { return s.Ensure(p, 3, 0) }, false},
+		{"ensure-retains-prefix", "old", func(s *ShadowStore, p string) error { return s.Ensure(p, 9, 0) }, false},
+		{"partial-write", "old bytes", func(s *ShadowStore, p string) error {
+			_, err := s.WriteAt(p, 0, []byte("new"), 0)
+			return err
+		}, false},
+		{"empty-write", "", func(s *ShadowStore, p string) error {
+			_, err := s.WriteAt(p, 3, []byte("new"), 0)
+			return err
+		}, true},
+		{"sync-empty-recovery", "", func(s *ShadowStore, p string) error { return s.Sync(p) }, false},
+		{"full-replacement", "old bytes", func(s *ShadowStore, p string) error {
+			return s.WriteFull(p, []byte("new"), 0)
+		}, true},
+		{"stream-replacement", "old bytes", func(s *ShadowStore, p string) error {
+			_, err := s.WriteStream(p, strings.NewReader("new"), 0)
+			return err
+		}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(s.Close)
+			const path = "/file"
+			if err := os.WriteFile(s.shadowPath(path), []byte(tc.initial), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := tc.mutate(s, path); err != nil {
+				t.Fatal(err)
+			}
+			pin, ok := s.PinResident(path, 0)
+			if ok {
+				defer s.Unpin(pin)
+			}
+			if ok != tc.readable {
+				t.Fatalf("readable=%t, want %t", ok, tc.readable)
+			}
+			if pin, ok := s.PinResident(path, 1); ok {
+				s.Unpin(pin)
+				t.Fatal("revision-zero initialization overrode a known commit")
+			}
+		})
+	}
+}

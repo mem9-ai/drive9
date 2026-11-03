@@ -31,6 +31,37 @@ async function main() {
 main().catch(console.error);
 ```
 
+## Just Bash
+
+`Drive9Fs` implements Just Bash's filesystem interface and persists shell file
+operations through this SDK. Import it from the optional `drive9/just-bash`
+entry point; the main SDK does not load Just Bash.
+
+```typescript
+import { Bash, InMemoryFs, MountableFs } from "just-bash";
+import { Client } from "drive9";
+import { Drive9Fs } from "drive9/just-bash";
+
+const client = Client.defaultClient();
+const fs = new MountableFs({ base: new InMemoryFs() });
+// /agent-work/ must already exist on Drive9.
+fs.mount("/workspace", new Drive9Fs(client, { root: "/agent-work" }));
+const bash = new Bash({ fs, cwd: "/workspace" });
+
+await bash.exec('echo "persistent notes" > notes.txt');
+console.log((await bash.exec("cat notes.txt")).stdout);
+```
+
+Requires Node.js >=20.19 and Just Bash 3.6.x. From this checkout, run
+`npm install` and `npm run example:just-bash -- --cleanup` with
+`DRIVE9_SERVER` and `DRIVE9_API_KEY` set. The example creates a unique remote
+directory, verifies persistence across fresh runtimes, and removes it with
+`--cleanup`; omit that flag to retain the files.
+
+See the [integration guide](../../docs/guides/just-bash-integration.md) for
+capabilities, limitations, credentials, and test commands, and the
+[runnable example](examples/just-bash.mjs).
+
 ## Config auto-loading
 
 `Client.defaultClient()` reads `~/.drive9/config` automatically:
@@ -110,6 +141,47 @@ Environment variables `DRIVE9_SERVER` or `DRIVE9_BASE` and `DRIVE9_API_KEY` take
 | Grep | `await client.grep(query, prefix, limit)` |
 | Layer grep | `await client.grepWithLayer(query, prefix, limit, layerRef)` |
 | Find | `await client.find(prefix, params?)` |
+
+### Remote exec
+
+When the server enables it, `exec` runs a command in a sandbox with the
+workspace mounted at `/workspace` and streams its output:
+
+```typescript
+import { Client, isRuntimeBusy, isRuntimeOutcomeUnknown } from "drive9";
+
+const client = Client.defaultClient();
+try {
+  const result = await client.exec(
+    { command: "npm ci && npm test", workspace: { root: "/repo" } },
+    {
+      onStdout: chunk => process.stdout.write(chunk),
+      onStderr: chunk => process.stderr.write(chunk),
+    },
+  );
+  process.exitCode = result.exitCode; // nonzero is a normal result
+} catch (error) {
+  if (isRuntimeBusy(error)) {
+    // Nothing started; retry after error.retryAfterMs.
+  } else if (isRuntimeOutcomeUnknown(error)) {
+    // The command may have run. Check the workspace; do not resubmit blindly.
+  }
+  throw error;
+}
+```
+
+- `command` runs through `/bin/sh -c`; use `argv` to skip the shell.
+- The whole drive is at `/workspace`; the command starts in
+  `/workspace/<workspace.root>` and `cwd` is relative to that. Only
+  `/workspace` persists.
+- Consecutive commands on the same workspace reuse a warm sandbox
+  (`result.sandbox === "warm"`), so installed packages survive between them;
+  processes do not. Pass `fresh: true` to start over in a new sandbox.
+- Pass `signal` to cancel; a resolved cancel means the server confirmed the
+  command stopped and the workspace drained.
+- `runtimeCapabilities()` reports limits such as `max_timeout_ms` and
+  `max_active_per_tenant`; it throws `RuntimeNotEnabledError` when the server
+  does not offer remote exec.
 
 ### Streaming & multipart
 
@@ -209,6 +281,8 @@ provides `onDisconnected(err)` and `onCurrent(seq)` callbacks.
 | Create layer | `await client.createFSLayer(request)` |
 | List layers | `await client.listFSLayers()` |
 | Get layer | `await client.getFSLayer(layerId)` |
+| Fork layer | `await client.forkFSLayer(parentRef, request?)` |
+| Abandon layer (logical delete) | `await client.deleteFSLayer(layerId, { cascade? })` |
 | Diff layer | `await client.diffFSLayer(layerId, maxSeq?)` |
 | Replay layer | `await client.replayFSLayer(layerId, maxSeq?)` |
 | Upsert entry | `await client.upsertFSLayerEntry(layerId, request)` |

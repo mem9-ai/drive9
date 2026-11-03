@@ -97,12 +97,7 @@ func (t *bearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 func installAzureSASFilter(sasURL string) {
 	setAzureSAS(sasURL)
 	azureFilterOnce.Do(func() {
-		rt := fshttp.NewTransport(context.Background())
-		t, ok := rt.(*fshttp.Transport)
-		if !ok {
-			logger.Warn(context.Background(), "object mount cannot install Azure SAS refresh filter; unexpected rclone transport")
-			return
-		}
+		t := fshttp.NewTransport(context.Background())
 		t.SetRequestFilter(rewriteAzureSASRequest)
 	})
 }

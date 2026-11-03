@@ -29,6 +29,13 @@
       "owner_hint": "fs",
       "failure_class": "correctness"
     },
+    "fuse-readdir-pending": {
+      "title": "FUSE pending READDIRPLUS",
+      "product_area": "fuse",
+      "product_promise": "Directory enumeration preserves pending file sizes through commit and drain",
+      "owner_hint": "fs",
+      "failure_class": "correctness"
+    },
     "fuse-smoke": {
       "title": "FUSE release gate",
       "product_area": "fuse",

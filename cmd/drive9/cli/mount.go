@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -149,7 +150,7 @@ func fsMountCmd(args []string) error {
 	return fsMountCmdWithBackground(args, false)
 }
 
-func fsMountCmdWithBackground(args []string, background bool) error {
+func fsMountCmdWithBackground(args []string, background bool) (resultErr error) {
 	authLocal, args, err := peelObjectAuth(args)
 	if err != nil {
 		return err
@@ -168,6 +169,8 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	foreground := fs.Bool("foreground", false, "run in the foreground and block until unmounted")
 	superviseForeground := fs.Bool("supervise-foreground", false, "run as in-process supervisor and block until stop (sandbox/systemd friendly)")
 	noSupervise := fs.Bool("no-supervise", false, "legacy fire-and-forget background mount without supervisor")
+	defaultOwner := fs.String("owner", "", "UID:GID to report for files without a stored owner (FUSE; default: the mounting user)")
+	noPersistCredentials := fs.Bool("no-persist-credentials", false, "do not store mount credentials in process state (FUSE only; requires --foreground or --no-supervise; disables credential-backed unmount helpers)")
 	supervised := fs.Bool("supervised", false, "internal: worker managed by supervisor")
 	maxRestarts := fs.Int("max-restarts", 5, "supervisor max restarts within restart window")
 	restartWindow := fs.Duration("restart-window", 10*time.Minute, "supervisor restart budget window")
@@ -205,6 +208,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	prefetchTimeout := fs.Duration("readdir-prefetch-timeout", time.Second, "timeout for one readdir prefetch batch")
 	trustProcessLocalEvents := fs.Bool("trust-process-local-events", false, "allow revision-bound GetAttr dir-cache hits using process-local SSE freshness; only safe for single-server/sticky routing or cluster-wide event streams")
 	durability := fs.String("durability", string(fuseDurabilityAuto), "write durability: auto, interactive, fsync, close-sync, or write-sync")
+	extensions := fs.String("extensions", "", "comma-separated fs extensions in build-up order (core first, each entry wrapping the previous ones; chain assembly is the reverse, core the terminal; default: the full set). e.g. --extensions core for a minimal write-sync fs, or --extensions core,sse,cache,writeback for the durability stack")
 	wbSyncWindow := fs.String("writeback-sync-window", "1s", "write-back close staging durability: a duration bounds the power-loss window via a background WAL syncer (default 1s); \"0\"/\"off\" defers all fsyncs to fsync(2)/umount; \"close\" restores fsync-at-close staging (legacy power-loss-safe behavior; see issue #964)")
 	layerRef := fs.String("layer", "", "mount through writable fs layer (layer id, name, or tag ref)")
 	checkpointRef := fs.String("checkpoint", "", "restore fs layer checkpoint before mounting")
@@ -252,6 +256,12 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	credentialSecrets := []string{*server, *apiKey}
+	defer func() {
+		if *noPersistCredentials {
+			resultErr = redactMountCommandCredentials(resultErr, credentialSecrets...)
+		}
+	}()
 	gvisorCompatGiven := flagProvided(fs, "gvisor-compat")
 	if !gvisorCompatGiven {
 		*gvisorCompat, err = mountGVisorCompatFromEnv()
@@ -313,6 +323,9 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	effectiveExtentPatterns := explicitExtentPatterns
 
 	if objectLoc != nil {
+		if *noPersistCredentials {
+			return fmt.Errorf("drive9 mount: --no-persist-credentials is only supported with Drive9 FUSE mounts")
+		}
 		if len(effectiveAppendLogPatterns) > 0 {
 			return fmt.Errorf("drive9 mount: --append-log is only supported with Drive9 FUSE mounts")
 		}
@@ -418,7 +431,6 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	if err != nil {
 		return err
 	}
-
 	lookupRetryCountGiven := flagProvided(fs, "lookup-retry-count")
 	lookupRetryTimeoutGiven := flagProvided(fs, "lookup-retry-timeout")
 	readCacheTTLGiven := flagProvided(fs, "read-cache-ttl")
@@ -510,6 +522,9 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	profileGiven := flagProvided(fs, "profile")
 	resolved := ResolveMountMode(mountMode, runtime.GOOS, exec.LookPath)
 	fmt.Fprintf(os.Stderr, "drive9: mount mode: %s\n", resolved)
+	if *noPersistCredentials && resolved != MountModeFUSE {
+		return fmt.Errorf("drive9 mount: --no-persist-credentials is only supported with Drive9 FUSE mounts")
+	}
 	if len(effectiveAppendLogPatterns) > 0 && resolved != MountModeFUSE {
 		return fmt.Errorf("drive9 mount: --append-log is only supported with Drive9 FUSE mounts")
 	}
@@ -652,10 +667,14 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		*readOnly = true
 	}
 
-	serverVal, apiKeyVal, tokenVal, err := resolveMountCredentials(ResolveCredentials(), *server, *apiKey)
+	resolvedCredentials := ResolveCredentials()
+	credentialSecrets = append(credentialSecrets,
+		resolvedCredentials.Server, resolvedCredentials.APIKey, resolvedCredentials.Token)
+	serverVal, apiKeyVal, tokenVal, err := resolveMountCredentials(resolvedCredentials, *server, *apiKey)
 	if err != nil {
 		return err
 	}
+	credentialSecrets = append(credentialSecrets, serverVal, apiKeyVal, tokenVal)
 	*server, *apiKey = serverVal, apiKeyVal
 	token := tokenVal
 
@@ -708,6 +727,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 			Debug:                        *debug,
 			GVisorCompat:                 *gvisorCompat,
 			LegacyInterruptibleMutations: *legacyInterruptibleMutations,
+			OmitProcessStateCredentials:  *noPersistCredentials,
 		})
 	}
 
@@ -715,6 +735,9 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	// DRIVE9_MOUNT_SUPERVISE=off forces legacy behavior.
 	envSuperviseOff := strings.EqualFold(strings.TrimSpace(os.Getenv("DRIVE9_MOUNT_SUPERVISE")), "off")
 	wantSupervise := !*noSupervise && !envSuperviseOff
+	if *noPersistCredentials && (*superviseForeground || background && !*foreground && wantSupervise) {
+		return fmt.Errorf("drive9 mount: --no-persist-credentials requires --foreground or --no-supervise")
+	}
 	if *superviseForeground {
 		// This process becomes the supervisor (blocks).
 		return runSuperviseForeground(mountSuperviseStartRequest{
@@ -873,6 +896,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		TrustLocalEvents:             *trustProcessLocalEvents,
 		SyncMode:                     syncModeVal,
 		WritePolicy:                  writePolicyVal,
+		Extensions:                   parseExtensionsFlag(*extensions),
 		WritebackLazyStaging:         wbLazyStaging,
 		WritebackSyncWindow:          wbSyncWindowDur,
 		Profile:                      profileCfg.Name,
@@ -915,9 +939,44 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		PerfMaxSampleFiles:           *perfMaxSampleFiles,
 		PerfMaxProfileFiles:          *perfMaxProfileFiles,
 		Supervised:                   *supervised,
+		OmitProcessStateCredentials:  *noPersistCredentials,
+		DefaultOwner:                 strings.TrimSpace(*defaultOwner),
 	}
 
 	return mountFuse(opts)
+}
+
+func redactMountCommandCredentials(err error, secrets ...string) error {
+	if err == nil {
+		return nil
+	}
+	message := err.Error()
+	for _, secret := range secrets {
+		if secret != "" {
+			message = strings.ReplaceAll(message, secret, "<redacted>")
+		}
+	}
+	if message == err.Error() {
+		return err
+	}
+	return mountCommandRedactedError{message: message, cause: err}
+}
+
+type mountCommandRedactedError struct {
+	message string
+	cause   error
+}
+
+func (e mountCommandRedactedError) Error() string { return e.message }
+func (e mountCommandRedactedError) Unwrap() error { return e.cause }
+
+func (e mountCommandRedactedError) ExitCode() int {
+	type exitCoder interface{ ExitCode() int }
+	var code exitCoder
+	if errors.As(e.cause, &code) {
+		return code.ExitCode()
+	}
+	return 1
 }
 
 type mountSuperviseStartRequest struct {
@@ -1337,7 +1396,51 @@ func foregroundMountCommandArgs(args []string) []string {
 		return out
 	}
 	out = append(out, "--foreground")
-	out = append(out, stripBackgroundOnlyCredentialArgs(args)...)
+	cleaned := stripBackgroundOnlyCredentialArgs(args)
+	if argsEnableNoPersistCredentials(cleaned) {
+		// The child gets the resolved server through its environment. Keep a
+		// possibly credential-bearing --server URL out of its argv, which
+		// stays readable through /proc/<pid>/cmdline.
+		cleaned = stripServerArgs(cleaned)
+	}
+	out = append(out, cleaned...)
+	return out
+}
+
+func argsEnableNoPersistCredentials(args []string) bool {
+	enabled := false
+	for _, arg := range args {
+		if arg == "--" {
+			break
+		}
+		name, value, hasValue := strings.Cut(strings.TrimLeft(arg, "-"), "=")
+		if name != "no-persist-credentials" || !strings.HasPrefix(arg, "-") {
+			continue
+		}
+		enabled = true
+		if hasValue {
+			parsed, err := strconv.ParseBool(value)
+			enabled = err == nil && parsed
+		}
+	}
+	return enabled
+}
+
+func stripServerArgs(args []string) []string {
+	out := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--server" || arg == "-server" {
+			if i+1 < len(args) {
+				i++
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, "--server=") || strings.HasPrefix(arg, "-server=") {
+			continue
+		}
+		out = append(out, arg)
+	}
 	return out
 }
 
@@ -1894,6 +1997,7 @@ type umountDeps struct {
 	remove           func(string) error
 	pidAlive         func(int) bool
 	packAfterUnmount func(context.Context, mountstate.ProcessState, []string, []string) error
+	readExitReason   func(string) (mountstate.ExitReason, string, error)
 	now              func() time.Time
 	sleep            func(time.Duration)
 	printErrf        func(string, ...any)
@@ -1924,6 +2028,7 @@ func defaultUmountDeps() umountDeps {
 		remove:           os.Remove,
 		pidAlive:         processAlive,
 		packAfterUnmount: defaultPackAfterUnmount,
+		readExitReason:   mountstate.ReadExitReason,
 		now:              time.Now,
 		sleep:            time.Sleep,
 		printErrf:        func(format string, args ...any) { fmt.Fprintf(os.Stderr, format, args...) },
@@ -1991,6 +2096,9 @@ func runUmount(args []string, deps umountDeps) error {
 	// Verify process identity (PID + creation time) before signaling so a reused
 	// PID from stale state cannot kill an unrelated process.
 	stoppedSupervisor := false
+	var stopErr error
+	workerPID := 0
+	var workerCreation uint64
 	var umountReceipt time.Time
 	umountGenPID := 0
 	var umountGenCreation uint64
@@ -2002,8 +2110,6 @@ func runUmount(args []string, deps umountDeps) error {
 		}
 		stopPID := 0
 		var stopCreation uint64
-		workerPID := 0
-		var workerCreation uint64
 		if deps.readProcessState != nil {
 			if st, _, rerr := deps.readProcessState(stateMountPoint); rerr == nil {
 				if st.SupervisorPID > 0 {
@@ -2039,8 +2145,8 @@ func runUmount(args []string, deps umountDeps) error {
 		if stopPID > 0 {
 			if processMatchesIdentity(stopPID, stopCreation) {
 				stoppedSupervisor = true
-				if terr := terminateProcessGraceful(stopPID, *waitTimeout); terr != nil && deps.printErrf != nil {
-					deps.printErrf("drive9 umount: stop supervisor pid %d: %v\n", stopPID, terr)
+				if terr := terminateProcessGraceful(stopPID, *waitTimeout); terr != nil {
+					stopErr = errors.Join(stopErr, fmt.Errorf("stop supervisor pid %d: %w", stopPID, terr))
 				}
 			} else if deps.printErrf != nil {
 				deps.printErrf("drive9 umount: skip stop for stale supervisor pid %d (identity mismatch)\n", stopPID)
@@ -2050,8 +2156,8 @@ func runUmount(args []string, deps umountDeps) error {
 		// stuck FUSE endpoint can be force-unmounted below.
 		if workerPID > 0 && processMatchesIdentity(workerPID, workerCreation) {
 			stoppedSupervisor = true // enable force-clean forgiveness path
-			if terr := terminateProcessGraceful(workerPID, *waitTimeout); terr != nil && deps.printErrf != nil {
-				deps.printErrf("drive9 umount: stop worker pid %d: %v\n", workerPID, terr)
+			if terr := terminateProcessGraceful(workerPID, *waitTimeout); terr != nil {
+				stopErr = errors.Join(stopErr, fmt.Errorf("stop worker pid %d: %w", workerPID, terr))
 			}
 		}
 	}
@@ -2078,6 +2184,19 @@ func runUmount(args []string, deps umountDeps) error {
 		return fmt.Errorf("drive9 umount: --pack-path requires an auto-pack mount or --pack")
 	}
 
+	readWorkerExitError := func() error {
+		if *waitTimeout <= 0 || workerPID <= 0 || deps.readExitReason == nil {
+			return nil
+		}
+		rec, _, err := deps.readExitReason(stateMountPoint)
+		if err == nil {
+			return unmountWorkerExitError(rec, workerPID, workerCreation, umountReceipt)
+		}
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("read mount exit status: %w", err)
+	}
 	var runErr error
 	// Supervised stop already asked the supervisor to unmount. Fusermount /
 	// force-unmount and token/state clear are generation+lock gated so a
@@ -2112,8 +2231,8 @@ func runUmount(args []string, deps umountDeps) error {
 		})
 		if !owned {
 			// Successor already owns the mountpoint. Do not re-read pidfile,
-			// wait on B, pack B's overlay, or fusermount B.
-			return nil
+			// wait on B, pack B's overlay, or fusermount B. Preserve A's errors.
+			return errors.Join(stopErr, readWorkerExitError())
 		}
 	} else if stoppedSupervisor && !mountPointStillActive(mountPoint) {
 		runErr = nil
@@ -2201,6 +2320,8 @@ func runUmount(args []string, deps umountDeps) error {
 		return runErr
 	}
 
+	runErr = errors.Join(runErr, stopErr)
+	runErr = errors.Join(runErr, readWorkerExitError())
 	state, path, stateOK, err := readUnmountProcessState(deps, stateMountPoint)
 	if err != nil {
 		if runErr != nil {
@@ -2261,6 +2382,20 @@ func runUmount(args []string, deps umountDeps) error {
 		return fmt.Errorf("%w (pid file: %s)", err, path)
 	}
 	return runPackAfterUnmountIfRequested(deps, packState, packArchiveArgs, packPaths)
+}
+
+// Ignore stale records and records belonging to a successor at this path.
+func unmountWorkerExitError(rec mountstate.ExitReason, pid int, creation uint64, requestedAt time.Time) error {
+	if rec.PID != pid || pid <= 0 || requestedAt.IsZero() || rec.At.Before(requestedAt) {
+		return nil
+	}
+	if rec.CreationTime != 0 && creation != 0 && rec.CreationTime != creation {
+		return nil
+	}
+	if rec.Code == 0 {
+		return nil
+	}
+	return fmt.Errorf("drive9 umount: worker pid %d exited with code %d (%s): %s; check mount logs and preserved recovery state", pid, rec.Code, rec.Reason, rec.Detail)
 }
 
 func readUnmountProcessState(deps umountDeps, mountPoint string) (mountstate.ProcessState, string, bool, error) {
@@ -2552,7 +2687,10 @@ func terminateProcess(pid int, waitTimeout time.Duration) error {
 	return terminateProcessWithSignal(pid, waitTimeout, true)
 }
 
+var errMountForcedStop = errors.New("graceful mount shutdown failed; forced termination")
+
 // terminateProcessGraceful sends SIGTERM first, then SIGKILL after waitTimeout.
+// A successful kill is cleanup, not a successful graceful shutdown.
 func terminateProcessGraceful(pid int, waitTimeout time.Duration) error {
 	return terminateProcessWithSignal(pid, waitTimeout, false)
 }
@@ -2565,6 +2703,7 @@ func terminateProcessWithSignal(pid int, waitTimeout time.Duration, killOnly boo
 	if err != nil {
 		return err
 	}
+	forced := false
 	if killOnly {
 		err = process.Kill()
 	} else {
@@ -2573,7 +2712,8 @@ func terminateProcessWithSignal(pid int, waitTimeout time.Duration, killOnly boo
 			if errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH) {
 				return nil
 			}
-			// Fall back to kill if SIGTERM fails.
+			// Fall back to kill if SIGTERM fails, retaining the failure.
+			forced = true
 			err = process.Kill()
 		}
 	}
@@ -2588,9 +2728,19 @@ func terminateProcessWithSignal(pid int, waitTimeout time.Duration, killOnly boo
 		if waitErr := waitForProcessExit(pid, waitTimeout); waitErr != nil {
 			// Escalate to SIGKILL after grace.
 			_ = process.Kill()
-			return waitForProcessExit(pid, 5*time.Second)
+			killErr := waitForProcessExit(pid, 5*time.Second)
+			if !killOnly {
+				return errors.Join(fmt.Errorf("%w: pid %d did not exit within %s: %v", errMountForcedStop, pid, waitTimeout, waitErr), killErr)
+			}
+			return killErr
+		}
+		if forced {
+			return errMountForcedStop
 		}
 		return nil
+	}
+	if forced {
+		return errMountForcedStop
 	}
 	return err
 }
@@ -2651,4 +2801,17 @@ func umountArgv(goos string, lookPath func(string) (string, error), mountPoint s
 		return []string{"umount", mountPoint}, nil
 	}
 	return nil, fmt.Errorf("umount: no supported unmount binary found (tried fusermount3, fusermount, umount)")
+}
+
+// parseExtensionsFlag splits the --extensions value; empty entries and
+// surrounding spaces are dropped. An empty value means "wire the default
+// full set" (handled inside fuse.Mount).
+func parseExtensionsFlag(v string) []string {
+	var out []string
+	for _, part := range strings.Split(v, ",") {
+		if name := strings.TrimSpace(part); name != "" {
+			out = append(out, name)
+		}
+	}
+	return out
 }

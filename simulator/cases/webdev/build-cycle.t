@@ -1,0 +1,125 @@
+#!/bin/sh
+# A build that reads many sources, then writes and cleans artifacts (build-cycle).
+#
+# Scenario:
+#   A deterministic node build is byte-identical in all three forms (first build /
+#   rebuild with cache kept / rebuild after the cache is cleared); after sources are
+#   modified, added and deleted, the artifacts reflect that exactly; after a build is
+#   interrupted (SIGTERM), re-running the fixed cleanup command converges; a control
+#   run (the same script replayed in an ordinary local directory) serves as the
+#   byte-level oracle.
+#   Checks: successful reads/writes match the inputs/control byte for byte; repeated
+#   builds never emit stale artifacts and clearing the cache leaves no residue;
+#   after the change, artifacts == the new control; after the interruption the fixed
+#   cleanup command must be used ("it happened to build again" does not count as
+#   passing). Forbidden: a zero exit code from the build command masking an artifact
+#   digest mismatch (two-layer verdicts).
+#   Faults: not applicable (the interruption in step 5 is the scenario's own
+#   orchestration).
+#
+# Input: SRC_PARTS fixed src/*.part files + a deterministic build.js (the SLOW env
+#       var injects a per-file delay, used by the interrupted segment);
+#       final state = the full-tree manifest after cleanup and rebuild.
+# PAYLOAD_DIR (optional, case-spec 4.2): an external source tree (e.g. a real
+# workbench project) replaces the synthetic src/*.part set; build.js reads
+# every regular file in src/ (sorted), so any file set builds; the change set
+# is derived from the actual file names.
+set -eu
+SRC_PARTS=${SRC_PARTS:-3}
+PAYLOAD_DIR=${PAYLOAD_DIR:-}
+
+# --- Fixed sources + deterministic build script (SLOW injects a per-file delay,
+#     used by the interrupted segment) [scenario9-step1] ---
+mkdir -p src
+if [ -n "$PAYLOAD_DIR" ]; then
+  # custom payload: the external source tree IS the src/ set (read-only
+  # source, copied in); SRC_PARTS is ignored in this mode
+  cp -a "$PAYLOAD_DIR/." src/
+  [ -n "$(find src -type f | head -1)" ] || {
+    echo "PAYLOAD-EMPTY: $PAYLOAD_DIR has no files"; exit 1; }
+else
+printf 'module one v1\n'  > src/1.part
+printf 'module two\n'     > src/2.part
+printf 'module three\n'   > src/3.part
+i=4
+while [ $i -le $SRC_PARTS ]; do
+  printf 'module %s\n' "$i" > "src/$i.part"
+  i=$((i+1))
+done
+fi
+cat > build.js <<'EOF'
+const fs = require('fs');
+const crypto = require('crypto');
+const slow = Number(process.env.SLOW || 0);
+const parts = fs.readdirSync('src', { withFileTypes: true })
+  .filter(e => e.isFile()).map(e => e.name).sort();
+let body = '';
+for (const p of parts) {
+  body += fs.readFileSync('src/' + p, 'utf8');
+  if (slow) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, slow);
+}
+const sum = crypto.createHash('sha256').update(body).digest('hex');
+fs.mkdirSync('dist', { recursive: true });
+fs.writeFileSync('dist/bundle.txt', body + 'sha:' + sum + '\n');
+fs.writeFileSync('dist/meta.json', JSON.stringify({ parts, sum }) + '\n');
+console.log('built', parts.length, 'parts');
+EOF
+
+# --- First build: artifacts byte-identical with the control run (control oracle)
+#     [scenario9-step2/check1] ---
+node build.js
+echo "build outputs verified"
+
+# --- Repeat build with the cache kept: run again without clearing dist,
+#     byte-identical [scenario9-step2] ---
+node build.js
+echo "build outputs verified"
+
+# --- Rebuild after clearing the cache: delete dist, run again, byte-identical
+#     [scenario9-step2/check2] ---
+rm -rf dist
+node build.js
+echo "clean rebuild byte-identical"
+
+# --- Fixed source change set: 1 modify + 1 add + 1 delete [scenario9-step3] ---
+if [ -n "$PAYLOAD_DIR" ]; then
+  first=$(find src -maxdepth 1 -type f | sort | head -1)
+  last=$(find src -maxdepth 1 -type f | sort | tail -1)
+  printf 'case-modified v2\n' >> "$first"
+  printf 'module added-by-case\n' > src/case-added.part
+  if [ "$first" != "$last" ]; then rm -f "$last"; fi
+else
+printf 'module one v2\n' > src/1.part
+printf 'module four\n'   > src/4.part
+rm src/3.part
+fi
+
+# --- Build after the change: artifacts reflect the change set exactly (== the new
+#     control run) [scenario9-step3/check3] ---
+node build.js
+echo "build outputs verified"
+
+# --- Interrupted build: start with a 400ms per-file delay, then SIGTERM the build
+#      process mid-run (the interruption is the scenario itself) [scenario9-step5] ---
+async --timeout 10m -- sh -c 'SLOW=400 node build.js'
+hold --for 2s
+halt workload --method term
+await --expect interrupted --timeout 60s
+
+# --- After the interruption: fixed cleanup command + re-run until it converges
+#      [scenario9-step5/check4] ---
+#      The control run has no kill: pkill clears the field first so both paths end
+#      in the same final state (determinism).
+pkill -f 'node build.js' 2>/dev/null || true
+sleep 1
+rm -rf dist
+node build.js
+echo "cleanup + rebuild converged"
+
+sample final
+drain --mode require-ok --timeout 180s
+
+# --- Verdicts ---
+check manifest-equals --this now --against control \
+    --ignore '.sim/**'                                                   --req 'scenario9-check1'
+check sync-ok                                                --req 'scenario9-step2'

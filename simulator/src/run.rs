@@ -1,6 +1,7 @@
 // shell case engine (case-spec v2): one case = one POSIX sh script.
-// The engine mounts drive9, injects drive9-test-* commands via PATH + a unix
-// control socket, runs the script, and aggregates check verdicts into TAP.
+// The engine mounts drive9, injects the bare case commands (fault, arm,
+// check, …) via PATH + a unix control socket, runs the script, and
+// aggregates check verdicts into TAP.
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Write as _};
@@ -28,8 +29,12 @@ use crate::utils::{
 /// replay, and integrity-checked at run end from a remote vantage.
 pub const SEED_DIR: &str = "__payload__";
 
+// Reserved case-command vocabulary. Bare names are injected at the front of
+// the script PATH; two upstream names are deliberately NOT used because they
+// are POSIX shell builtins the PATH cannot override: `wait` → `await`,
+// `kill` → `halt`.
 pub const COMMANDS: &[&str] = &[
-    "fault", "arm", "disarm", "window", "async", "wait", "kill", "remount", "hold", "sample",
+    "fault", "arm", "disarm", "window", "async", "await", "halt", "remount", "hold", "sample",
     "drain", "check",
 ];
 
@@ -72,6 +77,14 @@ pub struct RunArgs {
     pub allow_other: bool,
     pub tidbcloud_public_key: Option<String>,
     pub tidbcloud_private_key: Option<String>,
+    /// Path to the fstest binary exported to the script as D9_FSTEST_BIN
+    /// for `check fstest` (None = resolve from env/PATH at check time).
+    pub fstest: Option<String>,
+    /// Server-surface cases (api/cli): skip the FUSE mount entirely — the
+    /// script cwd is a plain directory and the case exercises the backend
+    /// through the D9_SERVER/D9_API_KEY channel. drain/remount/vantage
+    /// primitives are unavailable (operational errors).
+    pub no_mount: bool,
     /// External workload file set handed to the case via the PAYLOAD_DIR
     /// script variable (see case-spec §4.2). None = the case's default
     /// synthetic payload generation runs.
@@ -134,8 +147,8 @@ pub fn run(a: RunArgs) -> Result<i32> {
         bail!("--sandbox {:?} unknown (host | firecracker)", a.sandbox);
     }
     let script = a.case.canonicalize()?;
-    if script.extension().and_then(|e| e.to_str()) != Some("test") {
-        bail!("{}: case file must end in .test", script.display());
+    if script.extension().and_then(|e| e.to_str()) != Some("t") {
+        bail!("{}: case file must end in .t", script.display());
     }
     let name = script
         .file_stem()
@@ -306,7 +319,7 @@ fn run_once(
     };
 
     // proxy fronts the server whenever the case declares faults so wire
-    // effects are possible; faultless cases connect directly
+    // effects are possible; plain cases connect directly
     let proxy = if declared_faults.is_empty() {
         None
     } else {
@@ -365,6 +378,7 @@ fn run_once(
         allow_other: a.allow_other,
         write_cache_mb: a.write_cache_size_mb,
         sandbox_fc: sb.is_fc(),
+        no_mount: a.no_mount,
         blocked_reason: None,
     };
     runner.journal(json!({
@@ -415,12 +429,12 @@ fn run_once(
         });
     }
 
-    // bindir with drive9-test-* symlinks
+    // bindir with bare-name command symlinks
     let bindir = run_dir.join("bin");
     let _ = std::fs::create_dir_all(&bindir);
     let self_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("drive9-simulator"));
     for cmd in COMMANDS {
-        let link = bindir.join(format!("drive9-test-{cmd}"));
+        let link = bindir.join(cmd);
         let _ = std::fs::remove_file(&link);
         let _ = std::os::unix::fs::symlink(&self_exe, &link);
     }
@@ -486,8 +500,36 @@ fn run_once(
         .env("D9_MOUNT", &ws)
         .env("D9_RUN_DIR", run_dir)
         .env("D9_CONTROL", &sock_path);
+    // isolate HOME: the drive9 CLI resolves credentials as active-context >
+    // env, so an ambient ~/.drive9/config would silently hijack case traffic
+    // away from the case backend. Cases get a fresh HOME under the run dir
+    // (no case may depend on $HOME workload paths — case-spec §4.1).
+    let isolated_home = run_dir.join("home");
+    let _ = std::fs::create_dir_all(&isolated_home);
+    cmd.env("HOME", &isolated_home);
+    // server channel: lets migrated e2e-style cases call the CLI / curl the
+    // API directly. D9_SERVER points through the injector proxy when one is
+    // up, so case-issued server traffic rides the same faults as the
+    // mount's. Deliberately NOT set in the control replay: control is a
+    // local-dir oracle and must not mutate server state — scripts needing
+    // control compatibility guard with [ -n "${D9_SERVER:-}" ].
+    {
+        let r = runner.lock().unwrap();
+        cmd.env("D9_SERVER", &r.server_for_mount)
+            .env("D9_API_KEY", &r.api_key)
+            .env("D9_CLI", &r.bin);
+        if let Ok(t) = std::fs::read_to_string(run_dir.join("tenant.json"))
+            && let Ok(v) = serde_json::from_str::<Value>(&t)
+            && let Some(id) = v["tenant_id"].as_str()
+        {
+            cmd.env("D9_TENANT", id);
+        }
+    }
     if let Some(p) = &a.payload_dir {
         cmd.env("PAYLOAD_DIR", p);
+    }
+    if let Some(f) = &a.fstest {
+        cmd.env("D9_FSTEST_BIN", f);
     }
     #[cfg(unix)]
     {
@@ -657,7 +699,7 @@ fn run_once(
     };
     let mut reasons: Vec<String> = Vec::new();
     if es.is_empty() {
-        reasons.push("no case entries recorded (script must call drive9-test-check)".into());
+        reasons.push("no case entries recorded (script must call check)".into());
     }
     for e in es.iter() {
         // aggregate over the raw verdict; --accept only annotates (spec §5.2)
@@ -936,13 +978,17 @@ fn handle_ctl(
         }
         "drain" => {
             let mut r = runner.lock().unwrap();
-            let mode = req["mode"].as_str().unwrap_or("require-ok");
-            let secs = req["timeout_secs"].as_u64().unwrap_or(120);
+            if r.no_mount {
+                json!({"ok": false, "error": "drain is unavailable in no-mount mode (no mount daemon to flush)"})
+            } else {
+                let mode = req["mode"].as_str().unwrap_or("require-ok");
+                let secs = req["timeout_secs"].as_u64().unwrap_or(120);
             let (ok, pending_clear, file) = r.drain(mode, Duration::from_secs(secs));
             if mode == "require-ok" && !ok {
                 json!({"ok": false, "error": format!("drain did not reach ok (artifact {file})")})
             } else {
                 json!({"ok": true, "drain_ok": ok, "pending_clear": pending_clear, "artifact": file})
+            }
             }
         }
         "check" => {
@@ -1022,6 +1068,8 @@ pub struct Runner {
     pub allow_other: bool,
     pub write_cache_mb: Option<u64>,
     pub sandbox_fc: bool,
+    /// server-surface mode: no FUSE mount, plain-dir cwd, no drain/remount
+    pub no_mount: bool,
     pub blocked_reason: Option<String>,
 }
 
@@ -1271,6 +1319,14 @@ impl Runner {
     // ---- mount / vantages / drain ----
 
     pub fn mount(&mut self, cache_fresh: bool) -> Result<bool> {
+        if self.no_mount {
+            // server-surface case: the "mount" is a plain directory; the
+            // workload talks to the backend via D9_SERVER/D9_API_KEY
+            let _ = std::fs::create_dir_all(&self.ws);
+            self.mount_idx += 1;
+            self.journal(json!({"ts": now_ms(), "kind": "mount", "no_mount": true}));
+            return Ok(true);
+        }
         self.unmount_quiet();
         let _ = std::fs::create_dir_all(&self.ws);
         let _ = Command::new("fusermount3")
@@ -1344,6 +1400,23 @@ impl Runner {
                 return Ok(false);
             }
             if crate::utils::mount_alive(&self.ws).unwrap_or(false) {
+                // the daemon writes its /tmp pid state file around the FUSE
+                // mount — observed as landing a few ms AFTER mount-aliveness
+                // — while `mount drain`/`umount` resolve the daemon through
+                // exactly that file. Gate the script on it (bounded) or the
+                // first drain races the write and fails with ENOENT.
+                let pid_state = crate::utils::mount_state_pid_path(&self.ws);
+                let state_deadline = Instant::now() + Duration::from_secs(10);
+                while !pid_state.exists() {
+                    if Instant::now() >= state_deadline {
+                        eprintln!(
+                            "mount: pid state file {} did not appear within 10s (drain/umount may race)",
+                            pid_state.display()
+                        );
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
                 self.mount = Some(proc);
                 return Ok(true);
             }
@@ -1499,7 +1572,7 @@ impl Runner {
                 if !self.ensure_observer()? {
                     bail!("observer vantage unavailable");
                 }
-                walk(self.run_dir.join("observer"))?
+                Self::walk_settled(self.run_dir.join("observer"), name)?
             }
             "remote" => {
                 self.remote_idx += 1;
@@ -1516,11 +1589,11 @@ impl Runner {
                     self.unmount_vantage(&mut proc, &rws);
                     bail!("remote vantage mount failed");
                 }
-                let entries = walk(rws.clone())?;
+                let entries = Self::walk_settled(rws.clone(), name)?;
                 self.unmount_vantage(&mut proc, &rws);
                 entries
             }
-            _ => walk(self.ws.clone())?,
+            _ => Self::walk_settled(self.ws.clone(), name)?,
         };
         let path = self
             .run_dir
@@ -1536,9 +1609,23 @@ impl Runner {
         Ok(())
     }
 
+    /// Uniform env for every drive9 CLI invocation the engine makes:
+    /// explicit credentials (the CLI resolves active-context > env, so
+    /// without these an ambient ~/.drive9/config hijacks drain/vantage
+    /// traffic — or, with no config at all, drain fails credential
+    /// resolution instantly) and an isolated HOME for the same reason.
+    fn cli_env(&self, cmd: &mut Command) {
+        cmd.env("DRIVE9_SERVER", &self.server_for_mount)
+            .env("DRIVE9_API_KEY", &self.api_key)
+            .env("HOME", self.run_dir.join("home"));
+        let _ = std::fs::create_dir_all(self.run_dir.join("home"));
+    }
+
     pub fn drain(&mut self, mode: &str, timeout: Duration) -> (bool, bool, String) {
         let to = format!("{}s", timeout.as_secs().max(1));
-        let out = Command::new(&self.bin)
+        let mut cli = Command::new(&self.bin);
+        self.cli_env(&mut cli);
+        let out = cli
             .args([
                 "mount",
                 "drain",
@@ -1548,7 +1635,7 @@ impl Runner {
                 &self.ws.to_string_lossy(),
             ])
             .output();
-        let (exit_ok, stdout) = match out {
+        let (exit_ok, stdout) = match &out {
             Ok(o) => (
                 o.status.success(),
                 String::from_utf8_lossy(&o.stdout).into_owned(),
@@ -1560,11 +1647,50 @@ impl Runner {
         let path = self.run_dir.join(format!("sync-{idx}.json"));
         let _ = std::fs::write(&path, &stdout);
         self.syncs.push((mode.to_string(), ok, pending_clear));
-        self.journal(json!({"ts": now_ms(), "kind":"drain", "mode": mode, "ok": ok, "pending_clear": pending_clear, "file": path.display().to_string()}));
+        self.journal(json!({
+            "ts": now_ms(), "kind":"drain", "mode": mode, "ok": ok,
+            "pending_clear": pending_clear, "file": path.display().to_string(),
+            "stdout_len": stdout.len(),
+        }));
+        if !ok {
+            let err_tail = match &out {
+                Ok(o) => {
+                    let e = String::from_utf8_lossy(&o.stderr);
+                    let rc = o.status.code();
+                    e.chars().rev().take(400).collect::<Vec<_>>().into_iter().rev().collect::<String>()
+                        .replace('\n', " | ")
+                        + &format!(" (rc={rc:?})")
+                }
+                Err(e) => format!("spawn: {e}"),
+            };
+            eprintln!("drain failed: stdout_len={} stderr_tail: {}", stdout.len(), err_tail);
+        }
         (ok, pending_clear, format!("sync-{idx}.json"))
     }
 
     // ---- check evaluation ----
+
+/// Walk a mount vantage, retrying bounded when the result is empty: a
+/// freshly started (or just-drained) daemon's readdir can transiently
+/// return nothing while its view settles; an empty manifest from such a
+/// window is not evidence. Diagnostics on every retry.
+fn walk_settled(root: PathBuf, name: &str) -> Result<Vec<Entry>> {
+    let mut entries = walk(root.clone())?;
+    for attempt in 0..10 {
+        if !entries.is_empty() {
+            return Ok(entries);
+        }
+        let probe = std::fs::read_dir(&root).map(|i| i.count()).unwrap_or(0);
+        eprintln!(
+            "sample {name}: walk of {} returned 0 entries (readdir probe={probe}, attempt {attempt})",
+            root.display()
+        );
+        std::thread::sleep(Duration::from_millis(500));
+        entries = walk(root.clone())?;
+    }
+    Ok(entries)
+}
+
 
     fn resolve_ref(&self, r: &str) -> Result<Vec<Entry>, String> {
         match r {
@@ -1747,6 +1873,26 @@ impl Runner {
                     Outcome::Unconfirmed,
                     format!("metric {metric:?}: engine op-granularity metrics not wired"),
                 )
+            }
+            "fstest" => {
+                // verdict computed where the fstest binary ran (bi_check);
+                // the engine only records it (one case entry per expanded
+                // test/file/script, plus the summary entry)
+                match c["fstest_outcome"].as_str().unwrap_or("") {
+                    "pass" => (Outcome::Pass, String::new()),
+                    "fail" => (
+                        Outcome::Fail,
+                        c["fstest_detail"].as_str().unwrap_or("").to_string(),
+                    ),
+                    "skip" => (
+                        Outcome::Unsupported,
+                        c["fstest_detail"].as_str().unwrap_or("skipped").to_string(),
+                    ),
+                    other => (
+                        Outcome::Blocked,
+                        format!("fstest entry has no outcome ({other:?})"),
+                    ),
+                }
             }
             "artifact-contains" => {
                 let (Some(art), Some(pat)) = (c["artifact"].as_str(), c["pattern"].as_str()) else {
@@ -1974,7 +2120,7 @@ fn parse_args(
     })
 }
 
-/// Entry point when argv[0] is drive9-test-<name>.
+/// Entry point when argv[0] is a bare injected command name.
 pub fn builtin_main(name: &str, args: Vec<String>) -> i32 {
     let stub = std::env::var("D9_STUB").is_ok();
     match name {
@@ -1982,14 +2128,14 @@ pub fn builtin_main(name: &str, args: Vec<String>) -> i32 {
         "arm" | "disarm" => bi_arm_disarm(name, &args),
         "window" => bi_window(&args, stub),
         "async" => bi_async(&args, stub),
-        "wait" => bi_wait(&args, stub),
-        "kill" => bi_kill(&args, stub),
+        "await" => bi_await(&args, stub),
+        "halt" => bi_halt(&args, stub),
         "remount" => bi_remount(&args, stub),
         "hold" => bi_hold(&args, stub),
         "sample" => bi_sample(&args, stub),
         "drain" => bi_drain(&args, stub),
         "check" => bi_check(&args, stub),
-        other => die(&format!("unknown drive9-test command {other:?}")),
+        other => die(&format!("unknown case command {other:?}")),
     }
 }
 
@@ -2008,7 +2154,7 @@ fn bi_fault(args: &[String]) -> i32 {
         Err(e) => return die(&format!("fault: {e}")),
     };
     if fp.positional.len() < 2 {
-        return die("fault: usage: drive9-test-fault <name> <effect> <anchor…>");
+        return die("fault: usage: fault <name> <effect> <anchor…>");
     }
     let mut req = json!({
         "op": "fault",
@@ -2034,7 +2180,7 @@ fn bi_arm_disarm(name: &str, args: &[String]) -> i32 {
         return 0;
     }
     if args.len() != 1 {
-        return die(&format!("{name}: usage: drive9-test-{name} <fault-name>"));
+        return die(&format!("{name}: usage: {name} <fault-name>"));
     }
     let req = json!({"op": name, "name": args[0]});
     match ctl_call(&req) {
@@ -2050,7 +2196,7 @@ fn bi_window(args: &[String], stub: bool) -> i32 {
         Err(e) => return die(&format!("window: {e}")),
     };
     if fp.payload.is_empty() {
-        return die("window: usage: drive9-test-window [--expect C] [--timeout D] -- <payload…>");
+        return die("window: usage: window [--expect C] [--timeout D] -- <payload…>");
     }
     if stub {
         return exec_payload(&fp.payload);
@@ -2118,7 +2264,7 @@ fn bi_async(args: &[String], stub: bool) -> i32 {
         Err(e) => return die(&format!("async: {e}")),
     };
     if fp.payload.is_empty() {
-        return die("async: usage: drive9-test-async [--timeout D] -- <payload…>");
+        return die("async: usage: async [--timeout D] -- <payload…>");
     }
     if stub {
         // control replay: run the payload synchronously
@@ -2162,7 +2308,7 @@ fn bi_async(args: &[String], stub: bool) -> i32 {
     0
 }
 
-fn bi_wait(args: &[String], stub: bool) -> i32 {
+fn bi_await(args: &[String], stub: bool) -> i32 {
     let fp = match parse_args(args, &["expect", "timeout"], false) {
         Ok(p) => p,
         Err(e) => return die(&format!("wait: {e}")),
@@ -2224,13 +2370,13 @@ fn bi_wait(args: &[String], stub: bool) -> i32 {
     }
 }
 
-fn bi_kill(args: &[String], stub: bool) -> i32 {
+fn bi_halt(args: &[String], stub: bool) -> i32 {
     let fp = match parse_args(args, &["method"], false) {
         Ok(p) => p,
         Err(e) => return die(&format!("kill: {e}")),
     };
     if fp.positional.len() != 1 {
-        return die("kill: usage: drive9-test-kill <client|workload> [--method kill|term]");
+        return die("kill: usage: kill <client|workload> [--method kill|term]");
     }
     if stub {
         return 0;
@@ -2298,7 +2444,7 @@ fn bi_hold(args: &[String], stub: bool) -> i32 {
             Err(e) => return die(&format!("hold: {e:#}")),
         }
     }
-    die("hold: usage: drive9-test-hold --for D | --idle D")
+    die("hold: usage: hold --for D | --idle D")
 }
 
 fn bi_sample(args: &[String], stub: bool) -> i32 {
@@ -2308,7 +2454,7 @@ fn bi_sample(args: &[String], stub: bool) -> i32 {
     };
     if fp.positional.len() != 1 {
         return die(
-            "sample: usage: drive9-test-sample <name> [--as mount|observer|remote] [--optional]",
+            "sample: usage: sample <name> [--as mount|observer|remote] [--optional]",
         );
     }
     if stub {
@@ -2388,7 +2534,7 @@ fn bi_check(args: &[String], stub: bool) -> i32 {
         args,
         &[
             "req", "claim", "accept", "this", "against", "ignore", "paths", "fault", "drain",
-            "metric", "budget", "artifact", "pattern",
+            "metric", "budget", "artifact", "pattern", "suite", "args",
         ],
         true,
     ) {
@@ -2400,7 +2546,7 @@ fn bi_check(args: &[String], stub: bool) -> i32 {
         return 0;
     }
     if fp.positional.is_empty() {
-        return die("check: usage: drive9-test-check <kind> [args…] --req T");
+        return die("check: usage: check <kind> [args…] --req T");
     }
     let kind = fp.positional[0].clone();
     let mut req = json!({"op": "check", "kind": kind});
@@ -2425,7 +2571,7 @@ fn bi_check(args: &[String], stub: bool) -> i32 {
     match kind.as_str() {
         "shell" => {
             if fp.payload.is_empty() {
-                return die("check shell: usage: drive9-test-check shell -- <cmd…> --req T");
+                return die("check shell: usage: check shell -- <cmd…> --req T");
             }
             let out = Command::new(&fp.payload[0]).args(&fp.payload[1..]).output();
             let (rc, text) = match out {
@@ -2477,6 +2623,111 @@ fn bi_check(args: &[String], stub: bool) -> i32 {
             if req["artifact"].is_null() || req["pattern"].is_null() {
                 return die("check artifact-contains: --artifact and --pattern are required");
             }
+        }
+        "fstest" => {
+            // run the pinned fstest binary against the mount and expand its
+            // JSON envelope into per-test case entries (files for pjdfstest,
+            // tests for ltp, scripts for git, failures for sqlite/fsx) plus
+            // one summary entry; the raw JSON is kept as a run artifact
+            let Some(suite) = fp.map.get("suite").cloned() else {
+                return die("check fstest: usage: check fstest --suite <name> [--args '…'] --req T");
+            };
+            let mount = match std::env::var("D9_MOUNT") {
+                Ok(m) => m,
+                Err(_) => return die("check fstest: D9_MOUNT not set"),
+            };
+            let bin = fstest_binary();
+            let run_dir = std::env::var("D9_RUN_DIR").unwrap_or_else(|_| ".".into());
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let json_path = std::path::Path::new(&run_dir).join(format!("fstest-{suite}-{now}.json"));
+            let extra: Vec<String> = fp
+                .map
+                .get("args")
+                .map(|a| a.split_whitespace().map(|s| s.to_string()).collect())
+                .unwrap_or_default();
+            let mut argv = vec![suite.clone()];
+            argv.extend(extra);
+            argv.push("--json".into());
+            argv.push(json_path.display().to_string());
+            argv.push(mount);
+            let out = Command::new(&bin).args(&argv).output();
+            let (rc, text) = match out {
+                Ok(o) => (
+                    o.status.code().unwrap_or(1),
+                    format!(
+                        "{}{}",
+                        String::from_utf8_lossy(&o.stderr),
+                        String::from_utf8_lossy(&o.stdout)
+                    ),
+                ),
+                Err(e) => (
+                    1,
+                    format!(
+                        "fstest binary {bin:?} not executable: {e} (set D9_FSTEST_BIN or use `drive9-simulator tools ensure-fstest`)"
+                    ),
+                ),
+            };
+            if !text.trim().is_empty() {
+                println!("{}", text.trim_end());
+            }
+            let report = std::fs::read_to_string(&json_path)
+                .ok()
+                .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+            let entries = match &report {
+                Some(v) => fstest_extract(v, &suite),
+                None => vec![FstestEntry {
+                    suffix: "report".into(),
+                    outcome: "blocked".into(),
+                    detail: format!(
+                        "no parsable fstest JSON report (rc={rc}): {}",
+                        tail_chars(&text, 400)
+                    ),
+                }],
+            };
+            let base_claim = fp.map.get("claim").cloned().unwrap_or_default();
+            let mut worst_rc = 0;
+            for e in &entries {
+                let mut creq = json!({
+                    "op": "check",
+                    "kind": "fstest",
+                    "suite": suite,
+                    "fstest_outcome": e.outcome,
+                    "fstest_detail": e.detail,
+                });
+                for k in ["req", "accept"] {
+                    if let Some(v) = fp.map.get(k) {
+                        creq[k] = if k == "accept" {
+                            json!(v.split(',').map(|x| x.trim().to_string()).collect::<Vec<_>>())
+                        } else {
+                            json!(v)
+                        };
+                    }
+                }
+                if base_claim.is_empty() {
+                    creq["claim"] = json!(format!("fstest-{}-{}", suite, e.suffix));
+                } else {
+                    creq["claim"] = json!(format!("{}-{}", base_claim, e.suffix));
+                }
+                match ctl_call(&creq) {
+                    Ok(v) if v["ok"] == json!(true) => {}
+                    Ok(v) => {
+                        worst_rc = 1;
+                        eprintln!(
+                            "check fstest: entry {} not recorded: {}",
+                            e.suffix,
+                            v["error"].as_str().unwrap_or("?")
+                        );
+                    }
+                    Err(e2) => {
+                        worst_rc = 1;
+                        eprintln!("check fstest: control channel error: {e2:#}");
+                    }
+                }
+            }
+            return worst_rc;
         }
         other => return die(&format!("check: unknown kind {other:?}")),
     }
@@ -2682,7 +2933,7 @@ pub fn lint_faults(path: &Path) -> Result<Vec<String>> {
         let tokens = tokenize(&line);
         if tokens
             .first()
-            .map(|x| x == "drive9-test-fault")
+            .map(|x| x == "fault")
             .unwrap_or(false)
             && tokens.len() >= 2
         {
@@ -2739,34 +2990,27 @@ pub fn lint_file(path: &Path) -> Result<Vec<String>> {
         }
         let first = tokens[0].clone();
 
-        // shadowing / definitions of the reserved prefix
+        // shadowing / definitions of the reserved command vocabulary: the
+        // bare names are injected at the front of PATH, so defining a
+        // function or alias with one of these names hijacks the engine
         for tok in &tokens {
             let stripped = tok
                 .trim_start_matches("$(")
                 .trim_start_matches('{')
                 .to_string();
-            if stripped.starts_with("drive9-test-")
+            let bare = stripped.trim_end_matches('(').trim();
+            if COMMANDS.contains(&bare)
                 && (stripped.contains('(') || stripped.contains('='))
             {
-                let is_call = COMMANDS.iter().any(|c| {
-                    stripped.starts_with(&format!("drive9-test-{c} "))
-                        || stripped.trim_end_matches('(').trim() == format!("drive9-test-{c}")
-                });
-                if !is_call {
-                    errs.push(format!("line {lineno}: reserved prefix drive9-test- must not be defined or shadowed: {tok:?}"));
-                }
+                errs.push(format!(
+                    "line {lineno}: reserved command name must not be defined or shadowed: {tok:?}"
+                ));
             }
         }
-        if !first.starts_with("drive9-test-") {
+        if !COMMANDS.contains(&first.as_str()) {
             continue;
         }
-        let cmd = first.trim_start_matches("drive9-test-").to_string();
-        if !COMMANDS.contains(&cmd.as_str()) {
-            errs.push(format!(
-                "line {lineno}: unknown drive9-test command {cmd:?}"
-            ));
-            continue;
-        }
+        let cmd = first;
         let rest = &tokens[1..];
         match cmd.as_str() {
             "fault" => {
@@ -2849,35 +3093,35 @@ pub fn lint_file(path: &Path) -> Result<Vec<String>> {
                 }
                 if cmd == "async" {
                     if async_open {
-                        errs.push(format!("line {lineno}: a second async while another is live (wait/kill required between asyncs)"));
+                        errs.push(format!("line {lineno}: a second async while another is live (await/halt required between asyncs)"));
                     }
                     async_open = true;
                 }
                 let _ = payload_started;
             }
-            "wait" => {
+            "await" => {
                 async_open = false;
                 if let Some(i) = rest.iter().position(|x| x == "--expect")
                     && let Some(v) = rest.get(i + 1)
                     && !matches!(v.as_str(), "ok" | "interrupted")
                 {
                     errs.push(format!(
-                        "line {lineno}: wait --expect must be ok|interrupted"
+                        "line {lineno}: await --expect must be ok|interrupted"
                     ));
                 }
             }
-            "kill" => {
+            "halt" => {
                 if let Some(first_arg) = rest.first() {
                     if !matches!(first_arg.as_str(), "client" | "workload" | "vm") {
                         errs.push(format!(
-                            "line {lineno}: kill target must be client|workload|vm"
+                            "line {lineno}: halt target must be client|workload|vm"
                         ));
                     }
                     if first_arg == "workload" {
                         async_open = false;
                     }
                 } else {
-                    errs.push(format!("line {lineno}: kill needs a target"));
+                    errs.push(format!("line {lineno}: halt needs a target"));
                 }
             }
             "hold" => {
@@ -2917,6 +3161,7 @@ pub fn lint_file(path: &Path) -> Result<Vec<String>> {
                         | "fault-fired"
                         | "metrics"
                         | "artifact-contains"
+                        | "fstest"
                 ) {
                     errs.push(format!("line {lineno}: unknown check kind {kind:?}"));
                 }
@@ -3005,7 +3250,7 @@ pub fn lint_file(path: &Path) -> Result<Vec<String>> {
         }
     }
     if check_count == 0 {
-        errs.push("case must contain at least one drive9-test-check".into());
+        errs.push("case must contain at least one check".into());
     }
     Ok(errs)
 }
@@ -3036,7 +3281,7 @@ pub fn validate(paths: Vec<PathBuf>, trace: Option<PathBuf>) -> Result<i32> {
                 let tokens = tokenize(&line);
                 if tokens
                     .first()
-                    .map(|t| t == "drive9-test-check")
+                    .map(|t| t == "check")
                     .unwrap_or(false)
                     && let Some(i) = tokens.iter().position(|t| t == "--req")
                     && let Some(r) = tokens.get(i + 1)
@@ -3060,4 +3305,433 @@ pub fn validate(paths: Vec<PathBuf>, trace: Option<PathBuf>) -> Result<i32> {
         }
     }
     Ok(if any_err { 1 } else { 0 })
+}
+
+// ---------------------------------------------------------------- fstest
+
+/// One expanded verdict row from a fstest JSON envelope: per failed
+/// file/test/script plus the summary row. `outcome` ∈ pass|fail|skip|blocked.
+pub struct FstestEntry {
+    pub suffix: String,
+    pub outcome: String,
+    pub detail: String,
+}
+
+fn tail_chars(s: &str, n: usize) -> String {
+    s.chars().rev().take(n).collect::<Vec<_>>().into_iter().rev().collect()
+}
+
+fn fstest_binary() -> String {
+    if let Ok(b) = std::env::var("D9_FSTEST_BIN")
+        && !b.trim().is_empty()
+    {
+        return b;
+    }
+    "fstest".into()
+}
+
+/// Expand a fstest report envelope into case entries. Layouts, per suite
+/// family (see the fstest README / src):
+/// - pjdfstest: `summary {files,tests,passed,failed,todoPassed}` + `files[]
+///   {name, tests, passed, failed, bail, timedOut, failures[]}` → one entry
+///   per failed/bailed/timed-out file + the summary
+/// - ltp: `results.summary {total,passed,failed,broken,skipped,…}` +
+///   `results.tests[] {name,result,exitCode,timedOut}` → per non-pass test
+///   (skip=TCONF → unsupported) + summary
+/// - git: per-script rows `{name,status,…}` under `tests[]`/`scripts[]` →
+///   per failed script + summary
+/// - sqlite / fsx: `failures[]` / `failure` → per failure + summary
+/// - everything else (benchmarks): summary entry only; the full JSON stays
+///   an artifact for the perf-baseline tooling
+pub fn fstest_extract(v: &Value, suite: &str) -> Vec<FstestEntry> {
+    let mut out = Vec::new();
+    let ok = v["status"].as_str() == Some("ok");
+    let mut failed_any = !ok;
+
+    // per-file granularity (pjdfstest)
+    if let Some(files) = v["files"].as_array() {
+        for f in files {
+            let name = f["name"].as_str().unwrap_or("?");
+            let failed = f["failed"].as_i64().unwrap_or(0);
+            let tests = f["tests"].as_i64().unwrap_or(0);
+            let bail = f["bail"].as_bool().unwrap_or(false);
+            let timed_out = f["timedOut"].as_bool().unwrap_or(false);
+            if failed > 0 || bail || timed_out {
+                failed_any = true;
+                let first = f["failures"]
+                    .as_array()
+                    .and_then(|a| a.first())
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("");
+                out.push(FstestEntry {
+                    suffix: name.replace('/', "_"),
+                    outcome: "fail".into(),
+                    detail: format!(
+                        "{}/{} failed{}{}: {}",
+                        failed,
+                        tests,
+                        if bail { ", BAIL OUT" } else { "" },
+                        if timed_out { ", TIMED OUT" } else { "" },
+                        tail_chars(first, 200)
+                    ),
+                });
+            }
+        }
+    }
+    // per-test granularity (ltp)
+    if let Some(tests) = v["results"]["tests"].as_array() {
+        for t in tests {
+            let name = t["name"].as_str().unwrap_or("?");
+            let result = t["result"].as_str().unwrap_or("");
+            if result == "pass" {
+                continue;
+            }
+            let (outcome, label) = match result {
+                // TCONF = 32: the environment declares a capability
+                // boundary, not a product failure
+                "skip" => ("skip", "TCONF skip"),
+                r => ("fail", r),
+            };
+            if outcome == "fail" {
+                failed_any = true;
+            }
+            out.push(FstestEntry {
+                suffix: name.to_string(),
+                outcome: outcome.into(),
+                detail: format!(
+                    "{label} exit={}{}",
+                    t["exitCode"].as_i64().unwrap_or(-1),
+                    if t["timedOut"].as_bool().unwrap_or(false) { " TIMED OUT" } else { "" }
+                ),
+            });
+        }
+    }
+    // per-script granularity (git t/): rows with name+status
+    for key in ["tests", "scripts"] {
+        if let Some(rows) = v[key].as_array() {
+            for t in rows {
+                let (Some(name), Some(status)) = (t["name"].as_str(), t["status"].as_str()) else {
+                    continue;
+                };
+                if status == "failed" || status == "error" {
+                    failed_any = true;
+                    out.push(FstestEntry {
+                        suffix: name.to_string(),
+                        outcome: "fail".into(),
+                        detail: format!(
+                            "{}",
+                            t["failures"]
+                                .as_array()
+                                .and_then(|a| a.first())
+                                .map(|f| f["detail"].clone())
+                                .unwrap_or(json!(""))
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    // failures list (sqlite) / failure string (fsx)
+    if let Some(fails) = v["failures"].as_array()
+        && !fails.is_empty()
+    {
+        failed_any = true;
+        for f in fails {
+            out.push(FstestEntry {
+                suffix: format!("failure-{}", out.len()),
+                outcome: "fail".into(),
+                detail: f.to_string(),
+            });
+        }
+    }
+    if let Some(f) = v["failure"].as_str()
+        && !f.is_empty()
+    {
+        failed_any = true;
+        out.push(FstestEntry {
+            suffix: "failure".into(),
+            outcome: "fail".into(),
+            detail: tail_chars(f, 300),
+        });
+    }
+
+    // summary entry
+    let detail = match &v["summary"] {
+        s if s.is_object() => s.to_string(),
+        _ => format!("status={}", v["status"].as_str().unwrap_or("?")),
+    };
+    out.push(FstestEntry {
+        suffix: "summary".into(),
+        outcome: if failed_any { "fail".into() } else { "pass".into() },
+        detail: tail_chars(&detail, 300),
+    });
+    let _ = suite;
+    out
+}
+
+#[cfg(test)]
+mod fstest_tests {
+    use super::*;
+
+    #[test]
+    fn extracts_pjdfstest_failures_per_file() {
+        let v = json!({
+            "suite": "pjdfstest", "status": "failed",
+            "summary": {"files": 3, "tests": 10, "passed": 8, "failed": 2},
+            "files": [
+                {"name": "chmod/01.t", "tests": 4, "passed": 4, "failed": 0, "bail": false, "timedOut": false},
+                {"name": "link/02.t", "tests": 3, "passed": 1, "failed": 2, "bail": false, "timedOut": false,
+                 "failures": ["not ok 2 - link counts"]},
+                {"name": "open/07.t", "tests": 3, "passed": 3, "failed": 0, "bail": true, "timedOut": false}
+            ]
+        });
+        let e = fstest_extract(&v, "pjdfstest");
+        let fails: Vec<&FstestEntry> = e.iter().filter(|x| x.outcome == "fail").collect();
+        assert_eq!(fails.len(), 3, "two failed files + summary");
+        assert!(e.iter().any(|x| x.suffix == "link_02.t" && x.detail.contains("link counts")));
+        assert!(e.iter().any(|x| x.suffix == "open_07.t" && x.detail.contains("BAIL")));
+        assert!(e.iter().any(|x| x.suffix == "summary" && x.outcome == "fail"));
+    }
+
+    #[test]
+    fn extracts_ltp_skip_vs_fail() {
+        let v = json!({
+            "suite": "ltp", "status": "failed",
+            "results": {"summary": {"total": 3, "passed": 1},
+                "tests": [
+                    {"name": "access01", "result": "pass", "exitCode": 0},
+                    {"name": "acct02", "result": "skip", "exitCode": 32},
+                    {"name": "chmod01", "result": "fail", "exitCode": 1, "timedOut": true}
+                ]}
+        });
+        let e = fstest_extract(&v, "ltp");
+        assert!(e.iter().any(|x| x.suffix == "acct02" && x.outcome == "skip" && x.detail.contains("TCONF")));
+        assert!(e.iter().any(|x| x.suffix == "chmod01" && x.outcome == "fail" && x.detail.contains("TIMED OUT")));
+        assert!(e.iter().any(|x| x.suffix == "summary" && x.outcome == "fail"));
+    }
+
+    #[test]
+    fn ok_report_yields_only_passing_summary() {
+        let v = json!({
+            "suite": "fsx", "status": "ok",
+            "summary": {"ops": 1000}, "opsExecuted": 1000, "finalFileSize": 65536
+        });
+        let e = fstest_extract(&v, "fsx");
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].suffix, "summary");
+        assert_eq!(e[0].outcome, "pass");
+    }
+
+    #[test]
+    fn fsx_failure_string_expands() {
+        let v = json!({"suite": "fsx", "status": "failed", "failure": "DATA MISCOMPARE at op 412"});
+        let e = fstest_extract(&v, "fsx");
+        assert!(e.iter().any(|x| x.suffix == "failure" && x.detail.contains("MISCOMPARE")));
+    }
+}
+
+// ---------------------------------------------------------------- run-suite
+
+#[derive(Clone, serde::Deserialize)]
+struct SuiteCase {
+    name: String,
+    tier: Option<String>,
+    timeout: Option<String>,
+    durability: Option<String>,
+    fstest: Option<String>,
+    #[serde(default)]
+    allow_other: bool,
+    #[serde(default)]
+    no_mount: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct SuiteManifest {
+    #[serde(default, rename = "case")]
+    cases: Vec<SuiteCase>,
+}
+
+pub struct RunSuiteArgs {
+    pub manifest: PathBuf,
+    pub tier: Option<String>,
+    pub server: String,
+    pub bin: String,
+    pub home: Option<PathBuf>,
+    pub fstest: Option<String>,
+    pub stop_on_fail: bool,
+}
+
+/// Batch runner: execute every manifest case whose tier matches (or all when
+/// no --tier), sequentially, reusing the single-case engine. Prints a TAP-ish
+/// summary line per case, writes <home>/suite-summary.json, exits with the
+/// worst case code.
+pub fn run_suite(a: RunSuiteArgs) -> Result<i32> {
+    let raw = std::fs::read_to_string(&a.manifest)
+        .with_context(|| format!("reading manifest {}", a.manifest.display()))?;
+    let manifest: SuiteManifest =
+        toml::from_str(&raw).context("parsing suites manifest (expected [[case]] tables)")?;
+    let cases_root = a
+        .manifest
+        .parent()
+        .map(|p| p.join("cases"))
+        .unwrap_or_else(|| PathBuf::from("cases"));
+    let selected: Vec<&SuiteCase> = manifest
+        .cases
+        .iter()
+        .filter(|c| match &a.tier {
+            Some(t) => c.tier.as_deref() == Some(t.as_str()),
+            None => true,
+        })
+        .collect();
+    if selected.is_empty() {
+        bail!("no cases selected (tier {:?})", a.tier);
+    }
+    // one shared backend for the whole suite: every case provisions its own
+    // tenant on it; the suite home exists because every case run wipes its
+    // own home directory
+    let suite_home = a.home.clone().unwrap_or_else(|| {
+        std::env::temp_dir().join(format!("drive9-simulator-suite-{}", std::process::id()))
+    });
+    let server = a.server.clone();
+    let mut results: Vec<(String, i32)> = Vec::new();
+    for c in &selected {
+        let case_path = cases_root.join(format!("{}.t", c.name));
+        if !case_path.exists() {
+            bail!("case file missing: {}", case_path.display());
+        }
+        eprintln!("=== suite case {} ===", c.name);
+        // per-case home: run() wipes home at start, so cases must not share
+        // one directory
+        let case_home = suite_home.join("cases").join(c.name.replace('/', "_"));
+        let code = match run(RunArgs {
+            case: case_path,
+            sandbox: "host".into(),
+            home: Some(case_home.clone()),
+            server: server.clone(),
+            bin: a.bin.clone(),
+            repeat: 1,
+            budgets: vec![],
+            timeout: c.timeout.clone(),
+            durability: c.durability.clone().unwrap_or_else(|| "fsync".into()),
+            overlay: None,
+            write_cache_size_mb: None,
+            allow_other: c.allow_other,
+            tidbcloud_public_key: None,
+            tidbcloud_private_key: None,
+            fstest: c.fstest.clone().or_else(|| a.fstest.clone()),
+            payload_dir: None,
+            seed_dir: None,
+            no_mount: c.no_mount,
+        }) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("case {} errored: {e:#}", c.name);
+                1
+            }
+        };
+        results.push((c.name.clone(), code));
+        if code != 0 {
+            if let Ok(tap) = std::fs::read_to_string(case_home.join("runs").join("r0").join("report.tap")) {
+                for line in tap.lines().filter(|l| l.starts_with("not ok")) {
+                    eprintln!("  {}: {}", c.name, line);
+                }
+            }
+            for (label, file) in [
+                ("script.out", "logs/script.out"),
+                ("mount.log", "mount.log"),
+            ] {
+                if let Ok(txt) = std::fs::read_to_string(case_home.join("runs").join("r0").join(file)) {
+                    let tail: String = txt.lines().rev().take(15).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+                    if !tail.trim().is_empty() {
+                        eprintln!("  {} {}: --- tail ---\n{}", c.name, label, tail);
+                    }
+                }
+            }
+        }
+        if a.stop_on_fail && code != 0 {
+            break;
+        }
+    }
+    let worst = results.iter().map(|(_, c)| *c).max().unwrap_or(0);
+    let passed = results.iter().filter(|(_, c)| *c == 0).count();
+    for (name, code) in &results {
+        println!("{} {} (rc={})", if *code == 0 { "ok" } else { "NOT OK" }, name, code);
+    }
+    println!("# suite: {}/{} cases passed (tier {:?})", passed, results.len(), a.tier);
+    if let Some(home) = &a.home {
+        let _ = std::fs::create_dir_all(home);
+        let summary = json!({
+            "tier": a.tier,
+            "server": a.server,
+            "cases": results.iter()
+                .map(|(n, c)| json!({"name": n, "rc": c}))
+                .collect::<Vec<_>>(),
+        });
+        let _ = std::fs::write(home.join("suite-summary.json"), summary.to_string());
+    }
+    Ok(worst)
+}
+
+// ---------------------------------------------------------------- tools
+
+/// Ensure the fstest binary is resolvable: existing D9_FSTEST_BIN, PATH, or
+/// clone+build the requested git ref into the tools cache. Prints the path
+/// (and an export line when it built something). Pinning note: fstest has no
+/// tags yet — CI should pass an explicit commit sha until it versions.
+pub fn tools_ensure_fstest(git_ref: String) -> Result<i32> {
+    if let Ok(b) = std::env::var("D9_FSTEST_BIN")
+        && !b.trim().is_empty()
+    {
+        println!("D9_FSTEST_BIN already set: {b}");
+        return Ok(0);
+    }
+    if let Ok(out) = Command::new("which").arg("fstest").output()
+        && out.status.success()
+    {
+        println!(
+            "fstest on PATH: {}",
+            String::from_utf8_lossy(&out.stdout).trim()
+        );
+        return Ok(0);
+    }
+    let cache = home_cache_dir().join("fstest").join(&git_ref);
+    let binary = cache.join("target/release/fstest");
+    if binary.exists() {
+        println!("cached build: {}", binary.display());
+        println!("export D9_FSTEST_BIN={}", binary.display());
+        return Ok(0);
+    }
+    if cache.exists() {
+        std::fs::remove_dir_all(&cache).context("clearing stale fstest cache")?;
+    }
+    let url = "https://github.com/mornyx/fstest";
+    let st = Command::new("git")
+        .args(["clone", "--depth", "1", "--branch"])
+        .arg(&git_ref)
+        .arg(url)
+        .arg(&cache)
+        .status()
+        .context("spawning git clone")?;
+    if !st.success() {
+        bail!("git clone {url}@{git_ref} failed");
+    }
+    let st = Command::new("cargo")
+        .args(["build", "--release"])
+        .current_dir(&cache)
+        .status()
+        .context("spawning cargo build (needs a Rust toolchain)")?;
+    if !st.success() {
+        bail!("cargo build --release failed in {}", cache.display());
+    }
+    println!("built: {}", binary.display());
+    println!("export D9_FSTEST_BIN={}", binary.display());
+    Ok(0)
+}
+
+fn home_cache_dir() -> PathBuf {
+    std::env::var("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .unwrap_or_else(|_| PathBuf::from("/tmp"))
+        .join("drive9-simulator")
 }
