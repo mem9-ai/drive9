@@ -1724,7 +1724,7 @@ func (c *Client) ReadStreamRange(ctx context.Context, path string, offset, lengt
 			}
 			// 200: server returned full body (Range not honored).
 			// Skip to offset and limit the read.
-			return c.sliceBody(resp2.Body, offset, length)
+			return c.sliceBodyWithHeader(resp2.Body, offset, length, resp2.Header.Clone())
 		}
 
 	case resp.StatusCode == http.StatusPartialContent:
@@ -1736,7 +1736,7 @@ func (c *Client) ReadStreamRange(ctx context.Context, path string, offset, lengt
 		// First-hop Range honored. The body already starts at offset, so
 		// bound it to the declared response range without skipping the
 		// offset a second time.
-		return &limitedReadCloser{r: io.LimitReader(resp.Body, end-offset+1), c: resp.Body}, nil
+		return &limitedReadCloser{r: io.LimitReader(resp.Body, end-offset+1), c: resp.Body, h: resp.Header.Clone()}, nil
 
 	case resp.StatusCode == http.StatusRequestedRangeNotSatisfiable:
 		_ = resp.Body.Close()
@@ -1749,7 +1749,7 @@ func (c *Client) ReadStreamRange(ctx context.Context, path string, offset, lengt
 	default:
 		// 200: server ignored Range (small inline file or old server).
 		// Skip to offset and limit the read.
-		return c.sliceBody(resp.Body, offset, length)
+		return c.sliceBodyWithHeader(resp.Body, offset, length, resp.Header.Clone())
 	}
 }
 
@@ -1801,7 +1801,9 @@ func (c *Client) readObjectRangeStrict(ctx context.Context, objectURL string, of
 
 // sliceBody skips offset bytes from rc, then returns a reader limited to
 // length bytes. The original rc is closed when the returned ReadCloser is closed.
-func (c *Client) sliceBody(rc io.ReadCloser, offset, length int64) (io.ReadCloser, error) {
+// sliceBodyWithHeader is sliceBody carrying the first-hop response headers
+// on the returned reader (the resource identity rides the same response).
+func (c *Client) sliceBodyWithHeader(rc io.ReadCloser, offset, length int64, h http.Header) (io.ReadCloser, error) {
 	if offset > 0 {
 		if _, err := io.CopyN(io.Discard, rc, offset); err != nil {
 			_ = rc.Close()
@@ -1812,7 +1814,7 @@ func (c *Client) sliceBody(rc io.ReadCloser, offset, length int64) (io.ReadClose
 			return nil, fmt.Errorf("skip to offset: %w", err)
 		}
 	}
-	return &limitedReadCloser{r: io.LimitReader(rc, length), c: rc}, nil
+	return &limitedReadCloser{r: io.LimitReader(rc, length), c: rc, h: h}, nil
 }
 
 // validatePartialContentRange checks that a first-hop 206 response carries a
@@ -1887,10 +1889,15 @@ func isDecimalDigits(s string) bool {
 type limitedReadCloser struct {
 	r io.Reader
 	c io.Closer
+	h http.Header
 }
 
 func (l *limitedReadCloser) Read(p []byte) (int, error) { return l.r.Read(p) }
 func (l *limitedReadCloser) Close() error               { return l.c.Close() }
+
+// Header exposes the first-hop response headers (including the resource
+// identity the server may echo on the read that supplied the bytes).
+func (l *limitedReadCloser) Header() http.Header { return l.h }
 
 // DownloadToFile downloads a remote file into a local path.
 func (c *Client) DownloadToFile(ctx context.Context, remotePath, localPath string, size int64) error {

@@ -558,20 +558,20 @@ func (r *blockRegistry) fetch(ctx context.Context, c fetchClient, id uint64, off
 	}
 	if snap.classicRange > 0 {
 		// Classic-read provenance: the bytes were dropped under cache
-		// pressure while a reader still held the id. The refetch is
-		// IDENTITY-VERIFIED — the pathname alone is reusable (renames,
-		// replacements) and must never serve another file's bytes under
-		// this id; on mismatch the fetch errors (never wrong bytes).
+		// pressure while a reader still held the id. The refetch's proof
+		// is the READ's OWN response identity (the pre-stat only fences
+		// the obvious): a mismatch or absent echo errors — never wrong
+		// bytes under this id.
 		if snap.provResID == "" {
 			return nil, fmt.Errorf("classic slice %d has no verified source", id)
-		}
-		curID, serr := c.StatResourceID(ctx, path)
-		if serr != nil || curID != snap.provResID {
-			return nil, fmt.Errorf("classic slice %d source no longer holds the staged object", id)
 		}
 		rc, rerr := c.ReadStreamRange(ctx, path, snap.provenanceStart+off, limit)
 		if rerr != nil {
 			return nil, rerr
+		}
+		if got := rcHeaderResourceID(rc); got != snap.provResID {
+			_ = rc.Close()
+			return nil, fmt.Errorf("classic slice %d source no longer holds the staged object", id)
 		}
 		return rc, nil
 	}

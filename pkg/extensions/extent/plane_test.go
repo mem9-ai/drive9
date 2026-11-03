@@ -4242,3 +4242,68 @@ func TestDemotedSliceSurvivesRename(t *testing.T) {
 		t.Fatalf("post-rename bytes = %q, want AAAAAAAA", data)
 	}
 }
+
+// Round-30: an overlay image containing a write that SURVIVED the commit
+// (appended mid-flight, still pending) stays protected — the flush of the
+// earlier snapshot does not make it remotely reproducible.
+func TestOverlayWithSurvivingWriteStaysProtected(t *testing.T) {
+	f := newFakeV2(t)
+	f.setLegacy(true)
+	f.setDir("/d", true)
+	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: engineCacheDir(t)})
+	h := New(Options{Engine: eng, Threshold: 0, SyncMode: "interactive"})
+	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
+	eh := res.Handle.(*engineHandle)
+	if err := eh.Write(context.Background(), 0, []byte("AAAA")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// Deferred Z@0 (snapshot S1) — then, while S1's landing is emulated
+	// in-flight, Y@1 is staged and read (the ZYAA whole-chunk image).
+	if err := eh.Write(context.Background(), 0, []byte("Z")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Write(context.Background(), 1, []byte("Y")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	old := classicReadCacheBytes
+	classicReadCacheBytes = 1
+	defer func() { classicReadCacheBytes = old }()
+	if got := readFront(t, eh, 4); got != "ZYAA" {
+		t.Fatalf("overlay read = %q, want ZYAA", got)
+	}
+	br := eng.Bridge
+	// Land ONLY S1 (Z@0): model by removing the Y fragment's pending entry
+	// is wrong — instead run a real Flush: everything pending lands (both
+	// Z and Y are in one pending list in this simplified flow). To target
+	// the interleaving deterministically, commit S1 through the bridge with
+	// Y appended mid-flight:
+	br.mu.Lock()
+	pend := br.pending[eh.ino]
+	s1 := append([]pendingWrite(nil), pend[:len(pend)-1]...) // Z only
+	br.pending[eh.ino] = pend                                // restore: surgical delete keeps Y
+	br.mu.Unlock()
+	_ = s1
+	// Direct: simulate releaseCommitted for S1 with Y still pending.
+	br.mu.Lock()
+	br.classicSeen[eh.ino] = f.ids["/d/f.bin"]
+	br.mu.Unlock()
+	br.releaseCommitted(eh.ino, []pendingWrite{pend[0]})
+	// Pressure hard: the ZYAA image must stay (Y is un-published).
+	for i := 0; i < 8; i++ {
+		d := make([]byte, 4096)
+		_, _ = rand.Read(d)
+		br.stageClassicChunk(sha256Hex(d), d, "/d/f.bin", int64(i+1)<<20, false, fmt.Sprintf("res-%d", i+2), 1)
+	}
+	if got := readFront(t, eh, 4); got != "ZYAA" {
+		t.Fatalf("post-pressure read = %q, want ZYAA (an image with a surviving pending write must not demote)", got)
+	}
+}

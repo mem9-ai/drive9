@@ -2140,6 +2140,17 @@ func (b *Bridge) TruncateLocal(ctx context.Context, local string, size int64) er
 // release cleared the sibling's bytes and a fresh sibling silently
 // uploaded zeros for them).
 func (b *Bridge) releaseCommitted(ino meta.Ino, pending []pendingWrite) {
+	// Whole-chunk overlay images from this inode become remotely
+	// reproducible only when NOTHING survives un-published: the surgical
+	// deletion preserved writes appended during the commit, and their
+	// bytes exist only inside those images. Resolving by commit snapshot
+	// (per checksum) left such images demotable with Y still pending.
+	b.mu.Lock()
+	surviving := len(b.pending[ino]) > 0
+	b.mu.Unlock()
+	if !surviving {
+		defer b.blocks.resolveOverlaysFor(ino)
+	}
 	// The reference snapshot and the retirement must share ONE critical
 	// section with Bridge.Write's staging (b.mu): a snapshot-then-unlock
 	// let a sibling stage the same checksum between the two and lose its
@@ -2164,9 +2175,6 @@ func (b *Bridge) releaseCommitted(ino meta.Ino, pending []pendingWrite) {
 		// after the last reference completed, and pinned entries are never
 		// retired by the classic-read LRU.
 		b.blocks.unpin(p.checksum)
-		// The landed fragment makes any whole-chunk overlay image
-		// reproducible from the remote again — its entry may demote.
-		b.blocks.resolveOverlaysFor(ino)
 		if refs[p.checksum] > 0 {
 			continue
 		}
