@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -1439,6 +1440,29 @@ func GitAllowLocalRepos() bool {
 	}
 }
 
+// HasRemoteHelperScheme reports whether value uses git's
+// "<helper>::<address>" remote-helper syntax outside an IPv6 bracket. ext:: is
+// the executor; the other helpers are rejected on the same rule because the
+// caller's URL should never select a transport helper.
+func HasRemoteHelperScheme(value string) bool {
+	depth := 0
+	for i := 0; i < len(value); i++ {
+		switch value[i] {
+		case '[':
+			depth++
+		case ']':
+			if depth > 0 {
+				depth--
+			}
+		case ':':
+			if depth == 0 && i+1 < len(value) && value[i+1] == ':' {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // ValidateRepoURL rejects a repository URL that git would treat as a command,
 // a local path, or an option.
 //
@@ -1458,9 +1482,11 @@ func ValidateRepoURL(raw string) error {
 	if strings.HasPrefix(value, "-") {
 		return fmt.Errorf("repo_url must not start with '-'")
 	}
-	// ext:: (and its remote-helper cousins) execute a command named by the URL.
-	if strings.Contains(strings.ToLower(value), "ext::") || strings.Contains(value, "::") {
-		return fmt.Errorf("repo_url must not use an ext:: transport")
+	// A "<helper>::<address>" prefix is git's remote-helper syntax, and ext::
+	// executes a command named by the URL. Only a top-level "::" is a helper
+	// prefix: inside brackets it is an IPv6 literal, which is a valid host.
+	if HasRemoteHelperScheme(value) {
+		return fmt.Errorf("repo_url must not use an ext:: or remote-helper transport")
 	}
 	allowLocal := GitAllowLocalRepos()
 	scheme, rest, hasScheme := strings.Cut(value, "://")
@@ -1478,6 +1504,19 @@ func ValidateRepoURL(raw string) error {
 			return fmt.Errorf("repo_url scheme %q is not supported", scheme)
 		}
 		return nil
+	}
+	// Bracketed IPv6 scp-like syntax: [user@][2001:db8::1]:path
+	if strings.HasPrefix(value, "[") || (strings.Contains(value, "@[") && strings.Index(value, "@[") < strings.Index(value, "]:")) {
+		at := strings.Index(value, "@[")
+		if at < 0 {
+			at = 0
+		}
+		if end := strings.Index(value, "]:"); end > at+1 {
+			host := strings.Trim(value[at+1:end], "[]")
+			if ip := net.ParseIP(host); ip != nil && ip.To4() == nil && strings.TrimSpace(value[end+2:]) != "" {
+				return nil
+			}
+		}
 	}
 	// scp-like syntax: [user@]host:path
 	host, path, ok := strings.Cut(value, ":")

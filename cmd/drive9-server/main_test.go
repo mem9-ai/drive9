@@ -872,3 +872,32 @@ func TestDecodePreviousMasterKeys(t *testing.T) {
 		t.Fatal("expected a length error for a 16-byte key")
 	}
 }
+
+// Presigned URLs must follow the listener's scheme: with direct TLS enabled an
+// http:// base would hand clients URLs against an https listener.
+func TestPublicBaseURLFollowsTLSScheme(t *testing.T) {
+	keys := []string{"DRIVE9_PUBLIC_URL", "DRIVE9_TLS_CERT_FILE", "DRIVE9_TLS_KEY_FILE"}
+	t.Cleanup(func() { restoreEnv(t, snapshotEnv(t, keys)) })
+	unsetEnv(t, keys)
+
+	unsetEnv(t, []string{"DRIVE9_TLS_CERT_FILE", "DRIVE9_TLS_KEY_FILE"})
+	if got := publicBaseURL("127.0.0.1:9009"); got != "http://127.0.0.1:9009" {
+		t.Fatalf("plaintext base = %q", got)
+	}
+
+	setEnv(t, "DRIVE9_TLS_CERT_FILE", "/etc/drive9/tls.crt")
+	setEnv(t, "DRIVE9_TLS_KEY_FILE", "/etc/drive9/tls.key")
+	if got := publicBaseURL("127.0.0.1:9009"); got != "https://127.0.0.1:9009" {
+		t.Fatalf("tls base = %q, want https", got)
+	}
+	// A half-configured pair is not treated as TLS; ListenAndServe rejects it.
+	unsetEnv(t, []string{"DRIVE9_TLS_KEY_FILE"})
+	if got := publicBaseURL("127.0.0.1:9009"); got != "http://127.0.0.1:9009" {
+		t.Fatalf("half TLS base = %q, want http", got)
+	}
+	// An explicit public URL always wins.
+	setEnv(t, "DRIVE9_PUBLIC_URL", "https://drive9.example.com/")
+	if got := publicBaseURL("127.0.0.1:9009"); got != "https://drive9.example.com" {
+		t.Fatalf("explicit base = %q", got)
+	}
+}

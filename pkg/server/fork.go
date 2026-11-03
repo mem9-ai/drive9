@@ -351,6 +351,10 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 	if err != nil {
 		return nil, err
 	}
+	// The lock stays held until the fork's organization binding is durable:
+	// CountTiDBCloudFreeTenants joins tenant_tidbcloud_org_bindings, so a fork
+	// released before its binding is written is invisible to the next request
+	// and two overlapping forks could both pass the ceiling.
 	defer func() {
 		if releaseFreeQuota == nil {
 			return
@@ -389,13 +393,6 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 	forkRoot.UpdatedAt = now
 	if err := s.meta.InsertTenant(ctx, &forkRoot); err != nil {
 		return nil, err
-	}
-	if releaseFreeQuota != nil {
-		if releaseErr := releaseFreeQuota(); releaseErr != nil {
-			logger.Error(ctx, "fork_free_quota_lock_release_failed",
-				zap.String("organization_id", orgID), zap.Error(releaseErr))
-		}
-		releaseFreeQuota = nil
 	}
 	if err := s.copyAutoEmbeddingProfileForFork(ctx, source.ID, forkID, source.Provider, now); err != nil {
 		s.deleteForkBranchOrPersist(ctx, forkID, credentialReq, nil)

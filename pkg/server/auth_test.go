@@ -964,8 +964,18 @@ func TestVerifyVaultCapabilityLocallyRejectsForgedAndExpiredTokens(t *testing.T)
 	if err := s.verifyVaultCapabilityLocally(capTok, "tenant-b"); err == nil {
 		t.Fatal("token verified under a different tenant")
 	}
-	// A tampered signature fails.
-	forged := capTok[:len(capTok)-2] + "AA"
+	// A tampered signature fails. Flip one signature character to a different
+	// value instead of overwriting the tail, which could already be "AA" and
+	// leave the token unchanged.
+	last := capTok[len(capTok)-1]
+	replacement := byte('A')
+	if last == 'A' {
+		replacement = 'B'
+	}
+	forged := capTok[:len(capTok)-1] + string(replacement)
+	if forged == capTok {
+		t.Fatal("test setup produced an unchanged token")
+	}
 	if err := s.verifyVaultCapabilityLocally(forged, tenantID); err == nil {
 		t.Fatal("forged token verified")
 	}

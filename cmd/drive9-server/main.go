@@ -633,6 +633,13 @@ func (cfg s3Config) awsConfig() s3client.AWSConfig {
 	}
 }
 
+// tlsDirectlyEnabled reports whether the API listener will serve HTTPS itself
+// (both halves of the certificate configuration are present).
+func tlsDirectlyEnabled() bool {
+	return strings.TrimSpace(os.Getenv("DRIVE9_TLS_CERT_FILE")) != "" &&
+		strings.TrimSpace(os.Getenv("DRIVE9_TLS_KEY_FILE")) != ""
+}
+
 func versionText() string {
 	return buildinfo.String("drive9-server")
 }
@@ -858,13 +865,22 @@ func publicBaseURL(listenAddr string) string {
 		return v
 	}
 
+	// Presigned URLs are minted from this base. When the listener serves TLS
+	// directly, the scheme must follow: an http:// URL against an https
+	// listener is rejected by every client (and would send signed object URLs
+	// in the clear).
+	scheme := "http"
+	if tlsDirectlyEnabled() {
+		scheme = "https"
+	}
+
 	// Without DRIVE9_PUBLIC_URL, only allow explicit loopback addresses.
 	// Wildcard or non-loopback addresses would produce unreachable presigned URLs.
 	switch {
 	case strings.HasPrefix(listenAddr, "127.0.0.1:"),
 		strings.HasPrefix(listenAddr, "localhost:"),
 		strings.HasPrefix(listenAddr, "[::1]:"):
-		return "http://" + listenAddr
+		return scheme + "://" + listenAddr
 	case strings.HasPrefix(listenAddr, "http://"), strings.HasPrefix(listenAddr, "https://"):
 		return strings.TrimRight(listenAddr, "/")
 	default:

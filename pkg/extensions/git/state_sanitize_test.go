@@ -49,6 +49,12 @@ func TestSanitizeGitCheckpointDirStripsExecutionSurface(t *testing.T) {
 [remote "origin"]
 	url = https://github.com/example/repo.git
 	fetch = +refs/heads/*:refs/remotes/origin/*
+[remote "evil"]
+	url = ext::sh -c 'touch /tmp/pwned'
+	vcs = evil
+	uploadpack = touch /tmp/pwned
+	receivepack = touch /tmp/pwned
+	proxy = touch /tmp/pwned
 [branch "main"]
 	remote = origin
 	merge = refs/heads/main
@@ -77,6 +83,10 @@ func TestSanitizeGitCheckpointDirStripsExecutionSurface(t *testing.T) {
 		"fsmonitor", "pager", "sshCommand", "askPass", "editor", "hooksPath",
 		"alternateRefsCommand", "filter", "textconv", "driver", "include",
 		"insteadOf", "credential", "helper",
+		// remote keys that name a program git runs
+		"vcs", "uploadpack", "receivepack", "proxy", "ext::",
+		// a checkpoint must not redirect the worktree outside the repository
+		"core.worktree",
 	} {
 		if strings.Contains(got, banned) {
 			t.Errorf("config still contains %q:\n%s", banned, got)
@@ -168,5 +178,28 @@ func TestCheckpointArchiveSkipsHooks(t *testing.T) {
 		if strings.HasPrefix(hdr.Name, "hooks/") {
 			t.Fatalf("archive carries %q", hdr.Name)
 		}
+	}
+}
+
+// extensions.worktreeconfig moves core.* keys into config.worktree; a
+// checkpoint must not be able to hide an executable key there.
+func TestSanitizeGitCheckpointDirStripsWorktreeConfig(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "config"), []byte("[core]\n\trepositoryformatversion = 0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	worktreeConfig := "[core]\n\tfsmonitor = /tmp/evil\n\thooksPath = /tmp/evil-hooks\n"
+	if err := os.WriteFile(filepath.Join(dir, "config.worktree"), []byte(worktreeConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := sanitizeGitCheckpointDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "config.worktree"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(data); strings.Contains(got, "fsmonitor") || strings.Contains(got, "hooksPath") {
+		t.Fatalf("config.worktree kept executable keys:\n%s", got)
 	}
 }

@@ -27,24 +27,29 @@ func DBTLSSkipVerifyRequested() bool {
 
 // MySQLTLSParam returns the go-sql-driver `tls` DSN value for a tenant DB
 // connection. Loopback hosts never request TLS: local unistore TiDB (and most
-// testcontainers mappings) do not speak it. Non-loopback TiDB Cloud Native
-// endpoints get verified TLS, not skip-verify: the DSN carries the tenant's
-// database password, so an unverified channel would expose it to anyone on the
-// path. DRIVE9_DB_TLS_SKIP_VERIFY is the documented, explicit opt-out.
+// testcontainers mappings) do not speak it.
+//
+// Every non-loopback host gets TLS regardless of the provider or of the stored
+// DBTLS flag: the DSN carries the tenant's database password, so an unverified
+// or absent channel would expose it to anyone on the path.
+// DRIVE9_DB_TLS_SKIP_VERIFY only trades certificate verification for
+// encryption — it never removes encryption — so a deployment that opts out
+// still gets a TLS connection, not a plaintext one.
 func MySQLTLSParam(tlsEnabled bool, provider, host string) string {
+	skipVerify := DBTLSSkipVerifyRequested()
 	if tlsEnabled {
-		if DBTLSSkipVerifyRequested() {
+		if skipVerify {
 			return "skip-verify"
 		}
 		return "true"
 	}
-	if UsesTiDBCloudNativeCredentials(provider) && !IsLoopbackDBHost(host) {
-		if DBTLSSkipVerifyRequested() {
-			return "skip-verify"
-		}
-		return "true"
+	if IsLoopbackDBHost(host) {
+		return ""
 	}
-	return ""
+	if skipVerify {
+		return "skip-verify"
+	}
+	return "true"
 }
 
 // IsLoopbackDBHost reports whether host is a loopback name or address.

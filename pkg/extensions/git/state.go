@@ -1151,6 +1151,27 @@ var gitCheckpointSafeConfigSections = map[string]bool{
 	"init":   true,
 }
 
+// gitCheckpointUnsafeRemoteKeys are remote-section keys that make git run a
+// program rather than talk to a URL.
+var gitCheckpointUnsafeRemoteKeys = map[string]bool{
+	"vcs":         true, // remote.<name>.vcs invokes git-remote-<vcs>
+	"uploadpack":  true,
+	"receivepack": true,
+	"proxy":       true,
+}
+
+// splitGitConfigKeyValue splits one config line into its lower-cased key and its
+// trimmed value (empty when the line has no "=").
+func splitGitConfigKeyValue(line string) (string, string) {
+	key := line
+	value := ""
+	if i := strings.IndexByte(line, '='); i >= 0 {
+		key = line[:i]
+		value = strings.TrimSpace(line[i+1:])
+	}
+	return strings.ToLower(strings.TrimSpace(key)), value
+}
+
 // sanitizeGitCheckpointDir removes the executable surface of a restored .git
 // directory: the hooks directory and every config key or section that can make
 // git run a program. It is applied to the freshly extracted tree, before the
@@ -1164,7 +1185,12 @@ func sanitizeGitCheckpointDir(gitDir string) error {
 	if err := os.RemoveAll(filepath.Join(gitDir, "hooks")); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove checkpoint hooks: %w", err)
 	}
-	return sanitizeGitCheckpointConfig(filepath.Join(gitDir, "config"))
+	if err := sanitizeGitCheckpointConfig(filepath.Join(gitDir, "config")); err != nil {
+		return err
+	}
+	// extensions.worktreeconfig moves core.* keys into config.worktree, so a
+	// checkpoint could hide a fsmonitor/pager there instead of in config.
+	return sanitizeGitCheckpointConfig(filepath.Join(gitDir, "config.worktree"))
 }
 
 // sanitizeGitCheckpointConfig rewrites a git config file keeping only the
@@ -1216,6 +1242,22 @@ func sanitizeGitCheckpointConfig(path string) error {
 		// values; core/extensions/gc are key allowlists because those keys can
 		// name a program to run.
 		continued = strings.HasSuffix(trimmed, `\`)
+		if sectionName == "remote" {
+			// A remote section is kept for its URL and fetch refspecs, but some
+			// of its keys name a program git runs: remote.<name>.vcs selects a
+			// git-remote-<vcs> helper, and uploadpack/receivepack/proxy name
+			// commands. Those are dropped, as is any URL that asks for a
+			// remote-helper transport.
+			key, value := splitGitConfigKeyValue(trimmed)
+			if gitCheckpointUnsafeRemoteKeys[key] {
+				continue
+			}
+			if (key == "url" || key == "pushurl") && gitcache.HasRemoteHelperScheme(value) {
+				continue
+			}
+			out.WriteString(line)
+			continue
+		}
 		if gitCheckpointSafeConfigSections[sectionName] {
 			out.WriteString(line)
 			continue

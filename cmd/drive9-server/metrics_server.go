@@ -52,16 +52,32 @@ func resolveMetricsListenAddr(envAddr string, localProvider bool) (string, bool)
 // rejectLocalProviderNonLoopbackMetrics keeps provider=local inside its
 // loopback boundary. Local mode does not isolate tenants in SQL, so serving
 // process metrics — which carry tenant and organization labels — on a routable
-// address would leak one local tenant's identifiers to the network.
+// address would leak one local tenant's identifiers to the network. Any
+// non-loopback bind is refused, not just the wildcard ones: a specific LAN
+// address is just as reachable as 0.0.0.0 from the network's point of view.
 func rejectLocalProviderNonLoopbackMetrics(addr string) error {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		return fmt.Errorf("invalid metrics listen address %q: %w", addr, err)
 	}
-	if host == "" || host == "0.0.0.0" || host == "::" {
-		return fmt.Errorf("DRIVE9_METRICS_LISTEN=%q exposes metrics beyond loopback while DRIVE9_TENANT_PROVIDER=local; use 127.0.0.1:<port> or disable the listener", addr)
+	if isLoopbackMetricsHost(host) {
+		return nil
 	}
-	return nil
+	return fmt.Errorf("DRIVE9_METRICS_LISTEN=%q must bind loopback while DRIVE9_TENANT_PROVIDER=local; use 127.0.0.1:<port> (or [::1]:<port>), or disable the listener", addr)
+}
+
+// isLoopbackMetricsHost reports whether a listen host only accepts loopback
+// connections.
+func isLoopbackMetricsHost(host string) bool {
+	h := strings.Trim(strings.TrimSpace(host), "[]")
+	if h == "" {
+		return false
+	}
+	if strings.EqualFold(h, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(h)
+	return ip != nil && ip.IsLoopback()
 }
 
 // serveMetrics serves the dedicated metrics handler on ln until ctx is

@@ -5913,10 +5913,10 @@ func (s *Server) cleanupProvisionedClusterAfterProvisionFailure(ctx context.Cont
 }
 
 // dbTLSForProvisionedTenant records whether a provisioned tenant's connection
-// uses TLS. Every non-local provider does; the DBTLS flag only distinguishes
-// "TLS" from "TLS without certificate verification", which is now the explicit
-// DRIVE9_DB_TLS_SKIP_VERIFY opt-out rather than an implicit private-endpoint
-// default.
+// has its certificate verified. The DBTLS flag only distinguishes "verified
+// TLS" from "TLS without certificate verification", which is the explicit
+// DRIVE9_DB_TLS_SKIP_VERIFY opt-out; it never means "no TLS" for a non-local
+// provider.
 func dbTLSForProvisionedTenant(provider string) bool {
 	if provider == tenant.ProviderLocal {
 		return false
