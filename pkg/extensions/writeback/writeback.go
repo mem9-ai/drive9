@@ -2746,23 +2746,6 @@ func (w *Writeback) armBypass(path string, rev, size int64, reason string) {
 // write touching an evicted part failed with 'shadow file not found' and
 // surfaced as EIO on write(2). After a landing the remote image is
 // authoritative and complete, so it becomes the fallback restore source.
-// stagedSnapshotIs reports whether the landing acknowledged the image this
-// buffer still holds: the snapshot ID matches (a newer staging mints a
-// fresh one) AND the content generation is unchanged since that staging —
-// a truncate-regrow without a new staging keeps the ID but diverges the
-// bytes.
-func (h *bufferingHandle) stagedSnapshotIs(id string) bool {
-	if id == "" {
-		return false
-	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.stagedSnapshotID != id {
-		return false
-	}
-	return h.buf == nil || h.buf.ContentVersion() == h.stagedContentVersion
-}
-
 func (h *bufferingHandle) armRemoteRestoreLocked(size int64) {
 	// h.mu must be held: every field read and every WriteBuffer mutation
 	// below (LoadPart install, SetRemoteSize, MarkRemoteAuthoritative)
