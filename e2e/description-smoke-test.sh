@@ -199,6 +199,11 @@ else
   export DRIVE9_QUERY_EMBED_DIMENSIONS="$EMBED_DIMS"
 fi
 
+# The harness starts its own drive9-server; the metrics listener has a fixed
+# default port that a concurrently running server may already hold, so keep it
+# off unless the caller asked for a specific address.
+export DRIVE9_METRICS_LISTEN="${DRIVE9_METRICS_LISTEN:-off}"
+
 export DRIVE9_SEMANTIC_WORKERS=1
 export DRIVE9_SEMANTIC_POLL_INTERVAL_MS=200
 
