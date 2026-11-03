@@ -1125,12 +1125,6 @@ func (c *Client) completeUploadWithOptions(ctx context.Context, uploadID string,
 	return nil
 }
 
-// resourceIDOf extracts an echoed resource identity from a response.
-func resourceIDOf(resp *http.Response) string {
-	id, _ := completedEchoOf(resp)
-	return id
-}
-
 // completedEchoOf decodes a completion response's echo block once: the
 // landed object's resource identity and, when the server attributes one,
 // the revision of exactly this publication.
