@@ -38,6 +38,7 @@ import (
 	"hash/fnv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/meta"
@@ -51,6 +52,10 @@ type Config struct {
 	// RemoteRoot is the namespace subtree the bridge serves (the JuiceFS
 	// root inode maps onto it).
 	RemoteRoot string
+	// StagingDir arms the interactive-durability barrier: pending blocks
+	// are spilled there at fsync and re-committed by a later mount when a
+	// remote commit never landed. Empty disables the barrier.
+	StagingDir string
 }
 
 const (
@@ -71,6 +76,14 @@ type Bridge struct {
 	// blocks maps deterministic ids (content sha256, or the zero-block ids)
 	// to their URL registry entry.
 	blocks *blockRegistry
+	// deferred (interactive durability): meta.Write keeps slices pending
+	// locally instead of committing remotely at every writer flush; reads
+	// overlay the pending state and the remote commit lands at the
+	// flush/close boundary or the next mount's replay.
+	deferred atomic.Bool
+	// commitLocks serializes per-file commit lifecycles (FlushFile).
+	commitMu    sync.Mutex
+	commitLocks map[meta.Ino]*sync.Mutex
 
 	// paths caches inode → remote path; inode values are content-stable
 	// hashes of the path so lookups survive restarts of the bridge.
@@ -123,7 +136,7 @@ func NewBridge(cfg Config) *Bridge {
 	if root == "" {
 		root = "/"
 	}
-	return &Bridge{
+	br := &Bridge{
 		cfg:          cfg,
 		format:       meta.Format{Name: "drive9", UUID: "drive9-extent-v2", Storage: "drive9-presign", BlockSize: blockSizeMiB << 20, TrashDays: 0, DirStats: false},
 		nextID:       uint64(1) << 63,
@@ -139,8 +152,24 @@ func NewBridge(cfg Config) *Bridge {
 		nextHeldIno:  heldInoBase,
 		moved:        make(map[meta.Ino]string),
 		replacements: make(map[string]meta.Ino),
+		commitLocks:  make(map[meta.Ino]*sync.Mutex),
 	}
+	// Provenance refetch resolves through the inode's CURRENT mapping:
+	// open files move under renames and retention aliases, and a stale
+	// plan path belongs to a replacement file or nothing at all.
+	br.blocks.currentPath = func(ino meta.Ino) (string, bool) {
+		br.mu.Lock()
+		defer br.mu.Unlock()
+		p, ok := br.paths[ino]
+		return p, ok
+	}
+	return br
 }
+
+// newBridgeFinish installs cross-referencing hooks that need the assembled
+// Bridge (the block registry resolves provenance inodes through the
+// bridge's CURRENT path mappings — open files move under renames and
+// retention aliases).
 
 // Storage returns the object backend for the chunk store.
 func (b *Bridge) Storage() objectStorage {
@@ -226,6 +255,8 @@ func detID(sum []byte) uint64 {
 type blockRegistry struct {
 	mu sync.Mutex
 	m  map[uint64]*blockEntry
+	// currentPath resolves an inode to the remote path it maps to NOW.
+	currentPath func(ino meta.Ino) (string, bool)
 }
 
 type blockEntry struct {
@@ -235,6 +266,7 @@ type blockEntry struct {
 	expires         time.Time
 	path            string // provenance for plan refetch
 	provenanceStart int64
+	provenanceIno   meta.Ino // whose mapping the provenance path belongs to
 	cached          []byte
 }
 

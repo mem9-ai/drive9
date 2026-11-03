@@ -4244,6 +4244,27 @@ func (h *bufferingHandle) commitLocked(ctx context.Context) error {
 		// hosts), and close(2) returned after the local durable stage.
 		return h.stageAndEnqueue(ctx)
 	}
+	// Extent takeover must not depend on the durability policy: the
+	// per-Write synchronous boundary (write-sync) routes a
+	// promotion-sized image through the extent branch too — stage locally
+	// and land synchronously through the queue's extent session, waiting
+	// for THIS path so the Write still returns remote-durable.
+	if size := func() int64 {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		if h.buf == nil {
+			return 0
+		}
+		return h.buf.Size()
+	}(); h.w.extentRoute(size) {
+		if err := h.stageAndEnqueueOpt(ctx, true, false); err != nil {
+			return err
+		}
+		if err := h.w.queue.WaitPathOutcome(h.path, uploadTimeout); err != nil {
+			return fs.StatusErrorOf(gofuse.Status(syscall.EIO))
+		}
+		return nil
+	}
 	// Commit dispatch: a partial edit of an existing large file patches
 	// only the dirty parts (the server copies the rest from the current
 	// object); everything else falls through to the full-write path.

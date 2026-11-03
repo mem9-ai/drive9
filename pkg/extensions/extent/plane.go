@@ -37,6 +37,12 @@ type Options struct {
 	// bridge commit per write); the other policies commit at Flush/Release
 	// like the classic plane.
 	SyncPolicy string
+	// SyncMode is the mount's resolved fsync semantic: "interactive" makes
+	// fsync a LOCAL durability barrier (pending blocks spilled under the
+	// engine's staging dir; the remote commit lands at flush/close or the
+	// next mount's replay) exactly like the classic plane's staging
+	// ledger; "strict" (or empty) pays the remote commit synchronously.
+	SyncMode string
 	// Events, when set, drops the bridge's cached mappings when names
 	// vanish or change underneath the engine.
 	Events *fs.EventBus
@@ -58,6 +64,11 @@ type Handler struct {
 // New builds the engine-plane handler.
 func New(opts Options) *Handler {
 	h := &Handler{opts: opts, handles: make(map[string][]*engineHandle)}
+	if opts.SyncMode == "interactive" && opts.Engine != nil {
+		// Interactive durability: fsync is a local barrier; commits defer
+		// to the flush/close boundary (or the next mount's replay).
+		opts.Engine.Bridge.EnableDeferredCommits()
+	}
 	if opts.Events != nil {
 		// A rename rides EventWrite for the OLD name with RenamedTo set
 		// (pkg/fuse mutatedRename), followed by a plain EventDelete for
@@ -225,6 +236,13 @@ func (h *Handler) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, e
 		}
 		unlock()
 		return fs.Result{}, nil
+	case fs.OpLookup:
+		// A fresh engine create exists only in the bridge until its first
+		// commit; the classic lookup would answer (and negatively cache)
+		// ENOENT for a successfully created, still-open file.
+		if attr, ok := h.lookupLocalOnly(ctx, op.Path); ok {
+			return fs.Result{Attr: attr}, nil
+		}
 	case fs.OpCreate:
 		if res, err, claimed := h.tryClaimOpen(ctx, op); claimed {
 			return res, err
@@ -240,6 +258,14 @@ func (h *Handler) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, e
 			}
 		}
 	case fs.OpGetAttr:
+		h.mu.Lock()
+		_, open := h.handles[op.Path]
+		h.mu.Unlock()
+		if open {
+			if attr, ok := h.lookupLocalOnly(ctx, op.Path); ok {
+				return fs.Result{Attr: attr}, nil
+			}
+		}
 		res, err := next(ctx, op)
 		if err == nil && res.Attr != nil {
 			h.mu.Lock()
@@ -283,7 +309,16 @@ func (h *Handler) tryClaimOpen(ctx context.Context, op *fs.Op) (fs.Result, error
 			return fs.Result{}, errno, true
 		}
 		handle := h.register(op.Path, ino, fh, op.Caller)
-		return fs.Result{Handle: handle}, nil, true
+		// Creation attributes let the facade populate its namespace cache
+		// (a handle-only reply leaves the entry uncached).
+		attr := &fs.Attr{Kind: fs.KindFile, Nlink: 1}
+		if st2, serr := h.opts.Engine.Bridge.StatLocal(ctx, op.Path); serr == nil {
+			attr.Size = st2.Size
+			if st2.HasMode {
+				attr.Mode = st2.Mode
+			}
+		}
+		return fs.Result{Handle: handle, Attr: attr}, nil, true
 	}
 	if !client.IsNotFound(err) {
 		return fs.Result{}, nil, false
@@ -314,7 +349,33 @@ func (h *Handler) tryClaimOpen(ctx context.Context, op *fs.Op) (fs.Result, error
 		return fs.Result{}, errno, true
 	}
 	handle := h.register(op.Path, ino, fh, op.Caller)
-	return fs.Result{Handle: handle}, nil, true
+	return fs.Result{Handle: handle, Attr: &fs.Attr{Kind: fs.KindFile, Mode: mode, Nlink: 1}}, nil, true
+}
+
+// lookupLocalOnly answers namespace operations for files that exist ONLY
+// in the bridge: fresh engine creates claimed from byte zero do not
+// materialize server-side until their first commit. Committed files answer
+// the classic plane themselves.
+func (h *Handler) lookupLocalOnly(ctx context.Context, path string) (*fs.Attr, bool) {
+	if h.opts.Engine == nil {
+		return nil, false
+	}
+	br := h.opts.Engine.Bridge
+	ino, ok := br.LocalResolve(path)
+	if !ok {
+		return nil, false
+	}
+	if st, err := br.StatLocal(ctx, path); err == nil {
+		_ = st
+		return nil, false // remotely materialized: the classic plane answers
+	} else if !client.IsNotFound(err) {
+		return nil, false // undecided: do not shadow the classic plane
+	}
+	size, mode, _ := br.LocalView(ino)
+	if mode == 0 {
+		mode = 0o644
+	}
+	return &fs.Attr{Kind: fs.KindFile, Mode: mode, Size: size, Nlink: 1}, true
 }
 
 // claimsPattern reports whether a fresh create of the path is explicitly
@@ -467,8 +528,19 @@ func (h *Handler) tryTruncate(ctx context.Context, op *fs.Op, next fs.Next) (fs.
 		return fs.Result{}, err, true
 	}
 	if !op.HasMode && op.SetUID == 0 && op.SetGID == 0 && op.Mtime.IsZero() {
+		// The facade treats this attribute as authoritative (it re-applies
+		// the mode and publishes to the caches); a size-only attribute
+		// would publish mode 0000. Return the complete current set.
 		size, _ := h.opts.Engine.LocalAttr(ctx, op.Path)
-		return fs.Result{Attr: &fs.Attr{Size: size}}, nil, true
+		attr := &fs.Attr{Kind: fs.KindFile, Nlink: 1, Size: size}
+		if live != nil {
+			if st, err := h.opts.Engine.Bridge.StatLocal(ctx, live.path); err == nil && st.HasMode {
+				attr.Mode = st.Mode
+			} else if m, ok := h.opts.Engine.Bridge.ModeOf(live.ino); ok && m != 0 {
+				attr.Mode = m
+			}
+		}
+		return fs.Result{Attr: attr}, nil, true
 	}
 	// Mixed setattr: the size landed in the bridge, the rest goes classic.
 	rest := *op
@@ -525,6 +597,13 @@ func (e *engineHandle) Write(ctx context.Context, off int64, data []byte) error 
 func (e *engineHandle) Sync(ctx context.Context) error {
 	if errno := e.plane.opts.Engine.VFS.Fsync(e.vctx, e.ino, 0, e.fh); errno != 0 {
 		return errno
+	}
+	if e.plane.opts.SyncMode == "interactive" {
+		// fsync is a local durability barrier on RTT-bound mounts, exactly
+		// like the classic plane's staging ledger: spill the pending blocks
+		// durably and return; the remote commit lands at the flush/close
+		// boundary or the next mount's replay of the staged record.
+		return e.plane.opts.Engine.Bridge.StagePendingLocal(e.ino)
 	}
 	return e.plane.opts.Engine.FlushFile(ctx, uint64(e.ino))
 }

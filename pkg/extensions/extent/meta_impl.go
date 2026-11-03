@@ -2,10 +2,15 @@ package extent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"path"
+	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -498,7 +503,11 @@ func (b *Bridge) Read(ctx meta.Context, ino meta.Ino, indx uint32, slices *[]met
 	}
 	b.mu.Lock()
 	b.revs[ino] = plan.Revision
-	if plan.Size > b.sizes[ino] {
+	// A pending truncation is authoritative: the server's (older, larger)
+	// plan size must not resurrect a shrunk tail — the truncate-only
+	// flush would then see its own size back and silently drop the
+	// shrink.
+	if _, truncating := b.truncs[ino]; !truncating && plan.Size > b.sizes[ino] {
 		b.sizes[ino] = plan.Size
 	}
 	b.mu.Unlock()
@@ -507,21 +516,138 @@ func (b *Bridge) Read(ctx meta.Context, ino meta.Ino, indx uint32, slices *[]met
 	for n > 0 && blocks[n-1].Zero {
 		n--
 	}
-	out := make([]meta.Slice, 0, n)
-	for _, blk := range blocks[:n] {
+	blocks = blocks[:n]
+
+	// Deferred (interactive) writes live only in the pending list: overlay
+	// them so reads serve the newest image without a remote round trip.
+	// Without pending state the plan is emitted exactly as before (plan
+	// gaps keep their server-authoritative meaning); with pending state a
+	// fragment SHADOWS the overlapping range of any plan block (JuiceFS
+	// overwrite semantics) and the merged run is re-built with explicit
+	// holes.
+	b.mu.Lock()
+	pending := append([]pendingWrite(nil), b.pending[ino]...)
+	b.mu.Unlock()
+	if len(pending) == 0 {
+		out := make([]meta.Slice, 0, len(blocks))
+		for _, blk := range blocks {
+			if blk.Zero {
+				// The engine's native hole slice: readSlice zero-fills Id 0.
+				out = append(out, meta.Slice{Id: 0, Len: uint32(blk.Length)})
+				continue
+			}
+			id := b.blocks.register(blk.BlockKey, blk.URL, blk.BlockOffset+blk.Length, path, blk.FileOffset, ino)
+			// JuiceFS slice semantics: Size is the backing object's size,
+			// Off the start within it. Shadow-merged plans reference one
+			// object with block_offset > 0, so Size must cover Off+Len for
+			// the store's key derivation and reads to line up.
+			out = append(out, meta.Slice{Id: id, Size: uint32(blk.BlockOffset + blk.Length), Off: uint32(blk.BlockOffset), Len: uint32(blk.Length)})
+		}
+		*slices = out
+		return 0
+	}
+
+	type span struct {
+		off, length int64
+		id          uint64
+		size        uint32
+		inner       uint32
+		seq         int
+	}
+	var planSpans, pend []span
+	for _, blk := range blocks {
 		if blk.Zero {
-			// The engine's native hole slice: readSlice zero-fills Id 0.
-			out = append(out, meta.Slice{Id: 0, Len: uint32(blk.Length)})
+			planSpans = append(planSpans, span{off: blk.FileOffset, length: blk.Length})
 			continue
 		}
-		id := b.blocks.register(blk.BlockKey, blk.URL, blk.BlockOffset+blk.Length, path, blk.FileOffset)
-		// JuiceFS slice semantics: Size is the backing object's size, Off
-		// the start within it. Shadow-merged plans reference one object
-		// with block_offset > 0, so Size must cover Off+Len for the store's
-		// key derivation and reads to line up.
-		out = append(out, meta.Slice{Id: id, Size: uint32(blk.BlockOffset + blk.Length), Off: uint32(blk.BlockOffset), Len: uint32(blk.Length)})
+		id := b.blocks.register(blk.BlockKey, blk.URL, blk.BlockOffset+blk.Length, path, blk.FileOffset, ino)
+		planSpans = append(planSpans, span{off: blk.FileOffset, length: blk.Length, id: id, size: uint32(blk.BlockOffset + blk.Length), inner: uint32(blk.BlockOffset)})
 	}
-	*slices = out
+	for i, p := range pending {
+		off := int64(p.chunk)*meta.ChunkSize + int64(p.off)
+		if off+p.size <= start || off > chunkEnd {
+			continue
+		}
+		id := b.blocks.registerLocal(p.checksum, p.size)
+		pend = append(pend, span{off: off, length: p.size, id: id, size: uint32(p.size), seq: i})
+	}
+	// Compact the pending fragments first: a later write shadows an
+	// earlier overlapping one.
+	sort.Slice(pend, func(i, j int) bool {
+		if pend[i].off != pend[j].off {
+			return pend[i].off < pend[j].off
+		}
+		return pend[i].seq < pend[j].seq
+	})
+	var pendCompact []span
+	for _, pe := range pend {
+		for len(pendCompact) > 0 {
+			last := &pendCompact[len(pendCompact)-1]
+			if last.off+last.length <= pe.off {
+				break
+			}
+			if last.seq > pe.seq && last.off+last.length >= pe.off+pe.length {
+				pe.length = 0 // fully shadowed by a later write
+				break
+			}
+			if last.seq < pe.seq {
+				last.length = pe.off - last.off // the later write cuts it
+				if last.length <= 0 {
+					pendCompact = pendCompact[:len(pendCompact)-1]
+					continue
+				}
+			}
+			break
+		}
+		if pe.length > 0 {
+			pendCompact = append(pendCompact, pe)
+		}
+	}
+	// Split the plan spans around the compacted pending fragments, then
+	// merge by offset with explicit holes so the run stays consecutive.
+	var merged []span
+	for _, ps := range planSpans {
+		cur := ps
+		for _, pe := range pendCompact {
+			if pe.off+pe.length <= cur.off || pe.off >= cur.off+cur.length {
+				continue
+			}
+			if pe.off > cur.off {
+				head := cur
+				head.length = pe.off - cur.off
+				merged = append(merged, head)
+			}
+			tailStart := pe.off + pe.length
+			if tailStart >= cur.off+cur.length {
+				cur.length = 0
+				break
+			}
+			cut := tailStart - cur.off
+			cur.inner += uint32(cut)
+			cur.off = tailStart
+			cur.length -= cut
+		}
+		if cur.length > 0 {
+			merged = append(merged, cur)
+		}
+	}
+	merged = append(merged, pendCompact...)
+	sort.Slice(merged, func(i, j int) bool { return merged[i].off < merged[j].off })
+
+	var outSlices []meta.Slice
+	cursor := int64(-1)
+	for _, sp := range merged {
+		if cursor >= 0 && sp.off > cursor {
+			outSlices = append(outSlices, meta.Slice{Id: 0, Len: uint32(sp.off - cursor)}) // hole
+		}
+		if sp.id == 0 {
+			outSlices = append(outSlices, meta.Slice{Id: 0, Len: uint32(sp.length)})
+		} else {
+			outSlices = append(outSlices, meta.Slice{Id: sp.id, Size: sp.size, Off: sp.inner, Len: uint32(sp.length)})
+		}
+		cursor = sp.off + sp.length
+	}
+	*slices = outSlices
 	return 0
 }
 
@@ -560,8 +686,15 @@ func (b *Bridge) Write(ctx meta.Context, ino meta.Ino, indx uint32, off uint32, 
 	}
 	pending := append([]pendingWrite(nil), b.pending[ino]...)
 	size := b.sizes[ino]
+	deferred := b.deferred.Load()
 	b.mu.Unlock()
 
+	if deferred {
+		// Interactive durability: the bytes are staged locally and reads
+		// overlay them; the remote commit lands at the flush/close
+		// boundary (StagePendingLocal makes this fsync-durable).
+		return 0
+	}
 	if err := b.commit(ctxOf(ctx), ino, pending, size); err != nil {
 		// Put the slices back so a later flush retries them.
 		b.mu.Lock()
@@ -982,6 +1115,227 @@ func (b *Bridge) ForgetPath(local string) {
 	}
 }
 
+// LocalResolve resolves a mount-local path purely from local state: the
+// live incarnation's inode when the bridge holds a mapping for the name,
+// without a server round trip. Fresh, not-yet-committed engine creates
+// exist ONLY here until their first commit.
+func (b *Bridge) LocalResolve(local string) (meta.Ino, bool) {
+	full := b.fullPath(local)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	ino := b.liveInoLocked(full)
+	p, ok := b.paths[ino]
+	return ino, ok && p == full
+}
+
+// LocalView reports the bridge's cached size and creation mode for an
+// inode (ok=false when no size is cached).
+func (b *Bridge) LocalView(ino meta.Ino) (size int64, mode uint32, ok bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	size, ok = b.sizes[ino]
+	mode = b.modes[ino]
+	return
+}
+
+// stagedManifest is the durable record of one interactive fsync barrier:
+// the file's pending blocks (spilled to sibling files) and the size state
+// a later mount needs to re-commit them.
+type stagedManifest struct {
+	Path     string `json:"path"`
+	Ino      uint64 `json:"ino"`
+	Size     int64  `json:"size"`
+	Trunc    int64  `json:"trunc,omitempty"`
+	HasTrunc bool   `json:"has_trunc,omitempty"`
+	Blocks   []struct {
+		Chunk    uint32 `json:"chunk"`
+		Off      uint32 `json:"off"`
+		Size     int64  `json:"size"`
+		Checksum string `json:"checksum"`
+		File     string `json:"file"`
+	} `json:"blocks"`
+}
+
+// StagePendingLocal is the INTERACTIVE fsync barrier: everything pending
+// on the file is spilled durably under the staging dir (block files +
+// manifest, fsynced) so a client crash loses nothing — the remote commit
+// lands at the flush/close boundary here, or at the next mount's replay.
+func (b *Bridge) StagePendingLocal(ino meta.Ino) error {
+	if b.cfg.StagingDir == "" {
+		return nil // no barrier armed: the mount degrades to strict fsync
+	}
+	b.mu.Lock()
+	path, mapped := b.paths[ino]
+	size, hasSize := b.sizes[ino]
+	pending := append([]pendingWrite(nil), b.pending[ino]...)
+	trunc, hasTrunc := b.truncs[ino]
+	b.mu.Unlock()
+	if !mapped || (!hasSize && len(pending) == 0) {
+		return nil
+	}
+	dir := filepath.Join(b.cfg.StagingDir, fmt.Sprintf("%d-%d", uint64(ino), time.Now().UnixNano()))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	clean := true
+	defer func() {
+		if clean {
+			_ = os.RemoveAll(dir)
+		}
+	}()
+	var m stagedManifest
+	m.Path, m.Ino, m.Size, m.Trunc, m.HasTrunc = path, uint64(ino), size, trunc, hasTrunc
+	ctx := context.Background()
+	for i, p := range pending {
+		data, has := b.blocks.stagedBytes(p.checksum)
+		if !has {
+			var err error
+			data, err = b.blockBytes(ctx, p, path)
+			if err != nil {
+				return err
+			}
+		}
+		name := fmt.Sprintf("%06d-%s", i, p.checksum)
+		if err := writeFileSynced(filepath.Join(dir, name), data); err != nil {
+			return err
+		}
+		m.Blocks = append(m.Blocks, struct {
+			Chunk    uint32 `json:"chunk"`
+			Off      uint32 `json:"off"`
+			Size     int64  `json:"size"`
+			Checksum string `json:"checksum"`
+			File     string `json:"file"`
+		}{Chunk: p.chunk, Off: p.off, Size: p.size, Checksum: p.checksum, File: name})
+	}
+	raw, err := json.Marshal(m)
+	if err != nil {
+		return err
+	}
+	if err := writeFileSynced(filepath.Join(dir, "manifest.json"), raw); err != nil {
+		return err
+	}
+	clean = false
+	return nil
+}
+
+// writeFileSynced writes a file and fsyncs it (the staging barrier's
+// durability point).
+func writeFileSynced(path string, data []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+// ReplayStagedLocal re-commits every staged interactive barrier that never
+// landed (a crashed or interrupted mount). Runs at engine construction.
+func (b *Bridge) ReplayStagedLocal(ctx context.Context) {
+	if b.cfg.StagingDir == "" {
+		return
+	}
+	entries, err := os.ReadDir(b.cfg.StagingDir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		dir := filepath.Join(b.cfg.StagingDir, e.Name())
+		raw, err := os.ReadFile(filepath.Join(dir, "manifest.json"))
+		if err != nil {
+			continue
+		}
+		var m stagedManifest
+		if json.Unmarshal(raw, &m) != nil || m.Ino == 0 {
+			continue
+		}
+		ino := meta.Ino(m.Ino)
+		pending := make([]pendingWrite, 0, len(m.Blocks))
+		for _, blk := range m.Blocks {
+			data, err := os.ReadFile(filepath.Join(dir, blk.File))
+			if err != nil {
+				continue
+			}
+			b.blocks.stageBytes(blk.Checksum, data)
+			pending = append(pending, pendingWrite{chunk: blk.Chunk, off: blk.Off, checksum: blk.Checksum, size: blk.Size})
+		}
+		b.mu.Lock()
+		// Direct assignment: remember() takes b.mu itself.
+		b.paths[ino] = m.Path
+		b.sizes[ino] = m.Size
+		b.pending[ino] = pending
+		if m.HasTrunc {
+			b.truncs[ino] = m.Trunc
+		}
+		b.mu.Unlock()
+		rctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+		err = b.FlushFile(rctx, ino)
+		cancel()
+		if err == nil {
+			_ = os.RemoveAll(dir)
+		}
+		// A failed replay leaves the record for the next mount; the
+		// staged bytes are also live in this bridge's registry, so an
+		// open of the file can still serve and commit them.
+	}
+}
+
+// clearStagedLocal drops a file's staged barriers after a successful
+// remote commit made them redundant.
+func (b *Bridge) clearStagedLocal(ino meta.Ino) {
+	if b.cfg.StagingDir == "" {
+		return
+	}
+	entries, err := os.ReadDir(b.cfg.StagingDir)
+	if err != nil {
+		return
+	}
+	prefix := fmt.Sprintf("%d-", uint64(ino))
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), prefix) {
+			_ = os.RemoveAll(filepath.Join(b.cfg.StagingDir, e.Name()))
+		}
+	}
+}
+
+// lockCommit serializes a file's commit lifecycle (snapshot -> remote
+// commit -> state cleanup) against concurrent chunk commits of the same
+// file.
+func (b *Bridge) lockCommit(ino meta.Ino) func() {
+	b.commitMu.Lock()
+	mu, ok := b.commitLocks[ino]
+	if !ok {
+		mu = &sync.Mutex{}
+		b.commitLocks[ino] = mu
+	}
+	b.commitMu.Unlock()
+	mu.Lock()
+	return mu.Unlock
+}
+
+// EnableDeferredCommits arms interactive durability: writer flushes stage
+// slices locally (reads overlay them) and the remote commit defers to the
+// flush/close boundary or the next mount's replay of a staged barrier.
+func (b *Bridge) EnableDeferredCommits() { b.deferred.Store(true) }
+
+// ModeOf reports the mode recorded for the inode at creation (Mknod).
+func (b *Bridge) ModeOf(ino meta.Ino) (uint32, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	m, ok := b.modes[ino]
+	return m, ok
+}
+
 // forgetInoLocked drops one inode's cached state; the caller holds b.mu.
 func (b *Bridge) forgetInoLocked(ino meta.Ino) {
 	delete(b.paths, ino)
@@ -1285,6 +1639,13 @@ func (b *Bridge) allocateHeldReplacementInoLocked() meta.Ino {
 // truncate-only growth. Empty fresh files (touch) materialize as classic
 // empties — the extent protocol has no zero-size session.
 func (b *Bridge) FlushFile(ctx context.Context, ino meta.Ino) error {
+	// One commit lifecycle at a time per file: concurrent chunk commits
+	// each snapshot the size independently, and a retry that only re-bases
+	// its revision could then send an older, smaller size over a newly
+	// committed tail. Serializing the snapshot->commit->cleanup sequence
+	// makes every retry observe the previous commit's result.
+	unlockCommit := b.lockCommit(ino)
+	defer unlockCommit()
 	if err := b.flushPending(ctx, ino); err != nil {
 		return err
 	}
@@ -1307,7 +1668,12 @@ func (b *Bridge) FlushFile(ctx context.Context, ino meta.Ino) error {
 	if !has {
 		return nil
 	}
-	return b.flushTruncateOnly(ctx, ino, size)
+	if err := b.flushTruncateOnly(ctx, ino, size); err != nil {
+		return err
+	}
+	// Everything landed: staged interactive barriers are redundant now.
+	b.clearStagedLocal(ino)
+	return nil
 }
 
 func (b *Bridge) CompactAll(ctx meta.Context, threads int, bar *utils.Bar) syscall.Errno { return 0 }

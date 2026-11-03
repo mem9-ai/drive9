@@ -994,9 +994,13 @@ func mountWithConfig(cfg MountConfig) error {
 			CacheDir:   cacheScopedDir(cacheBase, mountHash, "jfs-engine"),
 		}
 		if cfg.DiskReadCacheSize > 0 {
-			// Honor the mount's configured disk-cache bound for the
-			// engine's block cache too.
-			engineConf.CacheSize = uint64(cfg.DiskReadCacheSize)
+			// The classic read cache already holds the full configured
+			// budget; granting the engine the same amount again would let
+			// a mixed mount retain roughly twice the limit. Split the
+			// budget between the two independently evicted caches instead
+			// (the engine's block cache carries the large-file plane, so
+			// it gets the majority share of the split).
+			engineConf.CacheSize = uint64(cfg.DiskReadCacheSize / 2)
 		}
 		engine := extent.NewEngine(engineConf)
 		built["extent"] = extent.New(extent.Options{
@@ -1007,6 +1011,7 @@ func mountWithConfig(cfg MountConfig) error {
 			Threshold:  1,
 			Patterns:   cfg.ExtentPaths,
 			SyncPolicy: cfg.WritePolicy,
+			SyncMode:   syncMode,
 			Events:     bus,
 		})
 	}

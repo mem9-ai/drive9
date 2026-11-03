@@ -2,6 +2,7 @@ package extent
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -37,7 +38,18 @@ type Engine struct {
 
 // NewEngine builds a ready-to-use engine.
 func NewEngine(cfg EngineConfig) *Engine {
-	b := NewBridge(Config{Client: cfg.Client, RemoteRoot: cfg.RemoteRoot})
+	bcfg := Config{Client: cfg.Client, RemoteRoot: cfg.RemoteRoot}
+	if cfg.CacheDir != "" {
+		// Interactive-durability staging lives with the engine's cache.
+		bcfg.StagingDir = filepath.Join(cfg.CacheDir, "commit-staging")
+	}
+	b := NewBridge(bcfg)
+	if bcfg.StagingDir != "" {
+		// Barriers a previous mount spilled but never landed: re-commit
+		// them in the background; staged bytes are in the registry either
+		// way, so an open of the file can serve and commit them.
+		go b.ReplayStagedLocal(context.Background())
+	}
 	cacheSize := cfg.CacheSize
 	if cacheSize == 0 {
 		cacheSize = 1 << 30

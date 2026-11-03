@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -157,6 +158,7 @@ func newFakeV2(t *testing.T) *fakeV2 {
 				w.Header().Set("X-Dat9-Content-Layout", "extent")
 				w.Header().Set("X-Dat9-Revision", "3")
 				w.Header().Set("X-Dat9-Resource-ID", f.ids[path])
+				w.Header().Set("X-Dat9-Mode", "420") // 0644
 				w.Header().Set("Content-Length", fmt.Sprint(len(f.extent[path])))
 				w.WriteHeader(200)
 			case f.classic[path] != "":
@@ -2444,4 +2446,165 @@ func TestResolutionAcrossRetentionKeepsMapping(t *testing.T) {
 	if repB != 0 {
 		t.Fatalf("the name still resolves to the retained inode: replacements[/b]=%d", repB)
 	}
+}
+
+// Round-16: a size-only setattr on an engine file must return the complete
+// attribute set — the facade treats the reply as authoritative and would
+// otherwise publish mode 0000.
+func TestSizeOnlySetAttrReturnsFullAttributes(t *testing.T) {
+	f := newFakeV2(t)
+	f.seedExtent(t, "/big.bin", "AAAA-BBBBBBBB")
+	h := newTestHandler(t, f, 1<<20)
+	eh := claimOpen(t, h, "/big.bin")
+	res, err := h.Do(context.Background(), &fs.Op{Kind: fs.OpSetAttr, Path: "/big.bin", HasSize: true, Size: 4, Caller: fs.Caller{Pid: 1}}, fs.Next(func(ctx context.Context, op *fs.Op) (fs.Result, error) {
+		t.Fatal("size-only setattr on an engine file reached the classic plane")
+		return fs.Result{}, nil
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Attr == nil {
+		t.Fatal("no attribute returned")
+	}
+	if res.Attr.Kind != fs.KindFile || res.Attr.Mode == 0 || res.Attr.Size != 4 {
+		t.Fatalf("attr = %+v, want a complete file attribute with size 4", res.Attr)
+	}
+	if res.Attr.Mode&0o777 != 0o644 {
+		t.Fatalf("mode = %o, want the file's 0644", res.Attr.Mode&0o777)
+	}
+	_ = eh
+}
+
+// Round-16: a read between ftruncate and fsync must not cancel the
+// truncation — the server's (older, larger) plan size cannot resurrect the
+// shrunk tail.
+func TestReadBetweenTruncateAndFlushKeepsShrink(t *testing.T) {
+	f := newFakeV2(t)
+	f.seedExtent(t, "/big.bin", "AAAABBBBCCCCDDDD")
+	h := newTestHandler(t, f, 1<<20)
+	eh := claimOpen(t, h, "/big.bin")
+
+	_, err := h.Do(context.Background(), &fs.Op{Kind: fs.OpSetAttr, Path: "/big.bin", HasSize: true, Size: 4, Caller: fs.Caller{Pid: 1}}, fs.Next(func(ctx context.Context, op *fs.Op) (fs.Result, error) {
+		t.Fatal("size-only setattr on an engine file reached the classic plane")
+		return fs.Result{}, nil
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Read through the descriptor between the truncate and the flush.
+	if got := readFront(t, eh, 16); got != "AAAA" {
+		t.Fatalf("read after shrink = %q, want the 4-byte view", got)
+	}
+	if err := eh.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// The server must show the committed shrink.
+	if got := f.contentOf("/big.bin"); got != "AAAA" {
+		t.Fatalf("server content after flush = %q, want AAAA (the shrink must not be cancelled)", got)
+	}
+}
+
+// Round-16: a fresh engine create is visible to lookup and getattr before
+// its first remote commit.
+func TestFreshEngineCreateVisibleBeforeCommit(t *testing.T) {
+	f := newFakeV2(t)
+	f.setDir("/d", true)
+	h := newTestHandler(t, f, 0) // full mode
+	if _, _, passed := dispatchCreate(context.Background(), h, "/d/new.bin", syscall.O_RDWR|syscall.O_CREAT); passed {
+		t.Fatal("full-mode create must be claimed")
+	}
+	looked := false
+	res, err := h.Do(context.Background(), &fs.Op{Kind: fs.OpLookup, Path: "/d/new.bin", Caller: fs.Caller{Pid: 1}}, fs.Next(func(ctx context.Context, op *fs.Op) (fs.Result, error) {
+		looked = true
+		return fs.Result{}, syscall.ENOENT
+	}))
+	if err != nil {
+		t.Fatalf("lookup of the fresh create: %v", err)
+	}
+	if looked || res.Attr == nil || res.Attr.Kind != fs.KindFile {
+		t.Fatalf("lookup did not resolve the local-only file: classic=%v attr=%+v", looked, res.Attr)
+	}
+	got, err := h.Do(context.Background(), &fs.Op{Kind: fs.OpGetAttr, Path: "/d/new.bin", Caller: fs.Caller{Pid: 1}}, fs.Next(func(ctx context.Context, op *fs.Op) (fs.Result, error) {
+		return fs.Result{}, syscall.ENOENT
+	}))
+	if err != nil || got.Attr == nil || got.Attr.Kind != fs.KindFile {
+		t.Fatalf("getattr of the fresh create: err=%v attr=%+v", err, got.Attr)
+	}
+}
+
+// Round-16: interactive fsync is a LOCAL barrier — no remote commit during
+// Sync, the commit lands at flush, and a mount that never flushed replays
+// the staged barrier.
+func TestInteractiveFsyncLocalBarrierAndReplay(t *testing.T) {
+	f := newFakeV2(t)
+	f.seedExtent(t, "/big.bin", "AAAA-BBBB-CCCC")
+	dir := engineCacheDir(t)
+	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: dir})
+	h := New(Options{Engine: eng, Threshold: 1 << 20, SyncMode: "interactive"})
+	eh := claimOpen(t, h, "/big.bin")
+
+	if err := eh.Write(context.Background(), 0, []byte("ZZZZ")); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	patchesBefore := f.patches
+	f.mu.Unlock()
+	if err := eh.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	patchesAfter := f.patches
+	f.mu.Unlock()
+	if patchesAfter != patchesBefore {
+		t.Fatal("interactive fsync performed a remote commit")
+	}
+	if got := readFront(t, eh, 16); got != "ZZZZ-BBBB-CCCC" {
+		t.Fatalf("read after interactive fsync = %q", got)
+	}
+	// The flush boundary lands the remote commit and clears the barrier.
+	if err := eh.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	patchesFlushed := f.patches
+	f.mu.Unlock()
+	if patchesFlushed == patchesBefore {
+		t.Fatal("flush did not land the deferred commit")
+	}
+	if got := f.contentOf("/big.bin"); got != "ZZZZ-BBBB-CCCC" {
+		t.Fatalf("server content after flush = %q", got)
+	}
+
+	// Crash before flush: a NEW engine over the same staging dir replays
+	// the barrier and lands the commit.
+	if err := eh.Write(context.Background(), 5, []byte("QQQQ")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate the crash: a new engine with the same staging directory.
+	stagingRoot := filepath.Join(dir, "commit-staging")
+	if ents, err := os.ReadDir(stagingRoot); err != nil {
+		t.Logf("staging dir unreadable: %v", err)
+	} else {
+		for _, e := range ents {
+			t.Logf("staged: %s", e.Name())
+			if raw, rerr := os.ReadFile(filepath.Join(stagingRoot, e.Name(), "manifest.json")); rerr == nil {
+				t.Logf("manifest: %s", raw)
+			} else {
+				t.Logf("manifest read: %v", rerr)
+			}
+		}
+	}
+	eng2 := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: dir})
+	_ = eng2
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := f.contentOf("/big.bin"); got == "ZZZZ-QQQQ-CCCC" {
+			return // replay landed
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("replay never landed the staged commit; server has %q", f.contentOf("/big.bin"))
 }

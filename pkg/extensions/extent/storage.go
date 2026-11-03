@@ -12,6 +12,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/juicedata/juicefs/pkg/meta"
+
 	"github.com/juicedata/juicefs/pkg/object"
 
 	"github.com/mem9-ai/drive9/pkg/client"
@@ -217,7 +219,7 @@ func (s objectStorage) Restore(ctx context.Context, key string, days int32) erro
 
 const urlTTL = 8 * time.Minute
 
-func (r *blockRegistry) register(sha, url string, length int64, path string, fileOffset int64) uint64 {
+func (r *blockRegistry) register(sha, url string, length int64, path string, fileOffset int64, ino meta.Ino) uint64 {
 	sum, err := hex.DecodeString(sha)
 	if err != nil || len(sum) < 8 {
 		return 0
@@ -234,11 +236,12 @@ func (r *blockRegistry) register(sha, url string, length int64, path string, fil
 		e.expires = time.Now().Add(urlTTL)
 		e.path = path
 		e.provenanceStart = fileOffset
+		e.provenanceIno = ino
 		if e.size < length {
 			e.size = length
 		}
 	} else {
-		r.m[id] = &blockEntry{sha256: sha, size: length, url: url, expires: time.Now().Add(urlTTL), path: path, provenanceStart: fileOffset}
+		r.m[id] = &blockEntry{sha256: sha, size: length, url: url, expires: time.Now().Add(urlTTL), path: path, provenanceStart: fileOffset, provenanceIno: ino}
 	}
 	r.mu.Unlock()
 	return id
@@ -247,6 +250,16 @@ func (r *blockRegistry) register(sha, url string, length int64, path string, fil
 // stageBytes caches block content for pending commits. Idempotent: an
 // already-staged block keeps its first copy (write retries used to
 // re-copy the whole slice on every attempt).
+// registerLocal publishes a locally staged block (deferred write) under
+// its deterministic id so the engine's reader can fetch it from staging.
+func (r *blockRegistry) registerLocal(sha string, length int64) uint64 {
+	sum, err := hex.DecodeString(sha)
+	if err != nil || len(sum) < 8 {
+		return 0
+	}
+	return detID(sum)
+}
+
 func (r *blockRegistry) stageBytes(sha string, data []byte) {
 	sum, err := hex.DecodeString(sha)
 	if err != nil || len(sum) < 8 {
@@ -331,7 +344,16 @@ func (r *blockRegistry) fetch(ctx context.Context, c fetchClient, id uint64, off
 	if snap.path == "" {
 		return nil, fmt.Errorf("block %d has neither URL nor provenance", id)
 	}
-	plan, err := c.GetExtentReadPlan(ctx, snap.path, snap.provenanceStart, snap.provenanceStart+snap.size)
+	path := snap.path
+	if snap.provenanceIno != 0 && r.currentPath != nil {
+		// The file may have been renamed or retained under an alias since
+		// this plan was fetched; refresh through the inode's CURRENT
+		// mapping, never the stale name.
+		if cur, ok := r.currentPath(snap.provenanceIno); ok {
+			path = cur
+		}
+	}
+	plan, err := c.GetExtentReadPlan(ctx, path, snap.provenanceStart, snap.provenanceStart+snap.size)
 	if err != nil {
 		return nil, err
 	}
@@ -346,7 +368,7 @@ func (r *blockRegistry) fetch(ctx context.Context, c fetchClient, id uint64, off
 			return c.FetchExtentBlockRange(ctx, blk.URL, off, limit)
 		}
 	}
-	return nil, fmt.Errorf("block %s no longer present in the plan of %s", snap.sha256[:12], snap.path)
+	return nil, fmt.Errorf("block %s no longer present in the plan of %s", snap.sha256[:12], path)
 }
 
 // fetchClient is the subset of *client.Client the registry needs.
