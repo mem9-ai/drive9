@@ -74,7 +74,7 @@ struct ExtentFileSystem::Impl {
     uint64_t sid = 0, next_handle = 0;
     uint64_t next_slice = 0, slice_limit = 0, next_inode = 0, inode_limit = 0;
     std::mutex allocation_mu;
-    bool guard_supported = false, directory_projection = false, hash_prefix = false, closed = false;
+    bool guard_supported = false, directory_projection = false, clone_supported = false, hash_prefix = false, closed = false;
     std::atomic<bool> failed{false};
     std::atomic<int64_t> expiry_ticks{INT64_MAX};
     // Lifetime gate: positional reads share it; writes/close/shutdown exclude
@@ -125,6 +125,7 @@ struct ExtentFileSystem::Impl {
                                                   {"info", detail::EncodeBase64(Json({{"Version", "drive9-cpp/0.1.0"}}).dump())}});
         guard_supported = registration.value("session_guard", false);
         directory_projection = registration.value("directory_projection", false);
+        clone_supported = registration.value("clone_v1", false);
         Confirm(expire);
         if (options.heartbeat < std::chrono::seconds(12) && !guard_supported) {
             ExpireSession();
@@ -406,6 +407,7 @@ size_t ExtentTestAccess::NodeCount(ExtentFileSystem &fs) {
     return fs.impl_->nodes.size();
 }
 bool ExtentFileSystem::SessionGuardSupported() const { return impl_->guard_supported; }
+bool ExtentFileSystem::CloneSupported() const { return impl_->clone_supported && impl_->guard_supported; }
 void ExtentFileSystem::Shutdown() { impl_->Shutdown(); }
 FileInfo ExtentFileSystem::Stat(const std::string &input) {
     auto &s = *impl_; std::shared_lock<std::shared_mutex> lock(s.lifetime); s.Ready();
@@ -580,6 +582,28 @@ void ExtentFileSystem::Rename(const std::string &source, const std::string &targ
     if (info.directory) { from += '/'; to += '/'; }
     s.Meta("rename", {{"src_parent", a.first}, {"src_name", a.second}, {"dst_parent", b.first}, {"dst_name", b.second},
                       {"flags", 0}, {"src_path", from}, {"dst_path", to}, {"sid", s.sid}, {"dst_opened", false}});
+}
+FileInfo ExtentFileSystem::Clone(uint64_t handle, const std::string &target, uint64_t expected_inode) {
+    auto &s = *impl_; std::unique_lock<std::shared_mutex> lock(s.lifetime);
+    auto &h = s.Get(handle);
+    if (!CloneSupported()) throw Error("Server lacks session-guarded clone_v1 support", 95);
+    if (h.lock == Lock::None) throw Error("Clone requires a whole-file locked source handle", 1);
+    if (expected_inode == h.node->inode) throw Error("Clone cannot replace its source inode", 22);
+    auto path = CanonicalPath(target);
+    auto parent = s.Parent(path);
+    auto inode = s.NewInode();
+    auto result = s.Meta("clone", {{"inode", h.node->inode}, {"owner", handle}, {"parent", parent.first},
+                                  {"name", parent.second}, {"proj_path", path}, {"new_inode", inode},
+                                  {"expected_inode", expected_inode}});
+    try {
+        auto info = ParseInfo(result);
+        if (info.inode != inode || info.type != 1) throw Error("Malformed extent clone acknowledgement");
+        return info;
+    } catch (...) {
+        // A success-shaped malformed acknowledgement is still ambiguous.
+        s.failed.store(true);
+        throw;
+    }
 }
 std::vector<DirectoryEntry> ExtentFileSystem::List(const std::string &input) {
     auto &s = *impl_; std::shared_lock<std::shared_mutex> lock(s.lifetime); s.Ready();
