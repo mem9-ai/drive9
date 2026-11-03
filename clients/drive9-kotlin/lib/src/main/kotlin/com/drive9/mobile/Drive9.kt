@@ -26,6 +26,7 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
 import java.io.RandomAccessFile
+import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.HttpURLConnection
 import java.net.URI
@@ -56,6 +57,10 @@ private const val REMOVE_ALL_MAX_RETRY_DELAY_SECS = 60L
 // RAW_HTTP_READ_TIMEOUT_MS bounds the raw-socket transport, covering the TLS
 // handshake, the write and the response read.
 private const val RAW_HTTP_READ_TIMEOUT_MS = 120_000
+
+// RAW_HTTP_CONNECT_TIMEOUT_MS bounds TCP connection establishment, matching the
+// connectTimeout used by the HttpURLConnection transport.
+private const val RAW_HTTP_CONNECT_TIMEOUT_MS = 30_000
 
 /** Idiomatic Kotlin Drive9 client implemented with platform-native HTTP. */
 public class Drive9Client(
@@ -922,18 +927,32 @@ public class Drive9Client(
         // The request carries the caller's API key: reuse the same plaintext
         // rule as the main transport before anything is written.
         requireSecureForApiKey(url)
+        // Establish the TCP connection ourselves so it honors the same connect
+        // timeout as open(): Socket(host, port) and SSLSocketFactory.createSocket
+        // both connect with the OS default (minutes on a blackholed host), and
+        // soTimeout only covers reads after a connection exists.
+        val connected = Socket()
+        try {
+            connected.connect(InetSocketAddress(host, port), RAW_HTTP_CONNECT_TIMEOUT_MS)
+        } catch (t: Throwable) {
+            runCatching { connected.close() }
+            throw t
+        }
         val socket: Socket = if (ssl) {
-            val sslSocket = SSLSocketFactory.getDefault().createSocket(host, port) as SSLSocket
+            // Wrap the connected socket: the factory's host/port overload would
+            // open a second, unbounded connection.
+            val sslSocket = (SSLSocketFactory.getDefault() as SSLSocketFactory)
+                .createSocket(connected, host, port, true) as SSLSocket
             // A peer that accepts the connection but stalls the handshake must
             // not hang the caller: set the read timeout before handshaking, and
             // close the socket if the handshake fails so the descriptor is not
             // leaked.
             sslSocket.soTimeout = RAW_HTTP_READ_TIMEOUT_MS
             try {
-                // createSocket returns an unconnected-handshake socket with no
-                // identity check: without these two settings the certificate
-                // chain is validated against nothing in particular and a MITM
-                // with any valid certificate would receive the bearer token.
+                // The wrapped socket still needs an identity check: without it
+                // the certificate chain is validated against nothing in
+                // particular and a MITM with any valid certificate would
+                // receive the bearer token.
                 sslSocket.sslParameters = sslSocket.sslParameters.apply {
                     endpointIdentificationAlgorithm = "HTTPS"
                 }
@@ -944,7 +963,7 @@ public class Drive9Client(
             }
             sslSocket
         } else {
-            Socket(host, port)
+            connected
         }
         socket.use { s ->
             s.soTimeout = RAW_HTTP_READ_TIMEOUT_MS
