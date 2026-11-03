@@ -105,6 +105,13 @@ type CommitCleanupFunc func(entry *CommitEntry)
 // overtaken by a newer mutation and must not reach remote storage.
 type CommitSupersededFunc func(entry *CommitEntry) bool
 
+// pathCommitFailure is the most recent terminal commit failure recorded for a
+// path: the last upload error and a monotonic stamp for bounded trimming.
+type pathCommitFailure struct {
+	err error
+	seq uint64
+}
+
 // CommitQueue manages ordered background remote commits with baseRev tracking.
 // It provides backpressure when the queue exceeds maxPending items.
 type CommitQueue struct {
@@ -119,15 +126,23 @@ type CommitQueue struct {
 	// replaced across a crash, so persisting this proof would be unsafe.
 	landed      map[string]pathCommitLandmark
 	landedClock uint64
-	maxPending  int
-	client      *client.Client
-	remoteRoot  string
-	layerRef    string
-	shadows     *staging.ShadowStore
-	index       *staging.PendingIndex
-	journal     *staging.Journal
-	wg          sync.WaitGroup
-	stopped     bool
+	// terminalFailures records the most recent terminal commit failure per
+	// path so a durability barrier that waited on the path can report EIO
+	// instead of success: after onCommitTerminalFailure the path looks
+	// idle to WaitPath* exactly like a landed commit. Recorded before the
+	// entry leaves in-flight, cleared by the next successful commit of the
+	// path (onCommitSuccessWithOptions), mirroring landed's lifecycle.
+	terminalFailures map[string]pathCommitFailure
+	failureClock     uint64
+	maxPending       int
+	client           *client.Client
+	remoteRoot       string
+	layerRef         string
+	shadows          *staging.ShadowStore
+	index            *staging.PendingIndex
+	journal          *staging.Journal
+	wg               sync.WaitGroup
+	stopped          bool
 	// abandoned is set by AbandonLayer when the mounted layer was rolled
 	// back. When true, Enqueue returns errLayerRolledBack and commitOne
 	// skips tryAutoResolveConflict, going straight to terminal failure so
@@ -225,6 +240,7 @@ func NewCommitQueue(c *client.Client, shadows *staging.ShadowStore, index *stagi
 		queuedByPath:      make(map[string]map[*CommitEntry]struct{}),
 		delayed:           make(map[*CommitEntry]*time.Timer),
 		landed:            make(map[string]pathCommitLandmark),
+		terminalFailures:  make(map[string]pathCommitFailure),
 		workCh:            make(chan *CommitEntry, bufSize),
 		zeroTruncateDelay: zeroTruncateCommitQueueDelay,
 	}
@@ -2478,6 +2494,10 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 		committedRev = committedRevisionForExpectedRevision(expectedRevision, committedRev)
 	}
 	cq.rememberLanded(entry.Path, committedRev, entry.Size, cq.checksumLandedPayload(entry), entry.SnapshotID, entry.liveAncestors...)
+	// The image landed remotely: a previously recorded terminal failure for
+	// this path must not fail later durability barriers. Clear it before the
+	// entry leaves the queue (same visibility window as rememberLanded).
+	cq.clearTerminalFailure(entry.Path)
 	if cq.OnUploaded != nil {
 		cq.OnUploaded(entry, committedRev)
 	}
@@ -3034,6 +3054,22 @@ func (cq *CommitQueue) recordCommitTerminalFailure(entry *CommitEntry, lastErr e
 		cq.perf.commitFailure.add(1)
 		cq.perf.commitTerminalFailure.add(1)
 	}
+	// Record the failure before this worker returns (the entry is already
+	// dequeued; endInFlight follows commitOne) so any durability barrier that
+	// observes the path idle through WaitPath* necessarily sees the failure.
+	if lastErr == nil {
+		// The data still never landed remotely; report a concrete error to
+		// barriers instead of a nil that would read as success.
+		lastErr = errCommitTerminalUnknown
+	}
+	cq.mu.Lock()
+	if cq.terminalFailures == nil {
+		cq.terminalFailures = make(map[string]pathCommitFailure)
+	}
+	cq.failureClock++
+	cq.terminalFailures[entry.Path] = pathCommitFailure{err: lastErr, seq: cq.failureClock}
+	cq.pruneTerminalFailuresLocked()
+	cq.mu.Unlock()
 	// Alertable FUSE-local error. Collectors should match
 	// "drive9: error event=commit_terminal_failure" on stderr / mount-log
 	// files (typically ~/.cache/drive9/mount-logs/). The drive9 server never
@@ -3041,6 +3077,55 @@ func (cq *CommitQueue) recordCommitTerminalFailure(entry *CommitEntry, lastErr e
 	// reason= distinguishes retryable upload loss from concurrency conflict
 	// and layer-abandonment so alert severity can differ.
 	safeLogPrintf("drive9: error event=commit_terminal_failure path=%s reason=%s err=%v detail=local_data_preserved", entry.Path, classifyCommitTerminalReason(lastErr), lastErr)
+}
+
+// errCommitTerminalUnknown backs PathTerminalFailure when a terminal commit
+// failure carried no upload error: the data never landed either way, so the
+// barrier must still report failure.
+var errCommitTerminalUnknown = errors.New("commit queue: terminal commit failure without a recorded upload error")
+
+// terminalFailuresLimit bounds terminalFailures the way landedLimit bounds
+// landed: failure records carry no lineage to protect, so plain oldest-first
+// eviction by seq is enough.
+const terminalFailuresLimit = 64
+
+func (cq *CommitQueue) pruneTerminalFailuresLocked() {
+	for len(cq.terminalFailures) > terminalFailuresLimit {
+		var oldestPath string
+		var oldestSeq uint64
+		first := true
+		for path, failure := range cq.terminalFailures {
+			if first || failure.seq < oldestSeq {
+				oldestPath, oldestSeq, first = path, failure.seq, false
+			}
+		}
+		delete(cq.terminalFailures, oldestPath)
+	}
+}
+
+// clearTerminalFailure drops the recorded terminal failure for path: a newer
+// commit landed, so later durability barriers must not keep reporting EIO.
+func (cq *CommitQueue) clearTerminalFailure(path string) {
+	cq.mu.Lock()
+	delete(cq.terminalFailures, path)
+	cq.mu.Unlock()
+}
+
+// PathTerminalFailure returns the most recent terminal commit failure recorded
+// for path whose data never landed remotely (local pending state is
+// preserved). Durability barriers consult it once the path goes idle: without
+// it, a terminally failed path is indistinguishable from a landed commit and
+// fsync would report success for data that exists only locally.
+func (cq *CommitQueue) PathTerminalFailure(path string) error {
+	if cq == nil {
+		return nil
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	if failure, ok := cq.terminalFailures[path]; ok {
+		return failure.err
+	}
+	return nil
 }
 
 // directPutThreshold returns the size limit below which commit queue workers

@@ -2043,6 +2043,14 @@ func (h *bufferingHandle) Sync(ctx context.Context) error {
 		if !h.w.queue.WaitPathDeadline(h.path, uploadTimeout) {
 			return fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
 		}
+		// The wait also ends when the commit terminally failed and was
+		// dropped with local state preserved: an idle path is then
+		// indistinguishable from a landed commit, so consult the failure
+		// record and answer EIO — fsync must not claim remote durability for
+		// data that exists only locally.
+		if err := h.w.queue.PathTerminalFailure(h.path); err != nil {
+			return fs.StatusErrorOf(gofuse.Status(syscall.EIO))
+		}
 	}
 	// A staged .dat/.meta snapshot is only locally durable; strict fsync
 	// pays the remote landing synchronously (v1 fsync on the write-back
@@ -2061,6 +2069,11 @@ func (h *bufferingHandle) Sync(ctx context.Context) error {
 		h.mu.Unlock()
 		h.markLanded(rev)
 		h.w.landedAt(h.path, rev, size)
+		// The synchronous landing bypasses the queue: clear any terminal
+		// failure it recorded so later barriers do not keep reporting EIO.
+		if h.w.queue != nil {
+			h.w.queue.clearTerminalFailure(h.path)
+		}
 	}
 	return nil
 }
