@@ -586,42 +586,64 @@ func (b *Bridge) Read(ctx meta.Context, ino meta.Ino, indx uint32, slices *[]met
 	// sorted by offset below.
 	// Compact the pending fragments: each write's VISIBLE pieces are the
 	// write minus the UNION of every later write (JuiceFS overwrite
-	// semantics). A pairwise walk emits head fragments before later
-	// shadows are considered, so a shadow landing inside an already
-	// emitted head survives — compute against the full later-union.
+	// semantics). Computed as pure interval subtraction against the merged
+	// later-union — every emitted fragment carries its own inner offset
+	// into the staged block (cur.inner is derived from cur.off, never
+	// accumulated), and a write fully covered from the front contributes
+	// nothing.
 	var pendCompact []span
 	for i := range pend {
-		cur := pend[i]
-		shadows := make([]span, 0, len(pend)-i-1)
+		w := pend[i]
+		union := make([]span, 0, len(pend)-i-1)
 		for j := i + 1; j < len(pend); j++ {
 			if pend[j].length > 0 {
-				shadows = append(shadows, pend[j])
+				union = append(union, pend[j])
 			}
 		}
-		sort.Slice(shadows, func(x, y int) bool { return shadows[x].off < shadows[y].off })
-		base := pend[i].off
-		for _, sh := range shadows {
-			if sh.off+sh.length <= base || sh.off >= cur.off+cur.length || sh.off <= base {
-				if sh.off+sh.length > base && sh.off <= base {
-					base = sh.off + sh.length // consumed from the front
+		sort.Slice(union, func(x, y int) bool { return union[x].off < union[y].off })
+		// Merge the union into disjoint intervals.
+		var merged []span
+		for _, sh := range union {
+			if len(merged) > 0 && sh.off <= merged[len(merged)-1].off+merged[len(merged)-1].length {
+				last := &merged[len(merged)-1]
+				if end := sh.off + sh.length; end > last.off+last.length {
+					last.length = end - last.off
 				}
 				continue
 			}
-			if frag := cur; frag.off < sh.off {
-				// head fragment [frag.off, sh.off): emit with its own
-				// inner offset, THEN continue scanning past the shadow.
-				head := cur
-				head.length = sh.off - cur.off
-				head.inner += uint32(cur.off - pend[i].off)
-				pendCompact = append(pendCompact, head)
-			}
-			cur.inner += uint32(sh.off + sh.length - cur.off) // tail inside the block
-			cur.off = sh.off + sh.length
-			cur.length = pend[i].off + pend[i].length - cur.off
+			merged = append(merged, sh)
 		}
-		if cur.length > 0 {
-			cur.inner += 0 // already advanced
-			pendCompact = append(pendCompact, cur)
+		// Subtract: walk [w.off, w.off+w.length) against the merged union.
+		start, end := w.off, w.off+w.length
+		for _, sh := range merged {
+			sEnd := sh.off + sh.length
+			if sEnd <= start {
+				continue // shadow entirely before the remaining window
+			}
+			if sh.off >= end {
+				break // shadows are sorted: the rest is past the window
+			}
+			if sh.off > start {
+				frag := span{
+					off:    start,
+					length: sh.off - start,
+					id:     w.id,
+					size:   w.size,
+					seq:    w.seq,
+				}
+				frag.inner = uint32(start - w.off) // the fragment's offset inside the staged block
+				pendCompact = append(pendCompact, frag)
+			}
+			if sEnd >= end {
+				start = end
+				break
+			}
+			start = sEnd
+		}
+		if start < end {
+			frag := span{off: start, length: end - start, id: w.id, size: w.size, seq: w.seq}
+			frag.inner = uint32(start - w.off)
+			pendCompact = append(pendCompact, frag)
 		}
 	}
 	// Drop empties and sort the survivors by offset for the merge.
@@ -775,12 +797,15 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 	if err != nil && !fresh {
 		return err
 	}
-	// An identity-verified recovery (durable replay) constrains THIS
-	// publication: the occupant must still be the staged object, and the
-	// verified revision is the CAS base — the fresh Stat above only
-	// confirms, it never substitutes its own identity.
-	if v, bounded := b.takeVerifyBase(ino); bounded {
+	// An identity-verified recovery (durable replay) constrains EVERY
+	// publication of this data: the occupant must still be the staged
+	// object. The constraint SURVIVES failures and retries (it is only
+	// consumed by a completed publication) — and when the occupant is a
+	// replacement, the staged data is abandoned (mappings dropped) so no
+	// later unconstrained flush can publish into the replacement.
+	if v, bounded := b.peekVerifyBase(ino); bounded {
 		if fresh || st.ResourceID != v.resID {
+			b.abandonIno(ino)
 			return fmt.Errorf("recovery target %s no longer holds the staged object", path)
 		}
 		st.Revision = v.rev
@@ -789,16 +814,21 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 		if b.isClassicOwned(ino) || b.isLayoutPending(ino) {
 			// A fresh session of ours degraded to a classic upload on a
 			// legacy server (or its post-upload classification never
-			// completed — layoutPending is set only by OUR upload, never
-			// by a foreign replacement): keep the open handle usable —
-			// commit through the classic surface instead of rejecting a
-			// target we own.
+			// completed): keep the open handle usable — commit through
+			// the classic surface instead of rejecting a target we own.
+			// "Ours" is IDENTITY-BOUND: when the classification ever saw
+			// our landed upload, the occupant must still be THAT object —
+			// a foreign replacement is rejected exactly like the plain
+			// non-extent case.
 			if b.isLayoutPending(ino) && !b.isClassicOwned(ino) {
+				if !b.layoutPendingMatches(ino, st.ResourceID) {
+					return fmt.Errorf("target %s is not extent layout", path)
+				}
 				// The pending classification may have recovered by now.
 				for _, delay := range []time.Duration{0, 200 * time.Millisecond} {
 					time.Sleep(delay)
 					nst, serr := b.cfg.Client.StatCtx(ctx, path)
-					if serr == nil && nst.ContentLayout == client.ContentLayoutExtent {
+					if serr == nil && nst.ContentLayout == client.ContentLayoutExtent && nst.ResourceID == st.ResourceID {
 						b.clearLayoutPending(ino)
 						return b.commitExtentExisting(ctx, ino, path, pending, size, nst.Revision)
 					}
@@ -839,7 +869,7 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 			}
 			blocks = append(blocks, client.ExtentBlockWrite{Chunk: p.chunk, Off: p.off, Data: data})
 		}
-		if err := b.commitWithRetry(ctx, path, blocks, size, st.Revision); err != nil {
+		if err := b.commitWithRetry(ctx, ino, path, blocks, size, st.Revision); err != nil {
 			return err
 		}
 	}
@@ -853,6 +883,7 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 		// attempt classifies instead of rejecting.
 		classic := false
 		classified := false
+		landedID := "" // OUR landed upload's identity, when we could see it
 		for _, delay := range []time.Duration{0, 200 * time.Millisecond, 500 * time.Millisecond} {
 			time.Sleep(delay)
 			nst, serr := b.cfg.Client.StatCtx(ctx, path)
@@ -862,6 +893,7 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 			b.mu.Lock()
 			b.revs[ino] = nst.Revision
 			b.mu.Unlock()
+			landedID = nst.ResourceID
 			classic = nst.ContentLayout != client.ContentLayoutExtent
 			classified = true
 			break
@@ -869,6 +901,7 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 		if !classified {
 			b.mu.Lock()
 			b.layoutPending[ino] = true
+			b.layoutPendingID[ino] = landedID // OUR upload's identity, if we saw it
 			b.mu.Unlock()
 			// The pending list is INTACT (cleanup runs only after
 			// classification) — nothing to restore, and re-appending
@@ -889,6 +922,9 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 	b.mu.Lock()
 	mode := b.modes[ino]
 	delete(b.commitErr, ino) // a successful landing resolves the memory
+	delete(b.verifyBase, ino)
+	delete(b.layoutPendingID, ino)
+	delete(b.layoutPending, ino)
 	b.mu.Unlock()
 	b.surgicalDeletePending(ino, pending)
 	b.releaseCommitted(ino, pending)
@@ -911,7 +947,7 @@ func (b *Bridge) commitExtentExisting(ctx context.Context, ino meta.Ino, path st
 		}
 		blocks = append(blocks, client.ExtentBlockWrite{Chunk: p.chunk, Off: p.off, Data: data})
 	}
-	if err := b.commitWithRetry(ctx, path, blocks, size, rev); err != nil {
+	if err := b.commitWithRetry(ctx, ino, path, blocks, size, rev); err != nil {
 		return err
 	}
 	b.surgicalDeletePending(ino, pending)
@@ -972,9 +1008,9 @@ func (b *Bridge) commitClassic(ctx context.Context, ino meta.Ino, path string, p
 		return err
 	}
 	b.mu.Lock()
-	delete(b.pending, ino)
-	delete(b.truncs, ino)
+	delete(b.commitErr, ino)
 	b.mu.Unlock()
+	b.surgicalDeletePending(ino, pending)
 	b.releaseCommitted(ino, pending)
 	if nst, err := b.cfg.Client.StatCtx(ctx, path); err == nil {
 		b.mu.Lock()
@@ -984,16 +1020,22 @@ func (b *Bridge) commitClassic(ctx context.Context, ino meta.Ino, path string, p
 	return nil
 }
 
-func (b *Bridge) commitWithRetry(ctx context.Context, path string, blocks []client.ExtentBlockWrite, size, rev int64) error {
+func (b *Bridge) commitWithRetry(ctx context.Context, ino meta.Ino, path string, blocks []client.ExtentBlockWrite, size, rev int64) error {
 	err := b.cfg.Client.CommitExtentPatch(ctx, path, size, blocks, rev)
 	if err == nil {
 		return nil
 	}
 	// Revision conflict: re-base and retry once — blocks are
-	// content-addressed, nothing is re-uploaded.
+	// content-addressed, nothing is re-uploaded. The re-stat is
+	// IDENTITY-CHECKED when a recovery constraint is active: a conflict
+	// against a replacement must never publish the staged data into it.
 	st, serr := b.cfg.Client.StatCtx(ctx, path)
 	if serr != nil {
 		return err
+	}
+	if v, bounded := b.peekVerifyBase(ino); bounded && st.ResourceID != v.resID {
+		b.abandonIno(ino)
+		return fmt.Errorf("recovery target %s no longer holds the staged object", path)
 	}
 	return b.cfg.Client.CommitExtentPatch(ctx, path, size, blocks, st.Revision)
 }
@@ -1046,6 +1088,16 @@ func (b *Bridge) flushTruncateOnly(ctx context.Context, ino meta.Ino, size int64
 			return nil
 		}
 		return err
+	}
+	// A recovery constraint applies to metadata-only publication too: a
+	// replacement at the saved path must never be truncated with the
+	// staged object's size.
+	if v, bounded := b.peekVerifyBase(ino); bounded {
+		if st.ResourceID != v.resID {
+			b.abandonIno(ino)
+			return fmt.Errorf("recovery target %s no longer holds the staged object", path)
+		}
+		st.Revision = v.rev
 	}
 	if b.isClassicOwned(ino) && st.ContentLayout != client.ContentLayoutExtent {
 		// A degraded (classic) target: compose the truncated image and
@@ -1118,7 +1170,7 @@ func (b *Bridge) flushTruncateOnly(ctx context.Context, ino meta.Ino, size int64
 			blocks = []client.ExtentBlockWrite{{Chunk: chunk, Off: off, Data: data}}
 		}
 	}
-	if err := b.commitWithRetry(ctx, path, blocks, size, st.Revision); err != nil {
+	if err := b.commitWithRetry(ctx, ino, path, blocks, size, st.Revision); err != nil {
 		return err // marker retained: the truncate has NOT landed
 	}
 	b.mu.Lock()
@@ -1766,8 +1818,12 @@ func (b *Bridge) stageClassicChunk(sum string, data []byte) uint64 {
 	}
 	b.mu.Unlock()
 	for _, r := range retire {
+		if b.blocks.isIssued(r.id) {
+			continue // an outstanding reader still holds this slice
+		}
 		b.blocks.releaseIfUnpinned(r.sum)
 	}
+	b.blocks.issuePin(id)
 	return id
 }
 
@@ -1810,6 +1866,49 @@ func (b *Bridge) isLayoutPending(ino meta.Ino) bool {
 	return b.layoutPending[ino]
 }
 
+// layoutPendingMatches reports whether the pending-classification upload
+// is still the occupant: with a recorded identity the occupant must match
+// it exactly; without one (the classification never saw ANY stat) our own
+// path mapping and pending data are the only proof, and a KNOWN different
+// occupant (caller-provided resource ID) always fails.
+func (b *Bridge) layoutPendingMatches(ino meta.Ino, occupantID string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.layoutPending[ino] {
+		return false
+	}
+	id, seen := b.layoutPendingID[ino]
+	if !seen || id == "" {
+		return occupantID == "" // unknowable: only when the caller also could not see it
+	}
+	return id == occupantID
+}
+
+// peekVerifyBase reads the recovery constraint without consuming it.
+func (b *Bridge) peekVerifyBase(ino meta.Ino) (verifyBase, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	v, ok := b.verifyBase[ino]
+	return v, ok
+}
+
+// abandonIno drops every mapping for an inode whose recovery target was
+// replaced: the staged data must never reach a later unconstrained
+// publication.
+func (b *Bridge) abandonIno(ino meta.Ino) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.verifyBase, ino)
+	delete(b.layoutPending, ino)
+	delete(b.layoutPendingID, ino)
+	delete(b.pending, ino)
+	delete(b.truncs, ino)
+	delete(b.sizes, ino)
+	delete(b.paths, ino)
+	delete(b.replacements, "")
+	delete(b.classicOwned, ino)
+}
+
 // clearLayoutPending drops the pending-classification marker.
 func (b *Bridge) clearLayoutPending(ino meta.Ino) {
 	b.mu.Lock()
@@ -1824,17 +1923,6 @@ func (b *Bridge) setVerifyBase(ino meta.Ino, rev int64, resID string) {
 	b.mu.Lock()
 	b.verifyBase[ino] = verifyBase{rev: rev, resID: resID}
 	b.mu.Unlock()
-}
-
-// takeVerifyBase consumes the constraint (one publication).
-func (b *Bridge) takeVerifyBase(ino meta.Ino) (verifyBase, bool) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	v, ok := b.verifyBase[ino]
-	if ok {
-		delete(b.verifyBase, ino)
-	}
-	return v, ok
 }
 
 // HasPending reports whether un-committed writes remain for the inode.
@@ -1859,6 +1947,10 @@ func (b *Bridge) ModeOf(ino meta.Ino) (uint32, bool) {
 
 // forgetInoLocked drops one inode's cached state; the caller holds b.mu.
 func (b *Bridge) forgetInoLocked(ino meta.Ino) {
+	delete(b.layoutPendingID, ino)
+	delete(b.layoutPending, ino)
+	delete(b.verifyBase, ino)
+	delete(b.commitErr, ino)
 	delete(b.classicOwned, ino)
 	delete(b.paths, ino)
 	delete(b.sizes, ino)

@@ -520,6 +520,21 @@ func (f *fakeV2) existsOf(path string) bool {
 	return hasID || f.dirs[path]
 }
 
+// stat returns the resource identity stored for the path.
+func (f *fakeV2) stat(t *testing.T, path string) (string, error) {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if id, ok := f.ids[path]; ok && id != "" {
+		return id, nil
+	}
+	return "", &httpNope{}
+}
+
+type httpNope struct{}
+
+func (httpNope) Error() string { return "no identity" }
+
 // setLegacy switches the fake to a pre-extent (classic-only) server.
 func (f *fakeV2) setLegacy(on bool) {
 	f.mu.Lock()
@@ -3446,7 +3461,7 @@ func TestDeferredOverlayThreeWritesBackwards(t *testing.T) {
 	for _, w := range []struct {
 		off  int64
 		data string
-	}{{0, "AAAAAAAAAAAA"}, {8, "BB"}, {2, "CC"}} {
+	}{{0, "abcdefghijkl"}, {8, "BB"}, {2, "CC"}} {
 		if err := eh.Write(context.Background(), w.off, []byte(w.data)); err != nil {
 			t.Fatal(err)
 		}
@@ -3454,8 +3469,8 @@ func TestDeferredOverlayThreeWritesBackwards(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if got := readFront(t, eh, 12); got != "AACCAAAABBAA" {
-		t.Fatalf("overlaid read = %q, want AACCAAAABBAA", got)
+	if got := readFront(t, eh, 12); got != "abCCefghBBkl" {
+		t.Fatalf("overlaid read = %q, want abCCefghBBkl", got)
 	}
 }
 
@@ -3564,5 +3579,119 @@ func TestSameInodeSurvivorKeepsBytes(t *testing.T) {
 
 	if data, ok := b.blocks.stagedBytes(shared); !ok || string(data) != "SHARED" {
 		t.Fatalf("survivor's staged bytes lost: ok=%v data=%q", ok, data)
+	}
+}
+
+// Round-22: an issued slice stays fetchable across concurrent staging —
+// its issue-pin is only consumed by the fetch, so eviction can never
+// invalidate an outstanding reader (bridge-level, deterministic).
+func TestIssuedSliceSurvivesEviction(t *testing.T) {
+	f := newFakeV2(t)
+	h := newTestHandler(t, f, 1<<20)
+	br := h.opts.Engine.Bridge
+
+	// Hand out a slice (stage + issue pin, as readClassic does).
+	data := []byte("FIRST")
+	id1 := br.stageClassicChunk(sha256Hex(data), data)
+	if !br.blocks.isIssued(id1) {
+		t.Fatal("staged classic slice was not issue-pinned")
+	}
+	// Stage many distinct chunks to force LRU pressure.
+	for i := 0; i < 32; i++ {
+		d := []byte{byte(i), byte(i), byte(i), byte(i)}
+		br.stageClassicChunk(sha256Hex(d), d)
+	}
+	// The issued id must still be fetchable (objectStorage.Get consumes
+	// the pin and serves the bytes).
+	rc, err := br.Storage().Get(context.Background(), fmt.Sprintf("chunks/0/0/%d_0_%d", id1, len(data)), 0, int64(len(data)))
+	if err != nil {
+		t.Fatalf("issued slice was evicted before its fetch: %v", err)
+	}
+	got, _ := io.ReadAll(rc)
+	_ = rc.Close()
+	if string(got) != "FIRST" {
+		t.Fatalf("issued slice bytes = %q, want FIRST", got)
+	}
+}
+
+// Round-22: the recovery constraint covers TRUNCATION-ONLY publication —
+// a replacement at the saved path is never truncated.
+func TestTruncateOnlyRecoveryRejectsReplacement(t *testing.T) {
+	f := newFakeV2(t)
+	f.seedExtent(t, "/a", "AAAAAAAA")
+	dir := engineCacheDir(t)
+	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: dir})
+	h := New(Options{Engine: eng, Threshold: 1 << 20, SyncMode: "interactive"})
+	eh := claimOpen(t, h, "/a")
+	resID := func() string {
+		st, err := f.stat(t, "/a")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return st
+	}()
+	_ = resID
+	// Truncate locally and fsync (a truncation-only barrier).
+	if _, err := h.Do(context.Background(), &fs.Op{Kind: fs.OpSetAttr, Path: "/a", HasSize: true, Size: 0, Caller: fs.Caller{Pid: 1}}, fs.Next(func(ctx context.Context, op *fs.Op) (fs.Result, error) {
+		return fs.Result{}, nil
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// The name is replaced before the crash recovery runs.
+	f.remove("/a")
+	f.seedExtent(t, "/a", "OTHER")
+	eng2 := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: dir})
+	_ = eng2
+	time.Sleep(500 * time.Millisecond)
+	if got := f.contentOf("/a"); got != "OTHER" {
+		t.Fatalf("replacement content = %q, want OTHER untouched (a zero-length truncate must never apply to it)", got)
+	}
+	if got := f.contentOf("/b"); got != "" {
+		t.Fatalf("/b unexpectedly = %q", got)
+	}
+}
+
+// Round-22: the constraint SURVIVES a failed publication — the staged
+// data cannot reach a replacement through a later unconstrained flush.
+func TestRecoveryConstraintSurvivesFailure(t *testing.T) {
+	f := newFakeV2(t)
+	f.seedExtent(t, "/a", "AAAAAAAA")
+	dir := engineCacheDir(t)
+	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: dir})
+	br := eng.Bridge
+	// Install a verified constraint for /a's current occupant.
+	st, err := br.StatLocal(context.Background(), "/a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ino, errno := br.ResolveLocal(context.Background(), "/a")
+	if errno != 0 {
+		t.Fatal(errno)
+	}
+	br.setVerifyBase(ino, st.Revision, st.ResourceID)
+	br.mu.Lock()
+	br.pending[ino] = []pendingWrite{{chunk: 0, off: 0, checksum: sha256Hex([]byte("ZZZZ")), size: 4}}
+	br.blocks.stagePinned(sha256Hex([]byte("ZZZZ")), []byte("ZZZZ"), true)
+	br.sizes[ino] = 8
+	br.mu.Unlock()
+
+	// Replace the occupant, then attempt the (constrained) publication.
+	f.remove("/a")
+	f.seedExtent(t, "/a", "OTHER")
+	f.setStatFail("/a", true) // the commit's own stat also fails first
+	err = br.FlushFile(context.Background(), ino)
+	f.setStatFail("/a", false)
+	if err == nil {
+		t.Fatal("the constrained publication unexpectedly succeeded against a replacement")
+	}
+	// A later flush must NOT publish into the replacement either.
+	if err := br.FlushFile(context.Background(), ino); err == nil {
+		t.Fatal("a later flush published into the replacement")
+	}
+	if got := f.contentOf("/a"); got != "OTHER" {
+		t.Fatalf("replacement content = %q, want OTHER untouched", got)
 	}
 }

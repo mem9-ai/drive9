@@ -132,9 +132,16 @@ func (s objectStorage) Get(ctx context.Context, key string, off, limit int64, ge
 	if limit <= 0 {
 		return io.NopCloser(bytes.NewReader(nil)), nil
 	}
+	// An issued classic slice stays fetchable for its whole reader
+	// lifetime: the retirement path skips issued ids, and THIS fetch is
+	// the pin's consumer — release it and serve the bytes (the entry
+	// could not have been retired while the pin was held).
 	s.bridge.mu.Lock()
 	sl := s.bridge.stagedSlices[id]
 	s.bridge.mu.Unlock()
+	if sl == nil {
+		s.bridge.blocks.releaseIssuePin(id)
+	}
 	if sl != nil {
 		staged := sl.join()
 		if objOff > int64(len(staged)) {
@@ -284,6 +291,42 @@ func (r *blockRegistry) unpin(sha string) {
 		r.pins[sha]--
 	}
 	r.mu.Unlock()
+}
+
+// issuePin increments the issued-reader count for a staged id (the
+// registry entry is immune from LRU retirement until fetched).
+func (r *blockRegistry) issuePin(id uint64) {
+	if id == 0 {
+		return
+	}
+	r.mu.Lock()
+	r.issued[id]++
+	r.mu.Unlock()
+}
+
+// releaseIssuePin decrements an id's issued-reader count; true when a pin
+// existed.
+func (r *blockRegistry) releaseIssuePin(id uint64) bool {
+	if id == 0 {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.issued[id] <= 0 {
+		return false
+	}
+	r.issued[id]--
+	if r.issued[id] == 0 {
+		delete(r.issued, id)
+	}
+	return true
+}
+
+// isIssued reports whether an outstanding reader holds the staged id.
+func (r *blockRegistry) isIssued(id uint64) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.issued[id] > 0
 }
 
 // releaseIfUnpinned drops a staged entry nothing references.

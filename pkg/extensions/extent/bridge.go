@@ -93,7 +93,11 @@ type Bridge struct {
 	commitErr map[meta.Ino]error
 
 	layoutPending map[meta.Ino]bool
-	verifyBase    map[meta.Ino]verifyBase
+	// layoutPendingID is the resource identity of OUR landed upload for
+	// an inode whose classification failed: adopting the classic surface
+	// is only valid while the occupant is still THAT object.
+	layoutPendingID map[meta.Ino]string
+	verifyBase      map[meta.Ino]verifyBase
 
 	// classicOwned marks files whose fresh extent session silently
 	// degraded to a CLASSIC upload on a legacy server: the handle stays
@@ -162,26 +166,27 @@ func NewBridge(cfg Config) *Bridge {
 		root = "/"
 	}
 	br := &Bridge{
-		cfg:           cfg,
-		format:        meta.Format{Name: "drive9", UUID: "drive9-extent-v2", Storage: "drive9-presign", BlockSize: blockSizeMiB << 20, TrashDays: 0, DirStats: false},
-		nextID:        uint64(1) << 63,
-		stagedSlices:  make(map[uint64]*stagedSlice),
-		blocks:        newBlockRegistry(),
-		paths:         map[meta.Ino]string{rootIno: root},
-		sizes:         make(map[meta.Ino]int64),
-		revs:          make(map[meta.Ino]int64),
-		pending:       make(map[meta.Ino][]pendingWrite),
-		truncs:        make(map[meta.Ino]int64),
-		modes:         make(map[meta.Ino]uint32),
-		sentinels:     make(map[string]meta.Ino),
-		nextHeldIno:   heldInoBase,
-		moved:         make(map[meta.Ino]string),
-		replacements:  make(map[string]meta.Ino),
-		commitLocks:   make(map[meta.Ino]*sync.Mutex),
-		classicOwned:  make(map[meta.Ino]bool),
-		layoutPending: make(map[meta.Ino]bool),
-		commitErr:     make(map[meta.Ino]error),
-		verifyBase:    make(map[meta.Ino]verifyBase),
+		cfg:             cfg,
+		format:          meta.Format{Name: "drive9", UUID: "drive9-extent-v2", Storage: "drive9-presign", BlockSize: blockSizeMiB << 20, TrashDays: 0, DirStats: false},
+		nextID:          uint64(1) << 63,
+		stagedSlices:    make(map[uint64]*stagedSlice),
+		blocks:          newBlockRegistry(),
+		paths:           map[meta.Ino]string{rootIno: root},
+		sizes:           make(map[meta.Ino]int64),
+		revs:            make(map[meta.Ino]int64),
+		pending:         make(map[meta.Ino][]pendingWrite),
+		truncs:          make(map[meta.Ino]int64),
+		modes:           make(map[meta.Ino]uint32),
+		sentinels:       make(map[string]meta.Ino),
+		nextHeldIno:     heldInoBase,
+		moved:           make(map[meta.Ino]string),
+		replacements:    make(map[string]meta.Ino),
+		commitLocks:     make(map[meta.Ino]*sync.Mutex),
+		classicOwned:    make(map[meta.Ino]bool),
+		layoutPending:   make(map[meta.Ino]bool),
+		layoutPendingID: make(map[meta.Ino]string),
+		commitErr:       make(map[meta.Ino]error),
+		verifyBase:      make(map[meta.Ino]verifyBase),
 	}
 	// Provenance refetch resolves through the inode's CURRENT mapping:
 	// open files move under renames and retention aliases, and a stale
@@ -299,6 +304,9 @@ type blockRegistry struct {
 	mu   sync.Mutex
 	m    map[uint64]*blockEntry
 	pins map[string]int // checksum -> pending-commit references
+	// issued tracks outstanding readers of staged classic ids: an issued
+	// entry is immune from LRU retirement until its fetch consumes the pin.
+	issued map[uint64]int
 	// currentPath resolves an inode to the remote path it maps to NOW.
 	currentPath func(ino meta.Ino) (string, bool)
 }
@@ -315,7 +323,7 @@ type blockEntry struct {
 }
 
 func newBlockRegistry() *blockRegistry {
-	return &blockRegistry{m: make(map[uint64]*blockEntry), pins: make(map[string]int)}
+	return &blockRegistry{m: make(map[uint64]*blockEntry), pins: make(map[string]int), issued: make(map[uint64]int)}
 }
 
 // ctxOf adapts a meta.Context to a context.Context (meta.Context embeds
