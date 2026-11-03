@@ -3,19 +3,46 @@ package tenant
 import (
 	"fmt"
 	"net"
+	"os"
 	"strings"
 )
 
+// EnvDBTLSSkipVerify is the explicit opt-out from verified tenant DB TLS.
+// It exists only for deployments whose database endpoint presents a
+// certificate the client cannot validate (typically a private-link gateway
+// whose certificate is not issued for the address the client dials). Without
+// it, every non-loopback tenant connection is verified.
+const EnvDBTLSSkipVerify = "DRIVE9_DB_TLS_SKIP_VERIFY"
+
+// DBTLSSkipVerifyRequested reports whether the deployment explicitly opted out
+// of tenant DB certificate verification.
+func DBTLSSkipVerifyRequested() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(EnvDBTLSSkipVerify))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
 // MySQLTLSParam returns the go-sql-driver `tls` DSN value for a tenant DB
 // connection. Loopback hosts never request TLS: local unistore TiDB (and most
-// testcontainers mappings) do not speak it. Public TiDB Cloud Native endpoints
-// still get skip-verify when DBTLS is unset.
+// testcontainers mappings) do not speak it. Non-loopback TiDB Cloud Native
+// endpoints get verified TLS, not skip-verify: the DSN carries the tenant's
+// database password, so an unverified channel would expose it to anyone on the
+// path. DRIVE9_DB_TLS_SKIP_VERIFY is the documented, explicit opt-out.
 func MySQLTLSParam(tlsEnabled bool, provider, host string) string {
 	if tlsEnabled {
+		if DBTLSSkipVerifyRequested() {
+			return "skip-verify"
+		}
 		return "true"
 	}
 	if UsesTiDBCloudNativeCredentials(provider) && !IsLoopbackDBHost(host) {
-		return "skip-verify"
+		if DBTLSSkipVerifyRequested() {
+			return "skip-verify"
+		}
+		return "true"
 	}
 	return ""
 }

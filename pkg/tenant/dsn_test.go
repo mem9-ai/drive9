@@ -15,7 +15,7 @@ func TestMySQLTLSParam(t *testing.T) {
 	}{
 		{true, ProviderLocal, "127.0.0.1", "true"},
 		{true, ProviderTiDBCloudNative, "127.0.0.1", "true"},
-		{false, ProviderTiDBCloudNative, "gateway.us-east-1.prod.aws.tidbcloud.com", "skip-verify"},
+		{false, ProviderTiDBCloudNative, "gateway.us-east-1.prod.aws.tidbcloud.com", "true"},
 		{false, ProviderTiDBCloudNative, "127.0.0.1", ""},
 		{false, ProviderTiDBCloudNative, "localhost", ""},
 		{false, ProviderTiDBCloudNative, "::1", ""},
@@ -38,8 +38,8 @@ func TestFormatTenantMySQLDSN(t *testing.T) {
 		t.Fatalf("loopback native DSN unexpectedly has tls: %s", dsn)
 	}
 	dsn = FormatTenantMySQLDSN("u", "p", "db.example.com", 4000, "drive9_t", false, ProviderTiDBCloudNative)
-	if !strings.Contains(dsn, "tls=skip-verify") {
-		t.Fatalf("public native DSN = %q, want tls=skip-verify", dsn)
+	if !strings.Contains(dsn, "tls=true") {
+		t.Fatalf("public native DSN = %q, want verified tls=true", dsn)
 	}
 	dsn = FormatTenantMySQLDSN("u", "p", "::1", 4000, "drive9_t", false, ProviderLocal)
 	if !strings.Contains(dsn, "tcp([::1]:4000)") {

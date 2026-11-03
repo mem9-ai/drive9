@@ -18,6 +18,12 @@ import (
 type MasterKey struct {
 	key []byte
 	gcm cipher.AEAD
+	// previous holds retired master keys: unwrapping tries the primary key and
+	// then each retired key, so DEKs wrapped before a rotation stay readable
+	// while every new wrap uses the primary. Derivation (DeriveCSK) always uses
+	// the primary, so capability tokens issued under a retired key stop
+	// verifying — that is the point of retiring it.
+	previous []cipher.AEAD
 }
 
 // NewMasterKey creates a MasterKey from raw 32-byte key material.
@@ -34,6 +40,30 @@ func NewMasterKey(key []byte) (*MasterKey, error) {
 		return nil, fmt.Errorf("cipher.NewGCM: %w", err)
 	}
 	return &MasterKey{key: key, gcm: gcm}, nil
+}
+
+// NewMasterKeyWithPrevious creates a rotating master key: wrapping uses
+// primary, unwrapping also tries previous (retired) keys.
+func NewMasterKeyWithPrevious(primary []byte, previous [][]byte) (*MasterKey, error) {
+	mk, err := NewMasterKey(primary)
+	if err != nil {
+		return nil, err
+	}
+	for _, key := range previous {
+		if len(key) != 32 {
+			return nil, fmt.Errorf("previous vault master key must be 32 bytes, got %d", len(key))
+		}
+		block, err := aes.NewCipher(key)
+		if err != nil {
+			return nil, fmt.Errorf("previous vault master key: %w", err)
+		}
+		gcm, err := cipher.NewGCM(block)
+		if err != nil {
+			return nil, fmt.Errorf("previous vault master key: %w", err)
+		}
+		mk.previous = append(mk.previous, gcm)
+	}
+	return mk, nil
 }
 
 // GenerateDEK creates a new random 32-byte DEK and returns it wrapped (encrypted by MK).
@@ -56,11 +86,15 @@ func (mk *MasterKey) UnwrapDEK(wrappedDEK []byte) ([]byte, error) {
 	if len(wrappedDEK) < ns {
 		return nil, fmt.Errorf("wrapped DEK too short")
 	}
-	plainDEK, err := mk.gcm.Open(nil, wrappedDEK[:ns], wrappedDEK[ns:], nil)
-	if err != nil {
-		return nil, fmt.Errorf("unwrap DEK: %w", err)
+	if plainDEK, err := mk.gcm.Open(nil, wrappedDEK[:ns], wrappedDEK[ns:], nil); err == nil {
+		return plainDEK, nil
 	}
-	return plainDEK, nil
+	for _, gcm := range mk.previous {
+		if plainDEK, err := gcm.Open(nil, wrappedDEK[:ns], wrappedDEK[ns:], nil); err == nil {
+			return plainDEK, nil
+		}
+	}
+	return nil, fmt.Errorf("unwrap DEK: no master key matches this value")
 }
 
 // DeriveCSK derives the Capability Signing Key from MK + tenantID.

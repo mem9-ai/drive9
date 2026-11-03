@@ -2,23 +2,64 @@ package s3client
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
+
+// Presigned-URL query parameters minted and verified by the local object-store
+// mock. Unlike S3/GCS/Azure the local gateway has no cloud provider to sign its
+// URLs, so it signs them itself: without a signature GET /s3/objects/{key}
+// would hand any caller that can guess a key the bytes of another tenant's
+// object, and PUT /s3/upload/{uploadID}/{part} would accept anonymous writes.
+const (
+	localPresignExpiresParam   = "x-drive9-expires"
+	localPresignSignatureParam = "x-drive9-signature"
+	localPresignDefaultTTL     = 10 * time.Minute
+)
+
+// All LocalS3Client instances in one process share the signing key: a
+// presigned URL minted by one tenant backend must still verify after that
+// backend is evicted and reopened, which creates a new client for the same
+// storage. The key is process-local, so URLs die with the process.
+var (
+	localPresignKeyOnce sync.Once
+	localPresignKey     []byte
+	localPresignKeyErr  error
+)
+
+// ErrInvalidObjectKey marks a key that would address a path outside the local
+// object-store root.
+var ErrInvalidObjectKey = errors.New("invalid object key")
+
+func sharedLocalPresignKey() ([]byte, error) {
+	localPresignKeyOnce.Do(func() {
+		localPresignKey = make([]byte, 32)
+		_, localPresignKeyErr = rand.Read(localPresignKey)
+	})
+	return localPresignKey, localPresignKeyErr
+}
 
 // LocalS3Client implements S3Client using the local filesystem.
 // Used for testing and development without real S3.
 type LocalS3Client struct {
 	rootDir string
 	baseURL string // base URL for presigned URLs (e.g. "http://localhost:9091/s3")
+	signKey []byte
+	now     func() time.Time
 	mu      sync.Mutex
 	uploads map[string]*localUpload // uploadID → upload state
 }
@@ -36,19 +77,82 @@ type localPart struct {
 // NewLocal creates a LocalS3Client rooted at the given directory.
 // baseURL is used to construct presigned URLs that can be resolved locally.
 func NewLocal(rootDir, baseURL string) (*LocalS3Client, error) {
+	// Canonicalize the root: the signature binds it, and the pool can hand the
+	// same storage through a relative and an absolute path.
+	absRoot, err := filepath.Abs(rootDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve s3 root: %w", err)
+	}
+	rootDir = absRoot
 	if err := os.MkdirAll(rootDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create s3 root: %w", err)
 	}
 	markS3ClientAvailable()
+	signKey, err := sharedLocalPresignKey()
+	if err != nil {
+		return nil, fmt.Errorf("generate local s3 presign key: %w", err)
+	}
 	return &LocalS3Client{
 		rootDir: rootDir,
 		baseURL: baseURL,
+		signKey: signKey,
+		now:     time.Now,
 		uploads: make(map[string]*localUpload),
 	}, nil
 }
 
-func (c *LocalS3Client) objectPath(key string) string {
-	return filepath.Join(c.rootDir, "objects", key)
+// objectPath maps an object key to its path under the objects root.
+//
+// Keys reach this method from persisted storage_ref values and from presigned
+// URLs, so the mapped path is verified to stay inside the objects root: a key
+// such as "../../etc/passwd" must never resolve to a host file. Both callers
+// and tests rely on the containment check, so it lives here rather than in the
+// individual operations.
+func (c *LocalS3Client) objectPath(key string) (string, error) {
+	if !validObjectKey(key) {
+		return "", fmt.Errorf("%w: %q", ErrInvalidObjectKey, key)
+	}
+	root := filepath.Join(c.rootDir, "objects")
+	path := filepath.Join(root, filepath.FromSlash(key))
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return "", fmt.Errorf("%w: %q", ErrInvalidObjectKey, key)
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", fmt.Errorf("%w: %q", ErrInvalidObjectKey, key)
+	}
+	return path, nil
+}
+
+// ValidateObjectKey reports whether key is a well-formed object key the local
+// object store (and any S3-compatible backend) can address: non-empty,
+// relative, and free of "..", "." and empty segments, backslashes and NUL
+// bytes. Callers that accept a key from outside the process use it to reject
+// references that would escape a tenant's namespace; the local client enforces
+// the same rule on every object operation.
+func ValidateObjectKey(key string) error {
+	if !validObjectKey(key) {
+		return fmt.Errorf("%w: %q", ErrInvalidObjectKey, key)
+	}
+	return nil
+}
+
+// validObjectKey reports whether key is a well-formed object key: non-empty,
+// relative, and free of "..", "." and empty segments, backslashes and NUL
+// bytes.
+func validObjectKey(key string) bool {
+	if key == "" || strings.ContainsRune(key, 0) || strings.Contains(key, `\`) {
+		return false
+	}
+	if strings.HasPrefix(key, "/") {
+		return false
+	}
+	for _, seg := range strings.Split(key, "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			return false
+		}
+	}
+	return true
 }
 
 // RootDir is the local mock S3 root.
@@ -56,6 +160,63 @@ func (c *LocalS3Client) RootDir() string { return c.rootDir }
 
 // ObjectsDir is where PutObject stores keys (root/objects).
 func (c *LocalS3Client) ObjectsDir() string { return filepath.Join(c.rootDir, "objects") }
+
+func (c *LocalS3Client) nowTime() time.Time {
+	if c.now != nil {
+		return c.now()
+	}
+	return time.Now()
+}
+
+// signLocalPresign is the canonical signature for one presigned request: the
+// storage root, HTTP method, handler-relative path, the extra query the URL
+// was minted with (the range selector, or empty), and the expiry. Binding the
+// storage root keeps a URL for one tenant from being replayed against another
+// tenant's backend after the /s3/{tenant}/ proxy strips the prefix; binding the
+// rest stops cross-method, cross-key, and expired replays.
+func (c *LocalS3Client) signLocalPresign(method, path, extra string, expires int64) string {
+	mac := hmac.New(sha256.New, c.signKey)
+	_, _ = fmt.Fprintf(mac, "%s\n%s\n%s\n%s\n%d", c.rootDir, method, path, extra, expires)
+	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+// presignLocalRequest returns baseURL+path with an expiry and signature
+// appended. extraQuery is the optional query fragment that is part of the
+// signature (e.g. "range=0-1023").
+func (c *LocalS3Client) presignLocalRequest(method, path, extraQuery string, ttl time.Duration) string {
+	if ttl <= 0 {
+		ttl = localPresignDefaultTTL
+	}
+	expires := c.nowTime().Add(ttl).Unix()
+	signature := c.signLocalPresign(method, path, extraQuery, expires)
+	query := extraQuery
+	if query != "" {
+		query += "&"
+	}
+	query += localPresignExpiresParam + "=" + strconv.FormatInt(expires, 10) +
+		"&" + localPresignSignatureParam + "=" + signature
+	return c.baseURL + path + "?" + query
+}
+
+// authorizeLocalPresign verifies the expiry and signature of an incoming
+// presigned request before any object bytes are read or written.
+func (c *LocalS3Client) authorizeLocalPresign(r *http.Request, extraQuery string) bool {
+	query := r.URL.Query()
+	expiresRaw := query.Get(localPresignExpiresParam)
+	signature := query.Get(localPresignSignatureParam)
+	if expiresRaw == "" || signature == "" {
+		return false
+	}
+	expires, err := strconv.ParseInt(expiresRaw, 10, 64)
+	if err != nil {
+		return false
+	}
+	if c.nowTime().Unix() > expires {
+		return false
+	}
+	want := c.signLocalPresign(r.Method, r.URL.Path, extraQuery, expires)
+	return hmac.Equal([]byte(signature), []byte(want))
+}
 
 func (c *LocalS3Client) partPath(key, uploadID string, partNumber int) string {
 	return filepath.Join(c.rootDir, "parts", uploadID, fmt.Sprintf("%05d", partNumber))
@@ -86,7 +247,10 @@ func (c *LocalS3Client) PresignUploadPart(ctx context.Context, key, uploadID str
 	metricResult := "ok"
 	defer func() { recordS3Operation("presign_upload_part", metricResult, start) }()
 
-	url := fmt.Sprintf("%s/upload/%s/%d", c.baseURL, uploadID, partNumber)
+	if !validObjectKey(key) {
+		return nil, fmt.Errorf("%w: %q", ErrInvalidObjectKey, key)
+	}
+	url := c.presignLocalRequest(http.MethodPut, fmt.Sprintf("/upload/%s/%d", uploadID, partNumber), "", ttl)
 	var headers map[string]string
 	if checksumValue != "" {
 		switch algo {
@@ -178,7 +342,11 @@ func (c *LocalS3Client) CompleteMultipartUpload(ctx context.Context, key, upload
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Number < sorted[j].Number })
 
 	// Assemble final object from parts
-	objPath := c.objectPath(key)
+	objPath, err := c.objectPath(key)
+	if err != nil {
+		result = "error"
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(objPath), 0o755); err != nil {
 		result = "error"
 		return err
@@ -259,8 +427,10 @@ func (c *LocalS3Client) PresignGetObject(ctx context.Context, key string, ttl ti
 	start := time.Now()
 	defer func() { recordS3Operation("presign_get_object", "ok", start) }()
 
-	url := fmt.Sprintf("%s/objects/%s", c.baseURL, key)
-	return url, nil
+	if !validObjectKey(key) {
+		return "", fmt.Errorf("%w: %q", ErrInvalidObjectKey, key)
+	}
+	return c.presignLocalRequest(http.MethodGet, "/objects/"+key, "", ttl), nil
 }
 
 func (c *LocalS3Client) PutObject(ctx context.Context, key string, body io.Reader, size int64, encOpts EncryptionOpts) error {
@@ -268,7 +438,11 @@ func (c *LocalS3Client) PutObject(ctx context.Context, key string, body io.Reade
 	result := "ok"
 	defer func() { recordS3Operation("put_object", result, start) }()
 
-	objPath := c.objectPath(key)
+	objPath, err := c.objectPath(key)
+	if err != nil {
+		result = "error"
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(objPath), 0o755); err != nil {
 		result = "error"
 		return err
@@ -295,9 +469,9 @@ func (c *LocalS3Client) GetObject(ctx context.Context, key string) (io.ReadClose
 	result := "ok"
 	defer func() { recordS3Operation("get_object", result, start) }()
 
-	rc, err := os.Open(c.objectPath(key))
+	rc, err := c.openObject(key)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if os.IsNotExist(err) || errors.Is(err, ErrInvalidObjectKey) {
 			result = "not_found"
 		} else {
 			result = "error"
@@ -307,12 +481,26 @@ func (c *LocalS3Client) GetObject(ctx context.Context, key string) (io.ReadClose
 	return rc, nil
 }
 
+// openObject opens an object file after containment validation.
+func (c *LocalS3Client) openObject(key string) (io.ReadCloser, error) {
+	path, err := c.objectPath(key)
+	if err != nil {
+		return nil, err
+	}
+	return os.Open(path)
+}
+
 func (c *LocalS3Client) DeleteObject(ctx context.Context, key string) error {
 	start := time.Now()
 	result := "ok"
 	defer func() { recordS3Operation("delete_object", result, start) }()
 
-	err := os.Remove(c.objectPath(key))
+	path, err := c.objectPath(key)
+	if err != nil {
+		result = "error"
+		return err
+	}
+	err = os.Remove(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			result = "not_found"
@@ -405,7 +593,11 @@ func (c *LocalS3Client) UploadPartCopy(ctx context.Context, destKey, uploadID st
 	}
 
 	// Read source range from the existing object file
-	srcPath := c.objectPath(sourceKey)
+	srcPath, err := c.objectPath(sourceKey)
+	if err != nil {
+		result = "error"
+		return "", err
+	}
 	f, err := os.Open(srcPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -455,8 +647,11 @@ func (c *LocalS3Client) PresignGetObjectRange(ctx context.Context, key string, s
 	start := time.Now()
 	defer func() { recordS3Operation("presign_get_object_range", "ok", start) }()
 
-	url := fmt.Sprintf("%s/objects/%s?range=%d-%d", c.baseURL, key, startByte, endByte)
-	return url, nil
+	if !validObjectKey(key) {
+		return "", fmt.Errorf("%w: %q", ErrInvalidObjectKey, key)
+	}
+	rangeQuery := fmt.Sprintf("range=%d-%d", startByte, endByte)
+	return c.presignLocalRequest(http.MethodGet, "/objects/"+key, rangeQuery, ttl), nil
 }
 
 // Verify interface compliance.

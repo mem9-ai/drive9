@@ -255,3 +255,26 @@ func TestValidateTenantS3EncryptionPolicyP1RejectsUnsupportedMode(t *testing.T) 
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+// The zero-config policy must encrypt objects at rest: an unset mode used to
+// resolve to none, leaving tenant blobs in plaintext in the bucket.
+func TestDefaultS3EncryptionPolicyEncryptsAtRest(t *testing.T) {
+	if got := DefaultS3EncryptionPolicy().Mode; got != S3EncryptionModeSSES3 {
+		t.Fatalf("default mode = %q, want %q", got, S3EncryptionModeSSES3)
+	}
+	resolved, err := ResolveS3EncryptionPolicy(S3EncryptionPolicy{}, S3EncryptionPolicy{Mode: S3EncryptionModeInherit})
+	if err != nil {
+		t.Fatalf("resolve unset global policy: %v", err)
+	}
+	if resolved.Mode != s3client.EncryptionModeSSES3 {
+		t.Fatalf("unset global policy resolved to %q, want %q", resolved.Mode, s3client.EncryptionModeSSES3)
+	}
+	// An explicit opt-out is still honored for SSE-hostile backends.
+	resolved, err = ResolveS3EncryptionPolicy(S3EncryptionPolicy{Mode: S3EncryptionModeNone}, S3EncryptionPolicy{Mode: S3EncryptionModeInherit})
+	if err != nil {
+		t.Fatalf("resolve explicit none: %v", err)
+	}
+	if resolved.Mode != s3client.EncryptionModeNone {
+		t.Fatalf("explicit none resolved to %q", resolved.Mode)
+	}
+}

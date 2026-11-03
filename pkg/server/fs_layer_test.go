@@ -1353,11 +1353,14 @@ func TestFSLayerCommitRollsBackAppliedEntriesOnFailure(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("UpsertFSLayerEntry first: %v", err)
 	}
+	// A directory whiteout that is empty at preflight time but not at apply
+	// time fails mid-commit, which is the failure this test rolls back.
+	// (References the server could never mint are rejected at upsert time
+	// instead — see TestFSLayerEntryRejectsUnissuedStorageRef.)
 	if _, err := c.UpsertFSLayerEntry(ctx, "layer-rollback-commit", client.FSLayerEntryRequest{
-		Path:       "/repo/second.txt",
-		Op:         "upsert",
-		Kind:       "file",
-		StorageRef: "external-not-supported",
+		Path: "/repo/",
+		Op:   "whiteout",
+		Kind: "dir",
 	}); err != nil {
 		t.Fatalf("UpsertFSLayerEntry second: %v", err)
 	}
@@ -1460,5 +1463,104 @@ func TestFSLayerEntryUpsertBaseRevisionCAS(t *testing.T) {
 	// The fresh base revision is accepted again.
 	if code := upsertEntry(2); code != http.StatusOK {
 		t.Fatalf("upsert with fresh base revision: %d, want 200", code)
+	}
+}
+
+// A layer entry's storage_ref is caller-supplied and is later fed to the
+// object store, so only references the server itself mints may be stored. An
+// unvalidated ref let a caller point at another tenant's object, or at an
+// arbitrary host file on the local backend.
+func TestFSLayerEntryRejectsUnissuedStorageRef(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	ctx := context.Background()
+	c := client.New(ts.URL, "")
+	if _, err := c.CreateFSLayer(ctx, client.FSLayerCreateRequest{
+		LayerID:      "layer-storage-ref",
+		BaseRootPath: "/repo",
+	}); err != nil {
+		t.Fatalf("CreateFSLayer: %v", err)
+	}
+	for _, ref := range []string{
+		"external-not-supported",
+		"../../etc/passwd",
+		"/etc/passwd",
+		"blobs/../other/file",
+		"layers/another-layer/object",
+	} {
+		if _, err := c.UpsertFSLayerEntry(ctx, "layer-storage-ref", client.FSLayerEntryRequest{
+			Path:       "/repo/file.txt",
+			Op:         "upsert",
+			Kind:       "file",
+			StorageRef: ref,
+		}); err == nil {
+			t.Fatalf("UpsertFSLayerEntry accepted storage_ref %q", ref)
+		}
+	}
+	// The layer's own payload prefix is still accepted.
+	if _, err := c.UpsertFSLayerEntry(ctx, "layer-storage-ref", client.FSLayerEntryRequest{
+		Path:       "/repo/file.txt",
+		Op:         "upsert",
+		Kind:       "file",
+		StorageRef: "layers/layer-storage-ref/object-1",
+	}); err != nil {
+		t.Fatalf("UpsertFSLayerEntry rejected a server-issued ref: %v", err)
+	}
+	if _, err := c.UpsertFSLayerEntry(ctx, "layer-storage-ref", client.FSLayerEntryRequest{
+		Path:       "/repo/blob.txt",
+		Op:         "upsert",
+		Kind:       "file",
+		StorageRef: "blobs/file-1",
+	}); err != nil {
+		t.Fatalf("UpsertFSLayerEntry rejected a blob ref: %v", err)
+	}
+}
+
+// The commit rollback buffer is the tenant's to inflate; it must be bounded or
+// the least-privileged token that can commit a layer can drive the server OOM.
+func TestFSLayerSnapshotBudget(t *testing.T) {
+	if err := checkFSLayerSnapshotBudget(1, 1); err != nil {
+		t.Fatalf("small snapshot rejected: %v", err)
+	}
+
+	if err := checkFSLayerSnapshotBudget(maxFSLayerCommitSnapshots, maxFSLayerCommitSnapshotBytes); err != nil {
+		t.Fatalf("at-limit snapshot rejected: %v", err)
+	}
+	if err := checkFSLayerSnapshotBudget(maxFSLayerCommitSnapshots+1, 0); err == nil {
+		t.Fatal("path-count budget not enforced")
+	}
+	if err := checkFSLayerSnapshotBudget(1, maxFSLayerCommitSnapshotBytes+1); err == nil {
+		t.Fatal("byte budget not enforced")
+	}
+}
+
+// A base file bigger than the remaining snapshot budget must be refused before
+// its bytes are read: the backend materializes a whole file even when a length
+// is requested, so checking the size first is what makes the byte cap real.
+func TestFSLayerSnapshotRefusesOversizedBaseFileWithoutReadingIt(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	content := bytes.Repeat([]byte("a"), 4096)
+	if _, err := s.fallback.WriteCtx(ctx, "/big.bin", content, 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate); err != nil {
+		t.Fatalf("write base file: %v", err)
+	}
+
+	snap := snapshotFSLayerBasePath(ctx, s.fallback, "/big.bin", 1024)
+	if !snap.TooLarge {
+		t.Fatal("oversized base file was not reported as TooLarge")
+	}
+	if len(snap.Data) != 0 {
+		t.Fatalf("oversized base file was read into memory (%d bytes)", len(snap.Data))
+	}
+
+	// Within budget the same file snapshots normally.
+	snap = snapshotFSLayerBasePath(ctx, s.fallback, "/big.bin", int64(len(content)))
+	if snap.TooLarge || !snap.SnapshotOK {
+		t.Fatalf("in-budget snapshot = %+v", snap)
+	}
+	if !bytes.Equal(snap.Data, content) {
+		t.Fatalf("snapshot data = %d bytes, want %d", len(snap.Data), len(content))
 	}
 }

@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/gitcache"
 )
 
 const (
@@ -460,9 +461,14 @@ func collectStagedObjectSet(ctx context.Context, gitDir string) (map[string]stru
 	return objects, nil
 }
 
+// shouldSkipGitObjectStatePath reports paths a checkpoint archive never needs to
+// carry. objects/ travels as packs, and hooks/ are executables that only the
+// mounting host could run: uploading them would ship code to the server and the
+// restore path strips them anyway.
 func shouldSkipGitObjectStatePath(rel string, _ fs.DirEntry) bool {
 	for _, part := range strings.Split(filepath.ToSlash(rel), "/") {
-		if part == "objects" {
+		switch part {
+		case "objects", "hooks":
 			return true
 		}
 	}
@@ -857,6 +863,15 @@ func (g *Git) restoreWorkspaceState(ctx context.Context, w *workspace) error {
 	if err := extractGitArchive(state.Content, tmpGitDir); err != nil {
 		return err
 	}
+	// The checkpoint archive is tenant-writable, but it is restored as a live
+	// .git directory on the mount host. Anything in it that git would execute —
+	// hooks, a core.fsmonitor/pager/sshCommand, a filter driver, an
+	// include.path — would run as the user running this process on the next
+	// git command, so the executable surface is stripped before the directory
+	// is put into service.
+	if err := sanitizeGitCheckpointDir(tmpGitDir); err != nil {
+		return err
+	}
 	if linkedCommonGitDir != "" {
 		// The worktree gitdir must resolve its shared state through the
 		// common .git; an archive that predates commondir gets the
@@ -962,6 +977,12 @@ func (g *Git) restoreGitObjectsFromRemote(ctx context.Context, w *workspace, git
 	if repoURL == "" {
 		return fmt.Errorf("git workspace %s has no repo URL for object restore", w.id)
 	}
+	// The URL came from a tenant request. Re-validate here (the API already
+	// did) so no other caller path can clone an ext:: transport or a local
+	// repository, and pin the transport list git itself accepts.
+	if err := gitcache.ValidateRepoURL(repoURL); err != nil {
+		return fmt.Errorf("git workspace %s repo URL rejected: %w", w.id, err)
+	}
 	worktreeRoot := filepath.Dir(gitDir)
 	parent := filepath.Dir(worktreeRoot)
 	if err := os.MkdirAll(parent, 0o755); err != nil {
@@ -978,6 +999,10 @@ func (g *Git) restoreGitObjectsFromRemote(ctx context.Context, w *workspace, git
 	}
 	args = append(args, repoURL, tmpWorktree)
 	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Env = append(gitSafeEnv(os.Environ()), "GIT_TERMINAL_PROMPT=0", "GIT_ALLOW_PROTOCOL="+gitcache.GitAllowedProtocols)
+	if gitcache.GitAllowLocalRepos() {
+		cmd.Env[len(cmd.Env)-1] = "GIT_ALLOW_PROTOCOL=" + gitcache.GitLocalAllowedProtocols
+	}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -1093,4 +1118,149 @@ func (g *Git) MaterializeHeadTree(ctx context.Context, gitDir string) error {
 		return fmt.Errorf("materialize head tree: %w", err)
 	}
 	return nil
+}
+
+// gitCheckpointSafeConfigKeys are the only config keys a restored checkpoint
+// may contribute to git's behaviour. Everything else is dropped: the archive is
+// tenant-writable, and a .git/config key can make git execute arbitrary
+// commands (core.fsmonitor, core.pager, core.sshCommand, core.askPass,
+// core.editor, core.alternateRefsCommand, filter.*.clean/smudge,
+// diff.*.textconv, merge.*.driver, include.path, url.*.insteadOf, ...).
+var gitCheckpointSafeConfigKeys = map[string]bool{
+	"core.repositoryformatversion": true,
+	"core.filemode":                true,
+	"core.bare":                    true,
+	"core.logallrefupdates":        true,
+	"core.ignorecase":              true,
+	"core.precomposeunicode":       true,
+	"core.symlinks":                true,
+	"core.worktree":                true,
+	"extensions.objectformat":      true,
+	"extensions.worktreeconfig":    true,
+	"gc.autodetach":                true,
+}
+
+// gitCheckpointSafeConfigSections are the config sections a checkpoint may
+// keep. Hooks and command-bearing sections are excluded by construction; a
+// section not listed here is dropped wholesale.
+var gitCheckpointSafeConfigSections = map[string]bool{
+	"remote": true,
+	"branch": true,
+	"tag":    true,
+	"user":   true,
+	"init":   true,
+}
+
+// sanitizeGitCheckpointDir removes the executable surface of a restored .git
+// directory: the hooks directory and every config key or section that can make
+// git run a program. It is applied to the freshly extracted tree, before the
+// directory is renamed into place.
+func sanitizeGitCheckpointDir(gitDir string) error {
+	if gitDir == "" {
+		return nil
+	}
+	// Hooks are executable programs in the repository. Nothing in a checkpoint
+	// needs them.
+	if err := os.RemoveAll(filepath.Join(gitDir, "hooks")); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove checkpoint hooks: %w", err)
+	}
+	return sanitizeGitCheckpointConfig(filepath.Join(gitDir, "config"))
+}
+
+// sanitizeGitCheckpointConfig rewrites a git config file keeping only the
+// sections and keys that cannot execute a program.
+func sanitizeGitCheckpointConfig(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read checkpoint config: %w", err)
+	}
+	var out strings.Builder
+	sectionName := ""
+	sectionKept := false
+	continued := false
+	for _, line := range strings.SplitAfter(string(data), "\n") {
+		trimmed := strings.TrimSpace(strings.TrimRight(line, "\r\n"))
+		if continued {
+			// A backslash continuation belongs to the previous value; keep or
+			// drop it together with that value so the file stays parseable.
+			continued = strings.HasSuffix(trimmed, `\`)
+			if sectionKept {
+				out.WriteString(line)
+			}
+			continue
+		}
+		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+			section := strings.ToLower(strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(trimmed, "["), "]")))
+			sectionName = section
+			if i := strings.IndexAny(sectionName, " \t\""); i >= 0 {
+				sectionName = sectionName[:i]
+			}
+			sectionKept = gitCheckpointSafeConfigSections[sectionName] || sectionName == "core" ||
+				sectionName == "extensions" || sectionName == "gc"
+			if sectionKept {
+				out.WriteString(line)
+			}
+			continue
+		}
+		if !sectionKept {
+			continue
+		}
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, ";") {
+			out.WriteString(line)
+			continue
+		}
+		// Sections kept wholesale (remote/branch/tag/user/init) carry only
+		// values; core/extensions/gc are key allowlists because those keys can
+		// name a program to run.
+		continued = strings.HasSuffix(trimmed, `\`)
+		if gitCheckpointSafeConfigSections[sectionName] {
+			out.WriteString(line)
+			continue
+		}
+		key := trimmed
+		if i := strings.IndexByte(key, '='); i >= 0 {
+			key = key[:i]
+		}
+		key = strings.ToLower(strings.TrimSpace(key))
+		if !gitCheckpointSafeConfigKeys[sectionName+"."+key] {
+			continued = false
+			continue
+		}
+		out.WriteString(line)
+	}
+	if err := os.WriteFile(path, []byte(out.String()), 0o600); err != nil {
+		return fmt.Errorf("rewrite checkpoint config: %w", err)
+	}
+	return nil
+}
+
+// gitSafeEnv neutralises ambient git configuration that could make a tenant
+// clone execute code: system/global config, hooks, and the credential helpers
+// an attacker-controlled URL could steer.
+func gitSafeEnv(base []string) []string {
+	out := make([]string, 0, len(base)+6)
+	for _, kv := range base {
+		switch {
+		case strings.HasPrefix(kv, "GIT_CONFIG_COUNT="),
+			strings.HasPrefix(kv, "GIT_ALLOW_PROTOCOL="),
+			strings.HasPrefix(kv, "GIT_TERMINAL_PROMPT="),
+			strings.HasPrefix(kv, "GIT_ASKPASS="),
+			strings.HasPrefix(kv, "SSH_ASKPASS="):
+			continue
+		}
+		out = append(out, kv)
+	}
+	// core.hooksPath=/dev/null still leaves no hook to run, and disabling the
+	// fsmonitor/askpass hooks keeps a crafted repo config inert.
+	return append(out,
+		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_CONFIG_COUNT=2",
+		"GIT_CONFIG_KEY_0=core.hooksPath",
+		"GIT_CONFIG_VALUE_0=/dev/null",
+		"GIT_CONFIG_KEY_1=core.fsmonitor",
+		"GIT_CONFIG_VALUE_1=false",
+	)
 }

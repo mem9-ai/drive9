@@ -1406,3 +1406,89 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 	cleanup = false
 	return nil
 }
+
+// Git transport policy for tenant-supplied repository URLs.
+//
+// A workspace repo_url reaches `git clone` on whichever host runs the mount.
+// Git accepts transports that are not network fetches at all: ext:: executes a
+// command the URL names, file:///path reads a repository off the local
+// filesystem, and a leading "-" is parsed as an option. A tenant must not be
+// able to reach any of them through an API field, so URLs are restricted to
+// real remote transports and the restriction is also enforced in git's own
+// environment when the clone runs.
+
+const (
+	// EnvGitAllowLocalRepos opts a deployment (local development, e2e) into
+	// file:// and local-path repositories. It is off by default because the
+	// server process can read repositories the caller cannot.
+	EnvGitAllowLocalRepos = "DRIVE9_GIT_ALLOW_LOCAL_REPOS"
+	// GitAllowedProtocols is the value passed as GIT_ALLOW_PROTOCOL when a
+	// clone runs: only these transports may be used, regardless of the URL.
+	GitAllowedProtocols = "https:ssh:git:http"
+	// GitLocalAllowedProtocols additionally permits local repositories.
+	GitLocalAllowedProtocols = "https:ssh:git:http:file"
+)
+
+// GitAllowLocalRepos reports whether local repository URLs are permitted.
+func GitAllowLocalRepos() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(EnvGitAllowLocalRepos))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+// ValidateRepoURL rejects a repository URL that git would treat as a command,
+// a local path, or an option.
+//
+// Accepted: http/https/ssh/git URLs and scp-like user@host:path remotes.
+// Rejected: ext:: (runs a command), file:// and bare local paths (reads the
+// server's filesystem), option-like values, and embedded control characters.
+func ValidateRepoURL(raw string) error {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return fmt.Errorf("repo_url is required")
+	}
+	for _, r := range value {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("repo_url contains a control character")
+		}
+	}
+	if strings.HasPrefix(value, "-") {
+		return fmt.Errorf("repo_url must not start with '-'")
+	}
+	// ext:: (and its remote-helper cousins) execute a command named by the URL.
+	if strings.Contains(strings.ToLower(value), "ext::") || strings.Contains(value, "::") {
+		return fmt.Errorf("repo_url must not use an ext:: transport")
+	}
+	allowLocal := GitAllowLocalRepos()
+	scheme, rest, hasScheme := strings.Cut(value, "://")
+	if hasScheme {
+		switch strings.ToLower(scheme) {
+		case "http", "https", "ssh", "git", "git+ssh", "ssh+git":
+		case "file":
+			if !allowLocal {
+				return fmt.Errorf("repo_url must be a remote repository URL")
+			}
+			if strings.TrimSpace(rest) == "" {
+				return fmt.Errorf("repo_url must name a repository")
+			}
+		default:
+			return fmt.Errorf("repo_url scheme %q is not supported", scheme)
+		}
+		return nil
+	}
+	// scp-like syntax: [user@]host:path
+	host, path, ok := strings.Cut(value, ":")
+	if ok && host != "" && !strings.HasPrefix(path, "//") && !strings.ContainsAny(host, "/\\") {
+		// A single-letter host is a Windows drive or a relative path, not a host.
+		if len(strings.TrimPrefix(host, "localhost")) > 1 {
+			return nil
+		}
+	}
+	if !allowLocal {
+		return fmt.Errorf("repo_url must be a remote repository URL")
+	}
+	return nil
+}

@@ -52,10 +52,10 @@ const (
 	DefaultSpendLimit   = int32(1000)
 	stateActive         = "ACTIVE"
 
-	// Local backend fill-ins: a process has one org/credential pair; no env knobs.
-	localPublicKey  = "drive9-local-public"
-	localPrivateKey = "drive9-local-private"
-	localOrgID      = "local-org"
+	// The local backend's control-plane credential is owned by LocalClustersAPI
+	// (pinned by DRIVE9_TIDBCLOUD_LOCAL_*_KEY or generated per process); no
+	// credential is compiled into the source tree.
+	localOrgID = "local-org"
 
 	cloudProviderTencentCloud = "tencentcloud"
 	cloudProviderAliCloud     = "alicloud"
@@ -130,18 +130,10 @@ func NewProvisionerFromEnv(providerType string) (*Provisioner, error) {
 		return nil, fmt.Errorf("invalid %s: %w", EnvTiDBCloudNativeDefaultDatabaseName, err)
 	}
 
-	// Local backend uses fixed server-owned credentials (one process = one pair).
-	// Also seed DefaultCredentials so empty-body /v1/provision works (api-smoke).
+	// Seed DefaultCredentials so empty-body /v1/provision works (api-smoke). The
+	// local backend completes them from its own control-plane credential below.
 	defaultPublicKey := strings.TrimSpace(os.Getenv(EnvTiDBCloudNativePublicKey))
 	defaultPrivateKey := strings.TrimSpace(os.Getenv(EnvTiDBCloudNativePrivateKey))
-	if backend == "local" {
-		if defaultPublicKey == "" {
-			defaultPublicKey = localPublicKey
-		}
-		if defaultPrivateKey == "" {
-			defaultPrivateKey = localPrivateKey
-		}
-	}
 
 	cloudProvider := strings.TrimSpace(os.Getenv(EnvTiDBCloudNativeCloudProvider))
 	region := strings.TrimSpace(os.Getenv(EnvTiDBCloudNativeRegion))
@@ -186,6 +178,16 @@ func NewProvisionerFromEnv(providerType string) (*Provisioner, error) {
 			return nil, err
 		}
 		p.clusters = localAPI
+		// The local control plane authenticates exactly one pair. In-process
+		// cluster operations must spend that pair; it is generated per process
+		// when the deployment does not pin one.
+		localPublic, localPrivate := localAPI.Credentials()
+		if p.defaultPublicKey == "" {
+			p.defaultPublicKey = localPublic
+		}
+		if p.defaultPrivateKey == "" {
+			p.defaultPrivateKey = localPrivate
+		}
 		return p, nil
 	case "http":
 		apiURL := strings.TrimSpace(os.Getenv(EnvTiDBCloudNativeAPIURL))

@@ -2328,16 +2328,7 @@ func TestMetricsEndpoint(t *testing.T) {
 	}
 	_ = findBadResp.Body.Close()
 
-	resp, err = http.Get(ts.URL + "/metrics")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("metrics status: %d", resp.StatusCode)
-	}
-	body, _ := io.ReadAll(resp.Body)
-	text := string(body)
+	text := scrapeMetrics()
 	if !strings.Contains(text, "drive9_http_requests_total") {
 		t.Fatalf("expected requests metric in response: %s", text)
 	}
@@ -2416,13 +2407,7 @@ func TestWriteBodyReadMetricRecordsFailureStatusClass(t *testing.T) {
 		t.Fatalf("write status = %d, want %d", resp.StatusCode, http.StatusRequestEntityTooLarge)
 	}
 
-	resp, err = http.Get(ts.URL + "/metrics")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	body, _ := io.ReadAll(resp.Body)
-	text := string(body)
+	text := scrapeMetrics()
 	if !strings.Contains(text, `drive9_http_request_body_read_duration_seconds_bucket{body_size_bucket="le_1KiB",method="PUT",route="/v1/fs/*",status_class="4xx",le="0.1"}`) {
 		t.Fatalf("expected failed body read histogram with 4xx status class, got: %s", text)
 	}
@@ -2483,13 +2468,7 @@ func TestUploadActionMetrics(t *testing.T) {
 		t.Fatalf("expected 400 for unknown upload action, got %d", uploadActionResp.StatusCode)
 	}
 
-	metricsResp, err := http.Get(ts.URL + "/metrics")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = metricsResp.Body.Close() }()
-	body, _ := io.ReadAll(metricsResp.Body)
-	text := string(body)
+	text := scrapeMetrics()
 
 	if !strings.Contains(text, `drive9_business_events_total{event="upload_complete",result="error"}`) {
 		t.Fatalf("expected upload_complete metric, got: %s", text)
@@ -2553,5 +2532,44 @@ func TestNewWithConfigFallsBackWorkerFSEventsRetention(t *testing.T) {
 	t.Cleanup(func() { s2.Close() })
 	if got := s2.tenantWorker.opts.FSEventsRetention; got != 3*time.Hour {
 		t.Fatalf("worker FSEventsRetention = %v, want 3h (explicit worker option wins)", got)
+	}
+}
+
+// scrapeMetrics renders the Prometheus export. /metrics is served by the
+// dedicated metrics listener, not the API mux, so tests must not scrape it over
+// the API surface.
+func scrapeMetrics() string {
+	rec := httptest.NewRecorder()
+	metrics.WritePrometheus(rec)
+	return rec.Body.String()
+}
+
+func TestIsLoopbackListenAddr(t *testing.T) {
+	for _, tc := range []struct {
+		addr string
+		want bool
+	}{
+		{"127.0.0.1:9009", true},
+		{"localhost:9009", true},
+		{"[::1]:9009", true},
+		{":9009", false},
+		{"0.0.0.0:9009", false},
+		{"10.0.0.5:9009", false},
+		{"[::]:9009", false},
+	} {
+		if got := isLoopbackListenAddr(tc.addr); got != tc.want {
+			t.Errorf("isLoopbackListenAddr(%q) = %v, want %v", tc.addr, got, tc.want)
+		}
+	}
+}
+
+// A half-configured TLS pair must fail startup instead of silently serving
+// plaintext with a certificate the operator believes is in use.
+func TestListenAndServeRejectsHalfConfiguredTLS(t *testing.T) {
+	t.Setenv(envTLSCertFile, "/tmp/cert.pem")
+	t.Setenv(envTLSKeyFile, "")
+	err := (&Server{}).ListenAndServe("127.0.0.1:0")
+	if err == nil || !strings.Contains(err.Error(), envTLSCertFile) {
+		t.Fatalf("err = %v, want a certificate/key pairing error", err)
 	}
 }

@@ -617,8 +617,10 @@ func TestS3ConfigFromEnv(t *testing.T) {
 	if cfg.Bucket != "" {
 		t.Fatalf("default bucket = %q, want empty", cfg.Bucket)
 	}
-	if cfg.EncryptionPolicy.Mode != meta.S3EncryptionModeNone {
-		t.Fatalf("default encryption mode = %q, want none", cfg.EncryptionPolicy.Mode)
+	// The zero-config default encrypts objects at rest; a deployment that wants
+	// plaintext for an SSE-hostile backend must say so explicitly.
+	if cfg.EncryptionPolicy.Mode != meta.S3EncryptionModeSSES3 {
+		t.Fatalf("default encryption mode = %q, want %q", cfg.EncryptionPolicy.Mode, meta.S3EncryptionModeSSES3)
 	}
 	if !cfg.EncryptionPolicy.BucketKeyEnabled {
 		t.Fatal("default bucket key enabled = false, want true")
@@ -846,5 +848,29 @@ func TestStartupEnvsSetMetaMediaAndVideoDefaults(t *testing.T) {
 	}
 	if meta.DefaultMaxVideoLLMFiles() != 10000 {
 		t.Errorf("default video = %d, want 10000", meta.DefaultMaxVideoLLMFiles())
+	}
+}
+
+func TestDecodePreviousMasterKeys(t *testing.T) {
+	keyA := strings.Repeat("11", 32)
+	keyB := strings.Repeat("22", 32)
+	got, err := decodePreviousMasterKeys(" " + keyA + " , " + keyB + " ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || len(got[0]) != 32 || len(got[1]) != 32 {
+		t.Fatalf("keys = %v", got)
+	}
+	if got[0][0] != 0x11 || got[1][0] != 0x22 {
+		t.Fatalf("unexpected key material: %x %x", got[0][0], got[1][0])
+	}
+	if out, err := decodePreviousMasterKeys(""); err != nil || out != nil {
+		t.Fatalf("empty input = %v, %v", out, err)
+	}
+	if _, err := decodePreviousMasterKeys("not-hex"); err == nil {
+		t.Fatal("expected a decode error for non-hex input")
+	}
+	if _, err := decodePreviousMasterKeys(strings.Repeat("11", 16)); err == nil {
+		t.Fatal("expected a length error for a 16-byte key")
 	}
 }

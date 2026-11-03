@@ -28,9 +28,15 @@ type ResolvedS3EncryptionPolicy struct {
 	BucketKeyEnabled bool
 }
 
+// DefaultS3EncryptionPolicy is the zero-config policy: every object is written
+// with server-side encryption (SSE-S3, provider-managed keys). Storing tenant
+// objects unencrypted at rest used to be the default, which meant a deployment
+// that never set DRIVE9_S3_ENCRYPTION_MODE silently kept plaintext objects in
+// the bucket. Opting out is explicit (Mode: none) for backends that reject the
+// SSE header.
 func DefaultS3EncryptionPolicy() S3EncryptionPolicy {
 	return S3EncryptionPolicy{
-		Mode:             S3EncryptionModeNone,
+		Mode:             S3EncryptionModeSSES3,
 		BucketKeyEnabled: true,
 	}
 }
@@ -125,7 +131,9 @@ func ValidateTenantS3EncryptionPolicyP1(policy S3EncryptionPolicy) error {
 
 func normalizeGlobalS3EncryptionPolicy(policy S3EncryptionPolicy) S3EncryptionPolicy {
 	if policy.Mode == "" {
-		policy.Mode = S3EncryptionModeNone
+		// An unset global mode inherits the secure default rather than silently
+		// disabling encryption, so a partial configuration fails closed.
+		policy.Mode = S3EncryptionModeSSES3
 	}
 	return policy
 }

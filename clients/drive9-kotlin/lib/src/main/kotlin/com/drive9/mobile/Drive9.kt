@@ -37,6 +37,7 @@ import java.time.format.DateTimeParseException
 import java.util.Base64
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.zip.CRC32C
+import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
 
 private const val DEFAULT_SMALL_FILE_THRESHOLD = 50_000L
@@ -806,7 +807,24 @@ public class Drive9Client(
         }
     }
 
+    private fun requireSecureForApiKey(url: String) {
+        if (apiKeyValue.isEmpty()) return
+        val uri = URI(url)
+        val secure = uri.scheme.equals("https", ignoreCase = true)
+        if (secure) return
+        val host = uri.host ?: return
+        if (isLoopbackHost(host)) return
+        // A bearer token on a plaintext connection is a credential in the clear.
+        throw Drive9Exception.Drive9(
+            "request",
+            null,
+            "refusing to send the API key over plaintext HTTP to $host; use https",
+            null,
+        )
+    }
+
     private fun open(method: String, url: String): HttpURLConnection {
+        requireSecureForApiKey(url)
         val conn = URI(url).toURL().openConnection() as HttpURLConnection
         conn.requestMethod = method
         if (apiKeyValue.isNotEmpty()) {
@@ -842,6 +860,14 @@ public class Drive9Client(
             input = DisconnectingInputStream(conn.inputStream, conn),
             contentLength = conn.headerFieldLong("Content-Length") ?: 0L,
         )
+    }
+
+    private fun isLoopbackHost(host: String): Boolean {
+        val h = host.trim().removeSurrounding("[", "]").lowercase()
+        if (h == "localhost" || h == "::1") return true
+        val parts = h.split('.')
+        return parts.size == 4 && parts[0] == "127" &&
+            parts.drop(1).all { it.toIntOrNull()?.let { n -> n in 0..255 } == true }
     }
 
     private fun rawRequestBytes(method: String, url: String, headers: Map<String, String>): ByteArray {
@@ -886,8 +912,20 @@ public class Drive9Client(
         val ssl = uri.scheme.equals("https", ignoreCase = true)
         val port = if (uri.port > 0) uri.port else if (ssl) 443 else 80
         val host = uri.host ?: throw Drive9Exception.Drive9("request", null, "missing host in URL: $url", null)
-        val socket = if (ssl) {
-            SSLSocketFactory.getDefault().createSocket(host, port)
+        // The request carries the caller's API key: reuse the same plaintext
+        // rule as the main transport before anything is written.
+        requireSecureForApiKey(url)
+        val socket: Socket = if (ssl) {
+            val sslSocket = SSLSocketFactory.getDefault().createSocket(host, port) as SSLSocket
+            // createSocket returns an unconnected-handshake socket with no
+            // identity check: without these two settings the certificate chain
+            // is validated against nothing in particular and a MITM with any
+            // valid certificate would receive the bearer token.
+            sslSocket.sslParameters = sslSocket.sslParameters.apply {
+                endpointIdentificationAlgorithm = "HTTPS"
+            }
+            sslSocket.startHandshake()
+            sslSocket
         } else {
             Socket(host, port)
         }
