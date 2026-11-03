@@ -8,9 +8,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Release gate (simulator/ROADMAP.md G5): a release must not ship unless
+  # the real-backend test action passes on the release commit. The daily
+  # action is reusable (workflow_call) and runs the pr-gate + nightly
+  # simulator tiers plus the pjdfstest gate and the perf-baseline
+  # comparison against TiDB + rustfs + drive9-server.
+  real-backend-gate:
+    name: Real-backend test gate
+    uses: ./.github/workflows/daily-real-backend.yml
+
   release:
     name: Build and Publish CLI
     if: ${{ github.event_name == 'workflow_dispatch' }}
+    needs: real-backend-gate
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
