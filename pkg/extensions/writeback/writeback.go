@@ -2038,9 +2038,19 @@ func (h *bufferingHandle) Sync(ctx context.Context) error {
 	}
 	// fsync is a durability barrier: under the async queue policy the image
 	// is staged+enqueued — wait for THIS path to land, not the whole queue
-	// (a foreign path's slow upload must not hold this fsync hostage).
+	// (a foreign path's slow upload must not hold this fsync hostage). The
+	// deadline scales with the image like the queue worker's own shadow-spill
+	// attempt (releaseTimeout): a fixed cap would give up on large uploads
+	// that the worker is still successfully streaming (v1 fsync waited out
+	// the size-scaled upload synchronously).
 	if h.w.queue != nil {
-		if !h.w.queue.WaitPathDeadline(h.path, uploadTimeout) {
+		h.mu.Lock()
+		deadlineSize := int64(0)
+		if h.buf != nil {
+			deadlineSize = h.buf.Size()
+		}
+		h.mu.Unlock()
+		if !h.w.queue.WaitPathDeadline(h.path, releaseTimeout(deadlineSize)) {
 			return fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
 		}
 		// The wait also ends when the commit terminally failed and was
