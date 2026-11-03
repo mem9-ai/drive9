@@ -19,7 +19,10 @@ rm -rf rmr-tree
 # removal is asynchronous server-side: the destructive caller must await
 # the landed removal before asserting absence or reusing the path
 check shell --req 'juicefs-rmr-gone' -- sh -c 'i=0; while [ -e rmr-tree ] && [ $i -lt 200 ]; do i=$((i+1)); sleep 0.1; done; test ! -e rmr-tree'
-check shell --req 'juicefs-rmr-reuse' -- sh -c 'mkdir rmr-tree && rmdir rmr-tree'
+# path reusability asserted at SERVER truth (kernel entry caches can hold
+# the removed name for minutes on CI even though the server is clean) plus
+# a fresh-name create/remove cycle on the mount itself
+check shell --req 'juicefs-rmr-reuse' -- sh -c '"$D9_CLI" fs stat :/rmr-tree >/dev/null 2>&1 && exit 1; mkdir rmr-reuse && rmdir rmr-reuse'
 
 drain --mode require-ok --timeout 120s
 check sync-ok --req 'juicefs-rmr-sync'
