@@ -452,7 +452,7 @@ func New(opts Options) (*Writeback, error) {
 			// base revision advances on exactly this publication.
 			if v, ok := w.live.Load(entry.Path); ok {
 				if h, ok := v.(*bufferingHandle); ok && h.stagedSnapshotIs(entry.SnapshotID) {
-					h.markLanded(committedRev)
+					h.markLandedImage(committedRev, entry.Size)
 				}
 			}
 			if w.opts.Policy == PolicyWriteSync || w.opts.Policy == PolicyCloseSync {
@@ -2451,10 +2451,28 @@ func (h *bufferingHandle) markLanded(rev int64) {
 	if rev > 0 {
 		h.baseRev = rev
 	}
-	h.mu.Unlock()
 	// The landing makes the remote image authoritative: evicted parts
-	// must be able to restore from it once the shadow is reclaimed.
-	h.armRemoteRestore()
+	// must be able to restore from it once the shadow is reclaimed. The
+	// arming runs UNDER the lock — WriteBuffer is not thread-safe, and an
+	// unlocked install could interleave with a truncate (clamping
+	// remoteSize to zero) and reinstate the pre-truncate snapshot.
+	h.armRemoteRestoreLocked(0)
+	h.mu.Unlock()
+}
+
+// markLandedImage is markLanded for a landing whose committed image size
+// is known (the queue's entry): the remote-restore boundary is that
+// landed size, not whatever the buffer has accumulated since.
+func (h *bufferingHandle) markLandedImage(rev, size int64) {
+	h.mu.Lock()
+	h.landed = true
+	h.isNew = false
+	h.visTrunc = false
+	if rev > 0 {
+		h.baseRev = rev
+	}
+	h.armRemoteRestoreLocked(size)
+	h.mu.Unlock()
 }
 
 func attrSize(res fs.Result) int64 {
@@ -2711,28 +2729,31 @@ func (h *bufferingHandle) stagedSnapshotIs(id string) bool {
 	return h.stagedSnapshotID == id
 }
 
-func (h *bufferingHandle) armRemoteRestore() {
-	h.mu.Lock()
+func (h *bufferingHandle) armRemoteRestoreLocked(size int64) {
+	// h.mu must be held: every field read and every WriteBuffer mutation
+	// below (LoadPart install, SetRemoteSize, MarkRemoteAuthoritative)
+	// shares the buffer's single synchronization domain.
 	buf, cli, path := h.buf, h.w.opts.Client, h.path
-	size := int64(0)
 	partSize := int64(0)
 	if buf != nil {
-		size = buf.Size()
 		partSize = buf.PartSize()
+		if size <= 0 {
+			size = buf.Size()
+		}
 	}
-	h.mu.Unlock()
 	if buf == nil || cli == nil || partSize <= 0 || size <= 0 {
 		return
 	}
 	remote := h.w.remotePath(path)
+	landed := size
 	buf.LoadPart = func(partNum int) ([]byte, error) {
 		start := int64(partNum-1) * partSize
-		if start >= size {
+		if start >= landed {
 			return nil, nil
 		}
 		end := start + partSize
-		if end > size {
-			end = size
+		if end > landed {
+			end = landed
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
 		defer cancel()
@@ -2747,7 +2768,7 @@ func (h *bufferingHandle) armRemoteRestore() {
 		}
 		return data, nil
 	}
-	buf.SetRemoteSize(size)
+	buf.SetRemoteSize(landed)
 	// The landed remote image now holds every retained byte: evicted
 	// parts may fall back to it once the queue reclaims the shadow.
 	buf.MarkRemoteAuthoritative()
