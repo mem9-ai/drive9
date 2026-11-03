@@ -35,7 +35,7 @@ pub const SEED_DIR: &str = "__payload__";
 // `kill` → `halt`.
 pub const COMMANDS: &[&str] = &[
     "fault", "arm", "disarm", "window", "async", "await", "halt", "remount", "hold", "sample",
-    "drain", "check", "latency",
+    "drain", "check",
 ];
 
 const RESULT_CLASSES: &[&str] = &[
@@ -64,9 +64,6 @@ fn class_tolerates_failure(class: &str) -> bool {
 #[derive(Clone)]
 pub struct RunArgs {
     pub case: PathBuf,
-    /// backend flavor: None = use --server as-is; "mock" = spawn the
-    /// embedded mock server (+ rustfs when bootstrappable) for this run
-    pub stack: Option<String>,
     pub sandbox: String,
     pub home: Option<PathBuf>,
     pub server: String,
@@ -247,18 +244,6 @@ pub fn run(a: RunArgs) -> Result<i32> {
     });
     fs_extra_clean(&home);
 
-    // embedded backend: --stack mock spawns drive9-mock-server (+ rustfs
-    // via scripts/local-object-store.sh when available) and replaces the
-    // case server for the whole run; the handle tears the stack down on drop
-    let _mock_stack = match a.stack.as_deref() {
-        Some("mock") => Some(crate::stack::start(&home, None)?),
-        Some(other) => bail!("--stack {other:?} unknown (mock)"),
-        None => None,
-    };
-    if let Some(st) = &_mock_stack {
-        a.server = st.server_addr.clone();
-    }
-
     let mut worst = Outcome::Pass;
     let mut lines = Vec::new();
     for r in 0..a.repeat.max(1) {
@@ -333,10 +318,9 @@ fn run_once(
         "127.0.0.1"
     };
 
-    // proxy fronts the server whenever the case declares faults or latency
-    // shaping so wire effects are possible; plain cases connect directly
-    let uses_latency = lint_uses_latency(script).unwrap_or(false);
-    let proxy = if declared_faults.is_empty() && !uses_latency {
+    // proxy fronts the server whenever the case declares faults so wire
+    // effects are possible; plain cases connect directly
+    let proxy = if declared_faults.is_empty() {
         None
     } else {
         match Proxy::start_bind(&a.server, run_dir, bind_host) {
@@ -525,7 +509,7 @@ fn run_once(
     cmd.env("HOME", &isolated_home);
     // server channel: lets migrated e2e-style cases call the CLI / curl the
     // API directly. D9_SERVER points through the injector proxy when one is
-    // up, so case-issued server traffic rides the same faults/latency as the
+    // up, so case-issued server traffic rides the same faults as the
     // mount's. Deliberately NOT set in the control replay: control is a
     // local-dir oracle and must not mutate server state — scripts needing
     // control compatibility guard with [ -n "${D9_SERVER:-}" ].
@@ -857,10 +841,6 @@ fn handle_ctl(
             let mut r = runner.lock().unwrap();
             r.op_fault(&req)
         }
-        "latency" => {
-            let mut r = runner.lock().unwrap();
-            r.op_latency(&req)
-        }
         "arm" => {
             let mut r = runner.lock().unwrap();
             r.op_arm(&req)
@@ -1187,34 +1167,6 @@ impl Runner {
         }
         self.disarmed.push((name.clone(), now_ms()));
         self.journal(json!({"ts": now_ms(), "kind":"disarm", "fault": name}));
-        json!({"ok": true})
-    }
-
-    /// Route latency shaping (case command `latency`): arms/clears ambient
-    /// per-request delays on the injector proxy. Requires the proxy — the
-    /// engine starts it whenever the case uses `latency`, so a missing proxy
-    /// here is an engine failure, reported loudly.
-    pub fn op_latency(&mut self, req: &Value) -> Value {
-        let mode = req["mode"].as_str().unwrap_or("set").to_string();
-        let pattern = req["pattern"].as_str().map(|s| s.to_string());
-        let Some(proxy) = self.proxy.as_ref() else {
-            return json!({"ok": false, "error": "latency requires the injector proxy, which the engine failed to start"});
-        };
-        if mode == "clear" {
-            proxy.clear_latency(pattern.clone());
-            self.journal(json!({"ts": now_ms(), "kind":"latency", "event":"clear", "pattern": pattern}));
-            return json!({"ok": true});
-        }
-        let (lo, hi) = match (req["lo_ms"].as_u64(), req["hi_ms"].as_u64()) {
-            (Some(lo), Some(hi)) => (Duration::from_millis(lo), Duration::from_millis(hi.max(lo))),
-            _ => return json!({"ok": false, "error": "latency needs lo_ms and hi_ms"}),
-        };
-        proxy.set_latency(pattern.clone(), lo, hi);
-        self.journal(json!({
-            "ts": now_ms(), "kind":"latency", "event":"set",
-            "pattern": pattern,
-            "lo_ms": lo.as_millis() as u64, "hi_ms": hi.as_millis() as u64,
-        }));
         json!({"ok": true})
     }
 
@@ -2183,7 +2135,6 @@ pub fn builtin_main(name: &str, args: Vec<String>) -> i32 {
         "sample" => bi_sample(&args, stub),
         "drain" => bi_drain(&args, stub),
         "check" => bi_check(&args, stub),
-        "latency" => bi_latency(&args),
         other => die(&format!("unknown case command {other:?}")),
     }
 }
@@ -2544,69 +2495,6 @@ fn bi_sample(args: &[String], stub: bool) -> i32 {
         return 0;
     }
     die(&format!("sample: {last_err}"))
-}
-
-/// `latency <range> [--pattern 'PUT /v1/fs']` arms an ambient per-request
-/// delay sampled uniformly from the range; `latency off [--pattern P]`
-/// clears (all profiles, or only the matching one). The range is `300ms`
-/// (fixed) or `80ms-400ms` (uniform inclusive). This is workload shaping for
-/// benchmark suites (fio/mdtest/…), not a fault: no result classes, no
-/// firing adjudication.
-fn bi_latency(args: &[String]) -> i32 {
-    if std::env::var("D9_STUB").is_ok() {
-        return 0;
-    }
-    let lp = match parse_args(args, &["pattern"], false) {
-        Ok(p) => p,
-        Err(e) => return die(&format!("latency: {e}")),
-    };
-    let pattern = lp.map.get("pattern").cloned();
-    if lp.positional.first().map(|s| s.as_str()) == Some("off") {
-        if lp.positional.len() > 1 {
-            return die("latency: usage: latency off [--pattern P]");
-        }
-        return match ctl_call(&json!({"op": "latency", "mode": "clear", "pattern": pattern})) {
-            Ok(v) if v["ok"] == json!(true) => 0,
-            Ok(v) => die(v["error"].as_str().unwrap_or("latency rejected")),
-            Err(e) => die(&format!("latency: {e:#}")),
-        };
-    }
-    let Some(range) = lp.positional.first() else {
-        return die("latency: usage: latency <300ms | 80ms-400ms> [--pattern 'PUT /v1/fs']  |  latency off [--pattern P]");
-    };
-    let (lo, hi) = match parse_ms_range(range) {
-        Ok(v) => v,
-        Err(e) => return die(&format!("latency: {e:#}")),
-    };
-    match ctl_call(&json!({
-        "op": "latency", "mode": "set", "pattern": pattern,
-        "lo_ms": lo.as_millis() as u64, "hi_ms": hi.as_millis() as u64,
-    })) {
-        Ok(v) if v["ok"] == json!(true) => 0,
-        Ok(v) => die(v["error"].as_str().unwrap_or("latency rejected")),
-        Err(e) => die(&format!("latency: {e:#}")),
-    }
-}
-
-/// Parse "300ms" → (300ms, 300ms) or "80ms-400ms" → (80ms, 400ms).
-/// Both endpoints carry a unit (ms|s|m|…), parsed by `parse_duration`.
-fn parse_ms_range(s: &str) -> Result<(Duration, Duration)> {
-    let s = s.trim();
-    let (lo_s, hi_s) = match s.split_once('-') {
-        Some((a, b)) => (a, Some(b)),
-        None => (s, None),
-    };
-    let lo = parse_duration(lo_s.trim())
-        .with_context(|| format!("latency range endpoint {lo_s:?} is not a duration"))?;
-    let hi = match hi_s {
-        Some(b) => parse_duration(b.trim())
-            .with_context(|| format!("latency range endpoint {b:?} is not a duration"))?,
-        None => lo,
-    };
-    if hi < lo {
-        bail!("latency range hi {hi:?} < lo {lo:?}");
-    }
-    Ok((lo, hi))
 }
 
 fn bi_drain(args: &[String], stub: bool) -> i32 {
@@ -3055,23 +2943,6 @@ pub fn lint_faults(path: &Path) -> Result<Vec<String>> {
     Ok(out)
 }
 
-/// Whether the case uses `latency` (the run then fronts the server with the
-/// injector proxy even when no fault is declared).
-pub fn lint_uses_latency(path: &Path) -> Result<bool> {
-    let src = std::fs::read_to_string(path)?;
-    for (_, line) in join_continuations(&src) {
-        let tokens = tokenize(&line);
-        if tokens
-            .first()
-            .map(|x| x == "latency")
-            .unwrap_or(false)
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
 pub fn lint_file(path: &Path) -> Result<Vec<String>> {
     let mut errs = Vec::new();
     let src = std::fs::read_to_string(path)?;
@@ -3251,24 +3122,6 @@ pub fn lint_file(path: &Path) -> Result<Vec<String>> {
                     }
                 } else {
                     errs.push(format!("line {lineno}: halt needs a target"));
-                }
-            }
-            "latency" => {
-                let mut it = rest.iter();
-                let mut prev_flag = String::new();
-                for x in it.by_ref() {
-                    if x == "--" {
-                        break;
-                    }
-                    if x.starts_with("--") {
-                        prev_flag = x.trim_start_matches('-').to_string();
-                    } else if prev_flag == "pattern" {
-                        prev_flag.clear();
-                    } else if prev_flag.is_empty() && x.contains('=') {
-                        errs.push(format!("line {lineno}: latency range must not be an assignment"));
-                    } else {
-                        prev_flag.clear();
-                    }
                 }
             }
             "hold" => {
@@ -3702,7 +3555,6 @@ pub struct RunSuiteArgs {
     pub manifest: PathBuf,
     pub tier: Option<String>,
     pub server: String,
-    pub stack: Option<String>,
     pub bin: String,
     pub home: Option<PathBuf>,
     pub fstest: Option<String>,
@@ -3734,21 +3586,13 @@ pub fn run_suite(a: RunSuiteArgs) -> Result<i32> {
     if selected.is_empty() {
         bail!("no cases selected (tier {:?})", a.tier);
     }
-    // one shared embedded backend for the whole suite (per-case --stack
-    // would respawn it for every case); its state lives in its own
-    // directory because every case run wipes its home
+    // one shared backend for the whole suite: every case provisions its own
+    // tenant on it; the suite home exists because every case run wipes its
+    // own home directory
     let suite_home = a.home.clone().unwrap_or_else(|| {
         std::env::temp_dir().join(format!("drive9-simulator-suite-{}", std::process::id()))
     });
-    let _mock_stack = match a.stack.as_deref() {
-        Some("mock") => Some(crate::stack::start(&suite_home.join("stack"), None)?),
-        Some(other) => bail!("--stack {other:?} unknown (mock)"),
-        None => None,
-    };
-    let server = _mock_stack
-        .as_ref()
-        .map(|s| s.server_addr.clone())
-        .unwrap_or_else(|| a.server.clone());
+    let server = a.server.clone();
     let mut results: Vec<(String, i32)> = Vec::new();
     for c in &selected {
         let case_path = cases_root.join(format!("{}.t", c.name));
@@ -3757,11 +3601,10 @@ pub fn run_suite(a: RunSuiteArgs) -> Result<i32> {
         }
         eprintln!("=== suite case {} ===", c.name);
         // per-case home: run() wipes home at start, so cases must not share
-        // one directory (and never the suite stack's)
+        // one directory
         let case_home = suite_home.join("cases").join(c.name.replace('/', "_"));
         let code = match run(RunArgs {
             case: case_path,
-            stack: None,
             sandbox: "host".into(),
             home: Some(case_home.clone()),
             server: server.clone(),

@@ -2,8 +2,10 @@
 # juicefs/cache-consistency: content written through the writer's mount and
 # drained must be readable from an independent second mount with identical
 # bytes — the cross-client visibility invariant (blackbox
-# juicefs.cache_consistency port). NOTE: currently FAILS against the mock
-# backend — the long-lived observer vantage flaps its directory cache
+# juicefs.cache_consistency port). NOTE: was FAILING when last exercised —
+# the long-lived observer vantage flapped its directory cache (mostly-empty
+# with rare populated windows) even with a stable SSE head (observed against
+# the former embedded mock backend; recheck against the real backend); the
 # (mostly-empty with rare populated windows) against a quiet backend even
 # with a stable SSE head; the remote vantage (fresh stateless mount) hangs
 # in its startup path. Real product finding, tracked in ROADMAP (G1);

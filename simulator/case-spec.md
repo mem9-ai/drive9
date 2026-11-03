@@ -21,7 +21,7 @@ Delivery contract (four-state verdicts and merging, evidence artifacts, attribut
 ## 1. Definitions
 
 - **Test script (case file)**: a `.t` file, a POSIX shell script; the unit of execution for `drive9-simulator run`.
-- **Case command**: a command the engine places at the front of the script's `PATH`, talking to the engine over a control channel. The command vocabulary is closed and reserved (§4.3): `fault`, `arm`, `disarm`, `window`, `async`, `await`, `halt`, `remount`, `hold`, `sample`, `drain`, `check`, `latency`. Two vocabulary names deliberately differ from their natural names because POSIX shell builtins win over `PATH` resolution: `await` (not `wait`) and `halt` (not `kill`).
+- **Case command**: a command the engine places at the front of the script's `PATH`, talking to the engine over a control channel. The command vocabulary is closed and reserved (§4.3): `fault`, `arm`, `disarm`, `window`, `async`, `await`, `halt`, `remount`, `hold`, `sample`, `drain`, `check`. Two vocabulary names deliberately differ from their natural names because POSIX shell builtins win over `PATH` resolution: `await` (not `wait`) and `halt` (not `kill`).
 - **Case entry**: the execution record of one `check` assertion `{claim, kind, verdict, req, …}` — the smallest unit of pass/fail statistics. Echo output, primitive invocations and payload failures MUST NOT directly produce case entries.
 - **Payload**: a command string handed to an injected command for execution (the part after `--` of `window` / `async` / `check shell`).
 - **Window**: the execution interval of `window`; failures of the payload inside the window are adjudicated by the result classes of faults armed during the window.
@@ -102,7 +102,7 @@ The engine MUST have the drive9 mount ready before starting the script. At scrip
 | `D9_MOUNT` | absolute path of the mount point. After `halt client` / `remount` the cwd and open fds may go stale; scripts SHOULD re-resolve via `$D9_MOUNT/...` and `cd "$D9_MOUNT"` after a remount |
 | `PATH` | carries all `*` commands at the front |
 | `D9_CONTROL` | engine control channel (used internally by injected commands; scripts MUST NOT touch it) |
-| `D9_SERVER` | server address for direct CLI/API calls from the case (`drive9 fs …`, `curl`). Points through the injector proxy when one is up, so case-issued traffic rides the same faults/latency as the mount's. Absent in the control replay — scripts that must stay control-compatible guard with `[ -n "${D9_SERVER:-}" ]` |
+| `D9_SERVER` | server address for direct CLI/API calls from the case (`drive9 fs …`, `curl`). Points through the injector proxy when one is up, so case-issued traffic rides the same faults as the mount's. Absent in the control replay — scripts that must stay control-compatible guard with `[ -n "${D9_SERVER:-}" ]` |
 | `D9_API_KEY` | this run's tenant API key (pairs with `D9_SERVER`) |
 | `D9_TENANT` | this run's tenant id |
 | `D9_CLI` | absolute path of the drive9 CLI under test. Map to the CLI's own env (`export DRIVE9_SERVER="$D9_SERVER" DRIVE9_API_KEY="$D9_API_KEY"`) in server-channel cases |
@@ -159,7 +159,7 @@ drive9-simulator run <case.t> --seed <dir>
 
 ### 4.3 Case-command rules
 
-- The command vocabulary is **closed and reserved**: the script MUST NOT define, alias or shadow any of `fault arm disarm window async await halt remount hold sample drain check latency` (functions, aliases, PATH substitution are all forbidden). Note that `wait` and `kill` keep their POSIX shell builtin meanings — that is exactly why the vocabulary uses `await` and `halt`.
+- The command vocabulary is **closed and reserved**: the script MUST NOT define, alias or shadow any of `fault arm disarm window async await halt remount hold sample drain check` (functions, aliases, PATH substitution are all forbidden). Note that `wait` and `kill` keep their POSIX shell builtin meanings — that is exactly why the vocabulary uses `await` and `halt`.
 - Case commands talk to the engine over `D9_CONTROL`. A command's **operational failure** (broken channel, unknown reference, bad arguments, insufficient engine capability) returns a nonzero rc with an explanation on stderr — under `set -e` that aborts the script: **a scenario that cannot produce evidence must fail loudly, never degrade silently**.
 - Exception: `check` verdicts are data, not operational errors — a failing assertion still returns 0 (the verdict was recorded); it returns nonzero only when the verdict could not be recorded (§4.6).
 - Referencing an unimplemented effect / an effect unsupported by the sandbox: the run reports `blocked` as a whole (reason: effect not implemented), and MUST NOT skip silently or approximate.
@@ -246,8 +246,6 @@ await [--expect ok|interrupted] [--timeout D]
 halt <target> [--method kill|term]
 remount [--cache same|fresh]
 hold (--for D | --idle D)
-latency <range> [--pattern 'METHOD /path-prefix']
-latency off [--pattern 'METHOD /path-prefix']
 ```
 
 | Primitive | Meaning |
@@ -259,7 +257,6 @@ latency off [--pattern 'METHOD /path-prefix']
 | `halt` | `target = client` (the mount daemon) / `workload` (the live async payload's process group); `method = kill` (SIGKILL, sudden exit) / `term` (SIGTERM, cancellation semantics). `halt` is an orchestration action, not a fault: it produces no result class; its victim payload declares `await --expect interrupted`. `vm` target reserved for the firecracker tier, unimplemented |
 | `remount` | `cache = same` (default) / `fresh` (new environment without the original cache); `fresh` is one of the independent read entries. After remount the script's cwd and open fds are stale; SHOULD continue via `$D9_MOUNT` absolute references |
 | `hold` | `--for D` wait wall-clock / `--idle D` wait for engine-observed quiet |
-| `latency` | ambient route latency shaping (workload knob, NOT a fault): every request matching the anchor pattern is delayed by a duration sampled uniformly from `<range>` (`300ms` fixed, `80ms-400ms` inclusive uniform) before it reaches the upstream. Patterns use the fault anchor syntax (`'PUT'`, `'PUT /v1/fs'`); no pattern = every request. `latency off [--pattern P]` clears all profiles or only the matching one. No result classes, no firing adjudication, no verdicts — it exists so benchmark suites (fio, mdtest, …) can run against a realistic "slow backend" shape. Ground truth: every set/clear is journal-recorded and appended to `injector/armed.jsonl` |
 
 Sample evidence collection is engine-internal and tolerates transient vantage errors with bounded retries; a persistently unavailable vantage can be recorded instead of aborting via `--optional` — the snapshot is then recorded as missed and any check referencing it reports unconfirmed (visibility windows are not pre-agreed).
 
@@ -338,7 +335,6 @@ Any check referencing `control` enables it: the engine replays the **same script
 | `fault` / `arm` / `disarm` / `hold` / `drain` / `remount` / `halt` / `sample` | no-op |
 | `window` | executes the payload directly, no result-class protection |
 | `async` / `await` | the payload runs synchronously to natural completion |
-| `latency` | no-op |
 | `check` | no-op, produces no case entries |
 
 The control run's artifacts live under `control/`; its terminal state is the value of the `control` reference; its checks and terminal state MUST NOT enter the real run's statistics or aggregation. The control run's results serve only as a manifest-comparison and attribution baseline (control fails the same way → application / environment, not a drive9 defect). The control run MUST NOT contain faults — in the stub environment fault injection does not exist by construction. Checks referencing `control` are deferred during the real run and resolved after the control replay.
@@ -381,7 +377,6 @@ check    <kind> [kind args…] --req T [--claim ID] [--accept S1,S2]
                      kind: shell | manifest-equals | manifest-contains | manifest-absent
                          | sync-ok | no-pending | fault-fired | metrics | artifact-contains
                          | fstest
-latency  <300ms | 80ms-400ms> [--pattern 'PUT /v1/fs']   |   latency off [--pattern P]
 
 run CLI  --timeout  --durability  --overlay  --write-cache-size-mb  --payload-dir  --fstest   (environment knobs, never in-script)
 env      D9_MOUNT  D9_CONTROL  PAYLOAD_DIR (§4.2)  D9_SERVER  D9_API_KEY  D9_TENANT  D9_CLI (server channel; no control replay)
@@ -394,7 +389,7 @@ batch    drive9-simulator run-suite --manifest simulator/suites.toml --tier <pr-
 ## 8. Validation rules (lint, implemented by `drive9-simulator validate`)
 
 1. `.t` suffix; POSIX sh (`sh -n`); case name = stem and unique; `set -e` enabled before the first non-comment command; no directive headers in the script (environment configuration arrives only via run CLI flags).
-2. Reserved vocabulary: the script must not define / shadow any case-command name (`fault arm disarm window async await halt remount hold sample drain check latency`); POSIX `wait` / `kill` keep their builtin meanings and MUST NOT be repurposed either.
+2. Reserved vocabulary: the script must not define / shadow any case-command name (`fault arm disarm window async await halt remount hold sample drain check`); POSIX `wait` / `kill` keep their builtin meanings and MUST NOT be repurposed either.
 3. **Literal discipline**: fault names / effects in `fault`, `sample` names, `--req` tokens and `@name` references MUST be literal words (never built from variables, command substitution or string concatenation) — this is the precondition for static reference checking and the req coverage matrix.
 4. Every fault name referenced by `arm` / `disarm` / `fault-fired` must exist; every fault is armed at least once, and is covered by a disarm or `--hold` expiry (neither disarm nor hold is an error).
 5. A `@name` referenced snapshot must exist with its sample call earlier in file order than the referencing check; manifest checks must pass `--this` and `--against` explicitly.

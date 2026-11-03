@@ -1,27 +1,51 @@
-name: daily-real-backend
+name: real-backend
 
-# G5 of simulator/ROADMAP.md: the REAL-backend run (TiDB + rustfs +
-# drive9-server, provider=local) — daily, manually dispatchable, and
-# reusable as a release gate (`workflow_call`: a release workflow requiring
-# this workflow's success blocks the release until it passes). Also runs
-# the benchmark tier with baseline comparison against the previous run
-# (G6). The blackbox workflows this replaces were removed with it.
+# The simulator's ONLY backend: a real drive9 deployment brought up on the
+# runner — TiDB playground + rustfs (scripts/local-object-store.sh) +
+# drive9-server (provider=local) — addressed via the simulator's --server.
+# (The embedded mock backend and the injector `latency` shaping were removed;
+# see simulator/ROADMAP.md.)
+#
+# Profiles:
+#   full (default) — daily cron, manual dispatch, and the release gate
+#                    (release-cli.yml requires this workflow to pass):
+#                    pr-gate + pr-gate-mount + nightly tiers, the no-skip
+#                    pjdfstest gate, and the benchmark tier with baseline
+#                    comparison (G6).
+#   pr             — the pull-request gate (called by simulator-e2e.yml):
+#                    pr-gate + pr-gate-mount + pjdfstest + bench.
+#
+# FUSE tiers run on the host runner (each bounded by an outer `timeout -k`).
+# GitHub runners are ephemeral, so a worst-case wedged mount daemon costs the
+# job, not the fleet.
 
 on:
   schedule:
     - cron: '23 3 * * *'
   workflow_dispatch:
+    inputs:
+      profile:
+        description: 'pr | full'
+        type: choice
+        options: [pr, full]
+        default: full
   workflow_call:
+    inputs:
+      profile:
+        description: 'pr | full'
+        type: string
+        default: full
 
 concurrency:
-  group: daily-real-backend
-  cancel-in-progress: false
+  group: real-backend-${{ inputs.profile || 'full' }}-${{ github.ref }}
+  cancel-in-progress: ${{ inputs.profile == 'pr' }}
 
 jobs:
   real-backend:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: ${{ (inputs.profile || 'full') != 'pr' && 150 || 120 }}
     env:
+      PROFILE: ${{ inputs.profile || 'full' }}
       DRIVE9_TENANT_PROVIDER: local
       DRIVE9_S3_BACKEND: s3
       DRIVE9_EXTENT_ALLOW_STATIC_CREDENTIALS: '1'
@@ -113,40 +137,60 @@ jobs:
         run: cargo build --release --manifest-path simulator/Cargo.toml
 
       - name: Ensure fstest
+        # TODO(G6): pin a commit sha once fstest tags versions
         run: simulator/target/release/drive9-simulator tools --ensure-fstest main
 
-      - name: Run pr-gate + nightly tiers (real backend)
+      - name: Run pr-gate tier — server-surface cases (no mount)
         run: |
           export PATH="$PWD/bin:$PATH"
           export D9_FSTEST_BIN="$(ls -d ~/.cache/drive9-simulator/fstest/main/target/release/fstest)"
-          simulator/target/release/drive9-simulator run-suite simulator/suites.toml \
-            --tier pr-gate --server "$DRIVE9_BASE" --home /tmp/d9-daily-pr
-          simulator/target/release/drive9-simulator run-suite simulator/suites.toml \
-            --tier nightly --server "$DRIVE9_BASE" --home /tmp/d9-daily-nightly
+          timeout -k 15 900 simulator/target/release/drive9-simulator run-suite simulator/suites.toml \
+            --tier pr-gate --server "$DRIVE9_BASE" --stop-on-fail \
+            --home /tmp/d9-pr
 
-      - name: pjdfstest gate (no-skip, real backend)
+      - name: Run pr-gate-mount tier (FUSE, host)
         run: |
           export PATH="$PWD/bin:$PATH"
           export D9_FSTEST_BIN="$(ls -d ~/.cache/drive9-simulator/fstest/main/target/release/fstest)"
-          sudo -E simulator/target/release/drive9-simulator run \
+          timeout -k 15 1500 simulator/target/release/drive9-simulator run-suite simulator/suites.toml \
+            --tier pr-gate-mount --server "$DRIVE9_BASE" --stop-on-fail \
+            --bin "$PWD/bin/drive9" --home /tmp/d9-mount
+
+      - name: pjdfstest gate (no-skip, merge-blocking)
+        # Budget from the measured full-suite run: the 238-file suite needs
+        # ~28m; case timeout 50m, outer guard 60m.
+        run: |
+          export PATH="$PWD/bin:$PATH"
+          export D9_FSTEST_BIN="$(ls -d ~/.cache/drive9-simulator/fstest/main/target/release/fstest)"
+          timeout -k 15 3600 sudo -E simulator/target/release/drive9-simulator run \
             simulator/cases/community/fstest-pjdfstest.t \
-            --server "$DRIVE9_BASE" --allow-other --timeout 30m
+            --server "$DRIVE9_BASE" --allow-other --timeout 50m
+
+      - name: Run nightly tier (full profile only)
+        if: env.PROFILE == 'full'
+        run: |
+          export PATH="$PWD/bin:$PATH"
+          export D9_FSTEST_BIN="$(ls -d ~/.cache/drive9-simulator/fstest/main/target/release/fstest)"
+          timeout -k 15 3600 simulator/target/release/drive9-simulator run-suite simulator/suites.toml \
+            --tier nightly --server "$DRIVE9_BASE" \
+            --bin "$PWD/bin/drive9" --home /tmp/d9-nightly
 
       - name: Restore perf baseline
         uses: actions/cache/restore@v4
         with:
           path: /tmp/perf-baseline.json
-          key: perf-baseline-real-${{ github.run_id }}
-          restore-keys: perf-baseline-real-
+          key: perf-baseline-${{ env.PROFILE }}-${{ github.run_id }}
+          restore-keys: perf-baseline-${{ env.PROFILE }}-
 
-      - name: Benchmark tier + baseline comparison (G6)
+      - name: Benchmark tier + baseline comparison (G6, red on regression)
         run: |
           export PATH="$PWD/bin:$PATH"
           export D9_FSTEST_BIN="$(ls -d ~/.cache/drive9-simulator/fstest/main/target/release/fstest)"
-          simulator/target/release/drive9-simulator run-suite simulator/suites.toml \
-            --tier bench --server "$DRIVE9_BASE" --home /tmp/d9-daily-bench
+          timeout -k 15 2100 simulator/target/release/drive9-simulator run-suite simulator/suites.toml \
+            --tier bench --server "$DRIVE9_BASE" \
+            --bin "$PWD/bin/drive9" --home /tmp/d9-bench
           python3 simulator/scripts/perf_baseline.py \
-            --artifacts /tmp/d9-daily-bench \
+            --artifacts /tmp/d9-bench \
             --baseline /tmp/perf-baseline.json \
             --out /tmp/perf-baseline.json.new \
             --threshold-pct 15
@@ -157,7 +201,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: /tmp/perf-baseline.json
-          key: perf-baseline-real-${{ github.run_id }}
+          key: perf-baseline-${{ env.PROFILE }}-${{ github.run_id }}
 
       - name: Stop server and object store
         if: always()
@@ -169,9 +213,13 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: daily-real-backend-artifacts
+          name: real-backend-artifacts
           path: |
-            /tmp/d9-daily-*
+            /tmp/d9-pr
+            /tmp/d9-mount
+            /tmp/d9-nightly
+            /tmp/d9-bench
+            /tmp/drive9-simulator-suite-*
             /tmp/drive9-server.log
             /tmp/tiup-playground.log
           if-no-files-found: ignore

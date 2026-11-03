@@ -2,7 +2,7 @@
 # drive9/api-fs: the fs domain over plain HTTP against the case backend
 # (ex-e2e api-smoke core; server-surface case — no_mount = true in
 # suites.toml). The engine hands us D9_SERVER / D9_API_KEY; every curl runs
-# through the injector when faults/latency are declared. Inside `check shell
+# through the injector when faults are declared. Inside `check shell
 # -- sh -c '…'` payloads the D9_* variables expand from the inherited
 # environment.
 set -eu

@@ -2,7 +2,6 @@ mod fcvm;
 mod injector;
 mod run;
 mod sandbox;
-mod stack;
 mod utils;
 mod workbench;
 
@@ -31,11 +30,6 @@ enum Commands {
     Run {
         /// path to the case file (must end in .t)
         case: PathBuf,
-        /// backend stack: omit for an externally provided --server, or
-        /// "mock" to spawn the embedded mock server (+ rustfs when
-        /// available) as the backend for this run
-        #[arg(long)]
-        stack: Option<String>,
         #[arg(long, default_value = "host")]
         sandbox: String,
         #[arg(long)]
@@ -100,9 +94,6 @@ enum Commands {
         /// only cases whose tier matches
         #[arg(long)]
         tier: Option<String>,
-        /// spawn the embedded mock backend for the whole suite ("mock")
-        #[arg(long)]
-        stack: Option<String>,
         #[arg(long, default_value = "http://127.0.0.1:9009")]
         server: String,
         #[arg(long, default_value = "drive9")]
@@ -152,7 +143,6 @@ fn main() -> Result<()> {
     let code = match cli.command {
         Commands::Run {
             case,
-            stack,
             sandbox,
             home,
             server,
@@ -172,7 +162,6 @@ fn main() -> Result<()> {
             no_mount,
         } => run::run(RunArgs {
             case,
-            stack,
             no_mount,
             sandbox,
             home,
@@ -195,7 +184,6 @@ fn main() -> Result<()> {
             manifest,
             tier,
             server,
-            stack,
             bin,
             home,
             fstest,
@@ -204,7 +192,6 @@ fn main() -> Result<()> {
             manifest,
             tier,
             server,
-            stack,
             bin,
             home,
             fstest,

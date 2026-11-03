@@ -2,7 +2,7 @@
 # Run: drive9-simulator run-suite --manifest simulator/suites.toml --tier pr-gate --server …
 # Case paths resolve as simulator/cases/<name>.t.
 
-# ---- pr-gate: fast core (mock backend friendly) ----
+# ---- pr-gate: fast core (server-surface cases, no mount) ----
 
 [[case]]
 name = "drive9/api-fs"
@@ -16,7 +16,7 @@ no_mount = true
 
 # ---- nightly: bigger / root-requiring community suites ----
 [[case]]
-# mptest coordinator reports broken 0/0 on FUSE+mock (fstest-internal
+# mptest coordinator reports broken 0/0 on FUSE (fstest-internal
 # startup behavior) — nightly until understood
 name = "community/fstest-sqlite"
 tier = "nightly"
@@ -42,8 +42,8 @@ name = "juicefs/rmr"
 tier = "pr-gate-mount"
 
 [[case]]
-# real failing finding: observer cache flaps empty against the mock (see
-# the case header) — nightly until understood, not a PR blocker
+# real failing finding: observer cache flaps empty (last seen against the
+# former mock backend; see the case header) — nightly, not a PR blocker
 name = "juicefs/cache-consistency"
 tier = "nightly"
 
@@ -91,7 +91,7 @@ tier = "nightly"
 name = "drive9/git-ops-fast-clone"
 tier = "nightly"
 
-# ---- bench: fstest benchmark suites under latency shaping (G6); metrics
+# ---- bench: fstest benchmark suites against the real backend (G6); metrics
 # land in the run's fstest-*.json artifacts and perf_baseline.py compares
 # them against the previous run's baseline ----
 [[case]]

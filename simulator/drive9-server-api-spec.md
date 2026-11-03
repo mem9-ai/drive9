@@ -1,7 +1,9 @@
 # drive9 Server API Specification
 
-Status: **draft v1** — normative for the simulator's embedded mock backend.
-Provenance tags on every section:
+Status: **draft v1** — the backend contract the simulator's cases run
+against. The simulator only talks to REAL backends (`--server`; see
+ROADMAP.md); this spec documents what they must serve. Provenance tags on
+every section:
 
 - `[prod]` — the production server implementation in `tidbcloud/fs`
   (module `github.com/mem9-ai/drive9`). Machine-readable skeleton:
@@ -11,11 +13,8 @@ Provenance tags on every section:
 - `[v1]` — the extent v1 data plane implemented **in this repository**
   (`pkg/server/extent_meta.go`, `pkg/datastore/jfs_meta.go`). The production
   v2 design drops these endpoints; they are specified here because the client
-  in this repo speaks them and the mock must serve them.
+  in this repo speaks them.
 - `[both]` — verified identical in both implementations.
-
-Mock-server requirement tiers (§21) say which parts the embedded backend must
-implement, may implement, or may stub.
 
 ## 1. Conventions
 
@@ -253,7 +252,7 @@ incomplete → `503` + `Retry-After: 2`.
 
 > Divergence: `[prod]` v2 removes both endpoints below. Reads become the
 > `206` block plan (§4.1); writes become V2 `layout=extent` + `PATCH
-> dirty_blocks`; compaction/GC move server-side. The mock implements v1.
+> dirty_blocks`; compaction/GC move server-side.
 
 ### 7.1 `POST /v1/data-credential`
 
@@ -496,27 +495,3 @@ table).
 | SSE heartbeat | 30s |
 | STS extent session TTL | 1h |
 | admin logs rate limit | 60/min, burst 10 (env-tunable) |
-
-## 21. Embedded mock server requirements (simulator)
-
-Tiering for `simulator`'s embedded backend (SQLite metadb/tenantdb + embedded
-rustfs S3 endpoint). The mock's fidelity contract is THIS spec; drift is
-caught by a nightly mock-vs-real conformance diff (same request sequence,
-compare status + key headers + body shape).
-
-- **Tier 0 — must implement** (mount daemon + CLI core):
-  `/healthz`; `/v1/provision` + `/v1/status` (v1 shape; `inline_threshold`
-  honored); `/v1/tenant` delete; fs domain: read/stat/list/HEAD/PUT/
-  append-log/append/mkdir/rename/copy/delete/recursive-delete(+503 shape)/
-  setmeta/chmod/symlink/hardlink; uploads V1 full; extent v1 full (§7) —
-  `/v1/extent/meta` op registry against SQLite-backed `jfs_*` tables,
-  `/v1/data-credential` minting `scheme=s3` against the embedded rustfs
-  (prefix `t/<tenant>/`) plus `scheme=file` mode; `/v1/sql` reading the
-  mock's own SQLite; `/v1/events` minimal (`file_changed`, `reset`,
-  heartbeat); `/v1/tokens` issue/refresh (scoped subset enough for tests).
-- **Tier 1 — should implement**: batch endpoints; uploads V2 presign family;
-  quota; journals; git-workspaces; layers.
-- **Tier 2 — may stub**: vault, runtime/exec, admin/*, slock — return the
-  spec's documented error shapes where clients probe capabilities.
-- Latency shaping is NOT the mock's job: the injector `latency` primitive
-  applies per-route delays in front of any backend (mock or real).
