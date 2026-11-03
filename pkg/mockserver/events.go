@@ -38,18 +38,21 @@ func (h *eventHub) unsubscribe(ch chan string) {
 	h.mu.Unlock()
 }
 
-// publish bumps the seq and fans the event out to every subscriber. No
-// actor field: subscribers must not self-filter, so every mount invalidates
-// on every change (over-invalidation is always safe).
-func (h *eventHub) publish(path, op string) {
+// publish bumps the seq and fans the event out to every subscriber. The
+// actor comes from the mutating request's X-Dat9-Actor header: subscribers
+// filter their own actor, so a mount's own writes must NOT invalidate its
+// own pending/commit seeds (an unattributed event reads as a remote change
+// and makes the mount drop its own just-committed content).
+func (h *eventHub) publish(path, op, actor string) {
 	h.mu.Lock()
 	h.seq++
 	seq := h.seq
 	data, _ := json.Marshal(map[string]any{
-		"seq":  seq,
-		"path": path,
-		"op":   op,
-		"ts":   time.Now().UnixMilli(),
+		"seq":   seq,
+		"path":  path,
+		"op":    op,
+		"actor": actor,
+		"ts":    time.Now().UnixMilli(),
 	})
 	line := fmt.Sprintf("event: file_changed\ndata: %s\n\n", data)
 	for ch := range h.subs {

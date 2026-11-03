@@ -461,7 +461,7 @@ func (s *Server) fsPut(w http.ResponseWriter, r *http.Request, t *tenantDB, raw 
 	if desc := r.Header.Get("X-Dat9-Description"); desc != "" {
 		_, _ = t.db.Exec(`UPDATE file_nodes SET description = ? WHERE path = ?`, desc, p)
 	}
-	s.hubFor(t.id).publish(p, "write")
+	s.hubFor(t.id).publish(p, "write", r.Header.Get("X-Dat9-Actor"))
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "revision": rev})
 }
 
@@ -492,7 +492,7 @@ func (s *Server) fsDelete(w http.ResponseWriter, r *http.Request, t *tenantDB, r
 		errJSON(w, http.StatusInternalServerError, "delete failed")
 		return
 	}
-	s.hubFor(t.id).publish(p, "delete")
+	s.hubFor(t.id).publish(p, "delete", r.Header.Get("X-Dat9-Actor"))
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
@@ -544,7 +544,7 @@ func (s *Server) fsPost(w http.ResponseWriter, r *http.Request, t *tenantDB, raw
 			errJSON(w, http.StatusInternalServerError, "mkdir failed")
 			return
 		}
-		s.hubFor(t.id).publish(p, "mkdir")
+		s.hubFor(t.id).publish(p, "mkdir", r.Header.Get("X-Dat9-Actor"))
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	case has("rename"):
 		dst, err := fsPath(raw, false)
@@ -570,8 +570,8 @@ func (s *Server) fsPost(w http.ResponseWriter, r *http.Request, t *tenantDB, raw
 			errJSON(w, http.StatusInternalServerError, "rename failed")
 			return
 		}
-		s.hubFor(t.id).publish(src, "delete")
-		s.hubFor(t.id).publish(dst, "rename")
+		s.hubFor(t.id).publish(src, "delete", r.Header.Get("X-Dat9-Actor"))
+		s.hubFor(t.id).publish(dst, "rename", r.Header.Get("X-Dat9-Actor"))
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "revision": rev})
 	case has("copy"):
 		dst, err := fsPath(raw, false)
@@ -625,7 +625,7 @@ func (s *Server) fsPost(w http.ResponseWriter, r *http.Request, t *tenantDB, raw
 			errJSON(w, http.StatusInternalServerError, "hardlink failed")
 			return
 		}
-		s.hubFor(t.id).publish(dst, "copy")
+		s.hubFor(t.id).publish(dst, "copy", r.Header.Get("X-Dat9-Actor"))
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "revision": rev})
 	case has("append"), has("setmeta"), has("chmod"),
 		has("create"), has("symlink"):
@@ -686,7 +686,7 @@ func (s *Server) fsAppendLog(w http.ResponseWriter, r *http.Request, t *tenantDB
 		errJSON(w, http.StatusInternalServerError, "append failed")
 		return
 	}
-	s.hubFor(t.id).publish(p, "write")
+	s.hubFor(t.id).publish(p, "write", r.Header.Get("X-Dat9-Actor"))
 	w.Header().Set("X-Dat9-Revision", fmt.Sprint(rev))
 	writeJSON(w, http.StatusOK, map[string]any{"revision": rev, "size_bytes": wantSize + int64(len(body))})
 }
