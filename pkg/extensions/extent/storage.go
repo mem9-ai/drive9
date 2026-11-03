@@ -343,21 +343,30 @@ func (r *blockRegistry) releaseIssuePin(id uint64) bool {
 	return true
 }
 
-// trimIssued bounds the OUTSTANDING issued ids to keep, releasing the
-// OLDEST handout's pins first (insertion order). Used when a new handout
-// arrives; block fetches never trim (a block boundary is not the end of
-// an outstanding user).
-func (r *blockRegistry) trimIssued(keep int) {
-	if keep < 0 {
-		return
-	}
+// demoteToProvenance drops a classic entry's cached bytes while keeping
+// the id fetchable: the remote range is the usable source for any
+// outstanding reader's later block fetches.
+func (r *blockRegistry) demoteToProvenance(id uint64, path string, start int64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for len(r.issueOrder) > keep {
-		oldest := r.issueOrder[0]
-		r.issueOrder = r.issueOrder[1:]
-		delete(r.issued, oldest)
+	if e, ok := r.m[id]; ok && e.cached != nil {
+		e.cached = nil
+		e.path = path
+		e.provenanceStart = start
+		e.classicRange = e.size
 	}
+}
+
+// trimIssued is a no-op retained for call-site symmetry: pins belonging
+// to outstanding readers are NEVER revoked by cache pressure (revoking
+// them makes valid reads fail with no reconstructable source). The
+// memory bound comes from the LRU accounting (issued entries stay
+// counted) plus entry reuse: re-staging the same id refreshes the entry,
+// and the byte budget bounds the non-issued population. A hard
+// outstanding-set cap would reintroduce reader failure and is
+// deliberately not implemented.
+func (r *blockRegistry) trimIssued(keep int) {
+	_ = keep
 }
 
 // isIssued reports whether an outstanding reader holds the staged id.
@@ -477,6 +486,19 @@ func (r *blockRegistry) fetch(ctx context.Context, c fetchClient, id uint64, off
 		if cur, ok := r.currentPath(snap.provenanceIno); ok {
 			path = cur
 		}
+	}
+	if snap.classicRange > 0 {
+		// Classic-read provenance: the bytes were dropped under cache
+		// pressure while a reader still held the id — re-read the exact
+		// remote range instead of failing.
+		type ranger interface {
+			ReadStreamRange(ctx context.Context, path string, offset, length int64) (io.ReadCloser, error)
+		}
+		rc, rerr := c.(ranger).ReadStreamRange(ctx, path, snap.provenanceStart+off, limit)
+		if rerr != nil {
+			return nil, rerr
+		}
+		return rc, nil
 	}
 	plan, err := c.GetExtentReadPlan(ctx, path, snap.provenanceStart, snap.provenanceStart+snap.size)
 	if err != nil {

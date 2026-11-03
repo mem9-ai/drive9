@@ -1537,7 +1537,10 @@ func newMultipartAbortContext(parent context.Context, timeout time.Duration) (co
 
 // ReadStream reads a file, following 302 redirects for large files.
 func (c *Client) ReadStream(ctx context.Context, path string) (io.ReadCloser, error) {
-	resp, err := c.readWithoutRedirect(ctx, path, "")
+	// The extent read-plan representation is opt-in on the wire: declare
+	// support on every plain read too — a classic server ignores the
+	// header, an extent server answers the plan (without it, 422).
+	resp, err := c.readWithoutRedirectOptIn(ctx, path, "", true)
 	if err != nil {
 		return nil, err
 	}
@@ -1579,6 +1582,13 @@ func (c *Client) ReadStream(ctx context.Context, path string) (io.ReadCloser, er
 }
 
 func (c *Client) readWithoutRedirect(ctx context.Context, path, rangeHeader string) (*http.Response, error) {
+	return c.readWithoutRedirectOptIn(ctx, path, rangeHeader, false)
+}
+
+// readWithoutRedirectOptIn additionally declares support for the extent
+// block-plan representation (X-Dat9-Extent-Read-Plan): extent reads MUST
+// opt in or the server answers 422; classic reads leave it off.
+func (c *Client) readWithoutRedirectOptIn(ctx context.Context, path, rangeHeader string, extentPlan bool) (*http.Response, error) {
 	// Disable redirect following so we can detect 302. The request carries the
 	// same credentials as any other read (doWith), including X-Dat9-Actor: the
 	// actor header is read by the drive9 origin on this hop and is not forwarded
@@ -1586,6 +1596,9 @@ func (c *Client) readWithoutRedirect(ctx context.Context, path, rangeHeader stri
 	req, err := c.newFSRequest(ctx, http.MethodGet, path, "", nil)
 	if err != nil {
 		return nil, err
+	}
+	if extentPlan {
+		req.Header.Set("X-Dat9-Extent-Read-Plan", "1")
 	}
 	if rangeHeader != "" {
 		req.Header.Set("Range", rangeHeader)
@@ -1668,7 +1681,9 @@ func (c *Client) ReadStreamRange(ctx context.Context, path string, offset, lengt
 		return nil, fmt.Errorf("offset + length overflows int64")
 	}
 
-	resp, err := c.readWithoutRedirect(ctx, path, fmt.Sprintf("bytes=%d-%d", offset, offset+length-1))
+	// Same opt-in as ReadStream: extent servers answer plans only when
+	// the client declares support.
+	resp, err := c.readWithoutRedirectOptIn(ctx, path, fmt.Sprintf("bytes=%d-%d", offset, offset+length-1), true)
 	if err != nil {
 		return nil, err
 	}

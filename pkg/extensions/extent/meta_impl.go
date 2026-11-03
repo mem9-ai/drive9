@@ -811,6 +811,16 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 		}
 		st.Revision = v.rev
 	}
+	// A captured (echoed) landed identity constrains EVERY retry of a
+	// live handle whose classification never completed — regardless of the
+	// occupant's CURRENT layout: an extent replacement at the path must be
+	// rejected exactly like a classic one, not published into via the
+	// plain PATCH path.
+	if !fresh && b.isLayoutPending(ino) && !b.isClassicOwned(ino) {
+		if !b.layoutPendingMatches(ino, st.ResourceID) {
+			return fmt.Errorf("target %s no longer holds our upload", path)
+		}
+	}
 	if !fresh && st.ContentLayout != client.ContentLayoutExtent {
 		if b.isClassicOwned(ino) || b.isLayoutPending(ino) {
 			// A fresh session of ours degraded to a classic upload on a
@@ -1812,7 +1822,7 @@ func (b *Bridge) readClassic(ctx context.Context, ino meta.Ino, path string, sta
 		copy(data[off-start:], pdata)
 	}
 	sum := sha256Hex(data)
-	id := b.stageClassicChunk(sum, data)
+	id := b.stageClassicChunk(sum, data, path, start)
 	*slices = []meta.Slice{{Id: id, Size: uint32(len(data)), Len: uint32(len(data))}}
 	return 0
 }
@@ -1836,7 +1846,7 @@ var classicReadProtect = 4
 // handed), records inside the grace window are immune (in-flight fetches),
 // and pinned entries (a pending commit still references their checksum)
 // are never retired.
-func (b *Bridge) stageClassicChunk(sum string, data []byte) uint64 {
+func (b *Bridge) stageClassicChunk(sum string, data []byte, path string, start int64) uint64 {
 	id := b.blocks.stagePinned(sum, data, false)
 	b.mu.Lock()
 	now := time.Now()
@@ -1862,7 +1872,7 @@ func (b *Bridge) stageClassicChunk(sum string, data []byte) uint64 {
 			return id
 		}
 	}
-	b.classicLRU = append(b.classicLRU, classicRef{sum: sum, id: id, bytes: int64(len(data)), at: now})
+	b.classicLRU = append(b.classicLRU, classicRef{sum: sum, id: id, bytes: int64(len(data)), at: now, path: path, start: start})
 	b.classicBytes += int64(len(data))
 	var retire []classicRef
 	for b.classicBytes > classicReadCacheBytes {
@@ -1877,13 +1887,12 @@ func (b *Bridge) stageClassicChunk(sum string, data []byte) uint64 {
 	b.mu.Unlock()
 	for _, r := range retire {
 		if b.blocks.isIssued(r.id) {
-			// An outstanding reader still holds this slice: the BYTES stay
-			// (the fetch must succeed), and they stay ACCOUNTED — re-append
-			// the record so a later trim (after the pin drains) reclaims it.
-			b.mu.Lock()
-			b.classicLRU = append(b.classicLRU, r)
-			b.classicBytes += r.bytes
-			b.mu.Unlock()
+			// An outstanding reader still holds this slice: DEMOTE it —
+			// the cached bytes are dropped (freeing the budget) while the
+			// id stays fetchable through the classic remote range, the
+			// usable source for the reader's later block fetches. The LRU
+			// record goes with the bytes; a re-read simply re-stages.
+			b.blocks.demoteToProvenance(r.id, r.path, r.start)
 			continue
 		}
 		b.blocks.releaseIfUnpinned(r.sum)

@@ -182,6 +182,13 @@ func newFakeV2(t *testing.T) *fakeV2 {
 			}
 		case http.MethodGet:
 			f.mu.Lock()
+			if f.extent[path] != "" && r.Header.Get("X-Dat9-Extent-Read-Plan") == "" {
+				// The wire contract: extent reads MUST declare support for
+				// the block-plan representation.
+				f.mu.Unlock()
+				http.Error(w, "extent read requires X-Dat9-Extent-Read-Plan", http.StatusUnprocessableEntity)
+				return
+			}
 			if classic := f.classic[path]; classic != "" && f.extent[path] == "" {
 				// A classic (legacy) file: the raw byte stream, not a plan.
 				fail := f.failBody
@@ -3582,11 +3589,10 @@ func TestClassicReadCacheBoundedUnderScan(t *testing.T) {
 	br.mu.Lock()
 	held := br.classicBytes
 	br.mu.Unlock()
-	// Bound: the budget plus the protected newest records, each of which
-	// may span a whole chunk fetch (sparse chunks materialize their zero
-	// holes). Distinct-chunk scans retire everything older.
-	span := int64(64 << 20) // one chunk fetch (sparse chunks materialize their zero holes)
-	if held > classicReadCacheBytes+int64(classicReadProtect)*span {
+	// Bound: the budget plus the protected newest records (bytes; issued
+	// entries beyond it are DEMOTED to provenance — bytes dropped, the
+	// remote range kept as the usable source).
+	if held > classicReadCacheBytes+int64(classicReadProtect)*(64<<20) {
 		t.Fatalf("classic staging holds %d bytes, want <= %d + %d protected chunk spans", held, classicReadCacheBytes, classicReadProtect)
 	}
 }
@@ -3631,14 +3637,14 @@ func TestIssuedSliceSurvivesEviction(t *testing.T) {
 
 	// Hand out a slice (stage + issue pin, as readClassic does).
 	data := []byte("FIRST")
-	id1 := br.stageClassicChunk(sha256Hex(data), data)
+	id1 := br.stageClassicChunk(sha256Hex(data), data, "/d/f.bin", 0)
 	if !br.blocks.isIssued(id1) {
 		t.Fatal("staged classic slice was not issue-pinned")
 	}
 	// Stage many distinct chunks to force LRU pressure.
 	for i := 0; i < 32; i++ {
 		d := []byte{byte(i), byte(i), byte(i), byte(i)}
-		br.stageClassicChunk(sha256Hex(d), d)
+		br.stageClassicChunk(sha256Hex(d), d, "/d/f.bin", int64(i+1)<<20)
 	}
 	// The issued id must still be fetchable (objectStorage.Get consumes
 	// the pin and serves the bytes).
@@ -3904,5 +3910,81 @@ func TestBoundDirectPutWithoutRevisionCAS(t *testing.T) {
 	}
 	if got := f.contentOf("/a"); got != "OTHER" {
 		t.Fatalf("replacement content = %q, want OTHER untouched", got)
+	}
+}
+
+// Round-26: a classic read whose bytes were demoted under pressure while a
+// reader still held the id re-reads from the remote range — the later
+// block fetch succeeds instead of failing with an unknown id.
+func TestDemotedSliceRefetchesRemotely(t *testing.T) {
+	f := newFakeV2(t)
+	f.setLegacy(true)
+	f.setDir("/d", true)
+	h := newTestHandler(t, f, 0)
+	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
+	eh := res.Handle.(*engineHandle)
+	payload := make([]byte, 16<<10)
+	for i := range payload {
+		payload[i] = byte('A' + i%26)
+	}
+	if err := eh.Write(context.Background(), 0, payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// Read once (stage + fetch), then force demotion by budget pressure.
+	old := classicReadCacheBytes
+	classicReadCacheBytes = 4 << 10
+	defer func() { classicReadCacheBytes = old }()
+	buf := make([]byte, 4096)
+	if _, err := eh.Read(context.Background(), 0, buf); err != nil {
+		t.Fatal(err)
+	}
+	// Stage many distinct ranges to pressure the LRU past the first id.
+	br := h.opts.Engine.Bridge
+	for i := 0; i < 8; i++ {
+		d := make([]byte, 4096)
+		_, _ = rand.Read(d)
+		br.stageClassicChunk(sha256Hex(d), d, "/d/f.bin", int64(i)*4096)
+	}
+	// The first read's entry was demoted: its bytes are gone, provenance
+	// remains. A later fetch of the SAME range re-reads the remote.
+	if _, err := eh.Read(context.Background(), 0, buf); err != nil {
+		t.Fatalf("read after demotion: %v", err)
+	}
+	if string(buf) != string(payload[:4096]) {
+		t.Fatal("post-demotion read returned wrong bytes")
+	}
+}
+
+// Round-26: the captured (echoed) identity constrains retries regardless of
+// the occupant's CURRENT layout — an EXTENT replacement at the path of a
+// still-unclassified upload is rejected too.
+func TestExtentReplacementRejectedUnderLayoutPending(t *testing.T) {
+	f := newFakeV2(t)
+	f.setDir("/d", true)
+	h := newTestHandler(t, f, 0)
+	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
+	eh := res.Handle.(*engineHandle)
+	f.setStatGone(true)
+	if err := eh.Write(context.Background(), 0, []byte("AAAA")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Sync(context.Background()); err == nil {
+		t.Fatal("the commit succeeded despite the stat outage")
+	}
+	// An EXTENT replacement takes the path while stats are blind.
+	f.mu.Lock()
+	f.extent["/d/f.bin"] = "EXTREPL"
+	f.nextID++
+	f.ids["/d/f.bin"] = "extent-replacement-id"
+	f.statGone = false
+	f.mu.Unlock()
+	if err := eh.Sync(context.Background()); err == nil {
+		t.Fatal("the retry published into an extent replacement")
+	}
+	if got := f.contentOf("/d/f.bin"); got != "EXTREPL" {
+		t.Fatalf("replacement content = %q, want EXTREPL untouched", got)
 	}
 }

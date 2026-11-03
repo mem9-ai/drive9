@@ -96,7 +96,10 @@ func (c *Client) GetExtentReadPlan(ctx context.Context, path string, start, end 
 	if end >= 0 {
 		rng = fmt.Sprintf("bytes=%d-%d", start, end)
 	}
-	resp, err := c.readWithoutRedirect(ctx, path, rng)
+	// Opt in to the block-plan representation: every plan request
+	// (first page and continuations) must declare support or the server
+	// answers 422.
+	resp, err := c.readWithoutRedirectOptIn(ctx, path, rng, true)
 	if err != nil {
 		return nil, err
 	}
