@@ -306,7 +306,8 @@ type blockRegistry struct {
 	pins map[string]int // checksum -> pending-commit references
 	// issued tracks outstanding readers of staged classic ids: an issued
 	// entry is immune from LRU retirement until its fetch consumes the pin.
-	issued map[uint64]int
+	issued     map[uint64]int
+	issueOrder []uint64 // handout insertion order (oldest first)
 	// currentPath resolves an inode to the remote path it maps to NOW.
 	currentPath func(ino meta.Ino) (string, bool)
 }

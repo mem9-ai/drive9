@@ -522,6 +522,12 @@ func (c *Client) WriteMultipartStreamConditional(ctx context.Context, path strin
 		TotalBytes: size,
 	}
 	err := c.writeStreamV2WithSummary(ctx, path, ra, size, progress, expectedRevision, summary, nil, "", "")
+	if err == errV2NotAvailable && expectedResourceOf(ctx) != "" {
+		// The publication is IDENTITY-BOUND; the V1 surface cannot carry
+		// the precondition, so silently publishing through it would
+		// unbind the operation. Refuse instead.
+		return fmt.Errorf("%s: %w (v1 fallback cannot carry the identity binding)", path, ErrResourceMismatch)
+	}
 	if err == errV2NotAvailable {
 		err = c.writeStreamV1WithSummary(ctx, path, ra, size, progress, expectedRevision, summary, nil, "", "")
 	}
@@ -590,6 +596,11 @@ func (c *Client) writeStreamConditionalWithSummaryAndPreCompleteCheck(ctx contex
 	// Every attempt is fresh. Prefer V2 and use V1 only when the endpoint is
 	// explicitly unavailable on an older Server.
 	err := c.writeStreamV2WithSummaryAndPreCompleteCheck(ctx, path, ra, size, progress, expectedRevision, summary, tags, description, checksumSHA256, preCompleteCheck)
+	if err == errV2NotAvailable && expectedResourceOf(ctx) != "" {
+		// Identity-bound publication: the V1 surface cannot carry the
+		// precondition — refuse instead of silently unbinding.
+		return nil, fmt.Errorf("%s: %w (v1 fallback cannot carry the identity binding)", path, ErrResourceMismatch)
+	}
 	if err == errV2NotAvailable {
 		// Server doesn't support v2 — fall back to v1.
 		if err := c.writeStreamV1WithSummaryAndPreCompleteCheck(ctx, path, ra, size, progress, expectedRevision, summary, tags, description, checksumSHA256, preCompleteCheck); err != nil {
@@ -1477,6 +1488,15 @@ func (c *Client) completeUploadV2WithOptions(ctx context.Context, uploadID strin
 
 	if resp.StatusCode >= 300 {
 		return markCommitAttempt(readError(resp))
+	}
+	// The server may echo the landed object's resource identity: publish
+	// it to any bound writer (the extent session AND the degraded classic
+	// session both complete here) so a post-upload stat outage cannot
+	// lose the ownership proof.
+	if id := resourceIDOf(resp); id != "" {
+		if out := completedResourceSinkOf(ctx); out != nil {
+			*out = id
+		}
 	}
 	return nil
 }

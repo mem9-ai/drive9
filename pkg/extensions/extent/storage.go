@@ -142,16 +142,17 @@ func (s objectStorage) Get(ctx context.Context, key string, off, limit int64, ge
 	sl := s.bridge.stagedSlices[id]
 	s.bridge.mu.Unlock()
 	if sl == nil {
-		// Transient pin for THIS fetch (a concurrent stage cannot retire
-		// the entry between the pin and the snapshot — retirement checks
-		// issued under the same registry lock). The block's handout pin
-		// drains here too; a fetch that reaches the entry's END drains
-		// every remaining pin — that reader is done with the slice.
+		// A fetch pins for its OWN duration only (a concurrent stage
+		// cannot retire the entry between the pin and the snapshot —
+		// retirement checks issued under the same registry lock). The
+		// HANDOUT pins are NOT consumed here: a block boundary is not the
+		// end of an outstanding slice user (rSlice loads blocks one at a
+		// time, and other readers may hold the same id), so clearing on a
+		// block boundary would strip protection mid-slice and from other
+		// readers. Handout pins drain when the entry is re-staged fresh
+		// (the reader set turned over) or stay accounted until then.
 		s.bridge.blocks.issuePin(id)
 		defer s.bridge.blocks.releaseIssuePin(id)
-		if off+limit >= size {
-			s.bridge.blocks.dropIssuePins(id)
-		}
 	}
 	if sl != nil {
 		staged := sl.join()
@@ -311,6 +312,9 @@ func (r *blockRegistry) issuePin(id uint64) {
 		return
 	}
 	r.mu.Lock()
+	if r.issued[id] == 0 {
+		r.issueOrder = append(r.issueOrder, id)
+	}
 	r.issued[id]++
 	r.mu.Unlock()
 }
@@ -329,19 +333,31 @@ func (r *blockRegistry) releaseIssuePin(id uint64) bool {
 	r.issued[id]--
 	if r.issued[id] == 0 {
 		delete(r.issued, id)
+		for i, v := range r.issueOrder {
+			if v == id {
+				r.issueOrder = append(r.issueOrder[:i], r.issueOrder[i+1:]...)
+				break
+			}
+		}
 	}
 	return true
 }
 
-// dropIssuePins clears every remaining pin for an id (the reader that
-// reached the slice's end is finished with it).
-func (r *blockRegistry) dropIssuePins(id uint64) {
-	if id == 0 {
+// trimIssued bounds the OUTSTANDING issued ids to keep, releasing the
+// OLDEST handout's pins first (insertion order). Used when a new handout
+// arrives; block fetches never trim (a block boundary is not the end of
+// an outstanding user).
+func (r *blockRegistry) trimIssued(keep int) {
+	if keep < 0 {
 		return
 	}
 	r.mu.Lock()
-	delete(r.issued, id)
-	r.mu.Unlock()
+	defer r.mu.Unlock()
+	for len(r.issueOrder) > keep {
+		oldest := r.issueOrder[0]
+		r.issueOrder = r.issueOrder[1:]
+		delete(r.issued, oldest)
+	}
 }
 
 // isIssued reports whether an outstanding reader holds the staged id.

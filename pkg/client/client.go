@@ -900,12 +900,12 @@ func (c *Client) writeCtxConditionalFull(ctx context.Context, path string, data 
 	req.Header.Set("Content-Type", "application/octet-stream")
 	if expectedRevision >= 0 {
 		req.Header.Set("X-Dat9-Expected-Revision", strconv.FormatInt(expectedRevision, 10))
-		if id := expectedResourceOf(ctx); id != "" {
-			// The identity precondition rides EVERY bound publication
-			// route, direct PUT included: a same-revision replacement at
-			// the path must not receive the bytes.
-			req.Header.Set("X-Dat9-Expected-Resource", id)
-		}
+	}
+	if id := expectedResourceOf(ctx); id != "" {
+		// The identity precondition rides EVERY bound publication route,
+		// direct PUT included, and INDEPENDENTLY of the numeric revision
+		// CAS (a bound call with -1 still binds).
+		req.Header.Set("X-Dat9-Expected-Resource", id)
 	}
 	if err := setTagHeaders(req, tags); err != nil {
 		return 0, err

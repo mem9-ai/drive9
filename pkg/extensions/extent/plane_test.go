@@ -40,6 +40,7 @@ type fakeV2 struct {
 	statFail   map[string]bool          // paths whose HEAD answers 500 (probe injection)
 	legacy     bool                     // classic-only server: extent sessions degrade to classic
 	failBody   bool                     // abort classic GET bodies mid-stream (2 bytes delivered)
+	statGone   bool                     // existing paths invisible to stats (404)
 	presigns   int                      // presign-batch calls
 	completes  int                      // complete calls
 	upSize     int64                    // last initiate's total size (part sizing)
@@ -152,6 +153,10 @@ func newFakeV2(t *testing.T) *fakeV2 {
 			}
 			if hook := f.afterHead; hook != nil {
 				defer hook(path)
+			}
+			if f.statGone && f.extent[path]+f.classic[path] != "" {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
 			}
 			if f.statFail[path] {
 				http.Error(w, "probe refused", http.StatusInternalServerError)
@@ -399,9 +404,19 @@ func newFakeV2(t *testing.T) *fakeV2 {
 				landedPath = f.creates[len(f.creates)-1]
 			}
 			landedID := f.ids[landedPath]
+			if landedPath != "" && landedID == "" {
+				// A fresh landing: assign the object's identity now (the
+				// server knows it even when our stats fail).
+				f.nextID++
+				landedID = fmt.Sprintf("res-%d", f.nextID)
+				f.ids[landedPath] = landedID
+			}
 			f.mu.Unlock()
 			// Echo the landed object's identity: the client captures it
 			// as the ownership proof for post-upload stat outages.
+			if os.Getenv("EXTENT_DBG_ID") != "" {
+				fmt.Println("FAKE COMPLETE echo:", landedID, "path:", landedPath)
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"status": "completed", "resource_id": landedID})
 			return
 		}
@@ -555,6 +570,13 @@ func (f *fakeV2) setLegacy(on bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.legacy = on
+}
+
+// setStatGone toggles visibility of EXISTING objects (stats answer 404).
+func (f *fakeV2) setStatGone(on bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.statGone = on
 }
 
 // setStatFail injects (on=true) or clears (on=false) HEAD failures for a
@@ -3563,7 +3585,7 @@ func TestClassicReadCacheBoundedUnderScan(t *testing.T) {
 	// Bound: the budget plus the protected newest records, each of which
 	// may span a whole chunk fetch (sparse chunks materialize their zero
 	// holes). Distinct-chunk scans retire everything older.
-	span := int64(1 << 20)
+	span := int64(64 << 20) // one chunk fetch (sparse chunks materialize their zero holes)
 	if held > classicReadCacheBytes+int64(classicReadProtect)*span {
 		t.Fatalf("classic staging holds %d bytes, want <= %d + %d protected chunk spans", held, classicReadCacheBytes, classicReadProtect)
 	}
@@ -3821,5 +3843,66 @@ func TestBoundPublicationOrdinaryConflictKeepsState(t *testing.T) {
 	}
 	if got := f.contentOf("/a"); got != "ZZZZAAAA" {
 		t.Fatalf("server content = %q, want ZZZZAAAA", got)
+	}
+}
+
+// Round-25: the echoed identity is captured on the completion path ACTUALLY
+// used (the V2/degraded-classic session), and the outage branch never
+// clobbers it — a replacement installed while the object was stat-invisible
+// is rejected once visibility returns.
+func TestEchoedIdentitySurvivesStatOutage(t *testing.T) {
+	f := newFakeV2(t)
+	f.setLegacy(true)
+	f.setDir("/d", true)
+	h := newTestHandler(t, f, 0)
+	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
+	eh := res.Handle.(*engineHandle)
+	f.setStatGone(true)
+	if err := eh.Write(context.Background(), 0, []byte("AAAA")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Sync(context.Background()); err == nil {
+		t.Fatal("the commit succeeded despite the stat outage")
+	}
+	br := h.opts.Engine.Bridge
+	br.mu.Lock()
+	id := br.layoutPendingID[eh.ino]
+	br.mu.Unlock()
+	if id == "" {
+		t.Fatal("the echoed landed identity was not retained through the outage")
+	}
+	f.mu.Lock()
+	f.classic["/d/f.bin"] = "REPL"
+	f.nextID++
+	f.ids["/d/f.bin"] = "replacement-id"
+	f.statGone = false
+	f.mu.Unlock()
+	if err := eh.Sync(context.Background()); err == nil {
+		t.Fatal("the retry adopted the replacement")
+	}
+	if got := f.contentOf("/d/f.bin"); got != "REPL" {
+		t.Fatalf("replacement content = %q, want REPL untouched", got)
+	}
+}
+
+// Round-25: a bound publication with the revision CAS DISABLED (-1) still
+// carries the identity precondition on the direct-PUT route.
+func TestBoundDirectPutWithoutRevisionCAS(t *testing.T) {
+	f := newFakeV2(t)
+	f.seedExtent(t, "/a", "AAAAAAAA")
+	st, err := client.New(f.URL, "").StatCtx(context.Background(), "/a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Replace the path AFTER capturing the identity.
+	f.remove("/a")
+	f.seedExtent(t, "/a", "OTHER")
+	err = client.New(f.URL, "").WriteStreamConditionalExpectedResource(
+		context.Background(), "/a", strings.NewReader("ZZZZ"), 4, nil, -1, st.ResourceID)
+	if err == nil {
+		t.Fatal("the bound -1 revision publication overwrote a replacement")
+	}
+	if got := f.contentOf("/a"); got != "OTHER" {
+		t.Fatalf("replacement content = %q, want OTHER untouched", got)
 	}
 }

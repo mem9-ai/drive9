@@ -895,7 +895,11 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 		// attempt classifies instead of rejecting.
 		classic := false
 		classified := false
-		landedID := "" // OUR landed upload's identity, when we could see it
+		// The echoed identity (complete response) is the fallback proof
+		// when no Stat succeeds.
+		b.mu.Lock()
+		landedID := b.layoutPendingID[ino]
+		b.mu.Unlock()
 		for _, delay := range []time.Duration{0, 200 * time.Millisecond, 500 * time.Millisecond} {
 			time.Sleep(delay)
 			nst, serr := b.cfg.Client.StatCtx(ctx, path)
@@ -913,7 +917,12 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 		if !classified {
 			b.mu.Lock()
 			b.layoutPending[ino] = true
-			b.layoutPendingID[ino] = landedID // OUR upload's identity, if we saw it
+			// The completion path's ECHOED identity is the ownership proof
+			// even when no Stat ever succeeded; never clobber a captured
+			// identity with the empty stat-derived one.
+			if landedID != "" {
+				b.layoutPendingID[ino] = landedID
+			}
 			b.mu.Unlock()
 			// The pending list is INTACT (cleanup runs only after
 			// classification) — nothing to restore, and re-appending
@@ -1841,9 +1850,12 @@ func (b *Bridge) stageClassicChunk(sum string, data []byte) uint64 {
 			b.classicLRU = append(b.classicLRU[:i], b.classicLRU[i+1:]...)
 			b.classicLRU = append(b.classicLRU, rec)
 			b.mu.Unlock()
-			// A refreshed handout restarts the pin accounting at one
-			// handout's worth (the previous reader's pins are stale).
-			b.blocks.dropIssuePins(id)
+			// A refreshed handout issues a fresh handout's worth of pins
+			// WITHOUT clearing existing ones: another outstanding reader
+			// may still hold the id (clearing would strip its
+			// protection). Stale pins age out with the entry (kept
+			// accounted by the retirement re-append; a fresh staging of
+			// the same id only ever ADDS readers).
 			for issued := (rec.bytes + client.ExtentBlockSize - 1) / client.ExtentBlockSize; issued > 0; issued-- {
 				b.blocks.issuePin(id)
 			}
@@ -1877,13 +1889,18 @@ func (b *Bridge) stageClassicChunk(sum string, data []byte) uint64 {
 		b.blocks.releaseIfUnpinned(r.sum)
 	}
 	// One pin per BLOCK the reader may fetch: a 64 MiB slice is consumed
-	// by sixteen separate 4 MiB Gets, and each Get releases exactly one —
-	// the slice stays protected across the gaps between its block
-	// fetches. (A partially fetched slice keeps its remaining pins, and
-	// the entries stay accounted — see the retirement re-append.)
+	// by sixteen separate 4 MiB Gets, and pins are NOT consumed by any
+	// block fetch (a block boundary is not the end of an outstanding
+	// user; clearing there would strip mid-slice and cross-reader
+	// protection). The OUTSTANDING set is bounded instead: a handout
+	// beyond classicReadProtect distinct issued ids releases the OLDEST
+	// issued id's pins — a stalled reader behind that many newer distinct
+	// chunk reads loses protection (documented residual), while ordinary
+	// multi-block and concurrent-reader lifetimes stay covered.
 	for issued := (int64(len(data)) + client.ExtentBlockSize - 1) / client.ExtentBlockSize; issued > 0; issued-- {
 		b.blocks.issuePin(id)
 	}
+	b.blocks.trimIssued(classicReadProtect)
 	return id
 }
 
