@@ -424,30 +424,38 @@ func (wb *WriteBuffer) restoreEvictedPart(partIdx int) ([]byte, bool, error) {
 	if wb.partSize > 0 && partStart >= wb.totalSize {
 		return nil, false, nil
 	}
+	// The shadow spill is the FAST restore path, not the only source: the
+	// commit queue removes a successfully landed entry's shadow while this
+	// handle's evicted parts still reference it, and the landed remote
+	// image is the authoritative content from then on. A shadow failure
+	// (or an empty read) falls through to the remote LoadPart — ungated
+	// when the shadow spoke, because the landed size may exceed whatever
+	// stale remoteSize the buffer was opened with. Only when both sources
+	// fail is the shadow diagnostic returned.
+	var shadowErr error
 	if wb.RestorePart != nil {
 		data, err := wb.RestorePart(partIdx + 1)
-		if err != nil {
-			return nil, false, fmt.Errorf("restore evicted part %d of %s: %w", partIdx+1, wb.path, err)
-		}
-		if len(data) == 0 {
-			return nil, false, fmt.Errorf("restored evicted part %d of %s is empty", partIdx+1, wb.path)
-		}
-		return data, true, nil
-	}
-	if wb.LoadPart != nil {
-		partStart := int64(partIdx) * wb.partSize
-		if partStart < wb.remoteSize {
-			data, err := wb.LoadPart(partIdx + 1)
-			if err != nil {
-				return nil, false, err
-			}
-			if len(data) == 0 {
-				return nil, false, fmt.Errorf("loaded evicted part %d of %s is empty", partIdx+1, wb.path)
-			}
+		switch {
+		case err != nil:
+			shadowErr = fmt.Errorf("restore evicted part %d of %s: %w", partIdx+1, wb.path, err)
+		case len(data) == 0:
+			shadowErr = fmt.Errorf("restored evicted part %d of %s is empty", partIdx+1, wb.path)
+		default:
 			return data, true, nil
 		}
 	}
-	return nil, false, nil
+	if wb.LoadPart != nil {
+		if partStart < wb.remoteSize || shadowErr != nil {
+			data, err := wb.LoadPart(partIdx + 1)
+			if err == nil {
+				return data, true, nil
+			}
+			if shadowErr == nil {
+				return nil, false, err
+			}
+		}
+	}
+	return nil, false, shadowErr
 }
 
 // markDirty marks all parts that overlap with [start, end) as dirty.

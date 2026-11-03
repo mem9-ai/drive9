@@ -239,3 +239,50 @@ func allZero(b []byte) bool {
 	}
 	return true
 }
+
+// A landed commit removes the shadow spill while this handle's evicted parts
+// still reference it: the restore must fall back to the remote image (the
+// landed content is authoritative), and only fail when both sources do.
+func TestEvictedPartFallsBackToRemoteWhenShadowIsGone(t *testing.T) {
+	wb := partModeBuffer(4)
+	wb.SetSmallFileMax(1)
+	if _, err := wb.Write(0, []byte("aaaa")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wb.Write(4, []byte("bbbb")); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate the post-commit state: the shadow is gone, the remote now
+	// holds the landed bytes, and remoteSize is stale (the buffer was
+	// opened before the landing).
+	wb.RestorePart = func(partNum int) ([]byte, error) {
+		return nil, syscall.ENOENT
+	}
+	var loads atomic.Int32
+	wb.LoadPart = func(partNum int) ([]byte, error) {
+		loads.Add(1)
+		return []byte("dddd"), nil
+	}
+	wb.EvictPart(0)
+	if err := wb.EnsurePartsForWrite(0, 4); err != nil {
+		t.Fatalf("write after the shadow was reclaimed: %v", err)
+	}
+	if loads.Load() == 0 {
+		t.Fatal("the evicted part did not fall back to the remote image")
+	}
+	if got := string(wb.PartData(1)); got != "dddd" {
+		t.Fatalf("restored part = %q, want dddd", got)
+	}
+
+	// Both sources failing keeps the shadow diagnostic.
+	wb.RestorePart = func(partNum int) ([]byte, error) {
+		return nil, syscall.ENOENT
+	}
+	wb.LoadPart = func(partNum int) ([]byte, error) {
+		return nil, syscall.EIO
+	}
+	wb.EvictPart(0)
+	if err := wb.EnsurePartsForWrite(0, 4); err == nil {
+		t.Fatal("both restore sources gone must fail, not zero-fill")
+	}
+}
