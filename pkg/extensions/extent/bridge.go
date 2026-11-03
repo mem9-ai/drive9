@@ -183,6 +183,7 @@ type classicRef struct {
 	sum   string
 	id    uint64
 	bytes int64
+	at    time.Time // staged time; inside the grace window it is immune
 }
 
 // newBridgeFinish installs cross-referencing hooks that need the assembled

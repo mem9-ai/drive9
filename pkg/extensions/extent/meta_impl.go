@@ -580,12 +580,10 @@ func (b *Bridge) Read(ctx meta.Context, ino meta.Ino, indx uint32, slices *[]met
 	}
 	// Compact the pending fragments first: a later write shadows an
 	// earlier overlapping one.
-	sort.Slice(pend, func(i, j int) bool {
-		if pend[i].off != pend[j].off {
-			return pend[i].off < pend[j].off
-		}
-		return pend[i].seq < pend[j].seq
-	})
+	// NOTE: no offset sort here — the compaction walks WRITE order
+	// (construction order); sorting first would let an older high-offset
+	// fragment shadow a newer low-offset write. The compacted result is
+	// sorted by offset below.
 	// Compact the pending fragments: for each write, its VISIBLE pieces
 	// are what the LATER writes do not cover (JuiceFS overwrite
 	// semantics) — heads AND tails, so a middle overwrite keeps the
@@ -753,10 +751,11 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 		return err
 	}
 	if !fresh && st.ContentLayout != client.ContentLayoutExtent {
-		if b.isClassicOwned(ino) {
+		if b.isClassicOwned(ino) || b.ownsMapping(ino, path) {
 			// A fresh session of ours degraded to a classic upload on a
-			// legacy server: keep the open handle usable — commit through
-			// the classic surface instead of rejecting the layout.
+			// legacy server (or its post-upload classification never
+			// completed): keep the open handle usable — commit through
+			// the classic surface instead of rejecting a target we own.
 			return b.commitClassic(ctx, ino, path, pending, size, st.Revision)
 		}
 		if st.Size == 0 {
@@ -795,10 +794,8 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 
 	b.mu.Lock()
 	mode := b.modes[ino]
-	delete(b.pending, ino)
-	delete(b.truncs, ino)
-	delete(b.modes, ino)
 	b.mu.Unlock()
+	b.surgicalDeletePending(ino, pending)
 	b.releaseCommitted(ino, pending)
 	if fresh && mode != 0 && mode != 0o644 {
 		// The sequential extent create carries no mode; apply the one the
@@ -815,10 +812,7 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 			time.Sleep(delay)
 			nst, serr := b.cfg.Client.StatCtx(ctx, path)
 			if serr != nil {
-				if client.IsNotFound(serr) {
-					continue // landed under a different view; keep retrying
-				}
-				continue
+				continue // transient; keep retrying
 			}
 			b.mu.Lock()
 			b.revs[ino] = nst.Revision
@@ -828,6 +822,11 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 			b.mu.Unlock()
 			return nil
 		}
+		// Classification failed after a successful upload: keep the
+		// snapshot recoverable (the caller's pending list is restored,
+		// the staged bytes stay pinned) — the next attempt re-runs the
+		// classification instead of rejecting the target it owns.
+		b.restorePending(ino, pending)
 		return fmt.Errorf("verify landed layout of %s: stat unavailable", path)
 	}
 	if nst, err := b.cfg.Client.StatCtx(ctx, path); err == nil {
@@ -1329,10 +1328,14 @@ func (b *Bridge) StagePendingLocal(ino meta.Ino) error {
 		return nil
 	}
 	// Bind the barrier to the object, not the name: renames and
-	// replacements must not redirect recovery onto a different file.
+	// replacements must not redirect recovery onto a different file. The
+	// identity is MANDATORY for an existing remote object — a barrier
+	// whose binding could not be established must not acknowledge.
 	resID := ""
 	if st, err := b.cfg.Client.StatCtx(context.Background(), path); err == nil {
 		resID = st.ResourceID
+	} else if !client.IsNotFound(err) {
+		return fmt.Errorf("stage barrier for %s: identity unavailable: %w", path, err)
 	}
 	dir := filepath.Join(b.cfg.StagingDir, fmt.Sprintf("%d-%d", uint64(ino), time.Now().UnixNano()))
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -1436,12 +1439,16 @@ func (b *Bridge) ReplayStagedLocal(ctx context.Context) {
 			continue
 		}
 		// Identity: the bytes belong to the staged object, not to
-		// whichever file occupies the saved path now.
+		// whichever file occupies the saved path now. The SAME stat feeds
+		// the commit's CAS base, so a replacement cannot slip between the
+		// verification and the publication.
+		var verified *client.StatResult
 		if m.ResourceID != "" {
 			st, err := b.cfg.Client.StatCtx(ctx, m.Path)
 			if err != nil || st.ResourceID != m.ResourceID {
 				continue // moved, deleted or replaced: leave the record
 			}
+			verified = st
 		}
 		for sum, data := range blocks {
 			b.blocks.stageBytes(sum, data)
@@ -1461,6 +1468,11 @@ func (b *Bridge) ReplayStagedLocal(ctx context.Context) {
 			b.classicOwned[ino] = true
 		}
 		b.mu.Unlock()
+		if verified != nil {
+			b.mu.Lock()
+			b.revs[ino] = verified.Revision // CAS base from the identity-verified stat
+			b.mu.Unlock()
+		}
 		err = b.flushPendingLocked(ctx, ino)
 		if err == nil && m.HasTrunc && len(pending) == 0 {
 			err = b.flushTruncateOnly(ctx, ino, m.Size)
@@ -1590,7 +1602,10 @@ func (b *Bridge) readClassic(ctx context.Context, ino meta.Ino, path string, sta
 	for _, p := range pending {
 		off := int64(p.chunk)*meta.ChunkSize + int64(p.off)
 		end := off + p.size
-		if end <= start || off >= start+int64(len(data)) {
+		// Bounded by the REQUESTED range (clamped to the local size
+		// above), never by the downloaded base length: appends and sparse
+		// writes live past the remote EOF until publication.
+		if end <= start || off >= start+length {
 			continue
 		}
 		pdata, err := b.blockBytes(ctx, p, path)
@@ -1600,6 +1615,10 @@ func (b *Bridge) readClassic(ctx context.Context, ino meta.Ino, path string, sta
 		if off < start {
 			pdata = pdata[start-off:]
 			off = start
+		}
+		if end > start+length {
+			pdata = pdata[:start+length-off]
+			end = start + length
 		}
 		if end > start+int64(len(data)) {
 			data = append(data, make([]byte, end-start-int64(len(data)))...)
@@ -1616,19 +1635,43 @@ func (b *Bridge) readClassic(ctx context.Context, ino meta.Ino, path string, sta
 // classic-owned (degraded) files. A var so tests can shrink it.
 var classicReadCacheBytes int64 = 64 << 20
 
+// classicReadGrace is how long a staged classic record is immune from LRU
+// retirement: the engine fetches a returned slice's bytes right after
+// meta.Read, and a concurrent read must not evict an earlier reader's
+// entry between the two.
+var classicReadGrace = 30 * time.Second
+
 // stageClassicChunk publishes a classic chunk read under its deterministic
-// id and retires the OLDEST classic-sourced entries beyond the budget —
-// pinned entries (a pending commit still references their checksum) are
-// never retired, so a scan through a large degraded file cannot grow the
-// staging registry without bound.
+// id and retires the OLDEST classic-sourced entries beyond the budget.
+// Records are deduplicated by id (repeated content refreshes its record —
+// retiring a duplicate would delete the id an earlier reader was just
+// handed), records inside the grace window are immune (in-flight fetches),
+// and pinned entries (a pending commit still references their checksum)
+// are never retired.
 func (b *Bridge) stageClassicChunk(sum string, data []byte) uint64 {
 	id := b.blocks.stagePinned(sum, data, false)
 	b.mu.Lock()
-	b.classicLRU = append(b.classicLRU, classicRef{sum: sum, id: id, bytes: int64(len(data))})
+	now := time.Now()
+	// Refresh an existing record for this id instead of appending a
+	// duplicate.
+	for i := range b.classicLRU {
+		if b.classicLRU[i].id == id {
+			rec := b.classicLRU[i]
+			rec.at = now
+			b.classicLRU = append(b.classicLRU[:i], b.classicLRU[i+1:]...)
+			b.classicLRU = append(b.classicLRU, rec)
+			b.mu.Unlock()
+			return id
+		}
+	}
+	b.classicLRU = append(b.classicLRU, classicRef{sum: sum, id: id, bytes: int64(len(data)), at: now})
 	b.classicBytes += int64(len(data))
 	var retire []classicRef
-	for b.classicBytes > classicReadCacheBytes && len(b.classicLRU) > 1 {
+	for b.classicBytes > classicReadCacheBytes {
 		oldest := b.classicLRU[0]
+		if len(b.classicLRU) == 1 || time.Since(oldest.at) < classicReadGrace {
+			break // the newest record and in-flight fetches stay
+		}
 		b.classicLRU = b.classicLRU[1:]
 		b.classicBytes -= oldest.bytes
 		retire = append(retire, oldest)
@@ -1638,6 +1681,61 @@ func (b *Bridge) stageClassicChunk(sum string, data []byte) uint64 {
 		b.blocks.releaseIfUnpinned(r.sum)
 	}
 	return id
+}
+
+// surgicalDeletePending removes exactly the given snapshot entries from
+// the inode's pending list: writes appended while a commit was in flight
+// survive it.
+func (b *Bridge) surgicalDeletePending(ino meta.Ino, pending []pendingWrite) {
+	b.mu.Lock()
+	if cur := b.pending[ino]; len(cur) >= len(pending) {
+		keys := make(map[pendingWrite]int, len(pending))
+		for _, p := range pending {
+			keys[p]++
+		}
+		next := make([]pendingWrite, 0, len(cur)-len(pending))
+		for _, p := range cur {
+			if keys[p] > 0 {
+				keys[p]--
+				continue
+			}
+			next = append(next, p)
+		}
+		if len(next) == 0 {
+			delete(b.pending, ino)
+		} else {
+			b.pending[ino] = next
+		}
+	} else {
+		delete(b.pending, ino)
+	}
+	delete(b.truncs, ino)
+	delete(b.modes, ino)
+	b.mu.Unlock()
+}
+
+// restorePending re-queues a commit's snapshot after its failure so the
+// next attempt retries with the same bytes (Bridge.Write's error path
+// duplicates this for its own caller).
+func (b *Bridge) restorePending(ino meta.Ino, pending []pendingWrite) {
+	if len(pending) == 0 {
+		return
+	}
+	b.mu.Lock()
+	b.pending[ino] = append(pending, b.pending[ino]...)
+	b.mu.Unlock()
+}
+
+// ownsMapping reports whether the bridge holds a live local mapping of
+// this inode onto exactly this path — proof that WE created or committed
+// the target, so a classic layout there is our degraded session's result
+// and must not be rejected.
+func (b *Bridge) ownsMapping(ino meta.Ino, path string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	p, ok := b.paths[ino]
+	_, sized := b.sizes[ino]
+	return ok && p == path && sized
 }
 
 // HasPending reports whether un-committed writes remain for the inode.
@@ -1711,11 +1809,15 @@ func (b *Bridge) releaseCommitted(ino meta.Ino, pending []pendingWrite) {
 		}
 	}
 	for _, p := range pending {
+		// EVERY completed reference unpins: skipping the decrement while
+		// another file still referenced the checksum left a permanent pin
+		// after the last reference completed, and pinned entries are never
+		// retired by the classic-read LRU.
+		b.blocks.unpin(p.checksum)
 		if refs[p.checksum] > 0 {
 			continue
 		}
 		b.blocks.release(p.checksum)
-		b.blocks.unpin(p.checksum)
 	}
 }
 

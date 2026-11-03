@@ -3247,3 +3247,185 @@ func TestLocalClaimFlagSemantics(t *testing.T) {
 		t.Fatalf("content after O_TRUNC + write = %q, want DATA (the truncate cleared nothing)", got)
 	}
 }
+
+// Round-20: deferred appends past the remote EOF are served by the classic
+// overlay (and a wholly new chunk too), not dropped as zeros.
+func TestInteractiveClassicAppendRead(t *testing.T) {
+	f := newFakeV2(t)
+	f.setLegacy(true)
+	f.setDir("/d", true)
+	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: engineCacheDir(t)})
+	h := New(Options{Engine: eng, Threshold: 0, SyncMode: "interactive"})
+	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
+	eh := res.Handle.(*engineHandle)
+	if err := eh.Write(context.Background(), 0, []byte("AAAA")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// Append past the 4-byte remote EOF and fsync locally.
+	if err := eh.Write(context.Background(), 4, []byte("BBBB")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := readFront(t, eh, 8); got != "AAAABBBB" {
+		t.Fatalf("append read = %q, want AAAABBBB (the deferred tail must survive)", got)
+	}
+	// A write in a wholly later chunk (sparse) is served too.
+	if err := eh.Write(context.Background(), meta.ChunkSize+1024, []byte("ZZZZ")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 4)
+	n, rerr := eh.Read(context.Background(), meta.ChunkSize+1024, buf)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if string(buf[:n]) != "ZZZZ" {
+		t.Fatalf("sparse-chunk read = %q, want ZZZZ", string(buf[:n]))
+	}
+}
+
+// Round-20: the handle stays usable after a temporary base-read failure —
+// repeated fsync AND further writes work, not just the first bridge retry.
+func TestClassicBaseReadFailureThenContinuedUse(t *testing.T) {
+	f := newFakeV2(t)
+	f.setLegacy(true)
+	f.setDir("/d", true)
+	h := newTestHandler(t, f, 0)
+	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
+	eh := res.Handle.(*engineHandle)
+	if err := eh.Write(context.Background(), 0, []byte("AAAA")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	f.setFailBody(true)
+	if err := eh.Write(context.Background(), 4, []byte("BBBB")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Sync(context.Background()); err == nil {
+		t.Fatal("commit succeeded despite the truncated base read")
+	}
+	f.setFailBody(false)
+	if err := eh.Sync(context.Background()); err != nil {
+		t.Fatalf("recovery fsync: %v", err)
+	}
+	// The community writer's recorded error must not stick.
+	if err := eh.Sync(context.Background()); err != nil {
+		t.Fatalf("second fsync after recovery: %v", err)
+	}
+	if err := eh.Write(context.Background(), 8, []byte("CCCC")); err != nil {
+		t.Fatalf("write after recovery: %v", err)
+	}
+	if err := eh.Sync(context.Background()); err != nil {
+		t.Fatalf("fsync of the new write: %v", err)
+	}
+	if got := f.contentOf("/d/f.bin"); got != "AAAABBBBCCCC" {
+		t.Fatalf("server content = %q, want AAAABBBBCCCC", got)
+	}
+}
+
+// Round-20: repeated identical chunk reads keep the returned slice id
+// usable — the LRU refreshes the record instead of retiring a duplicate.
+func TestClassicReadCacheRepeatedContent(t *testing.T) {
+	f := newFakeV2(t)
+	f.setLegacy(true)
+	f.setDir("/d", true)
+	h := newTestHandler(t, f, 0)
+	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
+	eh := res.Handle.(*engineHandle)
+	payload := make([]byte, 8192)
+	for i := range payload {
+		payload[i] = byte('A' + i%26)
+	}
+	if err := eh.Write(context.Background(), 0, payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// Read the same range twice (identical content -> identical id).
+	for i := 0; i < 2; i++ {
+		buf := make([]byte, 8192)
+		if _, err := eh.Read(context.Background(), 0, buf); err != nil {
+			t.Fatalf("read %d: %v", i, err)
+		}
+		if string(buf) != string(payload) {
+			t.Fatalf("read %d returned wrong bytes", i)
+		}
+	}
+	// Then a partial re-read of a 4 KiB segment inside the same id.
+	buf := make([]byte, 4096)
+	if _, err := eh.Read(context.Background(), 2048, buf); err != nil {
+		t.Fatalf("segment read: %v", err)
+	}
+	if string(buf) != string(payload[2048:2048+4096]) {
+		t.Fatal("segment read returned wrong bytes")
+	}
+}
+
+// Round-20: a write appended to b.pending while another chunk's commit is
+// in flight survives that commit (the deletion is surgical).
+func TestPendingSurvivesConcurrentCommitCleanup(t *testing.T) {
+	f := newFakeV2(t)
+	f.seedExtent(t, "/big.bin", "AAAA")
+	h := newTestHandler(t, f, 1<<20)
+	b := h.opts.Engine.Bridge
+	eh := claimOpen(t, h, "/big.bin")
+	ino := uint64(eh.ino)
+
+	// Simulate the interleaving deterministically: a snapshot is taken,
+	// a NEW pending write arrives, then the snapshot's commit cleans up.
+	w1 := pendingWrite{chunk: 0, off: 0, checksum: sha256Hex([]byte("ZZZZ")), size: 4}
+	w2 := pendingWrite{chunk: 1, off: 0, checksum: sha256Hex([]byte("YYYY")), size: 4}
+	b.mu.Lock()
+	b.pending[meta.Ino(ino)] = []pendingWrite{w1}
+	b.blocks.stagePinned(w1.checksum, []byte("ZZZZ"), true)
+	b.mu.Unlock()
+	// The in-flight commit's snapshot is [w1]; w2 lands meanwhile.
+	b.mu.Lock()
+	b.pending[meta.Ino(ino)] = append(b.pending[meta.Ino(ino)], w2)
+	b.blocks.stagePinned(w2.checksum, []byte("YYYY"), true)
+	b.sizes[meta.Ino(ino)] = 1 << 20
+	b.mu.Unlock()
+	// The commit's cleanup deletes exactly its snapshot.
+	b.surgicalDeletePending(meta.Ino(ino), []pendingWrite{w1})
+	b.mu.Lock()
+	left := len(b.pending[meta.Ino(ino)])
+	b.mu.Unlock()
+	if left != 1 {
+		t.Fatalf("pending after the commit's cleanup = %d, want 1 (w2 must survive)", left)
+	}
+}
+
+// Round-20: deferred extent overlay honors WRITE order — a later write at
+// a lower offset shadows the earlier higher-offset write.
+func TestDeferredExtentOverlayWriteOrder(t *testing.T) {
+	f := newFakeV2(t)
+	f.seedExtent(t, "/big.bin", "AAAAAAAA")
+	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: engineCacheDir(t)})
+	h := New(Options{Engine: eng, Threshold: 1 << 20, SyncMode: "interactive"})
+	eh := claimOpen(t, h, "/big.bin")
+	if err := eh.Write(context.Background(), 4, []byte("AAAA")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Write(context.Background(), 0, []byte("BBBBBBBB")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := readFront(t, eh, 8); got != "BBBBBBBB" {
+		t.Fatalf("overlaid read = %q, want BBBBBBBB (the later write wins)", got)
+	}
+}

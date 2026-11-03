@@ -308,7 +308,7 @@ func (h *Handler) tryClaimOpen(ctx context.Context, op *fs.Op) (fs.Result, error
 		if errno != 0 {
 			return fs.Result{}, errno, true
 		}
-		handle := h.register(op.Path, ino, fh, op.Caller)
+		handle := h.register(op.Path, ino, fh, op.Flags, op.Caller)
 		// Creation attributes let the facade populate its namespace cache
 		// (a handle-only reply leaves the entry uncached).
 		attr := &fs.Attr{Kind: fs.KindFile, Nlink: 1}
@@ -345,7 +345,7 @@ func (h *Handler) tryClaimOpen(ctx context.Context, op *fs.Op) (fs.Result, error
 		if errno != 0 {
 			return fs.Result{}, errno, true
 		}
-		handle := h.register(op.Path, uint64(ino), fh, op.Caller)
+		handle := h.register(op.Path, uint64(ino), fh, op.Flags, op.Caller)
 		attr := &fs.Attr{Kind: fs.KindFile, Nlink: 1}
 		if size, mode, ok := h.opts.Engine.Bridge.LocalView(ino); ok {
 			attr.Size = size
@@ -378,7 +378,7 @@ func (h *Handler) tryClaimOpen(ctx context.Context, op *fs.Op) (fs.Result, error
 		// defensively (fresh files resolve locally).
 		return fs.Result{}, errno, true
 	}
-	handle := h.register(op.Path, ino, fh, op.Caller)
+	handle := h.register(op.Path, ino, fh, op.Flags, op.Caller)
 	return fs.Result{Handle: handle, Attr: &fs.Attr{Kind: fs.KindFile, Mode: mode, Nlink: 1}}, nil, true
 }
 
@@ -585,8 +585,8 @@ func (h *Handler) tryTruncate(ctx context.Context, op *fs.Op, next fs.Next) (fs.
 	return res, err, true
 }
 
-func (h *Handler) register(path string, ino uint64, fh uint64, c fs.Caller) *engineHandle {
-	eh := &engineHandle{plane: h, path: path, ino: meta.Ino(ino), fh: fh, vctx: vfsCtx(c)}
+func (h *Handler) register(path string, ino uint64, fh uint64, flags uint32, c fs.Caller) *engineHandle {
+	eh := &engineHandle{plane: h, path: path, ino: meta.Ino(ino), fh: fh, flags: flags, vctx: vfsCtx(c)}
 	h.mu.Lock()
 	h.handles[path] = append(h.handles[path], eh)
 	h.mu.Unlock()
@@ -599,6 +599,7 @@ type engineHandle struct {
 	path  string
 	ino   meta.Ino
 	fh    uint64
+	flags uint32 // open flags, for re-opening after a writer recovery
 	vctx  vfs.LogContext
 }
 
@@ -646,6 +647,19 @@ func (e *engineHandle) Sync(ctx context.Context) error {
 			return errno // the VFS-level failure still stands
 		}
 		return err
+	}
+	if errno != 0 {
+		// The bridge landed what the community writer recorded as failed:
+		// that writer keeps returning its recorded error forever (v1.4.1
+		// fileWriter.err), so replace the handle with a fresh one — same
+		// inode, same flags — or every later Write/Flush on this descriptor
+		// would keep failing after the reported recovery.
+		e.plane.opts.Engine.VFS.Release(e.vctx, e.ino, e.fh)
+		_, fh, nerr := e.plane.opts.Engine.VFS.Open(e.vctx, e.ino, e.flags)
+		if nerr != 0 {
+			return errno
+		}
+		e.fh = fh
 	}
 	return nil
 }
