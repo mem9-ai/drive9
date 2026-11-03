@@ -72,7 +72,7 @@ func mountFuseImpl(opts *mountFuseOptions) error {
 		// profile name.
 		DisableBuiltinOverlayDefaults: true,
 		AppendLogPatterns:             opts.AppendLogPatterns,
-		ExtentFullMode:                opts.ExtentFullMode,
+		ExtentPaths:                   opts.ExtentPaths,
 		PackPaths:                     opts.PackPaths,
 		UploadConcurrency:             opts.UploadConcurrency,
 		DirCacheMaxEntries:            opts.DirCacheMaxEntries,

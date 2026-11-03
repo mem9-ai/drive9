@@ -12,6 +12,8 @@ import (
 	"github.com/juicedata/juicefs/pkg/vfs"
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/fs"
+	"github.com/mem9-ai/drive9/pkg/pathfilter"
+	"github.com/mem9-ai/drive9/pkg/pathutil"
 )
 
 // Options configures the engine plane.
@@ -25,6 +27,11 @@ type Options struct {
 	// plane, which promotes large images to extent layout at the inline
 	// cutoff.
 	Threshold int64
+	// Patterns are explicit path globs (--extent / the profile [extent]
+	// section; the builtin "extent" profile uses ["*"]): fresh creates of
+	// matching paths ride the engine plane from byte zero even in hybrid
+	// mode.
+	Patterns []string
 	// SyncPolicy is the mount's --durability write policy. "write-sync"
 	// makes every Write remote-durable before returning (engine flush +
 	// bridge commit per write); the other policies commit at Flush/Release
@@ -42,6 +49,10 @@ type Handler struct {
 	mu        sync.Mutex
 	handles   map[string][]*engineHandle
 	pathLocks sync.Map // mount-local path -> *sync.Mutex
+
+	// patterns (compiled once from opts.Patterns) — explicit
+	// --extent /[extent] routing for fresh creates.
+	patterns []pathfilter.Pattern
 }
 
 // New builds the engine-plane handler.
@@ -251,16 +262,18 @@ func (h *Handler) tryClaimOpen(ctx context.Context, op *fs.Op) (fs.Result, error
 	if h.opts.Engine == nil {
 		return fs.Result{}, nil, false
 	}
+	// Serialized against retention for this name (unlink or rename-over):
+	// a claim straddling a retention boundary would attach a descriptor
+	// for the retained file onto the replaceable name. The layout decision
+	// is (re)made under the lock too — the file at the name may have been
+	// replaced while this claim waited, and a classic replacement must
+	// pass through to the classic plane, never ride the engine.
+	defer h.lockPaths(op.Path)()
 	st, err := h.opts.Engine.Bridge.StatLocal(ctx, op.Path)
 	if err == nil {
 		if st.ContentLayout != client.ContentLayoutExtent {
 			return fs.Result{}, nil, false
 		}
-		// Serialized against retention for this name (unlink or
-		// rename-over): a claim straddling a retention boundary would
-		// attach a descriptor for the retained file onto the replaceable
-		// name.
-		defer h.lockPaths(op.Path)()
 		ino, errno := h.opts.Engine.ResolvePath(ctx, op.Path)
 		if errno != 0 {
 			return fs.Result{}, errno, false
@@ -275,11 +288,12 @@ func (h *Handler) tryClaimOpen(ctx context.Context, op *fs.Op) (fs.Result, error
 	if !client.IsNotFound(err) {
 		return fs.Result{}, nil, false
 	}
-	// Fresh path: claim only in full JuiceFS mode, and only for creates.
-	if h.opts.Threshold != 0 || op.Flags&syscall.O_CREAT == 0 {
+	// Fresh path: claim creates in full JuiceJS mode, or when the path
+	// matches an explicit --extent / [extent] pattern; otherwise creation
+	// stays on the classic plane (hybrid promotion).
+	if op.Flags&syscall.O_CREAT == 0 || (h.opts.Threshold != 0 && !h.claimsPattern(op.Path)) {
 		return fs.Result{}, nil, false
 	}
-	defer h.lockPaths(op.Path)()
 	parent, name := SplitParent(op.Path)
 	parentIno, errno := h.opts.Engine.ResolvePath(ctx, parent)
 	if errno != 0 {
@@ -303,6 +317,28 @@ func (h *Handler) tryClaimOpen(ctx context.Context, op *fs.Op) (fs.Result, error
 	return fs.Result{Handle: handle}, nil, true
 }
 
+// claimsPattern reports whether a fresh create of the path is explicitly
+// routed to the engine plane (--extent / the profile [extent] section).
+func (h *Handler) claimsPattern(path string) bool {
+	if len(h.opts.Patterns) == 0 {
+		return false
+	}
+	if h.patterns == nil {
+		h.patterns = pathfilter.CompileAll(h.opts.Patterns)
+	}
+	cleaned, err := pathutil.Canonicalize(path)
+	if err != nil {
+		return false
+	}
+	cleaned = strings.TrimPrefix(cleaned, "/")
+	for _, p := range h.patterns {
+		if p.MatchCanonical(cleaned) {
+			return true
+		}
+	}
+	return false
+}
+
 // tryRenameOverOpen preserves an OPEN engine file that a rename is about
 // to replace. The server's rename overwrites the destination object while
 // the displaced descriptors keep addressing the name, so their next commit
@@ -322,20 +358,29 @@ func (h *Handler) tryRenameOverOpen(ctx context.Context, op *fs.Op, next fs.Next
 	if h.opts.Engine == nil || op.Path2 == "" || op.Path2 == op.Path {
 		return fs.Result{}, nil, false
 	}
-	h.mu.Lock()
-	_, destOpen := h.handles[op.Path2]
-	h.mu.Unlock()
-	if !destOpen {
-		return fs.Result{}, nil, false
-	}
 	// Serialized against concurrent claims, truncates, unlinks and other
-	// renames touching either name, across the retention, the chain call
-	// and the outcome resolution.
+	// renames touching either name, across the whole operation INCLUDING
+	// the destination-open check: an Open that starts while the rename is
+	// pending must not register a descriptor on the destination before the
+	// replacement lands — taken before the check, the lock holds for the
+	// no-open-destination branch too, so that Open waits for the outcome.
 	defer h.lockPaths(op.Path, op.Path2)()
 	br := h.opts.Engine.Bridge
 	// The source's identity, to recognize a rename that committed without
 	// a response.
 	srcID := resourceIDOf(ctx, br, op.Path)
+	h.mu.Lock()
+	_, destOpen := h.handles[op.Path2]
+	h.mu.Unlock()
+	if !destOpen {
+		// No handle to protect, but the lock must still cover the chain's
+		// rename itself: an Open of the destination starting now waits for
+		// the outcome instead of registering a descriptor on the name
+		// about to be replaced. (Returning "not handled" would drop the
+		// lock before the chain runs.)
+		res, nerr := next(ctx, op)
+		return res, nerr, true
+	}
 	sentinel, err := br.RetainOpenAlias(op.Path2)
 	if err != nil {
 		// Retention failed: refuse the rename rather than risk the open

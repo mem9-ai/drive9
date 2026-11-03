@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,8 +12,12 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
+
+	"github.com/juicedata/juicefs/pkg/meta"
 
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/fs"
@@ -617,5 +622,1826 @@ func TestEngineTruncateIntercepted(t *testing.T) {
 	}
 	if size, _ := h.opts.Engine.LocalAttr(context.Background(), "/big.bin"); size != 8192 {
 		t.Fatalf("local size = %d, want 8192", size)
+	}
+}
+
+// Round-15 P1: the serialization must hold for the no-open-destination
+// branch too. With NO descriptor on /b, an Open of /b started while
+// mv /a /b is pending must wait for the outcome instead of registering a
+// B descriptor on the replaceable name; after the rename it opens A.
+func TestOpenDuringNoHandleRenameWaitsForOutcome(t *testing.T) {
+	f := newFakeV2(t)
+	f.seedExtent(t, "/a", "AAAA")
+	f.seedExtent(t, "/b", "BBBBBBBB")
+	h := newTestHandler(t, f, 1<<20)
+
+	blocked, release := make(chan struct{}), make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- renameWith(h, "/a", "/b", func(ctx context.Context, op *fs.Op) (fs.Result, error) {
+			close(blocked)
+			<-release
+			f.rename(t, op.Path, op.Path2)
+			return fs.Result{}, nil
+		})
+	}()
+	select {
+	case <-blocked:
+	case <-time.After(10 * time.Second):
+		t.Fatal("rename never reached the chain")
+	}
+
+	type openResult struct {
+		eh  *engineHandle
+		err error
+	}
+	opened := make(chan openResult, 1)
+	go func() {
+		res, err, passed := dispatchCreate(context.Background(), h, "/b", syscall.O_RDWR)
+		if err != nil || passed {
+			opened <- openResult{nil, fmt.Errorf("claim /b: err=%v passed=%v", err, passed)}
+			return
+		}
+		eh, ok := res.Handle.(*engineHandle)
+		if !ok {
+			opened <- openResult{nil, fmt.Errorf("handle type = %T", res.Handle)}
+			return
+		}
+		opened <- openResult{eh, nil}
+	}()
+	select {
+	case r := <-opened:
+		t.Fatalf("open of the destination completed during a rename that held no handle: %+v", r)
+	case <-time.After(300 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("rename: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("rename did not finish")
+	}
+	renameEvent(h, "/a", "/b")
+
+	var later openResult
+	select {
+	case later = <-opened:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the pending open never completed after the rename resolved")
+	}
+	if later.err != nil {
+		t.Fatal(later.err)
+	}
+	// The open now sees A at /b: its write lands on A's object.
+	if err := later.eh.Write(context.Background(), 0, []byte("ZZZZ")); err != nil {
+		t.Fatal(err)
+	}
+	if err := later.eh.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.contentOf("/b"); got != "ZZZZ" {
+		t.Fatalf("/b = %q after the opened descriptor's write, want ZZZZ (A's object)", got)
+	}
+}
+
+// Round-15 P2: a claim that waited for a rename must decide layout AFTER
+// the wait: replacing the destination with a CLASSIC file leaves the
+// waiting Open routed to the classic plane, never the engine.
+func TestWaitingOpenUsesPostRenameLayout(t *testing.T) {
+	f := newFakeV2(t)
+	f.mu.Lock()
+	f.classic["/a"] = "CLASSIC-CLASSIC"
+	f.nextID++
+	f.ids["/a"] = "classic-a"
+	f.mu.Unlock()
+	f.seedExtent(t, "/b", "BBBBBBBB")
+	h := newTestHandler(t, f, 1<<20)
+	ehB := claimOpen(t, h, "/b")
+
+	blocked, release := make(chan struct{}), make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- renameWith(h, "/a", "/b", func(ctx context.Context, op *fs.Op) (fs.Result, error) {
+			close(blocked)
+			<-release
+			f.rename(t, op.Path, op.Path2)
+			return fs.Result{}, nil
+		})
+	}()
+	select {
+	case <-blocked:
+	case <-time.After(10 * time.Second):
+		t.Fatal("rename never reached the chain")
+	}
+
+	type openResult struct {
+		passed bool
+		err    error
+	}
+	opened := make(chan openResult, 1)
+	go func() {
+		_, err, passed := dispatchCreate(context.Background(), h, "/b", syscall.O_RDWR)
+		opened <- openResult{passed, err}
+	}()
+	select {
+	case r := <-opened:
+		t.Fatalf("open of the destination completed during the pending rename: %+v", r)
+	case <-time.After(300 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("rename: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("rename did not finish")
+	}
+	renameEvent(h, "/a", "/b")
+
+	select {
+	case r := <-opened:
+		if r.err != nil {
+			t.Fatal(r.err)
+		}
+		if !r.passed {
+			t.Fatal("the waiting open returned an ENGINE handle for a classic file")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the pending open never completed after the rename resolved")
+	}
+	// The displaced extent descriptor keeps its alias semantics.
+	if ehB.path == "/b" {
+		t.Fatal("the displaced extent descriptor was left on the replaced name")
+	}
+	if got := f.contentOf(h.opts.Engine.Bridge.fullPath(ehB.path)); got != "BBBBBBBB" {
+		t.Fatalf("displaced object = %q, want BBBBBBBB", got)
+	}
+}
+
+// --extent / [extent] patterns claim matching fresh creates even in hybrid
+// mode; unmatched paths keep the classic promotion flow.
+func TestExtentPatternsClaimFreshCreates(t *testing.T) {
+	f := newFakeV2(t)
+	f.setDir("/big", true)
+	h := newTestHandler(t, f, 1<<20)
+	h.opts.Patterns = []string{"/big/*"}
+
+	res, err, passed := dispatchCreate(context.Background(), h, "/big/new.bin", syscall.O_RDWR|syscall.O_CREAT)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if passed {
+		t.Fatal("a pattern-matched create must be claimed by the engine plane")
+	}
+	if _, ok := res.Handle.(*engineHandle); !ok {
+		t.Fatalf("matched create handle type = %T, want *engineHandle", res.Handle)
+	}
+	if _, err2, passed2 := dispatchCreate(context.Background(), h, "/elsewhere.bin", syscall.O_RDWR|syscall.O_CREAT); err2 != nil || !passed2 {
+		t.Fatalf("unmatched create: err=%v passed=%v, want the classic plane", err2, passed2)
+	}
+}
+
+// --------------------------------------------------------------------------
+// merged from review_round2_test.go
+// --------------------------------------------------------------------------
+// ---- Fix A regression: multi-block backing objects read the right 4 MiB ----
+
+func TestObjectGetUsesBlockIndex(t *testing.T) {
+	b := NewBridge(Config{Client: client.New("http://127.0.0.1:1", ""), RemoteRoot: "/"})
+	// Stage an 8 MiB slice object: first half 'A', second half 'B'.
+	const half = 4 << 20
+	obj := make([]byte, 2*half)
+	for i := 0; i < half; i++ {
+		obj[i] = 'A'
+		obj[half+i] = 'B'
+	}
+	sl := &stagedSlice{total: int64(len(obj)), blocks: make(map[int64][]byte)}
+	sl.blocks[0] = obj[:half]
+	sl.blocks[1] = obj[half:]
+	const sliceID = uint64(1 << 63)
+	b.mu.Lock()
+	b.stagedSlices[sliceID] = sl
+	b.mu.Unlock()
+
+	s := objectStorage{bridge: b}
+	// The chunk store reads block index 1 with an offset of 0 within that
+	// block — that must land in the object's SECOND half.
+	rc, err := s.Get(context.Background(), fmt.Sprintf("chunks/0/%d/%d_1_%d", sliceID/1000, sliceID, half), 0, 16, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 16)
+	_, _ = rc.Read(buf)
+	_ = rc.Close()
+	if buf[0] != 'B' {
+		t.Fatalf("block 1 read returned %q (object offset 0) — the block index is being ignored", string(buf))
+	}
+}
+
+// ---- Fix B regression: Read merges plan continuations ----
+
+func TestReadMergesPlanContinuations(t *testing.T) {
+	var pages int
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("X-Dat9-Content-Layout", "extent")
+			w.WriteHeader(200)
+		default:
+			w.Header().Set("X-Dat9-Content-Layout", "extent")
+			w.WriteHeader(http.StatusPartialContent)
+			if pages == 0 {
+				pages++
+				_ = json.NewEncoder(w).Encode(client.ExtentReadPlan{
+					Size: 3 << 20, Revision: 4,
+					Blocks: []client.ExtentReadPlanBlock{
+						{FileOffset: 0, Length: 1 << 20, BlockKey: sha256Hex([]byte("aa")), URL: ts.URL + "/obj/aa"},
+					},
+					NextOffset: 1 << 20,
+				})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(client.ExtentReadPlan{
+				Size: 3 << 20, Revision: 4,
+				Blocks: []client.ExtentReadPlanBlock{
+					{FileOffset: 2 << 20, Length: 1 << 20, BlockKey: sha256Hex([]byte("cc")), URL: ts.URL + "/obj/cc"},
+				},
+			})
+		}
+	}))
+	t.Cleanup(ts.Close)
+	b := NewBridge(Config{Client: client.New(ts.URL, ""), RemoteRoot: "/"})
+	var slices []meta.Slice
+	if st := b.Read(meta.Background(), 1, 0, &slices); st != 0 {
+		t.Fatal(st)
+	}
+	if len(slices) != 2 {
+		t.Fatalf("slices = %d, want the continuation merged in (2)", len(slices))
+	}
+	if slices[0].Id == 0 || slices[1].Id == 0 || slices[0].Id == slices[1].Id {
+		t.Fatalf("slice ids = %v", slices)
+	}
+}
+
+// ---- Fix E regression: a failed truncation keeps its pending marker ----
+
+func TestTruncateMarkerSurvivesFailedFlush(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("X-Dat9-Content-Layout", "extent")
+			w.Header().Set("X-Dat9-Revision", "5")
+			w.Header().Set("Content-Length", "4096")
+			w.WriteHeader(200)
+		case http.MethodPatch:
+			http.Error(w, "boom", http.StatusInternalServerError)
+		default:
+			w.Header().Set("X-Dat9-Content-Layout", "extent")
+			w.WriteHeader(http.StatusPartialContent)
+			_ = json.NewEncoder(w).Encode(client.ExtentReadPlan{Size: 4096, Revision: 5})
+		}
+	}))
+	t.Cleanup(ts.Close)
+	b := NewBridge(Config{Client: client.New(ts.URL, ""), RemoteRoot: "/"})
+	ino, errno := b.ResolveLocal(context.Background(), "/t.bin")
+	if errno != 0 {
+		t.Fatal(errno)
+	}
+	if err := b.TruncateLocal(context.Background(), "/t.bin", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.FlushFile(context.Background(), ino); err == nil {
+		t.Fatal("flush should fail while the server rejects the PATCH")
+	}
+	b.mu.Lock()
+	_, stillTracked := b.truncs[ino]
+	b.mu.Unlock()
+	if !stillTracked {
+		t.Fatal("truncate marker dropped on a failed flush — a later flush would report success over stale data")
+	}
+}
+
+// ---- Fix G regression: committed slices release their staged bytes ----
+
+func TestCommitReleasesStagedBytes(t *testing.T) {
+	b := NewBridge(Config{Client: client.New("http://127.0.0.1:1", ""), RemoteRoot: "/"})
+	sum := sha256Hex([]byte("payload"))
+	b.blocks.stageBytes(sum, []byte("payload"))
+	b.blocks.release(sum)
+	if _, ok := b.blocks.stagedBytes(sum); ok {
+		t.Fatal("released block still staged")
+	}
+	// stageBytes is idempotent: a second stage of the same content keeps
+	// the first copy (pointer-stable).
+	d1 := []byte("x")
+	b.blocks.stageBytes(sum, d1)
+	b.blocks.stageBytes(sum, []byte("y"))
+	got, ok := b.blocks.stagedBytes(sum)
+	if !ok || &got[0] != &d1[0] {
+		t.Fatal("stageBytes overwrote the first staged copy")
+	}
+}
+
+// --------------------------------------------------------------------------
+// merged from review_round3_test.go
+// --------------------------------------------------------------------------
+// Round-3 fix 5: a page whose cursor does not advance must error, not spin.
+
+func TestReadRejectsNonAdvancingContinuation(t *testing.T) {
+	var calls int32
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("X-Dat9-Content-Layout", "extent")
+			w.WriteHeader(200)
+		default:
+			atomic.AddInt32(&calls, 1)
+			w.Header().Set("X-Dat9-Content-Layout", "extent")
+			w.WriteHeader(http.StatusPartialContent)
+			_ = json.NewEncoder(w).Encode(client.ExtentReadPlan{
+				Size: 3 << 20, Revision: 1,
+				Blocks: []client.ExtentReadPlanBlock{
+					{FileOffset: 0, Length: 1 << 20, BlockKey: sha256Hex([]byte("a")), URL: ts.URL + "/obj/a"},
+				},
+				NextOffset: 1 << 20,
+			})
+		}
+	}))
+	t.Cleanup(ts.Close)
+	b := NewBridge(Config{Client: client.New(ts.URL, ""), RemoteRoot: "/"})
+	var slices []meta.Slice
+	if st := b.Read(meta.Background(), 1, 0, &slices); st == 0 {
+		t.Fatal("non-advancing continuation must fail, not publish")
+	}
+	if atomic.LoadInt32(&calls) > 4 {
+		t.Fatalf("server hammered %d times — the loop did not bound retries", calls)
+	}
+}
+
+// Round-3 fix 6: budget exhaustion must error, not zero-fill the tail.
+
+func TestReadRejectsBudgetExhaustion(t *testing.T) {
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("X-Dat9-Content-Layout", "extent")
+			w.WriteHeader(200)
+		default:
+			w.Header().Set("X-Dat9-Content-Layout", "extent")
+			w.WriteHeader(http.StatusPartialContent)
+			_ = json.NewEncoder(w).Encode(client.ExtentReadPlan{
+				Size: 3 << 20, Revision: 1,
+				Blocks: []client.ExtentReadPlanBlock{
+					{FileOffset: 0, Length: 1 << 20, BlockKey: sha256Hex([]byte("a")), URL: ts.URL + "/obj/a"},
+				},
+				NextOffset: 1 << 20,
+			})
+		}
+	}))
+	t.Cleanup(ts.Close)
+	b := NewBridge(Config{Client: client.New(ts.URL, ""), RemoteRoot: "/"})
+	saved := maxPlanBlocksPerChunk
+	maxPlanBlocksPerChunk = 1
+	defer func() { maxPlanBlocksPerChunk = saved }()
+	var slices []meta.Slice
+	if st := b.Read(meta.Background(), 1, 0, &slices); st == 0 {
+		t.Fatal("budget exhaustion must fail instead of publishing partial coverage")
+	}
+}
+
+// Round-3 fix 1: rename rides EventWrite with RenamedTo; the trailing
+
+// plain EventDelete must not clobber the retargeted handles.
+
+func TestRenameEventRetargetsHandles(t *testing.T) {
+	f := newFakeV2(t)
+	f.seedExtent(t, "/big.bin", "AAAA-EXTENT")
+	h := newTestHandler(t, f, 1<<20)
+	res, err, passed := dispatchCreate(context.Background(), h, "/big.bin", 2 /* O_RDWR */)
+	if err != nil || passed {
+		t.Fatalf("claim failed: %v passed=%v", err, passed)
+	}
+	eh := res.Handle.(*engineHandle)
+	h.opts.Events.Emit(fs.Event{Kind: fs.EventWrite, Path: "/big.bin", RenamedTo: "/moved.bin"})
+	h.opts.Events.Emit(fs.Event{Kind: fs.EventDelete, Path: "/big.bin"})
+	h.mu.Lock()
+	_, openOld := h.handles["/big.bin"]
+	list, openNew := h.handles["/moved.bin"]
+	h.mu.Unlock()
+	if openOld || !openNew || len(list) != 1 || list[0] != eh || eh.path != "/moved.bin" {
+		t.Fatalf("rename retarget failed: old=%v new=%v handle-path=%q", openOld, openNew, eh.path)
+	}
+	if got := h.opts.Engine.Bridge.PathsOf("/moved.bin"); got == "" {
+		t.Fatal("bridge mapping did not follow the rename")
+	}
+}
+
+// Round-3 fix 3: a checksum shared by two pending commits is not released
+
+// until the last referencing commit lands.
+
+func TestSharedChecksumSurvivesSiblingCommit(t *testing.T) {
+	b := NewBridge(Config{Client: client.New("http://127.0.0.1:1", ""), RemoteRoot: "/"})
+	sum := sha256Hex([]byte("shared"))
+	b.blocks.stageBytes(sum, []byte("shared"))
+	inoA, inoB := meta.Ino(101), meta.Ino(102)
+	w := pendingWrite{chunk: 0, off: 0, checksum: sum, size: 5}
+	b.mu.Lock()
+	b.pending[inoA] = []pendingWrite{w}
+	b.pending[inoB] = []pendingWrite{w}
+	b.mu.Unlock()
+	b.releaseCommitted(inoA, []pendingWrite{w})
+	if _, ok := b.blocks.stagedBytes(sum); !ok {
+		t.Fatal("sibling pending commit lost its staged bytes")
+	}
+	// Mirror the commit path: each ino's pending entry is deleted before
+	// its release (commit deletes pending[ino], then calls
+	// releaseCommitted). The last referencing commit now finds refs==0.
+	b.mu.Lock()
+	delete(b.pending, inoA)
+	delete(b.pending, inoB)
+	b.mu.Unlock()
+	b.releaseCommitted(inoB, []pendingWrite{w})
+	if _, ok := b.blocks.stagedBytes(sum); ok {
+		t.Fatal("bytes leaked after the last referencing commit")
+	}
+}
+
+// --------------------------------------------------------------------------
+// merged from review_round7_test.go
+// --------------------------------------------------------------------------
+// claimOpen claims an existing extent file through the plane and returns
+
+// its engine handle.
+
+func claimOpen(t *testing.T, h *Handler, path string) *engineHandle {
+	t.Helper()
+	res, err, passed := dispatchCreate(context.Background(), h, path, syscall.O_RDWR)
+	if err != nil || passed {
+		t.Fatalf("claim %s: err=%v passed=%v", path, err, passed)
+	}
+	eh, ok := res.Handle.(*engineHandle)
+	if !ok {
+		t.Fatalf("claim %s: handle type = %T", path, res.Handle)
+	}
+	return eh
+}
+
+// renameEvent replays what pkg/fuse emits for a rename: EventWrite on the
+
+// OLD name with RenamedTo, then a plain EventDelete for the old name.
+
+func renameEvent(h *Handler, from, to string) {
+	h.opts.Events.Emit(fs.Event{Kind: fs.EventWrite, Path: from, RenamedTo: to})
+	h.opts.Events.Emit(fs.Event{Kind: fs.EventDelete, Path: from})
+}
+
+// unlinkOpen drives OpUnlink through the plane for a path with live
+
+// handles; the classic chain must never see it.
+
+func unlinkOpen(t *testing.T, h *Handler, path string) {
+	t.Helper()
+	passed := false
+	_, err := h.Do(context.Background(), &fs.Op{Kind: fs.OpUnlink, Path: path, Caller: fs.Caller{Pid: 1}}, fs.Next(func(ctx context.Context, op *fs.Op) (fs.Result, error) {
+		passed = true
+		return fs.Result{}, nil
+	}))
+	if err != nil {
+		t.Fatalf("unlink %s: %v", path, err)
+	}
+	if passed {
+		t.Fatalf("unlink %s with live handles reached the classic plane", path)
+	}
+}
+
+func readFront(t *testing.T, eh *engineHandle, n int) string {
+	t.Helper()
+	buf := make([]byte, n)
+	got, err := eh.Read(context.Background(), 0, buf)
+	if err != nil {
+		t.Fatalf("read %s: %v", eh.path, err)
+	}
+	return string(buf[:got])
+}
+
+// Round-7 P1: renaming a REPLACEMENT again must retarget the replacement,
+
+// not the unrelated original inode whose pathname hash it reused. Open A
+
+// at /a, rename it to /b, open the new incarnation B at /a (synthetic key
+
+// H), then rename B to /c while A stays open: A keeps committing to /b.
+
+func TestSecondRenameKeepsOriginalIncarnation(t *testing.T) {
+	f := newFakeV2(t)
+	f.seedExtent(t, "/a", "AAAA")
+	h := newTestHandler(t, f, 1<<20)
+	b := h.opts.Engine.Bridge
+	ehA := claimOpen(t, h, "/a")
+
+	f.rename(t, "/a", "/b")
+	renameEvent(h, "/a", "/b")
+
+	f.seedExtent(t, "/a", "BBBB") // another client's new incarnation at /a
+	ehB := claimOpen(t, h, "/a")
+	if ehB.ino == ehA.ino {
+		t.Fatalf("replacement reused the original inode %d", ehA.ino)
+	}
+
+	f.rename(t, "/a", "/c")
+	renameEvent(h, "/a", "/c")
+
+	b.mu.Lock()
+	pathA, pathB := b.paths[ehA.ino], b.paths[ehB.ino]
+	repC, hasC := b.replacements["/c"]
+	_, staleA := b.replacements["/a"]
+	b.mu.Unlock()
+	if pathA != "/b" {
+		t.Fatalf("original inode retargeted by the replacement's rename: paths[A]=%q, want /b", pathA)
+	}
+	if pathB != "/c" || !hasC || repC != ehB.ino || staleA {
+		t.Fatalf("replacement did not follow its rename: paths[B]=%q replacements[/c]=(%d,%v) stale[/a]=%v", pathB, repC, hasC, staleA)
+	}
+	if ehA.path != "/b" || ehB.path != "/c" {
+		t.Fatalf("handle paths A=%q B=%q, want /b and /c", ehA.path, ehB.path)
+	}
+	// The behavioral proof: a write through A's descriptor commits to /b,
+	// never to B's /c.
+	if err := ehA.Write(context.Background(), 0, []byte("ZZZZ")); err != nil {
+		t.Fatal(err)
+	}
+	if err := ehA.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	patched := append([]string(nil), f.patchPaths...)
+	f.mu.Unlock()
+	if len(patched) == 0 {
+		t.Fatal("sync through A committed nothing")
+	}
+	for _, p := range patched {
+		if p != "/b" {
+			t.Fatalf("A's commit targeted %q (B's object), want /b", p)
+		}
+	}
+}
+
+// Round-7 P1: two simultaneously open, unlinked generations of one
+
+// pathname must retain DISTINCT sentinel objects — the server's rename
+
+// replaces an existing target, so a shared name would overwrite the first
+
+// retained file while it is still open.
+
+func TestDeletedOpenGenerationsKeepDistinctSentinels(t *testing.T) {
+	f := newFakeV2(t)
+	f.seedExtent(t, "/a", "AAAA")
+	h := newTestHandler(t, f, 1<<20)
+	b := h.opts.Engine.Bridge
+	ehA := claimOpen(t, h, "/a")
+	unlinkOpen(t, h, "/a")
+	sentinelA := ehA.path
+	if sentinelA == "/a" {
+		t.Fatal("unlink with a live handle did not silly-rename")
+	}
+
+	f.seedExtent(t, "/a", "BBBB") // recreate + commit the next generation
+	ehB := claimOpen(t, h, "/a")
+	unlinkOpen(t, h, "/a")
+	sentinelB := ehB.path
+	if sentinelB == "/a" || sentinelB == sentinelA {
+		t.Fatalf("second generation sentinel %q collides with the first %q", sentinelB, sentinelA)
+	}
+	if got := f.contentOf(b.fullPath(sentinelA)); got != "AAAA" {
+		t.Fatalf("first retained object overwritten by the second retention: %q", got)
+	}
+	if got := f.contentOf(b.fullPath(sentinelB)); got != "BBBB" {
+		t.Fatalf("second retained object = %q, want BBBB", got)
+	}
+	if got := readFront(t, ehA, 16); got != "AAAA" {
+		t.Fatalf("A reads %q after B's retention, want AAAA", got)
+	}
+	if got := readFront(t, ehB, 16); got != "BBBB" {
+		t.Fatalf("B reads %q, want BBBB", got)
+	}
+	// B's last close drops ONLY B's sentinel; A stays readable until its
+	// own last close.
+	if err := ehB.Release(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.contentOf(b.fullPath(sentinelB)); got != "" {
+		t.Fatalf("B's sentinel survived its last close: %q", got)
+	}
+	if got := f.contentOf(b.fullPath(sentinelA)); got != "AAAA" {
+		t.Fatalf("A's retained object lost with B's close: %q", got)
+	}
+	if got := readFront(t, ehA, 16); got != "AAAA" {
+		t.Fatalf("A reads %q after B closed, want AAAA", got)
+	}
+	if err := ehA.Release(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.contentOf(b.fullPath(sentinelA)); got != "" {
+		t.Fatalf("A's sentinel survived its last close: %q", got)
+	}
+	b.mu.Lock()
+	left := len(b.sentinels)
+	b.mu.Unlock()
+	if left != 0 {
+		t.Fatalf("%d sentinel registrations leaked", left)
+	}
+}
+
+// Round-7 P2: the size overlay must read the LIVE incarnation. After the
+
+// 8-byte original is renamed away and a 4-byte replacement is opened at
+
+// the old name, GetAttr on that name must not inherit the original's
+
+// length.
+
+func TestGetAttrOverlayReadsReplacementIncarnation(t *testing.T) {
+	f := newFakeV2(t)
+	f.seedExtent(t, "/a", "AAAAAAAA")
+	h := newTestHandler(t, f, 1<<20)
+	b := h.opts.Engine.Bridge
+	ehA := claimOpen(t, h, "/a")
+	f.rename(t, "/a", "/b")
+	renameEvent(h, "/a", "/b")
+
+	f.seedExtent(t, "/a", "BBBB")
+	ehB := claimOpen(t, h, "/a")
+	if ehB.ino == ehA.ino {
+		t.Fatalf("replacement reused the original inode %d", ehA.ino)
+	}
+	if size, ok := b.LocalSizeOf("/a"); !ok || size != 4 {
+		t.Fatalf("LocalSizeOf(/a) = (%d,%v), want the replacement's 4", size, ok)
+	}
+	if size, ok := b.LocalSizeOf("/b"); !ok || size != 8 {
+		t.Fatalf("LocalSizeOf(/b) = (%d,%v), want the original's 8", size, ok)
+	}
+	res, err := h.Do(context.Background(), &fs.Op{Kind: fs.OpGetAttr, Path: "/a", Caller: fs.Caller{Pid: 1}}, fs.Next(func(ctx context.Context, op *fs.Op) (fs.Result, error) {
+		return fs.Result{Attr: &fs.Attr{Size: 4}}, nil
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Attr == nil || res.Attr.Size != 4 {
+		t.Fatalf("GetAttr(/a) published %+v, want the replacement's size 4", res.Attr)
+	}
+}
+
+// Round-7 P2: concurrent first resolutions of one replacement incarnation
+
+// must converge on a single synthetic inode — JuiceFS keys reader/writer
+
+// state and invalidation by inode, so two keys for one file would let one
+
+// handle keep stale bytes after a write through the other.
+
+func TestConcurrentResolveLocalConvergesOnOneInode(t *testing.T) {
+	f := newFakeV2(t)
+	f.seedExtent(t, "/a", "AAAA")
+	b := newTestHandler(t, f, 1<<20).opts.Engine.Bridge
+	orig, errno := b.ResolveLocal(context.Background(), "/a")
+	if errno != 0 {
+		t.Fatal(errno)
+	}
+	f.rename(t, "/a", "/b")
+	b.RemapLocal("/a", "/b")      // the original moved away: /a's hash is held
+	f.seedExtent(t, "/a", "BBBB") // another client created a new /a
+
+	const n = 32
+	var (
+		start = make(chan struct{})
+		wg    sync.WaitGroup
+		mu    sync.Mutex
+		seen  = map[meta.Ino]int{}
+	)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			ino, errno := b.ResolveLocal(context.Background(), "/a")
+			mu.Lock()
+			defer mu.Unlock()
+			if errno != 0 {
+				seen[0]++
+				return
+			}
+			seen[ino]++
+		}()
+	}
+	close(start)
+	wg.Wait()
+	if len(seen) != 1 {
+		t.Fatalf("concurrent resolutions published %d distinct inodes: %v", len(seen), seen)
+	}
+	for ino := range seen {
+		if ino == 0 || ino == orig {
+			t.Fatalf("replacement resolved to %d (original %d)", ino, orig)
+		}
+		b.mu.Lock()
+		rep := b.replacements["/a"]
+		b.mu.Unlock()
+		if rep != ino {
+			t.Fatalf("published inode %d but the replacement map says %d", ino, rep)
+		}
+	}
+}
+
+// --------------------------------------------------------------------------
+// merged from review_round8_test.go
+// --------------------------------------------------------------------------
+// Round-8 P1: a directory rename arrives as ONE event; open descendants
+
+// must follow it in the handler AND the bridge, so a later create at the
+
+// old child pathname (full mode) gets its own inode instead of the
+
+// retained descriptor's — and the retained descriptor keeps committing to
+
+// its moved name.
+
+func TestDirectoryRenameKeepsOpenDescendantIdentity(t *testing.T) {
+	f := newFakeV2(t)
+	f.setDir("/d", true)
+	f.seedExtent(t, "/d/a", "AAAA")
+	h := newTestHandler(t, f, 0) // full mode: fresh creates ride the engine
+	b := h.opts.Engine.Bridge
+	ehA := claimOpen(t, h, "/d/a")
+
+	// mv /d /e server-side, reported as one directory rename event.
+	f.rename(t, "/d/a", "/e/a")
+	f.setDir("/d", false)
+	f.setDir("/e", true)
+	renameEvent(h, "/d", "/e")
+	if ehA.path != "/e/a" {
+		t.Fatalf("open descendant did not follow the directory rename: %q", ehA.path)
+	}
+	b.mu.Lock()
+	pathA := b.paths[ehA.ino]
+	b.mu.Unlock()
+	if pathA != "/e/a" {
+		t.Fatalf("bridge mapping for A = %q, want /e/a", pathA)
+	}
+
+	// mkdir /d; create B at /d/a while A stays open.
+	f.setDir("/d", true)
+	res, err, passed := dispatchCreate(context.Background(), h, "/d/a", syscall.O_RDWR|syscall.O_CREAT)
+	if err != nil || passed {
+		t.Fatalf("full-mode create: err=%v passed=%v", err, passed)
+	}
+	ehB := res.Handle.(*engineHandle)
+	if ehB.ino == ehA.ino {
+		t.Fatalf("B reused the retained descendant's inode %d", ehA.ino)
+	}
+	b.mu.Lock()
+	pathA, pathB := b.paths[ehA.ino], b.paths[ehB.ino]
+	b.mu.Unlock()
+	if pathA != "/e/a" || pathB != "/d/a" {
+		t.Fatalf("mappings A=%q B=%q, want /e/a and /d/a", pathA, pathB)
+	}
+	// A's write still lands on /e/a, never on B.
+	if err := ehA.Write(context.Background(), 0, []byte("ZZZZ")); err != nil {
+		t.Fatal(err)
+	}
+	if err := ehA.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	patched := append([]string(nil), f.patchPaths...)
+	f.mu.Unlock()
+	if len(patched) == 0 {
+		t.Fatal("sync through A committed nothing")
+	}
+	for _, p := range patched {
+		if p != "/e/a" {
+			t.Fatalf("A's commit targeted %q, want /e/a", p)
+		}
+	}
+	if got := f.contentOf("/e/a"); got != "ZZZZ" {
+		t.Fatalf("/e/a = %q after A's write, want ZZZZ", got)
+	}
+}
+
+// Round-8 P2: reopening a migrated replacement at its NEW name must return
+
+// the same inode its open descriptor uses — JuiceFS invalidates readers per
+
+// inode, so a second key would leave one handle's cache stale after a
+
+// write through the other.
+
+func TestReopenOfMigratedReplacementSharesInode(t *testing.T) {
+	f := newFakeV2(t)
+	f.seedExtent(t, "/a", "AAAA")
+	h := newTestHandler(t, f, 1<<20)
+	claimOpen(t, h, "/a") // A stays open throughout
+	f.rename(t, "/a", "/b")
+	renameEvent(h, "/a", "/b")
+	f.seedExtent(t, "/a", "BBBB")
+	ehB := claimOpen(t, h, "/a") // the replacement incarnation
+	f.rename(t, "/a", "/c")
+	renameEvent(h, "/a", "/c")
+
+	ehC := claimOpen(t, h, "/c")
+	if ehC.ino != ehB.ino {
+		t.Fatalf("reopen of /c resolved inode %d, want the migrated replacement's %d", ehC.ino, ehB.ino)
+	}
+	// Read-cache coherence: populate C's reader, write through B, read C.
+	if got := readFront(t, ehC, 16); got != "BBBB" {
+		t.Fatalf("C reads %q before the write, want BBBB", got)
+	}
+	if err := ehB.Write(context.Background(), 0, []byte("ZZZZ")); err != nil {
+		t.Fatal(err)
+	}
+	if err := ehB.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.contentOf("/c"); got != "ZZZZ" {
+		t.Fatalf("server content after B's sync = %q, want ZZZZ", got)
+	}
+	if got := readFront(t, ehC, 16); got != "ZZZZ" {
+		t.Fatalf("C reads %q after B's write+sync through the shared inode, want ZZZZ", got)
+	}
+}
+
+// Round-8 P2: a replacement's local state is retired when its last handle
+
+// closes / its name is deleted, so the next incarnation at the same name
+
+// cannot inherit its length — while the original descriptor at the
+
+// renamed-away name stays protected, and a second open of the STILL-LIVE
+
+// replacement keeps reusing its inode.
+
+func TestClosedDeletedReplacementStateRetired(t *testing.T) {
+	f := newFakeV2(t)
+	f.seedExtent(t, "/a", "AAAAAAAA")
+	h := newTestHandler(t, f, 1<<20)
+	b := h.opts.Engine.Bridge
+	ehA := claimOpen(t, h, "/a")
+	f.rename(t, "/a", "/b")
+	renameEvent(h, "/a", "/b")
+
+	f.seedExtent(t, "/a", "BBBBBBBB")
+	ehB := claimOpen(t, h, "/a")
+	ehB2 := claimOpen(t, h, "/a")
+	if ehB2.ino != ehB.ino {
+		t.Fatalf("second open of the live replacement got %d, want %d", ehB2.ino, ehB.ino)
+	}
+	if err := ehB2.Release(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	b.mu.Lock()
+	_, stillOwned := b.replacements["/a"]
+	b.mu.Unlock()
+	if !stillOwned {
+		t.Fatal("closing one of two handles retired the live replacement")
+	}
+	if err := ehB.Release(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	b.mu.Lock()
+	_, owned := b.replacements["/a"]
+	_, sized := b.sizes[ehB.ino]
+	pathA, sizeA := b.paths[ehA.ino], b.sizes[ehA.ino]
+	b.mu.Unlock()
+	if owned || sized {
+		t.Fatalf("closed replacement state survived: owned=%v sized=%v", owned, sized)
+	}
+	if pathA != "/b" || sizeA != 8 {
+		t.Fatalf("original descriptor disturbed: path=%q size=%d", pathA, sizeA)
+	}
+
+	// rm /a, then another client creates a 4-byte C there.
+	f.remove("/a")
+	h.opts.Events.Emit(fs.Event{Kind: fs.EventDelete, Path: "/a"})
+	f.seedExtent(t, "/a", "CCCC")
+	ehC := claimOpen(t, h, "/a")
+	if ehC.ino == ehB.ino {
+		t.Fatalf("new incarnation inherited the retired replacement inode %d", ehB.ino)
+	}
+	if size, ok := b.LocalSizeOf("/a"); !ok || size != 4 {
+		t.Fatalf("LocalSizeOf(/a) = (%d,%v), want 4", size, ok)
+	}
+	res, err := h.Do(context.Background(), &fs.Op{Kind: fs.OpGetAttr, Path: "/a", Caller: fs.Caller{Pid: 1}}, fs.Next(func(ctx context.Context, op *fs.Op) (fs.Result, error) {
+		return fs.Result{Attr: &fs.Attr{Size: 4}}, nil
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Attr == nil || res.Attr.Size != 4 {
+		t.Fatalf("GetAttr(/a) published %+v, want 4", res.Attr)
+	}
+}
+
+// --------------------------------------------------------------------------
+// merged from review_round9_test.go
+// --------------------------------------------------------------------------
+// Round-9 P1: moving another file into a VACATED pathname must not take
+
+// over the hash key still used by the moved-open file that vacated it.
+
+// Open B at /b, rename it to /c (B stays open), open A at /a and rename it
+
+// into the now-empty /b: B keeps committing to /c and keeps its own length;
+
+// A owns /b.
+
+func TestRenameIntoVacatedNameKeepsMovedOpenInode(t *testing.T) {
+	f := newFakeV2(t)
+	f.seedExtent(t, "/a", "AAAA")
+	f.seedExtent(t, "/b", "BBBBBBBB")
+	h := newTestHandler(t, f, 1<<20)
+	b := h.opts.Engine.Bridge
+
+	ehB := claimOpen(t, h, "/b")
+	f.rename(t, "/b", "/c")
+	renameEvent(h, "/b", "/c")
+
+	ehA := claimOpen(t, h, "/a")
+	f.rename(t, "/a", "/b")
+	renameEvent(h, "/a", "/b")
+
+	b.mu.Lock()
+	pathB, sizeB := b.paths[ehB.ino], b.sizes[ehB.ino]
+	pathA := b.paths[ehA.ino]
+	owner, owned := b.replacements["/b"]
+	b.mu.Unlock()
+	if pathB != "/c" || sizeB != 8 {
+		t.Fatalf("moved-open B hijacked by the rename into its vacated name: path=%q size=%d, want /c and 8", pathB, sizeB)
+	}
+	if pathA != "/b" || !owned || owner != ehA.ino {
+		t.Fatalf("A does not own /b: path=%q owner=(%d,%v)", pathA, owner, owned)
+	}
+	if ehA.path != "/b" || ehB.path != "/c" {
+		t.Fatalf("handle paths A=%q B=%q, want /b and /c", ehA.path, ehB.path)
+	}
+	if size, ok := b.LocalSizeOf("/b"); !ok || size != 4 {
+		t.Fatalf("LocalSizeOf(/b) = (%d,%v), want A's 4", size, ok)
+	}
+	// Where the old descriptor's write actually lands: B's commit goes to
+	// /c; A's file at /b is untouched.
+	if err := ehB.Write(context.Background(), 0, []byte("ZZZZ")); err != nil {
+		t.Fatal(err)
+	}
+	if err := ehB.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	patched := append([]string(nil), f.patchPaths...)
+	f.mu.Unlock()
+	if len(patched) == 0 {
+		t.Fatal("sync through B committed nothing")
+	}
+	for _, p := range patched {
+		if p != "/c" {
+			t.Fatalf("B's commit targeted %q (A's file), want /c", p)
+		}
+	}
+	if got := f.contentOf("/c"); got != "ZZZZBBBB" {
+		t.Fatalf("/c = %q after B's write, want ZZZZBBBB", got)
+	}
+	if got := f.contentOf("/b"); got != "AAAA" {
+		t.Fatalf("/b = %q, A's file was modified through B's descriptor", got)
+	}
+	if got := readFront(t, ehA, 16); got != "AAAA" {
+		t.Fatalf("A reads %q, want AAAA", got)
+	}
+}
+
+// --------------------------------------------------------------------------
+// merged from review_round10_test.go
+// --------------------------------------------------------------------------
+// renameThrough drives OpRename through the plane; next models the chain
+
+// performing the server rename (replacing an existing destination like the
+
+// real server) unless told to fail.
+
+func renameThrough(t *testing.T, h *Handler, f *fakeV2, from, to string, fail error) (passed bool, err error) {
+	t.Helper()
+	_, err = h.Do(context.Background(), &fs.Op{Kind: fs.OpRename, Path: from, Path2: to, Caller: fs.Caller{Pid: 1}}, fs.Next(func(ctx context.Context, op *fs.Op) (fs.Result, error) {
+		passed = true
+		if fail != nil {
+			return fs.Result{}, fail
+		}
+		f.rename(t, op.Path, op.Path2)
+		return fs.Result{}, nil
+	}))
+	return passed, err
+}
+
+// hiddenNames lists the sentinel-looking names the fake currently holds.
+
+func hiddenNames(f *fakeV2) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []string
+	for p := range f.extent {
+		if strings.Contains(p, ".d9open-") {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// Round-10 P1: renaming onto a still-open engine file must preserve the
+
+// displaced descriptor's original object. A at /a and B at /b both open;
+
+// mv /a /b: B gains a hardlink alias BEFORE the server replaces /b, so a
+
+// write through B lands on B's retained object and never on A.
+
+func TestRenameOverOpenTargetPreservesDisplacedDescriptor(t *testing.T) {
+	f := newFakeV2(t)
+	f.seedExtent(t, "/a", "AAAA")
+	f.seedExtent(t, "/b", "BBBBBBBB")
+	h := newTestHandler(t, f, 1<<20)
+	b := h.opts.Engine.Bridge
+	ehA := claimOpen(t, h, "/a")
+	ehB := claimOpen(t, h, "/b")
+
+	passed, err := renameThrough(t, h, f, "/a", "/b", nil)
+	if err != nil || !passed {
+		t.Fatalf("rename: err=%v passed=%v", err, passed)
+	}
+	renameEvent(h, "/a", "/b") // the facade's event after the chain's rename
+
+	sentinel := ehB.path
+	if sentinel == "/b" {
+		t.Fatal("displaced open target was not given a retained alias")
+	}
+	if got := f.contentOf(b.fullPath(sentinel)); got != "BBBBBBBB" {
+		t.Fatalf("displaced object = %q, want BBBBBBBB", got)
+	}
+	if got := f.contentOf("/b"); got != "AAAA" {
+		t.Fatalf("/b = %q after the rename, want A's AAAA", got)
+	}
+	h.mu.Lock()
+	atB := append([]*engineHandle(nil), h.handles["/b"]...)
+	h.mu.Unlock()
+	if ehA.path != "/b" || len(atB) != 1 || atB[0] != ehA {
+		t.Fatalf("handles at /b = %d (A at %q), want only A", len(atB), ehA.path)
+	}
+	// A write through the displaced descriptor leaves the new /b unchanged.
+	if err := ehB.Write(context.Background(), 0, []byte("ZZZZ")); err != nil {
+		t.Fatal(err)
+	}
+	if err := ehB.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	patched := append([]string(nil), f.patchPaths...)
+	f.mu.Unlock()
+	if len(patched) == 0 {
+		t.Fatal("sync through B committed nothing")
+	}
+	for _, p := range patched {
+		if p != b.fullPath(sentinel) {
+			t.Fatalf("B's commit targeted %q, want its alias %q", p, b.fullPath(sentinel))
+		}
+	}
+	if got := f.contentOf("/b"); got != "AAAA" {
+		t.Fatalf("/b = %q, the renamed file was modified through the displaced descriptor", got)
+	}
+	if got := readFront(t, ehA, 16); got != "AAAA" {
+		t.Fatalf("A reads %q, want AAAA", got)
+	}
+	if got := readFront(t, ehB, 16); got != "ZZZZBBBB" {
+		t.Fatalf("B reads %q, want ZZZZBBBB", got)
+	}
+	// B's last close drops its alias — the last reference; /b (A) stays.
+	if err := ehB.Release(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.contentOf(b.fullPath(sentinel)); got != "" {
+		t.Fatalf("alias survived B's last close: %q", got)
+	}
+	if got := f.contentOf("/b"); got != "AAAA" {
+		t.Fatalf("/b = %q after B's close, want AAAA", got)
+	}
+}
+
+// Round-10 (round-13 semantics): a rename the chain refuses (nothing
+
+// applied) leaves the displaced file attached to its alias — the file
+
+// never left its name, so the alias shares the object and a write through
+
+// the descriptor is visible at /b — and the alias drops at its own last
+
+// close, leaving /b exactly as it was.
+
+func TestRenameOverOpenTargetFailedRenameKeepsAlias(t *testing.T) {
+	f := newFakeV2(t)
+	f.seedExtent(t, "/a", "AAAA")
+	f.seedExtent(t, "/b", "BBBBBBBB")
+	h := newTestHandler(t, f, 1<<20)
+	b := h.opts.Engine.Bridge
+	claimOpen(t, h, "/a")
+	ehB := claimOpen(t, h, "/b")
+
+	boom := errors.New("rename refused")
+	passed, err := renameThrough(t, h, f, "/a", "/b", boom)
+	if !passed || !errors.Is(err, boom) {
+		t.Fatalf("rename: err=%v passed=%v, want the chain's error", err, passed)
+	}
+	sentinel := ehB.path
+	if sentinel == "/b" {
+		t.Fatal("displaced descriptor was pulled back onto the replaceable name")
+	}
+	if got := f.contentOf("/b"); got != "BBBBBBBB" {
+		t.Fatalf("/b = %q after the failed rename, want BBBBBBBB", got)
+	}
+	if got := f.contentOf("/a"); got != "AAAA" {
+		t.Fatalf("/a = %q, want AAAA", got)
+	}
+	// The alias shares the object: a write through the displaced descriptor
+	// lands on the alias and is the same bytes /b shows.
+	if err := ehB.Write(context.Background(), 0, []byte("ZZZZ")); err != nil {
+		t.Fatal(err)
+	}
+	if err := ehB.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.contentOf(b.fullPath(sentinel)); got != "ZZZZBBBB" {
+		t.Fatalf("alias = %q after B's write, want ZZZZBBBB", got)
+	}
+	if got := f.contentOf("/b"); got != "ZZZZBBBB" {
+		t.Fatalf("/b = %q after B's write (the object is shared), want ZZZZBBBB", got)
+	}
+	// A later descriptor opens the same file through the name; closing the
+	// ORIGINAL descriptor then drops the alias but must not discard B
+	// while the later descriptor is still open (B still holds /b).
+	ehB2 := claimOpen(t, h, "/b")
+	if ehB2.ino == ehB.ino {
+		t.Fatal("the post-failure open reused the retained inode")
+	}
+	if err := ehB.Release(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if left := hiddenNames(f); len(left) != 0 {
+		t.Fatalf("alias left behind after B's close: %v", left)
+	}
+	if got := f.contentOf("/b"); got != "ZZZZBBBB" {
+		t.Fatalf("/b = %q after B's close, want ZZZZBBBB", got)
+	}
+	if got := readFront(t, ehB2, 16); got != "ZZZZBBBB" {
+		t.Fatalf("the later descriptor reads %q, want ZZZZBBBB", got)
+	}
+	if err := ehB2.Write(context.Background(), 0, []byte("YYYY")); err != nil {
+		t.Fatal(err)
+	}
+	if err := ehB2.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.contentOf("/b"); got != "YYYYBBBB" {
+		t.Fatalf("/b = %q after the later descriptor's write, want YYYYBBBB", got)
+	}
+	if reg := registeredSentinels(b); reg != 0 {
+		t.Fatalf("%d registrations left behind", reg)
+	}
+}
+
+// --------------------------------------------------------------------------
+// merged from review_round11_test.go
+// --------------------------------------------------------------------------
+// renameWith drives OpRename through the plane with an arbitrary chain
+
+// continuation.
+
+func renameWith(h *Handler, from, to string, next fs.Next) error {
+	_, err := h.Do(context.Background(), &fs.Op{Kind: fs.OpRename, Path: from, Path2: to, Caller: fs.Caller{Pid: 1}}, next)
+	return err
+}
+
+func registeredSentinels(b *Bridge) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.sentinels)
+}
+
+// Round-11 P1 (retention): the displaced destination must survive its own
+
+// last close while the source rename is still pending. With link-based
+
+// retention the file never leaves its name, so B's last close during the
+
+// window only drops the extra alias; the rename then fails and /b is
+
+// simply still B — nothing was ever at risk of deletion.
+
+func TestRenameOverOpenTargetSurvivesLastCloseDuringRename(t *testing.T) {
+	f := newFakeV2(t)
+	f.seedExtent(t, "/a", "AAAA")
+	f.seedExtent(t, "/b", "BBBBBBBB")
+	h := newTestHandler(t, f, 1<<20)
+	b := h.opts.Engine.Bridge
+	claimOpen(t, h, "/a")
+	ehB := claimOpen(t, h, "/b")
+
+	blocked, release := make(chan struct{}), make(chan struct{})
+	boom := errors.New("server failure")
+	done := make(chan error, 1)
+	go func() {
+		done <- renameWith(h, "/a", "/b", func(ctx context.Context, op *fs.Op) (fs.Result, error) {
+			close(blocked)
+			<-release
+			return fs.Result{}, boom // nothing moved
+		})
+	}()
+	select {
+	case <-blocked:
+	case <-time.After(10 * time.Second):
+		t.Fatal("rename never reached the chain")
+	}
+	sentinel := ehB.path
+	if sentinel == "/b" {
+		t.Fatal("displaced target was not retained before the chain ran")
+	}
+	if got := f.contentOf("/b"); got != "BBBBBBBB" {
+		t.Fatalf("/b = %q during the pending rename, want B still in place", got)
+	}
+	// B's last close while the rename is pending.
+	if err := ehB.Release(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.contentOf("/b"); got != "BBBBBBBB" {
+		t.Fatalf("/b = %q after B's close during the pending rename, want BBBBBBBB", got)
+	}
+	close(release)
+	select {
+	case err := <-done:
+		if !errors.Is(err, boom) {
+			t.Fatalf("rename error = %v, want the chain's", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("rename did not finish")
+	}
+	if got := f.contentOf("/b"); got != "BBBBBBBB" {
+		t.Fatalf("/b = %q after the failed rename, want the original B", got)
+	}
+	if got := f.contentOf("/a"); got != "AAAA" {
+		t.Fatalf("/a = %q, want AAAA", got)
+	}
+	if left := hiddenNames(f); len(left) != 0 {
+		t.Fatalf("aliases left behind: %v", left)
+	}
+	if reg := registeredSentinels(b); reg != 0 {
+		t.Fatalf("%d registrations left behind", reg)
+	}
+}
+
+// Round-11 P1 (rollback): an error from the chain is not proof the rename
+
+// did not commit. Here the server applied mv /a /b and the response was
+
+// lost; the plane must recognize the source at /b by identity and leave it
+
+// — B stays retained at its alias — while following the source's
+
+// descriptors.
+
+func TestRenameOverOpenTargetAppliedThenErrorKeepsSource(t *testing.T) {
+	f := newFakeV2(t)
+	f.seedExtent(t, "/a", "AAAA")
+	f.seedExtent(t, "/b", "BBBBBBBB")
+	h := newTestHandler(t, f, 1<<20)
+	b := h.opts.Engine.Bridge
+	ehA := claimOpen(t, h, "/a")
+	ehB := claimOpen(t, h, "/b")
+
+	lost := errors.New("response lost")
+	err := renameWith(h, "/a", "/b", func(ctx context.Context, op *fs.Op) (fs.Result, error) {
+		f.rename(t, op.Path, op.Path2) // committed server-side...
+		return fs.Result{}, lost       // ...but the client never heard
+	})
+	if !errors.Is(err, lost) {
+		t.Fatalf("rename error = %v, want the chain's", err)
+	}
+	sentinel := ehB.path
+	if got := f.contentOf("/b"); got != "AAAA" {
+		t.Fatalf("/b = %q: the moved source was overwritten (want AAAA)", got)
+	}
+	if got := f.contentOf("/a"); got != "" {
+		t.Fatalf("/a = %q, the source should have moved", got)
+	}
+	if got := f.contentOf(b.fullPath(sentinel)); got != "BBBBBBBB" {
+		t.Fatalf("displaced object = %q, want BBBBBBBB", got)
+	}
+	// The source's descriptors follow where its bytes are.
+	b.mu.Lock()
+	pathA := b.paths[ehA.ino]
+	b.mu.Unlock()
+	if ehA.path != "/b" || pathA != "/b" {
+		t.Fatalf("A not followed to /b: handle %q mapping %q", ehA.path, pathA)
+	}
+	if err := ehA.Write(context.Background(), 0, []byte("ZZZZ")); err != nil {
+		t.Fatal(err)
+	}
+	if err := ehA.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.contentOf("/b"); got != "ZZZZ" {
+		t.Fatalf("/b = %q after A's write, want ZZZZ", got)
+	}
+	if got := f.contentOf(b.fullPath(sentinel)); got != "BBBBBBBB" {
+		t.Fatalf("displaced object = %q after A's write, want BBBBBBBB", got)
+	}
+	// Ordinary rename-over lifecycle: B's last close drops its alias.
+	if err := ehB.Release(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.contentOf(b.fullPath(sentinel)); got != "" {
+		t.Fatalf("alias survived B's last close: %q", got)
+	}
+}
+
+// Round-11 P1 (rollback): a different file at the destination — the name
+
+// was replaced by another client while the rename was failing — is never
+
+// touched; the displaced object stays alive at its alias until its own
+
+// last close (the rename-over lifecycle), since its name is gone.
+
+func TestRenameOverOpenTargetForeignDestinationNeverOverwritten(t *testing.T) {
+	f := newFakeV2(t)
+	f.seedExtent(t, "/a", "AAAA")
+	f.seedExtent(t, "/b", "BBBBBBBB")
+	h := newTestHandler(t, f, 1<<20)
+	b := h.opts.Engine.Bridge
+	claimOpen(t, h, "/a")
+	ehB := claimOpen(t, h, "/b")
+
+	boom := errors.New("server failure")
+	err := renameWith(h, "/a", "/b", func(ctx context.Context, op *fs.Op) (fs.Result, error) {
+		f.seedExtent(t, "/b", "CCCC") // another client replaced the name
+		return fs.Result{}, boom
+	})
+	if !errors.Is(err, boom) {
+		t.Fatalf("rename error = %v, want the chain's", err)
+	}
+	sentinel := ehB.path
+	if got := f.contentOf("/b"); got != "CCCC" {
+		t.Fatalf("/b = %q: another client's file was overwritten (want CCCC)", got)
+	}
+	if got := f.contentOf(b.fullPath(sentinel)); got != "BBBBBBBB" {
+		t.Fatalf("displaced object = %q, want BBBBBBBB", got)
+	}
+	if got := readFront(t, ehB, 16); got != "BBBBBBBB" {
+		t.Fatalf("B reads %q, want BBBBBBBB", got)
+	}
+	if err := ehB.Release(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.contentOf("/b"); got != "CCCC" {
+		t.Fatalf("/b = %q after B's close, want CCCC", got)
+	}
+}
+
+// Round-11 P1 (rollback): when the destination cannot be probed at all the
+
+// outcome is unknown — nothing is written anywhere; the displaced object
+
+// stays alive at its alias until its own last close.
+
+func TestRenameOverOpenTargetUnknownOutcomeKeepsRetention(t *testing.T) {
+	f := newFakeV2(t)
+	f.seedExtent(t, "/a", "AAAA")
+	f.seedExtent(t, "/b", "BBBBBBBB")
+	h := newTestHandler(t, f, 1<<20)
+	b := h.opts.Engine.Bridge
+	claimOpen(t, h, "/a")
+	ehB := claimOpen(t, h, "/b")
+
+	lost := errors.New("response lost")
+	err := renameWith(h, "/a", "/b", func(ctx context.Context, op *fs.Op) (fs.Result, error) {
+		f.rename(t, op.Path, op.Path2)
+		f.setStatFail("/b", true) // the probes cannot reach the destination
+		return fs.Result{}, lost
+	})
+	if !errors.Is(err, lost) {
+		t.Fatalf("rename error = %v, want the chain's", err)
+	}
+	f.setStatFail("/b", false)
+	sentinel := ehB.path
+	if got := f.contentOf("/b"); got != "AAAA" {
+		t.Fatalf("/b = %q: an unestablished destination was touched (want AAAA)", got)
+	}
+	if got := f.contentOf(b.fullPath(sentinel)); got != "BBBBBBBB" {
+		t.Fatalf("displaced object = %q, want BBBBBBBB", got)
+	}
+	if err := ehB.Release(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.contentOf("/b"); got != "AAAA" {
+		t.Fatalf("/b = %q after B's close, want AAAA", got)
+	}
+}
+
+// --------------------------------------------------------------------------
+// merged from review_round12_test.go
+// --------------------------------------------------------------------------
+// Round-12 P1: a file appearing at the destination right after a vacant
+
+// probe must never be destroyed. The rename fails without applying while
+
+// someone removes /b; the probe answers 404 and, before the plane's next
+
+// request, another client creates C there. Nothing is restored over C: the
+
+// displaced B stays alive at its alias.
+
+func TestRenameOverOpenTargetNeverTouchesALateArrival(t *testing.T) {
+	f := newFakeV2(t)
+	f.seedExtent(t, "/a", "AAAA")
+	f.seedExtent(t, "/b", "BBBBBBBB")
+	h := newTestHandler(t, f, 1<<20)
+	b := h.opts.Engine.Bridge
+	claimOpen(t, h, "/a")
+	ehB := claimOpen(t, h, "/b")
+
+	boom := errors.New("server failure")
+	arrived := false
+	err := renameWith(h, "/a", "/b", func(ctx context.Context, op *fs.Op) (fs.Result, error) {
+		f.remove("/b") // the name vanished underneath the failing rename
+		f.setAfterHead(func(path string) {
+			// Right after the probe's 404: C lands at /b (f.mu is held by
+			// the HEAD handler; mutate the maps directly).
+			if path == "/b" && !arrived {
+				arrived = true
+				f.extent["/b"] = "CCCC"
+				f.nextID++
+				f.ids["/b"] = "late-arrival"
+			}
+		})
+		return fs.Result{}, boom
+	})
+	f.setAfterHead(nil)
+	if !errors.Is(err, boom) {
+		t.Fatalf("rename error = %v, want the chain's", err)
+	}
+	if !arrived {
+		t.Fatal("the probe never ran")
+	}
+	sentinel := ehB.path
+	if got := f.contentOf("/b"); got != "CCCC" {
+		t.Fatalf("/b = %q: the late arrival was destroyed (want CCCC)", got)
+	}
+	if got := f.contentOf(b.fullPath(sentinel)); got != "BBBBBBBB" {
+		t.Fatalf("displaced object = %q, want BBBBBBBB", got)
+	}
+	if got := readFront(t, ehB, 16); got != "BBBBBBBB" {
+		t.Fatalf("B reads %q, want BBBBBBBB", got)
+	}
+	if err := ehB.Release(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.contentOf("/b"); got != "CCCC" {
+		t.Fatalf("/b = %q after B's close, want CCCC", got)
+	}
+}
+
+// Round-12 P1: retention names are unique per operation, so a later
+
+// retention of the same pathname can never land on an earlier retained
+
+// object — whether that object is still live or a leftover.
+
+func TestRetentionNamesNeverCollide(t *testing.T) {
+	if a, b := deletedOpenSentinel("/b", 7), deletedOpenSentinel("/b", 7); a == b {
+		t.Fatalf("two retentions of the same path/inode produced one name %q", a)
+	}
+	f := newFakeV2(t)
+	f.seedExtent(t, "/a", "AAAA")
+	f.seedExtent(t, "/b", "BBBBBBBB")
+	f.seedExtent(t, "/x", "XXXX")
+	h := newTestHandler(t, f, 1<<20)
+	b := h.opts.Engine.Bridge
+	ehB := claimOpen(t, h, "/b")
+
+	// mv /a /b with B open: B retained at S1.
+	if passed, err := renameThrough(t, h, f, "/a", "/b", nil); err != nil || !passed {
+		t.Fatalf("first rename: err=%v passed=%v", err, passed)
+	}
+	renameEvent(h, "/a", "/b")
+	s1 := ehB.path
+	// Open the file now at /b (A) and mv /x /b over it: A retained at S2.
+	ehA := claimOpen(t, h, "/b")
+	if passed, err := renameThrough(t, h, f, "/x", "/b", nil); err != nil || !passed {
+		t.Fatalf("second rename: err=%v passed=%v", err, passed)
+	}
+	renameEvent(h, "/x", "/b")
+	s2 := ehA.path
+	if s1 == s2 || s1 == "/b" || s2 == "/b" {
+		t.Fatalf("retention names collide or missing: s1=%q s2=%q", s1, s2)
+	}
+	if got := f.contentOf(b.fullPath(s1)); got != "BBBBBBBB" {
+		t.Fatalf("first retained object = %q after the second retention, want BBBBBBBB", got)
+	}
+	if got := f.contentOf(b.fullPath(s2)); got != "AAAA" {
+		t.Fatalf("second retained object = %q, want AAAA", got)
+	}
+	if got := f.contentOf("/b"); got != "XXXX" {
+		t.Fatalf("/b = %q, want XXXX", got)
+	}
+	if got := readFront(t, ehB, 16); got != "BBBBBBBB" {
+		t.Fatalf("B reads %q, want BBBBBBBB", got)
+	}
+	if got := readFront(t, ehA, 16); got != "AAAA" {
+		t.Fatalf("A reads %q, want AAAA", got)
+	}
+}
+
+// --------------------------------------------------------------------------
+// merged from review_round13_test.go
+// --------------------------------------------------------------------------
+// Round-13 P1: an identity probe is not a reservation on the name. The
+
+// probe returns B's identity at /b and another client replaces /b with C
+
+// immediately afterwards; the displaced descriptor must stay attached to
+
+// B, its alias must survive (it may be B's last reference), and C must be
+
+// untouched.
+
+func TestRenameOverOpenTargetDisplacedProbeIsNotAReservation(t *testing.T) {
+	f := newFakeV2(t)
+	f.seedExtent(t, "/a", "AAAA")
+	f.seedExtent(t, "/b", "BBBBBBBB")
+	h := newTestHandler(t, f, 1<<20)
+	b := h.opts.Engine.Bridge
+	claimOpen(t, h, "/a")
+	ehB := claimOpen(t, h, "/b")
+	dstID := func() string {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		return f.ids["/b"]
+	}()
+
+	boom := errors.New("server failure")
+	err := renameWith(h, "/a", "/b", func(ctx context.Context, op *fs.Op) (fs.Result, error) {
+		// The probe will see B's identity... and C replaces /b right
+		// after that HEAD was answered (f.mu is held by the handler).
+		f.setAfterHead(func(path string) {
+			if path == "/b" && f.ids["/b"] == dstID {
+				f.extent["/b"] = "CCCC"
+				f.nextID++
+				f.ids["/b"] = "foreign-c"
+			}
+		})
+		return fs.Result{}, boom // the rename itself never applied
+	})
+	f.setAfterHead(nil)
+	if !errors.Is(err, boom) {
+		t.Fatalf("rename error = %v, want the chain's", err)
+	}
+	sentinel := ehB.path
+	if sentinel == "/b" {
+		t.Fatal("the displaced descriptor was redirected onto the replaceable name")
+	}
+	if got := f.contentOf("/b"); got != "CCCC" {
+		t.Fatalf("/b = %q: the concurrent replacement was damaged (want CCCC)", got)
+	}
+	if got := f.contentOf(b.fullPath(sentinel)); got != "BBBBBBBB" {
+		t.Fatalf("B's retained alias = %q, want BBBBBBBB", got)
+	}
+	// A write through the displaced descriptor targets B's alias, never C.
+	if err := ehB.Write(context.Background(), 0, []byte("ZZZZ")); err != nil {
+		t.Fatal(err)
+	}
+	if err := ehB.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.contentOf("/b"); got != "CCCC" {
+		t.Fatalf("/b = %q after B's write, want CCCC untouched", got)
+	}
+	if got := f.contentOf(b.fullPath(sentinel)); got != "ZZZZBBBB" {
+		t.Fatalf("B's alias = %q after its write, want ZZZZBBBB", got)
+	}
+	if got := readFront(t, ehB, 16); got != "ZZZZBBBB" {
+		t.Fatalf("B reads %q, want ZZZZBBBB", got)
+	}
+	// Both original objects survive; B's close drops only its alias.
+	if err := ehB.Release(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.contentOf("/b"); got != "CCCC" {
+		t.Fatalf("/b = %q after B's close, want CCCC", got)
+	}
+}
+
+// Round-13/14 P1: an Open of the destination while the rename is pending
+
+// must not attach a descriptor for B onto the replaceable name. It is
+
+// serialized behind the rename; when the rename lands, that open (and only
+
+// that open) resolves the source now at the name. Writes through BOTH the
+
+// retained B descriptor and the later one land on their own objects.
+
+func TestOpenDuringPendingRenameWaitsForOutcome(t *testing.T) {
+	f := newFakeV2(t)
+	f.seedExtent(t, "/a", "AAAA")
+	f.seedExtent(t, "/b", "BBBBBBBB")
+	h := newTestHandler(t, f, 1<<20)
+	b := h.opts.Engine.Bridge
+	ehA := claimOpen(t, h, "/a")
+	ehB := claimOpen(t, h, "/b")
+
+	blocked, release := make(chan struct{}), make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- renameWith(h, "/a", "/b", func(ctx context.Context, op *fs.Op) (fs.Result, error) {
+			close(blocked)
+			<-release
+			f.rename(t, op.Path, op.Path2)
+			return fs.Result{}, nil
+		})
+	}()
+	select {
+	case <-blocked:
+	case <-time.After(10 * time.Second):
+		t.Fatal("rename never reached the chain")
+	}
+	sentinel := ehB.path
+
+	type openResult struct {
+		eh  *engineHandle
+		err error
+	}
+	opened := make(chan openResult, 1)
+	go func() {
+		res, err, passed := dispatchCreate(context.Background(), h, "/b", syscall.O_RDWR)
+		if err != nil || passed {
+			opened <- openResult{nil, fmt.Errorf("claim /b: err=%v passed=%v", err, passed)}
+			return
+		}
+		eh, ok := res.Handle.(*engineHandle)
+		if !ok {
+			opened <- openResult{nil, fmt.Errorf("handle type = %T", res.Handle)}
+			return
+		}
+		opened <- openResult{eh, nil}
+	}()
+	// The open must NOT complete while the rename is unresolved: no
+	// descriptor for B may land on the replaceable name.
+	select {
+	case r := <-opened:
+		t.Fatalf("open of the pending destination completed early: %+v", r)
+	case <-time.After(300 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("rename: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("rename did not finish")
+	}
+	renameEvent(h, "/a", "/b")
+
+	var later openResult
+	select {
+	case later = <-opened:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the pending open never completed after the rename resolved")
+	}
+	if later.err != nil {
+		t.Fatal(later.err)
+	}
+	ehC := later.eh
+	if ehC.ino == ehB.ino {
+		t.Fatal("the post-rename open reused B's retained inode")
+	}
+	// B stays attached to its alias; a write/fsync through B never touches A.
+	b.mu.Lock()
+	pathB := b.paths[ehB.ino]
+	b.mu.Unlock()
+	if pathB != b.fullPath(sentinel) {
+		t.Fatalf("B's mapping = %q, want its alias %q", pathB, b.fullPath(sentinel))
+	}
+	if err := ehB.Write(context.Background(), 0, []byte("ZZZZ")); err != nil {
+		t.Fatal(err)
+	}
+	if err := ehB.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.contentOf("/b"); got != "AAAA" {
+		t.Fatalf("/b = %q after B's write, want the source's AAAA untouched", got)
+	}
+	if got := f.contentOf(b.fullPath(sentinel)); got != "ZZZZBBBB" {
+		t.Fatalf("B's alias = %q after its write, want ZZZZBBBB", got)
+	}
+	if got := readFront(t, ehB, 16); got != "ZZZZBBBB" {
+		t.Fatalf("B reads %q, want ZZZZBBBB", got)
+	}
+	// The later descriptor opened the source: its write lands on /b.
+	if err := ehC.Write(context.Background(), 0, []byte("QQQQ")); err != nil {
+		t.Fatal(err)
+	}
+	if err := ehC.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.contentOf("/b"); got != "QQQQ" {
+		t.Fatalf("/b = %q after the later descriptor's write, want QQQQ", got)
+	}
+	if got := f.contentOf(b.fullPath(sentinel)); got != "ZZZZBBBB" {
+		t.Fatalf("B's alias = %q after the later descriptor's write, want ZZZZBBBB", got)
+	}
+	if got := readFront(t, ehA, 16); got != "QQQQ" {
+		t.Fatalf("A reads %q, want QQQQ", got)
+	}
+}
+
+// --------------------------------------------------------------------------
+// merged from review_round14_test.go
+// --------------------------------------------------------------------------
+// Round-14 P1: a resolution whose stat straddles the retention boundary
+
+// must not drag the retained mapping back onto the replaceable name. The
+
+// resolution selects B's inode, pauses in its stat while RetainOpenAlias
+
+// installs the alias, and only then completes: remember() must keep the
+
+// alias mapping, so the descriptor it returns still targets B's retained
+
+// object after the source is renamed onto the name.
+
+func TestResolutionAcrossRetentionKeepsMapping(t *testing.T) {
+	f := newFakeV2(t)
+	f.seedExtent(t, "/b", "BBBBBBBB")
+	h := newTestHandler(t, f, 1<<20)
+	b := h.opts.Engine.Bridge
+	orig, errno := b.ResolveLocal(context.Background(), "/b")
+	if errno != 0 {
+		t.Fatal(errno)
+	}
+
+	gate := make(chan struct{})
+	f.gateHead("/b", gate)
+	resolved := make(chan meta.Ino, 1)
+	go func() {
+		ino, errno := b.ResolveLocal(context.Background(), "/b")
+		if errno != 0 {
+			ino = 0
+		}
+		resolved <- ino
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	for f.gateWaiting("/b") == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if f.gateWaiting("/b") == 0 {
+		t.Fatal("the resolution never reached its stat")
+	}
+
+	// Retention runs while the resolution's stat is in flight; its own
+	// stat passes (the gate is one-shot).
+	sentinel, err := b.RetainOpenAlias("/b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sentinel == "" {
+		t.Fatal("retention declined a present file")
+	}
+	alias := b.fullPath(sentinel)
+	close(gate)
+
+	select {
+	case ino := <-resolved:
+		if ino != orig {
+			t.Fatalf("straddling resolution returned inode %d, want B's %d", ino, orig)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the straddling resolution never completed")
+	}
+	b.mu.Lock()
+	pathB, repB := b.paths[orig], b.replacements["/b"]
+	b.mu.Unlock()
+	if pathB != alias {
+		t.Fatalf("the straddling resolution dragged the mapping back: paths[B]=%q, want the alias %q", pathB, alias)
+	}
+	if repB != 0 {
+		t.Fatalf("the name still resolves to the retained inode: replacements[/b]=%d", repB)
 	}
 }

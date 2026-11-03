@@ -17,7 +17,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/hanwen/go-fuse/v2 v2.10.1
 	github.com/jackc/pgx/v5 v5.9.2
-	github.com/juicedata/juicefs v1.4.0-dev.0.20261023073824-b2a3be78a08b
+	github.com/juicedata/juicefs v1.4.1
 	github.com/oklog/ulid/v2 v2.1.1
 	github.com/pingcap/failpoint v0.0.0-20260406204437-bbc9d102c19e
 	github.com/rclone/rclone v1.75.2
@@ -77,7 +77,6 @@ require (
 	github.com/charlievieth/fastwalk v1.0.14 // indirect
 	github.com/clbanning/mxj v1.8.4 // indirect
 	github.com/clipperhouse/uax29/v2 v2.7.0 // indirect
-	github.com/cloudfoundry/gosigar v1.3.6 // indirect
 	github.com/cloudsoda/go-smb2 v0.0.0-20260701064823-d8c5600d73b8 // indirect
 	github.com/cloudsoda/sddl v0.0.0-20250224235906-926454e91efc // indirect
 	github.com/cncf/xds/go v0.0.0-20260202195803-dba9d589def2 // indirect
@@ -95,6 +94,7 @@ require (
 	github.com/dgryski/go-farm v0.0.0-20240924180020-3414d57e47da // indirect
 	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
+	github.com/elastic/gosigar v0.14.2 // indirect
 	github.com/emmansun/gmsm v0.41.1 // indirect
 	github.com/envoyproxy/go-control-plane/envoy v1.39.1-0.20260819172001-e6e3fd93e4be // indirect
 	github.com/envoyproxy/protoc-gen-validate v1.3.3 // indirect
@@ -197,8 +197,8 @@ require (
 	github.com/syndtr/goleveldb v1.0.0 // indirect
 	github.com/tencentyun/cos-go-sdk-v5 v0.7.73 // indirect
 	github.com/tiancaiamao/gp v0.0.0-20221230034425-4025bc8a4d4a // indirect
-	github.com/tikv/client-go/v2 v2.0.8-0.20260615130046-a2b634d170d9 // indirect
-	github.com/tikv/pd/client v0.0.0-20260609141937-b01426f6b08b // indirect
+	github.com/tikv/client-go/v2 v2.0.7 // indirect
+	github.com/tikv/pd/client v0.0.0-20230329114254-1948c247c2b1 // indirect
 	github.com/twmb/murmur3 v1.1.8 // indirect
 	github.com/unknwon/goconfig v1.0.0 // indirect
 	github.com/urfave/cli/v2 v2.24.4 // indirect

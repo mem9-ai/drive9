@@ -64,7 +64,7 @@ type mountFuseOptions struct {
 	LocalGitignoreAwarePatterns  []string
 	RemoteOnlyPatterns           []string
 	AppendLogPatterns            []string
-	ExtentFullMode               bool
+	ExtentPaths                  []string
 	PackPaths                    []string
 	UploadConcurrency            int
 	DirCacheMaxEntries           int

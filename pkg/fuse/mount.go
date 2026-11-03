@@ -90,11 +90,12 @@ type MountConfig struct {
 
 	AppendLogPatterns []string
 	PackPaths         []string
-	// ExtentFullMode routes every fresh create through the JuiceFS engine
-	// plane (extent layout for all sizes). Set by the builtin "extent"
-	// mount profile; default mounts stay hybrid — creation on the classic
-	// plane, large files promoted to extent at the inline cutoff.
-	ExtentFullMode bool
+	// ExtentPaths are path globs whose fresh creates ride the JuiceFS
+	// engine plane from byte zero (content_layout=extent); the builtin
+	// "extent" profile sets ["*"]. Default mounts stay hybrid — creation
+	// on the classic plane, large files promoted to extent at the inline
+	// cutoff.
+	ExtentPaths []string
 
 	UploadConcurrency     int
 	DirCacheMaxEntries    int
@@ -333,7 +334,7 @@ type MountOptions struct {
 	DisableBuiltinOverlayDefaults bool
 	AppendLogPatterns             []string // remote-persistent files eligible for append-log synchronization
 	PackPaths                     []string // local overlay paths auto-packed after unmount
-	ExtentFullMode                bool     // builtin "extent" profile: every create rides the engine plane
+	ExtentPaths                   []string // path globs created as content_layout=extent (--extent / [extent])
 	CommitQueueMaxPending         int      // CommitQueue backpressure bound (default 100; 0 default)
 	WriteBackBatchWindow          time.Duration
 	WriteBackBatchMaxFiles        int
@@ -448,7 +449,7 @@ func mountConfigFromOptions(opts *MountOptions) MountConfig {
 		DisableBuiltinOverlayDefaults: opts.DisableBuiltinOverlayDefaults,
 		AppendLogPatterns:             opts.AppendLogPatterns,
 		PackPaths:                     opts.PackPaths,
-		ExtentFullMode:                opts.ExtentFullMode,
+		ExtentPaths:                   opts.ExtentPaths,
 		UploadConcurrency:             opts.UploadConcurrency,
 		DirCacheMaxEntries:            opts.DirCacheMaxEntries,
 		CommitQueueMaxPending:         opts.CommitQueueMaxPending,
@@ -998,13 +999,13 @@ func mountWithConfig(cfg MountConfig) error {
 			engineConf.CacheSize = uint64(cfg.DiskReadCacheSize)
 		}
 		engine := extent.NewEngine(engineConf)
-		engineThreshold := int64(1) // hybrid: creation stays on the classic plane
-		if cfg.ExtentFullMode {
-			engineThreshold = 0 // the builtin "extent" profile: engine from byte zero
-		}
 		built["extent"] = extent.New(extent.Options{
-			Engine:     engine,
-			Threshold:  engineThreshold,
+			Engine: engine,
+			// Hybrid: creation stays on the classic plane (promotion at
+			// the inline cutoff) unless the path matches an explicit
+			// --extent / [extent] pattern.
+			Threshold:  1,
+			Patterns:   cfg.ExtentPaths,
 			SyncPolicy: cfg.WritePolicy,
 			Events:     bus,
 		})

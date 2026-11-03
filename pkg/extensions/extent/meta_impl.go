@@ -51,7 +51,7 @@ func (b *Bridge) GetFormat() meta.Format {
 
 func (b *Bridge) Shutdown() error { return nil }
 
-func (b *Bridge) OnReload(cb func(*meta.Format) error) {}
+func (b *Bridge) OnReload(cb func(*meta.Format)) {}
 
 func (b *Bridge) NewSession(record bool) error {
 	atomic.AddInt32(&b.sessionCount, 1)

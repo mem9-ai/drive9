@@ -10,10 +10,11 @@ import (
 )
 
 const (
-	defaultMountProfile  = "coding-agent"
-	noneMountProfile     = "none"
-	portableMountProfile = "portable"
-	extentMountProfile   = "extent"
+	defaultMountProfile           = "coding-agent"
+	codingAgentExtentMountProfile = "coding-agent-extent"
+	noneMountProfile              = "none"
+	extentMountProfile            = "extent"
+	portableMountProfile          = "portable"
 )
 
 type profileConfig struct {
@@ -23,6 +24,7 @@ type profileConfig struct {
 	RemoteOnlyPatterns []string
 	AppendLogPatterns  []string
 	PackPaths          []string
+	ExtentPatterns     []string
 	// Builtin marks a config produced by a built-in profile rather than a user
 	// file. It distinguishes `coding-agent` the builtin from a user's
 	// ~/.drive9/profiles/coding-agent: only the builtin carries the built-in
@@ -32,10 +34,6 @@ type profileConfig struct {
 	// LocalGitignoreAwarePatterns are local-only patterns overlaid only when
 	// the repository's Git ignore rules also ignore the path.
 	LocalGitignoreAwarePatterns []string
-	// ExtentFull routes every new file through the JuiceFS engine plane
-	// (extent layout for all sizes, like using JuiceFS directly). Only the
-	// builtin "extent" profile sets it.
-	ExtentFull bool
 }
 
 func Profile(args []string) error {
@@ -90,11 +88,11 @@ func loadProfileConfig(name string) (profileConfig, error) {
 	if name == noneMountProfile {
 		return builtinNoneProfile(), nil
 	}
-	if name == "interactive" {
-		return profileConfig{Name: "interactive", Source: "builtin:interactive", Builtin: true}, nil
-	}
 	if name == extentMountProfile {
 		return builtinExtentProfile(), nil
+	}
+	if name == "interactive" {
+		return profileConfig{Name: "interactive", Source: "builtin:interactive", Builtin: true}, nil
 	}
 	if path := profileConfigPath(name); path != "" {
 		if data, err := os.ReadFile(path); err == nil {
@@ -109,6 +107,9 @@ func loadProfileConfig(name string) (profileConfig, error) {
 	}
 	if name == defaultMountProfile {
 		return builtinCodingAgentProfile(), nil
+	}
+	if name == codingAgentExtentMountProfile {
+		return builtinCodingAgentExtentProfile(), nil
 	}
 	if name == portableMountProfile {
 		return builtinPortableProfile(), nil
@@ -152,14 +153,17 @@ func validateProfileName(name string) error {
 	return nil
 }
 
-// builtinExtentProfile routes every file through the JuiceFS engine plane:
-// extent layout for all creates, engine-owned buffering and caches.
-func builtinExtentProfile() profileConfig {
-	return profileConfig{Name: extentMountProfile, Source: "builtin:extent", Builtin: true, ExtentFull: true}
-}
-
 func builtinNoneProfile() profileConfig {
 	return profileConfig{Name: noneMountProfile, Source: "builtin:none", Builtin: true}
+}
+
+func builtinExtentProfile() profileConfig {
+	return profileConfig{
+		Name:           extentMountProfile,
+		Source:         "builtin:extent",
+		ExtentPatterns: []string{"*"},
+		Builtin:        true,
+	}
 }
 
 func builtinCodingAgentProfile() profileConfig {
@@ -187,6 +191,14 @@ func builtinPortableProfile() profileConfig {
 	}
 }
 
+func builtinCodingAgentExtentProfile() profileConfig {
+	cfg := builtinCodingAgentProfile()
+	cfg.Name = codingAgentExtentMountProfile
+	cfg.Source = "builtin:coding-agent-extent"
+	cfg.ExtentPatterns = []string{"*"}
+	return cfg
+}
+
 func mergeProfileValues(groups ...[]string) []string {
 	seen := map[string]struct{}{}
 	var out []string
@@ -207,7 +219,7 @@ func mergeProfileValues(groups ...[]string) []string {
 }
 
 // builtinCodingAgentLocalOnlyPatterns is the shared [local] overlay policy for
-// the coding-agent and portable profiles. These paths are
+// the coding-agent, coding-agent-extent, and portable profiles. These paths are
 // overlaid unconditionally.
 //
 // VCS metadata is absent: `.git` is routed structurally (local only for a
@@ -241,7 +253,7 @@ func parseProfileConfig(name, source, body string) (profileConfig, error) {
 		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
 			section = strings.ToLower(strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(line, "["), "]")))
 			switch section {
-			case "local", "local-gitignore-aware", "remote", "pack", "append-log":
+			case "local", "local-gitignore-aware", "remote", "pack", "append-log", "extent":
 			default:
 				return profileConfig{}, fmt.Errorf("profile %q line %d: unknown section [%s]", name, lineNo+1, section)
 			}
@@ -258,6 +270,8 @@ func parseProfileConfig(name, source, body string) (profileConfig, error) {
 			cfg.PackPaths = append(cfg.PackPaths, line)
 		case "append-log":
 			cfg.AppendLogPatterns = append(cfg.AppendLogPatterns, line)
+		case "extent":
+			cfg.ExtentPatterns = append(cfg.ExtentPatterns, line)
 		}
 	}
 	return cfg, nil
@@ -275,6 +289,7 @@ func formatProfileConfig(cfg profileConfig) string {
 	writeProfileSection(&b, "remote", cfg.RemoteOnlyPatterns, "no remote override paths")
 	writeProfileSection(&b, "pack", cfg.PackPaths, "no automatic pack paths")
 	writeProfileSection(&b, "append-log", cfg.AppendLogPatterns, "no append-log optimization paths")
+	writeProfileSection(&b, "extent", cfg.ExtentPatterns, "no extent path patterns")
 	return b.String()
 }
 

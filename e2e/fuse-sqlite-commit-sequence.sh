@@ -5,7 +5,7 @@
 # N independent COMMIT transactions with journal_mode=WAL and synchronous=FULL,
 # then same-mount reopen, remount, and remote-snapshot fingerprint checks.
 # It does not require append-log or Directory Buckets. Honor FUSE_PROFILE so
-# the same script covers the default FS and the profile mounts.
+# the same script covers the default FS and coding-agent-extent.
 
 set -euo pipefail
 

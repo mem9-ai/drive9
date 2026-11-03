@@ -29,7 +29,7 @@
 // which the tests would surface immediately.
 //
 // Compaction and block GC are deliberately absent: they run in the server's
-// tenant worker (see docs/design/extent-content-layout-v2.md §6).
+// tenant worker.
 package extent
 
 import (
