@@ -395,6 +395,45 @@ func (c *Client) WriteStreamConditional(ctx context.Context, path string, r io.R
 	return err
 }
 
+// ErrResourceMismatch reports a publication refused because the path's
+// current occupant is not the expected resource object.
+var ErrResourceMismatch = errors.New("path occupant is not the expected resource")
+
+type expectedResourceCtxKey struct{}
+
+// WithExpectedResource binds a context's publications to the object's
+// resource identity: every upload initiate (and extent PATCH) under the
+// context carries X-Dat9-Expected-Resource, so the server can refuse a
+// publication into a replacement whose revision merely equals the saved
+// one. An empty ID leaves the context unbound.
+func WithExpectedResource(ctx context.Context, resourceID string) context.Context {
+	if resourceID == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, expectedResourceCtxKey{}, resourceID)
+}
+
+func expectedResourceOf(ctx context.Context) string {
+	v, _ := ctx.Value(expectedResourceCtxKey{}).(string)
+	return v
+}
+
+// WriteStreamConditionalExpectedResource binds the conditional upload to
+// the object's resource identity in addition to the revision (see
+// WithExpectedResource). A server answer of 409 Conflict while bound is
+// reported as ErrResourceMismatch.
+func (c *Client) WriteStreamConditionalExpectedResource(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, expectedRevision int64, expectedResourceID string) error {
+	err := c.WriteStreamConditional(WithExpectedResource(ctx, expectedResourceID), path, r, size, progress, expectedRevision)
+	if err == nil {
+		return nil
+	}
+	var se *StatusError
+	if expectedResourceID != "" && errors.As(err, &se) && se.StatusCode == http.StatusConflict {
+		return fmt.Errorf("%s: %w", path, ErrResourceMismatch)
+	}
+	return err
+}
+
 // WriteStreamConditionalWithChecksum performs one fresh conditional upload,
 // supplies the trusted whole-file checksum to Multipart Complete, and rereads
 // the committed Stat. Direct PUT ignores the supplied checksum because the
@@ -1065,12 +1104,18 @@ func (c *Client) initiateUploadV2WithLayout(ctx context.Context, path string, si
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if id := expectedResourceOf(ctx); id != "" {
+		req.Header.Set("X-Dat9-Expected-Resource", id)
+	}
 	resp, err := c.do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	if resp.StatusCode == http.StatusConflict && expectedResourceOf(ctx) != "" {
+		return nil, fmt.Errorf("%s: %w", path, ErrResourceMismatch)
+	}
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, errV2NotAvailable
 	}

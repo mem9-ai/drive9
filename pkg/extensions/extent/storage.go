@@ -133,13 +133,20 @@ func (s objectStorage) Get(ctx context.Context, key string, off, limit int64, ge
 		return io.NopCloser(bytes.NewReader(nil)), nil
 	}
 	// An issued classic slice stays fetchable for its whole reader
-	// lifetime: the retirement path skips issued ids, and THIS fetch is
-	// the pin's consumer — release it and serve the bytes (the entry
-	// could not have been retired while the pin was held).
+	// lifetime: this Get ACQUIRES a pin before touching the registry (a
+	// concurrent stageClassicChunk cannot retire the entry between the
+	// pin and the snapshot) and releases ONE pin on exit — the handout
+	// issued one pin per block, so multi-block slices stay protected
+	// across their separate Gets.
 	s.bridge.mu.Lock()
 	sl := s.bridge.stagedSlices[id]
 	s.bridge.mu.Unlock()
 	if sl == nil {
+		// Transient pin for THIS fetch (a concurrent stage cannot retire
+		// the entry between the pin and the snapshot), and the handout pin
+		// drains on the first Get.
+		s.bridge.blocks.issuePin(id)
+		defer s.bridge.blocks.releaseIssuePin(id)
 		s.bridge.blocks.releaseIssuePin(id)
 	}
 	if sl != nil {

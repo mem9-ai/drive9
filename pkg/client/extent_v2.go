@@ -330,6 +330,16 @@ func (b *cappedBody) Close() error { return b.rc.Close() }
 // returns the server's upload plan (presigned block PUT URLs, or Exists for
 // content the object store already holds).
 func (c *Client) InitiateExtentPatch(ctx context.Context, path string, newSize int64, dirty []ExtentDirtyBlock, expectedRevision int64) (*ExtentWritePlan, error) {
+	return c.InitiateExtentPatchExpectedResource(ctx, path, newSize, dirty, expectedRevision, "")
+}
+
+// InitiateExtentPatchExpectedResource additionally binds the patch to the
+// object's resource identity: the server (when it understands the header)
+// rejects the publication when the path's current occupant is not that
+// object, so a replacement whose revision merely happens to equal the
+// saved one cannot receive the staged bytes. An empty ID disables the
+// binding.
+func (c *Client) InitiateExtentPatchExpectedResource(ctx context.Context, path string, newSize int64, dirty []ExtentDirtyBlock, expectedRevision int64, expectedResourceID string) (*ExtentWritePlan, error) {
 	if err := validateFSPath(path); err != nil {
 		return nil, err
 	}
@@ -346,9 +356,19 @@ func (c *Client) InitiateExtentPatch(ctx context.Context, path string, newSize i
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if expectedResourceID == "" {
+		expectedResourceID = expectedResourceOf(ctx)
+	}
+	if expectedResourceID != "" {
+		req.Header.Set("X-Dat9-Expected-Resource", expectedResourceID)
+	}
 	resp, err := c.do(req)
 	if err != nil {
 		return nil, err
+	}
+	if resp.StatusCode == http.StatusConflict && expectedResourceID != "" {
+		_ = resp.Body.Close()
+		return nil, fmt.Errorf("%s: %w", path, ErrResourceMismatch)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusAccepted {
@@ -379,6 +399,53 @@ func ChunkOffset(fileOffset int64) (chunk uint32, off uint32, ok bool) {
 // CommitExtentPatch uploads dirty blocks and commits the patch session in
 // one call: PATCH → PUT each non-existing block → complete with explicit
 // part records. expectedRevision must match the server's current revision.
+func (c *Client) CommitExtentPatchExpectedResource(ctx context.Context, path string, newSize int64, blocks []ExtentBlockWrite, expectedRevision int64, expectedResourceID string) error {
+	// Same contract as CommitExtentPatch, bound to the object's resource
+	// identity (see InitiateExtentPatchExpectedResource).
+	if len(blocks) == 0 && newSize != 0 {
+		return fmt.Errorf("extent patch requires at least one dirty block")
+	}
+	dirty := make([]ExtentDirtyBlock, len(blocks))
+	for i, b := range blocks {
+		if len(b.Data) == 0 {
+			return fmt.Errorf("dirty block %d is empty", i)
+		}
+		if int64(len(b.Data)) > ExtentChunkSize {
+			return fmt.Errorf("dirty block %d exceeds the chunk span", i)
+		}
+		sum := sha256.Sum256(b.Data)
+		dirty[i] = ExtentDirtyBlock{Chunk: b.Chunk, Off: b.Off, Size: int64(len(b.Data)), Checksum: hex.EncodeToString(sum[:])}
+	}
+	plan, err := c.InitiateExtentPatchExpectedResource(ctx, path, newSize, dirty, expectedRevision, expectedResourceID)
+	if err != nil {
+		return err
+	}
+	parts := make([]completePart, 0, len(blocks))
+	for i, b := range blocks {
+		wb := extentPlanBlockFor(plan, dirty[i])
+		if wb == nil {
+			return fmt.Errorf("extent patch plan lacks block %d/%d", dirty[i].Chunk, dirty[i].Off)
+		}
+		if !wb.Exists && wb.URL != "" {
+			if err := c.putExtentBlock(ctx, wb.URL, wb.Headers, b.Data); err != nil {
+				c.abortUploadV2BestEffort(ctx, plan.UploadID)
+				return err
+			}
+		}
+		parts = append(parts, completePart{
+			Number: i + 1,
+			ETag:   dirty[i].Checksum,
+			Chunk:  b.Chunk,
+			Off:    b.Off,
+			Size:   int64(len(b.Data)),
+		})
+	}
+	if err := c.completeUploadV2WithOptions(ctx, plan.UploadID, parts, nil, ""); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (c *Client) CommitExtentPatch(ctx context.Context, path string, newSize int64, blocks []ExtentBlockWrite, expectedRevision int64) error {
 	if len(blocks) == 0 && newSize != 0 {
 		return fmt.Errorf("extent patch requires at least one dirty block")

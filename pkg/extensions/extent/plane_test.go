@@ -300,7 +300,14 @@ func newFakeV2(t *testing.T) *fakeV2 {
 		f.creates = append(f.creates, body["path"].(string))
 		legacy := f.legacy
 		f.upSize = int64(body["total_size"].(float64))
+		occupant := f.ids[body["path"].(string)]
 		f.mu.Unlock()
+		if exp := r.Header.Get("X-Dat9-Expected-Resource"); exp != "" && occupant != "" && occupant != exp {
+			// The publication is bound to a DIFFERENT object than the one
+			// occupying the path: refuse it.
+			http.Error(w, "resource mismatch", http.StatusConflict)
+			return
+		}
 		w.WriteHeader(http.StatusAccepted)
 		if legacy {
 			// A pre-extent server ignores the layout field and answers a
@@ -3544,11 +3551,13 @@ func TestClassicReadCacheBoundedUnderScan(t *testing.T) {
 	br := h.opts.Engine.Bridge
 	br.mu.Lock()
 	held := br.classicBytes
-	records := len(br.classicLRU)
 	br.mu.Unlock()
-	// Bound: the budget plus the protected newest records.
-	if held > classicReadCacheBytes+int64(classicReadProtect)*4096 || records > classicReadProtect {
-		t.Fatalf("classic staging holds %d bytes in %d records, want <= %d + %d protected", held, records, classicReadCacheBytes, classicReadProtect)
+	// Bound: the budget plus the protected newest records, each of which
+	// may span a whole chunk fetch (sparse chunks materialize their zero
+	// holes). Distinct-chunk scans retire everything older.
+	span := int64(1 << 20)
+	if held > classicReadCacheBytes+int64(classicReadProtect)*span {
+		t.Fatalf("classic staging holds %d bytes, want <= %d + %d protected chunk spans", held, classicReadCacheBytes, classicReadProtect)
 	}
 }
 
@@ -3690,6 +3699,46 @@ func TestRecoveryConstraintSurvivesFailure(t *testing.T) {
 	// A later flush must NOT publish into the replacement either.
 	if err := br.FlushFile(context.Background(), ino); err == nil {
 		t.Fatal("a later flush published into the replacement")
+	}
+	if got := f.contentOf("/a"); got != "OTHER" {
+		t.Fatalf("replacement content = %q, want OTHER untouched", got)
+	}
+}
+
+// Round-23: a classic recovery publication carries the verified object's
+// identity — a replacement whose revision merely EQUALS the saved one
+// cannot receive the staged bytes.
+func TestClassicRecoveryResourceBinding(t *testing.T) {
+	f := newFakeV2(t)
+	f.seedExtent(t, "/a", "AAAAAAAA")
+	h := newTestHandler(t, f, 1<<20)
+	br := h.opts.Engine.Bridge
+	st, err := br.StatLocal(context.Background(), "/a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ino, errno := br.ResolveLocal(context.Background(), "/a")
+	if errno != 0 {
+		t.Fatal(errno)
+	}
+	br.setVerifyBase(ino, st.Revision, st.ResourceID)
+	br.mu.Lock()
+	br.pending[ino] = []pendingWrite{{chunk: 0, off: 0, checksum: sha256Hex([]byte("ZZZZ")), size: 4}}
+	br.blocks.stagePinned(sha256Hex([]byte("ZZZZ")), []byte("ZZZZ"), true)
+	br.sizes[ino] = 8
+	br.classicOwned[ino] = true // the recovery target publishes classic
+	br.mu.Unlock()
+
+	// Replace the occupant with one at the SAME revision number.
+	f.remove("/a")
+	f.mu.Lock()
+	f.extent["/a"] = "OTHER"
+	f.nextID++
+	f.ids["/a"] = "replacement-id"
+	f.mu.Unlock()
+
+	if err := br.FlushFile(context.Background(), ino); err == nil {
+		t.Fatal("the bound publication succeeded into a same-revision replacement")
 	}
 	if got := f.contentOf("/a"); got != "OTHER" {
 		t.Fatalf("replacement content = %q, want OTHER untouched", got)

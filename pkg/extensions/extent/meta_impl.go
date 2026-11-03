@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -1004,7 +1005,18 @@ func (b *Bridge) commitClassic(ctx context.Context, ino meta.Ino, path string, p
 	for int64(len(image)) < size {
 		image = append(image, 0)
 	}
-	if err := b.cfg.Client.WriteStreamConditional(ctx, path, bytes.NewReader(image), int64(len(image)), nil, rev); err != nil {
+	// The classic publication is bound to the verified object's identity
+	// when a recovery constraint is active: the request carries the
+	// expected resource (header), so a replacement whose revision merely
+	// equals the saved one cannot receive the staged bytes.
+	expRes := ""
+	if v, bounded := b.peekVerifyBase(ino); bounded {
+		expRes = v.resID
+	}
+	if err := b.cfg.Client.WriteStreamConditionalExpectedResource(ctx, path, bytes.NewReader(image), int64(len(image)), nil, rev, expRes); err != nil {
+		if errors.Is(err, client.ErrResourceMismatch) {
+			b.abandonIno(ino)
+		}
 		return err
 	}
 	b.mu.Lock()
@@ -1021,9 +1033,17 @@ func (b *Bridge) commitClassic(ctx context.Context, ino meta.Ino, path string, p
 }
 
 func (b *Bridge) commitWithRetry(ctx context.Context, ino meta.Ino, path string, blocks []client.ExtentBlockWrite, size, rev int64) error {
-	err := b.cfg.Client.CommitExtentPatch(ctx, path, size, blocks, rev)
+	expRes := ""
+	if v, bounded := b.peekVerifyBase(ino); bounded {
+		expRes = v.resID
+	}
+	err := b.cfg.Client.CommitExtentPatchExpectedResource(ctx, path, size, blocks, rev, expRes)
 	if err == nil {
 		return nil
+	}
+	if errors.Is(err, client.ErrResourceMismatch) {
+		b.abandonIno(ino)
+		return err
 	}
 	// Revision conflict: re-base and retry once — blocks are
 	// content-addressed, nothing is re-uploaded. The re-stat is
@@ -1037,7 +1057,15 @@ func (b *Bridge) commitWithRetry(ctx context.Context, ino meta.Ino, path string,
 		b.abandonIno(ino)
 		return fmt.Errorf("recovery target %s no longer holds the staged object", path)
 	}
-	return b.cfg.Client.CommitExtentPatch(ctx, path, size, blocks, st.Revision)
+	expRes2 := ""
+	if v, bounded := b.peekVerifyBase(ino); bounded {
+		expRes2 = v.resID
+	}
+	err2 := b.cfg.Client.CommitExtentPatchExpectedResource(ctx, path, size, blocks, st.Revision, expRes2)
+	if errors.Is(err2, client.ErrResourceMismatch) {
+		b.abandonIno(ino)
+	}
+	return err2
 }
 
 // flushPending commits a file's pending slices (used on Close and fsync
@@ -1819,10 +1847,19 @@ func (b *Bridge) stageClassicChunk(sum string, data []byte) uint64 {
 	b.mu.Unlock()
 	for _, r := range retire {
 		if b.blocks.isIssued(r.id) {
-			continue // an outstanding reader still holds this slice
+			// An outstanding reader still holds this slice: the BYTES stay
+			// (the fetch must succeed), and they stay ACCOUNTED — re-append
+			// the record so a later trim (after the pin drains) reclaims it.
+			b.mu.Lock()
+			b.classicLRU = append(b.classicLRU, r)
+			b.classicBytes += r.bytes
+			b.mu.Unlock()
+			continue
 		}
 		b.blocks.releaseIfUnpinned(r.sum)
 	}
+	// One pin per handout; the reader's first Get releases it (later
+	// blocks of a multi-block slice ride the Get-time transient pin).
 	b.blocks.issuePin(id)
 	return id
 }
@@ -1867,21 +1904,23 @@ func (b *Bridge) isLayoutPending(ino meta.Ino) bool {
 }
 
 // layoutPendingMatches reports whether the pending-classification upload
-// is still the occupant: with a recorded identity the occupant must match
-// it exactly; without one (the classification never saw ANY stat) our own
-// path mapping and pending data are the only proof, and a KNOWN different
-// occupant (caller-provided resource ID) always fails.
+// is still the occupant. With a recorded identity the occupant must match
+// it exactly. Without one — a total stat outage around OUR successful
+// fresh upload — the upload PROVABLY created this path's occupant (the
+// path did not exist before), so recovery adopts whichever object is
+// there: refusing would strand the handle forever after a transient
+// outage, and the residual risk is a replacement installed DURING a
+// complete outage, which no client-side evidence can distinguish.
 func (b *Bridge) layoutPendingMatches(ino meta.Ino, occupantID string) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if !b.layoutPending[ino] {
 		return false
 	}
-	id, seen := b.layoutPendingID[ino]
-	if !seen || id == "" {
-		return occupantID == "" // unknowable: only when the caller also could not see it
+	if id := b.layoutPendingID[ino]; id != "" {
+		return id == occupantID
 	}
-	return id == occupantID
+	return true // fresh upload of ours created the occupant
 }
 
 // peekVerifyBase reads the recovery constraint without consuming it.
