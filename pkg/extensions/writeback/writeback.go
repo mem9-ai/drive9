@@ -2051,16 +2051,18 @@ func (h *bufferingHandle) Sync(ctx context.Context) error {
 	staged := h.stagedToCache
 	h.mu.Unlock()
 	if staged && h.w.uploader != nil {
+		meta, hasMeta := h.w.wbCache.GetMeta(h.path)
 		rev, err := h.w.uploader.UploadSyncWithRevision(ctx, h.path)
 		if err != nil {
 			return err
 		}
 		h.mu.Lock()
-		size := h.buf.Size()
 		h.stagedToCache = false
 		h.mu.Unlock()
 		h.markLanded(rev)
-		h.w.landedAt(h.path, rev, size)
+		if hasMeta {
+			h.w.landedAt(h.path, rev, meta.Size)
+		}
 	}
 	return nil
 }
@@ -2120,13 +2122,15 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 				defer detachCancel()
 			}
 			isNew := func() bool { h.mu.Lock(); defer h.mu.Unlock(); return h.isNew }()
-			if err := h.stageToWriteCache(ctx, isNew); err != nil {
+			snapshot, err := h.stageToWriteCache(ctx, isNew)
+			if err != nil {
 				return err
+			}
+			if snapshot == nil {
+				return nil
 			}
 			h.mu.Lock()
 			h.stagedToCache = true
-			stagedGen := h.wgen
-			stagedSize := h.buf.Size()
 			h.mu.Unlock()
 			rev, err := h.w.uploader.UploadSyncWithRevision(ctx, h.path)
 			if err != nil {
@@ -2136,7 +2140,7 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 			// OnSuccess feeds the landed table — record the watermark here
 			// so append siblings see the advance without a remote stat
 			// (v1 recordCommittedRevisionWithSize at this boundary).
-			h.w.landedAt(h.path, rev, stagedSize)
+			h.w.landedAt(h.path, rev, snapshot.size)
 			h.mu.Lock()
 			h.stagedToCache = false
 			// The image is on the remote now — for every create shape, not
@@ -2147,10 +2151,7 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 			// acknowledged while the upload was in flight (Drain flushes
 			// without the per-FH write lock) keeps its own dirty flag and
 			// the next durability barrier commits it.
-			if h.wgen == stagedGen {
-				h.dirty = false
-				h.visTrunc = false
-			}
+			h.retireDirtyLocked(snapshot.wgen)
 			h.mu.Unlock()
 			// The landed revision also retires isNew: a later write on
 			// this handle must stage as an overwrite of that revision.
@@ -2184,8 +2185,12 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 			return nil
 		}
 		if size < commitInlineStreamThreshold {
-			if err := h.stageToWriteCache(ctx, isNew); err != nil {
+			snapshot, err := h.stageToWriteCache(ctx, isNew)
+			if err != nil {
 				return err
+			}
+			if snapshot == nil {
+				return nil
 			}
 			// v1 small-file contract (write-back policy): the Flush
 			// snapshot is local-only. Uploading here would publish transient
@@ -2316,7 +2321,7 @@ func (h *bufferingHandle) Release(ctx context.Context) error {
 				// snapshot is stale — refresh it from the current buffer
 				// before submitting (v1: the latest image always wins;
 				// submitting the stale snapshot loses the newer write).
-				if err := h.stageToWriteCache(ctx, isNew); err != nil {
+				if _, err := h.stageToWriteCache(ctx, isNew); err != nil {
 					return err
 				}
 			}
@@ -2463,7 +2468,8 @@ func readShadowGenerationFenced(shadows *staging.ShadowStore, path string, size 
 func (h *bufferingHandle) checkoutDropCleanBuffer() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.unlinked || h.dirty || h.pendingImage != nil {
+	// A locally created handle has no terminal from which to reload its bytes.
+	if h.inner == nil || h.unlinked || h.dirty || h.pendingImage != nil {
 		return
 	}
 	h.buf = nil
@@ -4469,9 +4475,15 @@ func (h *bufferingHandle) finishStreaming(ctx context.Context) error {
 	return stream.FinishStreaming(ctx, size, 0, nil, dirtyParts)
 }
 
+type writeCacheSnapshot struct {
+	size int64
+	wgen uint64
+}
+
 // stageToWriteCache writes the buffered image into the .dat/.meta cache
-// (small-stage) and clears the in-memory buffer's dirty state.
-func (h *bufferingHandle) stageToWriteCache(ctx context.Context, isNew bool) error {
+// (small-stage) and clears the in-memory buffer's dirty state. A nil result
+// means no image was staged; a snapshot remains valid after buffer invalidation.
+func (h *bufferingHandle) stageToWriteCache(ctx context.Context, isNew bool) (*writeCacheSnapshot, error) {
 	// The #1023 fence for the writeback-cache track (close-sync and the
 	// small-file write-back flush both stage here): compose with the
 	// file's newest state before this staging refreshes the CAS base —
@@ -4480,7 +4492,7 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, isNew bool) err
 	if h.appendParticipant() {
 		image, landedRev, err := h.w.fenceRefreshAppendBase(ctx, h)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if image != nil {
 			h.mu.Lock()
@@ -4488,7 +4500,7 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, isNew bool) err
 			if !bytes.Equal(image, cur) || landedRev > h.baseRev {
 				if err := h.adoptAppendImageLocked(image, landedRev); err != nil {
 					h.mu.Unlock()
-					return err
+					return nil, err
 				}
 			}
 			h.mu.Unlock()
@@ -4498,26 +4510,26 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, isNew bool) err
 	if h.buf == nil {
 		h.mu.Unlock()
 		if !isNew {
-			return nil
+			return nil, nil
 		}
 		// An O_CREAT claim that never wrote stages as a zero-byte image
 		// (v1 createEmptyHandleRemote): its existence must land at the
 		// durability boundary, not only at Release.
 		if err := h.ensureBuffer(ctx); err != nil {
-			return err
+			return nil, err
 		}
 		h.mu.Lock()
 		if h.buf == nil {
 			h.mu.Unlock()
-			return nil
+			return nil, nil
 		}
 	}
 	if err := h.buf.LoadMissingParts(); err != nil {
 		h.mu.Unlock()
-		return err
+		return nil, err
 	}
 	image := h.buf.Bytes()
-	stagedGen := h.wgen
+	snapshot := &writeCacheSnapshot{size: int64(len(image)), wgen: h.wgen}
 	baseRev := h.baseRev
 	mode, hasMode := h.pendingMode, h.hasPendingMode
 	h.mu.Unlock()
@@ -4549,7 +4561,7 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, isNew bool) err
 	// upload silently no-op — the git-ops clone's config.lock never
 	// landed).
 	if err := h.w.wbCache.PutWithBaseRevAndMode(h.path, image, int64(len(image)), kind, baseRev, mode, hasMode); err != nil {
-		return err
+		return nil, err
 	}
 	// v1 seeded the read cache with the staged image at the flush
 	// boundary: readers during the async landing serve these bytes instead
@@ -4557,8 +4569,8 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, isNew bool) err
 	if h.w.pendingSeeder != nil {
 		h.w.pendingSeeder(h.path, image)
 	}
-	h.retireDirty(stagedGen)
-	return nil
+	h.retireDirty(snapshot.wgen)
+	return snapshot, nil
 }
 
 // applyPendingMode publishes a deferred chmod once the image it describes
