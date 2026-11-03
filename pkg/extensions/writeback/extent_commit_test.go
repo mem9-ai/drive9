@@ -401,3 +401,94 @@ func TestExtentCommitPropagatesLandedRevision(t *testing.T) {
 		t.Fatalf("stale initiate CAS rejections = %d, want 0", staleRejects)
 	}
 }
+
+// A base-0 entry (its base revision not yet propagated when the journal
+// recorded it) must not collide with the existing target: the stream branch
+// CASes against the revision the routing Stat observed.
+func TestExtentCommitBaseZeroEntryUsesStatRevision(t *testing.T) {
+	var mu sync.Mutex
+	rev := int64(1)
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/ok.bin":
+			w.Header().Set("X-Dat9-Content-Layout", "extent")
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.Header().Set("X-Dat9-Resource-Id", "res-ok")
+			w.Header().Set("X-Dat9-Mode", "420")
+			w.Header().Set("Content-Length", "5242880")
+			w.WriteHeader(200)
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if exp, ok := body["expected_revision"]; !ok || int64(exp.(float64)) != 1 {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusConflict)
+				_, _ = w.Write([]byte(`{"error":"revision conflict"}`))
+				return
+			}
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"upload_id": "e1", "key": "", "part_size": 4 << 20,
+				"total_parts":       int(body["total_size"].(float64)/(4<<20)) + 1,
+				"checksum_contract": map[string]any{"supported": []string{"SHA-256"}, "required": true},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/e1/presign-batch":
+			var body struct {
+				Parts []struct {
+					Number   int    `json:"part_number"`
+					Checksum string `json:"checksum"`
+				} `json:"parts"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			out := make([]map[string]any, 0, len(body.Parts))
+			for _, p := range body.Parts {
+				out = append(out, map[string]any{"number": p.Number, "url": ts.URL + "/obj/" + p.Checksum, "size": 4 << 20, "skip_upload": true})
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"parts": out})
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/e1/complete":
+			mu.Lock()
+			rev++
+			rv := rev
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "completed", "resource_id": fmt.Sprintf("res-%d", rv)})
+		default:
+			http.Error(w, "bad request", http.StatusBadRequest)
+		}
+	}))
+	defer ts.Close()
+
+	shadow, err := staging.NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := staging.NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := shadow.WriteFull("/ok.bin", make([]byte, 5*1024*1024), 0); err != nil {
+		t.Fatal(err)
+	}
+	gen := shadow.ActiveGeneration("/ok.bin")
+	pgen, err := pending.PutWithBaseRev("/ok.bin", 0, staging.PendingNew, 5*1024*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var successRevs []int64
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	cq.SetExtentTakeover(true)
+	cq.OnSuccess = func(entry *CommitEntry, committedRev int64) {
+		successRevs = append(successRevs, committedRev)
+	}
+	if err := cq.Enqueue(&CommitEntry{
+		Path: "/ok.bin", BaseRev: 0, Size: 5 * 1024 * 1024,
+		Kind: staging.PendingNew, ShadowGen: gen, PendingIndexGen: pgen,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cq.DrainAll()
+	if len(successRevs) != 1 || successRevs[0] != 1 {
+		t.Fatalf("base-0 extent commit against an existing target reported %v, want [1]", successRevs)
+	}
+}

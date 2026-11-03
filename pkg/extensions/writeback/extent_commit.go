@@ -114,7 +114,18 @@ func (cq *CommitQueue) uploadExtentEntry(ctx context.Context, entry *CommitEntry
 	if extentTarget && len(entry.DirtyRanges) > 0 {
 		upErr = cq.commitExtentPatch(ctx, apiPath, entry, ra, st.Size)
 	} else {
-		upErr = cq.client.WriteExtentStreamConditional(ctx, apiPath, ra, entry.Size, nil, expectedRevision)
+		streamRev := expectedRevision
+		if streamRev <= 0 && extentTarget {
+			// A base-0 entry racing an unpropagated landing (the extent
+			// publication carries no revision home, so the journal still
+			// believes the target is absent): CAS against the revision the
+			// routing Stat JUST observed instead of the stale zero. The
+			// whole image is the entry's own content — last-writer-wins
+			// against exactly that revision — and a concurrent change
+			// still fails the CAS into the ordinary conflict resolution.
+			streamRev = st.Revision
+		}
+		upErr = cq.client.WriteExtentStreamConditional(ctx, apiPath, ra, entry.Size, nil, streamRev)
 	}
 	if cq.perf != nil {
 		cq.perf.recordRemoteOp(perfRemoteWrite, upErr, time.Since(start), uint64(entry.Size))
