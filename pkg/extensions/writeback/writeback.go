@@ -2698,15 +2698,17 @@ func (w *Writeback) armBypass(path string, rev, size int64, reason string) {
 // surfaced as EIO on write(2). After a landing the remote image is
 // authoritative and complete, so it becomes the fallback restore source.
 // stagedSnapshotIs reports whether this handle's current staged snapshot is
-// exactly id AND nothing has been staged since (a newer staging replaced
-// the image this landing acknowledges).
+// exactly id: a newer staging mints a fresh snapshot ID, so ID equality
+// alone establishes that no image replaced the one this landing
+// acknowledges (the seq fields intentionally differ right after a staging
+// — stageSeq is incremented past the snapshot it just minted).
 func (h *bufferingHandle) stagedSnapshotIs(id string) bool {
 	if id == "" {
 		return false
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return h.stagedSnapshotID == id && h.stagedSnapshotSeq == h.stageSeq
+	return h.stagedSnapshotID == id
 }
 
 func (h *bufferingHandle) armRemoteRestore() {
