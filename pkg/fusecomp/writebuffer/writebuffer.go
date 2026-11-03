@@ -81,6 +81,14 @@ type WriteBuffer struct {
 	// truncated-away remote bytes (#984).
 	remoteSize int64
 
+	// remoteAuthoritative records that the CURRENT remote image holds
+	// every retained byte of this buffer (the owning handle armed the
+	// loader after its commit landed). Only then may an evicted part fall
+	// back to LoadPart when the shadow spill is gone: without the landing
+	// the remote holds a STALE image, and restoring from it would silently
+	// discard locally staged (fsync-acknowledged) modifications.
+	remoteAuthoritative bool
+
 	// Memory tracking
 	curMemory int64 // current bytes held in parts map
 
@@ -424,14 +432,17 @@ func (wb *WriteBuffer) restoreEvictedPart(partIdx int) ([]byte, bool, error) {
 	if wb.partSize > 0 && partStart >= wb.totalSize {
 		return nil, false, nil
 	}
-	// The shadow spill is the FAST restore path, not the only source: the
-	// commit queue removes a successfully landed entry's shadow while this
-	// handle's evicted parts still reference it, and the landed remote
-	// image is the authoritative content from then on. A shadow failure
-	// (or an empty read) falls through to the remote LoadPart — ungated
-	// when the shadow spoke, because the landed size may exceed whatever
-	// stale remoteSize the buffer was opened with. Only when both sources
-	// fail is the shadow diagnostic returned.
+	// The shadow spill is the only restore source UNLESS the remote image
+	// is known authoritative for this buffer's retained bytes (the owning
+	// handle armed the fallback after its commit landed — the queue then
+	// reclaims the shadow while evicted parts still reference it). A bare
+	// shadow failure is NOT evidence of a landing: interactive staging
+	// acknowledges fsync before the upload completes, and falling back to
+	// a stale remote image would silently discard those acknowledged
+	// modifications. Even when armed, the fallback must supply the
+	// WHOLE retained range of the part: a short (or empty) read — e.g. a
+	// loader still clamped to a pre-landing EOF — would zero-fill the
+	// remainder and publish the loss.
 	var shadowErr error
 	if wb.RestorePart != nil {
 		data, err := wb.RestorePart(partIdx + 1)
@@ -444,27 +455,24 @@ func (wb *WriteBuffer) restoreEvictedPart(partIdx int) ([]byte, bool, error) {
 			return data, true, nil
 		}
 	}
-	if wb.LoadPart != nil {
-		if partStart < wb.remoteSize || shadowErr != nil {
-			data, err := wb.LoadPart(partIdx + 1)
-			// An error-free EMPTY result is not a restore: the production
-			// loader answers (nil, nil) for any part starting beyond the
-			// base size it captured at open — treating that as a zero hole
-			// zero-fills a part whose retained bytes exist (the landed
-			// image holds them) and silently publishes the loss. Only
-			// bytes actually supplied by the loader count.
-			if err == nil && len(data) > 0 {
-				return data, true, nil
-			}
-			if shadowErr == nil {
-				if err != nil {
-					return nil, false, err
-				}
-				return nil, false, fmt.Errorf("loaded evicted part %d of %s is empty", partIdx+1, wb.path)
-			}
-		}
+	if !wb.remoteAuthoritative || wb.LoadPart == nil {
+		return nil, false, shadowErr
 	}
-	return nil, false, shadowErr
+	data, err := wb.LoadPart(partIdx + 1)
+	if err != nil {
+		return nil, false, shadowErr
+	}
+	want := wb.totalSize - partStart
+	if want > wb.partSize {
+		want = wb.partSize
+	}
+	if int64(len(data)) != want {
+		if shadowErr == nil {
+			shadowErr = fmt.Errorf("loaded evicted part %d of %s is short: %d of %d bytes", partIdx+1, wb.path, len(data), want)
+		}
+		return nil, false, shadowErr
+	}
+	return data, true, nil
 }
 
 // markDirty marks all parts that overlap with [start, end) as dirty.
@@ -622,6 +630,14 @@ func (wb *WriteBuffer) PartSize() int64 {
 // territory. Call before any Write/Read/Truncate touches the buffer.
 func (wb *WriteBuffer) SetRemoteSize(size int64) {
 	wb.remoteSize = size
+}
+
+// MarkRemoteAuthoritative declares that the current remote image holds
+// every retained byte of this buffer — the owning handle's commit landed
+// and armed the remote loader. Only then may an evicted part fall back to
+// LoadPart when the shadow spill is gone.
+func (wb *WriteBuffer) MarkRemoteAuthoritative() {
+	wb.remoteAuthoritative = true
 }
 
 // SeedRemote installs a lazy base: the buffer logically spans size bytes

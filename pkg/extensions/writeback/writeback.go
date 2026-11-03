@@ -2047,6 +2047,10 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 				// must surface at the close(2) durability boundary.
 				return fs.StatusErrorOf(gofuse.Status(syscall.EIO))
 			}
+			// The landing retires isNew (later writes stage as overwrites
+			// of whatever landed) and re-bases evicted-part recovery on
+			// the remote image before the queue reclaims the shadow.
+			h.markLanded(0)
 			return nil
 		}
 		if h.w.uploader != nil && h.w.wbCache != nil {
@@ -2132,6 +2136,7 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 			if err := h.w.queue.WaitPathOutcome(h.path, uploadTimeout); err != nil {
 				return fs.StatusErrorOf(gofuse.Status(syscall.EIO))
 			}
+			h.markLanded(0)
 			h.mu.Lock()
 			h.dirty = false
 			h.mu.Unlock()
@@ -2435,6 +2440,9 @@ func (h *bufferingHandle) markLanded(rev int64) {
 		h.baseRev = rev
 	}
 	h.mu.Unlock()
+	// The landing makes the remote image authoritative: evicted parts
+	// must be able to restore from it once the shadow is reclaimed.
+	h.armRemoteRestore()
 }
 
 func attrSize(res fs.Result) int64 {
@@ -2667,6 +2675,56 @@ func (w *Writeback) armBypass(path string, rev, size int64, reason string) {
 	if w.bypass != nil {
 		w.bypass.ArmBypass(path, rev, size, reason)
 	}
+}
+
+// armRemoteRestore re-bases this handle's evicted-part recovery on the
+// landed remote image. A spilled buffer's only restore source is the
+// shadow, which the queue's success cleanup removes once the commit
+// lands — while this handle may stay open and keep evicting parts. For a
+// freshly created file the buffer has no LoadPart at all, so every later
+// write touching an evicted part failed with 'shadow file not found' and
+// surfaced as EIO on write(2). After a landing the remote image is
+// authoritative and complete, so it becomes the fallback restore source.
+func (h *bufferingHandle) armRemoteRestore() {
+	h.mu.Lock()
+	buf, cli, path := h.buf, h.w.opts.Client, h.path
+	size := int64(0)
+	partSize := int64(0)
+	if buf != nil {
+		size = buf.Size()
+		partSize = buf.PartSize()
+	}
+	h.mu.Unlock()
+	if buf == nil || cli == nil || partSize <= 0 || size <= 0 {
+		return
+	}
+	remote := h.w.remotePath(path)
+	buf.LoadPart = func(partNum int) ([]byte, error) {
+		start := int64(partNum-1) * partSize
+		if start >= size {
+			return nil, nil
+		}
+		end := start + partSize
+		if end > size {
+			end = size
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
+		defer cancel()
+		rc, err := cli.ReadStreamRange(ctx, remote, start, end-start)
+		if err != nil {
+			return nil, err
+		}
+		data, rerr := io.ReadAll(rc)
+		_ = rc.Close()
+		if rerr != nil {
+			return nil, rerr
+		}
+		return data, nil
+	}
+	buf.SetRemoteSize(size)
+	// The landed remote image now holds every retained byte: evicted
+	// parts may fall back to it once the queue reclaims the shadow.
+	buf.MarkRemoteAuthoritative()
 }
 
 func (w *Writeback) remotePath(p string) string {
@@ -4263,6 +4321,7 @@ func (h *bufferingHandle) commitLocked(ctx context.Context) error {
 		if err := h.w.queue.WaitPathOutcome(h.path, uploadTimeout); err != nil {
 			return fs.StatusErrorOf(gofuse.Status(syscall.EIO))
 		}
+		h.markLanded(0)
 		return nil
 	}
 	// Commit dispatch: a partial edit of an existing large file patches

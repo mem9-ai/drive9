@@ -241,8 +241,9 @@ func allZero(b []byte) bool {
 }
 
 // A landed commit removes the shadow spill while this handle's evicted parts
-// still reference it: the restore must fall back to the remote image (the
-// landed content is authoritative), and only fail when both sources do.
+// still reference it: once the handle has armed the remote loader (the
+// landing made the remote image authoritative), the restore falls back to
+// it — but only for a COMPLETE part, and never before the arming.
 func TestEvictedPartFallsBackToRemoteWhenShadowIsGone(t *testing.T) {
 	wb := partModeBuffer(4)
 	wb.SetSmallFileMax(1)
@@ -263,6 +264,8 @@ func TestEvictedPartFallsBackToRemoteWhenShadowIsGone(t *testing.T) {
 		loads.Add(1)
 		return []byte("dddd"), nil
 	}
+	// The handle's landing armed the remote restore.
+	wb.MarkRemoteAuthoritative()
 	wb.EvictPart(0)
 	if err := wb.EnsurePartsForWrite(0, 4); err != nil {
 		t.Fatalf("write after the shadow was reclaimed: %v", err)
@@ -286,26 +289,45 @@ func TestEvictedPartFallsBackToRemoteWhenShadowIsGone(t *testing.T) {
 		t.Fatal("both restore sources gone must fail, not zero-fill")
 	}
 
-	// The PRODUCTION loader shape: an error-free (nil, nil) for a part
-	// beyond the base size it captured at open. That is not a zero hole —
-	// the landed image holds the bytes — so the restore must refuse
-	// instead of growing a zero-filled part that silently loses them.
-	wb2 := partModeBuffer(4)
-	wb2.SetSmallFileMax(1)
-	if _, err := wb2.Write(0, []byte("aaaa")); err != nil {
+	// A loader still clamped to a PRE-LANDING EOF answers nonempty but
+	// short: the retained range is incomplete, so restoring it would
+	// zero-fill the discarded tail ("a" + zero-fill + X instead of abcX).
+	wb3 := partModeBuffer(4)
+	wb3.SetSmallFileMax(1)
+	if _, err := wb3.Write(0, []byte("abcd")); err != nil {
 		t.Fatal(err)
 	}
-	wb2.RestorePart = func(partNum int) ([]byte, error) {
+	wb3.RestorePart = func(partNum int) ([]byte, error) {
 		return nil, syscall.ENOENT // the queue reclaimed the shadow
 	}
-	wb2.LoadPart = func(partNum int) ([]byte, error) {
-		return nil, nil // boundary captured before the landing
+	wb3.LoadPart = func(partNum int) ([]byte, error) {
+		return []byte("a"), nil // stale boundary captured at open
 	}
-	wb2.EvictPart(0)
-	if err := wb2.EnsurePartsForWrite(0, 4); err == nil {
-		t.Fatal("an empty error-free fallback restored a part and would zero-fill it")
+	wb3.MarkRemoteAuthoritative()
+	wb3.EvictPart(0)
+	if err := wb3.EnsurePartsForWrite(3, 1); err == nil {
+		t.Fatal("a short fallback restored a part and would zero-fill its tail")
 	}
-	if err := wb2.EnsureLoaded(0); err == nil {
-		t.Fatal("a later full read must not silently serve the zero-filled part")
+
+	// Before the arming, a shadow error is NOT evidence that the remote
+	// holds this image: interactive staging acknowledges fsync while the
+	// upload is still pending, so the fallback must stay off and the
+	// shadow diagnostic propagate — even against a full-length stale
+	// remote part.
+	wb4 := partModeBuffer(4)
+	wb4.SetSmallFileMax(1)
+	if _, err := wb4.Write(0, []byte("modi")); err != nil {
+		t.Fatal(err)
+	}
+	wb4.RestorePart = func(partNum int) ([]byte, error) {
+		return nil, syscall.EIO // local read failure, upload pending
+	}
+	wb4.LoadPart = func(partNum int) ([]byte, error) {
+		return []byte("old!"), nil // pre-modification remote image
+	}
+	wb4.EvictPart(0)
+	err := wb4.EnsurePartsForWrite(0, 4)
+	if err == nil {
+		t.Fatal("an un-armed fallback silently replaced staged bytes with the stale remote image")
 	}
 }
