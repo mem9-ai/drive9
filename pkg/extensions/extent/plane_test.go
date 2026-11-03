@@ -4293,9 +4293,6 @@ func TestOverlayWithSurvivingWriteStaysProtected(t *testing.T) {
 	br.mu.Unlock()
 	_ = s1
 	// Direct: simulate releaseCommitted for S1 with Y still pending.
-	br.mu.Lock()
-	br.classicSeen[eh.ino] = f.ids["/d/f.bin"]
-	br.mu.Unlock()
 	br.releaseCommitted(eh.ino, []pendingWrite{pend[0]})
 	// Pressure hard: the ZYAA image must stay (Y is un-published).
 	for i := 0; i < 8; i++ {
@@ -4305,5 +4302,55 @@ func TestOverlayWithSurvivingWriteStaysProtected(t *testing.T) {
 	}
 	if got := readFront(t, eh, 4); got != "ZYAA" {
 		t.Fatalf("post-pressure read = %q, want ZYAA (an image with a surviving pending write must not demote)", got)
+	}
+}
+
+// Round-31: the overlay-resolution decision is taken in the SAME critical
+// section as the pending check — a write staged between the snapshot and
+// the clear keeps its image protected.
+func TestOverlayDecisionAtomicWithPendingCheck(t *testing.T) {
+	f := newFakeV2(t)
+	f.setLegacy(true)
+	f.setDir("/d", true)
+	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: engineCacheDir(t)})
+	h := New(Options{Engine: eng, Threshold: 0, SyncMode: "interactive"})
+	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
+	eh := res.Handle.(*engineHandle)
+	if err := eh.Write(context.Background(), 0, []byte("AAAA")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Write(context.Background(), 0, []byte("Z")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// The mid-flight Y lands BEFORE releaseCommitted samples the pending
+	// list (the exact window the separate-snapshot version missed).
+	if err := eh.Write(context.Background(), 1, []byte("Y")); err != nil {
+		t.Fatal(err)
+	}
+	old := classicReadCacheBytes
+	classicReadCacheBytes = 1
+	defer func() { classicReadCacheBytes = old }()
+	if got := readFront(t, eh, 4); got != "ZYAA" {
+		t.Fatalf("overlay read = %q, want ZYAA", got)
+	}
+	br := eng.Bridge
+	br.mu.Lock()
+	pend := br.pending[eh.ino]
+	br.mu.Unlock()
+	// Run releaseCommitted for the Z snapshot with Y already staged.
+	br.releaseCommitted(eh.ino, []pendingWrite{pend[0]})
+	for i := 0; i < 8; i++ {
+		d := make([]byte, 4096)
+		_, _ = rand.Read(d)
+		br.stageClassicChunk(sha256Hex(d), d, "/d/f.bin", int64(i+1)<<20, false, fmt.Sprintf("res-%d", i+2), 1)
+	}
+	if got := readFront(t, eh, 4); got != "ZYAA" {
+		t.Fatalf("post-pressure read = %q, want ZYAA (Y is still pending; its image must stay protected)", got)
 	}
 }

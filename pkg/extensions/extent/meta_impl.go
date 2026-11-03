@@ -1820,7 +1820,12 @@ func (b *Bridge) readClassic(ctx context.Context, ino meta.Ino, path string, sta
 		copy(data[off-start:], pdata)
 	}
 	sum := sha256Hex(data)
-	id := b.stageClassicChunk(sum, data, path, start, len(pending) > 0, firstNonEmpty(hdrID, b.remoteIdentity(ino, path)), ino)
+	// The refetch verifies the READ RESPONSE's identity; a stat-derived
+	// fallback cannot (the redirect/206 and legacy no-echo wire paths carry
+	// no echo, and a later stat may describe a replacement). Without a
+	// same-read identity the entry simply never demotes — its bytes stay
+	// resident and accounted instead of becoming an unreadable source.
+	id := b.stageClassicChunk(sum, data, path, start, len(pending) > 0, hdrID, ino)
 	*slices = []meta.Slice{{Id: id, Size: uint32(len(data)), Len: uint32(len(data))}}
 	return 0
 }
@@ -2000,35 +2005,6 @@ func rcHeaderResourceID(rc io.ReadCloser) string {
 	return ""
 }
 
-func firstNonEmpty(a, b string) string {
-	if a != "" {
-		return a
-	}
-	return b
-}
-
-// remoteIdentity returns the identity the bridge last saw for the file a
-// classic read was served from (empty when unknown).
-func (b *Bridge) remoteIdentity(ino meta.Ino, path string) string {
-	// The identity of whatever object CURRENTLY occupies the mapping (a
-	// rename means the mapping moved with the file; a replacement means a
-	// new id). Stat; on failure fall back to the last one seen for this
-	// inode's CURRENT mapping path.
-	if cur, ok := b.remotePath(ino); ok {
-		path = cur
-	}
-	if st, err := b.cfg.Client.StatCtx(context.Background(), path); err == nil {
-		b.mu.Lock()
-		b.classicSeen[ino] = st.ResourceID
-		b.mu.Unlock()
-		return st.ResourceID
-	}
-	b.mu.Lock()
-	id := b.classicSeen[ino]
-	b.mu.Unlock()
-	return id
-}
-
 // publicationIdentity returns the resource identity this inode's next
 // publication must be bound to: a verified recovery's constraint, or a
 // still-unclassified upload's captured (echoed) identity. Empty when
@@ -2140,25 +2116,25 @@ func (b *Bridge) TruncateLocal(ctx context.Context, local string, size int64) er
 // release cleared the sibling's bytes and a fresh sibling silently
 // uploaded zeros for them).
 func (b *Bridge) releaseCommitted(ino meta.Ino, pending []pendingWrite) {
+	// The reference snapshot, the overlay-resolution decision and the
+	// retirement share ONE critical section with Bridge.Write's staging
+	// (b.mu): a snapshot-then-unlock let a sibling stage the same checksum
+	// between the two and lose its bytes to the stale snapshot, and a
+	// separately-sampled "no pending writes" could clear an inode's
+	// overlay flags while a write staged in between was still
+	// un-published. Lock order is b.mu then registry.mu — Bridge.Write
+	// stages under b.mu before touching the registry, so no inversion
+	// exists.
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	// Whole-chunk overlay images from this inode become remotely
 	// reproducible only when NOTHING survives un-published: the surgical
 	// deletion preserved writes appended during the commit, and their
 	// bytes exist only inside those images. Resolving by commit snapshot
 	// (per checksum) left such images demotable with Y still pending.
-	b.mu.Lock()
-	surviving := len(b.pending[ino]) > 0
-	b.mu.Unlock()
-	if !surviving {
+	if len(b.pending[ino]) == 0 {
 		defer b.blocks.resolveOverlaysFor(ino)
 	}
-	// The reference snapshot and the retirement must share ONE critical
-	// section with Bridge.Write's staging (b.mu): a snapshot-then-unlock
-	// let a sibling stage the same checksum between the two and lose its
-	// bytes to the stale snapshot. Lock order is b.mu then registry.mu —
-	// Bridge.Write stages under b.mu before touching the registry, so no
-	// inversion exists.
-	b.mu.Lock()
-	defer b.mu.Unlock()
 	refs := make(map[string]int, len(pending))
 	// The surgical deletion has already removed THIS inode's committed
 	// snapshot, so its remaining list holds only writes that SURVIVED the

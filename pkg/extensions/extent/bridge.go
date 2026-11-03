@@ -104,10 +104,6 @@ type Bridge struct {
 	// owned by this bridge, so commits and reads keep serving it through
 	// the classic wire surface instead of erroring on the layout.
 	classicOwned map[meta.Ino]bool
-	// classicSeen remembers the resource identity each classic-owned
-	// inode last read from (the demotion provenance binds to it).
-	classicSeen map[meta.Ino]string
-
 	// deferred (interactive durability): meta.Write keeps slices pending
 	// locally instead of committing remotely at every writer flush; reads
 	// overlay the pending state and the remote commit lands at the
@@ -186,7 +182,6 @@ func NewBridge(cfg Config) *Bridge {
 		replacements:    make(map[string]meta.Ino),
 		commitLocks:     make(map[meta.Ino]*sync.Mutex),
 		classicOwned:    make(map[meta.Ino]bool),
-		classicSeen:     make(map[meta.Ino]string),
 		layoutPending:   make(map[meta.Ino]bool),
 		layoutPendingID: make(map[meta.Ino]string),
 		commitErr:       make(map[meta.Ino]error),

@@ -569,7 +569,22 @@ func (r *blockRegistry) fetch(ctx context.Context, c fetchClient, id uint64, off
 		if rerr != nil {
 			return nil, rerr
 		}
-		if got := rcHeaderResourceID(rc); got != snap.provResID {
+		if got := rcHeaderResourceID(rc); got == "" {
+			// Redirected (302/307) and legacy-inline reads carry no echo.
+			// Fall back to an identity STAT fenced against the same
+			// replacement risk as before the read: close the unverified
+			// body, verify, then re-read. A mismatch errors (never wrong
+			// bytes); the residual race is identical to the pre-read stat.
+			_ = rc.Close()
+			curID, serr := c.StatResourceID(ctx, path)
+			if serr != nil || curID != snap.provResID {
+				return nil, fmt.Errorf("classic slice %d source no longer holds the staged object", id)
+			}
+			rc, rerr = c.ReadStreamRange(ctx, path, snap.provenanceStart+off, limit)
+			if rerr != nil {
+				return nil, rerr
+			}
+		} else if got != snap.provResID {
 			_ = rc.Close()
 			return nil, fmt.Errorf("classic slice %d source no longer holds the staged object", id)
 		}
