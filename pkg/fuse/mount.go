@@ -1012,14 +1012,36 @@ func mountWithConfig(cfg MountConfig) error {
 		engineConf := extent.EngineConfig{
 			Client:     cl,
 			RemoteRoot: remoteRoot,
-			CacheDir:   cacheScopedDir(cacheBase, mountHash, "jfs-engine"),
-			ReadOnly:   cfg.ReadOnly,
+			// Cache placement: ONE shared tree with the read cache. Both
+			// planes live under the same scoped cache root; JuiceFS
+			// appends its volume UUID below it, so the engine's chunk
+			// cache is a direct child of the mount's cache scope rather
+			// than a parallel "jfs-engine" side tree — a single directory
+			// holds everything the mount caches, and the byte budgets
+			// below partition that one tree.
+			CacheDir:  extentCacheRoot(cacheBase, mountHash, readCacheHash),
+			ReadOnly:  cfg.ReadOnly,
+			FreeSpaceRatio: float32(cfg.DiskReadCacheFreeRatio),
+			// JuiceFS's OWN writeback pipeline: blocks below the threshold
+			// are staged into the engine's disk cache and uploaded by the
+			// chunk store asynchronously; the bridge waits for the bytes at
+			// the meta-commit boundary (the server verifies blocks then).
+			// Memory-only mounts (no cache dir) keep the direct path, as
+			// JuiceFS itself disables writeback without a disk cache.
+			Writeback:              !cfg.ReadOnly && cacheBase != "",
+			WritebackThresholdSize: int(client.ExtentBlockSize) + 1,
+			// In-flight staging concurrency feeding the shared cache
+			// budget (the bytes themselves are bounded by the engine's
+			// CacheSize half + the free-space floor).
+			MaxStageWrite: 40,
 		}
 		if cfg.DiskReadCacheSize > 0 {
 			// AGGREGATE budget: the classic read cache below is capped at
 			// half the configured bytes when the engine is armed (see the
 			// cache extension), so this half keeps the mount's total disk
 			// cache at exactly the configured limit across both planes.
+			// The engine's writeback staging lives in this same cache, so
+			// the partition bounds retained writeback bytes too.
 			engineConf.CacheSize = uint64(cfg.DiskReadCacheSize / 2)
 		}
 		engine := extent.NewEngine(engineConf)
@@ -1543,6 +1565,25 @@ func diskCacheOpts(dir string, sizeMB int64, freeRatio float64) cache.DiskReadCa
 
 // cacheScopedDir joins a named cache subtree under the mount-scoped
 // namespace; an unavailable cache base disables the subtree (empty).
+// extentCacheRoot is the engine's cache root inside the mount's shared
+// cache scope: the SAME parent directory the read cache occupies, so the
+// two planes share one cache tree (JuiceFS adds its own volume UUID under
+// it). A distinct hash would place the engine beside — not inside — the
+// read cache, which is exactly what the shared-placement contract forbids.
+func extentCacheRoot(cacheBase, mountHash, readCacheHash string) string {
+	if cacheBase == "" {
+		return ""
+	}
+	hash := readCacheHash
+	if hash == "" {
+		hash = mountHash
+	}
+	if hash == "" {
+		return cacheBase
+	}
+	return filepath.Join(cacheBase, hash)
+}
+
 func cacheScopedDir(cacheBase, hash, name string) string {
 	if cacheBase == "" {
 		return ""

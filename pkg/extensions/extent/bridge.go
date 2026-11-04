@@ -56,6 +56,15 @@ type Config struct {
 	// are spilled there at fsync and re-committed by a later mount when a
 	// remote commit never landed. Empty disables the barrier.
 	StagingDir string
+	// NativeWriteback declares that the chunk store runs JuiceFS's own
+	// writeback pipeline: blocks are staged to the disk cache and handed
+	// to the store's asynchronous uploader, so objectStorage.Put may run
+	// AFTER the writer's Finish returned. The meta side then waits
+	// (bounded) for a slice's blocks to land before committing it, since
+	// the server verifies every referenced block at commit time.
+	NativeWriteback bool
+	// WritebackWait bounds that wait (0 uses the upload timeout).
+	WritebackWait time.Duration
 }
 
 const (

@@ -4642,3 +4642,36 @@ func (b *Bridge) AddPendingForTest(ino meta.Ino, chunk, off uint32, sum string, 
 	b.sizes[ino] = total
 	b.mu.Unlock()
 }
+
+// Round-49: with JuiceFS's native writeback armed, blocks are staged to the
+// engine's disk cache and uploaded by the chunk store asynchronously; the
+// meta side must wait for them before committing (the server verifies every
+// referenced block). A write+flush through a writeback engine must land the
+// same bytes as the direct path.
+func TestNativeWritebackCommitWaitsForStagedBlocks(t *testing.T) {
+	f := newFakeV2(t)
+	f.setDir("/d", true)
+	eng := NewEngine(EngineConfig{
+		Client:                 client.New(f.URL, ""),
+		RemoteRoot:             "/",
+		CacheDir:               engineCacheDir(t),
+		CacheSize:              64 << 20,
+		Writeback:              true,
+		WritebackThresholdSize: int(client.ExtentBlockSize) + 1,
+	})
+	if !eng.Bridge.NativeWritebackForTest() {
+		t.Fatal("native writeback was not armed on the bridge")
+	}
+	h := New(Options{Engine: eng, Threshold: 0, SyncMode: "interactive"})
+	res, _, _ := dispatchCreate(context.Background(), h, "/d/w.bin", syscall.O_RDWR|syscall.O_CREAT)
+	eh := res.Handle.(*engineHandle)
+	if err := eh.Write(context.Background(), 0, []byte("WRITEBACK")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Flush(context.Background()); err != nil {
+		t.Fatalf("writeback flush: %v", err)
+	}
+	if got := f.contentOf("/d/w.bin"); got != "WRITEBACK" {
+		t.Fatalf("content = %q, want WRITEBACK", got)
+	}
+}

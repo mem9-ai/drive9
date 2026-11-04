@@ -24,6 +24,26 @@ type EngineConfig struct {
 	CacheDir string
 	// CacheSize bounds the disk cache in bytes (0 = default).
 	CacheSize uint64
+	// FreeSpaceRatio is the disk-cache free-space floor (JuiceFS
+	// free-space-ratio): eviction and staging both respect it so the
+	// cache never fills the volume. 0 = JuiceFS default (10%).
+	FreeSpaceRatio float32
+	// Writeback enables the ENGINE's own writeback pipeline: chunk blocks
+	// below WritebackThresholdSize land in the on-disk stage cache and are
+	// uploaded asynchronously by the chunk store (JuiceFS's native path),
+	// instead of the bridge's synchronous commit staging.
+	Writeback bool
+	// WritebackThresholdSize is the block-size cutoff for staging a block
+	// as a writeback block (JuiceFS default: BlockSize+1, i.e. every block
+	// that is not the full block size).
+	WritebackThresholdSize int
+	// WritebackWait bounds the meta-side wait for asynchronously uploaded
+	// blocks (0 uses a safe default).
+	WritebackWait time.Duration
+	// MaxStageWrite bounds concurrent staging writes (0 = JuiceFS default:
+	// 40 on Linux). Caps the in-flight writeback byte footprint feeding the
+	// shared cache budget.
+	MaxStageWrite int
 	// ReadOnly mounts never mutate the remote: staged interactive
 	// barriers are NOT replayed (their commits are writes).
 	ReadOnly bool
@@ -41,7 +61,12 @@ type Engine struct {
 
 // NewEngine builds a ready-to-use engine.
 func NewEngine(cfg EngineConfig) *Engine {
-	bcfg := Config{Client: cfg.Client, RemoteRoot: cfg.RemoteRoot}
+	bcfg := Config{
+		Client:          cfg.Client,
+		RemoteRoot:      cfg.RemoteRoot,
+		NativeWriteback: cfg.Writeback && cfg.CacheDir != "",
+		WritebackWait:   cfg.WritebackWait,
+	}
 	if cfg.CacheDir != "" {
 		// Interactive-durability staging lives with the engine's cache.
 		bcfg.StagingDir = filepath.Join(cfg.CacheDir, "commit-staging")
@@ -73,6 +98,20 @@ func NewEngine(cfg EngineConfig) *Engine {
 		Readahead:  0,
 		GetTimeout: time.Minute,
 		PutTimeout: time.Minute,
+		// Writeback (JuiceFS native pipeline): blocks below the threshold
+		// are staged to the disk cache and uploaded asynchronously, with
+		// the cache's own eviction/free-space accounting bounding the
+		// retained bytes. Requires a real cache directory (memory mode
+		// disables it in SelfCheck).
+		Writeback:              cfg.Writeback && cfg.CacheDir != "",
+		WritebackThresholdSize: cfg.WritebackThresholdSize,
+		FreeSpace:              cfg.FreeSpaceRatio,
+		// Bound how many blocks may sit in the stage area at once: the
+		// writeback byte budget is the shared cache quota (CacheSize +
+		// FreeSpace), and this caps the in-flight staging concurrency
+		// that feeds it (JuiceFS falls back to a direct upload when the
+		// stage area is full — errStageFull).
+		MaxStageWrite: cfg.MaxStageWrite,
 	}
 	store := chunk.NewCachedStore(b.Storage(), chunkConf, nil)
 	conf := &vfs.Config{

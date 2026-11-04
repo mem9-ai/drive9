@@ -14,6 +14,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -149,5 +151,25 @@ func TestExtentPromotionCutoffRespectsPatterns(t *testing.T) {
 	}
 	if got := extentPromotionCutoff(false, cl); got <= 0 {
 		t.Fatalf("hybrid promotion cutoff = %d, want the positive inline fallback", got)
+	}
+}
+
+// The engine's cache root must sit INSIDE the same scoped cache tree the
+// read cache occupies (both planes share one directory), never a parallel
+// side tree.
+func TestExtentCacheRootSharesReadCacheScope(t *testing.T) {
+	base := "/tmp/d9cache"
+	readHash := "readscope"
+	if got, want := extentCacheRoot(base, "mountscope", readHash), filepath.Join(base, readHash); got != want {
+		t.Fatalf("extentCacheRoot = %q, want %q (same scope as the read cache)", got, want)
+	}
+	// The read cache's own disk dir is a CHILD of that root.
+	readDir := cacheScopedDir(base, readHash, "read")
+	if !strings.HasPrefix(readDir, extentCacheRoot(base, "mountscope", readHash)) {
+		t.Fatalf("read cache %q is not inside the shared root", readDir)
+	}
+	// No cache base (memory-only) stays empty.
+	if got := extentCacheRoot("", "m", "r"); got != "" {
+		t.Fatalf("memory-only cache root = %q, want empty", got)
 	}
 }

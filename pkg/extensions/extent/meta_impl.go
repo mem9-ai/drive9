@@ -724,6 +724,16 @@ func (b *Bridge) Write(ctx meta.Context, ino meta.Ino, indx uint32, off uint32, 
 	if slice.Off != 0 {
 		return syscall.EIO // see package doc: engine merges RMW into whole blocks
 	}
+	if b.cfg.NativeWriteback {
+		// The chunk store owns the block upload (JuiceFS writeback): its
+		// staging is asynchronous, so the slice's bytes may not be in the
+		// registry yet when the writer's Finish returns. Wait for them
+		// before committing — the server verifies each referenced block,
+		// so publishing early would fail the PATCH (or worse, race it).
+		if !b.waitStagedSlice(ctxOf(ctx), slice.Id, int64(slice.Size)) {
+			return syscall.EIO
+		}
+	}
 	b.mu.Lock()
 	sl := b.stagedSlices[slice.Id]
 	if sl == nil || sl.total != int64(slice.Size) {
@@ -2215,6 +2225,35 @@ func (b *Bridge) MarkFreshCreate(ino meta.Ino) {
 	b.mu.Unlock()
 }
 
+// waitStagedSlice blocks until the store has delivered all blocks of the
+// slice (or the bounded wait expires). JuiceFS writeback stages blocks to
+// its disk cache and signals the writer before the object PUT completes,
+// so the meta side must not assume the bytes are present.
+func (b *Bridge) waitStagedSlice(ctx context.Context, id uint64, size int64) bool {
+	wait := b.cfg.WritebackWait
+	if wait <= 0 {
+		wait = 60 * time.Second
+	}
+	deadline := time.Now().Add(wait)
+	for {
+		b.mu.Lock()
+		sl := b.stagedSlices[id]
+		ready := sl != nil && sl.total == size
+		b.mu.Unlock()
+		if ready {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+}
+
 // needsFreshIdentity reports whether this inode is a locally-created
 // descriptor whose identity was never established (no verifyBase, no
 // bound landing identity, not classic-owned).
@@ -2666,3 +2705,6 @@ func max64(a, b int64) int64 {
 	}
 	return b
 }
+
+// NativeWritebackForTest reports the bridge's writeback mode (test hook).
+func (b *Bridge) NativeWritebackForTest() bool { return b.cfg.NativeWriteback }
