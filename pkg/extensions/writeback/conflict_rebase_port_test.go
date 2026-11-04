@@ -91,21 +91,70 @@ func TestPortConflictedEntryRebasesOntoOwnLanding(t *testing.T) {
 		t.Fatalf("landed watermark = %d %v, want the winner's revision > 1", r, ok)
 	}
 
-	// The loser: an entry staged at the PRE-landing base (exactly what the
-	// racing flush captured before the winner landed).
-	if err := wb.wbCache.PutWithBaseRevAndMode("/f", []byte("loser!!"), 7, staging.PendingOverwrite, 1, 0o644, false); err != nil {
+	// The loser: the SAME image staged at the PRE-landing base (exactly
+	// what the racing duplicate flush captured before the winner landed).
+	if err := wb.wbCache.PutWithBaseRevAndMode("/f", []byte("winner!"), 7, staging.PendingOverwrite, 1, 0o644, false); err != nil {
 		t.Fatal(err)
 	}
-	// Its upload conflicts on base 1, rebases onto the winner's revision,
-	// and lands — the flush that routed here succeeds instead of EIO.
+	// Its upload conflicts on base 1, proves itself the winner's duplicate
+	// (size + CRC against the landed record), rebases onto the winner's
+	// revision, and lands — the flush that routed here succeeds instead of
+	// EIO.
 	if _, err := wb.uploader.UploadSyncWithRevision(ctx, "/f"); err != nil {
-		t.Fatalf("conflicted entry was not repaired: %v", err)
+		t.Fatalf("conflicted duplicate was not repaired: %v", err)
 	}
-	if n, _ := b.Node("/f"); string(n.Data) != "loser!!" {
-		t.Fatalf("backend = %q, want the repaired loser image", n.Data)
+	if n, _ := b.Node("/f"); string(n.Data) != "winner!" {
+		t.Fatalf("backend = %q, want the repaired image", n.Data)
 	}
 	if _, ok := wb.wbCache.GetMeta("/f"); ok {
 		t.Fatal("repaired entry survived in the write cache")
+	}
+}
+
+// TestPortDivergentConflictStaysPending pins the repair's payload gate:
+// two handles staging DIFFERENT whole-file images from one base both
+// conflict when the first lands, but the watermark only proves the mount
+// wrote the winning revision — not that the loser's image is its
+// duplicate. Rebase-and-overwrite would lose the winner's bytes, so the
+// divergent entry stays pending like any other divergent writer.
+func TestPortDivergentConflictStaysPending(t *testing.T) {
+	b, wb, ch, _ := newConflictStack(t)
+	ctx := context.Background()
+
+	h := openExisting(t, ch, "/f")
+	if err := h.Write(ctx, 0, []byte("first!!")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if n, ok := b.Node("/f"); ok && string(n.Data) == "first!!" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("winner cycle never landed")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// A divergent image staged at the same pre-landing base: same size
+	// class, different bytes.
+	if err := wb.wbCache.PutWithBaseRevAndMode("/f", []byte("second!"), 7, staging.PendingOverwrite, 1, 0o644, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wb.uploader.UploadSyncWithRevision(ctx, "/f"); err == nil {
+		t.Fatal("a divergent conflicted image must not rebase onto the winner")
+	}
+	if meta, ok := wb.wbCache.GetMeta("/f"); !ok || meta.BaseRev != 1 {
+		t.Fatalf("divergent entry = %+v ok=%t, want it retained at its original base", meta, ok)
+	}
+	if n, _ := b.Node("/f"); string(n.Data) != "first!!" {
+		t.Fatalf("backend = %q, want the winner's image untouched", n.Data)
 	}
 }
 
@@ -206,10 +255,10 @@ func TestPortConflictRepairSuspendedWhileUnverified(t *testing.T) {
 		t.Fatalf("watermark during gap = %d %v, want the just-landed revision", r, ok)
 	}
 
-	// A duplicate-commit loser staged at the pre-gap base: its upload
-	// conflicts, and the repair must refuse the watermark while
-	// continuity is unverified.
-	if err := wb.wbCache.PutWithBaseRevAndMode("/f", []byte("loser!!"), 7, staging.PendingOverwrite, 2, 0o644, false); err != nil {
+	// A duplicate-commit loser — the SAME image the gap landing wrote —
+	// staged at the pre-gap base: its upload conflicts, and the repair
+	// must refuse the watermark while continuity is unverified.
+	if err := wb.wbCache.PutWithBaseRevAndMode("/f", []byte("gap!!!"), 6, staging.PendingOverwrite, 2, 0o644, false); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := wb.uploader.UploadSyncWithRevision(ctx, "/f"); err == nil {
@@ -222,15 +271,83 @@ func TestPortConflictRepairSuspendedWhileUnverified(t *testing.T) {
 		t.Fatalf("backend = %q, want the gap image untouched", n.Data)
 	}
 
-	// Re-verified: the same conflict repairs onto our own landing.
+	// Re-verified: the same duplicate conflict repairs onto our own
+	// landing.
 	wb.opts.Events.Emit(fs.Event{Kind: fs.EventVerified, Path: "/"})
 	if _, err := wb.uploader.UploadSyncWithRevision(ctx, "/f"); err != nil {
 		t.Fatalf("repair did not resume after EventVerified: %v", err)
 	}
-	if n, _ := b.Node("/f"); string(n.Data) != "loser!!" {
-		t.Fatalf("backend = %q, want the repaired image", n.Data)
-	}
 	if _, ok := wb.wbCache.GetMeta("/f"); ok {
 		t.Fatal("repaired entry survived in the write cache")
+	}
+}
+
+// TestPortRecoveryOwnershipSnapshot pins the recovery split's snapshot
+// rule: a crash can leave BOTH a pending-index entry and an older .dat/
+// .meta snapshot for one path (the ledger put landed but the enqueue's
+// cache removal did not). The queue starts workers inside its own
+// RecoverPending; if the uploader's filter consulted the LIVE pending
+// index afterwards, a path the queue had already landed and removed would
+// pass and get the stale snapshot submitted as a second owner — a
+// permanent conflict or a same-origin rebase republishing stale bytes.
+// The ownership set is captured before either track starts, so the stale
+// snapshot stays put.
+func TestPortRecoveryOwnershipSnapshot(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/f", []byte("seeded"))
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	ledger, err := staging.NewStaging(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wb, err := New(Options{Policy: PolicyWriteBack, Client: cl, WriteCacheDir: t.TempDir(), Staging: ledger})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fs.NewChain(wb, terminal); err != nil {
+		t.Fatal(err)
+	}
+
+	// The ledger track's state: a durable shadow image plus its pending
+	// entry (what a crashed enqueue leaves behind).
+	if err := ledger.Shadow.WriteFull("/f", []byte("ledger-image"), 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ledger.Pending.PutWithBaseRevAndMode("/f", 12, staging.PendingOverwrite, 1, 0o644, false); err != nil {
+		t.Fatal(err)
+	}
+	// The stale .dat/.meta snapshot the flush left for the same path.
+	if err := wb.wbCache.PutWithBaseRevAndMode("/f", []byte("stale-snapshot"), 14, staging.PendingOverwrite, 1, 0o644, false); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := wb.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// The queue recovers its own entry and lands it; the uploader must
+	// never touch the stale snapshot (it stays cached, byte-identical).
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if n, ok := b.Node("/f"); ok && string(n.Data) == "ledger-image" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("ledger recovery never landed")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	// Give the uploader's recovery pass ample time to (wrongly) run.
+	time.Sleep(500 * time.Millisecond)
+	if data, ok := wb.wbCache.GetView("/f"); !ok || string(data) != "stale-snapshot" {
+		t.Fatalf("stale snapshot = %q ok=%t, want it untouched (ledger-owned path)", data, ok)
+	}
+	if n, _ := b.Node("/f"); string(n.Data) != "ledger-image" {
+		t.Fatalf("backend = %q, want the ledger image alone", n.Data)
 	}
 }

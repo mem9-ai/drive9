@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"net/http"
 	"os"
@@ -379,7 +380,15 @@ func New(opts Options) (*Writeback, error) {
 		// provably ours anymore.
 		opts.Events.On(fs.EventInvalidated, func(ev fs.Event) { w.forgetLanded(ev.Path) })
 		opts.Events.On(fs.EventDelete, func(ev fs.Event) { w.forgetLanded(ev.Path) })
-		opts.Events.On(fs.EventCheckout, func(fs.Event) { w.clearLanded() })
+		opts.Events.On(fs.EventCheckout, func(fs.Event) {
+			// A checkout rides a RESET on the live stream (the SSE reset
+			// path emits no separate EventVerified), so the unverified
+			// suspension ends here too — leaving it set would disable
+			// watermark adoption and conflict repair forever after one
+			// disconnect followed by a reset.
+			w.unverified.Store(false)
+			w.clearLanded()
+		})
 		// Stream continuity lost: ordinary file API keeps working while
 		// change events stop, so a foreign delete+recreate can replace a
 		// path with a LOW revision under a stale high watermark and no
@@ -422,24 +431,33 @@ func New(opts Options) (*Writeback, error) {
 		}
 		up := NewWriteBackUploader(opts.Client, w.wbCache, workers, root)
 		up.ResolveConflict = func(path string, meta *staging.WriteBackMeta, conflictedBase int64) (int64, bool) {
-			// Same-origin proof: the landed watermark holds exactly the
-			// revisions THIS mount recorded. A conflicted entry rebases only
-			// onto one of those — a duplicate-commit race (the kernel's
-			// asynchronous RELEASE racing a handoff flush of one handle, the
-			// loser staging at the pre-landing base) heals without a remote
-			// stat; a foreign advance never enters the table and stays
-			// conflicted. The proof obeys the same continuity restriction as
-			// every other watermark use: while the event stream is
-			// unverified the table may hold revisions recorded DURING the
-			// gap (uploads keep succeeding, OnSuccess keeps landing), and a
-			// foreign recreation whose events have not arrived could sit at
-			// a coincidentally equal revision — rebase onto it and the
-			// stale image would overwrite the foreign bytes.
+			// Same-origin AND same-payload proof. The landed watermark holds
+			// exactly the revisions THIS mount recorded, and its size+CRC
+			// identify the bytes that revision landed. A conflicted entry
+			// rebases only when it is that landing's own DUPLICATE — the
+			// duplicate-commit race (the kernel's asynchronous RELEASE
+			// racing a handoff flush of one handle, the loser staging the
+			// same image at the pre-landing base) — because rebasing a
+			// DIVERGENT image onto the winner's revision would overwrite
+			// the winner's bytes (two handles staging different whole-file
+			// images from one base both conflict; the loser must stay
+			// pending like any divergent writer). A foreign advance never
+			// enters the table and stays conflicted. The proof obeys the
+			// same continuity restriction as every other watermark use:
+			// while the event stream is unverified the table may hold
+			// revisions recorded DURING the gap (uploads keep succeeding,
+			// OnSuccess keeps landing), and a foreign recreation whose
+			// events have not arrived could sit at a coincidentally equal
+			// revision — rebase onto it and the stale image would overwrite
+			// the foreign bytes.
 			if w.unverified.Load() {
 				return 0, false
 			}
-			rev, ok := w.landedRevision(path)
+			rev, size, crc, ok := w.landedRecord(path)
 			if !ok || rev <= conflictedBase || rev <= meta.BaseRev {
+				return 0, false
+			}
+			if size != meta.Size || (crc != 0 && crc != meta.DataCRC) {
 				return 0, false
 			}
 			if !w.wbCache.RebaseBaseRevIfGeneration(path, meta.Generation, rev) {
@@ -455,7 +473,7 @@ func New(opts Options) (*Writeback, error) {
 			// root "/team": "/f"), so landedAt/inode-settle updated the
 			// wrong path and the uploaded file missed its own landing.
 			if committedRev > 0 {
-				w.landedAt(meta.Path, committedRev, meta.Size)
+				w.landedAt(meta.Path, committedRev, meta.Size, meta.DataCRC)
 			}
 			if w.commitSeeder != nil && committedRev > 0 && meta.Size > 0 && w.commitSeedAllowed(meta.Size) {
 				if data, derr := w.wbCache.Get(meta.Path); derr && int64(len(data)) == meta.Size {
@@ -496,7 +514,7 @@ func New(opts Options) (*Writeback, error) {
 			// revision (row updated, backend replicas still converging) then
 			// serve this mount's own bytes instead of a lagging replica.
 			if committedRev > 0 {
-				w.landedAt(entry.Path, committedRev, entry.Size)
+				w.landedAt(entry.Path, committedRev, entry.Size, 0)
 			}
 			if w.commitSeeder != nil && committedRev > 0 && entry.Size > 0 && w.commitSeedAllowed(entry.Size) {
 				if data, derr := opts.Staging.Shadow.ReadAll(entry.Path); derr == nil && int64(len(data)) == entry.Size {
@@ -603,13 +621,25 @@ func (w *Writeback) Start(ctx context.Context) error {
 			fmt.Fprintf(os.Stderr, "drive9: pending index recovery: %v\n", err)
 		}
 	}
+	// Recovery ownership is snapshotted BEFORE either track starts: the
+	// queue's workers begin inside RecoverPending, and a path they land and
+	// remove before the uploader's filter evaluates would pass a live
+	// HasPending check and get the stale .dat/.meta submitted as a second
+	// recovery owner — a permanent conflict, or a same-origin rebase
+	// republishing the stale bytes. The immutable snapshot owns the split.
+	var ledgerOwned map[string]struct{}
+	if w.opts.Staging != nil && w.opts.Staging.Pending != nil {
+		ledgerOwned = w.opts.Staging.Pending.ListUncommittedPaths()
+	}
 	if w.queue != nil {
 		w.queue.RecoverPending()
 	}
 	if w.uploader != nil {
-		if w.queue != nil && w.opts.Staging != nil && w.opts.Staging.Pending != nil {
-			pending := w.opts.Staging.Pending
-			w.uploader.RecoverPendingFilter(func(p string) bool { return pending.HasPending(p) })
+		if ledgerOwned != nil {
+			w.uploader.RecoverPendingFilter(func(p string) bool {
+				_, ok := ledgerOwned[p]
+				return ok
+			})
 		} else {
 			w.uploader.RecoverPending()
 		}
@@ -1379,7 +1409,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			w.wbCache.RemoveIfGeneration(p, meta.Generation)
 			if rev > 0 {
 				landedRev, landedSize = rev, meta.Size
-				w.landedAt(p, rev, meta.Size)
+				w.landedAt(p, rev, meta.Size, meta.DataCRC)
 			}
 			return nil
 		}
@@ -1478,7 +1508,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		// conflicted, silently dropping the acknowledged bytes.
 		if landedRev > 0 {
 			w.settleRenamedHandle(op.Path2, landedRev, landedSize)
-			w.landedAt(op.Path2, landedRev, landedSize)
+			w.landedAt(op.Path2, landedRev, landedSize, 0)
 		}
 		// staged descendants migrate to the new
 		// prefix alongside the remote rename.
@@ -2121,6 +2151,12 @@ func (h *bufferingHandle) Sync(ctx context.Context) error {
 	staged := h.stagedToCache
 	h.mu.Unlock()
 	if staged && h.w.uploader != nil {
+		// Capture the staged payload's identity BEFORE the upload: the
+		// upload's success removes the entry the landing record proves.
+		var stagedCRC uint32
+		if m, ok := h.w.wbCache.GetMeta(h.path); ok {
+			stagedCRC = m.DataCRC
+		}
 		rev, err := h.w.uploader.UploadSyncWithRevision(ctx, h.path)
 		if err != nil {
 			return err
@@ -2130,7 +2166,7 @@ func (h *bufferingHandle) Sync(ctx context.Context) error {
 		h.stagedToCache = false
 		h.mu.Unlock()
 		h.markLanded(rev)
-		h.w.landedAt(h.path, rev, size)
+		h.w.landedAt(h.path, rev, size, stagedCRC)
 	}
 	return nil
 }
@@ -2193,6 +2229,13 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 			if err := h.stageToWriteCache(ctx, isNew, stageFullDurable); err != nil {
 				return err
 			}
+			// Capture the staged payload's identity BEFORE the upload: the
+			// landing record's CRC is the same-origin repair's payload
+			// proof, and a successful upload removes the entry.
+			var stagedCRC uint32
+			if m, ok := h.w.wbCache.GetMeta(h.path); ok {
+				stagedCRC = m.DataCRC
+			}
 			h.mu.Lock()
 			h.stagedToCache = true
 			stagedGen := h.wgen
@@ -2206,7 +2249,7 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 			// OnSuccess feeds the landed table — record the watermark here
 			// so append siblings see the advance without a remote stat
 			// (v1 recordCommittedRevisionWithSize at this boundary).
-			h.w.landedAt(h.path, rev, stagedSize)
+			h.w.landedAt(h.path, rev, stagedSize, stagedCRC)
 			h.mu.Lock()
 			h.stagedToCache = false
 			// The image is on the remote now — for every create shape, not
@@ -3480,13 +3523,16 @@ func (w *Writeback) hasPendingLocalState(path string) bool {
 }
 
 // landedAt records this mount's own just-landed commits (queue/uploader
-// success): path → revision+size with a settle time. Lookups inside the
-// window answer from local knowledge — the backend replicas converge
-// asynchronously, and a chain stat racing the landing reads the stale
-// replica and poisons the namespace cache with a negative row (the
-// close/write-sync modes land on every close, so this seam dominates
-// their ENOENT counts).
-func (w *Writeback) landedAt(path string, rev, size int64) {
+// success): path → revision+size (+ the payload's CRC, when the landing
+// knows it) with a settle time. Lookups inside the window answer from
+// local knowledge — the backend replicas converge asynchronously, and a
+// chain stat racing the landing reads the stale replica and poisons the
+// namespace cache with a negative row (the close/write-sync modes land on
+// every close, so this seam dominates their ENOENT counts). The CRC is
+// the payload-identity half of a same-origin conflict repair: it proves
+// a conflicted entry is the landing's own duplicate, not a divergent
+// image that happens to share the mount.
+func (w *Writeback) landedAt(path string, rev, size int64, crc uint32) {
 	if rev <= 0 {
 		return
 	}
@@ -3494,7 +3540,7 @@ func (w *Writeback) landedAt(path string, rev, size int64) {
 	if w.landed == nil {
 		w.landed = map[string]landedInfo{}
 	}
-	w.landed[path] = landedInfo{rev: rev, size: size, at: time.Now()}
+	w.landed[path] = landedInfo{rev: rev, size: size, crc: crc, at: time.Now()}
 	w.landedMu.Unlock()
 }
 
@@ -3551,13 +3597,17 @@ func (w *Writeback) landedCoversInode(path string, rev int64) bool {
 // landedRevision returns this mount's newest recorded landing revision at
 // path.
 func (w *Writeback) landedRevision(path string) (int64, bool) {
+	rev, _, _, ok := w.landedRecord(path)
+	return rev, ok
+}
+
+// landedRecord returns the newest landing record at path: revision, size,
+// payload CRC (0 = the landing did not know it), presence.
+func (w *Writeback) landedRecord(path string) (rev, size int64, crc uint32, ok bool) {
 	w.landedMu.Lock()
-	info, ok := w.landed[path]
+	info, has := w.landed[path]
 	w.landedMu.Unlock()
-	if !ok {
-		return 0, false
-	}
-	return info.rev, true
+	return info.rev, info.size, info.crc, has
 }
 
 // landedRevisionIs reports whether rev is a revision THIS mount landed at
@@ -3585,6 +3635,7 @@ func (w *Writeback) landedAttr(path string) (fs.Attr, bool) {
 type landedInfo struct {
 	rev  int64
 	size int64
+	crc  uint32 // payload CRC32 at landing time (0 = unknown)
 	at   time.Time
 }
 
@@ -3717,7 +3768,11 @@ func (h *bufferingHandle) commitInline(ctx context.Context) error {
 
 	committedRev, err := h.w.commitReaderOpt(ctx, h.path, newReader, size, isNew && size == 0, baseRev)
 	if err == nil {
-		h.w.landedAt(h.path, committedRev, size)
+		var crc uint32
+		if image != nil {
+			crc = crc32.ChecksumIEEE(image)
+		}
+		h.w.landedAt(h.path, committedRev, size, crc)
 		if h.w.commitSeeder != nil && image != nil && h.w.commitSeedAllowed(int64(len(image))) {
 			h.w.commitSeeder(h.path, image, committedRev)
 		}
@@ -4630,28 +4685,48 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, isNew bool, dur
 	h.mu.Unlock()
 	if isNew {
 		baseRev = 0
-	} else if !h.w.unverified.Load() {
-		// v1 adoptCommittedRevisionLocked: the CAS base composes with this
-		// mount's OWN landed watermark — the local table the queue and the
-		// uploader record on every success — never a remote HEAD (v1's
-		// flush-stage never touched the wire; the direct stat here cost
-		// every small-file close one synchronous round trip). Two cases
-		// may advance it: no lineage at all (a legacy open that never
-		// observed one), or a newer revision this mount itself landed
-		// (same-origin by construction — an async upload advanced the row
-		// under an unobserved open). A foreign write never enters the
-		// table, so it stays a conflict: adopting its revision would let
-		// the stale image overwrite it silently (hello+X vs WORLD landed
-		// Xello). While the event stream is UNVERIFIED the watermark
-		// proves nothing — an unobserved foreign delete+recreate may sit
-		// above the recorded incarnation — so the open-time base, read
-		// fresh from the current row, stays authoritative until
-		// EventVerified.
-		if r, ok := h.w.landedRevision(h.path); ok && (baseRev <= 0 || r > baseRev) {
-			h.mu.Lock()
-			h.baseRev = r
-			h.mu.Unlock()
-			baseRev = r
+	} else {
+		if !h.w.unverified.Load() {
+			// v1 adoptCommittedRevisionLocked: the CAS base composes with
+			// this mount's OWN landed watermark — the local table the queue
+			// and the uploader record on every success — never a remote
+			// HEAD (v1's flush-stage never touched the wire; the direct
+			// stat here cost every small-file close one synchronous round
+			// trip). It may advance the base to a newer revision this mount
+			// itself landed (same-origin by construction — an async upload
+			// advanced the row under an unobserved open). A foreign write
+			// never enters the table, so it stays a conflict: adopting its
+			// revision would let the stale image overwrite it silently
+			// (hello+X vs WORLD landed Xello). While the event stream is
+			// UNVERIFIED the watermark proves nothing — an unobserved
+			// foreign delete+recreate may sit above the recorded
+			// incarnation — so the open-time base stays authoritative until
+			// EventVerified.
+			if r, ok := h.w.landedRevision(h.path); ok && r > baseRev {
+				h.mu.Lock()
+				h.baseRev = r
+				h.mu.Unlock()
+				baseRev = r
+			}
+		}
+		if baseRev <= 0 {
+			// Lineage is MISSING: a second writable open of a live writer's
+			// path answers Attr.Rev 0 (#984 stat visibility zeroes the
+			// revision), so the handle carries no base and neither the
+			// open-time probe nor the watermark can recover one. v1
+			// discovered the authoritative revision at exactly this seam
+			// ("If BaseRev is still 0... fetch the authoritative revision");
+			// without it the writeback tier strands the entry (a
+			// PendingOverwrite without a base is rejected before upload,
+			// and recovery skips it) while close-sync degrades to an
+			// UNCONDITIONAL put that overwrites even a known-foreign row.
+			// One remote HEAD, only on this rare lineage-less path.
+			if st, serr := h.w.opts.Client.StatCtx(ctx, h.w.remotePath(h.path)); serr == nil && st != nil && st.Revision > 0 {
+				h.mu.Lock()
+				h.baseRev = st.Revision
+				h.mu.Unlock()
+				baseRev = st.Revision
+			}
 		}
 	}
 	kind := staging.PendingOverwrite

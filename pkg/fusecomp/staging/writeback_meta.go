@@ -920,6 +920,56 @@ func (c *WriteBackCache) ListPending() []PendingEntry {
 	return result
 }
 
+// ListPendingMetas enumerates the pending entries' METADATA only. It is
+// the recovery-scheduling path: unlike ListPending it never loads a
+// payload, so a mount recovering a large on-disk backlog stays bounded by
+// the per-upload working set (the worker loads one image at a time through
+// GetMetaAndView) instead of materializing the backlog's total bytes.
+func (c *WriteBackCache) ListPendingMetas() []WriteBackMeta {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	entries, err := os.ReadDir(c.dir)
+	if err == nil {
+		for _, e := range entries {
+			name := e.Name()
+			if !strings.HasSuffix(name, ".meta") {
+				continue
+			}
+			metaPath := filepath.Join(c.dir, name)
+			raw, err := os.ReadFile(metaPath)
+			if err != nil {
+				continue
+			}
+			var meta WriteBackMeta
+			if err := json.Unmarshal(raw, &meta); err != nil {
+				c.pruneScannedEntry(name)
+				continue
+			}
+			if !c.validateScannedMeta(name, &meta) {
+				c.pruneScannedEntry(name)
+				continue
+			}
+			if _, ok := c.metas[meta.Path]; !ok {
+				cp := meta
+				c.metas[meta.Path] = &cp
+				if meta.Generation > c.nextGen.Load() {
+					c.nextGen.Store(meta.Generation)
+				}
+			}
+		}
+	}
+
+	result := make([]WriteBackMeta, 0, len(c.metas))
+	for _, meta := range c.metas {
+		if meta.Kind == PendingConflict {
+			continue
+		}
+		result = append(result, *meta)
+	}
+	return result
+}
+
 func (c *WriteBackCache) pruneScannedEntry(scannedMetaName string) {
 	base := strings.TrimSuffix(scannedMetaName, ".meta")
 	_ = os.Remove(filepath.Join(c.dir, scannedMetaName))

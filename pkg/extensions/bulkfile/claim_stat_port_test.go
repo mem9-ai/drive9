@@ -285,3 +285,43 @@ func TestPortStaleDentryOpenFallsBackToCreate(t *testing.T) {
 		t.Fatalf("fallback claim pushed=%d dirty=%t, want 0/false", sh.pushed, sh.dirty)
 	}
 }
+
+// TestPortKernelOpenTruncWithoutCreateClaims: Linux strips O_CREAT from
+// FUSE_OPEN for existing files, so `: > f` arrives as OPEN|O_TRUNC with
+// no O_CREAT. The claim must take that shape too — its truncation
+// ownership cannot depend on which kernel forwarded the flags.
+func TestPortKernelOpenTruncWithoutCreateClaims(t *testing.T) {
+	below := &stubBelow{size: 4096, rev: 9}
+	ch, b := claimStack(t, below)
+	ctx := context.Background()
+
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/live.bin",
+		Flags:  uint32(syscall.O_WRONLY | syscall.O_TRUNC),
+		Kernel: &gofuse.OpenIn{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sh, ok := res.Handle.(*streamHandle)
+	if !ok {
+		t.Fatalf("handle = %T, want *streamHandle (the claim must own the kernel OPEN|O_TRUNC shape)", res.Handle)
+	}
+	if below.getattrs != 0 {
+		t.Fatalf("kernel OPEN probed existence: %d stat ops below", below.getattrs)
+	}
+	assertNoDirectRemote(t, b)
+	if len(below.creates) != 1 {
+		t.Fatalf("creates = %d, want 1", len(below.creates))
+	}
+	if got := below.creates[0]; got&uint32(syscall.O_TRUNC) != 0 {
+		t.Fatalf("inner open flags = %#x, want O_TRUNC cleared (the claim owns the truncation)", got)
+	}
+	if sh.pushed != 4096 || !sh.dirty {
+		t.Fatalf("claim pushed=%d dirty=%t, want 4096/true (truncation pending)", sh.pushed, sh.dirty)
+	}
+	if err := sh.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(below.setattrs) != 1 || below.setattrs[0] != 0 {
+		t.Fatalf("boundary setattr sizes = %v, want one truncation to 0", below.setattrs)
+	}
+}

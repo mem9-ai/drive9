@@ -308,21 +308,24 @@ func (u *WriteBackUploader) RecoverPending() {
 
 // RecoverPendingFilter is RecoverPending with a skip predicate: paths for
 // which skip reports true belong to another track's recovery (the staging
-// ledger's pending index) and are left alone.
+// ledger's pending index) and are left alone. It enumerates metadata only
+// — the payloads are loaded one at a time by the workers, so recovering a
+// large backlog never materializes its total bytes.
 func (u *WriteBackUploader) RecoverPendingFilter(skip func(localPath string) bool) {
-	entries := u.cache.ListPending()
+	metas := u.cache.ListPendingMetas()
 	skippedLegacyOverwrites := 0
-	for _, e := range entries {
-		if skip != nil && skip(e.Meta.Path) {
+	for i := range metas {
+		path, meta := metas[i].Path, &metas[i]
+		if skip != nil && skip(path) {
 			continue
 		}
-		if e.Meta.Kind == staging.PendingOverwrite && e.Meta.BaseRev <= 0 {
+		if meta.Kind == staging.PendingOverwrite && meta.BaseRev <= 0 {
 			skippedLegacyOverwrites++
-			safeLogPrintf("writeback: skipping legacy overwrite without base revision for %s", e.Meta.Path)
+			safeLogPrintf("writeback: skipping legacy overwrite without base revision for %s", path)
 			continue
 		}
-		safeLogPrintf("writeback: recovering pending upload for %s (%d bytes)", e.Meta.Path, e.Meta.Size)
-		u.Submit(e.Meta.Path)
+		safeLogPrintf("writeback: recovering pending upload for %s (%d bytes)", path, meta.Size)
+		u.Submit(path)
 	}
 	if skippedLegacyOverwrites > 0 {
 		safeLogPrintf("writeback: skipped %d legacy overwrite entries without base revision during recovery", skippedLegacyOverwrites)
@@ -599,13 +602,19 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 			break
 		}
 		if errors.Is(lastErr, client.ErrConflict) {
-			// Same-origin repair first: if this mount itself landed a newer
-			// revision after this entry staged (a duplicate-commit race —
-			// the kernel's asynchronous RELEASE racing a handoff flush of
-			// the same handle), rebase onto the winner's base and retry
+			// Same-origin repair first: if this mount itself landed this
+			// entry's image after it staged (a duplicate-commit race — the
+			// kernel's asynchronous RELEASE racing a handoff flush of the
+			// same handle), rebase onto the winner's base and retry
 			// instead of staying conflicted forever.
 			if rev, ok := u.resolveConflict(localPath, meta, expectedRevision); ok {
 				expectedRevision = rev
+				if attempt == uploadMaxRetries {
+					// The repair earned its own attempt: refund this slot
+					// so the rebased PUT runs even when the conflict hit
+					// the last ordinary attempt.
+					attempt--
+				}
 				continue
 			}
 			break

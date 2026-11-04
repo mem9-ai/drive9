@@ -340,7 +340,12 @@ func TestPortUnverifiedStreamSuspendsWatermarkAdoption(t *testing.T) {
 		deadline := time.Now().Add(5 * time.Second)
 		for {
 			if n, ok := b.Node("/f"); ok && string(n.Data) == content {
-				return
+				// Also wait for the uploader's callback: the backend can
+				// expose the content before OnSuccess records the landed
+				// revision the next assertions read.
+				if _, landed := wb.landedRevision("/f"); landed {
+					return
+				}
 			}
 			if time.Now().After(deadline) {
 				t.Fatalf("cycle for %q never landed", content)
@@ -408,5 +413,69 @@ func TestPortUnverifiedStreamSuspendsWatermarkAdoption(t *testing.T) {
 	cycle("third!!")
 	if _, ok := wb.landedRevision("/f"); !ok {
 		t.Fatal("watermark not re-recorded after the stream re-verified")
+	}
+}
+
+// TestPortMissingLineageDiscoversBase pins the baseRev==0 fallback: a
+// second writable open of a live writer's path answers Attr.Rev 0 (#984
+// stat visibility), leaving the handle with no CAS lineage. v1 fetched the
+// authoritative revision at exactly this seam; without the fallback the
+// writeback tier strands the staged entry (an overwrite without a base is
+// rejected before upload and skipped by recovery) and close-sync degrades
+// to an unconditional PUT.
+func TestPortMissingLineageDiscoversBase(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/f", []byte("seeded"))
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	wb, err := New(Options{Policy: PolicyWriteBack, Client: cl, WriteCacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := fs.NewChain(wb, terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/f", Flags: uint32(syscall.O_RDWR)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := res.Handle.(*bufferingHandle)
+	// Model the lineage-less handle (the live-writer second open shape).
+	h.mu.Lock()
+	h.baseRev = 0
+	h.mu.Unlock()
+	if err := h.Write(ctx, 0, []byte("second!")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	meta, ok := wb.wbCache.GetMeta("/f")
+	if !ok {
+		t.Fatal("flush did not stage")
+	}
+	if meta.BaseRev <= 0 {
+		t.Fatalf("staged BaseRev = %d, want the discovered current revision", meta.BaseRev)
+	}
+	if err := h.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if n, ok := b.Node("/f"); ok && string(n.Data) == "second!" {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("lineage-less image never landed")
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }

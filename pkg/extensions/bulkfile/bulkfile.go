@@ -108,8 +108,16 @@ func New(opts Options) (*Bulkfile, error) {
 // handle, serves lookups of live claims from the buffered image, and keeps
 // unlinks and renames of never-committed claims local.
 func (b *Bulkfile) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error) {
+	// Linux strips O_CREAT from FUSE_OPEN for existing files: `: > f`
+	// arrives as OPEN|O_TRUNC with no O_CREAT, while the same open on a
+	// kernel that forwards create flags (or a fresh path's FUSE_CREATE)
+	// carries O_CREAT. The claim must treat both shapes as the truncate-
+	// writer it exists for, or its truncation ownership would silently
+	// depend on the kernel.
+	kernelExisting := op.KernelOpenExisting()
 	if op.Kind == fs.OpCreate && writeIntent(op.Flags) &&
-		op.Flags&uint32(syscall.O_CREAT) != 0 && op.Flags&uint32(syscall.O_TRUNC) != 0 &&
+		op.Flags&uint32(syscall.O_TRUNC) != 0 &&
+		(op.Flags&uint32(syscall.O_CREAT) != 0 || kernelExisting) &&
 		op.Flags&uint32(syscall.O_APPEND) == 0 && !hasSyncOpenFlag(op.Flags) &&
 		b.policy != policyWriteSync {
 		// A prior claim on this path must hand off BEFORE the new claim
@@ -137,7 +145,6 @@ func (b *Bulkfile) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 		// misalignment with v1's zero-remote Create.
 		exists := false
 		existingSize := int64(0)
-		kernelExisting := op.KernelOpenExisting()
 		switch {
 		case op.KernelCreate():
 			// Fresh by kernel proof: the preceding lookup saw the path
