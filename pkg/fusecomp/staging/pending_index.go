@@ -313,14 +313,18 @@ func (idx *PendingIndex) RenamePending(oldPath, newPath string) bool {
 // paired with the bytes that actually sit beside it:
 //   - prepare: when the destination has no entry, its .meta is persisted
 //     FIRST, while the old name keeps both its .meta and its payload;
-//   - move: the caller moves the payload (ShadowStore.Rename);
+//   - move: a LIVE destination first loses its own payload (its object
+//     incarnation was already replaced by the remote rename that precedes
+//     this transaction) and then receives the prepared .meta — only then is
+//     the source payload renamed over it, so the prepared meta can never be
+//     observed beside the dead bytes it does not describe;
 //   - commit: the destination .meta is (re)written to describe the moved
 //     payload, memory is published, and the old .meta is removed.
 //
-// A destination that already carried an entry is deliberately NOT overwritten
-// at prepare time: its own .meta stays exactly as it was until commit, so an
-// abort has nothing to restore and a crash before the move leaves both sides
-// describing their own bytes.
+// A destination that already carried an entry is deliberately NOT touched at
+// prepare time: its own .meta and payload stay exactly as they were until the
+// move, so an abort before the move has nothing to restore and a crash leaves
+// both sides describing their own bytes.
 type PendingConflictTransfer struct {
 	idx     *PendingIndex
 	shadows *ShadowStore
@@ -331,8 +335,22 @@ type PendingConflictTransfer struct {
 	// generation. It is only published by Commit (or PublishDestination).
 	prepared *WriteBackMeta
 	// destWasLive records that newPath carried an entry when the transfer
-	// began; its .meta must survive untouched until Commit.
-	destWasLive    bool
+	// began; its .meta and payload stay untouched until the move.
+	destWasLive bool
+	// destReplaced records that MovePayload already retired the live
+	// destination's own payload and persisted the prepared .meta there: from
+	// that point the destination durably describes the source image, so
+	// PublishDestination publishes it instead of skipping, and Abort can no
+	// longer restore the dead entry.
+	destReplaced bool
+	// destMetaPersisted records that the prepared .meta is durable at the
+	// destination path (written at prepare for an empty destination, at the
+	// move for a live one).
+	destMetaPersisted bool
+	// payloadMoved records that the source payload was renamed to the
+	// destination: the durable state already describes the committed pairing,
+	// so Abort degenerates into finishing the publication.
+	payloadMoved   bool
 	expectedOldGen uint64
 	expectedNewGen uint64
 	closed         bool
@@ -354,15 +372,16 @@ func (idx *PendingIndex) BeginConflictTransfer(oldPath, newPath string, expected
 		return nil, false, err
 	}
 	return &PendingConflictTransfer{
-		idx:            idx,
-		shadows:        shadows,
-		oldPath:        oldPath,
-		newPath:        newPath,
-		locks:          [2]*pendingPathLock{pla, plb},
-		prepared:       prepared,
-		destWasLive:    destWasLive,
-		expectedOldGen: expectedOldGen,
-		expectedNewGen: expectedNewGen,
+		idx:               idx,
+		shadows:           shadows,
+		oldPath:           oldPath,
+		newPath:           newPath,
+		locks:             [2]*pendingPathLock{pla, plb},
+		prepared:          prepared,
+		destWasLive:       destWasLive,
+		destMetaPersisted: !destWasLive,
+		expectedOldGen:    expectedOldGen,
+		expectedNewGen:    expectedNewGen,
 	}, true, nil
 }
 
@@ -401,6 +420,14 @@ func (idx *PendingIndex) prepareConflictTransferLocked(oldPath, newPath string, 
 // MovePayload moves the preserved shadow bytes to the new name. It reports
 // false when the source has no payload to move or the move failed; the
 // transaction is then still open and must be aborted or published.
+//
+// For a destination that carried its own entry, the move runs in a fixed
+// order — retire the dead destination payload, persist the prepared .meta,
+// then rename the source payload over it — so every intermediate crash state
+// keeps each surviving .meta paired with the bytes beside it: the old
+// destination .meta can only ever be observed WITHOUT its bytes (pruned on
+// recovery), and the prepared .meta can only ever be observed without bytes
+// or beside the source's bytes, never beside the dead destination's.
 func (t *PendingConflictTransfer) MovePayload() bool {
 	if t == nil || t.closed || t.prepared == nil {
 		return false
@@ -408,7 +435,28 @@ func (t *PendingConflictTransfer) MovePayload() bool {
 	if t.shadows == nil {
 		return true // metadata-only transfer: there are no preserved bytes
 	}
-	return t.shadows.Rename(t.oldPath, t.newPath)
+	if t.destWasLive && !t.destReplaced {
+		if !t.shadows.Has(t.oldPath) {
+			// No preserved bytes to pair with the marker: leave the
+			// destination's own entry untouched for PublishDestination.
+			return false
+		}
+		// The destination's own pending image belongs to an object incarnation
+		// the completed remote rename already replaced: retire its payload
+		// BEFORE the prepared .meta can describe this path, so no crash can
+		// pair that .meta with the dead bytes.
+		t.shadows.Remove(t.newPath)
+		t.destReplaced = true
+		if err := t.idx.writeMetaFile(t.prepared); err != nil {
+			return false
+		}
+		t.destMetaPersisted = true
+	}
+	if t.shadows.Rename(t.oldPath, t.newPath) {
+		t.payloadMoved = true
+		return true
+	}
+	return false
 }
 
 // Commit re-verifies both fences, publishes the destination metadata (durable
@@ -439,14 +487,33 @@ func (t *PendingConflictTransfer) Commit() (bool, error) {
 	return true, nil
 }
 
-// Abort rolls the transaction back. The destination's own .meta was never
-// touched when it was live; an empty destination only needs the prepared file
-// removed. The old name keeps its entry and payload either way.
+// Abort rolls the transaction back. Before any payload move it is exact: an
+// empty destination only needs the prepared file removed, a live destination
+// was never touched, and the old name keeps its entry and payload either way.
+// Once the payload has moved, the durable state already describes the
+// committed pairing and a rollback would strand the moved bytes without
+// metadata — Abort then degenerates into finishing the publication.
 func (t *PendingConflictTransfer) Abort() {
 	if t == nil || t.closed {
 		return
 	}
+	if t.payloadMoved {
+		_, _ = t.Commit()
+		return
+	}
 	defer t.release()
+	if t.destReplaced {
+		// The move retired the destination's own payload (its incarnation was
+		// replaced by the remote rename) and may have persisted the prepared
+		// .meta beside no bytes: restore silence at the destination so no
+		// surviving .meta describes missing bytes. The source keeps its entry
+		// and payload — the rename of the shadow never happened.
+		_ = os.Remove(filepath.Join(t.idx.dir, HashPath(t.newPath)+".meta"))
+		t.idx.mu.Lock()
+		delete(t.idx.items, t.newPath)
+		t.idx.mu.Unlock()
+		return
+	}
 	if !t.destWasLive {
 		_ = os.Remove(filepath.Join(t.idx.dir, HashPath(t.newPath)+".meta"))
 	}
@@ -458,18 +525,30 @@ func (t *PendingConflictTransfer) Abort() {
 // bytes that are still only under the old name. The old name keeps its own
 // entry — and the payload — so the data stays recoverable when the
 // destination's own entry is pruned on restart (it has no shadow).
+//
+// A destination that was live and was NOT yet replaced (the move was refused
+// before it could start) keeps its own entry: it still describes its own
+// bytes, and overwriting it would mislabel them — the caller must record the
+// failure in memory instead. Once the move has replaced the destination, the
+// prepared marker is (or must become) its durable state and is published.
 func (t *PendingConflictTransfer) PublishDestination() error {
-	if t == nil || t.closed || t.prepared == nil || t.destWasLive {
-		// A live destination still carries its own marker describing its own
-		// bytes; overwriting it would mislabel them.
+	if t == nil || t.closed || t.prepared == nil {
 		if t != nil && !t.closed {
 			t.release()
 		}
 		return nil
 	}
+	if t.destWasLive && !t.destReplaced {
+		// A live destination still carries its own marker describing its own
+		// bytes; overwriting it would mislabel them.
+		t.release()
+		return nil
+	}
 	defer t.release()
-	if err := t.idx.writeMetaFile(t.prepared); err != nil {
-		return err
+	if !t.destMetaPersisted {
+		if err := t.idx.writeMetaFile(t.prepared); err != nil {
+			return err
+		}
 	}
 	t.idx.mu.Lock()
 	cp := *t.prepared

@@ -603,3 +603,111 @@ func TestSyncWaitDeadlineSizeForReopenedPendingHandles(t *testing.T) {
 		t.Fatal("a 2GiB pending image must scale the wait beyond the 60s floor")
 	}
 }
+
+// TestPortRenameMovesConflictMarkerStagedDuringRename pins the transfer fence
+// for an image that was staged (and terminally failed) under the old name
+// WHILE the remote rename was in flight: the pre-rename generation snapshot
+// no longer matches, and the transfer must re-derive the live generations
+// under the path locks and move THAT marker (and its preserved bytes) to the
+// new name instead of reporting the fenced-out transfer as a success the
+// caller would act on.
+func TestPortRenameMovesConflictMarkerStagedDuringRename(t *testing.T) {
+	fb := &failingWritesBackend{backend: testbackend.NewBackend()}
+	ch, wb := newUploadStack(t, fb, Options{Policy: PolicyWriteBack})
+	ctx := context.Background()
+
+	// The rename observed this conflict under /a ...
+	mkConflict := func(path, unlanded string) {
+		t.Helper()
+		h := open(t, ch, path)
+		if err := h.Write(ctx, 0, []byte("landed base")); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.Sync(ctx); err != nil {
+			t.Fatal(err)
+		}
+		fb.setFail(true)
+		if err := h.Write(ctx, 0, []byte(unlanded)); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.Sync(ctx); err == nil {
+			t.Fatalf("fsync for %s reported durability during the upload outage", path)
+		}
+		fb.setFail(false)
+	}
+	mkConflict("/race-src.txt", "v2 unlanded")
+	// ... while the RPC was in flight, a second writer staged a newer image
+	// and terminally failed it: the pending entry advanced past the snapshot.
+	mkConflict("/race-src.txt", "v3 unlanded")
+
+	// The post-Rename transition, with the stale pre-rename generations the
+	// old code trusted: the marker that must move is the LIVE one (v3).
+	if err := wb.retargetConflictMarkers("/race-src.txt", "/race-dst.txt"); err != nil {
+		t.Fatalf("retarget reported the fenced-out transfer as a failure: %v", err)
+	}
+	// What the rename caller does on a successful transition.
+	wb.queue.clearTerminalFailure("/race-src.txt")
+	wb.queue.clearTerminalFailure("/race-dst.txt")
+
+	if wb.opts.Staging.Pending.HasPending("/race-src.txt") {
+		t.Fatal("source pending entry stayed keyed under the dead old name")
+	}
+	meta, ok := wb.opts.Staging.Pending.GetMeta("/race-dst.txt")
+	if !ok || meta == nil || meta.Kind != staging.PendingConflict {
+		t.Fatalf("pending entry at the new name = %+v ok=%v, want the racing writer's transferred marker", meta, ok)
+	}
+	data, err := wb.opts.Staging.Shadow.ReadAll("/race-dst.txt")
+	if err != nil || string(data) != "v3 unlanded" {
+		t.Fatalf("shadow at the new name = %q err=%v, want the NEWEST unlanded image", data, err)
+	}
+	// The in-memory records were cleared like a successful rename does; the
+	// durable marker must keep answering EIO for the unlanded image.
+	if err := wb.queue.PathTerminalFailure("/race-dst.txt"); err == nil {
+		t.Fatal("the racing writer's terminal failure was lost by the rename")
+	}
+}
+
+// TestStandaloneTransferFailuresAreNeverEvicted pins the eviction rule for
+// standalone records (RecordTerminalFailureForPath): their unlanded bytes sit
+// under a DIFFERENT old pathname, so "no pending entry at this path" is not
+// staleness but the record's normal shape — the absence of destination
+// metadata must not authorize eviction. A standalone record whose path does
+// carry a durable conflict marker stays evictable through the fallback.
+func TestStandaloneTransferFailuresAreNeverEvicted(t *testing.T) {
+	pending, err := staging.NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	boom := errors.New("boom")
+	cq := NewCommitQueue(nil, nil, pending, nil, 1, 8)
+
+	// Marker-backed standalone record: the durable fallback re-derives it.
+	if _, err := pending.PutWithBaseRev("/marker.txt", 3, staging.PendingNew, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := pending.MarkConflict("/marker.txt"); err != nil {
+		t.Fatal(err)
+	}
+	cq.RecordTerminalFailureForPath("/marker.txt", boom)
+	// Bare standalone records: nothing at their path can re-derive them.
+	for i := 0; i < terminalFailuresLimit+4; i++ {
+		cq.RecordTerminalFailureForPath(fmt.Sprintf("/moved-%d.txt", i), boom)
+	}
+
+	cq.mu.Lock()
+	size := len(cq.terminalFailures)
+	_, markerKept := cq.terminalFailures["/marker.txt"]
+	cq.mu.Unlock()
+	if markerKept {
+		t.Fatal("a marker-backed standalone record was not pruned past the bound")
+	}
+	if size != terminalFailuresLimit+4 {
+		t.Fatalf("pruned map holds %d records, want every bare standalone one of %d kept", size, terminalFailuresLimit+4)
+	}
+	if err := cq.PathTerminalFailure("/marker.txt"); err == nil {
+		t.Fatal("the marker-backed record no longer answers through the durable fallback")
+	}
+	if err := cq.PathTerminalFailure("/moved-0.txt"); err == nil {
+		t.Fatal("a bare standalone failure was evicted although nothing can re-derive it")
+	}
+}

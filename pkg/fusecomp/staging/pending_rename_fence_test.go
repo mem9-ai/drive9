@@ -255,9 +255,9 @@ func TestConflictTransferPublishesMarkerWhenPayloadMoveFails(t *testing.T) {
 }
 
 // TestConflictTransferLiveDestinationNotRepublished pins the destination
-// guard on the failed-move path: when the destination carried its own entry,
-// publishing the source's marker over it would mislabel the destination's
-// own bytes.
+// guard on the failed-move path: when the destination carried its own entry
+// and the move never replaced it, publishing the source's marker over it
+// would mislabel the destination's own bytes.
 func TestConflictTransferLiveDestinationNotRepublished(t *testing.T) {
 	dir := t.TempDir()
 	idx, shadows, srcGen := newConflictTransferFixture(t, dir, "/a", "src")
@@ -280,5 +280,143 @@ func TestConflictTransferLiveDestinationNotRepublished(t *testing.T) {
 	meta, found := idx.GetMeta("/b")
 	if !found || meta.Generation != dstGen || meta.Size != 9 || meta.BaseRev != 3 {
 		t.Fatalf("destination entry = %+v found=%v, want its own metadata untouched", meta, found)
+	}
+}
+
+// TestConflictTransferLiveDestinationKeepsPairAcrossCrash pins the crash
+// window between a successful payload move over a LIVE destination and the
+// commit: the destination's .meta must already describe the bytes that were
+// moved onto it, so a restart pairs the surviving metadata with the payload
+// it actually describes instead of the dead destination's (whose larger size
+// would make recovery reject the surviving source bytes as too short).
+func TestConflictTransferLiveDestinationKeepsPairAcrossCrash(t *testing.T) {
+	dir := t.TempDir()
+	idx, shadows, srcGen := newConflictTransferFixture(t, dir, "/a", "short src")
+
+	// A larger conflicted destination: its old metadata must not survive the
+	// move to mislabel the source bytes that replace it.
+	dstGen, err := idx.PutWithBaseRev("/b", 4096, PendingNew, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.MarkConflict("/b"); err != nil {
+		t.Fatal(err)
+	}
+	if err := shadows.WriteFull("/b", make([]byte, 4096), 7); err != nil {
+		t.Fatal(err)
+	}
+	srcMeta, found := idx.GetMeta("/a")
+	if !found || srcMeta == nil {
+		t.Fatal("source meta missing before the transfer")
+	}
+
+	transfer, ok, err := idx.BeginConflictTransfer("/a", "/b", srcGen, dstGen, shadows)
+	if err != nil || !ok {
+		t.Fatalf("begin = ok=%v err=%v", ok, err)
+	}
+	if !transfer.MovePayload() {
+		t.Fatal("payload move failed")
+	}
+	// Crash: no Commit, no memory publish — restart from disk only.
+	transfer = nil
+
+	recovered, err := NewPendingIndex(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recovered.RecoverFromDisk(); err != nil {
+		t.Fatal(err)
+	}
+	dstMeta, found := recovered.GetMeta("/b")
+	if !found || dstMeta == nil {
+		t.Fatal("destination meta missing after the crash window")
+	}
+	if dstMeta.Kind != PendingConflict || dstMeta.Size != int64(len("short src")) || dstMeta.BaseRev != srcMeta.BaseRev {
+		t.Fatalf("recovered destination meta = %+v, want the SOURCE's kind/size/baseRev paired with its moved bytes", dstMeta)
+	}
+	if shadows.Has("/a") {
+		t.Fatal("source payload still at the old name after the move")
+	}
+	data, rerr := os.ReadFile(shadows.shadowPath("/b"))
+	if rerr != nil || string(data) != "short src" {
+		t.Fatalf("payload beside the recovered meta = %q err=%v, want the source bytes", data, rerr)
+	}
+}
+
+// TestConflictTransferLiveDestinationFailedMovePublishesMarker pins the
+// failed-move path over a live destination: once the move retired the dead
+// destination payload and persisted the prepared .meta, a failed payload
+// rename must still publish the marker at the destination — the remote name
+// already moved, so silence there would let a later fsync certify bytes that
+// never landed.
+func TestConflictTransferLiveDestinationFailedMovePublishesMarker(t *testing.T) {
+	dir := t.TempDir()
+	idx, shadows, srcGen := newConflictTransferFixture(t, dir, "/a", "stays behind")
+
+	dstGen, err := idx.PutWithBaseRev("/b", 9, PendingNew, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.MarkConflict("/b"); err != nil {
+		t.Fatal(err)
+	}
+	if err := shadows.WriteFull("/b", []byte("dst bytes"), 3); err != nil {
+		t.Fatal(err)
+	}
+
+	transfer, ok, err := idx.BeginConflictTransfer("/a", "/b", srcGen, dstGen, shadows)
+	if err != nil || !ok {
+		t.Fatalf("begin = ok=%v err=%v", ok, err)
+	}
+	// Make the payload rename fail behind the store's back: the in-memory
+	// entry (and Has) still sees the source, but os.Rename cannot find it.
+	if err := os.Remove(shadows.shadowPath("/a")); err != nil {
+		t.Fatal(err)
+	}
+	if transfer.MovePayload() {
+		t.Fatal("payload move reported success with the source file gone")
+	}
+	if perr := transfer.PublishDestination(); perr != nil {
+		t.Fatal(perr)
+	}
+
+	meta, found := idx.GetMeta("/b")
+	if !found || meta.Kind != PendingConflict || meta.Size != int64(len("stays behind")) {
+		t.Fatalf("destination entry after the failed move = %+v found=%v, want the published source marker", meta, found)
+	}
+	if _, err := os.Stat(filepath.Join(dir, HashPath("/b")+".meta")); err != nil {
+		t.Fatalf("published marker is not durable: %v", err)
+	}
+	if meta, found := idx.GetMeta("/a"); !found || meta.Kind != PendingConflict {
+		t.Fatalf("old-name entry after the failed move = %+v found=%v, want the marker kept", meta, found)
+	}
+}
+
+// TestConflictTransferAbortAfterMoveCommits pins the degenerate abort: once
+// the payload has moved, the durable state already describes the committed
+// pairing, so aborting must finish the publication rather than strand the
+// moved bytes without metadata.
+func TestConflictTransferAbortAfterMoveCommits(t *testing.T) {
+	dir := t.TempDir()
+	idx, shadows, gen := newConflictTransferFixture(t, dir, "/a", "unlanded")
+
+	transfer, ok, err := idx.BeginConflictTransfer("/a", "/b", gen, 0, shadows)
+	if err != nil || !ok {
+		t.Fatalf("begin = ok=%v err=%v", ok, err)
+	}
+	if !transfer.MovePayload() {
+		t.Fatal("payload move failed")
+	}
+	transfer.Abort()
+
+	if idx.HasPending("/a") {
+		t.Fatal("abort after the move left the old name published")
+	}
+	meta, found := idx.GetMeta("/b")
+	if !found || meta.Kind != PendingConflict {
+		t.Fatalf("new-name entry after the aborted transfer = %+v found=%v, want the published marker", meta, found)
+	}
+	if data, rerr := shadows.ReadAll("/b"); rerr != nil || string(data) != "unlanded" {
+		t.Fatalf("payload at the new name = %q err=%v, want the preserved bytes", data, rerr)
 	}
 }

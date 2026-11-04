@@ -107,9 +107,15 @@ type CommitSupersededFunc func(entry *CommitEntry) bool
 
 // pathCommitFailure is the most recent terminal commit failure recorded for a
 // path: the last upload error and a monotonic stamp for bounded trimming.
+// standalone marks records installed by RecordTerminalFailureForPath: no
+// queue entry backs them and the unlanded bytes stay under a DIFFERENT (old)
+// pathname, so their own path typically carries no pending state at all —
+// nothing durable can re-derive them, and only an explicit clear may drop
+// them.
 type pathCommitFailure struct {
-	err error
-	seq uint64
+	err        error
+	seq        uint64
+	standalone bool
 }
 
 // CommitQueue manages ordered background remote commits with baseRev tracking.
@@ -3093,7 +3099,10 @@ func (cq *CommitQueue) recordCommitTerminalFailure(entry *CommitEntry, lastErr e
 // without a queue entry behind it. Callers use it when a failure happened
 // outside the commit worker (a rename whose preserved payload could not be
 // re-paired with its new name): barriers on the path must still answer EIO
-// even though nothing can be re-driven from the queue.
+// even though nothing can be re-driven from the queue. The record is
+// standalone — the unlanded bytes stay under the old pathname, so this path
+// usually carries no pending entry the pruner could treat as a durable
+// fallback or as proof of staleness.
 func (cq *CommitQueue) RecordTerminalFailureForPath(path string, err error) {
 	if cq == nil {
 		return
@@ -3106,7 +3115,7 @@ func (cq *CommitQueue) RecordTerminalFailureForPath(path string, err error) {
 		cq.terminalFailures = make(map[string]pathCommitFailure)
 	}
 	cq.failureClock++
-	cq.terminalFailures[path] = pathCommitFailure{err: err, seq: cq.failureClock}
+	cq.terminalFailures[path] = pathCommitFailure{err: err, seq: cq.failureClock, standalone: true}
 	cq.pruneTerminalFailuresLocked()
 	cq.mu.Unlock()
 }
@@ -3124,9 +3133,12 @@ var errCommitTerminalRecovered = errors.New("commit queue: pending entry preserv
 // terminalFailuresLimit bounds terminalFailures the way landedLimit bounds
 // landed. Eviction is only allowed for records the barrier can still
 // re-derive: one whose path still carries a PendingConflict marker (the
-// fallback below reports it) or whose pending state is already gone (stale).
-// A record with neither must stay — evicting it would let fsync claim
-// durability for data that never landed.
+// fallback below reports it), plus — for worker records only — one whose
+// pending state is already gone (stale). A standalone record with no marker
+// at its path must stay regardless: its bytes sit under a different (old)
+// pathname, so the absence of pending state here is not staleness but the
+// record's normal shape, and evicting it would let fsync claim durability for
+// data that never landed.
 const terminalFailuresLimit = 64
 
 func (cq *CommitQueue) pruneTerminalFailuresLocked() {
@@ -3138,15 +3150,21 @@ func (cq *CommitQueue) pruneTerminalFailuresLocked() {
 	for len(cq.terminalFailures) > terminalFailuresLimit {
 		// Evict the oldest EVICTABLE record: one whose path still carries a
 		// PendingConflict marker (the fallback in PathTerminalFailure keeps
-		// answering it) or whose pending state is already gone (stale). A
-		// record with a live non-conflict entry is the only witness of an
-		// unresolved failure and is skipped, not dropped.
+		// answering it — standalone or not), or a worker record whose pending
+		// state is already gone (stale). A record with a live non-conflict
+		// entry, and a standalone record with no marker at all, are the only
+		// witnesses of an unresolved failure and are skipped, not dropped.
 		var oldestPath string
 		var oldestSeq uint64
 		first := true
 		for path, failure := range cq.terminalFailures {
-			if meta, ok := cq.index.GetMeta(path); ok && meta != nil && meta.Kind != staging.PendingConflict {
-				continue
+			meta, hasMeta := cq.index.GetMeta(path)
+			if hasMeta && meta != nil && meta.Kind != staging.PendingConflict {
+				continue // live non-conflict entry: the record is the only witness
+			}
+			markerBacked := hasMeta && meta != nil
+			if failure.standalone && !markerBacked {
+				continue // nothing at this path can re-derive a standalone record
 			}
 			if first || failure.seq < oldestSeq {
 				oldestPath, oldestSeq, first = path, failure.seq, false
