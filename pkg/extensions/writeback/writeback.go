@@ -335,10 +335,10 @@ type bufferingHandle struct {
 	// later Write/Truncate/Reset (including an unstaged truncate-regrow)
 	// makes the live image diverge from what landed.
 	stagedContentVersion uint64
-	// stagedSnapshotReg is the snapshot ID this handle last registered
-	// under w.liveSnapshots (atomic string) — replaced at each staging,
-	// dropped at untrack.
-	stagedSnapshotReg atomic.Value
+	// stagedSnapshotRegs is the set of snapshot IDs this handle has
+	// registered under w.liveSnapshots (atomic map copy): entries are
+	// consumed by their landings and the remainder is dropped at untrack.
+	stagedSnapshotRegs atomic.Value
 	stagedSnapshotSeq int64
 	contentSnapshotID string
 }
@@ -2091,12 +2091,10 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 			// The landing retires isNew (later writes stage as overwrites
 			// of whatever landed) and re-bases evicted-part recovery on
 			// the remote image before the queue reclaims the shadow —
-			// but only when the buffer still holds the staged image: a
-			// write accepted while the upload was pending stays
-			// unpublished dirty state.
-			if h.landingCertified() {
-				h.markLanded(0)
-			}
+			// atomically gated on the buffer still holding the staged
+			// image, so a write accepted while the upload was pending
+			// stays unpublished dirty state.
+			h.completeStagedLanding(0, 0, "", false)
 			return nil
 		}
 		if h.w.uploader != nil && h.w.wbCache != nil {
@@ -2184,15 +2182,11 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 			}
 			// Post-wait completion: retire the fresh-create view and drop
 			// the dirty flag only when the buffer still holds the staged
-			// image. A write accepted while the upload was pending (the
-			// drain path runs without the FUSE per-handle lock) must keep
-			// its dirty flag so a later Flush/Release publishes it.
-			if h.landingCertified() {
-				h.markLanded(0)
-				h.mu.Lock()
-				h.dirty = false
-				h.mu.Unlock()
-			}
+			// image — checked and applied atomically, so a write accepted
+			// while the upload was pending (the drain path runs without
+			// the FUSE per-handle lock) cannot slip between the check and
+			// the reset and lose its publication.
+			h.completeStagedLanding(0, 0, "", true)
 			return nil
 		}
 		if size < commitInlineStreamThreshold {
@@ -2510,32 +2504,39 @@ func (h *bufferingHandle) markLanded(rev int64) {
 // exactly the staged image the landing acknowledged: newer mutations,
 // such as an unstaged truncate-regrow, keep their own state.
 func (h *bufferingHandle) markLandedImage(rev, size int64, snapshotID string) (certified bool) {
+	return h.completeStagedLanding(rev, size, snapshotID, false)
+}
+
+// completeStagedLanding applies a landing completion ATOMICALLY: the
+// generation check and every state change that depends on it — the
+// landed/isNew/base-revision retirement, the visTrunc/arming
+// certification, and the optional dirty reset — happen under ONE h.mu
+// acquisition. The mount-drain path runs without the FUSE per-handle
+// lock, so splitting the check from the updates would let a concurrent
+// Write or truncate slip between them and still lose the newer bytes
+// (or re-certify a regrown buffer against the old remote image). An
+// empty snapshotID means "the current staging" (post-wait sites).
+func (h *bufferingHandle) completeStagedLanding(rev, size int64, snapshotID string, resetDirty bool) (certified bool) {
 	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.landed = true
 	h.isNew = false
 	if rev > 0 {
 		h.baseRev = rev
+	}
+	if snapshotID == "" {
+		snapshotID = h.stagedSnapshotID
 	}
 	certified = snapshotID != "" && h.stagedSnapshotID == snapshotID &&
 		(h.buf == nil || h.buf.ContentVersion() == h.stagedContentVersion)
 	if certified {
 		h.visTrunc = false
 		h.armRemoteRestoreLocked(size)
+		if resetDirty {
+			h.dirty = false
+		}
 	}
-	h.mu.Unlock()
 	return certified
-}
-
-// landingCertified reports whether the buffer still holds the image of its
-// last staging (content generation unchanged). A landing completion — the
-// queue callback or a post-wait continuation — may only clear the dirty
-// flag, retire the fresh-create view, or arm the remote restore when this
-// holds: a write or truncate accepted after that staging must survive as
-// unpublished dirty state.
-func (h *bufferingHandle) landingCertified() bool {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.buf == nil || h.buf.ContentVersion() == h.stagedContentVersion
 }
 
 func attrSize(res fs.Result) int64 {
@@ -2938,8 +2939,10 @@ func (w *Writeback) retireLocked(h *bufferingHandle) {
 			return true
 		})
 	}
-	if prev, ok := h.stagedSnapshotReg.Load().(string); ok && prev != "" {
-		w.liveSnapshots.Delete(prev)
+	if regs, ok := h.stagedSnapshotRegs.Load().(map[string]struct{}); ok {
+		for k := range regs {
+			w.liveSnapshots.Delete(k)
+		}
 	}
 	w.liveSet.Delete(h)
 }
@@ -4135,12 +4138,19 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 	}
 	h.stagedContentVersion = stagedContentVersion
 	// The landing of THIS image must find THIS handle even when a newer
-	// writer has since opened the same path. Replace any earlier
-	// registration of this handle (superseded snapshot).
-	if prev, ok := h.stagedSnapshotReg.Load().(string); ok && prev != "" && prev != snapshotID {
-		h.w.liveSnapshots.Delete(prev)
+	// writer has since opened the same path. Earlier registrations of
+	// this handle STAY: the new staging has not yet replaced their
+	// backing (the shadow write and the path lock come later), and an
+	// in-flight earlier landing still needs to arm or retain its own
+	// shadow generation. Each registration is consumed by its landing
+	// and the rest are dropped at untrack.
+	regs, _ := h.stagedSnapshotRegs.Load().(map[string]struct{})
+	next := make(map[string]struct{}, len(regs)+1)
+	for k := range regs {
+		next[k] = struct{}{}
 	}
-	h.stagedSnapshotReg.Store(snapshotID)
+	next[snapshotID] = struct{}{}
+	h.stagedSnapshotRegs.Store(next)
 	h.w.liveSnapshots.Store(snapshotID, h)
 	buf := h.buf
 	h.mu.Unlock()
@@ -4435,9 +4445,7 @@ func (h *bufferingHandle) commitLocked(ctx context.Context) error {
 		if err := h.w.queue.WaitPathOutcome(h.path, uploadTimeout); err != nil {
 			return fs.StatusErrorOf(gofuse.Status(syscall.EIO))
 		}
-		if h.landingCertified() {
-			h.markLanded(0)
-		}
+		h.completeStagedLanding(0, 0, "", false)
 		return nil
 	}
 	// Commit dispatch: a partial edit of an existing large file patches
