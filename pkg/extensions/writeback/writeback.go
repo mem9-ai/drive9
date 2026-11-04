@@ -237,6 +237,14 @@ type bufferingHandle struct {
 	// pendingImage is an immutable captured pending image: reads of a
 	// pending-overlay handle serve exactly these bytes.
 	pendingImage []byte
+	// supersededPendingGen is the pending-index generation this handle's
+	// content provably INCLUDES: the generation this handle's own queue
+	// staging published (stageAndEnqueueOpt) or the pending image a re-open
+	// materialized. Only this generation — never whatever happens to be
+	// registered at the path when a write-cache image is stamped — may be
+	// claimed as superseded by a landing, so a foreign writer's conflict
+	// marker cannot be retired by an image that never contained its bytes.
+	supersededPendingGen uint64
 	// pendingFile backs a snapshot larger than the memory bound: the old
 	// object's bytes are streamed to a temp file (closed with the handle),
 	// so a 65MiB anonymous fd keeps its identity instead of falling back
@@ -954,6 +962,12 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 						baseSize: attr.Size, forceSync: hasSyncOpenFlag(op.Flags),
 						pendingImage:     w.capturePendingImage(op.Path),
 						pendingShadowGen: w.pinPendingShadow(op.Path)}
+					// The handle serves this pending generation's image, so a
+					// later staging through it contains that generation — and
+					// only it.
+					if meta, ok := w.pendingMeta(op.Path); ok && meta != nil {
+						h.supersededPendingGen = meta.Generation
+					}
 					if pb, ok := w.pendingBaseRevOf(op.Path); ok {
 						h.baseRev = pb
 					}
@@ -970,7 +984,8 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 				// need the mode.
 				if w.hasPendingLocalState(op.Path) {
 					size := int64(0)
-					if meta, ok := w.pendingMeta(op.Path); ok && meta != nil {
+					meta, _ := w.pendingMeta(op.Path)
+					if meta != nil {
 						size = meta.Size
 					}
 					shadowGen := w.pinPendingShadow(op.Path)
@@ -979,6 +994,11 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 						h := &bufferingHandle{w: w, path: op.Path, flags: op.Flags,
 							baseSize: size, forceSync: hasSyncOpenFlag(op.Flags),
 							pendingImage: image, pendingShadowGen: shadowGen}
+						// Same fence as the pendingAttr open above: the
+						// captured image IS this generation's content.
+						if meta != nil {
+							h.supersededPendingGen = meta.Generation
+						}
 						if pb, ok := w.pendingBaseRevOf(op.Path); ok {
 							h.baseRev = pb
 						}
@@ -1500,11 +1520,23 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 				if tmeta, tok := w.opts.Staging.Pending.GetMeta(target); tok && tmeta != nil {
 					tgen = tmeta.Generation
 				}
-				if w.opts.Staging.Pending.RenamePendingIfGeneration(path, target, meta.Generation, tgen) {
-					if w.opts.Staging.Shadow != nil {
-						_ = w.opts.Staging.Shadow.Rename(path, target)
+				// Same crash-safe two-phase transfer as the renamed path
+				// itself: prepare the new name's meta, move the bytes, then
+				// commit — an interrupted move keeps both metas so recovery
+				// retains whichever side the shadow backs, and a failed move
+				// rolls the prepared meta back.
+				prepared, ok, err := w.opts.Staging.Pending.PrepareRenameIfGeneration(path, target, meta.Generation, tgen)
+				if err != nil || !ok {
+					if err != nil {
+						safeLogPrintf("writeback: prepare conflict transfer %s -> %s failed: %v", path, target, err)
 					}
+					continue
 				}
+				if w.opts.Staging.Shadow != nil && !w.opts.Staging.Shadow.Rename(path, target) {
+					w.opts.Staging.Pending.AbortRenameIfGeneration(path, target, prepared)
+					continue
+				}
+				w.opts.Staging.Pending.CommitRenameIfGeneration(path, prepared, meta.Generation)
 			}
 		}
 		return res, nil
@@ -2161,19 +2193,39 @@ func (w *Writeback) pendingConflictGen(path string) (gen uint64, conflict bool) 
 // transitions are fenced on the generations captured before the remote
 // rename, so a racing same-path staging under either name is neither moved
 // away nor clobbered.
+//
+// The transfer is two-phase (PrepareRenameIfGeneration → Shadow.Rename →
+// CommitRenameIfGeneration) for the same reason the general rename path is:
+// committing the metadata first would leave a crash window in which only the
+// NEW name has metadata while only the OLD name has bytes — and recovery
+// prunes metadata whose shadow is missing, destroying the sole copy of the
+// unlanded image. A failed shadow move aborts the prepared meta so the
+// old-name entry remains authoritative (and still answers EIO).
 func (w *Writeback) retargetConflictMarkers(oldPath, newPath string, srcPendingGen uint64, srcConflict bool, dstPendingGen uint64, dstConflict bool) {
 	st := w.opts.Staging
 	if st == nil || st.Pending == nil {
 		return
 	}
-	switch {
-	case srcConflict:
-		if st.Pending.RenamePendingIfGeneration(oldPath, newPath, srcPendingGen, dstPendingGen) {
-			if st.Shadow != nil {
-				_ = st.Shadow.Rename(oldPath, newPath)
-			}
+	if srcConflict {
+		prepared, ok, err := st.Pending.PrepareRenameIfGeneration(oldPath, newPath, srcPendingGen, dstPendingGen)
+		if err != nil {
+			safeLogPrintf("writeback: prepare conflict marker transfer %s -> %s failed: %v (marker stays at the old name)", oldPath, newPath, err)
+			return
 		}
-	case dstConflict:
+		if !ok {
+			return // a racing staging owns one end; leave both alone
+		}
+		if st.Shadow != nil && !st.Shadow.Rename(oldPath, newPath) {
+			// The bytes did not move: roll the prepared meta back so the
+			// old name keeps the marker AND the shadow it describes.
+			st.Pending.AbortRenameIfGeneration(oldPath, newPath, prepared)
+			safeLogPrintf("writeback: shadow move %s -> %s failed; conflict marker stays at the old name", oldPath, newPath)
+			return
+		}
+		st.Pending.CommitRenameIfGeneration(oldPath, prepared, srcPendingGen)
+		return
+	}
+	if dstConflict {
 		st.Pending.RemoveIfGeneration(newPath, dstPendingGen)
 	}
 }
@@ -4338,6 +4390,11 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 	h.visTrunc = false
 	h.buf.ClearDirty()
 	h.landed = true
+	// This staging's image is now part of this handle's content: a later
+	// write-cache staging of the same handle provably contains it (and only
+	// it — never a foreign writer's generation, which the handle's buffer
+	// was never composed over).
+	h.supersededPendingGen = pendingGen
 	// v1 publishStagedSnapshotLineageLocked: the staged snapshot becomes
 	// this handle's content identity — the next staging parents on it.
 	h.contentSnapshotID = snapshotID
@@ -4721,6 +4778,10 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, isNew bool) err
 	stagedGen := h.wgen
 	baseRev := h.baseRev
 	mode, hasMode := h.pendingMode, h.hasPendingMode
+	// Read the supersession fence in the SAME lock window that captured the
+	// image: it describes this handle's content, not whatever staging happens
+	// to be registered at the path when the meta is written.
+	supersedesGen := h.supersededPendingGen
 	h.mu.Unlock()
 	if isNew {
 		baseRev = 0
@@ -4745,14 +4806,13 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, isNew bool) err
 	if isNew {
 		kind = staging.PendingNew
 	}
-	// The staged image composed over every pending generation at or below
-	// the one live right now — record it so a later landing of THIS image
-	// can retire failure state that old (and only that old: the fence keeps
-	// a newer queue staging's preserved entry untouchable).
-	supersedesGen := uint64(0)
-	if h.w.opts.Staging != nil && h.w.opts.Staging.Pending != nil {
-		supersedesGen = h.w.opts.Staging.Pending.Generation(h.path)
-	}
+	// supersedesGen was read under the image-capture lock above: the staged
+	// image composed over every pending generation this handle's content
+	// actually includes — recorded when the handle staged through the queue
+	// or materialized a pending image on open. It is deliberately NOT a fresh
+	// Pending.Generation read here, because a writer that staged a newer
+	// generation after the capture would otherwise be stamped as superseded
+	// by an image that never contained its bytes.
 	// The write cache is LOCAL-path keyed; the uploader maps to the
 	// remote name itself (a remote key here made every subtree mount's
 	// upload silently no-op — the git-ops clone's config.lock never

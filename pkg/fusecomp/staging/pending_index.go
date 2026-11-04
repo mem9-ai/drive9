@@ -302,15 +302,16 @@ func (idx *PendingIndex) RenamePending(oldPath, newPath string) bool {
 	return true
 }
 
-// RenamePendingIfGeneration is RenamePending fenced on both endpoints'
-// generations: the move happens only when oldPath's entry is still
-// expectedOldGen and newPath's entry, if any, is still expectedNewGen
-// (0 = must be absent). A rename that raced a same-path staging therefore
-// neither moves a fresher entry away from the old name nor clobbers one at
-// the new name. Returns true when the move happened.
-func (idx *PendingIndex) RenamePendingIfGeneration(oldPath, newPath string, expectedOldGen, expectedNewGen uint64) bool {
+// PrepareRenameIfGeneration is PrepareRename fenced on both endpoints'
+// generations: oldPath must still carry expectedOldGen and newPath's entry,
+// if any, must still be expectedNewGen (0 = must be absent). Persisting the
+// prepared meta for newPath FIRST keeps the metadata/payload pairing
+// recoverable across the caller's subsequent shadow move: a crash before the
+// move leaves both .meta files, and recovery keeps whichever side the shadow
+// file actually backs.
+func (idx *PendingIndex) PrepareRenameIfGeneration(oldPath, newPath string, expectedOldGen, expectedNewGen uint64) (*WriteBackMeta, bool, error) {
 	if oldPath == newPath || expectedOldGen == 0 {
-		return false
+		return nil, false, nil
 	}
 	pla, plb := idx.acquireTwoPathLocks(oldPath, newPath)
 	defer idx.releaseTwoPathLocks(oldPath, newPath, pla, plb)
@@ -319,45 +320,78 @@ func (idx *PendingIndex) RenamePendingIfGeneration(oldPath, newPath string, expe
 	meta, ok := idx.items[oldPath]
 	if !ok || meta == nil || meta.Generation != expectedOldGen {
 		idx.mu.RUnlock()
-		return false
+		return nil, false, nil
 	}
 	if cur, exists := idx.items[newPath]; exists {
 		if cur == nil || cur.Generation != expectedNewGen {
 			idx.mu.RUnlock()
-			return false
+			return nil, false, nil
 		}
 	} else if expectedNewGen != 0 {
 		idx.mu.RUnlock()
-		return false
+		return nil, false, nil
 	}
-	// Copy fields under read lock.
 	gen := idx.nextGen.Add(1)
 	newMeta := cloneWriteBackMeta(meta)
 	newMeta.Path = newPath
 	newMeta.Generation = gen
 	idx.mu.RUnlock()
 
-	// Persist new meta to disk BEFORE updating memory so that crash
-	// recovery always has a consistent view.
-	metaBytes, _ := json.Marshal(&newMeta)
+	metaBytes, err := json.Marshal(&newMeta)
+	if err != nil {
+		return nil, false, fmt.Errorf("marshal prepared conflict meta for %s: %w", newPath, err)
+	}
 	if err := atomicWrite(filepath.Join(idx.dir, HashPath(newPath)+".meta"), metaBytes); err != nil {
+		return nil, false, fmt.Errorf("persist prepared conflict meta for %s: %w", newPath, err)
+	}
+	return &newMeta, true, nil
+}
+
+// CommitRenameIfGeneration completes a PrepareRenameIfGeneration transaction:
+// the shadow bytes have moved, so newPath becomes authoritative in memory and
+// oldPath is removed from memory and disk. The old-side generation is
+// re-verified under the path locks; when it no longer matches, the prepared
+// meta is dropped instead of clobbering a fresher staging.
+func (idx *PendingIndex) CommitRenameIfGeneration(oldPath string, newMeta *WriteBackMeta, expectedOldGen uint64) bool {
+	if newMeta == nil || expectedOldGen == 0 {
 		return false
 	}
+	pla, plb := idx.acquireTwoPathLocks(oldPath, newMeta.Path)
+	defer idx.releaseTwoPathLocks(oldPath, newMeta.Path, pla, plb)
 
 	idx.mu.Lock()
-	// The path locks serialize same-path mutations, but re-verify before the
-	// publish: a caller that raced past the fence must not be committed.
 	if cur, exists := idx.items[oldPath]; !exists || cur == nil || cur.Generation != expectedOldGen {
 		idx.mu.Unlock()
 		return false
 	}
-	cp := newMeta
-	idx.items[newPath] = &cp
+	cp := *newMeta
+	idx.items[newMeta.Path] = &cp
 	delete(idx.items, oldPath)
 	idx.mu.Unlock()
 
 	_ = os.Remove(filepath.Join(idx.dir, HashPath(oldPath)+".meta"))
 	return true
+}
+
+// AbortRenameIfGeneration rolls back PrepareRenameIfGeneration when the shadow
+// move failed: the prepared meta for newPath is removed so the old-name entry
+// stays the only authoritative record. Refuses to touch disk when newPath is
+// live in memory, so an unrelated pending entry at the target path cannot be
+// destroyed.
+func (idx *PendingIndex) AbortRenameIfGeneration(oldPath, newPath string, preparedMeta *WriteBackMeta) {
+	if preparedMeta == nil || oldPath == newPath {
+		return
+	}
+	pla, plb := idx.acquireTwoPathLocks(oldPath, newPath)
+	defer idx.releaseTwoPathLocks(oldPath, newPath, pla, plb)
+
+	idx.mu.RLock()
+	cur, live := idx.items[newPath]
+	idx.mu.RUnlock()
+	if live && cur != nil && cur.Generation != preparedMeta.Generation {
+		return // a different entry took the name; leave it alone
+	}
+	_ = os.Remove(filepath.Join(idx.dir, HashPath(newPath)+".meta"))
 }
 
 // PrepareRename is phase one of a crash-safe rename: it persists the pending

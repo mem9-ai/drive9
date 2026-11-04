@@ -530,6 +530,61 @@ func TestPortRenameRetiresTargetConflictMarker(t *testing.T) {
 		t.Fatal("replaced target's conflict marker survived its incarnation")
 	}
 }
+
+// TestSupersededGenComesFromHandleContent pins the supersession fence's
+// source of truth: a write-cache staging may only claim the pending
+// generation the handle's own content actually contains, never whatever
+// generation happens to be registered at the path when the image is stamped.
+// Landing an image that never carried a foreign writer's bytes must not
+// retire that writer's conflict marker.
+func TestSupersededGenComesFromHandleContent(t *testing.T) {
+	fb := &failingWritesBackend{backend: testbackend.NewBackend()}
+	ch, wb := newUploadStack(t, fb, Options{Policy: PolicyWriteBack})
+	ctx := context.Background()
+
+	// Writer B: stages and terminally fails, leaving a conflict marker.
+	b := open(t, ch, "/gen-race.txt")
+	if err := b.Write(ctx, 0, []byte("B landed base")); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	fb.setFail(true)
+	if err := b.Write(ctx, 0, []byte("B never landed")); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Sync(ctx); err == nil {
+		t.Fatal("fsync reported durability during the upload outage")
+	}
+	fb.setFail(false)
+	meta, ok := wb.opts.Staging.Pending.GetMeta("/gen-race.txt")
+	if !ok || meta.Kind != staging.PendingConflict {
+		t.Fatalf("pending entry = %+v ok=%v, want a conflict marker", meta, ok)
+	}
+	markerGen := meta.Generation
+
+	// Writer A: a handle that captured no pending image claims nothing —
+	// the stamp is the handle's content, not the path's live generation.
+	a := &bufferingHandle{w: wb, path: "/gen-race.txt", flags: uint32(syscall.O_RDWR)}
+	if a.supersededPendingGen != 0 {
+		t.Fatalf("fresh handle claims to supersede generation %d", a.supersededPendingGen)
+	}
+	if a.supersededPendingGen == markerGen {
+		t.Fatal("a handle claims to contain a generation its image never carried")
+	}
+
+	// The fenced cleanup leaves B's marker alone: A's image does not
+	// supersede it, so the path keeps answering EIO.
+	wb.resolveLandedStaging("/gen-race.txt", 42, a.supersededPendingGen, wb.queue.PathTerminalFailureSeq("/gen-race.txt"))
+	if _, still := wb.opts.Staging.Pending.GetMeta("/gen-race.txt"); !still {
+		t.Fatal("a landing that never contained the marker's bytes retired it")
+	}
+	if err := wb.queue.PathTerminalFailure("/gen-race.txt"); err == nil {
+		t.Fatal("the foreign writer's terminal failure stopped being reported")
+	}
+}
+
 // TestSyncWaitDeadlineSizeForReopenedPendingHandles pins the wait-deadline
 // input for handles that serve a staged pending image without a buffer: the
 // deadline must scale with the image being waited for (the worker's own
