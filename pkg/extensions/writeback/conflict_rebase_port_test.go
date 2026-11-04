@@ -164,3 +164,73 @@ func TestPortForeignConflictStaysPending(t *testing.T) {
 		t.Fatalf("backend = %q, want the foreign image untouched", n.Data)
 	}
 }
+
+// TestPortConflictRepairSuspendedWhileUnverified pins the resolver's
+// continuity restriction: while the event stream is unverified the landed
+// table may hold revisions recorded DURING the gap (uploads keep
+// succeeding and OnSuccess keeps landing), and a foreign recreation whose
+// events have not arrived could sit at a coincidentally equal revision.
+// A conflicted entry must NOT rebase then — it stays pending — and the
+// repair resumes once the stream re-verifies.
+func TestPortConflictRepairSuspendedWhileUnverified(t *testing.T) {
+	b, wb, ch, _ := newConflictStack(t)
+	ctx := context.Background()
+	land := func(content string) {
+		t.Helper()
+		h := openExisting(t, ch, "/f")
+		if err := h.Write(ctx, 0, []byte(content)); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.Release(ctx); err != nil {
+			t.Fatal(err)
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			if n, ok := b.Node("/f"); ok && string(n.Data) == content {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("cycle for %q never landed", content)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+
+	land("first!") // revision 2, watermark recorded
+	wb.opts.Events.Emit(fs.Event{Kind: fs.EventUnverified, Path: "/"})
+	land("gap!!!") // revision 3; the watermark REFILLS during the gap
+	if r, ok := wb.landedRevision("/f"); !ok || r <= 2 {
+		t.Fatalf("watermark during gap = %d %v, want the just-landed revision", r, ok)
+	}
+
+	// A duplicate-commit loser staged at the pre-gap base: its upload
+	// conflicts, and the repair must refuse the watermark while
+	// continuity is unverified.
+	if err := wb.wbCache.PutWithBaseRevAndMode("/f", []byte("loser!!"), 7, staging.PendingOverwrite, 2, 0o644, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wb.uploader.UploadSyncWithRevision(ctx, "/f"); err == nil {
+		t.Fatal("conflict repair must stay suspended while the stream is unverified")
+	}
+	if meta, ok := wb.wbCache.GetMeta("/f"); !ok || meta.BaseRev != 2 {
+		t.Fatalf("suspended entry = %+v ok=%t, want it retained at its original base", meta, ok)
+	}
+	if n, _ := b.Node("/f"); string(n.Data) != "gap!!!" {
+		t.Fatalf("backend = %q, want the gap image untouched", n.Data)
+	}
+
+	// Re-verified: the same conflict repairs onto our own landing.
+	wb.opts.Events.Emit(fs.Event{Kind: fs.EventVerified, Path: "/"})
+	if _, err := wb.uploader.UploadSyncWithRevision(ctx, "/f"); err != nil {
+		t.Fatalf("repair did not resume after EventVerified: %v", err)
+	}
+	if n, _ := b.Node("/f"); string(n.Data) != "loser!!" {
+		t.Fatalf("backend = %q, want the repaired image", n.Data)
+	}
+	if _, ok := wb.wbCache.GetMeta("/f"); ok {
+		t.Fatal("repaired entry survived in the write cache")
+	}
+}

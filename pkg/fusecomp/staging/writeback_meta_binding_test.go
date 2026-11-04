@@ -137,3 +137,49 @@ func TestTornPairPrunedOnPlainReads(t *testing.T) {
 		t.Fatal("torn pair's metadata survived the prune")
 	}
 }
+
+// TestTornPairPrunedAtRecoveryAdmission pins the recovery path: ListPending
+// admits payloads into the in-memory cache itself, so a torn pair left by a
+// crash must be caught THERE — once cached, the memory fast path serves the
+// stale bytes unchecked and the upload republishes old contents at the new
+// base. A fresh instance models the restart: no in-memory state exists, and
+// the pair reaches memory only through this scan.
+func TestTornPairPrunedAtRecoveryAdmission(t *testing.T) {
+	dir := t.TempDir()
+	c, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const path = "/recover.bin"
+
+	old := []byte("crash-survivor bytes")
+	if _, _, err := c.PutWithBaseRevAndModeAndLineageTimingsDirSync(path, old, int64(len(old)), PendingOverwrite, 3, 0o644, false, "", "", false); err != nil {
+		t.Fatal(err)
+	}
+	empty := []byte{}
+	if _, _, err := c.PutWithBaseRevAndModeAndLineageTimingsDirSync(path, empty, 0, PendingOverwrite, 7, 0o644, false, "", "", false); err != nil {
+		t.Fatal(err)
+	}
+	// The crash window: the truncation's .dat rename is lost.
+	if err := os.WriteFile(c.DatFile(path), old, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Fresh instance: the constructor scans the metadata, ListPending is
+	// the recovery admission of the payload.
+	c2, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range c2.ListPending() {
+		if e.Meta.Path == path {
+			t.Fatalf("torn pair admitted by recovery: size=%d base=%d", e.Meta.Size, e.Meta.BaseRev)
+		}
+	}
+	if _, ok := c2.GetMeta(path); ok {
+		t.Fatal("torn pair's metadata survived recovery admission")
+	}
+	if _, err := os.Stat(c2.DatFile(path)); !os.IsNotExist(err) {
+		t.Fatal("torn pair's data file survived recovery admission")
+	}
+}

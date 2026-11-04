@@ -904,6 +904,15 @@ func (c *WriteBackCache) ListPending() []PendingEntry {
 			c.pruneEntryLocked(path, false)
 			continue
 		}
+		// Recovery admits the payload through the same binding check as
+		// every other load: caching a torn pair here would hand the stale
+		// bytes to later memory hits (getViewLocked's fast path skips the
+		// recheck) and to the uploader — republishing old contents at the
+		// new base revision instead of pruning the pair.
+		if !viewMatchesMeta(meta, data) {
+			c.pruneEntryLocked(path, true)
+			continue
+		}
 
 		c.cacheDataLocked(path, data, meta.Size)
 		result = append(result, PendingEntry{Meta: *meta, Data: data})

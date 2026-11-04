@@ -428,8 +428,16 @@ func New(opts Options) (*Writeback, error) {
 			// asynchronous RELEASE racing a handoff flush of one handle, the
 			// loser staging at the pre-landing base) heals without a remote
 			// stat; a foreign advance never enters the table and stays
-			// conflicted. The watermark's incarnation rules (cleared at
-			// unverified/checkout/invalidations) bound the proof's validity.
+			// conflicted. The proof obeys the same continuity restriction as
+			// every other watermark use: while the event stream is
+			// unverified the table may hold revisions recorded DURING the
+			// gap (uploads keep succeeding, OnSuccess keeps landing), and a
+			// foreign recreation whose events have not arrived could sit at
+			// a coincidentally equal revision — rebase onto it and the
+			// stale image would overwrite the foreign bytes.
+			if w.unverified.Load() {
+				return 0, false
+			}
 			rev, ok := w.landedRevision(path)
 			if !ok || rev <= conflictedBase || rev <= meta.BaseRev {
 				return 0, false
