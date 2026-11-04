@@ -1456,6 +1456,29 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			return res, err
 		}
 		w.forgetLanded(op.Path)
+		// The instant the remote rename completed: pending state published
+		// at either name after this belongs to the NEW incarnation (the
+		// retargeted writer's own flush, or a fresh opener's) and must never
+		// be retired as the replaced incumbent's.
+		movedAt := time.Now()
+		// Whether any queue work existed for the old name at the moment the
+		// rename completed: the pre-drain left the path idle, so anything
+		// now queued or in-flight was staged DURING the RPC — the only shape
+		// whose worker could later land (and resurrect) the obsolete name.
+		windowWork := w.queue != nil && w.queue.HasPath(op.Path)
+		// The same for the old prefix's pending children: the set present
+		// right after the rename is exactly the in-window stagings; a child
+		// that vanishes from it before the descendant loop runs may have
+		// landed under the dead prefix and needs the strict check below.
+		windowDescendants := map[string]bool{}
+		if w.opts.Staging != nil && w.opts.Staging.Pending != nil {
+			prefix := strings.TrimSuffix(op.Path, "/") + "/"
+			for p := range w.opts.Staging.Pending.ListPendingPaths() {
+				if strings.HasPrefix(p, prefix) {
+					windowDescendants[p] = true
+				}
+			}
+		}
 		// Both pathname incarnations ended (source moved, target replaced),
 		// so neither name may keep answering EIO for the previous
 		// incumbent's terminally failed image — and the DURABLE state must
@@ -1472,7 +1495,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		// whose unlanded image could not be re-paired with the new name must
 		// answer EIO rather than let a later fsync certify bytes that are
 		// still only under the old name.
-		if terr := w.retargetConflictMarkers(ctx, op.Path, op.Path2); terr != nil {
+		if terr := w.retargetConflictMarkers(ctx, op.Path, op.Path2, movedAt, windowWork); terr != nil {
 			// The remote rename already succeeded; the local staging
 			// transition did not. The handles still point at the source
 			// object, whose preserved image never landed — keep it that
@@ -1535,13 +1558,26 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 					// itself; conflict entries carry no live queue
 					// bookkeeping (the worker left, recovery skips them), so
 					// a fenced move is safe.
-					terr = w.transferConflictMarker(ctx, path, target)
+					terr = w.transferConflictMarker(ctx, path, target, movedAt, true)
 				} else {
-					terr = w.retargetQueuedImage(path, target)
+					terr = w.retargetQueuedImage(path, target, movedAt)
 				}
 				if terr != nil {
 					safeLogPrintf("writeback: pending descendant %s did not follow the rename: %v", path, terr)
 				}
+			}
+		}
+		// In-window children whose pending entry vanished before the loop
+		// reached them: a worker may have landed them under the dead prefix
+		// (its not-found retry recreates the name). The same strict
+		// old-name check as the renamed path itself decides.
+		for path := range windowDescendants {
+			if w.opts.Staging.Pending.HasPending(path) {
+				continue // the loop above moved it
+			}
+			target := op.Path2 + strings.TrimPrefix(path, op.Path)
+			if terr := w.transferConflictMarker(ctx, path, target, movedAt, true); terr != nil {
+				safeLogPrintf("writeback: in-window descendant %s did not stay gone: %v", path, terr)
 			}
 		}
 		// In-memory failure records under the renamed prefix follow the move
@@ -2229,8 +2265,8 @@ func (w *Writeback) pendingImageState(path string) (gen uint64, size int64, conf
 // marker (PublishDestination): the remote name has already moved, so
 // reporting success there would claim durability for bytes that are still
 // only under the old name.
-func (w *Writeback) retargetConflictMarkers(ctx context.Context, oldPath, newPath string) error {
-	return w.transferConflictMarker(ctx, oldPath, newPath)
+func (w *Writeback) retargetConflictMarkers(ctx context.Context, oldPath, newPath string, movedAt time.Time, windowWork bool) error {
+	return w.transferConflictMarker(ctx, oldPath, newPath, movedAt, windowWork)
 }
 
 // conflictTransferAttempts bounds the fenced-out retries of one locked
@@ -2245,31 +2281,40 @@ const conflictTransferAttempts = 4
 // generations — a newer conflict under the old name belongs to the object that
 // now lives at the new name, so its marker must be the one that moves — and
 // runs the locked two-phase transaction (prepare, payload move, commit).
-func (w *Writeback) transferConflictMarker(ctx context.Context, oldPath, newPath string) error {
+// movedAt is the instant the remote rename completed; destination state
+// published after it belongs to the new incarnation and is never retired.
+// windowWork reports whether queue work for oldPath existed at that instant
+// (staged during the RPC): only then can a worker have landed the in-window
+// image under the obsolete name afterwards, so only then is the old name
+// statted for resurrection.
+func (w *Writeback) transferConflictMarker(ctx context.Context, oldPath, newPath string, movedAt time.Time, windowWork bool) error {
 	st := w.opts.Staging
 	if st == nil || st.Pending == nil {
 		return nil
 	}
 	unlock := w.lockRenamePaths(oldPath, newPath)
 	defer unlock()
-	return w.conflictTransitionLocked(ctx, oldPath, newPath)
+	return w.conflictTransitionLocked(ctx, oldPath, newPath, movedAt, windowWork)
 }
 
 // conflictTransitionLocked runs one locked pass of the durable
-// terminal-failure transition. The caller holds both writeback path locks; a
-// fenced-out begin is retried against fresh reads inside the pass.
-func (w *Writeback) conflictTransitionLocked(ctx context.Context, oldPath, newPath string) error {
+// terminal-failure transition. The caller holds both writeback path locks;
+// a fenced-out begin is retried against fresh reads inside the pass.
+// movedAt is the instant the remote rename completed: destination state
+// published after it belongs to the new incarnation and must never be
+// retired as the replaced incumbent's.
+func (w *Writeback) conflictTransitionLocked(ctx context.Context, oldPath, newPath string, movedAt time.Time, windowWork bool) error {
 	st := w.opts.Staging
 	for attempt := 0; attempt < conflictTransferAttempts; attempt++ {
 		srcPendingGen, _, srcConflict, srcLive := w.pendingImageState(oldPath)
-		dstPendingGen, dstConflict := w.pendingConflictGen(newPath)
+		dstPendingGen, dstConflict, dstLive, dstPreMove := w.dstEntryPreMove(newPath, movedAt)
 		if srcLive {
 			// A queued image is un-landed local state, and its upload runs
 			// against entry.Path — the dead old name: an acknowledgement
 			// there is not durability for the renamed object, and its
 			// not-found retry would recreate the name. Move the whole
 			// obligation to the new name instead.
-			if rerr := w.retargetQueuedImageLocked(oldPath, newPath); rerr != nil {
+			if rerr := w.retargetQueuedImageLocked(oldPath, newPath, movedAt); rerr != nil {
 				safeLogPrintf("writeback: moving the staged image of %s to %s failed: %v", oldPath, newPath, rerr)
 				w.recordTransferFailure(newPath, rerr)
 				return rerr
@@ -2282,22 +2327,46 @@ func (w *Writeback) conflictTransitionLocked(ctx context.Context, oldPath, newPa
 		if !srcConflict {
 			// Nothing un-landed remains under the old name locally (a
 			// landing resolved it): the only marker left to retire is the
-			// replaced target's. The source's local state being gone is not
-			// yet proof of durability, though — a worker that reached the old
-			// name before these locks may have landed the in-window successor
-			// THERE, its not-found retry recreating the dead name; an upload
-			// acknowledged at the obsolete pathname cannot count. Stat-based
-			// detection errs only on transient errors (fail-open there).
-			if dstConflict {
+			// replaced target's — and only if it predates the move.
+			if dstConflict && dstPreMove {
 				st.Pending.RemoveIfGeneration(newPath, dstPendingGen)
 			}
-			if stat, serr := w.opts.Client.StatCtx(ctx, w.remotePath(oldPath)); serr == nil && stat != nil {
+			if !windowWork {
+				return nil // nothing was staged in-window: no worker could resurrect
+			}
+			// The source's local state being gone is not yet proof of
+			// durability, though — a worker that reached the old name before
+			// these locks may have landed the in-window successor THERE, its
+			// not-found retry recreating the dead name. An upload
+			// acknowledged at the obsolete pathname cannot count, and a Stat
+			// that cannot decide (timeout, 5xx) proves nothing either: the
+			// barrier keeps the obligation instead of silently accepting.
+			stat, serr := w.opts.Client.StatCtx(ctx, w.remotePath(oldPath))
+			switch {
+			case serr == nil && stat != nil:
 				err := fmt.Errorf("writeback: rename %s -> %s left staged data landed under the obsolete name %s", oldPath, newPath, oldPath)
 				safeLogPrintf("%v", err)
 				w.recordTransferFailure(newPath, err)
 				return err
+			case client.IsNotFound(serr):
+				return nil // the old name stayed gone
+			default:
+				err := fmt.Errorf("writeback: rename %s -> %s could not confirm the old name stayed gone: %v", oldPath, newPath, serr)
+				safeLogPrintf("%v", err)
+				w.recordTransferFailure(newPath, err)
+				return err
 			}
-			return nil
+		}
+		if (dstConflict || dstLive) && !dstPreMove {
+			// The destination already carries a NEWER image of the renamed
+			// object (published after the move, typically the retargeted
+			// writer's own flush): transferring the older marker over it
+			// would discard acknowledged writes. Leave both sides alone and
+			// answer EIO at the new name until the newer image settles.
+			err := fmt.Errorf("writeback: a newer image already sits at %s; the preserved marker of %s stayed under the old name", newPath, oldPath)
+			safeLogPrintf("%v", err)
+			w.recordTransferFailure(newPath, err)
+			return err
 		}
 		transfer, ok, berr := st.Pending.BeginConflictTransfer(oldPath, newPath, srcPendingGen, dstPendingGen, st.Shadow)
 		if berr != nil {
@@ -2319,13 +2388,31 @@ func (w *Writeback) conflictTransitionLocked(ctx context.Context, oldPath, newPa
 	return err
 }
 
+// dstEntryPreMove classifies the destination's pending entry and reports
+// whether it was published before the remote rename completed at movedAt.
+// State that landed at the destination AFTER the move belongs to the new
+// incarnation — typically the retargeted writer's own newer flush, or a
+// fresh opener's — and must never be retired as the replaced incumbent's:
+// merely sharing the target pathname is not evidence of the old object.
+func (w *Writeback) dstEntryPreMove(path string, movedAt time.Time) (gen uint64, conflict, live, preMove bool) {
+	gen, _, conflict, live = w.pendingImageState(path)
+	if !conflict && !live {
+		return gen, false, false, true
+	}
+	meta, ok := w.opts.Staging.Pending.GetMeta(path)
+	if !ok || meta == nil || meta.CreatedAt.IsZero() || !meta.CreatedAt.After(movedAt) {
+		return gen, conflict, live, true
+	}
+	return gen, conflict, live, false
+}
+
 // retargetQueuedImage is retargetQueuedImageLocked plus the writeback path
 // locks, for callers that do not already hold them (the directory-rename
 // descendant loop).
-func (w *Writeback) retargetQueuedImage(oldPath, newPath string) error {
+func (w *Writeback) retargetQueuedImage(oldPath, newPath string, movedAt time.Time) error {
 	unlock := w.lockRenamePaths(oldPath, newPath)
 	defer unlock()
-	if err := w.retargetQueuedImageLocked(oldPath, newPath); err != nil {
+	if err := w.retargetQueuedImageLocked(oldPath, newPath, movedAt); err != nil {
 		w.recordTransferFailure(newPath, err)
 		return err
 	}
@@ -2341,7 +2428,16 @@ func (w *Writeback) retargetQueuedImage(oldPath, newPath string) error {
 // would acknowledge the image at the obsolete pathname (or recreate it via
 // the upload's not-found retry) while the retargeted handle certifies a
 // remote image that never contained the staged bytes.
-func (w *Writeback) retargetQueuedImageLocked(oldPath, newPath string) error {
+//
+// The move reuses the conflict transfer's two-phase discipline so every
+// crash point keeps a recoverable metadata/payload pair: the prepared .meta
+// is persisted at the destination while the old name still holds BOTH its
+// .meta and its payload, the payload rename follows, and the commit drops
+// the old .meta only once the destination pair is durable. A failed payload
+// move aborts back to the old name (the prepared .meta is removed, the
+// source stays intact) and marks the source entry a conflict so recovery
+// preserves it for manual re-drive instead of re-uploading the dead name.
+func (w *Writeback) retargetQueuedImageLocked(oldPath, newPath string, movedAt time.Time) error {
 	st := w.opts.Staging
 	if w.queue == nil {
 		return fmt.Errorf("writeback: no queue to carry the staged image of %s to %s", oldPath, newPath)
@@ -2351,17 +2447,35 @@ func (w *Writeback) retargetQueuedImageLocked(oldPath, newPath string) error {
 		// name; leave it in place for the caller's failure answer.
 		return fmt.Errorf("writeback: staged image of %s has no payload to move to %s", oldPath, newPath)
 	}
+	srcGen, _, srcConflict, srcLive := w.pendingImageState(oldPath)
+	if !srcLive && !srcConflict {
+		return fmt.Errorf("writeback: staged image of %s vanished before its move to %s", oldPath, newPath)
+	}
+	dstGen, dstConflict, dstLive, dstPreMove := w.dstEntryPreMove(newPath, movedAt)
+	if (dstConflict || dstLive) && !dstPreMove {
+		// The destination already carries a NEWER image of the renamed object
+		// (published after the move — the retargeted writer's own flush, or a
+		// fresh opener's): retiring it as the replaced incumbent would
+		// discard acknowledged writes, and landing the older image over it
+		// would rewind them. Stop the old name's work (nothing may upload
+		// there), preserve the older image under the old name as a conflict
+		// (recovery must not re-drive it at the dead name), and answer EIO at
+		// the new name until the newer image lands and clears the record.
+		if err := w.preserveImageUnderOldName(oldPath, srcGen); err != nil {
+			return err
+		}
+		return fmt.Errorf("writeback: a newer image already sits at %s; the staged image of %s stayed preserved under the old name", newPath, oldPath)
+	}
 	// Stop the old name's queue work and fence its earlier fsync frames: the
 	// worker uploads to entry.Path, and a restart would replay the frames
 	// back under the dead name.
 	if err := w.queue.CancelQueuedForRename(oldPath); err != nil {
 		return err
 	}
-	// A destination entry belongs to the object incarnation the completed
-	// remote rename already replaced: stop its queue work, retire its payload
-	// (confirmed, so the incoming metadata can never describe the dead bytes)
-	// and drop the entry, leaving the name clean for the moved image.
-	dstGen, _, dstConflict, dstLive := w.pendingImageState(newPath)
+	// A pre-move destination entry belongs to the object incarnation the
+	// completed remote rename already replaced: stop its queue work, retire
+	// its payload (confirmed, so the incoming metadata can never describe
+	// the dead bytes) and drop the entry, leaving the name clean.
 	if dstConflict || dstLive {
 		if err := w.queue.CancelQueuedForRename(newPath); err != nil {
 			return err
@@ -2374,11 +2488,23 @@ func (w *Writeback) retargetQueuedImageLocked(oldPath, newPath string) error {
 		}
 		st.Pending.RemoveIfGeneration(newPath, dstGen)
 	}
-	if !st.Pending.RenamePending(oldPath, newPath) {
-		return fmt.Errorf("writeback: pending entry of %s vanished before its move to %s", oldPath, newPath)
+	// Two-phase move (prepare persists the destination .meta first; a crash
+	// leaves the old name fully intact, and the committed state leaves the
+	// destination pair durable before the old .meta dies).
+	transfer, ok, err := st.Pending.BeginConflictTransfer(oldPath, newPath, srcGen, 0, st.Shadow)
+	if err != nil || !ok {
+		return fmt.Errorf("writeback: begin live-image transfer %s -> %s: ok=%v err=%v", oldPath, newPath, ok, err)
 	}
-	if st.Shadow != nil && !st.Shadow.Rename(oldPath, newPath) {
-		return fmt.Errorf("writeback: shadow payload of %s could not move to %s", oldPath, newPath)
+	if !transfer.MovePayload() {
+		transfer.Abort()
+		if _, merr := st.Pending.MarkConflictIfGeneration(oldPath, srcGen); merr != nil {
+			safeLogPrintf("writeback: preserving %s after a failed move failed: %v", oldPath, merr)
+		}
+		return fmt.Errorf("writeback: staged image of %s could not move to %s", oldPath, newPath)
+	}
+	committed, cerr := transfer.Commit()
+	if cerr != nil || !committed {
+		return fmt.Errorf("writeback: committing the live-image transfer %s -> %s: committed=%v err=%v", oldPath, newPath, committed, cerr)
 	}
 	// Re-drive the landing at the new name from the moved state.
 	entry := w.queue.recoveredEntry(newPath)
@@ -2396,6 +2522,21 @@ func (w *Writeback) retargetQueuedImageLocked(oldPath, newPath string) error {
 		return fmt.Errorf("writeback: re-driving %s after the rename: %w", newPath, err)
 	}
 	safeLogPrintf("writeback: staged image moved %s -> %s after the rename (pending gen %d, landing re-driven)", oldPath, newPath, entry.PendingIndexGen)
+	return nil
+}
+
+// preserveImageUnderOldName retires a staged image's queue work and marks its
+// pending entry a conflict while leaving bytes and metadata in place: the
+// image stays recoverable under the (now dead) old name, nothing re-drives
+// it there, and recovery preserves it for manual re-drive instead of
+// re-uploading the dead pathname.
+func (w *Writeback) preserveImageUnderOldName(oldPath string, gen uint64) error {
+	if err := w.queue.CancelQueuedForRename(oldPath); err != nil {
+		return err
+	}
+	if _, merr := w.opts.Staging.Pending.MarkConflictIfGeneration(oldPath, gen); merr != nil {
+		safeLogPrintf("writeback: preserving %s under the old name failed: %v", oldPath, merr)
+	}
 	return nil
 }
 

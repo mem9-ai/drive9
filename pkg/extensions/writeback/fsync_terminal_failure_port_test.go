@@ -39,6 +39,9 @@ type failingWritesBackend struct {
 	backend *testbackend.Backend
 	mu      sync.Mutex
 	fail    bool
+	// failStat answers stat/read probes (HEAD/GET) with 500 while armed, for
+	// callers that must fail closed when they cannot observe the remote.
+	failStat bool
 
 	renameGate chan struct{}
 	gated      chan struct{}
@@ -47,6 +50,7 @@ type failingWritesBackend struct {
 func (b *failingWritesBackend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	b.mu.Lock()
 	fail := b.fail
+	failStat := b.failStat
 	gate := b.renameGate
 	if gate != nil && r.URL.Query().Has("rename") {
 		b.renameGate = nil
@@ -60,6 +64,10 @@ func (b *failingWritesBackend) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	} else {
 		b.mu.Unlock()
 	}
+	if failStat && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
+		return
+	}
 	if fail && r.Method != http.MethodGet {
 		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
 		return
@@ -70,6 +78,12 @@ func (b *failingWritesBackend) ServeHTTP(w http.ResponseWriter, r *http.Request)
 func (b *failingWritesBackend) setFail(fail bool) {
 	b.mu.Lock()
 	b.fail = fail
+	b.mu.Unlock()
+}
+
+func (b *failingWritesBackend) setFailStat(fail bool) {
+	b.mu.Lock()
+	b.failStat = fail
 	b.mu.Unlock()
 }
 
@@ -664,7 +678,7 @@ func TestPortRenameMovesConflictMarkerStagedDuringRename(t *testing.T) {
 
 	// The post-Rename transition, with the stale pre-rename generations the
 	// old code trusted: the marker that must move is the LIVE one (v3).
-	if err := wb.retargetConflictMarkers(context.Background(), "/race-src.txt", "/race-dst.txt"); err != nil {
+	if err := wb.retargetConflictMarkers(context.Background(), "/race-src.txt", "/race-dst.txt", time.Time{}, false); err != nil {
 		t.Fatalf("retarget reported the fenced-out transfer as a failure: %v", err)
 	}
 	// What the rename caller does on a successful transition.
@@ -992,7 +1006,7 @@ func TestPortRenameRefusesDataLandedAtObsoleteName(t *testing.T) {
 	}
 
 	unlock := wb.lockRenamePaths("/obs-src.txt", "/obs-dst.txt")
-	err := wb.conflictTransitionLocked(ctx, "/obs-src.txt", "/obs-dst.txt")
+	err := wb.conflictTransitionLocked(ctx, "/obs-src.txt", "/obs-dst.txt", time.Time{}, true)
 	unlock()
 	if err == nil {
 		t.Fatal("the transition certified data landed under the obsolete old name")
@@ -1072,5 +1086,128 @@ func TestPortDirRenameCarriesStandaloneFailureRecords(t *testing.T) {
 	}
 	if meta, ok := wb.opts.Staging.Pending.GetMeta("/d/a"); !ok || meta == nil || meta.Kind != staging.PendingConflict {
 		t.Fatalf("pre-move marker at /d/a = %+v ok=%v, want the preserved conflict entry", meta, ok)
+	}
+}
+
+// TestPortRenameFailsClosedWhenOldNameStatErrors pins the fail-closed row of
+// the obsolete-name guard: a Stat that cannot decide (timeout, 5xx) is not
+// evidence that the successor landed at the new name, so the transition must
+// preserve the durability obligation instead of silently accepting — with or
+// without a resurrection actually sitting at the old name.
+func TestPortRenameFailsClosedWhenOldNameStatErrors(t *testing.T) {
+	for _, resurrected := range []bool{false, true} {
+		fb := &failingWritesBackend{backend: testbackend.NewBackend()}
+		ch, wb := newUploadStack(t, fb, Options{Policy: PolicyWriteBack})
+		ctx := context.Background()
+
+		h := open(t, ch, "/stat-src.txt")
+		if err := h.Write(ctx, 0, []byte("landed base")); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.Sync(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/stat-src.txt", Path2: "/stat-dst.txt"}); err != nil {
+			t.Fatal(err)
+		}
+		if resurrected {
+			squatter := open(t, ch, "/stat-src.txt")
+			if err := squatter.Write(ctx, 0, []byte("landed at the obsolete name")); err != nil {
+				t.Fatal(err)
+			}
+			if err := squatter.Sync(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		fb.setFailStat(true)
+		unlock := wb.lockRenamePaths("/stat-src.txt", "/stat-dst.txt")
+		err := wb.conflictTransitionLocked(ctx, "/stat-src.txt", "/stat-dst.txt", time.Now(), true)
+		unlock()
+		if err == nil {
+			t.Fatalf("resurrected=%v: the transition certified the rename although the old name could not be observed", resurrected)
+		}
+		if err := wb.queue.PathTerminalFailure("/stat-dst.txt"); err == nil {
+			t.Fatalf("resurrected=%v: the undecided Stat left no failure record", resurrected)
+		}
+	}
+}
+
+// TestPortDirRenameKeepsSuccessorPublishedAfterRetarget pins the reviewer's
+// interleaving: after the directory rename moves the handles, an open writer
+// can Flush a NEWER image at the new name before the descendant loop reaches
+// the child. That publication belongs to the renamed object's new
+// incarnation — it must not be retired as the replaced target's, and the
+// older queued image must not land over it. The older image stays preserved
+// under the old name, EIO answers at the new name until the newer image
+// lands, and the landing clears the record.
+func TestPortDirRenameKeepsSuccessorPublishedAfterRetarget(t *testing.T) {
+	fb := &failingWritesBackend{backend: testbackend.NewBackend()}
+	ch, wb := newUploadStack(t, fb, Options{Policy: PolicyWriteBack})
+	ctx := context.Background()
+
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMkdir, Path: "/d", Mode: 0o755}); err != nil {
+		t.Fatal(err)
+	}
+	h := open(t, ch, "/d/a")
+	if err := h.Write(ctx, 0, []byte("v1 landed")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// G2 staged "during the rename RPC" and left queued (uploads failing).
+	fb.setFail(true)
+	if err := h.Write(ctx, 0, []byte("v2 queued")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// The rename completes, the handles move, and the retargeted writer
+	// publishes the NEWER G3 at the new name before the descendant loop
+	// acquires the child locks.
+	movedAt := time.Now()
+	wb.retarget("/d", "/e")
+	if err := h.Write(ctx, 0, []byte("v3 newest")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := wb.retargetQueuedImage("/d/a", "/e/a", movedAt); err == nil {
+		t.Fatal("the move retired a newer post-rename publication at the destination")
+	}
+	// G3 is untouched at the new name — still queued, still live.
+	dstMeta, ok := wb.opts.Staging.Pending.GetMeta("/e/a")
+	if !ok || dstMeta == nil || dstMeta.Kind == staging.PendingConflict || dstMeta.Size != int64(len("v3 newest")) {
+		t.Fatalf("newer image at the new name = %+v ok=%v, want the untouched live G3", dstMeta, ok)
+	}
+	// The older G2 stayed preserved under the old name as a conflict marker
+	// with its bytes, and nothing re-drives it at the dead prefix.
+	srcMeta, ok := wb.opts.Staging.Pending.GetMeta("/d/a")
+	if !ok || srcMeta == nil || srcMeta.Kind != staging.PendingConflict {
+		t.Fatalf("older image under the old name = %+v ok=%v, want the preserved conflict marker", srcMeta, ok)
+	}
+	if !wb.opts.Staging.Shadow.Has("/d/a") {
+		t.Fatal("the preserved older image lost its payload")
+	}
+	if err := wb.queue.PathTerminalFailure("/e/a"); err == nil {
+		t.Fatal("the refused move left no failure record at the new name")
+	}
+
+	// The writer's barrier: with the backend healthy again, G3 lands at the
+	// new name, its landing clears the record, and strict Sync answers nil —
+	// for the NEWEST bytes, not the older queued image.
+	fb.setFail(false)
+	if err := h.Sync(ctx); err != nil {
+		t.Fatalf("strict Sync on the retargeted writer = %v, want G3 to land and clear the record", err)
+	}
+	if got, ok := nodeString(fb.backend, "/e/a"); !ok || got != "v3 newest" {
+		t.Fatalf("remote image at the new name = %q ok=%v, want G3's bytes", got, ok)
+	}
+	if err := wb.queue.PathTerminalFailure("/e/a"); err != nil {
+		t.Fatalf("the landed G3 still answers EIO: %v", err)
 	}
 }

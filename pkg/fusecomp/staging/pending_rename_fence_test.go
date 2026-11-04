@@ -481,3 +481,103 @@ func TestConflictTransferLiveDestinationFailedRemovalKeepsPair(t *testing.T) {
 		t.Fatalf("source entry = %+v found=%v, want the marker kept for the caller's failure record", meta, found)
 	}
 }
+
+// newLiveTransferFixture stages a LIVE (non-conflict) queued entry at path
+// with its payload — the shape writeback's rename re-target moves.
+func newLiveTransferFixture(t *testing.T, dir, path, data string) (*PendingIndex, *ShadowStore, uint64) {
+	t.Helper()
+	idx, err := NewPendingIndex(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shadows, err := NewShadowStoreWithQuota(filepath.Join(dir, "shadows"), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(shadows.Close)
+	if err := shadows.WriteFull(path, []byte(data), 0); err != nil {
+		t.Fatal(err)
+	}
+	gen, err := idx.Put(path, int64(len(data)), PendingNew)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return idx, shadows, gen
+}
+
+// TestConflictTransferMovesLiveEntryPairAcrossCrash pins the live-image move
+// (writeback re-targets a queued successor through this transaction) to the
+// same crash discipline as the marker move: after the payload rename and
+// before the commit, a restart must find the destination metadata paired
+// with the moved bytes and the old name prunable — never metadata at one name
+// and payload at the other.
+func TestConflictTransferMovesLiveEntryPairAcrossCrash(t *testing.T) {
+	dir := t.TempDir()
+	idx, shadows, gen := newLiveTransferFixture(t, dir, "/a", "queued successor")
+
+	transfer, ok, err := idx.BeginConflictTransfer("/a", "/b", gen, 0, shadows)
+	if err != nil || !ok {
+		t.Fatalf("begin = ok=%v err=%v", ok, err)
+	}
+	if !transfer.MovePayload() {
+		t.Fatal("payload move failed")
+	}
+	// Crash: no Commit, no memory publish — restart from disk only.
+
+	recovered, err := NewPendingIndex(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recovered.RecoverFromDisk(); err != nil {
+		t.Fatal(err)
+	}
+	dstMeta, dstFound := recovered.GetMeta("/b")
+	if dstMeta == nil || !dstFound {
+		t.Fatal("destination meta missing after the crash window")
+	}
+	// The old name's stale .meta may linger until the commit — its payload is
+	// gone, so recovery prunes it; the destination pair is what must hold.
+	if dstMeta.Kind == PendingConflict {
+		t.Fatalf("the live image was moved as a terminal-failure marker: %+v", dstMeta)
+	}
+	if dstMeta.Size != int64(len("queued successor")) {
+		t.Fatalf("recovered destination meta size = %d, want the live image's", dstMeta.Size)
+	}
+	data, rerr := os.ReadFile(shadows.shadowPath("/b"))
+	if rerr != nil || string(data) != "queued successor" {
+		t.Fatalf("payload beside the recovered meta = %q err=%v, want the live image's bytes", data, rerr)
+	}
+	if shadows.Has("/a") {
+		t.Fatal("source payload still at the old name after the move")
+	}
+}
+
+// TestConflictTransferAbortKeepsLiveEntryIntact pins the failed-move rollback
+// for a live entry: the prepared destination .meta is removed and the old
+// name keeps its live entry and payload — the re-target's failure path must
+// not leave an unbacked metadata file behind.
+func TestConflictTransferAbortKeepsLiveEntryIntact(t *testing.T) {
+	dir := t.TempDir()
+	idx, shadows, gen := newLiveTransferFixture(t, dir, "/a", "queued successor")
+
+	transfer, ok, err := idx.BeginConflictTransfer("/a", "/b", gen, 0, shadows)
+	if err != nil || !ok {
+		t.Fatalf("begin = ok=%v err=%v", ok, err)
+	}
+	// Make the payload rename fail behind the store's back.
+	if err := os.Remove(shadows.shadowPath("/a")); err != nil {
+		t.Fatal(err)
+	}
+	if transfer.MovePayload() {
+		t.Fatal("payload move reported success with the source file gone")
+	}
+	transfer.Abort()
+
+	if _, serr := os.Stat(filepath.Join(dir, HashPath("/b")+".meta")); !os.IsNotExist(serr) {
+		t.Fatalf("prepared meta for the new name survived the abort: %v", serr)
+	}
+	meta, found := idx.GetMeta("/a")
+	if !found || meta == nil || meta.Kind != PendingNew || meta.Generation != gen {
+		t.Fatalf("old-name entry after the abort = %+v found=%v, want the live entry intact", meta, found)
+	}
+}
