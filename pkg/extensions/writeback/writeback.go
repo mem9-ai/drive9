@@ -1480,8 +1480,12 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			return fs.Result{}, fs.StatusErrorOf(gofuse.Status(syscall.EIO))
 		}
 		if w.queue != nil {
-			w.queue.clearTerminalFailure(op.Path)
-			w.queue.clearTerminalFailure(op.Path2)
+			// The in-memory records follow the object rather than being
+			// wiped: a standalone record at the source (its unlanded bytes
+			// under an even older name) is the only witness for the
+			// retargeted handle's barrier, and the destination's previous
+			// record dies with its replaced incarnation.
+			w.queue.RenameTerminalFailure(op.Path, op.Path2)
 		}
 		w.retarget(op.Path, op.Path2)
 		// The landed image's revision is the new base for every retargeted
@@ -1535,6 +1539,15 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 					safeLogPrintf("writeback: conflict marker for descendant %s did not follow the rename: %v", path, terr)
 				}
 			}
+		}
+		// In-memory failure records under the renamed prefix follow the move
+		// unconditionally: standalone ones (a descendant transfer that could
+		// not install its marker, bytes left under the pre-move name) have no
+		// pending entry, so neither prefix loop above carries them — without
+		// this rekey the retargeted handle's next strict Sync would check a
+		// dead name and answer success for data that never landed.
+		if w.queue != nil {
+			w.queue.RenameTerminalFailuresPrefix(strings.TrimSuffix(op.Path, "/")+"/", strings.TrimSuffix(op.Path2, "/")+"/")
 		}
 		return res, nil
 
@@ -2172,14 +2185,27 @@ func (w *Writeback) resolveLandedStaging(path string, landedRev int64, supersede
 // pendingConflictGen reports the pending-index generation a path's entry
 // carries and whether that entry is a terminal-failure conflict marker.
 func (w *Writeback) pendingConflictGen(path string) (gen uint64, conflict bool) {
+	gen, _, conflict, _ = w.pendingImageState(path)
+	return gen, conflict
+}
+
+// pendingImageState classifies the pending entry at path for a rename's
+// terminal-failure transition: a conflict marker (the terminal failure's
+// durable record), a LIVE queued image (staged, not yet landed or terminally
+// failed), or nothing (resolved). A live entry is NOT durability: it is
+// un-landed local state the rename must settle, not certify.
+func (w *Writeback) pendingImageState(path string) (gen uint64, size int64, conflict, live bool) {
 	if w.opts.Staging == nil || w.opts.Staging.Pending == nil {
-		return 0, false
+		return 0, 0, false, false
 	}
 	meta, ok := w.opts.Staging.Pending.GetMeta(path)
 	if !ok || meta == nil {
-		return 0, false
+		return 0, 0, false, false
 	}
-	return meta.Generation, meta.Kind == staging.PendingConflict
+	if meta.Kind == staging.PendingConflict {
+		return meta.Generation, meta.Size, true, false
+	}
+	return meta.Generation, meta.Size, false, true
 }
 
 // retargetConflictMarkers moves the durable terminal-failure state of a
@@ -2200,59 +2226,59 @@ func (w *Writeback) pendingConflictGen(path string) (gen uint64, conflict bool) 
 // reporting success there would claim durability for bytes that are still
 // only under the old name.
 func (w *Writeback) retargetConflictMarkers(oldPath, newPath string) error {
+	return w.transferConflictMarker(oldPath, newPath)
+}
+
+// conflictTransferAttempts bounds the fenced-out retries of one locked
+// transition pass. Same-path publications are excluded by the writeback path
+// locks, so a fence loss means a mutator that publishes without them; the
+// bound only keeps a pathological publisher from spinning the rename forever.
+const conflictTransferAttempts = 4
+
+// conflictTransferRounds bounds the settle-and-retry rounds of one transfer:
+// each round ends with the source's queued image settled (landed or terminally
+// failed), so more than a couple of rounds means a publisher keeps re-arming
+// the source mid-settle.
+const conflictTransferRounds = 3
+
+// transferConflictMarker drives one conflict-marker transfer for a completed
+// rename (the renamed path itself, or a conflict-marked descendant): each
+// round takes both writeback path locks, re-decides the transition from the
+// LIVE generations — a newer conflict under the old name belongs to the object
+// that now lives at the new name, so its marker must be the one that moves —
+// and runs the locked two-phase transaction (prepare, payload move, commit).
+//
+// A source that instead carries a LIVE queued image (PendingNew/Overwrite, no
+// terminal failure yet) is NOT proof its data landed: the pre-rename drain
+// cannot see anything staged while the remote RPC was in flight. The round
+// then reports settle, the locks are dropped, and the queue gets one
+// size-scaled chance to land or terminally fail that image (the worker needs
+// the same path locks) before the transition re-runs. Answering success with
+// such an image still queued would let the retargeted handle's next strict
+// Sync certify data that exists only under the dead old name; a settle that
+// does not converge reports failure instead.
+func (w *Writeback) transferConflictMarker(oldPath, newPath string) error {
 	st := w.opts.Staging
 	if st == nil || st.Pending == nil {
 		return nil
 	}
-	unlock := w.lockRenamePaths(oldPath, newPath)
-	defer unlock()
-	return w.conflictTransferLocked(oldPath, newPath)
-}
-
-// conflictTransferAttempts bounds the fenced-out retries of one conflict
-// transfer. Same-path publications are excluded by the writeback path locks,
-// so a fence loss means a mutator that publishes without them; the bound only
-// keeps a pathological publisher from spinning the rename forever.
-const conflictTransferAttempts = 4
-
-// conflictTransferLocked runs one locked, two-phase conflict-marker transfer:
-// the destination .meta is prepared (only when empty), the preserved payload
-// is moved, and the transaction commits — all under both writeback path
-// locks so a same-path staging cannot advance either generation meanwhile.
-// Each attempt re-decides the roles from the LIVE generations: a newer
-// conflict under the old name belongs to the object that now lives at the new
-// name, so its marker must be the one that moves, and a conflict that was
-// resolved while the rename was in flight leaves nothing to move at all. A
-// fenced-out begin is retried against fresh reads before giving up — never
-// reported as success, or the caller would clear the failure records and
-// retarget the handle while an unlanded image stays stranded under the dead
-// name.
-func (w *Writeback) conflictTransferLocked(oldPath, newPath string) error {
-	st := w.opts.Staging
-	for attempt := 0; attempt < conflictTransferAttempts; attempt++ {
-		srcPendingGen, srcConflict := w.pendingConflictGen(oldPath)
-		dstPendingGen, dstConflict := w.pendingConflictGen(newPath)
-		if !srcConflict {
-			// Nothing unlanded remains under the old name (a landing resolved
-			// it): the only marker left to retire is the replaced target's.
-			if dstConflict {
-				st.Pending.RemoveIfGeneration(newPath, dstPendingGen)
-			}
-			return nil
+	deadline := time.Time{}
+	for round := 0; round < conflictTransferRounds; round++ {
+		unlock := w.lockRenamePaths(oldPath, newPath)
+		settle, waitSize, err := w.conflictTransitionLocked(oldPath, newPath)
+		unlock()
+		if err != nil || !settle {
+			return err
 		}
-		transfer, ok, err := st.Pending.BeginConflictTransfer(oldPath, newPath, srcPendingGen, dstPendingGen, st.Shadow)
-		if err != nil {
-			// Nothing durable moved: the old name keeps its marker and bytes, but
-			// the new name must still refuse to certify the unlanded image.
-			safeLogPrintf("writeback: begin conflict transfer %s -> %s failed: %v", oldPath, newPath, err)
+		if deadline.IsZero() {
+			deadline = time.Now().Add(releaseTimeout(waitSize))
+		}
+		if w.queue == nil || !w.queue.WaitPathDeadline(oldPath, time.Until(deadline)) {
+			err := fmt.Errorf("writeback: rename %s -> %s could not settle the image staged under the old name", oldPath, newPath)
+			safeLogPrintf("%v", err)
 			w.recordTransferFailure(newPath, err)
 			return err
 		}
-		if ok {
-			return w.finishConflictTransfer(transfer, oldPath, newPath)
-		}
-		// Fenced out: an endpoint advanced past the generation this attempt
-		// fenced on. Retry with the live state.
 	}
 	err := fmt.Errorf("writeback: conflict transfer %s -> %s could not converge under a racing publication", oldPath, newPath)
 	safeLogPrintf("%v", err)
@@ -2260,17 +2286,45 @@ func (w *Writeback) conflictTransferLocked(oldPath, newPath string) error {
 	return err
 }
 
-// transferConflictMarker is conflictTransferLocked plus the writeback path
-// locks, for callers that do not already hold them (the directory-rename
-// descendant loop).
-func (w *Writeback) transferConflictMarker(oldPath, newPath string) error {
+// conflictTransitionLocked runs one locked pass of the durable
+// terminal-failure transition and reports settle=true when the source instead
+// carries a live queued image the caller must let the queue settle outside the
+// locks. The caller holds both writeback path locks; a fenced-out begin is
+// retried against fresh reads inside the pass.
+func (w *Writeback) conflictTransitionLocked(oldPath, newPath string) (settle bool, waitSize int64, err error) {
 	st := w.opts.Staging
-	if st == nil || st.Pending == nil {
-		return nil
+	for attempt := 0; attempt < conflictTransferAttempts; attempt++ {
+		srcPendingGen, srcSize, srcConflict, srcLive := w.pendingImageState(oldPath)
+		dstPendingGen, dstConflict := w.pendingConflictGen(newPath)
+		if srcLive {
+			return true, srcSize, nil
+		}
+		if !srcConflict {
+			// Nothing unlanded remains under the old name (a landing resolved
+			// it): the only marker left to retire is the replaced target's.
+			if dstConflict {
+				st.Pending.RemoveIfGeneration(newPath, dstPendingGen)
+			}
+			return false, 0, nil
+		}
+		transfer, ok, berr := st.Pending.BeginConflictTransfer(oldPath, newPath, srcPendingGen, dstPendingGen, st.Shadow)
+		if berr != nil {
+			// Nothing durable moved: the old name keeps its marker and bytes, but
+			// the new name must still refuse to certify the unlanded image.
+			safeLogPrintf("writeback: begin conflict transfer %s -> %s failed: %v", oldPath, newPath, berr)
+			w.recordTransferFailure(newPath, berr)
+			return false, 0, berr
+		}
+		if ok {
+			return false, 0, w.finishConflictTransfer(transfer, oldPath, newPath)
+		}
+		// Fenced out: an endpoint advanced past the generation this attempt
+		// fenced on. Retry with the live state.
 	}
-	unlock := w.lockRenamePaths(oldPath, newPath)
-	defer unlock()
-	return w.conflictTransferLocked(oldPath, newPath)
+	err = fmt.Errorf("writeback: conflict transfer %s -> %s could not converge under a racing publication", oldPath, newPath)
+	safeLogPrintf("%v", err)
+	w.recordTransferFailure(newPath, err)
+	return false, 0, err
 }
 
 // finishConflictTransfer drives an opened transfer through its payload move

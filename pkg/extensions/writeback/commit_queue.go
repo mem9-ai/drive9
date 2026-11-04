@@ -3185,6 +3185,50 @@ func (cq *CommitQueue) clearTerminalFailure(path string) {
 	cq.mu.Unlock()
 }
 
+// RenameTerminalFailure moves a completed rename's endpoint records with the
+// object: the source's record (standalone ones included — their bytes sit
+// under an even older name, and the retargeted handle's next barrier checks
+// the NEW path) transfers to the destination, and the destination's previous
+// record dies with its replaced incarnation. Clearing both the way the caller
+// once did would strand a standalone witness at the dead source name.
+func (cq *CommitQueue) RenameTerminalFailure(oldPath, newPath string) {
+	if cq == nil || oldPath == newPath {
+		return
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	failure, ok := cq.terminalFailures[oldPath]
+	delete(cq.terminalFailures, oldPath)
+	delete(cq.terminalFailures, newPath)
+	if ok {
+		cq.terminalFailures[newPath] = failure
+	}
+}
+
+// RenameTerminalFailuresPrefix rekeys every terminal-failure record under a
+// renamed directory prefix. Standalone records have no pending entry at their
+// own path (their bytes remain under the pre-move name), so neither the
+// write-cache nor the pending-index prefix loop carries them — without this
+// rekey, a retargeted handle's next strict Sync would check a dead name and
+// certify data that never landed.
+func (cq *CommitQueue) RenameTerminalFailuresPrefix(oldPrefix, newPrefix string) {
+	if cq == nil || oldPrefix == newPrefix {
+		return
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	moved := make(map[string]pathCommitFailure, len(cq.terminalFailures))
+	for path, failure := range cq.terminalFailures {
+		if strings.HasPrefix(path, oldPrefix) {
+			moved[newPrefix+strings.TrimPrefix(path, oldPrefix)] = failure
+			delete(cq.terminalFailures, path)
+		}
+	}
+	for path, failure := range moved {
+		cq.terminalFailures[path] = failure
+	}
+}
+
 // PathTerminalFailureSeq reports the monotonic stamp of the recorded terminal
 // failure for path (0 when none). Callers capture it before a landing attempt
 // and hand it to ClearTerminalFailureIfSeq so the landing cannot erase a

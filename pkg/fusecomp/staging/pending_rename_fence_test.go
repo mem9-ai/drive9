@@ -420,3 +420,64 @@ func TestConflictTransferAbortAfterMoveCommits(t *testing.T) {
 		t.Fatalf("payload at the new name = %q err=%v, want the preserved bytes", data, rerr)
 	}
 }
+
+// TestConflictTransferLiveDestinationFailedRemovalKeepsPair pins the
+// removal-confirmation fence: when the destination's own payload cannot be
+// removed (an unwritable shadow directory), the prepared .meta must NOT be
+// written beside the surviving bytes — relabeling them with the source's
+// size/base revision would recreate the durable mispairing on the failure
+// path. The move reports failure, the destination keeps its own metadata and
+// payload, and PublishDestination leaves the live entry untouched.
+func TestConflictTransferLiveDestinationFailedRemovalKeepsPair(t *testing.T) {
+	dir := t.TempDir()
+	idx, shadows, srcGen := newConflictTransferFixture(t, dir, "/a", "src")
+
+	dstGen, err := idx.PutWithBaseRev("/b", 4096, PendingNew, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.MarkConflict("/b"); err != nil {
+		t.Fatal(err)
+	}
+	if err := shadows.WriteFull("/b", make([]byte, 4096), 7); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(filepath.Join(dir, HashPath("/b")+".meta"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	shadowDir := filepath.Join(dir, "shadows")
+	if err := os.Chmod(shadowDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(shadowDir, 0o755) })
+
+	transfer, ok, err := idx.BeginConflictTransfer("/a", "/b", srcGen, dstGen, shadows)
+	if err != nil || !ok {
+		t.Fatalf("begin = ok=%v err=%v", ok, err)
+	}
+	if transfer.MovePayload() {
+		t.Fatal("move reported success although the destination payload was unremovable")
+	}
+	after, err := os.ReadFile(filepath.Join(dir, HashPath("/b")+".meta"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatal("the failed removal relabeled the destination's metadata beside the surviving bytes")
+	}
+	if !shadows.Has("/b") {
+		t.Fatal("the destination payload vanished although its removal was not confirmed")
+	}
+	if perr := transfer.PublishDestination(); perr != nil {
+		t.Fatal(perr)
+	}
+	meta, found := idx.GetMeta("/b")
+	if !found || meta.Generation != dstGen || meta.Size != 4096 || meta.BaseRev != 7 {
+		t.Fatalf("destination entry = %+v found=%v, want its own metadata kept", meta, found)
+	}
+	if meta, found := idx.GetMeta("/a"); !found || meta.Kind != PendingConflict {
+		t.Fatalf("source entry = %+v found=%v, want the marker kept for the caller's failure record", meta, found)
+	}
+}

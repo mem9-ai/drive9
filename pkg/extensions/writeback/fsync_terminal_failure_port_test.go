@@ -28,16 +28,38 @@ import (
 // non-GET request with HTTP 500 while armed: stat/read traffic keeps working
 // (fresh readers must still see the remote), only the uploads fail — the
 // production symptom of the server-side 500s.
+//
+// renameGate, when set, parks the FIRST rename request until the channel
+// closes and reports the parking through gated once: a test can hold the
+// remote rename RPC in flight while a writer stages under the old name —
+// the publication window the pre-rename drain cannot see. The parked request
+// keeps the fail snapshot from its arrival, so the rename itself still
+// succeeds while everything staged meanwhile fails.
 type failingWritesBackend struct {
 	backend *testbackend.Backend
 	mu      sync.Mutex
 	fail    bool
+
+	renameGate chan struct{}
+	gated      chan struct{}
 }
 
 func (b *failingWritesBackend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	b.mu.Lock()
 	fail := b.fail
-	b.mu.Unlock()
+	gate := b.renameGate
+	if gate != nil && r.URL.Query().Has("rename") {
+		b.renameGate = nil
+		gated := b.gated
+		b.gated = nil
+		b.mu.Unlock()
+		if gated != nil {
+			close(gated)
+		}
+		<-gate
+	} else {
+		b.mu.Unlock()
+	}
 	if fail && r.Method != http.MethodGet {
 		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
 		return
@@ -709,5 +731,157 @@ func TestStandaloneTransferFailuresAreNeverEvicted(t *testing.T) {
 	}
 	if err := cq.PathTerminalFailure("/moved-0.txt"); err == nil {
 		t.Fatal("a bare standalone failure was evicted although nothing can re-derive it")
+	}
+}
+
+// TestPortRenameSettlesSuccessorStagedDuringRename pins the publication
+// window the pre-rename drain cannot close: while the remote rename RPC is
+// in flight, the open writer stages (and enqueues) a successor image under
+// the OLD name. A non-conflict source entry is not durability — the rename
+// must let the queue settle that image (it can only terminally fail against
+// the moved name) and carry the resulting marker to the new name instead of
+// certifying the still-queued bytes; the retargeted handle's strict Sync must
+// then answer EIO.
+func TestPortRenameSettlesSuccessorStagedDuringRename(t *testing.T) {
+	fb := &failingWritesBackend{backend: testbackend.NewBackend()}
+	gate := make(chan struct{})
+	gated := make(chan struct{})
+	fb.renameGate, fb.gated = gate, gated
+	ch, wb := newUploadStack(t, fb, Options{Policy: PolicyWriteBack})
+	ctx := context.Background()
+
+	// The source lands cleanly, so the rename starts from a durable image.
+	h := open(t, ch, "/settle-src.txt")
+	if err := h.Write(ctx, 0, []byte("landed base")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Hold the rename RPC in flight and stage the successor inside the
+	// window: Flush publishes and enqueues without waiting, and every upload
+	// from here on fails, so the successor cannot land.
+	renamed := make(chan error, 1)
+	go func() {
+		_, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/settle-src.txt", Path2: "/settle-dst.txt"})
+		renamed <- err
+	}()
+	select {
+	case <-gated:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the rename request never reached the backend")
+	}
+	fb.setFail(true)
+	if err := h.Write(ctx, 0, []byte("successor never landed")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	close(gate)
+
+	select {
+	case err := <-renamed:
+		if err != nil {
+			t.Fatalf("rename reported %v, want success after settling the successor", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the rename never settled the successor staged during its RPC")
+	}
+
+	// The successor's terminal failure followed the name: its marker (and
+	// preserved bytes) live at the destination, and the retargeted handle's
+	// strict Sync answers EIO for the image that never landed.
+	fb.setFail(false)
+	if wb.opts.Staging.Pending.HasPending("/settle-src.txt") {
+		t.Fatal("the successor's pending entry stayed keyed under the dead old name")
+	}
+	meta, ok := wb.opts.Staging.Pending.GetMeta("/settle-dst.txt")
+	if !ok || meta == nil || meta.Kind != staging.PendingConflict {
+		t.Fatalf("pending entry at the new name = %+v ok=%v, want the settled successor's marker", meta, ok)
+	}
+	data, err := wb.opts.Staging.Shadow.ReadAll("/settle-dst.txt")
+	if err != nil || string(data) != "successor never landed" {
+		t.Fatalf("shadow at the new name = %q err=%v, want the successor's preserved bytes", data, err)
+	}
+	if err := wb.queue.PathTerminalFailure("/settle-dst.txt"); err == nil {
+		t.Fatal("the settled successor's terminal failure is not reachable at the new name")
+	}
+	if err := h.Sync(ctx); err == nil {
+		t.Fatal("strict Sync on the retargeted handle certified the never-landed successor")
+	}
+}
+
+// TestPortDirRenameCarriesStandaloneFailureRecords pins the second rename of
+// the reviewer's chain: a descendant transfer failure leaves a standalone
+// failure record at the new name with NO pending entry behind it (the marker
+// and bytes stay under the pre-move name), so neither prefix loop of a later
+// directory rename would carry it. The record must follow the move —
+// rekeyed with the prefix — or the retargeted handle's strict Sync would
+// check a dead name and certify data that never landed.
+func TestPortDirRenameCarriesStandaloneFailureRecords(t *testing.T) {
+	fb := &failingWritesBackend{backend: testbackend.NewBackend()}
+	ch, wb := newUploadStack(t, fb, Options{Policy: PolicyWriteBack})
+	ctx := context.Background()
+
+	// The pre-move residue: a terminally failed image under /d/a whose
+	// marker and preserved bytes stay there.
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMkdir, Path: "/d", Mode: 0o755}); err != nil {
+		t.Fatal(err)
+	}
+	src := open(t, ch, "/d/a")
+	if err := src.Write(ctx, 0, []byte("landed base")); err != nil {
+		t.Fatal(err)
+	}
+	if err := src.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	fb.setFail(true)
+	if err := src.Write(ctx, 0, []byte("unlanded")); err != nil {
+		t.Fatal(err)
+	}
+	if err := src.Sync(ctx); err == nil {
+		t.Fatal("fsync reported durability during the upload outage")
+	}
+	fb.setFail(false)
+
+	// The failed /d -> /e transfer's destination-only residue: the record the
+	// descendant transfer leaves at the new name when its marker could not be
+	// installed (prepare ENOSPC), while the durable marker stays at /d/a.
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMkdir, Path: "/e", Mode: 0o755}); err != nil {
+		t.Fatal(err)
+	}
+	incumbent := open(t, ch, "/e/a")
+	if err := incumbent.Write(ctx, 0, []byte("incumbent")); err != nil {
+		t.Fatal(err)
+	}
+	if err := incumbent.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	wb.queue.RecordTerminalFailureForPath("/e/a", errors.New("simulated failed transfer: prepare /e/a.meta: no space left on device"))
+	if err := wb.queue.PathTerminalFailure("/e/a"); err == nil {
+		t.Fatal("the standalone record did not land at /e/a")
+	}
+
+	// The second directory rename: nothing under /e has a pending entry, so
+	// only the record rekey can carry the witness.
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/e", Path2: "/f"}); err != nil {
+		t.Fatalf("directory rename: %v", err)
+	}
+	if err := wb.queue.PathTerminalFailure("/e/a"); err != nil {
+		t.Fatalf("the standalone record stayed at the dead name /e/a: %v", err)
+	}
+	if err := wb.queue.PathTerminalFailure("/f/a"); err == nil {
+		t.Fatal("the standalone record did not follow the directory rename to /f/a")
+	}
+	// The barrier on the renamed name answers EIO, and the durable marker
+	// that stayed behind documents where the unlanded bytes still are.
+	moved := open(t, ch, "/f/a")
+	if err := moved.Sync(ctx); err == nil {
+		t.Fatal("strict Sync at /f/a certified data whose unlanded image never landed")
+	}
+	if meta, ok := wb.opts.Staging.Pending.GetMeta("/d/a"); !ok || meta == nil || meta.Kind != staging.PendingConflict {
+		t.Fatalf("pre-move marker at /d/a = %+v ok=%v, want the preserved conflict entry", meta, ok)
 	}
 }

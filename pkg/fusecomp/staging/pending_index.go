@@ -444,8 +444,16 @@ func (t *PendingConflictTransfer) MovePayload() bool {
 		// The destination's own pending image belongs to an object incarnation
 		// the completed remote rename already replaced: retire its payload
 		// BEFORE the prepared .meta can describe this path, so no crash can
-		// pair that .meta with the dead bytes.
+		// pair that .meta with the dead bytes. Remove's cleanup ignores disk
+		// errors, so the retirement must be CONFIRMED (VerifyRemoved) before
+		// the relabel: with the payload still beside the path, writing the
+		// prepared .meta would pair the source's size/base revision with the
+		// dead destination's bytes — durably, surviving a restart, exactly
+		// the mismatch this ordering exists to prevent.
 		t.shadows.Remove(t.newPath)
+		if verr := t.shadows.VerifyRemoved(t.newPath); verr != nil {
+			return false
+		}
 		t.destReplaced = true
 		if err := t.idx.writeMetaFile(t.prepared); err != nil {
 			return false
