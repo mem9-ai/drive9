@@ -66,6 +66,12 @@ type fakeV2 struct {
 	partialPlan map[string]partialPlanShape
 }
 
+// fakeTotalParts is the multipart part count for a size: ceil(size/part),
+// never truncation.
+func fakeTotalParts(size, part float64) int {
+	return int((size + part - 1) / part)
+}
+
 // partialPlanShape overrides one block's represented range in the read plan.
 type partialPlanShape struct {
 	Length      int64
@@ -414,13 +420,15 @@ func newFakeV2(t *testing.T) *fakeV2 {
 			// CLASSIC multipart plan (Key != "").
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"upload_id": "s1", "key": "classic-key", "part_size": 4 << 20,
-				"total_parts": int(body["total_size"].(float64)/(4<<20)) + 1,
+				"total_parts": fakeTotalParts(body["total_size"].(float64), 4<<20),
 			})
 			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"upload_id": "s1", "key": "", "part_size": 4 << 20,
-			"total_parts":       int(body["total_size"].(float64)/(4<<20)) + 1,
+			// CEIL, like the real server: a size one byte past a part
+			// boundary needs the extra part, or the tail is silently lost.
+			"total_parts":       fakeTotalParts(body["total_size"].(float64), 4<<20),
 			"checksum_contract": map[string]any{"supported": []string{"SHA-256"}, "required": true},
 		})
 	})
@@ -4862,12 +4870,12 @@ func TestEcholessSharedBlockIsNotIdentity(t *testing.T) {
 	}
 }
 
-// Round-52: an empty classic occupant can never be attributed to our create
-// — the create call returns no resource identity, and a follow-up Stat may
-// describe a concurrent replacement — so the commit must NEVER delete it.
-// It falls back to the classic surface instead, which is exactly where a
-// classic mount would have written, leaving the occupant untouched.
-func TestEmptyOccupantIsNeverDeleted(t *testing.T) {
+// Round-53: an empty classic occupant can never be attributed to our create
+// (the create call returns no resource identity), so the commit must neither
+// delete it NOR publish into it. Refusing is the only option that leaves a
+// foreign object untouched — "avoid the DELETE" was not enough, because a
+// classic write would still have overwritten that object's contents.
+func TestUnattributedEmptyOccupantRefusedNotWritten(t *testing.T) {
 	f := newFakeV2(t)
 	f.setDir("/d", true)
 	h := newTestHandler(t, f, 0)
@@ -4884,13 +4892,12 @@ func TestEmptyOccupantIsNeverDeleted(t *testing.T) {
 	f.ids["/d/e.bin"] = fmt.Sprintf("res-%d", f.nextID)
 	foreignID := f.ids["/d/e.bin"]
 	f.mu.Unlock()
-	if ferr := eh.Flush(context.Background()); ferr != nil {
-		t.Fatalf("flush over an empty classic occupant must degrade to classic, not fail: %v", ferr)
+	if err := eh.Flush(context.Background()); err == nil {
+		t.Fatal("an unattributed occupant must be refused, not written into")
 	}
-
-	content := f.contentOf("/d/e.bin")
 	f.mu.Lock()
 	gotID := f.ids["/d/e.bin"]
+	content, stillClassic := f.classic["/d/e.bin"]
 	dels := 0
 	for _, d := range f.deletes {
 		if d == "/d/e.bin" {
@@ -4899,13 +4906,13 @@ func TestEmptyOccupantIsNeverDeleted(t *testing.T) {
 	}
 	f.mu.Unlock()
 	if dels != 0 {
-		t.Fatalf("the empty occupant was deleted %d time(s); it can never be attributed to our create", dels)
+		t.Fatalf("the occupant was deleted %d time(s)", dels)
 	}
-	if gotID != foreignID {
-		t.Fatalf("occupant identity changed (%q -> %q)", foreignID, gotID)
+	if !stillClassic || gotID != foreignID {
+		t.Fatalf("occupant identity changed (%q -> %q, classic=%v)", foreignID, gotID, stillClassic)
 	}
-	if content != "OURS" {
-		t.Fatalf("content = %q, want OURS (the bytes still land, through the classic surface)", content)
+	if content != "" {
+		t.Fatalf("occupant content = %q, want it untouched (never published into)", content)
 	}
 }
 
@@ -5012,7 +5019,13 @@ func TestRenameIntentPrecedesRemoteRename(t *testing.T) {
 		&fs.Op{Kind: fs.OpRename, Path: "/d/a.bin", Path2: "/d/b.bin"},
 		func(context.Context, *fs.Op) (fs.Result, error) {
 			// Observe the record exactly when the chain would rename.
-			atChainTime = stagedNextPath(t, br)
+			if recs, err := br.scanStaged(); err == nil && len(recs) == 1 {
+				for _, c := range recs[0].m.candidatePaths() {
+					if c == "/d/b.bin" {
+						atChainTime = c
+					}
+				}
+			}
 			return fs.Result{}, nil
 		})
 	if err != nil {
@@ -5024,8 +5037,9 @@ func TestRenameIntentPrecedesRemoteRename(t *testing.T) {
 	if got := stagedManifestPath(t, br); got != "/d/b.bin" {
 		t.Fatalf("settled manifest path = %q, want /d/b.bin", got)
 	}
-	if next := stagedNextPath(t, br); next != "" {
-		t.Fatalf("intent not retired after a landed rename: %q", next)
+	if rec := onlyStaged(t, br); rec.m.Path != "/d/b.bin" || len(rec.m.NextPaths) != 0 {
+		t.Fatalf("settled record = path %q / candidates %v, want path /d/b.bin and none pending",
+			rec.m.Path, rec.m.candidatePaths())
 	}
 }
 
@@ -5123,62 +5137,97 @@ func stagedNextPath(t *testing.T, br *Bridge) string {
 	return recs[0].m.NextPath
 }
 
-// Round-52: the descriptor that created the empty placeholder must still be
-// able to write through it — but WITHOUT ever deleting the occupant, since
-// the placeholder's identity is not attributable (the create response has no
-// resource id). The write therefore lands through the classic surface and
-// the file keeps its identity.
-func TestOwnEmptyPlaceholderGrowsClassically(t *testing.T) {
+// Round-53: an empty flush must not materialize a classic name while the
+// descriptor can still write. If it did, the next write would face an
+// occupant it can neither attribute nor delete — and on a sparse write the
+// classic fallback would materialize the whole logical image (one byte at
+// 2 GiB would allocate 2 GiB), OOMing the mount and leaving the file off the
+// extent path.
+func TestEmptyFlushKeepsSparseWritesOnExtentPath(t *testing.T) {
 	f := newFakeV2(t)
 	f.setDir("/d", true)
 	h := newTestHandler(t, f, 0)
 	res, _, _ := dispatchCreate(context.Background(), h, "/d/p.bin", syscall.O_RDWR|syscall.O_CREAT)
 	eh := res.Handle.(*engineHandle)
-	// touch: flush with no bytes materializes the empty classic name.
+	// Flush while empty: no name is materialized, so no classic occupant can
+	// block (or be mistaken for) the later write.
 	if err := eh.Flush(context.Background()); err != nil {
 		t.Fatalf("empty flush: %v", err)
 	}
-	f.mu.Lock()
-	_, isClassic := f.classic["/d/p.bin"]
-	placeholderID := f.ids["/d/p.bin"]
-	f.mu.Unlock()
-	if !isClassic {
-		t.Fatal("an empty flush must materialize a classic empty file")
+	if n := f.hashParsedLayout("/d/p.bin"); n != "" {
+		t.Fatalf("an intermediate empty flush materialized a %s object; it must stay local until close", n)
 	}
-	// The SAME descriptor now writes: the bytes land classically, and the
-	// occupant is never deleted.
-	if err := eh.Write(context.Background(), 0, []byte("GROWN")); err != nil {
+	// A one-byte sparse write at 2 GiB must stay on the extent path: no
+	// whole-image materialization, no classic fallback.
+	const farOff = int64(2) << 30
+	if err := eh.Write(context.Background(), farOff, []byte("X")); err != nil {
 		t.Fatal(err)
 	}
 	if err := eh.Flush(context.Background()); err != nil {
-		t.Fatalf("our own empty placeholder must stay writable: %v", err)
+		t.Fatalf("sparse write after an empty flush must land on the extent path: %v", err)
 	}
-	if got := f.contentOf("/d/p.bin"); got != "GROWN" {
-		t.Fatalf("content = %q, want GROWN", got)
+	if n := f.hashParsedLayout("/d/p.bin"); n != "extent" {
+		t.Fatalf("layout = %q, want extent (a classic fallback would materialize the sparse image)", n)
 	}
-	f.mu.Lock()
-	gotID := f.ids["/d/p.bin"]
-	dels := 0
-	for _, d := range f.deletes {
-		if d == "/d/p.bin" {
-			dels++
-		}
-	}
-	f.mu.Unlock()
-	if dels != 0 {
-		t.Fatalf("the occupant was deleted %d time(s); an unattributable placeholder must never be deleted", dels)
-	}
-	if gotID != placeholderID {
-		t.Fatalf("occupant identity changed (%q -> %q)", placeholderID, gotID)
+	// The bridge's logical size must cover the byte written at 2 GiB. (The
+	// fake reconstructs block bytes rather than a sparse map, so the exact
+	// file length is asserted on the client view, not its buffer.)
+	br := h.opts.Engine.Bridge
+	br.mu.Lock()
+	size := br.sizes[eh.ino]
+	br.mu.Unlock()
+	if size != farOff+1 {
+		t.Fatalf("logical size = %d, want %d", size, farOff+1)
 	}
 }
 
+// Round-53: the name is still materialized at the LAST close, so `touch`
+// keeps working.
+func TestEmptyFileMaterializesAtClose(t *testing.T) {
+	f := newFakeV2(t)
+	f.setDir("/d", true)
+	h := newTestHandler(t, f, 0)
+	res, _, _ := dispatchCreate(context.Background(), h, "/d/t.bin", syscall.O_RDWR|syscall.O_CREAT)
+	eh := res.Handle.(*engineHandle)
+	if err := eh.Release(context.Background()); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if n := f.hashParsedLayout("/d/t.bin"); n != "classic" {
+		t.Fatalf("layout after close = %q, want classic (touch must materialize the name)", n)
+	}
+}
+
+// sizeOf reports the server-side size the fake reports for a path.
+func (f *fakeV2) sizeOf(path string) int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if c, ok := f.extent[path]; ok {
+		return int64(len(c))
+	}
+	if c, ok := f.classic[path]; ok {
+		return int64(len(c))
+	}
+	return -1
+}
+
+// hashParsedLayout reports the fake's stored layout for a path ("", "extent"
+// or "classic").
+func (f *fakeV2) hashParsedLayout(path string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.extent[path] != "" {
+		return "extent"
+	}
+	if f.hasClassic(path) {
+		return "classic"
+	}
+	return ""
+}
+
 // Round-52: an error from the chain does NOT prove the remote rename failed
-// to commit — a committed rename can lose its response, and the detached
-// probes can fail during the same outage. The durable destination must
-// therefore SURVIVE an ambiguous outcome so recovery accepts the staged
-// object at either name; clearing it would strand the acknowledged bytes at
-// the destination.
+// to commit — a committed rename can lose its response. The durable
+// destination must therefore SURVIVE an ambiguous outcome, so recovery
+// accepts the staged object at every name it may hold.
 func TestAmbiguousRenameKeepsIntent(t *testing.T) {
 	f := newFakeV2(t)
 	f.setDir("/d", true)
@@ -5202,19 +5251,21 @@ func TestAmbiguousRenameKeepsIntent(t *testing.T) {
 	if !errors.Is(err, boom) {
 		t.Fatalf("rename error = %v, want the chain's failure", err)
 	}
-	if next := stagedNextPath(t, br); next != "/d/b.bin" {
-		t.Fatalf("ambiguous rename cleared the durable destination (next = %q)", next)
+	rec := onlyStaged(t, br)
+	if !rec.hasCandidate("/d/b.bin") {
+		t.Fatalf("ambiguous rename lost the destination: candidates = %v", rec.m.candidatePaths())
 	}
-	if got := stagedManifestPath(t, br); got != "/d/a.bin" {
-		t.Fatalf("saved path = %q, want /d/a.bin (only the intent records /d/b.bin)", got)
+	// The PRE-rename name must remain a candidate too — the rename may not
+	// have committed.
+	if rec.m.Path != "/d/a.bin" {
+		t.Fatalf("saved path = %q, want /d/a.bin still", rec.m.Path)
 	}
 }
 
-// Round-52: a still-pending destination must be carried through a SUBSEQUENT
-// rename. A committed rename whose local cleanup failed leaves
-// Path=/a, NextPath=/b; a later /b -> /c must move that record too, or a
-// crash after the second rename strands the bytes at /c.
-func TestPendingIntentChainsThroughSecondRename(t *testing.T) {
+// Round-53: a second rename must ADD its destination, not replace the
+// previous one. Until B -> C commits, the object may still be at B, so
+// recovery has to try it.
+func TestSecondRenameKeepsPreviousCandidate(t *testing.T) {
 	f := newFakeV2(t)
 	f.setDir("/d", true)
 	f.seedExtent(t, "/d/a.bin", "BASE")
@@ -5229,35 +5280,33 @@ func TestPendingIntentChainsThroughSecondRename(t *testing.T) {
 	if err := br.StagePendingLocal(ino); err != nil {
 		t.Fatal(err)
 	}
-	// The first rename commits remotely but its cleanup fails locally,
-	// leaving Path=/d/a.bin with NextPath=/d/b.bin.
-	f.seedExtent(t, "/d/b.bin", "BASE")
+	// First rename: A -> B, committed but not settled (cleanup failed).
 	if err := br.StageRenameIntentLocal("/d/a.bin", "/d/b.bin"); err != nil {
 		t.Fatal(err)
 	}
 	br.ClearRenameIntentLocal("/d/a.bin", "/d/b.bin")
-	if got := stagedNextPath(t, br); got != "/d/b.bin" {
-		t.Fatalf("precondition: next = %q, want /d/b.bin", got)
-	}
-	// A SECOND rename moves /d/b.bin -> /d/c.bin. The record already moved
-	// from /d/a.bin, so only the pending destination identifies it.
+	// Second rename: B -> C, staged but NOT committed yet.
 	if err := br.StageRenameIntentLocal("/d/b.bin", "/d/c.bin"); err != nil {
 		t.Fatal(err)
 	}
-	br.SettleRenameIntentLocal("/d/b.bin", "/d/c.bin")
-	if got := stagedManifestPath(t, br); got != "/d/c.bin" {
-		t.Fatalf("manifest after the second rename = %q, want /d/c.bin", got)
+	rec := onlyStaged(t, br)
+	// The object is still at B, so B must remain a candidate even though C
+	// was just recorded.
+	if !rec.hasCandidate("/d/b.bin") {
+		t.Fatalf("second rename dropped the still-current name: candidates = %v", rec.m.candidatePaths())
 	}
-	if got := stagedNextPath(t, br); got != "" {
-		t.Fatalf("intent not retired after the second rename: %q", got)
+	if !rec.hasCandidate("/d/c.bin") {
+		t.Fatalf("second rename did not record its destination: candidates = %v", rec.m.candidatePaths())
+	}
+	// And a definitive failure of that RPC leaves the record replayable at B.
+	br.ClearRenameIntentLocal("/d/b.bin", "/d/c.bin")
+	if !onlyStaged(t, br).hasCandidate("/d/b.bin") {
+		t.Fatal("a failed second rename must leave the object's current name replayable")
 	}
 }
 
 // Round-52: a barrier staged WHILE a rename is in flight must inherit its
-// destination. StagePendingLocal does not run under the plane's path locks,
-// so a generation written between the intent scan and the remote rename
-// would otherwise supersede the record carrying the intent and name only the
-// old path.
+// destination, since StagePendingLocal does not run under the path locks.
 func TestConcurrentStageInheritsInFlightIntent(t *testing.T) {
 	f := newFakeV2(t)
 	f.setDir("/d", true)
@@ -5270,15 +5319,36 @@ func TestConcurrentStageInheritsInFlightIntent(t *testing.T) {
 	sum := sha256Hex([]byte("PEND"))
 	br.StageBlockForTest(sum, []byte("PEND"))
 	br.AddPendingForTest(ino, 0, 0, sum, 4, 8)
-	// Register the rename FIRST (as StageRenameIntent does), then stage a
-	// fresh generation — simulating an fsync that landed mid-rename.
 	if err := br.StageRenameIntentLocal("/d/a.bin", "/d/b.bin"); err != nil {
 		t.Fatal(err)
 	}
 	if err := br.StagePendingLocal(ino); err != nil {
 		t.Fatal(err)
 	}
-	if got := stagedNextPath(t, br); got != "/d/b.bin" {
-		t.Fatalf("mid-rename barrier carries next = %q, want /d/b.bin", got)
+	if !onlyStaged(t, br).hasCandidate("/d/b.bin") {
+		t.Fatalf("mid-rename barrier missed the in-flight destination: %v", onlyStaged(t, br).m.candidatePaths())
 	}
+}
+
+// onlyStaged returns the single staged record.
+func onlyStaged(t *testing.T, br *Bridge) stagedRecord {
+	t.Helper()
+	recs, err := br.scanStaged()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recs) != 1 {
+		t.Fatalf("staged records = %d, want 1", len(recs))
+	}
+	return recs[0]
+}
+
+// hasCandidate reports whether p is one of the record's candidate names.
+func (r stagedRecord) hasCandidate(p string) bool {
+	for _, c := range r.m.candidatePaths() {
+		if c == p {
+			return true
+		}
+	}
+	return false
 }

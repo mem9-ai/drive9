@@ -177,6 +177,12 @@ func (e *Engine) FlushFile(ctx context.Context, ino uint64) error {
 	return e.Bridge.FlushFile(ctx, meta.Ino(ino))
 }
 
+// FlushFileFinal is FlushFile for the last close of a descriptor: it may
+// also materialize a still-empty file's name (see Bridge.FlushFileFinal).
+func (e *Engine) FlushFileFinal(ctx context.Context, ino uint64) error {
+	return e.Bridge.FlushFileFinal(ctx, meta.Ino(ino))
+}
+
 // ResolvePath maps a mount-local path onto a bridge inode, registering the
 // path↔inode mapping. ENOENT when the target does not exist server-side
 // and has no local (fresh, uncommitted) mapping either.

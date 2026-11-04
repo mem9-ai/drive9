@@ -841,13 +841,13 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 		// A locally-created descriptor whose landing never established an
 		// attributable identity (no completion echo, no bound
 		// classification) must not write into whoever currently holds the
-		// name: that occupant may be a replacement. An EMPTY CLASSIC
-		// occupant is the one exception, and only because the branch below
-		// handles it WITHOUT deleting anything — it commits through the
-		// classic surface. Anything else is refused.
-		if st.ContentLayout == client.ContentLayoutExtent || st.Size != 0 {
-			return fmt.Errorf("fresh create of %s has no attributable identity for the current occupant", path)
-		}
+		// name. An empty classic occupant is NOT an exception: publishing
+		// into it is an unconditional conditional-write against a foreign
+		// object (publicationIdentity is empty, so the request carries no
+		// expected resource and simply succeeds), and deleting it would be
+		// equally unauthorized. Refuse — the descriptor may not mutate an
+		// object it was never bound to.
+		return fmt.Errorf("fresh create of %s has no attributable identity for the current occupant", path)
 	}
 	if !fresh && st.ContentLayout != client.ContentLayoutExtent {
 		if b.isClassicOwned(ino) || b.isLayoutPending(ino) {
@@ -879,26 +879,14 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 			}
 			return b.commitClassic(ctx, ino, path, pending, size, st.Revision)
 		}
-		if st.Size == 0 {
-			// An empty file materialized as classic (empty extent files
-			// cannot exist server-side yet). Promoting it means DELETING the
-			// occupant, which is only authorized when the occupant is
-			// provably the placeholder we created.
-			//
-			// That proof is unavailable: the create call answers with a
-			// revision and no resource identity, and a follow-up Stat is a
-			// separate request — a concurrent replacement between them
-			// would be recorded as "our" placeholder and then deleted. So an
-			// unattributable empty occupant is NEVER deleted; the commit
-			// falls back to the classic surface, which is exactly where a
-			// classic mount would have written it.
-			b.mu.Lock()
-			b.classicOwned[ino] = true
-			b.mu.Unlock()
-			return b.commitClassic(ctx, ino, path, pending, size, st.Revision)
-		} else {
-			return fmt.Errorf("target %s is not extent layout", path)
-		}
+		// No ownership of this classic occupant. It must not be deleted
+		// (that would destroy another client's file) and must not be
+		// written through the classic surface either (that would mutate
+		// it). Refuse both, whatever its size: an empty occupant is no
+		// more attributable than a non-empty one, and routing it to
+		// commitClassic would also materialize the whole image for a
+		// sparse write.
+		return fmt.Errorf("target %s is not extent layout", path)
 	}
 
 	if fresh {
@@ -1553,10 +1541,16 @@ func (b *Bridge) LocalView(ino meta.Ino) (size int64, mode uint32, ok bool) {
 // currently occupies the saved path.
 type stagedManifest struct {
 	Path string `json:"path"`
-	// NextPath is a PENDING rename's destination, written durably BEFORE
-	// the remote rename is issued. Recovery accepts the staged object at
-	// either name, so a crash on either side of the remote rename still
-	// finds the bytes' object. It is cleared once the rename settles.
+	// NextPaths are the OTHER names the staged object may currently hold:
+	// pending rename destinations, plus every earlier destination still
+	// reachable when a rename's outcome is unconfirmed. They accumulate —
+	// a second rename ADDS its destination rather than replacing the
+	// previous one — because until each rename is confirmed, the object may
+	// be at any of them. Recovery accepts the object under Path or any
+	// candidate; only a confirmed rename collapses the list.
+	NextPaths []string `json:"next_paths,omitempty"`
+	// NextPath is the pre-list single-destination field, read only so a
+	// record written by an earlier build still recovers.
 	NextPath   string `json:"next_path,omitempty"`
 	Ino        uint64 `json:"ino"`
 	ResourceID string `json:"resource_id,omitempty"`
@@ -1573,20 +1567,72 @@ type stagedManifest struct {
 	} `json:"blocks"`
 }
 
-// resolveStagedPath decides which name currently holds the staged object:
-// the pending rename's destination when the intent was recorded, else the
-// name saved at staging time. Returns the landed path and the identity
-// stat that verified it (nil when the barrier carried no identity — a
-// fresh create that had no server object yet).
+// addNextPath appends p as a candidate destination, reporting whether the
+// record changed. The saved Path is never recorded as a destination.
+func (m *stagedManifest) addNextPath(p string) bool {
+	if p == "" || p == m.Path {
+		return false
+	}
+	for _, have := range m.NextPaths {
+		if have == p {
+			return false
+		}
+	}
+	m.NextPaths = append(m.NextPaths, p)
+	return true
+}
+
+// renamedOrigin maps the record's names through a rename of oldFull to
+// newFull, reporting the first candidate that lies at or under the moved
+// name.
+func (m stagedManifest) renamedOrigin(oldFull, newFull string) (string, bool) {
+	for _, p := range m.candidatePaths() {
+		if mapped, ok := renamedUnder(p, oldFull, newFull); ok {
+			return mapped, true
+		}
+	}
+	return "", false
+}
+
+// candidatePaths lists every name the staged object may currently hold: the
+// name saved at staging time followed by each recorded destination, newest
+// first. Duplicates and empties are dropped, and the legacy single
+// destination is folded in.
+func (m stagedManifest) candidatePaths() []string {
+	out := make([]string, 0, 2+len(m.NextPaths))
+	add := func(p string) {
+		if p == "" {
+			return
+		}
+		for _, have := range out {
+			if have == p {
+				return
+			}
+		}
+		out = append(out, p)
+	}
+	add(m.Path)
+	for i := len(m.NextPaths) - 1; i >= 0; i-- {
+		add(m.NextPaths[i])
+	}
+	add(m.NextPath) // legacy record
+	return out
+}
+
+// resolveStagedPath decides which name currently holds the staged object.
+// Every candidate is tried, not merely the most recent destination: a
+// rename may have committed or not, and a second rename must not discard
+// the previous destination that the object may still occupy. Returns the
+// landed path and the identity stat that verified it (nil when the barrier
+// carried no identity — a fresh create that had no server object yet).
 func resolveStagedPath(c *client.Client, ctx context.Context, m stagedManifest) (string, *client.StatResult) {
-	candidates := []string{m.Path}
-	if m.NextPath != "" && m.NextPath != m.Path {
-		candidates = append([]string{m.NextPath}, candidates...)
+	candidates := m.candidatePaths()
+	if len(candidates) == 0 {
+		return "", nil
 	}
 	if m.ResourceID == "" {
-		// No identity to verify: the record can only trust its own name.
-		// A pending rename means the intent was written just before the
-		// remote rename, so the destination is the name to use.
+		// No identity to verify: the record can only trust its own names,
+		// and the most recently recorded destination is the best guess.
 		return candidates[0], nil
 	}
 	for _, p := range candidates {
@@ -1689,11 +1735,7 @@ func (b *Bridge) StagePendingLocal(ino meta.Ino) error {
 	// after the manifest lands: the writer either sees a registration whose
 	// scan can no longer reach this record, or the scan sees a record that
 	// already carries the intent — one of the two orderings always wins.
-	b.mu.Lock()
-	if to, ok := b.pendingRenameLocked(path); ok {
-		m.NextPath = to
-	}
-	b.mu.Unlock()
+	m.addNextPath(b.pendingRenameFor(path))
 	raw, err := json.Marshal(m)
 	if err != nil {
 		return err
@@ -1707,11 +1749,7 @@ func (b *Bridge) StagePendingLocal(ino meta.Ino) error {
 	// the only place that ordering is caught. Later registrations are the
 	// scan's responsibility — it runs after installing the registration and
 	// therefore sees this manifest.
-	b.mu.Lock()
-	to, renamed := b.pendingRenameLocked(path)
-	b.mu.Unlock()
-	if renamed && to != m.NextPath {
-		m.NextPath = to
+	if to := b.pendingRenameFor(path); to != "" && m.addNextPath(to) {
 		again, merr := json.Marshal(m)
 		if merr != nil {
 			return merr
@@ -1977,10 +2015,11 @@ func renamedUnder(p, oldFull, newFull string) (string, bool) {
 //
 // Two further obligations:
 //
-//   - A record whose PENDING destination (NextPath) lies under oldFull is
-//     moving too: a previous rename may have committed with its post-rename
-//     cleanup failing locally, so NextPath is still the live location. The
-//     new destination supersedes it.
+//   - A record whose SAVED name or any candidate destination lies under
+//     oldFull is moving too: a previous rename may have committed with its
+//     post-rename cleanup failing locally, so a candidate is the live
+//     location. The new destination is ADDED to the candidates rather than
+//     replacing them, because nothing is confirmed until the settle.
 //   - Barriers STAGED while the rename is in flight must inherit the intent.
 //     StagePendingLocal does not run under the plane's path locks, so the
 //     in-flight registration is installed FIRST and StagePendingLocal
@@ -2002,16 +2041,21 @@ func (b *Bridge) StageRenameIntent(oldFull, newFull string) error {
 		return fmt.Errorf("stage rename intent %s → %s: %w", oldFull, newFull, err)
 	}
 	for _, r := range recs {
-		next := ""
-		if mapped, ok := renamedUnder(r.m.Path, oldFull, newFull); ok {
-			next = mapped
-		} else if mapped, ok := renamedUnder(r.m.NextPath, oldFull, newFull); ok {
-			next = mapped
-		}
-		if next == "" || r.m.NextPath == next {
+		// Match the SAVED name or any recorded destination: after an
+		// unconfirmed rename the object may sit at a candidate that is not
+		// the saved name, and that candidate is the one this rename moves.
+		if _, ok := r.m.renamedOrigin(oldFull, newFull); !ok {
 			continue
 		}
-		r.m.NextPath = next
+		// ADD the destination; never replace an existing candidate, and
+		// never move Path here. Until the remote rename is CONFIRMED the
+		// object is still at whatever name it held, so Path and every
+		// earlier candidate must stay reachable: a crash before this RPC
+		// commits, or a definite failure of it, then recovers from the
+		// pre-rename names instead of only the name it never reached.
+		if !r.m.addNextPath(newFull) {
+			continue
+		}
 		raw, merr := json.Marshal(r.m)
 		if merr != nil {
 			b.ClearRenameIntent(oldFull, newFull)
@@ -2047,6 +2091,15 @@ func (b *Bridge) pendingRenameLocked(full string) (string, bool) {
 	return "", false
 }
 
+// pendingRenameFor reports the destination an in-flight rename assigns to
+// full ("" when none).
+func (b *Bridge) pendingRenameFor(full string) string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	to, _ := b.pendingRenameLocked(full)
+	return to
+}
+
 // SettleRenameIntent adopts the destination of a rename that LANDED: every
 // record at or under the old name (a directory rename strands all of its
 // descendants, not only the renamed inode) follows, and the recorded
@@ -2063,16 +2116,25 @@ func (b *Bridge) SettleRenameIntent(oldFull, newFull string) {
 	}
 	for _, r := range recs {
 		changed := false
-		// A record still naming the old subtree follows the rename. This is
-		// what covers DESCENDANTS: they hold their own inodes, so no
-		// per-inode retarget can reach them from the renamed directory.
-		if next, ok := renamedUnder(r.m.Path, oldFull, newFull); ok {
-			r.m.Path, r.m.NextPath, changed = next, "", true
+		// The record follows the rename when the SAVED name or ANY
+		// candidate lies in the moved subtree — descendants included, since
+		// they hold their own inodes and no per-inode retarget reaches them.
+		if next, ok := r.m.renamedOrigin(oldFull, newFull); ok {
+			r.m.Path, r.m.NextPaths, r.m.NextPath = next, nil, ""
+			changed = true
 		}
-		// Retire the recorded intent, adopting its destination.
-		if r.m.NextPath != "" && (r.m.NextPath == newFull || strings.HasPrefix(r.m.NextPath, newFull+"/")) {
-			r.m.Path = r.m.NextPath
-			r.m.NextPath, changed = "", true
+		// A recorded destination inside the new subtree is confirmed by
+		// this rename: adopt it and collapse every other candidate, since
+		// the object is now known to be here.
+		for _, cand := range r.m.candidatePaths() {
+			if cand == newFull || strings.HasPrefix(cand, newFull+"/") {
+				if r.m.Path != cand {
+					r.m.Path = cand
+				}
+				r.m.NextPaths, r.m.NextPath = nil, ""
+				changed = true
+				break
+			}
 		}
 		if !changed {
 			continue
@@ -2118,11 +2180,12 @@ func (b *Bridge) retargetStagedGensFor(ino meta.Ino, newFull string) {
 		if !strings.HasPrefix(filepath.Base(r.dir), prefix) {
 			continue
 		}
-		if r.m.Path == newFull && r.m.NextPath == "" {
+		if r.m.Path == newFull && r.m.NextPath == "" && len(r.m.NextPaths) == 0 {
 			continue
 		}
 		r.m.Path = newFull
 		r.m.NextPath = ""
+		r.m.NextPaths = nil
 		raw, merr := json.Marshal(r.m)
 		if merr != nil {
 			continue
@@ -2945,6 +3008,22 @@ func (b *Bridge) allocateHeldReplacementInoLocked() meta.Ino {
 // truncate-only growth. Empty fresh files (touch) materialize as classic
 // empties — the extent protocol has no zero-size session.
 func (b *Bridge) FlushFile(ctx context.Context, ino meta.Ino) error {
+	return b.flushFile(ctx, ino, false)
+}
+
+// FlushFileFinal is FlushFile for the LAST close of a descriptor: it may
+// additionally materialize a still-empty file's NAME. Intermediate flushes
+// deliberately do not: an empty classic object cannot be attributed back to
+// this descriptor later (the create returns no resource identity), so
+// materializing it while the handle can still be written would leave the
+// next write with an occupant it must neither delete nor publish into. A
+// name created at the last close is never written through this descriptor
+// again — a later open resolves it as an ordinary classic file.
+func (b *Bridge) FlushFileFinal(ctx context.Context, ino meta.Ino) error {
+	return b.flushFile(ctx, ino, true)
+}
+
+func (b *Bridge) flushFile(ctx context.Context, ino meta.Ino, finalize bool) error {
 	// One commit lifecycle at a time per file: concurrent chunk commits
 	// each snapshot the size independently, and a retry that only re-bases
 	// its revision could then send an older, smaller size over a newly
@@ -2959,7 +3038,7 @@ func (b *Bridge) FlushFile(ctx context.Context, ino meta.Ino) error {
 	size, has := b.sizes[ino]
 	path, mapped := b.paths[ino]
 	b.mu.Unlock()
-	if has && mapped && size == 0 {
+	if finalize && has && mapped && size == 0 {
 		if _, err := b.StatLocal(ctx, path); err != nil && client.IsNotFound(err) {
 			if _, err := b.cfg.Client.CreateFileCtx(ctx, path); err != nil {
 				return err

@@ -728,7 +728,12 @@ func (e *engineHandle) Release(ctx context.Context) error {
 	// callback) would otherwise stay unlanded. VFS.Release reports no
 	// error, so the bridge-side landing is the only failure channel here.
 	e.plane.opts.Engine.VFS.Release(e.vctx, e.ino, e.fh)
-	landErr := e.plane.opts.Engine.FlushFile(ctx, uint64(e.ino))
+	// The LAST close is the only point where an empty file's name may be
+	// materialized classically: an empty classic object cannot be attributed
+	// back to this descriptor afterwards, so creating it earlier would leave
+	// the next write with an occupant it must neither delete nor publish
+	// into.
+	landErr := e.plane.opts.Engine.FlushFileFinal(ctx, uint64(e.ino))
 	e.plane.release(e)
 	return landErr
 }
