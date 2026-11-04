@@ -90,10 +90,11 @@ func NewEngine(cfg EngineConfig) *Engine {
 		// way, so an open of the file can serve and commit them.
 		go b.ReplayStagedLocal(context.Background())
 	}
+	// CacheSize 0 means NO disk cache (JuiceFS's memory-only mode: reads
+	// bypass the cache, writeback is disabled by SelfCheck). It must not
+	// silently become a 1 GiB default — the mount wiring derives this value
+	// from --disk-read-cache-size-mb so the operator's budget is exact.
 	cacheSize := cfg.CacheSize
-	if cacheSize == 0 {
-		cacheSize = 1 << 30
-	}
 	blockSize := blockSizeMiB << 20
 	chunkConf := chunk.Config{
 		BlockSize:  blockSize << 0,

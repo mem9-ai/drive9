@@ -178,3 +178,18 @@ func TestExtentCacheRootSharesReadCacheScope(t *testing.T) {
 		t.Fatalf("memory-only cache scope = %q, want empty", got)
 	}
 }
+
+// A zero budget must DISABLE a disk cache, never fall through to a
+// library default: --disk-read-cache-size-mb 0 has to mean "no disk read
+// cache" on both planes (the operator's number is exact), and the extent
+// engine's CacheSize 0 is JuiceFS's memory-only mode.
+func TestZeroDiskCacheBudgetDisablesBothPlanes(t *testing.T) {
+	if got := diskCacheOpts("", 0, 0.1); got.Dir != "" {
+		t.Fatalf("zero-budget read cache dir = %q, want empty (disabled)", got.Dir)
+	}
+	if got := diskCacheOpts("/tmp/x", 0, 0.1); got.Dir != "" {
+		// Guard the call shape used by the mount: a zero budget never
+		// yields a configured dir, so the plugin's default cannot kick in.
+		t.Fatalf("zero-budget diskCacheOpts leaked a dir: %q", got.Dir)
+	}
+}

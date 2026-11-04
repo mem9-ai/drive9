@@ -826,7 +826,15 @@ func mountWithConfig(cfg MountConfig) error {
 				if wantExt["extent"] && budget > 0 {
 					budget /= 2
 				}
-				return diskCacheOpts(cacheScopedDir(cacheBase, readCacheHash, "read"), budget, cfg.DiskReadCacheFreeRatio)
+				// A non-positive budget disables the disk read cache
+				// entirely (mirroring the extent engine, whose CacheSize 0
+				// means memory-only) instead of falling through to the
+				// cache plugin's own 1 MiB default.
+				dir := ""
+				if budget > 0 {
+					dir = cacheScopedDir(cacheBase, readCacheHash, "read")
+				}
+				return diskCacheOpts(dir, budget, cfg.DiskReadCacheFreeRatio)
 			}(),
 		})
 		if cerr != nil {
@@ -1554,7 +1562,10 @@ func remoteRootValidationError(remoteRoot string, err error) *MountExitError {
 // diskCacheOpts builds the on-disk read-cache options; an empty cache
 // directory disables the disk layer (memory-only, v1 default).
 func diskCacheOpts(dir string, sizeMB int64, freeRatio float64) cache.DiskReadCacheOptions {
-	if dir == "" {
+	// An empty dir OR a non-positive budget disables the disk read cache:
+	// the plugin substitutes its own default for MaxSize <= 0, which would
+	// silently grant a cache the operator disabled.
+	if dir == "" || sizeMB <= 0 {
 		return cache.DiskReadCacheOptions{}
 	}
 	return cache.DiskReadCacheOptions{
