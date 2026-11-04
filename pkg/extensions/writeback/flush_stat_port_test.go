@@ -2,7 +2,10 @@ package writeback
 
 import (
 	"context"
+	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -414,6 +417,29 @@ func TestPortUnverifiedStreamSuspendsWatermarkAdoption(t *testing.T) {
 	if _, ok := wb.landedRevision("/f"); !ok {
 		t.Fatal("watermark not re-recorded after the stream re-verified")
 	}
+
+	// A checkout alone must NOT resume: 401 view resets (core.mapErr) and
+	// layer view switches emit EventCheckout while the SSE stream may
+	// still be down — resuming on it would reopen the unverified adoption
+	// window. Only the SSE reset's full sequence (handleReset emits
+	// Checkout AND Verified once its catch-up completes) ends the
+	// suspension.
+	bus.Emit(fs.Event{Kind: fs.EventUnverified, Path: "/"})
+	if !wb.unverified.Load() {
+		t.Fatal("second EventUnverified did not suspend adoption")
+	}
+	bus.Emit(fs.Event{Kind: fs.EventCheckout, Path: "/"})
+	if !wb.unverified.Load() {
+		t.Fatal("an unrelated EventCheckout resumed the suspension")
+	}
+	bus.Emit(fs.Event{Kind: fs.EventVerified, Path: "/"})
+	if wb.unverified.Load() {
+		t.Fatal("EventVerified did not resume after the reset sequence")
+	}
+	cycle("fourth!")
+	if _, ok := wb.landedRevision("/f"); !ok {
+		t.Fatal("watermark not re-recorded after the reset resume")
+	}
 }
 
 // TestPortMissingLineageDiscoversBase pins the baseRev==0 fallback: a
@@ -478,4 +504,185 @@ func TestPortMissingLineageDiscoversBase(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+}
+
+// TestPortDivergentBufferNotAdopted pins the adoption's lineage boundary:
+// a buffer whose image does not extend this mount's landed bytes keeps
+// its open-time base and surfaces as a conflict — advancing it to the
+// landing's revision would erase the landing's edits without any 409 for
+// the CRC gate to catch.
+func TestPortDivergentBufferNotAdopted(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/f", []byte("seeded"))
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	wb, err := New(Options{Policy: PolicyWriteBack, Client: cl, WriteCacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := fs.NewChain(wb, terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	// H1 lands "winner" at revision R.
+	open := func() *bufferingHandle {
+		res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/f", Flags: uint32(syscall.O_RDWR)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res.Handle.(*bufferingHandle)
+	}
+	h1 := open()
+	if err := h1.Write(ctx, 0, []byte("winner")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h1.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := h1.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if n, ok := b.Node("/f"); ok && string(n.Data) == "winner" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("winner never landed")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	wonRev := func() int64 { n, _ := b.Node("/f"); return n.Rev }()
+
+	// H2 buffered a DIVERGENT image from the pre-landing base (its stale
+	// base models the open that raced H1's landing).
+	h2 := open()
+	h2.mu.Lock()
+	h2.baseRev = 1
+	h2.mu.Unlock()
+	if err := h2.Write(ctx, 0, []byte("loser!")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h2.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	meta, ok := wb.wbCache.GetMeta("/f")
+	if !ok {
+		t.Fatal("divergent flush did not stage")
+	}
+	if meta.BaseRev >= wonRev {
+		t.Fatalf("divergent buffer adopted base %d (>= winner's %d) — it must keep its own base and conflict", meta.BaseRev, wonRev)
+	}
+	if err := h2.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if n, _ := b.Node("/f"); string(n.Data) != "winner" {
+		t.Fatalf("backend = %q, want the winner's image untouched", n.Data)
+	}
+
+	// The legitimate composition still adopts: a buffer EXTENDING the
+	// landed bytes (the append over our own landing) advances to the
+	// landed revision and lands whole.
+	h3 := open()
+	h3.mu.Lock()
+	h3.baseRev = 1
+	h3.baseSize = 0
+	if h3.buf != nil {
+		h3.buf = nil
+	}
+	h3.mu.Unlock()
+	if err := h3.ensureBuffer(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := h3.Write(ctx, 0, append([]byte("winner"), []byte("+more")...)); err != nil {
+		t.Fatal(err)
+	}
+	if err := h3.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := h3.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		if n, ok := b.Node("/f"); ok && string(n.Data) == "winner+more" {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("prefix-composed append never landed")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestPortFailedDiscoveryDoesNotStage pins the failed-HEAD seam: a
+// lineage-less handle whose discovery probe fails transiently must not
+// persist an unguarded PendingOverwrite — that entry would route
+// close-sync through the legacy unconditional PUT and overwrite a
+// foreign row.
+func TestPortFailedDiscoveryDoesNotStage(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/f", []byte("seeded"))
+	var failHead atomic.Bool
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead && strings.HasSuffix(r.URL.Path, "/f") && failHead.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		b.ServeHTTP(w, r)
+	}))
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	wb, err := New(Options{Policy: PolicyCloseSync, Client: cl, WriteCacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := fs.NewChain(wb, terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/f", Flags: uint32(syscall.O_RDWR)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := res.Handle.(*bufferingHandle)
+	h.mu.Lock()
+	h.baseRev = 0
+	h.mu.Unlock()
+	if err := h.Write(ctx, 0, []byte("guard!")); err != nil {
+		t.Fatal(err)
+	}
+	failHead.Store(true)
+	if err := h.Flush(ctx); err == nil {
+		t.Fatal("flush must fail when the discovery HEAD fails")
+	}
+	failHead.Store(false)
+	if _, ok := wb.wbCache.GetMeta("/f"); ok {
+		t.Fatal("an unguarded entry was staged despite the failed discovery")
+	}
+	if n, _ := b.Node("/f"); string(n.Data) != "seeded" {
+		t.Fatalf("backend = %q, want no unconditional overwrite", n.Data)
+	}
+	// Recovery of the failure: the retry stages with a discovered base.
+	if err := h.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := b.Node("/f"); string(n.Data) != "guard!" {
+		t.Fatalf("backend = %q, want the retried landing", n.Data)
+	}
+	_ = h.Release(ctx)
 }

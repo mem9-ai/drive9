@@ -82,10 +82,19 @@ func uploadBufferedRemoteFile(ctx context.Context, c *client.Client, remotePath 
 }
 
 func uploadBufferedRemoteFileWithRevision(ctx context.Context, c *client.Client, remotePath string, data []byte, expectedRevision int64) (int64, error) {
-	if err := c.WriteStreamConditional(ctx, remotePath, bytes.NewReader(data), int64(len(data)), nil, expectedRevision); err != nil {
+	// The checksum-carrying variant re-reads the committed Stat and reports
+	// the server's revision: callers downstream (landed records, watermark
+	// bookkeeping) must never fall back to expected+1 for a landed row —
+	// that fabrication understates the revision and poisons every
+	// same-origin proof built on it.
+	st, err := c.WriteStreamConditionalWithChecksum(ctx, remotePath, bytes.NewReader(data), int64(len(data)), nil, expectedRevision, "")
+	if err != nil {
 		return 0, err
 	}
-	return 0, nil
+	if st == nil {
+		return 0, nil
+	}
+	return st.Revision, nil
 }
 
 // isInlineShadowUpload is shared by the ordinary uploader and combined-mode

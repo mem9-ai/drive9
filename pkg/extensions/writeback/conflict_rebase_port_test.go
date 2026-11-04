@@ -310,7 +310,8 @@ func TestPortRecoveryOwnershipSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fs.NewChain(wb, terminal); err != nil {
+	ch, err := fs.NewChain(wb, terminal)
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -331,23 +332,94 @@ func TestPortRecoveryOwnershipSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The queue recovers its own entry and lands it; the uploader must
-	// never touch the stale snapshot (it stays cached, byte-identical).
+	// never submit the stale snapshot, and the queue's success RETIRES it
+	// — it must neither serve reads nor survive into a later recovery.
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		if n, ok := b.Node("/f"); ok && string(n.Data) == "ledger-image" {
+		if _, ok := wb.wbCache.GetMeta("/f"); !ok {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("ledger recovery never landed")
+			t.Fatal("stale snapshot was not retired after the ledger landing")
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	// Give the uploader's recovery pass ample time to (wrongly) run.
-	time.Sleep(500 * time.Millisecond)
-	if data, ok := wb.wbCache.GetView("/f"); !ok || string(data) != "stale-snapshot" {
-		t.Fatalf("stale snapshot = %q ok=%t, want it untouched (ledger-owned path)", data, ok)
-	}
 	if n, _ := b.Node("/f"); string(n.Data) != "ledger-image" {
 		t.Fatalf("backend = %q, want the ledger image alone", n.Data)
+	}
+	// Public read behavior after the queue cleanup: a read-only reopen
+	// must see the recovered successor, never the retired snapshot.
+	res, err := ch.Dispatch(context.Background(), &fs.Op{Kind: fs.OpCreate, Path: "/f",
+		Flags: uint32(syscall.O_RDONLY)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 32)
+	n, err := res.Handle.Read(context.Background(), 0, buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(buf[:n]); got != "ledger-image" {
+		t.Fatalf("post-cleanup read = %q, want the recovered image", got)
+	}
+	// And a restart's recovery finds nothing left to double-own.
+	if m := wb.wbCache.ListPendingMetas(); len(m) != 0 {
+		t.Fatalf("pending metas after retirement = %v, want none", m)
+	}
+}
+
+// TestPortUnknownIdentityLandingRefusesRebase pins the proof's known-bytes
+// requirement: landings that record no payload bytes (the ledger track,
+// oversized images) can prove NOTHING — not a size match, not a checksum,
+// not the revision alone. A conflicted same-size entry must stay pending
+// after such a landing instead of rebasing on size-only evidence.
+func TestPortUnknownIdentityLandingRefusesRebase(t *testing.T) {
+	b, wb, ch, _ := newConflictStack(t)
+	ctx := context.Background()
+
+	h := openExisting(t, ch, "/f")
+	if err := h.Write(ctx, 0, []byte("first!!")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if n, ok := b.Node("/f"); ok && string(n.Data) == "first!!" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("winner cycle never landed")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Overwrite the landing record with an identity-less one (the ledger
+	// track's shape: revision known, bytes not retained).
+	wb.landedMu.Lock()
+	if info, ok := wb.landed["/f"]; ok {
+		info.image = nil
+		wb.landed["/f"] = info
+	}
+	wb.landedMu.Unlock()
+
+	// A same-size, same-checksum-class duplicate staged at the stale base:
+	// the unknown identity must refuse the rebase.
+	dup := []byte("first!!")
+	if err := wb.wbCache.PutWithBaseRevAndMode("/f", dup, int64(len(dup)), staging.PendingOverwrite, 1, 0o644, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wb.uploader.UploadSyncWithRevision(ctx, "/f"); err == nil {
+		t.Fatal("an identity-less landing must not authorize a rebase")
+	}
+	if meta, ok := wb.wbCache.GetMeta("/f"); !ok || meta.BaseRev != 1 {
+		t.Fatalf("entry = %+v ok=%t, want it retained at its original base", meta, ok)
+	}
+	if n, _ := b.Node("/f"); string(n.Data) != "first!!" {
+		t.Fatalf("backend = %q, want the winner's image untouched", n.Data)
 	}
 }

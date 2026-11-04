@@ -84,22 +84,38 @@ type WriteBackUploader struct {
 	// generations for a path so OnSuccess can do generation-guarded cleanup.
 	SnapshotStagingGens SnapshotStagingGensFunc
 	// ResolveConflict optionally repairs a conflicted entry in place:
-	// given the staged meta and the base its upload just conflicted on, it
-	// returns a newer same-origin base to rebase onto and retry. Wired by
-	// the writeback plane to its landed watermark — the revisions this
-	// mount itself recorded — so a duplicate-commit race (the kernel's
-	// asynchronous RELEASE racing a handoff flush of one handle) heals
-	// without a remote stat, while a foreign advance stays conflicted.
-	ResolveConflict func(localPath string, meta *staging.WriteBackMeta, conflictedBase int64) (int64, bool)
+	// given the staged meta, the payload that was read for upload, and the
+	// base its upload just conflicted on, it returns a newer same-origin
+	// base to rebase onto and retry. Wired by the writeback plane to its
+	// landed records — the payload this mount itself uploaded — so a
+	// duplicate-commit race (the kernel's asynchronous RELEASE racing a
+	// handoff flush of one handle) heals without a remote stat, while a
+	// foreign advance or a divergent image stays conflicted.
+	ResolveConflict func(localPath string, meta *staging.WriteBackMeta, data []byte, conflictedBase int64) (int64, bool)
+	// RecordLanding observes every successful upload with EXACTLY the
+	// bytes that were published (both the background worker and the sync
+	// path), read under the same generation gate as the upload's meta
+	// snapshot. Wired by the writeback plane to its landed records, whose
+	// payload identity must describe the uploaded generation — capturing
+	// it outside this gate can pair one generation's identity with
+	// another's revision.
+	RecordLanding func(localPath string, data []byte, committedRev int64, meta *staging.WriteBackMeta)
 }
 
 // resolveConflict consults ResolveConflict and rebases the staged entry's
 // base when the proof holds; ok reports a retryable new base.
-func (u *WriteBackUploader) resolveConflict(localPath string, meta *staging.WriteBackMeta, conflictedBase int64) (int64, bool) {
+func (u *WriteBackUploader) resolveConflict(localPath string, meta *staging.WriteBackMeta, data []byte, conflictedBase int64) (int64, bool) {
 	if u.ResolveConflict == nil {
 		return 0, false
 	}
-	return u.ResolveConflict(localPath, meta, conflictedBase)
+	return u.ResolveConflict(localPath, meta, data, conflictedBase)
+}
+
+// recordLanding consults RecordLanding when wired.
+func (u *WriteBackUploader) recordLanding(localPath string, data []byte, committedRev int64, meta *staging.WriteBackMeta) {
+	if u.RecordLanding != nil {
+		u.RecordLanding(localPath, data, committedRev, meta)
+	}
 }
 
 // WriteBackUploaderSnapshot is one uploader-depth observation.
@@ -399,7 +415,7 @@ func (u *WriteBackUploader) UploadSyncWithRevision(ctx context.Context, localPat
 		// retry once so the flush that routed here (close-sync's boundary,
 		// the claim handoff inside an open) does not surface EIO for a
 		// race the mount itself can prove.
-		if rev, ok := u.resolveConflict(localPath, meta, expectedRevision); ok {
+		if rev, ok := u.resolveConflict(localPath, meta, data, expectedRevision); ok {
 			expectedRevision = rev
 			committedRev, err = put(ctx, expectedRevision)
 		}
@@ -414,6 +430,7 @@ func (u *WriteBackUploader) UploadSyncWithRevision(ctx context.Context, localPat
 		return 0, err
 	}
 	committedRev = committedRevisionForExpectedRevision(expectedRevision, committedRev)
+	u.recordLanding(localPath, data, committedRev, meta)
 	chmodCtx, chmodCancel := context.WithTimeout(ctx, 30*time.Second)
 	err = u.applyMode(chmodCtx, meta)
 	chmodCancel()
@@ -607,7 +624,7 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 			// kernel's asynchronous RELEASE racing a handoff flush of the
 			// same handle), rebase onto the winner's base and retry
 			// instead of staying conflicted forever.
-			if rev, ok := u.resolveConflict(localPath, meta, expectedRevision); ok {
+			if rev, ok := u.resolveConflict(localPath, meta, data, expectedRevision); ok {
 				expectedRevision = rev
 				if attempt == uploadMaxRetries {
 					// The repair earned its own attempt: refund this slot
@@ -636,6 +653,7 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 		return
 	}
 	committedRev = committedRevisionForExpectedRevision(expectedRevision, committedRev)
+	u.recordLanding(localPath, data, committedRev, meta)
 	chmodCtx, chmodCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	modeErr := u.applyMode(chmodCtx, meta)
 	chmodCancel()
