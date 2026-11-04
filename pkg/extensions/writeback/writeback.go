@@ -1438,7 +1438,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		// rename: its buffer simply moves (PrepareRename's local
 		// phase). Otherwise the remote rename runs first and the open
 		// writers follow it onto the new path (fh.Path + SetPath).
-		srcStat, statErr := w.opts.Client.StatCtx(ctx, w.remotePath(op.Path))
+		_, statErr := w.opts.Client.StatCtx(ctx, w.remotePath(op.Path))
 		if statErr != nil {
 			if !client.IsNotFound(statErr) {
 				return fs.Result{}, mapErr(statErr)
@@ -1449,12 +1449,17 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			w.retarget(op.Path, op.Path2)
 			return fs.Result{}, nil
 		}
-		// The renamed object's revision: a staging at the destination that
-		// carries it composed over the RENAMED object (a fresh opener of the
-		// new incumbent) and can never be the replaced one's leftover.
-		srcRev := int64(0)
-		if srcStat != nil {
-			srcRev = srcStat.Revision
+		// The REPLACED destination object's revision, statted before the RPC
+		// (0 when the destination does not exist): with it, a destination
+		// entry carrying that exact revision — like a create-shaped base —
+		// is positively the old incumbent's and may be retired; anything
+		// else revisioned stays protected as possibly the renamed object's
+		// own new publication.
+		dstOldRev := int64(0)
+		if dstStat, derr := w.opts.Client.StatCtx(ctx, w.remotePath(op.Path2)); derr == nil && dstStat != nil {
+			dstOldRev = dstStat.Revision
+		} else if !client.IsNotFound(derr) {
+			return fs.Result{}, mapErr(derr)
 		}
 		// The pre-drain's own landings must not read as in-window work below:
 		// forget the old name's and the old prefix's watermarks entirely, so
@@ -1529,7 +1534,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		// whose unlanded image could not be re-paired with the new name must
 		// answer EIO rather than let a later fsync certify bytes that are
 		// still only under the old name.
-		installedGen, terr := w.retargetConflictMarkers(ctx, op.Path, op.Path2, renameFence{movedAt: movedAt, srcRev: srcRev}, windowWork)
+		installedGen, terr := w.retargetConflictMarkers(ctx, op.Path, op.Path2, renameFence{movedAt: movedAt, oldRev: dstOldRev, oldRevSet: true}, windowWork)
 		if terr != nil {
 			// The remote rename already succeeded; the local staging
 			// transition did not. The handles still point at the source
@@ -1558,7 +1563,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		// recorded rather than failing the rename: the remote move and the
 		// handle retarget already happened, and the transition's failure
 		// records answer EIO at the new name.
-		secondFence := renameFence{movedAt: movedAt, srcRev: srcRev, ownGen: installedGen}
+		secondFence := renameFence{movedAt: movedAt, oldRev: dstOldRev, oldRevSet: true, ownGen: installedGen}
 		secondWork := (w.queue != nil && w.queue.HasPath(op.Path)) || w.everLanded(op.Path)
 		if _, terr := w.retargetConflictMarkers(ctx, op.Path, op.Path2, secondFence, secondWork); terr != nil {
 			safeLogPrintf("writeback: rename %s -> %s could not carry a late old-name publication: %v", op.Path, op.Path2, terr)
@@ -1610,37 +1615,16 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 					// itself; conflict entries carry no live queue
 					// bookkeeping (the worker left, recovery skips them), so
 					// a fenced move is safe.
-					_, terr = w.transferConflictMarker(ctx, path, target, w.childFence(ctx, path, target, movedAt), true)
+					_, terr = w.transferConflictMarker(ctx, path, target, renameFence{movedAt: movedAt}, true)
 				} else {
-					_, terr = w.retargetQueuedImage(path, target, w.childFence(ctx, path, target, movedAt))
+					_, terr = w.retargetQueuedImage(path, target, renameFence{movedAt: movedAt})
 				}
 				if terr != nil {
 					safeLogPrintf("writeback: pending descendant %s did not follow the rename: %v", path, terr)
 				}
 			}
 		}
-		// In-window children whose pending entry vanished before the loop
-		// reached them: a worker may have landed them under the dead prefix
-		// (its not-found retry recreates the name). The same strict
-		// old-name check as the renamed path itself decides.
-		for path := range windowDescendants {
-			if w.opts.Staging.Pending.HasPending(path) {
-				continue // the loop above moved it
-			}
-			target := op.Path2 + strings.TrimPrefix(path, op.Path)
-			if _, terr := w.transferConflictMarker(ctx, path, target, w.childFence(ctx, path, target, movedAt), true); terr != nil {
-				safeLogPrintf("writeback: in-window descendant %s did not stay gone: %v", path, terr)
-			}
-		}
-		// In-memory failure records under the renamed prefix follow the move
-		// unconditionally: standalone ones (a descendant transfer that could
-		// not install its marker, bytes left under the pre-move name) have no
-		// pending entry, so neither prefix loop above carries them — without
-		// this rekey the retargeted handle's next strict Sync would check a
-		// dead name and answer success for data that never landed.
-		if w.queue != nil {
-			w.queue.RenameTerminalFailuresPrefix(strings.TrimSuffix(op.Path, "/")+"/", strings.TrimSuffix(op.Path2, "/")+"/")
-		}
+		w.settleOldPrefixAfterMove(ctx, op, movedAt, windowDescendants)
 		return res, nil
 
 	case fs.OpSetAttr:
@@ -2486,52 +2470,24 @@ func (w *Writeback) conflictTransitionLocked(ctx context.Context, oldPath, newPa
 // matches neither.
 type renameFence struct {
 	movedAt time.Time
-	srcRev  int64
-	// srcBaseRev is the revision the OLD-name source entry itself was staged
-	// against — the renamed object's at-rename revision. A destination
-	// publication composed over THAT revision belongs to the renamed object
-	// even when a later landing (by any client) has since advanced the
-	// current revision past it: exact equality with the fence Stat alone
-	// would classify it as the replaced incumbent's and discard it.
-	srcBaseRev    int64
-	srcBaseRevSet bool
+	// oldRev is the REPLACED destination object's revision as statted before
+	// the RPC (0 when the destination did not exist), oldRevSet whether the
+	// top-level rename could establish it. Retirement of a destination entry
+	// requires POSITIVE proof it belongs to the replaced incumbent; the two
+	// proofs are a create-shaped base (the staging's handle opened the
+	// destination before the rename — a post-rename opener always finds the
+	// renamed object present and stages over its revision) and a base equal
+	// to oldRev. Directory descendants have no per-child old revision, so
+	// every revisioned child entry stays protected: the source straggler's
+	// own composition revision is arbitrarily stale and proves nothing about
+	// the destination.
+	oldRev    int64
+	oldRevSet bool
 	// ownGen is the destination generation this rename's own first pass
 	// installed (0 = none): the post-retarget second pass may replace
 	// exactly that entry — anything else published at the destination
 	// meanwhile keeps its protection.
 	ownGen uint64
-}
-
-// childFence builds the incarnation fence for one renamed descendant. The
-// revision a fresh opener of the renamed CHILD composed over is the child's
-// own revision — the directory's revision from the parent stat classifies
-// nothing — so the child's current revision is read from its target name at
-// fence time: post-rename it is the renamed child's landing (or a newer
-// one's, which protects at least as much). A Stat that cannot decide (5xx,
-// timeout) leaves the revision UNKNOWN (srcRev < 0): every destination entry
-// is then treated as protected — an undecided fence must not authorize
-// retiring a publication that may belong to the renamed child.
-func (w *Writeback) childFence(ctx context.Context, oldPath, target string, movedAt time.Time) renameFence {
-	fence := renameFence{movedAt: movedAt}
-	// The old name's own pending entry carries the renamed child's at-rename
-	// revision: a destination staging composed over it belongs to the
-	// renamed child even if the fence Stat below reads a newer revision some
-	// other client landed meanwhile. Without a source entry there is nothing
-	// to move and the base stays unset.
-	if m, ok := w.opts.Staging.Pending.GetMeta(oldPath); ok && m != nil {
-		fence.srcBaseRev, fence.srcBaseRevSet = m.BaseRev, true
-	}
-	st, serr := w.opts.Client.StatCtx(ctx, w.remotePath(target))
-	switch {
-	case serr == nil && st != nil:
-		fence.srcRev = st.Revision
-	case client.IsNotFound(serr):
-		// The target is absent: nothing could have opened it, so any entry
-		// at the name is not a fresh opener's.
-	default:
-		fence.srcRev = -1
-	}
-	return fence
 }
 
 // dstProtected classifies the destination's pending entry and reports whether
@@ -2559,25 +2515,47 @@ func (w *Writeback) dstProtected(path string, fence renameFence) (gen uint64, co
 		// replace exactly it.
 		return gen, conflict, live, false
 	}
-	if fence.srcRev < 0 {
-		return gen, conflict, live, true // the fence itself is undecided
+	// Retirement requires positive proof of the replaced incumbent — see
+	// renameFence. Without one of the two proofs the entry is protected.
+	if meta.BaseRev == 0 {
+		return gen, conflict, live, false // a pre-rename opener's staging
 	}
-	if fence.srcRev > 0 && meta.BaseRev == fence.srcRev {
-		return gen, conflict, live, true // composed over the renamed object's current revision
+	if fence.oldRevSet && meta.BaseRev == fence.oldRev {
+		return gen, conflict, live, false // composed over the replaced object's own revision
 	}
-	if fence.srcBaseRevSet {
-		if fence.srcBaseRev > 0 && meta.BaseRev == fence.srcBaseRev {
-			return gen, conflict, live, true // composed over the renamed object's at-rename revision
+	return gen, conflict, live, true
+}
+
+// settleOldPrefixAfterMove closes the directory rename's final window: a
+// child can stage AND COMPLETELY LAND its successor under the obsolete
+// prefix between the in-window snapshot and the handle retarget — its
+// pending entry is then gone and only the landed watermark remains, which
+// the pre-retarget snapshot never contained. The prefix's watermarks were
+// wiped before the RPC, so the set read HERE (after the handles moved;
+// nothing publishes under the old prefix anymore) contains exactly the
+// in-window child landings, completed in the RPC or in the gap alike, and
+// each entry-less child gets the same strict old-name check as the renamed
+// path itself. In-memory failure records follow the move unconditionally:
+// standalone ones (a descendant transfer that could not install its marker,
+// bytes left under the pre-move name) have no pending entry, so neither
+// prefix loop above carries them.
+func (w *Writeback) settleOldPrefixAfterMove(ctx context.Context, op *fs.Op, movedAt time.Time, windowDescendants map[string]bool) {
+	prefix := strings.TrimSuffix(op.Path, "/") + "/"
+	for p := range w.landedPathsUnderPrefix(prefix) {
+		windowDescendants[p] = true
+	}
+	for path := range windowDescendants {
+		if w.opts.Staging.Pending.HasPending(path) {
+			continue // the descendant loop moved it
 		}
-		if fence.srcBaseRev == 0 && meta.BaseRev != 0 {
-			// The source entry is create-shaped (no base revision), so the
-			// renamed lineage's revisions are unknowable and only a
-			// create-shaped destination entry is provably not a fresh
-			// opener's. Fail safe on everything else.
-			return gen, conflict, live, true
+		target := op.Path2 + strings.TrimPrefix(path, op.Path)
+		if _, terr := w.transferConflictMarker(ctx, path, target, renameFence{movedAt: movedAt}, true); terr != nil {
+			safeLogPrintf("writeback: in-window descendant %s did not stay gone: %v", path, terr)
 		}
 	}
-	return gen, conflict, live, false
+	if w.queue != nil {
+		w.queue.RenameTerminalFailuresPrefix(prefix, strings.TrimSuffix(op.Path2, "/")+"/")
+	}
 }
 
 // retargetQueuedImage is retargetQueuedImageLocked plus the writeback path
