@@ -68,9 +68,18 @@ func TestPathCommitErrRetiredByLifecycle(t *testing.T) {
 	}
 
 	// A later successful publication outside the queue retires it too.
-	cq.rememberPathCommitErr(&CommitEntry{Path: "/q.bin"}, boom)
-	cq.ClearPathCommitErr("/q.bin")
-	if got := cq.WaitPathOutcome("/q.bin", time.Second); got != nil {
+	// Exercise the REAL success path (landedAt) rather than the clearer
+	// directly: every non-PATCH publication funnels through it.
+	wb, werr := New(Options{Policy: PolicyCloseSync, Client: newTestClient("http://127.0.0.1:1"), Staging: mustStaging(t)})
+	if werr != nil {
+		t.Fatal(werr)
+	}
+	if wb.queue == nil {
+		t.Fatal("precondition: the writeback must own a commit queue")
+	}
+	wb.queue.rememberPathCommitErr(&CommitEntry{Path: "/q.bin"}, boom)
+	wb.landedAt("/q.bin", 5, 1024)
+	if got := wb.queue.WaitPathOutcome("/q.bin", time.Second); got != nil {
 		t.Fatalf("after a successful publication, outcome = %v, want nil", got)
 	}
 }

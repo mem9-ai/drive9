@@ -4672,6 +4672,14 @@ func (h *bufferingHandle) commitLocked(ctx context.Context) error {
 		// A patch reply carries no revision; caches invalidate without a
 		// read-cache seed.
 		h.w.invalidateRev(h.path, 0, size)
+		// This publication SUCCEEDED, so a failure remembered for an earlier
+		// publication of the same name must not keep surfacing: the PATCH
+		// path does not reach landedAt (it has no revision to report), and a
+		// Sync after a recovering edit would otherwise return EIO despite
+		// the bytes having landed.
+		if h.w.queue != nil {
+			h.w.queue.ClearPathCommitErr(h.path)
+		}
 		return h.applyPendingMode(ctx)
 	}
 	return h.commitInline(ctx)
