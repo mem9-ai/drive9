@@ -1297,17 +1297,12 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			if w.wbCache == nil || w.uploader == nil {
 				return nil
 			}
-			meta, ok := w.wbCache.GetMeta(p)
-			if !ok {
-				return nil
-			}
-			rev, err := w.uploader.UploadSyncWithRevision(ctx, p)
+			rev, meta, err := w.uploader.uploadSyncWithMetadata(ctx, p)
 			if err != nil {
 				return err
 			}
 			w.uploader.WaitPath(p)
-			w.wbCache.RemoveIfGeneration(p, meta.Generation)
-			if rev > 0 {
+			if meta != nil && rev > 0 {
 				landedRev, landedSize = rev, meta.Size
 				w.landedAt(p, rev, meta.Size)
 			}
@@ -1988,27 +1983,42 @@ func (h *bufferingHandle) Write(ctx context.Context, off int64, data []byte) err
 // which only snapshots locally and lets Release own the upload — no close
 // boundary is coming, so the image stages into the ledger now and the
 // facade's chain drain waits for the landing.
-func (h *bufferingHandle) DrainFlush(ctx context.Context) error {
+func (h *bufferingHandle) DrainFlush(ctx context.Context) (err error) {
 	h.mu.Lock()
 	staged, unlinked := h.stagedToCache, h.unlinked
+	dirty, isNew, uploadGen := h.dirty, h.isNew, h.wgen
 	h.stagedToCache = false
 	h.mu.Unlock()
 	if staged && !unlinked && h.w.uploader != nil && h.w.wbCache != nil {
 		if _, ok := h.w.wbCache.GetMeta(h.path); ok {
-			// v1 FlushAll over the write-cache track: the Flush snapshot
-			// owns the upload — land it synchronously, exactly once. A
-			// commitLocked here would publish a second image that races
-			// the uploader's CAS on the same base.
-			h.mu.Lock()
-			uploadGen := h.wgen
-			h.mu.Unlock()
-			if err := h.w.uploader.UploadSync(ctx, h.path); err != nil {
-				return err
+			// A failed drain keeps the staged image available to Release or retry.
+			defer func() {
+				if err != nil {
+					h.mu.Lock()
+					h.stagedToCache = !h.unlinked
+					h.mu.Unlock()
+				}
+			}()
+			if dirty {
+				snapshot, stageErr := h.stageToWriteCache(ctx, isNew)
+				if stageErr != nil {
+					return stageErr
+				}
+				if snapshot != nil {
+					uploadGen = snapshot.wgen
+				}
 			}
-			h.mu.Lock()
-			h.retireDirtyLocked(uploadGen)
-			h.landed = true
-			h.mu.Unlock()
+			rev, meta, uploadErr := h.w.uploader.uploadSyncWithMetadata(ctx, h.path)
+			if uploadErr != nil {
+				return uploadErr
+			}
+			if meta != nil {
+				h.mu.Lock()
+				h.retireDirtyLocked(uploadGen)
+				h.mu.Unlock()
+				h.markLanded(rev)
+				h.w.landedAt(h.path, rev, meta.Size)
+			}
 			return nil
 		}
 	}
@@ -2051,16 +2061,15 @@ func (h *bufferingHandle) Sync(ctx context.Context) error {
 	staged := h.stagedToCache
 	h.mu.Unlock()
 	if staged && h.w.uploader != nil {
-		meta, hasMeta := h.w.wbCache.GetMeta(h.path)
-		rev, err := h.w.uploader.UploadSyncWithRevision(ctx, h.path)
+		rev, meta, err := h.w.uploader.uploadSyncWithMetadata(ctx, h.path)
 		if err != nil {
 			return err
 		}
 		h.mu.Lock()
 		h.stagedToCache = false
 		h.mu.Unlock()
-		h.markLanded(rev)
-		if hasMeta {
+		if meta != nil {
+			h.markLanded(rev)
 			h.w.landedAt(h.path, rev, meta.Size)
 		}
 	}
@@ -2132,7 +2141,7 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 			h.mu.Lock()
 			h.stagedToCache = true
 			h.mu.Unlock()
-			rev, err := h.w.uploader.UploadSyncWithRevision(ctx, h.path)
+			rev, meta, err := h.w.uploader.uploadSyncWithMetadata(ctx, h.path)
 			if err != nil {
 				return err
 			}
@@ -2140,7 +2149,9 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 			// OnSuccess feeds the landed table — record the watermark here
 			// so append siblings see the advance without a remote stat
 			// (v1 recordCommittedRevisionWithSize at this boundary).
-			h.w.landedAt(h.path, rev, snapshot.size)
+			if meta != nil {
+				h.w.landedAt(h.path, rev, meta.Size)
+			}
 			h.mu.Lock()
 			h.stagedToCache = false
 			// The image is on the remote now — for every create shape, not
@@ -2155,7 +2166,9 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 			h.mu.Unlock()
 			// The landed revision also retires isNew: a later write on
 			// this handle must stage as an overwrite of that revision.
-			h.markLanded(rev)
+			if meta != nil {
+				h.markLanded(rev)
+			}
 			return nil
 		}
 		if emptyCreate {
@@ -2479,10 +2492,6 @@ func (h *bufferingHandle) markLanded(rev int64) {
 	h.mu.Lock()
 	h.landed = true
 	h.isNew = false
-	// #984 supersession: the landed image IS the newest truth now, so the
-	// uncommitted-truncate claim ends (v1 ClearDirty dropping
-	// visibleTruncate). A later write re-dirties and re-stamps on its own.
-	h.visTrunc = false
 	if rev > 0 {
 		h.baseRev = rev
 	}
@@ -4476,7 +4485,6 @@ func (h *bufferingHandle) finishStreaming(ctx context.Context) error {
 }
 
 type writeCacheSnapshot struct {
-	size int64
 	wgen uint64
 }
 
@@ -4529,7 +4537,7 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, isNew bool) (*w
 		return nil, err
 	}
 	image := h.buf.Bytes()
-	snapshot := &writeCacheSnapshot{size: int64(len(image)), wgen: h.wgen}
+	snapshot := &writeCacheSnapshot{wgen: h.wgen}
 	baseRev := h.baseRev
 	mode, hasMode := h.pendingMode, h.hasPendingMode
 	h.mu.Unlock()

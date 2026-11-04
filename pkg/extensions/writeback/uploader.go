@@ -314,6 +314,12 @@ func (u *WriteBackUploader) UploadSync(ctx context.Context, localPath string) er
 // UploadSyncWithRevision uploads one path synchronously and reports
 // the committed revision.
 func (u *WriteBackUploader) UploadSyncWithRevision(ctx context.Context, localPath string) (int64, error) {
+	rev, _, err := u.uploadSyncWithMetadata(ctx, localPath)
+	return rev, err
+}
+
+// Metadata identifies the completed cache operation; nil means no entry was consumed.
+func (u *WriteBackUploader) uploadSyncWithMetadata(ctx context.Context, localPath string) (int64, *staging.WriteBackMeta, error) {
 	// Own the gate through cache cleanup, just like uploadOne. A wait alone
 	// leaves a gap in which a background or second synchronous upload can
 	// publish the same generation and trigger a false revision conflict.
@@ -325,17 +331,20 @@ func (u *WriteBackUploader) UploadSyncWithRevision(ctx context.Context, localPat
 	// data — GetMetaAndView would prune the entry when the .dat is missing.
 	chmodMeta, chmodOK := u.cache.GetMeta(localPath)
 	if !chmodOK {
-		return 0, nil // not in cache (may have been uploaded by the background worker we just waited for)
+		return 0, nil, nil // not in cache (may have been uploaded by the background worker we just waited for)
 	}
 	if chmodMeta.Kind == staging.PendingChmod {
-		return 0, u.applyPendingChmod(ctx, localPath, chmodMeta, chmodMeta.Generation, true)
+		if err := u.applyPendingChmod(ctx, localPath, chmodMeta, chmodMeta.Generation, true); err != nil {
+			return 0, nil, err
+		}
+		return 0, chmodMeta, nil
 	}
 
 	// Atomically read meta + data under one path lock so they are guaranteed
 	// to be from the same generation.
 	meta, data, ok := u.cache.GetMetaAndView(localPath)
 	if !ok {
-		return 0, nil // not in cache (removed between GetMeta and GetMetaAndView)
+		return 0, nil, nil // not in cache (removed between GetMeta and GetMetaAndView)
 	}
 	gen := meta.Generation
 
@@ -348,7 +357,7 @@ func (u *WriteBackUploader) UploadSyncWithRevision(ctx context.Context, localPat
 			safeLogPrintf("writeback uploadsync: legacy overwrite without base revision for %s, falling back to unconditional write", localPath)
 			expectedRevision = -1
 		} else {
-			return 0, fmt.Errorf("resolve expected revision for %s: %w", localPath, err)
+			return 0, nil, fmt.Errorf("resolve expected revision for %s: %w", localPath, err)
 		}
 	}
 
@@ -368,7 +377,7 @@ func (u *WriteBackUploader) UploadSyncWithRevision(ctx context.Context, localPat
 		if u.perf != nil {
 			u.perf.uploaderFailure.add(1)
 		}
-		return 0, err
+		return 0, nil, err
 	}
 	committedRev = committedRevisionForExpectedRevision(expectedRevision, committedRev)
 	chmodCtx, chmodCancel := context.WithTimeout(ctx, 30*time.Second)
@@ -379,9 +388,9 @@ func (u *WriteBackUploader) UploadSyncWithRevision(ctx context.Context, localPat
 			u.perf.uploaderFailure.add(1)
 		}
 		if _, markErr := u.cache.MarkChmodPending(localPath, gen); markErr != nil {
-			return 0, fmt.Errorf("%w; mark chmod pending: %v", err, markErr)
+			return 0, nil, fmt.Errorf("%w; mark chmod pending: %v", err, markErr)
 		}
-		return 0, err
+		return 0, nil, err
 	}
 
 	// Atomically remove only if generation matches — a concurrent Put may
@@ -390,7 +399,7 @@ func (u *WriteBackUploader) UploadSyncWithRevision(ctx context.Context, localPat
 	if u.perf != nil {
 		u.perf.uploaderSuccess.add(1)
 	}
-	return committedRev, nil
+	return committedRev, meta, nil
 }
 
 func expectedRevisionForWriteBack(meta *staging.WriteBackMeta) (int64, error) {
