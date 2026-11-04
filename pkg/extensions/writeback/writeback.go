@@ -299,6 +299,20 @@ type bufferingHandle struct {
 	// .dat/.meta track; Release owes the uploader a Submit for it (v1: the
 	// write-back cache fast path — Flush persists locally, the upload is
 	// enqueued once, at the close boundary).
+	// selfLandSize/selfLandCRC remember THIS handle's last streamed inline
+	// commit when the stream protocol reported no revision: the next write
+	// on the same descriptor needs a continuation base, and only a verified
+	// read-back (the row equals those exact bytes) can attribute a revision
+	// to it. Zero size = none pending.
+	selfLandSize int64
+	selfLandCRC  uint32
+	// lastStageSize/stageSeq track the handle's own queue staging history:
+	// a landed record whose size equals the last staged image's is this
+	// handle's own landing, and the next staging may continue from its
+	// revision (same-origin table + size match; divergence stays a CAS
+	// conflict).
+	lastStageSize int64
+	stagedHist    uint64
 	stagedToCache bool
 	// unlinked marks the handle anonymous (fh.Unlinked): the buffer
 	// keeps serving the fd, commits are discarded.
@@ -473,6 +487,9 @@ func New(opts Options) (*Writeback, error) {
 				return 0, false
 			}
 			return rev, true
+		}
+		up.LedgerOwned = func(path string) bool {
+			return w.opts.Staging != nil && w.opts.Staging.Pending.HasPending(path)
 		}
 		up.RecordLanding = func(path string, data []byte, committedRev int64, meta *staging.WriteBackMeta) {
 			// The identity is recorded at the uploader's success point, for
@@ -1440,6 +1457,12 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			}
 			rev, meta, err := w.uploader.uploadSyncWithMetadata(ctx, p)
 			if err != nil {
+				if w.uploader.IsLedgerOwnedError(err) {
+					// The ledger owns this image; the queue lands it. Wait
+					// for THAT instead of publishing the superseded pair.
+					w.waitPathCommit(p)
+					return nil
+				}
 				return err
 			}
 			w.uploader.WaitPath(p)
@@ -1742,7 +1765,16 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			if w.wbCache != nil && w.uploader != nil {
 				if _, ok := w.wbCache.GetMeta(op.Path); ok {
 					if err := w.uploader.UploadSync(ctx, op.Path); err != nil {
-						return fs.Result{}, mapErr(err)
+						if w.uploader.IsLedgerOwnedError(err) {
+							// The ledger owns this image; its queue entry
+							// lands it. Truncating below would race the
+							// landing — wait it out first.
+							if !w.waitPathCommit(op.Path) {
+								return fs.Result{}, fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
+							}
+						} else {
+							return fs.Result{}, mapErr(err)
+						}
 					}
 				}
 			}
@@ -3937,7 +3969,46 @@ func (h *bufferingHandle) commitInline(ctx context.Context) error {
 	}
 	h.mu.Unlock()
 
+	// Streamed commits report no revision (the protocol carries none and a
+	// bare re-read cannot be attributed): digest the exact bytes via a
+	// LOCAL replay of the buffer — the multipart contract requires an
+	// io.ReaderAt, so the upload reader itself cannot be teed — so a LATER
+	// conflict on this descriptor can prove the remote row still equals
+	// this handle's previous image, the only sound way to attribute a
+	// continuation base.
+	// The digest covers BOTH rev-less shapes: the bufferReader stream and
+	// the materialized image that still streams because it exceeds the
+	// direct-PUT threshold (image bytes hash directly).
+	var streamCRC uint32
+	if image != nil {
+		streamCRC = crc32.ChecksumIEEE(image)
+	} else {
+		d := crc32.NewIEEE()
+		if _, cerr := io.Copy(d, newReader()); cerr == nil {
+			streamCRC = d.Sum32()
+		}
+	}
 	committedRev, err := h.w.commitReaderOpt(ctx, h.path, newReader, size, isNew && size == 0, baseRev)
+	if isStatusEAGAIN(err) {
+		// The conflict path could not attribute the row. If this handle
+		// streamed a previous image the server still holds byte-exactly,
+		// that proof attributes the row to US: adopt it as the continuation
+		// base and retry this commit against it once.
+		if h.mu.TryLock() {
+			selfSize, selfCRC := h.selfLandSize, h.selfLandCRC
+			h.mu.Unlock()
+			if selfSize > 0 && selfSize <= selfLandVerifyBudget {
+				if adopted, aerr := h.w.verifySelfLanding(ctx, h.path, selfSize, selfCRC); aerr == nil && adopted.rev > baseRev {
+					h.mu.Lock()
+					h.baseRev = adopted.rev
+					h.selfLandSize, h.selfLandCRC = 0, 0
+					h.mu.Unlock()
+					baseRev = adopted.rev
+					committedRev, err = h.w.commitReaderOpt(ctx, h.path, newReader, size, false, baseRev)
+				}
+			}
+		}
+	}
 	if err == nil {
 		if cacheGen != 0 {
 			h.w.wbCache.RemoveIfGeneration(h.path, cacheGen)
@@ -3958,6 +4029,12 @@ func (h *bufferingHandle) commitInline(ctx context.Context) error {
 		h.isNew = false
 		if committedRev > 0 {
 			h.baseRev = committedRev
+			h.selfLandSize, h.selfLandCRC = 0, 0
+		} else {
+			// Rev-less streamed success: remember the exact bytes for the
+			// next write's continuation proof.
+			h.selfLandSize = size
+			h.selfLandCRC = streamCRC
 		}
 		h.mu.Unlock()
 		if h.w.opts.Policy == PolicyWriteSync || h.w.opts.Policy == PolicyCloseSync {
@@ -3967,6 +4044,47 @@ func (h *bufferingHandle) commitInline(ctx context.Context) error {
 		err = h.applyPendingMode(ctx)
 	}
 	return err
+}
+
+// selfLandVerifyBudget bounds the verified read-back that attributes a
+// rev-less streamed commit: beyond it the next write stays EAGAIN
+// (conservative) rather than paying an unbounded GET per conflict.
+const selfLandVerifyBudget = 32 << 20
+
+type selfLandingProof struct{ rev int64 }
+
+// verifySelfLanding proves the CURRENT remote row is byte-exactly this
+// handle's previously streamed image (size + CRC32 of the full read-back)
+// and returns its revision. A mismatch proves a foreign write — no
+// adoption, the conflict stands.
+func (w *Writeback) verifySelfLanding(ctx context.Context, path string, size int64, wantCRC uint32) (selfLandingProof, error) {
+	st, serr := w.opts.Client.StatCtx(ctx, w.remotePath(path))
+	if serr != nil || st == nil {
+		return selfLandingProof{}, serr
+	}
+	if st.Size != size {
+		// The row is not even the same size as our streamed image: a
+		// foreign write (or our own truncation) owns it now.
+		return selfLandingProof{}, nil
+	}
+	data, rerr := w.opts.Client.ReadAtCtx(ctx, w.remotePath(path), 0, size)
+	if rerr != nil || int64(len(data)) != size {
+		return selfLandingProof{}, rerr
+	}
+	if crc32.ChecksumIEEE(data) != wantCRC {
+		return selfLandingProof{}, nil
+	}
+	// Content-equal to the bytes WE streamed: the row's payload is ours
+	// regardless of which revision number it sits at — attribution by
+	// content, exactly the byte-exact standard the repair enforces.
+	w.landedAt(path, st.Revision, size, wantCRC, data)
+	return selfLandingProof{rev: st.Revision}, nil
+}
+
+// isStatusEAGAIN reports an fs.StatusError carrying EAGAIN.
+func isStatusEAGAIN(err error) bool {
+	var se *fs.StatusError
+	return errors.As(err, &se) && se.Status == gofuse.Status(syscall.EAGAIN)
 }
 
 // detachCommitContext ports v1 syncDataCommitContext: under interrupt-safe
@@ -4206,16 +4324,43 @@ func (h *bufferingHandle) ensureBufferLocked(ctx context.Context) error {
 		// existing handles preload here too — their remote row may not
 		// exist yet (recovery window) or lags the ledger image, and the
 		// cache pair beneath the ledger entry is not theirs to read.
-		// Size-gated — a spilled multi-GiB image stays a view over the
-		// shadow.
-		if meta, ok := h.w.opts.Staging.Pending.GetMeta(h.path); ok && meta != nil &&
-			meta.Size > 0 && meta.Size <= pendingServeMaterializeBytes {
-			if data, err := h.w.opts.Staging.Shadow.ReadAll(h.path); err == nil && int64(len(data)) == meta.Size {
-				if _, werr := h.buf.Write(0, data); werr == nil {
-					h.buf.ClearDirty()
-					h.baseLoaded = true
-					return nil
+		if meta, ok := h.w.opts.Staging.Pending.GetMeta(h.path); ok && meta != nil && meta.Size > 0 {
+			if meta.Size <= pendingServeMaterializeBytes {
+				if data, err := h.w.opts.Staging.Shadow.ReadAll(h.path); err == nil && int64(len(data)) == meta.Size {
+					if _, werr := h.buf.Write(0, data); werr == nil {
+						h.buf.ClearDirty()
+						h.baseLoaded = true
+						return nil
+					}
 				}
+			} else {
+				// A spilled ledger image stays a lazy view — over the
+				// SHADOW, never the remote: the remote row is either the
+				// pre-ledger image or absent, and composing a partial
+				// write with it would expose superseded bytes under the
+				// ledger's acknowledged image. Parts load fenced against
+				// the shadow's active generation.
+				lazySize := meta.Size
+				h.buf.SeedRemote(lazySize)
+				partSize := h.buf.PartSize()
+				h.buf.LoadPart = func(partNum int) ([]byte, error) {
+					start := int64(partNum-1) * partSize
+					end := start + partSize
+					if end > lazySize {
+						end = lazySize
+					}
+					if end <= start {
+						return nil, nil
+					}
+					part := make([]byte, end-start)
+					n, ok, err := readShadowRangeFenced(h.w.opts.Staging.Shadow, h.path, lazySize, start, part)
+					if err != nil || !ok || int64(n) != end-start {
+						return nil, fmt.Errorf("ledger shadow part %d of %s unavailable", partNum, h.path)
+					}
+					return part, nil
+				}
+				h.baseLoaded = true
+				return nil
 			}
 		}
 	}
@@ -4467,6 +4612,8 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 		return err
 	}
 	h.mu.Lock()
+	h.lastStageSize = size
+	h.stagedHist++
 	h.retireDirtyLocked(stageGen)
 	if h.wgen == stageGen {
 		h.stagedToCache = false

@@ -92,6 +92,14 @@ type WriteBackUploader struct {
 	// handoff flush of one handle) heals without a remote stat, while a
 	// foreign advance or a divergent image stays conflicted.
 	ResolveConflict func(localPath string, meta *staging.WriteBackMeta, data []byte, conflictedBase int64) (int64, bool)
+	// LedgerOwned optionally reports that the staging ledger owns a path's
+	// current image (pending index entry). The synchronous cache landing
+	// REFUSES such paths: the .dat/.meta pair beneath the ledger entry may
+	// be a superseded image, and publishing it — including the
+	// expect-absent create a PendingNew pair would issue against an absent
+	// row — hands the backend bytes the queue's own recovery is about to
+	// contradict. Callers fall back to the queue track.
+	LedgerOwned func(localPath string) bool
 	// RecordLanding observes every successful upload with EXACTLY the
 	// bytes that were published (both the background worker and the sync
 	// path), read under the same generation gate as the upload's meta
@@ -350,24 +358,46 @@ func (u *WriteBackUploader) RecoverPendingFilter(skip func(localPath string) boo
 	}
 }
 
+// errLedgerOwned reports a synchronous landing refused because the staging
+// ledger owns the path's image (see WriteBackUploader.LedgerOwned).
+var errLedgerOwned = errors.New("writeback: path owned by the staging ledger")
+
+// IsLedgerOwnedError reports whether err is the ledger-ownership refusal.
+func IsLedgerOwnedError(err error) bool { return errors.Is(err, errLedgerOwned) }
+
+// IsLedgerOwnedError on the uploader forwards to the package-level check.
+func (u *WriteBackUploader) IsLedgerOwnedError(err error) bool { return IsLedgerOwnedError(err) }
+
 // UploadSync synchronously uploads a single path from the cache to the server.
 // Serializes with other uploads of the same path, then uploads with
 // generation protection. Used by Fsync/Rename which require the data to be
-// persisted remotely before returning.
+// persisted remotely before returning. Ledger-owned paths are refused.
 func (u *WriteBackUploader) UploadSync(ctx context.Context, localPath string) error {
 	_, err := u.UploadSyncWithRevision(ctx, localPath)
 	return err
 }
 
+// ledgerOwnedRefused reports whether this path's sync landing must be
+// refused (the ledger owns its image).
+func (u *WriteBackUploader) ledgerOwnedRefused(localPath string) bool {
+	return u.LedgerOwned != nil && u.LedgerOwned(localPath)
+}
+
 // UploadSyncWithRevision uploads one path synchronously and reports
 // the committed revision.
 func (u *WriteBackUploader) UploadSyncWithRevision(ctx context.Context, localPath string) (int64, error) {
+	if u.ledgerOwnedRefused(localPath) {
+		return 0, errLedgerOwned
+	}
 	rev, _, err := u.uploadSyncWithMetadata(ctx, localPath)
 	return rev, err
 }
 
 // Metadata identifies the completed cache operation; nil means no entry was consumed.
 func (u *WriteBackUploader) uploadSyncWithMetadata(ctx context.Context, localPath string) (int64, *staging.WriteBackMeta, error) {
+	if u.ledgerOwnedRefused(localPath) {
+		return 0, nil, errLedgerOwned
+	}
 	// Own the gate through cache cleanup, just like uploadOne. A wait alone
 	// leaves a gap in which a background or second synchronous upload can
 	// publish the same generation and trigger a false revision conflict.
@@ -620,6 +650,7 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 	var (
 		lastErr      error
 		committedRev int64
+		repaired     bool
 	)
 	for attempt := 0; attempt <= uploadMaxRetries; attempt++ {
 		if attempt > 0 {
@@ -646,16 +677,23 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 			// entry's image after it staged (a duplicate-commit race — the
 			// kernel's asynchronous RELEASE racing a handoff flush of the
 			// same handle), rebase onto the winner's base and retry
-			// instead of staying conflicted forever.
-			if rev, ok := u.resolveConflict(localPath, meta, data, expectedRevision); ok {
-				expectedRevision = rev
-				if attempt == uploadMaxRetries {
-					// The repair earned its own attempt: refund this slot
-					// so the rebased PUT runs even when the conflict hit
-					// the last ordinary attempt.
-					attempt--
+			// instead of staying conflicted forever. Exactly ONE repair
+			// per upload: successive conflicts can keep finding eligible
+			// newer duplicates while this worker holds the path gate, and
+			// re-repairing on the extra attempt would extend the gate
+			// beyond the single promised retry (the sync path repairs once).
+			if !repaired {
+				if rev, ok := u.resolveConflict(localPath, meta, data, expectedRevision); ok {
+					expectedRevision = rev
+					repaired = true
+					if attempt == uploadMaxRetries {
+						// The repair earned its own attempt: refund this
+						// slot so the rebased PUT runs even when the
+						// conflict hit the last ordinary attempt.
+						attempt--
+					}
+					continue
 				}
-				continue
 			}
 			break
 		}

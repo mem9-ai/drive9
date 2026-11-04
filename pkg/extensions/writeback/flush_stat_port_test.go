@@ -737,3 +737,63 @@ func TestPortLandedBytesAccountingOnReplacement(t *testing.T) {
 	// whatever the outcome, the two numbers must agree (checked above) and
 	// no image may be double-counted.
 }
+
+// TestPortStreamedCommitContinuesOnSameHandle pins the self-landing
+// continuation: a streamed (rev-less) inline commit must not strand the
+// descriptor's CAS base — the next write on the SAME handle publishes
+// against the row the first commit produced, proven by a verified
+// read-back instead of an unattributable re-read.
+func TestPortStreamedCommitContinuesOnSameHandle(t *testing.T) {
+	b := testbackend.NewBackend()
+	// Existing row at revision 1 with a base large enough that growing
+	// past it exceeds the direct-PUT threshold and takes the stream path.
+	base := bytes.Repeat([]byte("s"), 1<<20)
+	b.Seed("/f", base)
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	cl.SetSmallFileThresholdForTests(1 << 20)
+	wb, err := New(Options{Policy: PolicyCloseSync, Client: cl, WriteCacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := fs.NewChain(wb, terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/f", Flags: uint32(syscall.O_RDWR | syscall.O_SYNC)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := res.Handle.(*bufferingHandle)
+	// Grow past the threshold: the commit streams (rev-less) and lands.
+	grown := append(append([]byte(nil), base...), []byte("-tail")...)
+	if err := h.Write(ctx, 0, grown); err != nil {
+		t.Fatalf("first (streamed) write: %v", err)
+	}
+	if n, _ := b.Node("/f"); string(n.Data) != string(grown) {
+		t.Fatalf("streamed commit did not land: %d bytes", len(n.Data))
+	}
+
+	// The SECOND write on the same descriptor must not strand on a stale
+	// base: force its conditional upload to 409 once (the in-memory
+	// fixture's multipart track does not enforce CAS; the production
+	// conflict arrives the same way — a row that moved past the stale
+	// base), then the verified self-landing attributes the row and the
+	// commit continues.
+	b.ForceConflict("/f", 1)
+	second := append([]byte("X"), grown[1:]...)
+	if err := h.Write(ctx, 0, second); err != nil {
+		t.Fatalf("second write on the streamed handle: %v", err)
+	}
+	if n, _ := b.Node("/f"); string(n.Data) != string(second) {
+		t.Fatalf("second commit did not land: got %d bytes, want %d", len(n.Data), len(second))
+	}
+	_ = h.Release(ctx)
+}
