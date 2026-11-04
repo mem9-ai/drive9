@@ -30,6 +30,24 @@ import (
 // path.
 var maxPlanBlocksPerChunk = 1 << 15
 
+// stagedPublishRetries bounds the write/verify/merge loop that publishes a
+// staged record: enough for repeated rename interleavings, never unbounded.
+const stagedPublishRetries = 8
+
+// sameStagedRecord reports whether two manifests describe the same record
+// (the fields a publish sets; block payload names are stable).
+func sameStagedRecord(a, b stagedManifest) bool {
+	if a.Path != b.Path || len(a.NextPaths) != len(b.NextPaths) {
+		return false
+	}
+	for i := range a.NextPaths {
+		if a.NextPaths[i] != b.NextPaths[i] {
+			return false
+		}
+	}
+	return a.Ino == b.Ino && a.Size == b.Size
+}
+
 // maxStagedPlanPages caps the pages walked by the echo-less content proof
 // (one page per 64 MiB chunk). Exhausting it refuses the adoption: an image
 // too large to be compared end-to-end cannot be attributed by content.
@@ -1785,30 +1803,12 @@ func (b *Bridge) StagePendingLocal(ino meta.Ino) error {
 	// scan can no longer reach this record, or the scan sees a record that
 	// already carries the intent — one of the two orderings always wins.
 	m.addNextPath(b.pendingRenameFor(path))
-	raw, err := json.Marshal(m)
-	if err != nil {
-		return err
-	}
-	if err := writeFileSynced(filepath.Join(dir, "manifest.json"), raw); err != nil {
-		return err
-	}
-	// Re-check AFTER the manifest landed. A registration installed between
-	// the snapshot above and this write cannot have been seen by its own
-	// scan (the scan cannot observe a manifest written after it), so this is
-	// the only place that ordering is caught. Later registrations are the
-	// scan's responsibility — it runs after installing the registration and
-	// therefore sees this manifest.
-	adopted := false
-	if to := b.pendingRenameFor(path); to != "" {
-		adopted = m.addNextPath(to)
-	}
 	// The inode's CURRENT mapping wins over the snapshot: RemapLocal runs
 	// when a rename commits, so a different name here means the object has
 	// already moved and this barrier must say so even if the registration
 	// was retired before this run resumed.
 	if cur, ok := b.currentPath(ino); ok && cur != path {
 		m.Path = cur
-		adopted = true
 	}
 	// MERGE WITH DISK before replacing: a rename writer may have settled a
 	// NEWER record between this run's snapshot and this write (recording a
@@ -1817,27 +1817,80 @@ func (b *Bridge) StagePendingLocal(ino meta.Ino) error {
 	// in no candidate. Candidates are a union — strictly more knowledge is
 	// never wrong — and the on-disk Path wins when it differs and the
 	// current mapping has not advanced past it.
+	// FIRST write: this run's record must exist on disk before anything can
+	// interact with it (a rename's intent scan has to see this generation).
+	if first, merr := json.Marshal(m); merr == nil {
+		if werr := writeFileSynced(filepath.Join(dir, "manifest.json"), first); werr != nil {
+			return werr
+		}
+	} else {
+		return merr
+	}
 	if pause := b.stagingPausePublish; pause != nil {
 		pause()
 	}
+	// Merge whatever is already durable (a rename may have settled it before
+	// this run resumed). The on-disk Path wins: it is the name a CONFIRMED
+	// rename produced, while this run's snapshot may predate that rename.
 	if prev, ok := readStagedManifest(filepath.Join(dir, "manifest.json")); ok {
 		for _, cand := range prev.candidatePaths() {
-			if m.addNextPath(cand) {
-				adopted = true
-			}
+			m.addNextPath(cand)
 		}
-		if prev.Path != m.Path && prev.Path != path {
+		if prev.Path != m.Path {
 			m.Path = prev.Path
-			adopted = true
 		}
 	}
-	if adopted {
-		again, merr := json.Marshal(m)
+	// Write, then VERIFY that no concurrent writer slipped in between the
+	// read above and this write. A rename that settled a newer record in that
+	// window would have been overwritten; re-reading catches it and the loop
+	// merges again. (A lock would be simpler but the rename writers run under
+	// b.mu in RemapLocal, so a shared manifest mutex would invert the order
+	// and deadlock — verified the hard way.)
+	manifestPath := filepath.Join(dir, "manifest.json")
+	for attempt := 0; attempt < stagedPublishRetries; attempt++ {
+		raw, merr := json.Marshal(m)
 		if merr != nil {
 			return merr
 		}
-		if werr := writeFileSynced(filepath.Join(dir, "manifest.json"), again); werr != nil {
-			return werr
+		// Snapshot what is on disk BEFORE writing: after the write we cannot
+		// tell our own bytes from a racer's.
+		before, hadBefore := readStagedManifest(manifestPath)
+		if err := writeFileSynced(manifestPath, raw); err != nil {
+			return err
+		}
+		after, ok := readStagedManifest(manifestPath)
+		if !ok {
+			break // unreadable now: our write is what landed as far as we know
+		}
+		// Our write is intact when the file decodes to exactly the record we
+		// emitted. Anything else means a racer replaced it after us, and that
+		// racer's knowledge must be merged in rather than lost.
+		if sameStagedRecord(after, m) {
+			// A racer may still have written BEFORE us and been clobbered by
+			// our write; merge anything the pre-write snapshot knew that we
+			// do not, and loop only if that changes our record.
+			if hadBefore {
+				merged := false
+				for _, cand := range before.candidatePaths() {
+					if m.addNextPath(cand) {
+						merged = true
+					}
+				}
+				if before.Path != m.Path {
+					m.Path = before.Path
+					merged = true
+				}
+				if merged {
+					continue
+				}
+			}
+			break
+		}
+		for _, cand := range after.candidatePaths() {
+			m.addNextPath(cand)
+		}
+		if after.Path != m.Path {
+			m.Path = after.Path
 		}
 	}
 	clean = false
@@ -3239,17 +3292,35 @@ func (b *Bridge) MaterializeEmpty(ctx context.Context, ino meta.Ino) error {
 	if !has || !mapped || pending > 0 || size != 0 {
 		return nil
 	}
+	// Already named remotely: the create is done, but the BINDING may not be.
+	// A previous attempt can have created the name and then failed its
+	// binding Stat, so retrying must establish the ownership basis rather
+	// than short-circuit on the name's existence — otherwise the next write
+	// is refused by needsFreshIdentity and strict durability is unreachable
+	// for this descriptor.
 	if b.nameMaterialized(ctx, path) {
-		return nil // already remote-durable
+		return b.bindMaterialized(ctx, ino, path)
 	}
 	if _, err := b.cfg.Client.CreateFileCtx(ctx, path); err != nil {
 		return fmt.Errorf("materialize empty file %s: %w", path, err)
 	}
-	// Bind the created object: the identity and revision become the expected
-	// resource/revision of every later publication of this descriptor. This
-	// is MANDATORY — a strict fsync must not report success while the
-	// descriptor has no ownership basis, because its next write would then
-	// be refused by the very guard that requires one.
+	if err := b.bindMaterialized(ctx, ino, path); err != nil {
+		return err
+	}
+	// The remote name now carries the file, so any staged empty barrier is
+	// redundant.
+	b.clearStagedLocal(ino)
+	return nil
+}
+
+// bindMaterialized records the identity and revision of an existing remote
+// name as this descriptor's publication base. MANDATORY for strict
+// durability: without it the descriptor has no ownership basis, and its next
+// write is refused by needsFreshIdentity.
+func (b *Bridge) bindMaterialized(ctx context.Context, ino meta.Ino, path string) error {
+	if b.publicationIdentity(ino) != "" {
+		return nil // already bound
+	}
 	st, err := b.cfg.Client.StatCtx(ctx, path)
 	if err != nil {
 		return fmt.Errorf("materialize empty file %s: bind created object: %w", path, err)
@@ -3261,9 +3332,6 @@ func (b *Bridge) MaterializeEmpty(ctx context.Context, ino meta.Ino) error {
 	b.mu.Lock()
 	b.classicOwned[ino] = true
 	b.mu.Unlock()
-	// The remote name now carries the file, so any staged empty barrier is
-	// redundant.
-	b.clearStagedLocal(ino)
 	return nil
 }
 

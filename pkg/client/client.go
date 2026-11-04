@@ -941,6 +941,15 @@ func (c *Client) writeCtxConditionalFull(ctx context.Context, path string, data 
 		// If response doesn't contain revision (old server), return 0.
 		return 0, nil
 	}
+	// Publish the revision to a bound sink: the direct-PUT path is a
+	// publication like the V2 completion, and callers that must attribute a
+	// revision to exactly this write (the extent meta layer's CAS base)
+	// cannot rely on a follow-up Stat, which may observe a later writer.
+	if result.Revision > 0 {
+		if out := completedRevisionSinkOf(ctx); out != nil {
+			*out = result.Revision
+		}
+	}
 	return result.Revision, nil
 }
 

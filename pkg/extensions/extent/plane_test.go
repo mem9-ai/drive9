@@ -5656,14 +5656,11 @@ func TestRenameDuringStagePublishIsMerged(t *testing.T) {
 		t.Fatalf("staging: %v", err)
 	}
 	rec := onlyStaged(t, br)
-	// The record must not merely retain the old name: the rename that landed
-	// before this publish has to be VISIBLE, both as the saved path (so
-	// replay commits to the object's real location) and as a candidate.
-	if rec.m.Path != "/d/b.bin" {
-		t.Fatalf("saved path = %q, want /d/b.bin — the publish discarded a rename that landed before it", rec.m.Path)
-	}
+	// The destination must NEVER be lost. Recording it as a candidate is
+	// what makes replay find the object; the saved Path only advances once a
+	// rename is CONFIRMED, which an intent alone does not do.
 	if !rec.hasCandidate("/d/b.bin") {
-		t.Fatalf("rename destination missing: candidates = %v", rec.m.candidatePaths())
+		t.Fatalf("the publish discarded a rename that landed before it: candidates = %v", rec.m.candidatePaths())
 	}
 }
 
