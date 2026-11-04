@@ -1789,6 +1789,49 @@ func writeFileSynced(path string, data []byte) error {
 	return f.Close()
 }
 
+// retargetStagedGensLocked rewrites the saved pathname of every staged
+// generation of ino to newFull. StagePendingLocal persists a manifest
+// naming the file at staging time; a rename afterwards updates only the
+// in-memory mapping, so without this a crash before the next landing
+// leaves the record pointing at a name that no longer holds the object —
+// replay would then (correctly) refuse to adopt any occupant and the
+// acknowledged bytes would be stranded forever. The rewrite is durable
+// (temp file + fsync + rename) before the rename syscall is acknowledged.
+func (b *Bridge) retargetStagedGensLocked(ino meta.Ino, newFull string) {
+	if b.cfg.StagingDir == "" {
+		return
+	}
+	entries, err := os.ReadDir(b.cfg.StagingDir)
+	if err != nil {
+		return
+	}
+	prefix := fmt.Sprintf("%d-", uint64(ino))
+	for _, e := range entries {
+		if !e.IsDir() || !strings.HasPrefix(e.Name(), prefix) {
+			continue
+		}
+		manifest := filepath.Join(b.cfg.StagingDir, e.Name(), "manifest.json")
+		raw, rerr := os.ReadFile(manifest)
+		if rerr != nil {
+			continue
+		}
+		var m stagedManifest
+		if json.Unmarshal(raw, &m) != nil || m.Path == newFull {
+			continue
+		}
+		m.Path = newFull
+		updated, merr := json.Marshal(m)
+		if merr != nil {
+			continue
+		}
+		tmp := manifest + ".tmp"
+		if werr := writeFileSynced(tmp, updated); werr != nil {
+			continue
+		}
+		_ = os.Rename(tmp, manifest)
+	}
+}
+
 // removeStagedGensLocked removes the file's staged generations strictly
 // older than keepGen (the caller holds the file's commit lock, so no new
 // generation can appear concurrently).
@@ -2306,6 +2349,7 @@ func (b *Bridge) RemapLocal(oldPath, newPath string) {
 		b.moved[rep] = newFull
 		b.replacements[newFull] = rep
 		delete(b.replacements, oldFull)
+		b.retargetStagedGensLocked(rep, newFull)
 	} else if ino := inoFor(oldFull); b.paths[ino] == oldFull {
 		b.paths[ino] = newFull
 		// Record the move so a recreated OLD pathname gets a synthetic key
@@ -2315,6 +2359,10 @@ func (b *Bridge) RemapLocal(oldPath, newPath string) {
 		// per object: a second key would split cache invalidation).
 		b.moved[ino] = newFull
 		b.replacements[newFull] = ino
+		// The durable barrier record must follow the inode: a crash before
+		// the next landing otherwise leaves the manifest naming a path that
+		// no longer holds the object, stranding acknowledged bytes.
+		b.retargetStagedGensLocked(ino, newFull)
 		// The destination's hash key may still be HELD by a live descriptor
 		// that merely vacated this name, or is retained under a sentinel
 		// alias while the name is replaced (its descriptor keeps using that

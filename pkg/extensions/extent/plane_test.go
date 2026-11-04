@@ -4563,3 +4563,82 @@ func TestEcholessReplacementBeforeClassificationRefuses(t *testing.T) {
 		t.Fatalf("replacement = %q, want OTHER! untouched", got)
 	}
 }
+
+// Round-48: a durable interactive barrier must follow its inode across a
+// rename. The manifest persists the pathname at staging time; a rename
+// updates only memory, so without retargeting, replay after a crash would
+// find the saved name pointing at nothing (or at a replacement) and the
+// acknowledged bytes would be stranded. The retarget rewrites the record
+// durably at the rename boundary.
+func TestStagedBarrierFollowsRename(t *testing.T) {
+	f := newFakeV2(t)
+	f.setDir("/d", true)
+	f.seedExtent(t, "/d/a.bin", "BASE-PAYLOAD")
+	cacheDir := engineCacheDir(t)
+	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: cacheDir})
+	br := eng.Bridge
+	ino := meta.Ino(1)
+	br.RememberPathForTest(ino, "/d/a.bin")
+	sum := sha256Hex([]byte("NEW!"))
+	br.StageBlockForTest(sum, []byte("NEW!"))
+	br.AddPendingForTest(ino, 0, 0, sum, 4, 4)
+	if err := br.StagePendingLocal(ino); err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := func() string {
+		entries, err := os.ReadDir(br.cfg.StagingDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range entries {
+			if e.IsDir() {
+				return filepath.Join(br.cfg.StagingDir, e.Name(), "manifest.json")
+			}
+		}
+		t.Fatal("no staged manifest")
+		return ""
+	}
+	readPath := func() string {
+		raw, err := os.ReadFile(manifestPath())
+		if err != nil {
+			t.Fatal(err)
+		}
+		var m struct {
+			Path string `json:"path"`
+		}
+		if err := json.Unmarshal(raw, &m); err != nil {
+			t.Fatal(err)
+		}
+		return m.Path
+	}
+	if got := readPath(); got != "/d/a.bin" {
+		t.Fatalf("staged manifest path = %q, want /d/a.bin", got)
+	}
+	// Rename: the durable record must be retargeted before the syscall
+	// is acknowledged.
+	br.RemapLocal("/d/a.bin", "/d/b.bin")
+	if got := readPath(); got != "/d/b.bin" {
+		t.Fatalf("after rename, manifest path = %q, want /d/b.bin (record stranded at the old name)", got)
+	}
+}
+
+// Test-only bridge accessors: drive the durable-barrier path directly,
+// without an engine handle, so the test pins the manifest contract.
+func (b *Bridge) RememberPathForTest(ino meta.Ino, path string) {
+	b.mu.Lock()
+	full := b.fullPath(path)
+	b.paths[ino] = full
+	b.replacements[full] = ino // the descriptor owns the name
+	b.mu.Unlock()
+}
+
+func (b *Bridge) StageBlockForTest(sum string, data []byte) {
+	b.blocks.stagePinned(sum, data, true)
+}
+
+func (b *Bridge) AddPendingForTest(ino meta.Ino, chunk, off uint32, sum string, size int64, total int64) {
+	b.mu.Lock()
+	b.pending[ino] = append(b.pending[ino], pendingWrite{chunk: chunk, off: off, checksum: sum, size: size})
+	b.sizes[ino] = total
+	b.mu.Unlock()
+}
