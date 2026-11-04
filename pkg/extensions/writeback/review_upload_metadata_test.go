@@ -184,6 +184,13 @@ func TestUploadSyncNoDataOutcomeMetadata(t *testing.T) {
 				}
 			}
 			putsBefore := b.Requests()["PUT /v1/fs/f"]
+			landingBefore, hadLanding := wb.landedAttr("/f")
+			if hadLanding {
+				remote, exists := b.Node("/f")
+				if !exists || landingBefore.Rev != remote.Rev || landingBefore.Size != int64(len(remote.Data)) {
+					t.Fatal("prior data landing does not match the actual remote image")
+				}
+			}
 			rejectMode.Store(false)
 			rev, meta, err := wb.uploader.uploadSyncWithMetadata(context.Background(), "/f")
 			if err != nil || rev != 0 {
@@ -198,8 +205,8 @@ func TestUploadSyncNoDataOutcomeMetadata(t *testing.T) {
 			if puts := b.Requests()["PUT /v1/fs/f"]; puts != putsBefore {
 				t.Fatalf("no-data retry issued another PUT: before=%d after=%d", putsBefore, puts)
 			}
-			if _, exists := wb.landedAttr("/f"); exists {
-				t.Fatal("no-data retry invented a size/revision watermark")
+			if after, exists := wb.landedAttr("/f"); exists != hadLanding || (exists && (after.Rev != landingBefore.Rev || after.Size != landingBefore.Size)) {
+				t.Fatal("no-data retry changed the prior size/revision watermark")
 			}
 		})
 	}

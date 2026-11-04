@@ -168,7 +168,7 @@ func TestSSEStageWithoutBufferDoesNotPublish(t *testing.T) {
 	buffered := writebackHandleOf(h)
 	// The helper permits an existing handle with no buffer; success must
 	// remain a no-op, never a synthetic zero-byte staging publication.
-	snapshot, err := buffered.stageToWriteCache(ctx, false)
+	snapshot, err := buffered.stageToWriteCache(ctx)
 	if err != nil || snapshot != nil {
 		t.Fatalf("no-op stage returned snapshot=%+v err=%v", snapshot, err)
 	}
