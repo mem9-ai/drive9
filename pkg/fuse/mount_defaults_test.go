@@ -137,3 +137,17 @@ func TestMountDefaultParallelReadBlockSize(t *testing.T) {
 	defer rec.mu.Unlock()
 	t.Fatalf("no 1MiB range request observed; saw lengths %v", rec.length)
 }
+
+// With explicit [extent] patterns the layout is pattern-owned: the
+// write plane's size-based promotion stays off, so a non-matching file
+// never flips to extent by crossing the inline cutoff. Pattern-less
+// hybrid mounts keep the promotion line.
+func TestExtentPromotionCutoffRespectsPatterns(t *testing.T) {
+	cl := client.New("http://promote.invalid", "")
+	if got := extentPromotionCutoff(true, cl); got != 0 {
+		t.Fatalf("pattern-configured promotion cutoff = %d, want 0 (pattern owns the layout)", got)
+	}
+	if got := extentPromotionCutoff(false, cl); got <= 0 {
+		t.Fatalf("hybrid promotion cutoff = %d, want the positive inline fallback", got)
+	}
+}

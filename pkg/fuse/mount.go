@@ -239,6 +239,16 @@ func parseExtensionOrder(list []string) ([]string, error) {
 	return out, nil
 }
 
+// extentPromotionCutoff decides the write plane's promotion line: with
+// explicit [extent] patterns the layout is pattern-owned (no promotion);
+// pattern-less hybrid mounts promote at the server's inline cutoff.
+func extentPromotionCutoff(patternConfigured bool, cl *client.Client) int64 {
+	if patternConfigured {
+		return 0
+	}
+	return extentInlineThreshold(cl)
+}
+
 // extentInlineThreshold returns the server's inline cutoff (the old
 // multipart upgrade line): staged images at or above it become extent.
 func extentInlineThreshold(cl *client.Client) int64 {
@@ -1079,9 +1089,15 @@ func mountWithConfig(cfg MountConfig) error {
 			BatchMaxBytes:         cfg.WriteBackBatchMaxBytes,
 			// The extent plane and its write-plane branch arm together:
 			// the engine serves extent reads, the commit queue promotes
-			// fresh large files (multipart's successor).
+			// fresh large files (multipart's successor). With explicit
+			// [extent] patterns the pattern IS the layout truth — creation
+			// happens on the extent plane for matches and stays classic
+			// everywhere else, so the size-based promotion channel is
+			// OFF (a non-matching file must not silently flip to extent
+			// just by crossing the inline cutoff on a rename or landing).
+			// Pattern-less hybrid mounts keep the promotion line.
 			ExtentTakeover: wantExt["extent"],
-			ExtentMinSize:  int64(extentInlineThreshold(cl)),
+			ExtentMinSize:  extentPromotionCutoff(len(cfg.ExtentPaths) > 0, cl),
 			// gvisor-compat takes precedence and always keeps commits
 			// detached (v1).
 			InterruptibleCommits:    cfg.LegacyInterruptibleMutations && !cfg.GVisorCompat,
