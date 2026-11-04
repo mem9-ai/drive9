@@ -325,6 +325,16 @@ func (b *Backend) ReplaceWithClassic(path string, data []byte) {
 }
 
 // ForceConflict arms N forced 409s for conditional writes to path.
+// forceConflictLocked consumes one forced-conflict request for path.
+// Caller holds b.mu.
+func (b *Backend) forceConflictLocked(path string) bool {
+	if b.forceConflict[path] > 0 {
+		b.forceConflict[path]--
+		return true
+	}
+	return false
+}
+
 func (b *Backend) ForceConflict(path string, n int) {
 	b.mu.Lock()
 	b.forceConflict[path] = n
@@ -477,11 +487,11 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					ChecksumSHA256 string `json:"checksum_sha256"`
 				}
 				_ = json.NewDecoder(r.Body).Decode(&req)
-				if b.forceConflict[us.path] > 0 {
+				if b.forceConflictLocked(us.path) {
 					// The forced-conflict test knob reaches the multipart
 					// track too: complete 409s once per request, exactly
-					// like the direct-PUT handler.
-					b.forceConflict[us.path]--
+					// like the direct-PUT handler (same locked accessor —
+					// handlers run concurrently).
 					b.writeErr(w, http.StatusConflict, "forced conflict")
 					return
 				}

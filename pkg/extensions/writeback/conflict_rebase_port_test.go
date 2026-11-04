@@ -1,6 +1,7 @@
 package writeback
 
 import (
+	"bytes"
 	"context"
 	"net/http/httptest"
 	"syscall"
@@ -574,4 +575,134 @@ func TestPortSyncLandingRefusesLedgerOwnedPendingNew(t *testing.T) {
 	if data, ok := wb.wbCache.GetView("/g"); !ok || string(data) != string(staleImage) {
 		t.Fatalf("cache pair = %q ok=%t, want it untouched", data, ok)
 	}
+}
+
+// TestPortLedgerShadowSurvivesQueueLanding pins the spilled lazy view's
+// lifetime: a writable reopen over a >16 MiB ledger image keeps reading the
+// SHADOW (pinned generation) even after the queue lands G2 and removes the
+// active shadow — the acknowledged partial edit must compose with the exact
+// image it was opened over, not fail and not fall to the pre-ledger row.
+func TestPortLedgerShadowSurvivesQueueLanding(t *testing.T) {
+	b := testbackend.NewBackend()
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	ledger, err := staging.NewStaging(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wb, err := New(Options{Policy: PolicyWriteBack, Client: cl, WriteCacheDir: t.TempDir(), Staging: ledger})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := fs.NewChain(wb, terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A spilled (17 MiB) ledger image G2 over a DIFFERENT 17 MiB remote row
+	// G1 — the lazy branch, not the materialize branch.
+	ledgerImage := bytes.Repeat([]byte("L"), 17<<20)
+	remoteRow := bytes.Repeat([]byte("R"), 17<<20)
+	b.Seed("/h", remoteRow)
+	if err := ledger.Shadow.WriteFull("/h", ledgerImage, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ledger.Pending.PutWithBaseRevAndMode("/h", int64(len(ledgerImage)), staging.PendingOverwrite, 1, 0o644, false); err != nil {
+		t.Fatal(err)
+	}
+
+	// Writable reopen: the first write initializes the lazy shadow view.
+	res, err := ch.Dispatch(context.Background(), &fs.Op{Kind: fs.OpCreate, Path: "/h",
+		Flags: uint32(syscall.O_RDWR | syscall.O_CREAT)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := res.Handle.(*bufferingHandle)
+	if err := h.Write(context.Background(), 0, []byte("X")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Let the queue land G2 and clean up its shadow (active generation
+	// removed; only the pinned file remains).
+	if err := wb.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		if n, ok := b.Node("/h"); ok && string(n.Data[:7]) == "LLLLLLL" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("ledger image never landed")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if ledger.Shadow.Has("/h") {
+		t.Fatal("queue landing did not clean up its shadow")
+	}
+
+	// Untouched parts must still read the LEDGER bytes from the pinned
+	// generation — not the pre-ledger row, not an error.
+	got := make([]byte, 8)
+	n, rerr := h.Read(context.Background(), 1<<20, got)
+	if rerr != nil || n != 8 {
+		t.Fatalf("post-landing read of untouched part: n=%d err=%v", n, rerr)
+	}
+	if string(got) != "LLLLLLLL" {
+		t.Fatalf("post-landing read = %q, want ledger bytes (pinned shadow)", got)
+	}
+	_ = h.Release(context.Background())
+}
+
+// TestPortLedgerShadowFailureSurfaces pins the small-image branch: when the
+// ledger owns the path and its shadow cannot serve the pending image (wrong
+// length here), initialization FAILS — it must not fall through to the
+// remote row underneath, which would compose a future write with superseded
+// bytes.
+func TestPortLedgerShadowFailureSurfaces(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/k", []byte("remote-row"))
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	ledger, err := staging.NewStaging(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wb, err := New(Options{Policy: PolicyWriteBack, Client: cl, WriteCacheDir: t.TempDir(), Staging: ledger})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := fs.NewChain(wb, terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Pending entry claims 16 bytes; the shadow holds 8 — a torn ledger.
+	if err := ledger.Shadow.WriteFull("/k", []byte("12345678"), 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ledger.Pending.PutWithBaseRevAndMode("/k", 16, staging.PendingOverwrite, 1, 0o644, false); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := ch.Dispatch(context.Background(), &fs.Op{Kind: fs.OpCreate, Path: "/k",
+		Flags: uint32(syscall.O_RDWR | syscall.O_CREAT)})
+	if err != nil {
+		t.Fatalf("open over torn ledger: %v", err)
+	}
+	h := res.Handle.(*bufferingHandle)
+	err = h.Write(context.Background(), 0, []byte("Z"))
+	if err == nil {
+		t.Fatal("initialization over a torn ledger must fail, not compose with the remote row")
+	}
+	_ = h.Release(context.Background())
 }

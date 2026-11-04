@@ -747,7 +747,7 @@ func TestPortStreamedCommitContinuesOnSameHandle(t *testing.T) {
 	b := testbackend.NewBackend()
 	// Existing row at revision 1 with a base large enough that growing
 	// past it exceeds the direct-PUT threshold and takes the stream path.
-	base := bytes.Repeat([]byte("s"), 1<<20)
+	base := bytes.Repeat([]byte("s"), 40<<20) // beyond any verify budget: the SHA read-back streams
 	b.Seed("/f", base)
 	ts := httptest.NewServer(b)
 	t.Cleanup(ts.Close)
