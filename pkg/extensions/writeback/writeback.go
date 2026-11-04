@@ -1130,7 +1130,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			// ledger entry may be a superseded image, and the queue's own
 			// recovery owns the landing.
 			if w.wbCache != nil && w.uploader != nil &&
-				!(w.opts.Staging != nil && w.opts.Staging.Pending.HasPending(op.Path)) {
+				(w.opts.Staging == nil || !w.opts.Staging.Pending.HasPending(op.Path)) {
 				if _, ok := w.wbCache.GetMeta(op.Path); ok {
 					if _, serr := w.opts.Client.StatCtx(ctx, w.remotePath(op.Path)); serr != nil && client.IsNotFound(serr) {
 						if err := w.uploader.UploadSync(ctx, op.Path); err == nil {
