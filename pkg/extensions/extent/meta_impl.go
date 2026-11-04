@@ -919,7 +919,20 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 			}
 			b.mu.Lock()
 			b.revs[ino] = nst.Revision
+			savedID := b.layoutPendingID[ino]
 			b.mu.Unlock()
+			// The classification Stat must describe the object OUR
+			// completion echoed: a replacement landing between the
+			// completion and this Stat presents a different identity
+			// (and possibly a classic layout), and marking the handle
+			// classic-owned off it would let this descriptor write into
+			// a foreign file.
+			if savedID != "" && nst.ResourceID != savedID {
+				b.mu.Lock()
+				b.layoutPending[ino] = true // proof pending, owner unknown
+				b.mu.Unlock()
+				return fmt.Errorf("verify landed layout of %s: occupant replaced our upload", path)
+			}
 			landedID = nst.ResourceID
 			classic = nst.ContentLayout != client.ContentLayoutExtent
 			classified = true

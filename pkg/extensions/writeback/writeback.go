@@ -680,6 +680,15 @@ func (w *Writeback) Stop(ctx context.Context) error {
 // bookkeeping) without touching the remote: the facade defers the actual
 // deletion to the last close of an open file.
 func (w *Writeback) MarkPathUnlinked(p string) {
+	// Serialize with staging: the staging path holds this lock across its
+	// unlinked check AND its snapshot write/enqueue, so taking it here
+	// makes "check unlinked" vs "mark anonymous + cancel the queue"
+	// mutually exclusive — without it, an interactive fsync that passed
+	// the check could still publish and enqueue under the dead name after
+	// the cancel swept an empty queue. None of the callees re-acquire a
+	// path lock, so this cannot deadlock.
+	unlock := w.pathLocks.lock(p)
+	defer unlock()
 	w.markUnlinked(p, false)
 	// The name is going away NOW (the syscall already returned OK): the
 	// pending overlays must stop answering lookups for it, or a
