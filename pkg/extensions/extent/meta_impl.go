@@ -865,6 +865,14 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 		}
 	}
 
+	if !fresh && b.needsFreshIdentity(ino) {
+		// A locally-created descriptor whose landing never established an
+		// attributable identity (no completion echo, no bound
+		// classification) must not PATCH whoever currently holds the
+		// name: that occupant may be a replacement, and without identity
+		// the write is indistinguishable from adopting it.
+		return fmt.Errorf("fresh create of %s has no attributable identity for the current occupant", path)
+	}
 	if fresh {
 		// Sparse: holes are synthesized on demand — a small write at a
 		// huge offset must not materialize the whole logical image. The
@@ -950,11 +958,22 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 				return fmt.Errorf("verify landed layout of %s: occupant not attributable to our upload", path)
 			}
 			if savedID == "" {
-				// The echo-less continuation only works because this
-				// identity BINDS: record it now so every later publication
-				// of the descriptor carries it as the PATCH's expected
-				// resource (a replacement then fails the identity check
-				// instead of receiving our bytes).
+				// The echo-less continuation needs evidence ATTRIBUTABLE
+				// to this completion: an extent layout plus a pathname
+				// lookup proves nothing (a replacement created before
+				// this Stat presents the same shape). The content-
+				// addressed plan is that evidence — our upload's blocks
+				// are keyed by their content, so an object containing one
+				// of OUR pending blocks is the object this completion
+				// landed (a foreign file cannot reference them except by
+				// holding the same bytes, which makes the distinction
+				// moot). Only then does the observed identity BIND.
+				if !b.pendingBlocksPresent(ctx, path, pending) {
+					b.mu.Lock()
+					b.layoutPending[ino] = true
+					b.mu.Unlock()
+					return fmt.Errorf("verify landed layout of %s: occupant not attributable to our upload", path)
+				}
 				b.mu.Lock()
 				b.layoutPendingID[ino] = nst.ResourceID
 				b.mu.Unlock()
@@ -995,6 +1014,7 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 	delete(b.commitErr, ino) // a successful landing resolves the memory
 	delete(b.verifyBase, ino)
 	delete(b.layoutPending, ino)
+	delete(b.freshCreate, ino)
 	// layoutPendingID SURVIVES the landing: it is the identity binding
 	// for every later publication of this descriptor (the PATCH's
 	// expected-resource), not merely the pending-classification proof.
@@ -2040,6 +2060,28 @@ func (b *Bridge) layoutPendingMatches(ino meta.Ino, occupantID string) bool {
 	return b.layoutPendingID[ino] != "" && b.layoutPendingID[ino] == occupantID
 }
 
+// pendingBlocksPresent verifies, via the content-addressed read plan,
+// that the pathname's current extent object contains one of OUR pending
+// blocks — the only echo-less evidence attributable to this descriptor's
+// own upload. A transient plan failure reports not-present (the refusal
+// side); the pending state stays for the next attempt.
+func (b *Bridge) pendingBlocksPresent(ctx context.Context, path string, pending []pendingWrite) bool {
+	for _, p := range pending {
+		start := int64(p.chunk)*meta.ChunkSize + int64(p.off)
+		end := start + p.size
+		plan, err := b.cfg.Client.GetExtentReadPlan(ctx, path, start, end)
+		if err != nil {
+			continue // transient or non-extent answer: try the next block
+		}
+		for _, blk := range plan.Blocks {
+			if blk.BlockKey == p.checksum {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // rcHeaderResourceID extracts an identity echoed by a read response, when
 // the server provides one on the same request that supplied the bytes.
 func rcHeaderResourceID(rc io.ReadCloser) string {
@@ -2075,6 +2117,9 @@ func (b *Bridge) peekVerifyBase(ino meta.Ino) (verifyBase, bool) {
 // replaced: the staged data must never reach a later unconstrained
 // publication.
 func (b *Bridge) abandonIno(ino meta.Ino) {
+	b.mu.Lock()
+	delete(b.freshCreate, ino)
+	b.mu.Unlock()
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -2116,6 +2161,26 @@ func (b *Bridge) HasPending(ino meta.Ino) bool {
 // slices locally (reads overlay them) and the remote commit defers to the
 // flush/close boundary or the next mount's replay of a staged barrier.
 func (b *Bridge) EnableDeferredCommits() { b.deferred.Store(true) }
+
+// MarkFreshCreate records that this inode is a descriptor WE created: its
+// first publication must establish an attributable identity (completion
+// echo, or the content-addressed classification proof) before writing any
+// pathname occupant.
+func (b *Bridge) MarkFreshCreate(ino meta.Ino) {
+	b.mu.Lock()
+	b.freshCreate[ino] = true
+	b.mu.Unlock()
+}
+
+// needsFreshIdentity reports whether this inode is a locally-created
+// descriptor whose identity was never established (no verifyBase, no
+// bound landing identity, not classic-owned).
+func (b *Bridge) needsFreshIdentity(ino meta.Ino) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.freshCreate[ino] && b.verifyBase[ino].resID == "" &&
+		b.layoutPendingID[ino] == "" && !b.classicOwned[ino]
+}
 
 // ModeOf reports the mode recorded for the inode at creation (Mknod).
 func (b *Bridge) ModeOf(ino meta.Ino) (uint32, bool) {

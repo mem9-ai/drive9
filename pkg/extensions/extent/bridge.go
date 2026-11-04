@@ -93,6 +93,11 @@ type Bridge struct {
 	commitErr map[meta.Ino]error
 
 	layoutPending map[meta.Ino]bool
+	// freshCreate marks inodes this bridge CREATED locally: their first
+	// publication must establish an attributable identity before writing
+	// any pathname occupant (an unbound fresh descriptor must not PATCH
+	// whoever happens to hold the name).
+	freshCreate map[meta.Ino]bool
 	// layoutPendingID is the resource identity of OUR landed upload for
 	// an inode whose classification failed: adopting the classic surface
 	// is only valid while the occupant is still THAT object.
@@ -184,6 +189,7 @@ func NewBridge(cfg Config) *Bridge {
 		classicOwned:    make(map[meta.Ino]bool),
 		layoutPending:   make(map[meta.Ino]bool),
 		layoutPendingID: make(map[meta.Ino]string),
+		freshCreate:     make(map[meta.Ino]bool),
 		commitErr:       make(map[meta.Ino]error),
 		verifyBase:      make(map[meta.Ino]verifyBase),
 	}

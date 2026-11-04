@@ -780,9 +780,11 @@ func (cq *CommitQueue) CancelEntryInFlight(entry *CommitEntry) {
 	entry.canceled = true
 	cancel := entry.cancelCommit
 	if cancel == nil {
-		// Not picked up by a worker yet: remove it from the waitable
-		// sets under the lock; a worker that already dequeued it observes
-		// the canceled flag on its own checks.
+		// Not picked up by a worker yet: retire it from EVERY waitable
+		// set — the queue slice, the immediate set, and the queuedByPath
+		// index (WaitPath/WaitPathDeadline consult the index; leaving the
+		// membership behind keeps the path busy forever, since a worker
+		// that never sees the entry can never repair it).
 		cq.stopDelayedLocked(entry)
 		for i, e := range cq.queue {
 			if e == entry {
@@ -791,6 +793,7 @@ func (cq *CommitQueue) CancelEntryInFlight(entry *CommitEntry) {
 			}
 		}
 		delete(cq.immediate, entry)
+		cq.removeQueuedLocked(entry)
 	}
 	cq.mu.Unlock()
 	if cancel != nil {

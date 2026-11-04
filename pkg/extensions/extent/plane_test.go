@@ -4534,3 +4534,32 @@ func TestEcholessClassicOccupantRefusedOnRetries(t *testing.T) {
 		t.Fatal("the refusal must persist across retries")
 	}
 }
+
+// Round-47: with no completion echo, an extent occupant that replaced OUR
+// landing BEFORE the classification Stat must not be adopted — its read
+// plan holds none of our content-addressed blocks, so the binding is
+// refused and the replacement is never written through our descriptor.
+func TestEcholessReplacementBeforeClassificationRefuses(t *testing.T) {
+	f := newFakeV2(t)
+	f.completeEcho = false
+	f.setDir("/d", true)
+	h := newTestHandler(t, f, 0)
+	// Interactive staging: Write only stages; the commit (and its
+	// classification) happens at the flush boundary, after the replacement.
+	h.opts.Engine.Bridge.EnableDeferredCommits()
+	res, _, _ := dispatchCreate(context.Background(), h, "/d/n.bin", syscall.O_RDWR|syscall.O_CREAT)
+	eh := res.Handle.(*engineHandle)
+	if err := eh.Write(context.Background(), 0, []byte("AAAA")); err != nil {
+		t.Fatal(err)
+	}
+	// Another client replaces the name with a DIFFERENT extent object
+	// before our classification Stat runs.
+	f.remove("/d/n.bin")
+	f.seedExtent(t, "/d/n.bin", "OTHER!")
+	if err := eh.Flush(context.Background()); err == nil {
+		t.Fatal("an echo-less flush over a pre-classification replacement must refuse")
+	}
+	if got := f.contentOf("/d/n.bin"); got != "OTHER!" {
+		t.Fatalf("replacement = %q, want OTHER! untouched", got)
+	}
+}

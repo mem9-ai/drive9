@@ -379,6 +379,9 @@ func (h *Handler) tryClaimOpen(ctx context.Context, op *fs.Op) (fs.Result, error
 		// defensively (fresh files resolve locally).
 		return fs.Result{}, errno, true
 	}
+	// This descriptor CREATED the name: its first publication must
+	// establish an attributable identity before writing any occupant.
+	h.opts.Engine.Bridge.MarkFreshCreate(meta.Ino(ino))
 	handle := h.register(op.Path, ino, fh, op.Caller)
 	return fs.Result{Handle: handle, Attr: &fs.Attr{Kind: fs.KindFile, Mode: mode, Nlink: 1}}, nil, true
 }
