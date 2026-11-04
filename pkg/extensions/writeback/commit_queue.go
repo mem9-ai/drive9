@@ -651,6 +651,19 @@ func (cq *CommitQueue) rememberPathCommitErr(entry *CommitEntry, err error) {
 	}
 }
 
+// ClearPathCommitErr retires a remembered failure for a pathname after a
+// publication of that name SUCCEEDED outside the queue (an inline PUT, the
+// write-cache uploader, a synchronous commit). Without this a recreated or
+// re-published file keeps inheriting its predecessor's error.
+func (cq *CommitQueue) ClearPathCommitErr(path string) {
+	if cq == nil || path == "" {
+		return
+	}
+	cq.mu.Lock()
+	delete(cq.pathCommitErr, path)
+	cq.mu.Unlock()
+}
+
 // WaitPathOutcome waits like WaitPathDeadline and then reports whether the
 // path's last commit actually succeeded. A path can be idle because its
 // entry terminally failed (the queue removed it) — close-style durability
@@ -1384,6 +1397,11 @@ func (cq *CommitQueue) cancelPathEntries(path string) []context.CancelFunc {
 	cq.mu.Lock()
 	defer cq.mu.Unlock()
 	delete(cq.landed, path)
+	// The remembered failure belongs to the PUBLICATION that failed, not to
+	// the pathname: a cancel (unlink/rename/delete) retires it, or a
+	// recreated file would inherit its predecessor's EIO on every Sync until
+	// an unrelated queue success happened to clear it.
+	delete(cq.pathCommitErr, path)
 	if e, ok := cq.inFlight[path]; ok {
 		markCanceled(e)
 	}

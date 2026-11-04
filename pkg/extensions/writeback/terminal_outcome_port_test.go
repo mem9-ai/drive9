@@ -41,3 +41,36 @@ func TestWaitPathOutcomeReportsTerminalFailure(t *testing.T) {
 		t.Fatalf("WaitPathOutcome after success = %v, want nil", got)
 	}
 }
+
+// A remembered failure belongs to the PUBLICATION that failed, not to the
+// pathname forever. After a cancel (unlink/rename) or a later successful
+// publication of the same name, a Sync must not keep reporting the old
+// error — otherwise a recreated file inherits its predecessor's EIO.
+func TestPathCommitErrRetiredByLifecycle(t *testing.T) {
+	shadow, err := staging.NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	cq := NewCommitQueue(newTestClient("http://127.0.0.1:1"), shadow, nil, nil, 1, 8)
+	defer cq.DrainAll()
+
+	boom := errors.New("predecessor failed")
+	cq.rememberPathCommitErr(&CommitEntry{Path: "/p.bin"}, boom)
+	if got := cq.WaitPathOutcome("/p.bin", time.Second); !errors.Is(got, boom) {
+		t.Fatalf("precondition: outcome = %v, want the failure", got)
+	}
+
+	// A cancel (what unlink/rename/delete issue) retires it.
+	cq.cancelPathEntries("/p.bin")
+	if got := cq.WaitPathOutcome("/p.bin", time.Second); got != nil {
+		t.Fatalf("after cancel, outcome = %v, want nil (a recreated file must not inherit it)", got)
+	}
+
+	// A later successful publication outside the queue retires it too.
+	cq.rememberPathCommitErr(&CommitEntry{Path: "/q.bin"}, boom)
+	cq.ClearPathCommitErr("/q.bin")
+	if got := cq.WaitPathOutcome("/q.bin", time.Second); got != nil {
+		t.Fatalf("after a successful publication, outcome = %v, want nil", got)
+	}
+}

@@ -3715,6 +3715,13 @@ func (w *Writeback) landedAt(path string, rev, size int64) {
 	}
 	w.landed[path] = landedInfo{rev: rev, size: size, at: time.Now()}
 	w.landedMu.Unlock()
+	// A publication of this pathname SUCCEEDED, so a failure remembered for
+	// an earlier publication of the same name must not keep surfacing: the
+	// error is keyed by pathname for want of a better handle, not because it
+	// describes every future file at that name.
+	if w.queue != nil {
+		w.queue.ClearPathCommitErr(path)
+	}
 }
 
 func (w *Writeback) forgetLanded(path string) {
