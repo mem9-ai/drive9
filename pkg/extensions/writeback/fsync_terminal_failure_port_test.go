@@ -424,6 +424,112 @@ func TestTerminalFailureClearGuards(t *testing.T) {
 	}
 }
 
+// TestPortRenameMovesConflictMarkers pins the durable side of rename: a
+// terminally failed source keeps its conflict marker (and preserved bytes)
+// through the rename — they follow the name — while the replaced target's
+// own marker dies with its incarnation. Clearing only the in-memory records
+// would leave both markers answering EIO through the durable fallback.
+func TestPortRenameMovesConflictMarkers(t *testing.T) {
+	fb := &failingWritesBackend{backend: testbackend.NewBackend()}
+	ch, wb := newUploadStack(t, fb, Options{Policy: PolicyWriteBack})
+	ctx := context.Background()
+
+	// Both files land once, then a second edit terminally fails: each name
+	// ends with a durable conflict marker over a landed remote image.
+	stageConflict := func(path, landed, unlanded string) {
+		t.Helper()
+		h := open(t, ch, path)
+		if err := h.Write(ctx, 0, []byte(landed)); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.Sync(ctx); err != nil {
+			t.Fatal(err)
+		}
+		fb.setFail(true)
+		if err := h.Write(ctx, 0, []byte(unlanded)); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.Sync(ctx); err == nil {
+			t.Fatalf("fsync for %s reported durability during the upload outage", path)
+		}
+		if err := wb.queue.PathTerminalFailure(path); err == nil {
+			t.Fatalf("terminal failure not recorded for %s", path)
+		}
+		fb.setFail(false)
+	}
+	stageConflict("/mv-src.txt", "src landed", "src unlanded v2")
+	stageConflict("/mv-dst.txt", "dst landed", "dst unlanded v2")
+
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/mv-src.txt", Path2: "/mv-dst.txt"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The old name is clean: record cleared, no pending entry left behind.
+	if err := wb.queue.PathTerminalFailure("/mv-src.txt"); err != nil {
+		t.Fatalf("old name still answers EIO after rename: %v", err)
+	}
+	if wb.opts.Staging.Pending.HasPending("/mv-src.txt") {
+		t.Fatal("source pending entry stayed keyed under the dead old name")
+	}
+	// The new name carries the SOURCE's failure: its unlanded image now
+	// lives there, so the marker (and the preserved bytes) must have moved.
+	if err := wb.queue.PathTerminalFailure("/mv-dst.txt"); err == nil {
+		t.Fatal("the moved source's terminal failure was lost by the rename")
+	}
+	meta, ok := wb.opts.Staging.Pending.GetMeta("/mv-dst.txt")
+	if !ok || meta == nil || meta.Kind != staging.PendingConflict {
+		t.Fatalf("pending entry at the new name = %+v ok=%v, want the transferred conflict marker", meta, ok)
+	}
+	data, err := wb.opts.Staging.Shadow.ReadAll("/mv-dst.txt")
+	if err != nil || string(data) != "src unlanded v2" {
+		t.Fatalf("shadow at the new name = %q err=%v, want the source's preserved bytes", data, err)
+	}
+}
+
+// TestPortRenameRetiresTargetConflictMarker covers the no-source-failure
+// leg: a clean source replaces a terminally failed target, and the target's
+// durable marker must die with its incarnation — the new incumbent of the
+// name has nothing undurable.
+func TestPortRenameRetiresTargetConflictMarker(t *testing.T) {
+	fb := &failingWritesBackend{backend: testbackend.NewBackend()}
+	ch, wb := newUploadStack(t, fb, Options{Policy: PolicyWriteBack})
+	ctx := context.Background()
+
+	src := open(t, ch, "/mv2-src.txt")
+	if err := src.Write(ctx, 0, []byte("clean source")); err != nil {
+		t.Fatal(err)
+	}
+	if err := src.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	dst := open(t, ch, "/mv2-dst.txt")
+	if err := dst.Write(ctx, 0, []byte("target landed")); err != nil {
+		t.Fatal(err)
+	}
+	if err := dst.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	fb.setFail(true)
+	if err := dst.Write(ctx, 0, []byte("target unlanded")); err != nil {
+		t.Fatal(err)
+	}
+	if err := dst.Sync(ctx); err == nil {
+		t.Fatal("fsync reported durability during the upload outage")
+	}
+	fb.setFail(false)
+
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/mv2-src.txt", Path2: "/mv2-dst.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"/mv2-src.txt", "/mv2-dst.txt"} {
+		if err := wb.queue.PathTerminalFailure(path); err != nil {
+			t.Fatalf("PathTerminalFailure(%s) after rename = %v, want nil", path, err)
+		}
+	}
+	if wb.opts.Staging.Pending.HasPending("/mv2-dst.txt") {
+		t.Fatal("replaced target's conflict marker survived its incarnation")
+	}
+}
 // TestSyncWaitDeadlineSizeForReopenedPendingHandles pins the wait-deadline
 // input for handles that serve a staged pending image without a buffer: the
 // deadline must scale with the image being waited for (the worker's own

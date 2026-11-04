@@ -1428,6 +1428,12 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			restoreMarked(marked)
 			return fs.Result{}, serr
 		}
+		// Capture the pending-index generations both names carry INTO the
+		// remote rename: the durable conflict-marker transitions below may
+		// only touch these generations, so a racing same-path staging is
+		// neither moved away nor clobbered.
+		srcPendingGen, srcConflict := w.pendingConflictGen(op.Path)
+		dstPendingGen, dstConflict := w.pendingConflictGen(op.Path2)
 		res, err := next(ctx, op)
 		if err != nil {
 			// The rename failed: the target's descriptors are still bound
@@ -1436,11 +1442,18 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			return res, err
 		}
 		w.forgetLanded(op.Path)
-		// Both pathname incarnations ended (source moved, target replaced):
-		// neither name may keep answering EIO for the previous incumbent's
-		// terminally failed image. The failure itself follows the bytes —
-		// the durable conflict marker transfers with the pending entry.
+		// Both pathname incarnations ended (source moved, target replaced),
+		// so neither name may keep answering EIO for the previous
+		// incumbent's terminally failed image — and the DURABLE state must
+		// follow the rename, because PathTerminalFailure answers from the
+		// PendingConflict marker whenever the in-memory record is gone:
+		//   - a conflicted SOURCE moves its marker (and preserved bytes) to
+		//     the new name — the unlanded data it describes now lives there;
+		//   - otherwise the replaced TARGET's marker describes a name that
+		//     no longer exists and is retired.
+		// In-memory records are cleared only after those transitions.
 		if w.queue != nil {
+			w.retargetConflictMarkers(op.Path, op.Path2, srcPendingGen, srcConflict, dstPendingGen, dstConflict)
 			w.queue.clearTerminalFailure(op.Path)
 			w.queue.clearTerminalFailure(op.Path2)
 		}
@@ -1462,6 +1475,35 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 				_ = w.wbCache.RenamePending(entry.Path, target)
 				if w.opts.Staging != nil {
 					_ = w.opts.Staging.Shadow.Rename(entry.Path, target)
+				}
+			}
+		}
+		// Conflict-marked descendants follow the same rule as the renamed
+		// path itself: the write-cache loop above moves the .dat/.meta
+		// track, while the queue's preserved conflict entries would stay
+		// keyed under the dead prefix and keep answering EIO for names a
+		// recreator now owns. Conflict entries carry no live queue
+		// bookkeeping (the worker left, recovery skips them), so a fenced
+		// move is safe.
+		if w.opts.Staging != nil && w.opts.Staging.Pending != nil {
+			prefix := strings.TrimSuffix(op.Path, "/") + "/"
+			for path := range w.opts.Staging.Pending.ListPendingPaths() {
+				if !strings.HasPrefix(path, prefix) {
+					continue
+				}
+				meta, ok := w.opts.Staging.Pending.GetMeta(path)
+				if !ok || meta == nil || meta.Kind != staging.PendingConflict {
+					continue
+				}
+				target := op.Path2 + strings.TrimPrefix(path, op.Path)
+				tgen := uint64(0)
+				if tmeta, tok := w.opts.Staging.Pending.GetMeta(target); tok && tmeta != nil {
+					tgen = tmeta.Generation
+				}
+				if w.opts.Staging.Pending.RenamePendingIfGeneration(path, target, meta.Generation, tgen) {
+					if w.opts.Staging.Shadow != nil {
+						_ = w.opts.Staging.Shadow.Rename(path, target)
+					}
 				}
 			}
 		}
@@ -2096,6 +2138,44 @@ func (w *Writeback) resolveLandedStaging(path string, landedRev int64, supersede
 	}
 	w.queue.ClearTerminalFailureIfSeq(path, failureSeq)
 	w.queue.ResolveSupersededConflict(path, supersedesGen)
+}
+
+// pendingConflictGen reports the pending-index generation a path's entry
+// carries and whether that entry is a terminal-failure conflict marker.
+func (w *Writeback) pendingConflictGen(path string) (gen uint64, conflict bool) {
+	if w.opts.Staging == nil || w.opts.Staging.Pending == nil {
+		return 0, false
+	}
+	meta, ok := w.opts.Staging.Pending.GetMeta(path)
+	if !ok || meta == nil {
+		return 0, false
+	}
+	return meta.Generation, meta.Kind == staging.PendingConflict
+}
+
+// retargetConflictMarkers moves the durable terminal-failure state of a
+// completed rename: a conflicted SOURCE's pending entry (and its preserved
+// shadow bytes) transfers to the new name — the unlanded image it describes
+// now lives there — while without a source conflict the replaced TARGET's
+// marker describes a name that no longer exists and is retired. Both
+// transitions are fenced on the generations captured before the remote
+// rename, so a racing same-path staging under either name is neither moved
+// away nor clobbered.
+func (w *Writeback) retargetConflictMarkers(oldPath, newPath string, srcPendingGen uint64, srcConflict bool, dstPendingGen uint64, dstConflict bool) {
+	st := w.opts.Staging
+	if st == nil || st.Pending == nil {
+		return
+	}
+	switch {
+	case srcConflict:
+		if st.Pending.RenamePendingIfGeneration(oldPath, newPath, srcPendingGen, dstPendingGen) {
+			if st.Shadow != nil {
+				_ = st.Shadow.Rename(oldPath, newPath)
+			}
+		}
+	case dstConflict:
+		st.Pending.RemoveIfGeneration(newPath, dstPendingGen)
+	}
 }
 
 // Sync implements fs.Handle.

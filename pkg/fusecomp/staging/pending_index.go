@@ -302,6 +302,64 @@ func (idx *PendingIndex) RenamePending(oldPath, newPath string) bool {
 	return true
 }
 
+// RenamePendingIfGeneration is RenamePending fenced on both endpoints'
+// generations: the move happens only when oldPath's entry is still
+// expectedOldGen and newPath's entry, if any, is still expectedNewGen
+// (0 = must be absent). A rename that raced a same-path staging therefore
+// neither moves a fresher entry away from the old name nor clobbers one at
+// the new name. Returns true when the move happened.
+func (idx *PendingIndex) RenamePendingIfGeneration(oldPath, newPath string, expectedOldGen, expectedNewGen uint64) bool {
+	if oldPath == newPath || expectedOldGen == 0 {
+		return false
+	}
+	pla, plb := idx.acquireTwoPathLocks(oldPath, newPath)
+	defer idx.releaseTwoPathLocks(oldPath, newPath, pla, plb)
+
+	idx.mu.RLock()
+	meta, ok := idx.items[oldPath]
+	if !ok || meta == nil || meta.Generation != expectedOldGen {
+		idx.mu.RUnlock()
+		return false
+	}
+	if cur, exists := idx.items[newPath]; exists {
+		if cur == nil || cur.Generation != expectedNewGen {
+			idx.mu.RUnlock()
+			return false
+		}
+	} else if expectedNewGen != 0 {
+		idx.mu.RUnlock()
+		return false
+	}
+	// Copy fields under read lock.
+	gen := idx.nextGen.Add(1)
+	newMeta := cloneWriteBackMeta(meta)
+	newMeta.Path = newPath
+	newMeta.Generation = gen
+	idx.mu.RUnlock()
+
+	// Persist new meta to disk BEFORE updating memory so that crash
+	// recovery always has a consistent view.
+	metaBytes, _ := json.Marshal(&newMeta)
+	if err := atomicWrite(filepath.Join(idx.dir, HashPath(newPath)+".meta"), metaBytes); err != nil {
+		return false
+	}
+
+	idx.mu.Lock()
+	// The path locks serialize same-path mutations, but re-verify before the
+	// publish: a caller that raced past the fence must not be committed.
+	if cur, exists := idx.items[oldPath]; !exists || cur == nil || cur.Generation != expectedOldGen {
+		idx.mu.Unlock()
+		return false
+	}
+	cp := newMeta
+	idx.items[newPath] = &cp
+	delete(idx.items, oldPath)
+	idx.mu.Unlock()
+
+	_ = os.Remove(filepath.Join(idx.dir, HashPath(oldPath)+".meta"))
+	return true
+}
+
 // PrepareRename is phase one of a crash-safe rename: it persists the pending
 // entry under newPath on disk while oldPath stays authoritative in memory and
 // on disk. With both .meta files durable, a crash leaves the data reachable
