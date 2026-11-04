@@ -515,3 +515,63 @@ func TestPortRecoveryIntervalReadsServeLedgerImage(t *testing.T) {
 		t.Fatalf("writable reopen read = %q, want the ledger image with the write %q", got, want)
 	}
 }
+
+// TestPortSyncLandingRefusesLedgerOwnedPendingNew pins the uploader's
+// synchronous boundary on the create shape: a crashed enqueue can leave a
+// ledger PendingNew entry plus an older cache pair for a path with NO
+// backend row. Both synchronous entrypoints must refuse the path (no
+// expect-absent create publishing the stale pair, no cache consumption),
+// leaving the queue's recovery as the only landing track.
+func TestPortSyncLandingRefusesLedgerOwnedPendingNew(t *testing.T) {
+	b := testbackend.NewBackend() // no /g row
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	ledger, err := staging.NewStaging(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wb, err := New(Options{Policy: PolicyWriteBack, Client: cl, WriteCacheDir: t.TempDir(), Staging: ledger})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fs.NewChain(wb, terminal); err != nil {
+		t.Fatal(err)
+	}
+
+	ledgerImage := []byte("ledger-new")
+	staleImage := []byte("stale-old") // same length, superseded bytes
+	if err := ledger.Shadow.WriteFull("/g", ledgerImage, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ledger.Pending.PutWithBaseRevAndMode("/g", int64(len(ledgerImage)), staging.PendingNew, 0, 0o644, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := wb.wbCache.PutWithBaseRevAndMode("/g", staleImage, int64(len(staleImage)), staging.PendingNew, 0, 0o644, false); err != nil {
+		t.Fatal(err)
+	}
+
+	// Both synchronous entrypoints refuse before any PUT or cache use.
+	ctx := context.Background()
+	if _, err := wb.uploader.UploadSyncWithRevision(ctx, "/g"); !wb.uploader.IsLedgerOwnedError(err) {
+		t.Fatalf("UploadSyncWithRevision err = %v, want the ledger-ownership refusal", err)
+	}
+	if _, _, err := wb.uploader.uploadSyncWithMetadata(ctx, "/g"); !wb.uploader.IsLedgerOwnedError(err) {
+		t.Fatalf("uploadSyncWithMetadata err = %v, want the ledger-ownership refusal", err)
+	}
+	// Nothing landed, nothing consumed: no row, no requests, the cache
+	// pair byte-identical for the queue's own recovery.
+	if _, ok := b.Node("/g"); ok {
+		t.Fatal("a row was created despite the refusal")
+	}
+	if puts := b.Requests()["PUT /v1/fs/g"]; puts != 0 {
+		t.Fatalf("%d PUTs issued despite the refusal", puts)
+	}
+	if data, ok := wb.wbCache.GetView("/g"); !ok || string(data) != string(staleImage) {
+		t.Fatalf("cache pair = %q ok=%t, want it untouched", data, ok)
+	}
+}
