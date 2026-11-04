@@ -342,6 +342,16 @@ type bufferingHandle struct {
 	stagedParentID    string
 	stagedSnapshotSeq int64
 	contentSnapshotID string
+	// stagedContentVersion is the buffer's content generation when the
+	// current staged snapshot was minted. A landing may only arm the remote
+	// restore for a buffer whose generation is unchanged: any later
+	// Write/Truncate/Reset (including an unstaged truncate-regrow) makes the
+	// live image diverge from what landed.
+	stagedContentVersion uint64
+	// stagedSnapshotRegs is the set of snapshot IDs this handle has
+	// registered (atomic map copy): entries are consumed by their landings
+	// and the remainder is dropped at untrack.
+	stagedSnapshotRegs atomic.Value
 }
 
 // lineageSeq mints process-unique snapshot IDs (v1 generateMountID): the
@@ -460,6 +470,11 @@ func New(opts Options) (*Writeback, error) {
 			workers = defaultUploadConcurrency
 		}
 		q := NewCommitQueue(opts.Client, opts.Staging.Shadow, opts.Staging.Pending, opts.Staging.Journal, workers, opts.CommitQueueMaxPending, root)
+		// Arm the extent plane's promotion rules on the queue: this is what
+		// turns a promotion-sized staged image into an extent sequential
+		// session (or an incremental PATCH) instead of a classic upload.
+		q.SetExtentTakeover(opts.ExtentTakeover)
+		q.SetExtentPatterns(opts.ExtentPatterns, opts.ExtentThreshold)
 		q.SetPerfCounters(w.perfShim)
 		if opts.BatchWindow > 0 || opts.BatchMaxFiles > 0 || opts.BatchMaxBytes > 0 {
 			q.ConfigureBatchWrite(opts.BatchWindow, opts.BatchMaxFiles, opts.BatchMaxBytes)
@@ -469,6 +484,25 @@ func New(opts Options) (*Writeback, error) {
 		// size for the inode/dir-cache refresh, onCommitQueueSuccess);
 		// PathLock keeps queue cleanup serialized with same-path staging.
 		q.OnSuccess = func(entry *CommitEntry, committedRev int64) {
+			// Hand the landing to the handle that STAGED this image, found by
+			// the entry's snapshot ID: the newest handle at the path may be an
+			// unrelated writer, and the staging handle must learn its shadow is
+			// about to be reclaimed. Without this the still-open buffer keeps
+			// RestorePart pointed at a shadow generation the queue deletes.
+			if entry.SnapshotID != "" {
+				if h := w.handleForStagedSnapshot(entry.SnapshotID); h != nil {
+					{
+						if !h.completeStagedLanding(committedRev, entry.Size, entry.SnapshotID, false) {
+							// The buffer moved past the staged image, but its
+							// still-unchanged evicted parts reference THIS
+							// shadow generation and have no other restore
+							// source until their own landing: the queue's
+							// cleanup must keep the shadow.
+							w.queue.RetainShadowForLanding(entry.Path, entry.ShadowGen)
+						}
+					}
+				}
+			}
 			w.acknowledgeUploadedCreate(entry.Path, committedRev)
 			if w.opts.Policy == PolicyWriteSync || w.opts.Policy == PolicyCloseSync {
 				w.armBypass(entry.Path, committedRev, entry.Size, "sync-commit")
@@ -2833,6 +2867,143 @@ func (w *Writeback) armBypass(path string, rev, size int64, reason string) {
 	}
 }
 
+// handleForStagedSnapshot finds the open handle that staged the given
+// snapshot ID (nil when that handle has since closed).
+func (w *Writeback) handleForStagedSnapshot(id string) *bufferingHandle {
+	var found *bufferingHandle
+	w.liveSet.Range(func(key, _ any) bool {
+		h, ok := key.(*bufferingHandle)
+		if !ok {
+			return true
+		}
+		h.mu.Lock()
+		regs, _ := h.stagedSnapshotRegs.Load().(map[string]struct{})
+		_, registered := regs[id]
+		h.mu.Unlock()
+		if registered {
+			found = h
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+// armRemoteRestoreLocked gives the handle a REMOTE loader for its evicted
+// parts. Once the queue reclaims the shadow generation that backed them,
+// this is the only restore source the open buffer has; without it the next
+// read or partial write of an evicted part fails on a missing shadow. h.mu
+// must be held: every field read and every WriteBuffer mutation below
+// shares the buffer's single synchronization domain.
+func (h *bufferingHandle) armRemoteRestoreLocked(size int64) {
+	buf, cli, path := h.buf, h.w.opts.Client, h.path
+	partSize := int64(0)
+	if buf != nil {
+		partSize = buf.PartSize()
+		if size <= 0 {
+			size = buf.Size()
+		}
+	}
+	if buf == nil || cli == nil || partSize <= 0 || size <= 0 {
+		return
+	}
+	remote := h.w.remotePath(path)
+	landed := size
+	buf.LoadPart = func(partNum int) ([]byte, error) {
+		start := int64(partNum-1) * partSize
+		if start >= landed {
+			return nil, nil
+		}
+		end := start + partSize
+		if end > landed {
+			end = landed
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
+		defer cancel()
+		rc, err := cli.ReadStreamRange(ctx, remote, start, end-start)
+		if err != nil {
+			return nil, err
+		}
+		data, rerr := io.ReadAll(rc)
+		_ = rc.Close()
+		if rerr != nil {
+			return nil, rerr
+		}
+		return data, nil
+	}
+	buf.SetRemoteSize(landed)
+	// The landed remote image now holds every retained byte: evicted
+	// parts may fall back to it once the queue reclaims the shadow.
+	buf.MarkRemoteAuthoritative()
+}
+
+// completeStagedLanding applies a landing completion ATOMICALLY: the
+// metadata (landed / isNew retirement / base revision) always advances —
+// the server really holds that revision — while the buffer is certified
+// (visTrunc cleared, remote restore armed) only when it still holds exactly
+// the staged image the landing acknowledged. A newer mutation keeps its own
+// state. An empty snapshotID certifies nothing: substituting the CURRENT
+// staging would certify an in-progress image over the one that landed.
+func (h *bufferingHandle) completeStagedLanding(rev, size int64, snapshotID string, resetDirty bool) (certified bool) {
+	if snapshotID == "" {
+		return false
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.landed = true
+	h.isNew = false
+	if rev > 0 {
+		h.baseRev = rev
+	}
+	certified = h.stagedSnapshotID == snapshotID &&
+		(h.buf == nil || h.buf.ContentVersion() == h.stagedContentVersion)
+	if certified {
+		h.visTrunc = false
+		h.armRemoteRestoreLocked(size)
+		if resetDirty {
+			h.dirty = false
+		}
+	}
+	h.retireStagedSnapshotLocked(snapshotID)
+	return certified
+}
+
+// registerStagedSnapshotLocked adds a snapshot ID to the handle's set.
+// h.mu must be held.
+func (h *bufferingHandle) registerStagedSnapshotLocked(id string) {
+	if id == "" {
+		return
+	}
+	regs, _ := h.stagedSnapshotRegs.Load().(map[string]struct{})
+	next := make(map[string]struct{}, len(regs)+1)
+	for k := range regs {
+		next[k] = struct{}{}
+	}
+	next[id] = struct{}{}
+	h.stagedSnapshotRegs.Store(next)
+}
+
+// retireStagedSnapshotLocked drops a completed snapshot ID from the
+// per-handle registration set: only in-flight landings need to find it, and
+// a long-lived descriptor with repeated write/fsync cycles must not
+// accumulate them. h.mu must be held.
+func (h *bufferingHandle) retireStagedSnapshotLocked(id string) {
+	if id == "" {
+		return
+	}
+	regs, _ := h.stagedSnapshotRegs.Load().(map[string]struct{})
+	if _, ok := regs[id]; !ok {
+		return
+	}
+	next := make(map[string]struct{}, len(regs))
+	for k := range regs {
+		if k != id {
+			next[k] = struct{}{}
+		}
+	}
+	h.stagedSnapshotRegs.Store(next)
+}
+
 func (w *Writeback) remotePath(p string) string {
 	if w.root == "/" {
 		return p
@@ -4165,6 +4336,16 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 	h.stageSeq++
 	snapshotID, parentSnapshotID := h.stagedSnapshotID, h.stagedParentID
 	buf := h.buf
+	// Record the content generation this staging represents, and register
+	// the ID so the landing can find this handle by the entry's snapshot
+	// rather than by whichever handle currently owns the path (a newer
+	// handle at the same name is an unrelated writer).
+	if buf != nil {
+		h.stagedContentVersion = buf.ContentVersion()
+	} else {
+		h.stagedContentVersion = 0
+	}
+	h.registerStagedSnapshotLocked(snapshotID)
 	stageGen := h.wgen
 	kind := staging.PendingOverwrite
 	if isNew {
