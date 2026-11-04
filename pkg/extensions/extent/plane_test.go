@@ -4699,7 +4699,7 @@ func TestEngineUsesUpstreamCacheDefaults(t *testing.T) {
 	// a usable eviction policy.
 	conf := got
 	conf.CacheSize = 64 << 20
-	conf.CacheDir = filepath.Join(engineCacheDir(t), "jfs")
+	conf.CacheDir = filepath.Join(engineCacheDir(t), "extent")
 	conf.SelfCheck("vol-uuid")
 	if !strings.HasSuffix(conf.CacheDir, "vol-uuid") {
 		t.Fatalf("SelfCheck cache dir = %q, want it UUID-scoped", conf.CacheDir)

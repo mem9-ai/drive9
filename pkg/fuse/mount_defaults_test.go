@@ -166,7 +166,7 @@ func TestExtentCacheRootSharesReadCacheScope(t *testing.T) {
 	}
 	// Both planes are subdirectories of that ONE scope directory.
 	readDir := cacheScopedDir(base, readHash, "read")
-	engDir := cacheScopedDir(scope, "", "jfs")
+	engDir := cacheScopedDir(scope, "", "extent")
 	if !strings.HasPrefix(readDir, scope+string(filepath.Separator)) {
 		t.Fatalf("read cache %q is not inside the shared scope", readDir)
 	}

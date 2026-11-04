@@ -1013,12 +1013,12 @@ func mountWithConfig(cfg MountConfig) error {
 			Client:     cl,
 			RemoteRoot: remoteRoot,
 			// Cache placement: inside the SAME drive9 cache directory the
-			// read cache lives in, as one dedicated subdirectory ("jfs";
+			// read cache lives in, as one dedicated subdirectory ("extent";
 			// JuiceFS appends its volume UUID below it). The read cache
-			// occupies ".../<scope>/read", the engine ".../<scope>/jfs/
-			// <uuid>" — one cache dir, per-plane subdirs, and the byte
-			// budgets below partition that one tree.
-			CacheDir:  cacheScopedDir(extentCacheScope(cacheBase, mountHash, readCacheHash), "", "jfs"),
+			// occupies ".../<scope>/read", the engine
+			// ".../<scope>/extent/<uuid>" — one cache dir, per-plane
+			// subdirs, and the byte budgets below partition that one tree.
+			CacheDir:  cacheScopedDir(extentCacheScope(cacheBase, mountHash, readCacheHash), "", "extent"),
 			ReadOnly:  cfg.ReadOnly,
 			FreeSpaceRatio: float32(cfg.DiskReadCacheFreeRatio),
 			// JuiceFS's OWN writeback pipeline: blocks below the threshold
