@@ -5738,3 +5738,62 @@ func TestSyncRefusesForeignOccupantOfLocalCreate(t *testing.T) {
 		t.Fatalf("foreign occupant changed (%q -> %q)", foreignID, after)
 	}
 }
+
+// An ordinary open of an EXISTING empty extent file must synchronize: the
+// object predates this handle, so there is nothing to materialize and nothing
+// to attribute. The fresh-create refusal must not reach it.
+func TestStrictSyncOfExistingEmptyExtentFile(t *testing.T) {
+	f := newFakeV2(t)
+	f.setDir("/d", true)
+	// A CLASSIC empty object: `hasClassic` true, size 0 — the shape an
+	// existing zero-length extent-plane file presents to nameMaterialized.
+	f.mu.Lock()
+	f.classic["/d/empty.bin"] = ""
+	f.nextID++
+	f.ids["/d/empty.bin"] = fmt.Sprintf("res-%d", f.nextID)
+	f.mu.Unlock()
+	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: engineCacheDir(t)})
+	br := eng.Bridge
+	// An ORDINARY open: the bridge knows the path/size/revision but did not
+	// create the inode (no freshCreate marker, no binding) — exactly what
+	// ResolveLocal + GetAttr leave behind.
+	ino := meta.Ino(901)
+	br.RememberPathForTest(ino, "/d/empty.bin")
+	br.mu.Lock()
+	br.sizes[ino] = 0
+	br.mu.Unlock()
+	if br.isFreshCreate(ino) {
+		t.Fatal("precondition: an ordinary open must not be a fresh create")
+	}
+	if !br.nameMaterialized(context.Background(), "/d/empty.bin") {
+		t.Fatal("precondition: the empty object must exist remotely")
+	}
+	if err := br.MaterializeEmpty(context.Background(), ino); err != nil {
+		t.Fatalf("fsync of an existing empty extent file must succeed: %v", err)
+	}
+}
+
+// Truncating an existing nonempty extent file to zero publishes the
+// truncation, then Sync must not turn that completed publication into an
+// error — the descriptor never created the file.
+func TestStrictSyncAfterTruncateToZero(t *testing.T) {
+	f := newFakeV2(t)
+	f.setDir("/d", true)
+	f.seedExtent(t, "/d/t.bin", "PAYLOAD")
+	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: engineCacheDir(t)})
+	h := New(Options{Engine: eng, Threshold: 0, SyncMode: "strict"})
+	res, _, _ := dispatchCreate(context.Background(), h, "/d/t.bin", syscall.O_RDWR)
+	eh, ok := res.Handle.(*engineHandle)
+	if !ok {
+		t.Skipf("the existing file was not claimed by the engine (%T)", res.Handle)
+	}
+	if errno := eng.VFS.Truncate(eh.vctx, eh.ino, 0, 0, nil); errno != 0 {
+		t.Fatalf("truncate: %v", errno)
+	}
+	if err := eng.Bridge.TruncateLocal(context.Background(), "/d/t.bin", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Sync(context.Background()); err != nil {
+		t.Fatalf("fsync after a successful truncate-to-zero must succeed: %v", err)
+	}
+}

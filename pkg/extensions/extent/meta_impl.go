@@ -3245,6 +3245,14 @@ func (b *Bridge) flushFile(ctx context.Context, ino meta.Ino, finalize bool) err
 	return nil
 }
 
+// isFreshCreate reports whether this bridge created the inode locally (so its
+// first publication must establish an attributable identity).
+func (b *Bridge) isFreshCreate(ino meta.Ino) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.freshCreate[ino]
+}
+
 // nameMaterialized reports whether the file's name currently exists
 // server-side (a fresh empty engine file may have none yet).
 func (b *Bridge) nameMaterialized(ctx context.Context, path string) bool {
@@ -3276,21 +3284,21 @@ func (b *Bridge) MaterializeEmpty(ctx context.Context, ino meta.Ino) error {
 	if !has || !mapped || pending > 0 || size != 0 {
 		return nil
 	}
-	// Already named remotely. This descriptor did NOT necessarily create that
-	// object: a local-only engine create (Mknod does not touch the server) can
-	// race another client's create at the same path, and an ambiguous earlier
-	// create can have been followed by a replacement. Adopting the occupant's
-	// identity here would bind a stranger's object as this descriptor's
-	// publication target, so the safe outcome depends on whether we already
-	// hold an attributable identity:
+	// Already named remotely. What this means depends on whether THIS
+	// descriptor created the file:
 	//
-	//   - bound from an echo (the branch below): nothing to do, the name is
-	//     ours and durable;
-	//   - not bound: we cannot prove creation, so REFUSE. The caller surfaces
-	//     an error instead of acknowledging a file we cannot attribute.
+	//   - an ordinary open of an existing empty file: nothing to materialize
+	//     and nothing to attribute — the object predates this handle, and its
+	//     later writes go through the normal commit path with their own
+	//     revision CAS. Synchronizing it must simply succeed.
+	//   - a descriptor THIS bridge created locally, whose remote create has
+	//     not been attributed: the occupant may be another client's object
+	//     (Mknod never touches the server, so two clients can race the same
+	//     path). Binding it would make every later write publish against a
+	//     stranger's object, so refuse rather than adopt.
 	if b.nameMaterialized(ctx, path) {
-		if b.publicationIdentity(ino) != "" {
-			return nil // ours, already bound by the create echo
+		if b.publicationIdentity(ino) != "" || !b.isFreshCreate(ino) {
+			return nil
 		}
 		return fmt.Errorf("materialize empty file %s: name occupied by an object this descriptor did not create", path)
 	}
