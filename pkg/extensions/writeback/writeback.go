@@ -15,6 +15,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -767,6 +768,18 @@ type globMatcher func(path string) bool
 
 func compileExtentGlobs(patterns []string) []globMatcher {
 	compiled := pathfilter.CompileAll(patterns)
+	// A single-segment pattern (no '/') also matches by BASENAME at any
+	// depth: the profile's [extent] globs follow the suite's contract
+	// that "*.db" covers mix/a.db, while a pathfilter segment never
+	// crosses a separator.
+	var names []string
+	for _, raw := range patterns {
+		raw = strings.TrimSpace(raw)
+		if raw == "" || strings.Contains(raw, "/") {
+			continue
+		}
+		names = append(names, raw)
+	}
 	return []globMatcher{func(path string) bool {
 		cleaned, err := pathutil.Canonicalize(path)
 		if err != nil {
@@ -775,6 +788,12 @@ func compileExtentGlobs(patterns []string) []globMatcher {
 		cleaned = strings.TrimPrefix(cleaned, "/")
 		for _, p := range compiled {
 			if p.MatchCanonical(cleaned) {
+				return true
+			}
+		}
+		base := pathutil.BaseName(cleaned)
+		for _, n := range names {
+			if ok, _ := filepath.Match(n, base); ok {
 				return true
 			}
 		}

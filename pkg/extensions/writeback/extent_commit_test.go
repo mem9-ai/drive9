@@ -480,4 +480,12 @@ func TestUploadExtentEntryPatternRouting(t *testing.T) {
 	if _, handled, err := cq2.uploadExtentEntry(context.Background(), entry3, "/keep.db", 9); err != nil || handled {
 		t.Fatalf("below matched cutoff: handled=%v err=%v (want classic fallthrough)", handled, err)
 	}
+
+	// A single-segment pattern matches by BASENAME at any depth: the
+	// suite's contract is that "*.db" covers mix/a.db.
+	entry4 := extentTestEntry(big)
+	entry4.Path = "/mix/a.db"
+	if _, handled, err := cq.uploadExtentEntry(context.Background(), entry4, "/mix/a.db", 9); err != nil || !handled {
+		t.Fatalf("nested basename match: handled=%v err=%v (want extent)", handled, err)
+	}
 }
