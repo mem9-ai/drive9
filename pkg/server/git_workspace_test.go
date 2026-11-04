@@ -607,3 +607,68 @@ func TestGitWorkspaceDeleteRejectsOversizedIndex(t *testing.T) {
 		t.Fatalf("status = %q, want deleted", got.Status)
 	}
 }
+
+// Git state and overlay entries are inline content in this server: no object
+// reference is ever issued, so a caller-supplied one must be rejected instead
+// of being stored and later resolved.
+func TestGitStateAndOverlayRejectUnissuedStorageRef(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	ctx := context.Background()
+	c := client.New(ts.URL, "")
+	ws, err := c.UpsertGitWorkspace(ctx, client.GitWorkspaceRequest{
+		RootPath:   "/repo",
+		RepoURL:    "https://github.com/example/repo.git",
+		BaseCommit: "0123456789abcdef0123456789abcdef01234567",
+	})
+	if err != nil {
+		t.Fatalf("UpsertGitWorkspace: %v", err)
+	}
+
+	for _, ref := range []string{"blobs/other-file", "../../etc/passwd", "/etc/passwd"} {
+		if _, err := c.UpsertGitState(ctx, ws.WorkspaceID, client.GitStateRequest{
+			CheckpointCommit: "0123456789abcdef0123456789abcdef01234567",
+			StorageRef:       ref,
+		}); err == nil {
+			t.Fatalf("UpsertGitState accepted storage_ref %q", ref)
+		}
+		if _, err := c.PutGitOverlayEntry(ctx, ws.WorkspaceID, client.GitOverlayEntryRequest{
+			Path:       "a.txt",
+			Op:         "upsert",
+			Kind:       "file",
+			StorageRef: ref,
+		}); err == nil {
+			t.Fatalf("UpsertGitOverlayEntry accepted storage_ref %q", ref)
+		}
+	}
+
+	// A malformed base_object_sha must not reach git's argv later.
+	if _, err := c.PutGitOverlayEntry(ctx, ws.WorkspaceID, client.GitOverlayEntryRequest{
+		Path:          "a.txt",
+		Op:            "upsert",
+		Kind:          "file",
+		BaseObjectSHA: "--upload-pack=touch /tmp/pwned",
+	}); err == nil {
+		t.Fatal("UpsertGitOverlayEntry accepted an invalid base_object_sha")
+	}
+
+	// The supported inline shape still works.
+	if _, err := c.UpsertGitState(ctx, ws.WorkspaceID, client.GitStateRequest{
+		CheckpointCommit: "0123456789abcdef0123456789abcdef01234567",
+		StorageType:      "tar.gz-no-objects",
+		Content:          []byte("archive"),
+	}); err != nil {
+		t.Fatalf("UpsertGitState rejected the inline shape: %v", err)
+	}
+	if _, err := c.PutGitOverlayEntry(ctx, ws.WorkspaceID, client.GitOverlayEntryRequest{
+		Path:          "a.txt",
+		Op:            "upsert",
+		Kind:          "file",
+		BaseObjectSHA: "0123456789abcdef0123456789abcdef01234567",
+		Content:       []byte("hello"),
+	}); err != nil {
+		t.Fatalf("UpsertGitOverlayEntry rejected a valid entry: %v", err)
+	}
+}

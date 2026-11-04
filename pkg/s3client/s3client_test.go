@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mem9-ai/drive9/pkg/metrics"
 )
@@ -237,7 +238,10 @@ func TestLocalHandlerRangeReadSparseLargeObject(t *testing.T) {
 	c := newTestClient(t)
 
 	key := "blobs/sparse-large"
-	path := c.objectPath(key)
+	path, err := c.objectPath(key)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -258,7 +262,11 @@ func TestLocalHandlerRangeReadSparseLargeObject(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "/objects/"+key+"?range=2147483649-2147483649", nil)
+	presigned, err := c.PresignGetObjectRange(context.Background(), key, 2147483649, 2147483649, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := localPresignedRequest(t, presigned)
 	rec := httptest.NewRecorder()
 	c.Handler().ServeHTTP(rec, req)
 

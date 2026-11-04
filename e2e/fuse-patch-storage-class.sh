@@ -187,9 +187,14 @@ start_server() { # start_server <threshold>
     kill "$SERVER_PID" >/dev/null 2>&1 || true
     wait "$SERVER_PID" 2>/dev/null || true
   fi
+  # DRIVE9_METRICS_LISTEN is forced off: this harness starts its own
+  # short-lived server on a random API port, and the metrics listener has a fixed
+  # default port that a concurrently running drive9-server already holds, so an
+  # unset value would fail the bind and abort startup.
   env \
     DRIVE9_LISTEN_ADDR="$LISTEN_ADDR" \
     DRIVE9_PUBLIC_URL="$PUBLIC_URL" \
+    DRIVE9_METRICS_LISTEN="${DRIVE9_METRICS_LISTEN:-off}" \
     DRIVE9_TENANT_PROVIDER="${DRIVE9_TENANT_PROVIDER:-local}" \
     DRIVE9_LOCAL_DSN="$DRIVE9_LOCAL_DSN" \
     DRIVE9_META_DSN="${DRIVE9_META_DSN:-$DRIVE9_LOCAL_DSN}" \

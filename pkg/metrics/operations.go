@@ -374,15 +374,47 @@ func DeleteTenantGaugeWithOrg(tenantID, tidbCloudOrgID, component, name string) 
 	)
 }
 
+// boundedHTTPMethod maps an arbitrary request method onto the fixed label set
+// of the HTTP metrics. net/http accepts any token as a method, so an
+// attacker-chosen method such as "X1", "X2", ... would otherwise mint a new
+// Prometheus series per distinct string and grow the process's memory and
+// scrape payload without bound.
+func boundedHTTPMethod(method string) string {
+	method = strings.TrimSpace(method)
+	if method == "" {
+		// Keep the historical label for "no method" so existing queries and
+		// dashboards still match; every non-empty value is bounded.
+		return "UNKNOWN"
+	}
+	switch strings.ToUpper(method) {
+	case http.MethodGet:
+		return http.MethodGet
+	case http.MethodPost:
+		return http.MethodPost
+	case http.MethodPut:
+		return http.MethodPut
+	case http.MethodDelete:
+		return http.MethodDelete
+	case http.MethodPatch:
+		return http.MethodPatch
+	case http.MethodHead:
+		return http.MethodHead
+	case http.MethodOptions:
+		return http.MethodOptions
+	default:
+		return "OTHER"
+	}
+}
+
 func RecordHTTPRequest(method, route string, status int, d time.Duration) {
 	RegisterModule("server")
 	httpRequestsTotal.Add(1,
-		Attr("method", cleanMetricValue(method, "UNKNOWN")),
+		Attr("method", boundedHTTPMethod(method)),
 		Attr("route", cleanMetricValue(route, "other")),
 		Attr("status", strconv.Itoa(status)),
 	)
 	httpRequestDuration.Observe(d.Seconds(),
-		Attr("method", cleanMetricValue(method, "UNKNOWN")),
+		Attr("method", boundedHTTPMethod(method)),
 		Attr("route", cleanMetricValue(route, "other")),
 	)
 }
@@ -390,7 +422,7 @@ func RecordHTTPRequest(method, route string, status int, d time.Duration) {
 func RecordHTTPRequestBodyRead(method, route string, status int, bodyBytes int64, d time.Duration) {
 	RegisterModule("server")
 	httpRequestBodyReadDuration.Observe(d.Seconds(),
-		Attr("method", cleanMetricValue(method, "UNKNOWN")),
+		Attr("method", boundedHTTPMethod(method)),
 		Attr("route", cleanMetricValue(route, "other")),
 		Attr("status_class", statusClass(status)),
 		Attr("body_size_bucket", bodySizeBucket(bodyBytes)),
@@ -404,7 +436,7 @@ func RecordHTTPRequestBodyRead(method, route string, status int, bodyBytes int64
 func RecordHTTPRequestCount(method, route string, status int) {
 	RegisterModule("server")
 	httpRequestsTotal.Add(1,
-		Attr("method", cleanMetricValue(method, "UNKNOWN")),
+		Attr("method", boundedHTTPMethod(method)),
 		Attr("route", cleanMetricValue(route, "other")),
 		Attr("status", strconv.Itoa(status)),
 	)

@@ -82,19 +82,22 @@ func uploadBufferedRemoteFile(ctx context.Context, c *client.Client, remotePath 
 }
 
 func uploadBufferedRemoteFileWithRevision(ctx context.Context, c *client.Client, remotePath string, data []byte, expectedRevision int64) (int64, error) {
-	// The checksum-carrying variant re-reads the committed Stat and reports
-	// the server's revision: callers downstream (landed records, watermark
-	// bookkeeping) must never fall back to expected+1 for a landed row —
-	// that fabrication understates the revision and poisons every
-	// same-origin proof built on it.
-	st, err := c.WriteStreamConditionalWithChecksum(ctx, remotePath, bytes.NewReader(data), int64(len(data)), nil, expectedRevision, "")
-	if err != nil {
+	// Small payloads take the direct conditional PUT (#1077): its response
+	// carries the revision the server assigned to THESE bytes — the only
+	// kind of revision a landed record may be built on. Larger payloads
+	// stream, and the stream protocol reports no revision; the committed
+	// re-read is NOT an acceptable substitute (a foreign commit between
+	// our upload and the HEAD would hand back its revision), so streaming
+	// landings report 0 and the caller records no payload identity for
+	// them — conservative, exactly like the ledger track.
+	threshold := c.CachedSmallFileThreshold()
+	if len(data) == 0 || (threshold > 0 && int64(len(data)) < threshold) {
+		return c.WriteCtxConditionalWithRevision(ctx, remotePath, data, expectedRevision)
+	}
+	if err := c.WriteStreamConditional(ctx, remotePath, bytes.NewReader(data), int64(len(data)), nil, expectedRevision); err != nil {
 		return 0, err
 	}
-	if st == nil {
-		return 0, nil
-	}
-	return st.Revision, nil
+	return 0, nil
 }
 
 // isInlineShadowUpload is shared by the ordinary uploader and combined-mode

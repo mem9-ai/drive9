@@ -327,7 +327,28 @@ func (rt *forkCleanupTestRuntime) insertTenantWithProvider(t *testing.T, id stri
 	}); err != nil {
 		t.Fatal(err)
 	}
+	// A fork is billable only when its source is bound to an organization, so
+	// the shared fixture binds it the way real provisioning does. The binding's
+	// unique key is (organization, cluster, branch) and the store takes the
+	// branch dimension from the tenant row, so a branchless fixture tenant needs
+	// its own cluster id or two of them collide.
+	bindingClusterID := "cluster-a"
+	if branchID == "" {
+		bindingClusterID = "fixture-cluster-" + id
+	}
+	if err := rt.meta.UpsertTenantTiDBCloudOrgBinding(ctx, &meta.TenantTiDBCloudOrgBinding{
+		TenantID:       id,
+		OrganizationID: forkTestOrganizationID,
+		ClusterID:      bindingClusterID,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}); err != nil {
+		t.Fatal(err)
+	}
 }
+
+// forkTestOrganizationID is the organization the fork fixtures bill to.
+const forkTestOrganizationID = "org-fork-test"
 
 func waitForCondition(t *testing.T, fn func() bool) {
 	t.Helper()
@@ -1059,14 +1080,19 @@ func TestCreateForkTenantPersistsPrivateEndpointDBTLS(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		envValue   string
+		skipVerify bool
 		wantDBTLS  bool
 		wantDSNTLS string
 	}{
 		{name: "public_endpoint_uses_tls", envValue: "", wantDBTLS: true, wantDSNTLS: "tls=true"},
-		{name: "private_endpoint_skips_verify", envValue: "1", wantDBTLS: false, wantDSNTLS: "tls=skip-verify"},
+		{name: "private_endpoint_verifies_tls", envValue: "1", wantDBTLS: true, wantDSNTLS: "tls=true"},
+		{name: "private_endpoint_explicit_skip_verify", envValue: "1", skipVerify: true, wantDBTLS: false, wantDSNTLS: "tls=skip-verify"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("DRIVE9_TIDBCLOUD_NATIVE_USE_PRIVATE_ENDPOINT", tc.envValue)
+			if tc.skipVerify {
+				t.Setenv(tenant.EnvDBTLSSkipVerify, "1")
+			}
 
 			rt := newForkCleanupTestRuntime(t)
 			rt.prov.provider = tenant.ProviderTiDBCloudNative
@@ -1141,5 +1167,57 @@ func TestProvisionForkTenantAsyncWithProvisionCallsProvisionClosure(t *testing.T
 	}
 	if !called {
 		t.Fatal("provision closure was not invoked")
+	}
+}
+
+// Only a TiDB Cloud native source must be bound: it is the only provider whose
+// forks are billed, and refusing an unbound starter fork would remove a
+// supported operation rather than close a billing gap.
+func TestForkSourceOrganizationRequiresBindingForNativeOnly(t *testing.T) {
+	rt := newForkCleanupTestRuntime(t)
+	ctx := context.Background()
+
+	// Native source without a binding is refused.
+	rt.insertTenantWithProvider(t, "native-unbound", meta.TenantActive, meta.TenantKindLive, "", "ns-parent", "", tenant.ProviderTiDBCloudNative)
+	if _, err := rt.meta.DB().ExecContext(ctx, `DELETE FROM tenant_tidbcloud_org_bindings WHERE tenant_id = ?`, "native-unbound"); err != nil {
+		t.Fatal(err)
+	}
+	src, err := rt.meta.GetTenant(ctx, "native-unbound")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rt.server.forkSourceOrganization(ctx, src); err == nil {
+		t.Fatal("unbound native source was accepted")
+	}
+
+	// Starter legacy source keeps its previous behaviour.
+	rt.insertTenantWithProvider(t, "starter-unbound", meta.TenantActive, meta.TenantKindLive, "", "ns-parent", "", tenant.ProviderTiDBCloudStarterLegacy)
+	if _, err := rt.meta.DB().ExecContext(ctx, `DELETE FROM tenant_tidbcloud_org_bindings WHERE tenant_id = ?`, "starter-unbound"); err != nil {
+		t.Fatal(err)
+	}
+	starter, err := rt.meta.GetTenant(ctx, "starter-unbound")
+	if err != nil {
+		t.Fatal(err)
+	}
+	orgID, err := rt.server.forkSourceOrganization(ctx, starter)
+	if err != nil {
+		t.Fatalf("starter source rejected: %v", err)
+	}
+	if orgID != "" {
+		t.Fatalf("starter source org = %q, want none", orgID)
+	}
+
+	// A bound native source returns its organization.
+	rt.insertLiveTenantWithProvider(t, "native-bound", tenant.ProviderTiDBCloudNative)
+	bound, err := rt.meta.GetTenant(ctx, "native-bound")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := rt.server.forkSourceOrganization(ctx, bound)
+	if err != nil {
+		t.Fatalf("bound native source rejected: %v", err)
+	}
+	if got != forkTestOrganizationID {
+		t.Fatalf("org = %q, want %q", got, forkTestOrganizationID)
 	}
 }

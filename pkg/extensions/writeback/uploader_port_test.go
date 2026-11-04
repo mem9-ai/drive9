@@ -1004,11 +1004,6 @@ func TestWriteBackUploader_OnSuccessInfersStreamRevision(t *testing.T) {
 			w.WriteHeader(http.StatusOK)
 		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/u1/complete":
 			w.WriteHeader(http.StatusOK)
-		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/existing.txt":
-			// The committed re-read: the uploader records the landing from
-			// the server's own revision, never an expected+1 fabrication.
-			w.Header().Set("X-Dat9-Revision", "24")
-			w.WriteHeader(http.StatusOK)
 		default:
 			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
 		}
@@ -1041,7 +1036,7 @@ func TestWriteBackUploader_OnSuccessInfersStreamRevision(t *testing.T) {
 		t.Fatalf("OnSuccess path = %q, want /existing.txt", successMeta.Path)
 	}
 	if successRev != 24 {
-		t.Fatalf("OnSuccess committedRev = %d, want 24 from the committed re-read", successRev)
+		t.Fatalf("OnSuccess committedRev = %d, want 24 from CAS base revision", successRev)
 	}
 }
 

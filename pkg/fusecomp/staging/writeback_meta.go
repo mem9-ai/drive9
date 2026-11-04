@@ -663,6 +663,39 @@ func (c *WriteBackCache) RebaseBaseRevIfGeneration(remotePath string, generation
 	return true
 }
 
+// RebasePendingNew carries a real create's revision to a newer pending image.
+func (c *WriteBackCache) RebasePendingNew(remotePath string, baseRev int64) error {
+	if baseRev <= 0 {
+		return nil
+	}
+	pl := c.AcquirePathLock(remotePath)
+	defer c.ReleasePathLock(remotePath, pl)
+
+	c.mu.Lock()
+	meta, ok := c.metas[remotePath]
+	if !ok || meta.Kind != PendingNew || meta.BaseRev != 0 {
+		c.mu.Unlock()
+		return nil
+	}
+	updated := cloneWriteBackMeta(meta)
+	updated.Kind = PendingOverwrite
+	updated.BaseRev = baseRev
+	updated.Generation = c.nextGen.Add(1)
+	c.mu.Unlock()
+
+	metaBytes, err := json.Marshal(updated)
+	if err != nil {
+		return fmt.Errorf("writeback marshal create acknowledgement: %w", err)
+	}
+	if err := atomicWrite(c.MetaFile(remotePath), metaBytes); err != nil {
+		return fmt.Errorf("writeback persist create acknowledgement: %w", err)
+	}
+	c.mu.Lock()
+	c.metas[remotePath] = &updated
+	c.mu.Unlock()
+	return nil
+}
+
 // MarkChmodPending records that data has reached the remote server and only
 // the chmod step remains. The generation guard prevents an old upload from
 // overwriting metadata for a newer local write.

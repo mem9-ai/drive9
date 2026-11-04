@@ -861,14 +861,6 @@ func (s *Server) observe(next http.Handler, w http.ResponseWriter, r *http.Reque
 	logger.Info(r.Context(), "http_request", fields...)
 }
 
-func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	s.metrics.writePrometheus(w)
-}
-
 func normalizeTenantMetricTiDBCloudOrgID(orgID string) string {
 	orgID = strings.TrimSpace(orgID)
 	if orgID == "" {

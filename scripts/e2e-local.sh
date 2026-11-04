@@ -275,6 +275,9 @@ start_server() {
   export DRIVE9_LISTEN_ADDR="$LISTEN_ADDR"
   export DRIVE9_PUBLIC_URL="${DRIVE9_PUBLIC_URL:-http://$LISTEN_ADDR}"
   export DRIVE9_TENANT_PROVIDER="${DRIVE9_TENANT_PROVIDER:-local}"
+  # The Git suites clone a fixture repository created on this host; the server
+  # rejects local repository URLs unless this opt-in is set.
+  export DRIVE9_GIT_ALLOW_LOCAL_REPOS="${DRIVE9_GIT_ALLOW_LOCAL_REPOS:-1}"
   # A local object store has no STS, so the extent data plane needs the static-key
   # fallback; the server refuses it without this explicit opt-in.
   export DRIVE9_EXTENT_ALLOW_STATIC_CREDENTIALS="${DRIVE9_EXTENT_ALLOW_STATIC_CREDENTIALS:-1}"

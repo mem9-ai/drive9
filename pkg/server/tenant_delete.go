@@ -186,6 +186,19 @@ func writeTenantDeleteStatus(w http.ResponseWriter, status meta.TenantStatus) {
 }
 
 func (s *Server) deprovisionTenantCluster(ctx context.Context, t *meta.Tenant, req tenant.CredentialProvisionRequest) error {
+	// A fork (or any native tenant whose row carries a branch) must never be
+	// deprovisioned as a cluster: the tenant row stores the SOURCE tenant's
+	// cluster_id, so the delete would destroy the live parent and every sibling
+	// fork while leaking the branch. Fork cleanup goes through
+	// deleteFailedForkBranch / the branch provisioner instead. The local
+	// provisioner is excluded: its standalone database carries a synthetic
+	// "main" branch and must still be dropped by name.
+	if t.Kind == meta.TenantKindFork && t.Provider != tenant.ProviderLocal {
+		return fmt.Errorf("refusing to deprovision cluster %s for fork tenant %s: delete the branch instead", t.ClusterID, t.ID)
+	}
+	if t.Provider != tenant.ProviderLocal && t.Provider != tenant.ProviderTiDBZero && strings.TrimSpace(t.BranchID) != "" {
+		return fmt.Errorf("refusing to deprovision cluster %s for branch-backed tenant %s (branch %s)", t.ClusterID, t.ID, t.BranchID)
+	}
 	cluster := clusterInfoFromTenant(t)
 	switch t.Provider {
 	case tenant.ProviderTiDBCloudNative:
