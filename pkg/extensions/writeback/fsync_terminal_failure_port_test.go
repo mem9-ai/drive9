@@ -1371,7 +1371,7 @@ func TestPortRenameKeepsFreshOpenerStagedDuringResponse(t *testing.T) {
 	// The delayed response arrives NOW: the fresh opener's publication
 	// predates it, and only the revision fence can tell the incarnations
 	// apart.
-	if _, err := wb.retargetQueuedImage("/inc-src.txt", "/inc-dst.txt", renameFence{movedAt: time.Now(), oldRev: srcRev + 1000, oldRevSet: true}); err == nil {
+	if _, err := wb.retargetQueuedImage("/inc-src.txt", "/inc-dst.txt", renameFence{movedAt: time.Now()}); err == nil {
 		t.Fatal("the move retired a fresh opener's publication that predates the response")
 	}
 
@@ -1597,9 +1597,9 @@ func TestPortRenameCarriesPublicationFromRetargetGap(t *testing.T) {
 	if err := wb.opts.Client.RenameCtx(ctx, wb.remotePath("/gap-src.txt"), wb.remotePath("/gap-dst.txt")); err != nil {
 		t.Fatal(err)
 	}
-	// First pass: the clean rename's transition (dstOldRev mirrors the
-	// handler's pre-RPC destination stat; the destination is absent here).
-	fence := renameFence{movedAt: time.Now(), oldRevSet: true}
+	// First pass: the clean rename's transition (dstPreGen mirrors the
+	// handler's pre-RPC destination snapshot; the destination is absent).
+	fence := renameFence{movedAt: time.Now()}
 	installedGen, terr := wb.retargetConflictMarkers(ctx, "/gap-src.txt", "/gap-dst.txt", fence, false)
 	if terr != nil {
 		t.Fatalf("first transition pass: %v", terr)
@@ -1616,7 +1616,7 @@ func TestPortRenameCarriesPublicationFromRetargetGap(t *testing.T) {
 	// The handle retarget: publications now go to the new name only.
 	wb.retarget("/gap-src.txt", "/gap-dst.txt")
 	// The handler's second pass: the stranded old-name publication moves.
-	secondFence := renameFence{movedAt: fence.movedAt, oldRevSet: true, ownGen: installedGen}
+	secondFence := renameFence{movedAt: fence.movedAt, ownGen: installedGen}
 	secondWork := (wb.queue != nil && wb.queue.HasPath("/gap-src.txt")) || wb.everLanded("/gap-src.txt")
 	if !secondWork {
 		t.Fatal("the gap publication was not detected as in-window work")
@@ -1776,66 +1776,64 @@ func landChild(t *testing.T, ch *fs.Chain, path, content string) error {
 	return h.Sync(context.Background())
 }
 
-// TestDstProtectedLineageRules pins the incarnation classifier's
-// positive-proof rule directly: retiring a destination entry requires proof
-// it belongs to the replaced incumbent — a create-shaped base (a pre-rename
-// opener; post-rename openers always find the renamed object and stage over
-// its revision) or the replaced object's actual pre-rename revision. Any
-// other revisioned entry is protected, with or without a known old
-// revision, and the rename's own installation is replaceable only by its
-// own second pass.
+// TestDstProtectedLineageRules pins the incarnation classifier's identity
+// rule directly: retiring a destination entry requires its pending
+// GENERATION to equal the pre-RPC snapshot of that same path — generations
+// come from one global counter, so the match proves the entry is the very
+// one that existed before the rename (the replaced incumbent's). Revisions
+// cannot do this (per-inode counters collide across objects; a post-rename
+// opener can even stage create-shaped), so every non-matching generation —
+// including fresh openers under any revision, and children without a
+// snapshot — stays protected, and the rename's own installation is
+// replaceable only by its own second pass.
 func TestDstProtectedLineageRules(t *testing.T) {
 	fb := &failingWritesBackend{backend: testbackend.NewBackend()}
 	_, wb := newUploadStack(t, fb, Options{Policy: PolicyWriteBack})
 
-	const (
-		oldIncumbentRev = int64(7)
-		freshOpenerRev  = int64(11)
-		advancedRev     = int64(12)
-	)
-	stage := func(path string, baseRev int64) uint64 {
+	stage := func(path string) uint64 {
 		t.Helper()
-		gen, err := wb.opts.Staging.Pending.PutWithBaseRev(path, 3, staging.PendingOverwrite, baseRev)
+		gen, err := wb.opts.Staging.Pending.Put(path, 3, staging.PendingOverwrite)
 		if err != nil {
 			t.Fatal(err)
 		}
 		return gen
 	}
-	// Stage everything first, then set movedAt: no entry may win on
-	// CreatedAt — the rows below exercise the proof rules alone.
-	stage("/createshape.txt", 0)
-	stage("/incumbent.txt", oldIncumbentRev)
-	freshGen := stage("/fresh.txt", freshOpenerRev)
+	preGen := stage("/pre.txt") // existed before the rename
+	stage("/fresh.txt")         // published during the window
+	// movedAt AFTER the stagings: no entry may win on CreatedAt.
 	now := time.Now()
 
-	// A create-shaped base is provably a pre-rename opener's: replaceable
-	// even with no old revision known (children).
-	if _, _, _, protected := wb.dstProtected("/createshape.txt", renameFence{movedAt: now}); protected {
-		t.Fatal("a create-shaped destination entry was classified protected")
+	// The snapshotted generation is provably the pre-rename entry:
+	// replaceable even under an advanced destination revision.
+	if _, _, _, protected := wb.dstProtected("/pre.txt", renameFence{movedAt: now, preGen: map[string]uint64{"/pre.txt": preGen}}); protected {
+		t.Fatal("the snapshotted pre-rename entry was classified protected")
 	}
 
-	// A staging over the replaced object's actual revision is provably the
-	// old incumbent's, even though the destination has advanced beyond it.
-	if _, _, _, protected := wb.dstProtected("/incumbent.txt", renameFence{movedAt: now, oldRev: oldIncumbentRev, oldRevSet: true}); protected {
-		t.Fatal("a staging over the replaced object's revision was classified protected")
+	// Any other generation — a fresh publication during the window, whatever
+	// revision it carries — stays protected, and so does everything when the
+	// path has no snapshot at all (children without one).
+	if _, _, _, protected := wb.dstProtected("/fresh.txt", renameFence{movedAt: now, preGen: map[string]uint64{"/pre.txt": preGen}}); !protected {
+		t.Fatal("an entry published during the window was retired without identity proof")
 	}
-
-	// A fresh opener's revision (or any revision the fence cannot prove old)
-	// stays protected with and without a known old revision — the renamed
-	// lineage's revisions are not inferable from the source or the current
-	// state.
-	if _, _, _, protected := wb.dstProtected("/fresh.txt", renameFence{movedAt: now, oldRev: oldIncumbentRev, oldRevSet: true}); !protected {
-		t.Fatal("a revisioned destination entry was retired without positive old proof")
-	}
-	if _, _, _, protected := wb.dstProtected("/fresh.txt", renameFence{movedAt: now, oldRev: advancedRev, oldRevSet: true}); !protected {
-		t.Fatal("matching the ADVANCED current revision was treated as old proof")
+	if _, _, _, protected := wb.dstProtected("/fresh.txt", renameFence{movedAt: now}); !protected {
+		t.Fatal("an entry without a snapshot was retired without identity proof")
 	}
 
 	// The rename's own installation is replaceable — by exactly its own
 	// second pass.
-	if _, _, _, protected := wb.dstProtected("/fresh.txt", renameFence{movedAt: now, oldRev: oldIncumbentRev, oldRevSet: true, ownGen: freshGen}); protected {
+	if _, _, _, protected := wb.dstProtected("/fresh.txt", renameFence{movedAt: now, ownGen: wb.genOf(t, "/fresh.txt")}); protected {
 		t.Fatal("the rename's own installation was not replaceable by its second pass")
 	}
+}
+
+// genOf reads a path's current pending generation for fence assertions.
+func (w *Writeback) genOf(t *testing.T, path string) uint64 {
+	t.Helper()
+	m, ok := w.opts.Staging.Pending.GetMeta(path)
+	if !ok || m == nil {
+		t.Fatalf("no pending entry at %s", path)
+	}
+	return m.Generation
 }
 
 // TestPortDirRenameCatchesChildLandedInRetargetGap pins the directory
@@ -1899,7 +1897,7 @@ func TestPortDirRenameCatchesChildLandedInRetargetGap(t *testing.T) {
 
 	// The handle retarget and the handler's post-retarget settlement.
 	wb.retarget("/d", "/e")
-	wb.settleOldPrefixAfterMove(ctx, &fs.Op{Kind: fs.OpRename, Path: "/d", Path2: "/e"}, time.Now(), map[string]bool{})
+	wb.settleOldPrefixAfterMove(ctx, &fs.Op{Kind: fs.OpRename, Path: "/d", Path2: "/e"}, time.Now(), nil, map[string]bool{})
 
 	if err := wb.queue.PathTerminalFailure("/e/f"); err == nil {
 		t.Fatal("the gap-completed child left no failure witness at the new prefix")
@@ -1907,4 +1905,33 @@ func TestPortDirRenameCatchesChildLandedInRetargetGap(t *testing.T) {
 	if got, ok := nodeString(fb.backend, "/e/f"); !ok || got != "child v1" {
 		t.Fatalf("remote image at the new prefix = %q ok=%v, want the stale pre-successor bytes", got, ok)
 	}
+}
+
+// TestSettleOldPrefixWithoutLedger pins the write-sync configuration:
+// mount.go wires a staging ledger only for writeback/close-sync, so
+// PolicyWriteSync runs with Staging == nil. An inline child write that
+// completes under the old prefix after the watermark wipe leaves a landed
+// watermark, and the post-move settlement must handle it without
+// dereferencing the absent ledger — surfacing an old-name landing instead
+// of panicking after the remote rename already succeeded.
+func TestSettleOldPrefixWithoutLedger(t *testing.T) {
+	fb := &failingWritesBackend{backend: testbackend.NewBackend()}
+	ts := httptest.NewServer(fb)
+	t.Cleanup(ts.Close)
+	c := newTestClient(ts.URL)
+	c.Warm(context.Background())
+	wb, err := New(Options{Policy: PolicyWriteSync, Client: c})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wb.opts.Staging != nil {
+		t.Fatal("write-sync must run without a staging ledger for this row")
+	}
+
+	// The in-window child landing: only the watermark remains (no pending
+	// entry exists to move), exactly what the fresh scan finds.
+	wb.landedAt("/d/f", 7, 7)
+	op := &fs.Op{Kind: fs.OpRename, Path: "/d", Path2: "/e"}
+	// Must not panic on the nil ledger.
+	wb.settleOldPrefixAfterMove(context.Background(), op, time.Now(), nil, map[string]bool{})
 }
