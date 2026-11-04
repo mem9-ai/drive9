@@ -927,17 +927,37 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 			// (and possibly a classic layout), and marking the handle
 			// classic-owned off it would let this descriptor write into
 			// a foreign file.
-			if savedID == "" || nst.ResourceID != savedID {
-				// No echoed identity means NO evidence attributes this
-				// Stat's occupant to our completion: a replacement (of
-				// either layout — a matching extent layout establishes
-				// nothing) is indistinguishable from our own object. The
-				// pending state stays refused on every retry until a
-				// completion supplies the identity.
+			if savedID != "" && nst.ResourceID != savedID {
+				// The echo names OUR object and this Stat describes
+				// another: a replacement, whatever its layout.
+				b.mu.Lock()
+				b.layoutPending[ino] = true
+				b.mu.Unlock()
+				return fmt.Errorf("verify landed layout of %s: occupant replaced our upload", path)
+			}
+			if savedID == "" && (nst.ContentLayout != client.ContentLayoutExtent || nst.ResourceID == "") {
+				// No echoed identity: an ordinary successful create still
+				// needs a usable outcome, so an EXTENT occupant carrying a
+				// stat-visible identity continues — but only by BINDING
+				// that identity (below): every later publication of this
+				// descriptor verifies it, so a replacement landing later
+				// is rejected at the PATCH instead of silently adopted.
+				// A classic occupant, or one with no identity at all,
+				// stays refused: nothing could ever re-verify it.
 				b.mu.Lock()
 				b.layoutPending[ino] = true
 				b.mu.Unlock()
 				return fmt.Errorf("verify landed layout of %s: occupant not attributable to our upload", path)
+			}
+			if savedID == "" {
+				// The echo-less continuation only works because this
+				// identity BINDS: record it now so every later publication
+				// of the descriptor carries it as the PATCH's expected
+				// resource (a replacement then fails the identity check
+				// instead of receiving our bytes).
+				b.mu.Lock()
+				b.layoutPendingID[ino] = nst.ResourceID
+				b.mu.Unlock()
 			}
 			landedID = nst.ResourceID
 			classic = nst.ContentLayout != client.ContentLayoutExtent
@@ -974,8 +994,11 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 	mode := b.modes[ino]
 	delete(b.commitErr, ino) // a successful landing resolves the memory
 	delete(b.verifyBase, ino)
-	delete(b.layoutPendingID, ino)
 	delete(b.layoutPending, ino)
+	// layoutPendingID SURVIVES the landing: it is the identity binding
+	// for every later publication of this descriptor (the PATCH's
+	// expected-resource), not merely the pending-classification proof.
+	// It is dropped with the inode mapping itself (abandon/forget).
 	b.mu.Unlock()
 	b.surgicalDeletePending(ino, pending)
 	b.releaseCommitted(ino, pending)
@@ -2052,6 +2075,7 @@ func (b *Bridge) peekVerifyBase(ino meta.Ino) (verifyBase, bool) {
 // replaced: the staged data must never reach a later unconstrained
 // publication.
 func (b *Bridge) abandonIno(ino meta.Ino) {
+
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	delete(b.verifyBase, ino)

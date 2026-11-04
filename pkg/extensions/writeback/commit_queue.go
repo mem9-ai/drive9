@@ -766,6 +766,38 @@ func (cq *CommitQueue) CancelPathPreserveLocal(path string) error {
 	return cq.cancelPath(path, true)
 }
 
+// CancelEntryInFlight cancels EXACTLY the given entry — the targeted
+// counterpart of the pathname-wide CancelPath* family. Used by a staging
+// that observed the unlink marking after its enqueue: the name may have
+// been recreated by the time this runs, so nothing but this entry may be
+// touched (no pathname sweep, no journal fence — the unlink's own cancel
+// owns those).
+func (cq *CommitQueue) CancelEntryInFlight(entry *CommitEntry) {
+	if cq == nil || entry == nil {
+		return
+	}
+	cq.mu.Lock()
+	entry.canceled = true
+	cancel := entry.cancelCommit
+	if cancel == nil {
+		// Not picked up by a worker yet: remove it from the waitable
+		// sets under the lock; a worker that already dequeued it observes
+		// the canceled flag on its own checks.
+		cq.stopDelayedLocked(entry)
+		for i, e := range cq.queue {
+			if e == entry {
+				cq.queue = append(cq.queue[:i], cq.queue[i+1:]...)
+				break
+			}
+		}
+		delete(cq.immediate, entry)
+	}
+	cq.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
 // CancelPathIfInode cancels queued or in-flight uploads for path whose entries
 // were staged by the given inode, leaving entries owned by other inodes (e.g.
 // a replacement file that reused the pathname after an unlink) untouched.

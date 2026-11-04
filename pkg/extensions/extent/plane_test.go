@@ -53,6 +53,7 @@ type fakeV2 struct {
 	lastPatch  *fakePatch // the open PATCH session, applied at /complete
 
 	readEchoOff      bool   // classic GETs omit the identity echo (redirect shape); HEADs keep it
+	completeEcho     bool   // complete responses echo the landed identity (default on)
 	readEchoOverride string // classic GETs echo this instead of the stored id
 	readBodyOverride string // classic GETs serve these bytes instead of the stored content
 }
@@ -102,9 +103,15 @@ func (f *fakeV2) applyPatchLocked() {
 	f.blocks[sha256Hex(content)] = append([]byte(nil), content...)
 }
 
+func (f *fakeV2) completeEchoOff() {
+	f.mu.Lock()
+	f.completeEcho = false
+	f.mu.Unlock()
+}
+
 func newFakeV2(t *testing.T) *fakeV2 {
 	t.Helper()
-	f := &fakeV2{extent: map[string]string{}, classic: map[string]string{}, dirs: map[string]bool{"/": true}, blocks: map[string][]byte{}, ids: map[string]string{}, statFail: map[string]bool{}, gateOnce: map[string]chan struct{}{}, gateHits: map[string]int{}}
+	f := &fakeV2{extent: map[string]string{}, classic: map[string]string{}, dirs: map[string]bool{"/": true}, blocks: map[string][]byte{}, ids: map[string]string{}, statFail: map[string]bool{}, gateOnce: map[string]chan struct{}{}, gateHits: map[string]int{}, completeEcho: true}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/obj/", func(w http.ResponseWriter, r *http.Request) {
 		key := strings.TrimPrefix(r.URL.Path, "/obj/")
@@ -241,6 +248,20 @@ func newFakeV2(t *testing.T) *fakeV2 {
 				DirtyBlocks []client.ExtentDirtyBlock `json:"dirty_blocks"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&body)
+			// The wire contract mirrors initiate: a PATCH bound to an
+			// expected resource refuses (412) when the path's occupant is
+			// a different object — the identity check real servers run at
+			// the extent-maintenance layer.
+			if exp := r.Header.Get("X-Dat9-Expected-Resource"); exp != "" {
+				f.mu.Lock()
+				occupant := f.ids[path]
+				f.mu.Unlock()
+				if occupant != "" && occupant != exp {
+					w.WriteHeader(http.StatusPreconditionFailed)
+					_, _ = w.Write([]byte(`{"error":"resource mismatch"}`))
+					return
+				}
+			}
 			f.mu.Lock()
 			f.patches++
 			f.patchPaths = append(f.patchPaths, path)
@@ -441,7 +462,11 @@ func newFakeV2(t *testing.T) *fakeV2 {
 			if os.Getenv("EXTENT_DBG_ID") != "" {
 				fmt.Println("FAKE COMPLETE echo:", landedID, "path:", landedPath)
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"status": "completed", "resource_id": landedID, "revision": f.completes})
+			completion := map[string]any{"status": "completed", "revision": f.completes}
+			if f.completeEcho {
+				completion["resource_id"] = landedID
+			}
+			_ = json.NewEncoder(w).Encode(completion)
 			return
 		}
 		http.Error(w, "bad upload route", http.StatusNotFound)
@@ -4446,5 +4471,72 @@ func TestOverlayDecisionAtomicWithPendingCheck(t *testing.T) {
 	}
 	if got := readFront(t, eh, 4); got != "ZYAA" {
 		t.Fatalf("post-pressure read = %q, want ZYAA (Y is still pending; its image must stay protected)", got)
+	}
+}
+
+// Round-46: a completion without the optional identity echo still leaves
+// a fresh extent create USABLE — an extent classification with a
+// stat-visible identity binds that identity, and every later PATCH of
+// the descriptor verifies it (a replacement is rejected at the PATCH,
+// not silently adopted). A classic occupant without an echo stays
+// refused on every retry.
+func TestEcholessExtentCreateBindsStatIdentity(t *testing.T) {
+	f := newFakeV2(t)
+	f.mu.Lock()
+	f.completeEcho = false
+	f.mu.Unlock()
+	f.setDir("/d", true)
+	h := newTestHandler(t, f, 0)
+	res, _, _ := dispatchCreate(context.Background(), h, "/d/n.bin", syscall.O_RDWR|syscall.O_CREAT)
+	eh := res.Handle.(*engineHandle)
+	if err := eh.Write(context.Background(), 0, []byte("AAAA")); err != nil {
+		t.Fatal(err)
+	}
+	// First flush: no echo, but the (extent) fake's stat identity binds.
+	if err := eh.Flush(context.Background()); err != nil {
+		t.Fatalf("echo-less extent create must stay usable: %v", err)
+	}
+	if got := f.contentOf("/d/n.bin"); got != "AAAA" {
+		t.Fatalf("content = %q, want AAAA", got)
+	}
+	// The binding constrains later writes: a replacement at the path is
+	// rejected at the PATCH (identity mismatch) and the descriptor is
+	// abandoned — the engine's sticky-error semantics surface that on the
+	// next descriptor operation, and the replacement's bytes are never
+	// touched.
+	f.remove("/d/n.bin")
+	f.seedExtent(t, "/d/n.bin", "OTHER!")
+	if err := eh.Write(context.Background(), 0, []byte("ZZZZ")); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.contentOf("/d/n.bin"); got != "OTHER!" {
+		t.Fatalf("replacement = %q, want OTHER! untouched", got)
+	}
+	if _, err := eh.Read(context.Background(), 0, make([]byte, 4)); err == nil {
+		t.Fatal("the abandoned descriptor must stop serving after the identity refusal")
+	}
+}
+
+// The classic mirror: no echo and a classic occupant refuses on every
+// retry — the descriptor never adopts it.
+func TestEcholessClassicOccupantRefusedOnRetries(t *testing.T) {
+	f := newFakeV2(t)
+	f.setLegacy(true)
+	f.mu.Lock()
+	f.completeEcho = false
+	f.mu.Unlock()
+	f.setDir("/d", true)
+	h := newTestHandler(t, f, 0)
+	res, _, _ := dispatchCreate(context.Background(), h, "/d/c.bin", syscall.O_RDWR|syscall.O_CREAT)
+	eh := res.Handle.(*engineHandle)
+	if err := eh.Write(context.Background(), 0, []byte("AAAA")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Flush(context.Background()); err == nil {
+		t.Fatal("an echo-less completion over a classic occupant must refuse")
+	}
+	// Retrying keeps refusing; nothing is adopted.
+	if err := eh.Sync(context.Background()); err == nil {
+		t.Fatal("the refusal must persist across retries")
 	}
 }

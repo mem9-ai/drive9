@@ -351,9 +351,13 @@ type bufferingHandle struct {
 	// makes the live image diverge from what landed.
 	stagedContentVersion uint64
 	// selfCancelAfterStaging records (under h.mu) that a staging observed
-	// the unlink marking after its enqueue: its outer wrapper then cancels
-	// the just-enqueued entry outside the staging path lock.
+	// the unlink marking after its enqueue; selfCancelEntry is THAT
+	// staging's own queue entry. The outer wrapper cancels exactly this
+	// entry outside the staging path lock — a pathname-wide cancel there
+	// would also kill a replacement's in-flight publication after a
+	// same-name recreation.
 	selfCancelAfterStaging bool
+	selfCancelEntry        *CommitEntry
 	// stagedSnapshotRegs is the set of snapshot IDs this handle has
 	// registered under w.liveSnapshots (atomic map copy): entries are
 	// consumed by their landings and the remainder is dropped at untrack.
@@ -4324,16 +4328,20 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 		return stagedSnapshot, err
 	}
 	// The staging path lock is released here (the inner function's defer
-	// has run): a marking observed by the inner recheck cancels its own
-	// just-enqueued entry now, without re-entering the non-reentrant lock
-	// the staging held. The unlink's own sweep races harmlessly — the
-	// entry is either canceled here or by it, never left enqueued.
+	// has run). A marking observed by the inner recheck cancels EXACTLY
+	// this staging's own entry — a pathname-wide cancel would also kill a
+	// replacement's in-flight publication after the name was recreated,
+	// and would journal a pathname-wide unlink fence over its frames. The
+	// unlink's own sweep races harmlessly: this entry is canceled by one
+	// side or the other, never left enqueued, and nothing else is touched.
 	h.mu.Lock()
 	selfCancel := h.selfCancelAfterStaging
+	entry := h.selfCancelEntry
 	h.selfCancelAfterStaging = false
+	h.selfCancelEntry = nil
 	h.mu.Unlock()
-	if selfCancel && h.w.queue != nil {
-		_ = h.w.queue.CancelPathPreserveLocal(h.path)
+	if selfCancel && entry != nil && h.w.queue != nil {
+		h.w.queue.CancelEntryInFlight(entry)
 	}
 	return stagedSnapshot, nil
 }
@@ -4547,6 +4555,7 @@ func (h *bufferingHandle) stageAndEnqueueInner(ctx context.Context, durable, jou
 	// it after this function has released the lock.
 	h.mu.Lock()
 	h.selfCancelAfterStaging = h.unlinked
+	h.selfCancelEntry = entry
 	h.mu.Unlock()
 	h.mu.Lock()
 	h.dirty = false
