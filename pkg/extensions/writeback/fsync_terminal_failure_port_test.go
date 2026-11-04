@@ -664,12 +664,11 @@ func TestPortRenameMovesConflictMarkerStagedDuringRename(t *testing.T) {
 
 	// The post-Rename transition, with the stale pre-rename generations the
 	// old code trusted: the marker that must move is the LIVE one (v3).
-	if err := wb.retargetConflictMarkers("/race-src.txt", "/race-dst.txt"); err != nil {
+	if err := wb.retargetConflictMarkers(context.Background(), "/race-src.txt", "/race-dst.txt"); err != nil {
 		t.Fatalf("retarget reported the fenced-out transfer as a failure: %v", err)
 	}
 	// What the rename caller does on a successful transition.
-	wb.queue.clearTerminalFailure("/race-src.txt")
-	wb.queue.clearTerminalFailure("/race-dst.txt")
+	wb.queue.RenameTerminalFailure("/race-src.txt", "/race-dst.txt")
 
 	if wb.opts.Staging.Pending.HasPending("/race-src.txt") {
 		t.Fatal("source pending entry stayed keyed under the dead old name")
@@ -734,15 +733,16 @@ func TestStandaloneTransferFailuresAreNeverEvicted(t *testing.T) {
 	}
 }
 
-// TestPortRenameSettlesSuccessorStagedDuringRename pins the publication
+// TestPortRenameRetargetsSuccessorStagedDuringRename pins the publication
 // window the pre-rename drain cannot close: while the remote rename RPC is
 // in flight, the open writer stages (and enqueues) a successor image under
-// the OLD name. A non-conflict source entry is not durability — the rename
-// must let the queue settle that image (it can only terminally fail against
-// the moved name) and carry the resulting marker to the new name instead of
-// certifying the still-queued bytes; the retargeted handle's strict Sync must
-// then answer EIO.
-func TestPortRenameSettlesSuccessorStagedDuringRename(t *testing.T) {
+// the OLD name. Its upload runs against entry.Path — the dead old name — so
+// the rename must move the whole obligation (entry, bytes, queue work) to
+// the new name. With every upload failing, the re-driven landing terminally
+// fails THERE: the marker and preserved bytes answer EIO at the new name
+// instead of the successor being acknowledged at (or resurrecting) the old
+// one, and the retargeted handle's strict Sync must refuse to certify it.
+func TestPortRenameRetargetsSuccessorStagedDuringRename(t *testing.T) {
 	fb := &failingWritesBackend{backend: testbackend.NewBackend()}
 	gate := make(chan struct{})
 	gated := make(chan struct{})
@@ -761,7 +761,7 @@ func TestPortRenameSettlesSuccessorStagedDuringRename(t *testing.T) {
 
 	// Hold the rename RPC in flight and stage the successor inside the
 	// window: Flush publishes and enqueues without waiting, and every upload
-	// from here on fails, so the successor cannot land.
+	// from here on fails, so the successor cannot land anywhere.
 	renamed := make(chan error, 1)
 	go func() {
 		_, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/settle-src.txt", Path2: "/settle-dst.txt"})
@@ -784,32 +784,221 @@ func TestPortRenameSettlesSuccessorStagedDuringRename(t *testing.T) {
 	select {
 	case err := <-renamed:
 		if err != nil {
-			t.Fatalf("rename reported %v, want success after settling the successor", err)
+			t.Fatalf("rename reported %v, want success after moving the successor", err)
 		}
 	case <-time.After(30 * time.Second):
-		t.Fatal("the rename never settled the successor staged during its RPC")
+		t.Fatal("the rename never moved the successor staged during its RPC")
 	}
 
-	// The successor's terminal failure followed the name: its marker (and
-	// preserved bytes) live at the destination, and the retargeted handle's
-	// strict Sync answers EIO for the image that never landed.
+	// The successor's obligation followed the name: its pending state and
+	// preserved bytes live at the destination, and with uploads failing the
+	// re-driven landing terminally fails THERE.
+	wb.queue.WaitPath("/settle-dst.txt")
 	fb.setFail(false)
 	if wb.opts.Staging.Pending.HasPending("/settle-src.txt") {
 		t.Fatal("the successor's pending entry stayed keyed under the dead old name")
 	}
 	meta, ok := wb.opts.Staging.Pending.GetMeta("/settle-dst.txt")
 	if !ok || meta == nil || meta.Kind != staging.PendingConflict {
-		t.Fatalf("pending entry at the new name = %+v ok=%v, want the settled successor's marker", meta, ok)
+		t.Fatalf("pending entry at the new name = %+v ok=%v, want the moved successor's marker", meta, ok)
 	}
 	data, err := wb.opts.Staging.Shadow.ReadAll("/settle-dst.txt")
 	if err != nil || string(data) != "successor never landed" {
 		t.Fatalf("shadow at the new name = %q err=%v, want the successor's preserved bytes", data, err)
 	}
 	if err := wb.queue.PathTerminalFailure("/settle-dst.txt"); err == nil {
-		t.Fatal("the settled successor's terminal failure is not reachable at the new name")
+		t.Fatal("the moved successor's terminal failure is not reachable at the new name")
 	}
 	if err := h.Sync(ctx); err == nil {
 		t.Fatal("strict Sync on the retargeted handle certified the never-landed successor")
+	}
+	if _, recreated := nodeString(fb.backend, "/settle-src.txt"); recreated {
+		t.Fatal("the dead old name was resurrected by the successor's upload")
+	}
+}
+
+// TestPortRenameRetargetedSuccessorLandsAtNewName is the healthy-backend
+// counterpart: the staged successor is moved to the new name and its landing
+// is re-driven THERE — the metadata-only rename preserved the base revision,
+// so the re-driven upload CASes cleanly and the retargeted handle's strict
+// Sync reports durability for the successor's bytes, which land under the
+// new name and only there.
+func TestPortRenameRetargetedSuccessorLandsAtNewName(t *testing.T) {
+	fb := &failingWritesBackend{backend: testbackend.NewBackend()}
+	gate := make(chan struct{})
+	gated := make(chan struct{})
+	fb.renameGate, fb.gated = gate, gated
+	ch, wb := newUploadStack(t, fb, Options{Policy: PolicyWriteBack})
+	ctx := context.Background()
+
+	h := open(t, ch, "/land-src.txt")
+	if err := h.Write(ctx, 0, []byte("landed base")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	renamed := make(chan error, 1)
+	go func() {
+		_, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/land-src.txt", Path2: "/land-dst.txt"})
+		renamed <- err
+	}()
+	select {
+	case <-gated:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the rename request never reached the backend")
+	}
+	// Failing uploads only until the rename returns keep the successor from
+	// landing at the still-live old name during the window; afterwards the
+	// backend is healthy so the re-driven landing must succeed at the NEW name.
+	fb.setFail(true)
+	if err := h.Write(ctx, 0, []byte("successor landed at the new name")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	close(gate)
+
+	select {
+	case err := <-renamed:
+		if err != nil {
+			t.Fatalf("rename reported %v, want success after moving the successor", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the rename never moved the successor staged during its RPC")
+	}
+	fb.setFail(false)
+
+	if wb.opts.Staging.Pending.HasPending("/land-src.txt") {
+		t.Fatal("the successor's pending entry stayed keyed under the dead old name")
+	}
+	if err := h.Sync(ctx); err != nil {
+		t.Fatalf("strict Sync on the retargeted handle = %v, want the re-driven landing at the new name to succeed", err)
+	}
+	if err := wb.queue.PathTerminalFailure("/land-dst.txt"); err != nil {
+		t.Fatalf("the landed successor still answers EIO: %v", err)
+	}
+	if got, ok := nodeString(fb.backend, "/land-dst.txt"); !ok || got != "successor landed at the new name" {
+		t.Fatalf("remote image at the new name = %q ok=%v, want the successor's bytes", got, ok)
+	}
+	if _, recreated := nodeString(fb.backend, "/land-src.txt"); recreated {
+		t.Fatal("the dead old name was resurrected by the successor's upload")
+	}
+}
+
+// TestPortDirRenameRetargetsQueuedDescendant pins the directory-rename row of
+// the same window: a child staged (and enqueued) under the old prefix while
+// the rename RPC was in flight is LIVE, not terminal, and its durability
+// obligation must follow the move like the renamed path's own staged image —
+// its upload may not run against (or recreate) the dead prefix.
+func TestPortDirRenameRetargetsQueuedDescendant(t *testing.T) {
+	fb := &failingWritesBackend{backend: testbackend.NewBackend()}
+	gate := make(chan struct{})
+	gated := make(chan struct{})
+	fb.renameGate, fb.gated = gate, gated
+	ch, wb := newUploadStack(t, fb, Options{Policy: PolicyWriteBack})
+	ctx := context.Background()
+
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMkdir, Path: "/d", Mode: 0o755}); err != nil {
+		t.Fatal(err)
+	}
+	h := open(t, ch, "/d/a")
+	if err := h.Write(ctx, 0, []byte("landed base")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	renamed := make(chan error, 1)
+	go func() {
+		_, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/d", Path2: "/e"})
+		renamed <- err
+	}()
+	select {
+	case <-gated:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the rename request never reached the backend")
+	}
+	fb.setFail(true)
+	if err := h.Write(ctx, 0, []byte("descendant successor")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	close(gate)
+
+	select {
+	case err := <-renamed:
+		if err != nil {
+			t.Fatalf("directory rename reported %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the directory rename never completed")
+	}
+	fb.setFail(false)
+
+	if wb.opts.Staging.Pending.HasPending("/d/a") {
+		t.Fatal("the queued descendant stayed keyed under the dead old prefix")
+	}
+	meta, ok := wb.opts.Staging.Pending.GetMeta("/e/a")
+	if !ok || meta == nil {
+		t.Fatal("the queued descendant did not follow the directory rename")
+	}
+	if err := h.Sync(ctx); err != nil {
+		t.Fatalf("strict Sync on the retargeted descendant = %v, want the re-driven landing at the new prefix to succeed", err)
+	}
+	if got, ok := nodeString(fb.backend, "/e/a"); !ok || got != "descendant successor" {
+		t.Fatalf("remote image at the new prefix = %q ok=%v, want the descendant's successor bytes", got, ok)
+	}
+	if _, recreated := nodeString(fb.backend, "/d/a"); recreated {
+		t.Fatal("the dead old prefix was resurrected by the descendant's upload")
+	}
+}
+
+// TestPortRenameRefusesDataLandedAtObsoleteName pins the resurrection guard:
+// a worker that reached the old name before the transition's locks can land
+// the in-window successor THERE — its not-found retry recreates the dead
+// name. An upload acknowledged at the obsolete pathname is not durability
+// for the renamed object, so the transition must refuse to certify it.
+func TestPortRenameRefusesDataLandedAtObsoleteName(t *testing.T) {
+	fb := &failingWritesBackend{backend: testbackend.NewBackend()}
+	ch, wb := newUploadStack(t, fb, Options{Policy: PolicyWriteBack})
+	ctx := context.Background()
+
+	// A completed clean rename: the source landed and moved.
+	h := open(t, ch, "/obs-src.txt")
+	if err := h.Write(ctx, 0, []byte("landed base")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/obs-src.txt", Path2: "/obs-dst.txt"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The resurrection residue: the old name exists remotely again, exactly
+	// as the landed-at-the-old-name successor's create-retry leaves it.
+	squatter := open(t, ch, "/obs-src.txt")
+	if err := squatter.Write(ctx, 0, []byte("landed at the obsolete name")); err != nil {
+		t.Fatal(err)
+	}
+	if err := squatter.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	unlock := wb.lockRenamePaths("/obs-src.txt", "/obs-dst.txt")
+	err := wb.conflictTransitionLocked(ctx, "/obs-src.txt", "/obs-dst.txt")
+	unlock()
+	if err == nil {
+		t.Fatal("the transition certified data landed under the obsolete old name")
+	}
+	if err := wb.queue.PathTerminalFailure("/obs-dst.txt"); err == nil {
+		t.Fatal("the resurrection refusal did not leave a failure record at the new name")
 	}
 }
 

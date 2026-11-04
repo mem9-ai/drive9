@@ -3185,6 +3185,30 @@ func (cq *CommitQueue) clearTerminalFailure(path string) {
 	cq.mu.Unlock()
 }
 
+// CancelQueuedForRename stops every queued or in-flight entry for path and
+// journals the rename's done marker fencing the path's earlier fsync frames.
+// Unlike CancelPath the caller already holds the writeback path locks, so no
+// staging or worker can publish in between — a worker blocked ahead of the
+// upload aborts on the cancelled entry context once it gets the lock. Local
+// shadow/pending state is preserved: the caller moves it to the new name,
+// where the re-driven landing carries the durability obligation. Without the
+// marker a restart would replay the old frames and re-upload the dead name.
+func (cq *CommitQueue) CancelQueuedForRename(path string) error {
+	if cq == nil {
+		return nil
+	}
+	for _, cancel := range cq.cancelPathEntries(path) {
+		cancel()
+	}
+	if cq.journal == nil {
+		return nil
+	}
+	if err := cq.journal.Append(staging.JournalEntry{Op: staging.JournalUnlink, Path: path}); err != nil {
+		return fmt.Errorf("journal rename marker for %s: %w", path, err)
+	}
+	return nil
+}
+
 // RenameTerminalFailure moves a completed rename's endpoint records with the
 // object: the source's record (standalone ones included — their bytes sit
 // under an even older name, and the retargeted handle's next barrier checks
