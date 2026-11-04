@@ -180,6 +180,20 @@ func (h *Handler) drop(path string) {
 	h.opts.Engine.Bridge.ForgetPath(path)
 }
 
+// lastHandleFor reports whether e is the only handle registered for its
+// path (i.e. closing it is the file's final close). It counts the handle
+// being released, so it must be consulted BEFORE release retires it.
+func (h *Handler) lastHandleFor(e *engineHandle) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, x := range h.handles[e.path] {
+		if x != e {
+			return false
+		}
+	}
+	return true
+}
+
 // release removes one handle for a path; the bridge mapping is only
 // forgotten when the LAST handle for the path closes.
 func (h *Handler) release(e *engineHandle) {
@@ -711,6 +725,15 @@ func (e *engineHandle) Sync(ctx context.Context) error {
 		}
 		return err
 	}
+	// A fresh EMPTY file has nothing to commit, so the flush above was a
+	// no-op — but fsync was still acknowledged, and the NAME must survive a
+	// crash. The name is deliberately not materialized remotely while this
+	// descriptor can still write (an unattributable empty classic object
+	// would block the next write), so a durable local barrier is what makes
+	// the acknowledgment true: replay creates the file.
+	if e.plane.opts.Engine.Bridge.NeedsEmptyBarrier(ctx, e.ino) {
+		return e.plane.opts.Engine.Bridge.StagePendingLocal(e.ino)
+	}
 	return nil
 }
 
@@ -728,12 +751,21 @@ func (e *engineHandle) Release(ctx context.Context) error {
 	// callback) would otherwise stay unlanded. VFS.Release reports no
 	// error, so the bridge-side landing is the only failure channel here.
 	e.plane.opts.Engine.VFS.Release(e.vctx, e.ino, e.fh)
-	// The LAST close is the only point where an empty file's name may be
-	// materialized classically: an empty classic object cannot be attributed
-	// back to this descriptor afterwards, so creating it earlier would leave
-	// the next write with an occupant it must neither delete nor publish
-	// into.
-	landErr := e.plane.opts.Engine.FlushFileFinal(ctx, uint64(e.ino))
+	// Only the LAST close may materialize an empty file's name. Doing it on
+	// every release would create an unattributed classic placeholder while
+	// another descriptor for the same inode is still open — and that
+	// descriptor's next write would then be refused by the very ownership
+	// guard this ordering exists to satisfy.
+	//
+	// lastClose is computed BEFORE the release retires this handle: the
+	// count must include the handle being closed.
+	lastClose := e.plane.lastHandleFor(e)
+	var landErr error
+	if lastClose {
+		landErr = e.plane.opts.Engine.FlushFileFinal(ctx, uint64(e.ino))
+	} else {
+		landErr = e.plane.opts.Engine.FlushFile(ctx, uint64(e.ino))
+	}
 	e.plane.release(e)
 	return landErr
 }

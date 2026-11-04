@@ -2041,10 +2041,13 @@ func (b *Bridge) StageRenameIntent(oldFull, newFull string) error {
 		return fmt.Errorf("stage rename intent %s → %s: %w", oldFull, newFull, err)
 	}
 	for _, r := range recs {
-		// Match the SAVED name or any recorded destination: after an
-		// unconfirmed rename the object may sit at a candidate that is not
-		// the saved name, and that candidate is the one this rename moves.
-		if _, ok := r.m.renamedOrigin(oldFull, newFull); !ok {
+		// Match the SAVED name or any recorded destination, and use the
+		// MAPPED name: a record for a descendant of a renamed directory must
+		// get its own destination (/a/file → /b/file), never the directory
+		// root. Recording /b for an object that lives at /b/file leaves
+		// recovery probing a directory and the missing old name.
+		mapped, ok := r.m.renamedOrigin(oldFull, newFull)
+		if !ok {
 			continue
 		}
 		// ADD the destination; never replace an existing candidate, and
@@ -2053,7 +2056,7 @@ func (b *Bridge) StageRenameIntent(oldFull, newFull string) error {
 		// earlier candidate must stay reachable: a crash before this RPC
 		// commits, or a definite failure of it, then recovers from the
 		// pre-rename names instead of only the name it never reached.
-		if !r.m.addNextPath(newFull) {
+		if !r.m.addNextPath(mapped) {
 			continue
 		}
 		raw, merr := json.Marshal(r.m)
@@ -3066,8 +3069,48 @@ func (b *Bridge) flushFile(ctx context.Context, ino meta.Ino, finalize bool) err
 	// (A remembered landing failure was cleared by the successful commit
 	// itself — Bridge.Write's sticky memory exists only until the next
 	// successful landing, which just happened.)
+	//
+	// An EMPTY file whose name was never materialized has nothing staged
+	// for this inode to make redundant: clearing here deleted the barrier
+	// an earlier interactive fsync wrote, leaving a durability-acknowledged
+	// empty file with neither a remote name nor a local record. Keep it for
+	// the replay (or the final close, which materializes the name and then
+	// clears it once the name exists).
+	if !finalize && size == 0 && !b.nameMaterialized(ctx, path) {
+		return nil
+	}
 	b.clearStagedLocal(ino)
 	return nil
+}
+
+// nameMaterialized reports whether the file's name currently exists
+// server-side (a fresh empty engine file may have none yet).
+func (b *Bridge) nameMaterialized(ctx context.Context, path string) bool {
+	_, err := b.StatLocal(ctx, path)
+	return err == nil
+}
+
+// NeedsEmptyBarrier reports whether a fsync on this inode was acknowledged
+// without anything durable backing it: a fresh empty file has no slices and
+// no truncation to commit, and its name is deliberately not materialized
+// remotely while the descriptor can still write. The caller stages a local
+// barrier so the acknowledgment survives a crash.
+func (b *Bridge) NeedsEmptyBarrier(ctx context.Context, ino meta.Ino) bool {
+	b.mu.Lock()
+	size, has := b.sizes[ino]
+	path, mapped := b.paths[ino]
+	pending := len(b.pending[ino])
+	b.mu.Unlock()
+	if !has || !mapped || pending > 0 || size != 0 {
+		return false
+	}
+	if b.cfg.StagingDir == "" {
+		return false // no barrier armed: nothing can be made durable locally
+	}
+	if b.nameMaterialized(ctx, path) {
+		return false // the remote name already carries the file
+	}
+	return true
 }
 
 func (b *Bridge) CompactAll(ctx meta.Context, threads int, bar *utils.Bar) syscall.Errno { return 0 }

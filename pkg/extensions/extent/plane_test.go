@@ -5326,3 +5326,135 @@ func (r stagedRecord) hasCandidate(p string) bool {
 	}
 	return false
 }
+
+// Round-54: a directory rename must record each DESCENDANT's own
+// destination, not the directory root. Staging /a -> /b for an object at
+// /a/file must record /b/file: recording /b leaves recovery probing a
+// directory and the missing old name while the bytes sit at /b/file.
+func TestDirRenameCandidateKeepsDescendantSuffix(t *testing.T) {
+	f := newFakeV2(t)
+	f.setDir("/a", true)
+	f.seedExtent(t, "/a/file.bin", "BASE")
+	cacheDir := engineCacheDir(t)
+	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: cacheDir})
+	br := eng.Bridge
+	ino := meta.Ino(61)
+	br.RememberPathForTest(ino, "/a/file.bin")
+	sum := sha256Hex([]byte("PEND"))
+	br.StageBlockForTest(sum, []byte("PEND"))
+	br.AddPendingForTest(ino, 0, 0, sum, 4, 8)
+	if err := br.StagePendingLocal(ino); err != nil {
+		t.Fatal(err)
+	}
+	// The directory rename arrives as one intent for /a.
+	if err := br.StageRenameIntentLocal("/a", "/b"); err != nil {
+		t.Fatal(err)
+	}
+	rec := onlyStaged(t, br)
+	if !rec.hasCandidate("/b/file.bin") {
+		t.Fatalf("descendant destination missing: candidates = %v, want /b/file.bin", rec.m.candidatePaths())
+	}
+	if rec.hasCandidate("/b") {
+		t.Fatalf("the directory ROOT was recorded as a file candidate: %v", rec.m.candidatePaths())
+	}
+	if !rec.hasCandidate("/a/file.bin") {
+		t.Fatal("the pre-rename name must stay a candidate until the rename is confirmed")
+	}
+}
+
+// Round-54: an acknowledged fsync of a fresh EMPTY file must stay durable.
+// Nothing is pending and the name is deliberately not materialized remotely
+// while the descriptor can still write, so the strict path must stage a
+// local barrier instead of returning success with nothing behind it.
+func TestStrictFsyncOfEmptyFileStagesBarrier(t *testing.T) {
+	f := newFakeV2(t)
+	f.setDir("/d", true)
+	cacheDir := engineCacheDir(t)
+	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: cacheDir})
+	// STRICT mode: fsync must be remote-durable, and here it instead has to
+	// become locally durable, because the name cannot be created yet.
+	h := New(Options{Engine: eng, Threshold: 0, SyncMode: "strict"})
+	res, _, _ := dispatchCreate(context.Background(), h, "/d/e.bin", syscall.O_RDWR|syscall.O_CREAT)
+	eh := res.Handle.(*engineHandle)
+	if err := eh.Sync(context.Background()); err != nil {
+		t.Fatalf("fsync: %v", err)
+	}
+	recs, err := eng.Bridge.scanStaged()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recs) != 1 {
+		t.Fatalf("staged barriers = %d, want 1 (the acknowledged empty file must be recoverable)", len(recs))
+	}
+	if got := recs[0].m.Path; got != "/d/e.bin" {
+		t.Fatalf("barrier path = %q, want /d/e.bin", got)
+	}
+}
+
+// Round-54: an intervening ordinary Flush must not delete the durable
+// barrier that an earlier interactive fsync wrote. An empty file has nothing
+// staged to make redundant; clearing here left it with neither a remote name
+// nor a local record.
+func TestInterveningFlushKeepsEmptyBarrier(t *testing.T) {
+	f := newFakeV2(t)
+	f.setDir("/d", true)
+	cacheDir := engineCacheDir(t)
+	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: cacheDir})
+	h := New(Options{Engine: eng, Threshold: 0, SyncMode: "interactive"})
+	res, _, _ := dispatchCreate(context.Background(), h, "/d/e.bin", syscall.O_RDWR|syscall.O_CREAT)
+	eh := res.Handle.(*engineHandle)
+	if err := eh.Sync(context.Background()); err != nil {
+		t.Fatalf("fsync: %v", err)
+	}
+	if recs, _ := eng.Bridge.scanStaged(); len(recs) != 1 {
+		t.Fatalf("precondition: staged barriers = %d, want 1", len(recs))
+	}
+	// An ordinary flush follows (libc does this between fsync and close).
+	if err := eh.Flush(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if recs, _ := eng.Bridge.scanStaged(); len(recs) != 1 {
+		t.Fatalf("the intervening flush deleted the only durable record (barriers = %d)", len(recs))
+	}
+	// And the file still materializes at close.
+	if err := eh.Release(context.Background()); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if n := f.hashParsedLayout("/d/e.bin"); n != "classic" {
+		t.Fatalf("layout after close = %q, want classic", n)
+	}
+}
+
+// Round-54: closing ONE of several descriptors must not materialize the
+// empty name. Another handle is still open and may write; an unattributed
+// placeholder created by the first close would make its next write fail.
+func TestFirstCloseOfTwoKeepsHandleWritable(t *testing.T) {
+	f := newFakeV2(t)
+	f.setDir("/d", true)
+	h := newTestHandler(t, f, 0)
+	res1, _, _ := dispatchCreate(context.Background(), h, "/d/m.bin", syscall.O_RDWR|syscall.O_CREAT)
+	eh1 := res1.Handle.(*engineHandle)
+	// A second descriptor for the same file.
+	res2, _, _ := dispatchCreate(context.Background(), h, "/d/m.bin", syscall.O_RDWR)
+	eh2, ok := res2.Handle.(*engineHandle)
+	if !ok {
+		t.Skipf("the second open was not claimed by the engine (%T)", res2.Handle)
+	}
+	// Close the FIRST one: it is not the last close, so no name may appear.
+	if err := eh1.Release(context.Background()); err != nil {
+		t.Fatalf("first release: %v", err)
+	}
+	if n := f.hashParsedLayout("/d/m.bin"); n != "" {
+		t.Fatalf("the first of two closes materialized a %s object; the remaining handle would be blocked", n)
+	}
+	// The surviving descriptor must still be able to write.
+	if err := eh2.Write(context.Background(), 0, []byte("STILL-OK")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh2.Flush(context.Background()); err != nil {
+		t.Fatalf("the surviving handle became unwritable: %v", err)
+	}
+	if got := f.contentOf("/d/m.bin"); got != "STILL-OK" {
+		t.Fatalf("content = %q, want STILL-OK", got)
+	}
+}
