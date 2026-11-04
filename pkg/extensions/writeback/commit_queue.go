@@ -134,6 +134,8 @@ type CommitQueue struct {
 	// buffer moved on), but the shadow is still the only restore source for
 	// the landing's unchanged evicted parts. Consumed by the cleanup pass.
 	retainedShadows sync.Map
+	extentGlobs       []globMatcher
+	extentMatchCutoff int64
 	index       *staging.PendingIndex
 	journal     *staging.Journal
 	wg          sync.WaitGroup
@@ -269,6 +271,41 @@ func (cq *CommitQueue) SetExtentTakeover(enabled bool) {
 	cq.mu.Lock()
 	cq.extentTakeover = enabled
 	cq.mu.Unlock()
+}
+
+// SetExtentPatterns arms the pattern-owned extent routing: with a
+// non-empty pattern set, a queued image promotes to an extent session
+// only when its (mount-relative) path matches, at or above the matched
+// cutoff; an empty set keeps the size-only hybrid promotion.
+func (cq *CommitQueue) SetExtentPatterns(patterns []string, matchedCutoff int64) {
+	if cq == nil {
+		return
+	}
+	globs := compileExtentGlobs(patterns)
+	cq.mu.Lock()
+	cq.extentGlobs = globs
+	cq.extentMatchCutoff = matchedCutoff
+	cq.mu.Unlock()
+}
+
+// extentRouteFor reports the extent routing decision for a queued path.
+func (cq *CommitQueue) extentRouteFor(path string, size int64) bool {
+	cq.mu.Lock()
+	globs, cutoff := cq.extentGlobs, cq.extentMatchCutoff
+	cq.mu.Unlock()
+	if len(globs) > 0 {
+		if !matchExtentPattern(globs, path) {
+			return false
+		}
+		return size >= cutoff
+	}
+	threshold := cq.directPutThreshold()
+	if threshold <= 0 {
+		// Unknown cutoff (cache cold): the historical behavior routes to
+		// the extent plane rather than guessing classic.
+		return true
+	}
+	return size >= threshold
 }
 
 // RetainShadowForLanding asks the success cleanup to keep this path's

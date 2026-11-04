@@ -76,9 +76,10 @@ func (cq *CommitQueue) uploadExtentEntry(ctx context.Context, entry *CommitEntry
 	if entry.Size <= 0 || (entry.Kind == staging.PendingOverwrite && expectedRevision == 0) {
 		return 0, false, nil
 	}
-	threshold := cq.directPutThreshold()
-	if entry.Size > 0 && threshold > 0 && entry.Size < threshold {
-		return 0, false, nil // below the inline cutoff: classic direct PUT
+	if entry.Size <= 0 || !cq.extentRouteFor(entry.Path, entry.Size) {
+		// Below the promotion line, or the pattern-owned layout says this
+		// path stays classic — never converted through the extent plane.
+		return 0, false, nil
 	}
 	if cq.client == nil {
 		return 0, false, nil

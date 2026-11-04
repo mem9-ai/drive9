@@ -240,8 +240,10 @@ func parseExtensionOrder(list []string) ([]string, error) {
 }
 
 // extentPromotionCutoff decides the write plane's promotion line: with
-// explicit [extent] patterns the layout is pattern-owned (no promotion);
-// pattern-less hybrid mounts promote at the server's inline cutoff.
+// explicit [extent] patterns the layout is pattern-owned (a staged image
+// promotes only when its PATH matches — see extentRoute; the cutoff is
+// then 0 so size alone never promotes); pattern-less hybrid mounts
+// promote at the server's inline cutoff.
 func extentPromotionCutoff(patternConfigured bool, cl *client.Client) int64 {
 	if patternConfigured {
 		return 0
@@ -1090,15 +1092,14 @@ func mountWithConfig(cfg MountConfig) error {
 			// The extent plane and its write-plane branch arm together:
 			// the engine serves extent reads, the commit queue promotes
 			// fresh large files (multipart's successor). With explicit
-			// [extent] patterns the pattern IS the layout truth — creation
-			// happens on the extent plane for matches and stays classic
-			// everywhere else — so the write plane's size-based promotion
-			// channel is OFF entirely (a non-matching file must not
-			// silently flip to extent just by crossing the inline cutoff
-			// on a landing). Pattern-less hybrid mounts keep the promotion
-			// line.
-			ExtentTakeover: wantExt["extent"] && len(cfg.ExtentPaths) == 0,
-			ExtentMinSize:  extentPromotionCutoff(len(cfg.ExtentPaths) > 0, cl),
+			// [extent] patterns the PATTERN owns the layout on the write
+			// plane too: matching staged images promote, non-matching ones
+			// stay classic however large (create-time stickiness).
+			// Pattern-less hybrid mounts promote at the inline cutoff.
+			ExtentTakeover:  wantExt["extent"],
+			ExtentMinSize:   extentPromotionCutoff(len(cfg.ExtentPaths) > 0, cl),
+			ExtentPatterns:  cfg.ExtentPaths,
+			ExtentThreshold: int64(extentInlineThreshold(cl)),
 			// gvisor-compat takes precedence and always keeps commits
 			// detached (v1).
 			InterruptibleCommits:    cfg.LegacyInterruptibleMutations && !cfg.GVisorCompat,

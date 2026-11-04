@@ -442,3 +442,42 @@ func TestExtentCommitPropagatesLandedRevision(t *testing.T) {
 		t.Fatalf("echo-less extent commit reported %v, want [1 2] then the CAS-derived 3", successRevs)
 	}
 }
+
+// Pattern-owned layout: a queued image promotes only when its path
+// matches an [extent] glob; non-matching paths stay classic however
+// large, and matches below the matched cutoff stay classic too.
+func TestUploadExtentEntryPatternRouting(t *testing.T) {
+	rs := newExtentRoutingServer(t, "extent")
+	cq := &CommitQueue{client: client.New(rs.URL, ""), extentTakeover: true}
+	cq.SetExtentPatterns([]string{"*.db"}, 1)
+
+	big := make([]byte, 1<<20)
+	// Non-matching large path: classic (never converted).
+	entry := extentTestEntry(big)
+	entry.Path = "/plain.txt"
+	if _, handled, err := cq.uploadExtentEntry(context.Background(), entry, "/plain.txt", 9); err != nil || handled {
+		t.Fatalf("non-matching: handled=%v err=%v (want classic fallthrough)", handled, err)
+	}
+	// Matching path at/above the cutoff: extent session.
+	entry2 := extentTestEntry(big)
+	entry2.Path = "/keep.db"
+	if _, handled, err := cq.uploadExtentEntry(context.Background(), entry2, "/keep.db", 9); err != nil || !handled {
+		t.Fatalf("matching: handled=%v err=%v (want extent)", handled, err)
+	}
+	rs.mu.Lock()
+	patches, initiates := rs.patches, len(rs.initiates)
+	rs.mu.Unlock()
+	if patches != 0 || initiates != 1 {
+		t.Fatalf("matching path: patches=%d initiates=%d (want 0/1)", patches, initiates)
+	}
+
+	// Matching but below the matched cutoff: classic.
+	small := make([]byte, 16)
+	cq2 := &CommitQueue{client: client.New(rs.URL, ""), extentTakeover: true}
+	cq2.SetExtentPatterns([]string{"*.db"}, 1<<20)
+	entry3 := extentTestEntry(small)
+	entry3.Path = "/keep.db"
+	if _, handled, err := cq2.uploadExtentEntry(context.Background(), entry3, "/keep.db", 9); err != nil || handled {
+		t.Fatalf("below matched cutoff: handled=%v err=%v (want classic fallthrough)", handled, err)
+	}
+}

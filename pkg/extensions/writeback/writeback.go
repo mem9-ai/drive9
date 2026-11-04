@@ -30,6 +30,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/fusecomp/httperr"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/staging"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/writebuffer"
+	"github.com/mem9-ai/drive9/pkg/pathfilter"
 	"github.com/mem9-ai/drive9/pkg/pathutil"
 )
 
@@ -103,6 +104,15 @@ type Options struct {
 	// promotes them to the extent plane) instead of the small-file
 	// writeback cache track. 0 disables.
 	ExtentMinSize int64
+	// ExtentPatterns are explicit path globs (--extent / the profile
+	// [extent] section). When set, the layout is pattern-owned on this
+	// plane: a staged image promotes only when its path matches, whatever
+	// its size; non-matching images stay classic (create-time
+	// stickiness). Empty means hybrid promotion at ExtentMinSize.
+	ExtentPatterns []string
+	// ExtentThreshold is the size cutoff used WITH patterns (matched
+	// paths promote at or above it; 0 with patterns means every match).
+	ExtentThreshold int64
 	// ExtentTakeover arms the extent content-layout commit branch: fresh
 	// large files are created through extent sequential sessions and
 	// existing extent files commit incrementally through PATCH dirty
@@ -141,6 +151,10 @@ type Writeback struct {
 	// rolledBack fences every inline commit after a layer rollback.
 	rolledBack atomic.Bool
 	opts       Options
+	// extentGlobs/extentMatchCutoff are the compiled pattern-owned
+	// promotion rules (see Options.ExtentPatterns).
+	extentGlobs      []globMatcher
+	extentMatchCutoff int64
 	// interactive mirrors SyncMode == "interactive".
 	interactive bool
 	debounce    *flushdebounce.FlushDebouncer
@@ -353,6 +367,8 @@ func newSnapshotID() string {
 
 // New constructs the write plane.
 func New(opts Options) (*Writeback, error) {
+	// Compile the pattern-owned promotion rules once.
+	extentGlobs := compileExtentGlobs(opts.ExtentPatterns)
 	if opts.Client == nil {
 		return nil, fmt.Errorf("writeback: client is required")
 	}
@@ -368,6 +384,8 @@ func New(opts Options) (*Writeback, error) {
 	}
 	w := &Writeback{opts: opts, root: root, preload: preload, interactive: opts.SyncMode == "interactive",
 		perfShim: &fusePerfCounters{}}
+	w.extentGlobs = extentGlobs
+	w.extentMatchCutoff = opts.ExtentThreshold
 	w.perfShim.enabled.Store(true)
 	// A view checkout (layer restore/switch, SSE reset) retargets the base:
 	// open handles with CLEAN buffers would keep serving the abandoned
@@ -450,6 +468,7 @@ func New(opts Options) (*Writeback, error) {
 		}
 		q := NewCommitQueue(opts.Client, opts.Staging.Shadow, opts.Staging.Pending, opts.Staging.Journal, workers, opts.CommitQueueMaxPending, root)
 		q.SetExtentTakeover(opts.ExtentTakeover)
+		q.SetExtentPatterns(opts.ExtentPatterns, opts.ExtentThreshold)
 		q.SetPerfCounters(w.perfShim)
 		if opts.BatchWindow > 0 || opts.BatchMaxFiles > 0 || opts.BatchMaxBytes > 0 {
 			q.ConfigureBatchWrite(opts.BatchWindow, opts.BatchMaxFiles, opts.BatchMaxBytes)
@@ -712,8 +731,55 @@ func (w *Writeback) SetRemoteOpRecorder(fn func(name string, err error, dur time
 // extentRoute reports whether a staged image of this size should bypass
 // the small-file writeback cache track and land through the commit queue,
 // where the extent branch promotes it to the extent plane.
-func (w *Writeback) extentRoute(size int64) bool {
-	return w.opts.ExtentMinSize > 0 && size >= w.opts.ExtentMinSize && w.queue != nil && w.opts.Staging != nil
+func (w *Writeback) extentRoute(path string, size int64) bool {
+	if w.queue == nil || w.opts.Staging == nil {
+		return false
+	}
+	if len(w.extentGlobs) > 0 {
+		// Pattern-owned layout: only matching paths promote, at or above
+		// the (possibly zero) matched-path cutoff.
+		if !matchExtentPattern(w.extentGlobs, path) {
+			return false
+		}
+		return size >= w.extentMatchCutoff
+	}
+	// Hybrid: promotion at the inline cutoff.
+	return w.opts.ExtentMinSize > 0 && size >= w.opts.ExtentMinSize
+}
+
+// matchExtentPattern reports whether path matches any compiled extent
+// glob. Globs match the whole path; a trailing /* covers subtrees.
+func matchExtentPattern(globs []globMatcher, path string) bool {
+	for _, g := range globs {
+		if g(path) {
+			return true
+		}
+	}
+	return false
+}
+
+// compileExtentGlobs compiles the profile's [extent] patterns with the
+// SAME filter the extent plane uses for its fresh-create claims
+// (pathfilter over canonicalized, root-relative paths), so the write
+// plane's promotion decision can never disagree with the plane's
+// create-time decision.
+type globMatcher func(path string) bool
+
+func compileExtentGlobs(patterns []string) []globMatcher {
+	compiled := pathfilter.CompileAll(patterns)
+	return []globMatcher{func(path string) bool {
+		cleaned, err := pathutil.Canonicalize(path)
+		if err != nil {
+			return false
+		}
+		cleaned = strings.TrimPrefix(cleaned, "/")
+		for _, p := range compiled {
+			if p.MatchCanonical(cleaned) {
+				return true
+			}
+		}
+		return false
+	}}
 }
 
 // smallFileShadowThreshold is the cached-I/O cutoff (v1): handles of bases
@@ -2079,7 +2145,7 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 		// from the FUSE cancel channel under interrupt-safe mutations (v1
 		// syncDataCommitContext): a kernel interrupt after the PUT hit the
 		// wire must not cancel it into an ambiguous server-side state.
-		if h.w.extentRoute(size) {
+		if h.w.extentRoute(h.path, size) {
 			if err := h.stageAndEnqueueOpt(ctx, true, false); err != nil {
 				return err
 			}
@@ -2171,7 +2237,7 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 		if !dirty || unlinked {
 			return nil
 		}
-		if h.w.extentRoute(size) {
+		if h.w.extentRoute(h.path, size) {
 			// Promotion-sized image: the commit queue's extent branch
 			// turns it into an extent sequential session — never the
 			// small-file classic track. Stage durably and wait for THIS
@@ -4482,7 +4548,7 @@ func (h *bufferingHandle) commitLocked(ctx context.Context) error {
 			return 0
 		}
 		return h.buf.Size()
-	}(); h.w.extentRoute(size) {
+	}(); h.w.extentRoute(h.path, size) {
 		if err := h.stageAndEnqueueOpt(ctx, true, false); err != nil {
 			return err
 		}
