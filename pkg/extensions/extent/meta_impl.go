@@ -1113,7 +1113,12 @@ func (b *Bridge) commitClassic(ctx context.Context, ino meta.Ino, path string, p
 	// when a recovery constraint is active: the request carries the
 	// expected resource (header), so a replacement whose revision merely
 	// equals the saved one cannot receive the staged bytes.
-	if err := b.cfg.Client.WriteStreamConditionalExpectedResource(ctx, path, bytes.NewReader(image), int64(len(image)), nil, rev, b.publicationIdentity(ino)); err != nil {
+	// The completion echo carries the revision the server attributed to THIS
+	// publication; capture it so the constraint below advances to it rather
+	// than reusing the pre-write base.
+	var landedRev int64
+	wctx := client.WithCompletedRevisionSink(ctx, &landedRev)
+	if err := b.cfg.Client.WriteStreamConditionalExpectedResource(wctx, path, bytes.NewReader(image), int64(len(image)), nil, rev, b.publicationIdentity(ino)); err != nil {
 		if errors.Is(err, client.ErrResourceMismatch) {
 			b.abandonIno(ino)
 		}
@@ -1124,11 +1129,28 @@ func (b *Bridge) commitClassic(ctx context.Context, ino meta.Ino, path string, p
 	b.mu.Unlock()
 	b.surgicalDeletePending(ino, pending)
 	b.releaseCommitted(ino, pending)
-	if nst, err := b.cfg.Client.StatCtx(ctx, path); err == nil {
-		b.mu.Lock()
-		b.revs[ino] = nst.Revision
-		b.mu.Unlock()
+	newRev := landedRev
+	if newRev <= 0 {
+		// No echo: fall back to the stat, but only to ADVANCE the base. A
+		// stale base would make every later publication send an obsolete
+		// expected revision and fail with 409 forever — the constraint must
+		// track the publication that just succeeded.
+		if nst, err := b.cfg.Client.StatCtx(ctx, path); err == nil {
+			newRev = nst.Revision
+		}
 	}
+	b.mu.Lock()
+	b.revs[ino] = newRev
+	// A classic publication is SUCCESSFUL and bound: the identity stays (it
+	// is the ownership proof for later writes) while the revision advances
+	// to the one this publication produced. (The normal extent path retires
+	// verifyBase because its own commit already carried the identity
+	// forward; the classic path has no such carrier, so it must update.)
+	if v, ok := b.verifyBase[ino]; ok && newRev > 0 {
+		v.rev = newRev
+		b.verifyBase[ino] = v
+	}
+	b.mu.Unlock()
 	return nil
 }
 
@@ -1644,6 +1666,20 @@ func resolveStagedPath(c *client.Client, ctx context.Context, m stagedManifest) 
 	return "", nil
 }
 
+// readStagedManifest loads one staged record's manifest (ok=false when it is
+// absent or unreadable).
+func readStagedManifest(manifestPath string) (stagedManifest, bool) {
+	raw, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return stagedManifest{}, false
+	}
+	var m stagedManifest
+	if json.Unmarshal(raw, &m) != nil {
+		return stagedManifest{}, false
+	}
+	return m, true
+}
+
 // stagedGenOf extracts the generation stamp from a staging directory name
 // (<ino>-<gen>).
 func stagedGenOf(name string) int64 {
@@ -1731,6 +1767,10 @@ func (b *Bridge) StagePendingLocal(ino meta.Ino) error {
 			File     string `json:"file"`
 		}{Chunk: p.chunk, Off: p.off, Size: p.size, Checksum: p.checksum, File: name})
 	}
+	// The pause hook models a run that is still in flight; it must observe
+	// the same state a real one would BEFORE taking the manifest lock (the
+	// lock is what makes the publish atomic, so pausing inside it would
+	// simply block the rename it is meant to interleave with).
 	if pause := b.stagingPause; pause != nil {
 		pause()
 	}
@@ -1769,6 +1809,27 @@ func (b *Bridge) StagePendingLocal(ino meta.Ino) error {
 	if cur, ok := b.currentPath(ino); ok && cur != path {
 		m.Path = cur
 		adopted = true
+	}
+	// MERGE WITH DISK before replacing: a rename writer may have settled a
+	// NEWER record between this run's snapshot and this write (recording a
+	// further destination, and possibly moving Path). Overwriting blindly
+	// would erase it, and after a crash the object's real name would appear
+	// in no candidate. Candidates are a union — strictly more knowledge is
+	// never wrong — and the on-disk Path wins when it differs and the
+	// current mapping has not advanced past it.
+	if pause := b.stagingPausePublish; pause != nil {
+		pause()
+	}
+	if prev, ok := readStagedManifest(filepath.Join(dir, "manifest.json")); ok {
+		for _, cand := range prev.candidatePaths() {
+			if m.addNextPath(cand) {
+				adopted = true
+			}
+		}
+		if prev.Path != m.Path && prev.Path != path {
+			m.Path = prev.Path
+			adopted = true
+		}
 	}
 	if adopted {
 		again, merr := json.Marshal(m)
@@ -2242,6 +2303,12 @@ func (b *Bridge) retargetStagedGensFor(ino meta.Ino, newFull string) {
 	if b.cfg.StagingDir == "" {
 		return
 	}
+	b.retargetStagedGensLocked(ino, newFull)
+}
+
+// retargetStagedGensLocked is the body of retargetStagedGensFor; the caller
+// holds stagingMu (RemapLocal takes it before b.mu).
+func (b *Bridge) retargetStagedGensLocked(ino meta.Ino, newFull string) {
 	recs, err := b.scanStaged()
 	if err != nil {
 		return
@@ -2859,7 +2926,7 @@ func (b *Bridge) RemapLocal(oldPath, newPath string) {
 		b.moved[rep] = newFull
 		b.replacements[newFull] = rep
 		delete(b.replacements, oldFull)
-		b.retargetStagedGensFor(rep, newFull)
+		b.retargetStagedGensLocked(rep, newFull)
 	} else if ino := inoFor(oldFull); b.paths[ino] == oldFull {
 		b.paths[ino] = newFull
 		// Record the move so a recreated OLD pathname gets a synthetic key
@@ -2872,7 +2939,7 @@ func (b *Bridge) RemapLocal(oldPath, newPath string) {
 		// The durable barrier record must follow the inode: a crash before
 		// the next landing otherwise leaves the manifest naming a path that
 		// no longer holds the object, stranding acknowledged bytes.
-		b.retargetStagedGensFor(ino, newFull)
+		b.retargetStagedGensLocked(ino, newFull)
 		// The destination's hash key may still be HELD by a live descriptor
 		// that merely vacated this name, or is retained under a sentinel
 		// alias while the name is replaced (its descriptor keeps using that
@@ -2902,12 +2969,12 @@ func (b *Bridge) RemapLocal(oldPath, newPath string) {
 		case p == oldFull:
 			b.paths[i] = newFull
 			b.moved[i] = newFull
-			b.retargetStagedGensFor(i, newFull)
+			b.retargetStagedGensLocked(i, newFull)
 		case strings.HasPrefix(p, prefix):
 			np := newFull + p[len(oldFull):]
 			b.paths[i] = np
 			b.moved[i] = np
-			b.retargetStagedGensFor(i, np)
+			b.retargetStagedGensLocked(i, np)
 			if i == inoFor(p) {
 				if _, owned := b.replacements[p]; !owned {
 					b.replacements[np] = i
@@ -3189,13 +3256,21 @@ func (b *Bridge) MaterializeEmpty(ctx context.Context, ino meta.Ino) error {
 		return fmt.Errorf("materialize empty file %s: %w", path, err)
 	}
 	// Bind the created object: the identity and revision become the expected
-	// resource/revision of every later publication of this descriptor.
-	if st, err := b.cfg.Client.StatCtx(ctx, path); err == nil && st.ResourceID != "" {
-		b.setVerifyBase(ino, st.Revision, st.ResourceID)
-		b.mu.Lock()
-		b.classicOwned[ino] = true
-		b.mu.Unlock()
+	// resource/revision of every later publication of this descriptor. This
+	// is MANDATORY — a strict fsync must not report success while the
+	// descriptor has no ownership basis, because its next write would then
+	// be refused by the very guard that requires one.
+	st, err := b.cfg.Client.StatCtx(ctx, path)
+	if err != nil {
+		return fmt.Errorf("materialize empty file %s: bind created object: %w", path, err)
 	}
+	if st.ResourceID == "" {
+		return fmt.Errorf("materialize empty file %s: server reported no resource identity", path)
+	}
+	b.setVerifyBase(ino, st.Revision, st.ResourceID)
+	b.mu.Lock()
+	b.classicOwned[ino] = true
+	b.mu.Unlock()
 	// The remote name now carries the file, so any staged empty barrier is
 	// redundant.
 	b.clearStagedLocal(ino)

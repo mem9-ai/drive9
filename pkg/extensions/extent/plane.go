@@ -766,9 +766,15 @@ func (e *engineHandle) Release(ctx context.Context) error {
 	// descriptor's next write would then be refused by the very ownership
 	// guard this ordering exists to satisfy.
 	//
+	// Serialize with handle ADMISSION too, not only with retirement: an Open
+	// of a still-local name registers through tryClaimOpen under the same
+	// per-path lock, so taking it here means a new handle cannot slip in
+	// between the final-close decision and the publication it gates.
+	unlockPath := e.plane.lockPaths(e.path)
 	// claimFinalClose makes the selection atomic, so overlapping closes still
 	// produce exactly one owner of the final publication.
 	finalClose := e.plane.claimFinalClose(e)
+	defer unlockPath()
 	var landErr error
 	if finalClose {
 		landErr = e.plane.opts.Engine.FlushFileFinal(ctx, uint64(e.ino))

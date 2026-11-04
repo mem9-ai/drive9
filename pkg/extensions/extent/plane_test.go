@@ -5599,3 +5599,73 @@ func (b *Bridge) hasPendingRenameForTest(path string) bool {
 	_, ok := b.pendingRenames[path]
 	return ok
 }
+
+// Round-57: a rename that lands BETWEEN a staging run's path snapshot and
+// its manifest replacement must not be erased. The run's in-memory record
+// predates that rename, so publishing it blindly would drop the newer
+// destination — and after a crash the object's real name would appear in no
+// candidate. The publish therefore MERGES with the on-disk record first.
+func TestRenameDuringStagePublishIsMerged(t *testing.T) {
+	f := newFakeV2(t)
+	f.setDir("/d", true)
+	f.seedExtent(t, "/d/a.bin", "BASE")
+	cacheDir := engineCacheDir(t)
+	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: cacheDir})
+	br := eng.Bridge
+	ino := meta.Ino(81)
+	br.RememberPathForTest(ino, "/d/a.bin")
+	sum := sha256Hex([]byte("PEND"))
+	br.StageBlockForTest(sum, []byte("PEND"))
+	br.AddPendingForTest(ino, 0, 0, sum, 4, 8)
+
+	paused := make(chan struct{})
+	resumed := make(chan struct{})
+	// Pause AFTER this run wrote its own manifest and BEFORE it merges the
+	// on-disk state back in: exactly the window described.
+	br.stagingPausePublish = func() {
+		br.stagingPausePublish = nil
+		close(paused)
+		<-resumed
+	}
+	done := make(chan error, 1)
+	go func() { done <- br.StagePendingLocal(ino) }()
+	<-paused
+
+	// A FULL rename A->B lands now: intent, remote rename, settlement, and
+	// retirement of the in-memory registration. Only the DURABLE record
+	// remembers it, so the paused run cannot learn about it from memory —
+	// it must merge the on-disk state it is about to replace.
+	h := New(Options{Engine: eng, Threshold: 0})
+	_, rerr, _ := h.renameWithDurableIntent(context.Background(),
+		&fs.Op{Kind: fs.OpRename, Path: "/d/a.bin", Path2: "/d/b.bin"},
+		func(context.Context, *fs.Op) (fs.Result, error) {
+			f.mu.Lock()
+			f.move("/d/a.bin", "/d/b.bin")
+			f.mu.Unlock()
+			return fs.Result{}, nil
+		})
+	if rerr != nil {
+		t.Fatalf("rename: %v", rerr)
+	}
+	// Erase the in-memory mapping's knowledge of the move too: this is the
+	// worst case, where nothing but the manifest remembers /d/b.bin.
+	br.ForgetPathForTest("/d/a.bin")
+
+	close(resumed)
+	if err := <-done; err != nil {
+		t.Fatalf("staging: %v", err)
+	}
+	rec := onlyStaged(t, br)
+	// The record must not merely retain the old name: the rename that landed
+	// before this publish has to be VISIBLE, both as the saved path (so
+	// replay commits to the object's real location) and as a candidate.
+	if rec.m.Path != "/d/b.bin" {
+		t.Fatalf("saved path = %q, want /d/b.bin — the publish discarded a rename that landed before it", rec.m.Path)
+	}
+	if !rec.hasCandidate("/d/b.bin") {
+		t.Fatalf("rename destination missing: candidates = %v", rec.m.candidatePaths())
+	}
+}
+
+// ForgetPathForTest drops the bridge's in-memory mappings for a path.
+func (b *Bridge) ForgetPathForTest(local string) { b.ForgetPath(local) }
