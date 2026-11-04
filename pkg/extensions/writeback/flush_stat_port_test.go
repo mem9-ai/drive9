@@ -66,6 +66,13 @@ func TestPortExternalChangeDropsLandedWatermark(t *testing.T) {
 		deadline := time.Now().Add(5 * time.Second)
 		for {
 			if n, ok := b.Node("/f"); ok && string(n.Data) == content {
+				// "Any watermark" is deliberate: matching it against the node's
+				// revision would couple the wait to the client's revision
+				// bookkeeping (a conditional PUT answered without a parseable
+				// revision falls back to expected+1, which never equals the
+				// node's). Accepting a previous cycle's watermark is impossible
+				// here — every cycle that re-polls runs after a clear
+				// (EventInvalidated/EventUnverified/EventCheckout).
 				if _, landed := wb.landedRevision("/f"); landed {
 					break
 				}
