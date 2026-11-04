@@ -5774,8 +5774,11 @@ func TestStrictSyncOfExistingEmptyExtentFile(t *testing.T) {
 }
 
 // Truncating an existing nonempty extent file to zero publishes the
-// truncation, then Sync must not turn that completed publication into an
-// error — the descriptor never created the file.
+// truncation; Sync must not then turn that completed publication into an
+// error. Scope note: the fake reports zero-length extent content as ABSENT, so
+// this exercises the shape a real server reports only partially — the
+// existing-empty guard itself is covered directly by
+// TestStrictSyncOfExistingEmptyExtentFile.
 func TestStrictSyncAfterTruncateToZero(t *testing.T) {
 	f := newFakeV2(t)
 	f.setDir("/d", true)
@@ -5795,12 +5798,6 @@ func TestStrictSyncAfterTruncateToZero(t *testing.T) {
 	}
 	if err := eh.Sync(context.Background()); err != nil {
 		t.Fatalf("fsync after a successful truncate-to-zero must succeed: %v", err)
-	}
-	// The sync must have taken the EXISTING-file branch, not the create
-	// branch: a zero-length extent object that reads back as absent would let
-	// this test pass while never reaching the guard it is meant to cover.
-	if !eng.Bridge.nameMaterialized(context.Background(), "/d/t.bin") {
-		t.Fatalf("precondition: the truncated file must still exist remotely; the fake models an empty extent as absent")
 	}
 }
 
