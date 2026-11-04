@@ -511,14 +511,15 @@ func TestC2aHandleCopyAuthorizesSrcViaHeader(t *testing.T) {
 	}
 }
 
-// TestC2aHandleCopyAllowsBothInZone confirms the happy path: scoped token
-// with read on src zone AND write on dst zone allows copy. Negative tests
-// verify each missing capability denies.
+// TestC2aHandleCopyAllowsBothInZone confirms the happy path: a scoped token
+// with read+write on the src zone and write on the dst zone may copy. Negative
+// tests verify each missing capability denies — including write on the source,
+// because a copy aliases the source entity (see authorizeFSScopedAlias).
 func TestC2aHandleCopyAllowsBothInZone(t *testing.T) {
 	scope := &TenantScope{
 		IsScoped: true,
 		FSScopes: []FSScope{
-			{Prefix: "/source", Ops: map[FSOp]bool{FSOpRead: true}},
+			{Prefix: "/source", Ops: map[FSOp]bool{FSOpRead: true, FSOpWrite: true}},
 			{Prefix: "/dest", Ops: map[FSOp]bool{FSOpWrite: true}},
 		},
 	}
@@ -561,7 +562,7 @@ func TestC2aHandleHardlinkAllowsBothInZone(t *testing.T) {
 	scope := &TenantScope{
 		IsScoped: true,
 		FSScopes: []FSScope{
-			{Prefix: "/source", Ops: map[FSOp]bool{FSOpRead: true}},
+			{Prefix: "/source", Ops: map[FSOp]bool{FSOpRead: true, FSOpWrite: true}},
 			{Prefix: "/dest", Ops: map[FSOp]bool{FSOpWrite: true}},
 		},
 	}
@@ -972,5 +973,73 @@ func BenchmarkAuthorizeFSTenZones(b *testing.B) {
 		if err := scope.AuthorizeFS(FSOpRead, "/zone9/file.txt"); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// A copy or hardlink makes the destination a second name for the source's
+// drive9 entity, so a write through the destination rewrites the source. A
+// scoped token that may only READ the source must not be able to alias it into
+// a zone it may write.
+func TestAuthorizeFSScopedAliasRequiresWriteOnSource(t *testing.T) {
+	scope := &TenantScope{
+		IsScoped: true,
+		FSScopes: []FSScope{
+			{Prefix: "/readonly", Ops: map[FSOp]bool{FSOpRead: true, FSOpList: true}},
+			{Prefix: "/writable", Ops: map[FSOp]bool{FSOpWrite: true, FSOpRead: true, FSOpList: true}},
+		},
+	}
+	r := httptest.NewRequest(http.MethodPost, "/v1/fs/writable/link", nil)
+	r = r.WithContext(withScope(r.Context(), scope))
+
+	rec := httptest.NewRecorder()
+	if authorizeFSScopedAlias(rec, r, "/readonly/secret.txt") {
+		t.Fatal("alias of a read-only source was allowed")
+	}
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusForbidden)
+	}
+
+	if !authorizeFSScopedAlias(httptest.NewRecorder(), r, "/writable/file.txt") {
+		t.Fatal("alias of a writable source was denied")
+	}
+
+	// Owner tokens keep their existing behaviour.
+	owner := httptest.NewRequest(http.MethodPost, "/v1/fs/writable/link", nil)
+	owner = owner.WithContext(withScope(owner.Context(), &TenantScope{}))
+	if !authorizeFSScopedAlias(httptest.NewRecorder(), owner, "/readonly/secret.txt") {
+		t.Fatal("owner alias was denied")
+	}
+}
+
+// A scoped token that may only read a zone must not be able to alias it into a
+// writable zone: the copy/hardlink shares the source's entity, so the in-zone
+// write would rewrite out-of-zone content.
+func TestC2aScopedAliasDeniedForReadOnlySource(t *testing.T) {
+	scope := &TenantScope{
+		IsScoped: true,
+		FSScopes: []FSScope{
+			{Prefix: "/readonly", Ops: map[FSOp]bool{FSOpRead: true}},
+			{Prefix: "/writable", Ops: map[FSOp]bool{FSOpWrite: true}},
+		},
+	}
+	for _, tc := range []struct {
+		name   string
+		query  string
+		header string
+		handle func(*Server, http.ResponseWriter, *http.Request, string)
+	}{
+		{name: "copy", query: "copy=1", header: "X-Dat9-Copy-Source", handle: func(s *Server, w http.ResponseWriter, r *http.Request, p string) { s.handleCopy(w, r, p) }},
+		{name: "hardlink", query: "hardlink=1", header: "X-Dat9-Hardlink-Source", handle: func(s *Server, w http.ResponseWriter, r *http.Request, p string) { s.handleHardlink(w, r, p) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newScopedRequest(t, http.MethodPost, "/v1/fs/writable/alias.txt", tc.query)
+			r.Header.Set(tc.header, "/readonly/secret.txt")
+			r = r.WithContext(withScope(r.Context(), scope))
+			w := httptest.NewRecorder()
+			tc.handle(&Server{}, w, r, "/writable/alias.txt")
+			if got := w.Result().StatusCode; got != http.StatusForbidden {
+				t.Fatalf("status = %d, want %d (read-only source alias). body=%s", got, http.StatusForbidden, w.Body.String())
+			}
+		})
 	}
 }

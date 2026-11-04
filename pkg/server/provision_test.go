@@ -662,10 +662,11 @@ func TestProvisionMarksTenantFailedWhenInitKeepsFailing(t *testing.T) {
 	}()
 
 	srv := NewWithConfig(Config{
-		Meta:        metaStore,
-		Pool:        pool,
-		Provisioner: prov,
-		TokenSecret: tokenSecret,
+		Meta:                    metaStore,
+		Pool:                    pool,
+		Provisioner:             prov,
+		TokenSecret:             tokenSecret,
+		AllowAnonymousProvision: true,
 	})
 
 	ts := httptest.NewServer(srv)
@@ -764,10 +765,11 @@ func TestProvisionUsesConfiguredProvisioner(t *testing.T) {
 	}}
 
 	srv := NewWithConfig(Config{
-		Meta:        metaStore,
-		Pool:        pool,
-		Provisioner: prov,
-		TokenSecret: tokenSecret,
+		Meta:                    metaStore,
+		Pool:                    pool,
+		Provisioner:             prov,
+		TokenSecret:             tokenSecret,
+		AllowAnonymousProvision: true,
 	})
 
 	ts := httptest.NewServer(srv)
@@ -869,10 +871,11 @@ func TestProvisionTiDBCloudNativeUsesRequestCredentials(t *testing.T) {
 	}}
 
 	srv := NewWithConfig(Config{
-		Meta:        metaStore,
-		Pool:        pool,
-		Provisioner: prov,
-		TokenSecret: tokenSecret,
+		Meta:                    metaStore,
+		Pool:                    pool,
+		Provisioner:             prov,
+		TokenSecret:             tokenSecret,
+		AllowAnonymousProvision: true,
 	})
 
 	ts := httptest.NewServer(srv)
@@ -1634,6 +1637,7 @@ func TestProvisionTiDBCloudNativeCreateQuotaSkipsQuotaPatch(t *testing.T) {
 		Pool:                         pool,
 		Provisioner:                  prov,
 		TokenSecret:                  tokenSecret,
+		AllowAnonymousProvision:      true,
 		DisableDatabaseAutoEmbedding: true,
 	})
 	defer srv.Close()
@@ -1721,6 +1725,7 @@ func TestProvisionSeedsQuotaConfigWithoutExplicitQuota(t *testing.T) {
 		Pool:                         pool,
 		Provisioner:                  prov,
 		TokenSecret:                  tokenSecret,
+		AllowAnonymousProvision:      true,
 		DisableDatabaseAutoEmbedding: true,
 	})
 	defer srv.Close()
@@ -1818,6 +1823,7 @@ func TestProvisionTiDBCloudNativeRequiresEarlyBindingProvisioner(t *testing.T) {
 		Pool:                         pool,
 		Provisioner:                  prov,
 		TokenSecret:                  tokenSecret,
+		AllowAnonymousProvision:      true,
 		DisableDatabaseAutoEmbedding: true,
 	})
 	defer srv.Close()
@@ -1908,6 +1914,7 @@ func TestProvisionTiDBCloudNativeCreateTimeQuotaLocalPersistenceErrorIsInternal(
 		Pool:                         pool,
 		Provisioner:                  prov,
 		TokenSecret:                  tokenSecret,
+		AllowAnonymousProvision:      true,
 		DisableDatabaseAutoEmbedding: true,
 	})
 	defer srv.Close()
@@ -1981,6 +1988,7 @@ func TestProvisionTiDBCloudNativeCleansClusterWhenOrgBindingMissing(t *testing.T
 		Pool:                         pool,
 		Provisioner:                  prov,
 		TokenSecret:                  tokenSecret,
+		AllowAnonymousProvision:      true,
 		DisableDatabaseAutoEmbedding: true,
 	})
 	defer srv.Close()
@@ -2061,6 +2069,7 @@ func TestProvisionTiDBCloudNativeCleansClusterWhenProvisionReturnsClusterAndErro
 		Pool:                         pool,
 		Provisioner:                  prov,
 		TokenSecret:                  tokenSecret,
+		AllowAnonymousProvision:      true,
 		DisableDatabaseAutoEmbedding: true,
 	})
 	defer srv.Close()
@@ -2139,6 +2148,7 @@ func TestProvisionTiDBCloudNativePersistsClusterReferenceWhenCleanupFails(t *tes
 		Pool:                         pool,
 		Provisioner:                  prov,
 		TokenSecret:                  tokenSecret,
+		AllowAnonymousProvision:      true,
 		DisableDatabaseAutoEmbedding: true,
 	})
 	defer srv.Close()
@@ -2204,6 +2214,7 @@ func TestProvisionTiDBCloudNativeCleansClusterWhenPasswordEncryptFails(t *testin
 		Pool:                         pool,
 		Provisioner:                  prov,
 		TokenSecret:                  tokenSecret,
+		AllowAnonymousProvision:      true,
 		DisableDatabaseAutoEmbedding: true,
 	})
 	defer srv.Close()
@@ -2271,10 +2282,11 @@ func TestProvisionTiDBCloudNativeRequiresRequestCredentials(t *testing.T) {
 	}
 	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative, cluster: &tenant.ClusterInfo{}}
 	srv := NewWithConfig(Config{
-		Meta:        metaStore,
-		Pool:        pool,
-		Provisioner: prov,
-		TokenSecret: tokenSecret,
+		Meta:                    metaStore,
+		Pool:                    pool,
+		Provisioner:             prov,
+		TokenSecret:             tokenSecret,
+		AllowAnonymousProvision: true,
 	})
 
 	ts := httptest.NewServer(srv)
@@ -2361,6 +2373,7 @@ func TestProvisionTiDBCloudNativeRejectsQuotaWithoutCredentials(t *testing.T) {
 		Pool:                         pool,
 		Provisioner:                  prov,
 		TokenSecret:                  tokenSecret,
+		AllowAnonymousProvision:      true,
 		DisableDatabaseAutoEmbedding: true,
 	})
 	defer srv.Close()
@@ -2423,10 +2436,11 @@ func TestProvisionTenantRejectsMissingNativeCredentialsBeforeInsert(t *testing.T
 	}
 	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative}
 	srv := NewWithConfig(Config{
-		Meta:        metaStore,
-		Pool:        pool,
-		Provisioner: prov,
-		TokenSecret: tokenSecret,
+		Meta:                    metaStore,
+		Pool:                    pool,
+		Provisioner:             prov,
+		TokenSecret:             tokenSecret,
+		AllowAnonymousProvision: true,
 	})
 	defer srv.Close()
 
@@ -2895,10 +2909,11 @@ func TestProvisionPersistsTenantBeforeProvisionFailure(t *testing.T) {
 	}
 
 	srv := NewWithConfig(Config{
-		Meta:        metaStore,
-		Pool:        pool,
-		Provisioner: prov,
-		TokenSecret: tokenSecret,
+		Meta:                    metaStore,
+		Pool:                    pool,
+		Provisioner:             prov,
+		TokenSecret:             tokenSecret,
+		AllowAnonymousProvision: true,
 	})
 
 	ts := httptest.NewServer(srv)
@@ -2975,10 +2990,11 @@ func TestProvisionCleansPartialClusterBeforeMarkingFailed(t *testing.T) {
 	}
 
 	srv := NewWithConfig(Config{
-		Meta:        metaStore,
-		Pool:        pool,
-		Provisioner: prov,
-		TokenSecret: tokenSecret,
+		Meta:                    metaStore,
+		Pool:                    pool,
+		Provisioner:             prov,
+		TokenSecret:             tokenSecret,
+		AllowAnonymousProvision: true,
 	})
 
 	ts := httptest.NewServer(srv)
@@ -3579,6 +3595,7 @@ func TestProvisionTiDBCloudNativeRejectsPartialCredentials(t *testing.T) {
 		Pool:                         pool,
 		Provisioner:                  prov,
 		TokenSecret:                  tokenSecret,
+		AllowAnonymousProvision:      true,
 		DisableDatabaseAutoEmbedding: true,
 	})
 	defer srv.Close()
@@ -3633,6 +3650,7 @@ func TestProvisionTiDBCloudNativeUsesDefaultCredentialsWhenOmitted(t *testing.T)
 		Pool:                         pool,
 		Provisioner:                  prov,
 		TokenSecret:                  tokenSecret,
+		AllowAnonymousProvision:      true,
 		DisableDatabaseAutoEmbedding: true,
 	})
 	defer srv.Close()
@@ -3664,5 +3682,65 @@ func TestProvisionTiDBCloudNativeUsesDefaultCredentialsWhenOmitted(t *testing.T)
 	}
 	if binding.OrganizationID != "org-default" || binding.ClusterID != "native-cluster-default" {
 		t.Fatalf("binding = %#v", binding)
+	}
+}
+
+// Anonymous provisioning is opt-in. With the default policy, a request that
+// omits the caller's TiDB Cloud key pair must not spend the server's own
+// credential to create a tenant.
+func TestProvisionRejectsAnonymousCallerByDefault(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testtidb.ResetMetaDB(t, metaStore.DB())
+
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	defer pool.Close()
+
+	tokenSecret := make([]byte, 32)
+	if _, err := rand.Read(tokenSecret); err != nil {
+		t.Fatal(err)
+	}
+	prov := &fakeProvisioner{
+		provider: tenant.ProviderTiDBCloudNative,
+		cluster:  &tenant.ClusterInfo{ClusterID: "cluster-1", Host: "db.example", Port: 4000, Username: "u", DBName: "d"},
+	}
+	prov.defaultPublicKey = "default-pk"
+	prov.defaultPrivateKey = "default-sk"
+
+	srv := NewWithConfig(Config{
+		Meta:        metaStore,
+		Pool:        pool,
+		Provisioner: prov,
+		TokenSecret: tokenSecret,
+		// AllowAnonymousProvision deliberately unset: this is the default.
+	})
+	defer srv.Close()
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	body, _ := json.Marshal(map[string]string{})
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/provision", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d (anonymous provisioning must be opt-in)", resp.StatusCode, http.StatusUnauthorized)
+	}
+	if cred := prov.lastCredentialReq; cred.PublicKey != "" || cred.PrivateKey != "" {
+		t.Fatalf("provisioner was called with credentials %+v", cred)
 	}
 }

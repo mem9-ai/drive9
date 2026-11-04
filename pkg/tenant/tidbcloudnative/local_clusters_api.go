@@ -2,7 +2,10 @@ package tidbcloudnative
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -30,9 +33,21 @@ const (
 	// label drive9.local.session=<id> so harness scripts can clean only this run.
 	EnvTiDBCloudLocalSessionID = "DRIVE9_TIDBCLOUD_LOCAL_SESSION_ID"
 
+	// EnvTiDBCloudLocalPublicKey and EnvTiDBCloudLocalPrivateKey pin the
+	// server-owned key pair the local control plane authenticates. They must be
+	// set together. When both are unset a random pair is generated per process,
+	// so the backend never accepts a credential that ships in the source tree.
+	EnvTiDBCloudLocalPublicKey  = "DRIVE9_TIDBCLOUD_LOCAL_PUBLIC_KEY"
+	EnvTiDBCloudLocalPrivateKey = "DRIVE9_TIDBCLOUD_LOCAL_PRIVATE_KEY"
+
 	defaultLocalTiDBImage = "pingcap/tidb:v8.5.6"
 	localUserPrefix       = "local"
 	localSessionLabelKey  = "drive9.local.session"
+
+	// localCredentialKeyPrefix and localCredentialBytes shape a generated local
+	// control-plane key pair: 16 random bytes per half, hex encoded.
+	localCredentialKeyPrefix = "drive9-local-"
+	localCredentialBytes     = 16
 
 	// Concurrent warm-pool grow + real-time create can race on host
 	// ports. Serialize allocate+run and retry on bind conflicts.
@@ -52,6 +67,10 @@ type LocalClustersAPI struct {
 	host      string
 	sessionID string
 
+	// credential is the only key pair authorize accepts. It is pinned by the
+	// local key env vars or generated at startup; it is never a constant.
+	credential localCredential
+
 	// createMu serializes host-port allocation + container start so concurrent
 	// Create/BatchCreate (warm grow vs real-time pool) do not pick the same port.
 	createMu sync.Mutex
@@ -60,6 +79,13 @@ type LocalClustersAPI struct {
 	clusters      map[string]*localCluster // clusterID -> state
 	branches      map[string]*localBranch  // clusterID/branchID -> state
 	reservedPorts map[int]struct{}         // ports held between docker start and registry insert
+}
+
+// localCredential is the key pair the local control plane authenticates. The
+// local backend is the only issuer and the only verifier of it.
+type localCredential struct {
+	publicKey  string
+	privateKey string
 }
 
 type localCluster struct {
@@ -80,6 +106,10 @@ type LocalClustersAPIConfig struct {
 	Image     string
 	Host      string
 	SessionID string
+	// PublicKey and PrivateKey pin the server-owned control-plane credential.
+	// Leaving both empty generates a random pair for this process.
+	PublicKey  string
+	PrivateKey string
 }
 
 func NewLocalClustersAPIFromEnv() (*LocalClustersAPI, error) {
@@ -104,25 +134,101 @@ func NewLocalClustersAPIFromEnv() (*LocalClustersAPI, error) {
 	if host == "" {
 		host = "127.0.0.1"
 	}
-	return NewLocalClustersAPI(LocalClustersAPIConfig{
-		Runtime:   runtime,
-		Image:     image,
-		Host:      host,
-		SessionID: strings.TrimSpace(os.Getenv(EnvTiDBCloudLocalSessionID)),
-	}), nil
+	publicKey := strings.TrimSpace(os.Getenv(EnvTiDBCloudLocalPublicKey))
+	privateKey := strings.TrimSpace(os.Getenv(EnvTiDBCloudLocalPrivateKey))
+	api, err := NewLocalClustersAPI(LocalClustersAPIConfig{
+		Runtime:    runtime,
+		Image:      image,
+		Host:       host,
+		SessionID:  strings.TrimSpace(os.Getenv(EnvTiDBCloudLocalSessionID)),
+		PublicKey:  publicKey,
+		PrivateKey: privateKey,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if publicKey == "" && privateKey == "" {
+		// An unpinned deployment only knows its credential in memory, so external
+		// control-plane callers cannot authenticate. Say so once at startup
+		// instead of letting them collect 401s; the values are never logged.
+		logger.Info(context.Background(), "local_clusters_credential_generated",
+			zap.String("hint", "set "+EnvTiDBCloudLocalPublicKey+" and "+EnvTiDBCloudLocalPrivateKey+" to pin a known local control-plane key pair"))
+	}
+	return api, nil
 }
 
-func NewLocalClustersAPI(cfg LocalClustersAPIConfig) *LocalClustersAPI {
+func NewLocalClustersAPI(cfg LocalClustersAPIConfig) (*LocalClustersAPI, error) {
+	credential, err := resolveLocalCredential(cfg.PublicKey, cfg.PrivateKey)
+	if err != nil {
+		return nil, err
+	}
 	return &LocalClustersAPI{
 		runtime:       cfg.Runtime,
 		image:         cfg.Image,
 		orgID:         localOrgID,
 		host:          cfg.Host,
 		sessionID:     strings.TrimSpace(cfg.SessionID),
+		credential:    credential,
 		clusters:      map[string]*localCluster{},
 		branches:      map[string]*localBranch{},
 		reservedPorts: map[int]struct{}{},
+	}, nil
+}
+
+// Credentials returns the server-owned key pair this local control plane
+// accepts. Internal callers (the provisioner) use it to execute cluster
+// operations; it is never derived from the source tree.
+func (a *LocalClustersAPI) Credentials() (publicKey, privateKey string) {
+	if a == nil {
+		return "", ""
 	}
+	return a.credential.publicKey, a.credential.privateKey
+}
+
+// resolveLocalCredential returns the only pair the local control plane accepts.
+// A pinned pair must be complete; otherwise a fresh random pair is generated so
+// the backend never falls back to a compiled-in credential.
+func resolveLocalCredential(publicKey, privateKey string) (localCredential, error) {
+	publicKey = strings.TrimSpace(publicKey)
+	privateKey = strings.TrimSpace(privateKey)
+	if publicKey == "" && privateKey == "" {
+		return generateLocalCredential()
+	}
+	if publicKey == "" || privateKey == "" {
+		return localCredential{}, fmt.Errorf("%s and %s must be set together", EnvTiDBCloudLocalPublicKey, EnvTiDBCloudLocalPrivateKey)
+	}
+	// Reject values no caller could ever present: a control character cannot be
+	// carried in an X-TiDBCloud-*-Key header, so accepting one at startup would
+	// produce a healthy server that 401s every external caller.
+	if err := validateLocalCredentialEnvValue(EnvTiDBCloudLocalPublicKey, publicKey); err != nil {
+		return localCredential{}, err
+	}
+	if err := validateLocalCredentialEnvValue(EnvTiDBCloudLocalPrivateKey, privateKey); err != nil {
+		return localCredential{}, err
+	}
+	return localCredential{publicKey: publicKey, privateKey: privateKey}, nil
+}
+
+// validateLocalCredentialEnvValue rejects the ASCII control characters (C0 and
+// DEL) that HTTP header values cannot carry.
+func validateLocalCredentialEnvValue(envVar, value string) error {
+	for _, r := range value {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("%s contains a control character that cannot be sent in a request header", envVar)
+		}
+	}
+	return nil
+}
+
+func generateLocalCredential() (localCredential, error) {
+	buf := make([]byte, 2*localCredentialBytes)
+	if _, err := rand.Read(buf); err != nil {
+		return localCredential{}, fmt.Errorf("generate local control-plane credential: %w", err)
+	}
+	return localCredential{
+		publicKey:  localCredentialKeyPrefix + "pk-" + hex.EncodeToString(buf[:localCredentialBytes]),
+		privateKey: localCredentialKeyPrefix + "sk-" + hex.EncodeToString(buf[localCredentialBytes:]),
+	}, nil
 }
 
 var _ ClustersAPI = (*LocalClustersAPI)(nil)
@@ -687,9 +793,23 @@ func (a *LocalClustersAPI) waitMySQL(ctx context.Context, host string, port int,
 	return fmt.Errorf("timeout waiting for mysql at %s:%d: %w", host, port, last)
 }
 
+// authorize verifies the caller-supplied key pair against the server-owned
+// local credential. LocalClustersAPI simulates the TiDB Cloud control plane, so
+// it keeps the same invariant as the real API: only the configured pair is
+// authenticated, and that pair is what ResolveAPIKey maps to the org-owner
+// identity. Anything else fails closed with 401 instead of being trusted.
 func (a *LocalClustersAPI) authorize(publicKey, privateKey string) error {
-	if strings.TrimSpace(publicKey) == "" || strings.TrimSpace(privateKey) == "" {
+	publicKey = strings.TrimSpace(publicKey)
+	privateKey = strings.TrimSpace(privateKey)
+	if publicKey == "" || privateKey == "" {
 		return tenant.ErrCredentialsRequired
+	}
+	// Compare both halves without short-circuiting so a matching public key is
+	// not distinguishable from a matching private key through timing.
+	publicMatches := subtle.ConstantTimeCompare([]byte(publicKey), []byte(a.credential.publicKey))
+	privateMatches := subtle.ConstantTimeCompare([]byte(privateKey), []byte(a.credential.privateKey))
+	if publicMatches&privateMatches != 1 {
+		return newAPIStatusError("api key authorize", http.StatusUnauthorized, "")
 	}
 	return nil
 }
