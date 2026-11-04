@@ -112,12 +112,13 @@ type Bridge struct {
 	// is only valid while the occupant is still THAT object.
 	layoutPendingID map[meta.Ino]string
 	verifyBase      map[meta.Ino]verifyBase
-	// createdIdentity is the identity of the EMPTY placeholder THIS
-	// descriptor materialized with an absence-CAS create (touch). The same
-	// name file is replaced with a fresh extent create on the first write,
-	// and that delete must be authorized by this identity — a foreign empty
-	// file that took the name in between is refused, never deleted.
-	placeholderID map[meta.Ino]string
+	// pendingRenames maps an in-flight rename's source to its destination
+	// (full remote paths). A durable barrier STAGED while the remote rename
+	// is in flight inherits the intent: StagePendingLocal does not run under
+	// the plane's path locks, so a generation written between the intent
+	// scan and the rename would otherwise name only the OLD path, and a
+	// crash after the rename commits would make recovery skip it.
+	pendingRenames map[string]string
 
 	// classicOwned marks files whose fresh extent session silently
 	// degraded to a CLASSIC upload on a legacy server: the handle stays
@@ -207,7 +208,7 @@ func NewBridge(cfg Config) *Bridge {
 		freshCreate:     make(map[meta.Ino]bool),
 		commitErr:       make(map[meta.Ino]error),
 		verifyBase:      make(map[meta.Ino]verifyBase),
-		placeholderID:   make(map[meta.Ino]string),
+		pendingRenames:  make(map[string]string),
 	}
 	// Provenance refetch resolves through the inode's CURRENT mapping:
 	// open files move under renames and retention aliases, and a stale

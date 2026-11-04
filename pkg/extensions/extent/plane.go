@@ -466,19 +466,33 @@ func (h *Handler) renameWithDurableIntent(ctx context.Context, op *fs.Op, next f
 	if err := br.StageRenameIntentLocal(op.Path, op.Path2); err != nil {
 		return fs.Result{}, fmt.Errorf("rename %s to %s: %w", op.Path, op.Path2, err), true
 	}
-	res, err, _ := h.tryRenameOverOpen(ctx, op, next)
-	if err == nil {
-		// The rename landed: retire the intent and adopt the destination
-		// name (every staged record at or under the old name follows).
-		// A failure leaves the intent in place — recovery tries both
-		// names — so this can only delay cleanup.
-		br.SettleRenameIntentLocal(op.Path, op.Path2, true)
-		return res, nil, true
+	// The in-flight registration must end with this operation whatever the
+	// outcome; the DURABLE intents are what keep recovery correct.
+	defer br.ClearRenameIntentLocal(op.Path, op.Path2)
+
+	res, err, handled := h.tryRenameOverOpen(ctx, op, next)
+	if !handled {
+		// The helper declined to run the rename (e.g. the destination has an
+		// open handle that is still local-only, so there is no remote alias
+		// to retain). Run the chain HERE so this wrapper observes the
+		// outcome; a not-handled result means only that the helper did
+		// nothing, never that the rename happened.
+		res, err = next(ctx, op)
 	}
-	// The rename did NOT land: abandon the intent so a later unrelated
-	// create at the destination name never adopts this record.
-	br.SettleRenameIntentLocal(op.Path, op.Path2, false)
-	return res, err, true
+	if err != nil {
+		// An error does NOT prove the remote rename failed to commit: a
+		// committed rename can lose its response, and the detached probes
+		// can fail during the same outage. Keep the durable destination —
+		// recovery then accepts the staged object at EITHER name — instead
+		// of clearing the only record of where the bytes may now live.
+		return res, err, true
+	}
+	// The rename landed: adopt the destination name and retire the intent
+	// in every staged record at or under the old name. Best-effort: a
+	// leftover intent stays recoverable (replay tries both names), so a
+	// failure here can only delay cleanup.
+	br.SettleRenameIntentLocal(op.Path, op.Path2)
+	return res, nil, true
 }
 
 // tryRenameOverOpen preserves an OPEN engine file that a rename is about

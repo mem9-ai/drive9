@@ -840,13 +840,14 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 	if !fresh && b.needsFreshIdentity(ino) {
 		// A locally-created descriptor whose landing never established an
 		// attributable identity (no completion echo, no bound
-		// classification) must not touch whoever currently holds the name:
-		// that occupant may be a replacement, and without identity neither
-		// a PATCH nor a "replace the empty stub" delete can tell it apart.
-		// This guard runs BEFORE the classic-layout branch: an empty
-		// occupant is still a foreign object, and deleting it would be the
-		// same unauthorized write as PATCHing it.
-		return fmt.Errorf("fresh create of %s has no attributable identity for the current occupant", path)
+		// classification) must not write into whoever currently holds the
+		// name: that occupant may be a replacement. An EMPTY CLASSIC
+		// occupant is the one exception, and only because the branch below
+		// handles it WITHOUT deleting anything — it commits through the
+		// classic surface. Anything else is refused.
+		if st.ContentLayout == client.ContentLayoutExtent || st.Size != 0 {
+			return fmt.Errorf("fresh create of %s has no attributable identity for the current occupant", path)
+		}
 	}
 	if !fresh && st.ContentLayout != client.ContentLayoutExtent {
 		if b.isClassicOwned(ino) || b.isLayoutPending(ino) {
@@ -880,20 +881,21 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 		}
 		if st.Size == 0 {
 			// An empty file materialized as classic (empty extent files
-			// cannot exist server-side yet); replace it and treat this as
-			// the fresh create it semantically is. The replacement is only
-			// authorized for the object THIS descriptor created — the
-			// absence-CAS create recorded its identity, so a foreign empty
-			// file that took the name since is refused, exactly like a
-			// non-empty occupant.
-			if created := b.createdIdentityOf(ino); created == "" || created != st.ResourceID {
-				return fmt.Errorf("target %s was replaced before our create landed", path)
-			}
-			if err := b.cfg.Client.RemoveAllCtx(ctx, path); err != nil {
-				return err
-			}
-			b.forgetCreatedIdentity(ino)
-			fresh = true
+			// cannot exist server-side yet). Promoting it means DELETING the
+			// occupant, which is only authorized when the occupant is
+			// provably the placeholder we created.
+			//
+			// That proof is unavailable: the create call answers with a
+			// revision and no resource identity, and a follow-up Stat is a
+			// separate request — a concurrent replacement between them
+			// would be recorded as "our" placeholder and then deleted. So an
+			// unattributable empty occupant is NEVER deleted; the commit
+			// falls back to the classic surface, which is exactly where a
+			// classic mount would have written it.
+			b.mu.Lock()
+			b.classicOwned[ino] = true
+			b.mu.Unlock()
+			return b.commitClassic(ctx, ino, path, pending, size, st.Revision)
 		} else {
 			return fmt.Errorf("target %s is not extent layout", path)
 		}
@@ -1677,12 +1679,46 @@ func (b *Bridge) StagePendingLocal(ino meta.Ino) error {
 			File     string `json:"file"`
 		}{Chunk: p.chunk, Off: p.off, Size: p.size, Checksum: p.checksum, File: name})
 	}
+	// A rename may be IN FLIGHT for this pathname right now. StagePendingLocal
+	// does not hold the plane's path locks, so this generation can be written
+	// after the rename's intent scan and before the remote rename commits —
+	// in which case the older generation carrying the intent is superseded
+	// here, and a record naming only the OLD path would strand these
+	// acknowledged bytes if the rename then commits and the process crashes.
+	// The registration is consulted AFTER the bytes are written and again
+	// after the manifest lands: the writer either sees a registration whose
+	// scan can no longer reach this record, or the scan sees a record that
+	// already carries the intent — one of the two orderings always wins.
+	b.mu.Lock()
+	if to, ok := b.pendingRenameLocked(path); ok {
+		m.NextPath = to
+	}
+	b.mu.Unlock()
 	raw, err := json.Marshal(m)
 	if err != nil {
 		return err
 	}
 	if err := writeFileSynced(filepath.Join(dir, "manifest.json"), raw); err != nil {
 		return err
+	}
+	// Re-check AFTER the manifest landed. A registration installed between
+	// the snapshot above and this write cannot have been seen by its own
+	// scan (the scan cannot observe a manifest written after it), so this is
+	// the only place that ordering is caught. Later registrations are the
+	// scan's responsibility — it runs after installing the registration and
+	// therefore sees this manifest.
+	b.mu.Lock()
+	to, renamed := b.pendingRenameLocked(path)
+	b.mu.Unlock()
+	if renamed && to != m.NextPath {
+		m.NextPath = to
+		again, merr := json.Marshal(m)
+		if merr != nil {
+			return merr
+		}
+		if werr := writeFileSynced(filepath.Join(dir, "manifest.json"), again); werr != nil {
+			return werr
+		}
 	}
 	clean = false
 	// Supersede: pending is cumulative, so older generations of this file
@@ -1786,18 +1822,12 @@ func (b *Bridge) ReplayStagedLocal(ctx context.Context) {
 			// An empty-file barrier must still materialize the NAME: a
 			// successful fsync acknowledged the file's existence, and
 			// dropping the record without creating it would make the
-			// acknowledged file disappear. Record the placeholder's
-			// identity for the same reason FlushFile does: the first write
-			// through this inode replaces an empty classic occupant, and
-			// that delete is only authorized against OUR placeholder.
+			// acknowledged file disappear. No identity is recorded: the
+			// create call returns none, and a follow-up Stat could describe
+			// a concurrent replacement. A later promotion therefore never
+			// deletes this occupant — it commits classically instead.
 			if st, serr := b.StatLocal(ctx, landedPath); serr != nil && client.IsNotFound(serr) {
-				if _, cerr := b.cfg.Client.CreateFileCtx(ctx, landedPath); cerr != nil {
-					err = cerr
-				} else if pst, perr := b.cfg.Client.StatCtx(ctx, landedPath); perr == nil && pst.ResourceID != "" {
-					b.mu.Lock()
-					b.placeholderID[ino] = pst.ResourceID
-					b.mu.Unlock()
-				}
+				_, err = b.cfg.Client.CreateFileCtx(ctx, landedPath)
 			} else if serr != nil {
 				err = serr
 			} else {
@@ -1944,42 +1974,86 @@ func renamedUnder(p, oldFull, newFull string) (string, bool) {
 // bytes. A failure here refuses the rename while nothing has moved yet —
 // acknowledging it would leave the barrier naming a name that no longer
 // holds the object (or, worse, the reverse) forever.
+//
+// Two further obligations:
+//
+//   - A record whose PENDING destination (NextPath) lies under oldFull is
+//     moving too: a previous rename may have committed with its post-rename
+//     cleanup failing locally, so NextPath is still the live location. The
+//     new destination supersedes it.
+//   - Barriers STAGED while the rename is in flight must inherit the intent.
+//     StagePendingLocal does not run under the plane's path locks, so the
+//     in-flight registration is installed FIRST and StagePendingLocal
+//     re-checks it after writing — either the scan below sees the new
+//     manifest, or the manifest sees the registration.
 func (b *Bridge) StageRenameIntent(oldFull, newFull string) error {
 	if b.cfg.StagingDir == "" || oldFull == newFull {
 		return nil
 	}
+	b.mu.Lock()
+	if b.pendingRenames == nil {
+		b.pendingRenames = make(map[string]string)
+	}
+	b.pendingRenames[oldFull] = newFull
+	b.mu.Unlock()
 	recs, err := b.scanStaged()
 	if err != nil {
+		b.ClearRenameIntent(oldFull, newFull)
 		return fmt.Errorf("stage rename intent %s → %s: %w", oldFull, newFull, err)
 	}
 	for _, r := range recs {
-		next, ok := renamedUnder(r.m.Path, oldFull, newFull)
-		if !ok || r.m.NextPath == next {
+		next := ""
+		if mapped, ok := renamedUnder(r.m.Path, oldFull, newFull); ok {
+			next = mapped
+		} else if mapped, ok := renamedUnder(r.m.NextPath, oldFull, newFull); ok {
+			next = mapped
+		}
+		if next == "" || r.m.NextPath == next {
 			continue
 		}
 		r.m.NextPath = next
 		raw, merr := json.Marshal(r.m)
 		if merr != nil {
+			b.ClearRenameIntent(oldFull, newFull)
 			return fmt.Errorf("stage rename intent for %s: %w", r.m.Path, merr)
 		}
 		if werr := writeFileAtomic(filepath.Join(r.dir, "manifest.json"), raw); werr != nil {
+			b.ClearRenameIntent(oldFull, newFull)
 			return fmt.Errorf("stage rename intent for %s: %w", r.m.Path, werr)
 		}
 	}
 	return nil
 }
 
-// SettleRenameIntent finalizes or abandons a staged rename's intent.
-// landed=true means the remote rename took effect: every record under the
-// OLD name (a directory rename strands all of its descendants, not only the
-// renamed inode) adopts its destination, and every intent recorded for the
-// new subtree is retired. landed=false only abandons the intents — nothing
-// moved, so the saved names still hold their objects.
-//
-// Deliberately best-effort: a leftover NextPath stays recoverable (replay
-// tries both names), so a post-rename write failure can only delay cleanup,
-// never lose data.
-func (b *Bridge) SettleRenameIntent(oldFull, newFull string, landed bool) {
+// ClearRenameIntent retires the in-flight registration for a rename (it has
+// either settled or failed). The durable NextPath entries are untouched: an
+// ambiguous outcome keeps them so recovery tries both names.
+func (b *Bridge) ClearRenameIntent(oldFull, newFull string) {
+	b.mu.Lock()
+	if cur, ok := b.pendingRenames[oldFull]; ok && cur == newFull {
+		delete(b.pendingRenames, oldFull)
+	}
+	b.mu.Unlock()
+}
+
+// pendingRenameLocked reports the destination a in-flight rename assigns to
+// full, if any. The caller holds b.mu.
+func (b *Bridge) pendingRenameLocked(full string) (string, bool) {
+	for from, to := range b.pendingRenames {
+		if mapped, ok := renamedUnder(full, from, to); ok {
+			return mapped, true
+		}
+	}
+	return "", false
+}
+
+// SettleRenameIntent adopts the destination of a rename that LANDED: every
+// record at or under the old name (a directory rename strands all of its
+// descendants, not only the renamed inode) follows, and the recorded
+// intents are retired. It is only called for a committed rename —
+// deliberately best-effort, because a leftover NextPath stays recoverable
+// (replay tries both names), so a failure here can only delay cleanup.
+func (b *Bridge) SettleRenameIntent(oldFull, newFull string) {
 	if b.cfg.StagingDir == "" || newFull == "" {
 		return
 	}
@@ -1992,17 +2066,12 @@ func (b *Bridge) SettleRenameIntent(oldFull, newFull string, landed bool) {
 		// A record still naming the old subtree follows the rename. This is
 		// what covers DESCENDANTS: they hold their own inodes, so no
 		// per-inode retarget can reach them from the renamed directory.
-		if landed {
-			if next, ok := renamedUnder(r.m.Path, oldFull, newFull); ok {
-				r.m.Path, r.m.NextPath, changed = next, "", true
-			}
+		if next, ok := renamedUnder(r.m.Path, oldFull, newFull); ok {
+			r.m.Path, r.m.NextPath, changed = next, "", true
 		}
-		// Retire the recorded intent, adopting its destination when the
-		// rename landed.
+		// Retire the recorded intent, adopting its destination.
 		if r.m.NextPath != "" && (r.m.NextPath == newFull || strings.HasPrefix(r.m.NextPath, newFull+"/")) {
-			if landed {
-				r.m.Path = r.m.NextPath
-			}
+			r.m.Path = r.m.NextPath
 			r.m.NextPath, changed = "", true
 		}
 		if !changed {
@@ -2021,9 +2090,14 @@ func (b *Bridge) StageRenameIntentLocal(srcLocal, dstLocal string) error {
 	return b.StageRenameIntent(b.fullPath(srcLocal), b.fullPath(dstLocal))
 }
 
+// ClearRenameIntentLocal is ClearRenameIntent for mount-local paths.
+func (b *Bridge) ClearRenameIntentLocal(srcLocal, dstLocal string) {
+	b.ClearRenameIntent(b.fullPath(srcLocal), b.fullPath(dstLocal))
+}
+
 // SettleRenameIntentLocal is SettleRenameIntent for mount-local paths.
-func (b *Bridge) SettleRenameIntentLocal(srcLocal, dstLocal string, landed bool) {
-	b.SettleRenameIntent(b.fullPath(srcLocal), b.fullPath(dstLocal), landed)
+func (b *Bridge) SettleRenameIntentLocal(srcLocal, dstLocal string) {
+	b.SettleRenameIntent(b.fullPath(srcLocal), b.fullPath(dstLocal))
 }
 
 // retargetStagedGensFor rewrites the saved pathname of every staged
@@ -2330,21 +2404,30 @@ func (b *Bridge) layoutPendingMatches(ino meta.Ino, occupantID string) bool {
 
 // imageMatchesPending reports whether the pathname's current extent object
 // holds EXACTLY the image this descriptor staged: the same size, every
-// staged block at its exact offset with its exact content key, and no
-// non-zero block outside the staged ranges (everything else is a hole, which
-// the staged image also serves as zeros).
+// staged block represented at its exact offset over its exact byte range,
+// and no non-zero block outside the staged ranges (everything else is a
+// hole, which the staged image also serves as zeros).
 //
-// One shared block is deliberately NOT enough: a foreign replacement whose
-// first block happens to match would be adopted and then would receive this
-// descriptor's size and bytes.
+// Neither a shared checksum nor FileOffset+BlockKey is enough. A plan block
+// also carries Length and BlockOffset, and a block that references only a
+// PREFIX of our content (same key, same start offset, shorter length)
+// followed by holes would otherwise pass: the one wanted offset gets marked
+// seen while the rest of the range is zeros, so a same-size replacement with
+// a truncated tail could be bound as our upload. Every staged range must
+// therefore be represented with its full length, read from the start of its
+// object.
 func (b *Bridge) imageMatchesPending(ctx context.Context, path string, size int64, pending []pendingWrite) bool {
 	if size <= 0 {
 		return false
 	}
-	want := make(map[int64]string, len(pending))
+	type stagedBlock struct {
+		length int64
+		key    string
+	}
+	want := make(map[int64]stagedBlock, len(pending))
 	for _, p := range pending {
 		start := int64(p.chunk)*meta.ChunkSize + int64(p.off)
-		want[start] = p.checksum
+		want[start] = stagedBlock{length: p.size, key: p.checksum}
 	}
 	if len(want) == 0 {
 		return false
@@ -2366,8 +2449,14 @@ func (b *Bridge) imageMatchesPending(ctx context.Context, path string, size int6
 			if blk.Zero || blk.BlockKey == "" {
 				continue // a hole agrees with our zero-filled gaps
 			}
-			if want[blk.FileOffset] != blk.BlockKey {
-				return false // foreign bytes somewhere in the image
+			exp, ours := want[blk.FileOffset]
+			// The block must represent OUR bytes: same content key, the
+			// full staged length, and read from the beginning of that
+			// object. A partial reference to the same content is a
+			// different image (holes where our bytes should be).
+			if !ours || exp.key != blk.BlockKey ||
+				exp.length != blk.Length || blk.BlockOffset != 0 {
+				return false
 			}
 			seen[blk.FileOffset] = true
 		}
@@ -2508,25 +2597,8 @@ func (b *Bridge) needsFreshIdentity(ino meta.Ino) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.freshCreate[ino] && b.verifyBase[ino].resID == "" &&
-		b.layoutPendingID[ino] == "" && b.placeholderID[ino] == "" &&
+		b.layoutPendingID[ino] == "" &&
 		!b.classicOwned[ino]
-}
-
-// createdIdentity reports the identity of the empty placeholder this
-// bridge created for the inode ("" when none was recorded).
-func (b *Bridge) createdIdentityOf(ino meta.Ino) string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.placeholderID[ino]
-}
-
-// forgetCreatedIdentity retires the placeholder record once it has been
-// consumed (the placeholder was deleted and replaced) or the file left the
-// classic-empty state.
-func (b *Bridge) forgetCreatedIdentity(ino meta.Ino) {
-	b.mu.Lock()
-	delete(b.placeholderID, ino)
-	b.mu.Unlock()
 }
 
 // ModeOf reports the mode recorded for the inode at creation (Mknod).
@@ -2541,7 +2613,6 @@ func (b *Bridge) ModeOf(ino meta.Ino) (uint32, bool) {
 func (b *Bridge) forgetInoLocked(ino meta.Ino) {
 	delete(b.layoutPendingID, ino)
 	delete(b.layoutPending, ino)
-	delete(b.placeholderID, ino)
 	delete(b.verifyBase, ino)
 	delete(b.commitErr, ino)
 	delete(b.classicOwned, ino)
@@ -2893,16 +2964,12 @@ func (b *Bridge) FlushFile(ctx context.Context, ino meta.Ino) error {
 			if _, err := b.cfg.Client.CreateFileCtx(ctx, path); err != nil {
 				return err
 			}
-			// Record the identity of the placeholder we just created: the
-			// first write replaces this classic empty with a fresh extent
-			// create, and that DELETE must be authorized by knowing the
-			// occupant is exactly our placeholder — a foreign empty file
-			// that took the name meanwhile is refused instead.
-			if st, serr := b.cfg.Client.StatCtx(ctx, path); serr == nil && st.ResourceID != "" {
-				b.mu.Lock()
-				b.placeholderID[ino] = st.ResourceID
-				b.mu.Unlock()
-			}
+			// No placeholder identity is recorded: CreateFileCtx returns a
+			// revision and no resource id, and a follow-up Stat is a
+			// separate request whose answer may describe another client's
+			// replacement. Binding that answer would authorize deleting a
+			// foreign object, so the identity stays unknown and a later
+			// promotion commits through the classic surface instead.
 			// Keep the inode mapping: the engine handle is still open, and
 			// a later write through the same descriptor commits via this
 			// path (the size-0 classic target is replaced with a fresh
