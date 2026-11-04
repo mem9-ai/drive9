@@ -7,6 +7,7 @@
 package staging
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -554,8 +555,9 @@ func TestConflictTransferMovesLiveEntryPairAcrossCrash(t *testing.T) {
 
 // TestConflictTransferAbortKeepsLiveEntryIntact pins the failed-move rollback
 // for a live entry: the prepared destination .meta is removed and the old
-// name keeps its live entry and payload — the re-target's failure path must
-// not leave an unbacked metadata file behind.
+// name keeps its entry and payload — flipped to a preserved conflict marker
+// at Begin, so recovery skips it instead of re-uploading the dead name — and
+// the re-target's failure path leaves no unbacked metadata behind.
 func TestConflictTransferAbortKeepsLiveEntryIntact(t *testing.T) {
 	dir := t.TempDir()
 	idx, shadows, gen := newLiveTransferFixture(t, dir, "/a", "queued successor")
@@ -577,7 +579,55 @@ func TestConflictTransferAbortKeepsLiveEntryIntact(t *testing.T) {
 		t.Fatalf("prepared meta for the new name survived the abort: %v", serr)
 	}
 	meta, found := idx.GetMeta("/a")
-	if !found || meta == nil || meta.Kind != PendingNew || meta.Generation != gen {
-		t.Fatalf("old-name entry after the abort = %+v found=%v, want the live entry intact", meta, found)
+	if !found || meta == nil || meta.Kind != PendingConflict || meta.Generation != gen {
+		t.Fatalf("old-name entry after the abort = %+v found=%v, want the preserved marker at the same generation", meta, found)
+	}
+}
+
+// TestConflictTransferPrepareFlipsLiveSource pins the recovery boundary
+// BEFORE the payload move: a live queued image whose transfer is prepared
+// must already be a durable conflict marker at the old name, so a crash
+// between the prepare and the move leaves RecoverPending SKIPPING the old
+// name (preserved, never re-uploaded to the dead path) while the prepared
+// destination keeps the entry's live kind — the obligation it carries is a
+// landing, not a terminal failure.
+func TestConflictTransferPrepareFlipsLiveSource(t *testing.T) {
+	dir := t.TempDir()
+	idx, shadows, gen := newLiveTransferFixture(t, dir, "/a", "queued successor")
+
+	_, ok, err := idx.BeginConflictTransfer("/a", "/b", gen, 0, shadows)
+	if err != nil || !ok {
+		t.Fatalf("begin = ok=%v err=%v", ok, err)
+	}
+	// Crash: nothing after the prepare — the transaction is never committed
+	// or aborted, exactly the process-death state.
+
+	// The old name's durable .meta is a conflict marker at the same
+	// generation: recovery preserves it instead of re-driving the dead name.
+	raw, rerr := os.ReadFile(filepath.Join(dir, HashPath("/a")+".meta"))
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	var onDisk WriteBackMeta
+	if err := json.Unmarshal(raw, &onDisk); err != nil {
+		t.Fatal(err)
+	}
+	if onDisk.Kind != PendingConflict || onDisk.Generation != gen {
+		t.Fatalf("old-name durable meta after prepare = kind %v gen %d, want the flipped marker at gen %d", onDisk.Kind, onDisk.Generation, gen)
+	}
+	// The prepared destination keeps the LIVE kind (durable only — memory
+	// publishes at Commit — so read it back the way a restart would).
+	recovered, err := NewPendingIndex(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recovered.RecoverFromDisk(); err != nil {
+		t.Fatal(err)
+	}
+	if meta, found := recovered.GetMeta("/a"); !found || meta == nil || meta.Kind != PendingConflict {
+		t.Fatalf("recovered old-name entry = %+v found=%v, want the preserved marker", meta, found)
+	}
+	if meta, found := recovered.GetMeta("/b"); !found || meta == nil || meta.Kind == PendingConflict {
+		t.Fatalf("recovered prepared entry = %+v found=%v, want the live kind preserved", meta, found)
 	}
 }

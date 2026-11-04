@@ -361,12 +361,31 @@ type PendingConflictTransfer struct {
 // move leaves both names recoverable. It reports (nil, false, nil) when either
 // endpoint no longer matches the generations the caller captured, and a
 // non-nil error only when the prepared metadata could not be persisted.
+//
+// A LIVE source entry (a queued image, not a terminal-failure marker) is
+// durably flipped to PendingConflict BEFORE the destination is prepared: a
+// crash between the two writes must leave recovery skipping the old name —
+// preserved, never re-driven at the dead path the successful remote rename
+// left behind — instead of re-uploading it there through the 404/create
+// retry. The prepared destination keeps the entry's LIVE kind: the
+// obligation it carries is still a landing, not a terminal failure.
 func (idx *PendingIndex) BeginConflictTransfer(oldPath, newPath string, expectedOldGen, expectedNewGen uint64, shadows *ShadowStore) (*PendingConflictTransfer, bool, error) {
 	if idx == nil || oldPath == newPath || expectedOldGen == 0 {
 		return nil, false, nil
 	}
+	idx.mu.RLock()
+	srcKind := PendingConflict
+	if m, ok := idx.items[oldPath]; ok && m != nil {
+		srcKind = m.Kind
+	}
+	idx.mu.RUnlock()
+	if srcKind != PendingConflict {
+		if _, err := idx.MarkConflictIfGeneration(oldPath, expectedOldGen); err != nil {
+			return nil, false, err
+		}
+	}
 	pla, plb := idx.acquireTwoPathLocks(oldPath, newPath)
-	prepared, ok, destWasLive, err := idx.prepareConflictTransferLocked(oldPath, newPath, expectedOldGen, expectedNewGen)
+	prepared, ok, destWasLive, err := idx.prepareConflictTransferLocked(oldPath, newPath, expectedOldGen, expectedNewGen, srcKind)
 	if err != nil || !ok {
 		idx.releaseTwoPathLocks(oldPath, newPath, pla, plb)
 		return nil, false, err
@@ -389,7 +408,7 @@ func (idx *PendingIndex) BeginConflictTransfer(oldPath, newPath string, expected
 // meta. The caller holds both path locks. It returns the prepared meta, ok,
 // whether the destination was live, and an error when the prepared file could
 // not be persisted.
-func (idx *PendingIndex) prepareConflictTransferLocked(oldPath, newPath string, expectedOldGen, expectedNewGen uint64) (*WriteBackMeta, bool, bool, error) {
+func (idx *PendingIndex) prepareConflictTransferLocked(oldPath, newPath string, expectedOldGen, expectedNewGen uint64, keepKind PendingKind) (*WriteBackMeta, bool, bool, error) {
 	idx.mu.RLock()
 	src, hasSrc := idx.items[oldPath]
 	dst, hasDst := idx.items[newPath]
@@ -408,6 +427,10 @@ func (idx *PendingIndex) prepareConflictTransferLocked(oldPath, newPath string, 
 	clone := cloneWriteBackMeta(src)
 	clone.Path = newPath
 	clone.Generation = gen
+	// A live source was flipped to a marker at Begin so recovery cannot
+	// re-drive the old name; the prepared clone keeps the LIVE kind the
+	// destination must carry.
+	clone.Kind = keepKind
 	prepared := &clone
 	if !hasDst {
 		if err := idx.writeMetaFile(prepared); err != nil {

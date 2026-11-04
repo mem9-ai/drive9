@@ -30,11 +30,13 @@ import (
 // production symptom of the server-side 500s.
 //
 // renameGate, when set, parks the FIRST rename request until the channel
-// closes and reports the parking through gated once: a test can hold the
-// remote rename RPC in flight while a writer stages under the old name —
-// the publication window the pre-rename drain cannot see. The parked request
-// keeps the fail snapshot from its arrival, so the rename itself still
-// succeeds while everything staged meanwhile fails.
+// closes and reports the parking through gated once. The rename is applied
+// SERVER-SIDE first and only the response is held: a test can stage under
+// the old name while the namespace has already moved — the publication
+// window the pre-rename drain cannot see, including everything that happens
+// between the server-side change and the delayed response. The parked
+// request keeps the fail snapshot from its arrival, so the rename itself
+// still succeeds while everything staged meanwhile fails.
 type failingWritesBackend struct {
 	backend *testbackend.Backend
 	mu      sync.Mutex
@@ -60,10 +62,20 @@ func (b *failingWritesBackend) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		if gated != nil {
 			close(gated)
 		}
+		// Apply the rename server-side, then hold only the response: the
+		// namespace has moved while the client still believes the RPC is in
+		// flight.
+		rec := httptest.NewRecorder()
+		b.backend.ServeHTTP(rec, r)
 		<-gate
-	} else {
-		b.mu.Unlock()
+		for k, v := range rec.Header() {
+			w.Header()[k] = v
+		}
+		w.WriteHeader(rec.Code)
+		_, _ = w.Write(rec.Body.Bytes())
+		return
 	}
+	b.mu.Unlock()
 	if failStat && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
 		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
 		return
@@ -678,7 +690,7 @@ func TestPortRenameMovesConflictMarkerStagedDuringRename(t *testing.T) {
 
 	// The post-Rename transition, with the stale pre-rename generations the
 	// old code trusted: the marker that must move is the LIVE one (v3).
-	if err := wb.retargetConflictMarkers(context.Background(), "/race-src.txt", "/race-dst.txt", time.Time{}, false); err != nil {
+	if err := wb.retargetConflictMarkers(context.Background(), "/race-src.txt", "/race-dst.txt", renameFence{}, false); err != nil {
 		t.Fatalf("retarget reported the fenced-out transfer as a failure: %v", err)
 	}
 	// What the rename caller does on a successful transition.
@@ -1006,7 +1018,7 @@ func TestPortRenameRefusesDataLandedAtObsoleteName(t *testing.T) {
 	}
 
 	unlock := wb.lockRenamePaths("/obs-src.txt", "/obs-dst.txt")
-	err := wb.conflictTransitionLocked(ctx, "/obs-src.txt", "/obs-dst.txt", time.Time{}, true)
+	err := wb.conflictTransitionLocked(ctx, "/obs-src.txt", "/obs-dst.txt", renameFence{}, true)
 	unlock()
 	if err == nil {
 		t.Fatal("the transition certified data landed under the obsolete old name")
@@ -1122,7 +1134,7 @@ func TestPortRenameFailsClosedWhenOldNameStatErrors(t *testing.T) {
 
 		fb.setFailStat(true)
 		unlock := wb.lockRenamePaths("/stat-src.txt", "/stat-dst.txt")
-		err := wb.conflictTransitionLocked(ctx, "/stat-src.txt", "/stat-dst.txt", time.Now(), true)
+		err := wb.conflictTransitionLocked(ctx, "/stat-src.txt", "/stat-dst.txt", renameFence{}, true)
 		unlock()
 		if err == nil {
 			t.Fatalf("resurrected=%v: the transition certified the rename although the old name could not be observed", resurrected)
@@ -1176,7 +1188,7 @@ func TestPortDirRenameKeepsSuccessorPublishedAfterRetarget(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := wb.retargetQueuedImage("/d/a", "/e/a", movedAt); err == nil {
+	if err := wb.retargetQueuedImage("/d/a", "/e/a", renameFence{movedAt: movedAt}); err == nil {
 		t.Fatal("the move retired a newer post-rename publication at the destination")
 	}
 	// G3 is untouched at the new name — still queued, still live.
@@ -1209,5 +1221,181 @@ func TestPortDirRenameKeepsSuccessorPublishedAfterRetarget(t *testing.T) {
 	}
 	if err := wb.queue.PathTerminalFailure("/e/a"); err != nil {
 		t.Fatalf("the landed G3 still answers EIO: %v", err)
+	}
+}
+
+// TestPortRenameCatchesLandingBeforeResponse pins the lost-history row of
+// the in-window detector: the server applies the rename but the response is
+// delayed, and the in-window successor's worker finishes INSIDE that delay —
+// its 404/create retry recreates the old name, its pending entry is removed,
+// and the queue is idle again before the handler resumes. The landed
+// watermark (not HasPath) must still flag the window, the strict old-name
+// check must catch the resurrection, and the rename must answer EIO instead
+// of certifying a destination that never contained the successor.
+func TestPortRenameCatchesLandingBeforeResponse(t *testing.T) {
+	fb := &failingWritesBackend{backend: testbackend.NewBackend()}
+	gate := make(chan struct{})
+	gated := make(chan struct{})
+	fb.renameGate, fb.gated = gate, gated
+	ch, wb := newUploadStack(t, fb, Options{Policy: PolicyWriteBack})
+	ctx := context.Background()
+
+	h := open(t, ch, "/hist-src.txt")
+	if err := h.Write(ctx, 0, []byte("v1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// The rename applies server-side; only its response is held. Inside the
+	// delay the writer stages the successor and — uploads healthy — its
+	// worker resurrects the OLD name and finishes before the gate opens.
+	renamed := make(chan error, 1)
+	go func() {
+		_, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/hist-src.txt", Path2: "/hist-dst.txt"})
+		renamed <- err
+	}()
+	select {
+	case <-gated:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the rename request never reached the backend")
+	}
+	if err := h.Write(ctx, 0, []byte("v2 resurrected the old name")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if !wb.opts.Staging.Pending.HasPending("/hist-src.txt") {
+			if _, ok := nodeString(fb.backend, "/hist-src.txt"); ok {
+				break // the worker landed (and recreated) the old name
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if wb.opts.Staging.Pending.HasPending("/hist-src.txt") {
+		t.Fatal("the successor never landed inside the response delay")
+	}
+	if _, ok := nodeString(fb.backend, "/hist-src.txt"); !ok {
+		t.Fatal("the old name was not resurrected by the create retry")
+	}
+	close(gate)
+
+	select {
+	case err := <-renamed:
+		if err == nil {
+			t.Fatal("the rename certified a destination that never contained the successor")
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the rename never completed")
+	}
+	if err := wb.queue.PathTerminalFailure("/hist-dst.txt"); err == nil {
+		t.Fatal("the resurrection left no failure witness at the new name")
+	}
+	if got, ok := nodeString(fb.backend, "/hist-dst.txt"); !ok || got != "v1" {
+		t.Fatalf("remote image at the new name = %q ok=%v, want the stale pre-successor bytes", got, ok)
+	}
+}
+
+// TestPortRenameKeepsFreshOpenerStagedDuringResponse pins the incarnation
+// fence's revision row: between the server-side rename and the delayed
+// response, a fresh writable open of the destination sees the RENAMED object
+// and stages an overwrite carrying its revision. That publication belongs to
+// the new incarnation even though it predates the response, and the live
+// image move must refuse to retire it — the older queued image stays
+// preserved under the old name and EIO answers at the destination until the
+// newer image lands. The server-side move is driven through the raw client
+// (the port chain serializes dispatches, so the rename handler itself cannot
+// be held mid-RPC while another dispatch runs).
+func TestPortRenameKeepsFreshOpenerStagedDuringResponse(t *testing.T) {
+	fb := &failingWritesBackend{backend: testbackend.NewBackend()}
+	ch, wb := newUploadStack(t, fb, Options{Policy: PolicyWriteBack})
+	ctx := context.Background()
+
+	// The source lands (its revision is the renamed object's), and the
+	// destination exists with its own landed incumbent.
+	src := open(t, ch, "/inc-src.txt")
+	if err := src.Write(ctx, 0, []byte("source v1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := src.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	srcRev, ok := wb.landedRevision("/inc-src.txt")
+	if !ok || srcRev <= 0 {
+		t.Fatalf("source revision = %d ok=%v, want the landed watermark", srcRev, ok)
+	}
+	dst := open(t, ch, "/inc-dst.txt")
+	if err := dst.Write(ctx, 0, []byte("old incumbent")); err != nil {
+		t.Fatal(err)
+	}
+	if err := dst.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// The server applies the rename; the writeback handler has not run (its
+	// response never arrived). Inside that delay a fresh writable open of the
+	// destination observes the RENAMED object (opened before the outage so
+	// the open itself is not the failing plane) ...
+	if err := wb.opts.Client.RenameCtx(ctx, wb.remotePath("/inc-src.txt"), wb.remotePath("/inc-dst.txt")); err != nil {
+		t.Fatal(err)
+	}
+	fresh := open(t, ch, "/inc-dst.txt")
+	// ... and with uploads now failing, both sides stage inside the delay:
+	// the source's writer queues an older successor, and the fresh opener
+	// stages its overwrite of the renamed object (so both stay live).
+	fb.setFail(true)
+	if err := src.Write(ctx, 0, []byte("source v2 queued")); err != nil {
+		t.Fatal(err)
+	}
+	if err := src.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := fresh.Write(ctx, 0, []byte("fresh opener over the renamed object")); err != nil {
+		t.Fatal(err)
+	}
+	if err := fresh.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	dstMeta, ok := wb.opts.Staging.Pending.GetMeta("/inc-dst.txt")
+	if !ok || dstMeta == nil {
+		t.Fatal("the fresh opener did not stage at the destination")
+	}
+	if dstMeta.BaseRev != srcRev {
+		t.Fatalf("fresh opener staged against rev %d, want the renamed object's rev %d", dstMeta.BaseRev, srcRev)
+	}
+
+	// The delayed response arrives NOW: the fresh opener's publication
+	// predates it, and only the revision fence can tell the incarnations
+	// apart.
+	if err := wb.retargetQueuedImage("/inc-src.txt", "/inc-dst.txt", renameFence{movedAt: time.Now(), srcRev: srcRev}); err == nil {
+		t.Fatal("the move retired a fresh opener's publication that predates the response")
+	}
+
+	// The fresh opener's image is intact at the destination and still live.
+	dstMeta, ok = wb.opts.Staging.Pending.GetMeta("/inc-dst.txt")
+	if !ok || dstMeta == nil || dstMeta.Kind == staging.PendingConflict {
+		t.Fatalf("destination entry = %+v ok=%v, want the fresh opener's untouched live image", dstMeta, ok)
+	}
+	// The older queued successor stayed preserved under the old name.
+	srcMeta, ok := wb.opts.Staging.Pending.GetMeta("/inc-src.txt")
+	if !ok || srcMeta == nil || srcMeta.Kind != staging.PendingConflict {
+		t.Fatalf("old-name entry = %+v ok=%v, want the preserved conflict marker", srcMeta, ok)
+	}
+	if err := wb.queue.PathTerminalFailure("/inc-dst.txt"); err == nil {
+		t.Fatal("the refused move left no failure record at the destination")
+	}
+
+	// With the backend healthy the fresh opener's image lands and clears
+	// the record; the barrier then answers for THOSE bytes.
+	fb.setFail(false)
+	if err := fresh.Sync(ctx); err != nil {
+		t.Fatalf("strict Sync on the fresh opener = %v, want its image to land and clear the record", err)
+	}
+	if got, ok := nodeString(fb.backend, "/inc-dst.txt"); !ok || got != "fresh opener over the renamed object" {
+		t.Fatalf("remote image at the destination = %q ok=%v, want the fresh opener's bytes", got, ok)
 	}
 }
