@@ -1132,7 +1132,7 @@ func extractPackEntry(localRoot string, hdr *tar.Header, r io.Reader, dirTimes *
 		}
 		_ = os.Chtimes(target, hdr.ModTime, hdr.ModTime)
 	case tar.TypeSymlink:
-		if err := validatePackSymlinkTarget(hdr.Linkname); err != nil {
+		if err := validatePackSymlinkTarget(localRoot, target, hdr.Linkname); err != nil {
 			return err
 		}
 		if err := ensureNoSymlinkPath(localRoot, filepath.Dir(target), true); err != nil {
@@ -1156,9 +1156,27 @@ func extractPackEntry(localRoot string, hdr *tar.Header, r io.Reader, dirTimes *
 	return nil
 }
 
-func validatePackSymlinkTarget(linkname string) error {
+// validatePackSymlinkTarget rejects a symlink whose target would leave the
+// unpacked overlay. The target is resolved relative to the link's own directory,
+// so an absolute target and a "../.." chain that climbs out of the overlay are
+// both refused while a nested relative target stays available. The archive is
+// tenant-writable input: materializing a link to /etc/passwd or to the user's
+// home would hand that content to every later local tool that follows it.
+func validatePackSymlinkTarget(localRoot, linkPath, linkname string) error {
 	if linkname == "" || strings.ContainsRune(linkname, '\x00') || strings.Contains(linkname, "\\") {
 		return fmt.Errorf("unsafe pack symlink target %q", linkname)
+	}
+	if filepath.IsAbs(linkname) {
+		return fmt.Errorf("pack symlink %s has an absolute target %q", linkPath, linkname)
+	}
+	overlayRoot := filepath.Clean(filepath.Join(localRoot, "overlay"))
+	resolved := filepath.Clean(filepath.Join(filepath.Dir(linkPath), filepath.FromSlash(linkname)))
+	rel, err := filepath.Rel(overlayRoot, resolved)
+	if err != nil {
+		return fmt.Errorf("resolve pack symlink target %q: %w", linkname, err)
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return fmt.Errorf("pack symlink %s target %q escapes local overlay root", linkPath, linkname)
 	}
 	return nil
 }

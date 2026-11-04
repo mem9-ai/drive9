@@ -363,54 +363,83 @@ func TestExtractPackArchiveDoesNotReplaceUntilArchiveValidated(t *testing.T) {
 	assertFileContent(t, filepath.Join(localRoot, "overlay", "repo", ".git", "config"), "old\n")
 }
 
-func TestExtractPackArchivePreservesPortableSymlinkTargets(t *testing.T) {
+// A symlink target is resolved relative to the link's own directory, so a
+// nested relative target inside the overlay is restored while an absolute or
+// climbing one is refused: the archive is tenant-writable input and a link to
+// /etc/passwd (or to the user's home) would be followed by later local tooling.
+func TestExtractPackArchiveSymlinkTargetConfinement(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("symlink semantics differ on Windows")
 	}
-	var buf bytes.Buffer
-	gz := gzip.NewWriter(&buf)
-	tw := tar.NewWriter(gz)
-	manifest := []byte(`{"format":"drive9.pack.v1","version":1,"paths":["/repo"],"entries":[{"path":"/repo/absolute","type":"symlink","linkname":"/opt/tool/bin/python"},{"path":"/repo/pkg-link","type":"symlink","linkname":"../store/pkg"}]}`)
-	if err := tw.WriteHeader(&tar.Header{Name: packManifestEntryName, Mode: 0o644, Size: int64(len(manifest))}); err != nil {
-		t.Fatalf("manifest header: %v", err)
-	}
-	if _, err := tw.Write(manifest); err != nil {
-		t.Fatalf("manifest write: %v", err)
-	}
-	if err := tw.WriteHeader(&tar.Header{Name: packArchiveEntryPrefix + "repo/absolute", Typeflag: tar.TypeSymlink, Linkname: "/opt/tool/bin/python", Mode: 0o777}); err != nil {
-		t.Fatalf("absolute symlink header: %v", err)
-	}
-	if err := tw.WriteHeader(&tar.Header{Name: packArchiveEntryPrefix + "repo/pkg-link", Typeflag: tar.TypeSymlink, Linkname: "../store/pkg", Mode: 0o777}); err != nil {
-		t.Fatalf("relative symlink header: %v", err)
-	}
-	if err := tw.Close(); err != nil {
-		t.Fatalf("tar close: %v", err)
-	}
-	if err := gz.Close(); err != nil {
-		t.Fatalf("gzip close: %v", err)
+	build := func(t *testing.T, links map[string]string) []byte {
+		t.Helper()
+		var buf bytes.Buffer
+		gz := gzip.NewWriter(&buf)
+		tw := tar.NewWriter(gz)
+		manifest := []byte(`{"format":"drive9.pack.v1","version":1,"paths":["/repo"]}`)
+		if err := tw.WriteHeader(&tar.Header{Name: packManifestEntryName, Mode: 0o644, Size: int64(len(manifest))}); err != nil {
+			t.Fatalf("manifest header: %v", err)
+		}
+		if _, err := tw.Write(manifest); err != nil {
+			t.Fatalf("manifest write: %v", err)
+		}
+		for name, target := range links {
+			if err := tw.WriteHeader(&tar.Header{Name: packArchiveEntryPrefix + name, Typeflag: tar.TypeSymlink, Linkname: target, Mode: 0o777}); err != nil {
+				t.Fatalf("symlink header %s: %v", name, err)
+			}
+		}
+		if err := tw.Close(); err != nil {
+			t.Fatalf("tar close: %v", err)
+		}
+		if err := gz.Close(); err != nil {
+			t.Fatalf("gzip close: %v", err)
+		}
+		return buf.Bytes()
 	}
 
-	localRoot := t.TempDir()
-	_, err := extractPackArchive(context.Background(), bytes.NewReader(buf.Bytes()), unpackOptions{
-		LocalRoot: localRoot,
-		Replace:   true,
-	})
-	if err != nil {
-		t.Fatalf("extractPackArchive: %v", err)
-	}
-	absolute, err := os.Readlink(filepath.Join(localRoot, "overlay", "repo", "absolute"))
-	if err != nil {
-		t.Fatalf("read absolute symlink: %v", err)
-	}
-	if absolute != "/opt/tool/bin/python" {
-		t.Fatalf("absolute symlink = %q, want /opt/tool/bin/python", absolute)
-	}
-	relative, err := os.Readlink(filepath.Join(localRoot, "overlay", "repo", "pkg-link"))
-	if err != nil {
-		t.Fatalf("read relative symlink: %v", err)
-	}
-	if relative != "../store/pkg" {
-		t.Fatalf("relative symlink = %q, want ../store/pkg", relative)
+	for _, tc := range []struct {
+		name   string
+		links  map[string]string
+		wantOK bool
+	}{
+		{name: "absolute target", links: map[string]string{"repo/absolute": "/opt/tool/bin/python"}},
+		{name: "parent escape", links: map[string]string{"repo/pkg-link": "../../../outside/pkg"}},
+		{name: "sibling escape", links: map[string]string{"repo/deep/pkg-link": "../../../../store/pkg"}},
+		{name: "safe nested relative", links: map[string]string{"repo/pkg-link": "../store/pkg"}, wantOK: true},
+		{name: "safe sibling relative", links: map[string]string{"repo/deep/pkg-link": "../store/pkg"}, wantOK: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			localRoot := t.TempDir()
+			_, err := extractPackArchive(context.Background(), bytes.NewReader(build(t, tc.links)), unpackOptions{
+				LocalRoot: localRoot,
+				Replace:   true,
+			})
+			if tc.wantOK {
+				if err != nil {
+					t.Fatalf("extractPackArchive: %v", err)
+				}
+				for name, want := range tc.links {
+					got, readErr := os.Readlink(filepath.Join(localRoot, "overlay", filepath.FromSlash(name)))
+					if readErr != nil {
+						t.Fatalf("readlink %s: %v", name, readErr)
+					}
+					if got != want {
+						t.Fatalf("symlink %s = %q, want %q", name, got, want)
+					}
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("extractPackArchive accepted an escaping symlink target")
+			}
+			if !strings.Contains(err.Error(), "pack symlink") {
+				t.Fatalf("error = %v, want a pack symlink confinement error", err)
+			}
+			// Nothing may be materialized outside the overlay by the failed unpack.
+			if _, statErr := os.Lstat(filepath.Join(localRoot, "outside")); statErr == nil {
+				t.Fatal("unpack created a path outside the overlay")
+			}
+		})
 	}
 }
 

@@ -1134,10 +1134,12 @@ var gitCheckpointSafeConfigKeys = map[string]bool{
 	"core.ignorecase":              true,
 	"core.precomposeunicode":       true,
 	"core.symlinks":                true,
-	"core.worktree":                true,
-	"extensions.objectformat":      true,
-	"extensions.worktreeconfig":    true,
-	"gc.autodetach":                true,
+	// core.worktree is deliberately absent: it redirects the repository's
+	// worktree to an arbitrary host path, which tenant-controlled checkpoint
+	// state must never be able to do.
+	"extensions.objectformat":   true,
+	"extensions.worktreeconfig": true,
+	"gc.autodetach":             true,
 }
 
 // gitCheckpointSafeConfigSections are the config sections a checkpoint may
@@ -1218,22 +1220,39 @@ func sanitizeGitCheckpointConfig(path string) error {
 			continue
 		}
 		if strings.HasPrefix(trimmed, "[") {
-			if end := strings.IndexByte(trimmed, ']'); end > 0 {
-				raw := strings.TrimSpace(trimmed[1:end])
-				sectionName = strings.ToLower(raw)
-				if i := strings.IndexAny(sectionName, " \t\""); i >= 0 {
-					sectionName = sectionName[:i]
-				}
-				sectionKept = gitCheckpointSafeConfigSections[sectionName] || sectionName == "core" ||
-					sectionName == "extensions" || sectionName == "gc"
-				// Anything after the closing bracket is dropped: git config
-				// tolerates a key on the header line, and writing it back would
-				// smuggle a key past the per-section policy below.
-				if sectionKept && end == len(trimmed)-1 {
-					out.WriteString(line)
-				}
+			end := strings.IndexByte(trimmed, ']')
+			if end <= 0 {
+				// Malformed header: stop keeping anything under it so the
+				// parser and the emitted text cannot disagree.
+				sectionName, sectionKept, continued = "", false, false
 				continue
 			}
+			header := trimmed[:end+1]
+			raw := strings.TrimSpace(trimmed[1:end])
+			sectionName = strings.ToLower(raw)
+			if i := strings.IndexAny(sectionName, " \t\""); i >= 0 {
+				sectionName = sectionName[:i]
+			}
+			sectionKept = gitCheckpointSafeConfigSections[sectionName] || sectionName == "core" ||
+				sectionName == "extensions" || sectionName == "gc"
+			continued = false
+			// The header itself is inert, so a kept section always emits it —
+			// otherwise the parser state (say, "user") would diverge from the
+			// last emitted section (say, "core") and the following lines would
+			// land in the wrong section. Trailing content is kept only when it
+			// is a comment; a key on the header line is dropped because writing
+			// it back would smuggle it past the per-section policy below.
+			if sectionKept {
+				trailing := strings.TrimSpace(trimmed[end+1:])
+				if trailing == "" {
+					out.WriteString(line)
+				} else if strings.HasPrefix(trailing, "#") || strings.HasPrefix(trailing, ";") {
+					out.WriteString(header + " " + trailing + "\n")
+				} else {
+					out.WriteString(header + "\n")
+				}
+			}
+			continue
 		}
 		if !sectionKept {
 			continue

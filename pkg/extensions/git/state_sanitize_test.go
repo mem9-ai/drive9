@@ -259,3 +259,61 @@ func TestCheckpointArchiveKeepsRefsNamedHooks(t *testing.T) {
 		}
 	}
 }
+
+// A syntactically valid header with a trailing comment used to update the
+// parser's section without being emitted, so the following keys were written
+// under the previous (kept) section. Parser state and emitted text must not
+// diverge.
+func TestSanitizeGitCheckpointConfigKeepsHeaderWithTrailingComment(t *testing.T) {
+	dir := t.TempDir()
+	cfg := "[core]\n[user] # comment\nfsmonitor = /tmp/evil\n"
+	path := filepath.Join(dir, "config")
+	if err := os.WriteFile(path, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := sanitizeGitCheckpointConfig(path); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(data)
+	// The header must be emitted, so the key stays scoped to "user" and can
+	// never become core.fsmonitor after a restore.
+	if !strings.Contains(got, "[user]") {
+		t.Fatalf("trailing-comment header was dropped:\n%s", got)
+	}
+	userIdx := strings.Index(got, "[user]")
+	if fsmonitorIdx := strings.Index(got, "fsmonitor"); fsmonitorIdx >= 0 && fsmonitorIdx < userIdx {
+		t.Fatalf("fsmonitor emitted before the [user] header:\n%s", got)
+	}
+	if coreIdx := strings.Index(got, "[core]"); coreIdx >= 0 && userIdx < coreIdx {
+		t.Fatalf("section order changed:\n%s", got)
+	}
+}
+
+// core.worktree redirects the repository's worktree to an arbitrary host path;
+// tenant-controlled checkpoint state must not be able to do that.
+func TestSanitizeGitCheckpointConfigDropsCoreWorktree(t *testing.T) {
+	dir := t.TempDir()
+	cfg := "[core]\n\trepositoryformatversion = 0\n\tworktree = /tmp/evil-worktree\n[extensions]\n\tobjectformat = sha1\n"
+	path := filepath.Join(dir, "config")
+	if err := os.WriteFile(path, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := sanitizeGitCheckpointConfig(path); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(data)
+	if strings.Contains(got, "worktree") {
+		t.Fatalf("core.worktree survived the sanitizer:\n%s", got)
+	}
+	if !strings.Contains(got, "repositoryformatversion = 0") || !strings.Contains(got, "objectformat = sha1") {
+		t.Fatalf("safe keys were dropped:\n%s", got)
+	}
+}
