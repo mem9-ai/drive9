@@ -219,9 +219,9 @@ require (
 	github.com/zeebo/errs v1.4.0 // indirect
 	github.com/zeebo/xxh3 v1.1.0 // indirect
 	go.etcd.io/etcd v3.3.27+incompatible // indirect
-	go.etcd.io/etcd/api/v3 v3.5.10 // indirect
-	go.etcd.io/etcd/client/pkg/v3 v3.5.10 // indirect
-	go.etcd.io/etcd/client/v3 v3.5.10 // indirect
+	go.etcd.io/etcd/api/v3 v3.5.9 // indirect
+	go.etcd.io/etcd/client/pkg/v3 v3.5.9 // indirect
+	go.etcd.io/etcd/client/v3 v3.5.9 // indirect
 	go.opentelemetry.io/contrib/detectors/gcp v1.45.0 // indirect
 	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.68.0 // indirect
 	go.opentelemetry.io/otel/sdk v1.45.0 // indirect
@@ -249,7 +249,7 @@ require (
 	storj.io/infectious v0.0.2 // indirect
 	storj.io/picobuf v0.0.4 // indirect
 	storj.io/uplink v1.14.3 // indirect
-	xorm.io/builder v0.3.13 // indirect
+	xorm.io/builder v0.3.7 // indirect
 	xorm.io/xorm v1.0.7 // indirect
 )
 
@@ -308,7 +308,7 @@ require (
 	github.com/opencontainers/go-digest v1.0.0 // indirect
 	github.com/opencontainers/image-spec v1.1.1 // indirect
 	github.com/opentracing/opentracing-go v1.2.1-0.20220228012449-10b1cf09e00b // indirect
-	github.com/pingcap/errors v0.11.5-0.20241219054535-6b8c588c3122 // indirect
+	github.com/pingcap/errors v0.11.5-0.20211224045212-9687c2b0f87c // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/power-devops/perfstat v0.0.0-20240221224432-82ca36839d55 // indirect
 	github.com/shirou/gopsutil/v4 v4.26.6 // indirect
@@ -352,6 +352,9 @@ replace github.com/urfave/cli/v2 v2.19.3 => github.com/juicedata/cli/v2 v2.19.4-
 replace github.com/vmware/go-nfs-client v0.0.0-20190605212624-d43b92724c1b => github.com/juicedata/go-nfs-client v0.0.0-20250220101412-d3a8c1ca64a1
 
 replace github.com/minio/minio v0.0.0-20210206053228-97fe57bba92c => github.com/juicedata/minio v0.0.0-20260515071949-69a6cfc9da65
+
+// JuiceFS fork with the drive9 HTTP meta engine (extend-v1.4 from v1.4.1).
+// Pin the GitHub commit; do not replace with a local path.
 
 // Upstream juicefs replaces hashicorp/golang-lru with the juicedata fork that
 // adds LRU.AddIf; a dependency replace is ignored, so consumers must carry it.
