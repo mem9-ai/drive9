@@ -4755,25 +4755,6 @@ func (l *stripedLocks) lock(path string) func() {
 	return m.Unlock
 }
 
-// extentRoute reports whether a staged image of this size should bypass
-// the small-file writeback cache track and land through the commit queue,
-// where the extent branch promotes it to the extent plane.
-func (w *Writeback) extentRoute(path string, size int64) bool {
-	if w.queue == nil || w.opts.Staging == nil {
-		return false
-	}
-	if len(w.extentGlobs) > 0 {
-		// Pattern-owned layout: only matching paths promote, at or above
-		// the (possibly zero) matched-path cutoff.
-		if !matchExtentPattern(w.extentGlobs, path) {
-			return false
-		}
-		return size >= w.extentMatchCutoff
-	}
-	// Hybrid: promotion at the inline cutoff.
-	return w.opts.ExtentMinSize > 0 && size >= w.opts.ExtentMinSize
-}
-
 // matchExtentPattern reports whether path matches any compiled extent
 // glob. Globs match the whole path; a trailing /* covers subtrees.
 func matchExtentPattern(globs []globMatcher, path string) bool {

@@ -2294,20 +2294,10 @@ func (b *Bridge) SettleRenameIntentLocal(srcLocal, dstLocal string) {
 	b.SettleRenameIntent(b.fullPath(srcLocal), b.fullPath(dstLocal))
 }
 
-// retargetStagedGensFor rewrites the saved pathname of every staged
-// generation of ino, clearing any pending rename intent. It serves callers
-// that learn about a name change without having staged an intent (the
-// unlink sentinel, and the event-based rename hook): best-effort, because
-// those paths cannot surface an error to the syscall that caused them.
-func (b *Bridge) retargetStagedGensFor(ino meta.Ino, newFull string) {
-	if b.cfg.StagingDir == "" {
-		return
-	}
-	b.retargetStagedGensLocked(ino, newFull)
-}
-
-// retargetStagedGensLocked is the body of retargetStagedGensFor; the caller
-// holds stagingMu (RemapLocal takes it before b.mu).
+// retargetStagedGensLocked rewrites the saved pathname of every staged
+// generation of ino, clearing any pending rename intent. Best-effort: the
+// callers (the unlink sentinel and the event-based rename hook) cannot
+// surface an error to the syscall that caused them.
 func (b *Bridge) retargetStagedGensLocked(ino meta.Ino, newFull string) {
 	recs, err := b.scanStaged()
 	if err != nil {

@@ -136,13 +136,6 @@ type Bridge struct {
 	// BEFORE it merges the on-disk state back in, so a test can interleave a
 	// rename into exactly that window.
 	stagingPausePublish func()
-	// stagingMu serializes every durable-manifest READ-MODIFY-WRITE against
-	// the rename writers. A staging run publishes a record it built from an
-	// earlier snapshot; without this, a rename that settles a newer record
-	// between that snapshot and this replacement is silently overwritten by
-	// stale in-memory state, and the surviving manifest no longer names the
-	// object's real location.
-	stagingMu sync.Mutex
 
 	// classicOwned marks files whose fresh extent session silently
 	// degraded to a CLASSIC upload on a legacy server: the handle stays
