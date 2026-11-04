@@ -940,9 +940,16 @@ public class Drive9Client(
         }
         val socket: Socket = if (ssl) {
             // Wrap the connected socket: the factory's host/port overload would
-            // open a second, unbounded connection.
-            val sslSocket = (SSLSocketFactory.getDefault() as SSLSocketFactory)
-                .createSocket(connected, host, port, true) as SSLSocket
+            // open a second, unbounded connection. The wrapper owns the socket
+            // once it exists (autoClose), so only a failure while creating it
+            // needs to close the plain socket.
+            val sslSocket = try {
+                (SSLSocketFactory.getDefault() as SSLSocketFactory)
+                    .createSocket(connected, host, port, true) as SSLSocket
+            } catch (t: Throwable) {
+                runCatching { connected.close() }
+                throw t
+            }
             // A peer that accepts the connection but stalls the handshake must
             // not hang the caller: set the read timeout before handshaking, and
             // close the socket if the handshake fails so the descriptor is not
