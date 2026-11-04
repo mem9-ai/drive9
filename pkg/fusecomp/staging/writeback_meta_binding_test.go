@@ -62,3 +62,78 @@ func TestTornPairPrunedNotServed(t *testing.T) {
 		t.Fatalf("re-stage after prune not served: ok=%t data=%q", ok, data)
 	}
 }
+
+// TestTornPairEmptyTruncationPruned pins the zero-checksum edge: an empty
+// payload binds with DataCRC 0 and Size 0, so "checksum absent" must never
+// be inferred from the value — a truncation-to-empty whose .dat rename was
+// lost leaves the stale nonempty bytes under the new metadata, and the
+// binding (length first) must prune that pair, not serve or upload the old
+// contents at the truncation's base revision.
+func TestTornPairEmptyTruncationPruned(t *testing.T) {
+	dir := t.TempDir()
+	c, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const path = "/empty.bin"
+
+	old := []byte("previous contents")
+	if _, _, err := c.PutWithBaseRevAndModeAndLineageTimingsDirSync(path, old, int64(len(old)), PendingOverwrite, 3, 0o644, false, "", "", false); err != nil {
+		t.Fatal(err)
+	}
+	// The truncation snapshot: empty image, bound with CRC 0 and Size 0.
+	if _, _, err := c.PutWithBaseRevAndModeAndLineageTimingsDirSync(path, nil, 0, PendingOverwrite, 7, 0o644, false, "", "", false); err != nil {
+		t.Fatal(err)
+	}
+	// Crash window: the truncation's .dat rename is lost.
+	if err := os.WriteFile(c.DatFile(path), old, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c.DropInMemoryPayload(path)
+
+	if _, _, ok := c.GetMetaAndView(path); ok {
+		t.Fatal("torn truncation pair was served instead of pruned")
+	}
+	if _, ok := c.GetMeta(path); ok {
+		t.Fatal("torn truncation pair's metadata survived the prune")
+	}
+}
+
+// TestTornPairPrunedOnPlainReads pins the consumer choke point: the binding
+// is enforced where the payload is loaded (getViewLocked), so the ordinary
+// read paths — Get/GetView, the pending-image capture and writable-open
+// preloads behind them — cannot observe a torn pair either; pruning must
+// not depend on the uploader's checked getters running first.
+func TestTornPairPrunedOnPlainReads(t *testing.T) {
+	dir := t.TempDir()
+	c, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const path = "/reads.bin"
+
+	first := []byte("stale generation")
+	if _, _, err := c.PutWithBaseRevAndModeAndLineageTimingsDirSync(path, first, int64(len(first)), PendingOverwrite, 2, 0o644, false, "", "", false); err != nil {
+		t.Fatal(err)
+	}
+	second := []byte("freshmutation") // same length, different bytes
+	if _, _, err := c.PutWithBaseRevAndModeAndLineageTimingsDirSync(path, second, int64(len(second)), PendingOverwrite, 5, 0o644, false, "", "", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(c.DatFile(path), first, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c.DropInMemoryPayload(path)
+
+	if _, ok := c.Get(path); ok {
+		t.Fatal("plain Get served a torn pair")
+	}
+	// The prune already ran on that Get; a later view must see nothing
+	// (and the files are gone), exactly like the checked getters.
+	if _, ok := c.GetView(path); ok {
+		t.Fatal("GetView served a torn pair after the prune")
+	}
+	if _, ok := c.GetMeta(path); ok {
+		t.Fatal("torn pair's metadata survived the prune")
+	}
+}

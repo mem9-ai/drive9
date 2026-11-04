@@ -117,13 +117,19 @@ type WriteBackMeta struct {
 	HasMode          bool        `json:"has_mode,omitempty"`
 	SnapshotID       string      `json:"-"`
 	ParentSnapshotID string      `json:"-"`
-	// DataCRC binds the .dat payload to this metadata record (CRC32 of the
-	// staged bytes, 0 = legacy unbound). The batched-dir-sync put stages
-	// the pair through two renames that a crash between them can mix — a
-	// surviving new .meta over a stale .dat would upload OLD bytes at the
-	// NEW base revision; the binding detects such a torn pair at read
-	// time (see viewMatchesMeta) and prunes it instead.
+	// DataCRC binds the .dat payload to this metadata record (CRC32 of
+	// the staged bytes), guarded by DataBound — zero is a LEGITIMATE
+	// checksum (an empty payload binds with CRC 0 and Size 0), so absence
+	// of the binding must not be inferred from the value. The batched-
+	// dir-sync put stages the pair through two renames that a crash
+	// between them can mix — a surviving new .meta over a stale .dat
+	// would serve or upload OLD bytes at the NEW base revision; the
+	// binding detects such a torn pair at read time (see viewMatchesMeta)
+	// and prunes it instead.
 	DataCRC uint32 `json:"data_crc,omitempty"`
+	// DataBound marks a record whose DataCRC/Size binding is authoritative
+	// (every put sets it); legacy records without it are unbound.
+	DataBound bool `json:"data_bound,omitempty"`
 	// LayerClean retains a remotely durable overlay for reads, not recovery.
 	// Every new staging publication resets it; legacy records remain dirty.
 	LayerClean bool `json:"layer_clean,omitempty"`
@@ -471,13 +477,15 @@ func (c *WriteBackCache) GetMeta(remotePath string) (*WriteBackMeta, bool) {
 }
 
 // viewMatchesMeta reports whether a data image is the one its metadata
-// record describes: the put binds them with the payload's length and CRC32
-// (DataCRC; 0 = a legacy unbound record, accepted as-is). A mismatch is a
-// TORN PAIR — a crash between the two renames of a batched-dir-sync put
-// left a surviving .meta over a stale .dat — and must never be uploaded:
-// the stale bytes would publish at the NEW base revision.
+// record describes: a bound record (DataBound — every put sets it) carries
+// the payload's length and CRC32, and zero is a legitimate checksum (an
+// empty payload binds with CRC 0 and Size 0). Unbound legacy records are
+// accepted as-is. A mismatch is a TORN PAIR — a crash between the two
+// renames of a batched-dir-sync put left a surviving .meta over a stale
+// .dat — and must never be served or uploaded: the stale bytes would
+// publish at the NEW base revision.
 func viewMatchesMeta(meta *WriteBackMeta, data []byte) bool {
-	if meta == nil || meta.DataCRC == 0 {
+	if meta == nil || !meta.DataBound {
 		return true
 	}
 	return int64(len(data)) == meta.Size && crc32.ChecksumIEEE(data) == meta.DataCRC
@@ -488,7 +496,8 @@ func viewMatchesMeta(meta *WriteBackMeta, data []byte) bool {
 // generation. This prevents an interleaving where a concurrent Put replaces
 // the .dat file between a separate GetMeta and getView call, causing the
 // uploader to upload new data with old meta (wrong baseRev/generation).
-// A pair whose DataCRC binding does not match is torn and pruned, not served.
+// The view load itself enforces the metadata binding: a torn pair is pruned
+// by getViewLocked, never returned.
 func (c *WriteBackCache) GetMetaAndView(remotePath string) (*WriteBackMeta, []byte, bool) {
 	pl := c.AcquirePathLock(remotePath)
 	c.mu.Lock()
@@ -502,12 +511,6 @@ func (c *WriteBackCache) GetMetaAndView(remotePath string) (*WriteBackMeta, []by
 	cp := cloneWriteBackMeta(meta)
 
 	data, dataOK := c.getViewLocked(remotePath)
-	if dataOK && !viewMatchesMeta(&cp, data) {
-		// Torn pair (viewMatchesMeta): drop it — losing the entry cleanly
-		// beats uploading stale bytes at the new base.
-		c.pruneEntryLocked(remotePath, true)
-		dataOK = false
-	}
 	c.mu.Unlock()
 	c.ReleasePathLock(remotePath, pl)
 
@@ -525,8 +528,8 @@ func (c *WriteBackCache) GetMetaAndView(remotePath string) (*WriteBackMeta, []by
 // lets callers atomically capture associated staging-store generations (e.g.
 // pendingIndex/shadowStore) under the same serialization window so a concurrent
 // same-path Put cannot race the snapshot and leave a stale upload holding newer
-// generations it is not responsible for. A pair whose DataCRC binding does not
-// match is torn and pruned, not served.
+// generations it is not responsible for. The view load itself enforces the
+// metadata binding: a torn pair is pruned by getViewLocked, never returned.
 func (c *WriteBackCache) GetMetaAndViewWithCallback(remotePath string, onLocked func()) (*WriteBackMeta, []byte, bool) {
 	pl := c.AcquirePathLock(remotePath)
 	defer c.ReleasePathLock(remotePath, pl)
@@ -540,13 +543,6 @@ func (c *WriteBackCache) GetMetaAndViewWithCallback(remotePath string, onLocked 
 	cp := cloneWriteBackMeta(meta)
 
 	data, dataOK := c.getViewLocked(remotePath)
-	if dataOK && !viewMatchesMeta(&cp, data) {
-		// Torn pair (viewMatchesMeta): drop it — losing the entry cleanly
-		// beats uploading stale bytes at the new base.
-		c.pruneEntryLocked(remotePath, true)
-		c.mu.Unlock()
-		return nil, nil, false
-	}
 	c.mu.Unlock()
 
 	if !dataOK {
@@ -957,6 +953,7 @@ func (c *WriteBackCache) putWithBaseRevAndModeAndLineage(remotePath string, data
 		Mode:             mode & posixPermissionModeMask,
 		HasMode:          hasMode,
 		DataCRC:          crc32.ChecksumIEEE(data),
+		DataBound:        true,
 		SnapshotID:       snapshotID,
 		ParentSnapshotID: parentSnapshotID,
 		lineageTrusted:   lineageTrusted,
@@ -1008,6 +1005,13 @@ func (c *WriteBackCache) pruneEntryLocked(remotePath string, removeDataFile bool
 
 // getViewLocked returns a read-only payload view for remotePath.
 // The caller must hold c.mu and must not mutate the returned slice.
+// A payload loaded from disk is validated against its metadata binding
+// BEFORE it is served or cached: a torn pair (a surviving .meta over a
+// stale .dat — see viewMatchesMeta) is pruned here, so every consumer —
+// Get, GetView, the meta+view getters, the pending-image capture, the
+// writable-open preload — is protected at the one choke point. In-memory
+// payloads skip the check: they were either written by a put (bound by
+// construction) or admitted through this validated load.
 func (c *WriteBackCache) getViewLocked(remotePath string) ([]byte, bool) {
 	if data, ok := c.data[remotePath]; ok {
 		c.touchDataLocked(remotePath)
@@ -1022,6 +1026,12 @@ func (c *WriteBackCache) getViewLocked(remotePath string) ([]byte, bool) {
 		if errors.Is(err, os.ErrNotExist) {
 			c.pruneEntryLocked(remotePath, false)
 		}
+		return nil, false
+	}
+	if !viewMatchesMeta(meta, data) {
+		// Torn pair: drop it — losing the entry cleanly beats serving or
+		// uploading stale bytes at the new base.
+		c.pruneEntryLocked(remotePath, true)
 		return nil, false
 	}
 	c.cacheDataLocked(remotePath, data, meta.Size)
