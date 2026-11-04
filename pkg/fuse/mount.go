@@ -50,11 +50,22 @@ type MountConfig struct {
 	MountPoint string
 	RemoteRoot string
 
-	CacheDir               string
-	CacheSize              int64
-	ReadCacheMaxFileBytes  int64
-	ReadCacheTTL           time.Duration
-	DiskReadCacheSize      int64
+	CacheDir              string
+	CacheSize             int64
+	ReadCacheMaxFileBytes int64
+	ReadCacheTTL          time.Duration
+	DiskReadCacheSize     int64
+	// ExtentCacheSize is the extent engine's disk-cache budget in bytes
+	// (read cache + writeback staging, JuiceFS's own accounting). 0
+	// derives it from DiskReadCacheSize: the two planes then split that
+	// one budget in half (backward compatible). Set it to give the extent
+	// plane its own budget — the classic read cache then keeps the full
+	// DiskReadCacheSize.
+	ExtentCacheSize int64
+	// ExtentWriteCacheSize bounds the extent plane's writeback staging
+	// (bytes in flight, derived to a staging-block count). 0 uses the
+	// engine's default concurrency cap.
+	ExtentWriteCacheSize   int64
 	DiskReadCacheFreeRatio float64
 
 	DirTTL           time.Duration
@@ -353,32 +364,36 @@ type MountOptions struct {
 	WriteBackBatchMaxBytes        int64
 	WriteCacheFreeRatio           float64
 	WriteCacheSizeMB              int64
-	UploadConcurrency             int           // background upload workers (default 16)
-	ReadConcurrency               int           // concurrent backend reads (default 24)
-	ParallelReadConcurrency       int           // concurrent block reads per large FUSE read (default 4)
-	ParallelReadBlockSize         int64         // block size for parallel reads (default 1MiB)
-	SyncRead                      bool          // disable kernel async read dispatch
-	DirectMountStrict             bool          // Linux only: mount(2) without fusermount fallback
-	GVisorCompat                  bool          // gVisor FUSE compatibility behavior
-	LegacyInterruptibleMutations  bool          // FUSE interrupt cancels in-flight remote commits (legacy)
-	LookupRetryCount              int           // detached retries after transient stat failures (default 2)
-	LookupRetryTimeout            time.Duration // timeout per detached stat retry (default 250ms)
-	LegacyDirStatFallback         bool          // list parent when directory stat 404s (legacy servers)
-	ReadDirPrefetch               bool
-	PrefetchMaxFiles              int
-	PrefetchMaxFileBytes          int64
-	PrefetchMaxBytes              int64
-	PrefetchTimeout               time.Duration
-	DirCacheMaxEntries            int
-	TrustLocalEvents              bool
-	AllowOther                    bool
-	ReadOnly                      bool
-	Debug                         bool
-	PerfCounters                  bool
-	EnableGitWorkspaces           bool // enable git workspace overlay discovery (default off)
-	Profiling                     ProfilingOptions
-	WritebackLazyStaging          bool
-	WritebackSyncWindow           time.Duration
+	// ExtentCacheSize / ExtentWriteCacheSize are the extent plane's own
+	// disk-cache and writeback-staging budgets (bytes; 0 = derive).
+	ExtentCacheSize              int64
+	ExtentWriteCacheSize         int64
+	UploadConcurrency            int           // background upload workers (default 16)
+	ReadConcurrency              int           // concurrent backend reads (default 24)
+	ParallelReadConcurrency      int           // concurrent block reads per large FUSE read (default 4)
+	ParallelReadBlockSize        int64         // block size for parallel reads (default 1MiB)
+	SyncRead                     bool          // disable kernel async read dispatch
+	DirectMountStrict            bool          // Linux only: mount(2) without fusermount fallback
+	GVisorCompat                 bool          // gVisor FUSE compatibility behavior
+	LegacyInterruptibleMutations bool          // FUSE interrupt cancels in-flight remote commits (legacy)
+	LookupRetryCount             int           // detached retries after transient stat failures (default 2)
+	LookupRetryTimeout           time.Duration // timeout per detached stat retry (default 250ms)
+	LegacyDirStatFallback        bool          // list parent when directory stat 404s (legacy servers)
+	ReadDirPrefetch              bool
+	PrefetchMaxFiles             int
+	PrefetchMaxFileBytes         int64
+	PrefetchMaxBytes             int64
+	PrefetchTimeout              time.Duration
+	DirCacheMaxEntries           int
+	TrustLocalEvents             bool
+	AllowOther                   bool
+	ReadOnly                     bool
+	Debug                        bool
+	PerfCounters                 bool
+	EnableGitWorkspaces          bool // enable git workspace overlay discovery (default off)
+	Profiling                    ProfilingOptions
+	WritebackLazyStaging         bool
+	WritebackSyncWindow          time.Duration
 	// RemoteCommitWaitTimeout bounds how long a FUSE write/flush handler waits
 	// for a background commit before proceeding anyway (default 5s; 0 uses
 	// default; negative disables the timeout).
@@ -432,6 +447,8 @@ func mountConfigFromOptions(opts *MountOptions) MountConfig {
 		ReadCacheMaxFileBytes:         opts.ReadCacheMaxFileBytes,
 		ReadCacheTTL:                  opts.ReadCacheTTL,
 		DiskReadCacheSize:             opts.DiskReadCacheSize,
+		ExtentCacheSize:               opts.ExtentCacheSize,
+		ExtentWriteCacheSize:          opts.ExtentWriteCacheSize,
 		DiskReadCacheFreeRatio:        opts.DiskReadCacheFreeRatio,
 		DirTTL:                        opts.DirTTL,
 		AttrTTL:                       opts.AttrTTL,
@@ -823,8 +840,12 @@ func mountWithConfig(cfg MountConfig) error {
 				// independently evicted disk caches; each gets half the
 				// configured budget so the AGGREGATE stays at the limit.
 				budget := cfg.DiskReadCacheSize
-				if wantExt["extent"] && budget > 0 {
-					budget /= 2
+				// Two planes, two budgets (see classicAndEngineBudgets):
+				// with an explicit extent budget the classic read cache
+				// keeps the full configured size; otherwise the single
+				// configured budget is split (backward compatible).
+				if wantExt["extent"] {
+					budget, _ = classicAndEngineBudgets(cfg.DiskReadCacheSize, cfg.ExtentCacheSize)
 				}
 				// A non-positive budget disables the disk read cache
 				// entirely (mirroring the extent engine, whose CacheSize 0
@@ -1028,8 +1049,8 @@ func mountWithConfig(cfg MountConfig) error {
 			// suppresses JuiceFS's UUID cache namespace: the scope
 			// directory is already per-mount, so another segment would be
 			// redundant.)
-			CacheDir:  cacheScopedDir(extentCacheScope(cacheBase, mountHash, readCacheHash), "", "extent"),
-			ReadOnly:  cfg.ReadOnly,
+			CacheDir:       cacheScopedDir(extentCacheScope(cacheBase, mountHash, readCacheHash), "", "extent"),
+			ReadOnly:       cfg.ReadOnly,
 			FreeSpaceRatio: float32(cfg.DiskReadCacheFreeRatio),
 			// JuiceFS's OWN writeback pipeline: blocks below the threshold
 			// are staged into the engine's disk cache and uploaded by the
@@ -1039,19 +1060,26 @@ func mountWithConfig(cfg MountConfig) error {
 			// JuiceFS itself disables writeback without a disk cache.
 			Writeback:              !cfg.ReadOnly && cacheBase != "",
 			WritebackThresholdSize: int(client.ExtentBlockSize) + 1,
-			// In-flight staging concurrency feeding the shared cache
-			// budget (the bytes themselves are bounded by the engine's
-			// CacheSize half + the free-space floor).
+			// In-flight staging concurrency: raised/derived from
+			// --extent-write-cache-size-mb below (this is the fallback).
 			MaxStageWrite: 40,
 		}
-		if cfg.DiskReadCacheSize > 0 {
-			// AGGREGATE budget: the classic read cache below is capped at
-			// half the configured bytes when the engine is armed (see the
-			// cache extension), so this half keeps the mount's total disk
-			// cache at exactly the configured limit across both planes.
-			// The engine's writeback staging lives in this same cache, so
-			// the partition bounds retained writeback bytes too.
-			engineConf.CacheSize = uint64(cfg.DiskReadCacheSize / 2)
+		// The extent plane's own disk budget: read cache and writeback
+		// staging share it (JuiceFS accounting). An explicit
+		// ExtentCacheSize wins; otherwise the single configured disk budget
+		// is split with the classic read cache (backward compatible).
+		if _, engineBudget := classicAndEngineBudgets(cfg.DiskReadCacheSize, cfg.ExtentCacheSize); engineBudget > 0 {
+			engineConf.CacheSize = uint64(engineBudget)
+		}
+		// The writeback staging budget: JuiceFS exposes no byte quota for
+		// staging (it shares the cache quota above), but it does bound how
+		// many staging blocks may be in flight. Map the configured byte
+		// budget onto that block count so the operator's number caps the
+		// in-flight staging bytes.
+		if cfg.ExtentWriteCacheSize > 0 {
+			if blocks := int(cfg.ExtentWriteCacheSize / int64(client.ExtentBlockSize)); blocks > 0 {
+				engineConf.MaxStageWrite = blocks
+			}
 		}
 		engine := extent.NewEngine(engineConf)
 		built["extent"] = extent.New(extent.Options{
@@ -1561,6 +1589,20 @@ func remoteRootValidationError(remoteRoot string, err error) *MountExitError {
 
 // diskCacheOpts builds the on-disk read-cache options; an empty cache
 // directory disables the disk layer (memory-only, v1 default).
+// classicAndEngineBudgets resolves the two planes' disk budgets from the
+// configured knobs: an explicit extent budget is the engine's own and lets
+// the classic read cache keep the full configured size; otherwise the one
+// configured budget is split in half (backward compatible).
+func classicAndEngineBudgets(disk, extent int64) (classic, engine int64) {
+	if extent > 0 {
+		return disk, extent
+	}
+	if disk > 0 {
+		return disk / 2, disk / 2
+	}
+	return 0, 0
+}
+
 func diskCacheOpts(dir string, sizeMB int64, freeRatio float64) cache.DiskReadCacheOptions {
 	// An empty dir OR a non-positive budget disables the disk read cache:
 	// the plugin substitutes its own default for MaxSize <= 0, which would

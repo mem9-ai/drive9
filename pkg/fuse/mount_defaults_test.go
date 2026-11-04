@@ -193,3 +193,27 @@ func TestZeroDiskCacheBudgetDisablesBothPlanes(t *testing.T) {
 		t.Fatalf("zero-budget diskCacheOpts leaked a dir: %q", got.Dir)
 	}
 }
+
+// Two independent budgets: when the extent plane has an explicit budget,
+// the classic read cache keeps the FULL --disk-read-cache-size-mb (no
+// splitting); with no explicit extent budget the single configured value
+// is still split in half (backward compatible).
+func TestExtentBudgetSplitsOnlyWhenDerived(t *testing.T) {
+	cases := []struct {
+		name                    string
+		disk, extent            int64
+		wantClassic, wantEngine int64
+	}{
+		{"derived", 1024 << 20, 0, 512 << 20, 512 << 20},
+		{"explicit extent", 1024 << 20, 4096 << 20, 1024 << 20, 4096 << 20},
+		{"both zero", 0, 0, 0, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			classic, engine := classicAndEngineBudgets(tc.disk, tc.extent)
+			if classic != tc.wantClassic || engine != tc.wantEngine {
+				t.Fatalf("classic=%d engine=%d, want %d/%d", classic, engine, tc.wantClassic, tc.wantEngine)
+			}
+		})
+	}
+}
