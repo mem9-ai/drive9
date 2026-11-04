@@ -1159,6 +1159,17 @@ func (cq *CommitQueue) recoveredEntry(path string) *CommitEntry {
 	if !ok || meta.LayerClean {
 		return nil
 	}
+	if meta.Kind == staging.PendingConflict {
+		// A conflict marker is preserved even without a shadow: the
+		// transfer transaction stages one at the destination deliberately
+		// (a crash mid-move must leave the renamed name refusing to certify
+		// the image that never landed, with the bytes preserved under the
+		// old name) — pruning it as "orphaned" would erase the only durable
+		// witness. Entries WITH a shadow are the ordinary preserved-for-
+		// manual-recovery case.
+		safeLogPrintf("commit queue: skipping conflicted entry for %s (preserved for manual recovery)", path)
+		return nil
+	}
 	if cq.shadows != nil && !cq.shadows.Has(path) {
 		// Shadow file missing — prune orphaned pending index entry so
 		// Lookup/GetAttr don't serve stale metadata.
@@ -1167,10 +1178,6 @@ func (cq *CommitQueue) recoveredEntry(path string) *CommitEntry {
 		return nil
 	}
 	shadowGen := cq.index.RecoverShadowSource(path, meta.Generation, cq.shadows)
-	if meta.Kind == staging.PendingConflict {
-		safeLogPrintf("commit queue: skipping conflicted entry for %s (preserved for manual recovery)", path)
-		return nil
-	}
 	if meta.Kind == staging.PendingOverwrite && meta.BaseRev <= 0 && cq.layerRefSnapshot() == "" {
 		safeLogPrintf("commit queue: skip legacy pending overwrite without base revision for %s", path)
 		return nil

@@ -536,10 +536,13 @@ func TestConflictTransferMovesLiveEntryPairAcrossCrash(t *testing.T) {
 	if dstMeta == nil || !dstFound {
 		t.Fatal("destination meta missing after the crash window")
 	}
-	// The old name's stale .meta may linger until the commit — its payload is
-	// gone, so recovery prunes it; the destination pair is what must hold.
-	if dstMeta.Kind == PendingConflict {
-		t.Fatalf("the live image was moved as a terminal-failure marker: %+v", dstMeta)
+	// The destination's durable state in this window is the CONFLICT-KIND
+	// WITNESS the transaction stages deliberately: a crash here must leave
+	// the renamed name refusing to certify the image (recovery preserves
+	// the shadowless marker), with the moved bytes paired beside it. The
+	// commit is what rewrites the entry with its live kind.
+	if dstMeta.Kind != PendingConflict {
+		t.Fatalf("the crash-window destination meta kind = %v, want the preserved witness marker", dstMeta.Kind)
 	}
 	if dstMeta.Size != int64(len("queued successor")) {
 		t.Fatalf("recovered destination meta size = %d, want the live image's", dstMeta.Size)
@@ -615,8 +618,9 @@ func TestConflictTransferPrepareFlipsLiveSource(t *testing.T) {
 	if onDisk.Kind != PendingConflict || onDisk.Generation != gen {
 		t.Fatalf("old-name durable meta after prepare = kind %v gen %d, want the flipped marker at gen %d", onDisk.Kind, onDisk.Generation, gen)
 	}
-	// The prepared destination keeps the LIVE kind (durable only — memory
-	// publishes at Commit — so read it back the way a restart would).
+	// The prepared destination carries the conflict-kind WITNESS durably
+	// (memory keeps the live kind and publishes it at Commit); read the
+	// durable state back the way a restart would.
 	recovered, err := NewPendingIndex(dir)
 	if err != nil {
 		t.Fatal(err)
@@ -627,7 +631,7 @@ func TestConflictTransferPrepareFlipsLiveSource(t *testing.T) {
 	if meta, found := recovered.GetMeta("/a"); !found || meta == nil || meta.Kind != PendingConflict {
 		t.Fatalf("recovered old-name entry = %+v found=%v, want the preserved marker", meta, found)
 	}
-	if meta, found := recovered.GetMeta("/b"); !found || meta == nil || meta.Kind == PendingConflict {
-		t.Fatalf("recovered prepared entry = %+v found=%v, want the live kind preserved", meta, found)
+	if meta, found := recovered.GetMeta("/b"); !found || meta == nil || meta.Kind != PendingConflict {
+		t.Fatalf("recovered prepared entry = %+v found=%v, want the preserved shadowless witness marker", meta, found)
 	}
 }

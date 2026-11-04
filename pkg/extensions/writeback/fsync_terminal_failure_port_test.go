@@ -690,7 +690,7 @@ func TestPortRenameMovesConflictMarkerStagedDuringRename(t *testing.T) {
 
 	// The post-Rename transition, with the stale pre-rename generations the
 	// old code trusted: the marker that must move is the LIVE one (v3).
-	if err := wb.retargetConflictMarkers(context.Background(), "/race-src.txt", "/race-dst.txt", renameFence{}, false); err != nil {
+	if _, err := wb.retargetConflictMarkers(context.Background(), "/race-src.txt", "/race-dst.txt", renameFence{}, false); err != nil {
 		t.Fatalf("retarget reported the fenced-out transfer as a failure: %v", err)
 	}
 	// What the rename caller does on a successful transition.
@@ -1018,7 +1018,7 @@ func TestPortRenameRefusesDataLandedAtObsoleteName(t *testing.T) {
 	}
 
 	unlock := wb.lockRenamePaths("/obs-src.txt", "/obs-dst.txt")
-	err := wb.conflictTransitionLocked(ctx, "/obs-src.txt", "/obs-dst.txt", renameFence{}, true)
+	_, err := wb.conflictTransitionLocked(ctx, "/obs-src.txt", "/obs-dst.txt", renameFence{}, true)
 	unlock()
 	if err == nil {
 		t.Fatal("the transition certified data landed under the obsolete old name")
@@ -1134,7 +1134,7 @@ func TestPortRenameFailsClosedWhenOldNameStatErrors(t *testing.T) {
 
 		fb.setFailStat(true)
 		unlock := wb.lockRenamePaths("/stat-src.txt", "/stat-dst.txt")
-		err := wb.conflictTransitionLocked(ctx, "/stat-src.txt", "/stat-dst.txt", renameFence{}, true)
+		_, err := wb.conflictTransitionLocked(ctx, "/stat-src.txt", "/stat-dst.txt", renameFence{}, true)
 		unlock()
 		if err == nil {
 			t.Fatalf("resurrected=%v: the transition certified the rename although the old name could not be observed", resurrected)
@@ -1188,7 +1188,7 @@ func TestPortDirRenameKeepsSuccessorPublishedAfterRetarget(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := wb.retargetQueuedImage("/d/a", "/e/a", renameFence{movedAt: movedAt}); err == nil {
+	if _, err := wb.retargetQueuedImage("/d/a", "/e/a", renameFence{movedAt: movedAt}); err == nil {
 		t.Fatal("the move retired a newer post-rename publication at the destination")
 	}
 	// G3 is untouched at the new name — still queued, still live.
@@ -1371,7 +1371,7 @@ func TestPortRenameKeepsFreshOpenerStagedDuringResponse(t *testing.T) {
 	// The delayed response arrives NOW: the fresh opener's publication
 	// predates it, and only the revision fence can tell the incarnations
 	// apart.
-	if err := wb.retargetQueuedImage("/inc-src.txt", "/inc-dst.txt", renameFence{movedAt: time.Now(), srcRev: srcRev}); err == nil {
+	if _, err := wb.retargetQueuedImage("/inc-src.txt", "/inc-dst.txt", renameFence{movedAt: time.Now(), srcRev: srcRev}); err == nil {
 		t.Fatal("the move retired a fresh opener's publication that predates the response")
 	}
 
@@ -1543,7 +1543,7 @@ func TestPortDirRenameKeepsFreshChildOpenerStagedDuringResponse(t *testing.T) {
 
 	// The child's fence must classify G3 by the CHILD's revision and refuse
 	// the move; the directory's own revision (or zero) classifies nothing.
-	if err := wb.retargetQueuedImage("/d/f", "/e/f", wb.childFence(ctx, "/e/f", time.Now())); err == nil {
+	if _, err := wb.retargetQueuedImage("/d/f", "/e/f", wb.childFence(ctx, "/d/f", "/e/f", time.Now())); err == nil {
 		t.Fatal("the move retired a fresh child opener's publication that predates the response")
 	}
 	dstMeta, ok = wb.opts.Staging.Pending.GetMeta("/e/f")
@@ -1566,5 +1566,276 @@ func TestPortDirRenameKeepsFreshChildOpenerStagedDuringResponse(t *testing.T) {
 	}
 	if got, ok := nodeString(fb.backend, "/e/f"); !ok || got != "fresh child opener" {
 		t.Fatalf("remote image at the child's new name = %q ok=%v, want the fresh opener's bytes", got, ok)
+	}
+}
+
+// TestPortRenameCarriesPublicationFromRetargetGap pins the final-publication
+// window: between the rename transition releasing its path locks and the
+// handles moving to the new name, an open writer can still stage (and
+// enqueue, clearing its dirty flag) under the OLD name — the one window no
+// earlier snapshot covers. The second pass after the handle retarget must
+// carry that stranded publication to the new name, where the retargeted
+// handle's strict Sync waits its landing instead of certifying without it.
+func TestPortRenameCarriesPublicationFromRetargetGap(t *testing.T) {
+	fb := &failingWritesBackend{backend: testbackend.NewBackend()}
+	ch, wb := newUploadStack(t, fb, Options{Policy: PolicyWriteBack})
+	ctx := context.Background()
+
+	h := open(t, ch, "/gap-src.txt")
+	if err := h.Write(ctx, 0, []byte("v1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	srcRev, ok := wb.landedRevision("/gap-src.txt")
+	if !ok || srcRev <= 0 {
+		t.Fatalf("source revision = %d ok=%v", srcRev, ok)
+	}
+
+	// The server applies the rename (this sequence exercises the handler's
+	// post-RPC phases directly); srcRev is the pre-RPC source stat.
+	if err := wb.opts.Client.RenameCtx(ctx, wb.remotePath("/gap-src.txt"), wb.remotePath("/gap-dst.txt")); err != nil {
+		t.Fatal(err)
+	}
+	// First pass: the clean rename's transition.
+	fence := renameFence{movedAt: time.Now(), srcRev: srcRev}
+	installedGen, terr := wb.retargetConflictMarkers(ctx, "/gap-src.txt", "/gap-dst.txt", fence, false)
+	if terr != nil {
+		t.Fatalf("first transition pass: %v", terr)
+	}
+	// THE GAP: locks released, handles not yet moved — the writer stages a
+	// fresh image under the old name and its Flush clears the dirty flag.
+	fb.setFail(true)
+	if err := h.Write(ctx, 0, []byte("gap v2")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// The handle retarget: publications now go to the new name only.
+	wb.retarget("/gap-src.txt", "/gap-dst.txt")
+	// The handler's second pass: the stranded old-name publication moves.
+	secondFence := renameFence{movedAt: fence.movedAt, srcRev: srcRev, ownGen: installedGen}
+	secondWork := (wb.queue != nil && wb.queue.HasPath("/gap-src.txt")) || wb.everLanded("/gap-src.txt")
+	if !secondWork {
+		t.Fatal("the gap publication was not detected as in-window work")
+	}
+	if _, terr := wb.retargetConflictMarkers(ctx, "/gap-src.txt", "/gap-dst.txt", secondFence, secondWork); terr != nil {
+		t.Fatalf("second transition pass: %v", terr)
+	}
+
+	if wb.opts.Staging.Pending.HasPending("/gap-src.txt") {
+		t.Fatal("the gap publication stayed stranded under the dead old name")
+	}
+	// The retargeted handle's strict Sync waits the re-driven landing.
+	fb.setFail(false)
+	if err := h.Sync(ctx); err != nil {
+		t.Fatalf("strict Sync after the gap publication = %v, want the re-driven landing", err)
+	}
+	if got, ok := nodeString(fb.backend, "/gap-dst.txt"); !ok || got != "gap v2" {
+		t.Fatalf("remote image at the new name = %q ok=%v, want the gap publication's bytes", got, ok)
+	}
+	if _, recreated := nodeString(fb.backend, "/gap-src.txt"); recreated {
+		t.Fatal("the dead old name was resurrected")
+	}
+}
+
+// TestPortChildFenceProtectsAdvanceToNewerRevision pins the lineage row of
+// the child fence: a fresh opener stages G3 over the renamed child's R1
+// during the delayed response, and ANOTHER client (a second mount) advances
+// the child to R2 before the fence Stat. Exact equality with the current
+// revision would classify G3 as the replaced incumbent's; the fence's
+// source-entry base revision (the renamed lineage's at-rename point) must
+// protect it.
+func TestPortChildFenceProtectsAdvanceToNewerRevision(t *testing.T) {
+	fb := &failingWritesBackend{backend: testbackend.NewBackend()}
+	ch, wb := newUploadStack(t, fb, Options{Policy: PolicyWriteBack})
+	ctx := context.Background()
+
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMkdir, Path: "/d", Mode: 0o755}); err != nil {
+		t.Fatal(err)
+	}
+	if err := landChild(t, ch, "/d/f", "child v1"); err != nil {
+		t.Fatal(err)
+	}
+	childRev, ok := wb.landedRevision("/d/f")
+	if !ok || childRev <= 0 {
+		t.Fatalf("child revision = %d ok=%v", childRev, ok)
+	}
+	// The server applies the directory rename; the handler never runs.
+	if err := wb.opts.Client.RenameCtx(ctx, wb.remotePath("/d"), wb.remotePath("/e")); err != nil {
+		t.Fatal(err)
+	}
+
+	// The old-name straggler: a FRESH opener of the old child (so its
+	// staging carries the child's real revision, not a stale create shape).
+	straggler := open(t, ch, "/d/f")
+	// The fresh destination opener stages G3 over the renamed child (R1).
+	fresh := open(t, ch, "/e/f")
+	fb.setFail(true)
+	if err := straggler.Write(ctx, 0, []byte("straggler over R1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := straggler.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := fresh.Write(ctx, 0, []byte("G3 over renamed child")); err != nil {
+		t.Fatal(err)
+	}
+	if err := fresh.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	g3, ok2 := wb.opts.Staging.Pending.GetMeta("/e/f")
+	if !ok2 || g3 == nil {
+		t.Fatal("the fresh opener must be pending at the destination")
+	}
+	if g3.BaseRev != childRev {
+		t.Fatalf("G3 base=%d, want the renamed child's rev %d", g3.BaseRev, childRev)
+	}
+	// ANOTHER client advances the child to R2 before the fence Stat — on
+	// its own backend wrapper, so this mount's queued straggler/G3 stay
+	// pending (a shared failure switch would let them land first).
+	fb2 := &failingWritesBackend{backend: fb.backend}
+	ch2, _ := newUploadStack(t, fb2, Options{Policy: PolicyWriteBack})
+	other := open(t, ch2, "/e/f")
+	if err := other.Write(ctx, 0, []byte("another client advances to R2")); err != nil {
+		t.Fatal(err)
+	}
+	if err := other.Sync(ctx); err != nil {
+		t.Fatalf("the other client's landing: %v", err)
+	}
+
+	// The fence reads the ADVANCED revision. The straggler's own base is
+	// create-shaped (0) — same-handle succession lag — so the renamed
+	// lineage's revisions are unknowable and the fence must fail safe:
+	// G3's revisioned staging can never be classified as the replaced
+	// incumbent's. (The lineage-equality row is pinned directly in
+	// TestDstProtectedLineageRules.)
+	fence := wb.childFence(ctx, "/d/f", "/e/f", time.Now())
+	if fence.srcRev == childRev {
+		t.Fatal("the other client's advance was not observed by the fence stat")
+	}
+	if !fence.srcBaseRevSet || fence.srcBaseRev != 0 {
+		t.Fatalf("straggler base fence = %+v, want the create-shaped source recorded", fence)
+	}
+	if _, err := wb.retargetQueuedImage("/d/f", "/e/f", fence); err == nil {
+		t.Fatal("the move retired G3 although its base belongs to the renamed child's lineage")
+	}
+	g3After, ok := wb.opts.Staging.Pending.GetMeta("/e/f")
+	if !ok || g3After == nil || g3After.Kind == staging.PendingConflict || g3After.BaseRev != childRev {
+		t.Fatalf("destination entry = %+v ok=%v, want G3 untouched", g3After, ok)
+	}
+	srcMeta, ok := wb.opts.Staging.Pending.GetMeta("/d/f")
+	if !ok || srcMeta == nil || srcMeta.Kind != staging.PendingConflict {
+		t.Fatalf("old-prefix entry = %+v ok=%v, want the preserved conflict marker", srcMeta, ok)
+	}
+	// G3 lands once uploads recover and clears the record.
+	fb.setFail(false)
+	if err := fresh.Sync(ctx); err != nil {
+		t.Fatalf("strict Sync on G3 = %v, want it to land and clear the record", err)
+	}
+}
+
+// TestRecoveryKeepsShadowlessConflictWitness pins the recovery rule the
+// pre-move crash witness depends on: a conflict marker without a shadow is
+// PRESERVED (it is the durable EIO witness a crashed transfer left at the
+// renamed name, with the bytes preserved under the old one), while a
+// shadowless LIVE entry stays pruned as an orphan.
+func TestRecoveryKeepsShadowlessConflictWitness(t *testing.T) {
+	pending, err := staging.NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev("/witness.txt", 7, staging.PendingNew, 3); err != nil {
+		t.Fatal(err)
+	}
+	if err := pending.MarkConflict("/witness.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev("/orphan.txt", 7, staging.PendingNew, 3); err != nil {
+		t.Fatal(err)
+	}
+	shadows, err := staging.NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(shadows.Close)
+	cq := NewCommitQueue(nil, shadows, pending, nil, 1, 8)
+	cq.RecoverPending()
+
+	if !pending.HasPending("/witness.txt") {
+		t.Fatal("recovery pruned the shadowless conflict witness")
+	}
+	if err := cq.PathTerminalFailure("/witness.txt"); err == nil {
+		t.Fatal("the preserved witness does not answer EIO")
+	}
+	if pending.HasPending("/orphan.txt") {
+		t.Fatal("recovery kept a shadowless live entry")
+	}
+}
+
+// landChild lands one image through a fresh handle and returns.
+func landChild(t *testing.T, ch *fs.Chain, path, content string) error {
+	t.Helper()
+	h := open(t, ch, path)
+	if err := h.Write(context.Background(), 0, []byte(content)); err != nil {
+		return err
+	}
+	return h.Sync(context.Background())
+}
+
+// TestDstProtectedLineageRules pins the incarnation classifier's lineage
+// row directly: a destination staging composed over the renamed object's
+// AT-RENAME revision (the source entry's own base) is protected even when
+// the current revision has since advanced past it, while a staging against
+// any other revision (the replaced incumbent's) stays replaceable, and the
+// rename's own first-pass installation is replaceable only by its own
+// second pass.
+func TestDstProtectedLineageRules(t *testing.T) {
+	fb := &failingWritesBackend{backend: testbackend.NewBackend()}
+	_, wb := newUploadStack(t, fb, Options{Policy: PolicyWriteBack})
+
+	const (
+		oldIncumbentRev = int64(7)
+		atRenameRev     = int64(11)
+		advancedRev     = int64(12)
+	)
+	stage := func(path string, baseRev int64) uint64 {
+		t.Helper()
+		gen, err := wb.opts.Staging.Pending.PutWithBaseRev(path, 3, staging.PendingOverwrite, baseRev)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return gen
+	}
+
+	// A staging over the at-rename revision is protected even though the
+	// fence's current revision has advanced past it.
+	stage("/lineage.txt", atRenameRev)
+	_, _, _, protected := wb.dstProtected("/lineage.txt", renameFence{
+		movedAt: time.Now(), srcRev: advancedRev, srcBaseRev: atRenameRev, srcBaseRevSet: true,
+	})
+	if !protected {
+		t.Fatal("a staging over the renamed lineage's at-rename revision was classified replaceable")
+	}
+
+	// A staging against the replaced incumbent's revision is not.
+	stage("/incumbent.txt", oldIncumbentRev)
+	_, _, _, protected = wb.dstProtected("/incumbent.txt", renameFence{
+		movedAt: time.Now(), srcRev: advancedRev, srcBaseRev: atRenameRev, srcBaseRevSet: true,
+	})
+	if protected {
+		t.Fatal("a staging against the replaced incumbent's revision was classified protected")
+	}
+
+	// The rename's own installation is replaceable — by exactly its own
+	// second pass.
+	own := stage("/own.txt", atRenameRev)
+	_, _, _, protected = wb.dstProtected("/own.txt", renameFence{
+		movedAt: time.Now(), srcRev: advancedRev, srcBaseRev: atRenameRev, srcBaseRevSet: true, ownGen: own,
+	})
+	if protected {
+		t.Fatal("the rename's own installation was not replaceable by its second pass")
 	}
 }

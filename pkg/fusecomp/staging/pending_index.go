@@ -433,11 +433,25 @@ func (idx *PendingIndex) prepareConflictTransferLocked(oldPath, newPath string, 
 	clone.Kind = keepKind
 	prepared := &clone
 	if !hasDst {
-		if err := idx.writeMetaFile(prepared); err != nil {
+		if err := idx.writePreparedWitness(prepared); err != nil {
 			return nil, false, false, err
 		}
 	}
 	return prepared, true, hasDst, nil
+}
+
+// writePreparedWitness persists the prepared entry at the destination as a
+// CONFLICT-kind witness while the transaction is in flight: every crash
+// point before the commit must leave the destination either empty or
+// carrying a durable EIO marker — recovery preserves shadowless conflict
+// entries precisely so this witness survives restart instead of being
+// pruned like an orphaned live entry. The commit rewrites the entry with
+// its true kind (live for a moved queued image) once the payload sits
+// beside it.
+func (idx *PendingIndex) writePreparedWitness(prepared *WriteBackMeta) error {
+	witness := cloneWriteBackMeta(prepared)
+	witness.Kind = PendingConflict
+	return idx.writeMetaFile(&witness)
 }
 
 // MovePayload moves the preserved shadow bytes to the new name. It reports
@@ -478,7 +492,7 @@ func (t *PendingConflictTransfer) MovePayload() bool {
 			return false
 		}
 		t.destReplaced = true
-		if err := t.idx.writeMetaFile(t.prepared); err != nil {
+		if err := t.idx.writePreparedWitness(t.prepared); err != nil {
 			return false
 		}
 		t.destMetaPersisted = true
@@ -495,6 +509,17 @@ func (t *PendingConflictTransfer) MovePayload() bool {
 // lost; nothing is changed in that case. A non-nil error means the
 // destination metadata could not be persisted — the payload has already
 // moved, so the caller must surface the failure.
+// PreparedGeneration reports the generation the prepared destination entry
+// will carry once committed: the rename flow records it so its own second
+// pass can distinguish the entry IT installed from anything else published
+// at the destination meanwhile.
+func (t *PendingConflictTransfer) PreparedGeneration() uint64 {
+	if t == nil || t.prepared == nil {
+		return 0
+	}
+	return t.prepared.Generation
+}
+
 func (t *PendingConflictTransfer) Commit() (bool, error) {
 	if t == nil || t.closed || t.prepared == nil {
 		return false, nil
