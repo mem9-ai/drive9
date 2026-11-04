@@ -2757,16 +2757,6 @@ func (h *bufferingHandle) completeStagedLanding(rev, size int64, snapshotID stri
 	return certified
 }
 
-// currentStagedSnapshot returns the ID of this handle's most recent
-// staging (callers capture it immediately after staging, before the
-// landing wait, so a completion refers to exactly the operation that
-// completed).
-func (h *bufferingHandle) currentStagedSnapshot() string {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.stagedSnapshotID
-}
-
 // retireStagedSnapshotLocked drops a completed snapshot ID from the
 // per-handle registration set: only in-flight landings need to find it,
 // and a long-lived descriptor with repeated write/fsync cycles must not
