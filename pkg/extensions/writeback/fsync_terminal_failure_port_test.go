@@ -1399,3 +1399,172 @@ func TestPortRenameKeepsFreshOpenerStagedDuringResponse(t *testing.T) {
 		t.Fatalf("remote image at the destination = %q ok=%v, want the fresh opener's bytes", got, ok)
 	}
 }
+
+// TestPortDirRenameCatchesRepeatChildLanding pins the repeat-landing row of
+// the in-window child detector: a child that had ALREADY landed before the
+// RPC lands AGAIN in place during the delayed response (the watermark is
+// replaced, so a set snapshot cannot tell it from the pre-existing landing).
+// The worker's create retry recreates the child under the dead prefix and
+// finishes before the response arrives; the rename must still refuse to
+// certify the child's new name and leave a failure witness there.
+func TestPortDirRenameCatchesRepeatChildLanding(t *testing.T) {
+	fb := &failingWritesBackend{backend: testbackend.NewBackend()}
+	gate := make(chan struct{})
+	gated := make(chan struct{})
+	fb.renameGate, fb.gated = gate, gated
+	ch, wb := newUploadStack(t, fb, Options{Policy: PolicyWriteBack})
+	ctx := context.Background()
+
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMkdir, Path: "/d", Mode: 0o755}); err != nil {
+		t.Fatal(err)
+	}
+	// G1 lands BEFORE the rename, so the child already has a landed
+	// watermark when the delayed response window opens.
+	h := open(t, ch, "/d/f")
+	if err := h.Write(ctx, 0, []byte("child v1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	renamed := make(chan error, 1)
+	go func() {
+		_, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/d", Path2: "/e"})
+		renamed <- err
+	}()
+	select {
+	case <-gated:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the rename request never reached the backend")
+	}
+	// Inside the delayed response the same writer stages G2 and — uploads
+	// healthy — the worker resurrects the child under the dead prefix and
+	// finishes, replacing the child's existing watermark in place.
+	if err := h.Write(ctx, 0, []byte("child v2 resurrected")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if !wb.opts.Staging.Pending.HasPending("/d/f") {
+			if _, ok := nodeString(fb.backend, "/d/f"); ok {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if wb.opts.Staging.Pending.HasPending("/d/f") {
+		t.Fatal("the successor never landed inside the response delay")
+	}
+	if _, ok := nodeString(fb.backend, "/d/f"); !ok {
+		t.Fatal("the dead prefix child was not resurrected by the create retry")
+	}
+	close(gate)
+
+	// The rename itself answers success (the remote move happened and the
+	// child's failure is per-descendant), but the barrier must not certify
+	// the child: the resurrection leaves a failure witness at its new name,
+	// where the retargeted handle's strict Sync will answer EIO.
+	select {
+	case err := <-renamed:
+		if err != nil {
+			t.Fatalf("directory rename reported %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the directory rename never completed")
+	}
+	if err := wb.queue.PathTerminalFailure("/e/f"); err == nil {
+		t.Fatal("the child resurrection left no failure witness at the new prefix")
+	}
+	if got, ok := nodeString(fb.backend, "/e/f"); !ok || got != "child v1" {
+		t.Fatalf("remote image at the new prefix = %q ok=%v, want the stale pre-successor bytes", got, ok)
+	}
+}
+
+// TestPortDirRenameKeepsFreshChildOpenerStagedDuringResponse pins the
+// child-revision row of the incarnation fence for directory renames: during
+// the delayed response a fresh writable open of the renamed CHILD stages
+// over the CHILD's revision, which differs from the directory's — the fence
+// must classify by the child's own revision or it would retire that newer
+// publication as the replaced incumbent's and move the older queued image
+// over it. The server-side move is driven through the raw client (the port
+// chain serializes dispatches).
+func TestPortDirRenameKeepsFreshChildOpenerStagedDuringResponse(t *testing.T) {
+	fb := &failingWritesBackend{backend: testbackend.NewBackend()}
+	ch, wb := newUploadStack(t, fb, Options{Policy: PolicyWriteBack})
+	ctx := context.Background()
+
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMkdir, Path: "/d", Mode: 0o755}); err != nil {
+		t.Fatal(err)
+	}
+	src := open(t, ch, "/d/f")
+	if err := src.Write(ctx, 0, []byte("child v1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := src.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	childRev, ok := wb.landedRevision("/d/f")
+	if !ok || childRev <= 0 {
+		t.Fatalf("child revision = %d ok=%v, want the landed watermark", childRev, ok)
+	}
+
+	// The server applies the directory rename; the writeback handler has
+	// not run. Inside the delay: the source's writer queues an older G2
+	// under the old prefix ...
+	if err := wb.opts.Client.RenameCtx(ctx, wb.remotePath("/d"), wb.remotePath("/e")); err != nil {
+		t.Fatal(err)
+	}
+	fresh := open(t, ch, "/e/f")
+	fb.setFail(true)
+	if err := src.Write(ctx, 0, []byte("child v2 queued")); err != nil {
+		t.Fatal(err)
+	}
+	if err := src.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// ... and the fresh opener stages G3 over the renamed CHILD's revision.
+	if err := fresh.Write(ctx, 0, []byte("fresh child opener")); err != nil {
+		t.Fatal(err)
+	}
+	if err := fresh.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	dstMeta, ok := wb.opts.Staging.Pending.GetMeta("/e/f")
+	if !ok || dstMeta == nil {
+		t.Fatal("the fresh opener did not stage at the child's new name")
+	}
+	if dstMeta.BaseRev != childRev {
+		t.Fatalf("fresh opener staged against rev %d, want the renamed child's rev %d", dstMeta.BaseRev, childRev)
+	}
+
+	// The child's fence must classify G3 by the CHILD's revision and refuse
+	// the move; the directory's own revision (or zero) classifies nothing.
+	if err := wb.retargetQueuedImage("/d/f", "/e/f", wb.childFence(ctx, "/e/f", time.Now())); err == nil {
+		t.Fatal("the move retired a fresh child opener's publication that predates the response")
+	}
+	dstMeta, ok = wb.opts.Staging.Pending.GetMeta("/e/f")
+	if !ok || dstMeta == nil || dstMeta.Kind == staging.PendingConflict {
+		t.Fatalf("child destination entry = %+v ok=%v, want the fresh opener's untouched live image", dstMeta, ok)
+	}
+	srcMeta, ok := wb.opts.Staging.Pending.GetMeta("/d/f")
+	if !ok || srcMeta == nil || srcMeta.Kind != staging.PendingConflict {
+		t.Fatalf("old-prefix child entry = %+v ok=%v, want the preserved conflict marker", srcMeta, ok)
+	}
+	if err := wb.queue.PathTerminalFailure("/e/f"); err == nil {
+		t.Fatal("the refused move left no failure record at the child's new name")
+	}
+
+	// With the backend healthy the fresh opener's image lands and clears
+	// the record.
+	fb.setFail(false)
+	if err := fresh.Sync(ctx); err != nil {
+		t.Fatalf("strict Sync on the fresh child opener = %v, want its image to land and clear the record", err)
+	}
+	if got, ok := nodeString(fb.backend, "/e/f"); !ok || got != "fresh child opener" {
+		t.Fatalf("remote image at the child's new name = %q ok=%v, want the fresh opener's bytes", got, ok)
+	}
+}

@@ -1457,11 +1457,14 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			srcRev = srcStat.Revision
 		}
 		// The pre-drain's own landings must not read as in-window work below:
-		// forget them and snapshot the landed set so that only landings DURING
-		// the RPC count — a worker can finish (and resurrect the old name)
-		// before the rename response even arrives, leaving the queue idle.
+		// forget the old name's and the old prefix's watermarks entirely, so
+		// that any watermark re-appearing there during the RPC counts — a
+		// worker can finish (and resurrect the old name) before the response
+		// even arrives leaving the queue idle, and a child that had already
+		// landed before can land AGAIN in place, which a set snapshot cannot
+		// tell from the pre-existing landing.
 		w.forgetLanded(op.Path)
-		preLanded := w.landedPathsUnderPrefix(strings.TrimSuffix(op.Path, "/") + "/")
+		w.forgetLandedPrefix(strings.TrimSuffix(op.Path, "/") + "/")
 		// A rename over an OPEN target replaces the object its descriptors
 		// were reading: mark them anonymous BEFORE the remote rename (their
 		// clean images are snapshotted for post-overwrite reads), or they
@@ -1507,9 +1510,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 				}
 			}
 			for p := range w.landedPathsUnderPrefix(prefix) {
-				if !preLanded[p] {
-					windowDescendants[p] = true
-				}
+				windowDescendants[p] = true
 			}
 		}
 		// Both pathname incarnations ended (source moved, target replaced),
@@ -1591,9 +1592,9 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 					// itself; conflict entries carry no live queue
 					// bookkeeping (the worker left, recovery skips them), so
 					// a fenced move is safe.
-					terr = w.transferConflictMarker(ctx, path, target, renameFence{movedAt: movedAt, srcRev: srcRev}, true)
+					terr = w.transferConflictMarker(ctx, path, target, w.childFence(ctx, target, movedAt), true)
 				} else {
-					terr = w.retargetQueuedImage(path, target, renameFence{movedAt: movedAt, srcRev: srcRev})
+					terr = w.retargetQueuedImage(path, target, w.childFence(ctx, target, movedAt))
 				}
 				if terr != nil {
 					safeLogPrintf("writeback: pending descendant %s did not follow the rename: %v", path, terr)
@@ -1609,7 +1610,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 				continue // the loop above moved it
 			}
 			target := op.Path2 + strings.TrimPrefix(path, op.Path)
-			if terr := w.transferConflictMarker(ctx, path, target, renameFence{movedAt: movedAt, srcRev: srcRev}, true); terr != nil {
+			if terr := w.transferConflictMarker(ctx, path, target, w.childFence(ctx, target, movedAt), true); terr != nil {
 				safeLogPrintf("writeback: in-window descendant %s did not stay gone: %v", path, terr)
 			}
 		}
@@ -2466,6 +2467,30 @@ type renameFence struct {
 	srcRev  int64
 }
 
+// childFence builds the incarnation fence for one renamed descendant. The
+// revision a fresh opener of the renamed CHILD composed over is the child's
+// own revision — the directory's revision from the parent stat classifies
+// nothing — so the child's current revision is read from its target name at
+// fence time: post-rename it is the renamed child's landing (or a newer
+// one's, which protects at least as much). A Stat that cannot decide (5xx,
+// timeout) leaves the revision UNKNOWN (srcRev < 0): every destination entry
+// is then treated as protected — an undecided fence must not authorize
+// retiring a publication that may belong to the renamed child.
+func (w *Writeback) childFence(ctx context.Context, target string, movedAt time.Time) renameFence {
+	fence := renameFence{movedAt: movedAt}
+	st, serr := w.opts.Client.StatCtx(ctx, w.remotePath(target))
+	switch {
+	case serr == nil && st != nil:
+		fence.srcRev = st.Revision
+	case client.IsNotFound(serr):
+		// The target is absent: nothing could have opened it, so any entry
+		// at the name is not a fresh opener's.
+	default:
+		fence.srcRev = -1
+	}
+	return fence
+}
+
 // dstProtected classifies the destination's pending entry and reports whether
 // it must be treated as the renamed object's NEW incarnation: published after
 // the response arrived, or staged against the renamed object's own revision.
@@ -2485,6 +2510,9 @@ func (w *Writeback) dstProtected(path string, fence renameFence) (gen uint64, co
 	}
 	if !meta.CreatedAt.IsZero() && meta.CreatedAt.After(fence.movedAt) {
 		return gen, conflict, live, true // published after the response arrived
+	}
+	if fence.srcRev < 0 {
+		return gen, conflict, live, true // the fence itself is undecided
 	}
 	if fence.srcRev > 0 && meta.BaseRev == fence.srcRev {
 		return gen, conflict, live, true // composed over the renamed object
@@ -4191,9 +4219,12 @@ func (w *Writeback) everLanded(path string) bool {
 }
 
 // landedPathsUnderPrefix lists the paths under prefix that have a landed
-// watermark in this process: the rename flow snapshots it before the remote
-// RPC so that only landings DURING the RPC — including ones whose worker
-// finished before the response arrived — count as in-window work.
+// watermark in this process: the rename flow forgets the prefix's watermarks
+// before the remote RPC, so every path present in this set afterwards landed
+// DURING the RPC — including a REPEAT landing of a child that had already
+// landed before (the watermark is replaced in place, so set subtraction
+// could not see it) and ones whose worker finished before the response
+// arrived.
 func (w *Writeback) landedPathsUnderPrefix(prefix string) map[string]bool {
 	out := map[string]bool{}
 	w.landedMu.Lock()
@@ -4204,6 +4235,20 @@ func (w *Writeback) landedPathsUnderPrefix(prefix string) map[string]bool {
 	}
 	w.landedMu.Unlock()
 	return out
+}
+
+// forgetLandedPrefix drops every landed watermark under prefix: the rename
+// flow clears the old prefix's landings before the remote RPC (the names are
+// dying anyway) so that any watermark re-appearing under it afterwards is
+// provably an in-window landing.
+func (w *Writeback) forgetLandedPrefix(prefix string) {
+	w.landedMu.Lock()
+	for path := range w.landed {
+		if strings.HasPrefix(path, prefix) {
+			delete(w.landed, path)
+		}
+	}
+	w.landedMu.Unlock()
 }
 
 // landedAttr answers a lookup from the recently-landed table (30s window).
