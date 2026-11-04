@@ -927,22 +927,13 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 			// (and possibly a classic layout), and marking the handle
 			// classic-owned off it would let this descriptor write into
 			// a foreign file.
-			if savedID != "" && nst.ResourceID != savedID {
-				b.mu.Lock()
-				b.layoutPending[ino] = true // proof pending, owner unknown
-				b.mu.Unlock()
-				return fmt.Errorf("verify landed layout of %s: occupant replaced our upload", path)
-			}
-			if savedID == "" && nst.ContentLayout != client.ContentLayoutExtent {
-				// No echoed identity means no evidence ties this Stat's
-				// occupant to OUR completion: an arbitrary later classic
-				// occupant (a replacement) is indistinguishable from our
-				// own degraded upload, and accepting it would hand this
-				// descriptor the replacement's revision with no identity
-				// precondition. Only the EXTENT classification is
-				// attributable without an echo (a replacement of ours
-				// would have to be an extent upload that kept the path);
-				// the classic outcome stays pending and refuses.
+			if savedID == "" || nst.ResourceID != savedID {
+				// No echoed identity means NO evidence attributes this
+				// Stat's occupant to our completion: a replacement (of
+				// either layout — a matching extent layout establishes
+				// nothing) is indistinguishable from our own object. The
+				// pending state stays refused on every retry until a
+				// completion supplies the identity.
 				b.mu.Lock()
 				b.layoutPending[ino] = true
 				b.mu.Unlock()
@@ -2017,10 +2008,13 @@ func (b *Bridge) layoutPendingMatches(ino meta.Ino, occupantID string) bool {
 	if !b.layoutPending[ino] {
 		return false
 	}
-	if id := b.layoutPendingID[ino]; id != "" {
-		return id == occupantID
-	}
-	return true // fresh upload of ours created the occupant
+	// An UNKNOWN identity authorizes nothing — across retries and layouts
+	// alike: without the completion echo there is no evidence tying the
+	// pathname's occupant to OUR upload, so adopting it (this attempt or
+	// a later one, classic or extent) would hand this descriptor a
+	// replacement's bytes under its own revision. The pending state stays
+	// refused until a completion supplies the identity.
+	return b.layoutPendingID[ino] != "" && b.layoutPendingID[ino] == occupantID
 }
 
 // rcHeaderResourceID extracts an identity echoed by a read response, when

@@ -350,6 +350,10 @@ type bufferingHandle struct {
 	// later Write/Truncate/Reset (including an unstaged truncate-regrow)
 	// makes the live image diverge from what landed.
 	stagedContentVersion uint64
+	// selfCancelAfterStaging records (under h.mu) that a staging observed
+	// the unlink marking after its enqueue: its outer wrapper then cancels
+	// the just-enqueued entry outside the staging path lock.
+	selfCancelAfterStaging bool
 	// stagedSnapshotRegs is the set of snapshot IDs this handle has
 	// registered under w.liveSnapshots (atomic map copy): entries are
 	// consumed by their landings and the remainder is dropped at untrack.
@@ -4316,7 +4320,22 @@ func (h *bufferingHandle) stageAndEnqueue(ctx context.Context) error {
 // resurrect a path the commit settled (v1 interactive fsync ordering).
 func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journalFsync bool) (stagedSnapshot string, err error) {
 	stagedSnapshot, err = h.stageAndEnqueueInner(ctx, durable, journalFsync)
-	return stagedSnapshot, err
+	if err != nil {
+		return stagedSnapshot, err
+	}
+	// The staging path lock is released here (the inner function's defer
+	// has run): a marking observed by the inner recheck cancels its own
+	// just-enqueued entry now, without re-entering the non-reentrant lock
+	// the staging held. The unlink's own sweep races harmlessly — the
+	// entry is either canceled here or by it, never left enqueued.
+	h.mu.Lock()
+	selfCancel := h.selfCancelAfterStaging
+	h.selfCancelAfterStaging = false
+	h.mu.Unlock()
+	if selfCancel && h.w.queue != nil {
+		_ = h.w.queue.CancelPathPreserveLocal(h.path)
+	}
+	return stagedSnapshot, nil
 }
 
 func (h *bufferingHandle) stageAndEnqueueInner(ctx context.Context, durable, journalFsync bool) (staged string, err error) {
@@ -4522,17 +4541,13 @@ func (h *bufferingHandle) stageAndEnqueueInner(ctx context.Context, durable, jou
 	}
 	// The unlink's marking takes no path lock (a commit worker holds it
 	// across its upload), so the pre-enqueue guard alone cannot close the
-	// check-to-enqueue window. Recheck AFTER the entry is visible to the
-	// queue's cancel sweep: an unlink that marked in the window either
-	// cancels this entry itself, or we observe the marking here and
-	// remove our own publication — the dead name is never left enqueued.
+	// check-to-enqueue window. Record the recheck result here — the
+	// CANCEL itself must run OUTSIDE this path lock (CancelPathPreserveLocal
+	// re-acquires the same non-reentrant lock): the outer wrapper performs
+	// it after this function has released the lock.
 	h.mu.Lock()
-	markedSince := h.unlinked
+	h.selfCancelAfterStaging = h.unlinked
 	h.mu.Unlock()
-	if markedSince && w.queue != nil {
-		_ = w.queue.CancelPathPreserveLocal(h.path)
-		return staged, nil
-	}
 	h.mu.Lock()
 	h.dirty = false
 	h.visTrunc = false
