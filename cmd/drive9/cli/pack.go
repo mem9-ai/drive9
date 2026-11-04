@@ -474,7 +474,6 @@ func extractPackArchive(ctx context.Context, r io.Reader, opts unpackOptions) (*
 	manifest := packManifest{Format: packArchiveFormat, Version: 1}
 	sawManifest := false
 	var dirTimes []packDirTime
-	var installedLinks []string
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -502,11 +501,6 @@ func extractPackArchive(ctx context.Context, r io.Reader, opts unpackOptions) (*
 		if err := extractPackEntry(stageRoot, hdr, tr, &dirTimes); err != nil {
 			return nil, err
 		}
-		if hdr.Typeflag == tar.TypeSymlink {
-			if rel, relErr := packEntryRel(hdr.Name); relErr == nil {
-				installedLinks = append(installedLinks, rel)
-			}
-		}
 	}
 	if !sawManifest {
 		return nil, fmt.Errorf("invalid pack archive: missing %s", packManifestEntryName)
@@ -521,15 +515,17 @@ func extractPackArchive(ctx context.Context, r io.Reader, opts unpackOptions) (*
 	if err := validatePackSymlinkGraph(filepath.Join(stageRoot, "overlay")); err != nil {
 		return nil, err
 	}
-	if err := installStagedPack(opts.LocalRoot, stageRoot, manifest, opts.Replace); err != nil {
-		return nil, err
-	}
-	// The staged tree cannot see links the destination already had: an archive
-	// containing only "repo/a -> s/../outside" is resolved as a plain component
-	// while "s -> .." is absent from staging, but installation keeps the
-	// destination's "s", so the installed link escapes anyway. Validate the
-	// links in the overlay that actually remains, and unwind the ones that fail.
-	if err := validateInstalledPackLinks(filepath.Join(opts.LocalRoot, "overlay"), installedLinks); err != nil {
+	installErr := installStagedPack(opts.LocalRoot, stageRoot, manifest, opts.Replace)
+	// Validate the overlay that actually remains, not the staged tree and not
+	// just this archive's own links. Three cases need it: an archive link can
+	// compose with a link the destination already keeps; an archive entry can
+	// change the meaning of a retained link the archive never names (replacing
+	// a directory with "s -> .." turns a retained "a -> s/../outside" into an
+	// escape); and a failed installation has already written part of the
+	// archive. The sweep removes every offending link, so a rejected unpack
+	// never leaves a live escape behind.
+	offenders, sweepErr := removeEscapingPackLinks(filepath.Join(opts.LocalRoot, "overlay"))
+	if err := errors.Join(installErr, sweepErr, escapingPackLinksError(offenders)); err != nil {
 		return nil, err
 	}
 	return &manifest, nil
@@ -1206,24 +1202,49 @@ func validatePackSymlinkTarget(localRoot, linkPath, linkname string) error {
 // mutually referencing links cannot spin the validator.
 const maxPackSymlinkDepth = 40
 
-// validateInstalledPackLinks re-resolves the links this archive installed
-// against the overlay that remains after installation. A link that composes with
-// a retained destination link into an escape is removed and reported, so a
-// rejected composition never stays live.
-func validateInstalledPackLinks(overlayRoot string, relLinks []string) error {
+// removeEscapingPackLinks resolves every symlink under overlayRoot and deletes
+// each one that leaves it, returning the failures it found and removed.
+//
+// Post-install resolution is the only check that sees the real graph. Staging
+// validates the archive's own links against each other, but installation also
+// preserves links the destination already had, and replacing a directory with a
+// link re-targets every retained link that passes through that path. Walking the
+// whole overlay is therefore the backstop, and it removes all offenders rather
+// than the first one: returning early would leave a live escape behind.
+func removeEscapingPackLinks(overlayRoot string) ([]error, error) {
 	overlayRoot = filepath.Clean(overlayRoot)
-	for _, rel := range relLinks {
-		target := filepath.Join(overlayRoot, filepath.FromSlash(rel))
-		info, err := os.Lstat(target)
-		if err != nil || info.Mode()&fs.ModeSymlink == 0 {
-			continue
+	var offenders []error
+	walkErr := filepath.WalkDir(overlayRoot, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+			return err
 		}
-		if _, err := resolvePackSymlink(overlayRoot, target); err != nil {
-			_ = os.Remove(target)
-			return fmt.Errorf("%w (an existing link in the overlay composes with the archive's link; it was removed)", err)
+		if d.IsDir() || d.Type()&fs.ModeSymlink == 0 {
+			return nil
 		}
+		if _, resolveErr := resolvePackSymlink(overlayRoot, p); resolveErr != nil {
+			offenders = append(offenders, resolveErr)
+			if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("remove escaping pack symlink %s: %w", p, err)
+			}
+		}
+		return nil
+	})
+	if walkErr != nil {
+		return offenders, walkErr
 	}
-	return nil
+	return offenders, nil
+}
+
+// escapingPackLinksError turns the sweep's offenders into one rejection error.
+func escapingPackLinksError(offenders []error) error {
+	if len(offenders) == 0 {
+		return nil
+	}
+	return fmt.Errorf("pack archive left %d symlink(s) that escape the local overlay root; they were removed: %w",
+		len(offenders), errors.Join(offenders...))
 }
 
 // validatePackSymlinkGraph resolves every symlink under root through the links

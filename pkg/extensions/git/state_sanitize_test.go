@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -442,8 +443,99 @@ func TestGitConfigValueContinues(t *testing.T) {
 		{`name = "trailing\\"`, false},
 		{"", false},
 	} {
-		if got := gitConfigValueContinues(tc.line); got != tc.want {
-			t.Errorf("gitConfigValueContinues(%q) = %v, want %v", tc.line, got, tc.want)
+		var scan gitConfigValueState
+		if got := scan.continues(tc.line, true); got != tc.want {
+			t.Errorf("continues(%q) = %v, want %v", tc.line, got, tc.want)
 		}
+	}
+}
+
+// Git keeps its quote flag across a backslash-newline, so the quote a value opens
+// on one physical line can be closed by the next. Scanning each line with a fresh
+// quote state reported the comment's trailing backslash as a continuation and
+// then emitted the following "[core] fsmonitor" line verbatim.
+func TestGitConfigValueStateCarriesQuoteAcrossContinuation(t *testing.T) {
+	var scan gitConfigValueState
+	if !scan.continues(`name = "example\`, true) {
+		t.Fatal("opening quote with a trailing backslash must continue the value")
+	}
+	if scan.continues(`" # \`, false) {
+		t.Fatal("the continuation line closes the quote, so its comment backslash cannot continue the value")
+	}
+	// A completed value carries nothing into the next one.
+	if scan.continues(`next = value\`, true) != true {
+		t.Fatal("a fresh value must start with a clean quote state")
+	}
+	if scan.continues(`tail`, false) {
+		t.Fatal("continuation ended without a trailing backslash")
+	}
+	if scan.inQuotes {
+		t.Fatal("quote state must not survive the end of a value")
+	}
+}
+
+// The full shape of the reported bypass: the closed quote ends the value, the
+// comment's backslash does not continue it, and the smuggled key is dropped.
+func TestSanitizeGitCheckpointConfigCarriesQuoteStateAcrossLines(t *testing.T) {
+	const cfg = `[user]
+	name = "example\
+" # \
+[core]
+	fsmonitor = /path/to/program
+	repositoryformatversion = 0
+`
+	path := filepath.Join(t.TempDir(), "config")
+	if err := os.WriteFile(path, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := sanitizeGitCheckpointConfig(path); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(data)
+	if strings.Contains(got, "fsmonitor") {
+		t.Fatalf("fsmonitor survived a quote-carrying continuation:\n%s", got)
+	}
+	if strings.Contains(got, "/path/to/program") {
+		t.Fatalf("command path survived a quote-carrying continuation:\n%s", got)
+	}
+	if !strings.Contains(got, "repositoryformatversion = 0") {
+		t.Fatalf("kept core keys were dropped:\n%s", got)
+	}
+}
+
+// git itself must agree with the sanitizer's reading: the emitted file has to
+// parse, and the command-bearing key must be absent from git's own key list.
+func TestSanitizeGitCheckpointConfigQuoteContinuationMatchesGit(t *testing.T) {
+	gitBin, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("git is not installed")
+	}
+	const cfg = `[user]
+	name = "example\
+" # \
+[core]
+	fsmonitor = /path/to/program
+	repositoryformatversion = 0
+`
+	path := filepath.Join(t.TempDir(), "config")
+	if err := os.WriteFile(path, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := sanitizeGitCheckpointConfig(path); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command(gitBin, "config", "--file", path, "--list").CombinedOutput()
+	if err != nil {
+		t.Fatalf("git rejected the sanitized config: %v\n%s", err, out)
+	}
+	if strings.Contains(string(out), "fsmonitor") {
+		t.Fatalf("git still sees fsmonitor:\n%s", out)
+	}
+	if !strings.Contains(string(out), "core.repositoryformatversion=0") {
+		t.Fatalf("git lost the kept core key:\n%s", out)
 	}
 }

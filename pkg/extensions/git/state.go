@@ -1161,17 +1161,31 @@ var gitCheckpointUnsafeRemoteKeys = map[string]bool{
 	"proxy":       true,
 }
 
-// gitConfigValueContinues reports whether a git config line really ends with a
-// line continuation.
+// gitConfigValueState carries git's parser state across continued value lines.
+// Quote state is not per line: git keeps its `quote` flag while consuming a
+// backslash-newline, so a value that opens a quote on one physical line and
+// closes it on the next must be scanned with that quote still open.
+type gitConfigValueState struct {
+	inQuotes bool
+}
+
+// continues reports whether a physical line ends inside a value that a trailing
+// backslash continues, and advances the carried quote state.
 //
 // Git ends a value at an unquoted '#' or ';' (the rest of the line is a comment)
 // and only a single trailing backslash continues the value; "\\" is an escaped
 // literal. Treating any trailing backslash as a continuation let a comment end
 // the value while the sanitizer still swallowed — and emitted verbatim — the
 // following physical line, which is how a "[core] fsmonitor = ..." line could
-// slip past the per-key policy.
-func gitConfigValueContinues(line string) bool {
-	inQuotes := false
+// slip past the per-key policy. Resetting the quote flag per line reintroduced
+// the same hole through a continuation: in `name = "example\` followed by
+// `" # \`, git closes the quote and starts a comment, while a fresh scan treats
+// the quote as opening a new string and reports the comment's backslash as a
+// continuation. fresh starts a new value and clears that carried state.
+func (s *gitConfigValueState) continues(line string, fresh bool) bool {
+	if fresh {
+		s.inQuotes = false
+	}
 	escaped := false
 	trailingBackslashes := 0
 	for i := 0; i < len(line); i++ {
@@ -1186,24 +1200,30 @@ func gitConfigValueContinues(line string) bool {
 			escaped = true
 			trailingBackslashes++
 		case '"':
-			inQuotes = !inQuotes
+			s.inQuotes = !s.inQuotes
 			trailingBackslashes = 0
 		case '#', ';':
-			if !inQuotes {
+			if !s.inQuotes {
 				// The value ends here; anything after the marker is a comment,
 				// including a backslash.
+				s.inQuotes = false
 				return false
 			}
 			trailingBackslashes = 0
 		case ' ', '\t', '\r':
-			if !inQuotes {
+			if !s.inQuotes {
 				trailingBackslashes = 0
 			}
 		default:
 			trailingBackslashes = 0
 		}
 	}
-	return trailingBackslashes%2 == 1
+	if trailingBackslashes%2 == 1 {
+		return true
+	}
+	// The value ends on this line, so it carries no state into the next one.
+	s.inQuotes = false
+	return false
 }
 
 // splitGitConfigKeyValue splits one config line into its lower-cased key and its
@@ -1261,20 +1281,22 @@ func sanitizeGitCheckpointConfig(path string) error {
 	// configuration under the previous section.
 	continued := false
 	dropped := false
+	// scan carries git's quote state across the physical lines of one value.
+	var scan gitConfigValueState
 	dropLine := func(trimmed string) {
-		dropped = gitConfigValueContinues(trimmed)
+		dropped = scan.continues(trimmed, true)
 		continued = false
 	}
 	for _, line := range strings.SplitAfter(string(data), "\n") {
 		trimmed := strings.TrimSpace(strings.TrimRight(line, "\r\n"))
 		if dropped {
-			dropped = gitConfigValueContinues(trimmed)
+			dropped = scan.continues(trimmed, false)
 			continue
 		}
 		if continued {
 			// A backslash continuation belongs to the previous value; keep or
 			// drop it together with that value so the file stays parseable.
-			continued = gitConfigValueContinues(trimmed)
+			continued = scan.continues(trimmed, false)
 			if sectionKept {
 				out.WriteString(line)
 			}
@@ -1286,6 +1308,7 @@ func sanitizeGitCheckpointConfig(path string) error {
 				// Malformed header: stop keeping anything under it so the
 				// parser and the emitted text cannot disagree.
 				sectionName, sectionKept, continued = "", false, false
+				scan.inQuotes = false
 				continue
 			}
 			header := trimmed[:end+1]
@@ -1298,6 +1321,7 @@ func sanitizeGitCheckpointConfig(path string) error {
 				sectionName == "extensions" || sectionName == "gc"
 			continued = false
 			dropped = false
+			scan.inQuotes = false
 			// The header itself is inert, so a kept section always emits it —
 			// otherwise the parser state (say, "user") would diverge from the
 			// last emitted section (say, "core") and the following lines would
@@ -1327,7 +1351,6 @@ func sanitizeGitCheckpointConfig(path string) error {
 		// Sections kept wholesale (remote/branch/tag/user/init) carry only
 		// values; core/extensions/gc are key allowlists because those keys can
 		// name a program to run.
-		continued = strings.HasSuffix(trimmed, `\`)
 		if sectionName == "remote" {
 			// A remote section is kept for its URL and fetch refspecs, but some
 			// of its keys name a program git runs: remote.<name>.vcs selects a
@@ -1343,12 +1366,12 @@ func sanitizeGitCheckpointConfig(path string) error {
 				dropLine(trimmed)
 				continue
 			}
-			continued = gitConfigValueContinues(trimmed)
+			continued = scan.continues(trimmed, true)
 			out.WriteString(line)
 			continue
 		}
 		if gitCheckpointSafeConfigSections[sectionName] {
-			continued = gitConfigValueContinues(trimmed)
+			continued = scan.continues(trimmed, true)
 			out.WriteString(line)
 			continue
 		}
@@ -1361,7 +1384,7 @@ func sanitizeGitCheckpointConfig(path string) error {
 			dropLine(trimmed)
 			continue
 		}
-		continued = gitConfigValueContinues(trimmed)
+		continued = scan.continues(trimmed, true)
 		out.WriteString(line)
 	}
 	if err := os.WriteFile(path, []byte(out.String()), 0o600); err != nil {
