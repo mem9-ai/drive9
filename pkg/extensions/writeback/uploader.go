@@ -83,6 +83,23 @@ type WriteBackUploader struct {
 	// SnapshotStagingGens optionally captures the pendingIndex/shadowStore
 	// generations for a path so OnSuccess can do generation-guarded cleanup.
 	SnapshotStagingGens SnapshotStagingGensFunc
+	// ResolveConflict optionally repairs a conflicted entry in place:
+	// given the staged meta and the base its upload just conflicted on, it
+	// returns a newer same-origin base to rebase onto and retry. Wired by
+	// the writeback plane to its landed watermark — the revisions this
+	// mount itself recorded — so a duplicate-commit race (the kernel's
+	// asynchronous RELEASE racing a handoff flush of one handle) heals
+	// without a remote stat, while a foreign advance stays conflicted.
+	ResolveConflict func(localPath string, meta *staging.WriteBackMeta, conflictedBase int64) (int64, bool)
+}
+
+// resolveConflict consults ResolveConflict and rebases the staged entry's
+// base when the proof holds; ok reports a retryable new base.
+func (u *WriteBackUploader) resolveConflict(localPath string, meta *staging.WriteBackMeta, conflictedBase int64) (int64, bool) {
+	if u.ResolveConflict == nil {
+		return 0, false
+	}
+	return u.ResolveConflict(localPath, meta, conflictedBase)
 }
 
 // WriteBackUploaderSnapshot is one uploader-depth observation.
@@ -363,13 +380,26 @@ func (u *WriteBackUploader) UploadSyncWithRevision(ctx context.Context, localPat
 	}
 
 	var committedRev int64
-	uploadStart := time.Now()
 	threshold := u.directPutThreshold()
 	useDirectPUT := meta.Size == 0 || (threshold > 0 && meta.Size < threshold)
-	if useDirectPUT {
-		committedRev, err = u.client.WriteCtxConditionalWithRevision(ctx, u.remotePath(localPath), data, expectedRevision)
-	} else {
-		committedRev, err = uploadBufferedRemoteFileWithRevision(ctx, u.client, u.remotePath(localPath), data, expectedRevision)
+	put := func(ctx context.Context, rev int64) (int64, error) {
+		if useDirectPUT {
+			return u.client.WriteCtxConditionalWithRevision(ctx, u.remotePath(localPath), data, rev)
+		}
+		return uploadBufferedRemoteFileWithRevision(ctx, u.client, u.remotePath(localPath), data, rev)
+	}
+	uploadStart := time.Now()
+	committedRev, err = put(ctx, expectedRevision)
+	if errors.Is(err, client.ErrConflict) {
+		// Same-origin repair (see uploadOne): this mount's own landing may
+		// have won a duplicate-commit race under this staging — rebase and
+		// retry once so the flush that routed here (close-sync's boundary,
+		// the claim handoff inside an open) does not surface EIO for a
+		// race the mount itself can prove.
+		if rev, ok := u.resolveConflict(localPath, meta, expectedRevision); ok {
+			expectedRevision = rev
+			committedRev, err = put(ctx, expectedRevision)
+		}
 	}
 	if u.perf != nil {
 		u.perf.recordRemoteOp(perfRemoteWrite, err, time.Since(uploadStart), uint64(len(data)))
@@ -569,6 +599,15 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 			break
 		}
 		if errors.Is(lastErr, client.ErrConflict) {
+			// Same-origin repair first: if this mount itself landed a newer
+			// revision after this entry staged (a duplicate-commit race —
+			// the kernel's asynchronous RELEASE racing a handoff flush of
+			// the same handle), rebase onto the winner's base and retry
+			// instead of staying conflicted forever.
+			if rev, ok := u.resolveConflict(localPath, meta, expectedRevision); ok {
+				expectedRevision = rev
+				continue
+			}
 			break
 		}
 		safeLogPrintf("writeback upload attempt %d/%d failed for %s: %v", attempt+1, uploadMaxRetries+1, localPath, lastErr)

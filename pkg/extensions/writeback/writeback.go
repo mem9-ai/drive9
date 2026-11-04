@@ -421,6 +421,24 @@ func New(opts Options) (*Writeback, error) {
 			workers = defaultUploadConcurrency
 		}
 		up := NewWriteBackUploader(opts.Client, w.wbCache, workers, root)
+		up.ResolveConflict = func(path string, meta *staging.WriteBackMeta, conflictedBase int64) (int64, bool) {
+			// Same-origin proof: the landed watermark holds exactly the
+			// revisions THIS mount recorded. A conflicted entry rebases only
+			// onto one of those — a duplicate-commit race (the kernel's
+			// asynchronous RELEASE racing a handoff flush of one handle, the
+			// loser staging at the pre-landing base) heals without a remote
+			// stat; a foreign advance never enters the table and stays
+			// conflicted. The watermark's incarnation rules (cleared at
+			// unverified/checkout/invalidations) bound the proof's validity.
+			rev, ok := w.landedRevision(path)
+			if !ok || rev <= conflictedBase || rev <= meta.BaseRev {
+				return 0, false
+			}
+			if !w.wbCache.RebaseBaseRevIfGeneration(path, meta.Generation, rev) {
+				return 0, false
+			}
+			return rev, true
+		}
 		up.OnSuccess = func(meta staging.WriteBackMeta, committedRev int64, gens StagingGens) {
 			// meta.Path is ALREADY the write-back cache's local key (the
 			// uploader maps to the remote name only at the HTTP boundary).

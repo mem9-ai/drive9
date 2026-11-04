@@ -622,6 +622,47 @@ func (c *WriteBackCache) UpdateMode(remotePath string, mode uint32) error {
 	return nil
 }
 
+// RebaseBaseRevIfGeneration advances a staged entry's CAS base to baseRev
+// — the same-origin conflict repair: an entry that lost a duplicate-commit
+// race (another flush of this mount landed a newer revision between its
+// staging and its upload) retries against the revision the race winner
+// recorded instead of conflicting forever. The generation guard (checked
+// under the path lock) keeps a rebased upload from pairing with a fresher
+// same-path staging; the entry's generation is unchanged — its payload
+// did not change, and the uploader's success cleanup keys on it.
+func (c *WriteBackCache) RebaseBaseRevIfGeneration(remotePath string, generation uint64, baseRev int64) bool {
+	if baseRev <= 0 {
+		return false
+	}
+	pl := c.AcquirePathLock(remotePath)
+	defer c.ReleasePathLock(remotePath, pl)
+
+	c.mu.Lock()
+	meta, ok := c.metas[remotePath]
+	if !ok || meta.Generation != generation || baseRev <= meta.BaseRev {
+		c.mu.Unlock()
+		return false
+	}
+	updated := cloneWriteBackMeta(meta)
+	updated.BaseRev = baseRev
+	metaPath := c.MetaFile(remotePath)
+	c.mu.Unlock()
+
+	metaBytes, err := json.Marshal(updated)
+	if err != nil {
+		return false
+	}
+	if err := atomicWrite(metaPath, metaBytes); err != nil {
+		return false
+	}
+
+	c.mu.Lock()
+	cp := updated
+	c.metas[remotePath] = &cp
+	c.mu.Unlock()
+	return true
+}
+
 // MarkChmodPending records that data has reached the remote server and only
 // the chmod step remains. The generation guard prevents an old upload from
 // overwriting metadata for a newer local write.
