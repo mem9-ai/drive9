@@ -1,7 +1,9 @@
 package writeback
 
 import (
+	"bytes"
 	"context"
+	"hash/crc32"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -588,20 +590,13 @@ func TestPortDivergentBufferNotAdopted(t *testing.T) {
 		t.Fatalf("backend = %q, want the winner's image untouched", n.Data)
 	}
 
-	// The legitimate composition still adopts: a buffer EXTENDING the
-	// landed bytes (the append over our own landing) advances to the
-	// landed revision and lands whole.
+	// The legitimate append still lands — through its OWN base, not
+	// adoption: a fresh reopen reads the landing's revision at open, and
+	// the appended image commits against it without any watermark
+	// advancement. (A stale-based append whose image merely PREFIX-matches
+	// the landing is exactly the divergent case above: prefix bytes are
+	// not lineage, so it conflicts conservatively.)
 	h3 := open()
-	h3.mu.Lock()
-	h3.baseRev = 1
-	h3.baseSize = 0
-	if h3.buf != nil {
-		h3.buf = nil
-	}
-	h3.mu.Unlock()
-	if err := h3.ensureBuffer(ctx); err != nil {
-		t.Fatal(err)
-	}
 	if err := h3.Write(ctx, 0, append([]byte("winner"), []byte("+more")...)); err != nil {
 		t.Fatal(err)
 	}
@@ -617,7 +612,7 @@ func TestPortDivergentBufferNotAdopted(t *testing.T) {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("prefix-composed append never landed")
+			t.Fatal("fresh-base append never landed")
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
@@ -685,4 +680,60 @@ func TestPortFailedDiscoveryDoesNotStage(t *testing.T) {
 		t.Fatalf("backend = %q, want the retried landing", n.Data)
 	}
 	_ = h.Release(ctx)
+}
+
+// TestPortLandedBytesAccountingOnReplacement pins the retention ledger:
+// replacing the OLDEST path's landing while the store sits near its budget
+// must account the replaced image exactly once. The original bug left the
+// replaced image set in the map after subtracting its bytes, so the
+// eviction scan subtracted them again and the accounting drifted (reporting
+// a fraction of the bytes actually retained).
+func TestPortLandedBytesAccountingOnReplacement(t *testing.T) {
+	b := testbackend.NewBackend()
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	wb, err := New(Options{Policy: PolicyWriteBack, Client: cl, WriteCacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	retained := func() int64 {
+		wb.landedMu.Lock()
+		defer wb.landedMu.Unlock()
+		total := int64(0)
+		for _, info := range wb.landed {
+			total += int64(len(info.image))
+		}
+		return total
+	}
+
+	// A: 600 KiB (the oldest), B: 400 KiB — exactly the 1 MiB budget.
+	imgA := bytes.Repeat([]byte("A"), 600<<10)
+	imgB := bytes.Repeat([]byte("B"), 400<<10)
+	wb.landedAt("/a", 1, int64(len(imgA)), crc32.ChecksumIEEE(imgA), imgA)
+	wb.landedAt("/b", 2, int64(len(imgB)), crc32.ChecksumIEEE(imgB), imgB)
+	time.Sleep(2 * time.Millisecond)
+	if got := retained(); got != 1024000 {
+		t.Fatalf("retained after A+B = %d, want 1024000", got)
+	}
+
+	// Replace A (the oldest) with 800 KiB: eviction must select A's OLD
+	// image exactly once. With the double-subtraction bug the accounting
+	// ended at 600 KiB while 1.2 MiB→(800+400)=1.2MiB was retained.
+	imgA2 := bytes.Repeat([]byte("C"), 800<<10)
+	wb.landedAt("/a", 3, int64(len(imgA2)), crc32.ChecksumIEEE(imgA2), imgA2)
+
+	wb.landedMu.Lock()
+	accounted := wb.landedBytes
+	wb.landedMu.Unlock()
+	if accounted != retained() {
+		t.Fatalf("accounted = %d, actually retained = %d (ledger drift)", accounted, retained())
+	}
+	if accounted > landedImageBudget {
+		t.Fatalf("retained %d exceeds the %d budget", accounted, landedImageBudget)
+	}
+	// B's image survives the eviction of A's replacement only if it fits;
+	// whatever the outcome, the two numbers must agree (checked above) and
+	// no image may be double-counted.
 }

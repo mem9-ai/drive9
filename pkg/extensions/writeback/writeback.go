@@ -1126,8 +1126,11 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			// this mount's own file — land it instead of letting the chain
 			// below stat a remote that has not seen it (v1: read-only
 			// re-opens of a lagging close read the pending bytes, never a
-			// 404).
-			if w.wbCache != nil && w.uploader != nil {
+			// 404). Ledger-owned paths are exempt: the pair under the
+			// ledger entry may be a superseded image, and the queue's own
+			// recovery owns the landing.
+			if w.wbCache != nil && w.uploader != nil &&
+				!(w.opts.Staging != nil && w.opts.Staging.Pending.HasPending(op.Path)) {
 				if _, ok := w.wbCache.GetMeta(op.Path); ok {
 					if _, serr := w.opts.Client.StatCtx(ctx, w.remotePath(op.Path)); serr != nil && client.IsNotFound(serr) {
 						if err := w.uploader.UploadSync(ctx, op.Path); err == nil {
@@ -3650,6 +3653,11 @@ func (w *Writeback) landedAt(path string, rev, size int64, crc uint32, image []b
 	// identity store finite no matter how many paths land.
 	if old, ok := w.landed[path]; ok {
 		w.landedBytes -= int64(len(old.image))
+		// Clear the replaced image IN THE MAP before the eviction scan
+		// below: leaving it set lets the scan select it again and subtract
+		// its bytes a second time, corrupting the accounting.
+		old.image = nil
+		w.landed[path] = old
 	}
 	w.landedBytes += int64(len(image))
 	for w.landedBytes > landedImageBudget {
@@ -4021,8 +4029,21 @@ func (w *Writeback) commitReaderOpt(ctx context.Context, path string, newReader 
 				return 0, mapErr(err)
 			}
 		}
-		st, werr := w.opts.Client.WriteStreamConditionalWithChecksum(ctx,
-			rp, newReader(), size, nil, expected, "")
+		// (see the routing comment above)
+		var werr error
+		if threshold := w.opts.Client.CachedSmallFileThreshold(); threshold > 0 && size < threshold {
+			data := make([]byte, size)
+			if n, rerr := io.ReadFull(newReader(), data); rerr == nil && int64(n) == size {
+				rev, perr := w.opts.Client.WriteCtxConditionalWithRevision(ctx, rp, data, expected)
+				if perr == nil {
+					return rev, nil
+				}
+				werr = perr
+			}
+		}
+		if werr == nil {
+			werr = w.opts.Client.WriteStreamConditional(ctx, rp, newReader(), size, nil, expected)
+		}
 		if werr != nil {
 			if errors.Is(werr, client.ErrConflict) {
 				if st, serr := w.opts.Client.StatCtx(ctx, rp); serr == nil && st != nil {
@@ -4041,11 +4062,7 @@ func (w *Writeback) commitReaderOpt(ctx context.Context, path string, newReader 
 			}
 			return 0, mapErr(werr)
 		}
-		rev := int64(0)
-		if st != nil {
-			rev = st.Revision
-		}
-		return rev, nil
+		return 0, nil
 	}
 	return 0, &fs.StatusError{Path: path, Status: gofuse.EAGAIN}
 }
@@ -4152,11 +4169,13 @@ func (h *bufferingHandle) ensureBufferLocked(ctx context.Context) error {
 	}
 	// Ledger-owned paths (in-flight enqueue or the recovery window) must
 	// not preload from the write-cache pair beneath the ledger entry: it
-	// may be a superseded image — the shadow branch above owns their bytes.
-	if h.w.opts.Staging != nil && h.w.opts.Staging.Pending.HasPending(h.path) {
-		return nil
-	}
-	if !h.isNew && h.w.wbCache != nil {
+	// may be a superseded image — the ledger shadow branch below owns
+	// their bytes. Only this preload is gated; the shadow and truncation
+	// initializations below must still run (an early return here left a
+	// nil/empty buffer that Write then dereferenced, and skipped the
+	// O_TRUNC dirty initialization).
+	ledgerOwned := h.w.opts.Staging != nil && h.w.opts.Staging.Pending.HasPending(h.path)
+	if !h.isNew && h.w.wbCache != nil && !ledgerOwned {
 		// The write cache is LOCAL-path keyed (stageToWriteCache Put uses
 		// h.path): querying the remote name under a RemoteRoot subtree
 		// missed every not-yet-uploaded image and served the stale remote
@@ -4181,10 +4200,14 @@ func (h *bufferingHandle) ensureBufferLocked(ctx context.Context) error {
 		h.baseLoaded = true
 		return nil
 	}
-	if (h.isNew || h.inner == nil) && h.w.opts.Staging != nil {
+	if (h.isNew || h.inner == nil || ledgerOwned) && h.w.opts.Staging != nil {
 		// A pending image owns this path (queue track): preload the
-		// staged bytes so the handle reads its own image. Size-gated —
-		// a spilled multi-GiB image stays a view over the shadow.
+		// staged bytes so the handle reads its own image. Ledger-owned
+		// existing handles preload here too — their remote row may not
+		// exist yet (recovery window) or lags the ledger image, and the
+		// cache pair beneath the ledger entry is not theirs to read.
+		// Size-gated — a spilled multi-GiB image stays a view over the
+		// shadow.
 		if meta, ok := h.w.opts.Staging.Pending.GetMeta(h.path); ok && meta != nil &&
 			meta.Size > 0 && meta.Size <= pendingServeMaterializeBytes {
 			if data, err := h.w.opts.Staging.Shadow.ReadAll(h.path); err == nil && int64(len(data)) == meta.Size {
@@ -4894,29 +4917,18 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, dur stageDurabi
 	if isNew {
 		baseRev = 0
 	} else {
-		if !h.w.unverified.Load() {
-			// v1 adoptCommittedRevisionLocked, with the payload lineage the
-			// conflict repair enforces: the landed record holds the bytes
-			// this mount ACTUALLY uploaded for that revision, and the base
-			// may advance to it only when this buffer was built from those
-			// bytes — the landed image is a PREFIX of the staged one (an
-			// append over our own landing; equality included). Anything
-			// else keeps the open-time base and surfaces as a conflict: a
-			// divergent buffer (advancing it would silently erase the
-			// landing's edits — the very hole the repair's gate closes) or
-			// a landing whose payload identity is unknown (the ledger track
-			// records none). While the event stream is UNVERIFIED no record
-			// proves anything — an unobserved foreign delete+recreate may
-			// sit above the recorded incarnation.
-			if r, ok := h.w.landedRevision(h.path); ok && r > baseRev {
-				if img, known := h.w.landedImage(h.path); known && bytes.HasPrefix(image, img) {
-					h.mu.Lock()
-					h.baseRev = r
-					h.mu.Unlock()
-					baseRev = r
-				}
-			}
-		}
+		// No watermark advancement here, by design. Even a byte-carrying
+		// landed record cannot prove THIS buffer derives from its revision:
+		// a prefix match is not lineage (a handle over the pre-truncation
+		// image of a landing that shrank the file passes the prefix test,
+		// and adopting the landing's revision would let its upload restore
+		// the truncated-away bytes without ever surfacing a 409). A handle
+		// that produced a landing has its own base set at that boundary;
+		// every other handle keeps its open-time base, stages against it,
+		// and lets the conflict path decide (the repair there IS byte-
+		// exact, on the uploader's own payload). While the event stream is
+		// UNVERIFIED the table proves nothing anyway — an unobserved
+		// foreign delete+recreate may sit above the recorded incarnation.
 		if baseRev <= 0 {
 			// Lineage is MISSING: a second writable open of a live writer's
 			// path answers Attr.Rev 0 (#984 stat visibility zeroes the

@@ -453,9 +453,10 @@ func TestPortRecoveryIntervalReadsServeLedgerImage(t *testing.T) {
 	}
 
 	// The crashed-enqueue shape: a newer ledger image plus an older,
-	// same-length superseded cache pair.
-	ledgerImage := []byte("newer-image")
-	staleImage := []byte("olderimage") // same length, stale bytes
+	// same-length superseded cache pair (equal length is the point — the
+	// old cache-first selection accepted a pair purely by length match).
+	ledgerImage := []byte("ledger-image") // 12 bytes
+	staleImage := []byte("stale-image!")  // 12 bytes
 	if err := ledger.Shadow.WriteFull("/f", ledgerImage, 1); err != nil {
 		t.Fatal(err)
 	}
@@ -487,5 +488,30 @@ func TestPortRecoveryIntervalReadsServeLedgerImage(t *testing.T) {
 	// retires it — only its read authority is gone.
 	if data, ok := wb.wbCache.GetView("/f"); !ok || string(data) != string(staleImage) {
 		t.Fatalf("stale pair = %q ok=%t, want it retained until retirement", data, ok)
+	}
+
+	// A WRITABLE reopen through the same interval initializes from the
+	// ledger image too (the shadow branch), never from the cache pair:
+	// read-your-writes on the new descriptor must see the ledger bytes.
+	wres, err := ch.Dispatch(context.Background(), &fs.Op{Kind: fs.OpCreate, Path: "/f",
+		Flags: uint32(syscall.O_RDWR | syscall.O_CREAT)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The first write triggers the base initialization; reading back
+	// afterwards must show the LEDGER image underneath the write (not
+	// zeros, and not the stale cache pair).
+	if err := wres.Handle.Write(context.Background(), 3, []byte("Z")); err != nil {
+		t.Fatal(err)
+	}
+	wbuf := make([]byte, len(ledgerImage))
+	n, werr := wres.Handle.Read(context.Background(), 0, wbuf)
+	if werr != nil && werr.Error() != "EOF" {
+		t.Fatalf("writable reopen read: %v", werr)
+	}
+	want := string(ledgerImage)
+	want = want[:3] + "Z" + want[4:]
+	if got := string(wbuf[:n]); got != want {
+		t.Fatalf("writable reopen read = %q, want the ledger image with the write %q", got, want)
 	}
 }
