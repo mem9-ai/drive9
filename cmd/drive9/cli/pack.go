@@ -474,6 +474,7 @@ func extractPackArchive(ctx context.Context, r io.Reader, opts unpackOptions) (*
 	manifest := packManifest{Format: packArchiveFormat, Version: 1}
 	sawManifest := false
 	var dirTimes []packDirTime
+	var installedLinks []string
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -501,6 +502,11 @@ func extractPackArchive(ctx context.Context, r io.Reader, opts unpackOptions) (*
 		if err := extractPackEntry(stageRoot, hdr, tr, &dirTimes); err != nil {
 			return nil, err
 		}
+		if hdr.Typeflag == tar.TypeSymlink {
+			if rel, relErr := packEntryRel(hdr.Name); relErr == nil {
+				installedLinks = append(installedLinks, rel)
+			}
+		}
 	}
 	if !sawManifest {
 		return nil, fmt.Errorf("invalid pack archive: missing %s", packManifestEntryName)
@@ -516,6 +522,14 @@ func extractPackArchive(ctx context.Context, r io.Reader, opts unpackOptions) (*
 		return nil, err
 	}
 	if err := installStagedPack(opts.LocalRoot, stageRoot, manifest, opts.Replace); err != nil {
+		return nil, err
+	}
+	// The staged tree cannot see links the destination already had: an archive
+	// containing only "repo/a -> s/../outside" is resolved as a plain component
+	// while "s -> .." is absent from staging, but installation keeps the
+	// destination's "s", so the installed link escapes anyway. Validate the
+	// links in the overlay that actually remains, and unwind the ones that fail.
+	if err := validateInstalledPackLinks(filepath.Join(opts.LocalRoot, "overlay"), installedLinks); err != nil {
 		return nil, err
 	}
 	return &manifest, nil
@@ -1191,6 +1205,26 @@ func validatePackSymlinkTarget(localRoot, linkPath, linkname string) error {
 // maxPackSymlinkDepth bounds link-chain resolution so a crafted archive of
 // mutually referencing links cannot spin the validator.
 const maxPackSymlinkDepth = 40
+
+// validateInstalledPackLinks re-resolves the links this archive installed
+// against the overlay that remains after installation. A link that composes with
+// a retained destination link into an escape is removed and reported, so a
+// rejected composition never stays live.
+func validateInstalledPackLinks(overlayRoot string, relLinks []string) error {
+	overlayRoot = filepath.Clean(overlayRoot)
+	for _, rel := range relLinks {
+		target := filepath.Join(overlayRoot, filepath.FromSlash(rel))
+		info, err := os.Lstat(target)
+		if err != nil || info.Mode()&fs.ModeSymlink == 0 {
+			continue
+		}
+		if _, err := resolvePackSymlink(overlayRoot, target); err != nil {
+			_ = os.Remove(target)
+			return fmt.Errorf("%w (an existing link in the overlay composes with the archive's link; it was removed)", err)
+		}
+	}
+	return nil
+}
 
 // validatePackSymlinkGraph resolves every symlink under root through the links
 // already materialized there and rejects any that leaves root. It runs after

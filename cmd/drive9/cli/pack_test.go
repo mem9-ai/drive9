@@ -1233,3 +1233,65 @@ func TestExtractPackArchiveAllowsComposedSymlinkInsideOverlay(t *testing.T) {
 		t.Fatalf("link = %q, %v", got, err)
 	}
 }
+
+// The staged tree cannot see links the destination already keeps, so an archive
+// whose only link composes with a retained one must be refused by validating the
+// overlay that remains after installation.
+func TestExtractPackArchiveRejectsEscapeViaRetainedLink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink semantics differ on Windows")
+	}
+	buildArchive := func(t *testing.T, manifest string, links map[string]string) []byte {
+		t.Helper()
+		var buf bytes.Buffer
+		gz := gzip.NewWriter(&buf)
+		tw := tar.NewWriter(gz)
+		if err := tw.WriteHeader(&tar.Header{Name: packManifestEntryName, Mode: 0o644, Size: int64(len(manifest))}); err != nil {
+			t.Fatalf("manifest header: %v", err)
+		}
+		if _, err := tw.Write([]byte(manifest)); err != nil {
+			t.Fatalf("manifest write: %v", err)
+		}
+		for name, target := range links {
+			if err := tw.WriteHeader(&tar.Header{Name: packArchiveEntryPrefix + name, Typeflag: tar.TypeSymlink, Linkname: target, Mode: 0o777}); err != nil {
+				t.Fatalf("symlink header %s: %v", name, err)
+			}
+		}
+		if err := tw.Close(); err != nil {
+			t.Fatalf("tar close: %v", err)
+		}
+		if err := gz.Close(); err != nil {
+			t.Fatalf("gzip close: %v", err)
+		}
+		return buf.Bytes()
+	}
+
+	localRoot := t.TempDir()
+	// A safe link already present in the destination.
+	if err := os.MkdirAll(filepath.Join(localRoot, "overlay", "repo"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("..", filepath.Join(localRoot, "overlay", "repo", "s")); err != nil {
+		t.Fatalf("plant retained link: %v", err)
+	}
+
+	archive := buildArchive(t, `{"format":"drive9.pack.v1","version":1,"paths":["/repo/a"]}`, map[string]string{
+		"repo/a": "s/../outside",
+	})
+	_, err := extractPackArchive(context.Background(), bytes.NewReader(archive), unpackOptions{
+		LocalRoot: localRoot,
+		Replace:   true,
+	})
+	if err == nil {
+		t.Fatal("extractPackArchive accepted a link that escapes through a retained link")
+	}
+	if !strings.Contains(err.Error(), "resolves outside the local overlay root") {
+		t.Fatalf("error = %v, want a composed escape error", err)
+	}
+	if _, statErr := os.Lstat(filepath.Join(localRoot, "overlay", "repo", "a")); statErr == nil {
+		t.Fatal("the escaping link stayed live after the rejection")
+	}
+	if got, readErr := os.Readlink(filepath.Join(localRoot, "overlay", "repo", "s")); readErr != nil || got != ".." {
+		t.Fatalf("retained link changed: %q, %v", got, readErr)
+	}
+}

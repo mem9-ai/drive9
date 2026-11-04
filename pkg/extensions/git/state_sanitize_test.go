@@ -379,3 +379,71 @@ func TestSanitizeGitCheckpointConfigDropsRejectedValueContinuation(t *testing.T)
 		})
 	}
 }
+
+// A backslash inside an inline comment does not continue the value: git ends it
+// at the unquoted '#'/';'. Treating it as a continuation swallowed the next
+// physical line verbatim, which is a path for "[core] fsmonitor = ...".
+func TestSanitizeGitCheckpointConfigIgnoresCommentContinuation(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  string
+	}{
+		{
+			name: "hash comment",
+			cfg:  "[user]\n\tname = example # \\\n[core] fsmonitor = /path/to/program\n",
+		},
+		{
+			name: "semicolon comment",
+			cfg:  "[user]\n\tname = example ; \\\n[core] pager = /path/to/program\n",
+		},
+		{
+			name: "escaped trailing backslash",
+			cfg:  "[user]\n\tname = example\\\\\n[core] fsmonitor = /path/to/program\n",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "config")
+			if err := os.WriteFile(path, []byte(tc.cfg), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := sanitizeGitCheckpointConfig(path); err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := string(data)
+			for _, banned := range []string{"fsmonitor", "pager"} {
+				if strings.Contains(got, banned) {
+					t.Fatalf("false continuation leaked %q:\n%s", banned, got)
+				}
+			}
+			if !strings.Contains(got, "name = example") {
+				t.Fatalf("kept user value missing:\n%s", got)
+			}
+		})
+	}
+}
+
+// A quoted inline comment keeps a real continuation working, and an escaped
+// backslash ends the value.
+func TestGitConfigValueContinues(t *testing.T) {
+	for _, tc := range []struct {
+		line string
+		want bool
+	}{
+		{`url = https://example.com/\`, true},
+		{`url = https://example.com/\\`, false},
+		{`name = example # \`, false},
+		{`name = example ; \`, false},
+		{`name = "a # b" \`, true},
+		{`name = "trailing\\"`, false},
+		{"", false},
+	} {
+		if got := gitConfigValueContinues(tc.line); got != tc.want {
+			t.Errorf("gitConfigValueContinues(%q) = %v, want %v", tc.line, got, tc.want)
+		}
+	}
+}

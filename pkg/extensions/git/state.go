@@ -1161,6 +1161,51 @@ var gitCheckpointUnsafeRemoteKeys = map[string]bool{
 	"proxy":       true,
 }
 
+// gitConfigValueContinues reports whether a git config line really ends with a
+// line continuation.
+//
+// Git ends a value at an unquoted '#' or ';' (the rest of the line is a comment)
+// and only a single trailing backslash continues the value; "\\" is an escaped
+// literal. Treating any trailing backslash as a continuation let a comment end
+// the value while the sanitizer still swallowed — and emitted verbatim — the
+// following physical line, which is how a "[core] fsmonitor = ..." line could
+// slip past the per-key policy.
+func gitConfigValueContinues(line string) bool {
+	inQuotes := false
+	escaped := false
+	trailingBackslashes := 0
+	for i := 0; i < len(line); i++ {
+		c := line[i]
+		if escaped {
+			escaped = false
+			trailingBackslashes = 0
+			continue
+		}
+		switch c {
+		case '\\':
+			escaped = true
+			trailingBackslashes++
+		case '"':
+			inQuotes = !inQuotes
+			trailingBackslashes = 0
+		case '#', ';':
+			if !inQuotes {
+				// The value ends here; anything after the marker is a comment,
+				// including a backslash.
+				return false
+			}
+			trailingBackslashes = 0
+		case ' ', '\t', '\r':
+			if !inQuotes {
+				trailingBackslashes = 0
+			}
+		default:
+			trailingBackslashes = 0
+		}
+	}
+	return trailingBackslashes%2 == 1
+}
+
 // splitGitConfigKeyValue splits one config line into its lower-cased key and its
 // trimmed value (empty when the line has no "=").
 func splitGitConfigKeyValue(line string) (string, string) {
@@ -1217,19 +1262,19 @@ func sanitizeGitCheckpointConfig(path string) error {
 	continued := false
 	dropped := false
 	dropLine := func(trimmed string) {
-		dropped = strings.HasSuffix(trimmed, `\`)
+		dropped = gitConfigValueContinues(trimmed)
 		continued = false
 	}
 	for _, line := range strings.SplitAfter(string(data), "\n") {
 		trimmed := strings.TrimSpace(strings.TrimRight(line, "\r\n"))
 		if dropped {
-			dropped = strings.HasSuffix(trimmed, `\`)
+			dropped = gitConfigValueContinues(trimmed)
 			continue
 		}
 		if continued {
 			// A backslash continuation belongs to the previous value; keep or
 			// drop it together with that value so the file stays parseable.
-			continued = strings.HasSuffix(trimmed, `\`)
+			continued = gitConfigValueContinues(trimmed)
 			if sectionKept {
 				out.WriteString(line)
 			}
@@ -1298,12 +1343,12 @@ func sanitizeGitCheckpointConfig(path string) error {
 				dropLine(trimmed)
 				continue
 			}
-			continued = strings.HasSuffix(trimmed, `\`)
+			continued = gitConfigValueContinues(trimmed)
 			out.WriteString(line)
 			continue
 		}
 		if gitCheckpointSafeConfigSections[sectionName] {
-			continued = strings.HasSuffix(trimmed, `\`)
+			continued = gitConfigValueContinues(trimmed)
 			out.WriteString(line)
 			continue
 		}
@@ -1316,7 +1361,7 @@ func sanitizeGitCheckpointConfig(path string) error {
 			dropLine(trimmed)
 			continue
 		}
-		continued = strings.HasSuffix(trimmed, `\`)
+		continued = gitConfigValueContinues(trimmed)
 		out.WriteString(line)
 	}
 	if err := os.WriteFile(path, []byte(out.String()), 0o600); err != nil {
