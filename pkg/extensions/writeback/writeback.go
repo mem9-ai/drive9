@@ -58,6 +58,8 @@ const (
 	defaultUploadConcurrency = 16
 )
 
+var errWriteCacheBypass = errors.New("writeback: image requires queue or streaming staging")
+
 // Policy selects when a buffered handle commits.
 type Policy int
 
@@ -184,12 +186,6 @@ type Writeback struct {
 	// liveSet tracks every open bufferingHandle so unlink/rename can walk
 	// them; keeps this per-handle on FileHandle.
 	liveSet sync.Map
-	// liveSnapshots maps staged snapshot ID → the handle that staged it,
-	// so a queued landing notifies exactly the submitting descriptor (the
-	// path index only keeps the newest handle, which may be an unrelated
-	// writer). Entries are consumed by the landing and dropped on
-	// untrack.
-	liveSnapshots sync.Map
 	// landedMu/landed is the recently-landed table (landedAt).
 	landedMu sync.Mutex
 	landed   map[string]landedInfo
@@ -341,29 +337,11 @@ type bufferingHandle struct {
 	// handle chain snapshot IDs — the queue's direct-parent merge and
 	// growth-rebase decisions need real lineage instead of fail-closed
 	// empties.
-	stageSeq         int64
-	stagedSnapshotID string
-	stagedParentID   string
-	// stagedContentVersion is the buffer's content generation when the
-	// current staged snapshot was minted. A landing may only arm the
-	// remote restore for a buffer whose generation is unchanged: any
-	// later Write/Truncate/Reset (including an unstaged truncate-regrow)
-	// makes the live image diverge from what landed.
-	stagedContentVersion uint64
-	// selfCancelAfterStaging records (under h.mu) that a staging observed
-	// the unlink marking after its enqueue; selfCancelEntry is THAT
-	// staging's own queue entry. The outer wrapper cancels exactly this
-	// entry outside the staging path lock — a pathname-wide cancel there
-	// would also kill a replacement's in-flight publication after a
-	// same-name recreation.
-	selfCancelAfterStaging bool
-	selfCancelEntry        *CommitEntry
-	// stagedSnapshotRegs is the set of snapshot IDs this handle has
-	// registered under w.liveSnapshots (atomic map copy): entries are
-	// consumed by their landings and the remainder is dropped at untrack.
-	stagedSnapshotRegs atomic.Value
-	stagedSnapshotSeq  int64
-	contentSnapshotID  string
+	stageSeq          int64
+	stagedSnapshotID  string
+	stagedParentID    string
+	stagedSnapshotSeq int64
+	contentSnapshotID string
 }
 
 // lineageSeq mints process-unique snapshot IDs (v1 generateMountID): the
@@ -445,6 +423,12 @@ func New(opts Options) (*Writeback, error) {
 		}
 		up := NewWriteBackUploader(opts.Client, w.wbCache, workers, root)
 		up.OnSuccess = func(meta staging.WriteBackMeta, committedRev int64, gens StagingGens) {
+			unlock := w.pathLocks.lock(meta.Path)
+			defer unlock()
+			w.acknowledgeUploadedCreate(meta.Path, committedRev)
+			if meta.Kind == staging.PendingChmod {
+				return
+			}
 			// meta.Path is ALREADY the write-back cache's local key (the
 			// uploader maps to the remote name only at the HTTP boundary).
 			// Running it through the remote→local translation again
@@ -455,7 +439,7 @@ func New(opts Options) (*Writeback, error) {
 				w.landedAt(meta.Path, committedRev, meta.Size)
 			}
 			if w.commitSeeder != nil && committedRev > 0 && meta.Size > 0 && w.commitSeedAllowed(meta.Size) {
-				if data, derr := w.wbCache.Get(meta.Path); derr && int64(len(data)) == meta.Size {
+				if current, data, ok := w.wbCache.GetMetaAndView(meta.Path); ok && current.Generation == meta.Generation && int64(len(data)) == meta.Size {
 					w.commitSeeder(meta.Path, data, committedRev)
 				}
 			}
@@ -476,8 +460,6 @@ func New(opts Options) (*Writeback, error) {
 			workers = defaultUploadConcurrency
 		}
 		q := NewCommitQueue(opts.Client, opts.Staging.Shadow, opts.Staging.Pending, opts.Staging.Journal, workers, opts.CommitQueueMaxPending, root)
-		q.SetExtentTakeover(opts.ExtentTakeover)
-		q.SetExtentPatterns(opts.ExtentPatterns, opts.ExtentThreshold)
 		q.SetPerfCounters(w.perfShim)
 		if opts.BatchWindow > 0 || opts.BatchMaxFiles > 0 || opts.BatchMaxBytes > 0 {
 			q.ConfigureBatchWrite(opts.BatchWindow, opts.BatchMaxFiles, opts.BatchMaxBytes)
@@ -487,31 +469,7 @@ func New(opts Options) (*Writeback, error) {
 		// size for the inode/dir-cache refresh, onCommitQueueSuccess);
 		// PathLock keeps queue cleanup serialized with same-path staging.
 		q.OnSuccess = func(entry *CommitEntry, committedRev int64) {
-			// The landing retires isNew and re-bases the open handle's
-			// evicted-part recovery on the remote image — here, not only
-			// at the strict wait points, because interactive fsync returns
-			// from durable staging while the upload is still pending and
-			// the queue's shadow cleanup follows this success. committedRev
-			// comes from the server's completion echo, so the handle's
-			// base revision advances on exactly this publication.
-			// Deliver to the handle that staged this image: the newest
-			// handle at the path may be an unrelated writer, and the
-			// staging handle must learn its shadow is being reclaimed.
-			if entry.SnapshotID != "" {
-				if v, ok := w.liveSnapshots.Load(entry.SnapshotID); ok {
-					w.liveSnapshots.Delete(entry.SnapshotID)
-					if h, ok := v.(*bufferingHandle); ok {
-						if !h.markLandedImage(committedRev, entry.Size, entry.SnapshotID) {
-							// The buffer moved past the staged image, but
-							// its still-unchanged evicted parts reference
-							// THIS shadow generation and have no other
-							// restore source until their own landing: the
-							// queue's cleanup must keep the shadow.
-							w.queue.RetainShadowForLanding(entry.Path, entry.ShadowGen)
-						}
-					}
-				}
-			}
+			w.acknowledgeUploadedCreate(entry.Path, committedRev)
 			if w.opts.Policy == PolicyWriteSync || w.opts.Policy == PolicyCloseSync {
 				w.armBypass(entry.Path, committedRev, entry.Size, "sync-commit")
 			}
@@ -692,13 +650,6 @@ func (w *Writeback) Stop(ctx context.Context) error {
 // then fail the unlink instead of acknowledging a deletion that a restart
 // would undo. The anonymous marking is rolled back on that path.
 func (w *Writeback) MarkPathUnlinked(p string) error {
-	// The marking takes NO path lock: a commit worker holds the path lock
-	// across its network upload, and unlink(2) must not queue behind an
-	// in-flight PUT. Ordering against a racing staging is provided on the
-	// staging side — the entry rechecks the marking right after its
-	// enqueue and cancels itself — so the unlink either cancels the entry
-	// from the queue, or the entry observes the marking and removes
-	// itself; no window publishes the dead name.
 	marked, _ := w.markUnlinkedSnapshot(p, false)
 	// The name is going away NOW (the facade invokes this before FS.Unlink
 	// replies OK): the pending overlays must stop answering lookups for it,
@@ -706,7 +657,7 @@ func (w *Writeback) MarkPathUnlinked(p string) error {
 	// (unlink/14 row 4's EEXIST against the resurrected name). The open
 	// fds keep their image: the staged bytes move to the unlink
 	// snapshot before the pending entries die.
-	if w.opts.Staging != nil {
+	if w.opts.Staging != nil && w.queue != nil {
 		if meta, ok := w.pendingMeta(p); ok && meta != nil {
 			if data, kok := readShadowGenerationFenced(w.opts.Staging.Shadow, p, meta.Size); kok {
 				if err := w.opts.Staging.Shadow.WriteFull(p, data, 0); err == nil {
@@ -723,11 +674,9 @@ func (w *Writeback) MarkPathUnlinked(p string) error {
 				}
 			}
 		}
-	}
-	// CancelPathPreserveLocal: a plain CancelPath also deletes the
-	// shadow the snapshot above just wrote, so the anonymous fd fell
-	// through to the recreated same-name file's bytes.
-	if w.opts.Staging != nil && w.queue != nil {
+		// CancelPathPreserveLocal: a plain CancelPath also deletes the
+		// shadow the snapshot above just wrote, so the anonymous fd fell
+		// through to the recreated same-name file's bytes.
 		if err := w.queue.CancelPathPreserveLocal(p); err != nil {
 			// The unlink is failing: the descriptors must go on serving
 			// their name, and — the failed premise being that the durable
@@ -756,96 +705,6 @@ func (w *Writeback) SetInodeTable(t fs.InodeTable) { w.inodes = t }
 // counters (v1 perfRecordRemote).
 func (w *Writeback) SetRemoteOpRecorder(fn func(name string, err error, dur time.Duration, bytes uint64)) {
 	w.perfShim.setForward(fn)
-}
-
-// extentRoute reports whether a staged image of this size should bypass
-// the small-file writeback cache track and land through the commit queue,
-// where the extent branch promotes it to the extent plane.
-func (w *Writeback) extentRoute(path string, size int64) bool {
-	if w.queue == nil || w.opts.Staging == nil {
-		return false
-	}
-	if len(w.extentGlobs) > 0 {
-		// Pattern-owned layout: only matching paths promote, at or above
-		// the (possibly zero) matched-path cutoff.
-		if !matchExtentPattern(w.extentGlobs, path) {
-			return false
-		}
-		return size >= w.extentMatchCutoff
-	}
-	// Hybrid: promotion at the inline cutoff.
-	return w.opts.ExtentMinSize > 0 && size >= w.opts.ExtentMinSize
-}
-
-// matchExtentPattern reports whether path matches any compiled extent
-// glob. Globs match the whole path; a trailing /* covers subtrees.
-func matchExtentPattern(globs []globMatcher, path string) bool {
-	for _, g := range globs {
-		if g(path) {
-			return true
-		}
-	}
-	return false
-}
-
-// compileExtentGlobs compiles the profile's [extent] patterns with the
-// SAME filter the extent plane uses for its fresh-create claims
-// (pathfilter over canonicalized, root-relative paths), so the write
-// plane's promotion decision can never disagree with the plane's
-// create-time decision.
-type globMatcher func(path string) bool
-
-// hasSegmentPattern reports whether any raw pattern is a single-segment
-// (no '/') glob — those also match by basename at any depth.
-func hasSegmentPattern(patterns []string) bool {
-	for _, raw := range patterns {
-		raw = strings.TrimSpace(raw)
-		if raw != "" && !strings.Contains(raw, "/") {
-			return true
-		}
-	}
-	return false
-}
-
-func compileExtentGlobs(patterns []string) []globMatcher {
-	// An EMPTY pattern list must stay empty: the caller's hybrid routing
-	// (size-cutoff promotion) keys on len(globs) == 0, and a vacuous
-	// matcher here would disable default-mount promotion entirely.
-	if len(pathfilter.CompileAll(patterns)) == 0 && !hasSegmentPattern(patterns) {
-		return nil
-	}
-	compiled := pathfilter.CompileAll(patterns)
-	// A single-segment pattern (no '/') also matches by BASENAME at any
-	// depth: the profile's [extent] globs follow the suite's contract
-	// that "*.db" covers mix/a.db, while a pathfilter segment never
-	// crosses a separator.
-	var names []string
-	for _, raw := range patterns {
-		raw = strings.TrimSpace(raw)
-		if raw == "" || strings.Contains(raw, "/") {
-			continue
-		}
-		names = append(names, raw)
-	}
-	return []globMatcher{func(path string) bool {
-		cleaned, err := pathutil.Canonicalize(path)
-		if err != nil {
-			return false
-		}
-		cleaned = strings.TrimPrefix(cleaned, "/")
-		for _, p := range compiled {
-			if p.MatchCanonical(cleaned) {
-				return true
-			}
-		}
-		base := pathutil.BaseName(cleaned)
-		for _, n := range names {
-			if ok, _ := filepath.Match(n, base); ok {
-				return true
-			}
-		}
-		return false
-	}}
 }
 
 // smallFileShadowThreshold is the cached-I/O cutoff (v1): handles of bases
@@ -1479,17 +1338,12 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			if w.wbCache == nil || w.uploader == nil {
 				return nil
 			}
-			meta, ok := w.wbCache.GetMeta(p)
-			if !ok {
-				return nil
-			}
-			rev, err := w.uploader.UploadSyncWithRevision(ctx, p)
+			rev, meta, err := w.uploader.uploadSyncWithMetadata(ctx, p)
 			if err != nil {
 				return err
 			}
 			w.uploader.WaitPath(p)
-			w.wbCache.RemoveIfGeneration(p, meta.Generation)
-			if rev > 0 {
+			if meta != nil && rev > 0 {
 				landedRev, landedSize = rev, meta.Size
 				w.landedAt(p, rev, meta.Size)
 			}
@@ -2128,9 +1982,9 @@ func (h *bufferingHandle) Write(ctx context.Context, off int64, data []byte) err
 			h.mu.Lock()
 			cur := append([]byte(nil), h.buf.Bytes()...)
 			if !bytes.Equal(image, cur) || landedRev > h.baseRev {
-				if aerr := h.adoptAppendImageLocked(image, landedRev); aerr != nil {
+				if err := h.adoptAppendImageLocked(image, landedRev); err != nil {
 					h.mu.Unlock()
-					return aerr
+					return err
 				}
 			}
 			h.mu.Unlock()
@@ -2170,31 +2024,60 @@ func (h *bufferingHandle) Write(ctx context.Context, off int64, data []byte) err
 // which only snapshots locally and lets Release own the upload — no close
 // boundary is coming, so the image stages into the ledger now and the
 // facade's chain drain waits for the landing.
-func (h *bufferingHandle) DrainFlush(ctx context.Context) error {
+func (h *bufferingHandle) DrainFlush(ctx context.Context) (err error) {
+	retainBuffer := false
 	h.mu.Lock()
 	staged, unlinked := h.stagedToCache, h.unlinked
+	dirty, uploadGen := h.dirty, h.wgen
 	h.stagedToCache = false
 	h.mu.Unlock()
 	if staged && !unlinked && h.w.uploader != nil && h.w.wbCache != nil {
 		if _, ok := h.w.wbCache.GetMeta(h.path); ok {
-			// v1 FlushAll over the write-cache track: the Flush snapshot
-			// owns the upload — land it synchronously, exactly once. A
-			// commitLocked here would publish a second image that races
-			// the uploader's CAS on the same base.
-			h.mu.Lock()
-			uploadGen := h.wgen
-			h.mu.Unlock()
-			if err := h.w.uploader.UploadSync(ctx, h.path); err != nil {
-				return err
+			// A failed drain keeps the staged image available to Release or retry.
+			defer func() {
+				if err != nil {
+					if _, ok := h.w.wbCache.GetMeta(h.path); ok {
+						h.mu.Lock()
+						h.stagedToCache = !h.unlinked
+						h.mu.Unlock()
+					}
+				}
+			}()
+			useCache := true
+			if dirty {
+				snapshot, stageErr := h.stageToWriteCache(ctx)
+				if errors.Is(stageErr, errWriteCacheBypass) {
+					useCache = false
+					retainBuffer = true
+				} else if stageErr != nil {
+					return stageErr
+				}
+				if snapshot != nil {
+					uploadGen = snapshot.wgen
+				}
 			}
-			h.mu.Lock()
-			h.retireDirtyLocked(uploadGen)
-			h.landed = true
-			h.mu.Unlock()
-			return nil
+			if useCache {
+				rev, meta, uploadErr := h.w.uploader.uploadSyncWithMetadata(ctx, h.path)
+				if uploadErr != nil {
+					return uploadErr
+				}
+				if meta != nil {
+					h.mu.Lock()
+					h.retireDirtyLocked(uploadGen)
+					h.mu.Unlock()
+					h.markLanded(rev)
+					h.w.landedAt(h.path, rev, meta.Size)
+				}
+				return nil
+			}
 		}
 	}
-	if err := h.commitLocked(ctx); err != nil {
+	if retainBuffer && h.w.queue != nil && h.w.opts.Staging != nil {
+		err = h.stageAndEnqueueOpt(ctx, !h.w.lazy, false, true)
+	} else {
+		err = h.commitLocked(ctx)
+	}
+	if err != nil {
 		return err
 	}
 	if !h.w.waitPathCommit(h.path) {
@@ -2213,8 +2096,7 @@ func (h *bufferingHandle) Sync(ctx context.Context) error {
 	if h.w.interactive && h.w.opts.Policy == PolicyWriteBack && h.w.queue != nil && h.w.opts.Staging != nil {
 		// v1 interactive fsync: the staging is unconditionally durable and
 		// a JournalFsync frame fences the async commit's marker ordering.
-		_, err := h.stageAndEnqueueOpt(ctx, true, true)
-		return err
+		return h.stageAndEnqueueOpt(ctx, true, true, false)
 	}
 	if err := h.commitLocked(ctx); err != nil {
 		return err
@@ -2234,16 +2116,17 @@ func (h *bufferingHandle) Sync(ctx context.Context) error {
 	staged := h.stagedToCache
 	h.mu.Unlock()
 	if staged && h.w.uploader != nil {
-		rev, err := h.w.uploader.UploadSyncWithRevision(ctx, h.path)
+		rev, meta, err := h.w.uploader.uploadSyncWithMetadata(ctx, h.path)
 		if err != nil {
 			return err
 		}
 		h.mu.Lock()
-		size := h.buf.Size()
 		h.stagedToCache = false
 		h.mu.Unlock()
-		h.markLanded(rev)
-		h.w.landedAt(h.path, rev, size)
+		if meta != nil {
+			h.markLanded(rev)
+			h.w.landedAt(h.path, rev, meta.Size)
+		}
 	}
 	return nil
 }
@@ -2267,21 +2150,16 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 		if (!dirty && !truncPending && !emptyCreate) || unlinked {
 			return nil
 		}
-		size := int64(0)
-		if buffered {
-			h.mu.Lock()
-			if h.buf != nil {
-				size = h.buf.Size()
-			}
-			h.mu.Unlock()
-		}
-		if size >= commitInlineStreamThreshold && h.w.queue != nil && h.w.opts.Staging != nil {
+		h.mu.Lock()
+		large := h.buf != nil && h.buf.Size() >= commitInlineStreamThreshold
+		h.mu.Unlock()
+		if large && h.w.queue != nil && h.w.opts.Staging != nil {
 			// v1 close-sync large files (uploadCloseSyncShadow): stage
 			// through the shadow spill path — bounded memory, no whole-image
 			// materialization — and land synchronously through the queue's
 			// streaming upload, waiting for THIS path only.
-			if _, serr0 := h.stageAndEnqueueOpt(ctx, true, false); serr0 != nil {
-				return serr0
+			if err := h.stageAndEnqueueOpt(ctx, true, false, false); err != nil {
+				return err
 			}
 			if !h.w.queue.WaitPathDeadline(h.path, uploadTimeout) {
 				return fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
@@ -2296,49 +2174,42 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 		// from the FUSE cancel channel under interrupt-safe mutations (v1
 		// syncDataCommitContext): a kernel interrupt after the PUT hit the
 		// wire must not cancel it into an ambiguous server-side state.
-		if h.w.extentRoute(h.path, size) {
-			staged, serr := h.stageAndEnqueueOpt(ctx, true, false)
-			if serr != nil {
-				return serr
-			}
-			if err := h.w.queue.WaitPathOutcome(h.path, uploadTimeout); err != nil {
-				// Idle is not success: a terminally failed queued upload
-				// must surface at the close(2) durability boundary.
-				return fs.StatusErrorOf(gofuse.Status(syscall.EIO))
-			}
-			// The landing retires isNew (later writes stage as overwrites
-			// of whatever landed) and re-bases evicted-part recovery on
-			// the remote image before the queue reclaims the shadow —
-			// atomically gated on the buffer still holding the staged
-			// image, so a write accepted while the upload was pending
-			// stays unpublished dirty state.
-			h.completeStagedLanding(0, 0, staged, false)
-			return nil
-		}
 		if h.w.uploader != nil && h.w.wbCache != nil {
 			if !h.w.opts.InterruptibleCommits {
 				var detachCancel context.CancelFunc
 				ctx, detachCancel = h.w.detachCommitContext(ctx, 0)
 				defer detachCancel()
 			}
-			isNew := func() bool { h.mu.Lock(); defer h.mu.Unlock(); return h.isNew }()
-			if err := h.stageToWriteCache(ctx, isNew); err != nil {
-				return err
+			snapshot, err := h.stageToWriteCache(ctx)
+			if errors.Is(err, errWriteCacheBypass) {
+				if h.w.queue != nil && h.w.opts.Staging != nil {
+					if err := h.stageAndEnqueueOpt(ctx, true, false, false); err != nil {
+						return err
+					}
+					if !h.w.queue.WaitPathDeadline(h.path, uploadTimeout) {
+						return fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
+					}
+					return nil
+				}
+				return h.commitLocked(ctx)
 			}
-			h.mu.Lock()
-			h.stagedToCache = true
-			stagedGen := h.wgen
-			stagedSize := h.buf.Size()
-			h.mu.Unlock()
-			rev, err := h.w.uploader.UploadSyncWithRevision(ctx, h.path)
 			if err != nil {
 				return err
 			}
-			// The synchronous upload bypasses the background worker whose
-			// OnSuccess feeds the landed table — record the watermark here
-			// so append siblings see the advance without a remote stat
-			// (v1 recordCommittedRevisionWithSize at this boundary).
-			h.w.landedAt(h.path, rev, stagedSize)
+			if snapshot == nil {
+				return nil
+			}
+			h.mu.Lock()
+			h.stagedToCache = true
+			h.mu.Unlock()
+			rev, meta, err := h.w.uploader.uploadSyncWithMetadata(ctx, h.path)
+			if err != nil {
+				return err
+			}
+			// Only metadata consumed by this upload can settle this image.
+			if meta != nil {
+				h.w.landedAt(h.path, rev, meta.Size)
+			}
 			h.mu.Lock()
 			h.stagedToCache = false
 			// The image is on the remote now — for every create shape, not
@@ -2349,14 +2220,13 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 			// acknowledged while the upload was in flight (Drain flushes
 			// without the per-FH write lock) keeps its own dirty flag and
 			// the next durability barrier commits it.
-			if h.wgen == stagedGen {
-				h.dirty = false
-				h.visTrunc = false
-			}
+			h.retireDirtyLocked(snapshot.wgen)
 			h.mu.Unlock()
 			// The landed revision also retires isNew: a later write on
 			// this handle must stage as an overwrite of that revision.
-			h.markLanded(rev)
+			if meta != nil {
+				h.markLanded(rev)
+			}
 			return nil
 		}
 		if emptyCreate {
@@ -2376,42 +2246,18 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 		// .dat/.meta image on disk and the uploader lands it async; the
 		// commit queue keeps serving the large-file/shadow track.
 		h.mu.Lock()
-		dirty, unlinked, isNew := h.dirty, h.unlinked, h.isNew
-		size := int64(0)
-		if h.buf != nil {
-			size = h.buf.Size()
-		}
+		dirty, unlinked := h.dirty, h.unlinked
 		h.mu.Unlock()
 		if !dirty || unlinked {
 			return nil
 		}
-		if h.w.extentRoute(h.path, size) {
-			// Promotion-sized image: the commit queue's extent branch
-			// turns it into an extent sequential session — never the
-			// small-file classic track. Stage durably and wait for THIS
-			// path's landing (the close-sync large-file contract): the name
-			// must be visible as extent at close(2), and Release must not
-			// double-commit a classic image beside the queued one.
-			staged, serr := h.stageAndEnqueueOpt(ctx, true, false)
-			if serr != nil {
-				return serr
-			}
-			if err := h.w.queue.WaitPathOutcome(h.path, uploadTimeout); err != nil {
-				return fs.StatusErrorOf(gofuse.Status(syscall.EIO))
-			}
-			// Post-wait completion: retire the fresh-create view and drop
-			// the dirty flag only when the buffer still holds the staged
-			// image — bound to THIS staging's identity and applied
-			// atomically, so a write accepted while the upload was
-			// pending (the drain path runs without the FUSE per-handle
-			// lock) cannot slip between the check and the reset and lose
-			// its publication.
-			h.completeStagedLanding(0, 0, staged, true)
-			return nil
-		}
-		if size < commitInlineStreamThreshold {
-			if err := h.stageToWriteCache(ctx, isNew); err != nil {
+		snapshot, err := h.stageToWriteCache(ctx)
+		if !errors.Is(err, errWriteCacheBypass) {
+			if err != nil {
 				return err
+			}
+			if snapshot == nil {
+				return nil
 			}
 			// v1 small-file contract (write-back policy): the Flush
 			// snapshot is local-only. Uploading here would publish transient
@@ -2506,9 +2352,24 @@ func (h *bufferingHandle) Release(ctx context.Context) error {
 	// survivor cleanup). The selection happens ATOMICALLY with this
 	// handle's untrack inside the registry: two concurrent Releases both
 	// seeing each other skipped the drop and nobody reclaimed it.
-	last := h.w.untrackAndLast(h)
-	if last && h.w.unlinkedShadowServed(path) {
-		h.w.dropUnlinkedShadow(path)
+	defer func() {
+		last := h.w.untrackAndLast(h)
+		if last && h.w.unlinkedShadowServed(path) {
+			h.w.dropUnlinkedShadow(path)
+		}
+	}()
+	// New bytes need the in-flight upload's create acknowledgement before restaging.
+	var uploadUnlock func()
+	h.mu.Lock()
+	dirtyBeforeClose := h.dirty
+	h.mu.Unlock()
+	if dirtyBeforeClose && h.w.uploader != nil {
+		uploadUnlock = h.w.uploader.acquirePath(path)
+		defer func() {
+			if uploadUnlock != nil {
+				uploadUnlock()
+			}
+		}()
 	}
 	// A file-backed anonymous snapshot dies with its descriptor.
 	h.mu.Lock()
@@ -2532,17 +2393,19 @@ func (h *bufferingHandle) Release(ctx context.Context) error {
 	materialize := h.isNew && !h.landed && !h.unlinked
 	staged, unlinked := h.stagedToCache, h.unlinked
 	dirty := h.dirty
-	isNew := h.isNew
 	h.stagedToCache = false
 	h.mu.Unlock()
 	if staged && !unlinked && h.w.uploader != nil && h.w.wbCache != nil {
 		if _, ok := h.w.wbCache.GetMeta(path); ok {
+			useCache := true
 			if dirty {
 				// A write landed between Flush and Release: the staged
 				// snapshot is stale — refresh it from the current buffer
 				// before submitting (v1: the latest image always wins;
 				// submitting the stale snapshot loses the newer write).
-				if err := h.stageToWriteCache(ctx, isNew); err != nil {
+				if _, err := h.stageToWriteCache(ctx); errors.Is(err, errWriteCacheBypass) {
+					useCache = false
+				} else if err != nil {
 					return err
 				}
 			}
@@ -2550,19 +2413,26 @@ func (h *bufferingHandle) Release(ctx context.Context) error {
 			// owns the close upload — submit it exactly once instead of
 			// re-committing (commitLocked would publish a second image and
 			// race the uploader's CAS on the same base).
-			h.w.uploader.Submit(path)
-			h.mu.Lock()
-			h.dirty = false
-			h.visTrunc = false
-			if h.buf != nil {
-				h.buf.ClearDirty()
+			if useCache {
+				// Submit can upload synchronously when stopped or backpressured.
+				if uploadUnlock != nil {
+					uploadUnlock()
+					uploadUnlock = nil
+				}
+				h.w.uploader.Submit(path)
+				h.mu.Lock()
+				h.dirty = false
+				h.visTrunc = false
+				if h.buf != nil {
+					h.buf.ClearDirty()
+				}
+				h.landed = true
+				h.mu.Unlock()
+				if h.inner != nil {
+					_ = h.inner.Release(ctx)
+				}
+				return nil
 			}
-			h.landed = true
-			h.mu.Unlock()
-			if h.inner != nil {
-				_ = h.inner.Release(ctx)
-			}
-			return nil
 		}
 	}
 	if materialize {
@@ -2689,102 +2559,46 @@ func readShadowGenerationFenced(shadows *staging.ShadowStore, path string, size 
 func (h *bufferingHandle) checkoutDropCleanBuffer() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.unlinked || h.dirty || h.pendingImage != nil {
+	// A locally created handle has no terminal from which to reload its bytes.
+	if h.inner == nil || h.unlinked || h.dirty || h.pendingImage != nil {
 		return
 	}
 	h.buf = nil
+}
+
+func (w *Writeback) acknowledgeUploadedCreate(path string, rev int64) {
+	// Retire only the name claim; newer writes and truncations still own their bytes.
+	w.liveSet.Range(func(key, _ any) bool {
+		h, ok := key.(*bufferingHandle)
+		if !ok {
+			return true
+		}
+		h.mu.Lock()
+		if h.path == path && h.isNew && !h.unlinked {
+			h.landed = true
+			h.isNew = false
+			if rev > 0 {
+				h.baseRev = rev
+			}
+		}
+		h.mu.Unlock()
+		return true
+	})
+	if w.wbCache != nil {
+		if err := w.wbCache.RebasePendingNew(path, rev); err != nil {
+			safeLogPrintf("writeback: rebase pending create %s on revision %d: %v", path, rev, err)
+		}
+	}
 }
 
 func (h *bufferingHandle) markLanded(rev int64) {
 	h.mu.Lock()
 	h.landed = true
 	h.isNew = false
-	// #984 supersession: the landed image IS the newest truth now, so the
-	// uncommitted-truncate claim ends (v1 ClearDirty dropping
-	// visibleTruncate). A later write re-dirties and re-stamps on its own.
-	h.visTrunc = false
 	if rev > 0 {
 		h.baseRev = rev
 	}
-	// The landing makes the remote image authoritative: evicted parts
-	// must be able to restore from it once the shadow is reclaimed. The
-	// arming runs UNDER the lock — WriteBuffer is not thread-safe, and an
-	// unlocked install could interleave with a truncate (clamping
-	// remoteSize to zero) and reinstate the pre-truncate snapshot.
-	h.armRemoteRestoreLocked(0)
 	h.mu.Unlock()
-}
-
-// markLandedImage is markLanded for a landing whose committed image size
-// is known (the queue's entry): the remote-restore boundary is that
-// landed size, not whatever the buffer has accumulated since. The
-// metadata (landed / isNew retirement / base revision) always advances —
-// the server really holds that revision — but the buffer is certified
-// (visTrunc cleared, remote restore armed) only when it still holds
-// exactly the staged image the landing acknowledged: newer mutations,
-// such as an unstaged truncate-regrow, keep their own state.
-func (h *bufferingHandle) markLandedImage(rev, size int64, snapshotID string) (certified bool) {
-	return h.completeStagedLanding(rev, size, snapshotID, false)
-}
-
-// completeStagedLanding applies a landing completion ATOMICALLY: the
-// generation check and every state change that depends on it — the
-// landed/isNew/base-revision retirement, the visTrunc/arming
-// certification, and the optional dirty reset — happen under ONE h.mu
-// acquisition. The mount-drain path runs without the FUSE per-handle
-// lock, so splitting the check from the updates would let a concurrent
-// Write or truncate slip between them and still lose the newer bytes
-// (or re-certify a regrown buffer against the old remote image). An
-// empty snapshotID means "the current staging" (post-wait sites).
-func (h *bufferingHandle) completeStagedLanding(rev, size int64, snapshotID string, resetDirty bool) (certified bool) {
-	if snapshotID == "" {
-		// No identity, no completion: substituting the CURRENT staging
-		// here would certify an in-progress image over the one that
-		// actually landed (the mutex makes the decision atomic, not the
-		// identity correct). Callers capture the staging's ID right
-		// after staging it.
-		return false
-	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.landed = true
-	h.isNew = false
-	if rev > 0 {
-		h.baseRev = rev
-	}
-	certified = h.stagedSnapshotID == snapshotID &&
-		(h.buf == nil || h.buf.ContentVersion() == h.stagedContentVersion)
-	if certified {
-		h.visTrunc = false
-		h.armRemoteRestoreLocked(size)
-		if resetDirty {
-			h.dirty = false
-		}
-	}
-	h.retireStagedSnapshotLocked(snapshotID)
-	return certified
-}
-
-// retireStagedSnapshotLocked drops a completed snapshot ID from the
-// per-handle registration set: only in-flight landings need to find it,
-// and a long-lived descriptor with repeated write/fsync cycles must not
-// accumulate them (each staging copies the set under h.mu). h.mu must be
-// held.
-func (h *bufferingHandle) retireStagedSnapshotLocked(id string) {
-	if id == "" {
-		return
-	}
-	regs, _ := h.stagedSnapshotRegs.Load().(map[string]struct{})
-	if _, ok := regs[id]; !ok {
-		return
-	}
-	next := make(map[string]struct{}, len(regs))
-	for k := range regs {
-		if k != id {
-			next[k] = struct{}{}
-		}
-	}
-	h.stagedSnapshotRegs.Store(next)
 }
 
 func attrSize(res fs.Result) int64 {
@@ -3019,59 +2833,6 @@ func (w *Writeback) armBypass(path string, rev, size int64, reason string) {
 	}
 }
 
-// armRemoteRestore re-bases this handle's evicted-part recovery on the
-// landed remote image. A spilled buffer's only restore source is the
-// shadow, which the queue's success cleanup removes once the commit
-// lands — while this handle may stay open and keep evicting parts. For a
-// freshly created file the buffer has no LoadPart at all, so every later
-// write touching an evicted part failed with 'shadow file not found' and
-// surfaced as EIO on write(2). After a landing the remote image is
-// authoritative and complete, so it becomes the fallback restore source.
-func (h *bufferingHandle) armRemoteRestoreLocked(size int64) {
-	// h.mu must be held: every field read and every WriteBuffer mutation
-	// below (LoadPart install, SetRemoteSize, MarkRemoteAuthoritative)
-	// shares the buffer's single synchronization domain.
-	buf, cli, path := h.buf, h.w.opts.Client, h.path
-	partSize := int64(0)
-	if buf != nil {
-		partSize = buf.PartSize()
-		if size <= 0 {
-			size = buf.Size()
-		}
-	}
-	if buf == nil || cli == nil || partSize <= 0 || size <= 0 {
-		return
-	}
-	remote := h.w.remotePath(path)
-	landed := size
-	buf.LoadPart = func(partNum int) ([]byte, error) {
-		start := int64(partNum-1) * partSize
-		if start >= landed {
-			return nil, nil
-		}
-		end := start + partSize
-		if end > landed {
-			end = landed
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
-		defer cancel()
-		rc, err := cli.ReadStreamRange(ctx, remote, start, end-start)
-		if err != nil {
-			return nil, err
-		}
-		data, rerr := io.ReadAll(rc)
-		_ = rc.Close()
-		if rerr != nil {
-			return nil, rerr
-		}
-		return data, nil
-	}
-	buf.SetRemoteSize(landed)
-	// The landed remote image now holds every retained byte: evicted
-	// parts may fall back to it once the queue reclaims the shadow.
-	buf.MarkRemoteAuthoritative()
-}
-
 func (w *Writeback) remotePath(p string) string {
 	if w.root == "/" {
 		return p
@@ -3186,11 +2947,6 @@ func (w *Writeback) retireLocked(h *bufferingHandle) {
 			}
 			return true
 		})
-	}
-	if regs, ok := h.stagedSnapshotRegs.Load().(map[string]struct{}); ok {
-		for k := range regs {
-			w.liveSnapshots.Delete(k)
-		}
 	}
 	w.liveSet.Delete(h)
 }
@@ -3974,6 +3730,12 @@ func (r *bufferReader) ReadAt(p []byte, off int64) (int, error) {
 // the image is too large for the whole-image tracks (v1's large-file
 // bypass of the .dat/.meta track).
 func (h *bufferingHandle) commitInline(ctx context.Context) error {
+	var cacheGen uint64
+	if h.w.wbCache != nil {
+		if meta, ok := h.w.wbCache.GetMeta(h.path); ok {
+			cacheGen = meta.Generation
+		}
+	}
 	h.mu.Lock()
 	size := int64(0)
 	if h.buf != nil {
@@ -3987,9 +3749,9 @@ func (h *bufferingHandle) commitInline(ctx context.Context) error {
 	if size >= commitInlineStreamThreshold {
 		newReader = func() io.Reader { return &bufferReader{h: h, size: size} }
 	} else {
-		if lerr := h.buf.LoadMissingParts(); lerr != nil {
+		if err := h.buf.LoadMissingParts(); err != nil {
 			h.mu.Unlock()
-			return lerr
+			return err
 		}
 		image = h.buf.Bytes()
 		newReader = func() io.Reader { return bytes.NewReader(image) }
@@ -3998,6 +3760,9 @@ func (h *bufferingHandle) commitInline(ctx context.Context) error {
 
 	committedRev, err := h.w.commitReaderOpt(ctx, h.path, newReader, size, isNew && size == 0, baseRev)
 	if err == nil {
+		if cacheGen != 0 {
+			h.w.wbCache.RemoveIfGeneration(h.path, cacheGen)
+		}
 		h.w.landedAt(h.path, committedRev, size)
 		if h.w.commitSeeder != nil && image != nil && h.w.commitSeedAllowed(int64(len(image))) {
 			h.w.commitSeeder(h.path, image, committedRev)
@@ -4313,8 +4078,7 @@ func (h *bufferingHandle) ensureBufferLocked(ctx context.Context) error {
 // and hands it to the async commit queue (the true writeback path). The
 // close boundary stages durably unless lazy staging is on (v1).
 func (h *bufferingHandle) stageAndEnqueue(ctx context.Context) error {
-	_, err := h.stageAndEnqueueOpt(ctx, !h.w.lazy, false)
-	return err
+	return h.stageAndEnqueueOpt(ctx, !h.w.lazy, false, false)
 }
 
 // stageAndEnqueueOpt is stageAndEnqueue with explicit durability controls:
@@ -4322,39 +4086,15 @@ func (h *bufferingHandle) stageAndEnqueue(ctx context.Context) error {
 // appends a JournalFsync frame after staging so the async commit's
 // JournalCommit marker lands at a higher Seq — replay then cannot
 // resurrect a path the commit settled (v1 interactive fsync ordering).
-func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journalFsync bool) (stagedSnapshot string, err error) {
-	stagedSnapshot, err = h.stageAndEnqueueInner(ctx, durable, journalFsync)
-	if err != nil {
-		return stagedSnapshot, err
-	}
-	// The staging path lock is released here (the inner function's defer
-	// has run). A marking observed by the inner recheck cancels EXACTLY
-	// this staging's own entry — a pathname-wide cancel would also kill a
-	// replacement's in-flight publication after the name was recreated,
-	// and would journal a pathname-wide unlink fence over its frames. The
-	// unlink's own sweep races harmlessly: this entry is canceled by one
-	// side or the other, never left enqueued, and nothing else is touched.
-	h.mu.Lock()
-	selfCancel := h.selfCancelAfterStaging
-	entry := h.selfCancelEntry
-	h.selfCancelAfterStaging = false
-	h.selfCancelEntry = nil
-	h.mu.Unlock()
-	if selfCancel && entry != nil && h.w.queue != nil {
-		h.w.queue.CancelEntryInFlight(entry)
-	}
-	return stagedSnapshot, nil
-}
-
-func (h *bufferingHandle) stageAndEnqueueInner(ctx context.Context, durable, journalFsync bool) (staged string, err error) {
+func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journalFsync, retainBuffer bool) error {
 	// #1023 staging fence: an append handle must not publish an image a
 	// sibling's landed commit already superseded — compose (or reject)
 	// before this staging owns the path (v1 adoptLandedAppendSnapshot at
 	// the stageShadow fence).
 	if h.appendParticipant() {
-		image, landedRev, ferr0 := h.w.fenceRefreshAppendBase(ctx, h)
-		if ferr0 != nil {
-			return "", ferr0
+		image, landedRev, err := h.w.fenceRefreshAppendBase(ctx, h)
+		if err != nil {
+			return err
 		}
 		if image != nil {
 			h.mu.Lock()
@@ -4362,16 +4102,37 @@ func (h *bufferingHandle) stageAndEnqueueInner(ctx context.Context, durable, jou
 			if !bytes.Equal(image, cur) || landedRev > h.baseRev {
 				if err := h.adoptAppendImageLocked(image, landedRev); err != nil {
 					h.mu.Unlock()
-					return staged, err
+					return err
 				}
 			}
 			h.mu.Unlock()
 		}
 	}
+	w := h.w
+	st := w.opts.Staging
+	// Queue cleanup uses this lock order too; snapshot the mutable buffer only
+	// after obtaining the path lock so Drain cannot race a write during spill.
+	unlock := w.pathLocks.lock(h.path)
+	defer unlock()
+	var cacheGen uint64
+	if w.wbCache != nil {
+		if meta, ok := w.wbCache.GetMeta(h.path); ok {
+			cacheGen = meta.Generation
+		}
+	}
 	h.mu.Lock()
+	if h.unlinked {
+		h.dirty = false
+		h.visTrunc = false
+		if h.buf != nil {
+			h.buf.ClearDirty()
+		}
+		h.mu.Unlock()
+		return nil
+	}
 	if !h.dirty || h.buf == nil {
 		h.mu.Unlock()
-		return "", nil
+		return nil
 	}
 	size := h.buf.Size()
 	spill := size >= commitInlineStreamThreshold
@@ -4380,13 +4141,18 @@ func (h *bufferingHandle) stageAndEnqueueInner(ctx context.Context, durable, jou
 		// unloaded parts, which would publish a corrupted image.
 		if err := h.buf.LoadMissingParts(); err != nil {
 			h.mu.Unlock()
-			return staged, err
+			return err
 		}
 	}
 	isNew, baseRev := h.isNew, h.baseRev
 	// A zero-based image (fresh create, or O_TRUNC discarding the base)
 	// holds only zeros beyond its written parts — its spill stays sparse.
 	zeroBase := isNew || h.trunc
+	// The deferred chmod (or a create mode ≠ 0644) rides the staging entry:
+	// the queue snapshots Mode at enqueue and applies it post-landing
+	// (onCommitSuccess). Consume it here — a later staging must not re-apply
+	// a stale mode. Dropping it entirely (the old behavior) lost every chmod
+	// deferred onto an open writeback handle (chmod/12: 0777 → 0644).
 	mode, hasMode := h.pendingMode, h.hasPendingMode
 	h.pendingMode, h.hasPendingMode = 0, false
 	// Lineage (v1 ensureStagedSnapshotLineageLocked): a fresh snapshot ID
@@ -4398,65 +4164,12 @@ func (h *bufferingHandle) stageAndEnqueueInner(ctx context.Context, durable, jou
 	}
 	h.stageSeq++
 	snapshotID, parentSnapshotID := h.stagedSnapshotID, h.stagedParentID
-	// Still under h.mu here (the staging section holds it through the
-	// buffer hand-off below): read the generation directly.
-	stagedContentVersion := uint64(0)
-	if h.buf != nil {
-		stagedContentVersion = h.buf.ContentVersion()
-	}
-	h.stagedContentVersion = stagedContentVersion
-	// Bind this staging's identity for its completion: the value is
-	// minted under h.mu and returned to the caller, so a post-wait
-	// completion refers to exactly this operation even when a later
-	// staging (a concurrent fsync on the drain path) has since replaced
-	// h.stagedSnapshotID.
-	staged = snapshotID
-	// The landing of THIS image must find THIS handle even when a newer
-	// writer has since opened the same path. Earlier registrations of
-	// this handle STAY: the new staging has not yet replaced their
-	// backing (the shadow write and the path lock come later), and an
-	// in-flight earlier landing still needs to arm or retain its own
-	// shadow generation. Each registration is consumed by its landing
-	// and the rest are dropped at untrack.
-	regs, _ := h.stagedSnapshotRegs.Load().(map[string]struct{})
-	next := make(map[string]struct{}, len(regs)+1)
-	for k := range regs {
-		next[k] = struct{}{}
-	}
-	next[snapshotID] = struct{}{}
-	h.stagedSnapshotRegs.Store(next)
-	h.w.liveSnapshots.Store(snapshotID, h)
 	buf := h.buf
-	h.mu.Unlock()
-
-	w := h.w
-	st := w.opts.Staging
+	stageGen := h.wgen
 	kind := staging.PendingOverwrite
 	if isNew {
 		kind = staging.PendingNew
 		baseRev = 0
-	}
-	// staging.Staging keys are LOCAL paths; the queue maps them to API paths via
-	// its own remoteRoot (same convention as the terminal).
-	unlock := w.pathLocks.lock(h.path)
-	defer unlock()
-	// An anonymous handle must not publish under its dead name (commitLocked
-	// discards the same way). Checked under the path lock: the unlink's
-	// cancel+marker runs under it too (cancelPath), so a racing fsync either
-	// sees the marking here and stages nothing, or completed its publication
-	// and Enqueue first — and that entry dies with the marker (#1065).
-	h.mu.Lock()
-	unlinked := h.unlinked
-	if unlinked {
-		h.dirty = false
-		h.visTrunc = false
-		if h.buf != nil {
-			h.buf.ClearDirty()
-		}
-	}
-	h.mu.Unlock()
-	if unlinked {
-		return staged, nil
 	}
 	var image []byte
 	if spill {
@@ -4470,21 +4183,21 @@ func (h *bufferingHandle) stageAndEnqueueInner(ctx context.Context, durable, jou
 		// upload asynchronously: close(2) returns after the LOCAL durable
 		// stage (the write-back policy's defining contract), not after the
 		// network transfer.
-		if serr := h.spillToShadow(st, buf, baseRev, zeroBase); serr != nil {
-			return staged, serr
+		if err := h.spillToShadow(st, buf, baseRev, zeroBase, retainBuffer); err != nil {
+			h.mu.Unlock()
+			return err
 		}
 		if durable {
 			if err := st.Shadow.Sync(h.path); err != nil {
-				return staged, err
+				h.mu.Unlock()
+				return err
 			}
 		}
 	} else {
 		image = buf.Bytes()
 		if err := st.Shadow.WriteFull(h.path, image, baseRev); err != nil {
-			return staged, err
-		}
-		if w.pendingSeeder != nil {
-			w.pendingSeeder(h.path, image)
+			h.mu.Unlock()
+			return err
 		}
 		if durable {
 			// v1 stageShadowLocked(durable): the staged content is fsynced
@@ -4492,19 +4205,25 @@ func (h *bufferingHandle) stageAndEnqueueInner(ctx context.Context, durable, jou
 			// the bytes are durable (journal replay rebuilds the pending entry
 			// and the commit queue re-uploads from the shadow).
 			if err := st.Shadow.Sync(h.path); err != nil {
-				return staged, err
+				h.mu.Unlock()
+				return err
 			}
 		}
 	}
 	shadowGen := st.Shadow.ActiveGeneration(h.path)
+	h.mu.Unlock()
+	if image != nil && w.pendingSeeder != nil {
+		w.pendingSeeder(h.path, image)
+	}
 	var pendingGen uint64
+	var err error
 	if spill {
 		pendingGen, err = st.Pending.PutShadowSpillWithModeAndLineage(h.path, size, kind, baseRev, mode, hasMode, snapshotID, parentSnapshotID, true)
 	} else {
 		pendingGen, err = st.Pending.PutWithBaseRevAndModeAndLineage(h.path, int64(len(image)), kind, baseRev, mode, hasMode, snapshotID, parentSnapshotID, true)
 	}
 	if err != nil {
-		return staged, err
+		return err
 	}
 	if journalFsync && st.Journal != nil {
 		_ = st.Journal.Append(staging.JournalEntry{
@@ -4519,8 +4238,8 @@ func (h *bufferingHandle) stageAndEnqueueInner(ctx context.Context, durable, jou
 	// the Flush left, or Release's Submit double-publishes it as a second
 	// track and one side always 409s (the create case: queue lands the
 	// PendingNew, the uploader's expect-absent CAS then conflicts forever).
-	if w.wbCache != nil {
-		w.wbCache.Remove(h.path)
+	if cacheGen != 0 {
+		w.wbCache.RemoveIfGeneration(h.path, cacheGen)
 	}
 	entry := &CommitEntry{
 		Path:             h.path,
@@ -4535,45 +4254,30 @@ func (h *bufferingHandle) stageAndEnqueueInner(ctx context.Context, durable, jou
 		SnapshotID:       snapshotID,
 		ParentSnapshotID: parentSnapshotID,
 	}
-	// Capture this commit's delta before ClearDirty: extent-layout commits
-	// upload only these ranges as dirty blocks. Spilled entries lose
-	// per-part dirty tracking, so they carry no ranges and re-upload whole.
-	if !spill {
-		entry.DirtyRanges = dirtyPartRanges(h.buf, size)
-	}
 	if w.opts.Events != nil {
 		w.opts.Events.Emit(fs.Event{Kind: fs.EventStaged, Path: h.path, Size: entry.Size})
 	}
 	if err := w.queue.Enqueue(entry); err != nil {
-		return staged, err
+		return err
 	}
-	// The unlink's marking takes no path lock (a commit worker holds it
-	// across its upload), so the pre-enqueue guard alone cannot close the
-	// check-to-enqueue window. Record the recheck result here — the
-	// CANCEL itself must run OUTSIDE this path lock (CancelPathPreserveLocal
-	// re-acquires the same non-reentrant lock): the outer wrapper performs
-	// it after this function has released the lock.
 	h.mu.Lock()
-	h.selfCancelAfterStaging = h.unlinked
-	h.selfCancelEntry = entry
-	h.mu.Unlock()
-	h.mu.Lock()
-	h.dirty = false
-	h.visTrunc = false
-	h.buf.ClearDirty()
+	h.retireDirtyLocked(stageGen)
+	if h.wgen == stageGen {
+		h.stagedToCache = false
+	}
 	h.landed = true
 	// v1 publishStagedSnapshotLineageLocked: the staged snapshot becomes
 	// this handle's content identity — the next staging parents on it.
 	h.contentSnapshotID = snapshotID
 	h.mu.Unlock()
-	return snapshotID, nil
+	return nil
 }
 
 // spillToShadow stages the buffer's complete image into the shadow store
 // part-by-part with bounded memory (v1 large-file close staging). Parts are
 // loaded, written, and evicted; RestorePart and OnPartFull keep the
 // shadow as the buffer's authoritative backing from here on.
-func (h *bufferingHandle) spillToShadow(st *staging.Staging, buf *writebuffer.WriteBuffer, baseRev int64, zeroBase bool) error {
+func (h *bufferingHandle) spillToShadow(st *staging.Staging, buf *writebuffer.WriteBuffer, baseRev int64, zeroBase, retainBuffer bool) error {
 	partSize := buf.PartSize()
 	if partSize <= 0 {
 		return fmt.Errorf("writeback: spill without part size: %s", h.path)
@@ -4581,15 +4285,19 @@ func (h *bufferingHandle) spillToShadow(st *staging.Staging, buf *writebuffer.Wr
 	size := buf.Size()
 	// The shadow becomes the buffer's authoritative backing: evicted parts
 	// restore from it, and future sequential writes spill through it.
-	buf.RestorePart = func(partNum int) ([]byte, error) {
-		return restoreShadowPart(st.Shadow, h.path, buf, partNum)
-	}
-	buf.OnPartFull = func(partIdx int, data []byte) {
-		if _, err := st.Shadow.WriteAt(h.path, int64(partIdx)*partSize, data, baseRev); err != nil {
-			safeLogPrintf("writeback: shadow spill of part %d for %s failed: %v", partIdx, h.path, err)
-			return
+	// Drain leaves the writer open: keep its already-resident parts usable
+	// after queue cleanup removes the shadow, without materializing sparse holes.
+	if !retainBuffer {
+		buf.RestorePart = func(partNum int) ([]byte, error) {
+			return restoreShadowPart(st.Shadow, h.path, buf, partNum)
 		}
-		buf.EvictPart(partIdx)
+		buf.OnPartFull = func(partIdx int, data []byte) {
+			if _, err := st.Shadow.WriteAt(h.path, int64(partIdx)*partSize, data, baseRev); err != nil {
+				safeLogPrintf("writeback: shadow spill of part %d for %s failed: %v", partIdx, h.path, err)
+				return
+			}
+			buf.EvictPart(partIdx)
+		}
 	}
 	// v1's spill wrote only the parts the writer touched: a one-byte
 	// write at 2GiB+1 never materialized 2GiB of zeros on the disk, and
@@ -4624,7 +4332,9 @@ func (h *bufferingHandle) spillToShadow(st *staging.Staging, buf *writebuffer.Wr
 		if _, err := st.Shadow.WriteAt(h.path, start, data[:end-start], baseRev); err != nil {
 			return err
 		}
-		buf.EvictPart(int(start / partSize))
+		if !retainBuffer {
+			buf.EvictPart(int(start / partSize))
+		}
 	}
 	if err := st.Shadow.Truncate(h.path, size, baseRev); err != nil {
 		return err
@@ -4726,29 +4436,6 @@ func (h *bufferingHandle) commitLocked(ctx context.Context) error {
 		// the whole-image tracks (a sparse 2GiB pwrite OOM-killed small
 		// hosts), and close(2) returned after the local durable stage.
 		return h.stageAndEnqueue(ctx)
-	}
-	// Extent takeover must not depend on the durability policy: the
-	// per-Write synchronous boundary (write-sync) routes a
-	// promotion-sized image through the extent branch too — stage locally
-	// and land synchronously through the queue's extent session, waiting
-	// for THIS path so the Write still returns remote-durable.
-	if size := func() int64 {
-		h.mu.Lock()
-		defer h.mu.Unlock()
-		if h.buf == nil {
-			return 0
-		}
-		return h.buf.Size()
-	}(); h.w.extentRoute(h.path, size) {
-		staged, serr := h.stageAndEnqueueOpt(ctx, true, false)
-		if serr != nil {
-			return serr
-		}
-		if err := h.w.queue.WaitPathOutcome(h.path, uploadTimeout); err != nil {
-			return fs.StatusErrorOf(gofuse.Status(syscall.EIO))
-		}
-		h.completeStagedLanding(0, 0, staged, false)
-		return nil
 	}
 	// Commit dispatch: a partial edit of an existing large file patches
 	// only the dirty parts (the server copies the rest from the current
@@ -4917,9 +4604,14 @@ func (h *bufferingHandle) finishStreaming(ctx context.Context) error {
 	return stream.FinishStreaming(ctx, size, 0, nil, dirtyParts)
 }
 
+type writeCacheSnapshot struct {
+	wgen uint64
+}
+
 // stageToWriteCache writes the buffered image into the .dat/.meta cache
-// (small-stage) and clears the in-memory buffer's dirty state.
-func (h *bufferingHandle) stageToWriteCache(ctx context.Context, isNew bool) error {
+// (small-stage) and clears the in-memory buffer's dirty state. A nil result
+// means no image was staged; a snapshot remains valid after buffer invalidation.
+func (h *bufferingHandle) stageToWriteCache(ctx context.Context) (*writeCacheSnapshot, error) {
 	// The #1023 fence for the writeback-cache track (close-sync and the
 	// small-file write-back flush both stage here): compose with the
 	// file's newest state before this staging refreshes the CAS base —
@@ -4928,7 +4620,7 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, isNew bool) err
 	if h.appendParticipant() {
 		image, landedRev, err := h.w.fenceRefreshAppendBase(ctx, h)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if image != nil {
 			h.mu.Lock()
@@ -4936,36 +4628,46 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, isNew bool) err
 			if !bytes.Equal(image, cur) || landedRev > h.baseRev {
 				if err := h.adoptAppendImageLocked(image, landedRev); err != nil {
 					h.mu.Unlock()
-					return err
+					return nil, err
 				}
 			}
 			h.mu.Unlock()
 		}
 	}
+	unlock := h.w.pathLocks.lock(h.path)
+	defer unlock()
+	if h.w.opts.Staging != nil && h.w.opts.Staging.Pending.HasPending(h.path) {
+		return nil, errWriteCacheBypass
+	}
 	h.mu.Lock()
+	isNew := h.isNew
 	if h.buf == nil {
 		h.mu.Unlock()
 		if !isNew {
-			return nil
+			return nil, nil
 		}
 		// An O_CREAT claim that never wrote stages as a zero-byte image
 		// (v1 createEmptyHandleRemote): its existence must land at the
 		// durability boundary, not only at Release.
 		if err := h.ensureBuffer(ctx); err != nil {
-			return err
+			return nil, err
 		}
 		h.mu.Lock()
 		if h.buf == nil {
 			h.mu.Unlock()
-			return nil
+			return nil, nil
 		}
+	}
+	if h.buf.Size() >= commitInlineStreamThreshold {
+		h.mu.Unlock()
+		return nil, errWriteCacheBypass
 	}
 	if err := h.buf.LoadMissingParts(); err != nil {
 		h.mu.Unlock()
-		return err
+		return nil, err
 	}
 	image := h.buf.Bytes()
-	stagedGen := h.wgen
+	snapshot := &writeCacheSnapshot{wgen: h.wgen}
 	baseRev := h.baseRev
 	mode, hasMode := h.pendingMode, h.hasPendingMode
 	h.mu.Unlock()
@@ -4997,7 +4699,7 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, isNew bool) err
 	// upload silently no-op — the git-ops clone's config.lock never
 	// landed).
 	if err := h.w.wbCache.PutWithBaseRevAndMode(h.path, image, int64(len(image)), kind, baseRev, mode, hasMode); err != nil {
-		return err
+		return nil, err
 	}
 	// v1 seeded the read cache with the staged image at the flush
 	// boundary: readers during the async landing serve these bytes instead
@@ -5005,8 +4707,8 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, isNew bool) err
 	if h.w.pendingSeeder != nil {
 		h.w.pendingSeeder(h.path, image)
 	}
-	h.retireDirty(stagedGen)
-	return nil
+	h.retireDirty(snapshot.wgen)
+	return snapshot, nil
 }
 
 // applyPendingMode publishes a deferred chmod once the image it describes
@@ -5051,4 +4753,94 @@ func (l *stripedLocks) lock(path string) func() {
 	l.mu.Unlock()
 	m.Lock()
 	return m.Unlock
+}
+
+// extentRoute reports whether a staged image of this size should bypass
+// the small-file writeback cache track and land through the commit queue,
+// where the extent branch promotes it to the extent plane.
+func (w *Writeback) extentRoute(path string, size int64) bool {
+	if w.queue == nil || w.opts.Staging == nil {
+		return false
+	}
+	if len(w.extentGlobs) > 0 {
+		// Pattern-owned layout: only matching paths promote, at or above
+		// the (possibly zero) matched-path cutoff.
+		if !matchExtentPattern(w.extentGlobs, path) {
+			return false
+		}
+		return size >= w.extentMatchCutoff
+	}
+	// Hybrid: promotion at the inline cutoff.
+	return w.opts.ExtentMinSize > 0 && size >= w.opts.ExtentMinSize
+}
+
+// matchExtentPattern reports whether path matches any compiled extent
+// glob. Globs match the whole path; a trailing /* covers subtrees.
+func matchExtentPattern(globs []globMatcher, path string) bool {
+	for _, g := range globs {
+		if g(path) {
+			return true
+		}
+	}
+	return false
+}
+
+// compileExtentGlobs compiles the profile's [extent] patterns with the
+// SAME filter the extent plane uses for its fresh-create claims
+// (pathfilter over canonicalized, root-relative paths), so the write
+// plane's promotion decision can never disagree with the plane's
+// create-time decision.
+type globMatcher func(path string) bool
+
+// hasSegmentPattern reports whether any raw pattern is a single-segment
+// (no '/') glob — those also match by basename at any depth.
+func hasSegmentPattern(patterns []string) bool {
+	for _, raw := range patterns {
+		raw = strings.TrimSpace(raw)
+		if raw != "" && !strings.Contains(raw, "/") {
+			return true
+		}
+	}
+	return false
+}
+
+func compileExtentGlobs(patterns []string) []globMatcher {
+	// An EMPTY pattern list must stay empty: the caller's hybrid routing
+	// (size-cutoff promotion) keys on len(globs) == 0, and a vacuous
+	// matcher here would disable default-mount promotion entirely.
+	if len(pathfilter.CompileAll(patterns)) == 0 && !hasSegmentPattern(patterns) {
+		return nil
+	}
+	compiled := pathfilter.CompileAll(patterns)
+	// A single-segment pattern (no '/') also matches by BASENAME at any
+	// depth: the profile's [extent] globs follow the suite's contract
+	// that "*.db" covers mix/a.db, while a pathfilter segment never
+	// crosses a separator.
+	var names []string
+	for _, raw := range patterns {
+		raw = strings.TrimSpace(raw)
+		if raw == "" || strings.Contains(raw, "/") {
+			continue
+		}
+		names = append(names, raw)
+	}
+	return []globMatcher{func(path string) bool {
+		cleaned, err := pathutil.Canonicalize(path)
+		if err != nil {
+			return false
+		}
+		cleaned = strings.TrimPrefix(cleaned, "/")
+		for _, p := range compiled {
+			if p.MatchCanonical(cleaned) {
+				return true
+			}
+		}
+		base := pathutil.BaseName(cleaned)
+		for _, n := range names {
+			if ok, _ := filepath.Match(n, base); ok {
+				return true
+			}
+		}
+		return false
+	}}
 }
