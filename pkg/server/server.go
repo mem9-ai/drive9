@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"crypto/subtle"
+	"crypto/tls"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -56,13 +58,23 @@ type Config struct {
 	LegacyStarterProvisioner tenant.Provisioner
 	TokenSecret              []byte
 	LocalTenantAPIKey        string
-	VaultMasterKey           []byte // 32-byte AES key for vault DEK wrapping; nil disables vault
-	VaultIssuerURL           string // canonical server URL placed in grant `iss` claim; empty = server hostname unknown, grants disabled
-	PublicURL                string // externally reachable base URL for client responses (e.g., slock callback server_url)
-	Backend                  *backend.Dat9Backend
-	LocalS3                  *s3client.LocalS3Client
-	S3Dir                    string
-	MaxUploadBytes           int64
+	// AllowAnonymousProvision accepts POST /v1/provision without a caller key
+	// pair, provisioning with the server's own default TiDB Cloud credential.
+	// It is off by default: an anonymous caller would otherwise spend the
+	// deployment's credential to create tenants. provider=local keeps its
+	// loopback-only anonymous mode.
+	AllowAnonymousProvision bool
+	VaultMasterKey          []byte // 32-byte AES key for vault DEK wrapping; nil disables vault
+	// VaultMasterKeyPrevious lists retired vault master keys. DEK unwrap tries
+	// them after the primary, so the master key can be rotated without losing
+	// stored secrets; new wraps always use VaultMasterKey.
+	VaultMasterKeyPrevious [][]byte
+	VaultIssuerURL         string // canonical server URL placed in grant `iss` claim; empty = server hostname unknown, grants disabled
+	PublicURL              string // externally reachable base URL for client responses (e.g., slock callback server_url)
+	Backend                *backend.Dat9Backend
+	LocalS3                *s3client.LocalS3Client
+	S3Dir                  string
+	MaxUploadBytes         int64
 	// TenantPoolMaxSize caps admin tenant pool create/update target size. Values
 	// <= 0 are normalized to DefaultTenantPoolMaxSize; the pool is never
 	// intentionally uncapped.
@@ -189,6 +201,9 @@ type Server struct {
 	pool                  *tenant.Pool
 	provisioner           tenant.Provisioner
 	defaultTenantProvider string
+	// allowAnonymousProvision is the resolved policy for POST /v1/provision
+	// with no caller credentials.
+	allowAnonymousProvision bool
 
 	legacyStarterProvisioner  tenant.Provisioner
 	tokenSecret               []byte
@@ -384,7 +399,7 @@ func NewWithConfig(cfg Config) *Server {
 	var vaultMK *vault.MasterKey
 	if len(cfg.VaultMasterKey) > 0 {
 		var err error
-		vaultMK, err = vault.NewMasterKey(cfg.VaultMasterKey)
+		vaultMK, err = vault.NewMasterKeyWithPrevious(cfg.VaultMasterKey, cfg.VaultMasterKeyPrevious)
 		if err != nil {
 			srvLog.Warn("vault master key invalid, vault disabled", zap.Error(err))
 		} else {
@@ -410,16 +425,17 @@ func NewWithConfig(cfg Config) *Server {
 	forkWorkerCtx, forkWorkerCancel := context.WithCancel(context.Background())
 	sweepCtx, sweepCancel := context.WithCancel(backgroundWithTrace(context.Background()))
 	s := &Server{
-		fallback:              cfg.Backend,
-		meta:                  cfg.Meta,
-		pool:                  cfg.Pool,
-		tokenSecret:           cfg.TokenSecret,
-		localTenantAPIKey:     strings.TrimSpace(cfg.LocalTenantAPIKey),
-		vaultMK:               vaultMK,
-		vaultIssuerURL:        strings.TrimSpace(cfg.VaultIssuerURL),
-		publicURL:             strings.TrimRight(strings.TrimSpace(cfg.PublicURL), "/"),
-		provisioner:           cfg.Provisioner,
-		defaultTenantProvider: defaultTenantProvider,
+		fallback:                cfg.Backend,
+		meta:                    cfg.Meta,
+		pool:                    cfg.Pool,
+		tokenSecret:             cfg.TokenSecret,
+		localTenantAPIKey:       strings.TrimSpace(cfg.LocalTenantAPIKey),
+		vaultMK:                 vaultMK,
+		vaultIssuerURL:          strings.TrimSpace(cfg.VaultIssuerURL),
+		publicURL:               strings.TrimRight(strings.TrimSpace(cfg.PublicURL), "/"),
+		provisioner:             cfg.Provisioner,
+		defaultTenantProvider:   defaultTenantProvider,
+		allowAnonymousProvision: cfg.AllowAnonymousProvision,
 
 		legacyStarterProvisioner:  cfg.LegacyStarterProvisioner,
 		maxUploadBytes:            maxUpload,
@@ -542,7 +558,6 @@ func NewWithConfig(cfg Config) *Server {
 	mux.HandleFunc("/v1/auth/slock/login", s.handleSlockLogin)
 	mux.HandleFunc("/v1/auth/slock/callback", s.handleSlockCallback)
 	mux.HandleFunc("/healthz", s.handleHealthz)
-	mux.HandleFunc("/metrics", s.handleMetrics)
 
 	local := cfg.LocalS3
 	if local == nil && cfg.Backend != nil {
@@ -1508,13 +1523,62 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.observe(s.mux, w, r)
 }
 
+const (
+	// envTLSCertFile and envTLSKeyFile make the API listener serve HTTPS
+	// directly. Without them the API is plaintext and TLS must be terminated in
+	// front of it.
+	envTLSCertFile = "DRIVE9_TLS_CERT_FILE"
+	envTLSKeyFile  = "DRIVE9_TLS_KEY_FILE"
+)
+
+// isLoopbackListenAddr reports whether addr only accepts loopback connections.
+func isLoopbackListenAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	host = strings.Trim(host, "[]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 func (s *Server) ListenAndServe(addr string) error {
 	logger.Info(backgroundWithTrace(context.Background()), "server_start", zap.String("addr", addr), zap.Int64("max_upload_bytes", s.maxUploadBytes))
-	httpSrv := &http.Server{Addr: addr, Handler: s}
+	httpSrv := &http.Server{
+		Addr:              addr,
+		Handler:           s,
+		ReadHeaderTimeout: 15 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    1 << 20,
+		TLSConfig:         &tls.Config{MinVersion: tls.VersionTLS12},
+	}
+	// The API carries bearer tokens, vault secrets and file bytes. Serve HTTPS
+	// directly when a certificate is configured; otherwise say plainly that the
+	// listener is plaintext so an operator cannot mistake an unencrypted
+	// deployment for an encrypted one.
+	tlsCertFile := strings.TrimSpace(os.Getenv(envTLSCertFile))
+	tlsKeyFile := strings.TrimSpace(os.Getenv(envTLSKeyFile))
+	if (tlsCertFile == "") != (tlsKeyFile == "") {
+		return fmt.Errorf("%s and %s must be set together", envTLSCertFile, envTLSKeyFile)
+	}
+	if tlsCertFile == "" && !isLoopbackListenAddr(addr) {
+		logger.Warn(backgroundWithTrace(context.Background()), "server_plaintext_listener",
+			zap.String("addr", addr),
+			zap.String("hint", "set "+envTLSCertFile+"/"+envTLSKeyFile+" to serve HTTPS, or terminate TLS at the ingress"))
+	}
 	s.httpSrvMu.Lock()
 	s.httpSrv = httpSrv
 	s.httpSrvMu.Unlock()
-	err := httpSrv.ListenAndServe()
+	var err error
+	if tlsCertFile != "" {
+		logger.Info(backgroundWithTrace(context.Background()), "server_tls_enabled", zap.String("addr", addr))
+		err = httpSrv.ListenAndServeTLS(tlsCertFile, tlsKeyFile)
+	} else {
+		err = httpSrv.ListenAndServe()
+	}
 	if errors.Is(err, http.ErrServerClosed) {
 		// Shutdown (SIGINT/SIGTERM) drained the server; not an error.
 		return nil
@@ -3527,6 +3591,9 @@ func (s *Server) handleCopy(w http.ResponseWriter, r *http.Request, dstPath stri
 	if !authorizeFSPair(w, r, FSOpRead, srcPath, FSOpWrite, dstPath) {
 		return
 	}
+	if !authorizeFSScopedAlias(w, r, srcPath) {
+		return
+	}
 	b := backendFromRequest(r)
 	if b == nil {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "copy_missing_scope", "dst_path", dstPath)...)
@@ -3563,6 +3630,9 @@ func (s *Server) handleHardlink(w http.ResponseWriter, r *http.Request, dstPath 
 		return
 	}
 	if !authorizeFSPair(w, r, FSOpRead, srcPath, FSOpWrite, dstPath) {
+		return
+	}
+	if !authorizeFSScopedAlias(w, r, srcPath) {
 		return
 	}
 	b := backendFromRequest(r)
@@ -4750,6 +4820,14 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 				errJSON(w, http.StatusBadRequest, "TiDBCloud Mode requires public_key and private_key when quota settings are provided")
 				return
 			}
+			if !s.allowAnonymousProvision {
+				// No caller key pair and anonymous provisioning is disabled: the
+				// request must not spend the server's own credential.
+				logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "provision_credentials_required", "provider", provider)...)
+				metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
+				errJSON(w, http.StatusUnauthorized, "TiDB Cloud public_key and private_key are required")
+				return
+			}
 			defaultReq := resolveDefaultCredentials(s.provisioner, provider)
 			if defaultReq == nil {
 				errJSON(w, http.StatusBadRequest, tenant.ErrCredentialsRequired.Error())
@@ -4795,10 +4873,21 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	} else {
+		// This provider has no per-caller credential model, so a presented key
+		// pair is meaningless and rejected first.
 		if err := rejectCredentialProvisionBody(r); err != nil {
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "provision_credential_rejected", "provider", provider, "error", err)...)
 			metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
 			errJSON(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		// provider=local is the loopback-only development provider and stays
+		// anonymous; every other provider requires the explicit
+		// DRIVE9_ALLOW_ANONYMOUS_PROVISION opt-in.
+		if !s.allowAnonymousProvision && provider != tenant.ProviderLocal {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "provision_credentials_required", "provider", provider)...)
+			metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
+			errJSON(w, http.StatusUnauthorized, "provisioning requires authentication")
 			return
 		}
 	}
@@ -5786,15 +5875,22 @@ func (s *Server) cleanupProvisionedClusterAfterProvisionFailure(ctx context.Cont
 	})
 }
 
+// dbTLSForProvisionedTenant records whether a provisioned tenant's connection
+// has its certificate verified. The DBTLS flag only distinguishes "verified
+// TLS" from "TLS without certificate verification", which is the explicit
+// DRIVE9_DB_TLS_SKIP_VERIFY opt-out; it never means "no TLS" for a non-local
+// provider (MySQLTLSParam enforces TLS for every non-loopback host). The
+// opt-out is recorded only for the provider whose endpoint it can apply to;
+// other providers keep DBTLS=true, and the DSN still uses skip-verify for a
+// non-loopback host when the operator set the variable.
 func dbTLSForProvisionedTenant(provider string) bool {
 	if provider == tenant.ProviderLocal {
 		return false
 	}
-	if !tenant.UsesTiDBCloudNativeCredentials(provider) {
-		return true
+	if tenant.UsesTiDBCloudNativeCredentials(provider) && tenant.DBTLSSkipVerifyRequested() {
+		return false
 	}
-	v := strings.TrimSpace(strings.ToLower(os.Getenv("DRIVE9_TIDBCLOUD_NATIVE_USE_PRIVATE_ENDPOINT")))
-	return v != "1" && v != "true" && v != "yes"
+	return true
 }
 
 func provisioningCloudRegion(provisioner tenant.Provisioner) (string, string) {

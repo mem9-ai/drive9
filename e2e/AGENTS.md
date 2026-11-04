@@ -21,6 +21,12 @@ code. Manual "run everything" is Local E2E `workflow_dispatch` with
 Use a hosted deployment by default. For local development on this machine, use
 `drive9-server` with `DRIVE9_TENANT_PROVIDER=local` instead.
 
+The Git suites build their fixture repository on the runner and clone it from a
+`file://` URL, which the server rejects by default (a tenant-supplied URL must
+be a network transport). A local run therefore needs
+`DRIVE9_GIT_ALLOW_LOCAL_REPOS=1` on the server; `scripts/e2e-local.sh` and
+`local-e2e.yml` already set it. Do not enable it on a shared deployment.
+
 ### Hosted endpoints
 
 #### Deployment endpoints

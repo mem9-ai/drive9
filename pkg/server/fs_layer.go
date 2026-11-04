@@ -21,9 +21,20 @@ import (
 	"github.com/mem9-ai/drive9/pkg/journal"
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/pathutil"
+	"github.com/mem9-ai/drive9/pkg/s3client"
 )
 
 const maxFSLayerBodyBytes = 1 << 20
+
+// A commit snapshots every base path it may overwrite so a failed apply can be
+// rolled back, and each snapshot can hold the file's bytes. The budget bounds
+// that buffer: without it the least-privileged token able to commit a layer can
+// make the server hold an unbounded amount of data in memory by touching many
+// large files (an OOM denial of service).
+const (
+	maxFSLayerCommitSnapshots     = 20000
+	maxFSLayerCommitSnapshotBytes = 256 << 20
+)
 const maxFSLayerEntryBodyBytes = 128 << 20
 const fsLayerRollbackTimeout = 60 * time.Second
 
@@ -520,6 +531,9 @@ func (s *Server) handleFSLayerObjectRead(w http.ResponseWriter, r *http.Request,
 			errJSON(w, http.StatusBadRequest, "fs layer object path is not a file upsert")
 			return
 		}
+		if !s.authorizeFSLayerStorageRefSource(w, r, store, entry) {
+			return
+		}
 		rc, err := b.OpenFSLayerEntryData(r.Context(), entry)
 		if err != nil {
 			logger.Error(r.Context(), "fs_layer_object_read_failed", eventFields(r.Context(), "fs_layer_object_read_failed", "path", entry.Path, "error", err)...)
@@ -699,6 +713,9 @@ func (s *Server) handleFSLayerEntryUpsert(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if !authorizeFSLayerEntryMutation(w, r, &entry) {
+		return
+	}
+	if !s.authorizeFSLayerStorageRefSource(w, r, store, &entry) {
 		return
 	}
 	if len(entry.ContentBlob) > 0 {
@@ -930,7 +947,23 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 		})
 		return
 	}
-	snapshots := snapshotFSLayerCommit(r.Context(), b, entries)
+	// Entries can predate the write-time source check (or arrive from a client
+	// that wrote them before a scope was narrowed), so re-authorize every
+	// object reference before it is aliased into main.
+	for i := range entries {
+		if !s.authorizeFSLayerStorageRefSource(w, r, store, &entries[i]) {
+			_ = store.SetFSLayerStateIf(r.Context(), layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
+			return
+		}
+	}
+	snapshots, err := snapshotFSLayerCommit(r.Context(), b, entries)
+	if err != nil {
+		_ = store.SetFSLayerStateIf(r.Context(), layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
+		logger.Error(r.Context(), "fs_layer_commit_snapshot_budget_exceeded", eventFields(r.Context(), "fs_layer_commit_snapshot_budget_exceeded", "layer_id", layer.LayerID, "error", err)...)
+		metricEvent(r.Context(), "fs_layer_commit", "result", "rejected")
+		errJSON(w, http.StatusRequestEntityTooLarge, err.Error())
+		return
+	}
 	if err := validateFSLayerCommitSnapshots(snapshots); err != nil {
 		_ = store.SetFSLayerStateIf(r.Context(), layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
 		logger.Error(r.Context(), "fs_layer_commit_validate_failed", eventFields(r.Context(), "fs_layer_commit_validate_failed", "layer_id", layer.LayerID, "error", err)...)
@@ -1038,6 +1071,9 @@ func normalizeAndValidateFSLayerServerEntry(layer *datastore.FSLayer, entry *dat
 		return fmt.Errorf("fs layer entry path is outside base root")
 	}
 	entry.Path = path
+	if err := validateFSLayerServerStorageRef(layer, entry); err != nil {
+		return err
+	}
 	if entry.Op == datastore.FSLayerEntryOpRename {
 		target := fsLayerRenameTarget(entry)
 		targetPath, err := canonicalFSLayerServerPath(target, "", string(entry.Kind))
@@ -1050,6 +1086,84 @@ func normalizeAndValidateFSLayerServerEntry(layer *datastore.FSLayer, entry *dat
 		entry.ContentText = targetPath
 	}
 	return nil
+}
+
+// validateFSLayerServerStorageRef rejects a client-supplied object reference
+// that the server could not have minted.
+//
+// A layer entry carries a storage_ref that the commit path later feeds
+// straight into the object store (ReadFSLayerEntryData → OpenObject). The
+// entry body is caller-controlled, so an unvalidated ref would let any caller
+// with write access to a layer read another tenant's object — or, on the local
+// backend, any file the server can open — and then publish it as a file's
+// content. The server mints exactly two shapes: "blobs/<fileID>" for uploads
+// and "layers/<layerID>/<random>" for layer payloads, so anything else is
+// rejected instead of being resolved.
+func validateFSLayerServerStorageRef(layer *datastore.FSLayer, entry *datastore.FSLayerEntry) error {
+	ref := strings.TrimSpace(entry.StorageRef)
+	if ref == "" {
+		return nil
+	}
+	storageType := strings.TrimSpace(entry.StorageType)
+	if storageType != "" && storageType != string(datastore.StorageS3) {
+		return fmt.Errorf("storage_ref is only valid for s3 entries")
+	}
+	entry.StorageType = string(datastore.StorageS3)
+	entry.StorageRef = ref
+	if err := s3client.ValidateObjectKey(ref); err != nil {
+		return fmt.Errorf("invalid fs layer storage_ref: %w", err)
+	}
+	if strings.HasPrefix(ref, "blobs/") {
+		return nil
+	}
+	if layer != nil && strings.HasPrefix(ref, "layers/"+layer.LayerID+"/") {
+		return nil
+	}
+	return fmt.Errorf("fs layer storage_ref is not a server-issued object reference")
+}
+
+// authorizeFSLayerStorageRefSource rejects a layer entry whose "blobs/<fileID>"
+// reference aliases a file the caller may not read.
+//
+// A blobs/ reference names a file entity, not a path, and the layer endpoints
+// authorize only the layer path they operate on: a scoped caller could take the
+// stable resource id of an out-of-scope file (stat exposes it), store it on an
+// allowed layer path, and read the bytes back through the layer object read —
+// which calls the object store directly. The reference is therefore resolved to
+// its dentry paths and the caller must be able to read at least one of them;
+// content reachable inside the scope is legitimately readable, and a reference
+// with no remaining dentry is refused rather than treated as absent.
+func (s *Server) authorizeFSLayerStorageRefSource(w http.ResponseWriter, r *http.Request, store *datastore.Store, entry *datastore.FSLayerEntry) bool {
+	if entry == nil || store == nil {
+		return true
+	}
+	scope := ScopeFromContext(r.Context())
+	if scope == nil || !scope.IsScoped {
+		return true
+	}
+	ref := strings.TrimSpace(entry.StorageRef)
+	if !strings.HasPrefix(ref, "blobs/") {
+		// layers/<layerID>/... is minted for, and only readable through, this
+		// layer, which the caller's layer access already covers.
+		return true
+	}
+	fileID := strings.TrimPrefix(ref, "blobs/")
+	paths, err := store.ListFileDentryPathsByFileID(r.Context(), fileID, 64)
+	if err != nil {
+		logger.Error(r.Context(), "fs_layer_storage_ref_lookup_failed", eventFields(r.Context(), "fs_layer_storage_ref_lookup_failed",
+			"layer_id", entry.LayerID, "file_id", fileID, "error", err)...)
+		errJSON(w, http.StatusInternalServerError, "failed to authorize fs layer storage reference")
+		return false
+	}
+	for _, p := range paths {
+		if scope.AuthorizeFS(FSOpRead, p) == nil {
+			return true
+		}
+	}
+	logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "fs_layer_storage_ref_out_of_scope",
+		"layer_id", entry.LayerID, "path", entry.Path, "file_id", fileID)...)
+	errJSON(w, http.StatusForbidden, "storage_ref is outside the token's read scope")
+	return false
 }
 
 func canonicalFSLayerServerPath(rawPath, op, kind string) (string, error) {
@@ -1100,14 +1214,18 @@ type fsLayerBaseSnapshot struct {
 	IsDir       bool
 	IsSymlink   bool
 	CleanupOnly bool
-	Target      string
-	Data        []byte
-	Mode        uint32
-	ModeIsSet   bool
-	SnapshotOK  bool
+	// TooLarge marks a base file whose size alone exceeds the remaining commit
+	// budget: its bytes are never read, so a single huge file cannot be pulled
+	// into memory before the budget is checked.
+	TooLarge   bool
+	Target     string
+	Data       []byte
+	Mode       uint32
+	ModeIsSet  bool
+	SnapshotOK bool
 }
 
-func snapshotFSLayerCommit(ctx context.Context, b *backendpkg.Dat9Backend, entries []datastore.FSLayerEntry) []fsLayerBaseSnapshot {
+func snapshotFSLayerCommit(ctx context.Context, b *backendpkg.Dat9Backend, entries []datastore.FSLayerEntry) ([]fsLayerBaseSnapshot, error) {
 	seen := make(map[string]struct{})
 	var paths []string
 	cleanupOnly := make(map[string]bool)
@@ -1167,12 +1285,35 @@ func snapshotFSLayerCommit(ctx context.Context, b *backendpkg.Dat9Backend, entri
 		}
 	}
 	out := make([]fsLayerBaseSnapshot, 0, len(paths))
+	var dataBytes int64
 	for _, p := range paths {
-		snap := snapshotFSLayerBasePath(ctx, b, p)
+		if err := checkFSLayerSnapshotBudget(len(out)+1, dataBytes); err != nil {
+			return nil, err
+		}
+		snap := snapshotFSLayerBasePath(ctx, b, p, maxFSLayerCommitSnapshotBytes-dataBytes)
+		if snap.TooLarge {
+			return nil, fmt.Errorf("fs layer commit snapshot at path %s exceeds the %d byte budget", p, int64(maxFSLayerCommitSnapshotBytes))
+		}
 		snap.CleanupOnly = cleanupOnly[p]
+		dataBytes += int64(len(snap.Data))
 		out = append(out, snap)
 	}
-	return out
+	if err := checkFSLayerSnapshotBudget(len(out), dataBytes); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// checkFSLayerSnapshotBudget fails a commit whose rollback buffer would exceed
+// the count or byte budget instead of letting the server hold it in memory.
+func checkFSLayerSnapshotBudget(pathCount int, dataBytes int64) error {
+	if pathCount > maxFSLayerCommitSnapshots {
+		return fmt.Errorf("fs layer commit touches %d base paths, limit is %d", pathCount, maxFSLayerCommitSnapshots)
+	}
+	if dataBytes > maxFSLayerCommitSnapshotBytes {
+		return fmt.Errorf("fs layer commit snapshot buffer %d bytes exceeds the %d byte budget", dataBytes, int64(maxFSLayerCommitSnapshotBytes))
+	}
+	return nil
 }
 
 func filterFSLayerSnapshotsForEntries(snapshots []fsLayerBaseSnapshot, entries []datastore.FSLayerEntry) []fsLayerBaseSnapshot {
@@ -1244,7 +1385,12 @@ func validateFSLayerCommitSnapshots(snapshots []fsLayerBaseSnapshot) error {
 	return nil
 }
 
-func snapshotFSLayerBasePath(ctx context.Context, b *backendpkg.Dat9Backend, path string) fsLayerBaseSnapshot {
+// snapshotFSLayerBasePath captures what a rollback would need to restore path.
+// dataBudget is the number of bytes still available in the commit's snapshot
+// budget; a file larger than that is reported through TooLarge without being
+// read, because the backend materializes a whole file before applying an offset
+// or length.
+func snapshotFSLayerBasePath(ctx context.Context, b *backendpkg.Dat9Backend, path string, dataBudget int64) fsLayerBaseSnapshot {
 	snap := fsLayerBaseSnapshot{Path: path, SnapshotOK: true}
 	nf, err := b.StatNodeCtx(ctx, path)
 	if errors.Is(err, datastore.ErrNotFound) {
@@ -1266,6 +1412,11 @@ func snapshotFSLayerBasePath(ctx context.Context, b *backendpkg.Dat9Backend, pat
 			snap.ModeIsSet = true
 		}
 		snap.IsSymlink = isFSLayerSymlinkMode(nf.File.Mode)
+		if !snap.IsSymlink && nf.File.SizeBytes > dataBudget {
+			snap.SnapshotOK = false
+			snap.TooLarge = true
+			return snap
+		}
 		data, err := b.ReadCtx(ctx, path, 0, -1)
 		if err != nil {
 			snap.SnapshotOK = false

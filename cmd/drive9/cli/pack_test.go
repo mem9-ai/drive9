@@ -363,54 +363,83 @@ func TestExtractPackArchiveDoesNotReplaceUntilArchiveValidated(t *testing.T) {
 	assertFileContent(t, filepath.Join(localRoot, "overlay", "repo", ".git", "config"), "old\n")
 }
 
-func TestExtractPackArchivePreservesPortableSymlinkTargets(t *testing.T) {
+// A symlink target is resolved relative to the link's own directory, so a
+// nested relative target inside the overlay is restored while an absolute or
+// climbing one is refused: the archive is tenant-writable input and a link to
+// /etc/passwd (or to the user's home) would be followed by later local tooling.
+func TestExtractPackArchiveSymlinkTargetConfinement(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("symlink semantics differ on Windows")
 	}
-	var buf bytes.Buffer
-	gz := gzip.NewWriter(&buf)
-	tw := tar.NewWriter(gz)
-	manifest := []byte(`{"format":"drive9.pack.v1","version":1,"paths":["/repo"],"entries":[{"path":"/repo/absolute","type":"symlink","linkname":"/opt/tool/bin/python"},{"path":"/repo/pkg-link","type":"symlink","linkname":"../store/pkg"}]}`)
-	if err := tw.WriteHeader(&tar.Header{Name: packManifestEntryName, Mode: 0o644, Size: int64(len(manifest))}); err != nil {
-		t.Fatalf("manifest header: %v", err)
-	}
-	if _, err := tw.Write(manifest); err != nil {
-		t.Fatalf("manifest write: %v", err)
-	}
-	if err := tw.WriteHeader(&tar.Header{Name: packArchiveEntryPrefix + "repo/absolute", Typeflag: tar.TypeSymlink, Linkname: "/opt/tool/bin/python", Mode: 0o777}); err != nil {
-		t.Fatalf("absolute symlink header: %v", err)
-	}
-	if err := tw.WriteHeader(&tar.Header{Name: packArchiveEntryPrefix + "repo/pkg-link", Typeflag: tar.TypeSymlink, Linkname: "../store/pkg", Mode: 0o777}); err != nil {
-		t.Fatalf("relative symlink header: %v", err)
-	}
-	if err := tw.Close(); err != nil {
-		t.Fatalf("tar close: %v", err)
-	}
-	if err := gz.Close(); err != nil {
-		t.Fatalf("gzip close: %v", err)
+	build := func(t *testing.T, links map[string]string) []byte {
+		t.Helper()
+		var buf bytes.Buffer
+		gz := gzip.NewWriter(&buf)
+		tw := tar.NewWriter(gz)
+		manifest := []byte(`{"format":"drive9.pack.v1","version":1,"paths":["/repo"]}`)
+		if err := tw.WriteHeader(&tar.Header{Name: packManifestEntryName, Mode: 0o644, Size: int64(len(manifest))}); err != nil {
+			t.Fatalf("manifest header: %v", err)
+		}
+		if _, err := tw.Write(manifest); err != nil {
+			t.Fatalf("manifest write: %v", err)
+		}
+		for name, target := range links {
+			if err := tw.WriteHeader(&tar.Header{Name: packArchiveEntryPrefix + name, Typeflag: tar.TypeSymlink, Linkname: target, Mode: 0o777}); err != nil {
+				t.Fatalf("symlink header %s: %v", name, err)
+			}
+		}
+		if err := tw.Close(); err != nil {
+			t.Fatalf("tar close: %v", err)
+		}
+		if err := gz.Close(); err != nil {
+			t.Fatalf("gzip close: %v", err)
+		}
+		return buf.Bytes()
 	}
 
-	localRoot := t.TempDir()
-	_, err := extractPackArchive(context.Background(), bytes.NewReader(buf.Bytes()), unpackOptions{
-		LocalRoot: localRoot,
-		Replace:   true,
-	})
-	if err != nil {
-		t.Fatalf("extractPackArchive: %v", err)
-	}
-	absolute, err := os.Readlink(filepath.Join(localRoot, "overlay", "repo", "absolute"))
-	if err != nil {
-		t.Fatalf("read absolute symlink: %v", err)
-	}
-	if absolute != "/opt/tool/bin/python" {
-		t.Fatalf("absolute symlink = %q, want /opt/tool/bin/python", absolute)
-	}
-	relative, err := os.Readlink(filepath.Join(localRoot, "overlay", "repo", "pkg-link"))
-	if err != nil {
-		t.Fatalf("read relative symlink: %v", err)
-	}
-	if relative != "../store/pkg" {
-		t.Fatalf("relative symlink = %q, want ../store/pkg", relative)
+	for _, tc := range []struct {
+		name   string
+		links  map[string]string
+		wantOK bool
+	}{
+		{name: "absolute target", links: map[string]string{"repo/absolute": "/opt/tool/bin/python"}},
+		{name: "parent escape", links: map[string]string{"repo/pkg-link": "../../../outside/pkg"}},
+		{name: "sibling escape", links: map[string]string{"repo/deep/pkg-link": "../../../../store/pkg"}},
+		{name: "safe nested relative", links: map[string]string{"repo/pkg-link": "../store/pkg"}, wantOK: true},
+		{name: "safe sibling relative", links: map[string]string{"repo/deep/pkg-link": "../store/pkg"}, wantOK: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			localRoot := t.TempDir()
+			_, err := extractPackArchive(context.Background(), bytes.NewReader(build(t, tc.links)), unpackOptions{
+				LocalRoot: localRoot,
+				Replace:   true,
+			})
+			if tc.wantOK {
+				if err != nil {
+					t.Fatalf("extractPackArchive: %v", err)
+				}
+				for name, want := range tc.links {
+					got, readErr := os.Readlink(filepath.Join(localRoot, "overlay", filepath.FromSlash(name)))
+					if readErr != nil {
+						t.Fatalf("readlink %s: %v", name, readErr)
+					}
+					if got != want {
+						t.Fatalf("symlink %s = %q, want %q", name, got, want)
+					}
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("extractPackArchive accepted an escaping symlink target")
+			}
+			if !strings.Contains(err.Error(), "pack symlink") {
+				t.Fatalf("error = %v, want a pack symlink confinement error", err)
+			}
+			// Nothing may be materialized outside the overlay by the failed unpack.
+			if _, statErr := os.Lstat(filepath.Join(localRoot, "outside")); statErr == nil {
+				t.Fatal("unpack created a path outside the overlay")
+			}
+		})
 	}
 }
 
@@ -1090,5 +1119,482 @@ func assertFileContent(t *testing.T, path string, want string) {
 	}
 	if string(got) != want {
 		t.Fatalf("ReadFile(%s) = %q, want %q", path, got, want)
+	}
+}
+
+// A link graph can compose into an escape even when every target is lexically
+// inside the overlay: "repo/s -> .." and "repo/a -> s/../outside" cleans to
+// overlay/repo/outside but resolves one level above the overlay once "s" is
+// followed. The staged graph is validated with the links materialized.
+func TestExtractPackArchiveRejectsComposedSymlinkEscape(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink semantics differ on Windows")
+	}
+	build := func(t *testing.T, forward bool) []byte {
+		t.Helper()
+		type entry struct{ name, target string }
+		entries := []entry{
+			{"repo/s", ".."},
+			{"repo/a", "s/../outside"},
+		}
+		if forward {
+			entries = []entry{
+				{"repo/a", "s/../outside"},
+				{"repo/s", ".."},
+			}
+		}
+		var buf bytes.Buffer
+		gz := gzip.NewWriter(&buf)
+		tw := tar.NewWriter(gz)
+		manifest := []byte(`{"format":"drive9.pack.v1","version":1,"paths":["/repo"]}`)
+		if err := tw.WriteHeader(&tar.Header{Name: packManifestEntryName, Mode: 0o644, Size: int64(len(manifest))}); err != nil {
+			t.Fatalf("manifest header: %v", err)
+		}
+		if _, err := tw.Write(manifest); err != nil {
+			t.Fatalf("manifest write: %v", err)
+		}
+		for _, e := range entries {
+			if err := tw.WriteHeader(&tar.Header{Name: packArchiveEntryPrefix + e.name, Typeflag: tar.TypeSymlink, Linkname: e.target, Mode: 0o777}); err != nil {
+				t.Fatalf("symlink header %s: %v", e.name, err)
+			}
+		}
+		if err := tw.Close(); err != nil {
+			t.Fatalf("tar close: %v", err)
+		}
+		if err := gz.Close(); err != nil {
+			t.Fatalf("gzip close: %v", err)
+		}
+		return buf.Bytes()
+	}
+
+	for _, forward := range []bool{false, true} {
+		name := "backward reference"
+		if forward {
+			name = "forward reference"
+		}
+		t.Run(name, func(t *testing.T) {
+			localRoot := t.TempDir()
+			_, err := extractPackArchive(context.Background(), bytes.NewReader(build(t, forward)), unpackOptions{
+				LocalRoot: localRoot,
+				Replace:   true,
+			})
+			if err == nil {
+				t.Fatal("extractPackArchive accepted a composed symlink escape")
+			}
+			if !strings.Contains(err.Error(), "resolves outside the local overlay root") {
+				t.Fatalf("error = %v, want a composed escape error", err)
+			}
+			// Nothing was installed.
+			if _, statErr := os.Lstat(filepath.Join(localRoot, "overlay", "repo")); statErr == nil {
+				t.Fatal("rejected archive was installed anyway")
+			}
+		})
+	}
+}
+
+// A composed chain that stays inside the overlay must still restore.
+func TestExtractPackArchiveAllowsComposedSymlinkInsideOverlay(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink semantics differ on Windows")
+	}
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	manifest := []byte(`{"format":"drive9.pack.v1","version":1,"paths":["/repo"]}`)
+	if err := tw.WriteHeader(&tar.Header{Name: packManifestEntryName, Mode: 0o644, Size: int64(len(manifest))}); err != nil {
+		t.Fatalf("manifest header: %v", err)
+	}
+	if _, err := tw.Write(manifest); err != nil {
+		t.Fatalf("manifest write: %v", err)
+	}
+	for _, e := range [][2]string{
+		{"repo/dir", "."},
+		{"repo/link", "dir/../dir"},
+	} {
+		if err := tw.WriteHeader(&tar.Header{Name: packArchiveEntryPrefix + e[0], Typeflag: tar.TypeSymlink, Linkname: e[1], Mode: 0o777}); err != nil {
+			t.Fatalf("symlink header %s: %v", e[0], err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("tar close: %v", err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+
+	localRoot := t.TempDir()
+	if _, err := extractPackArchive(context.Background(), bytes.NewReader(buf.Bytes()), unpackOptions{
+		LocalRoot: localRoot,
+		Replace:   true,
+	}); err != nil {
+		t.Fatalf("extractPackArchive: %v", err)
+	}
+	if got, err := os.Readlink(filepath.Join(localRoot, "overlay", "repo", "link")); err != nil || got != "dir/../dir" {
+		t.Fatalf("link = %q, %v", got, err)
+	}
+}
+
+// The staged tree cannot see links the destination already keeps, so an archive
+// whose only link composes with a retained one must be refused by validating the
+// overlay that remains after installation.
+func TestExtractPackArchiveRejectsEscapeViaRetainedLink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink semantics differ on Windows")
+	}
+	localRoot := t.TempDir()
+	// A safe link already present in the destination.
+	if err := os.MkdirAll(filepath.Join(localRoot, "overlay", "repo"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("..", filepath.Join(localRoot, "overlay", "repo", "s")); err != nil {
+		t.Fatalf("plant retained link: %v", err)
+	}
+
+	archive := buildPackTestArchive(t, `{"format":"drive9.pack.v1","version":1,"paths":["/repo/a"]}`,
+		packTestEntry{path: "repo/a", link: "s/../outside"})
+	_, err := extractPackArchive(context.Background(), bytes.NewReader(archive), unpackOptions{
+		LocalRoot: localRoot,
+		Replace:   true,
+	})
+	if err == nil {
+		t.Fatal("extractPackArchive accepted a link that escapes through a retained link")
+	}
+	if !strings.Contains(err.Error(), "resolves outside the local overlay root") {
+		t.Fatalf("error = %v, want a composed escape error", err)
+	}
+	if _, statErr := os.Lstat(filepath.Join(localRoot, "overlay", "repo", "a")); statErr == nil {
+		t.Fatal("the escaping link stayed live after the rejection")
+	}
+	if got, readErr := os.Readlink(filepath.Join(localRoot, "overlay", "repo", "s")); readErr != nil || got != ".." {
+		t.Fatalf("retained link changed: %q, %v", got, readErr)
+	}
+}
+
+// packTestEntry describes one archive member: a symlink when link is set, a
+// regular file otherwise.
+type packTestEntry struct {
+	path string
+	link string
+	body string
+}
+
+func buildPackTestArchive(t *testing.T, manifest string, entries ...packTestEntry) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	if err := tw.WriteHeader(&tar.Header{Name: packManifestEntryName, Mode: 0o644, Size: int64(len(manifest))}); err != nil {
+		t.Fatalf("manifest header: %v", err)
+	}
+	if _, err := tw.Write([]byte(manifest)); err != nil {
+		t.Fatalf("manifest write: %v", err)
+	}
+	for _, e := range entries {
+		hdr := &tar.Header{Name: packArchiveEntryPrefix + e.path, Mode: 0o644}
+		if e.link != "" {
+			hdr.Typeflag = tar.TypeSymlink
+			hdr.Linkname = e.link
+			hdr.Mode = 0o777
+		} else {
+			hdr.Typeflag = tar.TypeReg
+			hdr.Size = int64(len(e.body))
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatalf("archive header %s: %v", e.path, err)
+		}
+		if e.link == "" {
+			if _, err := tw.Write([]byte(e.body)); err != nil {
+				t.Fatalf("archive write %s: %v", e.path, err)
+			}
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("tar close: %v", err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// Validating only the links an archive carries misses a retained link that the
+// archive re-targets: replacing a directory with "s -> .." changes what a
+// pre-existing "a -> s/../outside" resolves to even though the archive never
+// names "a".
+func TestExtractPackArchiveRejectsEscapeFromRetargetedRetainedLink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink semantics differ on Windows")
+	}
+	localRoot := t.TempDir()
+	repoDir := filepath.Join(localRoot, "overlay", "repo")
+	if err := os.MkdirAll(filepath.Join(repoDir, "s"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Safe while "s" is a directory: s/../outside resolves inside overlay/repo.
+	if err := os.Symlink("s/../outside", filepath.Join(repoDir, "a")); err != nil {
+		t.Fatalf("plant retained link: %v", err)
+	}
+
+	archive := buildPackTestArchive(t, `{"format":"drive9.pack.v1","version":1,"paths":["/repo/s"]}`,
+		packTestEntry{path: "repo/s", link: ".."})
+	_, err := extractPackArchive(context.Background(), bytes.NewReader(archive), unpackOptions{
+		LocalRoot: localRoot,
+		Replace:   true,
+	})
+	if err == nil {
+		t.Fatal("extractPackArchive accepted an archive that re-targeted a retained link out of the overlay")
+	}
+	if !strings.Contains(err.Error(), "resolves outside the local overlay root") {
+		t.Fatalf("error = %v, want a resolution error for the retained link", err)
+	}
+	if _, statErr := os.Lstat(filepath.Join(repoDir, "a")); statErr == nil {
+		t.Fatal("the retained link the archive made unsafe stayed live")
+	}
+	if got, readErr := os.Readlink(filepath.Join(repoDir, "s")); readErr != nil || got != ".." {
+		t.Fatalf("installed link = %q, %v", got, readErr)
+	}
+}
+
+// Rejection must unwind every escaping link, not just the first one the walk
+// happens to reach: the others are already installed and would stay live.
+func TestExtractPackArchiveRemovesEveryEscapingLink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink semantics differ on Windows")
+	}
+	localRoot := t.TempDir()
+	repoDir := filepath.Join(localRoot, "overlay", "repo")
+	if err := os.MkdirAll(repoDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("..", filepath.Join(repoDir, "s")); err != nil {
+		t.Fatalf("plant retained link: %v", err)
+	}
+
+	archive := buildPackTestArchive(t, `{"format":"drive9.pack.v1","version":1,"paths":["/repo/a","/repo/b"]}`,
+		packTestEntry{path: "repo/a", link: "s/../outside-a"},
+		packTestEntry{path: "repo/b", link: "s/../outside-b"})
+	_, err := extractPackArchive(context.Background(), bytes.NewReader(archive), unpackOptions{
+		LocalRoot: localRoot,
+		Replace:   true,
+	})
+	if err == nil {
+		t.Fatal("extractPackArchive accepted two links that escape through a retained link")
+	}
+	if !strings.Contains(err.Error(), "2 symlink(s)") {
+		t.Fatalf("error = %v, want both offenders reported", err)
+	}
+	for _, name := range []string{"a", "b"} {
+		if _, statErr := os.Lstat(filepath.Join(repoDir, name)); statErr == nil {
+			t.Fatalf("escaping link %s stayed live after the rejection", name)
+		}
+	}
+	if got, readErr := os.Readlink(filepath.Join(repoDir, "s")); readErr != nil || got != ".." {
+		t.Fatalf("retained link changed: %q, %v", got, readErr)
+	}
+}
+
+// A failed installation has already written part of the archive, so the sweep
+// has to run on that path too instead of returning the install error straight
+// away.
+func TestExtractPackArchiveSweepsEscapesAfterInstallFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink semantics differ on Windows")
+	}
+	localRoot := t.TempDir()
+	repoDir := filepath.Join(localRoot, "overlay", "repo")
+	if err := os.MkdirAll(repoDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Retained link that makes the archive's link escape during installation.
+	if err := os.Symlink("..", filepath.Join(repoDir, "s")); err != nil {
+		t.Fatalf("plant retained link: %v", err)
+	}
+	// A symlinked parent makes the second merge fail after the first path is
+	// installed, which is exactly the window the sweep has to cover.
+	if err := os.Symlink(".", filepath.Join(repoDir, "out")); err != nil {
+		t.Fatalf("plant blocking link: %v", err)
+	}
+
+	archive := buildPackTestArchive(t, `{"format":"drive9.pack.v1","version":1,"paths":["/repo/a","/repo/out/x"]}`,
+		packTestEntry{path: "repo/a", link: "s/../outside"},
+		packTestEntry{path: "repo/out/x", body: "payload\n"})
+	_, err := extractPackArchive(context.Background(), bytes.NewReader(archive), unpackOptions{
+		LocalRoot: localRoot,
+	})
+	if err == nil {
+		t.Fatal("extractPackArchive accepted a link that escapes through a retained link")
+	}
+	if !strings.Contains(err.Error(), "resolves outside the local overlay root") {
+		t.Fatalf("error = %v, want the installed escape reported alongside the install failure", err)
+	}
+	if _, statErr := os.Lstat(filepath.Join(repoDir, "a")); statErr == nil {
+		t.Fatal("a link installed before the failure stayed live after the rejection")
+	}
+	if got, readErr := os.Readlink(filepath.Join(repoDir, "out")); readErr != nil || got != "." {
+		t.Fatalf("unrelated retained link changed: %q, %v", got, readErr)
+	}
+}
+
+// The audit is scoped to what the unpack writes. An unrelated link that already
+// pointed outside the overlay is local state this archive neither installs nor
+// changes, so a valid unpack must neither delete it nor fail because of it.
+func TestExtractPackArchiveLeavesUnrelatedRetainedLinksAlone(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink semantics differ on Windows")
+	}
+	for _, replace := range []bool{true, false} {
+		name := "replace"
+		if !replace {
+			name = "merge"
+		}
+		t.Run(name, func(t *testing.T) {
+			localRoot := t.TempDir()
+			overlay := filepath.Join(localRoot, "overlay")
+			if err := os.MkdirAll(filepath.Join(overlay, "other"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			unrelated := filepath.Join(overlay, "other", "cache")
+			if err := os.Symlink("/opt/shared-cache", unrelated); err != nil {
+				t.Fatalf("plant unrelated link: %v", err)
+			}
+
+			archive := buildPackTestArchive(t, `{"format":"drive9.pack.v1","version":1,"paths":["/repo/new.txt"]}`,
+				packTestEntry{path: "repo/new.txt", body: "hello\n"})
+			if _, err := extractPackArchive(context.Background(), bytes.NewReader(archive), unpackOptions{
+				LocalRoot: localRoot,
+				Replace:   replace,
+			}); err != nil {
+				t.Fatalf("a valid unpack must not fail over an unrelated local link: %v", err)
+			}
+			if got, err := os.Readlink(unrelated); err != nil || got != "/opt/shared-cache" {
+				t.Fatalf("unrelated retained link changed: %q, %v", got, err)
+			}
+			if body, err := os.ReadFile(filepath.Join(overlay, "repo", "new.txt")); err != nil || string(body) != "hello\n" {
+				t.Fatalf("installed file = %q, %v", body, err)
+			}
+		})
+	}
+}
+
+// A traversal error must not abort the audit: returning it would stop the walk
+// and leave an escape that was installed earlier in it live.
+func TestExtractPackArchiveAuditSurvivesUnreadableSubtree(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink semantics differ on Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores mode 000")
+	}
+	localRoot := t.TempDir()
+	overlay := filepath.Join(localRoot, "overlay")
+	if err := os.MkdirAll(filepath.Join(overlay, "z"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Retained link the archive's own link escapes through.
+	if err := os.Symlink("..", filepath.Join(overlay, "z", "s")); err != nil {
+		t.Fatalf("plant retained link: %v", err)
+	}
+	// Sorts before "z", so the walk hits it first.
+	private := filepath.Join(overlay, "a-private")
+	if err := os.MkdirAll(private, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(private, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(private, 0o755) })
+
+	archive := buildPackTestArchive(t, `{"format":"drive9.pack.v1","version":1,"paths":["/z/a"]}`,
+		packTestEntry{path: "z/a", link: "s/../outside"})
+	_, err := extractPackArchive(context.Background(), bytes.NewReader(archive), unpackOptions{
+		LocalRoot: localRoot,
+		Replace:   true,
+	})
+	if err == nil {
+		t.Fatal("extractPackArchive accepted a link that escapes through a retained link")
+	}
+	if !strings.Contains(err.Error(), "resolves outside the local overlay root") {
+		t.Fatalf("error = %v, want the installed escape reported alongside the scan error", err)
+	}
+	if _, statErr := os.Lstat(filepath.Join(overlay, "z", "a")); statErr == nil {
+		t.Fatal("the installed escape stayed live after the walk hit an unreadable directory")
+	}
+}
+
+// Selecting a directory does not make its untouched descendants the archive's
+// business: merging /repo into an existing directory must preserve a retained
+// child link the archive never names.
+func TestExtractPackArchivePreservesUntouchedDescendantOnDirectoryMerge(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink semantics differ on Windows")
+	}
+	localRoot := t.TempDir()
+	repoDir := filepath.Join(localRoot, "overlay", "repo")
+	if err := os.MkdirAll(repoDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	retained := filepath.Join(repoDir, "cache")
+	if err := os.Symlink("/opt/shared-cache", retained); err != nil {
+		t.Fatalf("plant retained link: %v", err)
+	}
+
+	archive := buildPackTestArchive(t, `{"format":"drive9.pack.v1","version":1,"paths":["/repo"]}`,
+		packTestEntry{path: "repo/new.txt", body: "hello\n"})
+	if _, err := extractPackArchive(context.Background(), bytes.NewReader(archive), unpackOptions{
+		LocalRoot: localRoot,
+	}); err != nil {
+		t.Fatalf("merging into a directory must not fail over an untouched child link: %v", err)
+	}
+	if got, err := os.Readlink(retained); err != nil || got != "/opt/shared-cache" {
+		t.Fatalf("untouched descendant link changed: %q, %v", got, err)
+	}
+	if body, err := os.ReadFile(filepath.Join(repoDir, "new.txt")); err != nil || string(body) != "hello\n" {
+		t.Fatalf("installed file = %q, %v", body, err)
+	}
+}
+
+// Scope matching must follow the destination filesystem's own name semantics:
+// on a case-insensitive filesystem the installed entry can be reached through a
+// spelling the archive never wrote, and a literal comparison would classify the
+// archive's own link as unrelated and leave it live.
+func TestPackPathWithinUsesFilesystemIdentity(t *testing.T) {
+	dir := t.TempDir()
+	realDir := filepath.Join(dir, "Repo")
+	if err := os.MkdirAll(realDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	installed := filepath.Join(realDir, "a")
+	if err := os.WriteFile(installed, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// An aliased ancestor is the portable stand-in for the case-insensitive
+	// lookup: same directory entry, different spelling.
+	aliasDir := filepath.Join(dir, "repo")
+	if err := os.Symlink(realDir, aliasDir); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	aliased := filepath.Join(aliasDir, "a")
+	if aliased == installed {
+		t.Fatal("test setup produced identical spellings")
+	}
+	if !packPathWithin(aliased, []string{installed}) {
+		t.Fatal("a differently spelled alias of an installed path was treated as unrelated")
+	}
+	if !packPathWithin(installed, []string{aliased}) {
+		t.Fatal("scope entry reached through an alias was not matched")
+	}
+
+	unrelated := filepath.Join(dir, "other")
+	if err := os.WriteFile(unrelated, []byte("y"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if packPathWithin(unrelated, []string{installed}) {
+		t.Fatal("distinct filesystem objects compared equal")
+	}
+	if packPathWithin(filepath.Join(realDir, "missing"), []string{installed}) {
+		t.Fatal("a path that does not exist matched an unrelated scope entry")
+	}
+	if !packPathUnder(filepath.Join(installed, "child"), installed) {
+		t.Fatal("descendant of a scope entry was not matched")
 	}
 }

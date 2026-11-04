@@ -213,8 +213,10 @@ func TestAdminTenantPoolCreateUsesPrivateEndpointDBTLS(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if rows[0].Tenant.DBTLS {
-		t.Fatalf("pool tenant DBTLS = true, want false for private endpoint")
+	// A private endpoint uses verified TLS now; DBTLS is only false for the
+	// explicit skip-verify opt-out.
+	if !rows[0].Tenant.DBTLS {
+		t.Fatalf("pool tenant DBTLS = false, want true (verified TLS)")
 	}
 	assertTenantUsesPrivateEndpointTLS(t, rows[0].Tenant)
 	assertSchemaInitUsesPrivateEndpointTLS(t, schemaInitRecorder.lastSchemaInitDSNSnapshot())
@@ -294,8 +296,8 @@ func TestTenantPoolMetadataResumeUsesPrivateEndpointDBTLS(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if got.DBTLS {
-		t.Fatalf("resumed pool tenant DBTLS = true, want false for private endpoint")
+	if !got.DBTLS {
+		t.Fatalf("resumed pool tenant DBTLS = false, want true (verified TLS)")
 	}
 	assertTenantUsesPrivateEndpointTLS(t, *got)
 	assertSchemaInitUsesPrivateEndpointTLS(t, schemaInitRecorder.lastSchemaInitDSNSnapshot())
@@ -948,20 +950,20 @@ func (p *adminTenantPoolSchemaInitRecorder) lastSchemaInitDSNSnapshot() string {
 func assertTenantUsesPrivateEndpointTLS(t *testing.T, got meta.Tenant) {
 	t.Helper()
 	dsn := tenantDSN("u.root", "pass", got.DBHost, got.DBPort, got.DBName, got.DBTLS, got.Provider)
-	if !strings.Contains(dsn, "tls=skip-verify") {
-		t.Fatalf("tenant DSN = %q, want tls=skip-verify", dsn)
+	if !strings.Contains(dsn, "tls=true") {
+		t.Fatalf("tenant DSN = %q, want verified tls=true", dsn)
 	}
-	if strings.Contains(dsn, "tls=true") {
-		t.Fatalf("tenant DSN = %q, should not use tls=true for private endpoint", dsn)
+	if strings.Contains(dsn, "tls=skip-verify") {
+		t.Fatalf("tenant DSN = %q, must not skip TLS verification by default", dsn)
 	}
 }
 
 func assertSchemaInitUsesPrivateEndpointTLS(t *testing.T, dsn string) {
 	t.Helper()
-	if !strings.Contains(dsn, "tls=skip-verify") {
-		t.Fatalf("schema init DSN = %q, want tls=skip-verify", dsn)
+	if !strings.Contains(dsn, "tls=true") {
+		t.Fatalf("schema init DSN = %q, want verified tls=true", dsn)
 	}
-	if strings.Contains(dsn, "tls=true") {
-		t.Fatalf("schema init DSN = %q, should not use tls=true for private endpoint", dsn)
+	if strings.Contains(dsn, "tls=skip-verify") {
+		t.Fatalf("schema init DSN = %q, must not skip TLS verification by default", dsn)
 	}
 }

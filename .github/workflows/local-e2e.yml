@@ -169,6 +169,10 @@ env:
   TIDB_VERSION: v8.5.5
   DRIVE9_BASE: http://127.0.0.1:9009
   DRIVE9_TENANT_PROVIDER: local
+  # The Git suites clone a fixture repository built on this runner, so the
+  # server must accept a local repository URL. Production keeps the remote-only
+  # default; this opt-in is what the local provider harness is for.
+  DRIVE9_GIT_ALLOW_LOCAL_REPOS: "1"
   DRIVE9_LOCAL_DSN: root@tcp(127.0.0.1:4000)/drive9_local?parseTime=true
   DRIVE9_META_DSN: root@tcp(127.0.0.1:4000)/drive9_local?parseTime=true
   DRIVE9_LOCAL_MYSQL_DSN: root@tcp(127.0.0.1:4000)/drive9_local?parseTime=true

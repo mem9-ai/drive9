@@ -158,6 +158,10 @@ type gitOverlayEntryResponse struct {
 	UpdatedAt      time.Time `json:"updated_at"`
 }
 
+// gitStateStorageTypeTarGzNoObjects is the only git-state storage type this
+// server produces: an inline tar.gz of the .git directory without objects.
+const gitStateStorageTypeTarGzNoObjects = "tar.gz-no-objects"
+
 func (s *Server) handleGitWorkspaces(w http.ResponseWriter, r *http.Request) {
 	b := backendFromRequest(r)
 	if b == nil {
@@ -205,6 +209,13 @@ func (s *Server) handleGitWorkspaceUpsert(w http.ResponseWriter, r *http.Request
 	repoURL := gitcache.SanitizeRepoURL(req.RepoURL)
 	if repoURL == "" {
 		errJSON(w, http.StatusBadRequest, "repo_url is required")
+		return
+	}
+	// The URL is cloned on the mount host, so it must stay a network fetch:
+	// git would otherwise execute an ext:: command or read a local repository
+	// (and then serve its contents back as the workspace).
+	if err := gitcache.ValidateRepoURL(repoURL); err != nil {
+		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if err := validateOptionalGitObjectID("base_commit", req.BaseCommit); err != nil {
@@ -750,6 +761,19 @@ func (s *Server) handleGitStateUpsert(w http.ResponseWriter, r *http.Request, st
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// The git-state object reference is echoed back to clients and consumed by
+	// restore paths, and this server never mints one: state is inline content.
+	// Accepting a caller-chosen reference would let a client point a restore at
+	// another tenant's object (or, on the local backend, a host file), so it is
+	// rejected rather than resolved.
+	if ref := strings.TrimSpace(req.StorageRef); ref != "" {
+		errJSON(w, http.StatusBadRequest, "storage_ref is not supported for git state")
+		return
+	}
+	if st := strings.TrimSpace(req.StorageType); st != "" && st != gitStateStorageTypeTarGzNoObjects {
+		errJSON(w, http.StatusBadRequest, "unsupported git state storage_type")
+		return
+	}
 	if err := store.UpsertGitState(r.Context(), datastore.GitState{
 		WorkspaceID:      workspaceID,
 		CheckpointCommit: strings.TrimSpace(req.CheckpointCommit),
@@ -802,6 +826,18 @@ func (s *Server) handleGitOverlayUpsert(w http.ResponseWriter, r *http.Request, 
 	case datastore.GitOverlayKindFile, datastore.GitOverlayKindDirectory, datastore.GitOverlayKindSymlink, datastore.GitOverlayKindSubmodule:
 	default:
 		errJSON(w, http.StatusBadRequest, "invalid overlay kind")
+		return
+	}
+	if ref := strings.TrimSpace(req.StorageRef); ref != "" {
+		errJSON(w, http.StatusBadRequest, "storage_ref is not supported for git overlay entries")
+		return
+	}
+	if st := strings.TrimSpace(req.StorageType); st != "" && st != string(datastore.StorageDB9) && st != "inline" {
+		errJSON(w, http.StatusBadRequest, "unsupported git overlay storage_type")
+		return
+	}
+	if err := validateOptionalGitObjectID("base_object_sha", req.BaseObjectSHA); err != nil {
+		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	entry := datastore.GitOverlayEntry{

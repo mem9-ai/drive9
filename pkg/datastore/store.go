@@ -3172,3 +3172,39 @@ func shouldLogStoreOpFailure(result string) bool {
 		return true
 	}
 }
+
+// ListFileDentryPathsByFileID returns the dentry paths that reference a file
+// entity.
+//
+// A file's bytes are reachable through every name that shares its file_id, so a
+// caller gating content by path has to consider all of them: an alias inside a
+// scope makes the content part of that scope.
+func (s *Store) ListFileDentryPathsByFileID(ctx context.Context, fileID string, limit int) (out []string, err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "list_file_dentry_paths_by_file_id", start, &err)
+
+	fileID = strings.TrimSpace(fileID)
+	if fileID == "" {
+		return nil, fmt.Errorf("file_id is required")
+	}
+	if limit <= 0 {
+		limit = 64
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT path FROM file_nodes WHERE `+s.scope.And(`file_id = ?`)+`
+		ORDER BY path ASC LIMIT ?`, s.scope.Args(fileID, limit)...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out, rows.Err()
+}
