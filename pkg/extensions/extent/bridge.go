@@ -132,6 +132,18 @@ type Bridge struct {
 	// block files are written and before the rename intent is resolved,
 	// letting a test interleave a whole rename into that window.
 	stagingPause func()
+	// manifestMu serializes every durable-manifest read-modify-write: the
+	// staging publish, the rename intent stage/settle, and the inode
+	// retarget. It is always the OUTERMOST lock (manifestMu -> b.mu), which
+	// is why RemapLocal collects its retargets under b.mu and applies them
+	// after releasing it. A write-then-reverify was tried first and rejected
+	// in review: an unconditional replacement cannot be detected by reading
+	// it back, since the read returns exactly the bytes it just wrote.
+	manifestMu sync.Mutex
+	// manifestPause, when set, runs once INSIDE the manifest lock after the
+	// disk record has been read and before it is replaced. Only the lock
+	// makes that window safe, so this is the hook that actually exercises it.
+	manifestPause func()
 	// stagingPausePublish runs once AFTER this run's manifest is on disk and
 	// BEFORE it merges the on-disk state back in, so a test can interleave a
 	// rename into exactly that window.

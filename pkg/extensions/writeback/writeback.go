@@ -4611,6 +4611,23 @@ func (h *bufferingHandle) commitLocked(ctx context.Context) error {
 	if err := h.finishStreaming(ctx); err != nil {
 		return err
 	}
+	// An image the extent rules would promote must reach the QUEUE at any
+	// durability policy — write-sync and close-sync included. Those paths
+	// previously fell straight through to the classic inline/multipart
+	// publication, so a promotion-sized fresh file never became extent on
+	// them. Staging there and waiting for the landing keeps the policy's
+	// synchronous contract while still routing through the extent branch.
+	if h.w.queue != nil && h.w.opts.Staging != nil && h.extentRoutesImage() {
+		if err := h.stageAndEnqueue(ctx); err != nil {
+			return err
+		}
+		if h.w.opts.Policy != PolicyWriteBack {
+			if !h.w.queue.WaitPathDeadline(h.path, uploadTimeout) {
+				return fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
+			}
+		}
+		return nil
+	}
 	if h.w.opts.Policy == PolicyWriteBack && h.w.queue != nil && h.w.opts.Staging != nil {
 		// Large images stage through the shadow spill path (bounded memory)
 		// and land asynchronously — v1 never materialized a large image for
@@ -4839,7 +4856,16 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context) (*writeCacheSna
 			return nil, nil
 		}
 	}
-	if h.buf.Size() >= commitInlineStreamThreshold {
+	// A promotion-sized EXTENT image must bypass the small-file write-cache
+	// track at whatever cutoff the extent rules name — not only at the fixed
+	// 10 MiB one. With a server inline threshold below 10 MiB (50 KiB by
+	// default) a 100 KiB image would otherwise ride the write cache and land
+	// as classic multipart, never reaching the extent queue. The extent
+	// decision is the more specific rule, so it wins in either direction.
+	size := h.buf.Size()
+	path := h.path
+	promoteToExtent := h.w.extentRouteAllowed(path, size)
+	if size >= commitInlineStreamThreshold || promoteToExtent {
 		h.mu.Unlock()
 		return nil, errWriteCacheBypass
 	}
@@ -4934,6 +4960,37 @@ func (l *stripedLocks) lock(path string) func() {
 	l.mu.Unlock()
 	m.Lock()
 	return m.Unlock
+}
+
+// extentRoutesImage reports whether THIS handle's current image is one the
+// extent rules would promote.
+func (h *bufferingHandle) extentRoutesImage() bool {
+	h.mu.Lock()
+	size := int64(0)
+	if h.buf != nil {
+		size = h.buf.Size()
+	}
+	path := h.path
+	h.mu.Unlock()
+	return h.w.extentRouteAllowed(path, size)
+}
+
+// extentRouteAllowed reports whether the extent rules would promote an image
+// of this size at this path, independent of whether the caller can route it.
+// Used by the write-cache bypass decision, which must not send a
+// promotion-sized image down the classic track just because it is below the
+// fixed 10 MiB inline-stream threshold.
+func (w *Writeback) extentRouteAllowed(path string, size int64) bool {
+	if !w.opts.ExtentTakeover || size <= 0 {
+		return false
+	}
+	if len(w.extentGlobs) > 0 {
+		if !matchExtentPattern(w.extentGlobs, path) {
+			return false
+		}
+		return size >= w.extentMatchCutoff
+	}
+	return w.opts.ExtentMinSize > 0 && size >= w.opts.ExtentMinSize
 }
 
 // matchExtentPattern reports whether path matches any compiled extent

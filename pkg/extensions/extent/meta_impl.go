@@ -30,24 +30,6 @@ import (
 // path.
 var maxPlanBlocksPerChunk = 1 << 15
 
-// stagedPublishRetries bounds the write/verify/merge loop that publishes a
-// staged record: enough for repeated rename interleavings, never unbounded.
-const stagedPublishRetries = 8
-
-// sameStagedRecord reports whether two manifests describe the same record
-// (the fields a publish sets; block payload names are stable).
-func sameStagedRecord(a, b stagedManifest) bool {
-	if a.Path != b.Path || len(a.NextPaths) != len(b.NextPaths) {
-		return false
-	}
-	for i := range a.NextPaths {
-		if a.NextPaths[i] != b.NextPaths[i] {
-			return false
-		}
-	}
-	return a.Ino == b.Ino && a.Size == b.Size
-}
-
 // maxStagedPlanPages caps the pages walked by the echo-less content proof
 // (one page per 64 MiB chunk). Exhausting it refuses the adoption: an image
 // too large to be compared end-to-end cannot be attributed by content.
@@ -1817,21 +1799,29 @@ func (b *Bridge) StagePendingLocal(ino meta.Ino) error {
 	// in no candidate. Candidates are a union — strictly more knowledge is
 	// never wrong — and the on-disk Path wins when it differs and the
 	// current mapping has not advanced past it.
-	// FIRST write: this run's record must exist on disk before anything can
-	// interact with it (a rename's intent scan has to see this generation).
-	if first, merr := json.Marshal(m); merr == nil {
-		if werr := writeFileSynced(filepath.Join(dir, "manifest.json"), first); werr != nil {
-			return werr
-		}
-	} else {
-		return merr
-	}
+	// Test-only interleave point: a rename may complete entirely inside this
+	// window. The publish then re-reads both the inode mapping and the disk
+	// record under the lock, so the rename is observed either way.
 	if pause := b.stagingPausePublish; pause != nil {
 		pause()
 	}
-	// Merge whatever is already durable (a rename may have settled it before
-	// this run resumed). The on-disk Path wins: it is the name a CONFIRMED
-	// rename produced, while this run's snapshot may predate that rename.
+	// Publish under the manifest lock: the whole read-merge-write is one
+	// critical section, so no rename writer can settle a newer record
+	// between our read and our replacement. (A write-then-reverify, tried
+	// earlier, cannot detect that: the read-back returns exactly the bytes
+	// the replacement just wrote.)
+	b.manifestMu.Lock()
+	// Re-read the in-memory mapping INSIDE the lock: a rename that completed
+	// while this run was staging may have moved the object after our earlier
+	// snapshot. Lock order is manifestMu -> b.mu, consistently.
+	if cur, ok := b.currentPath(ino); ok && cur != path {
+		m.Path = cur
+	}
+	if to := b.pendingRenameFor(path); to != "" {
+		m.addNextPath(to)
+	}
+	// A rename may have settled the record on disk before we got the lock;
+	// its candidates and its (confirmed) path are newer than our snapshot.
 	if prev, ok := readStagedManifest(filepath.Join(dir, "manifest.json")); ok {
 		for _, cand := range prev.candidatePaths() {
 			m.addNextPath(cand)
@@ -1840,59 +1830,19 @@ func (b *Bridge) StagePendingLocal(ino meta.Ino) error {
 			m.Path = prev.Path
 		}
 	}
-	// Write, then VERIFY that no concurrent writer slipped in between the
-	// read above and this write. A rename that settled a newer record in that
-	// window would have been overwritten; re-reading catches it and the loop
-	// merges again. (A lock would be simpler but the rename writers run under
-	// b.mu in RemapLocal, so a shared manifest mutex would invert the order
-	// and deadlock — verified the hard way.)
-	manifestPath := filepath.Join(dir, "manifest.json")
-	for attempt := 0; attempt < stagedPublishRetries; attempt++ {
-		raw, merr := json.Marshal(m)
-		if merr != nil {
-			return merr
-		}
-		// Snapshot what is on disk BEFORE writing: after the write we cannot
-		// tell our own bytes from a racer's.
-		before, hadBefore := readStagedManifest(manifestPath)
-		if err := writeFileSynced(manifestPath, raw); err != nil {
-			return err
-		}
-		after, ok := readStagedManifest(manifestPath)
-		if !ok {
-			break // unreadable now: our write is what landed as far as we know
-		}
-		// Our write is intact when the file decodes to exactly the record we
-		// emitted. Anything else means a racer replaced it after us, and that
-		// racer's knowledge must be merged in rather than lost.
-		if sameStagedRecord(after, m) {
-			// A racer may still have written BEFORE us and been clobbered by
-			// our write; merge anything the pre-write snapshot knew that we
-			// do not, and loop only if that changes our record.
-			if hadBefore {
-				merged := false
-				for _, cand := range before.candidatePaths() {
-					if m.addNextPath(cand) {
-						merged = true
-					}
-				}
-				if before.Path != m.Path {
-					m.Path = before.Path
-					merged = true
-				}
-				if merged {
-					continue
-				}
-			}
-			break
-		}
-		for _, cand := range after.candidatePaths() {
-			m.addNextPath(cand)
-		}
-		if after.Path != m.Path {
-			m.Path = after.Path
-		}
+	if pause := b.manifestPause; pause != nil {
+		pause()
 	}
+	raw, merr := json.Marshal(m)
+	if merr != nil {
+		b.manifestMu.Unlock()
+		return merr
+	}
+	if err := writeFileSynced(filepath.Join(dir, "manifest.json"), raw); err != nil {
+		b.manifestMu.Unlock()
+		return err
+	}
+	b.manifestMu.Unlock()
 	clean = false
 	// Supersede: pending is cumulative, so older generations of this file
 	// are redundant once this one is durable.
@@ -2170,6 +2120,9 @@ func (b *Bridge) StageRenameIntent(oldFull, newFull string) error {
 	}
 	b.pendingRenames[oldFull] = newFull
 	b.mu.Unlock()
+	// Serialize with the staging publish (lock order: manifestMu outermost).
+	b.manifestMu.Lock()
+	defer b.manifestMu.Unlock()
 	recs, err := b.scanStaged()
 	if err != nil {
 		b.ClearRenameIntent(oldFull, newFull)
@@ -2295,6 +2248,8 @@ func (b *Bridge) SettleRenameIntent(oldFull, newFull string) {
 	if b.cfg.StagingDir == "" || newFull == "" {
 		return
 	}
+	b.manifestMu.Lock()
+	defer b.manifestMu.Unlock()
 	recs, err := b.scanStaged()
 	if err != nil {
 		return
@@ -2345,6 +2300,26 @@ func (b *Bridge) ClearRenameIntentLocal(srcLocal, dstLocal string) {
 // SettleRenameIntentLocal is SettleRenameIntent for mount-local paths.
 func (b *Bridge) SettleRenameIntentLocal(srcLocal, dstLocal string) {
 	b.SettleRenameIntent(b.fullPath(srcLocal), b.fullPath(dstLocal))
+}
+
+// stagedRetarget is one deferred durable-manifest retarget: the inode whose
+// record must follow a rename, and its new pathname.
+type stagedRetarget struct {
+	ino  meta.Ino
+	path string
+}
+
+// applyStagedRetargets performs deferred retargets under the manifest lock.
+// Called AFTER b.mu is released, so the lock order stays manifestMu -> b.mu.
+func (b *Bridge) applyStagedRetargets(rs []stagedRetarget) {
+	if len(rs) == 0 || b.cfg.StagingDir == "" {
+		return
+	}
+	b.manifestMu.Lock()
+	defer b.manifestMu.Unlock()
+	for _, r := range rs {
+		b.retargetStagedGensLocked(r.ino, r.path)
+	}
 }
 
 // retargetStagedGensLocked rewrites the saved pathname of every staged
@@ -2955,8 +2930,17 @@ func (b *Bridge) RemapLocal(oldPath, newPath string) {
 	if oldFull == newFull {
 		return
 	}
+	// Durable retargets are collected HERE but applied after b.mu is
+	// released: the manifest lock is always outermost (see
+	// Bridge.manifestMu), and a staging publish takes it before reading any
+	// in-memory mapping. Taking them in the other order is what deadlocked
+	// the suite earlier.
+	var retargets []stagedRetarget
 	b.mu.Lock()
-	defer b.mu.Unlock()
+	defer func() {
+		b.mu.Unlock()
+		b.applyStagedRetargets(retargets)
+	}()
 	newIno := inoFor(newFull)
 	if rep, ok := b.replacements[oldFull]; ok {
 		// A registered owner (replacement incarnation, or a file renamed
@@ -2969,7 +2953,7 @@ func (b *Bridge) RemapLocal(oldPath, newPath string) {
 		b.moved[rep] = newFull
 		b.replacements[newFull] = rep
 		delete(b.replacements, oldFull)
-		b.retargetStagedGensLocked(rep, newFull)
+		retargets = append(retargets, stagedRetarget{ino: rep, path: newFull})
 	} else if ino := inoFor(oldFull); b.paths[ino] == oldFull {
 		b.paths[ino] = newFull
 		// Record the move so a recreated OLD pathname gets a synthetic key
@@ -2982,7 +2966,7 @@ func (b *Bridge) RemapLocal(oldPath, newPath string) {
 		// The durable barrier record must follow the inode: a crash before
 		// the next landing otherwise leaves the manifest naming a path that
 		// no longer holds the object, stranding acknowledged bytes.
-		b.retargetStagedGensLocked(ino, newFull)
+		retargets = append(retargets, stagedRetarget{ino: ino, path: newFull})
 		// The destination's hash key may still be HELD by a live descriptor
 		// that merely vacated this name, or is retained under a sentinel
 		// alias while the name is replaced (its descriptor keeps using that
@@ -3012,12 +2996,12 @@ func (b *Bridge) RemapLocal(oldPath, newPath string) {
 		case p == oldFull:
 			b.paths[i] = newFull
 			b.moved[i] = newFull
-			b.retargetStagedGensLocked(i, newFull)
+			retargets = append(retargets, stagedRetarget{ino: i, path: newFull})
 		case strings.HasPrefix(p, prefix):
 			np := newFull + p[len(oldFull):]
 			b.paths[i] = np
 			b.moved[i] = np
-			b.retargetStagedGensLocked(i, np)
+			retargets = append(retargets, stagedRetarget{ino: i, path: np})
 			if i == inoFor(p) {
 				if _, owned := b.replacements[p]; !owned {
 					b.replacements[np] = i
@@ -3301,8 +3285,20 @@ func (b *Bridge) MaterializeEmpty(ctx context.Context, ino meta.Ino) error {
 	if b.nameMaterialized(ctx, path) {
 		return b.bindMaterialized(ctx, ino, path)
 	}
-	if _, err := b.cfg.Client.CreateFileCtx(ctx, path); err != nil {
+	rev, createdID, err := b.cfg.Client.CreateFileCreatedCtx(ctx, path)
+	if err != nil {
 		return fmt.Errorf("materialize empty file %s: %w", path, err)
+	}
+	if createdID != "" {
+		// The server echoed the identity of the object IT created. Bind
+		// that — never a follow-up stat, which a concurrent replacement
+		// can turn into a stranger's identity.
+		b.setVerifyBase(ino, rev, createdID)
+		b.mu.Lock()
+		b.classicOwned[ino] = true
+		b.mu.Unlock()
+		b.clearStagedLocal(ino)
+		return nil
 	}
 	if err := b.bindMaterialized(ctx, ino, path); err != nil {
 		return err
@@ -3321,6 +3317,12 @@ func (b *Bridge) bindMaterialized(ctx context.Context, ino meta.Ino, path string
 	if b.publicationIdentity(ino) != "" {
 		return nil // already bound
 	}
+	// The name already exists, so this create cannot echo anything (it is an
+	// absence-CAS that will not run). Re-issuing one to obtain the echo would
+	// fail, so the identity is read from the occupant — with the unavoidable
+	// caveat that a replacement between the earlier create and this call is
+	// indistinguishable. A create that DID echo is bound at its own call site
+	// and never reaches here.
 	st, err := b.cfg.Client.StatCtx(ctx, path)
 	if err != nil {
 		return fmt.Errorf("materialize empty file %s: bind created object: %w", path, err)

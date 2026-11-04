@@ -815,28 +815,40 @@ func (c *Client) CreateFile(path string) (int64, error) {
 // CreateFileCtx creates an empty file with context support and returns the
 // committed file revision when the server reports it.
 func (c *Client) CreateFileCtx(ctx context.Context, path string) (int64, error) {
+	rev, _, err := c.CreateFileCreatedCtx(ctx, path)
+	return rev, err
+}
+
+// CreateFileCreatedCtx also reports the identity of the object the create
+// produced, when the server echoes one. That echo is the ONLY attributable
+// proof of ownership for an absence-CAS create: a follow-up stat is a
+// separate request and may describe a replacement that took the pathname in
+// between, so binding its answer would let this descriptor write into a
+// stranger's file. Servers that predate the echo leave it empty.
+func (c *Client) CreateFileCreatedCtx(ctx context.Context, path string) (int64, string, error) {
 	req, err := c.newFSRequest(ctx, http.MethodPost, path, "?create=1", nil)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	resp, err := c.do(req)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
-		return 0, readError(resp)
+		return 0, "", readError(resp)
 	}
 	var result struct {
-		Revision int64 `json:"revision"`
+		Revision   int64  `json:"revision"`
+		ResourceID string `json:"resource_id"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		if errors.Is(err, io.EOF) {
-			return 0, nil
+			return 0, "", nil
 		}
-		return 0, fmt.Errorf("decode create file response: %w", err)
+		return 0, "", fmt.Errorf("decode create file response: %w", err)
 	}
-	return result.Revision, nil
+	return result.Revision, result.ResourceID, nil
 }
 
 // Symlink creates a symbolic link at linkPath pointing to target.

@@ -60,6 +60,12 @@ type fakeV2 struct {
 	// bytes: the window between our upload landing and the classification
 	// Stat, where another client can replace the name.
 	afterComplete func(path string)
+	// createEcho makes the create response echo the created object's
+	// identity (as a server implementing the echo contract does).
+	createEcho bool
+	// afterCreate runs (under f.mu) right after a create landed: the window
+	// a replacement can occupy before any follow-up stat.
+	afterCreate func(path string)
 	// partialPlan makes the read plan for a path represent only the first
 	// N bytes of each block (a truncated tail), modeling an object whose
 	// content block is referenced over a shorter range.
@@ -125,7 +131,7 @@ func (f *fakeV2) applyPatchLocked() {
 
 func newFakeV2(t *testing.T) *fakeV2 {
 	t.Helper()
-	f := &fakeV2{extent: map[string]string{}, classic: map[string]string{}, dirs: map[string]bool{"/": true}, blocks: map[string][]byte{}, ids: map[string]string{}, statFail: map[string]bool{}, gateOnce: map[string]chan struct{}{}, gateHits: map[string]int{}, completeEcho: true, partialPlan: map[string]partialPlanShape{}}
+	f := &fakeV2{extent: map[string]string{}, classic: map[string]string{}, dirs: map[string]bool{"/": true}, blocks: map[string][]byte{}, ids: map[string]string{}, statFail: map[string]bool{}, gateOnce: map[string]chan struct{}{}, gateHits: map[string]int{}, completeEcho: true, partialPlan: map[string]partialPlanShape{}, createEcho: true}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/obj/", func(w http.ResponseWriter, r *http.Request) {
 		key := strings.TrimPrefix(r.URL.Path, "/obj/")
@@ -316,7 +322,18 @@ func newFakeV2(t *testing.T) *fakeV2 {
 				f.classic[path] = ""
 				f.nextID++
 				f.ids[path] = fmt.Sprintf("res-%d", f.nextID)
-				_ = json.NewEncoder(w).Encode(map[string]any{"revision": 1})
+				createdID := f.ids[path]
+				echo := f.createEcho
+				if hook := f.afterCreate; hook != nil {
+					hook(path)
+				}
+				f.mu.Unlock()
+				resp := map[string]any{"revision": 1}
+				if echo {
+					resp["resource_id"] = createdID
+				}
+				_ = json.NewEncoder(w).Encode(resp)
+				f.mu.Lock()
 				return
 			}
 			if _, isLink := r.URL.Query()["hardlink"]; isLink {
@@ -612,6 +629,14 @@ func (f *fakeV2) rev(path string) int64 {
 		return int64(f.completes) + 1 // any stable positive base works for CAS
 	}
 	return 3
+}
+
+// setAfterCreate installs a callback that runs under f.mu right after a
+// create landed.
+func (f *fakeV2) setAfterCreate(fn func(path string)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.afterCreate = fn
 }
 
 // setDir creates (on) or removes (off) a directory entry.
@@ -5600,11 +5625,13 @@ func (b *Bridge) hasPendingRenameForTest(path string) bool {
 	return ok
 }
 
-// Round-57: a rename that lands BETWEEN a staging run's path snapshot and
-// its manifest replacement must not be erased. The run's in-memory record
-// predates that rename, so publishing it blindly would drop the newer
-// destination — and after a crash the object's real name would appear in no
-// candidate. The publish therefore MERGES with the on-disk record first.
+// Round-59: a rename that completes BETWEEN the staging run's disk read and
+// its manifest replacement must not be lost. Only the manifest lock makes
+// that window safe — a write-then-reverify cannot, because the read-back
+// returns exactly the bytes the replacement just wrote.
+//
+// The rename is driven from a hook INSIDE the lock, i.e. exactly in the
+// window the lock has to protect.
 func TestRenameDuringStagePublishIsMerged(t *testing.T) {
 	f := newFakeV2(t)
 	f.setDir("/d", true)
@@ -5618,51 +5645,63 @@ func TestRenameDuringStagePublishIsMerged(t *testing.T) {
 	br.StageBlockForTest(sum, []byte("PEND"))
 	br.AddPendingForTest(ino, 0, 0, sum, 4, 8)
 
-	paused := make(chan struct{})
-	resumed := make(chan struct{})
-	// Pause AFTER this run wrote its own manifest and BEFORE it merges the
-	// on-disk state back in: exactly the window described.
-	br.stagingPausePublish = func() {
-		br.stagingPausePublish = nil
-		close(paused)
-		<-resumed
+	// The concurrent writer: a rename landing while the publish holds the
+	// lock. It writes a NEW destination into the record.
+	done := make(chan struct{})
+	br.manifestPause = func() {
+		br.manifestPause = nil
+		go func() {
+			defer close(done)
+			if err := br.StageRenameIntentLocal("/d/a.bin", "/d/b.bin"); err != nil {
+				t.Errorf("stage rename intent: %v", err)
+			}
+		}()
+		// Give the rename every chance to run: it MUST block on the lock.
+		time.Sleep(150 * time.Millisecond)
 	}
-	done := make(chan error, 1)
-	go func() { done <- br.StagePendingLocal(ino) }()
-	<-paused
-
-	// A FULL rename A->B lands now: intent, remote rename, settlement, and
-	// retirement of the in-memory registration. Only the DURABLE record
-	// remembers it, so the paused run cannot learn about it from memory —
-	// it must merge the on-disk state it is about to replace.
-	h := New(Options{Engine: eng, Threshold: 0})
-	_, rerr, _ := h.renameWithDurableIntent(context.Background(),
-		&fs.Op{Kind: fs.OpRename, Path: "/d/a.bin", Path2: "/d/b.bin"},
-		func(context.Context, *fs.Op) (fs.Result, error) {
-			f.mu.Lock()
-			f.move("/d/a.bin", "/d/b.bin")
-			f.mu.Unlock()
-			return fs.Result{}, nil
-		})
-	if rerr != nil {
-		t.Fatalf("rename: %v", rerr)
-	}
-	// Erase the in-memory mapping's knowledge of the move too: this is the
-	// worst case, where nothing but the manifest remembers /d/b.bin.
-	br.ForgetPathForTest("/d/a.bin")
-
-	close(resumed)
-	if err := <-done; err != nil {
+	if err := br.StagePendingLocal(ino); err != nil {
 		t.Fatalf("staging: %v", err)
 	}
+	<-done
+
 	rec := onlyStaged(t, br)
-	// The destination must NEVER be lost. Recording it as a candidate is
-	// what makes replay find the object; the saved Path only advances once a
-	// rename is CONFIRMED, which an intent alone does not do.
 	if !rec.hasCandidate("/d/b.bin") {
-		t.Fatalf("the publish discarded a rename that landed before it: candidates = %v", rec.m.candidatePaths())
+		t.Fatalf("the publish lost a rename that committed inside its lock window: candidates = %v", rec.m.candidatePaths())
 	}
 }
 
-// ForgetPathForTest drops the bridge's in-memory mappings for a path.
-func (b *Bridge) ForgetPathForTest(local string) { b.ForgetPath(local) }
+// Round-59: when the server echoes the created object's identity, the
+// binding MUST use it — never a follow-up Stat, whose answer a concurrent
+// replacement can turn into a stranger's identity.
+func TestCreateEchoBindsWithoutStat(t *testing.T) {
+	f := newFakeV2(t)
+	f.setDir("/d", true)
+	h := newTestHandler(t, f, 0)
+	// A replacement lands between the create and any Stat the client might
+	// have issued. With the echo, that replacement must never be adopted.
+	f.setAfterCreate(func(path string) {
+		if path != "/d/e.bin" {
+			return
+		}
+		f.nextID++
+		f.ids[path] = fmt.Sprintf("res-%d", f.nextID) // a different object
+	})
+	eng := h.opts.Engine
+	res, _, _ := dispatchCreate(context.Background(), h, "/d/e.bin", syscall.O_RDWR|syscall.O_CREAT)
+	eh := res.Handle.(*engineHandle)
+	if err := eh.Sync(context.Background()); err != nil {
+		t.Fatalf("fsync: %v", err)
+	}
+	// The bound identity must be the one the CREATE echoed, not the
+	// replacement's.
+	bound := eng.Bridge.publicationIdentity(eh.ino)
+	if bound == "" {
+		t.Fatal("no identity bound after an echoing create")
+	}
+	f.mu.Lock()
+	after := f.ids["/d/e.bin"]
+	f.mu.Unlock()
+	if bound == after {
+		t.Fatalf("bound the replacement's identity %q instead of the created object", after)
+	}
+}
