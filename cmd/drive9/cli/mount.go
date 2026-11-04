@@ -186,8 +186,7 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 	readCacheMaxFile := fs.Int64("read-cache-max-file-mb", 4, "maximum single file size admitted to read cache in MB; files at or below this size are fetched with a single whole-file request")
 	readCacheTTL := fs.Duration("read-cache-ttl", 30*time.Second, "read cache TTL; 0 disables time-based expiry")
 	diskReadCacheSize := fs.Int64("disk-read-cache-size-mb", 1024, "disk-backed read cache size in MB")
-	extentCacheSizeMB := fs.Int64("extent-cache-size-mb", 0, "extent plane disk cache size in MB (read cache + writeback staging); 0 splits --disk-read-cache-size-mb in half")
-	extentWriteCacheSizeMB := fs.Int64("extent-write-cache-size-mb", 0, "extent plane writeback staging budget in MB (bounds in-flight staging blocks); 0 uses the engine default")
+	extentCacheSizeMB := fs.Int64("extent-cache-size-mb", 1024, "extent plane disk cache size in MB (read cache and writeback staging share this budget)")
 	diskReadCacheFreeRatio := fs.Float64("disk-read-cache-free-ratio", 0.10, "minimum filesystem free-space ratio before disk read cache evicts")
 	dirTTL := fs.Duration("dir-ttl", 10*time.Second, "directory cache TTL")
 	attrTTL := fs.Duration("attr-ttl", 10*time.Second, "kernel attr cache TTL (default 60s; coding-agent 30s; interactive 1s)")
@@ -883,7 +882,6 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 		ReadCacheTTL:                 normalizedReadCacheTTL,
 		DiskReadCacheSize:            *diskReadCacheSize << 20,
 		ExtentCacheSize:              *extentCacheSizeMB << 20,
-		ExtentWriteCacheSize:         *extentWriteCacheSizeMB << 20,
 		DiskReadCacheFreeRatio:       *diskReadCacheFreeRatio,
 		DirTTL:                       normalizedDirTTL,
 		AttrTTL:                      normalizedAttrTTL,

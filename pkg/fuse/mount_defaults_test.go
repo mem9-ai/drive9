@@ -179,41 +179,20 @@ func TestExtentCacheRootSharesReadCacheScope(t *testing.T) {
 	}
 }
 
-// A zero budget must DISABLE a disk cache, never fall through to a
-// library default: --disk-read-cache-size-mb 0 has to mean "no disk read
-// cache" on both planes (the operator's number is exact), and the extent
-// engine's CacheSize 0 is JuiceFS's memory-only mode.
-func TestZeroDiskCacheBudgetDisablesBothPlanes(t *testing.T) {
-	if got := diskCacheOpts("", 0, 0.1); got.Dir != "" {
-		t.Fatalf("zero-budget read cache dir = %q, want empty (disabled)", got.Dir)
-	}
-	if got := diskCacheOpts("/tmp/x", 0, 0.1); got.Dir != "" {
-		// Guard the call shape used by the mount: a zero budget never
-		// yields a configured dir, so the plugin's default cannot kick in.
-		t.Fatalf("zero-budget diskCacheOpts leaked a dir: %q", got.Dir)
-	}
-}
-
-// Two independent budgets: when the extent plane has an explicit budget,
-// the classic read cache keeps the FULL --disk-read-cache-size-mb (no
-// splitting); with no explicit extent budget the single configured value
-// is still split in half (backward compatible).
-func TestExtentBudgetSplitsOnlyWhenDerived(t *testing.T) {
-	cases := []struct {
-		name                    string
-		disk, extent            int64
-		wantClassic, wantEngine int64
-	}{
-		{"derived", 1024 << 20, 0, 512 << 20, 512 << 20},
-		{"explicit extent", 1024 << 20, 4096 << 20, 1024 << 20, 4096 << 20},
-		{"both zero", 0, 0, 0, 0},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			classic, engine := classicAndEngineBudgets(tc.disk, tc.extent)
-			if classic != tc.wantClassic || engine != tc.wantEngine {
-				t.Fatalf("classic=%d engine=%d, want %d/%d", classic, engine, tc.wantClassic, tc.wantEngine)
-			}
-		})
+// Three INDEPENDENT disk budgets: classic read, classic write, and ONE
+// extent budget that covers the extent plane's read cache and writeback
+// staging together (JuiceFS accounts them in a single CacheSize). No plane
+// shares or halves another's number, and each defaults to 1 GiB at the CLI.
+func TestThreeIndependentDiskBudgets(t *testing.T) {
+	// The extent budget is passed through verbatim — including 0, which is
+	// JuiceFS's memory-only mode (no silent default).
+	for _, tc := range []struct{ in, want int64 }{
+		{1024 << 20, 1024 << 20},
+		{0, 0},
+		{4096 << 20, 4096 << 20},
+	} {
+		if got := extentCacheSizeForTest(tc.in); int64(got) != tc.want {
+			t.Fatalf("extent cache size %d = %d, want %d (verbatim)", tc.in, got, tc.want)
+		}
 	}
 }

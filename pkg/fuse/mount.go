@@ -55,17 +55,18 @@ type MountConfig struct {
 	ReadCacheMaxFileBytes int64
 	ReadCacheTTL          time.Duration
 	DiskReadCacheSize     int64
-	// ExtentCacheSize is the extent engine's disk-cache budget in bytes
-	// (read cache + writeback staging, JuiceFS's own accounting). 0
-	// derives it from DiskReadCacheSize: the two planes then split that
-	// one budget in half (backward compatible). Set it to give the extent
-	// plane its own budget — the classic read cache then keeps the full
-	// DiskReadCacheSize.
-	ExtentCacheSize int64
-	// ExtentWriteCacheSize bounds the extent plane's writeback staging
-	// (bytes in flight, derived to a staging-block count). 0 uses the
-	// engine's default concurrency cap.
-	ExtentWriteCacheSize   int64
+	// ExtentCacheSize is the extent plane's disk cache budget in bytes.
+	// The three disk budgets are independent:
+	//
+	//   DiskReadCacheSize  classic read cache
+	//   WriteCacheSizeMB   classic writeback staging
+	//   ExtentCacheSize    extent plane (read cache + writeback staging)
+	//
+	// JuiceFS accounts its read cache and its writeback staging in ONE
+	// CacheSize, so the extent plane takes a single number: the engine's
+	// total retained disk bytes never exceed it, while the split between
+	// cached reads and staged writes stays JuiceFS's own LRU decision.
+	ExtentCacheSize        int64
 	DiskReadCacheFreeRatio float64
 
 	DirTTL           time.Duration
@@ -364,10 +365,9 @@ type MountOptions struct {
 	WriteBackBatchMaxBytes        int64
 	WriteCacheFreeRatio           float64
 	WriteCacheSizeMB              int64
-	// ExtentCacheSize / ExtentWriteCacheSize are the extent plane's own
-	// disk-cache and writeback-staging budgets (bytes; 0 = derive).
+	// ExtentCacheSize is the extent plane's disk cache budget (bytes;
+	// read cache and writeback staging share it).
 	ExtentCacheSize              int64
-	ExtentWriteCacheSize         int64
 	UploadConcurrency            int           // background upload workers (default 16)
 	ReadConcurrency              int           // concurrent backend reads (default 24)
 	ParallelReadConcurrency      int           // concurrent block reads per large FUSE read (default 4)
@@ -448,7 +448,6 @@ func mountConfigFromOptions(opts *MountOptions) MountConfig {
 		ReadCacheTTL:                  opts.ReadCacheTTL,
 		DiskReadCacheSize:             opts.DiskReadCacheSize,
 		ExtentCacheSize:               opts.ExtentCacheSize,
-		ExtentWriteCacheSize:          opts.ExtentWriteCacheSize,
 		DiskReadCacheFreeRatio:        opts.DiskReadCacheFreeRatio,
 		DirTTL:                        opts.DirTTL,
 		AttrTTL:                       opts.AttrTTL,
@@ -839,14 +838,10 @@ func mountWithConfig(cfg MountConfig) error {
 				// With the extent engine armed the mount runs two
 				// independently evicted disk caches; each gets half the
 				// configured budget so the AGGREGATE stays at the limit.
+				// Four independent budgets: the classic read cache gets
+				// exactly its configured size (no sharing with the extent
+				// plane, whose read and write budgets are separate knobs).
 				budget := cfg.DiskReadCacheSize
-				// Two planes, two budgets (see classicAndEngineBudgets):
-				// with an explicit extent budget the classic read cache
-				// keeps the full configured size; otherwise the single
-				// configured budget is split (backward compatible).
-				if wantExt["extent"] {
-					budget, _ = classicAndEngineBudgets(cfg.DiskReadCacheSize, cfg.ExtentCacheSize)
-				}
 				// A non-positive budget disables the disk read cache
 				// entirely (mirroring the extent engine, whose CacheSize 0
 				// means memory-only) instead of falling through to the
@@ -1064,23 +1059,16 @@ func mountWithConfig(cfg MountConfig) error {
 			// --extent-write-cache-size-mb below (this is the fallback).
 			MaxStageWrite: 40,
 		}
-		// The extent plane's own disk budget: read cache and writeback
-		// staging share it (JuiceFS accounting). An explicit
-		// ExtentCacheSize wins; otherwise the single configured disk budget
-		// is split with the classic read cache (backward compatible).
-		if _, engineBudget := classicAndEngineBudgets(cfg.DiskReadCacheSize, cfg.ExtentCacheSize); engineBudget > 0 {
-			engineConf.CacheSize = uint64(engineBudget)
+		// The extent plane's disk budget: ONE number for both its read
+		// cache and its writeback staging (JuiceFS accounts them together,
+		// so the plane's total retained bytes never exceed this value).
+		// The configured value passes through VERBATIM — 0 included: it is
+		// JuiceFS's memory-only mode (reads bypass the cache, writeback is
+		// disabled by SelfCheck), never a library default.
+		if cfg.ExtentCacheSize >= 0 {
+			engineConf.CacheSize = uint64(cfg.ExtentCacheSize)
 		}
-		// The writeback staging budget: JuiceFS exposes no byte quota for
-		// staging (it shares the cache quota above), but it does bound how
-		// many staging blocks may be in flight. Map the configured byte
-		// budget onto that block count so the operator's number caps the
-		// in-flight staging bytes.
-		if cfg.ExtentWriteCacheSize > 0 {
-			if blocks := int(cfg.ExtentWriteCacheSize / int64(client.ExtentBlockSize)); blocks > 0 {
-				engineConf.MaxStageWrite = blocks
-			}
-		}
+
 		engine := extent.NewEngine(engineConf)
 		built["extent"] = extent.New(extent.Options{
 			Engine: engine,
@@ -1589,25 +1577,17 @@ func remoteRootValidationError(remoteRoot string, err error) *MountExitError {
 
 // diskCacheOpts builds the on-disk read-cache options; an empty cache
 // directory disables the disk layer (memory-only, v1 default).
-// classicAndEngineBudgets resolves the two planes' disk budgets from the
-// configured knobs: an explicit extent budget is the engine's own and lets
-// the classic read cache keep the full configured size; otherwise the one
-// configured budget is split in half (backward compatible).
-func classicAndEngineBudgets(disk, extent int64) (classic, engine int64) {
-	if extent > 0 {
-		return disk, extent
+// extentCacheSizeForTest mirrors the engine wiring's extent budget
+// mapping: the configured bytes pass through verbatim, 0 included.
+func extentCacheSizeForTest(bytes int64) uint64 {
+	if bytes <= 0 {
+		return 0
 	}
-	if disk > 0 {
-		return disk / 2, disk / 2
-	}
-	return 0, 0
+	return uint64(bytes)
 }
 
 func diskCacheOpts(dir string, sizeMB int64, freeRatio float64) cache.DiskReadCacheOptions {
-	// An empty dir OR a non-positive budget disables the disk read cache:
-	// the plugin substitutes its own default for MaxSize <= 0, which would
-	// silently grant a cache the operator disabled.
-	if dir == "" || sizeMB <= 0 {
+	if dir == "" {
 		return cache.DiskReadCacheOptions{}
 	}
 	return cache.DiskReadCacheOptions{

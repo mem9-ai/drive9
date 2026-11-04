@@ -38,7 +38,6 @@ type mountFuseOptions struct {
 	ReadCacheTTL                 time.Duration
 	DiskReadCacheSize            int64
 	ExtentCacheSize              int64
-	ExtentWriteCacheSize         int64
 	DiskReadCacheFreeRatio       float64
 	DirTTL                       time.Duration
 	AttrTTL                      time.Duration
