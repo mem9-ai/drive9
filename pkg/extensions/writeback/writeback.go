@@ -2139,8 +2139,11 @@ func (h *bufferingHandle) Sync(ctx context.Context) error {
 	// is staged+enqueued — wait for THIS path to land, not the whole queue
 	// (a foreign path's slow upload must not hold this fsync hostage).
 	if h.w.queue != nil {
-		if !h.w.queue.WaitPathDeadline(h.path, uploadTimeout) {
-			return fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
+		if err := h.w.queue.WaitPathOutcome(h.path, uploadTimeout); err != nil {
+			// Idle is not success: a terminally failed queued upload must
+			// surface at the fsync barrier, or this mount acknowledges
+			// durability for bytes that never landed.
+			return fs.StatusErrorOf(gofuse.Status(syscall.EIO))
 		}
 	}
 	// A staged .dat/.meta snapshot is only locally durable; strict fsync
@@ -2195,8 +2198,8 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 			if err := h.stageAndEnqueueOpt(ctx, true, false, false); err != nil {
 				return err
 			}
-			if !h.w.queue.WaitPathDeadline(h.path, uploadTimeout) {
-				return fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
+			if err := h.w.queue.WaitPathOutcome(h.path, uploadTimeout); err != nil {
+				return fs.StatusErrorOf(gofuse.Status(syscall.EIO))
 			}
 			return nil
 		}
@@ -2220,8 +2223,8 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 					if err := h.stageAndEnqueueOpt(ctx, true, false, false); err != nil {
 						return err
 					}
-					if !h.w.queue.WaitPathDeadline(h.path, uploadTimeout) {
-						return fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
+					if err := h.w.queue.WaitPathOutcome(h.path, uploadTimeout); err != nil {
+						return fs.StatusErrorOf(gofuse.Status(syscall.EIO))
 					}
 					return nil
 				}
@@ -4622,8 +4625,11 @@ func (h *bufferingHandle) commitLocked(ctx context.Context) error {
 			return err
 		}
 		if h.w.opts.Policy != PolicyWriteBack {
-			if !h.w.queue.WaitPathDeadline(h.path, uploadTimeout) {
-				return fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
+			// The synchronous policies promise remote durability here, so a
+			// terminally failed upload must be reported rather than read as
+			// idle.
+			if err := h.w.queue.WaitPathOutcome(h.path, uploadTimeout); err != nil {
+				return fs.StatusErrorOf(gofuse.Status(syscall.EIO))
 			}
 		}
 		return nil
