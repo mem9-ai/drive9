@@ -1471,9 +1471,18 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		//     the new name — the unlanded data it describes now lives there;
 		//   - otherwise the replaced TARGET's marker describes a name that
 		//     no longer exists and is retired.
-		// In-memory records are cleared only after those transitions.
+		// In-memory records are cleared only after those transitions, and
+		// only when they succeeded: a rename whose unlanded image could not
+		// be re-paired with the new name must answer EIO rather than let a
+		// later fsync certify bytes that are still only under the old name.
+		if terr := w.retargetConflictMarkers(op.Path, op.Path2, srcPendingGen, srcConflict, dstPendingGen, dstConflict); terr != nil {
+			// The remote rename already succeeded; the local staging
+			// transition did not. The handles still point at the source
+			// object, whose preserved image never landed — keep it that
+			// way and report the failure.
+			return fs.Result{}, fs.StatusErrorOf(gofuse.Status(syscall.EIO))
+		}
 		if w.queue != nil {
-			w.retargetConflictMarkers(op.Path, op.Path2, srcPendingGen, srcConflict, dstPendingGen, dstConflict)
 			w.queue.clearTerminalFailure(op.Path)
 			w.queue.clearTerminalFailure(op.Path2)
 		}
@@ -1520,23 +1529,16 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 				if tmeta, tok := w.opts.Staging.Pending.GetMeta(target); tok && tmeta != nil {
 					tgen = tmeta.Generation
 				}
-				// Same crash-safe two-phase transfer as the renamed path
-				// itself: prepare the new name's meta, move the bytes, then
-				// commit — an interrupted move keeps both metas so recovery
-				// retains whichever side the shadow backs, and a failed move
-				// rolls the prepared meta back.
-				prepared, ok, err := w.opts.Staging.Pending.PrepareRenameIfGeneration(path, target, meta.Generation, tgen)
-				if err != nil || !ok {
-					if err != nil {
-						safeLogPrintf("writeback: prepare conflict transfer %s -> %s failed: %v", path, target, err)
-					}
-					continue
+				// Same locked two-phase transfer as the renamed path itself,
+				// and failures here are per-descendant: a child whose marker
+				// cannot follow the move keeps it under the (now dead) old
+				// name and that name answers EIO — the directory rename as a
+				// whole still succeeded remotely, so the error is logged
+				// rather than rolled back.
+				terr := w.transferConflictMarker(path, target, meta.Generation, tgen)
+				if terr != nil {
+					safeLogPrintf("writeback: conflict marker for descendant %s did not follow the rename: %v", path, terr)
 				}
-				if w.opts.Staging.Shadow != nil && !w.opts.Staging.Shadow.Rename(path, target) {
-					w.opts.Staging.Pending.AbortRenameIfGeneration(path, target, prepared)
-					continue
-				}
-				w.opts.Staging.Pending.CommitRenameIfGeneration(path, prepared, meta.Generation)
 			}
 		}
 		return res, nil
@@ -2189,45 +2191,91 @@ func (w *Writeback) pendingConflictGen(path string) (gen uint64, conflict bool) 
 // completed rename: a conflicted SOURCE's pending entry (and its preserved
 // shadow bytes) transfers to the new name — the unlanded image it describes
 // now lives there — while without a source conflict the replaced TARGET's
-// marker describes a name that no longer exists and is retired. Both
-// transitions are fenced on the generations captured before the remote
-// rename, so a racing same-path staging under either name is neither moved
-// away nor clobbered.
+// marker describes a name that no longer exists and is retired.
 //
-// The transfer is two-phase (PrepareRenameIfGeneration → Shadow.Rename →
-// CommitRenameIfGeneration) for the same reason the general rename path is:
-// committing the metadata first would leave a crash window in which only the
-// NEW name has metadata while only the OLD name has bytes — and recovery
-// prunes metadata whose shadow is missing, destroying the sole copy of the
-// unlanded image. A failed shadow move aborts the prepared meta so the
-// old-name entry remains authoritative (and still answers EIO).
-func (w *Writeback) retargetConflictMarkers(oldPath, newPath string, srcPendingGen uint64, srcConflict bool, dstPendingGen uint64, dstConflict bool) {
+// The transfer is a locked two-phase transaction (PendingConflictTransfer) and
+// runs under BOTH writeback path locks: stageAndEnqueueOpt writes the shadow
+// BEFORE publishing its pending entry, so only the path locks exclude a same
+// path staging that would otherwise slip a newer generation between the
+// generation fence and the payload move. When the payload move fails the
+// destination still receives a marker (PublishDestination): the remote name
+// has already moved, so reporting success there would claim durability for
+// bytes that are still only under the old name.
+func (w *Writeback) retargetConflictMarkers(oldPath, newPath string, srcPendingGen uint64, srcConflict bool, dstPendingGen uint64, dstConflict bool) error {
 	st := w.opts.Staging
 	if st == nil || st.Pending == nil {
+		return nil
+	}
+	if !srcConflict {
+		if dstConflict {
+			st.Pending.RemoveIfGeneration(newPath, dstPendingGen)
+		}
+		return nil
+	}
+	return w.transferConflictMarker(oldPath, newPath, srcPendingGen, dstPendingGen)
+}
+
+// transferConflictMarker runs one locked, two-phase conflict-marker transfer:
+// the destination .meta is prepared (only when empty), the preserved payload
+// is moved, and the transaction commits — all under both writeback path
+// locks so a same-path staging cannot advance either generation meanwhile.
+// A failed payload move publishes the marker at the destination instead of
+// restoring silence there: the remote name has already moved, so that name
+// must keep answering EIO for the image that never landed.
+func (w *Writeback) transferConflictMarker(oldPath, newPath string, srcPendingGen, dstPendingGen uint64) error {
+	st := w.opts.Staging
+	if st == nil || st.Pending == nil {
+		return nil
+	}
+	unlock := w.lockRenamePaths(oldPath, newPath)
+	defer unlock()
+
+	transfer, ok, err := st.Pending.BeginConflictTransfer(oldPath, newPath, srcPendingGen, dstPendingGen, st.Shadow)
+	if err != nil {
+		// Nothing durable moved: the old name keeps its marker and bytes, but
+		// the new name must still refuse to certify the unlanded image.
+		safeLogPrintf("writeback: begin conflict transfer %s -> %s failed: %v", oldPath, newPath, err)
+		w.recordTransferFailure(newPath, err)
+		return err
+	}
+	if !ok {
+		return nil // a racing publication owns one end; leave both alone
+	}
+	if !transfer.MovePayload() {
+		// The remote rename already happened but the preserved bytes could
+		// not follow it. They stay at the old name with their own entry; the
+		// destination must also answer EIO — the object there whose newest
+		// image never landed must not report success.
+		if perr := transfer.PublishDestination(); perr != nil {
+			safeLogPrintf("writeback: publishing the failed transfer marker at %s failed: %v", newPath, perr)
+			w.recordTransferFailure(newPath, perr)
+			return perr
+		}
+		return fmt.Errorf("writeback: preserved image for %s could not follow the rename to %s", oldPath, newPath)
+	}
+	committed, cerr := transfer.Commit()
+	if cerr != nil {
+		// The payload moved but its metadata could not be persisted: report
+		// the failure so barriers still answer EIO, and let restart prune the
+		// half-written pair.
+		safeLogPrintf("writeback: committing conflict transfer %s -> %s failed: %v", oldPath, newPath, cerr)
+		w.recordTransferFailure(newPath, cerr)
+		return cerr
+	}
+	if !committed {
+		safeLogPrintf("writeback: conflict transfer %s -> %s lost a fence; markers left in place", oldPath, newPath)
+	}
+	return nil
+}
+
+// recordTransferFailure records an in-memory terminal failure for a path whose
+// durable marker could not be installed: barriers on the new name must keep
+// answering EIO rather than certify data that never landed.
+func (w *Writeback) recordTransferFailure(path string, err error) {
+	if w.queue == nil {
 		return
 	}
-	if srcConflict {
-		prepared, ok, err := st.Pending.PrepareRenameIfGeneration(oldPath, newPath, srcPendingGen, dstPendingGen)
-		if err != nil {
-			safeLogPrintf("writeback: prepare conflict marker transfer %s -> %s failed: %v (marker stays at the old name)", oldPath, newPath, err)
-			return
-		}
-		if !ok {
-			return // a racing staging owns one end; leave both alone
-		}
-		if st.Shadow != nil && !st.Shadow.Rename(oldPath, newPath) {
-			// The bytes did not move: roll the prepared meta back so the
-			// old name keeps the marker AND the shadow it describes.
-			st.Pending.AbortRenameIfGeneration(oldPath, newPath, prepared)
-			safeLogPrintf("writeback: shadow move %s -> %s failed; conflict marker stays at the old name", oldPath, newPath)
-			return
-		}
-		st.Pending.CommitRenameIfGeneration(oldPath, prepared, srcPendingGen)
-		return
-	}
-	if dstConflict {
-		st.Pending.RemoveIfGeneration(newPath, dstPendingGen)
-	}
+	w.queue.RecordTerminalFailureForPath(path, err)
 }
 
 // Sync implements fs.Handle.
@@ -4876,4 +4924,23 @@ func (l *stripedLocks) lock(path string) func() {
 	l.mu.Unlock()
 	m.Lock()
 	return m.Unlock
+}
+
+// lockRenamePaths takes both pathname locks in a stable (lexicographic) order,
+// matching the queue's batch committer, so same-path staging and commits are
+// excluded for the duration and two renames cannot deadlock.
+func (w *Writeback) lockRenamePaths(a, b string) func() {
+	if a == b {
+		return w.pathLocks.lock(a)
+	}
+	first, second := a, b
+	if second < first {
+		first, second = second, first
+	}
+	u1 := w.pathLocks.lock(first)
+	u2 := w.pathLocks.lock(second)
+	return func() {
+		u2()
+		u1()
+	}
 }

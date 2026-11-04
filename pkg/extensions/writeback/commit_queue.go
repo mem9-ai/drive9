@@ -3089,6 +3089,28 @@ func (cq *CommitQueue) recordCommitTerminalFailure(entry *CommitEntry, lastErr e
 	safeLogPrintf("drive9: error event=commit_terminal_failure path=%s reason=%s err=%v detail=local_data_preserved", entry.Path, classifyCommitTerminalReason(lastErr), lastErr)
 }
 
+// RecordTerminalFailureForPath records an in-memory terminal failure for path
+// without a queue entry behind it. Callers use it when a failure happened
+// outside the commit worker (a rename whose preserved payload could not be
+// re-paired with its new name): barriers on the path must still answer EIO
+// even though nothing can be re-driven from the queue.
+func (cq *CommitQueue) RecordTerminalFailureForPath(path string, err error) {
+	if cq == nil {
+		return
+	}
+	if err == nil {
+		err = errCommitTerminalUnknown
+	}
+	cq.mu.Lock()
+	if cq.terminalFailures == nil {
+		cq.terminalFailures = make(map[string]pathCommitFailure)
+	}
+	cq.failureClock++
+	cq.terminalFailures[path] = pathCommitFailure{err: err, seq: cq.failureClock}
+	cq.pruneTerminalFailuresLocked()
+	cq.mu.Unlock()
+}
+
 // errCommitTerminalUnknown backs PathTerminalFailure when a terminal commit
 // failure carried no upload error: the data never landed either way, so the
 // barrier must still report failure.
