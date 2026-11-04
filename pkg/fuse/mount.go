@@ -1092,11 +1092,12 @@ func mountWithConfig(cfg MountConfig) error {
 			// fresh large files (multipart's successor). With explicit
 			// [extent] patterns the pattern IS the layout truth — creation
 			// happens on the extent plane for matches and stays classic
-			// everywhere else, so the size-based promotion channel is
-			// OFF (a non-matching file must not silently flip to extent
-			// just by crossing the inline cutoff on a rename or landing).
-			// Pattern-less hybrid mounts keep the promotion line.
-			ExtentTakeover: wantExt["extent"],
+			// everywhere else — so the write plane's size-based promotion
+			// channel is OFF entirely (a non-matching file must not
+			// silently flip to extent just by crossing the inline cutoff
+			// on a landing). Pattern-less hybrid mounts keep the promotion
+			// line.
+			ExtentTakeover: wantExt["extent"] && len(cfg.ExtentPaths) == 0,
 			ExtentMinSize:  extentPromotionCutoff(len(cfg.ExtentPaths) > 0, cl),
 			// gvisor-compat takes precedence and always keeps commits
 			// detached (v1).
