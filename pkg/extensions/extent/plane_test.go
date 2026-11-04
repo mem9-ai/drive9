@@ -5796,4 +5796,49 @@ func TestStrictSyncAfterTruncateToZero(t *testing.T) {
 	if err := eh.Sync(context.Background()); err != nil {
 		t.Fatalf("fsync after a successful truncate-to-zero must succeed: %v", err)
 	}
+	// The sync must have taken the EXISTING-file branch, not the create
+	// branch: a zero-length extent object that reads back as absent would let
+	// this test pass while never reaching the guard it is meant to cover.
+	if !eng.Bridge.nameMaterialized(context.Background(), "/d/t.bin") {
+		t.Fatalf("precondition: the truncated file must still exist remotely; the fake models an empty extent as absent")
+	}
+}
+
+// freshCreate describes the CURRENT incarnation only. Inodes are derived from
+// pathnames, so a closed file's marker surviving into a later file at the same
+// path would make that file's Sync believe it created an occupant it never
+// created — and refuse to synchronize it.
+func TestFreshCreateMarkerDoesNotSurviveReuse(t *testing.T) {
+	f := newFakeV2(t)
+	f.setDir("/d", true)
+	cacheDir := engineCacheDir(t)
+	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: cacheDir})
+	br := eng.Bridge
+	// A local create marks the path-derived inode, then the descriptor closes.
+	br.mu.Lock()
+	first := inoFor(br.fullPath("/d/reuse.bin"))
+	br.freshCreate[first] = true
+	br.mu.Unlock()
+	br.ForgetPath("/d/reuse.bin")
+	br.mu.Lock()
+	_, stillFresh := br.freshCreate[first]
+	br.mu.Unlock()
+	if stillFresh {
+		t.Fatal("freshCreate survived the incarnation's retirement; a reused path would inherit it")
+	}
+	// The reused path is an ordinary open: an existing empty occupant must be
+	// synchronizable.
+	f.mu.Lock()
+	f.classic["/d/reuse.bin"] = ""
+	f.nextID++
+	f.ids["/d/reuse.bin"] = fmt.Sprintf("res-%d", f.nextID)
+	f.mu.Unlock()
+	ino := inoFor(br.fullPath("/d/reuse.bin"))
+	br.RememberPathForTest(ino, "/d/reuse.bin")
+	br.mu.Lock()
+	br.sizes[ino] = 0
+	br.mu.Unlock()
+	if err := br.MaterializeEmpty(context.Background(), ino); err != nil {
+		t.Fatalf("a reopened path must not inherit the previous incarnation's create marker: %v", err)
+	}
 }

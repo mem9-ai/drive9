@@ -2832,6 +2832,11 @@ func (b *Bridge) ModeOf(ino meta.Ino) (uint32, bool) {
 func (b *Bridge) forgetInoLocked(ino meta.Ino) {
 	delete(b.layoutPendingID, ino)
 	delete(b.layoutPending, ino)
+	// freshCreate describes THIS incarnation's create. Inodes are derived
+	// from pathnames, so a closed file's marker must not survive into a
+	// later, unrelated file that reuses the same path: it would tell the
+	// new descriptor's Sync that it created an occupant it never created.
+	delete(b.freshCreate, ino)
 	delete(b.verifyBase, ino)
 	delete(b.commitErr, ino)
 	delete(b.classicOwned, ino)
