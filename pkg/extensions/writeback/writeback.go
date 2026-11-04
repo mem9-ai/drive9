@@ -2222,13 +2222,6 @@ func (w *Writeback) resolveLandedStaging(path string, landedRev int64, supersede
 	w.queue.ResolveSupersededConflict(path, supersedesGen)
 }
 
-// pendingConflictGen reports the pending-index generation a path's entry
-// carries and whether that entry is a terminal-failure conflict marker.
-func (w *Writeback) pendingConflictGen(path string) (gen uint64, conflict bool) {
-	gen, _, conflict, _ = w.pendingImageState(path)
-	return gen, conflict
-}
-
 // pendingImageState classifies the pending entry at path for a rename's
 // terminal-failure transition: a conflict marker (the terminal failure's
 // durable record), a LIVE queued image (staged, not yet landed or terminally
