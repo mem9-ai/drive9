@@ -3090,27 +3090,48 @@ func (b *Bridge) nameMaterialized(ctx context.Context, path string) bool {
 	return err == nil
 }
 
-// NeedsEmptyBarrier reports whether a fsync on this inode was acknowledged
-// without anything durable backing it: a fresh empty file has no slices and
-// no truncation to commit, and its name is deliberately not materialized
-// remotely while the descriptor can still write. The caller stages a local
-// barrier so the acknowledgment survives a crash.
-func (b *Bridge) NeedsEmptyBarrier(ctx context.Context, ino meta.Ino) bool {
+// MaterializeEmpty gives an EMPTY fresh file a remote name, which is what a
+// remotely-durable fsync boundary means for a file with no content: strict
+// fsync must not report success while the name exists only locally (or, with
+// no staging directory, nowhere at all).
+//
+// The name is created with an absence-CAS create, and its identity is
+// captured immediately afterward as the publication binding (verifyBase):
+// every later commit this descriptor makes CASes on that identity, so a
+// replacement taking the name is detected and the write is abandoned instead
+// of mutating a foreign object.
+//
+// Residual: the create and the recording Stat are separate requests, so a
+// replacement landing between them would be bound as ours. Closing that
+// window needs the server to echo the created object's resource identity —
+// no client-side observation can attribute an anonymous create.
+func (b *Bridge) MaterializeEmpty(ctx context.Context, ino meta.Ino) error {
 	b.mu.Lock()
 	size, has := b.sizes[ino]
 	path, mapped := b.paths[ino]
 	pending := len(b.pending[ino])
 	b.mu.Unlock()
 	if !has || !mapped || pending > 0 || size != 0 {
-		return false
-	}
-	if b.cfg.StagingDir == "" {
-		return false // no barrier armed: nothing can be made durable locally
+		return nil
 	}
 	if b.nameMaterialized(ctx, path) {
-		return false // the remote name already carries the file
+		return nil // already remote-durable
 	}
-	return true
+	if _, err := b.cfg.Client.CreateFileCtx(ctx, path); err != nil {
+		return fmt.Errorf("materialize empty file %s: %w", path, err)
+	}
+	// Bind the created object: the identity and revision become the expected
+	// resource/revision of every later publication of this descriptor.
+	if st, err := b.cfg.Client.StatCtx(ctx, path); err == nil && st.ResourceID != "" {
+		b.setVerifyBase(ino, st.Revision, st.ResourceID)
+		b.mu.Lock()
+		b.classicOwned[ino] = true
+		b.mu.Unlock()
+	}
+	// The remote name now carries the file, so any staged empty barrier is
+	// redundant.
+	b.clearStagedLocal(ino)
+	return nil
 }
 
 func (b *Bridge) CompactAll(ctx meta.Context, threads int, bar *utils.Bar) syscall.Errno { return 0 }

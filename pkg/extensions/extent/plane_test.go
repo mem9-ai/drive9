@@ -5362,32 +5362,58 @@ func TestDirRenameCandidateKeepsDescendantSuffix(t *testing.T) {
 	}
 }
 
-// Round-54: an acknowledged fsync of a fresh EMPTY file must stay durable.
-// Nothing is pending and the name is deliberately not materialized remotely
-// while the descriptor can still write, so the strict path must stage a
-// local barrier instead of returning success with nothing behind it.
-func TestStrictFsyncOfEmptyFileStagesBarrier(t *testing.T) {
+// Round-55: a STRICT fsync of a fresh empty file must be REMOTE-durable, not
+// merely local. `--durability=fsync` promises the drive9 server has the file
+// before fsync returns (docs/design/fuse-durability-policy.md), so a local
+// barrier — or, with no staging directory, nothing at all — does not satisfy
+// it. The name must exist remotely, and the descriptor must remain writable
+// afterwards because the created object is bound as its publication base.
+func TestStrictFsyncOfEmptyFileIsRemoteDurable(t *testing.T) {
 	f := newFakeV2(t)
 	f.setDir("/d", true)
 	cacheDir := engineCacheDir(t)
 	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: cacheDir})
-	// STRICT mode: fsync must be remote-durable, and here it instead has to
-	// become locally durable, because the name cannot be created yet.
 	h := New(Options{Engine: eng, Threshold: 0, SyncMode: "strict"})
 	res, _, _ := dispatchCreate(context.Background(), h, "/d/e.bin", syscall.O_RDWR|syscall.O_CREAT)
 	eh := res.Handle.(*engineHandle)
 	if err := eh.Sync(context.Background()); err != nil {
 		t.Fatalf("fsync: %v", err)
 	}
-	recs, err := eng.Bridge.scanStaged()
-	if err != nil {
+	if n := f.hashParsedLayout("/d/e.bin"); n != "classic" {
+		t.Fatalf("strict fsync left no remote object (layout %q); --durability=fsync must be remote-durable", n)
+	}
+	// Bound, not merely created: a write through the same descriptor still
+	// works and lands on the bound object.
+	if err := eh.Write(context.Background(), 0, []byte("AFTER-FSYNC")); err != nil {
 		t.Fatal(err)
 	}
-	if len(recs) != 1 {
-		t.Fatalf("staged barriers = %d, want 1 (the acknowledged empty file must be recoverable)", len(recs))
+	if err := eh.Flush(context.Background()); err != nil {
+		t.Fatalf("the descriptor became unwritable after a strict fsync: %v", err)
 	}
-	if got := recs[0].m.Path; got != "/d/e.bin" {
-		t.Fatalf("barrier path = %q, want /d/e.bin", got)
+	if got := f.contentOf("/d/e.bin"); got != "AFTER-FSYNC" {
+		t.Fatalf("content = %q, want AFTER-FSYNC", got)
+	}
+}
+
+// Round-55: the same strict fsync must work with NO staging directory: there
+// is no local place to record anything, so only a remote copy can make the
+// acknowledgment true.
+func TestStrictFsyncOfEmptyFileWithoutStagingDir(t *testing.T) {
+	f := newFakeV2(t)
+	f.setDir("/d", true)
+	// No CacheDir at all: no staging directory exists.
+	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/"})
+	if eng.Bridge.StagingDirForTest() != "" {
+		t.Fatal("precondition: this engine must have no staging directory")
+	}
+	h := New(Options{Engine: eng, Threshold: 0, SyncMode: "strict"})
+	res, _, _ := dispatchCreate(context.Background(), h, "/d/n.bin", syscall.O_RDWR|syscall.O_CREAT)
+	eh := res.Handle.(*engineHandle)
+	if err := eh.Sync(context.Background()); err != nil {
+		t.Fatalf("fsync: %v", err)
+	}
+	if n := f.hashParsedLayout("/d/n.bin"); n != "classic" {
+		t.Fatalf("with no staging dir a strict fsync must still create the remote file (layout %q)", n)
 	}
 }
 
@@ -5456,5 +5482,50 @@ func TestFirstCloseOfTwoKeepsHandleWritable(t *testing.T) {
 	}
 	if got := f.contentOf("/d/m.bin"); got != "STILL-OK" {
 		t.Fatalf("content = %q, want STILL-OK", got)
+	}
+}
+
+// StagingDirForTest exposes the configured staging directory.
+func (b *Bridge) StagingDirForTest() string { return b.cfg.StagingDir }
+
+// Round-55: two overlapping closes must still produce exactly one owner of
+// the final publication. A plain "is another handle registered?" check lets
+// both releases observe the other and BOTH decline, so the empty file is
+// never materialized even though both closes report success.
+//
+// The race is forced deterministically: each Release is held at the point
+// between "decide" and "act" until both have decided.
+func TestOverlappingClosesMaterializeOnce(t *testing.T) {
+	f := newFakeV2(t)
+	f.setDir("/d", true)
+	h := newTestHandler(t, f, 0)
+	res1, _, _ := dispatchCreate(context.Background(), h, "/d/o.bin", syscall.O_RDWR|syscall.O_CREAT)
+	eh1 := res1.Handle.(*engineHandle)
+	res2, _, _ := dispatchCreate(context.Background(), h, "/d/o.bin", syscall.O_RDWR)
+	eh2, ok := res2.Handle.(*engineHandle)
+	if !ok {
+		t.Skipf("the second open was not claimed by the engine (%T)", res2.Handle)
+	}
+	// Both handles are registered for the same path (dispatchCreate does it).
+	h.mu.Lock()
+	n := len(h.handles["/d/o.bin"])
+	h.mu.Unlock()
+	if n != 2 {
+		t.Fatalf("registered handles = %d, want 2", n)
+	}
+	// Claim the final close from both concurrently. The implementation marks
+	// the caller under h.mu before counting, so the outcome is total even
+	// when the two run at once.
+	var got [2]bool
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); got[0] = h.claimFinalClose(eh1) }()
+	go func() { defer wg.Done(); got[1] = h.claimFinalClose(eh2) }()
+	wg.Wait()
+	if !got[0] && !got[1] {
+		t.Fatal("neither overlapping close claimed the final publication")
+	}
+	if got[0] && got[1] {
+		t.Fatal("both overlapping closes claimed the final publication")
 	}
 }

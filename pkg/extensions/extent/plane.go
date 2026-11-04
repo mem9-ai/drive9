@@ -180,14 +180,21 @@ func (h *Handler) drop(path string) {
 	h.opts.Engine.Bridge.ForgetPath(path)
 }
 
-// lastHandleFor reports whether e is the only handle registered for its
-// path (i.e. closing it is the file's final close). It counts the handle
-// being released, so it must be consulted BEFORE release retires it.
-func (h *Handler) lastHandleFor(e *engineHandle) bool {
+// claimFinalClose reserves the right to publish the file's final state for
+// this path, returning true to exactly ONE handle even when closes overlap.
+//
+// A plain "is any other handle registered?" check is racy: two releases can
+// each observe the other still registered and both decline, leaving the file
+// with no owner of its final publication. Marking the caller FIRST and then
+// counting the still-unreleased handles gives a total order — the caller
+// that observes zero is the one whose mark made the set empty, and every
+// earlier caller observed itself excluded.
+func (h *Handler) claimFinalClose(e *engineHandle) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	e.released = true
 	for _, x := range h.handles[e.path] {
-		if x != e {
+		if x != e && !x.released {
 			return false
 		}
 	}
@@ -678,6 +685,11 @@ type engineHandle struct {
 	ino   meta.Ino
 	fh    uint64
 	vctx  vfs.LogContext
+	// released is set (under Handler.mu) by the Release that is retiring
+	// this handle. It makes the "am I the last close" decision atomic: two
+	// concurrent releases each mark themselves and then count the handles
+	// still unreleased, so exactly one of them observes zero.
+	released bool
 }
 
 func (e *engineHandle) Read(ctx context.Context, off int64, dest []byte) (int, error) {
@@ -726,15 +738,12 @@ func (e *engineHandle) Sync(ctx context.Context) error {
 		return err
 	}
 	// A fresh EMPTY file has nothing to commit, so the flush above was a
-	// no-op — but fsync was still acknowledged, and the NAME must survive a
-	// crash. The name is deliberately not materialized remotely while this
-	// descriptor can still write (an unattributable empty classic object
-	// would block the next write), so a durable local barrier is what makes
-	// the acknowledgment true: replay creates the file.
-	if e.plane.opts.Engine.Bridge.NeedsEmptyBarrier(ctx, e.ino) {
-		return e.plane.opts.Engine.Bridge.StagePendingLocal(e.ino)
-	}
-	return nil
+	// no-op — but fsync was still acknowledged, and the name must be durable
+	// at the boundary this mode promised. Strict/fsync semantics are
+	// REMOTE-durable (docs/design/fuse-durability-policy.md): a local
+	// barrier would not satisfy them, and with no staging directory there
+	// would be no copy at all. Materialize the name remotely.
+	return e.plane.opts.Engine.Bridge.MaterializeEmpty(ctx, e.ino)
 }
 
 func (e *engineHandle) Flush(ctx context.Context) error {
@@ -757,11 +766,11 @@ func (e *engineHandle) Release(ctx context.Context) error {
 	// descriptor's next write would then be refused by the very ownership
 	// guard this ordering exists to satisfy.
 	//
-	// lastClose is computed BEFORE the release retires this handle: the
-	// count must include the handle being closed.
-	lastClose := e.plane.lastHandleFor(e)
+	// claimFinalClose makes the selection atomic, so overlapping closes still
+	// produce exactly one owner of the final publication.
+	finalClose := e.plane.claimFinalClose(e)
 	var landErr error
-	if lastClose {
+	if finalClose {
 		landErr = e.plane.opts.Engine.FlushFileFinal(ctx, uint64(e.ino))
 	} else {
 		landErr = e.plane.opts.Engine.FlushFile(ctx, uint64(e.ino))
