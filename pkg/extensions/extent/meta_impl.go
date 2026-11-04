@@ -3276,14 +3276,23 @@ func (b *Bridge) MaterializeEmpty(ctx context.Context, ino meta.Ino) error {
 	if !has || !mapped || pending > 0 || size != 0 {
 		return nil
 	}
-	// Already named remotely: the create is done, but the BINDING may not be.
-	// A previous attempt can have created the name and then failed its
-	// binding Stat, so retrying must establish the ownership basis rather
-	// than short-circuit on the name's existence — otherwise the next write
-	// is refused by needsFreshIdentity and strict durability is unreachable
-	// for this descriptor.
+	// Already named remotely. This descriptor did NOT necessarily create that
+	// object: a local-only engine create (Mknod does not touch the server) can
+	// race another client's create at the same path, and an ambiguous earlier
+	// create can have been followed by a replacement. Adopting the occupant's
+	// identity here would bind a stranger's object as this descriptor's
+	// publication target, so the safe outcome depends on whether we already
+	// hold an attributable identity:
+	//
+	//   - bound from an echo (the branch below): nothing to do, the name is
+	//     ours and durable;
+	//   - not bound: we cannot prove creation, so REFUSE. The caller surfaces
+	//     an error instead of acknowledging a file we cannot attribute.
 	if b.nameMaterialized(ctx, path) {
-		return b.bindMaterialized(ctx, ino, path)
+		if b.publicationIdentity(ino) != "" {
+			return nil // ours, already bound by the create echo
+		}
+		return fmt.Errorf("materialize empty file %s: name occupied by an object this descriptor did not create", path)
 	}
 	rev, createdID, err := b.cfg.Client.CreateFileCreatedCtx(ctx, path)
 	if err != nil {
@@ -3300,41 +3309,12 @@ func (b *Bridge) MaterializeEmpty(ctx context.Context, ino meta.Ino) error {
 		b.clearStagedLocal(ino)
 		return nil
 	}
-	if err := b.bindMaterialized(ctx, ino, path); err != nil {
-		return err
-	}
-	// The remote name now carries the file, so any staged empty barrier is
-	// redundant.
-	b.clearStagedLocal(ino)
-	return nil
-}
-
-// bindMaterialized records the identity and revision of an existing remote
-// name as this descriptor's publication base. MANDATORY for strict
-// durability: without it the descriptor has no ownership basis, and its next
-// write is refused by needsFreshIdentity.
-func (b *Bridge) bindMaterialized(ctx context.Context, ino meta.Ino, path string) error {
-	if b.publicationIdentity(ino) != "" {
-		return nil // already bound
-	}
-	// The name already exists, so this create cannot echo anything (it is an
-	// absence-CAS that will not run). Re-issuing one to obtain the echo would
-	// fail, so the identity is read from the occupant — with the unavoidable
-	// caveat that a replacement between the earlier create and this call is
-	// indistinguishable. A create that DID echo is bound at its own call site
-	// and never reaches here.
-	st, err := b.cfg.Client.StatCtx(ctx, path)
-	if err != nil {
-		return fmt.Errorf("materialize empty file %s: bind created object: %w", path, err)
-	}
-	if st.ResourceID == "" {
-		return fmt.Errorf("materialize empty file %s: server reported no resource identity", path)
-	}
-	b.setVerifyBase(ino, st.Revision, st.ResourceID)
-	b.mu.Lock()
-	b.classicOwned[ino] = true
-	b.mu.Unlock()
-	return nil
+	// The create landed but the server did not echo what it created, so this
+	// descriptor still has no attributable identity. A follow-up Stat cannot
+	// supply one — a replacement landing in that window would be adopted as
+	// ours — so strict durability cannot be honoured here and the call must
+	// fail rather than acknowledge an object we cannot prove we created.
+	return fmt.Errorf("materialize empty file %s: server did not echo the created object's identity", path)
 }
 
 func (b *Bridge) CompactAll(ctx meta.Context, threads int, bar *utils.Bar) syscall.Errno { return 0 }

@@ -5705,3 +5705,36 @@ func TestCreateEchoBindsWithoutStat(t *testing.T) {
 		t.Fatalf("bound the replacement's identity %q instead of the created object", after)
 	}
 }
+
+// A local-only engine create (Mknod does not touch the server) can race
+// another client's create at the same path. Sync then finds the name already
+// materialized — but by an object THIS descriptor never created. Binding that
+// occupant would make every later write publish against a stranger's object,
+// so the call must refuse instead.
+func TestSyncRefusesForeignOccupantOfLocalCreate(t *testing.T) {
+	f := newFakeV2(t)
+	f.setDir("/d", true)
+	cacheDir := engineCacheDir(t)
+	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: cacheDir})
+	h := New(Options{Engine: eng, Threshold: 0, SyncMode: "strict"})
+	res, _, _ := dispatchCreate(context.Background(), h, "/d/r.bin", syscall.O_RDWR|syscall.O_CREAT)
+	eh := res.Handle.(*engineHandle)
+	// Another client creates the same path first.
+	f.seedExtent(t, "/d/r.bin", "FOREIGN")
+	f.mu.Lock()
+	foreignID := f.ids["/d/r.bin"]
+	f.mu.Unlock()
+
+	if err := eh.Sync(context.Background()); err == nil {
+		t.Fatal("strict fsync must not adopt an occupant this descriptor did not create")
+	}
+	if got := eng.Bridge.publicationIdentity(eh.ino); got != "" {
+		t.Fatalf("bound the foreign object %q as this descriptor's publication target", got)
+	}
+	f.mu.Lock()
+	after := f.ids["/d/r.bin"]
+	f.mu.Unlock()
+	if after != foreignID {
+		t.Fatalf("foreign occupant changed (%q -> %q)", foreignID, after)
+	}
+}
