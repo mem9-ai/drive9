@@ -1677,6 +1677,12 @@ func (b *Bridge) StagePendingLocal(ino meta.Ino) error {
 	if !mapped || (!hasSize && len(pending) == 0) {
 		return nil
 	}
+	// Register this staging run for the pathname BEFORE any bytes are
+	// written. A rename that settles while this run is in flight then defers
+	// retiring its registration instead of erasing it, so the checks below
+	// can still see the intent however the two interleave.
+	b.enterStaging(path)
+	defer b.exitStaging(path)
 	// Bind the barrier to the object, not the name: renames and
 	// replacements must not redirect recovery onto a different file. The
 	// identity is MANDATORY for an existing remote object — a barrier
@@ -1725,6 +1731,9 @@ func (b *Bridge) StagePendingLocal(ino meta.Ino) error {
 			File     string `json:"file"`
 		}{Chunk: p.chunk, Off: p.off, Size: p.size, Checksum: p.checksum, File: name})
 	}
+	if pause := b.stagingPause; pause != nil {
+		pause()
+	}
 	// A rename may be IN FLIGHT for this pathname right now. StagePendingLocal
 	// does not hold the plane's path locks, so this generation can be written
 	// after the rename's intent scan and before the remote rename commits —
@@ -1749,7 +1758,19 @@ func (b *Bridge) StagePendingLocal(ino meta.Ino) error {
 	// the only place that ordering is caught. Later registrations are the
 	// scan's responsibility — it runs after installing the registration and
 	// therefore sees this manifest.
-	if to := b.pendingRenameFor(path); to != "" && m.addNextPath(to) {
+	adopted := false
+	if to := b.pendingRenameFor(path); to != "" {
+		adopted = m.addNextPath(to)
+	}
+	// The inode's CURRENT mapping wins over the snapshot: RemapLocal runs
+	// when a rename commits, so a different name here means the object has
+	// already moved and this barrier must say so even if the registration
+	// was retired before this run resumed.
+	if cur, ok := b.currentPath(ino); ok && cur != path {
+		m.Path = cur
+		adopted = true
+	}
+	if adopted {
 		again, merr := json.Marshal(m)
 		if merr != nil {
 			return merr
@@ -2077,10 +2098,20 @@ func (b *Bridge) StageRenameIntent(oldFull, newFull string) error {
 // ambiguous outcome keeps them so recovery tries both names.
 func (b *Bridge) ClearRenameIntent(oldFull, newFull string) {
 	b.mu.Lock()
-	if cur, ok := b.pendingRenames[oldFull]; ok && cur == newFull {
-		delete(b.pendingRenames, oldFull)
+	defer b.mu.Unlock()
+	if cur, ok := b.pendingRenames[oldFull]; !ok || cur != newFull {
+		return
 	}
-	b.mu.Unlock()
+	if b.stagingInFlight[oldFull] > 0 {
+		// An fsync is mid-stage for this pathname. Retiring the registration
+		// now would let that run finish with only the OLD name persisted
+		// and no intent, stranding its acknowledged bytes if the rename
+		// already committed. Defer to the last exit instead.
+		b.renameClearPending[oldFull] = true
+		return
+	}
+	delete(b.pendingRenames, oldFull)
+	delete(b.renameClearPending, oldFull)
 }
 
 // pendingRenameLocked reports the destination a in-flight rename assigns to
@@ -2092,6 +2123,43 @@ func (b *Bridge) pendingRenameLocked(full string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// enterStaging registers an in-flight staging run for a pathname.
+func (b *Bridge) enterStaging(path string) {
+	b.mu.Lock()
+	b.stagingInFlight[path]++
+	b.mu.Unlock()
+}
+
+// exitStaging retires an in-flight staging run and performs any rename
+// registration retirement that was deferred while it was active.
+func (b *Bridge) exitStaging(path string) {
+	b.mu.Lock()
+	if n := b.stagingInFlight[path]; n > 1 {
+		b.stagingInFlight[path] = n - 1
+		b.mu.Unlock()
+		return
+	}
+	delete(b.stagingInFlight, path)
+	if b.renameClearPending[path] {
+		delete(b.renameClearPending, path)
+		for from, to := range b.pendingRenames {
+			if from == path {
+				delete(b.pendingRenames, from)
+				_ = to
+			}
+		}
+	}
+	b.mu.Unlock()
+}
+
+// currentPath reports the inode's current remote pathname.
+func (b *Bridge) currentPath(ino meta.Ino) (string, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	p, ok := b.paths[ino]
+	return p, ok
 }
 
 // pendingRenameFor reports the destination an in-flight rename assigns to

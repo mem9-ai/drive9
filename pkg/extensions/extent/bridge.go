@@ -119,6 +119,19 @@ type Bridge struct {
 	// scan and the rename would otherwise name only the OLD path, and a
 	// crash after the rename commits would make recovery skip it.
 	pendingRenames map[string]string
+	// stagingInFlight counts StagePendingLocal runs per pathname, and
+	// renameClearPending marks registrations whose retirement was requested
+	// while such a run was active. A rename that settles while an fsync is
+	// mid-stage must not erase the registration: the staging would then
+	// persist the OLD name with no intent, and a crash after the committed
+	// rename would strand the acknowledged bytes. The clear is deferred to
+	// the moment the last in-flight staging for that path exits.
+	stagingInFlight    map[string]int
+	renameClearPending map[string]bool
+	// stagingPause, when set, runs once inside StagePendingLocal after the
+	// block files are written and before the rename intent is resolved,
+	// letting a test interleave a whole rename into that window.
+	stagingPause func()
 
 	// classicOwned marks files whose fresh extent session silently
 	// degraded to a CLASSIC upload on a legacy server: the handle stays
@@ -186,29 +199,31 @@ func NewBridge(cfg Config) *Bridge {
 		root = "/"
 	}
 	br := &Bridge{
-		cfg:             cfg,
-		format:          meta.Format{Name: "drive9", UUID: "drive9-extent-v2", Storage: "drive9-presign", BlockSize: blockSizeMiB << 20, TrashDays: 0, DirStats: false},
-		nextID:          uint64(1) << 63,
-		stagedSlices:    make(map[uint64]*stagedSlice),
-		blocks:          newBlockRegistry(),
-		paths:           map[meta.Ino]string{rootIno: root},
-		sizes:           make(map[meta.Ino]int64),
-		revs:            make(map[meta.Ino]int64),
-		pending:         make(map[meta.Ino][]pendingWrite),
-		truncs:          make(map[meta.Ino]int64),
-		modes:           make(map[meta.Ino]uint32),
-		sentinels:       make(map[string]meta.Ino),
-		nextHeldIno:     heldInoBase,
-		moved:           make(map[meta.Ino]string),
-		replacements:    make(map[string]meta.Ino),
-		commitLocks:     make(map[meta.Ino]*sync.Mutex),
-		classicOwned:    make(map[meta.Ino]bool),
-		layoutPending:   make(map[meta.Ino]bool),
-		layoutPendingID: make(map[meta.Ino]string),
-		freshCreate:     make(map[meta.Ino]bool),
-		commitErr:       make(map[meta.Ino]error),
-		verifyBase:      make(map[meta.Ino]verifyBase),
-		pendingRenames:  make(map[string]string),
+		cfg:                cfg,
+		format:             meta.Format{Name: "drive9", UUID: "drive9-extent-v2", Storage: "drive9-presign", BlockSize: blockSizeMiB << 20, TrashDays: 0, DirStats: false},
+		nextID:             uint64(1) << 63,
+		stagedSlices:       make(map[uint64]*stagedSlice),
+		blocks:             newBlockRegistry(),
+		paths:              map[meta.Ino]string{rootIno: root},
+		sizes:              make(map[meta.Ino]int64),
+		revs:               make(map[meta.Ino]int64),
+		pending:            make(map[meta.Ino][]pendingWrite),
+		truncs:             make(map[meta.Ino]int64),
+		modes:              make(map[meta.Ino]uint32),
+		sentinels:          make(map[string]meta.Ino),
+		nextHeldIno:        heldInoBase,
+		moved:              make(map[meta.Ino]string),
+		replacements:       make(map[string]meta.Ino),
+		commitLocks:        make(map[meta.Ino]*sync.Mutex),
+		classicOwned:       make(map[meta.Ino]bool),
+		layoutPending:      make(map[meta.Ino]bool),
+		layoutPendingID:    make(map[meta.Ino]string),
+		freshCreate:        make(map[meta.Ino]bool),
+		commitErr:          make(map[meta.Ino]error),
+		verifyBase:         make(map[meta.Ino]verifyBase),
+		pendingRenames:     make(map[string]string),
+		stagingInFlight:    make(map[string]int),
+		renameClearPending: make(map[string]bool),
 	}
 	// Provenance refetch resolves through the inode's CURRENT mapping:
 	// open files move under renames and retention aliases, and a stale

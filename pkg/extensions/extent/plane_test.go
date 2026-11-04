@@ -5529,3 +5529,73 @@ func TestOverlappingClosesMaterializeOnce(t *testing.T) {
 		t.Fatal("both overlapping closes claimed the final publication")
 	}
 }
+
+// Round-56: a rename that completes ENTIRELY inside a staging run's window
+// must not strand the staged bytes. The run snapshots its path and pauses;
+// the rename registers, commits, settles and retires its registration; the
+// run resumes, finds no registration and would otherwise persist only the
+// OLD name. In-flight tracking defers that retirement, and the run also
+// adopts the inode's current mapping.
+func TestRenameCompletedInsideStageWindowStillRecorded(t *testing.T) {
+	f := newFakeV2(t)
+	f.setDir("/d", true)
+	f.seedExtent(t, "/d/a.bin", "BASE")
+	cacheDir := engineCacheDir(t)
+	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: cacheDir})
+	br := eng.Bridge
+	ino := meta.Ino(71)
+	br.RememberPathForTest(ino, "/d/a.bin")
+	sum := sha256Hex([]byte("PEND"))
+	br.StageBlockForTest(sum, []byte("PEND"))
+	br.AddPendingForTest(ino, 0, 0, sum, 4, 8)
+
+	resumed := make(chan struct{})
+	paused := make(chan struct{})
+	br.stagingPause = func() {
+		br.stagingPause = nil
+		close(paused)
+		<-resumed
+	}
+	done := make(chan error, 1)
+	go func() { done <- br.StagePendingLocal(ino) }()
+	<-paused
+
+	// The whole rename runs to completion inside that window: registration,
+	// remote rename, settlement, and retirement.
+	h := New(Options{Engine: eng, Threshold: 0})
+	_, err, _ := h.renameWithDurableIntent(context.Background(),
+		&fs.Op{Kind: fs.OpRename, Path: "/d/a.bin", Path2: "/d/b.bin"},
+		func(context.Context, *fs.Op) (fs.Result, error) {
+			f.mu.Lock()
+			f.move("/d/a.bin", "/d/b.bin")
+			f.mu.Unlock()
+			br.RemapLocal("/d/a.bin", "/d/b.bin")
+			return fs.Result{}, nil
+		})
+	if err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	// The rename has fully committed and settled at this point. Its
+	// registration retirement was DEFERRED because this staging run is still
+	// in flight — that is precisely the protection under test.
+	close(resumed)
+	if err := <-done; err != nil {
+		t.Fatalf("staging: %v", err)
+	}
+	rec := onlyStaged(t, br)
+	if !rec.hasCandidate("/d/b.bin") {
+		t.Fatalf("the staged record lost the committed rename: candidates = %v", rec.m.candidatePaths())
+	}
+	// With the staging run finished, the deferred retirement has now run.
+	if br.hasPendingRenameForTest("/d/a.bin") {
+		t.Fatal("the deferred registration retirement never happened")
+	}
+}
+
+// hasPendingRenameForTest reports whether a rename is registered for path.
+func (b *Bridge) hasPendingRenameForTest(path string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	_, ok := b.pendingRenames[path]
+	return ok
+}
