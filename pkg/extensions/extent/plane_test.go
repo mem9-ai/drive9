@@ -4695,6 +4695,13 @@ func TestEngineUsesUpstreamCacheDefaults(t *testing.T) {
 	if got.Prefetch != 1 {
 		t.Fatalf("Prefetch = %d, want 1 (upstream default)", got.Prefetch)
 	}
+	// BufferSize is not merely a write throttle: the data reader derives
+	// its GLOBAL read-ahead budget from it (80%), so an unbounded value
+	// grants the mount an enormous in-memory read budget. Keep it at the
+	// upstream 300 MiB shape.
+	if got.BufferSize != 300<<20 {
+		t.Fatalf("BufferSize = %d, want %d (upstream default 300 MiB)", got.BufferSize, 300<<20)
+	}
 	// The engine calls SelfCheck with an EMPTY uuid: the cache directory is
 	// already per-mount scoped, so upstream's UUID namespace segment would
 	// only add a redundant level (.../<scope>/extent/<uuid>).

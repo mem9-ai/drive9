@@ -58,6 +58,7 @@ func upstreamChunkDefaultsForTest(blockSize int) chunk.Config {
 		OSCache:        true,
 		Readahead:      8 * blockSize,
 		Prefetch:       1,
+		BufferSize:     300 << 20,
 	}
 }
 
@@ -116,10 +117,15 @@ func NewEngine(cfg EngineConfig) *Engine {
 		Prefetch:       1,
 		MaxUpload:      4,
 		MaxDownload:    4,
-		// The bridge stages uploads in memory at commit time; a generous
-		// buffer keeps the writer's AllocMemory-based throttle out of the
-		// way. TODO(calibrate): revisit for production mounts.
-		BufferSize: 32 << 30,
+		// BufferSize is JuiceFS's TOTAL read/write buffering budget, and it
+		// is not just a soft throttle: the data reader derives its global
+		// read-ahead budget from it (80% of this value gates every read
+		// buffer allocation, vfs/reader.go), so a huge number here grants
+		// the mount an enormous in-memory read budget. Upstream mounts
+		// 300 MiB; with the native writeback pipeline blocks go to the disk
+		// stage instead of accumulating in memory, so the upstream default
+		// is the right shape for this plane too.
+		BufferSize: 300 << 20,
 		GetTimeout: time.Minute,
 		PutTimeout: time.Minute,
 		// Writeback (JuiceFS native pipeline): blocks below the threshold
