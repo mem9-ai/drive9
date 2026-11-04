@@ -2083,6 +2083,10 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 			if err := h.stageAndEnqueueOpt(ctx, true, false); err != nil {
 				return err
 			}
+			// Bind the completion to exactly this staging: a newer
+			// staging begun while the upload is in flight keeps its own
+			// identity and its own completion.
+			staged := h.currentStagedSnapshot()
 			if err := h.w.queue.WaitPathOutcome(h.path, uploadTimeout); err != nil {
 				// Idle is not success: a terminally failed queued upload
 				// must surface at the close(2) durability boundary.
@@ -2094,7 +2098,7 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 			// atomically gated on the buffer still holding the staged
 			// image, so a write accepted while the upload was pending
 			// stays unpublished dirty state.
-			h.completeStagedLanding(0, 0, "", false)
+			h.completeStagedLanding(0, 0, staged, false)
 			return nil
 		}
 		if h.w.uploader != nil && h.w.wbCache != nil {
@@ -2177,16 +2181,18 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 			if err := h.stageAndEnqueueOpt(ctx, true, false); err != nil {
 				return err
 			}
+			staged := h.currentStagedSnapshot()
 			if err := h.w.queue.WaitPathOutcome(h.path, uploadTimeout); err != nil {
 				return fs.StatusErrorOf(gofuse.Status(syscall.EIO))
 			}
 			// Post-wait completion: retire the fresh-create view and drop
 			// the dirty flag only when the buffer still holds the staged
-			// image — checked and applied atomically, so a write accepted
-			// while the upload was pending (the drain path runs without
-			// the FUSE per-handle lock) cannot slip between the check and
-			// the reset and lose its publication.
-			h.completeStagedLanding(0, 0, "", true)
+			// image — bound to THIS staging's identity and applied
+			// atomically, so a write accepted while the upload was
+			// pending (the drain path runs without the FUSE per-handle
+			// lock) cannot slip between the check and the reset and lose
+			// its publication.
+			h.completeStagedLanding(0, 0, staged, true)
 			return nil
 		}
 		if size < commitInlineStreamThreshold {
@@ -2517,6 +2523,14 @@ func (h *bufferingHandle) markLandedImage(rev, size int64, snapshotID string) (c
 // (or re-certify a regrown buffer against the old remote image). An
 // empty snapshotID means "the current staging" (post-wait sites).
 func (h *bufferingHandle) completeStagedLanding(rev, size int64, snapshotID string, resetDirty bool) (certified bool) {
+	if snapshotID == "" {
+		// No identity, no completion: substituting the CURRENT staging
+		// here would certify an in-progress image over the one that
+		// actually landed (the mutex makes the decision atomic, not the
+		// identity correct). Callers capture the staging's ID right
+		// after staging it.
+		return false
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.landed = true
@@ -2524,10 +2538,7 @@ func (h *bufferingHandle) completeStagedLanding(rev, size int64, snapshotID stri
 	if rev > 0 {
 		h.baseRev = rev
 	}
-	if snapshotID == "" {
-		snapshotID = h.stagedSnapshotID
-	}
-	certified = snapshotID != "" && h.stagedSnapshotID == snapshotID &&
+	certified = h.stagedSnapshotID == snapshotID &&
 		(h.buf == nil || h.buf.ContentVersion() == h.stagedContentVersion)
 	if certified {
 		h.visTrunc = false
@@ -2536,7 +2547,40 @@ func (h *bufferingHandle) completeStagedLanding(rev, size int64, snapshotID stri
 			h.dirty = false
 		}
 	}
+	h.retireStagedSnapshotLocked(snapshotID)
 	return certified
+}
+
+// currentStagedSnapshot returns the ID of this handle's most recent
+// staging (callers capture it immediately after staging, before the
+// landing wait, so a completion refers to exactly the operation that
+// completed).
+func (h *bufferingHandle) currentStagedSnapshot() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.stagedSnapshotID
+}
+
+// retireStagedSnapshotLocked drops a completed snapshot ID from the
+// per-handle registration set: only in-flight landings need to find it,
+// and a long-lived descriptor with repeated write/fsync cycles must not
+// accumulate them (each staging copies the set under h.mu). h.mu must be
+// held.
+func (h *bufferingHandle) retireStagedSnapshotLocked(id string) {
+	if id == "" {
+		return
+	}
+	regs, _ := h.stagedSnapshotRegs.Load().(map[string]struct{})
+	if _, ok := regs[id]; !ok {
+		return
+	}
+	next := make(map[string]struct{}, len(regs))
+	for k := range regs {
+		if k != id {
+			next[k] = struct{}{}
+		}
+	}
+	h.stagedSnapshotRegs.Store(next)
 }
 
 func attrSize(res fs.Result) int64 {
@@ -4442,10 +4486,11 @@ func (h *bufferingHandle) commitLocked(ctx context.Context) error {
 		if err := h.stageAndEnqueueOpt(ctx, true, false); err != nil {
 			return err
 		}
+		staged := h.currentStagedSnapshot()
 		if err := h.w.queue.WaitPathOutcome(h.path, uploadTimeout); err != nil {
 			return fs.StatusErrorOf(gofuse.Status(syscall.EIO))
 		}
-		h.completeStagedLanding(0, 0, "", false)
+		h.completeStagedLanding(0, 0, staged, false)
 		return nil
 	}
 	// Commit dispatch: a partial edit of an existing large file patches
