@@ -2412,7 +2412,7 @@ func (w *Writeback) conflictTransitionLocked(ctx context.Context, oldPath, newPa
 			// and never this rename's own installation: the second pass may
 			// REPLACE it with a newer publication, but retiring it outright
 			// would strip the witness the first pass just installed.
-			if dstConflict && !dstProtectedEntry && !(fence.ownGen != 0 && dstPendingGen == fence.ownGen) {
+			if dstConflict && !dstProtectedEntry && (fence.ownGen == 0 || dstPendingGen != fence.ownGen) {
 				st.Pending.RemoveIfGeneration(newPath, dstPendingGen)
 			}
 			if !windowWork {
