@@ -2074,6 +2074,13 @@ func (f *FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName stri
 	// (xattr subscribers), losing the attributes entirely.
 	f.mutatedRename(oldPath, newPath)
 	f.mutated(fs.EventDelete, oldPath)
+	// A rename that REPLACED a destination swaps the object behind the
+	// name: the read caches (whole-file and attribute tiers) still hold
+	// the replaced file's images under that path, so a post-close read
+	// would serve the old bytes instead of the new extent source (the
+	// rename suite's H2). EventInvalidated sweeps the path's tiers
+	// without bumping the namespace epoch.
+	f.mutated(fs.EventInvalidated, newPath)
 	// v1 notifyRenameTarget: invalidate ONLY the rename TARGET — the kernel
 	// moves the old name's dentry natively, and dropping it from userspace
 	// disturbs the bookkeeping for the next create of the same name in
