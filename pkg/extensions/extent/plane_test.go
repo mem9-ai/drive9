@@ -4675,3 +4675,36 @@ func TestNativeWritebackCommitWaitsForStagedBlocks(t *testing.T) {
 		t.Fatalf("content = %q, want WRITEBACK", got)
 	}
 }
+
+// Round-50: the engine must actually USE JuiceFS's read cache and readahead
+// for whole blocks. The zero-value chunk config left CacheFullBlock false
+// (a full 4 MiB block was never written to the disk cache) and Readahead 0
+// (no readahead at all) — the extent plane silently ran without the
+// upstream data path. Pin the upstream mount defaults.
+func TestEngineUsesUpstreamCacheDefaults(t *testing.T) {
+	got := upstreamChunkDefaultsForTest(4 << 20)
+	if !got.CacheFullBlock {
+		t.Fatal("CacheFullBlock must be true (upstream default: cache-partial-only off)")
+	}
+	if !got.OSCache {
+		t.Fatal("OSCache must be true (upstream keeps the OS page cache)")
+	}
+	if want := 8 * (4 << 20); got.Readahead != want {
+		t.Fatalf("Readahead = %d, want %d (8 blocks, upstream default)", got.Readahead, want)
+	}
+	if got.Prefetch != 1 {
+		t.Fatalf("Prefetch = %d, want 1 (upstream default)", got.Prefetch)
+	}
+	// SelfCheck must normalize the cache dir with the volume UUID and leave
+	// a usable eviction policy.
+	conf := got
+	conf.CacheSize = 64 << 20
+	conf.CacheDir = filepath.Join(engineCacheDir(t), "jfs")
+	conf.SelfCheck("vol-uuid")
+	if !strings.HasSuffix(conf.CacheDir, "vol-uuid") {
+		t.Fatalf("SelfCheck cache dir = %q, want it UUID-scoped", conf.CacheDir)
+	}
+	if conf.CacheEviction == "" {
+		t.Fatal("SelfCheck must default the eviction policy")
+	}
+}

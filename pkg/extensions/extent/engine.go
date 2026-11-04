@@ -49,6 +49,18 @@ type EngineConfig struct {
 	ReadOnly bool
 }
 
+// upstreamChunkDefaultsForTest exposes the chunk-store defaults the engine
+// installs (test hook: they must match JuiceFS's own mount defaults).
+func upstreamChunkDefaultsForTest(blockSize int) chunk.Config {
+	return chunk.Config{
+		BlockSize:      blockSize,
+		CacheFullBlock: true,
+		OSCache:        true,
+		Readahead:      8 * blockSize,
+		Prefetch:       1,
+	}
+}
+
 // Engine bundles the bridge, chunk store and VFS — the construction the
 // mount wiring and the tests share. The community engine is used exactly
 // as upstream ships it; every drive9-specific behavior lives in the Bridge
@@ -82,20 +94,31 @@ func NewEngine(cfg EngineConfig) *Engine {
 	if cacheSize == 0 {
 		cacheSize = 1 << 30
 	}
+	blockSize := blockSizeMiB << 20
 	chunkConf := chunk.Config{
-		BlockSize:   blockSizeMiB << 20,
-		CacheDir:    cfg.CacheDir,
-		CacheSize:   cacheSize,
-		CacheMode:   0o600,
-		AutoCreate:  true,
-		Compress:    "none",
-		MaxUpload:   4,
-		MaxDownload: 4,
+		BlockSize:  blockSize << 0,
+		CacheDir:   cfg.CacheDir,
+		CacheSize:  cacheSize,
+		CacheMode:  0o600,
+		AutoCreate: true,
+		Compress:   "none",
+		// Upstream mount defaults (cmd/mount.go): cache FULL blocks too
+		// (cache-partial-only is off upstream), keep the OS page cache,
+		// read ahead 8 blocks per session, and prefetch one block.
+		// Leaving CacheFullBlock false — the zero value — meant a whole
+		// 4 MiB block was never written to the disk cache, i.e. the
+		// engine's read cache silently did nothing for the common case,
+		// and Readahead 0 disabled JuiceFS's own readahead entirely.
+		CacheFullBlock: true,
+		OSCache:        true,
+		Readahead:      8 * blockSize,
+		Prefetch:       1,
+		MaxUpload:      4,
+		MaxDownload:    4,
 		// The bridge stages uploads in memory at commit time; a generous
 		// buffer keeps the writer's AllocMemory-based throttle out of the
 		// way. TODO(calibrate): revisit for production mounts.
 		BufferSize: 32 << 30,
-		Readahead:  0,
 		GetTimeout: time.Minute,
 		PutTimeout: time.Minute,
 		// Writeback (JuiceFS native pipeline): blocks below the threshold
@@ -113,6 +136,13 @@ func NewEngine(cfg EngineConfig) *Engine {
 		// stage area is full — errStageFull).
 		MaxStageWrite: cfg.MaxStageWrite,
 	}
+	// SelfCheck is upstream's normalization step (cmd/mount.go calls it
+	// before NewCachedStore): it appends the volume UUID to every cache
+	// directory, applies the eviction/checksum defaults, and disables
+	// writeback when the cache is memory-only. Skipping it left the cache
+	// dir un-scoped ("unknown cache eviction policy" warnings) and the
+	// writeback setup unvalidated.
+	chunkConf.SelfCheck(b.format.UUID)
 	store := chunk.NewCachedStore(b.Storage(), chunkConf, nil)
 	conf := &vfs.Config{
 		Meta:            &meta.Config{Retries: 1},

@@ -1012,14 +1012,13 @@ func mountWithConfig(cfg MountConfig) error {
 		engineConf := extent.EngineConfig{
 			Client:     cl,
 			RemoteRoot: remoteRoot,
-			// Cache placement: ONE shared tree with the read cache. Both
-			// planes live under the same scoped cache root; JuiceFS
-			// appends its volume UUID below it, so the engine's chunk
-			// cache is a direct child of the mount's cache scope rather
-			// than a parallel "jfs-engine" side tree — a single directory
-			// holds everything the mount caches, and the byte budgets
-			// below partition that one tree.
-			CacheDir:  extentCacheRoot(cacheBase, mountHash, readCacheHash),
+			// Cache placement: inside the SAME drive9 cache directory the
+			// read cache lives in, as one dedicated subdirectory ("jfs";
+			// JuiceFS appends its volume UUID below it). The read cache
+			// occupies ".../<scope>/read", the engine ".../<scope>/jfs/
+			// <uuid>" — one cache dir, per-plane subdirs, and the byte
+			// budgets below partition that one tree.
+			CacheDir:  cacheScopedDir(extentCacheScope(cacheBase, mountHash, readCacheHash), "", "jfs"),
 			ReadOnly:  cfg.ReadOnly,
 			FreeSpaceRatio: float32(cfg.DiskReadCacheFreeRatio),
 			// JuiceFS's OWN writeback pipeline: blocks below the threshold
@@ -1565,12 +1564,11 @@ func diskCacheOpts(dir string, sizeMB int64, freeRatio float64) cache.DiskReadCa
 
 // cacheScopedDir joins a named cache subtree under the mount-scoped
 // namespace; an unavailable cache base disables the subtree (empty).
-// extentCacheRoot is the engine's cache root inside the mount's shared
-// cache scope: the SAME parent directory the read cache occupies, so the
-// two planes share one cache tree (JuiceFS adds its own volume UUID under
-// it). A distinct hash would place the engine beside — not inside — the
-// read cache, which is exactly what the shared-placement contract forbids.
-func extentCacheRoot(cacheBase, mountHash, readCacheHash string) string {
+// extentCacheScope is the mount's shared cache scope — the directory the
+// read cache is placed under. The engine's cache is a subdirectory of THIS
+// directory (never a parallel side tree), so one mount has exactly one
+// cache root on disk.
+func extentCacheScope(cacheBase, mountHash, readCacheHash string) string {
 	if cacheBase == "" {
 		return ""
 	}

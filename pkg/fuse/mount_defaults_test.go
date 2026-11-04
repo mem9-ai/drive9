@@ -160,16 +160,21 @@ func TestExtentPromotionCutoffRespectsPatterns(t *testing.T) {
 func TestExtentCacheRootSharesReadCacheScope(t *testing.T) {
 	base := "/tmp/d9cache"
 	readHash := "readscope"
-	if got, want := extentCacheRoot(base, "mountscope", readHash), filepath.Join(base, readHash); got != want {
-		t.Fatalf("extentCacheRoot = %q, want %q (same scope as the read cache)", got, want)
+	scope := extentCacheScope(base, "mountscope", readHash)
+	if want := filepath.Join(base, readHash); scope != want {
+		t.Fatalf("extentCacheScope = %q, want %q (same scope as the read cache)", scope, want)
 	}
-	// The read cache's own disk dir is a CHILD of that root.
+	// Both planes are subdirectories of that ONE scope directory.
 	readDir := cacheScopedDir(base, readHash, "read")
-	if !strings.HasPrefix(readDir, extentCacheRoot(base, "mountscope", readHash)) {
-		t.Fatalf("read cache %q is not inside the shared root", readDir)
+	engDir := cacheScopedDir(scope, "", "jfs")
+	if !strings.HasPrefix(readDir, scope+string(filepath.Separator)) {
+		t.Fatalf("read cache %q is not inside the shared scope", readDir)
+	}
+	if !strings.HasPrefix(engDir, scope+string(filepath.Separator)) || engDir == readDir {
+		t.Fatalf("engine cache %q must be a separate subdir inside %q", engDir, scope)
 	}
 	// No cache base (memory-only) stays empty.
-	if got := extentCacheRoot("", "m", "r"); got != "" {
-		t.Fatalf("memory-only cache root = %q, want empty", got)
+	if got := extentCacheScope("", "m", "r"); got != "" {
+		t.Fatalf("memory-only cache scope = %q, want empty", got)
 	}
 }
