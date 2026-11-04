@@ -2,8 +2,9 @@ package extent
 
 import (
 	"context"
-	"sort"
+	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -249,7 +250,7 @@ func (h *Handler) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, e
 			return res, err
 		}
 	case fs.OpRename:
-		if res, err, handled := h.tryRenameOverOpen(ctx, op, next); handled {
+		if res, err, handled := h.renameWithDurableIntent(ctx, op, next); handled {
 			return res, err
 		}
 	case fs.OpSetAttr:
@@ -447,6 +448,37 @@ func (h *Handler) claimsPattern(path string) bool {
 		}
 	}
 	return false
+}
+
+// renameWithDurableIntent makes an interactive fsync barrier survive a
+// rename of its file (or of any ancestor directory): the pending
+// destination is written durably BEFORE the remote rename is issued, so
+// recovery accepts the staged object under either name. A local persistence
+// failure REFUSES the rename — acknowledging it would leave the record
+// naming a name that no longer holds the object, and the acknowledged bytes
+// would never be replayed. handled=false only for renames the plane does
+// not touch (no engine, no destination name).
+func (h *Handler) renameWithDurableIntent(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error, bool) {
+	if h.opts.Engine == nil || op.Path2 == "" || op.Path2 == op.Path {
+		return fs.Result{}, nil, false
+	}
+	br := h.opts.Engine.Bridge
+	if err := br.StageRenameIntentLocal(op.Path, op.Path2); err != nil {
+		return fs.Result{}, fmt.Errorf("rename %s to %s: %w", op.Path, op.Path2, err), true
+	}
+	res, err, _ := h.tryRenameOverOpen(ctx, op, next)
+	if err == nil {
+		// The rename landed: retire the intent and adopt the destination
+		// name (every staged record at or under the old name follows).
+		// A failure leaves the intent in place — recovery tries both
+		// names — so this can only delay cleanup.
+		br.SettleRenameIntentLocal(op.Path, op.Path2, true)
+		return res, nil, true
+	}
+	// The rename did NOT land: abandon the intent so a later unrelated
+	// create at the destination name never adopts this record.
+	br.SettleRenameIntentLocal(op.Path, op.Path2, false)
+	return res, err, true
 }
 
 // tryRenameOverOpen preserves an OPEN engine file that a rename is about

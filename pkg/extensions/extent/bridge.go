@@ -112,6 +112,12 @@ type Bridge struct {
 	// is only valid while the occupant is still THAT object.
 	layoutPendingID map[meta.Ino]string
 	verifyBase      map[meta.Ino]verifyBase
+	// createdIdentity is the identity of the EMPTY placeholder THIS
+	// descriptor materialized with an absence-CAS create (touch). The same
+	// name file is replaced with a fresh extent create on the first write,
+	// and that delete must be authorized by this identity — a foreign empty
+	// file that took the name in between is refused, never deleted.
+	placeholderID map[meta.Ino]string
 
 	// classicOwned marks files whose fresh extent session silently
 	// degraded to a CLASSIC upload on a legacy server: the handle stays
@@ -201,6 +207,7 @@ func NewBridge(cfg Config) *Bridge {
 		freshCreate:     make(map[meta.Ino]bool),
 		commitErr:       make(map[meta.Ino]error),
 		verifyBase:      make(map[meta.Ino]verifyBase),
+		placeholderID:   make(map[meta.Ino]string),
 	}
 	// Provenance refetch resolves through the inode's CURRENT mapping:
 	// open files move under renames and retention aliases, and a stale

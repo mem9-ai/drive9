@@ -15,7 +15,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -154,28 +153,30 @@ func TestExtentPromotionCutoffRespectsPatterns(t *testing.T) {
 	}
 }
 
-// The engine's cache root must sit INSIDE the same scoped cache tree the
-// read cache occupies (both planes share one directory), never a parallel
-// side tree.
-func TestExtentCacheRootSharesReadCacheScope(t *testing.T) {
+// The engine's cache root must sit INSIDE the writeback-side cache
+// namespace (".../<mountHash>/extent", a sibling of "writecache"), and it
+// must NOT fold in the credential: interactive fsync stages durable
+// barriers there, so a rotated credential has to find the same directory.
+func TestExtentCacheRootKeysOnMountNotCredential(t *testing.T) {
 	base := "/tmp/d9cache"
-	readHash := "readscope"
-	scope := extentCacheScope(base, "mountscope", readHash)
-	if want := filepath.Join(base, readHash); scope != want {
-		t.Fatalf("extentCacheScope = %q, want %q (same scope as the read cache)", scope, want)
+	mountHash := "mountscope"
+	engDir := cacheScopedDir(base, mountHash, "extent")
+	if want := filepath.Join(base, mountHash, "extent"); engDir != want {
+		t.Fatalf("engine cache = %q, want %q", engDir, want)
 	}
-	// Both planes are subdirectories of that ONE scope directory.
-	readDir := cacheScopedDir(base, readHash, "read")
-	engDir := cacheScopedDir(scope, "", "extent")
-	if !strings.HasPrefix(readDir, scope+string(filepath.Separator)) {
-		t.Fatalf("read cache %q is not inside the shared scope", readDir)
+	// A sibling of the classic writeback directory, not inside a
+	// credential-derived read-cache scope.
+	writeDir := cacheScopedDir(base, mountHash, "writecache")
+	if filepath.Dir(engDir) != filepath.Dir(writeDir) {
+		t.Fatalf("engine cache %q must share the classic writeback parent %q", engDir, writeDir)
 	}
-	if !strings.HasPrefix(engDir, scope+string(filepath.Separator)) || engDir == readDir {
-		t.Fatalf("engine cache %q must be a separate subdir inside %q", engDir, scope)
+	readHash := "readscope-other-credential"
+	if other := cacheScopedDir(base, readHash, "extent"); engDir == other {
+		t.Fatalf("engine cache must not be credential-scoped (%q)", other)
 	}
 	// No cache base (memory-only) stays empty.
-	if got := extentCacheScope("", "m", "r"); got != "" {
-		t.Fatalf("memory-only cache scope = %q, want empty", got)
+	if got := cacheScopedDir("", mountHash, "extent"); got != "" {
+		t.Fatalf("memory-only cache dir = %q, want empty", got)
 	}
 }
 

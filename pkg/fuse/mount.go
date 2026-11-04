@@ -1037,14 +1037,17 @@ func mountWithConfig(cfg MountConfig) error {
 			Client:     cl,
 			RemoteRoot: remoteRoot,
 			// Cache placement: inside the SAME drive9 cache directory the
-			// read cache lives in, as one dedicated subdirectory. The read
-			// cache occupies ".../<scope>/read" and the engine
-			// ".../<scope>/extent" — one cache dir, per-plane subdirs, and
-			// the byte budgets below partition that one tree. (The engine
-			// suppresses JuiceFS's UUID cache namespace: the scope
-			// directory is already per-mount, so another segment would be
-			// redundant.)
-			CacheDir:       cacheScopedDir(extentCacheScope(cacheBase, mountHash, readCacheHash), "", "extent"),
+			// classic writeback/read caches live in, as one dedicated
+			// subdirectory of the MOUNT-scoped namespace
+			// (".../<mountHash>/extent"). That namespace deliberately does
+			// NOT fold in the credential: this directory is not only a
+			// disposable read cache — interactive fsync stages the file's
+			// durable barrier here and the next mount replays it. A rotated
+			// credential must find the same barriers, or acknowledged bytes
+			// are stranded in a scope nothing ever scans. (The engine
+			// suppresses JuiceFS's UUID cache namespace: the scope directory
+			// is already per-mount, so another segment would be redundant.)
+			CacheDir:       cacheScopedDir(cacheBase, mountHash, "extent"),
 			ReadOnly:       cfg.ReadOnly,
 			FreeSpaceRatio: float32(cfg.DiskReadCacheFreeRatio),
 			// JuiceFS's OWN writeback pipeline: blocks below the threshold
@@ -1599,24 +1602,6 @@ func diskCacheOpts(dir string, sizeMB int64, freeRatio float64) cache.DiskReadCa
 
 // cacheScopedDir joins a named cache subtree under the mount-scoped
 // namespace; an unavailable cache base disables the subtree (empty).
-// extentCacheScope is the mount's shared cache scope — the directory the
-// read cache is placed under. The engine's cache is a subdirectory of THIS
-// directory (never a parallel side tree), so one mount has exactly one
-// cache root on disk.
-func extentCacheScope(cacheBase, mountHash, readCacheHash string) string {
-	if cacheBase == "" {
-		return ""
-	}
-	hash := readCacheHash
-	if hash == "" {
-		hash = mountHash
-	}
-	if hash == "" {
-		return cacheBase
-	}
-	return filepath.Join(cacheBase, hash)
-}
-
 func cacheScopedDir(cacheBase, hash, name string) string {
 	if cacheBase == "" {
 		return ""
