@@ -14,6 +14,92 @@ import (
 	"github.com/mem9-ai/drive9/pkg/fusecomp/staging"
 )
 
+// TestPortExternalChangeDropsLandedWatermark pins the incarnation rule of
+// the local landed table: the watermark is a SAME-ORIGIN proof, and a
+// remote-origin change to the path ends it. A foreign delete+recreate
+// leaves a replacement whose revision restarts LOW while a stale watermark
+// sits high — adopting it would swap a fresh handle's correct base for the
+// dead incarnation's revision and the upload would conflict forever.
+func TestPortExternalChangeDropsLandedWatermark(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/f", []byte("seeded"))
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	bus := fs.NewEventBus()
+	wb, err := New(Options{Policy: PolicyWriteBack, Client: cl, WriteCacheDir: t.TempDir(), Events: bus})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := fs.NewChain(wb, terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	// landAndRecord runs one overwrite cycle and waits for the uploader's
+	// success to record the same-origin watermark.
+	landAndRecord := func(content string) {
+		t.Helper()
+		res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/f", Flags: uint32(syscall.O_RDWR)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		h, ok := res.Handle.(*bufferingHandle)
+		if !ok {
+			t.Fatalf("handle = %T, want *bufferingHandle", res.Handle)
+		}
+		if err := h.Write(ctx, 0, []byte(content)); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.Release(ctx); err != nil {
+			t.Fatal(err)
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			if n, ok := b.Node("/f"); ok && string(n.Data) == content {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("cycle for %q never landed", content)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		if _, ok := wb.landedRevision("/f"); !ok {
+			t.Fatal("landed watermark not recorded after a successful cycle")
+		}
+	}
+
+	landAndRecord("first!")
+	// A remote-origin modification of the path ends the proof (the row is
+	// no longer provably one this mount wrote).
+	bus.Emit(fs.Event{Kind: fs.EventInvalidated, Path: "/f"})
+	if _, ok := wb.landedRevision("/f"); ok {
+		t.Fatal("EventInvalidated did not drop the landed watermark")
+	}
+
+	landAndRecord("second")
+	bus.Emit(fs.Event{Kind: fs.EventDelete, Path: "/f"})
+	if _, ok := wb.landedRevision("/f"); ok {
+		t.Fatal("EventDelete did not drop the landed watermark")
+	}
+
+	landAndRecord("third!")
+	// A view checkout/reset clears the whole table: no landing is provably
+	// this view's anymore.
+	bus.Emit(fs.Event{Kind: fs.EventCheckout, Path: "/"})
+	if _, ok := wb.landedRevision("/f"); ok {
+		t.Fatal("EventCheckout did not clear the landed table")
+	}
+}
+
 // TestPortWriteBackFlushStagesWithoutRemoteStat pins the #1026 alignment
 // row for the small-file flush: v1's flush staged from local state only
 // (snapshotWriteBackLocked fed the CAS base from the local committed

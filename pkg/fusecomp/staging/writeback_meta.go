@@ -396,14 +396,14 @@ func (c *WriteBackCache) PutWithBaseRevAndModeAndLineageTimingsNoSync(remotePath
 }
 
 // PutWithBaseRevAndModeAndLineageTimingsDirSync is the v1 close-path stage
-// variant of PutWithBaseRevAndModeAndLineageTimings: the .dat data is
-// fsynced before its rename, the .meta rides its rename without its own
-// fsync, and ONE directory fsync after both renames makes the pair durable
-// together — two fsyncs instead of the durable put's four, the budget v1
-// paid at its close-path stage (shadow Sync + WAL fsync). Once the call
-// returns the entry is durable and the .dat is never torn; a crash inside
-// the call may lose the pair wholesale or leave a torn .meta frame (the
-// startup scan prunes it), matching v1's crash-before-WAL-fsync window.
+// variant of PutWithBaseRevAndModeAndLineageTimings: both files' contents
+// are fsynced before their renames and ONE directory fsync after both
+// renames makes the pair durable together — three barriers (two file syncs
+// + one directory sync) instead of the durable put's four. Once the call
+// returns the entry is durable and neither file is torn; a crash inside
+// the call loses the pair wholesale (its renames were never directory-
+// synced), never partially — the old pair or the new one, matching v1's
+// crash-before-WAL-fsync window.
 func (c *WriteBackCache) PutWithBaseRevAndModeAndLineageTimingsDirSync(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, liveAncestors ...string) (uint64, WriteBackPutTimings, error) {
 	return c.putWithBaseRevAndModeAndLineage(remotePath, data, size, kind, baseRev, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted, wbSyncDirOnce, liveAncestors)
 }
@@ -854,14 +854,13 @@ type wbSyncMode uint8
 
 const (
 	// wbSyncFull fsyncs each file and the directory rename after each
-	// rename — four fsyncs. The pair is the only durable authority.
+	// rename — four barriers. The pair is the only durable authority.
 	wbSyncFull wbSyncMode = iota
-	// wbSyncDirOnce is the v1 close-path stage cost: fsync the .dat data
-	// before its rename, write the .meta without its own fsync, then one
-	// directory fsync after both renames — two fsyncs. A crash may lose
-	// the pair wholesale (before the dir fsync) or leave a torn .meta
-	// frame (the startup scan prunes it); the .dat is never torn and the
-	// entry is durable once the put returns.
+	// wbSyncDirOnce is the v1 close-path stage cost: fsync both files'
+	// contents before their renames, then ONE directory fsync publishing
+	// the pair together — three barriers. A crash before the directory
+	// sync loses the pair wholesale (old pair or new, never mixed, never
+	// torn); after it the entry is durable.
 	wbSyncDirOnce
 	// wbSyncNone writes atomically without fsyncs; the durable authority
 	// must already exist elsewhere (shadow store + pending index).
@@ -890,7 +889,13 @@ func (c *WriteBackCache) putWithBaseRevAndModeAndLineage(remotePath string, data
 		writeDat = atomicWriteNoSync
 		writeMeta = atomicWriteNoSync
 	case wbSyncDirOnce:
-		writeMeta = atomicWriteNoSync
+		// Both files' CONTENTS are synced before their renames; the single
+		// trailing directory sync (below) publishes the pair together. A
+		// per-file directory sync here would both cost a third barrier and
+		// make the new .dat recoverable ahead of the .meta that describes
+		// it.
+		writeDat = atomicWriteFileSyncOnly
+		writeMeta = atomicWriteFileSyncOnly
 	}
 	datStart := time.Now()
 	if err := writeDat(datPath, data); err != nil {
@@ -929,9 +934,10 @@ func (c *WriteBackCache) putWithBaseRevAndModeAndLineage(remotePath string, data
 	}
 	t.MetaWrite = time.Since(metaStart)
 	if syncMode == wbSyncDirOnce {
-		// One directory fsync makes both renames durable together — the
-		// second half of the two-fsync budget (with the .dat data fsync
-		// above) that v1 paid at its close-path stage.
+		// One directory fsync makes both renames durable together — with
+		// the two content syncs above, three barriers total instead of the
+		// durable put's four (v1's close-path stage paid two for its
+		// shadow + WAL pair; this track's pair is one file larger).
 		if err := fsyncDir(filepath.Dir(datPath)); err != nil {
 			c.ReleasePathLock(remotePath, pl)
 			return 0, t, fmt.Errorf("writeback put dir sync: %w", err)
@@ -1033,7 +1039,7 @@ func cloneWriteBackMeta(meta *WriteBackMeta) WriteBackMeta {
 
 // atomicWrite writes data to path atomically using a temp file + fsync + rename.
 func atomicWrite(path string, data []byte) error {
-	return atomicWriteOpt(path, data, true)
+	return atomicWriteMode(path, data, true, true)
 }
 
 // atomicWriteNoSync is atomicWrite without the durability fsyncs. The
@@ -1043,10 +1049,22 @@ func atomicWrite(path string, data []byte) error {
 // store + pending index), e.g. the post-durable-stage Flush snapshot —
 // see Dat9FS.snapshotWriteBackLocked.
 func atomicWriteNoSync(path string, data []byte) error {
-	return atomicWriteOpt(path, data, false)
+	return atomicWriteMode(path, data, false, false)
 }
 
-func atomicWriteOpt(path string, data []byte, sync bool) error {
+// atomicWriteFileSyncOnly syncs the file's contents before the rename but
+// leaves the directory entry change UNsynced: the caller batches its own
+// directory fsync once every rename of a group has happened, so the group
+// becomes durable together (no file of it is recoverable ahead of its
+// metadata) at the cost of one shared directory sync.
+func atomicWriteFileSyncOnly(path string, data []byte) error {
+	return atomicWriteMode(path, data, true, false)
+}
+
+// atomicWriteMode is atomicWrite with the two durability levers split:
+// syncFile fsyncs the temp file's contents before the rename, syncDir
+// fsyncs the parent directory after it.
+func atomicWriteMode(path string, data []byte, syncFile, syncDir bool) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, ".tmp-*")
 	if err != nil {
@@ -1062,7 +1080,7 @@ func atomicWriteOpt(path string, data []byte, sync bool) error {
 	}
 
 	// Fsync to ensure data reaches disk before rename.
-	if sync {
+	if syncFile {
 		if err := tmp.Sync(); err != nil {
 			_ = tmp.Close()
 			_ = os.Remove(tmpName)
@@ -1080,7 +1098,7 @@ func atomicWriteOpt(path string, data []byte, sync bool) error {
 		return err
 	}
 
-	if !sync {
+	if !syncDir {
 		return nil
 	}
 	// Fsync parent directory so the rename is durable across power loss.

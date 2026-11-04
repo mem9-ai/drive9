@@ -360,6 +360,19 @@ func New(opts Options) (*Writeback, error) {
 		}
 		opts.Events.On(fs.EventCheckout, dropCleanBuffers)
 		opts.Events.On(fs.EventUnverified, dropCleanBuffers)
+		// The landed table is a SAME-ORIGIN proof: "revision r at this path
+		// is one THIS mount wrote". A remote-origin change ends that
+		// proof for the path — most dangerously a foreign delete+recreate,
+		// whose replacement starts at a LOW revision while our stale
+		// watermark sits high; adopting it would replace a fresh handle's
+		// correct base with the dead incarnation's revision and the
+		// conditional upload would conflict forever (v1 forgot its
+		// committed-revision watermark at exactly these namespace
+		// changes). A checkout resets the whole view: no landing is
+		// provably ours anymore.
+		opts.Events.On(fs.EventInvalidated, func(ev fs.Event) { w.forgetLanded(ev.Path) })
+		opts.Events.On(fs.EventDelete, func(ev fs.Event) { w.forgetLanded(ev.Path) })
+		opts.Events.On(fs.EventCheckout, func(fs.Event) { w.clearLanded() })
 	}
 	// FlushDebounce semantics: 0 disables, negative means unset (2s
 	// default — the CLI's default -1 must land on the default, not on 0).
@@ -2182,10 +2195,11 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 	}
 	if h.w.opts.Policy == PolicyWriteBack && h.w.uploader != nil && h.w.wbCache != nil {
 		// small-file writeback track: the flush stages a .dat/.meta image
-		// on disk — at v1's close-path durability (two fsyncs, none under
-		// lazy staging; v1's durable shadow + NoSync snapshot cache) — and
-		// the uploader lands it async; the commit queue keeps serving the
-		// large-file/shadow track.
+		// on disk — at the v1 close-path budget (both file contents + one
+		// directory sync, three barriers instead of four; v1 paid two for
+		// its smaller shadow + WAL pair) — and the uploader lands it
+		// async; the commit queue keeps serving the large-file/shadow
+		// track.
 		h.mu.Lock()
 		dirty, unlinked, isNew := h.dirty, h.unlinked, h.isNew
 		size := int64(0)
@@ -3444,6 +3458,14 @@ func (w *Writeback) forgetLanded(path string) {
 	w.landedMu.Unlock()
 }
 
+// clearLanded drops every same-origin watermark (a view checkout/reset:
+// none of the recorded landings is provably this view's anymore).
+func (w *Writeback) clearLanded() {
+	w.landedMu.Lock()
+	w.landed = nil
+	w.landedMu.Unlock()
+}
+
 func (w *Writeback) everLanded(path string) bool {
 	w.landedMu.Lock()
 	_, ok := w.landed[path]
@@ -4483,22 +4505,28 @@ func (h *bufferingHandle) finishStreaming(ctx context.Context) error {
 }
 
 // stageDurability selects the .dat/.meta snapshot's crash cost at the
-// staging boundary, restoring v1's close-path ladder: v1 paid shadow Sync
-// + WAL fsync — two fsyncs — for the durable stage, none under lazy
-// staging, and the write-back snapshot cache itself was always NoSync.
+// staging boundary, restoring v1's close-path budget: v1 paid two barriers
+// (durable shadow Sync + WAL fsync) and wrote the write-back snapshot
+// cache itself NoSync as a pure cache.
 type stageDurability uint8
 
 const (
 	// stageFullDurable fsyncs each file and its directory rename — four
-	// fsyncs. For boundaries where the pair is the only durable authority
+	// barriers. For boundaries where the pair is the only durable authority
 	// (close-sync's flush, which owes remote durability at close(2) right
 	// after, and Release's final-image refresh).
 	stageFullDurable stageDurability = iota
-	// stageV1Ladder is v1's default close-path cost: the .dat data fsync
-	// plus one directory fsync — two fsyncs — or, under lazy staging
-	// (v1 #964 WritebackLazyStaging / stageDurableAtClose), no fsync at
-	// all: the write-back tier's durability promise is fsync(2), not
-	// close(2).
+	// stageV1Ladder is v1's close-path cost scaled to this track's pair:
+	// both files' contents fsynced plus one directory fsync — three
+	// barriers instead of four. Lazy staging (v1 #964) deliberately does
+	// NOT reach this tier: in v1 a lazy close still left the durable
+	// ledger (shadow + WAL, bounded by the background syncer) under the
+	// snapshot; on this track the snapshot IS the payload's only durable
+	// copy, and nothing syncs it later — an unsynced pair here would turn
+	// the configured --writeback-sync-window into an unbounded power-loss
+	// window whenever the async upload is slow or unavailable. Lazy
+	// staging keeps governing the ledger track (stageAndEnqueueOpt and
+	// the WAL), exactly as before.
 	stageV1Ladder
 )
 
@@ -4598,22 +4626,16 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, isNew bool, dur
 }
 
 // putWriteCacheSnapshot writes the .dat/.meta snapshot at the selected
-// durability: the v1 ladder maps to the two-fsync stage put (or NoSync
-// under lazy staging); full durability keeps the four-fsync put for the
-// boundaries where the pair is the only authority.
+// durability: the v1 ladder uses the three-barrier stage put (both file
+// contents + one directory sync); full durability keeps the four-barrier
+// put for the boundaries where the pair is the only authority.
 func (w *Writeback) putWriteCacheSnapshot(path string, image []byte, kind staging.PendingKind, baseRev int64, mode uint32, hasMode bool, dur stageDurability) error {
 	size := int64(len(image))
-	switch dur {
-	case stageV1Ladder:
-		if w.lazy {
-			_, _, err := w.wbCache.PutWithBaseRevAndModeAndLineageTimingsNoSync(path, image, size, kind, baseRev, mode, hasMode, "", "", false)
-			return err
-		}
+	if dur == stageV1Ladder {
 		_, _, err := w.wbCache.PutWithBaseRevAndModeAndLineageTimingsDirSync(path, image, size, kind, baseRev, mode, hasMode, "", "", false)
 		return err
-	default:
-		return w.wbCache.PutWithBaseRevAndMode(path, image, size, kind, baseRev, mode, hasMode)
 	}
+	return w.wbCache.PutWithBaseRevAndMode(path, image, size, kind, baseRev, mode, hasMode)
 }
 
 // applyPendingMode publishes a deferred chmod once the image it describes

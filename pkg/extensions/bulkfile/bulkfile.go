@@ -141,8 +141,11 @@ func (b *Bulkfile) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 		switch {
 		case op.KernelCreate():
 			// Fresh by kernel proof: the preceding lookup saw the path
-			// missing. O_EXCL races are the commit boundary's conflict to
-			// catch, exactly as v1's Create deferred them.
+			// missing. The lookup is not atomic with the create — another
+			// client may create the name in between — so the claim still
+			// reconciles against the open reply below (a non-exclusive
+			// stale negative truncates the file it finds; O_EXCL surfaces
+			// EEXIST from the write plane's probe).
 		case kernelExisting:
 			exists = true
 			// The existing size comes from the open reply's Attr below —
@@ -206,14 +209,32 @@ func (b *Bulkfile) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 		if res.Handle == nil {
 			return res, nil
 		}
-		if exists {
-			if kernelExisting && res.Attr != nil {
-				// The open below answered with the existing image's own
-				// attributes — the state the first boundary truncates.
-				existingSize = res.Attr.Size
-			}
+		switch {
+		case res.Attr != nil && !res.Attr.IsDir() && res.Attr.Size > 0:
+			// The plane below resolved REAL existing content. That is the
+			// kernel OPEN's dentry — or a CREATE whose negative lookup went
+			// stale between the kernel's lookup and this request (another
+			// client created the name; the write plane's own probe takes
+			// its existing-file branch and answers with the row's real
+			// size). Either way the first boundary must express the
+			// truncation down from that content: an empty or shorter image
+			// publishes as a truncating overwrite, never as "nothing to
+			// do" over the old bytes.
+			h.pushed = res.Attr.Size
+			h.dirty = true
+		case exists && res.Attr == nil:
+			// A kernel OPEN resolved an existing dentry but the open below
+			// returned no attributes (a localize overlay handle whose
+			// Stat failed): the existing size is unknown. Force the first
+			// boundary to express the truncation explicitly instead of
+			// assuming the file is empty.
+			h.sizeUnknown = true
+			h.dirty = true
+		case exists && existingSize > 0:
+			// The synthesized-op probe saw content the reply no longer
+			// carries: keep the probe's size as the truncation base.
 			h.pushed = existingSize
-			h.dirty = existingSize > 0
+			h.dirty = true
 		}
 		h.inner = res.Handle
 		b.track(h)
