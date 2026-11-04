@@ -41,8 +41,9 @@ func TestPortExternalChangeDropsLandedWatermark(t *testing.T) {
 	}
 	ctx := context.Background()
 
-	// landAndRecord runs one overwrite cycle and waits for the uploader's
-	// success to record the same-origin watermark.
+	// landAndRecord runs one overwrite cycle and waits for BOTH the
+	// backend content and the uploader's OnSuccess watermark (the backend
+	// can expose content before the callback records the revision).
 	landAndRecord := func(content string) {
 		t.Helper()
 		res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/f", Flags: uint32(syscall.O_RDWR)})
@@ -65,15 +66,14 @@ func TestPortExternalChangeDropsLandedWatermark(t *testing.T) {
 		deadline := time.Now().Add(5 * time.Second)
 		for {
 			if n, ok := b.Node("/f"); ok && string(n.Data) == content {
-				break
+				if _, landed := wb.landedRevision("/f"); landed {
+					break
+				}
 			}
 			if time.Now().After(deadline) {
 				t.Fatalf("cycle for %q never landed", content)
 			}
 			time.Sleep(20 * time.Millisecond)
-		}
-		if _, ok := wb.landedRevision("/f"); !ok {
-			t.Fatal("landed watermark not recorded after a successful cycle")
 		}
 	}
 
@@ -215,8 +215,10 @@ func TestPortWriteBackFlushAdoptsOwnLandedRevision(t *testing.T) {
 		return h
 	}
 
-	// Cycle one: stage + land "first" asynchronously, then wait for the
-	// uploader's success to record the landed watermark.
+	// Cycle one: stage + land "first" asynchronously, then wait for BOTH
+	// the backend content and the uploader's OnSuccess watermark — the
+	// backend can expose the content before the callback records the
+	// landed revision, and the next cycle's assertions read the table.
 	h1 := openExisting()
 	if err := h1.Write(ctx, 0, []byte("first!")); err != nil {
 		t.Fatal(err)
@@ -230,7 +232,9 @@ func TestPortWriteBackFlushAdoptsOwnLandedRevision(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		if n, ok := b.Node("/f"); ok && string(n.Data) == "first!" {
-			break
+			if _, landed := wb.landedRevision("/f"); landed {
+				break
+			}
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("first cycle never landed")
@@ -277,5 +281,125 @@ func TestPortWriteBackFlushAdoptsOwnLandedRevision(t *testing.T) {
 			t.Fatalf("second cycle never landed (base rev %d)", meta.BaseRev)
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestPortUnverifiedStreamSuspendsWatermarkAdoption pins the disconnect
+// window: while the change-event stream has lost continuity (ordinary file
+// API still working), a foreign delete+recreate can replace a path with a
+// LOW revision under a stale high watermark and no invalidation is ever
+// observed. The watermark must neither survive the break nor be adopted
+// during it — the open-time base of the CURRENT row stays authoritative,
+// or the staged snapshot persists the dead incarnation's revision and its
+// upload conflicts forever.
+func TestPortUnverifiedStreamSuspendsWatermarkAdoption(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/f", []byte("seeded"))
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	bus := fs.NewEventBus()
+	wb, err := New(Options{Policy: PolicyWriteBack, Client: cl, WriteCacheDir: t.TempDir(), Events: bus})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := fs.NewChain(wb, terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	// Land our own image: the watermark records revision 2.
+	cycle := func(content string) {
+		t.Helper()
+		res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/f", Flags: uint32(syscall.O_RDWR)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		h := res.Handle.(*bufferingHandle)
+		if err := h.Write(ctx, 0, []byte(content)); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.Release(ctx); err != nil {
+			t.Fatal(err)
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			if n, ok := b.Node("/f"); ok && string(n.Data) == content {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("cycle for %q never landed", content)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	cycle("first!")
+	if r, ok := wb.landedRevision("/f"); !ok || r <= 1 {
+		t.Fatalf("watermark after cycle = %d %v, want revision > 1", r, ok)
+	}
+
+	// Stream loses continuity: the watermark must be dropped and adoption
+	// suspended.
+	bus.Emit(fs.Event{Kind: fs.EventUnverified, Path: "/"})
+	if _, ok := wb.landedRevision("/f"); ok {
+		t.Fatal("EventUnverified did not drop the landed watermark")
+	}
+	if !wb.unverified.Load() {
+		t.Fatal("EventUnverified did not suspend watermark adoption")
+	}
+
+	// Foreign delete+recreate while disconnected: the replacement restarts
+	// at revision 1. A fresh open records base 1; the flush must stage
+	// against THAT, not the dead incarnation's watermark.
+	b.Seed("/f", []byte("foreign"))
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/f", Flags: uint32(syscall.O_RDWR)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := res.Handle.(*bufferingHandle)
+	if err := h.Write(ctx, 0, []byte("second!")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	meta, ok := wb.wbCache.GetMeta("/f")
+	if !ok {
+		t.Fatal("flush did not stage during the unverified window")
+	}
+	if want := int64(1); meta.BaseRev != want {
+		t.Fatalf("staged BaseRev = %d, want the current row's revision %d (the dead watermark was adopted)", meta.BaseRev, want)
+	}
+	if err := h.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if n, ok := b.Node("/f"); ok && string(n.Data) == "second!" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("replacement image never landed — its base was poisoned")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Re-verified: adoption resumes and the table refills from our own
+	// landings only.
+	bus.Emit(fs.Event{Kind: fs.EventVerified, Path: "/"})
+	if wb.unverified.Load() {
+		t.Fatal("EventVerified did not resume watermark adoption")
+	}
+	cycle("third!!")
+	if _, ok := wb.landedRevision("/f"); !ok {
+		t.Fatal("watermark not re-recorded after the stream re-verified")
 	}
 }

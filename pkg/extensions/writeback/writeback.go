@@ -185,6 +185,13 @@ type Writeback struct {
 	// WAL syncer that bounds the lazy staging power-loss window.
 	lazy         bool
 	syncerCancel context.CancelFunc
+	// unverified is set while the change-event stream has lost continuity
+	// (EventUnverified, cleared by EventVerified): same-origin watermarks
+	// prove nothing then — an unobserved foreign delete+recreate may sit
+	// above every recorded incarnation — so the landed table is dropped at
+	// the break and watermark adoption stays suspended until the stream
+	// re-verifies.
+	unverified atomic.Bool
 	// commitSeeder caches the just-committed image (readCache.Put at
 	// commit settle) so reads racing backend replica lag see this mount's
 	// own writes; nil disables seeding.
@@ -373,6 +380,19 @@ func New(opts Options) (*Writeback, error) {
 		opts.Events.On(fs.EventInvalidated, func(ev fs.Event) { w.forgetLanded(ev.Path) })
 		opts.Events.On(fs.EventDelete, func(ev fs.Event) { w.forgetLanded(ev.Path) })
 		opts.Events.On(fs.EventCheckout, func(fs.Event) { w.clearLanded() })
+		// Stream continuity lost: ordinary file API keeps working while
+		// change events stop, so a foreign delete+recreate can replace a
+		// path with a LOW revision under a stale high watermark and no
+		// invalidation is ever observed. Every same-origin proof is
+		// suspended — drop the table (it can only refill from landings
+		// that happen after the break, all provably ours) and keep
+		// adoption off until EventVerified; delayed event delivery cannot
+		// retrofit a base a staging already persisted during the gap.
+		opts.Events.On(fs.EventUnverified, func(fs.Event) {
+			w.unverified.Store(true)
+			w.clearLanded()
+		})
+		opts.Events.On(fs.EventVerified, func(fs.Event) { w.unverified.Store(false) })
 	}
 	// FlushDebounce semantics: 0 disables, negative means unset (2s
 	// default — the CLI's default -1 must land on the default, not on 0).
@@ -4584,7 +4604,7 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, isNew bool, dur
 	h.mu.Unlock()
 	if isNew {
 		baseRev = 0
-	} else {
+	} else if !h.w.unverified.Load() {
 		// v1 adoptCommittedRevisionLocked: the CAS base composes with this
 		// mount's OWN landed watermark — the local table the queue and the
 		// uploader record on every success — never a remote HEAD (v1's
@@ -4596,7 +4616,11 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, isNew bool, dur
 		// under an unobserved open). A foreign write never enters the
 		// table, so it stays a conflict: adopting its revision would let
 		// the stale image overwrite it silently (hello+X vs WORLD landed
-		// Xello).
+		// Xello). While the event stream is UNVERIFIED the watermark
+		// proves nothing — an unobserved foreign delete+recreate may sit
+		// above the recorded incarnation — so the open-time base, read
+		// fresh from the current row, stays authoritative until
+		// EventVerified.
 		if r, ok := h.w.landedRevision(h.path); ok && (baseRev <= 0 || r > baseRev) {
 			h.mu.Lock()
 			h.baseRev = r
