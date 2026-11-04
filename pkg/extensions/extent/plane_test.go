@@ -4695,15 +4695,18 @@ func TestEngineUsesUpstreamCacheDefaults(t *testing.T) {
 	if got.Prefetch != 1 {
 		t.Fatalf("Prefetch = %d, want 1 (upstream default)", got.Prefetch)
 	}
-	// SelfCheck must normalize the cache dir with the volume UUID and leave
-	// a usable eviction policy.
+	// The engine calls SelfCheck with an EMPTY uuid: the cache directory is
+	// already per-mount scoped, so upstream's UUID namespace segment would
+	// only add a redundant level (.../<scope>/extent/<uuid>).
 	conf := got
 	conf.CacheSize = 64 << 20
-	conf.CacheDir = filepath.Join(engineCacheDir(t), "extent")
-	conf.SelfCheck("vol-uuid")
-	if !strings.HasSuffix(conf.CacheDir, "vol-uuid") {
-		t.Fatalf("SelfCheck cache dir = %q, want it UUID-scoped", conf.CacheDir)
+	dir := filepath.Join(engineCacheDir(t), "extent")
+	conf.CacheDir = dir
+	conf.SelfCheck("")
+	if conf.CacheDir != dir {
+		t.Fatalf("SelfCheck cache dir = %q, want it unchanged at %q", conf.CacheDir, dir)
 	}
+	// SelfCheck must still normalize everything else.
 	if conf.CacheEviction == "" {
 		t.Fatal("SelfCheck must default the eviction policy")
 	}

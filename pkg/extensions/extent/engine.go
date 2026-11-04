@@ -137,12 +137,19 @@ func NewEngine(cfg EngineConfig) *Engine {
 		MaxStageWrite: cfg.MaxStageWrite,
 	}
 	// SelfCheck is upstream's normalization step (cmd/mount.go calls it
-	// before NewCachedStore): it appends the volume UUID to every cache
-	// directory, applies the eviction/checksum defaults, and disables
-	// writeback when the cache is memory-only. Skipping it left the cache
-	// dir un-scoped ("unknown cache eviction policy" warnings) and the
-	// writeback setup unvalidated.
-	chunkConf.SelfCheck(b.format.UUID)
+	// before NewCachedStore): it applies the eviction/checksum defaults and
+	// disables writeback when the cache is memory-only. Skipping it left
+	// the cache dir un-scoped ("unknown cache eviction policy" warnings)
+	// and the writeback setup unvalidated.
+	//
+	// An EMPTY uuid on purpose: upstream appends it as a cache-directory
+	// namespace so several volumes can share one cache dir, but this
+	// engine already owns a per-mount directory (the mount's scoped cache
+	// root, whose hash covers server + mountpoint + remote root +
+	// credential). Appending a fixed per-plane UUID would only add a
+	// redundant path segment (.../<scope>/extent/<uuid>), so the cache
+	// stays exactly .../<scope>/extent.
+	chunkConf.SelfCheck("")
 	store := chunk.NewCachedStore(b.Storage(), chunkConf, nil)
 	conf := &vfs.Config{
 		Meta:            &meta.Config{Retries: 1},
