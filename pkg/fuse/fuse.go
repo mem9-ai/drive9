@@ -2064,6 +2064,18 @@ func (f *FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName stri
 	if pino2, ok := f.inodes.GetInode(parentDirOf(newPath)); ok {
 		f.InvalidateEntry(pino2, pathpkg.Base(newPath))
 	}
+	// A rename that REPLACED a destination must also drop the destination
+	// inode's cached data: the kernel keeps the old name's pages and attrs
+	// under the still-live inode id, so a post-close read of the new name
+	// would serve the replaced file's bytes (H2: extent source renamed
+	// over an open classic destination).
+	if ino2, ok := f.inodes.GetInode(newPath); ok {
+		if e, eok := f.inodes.GetEntry(ino2); eok {
+			f.InvalidateContent(ino2, uint64(e.Size))
+		} else {
+			f.InvalidateContent(ino2, 0)
+		}
+	}
 	// v1 surgical rename bookkeeping, applied after the events so their
 	// invalidations don't wipe it: remove the old name and upsert the new
 	// one in the cached listings — the next stat then answers locally
