@@ -3,6 +3,7 @@ package extent
 import (
 	"context"
 	"sort"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -425,6 +426,20 @@ func (h *Handler) claimsPattern(path string) bool {
 	cleaned = strings.TrimPrefix(cleaned, "/")
 	for _, p := range h.patterns {
 		if p.MatchCanonical(cleaned) {
+			return true
+		}
+	}
+	// A single-segment pattern (no '/') also claims by BASENAME at any
+	// depth, agreeing with the write plane's promotion rule: the builtin
+	// "extent" profile supplies "*", which must match mix/a.db, and
+	// "*.db" must claim nested creates the same way the queue promotes
+	// them.
+	for _, raw := range h.opts.Patterns {
+		raw = strings.TrimSpace(raw)
+		if raw == "" || strings.Contains(raw, "/") {
+			continue
+		}
+		if ok, _ := filepath.Match(raw, pathutil.BaseName(cleaned)); ok {
 			return true
 		}
 	}

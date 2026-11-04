@@ -766,7 +766,25 @@ func matchExtentPattern(globs []globMatcher, path string) bool {
 // create-time decision.
 type globMatcher func(path string) bool
 
+// hasSegmentPattern reports whether any raw pattern is a single-segment
+// (no '/') glob — those also match by basename at any depth.
+func hasSegmentPattern(patterns []string) bool {
+	for _, raw := range patterns {
+		raw = strings.TrimSpace(raw)
+		if raw != "" && !strings.Contains(raw, "/") {
+			return true
+		}
+	}
+	return false
+}
+
 func compileExtentGlobs(patterns []string) []globMatcher {
+	// An EMPTY pattern list must stay empty: the caller's hybrid routing
+	// (size-cutoff promotion) keys on len(globs) == 0, and a vacuous
+	// matcher here would disable default-mount promotion entirely.
+	if len(pathfilter.CompileAll(patterns)) == 0 && !hasSegmentPattern(patterns) {
+		return nil
+	}
 	compiled := pathfilter.CompileAll(patterns)
 	// A single-segment pattern (no '/') also matches by BASENAME at any
 	// depth: the profile's [extent] globs follow the suite's contract
@@ -1997,9 +2015,9 @@ func (h *bufferingHandle) Write(ctx context.Context, off int64, data []byte) err
 			h.mu.Lock()
 			cur := append([]byte(nil), h.buf.Bytes()...)
 			if !bytes.Equal(image, cur) || landedRev > h.baseRev {
-				if err := h.adoptAppendImageLocked(image, landedRev); err != nil {
+				if aerr := h.adoptAppendImageLocked(image, landedRev); aerr != nil {
 					h.mu.Unlock()
-					return err
+					return aerr
 				}
 			}
 			h.mu.Unlock()
@@ -2082,7 +2100,8 @@ func (h *bufferingHandle) Sync(ctx context.Context) error {
 	if h.w.interactive && h.w.opts.Policy == PolicyWriteBack && h.w.queue != nil && h.w.opts.Staging != nil {
 		// v1 interactive fsync: the staging is unconditionally durable and
 		// a JournalFsync frame fences the async commit's marker ordering.
-		return h.stageAndEnqueueOpt(ctx, true, true)
+		_, err := h.stageAndEnqueueOpt(ctx, true, true)
+	return err
 	}
 	if err := h.commitLocked(ctx); err != nil {
 		return err
@@ -2148,8 +2167,8 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 			// through the shadow spill path — bounded memory, no whole-image
 			// materialization — and land synchronously through the queue's
 			// streaming upload, waiting for THIS path only.
-			if err := h.stageAndEnqueueOpt(ctx, true, false); err != nil {
-				return err
+			if _, serr0 := h.stageAndEnqueueOpt(ctx, true, false); serr0 != nil {
+				return serr0
 			}
 			if !h.w.queue.WaitPathDeadline(h.path, uploadTimeout) {
 				return fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
@@ -2165,13 +2184,10 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 		// syncDataCommitContext): a kernel interrupt after the PUT hit the
 		// wire must not cancel it into an ambiguous server-side state.
 		if h.w.extentRoute(h.path, size) {
-			if err := h.stageAndEnqueueOpt(ctx, true, false); err != nil {
-				return err
+			staged, serr := h.stageAndEnqueueOpt(ctx, true, false)
+			if serr != nil {
+				return serr
 			}
-			// Bind the completion to exactly this staging: a newer
-			// staging begun while the upload is in flight keeps its own
-			// identity and its own completion.
-			staged := h.currentStagedSnapshot()
 			if err := h.w.queue.WaitPathOutcome(h.path, uploadTimeout); err != nil {
 				// Idle is not success: a terminally failed queued upload
 				// must surface at the close(2) durability boundary.
@@ -2263,10 +2279,10 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 			// path's landing (the close-sync large-file contract): the name
 			// must be visible as extent at close(2), and Release must not
 			// double-commit a classic image beside the queued one.
-			if err := h.stageAndEnqueueOpt(ctx, true, false); err != nil {
-				return err
+			staged, serr := h.stageAndEnqueueOpt(ctx, true, false)
+			if serr != nil {
+				return serr
 			}
-			staged := h.currentStagedSnapshot()
 			if err := h.w.queue.WaitPathOutcome(h.path, uploadTimeout); err != nil {
 				return fs.StatusErrorOf(gofuse.Status(syscall.EIO))
 			}
@@ -3868,9 +3884,9 @@ func (h *bufferingHandle) commitInline(ctx context.Context) error {
 	if size >= commitInlineStreamThreshold {
 		newReader = func() io.Reader { return &bufferReader{h: h, size: size} }
 	} else {
-		if err := h.buf.LoadMissingParts(); err != nil {
+		if lerr := h.buf.LoadMissingParts(); lerr != nil {
 			h.mu.Unlock()
-			return err
+			return lerr
 		}
 		image = h.buf.Bytes()
 		newReader = func() io.Reader { return bytes.NewReader(image) }
@@ -4194,7 +4210,8 @@ func (h *bufferingHandle) ensureBufferLocked(ctx context.Context) error {
 // and hands it to the async commit queue (the true writeback path). The
 // close boundary stages durably unless lazy staging is on (v1).
 func (h *bufferingHandle) stageAndEnqueue(ctx context.Context) error {
-	return h.stageAndEnqueueOpt(ctx, !h.w.lazy, false)
+	_, err := h.stageAndEnqueueOpt(ctx, !h.w.lazy, false)
+	return err
 }
 
 // stageAndEnqueueOpt is stageAndEnqueue with explicit durability controls:
@@ -4202,15 +4219,20 @@ func (h *bufferingHandle) stageAndEnqueue(ctx context.Context) error {
 // appends a JournalFsync frame after staging so the async commit's
 // JournalCommit marker lands at a higher Seq — replay then cannot
 // resurrect a path the commit settled (v1 interactive fsync ordering).
-func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journalFsync bool) error {
+func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journalFsync bool) (stagedSnapshot string, err error) {
+	stagedSnapshot, err = h.stageAndEnqueueInner(ctx, durable, journalFsync)
+	return stagedSnapshot, err
+}
+
+func (h *bufferingHandle) stageAndEnqueueInner(ctx context.Context, durable, journalFsync bool) (staged string, err error) {
 	// #1023 staging fence: an append handle must not publish an image a
 	// sibling's landed commit already superseded — compose (or reject)
 	// before this staging owns the path (v1 adoptLandedAppendSnapshot at
 	// the stageShadow fence).
 	if h.appendParticipant() {
-		image, landedRev, err := h.w.fenceRefreshAppendBase(ctx, h)
-		if err != nil {
-			return err
+		image, landedRev, ferr0 := h.w.fenceRefreshAppendBase(ctx, h)
+		if ferr0 != nil {
+			return "", ferr0
 		}
 		if image != nil {
 			h.mu.Lock()
@@ -4218,7 +4240,7 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 			if !bytes.Equal(image, cur) || landedRev > h.baseRev {
 				if err := h.adoptAppendImageLocked(image, landedRev); err != nil {
 					h.mu.Unlock()
-					return err
+					return staged, err
 				}
 			}
 			h.mu.Unlock()
@@ -4227,7 +4249,7 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 	h.mu.Lock()
 	if !h.dirty || h.buf == nil {
 		h.mu.Unlock()
-		return nil
+		return "", nil
 	}
 	size := h.buf.Size()
 	spill := size >= commitInlineStreamThreshold
@@ -4236,18 +4258,13 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 		// unloaded parts, which would publish a corrupted image.
 		if err := h.buf.LoadMissingParts(); err != nil {
 			h.mu.Unlock()
-			return err
+			return staged, err
 		}
 	}
 	isNew, baseRev := h.isNew, h.baseRev
 	// A zero-based image (fresh create, or O_TRUNC discarding the base)
 	// holds only zeros beyond its written parts — its spill stays sparse.
 	zeroBase := isNew || h.trunc
-	// The deferred chmod (or a create mode ≠ 0644) rides the staging entry:
-	// the queue snapshots Mode at enqueue and applies it post-landing
-	// (onCommitSuccess). Consume it here — a later staging must not re-apply
-	// a stale mode. Dropping it entirely (the old behavior) lost every chmod
-	// deferred onto an open writeback handle (chmod/12: 0777 → 0644).
 	mode, hasMode := h.pendingMode, h.hasPendingMode
 	h.pendingMode, h.hasPendingMode = 0, false
 	// Lineage (v1 ensureStagedSnapshotLineageLocked): a fresh snapshot ID
@@ -4266,6 +4283,12 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 		stagedContentVersion = h.buf.ContentVersion()
 	}
 	h.stagedContentVersion = stagedContentVersion
+	// Bind this staging's identity for its completion: the value is
+	// minted under h.mu and returned to the caller, so a post-wait
+	// completion refers to exactly this operation even when a later
+	// staging (a concurrent fsync on the drain path) has since replaced
+	// h.stagedSnapshotID.
+	staged = snapshotID
 	// The landing of THIS image must find THIS handle even when a newer
 	// writer has since opened the same path. Earlier registrations of
 	// this handle STAY: the new staging has not yet replaced their
@@ -4307,18 +4330,18 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 		// upload asynchronously: close(2) returns after the LOCAL durable
 		// stage (the write-back policy's defining contract), not after the
 		// network transfer.
-		if err := h.spillToShadow(st, buf, baseRev, zeroBase); err != nil {
-			return err
+		if serr := h.spillToShadow(st, buf, baseRev, zeroBase); serr != nil {
+			return staged, serr
 		}
 		if durable {
 			if err := st.Shadow.Sync(h.path); err != nil {
-				return err
+				return staged, err
 			}
 		}
 	} else {
 		image = buf.Bytes()
 		if err := st.Shadow.WriteFull(h.path, image, baseRev); err != nil {
-			return err
+			return staged, err
 		}
 		if w.pendingSeeder != nil {
 			w.pendingSeeder(h.path, image)
@@ -4329,20 +4352,19 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 			// the bytes are durable (journal replay rebuilds the pending entry
 			// and the commit queue re-uploads from the shadow).
 			if err := st.Shadow.Sync(h.path); err != nil {
-				return err
+				return staged, err
 			}
 		}
 	}
 	shadowGen := st.Shadow.ActiveGeneration(h.path)
 	var pendingGen uint64
-	var err error
 	if spill {
 		pendingGen, err = st.Pending.PutShadowSpillWithModeAndLineage(h.path, size, kind, baseRev, mode, hasMode, snapshotID, parentSnapshotID, true)
 	} else {
 		pendingGen, err = st.Pending.PutWithBaseRevAndModeAndLineage(h.path, int64(len(image)), kind, baseRev, mode, hasMode, snapshotID, parentSnapshotID, true)
 	}
 	if err != nil {
-		return err
+		return staged, err
 	}
 	if journalFsync && st.Journal != nil {
 		_ = st.Journal.Append(staging.JournalEntry{
@@ -4383,7 +4405,7 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 		w.opts.Events.Emit(fs.Event{Kind: fs.EventStaged, Path: h.path, Size: entry.Size})
 	}
 	if err := w.queue.Enqueue(entry); err != nil {
-		return err
+		return staged, err
 	}
 	h.mu.Lock()
 	h.dirty = false
@@ -4394,7 +4416,7 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 	// this handle's content identity — the next staging parents on it.
 	h.contentSnapshotID = snapshotID
 	h.mu.Unlock()
-	return nil
+	return snapshotID, nil
 }
 
 // spillToShadow stages the buffer's complete image into the shadow store
@@ -4568,10 +4590,10 @@ func (h *bufferingHandle) commitLocked(ctx context.Context) error {
 		}
 		return h.buf.Size()
 	}(); h.w.extentRoute(h.path, size) {
-		if err := h.stageAndEnqueueOpt(ctx, true, false); err != nil {
-			return err
+		staged, serr := h.stageAndEnqueueOpt(ctx, true, false)
+		if serr != nil {
+			return serr
 		}
-		staged := h.currentStagedSnapshot()
 		if err := h.w.queue.WaitPathOutcome(h.path, uploadTimeout); err != nil {
 			return fs.StatusErrorOf(gofuse.Status(syscall.EIO))
 		}
