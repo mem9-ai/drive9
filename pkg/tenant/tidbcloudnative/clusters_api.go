@@ -56,13 +56,15 @@ func IsLocalClustersBackend() bool {
 }
 
 // DBTLSModeForBackend returns the mysql driver TLS mode for tenant DB
-// connections. Local Docker TiDB has no TLS.
+// connections. Local Docker TiDB has no TLS; every other endpoint is verified.
+// Private-link gateways whose certificate is not issued for the address the
+// client dials need the explicit DRIVE9_DB_TLS_SKIP_VERIFY opt-out instead of
+// the default, because these connections carry tenant database passwords.
 func DBTLSModeForBackend() string {
 	if IsLocalClustersBackend() {
 		return ""
 	}
-	v := strings.TrimSpace(strings.ToLower(os.Getenv(EnvTiDBCloudNativeUsePrivateEndpoint)))
-	if v == "1" || v == "true" || v == "yes" {
+	if tenant.DBTLSSkipVerifyRequested() {
 		return "skip-verify"
 	}
 	return "true"

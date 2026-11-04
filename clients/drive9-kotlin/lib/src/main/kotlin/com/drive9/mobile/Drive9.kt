@@ -26,6 +26,7 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
 import java.io.RandomAccessFile
+import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.HttpURLConnection
 import java.net.URI
@@ -37,6 +38,7 @@ import java.time.format.DateTimeParseException
 import java.util.Base64
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.zip.CRC32C
+import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
 
 private const val DEFAULT_SMALL_FILE_THRESHOLD = 50_000L
@@ -51,6 +53,14 @@ private const val REMOVE_ALL_MAX_RETRIES = 4
 // header so a pathological value (e.g. Retry-After: 999999) cannot block the
 // caller for days.
 private const val REMOVE_ALL_MAX_RETRY_DELAY_SECS = 60L
+
+// RAW_HTTP_READ_TIMEOUT_MS bounds the raw-socket transport, covering the TLS
+// handshake, the write and the response read.
+private const val RAW_HTTP_READ_TIMEOUT_MS = 120_000
+
+// RAW_HTTP_CONNECT_TIMEOUT_MS bounds TCP connection establishment, matching the
+// connectTimeout used by the HttpURLConnection transport.
+private const val RAW_HTTP_CONNECT_TIMEOUT_MS = 30_000
 
 /** Idiomatic Kotlin Drive9 client implemented with platform-native HTTP. */
 public class Drive9Client(
@@ -806,7 +816,27 @@ public class Drive9Client(
         }
     }
 
+    private fun requireSecureForApiKey(url: String) {
+        if (apiKeyValue.isEmpty()) return
+        val uri = URI(url)
+        val secure = uri.scheme.equals("https", ignoreCase = true)
+        if (secure) return
+        // Fail closed: an http authority the URI parser cannot resolve to a host
+        // (opaque authority, userinfo-only, malformed) must not be treated as
+        // loopback just because there is nothing to compare.
+        val host = uri.host
+        if (host != null && isLoopbackHost(host)) return
+        // A bearer token on a plaintext connection is a credential in the clear.
+        throw Drive9Exception.Drive9(
+            "request",
+            null,
+            "refusing to send the API key over plaintext HTTP to ${host ?: url}; use https",
+            null,
+        )
+    }
+
     private fun open(method: String, url: String): HttpURLConnection {
+        requireSecureForApiKey(url)
         val conn = URI(url).toURL().openConnection() as HttpURLConnection
         conn.requestMethod = method
         if (apiKeyValue.isNotEmpty()) {
@@ -842,6 +872,14 @@ public class Drive9Client(
             input = DisconnectingInputStream(conn.inputStream, conn),
             contentLength = conn.headerFieldLong("Content-Length") ?: 0L,
         )
+    }
+
+    private fun isLoopbackHost(host: String): Boolean {
+        val h = host.trim().removeSurrounding("[", "]").lowercase()
+        if (h == "localhost" || h == "::1") return true
+        val parts = h.split('.')
+        return parts.size == 4 && parts[0] == "127" &&
+            parts.drop(1).all { it.toIntOrNull()?.let { n -> n in 0..255 } == true }
     }
 
     private fun rawRequestBytes(method: String, url: String, headers: Map<String, String>): ByteArray {
@@ -886,13 +924,56 @@ public class Drive9Client(
         val ssl = uri.scheme.equals("https", ignoreCase = true)
         val port = if (uri.port > 0) uri.port else if (ssl) 443 else 80
         val host = uri.host ?: throw Drive9Exception.Drive9("request", null, "missing host in URL: $url", null)
-        val socket = if (ssl) {
-            SSLSocketFactory.getDefault().createSocket(host, port)
+        // The request carries the caller's API key: reuse the same plaintext
+        // rule as the main transport before anything is written.
+        requireSecureForApiKey(url)
+        // Establish the TCP connection ourselves so it honors the same connect
+        // timeout as open(): Socket(host, port) and SSLSocketFactory.createSocket
+        // both connect with the OS default (minutes on a blackholed host), and
+        // soTimeout only covers reads after a connection exists.
+        val connected = Socket()
+        try {
+            connected.connect(InetSocketAddress(host, port), RAW_HTTP_CONNECT_TIMEOUT_MS)
+        } catch (t: Throwable) {
+            runCatching { connected.close() }
+            throw t
+        }
+        val socket: Socket = if (ssl) {
+            // Wrap the connected socket: the factory's host/port overload would
+            // open a second, unbounded connection. The wrapper owns the socket
+            // once it exists (autoClose), so only a failure while creating it
+            // needs to close the plain socket.
+            val sslSocket = try {
+                (SSLSocketFactory.getDefault() as SSLSocketFactory)
+                    .createSocket(connected, host, port, true) as SSLSocket
+            } catch (t: Throwable) {
+                runCatching { connected.close() }
+                throw t
+            }
+            // A peer that accepts the connection but stalls the handshake must
+            // not hang the caller: set the read timeout before handshaking, and
+            // close the socket if the handshake fails so the descriptor is not
+            // leaked.
+            sslSocket.soTimeout = RAW_HTTP_READ_TIMEOUT_MS
+            try {
+                // The wrapped socket still needs an identity check: without it
+                // the certificate chain is validated against nothing in
+                // particular and a MITM with any valid certificate would
+                // receive the bearer token.
+                sslSocket.sslParameters = sslSocket.sslParameters.apply {
+                    endpointIdentificationAlgorithm = "HTTPS"
+                }
+                sslSocket.startHandshake()
+            } catch (t: Throwable) {
+                runCatching { sslSocket.close() }
+                throw t
+            }
+            sslSocket
         } else {
-            Socket(host, port)
+            connected
         }
         socket.use { s ->
-            s.soTimeout = 120_000
+            s.soTimeout = RAW_HTTP_READ_TIMEOUT_MS
             val target = buildString {
                 append(uri.rawPath.ifEmpty { "/" })
                 if (!uri.rawQuery.isNullOrEmpty()) append("?").append(uri.rawQuery)

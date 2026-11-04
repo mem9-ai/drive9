@@ -179,6 +179,14 @@ func main() {
 			zap.Bool("path_style", s3cfg.ForcePathStyle),
 			zap.String("credentials", s3client.CredentialLogValue(s3cfg.AccessKeyID)),
 			zap.String("role", s3client.RoleLogValue(s3cfg.RoleARN)))
+		// Objects are stored unencrypted at rest unless the bucket default or
+		// this policy says otherwise; say so once at startup for a real bucket
+		// so a deployment cannot end up storing tenant data in the clear
+		// without noticing.
+		if s3cfg.EncryptionPolicy.Mode == meta.S3EncryptionModeNone {
+			logger.Warn(context.Background(), "s3_encryption_disabled",
+				zap.String("hint", "set DRIVE9_S3_ENCRYPTION_MODE=sse-kms (with DRIVE9_S3_KMS_KEY_ID) or sse-s3 to encrypt objects at rest"))
+		}
 	}
 
 	encryptType := envOr("DRIVE9_ENCRYPT_TYPE", "local_aes")
@@ -274,6 +282,17 @@ func main() {
 			die(fmt.Errorf("invalid DRIVE9_VAULT_MASTER_KEY: %w", err))
 		}
 	}
+	// Retired master keys are unwrap-only: they let a deployment rotate
+	// DRIVE9_MASTER_KEY / DRIVE9_VAULT_MASTER_KEY without losing the values the
+	// old key wrapped. New writes always use the current key.
+	previousMasterKeys, err := decodePreviousMasterKeys(os.Getenv("DRIVE9_MASTER_KEY_PREVIOUS"))
+	if err != nil {
+		die(fmt.Errorf("invalid DRIVE9_MASTER_KEY_PREVIOUS: %w", err))
+	}
+	previousVaultMasterKeys, err := decodePreviousMasterKeys(os.Getenv("DRIVE9_VAULT_MASTER_KEY_PREVIOUS"))
+	if err != nil {
+		die(fmt.Errorf("invalid DRIVE9_VAULT_MASTER_KEY_PREVIOUS: %w", err))
+	}
 
 	var pool *tenant.Pool
 	var leaderManager *leader.Manager
@@ -288,9 +307,14 @@ func main() {
 		if strings.EqualFold(string(eType), string(encrypt.TypeKMS)) || strings.EqualFold(string(eType), string(encrypt.TypeAliyunKMS)) || strings.EqualFold(string(eType), string(encrypt.TypeTencentKMS)) {
 			eKey = kmsKey
 		}
+		var previousKeyHex []string
+		for _, key := range previousMasterKeys {
+			previousKeyHex = append(previousKeyHex, hex.EncodeToString(key))
+		}
 		enc, err := encrypt.New(context.Background(), encrypt.Config{
 			Type:              eType,
 			Key:               eKey,
+			PreviousKeys:      previousKeyHex,
 			Region:            s3cfg.Region,
 			AliyunKMSEndpoint: aliyunKMSEndpoint,
 		})
@@ -441,7 +465,9 @@ func main() {
 		TiDBCloudFreePlanLimits:         tidbCloudFreePlanLimits,
 		LegacyStarterProvisioner:        legacyStarterProvisioner,
 		TokenSecret:                     tokenSecret,
+		AllowAnonymousProvision:         envBool("DRIVE9_ALLOW_ANONYMOUS_PROVISION", false),
 		VaultMasterKey:                  vaultMasterKey,
+		VaultMasterKeyPrevious:          previousVaultMasterKeys,
 		VaultIssuerURL:                  vaultIssuerURL(addr),
 		PublicURL:                       publicBaseURL(addr),
 		S3Dir:                           s3cfg.Dir,
@@ -487,6 +513,32 @@ func main() {
 		}
 		close(shutdownDone)
 	}()
+
+	// Dedicated metrics listener. /metrics is never mounted on the API mux, so
+	// the Service/Ingress that exposes DRIVE9_LISTEN_ADDR cannot reach process
+	// metrics. Binding happens here (not in the goroutine) so a port conflict
+	// fails startup instead of silently losing the scrape target.
+	metricsAddr, metricsEnabled := resolveMetricsListenAddr(os.Getenv("DRIVE9_METRICS_LISTEN"), localProvider)
+	if metricsEnabled && localProvider {
+		if err := rejectLocalProviderNonLoopbackMetrics(metricsAddr); err != nil {
+			die(err)
+		}
+	}
+	if metricsEnabled {
+		metricsLn, err := net.Listen("tcp", metricsAddr)
+		if err != nil {
+			die(fmt.Errorf("listen metrics on %s: %w", metricsAddr, err))
+		}
+		go func() {
+			if err := serveMetrics(stopCtx, metricsLn); err != nil {
+				logger.Error(context.Background(), "metrics_server_failed",
+					zap.String("addr", metricsAddr), zap.Error(err))
+				die(err)
+			}
+		}()
+	} else {
+		logger.Info(context.Background(), "metrics_server_disabled")
+	}
 
 	die(srv.ListenAndServe(addr))
 	// ListenAndServe returns as soon as Shutdown closes the listener, which can
@@ -581,6 +633,13 @@ func (cfg s3Config) awsConfig() s3client.AWSConfig {
 	}
 }
 
+// tlsDirectlyEnabled reports whether the API listener will serve HTTPS itself
+// (both halves of the certificate configuration are present).
+func tlsDirectlyEnabled() bool {
+	return strings.TrimSpace(os.Getenv("DRIVE9_TLS_CERT_FILE")) != "" &&
+		strings.TrimSpace(os.Getenv("DRIVE9_TLS_KEY_FILE")) != ""
+}
+
 func versionText() string {
 	return buildinfo.String("drive9-server")
 }
@@ -593,6 +652,18 @@ func usage(out io.Writer, exitCode int) {
 
 environment:
   DRIVE9_LISTEN_ADDR serve listen address (default: :9009)
+  DRIVE9_METRICS_LISTEN address for the dedicated /metrics listener (default: :9090;
+                        provider=local defaults to 127.0.0.1:9090). "off" disables it.
+                        /metrics is never served on the API listener.
+  DRIVE9_ALLOW_ANONYMOUS_PROVISION accept POST /v1/provision without a caller TiDB Cloud
+                        key pair, spending the server's default credential (default: false).
+                        provider=local is always anonymous.
+  DRIVE9_TLS_CERT_FILE  serve HTTPS directly: PEM certificate chain. Requires
+  DRIVE9_TLS_KEY_FILE   the matching PEM private key. Without them the API listener is
+                        plaintext; terminate TLS at the ingress or set these.
+  DRIVE9_MASTER_KEY_PREVIOUS comma-separated hex of retired master keys, unwrap-only, so
+                        DRIVE9_MASTER_KEY can be rotated without losing stored values.
+  DRIVE9_VAULT_MASTER_KEY_PREVIOUS same for DRIVE9_VAULT_MASTER_KEY (retired vault keys).
   DRIVE9_PUBLIC_URL  externally reachable base URL for presigned URLs (required for remote clients)
   DRIVE9_META_DSN    control-plane MySQL DSN (required)
   DRIVE9_POOL_MAX_TENANTS max cached tenant backends per pod (default: 1024)
@@ -655,6 +726,9 @@ environment:
   DRIVE9_TIDBCLOUD_NATIVE_PUBLIC_KEY optional default TiDB Cloud API public key for tidb_cloud_native create/delete when caller omits it
   DRIVE9_TIDBCLOUD_NATIVE_PRIVATE_KEY optional default TiDB Cloud API private key for tidb_cloud_native create/delete when caller omits it
   DRIVE9_TIDBCLOUD_NATIVE_USE_PRIVATE_ENDPOINT true|false to use TiDB Cloud private endpoint hosts for tidb_cloud_native
+  DRIVE9_DB_TLS_SKIP_VERIFY true|false (default: false). Tenant DB connections verify the
+                        server certificate; set this only for a private-link gateway whose
+                        certificate is not issued for the address the client dials.
   DRIVE9_TIDBCLOUD_PRIVATE_ENDPOINT_HOST_MAP comma-separated public_host=private_host mappings (also accepts public_host:private_host);
                                              when set, disables legacy single-host private endpoint overrides
   DRIVE9_TIDBCLOUD_TENCENT_PRIVATE_ENDPOINT_HOST legacy tencentcloud private endpoint fallback host, used only when host map is unset
@@ -791,13 +865,22 @@ func publicBaseURL(listenAddr string) string {
 		return v
 	}
 
+	// Presigned URLs are minted from this base. When the listener serves TLS
+	// directly, the scheme must follow: an http:// URL against an https
+	// listener is rejected by every client (and would send signed object URLs
+	// in the clear).
+	scheme := "http"
+	if tlsDirectlyEnabled() {
+		scheme = "https"
+	}
+
 	// Without DRIVE9_PUBLIC_URL, only allow explicit loopback addresses.
 	// Wildcard or non-loopback addresses would produce unreachable presigned URLs.
 	switch {
 	case strings.HasPrefix(listenAddr, "127.0.0.1:"),
 		strings.HasPrefix(listenAddr, "localhost:"),
 		strings.HasPrefix(listenAddr, "[::1]:"):
-		return "http://" + listenAddr
+		return scheme + "://" + listenAddr
 	case strings.HasPrefix(listenAddr, "http://"), strings.HasPrefix(listenAddr, "https://"):
 		return strings.TrimRight(listenAddr, "/")
 	default:
@@ -1286,4 +1369,30 @@ func envDurationCompat(canonical, deprecated string, fallback time.Duration) tim
 		return envDuration(deprecated, fallback)
 	}
 	return fallback
+}
+
+// decodePreviousMasterKeys parses a comma-separated list of retired 32-byte
+// master keys (hex). Retired keys are unwrap-only, which is what makes a
+// master-key rotation possible without losing the values the old key wrapped.
+func decodePreviousMasterKeys(raw string) ([][]byte, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	var out [][]byte
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		key, err := hex.DecodeString(part)
+		if err != nil {
+			return nil, fmt.Errorf("decode retired master key: %w", err)
+		}
+		if len(key) != 32 {
+			return nil, fmt.Errorf("retired master key must be 32 bytes, got %d", len(key))
+		}
+		out = append(out, key)
+	}
+	return out, nil
 }
