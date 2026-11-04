@@ -5124,19 +5124,6 @@ func stagedManifestPath(t *testing.T, br *Bridge) string {
 	return recs[0].m.Path
 }
 
-// stagedNextPath reads the (single) staged record's pending destination.
-func stagedNextPath(t *testing.T, br *Bridge) string {
-	t.Helper()
-	recs, err := br.scanStaged()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(recs) != 1 {
-		t.Fatalf("staged records = %d, want 1", len(recs))
-	}
-	return recs[0].m.NextPath
-}
-
 // Round-53: an empty flush must not materialize a classic name while the
 // descriptor can still write. If it did, the next write would face an
 // occupant it can neither attribute nor delete — and on a sparse write the
@@ -5195,19 +5182,6 @@ func TestEmptyFileMaterializesAtClose(t *testing.T) {
 	if n := f.hashParsedLayout("/d/t.bin"); n != "classic" {
 		t.Fatalf("layout after close = %q, want classic (touch must materialize the name)", n)
 	}
-}
-
-// sizeOf reports the server-side size the fake reports for a path.
-func (f *fakeV2) sizeOf(path string) int64 {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if c, ok := f.extent[path]; ok {
-		return int64(len(c))
-	}
-	if c, ok := f.classic[path]; ok {
-		return int64(len(c))
-	}
-	return -1
 }
 
 // hashParsedLayout reports the fake's stored layout for a path ("", "extent"
