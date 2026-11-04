@@ -423,3 +423,69 @@ func TestPortUnknownIdentityLandingRefusesRebase(t *testing.T) {
 		t.Fatalf("backend = %q, want the winner's image untouched", n.Data)
 	}
 }
+
+// TestPortRecoveryIntervalReadsServeLedgerImage pins the ownership of reads
+// through the whole recovery interval, including a queue that has not (yet)
+// landed: a crashed enqueue can leave a ledger entry G2 plus an older
+// same-length .dat/.meta pair G1; while the ledger owns the path, a
+// read-only reopen must capture the LEDGER image (or nothing), never the
+// superseded cache pair that merely matches its size.
+func TestPortRecoveryIntervalReadsServeLedgerImage(t *testing.T) {
+	b := testbackend.NewBackend()
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	ledger, err := staging.NewStaging(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wb, err := New(Options{Policy: PolicyWriteBack, Client: cl, WriteCacheDir: t.TempDir(), Staging: ledger})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := fs.NewChain(wb, terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The crashed-enqueue shape: a newer ledger image plus an older,
+	// same-length superseded cache pair.
+	ledgerImage := []byte("newer-image")
+	staleImage := []byte("olderimage") // same length, stale bytes
+	if err := ledger.Shadow.WriteFull("/f", ledgerImage, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ledger.Pending.PutWithBaseRevAndMode("/f", int64(len(ledgerImage)), staging.PendingOverwrite, 1, 0o644, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := wb.wbCache.PutWithBaseRevAndMode("/f", staleImage, int64(len(staleImage)), staging.PendingOverwrite, 1, 0o644, false); err != nil {
+		t.Fatal(err)
+	}
+
+	// A read-only reopen while the queue has not landed: the captured
+	// image must be the ledger's, never the same-length stale pair.
+	res, err := ch.Dispatch(context.Background(), &fs.Op{Kind: fs.OpCreate, Path: "/f",
+		Flags: uint32(syscall.O_RDONLY)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 64)
+	n, rerr := res.Handle.Read(context.Background(), 0, buf)
+	if rerr != nil && rerr.Error() != "EOF" {
+		t.Fatalf("read during recovery interval: %v", rerr)
+	}
+	if got := string(buf[:n]); got == string(staleImage) {
+		t.Fatalf("recovery-interval read served the superseded cache pair %q", got)
+	} else if got != string(ledgerImage) {
+		t.Fatalf("recovery-interval read = %q, want the ledger image %q", got, ledgerImage)
+	}
+	// The stale pair itself is untouched until the queue's success
+	// retires it — only its read authority is gone.
+	if data, ok := wb.wbCache.GetView("/f"); !ok || string(data) != string(staleImage) {
+		t.Fatalf("stale pair = %q ok=%t, want it retained until retirement", data, ok)
+	}
+}

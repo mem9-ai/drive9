@@ -201,8 +201,8 @@ type Writeback struct {
 	// snapshot — a flush staged after it carries a newer generation and
 	// survives.
 	recoveryCacheGens map[string]uint64
-	lazy         bool
-	syncerCancel context.CancelFunc
+	lazy              bool
+	syncerCancel      context.CancelFunc
 	// commitSeeder caches the just-committed image (readCache.Put at
 	// commit settle) so reads racing backend replica lag see this mount's
 	// own writes; nil disables seeding.
