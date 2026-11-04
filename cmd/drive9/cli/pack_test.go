@@ -1434,3 +1434,89 @@ func TestExtractPackArchiveSweepsEscapesAfterInstallFailure(t *testing.T) {
 		t.Fatalf("unrelated retained link changed: %q, %v", got, readErr)
 	}
 }
+
+// The audit is scoped to what the unpack writes. An unrelated link that already
+// pointed outside the overlay is local state this archive neither installs nor
+// changes, so a valid unpack must neither delete it nor fail because of it.
+func TestExtractPackArchiveLeavesUnrelatedRetainedLinksAlone(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink semantics differ on Windows")
+	}
+	for _, replace := range []bool{true, false} {
+		name := "replace"
+		if !replace {
+			name = "merge"
+		}
+		t.Run(name, func(t *testing.T) {
+			localRoot := t.TempDir()
+			overlay := filepath.Join(localRoot, "overlay")
+			if err := os.MkdirAll(filepath.Join(overlay, "other"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			unrelated := filepath.Join(overlay, "other", "cache")
+			if err := os.Symlink("/opt/shared-cache", unrelated); err != nil {
+				t.Fatalf("plant unrelated link: %v", err)
+			}
+
+			archive := buildPackTestArchive(t, `{"format":"drive9.pack.v1","version":1,"paths":["/repo/new.txt"]}`,
+				packTestEntry{path: "repo/new.txt", body: "hello\n"})
+			if _, err := extractPackArchive(context.Background(), bytes.NewReader(archive), unpackOptions{
+				LocalRoot: localRoot,
+				Replace:   replace,
+			}); err != nil {
+				t.Fatalf("a valid unpack must not fail over an unrelated local link: %v", err)
+			}
+			if got, err := os.Readlink(unrelated); err != nil || got != "/opt/shared-cache" {
+				t.Fatalf("unrelated retained link changed: %q, %v", got, err)
+			}
+			if body, err := os.ReadFile(filepath.Join(overlay, "repo", "new.txt")); err != nil || string(body) != "hello\n" {
+				t.Fatalf("installed file = %q, %v", body, err)
+			}
+		})
+	}
+}
+
+// A traversal error must not abort the audit: returning it would stop the walk
+// and leave an escape that was installed earlier in it live.
+func TestExtractPackArchiveAuditSurvivesUnreadableSubtree(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink semantics differ on Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores mode 000")
+	}
+	localRoot := t.TempDir()
+	overlay := filepath.Join(localRoot, "overlay")
+	if err := os.MkdirAll(filepath.Join(overlay, "z"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Retained link the archive's own link escapes through.
+	if err := os.Symlink("..", filepath.Join(overlay, "z", "s")); err != nil {
+		t.Fatalf("plant retained link: %v", err)
+	}
+	// Sorts before "z", so the walk hits it first.
+	private := filepath.Join(overlay, "a-private")
+	if err := os.MkdirAll(private, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(private, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(private, 0o755) })
+
+	archive := buildPackTestArchive(t, `{"format":"drive9.pack.v1","version":1,"paths":["/z/a"]}`,
+		packTestEntry{path: "z/a", link: "s/../outside"})
+	_, err := extractPackArchive(context.Background(), bytes.NewReader(archive), unpackOptions{
+		LocalRoot: localRoot,
+		Replace:   true,
+	})
+	if err == nil {
+		t.Fatal("extractPackArchive accepted a link that escapes through a retained link")
+	}
+	if !strings.Contains(err.Error(), "resolves outside the local overlay root") {
+		t.Fatalf("error = %v, want the installed escape reported alongside the scan error", err)
+	}
+	if _, statErr := os.Lstat(filepath.Join(overlay, "z", "a")); statErr == nil {
+		t.Fatal("the installed escape stayed live after the walk hit an unreadable directory")
+	}
+}

@@ -522,9 +522,11 @@ func extractPackArchive(ctx context.Context, r io.Reader, opts unpackOptions) (*
 	// change the meaning of a retained link the archive never names (replacing
 	// a directory with "s -> .." turns a retained "a -> s/../outside" into an
 	// escape); and a failed installation has already written part of the
-	// archive. The sweep removes every offending link, so a rejected unpack
-	// never leaves a live escape behind.
-	offenders, sweepErr := removeEscapingPackLinks(filepath.Join(opts.LocalRoot, "overlay"))
+	// archive. The audit removes every offending link it owns, so a rejected
+	// unpack never leaves a live escape behind, and it leaves unrelated local
+	// links alone.
+	scope := packLinkAuditScope(opts.LocalRoot, manifest, opts.Replace)
+	offenders, sweepErr := auditPackLinks(filepath.Join(opts.LocalRoot, "overlay"), scope)
 	if err := errors.Join(installErr, sweepErr, escapingPackLinksError(offenders)); err != nil {
 		return nil, err
 	}
@@ -1202,40 +1204,96 @@ func validatePackSymlinkTarget(localRoot, linkPath, linkname string) error {
 // mutually referencing links cannot spin the validator.
 const maxPackSymlinkDepth = 40
 
-// removeEscapingPackLinks resolves every symlink under overlayRoot and deletes
-// each one that leaves it, returning the failures it found and removed.
+// packLinkAuditScope lists the overlay paths an unpack can write: the replacement
+// roots for a replace install, the merged paths otherwise. A link is only this
+// operation's responsibility when resolving it passes through one of them.
+func packLinkAuditScope(localRoot string, manifest packManifest, replace bool) []string {
+	paths := manifest.Paths
+	if replace {
+		paths = manifestReplacePaths(manifest)
+	}
+	scope := make([]string, 0, len(paths))
+	for _, archivePath := range paths {
+		rel, err := manifestPathRel(archivePath)
+		if err != nil {
+			continue
+		}
+		target, err := safeOverlayTarget(localRoot, rel)
+		if err != nil {
+			continue
+		}
+		scope = append(scope, target)
+	}
+	return scope
+}
+
+// packPathWithin reports whether p is one of the scope roots or lives under one.
+func packPathWithin(p string, scope []string) bool {
+	for _, root := range scope {
+		if p == root || strings.HasPrefix(p, root+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
+}
+
+// auditPackLinks resolves every symlink under overlayRoot and removes the ones
+// that leave it, but only when resolving them passes through a path this unpack
+// wrote (scope).
 //
 // Post-install resolution is the only check that sees the real graph. Staging
 // validates the archive's own links against each other, but installation also
 // preserves links the destination already had, and replacing a directory with a
 // link re-targets every retained link that passes through that path. Walking the
-// whole overlay is therefore the backstop, and it removes all offenders rather
-// than the first one: returning early would leave a live escape behind.
-func removeEscapingPackLinks(overlayRoot string) ([]error, error) {
+// whole overlay is therefore the backstop. Two rules keep it honest:
+//
+//   - Scope. Links the archive neither installs nor changes are local state, so
+//     an unrelated pre-existing link that already pointed outside is left alone
+//     instead of being deleted by an otherwise valid unpack.
+//   - No early abort. A traversal or removal error is collected, not returned:
+//     returning it would stop the walk and leave escapes installed later in it
+//     live, which is the failure this audit exists to prevent.
+func auditPackLinks(overlayRoot string, scope []string) ([]error, error) {
 	overlayRoot = filepath.Clean(overlayRoot)
 	var offenders []error
+	var failures error
 	walkErr := filepath.WalkDir(overlayRoot, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				return nil
 			}
-			return err
+			// Keep walking: an unreadable subtree must not hide the rest.
+			failures = errors.Join(failures, fmt.Errorf("scan overlay path %s: %w", p, err))
+			return nil
 		}
 		if d.IsDir() || d.Type()&fs.ModeSymlink == 0 {
 			return nil
 		}
-		if _, resolveErr := resolvePackSymlink(overlayRoot, p); resolveErr != nil {
-			offenders = append(offenders, resolveErr)
-			if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return fmt.Errorf("remove escaping pack symlink %s: %w", p, err)
-			}
+		_, visited, resolveErr := resolvePackSymlinkTracked(overlayRoot, p)
+		if resolveErr == nil || !packPathInScope(visited, scope) {
+			return nil
+		}
+		offenders = append(offenders, resolveErr)
+		if removeErr := os.Remove(p); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			failures = errors.Join(failures, fmt.Errorf("remove escaping pack symlink %s: %w", p, removeErr))
 		}
 		return nil
 	})
 	if walkErr != nil {
-		return offenders, walkErr
+		failures = errors.Join(failures, walkErr)
 	}
-	return offenders, nil
+	return offenders, failures
+}
+
+// packPathInScope reports whether the resolution of a link examined any path this
+// unpack wrote.
+func packPathInScope(visited, scope []string) bool {
+	for _, p := range visited {
+		if packPathWithin(p, scope) {
+			return true
+		}
+	}
+	return false
 }
 
 // escapingPackLinksError turns the sweep's offenders into one rejection error.
@@ -1273,6 +1331,23 @@ func validatePackSymlinkGraph(root string) error {
 // resolvePackSymlink returns the final absolute path a staged symlink points at,
 // following the links on disk component by component the way the kernel will.
 func resolvePackSymlink(root, linkPath string) (string, error) {
+	resolved, _, err := resolvePackSymlinkTracked(root, linkPath)
+	return resolved, err
+}
+
+// resolvePackSymlinkTracked also reports every path the resolution examined,
+// starting with the link itself, so a caller can tell which links a change to a
+// given path can affect.
+func resolvePackSymlinkTracked(root, linkPath string) (string, []string, error) {
+	visited := []string{filepath.Clean(linkPath)}
+	resolved, err := resolvePackSymlinkInto(root, linkPath, &visited)
+	if err != nil {
+		return "", visited, err
+	}
+	return resolved, visited, nil
+}
+
+func resolvePackSymlinkInto(root, linkPath string, visited *[]string) (string, error) {
 	target, err := os.Readlink(linkPath)
 	if err != nil {
 		return "", fmt.Errorf("read pack symlink %s: %w", linkPath, err)
@@ -1293,6 +1368,7 @@ func resolvePackSymlink(root, linkPath string) (string, error) {
 			cur = filepath.Dir(cur)
 		default:
 			next := filepath.Join(cur, comp)
+			*visited = append(*visited, next)
 			if info, statErr := os.Lstat(next); statErr == nil && info.Mode()&fs.ModeSymlink != 0 {
 				depth++
 				if depth > maxPackSymlinkDepth {
