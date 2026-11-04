@@ -4708,3 +4708,25 @@ func TestEngineUsesUpstreamCacheDefaults(t *testing.T) {
 		t.Fatal("SelfCheck must default the eviction policy")
 	}
 }
+
+// Round-50: closing a descriptor must land its pending bytes. VFS.Release
+// only flushes the engine writer into the bridge; without the bridge's
+// landing the last close would leave the file's data unpublished (no later
+// callback exists on the FUSE path), breaking the close-time durability the
+// classic plane owns.
+func TestReleaseLandsPendingBytes(t *testing.T) {
+	f := newFakeV2(t)
+	f.setDir("/d", true)
+	h := newTestHandler(t, f, 0)
+	res, _, _ := dispatchCreate(context.Background(), h, "/d/r.bin", syscall.O_RDWR|syscall.O_CREAT)
+	eh := res.Handle.(*engineHandle)
+	if err := eh.Write(context.Background(), 0, []byte("CLOSED")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Release(context.Background()); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if got := f.contentOf("/d/r.bin"); got != "CLOSED" {
+		t.Fatalf("content after release = %q, want CLOSED (release must land pending bytes)", got)
+	}
+}

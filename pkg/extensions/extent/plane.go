@@ -676,7 +676,13 @@ func (e *engineHandle) Flush(ctx context.Context) error {
 }
 
 func (e *engineHandle) Release(ctx context.Context) error {
+	// VFS.Release flushes the engine writer into the bridge (its pending
+	// slices), but landing is the meta side's job: the bridge's Close does
+	// it, and a handle that never reaches Close (FUSE Release is the last
+	// callback) would otherwise stay unlanded. VFS.Release reports no
+	// error, so the bridge-side landing is the only failure channel here.
 	e.plane.opts.Engine.VFS.Release(e.vctx, e.ino, e.fh)
+	landErr := e.plane.opts.Engine.FlushFile(ctx, uint64(e.ino))
 	e.plane.release(e)
-	return nil
+	return landErr
 }
