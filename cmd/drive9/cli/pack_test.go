@@ -1121,3 +1121,115 @@ func assertFileContent(t *testing.T, path string, want string) {
 		t.Fatalf("ReadFile(%s) = %q, want %q", path, got, want)
 	}
 }
+
+// A link graph can compose into an escape even when every target is lexically
+// inside the overlay: "repo/s -> .." and "repo/a -> s/../outside" cleans to
+// overlay/repo/outside but resolves one level above the overlay once "s" is
+// followed. The staged graph is validated with the links materialized.
+func TestExtractPackArchiveRejectsComposedSymlinkEscape(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink semantics differ on Windows")
+	}
+	build := func(t *testing.T, forward bool) []byte {
+		t.Helper()
+		type entry struct{ name, target string }
+		entries := []entry{
+			{"repo/s", ".."},
+			{"repo/a", "s/../outside"},
+		}
+		if forward {
+			entries = []entry{
+				{"repo/a", "s/../outside"},
+				{"repo/s", ".."},
+			}
+		}
+		var buf bytes.Buffer
+		gz := gzip.NewWriter(&buf)
+		tw := tar.NewWriter(gz)
+		manifest := []byte(`{"format":"drive9.pack.v1","version":1,"paths":["/repo"]}`)
+		if err := tw.WriteHeader(&tar.Header{Name: packManifestEntryName, Mode: 0o644, Size: int64(len(manifest))}); err != nil {
+			t.Fatalf("manifest header: %v", err)
+		}
+		if _, err := tw.Write(manifest); err != nil {
+			t.Fatalf("manifest write: %v", err)
+		}
+		for _, e := range entries {
+			if err := tw.WriteHeader(&tar.Header{Name: packArchiveEntryPrefix + e.name, Typeflag: tar.TypeSymlink, Linkname: e.target, Mode: 0o777}); err != nil {
+				t.Fatalf("symlink header %s: %v", e.name, err)
+			}
+		}
+		if err := tw.Close(); err != nil {
+			t.Fatalf("tar close: %v", err)
+		}
+		if err := gz.Close(); err != nil {
+			t.Fatalf("gzip close: %v", err)
+		}
+		return buf.Bytes()
+	}
+
+	for _, forward := range []bool{false, true} {
+		name := "backward reference"
+		if forward {
+			name = "forward reference"
+		}
+		t.Run(name, func(t *testing.T) {
+			localRoot := t.TempDir()
+			_, err := extractPackArchive(context.Background(), bytes.NewReader(build(t, forward)), unpackOptions{
+				LocalRoot: localRoot,
+				Replace:   true,
+			})
+			if err == nil {
+				t.Fatal("extractPackArchive accepted a composed symlink escape")
+			}
+			if !strings.Contains(err.Error(), "resolves outside the local overlay root") {
+				t.Fatalf("error = %v, want a composed escape error", err)
+			}
+			// Nothing was installed.
+			if _, statErr := os.Lstat(filepath.Join(localRoot, "overlay", "repo")); statErr == nil {
+				t.Fatal("rejected archive was installed anyway")
+			}
+		})
+	}
+}
+
+// A composed chain that stays inside the overlay must still restore.
+func TestExtractPackArchiveAllowsComposedSymlinkInsideOverlay(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink semantics differ on Windows")
+	}
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	manifest := []byte(`{"format":"drive9.pack.v1","version":1,"paths":["/repo"]}`)
+	if err := tw.WriteHeader(&tar.Header{Name: packManifestEntryName, Mode: 0o644, Size: int64(len(manifest))}); err != nil {
+		t.Fatalf("manifest header: %v", err)
+	}
+	if _, err := tw.Write(manifest); err != nil {
+		t.Fatalf("manifest write: %v", err)
+	}
+	for _, e := range [][2]string{
+		{"repo/dir", "."},
+		{"repo/link", "dir/../dir"},
+	} {
+		if err := tw.WriteHeader(&tar.Header{Name: packArchiveEntryPrefix + e[0], Typeflag: tar.TypeSymlink, Linkname: e[1], Mode: 0o777}); err != nil {
+			t.Fatalf("symlink header %s: %v", e[0], err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("tar close: %v", err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+
+	localRoot := t.TempDir()
+	if _, err := extractPackArchive(context.Background(), bytes.NewReader(buf.Bytes()), unpackOptions{
+		LocalRoot: localRoot,
+		Replace:   true,
+	}); err != nil {
+		t.Fatalf("extractPackArchive: %v", err)
+	}
+	if got, err := os.Readlink(filepath.Join(localRoot, "overlay", "repo", "link")); err != nil || got != "dir/../dir" {
+		t.Fatalf("link = %q, %v", got, err)
+	}
+}

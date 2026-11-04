@@ -1207,9 +1207,25 @@ func sanitizeGitCheckpointConfig(path string) error {
 	var out strings.Builder
 	sectionName := ""
 	sectionKept := false
+	// continued: the previous emitted line ended with a backslash, so this
+	// physical line is part of a value that was kept.
+	// dropped: the previous line was dropped and ended with a backslash, so
+	// every physical line of that logical value is dropped too. Without this a
+	// continuation line of a rejected value ("uploadpack = x \" followed by
+	// "[core] fsmonitor = ...") would be written verbatim and become live
+	// configuration under the previous section.
 	continued := false
+	dropped := false
+	dropLine := func(trimmed string) {
+		dropped = strings.HasSuffix(trimmed, `\`)
+		continued = false
+	}
 	for _, line := range strings.SplitAfter(string(data), "\n") {
 		trimmed := strings.TrimSpace(strings.TrimRight(line, "\r\n"))
+		if dropped {
+			dropped = strings.HasSuffix(trimmed, `\`)
+			continue
+		}
 		if continued {
 			// A backslash continuation belongs to the previous value; keep or
 			// drop it together with that value so the file stays parseable.
@@ -1236,6 +1252,7 @@ func sanitizeGitCheckpointConfig(path string) error {
 			sectionKept = gitCheckpointSafeConfigSections[sectionName] || sectionName == "core" ||
 				sectionName == "extensions" || sectionName == "gc"
 			continued = false
+			dropped = false
 			// The header itself is inert, so a kept section always emits it —
 			// otherwise the parser state (say, "user") would diverge from the
 			// last emitted section (say, "core") and the following lines would
@@ -1255,6 +1272,7 @@ func sanitizeGitCheckpointConfig(path string) error {
 			continue
 		}
 		if !sectionKept {
+			dropLine(trimmed)
 			continue
 		}
 		if trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, ";") {
@@ -1273,15 +1291,19 @@ func sanitizeGitCheckpointConfig(path string) error {
 			// remote-helper transport.
 			key, value := splitGitConfigKeyValue(trimmed)
 			if gitCheckpointUnsafeRemoteKeys[key] {
+				dropLine(trimmed)
 				continue
 			}
 			if (key == "url" || key == "pushurl") && gitcache.HasRemoteHelperScheme(value) {
+				dropLine(trimmed)
 				continue
 			}
+			continued = strings.HasSuffix(trimmed, `\`)
 			out.WriteString(line)
 			continue
 		}
 		if gitCheckpointSafeConfigSections[sectionName] {
+			continued = strings.HasSuffix(trimmed, `\`)
 			out.WriteString(line)
 			continue
 		}
@@ -1291,9 +1313,10 @@ func sanitizeGitCheckpointConfig(path string) error {
 		}
 		key = strings.ToLower(strings.TrimSpace(key))
 		if !gitCheckpointSafeConfigKeys[sectionName+"."+key] {
-			continued = false
+			dropLine(trimmed)
 			continue
 		}
+		continued = strings.HasSuffix(trimmed, `\`)
 		out.WriteString(line)
 	}
 	if err := os.WriteFile(path, []byte(out.String()), 0o600); err != nil {

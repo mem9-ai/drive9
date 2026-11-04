@@ -317,3 +317,65 @@ func TestSanitizeGitCheckpointConfigDropsCoreWorktree(t *testing.T) {
 		t.Fatalf("safe keys were dropped:\n%s", got)
 	}
 }
+
+// A continuation line belongs to the value that started it: when that value is
+// rejected, every physical line of it must be dropped too, or a header on the
+// continuation becomes live configuration under the previous section.
+func TestSanitizeGitCheckpointConfigDropsRejectedValueContinuation(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  string
+		// banned must not appear anywhere in the sanitized output.
+		banned []string
+		// kept must still appear.
+		kept []string
+	}{
+		{
+			name:   "rejected remote key continuation",
+			cfg:    "[remote \"origin\"]\n\tuploadpack = ignored \\\n[core] fsmonitor = /path/to/program\n\turl = https://github.com/example/repo.git\n",
+			banned: []string{"uploadpack", "fsmonitor"},
+			kept:   []string{"url = https://github.com/example/repo.git"},
+		},
+		{
+			name:   "rejected helper-scheme url continuation",
+			cfg:    "[remote \"origin\"]\n\turl = ext::sh -c 'x' \\\n[core] pager = /tmp/evil\n",
+			banned: []string{"ext::", "pager"},
+		},
+		{
+			name:   "rejected allowlist key continuation",
+			cfg:    "[core]\n\tpager = less \\\n[remote \"origin\"]\n\turl = https://github.com/example/repo.git\n",
+			banned: []string{"pager"},
+		},
+		{
+			name:   "dropped section continuation",
+			cfg:    "[filter \"evil\"]\n\tclean = cmd \\\n[core]\n\tfsmonitor = /tmp/evil\n",
+			banned: []string{"filter", "clean", "fsmonitor"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "config")
+			if err := os.WriteFile(path, []byte(tc.cfg), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := sanitizeGitCheckpointConfig(path); err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := string(data)
+			for _, banned := range tc.banned {
+				if strings.Contains(got, banned) {
+					t.Fatalf("rejected value leaked %q:\n%s", banned, got)
+				}
+			}
+			for _, kept := range tc.kept {
+				if !strings.Contains(got, kept) {
+					t.Fatalf("kept value %q missing:\n%s", kept, got)
+				}
+			}
+		})
+	}
+}

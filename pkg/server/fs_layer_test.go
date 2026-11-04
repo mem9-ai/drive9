@@ -1564,3 +1564,70 @@ func TestFSLayerSnapshotRefusesOversizedBaseFileWithoutReadingIt(t *testing.T) {
 		t.Fatalf("snapshot data = %d bytes, want %d", len(snap.Data), len(content))
 	}
 }
+
+// A "blobs/<fileID>" reference names a file entity, not a path. A scoped caller
+// that knows an out-of-scope file's stable id (stat exposes it as resource_id)
+// must not be able to alias it onto an in-scope layer path and read the bytes
+// back through the layer object endpoint.
+func TestFSLayerStorageRefRequiresScopedReadOnSource(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+
+	// A file outside the token's scope, at a path the token cannot read.
+	if _, err := s.fallback.WriteCtx(ctx, "/secret/payroll.txt", []byte("classified"), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate); err != nil {
+		t.Fatalf("write source file: %v", err)
+	}
+	node, err := s.fallback.StatNodeCtx(ctx, "/secret/payroll.txt")
+	if err != nil {
+		t.Fatalf("stat source file: %v", err)
+	}
+	fileID := node.File.FileID
+	if fileID == "" {
+		t.Fatal("source file has no file id")
+	}
+	if err := s.fallback.Store().CreateFSLayer(ctx, &datastore.FSLayer{LayerID: "layer-src", BaseRootPath: "/repo"}); err != nil {
+		t.Fatalf("CreateFSLayer: %v", err)
+	}
+	layer, err := s.fallback.Store().GetFSLayer(ctx, "layer-src")
+	if err != nil {
+		t.Fatalf("GetFSLayer: %v", err)
+	}
+
+	scope := &TenantScope{
+		IsScoped: true,
+		FSScopes: []FSScope{{
+			Prefix: "/repo",
+			Ops:    map[FSOp]bool{FSOpRead: true, FSOpWrite: true},
+		}},
+	}
+	upsert := func(path string) int {
+		body := fmt.Sprintf(`{"path":%q,"op":"upsert","kind":"file","storage_ref":"blobs/%s"}`, path, fileID)
+		req := httptest.NewRequest(http.MethodPost, "/v1/layers/layer-src/entries", bytes.NewReader([]byte(body)))
+		req = req.WithContext(withScope(req.Context(), scope))
+		rr := httptest.NewRecorder()
+		s.handleFSLayerEntryUpsert(rr, req, s.fallback, s.fallback.Store(), layer)
+		return rr.Code
+	}
+
+	// The destination is in scope, but the referenced source is not.
+	if code := upsert("/repo/leak.txt"); code != http.StatusForbidden {
+		t.Fatalf("upsert status=%d, want 403 (out-of-scope source)", code)
+	}
+
+	// The same reference is legitimate when the source itself is in scope.
+	if _, err := s.fallback.WriteCtx(ctx, "/repo/in-scope.txt", []byte("fine"), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate); err != nil {
+		t.Fatalf("write in-scope file: %v", err)
+	}
+	inScope, err := s.fallback.StatNodeCtx(ctx, "/repo/in-scope.txt")
+	if err != nil {
+		t.Fatalf("stat in-scope file: %v", err)
+	}
+	body := fmt.Sprintf(`{"path":"/repo/allowed.txt","op":"upsert","kind":"file","storage_ref":"blobs/%s"}`, inScope.File.FileID)
+	req := httptest.NewRequest(http.MethodPost, "/v1/layers/layer-src/entries", bytes.NewReader([]byte(body)))
+	req = req.WithContext(withScope(req.Context(), scope))
+	rr := httptest.NewRecorder()
+	s.handleFSLayerEntryUpsert(rr, req, s.fallback, s.fallback.Store(), layer)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("in-scope upsert status=%d body=%s, want 200", rr.Code, rr.Body.String())
+	}
+}

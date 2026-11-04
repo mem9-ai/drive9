@@ -531,6 +531,9 @@ func (s *Server) handleFSLayerObjectRead(w http.ResponseWriter, r *http.Request,
 			errJSON(w, http.StatusBadRequest, "fs layer object path is not a file upsert")
 			return
 		}
+		if !s.authorizeFSLayerStorageRefSource(w, r, store, entry) {
+			return
+		}
 		rc, err := b.OpenFSLayerEntryData(r.Context(), entry)
 		if err != nil {
 			logger.Error(r.Context(), "fs_layer_object_read_failed", eventFields(r.Context(), "fs_layer_object_read_failed", "path", entry.Path, "error", err)...)
@@ -710,6 +713,9 @@ func (s *Server) handleFSLayerEntryUpsert(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if !authorizeFSLayerEntryMutation(w, r, &entry) {
+		return
+	}
+	if !s.authorizeFSLayerStorageRefSource(w, r, store, &entry) {
 		return
 	}
 	if len(entry.ContentBlob) > 0 {
@@ -941,6 +947,15 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 		})
 		return
 	}
+	// Entries can predate the write-time source check (or arrive from a client
+	// that wrote them before a scope was narrowed), so re-authorize every
+	// object reference before it is aliased into main.
+	for i := range entries {
+		if !s.authorizeFSLayerStorageRefSource(w, r, store, &entries[i]) {
+			_ = store.SetFSLayerStateIf(r.Context(), layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
+			return
+		}
+	}
 	snapshots, err := snapshotFSLayerCommit(r.Context(), b, entries)
 	if err != nil {
 		_ = store.SetFSLayerStateIf(r.Context(), layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
@@ -1105,6 +1120,50 @@ func validateFSLayerServerStorageRef(layer *datastore.FSLayer, entry *datastore.
 		return nil
 	}
 	return fmt.Errorf("fs layer storage_ref is not a server-issued object reference")
+}
+
+// authorizeFSLayerStorageRefSource rejects a layer entry whose "blobs/<fileID>"
+// reference aliases a file the caller may not read.
+//
+// A blobs/ reference names a file entity, not a path, and the layer endpoints
+// authorize only the layer path they operate on: a scoped caller could take the
+// stable resource id of an out-of-scope file (stat exposes it), store it on an
+// allowed layer path, and read the bytes back through the layer object read —
+// which calls the object store directly. The reference is therefore resolved to
+// its dentry paths and the caller must be able to read at least one of them;
+// content reachable inside the scope is legitimately readable, and a reference
+// with no remaining dentry is refused rather than treated as absent.
+func (s *Server) authorizeFSLayerStorageRefSource(w http.ResponseWriter, r *http.Request, store *datastore.Store, entry *datastore.FSLayerEntry) bool {
+	if entry == nil || store == nil {
+		return true
+	}
+	scope := ScopeFromContext(r.Context())
+	if scope == nil || !scope.IsScoped {
+		return true
+	}
+	ref := strings.TrimSpace(entry.StorageRef)
+	if !strings.HasPrefix(ref, "blobs/") {
+		// layers/<layerID>/... is minted for, and only readable through, this
+		// layer, which the caller's layer access already covers.
+		return true
+	}
+	fileID := strings.TrimPrefix(ref, "blobs/")
+	paths, err := store.ListFileDentryPathsByFileID(r.Context(), fileID, 64)
+	if err != nil {
+		logger.Error(r.Context(), "fs_layer_storage_ref_lookup_failed", eventFields(r.Context(), "fs_layer_storage_ref_lookup_failed",
+			"layer_id", entry.LayerID, "file_id", fileID, "error", err)...)
+		errJSON(w, http.StatusInternalServerError, "failed to authorize fs layer storage reference")
+		return false
+	}
+	for _, p := range paths {
+		if scope.AuthorizeFS(FSOpRead, p) == nil {
+			return true
+		}
+	}
+	logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "fs_layer_storage_ref_out_of_scope",
+		"layer_id", entry.LayerID, "path", entry.Path, "file_id", fileID)...)
+	errJSON(w, http.StatusForbidden, "storage_ref is outside the token's read scope")
+	return false
 }
 
 func canonicalFSLayerServerPath(rawPath, op, kind string) (string, error) {

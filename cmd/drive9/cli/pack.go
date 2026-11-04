@@ -508,6 +508,13 @@ func extractPackArchive(ctx context.Context, r io.Reader, opts unpackOptions) (*
 	for i := len(dirTimes) - 1; i >= 0; i-- {
 		_ = os.Chtimes(dirTimes[i].Path, dirTimes[i].ModTime, dirTimes[i].ModTime)
 	}
+	// Per-entry checks are lexical; a link graph can still compose into an escape
+	// ("a -> s/../outside" with "s -> .." cleans to overlay/outside but resolves
+	// one level above the overlay once "s" is followed). Validate the whole staged
+	// tree with the links materialized before anything is installed.
+	if err := validatePackSymlinkGraph(filepath.Join(stageRoot, "overlay")); err != nil {
+		return nil, err
+	}
 	if err := installStagedPack(opts.LocalRoot, stageRoot, manifest, opts.Replace); err != nil {
 		return nil, err
 	}
@@ -1179,6 +1186,85 @@ func validatePackSymlinkTarget(localRoot, linkPath, linkname string) error {
 		return fmt.Errorf("pack symlink %s target %q escapes local overlay root", linkPath, linkname)
 	}
 	return nil
+}
+
+// maxPackSymlinkDepth bounds link-chain resolution so a crafted archive of
+// mutually referencing links cannot spin the validator.
+const maxPackSymlinkDepth = 40
+
+// validatePackSymlinkGraph resolves every symlink under root through the links
+// already materialized there and rejects any that leaves root. It runs after
+// extraction and before installation, so both staged installation paths inherit
+// the same guarantee.
+func validatePackSymlinkGraph(root string) error {
+	root = filepath.Clean(root)
+	return filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if d.IsDir() || d.Type()&fs.ModeSymlink == 0 {
+			return nil
+		}
+		if _, err := resolvePackSymlink(root, p); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+// resolvePackSymlink returns the final absolute path a staged symlink points at,
+// following the links on disk component by component the way the kernel will.
+func resolvePackSymlink(root, linkPath string) (string, error) {
+	target, err := os.Readlink(linkPath)
+	if err != nil {
+		return "", fmt.Errorf("read pack symlink %s: %w", linkPath, err)
+	}
+	if filepath.IsAbs(target) {
+		return "", fmt.Errorf("pack symlink %s has an absolute target %q", linkPath, target)
+	}
+	cur := filepath.Dir(linkPath)
+	pending := strings.Split(filepath.ToSlash(target), "/")
+	depth := 0
+	for len(pending) > 0 {
+		comp := pending[0]
+		pending = pending[1:]
+		switch comp {
+		case "", ".":
+			continue
+		case "..":
+			cur = filepath.Dir(cur)
+		default:
+			next := filepath.Join(cur, comp)
+			if info, statErr := os.Lstat(next); statErr == nil && info.Mode()&fs.ModeSymlink != 0 {
+				depth++
+				if depth > maxPackSymlinkDepth {
+					return "", fmt.Errorf("pack symlink %s exceeds %d hops", linkPath, maxPackSymlinkDepth)
+				}
+				nested, readErr := os.Readlink(next)
+				if readErr != nil {
+					return "", fmt.Errorf("read pack symlink %s: %w", next, readErr)
+				}
+				if filepath.IsAbs(nested) {
+					return "", fmt.Errorf("pack symlink %s has an absolute target %q", next, nested)
+				}
+				cur = filepath.Dir(next)
+				pending = append(strings.Split(filepath.ToSlash(nested), "/"), pending...)
+				continue
+			}
+			cur = next
+		}
+		rel, relErr := filepath.Rel(root, filepath.Clean(cur))
+		if relErr != nil {
+			return "", fmt.Errorf("resolve pack symlink %s: %w", linkPath, relErr)
+		}
+		if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+			return "", fmt.Errorf("pack symlink %s resolves outside the local overlay root", linkPath)
+		}
+	}
+	return filepath.Clean(cur), nil
 }
 
 func ensureNoSymlinkPath(localRoot, target string, includeTarget bool) error {
