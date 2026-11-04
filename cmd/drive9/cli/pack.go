@@ -515,7 +515,8 @@ func extractPackArchive(ctx context.Context, r io.Reader, opts unpackOptions) (*
 	if err := validatePackSymlinkGraph(filepath.Join(stageRoot, "overlay")); err != nil {
 		return nil, err
 	}
-	installErr := installStagedPack(opts.LocalRoot, stageRoot, manifest, opts.Replace)
+	installed := &packInstallRecord{}
+	installErr := installStagedPack(opts.LocalRoot, stageRoot, manifest, opts.Replace, installed)
 	// Validate the overlay that actually remains, not the staged tree and not
 	// just this archive's own links. Three cases need it: an archive link can
 	// compose with a link the destination already keeps; an archive entry can
@@ -525,8 +526,7 @@ func extractPackArchive(ctx context.Context, r io.Reader, opts unpackOptions) (*
 	// archive. The audit removes every offending link it owns, so a rejected
 	// unpack never leaves a live escape behind, and it leaves unrelated local
 	// links alone.
-	scope := packLinkAuditScope(opts.LocalRoot, manifest, opts.Replace)
-	offenders, sweepErr := auditPackLinks(filepath.Join(opts.LocalRoot, "overlay"), scope)
+	offenders, sweepErr := auditPackLinks(filepath.Join(opts.LocalRoot, "overlay"), installed.written)
 	if err := errors.Join(installErr, sweepErr, escapingPackLinksError(offenders)); err != nil {
 		return nil, err
 	}
@@ -1204,37 +1204,65 @@ func validatePackSymlinkTarget(localRoot, linkPath, linkname string) error {
 // mutually referencing links cannot spin the validator.
 const maxPackSymlinkDepth = 40
 
-// packLinkAuditScope lists the overlay paths an unpack can write: the replacement
-// roots for a replace install, the merged paths otherwise. A link is only this
-// operation's responsibility when resolving it passes through one of them.
-func packLinkAuditScope(localRoot string, manifest packManifest, replace bool) []string {
-	paths := manifest.Paths
-	if replace {
-		paths = manifestReplacePaths(manifest)
-	}
-	scope := make([]string, 0, len(paths))
-	for _, archivePath := range paths {
-		rel, err := manifestPathRel(archivePath)
-		if err != nil {
-			continue
-		}
-		target, err := safeOverlayTarget(localRoot, rel)
-		if err != nil {
-			continue
-		}
-		scope = append(scope, target)
-	}
-	return scope
+// packInstallRecord collects the overlay paths an unpack actually wrote. That is
+// narrower than the manifest: a merge of /repo into an existing directory writes
+// only the archive's own entries, and the directory root itself is untouched.
+type packInstallRecord struct {
+	written []string
 }
 
-// packPathWithin reports whether p is one of the scope roots or lives under one.
+func (r *packInstallRecord) add(path string) {
+	if r == nil {
+		return
+	}
+	r.written = append(r.written, filepath.Clean(path))
+}
+
+// samePackPath reports whether two spellings name the same filesystem object.
+//
+// Comparing spelling literally is wrong on a case-insensitive destination: an
+// archive path /repo/a can be installed as overlay/Repo/a when overlay/Repo
+// already exists, and WalkDir then reports the stored spelling. Lstat keeps the
+// final component (so two different symlinks never compare equal) while still
+// identifying the same directory entry behind both spellings.
+func samePackPath(a, b string) bool {
+	if a == b {
+		return true
+	}
+	aInfo, aErr := os.Lstat(a)
+	bInfo, bErr := os.Lstat(b)
+	if aErr != nil || bErr != nil {
+		return false
+	}
+	return os.SameFile(aInfo, bInfo)
+}
+
+// packPathWithin reports whether p is one of the scope roots or lives under one,
+// under the destination filesystem's own name semantics.
 func packPathWithin(p string, scope []string) bool {
 	for _, root := range scope {
-		if p == root || strings.HasPrefix(p, root+string(filepath.Separator)) {
+		if samePackPath(p, root) || packPathUnder(p, root) {
 			return true
 		}
 	}
 	return false
+}
+
+// packPathUnder reports whether p is a descendant of root. The prefix test
+// handles the common case; the ancestor walk handles a differently-cased parent
+// on a case-insensitive filesystem.
+func packPathUnder(p, root string) bool {
+	if strings.HasPrefix(p, root+string(filepath.Separator)) {
+		return true
+	}
+	for dir := filepath.Dir(p); ; dir = filepath.Dir(dir) {
+		if samePackPath(dir, root) {
+			return true
+		}
+		if parent := filepath.Dir(dir); parent == dir {
+			return false
+		}
+	}
 }
 
 // auditPackLinks resolves every symlink under overlayRoot and removes the ones
@@ -1460,7 +1488,7 @@ func removeManifestPaths(localRoot string, paths []string) error {
 	return nil
 }
 
-func installStagedPack(localRoot, stageRoot string, manifest packManifest, replace bool) error {
+func installStagedPack(localRoot, stageRoot string, manifest packManifest, replace bool, installed *packInstallRecord) error {
 	paths := manifest.Paths
 	if replace {
 		paths = manifestReplacePaths(manifest)
@@ -1488,12 +1516,12 @@ func installStagedPack(localRoot, stageRoot string, manifest packManifest, repla
 			return err
 		}
 		if replace {
-			if err := moveStagedPath(localRoot, src, dst); err != nil {
+			if err := moveStagedPath(localRoot, src, dst, installed); err != nil {
 				return err
 			}
 			continue
 		}
-		if err := mergeStagedPath(localRoot, src, dst); err != nil {
+		if err := mergeStagedPath(localRoot, src, dst, installed); err != nil {
 			return err
 		}
 	}
@@ -1519,7 +1547,7 @@ func manifestPathRel(archivePath string) (string, error) {
 	return rel, nil
 }
 
-func moveStagedPath(localRoot, src, dst string) error {
+func moveStagedPath(localRoot, src, dst string, installed *packInstallRecord) error {
 	if err := ensureNoSymlinkPath(localRoot, filepath.Dir(dst), true); err != nil {
 		return err
 	}
@@ -1532,10 +1560,11 @@ func moveStagedPath(localRoot, src, dst string) error {
 	if err := os.Rename(src, dst); err != nil {
 		return fmt.Errorf("install unpack path %s: %w", dst, err)
 	}
+	installed.add(dst)
 	return nil
 }
 
-func mergeStagedPath(localRoot, src, dst string) error {
+func mergeStagedPath(localRoot, src, dst string, installed *packInstallRecord) error {
 	info, err := os.Lstat(src)
 	if err != nil {
 		return fmt.Errorf("stat staged unpack path %s: %w", src, err)
@@ -1544,8 +1573,15 @@ func mergeStagedPath(localRoot, src, dst string) error {
 		if err := ensureNoSymlinkPath(localRoot, dst, true); err != nil {
 			return err
 		}
+		// Only a directory this merge creates is part of the write set; merging
+		// into an existing one leaves every retained child untouched.
+		_, statErr := os.Lstat(dst)
+		created := errors.Is(statErr, os.ErrNotExist)
 		if err := os.MkdirAll(dst, info.Mode().Perm()); err != nil {
 			return fmt.Errorf("mkdir unpack target %s: %w", dst, err)
+		}
+		if created {
+			installed.add(dst)
 		}
 		if err := ensureNoSymlinkPath(localRoot, dst, true); err != nil {
 			return err
@@ -1555,7 +1591,7 @@ func mergeStagedPath(localRoot, src, dst string) error {
 			return fmt.Errorf("read staged unpack dir %s: %w", src, err)
 		}
 		for _, entry := range entries {
-			if err := mergeStagedPath(localRoot, filepath.Join(src, entry.Name()), filepath.Join(dst, entry.Name())); err != nil {
+			if err := mergeStagedPath(localRoot, filepath.Join(src, entry.Name()), filepath.Join(dst, entry.Name()), installed); err != nil {
 				return err
 			}
 		}
@@ -1577,6 +1613,7 @@ func mergeStagedPath(localRoot, src, dst string) error {
 	if err := os.Rename(src, dst); err != nil {
 		return fmt.Errorf("install unpack path %s: %w", dst, err)
 	}
+	installed.add(dst)
 	return nil
 }
 

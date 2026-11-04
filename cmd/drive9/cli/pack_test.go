@@ -1520,3 +1520,81 @@ func TestExtractPackArchiveAuditSurvivesUnreadableSubtree(t *testing.T) {
 		t.Fatal("the installed escape stayed live after the walk hit an unreadable directory")
 	}
 }
+
+// Selecting a directory does not make its untouched descendants the archive's
+// business: merging /repo into an existing directory must preserve a retained
+// child link the archive never names.
+func TestExtractPackArchivePreservesUntouchedDescendantOnDirectoryMerge(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink semantics differ on Windows")
+	}
+	localRoot := t.TempDir()
+	repoDir := filepath.Join(localRoot, "overlay", "repo")
+	if err := os.MkdirAll(repoDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	retained := filepath.Join(repoDir, "cache")
+	if err := os.Symlink("/opt/shared-cache", retained); err != nil {
+		t.Fatalf("plant retained link: %v", err)
+	}
+
+	archive := buildPackTestArchive(t, `{"format":"drive9.pack.v1","version":1,"paths":["/repo"]}`,
+		packTestEntry{path: "repo/new.txt", body: "hello\n"})
+	if _, err := extractPackArchive(context.Background(), bytes.NewReader(archive), unpackOptions{
+		LocalRoot: localRoot,
+	}); err != nil {
+		t.Fatalf("merging into a directory must not fail over an untouched child link: %v", err)
+	}
+	if got, err := os.Readlink(retained); err != nil || got != "/opt/shared-cache" {
+		t.Fatalf("untouched descendant link changed: %q, %v", got, err)
+	}
+	if body, err := os.ReadFile(filepath.Join(repoDir, "new.txt")); err != nil || string(body) != "hello\n" {
+		t.Fatalf("installed file = %q, %v", body, err)
+	}
+}
+
+// Scope matching must follow the destination filesystem's own name semantics:
+// on a case-insensitive filesystem the installed entry can be reached through a
+// spelling the archive never wrote, and a literal comparison would classify the
+// archive's own link as unrelated and leave it live.
+func TestPackPathWithinUsesFilesystemIdentity(t *testing.T) {
+	dir := t.TempDir()
+	realDir := filepath.Join(dir, "Repo")
+	if err := os.MkdirAll(realDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	installed := filepath.Join(realDir, "a")
+	if err := os.WriteFile(installed, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// An aliased ancestor is the portable stand-in for the case-insensitive
+	// lookup: same directory entry, different spelling.
+	aliasDir := filepath.Join(dir, "repo")
+	if err := os.Symlink(realDir, aliasDir); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	aliased := filepath.Join(aliasDir, "a")
+	if aliased == installed {
+		t.Fatal("test setup produced identical spellings")
+	}
+	if !packPathWithin(aliased, []string{installed}) {
+		t.Fatal("a differently spelled alias of an installed path was treated as unrelated")
+	}
+	if !packPathWithin(installed, []string{aliased}) {
+		t.Fatal("scope entry reached through an alias was not matched")
+	}
+
+	unrelated := filepath.Join(dir, "other")
+	if err := os.WriteFile(unrelated, []byte("y"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if packPathWithin(unrelated, []string{installed}) {
+		t.Fatal("distinct filesystem objects compared equal")
+	}
+	if packPathWithin(filepath.Join(realDir, "missing"), []string{installed}) {
+		t.Fatal("a path that does not exist matched an unrelated scope entry")
+	}
+	if !packPathUnder(filepath.Join(installed, "child"), installed) {
+		t.Fatal("descendant of a scope entry was not matched")
+	}
+}
