@@ -286,9 +286,19 @@ func (u *WriteBackUploader) DrainAll() {
 // RecoverPending scans the cache directory for leftover entries from a
 // previous session and submits them for upload.
 func (u *WriteBackUploader) RecoverPending() {
+	u.RecoverPendingFilter(nil)
+}
+
+// RecoverPendingFilter is RecoverPending with a skip predicate: paths for
+// which skip reports true belong to another track's recovery (the staging
+// ledger's pending index) and are left alone.
+func (u *WriteBackUploader) RecoverPendingFilter(skip func(localPath string) bool) {
 	entries := u.cache.ListPending()
 	skippedLegacyOverwrites := 0
 	for _, e := range entries {
+		if skip != nil && skip(e.Meta.Path) {
+			continue
+		}
 		if e.Meta.Kind == staging.PendingOverwrite && e.Meta.BaseRev <= 0 {
 			skippedLegacyOverwrites++
 			safeLogPrintf("writeback: skipping legacy overwrite without base revision for %s", e.Meta.Path)

@@ -382,7 +382,7 @@ func (c *WriteBackCache) PutWithBaseRevAndModeTimings(remotePath string, data []
 // used by FileHandle staging. Legacy callers deliberately store empty lineage,
 // which is safe because such metadata cannot authorize a growth rebase.
 func (c *WriteBackCache) PutWithBaseRevAndModeAndLineageTimings(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, liveAncestors ...string) (uint64, WriteBackPutTimings, error) {
-	return c.putWithBaseRevAndModeAndLineage(remotePath, data, size, kind, baseRev, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted, true, liveAncestors)
+	return c.putWithBaseRevAndModeAndLineage(remotePath, data, size, kind, baseRev, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted, wbSyncFull, liveAncestors)
 }
 
 // PutWithBaseRevAndModeAndLineageTimingsNoSync is the non-durable variant of
@@ -392,7 +392,20 @@ func (c *WriteBackCache) PutWithBaseRevAndModeAndLineageTimings(remotePath strin
 // elsewhere — the shadow store + pending index — so at most the snapshot's
 // freshness (not its integrity) is lost on a crash.
 func (c *WriteBackCache) PutWithBaseRevAndModeAndLineageTimingsNoSync(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, liveAncestors ...string) (uint64, WriteBackPutTimings, error) {
-	return c.putWithBaseRevAndModeAndLineage(remotePath, data, size, kind, baseRev, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted, false, liveAncestors)
+	return c.putWithBaseRevAndModeAndLineage(remotePath, data, size, kind, baseRev, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted, wbSyncNone, liveAncestors)
+}
+
+// PutWithBaseRevAndModeAndLineageTimingsDirSync is the v1 close-path stage
+// variant of PutWithBaseRevAndModeAndLineageTimings: the .dat data is
+// fsynced before its rename, the .meta rides its rename without its own
+// fsync, and ONE directory fsync after both renames makes the pair durable
+// together — two fsyncs instead of the durable put's four, the budget v1
+// paid at its close-path stage (shadow Sync + WAL fsync). Once the call
+// returns the entry is durable and the .dat is never torn; a crash inside
+// the call may lose the pair wholesale or leave a torn .meta frame (the
+// startup scan prunes it), matching v1's crash-before-WAL-fsync window.
+func (c *WriteBackCache) PutWithBaseRevAndModeAndLineageTimingsDirSync(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, liveAncestors ...string) (uint64, WriteBackPutTimings, error) {
+	return c.putWithBaseRevAndModeAndLineage(remotePath, data, size, kind, baseRev, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted, wbSyncDirOnce, liveAncestors)
 }
 
 // Get reads the cached data for remotePath. Returns nil, false if not cached.
@@ -836,7 +849,26 @@ func (c *WriteBackCache) validateScannedMeta(scannedMetaName string, meta *Write
 	return scannedMetaName == HashPath(meta.Path)+".meta"
 }
 
-func (c *WriteBackCache) putWithBaseRevAndModeAndLineage(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, durable bool, liveAncestors []string) (uint64, WriteBackPutTimings, error) {
+// wbSyncMode selects a put's crash cost (see the exported variants).
+type wbSyncMode uint8
+
+const (
+	// wbSyncFull fsyncs each file and the directory rename after each
+	// rename — four fsyncs. The pair is the only durable authority.
+	wbSyncFull wbSyncMode = iota
+	// wbSyncDirOnce is the v1 close-path stage cost: fsync the .dat data
+	// before its rename, write the .meta without its own fsync, then one
+	// directory fsync after both renames — two fsyncs. A crash may lose
+	// the pair wholesale (before the dir fsync) or leave a torn .meta
+	// frame (the startup scan prunes it); the .dat is never torn and the
+	// entry is durable once the put returns.
+	wbSyncDirOnce
+	// wbSyncNone writes atomically without fsyncs; the durable authority
+	// must already exist elsewhere (shadow store + pending index).
+	wbSyncNone
+)
+
+func (c *WriteBackCache) putWithBaseRevAndModeAndLineage(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, syncMode wbSyncMode, liveAncestors []string) (uint64, WriteBackPutTimings, error) {
 	var t WriteBackPutTimings
 
 	// Phase 1: acquire per-path lock (serializes same-path Put/Remove/etc.)
@@ -851,12 +883,17 @@ func (c *WriteBackCache) putWithBaseRevAndModeAndLineage(remotePath string, data
 	gen := c.nextGen.Add(1)
 
 	// Phase 2: file I/O outside global lock (only per-path serialized).
-	writeFn := atomicWrite
-	if !durable {
-		writeFn = atomicWriteNoSync
+	writeDat := atomicWrite
+	writeMeta := atomicWrite
+	switch syncMode {
+	case wbSyncNone:
+		writeDat = atomicWriteNoSync
+		writeMeta = atomicWriteNoSync
+	case wbSyncDirOnce:
+		writeMeta = atomicWriteNoSync
 	}
 	datStart := time.Now()
-	if err := writeFn(datPath, data); err != nil {
+	if err := writeDat(datPath, data); err != nil {
 		c.ReleasePathLock(remotePath, pl)
 		return 0, t, fmt.Errorf("writeback put data: %w", err)
 	}
@@ -884,13 +921,22 @@ func (c *WriteBackCache) putWithBaseRevAndModeAndLineage(remotePath string, data
 		return 0, t, fmt.Errorf("writeback marshal meta: %w", err)
 	}
 	metaStart := time.Now()
-	if err := writeFn(metaPath, metaBytes); err != nil {
+	if err := writeMeta(metaPath, metaBytes); err != nil {
 		// Best-effort cleanup of the .dat file if meta write fails.
 		_ = os.Remove(datPath)
 		c.ReleasePathLock(remotePath, pl)
 		return 0, t, fmt.Errorf("writeback put meta: %w", err)
 	}
 	t.MetaWrite = time.Since(metaStart)
+	if syncMode == wbSyncDirOnce {
+		// One directory fsync makes both renames durable together — the
+		// second half of the two-fsync budget (with the .dat data fsync
+		// above) that v1 paid at its close-path stage.
+		if err := fsyncDir(filepath.Dir(datPath)); err != nil {
+			c.ReleasePathLock(remotePath, pl)
+			return 0, t, fmt.Errorf("writeback put dir sync: %w", err)
+		}
+	}
 
 	// Phase 3: publish in-memory state under global lock (fast, no I/O).
 	c.mu.Lock()

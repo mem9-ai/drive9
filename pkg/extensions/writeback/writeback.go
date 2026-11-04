@@ -526,10 +526,15 @@ func (w *Writeback) SetBaseReader(fn func(path string) ([]byte, bool)) {
 
 // Lifecycle: the facade chain starts/drains/stops the queue with the mount.
 // Start ports the v1 crash-recovery wiring: rebuild the pending index from
-// its .meta files, then re-enqueue persisted pending commits. When the
-// commit queue is absent (write-sync/close-sync stacks) the uploader owns
-// recovery of the .dat/.meta track instead (v1: "Recover pending uploads
-// only when the newer commit queue is unavailable").
+// its .meta files, then re-enqueue persisted pending commits. The .dat/.meta
+// track recovers through the uploader on every stack: unlike v1 — where the
+// flush staged the durable ledger (shadow + pending index) and the write-back
+// cache was a pure NoSync snapshot, so queue recovery covered everything —
+// the small-file track's staged pair is its own only authority, and skipping
+// the uploader scan when the queue exists lost a Flush-staged image whose
+// Release never ran (v1 recovered exactly that from the ledger). The two
+// tracks own disjoint paths (the ledger track drops its .dat at enqueue);
+// paths still in the pending index belong to the queue's recovery.
 func (w *Writeback) Start(ctx context.Context) error {
 	if w == nil {
 		return nil
@@ -541,8 +546,14 @@ func (w *Writeback) Start(ctx context.Context) error {
 	}
 	if w.queue != nil {
 		w.queue.RecoverPending()
-	} else if w.uploader != nil {
-		w.uploader.RecoverPending()
+	}
+	if w.uploader != nil {
+		if w.queue != nil && w.opts.Staging != nil && w.opts.Staging.Pending != nil {
+			pending := w.opts.Staging.Pending
+			w.uploader.RecoverPendingFilter(func(p string) bool { return pending.HasPending(p) })
+		} else {
+			w.uploader.RecoverPending()
+		}
 	}
 	return nil
 }
@@ -2120,7 +2131,7 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 				defer detachCancel()
 			}
 			isNew := func() bool { h.mu.Lock(); defer h.mu.Unlock(); return h.isNew }()
-			if err := h.stageToWriteCache(ctx, isNew); err != nil {
+			if err := h.stageToWriteCache(ctx, isNew, stageFullDurable); err != nil {
 				return err
 			}
 			h.mu.Lock()
@@ -2170,9 +2181,11 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 		// No write-cache track: fall through to the inline commit below.
 	}
 	if h.w.opts.Policy == PolicyWriteBack && h.w.uploader != nil && h.w.wbCache != nil {
-		// small-file writeback track: the flush stages a durable
-		// .dat/.meta image on disk and the uploader lands it async; the
-		// commit queue keeps serving the large-file/shadow track.
+		// small-file writeback track: the flush stages a .dat/.meta image
+		// on disk — at v1's close-path durability (two fsyncs, none under
+		// lazy staging; v1's durable shadow + NoSync snapshot cache) — and
+		// the uploader lands it async; the commit queue keeps serving the
+		// large-file/shadow track.
 		h.mu.Lock()
 		dirty, unlinked, isNew := h.dirty, h.unlinked, h.isNew
 		size := int64(0)
@@ -2184,7 +2197,7 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 			return nil
 		}
 		if size < commitInlineStreamThreshold {
-			if err := h.stageToWriteCache(ctx, isNew); err != nil {
+			if err := h.stageToWriteCache(ctx, isNew, stageV1Ladder); err != nil {
 				return err
 			}
 			// v1 small-file contract (write-back policy): the Flush
@@ -2316,7 +2329,7 @@ func (h *bufferingHandle) Release(ctx context.Context) error {
 				// snapshot is stale — refresh it from the current buffer
 				// before submitting (v1: the latest image always wins;
 				// submitting the stale snapshot loses the newer write).
-				if err := h.stageToWriteCache(ctx, isNew); err != nil {
+				if err := h.stageToWriteCache(ctx, isNew, stageFullDurable); err != nil {
 					return err
 				}
 			}
@@ -4469,9 +4482,29 @@ func (h *bufferingHandle) finishStreaming(ctx context.Context) error {
 	return stream.FinishStreaming(ctx, size, 0, nil, dirtyParts)
 }
 
+// stageDurability selects the .dat/.meta snapshot's crash cost at the
+// staging boundary, restoring v1's close-path ladder: v1 paid shadow Sync
+// + WAL fsync — two fsyncs — for the durable stage, none under lazy
+// staging, and the write-back snapshot cache itself was always NoSync.
+type stageDurability uint8
+
+const (
+	// stageFullDurable fsyncs each file and its directory rename — four
+	// fsyncs. For boundaries where the pair is the only durable authority
+	// (close-sync's flush, which owes remote durability at close(2) right
+	// after, and Release's final-image refresh).
+	stageFullDurable stageDurability = iota
+	// stageV1Ladder is v1's default close-path cost: the .dat data fsync
+	// plus one directory fsync — two fsyncs — or, under lazy staging
+	// (v1 #964 WritebackLazyStaging / stageDurableAtClose), no fsync at
+	// all: the write-back tier's durability promise is fsync(2), not
+	// close(2).
+	stageV1Ladder
+)
+
 // stageToWriteCache writes the buffered image into the .dat/.meta cache
 // (small-stage) and clears the in-memory buffer's dirty state.
-func (h *bufferingHandle) stageToWriteCache(ctx context.Context, isNew bool) error {
+func (h *bufferingHandle) stageToWriteCache(ctx context.Context, isNew bool, dur stageDurability) error {
 	// The #1023 fence for the writeback-cache track (close-sync and the
 	// small-file write-back flush both stage here): compose with the
 	// file's newest state before this staging refreshes the CAS base —
@@ -4524,20 +4557,23 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, isNew bool) err
 	if isNew {
 		baseRev = 0
 	} else {
-		// The CAS base is the revision the BUFFER was built from. Only two
-		// cases may advance it: no lineage at all (a legacy open that never
-		// observed one), or the remote row is THIS mount's own landing
-		// (same-origin proof — its previous async upload advanced the
-		// revision under an unobserved open). A foreign write must stay a
-		// conflict: adopting its revision would let the stale image
-		// overwrite it silently (hello+X vs WORLD landed Xello).
-		if st, serr := h.w.opts.Client.StatCtx(ctx, h.w.remotePath(h.path)); serr == nil && st != nil {
-			if baseRev <= 0 || h.w.landedCoversInode(h.path, st.Revision) {
-				h.mu.Lock()
-				h.baseRev = st.Revision
-				h.mu.Unlock()
-				baseRev = st.Revision
-			}
+		// v1 adoptCommittedRevisionLocked: the CAS base composes with this
+		// mount's OWN landed watermark — the local table the queue and the
+		// uploader record on every success — never a remote HEAD (v1's
+		// flush-stage never touched the wire; the direct stat here cost
+		// every small-file close one synchronous round trip). Two cases
+		// may advance it: no lineage at all (a legacy open that never
+		// observed one), or a newer revision this mount itself landed
+		// (same-origin by construction — an async upload advanced the row
+		// under an unobserved open). A foreign write never enters the
+		// table, so it stays a conflict: adopting its revision would let
+		// the stale image overwrite it silently (hello+X vs WORLD landed
+		// Xello).
+		if r, ok := h.w.landedRevision(h.path); ok && (baseRev <= 0 || r > baseRev) {
+			h.mu.Lock()
+			h.baseRev = r
+			h.mu.Unlock()
+			baseRev = r
 		}
 	}
 	kind := staging.PendingOverwrite
@@ -4548,7 +4584,7 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, isNew bool) err
 	// remote name itself (a remote key here made every subtree mount's
 	// upload silently no-op — the git-ops clone's config.lock never
 	// landed).
-	if err := h.w.wbCache.PutWithBaseRevAndMode(h.path, image, int64(len(image)), kind, baseRev, mode, hasMode); err != nil {
+	if err := h.w.putWriteCacheSnapshot(h.path, image, kind, baseRev, mode, hasMode, dur); err != nil {
 		return err
 	}
 	// v1 seeded the read cache with the staged image at the flush
@@ -4559,6 +4595,25 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, isNew bool) err
 	}
 	h.retireDirty(stagedGen)
 	return nil
+}
+
+// putWriteCacheSnapshot writes the .dat/.meta snapshot at the selected
+// durability: the v1 ladder maps to the two-fsync stage put (or NoSync
+// under lazy staging); full durability keeps the four-fsync put for the
+// boundaries where the pair is the only authority.
+func (w *Writeback) putWriteCacheSnapshot(path string, image []byte, kind staging.PendingKind, baseRev int64, mode uint32, hasMode bool, dur stageDurability) error {
+	size := int64(len(image))
+	switch dur {
+	case stageV1Ladder:
+		if w.lazy {
+			_, _, err := w.wbCache.PutWithBaseRevAndModeAndLineageTimingsNoSync(path, image, size, kind, baseRev, mode, hasMode, "", "", false)
+			return err
+		}
+		_, _, err := w.wbCache.PutWithBaseRevAndModeAndLineageTimingsDirSync(path, image, size, kind, baseRev, mode, hasMode, "", "", false)
+		return err
+	default:
+		return w.wbCache.PutWithBaseRevAndMode(path, image, size, kind, baseRev, mode, hasMode)
+	}
 }
 
 // applyPendingMode publishes a deferred chmod once the image it describes
