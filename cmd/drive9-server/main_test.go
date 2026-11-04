@@ -877,7 +877,10 @@ func TestDecodePreviousMasterKeys(t *testing.T) {
 // http:// base would hand clients URLs against an https listener.
 func TestPublicBaseURLFollowsTLSScheme(t *testing.T) {
 	keys := []string{"DRIVE9_PUBLIC_URL", "DRIVE9_TLS_CERT_FILE", "DRIVE9_TLS_KEY_FILE"}
-	t.Cleanup(func() { restoreEnv(t, snapshotEnv(t, keys)) })
+	// Snapshot before mutating: a snapshot taken inside Cleanup would capture
+	// this test's final values and leave them set for every later test.
+	snapshot := snapshotEnv(t, keys)
+	t.Cleanup(func() { restoreEnv(t, snapshot) })
 	unsetEnv(t, keys)
 
 	unsetEnv(t, []string{"DRIVE9_TLS_CERT_FILE", "DRIVE9_TLS_KEY_FILE"})

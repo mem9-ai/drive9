@@ -6,7 +6,9 @@ import (
 )
 
 func TestMySQLTLSParam(t *testing.T) {
-	t.Parallel()
+	// The policy depends on DRIVE9_DB_TLS_SKIP_VERIFY; pin it so an ambient
+	// opt-out cannot rewrite the expected default results.
+	t.Setenv(EnvDBTLSSkipVerify, "")
 	cases := []struct {
 		tls      bool
 		provider string
@@ -40,7 +42,7 @@ func TestMySQLTLSParam(t *testing.T) {
 }
 
 func TestFormatTenantMySQLDSN(t *testing.T) {
-	t.Parallel()
+	t.Setenv(EnvDBTLSSkipVerify, "")
 	dsn := FormatTenantMySQLDSN("u", "p", "127.0.0.1", 4000, "drive9_t", false, ProviderTiDBCloudNative)
 	if strings.Contains(dsn, "tls=") {
 		t.Fatalf("loopback native DSN unexpectedly has tls: %s", dsn)

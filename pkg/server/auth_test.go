@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -964,15 +965,23 @@ func TestVerifyVaultCapabilityLocallyRejectsForgedAndExpiredTokens(t *testing.T)
 	if err := s.verifyVaultCapabilityLocally(capTok, "tenant-b"); err == nil {
 		t.Fatal("token verified under a different tenant")
 	}
-	// A tampered signature fails. Flip one signature character to a different
-	// value instead of overwriting the tail, which could already be "AA" and
-	// leave the token unchanged.
-	last := capTok[len(capTok)-1]
-	replacement := byte('A')
-	if last == 'A' {
-		replacement = 'B'
+	// A tampered signature fails. Flip a bit in the decoded MAC rather than
+	// substituting the trailing base64 character: a 32-byte MAC encodes to 43
+	// unpadded characters, so the last character carries only four significant
+	// bits and some substitutions (A -> B) decode to the identical MAC.
+	dot := strings.LastIndex(capTok, ".")
+	if dot < 0 {
+		t.Fatalf("unexpected capability token format: %q", capTok)
 	}
-	forged := capTok[:len(capTok)-1] + string(replacement)
+	mac, err := base64.RawURLEncoding.DecodeString(capTok[dot+1:])
+	if err != nil {
+		t.Fatalf("decode capability signature: %v", err)
+	}
+	if len(mac) == 0 {
+		t.Fatal("empty capability signature")
+	}
+	mac[0] ^= 0xff
+	forged := capTok[:dot+1] + base64.RawURLEncoding.EncodeToString(mac)
 	if forged == capTok {
 		t.Fatal("test setup produced an unchanged token")
 	}
