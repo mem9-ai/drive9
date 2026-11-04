@@ -174,7 +174,7 @@ func TestPortRecreateAfterFacadeUnlinkVisibleImmediately(t *testing.T) {
 	h := openLog(t, ch, "/app.log")
 	// The facade hides the name, defers its own delete, and later lands it
 	// through a second unlink dispatch before the recreate.
-	ext.MarkPathUnlinked("/app.log")
+	_ = ext.MarkPathUnlinked("/app.log")
 	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: "/app.log"}); err != nil {
 		t.Fatalf("landing unlink = %v", err)
 	}

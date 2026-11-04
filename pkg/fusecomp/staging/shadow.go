@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1192,6 +1193,32 @@ func (s *ShadowStore) Has(remotePath string) bool {
 	sp := s.shadowPath(remotePath)
 	_, err := os.Stat(sp)
 	return err == nil
+}
+
+// VerifyRemoved reports an error unless the path's shadow payload is
+// CONFIRMED absent: an in-memory entry or a stat-able file means it is
+// still present, and a stat failure other than not-exist (EACCES, EIO)
+// means its absence cannot be proven. Callers must not treat that latter
+// case as a successful removal — a read-only or failing cache filesystem
+// can leave the durable shadow behind while rejecting every probe
+// (Has alone cannot make the distinction: it returns false for any stat
+// error).
+func (s *ShadowStore) VerifyRemoved(remotePath string) error {
+	if s == nil || remotePath == "" {
+		return nil
+	}
+	s.mu.RLock()
+	_, active := s.files[remotePath]
+	s.mu.RUnlock()
+	if active {
+		return fmt.Errorf("shadow for %s is still active", remotePath)
+	}
+	if _, err := os.Stat(s.shadowPath(remotePath)); err == nil {
+		return fmt.Errorf("shadow for %s still exists on disk", remotePath)
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("absence of shadow for %s cannot be verified: %w", remotePath, err)
+	}
+	return nil
 }
 
 // Close closes all open shadow file descriptors.

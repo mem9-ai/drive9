@@ -154,7 +154,7 @@ type Writeback struct {
 	opts       Options
 	// extentGlobs/extentMatchCutoff are the compiled pattern-owned
 	// promotion rules (see Options.ExtentPatterns).
-	extentGlobs      []globMatcher
+	extentGlobs       []globMatcher
 	extentMatchCutoff int64
 	// interactive mirrors SyncMode == "interactive".
 	interactive bool
@@ -341,9 +341,9 @@ type bufferingHandle struct {
 	// handle chain snapshot IDs — the queue's direct-parent merge and
 	// growth-rebase decisions need real lineage instead of fail-closed
 	// empties.
-	stageSeq          int64
-	stagedSnapshotID  string
-	stagedParentID    string
+	stageSeq         int64
+	stagedSnapshotID string
+	stagedParentID   string
 	// stagedContentVersion is the buffer's content generation when the
 	// current staged snapshot was minted. A landing may only arm the
 	// remote restore for a buffer whose generation is unchanged: any
@@ -354,8 +354,8 @@ type bufferingHandle struct {
 	// registered under w.liveSnapshots (atomic map copy): entries are
 	// consumed by their landings and the remainder is dropped at untrack.
 	stagedSnapshotRegs atomic.Value
-	stagedSnapshotSeq int64
-	contentSnapshotID string
+	stagedSnapshotSeq  int64
+	contentSnapshotID  string
 }
 
 // lineageSeq mints process-unique snapshot IDs (v1 generateMountID): the
@@ -678,25 +678,27 @@ func (w *Writeback) Stop(ctx context.Context) error {
 
 // MarkPathUnlinked marks every live handle of p anonymous (survivor
 // bookkeeping) without touching the remote: the facade defers the actual
-// deletion to the last close of an open file.
-func (w *Writeback) MarkPathUnlinked(p string) {
-	// Serialize with staging: the staging path holds this lock across its
-	// unlinked check AND its snapshot write/enqueue, so taking it here
-	// makes "check unlinked" vs "mark anonymous + cancel the queue"
-	// mutually exclusive — without it, an interactive fsync that passed
-	// the check could still publish and enqueue under the dead name after
-	// the cancel swept an empty queue. None of the callees re-acquire a
-	// path lock, so this cannot deadlock.
-	unlock := w.pathLocks.lock(p)
-	defer unlock()
-	w.markUnlinked(p, false)
-	// The name is going away NOW (the syscall already returned OK): the
-	// pending overlays must stop answering lookups for it, or a
-	// re-creator racing the deferred remote DELETE reads the old entry
+// deletion to the last close of an open file. It reports an error when the
+// path's staged state provably stays replayable (WAL marker failed AND the
+// fallback cleanup could not remove the recovery source): the facade must
+// then fail the unlink instead of acknowledging a deletion that a restart
+// would undo. The anonymous marking is rolled back on that path.
+func (w *Writeback) MarkPathUnlinked(p string) error {
+	// The marking takes NO path lock: a commit worker holds the path lock
+	// across its network upload, and unlink(2) must not queue behind an
+	// in-flight PUT. Ordering against a racing staging is provided on the
+	// staging side — the entry rechecks the marking right after its
+	// enqueue and cancels itself — so the unlink either cancels the entry
+	// from the queue, or the entry observes the marking and removes
+	// itself; no window publishes the dead name.
+	marked, _ := w.markUnlinkedSnapshot(p, false)
+	// The name is going away NOW (the facade invokes this before FS.Unlink
+	// replies OK): the pending overlays must stop answering lookups for it,
+	// or a re-creator racing the deferred remote DELETE reads the old entry
 	// (unlink/14 row 4's EEXIST against the resurrected name). The open
 	// fds keep their image: the staged bytes move to the unlink
 	// snapshot before the pending entries die.
-	if w.opts.Staging != nil && w.queue != nil {
+	if w.opts.Staging != nil {
 		if meta, ok := w.pendingMeta(p); ok && meta != nil {
 			if data, kok := readShadowGenerationFenced(w.opts.Staging.Shadow, p, meta.Size); kok {
 				if err := w.opts.Staging.Shadow.WriteFull(p, data, 0); err == nil {
@@ -713,16 +715,26 @@ func (w *Writeback) MarkPathUnlinked(p string) {
 				}
 			}
 		}
-		// CancelPathPreserveLocal: a plain CancelPath also deletes the
-		// shadow the snapshot above just wrote, so the anonymous fd fell
-		// through to the recreated same-name file's bytes.
-		w.queue.CancelPathPreserveLocal(p)
+	}
+	// CancelPathPreserveLocal: a plain CancelPath also deletes the
+	// shadow the snapshot above just wrote, so the anonymous fd fell
+	// through to the recreated same-name file's bytes.
+	if w.opts.Staging != nil && w.queue != nil {
+		if err := w.queue.CancelPathPreserveLocal(p); err != nil {
+			// The unlink is failing: the descriptors must go on serving
+			// their name, and — the failed premise being that the durable
+			// staging survived — the replayable frames now correctly
+			// describe a file that was never unlinked.
+			restoreMarked(marked)
+			return err
+		}
 	}
 	if w.wbCache != nil {
 		w.wbCache.Remove(p)
 	}
 	// The landed table's rescue window must not resurrect it either.
 	w.forgetLanded(p)
+	return nil
 }
 
 // SetSurvivorLookup wires the facade's hardlink-alias probe.
@@ -888,13 +900,20 @@ func extOf(base string) string {
 
 // openDirectIO reports whether a freshly opened handle should reply
 // FOPEN_DIRECT_IO (v1 remoteOpenFlagsForHandle): sqlite-coherent paths,
-// shadow-backed staged images, and bases at or above the 64MB threshold.
-func (w *Writeback) openDirectIO(path string, baseSize int64) bool {
+// shadow-backed staged images, and WRITABLE opens of a base at or above
+// the 64MB threshold. v1 gated the size rule on a buffer-backed handle
+// (fh.Dirty != nil); applying it to read-only opens too dropped the page
+// cache for every large file, so a kernel-warm re-read went through FUSE
+// instead of the page cache.
+func (w *Writeback) openDirectIO(path string, flags uint32, baseSize int64) bool {
 	if w.isSQLiteDirectIOPath(path) {
 		return true
 	}
 	if w.opts.Staging != nil && w.opts.Staging.Pending.HasPending(path) {
 		return true
+	}
+	if flags&(uint32(syscall.O_WRONLY)|uint32(syscall.O_RDWR)) == 0 {
+		return false
 	}
 	return baseSize >= smallFileShadowThreshold
 }
@@ -1187,10 +1206,10 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			}
 			w.track(h)
 			res.Handle = h
-			if w.openDirectIO(op.Path, h.baseSize) {
-				// v1 remoteOpenFlagsForHandle: shadow-backed/sqlite/large
-				// bases reply DIRECT_IO; the facade keeps the flag and skips
-				// KEEP_CACHE.
+			if w.openDirectIO(op.Path, flags, h.baseSize) {
+				// v1 remoteOpenFlagsForHandle: shadow-backed/sqlite paths and
+				// large writable bases reply DIRECT_IO; the facade keeps the
+				// flag and skips KEEP_CACHE.
 				res.OpenFlags |= gofuse.FOPEN_DIRECT_IO
 			}
 			if trunc && res.Attr != nil {
@@ -1264,7 +1283,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			}
 			w.track(h)
 			res.Handle = h
-			if w.openDirectIO(op.Path, h.baseSize) {
+			if w.openDirectIO(op.Path, flags, h.baseSize) {
 				res.OpenFlags |= gofuse.FOPEN_DIRECT_IO
 			}
 			if trunc && res.Attr != nil {
@@ -1344,7 +1363,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		// retry source (the closed writer's overwrite vanished with it).
 		// The queue cancel (when it runs) precedes the survivor snapshot:
 		// CancelPath also removes the shadow an anonymous clean fd reads.
-		purgeStaging := func() {
+		purgeStaging := func() error {
 			if w.wbCache != nil {
 				if under {
 					for _, entry := range w.wbCache.ListByPrefix(prefix) {
@@ -1357,11 +1376,18 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 				// Preserve-local: the anonymous fd's unlink snapshot lives
 				// in the shadow and must survive the cancel (plain
 				// CancelPath removed it, and post-delete reads ENOENT'd).
-				w.queue.CancelPathPreserveLocal(op.Path)
+				if err := w.queue.CancelPathPreserveLocal(op.Path); err != nil {
+					// The remote DELETE already succeeded, so the handles
+					// stay anonymous — but a replayable local image would
+					// re-create the name after a crash: report the unlink
+					// as failed rather than acknowledge that.
+					return err
+				}
 				if under {
 					w.queue.CancelPrefix(prefix)
 				}
 			}
+			return nil
 		}
 		w.markUnlinked(op.Path, under)
 		rollback := func() {
@@ -1385,7 +1411,14 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			// nothing remote; a lazy-created path never landed. Local
 			// discard is enough, but queued entries must still die.
 			if w.queue != nil {
-				w.queue.CancelPath(op.Path)
+				if err := w.queue.CancelPath(op.Path); err != nil {
+					// The local image provably stayed replayable (WAL and
+					// cleanup both failed): fail the unlink and put the
+					// writers back on their name instead of acknowledging a
+					// deletion a restart would undo.
+					rollback()
+					return fs.Result{}, err
+				}
 				if under {
 					w.queue.CancelPrefix(prefix)
 				}
@@ -1401,7 +1434,9 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			rollback()
 			return res, err
 		}
-		purgeStaging()
+		if err := purgeStaging(); err != nil {
+			return res, err
+		}
 		w.forgetLanded(op.Path)
 		return res, nil
 	case fs.OpLink:
@@ -1803,6 +1838,67 @@ func (h *bufferingHandle) Anonymous() bool {
 	return h.unlinked
 }
 
+// IsRemoteNamespaceReadable reports whether a read through this handle
+// serves the ORDINARY remote namespace right now — the claim the outer
+// cache needs before its sequential prefetcher fetches blocks from the
+// remote behind the handle (v1 armed it for clean read-only opens and
+// served every local tier before a prefetch hit). It is false whenever a
+// tier of Read would answer from local bytes: this descriptor's buffer or
+// snapshot, or a path-level image (a live dirty writer, a staged or
+// pending image on the path or a hardlink alias). Otherwise the terminal's
+// own claim is forwarded, so a plane that does not read the remote
+// namespace (an overlay token, an extent handle) stays excluded.
+func (h *bufferingHandle) IsRemoteNamespaceReadable() bool {
+	h.mu.Lock()
+	inner := h.inner
+	local := inner == nil || h.buf != nil || h.dirty || h.isNew || h.trunc || h.unlinked ||
+		h.pendingImage != nil || h.pendingFile != nil || h.pendingShadowGen != 0
+	h.mu.Unlock()
+	if local || h.w.pathHasLocalImage(h) {
+		return false
+	}
+	r, ok := inner.(interface{ IsRemoteNamespaceReadable() bool })
+	return ok && r.IsRemoteNamespaceReadable()
+}
+
+// pathHasLocalImage reports whether a clean descriptor's read would be
+// answered by a local tier of Read instead of the remote namespace — the
+// path-level state no handle field records: a staged .dat/.meta image, a
+// dirty buffer on any live sibling of the inode (same-path fds and
+// hardlink aliases, the set readLiveWriter/readVisibleSiblingImage serve
+// from), or a pending (released, not yet landed) image on the path or an
+// alias (readAliasStagedImage). A sibling mid-mutation (its lock held) is
+// treated as a local image: fail closed, the tier below decides.
+func (w *Writeback) pathHasLocalImage(h *bufferingHandle) bool {
+	ino, path := w.identityOf(h)
+	if w.wbCache != nil {
+		if _, ok := w.wbCache.GetMeta(path); ok {
+			return true
+		}
+	}
+	for _, sib := range w.inodeHandles(ino, path) {
+		if sib == h {
+			continue
+		}
+		if !sib.mu.TryLock() {
+			return true
+		}
+		dirty := sib.dirty && sib.buf != nil && !sib.unlinked
+		sib.mu.Unlock()
+		if dirty {
+			return true
+		}
+	}
+	if w.opts.Staging != nil {
+		for _, alias := range w.inodeAliasPaths(ino, path) {
+			if w.opts.Staging.Pending.HasPending(alias) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // Read implements fs.Handle.
 func (h *bufferingHandle) Read(ctx context.Context, off int64, dest []byte) (int, error) {
 	h.mu.Lock()
@@ -2110,7 +2206,7 @@ func (h *bufferingHandle) Sync(ctx context.Context) error {
 		// v1 interactive fsync: the staging is unconditionally durable and
 		// a JournalFsync frame fences the async commit's marker ordering.
 		_, err := h.stageAndEnqueueOpt(ctx, true, true)
-	return err
+		return err
 	}
 	if err := h.commitLocked(ctx); err != nil {
 		return err
@@ -4433,6 +4529,19 @@ func (h *bufferingHandle) stageAndEnqueueInner(ctx context.Context, durable, jou
 	}
 	if err := w.queue.Enqueue(entry); err != nil {
 		return staged, err
+	}
+	// The unlink's marking takes no path lock (a commit worker holds it
+	// across its upload), so the pre-enqueue guard alone cannot close the
+	// check-to-enqueue window. Recheck AFTER the entry is visible to the
+	// queue's cancel sweep: an unlink that marked in the window either
+	// cancels this entry itself, or we observe the marking here and
+	// remove our own publication — the dead name is never left enqueued.
+	h.mu.Lock()
+	markedSince := h.unlinked
+	h.mu.Unlock()
+	if markedSince && w.queue != nil {
+		_ = w.queue.CancelPathPreserveLocal(h.path)
+		return staged, nil
 	}
 	h.mu.Lock()
 	h.dirty = false

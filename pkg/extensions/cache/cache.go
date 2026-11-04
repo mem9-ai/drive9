@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/client"
@@ -96,10 +97,45 @@ type Cache struct {
 	// must not un-dirty a writer's path).
 	dirtyMu sync.Mutex
 	dirty   map[string]int
+	// unverified is set while the event stream has lost continuity
+	// (EventUnverified) and cleared when it catches up (EventVerified):
+	// in between, a read re-pins its revision against the remote before
+	// the revision-keyed tiers may answer (v1 statCacheUnverified +
+	// revalidateReadCacheEntryIfUntrusted), because a remote change in
+	// the gap arrives with no event.
+	unverified atomic.Bool
+	// inodes is the facade's table, attached before the mount serves:
+	// hardlink aliases share the object, so invalidation and sibling
+	// prefetch hygiene must reach every name bound to the inode.
+	inodes fs.InodeTable
 }
 
 // SetCacheHitRecorder wires the facade-owned hit/miss perf feed.
 func (c *Cache) SetCacheHitRecorder(fn func(kind string, hit bool)) { c.hitRecorder = fn }
+
+// SetInodeTable is called by the facade before the mount serves.
+func (c *Cache) SetInodeTable(t fs.InodeTable) { c.inodes = t }
+
+// aliasSet returns every known name bound to the same inode as path: the
+// path itself plus its hardlink aliases. A hardlink alias names the same
+// remote object, so a write or landing through one name is a change to them
+// all. Without the table it is the path alone.
+func (c *Cache) aliasSet(path string) map[string]struct{} {
+	set := map[string]struct{}{path: {}}
+	if c.inodes == nil {
+		return set
+	}
+	ino, ok := c.inodes.Ino(path)
+	if !ok || ino == 0 {
+		return set
+	}
+	if aliaser, ok := c.inodes.(interface{ Aliases(ino uint64) []string }); ok {
+		for _, a := range aliaser.Aliases(ino) {
+			set[a] = struct{}{}
+		}
+	}
+	return set
+}
 
 func (c *Cache) noteHit(kind string, hit bool) {
 	if c.hitRecorder != nil {
@@ -126,7 +162,18 @@ type cachingHandle struct {
 	// dirtyOwned marks THIS handle as a dirty-path owner; only it clears
 	// its mark.
 	dirtyOwned bool
-	mu         sync.Mutex
+	// revalidate asks the next read to re-pin rev/size against the remote
+	// before the revision-keyed tiers answer: set when the stream lost
+	// continuity (the pinned revision may be stale) or a remote change
+	// replaced the image (the revision is known stale and zeroed). A
+	// checkout does not set it: its descriptors stay off the tiers.
+	revalidate bool
+	// identityGen counts changes to the handle's identity (rev/size/path/
+	// grown, including the invalidations that zero or flag them). A
+	// revalidation stats the remote without the lock; a result that arrives
+	// after the identity moved describes an older world and is discarded.
+	identityGen uint64
+	mu          sync.Mutex
 }
 
 // New constructs the read-plane cache.
@@ -205,9 +252,12 @@ func New(opts Options) (*Cache, error) {
 			}
 			c.invalidatePathTiers(e.Path)
 		})
-		for _, kind := range []fs.EventKind{fs.EventCheckout, fs.EventUnverified} {
-			opts.Events.On(kind, func(fs.Event) { c.invalidateAllTiers() })
-		}
+		opts.Events.On(fs.EventCheckout, func(fs.Event) { c.invalidateAllTiers() })
+		// Loss of stream continuity is not a view change: the revision-keyed
+		// tiers stay and open descriptors re-pin their revision before
+		// answering from them (v1 kept the read cache and revalidated).
+		opts.Events.On(fs.EventUnverified, func(fs.Event) { c.markUnverified() })
+		opts.Events.On(fs.EventVerified, func(fs.Event) { c.unverified.Store(false) })
 		opts.Events.On(fs.EventLanded, func(e fs.Event) {
 			// A local commit settle (onCommitQueueSuccess /
 			// onWriteBackUploadSuccess) replaces the file's image. Same
@@ -223,13 +273,18 @@ func New(opts Options) (*Cache, error) {
 				c.invalidateAllTiers()
 				return
 			}
-			if e.Rev <= 0 {
-				// No trustworthy revision to keep: drop the path's image
-				// (v1 settle) — a rev-keyed seed below supersedes it.
-				c.mem.Invalidate(e.Path)
-			}
-			if c.dsk != nil {
-				c.dsk.InvalidateFile(pathDiskReadCacheFileID(e.Path))
+			// A hardlink alias names the same object: the landing replaces
+			// the image its readers hold under their open-time revision too.
+			aliases := c.aliasSet(e.Path)
+			for alias := range aliases {
+				if e.Rev <= 0 {
+					// No trustworthy revision to keep: drop the alias's
+					// image (v1 settle) — a rev-keyed seed below supersedes it.
+					c.mem.Invalidate(alias)
+				}
+				if c.dsk != nil {
+					c.dsk.InvalidateFile(pathDiskReadCacheFileID(alias))
+				}
 			}
 			prefix := strings.TrimSuffix(e.Path, "/") + "/"
 			c.open.Range(func(key, _ any) bool {
@@ -238,12 +293,20 @@ func New(opts Options) (*Cache, error) {
 					return true
 				}
 				p := h.identity()
-				if p != e.Path && !strings.HasPrefix(p, prefix) {
+				if _, aliased := aliases[p]; !aliased && p != e.Path && !strings.HasPrefix(p, prefix) {
 					return true
 				}
 				h.mu.Lock()
 				if h.prefetch != nil {
-					h.prefetch.Invalidate()
+					// The prefetcher clips its last block to ITS file size:
+					// left at the open-time length, a reader crossing the
+					// old EOF after the file grew got a short block that
+					// Get took for EOF. Move it onto the landed size too.
+					if e.HasSize {
+						h.prefetch.invalidateWithSize(e.Size)
+					} else {
+						h.prefetch.Invalidate()
+					}
 				}
 				if e.Rev > 0 {
 					h.rev = e.Rev
@@ -255,6 +318,7 @@ func New(opts Options) (*Cache, error) {
 					h.size = e.Size
 				}
 				h.grown = false
+				h.identityGen++
 				h.mu.Unlock()
 				return true
 			})
@@ -269,10 +333,16 @@ func New(opts Options) (*Cache, error) {
 // tiers, so a per-file SSE change that skipped them kept answering the old
 // bytes until a full checkout.
 func (c *Cache) invalidatePathTiers(path string) {
-	c.mem.Invalidate(path)
+	// Hardlink aliases name the same object: the change is theirs too.
+	aliases := c.aliasSet(path)
+	for alias := range aliases {
+		c.mem.Invalidate(alias)
+		if c.dsk != nil {
+			c.dsk.InvalidateFile(pathDiskReadCacheFileID(alias))
+		}
+	}
 	c.mem.InvalidatePrefix(path + "/")
 	if c.dsk != nil {
-		c.dsk.InvalidateFile(pathDiskReadCacheFileID(path))
 		c.dsk.InvalidatePathPrefix(path + "/")
 	}
 	prefix := strings.TrimSuffix(path, "/") + "/"
@@ -282,7 +352,7 @@ func (c *Cache) invalidatePathTiers(path string) {
 			return true
 		}
 		p := h.identity()
-		if p == path || strings.HasPrefix(p, prefix) {
+		if _, aliased := aliases[p]; aliased || p == path || strings.HasPrefix(p, prefix) {
 			h.mu.Lock()
 			if h.prefetch != nil {
 				h.prefetch.Invalidate()
@@ -290,13 +360,60 @@ func (c *Cache) invalidatePathTiers(path string) {
 			// The SSE change replaced this file's remote image: the
 			// handle's open-time size/rev describe the OLD one, and a
 			// whole-file read under it re-cached the stale prefix as the
-			// complete image (the grown tail answered EOF).
+			// complete image (the grown tail answered EOF). The next read
+			// re-pins them against the remote instead of leaving the
+			// descriptor off the tiers for the rest of its life.
 			h.size, h.rev = 0, 0
 			h.grown = false
+			h.revalidate = true
+			h.identityGen++
 			h.mu.Unlock()
 		}
 		return true
 	})
+}
+
+// markUnverified handles a loss of event-stream continuity (an SSE
+// disconnect, and the catch-up that ends it): a remote change in the gap
+// arrives with no event, so nothing pinned before it can be trusted blindly
+// — but nothing is known to have changed either. v1 kept the read cache and
+// revalidated reads while the stat cache was unverified; a full sweep here
+// (#1026) dropped up to a GiB of disk tier per blip and zeroed every open
+// descriptor's revision with no path back onto the tiers (#1064).
+//
+//   - The revision-keyed disk tier stays: it is read only through handles,
+//     and every handle re-pins its revision before answering from it.
+//   - The whole-file memory tier is still swept: writeback's base preload
+//     reads it revision-blind (ReadCached with revision 0), and a stale
+//     base under a partial write would commit the old bytes.
+//   - Open handles keep rev/size as CANDIDATES and are flagged to
+//     revalidate; their prefetched blocks (offset-keyed, fetched under the
+//     candidate revision) are dropped. The epoch bump fences fetches still
+//     in flight from being admitted under a revision that may have moved.
+//
+// Without a client to stat with, the sweep is the only safe answer.
+func (c *Cache) markUnverified() {
+	if c.opts.PrefetchClient == nil {
+		c.invalidateAllTiers()
+		return
+	}
+	c.resetMu.Lock()
+	c.epoch.Add(1)
+	c.unverified.Store(true)
+	c.mem.InvalidateAll()
+	c.open.Range(func(key, _ any) bool {
+		if h, ok := key.(*cachingHandle); ok {
+			h.mu.Lock()
+			if h.prefetch != nil {
+				h.prefetch.Invalidate()
+			}
+			h.revalidate = true
+			h.identityGen++
+			h.mu.Unlock()
+		}
+		return true
+	})
+	c.resetMu.Unlock()
 }
 
 // invalidateAllTiers drops the whole-file memory/disk caches AND every open
@@ -307,6 +424,13 @@ func (c *Cache) invalidatePathTiers(path string) {
 func (c *Cache) invalidateAllTiers() {
 	c.resetMu.Lock()
 	c.epoch.Add(1)
+	// A checkout/reset re-synchronizes the whole view: every tier is swept
+	// and every handle re-pins through a fresh open, so the stream is
+	// continuous again from here. SSE's reset path clears its own
+	// unverified flag without a catch-up, so no EventVerified follows it —
+	// left set, gap mode would stat every warm read for the rest of the
+	// session.
+	c.unverified.Store(false)
 	c.mem.InvalidateAll()
 	if c.dsk != nil {
 		c.dsk.InvalidateAll()
@@ -320,9 +444,12 @@ func (c *Cache) invalidateAllTiers() {
 			// The open-time size/revision describe the OLD view: keeping
 			// them made a whole-file read re-cache the stale prefix as the
 			// complete image (a grown remote file read as its old length,
-			// with the tail answering EOF).
+			// with the tail answering EOF). No revalidation either: the
+			// view changed, and the facade fences these descriptors' reads.
 			h.size, h.rev = 0, 0
 			h.grown = false
+			h.revalidate = false
+			h.identityGen++
 			h.mu.Unlock()
 		}
 		return true
@@ -535,15 +662,17 @@ func (c *Cache) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 		// arm behind a claim whose bytes EQUAL that namespace — an
 		// explicit capability on the terminal (core's SyncHandle), not a
 		// decorator-shape inference (localize's token has no UnwrapHandle
-		// and passed the old check, mixing local and remote images).
-		if plainInner, ok := res.Handle.(interface {
-			IsRemoteNamespaceReadable() bool
-		}); ok && plainInner.IsRemoteNamespaceReadable() {
+		// and passed the old check, mixing local and remote images). A
+		// decorator that serves the remote bytes unchanged (writeback's
+		// clean descriptor of a path without local images) forwards the
+		// terminal's claim; one that serves its own bytes withholds it.
+		if remoteNamespaceReadable(res.Handle) && op.Flags&(uint32(syscall.O_WRONLY)|uint32(syscall.O_RDWR)) == 0 {
 			if c.opts.SequentialPrefetch && c.opts.PrefetchClient != nil && size > c.mem.MaxFileSize() {
-				// v1 armed the prefetcher only for handles whose size
-				// exceeds the whole-file cache admission limit: smaller
-				// files are served by the mem cache itself and need no
-				// block read-ahead.
+				// v1 armed the prefetcher only for READ-ONLY opens of files
+				// whose size exceeds the whole-file cache admission limit:
+				// smaller files are served by the mem cache itself and need
+				// no block read-ahead, and a writable descriptor's first
+				// write would only invalidate it.
 				p := NewPrefetcher(c.opts.PrefetchClient, c.remotePathOf(op.Path), size)
 				p.SetParallelRead(c.opts.ParallelReadConcurrency, c.opts.ParallelReadBlockSize)
 				h.prefetch = p
@@ -645,10 +774,53 @@ func (h *cachingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 		}
 		return copy(dest, data[off:]), nil
 	}
+	// The plane's claim that this descriptor reads the remote namespace is
+	// evaluated once per read, and only when a tier below depends on it
+	// (it walks the inode's live handles).
+	remote, remoteKnown := false, false
+	remoteReadable := func() bool {
+		if !remoteKnown {
+			remote, remoteKnown = remoteNamespaceReadable(h.inner), true
+		}
+		return remote
+	}
+	// Re-pin rev/size against the remote before any revision-keyed tier
+	// answers: once per loss of continuity or remote change, and on every
+	// read while the stream is down (v1 revalidateReadCacheEntryIfUntrusted).
+	if h.revalidationDue() {
+		if !remoteReadable() {
+			// The pinned revision is stale but this plane cannot re-pin it
+			// (an inner decorator that does not read the remote namespace):
+			// trust nothing revision-keyed, prefetched blocks included, and
+			// let the plane below answer.
+			if h.prefetch != nil {
+				h.prefetch.Invalidate()
+			}
+			return h.inner.Read(ctx, off, dest)
+		}
+		pinned, err := h.revalidateRevision(ctx, path)
+		if err != nil {
+			return 0, err
+		}
+		if !pinned {
+			// The identity moved under the stat: nothing revision-keyed
+			// (prefetched blocks included) can answer this read.
+			return h.inner.Read(ctx, off, dest)
+		}
+	}
 	if h.prefetch != nil {
-		h.prefetch.OnRead(off, len(dest))
-		if data, ok := h.prefetch.Get(off, len(dest)); ok {
-			return copy(dest, data), nil
+		if remoteReadable() {
+			h.prefetch.OnRead(off, len(dest))
+			if data, ok := h.prefetch.Get(off, len(dest)); ok {
+				return copy(dest, data), nil
+			}
+		} else {
+			// The path acquired a local image after the open armed the
+			// prefetcher (a sibling's released image still landing, a
+			// staged write): its blocks describe the remote base, not the
+			// bytes the plane below serves now. Drop them instead of
+			// answering stale; a later clean read re-arms from the remote.
+			h.prefetch.Invalidate()
 		}
 	}
 	// h.rev <= 0 means the open could not pin a trustworthy revision (the
@@ -798,21 +970,129 @@ func copyReadRange(dest, data []byte, off int64) int {
 	return copy(dest, data[off:end])
 }
 
+// remoteNamespaceReadable reports the plane's claim that reads through h
+// serve the ordinary remote namespace: core's SyncHandle states it, and a
+// decorator forwards it only while its own bytes equal the terminal's
+// (writeback: a clean descriptor of a path with no local image). It is
+// consulted when the prefetcher is armed and again on every read it could
+// answer, since the path can acquire a local image while the handle is
+// open.
+func remoteNamespaceReadable(h fs.Handle) bool {
+	r, ok := h.(interface{ IsRemoteNamespaceReadable() bool })
+	return ok && r.IsRemoteNamespaceReadable()
+}
+
+// revalidationDue reports whether the next read must re-pin the handle's
+// revision before a revision-keyed tier may answer: once for a flagged
+// handle (the stream lost continuity, or a remote change replaced the
+// image), and on every read of a handle with a pinned revision while the
+// stream is down. Without a client to stat with there is nothing to
+// revalidate against — markUnverified sweeps instead, and never flags.
+func (h *cachingHandle) revalidationDue() bool {
+	if h.cache.opts.PrefetchClient == nil {
+		return false
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.revalidate || (h.cache.unverified.Load() && h.rev > 0)
+}
+
+// revalidateRevision re-pins rev/size against the remote namespace (v1
+// revalidateReadCacheEntryIfUntrusted): a matching revision keeps the
+// revision-keyed tiers serving; a different one moves the handle onto it,
+// drops the path's stale image and prefetched blocks, and clips the
+// prefetcher to the new length. The stat runs without the handle lock: when
+// the identity moved meanwhile (an invalidation, a landed commit, a
+// retarget), the result describes an older world and is discarded —
+// pinned=false, the handle stays flagged, and the caller serves this read
+// from the plane below. A failed stat takes the same exit: a read that could
+// not verify its revision answers from nothing revision-keyed, and the plane
+// below reports whether the object is still there (a rename that retargeted
+// the descriptor mid-stat makes the old name 404 while the fd stays valid).
+func (h *cachingHandle) revalidateRevision(ctx context.Context, path string) (pinned bool, err error) {
+	c := h.cache
+	h.mu.Lock()
+	gen := h.identityGen
+	h.mu.Unlock()
+	st, err := c.opts.PrefetchClient.StatCtx(ctx, c.remotePathOf(path))
+	h.mu.Lock()
+	if err != nil || h.identityGen != gen {
+		// Unconditional, not only when the mover itself flags: an identity
+		// change from EventLanded, a retarget or a concurrent write does not
+		// set the flag, and a gap-mode revalidation runs with it unset —
+		// one extra stat after a raced revalidation is cheaper than
+		// trusting an identity that moved under an in-flight stat.
+		h.revalidate = true
+		h.mu.Unlock()
+		return false, nil
+	}
+	moved := st.Revision <= 0 || st.Revision != h.rev
+	if moved && h.prefetch != nil {
+		h.prefetch.invalidateWithSize(st.Size)
+	}
+	if st.Revision > 0 {
+		h.rev, h.size = st.Revision, st.Size
+	} else {
+		// An old server reports no revision: nothing keys the tiers safely.
+		h.rev, h.size = 0, 0
+	}
+	h.revalidate = false
+	h.mu.Unlock()
+	if moved {
+		c.mem.Invalidate(path)
+		if c.dsk != nil {
+			c.dsk.InvalidateFile(pathDiskReadCacheFileID(path))
+		}
+	}
+	return true, nil
+}
+
+// invalidateSiblingPrefetch drops the prefetched blocks of every OTHER open
+// descriptor of path once a write through writer succeeded: a block fetched
+// before the write describes the pre-write remote image, and a reader that
+// does not read again until the write has landed never sees the dirty
+// window that would make it drop the block itself (nor, without an event
+// bus, an EventLanded). The cancellation also fails a Get parked on an
+// in-flight fetch, so a block completing after the write is not answered.
+// Hardlink aliases count as siblings: a write through /b invalidates the
+// blocks a reader of /a prefetched for the same object.
+func (c *Cache) invalidateSiblingPrefetch(path string, writer *cachingHandle) {
+	aliases := c.aliasSet(path)
+	c.open.Range(func(key, _ any) bool {
+		h, ok := key.(*cachingHandle)
+		if !ok || h == writer {
+			return true
+		}
+		if _, sibling := aliases[h.identity()]; !sibling {
+			return true
+		}
+		h.mu.Lock()
+		if h.prefetch != nil {
+			h.prefetch.Invalidate()
+		}
+		h.mu.Unlock()
+		return true
+	})
+}
+
 // Write implements fs.Handle.
 func (h *cachingHandle) Write(ctx context.Context, off int64, data []byte) error {
 	err := h.inner.Write(ctx, off, data)
 	if err == nil {
-		h.cache.noteDirty(h.identity(), h)
-		h.cache.mem.Invalidate(h.identity())
+		path := h.identity()
+		h.cache.noteDirty(path, h)
+		h.cache.mem.Invalidate(path)
 		if h.prefetch != nil {
 			h.prefetch.Invalidate()
 		}
+		h.cache.invalidateSiblingPrefetch(path, h)
 		// The open-time size/rev no longer describe this file: the image
 		// grew (or changed) through this descriptor. Later reads must not
 		// admit whole-file cache entries under the stale identity — a
 		// 4096-byte read then returned only the open-time prefix forever.
 		h.mu.Lock()
 		h.grown = true
+		h.identityGen++
 		h.mu.Unlock()
 	}
 	return err
@@ -872,6 +1152,7 @@ func (h *cachingHandle) SetPath(p string) {
 	h.mu.Lock()
 	old := h.path
 	h.path = p
+	h.identityGen++
 	h.mu.Unlock()
 	if old != p {
 		// The dirty mark is ownership-based and keyed by path: leaving it

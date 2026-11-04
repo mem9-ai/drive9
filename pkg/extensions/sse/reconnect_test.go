@@ -168,3 +168,25 @@ func TestCurrentOnlyRevalidatesAfterDisconnect(t *testing.T) {
 		t.Fatalf("invalidations=%d want disconnect and catch-up only", invalidations)
 	}
 }
+
+// Catch-up after a disconnect also announces the regained continuity, so
+// revision-keyed tiers stop revalidating every read; a clean heartbeat
+// announces nothing.
+func TestCurrentEmitsVerifiedAfterDisconnect(t *testing.T) {
+	w, bus, _ := newSSE(t, "", "/")
+	var verified int
+	bus.On(fs.EventVerified, func(fs.Event) { verified++ })
+	w.handleCurrent()
+	if verified != 0 {
+		t.Fatal("initial heartbeat announced continuity")
+	}
+	w.handleDisconnect()
+	if verified != 0 {
+		t.Fatal("disconnect announced continuity")
+	}
+	w.handleCurrent()
+	w.handleCurrent()
+	if verified != 1 {
+		t.Fatalf("verified=%d want exactly one after the catch-up", verified)
+	}
+}

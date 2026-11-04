@@ -133,13 +133,13 @@ type CommitQueue struct {
 	// shadow reclaimed: the staging handle refused certification (its
 	// buffer moved on), but the shadow is still the only restore source for
 	// the landing's unchanged evicted parts. Consumed by the cleanup pass.
-	retainedShadows sync.Map
+	retainedShadows   sync.Map
 	extentGlobs       []globMatcher
 	extentMatchCutoff int64
-	index       *staging.PendingIndex
-	journal     *staging.Journal
-	wg          sync.WaitGroup
-	stopped     bool
+	index             *staging.PendingIndex
+	journal           *staging.Journal
+	wg                sync.WaitGroup
+	stopped           bool
 	// abandoned is set by AbandonLayer when the mounted layer was rolled
 	// back. When true, Enqueue returns errLayerRolledBack and commitOne
 	// skips tryAutoResolveConflict, going straight to terminal failure so
@@ -751,17 +751,19 @@ func (cq *CommitQueue) WaitPrefixTimeout(prefix string, timeout time.Duration) b
 // CancelPath marks currently queued or in-flight entries for path as canceled,
 // removes queued entries, and cleans up shadow/index state. Cancellation is
 // entry-scoped so future files that reuse the same path (for example git's
-// config.lock) are not poisoned by an old cancellation.
-func (cq *CommitQueue) CancelPath(path string) {
-	cq.cancelPath(path, false)
+// config.lock) are not poisoned by an old cancellation. It reports an error
+// only when the path's local state could not be made non-replayable.
+func (cq *CommitQueue) CancelPath(path string) error {
+	return cq.cancelPath(path, false)
 }
 
 // CancelPathPreserveLocal cancels queued or in-flight uploads for path without
-// removing the local shadow/index state. Rename uses this for Git's loose-object
-// temp files: the temp upload must stop, but the bytes must survive while the
-// pending entry moves to the content-addressed final path.
-func (cq *CommitQueue) CancelPathPreserveLocal(path string) {
-	cq.cancelPath(path, true)
+// removing the local shadow/index state. Unlink uses this when an open fd
+// still serves the staged image: the upload must stop, but the bytes survive
+// until the last close. The WAL done marker is still journaled (the name is
+// gone) so a crash before that close cannot replay the staged frames.
+func (cq *CommitQueue) CancelPathPreserveLocal(path string) error {
+	return cq.cancelPath(path, true)
 }
 
 // CancelPathIfInode cancels queued or in-flight uploads for path whose entries
@@ -1320,7 +1322,10 @@ func (cq *CommitQueue) hasImmediatePrefixLocked(prefix string) bool {
 	return false
 }
 
-func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) {
+// cancelPathEntries marks every queued, immediate, or in-flight entry for
+// path canceled, drops the queued ones, and returns their cancel funcs for
+// the caller to fire outside cq.mu.
+func (cq *CommitQueue) cancelPathEntries(path string) []context.CancelFunc {
 	var cancels []context.CancelFunc
 	seen := make(map[*CommitEntry]struct{})
 	markCanceled := func(e *CommitEntry) {
@@ -1342,6 +1347,7 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) {
 	}
 
 	cq.mu.Lock()
+	defer cq.mu.Unlock()
 	delete(cq.landed, path)
 	if e, ok := cq.inFlight[path]; ok {
 		markCanceled(e)
@@ -1376,37 +1382,110 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) {
 		cq.queue = remaining
 		delete(cq.queuedByPath, path)
 	}
-	cq.mu.Unlock()
+	return cancels
+}
 
-	for _, cancel := range cancels {
+// cancelPath is the shared Unlink/Rmdir cancel. It returns an error when the
+// path's local state provably stays replayable — the marker could not be
+// journaled AND the fallback cleanup could not remove the recovery source —
+// so the caller must not acknowledge a successful unlink on the assumption
+// that the void removal APIs below did their job.
+func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) error {
+	// First pass without the path lock: an in-flight upload holds that lock
+	// for its whole transfer, and aborting it here is what releases it.
+	for _, cancel := range cq.cancelPathEntries(path) {
 		cancel()
 	}
-	if preserveLocal {
-		return
+	// Second pass under the same-path lock the staging path holds across
+	// its shadow/pending publication and Enqueue: an entry that slipped in
+	// between the two passes is canceled too, and the marker below lands at
+	// a higher Seq than every frame published before it. A staging that
+	// takes the lock after this returns sees the handle's unlink marking and
+	// publishes nothing (stageAndEnqueueOpt).
+	unlock := cq.lockPath(path)
+	defer unlock()
+	for _, cancel := range cq.cancelPathEntries(path) {
+		cancel()
 	}
 	hadLocal := false
 	if cq.shadows != nil && cq.shadows.Has(path) {
 		hadLocal = true
-		cq.shadows.Remove(path)
+		if !preserveLocal {
+			cq.shadows.Remove(path)
+		}
 	}
+	// The pending entry dies only once the recovery source is CONFIRMED
+	// gone: it is the overlay lookups serve from, and a failed unlink must
+	// leave the fsynced publication discoverable and retryable.
+	pendingHad := false
 	if cq.index != nil && cq.index.HasPending(path) {
 		hadLocal = true
-		cq.index.Remove(path)
+		pendingHad = true
+	}
+	dropPending := func() {
+		if !preserveLocal && pendingHad && cq.index != nil {
+			cq.index.Remove(path)
+		}
 	}
 	// staging.Journal a "done" marker so crash recovery does not resurrect the
 	// unlinked path from earlier fsync frames, and so those frames compact.
 	// Only when local pending state existed, to avoid a WAL frame per unlink.
-	if hadLocal && cq.journal != nil {
-		// Best effort: a lost marker only means recovery re-checks a path
-		// whose shadow/.meta are already gone, which the pending-index
-		// prune discards. Log so persistent WAL write failures surface.
-		if err := cq.journal.Append(staging.JournalEntry{
-			Op:   staging.JournalCommit,
-			Path: path,
-		}); err != nil {
-			safeLogPrintf("commit queue: journal cancel marker failed for %s: %v", path, err)
+	// A preserve-local cancel journals it too: the in-memory shadow/index stay
+	// for the anonymous fd's reads, but the name is gone. The facade's
+	// unlink-of-open-file path defers the non-preserving cancel to the last
+	// close plus a remote HEAD, and a crash inside that window replayed the
+	// fsync'd frames and re-committed the unlinked file (#1065).
+	// No WAL (or nothing staged): without frames there is nothing to fence,
+	// and a journal-less queue keeps the preserve-local contract verbatim.
+	if cq.journal == nil || !hadLocal {
+		dropPending()
+		return nil
+	}
+	appendErr := cq.journal.Append(staging.JournalEntry{
+		Op:   staging.JournalUnlink,
+		Path: path,
+	})
+	if appendErr == nil {
+		// The marker fences every frame published before it — the path
+		// cannot replay even if the removal above silently failed.
+		dropPending()
+		return nil
+	}
+	safeLogPrintf("commit queue: journal cancel marker failed for %s: %v", path, appendErr)
+	if preserveLocal {
+		// The retained shadow/index are safe only while the marker fences
+		// their WAL frames: without it a crash replays them. Fall back to
+		// the non-preserving cleanup below.
+		if cq.shadows != nil {
+			cq.shadows.Remove(path)
 		}
 	}
+	// ShadowStore.Remove and PendingIndex.Remove discard their disk errors,
+	// so verify with evidence instead of assuming: a read-only or failing
+	// cache filesystem can reject the marker AND leave the durable shadow
+	// behind, and replay would then upload the deleted name after a restart.
+	if cq.shadows == nil || cq.shadows.VerifyRemoved(path) == nil {
+		// Confirmed gone — finish the degrade-to-non-preserving cleanup
+		// (the anonymous fd loses its staged image on a failing WAL, but
+		// the unlink cannot resurrect).
+		if pendingHad && cq.index != nil {
+			cq.index.Remove(path)
+		}
+		return nil
+	}
+	// The recovery source survived or its absence cannot be proven. Keep the
+	// pending entry (the overlay stays discoverable), re-drive the upload
+	// when the shadow is still stat-able so the fsynced publication is
+	// retryable without a restart, and report the unlink as failed — the
+	// caller must not acknowledge a deletion a restart would undo.
+	if cq.shadows.Has(path) {
+		if entry := cq.recoveredEntry(path); entry != nil {
+			if enqErr := cq.Enqueue(entry); enqErr != nil {
+				safeLogPrintf("commit queue: re-driving %s after the failed unlink rollback failed: %v", path, enqErr)
+			}
+		}
+	}
+	return fmt.Errorf("commit queue: unlink of %s is not crash-durable: WAL marker failed (%v) and the staged image could not be confirmed removed", path, appendErr)
 }
 
 // isEntryCanceled checks whether this specific entry was canceled by

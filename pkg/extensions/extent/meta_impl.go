@@ -933,6 +933,21 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 				b.mu.Unlock()
 				return fmt.Errorf("verify landed layout of %s: occupant replaced our upload", path)
 			}
+			if savedID == "" && nst.ContentLayout != client.ContentLayoutExtent {
+				// No echoed identity means no evidence ties this Stat's
+				// occupant to OUR completion: an arbitrary later classic
+				// occupant (a replacement) is indistinguishable from our
+				// own degraded upload, and accepting it would hand this
+				// descriptor the replacement's revision with no identity
+				// precondition. Only the EXTENT classification is
+				// attributable without an echo (a replacement of ours
+				// would have to be an extent upload that kept the path);
+				// the classic outcome stays pending and refuses.
+				b.mu.Lock()
+				b.layoutPending[ino] = true
+				b.mu.Unlock()
+				return fmt.Errorf("verify landed layout of %s: occupant not attributable to our upload", path)
+			}
 			landedID = nst.ResourceID
 			classic = nst.ContentLayout != client.ContentLayoutExtent
 			classified = true
