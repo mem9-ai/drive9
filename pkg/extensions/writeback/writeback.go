@@ -388,6 +388,24 @@ func New(opts Options) (*Writeback, error) {
 			workers = defaultUploadConcurrency
 		}
 		up := NewWriteBackUploader(opts.Client, w.wbCache, workers, root)
+		// The snapshot callback runs under the write-back cache's path lock at
+		// upload time: the failure stamp it captures is the one this landing
+		// may clear, and never a failure recorded after the upload started.
+		up.SnapshotStagingGens = func(path string) StagingGens {
+			gens := StagingGens{}
+			if opts.Staging != nil {
+				if opts.Staging.Pending != nil {
+					gens.PendingIndexGen = opts.Staging.Pending.Generation(path)
+				}
+				if opts.Staging.Shadow != nil {
+					gens.ShadowGen = opts.Staging.Shadow.ActiveGeneration(path)
+				}
+			}
+			if w.queue != nil {
+				gens.TerminalFailureSeq = w.queue.PathTerminalFailureSeq(path)
+			}
+			return gens
+		}
 		up.OnSuccess = func(meta staging.WriteBackMeta, committedRev int64, gens StagingGens) {
 			// meta.Path is ALREADY the write-back cache's local key (the
 			// uploader maps to the remote name only at the HTTP boundary).
@@ -409,6 +427,17 @@ func New(opts Options) (*Writeback, error) {
 				// Landed carrying the size) — never the parent listing, the
 				// kernel view, or unrelated cached data.
 				opts.Events.Emit(fs.Event{Kind: fs.EventLanded, Path: meta.Path, Rev: committedRev, Size: meta.Size, HasSize: true})
+			}
+			// The write-back track's async landing (Release submits the Flush
+			// snapshot) is a real remote landing of the path's newest image:
+			// it must retire a terminal failure the commit queue recorded for
+			// an older image, or a recovered writer keeps answering EIO
+			// forever. Seq-guarded so a failure recorded after this upload
+			// started (a newer queue generation) survives; generation-fenced
+			// on the pending side for the same reason.
+			if w.queue != nil {
+				w.queue.ClearTerminalFailureIfSeq(meta.Path, gens.TerminalFailureSeq)
+				w.queue.ResolveSupersededConflict(meta.Path, meta.SupersedesPendingGen)
 			}
 		}
 		w.uploader = up
@@ -1301,6 +1330,11 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			if !ok {
 				return nil
 			}
+			supersedesGen := meta.SupersedesPendingGen
+			failureSeq := uint64(0)
+			if w.queue != nil {
+				failureSeq = w.queue.PathTerminalFailureSeq(p)
+			}
 			rev, err := w.uploader.UploadSyncWithRevision(ctx, p)
 			if err != nil {
 				return err
@@ -1311,6 +1345,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 				landedRev, landedSize = rev, meta.Size
 				w.landedAt(p, rev, meta.Size)
 			}
+			w.resolveLandedStaging(p, rev, supersedesGen, failureSeq)
 			return nil
 		}
 		if w.uploader != nil {
@@ -1401,6 +1436,14 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			return res, err
 		}
 		w.forgetLanded(op.Path)
+		// Both pathname incarnations ended (source moved, target replaced):
+		// neither name may keep answering EIO for the previous incumbent's
+		// terminally failed image. The failure itself follows the bytes —
+		// the durable conflict marker transfers with the pending entry.
+		if w.queue != nil {
+			w.queue.clearTerminalFailure(op.Path)
+			w.queue.clearTerminalFailure(op.Path2)
+		}
 		w.retarget(op.Path, op.Path2)
 		// The landed image's revision is the new base for every retargeted
 		// writer, and the new path's committed watermark: without it the
@@ -2002,13 +2045,16 @@ func (h *bufferingHandle) DrainFlush(ctx context.Context) error {
 			h.mu.Lock()
 			uploadGen := h.wgen
 			h.mu.Unlock()
-			if err := h.w.uploader.UploadSync(ctx, h.path); err != nil {
+			supersedesGen, failureSeq := h.stagedLandingFence()
+			rev, err := h.w.uploader.UploadSyncWithRevision(ctx, h.path)
+			if err != nil {
 				return err
 			}
 			h.mu.Lock()
 			h.retireDirtyLocked(uploadGen)
 			h.landed = true
 			h.mu.Unlock()
+			h.w.resolveLandedStaging(h.path, rev, supersedesGen, failureSeq)
 			return nil
 		}
 	}
@@ -2019,6 +2065,37 @@ func (h *bufferingHandle) DrainFlush(ctx context.Context) error {
 		return fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
 	}
 	return nil
+}
+
+// syncWaitDeadlineSizeLocked reports the image a strict Sync may have to wait
+// out on the queue: the handle's buffer when one exists, otherwise the staged
+// pending image a re-opened handle serves (buf stays nil there — a 2GiB spill
+// re-opened mid-upload must scale the wait like the writer's own fsync, not
+// fall back to the 60s floor).
+func (h *bufferingHandle) syncWaitDeadlineSizeLocked() int64 {
+	if h.buf != nil {
+		return h.buf.Size()
+	}
+	if h.pendingImage != nil {
+		return int64(len(h.pendingImage))
+	}
+	return h.baseSize
+}
+
+// resolveLandedStaging retires path-scoped terminal-failure state after a
+// staged write-cache image landed remotely: the landing image contains every
+// pending generation at or below the one it composed over at staging time
+// (supersedesGen, 0 = unknown → only the in-memory record is considered), and
+// failureSeq is the failure stamp observed before the landing attempt — a
+// failure recorded after it belongs to a newer generation and must keep
+// answering EIO. landedRev <= 0 means the upload no-oped (the entry vanished
+// under a queue takeover); nothing landed, so nothing is retired.
+func (w *Writeback) resolveLandedStaging(path string, landedRev int64, supersedesGen, failureSeq uint64) {
+	if w.queue == nil || landedRev <= 0 {
+		return
+	}
+	w.queue.ClearTerminalFailureIfSeq(path, failureSeq)
+	w.queue.ResolveSupersededConflict(path, supersedesGen)
 }
 
 // Sync implements fs.Handle.
@@ -2045,47 +2122,66 @@ func (h *bufferingHandle) Sync(ctx context.Context) error {
 	// the size-scaled upload synchronously).
 	if h.w.queue != nil {
 		h.mu.Lock()
-		deadlineSize := int64(0)
-		if h.buf != nil {
-			deadlineSize = h.buf.Size()
-		}
+		deadlineSize := h.syncWaitDeadlineSizeLocked()
 		h.mu.Unlock()
 		if !h.w.queue.WaitPathDeadline(h.path, releaseTimeout(deadlineSize)) {
 			return fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
 		}
-		// The wait also ends when the commit terminally failed and was
-		// dropped with local state preserved: an idle path is then
-		// indistinguishable from a landed commit, so consult the failure
-		// record and answer EIO — fsync must not claim remote durability for
-		// data that exists only locally.
-		if err := h.w.queue.PathTerminalFailure(h.path); err != nil {
-			return fs.StatusErrorOf(gofuse.Status(syscall.EIO))
-		}
 	}
 	// A staged .dat/.meta snapshot is only locally durable; strict fsync
 	// pays the remote landing synchronously (v1 fsync on the write-back
-	// cache fast path).
+	// cache fast path). This landing also RETIRES a recorded terminal
+	// failure for the path: the staged image is a replacement the writer
+	// published after the failure, and landing it is the recovery — so it
+	// must run before the sticky-failure check below, or a rewritten file
+	// could never fsync successfully again.
 	h.mu.Lock()
 	staged := h.stagedToCache
 	h.mu.Unlock()
 	if staged && h.w.uploader != nil {
+		supersedesGen, failureSeq := h.stagedLandingFence()
 		rev, err := h.w.uploader.UploadSyncWithRevision(ctx, h.path)
 		if err != nil {
 			return err
 		}
 		h.mu.Lock()
-		size := h.buf.Size()
+		size := int64(0)
+		if h.buf != nil {
+			size = h.buf.Size()
+		}
 		h.stagedToCache = false
 		h.mu.Unlock()
 		h.markLanded(rev)
 		h.w.landedAt(h.path, rev, size)
-		// The synchronous landing bypasses the queue: clear any terminal
-		// failure it recorded so later barriers do not keep reporting EIO.
-		if h.w.queue != nil {
-			h.w.queue.clearTerminalFailure(h.path)
+		h.w.resolveLandedStaging(h.path, rev, supersedesGen, failureSeq)
+	}
+	// The wait above also ends when the commit terminally failed and was
+	// dropped with local state preserved: an idle path is then
+	// indistinguishable from a landed commit, so consult the failure
+	// record and answer EIO — fsync must not claim remote durability for
+	// data that exists only locally. Anything a landing above already
+	// retired has been cleared (or generation-fenced out) by then.
+	if h.w.queue != nil {
+		if err := h.w.queue.PathTerminalFailure(h.path); err != nil {
+			return fs.StatusErrorOf(gofuse.Status(syscall.EIO))
 		}
 	}
 	return nil
+}
+
+// stagedLandingFence snapshots the fence state a synchronous staged landing
+// needs before it starts: the staged image's superseded pending generation
+// and the currently recorded terminal-failure stamp.
+func (h *bufferingHandle) stagedLandingFence() (supersedesGen, failureSeq uint64) {
+	if h.w.wbCache != nil {
+		if meta, ok := h.w.wbCache.GetMeta(h.path); ok && meta != nil {
+			supersedesGen = meta.SupersedesPendingGen
+		}
+	}
+	if h.w.queue != nil {
+		failureSeq = h.w.queue.PathTerminalFailureSeq(h.path)
+	}
+	return supersedesGen, failureSeq
 }
 
 // Flush implements fs.Handle.
@@ -2151,10 +2247,12 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 			stagedGen := h.wgen
 			stagedSize := h.buf.Size()
 			h.mu.Unlock()
+			supersedesGen, failureSeq := h.stagedLandingFence()
 			rev, err := h.w.uploader.UploadSyncWithRevision(ctx, h.path)
 			if err != nil {
 				return err
 			}
+			h.w.resolveLandedStaging(h.path, rev, supersedesGen, failureSeq)
 			// The synchronous upload bypasses the background worker whose
 			// OnSuccess feeds the landed table — record the watermark here
 			// so append siblings see the advance without a remote stat
@@ -4567,12 +4665,24 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, isNew bool) err
 	if isNew {
 		kind = staging.PendingNew
 	}
+	// The staged image composed over every pending generation at or below
+	// the one live right now — record it so a later landing of THIS image
+	// can retire failure state that old (and only that old: the fence keeps
+	// a newer queue staging's preserved entry untouchable).
+	supersedesGen := uint64(0)
+	if h.w.opts.Staging != nil && h.w.opts.Staging.Pending != nil {
+		supersedesGen = h.w.opts.Staging.Pending.Generation(h.path)
+	}
 	// The write cache is LOCAL-path keyed; the uploader maps to the
 	// remote name itself (a remote key here made every subtree mount's
 	// upload silently no-op — the git-ops clone's config.lock never
 	// landed).
-	if err := h.w.wbCache.PutWithBaseRevAndMode(h.path, image, int64(len(image)), kind, baseRev, mode, hasMode); err != nil {
+	wbGen, _, err := h.w.wbCache.PutWithBaseRevAndModeTimings(h.path, image, int64(len(image)), kind, baseRev, mode, hasMode)
+	if err != nil {
 		return err
+	}
+	if supersedesGen != 0 {
+		h.w.wbCache.MarkSupersedesPendingGen(h.path, supersedesGen, wbGen)
 	}
 	// v1 seeded the read cache with the staged image at the flush
 	// boundary: readers during the async landing serve these bytes instead

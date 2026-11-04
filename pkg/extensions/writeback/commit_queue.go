@@ -847,6 +847,9 @@ func (cq *CommitQueue) CancelPrefix(prefix string) {
 		if cq.index != nil {
 			cq.index.Remove(p)
 		}
+		// Same pathname-incarnation rule as cancelPath: the subtree's names
+		// are gone, so their terminal failures must not poison a recreator.
+		cq.clearTerminalFailure(p)
 		if cq.journal != nil {
 			if err := cq.journal.Append(staging.JournalEntry{
 				Op:   staging.JournalCommit,
@@ -1287,7 +1290,11 @@ func (cq *CommitQueue) cancelPathEntries(path string) []context.CancelFunc {
 // path's local state provably stays replayable — the marker could not be
 // journaled AND the fallback cleanup could not remove the recovery source —
 // so the caller must not acknowledge a successful unlink on the assumption
-// that the void removal APIs below did their job.
+// that the void removal APIs below did their job. A successful cancel also
+// drops the path's recorded terminal failure: the pathname incarnation ended,
+// and a later reuse of the name (a renamed-in file) must not inherit an EIO
+// for data the recreator never wrote. The failure-free error return keeps the
+// record — the name survived, and so did its unlanded data.
 func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) error {
 	// First pass without the path lock: an in-flight upload holds that lock
 	// for its whole transfer, and aborting it here is what releases it.
@@ -1337,6 +1344,7 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) error {
 	// and a journal-less queue keeps the preserve-local contract verbatim.
 	if cq.journal == nil || !hadLocal {
 		dropPending()
+		cq.clearTerminalFailure(path)
 		return nil
 	}
 	appendErr := cq.journal.Append(staging.JournalEntry{
@@ -1347,6 +1355,7 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) error {
 		// The marker fences every frame published before it — the path
 		// cannot replay even if the removal above silently failed.
 		dropPending()
+		cq.clearTerminalFailure(path)
 		return nil
 	}
 	safeLogPrintf("commit queue: journal cancel marker failed for %s: %v", path, appendErr)
@@ -1369,6 +1378,7 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) error {
 		if pendingHad && cq.index != nil {
 			cq.index.Remove(path)
 		}
+		cq.clearTerminalFailure(path)
 		return nil
 	}
 	// The recovery source survived or its absence cannot be proven. Keep the
@@ -3084,20 +3094,44 @@ func (cq *CommitQueue) recordCommitTerminalFailure(entry *CommitEntry, lastErr e
 // barrier must still report failure.
 var errCommitTerminalUnknown = errors.New("commit queue: terminal commit failure without a recorded upload error")
 
+// errCommitTerminalRecovered backs PathTerminalFailure's durable fallback: the
+// in-memory record died with the previous process, but the conflict-marked
+// pending entry it left behind still describes data that never landed.
+var errCommitTerminalRecovered = errors.New("commit queue: pending entry preserved for manual recovery after a terminal commit failure")
+
 // terminalFailuresLimit bounds terminalFailures the way landedLimit bounds
-// landed: failure records carry no lineage to protect, so plain oldest-first
-// eviction by seq is enough.
+// landed. Eviction is only allowed for records the barrier can still
+// re-derive: one whose path still carries a PendingConflict marker (the
+// fallback below reports it) or whose pending state is already gone (stale).
+// A record with neither must stay — evicting it would let fsync claim
+// durability for data that never landed.
 const terminalFailuresLimit = 64
 
 func (cq *CommitQueue) pruneTerminalFailuresLocked() {
+	if cq.index == nil {
+		// No durable marker backs any record; evicting one would lose the
+		// only copy of an unresolved failure.
+		return
+	}
 	for len(cq.terminalFailures) > terminalFailuresLimit {
+		// Evict the oldest EVICTABLE record: one whose path still carries a
+		// PendingConflict marker (the fallback in PathTerminalFailure keeps
+		// answering it) or whose pending state is already gone (stale). A
+		// record with a live non-conflict entry is the only witness of an
+		// unresolved failure and is skipped, not dropped.
 		var oldestPath string
 		var oldestSeq uint64
 		first := true
 		for path, failure := range cq.terminalFailures {
+			if meta, ok := cq.index.GetMeta(path); ok && meta != nil && meta.Kind != staging.PendingConflict {
+				continue
+			}
 			if first || failure.seq < oldestSeq {
 				oldestPath, oldestSeq, first = path, failure.seq, false
 			}
+		}
+		if first {
+			return // nothing evictable
 		}
 		delete(cq.terminalFailures, oldestPath)
 	}
@@ -3111,19 +3145,83 @@ func (cq *CommitQueue) clearTerminalFailure(path string) {
 	cq.mu.Unlock()
 }
 
+// PathTerminalFailureSeq reports the monotonic stamp of the recorded terminal
+// failure for path (0 when none). Callers capture it before a landing attempt
+// and hand it to ClearTerminalFailureIfSeq so the landing cannot erase a
+// failure recorded after it started.
+func (cq *CommitQueue) PathTerminalFailureSeq(path string) uint64 {
+	if cq == nil {
+		return 0
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	if failure, ok := cq.terminalFailures[path]; ok {
+		return failure.seq
+	}
+	return 0
+}
+
+// ClearTerminalFailureIfSeq drops the recorded terminal failure only when it
+// is still the one stamped seq: a record with a newer stamp belongs to a
+// generation the just-landed image does not cover, and must keep answering
+// EIO.
+func (cq *CommitQueue) ClearTerminalFailureIfSeq(path string, seq uint64) {
+	if cq == nil || seq == 0 {
+		return
+	}
+	cq.mu.Lock()
+	if failure, ok := cq.terminalFailures[path]; ok && failure.seq == seq {
+		delete(cq.terminalFailures, path)
+	}
+	cq.mu.Unlock()
+}
+
+// ResolveSupersededConflict retires the durable conflict marker for path when
+// a landed image provably contains it: supersedeGen is the pending-index
+// generation the landing image composed over at staging time, and a conflict
+// entry at or below that generation is obsolete once the image is remote. The
+// generation fence keeps a newer staging's entry (and its preserved recovery
+// bytes) untouched. The conflict entry's shadow bytes are intentionally left
+// behind: the pending meta carries no shadow generation to fence a removal
+// with, and a stale recovery copy is safe where a wrong removal is not.
+func (cq *CommitQueue) ResolveSupersededConflict(path string, supersedeGen uint64) {
+	if cq == nil || cq.index == nil || supersedeGen == 0 {
+		return
+	}
+	meta, ok := cq.index.GetMeta(path)
+	if !ok || meta == nil || meta.Kind != staging.PendingConflict {
+		return
+	}
+	if meta.Generation > supersedeGen {
+		return
+	}
+	cq.index.RemoveIfGeneration(path, meta.Generation)
+	safeLogPrintf("commit queue: resolved conflict marker for %s superseded by a landed image (gen %d <= %d)", path, meta.Generation, supersedeGen)
+}
+
 // PathTerminalFailure returns the most recent terminal commit failure recorded
 // for path whose data never landed remotely (local pending state is
 // preserved). Durability barriers consult it once the path goes idle: without
 // it, a terminally failed path is indistinguishable from a landed commit and
-// fsync would report success for data that exists only locally.
+// fsync would report success for data that exists only locally. When the
+// in-memory record is absent (a fresh process, or eviction above the map
+// bound), the durable PendingConflict marker onCommitTerminalFailure left
+// behind answers instead: it survives restarts and re-enqueues nothing, so it
+// is exactly the state a barrier must refuse to certify.
 func (cq *CommitQueue) PathTerminalFailure(path string) error {
 	if cq == nil {
 		return nil
 	}
 	cq.mu.Lock()
-	defer cq.mu.Unlock()
-	if failure, ok := cq.terminalFailures[path]; ok {
+	failure, ok := cq.terminalFailures[path]
+	cq.mu.Unlock()
+	if ok {
 		return failure.err
+	}
+	if cq.index != nil {
+		if meta, found := cq.index.GetMeta(path); found && meta != nil && meta.Kind == staging.PendingConflict {
+			return errCommitTerminalRecovered
+		}
 	}
 	return nil
 }

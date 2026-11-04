@@ -116,6 +116,12 @@ type WriteBackMeta struct {
 	HasMode          bool        `json:"has_mode,omitempty"`
 	SnapshotID       string      `json:"-"`
 	ParentSnapshotID string      `json:"-"`
+	// SupersedesPendingGen records the pending-index generation this image
+	// composed over at staging time (0 = unknown/legacy). A later landing of
+	// this entry may retire failure state whose pending generation is at or
+	// below it: those images are contained in this one. Persisted so a
+	// post-restart landing keeps the same fence.
+	SupersedesPendingGen uint64 `json:"supersedes_pending_gen,omitempty"`
 	// LayerClean retains a remotely durable overlay for reads, not recovery.
 	// Every new staging publication resets it; legacy records remain dirty.
 	LayerClean bool `json:"layer_clean,omitempty"`
@@ -609,6 +615,43 @@ func (c *WriteBackCache) MarkChmodPending(remotePath string, generation uint64) 
 	c.metas[remotePath] = &cp
 	c.mu.Unlock()
 	return true, nil
+}
+
+// MarkSupersedesPendingGen records the pending-index generation the entry's
+// image composed over when it was staged. The generation guard prevents an
+// old staging from stamping a newer same-path entry. Acquires the per-path
+// lock to serialize the .meta rewrite with concurrent Put.
+func (c *WriteBackCache) MarkSupersedesPendingGen(remotePath string, supersedesGen, expectedGen uint64) bool {
+	if supersedesGen == 0 || expectedGen == 0 {
+		return false
+	}
+	pl := c.AcquirePathLock(remotePath)
+	defer c.ReleasePathLock(remotePath, pl)
+
+	c.mu.Lock()
+	meta, ok := c.metas[remotePath]
+	if !ok || meta.Generation != expectedGen {
+		c.mu.Unlock()
+		return false
+	}
+	updated := cloneWriteBackMeta(meta)
+	updated.SupersedesPendingGen = supersedesGen
+	metaPath := c.MetaFile(remotePath)
+	c.mu.Unlock()
+
+	metaBytes, err := json.Marshal(updated)
+	if err != nil {
+		return false
+	}
+	if err := atomicWrite(metaPath, metaBytes); err != nil {
+		return false
+	}
+
+	c.mu.Lock()
+	cp := updated
+	c.metas[remotePath] = &cp
+	c.mu.Unlock()
+	return true
 }
 
 // RenamePending atomically moves a pending cache entry from oldPath to newPath.
