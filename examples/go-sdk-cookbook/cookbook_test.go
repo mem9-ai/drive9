@@ -84,6 +84,9 @@ func ExampleClient_filesystemCRUDAndMetadata() {
 
 	_, _ = c.CreateFile("/workspace/empty.txt")
 	_, _ = c.CreateFileCtx(ctx, "/workspace/empty-ctx.txt")
+	// The identity echo is optional: a server that reports it lets a caller
+	// bind later writes to the object THIS create produced.
+	_, _, _ = c.CreateFileCreatedCtx(ctx, "/workspace/empty-created.txt")
 
 	_, _ = c.Read("/workspace/a.txt")
 	_, _ = c.ReadCtx(ctx, "/workspace/b.txt")
@@ -824,6 +827,7 @@ var coveredClientMethods = map[string]bool{
 	"CopyCtx":                                true,
 	"CreateFile":                             true,
 	"CreateFileCtx":                          true,
+	"CreateFileCreatedCtx":                   true,
 	"CreateFSLayer":                          true,
 	"DeleteFSLayer":                          true,
 	"CreateJournal":                          true,
