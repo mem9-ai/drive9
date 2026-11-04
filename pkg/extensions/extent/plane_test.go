@@ -103,12 +103,6 @@ func (f *fakeV2) applyPatchLocked() {
 	f.blocks[sha256Hex(content)] = append([]byte(nil), content...)
 }
 
-func (f *fakeV2) completeEchoOff() {
-	f.mu.Lock()
-	f.completeEcho = false
-	f.mu.Unlock()
-}
-
 func newFakeV2(t *testing.T) *fakeV2 {
 	t.Helper()
 	f := &fakeV2{extent: map[string]string{}, classic: map[string]string{}, dirs: map[string]bool{"/": true}, blocks: map[string][]byte{}, ids: map[string]string{}, statFail: map[string]bool{}, gateOnce: map[string]chan struct{}{}, gateHits: map[string]int{}, completeEcho: true}
