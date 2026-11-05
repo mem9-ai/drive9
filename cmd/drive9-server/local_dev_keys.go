@@ -73,16 +73,9 @@ func loadOrCreateLocalDevKeys() (localDevKeys, string, error) {
 	raw, err := readLocalDevKeyFilePlatform(path)
 	switch {
 	case err == nil:
-		var keys localDevKeys
-		if unmarshalErr := json.Unmarshal(raw, &keys); unmarshalErr != nil {
-			return localDevKeys{}, path, fmt.Errorf(
-				"local dev key file %s is malformed (%v); delete it to generate a new pair, or set DRIVE9_MASTER_KEY and DRIVE9_TOKEN_SIGNING_KEY",
-				path, unmarshalErr)
-		}
-		if validateErr := keys.validate(); validateErr != nil {
-			return localDevKeys{}, path, fmt.Errorf(
-				"local dev key file %s is unusable (%v); delete it to generate a new pair, or set DRIVE9_MASTER_KEY and DRIVE9_TOKEN_SIGNING_KEY",
-				path, validateErr)
+		keys, parseErr := parseLocalDevKeys(path, raw)
+		if parseErr != nil {
+			return localDevKeys{}, path, parseErr
 		}
 		return keys, path, nil
 	case !errors.Is(err, os.ErrNotExist):
@@ -112,12 +105,9 @@ func loadOrCreateLocalDevKeys() (localDevKeys, string, error) {
 			}
 			return localDevKeys{}, path, readErr
 		}
-		var existing localDevKeys
-		if unmarshalErr := json.Unmarshal(raw, &existing); unmarshalErr != nil {
-			return localDevKeys{}, path, fmt.Errorf("local dev key file %s is malformed (%v); delete it to generate a new pair", path, unmarshalErr)
-		}
-		if validateErr := existing.validate(); validateErr != nil {
-			return localDevKeys{}, path, fmt.Errorf("local dev key file %s is unusable (%v); delete it to generate a new pair", path, validateErr)
+		existing, parseErr := parseLocalDevKeys(path, raw)
+		if parseErr != nil {
+			return localDevKeys{}, path, parseErr
 		}
 		return existing, path, nil
 	}
@@ -217,6 +207,23 @@ func installLocalDevKeys(path string, keys localDevKeys) (bool, error) {
 		return false, fmt.Errorf("close local dev key file %s: %w", path, err)
 	}
 	return true, nil
+}
+
+// parseLocalDevKeys decodes one key file and validates it, with the remediation
+// hint both callers need.
+func parseLocalDevKeys(path string, raw []byte) (localDevKeys, error) {
+	var keys localDevKeys
+	if err := json.Unmarshal(raw, &keys); err != nil {
+		return localDevKeys{}, fmt.Errorf(
+			"local dev key file %s is malformed (%v); delete it to generate a new pair, or set DRIVE9_MASTER_KEY and DRIVE9_TOKEN_SIGNING_KEY",
+			path, err)
+	}
+	if err := keys.validate(); err != nil {
+		return localDevKeys{}, fmt.Errorf(
+			"local dev key file %s is unusable (%v); delete it to generate a new pair, or set DRIVE9_MASTER_KEY and DRIVE9_TOKEN_SIGNING_KEY",
+			path, err)
+	}
+	return keys, nil
 }
 
 // validate normalises the values before checking them: a hand-edited file may

@@ -1897,3 +1897,65 @@ func TestOverwriteMintsNewBlobKeyAndKeepsOriginalBytes(t *testing.T) {
 		t.Fatal("overwrite did not change the visible content")
 	}
 }
+
+// A policy denial during commit must leave the layer in a state the API can still
+// act on. "committing" has no exit — re-commit needs active/sealed, rollback needs
+// active/sealed/conflicted, and chain deletion refuses it — so a scoped or fork key
+// denied here used to strand the layer.
+func TestFSLayerCommitDenialLeavesLayerConflicted(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+
+	if _, err := s.fallback.WriteCtx(ctx, "/secret/commit.txt", bytes.Repeat([]byte("s"), 64<<10), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate); err != nil {
+		t.Fatalf("write secret file: %v", err)
+	}
+	secret, err := s.fallback.StatNodeCtx(ctx, "/secret/commit.txt")
+	if err != nil {
+		t.Fatalf("stat secret: %v", err)
+	}
+	if !strings.HasPrefix(secret.File.StorageRef, "blobs/") {
+		t.Fatalf("storage_ref = %q, want an S3 blob", secret.File.StorageRef)
+	}
+	if err := s.fallback.Store().CreateFSLayer(ctx, &datastore.FSLayer{
+		LayerID: "layer-commit-deny", BaseRootPath: "/repo", State: datastore.FSLayerStateActive,
+	}); err != nil {
+		t.Fatalf("CreateFSLayer: %v", err)
+	}
+	// An alias to an out-of-scope blob, written before the scope was narrowed.
+	if err := s.fallback.Store().UpsertFSLayerEntry(ctx, &datastore.FSLayerEntry{
+		LayerID:     "layer-commit-deny",
+		Path:        "/repo/alias.txt",
+		Op:          datastore.FSLayerEntryOpUpsert,
+		Kind:        datastore.FSLayerEntryKindFile,
+		StorageType: string(datastore.StorageS3),
+		StorageRef:  secret.File.StorageRef,
+		SizeBytes:   secret.File.SizeBytes,
+	}); err != nil {
+		t.Fatalf("UpsertFSLayerEntry: %v", err)
+	}
+	layer, err := s.fallback.Store().GetFSLayer(ctx, "layer-commit-deny")
+	if err != nil {
+		t.Fatalf("GetFSLayer: %v", err)
+	}
+
+	scoped := &TenantScope{IsScoped: true, FSScopes: []FSScope{{Prefix: "/repo", Ops: map[FSOp]bool{FSOpRead: true, FSOpWrite: true}}}}
+	req := httptest.NewRequest(http.MethodPost, "/v1/layers/layer-commit-deny/commit", nil)
+	req = req.WithContext(withScope(req.Context(), scoped))
+	rr := httptest.NewRecorder()
+	s.handleFSLayerCommit(rr, req, s.fallback, s.fallback.Store(), layer)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("commit status=%d body=%s, want 403", rr.Code, rr.Body.String())
+	}
+
+	after, err := s.fallback.Store().GetFSLayer(ctx, "layer-commit-deny")
+	if err != nil {
+		t.Fatalf("GetFSLayer after denial: %v", err)
+	}
+	if after.State != datastore.FSLayerStateConflicted {
+		t.Fatalf("layer state = %s, want conflicted (a denial must not strand it in committing)", after.State)
+	}
+	// Conflicted is a state the API can leave.
+	if err := s.fallback.Store().RollbackFSLayer(ctx, "layer-commit-deny"); err != nil {
+		t.Fatalf("rollback after denial: %v", err)
+	}
+}

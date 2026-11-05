@@ -955,9 +955,12 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 	for i := range entries {
 		entry := &entries[i]
 		if err := s.authorizeFSLayerStorageRefWith(r.Context(), store, ScopeFromContext(r.Context()), entry, decisions); err != nil {
-			if !s.writeFSLayerStorageRefError(w, r, entry, err) {
-				_ = store.SetFSLayerStateIf(r.Context(), layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
-			}
+			s.writeFSLayerStorageRefError(w, r, entry, err)
+			// Every refusal — policy denial or lookup failure — has to leave the
+			// layer in a state the API can still act on. "committing" has no exit:
+			// a re-commit requires active/sealed, rollback requires
+			// active/sealed/conflicted, and chain deletion refuses it.
+			_ = store.SetFSLayerStateIf(r.Context(), layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
 			return
 		}
 	}
@@ -1146,25 +1149,24 @@ func (s *Server) authorizeFSLayerStorageRefSource(w http.ResponseWriter, r *http
 	if err == nil {
 		return true
 	}
-	_ = s.writeFSLayerStorageRefError(w, r, entry, err)
+	s.writeFSLayerStorageRefError(w, r, entry, err)
 	return false
 }
 
 // writeFSLayerStorageRefError answers a policy refusal with 403 and a lookup
-// failure with 500, logging each once. It reports whether the request was denied
-// as opposed to failing internally.
-func (s *Server) writeFSLayerStorageRefError(w http.ResponseWriter, r *http.Request, entry *datastore.FSLayerEntry, err error) bool {
+// failure with 500, logging each once. Callers that also own state transitions
+// must apply them regardless of which answer was written.
+func (s *Server) writeFSLayerStorageRefError(w http.ResponseWriter, r *http.Request, entry *datastore.FSLayerEntry, err error) {
 	var denied *fsLayerStorageRefDenied
 	if errors.As(err, &denied) {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), denied.event,
 			"layer_id", entry.LayerID, "path", entry.Path, "blob_key", denied.blobKey, "parent_tenant_id", denied.parentTenantID)...)
 		errJSON(w, http.StatusForbidden, denied.message)
-		return true
+		return
 	}
 	logger.Error(r.Context(), "fs_layer_storage_ref_lookup_failed", eventFields(r.Context(), "fs_layer_storage_ref_lookup_failed",
 		"layer_id", entry.LayerID, "blob_key", strings.TrimPrefix(strings.TrimSpace(entry.StorageRef), "blobs/"), "error", err)...)
 	errJSON(w, http.StatusInternalServerError, "failed to authorize fs layer storage reference")
-	return false
 }
 
 // fsLayerStorageRefDenied is an authorization refusal, as opposed to a lookup

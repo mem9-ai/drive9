@@ -87,9 +87,9 @@ func checkLocalDevKeyDir(dir string) error {
 }
 
 // checkLocalDevKeyAncestors applies the sshd-StrictModes rule to every physical
-// component above the key directory: each existing one must be owned by root or
-// the current user and must not be writable by group or other unless it is
-// sticky. Ownership is checked even when a component is not writable today,
+// component above the key directory: each existing one must be owned by root, the
+// current user, or nobody, and must not be writable by group or other unless it
+// is sticky. Ownership is checked even when a component is not writable today,
 // because its owner can chmod it at any time.
 //
 // The path is resolved before the walk. An ancestor that is a symlink is not the
@@ -122,7 +122,7 @@ func checkLocalDevKeyAncestors(dir string) error {
 		}
 		if !localDevKeyTrustedOwner(owner) {
 			return fmt.Errorf(
-				"local dev key path ancestor %s is owned by uid %d, not root, a system account, or the current user (uid %d); move the key file under a directory you control",
+				"local dev key path ancestor %s is owned by uid %d, which is neither root, nobody, nor the current user (uid %d); move the key file under a directory you control",
 				current, owner, os.Getuid())
 		}
 		if perm := info.Mode().Perm(); perm&0o022 != 0 && info.Mode()&os.ModeSticky == 0 {
@@ -136,8 +136,10 @@ func checkLocalDevKeyAncestors(dir string) error {
 	}
 }
 
-// localDevKeyNobodyUID is nobody's conventional id, which some sandboxes and
-// rootless containers use for everything they do not map (this one included).
+// localDevKeyNobodyUID is nobody's conventional id on Linux, which some sandboxes
+// and rootless containers use for everything they do not map (this one included).
+// It is not assumed to exist elsewhere: on darwin nobody is uid -2, which simply
+// fails the trusted-owner check and fails closed.
 const localDevKeyNobodyUID = 65534
 
 // localDevKeyTrustedOwner reports whether a path component's owner cannot be the

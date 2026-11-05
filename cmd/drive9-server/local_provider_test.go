@@ -508,6 +508,9 @@ func TestLocalDevKeysRejectWritableAncestor(t *testing.T) {
 // 1000 is a system account" ceiling would trust exactly the users this check
 // exists to distrust.
 func TestLocalDevKeyTrustedOwnerIsNotARange(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the owner checks are Unix-only")
+	}
 	uid := os.Getuid()
 	if !localDevKeyTrustedOwner(0) {
 		t.Fatal("root must be trusted")
@@ -525,5 +528,25 @@ func TestLocalDevKeyTrustedOwnerIsNotARange(t *testing.T) {
 		if localDevKeyTrustedOwner(other) {
 			t.Fatalf("uid %d was trusted; only root, the current user and nobody may be", other)
 		}
+	}
+}
+
+// A hand-edited key file may carry stray whitespace. Validation normalises the
+// values, so the trimmed copy that gets checked is the one that gets used.
+func TestLocalDevKeysNormalizeWhitespaceBeforeValidating(t *testing.T) {
+	keyFile := keyFilePath(t)
+	t.Setenv(EnvLocalDevKeyFile, keyFile)
+	master := strings.Repeat("1a", 32)
+	token := strings.Repeat("2b", 32)
+	body := `{"master_key_hex":"  ` + master + `  ","token_signing_key_hex":"\t` + token + `\n"}`
+	if err := os.WriteFile(keyFile, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	keys, _, err := loadOrCreateLocalDevKeys()
+	if err != nil {
+		t.Fatalf("padded key file rejected: %v", err)
+	}
+	if keys.MasterKeyHex != master || keys.TokenSigningKeyHex != token {
+		t.Fatalf("keys were not normalised: %q / %q", keys.MasterKeyHex, keys.TokenSigningKeyHex)
 	}
 }
