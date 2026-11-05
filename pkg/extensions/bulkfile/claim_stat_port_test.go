@@ -21,8 +21,9 @@ import (
 type stubBelow struct {
 	size     int64
 	rev      int64
-	missing  bool // OpCreate without O_CREAT answers ENOENT (stale dentry)
-	noAttr   bool // OpCreate answers a handle with no attributes
+	mode     uint32 // mode the open/getattr replies carry (0 = none)
+	missing  bool   // OpCreate without O_CREAT answers ENOENT (stale dentry)
+	noAttr   bool   // OpCreate answers a handle with no attributes
 	creates  []uint32
 	getattrs int
 	setattrs []int64 // sizes expressed through OpSetAttr
@@ -45,7 +46,7 @@ func (s *stubBelow) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		if s.missing {
 			return fs.Result{}, fs.ErrNotFound
 		}
-		return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Size: s.size, Rev: s.rev}}, nil
+		return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Size: s.size, Rev: s.rev, Mode: s.mode}}, nil
 	case fs.OpSetAttr:
 		if op.Size >= 0 {
 			s.setattrs = append(s.setattrs, op.Size)
@@ -60,7 +61,7 @@ func (s *stubBelow) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			return fs.Result{Handle: stubHandle{}}, nil
 		}
 		return fs.Result{
-			Attr:   &fs.Attr{Kind: fs.KindFile, Size: s.size, Rev: s.rev},
+			Attr:   &fs.Attr{Kind: fs.KindFile, Size: s.size, Rev: s.rev, Mode: s.mode},
 			Handle: stubHandle{},
 		}, nil
 	}
@@ -324,4 +325,44 @@ func TestPortKernelOpenTruncWithoutCreateClaims(t *testing.T) {
 	if len(below.setattrs) != 1 || below.setattrs[0] != 0 {
 		t.Fatalf("boundary setattr sizes = %v, want one truncation to 0", below.setattrs)
 	}
+}
+
+// TestPortKernelOpenClaimKeepsExistingMode pins the kernel-OPEN claim's mode
+// fidelity: FUSE OPEN dispatches OpCreate without a mode, so the claim must
+// adopt the existing file's REAL mode from the open reply — a 0600 file
+// truncated through OPEN|O_TRUNC stays 0600 through lookups and re-opens,
+// not the 0644 default.
+func TestPortKernelOpenClaimKeepsExistingMode(t *testing.T) {
+	below := &stubBelow{size: 4096, rev: 9, mode: 0o600}
+	ch, b := claimStack(t, below)
+	ctx := context.Background()
+
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/mode.bin",
+		Flags:  uint32(syscall.O_WRONLY | syscall.O_TRUNC),
+		Kernel: &gofuse.OpenIn{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sh, ok := res.Handle.(*streamHandle)
+	if !ok {
+		t.Fatalf("handle = %T, want *streamHandle", res.Handle)
+	}
+	assertNoDirectRemote(t, b)
+	have, ok := sh.overlayAttr()
+	if !ok {
+		t.Fatal("claim has no overlay attributes")
+	}
+	if have.Mode != 0o600 {
+		t.Fatalf("claimed mode = %o, want the existing file's 0600 (no chmod happened)", have.Mode)
+	}
+	// An explicit chmod(000) through the claim stays explicit and
+	// distinguishable from an unknown mode.
+	if _, err := sh.applyAttr(ctx, &fs.Op{Kind: fs.OpSetAttr, HasMode: true, Mode: 0}); err != nil {
+		t.Fatal(err)
+	}
+	have2, _ := sh.overlayAttr()
+	if have2.Mode != 0 {
+		t.Fatalf("explicit chmod(000) reported as %o", have2.Mode)
+	}
+	_ = sh.Release(ctx)
 }

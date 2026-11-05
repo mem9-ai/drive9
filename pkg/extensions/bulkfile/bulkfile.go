@@ -243,6 +243,19 @@ func (b *Bulkfile) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 			h.pushed = existingSize
 			h.dirty = true
 		}
+		if kernelExisting && !h.modeKnown && res.Attr != nil && res.Attr.Mode&0o7777 != 0 {
+			// A kernel OPEN of an existing file carries no mode of its own
+			// (FUSE OPEN dispatches OpCreate without one), so the claim
+			// initialized mode-unknown — but the open reply just answered
+			// with the file's REAL mode. Adopt it: without this, the claim
+			// reported the 0644 default for a 0600 file although no chmod
+			// ever happened. A zero mode is not a mode here (Attr modes
+			// are permission bits; zero means the reply had none), so an
+			// explicit chmod(000) stays distinguishable through its own
+			// modeKnown path.
+			h.mode = res.Attr.Mode & 0o777
+			h.modeKnown = true
+		}
 		h.inner = res.Handle
 		b.track(h)
 		res.Handle = h
