@@ -959,35 +959,20 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 				b.mu.Unlock()
 				return fmt.Errorf("verify landed layout of %s: occupant replaced our upload", path)
 			}
-			// An echo-less completion has no server-supplied identity, so
-			// the occupant must be proven by CONTENT: the whole staged
-			// image, not one block. A single shared checksum proves
-			// nothing (a replacement whose first block happens to match
-			// would be adopted and then PATCHed with our size and bytes),
-			// so imageMatchesPending requires EVERY staged block at its
-			// exact offset, the exact size, and no non-zero block outside
-			// the staged set. Only then does the observed identity BIND.
-			//
-			// This is still content, not object identity: an occupant
-			// carrying a byte-identical image is indistinguishable, and
-			// adopting it is observationally the same object (every later
-			// PATCH writes exactly the bytes this descriptor would have
-			// written, onto a path CAS'd at the occupant's own revision).
-			// The definitive proof is the server echoing the landed
-			// resource on completion; until it does, this is the strongest
-			// evidence a client can obtain — and an occupant with no
-			// stat-visible identity could never be re-verified on ANY
-			// later publication, so it is refused outright.
+			// CONTENT IS NOT IDENTITY, so there is no adoption here: an
+			// echo-less completion binds nothing, even when the occupant's
+			// whole image matches byte for byte. A byte-identical
+			// replacement is still a DIFFERENT object, and adopting its
+			// resource ID would let this descriptor's later writes overwrite
+			// it under its own revision. The identity must come from the
+			// server's completion echo; without one the create stays refused
+			// (and the completion contract is the thing to fix, not this
+			// check).
 			if savedID == "" {
-				if nst.ResourceID == "" || !b.imageMatchesPending(ctx, path, size, pending) {
-					b.mu.Lock()
-					b.layoutPending[ino] = true
-					b.mu.Unlock()
-					return fmt.Errorf("verify landed layout of %s: occupant not attributable to our upload", path)
-				}
 				b.mu.Lock()
-				b.layoutPendingID[ino] = nst.ResourceID
+				b.layoutPending[ino] = true
 				b.mu.Unlock()
+				return fmt.Errorf("verify landed layout of %s: completion carried no resource identity", path)
 			}
 			landedID = nst.ResourceID
 			classic = nst.ContentLayout != client.ContentLayoutExtent
@@ -2619,75 +2604,6 @@ func (b *Bridge) layoutPendingMatches(ino meta.Ino, occupantID string) bool {
 	// replacement's bytes under its own revision. The pending state stays
 	// refused until a completion supplies the identity.
 	return b.layoutPendingID[ino] != "" && b.layoutPendingID[ino] == occupantID
-}
-
-// imageMatchesPending reports whether the pathname's current extent object
-// holds EXACTLY the image this descriptor staged: the same size, every
-// staged block represented at its exact offset over its exact byte range,
-// and no non-zero block outside the staged ranges (everything else is a
-// hole, which the staged image also serves as zeros).
-//
-// Neither a shared checksum nor FileOffset+BlockKey is enough. A plan block
-// also carries Length and BlockOffset, and a block that references only a
-// PREFIX of our content (same key, same start offset, shorter length)
-// followed by holes would otherwise pass: the one wanted offset gets marked
-// seen while the rest of the range is zeros, so a same-size replacement with
-// a truncated tail could be bound as our upload. Every staged range must
-// therefore be represented with its full length, read from the start of its
-// object.
-func (b *Bridge) imageMatchesPending(ctx context.Context, path string, size int64, pending []pendingWrite) bool {
-	if size <= 0 {
-		return false
-	}
-	type stagedBlock struct {
-		length int64
-		key    string
-	}
-	want := make(map[int64]stagedBlock, len(pending))
-	for _, p := range pending {
-		start := int64(p.chunk)*meta.ChunkSize + int64(p.off)
-		want[start] = stagedBlock{length: p.size, key: p.checksum}
-	}
-	if len(want) == 0 {
-		return false
-	}
-	seen := make(map[int64]bool, len(want))
-	// Page through the plan so the whole image is observed, not only the
-	// windows containing our own blocks: an EXTRA non-zero block is a
-	// difference and must refuse. Plans page by chunk (NextOffset).
-	off, prev := int64(0), int64(-1)
-	for i := 0; i < maxStagedPlanPages && off < size; i++ {
-		plan, err := b.cfg.Client.GetExtentReadPlan(ctx, path, off, -1)
-		if err != nil {
-			return false // transient or non-extent answer: refuse
-		}
-		if plan.Size != size {
-			return false
-		}
-		for _, blk := range plan.Blocks {
-			if blk.Zero || blk.BlockKey == "" {
-				continue // a hole agrees with our zero-filled gaps
-			}
-			exp, ours := want[blk.FileOffset]
-			// The block must represent OUR bytes: same content key, the
-			// full staged length, and read from the beginning of that
-			// object. A partial reference to the same content is a
-			// different image (holes where our bytes should be).
-			if !ours || exp.key != blk.BlockKey ||
-				exp.length != blk.Length || blk.BlockOffset != 0 {
-				return false
-			}
-			seen[blk.FileOffset] = true
-		}
-		if plan.NextOffset <= prev || plan.NextOffset <= off {
-			break // no further pages
-		}
-		prev, off = plan.NextOffset, plan.NextOffset
-	}
-	if len(seen) != len(want) {
-		return false // some staged block is not in the object
-	}
-	return true
 }
 
 // rcHeaderResourceID extracts an identity echoed by a read response, when

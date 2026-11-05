@@ -4584,17 +4584,15 @@ func TestOverlayDecisionAtomicWithPendingCheck(t *testing.T) {
 	}
 }
 
-// Round-46: a completion without the optional identity echo still leaves
-// a fresh extent create USABLE — an extent classification with a
-// stat-visible identity binds that identity, and every later PATCH of
-// the descriptor verifies it (a replacement is rejected at the PATCH,
-// not silently adopted). A classic occupant without an echo stays
-// refused on every retry.
-func TestEcholessExtentCreateBindsStatIdentity(t *testing.T) {
+// Round-60: an echo-less completion binds NOTHING, even when the occupant's
+// whole image matches byte for byte. Content is not identity — a byte-identical
+// replacement is a different object, and adopting its ID would let this
+// descriptor's later writes overwrite it under its own revision. The refined
+// requirement is that the server echoes the landed identity; without one the
+// create is refused rather than adopted.
+func TestEcholessCompletionBindsNothing(t *testing.T) {
 	f := newFakeV2(t)
-	f.mu.Lock()
 	f.completeEcho = false
-	f.mu.Unlock()
 	f.setDir("/d", true)
 	h := newTestHandler(t, f, 0)
 	res, _, _ := dispatchCreate(context.Background(), h, "/d/n.bin", syscall.O_RDWR|syscall.O_CREAT)
@@ -4602,28 +4600,20 @@ func TestEcholessExtentCreateBindsStatIdentity(t *testing.T) {
 	if err := eh.Write(context.Background(), 0, []byte("AAAA")); err != nil {
 		t.Fatal(err)
 	}
-	// First flush: no echo, but the (extent) fake's stat identity binds.
-	if err := eh.Flush(context.Background()); err != nil {
-		t.Fatalf("echo-less extent create must stay usable: %v", err)
+	if err := eh.Flush(context.Background()); err == nil {
+		t.Fatal("an echo-less completion must not bind the occupant, however identical its bytes")
 	}
 	if got := f.contentOf("/d/n.bin"); got != "AAAA" {
-		t.Fatalf("content = %q, want AAAA", got)
+		t.Fatalf("content = %q, want the upload's own bytes", got)
 	}
-	// The binding constrains later writes: a replacement at the path is
-	// rejected at the PATCH (identity mismatch) and the descriptor is
-	// abandoned — the engine's sticky-error semantics surface that on the
-	// next descriptor operation, and the replacement's bytes are never
-	// touched.
-	f.remove("/d/n.bin")
-	f.seedExtent(t, "/d/n.bin", "OTHER!")
-	if err := eh.Write(context.Background(), 0, []byte("ZZZZ")); err != nil {
-		t.Fatal(err)
+	bridge := h.opts.Engine.Bridge
+	if got := bridge.publicationIdentity(eh.ino); got != "" {
+		t.Fatalf("bound %q from an echo-less completion", got)
 	}
-	if got := f.contentOf("/d/n.bin"); got != "OTHER!" {
-		t.Fatalf("replacement = %q, want OTHER! untouched", got)
-	}
-	if _, err := eh.Read(context.Background(), 0, make([]byte, 4)); err == nil {
-		t.Fatal("the abandoned descriptor must stop serving after the identity refusal")
+	// Retrying keeps refusing: the pending state persists for the next
+	// attempt rather than silently succeeding once the Stat recovers.
+	if err := eh.Sync(context.Background()); err == nil {
+		t.Fatal("the refusal must persist across retries")
 	}
 }
 
@@ -5837,5 +5827,42 @@ func TestFreshCreateMarkerDoesNotSurviveReuse(t *testing.T) {
 	br.mu.Unlock()
 	if err := br.MaterializeEmpty(context.Background(), ino); err != nil {
 		t.Fatalf("a reopened path must not inherit the previous incarnation's create marker: %v", err)
+	}
+}
+
+// Round-60: a session that DEGRADES to the classic layout is usable again once
+// the server echoes the landed identity — the echo is layout-independent, so
+// the client never needs the (rejected) whole-image proof to attribute a
+// classic landing.
+func TestClassicFallbackBindsCompletionEcho(t *testing.T) {
+	f := newFakeV2(t)
+	f.setLegacy(true) // the initiate answers a CLASSIC plan
+	f.setDir("/d", true)
+	h := newTestHandler(t, f, 0)
+	res, _, _ := dispatchCreate(context.Background(), h, "/d/c.bin", syscall.O_RDWR|syscall.O_CREAT)
+	eh := res.Handle.(*engineHandle)
+	if err := eh.Write(context.Background(), 0, []byte("CLASSIC")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Flush(context.Background()); err != nil {
+		t.Fatalf("a classic-degraded landing with an identity echo must be usable: %v", err)
+	}
+	if got := f.contentOf("/d/c.bin"); got != "CLASSIC" {
+		t.Fatalf("content = %q, want CLASSIC", got)
+	}
+	if got := h.opts.Engine.Bridge.publicationIdentity(eh.ino); got == "" {
+		t.Fatal("the completion echo must bind the landed identity")
+	}
+	// And the descriptor stays writable through the classic surface. The
+	// rewrite is the SAME length, so it fully replaces the image rather than
+	// partially overwriting it.
+	if err := eh.Write(context.Background(), 0, []byte("SECOND!")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Flush(context.Background()); err != nil {
+		t.Fatalf("second write: %v", err)
+	}
+	if got := f.contentOf("/d/c.bin"); got != "SECOND!" {
+		t.Fatalf("content after rewrite = %q, want SECOND!", got)
 	}
 }
