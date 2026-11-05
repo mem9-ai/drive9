@@ -3395,7 +3395,7 @@ func (cq *CommitQueue) ResolveSupersededConflict(path string, supersedeGen uint6
 	// superseded EITHER generation recovered that image — most importantly
 	// the source one every retained handle and pre-staged cache snapshot
 	// recorded before the move.
-	if meta.Generation > supersedeGen && !(meta.SupersedesPendingGen != 0 && meta.SupersedesPendingGen <= supersedeGen) {
+	if meta.Generation > supersedeGen && (meta.SupersedesPendingGen == 0 || meta.SupersedesPendingGen > supersedeGen) {
 		return
 	}
 	cq.index.RemoveIfGeneration(path, meta.Generation)
