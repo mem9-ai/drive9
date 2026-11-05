@@ -1611,6 +1611,9 @@ func TestPortRenameCarriesPublicationFromRetargetGap(t *testing.T) {
 	if terr != nil {
 		t.Fatalf("first transition pass: %v", terr)
 	}
+	// The second window's commit-stamp baseline, read where the handler
+	// reads it: with the first window's delta, before the gap opens.
+	baseline := wb.queue.CommitSeq("/gap-src.txt")
 	// THE GAP: locks released, handles not yet moved — the writer stages a
 	// fresh image under the old name and its Flush clears the dirty flag.
 	fb.setFail(true)
@@ -1624,7 +1627,7 @@ func TestPortRenameCarriesPublicationFromRetargetGap(t *testing.T) {
 	wb.retarget("/gap-src.txt", "/gap-dst.txt")
 	// The handler's second pass: the stranded old-name publication moves.
 	secondFence := renameFence{movedAt: fence.movedAt, ownGen: installedGen}
-	secondWork := (wb.queue != nil && wb.queue.HasPath("/gap-src.txt")) || wb.everLanded("/gap-src.txt")
+	secondWork := wb.renameWindowWork("/gap-src.txt", baseline)
 	if !secondWork {
 		t.Fatal("the gap publication was not detected as in-window work")
 	}
@@ -1645,6 +1648,172 @@ func TestPortRenameCarriesPublicationFromRetargetGap(t *testing.T) {
 	}
 	if _, recreated := nodeString(fb.backend, "/gap-src.txt"); recreated {
 		t.Fatal("the dead old name was resurrected")
+	}
+}
+
+// TestPortRenameSecondPassSeesCompletedOldNameLanding pins the second pass's
+// blind spot from #1083: the gap publication does not stay pending — it
+// COMPLETES fully under the obsolete source name (queue and pending cleanup
+// done, the old name resurrected by the upload), and the event stream then
+// wipes every landed watermark (EventUnverified/EventCheckout) before the
+// handle retarget. HasPath and everLanded are both false at the second pass;
+// only the unconditional commit-seq delta still witnesses the landing, and
+// the pass must run its strict old-name check and leave a failure witness at
+// the destination instead of certifying the stale v1 image.
+func TestPortRenameSecondPassSeesCompletedOldNameLanding(t *testing.T) {
+	fb := &failingWritesBackend{backend: testbackend.NewBackend()}
+	ch, wb := newUploadStack(t, fb, Options{Policy: PolicyWriteBack})
+	ctx := context.Background()
+
+	h := open(t, ch, "/old-land.txt")
+	if err := h.Write(ctx, 0, []byte("v1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// The server applies the rename; the handler's phases run manually.
+	if err := wb.opts.Client.RenameCtx(ctx, wb.remotePath("/old-land.txt"), wb.remotePath("/new-land.txt")); err != nil {
+		t.Fatal(err)
+	}
+	// First pass: the clean rename's transition (nothing was in-window).
+	fence := renameFence{movedAt: time.Now()}
+	installedGen, terr := wb.retargetConflictMarkers(ctx, "/old-land.txt", "/new-land.txt", fence, false)
+	if terr != nil {
+		t.Fatalf("first transition pass: %v", terr)
+	}
+	baseline := wb.queue.CommitSeq("/old-land.txt")
+
+	// THE GAP: the writer stages a fresh image under the old name, and its
+	// upload COMPLETES there — the not-found retry resurrects the obsolete
+	// name with v2 while the handles still point at it.
+	if err := h.Write(ctx, 0, []byte("landed v2")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if !wb.opts.Staging.Pending.HasPending("/old-land.txt") && !wb.queue.HasPath("/old-land.txt") {
+			if _, ok := nodeString(fb.backend, "/old-land.txt"); ok {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if wb.opts.Staging.Pending.HasPending("/old-land.txt") || wb.queue.HasPath("/old-land.txt") {
+		t.Fatal("the gap publication never completed under the old name")
+	}
+	// The event stream wipes every landed watermark before the retarget.
+	wb.clearLanded()
+
+	// The handle retarget, then the handler's second pass.
+	wb.retarget("/old-land.txt", "/new-land.txt")
+	if wb.queue.HasPath("/old-land.txt") || wb.everLanded("/old-land.txt") {
+		t.Fatal("precondition: the old detection signals must both be quiet")
+	}
+	secondFence := renameFence{movedAt: fence.movedAt, ownGen: installedGen}
+	if !wb.renameWindowWork("/old-land.txt", baseline) {
+		t.Fatal("the completed old-name landing was not detected as in-window work")
+	}
+	if _, terr := wb.retargetConflictMarkers(ctx, "/old-land.txt", "/new-land.txt", secondFence, true); terr == nil {
+		t.Fatal("the second pass certified the rename although v2 landed only under the obsolete name")
+	}
+	// The failure witness at the destination answers EIO at the barrier.
+	if err := wb.queue.PathTerminalFailure("/new-land.txt"); err == nil {
+		t.Fatal("no failure witness recorded at the destination")
+	}
+	if err := h.Sync(ctx); err == nil {
+		t.Fatal("strict Sync on the retargeted handle = nil, want EIO from the destination witness")
+	}
+	if got, ok := nodeString(fb.backend, "/old-land.txt"); !ok || got != "landed v2" {
+		t.Fatalf("remote image at the old name = %q ok=%v, want the resurrected gap landing", got, ok)
+	}
+	if got, ok := nodeString(fb.backend, "/new-land.txt"); !ok || got != "v1" {
+		t.Fatalf("remote image at the new name = %q ok=%v, want the renamed v1", got, ok)
+	}
+}
+
+// TestWitnessOnlyMarkerDoesNotFeedReadOverlay pins the read-data half of the
+// standalone witness from #1083: a recovered WitnessOnly conflict at /e/f
+// describes bytes preserved under a dead name — it carries no payload (Size
+// zero, no shadow) and must only answer EIO at fsync barriers. A read-only
+// open with no live writer falls through to the remote-backed handle, but
+// Read's pending overlay used the RAW pending meta: HasPending was true and
+// Size was 0, so every read at offset 0 returned a successful EOF before the
+// remote handle was ever touched — stat reported the real nonzero size while
+// reads came back empty. Reads must serve the remote image's bytes.
+func TestWitnessOnlyMarkerDoesNotFeedReadOverlay(t *testing.T) {
+	fb := &failingWritesBackend{backend: testbackend.NewBackend()}
+	ch, wb := newUploadStack(t, fb, Options{Policy: PolicyWriteBack})
+	ctx := context.Background()
+
+	// The TestStandaloneTransferFailureSurvivesRestart sequence: a child
+	// lands, the directory is renamed away, and the writer's gap publication
+	// lands fully under the resurrected old name — the settlement then
+	// installs the shadowless witness at the child's NEW name.
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMkdir, Path: "/d", Mode: 0o755}); err != nil {
+		t.Fatal(err)
+	}
+	h := open(t, ch, "/d/f")
+	if err := h.Write(ctx, 0, []byte("child v1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	wb.forgetLanded("/d")
+	wb.forgetLandedPrefix("/d/")
+	if err := wb.opts.Client.RenameCtx(ctx, wb.remotePath("/d"), wb.remotePath("/e")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Write(ctx, 0, []byte("child v2 landed in the gap")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if !wb.opts.Staging.Pending.HasPending("/d/f") {
+			if _, ok := nodeString(fb.backend, "/d/f"); ok {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if wb.opts.Staging.Pending.HasPending("/d/f") {
+		t.Fatal("the gap successor never completed under the old prefix")
+	}
+	wb.retarget("/d", "/e")
+	wb.settleOldPrefixAfterMove(ctx, &fs.Op{Kind: fs.OpRename, Path: "/d", Path2: "/e"}, time.Now(), nil, nil, nil, map[string]bool{})
+
+	// The destination carries the standalone witness and a NONEMPTY remote
+	// image (the renamed v1).
+	marker, ok := wb.opts.Staging.Pending.GetMeta("/e/f")
+	if !ok || marker == nil || marker.Kind != staging.PendingConflict || !marker.WitnessOnly {
+		t.Fatalf("marker at /e/f = %+v ok=%v, want a witness-only conflict", marker, ok)
+	}
+	if got, ok := nodeString(fb.backend, "/e/f"); !ok || got != "child v1" {
+		t.Fatalf("remote image at /e/f = %q ok=%v, want the renamed child v1", got, ok)
+	}
+
+	// A read-only open with no live writer: reads serve the remote image's
+	// bytes — not a successful EOF manufactured from the witness's zero size.
+	ro := openRO(t, ch, "/e/f")
+	buf := make([]byte, len("child v1"))
+	n, rerr := ro.Read(ctx, 0, buf)
+	if rerr != nil {
+		t.Fatalf("read at 0 = %v, want the remote image", rerr)
+	}
+	if n != len("child v1") || string(buf[:n]) != "child v1" {
+		t.Fatalf("read at 0 = %q (n=%d), want %q", string(buf[:n]), n, "child v1")
+	}
+	// The witness keeps failing the durability barrier closed.
+	if err := wb.queue.PathTerminalFailure("/e/f"); err == nil {
+		t.Fatal("the witness stopped answering EIO at the barrier")
 	}
 }
 
