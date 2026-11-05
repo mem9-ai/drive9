@@ -502,3 +502,28 @@ func TestLocalDevKeysRejectWritableAncestor(t *testing.T) {
 		t.Fatalf("a symlinked ancestor must be allowed (macOS /var -> /private/var): %v", err)
 	}
 }
+
+// The trusted-owner set must not be a numeric range: macOS allocates interactive
+// users from 501 and legacy Linux sites still hand out 500-999 ids, so a "below
+// 1000 is a system account" ceiling would trust exactly the users this check
+// exists to distrust.
+func TestLocalDevKeyTrustedOwnerIsNotARange(t *testing.T) {
+	uid := os.Getuid()
+	if !localDevKeyTrustedOwner(0) {
+		t.Fatal("root must be trusted")
+	}
+	if !localDevKeyTrustedOwner(uid) {
+		t.Fatalf("the current user (%d) must be trusted", uid)
+	}
+	if !localDevKeyTrustedOwner(localDevKeyNobodyUID) {
+		t.Fatal("nobody must be trusted so rootless containers and sandboxes work")
+	}
+	for _, other := range []int{501, 502, 999, uid + 1} {
+		if other == 0 || other == uid || other == localDevKeyNobodyUID {
+			continue
+		}
+		if localDevKeyTrustedOwner(other) {
+			t.Fatalf("uid %d was trusted; only root, the current user and nobody may be", other)
+		}
+	}
+}

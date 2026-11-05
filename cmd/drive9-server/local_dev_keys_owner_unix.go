@@ -136,21 +136,21 @@ func checkLocalDevKeyAncestors(dir string) error {
 	}
 }
 
-// localDevKeySystemUIDMax is the platform convention for the first interactive
-// user id. Components owned by root or a system account are trusted; a regular
-// user's directory can be chmod-ed by its owner at any time, which is the risk
-// this walk exists to catch.
-const localDevKeySystemUIDMax = 1000
-
 // localDevKeyNobodyUID is nobody's conventional id, which some sandboxes and
-// rootless containers use for everything they do not map.
+// rootless containers use for everything they do not map (this one included).
 const localDevKeyNobodyUID = 65534
 
+// localDevKeyTrustedOwner reports whether a path component's owner cannot be the
+// local adversary this walk models.
+//
+// The set is deliberately tiny — root, the current user, nobody — and is not a
+// numeric range. A range is unsound: macOS allocates interactive users from 501
+// and Linux sites may still hand out legacy 500-999 ids, so "below 1000 means
+// system account" would trust exactly the users this check exists to distrust.
+// Every other owner can chmod its own directory writable at any time, which is
+// the delete/replace → forced rotation → stranded data path.
 func localDevKeyTrustedOwner(uid int) bool {
-	if uid == 0 || uid == os.Getuid() || uid == localDevKeyNobodyUID {
-		return true
-	}
-	return uid < localDevKeySystemUIDMax
+	return uid == 0 || uid == os.Getuid() || uid == localDevKeyNobodyUID
 }
 
 func localDevKeyPathUID(info os.FileInfo) (int, bool) {

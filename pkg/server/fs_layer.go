@@ -950,9 +950,14 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 	// Entries can predate the write-time source check (or arrive from a client
 	// that wrote them before a scope was narrowed), so re-authorize every
 	// object reference before it is aliased into main.
+	// Many entries can alias one blob; resolve each reference once for the request.
+	decisions := &fsLayerStorageRefDecisions{}
 	for i := range entries {
-		if !s.authorizeFSLayerStorageRefSource(w, r, store, &entries[i]) {
-			_ = store.SetFSLayerStateIf(r.Context(), layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
+		entry := &entries[i]
+		if err := s.authorizeFSLayerStorageRefWith(r.Context(), store, ScopeFromContext(r.Context()), entry, decisions); err != nil {
+			if !s.writeFSLayerStorageRefError(w, r, entry, err) {
+				_ = store.SetFSLayerStateIf(r.Context(), layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
+			}
 			return
 		}
 	}
@@ -1122,36 +1127,39 @@ func validateFSLayerServerStorageRef(layer *datastore.FSLayer, entry *datastore.
 	return fmt.Errorf("fs layer storage_ref is not a server-issued object reference")
 }
 
-// authorizeFSLayerStorageRefSource rejects a layer entry whose "blobs/<fileID>"
+// authorizeFSLayerStorageRefSource rejects a layer entry whose "blobs/<key>"
 // reference aliases a file the caller may not read.
 //
 // A blobs/ reference names a file entity, not a path, and the layer endpoints
 // authorize only the layer path they operate on: a scoped caller could take the
-// blobDentryPathLimit bounds how many dentry paths one blob lookup returns; the
-// callers only need one authorized path, and a higher fan-out would mean the blob
-// is shared by an implausible number of names.
-const blobDentryPathLimit = 64
-
 // stable resource id of an out-of-scope file (stat exposes it), store it on an
 // allowed layer path, and read the bytes back through the layer object read —
 // which calls the object store directly. The reference is therefore resolved to
 // its dentry paths and the caller must be able to read at least one of them;
 // content reachable inside the scope is legitimately readable, and a reference
 // with no remaining dentry is refused rather than treated as absent.
-// authorizeFSLayerStorageRefSource keeps a caller-supplied blobs/ reference
-// inside the tenant's own filesystem. It is the HTTP wrapper around
-// authorizeFSLayerStorageRef, which every byte-reading path shares.
+//
+// It is the HTTP wrapper around authorizeFSLayerStorageRef, which every
+// byte-reading path shares.
 func (s *Server) authorizeFSLayerStorageRefSource(w http.ResponseWriter, r *http.Request, store *datastore.Store, entry *datastore.FSLayerEntry) bool {
 	err := s.authorizeFSLayerStorageRef(r.Context(), store, ScopeFromContext(r.Context()), entry)
 	if err == nil {
 		return true
 	}
+	_ = s.writeFSLayerStorageRefError(w, r, entry, err)
+	return false
+}
+
+// writeFSLayerStorageRefError answers a policy refusal with 403 and a lookup
+// failure with 500, logging each once. It reports whether the request was denied
+// as opposed to failing internally.
+func (s *Server) writeFSLayerStorageRefError(w http.ResponseWriter, r *http.Request, entry *datastore.FSLayerEntry, err error) bool {
 	var denied *fsLayerStorageRefDenied
 	if errors.As(err, &denied) {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), denied.event,
 			"layer_id", entry.LayerID, "path", entry.Path, "blob_key", denied.blobKey, "parent_tenant_id", denied.parentTenantID)...)
 		errJSON(w, http.StatusForbidden, denied.message)
-		return false
+		return true
 	}
 	logger.Error(r.Context(), "fs_layer_storage_ref_lookup_failed", eventFields(r.Context(), "fs_layer_storage_ref_lookup_failed",
 		"layer_id", entry.LayerID, "blob_key", strings.TrimPrefix(strings.TrimSpace(entry.StorageRef), "blobs/"), "error", err)...)
@@ -1170,10 +1178,11 @@ type fsLayerStorageRefDenied struct {
 
 func (e *fsLayerStorageRefDenied) Error() string { return e.message }
 
-// authorizeFSLayerStorageRef is the request-independent form of the storage_ref
-// source check. Every path that reads a layer entry's bytes routes through it —
-// entry upsert, object read, commit, and the grep overlay — so one predicate
-// decides the question instead of each endpoint re-deriving it.
+// blobDentryPathLimit bounds how many dentry paths one blob lookup returns; the
+// callers only need one authorized path, and a higher fan-out would mean the blob
+// is shared by an implausible number of names.
+const blobDentryPathLimit = 64
+
 // fsLayerStorageRefDecisions memoizes the resolution of one storage_ref within a
 // single request, so a layer with many entries sharing a blob costs one DB
 // fan-out instead of one per entry.
@@ -1199,6 +1208,10 @@ func (d *fsLayerStorageRefDecisions) resolve(ctx context.Context, store *datasto
 	return paths, nil
 }
 
+// authorizeFSLayerStorageRef is the request-independent form of the storage_ref
+// source check. Every path that reads a layer entry's bytes routes through it —
+// entry upsert, object read, commit, and the grep overlay — so one predicate
+// decides the question instead of each endpoint re-deriving it.
 func (s *Server) authorizeFSLayerStorageRef(ctx context.Context, store *datastore.Store, scope *TenantScope, entry *datastore.FSLayerEntry) error {
 	return s.authorizeFSLayerStorageRefWith(ctx, store, scope, entry, nil)
 }

@@ -93,21 +93,35 @@ func loadOrCreateLocalDevKeys() (localDevKeys, string, error) {
 	if err != nil {
 		return localDevKeys{}, path, err
 	}
-	installed, err := installLocalDevKeys(path, keys)
-	if err != nil {
-		return localDevKeys{}, path, err
+	// Bounded retries: losing the install race means another process published a
+	// pair first, so adopt theirs. A peer that keeps winning, or a file that keeps
+	// vanishing, must not turn startup into unbounded recursion.
+	const installAttempts = 3
+	for attempt := 0; attempt < installAttempts; attempt++ {
+		installed, installErr := installLocalDevKeys(path, keys)
+		if installErr != nil {
+			return localDevKeys{}, path, installErr
+		}
+		if installed {
+			return keys, path, nil
+		}
+		raw, readErr := readLocalDevKeyFilePlatform(path)
+		if readErr != nil {
+			if errors.Is(readErr, os.ErrNotExist) {
+				continue
+			}
+			return localDevKeys{}, path, readErr
+		}
+		var existing localDevKeys
+		if unmarshalErr := json.Unmarshal(raw, &existing); unmarshalErr != nil {
+			return localDevKeys{}, path, fmt.Errorf("local dev key file %s is malformed (%v); delete it to generate a new pair", path, unmarshalErr)
+		}
+		if validateErr := existing.validate(); validateErr != nil {
+			return localDevKeys{}, path, fmt.Errorf("local dev key file %s is unusable (%v); delete it to generate a new pair", path, validateErr)
+		}
+		return existing, path, nil
 	}
-	if installed {
-		return keys, path, nil
-	}
-	// Another process won the race and installed its pair first. Ours never
-	// reached the file, so adopt theirs instead of running on keys nobody else
-	// holds.
-	existing, existingPath, retryErr := loadOrCreateLocalDevKeys()
-	if retryErr != nil {
-		return localDevKeys{}, path, retryErr
-	}
-	return existing, existingPath, nil
+	return localDevKeys{}, path, fmt.Errorf("install local dev key file %s: another process kept replacing it", path)
 }
 
 // newLocalDevKeys draws one random key per role.
@@ -205,7 +219,12 @@ func installLocalDevKeys(path string, keys localDevKeys) (bool, error) {
 	return true, nil
 }
 
-func (k localDevKeys) validate() error {
+// validate normalises the values before checking them: a hand-edited file may
+// carry stray whitespace, and validating a trimmed copy while the consumer reads
+// the untrimmed one would surface as a confusing failure at first use.
+func (k *localDevKeys) validate() error {
+	k.MasterKeyHex = strings.TrimSpace(k.MasterKeyHex)
+	k.TokenSigningKeyHex = strings.TrimSpace(k.TokenSigningKeyHex)
 	if err := validateKeyHex("master_key_hex", k.MasterKeyHex); err != nil {
 		return err
 	}

@@ -114,11 +114,13 @@ func MountVault(opts *VaultMountOptions) error {
 
 // newVaultMountOptions assembles the kernel mount options for a vault mount.
 //
-// allow_other without default_permissions leaves access to the filesystem's own
-// permission checks, so every local user could read the plaintext secrets in the
-// mount. default_permissions makes the kernel enforce the 0400/0500 modes that
-// VaultFS reports for a private mount (0444/0555 for an explicitly shared one).
-// Mirrors newGoFuseMountOptions in pkg/fuse.
+// A private mount is already restricted by the kernel to the mounting user, so
+// the mode bits VaultFS reports are what protect it; sharing is an explicit
+// --allow-other opt-in, and on Linux default_permissions is what makes the kernel
+// enforce 0400/0500 (0444/0555 when shared) once other users may traverse it.
+// Without it, allow_other leaves the decision to the filesystem's own checks and
+// every local user can read the plaintext secrets. Mirrors newGoFuseMountOptions
+// in pkg/fuse.
 func newVaultMountOptions(opts *VaultMountOptions) *gofuse.MountOptions {
 	return newVaultMountOptionsFor(runtime.GOOS, opts)
 }
@@ -141,12 +143,16 @@ func newVaultMountOptionsFor(goos string, opts *VaultMountOptions) *gofuse.Mount
 		}
 	}
 	if goos == "darwin" {
-		// macFUSE has no default_permissions switch; defer_permissions is the
-		// equivalent kernel-side enforcement, and pkg/fuse always passes it.
-		// Without it an allow_other mount falls back to user-space checks that
-		// VaultFS does not implement for other users.
+		// macFUSE has no default_permissions switch. defer_permissions defers the
+		// check to the filesystem's own handlers (pkg/fuse passes it for every
+		// mount); VaultFS implements no per-user handler, so the protection for a
+		// private mount is the kernel restricting the mount to the mounting user,
+		// and sharing is the explicit --allow-other opt-in.
 		fuseOpts.Options = append(fuseOpts.Options, "defer_permissions", "local")
 	}
+	// Other platforms (e.g. FreeBSD) take neither branch, so an allow_other vault
+	// mount there keeps the pre-change exposure. That matches pkg/fuse house
+	// behavior; a platform that supports it should add its own enforcement flag.
 	return fuseOpts
 }
 
