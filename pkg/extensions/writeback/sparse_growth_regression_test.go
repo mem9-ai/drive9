@@ -422,7 +422,7 @@ func TestSparseGrowthWriteCacheHelperRejectsLargeImage(t *testing.T) {
 	if err := h.Write(ctx, offset, []byte("z")); err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := h.stageToWriteCache(ctx)
+	snapshot, err := h.stageToWriteCache(ctx, stageFullDurable)
 	if err == nil || snapshot != nil {
 		t.Fatalf("large image was accepted by the whole-image helper: snapshot=%+v error=%v", snapshot, err)
 	}

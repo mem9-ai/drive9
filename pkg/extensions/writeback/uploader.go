@@ -83,6 +83,49 @@ type WriteBackUploader struct {
 	// SnapshotStagingGens optionally captures the pendingIndex/shadowStore
 	// generations for a path so OnSuccess can do generation-guarded cleanup.
 	SnapshotStagingGens SnapshotStagingGensFunc
+	// ResolveConflict optionally repairs a conflicted entry in place:
+	// given the staged meta, the payload that was read for upload, and the
+	// base its upload just conflicted on, it returns a newer same-origin
+	// base to rebase onto and retry. Wired by the writeback plane to its
+	// landed records — the payload this mount itself uploaded — so a
+	// duplicate-commit race (the kernel's asynchronous RELEASE racing a
+	// handoff flush of one handle) heals without a remote stat, while a
+	// foreign advance or a divergent image stays conflicted.
+	ResolveConflict func(localPath string, meta *staging.WriteBackMeta, data []byte, conflictedBase int64) (int64, bool)
+	// LedgerOwned optionally reports that the staging ledger owns a path's
+	// current image (pending index entry). The synchronous cache landing
+	// REFUSES such paths: the .dat/.meta pair beneath the ledger entry may
+	// be a superseded image, and publishing it — including the
+	// expect-absent create a PendingNew pair would issue against an absent
+	// row — hands the backend bytes the queue's own recovery is about to
+	// contradict. Callers fall back to the queue track.
+	LedgerOwned func(localPath string) bool
+	// RecordLanding observes every successful upload with EXACTLY the
+	// bytes that were published (both the background worker and the sync
+	// path), read under the same generation gate as the upload's meta
+	// snapshot. Wired by the writeback plane to its landed records, whose
+	// payload identity must describe the uploaded generation — capturing
+	// it outside this gate can pair one generation's identity with
+	// another's revision.
+	RecordLanding func(localPath string, data []byte, committedRev int64, meta *staging.WriteBackMeta)
+}
+
+// resolveConflict consults ResolveConflict and rebases the staged entry's
+// base when the proof holds; ok reports a retryable new base.
+func (u *WriteBackUploader) resolveConflict(localPath string, meta *staging.WriteBackMeta, data []byte, conflictedBase int64) (int64, bool) {
+	if u.ResolveConflict == nil {
+		return 0, false
+	}
+	return u.ResolveConflict(localPath, meta, data, conflictedBase)
+}
+
+// recordLanding consults RecordLanding when wired and only for a revision
+// the upload itself reported: a fabricated (expected+1) or absent revision
+// must never become a same-origin proof.
+func (u *WriteBackUploader) recordLanding(localPath string, data []byte, committedRev int64, meta *staging.WriteBackMeta) {
+	if u.RecordLanding != nil && committedRev > 0 {
+		u.RecordLanding(localPath, data, committedRev, meta)
+	}
 }
 
 // WriteBackUploaderSnapshot is one uploader-depth observation.
@@ -286,40 +329,75 @@ func (u *WriteBackUploader) DrainAll() {
 // RecoverPending scans the cache directory for leftover entries from a
 // previous session and submits them for upload.
 func (u *WriteBackUploader) RecoverPending() {
-	entries := u.cache.ListPending()
+	u.RecoverPendingFilter(nil)
+}
+
+// RecoverPendingFilter is RecoverPending with a skip predicate: paths for
+// which skip reports true belong to another track's recovery (the staging
+// ledger's pending index) and are left alone. It enumerates metadata only
+// — the payloads are loaded one at a time by the workers, so recovering a
+// large backlog never materializes its total bytes.
+func (u *WriteBackUploader) RecoverPendingFilter(skip func(localPath string) bool) {
+	metas := u.cache.ListPendingMetas()
 	skippedLegacyOverwrites := 0
-	for _, e := range entries {
-		if e.Meta.Kind == staging.PendingOverwrite && e.Meta.BaseRev <= 0 {
-			skippedLegacyOverwrites++
-			safeLogPrintf("writeback: skipping legacy overwrite without base revision for %s", e.Meta.Path)
+	for i := range metas {
+		path, meta := metas[i].Path, &metas[i]
+		if skip != nil && skip(path) {
 			continue
 		}
-		safeLogPrintf("writeback: recovering pending upload for %s (%d bytes)", e.Meta.Path, e.Meta.Size)
-		u.Submit(e.Meta.Path)
+		if meta.Kind == staging.PendingOverwrite && meta.BaseRev <= 0 {
+			skippedLegacyOverwrites++
+			safeLogPrintf("writeback: skipping legacy overwrite without base revision for %s", path)
+			continue
+		}
+		safeLogPrintf("writeback: recovering pending upload for %s (%d bytes)", path, meta.Size)
+		u.Submit(path)
 	}
 	if skippedLegacyOverwrites > 0 {
 		safeLogPrintf("writeback: skipped %d legacy overwrite entries without base revision during recovery", skippedLegacyOverwrites)
 	}
 }
 
+// errLedgerOwned reports a synchronous landing refused because the staging
+// ledger owns the path's image (see WriteBackUploader.LedgerOwned).
+var errLedgerOwned = errors.New("writeback: path owned by the staging ledger")
+
+// IsLedgerOwnedError reports whether err is the ledger-ownership refusal.
+func IsLedgerOwnedError(err error) bool { return errors.Is(err, errLedgerOwned) }
+
+// IsLedgerOwnedError on the uploader forwards to the package-level check.
+func (u *WriteBackUploader) IsLedgerOwnedError(err error) bool { return IsLedgerOwnedError(err) }
+
 // UploadSync synchronously uploads a single path from the cache to the server.
 // Serializes with other uploads of the same path, then uploads with
 // generation protection. Used by Fsync/Rename which require the data to be
-// persisted remotely before returning.
+// persisted remotely before returning. Ledger-owned paths are refused.
 func (u *WriteBackUploader) UploadSync(ctx context.Context, localPath string) error {
 	_, err := u.UploadSyncWithRevision(ctx, localPath)
 	return err
 }
 
+// ledgerOwnedRefused reports whether this path's sync landing must be
+// refused (the ledger owns its image).
+func (u *WriteBackUploader) ledgerOwnedRefused(localPath string) bool {
+	return u.LedgerOwned != nil && u.LedgerOwned(localPath)
+}
+
 // UploadSyncWithRevision uploads one path synchronously and reports
 // the committed revision.
 func (u *WriteBackUploader) UploadSyncWithRevision(ctx context.Context, localPath string) (int64, error) {
+	if u.ledgerOwnedRefused(localPath) {
+		return 0, errLedgerOwned
+	}
 	rev, _, err := u.uploadSyncWithMetadata(ctx, localPath)
 	return rev, err
 }
 
 // Metadata identifies the completed cache operation; nil means no entry was consumed.
 func (u *WriteBackUploader) uploadSyncWithMetadata(ctx context.Context, localPath string) (int64, *staging.WriteBackMeta, error) {
+	if u.ledgerOwnedRefused(localPath) {
+		return 0, nil, errLedgerOwned
+	}
 	// Own the gate through cache cleanup, just like uploadOne. A wait alone
 	// leaves a gap in which a background or second synchronous upload can
 	// publish the same generation and trigger a false revision conflict.
@@ -362,13 +440,26 @@ func (u *WriteBackUploader) uploadSyncWithMetadata(ctx context.Context, localPat
 	}
 
 	var committedRev int64
-	uploadStart := time.Now()
 	threshold := u.directPutThreshold()
 	useDirectPUT := meta.Size == 0 || (threshold > 0 && meta.Size < threshold)
-	if useDirectPUT {
-		committedRev, err = u.client.WriteCtxConditionalWithRevision(ctx, u.remotePath(localPath), data, expectedRevision)
-	} else {
-		committedRev, err = uploadBufferedRemoteFileWithRevision(ctx, u.client, u.remotePath(localPath), data, expectedRevision)
+	put := func(ctx context.Context, rev int64) (int64, error) {
+		if useDirectPUT {
+			return u.client.WriteCtxConditionalWithRevision(ctx, u.remotePath(localPath), data, rev)
+		}
+		return uploadBufferedRemoteFileWithRevision(ctx, u.client, u.remotePath(localPath), data, rev)
+	}
+	uploadStart := time.Now()
+	committedRev, err = put(ctx, expectedRevision)
+	if errors.Is(err, client.ErrConflict) {
+		// Same-origin repair (see uploadOne): this mount's own landing may
+		// have won a duplicate-commit race under this staging — rebase and
+		// retry once so the flush that routed here (close-sync's boundary,
+		// the claim handoff inside an open) does not surface EIO for a
+		// race the mount itself can prove.
+		if rev, ok := u.resolveConflict(localPath, meta, data, expectedRevision); ok {
+			expectedRevision = rev
+			committedRev, err = put(ctx, expectedRevision)
+		}
 	}
 	if u.perf != nil {
 		u.perf.recordRemoteOp(perfRemoteWrite, err, time.Since(uploadStart), uint64(len(data)))
@@ -379,10 +470,14 @@ func (u *WriteBackUploader) uploadSyncWithMetadata(ctx context.Context, localPat
 		}
 		return 0, nil, err
 	}
-	committedRev = committedRevisionForExpectedRevision(expectedRevision, committedRev)
+	// The landed record is written before the expected+1 fabrication below
+	// applies: a landed record may only carry a revision the upload itself
+	// reported (streaming landings report 0 and record nothing).
+	u.recordLanding(localPath, data, committedRev, meta)
 	if u.OnSuccess != nil && meta.LineageTrusted() && meta.SnapshotID != "" && meta.Size == int64(len(data)) && len(data) <= 1<<20 {
 		meta.LiveChecksum = payloadChecksum(data)
 	}
+	committedRev = committedRevisionForExpectedRevision(expectedRevision, committedRev)
 	chmodCtx, chmodCancel := context.WithTimeout(ctx, 30*time.Second)
 	err = u.applyMode(chmodCtx, meta)
 	chmodCancel()
@@ -555,6 +650,7 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 	var (
 		lastErr      error
 		committedRev int64
+		repaired     bool
 	)
 	for attempt := 0; attempt <= uploadMaxRetries; attempt++ {
 		if attempt > 0 {
@@ -577,6 +673,28 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 			break
 		}
 		if errors.Is(lastErr, client.ErrConflict) {
+			// Same-origin repair first: if this mount itself landed this
+			// entry's image after it staged (a duplicate-commit race — the
+			// kernel's asynchronous RELEASE racing a handoff flush of the
+			// same handle), rebase onto the winner's base and retry
+			// instead of staying conflicted forever. Exactly ONE repair
+			// per upload: successive conflicts can keep finding eligible
+			// newer duplicates while this worker holds the path gate, and
+			// re-repairing on the extra attempt would extend the gate
+			// beyond the single promised retry (the sync path repairs once).
+			if !repaired {
+				if rev, ok := u.resolveConflict(localPath, meta, data, expectedRevision); ok {
+					expectedRevision = rev
+					repaired = true
+					if attempt == uploadMaxRetries {
+						// The repair earned its own attempt: refund this
+						// slot so the rebased PUT runs even when the
+						// conflict hit the last ordinary attempt.
+						attempt--
+					}
+					continue
+				}
+			}
 			break
 		}
 		safeLogPrintf("writeback upload attempt %d/%d failed for %s: %v", attempt+1, uploadMaxRetries+1, localPath, lastErr)
@@ -595,11 +713,12 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 		safeLogPrintf("writeback upload failed for %s after %d attempts: %v (will retry on next mount)", localPath, uploadMaxRetries+1, lastErr)
 		return
 	}
-	committedRev = committedRevisionForExpectedRevision(expectedRevision, committedRev)
+	u.recordLanding(localPath, data, committedRev, meta)
 	if u.OnSuccess != nil && meta.LineageTrusted() && meta.SnapshotID != "" && meta.Size == int64(len(data)) && len(data) <= 1<<20 {
 		// The proof identifies the data PUT even when its later chmod fails.
 		meta.LiveChecksum = payloadChecksum(data)
 	}
+	committedRev = committedRevisionForExpectedRevision(expectedRevision, committedRev)
 	chmodCtx, chmodCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	modeErr := u.applyMode(chmodCtx, meta)
 	chmodCancel()

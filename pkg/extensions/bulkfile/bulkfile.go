@@ -21,6 +21,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/fs"
@@ -107,8 +108,16 @@ func New(opts Options) (*Bulkfile, error) {
 // handle, serves lookups of live claims from the buffered image, and keeps
 // unlinks and renames of never-committed claims local.
 func (b *Bulkfile) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error) {
+	// Linux strips O_CREAT from FUSE_OPEN for existing files: `: > f`
+	// arrives as OPEN|O_TRUNC with no O_CREAT, while the same open on a
+	// kernel that forwards create flags (or a fresh path's FUSE_CREATE)
+	// carries O_CREAT. The claim must treat both shapes as the truncate-
+	// writer it exists for, or its truncation ownership would silently
+	// depend on the kernel.
+	kernelExisting := op.KernelOpenExisting()
 	if op.Kind == fs.OpCreate && writeIntent(op.Flags) &&
-		op.Flags&uint32(syscall.O_CREAT) != 0 && op.Flags&uint32(syscall.O_TRUNC) != 0 &&
+		op.Flags&uint32(syscall.O_TRUNC) != 0 &&
+		(op.Flags&uint32(syscall.O_CREAT) != 0 || kernelExisting) &&
 		op.Flags&uint32(syscall.O_APPEND) == 0 && !hasSyncOpenFlag(op.Flags) &&
 		b.policy != policyWriteSync {
 		// A prior claim on this path must hand off BEFORE the new claim
@@ -127,9 +136,37 @@ func (b *Bulkfile) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 		// Resolve existence BEFORE claiming, so the claim knows whether the
 		// first boundary must express a truncation (an existing file) or
 		// nothing at all (a fresh create that materializes at the boundary).
-		st, statErr := b.cl.StatCtx(ctx, b.remotePath(op.Path))
-		if statErr != nil && !client.IsNotFound(statErr) {
-			return fs.Result{}, statErr
+		// The kernel already settled existence (v1 read its answer off the
+		// FUSE request, never the wire): a CREATE follows a negative lookup,
+		// an OPEN resolves an existing dentry. Only a synthesized op probes,
+		// and through the chain — the namespace cache answers locally. The
+		// direct remote HEAD here cost every truncate-create one synchronous
+		// round trip before the open (fsmark's create rate), a #1026
+		// misalignment with v1's zero-remote Create.
+		exists := false
+		existingSize := int64(0)
+		switch {
+		case op.KernelCreate():
+			// Fresh by kernel proof: the preceding lookup saw the path
+			// missing. The lookup is not atomic with the create — another
+			// client may create the name in between — so the claim still
+			// reconciles against the open reply below (a non-exclusive
+			// stale negative truncates the file it finds; O_EXCL surfaces
+			// EEXIST from the write plane's probe).
+		case kernelExisting:
+			exists = true
+			// The existing size comes from the open reply's Attr below —
+			// the same cache-first view v1's refreshed inode entry fed
+			// OrigSize.
+		default:
+			attr, probeErr := b.probeExisting(ctx, next, op.Path)
+			if probeErr != nil && !fs.IsNotFound(probeErr) {
+				return fs.Result{}, probeErr
+			}
+			if probeErr == nil && !attr.IsDir() {
+				exists = true
+				existingSize = attr.Size
+			}
 		}
 		h := &streamHandle{
 			b: b, path: op.Path,
@@ -144,7 +181,7 @@ func (b *Bulkfile) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 		h.openFlags = op.Flags&^uint32(syscall.O_TRUNC|syscall.O_EXCL) | uint32(syscall.O_CREAT)
 		innerOp := *op
 		innerOp.Flags &^= uint32(syscall.O_TRUNC)
-		if statErr == nil {
+		if exists {
 			if op.Flags&uint32(syscall.O_EXCL) != 0 {
 				return fs.Result{}, syscall.EEXIST
 			}
@@ -154,8 +191,6 @@ func (b *Bulkfile) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 			// image against it. The truncation is pending until the first
 			// boundary pushes the (shorter) image.
 			innerOp.Flags &^= uint32(syscall.O_CREAT)
-			h.pushed = st.Size
-			h.dirty = st.Size > 0
 		}
 		// Fresh file: keep O_CREAT so the plane below answers with its
 		// lazy create (no remote effect until the boundary); even `: >
@@ -163,10 +198,63 @@ func (b *Bulkfile) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 		// Release.
 		res, err := next(ctx, &innerOp)
 		if err != nil {
-			return res, err
+			if kernelExisting && exists && fs.IsNotFound(err) && op.Flags&uint32(syscall.O_EXCL) == 0 {
+				// Stale kernel dentry: the open below found no remote row.
+				// Fall back to the fresh-create branch (v1 semantics: the
+				// name materializes at the boundary) instead of failing an
+				// open the kernel had already resolved.
+				retry := innerOp
+				retry.Flags |= uint32(syscall.O_CREAT)
+				res, err = next(ctx, &retry)
+				exists = false
+				existingSize = 0
+			}
+			if err != nil {
+				return res, err
+			}
 		}
 		if res.Handle == nil {
 			return res, nil
+		}
+		switch {
+		case res.Attr != nil && !res.Attr.IsDir() && res.Attr.Size > 0:
+			// The plane below resolved REAL existing content. That is the
+			// kernel OPEN's dentry — or a CREATE whose negative lookup went
+			// stale between the kernel's lookup and this request (another
+			// client created the name; the write plane's own probe takes
+			// its existing-file branch and answers with the row's real
+			// size). Either way the first boundary must express the
+			// truncation down from that content: an empty or shorter image
+			// publishes as a truncating overwrite, never as "nothing to
+			// do" over the old bytes.
+			h.pushed = res.Attr.Size
+			h.dirty = true
+		case exists && res.Attr == nil:
+			// A kernel OPEN resolved an existing dentry but the open below
+			// returned no attributes (a localize overlay handle whose
+			// Stat failed): the existing size is unknown. Force the first
+			// boundary to express the truncation explicitly instead of
+			// assuming the file is empty.
+			h.sizeUnknown = true
+			h.dirty = true
+		case exists && existingSize > 0:
+			// The synthesized-op probe saw content the reply no longer
+			// carries: keep the probe's size as the truncation base.
+			h.pushed = existingSize
+			h.dirty = true
+		}
+		if kernelExisting && !h.modeKnown && res.Attr != nil {
+			// A kernel OPEN of an existing file carries no mode of its own
+			// (FUSE OPEN dispatches OpCreate without one), so the claim
+			// initialized mode-unknown — but the open reply just answered
+			// with the file's REAL mode, an explicit 000 included (core's
+			// attrOf distinguishes HasMode from an absent mode: a chmod(000)
+			// file answers Mode 0, and root may still open it writable).
+			// Adopt whatever the reply carried: without this, the claim
+			// reported the 0644 default although no chmod ever happened —
+			// for 0600 and for 000 alike.
+			h.mode = res.Attr.Mode & 0o777
+			h.modeKnown = true
 		}
 		h.inner = res.Handle
 		b.track(h)
@@ -570,6 +658,35 @@ func (b *Bulkfile) remotePath(p string) string {
 		return b.root
 	}
 	return b.root + p
+}
+
+// bulkProbeDeadline bounds the synthesized-op existence probe (the write
+// plane's probeDeadline).
+const bulkProbeDeadline = 30 * time.Second
+
+// probeExisting resolves a path through the chain below — never a raw
+// remote HEAD — for the synthesized-op claim (no kernel request to read
+// existence from). The namespace cache answers paths this mount already
+// knows, so the probe costs a remote round trip only on a cold miss, and
+// the pending overlays below answer paths this mount is still landing.
+func (b *Bulkfile) probeExisting(ctx context.Context, next fs.Next, path string) (fs.Attr, error) {
+	// The probe detaches from the FUSE cancel channel (the write plane's
+	// own probe contract): an interrupted open must still resolve the base
+	// it wraps — an aborted probe surfaces EAGAIN, which nothing retries.
+	base := context.WithoutCancel(ctx)
+	probeCtx, cancel := context.WithTimeout(base, bulkProbeDeadline)
+	if dl, ok := ctx.Deadline(); ok && dl.Before(time.Now().Add(bulkProbeDeadline)) {
+		probeCtx, cancel = context.WithDeadline(base, dl)
+	}
+	defer cancel()
+	res, err := next(probeCtx, &fs.Op{Kind: fs.OpGetAttr, Path: path})
+	if err != nil {
+		return fs.Attr{}, err
+	}
+	if res.Attr == nil {
+		return fs.Attr{}, fs.ErrNotFound
+	}
+	return *res.Attr, nil
 }
 
 func (b *Bulkfile) track(h *streamHandle) {
