@@ -356,6 +356,9 @@ type bufferingHandle struct {
 	// success callback running under this path's lock (the same lock the
 	// staging path takes), so no staging can be in flight across the swap.
 	extent fs.Handle
+	// releasing marks a descriptor whose teardown has begun. Migration must
+	// not adopt it: the engine handle it opened would then have no releaser.
+	releasing bool
 
 	mu    sync.Mutex
 	buf   *writebuffer.WriteBuffer
@@ -2197,7 +2200,7 @@ func (w *Writeback) migrateHandleToExtent(path, snapshotID string, committedRev 
 		return
 	}
 	h.mu.Lock()
-	if h.extent != nil || h.pendingImage != nil || h.pendingFile != nil || !h.landed {
+	if h.extent != nil || h.unlinked || h.releasing || h.pendingImage != nil || h.pendingFile != nil || !h.landed {
 		h.mu.Unlock()
 		return
 	}
@@ -2231,7 +2234,7 @@ func (w *Writeback) migrateHandleToExtent(path, snapshotID string, committedRev 
 // and this call keeps the handle on its own buffer.
 func (w *Writeback) adoptExtentHandle(h *bufferingHandle, e fs.Handle) bool {
 	h.mu.Lock()
-	if h.extent != nil || h.unlinked || !h.landed {
+	if h.extent != nil || h.unlinked || h.releasing || !h.landed {
 		h.mu.Unlock()
 		return false
 	}
@@ -3536,13 +3539,20 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 
 // Release implements fs.Handle.
 func (h *bufferingHandle) Release(ctx context.Context) error {
-	// Migrated: the engine handle owns the remaining state. Releasing it
-	// publishes (last-close materialization included) and retires the
-	// engine-side descriptor; this plane contributed nothing after the
-	// migration, so there is no buffer to drain.
+	// Migrated: the engine handle owns the bytes, but THIS plane still owns
+	// the descriptor's lifecycle. Returning early here skipped the ledger
+	// unpin, the core terminal release and — worst — untrackAndLast, which
+	// left the handle in the live registry forever: a stale live entry makes
+	// the plane believe a writer is still open at the path, so the mount's
+	// drain never completes and later namespace work blocks on it.
 	if e := h.extentHandle(); e != nil {
-		return e.Release(ctx)
+		return h.releaseMigrated(ctx, e)
 	}
+	// A concurrent migration must not adopt a handle that is already
+	// tearing down (see adoptExtentHandle).
+	h.mu.Lock()
+	h.releasing = true
+	h.mu.Unlock()
 	// The lazy ledger view's pinned shadow generation is dropped ONLY after
 	// every return path below has finished with the buffer — the close-time
 	// staging reads unloaded parts through that pin (EnsurePartsForWrite →
@@ -3671,6 +3681,59 @@ func (h *bufferingHandle) Release(ctx context.Context) error {
 	err := h.commitLocked(ctx)
 	if h.inner != nil {
 		if relErr := h.inner.Release(ctx); err == nil {
+			err = relErr
+		}
+	}
+	return err
+}
+
+// releaseMigrated retires a descriptor whose data plane moved to the engine.
+// It mirrors Release's teardown exactly — the engine release is ADDITIONAL,
+// never a replacement: this plane created the core terminal handle and owns
+// the registry entry, so both must still be retired here.
+func (h *bufferingHandle) releaseMigrated(ctx context.Context, e fs.Handle) error {
+	path := h.infoSnapshot().path
+	err := e.Release(ctx)
+
+	h.mu.Lock()
+	ledgerGen := h.ledgerShadowGen
+	h.ledgerShadowGen = 0
+	pendingShadow := h.pendingShadowGen
+	h.pendingShadowGen = 0
+	pendingFile := h.pendingFile
+	h.pendingFile = nil
+	h.pendingFileSize = 0
+	snapshotFile := h.snapshotFile
+	h.snapshotFile = nil
+	inner := h.inner
+	h.mu.Unlock()
+
+	if ledgerGen != 0 && h.w.opts.Staging != nil {
+		h.w.opts.Staging.Shadow.Unpin(ledgerGen)
+	}
+	if pendingShadow != 0 && h.w.opts.Staging != nil {
+		h.w.opts.Staging.Shadow.Unpin(pendingShadow)
+	}
+	if pendingFile != nil {
+		_ = pendingFile.Close()
+	}
+	if snapshotFile != nil {
+		_ = snapshotFile.Close()
+	}
+	if h.w.debounce != nil {
+		h.w.debounce.Cancel(path)
+	}
+	// An anonymous descriptor still owns its unlink snapshot; the LAST one
+	// reclaims it.
+	last := h.w.untrackAndLast(h)
+	if last && h.w.unlinkedShadowServed(path) {
+		h.w.dropUnlinkedShadow(path)
+	}
+	// The descriptor was OPENED through the core plane, which registered a
+	// terminal handle of its own. The engine handle is a second, separate
+	// one; releasing only that leaves this registration behind.
+	if inner != nil {
+		if relErr := inner.Release(ctx); err == nil {
 			err = relErr
 		}
 	}

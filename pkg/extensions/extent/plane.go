@@ -265,11 +265,24 @@ func (h *Handler) OpenExisting(ctx context.Context, path string, flags uint32, e
 	if expectRevision > 0 && st.Revision != expectRevision {
 		return nil, false, nil
 	}
-	handle, _, errno := h.openExistingLocked(ctx, path, flags, c)
+	// The descriptor was opened BEFORE the promotion and every write it made
+	// is already in the staged image the promotion just published. Replaying
+	// the open's truncate/create flags here would discard that image (O_TRUNC)
+	// or re-run create semantics this plane must not repeat. Only the access
+	// mode and append flag carry over.
+	handle, _, errno := h.openExistingLocked(ctx, path, migrateOpenFlags(flags), c)
 	if errno != 0 {
 		return nil, false, errno
 	}
 	return handle, true, nil
+}
+
+// migrateOpenFlags reduces an original open's flags to the ones that describe
+// ONGOING access: the mode bits (read/write) plus append. Create and truncate
+// intent was already satisfied by the original open, and re-applying it to a
+// live object is destructive.
+func migrateOpenFlags(flags uint32) uint32 {
+	return flags & uint32(syscall.O_ACCMODE|syscall.O_APPEND)
 }
 
 // Do claims extent files (and, in full mode, fresh creates); everything

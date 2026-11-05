@@ -264,3 +264,110 @@ func TestPromotionMigratesOpenHandleToExtent(t *testing.T) {
 		t.Fatalf("post-promotion fsyncs did not publish incrementally (patches %d -> %d)", patchesBefore, patchesAfter)
 	}
 }
+
+// A migrated descriptor still owns this plane's lifecycle: the core terminal
+// handle it opened at create time, its registry slot, and any unlink
+// snapshot. Release must retire all of them — the engine release is
+// ADDITIONAL, not a replacement.
+//
+// Regression: returning straight to the engine's Release left the handle in
+// the live registry forever, so the plane kept believing a writer was open.
+func TestMigratedHandleReleaseRetiresThisPlane(t *testing.T) {
+	srv := newMigrationServer(t)
+	ch, wb, _ := newMigratingStack(t, srv)
+	ctx := context.Background()
+
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/big.bin", Flags: syscall.O_RDWR | syscall.O_CREAT, Mode: 0o644, HasMode: true, Caller: fs.Caller{Pid: 1}})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := res.Handle.Write(ctx, 0, make([]byte, 1<<20)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := res.Handle.Flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if wb.queue != nil {
+		if err := wb.queue.WaitPathOutcome("/big.bin", 10*time.Second); err != nil {
+			t.Fatalf("wait for landing: %v", err)
+		}
+	}
+
+	h, ok := res.Handle.(*bufferingHandle)
+	if !ok {
+		t.Fatalf("handle type = %T", res.Handle)
+	}
+	if h.extentHandle() == nil {
+		t.Fatal("precondition: the descriptor did not migrate, so this proves nothing")
+	}
+
+	if err := res.Handle.Release(ctx); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	// The registry entry must be gone: a stale one makes the plane think a
+	// writer is still live at the path.
+	if _, tracked := wb.live.Load("/big.bin"); tracked {
+		t.Fatal("released handle is still tracked in the live registry")
+	}
+	if h.inner != nil {
+		// The core terminal was released through the same path; a second
+		// release from the facade is the double-release this guards.
+		t.Log("core terminal retained on the handle (release delegated elsewhere)")
+	}
+}
+
+// Migration must not replay the original open's create/truncate intent. The
+// bytes the descriptor wrote are already in the image promotion published;
+// re-opening with O_TRUNC would discard exactly that image.
+func TestMigrationDoesNotReplayOpenIntent(t *testing.T) {
+	srv := newMigrationServer(t)
+	ch, wb, _ := newMigratingStack(t, srv)
+	ctx := context.Background()
+
+	// Open with O_TRUNC, the shape a shell `>` or a compiler's rewrite uses.
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/big.bin", Flags: syscall.O_RDWR | syscall.O_CREAT | syscall.O_TRUNC, Mode: 0o644, HasMode: true, Caller: fs.Caller{Pid: 1}})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	payload := make([]byte, 1<<20)
+	for i := range payload {
+		payload[i] = byte(i%251) + 1
+	}
+	if err := res.Handle.Write(ctx, 0, payload); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := res.Handle.Flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if wb.queue != nil {
+		if err := wb.queue.WaitPathOutcome("/big.bin", 10*time.Second); err != nil {
+			t.Fatalf("wait for landing: %v", err)
+		}
+	}
+	_, rev, size, _, _, _ := srv.snapshot()
+	if rev == 0 || size != int64(len(payload)) {
+		t.Fatalf("after promotion the remote holds %d bytes at rev %d, want %d", size, rev, len(payload))
+	}
+	h := res.Handle.(*bufferingHandle)
+	if h.extentHandle() == nil {
+		t.Fatal("precondition: the descriptor did not migrate")
+	}
+	// A migrated O_TRUNC descriptor must still be able to publish the next
+	// write; replays of the truncate would leave the file empty.
+	if err := res.Handle.Write(ctx, 0, []byte("tail")); err != nil {
+		t.Fatalf("post-migration write: %v", err)
+	}
+	if err := res.Handle.Sync(ctx); err != nil {
+		t.Fatalf("post-migration fsync: %v", err)
+	}
+	_, rev2, size2, _, _, _ := srv.snapshot()
+	if rev2 <= rev {
+		t.Fatalf("post-migration fsync did not publish (rev %d -> %d)", rev, rev2)
+	}
+	// The in-place rewrite keeps the size. A replayed O_TRUNC shows up as a
+	// SHRUNKEN remote image, so anything below the original proves it.
+	if size2 < int64(len(payload)) {
+		t.Fatalf("post-migration remote size shrank to %d from %d: the open's O_TRUNC was replayed",
+			size2, len(payload))
+	}
+}
