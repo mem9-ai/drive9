@@ -119,13 +119,8 @@ func readLocalDevKeyFile(path string) ([]byte, error) {
 	if !info.Mode().IsRegular() {
 		return nil, fmt.Errorf("local dev key file %s is not a regular file", path)
 	}
-	if perm := info.Mode().Perm(); perm&0o077 != 0 {
-		return nil, fmt.Errorf(
-			"local dev key file %s has mode %04o; it must not be readable by group or other users (chmod 600, or delete it to generate a new pair)",
-			path, perm)
-	}
-	if ownerErr := checkLocalDevKeyFileOwner(path, info); ownerErr != nil {
-		return nil, ownerErr
+	if permErr := checkLocalDevKeyPermissions(path, info); permErr != nil {
+		return nil, permErr
 	}
 	return os.ReadFile(path)
 }
@@ -164,10 +159,8 @@ func installLocalDevKeys(path string, keys localDevKeys) (bool, error) {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return false, fmt.Errorf("create local dev key dir %s: %w", dir, err)
 		}
-		if info, statErr := os.Lstat(dir); statErr == nil && info.Mode().Perm()&0o077 != 0 {
-			if chmodErr := os.Chmod(dir, 0o700); chmodErr != nil {
-				return false, fmt.Errorf("local dev key dir %s must not be accessible to other users: %w", dir, chmodErr)
-			}
+		if dirErr := restrictLocalDevKeyDir(dir); dirErr != nil {
+			return false, dirErr
 		}
 	}
 	raw, err := json.MarshalIndent(keys, "", "  ")
