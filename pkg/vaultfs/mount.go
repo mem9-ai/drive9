@@ -47,19 +47,9 @@ func MountVault(opts *VaultMountOptions) error {
 		return err
 	}
 
-	vfs := NewVaultFS(c, opts.DirTTL)
+	vfs := NewVaultFSWithOptions(c, opts.DirTTL, opts.AllowOther)
 
-	fuseOpts := &gofuse.MountOptions{
-		FsName:     "drive9-vault",
-		Name:       "drive9-vault",
-		Debug:      opts.Debug,
-		AllowOther: opts.AllowOther,
-		// Always read-only at the kernel level too (belt-and-braces with
-		// the in-process EROFS rejections).
-		Options: []string{"ro"},
-	}
-
-	server, err := gofuse.NewServer(vfs, opts.MountPoint, fuseOpts)
+	server, err := gofuse.NewServer(vfs, opts.MountPoint, newVaultMountOptions(opts))
 	if err != nil {
 		return fmt.Errorf("fuse mount vault: %w", err)
 	}
@@ -120,6 +110,29 @@ func MountVault(opts *VaultMountOptions) error {
 	fmt.Fprintf(os.Stderr, "drive9: vault mounted on %s (server: %s, secrets: %d)\n", opts.MountPoint, opts.Server, len(secrets))
 	server.Wait()
 	return nil
+}
+
+// newVaultMountOptions assembles the kernel mount options for a vault mount.
+//
+// allow_other without default_permissions leaves access to the filesystem's own
+// permission checks, so every local user could read the plaintext secrets in the
+// mount. default_permissions makes the kernel enforce the 0400/0500 modes that
+// VaultFS reports for a private mount (0444/0555 for an explicitly shared one).
+// Mirrors newGoFuseMountOptions in pkg/fuse.
+func newVaultMountOptions(opts *VaultMountOptions) *gofuse.MountOptions {
+	fuseOpts := &gofuse.MountOptions{
+		FsName:     "drive9-vault",
+		Name:       "drive9-vault",
+		Debug:      opts.Debug,
+		AllowOther: opts.AllowOther,
+		// Always read-only at the kernel level too (belt-and-braces with
+		// the in-process EROFS rejections).
+		Options: []string{"ro"},
+	}
+	if opts.AllowOther && runtime.GOOS == "linux" {
+		fuseOpts.Options = append(fuseOpts.Options, "default_permissions")
+	}
+	return fuseOpts
 }
 
 // probeVaultMount validates opts, constructs the vault client, and runs the

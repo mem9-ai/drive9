@@ -67,6 +67,12 @@ type VaultFS struct {
 
 	uid uint32
 	gid uint32
+
+	// shared reports that the mount is served with allow_other. The vault holds
+	// plaintext secrets, so the default tree is owner-only (0500/0400); only an
+	// explicit shared mount widens it to world-readable, where the kernel's
+	// default_permissions enforcement decides who may read it.
+	shared bool
 }
 
 type vaultOpenFile struct {
@@ -77,6 +83,12 @@ type vaultOpenFile struct {
 // as the kernel entry/attr TTL hint only — there is intentionally no
 // in-process auth-decision cache (see listSecrets for the Row E rationale).
 func NewVaultFS(c *client.Client, dirTTL time.Duration) *VaultFS {
+	return NewVaultFSWithOptions(c, dirTTL, false)
+}
+
+// NewVaultFSWithOptions also selects the permission shape: private (owner-only)
+// mounts report 0500/0400, shared (allow_other) mounts report 0555/0444.
+func NewVaultFSWithOptions(c *client.Client, dirTTL time.Duration, shared bool) *VaultFS {
 	if dirTTL <= 0 {
 		dirTTL = 5 * time.Second
 	}
@@ -90,6 +102,7 @@ func NewVaultFS(c *client.Client, dirTTL time.Duration) *VaultFS {
 		openFiles:     make(map[uint64]*vaultOpenFile),
 		uid:           uint32(os.Getuid()),
 		gid:           uint32(os.Getgid()),
+		shared:        shared,
 	}
 	fs.pathToInode["/"] = 1
 	fs.inodeToPath[1] = "/"
@@ -439,9 +452,26 @@ func (fs *VaultFS) readSecret(ctx context.Context, secretName string) (map[strin
 }
 
 // fillDirAttr populates an Attr struct for a directory inode.
+// dirPerm and filePerm are the modes the kernel enforces through
+// default_permissions. Plaintext secrets are owner-only unless the operator
+// explicitly mounted the tree as shared.
+func (fs *VaultFS) dirPerm() uint32 {
+	if fs.shared {
+		return 0o555
+	}
+	return 0o500
+}
+
+func (fs *VaultFS) filePerm() uint32 {
+	if fs.shared {
+		return 0o444
+	}
+	return 0o400
+}
+
 func (fs *VaultFS) fillDirAttr(out *gofuse.Attr, ino uint64) {
 	out.Ino = ino
-	out.Mode = syscall.S_IFDIR | 0o555
+	out.Mode = syscall.S_IFDIR | fs.dirPerm()
 	out.Nlink = 2
 	out.Uid = fs.uid
 	out.Gid = fs.gid
@@ -450,7 +480,7 @@ func (fs *VaultFS) fillDirAttr(out *gofuse.Attr, ino uint64) {
 // fillFileAttr populates an Attr struct for a regular field inode.
 func (fs *VaultFS) fillFileAttr(out *gofuse.Attr, ino uint64, size int64) {
 	out.Ino = ino
-	out.Mode = syscall.S_IFREG | 0o444
+	out.Mode = syscall.S_IFREG | fs.filePerm()
 	out.Nlink = 1
 	out.Size = uint64(size)
 	out.Uid = fs.uid

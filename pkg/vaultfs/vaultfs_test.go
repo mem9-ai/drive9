@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -552,4 +553,63 @@ func TestVaultMountReadDirOffsetOverflowSafe(t *testing.T) {
 			}
 		}
 	}
+}
+
+// The vault serves plaintext secrets, so the default tree must be owner-only and
+// a shared mount must still let the kernel enforce that shape. A missing
+// default_permissions option or a world-readable default mode is the exposure
+// this pins.
+func TestVaultPermissionsAreOwnerOnlyUnlessShared(t *testing.T) {
+	privateFS := NewVaultFS(nil, time.Second)
+	var privateDir, privateFile gofuse.Attr
+	privateFS.fillDirAttr(&privateDir, 2)
+	privateFS.fillFileAttr(&privateFile, 3, 5)
+	if got := privateDir.Mode & 0o777; got != 0o500 {
+		t.Errorf("private dir mode = %04o, want 0500", got)
+	}
+	if got := privateFile.Mode & 0o777; got != 0o400 {
+		t.Errorf("private file mode = %04o, want 0400", got)
+	}
+
+	sharedFS := NewVaultFSWithOptions(nil, time.Second, true)
+	var sharedDir, sharedFile gofuse.Attr
+	sharedFS.fillDirAttr(&sharedDir, 2)
+	sharedFS.fillFileAttr(&sharedFile, 3, 5)
+	if got := sharedDir.Mode & 0o777; got != 0o555 {
+		t.Errorf("shared dir mode = %04o, want 0555", got)
+	}
+	if got := sharedFile.Mode & 0o777; got != 0o444 {
+		t.Errorf("shared file mode = %04o, want 0444", got)
+	}
+}
+
+func TestVaultMountOptionsEnforceKernelPermissionsWhenShared(t *testing.T) {
+	privateOpts := newVaultMountOptions(&VaultMountOptions{})
+	if hasMountOption(privateOpts.Options, "default_permissions") {
+		t.Fatal("a private mount reported default_permissions; modes must not depend on it")
+	}
+	if !hasMountOption(privateOpts.Options, "ro") {
+		t.Fatal("vault mount lost the read-only kernel option")
+	}
+
+	sharedOpts := newVaultMountOptions(&VaultMountOptions{AllowOther: true})
+	if runtime.GOOS != "linux" {
+		// The option is a Linux fusermount flag; darwin uses defer_permissions.
+		t.Skip("default_permissions is Linux-only")
+	}
+	if !hasMountOption(sharedOpts.Options, "default_permissions") {
+		t.Fatal("allow_other without default_permissions exposes the vault to every local user")
+	}
+	if !sharedOpts.AllowOther {
+		t.Fatal("allow_other was not propagated")
+	}
+}
+
+func hasMountOption(opts []string, want string) bool {
+	for _, o := range opts {
+		if o == want {
+			return true
+		}
+	}
+	return false
 }
