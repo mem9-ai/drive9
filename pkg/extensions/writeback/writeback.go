@@ -1613,18 +1613,15 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		}
 		// The commit-stamp obligation window opens here and closes when the
 		// flow's LAST stamp comparison runs (settleOldPrefixAfterMove): every
-		// stamp snapshot below and every landing recorded while it is open is
-		// pinned in the queue, so the commit-stamp table's reclamation can
-		// never hide a landing a delta comparison or rekey fence still has
-		// to observe. The defer covers every exit below, including the
-		// EIO-returning transition failures.
+		// stamp snapshot below and every landing recorded inside the window's
+		// universe is pinned to the window, so the commit-stamp table's
+		// reclamation can never hide a landing a delta comparison or rekey
+		// fence still has to observe. The defer covers every exit below,
+		// including the EIO-returning transition failures.
+		var commitSeqWin *CommitSeqWindow
 		if w.queue != nil {
-			w.queue.BeginCommitSeqWindow()
-			defer w.queue.EndCommitSeqWindow()
-			// The renamed pathname itself is under neither rename prefix, so
-			// no prefix snapshot pins it — pin it for the second pass's delta
-			// baseline read.
-			w.queue.PinCommitSeq(op.Path, op.Path2)
+			commitSeqWin = w.queue.BeginCommitSeqWindow(op.Path, op.Path2)
+			defer commitSeqWin.End()
 		}
 		// The destination's pending-generation snapshot, taken BEFORE the
 		// RPC: pending generations come from one global counter, so a
@@ -1637,10 +1634,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		// released its locks, and a destination whose re-driven upload landed
 		// meanwhile has fulfilled the source record's obligation — the rekey
 		// declines instead of re-installing stale EIO over the landing.
-		dstLandedSnaps := map[string]uint64{}
-		if w.queue != nil {
-			dstLandedSnaps = w.queue.LandedSnapshotsForRename(op.Path2, strings.TrimSuffix(op.Path2, "/")+"/")
-		}
+		dstLandedSnaps := commitSeqWin.LandedSnapshotsForRename(op.Path2, strings.TrimSuffix(op.Path2, "/")+"/")
 		dstPreGen := map[string]uint64{}
 		if w.opts.Staging != nil && w.opts.Staging.Pending != nil {
 			if m, ok := w.opts.Staging.Pending.GetMeta(op.Path2); ok && m != nil {
@@ -1673,8 +1667,17 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		// payload conditions: that is the durable witness for "completed
 		// during the window". Snapshot it for the old prefix.
 		queueLandedSnap := map[string]uint64{}
+		// The endpoint's own pre-RPC baseline, read separately: the old name
+		// is never under its own prefix (no trailing slash), so the
+		// descendant snapshot below carries no stamp for it. Without this
+		// baseline every previously committed source reads as "landed during
+		// the window" against a zero, and a legitimate remote recreation of
+		// the old name by another client would fail a clean rename with EIO
+		// and a false destination witness.
+		preRPCCommitSeq := uint64(0)
 		if w.queue != nil {
-			queueLandedSnap = w.queue.CommitSeqsUnderPrefix(strings.TrimSuffix(op.Path, "/") + "/")
+			queueLandedSnap = commitSeqWin.CommitSeqsUnderPrefix(strings.TrimSuffix(op.Path, "/") + "/")
+			preRPCCommitSeq = w.queue.CommitSeq(op.Path)
 		}
 		// A rename over an OPEN target replaces the object its descriptors
 		// were reading: mark them anonymous BEFORE the remote rename (their
@@ -1714,7 +1717,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		// possibly resurrecting, the obsolete name before the response
 		// arrived) left the queue idle but a landed watermark behind.
 		windowWork := (w.queue != nil && w.queue.HasPath(op.Path)) || w.everLanded(op.Path) ||
-			(w.queue != nil && pathCommitSeq > queueLandedSnap[op.Path])
+			(w.queue != nil && pathCommitSeq > preRPCCommitSeq)
 		// The same for the old prefix's children: the pending set right after
 		// the rename plus any child that landed during the RPC (its pending
 		// entry is gone, so only the landed watermark records it); a child

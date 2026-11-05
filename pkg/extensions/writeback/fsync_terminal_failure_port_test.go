@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -49,6 +50,13 @@ type failingWritesBackend struct {
 
 	renameGate chan struct{}
 	gated      chan struct{}
+
+	// statNeedle, when nonempty, arms counting of HEAD/GET requests whose
+	// URL path contains the needle: a test arms it at a precise point (the
+	// parked rename resuming) and asserts whether the flow probed a name it
+	// had no business statting afterwards.
+	statNeedle string
+	statHits   int
 }
 
 func (b *failingWritesBackend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -56,6 +64,7 @@ func (b *failingWritesBackend) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	fail := b.fail
 	failStat := b.failStat
 	gate := b.renameGate
+	statNeedle := b.statNeedle
 	if gate != nil && r.URL.Query().Has("rename") {
 		b.renameGate = nil
 		gated := b.gated
@@ -78,6 +87,11 @@ func (b *failingWritesBackend) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	b.mu.Unlock()
+	if (r.Method == http.MethodGet || r.Method == http.MethodHead) && statNeedle != "" && strings.Contains(r.URL.Path, statNeedle) {
+		b.mu.Lock()
+		b.statHits++
+		b.mu.Unlock()
+	}
 	if failStat && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
 		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
 		return
@@ -87,6 +101,21 @@ func (b *failingWritesBackend) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	b.backend.ServeHTTP(w, r)
+}
+
+// armStatCounting starts counting HEAD/GET requests whose URL path contains
+// needle, resetting the hit count.
+func (b *failingWritesBackend) armStatCounting(needle string) {
+	b.mu.Lock()
+	b.statNeedle, b.statHits = needle, 0
+	b.mu.Unlock()
+}
+
+// statCount reports the armed counter's hits.
+func (b *failingWritesBackend) statCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.statHits
 }
 
 func (b *failingWritesBackend) setFail(fail bool) {
@@ -1733,6 +1762,100 @@ func TestPortRenameSecondPassSeesCompletedOldNameLanding(t *testing.T) {
 	}
 	if got, ok := nodeString(fb.backend, "/new-land.txt"); !ok || got != "v1" {
 		t.Fatalf("remote image at the new name = %q ok=%v, want the renamed v1", got, ok)
+	}
+}
+
+// TestPortRenameHistoricalCommitIsNotInWindowWork pins the first pass's
+// endpoint baseline (the #1083 review finding): the source carries a commit
+// stamp from BEFORE the rename, and another client legitimately recreates
+// the old name after the server applies the rename but before this mount
+// receives the response. The old name is never under its own prefix (no
+// trailing slash), so the descendant snapshot carried no baseline for the
+// endpoint and any historical stamp read as "landed during the window"
+// against a zero: the strict old-name check stat'd the legitimately
+// recreated name, recorded a false failure witness at the destination, and
+// failed a clean rename with EIO. The pre-RPC endpoint baseline restricts
+// the comparison to commits that actually happened inside this rename's
+// window, so the rename succeeds without probing the old name at all.
+func TestPortRenameHistoricalCommitIsNotInWindowWork(t *testing.T) {
+	fb := &failingWritesBackend{backend: testbackend.NewBackend()}
+	gate := make(chan struct{})
+	gated := make(chan struct{})
+	fb.renameGate, fb.gated = gate, gated
+	ch, wb := newUploadStack(t, fb, Options{Policy: PolicyWriteBack})
+	ctx := context.Background()
+
+	// Committed history at the source: its commit stamp predates the rename.
+	h := open(t, ch, "/hist-a.txt")
+	if err := h.Write(ctx, 0, []byte("committed history")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if seq := wb.queue.CommitSeq("/hist-a.txt"); seq == 0 {
+		t.Fatal("the source never got a commit stamp")
+	}
+
+	// A second mount sharing only the backend plays the other client.
+	ch2, _ := newUploadStack(t, fb, Options{Policy: PolicyWriteBack})
+
+	renamed := make(chan error, 1)
+	go func() {
+		_, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/hist-a.txt", Path2: "/hist-b.txt"})
+		renamed <- err
+	}()
+	select {
+	case <-gated:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the rename request never reached the backend")
+	}
+	// The server has applied the rename and the response is parked: the
+	// other client legitimately recreates the old name in that gap. Nothing
+	// of THIS mount ever lands under it during the window.
+	other := open(t, ch2, "/hist-a.txt")
+	if err := other.Write(ctx, 0, []byte("recreated by another client")); err != nil {
+		t.Fatal(err)
+	}
+	if err := other.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// From here on (the response resuming), this rename has no in-window
+	// work and must not probe the old name.
+	fb.armStatCounting("/hist-a.txt")
+	close(gate)
+
+	select {
+	case err := <-renamed:
+		if err != nil {
+			t.Fatalf("clean rename reported %v, want success", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the rename never completed")
+	}
+	if err := wb.queue.PathTerminalFailure("/hist-b.txt"); err != nil {
+		t.Fatalf("a false failure witness was recorded at the destination: %v", err)
+	}
+	if m, ok := wb.opts.Staging.Pending.GetMeta("/hist-b.txt"); ok && m != nil && m.Kind == staging.PendingConflict {
+		t.Fatalf("destination pending entry = %+v, want no conflict marker", m)
+	}
+	if n := fb.statCount(); n != 0 {
+		t.Fatalf("the rename probed the old name %d times after the response, want none (no in-window work existed)", n)
+	}
+	// The renamed image stays intact and a clean fsync of the new name
+	// succeeds — no false witness poisons it.
+	fresh := open(t, ch, "/hist-b.txt")
+	if err := fresh.Sync(ctx); err != nil {
+		t.Fatalf("clean fsync on the renamed destination = %v, want nil", err)
+	}
+	if got, ok := nodeString(fb.backend, "/hist-a.txt"); !ok || got != "recreated by another client" {
+		t.Fatalf("remote image at the old name = %q ok=%v, want the other client's recreation untouched", got, ok)
+	}
+	if got, ok := nodeString(fb.backend, "/hist-b.txt"); !ok || got != "committed history" {
+		t.Fatalf("remote image at the new name = %q ok=%v, want the renamed history", got, ok)
 	}
 }
 
