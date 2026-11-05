@@ -366,3 +366,34 @@ func TestPortKernelOpenClaimKeepsExistingMode(t *testing.T) {
 	}
 	_ = sh.Release(ctx)
 }
+
+// TestPortKernelOpenClaimKeepsExplicitZeroMode pins the harder half of the
+// mode finding: a file already at chmod(000) BEFORE the open (root may open
+// it writable — the FUSE gate permits uid 0) answers Mode 0 with HasMode
+// semantics; the claim must adopt the explicit zero, not skip adoption and
+// report the 0644 default.
+func TestPortKernelOpenClaimKeepsExplicitZeroMode(t *testing.T) {
+	below := &stubBelow{size: 512, rev: 4, mode: 0}
+	ch, b := claimStack(t, below)
+	ctx := context.Background()
+
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/zero.bin",
+		Flags:  uint32(syscall.O_WRONLY | syscall.O_TRUNC),
+		Kernel: &gofuse.OpenIn{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sh, ok := res.Handle.(*streamHandle)
+	if !ok {
+		t.Fatalf("handle = %T, want *streamHandle", res.Handle)
+	}
+	assertNoDirectRemote(t, b)
+	have, ok := sh.overlayAttr()
+	if !ok {
+		t.Fatal("claim has no overlay attributes")
+	}
+	if have.Mode != 0 {
+		t.Fatalf("claimed mode = %o, want the file's explicit 000 (no chmod happened)", have.Mode)
+	}
+	_ = sh.Release(ctx)
+}
