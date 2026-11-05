@@ -77,12 +77,9 @@ func checkLocalDevKeyDir(dir string) error {
 			"local dev key dir %s is mode %04o, so other users can delete the key file and force a rotation; run 'chmod go-w %s' or point %s at a directory only this user can write",
 			dir, perm, dir, EnvLocalDevKeyFile)
 	}
-	// A writable ancestor defeats the directory check: rename/delete needs only
-	// write access on the parent, so /shared (0775) above a 0700 keys/ directory
-	// still lets another user move the directory aside and substitute one holding
-	// a stale key file. Walk the existing ancestors with the same rule, allowing
-	// root-owned components and sticky directories (/tmp), which is exactly what
-	// the sticky bit protects.
+	// A writable ancestor defeats the directory check, so the ancestors are walked
+	// too; checkLocalDevKeyAncestors owns the trusted-owner rule and the sticky
+	// exception, so it is defined in exactly one place.
 	return checkLocalDevKeyAncestors(dir)
 }
 

@@ -508,9 +508,6 @@ func TestLocalDevKeysRejectWritableAncestor(t *testing.T) {
 // 1000 is a system account" ceiling would trust exactly the users this check
 // exists to distrust.
 func TestLocalDevKeyTrustedOwnerIsNotARange(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("the owner checks are Unix-only")
-	}
 	uid := os.Getuid()
 	if !localDevKeyTrustedOwner(0) {
 		t.Fatal("root must be trusted")

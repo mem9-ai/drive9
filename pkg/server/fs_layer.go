@@ -904,6 +904,21 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 		writeFSLayerStoreError(w, r, err)
 		return
 	}
+	// Every return below happens while the layer is "committing", a state with no
+	// exit in the API: a re-commit requires active/sealed, rollback requires
+	// active/sealed/conflicted, and chain deletion refuses it. The transition is
+	// therefore a single deferred guard on a context that survives client
+	// cancellation — a disconnect cancels r.Context() and would otherwise skip the
+	// update and strand the layer.
+	commitCtx := context.WithoutCancel(r.Context())
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		_ = store.SetFSLayerStateIf(commitCtx, layer.LayerID,
+			[]datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
+	}()
 	// Child: flatten overlay then diff vs live main (D18/D19).
 	// Root: keep V1 ordered log replay.
 	var (
@@ -920,12 +935,10 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 		entries, err = store.ListFSLayerEntryLog(r.Context(), layer.LayerID)
 	}
 	if err != nil {
-		_ = store.SetFSLayerStateIf(r.Context(), layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
 		writeFSLayerStoreError(w, r, err)
 		return
 	}
 	if conflicts := validateFSLayerCommitScope(layer, entries); len(conflicts) > 0 {
-		_ = store.SetFSLayerStateIf(r.Context(), layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusConflict)
 		_ = json.NewEncoder(w).Encode(fsLayerCommitResponse{
@@ -937,7 +950,6 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 	}
 	conflicts := preflightFSLayerCommit(r.Context(), b, entries, false)
 	if len(conflicts) > 0 {
-		_ = store.SetFSLayerStateIf(r.Context(), layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusConflict)
 		_ = json.NewEncoder(w).Encode(fsLayerCommitResponse{
@@ -956,24 +968,19 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 		entry := &entries[i]
 		if err := s.authorizeFSLayerStorageRefWith(r.Context(), store, ScopeFromContext(r.Context()), entry, decisions); err != nil {
 			s.writeFSLayerStorageRefError(w, r, entry, err)
-			// Every refusal — policy denial or lookup failure — has to leave the
-			// layer in a state the API can still act on. "committing" has no exit:
-			// a re-commit requires active/sealed, rollback requires
-			// active/sealed/conflicted, and chain deletion refuses it.
-			_ = store.SetFSLayerStateIf(r.Context(), layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
+			// Every refusal — policy denial or lookup failure — leaves the layer in
+			// conflicted through the deferred guard above, so the API can act on it.
 			return
 		}
 	}
 	snapshots, err := snapshotFSLayerCommit(r.Context(), b, entries)
 	if err != nil {
-		_ = store.SetFSLayerStateIf(r.Context(), layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
 		logger.Error(r.Context(), "fs_layer_commit_snapshot_budget_exceeded", eventFields(r.Context(), "fs_layer_commit_snapshot_budget_exceeded", "layer_id", layer.LayerID, "error", err)...)
 		metricEvent(r.Context(), "fs_layer_commit", "result", "rejected")
 		errJSON(w, http.StatusRequestEntityTooLarge, err.Error())
 		return
 	}
 	if err := validateFSLayerCommitSnapshots(snapshots); err != nil {
-		_ = store.SetFSLayerStateIf(r.Context(), layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
 		logger.Error(r.Context(), "fs_layer_commit_validate_failed", eventFields(r.Context(), "fs_layer_commit_validate_failed", "layer_id", layer.LayerID, "error", err)...)
 		writeBackendError(w, r, err)
 		return
@@ -997,7 +1004,7 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 		}
 		markFSLayerEntryTouched(touchedPaths, &entries[i])
 	}
-	if err := store.SetFSLayerStateIf(r.Context(), layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateCommitted); err != nil {
+	if err := store.SetFSLayerStateIf(commitCtx, layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateCommitted); err != nil {
 		rollbackErr := rollbackFSLayerCommit(rollbackCtx, b, snapshots)
 		_ = store.SetFSLayerStateIf(rollbackCtx, layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
 		if rollbackErr != nil {
@@ -1009,6 +1016,7 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 		writeBackendError(w, r, err)
 		return
 	}
+	committed = true
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(fsLayerCommitResponse{
 		Status:  "committed",
