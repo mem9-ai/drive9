@@ -316,7 +316,7 @@ func TestPreadFullRejectsShortRead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer src.Close()
+	defer func() { _ = src.Close() }()
 	if _, err := src.Write([]byte("12345")); err != nil {
 		t.Fatal(err)
 	}
