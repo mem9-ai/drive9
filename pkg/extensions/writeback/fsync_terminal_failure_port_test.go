@@ -33,13 +33,14 @@ import (
 // production symptom of the server-side 500s.
 //
 // renameGate, when set, parks the FIRST rename request until the channel
-// closes and reports the parking through gated once. The rename is applied
-// SERVER-SIDE first and only the response is held: a test can stage under
-// the old name while the namespace has already moved — the publication
-// window the pre-rename drain cannot see, including everything that happens
-// between the server-side change and the delayed response. The parked
-// request keeps the fail snapshot from its arrival, so the rename itself
-// still succeeds while everything staged meanwhile fails.
+// closes and reports through gated once the rename has been applied
+// SERVER-SIDE (gated proves the move completed, not merely that the request
+// arrived). Only the response is held: a test can stage under the old name
+// while the namespace has already moved — the publication window the
+// pre-rename drain cannot see, including everything that happens between
+// the server-side change and the delayed response. The parked request keeps
+// the fail snapshot from its arrival, so the rename itself still succeeds
+// while everything staged meanwhile fails.
 type failingWritesBackend struct {
 	backend *testbackend.Backend
 	mu      sync.Mutex
@@ -70,14 +71,17 @@ func (b *failingWritesBackend) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		gated := b.gated
 		b.gated = nil
 		b.mu.Unlock()
+		// Apply the rename server-side FIRST, then signal, then hold only
+		// the response: the namespace has moved while the client still
+		// believes the RPC is in flight, and the gated signal now proves the
+		// move itself completed — the test's in-gap actions (staging under
+		// the old name, recreating it) run against the post-move namespace
+		// deterministically.
+		rec := httptest.NewRecorder()
+		b.backend.ServeHTTP(rec, r)
 		if gated != nil {
 			close(gated)
 		}
-		// Apply the rename server-side, then hold only the response: the
-		// namespace has moved while the client still believes the RPC is in
-		// flight.
-		rec := httptest.NewRecorder()
-		b.backend.ServeHTTP(rec, r)
 		<-gate
 		for k, v := range rec.Header() {
 			w.Header()[k] = v

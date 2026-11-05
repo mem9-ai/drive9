@@ -81,6 +81,21 @@ func TestCommitSeqLifecycleBounded(t *testing.T) {
 		t.Fatalf("commitSeq holds %d stamps right after the window ended, want <= %d without further churn", n, limit)
 	}
 
+	// The same restoration must hold when the OVER-limit mass is the
+	// window's OWN obligation: covered paths pin past the bound while the
+	// window is open, and End alone (no later commit) reclaims them.
+	wide := cq.BeginCommitSeqWindow("/wide", "/wide-dst")
+	for i := 0; i < limit+limit/2; i++ {
+		cq.recordCommitSeq(fmt.Sprintf("/wide/child-%d.txt", i))
+	}
+	if n := stampCount(); n <= limit {
+		t.Fatalf("precondition: the pinned covered paths grew the table to only %d, want > %d", n, limit)
+	}
+	wide.End()
+	if n := stampCount(); n > limit {
+		t.Fatalf("commitSeq holds %d stamps right after the covered window ended, want <= %d reclaimed immediately", n, limit)
+	}
+
 	// Overlapping windows keep progress: each window's close drops exactly
 	// ITS pins, so a finished rename never waits for the last sibling.
 	a := cq.BeginCommitSeqWindow("/ov/a", "/ov/a-dst")
