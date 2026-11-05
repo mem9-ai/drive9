@@ -3216,22 +3216,91 @@ func (cq *CommitQueue) CancelQueuedForRename(path string) error {
 	return nil
 }
 
+// LandedSeq reports the landed landmark stamp for path (0 when none): the
+// rename flow snapshots it before the transfer so the failure-record rekey
+// can decline to move a record onto a destination whose re-driven upload
+// has already landed — the landing fulfilled the obligation the record
+// describes, and re-installing it after the fact would answer stale EIO
+// forever.
+func (cq *CommitQueue) LandedSeq(path string) uint64 {
+	if cq == nil {
+		return 0
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	return cq.landed[path].lastUsed
+}
+
+// LandedSnapshotsForRename snapshots the landed landmark stamps a rename's
+// failure-record rekeys fence against: the destination name itself (its
+// landmark key carries no trailing slash, so a prefix scan alone misses it)
+// plus every path under the destination prefix.
+func (cq *CommitQueue) LandedSnapshotsForRename(newPath, newPrefix string) map[string]uint64 {
+	if cq == nil {
+		return nil
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	out := map[string]uint64{}
+	for path, landmark := range cq.landed {
+		if path == newPath || strings.HasPrefix(path, newPrefix) {
+			out[path] = landmark.lastUsed
+		}
+	}
+	return out
+}
+
+// LandedSeqsUnderPrefix snapshots every landed landmark stamp under prefix.
+func (cq *CommitQueue) LandedSeqsUnderPrefix(prefix string) map[string]uint64 {
+	if cq == nil {
+		return nil
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	out := map[string]uint64{}
+	for path, landmark := range cq.landed {
+		if strings.HasPrefix(path, prefix) {
+			out[path] = landmark.lastUsed
+		}
+	}
+	return out
+}
+
 // RenameTerminalFailure moves a completed rename's endpoint records with the
 // object: the source's record (standalone ones included — their bytes sit
 // under an even older name, and the retargeted handle's next barrier checks
 // the NEW path) transfers to the destination, and the destination's previous
 // record dies with its replaced incarnation. Clearing both the way the caller
 // once did would strand a standalone witness at the dead source name.
-func (cq *CommitQueue) RenameTerminalFailure(oldPath, newPath string) {
+func (cq *CommitQueue) RenameTerminalFailure(oldPath, newPath string, landedSnaps map[string]uint64) {
 	if cq == nil || oldPath == newPath {
 		return
 	}
 	cq.mu.Lock()
 	defer cq.mu.Unlock()
+	// The rekey runs after the transfer released its locks: the destination
+	// worker may have landed the re-driven replacement in between, which
+	// fulfills the source record's obligation (and clears the destination
+	// record). Moving the record onto that landing would reinstall stale
+	// EIO. A non-nil snapshot map arms the fence for the whole destination
+	// universe (a path absent from the map simply had no landing yet: stamp
+	// 0, and any landing since declines the move).
+	if landedSnaps != nil && cq.landed[newPath].lastUsed > landedSnaps[newPath] {
+		delete(cq.terminalFailures, oldPath)
+		return
+	}
 	failure, ok := cq.terminalFailures[oldPath]
+	dst, dstOK := cq.terminalFailures[newPath]
 	delete(cq.terminalFailures, oldPath)
 	delete(cq.terminalFailures, newPath)
-	if ok {
+	switch {
+	case !ok:
+		return
+	case dstOK && dst.seq > failure.seq:
+		// A newer failure was recorded at the destination meanwhile (the
+		// re-driven upload terminally failed again): it is the live truth.
+		cq.terminalFailures[newPath] = dst
+	default:
 		cq.terminalFailures[newPath] = failure
 	}
 }
@@ -3242,7 +3311,7 @@ func (cq *CommitQueue) RenameTerminalFailure(oldPath, newPath string) {
 // write-cache nor the pending-index prefix loop carries them — without this
 // rekey, a retargeted handle's next strict Sync would check a dead name and
 // certify data that never landed.
-func (cq *CommitQueue) RenameTerminalFailuresPrefix(oldPrefix, newPrefix string) {
+func (cq *CommitQueue) RenameTerminalFailuresPrefix(oldPrefix, newPrefix string, landedSnaps map[string]uint64) {
 	if cq == nil || oldPrefix == newPrefix {
 		return
 	}
@@ -3251,7 +3320,20 @@ func (cq *CommitQueue) RenameTerminalFailuresPrefix(oldPrefix, newPrefix string)
 	moved := make(map[string]pathCommitFailure, len(cq.terminalFailures))
 	for path, failure := range cq.terminalFailures {
 		if strings.HasPrefix(path, oldPrefix) {
-			moved[newPrefix+strings.TrimPrefix(path, oldPrefix)] = failure
+			target := newPrefix + strings.TrimPrefix(path, oldPrefix)
+			// Same landing fence as the endpoint rekey: a child's re-driven
+			// upload that landed after the snapshot fulfilled that record's
+			// obligation — drop the record instead of re-installing it over
+			// the landing (absent from the map = no landing yet = stamp 0).
+			if landedSnaps != nil && cq.landed[target].lastUsed > landedSnaps[target] {
+				delete(cq.terminalFailures, path)
+				continue
+			}
+			if dst, ok := cq.terminalFailures[target]; ok && dst.seq > failure.seq {
+				delete(cq.terminalFailures, path)
+				continue
+			}
+			moved[target] = failure
 			delete(cq.terminalFailures, path)
 		}
 	}
@@ -3307,7 +3389,13 @@ func (cq *CommitQueue) ResolveSupersededConflict(path string, supersedeGen uint6
 	if !ok || meta == nil || meta.Kind != staging.PendingConflict {
 		return
 	}
-	if meta.Generation > supersedeGen {
+	// A moved marker carries its own minted generation AND the source
+	// generation of the failed image it describes (a rename move mints a
+	// fresh generation without changing the image): a landing which
+	// superseded EITHER generation recovered that image — most importantly
+	// the source one every retained handle and pre-staged cache snapshot
+	// recorded before the move.
+	if meta.Generation > supersedeGen && !(meta.SupersedesPendingGen != 0 && meta.SupersedesPendingGen <= supersedeGen) {
 		return
 	}
 	cq.index.RemoveIfGeneration(path, meta.Generation)

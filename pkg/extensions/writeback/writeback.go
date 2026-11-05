@@ -1617,6 +1617,15 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		// provably the pre-rename (replaced incumbent's) entry and may be
 		// retired; any other generation was published during the rename
 		// window and belongs to the renamed object's new incarnation.
+		// The destination's landed-landmark snapshot, taken with the pending
+		// snapshot: the failure-record rekey below runs after the transfer
+		// released its locks, and a destination whose re-driven upload landed
+		// meanwhile has fulfilled the source record's obligation — the rekey
+		// declines instead of re-installing stale EIO over the landing.
+		dstLandedSnaps := map[string]uint64{}
+		if w.queue != nil {
+			dstLandedSnaps = w.queue.LandedSnapshotsForRename(op.Path2, strings.TrimSuffix(op.Path2, "/")+"/")
+		}
 		dstPreGen := map[string]uint64{}
 		if w.opts.Staging != nil && w.opts.Staging.Pending != nil {
 			if m, ok := w.opts.Staging.Pending.GetMeta(op.Path2); ok && m != nil {
@@ -1718,7 +1727,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			// under an even older name) is the only witness for the
 			// retargeted handle's barrier, and the destination's previous
 			// record dies with its replaced incarnation.
-			w.queue.RenameTerminalFailure(op.Path, op.Path2)
+			w.queue.RenameTerminalFailure(op.Path, op.Path2, dstLandedSnaps)
 		}
 		w.retarget(op.Path, op.Path2)
 		// The final publication fence: between the transition above and the
@@ -1794,7 +1803,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 				}
 			}
 		}
-		w.settleOldPrefixAfterMove(ctx, op, movedAt, dstPreGen, windowDescendants)
+		w.settleOldPrefixAfterMove(ctx, op, movedAt, dstPreGen, dstLandedSnaps, windowDescendants)
 		return res, nil
 
 	case fs.OpSetAttr:
@@ -2718,7 +2727,7 @@ func (w *Writeback) dstProtected(path string, fence renameFence) (gen uint64, co
 // standalone ones (a descendant transfer that could not install its marker,
 // bytes left under the pre-move name) have no pending entry, so neither
 // prefix loop above carries them.
-func (w *Writeback) settleOldPrefixAfterMove(ctx context.Context, op *fs.Op, movedAt time.Time, dstPreGen map[string]uint64, windowDescendants map[string]bool) {
+func (w *Writeback) settleOldPrefixAfterMove(ctx context.Context, op *fs.Op, movedAt time.Time, dstPreGen, dstLandedSnaps map[string]uint64, windowDescendants map[string]bool) {
 	prefix := strings.TrimSuffix(op.Path, "/") + "/"
 	for p := range w.landedPathsUnderPrefix(prefix) {
 		windowDescendants[p] = true
@@ -2745,7 +2754,7 @@ func (w *Writeback) settleOldPrefixAfterMove(ctx context.Context, op *fs.Op, mov
 		}
 	}
 	if w.queue != nil {
-		w.queue.RenameTerminalFailuresPrefix(prefix, strings.TrimSuffix(op.Path2, "/")+"/")
+		w.queue.RenameTerminalFailuresPrefix(prefix, strings.TrimSuffix(op.Path2, "/")+"/", dstLandedSnaps)
 	}
 }
 
@@ -2931,6 +2940,16 @@ func (w *Writeback) recordTransferFailure(path string, err error) {
 		return
 	}
 	w.queue.RecordTerminalFailureForPath(path, err)
+	// The in-memory record dies with the process, and a standalone failure
+	// has no pending entry at its path to carry a durable marker: install a
+	// shadowless conflict witness so a restart still answers EIO at the new
+	// name instead of certifying the stale destination image. An existing
+	// entry (a real marker or a live image) is left alone.
+	if w.opts.Staging != nil && w.opts.Staging.Pending != nil {
+		if terr := w.opts.Staging.Pending.EnsureConflictMarker(path); terr != nil {
+			safeLogPrintf("writeback: durable witness for the transfer failure at %s: %v", path, terr)
+		}
+	}
 }
 
 // Sync implements fs.Handle.

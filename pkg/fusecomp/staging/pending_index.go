@@ -63,6 +63,15 @@ func NewPendingIndex(dir string) (*PendingIndex, error) {
 	return idx, nil
 }
 
+// Dir reports the index's on-disk directory (recovery and tests rebuild a
+// fresh index over it).
+func (idx *PendingIndex) Dir() string {
+	if idx == nil {
+		return ""
+	}
+	return idx.dir
+}
+
 // SetJournal wires the WAL used for durable pending-meta publication. It is
 // wired once during mount init, before the first Put.
 func (idx *PendingIndex) SetJournal(j *Journal) {
@@ -431,6 +440,14 @@ func (idx *PendingIndex) prepareConflictTransferLocked(oldPath, newPath string, 
 	// re-drive the old name; the prepared clone keeps the LIVE kind the
 	// destination must carry.
 	clone.Kind = keepKind
+	if src.Kind == PendingConflict {
+		// The moved marker describes the same failed image the source entry
+		// described: remember that image's generation, so a landing which
+		// superseded the SOURCE generation — what every retained handle and
+		// pre-staged cache snapshot recorded before the move — recovers the
+		// marker even though the move itself minted a newer generation.
+		clone.SupersedesPendingGen = src.Generation
+	}
 	prepared := &clone
 	if !hasDst {
 		if err := idx.writePreparedWitness(prepared); err != nil {
@@ -922,6 +939,43 @@ func (idx *PendingIndex) MarkConflict(remotePath string) error {
 	idx.mu.Lock()
 	if m, exists := idx.items[remotePath]; exists {
 		m.Kind = PendingConflict
+	}
+	idx.mu.Unlock()
+	return nil
+}
+
+// EnsureConflictMarker installs a shadowless conflict marker at remotePath
+// when the index holds no entry there: a rename's standalone failure record
+// (its unlanded image preserved under a different, now-dead name) has no
+// pending entry of its own to carry the state, and recovery preserves
+// shadowless conflict markers precisely so this witness survives restart —
+// a fresh process answers EIO from it instead of certifying the stale
+// destination image. An existing entry (any kind) is left untouched: the
+// caller's own markers are richer than this minimal witness.
+func (idx *PendingIndex) EnsureConflictMarker(remotePath string) error {
+	pl := idx.acquirePathLock(remotePath)
+	defer idx.releasePathLock(remotePath, pl)
+
+	idx.mu.RLock()
+	_, exists := idx.items[remotePath]
+	idx.mu.RUnlock()
+	if exists {
+		return nil
+	}
+	meta := WriteBackMeta{
+		Path:       remotePath,
+		Kind:       PendingConflict,
+		LayerClean: false,
+	}
+	gen := idx.nextGen.Add(1)
+	meta.Generation = gen
+	if err := idx.writeMetaFile(&meta); err != nil {
+		return fmt.Errorf("pending index witness marker for %s: %w", remotePath, err)
+	}
+	idx.mu.Lock()
+	if _, exists := idx.items[remotePath]; !exists {
+		cp := meta
+		idx.items[remotePath] = &cp
 	}
 	idx.mu.Unlock()
 	return nil

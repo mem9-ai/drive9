@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"testing"
@@ -694,7 +695,7 @@ func TestPortRenameMovesConflictMarkerStagedDuringRename(t *testing.T) {
 		t.Fatalf("retarget reported the fenced-out transfer as a failure: %v", err)
 	}
 	// What the rename caller does on a successful transition.
-	wb.queue.RenameTerminalFailure("/race-src.txt", "/race-dst.txt")
+	wb.queue.RenameTerminalFailure("/race-src.txt", "/race-dst.txt", nil)
 
 	if wb.opts.Staging.Pending.HasPending("/race-src.txt") {
 		t.Fatal("source pending entry stayed keyed under the dead old name")
@@ -1897,7 +1898,7 @@ func TestPortDirRenameCatchesChildLandedInRetargetGap(t *testing.T) {
 
 	// The handle retarget and the handler's post-retarget settlement.
 	wb.retarget("/d", "/e")
-	wb.settleOldPrefixAfterMove(ctx, &fs.Op{Kind: fs.OpRename, Path: "/d", Path2: "/e"}, time.Now(), nil, map[string]bool{})
+	wb.settleOldPrefixAfterMove(ctx, &fs.Op{Kind: fs.OpRename, Path: "/d", Path2: "/e"}, time.Now(), nil, nil, map[string]bool{})
 
 	if err := wb.queue.PathTerminalFailure("/e/f"); err == nil {
 		t.Fatal("the gap-completed child left no failure witness at the new prefix")
@@ -1933,5 +1934,227 @@ func TestSettleOldPrefixWithoutLedger(t *testing.T) {
 	wb.landedAt("/d/f", 7, 7, 0, nil)
 	op := &fs.Op{Kind: fs.OpRename, Path: "/d", Path2: "/e"}
 	// Must not panic on the nil ledger.
-	wb.settleOldPrefixAfterMove(context.Background(), op, time.Now(), nil, map[string]bool{})
+	wb.settleOldPrefixAfterMove(context.Background(), op, time.Now(), nil, nil, map[string]bool{})
+}
+
+// TestStandaloneTransferFailureSurvivesRestart pins the restart row of the
+// standalone rename-failure record: the successor already landed under the
+// obsolete old name (its queue cleanup removed the pending metadata), the
+// rename answers success, and the in-memory record alone would die with the
+// process — a fresh queue would find neither a record nor a durable marker
+// and certify the stale destination. The shadowless conflict witness the
+// failure recording now installs must survive recovery and keep answering
+// EIO at the new name.
+func TestStandaloneTransferFailureSurvivesRestart(t *testing.T) {
+	fb := &failingWritesBackend{backend: testbackend.NewBackend()}
+	ch, wb := newUploadStack(t, fb, Options{Policy: PolicyWriteBack})
+	ctx := context.Background()
+
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMkdir, Path: "/d", Mode: 0o755}); err != nil {
+		t.Fatal(err)
+	}
+	h := open(t, ch, "/d/f")
+	if err := h.Write(ctx, 0, []byte("child v1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	wb.forgetLanded("/d")
+	wb.forgetLandedPrefix("/d/")
+	if err := wb.opts.Client.RenameCtx(ctx, wb.remotePath("/d"), wb.remotePath("/e")); err != nil {
+		t.Fatal(err)
+	}
+	// The gap publication lands under the resurrected old name.
+	if err := h.Write(ctx, 0, []byte("child v2 landed in the gap")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if !wb.opts.Staging.Pending.HasPending("/d/f") {
+			if _, ok := nodeString(fb.backend, "/d/f"); ok {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if wb.opts.Staging.Pending.HasPending("/d/f") {
+		t.Fatal("the gap successor never completed under the old prefix")
+	}
+
+	// The settlement records the standalone failure at /e/f and — the fix —
+	// installs the durable shadowless witness there too.
+	wb.retarget("/d", "/e")
+	wb.settleOldPrefixAfterMove(ctx, &fs.Op{Kind: fs.OpRename, Path: "/d", Path2: "/e"}, time.Now(), nil, nil, map[string]bool{})
+	if err := wb.queue.PathTerminalFailure("/e/f"); err == nil {
+		t.Fatal("no failure recorded at the new prefix")
+	}
+
+	// Restart: a fresh queue over the recovered pending index. Only the
+	// durable witness remains — recovery must preserve it (shadowless
+	// conflict markers are witnesses, not orphans) and the barrier must
+	// still answer EIO for the successor that never reached this name.
+	recovered, err := staging.NewPendingIndex(wb.opts.Staging.Pending.Dir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recovered.RecoverFromDisk(); err != nil {
+		t.Fatal(err)
+	}
+	cq2 := NewCommitQueue(nil, nil, recovered, nil, 1, 8)
+	t.Cleanup(cq2.DrainAll)
+	if err := cq2.PathTerminalFailure("/e/f"); err == nil {
+		t.Fatal("the standalone failure did not survive the restart")
+	}
+}
+
+// TestRekeyDeclinesAfterDestinationLanding pins the record-rekey ordering:
+// the transfer moves the source marker to the destination and releases its
+// locks; a recovery write at the destination then lands, replaces the moved
+// marker and clears the destination failure state — all BEFORE the endpoint
+// rekey runs (the reviewer's interleaving had the re-driven worker do this;
+// any landing at the destination fulfills the record's obligation the same
+// way). Moving the old source record onto that landing would reinstall
+// stale EIO forever; the landed-stamp fence must decline the move.
+func TestRekeyDeclinesAfterDestinationLanding(t *testing.T) {
+	fb := &failingWritesBackend{backend: testbackend.NewBackend()}
+	ch, wb := newUploadStack(t, fb, Options{Policy: PolicyWriteBack})
+	ctx := context.Background()
+
+	src := open(t, ch, "/rk-src.txt")
+	if err := src.Write(ctx, 0, []byte("failed image")); err != nil {
+		t.Fatal(err)
+	}
+	if err := src.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// A terminal failure at the source: its staging becomes the conflict
+	// marker and the in-memory record is stamped there.
+	fb.setFail(true)
+	if err := src.Write(ctx, 0, []byte("never lands")); err != nil {
+		t.Fatal(err)
+	}
+	_ = src.Sync(ctx) // EIO or EAGAIN; the marker below pins the state
+	if m, ok := wb.opts.Staging.Pending.GetMeta("/rk-src.txt"); !ok || m == nil || m.Kind != staging.PendingConflict {
+		t.Fatalf("source marker = %+v ok=%v", m, ok)
+	}
+	if err := wb.queue.PathTerminalFailure("/rk-src.txt"); err == nil {
+		t.Fatal("no failure record at the source")
+	}
+	fb.setFail(false)
+	// The server applies the rename; the handler never ran.
+	if err := wb.opts.Client.RenameCtx(ctx, wb.remotePath("/rk-src.txt"), wb.remotePath("/rk-dst.txt")); err != nil {
+		t.Fatal(err)
+	}
+
+	// The handler's pre-transfer landed snapshot (empty: nothing landed at
+	// the destination yet), then the transfer pass moving the marker.
+	snaps := wb.queue.LandedSnapshotsForRename("/rk-dst.txt", "/rk-dst.txt/")
+	if _, terr := wb.retargetConflictMarkers(ctx, "/rk-src.txt", "/rk-dst.txt", renameFence{movedAt: time.Now()}, false); terr != nil {
+		t.Fatalf("transfer: %v", terr)
+	}
+	// The destination recovery lands BEFORE the rekey runs: a fresh write
+	// through the renamed name replaces the moved marker and commits, and
+	// its success clears the destination failure state exactly like the
+	// re-driven worker's landing would.
+	recovery := open(t, ch, "/rk-dst.txt")
+	if err := recovery.Write(ctx, 0, []byte("recovery over the moved marker")); err != nil {
+		t.Fatal(err)
+	}
+	if err := recovery.Sync(ctx); err != nil {
+		t.Fatalf("recovery landing: %v", err)
+	}
+	if err := wb.queue.PathTerminalFailure("/rk-dst.txt"); err != nil {
+		t.Fatalf("the recovery landing left a failure at the destination: %v", err)
+	}
+
+	// The late rekey: the destination landed after the snapshot, so the old
+	// source record must NOT be re-installed over it.
+	wb.queue.RenameTerminalFailure("/rk-src.txt", "/rk-dst.txt", snaps)
+	if err := wb.queue.PathTerminalFailure("/rk-dst.txt"); err != nil {
+		t.Fatalf("the rekey reinstalled stale EIO over the landed recovery: %v", err)
+	}
+	// Without a landing the fence is inert: a live record still moves.
+	wb.queue.RecordTerminalFailureForPath("/rk-other.txt", errors.New("boom"))
+	wb.queue.RenameTerminalFailure("/rk-other.txt", "/rk-dst2.txt", snaps)
+	if err := wb.queue.PathTerminalFailure("/rk-dst2.txt"); err == nil {
+		t.Fatal("the unfenced rekey lost a live failure record")
+	}
+}
+
+// TestMovedMarkerKeepsSupersessionChain pins the moved marker's
+// supersession chain end to end: the rename move mints a fresh generation
+// for the same failed image, and every retained proof of that image's
+// recovery — a handle's fence, a pre-staged cache snapshot — references the
+// SOURCE generation. The moved marker must remember that generation, and the
+// queue's resolver must accept a landing that superseded any generation in
+// the chain; without it a recovery whose fence predates the move answers
+// EIO forever even though its bytes (which contain the failed image) are
+// remote.
+func TestMovedMarkerKeepsSupersessionChain(t *testing.T) {
+	dir := t.TempDir()
+	idx, err := staging.NewPendingIndex(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shadows, err := staging.NewShadowStoreWithQuota(filepath.Join(dir, "shadows"), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(shadows.Close)
+	if err := shadows.WriteFull("/a", []byte("failed image"), 0); err != nil {
+		t.Fatal(err)
+	}
+	gen, err := idx.Put("/a", int64(len("failed image")), staging.PendingNew)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.MarkConflict("/a"); err != nil {
+		t.Fatal(err)
+	}
+	transfer, ok, err := idx.BeginConflictTransfer("/a", "/b", gen, 0, shadows)
+	if err != nil || !ok {
+		t.Fatalf("begin = ok=%v err=%v", ok, err)
+	}
+	if !transfer.MovePayload() {
+		t.Fatal("payload move failed")
+	}
+	if committed, cerr := transfer.Commit(); cerr != nil || !committed {
+		t.Fatalf("commit = %v err=%v", committed, cerr)
+	}
+	moved, ok := idx.GetMeta("/b")
+	if !ok || moved == nil || moved.Kind != staging.PendingConflict {
+		t.Fatalf("moved marker = %+v ok=%v", moved, ok)
+	}
+	if moved.Generation <= gen || moved.SupersedesPendingGen != gen {
+		t.Fatalf("moved marker gen=%d chain=%d, want gen > %d and chain == the source generation", moved.Generation, moved.SupersedesPendingGen, gen)
+	}
+
+	// The resolver, over the very marker the move produced (recovered the
+	// way a restart would): a landing whose supersession fence is the SOURCE
+	// generation resolves the moved marker through the chain; a fence below
+	// the whole chain does not.
+	recovered, err := staging.NewPendingIndex(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recovered.RecoverFromDisk(); err != nil {
+		t.Fatal(err)
+	}
+	cq := NewCommitQueue(nil, nil, recovered, nil, 1, 8)
+	t.Cleanup(cq.DrainAll)
+	if m, ok := recovered.GetMeta("/b"); !ok || m == nil || m.SupersedesPendingGen != gen {
+		t.Fatalf("recovered moved marker = %+v ok=%v, want the chain preserved", m, ok)
+	}
+	cq.ResolveSupersededConflict("/b", gen-1)
+	if !recovered.HasPending("/b") {
+		t.Fatal("a fence below the whole chain resolved the marker")
+	}
+	cq.ResolveSupersededConflict("/b", gen) // the chain's source generation
+	if recovered.HasPending("/b") {
+		t.Fatal("a landing that superseded the chain's source generation did not resolve the moved marker")
+	}
 }
