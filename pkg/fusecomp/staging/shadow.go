@@ -119,6 +119,11 @@ type retiredShadow struct {
 	// final Unpin waits so it cannot orphan the retired disk path.
 	cleanupDone chan struct{}
 	reason      shadowRetirementReason
+	// debited records whether the logical pending-byte counter already
+	// dropped this file's size (the Remove paths debit at retire time);
+	// a rotation-retired file is still pending until its final Unpin, so
+	// THAT transition performs the debit.
+	debited bool
 }
 
 // shadowPathLock is a refcounted per-path mutex, mirroring WriteBackCache's
@@ -323,7 +328,6 @@ func (s *ShadowStore) Ensure(remotePath string, size int64, baseRev int64) error
 func (s *ShadowStore) WriteAt(remotePath string, offset int64, data []byte, baseRev int64) (int, error) {
 	pl := s.acquirePathLock(remotePath)
 	defer s.releasePathLock(remotePath, pl)
-	s.cowIfPinnedLocked(remotePath)
 
 	sf, err := s.ensureShadowFile(remotePath)
 	if err != nil {
@@ -348,6 +352,16 @@ func (s *ShadowStore) WriteAt(remotePath string, offset int64, data []byte, base
 			return 0, err
 		}
 	}
+	// Rotation only AFTER the quota gates: a rejected write must leave the
+	// acknowledged pinned image and its generation exactly as they were.
+	// The rotation copies the image, so this partial write composes with
+	// the existing bytes on the private copy.
+	if err := s.rotatePinnedIfNeeded(remotePath); err != nil {
+		return 0, err
+	}
+	if sf2, err2 := s.ensureShadowFile(remotePath); err2 == nil {
+		sf = sf2
+	}
 
 	n, err := writeShadowAt(sf.fd, data, offset)
 	s.recordWrite(remotePath, sf, offset, n, baseRev)
@@ -362,7 +376,6 @@ func (s *ShadowStore) WriteAt(remotePath string, offset int64, data []byte, base
 func (s *ShadowStore) WriteFull(remotePath string, data []byte, baseRev int64) error {
 	pl := s.acquirePathLock(remotePath)
 	defer s.releasePathLock(remotePath, pl)
-	s.cowIfPinnedLocked(remotePath)
 
 	sf, err := s.ensureShadowFile(remotePath)
 	if err != nil {
@@ -376,6 +389,17 @@ func (s *ShadowStore) WriteFull(remotePath string, data []byte, baseRev int64) e
 	delta := newSize - oldWritten
 	if err := s.checkQuotaForDelta(delta); err != nil {
 		return err
+	}
+	// Rotation only AFTER the quota gate: a rejected replacement must
+	// leave the acknowledged pinned image and its generation intact. The
+	// rotation's copy is discarded by the truncate below — the content
+	// preservation matters for WriteAt/Truncate, not for this full
+	// replacement, but the uniform primitive keeps one code path.
+	if err := s.rotatePinnedIfNeeded(remotePath); err != nil {
+		return err
+	}
+	if sf2, err2 := s.ensureShadowFile(remotePath); err2 == nil {
+		sf = sf2
 	}
 
 	if err := sf.fd.Truncate(0); err != nil {
@@ -498,7 +522,6 @@ func (s *ShadowStore) WriteStream(remotePath string, r io.Reader, baseRev int64)
 func (s *ShadowStore) Truncate(remotePath string, size int64, baseRev int64) error {
 	pl := s.acquirePathLock(remotePath)
 	defer s.releasePathLock(remotePath, pl)
-	s.cowIfPinnedLocked(remotePath)
 
 	sf, err := s.ensureShadowFile(remotePath)
 	if err != nil {
@@ -513,6 +536,14 @@ func (s *ShadowStore) Truncate(remotePath string, size int64, baseRev int64) err
 		if err := s.checkFreeRatio(delta); err != nil {
 			return err
 		}
+	}
+	// Rotation only AFTER the quota gate; the copy preserves the prefix a
+	// shrink keeps, so the pinned generation's image survives intact.
+	if err := s.rotatePinnedIfNeeded(remotePath); err != nil {
+		return err
+	}
+	if sf2, err2 := s.ensureShadowFile(remotePath); err2 == nil {
+		sf = sf2
 	}
 
 	if err := sf.fd.Truncate(size); err != nil {
@@ -922,6 +953,12 @@ func (s *ShadowStore) BaseRev(remotePath string) int64 {
 // returns a generation token. The caller must pass this token to Unpin on
 // Release. Use after creating a new shadow (e.g. ShadowSpill O_TRUNC).
 func (s *ShadowStore) Pin(remotePath string) uint64 {
+	// The path lock excludes the writers' rotate+mutate window: a pin
+	// taken here either sees the pre-rotation generation (whose fd the
+	// rotation then retires immutably) or the post-rotation fresh file —
+	// never a check-then-mutate race on the same fd.
+	pl := s.acquirePathLock(remotePath)
+	defer s.releasePathLock(remotePath, pl)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	gen := s.active[remotePath]
@@ -943,6 +980,9 @@ func (s *ShadowStore) Pin(remotePath string) uint64 {
 // exists. Loading from disk handles post-crash recovery where pending
 // shadows are on disk but not yet in the files map.
 func (s *ShadowStore) PinIfExists(remotePath string) (uint64, bool) {
+	// Same path-lock exclusion as Pin — see the comment there.
+	pl := s.acquirePathLock(remotePath)
+	defer s.releasePathLock(remotePath, pl)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sf, ok := s.files[remotePath]
@@ -1013,6 +1053,12 @@ func (s *ShadowStore) Unpin(gen uint64) {
 		}
 		_ = rt.fd.Close()
 		_ = os.Remove(rt.diskPath)
+		if !rt.debited {
+			// A rotation-retired file was never debited (the Remove paths
+			// debit at retire time via debited=true); its bytes were
+			// pending the whole time the pinned reader held them.
+			s.pendingBytes.Add(-rt.size)
+		}
 	}
 }
 
@@ -1127,9 +1173,10 @@ func (s *ShadowStore) Rename(oldPath, newPath string) bool {
 		delete(s.genFile, replacedGen)
 		if s.refs[replacedGen] > 0 && replacedSF != nil {
 			s.retired[replacedGen] = &retiredShadow{
-				fd:     replacedSF.fd,
-				size:   replacedSF.size,
-				reason: shadowRetiredSnapshot,
+				fd:      replacedSF.fd,
+				size:    replacedSF.size,
+				reason:  shadowRetiredSnapshot,
+				debited: true, // replacedSize was debited above
 			}
 		} else {
 			delete(s.refs, replacedGen)
@@ -1587,6 +1634,7 @@ func (s *ShadowStore) removeCoreLocked(remotePath string, expectedGen uint64, re
 				size:        sf.size,
 				cleanupDone: make(chan struct{}),
 				reason:      reason,
+				debited:     true, // runRemoveCleanup debits removedSize
 			}
 			s.retired[gen] = retired
 			cleanup.retired = retired
@@ -1613,51 +1661,122 @@ func (s *ShadowStore) removeCoreLocked(remotePath string, expectedGen uint64, re
 
 // runRemoveCleanup performs the disk cleanup returned by removeCoreLocked and
 // accounts the pendingBytes delta. Must be called after releasing s.mu.
-// cowIfPinnedLocked makes the NEXT writer a fresh file when the current
-// content has pinned readers. A pin token identifies the file descriptor —
-// not an immutable content version — so an in-place mutation (WriteFull's
+// rotatePinnedIfNeeded replaces a pinned active file with a private copy the
+// caller may mutate. A pin token identifies the file descriptor, not an
+// immutable content version, so an in-place mutation (WriteFull's
 // truncate+rewrite, WriteAt, Truncate) would silently change what pinned
-// readers observe. The pinned generation is retired exactly like a Remove:
-// its fd stays readable through ReadAtGen until the last Unpin, and writers
-// proceed on a brand-new file with a fresh generation. Caller holds the
-// path lock.
-func (s *ShadowStore) cowIfPinnedLocked(remotePath string) {
+// readers observe. The rotation is a complete, all-or-nothing primitive:
+//
+//   - the replacement COPIES the current image, so partial-update callers
+//     (WriteAt, Truncate) keep the untouched bytes around their mutation;
+//   - every failure (open, copy, rename) leaves the old file, its
+//     generation, and the pending-byte counter exactly as they were — the
+//     caller's write fails instead of tearing a durable pending image;
+//   - the swap happens under s.mu with the caller holding the path lock,
+//     and Pin/PinIfExists take the same path lock, so no pin can be
+//     acquired between the pinned-check and the mutation;
+//   - the retired original keeps its fd readable through ReadAtGen until
+//     the last Unpin, which also debits its pending bytes (they were
+//     pending the whole time — rotation only superseded the writer's
+//     view, the pinned reader's copy is still work in flight).
+//
+// Callers must have passed their quota checks BEFORE rotating: a rejected
+// write then leaves the acknowledged image fully intact.
+func (s *ShadowStore) rotatePinnedIfNeeded(remotePath string) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	gen := s.active[remotePath]
 	if gen == 0 || s.refs[gen] <= 0 {
-		return
+		s.mu.Unlock()
+		return nil
 	}
-	sf, ok := s.files[remotePath]
-	if !ok || sf == nil {
-		return
+	old, ok := s.files[remotePath]
+	if !ok || old == nil {
+		s.mu.Unlock()
+		return nil
 	}
+	oldSize := old.size
+	oldFD := old.fd
+	s.mu.Unlock()
+
+	// Copy the current image to a private disk file. Nothing observable
+	// changes until both renames below succeed.
 	diskPath := s.shadowPath(remotePath)
+	tmpPath := fmt.Sprintf("%s.cow.%d", diskPath, gen)
+	if err := copyShadowFile(tmpPath, oldFD, oldSize); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("shadow rotate %s: %w", remotePath, err)
+	}
 	retiredPath := fmt.Sprintf("%s.retired.%d", diskPath, gen)
 	if err := os.Rename(diskPath, retiredPath); err != nil {
-		// The retired fd keeps the bytes readable regardless; only the
-		// on-disk name failed to move.
-		_ = os.Remove(diskPath)
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("shadow rotate %s: retire rename: %w", remotePath, err)
 	}
-	delete(s.files, remotePath)
-	delete(s.active, remotePath)
-	delete(s.genFile, gen)
-	delete(s.writeGen, remotePath)
-	s.resizeWrittenLocked(sf, 0)
+	if err := os.Rename(tmpPath, diskPath); err != nil {
+		// Best-effort restore: the old file is intact under retiredPath.
+		_ = os.Rename(retiredPath, diskPath)
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("shadow rotate %s: promote rename: %w", remotePath, err)
+	}
+
 	rt := &retiredShadow{
-		fd:          sf.fd,
+		fd:          oldFD,
 		diskPath:    retiredPath,
-		size:        sf.size,
+		size:        oldSize,
 		cleanupDone: make(chan struct{}),
 		reason:      shadowRetiredSnapshot,
 	}
-	// The retire work (the rename) already happened synchronously above —
-	// release the final-Unpin waiter immediately, or Unpin blocks forever.
+	// The retire work (both renames) already happened synchronously —
+	// release the final-Unpin waiter immediately.
 	close(rt.cleanupDone)
+
+	nfd, err := os.OpenFile(diskPath, os.O_RDWR, 0o644)
+	if err != nil {
+		// The new canonical file exists but cannot be reopened; undo the
+		// swap so the store keeps serving the old image.
+		_ = os.Rename(retiredPath, diskPath)
+		_ = os.Remove(diskPath)
+		_ = os.Rename(retiredPath, diskPath)
+		return fmt.Errorf("shadow rotate %s: reopen: %w", remotePath, err)
+	}
+	sf := &ShadowFile{fd: nfd, size: oldSize}
+
+	s.mu.Lock()
+	s.files[remotePath] = sf
 	s.retired[gen] = rt
-	// ensureShadowFile (the writers' next step) now creates a fresh file
-	// with a fresh active generation; the retired entry's disk file is
-	// deleted by the final Unpin.
+	delete(s.active, remotePath)
+	delete(s.genFile, gen)
+	delete(s.writeGen, remotePath)
+	// The copy is a NEW logical pending image (the old image's bytes stay
+	// counted until the retired copy's final Unpin debits them): the
+	// counter briefly holds both, exactly like any two-image overlap.
+	s.pendingBytes.Add(oldSize)
+	s.mu.Unlock()
+	return nil
+}
+
+// copyShadowFile writes exactly size bytes from src (starting at 0) into a
+// fresh file at dst.
+func copyShadowFile(dst string, src *os.File, size int64) error {
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	buf := make([]byte, 64<<10)
+	for off := int64(0); off < size; off += int64(len(buf)) {
+		end := off + int64(len(buf))
+		if end > size {
+			end = size
+		}
+		chunk := buf[:end-off]
+		if _, err := src.ReadAt(chunk, off); err != nil {
+			return err
+		}
+		if _, err := out.WriteAt(chunk, off); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *ShadowStore) runRemoveCleanup(cleanup shadowRemoveCleanup) {

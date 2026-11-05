@@ -2469,11 +2469,22 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 
 // Release implements fs.Handle.
 func (h *bufferingHandle) Release(ctx context.Context) error {
-	// NOTE: the lazy ledger view's pinned shadow generation is dropped only
-	// AFTER the final commit below — the close-time staging reads unloaded
-	// parts through that pin (EnsurePartsForWrite → the loader's ReadAtGen),
-	// so unpinning here would close the retired backing out from under the
-	// last durability boundary and lose the acknowledged edit.
+	// The lazy ledger view's pinned shadow generation is dropped ONLY after
+	// every return path below has finished with the buffer — the close-time
+	// staging reads unloaded parts through that pin (EnsurePartsForWrite →
+	// the loader's ReadAtGen), so the pin must outlive the final commit.
+	// A defer covers the early returns too (the staged-to-cache fast path,
+	// a staging error): the retired backing would otherwise leak its fd and
+	// disk file forever, once per reopened spilled image.
+	defer func() {
+		h.mu.Lock()
+		gen := h.ledgerShadowGen
+		h.ledgerShadowGen = 0
+		h.mu.Unlock()
+		if gen != 0 && h.w.opts.Staging != nil {
+			h.w.opts.Staging.Shadow.Unpin(gen)
+		}
+	}()
 	// One identity snapshot for the whole close (a concurrent retarget
 	// rewrites h.path under h.mu — bare reads were a data race and could
 	// split a single Release's cancel/cleanup/submit across two names).
@@ -2588,11 +2599,6 @@ func (h *bufferingHandle) Release(ctx context.Context) error {
 		if relErr := h.inner.Release(ctx); err == nil {
 			err = relErr
 		}
-	}
-	// The final boundary has consumed the lazy view; the pin dies now.
-	if gen := h.ledgerShadowGen; gen != 0 && h.w.opts.Staging != nil {
-		h.ledgerShadowGen = 0
-		h.w.opts.Staging.Shadow.Unpin(gen)
 	}
 	return err
 }
