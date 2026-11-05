@@ -652,11 +652,6 @@ func (cq *CommitQueue) WaitPathDeadline(path string, timeout time.Duration) bool
 	return true
 }
 
-// errCommitTerminalNoDiagnostic surfaces terminal conflicts that carry no
-// error value (finishResolveFailure(..., nil) paths) to outcome-aware
-// waiters.
-var errCommitTerminalNoDiagnostic = errors.New("commit terminated without a diagnostic error")
-
 // ClearPathCommitErr retires a remembered terminal failure for a pathname
 // after a publication of that name SUCCEEDED outside the queue (an inline
 // PUT, the write-cache uploader, a synchronous commit). Without this a
@@ -3192,9 +3187,31 @@ func (cq *CommitQueue) onCommitPostUploadFailure(entry *CommitEntry, err error) 
 	if cq.perf != nil {
 		cq.perf.commitFailure.add(1)
 	}
+	// The DATA landed but the post-upload work (deferred chmod, tags) did
+	// not, so the requested outcome was never achieved. Record it for
+	// outcome-aware waiters: a close-sync/strict-fsync caller that waited on
+	// this path must not report success for a mode that was never committed.
+	// The record is the same terminal-failure channel the data-failure path
+	// uses — both mean "this path did not reach the requested state" — and it
+	// is retired by the next successful commit of the path.
+	if cq.terminalFailures == nil {
+		cq.terminalFailures = make(map[string]pathCommitFailure)
+	}
+	cq.mu.Lock()
+	if err == nil {
+		err = errCommitPostUploadUnknown
+	}
+	cq.failureClock++
+	cq.terminalFailures[entry.Path] = pathCommitFailure{err: err, seq: cq.failureClock}
+	cq.pruneTerminalFailuresLocked()
+	cq.mu.Unlock()
 	cq.removeFromQueue(entry)
 	safeLogPrintf("commit queue: post-upload failure for %s; local pending state preserved for retry: %v", entry.Path, err)
 }
+
+// errCommitPostUploadUnknown backs a post-upload failure that carried no
+// error value: the requested metadata was not applied either way.
+var errCommitPostUploadUnknown = errors.New("commit queue: post-upload work failed")
 
 func (cq *CommitQueue) onCommitTerminalFailure(entry *CommitEntry, lastErr error) {
 	// Mark the entry as conflicted in the pending index so that crash

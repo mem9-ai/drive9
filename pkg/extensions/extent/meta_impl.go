@@ -885,6 +885,16 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 	}
 
 	if fresh {
+		// Establish the capability boundary BEFORE publishing: a server that
+		// does not echo the published object's identity cannot give this
+		// descriptor an attributable one afterwards, and every client-side
+		// substitute (content equality, a later Stat, a bare revision) has
+		// been shown to adopt a stranger's object. Refusing here keeps the
+		// data OUT of the remote namespace; refusing after the upload leaves
+		// a published file whose descriptor is permanently unusable.
+		if !b.cfg.Client.WarmCompletionIdentity(ctx) {
+			return fmt.Errorf("create %s: server does not advertise completion_identity_v1, so the landed object cannot be attributed to this descriptor", path)
+		}
 		// Sparse: holes are synthesized on demand — a small write at a
 		// huge offset must not materialize the whole logical image. The
 		// completed upload's echoed resource identity is captured even if

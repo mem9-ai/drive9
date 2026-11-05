@@ -68,3 +68,36 @@ func TestTerminalFailureRetiredBySuccess(t *testing.T) {
 		t.Fatalf("after a successful publication, outcome = %v, want nil", got)
 	}
 }
+
+// A POST-UPLOAD failure (deferred chmod rejected after the data landed) must
+// stay observable to outcome-aware waiters: the bytes are remote, but the
+// requested metadata was never applied, so a close-sync/strict-fsync caller
+// must not be told success. onCommitSuccessWithOptions clears the record
+// before the chmod, so the post-upload path has to re-record it.
+func TestPostUploadFailureStaysObservable(t *testing.T) {
+	shadow, err := staging.NewShadowStoreWithQuota(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	cq := NewCommitQueue(newTestClient("http://127.0.0.1:1"), shadow, nil, nil, 1, 8)
+	defer cq.DrainAll()
+
+	// Precondition: the success path clears, so a bare clear leaves nil.
+	cq.RecordTerminalFailureForPath("/m.bin", errors.New("earlier data failure"))
+	cq.clearTerminalFailure("/m.bin")
+	if got := cq.WaitPathOutcome("/m.bin", time.Second); got != nil {
+		t.Fatalf("precondition: a successful commit must clear the record, got %v", got)
+	}
+
+	// A rejected deferred chmod after the data landed.
+	chmodErr := errors.New("chmod 403")
+	cq.onCommitPostUploadFailure(&CommitEntry{Path: "/m.bin"}, chmodErr)
+	got := cq.WaitPathOutcome("/m.bin", time.Second)
+	if got == nil {
+		t.Fatal("a post-upload failure was reported as success to the waiting caller")
+	}
+	if !errors.Is(got, chmodErr) {
+		t.Fatalf("wait outcome = %v, want the post-upload error", got)
+	}
+}

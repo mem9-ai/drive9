@@ -63,6 +63,9 @@ type fakeV2 struct {
 	// createEcho makes the create response echo the created object's
 	// identity (as a server implementing the echo contract does).
 	createEcho bool
+	// noIdentityCapability makes /v1/status withhold completion_identity_v1,
+	// like a server that predates the contract.
+	noIdentityCapability bool
 	// afterCreate runs (under f.mu) right after a create landed: the window
 	// a replacement can occupy before any follow-up stat.
 	afterCreate func(path string)
@@ -168,6 +171,19 @@ func newFakeV2(t *testing.T) *fakeV2 {
 		default:
 			http.Error(w, "bad method", http.StatusMethodNotAllowed)
 		}
+	})
+	// /v1/status advertises the negotiated contracts. completion_identity_v1
+	// is what the bridge requires before publishing a fresh create, so the
+	// fake must advertise it exactly like a current server does.
+	mux.HandleFunc("/v1/status", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"tenant_id": "t",
+			"status":    "active",
+			"storage_capabilities": map[string]any{
+				"completion_identity_v1": !f.noIdentityCapability,
+			},
+		})
 	})
 	mux.HandleFunc("/v1/fs/", func(w http.ResponseWriter, r *http.Request) {
 		path := strings.TrimPrefix(r.URL.Path, "/v1/fs")
@@ -5864,5 +5880,34 @@ func TestClassicFallbackBindsCompletionEcho(t *testing.T) {
 	}
 	if got := f.contentOf("/d/c.bin"); got != "SECOND!" {
 		t.Fatalf("content after rewrite = %q, want SECOND!", got)
+	}
+}
+
+// The capability boundary must be established BEFORE publishing: a server that
+// does not advertise completion_identity_v1 cannot give this descriptor an
+// attributable identity afterwards, and refusing only after the upload would
+// leave a published file whose descriptor is permanently unusable.
+func TestPublishRefusedBeforeUploadWithoutIdentityCapability(t *testing.T) {
+	f := newFakeV2(t)
+	f.setDir("/d", true)
+	f.noIdentityCapability = true
+	h := newTestHandler(t, f, 0)
+	res, _, _ := dispatchCreate(context.Background(), h, "/d/cap.bin", syscall.O_RDWR|syscall.O_CREAT)
+	eh := res.Handle.(*engineHandle)
+	if err := eh.Write(context.Background(), 0, []byte("DATA")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Flush(context.Background()); err == nil {
+		t.Fatal("a server without the identity contract must be refused")
+	}
+	// Nothing must have been published: the whole point is that the data never
+	// reaches the remote namespace under an unattributable identity.
+	f.mu.Lock()
+	_, classic := f.classic["/d/cap.bin"]
+	_, extent := f.extent["/d/cap.bin"]
+	completes := f.completes
+	f.mu.Unlock()
+	if classic || extent || completes != 0 {
+		t.Fatalf("published anyway: classic=%v extent=%v completes=%d", classic, extent, completes)
 	}
 }

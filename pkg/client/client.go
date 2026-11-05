@@ -65,6 +65,12 @@ type StorageCapabilities struct {
 	// BatchWriteModeV1 promises atomic content+mode create, owner-only mode
 	// authorization, and the definite-rejection contract on BatchWriteResult.
 	BatchWriteModeV1 bool `json:"batch_write_mode_v1"`
+	// CompletionIdentityV1 promises that create and V2 upload-complete
+	// responses echo `resource_id` — the identity of the object the operation
+	// actually published. A caller that must bind later writes to that object
+	// checks this BEFORE publishing: without it, a successful publication
+	// leaves no attributable identity and no safe inference.
+	CompletionIdentityV1 bool `json:"completion_identity_v1"`
 }
 
 // MigrationCapabilities is the bounded Server contract. A missing object
@@ -606,6 +612,31 @@ func (c *Client) CachedBatchWriteModeSupported() bool {
 	}
 	body := c.statusBody.Load()
 	return body != nil && body.StorageCapabilities != nil && body.StorageCapabilities.BatchWriteModeV1
+}
+
+// WarmCompletionIdentity fetches the tenant status (bounded by ctx) so a
+// later CachedCompletionIdentitySupported reflects the server's advertised
+// contract. Callers that must decide BEFORE publishing use this: an
+// un-warmed cache reads as "unsupported" and would refuse on a capable
+// server.
+func (c *Client) WarmCompletionIdentity(ctx context.Context) bool {
+	if c == nil {
+		return false
+	}
+	c.ensureTenantStatus(ctx)
+	return c.CachedCompletionIdentitySupported()
+}
+
+// CachedCompletionIdentitySupported reports the negotiated completion-identity
+// contract without I/O. Missing, failed or older status responses disable it,
+// so a caller that requires an attributable identity treats "unknown" exactly
+// like "absent" — the safe side.
+func (c *Client) CachedCompletionIdentitySupported() bool {
+	if c == nil {
+		return false
+	}
+	body := c.statusBody.Load()
+	return body != nil && body.StorageCapabilities != nil && body.StorageCapabilities.CompletionIdentityV1
 }
 
 // ensureTenantStatus is the compatibility warm path. Legacy getters
