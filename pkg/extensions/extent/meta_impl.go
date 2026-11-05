@@ -30,11 +30,6 @@ import (
 // path.
 var maxPlanBlocksPerChunk = 1 << 15
 
-// maxStagedPlanPages caps the pages walked by the echo-less content proof
-// (one page per 64 MiB chunk). Exhausting it refuses the adoption: an image
-// too large to be compared end-to-end cannot be attributed by content.
-var maxStagedPlanPages = 1 << 12
-
 const (
 	fattrMode  = 1 << 0
 	fattrUID   = 1 << 1
