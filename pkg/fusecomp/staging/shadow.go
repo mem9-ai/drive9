@@ -323,6 +323,7 @@ func (s *ShadowStore) Ensure(remotePath string, size int64, baseRev int64) error
 func (s *ShadowStore) WriteAt(remotePath string, offset int64, data []byte, baseRev int64) (int, error) {
 	pl := s.acquirePathLock(remotePath)
 	defer s.releasePathLock(remotePath, pl)
+	s.cowIfPinnedLocked(remotePath)
 
 	sf, err := s.ensureShadowFile(remotePath)
 	if err != nil {
@@ -361,6 +362,7 @@ func (s *ShadowStore) WriteAt(remotePath string, offset int64, data []byte, base
 func (s *ShadowStore) WriteFull(remotePath string, data []byte, baseRev int64) error {
 	pl := s.acquirePathLock(remotePath)
 	defer s.releasePathLock(remotePath, pl)
+	s.cowIfPinnedLocked(remotePath)
 
 	sf, err := s.ensureShadowFile(remotePath)
 	if err != nil {
@@ -496,6 +498,7 @@ func (s *ShadowStore) WriteStream(remotePath string, r io.Reader, baseRev int64)
 func (s *ShadowStore) Truncate(remotePath string, size int64, baseRev int64) error {
 	pl := s.acquirePathLock(remotePath)
 	defer s.releasePathLock(remotePath, pl)
+	s.cowIfPinnedLocked(remotePath)
 
 	sf, err := s.ensureShadowFile(remotePath)
 	if err != nil {
@@ -1610,6 +1613,53 @@ func (s *ShadowStore) removeCoreLocked(remotePath string, expectedGen uint64, re
 
 // runRemoveCleanup performs the disk cleanup returned by removeCoreLocked and
 // accounts the pendingBytes delta. Must be called after releasing s.mu.
+// cowIfPinnedLocked makes the NEXT writer a fresh file when the current
+// content has pinned readers. A pin token identifies the file descriptor —
+// not an immutable content version — so an in-place mutation (WriteFull's
+// truncate+rewrite, WriteAt, Truncate) would silently change what pinned
+// readers observe. The pinned generation is retired exactly like a Remove:
+// its fd stays readable through ReadAtGen until the last Unpin, and writers
+// proceed on a brand-new file with a fresh generation. Caller holds the
+// path lock.
+func (s *ShadowStore) cowIfPinnedLocked(remotePath string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	gen := s.active[remotePath]
+	if gen == 0 || s.refs[gen] <= 0 {
+		return
+	}
+	sf, ok := s.files[remotePath]
+	if !ok || sf == nil {
+		return
+	}
+	diskPath := s.shadowPath(remotePath)
+	retiredPath := fmt.Sprintf("%s.retired.%d", diskPath, gen)
+	if err := os.Rename(diskPath, retiredPath); err != nil {
+		// The retired fd keeps the bytes readable regardless; only the
+		// on-disk name failed to move.
+		_ = os.Remove(diskPath)
+	}
+	delete(s.files, remotePath)
+	delete(s.active, remotePath)
+	delete(s.genFile, gen)
+	delete(s.writeGen, remotePath)
+	s.resizeWrittenLocked(sf, 0)
+	rt := &retiredShadow{
+		fd:          sf.fd,
+		diskPath:    retiredPath,
+		size:        sf.size,
+		cleanupDone: make(chan struct{}),
+		reason:      shadowRetiredSnapshot,
+	}
+	// The retire work (the rename) already happened synchronously above —
+	// release the final-Unpin waiter immediately, or Unpin blocks forever.
+	close(rt.cleanupDone)
+	s.retired[gen] = rt
+	// ensureShadowFile (the writers' next step) now creates a fresh file
+	// with a fresh active generation; the retired entry's disk file is
+	// deleted by the final Unpin.
+}
+
 func (s *ShadowStore) runRemoveCleanup(cleanup shadowRemoveCleanup) {
 	if cleanup.removedSize > 0 {
 		s.pendingBytes.Add(-cleanup.removedSize)

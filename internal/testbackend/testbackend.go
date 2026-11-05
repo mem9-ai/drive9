@@ -487,7 +487,10 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					ChecksumSHA256 string `json:"checksum_sha256"`
 				}
 				_ = json.NewDecoder(r.Body).Decode(&req)
-				if b.forceConflictLocked(us.path) {
+				b.mu.Lock()
+				forced := b.forceConflictLocked(us.path)
+				b.mu.Unlock()
+				if forced {
 					// The forced-conflict test knob reaches the multipart
 					// track too: complete 409s once per request, exactly
 					// like the direct-PUT handler (same locked accessor —

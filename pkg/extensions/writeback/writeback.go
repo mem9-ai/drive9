@@ -2469,11 +2469,11 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 
 // Release implements fs.Handle.
 func (h *bufferingHandle) Release(ctx context.Context) error {
-	// The lazy ledger view's pinned shadow generation dies with the handle.
-	if gen := h.ledgerShadowGen; gen != 0 && h.w.opts.Staging != nil {
-		h.ledgerShadowGen = 0
-		h.w.opts.Staging.Shadow.Unpin(gen)
-	}
+	// NOTE: the lazy ledger view's pinned shadow generation is dropped only
+	// AFTER the final commit below — the close-time staging reads unloaded
+	// parts through that pin (EnsurePartsForWrite → the loader's ReadAtGen),
+	// so unpinning here would close the retired backing out from under the
+	// last durability boundary and lose the acknowledged edit.
 	// One identity snapshot for the whole close (a concurrent retarget
 	// rewrites h.path under h.mu — bare reads were a data race and could
 	// split a single Release's cancel/cleanup/submit across two names).
@@ -2588,6 +2588,11 @@ func (h *bufferingHandle) Release(ctx context.Context) error {
 		if relErr := h.inner.Release(ctx); err == nil {
 			err = relErr
 		}
+	}
+	// The final boundary has consumed the lazy view; the pin dies now.
+	if gen := h.ledgerShadowGen; gen != 0 && h.w.opts.Staging != nil {
+		h.ledgerShadowGen = 0
+		h.w.opts.Staging.Shadow.Unpin(gen)
 	}
 	return err
 }

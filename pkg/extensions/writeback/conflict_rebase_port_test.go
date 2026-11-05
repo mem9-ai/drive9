@@ -647,16 +647,34 @@ func TestPortLedgerShadowSurvivesQueueLanding(t *testing.T) {
 	}
 
 	// Untouched parts must still read the LEDGER bytes from the pinned
-	// generation — not the pre-ledger row, not an error.
+	// generation — not the pre-ledger row, not an error. The read targets
+	// part 2 (offset 8 MiB): NOT yet loaded by the first one-byte write,
+	// so it exercises the loader against the retired generation.
 	got := make([]byte, 8)
-	n, rerr := h.Read(context.Background(), 1<<20, got)
+	n, rerr := h.Read(context.Background(), 8<<20, got)
 	if rerr != nil || n != 8 {
-		t.Fatalf("post-landing read of untouched part: n=%d err=%v", n, rerr)
+		t.Fatalf("post-landing read of unloaded part: n=%d err=%v", n, rerr)
 	}
 	if string(got) != "LLLLLLLL" {
 		t.Fatalf("post-landing read = %q, want ledger bytes (pinned shadow)", got)
 	}
-	_ = h.Release(context.Background())
+	// The close itself is the durability outcome: Release's final commit
+	// stages the dirty edit (through the still-pinned backing for unloaded
+	// parts) and the backend ends up with the edited image.
+	if rerr := h.Release(context.Background()); rerr != nil {
+		t.Fatalf("release with dirty partial edit: %v", rerr)
+	}
+	deadline2 := time.Now().Add(20 * time.Second)
+	for {
+		if n2, ok := b.Node("/h"); ok && int64(len(n2.Data)) == int64(len(ledgerImage)) && n2.Data[0] == 'X' && n2.Data[1] == 'L' {
+			return
+		}
+		if time.Now().After(deadline2) {
+			n2, _ := b.Node("/h")
+			t.Fatalf("close-time staging never landed the edit: size=%d first=%q", len(n2.Data), string(n2.Data[:2]))
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 // TestPortLedgerShadowFailureSurfaces pins the small-image branch: when the
