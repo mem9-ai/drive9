@@ -1761,7 +1761,7 @@ func copyShadowFile(dst string, src *os.File, size int64) error {
 	if err != nil {
 		return err
 	}
-	defer out.Close()
+	defer func() { _ = out.Close() }()
 	buf := make([]byte, 64<<10)
 	for off := int64(0); off < size; off += int64(len(buf)) {
 		end := off + int64(len(buf))
