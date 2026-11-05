@@ -35,16 +35,21 @@ type WriteBackSuccessFunc func(meta staging.WriteBackMeta, committedRev int64, g
 // read for upload. This lets the OnSuccess callback perform generation-guarded
 // cleanup so a stale upload does not remove a fresher same-path staging entry
 // that was created by a concurrent write while the upload was in flight.
+// TerminalFailureSeq snapshots the commit queue's terminal-failure stamp for
+// the path: OnSuccess may only clear that exact failure, never one recorded
+// after the upload started.
 type StagingGens struct {
-	WriteBackGen    uint64
-	PendingIndexGen uint64
-	ShadowGen       uint64
+	WriteBackGen       uint64
+	PendingIndexGen    uint64
+	ShadowGen          uint64
+	TerminalFailureSeq uint64
 }
 
-// SnapshotStagingGensFunc snapshots the pendingIndex and shadowStore generations
-// for a path. If either store is absent or has no entry, the corresponding gen
-// is 0 (which never matches, so the guarded remove is skipped). Optional — if
-// nil, OnSuccess receives zero-value gens.
+// SnapshotStagingGensFunc snapshots the pendingIndex and shadowStore
+// generations plus the commit queue's terminal-failure stamp for a path. If a
+// store is absent or has no entry, the corresponding gen is 0 (which never
+// matches, so the guarded remove is skipped). Optional — if nil, OnSuccess
+// receives zero-value gens.
 type SnapshotStagingGensFunc func(remotePath string) StagingGens
 
 // WriteBackUploader consumes pending write-back cache entries and uploads

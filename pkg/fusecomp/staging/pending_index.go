@@ -63,6 +63,15 @@ func NewPendingIndex(dir string) (*PendingIndex, error) {
 	return idx, nil
 }
 
+// Dir reports the index's on-disk directory (recovery and tests rebuild a
+// fresh index over it).
+func (idx *PendingIndex) Dir() string {
+	if idx == nil {
+		return ""
+	}
+	return idx.dir
+}
+
 // SetJournal wires the WAL used for durable pending-meta publication. It is
 // wired once during mount init, before the first Put.
 func (idx *PendingIndex) SetJournal(j *Journal) {
@@ -300,6 +309,369 @@ func (idx *PendingIndex) RenamePending(oldPath, newPath string) bool {
 	_ = os.Remove(oldMetaPath)
 
 	return true
+}
+
+// PendingConflictTransfer is a fenced, two-phase move of a conflict-marked
+// pending entry — metadata AND payload — from one pathname to another. It
+// holds BOTH endpoint path locks for its whole lifetime, so no same-path
+// publication (or a caller's own staging) can slip a newer generation in
+// between the prepare and the payload move: whatever generation the
+// destination ends up paired with is the one the transaction fenced on.
+//
+// Phase order is chosen so a crash at any point leaves every surviving .meta
+// paired with the bytes that actually sit beside it:
+//   - prepare: when the destination has no entry, its .meta is persisted
+//     FIRST, while the old name keeps both its .meta and its payload;
+//   - move: a LIVE destination first loses its own payload (its object
+//     incarnation was already replaced by the remote rename that precedes
+//     this transaction) and then receives the prepared .meta — only then is
+//     the source payload renamed over it, so the prepared meta can never be
+//     observed beside the dead bytes it does not describe;
+//   - commit: the destination .meta is (re)written to describe the moved
+//     payload, memory is published, and the old .meta is removed.
+//
+// A destination that already carried an entry is deliberately NOT touched at
+// prepare time: its own .meta and payload stay exactly as they were until the
+// move, so an abort before the move has nothing to restore and a crash leaves
+// both sides describing their own bytes.
+type PendingConflictTransfer struct {
+	idx     *PendingIndex
+	shadows *ShadowStore
+	oldPath string
+	newPath string
+	locks   [2]*pendingPathLock
+	// prepared is the source entry re-homed under newPath with a fresh
+	// generation. It is only published by Commit (or PublishDestination).
+	prepared *WriteBackMeta
+	// destWasLive records that newPath carried an entry when the transfer
+	// began; its .meta and payload stay untouched until the move.
+	destWasLive bool
+	// destReplaced records that MovePayload already retired the live
+	// destination's own payload and persisted the prepared .meta there: from
+	// that point the destination durably describes the source image, so
+	// PublishDestination publishes it instead of skipping, and Abort can no
+	// longer restore the dead entry.
+	destReplaced bool
+	// destMetaPersisted records that the prepared .meta is durable at the
+	// destination path (written at prepare for an empty destination, at the
+	// move for a live one).
+	destMetaPersisted bool
+	// payloadMoved records that the source payload was renamed to the
+	// destination: the durable state already describes the committed pairing,
+	// so Abort degenerates into finishing the publication.
+	payloadMoved   bool
+	expectedOldGen uint64
+	expectedNewGen uint64
+	closed         bool
+}
+
+// BeginConflictTransfer opens a fenced transfer and, when the destination is
+// empty, persists its prepared .meta so a crash before the caller's payload
+// move leaves both names recoverable. It reports (nil, false, nil) when either
+// endpoint no longer matches the generations the caller captured, and a
+// non-nil error only when the prepared metadata could not be persisted.
+//
+// A LIVE source entry (a queued image, not a terminal-failure marker) is
+// durably flipped to PendingConflict BEFORE the destination is prepared: a
+// crash between the two writes must leave recovery skipping the old name —
+// preserved, never re-driven at the dead path the successful remote rename
+// left behind — instead of re-uploading it there through the 404/create
+// retry. The prepared destination keeps the entry's LIVE kind: the
+// obligation it carries is still a landing, not a terminal failure.
+func (idx *PendingIndex) BeginConflictTransfer(oldPath, newPath string, expectedOldGen, expectedNewGen uint64, shadows *ShadowStore) (*PendingConflictTransfer, bool, error) {
+	if idx == nil || oldPath == newPath || expectedOldGen == 0 {
+		return nil, false, nil
+	}
+	idx.mu.RLock()
+	srcKind := PendingConflict
+	if m, ok := idx.items[oldPath]; ok && m != nil {
+		srcKind = m.Kind
+	}
+	idx.mu.RUnlock()
+	if srcKind != PendingConflict {
+		if _, err := idx.MarkConflictIfGeneration(oldPath, expectedOldGen); err != nil {
+			return nil, false, err
+		}
+	}
+	pla, plb := idx.acquireTwoPathLocks(oldPath, newPath)
+	prepared, ok, destWasLive, err := idx.prepareConflictTransferLocked(oldPath, newPath, expectedOldGen, expectedNewGen, srcKind)
+	if err != nil || !ok {
+		idx.releaseTwoPathLocks(oldPath, newPath, pla, plb)
+		return nil, false, err
+	}
+	return &PendingConflictTransfer{
+		idx:               idx,
+		shadows:           shadows,
+		oldPath:           oldPath,
+		newPath:           newPath,
+		locks:             [2]*pendingPathLock{pla, plb},
+		prepared:          prepared,
+		destWasLive:       destWasLive,
+		destMetaPersisted: !destWasLive,
+		expectedOldGen:    expectedOldGen,
+		expectedNewGen:    expectedNewGen,
+	}, true, nil
+}
+
+// prepareConflictTransferLocked fences both endpoints and builds the prepared
+// meta. The caller holds both path locks. It returns the prepared meta, ok,
+// whether the destination was live, and an error when the prepared file could
+// not be persisted.
+func (idx *PendingIndex) prepareConflictTransferLocked(oldPath, newPath string, expectedOldGen, expectedNewGen uint64, keepKind PendingKind) (*WriteBackMeta, bool, bool, error) {
+	idx.mu.RLock()
+	src, hasSrc := idx.items[oldPath]
+	dst, hasDst := idx.items[newPath]
+	idx.mu.RUnlock()
+	if !hasSrc || src == nil || src.Generation != expectedOldGen {
+		return nil, false, false, nil
+	}
+	if hasDst {
+		if dst == nil || dst.Generation != expectedNewGen {
+			return nil, false, false, nil
+		}
+	} else if expectedNewGen != 0 {
+		return nil, false, false, nil
+	}
+	gen := idx.nextGen.Add(1)
+	clone := cloneWriteBackMeta(src)
+	clone.Path = newPath
+	clone.Generation = gen
+	// A live source was flipped to a marker at Begin so recovery cannot
+	// re-drive the old name; the prepared clone keeps the LIVE kind the
+	// destination must carry.
+	clone.Kind = keepKind
+	if src.Kind == PendingConflict {
+		// The moved marker describes the same failed image the source entry
+		// described: remember that image's generation, so a landing which
+		// superseded the SOURCE generation — what every retained handle and
+		// pre-staged cache snapshot recorded before the move — recovers the
+		// marker even though the move itself minted a newer generation.
+		clone.SupersedesPendingGen = src.Generation
+	}
+	prepared := &clone
+	if !hasDst {
+		if err := idx.writePreparedWitness(prepared); err != nil {
+			return nil, false, false, err
+		}
+	}
+	return prepared, true, hasDst, nil
+}
+
+// writePreparedWitness persists the prepared entry at the destination as a
+// CONFLICT-kind witness while the transaction is in flight: every crash
+// point before the commit must leave the destination either empty or
+// carrying a durable EIO marker — recovery preserves shadowless conflict
+// entries precisely so this witness survives restart instead of being
+// pruned like an orphaned live entry. The commit rewrites the entry with
+// its true kind (live for a moved queued image) once the payload sits
+// beside it.
+func (idx *PendingIndex) writePreparedWitness(prepared *WriteBackMeta) error {
+	witness := cloneWriteBackMeta(prepared)
+	witness.Kind = PendingConflict
+	return idx.writeMetaFile(&witness)
+}
+
+// MovePayload moves the preserved shadow bytes to the new name. It reports
+// false when the source has no payload to move or the move failed; the
+// transaction is then still open and must be aborted or published.
+//
+// For a destination that carried its own entry, the move runs in a fixed
+// order — retire the dead destination payload, persist the prepared .meta,
+// then rename the source payload over it — so every intermediate crash state
+// keeps each surviving .meta paired with the bytes beside it: the old
+// destination .meta can only ever be observed WITHOUT its bytes (pruned on
+// recovery), and the prepared .meta can only ever be observed without bytes
+// or beside the source's bytes, never beside the dead destination's.
+func (t *PendingConflictTransfer) MovePayload() bool {
+	if t == nil || t.closed || t.prepared == nil {
+		return false
+	}
+	if t.shadows == nil {
+		return true // metadata-only transfer: there are no preserved bytes
+	}
+	if t.destWasLive && !t.destReplaced {
+		if !t.shadows.Has(t.oldPath) {
+			// No preserved bytes to pair with the marker: leave the
+			// destination's own entry untouched for PublishDestination.
+			return false
+		}
+		// The destination's own pending image belongs to an object incarnation
+		// the completed remote rename already replaced: retire its payload
+		// BEFORE the prepared .meta can describe this path, so no crash can
+		// pair that .meta with the dead bytes. Remove's cleanup ignores disk
+		// errors, so the retirement must be CONFIRMED (VerifyRemoved) before
+		// the relabel: with the payload still beside the path, writing the
+		// prepared .meta would pair the source's size/base revision with the
+		// dead destination's bytes — durably, surviving a restart, exactly
+		// the mismatch this ordering exists to prevent.
+		t.shadows.Remove(t.newPath)
+		if verr := t.shadows.VerifyRemoved(t.newPath); verr != nil {
+			return false
+		}
+		t.destReplaced = true
+		if err := t.idx.writePreparedWitness(t.prepared); err != nil {
+			return false
+		}
+		t.destMetaPersisted = true
+	}
+	if t.shadows.Rename(t.oldPath, t.newPath) {
+		t.payloadMoved = true
+		return true
+	}
+	return false
+}
+
+// Commit re-verifies both fences, publishes the destination metadata (durable
+// first), and removes the old name's entry. It reports false when a fence was
+// lost; nothing is changed in that case. A non-nil error means the
+// destination metadata could not be persisted — the payload has already
+// moved, so the caller must surface the failure.
+// PreparedGeneration reports the generation the prepared destination entry
+// will carry once committed: the rename flow records it so its own second
+// pass can distinguish the entry IT installed from anything else published
+// at the destination meanwhile.
+func (t *PendingConflictTransfer) PreparedGeneration() uint64 {
+	if t == nil || t.prepared == nil {
+		return 0
+	}
+	return t.prepared.Generation
+}
+
+func (t *PendingConflictTransfer) Commit() (bool, error) {
+	if t == nil || t.closed || t.prepared == nil {
+		return false, nil
+	}
+	defer t.release()
+
+	if ok := t.fencesHold(); !ok {
+		return false, nil
+	}
+	if err := t.idx.writeMetaFile(t.prepared); err != nil {
+		return false, err
+	}
+	t.idx.mu.Lock()
+	cp := *t.prepared
+	t.idx.items[t.newPath] = &cp
+	delete(t.idx.items, t.oldPath)
+	t.idx.mu.Unlock()
+
+	_ = os.Remove(filepath.Join(t.idx.dir, HashPath(t.oldPath)+".meta"))
+	safeLogPrintf("pending: conflict marker moved %s -> %s (gen %d -> %d)", t.oldPath, t.newPath, t.expectedOldGen, t.prepared.Generation)
+	return true, nil
+}
+
+// Abort rolls the transaction back. Before any payload move it is exact: an
+// empty destination only needs the prepared file removed, a live destination
+// was never touched, and the old name keeps its entry and payload either way.
+// Once the payload has moved, the durable state already describes the
+// committed pairing and a rollback would strand the moved bytes without
+// metadata — Abort then degenerates into finishing the publication.
+func (t *PendingConflictTransfer) Abort() {
+	if t == nil || t.closed {
+		return
+	}
+	if t.payloadMoved {
+		_, _ = t.Commit()
+		return
+	}
+	defer t.release()
+	if t.destReplaced {
+		// The move retired the destination's own payload (its incarnation was
+		// replaced by the remote rename) and may have persisted the prepared
+		// .meta beside no bytes: restore silence at the destination so no
+		// surviving .meta describes missing bytes. The source keeps its entry
+		// and payload — the rename of the shadow never happened.
+		_ = os.Remove(filepath.Join(t.idx.dir, HashPath(t.newPath)+".meta"))
+		t.idx.mu.Lock()
+		delete(t.idx.items, t.newPath)
+		t.idx.mu.Unlock()
+		return
+	}
+	if !t.destWasLive {
+		_ = os.Remove(filepath.Join(t.idx.dir, HashPath(t.newPath)+".meta"))
+	}
+}
+
+// PublishDestination installs the prepared marker at the destination WITHOUT
+// a payload move: the caller's payload move failed after the pathname had
+// already moved remotely, so the new name must not report durability for
+// bytes that are still only under the old name. The old name keeps its own
+// entry — and the payload — so the data stays recoverable when the
+// destination's own entry is pruned on restart (it has no shadow).
+//
+// A destination that was live and was NOT yet replaced (the move was refused
+// before it could start) keeps its own entry: it still describes its own
+// bytes, and overwriting it would mislabel them — the caller must record the
+// failure in memory instead. Once the move has replaced the destination, the
+// prepared marker is (or must become) its durable state and is published.
+func (t *PendingConflictTransfer) PublishDestination() error {
+	if t == nil || t.closed || t.prepared == nil {
+		if t != nil && !t.closed {
+			t.release()
+		}
+		return nil
+	}
+	if t.destWasLive && !t.destReplaced {
+		// A live destination still carries its own marker describing its own
+		// bytes; overwriting it would mislabel them.
+		t.release()
+		return nil
+	}
+	defer t.release()
+	if !t.destMetaPersisted {
+		if err := t.idx.writeMetaFile(t.prepared); err != nil {
+			return err
+		}
+	}
+	t.idx.mu.Lock()
+	cp := *t.prepared
+	t.idx.items[t.newPath] = &cp
+	t.idx.mu.Unlock()
+	safeLogPrintf("pending: conflict marker published at %s (payload stayed at %s)", t.newPath, t.oldPath)
+	return nil
+}
+
+// fencesHold re-checks both endpoints under the held locks: a same-path
+// publication cannot interleave, so this is defence in depth against a
+// caller that mutated the index by other means.
+func (t *PendingConflictTransfer) fencesHold() bool {
+	t.idx.mu.RLock()
+	src, hasSrc := t.idx.items[t.oldPath]
+	dst, hasDst := t.idx.items[t.newPath]
+	t.idx.mu.RUnlock()
+	if !hasSrc || src == nil || src.Generation != t.expectedOldGen {
+		safeLogPrintf("pending: conflict transfer %s -> %s lost its source fence (generation advanced)", t.oldPath, t.newPath)
+		return false
+	}
+	if hasDst {
+		if dst == nil || dst.Generation != t.expectedNewGen {
+			safeLogPrintf("pending: conflict transfer %s -> %s lost its destination fence (generation advanced)", t.oldPath, t.newPath)
+			return false
+		}
+	} else if t.expectedNewGen != 0 {
+		return false
+	}
+	return true
+}
+
+func (t *PendingConflictTransfer) release() {
+	if t.closed {
+		return
+	}
+	t.closed = true
+	t.idx.releaseTwoPathLocks(t.oldPath, t.newPath, t.locks[0], t.locks[1])
+}
+
+// writeMetaFile persists one pending entry's .meta under the index directory.
+func (idx *PendingIndex) writeMetaFile(meta *WriteBackMeta) error {
+	raw, err := json.Marshal(meta)
+	if err != nil {
+		return fmt.Errorf("marshal pending meta for %s: %w", meta.Path, err)
+	}
+	if err := atomicWrite(filepath.Join(idx.dir, HashPath(meta.Path)+".meta"), raw); err != nil {
+		return fmt.Errorf("persist pending meta for %s: %w", meta.Path, err)
+	}
+	return nil
 }
 
 // PrepareRename is phase one of a crash-safe rename: it persists the pending
@@ -567,6 +939,44 @@ func (idx *PendingIndex) MarkConflict(remotePath string) error {
 	idx.mu.Lock()
 	if m, exists := idx.items[remotePath]; exists {
 		m.Kind = PendingConflict
+	}
+	idx.mu.Unlock()
+	return nil
+}
+
+// EnsureConflictMarker installs a shadowless conflict marker at remotePath
+// when the index holds no entry there: a rename's standalone failure record
+// (its unlanded image preserved under a different, now-dead name) has no
+// pending entry of its own to carry the state, and recovery preserves
+// shadowless conflict markers precisely so this witness survives restart —
+// a fresh process answers EIO from it instead of certifying the stale
+// destination image. An existing entry (any kind) is left untouched: the
+// caller's own markers are richer than this minimal witness.
+func (idx *PendingIndex) EnsureConflictMarker(remotePath string) error {
+	pl := idx.acquirePathLock(remotePath)
+	defer idx.releasePathLock(remotePath, pl)
+
+	idx.mu.RLock()
+	_, exists := idx.items[remotePath]
+	idx.mu.RUnlock()
+	if exists {
+		return nil
+	}
+	meta := WriteBackMeta{
+		Path:        remotePath,
+		Kind:        PendingConflict,
+		WitnessOnly: true,
+		LayerClean:  false,
+	}
+	gen := idx.nextGen.Add(1)
+	meta.Generation = gen
+	if err := idx.writeMetaFile(&meta); err != nil {
+		return fmt.Errorf("pending index witness marker for %s: %w", remotePath, err)
+	}
+	idx.mu.Lock()
+	if _, exists := idx.items[remotePath]; !exists {
+		cp := meta
+		idx.items[remotePath] = &cp
 	}
 	idx.mu.Unlock()
 	return nil
