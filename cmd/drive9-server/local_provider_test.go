@@ -12,15 +12,22 @@ import (
 )
 
 // keyFilePath returns a key path inside a private (0700) directory. t.TempDir()
-// is 0775 under a umask of 002, and a group-writable parent is refused.
+// is 0775 under a umask of 002 and the loader refuses group-writable ancestors,
+// so the chain up to the sticky temp root is tightened to 0700.
 func keyFilePath(t *testing.T) string {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), "keys")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(dir, 0o700); err != nil {
-		t.Fatal(err)
+	tmpRoot := filepath.Clean(os.TempDir())
+	for current := dir; ; current = filepath.Dir(current) {
+		if current == tmpRoot || filepath.Dir(current) == current {
+			break
+		}
+		if err := os.Chmod(current, 0o700); err != nil {
+			t.Fatal(err)
+		}
 	}
 	return filepath.Join(dir, "keys.json")
 }
@@ -248,8 +255,7 @@ func TestLocalDevKeysRejectBroadPermissionsAndSymlinks(t *testing.T) {
 	dir := filepath.Dir(keyFile)
 	t.Setenv(EnvLocalDevKeyFile, keyFile)
 
-	keys, _, err := loadOrCreateLocalDevKeys()
-	if err != nil {
+	if _, _, err := loadOrCreateLocalDevKeys(); err != nil {
 		t.Fatalf("generate: %v", err)
 	}
 	if _, _, err := loadOrCreateLocalDevKeys(); err != nil {
@@ -270,7 +276,6 @@ func TestLocalDevKeysRejectBroadPermissionsAndSymlinks(t *testing.T) {
 	if _, _, err := loadOrCreateLocalDevKeys(); err != nil {
 		t.Fatalf("rejected a 0600 key file: %v", err)
 	}
-	_ = keys
 
 	// A symlink at the key path would let a pre-creator redirect the read.
 	linkTarget := filepath.Join(dir, "real.json")
@@ -342,6 +347,10 @@ func TestLocalDevKeysLeaveExistingDirectoryPermissionsAlone(t *testing.T) {
 		t.Skip("mode bits are not meaningful on Windows")
 	}
 	base := t.TempDir()
+	// Keep the ancestors private: the loader refuses group-writable ones.
+	if err := os.Chmod(base, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	shared := filepath.Join(base, "config")
 	if err := os.MkdirAll(shared, 0o755); err != nil {
 		t.Fatal(err)
@@ -417,5 +426,49 @@ func TestLocalDevKeysRejectSymlinkedDirectory(t *testing.T) {
 	}
 	if entries, err := os.ReadDir(victim); err == nil && len(entries) != 0 {
 		t.Fatalf("a key file was written through the symlinked directory: %v", entries)
+	}
+}
+
+// A writable ancestor defeats the final-directory check: renaming keys/ aside
+// needs write access only on its parent, so a 0775 ancestor above a 0700 keys/
+// directory still lets another user substitute a directory holding a stale key
+// file, or delete it to force a rotation.
+func TestLocalDevKeysRejectWritableAncestor(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mode bits are not meaningful on Windows")
+	}
+	base := t.TempDir()
+	if err := os.Chmod(base, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	shared := filepath.Join(base, "shared")
+	keyDir := filepath.Join(shared, "keys")
+	if err := os.MkdirAll(keyDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(keyDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(shared, 0o775); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(shared, 0o700) })
+	t.Setenv(EnvLocalDevKeyFile, filepath.Join(keyDir, "keys.json"))
+
+	_, _, err := loadOrCreateLocalDevKeys()
+	if err == nil {
+		t.Fatal("accepted a group-writable ancestor directory")
+	}
+	if !strings.Contains(err.Error(), "other users can replace the key directory") {
+		t.Fatalf("error = %v, want the writable-ancestor rejection", err)
+	}
+	// A sticky world-writable ancestor (/tmp) is allowed: it refuses renames and
+	// deletions of other users' entries.
+	if err := os.Chmod(shared, os.ModeSticky|0o777); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(shared, 0o700) })
+	if _, _, err := loadOrCreateLocalDevKeys(); err != nil {
+		t.Fatalf("sticky ancestor must be allowed: %v", err)
 	}
 }

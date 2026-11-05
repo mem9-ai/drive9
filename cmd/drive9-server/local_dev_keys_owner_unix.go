@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"syscall"
 )
 
@@ -76,7 +77,60 @@ func checkLocalDevKeyDir(dir string) error {
 			"local dev key dir %s is mode %04o, so other users can delete the key file and force a rotation; run 'chmod go-w %s' or point %s at a directory only this user can write",
 			dir, perm, dir, EnvLocalDevKeyFile)
 	}
-	return nil
+	// A writable ancestor defeats the directory check: rename/delete needs only
+	// write access on the parent, so /shared (0775) above a 0700 keys/ directory
+	// still lets another user move the directory aside and substitute one holding
+	// a stale key file. Walk the existing ancestors with the same rule, allowing
+	// root-owned components and sticky directories (/tmp), which is exactly what
+	// the sticky bit protects.
+	return checkLocalDevKeyAncestors(dir)
+}
+
+// checkLocalDevKeyAncestors applies the directory rule to every existing
+// ancestor of dir. Components owned by root are trusted, and a sticky
+// world-writable directory (mode 1777, like /tmp) is allowed because it refuses
+// renames and deletions of other users' entries.
+func checkLocalDevKeyAncestors(dir string) error {
+	for current := filepath.Dir(dir); ; current = filepath.Dir(current) {
+		info, err := os.Lstat(current)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				// Nothing above exists yet, so it cannot be traversed either.
+				return nil
+			}
+			return fmt.Errorf("stat local dev key path ancestor %s: %w", current, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("local dev key path ancestor %s is a symlink; refusing to use it", current)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("local dev key path ancestor %s is not a directory", current)
+		}
+		perm := info.Mode().Perm()
+		writable := perm&0o022 != 0
+		if writable && info.Mode()&os.ModeSticky == 0 {
+			owner, ok := localDevKeyPathUID(info)
+			if !ok {
+				return fmt.Errorf("cannot determine the owner of local dev key path ancestor %s", current)
+			}
+			if owner != 0 {
+				return fmt.Errorf(
+					"local dev key path ancestor %s is mode %04o and owned by uid %d, so other users can replace the key directory; move the key file under a directory only this user (or root) can write",
+					current, perm, owner)
+			}
+		}
+		if parent := filepath.Dir(current); parent == current {
+			return nil
+		}
+	}
+}
+
+func localDevKeyPathUID(info os.FileInfo) (int, bool) {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, false
+	}
+	return int(stat.Uid), true
 }
 
 // openLocalDevNoFollow opens path without following a final symlink.

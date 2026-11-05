@@ -26,7 +26,13 @@ useDefault = true
 # strings in a new commit — as live defaults again — is still reported.
 [[allowlists]]
 description = "Retired local-dev placeholder keys, historical commit only"
-commits = ["572e442d6bfd1e7b34d3d349ca10361329929557"]
+# 572e442d is the squash-merge that introduced the values; b484fcc2 is the
+# pre-merge original, which only survives in local clones that still carry the
+# pre-rewrite feature branch.
+commits = [
+    "572e442d6bfd1e7b34d3d349ca10361329929557",
+    "b484fcc2",
+]
 paths = ["^pkg/tenant/local/provisioner\\.go$"]
 regexes = [
     "^0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef$",

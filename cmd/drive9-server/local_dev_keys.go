@@ -140,20 +140,21 @@ func randomKeyHex() (string, error) {
 // A hard link installs without replacing and publishes the finished content
 // atomically; filesystems that refuse links fall back to an exclusive create.
 func installLocalDevKeys(path string, keys localDevKeys) (bool, error) {
-	if dir := filepath.Dir(path); dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return false, fmt.Errorf("create local dev key dir %s: %w", dir, err)
-		}
-		if dirErr := checkLocalDevKeyDir(dir); dirErr != nil {
-			return false, dirErr
-		}
+	dir := filepath.Dir(path)
+	if dir == "" {
+		dir = "."
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return false, fmt.Errorf("create local dev key dir %s: %w", dir, err)
+	}
+	if dirErr := checkLocalDevKeyDir(dir); dirErr != nil {
+		return false, dirErr
 	}
 	raw, err := json.MarshalIndent(keys, "", "  ")
 	if err != nil {
 		return false, fmt.Errorf("encode local dev keys: %w", err)
 	}
 	raw = append(raw, '\n')
-	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, ".local-dev-keys-*.tmp")
 	if err != nil {
 		return false, fmt.Errorf("create local dev key file in %s: %w", dir, err)

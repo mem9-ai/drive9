@@ -120,6 +120,12 @@ func MountVault(opts *VaultMountOptions) error {
 // VaultFS reports for a private mount (0444/0555 for an explicitly shared one).
 // Mirrors newGoFuseMountOptions in pkg/fuse.
 func newVaultMountOptions(opts *VaultMountOptions) *gofuse.MountOptions {
+	return newVaultMountOptionsFor(runtime.GOOS, opts)
+}
+
+// newVaultMountOptionsFor is the platform-parameterised form, so both branches
+// are testable on any host.
+func newVaultMountOptionsFor(goos string, opts *VaultMountOptions) *gofuse.MountOptions {
 	fuseOpts := &gofuse.MountOptions{
 		FsName:     "drive9-vault",
 		Name:       "drive9-vault",
@@ -129,12 +135,12 @@ func newVaultMountOptions(opts *VaultMountOptions) *gofuse.MountOptions {
 		// the in-process EROFS rejections).
 		Options: []string{"ro"},
 	}
-	if runtime.GOOS == "linux" {
+	if goos == "linux" {
 		if opts.AllowOther {
 			fuseOpts.Options = append(fuseOpts.Options, "default_permissions")
 		}
 	}
-	if runtime.GOOS == "darwin" {
+	if goos == "darwin" {
 		// macFUSE has no default_permissions switch; defer_permissions is the
 		// equivalent kernel-side enforcement, and pkg/fuse always passes it.
 		// Without it an allow_other mount falls back to user-space checks that

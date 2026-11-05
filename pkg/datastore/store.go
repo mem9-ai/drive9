@@ -3508,12 +3508,6 @@ func shouldLogStoreOpFailure(result string) bool {
 	}
 }
 
-// ListFileDentryPathsByFileID returns the dentry paths that reference a file
-// entity.
-//
-// A file's bytes are reachable through every name that shares its file_id, so a
-// caller gating content by path has to consider all of them: an alias inside a
-// scope makes the content part of that scope.
 // ListFileDentryPathsByInodeID returns the dentry paths that reach one file's
 // inode. file_nodes indexes both file_id and inode_id; the inode is the stable
 // identity when a caller only knows a storage reference.
@@ -3546,6 +3540,81 @@ func (s *Store) ListFileDentryPathsByInodeID(ctx context.Context, inodeID string
 	}
 	return out, rows.Err()
 }
+
+// ResolveStorageRefDentryPaths returns the dentry paths through which a
+// "blobs/<key>" object reference is reachable.
+//
+// The key is a file id for a freshly created file, but an overwrite keeps the
+// file id and writes the bytes to a generated object key, and a layer entry
+// written before such an overwrite keeps pointing at the older key. Both
+// identities therefore have to be resolved, and both file_nodes identities
+// (file_id and inode_id) have to be consulted: legacy rows key the dentry by
+// file id, the inode model keys it by inode. Results are de-duplicated so one
+// name is never charged twice against limit.
+func (s *Store) ResolveStorageRefDentryPaths(ctx context.Context, storageRef string, limit int) (out []string, err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "resolve_storage_ref_dentry_paths", start, &err)
+
+	storageRef = strings.TrimSpace(storageRef)
+	if storageRef == "" {
+		return nil, fmt.Errorf("storage_ref is required")
+	}
+	if limit <= 0 {
+		limit = 64
+	}
+	seen := make(map[string]struct{}, limit)
+	add := func(paths []string) {
+		for _, p := range paths {
+			if len(out) >= limit {
+				return
+			}
+			if _, dup := seen[p]; dup {
+				continue
+			}
+			seen[p] = struct{}{}
+			out = append(out, p)
+		}
+	}
+
+	// A create-time reference is named after the file id.
+	createPaths, createErr := s.ListFileDentryPathsByFileID(ctx, strings.TrimPrefix(storageRef, "blobs/"), limit)
+	if createErr != nil {
+		return nil, createErr
+	}
+	add(createPaths)
+
+	// Overwrite-time and historical references are resolved through the stored
+	// storage_ref instead.
+	inodes, err := s.ListInodeIDsByStorageRef(ctx, storageRef, storageRefInodeLimit)
+	if err != nil {
+		return nil, err
+	}
+	for _, inodeID := range inodes {
+		if len(out) >= limit {
+			break
+		}
+		inodePaths, inodeErr := s.ListFileDentryPathsByInodeID(ctx, inodeID, limit-len(out))
+		if inodeErr != nil {
+			return nil, inodeErr
+		}
+		add(inodePaths)
+		if len(inodePaths) > 0 {
+			// The inode lookup found the names; the file-id lookup would only
+			// repeat them (file_id == inode_id in the standard model).
+			continue
+		}
+		filePaths, fileErr := s.ListFileDentryPathsByFileID(ctx, inodeID, limit-len(out))
+		if fileErr != nil {
+			return nil, fileErr
+		}
+		add(filePaths)
+	}
+	return out, nil
+}
+
+// storageRefInodeLimit bounds how many inodes one storage reference may resolve
+// to; a blob shared by more than a handful of files is already unusual.
+const storageRefInodeLimit = 8
 
 // ListInodeIDsByStorageRef returns the inodes whose content is stored at one
 // exact S3 object key. An overwrite keeps the file id and writes the bytes to a
@@ -3586,6 +3655,12 @@ func (s *Store) ListInodeIDsByStorageRef(ctx context.Context, storageRef string,
 	return out, rows.Err()
 }
 
+// ListFileDentryPathsByFileID returns the dentry paths that reference a file
+// entity.
+//
+// A file's bytes are reachable through every name that shares its file_id, so a
+// caller gating content by path has to consider all of them: an alias inside a
+// scope makes the content part of that scope.
 func (s *Store) ListFileDentryPathsByFileID(ctx context.Context, fileID string, limit int) (out []string, err error) {
 	start := time.Now()
 	defer observeStoreOp(ctx, "list_file_dentry_paths_by_file_id", start, &err)

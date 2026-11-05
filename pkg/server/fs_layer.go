@@ -1134,54 +1134,9 @@ func validateFSLayerServerStorageRef(layer *datastore.FSLayer, entry *datastore.
 // content reachable inside the scope is legitimately readable, and a reference
 // with no remaining dentry is refused rather than treated as absent.
 // blobDentryPathLimit bounds how many dentry paths one blob lookup returns; the
-// callers only need one authorized path, and a fan-out higher than this would
-// mean the blob is shared by an implausible number of names.
+// callers only need one authorized path, and a higher fan-out would mean the blob
+// is shared by an implausible number of names.
 const blobDentryPathLimit = 64
-
-// listFSLayerBlobDentryPaths resolves a blobs/<key> reference to the dentry paths
-// that can reach the object.
-//
-// The key is a file id for a freshly created file, but an overwrite deliberately
-// keeps the file id and writes the bytes to a generated object key instead. A
-// file-id-only lookup therefore finds nothing for an overwritten file and would
-// reject a legitimate reference — and, on a fork, would look like a
-// cross-tenant read. Both identities are tried.
-func listFSLayerBlobDentryPaths(ctx context.Context, store *datastore.Store, blobKey string) ([]string, error) {
-	paths, err := store.ListFileDentryPathsByFileID(ctx, blobKey, blobDentryPathLimit)
-	if err != nil {
-		return nil, err
-	}
-	if len(paths) > 0 {
-		return paths, nil
-	}
-	inodes, err := store.ListInodeIDsByStorageRef(ctx, "blobs/"+blobKey, 8)
-	if err != nil {
-		return nil, err
-	}
-	for _, inodeID := range inodes {
-		// Older rows key the dentry by file_id, the inode model keys it by
-		// inode_id; both point at the same names, so try each.
-		remaining := blobDentryPathLimit - len(paths)
-		if remaining <= 0 {
-			break
-		}
-		inodePaths, inodeErr := store.ListFileDentryPathsByInodeID(ctx, inodeID, remaining)
-		if inodeErr != nil {
-			return nil, inodeErr
-		}
-		paths = append(paths, inodePaths...)
-		remaining = blobDentryPathLimit - len(paths)
-		if remaining <= 0 {
-			break
-		}
-		filePaths, fileErr := store.ListFileDentryPathsByFileID(ctx, inodeID, remaining)
-		if fileErr != nil {
-			return nil, fileErr
-		}
-		paths = append(paths, filePaths...)
-	}
-	return paths, nil
-}
 
 // authorizeFSLayerStorageRefSource keeps a caller-supplied blobs/ reference
 // inside the tenant's own filesystem.
@@ -1195,51 +1150,82 @@ func listFSLayerBlobDentryPaths(ctx context.Context, store *datastore.Store, blo
 // therefore still prove the blob is reachable from the fork's own metadata, and a
 // scoped key must additionally keep it inside its read scope.
 func (s *Server) authorizeFSLayerStorageRefSource(w http.ResponseWriter, r *http.Request, store *datastore.Store, entry *datastore.FSLayerEntry) bool {
-	if entry == nil || store == nil {
+	err := s.authorizeFSLayerStorageRef(r.Context(), store, ScopeFromContext(r.Context()), entry)
+	if err == nil {
 		return true
+	}
+	var denied *fsLayerStorageRefDenied
+	if errors.As(err, &denied) {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), denied.event,
+			"layer_id", entry.LayerID, "path", entry.Path, "blob_key", denied.blobKey, "parent_tenant_id", denied.parentTenantID)...)
+		errJSON(w, http.StatusForbidden, denied.message)
+		return false
+	}
+	logger.Error(r.Context(), "fs_layer_storage_ref_lookup_failed", eventFields(r.Context(), "fs_layer_storage_ref_lookup_failed",
+		"layer_id", entry.LayerID, "blob_key", strings.TrimPrefix(strings.TrimSpace(entry.StorageRef), "blobs/"), "error", err)...)
+	errJSON(w, http.StatusInternalServerError, "failed to authorize fs layer storage reference")
+	return false
+}
+
+// fsLayerStorageRefDenied is an authorization refusal, as opposed to a lookup
+// failure; the HTTP wrapper answers 403 for it and 500 for anything else.
+type fsLayerStorageRefDenied struct {
+	event          string
+	message        string
+	blobKey        string
+	parentTenantID string
+}
+
+func (e *fsLayerStorageRefDenied) Error() string { return e.message }
+
+// authorizeFSLayerStorageRef is the request-independent form of the storage_ref
+// source check. Every path that reads a layer entry's bytes routes through it —
+// entry upsert, object read, commit, and the grep overlay — so one predicate
+// decides the question instead of each endpoint re-deriving it.
+func (s *Server) authorizeFSLayerStorageRef(ctx context.Context, store *datastore.Store, scope *TenantScope, entry *datastore.FSLayerEntry) error {
+	if entry == nil || store == nil || scope == nil {
+		return nil
 	}
 	ref := strings.TrimSpace(entry.StorageRef)
 	if !strings.HasPrefix(ref, "blobs/") {
-		return true
+		// layers/<layerID>/... is minted per layer and already validated against
+		// it, and an inline entry has no object at all.
+		return nil
 	}
-	scope := ScopeFromContext(r.Context())
-	if scope == nil {
-		return true
-	}
-	if !scope.IsScoped && scope.ParentTenantID == "" {
+	if !scope.IsScoped && !scope.IsFork {
 		// A live tenant owns its whole storage namespace, so any blob in it is
 		// this tenant's data.
-		return true
+		return nil
 	}
 	blobKey := strings.TrimPrefix(ref, "blobs/")
-	paths, err := listFSLayerBlobDentryPaths(r.Context(), store, blobKey)
+	paths, err := store.ResolveStorageRefDentryPaths(ctx, ref, blobDentryPathLimit)
 	if err != nil {
-		logger.Error(r.Context(), "fs_layer_storage_ref_lookup_failed", eventFields(r.Context(), "fs_layer_storage_ref_lookup_failed",
-			"layer_id", entry.LayerID, "blob_key", blobKey, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, "failed to authorize fs layer storage reference")
-		return false
+		return err
 	}
 	if !scope.IsScoped {
 		// Fork owner key: existence in this tenant's metadata is the whole
 		// requirement, because a fork's namespace is otherwise indistinguishable
 		// from its parent's in object storage.
 		if len(paths) > 0 {
-			return true
+			return nil
 		}
-		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "fs_layer_storage_ref_out_of_namespace",
-			"layer_id", entry.LayerID, "path", entry.Path, "blob_key", blobKey, "parent_tenant_id", scope.ParentTenantID)...)
-		errJSON(w, http.StatusForbidden, "storage_ref does not belong to this tenant's filesystem")
-		return false
+		return &fsLayerStorageRefDenied{
+			event:          "fs_layer_storage_ref_out_of_namespace",
+			message:        "storage_ref does not belong to this tenant's filesystem",
+			blobKey:        blobKey,
+			parentTenantID: scope.ParentTenantID,
+		}
 	}
 	for _, p := range paths {
 		if scope.AuthorizeFS(FSOpRead, p) == nil {
-			return true
+			return nil
 		}
 	}
-	logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "fs_layer_storage_ref_out_of_scope",
-		"layer_id", entry.LayerID, "path", entry.Path, "blob_key", blobKey)...)
-	errJSON(w, http.StatusForbidden, "storage_ref is outside the token's read scope")
-	return false
+	return &fsLayerStorageRefDenied{
+		event:   "fs_layer_storage_ref_out_of_scope",
+		message: "storage_ref is outside the token's read scope",
+		blobKey: blobKey,
+	}
 }
 
 func canonicalFSLayerServerPath(rawPath, op, kind string) (string, error) {

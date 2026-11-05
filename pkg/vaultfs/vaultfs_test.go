@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -584,24 +583,43 @@ func TestVaultPermissionsAreOwnerOnlyUnlessShared(t *testing.T) {
 }
 
 func TestVaultMountOptionsEnforceKernelPermissionsWhenShared(t *testing.T) {
-	privateOpts := newVaultMountOptions(&VaultMountOptions{})
-	if hasMountOption(privateOpts.Options, "default_permissions") {
-		t.Fatal("a private mount reported default_permissions; modes must not depend on it")
-	}
-	if !hasMountOption(privateOpts.Options, "ro") {
-		t.Fatal("vault mount lost the read-only kernel option")
+	// Both platform branches are asserted here regardless of the host, since the
+	// option set is pure: Linux relies on default_permissions, macFUSE on
+	// defer_permissions, and each must only apply on its own platform.
+	for _, goos := range []string{"linux", "darwin", "freebsd"} {
+		privateOpts := newVaultMountOptionsFor(goos, &VaultMountOptions{})
+		if hasMountOption(privateOpts.Options, "default_permissions") {
+			t.Fatalf("%s: a private mount reported default_permissions; modes must not depend on it", goos)
+		}
+		if !hasMountOption(privateOpts.Options, "ro") {
+			t.Fatalf("%s: vault mount lost the read-only kernel option", goos)
+		}
 	}
 
-	sharedOpts := newVaultMountOptions(&VaultMountOptions{AllowOther: true})
-	if runtime.GOOS != "linux" {
-		// The option is a Linux fusermount flag; darwin uses defer_permissions.
-		t.Skip("default_permissions is Linux-only")
+	sharedLinux := newVaultMountOptionsFor("linux", &VaultMountOptions{AllowOther: true})
+	if !hasMountOption(sharedLinux.Options, "default_permissions") {
+		t.Fatal("linux allow_other without default_permissions exposes the vault to every local user")
 	}
-	if !hasMountOption(sharedOpts.Options, "default_permissions") {
-		t.Fatal("allow_other without default_permissions exposes the vault to every local user")
-	}
-	if !sharedOpts.AllowOther {
+	if !sharedLinux.AllowOther {
 		t.Fatal("allow_other was not propagated")
+	}
+
+	// macFUSE has no default_permissions switch; without defer_permissions an
+	// allow_other mount falls back to user-space checks VaultFS does not implement.
+	for _, allowOther := range []bool{false, true} {
+		darwinOpts := newVaultMountOptionsFor("darwin", &VaultMountOptions{AllowOther: allowOther})
+		if !hasMountOption(darwinOpts.Options, "defer_permissions") || !hasMountOption(darwinOpts.Options, "local") {
+			t.Fatalf("darwin mount options = %v, want defer_permissions and local", darwinOpts.Options)
+		}
+		if hasMountOption(darwinOpts.Options, "default_permissions") {
+			t.Fatalf("darwin mount options = %v, must not carry the Linux-only default_permissions", darwinOpts.Options)
+		}
+	}
+
+	// freebsd takes neither branch.
+	other := newVaultMountOptionsFor("freebsd", &VaultMountOptions{AllowOther: true})
+	if hasMountOption(other.Options, "default_permissions") || hasMountOption(other.Options, "defer_permissions") {
+		t.Fatalf("freebsd mount options = %v, want only ro", other.Options)
 	}
 }
 

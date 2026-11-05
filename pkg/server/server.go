@@ -6322,7 +6322,7 @@ func (s *Server) handleGrep(w http.ResponseWriter, r *http.Request, path string)
 		return
 	}
 	if layerRef := strings.TrimSpace(r.URL.Query().Get("layer")); layerRef != "" {
-		results, err = overlayFSLayerGrep(r.Context(), b, layerRef, query, path, limit, results)
+		results, err = s.overlayFSLayerGrep(r.Context(), b, ScopeFromContext(r.Context()), layerRef, query, path, limit, results)
 		if err != nil {
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "grep_layer_failed", "path", path, "query_len", len(query), "limit", limit, "layer", layerRef, "error", err)...)
 			writeBackendError(w, r, err)
@@ -6419,7 +6419,7 @@ func (s *Server) handleFind(w http.ResponseWriter, r *http.Request, path string)
 	_ = json.NewEncoder(w).Encode(results)
 }
 
-func overlayFSLayerGrep(ctx context.Context, b *backend.Dat9Backend, layerRef, query, pathPrefix string, limit int, base []datastore.SearchResult) ([]datastore.SearchResult, error) {
+func (s *Server) overlayFSLayerGrep(ctx context.Context, b *backend.Dat9Backend, scope *TenantScope, layerRef, query, pathPrefix string, limit int, base []datastore.SearchResult) ([]datastore.SearchResult, error) {
 	layer, entries, err := resolveSearchLayerEntries(ctx, b, layerRef)
 	if err != nil {
 		return nil, err
@@ -6444,6 +6444,16 @@ func overlayFSLayerGrep(ctx context.Context, b *backend.Dat9Backend, layerRef, q
 		}
 		if !fsLayerSearchPathMatches(entry.Path, pathPrefix) {
 			continue
+		}
+		// The bytes behind this entry may live outside the caller's scope. Skip
+		// the entry rather than answer: returning a match/no-match verdict here
+		// would leak content the object-read endpoint refuses to serve.
+		if err := s.authorizeFSLayerStorageRef(ctx, b.Store(), scope, entry); err != nil {
+			var denied *fsLayerStorageRefDenied
+			if errors.As(err, &denied) {
+				continue
+			}
+			return nil, err
 		}
 		matched, err := fsLayerEntryContains(ctx, b, entry, queryFold)
 		if err != nil {
