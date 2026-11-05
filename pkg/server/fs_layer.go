@@ -1127,28 +1127,20 @@ func validateFSLayerServerStorageRef(layer *datastore.FSLayer, entry *datastore.
 //
 // A blobs/ reference names a file entity, not a path, and the layer endpoints
 // authorize only the layer path they operate on: a scoped caller could take the
+// blobDentryPathLimit bounds how many dentry paths one blob lookup returns; the
+// callers only need one authorized path, and a higher fan-out would mean the blob
+// is shared by an implausible number of names.
+const blobDentryPathLimit = 64
+
 // stable resource id of an out-of-scope file (stat exposes it), store it on an
 // allowed layer path, and read the bytes back through the layer object read —
 // which calls the object store directly. The reference is therefore resolved to
 // its dentry paths and the caller must be able to read at least one of them;
 // content reachable inside the scope is legitimately readable, and a reference
 // with no remaining dentry is refused rather than treated as absent.
-// blobDentryPathLimit bounds how many dentry paths one blob lookup returns; the
-// callers only need one authorized path, and a higher fan-out would mean the blob
-// is shared by an implausible number of names.
-const blobDentryPathLimit = 64
-
 // authorizeFSLayerStorageRefSource keeps a caller-supplied blobs/ reference
-// inside the tenant's own filesystem.
-//
-// layers/<layerID>/... is minted by the server for one layer and already
-// validated against that layer, so it needs no further check here. blobs/<fileID>
-// names a main-filesystem object, and its meaning depends on who owns the storage
-// namespace: a live tenant owns its namespace outright, while a fork shares the
-// parent's (StorageNamespaceID is inherited), so a blob id that belongs to the
-// parent resolves in the same bucket for the child. An owner key on a fork must
-// therefore still prove the blob is reachable from the fork's own metadata, and a
-// scoped key must additionally keep it inside its read scope.
+// inside the tenant's own filesystem. It is the HTTP wrapper around
+// authorizeFSLayerStorageRef, which every byte-reading path shares.
 func (s *Server) authorizeFSLayerStorageRefSource(w http.ResponseWriter, r *http.Request, store *datastore.Store, entry *datastore.FSLayerEntry) bool {
 	err := s.authorizeFSLayerStorageRef(r.Context(), store, ScopeFromContext(r.Context()), entry)
 	if err == nil {
@@ -1182,7 +1174,36 @@ func (e *fsLayerStorageRefDenied) Error() string { return e.message }
 // source check. Every path that reads a layer entry's bytes routes through it —
 // entry upsert, object read, commit, and the grep overlay — so one predicate
 // decides the question instead of each endpoint re-deriving it.
+// fsLayerStorageRefDecisions memoizes the resolution of one storage_ref within a
+// single request, so a layer with many entries sharing a blob costs one DB
+// fan-out instead of one per entry.
+type fsLayerStorageRefDecisions struct {
+	paths map[string][]string
+}
+
+func (d *fsLayerStorageRefDecisions) resolve(ctx context.Context, store *datastore.Store, ref string) ([]string, error) {
+	if d == nil {
+		return store.ResolveStorageRefDentryPaths(ctx, ref, blobDentryPathLimit)
+	}
+	if paths, ok := d.paths[ref]; ok {
+		return paths, nil
+	}
+	paths, err := store.ResolveStorageRefDentryPaths(ctx, ref, blobDentryPathLimit)
+	if err != nil {
+		return nil, err
+	}
+	if d.paths == nil {
+		d.paths = make(map[string][]string)
+	}
+	d.paths[ref] = paths
+	return paths, nil
+}
+
 func (s *Server) authorizeFSLayerStorageRef(ctx context.Context, store *datastore.Store, scope *TenantScope, entry *datastore.FSLayerEntry) error {
+	return s.authorizeFSLayerStorageRefWith(ctx, store, scope, entry, nil)
+}
+
+func (s *Server) authorizeFSLayerStorageRefWith(ctx context.Context, store *datastore.Store, scope *TenantScope, entry *datastore.FSLayerEntry, decisions *fsLayerStorageRefDecisions) error {
 	if entry == nil || store == nil || scope == nil {
 		return nil
 	}
@@ -1198,7 +1219,7 @@ func (s *Server) authorizeFSLayerStorageRef(ctx context.Context, store *datastor
 		return nil
 	}
 	blobKey := strings.TrimPrefix(ref, "blobs/")
-	paths, err := store.ResolveStorageRefDentryPaths(ctx, ref, blobDentryPathLimit)
+	paths, err := decisions.resolve(ctx, store, ref)
 	if err != nil {
 		return err
 	}

@@ -86,43 +86,71 @@ func checkLocalDevKeyDir(dir string) error {
 	return checkLocalDevKeyAncestors(dir)
 }
 
-// checkLocalDevKeyAncestors applies the directory rule to every existing
-// ancestor of dir. Components owned by root are trusted, and a sticky
-// world-writable directory (mode 1777, like /tmp) is allowed because it refuses
-// renames and deletions of other users' entries.
+// checkLocalDevKeyAncestors applies the sshd-StrictModes rule to every physical
+// component above the key directory: each existing one must be owned by root or
+// the current user and must not be writable by group or other unless it is
+// sticky. Ownership is checked even when a component is not writable today,
+// because its owner can chmod it at any time.
+//
+// The path is resolved before the walk. An ancestor that is a symlink is not the
+// threat the final-component rules defend against — the kernel resolves it before
+// the key file is opened, and the final component keeps its O_NOFOLLOW fd-based
+// validation — and refusing them would break macOS outright, where /var and /tmp
+// are links into /private and every path under $TMPDIR traverses one.
 func checkLocalDevKeyAncestors(dir string) error {
-	for current := filepath.Dir(dir); ; current = filepath.Dir(current) {
-		info, err := os.Lstat(current)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				// Nothing above exists yet, so it cannot be traversed either.
+	resolved, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("resolve local dev key dir %s: %w", dir, err)
+	}
+	for current := filepath.Dir(resolved); ; current = filepath.Dir(current) {
+		info, statErr := os.Lstat(current)
+		if statErr != nil {
+			if errors.Is(statErr, os.ErrNotExist) {
 				return nil
 			}
-			return fmt.Errorf("stat local dev key path ancestor %s: %w", current, err)
-		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("local dev key path ancestor %s is a symlink; refusing to use it", current)
+			return fmt.Errorf("stat local dev key path ancestor %s: %w", current, statErr)
 		}
 		if !info.IsDir() {
 			return fmt.Errorf("local dev key path ancestor %s is not a directory", current)
 		}
-		perm := info.Mode().Perm()
-		writable := perm&0o022 != 0
-		if writable && info.Mode()&os.ModeSticky == 0 {
-			owner, ok := localDevKeyPathUID(info)
-			if !ok {
-				return fmt.Errorf("cannot determine the owner of local dev key path ancestor %s", current)
-			}
-			if owner != 0 {
-				return fmt.Errorf(
-					"local dev key path ancestor %s is mode %04o and owned by uid %d, so other users can replace the key directory; move the key file under a directory only this user (or root) can write",
-					current, perm, owner)
-			}
+		owner, ok := localDevKeyPathUID(info)
+		if !ok {
+			return fmt.Errorf("cannot determine the owner of local dev key path ancestor %s", current)
+		}
+		if !localDevKeyTrustedOwner(owner) {
+			return fmt.Errorf(
+				"local dev key path ancestor %s is owned by uid %d, not root, a system account, or the current user (uid %d); move the key file under a directory you control",
+				current, owner, os.Getuid())
+		}
+		if perm := info.Mode().Perm(); perm&0o022 != 0 && info.Mode()&os.ModeSticky == 0 {
+			return fmt.Errorf(
+				"local dev key path ancestor %s is mode %04o, so other users can replace the key directory; run 'chmod go-w %s' (or make it sticky) or move the key file under a directory only this user and root can write",
+				current, perm, current)
 		}
 		if parent := filepath.Dir(current); parent == current {
 			return nil
 		}
 	}
+}
+
+// localDevKeySystemUIDMax is the platform convention for the first interactive
+// user id. Components owned by root or a system account are trusted; a regular
+// user's directory can be chmod-ed by its owner at any time, which is the risk
+// this walk exists to catch.
+const localDevKeySystemUIDMax = 1000
+
+// localDevKeyNobodyUID is nobody's conventional id, which some sandboxes and
+// rootless containers use for everything they do not map.
+const localDevKeyNobodyUID = 65534
+
+func localDevKeyTrustedOwner(uid int) bool {
+	if uid == 0 || uid == os.Getuid() || uid == localDevKeyNobodyUID {
+		return true
+	}
+	return uid < localDevKeySystemUIDMax
 }
 
 func localDevKeyPathUID(info os.FileInfo) (int, bool) {

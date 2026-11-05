@@ -78,12 +78,16 @@ func TestApplyLocalProviderEnvDefaults(t *testing.T) {
 	if os.Getenv(envLocalDevKeysInUse) != "1" {
 		t.Fatal("generated keys were not recorded as dev keys")
 	}
-	info, err := os.Stat(keyFile)
-	if err != nil {
-		t.Fatalf("stat key file: %v", err)
-	}
-	if perm := info.Mode().Perm(); perm != 0o600 {
-		t.Fatalf("key file mode = %04o, want 0600", perm)
+	if runtime.GOOS != "windows" {
+		// Windows reports every writable file as 0666; the mode check does not
+		// apply there (see checkLocalDevKeyPermissions).
+		info, err := os.Stat(keyFile)
+		if err != nil {
+			t.Fatalf("stat key file: %v", err)
+		}
+		if perm := info.Mode().Perm(); perm != 0o600 {
+			t.Fatalf("key file mode = %04o, want 0600", perm)
+		}
 	}
 	if os.Getenv("DRIVE9_LEADER_DISABLED") != "1" {
 		t.Fatalf("LEADER_DISABLED=%q", os.Getenv("DRIVE9_LEADER_DISABLED"))
@@ -470,5 +474,31 @@ func TestLocalDevKeysRejectWritableAncestor(t *testing.T) {
 	t.Cleanup(func() { _ = os.Chmod(shared, 0o700) })
 	if _, _, err := loadOrCreateLocalDevKeys(); err != nil {
 		t.Fatalf("sticky ancestor must be allowed: %v", err)
+	}
+
+	// A symlinked ancestor is not a threat: the kernel resolves it before the key
+	// file is opened, and the final component keeps its O_NOFOLLOW validation.
+	// macOS needs this (/var -> /private/var), and every $TMPDIR path traverses it.
+	if err := os.Chmod(shared, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	realDir := filepath.Join(base, "real")
+	if err := os.MkdirAll(realDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	linkDir := filepath.Join(base, "link")
+	if err := os.Symlink(realDir, linkDir); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	linkedKeyDir := filepath.Join(linkDir, "keys")
+	if err := os.MkdirAll(linkedKeyDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(linkedKeyDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(EnvLocalDevKeyFile, filepath.Join(linkedKeyDir, "keys.json"))
+	if _, _, err := loadOrCreateLocalDevKeys(); err != nil {
+		t.Fatalf("a symlinked ancestor must be allowed (macOS /var -> /private/var): %v", err)
 	}
 }

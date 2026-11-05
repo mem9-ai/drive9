@@ -31,7 +31,7 @@ description = "Retired local-dev placeholder keys, historical commit only"
 # pre-rewrite feature branch.
 commits = [
     "572e442d6bfd1e7b34d3d349ca10361329929557",
-    "b484fcc2",
+    "b484fcc2434c182a2848d53693580a1e3d8a72d6",
 ]
 paths = ["^pkg/tenant/local/provisioner\\.go$"]
 regexes = [

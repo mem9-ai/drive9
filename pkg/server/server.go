@@ -6434,6 +6434,8 @@ func (s *Server) overlayFSLayerGrep(ctx context.Context, b *backend.Dat9Backend,
 		seen[r.Path] = struct{}{}
 	}
 	queryFold := strings.ToLower(query)
+	// Several entries can alias the same blob; resolve each ref once per request.
+	decisions := &fsLayerStorageRefDecisions{}
 	for i := range entries {
 		entry := &entries[i]
 		if _, ok := seen[entry.Path]; ok {
@@ -6448,7 +6450,7 @@ func (s *Server) overlayFSLayerGrep(ctx context.Context, b *backend.Dat9Backend,
 		// The bytes behind this entry may live outside the caller's scope. Skip
 		// the entry rather than answer: returning a match/no-match verdict here
 		// would leak content the object-read endpoint refuses to serve.
-		if err := s.authorizeFSLayerStorageRef(ctx, b.Store(), scope, entry); err != nil {
+		if err := s.authorizeFSLayerStorageRefWith(ctx, b.Store(), scope, entry, decisions); err != nil {
 			var denied *fsLayerStorageRefDenied
 			if errors.As(err, &denied) {
 				continue

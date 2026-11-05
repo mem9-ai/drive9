@@ -1878,11 +1878,16 @@ func TestOverwriteMintsNewBlobKeyAndKeepsOriginalBytes(t *testing.T) {
 	}
 	// The original object must still hold the original bytes: a fork whose
 	// metadata still points at originalRef reads history, not the new content.
-	if _, err := s.fallback.ReadFSLayerEntryData(ctx, &datastore.FSLayerEntry{
+	staleBytes, err := s.fallback.ReadFSLayerEntryData(ctx, &datastore.FSLayerEntry{
 		StorageType: string(datastore.StorageS3),
 		StorageRef:  originalRef,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("original blob is gone after overwrite: %v", err)
+	}
+	if !bytes.Equal(staleBytes, originalBytes) {
+		t.Fatalf("the original blob was rewritten in place (%d bytes, want the pre-overwrite %d)",
+			len(staleBytes), len(originalBytes))
 	}
 	again, err := s.fallback.ReadCtx(ctx, "/repo/bin.dat", 0, -1)
 	if err != nil {
