@@ -319,3 +319,39 @@ func TestLocalDevKeysAdoptAnExistingFileInsteadOfReplacing(t *testing.T) {
 		t.Fatal("the installed key file changed under a concurrent start")
 	}
 }
+
+// The temp-dir fallback path is guessable, so a local attacker can pre-create the
+// key directory as a symlink to an unrelated directory. The loader must refuse it
+// instead of following the link, and must not chmod what the link points at.
+func TestLocalDevKeysRejectSymlinkedDirectory(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink semantics differ on Windows")
+	}
+	base := t.TempDir()
+	victim := filepath.Join(base, "victim")
+	if err := os.MkdirAll(victim, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	keyDir := filepath.Join(base, "keys")
+	if err := os.Symlink(victim, keyDir); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	keyFile := filepath.Join(keyDir, "keys.json")
+	t.Setenv(EnvLocalDevKeyFile, keyFile)
+
+	if _, _, err := loadOrCreateLocalDevKeys(); err == nil {
+		t.Fatal("accepted a symlinked key directory")
+	}
+	// The pointed-at directory must be untouched: a chmod through the link would
+	// have rewritten its mode.
+	info, err := os.Stat(victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o755 {
+		t.Fatalf("victim directory mode = %04o, want 0755 (chmod followed the symlink)", perm)
+	}
+	if entries, err := os.ReadDir(victim); err == nil && len(entries) != 0 {
+		t.Fatalf("a key file was written through the symlinked directory: %v", entries)
+	}
+}

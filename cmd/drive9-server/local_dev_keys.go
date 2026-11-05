@@ -62,7 +62,7 @@ func loadOrCreateLocalDevKeys() (localDevKeys, string, error) {
 	if err != nil {
 		return localDevKeys{}, "", err
 	}
-	raw, err := readLocalDevKeyFile(path)
+	raw, err := readLocalDevKeyFilePlatform(path)
 	switch {
 	case err == nil:
 		var keys localDevKeys
@@ -100,29 +100,6 @@ func loadOrCreateLocalDevKeys() (localDevKeys, string, error) {
 		return localDevKeys{}, path, retryErr
 	}
 	return existing, existingPath, nil
-}
-
-// readLocalDevKeyFile reads the key file only when the file itself is safe: a
-// regular file, owned by this user, with no group or other permission bits.
-//
-// The fallback location lives under the shared temp directory, where another
-// local user could pre-create a readable file holding keys they chose. Accepting
-// it would hand them this installation's master and signing keys.
-func readLocalDevKeyFile(path string) ([]byte, error) {
-	info, err := os.Lstat(path)
-	if err != nil {
-		return nil, err
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return nil, fmt.Errorf("local dev key file %s is a symlink; refusing to read keys through it", path)
-	}
-	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("local dev key file %s is not a regular file", path)
-	}
-	if permErr := checkLocalDevKeyPermissions(path, info); permErr != nil {
-		return nil, permErr
-	}
-	return os.ReadFile(path)
 }
 
 // newLocalDevKeys draws one random key per role.
