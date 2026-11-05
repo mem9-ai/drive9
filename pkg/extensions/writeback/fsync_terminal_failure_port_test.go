@@ -1463,6 +1463,11 @@ func TestPortDirRenameCatchesRepeatChildLanding(t *testing.T) {
 	if _, ok := nodeString(fb.backend, "/d/f"); !ok {
 		t.Fatal("the dead prefix child was not resurrected by the create retry")
 	}
+	// The event stream drops mid-window (EventUnverified clears the whole
+	// landed table — disconnects emit it regardless of actors), wiping the
+	// writeback watermark for /d/f before the rename response is processed:
+	// the queue-side landmark must still carry the evidence.
+	wb.clearLanded()
 	close(gate)
 
 	// The rename itself answers success (the remote move happened and the
@@ -1898,7 +1903,7 @@ func TestPortDirRenameCatchesChildLandedInRetargetGap(t *testing.T) {
 
 	// The handle retarget and the handler's post-retarget settlement.
 	wb.retarget("/d", "/e")
-	wb.settleOldPrefixAfterMove(ctx, &fs.Op{Kind: fs.OpRename, Path: "/d", Path2: "/e"}, time.Now(), nil, nil, map[string]bool{})
+	wb.settleOldPrefixAfterMove(ctx, &fs.Op{Kind: fs.OpRename, Path: "/d", Path2: "/e"}, time.Now(), nil, nil, nil, map[string]bool{})
 
 	if err := wb.queue.PathTerminalFailure("/e/f"); err == nil {
 		t.Fatal("the gap-completed child left no failure witness at the new prefix")
@@ -1934,7 +1939,7 @@ func TestSettleOldPrefixWithoutLedger(t *testing.T) {
 	wb.landedAt("/d/f", 7, 7, 0, nil)
 	op := &fs.Op{Kind: fs.OpRename, Path: "/d", Path2: "/e"}
 	// Must not panic on the nil ledger.
-	wb.settleOldPrefixAfterMove(context.Background(), op, time.Now(), nil, nil, map[string]bool{})
+	wb.settleOldPrefixAfterMove(context.Background(), op, time.Now(), nil, nil, nil, map[string]bool{})
 }
 
 // TestStandaloneTransferFailureSurvivesRestart pins the restart row of the
@@ -1988,7 +1993,7 @@ func TestStandaloneTransferFailureSurvivesRestart(t *testing.T) {
 	// The settlement records the standalone failure at /e/f and — the fix —
 	// installs the durable shadowless witness there too.
 	wb.retarget("/d", "/e")
-	wb.settleOldPrefixAfterMove(ctx, &fs.Op{Kind: fs.OpRename, Path: "/d", Path2: "/e"}, time.Now(), nil, nil, map[string]bool{})
+	wb.settleOldPrefixAfterMove(ctx, &fs.Op{Kind: fs.OpRename, Path: "/d", Path2: "/e"}, time.Now(), nil, nil, nil, map[string]bool{})
 	if err := wb.queue.PathTerminalFailure("/e/f"); err == nil {
 		t.Fatal("no failure recorded at the new prefix")
 	}

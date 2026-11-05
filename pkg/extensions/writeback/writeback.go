@@ -1649,6 +1649,16 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		// tell from the pre-existing landing.
 		w.forgetLanded(op.Path)
 		w.forgetLandedPrefix(strings.TrimSuffix(op.Path, "/") + "/")
+		// The writeback landed table can be cleared mid-window by the event
+		// stream (EventUnverified/EventCheckout from #1080 drop every
+		// watermark, disconnects emit them regardless of actors). The queue's
+		// landed landmarks are bookkeeping, not same-origin proof: nothing
+		// clears them on events, so they are the durable witness for
+		// "completed during the window". Snapshot them for the old prefix.
+		queueLandedSnap := map[string]uint64{}
+		if w.queue != nil {
+			queueLandedSnap = w.queue.LandedSeqsUnderPrefix(strings.TrimSuffix(op.Path, "/") + "/")
+		}
 		// A rename over an OPEN target replaces the object its descriptors
 		// were reading: mark them anonymous BEFORE the remote rename (their
 		// clean images are snapshotted for post-overwrite reads), or they
@@ -1679,7 +1689,8 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		// during the RPC — and a worker that already FINISHED (landing, and
 		// possibly resurrecting, the obsolete name before the response
 		// arrived) left the queue idle but a landed watermark behind.
-		windowWork := (w.queue != nil && w.queue.HasPath(op.Path)) || w.everLanded(op.Path)
+		windowWork := (w.queue != nil && w.queue.HasPath(op.Path)) || w.everLanded(op.Path) ||
+			(w.queue != nil && w.queue.LandedSeq(op.Path) > queueLandedSnap[op.Path])
 		// The same for the old prefix's children: the pending set right after
 		// the rename plus any child that landed during the RPC (its pending
 		// entry is gone, so only the landed watermark records it); a child
@@ -1695,6 +1706,15 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			}
 			for p := range w.landedPathsUnderPrefix(prefix) {
 				windowDescendants[p] = true
+			}
+			// Queue-landmark deltas survive event-stream clears: a child
+			// whose watermark was wiped still shows here.
+			if w.queue != nil {
+				for p, cur := range w.queue.LandedSeqsUnderPrefix(prefix) {
+					if cur > queueLandedSnap[p] {
+						windowDescendants[p] = true
+					}
+				}
 			}
 		}
 		// Both pathname incarnations ended (source moved, target replaced),
@@ -1803,7 +1823,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 				}
 			}
 		}
-		w.settleOldPrefixAfterMove(ctx, op, movedAt, dstPreGen, dstLandedSnaps, windowDescendants)
+		w.settleOldPrefixAfterMove(ctx, op, movedAt, dstPreGen, dstLandedSnaps, queueLandedSnap, windowDescendants)
 		return res, nil
 
 	case fs.OpSetAttr:
@@ -2727,10 +2747,20 @@ func (w *Writeback) dstProtected(path string, fence renameFence) (gen uint64, co
 // standalone ones (a descendant transfer that could not install its marker,
 // bytes left under the pre-move name) have no pending entry, so neither
 // prefix loop above carries them.
-func (w *Writeback) settleOldPrefixAfterMove(ctx context.Context, op *fs.Op, movedAt time.Time, dstPreGen, dstLandedSnaps map[string]uint64, windowDescendants map[string]bool) {
+func (w *Writeback) settleOldPrefixAfterMove(ctx context.Context, op *fs.Op, movedAt time.Time, dstPreGen, dstLandedSnaps, queueLandedSnap map[string]uint64, windowDescendants map[string]bool) {
 	prefix := strings.TrimSuffix(op.Path, "/") + "/"
 	for p := range w.landedPathsUnderPrefix(prefix) {
 		windowDescendants[p] = true
+	}
+	// The queue-landmark deltas again, read at settle time: a child that
+	// completed between the response and the handle retarget is here even
+	// if the event stream cleared the writeback watermarks meanwhile.
+	if w.queue != nil {
+		for p, cur := range w.queue.LandedSeqsUnderPrefix(prefix) {
+			if cur > queueLandedSnap[p] {
+				windowDescendants[p] = true
+			}
+		}
 	}
 	hasLedger := w.opts.Staging != nil && w.opts.Staging.Pending != nil
 	for path := range windowDescendants {
