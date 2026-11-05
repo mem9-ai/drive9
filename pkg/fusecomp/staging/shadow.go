@@ -1683,6 +1683,9 @@ func (s *ShadowStore) removeCoreLocked(remotePath string, expectedGen uint64, re
 // Callers must have passed their quota checks BEFORE rotating: a rejected
 // write then leaves the acknowledged image fully intact.
 func (s *ShadowStore) rotatePinnedIfNeeded(remotePath string) error {
+	// Snapshot the pinned state under s.mu, including the written-coverage
+	// charge (it transfers to the copy so the byte quota neither leaks the
+	// old charge nor double-charges the replacement).
 	s.mu.Lock()
 	gen := s.active[remotePath]
 	if gen == 0 || s.refs[gen] <= 0 {
@@ -1696,13 +1699,25 @@ func (s *ShadowStore) rotatePinnedIfNeeded(remotePath string) error {
 	}
 	oldSize := old.size
 	oldFD := old.fd
+	oldWritten := old.written.clone()
+	oldWrittenBytes := old.writtenBytes
 	s.mu.Unlock()
 
+	// The copy duplicates the image on disk: the full temporary
+	// allocation obeys the disk guard even when the logical mutation is
+	// small (a same-size WriteFull has delta=0, a range overwrite added=0,
+	// a shrink is negative — none of those gates would otherwise fire).
+	if oldSize > 0 {
+		if err := s.checkFreeRatio(oldSize); err != nil {
+			return fmt.Errorf("shadow rotate %s: %w", remotePath, err)
+		}
+	}
+
 	// Copy the current image to a private disk file. Nothing observable
-	// changes until both renames below succeed.
+	// changes until the publication below succeeds.
 	diskPath := s.shadowPath(remotePath)
 	tmpPath := fmt.Sprintf("%s.cow.%d", diskPath, gen)
-	if err := copyShadowFile(tmpPath, oldFD, oldSize); err != nil {
+	if err := copyShadowFile(tmpPath, oldFD, oldSize, oldWritten); err != nil {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("shadow rotate %s: %w", remotePath, err)
 	}
@@ -1712,56 +1727,116 @@ func (s *ShadowStore) rotatePinnedIfNeeded(remotePath string) error {
 		return fmt.Errorf("shadow rotate %s: retire rename: %w", remotePath, err)
 	}
 	if err := os.Rename(tmpPath, diskPath); err != nil {
-		// Best-effort restore: the old file is intact under retiredPath.
+		// Canonical no longer exists here — a plain rename restores it.
 		_ = os.Rename(retiredPath, diskPath)
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("shadow rotate %s: promote rename: %w", remotePath, err)
 	}
-
-	rt := &retiredShadow{
-		fd:          oldFD,
-		diskPath:    retiredPath,
-		size:        oldSize,
-		cleanupDone: make(chan struct{}),
-		reason:      shadowRetiredSnapshot,
-	}
-	// The retire work (both renames) already happened synchronously —
-	// release the final-Unpin waiter immediately.
-	close(rt.cleanupDone)
-
 	nfd, err := os.OpenFile(diskPath, os.O_RDWR, 0o644)
 	if err != nil {
-		// The new canonical file exists but cannot be reopened; undo the
-		// swap so the store keeps serving the old image.
-		_ = os.Rename(retiredPath, diskPath)
-		_ = os.Remove(diskPath)
-		_ = os.Rename(retiredPath, diskPath)
+		// The copy sits at the canonical path; rename(2) over it ATOMICALLY
+		// replaces it with the retired original. A remove-then-rename here
+		// would delete the restored original instead (the prior bug).
+		if rerr := os.Rename(retiredPath, diskPath); rerr != nil {
+			return fmt.Errorf("shadow rotate %s: reopen: %w (restore failed: %v)", remotePath, err, rerr)
+		}
 		return fmt.Errorf("shadow rotate %s: reopen: %w", remotePath, err)
 	}
 	sf := &ShadowFile{fd: nfd, size: oldSize}
 
 	s.mu.Lock()
+	// Publication re-checks the reference count: a reader whose LAST Unpin
+	// ran during the copy window has already dropped refs[gen] to zero and
+	// found no retired entry to clean — nobody would ever Unpin again. That
+	// case cleans up inline below (no retired entry, no pending-byte add);
+	// the copy becomes the only image.
+	refsAlive := s.refs[gen] > 0
+	// Transfer the written-coverage charge: the copy carries the same
+	// coverage as the original, and the retired original keeps none — the
+	// byte-quota total is unchanged, so the caller's post-rotation delta
+	// math matches the un-rotated behavior exactly.
+	old.written = shadowWrittenRanges{}
+	old.writtenBytes = 0
+	sf.written = oldWritten
+	sf.writtenBytes = oldWrittenBytes
 	s.files[remotePath] = sf
-	s.retired[gen] = rt
 	delete(s.active, remotePath)
 	delete(s.genFile, gen)
 	delete(s.writeGen, remotePath)
-	// The copy is a NEW logical pending image (the old image's bytes stay
-	// counted until the retired copy's final Unpin debits them): the
-	// counter briefly holds both, exactly like any two-image overlap.
-	s.pendingBytes.Add(oldSize)
+	if refsAlive {
+		rt := &retiredShadow{
+			fd:          oldFD,
+			diskPath:    retiredPath,
+			size:        oldSize,
+			cleanupDone: make(chan struct{}),
+			reason:      shadowRetiredSnapshot,
+		}
+		// The retire work (both renames) already happened synchronously —
+		// release the final-Unpin waiter immediately.
+		close(rt.cleanupDone)
+		s.retired[gen] = rt
+		// The copy is a NEW logical pending image (the old image's bytes
+		// stay counted until the retired copy's final Unpin debits them):
+		// the counter briefly holds both, exactly like any two-image
+		// overlap.
+		s.pendingBytes.Add(oldSize)
+	} else {
+		// No reader remains (the last Unpin raced the copy window): clean
+		// the retired original up inline — nobody will ever Unpin it. The
+		// fd close and disk remove happen after the unlock, mirroring
+		// Unpin's own ordering.
+		s.mu.Unlock()
+		_ = oldFD.Close()
+		_ = os.Remove(retiredPath)
+		return nil
+	}
 	s.mu.Unlock()
 	return nil
 }
 
-// copyShadowFile writes exactly size bytes from src (starting at 0) into a
-// fresh file at dst.
-func copyShadowFile(dst string, src *os.File, size int64) error {
+// copyShadowFile reproduces the source image at dst. When the source's
+// written coverage is known (this process wrote it), only those ranges are
+// copied and the destination is sparse-extended to the full size — a
+// multi-GiB sparse shadow stays sparse instead of being densified into a
+// real allocation. A recovered-from-disk source has no coverage knowledge
+// and is copied densely (the caller's free-space guard already reserved the
+// full size for exactly this worst case).
+func copyShadowFile(dst string, src *os.File, size int64, written shadowWrittenRanges) error {
 	out, err := os.OpenFile(dst, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = out.Close() }()
+	if size > 0 {
+		if err := out.Truncate(size); err != nil {
+			return err
+		}
+	}
+	if written.total > 0 && written.tree != nil {
+		buf := make([]byte, 64<<10)
+		var copyErr error
+		written.tree.AscendGreaterOrEqual(DirtyExtent{Offset: 0}, func(e DirtyExtent) bool {
+			for off := e.Offset; off < e.Offset+e.Length && copyErr == nil; off += int64(len(buf)) {
+				end := off + int64(len(buf))
+				if end > e.Offset+e.Length {
+					end = e.Offset + e.Length
+				}
+				chunk := buf[:end-off]
+				if _, copyErr = src.ReadAt(chunk, off); copyErr != nil {
+					return false
+				}
+				if _, copyErr = out.WriteAt(chunk, off); copyErr != nil {
+					return false
+				}
+			}
+			return copyErr == nil
+		})
+		if copyErr != nil {
+			return copyErr
+		}
+		return nil
+	}
+	// Dense fallback: no coverage knowledge (recovered file).
 	buf := make([]byte, 64<<10)
 	for off := int64(0); off < size; off += int64(len(buf)) {
 		end := off + int64(len(buf))

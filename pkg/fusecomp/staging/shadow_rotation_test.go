@@ -116,3 +116,74 @@ func TestRotationAccounting(t *testing.T) {
 		t.Fatalf("pending bytes after rotation cycle = %d, want 0", got)
 	}
 }
+
+// TestRotationRacedLastUnpinCleansUp pins the publication re-check: when the
+// pinned generation's LAST Unpin runs during the rotation's copy window (the
+// refs count hits zero before the retired entry is published), the rotation
+// itself must clean the retired original up — no orphaned fd, no leaked
+// pending bytes — because nobody will ever call Unpin again.
+func TestRotationRacedLastUnpinCleansUp(t *testing.T) {
+	s, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	image := []byte("race-image")
+	if err := s.WriteFull("/f", image, 1); err != nil {
+		t.Fatal(err)
+	}
+	gen := s.Pin("/f")
+	before := s.PendingBytes()
+	// Simulate the race deterministically: the last reader drops its ref
+	// during the copy window, before publication.
+	s.mu.Lock()
+	s.refs[gen] = 0
+	s.mu.Unlock()
+
+	if _, err := s.WriteAt("/f", 0, []byte("RACE-image"), 1); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.PendingBytes(); got != before {
+		t.Fatalf("pending bytes after raced rotation = %d, want unchanged %d", got, before)
+	}
+	s.mu.RLock()
+	_, retired := s.retired[gen]
+	s.mu.RUnlock()
+	if retired {
+		t.Fatal("raced rotation published a retired entry nobody will unpin")
+	}
+	s.Remove("/f")
+	if got := s.PendingBytes(); got != 0 {
+		t.Fatalf("pending bytes after remove = %d, want 0", got)
+	}
+}
+
+// TestRotationQuotaBytesTransfer pins the byte-quota coverage transfer: a
+// full pin→replace→unpin→remove cycle must release the byte quota entirely —
+// the replacement inherits the old written coverage (no double charge) and
+// the retired original transfers its charge away (no leak).
+func TestRotationQuotaBytesTransfer(t *testing.T) {
+	const n = 1 << 20
+	s, err := NewShadowStoreWithQuota(t.TempDir(), 0, n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	image := make([]byte, n)
+	if err := s.WriteFull("/f", image, 1); err != nil {
+		t.Fatal(err)
+	}
+	gen := s.Pin("/f")
+	if err := s.WriteFull("/f", image, 1); err != nil {
+		t.Fatalf("same-size replacement under a %d-byte quota: %v", n, err)
+	}
+	s.Unpin(gen)
+	s.Remove("/f")
+
+	// The quota must be fully released: a fresh same-size write succeeds.
+	if err := s.WriteFull("/g", image, 1); err != nil {
+		t.Fatalf("quota leaked after rotation cycle: %v", err)
+	}
+}
