@@ -106,10 +106,11 @@ func (cq *CommitQueue) uploadExtentEntry(ctx context.Context, entry *CommitEntry
 	}
 	extentTarget := statErr == nil && st != nil
 
-	ra, err := cq.entryReaderAt(ctx, entry)
+	ra, release, err := cq.entryReaderAt(ctx, entry)
 	if err != nil {
 		return 0, true, err
 	}
+	defer release()
 	// The revision reported on success must be attributable to THIS
 	// publication: a follow-up stat can observe a foreign writer's later
 	// landing and would poison the lineage (checksums recorded under a
@@ -222,29 +223,56 @@ func zeroGrowBlock(oldSize, newSize int64) client.ExtentBlockWrite {
 }
 
 // entryReaderAt exposes the entry's staged image as an io.ReaderAt:
-// materialized payload when it fits in memory, the shadow generation
-// otherwise (multi-GiB spill files stream block-by-block through the same
-// interface).
-func (cq *CommitQueue) entryReaderAt(ctx context.Context, entry *CommitEntry) (io.ReaderAt, error) {
+// materialized payload when it fits in memory, the shadow file otherwise
+// (multi-GiB spill files stream block-by-block through the same interface).
+// The returned release func must be called when the upload is done; it is a
+// no-op for payload-backed readers.
+//
+// A spilled entry is addressed by its CONTENT generation. That is the token
+// the entry carries and the one every other consumer (validate, cleanup,
+// lineage) checks, and it is what proves the bytes being uploaded are still
+// the ones this entry staged. Reading it through the PIN-generation API is a
+// different number space and never resolves — see ShadowStore's ContentGen /
+// PinGen documentation.
+func (cq *CommitQueue) entryReaderAt(ctx context.Context, entry *CommitEntry) (io.ReaderAt, func(), error) {
 	if !entry.ShadowSpill {
 		data, err := cq.readEntryPayloadCtx(ctx, entry)
 		if err != nil {
-			return nil, err
+			return nil, func() {}, err
 		}
-		return bytes.NewReader(data), nil
+		return bytes.NewReader(data), func() {}, nil
 	}
-	// A truncate-only fresh file (sparse ftruncate with no writes) never
-	// stages shadow bytes: its generation exists only as bookkeeping. The
-	// image is definitionally zeros — serve them directly; the extent
-	// sequential upload dedupes the repeated zero block after the first.
-	// Guard narrowly (no dirty ranges, no bound payload): a real streamed
-	// image whose generation was already consumed must ERROR, never
-	// silently serve zeros — that corrupted fio verify read-backs.
-	if entry.Kind == staging.PendingNew && len(entry.DirtyRanges) == 0 &&
-		!entry.payloadBound && !cq.shadows.HasGeneration(entry.ShadowGen) {
-		return zeroReaderAt{size: entry.Size}, nil
+	if cq.shadows == nil {
+		return nil, func() {}, fmt.Errorf("no shadow store")
 	}
-	return &shadowGenReaderAt{shadows: cq.shadows, gen: entry.ShadowGen, size: entry.Size}, nil
+	fd, size, release, err := cq.shadows.OpenIfGeneration(entry.Path, entry.ShadowGen)
+	if err != nil {
+		// A truncate-only fresh file (sparse ftruncate with no writes) never
+		// stages shadow bytes: its logical size is a hole. It is the ONLY
+		// case allowed to serve zeros, and it is recognized by carrying no
+		// content generation at all (never staged) plus a zero logical
+		// start — not by "the bytes happen to be missing", which is also
+		// what a lost shadow looks like. Serving zeros there is silent data
+		// loss, so that case fails instead.
+		if entry.Kind == staging.PendingNew && entry.ShadowGen == 0 && zeroBaseOnly(entry) {
+			return zeroReaderAt{size: entry.Size}, func() {}, nil
+		}
+		return nil, func() {}, err
+	}
+	if size != entry.Size {
+		release()
+		return nil, func() {}, fmt.Errorf("shadow %s is %d bytes, entry expects %d", entry.Path, size, entry.Size)
+	}
+	return fd, release, nil
+}
+
+// zeroBaseOnly reports whether an entry is a zero-based image with no staged
+// content of its own — i.e. the truncate-only shape. It requires the entry to
+// have no pending payload and no dirty ranges; the caller additionally
+// requires an absent content generation, which is what proves nothing was
+// ever staged for it.
+func zeroBaseOnly(entry *CommitEntry) bool {
+	return !entry.payloadBound && len(entry.payload) == 0 && len(entry.DirtyRanges) == 0
 }
 
 // zeroReaderAt serves a logically-sized all-zero image.
@@ -260,30 +288,4 @@ func (z zeroReaderAt) ReadAt(p []byte, off int64) (int, error) {
 	}
 	clear(p[:n])
 	return int(n), nil
-}
-
-type shadowGenReaderAt struct {
-	shadows *staging.ShadowStore
-	gen     uint64
-	size    int64
-}
-
-func (r *shadowGenReaderAt) ReadAt(p []byte, off int64) (int, error) {
-	if off < 0 {
-		return 0, fmt.Errorf("negative read offset")
-	}
-	if off >= r.size {
-		return 0, io.EOF
-	}
-	if off+int64(len(p)) > r.size {
-		p = p[:r.size-off]
-	}
-	n, err := r.shadows.ReadAtGen(r.gen, off, p)
-	if err != nil {
-		return n, err
-	}
-	if n < len(p) {
-		return n, io.EOF
-	}
-	return n, nil
 }

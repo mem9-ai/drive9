@@ -63,7 +63,14 @@ type CommitEntry struct {
 	// staging generations that existed when the entry was enqueued. Upload and
 	// cleanup use these tokens so a later same-path write cannot swap in newer
 	// shadow bytes or have its pending metadata removed by an older entry.
-	ShadowGen       uint64
+	//
+	// ShadowGen is a CONTENT generation, not a pin token: it gates uploads and
+	// cleanup by "is this still the same bytes", which is what every caller
+	// does with it. Reads of the entry's bytes must go through the
+	// content-generation APIs (ReadAllIfGeneration / OpenIfGeneration /
+	// ReadAtIfGeneration); the pin-generation APIs (ReadAtGen) live in a
+	// different number space and reject a content generation outright.
+	ShadowGen       staging.ContentGen
 	PendingIndexGen uint64
 	WriteBackGen    uint64
 	// DurableWatermarkRev is the newest revision that Dat9FS knows was already
@@ -338,7 +345,7 @@ func (cq *CommitQueue) extentRouteFor(path string, size int64) bool {
 // certification (newer local mutations), and its unchanged evicted parts
 // still reference the shadow as their only restore source. The next
 // staging overwrites the shadow and the next landing reclaims it.
-func (cq *CommitQueue) RetainShadowForLanding(path string, gen uint64) {
+func (cq *CommitQueue) RetainShadowForLanding(path string, gen staging.ContentGen) {
 	if cq == nil {
 		return
 	}

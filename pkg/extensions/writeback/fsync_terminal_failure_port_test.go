@@ -148,7 +148,7 @@ func TestPathTerminalFailureLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stage := func(path, data string) (shadowGen, pendingGen uint64) {
+	stage := func(path, data string) (shadowGen staging.ContentGen, pendingGen uint64) {
 		t.Helper()
 		if err := shadow.WriteFull(path, []byte(data), 0); err != nil {
 			t.Fatal(err)

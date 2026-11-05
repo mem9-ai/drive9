@@ -210,10 +210,10 @@ type Writeback struct {
 	// unlinkedShadowGen is the CONTENT generation the snapshot captured:
 	// `RemoveIfGeneration` compares write generations, so the drop must use
 	// this value (not the pin token).
-	unlinkedShadowGen map[string]uint64
+	unlinkedShadowGen map[string]staging.ContentGen
 	// unlinkedShadowPin is the shadow LIFECYCLE token returned by
 	// Shadow.Pin (pinned once per path; every snapshot shares it).
-	unlinkedShadowPin map[string]uint64
+	unlinkedShadowPin map[string]staging.PinGen
 	// lazy mirrors Options.LazyStaging; syncerCancel stops the background
 	// WAL syncer that bounds the lazy staging power-loss window.
 	// unverified is set while the change-event stream has lost continuity
@@ -280,7 +280,7 @@ type bufferingHandle struct {
 	// re-open whose image is too large to capture: commit cleanup retires
 	// (but keeps readable) the pinned generation, so the still-open fd keeps
 	// serving its own image after the upload lands.
-	pendingShadowGen uint64
+	pendingShadowGen staging.PinGen
 	// pendingImage is an immutable captured pending image: reads of a
 	// pending-overlay handle serve exactly these bytes.
 	pendingImage []byte
@@ -348,7 +348,7 @@ type bufferingHandle struct {
 	// removes the ACTIVE generation, and the pinned file must outlive the
 	// buffer reading it. Released when the buffer materializes fully or
 	// the handle goes away.
-	ledgerShadowGen uint64
+	ledgerShadowGen staging.PinGen
 	// lastStageSize/stageSeq track the handle's own queue staging history:
 	// a landed record whose size equals the last staged image's is this
 	// handle's own landing, and the next staging may continue from its
@@ -884,7 +884,7 @@ func (w *Writeback) MarkPathUnlinked(p string) error {
 			if data, kok := readShadowGenerationFenced(w.opts.Staging.Shadow, p, meta.Size); kok {
 				if err := w.opts.Staging.Shadow.WriteFull(p, data, 0); err == nil {
 					contentGen := w.opts.Staging.Shadow.ActiveGeneration(p)
-					pin := uint64(0)
+					var pin staging.PinGen
 					w.unlinkedMu.Lock()
 					if _, pinned := w.unlinkedShadowPin[p]; !pinned {
 						w.unlinkedMu.Unlock()
@@ -2282,18 +2282,32 @@ func (h *bufferingHandle) Read(ctx context.Context, off int64, dest []byte) (int
 				// The snapshot is GENERATION-bound: a replacement that
 				// reused the name wrote a newer generation at the same
 				// path key, and reading the current one served its bytes.
+				// The saved id is a CONTENT generation (that is what
+				// recordUnlinkedSnapshot stores), so it must be read
+				// through the content-generation API.
 				gen := h.w.unlinkedShadowGeneration(h.path)
-				if gen != 0 {
-					n, rerr := h.w.opts.Staging.Shadow.ReadAtGen(gen, off, dest)
-					if rerr == nil || rerr == io.EOF {
-						return n, nil
+				if gen == 0 {
+					// Legacy marker: nothing identifies the snapshot's bytes.
+					if data, rerr := h.w.opts.Staging.Shadow.ReadAll(h.path); rerr == nil && data != nil {
+						if off >= int64(len(data)) {
+							return 0, nil
+						}
+						return copy(dest, data[off:]), nil
 					}
-				} else if data, rerr := h.w.opts.Staging.Shadow.ReadAll(h.path); rerr == nil && data != nil {
-					if off >= int64(len(data)) {
-						return 0, nil
-					}
-					return copy(dest, data[off:]), nil
+					// The bytes are gone. Falling through would serve the
+					// pending/shadow tiers, which describe whichever object
+					// now owns the reused name — exactly the cross-object
+					// read this branch exists to prevent.
+					return 0, fs.ErrNotFound
 				}
+				n, rerr := h.w.opts.Staging.Shadow.ReadAtIfGeneration(h.path, gen, off, dest)
+				if rerr == nil || rerr == io.EOF {
+					return n, nil
+				}
+				// Stale snapshot (a replacement advanced the content
+				// generation) or a lost file: fail closed rather than
+				// serving the replacement that now owns the name.
+				return 0, fs.ErrNotFound
 			}
 			if h.inner == nil {
 				return 0, fs.ErrNotFound
@@ -3517,7 +3531,7 @@ func (w *Writeback) capturePendingImage(path string) []byte {
 
 // pinPendingShadow pins the path's shadow generation for a pending reader;
 // zero when no shadow exists.
-func (w *Writeback) pinPendingShadow(path string) uint64 {
+func (w *Writeback) pinPendingShadow(path string) staging.PinGen {
 	if w.opts.Staging == nil || w.opts.Staging.Shadow == nil {
 		return 0
 	}
@@ -4455,7 +4469,7 @@ func (w *Writeback) settleRenamedHandle(path string, rev, size int64) {
 // recordUnlinkedSnapshot installs the unlink-snapshot marker with the
 // shadow generation the snapshot captured, so a later drop only removes
 // bytes that are still the snapshot's own.
-func (w *Writeback) recordUnlinkedSnapshot(path string, contentGen, pin uint64) {
+func (w *Writeback) recordUnlinkedSnapshot(path string, contentGen staging.ContentGen, pin staging.PinGen) {
 	w.unlinkedMu.Lock()
 	defer w.unlinkedMu.Unlock()
 	if w.unlinkedShadow == nil {
@@ -4464,13 +4478,13 @@ func (w *Writeback) recordUnlinkedSnapshot(path string, contentGen, pin uint64) 
 	w.unlinkedShadow[path] = struct{}{}
 	if contentGen != 0 {
 		if w.unlinkedShadowGen == nil {
-			w.unlinkedShadowGen = map[string]uint64{}
+			w.unlinkedShadowGen = map[string]staging.ContentGen{}
 		}
 		w.unlinkedShadowGen[path] = contentGen
 	}
 	if pin != 0 {
 		if w.unlinkedShadowPin == nil {
-			w.unlinkedShadowPin = map[string]uint64{}
+			w.unlinkedShadowPin = map[string]staging.PinGen{}
 		}
 		w.unlinkedShadowPin[path] = pin
 	}
@@ -4480,7 +4494,7 @@ func (w *Writeback) recordUnlinkedSnapshot(path string, contentGen, pin uint64) 
 // the shadow (the read fallback for anonymous clean fds).
 // unlinkedShadowGeneration returns the shadow generation the unlink
 // snapshot captured (0 for a legacy marker).
-func (w *Writeback) unlinkedShadowGeneration(path string) uint64 {
+func (w *Writeback) unlinkedShadowGeneration(path string) staging.ContentGen {
 	w.unlinkedMu.Lock()
 	defer w.unlinkedMu.Unlock()
 	return w.unlinkedShadowGen[path]
