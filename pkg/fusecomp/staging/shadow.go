@@ -13,6 +13,8 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/mem9-ai/drive9/pkg/fusecomp/writebuffer"
 )
 
@@ -1682,6 +1684,12 @@ func (s *ShadowStore) removeCoreLocked(remotePath string, expectedGen uint64, re
 //
 // Callers must have passed their quota checks BEFORE rotating: a rejected
 // write then leaves the acknowledged image fully intact.
+// rotatePrePublishHook is a test-only seam at the copy-window exit: the
+// window between the initial refs snapshot and the publication below is
+// exactly where a racing last-Unpin lands, and tests interleave there
+// deterministically through it. Nil in production.
+var rotatePrePublishHook func()
+
 func (s *ShadowStore) rotatePinnedIfNeeded(remotePath string) error {
 	// Snapshot the pinned state under s.mu, including the written-coverage
 	// charge (it transfers to the copy so the byte quota neither leaks the
@@ -1703,13 +1711,25 @@ func (s *ShadowStore) rotatePinnedIfNeeded(remotePath string) error {
 	oldWrittenBytes := old.writtenBytes
 	s.mu.Unlock()
 
-	// The copy duplicates the image on disk: the full temporary
-	// allocation obeys the disk guard even when the logical mutation is
-	// small (a same-size WriteFull has delta=0, a range overwrite added=0,
-	// a shrink is negative — none of those gates would otherwise fire).
+	// The copy duplicates the image's ACTUAL data: the disk guard and the
+	// copy both use the filesystem's own data extents (SEEK_DATA/
+	// SEEK_HOLE) — not the logical size, and not this process's written-
+	// coverage map. Reserving the logical size would reject valid
+	// low-allocation updates on sparse files; trusting the coverage map
+	// would zero ranges a recovered file actually holds (its content
+	// extends beyond anything the current process wrote). Filesystems
+	// without extent seeking reserve the full size (dense fallback).
 	if oldSize > 0 {
-		if err := s.checkFreeRatio(oldSize); err != nil {
-			return fmt.Errorf("shadow rotate %s: %w", remotePath, err)
+		guardBytes := oldSize
+		if data, dense, err := shadowDataExtents(oldFD, oldSize); err == nil {
+			if !dense {
+				guardBytes = data
+			}
+		}
+		if guardBytes > 0 {
+			if err := s.checkFreeRatio(guardBytes); err != nil {
+				return fmt.Errorf("shadow rotate %s: %w", remotePath, err)
+			}
 		}
 	}
 
@@ -1717,7 +1737,7 @@ func (s *ShadowStore) rotatePinnedIfNeeded(remotePath string) error {
 	// changes until the publication below succeeds.
 	diskPath := s.shadowPath(remotePath)
 	tmpPath := fmt.Sprintf("%s.cow.%d", diskPath, gen)
-	if err := copyShadowFile(tmpPath, oldFD, oldSize, oldWritten); err != nil {
+	if err := copyShadowFile(tmpPath, oldFD, oldSize); err != nil {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("shadow rotate %s: %w", remotePath, err)
 	}
@@ -1731,6 +1751,9 @@ func (s *ShadowStore) rotatePinnedIfNeeded(remotePath string) error {
 		_ = os.Rename(retiredPath, diskPath)
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("shadow rotate %s: promote rename: %w", remotePath, err)
+	}
+	if rotatePrePublishHook != nil {
+		rotatePrePublishHook()
 	}
 	nfd, err := os.OpenFile(diskPath, os.O_RDWR, 0o644)
 	if err != nil {
@@ -1794,49 +1817,102 @@ func (s *ShadowStore) rotatePinnedIfNeeded(remotePath string) error {
 	return nil
 }
 
-// copyShadowFile reproduces the source image at dst. When the source's
-// written coverage is known (this process wrote it), only those ranges are
-// copied and the destination is sparse-extended to the full size — a
-// multi-GiB sparse shadow stays sparse instead of being densified into a
-// real allocation. A recovered-from-disk source has no coverage knowledge
-// and is copied densely (the caller's free-space guard already reserved the
-// full size for exactly this worst case).
-func copyShadowFile(dst string, src *os.File, size int64, written shadowWrittenRanges) error {
+// copyShadowFile reproduces the source image at dst, walking the
+// filesystem's data extents (SEEK_DATA/SEEK_HOLE) and reproducing them —
+// holes stay holes, and a recovered file's full content (beyond anything
+// the current process wrote) is preserved: the extent walk is the
+// filesystem's own content map, complete regardless of process coverage
+// tracking. Filesystems without extent seeking get a dense copy; the
+// caller reserved the full size for exactly that fallback.
+func copyShadowFile(dst string, src *os.File, size int64) error {
 	out, err := os.OpenFile(dst, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = out.Close() }()
-	if size > 0 {
-		if err := out.Truncate(size); err != nil {
-			return err
-		}
-	}
-	if written.total > 0 && written.tree != nil {
-		buf := make([]byte, 64<<10)
-		var copyErr error
-		written.tree.AscendGreaterOrEqual(DirtyExtent{Offset: 0}, func(e DirtyExtent) bool {
-			for off := e.Offset; off < e.Offset+e.Length && copyErr == nil; off += int64(len(buf)) {
-				end := off + int64(len(buf))
-				if end > e.Offset+e.Length {
-					end = e.Offset + e.Length
-				}
-				chunk := buf[:end-off]
-				if _, copyErr = src.ReadAt(chunk, off); copyErr != nil {
-					return false
-				}
-				if _, copyErr = out.WriteAt(chunk, off); copyErr != nil {
-					return false
-				}
-			}
-			return copyErr == nil
-		})
-		if copyErr != nil {
-			return copyErr
-		}
+	if size == 0 {
 		return nil
 	}
-	// Dense fallback: no coverage knowledge (recovered file).
+	if err := out.Truncate(size); err != nil {
+		return err
+	}
+	if err := copyFileExtents(out, src, size); err != nil {
+		if err == errExtentSeekUnsupported {
+			return copyFileDense(out, src, size)
+		}
+		return err
+	}
+	return nil
+}
+
+// errExtentSeekUnsupported reports that SEEK_DATA/SEEK_HOLE are unusable on
+// this file/filesystem; callers fall back to a dense copy.
+var errExtentSeekUnsupported = errors.New("extent seeking unsupported")
+
+// copyFileExtents copies each data extent [data, hole) reported by the
+// filesystem, leaving the gaps as holes in dst.
+func copyFileExtents(out *os.File, src *os.File, size int64) error {
+	conn, err := src.SyscallConn()
+	if err != nil {
+		return errExtentSeekUnsupported
+	}
+	var seekErr error
+	_ = conn.Control(func(fd uintptr) {
+		seekErr = copyFileExtentsFD(out, int(fd), size)
+	})
+	return seekErr
+}
+
+func copyFileExtentsFD(out *os.File, fd int, size int64) error {
+	buf := make([]byte, 64<<10)
+	off := int64(0)
+	for off < size {
+		data, err := unix.Seek(fd, off, unix.SEEK_DATA)
+		if err != nil {
+			if err == unix.ENXIO {
+				return nil // the rest is a hole
+			}
+			return extentSeekFallback(err)
+		}
+		hole, err := unix.Seek(fd, data, unix.SEEK_HOLE)
+		if err != nil {
+			if err == unix.ENXIO {
+				hole = size
+			} else {
+				return extentSeekFallback(err)
+			}
+		}
+		if hole > size {
+			hole = size
+		}
+		for at := data; at < hole; at += int64(len(buf)) {
+			end := at + int64(len(buf))
+			if end > hole {
+				end = hole
+			}
+			chunk := buf[:end-at]
+			if _, err := unix.Pread(fd, chunk, at); err != nil {
+				return err
+			}
+			if _, err := out.WriteAt(chunk, at); err != nil {
+				return err
+			}
+		}
+		off = hole
+	}
+	return nil
+}
+
+func extentSeekFallback(err error) error {
+	if err == unix.ENOSYS || err == unix.EINVAL || err == unix.ENOTTY {
+		return errExtentSeekUnsupported
+	}
+	return err
+}
+
+// copyFileDense is the whole-image fallback for filesystems without extent
+// seeking.
+func copyFileDense(out *os.File, src *os.File, size int64) error {
 	buf := make([]byte, 64<<10)
 	for off := int64(0); off < size; off += int64(len(buf)) {
 		end := off + int64(len(buf))
@@ -1850,6 +1926,50 @@ func copyShadowFile(dst string, src *os.File, size int64, written shadowWrittenR
 		if _, err := out.WriteAt(chunk, off); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// shadowDataExtents reports the image's real data bytes; dense=true means
+// extent seeking is unavailable and the whole size should be reserved.
+func shadowDataExtents(src *os.File, size int64) (dataBytes int64, dense bool, err error) {
+	conn, err := src.SyscallConn()
+	if err != nil {
+		return 0, true, nil
+	}
+	var total int64
+	var seekErr error
+	_ = conn.Control(func(fd uintptr) {
+		seekErr = shadowDataExtentsFD(int(fd), size, &total)
+	})
+	if seekErr == errExtentSeekUnsupported {
+		return 0, true, nil
+	}
+	if seekErr != nil {
+		return 0, false, seekErr
+	}
+	return total, false, nil
+}
+
+func shadowDataExtentsFD(fd int, size int64, total *int64) error {
+	off := int64(0)
+	for off < size {
+		data, e := unix.Seek(fd, off, unix.SEEK_DATA)
+		if e != nil {
+			if e == unix.ENXIO {
+				return nil // the rest is a hole
+			}
+			return extentSeekFallback(e)
+		}
+		hole, e := unix.Seek(fd, data, unix.SEEK_HOLE)
+		if e != nil && e != unix.ENXIO {
+			return extentSeekFallback(e)
+		}
+		if e == unix.ENXIO || hole > size {
+			hole = size
+		}
+		*total += hole - data
+		off = hole
 	}
 	return nil
 }

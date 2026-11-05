@@ -136,10 +136,16 @@ func TestRotationRacedLastUnpinCleansUp(t *testing.T) {
 	gen := s.Pin("/f")
 	before := s.PendingBytes()
 	// Simulate the race deterministically: the last reader drops its ref
-	// during the copy window, before publication.
-	s.mu.Lock()
-	s.refs[gen] = 0
-	s.mu.Unlock()
+	// INSIDE the copy window — after rotatePinnedIfNeeded's initial refs
+	// snapshot (so the rotation proceeds) but before the publication
+	// re-check. Without the publication branch, the retired entry would be
+	// installed with nobody left to unpin it.
+	rotatePrePublishHook = func() {
+		s.mu.Lock()
+		s.refs[gen] = 0
+		s.mu.Unlock()
+	}
+	t.Cleanup(func() { rotatePrePublishHook = nil })
 
 	if _, err := s.WriteAt("/f", 0, []byte("RACE-image"), 1); err != nil {
 		t.Fatal(err)
@@ -186,4 +192,104 @@ func TestRotationQuotaBytesTransfer(t *testing.T) {
 	if err := s.WriteFull("/g", image, 1); err != nil {
 		t.Fatalf("quota leaked after rotation cycle: %v", err)
 	}
+}
+
+// TestRotationCopyPreservesRecoveredContent pins the extent-copy's
+// completeness against the coverage map: a file RECOVERED from disk (no
+// written-range knowledge) plus one partial in-process write must rotate
+// without losing the recovered regions — the filesystem's extents, not the
+// process's coverage, are the content map.
+func TestRotationCopyPreservesRecoveredContent(t *testing.T) {
+	dir := t.TempDir()
+	s1, err := NewShadowStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	image := []byte("RECOVERED-IMAGE")
+	if err := s1.WriteFull("/f", image, 1); err != nil {
+		t.Fatal(err)
+	}
+	s1.Close()
+
+	// Reopen: the shadow is recovered from disk — no coverage tracking.
+	s2, err := NewShadowStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	gen := s2.Pin("/f")
+	if _, err := s2.WriteAt("/f", 0, []byte("r"), 1); err != nil {
+		t.Fatal(err)
+	}
+	s2.Unpin(gen)
+	data, err := s2.ReadAll("/f")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "rECOVERED-IMAGE" {
+		t.Fatalf("rotated image = %q, want rECOVERED-IMAGE (recovered regions preserved)", data)
+	}
+}
+
+// TestRotationSparseGuardUsesRealAllocation pins the guard's accuracy: the
+// rotation measures the image's REAL data volume through the filesystem's
+// extents — a sparse image whose logical size dwarfs its data both rotates
+// freely and would pass a ratio guard that the logical size would fail.
+func TestRotationSparseGuardUsesRealAllocation(t *testing.T) {
+	s, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	const logical = 64 << 20
+	sparse := make([]byte, 1<<20)
+	if _, err := s.WriteAt("/f", 0, sparse, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Truncate("/f", logical, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	// The guard's INPUT is the extent-measured data volume, a fraction of
+	// the logical size.
+	src, size, release, err := s.OpenIfGeneration("/f", s.ActiveGeneration("/f"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataBytes, dense, err := shadowDataExtents(src, size)
+	release()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dense {
+		t.Skip("filesystem without extent seeking; dense fallback reserved the full size by design")
+	}
+	if dataBytes >= logical {
+		t.Fatalf("extent walk reported %d bytes for a %d-byte sparse image (1 MiB data)", dataBytes, logical)
+	}
+
+	// The measured volume passes a ratio guard the logical size would fail.
+	// (s.writeCacheFreeRatio is 0 on this store; drive the threshold via a
+	// store configured at 0.9 so the comparison is the guard's own math.)
+	total := int64(128 << 20)
+	free := total - 4<<20
+	q, err := NewShadowStoreWithQuota(t.TempDir(), 0.9, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	if err := q.evalFreeRatio(free, total, logical); err == nil {
+		t.Fatalf("logical size %d unexpectedly passed a 0.9-ratio guard with %d free", logical, free)
+	}
+	if err := q.evalFreeRatio(free, total, dataBytes); err != nil {
+		t.Fatalf("extent-measured %d bytes rejected by the 0.9-ratio guard: %v", dataBytes, err)
+	}
+
+	// And the rotation itself goes through on the sparse image.
+	gen := s.Pin("/f")
+	if _, err := s.WriteAt("/f", 0, []byte("X"), 1); err != nil {
+		t.Fatalf("sparse rotation rejected: %v", err)
+	}
+	s.Unpin(gen)
 }
