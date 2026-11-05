@@ -87,6 +87,10 @@ func ExampleClient_filesystemCRUDAndMetadata() {
 	// The identity echo is optional: a server that reports it lets a caller
 	// bind later writes to the object THIS create produced.
 	_, _, _ = c.CreateFileCreatedCtx(ctx, "/workspace/empty-created.txt")
+	// The completion-identity contract is negotiated up front: a caller that
+	// must bind later writes to the published object decides BEFORE publishing.
+	_ = c.CachedCompletionIdentitySupported()
+	_ = c.WarmCompletionIdentity(ctx)
 
 	_, _ = c.Read("/workspace/a.txt")
 	_, _ = c.ReadCtx(ctx, "/workspace/b.txt")
@@ -828,6 +832,8 @@ var coveredClientMethods = map[string]bool{
 	"CreateFile":                             true,
 	"CreateFileCtx":                          true,
 	"CreateFileCreatedCtx":                   true,
+	"CachedCompletionIdentitySupported":      true,
+	"WarmCompletionIdentity":                 true,
 	"CreateFSLayer":                          true,
 	"DeleteFSLayer":                          true,
 	"CreateJournal":                          true,
