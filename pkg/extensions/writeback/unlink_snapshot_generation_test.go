@@ -59,12 +59,4 @@ func TestUnlinkSnapshotPinSurvivesPathnameReuse(t *testing.T) {
 		t.Fatal("stale content generation still resolved; the two spaces are being conflated again")
 	}
 
-	// Releasing the pin retires the backing for good.
-	shadows.Unpin(pin)
-	pin = 0
-	if _, rerr := shadows.ReadAtGen(staging.PinGen(contentGen), 0, buf); rerr == nil {
-		// Not a hard failure: the content generation could coincidentally
-		// match a live pin-space id. The meaningful assertion is above.
-		t.Log("content generation happened to resolve as a pin token; content match already asserted")
-	}
 }

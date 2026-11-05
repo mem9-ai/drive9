@@ -4677,16 +4677,6 @@ func (w *Writeback) recordUnlinkedSnapshot(path string, contentGen staging.Conte
 	}
 }
 
-// unlinkedShadowServed reports whether a path has an unlink snapshot in
-// the shadow (the read fallback for anonymous clean fds).
-// unlinkedShadowGeneration returns the shadow generation the unlink
-// snapshot captured (0 for a legacy marker).
-func (w *Writeback) unlinkedShadowGeneration(path string) staging.ContentGen {
-	w.unlinkedMu.Lock()
-	defer w.unlinkedMu.Unlock()
-	return w.unlinkedShadowGen[path]
-}
-
 // unlinkedShadowPinFor returns the LIFECYCLE token that keeps the unlink
 // snapshot's backing readable after a replacement retires it. Readings of an
 // anonymous descriptor go through this token; the content generation is only
@@ -4697,6 +4687,8 @@ func (w *Writeback) unlinkedShadowPinFor(path string) staging.PinGen {
 	return w.unlinkedShadowPin[path]
 }
 
+// unlinkedShadowServed reports whether a path has an unlink snapshot in the
+// shadow (the read fallback for anonymous clean fds).
 func (w *Writeback) unlinkedShadowServed(path string) bool {
 	w.unlinkedMu.Lock()
 	defer w.unlinkedMu.Unlock()

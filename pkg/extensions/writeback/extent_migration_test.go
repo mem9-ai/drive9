@@ -33,7 +33,6 @@ type migrationServer struct {
 	partSize int64
 
 	mu       sync.Mutex
-	path     string
 	layout   string // "classic" | "extent"
 	revision int64
 	size     int64
