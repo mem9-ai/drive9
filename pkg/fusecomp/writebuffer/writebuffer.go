@@ -321,7 +321,7 @@ func (wb *WriteBuffer) writeSmallFile(offset int64, data []byte) (uint32, error)
 	}
 	wb.touched = true
 	wb.dirtyParts[0] = true // small files map to a single logical part
-	wb.taintRemoteAll() // the single image diverges as a whole
+	wb.taintRemoteAll()     // the single image diverges as a whole
 
 	// Sequential write detection
 	if offset == wb.appendCursor {

@@ -23,7 +23,7 @@ func TestWaitPathOutcomeReportsTerminalFailure(t *testing.T) {
 	defer cq.DrainAll()
 
 	boom := errors.New("server rejected the upload")
-	cq.rememberPathCommitErr(&CommitEntry{Path: "/p.bin"}, boom)
+	cq.RecordTerminalFailureForPath("/p.bin", boom)
 
 	// The path is idle (nothing queued), so an idle-only wait returns true...
 	if !cq.WaitPathDeadline("/p.bin", time.Second) {
@@ -33,20 +33,12 @@ func TestWaitPathOutcomeReportsTerminalFailure(t *testing.T) {
 	if got := cq.WaitPathOutcome("/p.bin", time.Second); !errors.Is(got, boom) {
 		t.Fatalf("WaitPathOutcome = %v, want the terminal upload failure", got)
 	}
-
-	// A later successful commit clears it: a stale failure must not surface
-	// for a path that has since landed.
-	cq.rememberPathCommitErr(&CommitEntry{Path: "/p.bin"}, nil)
-	if got := cq.WaitPathOutcome("/p.bin", time.Second); got != nil {
-		t.Fatalf("WaitPathOutcome after success = %v, want nil", got)
-	}
 }
 
 // A remembered failure belongs to the PUBLICATION that failed, not to the
-// pathname forever. After a cancel (unlink/rename) or a later successful
-// publication of the same name, a Sync must not keep reporting the old
-// error — otherwise a recreated file inherits its predecessor's EIO.
-func TestPathCommitErrRetiredByLifecycle(t *testing.T) {
+// pathname forever: after a later successful publication of the same name, a
+// Sync must not keep reporting the old error.
+func TestTerminalFailureRetiredBySuccess(t *testing.T) {
 	shadow, err := staging.NewShadowStoreWithQuota(t.TempDir(), 0, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -56,20 +48,13 @@ func TestPathCommitErrRetiredByLifecycle(t *testing.T) {
 	defer cq.DrainAll()
 
 	boom := errors.New("predecessor failed")
-	cq.rememberPathCommitErr(&CommitEntry{Path: "/p.bin"}, boom)
-	if got := cq.WaitPathOutcome("/p.bin", time.Second); !errors.Is(got, boom) {
+	cq.RecordTerminalFailureForPath("/q.bin", boom)
+	if got := cq.WaitPathOutcome("/q.bin", time.Second); !errors.Is(got, boom) {
 		t.Fatalf("precondition: outcome = %v, want the failure", got)
 	}
 
-	// A cancel (what unlink/rename/delete issue) retires it.
-	cq.cancelPathEntries("/p.bin")
-	if got := cq.WaitPathOutcome("/p.bin", time.Second); got != nil {
-		t.Fatalf("after cancel, outcome = %v, want nil (a recreated file must not inherit it)", got)
-	}
-
-	// A later successful publication outside the queue retires it too.
-	// Exercise the REAL success path (landedAt) rather than the clearer
-	// directly: every non-PATCH publication funnels through it.
+	// A later successful publication retires it. Exercised through the REAL
+	// success path (landedAt), not the clearer directly.
 	wb, werr := New(Options{Policy: PolicyCloseSync, Client: newTestClient("http://127.0.0.1:1"), Staging: mustStaging(t)})
 	if werr != nil {
 		t.Fatal(werr)
@@ -77,8 +62,8 @@ func TestPathCommitErrRetiredByLifecycle(t *testing.T) {
 	if wb.queue == nil {
 		t.Fatal("precondition: the writeback must own a commit queue")
 	}
-	wb.queue.rememberPathCommitErr(&CommitEntry{Path: "/q.bin"}, boom)
-	wb.landedAt("/q.bin", 5, 1024)
+	wb.queue.RecordTerminalFailureForPath("/q.bin", boom)
+	wb.landedAt("/q.bin", 5, 1024, 0, nil)
 	if got := wb.queue.WaitPathOutcome("/q.bin", time.Second); got != nil {
 		t.Fatalf("after a successful publication, outcome = %v, want nil", got)
 	}

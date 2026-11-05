@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/mountstate"
 )
 
@@ -236,6 +237,26 @@ func TestExecErrorsAreActionable(t *testing.T) {
 	}
 }
 
+func TestExecCancellationErrorStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		code int
+	}{
+		{"before execution", context.Canceled, execExitCanceled},
+		{"wrapped before execution", fmt.Errorf("prepare: %w", context.Canceled), execExitCanceled},
+		{"unknown after dispatch", &client.RuntimeOutcomeUnknownError{ExecutionID: "rex_12345678", Cause: context.Canceled}, execExitUnknown},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := execError(tc.err, "")
+			var coded interface{ ExitCode() int }
+			if !errors.As(err, &coded) || coded.ExitCode() != tc.code {
+				t.Fatalf("error = %v, want status %d", err, tc.code)
+			}
+		})
+	}
+}
+
 func TestExecInterruptCancelsRemoteCommand(t *testing.T) {
 	stopped := make(chan struct{})
 	var once sync.Once
@@ -451,7 +472,7 @@ func TestExecShowsStartingSandboxOnlyWhileWaiting(t *testing.T) {
 	if err := runExec(t.Context(), []string{"true"}, rt); err != nil {
 		t.Fatal(err)
 	}
-	if got := stderr.String(); got != "drive9: starting sandbox…\r\033[K" {
+	if got := stderr.String(); got != "drive9: starting command…\r\033[K" {
 		t.Fatalf("stderr = %q", got)
 	}
 	if stdout.String() != "out" {
@@ -563,6 +584,14 @@ func TestExecRejectsDelegatedToken(t *testing.T) {
 	for _, kind := range []CredentialKind{CredentialOwner, CredentialFSScoped, CredentialNone} {
 		if err := execCredentialError(kind); err != nil {
 			t.Fatalf("kind %d: %v", kind, err)
+		}
+	}
+}
+
+func TestExecBackendLabelDoesNotInventSandbox(t *testing.T) {
+	for _, test := range []struct{ field, want string }{{"", "the remote executor"}, {"new", "a new sandbox"}, {"warm", "a warm sandbox"}, {"future", "the remote executor"}} {
+		if got := execBackendLabel(test.field); got != test.want {
+			t.Fatalf("backend %q = %q, want %q", test.field, got, test.want)
 		}
 	}
 }

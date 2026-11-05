@@ -10,8 +10,10 @@ package writeback
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"net/http"
 	"os"
@@ -187,8 +189,9 @@ type Writeback struct {
 	// them; keeps this per-handle on FileHandle.
 	liveSet sync.Map
 	// landedMu/landed is the recently-landed table (landedAt).
-	landedMu sync.Mutex
-	landed   map[string]landedInfo
+	landedMu    sync.Mutex
+	landed      map[string]landedInfo
+	landedBytes int64
 	// mutEpoch orders handle mutations mount-wide (v1 fs.dirtySeq): the
 	// sibling-visibility tiers pick an inode's newest uncommitted image by
 	// it, no matter which fd produced the image.
@@ -213,8 +216,22 @@ type Writeback struct {
 	unlinkedShadowPin map[string]uint64
 	// lazy mirrors Options.LazyStaging; syncerCancel stops the background
 	// WAL syncer that bounds the lazy staging power-loss window.
-	lazy         bool
-	syncerCancel context.CancelFunc
+	// unverified is set while the change-event stream has lost continuity
+	// (EventUnverified, cleared by EventVerified — a checkout is NOT
+	// verification): same-origin watermarks prove nothing then, so the
+	// landed table is dropped at the break and watermark adoption stays
+	// suspended until the stream re-verifies.
+	unverified atomic.Bool
+	// recoveryCacheGens snapshots the write-cache generations present at
+	// recovery start. The queue's recovery may land a ledger-owned path
+	// whose older .dat/.meta pair survived a crash (published after the
+	// ledger put, before the enqueue's cache removal); retiring that pair
+	// at the queue's success is generation-safe against exactly this
+	// snapshot — a flush staged after it carries a newer generation and
+	// survives.
+	recoveryCacheGens map[string]uint64
+	lazy              bool
+	syncerCancel      context.CancelFunc
 	// commitSeeder caches the just-committed image (readCache.Put at
 	// commit settle) so reads racing backend replica lag see this mount's
 	// own writes; nil disables seeding.
@@ -267,6 +284,14 @@ type bufferingHandle struct {
 	// pendingImage is an immutable captured pending image: reads of a
 	// pending-overlay handle serve exactly these bytes.
 	pendingImage []byte
+	// supersededPendingGen is the pending-index generation this handle's
+	// content provably INCLUDES: the generation this handle's own queue
+	// staging published (stageAndEnqueueOpt) or the pending image a re-open
+	// materialized. Only this generation — never whatever happens to be
+	// registered at the path when a write-cache image is stamped — may be
+	// claimed as superseded by a landing, so a foreign writer's conflict
+	// marker cannot be retired by an image that never contained its bytes.
+	supersededPendingGen uint64
 	// pendingFile backs a snapshot larger than the memory bound: the old
 	// object's bytes are streamed to a temp file (closed with the handle),
 	// so a 65MiB anonymous fd keeps its identity instead of falling back
@@ -311,6 +336,26 @@ type bufferingHandle struct {
 	// .dat/.meta track; Release owes the uploader a Submit for it (v1: the
 	// write-back cache fast path — Flush persists locally, the upload is
 	// enqueued once, at the close boundary).
+	// selfLandSize/selfLandSum remember THIS handle's last streamed inline
+	// commit when the stream protocol reported no revision: the next write
+	// on the same descriptor needs a continuation base, and only a verified
+	// read-back (the row equals those exact bytes) can attribute a revision
+	// to it. Zero size = none pending.
+	selfLandSize int64
+	selfLandSum  [sha256.Size]byte
+	// ledgerShadowGen pins the shadow generation backing this handle's
+	// lazy ledger view (a spilled pending image): the queue's landing
+	// removes the ACTIVE generation, and the pinned file must outlive the
+	// buffer reading it. Released when the buffer materializes fully or
+	// the handle goes away.
+	ledgerShadowGen uint64
+	// lastStageSize/stageSeq track the handle's own queue staging history:
+	// a landed record whose size equals the last staged image's is this
+	// handle's own landing, and the next staging may continue from its
+	// revision (same-origin table + size match; divergence stays a CAS
+	// conflict).
+	lastStageSize int64
+	stagedHist    uint64
 	stagedToCache bool
 	// unlinked marks the handle anonymous (fh.Unlinked): the buffer
 	// keeps serving the fd, commits are discarded.
@@ -404,6 +449,36 @@ func New(opts Options) (*Writeback, error) {
 		}
 		opts.Events.On(fs.EventCheckout, dropCleanBuffers)
 		opts.Events.On(fs.EventUnverified, dropCleanBuffers)
+		// The landed table is a SAME-ORIGIN proof: "revision r at this path
+		// is one THIS mount wrote". A remote-origin change ends that proof
+		// for the path — most dangerously a foreign delete+recreate, whose
+		// replacement starts at a LOW revision while our stale watermark
+		// sits high; adopting it would replace a fresh handle's correct
+		// base with the dead incarnation's revision and the conditional
+		// upload would conflict forever (v1 forgot its committed-revision
+		// watermark at exactly these namespace changes). A checkout resets
+		// the whole view: no landing is provably ours anymore — and a
+		// checkout is NOT stream verification (401 view resets and layer
+		// switches emit it while the stream may still be down), so it must
+		// not end the unverified suspension; only a real SSE catch-up does
+		// (the reset path emits EventVerified once its revalidation
+		// completes).
+		opts.Events.On(fs.EventInvalidated, func(ev fs.Event) { w.forgetLanded(ev.Path) })
+		opts.Events.On(fs.EventDelete, func(ev fs.Event) { w.forgetLanded(ev.Path) })
+		opts.Events.On(fs.EventCheckout, func(fs.Event) { w.clearLanded() })
+		// Stream continuity lost: ordinary file API keeps working while
+		// change events stop, so a foreign delete+recreate can replace a
+		// path with a LOW revision under a stale high watermark and no
+		// invalidation is ever observed. Every same-origin proof is
+		// suspended — drop the table (it can only refill from landings
+		// that happen after the break, all provably ours) and keep
+		// adoption off until EventVerified; delayed event delivery cannot
+		// retrofit a base a staging already persisted during the gap.
+		opts.Events.On(fs.EventUnverified, func(fs.Event) {
+			w.unverified.Store(true)
+			w.clearLanded()
+		})
+		opts.Events.On(fs.EventVerified, func(fs.Event) { w.unverified.Store(false) })
 	}
 	// FlushDebounce semantics: 0 disables, negative means unset (2s
 	// default — the CLI's default -1 must land on the default, not on 0).
@@ -432,6 +507,73 @@ func New(opts Options) (*Writeback, error) {
 			workers = defaultUploadConcurrency
 		}
 		up := NewWriteBackUploader(opts.Client, w.wbCache, workers, root)
+		// The snapshot callback runs under the write-back cache's path lock at
+		// upload time: the failure stamp it captures is the one this landing
+		// may clear, and never a failure recorded after the upload started.
+		up.SnapshotStagingGens = func(path string) StagingGens {
+			gens := StagingGens{}
+			if opts.Staging != nil {
+				if opts.Staging.Pending != nil {
+					gens.PendingIndexGen = opts.Staging.Pending.Generation(path)
+				}
+				if opts.Staging.Shadow != nil {
+					gens.ShadowGen = opts.Staging.Shadow.ActiveGeneration(path)
+				}
+			}
+			if w.queue != nil {
+				gens.TerminalFailureSeq = w.queue.PathTerminalFailureSeq(path)
+			}
+			return gens
+		}
+		up.ResolveConflict = func(path string, meta *staging.WriteBackMeta, data []byte, conflictedBase int64) (int64, bool) {
+			// Same-origin AND same-payload proof, byte-exact. The landed
+			// record keeps the bytes its revision ACTUALLY uploaded (read
+			// under the uploader's generation gate), and a conflicted entry
+			// rebases only when its payload is that landing's own DUPLICATE
+			// — the duplicate-commit race (the kernel's asynchronous RELEASE
+			// racing a handoff flush of one handle, the loser staging the
+			// same image at the pre-landing base). Everything else refuses:
+			// a divergent image (rebasing it would overwrite the winner's
+			// bytes), a foreign advance (never in the table), and any
+			// landing whose payload identity is unknown (the ledger track
+			// and streamed images record no bytes — checksums and sizes
+			// alone prove nothing). The proof obeys the same continuity
+			// restriction as every other watermark use: while the event
+			// stream is unverified the table may hold revisions recorded
+			// DURING the gap, and a foreign recreation whose events have
+			// not arrived could sit at a coincidentally equal revision.
+			if w.unverified.Load() {
+				return 0, false
+			}
+			rev, _, _, ok := w.landedRecord(path)
+			if !ok || rev <= conflictedBase || rev <= meta.BaseRev {
+				return 0, false
+			}
+			img, known := w.landedImage(path)
+			if !known || len(data) != len(img) {
+				return 0, false
+			}
+			for i := range data {
+				if data[i] != img[i] {
+					return 0, false
+				}
+			}
+			if !w.wbCache.RebaseBaseRevIfGeneration(path, meta.Generation, rev) {
+				return 0, false
+			}
+			return rev, true
+		}
+		up.LedgerOwned = func(path string) bool {
+			return w.opts.Staging != nil && w.opts.Staging.Pending.HasPending(path)
+		}
+		up.RecordLanding = func(path string, data []byte, committedRev int64, meta *staging.WriteBackMeta) {
+			// The identity is recorded at the uploader's success point, for
+			// exactly the bytes that were published — capturing it outside
+			// the upload's generation gate could pair one generation's
+			// payload with another's revision and let a later conflict
+			// "prove" the wrong image.
+			w.landedAt(path, committedRev, int64(len(data)), crc32.ChecksumIEEE(data), data)
+		}
 		up.OnSuccess = func(meta staging.WriteBackMeta, committedRev int64, gens StagingGens) {
 			unlock := w.pathLocks.lock(meta.Path)
 			defer unlock()
@@ -445,9 +587,8 @@ func New(opts Options) (*Writeback, error) {
 			// rewrote the settle target (root "/": "/team/f" became "/";
 			// root "/team": "/f"), so landedAt/inode-settle updated the
 			// wrong path and the uploaded file missed its own landing.
-			if committedRev > 0 {
-				w.landedAt(meta.Path, committedRev, meta.Size)
-			}
+			// The landed record itself is written by RecordLanding at the
+			// upload's success point, with the published bytes.
 			if w.commitSeeder != nil && committedRev > 0 && meta.Size > 0 && w.commitSeedAllowed(meta.Size) {
 				if current, data, ok := w.wbCache.GetMetaAndView(meta.Path); ok && current.Generation == meta.Generation && int64(len(data)) == meta.Size {
 					w.commitSeeder(meta.Path, data, committedRev)
@@ -459,6 +600,17 @@ func New(opts Options) (*Writeback, error) {
 				// Landed carrying the size) — never the parent listing, the
 				// kernel view, or unrelated cached data.
 				opts.Events.Emit(fs.Event{Kind: fs.EventLanded, Path: meta.Path, Rev: committedRev, Size: meta.Size, HasSize: true})
+			}
+			// The write-back track's async landing (Release submits the Flush
+			// snapshot) is a real remote landing of the path's newest image:
+			// it must retire a terminal failure the commit queue recorded for
+			// an older image, or a recovered writer keeps answering EIO
+			// forever. Seq-guarded so a failure recorded after this upload
+			// started (a newer queue generation) survives; generation-fenced
+			// on the pending side for the same reason.
+			if w.queue != nil {
+				w.queue.ClearTerminalFailureIfSeq(meta.Path, gens.TerminalFailureSeq)
+				w.queue.ResolveSupersededConflict(meta.Path, meta.SupersedesPendingGen)
 			}
 		}
 		w.uploader = up
@@ -491,16 +643,24 @@ func New(opts Options) (*Writeback, error) {
 			// RestorePart pointed at a shadow generation the queue deletes.
 			if entry.SnapshotID != "" {
 				if h := w.handleForStagedSnapshot(entry.SnapshotID); h != nil {
-					{
-						if !h.completeStagedLanding(committedRev, entry.Size, entry.SnapshotID, false) {
-							// The buffer moved past the staged image, but its
-							// still-unchanged evicted parts reference THIS
-							// shadow generation and have no other restore
-							// source until their own landing: the queue's
-							// cleanup must keep the shadow.
-							w.queue.RetainShadowForLanding(entry.Path, entry.ShadowGen)
-						}
+					if !h.completeStagedLanding(committedRev, entry.Size, entry.SnapshotID, false) {
+						// The buffer moved past the staged image, but its
+						// still-unchanged evicted parts reference THIS
+						// shadow generation and have no other restore
+						// source until their own landing: the queue's
+						// cleanup must keep the shadow.
+						w.queue.RetainShadowForLanding(entry.Path, entry.ShadowGen)
 					}
+				}
+			}
+			// A recovery landing retires the superseded .dat/.meta pair it
+			// overtook (see recoveryCacheGens): without this the stale pair
+			// keeps answering pending reads and future recoveries long
+			// after its successor landed. Generation-guarded against any
+			// flush staged after the snapshot.
+			if w.recoveryCacheGens != nil && w.wbCache != nil {
+				if gen, ok := w.recoveryCacheGens[entry.Path]; ok {
+					w.wbCache.RemoveIfGeneration(entry.Path, gen)
 				}
 			}
 			w.acknowledgeUploadedCreate(entry.Path, committedRev)
@@ -512,7 +672,7 @@ func New(opts Options) (*Writeback, error) {
 			// revision (row updated, backend replicas still converging) then
 			// serve this mount's own bytes instead of a lagging replica.
 			if committedRev > 0 {
-				w.landedAt(entry.Path, committedRev, entry.Size)
+				w.landedAt(entry.Path, committedRev, entry.Size, 0, nil)
 			}
 			if w.commitSeeder != nil && committedRev > 0 && entry.Size > 0 && w.commitSeedAllowed(entry.Size) {
 				if data, derr := opts.Staging.Shadow.ReadAll(entry.Path); derr == nil && int64(len(data)) == entry.Size {
@@ -614,10 +774,38 @@ func (w *Writeback) Start(ctx context.Context) error {
 			fmt.Fprintf(os.Stderr, "drive9: pending index recovery: %v\n", err)
 		}
 	}
+	// Recovery ownership is snapshotted BEFORE either track starts: the
+	// queue's workers begin inside RecoverPending, and a path they land and
+	// remove before the uploader's filter evaluates would pass a live
+	// HasPending check and get the stale .dat/.meta submitted as a second
+	// recovery owner — a permanent conflict, or a same-origin rebase
+	// republishing the stale bytes. The immutable snapshot owns the split,
+	// and the queue's success retires exactly the snapshotted pair (a
+	// crash can leave it behind between the ledger publication and the
+	// enqueue's cache removal; anything staged after the snapshot carries
+	// a newer generation and survives).
+	var ledgerOwned map[string]struct{}
+	if w.opts.Staging != nil && w.opts.Staging.Pending != nil {
+		ledgerOwned = w.opts.Staging.Pending.ListUncommittedPaths()
+	}
 	if w.queue != nil {
+		if w.wbCache != nil && len(ledgerOwned) > 0 {
+			w.recoveryCacheGens = make(map[string]uint64, len(ledgerOwned))
+			for _, m := range w.wbCache.ListPendingMetas() {
+				w.recoveryCacheGens[m.Path] = m.Generation
+			}
+		}
 		w.queue.RecoverPending()
-	} else if w.uploader != nil {
-		w.uploader.RecoverPending()
+	}
+	if w.uploader != nil {
+		if ledgerOwned != nil {
+			w.uploader.RecoverPendingFilter(func(p string) bool {
+				_, ok := ledgerOwned[p]
+				return ok
+			})
+		} else {
+			w.uploader.RecoverPending()
+		}
 	}
 	return nil
 }
@@ -944,7 +1132,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			// revalidation the close-time commit race would otherwise pin
 			// the pre-write size for the whole attr TTL (append is 20 on
 			// the mount, 22 remotely).
-			if meta, ok := w.pendingMeta(op.Path); ok && res.Attr.Kind != fs.KindDir {
+			if meta, ok := w.pendingImageMeta(op.Path); ok && res.Attr.Kind != fs.KindDir {
 				res.Attr.Size = meta.Size
 			}
 			// #984 stat visibility: a live writer's uncommitted image —
@@ -1000,6 +1188,12 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 						baseSize: attr.Size, forceSync: hasSyncOpenFlag(op.Flags),
 						pendingImage:     w.capturePendingImage(op.Path),
 						pendingShadowGen: w.pinPendingShadow(op.Path)}
+					// The handle serves this pending generation's image, so a
+					// later staging through it contains that generation — and
+					// only it.
+					if meta, ok := w.pendingMeta(op.Path); ok && meta != nil {
+						h.supersededPendingGen = meta.Generation
+					}
 					if pb, ok := w.pendingBaseRevOf(op.Path); ok {
 						h.baseRev = pb
 					}
@@ -1016,7 +1210,8 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 				// need the mode.
 				if w.hasPendingLocalState(op.Path) {
 					size := int64(0)
-					if meta, ok := w.pendingMeta(op.Path); ok && meta != nil {
+					meta, _ := w.pendingMeta(op.Path)
+					if meta != nil {
 						size = meta.Size
 					}
 					shadowGen := w.pinPendingShadow(op.Path)
@@ -1025,6 +1220,11 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 						h := &bufferingHandle{w: w, path: op.Path, flags: op.Flags,
 							baseSize: size, forceSync: hasSyncOpenFlag(op.Flags),
 							pendingImage: image, pendingShadowGen: shadowGen}
+						// Same fence as the pendingAttr open above: the
+						// captured image IS this generation's content.
+						if meta != nil {
+							h.supersededPendingGen = meta.Generation
+						}
 						if pb, ok := w.pendingBaseRevOf(op.Path); ok {
 							h.baseRev = pb
 						}
@@ -1063,8 +1263,11 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			// this mount's own file — land it instead of letting the chain
 			// below stat a remote that has not seen it (v1: read-only
 			// re-opens of a lagging close read the pending bytes, never a
-			// 404).
-			if w.wbCache != nil && w.uploader != nil {
+			// 404). Ledger-owned paths are exempt: the pair under the
+			// ledger entry may be a superseded image, and the queue's own
+			// recovery owns the landing.
+			if w.wbCache != nil && w.uploader != nil &&
+				(w.opts.Staging == nil || !w.opts.Staging.Pending.HasPending(op.Path)) {
 				if _, ok := w.wbCache.GetMeta(op.Path); ok {
 					if _, serr := w.opts.Client.StatCtx(ctx, w.remotePath(op.Path)); serr != nil && client.IsNotFound(serr) {
 						if err := w.uploader.UploadSync(ctx, op.Path); err == nil {
@@ -1372,15 +1575,34 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			if w.wbCache == nil || w.uploader == nil {
 				return nil
 			}
+			// The landing fence must be captured BEFORE the upload: the
+			// image's superseded pending generation and the failure stamp a
+			// landing may retire (664d8c46), read from the snapshot the
+			// uploader is about to consume.
+			supersedesGen := uint64(0)
+			if m, ok := w.wbCache.GetMeta(p); ok && m != nil {
+				supersedesGen = m.SupersedesPendingGen
+			}
+			failureSeq := uint64(0)
+			if w.queue != nil {
+				failureSeq = w.queue.PathTerminalFailureSeq(p)
+			}
 			rev, meta, err := w.uploader.uploadSyncWithMetadata(ctx, p)
 			if err != nil {
+				if w.uploader.IsLedgerOwnedError(err) {
+					// The ledger owns this image; the queue lands it. Wait
+					// for THAT instead of publishing the superseded pair.
+					w.waitPathCommit(p)
+					return nil
+				}
 				return err
 			}
 			w.uploader.WaitPath(p)
 			if meta != nil && rev > 0 {
 				landedRev, landedSize = rev, meta.Size
-				w.landedAt(p, rev, meta.Size)
+				w.landedAt(p, rev, meta.Size, 0, nil)
 			}
+			w.resolveLandedStaging(p, rev, supersedesGen, failureSeq)
 			return nil
 		}
 		if w.uploader != nil {
@@ -1442,7 +1664,8 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		// rename: its buffer simply moves (PrepareRename's local
 		// phase). Otherwise the remote rename runs first and the open
 		// writers follow it onto the new path (fh.Path + SetPath).
-		if _, statErr := w.opts.Client.StatCtx(ctx, w.remotePath(op.Path)); statErr != nil {
+		_, statErr := w.opts.Client.StatCtx(ctx, w.remotePath(op.Path))
+		if statErr != nil {
 			if !client.IsNotFound(statErr) {
 				return fs.Result{}, mapErr(statErr)
 			}
@@ -1451,6 +1674,56 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			}
 			w.retarget(op.Path, op.Path2)
 			return fs.Result{}, nil
+		}
+		// The destination's pending-generation snapshot, taken BEFORE the
+		// RPC: pending generations come from one global counter, so a
+		// destination entry still carrying the snapshotted generation is
+		// provably the pre-rename (replaced incumbent's) entry and may be
+		// retired; any other generation was published during the rename
+		// window and belongs to the renamed object's new incarnation.
+		// The destination's landed-landmark snapshot, taken with the pending
+		// snapshot: the failure-record rekey below runs after the transfer
+		// released its locks, and a destination whose re-driven upload landed
+		// meanwhile has fulfilled the source record's obligation — the rekey
+		// declines instead of re-installing stale EIO over the landing.
+		dstLandedSnaps := map[string]uint64{}
+		if w.queue != nil {
+			dstLandedSnaps = w.queue.LandedSnapshotsForRename(op.Path2, strings.TrimSuffix(op.Path2, "/")+"/")
+		}
+		dstPreGen := map[string]uint64{}
+		if w.opts.Staging != nil && w.opts.Staging.Pending != nil {
+			if m, ok := w.opts.Staging.Pending.GetMeta(op.Path2); ok && m != nil {
+				dstPreGen[op.Path2] = m.Generation
+			}
+			dstPrefix := strings.TrimSuffix(op.Path2, "/") + "/"
+			for path := range w.opts.Staging.Pending.ListPendingPaths() {
+				if strings.HasPrefix(path, dstPrefix) {
+					if m, ok := w.opts.Staging.Pending.GetMeta(path); ok && m != nil {
+						dstPreGen[path] = m.Generation
+					}
+				}
+			}
+		}
+		// The pre-drain's own landings must not read as in-window work below:
+		// forget the old name's and the old prefix's watermarks entirely, so
+		// that any watermark re-appearing there during the RPC counts — a
+		// worker can finish (and resurrect the old name) before the response
+		// even arrives leaving the queue idle, and a child that had already
+		// landed before can land AGAIN in place, which a set snapshot cannot
+		// tell from the pre-existing landing.
+		w.forgetLanded(op.Path)
+		w.forgetLandedPrefix(strings.TrimSuffix(op.Path, "/") + "/")
+		// The writeback landed table can be cleared mid-window by the event
+		// stream (EventUnverified/EventCheckout from #1080 drop every
+		// watermark, disconnects emit them regardless of actors), and the
+		// queue's landed LANDMARKS are only a selective lineage cache (no
+		// snapshot ID, no checksum above 1MiB ⇒ deleted). The queue's
+		// commit sequence stamps EVERY successful commit per path with no
+		// payload conditions: that is the durable witness for "completed
+		// during the window". Snapshot it for the old prefix.
+		queueLandedSnap := map[string]uint64{}
+		if w.queue != nil {
+			queueLandedSnap = w.queue.CommitSeqsUnderPrefix(strings.TrimSuffix(op.Path, "/") + "/")
 		}
 		// A rename over an OPEN target replaces the object its descriptors
 		// were reading: mark them anonymous BEFORE the remote rename (their
@@ -1470,15 +1743,105 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			restoreMarked(marked)
 			return res, err
 		}
-		w.forgetLanded(op.Path)
+		// The instant the rename RESPONSE arrived: pending state published
+		// at either name after this belongs to the NEW incarnation (the
+		// retargeted writer's own flush, or a fresh opener's) and must never
+		// be retired as the replaced incumbent's. Publications between the
+		// server-side change and this instant are fenced by revision instead
+		// (see renameFence).
+		movedAt := time.Now()
+		// Whether any in-window work existed for the old name: the pre-drain
+		// left the path idle, so anything now queued or in-flight was staged
+		// during the RPC — and a worker that already FINISHED (landing, and
+		// possibly resurrecting, the obsolete name before the response
+		// arrived) left the queue idle but a landed watermark behind.
+		windowWork := (w.queue != nil && w.queue.HasPath(op.Path)) || w.everLanded(op.Path) ||
+			(w.queue != nil && w.queue.CommitSeq(op.Path) > queueLandedSnap[op.Path])
+		// The same for the old prefix's children: the pending set right after
+		// the rename plus any child that landed during the RPC (its pending
+		// entry is gone, so only the landed watermark records it); a child
+		// missing from both by the time the descendant loop runs may have
+		// landed under the dead prefix and needs the strict check below.
+		windowDescendants := map[string]bool{}
+		if w.opts.Staging != nil && w.opts.Staging.Pending != nil {
+			prefix := strings.TrimSuffix(op.Path, "/") + "/"
+			for p := range w.opts.Staging.Pending.ListPendingPaths() {
+				if strings.HasPrefix(p, prefix) {
+					windowDescendants[p] = true
+				}
+			}
+			for p := range w.landedPathsUnderPrefix(prefix) {
+				windowDescendants[p] = true
+			}
+			// Commit-seq deltas survive event-stream clears and carry no
+			// payload conditions: a child whose watermark was wiped (or
+			// whose landmark was never recorded — large payloads, recovered
+			// entries) still shows here.
+			if w.queue != nil {
+				for p, cur := range w.queue.CommitSeqsUnderPrefix(prefix) {
+					if cur > queueLandedSnap[p] {
+						windowDescendants[p] = true
+					}
+				}
+			}
+		}
+		// Both pathname incarnations ended (source moved, target replaced),
+		// so neither name may keep answering EIO for the previous
+		// incumbent's terminally failed image — and the DURABLE state must
+		// follow the rename, because PathTerminalFailure answers from the
+		// PendingConflict marker whenever the in-memory record is gone:
+		//   - a conflicted SOURCE moves its marker (and preserved bytes) to
+		//     the new name — the unlanded data it describes now lives there;
+		//   - otherwise the replaced TARGET's marker describes a name that
+		//     no longer exists and is retired.
+		// The transition re-derives the generations under the path locks, so
+		// an image staged (and terminally failed) while the remote rename was
+		// in flight follows the name too. In-memory records are cleared only
+		// after those transitions, and only when they succeeded: a rename
+		// whose unlanded image could not be re-paired with the new name must
+		// answer EIO rather than let a later fsync certify bytes that are
+		// still only under the old name.
+		installedGen, terr := w.retargetConflictMarkers(ctx, op.Path, op.Path2, renameFence{movedAt: movedAt, preGen: dstPreGen}, windowWork)
+		if terr != nil {
+			// The remote rename already succeeded; the local staging
+			// transition did not. The handles still point at the source
+			// object, whose preserved image never landed — keep it that
+			// way and report the failure.
+			return fs.Result{}, fs.StatusErrorOf(gofuse.Status(syscall.EIO))
+		}
+		if w.queue != nil {
+			// The in-memory records follow the object rather than being
+			// wiped: a standalone record at the source (its unlanded bytes
+			// under an even older name) is the only witness for the
+			// retargeted handle's barrier, and the destination's previous
+			// record dies with its replaced incarnation.
+			w.queue.RenameTerminalFailure(op.Path, op.Path2, dstLandedSnaps)
+		}
 		w.retarget(op.Path, op.Path2)
+		// The final publication fence: between the transition above and the
+		// handle move just done, an open writer could still stage (and
+		// enqueue, clearing its dirty flag) under the OLD name — the one
+		// publication window no earlier snapshot covers. Handles now publish
+		// only at the new name, so anything still pending at the old name is
+		// provably stranded and moves in a second pass. That pass may replace
+		// exactly the destination entry this rename's first pass installed
+		// (identified by its generation); anything else published at the new
+		// name meanwhile keeps its protection. Failures are logged and
+		// recorded rather than failing the rename: the remote move and the
+		// handle retarget already happened, and the transition's failure
+		// records answer EIO at the new name.
+		secondFence := renameFence{movedAt: movedAt, preGen: dstPreGen, ownGen: installedGen}
+		secondWork := (w.queue != nil && w.queue.HasPath(op.Path)) || w.everLanded(op.Path)
+		if _, terr := w.retargetConflictMarkers(ctx, op.Path, op.Path2, secondFence, secondWork); terr != nil {
+			safeLogPrintf("writeback: rename %s -> %s could not carry a late old-name publication: %v", op.Path, op.Path2, terr)
+		}
 		// The landed image's revision is the new base for every retargeted
 		// writer, and the new path's committed watermark: without it the
 		// next flush CASed on the pre-rename revision and the upload
 		// conflicted, silently dropping the acknowledged bytes.
 		if landedRev > 0 {
 			w.settleRenamedHandle(op.Path2, landedRev, landedSize)
-			w.landedAt(op.Path2, landedRev, landedSize)
+			w.landedAt(op.Path2, landedRev, landedSize, 0, nil)
 		}
 		// staged descendants migrate to the new
 		// prefix alongside the remote rename.
@@ -1492,6 +1855,43 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 				}
 			}
 		}
+		// Pending descendants follow the same rule as the renamed path
+		// itself: the write-cache loop above moves the .dat/.meta track,
+		// while the queue's pending entries would stay keyed under the dead
+		// prefix — a conflict marker keeps answering EIO for names a
+		// recreator now owns, and a LIVE queued child's upload would run
+		// against (or recreate) the dead prefix instead of carrying its
+		// durability obligation to the new one. Failures here are
+		// per-descendant: the directory rename as a whole still succeeded
+		// remotely, so the error is logged and the failure recorded at the
+		// child's new name rather than rolled back.
+		if w.opts.Staging != nil && w.opts.Staging.Pending != nil {
+			prefix := strings.TrimSuffix(op.Path, "/") + "/"
+			for path := range w.opts.Staging.Pending.ListPendingPaths() {
+				if !strings.HasPrefix(path, prefix) {
+					continue
+				}
+				meta, ok := w.opts.Staging.Pending.GetMeta(path)
+				if !ok || meta == nil {
+					continue
+				}
+				target := op.Path2 + strings.TrimPrefix(path, op.Path)
+				var terr error
+				if meta.Kind == staging.PendingConflict {
+					// Same locked two-phase transfer as the renamed path
+					// itself; conflict entries carry no live queue
+					// bookkeeping (the worker left, recovery skips them), so
+					// a fenced move is safe.
+					_, terr = w.transferConflictMarker(ctx, path, target, renameFence{movedAt: movedAt, preGen: dstPreGen}, true)
+				} else {
+					_, terr = w.retargetQueuedImage(path, target, renameFence{movedAt: movedAt, preGen: dstPreGen})
+				}
+				if terr != nil {
+					safeLogPrintf("writeback: pending descendant %s did not follow the rename: %v", path, terr)
+				}
+			}
+		}
+		w.settleOldPrefixAfterMove(ctx, op, movedAt, dstPreGen, dstLandedSnaps, queueLandedSnap, windowDescendants)
 		return res, nil
 
 	case fs.OpSetAttr:
@@ -1676,7 +2076,16 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			if w.wbCache != nil && w.uploader != nil {
 				if _, ok := w.wbCache.GetMeta(op.Path); ok {
 					if err := w.uploader.UploadSync(ctx, op.Path); err != nil {
-						return fs.Result{}, mapErr(err)
+						if w.uploader.IsLedgerOwnedError(err) {
+							// The ledger owns this image; its queue entry
+							// lands it. Truncating below would race the
+							// landing — wait it out first.
+							if !w.waitPathCommit(op.Path) {
+								return fs.Result{}, fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
+							}
+						} else {
+							return fs.Result{}, mapErr(err)
+						}
 					}
 				}
 			}
@@ -2079,7 +2488,7 @@ func (h *bufferingHandle) DrainFlush(ctx context.Context) (err error) {
 			}()
 			useCache := true
 			if dirty {
-				snapshot, stageErr := h.stageToWriteCache(ctx)
+				snapshot, stageErr := h.stageToWriteCache(ctx, stageFullDurable)
 				if errors.Is(stageErr, errWriteCacheBypass) {
 					useCache = false
 					retainBuffer = true
@@ -2091,6 +2500,13 @@ func (h *bufferingHandle) DrainFlush(ctx context.Context) (err error) {
 				}
 			}
 			if useCache {
+				// v1 FlushAll over the write-cache track: the Flush snapshot
+				// owns the upload — land it synchronously, exactly once. A
+				// commitLocked here would publish a second image that races
+				// the uploader's CAS on the same base. The landing fence is
+				// captured before the upload so the landing can retire the
+				// failure state of exactly the generations it contains.
+				supersedesGen, failureSeq := h.stagedLandingFence()
 				rev, meta, uploadErr := h.w.uploader.uploadSyncWithMetadata(ctx, h.path)
 				if uploadErr != nil {
 					return uploadErr
@@ -2100,7 +2516,11 @@ func (h *bufferingHandle) DrainFlush(ctx context.Context) (err error) {
 					h.retireDirtyLocked(uploadGen)
 					h.mu.Unlock()
 					h.markLanded(rev)
-					h.w.landedAt(h.path, rev, meta.Size)
+					// The landed watermark itself is recorded by the
+					// uploader's RecordLanding callback with byte-exact
+					// identity; this side only retires the failure state of
+					// exactly the generations the landed image contains.
+					h.w.resolveLandedStaging(h.path, rev, supersedesGen, failureSeq)
 				}
 				return nil
 			}
@@ -2120,6 +2540,517 @@ func (h *bufferingHandle) DrainFlush(ctx context.Context) (err error) {
 	return nil
 }
 
+// syncWaitDeadlineSizeLocked reports the image a strict Sync may have to wait
+// out on the queue: the handle's buffer when one exists, otherwise the staged
+// pending image a re-opened handle serves (buf stays nil there — a 2GiB spill
+// re-opened mid-upload must scale the wait like the writer's own fsync, not
+// fall back to the 60s floor).
+func (h *bufferingHandle) syncWaitDeadlineSizeLocked() int64 {
+	if h.buf != nil {
+		return h.buf.Size()
+	}
+	if h.pendingImage != nil {
+		return int64(len(h.pendingImage))
+	}
+	return h.baseSize
+}
+
+// resolveLandedStaging retires path-scoped terminal-failure state after a
+// staged write-cache image landed remotely: the landing image contains every
+// pending generation at or below the one it composed over at staging time
+// (supersedesGen, 0 = unknown → only the in-memory record is considered), and
+// failureSeq is the failure stamp observed before the landing attempt — a
+// failure recorded after it belongs to a newer generation and must keep
+// answering EIO. landedRev <= 0 means the upload no-oped (the entry vanished
+// under a queue takeover); nothing landed, so nothing is retired.
+func (w *Writeback) resolveLandedStaging(path string, landedRev int64, supersedesGen, failureSeq uint64) {
+	if w.queue == nil || landedRev <= 0 {
+		return
+	}
+	w.queue.ClearTerminalFailureIfSeq(path, failureSeq)
+	w.queue.ResolveSupersededConflict(path, supersedesGen)
+}
+
+// pendingImageState classifies the pending entry at path for a rename's
+// terminal-failure transition: a conflict marker (the terminal failure's
+// durable record), a LIVE queued image (staged, not yet landed or terminally
+// failed), or nothing (resolved). A live entry is NOT durability: it is
+// un-landed local state the rename must settle, not certify.
+func (w *Writeback) pendingImageState(path string) (gen uint64, size int64, conflict, live bool) {
+	if w.opts.Staging == nil || w.opts.Staging.Pending == nil {
+		return 0, 0, false, false
+	}
+	meta, ok := w.opts.Staging.Pending.GetMeta(path)
+	if !ok || meta == nil {
+		return 0, 0, false, false
+	}
+	if meta.Kind == staging.PendingConflict {
+		return meta.Generation, meta.Size, true, false
+	}
+	return meta.Generation, meta.Size, false, true
+}
+
+// retargetConflictMarkers moves the durable terminal-failure state of a
+// completed rename: a conflicted SOURCE's pending entry (and its preserved
+// shadow bytes) transfers to the new name — the unlanded image it describes
+// now lives there — while without a source conflict the replaced TARGET's
+// marker describes a name that no longer exists and is retired.
+//
+// The transition is decided from generations read UNDER both writeback path
+// locks, never from a pre-rename snapshot: the remote rename RPC runs without
+// those locks, so a writer can stage a newer image under the old name (and
+// terminally fail it) while the rename is in flight. That image's marker must
+// follow the name exactly like the captured one's — reporting a fenced-out
+// transfer as success would let the caller clear the failure records and
+// retarget the handle while the newer unlanded image stays stranded under the
+// dead name. When the payload move fails the destination still receives a
+// marker (PublishDestination): the remote name has already moved, so
+// reporting success there would claim durability for bytes that are still
+// only under the old name.
+func (w *Writeback) retargetConflictMarkers(ctx context.Context, oldPath, newPath string, fence renameFence, windowWork bool) (uint64, error) {
+	return w.transferConflictMarker(ctx, oldPath, newPath, fence, windowWork)
+}
+
+// conflictTransferAttempts bounds the fenced-out retries of one locked
+// transition pass. Same-path publications are excluded by the writeback path
+// locks, so a fence loss means a mutator that publishes without them; the
+// bound only keeps a pathological publisher from spinning the rename forever.
+const conflictTransferAttempts = 4
+
+// transferConflictMarker drives the durable terminal-failure transition for a
+// completed rename (the renamed path itself, or a pending descendant): it
+// takes both writeback path locks, re-decides the transition from the LIVE
+// generations — a newer conflict under the old name belongs to the object that
+// now lives at the new name, so its marker must be the one that moves — and
+// runs the locked two-phase transaction (prepare, payload move, commit).
+// fence carries the destination-incarnation boundary (response time and
+// the renamed object's revision); windowWork reports whether in-window work
+// existed for oldPath (staged during the RPC, or already landed before the
+// response arrived): only then can a worker have landed the in-window image
+// under the obsolete name, so only then is the old name statted for
+// resurrection.
+func (w *Writeback) transferConflictMarker(ctx context.Context, oldPath, newPath string, fence renameFence, windowWork bool) (uint64, error) {
+	st := w.opts.Staging
+	if st == nil || st.Pending == nil {
+		return 0, nil
+	}
+	unlock := w.lockRenamePaths(oldPath, newPath)
+	defer unlock()
+	return w.conflictTransitionLocked(ctx, oldPath, newPath, fence, windowWork)
+}
+
+// conflictTransitionLocked runs one locked pass of the durable
+// terminal-failure transition. The caller holds both writeback path locks;
+// a fenced-out begin is retried against fresh reads inside the pass.
+// movedAt is the instant the remote rename completed: destination state
+// published after it belongs to the new incarnation and must never be
+// retired as the replaced incumbent's.
+func (w *Writeback) conflictTransitionLocked(ctx context.Context, oldPath, newPath string, fence renameFence, windowWork bool) (uint64, error) {
+	st := w.opts.Staging
+	for attempt := 0; attempt < conflictTransferAttempts; attempt++ {
+		srcPendingGen, _, srcConflict, srcLive := w.pendingImageState(oldPath)
+		dstPendingGen, dstConflict, dstLive, dstProtectedEntry := w.dstProtected(newPath, fence)
+		if srcLive {
+			// A queued image is un-landed local state, and its upload runs
+			// against entry.Path — the dead old name: an acknowledgement
+			// there is not durability for the renamed object, and its
+			// not-found retry would recreate the name. Move the whole
+			// obligation to the new name instead.
+			installed, rerr := w.retargetQueuedImageLocked(oldPath, newPath, fence)
+			if rerr != nil {
+				safeLogPrintf("writeback: moving the staged image of %s to %s failed: %v", oldPath, newPath, rerr)
+				w.recordTransferFailure(newPath, rerr)
+				return 0, rerr
+			}
+			// Nothing un-landed remains under the old name: the obligation
+			// now lives at the new one, and the retargeted handle's strict
+			// Sync waits the re-driven landing out itself.
+			return installed, nil
+		}
+		if !srcConflict {
+			// Nothing un-landed remains under the old name locally (a
+			// landing resolved it): the only marker left to retire is the
+			// replaced target's — and only when it is provably the old
+			// incumbent's (protected entries keep answering at the name),
+			// and never this rename's own installation: the second pass may
+			// REPLACE it with a newer publication, but retiring it outright
+			// would strip the witness the first pass just installed.
+			if dstConflict && !dstProtectedEntry && (fence.ownGen == 0 || dstPendingGen != fence.ownGen) {
+				st.Pending.RemoveIfGeneration(newPath, dstPendingGen)
+			}
+			if !windowWork {
+				return 0, nil // nothing was staged in-window: no worker could resurrect
+			}
+			// The source's local state being gone is not yet proof of
+			// durability, though — a worker that reached the old name before
+			// these locks may have landed the in-window successor THERE, its
+			// not-found retry recreating the dead name. An upload
+			// acknowledged at the obsolete pathname cannot count, and a Stat
+			// that cannot decide (timeout, 5xx) proves nothing either: the
+			// barrier keeps the obligation instead of silently accepting.
+			stat, serr := w.opts.Client.StatCtx(ctx, w.remotePath(oldPath))
+			switch {
+			case serr == nil && stat != nil:
+				err := fmt.Errorf("writeback: rename %s -> %s left staged data landed under the obsolete name %s", oldPath, newPath, oldPath)
+				safeLogPrintf("%v", err)
+				w.recordTransferFailure(newPath, err)
+				return 0, err
+			case client.IsNotFound(serr):
+				return 0, nil // the old name stayed gone
+			default:
+				err := fmt.Errorf("writeback: rename %s -> %s could not confirm the old name stayed gone: %v", oldPath, newPath, serr)
+				safeLogPrintf("%v", err)
+				w.recordTransferFailure(newPath, err)
+				return 0, err
+			}
+		}
+		if (dstConflict || dstLive) && dstProtectedEntry {
+			// The destination already carries an image of the renamed
+			// object's NEW incarnation (published after the response, staged
+			// over the renamed object's revision, or unreadable): moving the
+			// older image over it would discard acknowledged writes. Leave
+			// both sides alone and answer EIO at the new name until the
+			// newer image settles.
+			err := fmt.Errorf("writeback: a newer image already sits at %s; the preserved marker of %s stayed under the old name", newPath, oldPath)
+			safeLogPrintf("%v", err)
+			w.recordTransferFailure(newPath, err)
+			return 0, err
+		}
+		transfer, ok, berr := st.Pending.BeginConflictTransfer(oldPath, newPath, srcPendingGen, dstPendingGen, st.Shadow)
+		if berr != nil {
+			// Nothing durable moved: the old name keeps its marker and bytes, but
+			// the new name must still refuse to certify the unlanded image.
+			safeLogPrintf("writeback: begin conflict transfer %s -> %s failed: %v", oldPath, newPath, berr)
+			w.recordTransferFailure(newPath, berr)
+			return 0, berr
+		}
+		if ok {
+			return w.finishConflictTransfer(transfer, oldPath, newPath)
+		}
+		// Fenced out: an endpoint advanced past the generation this attempt
+		// fenced on. Retry with the live state.
+	}
+	err := fmt.Errorf("writeback: conflict transfer %s -> %s could not converge under a racing publication", oldPath, newPath)
+	safeLogPrintf("%v", err)
+	w.recordTransferFailure(newPath, err)
+	return 0, err
+}
+
+// renameFence carries what a completed rename knows about the destination's
+// incarnation boundary. movedAt is the instant the rename RESPONSE arrived:
+// pending state published at either name after it belongs to the renamed
+// object's new incarnation (the retargeted writer's own flush, or a fresh
+// opener's). srcRev is the renamed object's revision as statted before the
+// RPC: a destination staging that carries it composed over the RENAMED
+// object — the publication that can happen between the server-side change
+// and the response, which no client-side timestamp can place — and can never
+// be the replaced incumbent's leftover. Both fences protect; neither retires:
+// a destination entry is only provably the replaced incumbent's when it
+// matches neither.
+type renameFence struct {
+	movedAt time.Time
+	// preGen is the pending-index generation snapshot of the destination
+	// name and every pending entry under the destination prefix, taken
+	// BEFORE the remote RPC: pending generations come from one global
+	// counter, so a destination entry whose generation equals the snapshot
+	// is PROVABLY the pre-rename entry (the replaced incumbent's) and may
+	// be retired; any other generation was published during the window and
+	// belongs to the renamed object's new incarnation. Revisions cannot do
+	// this job: they are per-inode counters, so two objects can carry the
+	// same number, and a post-rename opener can even stage create-shaped
+	// (its open's revision was cleared for a live dirty sibling).
+	preGen map[string]uint64
+	// ownGen is the destination generation this rename's own first pass
+	// installed (0 = none): the post-retarget second pass may replace
+	// exactly that entry — anything else published at the destination
+	// meanwhile keeps its protection.
+	ownGen uint64
+}
+
+// dstProtected classifies the destination's pending entry and reports whether
+// it must be treated as the renamed object's NEW incarnation: published after
+// the response arrived, or staged against the renamed object's own revision.
+// Merely sharing the target pathname — or a timestamp before the response —
+// is not evidence of the old object, and a create-shaped base (0) can be
+// either side's same-handle succession, so only the two positive fences
+// above protect and the rest of the discrimination falls to retirement being
+// the exceptional, provable case below them.
+func (w *Writeback) dstProtected(path string, fence renameFence) (gen uint64, conflict, live, protected bool) {
+	gen, _, conflict, live = w.pendingImageState(path)
+	if !conflict && !live {
+		return gen, false, false, false
+	}
+	meta, ok := w.opts.Staging.Pending.GetMeta(path)
+	if meta == nil || !ok {
+		return gen, conflict, live, true // an entry we cannot read is never retired
+	}
+	if !meta.CreatedAt.IsZero() && meta.CreatedAt.After(fence.movedAt) {
+		return gen, conflict, live, true // published after the response arrived
+	}
+	if fence.ownGen != 0 && gen == fence.ownGen {
+		// This rename's own first-pass installation: the second pass may
+		// replace exactly it.
+		return gen, conflict, live, false
+	}
+	// Retirement requires identity evidence, not numerics: the entry's
+	// generation must equal the pre-RPC snapshot of this very path (see
+	// renameFence). Anything else was published during the window and stays
+	// protected.
+	if fence.preGen != nil && gen != 0 && fence.preGen[path] == gen {
+		return gen, conflict, live, false // provably the pre-rename entry
+	}
+	return gen, conflict, live, true
+}
+
+// settleOldPrefixAfterMove closes the directory rename's final window: a
+// child can stage AND COMPLETELY LAND its successor under the obsolete
+// prefix between the in-window snapshot and the handle retarget — its
+// pending entry is then gone and only the landed watermark remains, which
+// the pre-retarget snapshot never contained. The prefix's watermarks were
+// wiped before the RPC, so the set read HERE (after the handles moved;
+// nothing publishes under the old prefix anymore) contains exactly the
+// in-window child landings, completed in the RPC or in the gap alike, and
+// each entry-less child gets the same strict old-name check as the renamed
+// path itself. In-memory failure records follow the move unconditionally:
+// standalone ones (a descendant transfer that could not install its marker,
+// bytes left under the pre-move name) have no pending entry, so neither
+// prefix loop above carries them.
+func (w *Writeback) settleOldPrefixAfterMove(ctx context.Context, op *fs.Op, movedAt time.Time, dstPreGen, dstLandedSnaps, queueLandedSnap map[string]uint64, windowDescendants map[string]bool) {
+	prefix := strings.TrimSuffix(op.Path, "/") + "/"
+	for p := range w.landedPathsUnderPrefix(prefix) {
+		windowDescendants[p] = true
+	}
+	// The commit-seq deltas again, read at settle time: a child that
+	// completed between the response and the handle retarget is here even
+	// if the event stream cleared the writeback watermarks meanwhile, and
+	// regardless of payload size or entry provenance.
+	if w.queue != nil {
+		for p, cur := range w.queue.CommitSeqsUnderPrefix(prefix) {
+			if cur > queueLandedSnap[p] {
+				windowDescendants[p] = true
+			}
+		}
+	}
+	hasLedger := w.opts.Staging != nil && w.opts.Staging.Pending != nil
+	for path := range windowDescendants {
+		if hasLedger && w.opts.Staging.Pending.HasPending(path) {
+			continue // the descendant loop moved it
+		}
+		target := op.Path2 + strings.TrimPrefix(path, op.Path)
+		if !hasLedger {
+			// No staging ledger (write-sync mounts): there is no pending
+			// state to move and no queue to record a failure into. The
+			// strict check degrades to existence: an in-window child whose
+			// inline write landed under the already-renamed old name is
+			// surfaced loudly instead of panicking on the nil ledger.
+			if _, serr := w.opts.Client.StatCtx(ctx, w.remotePath(path)); serr == nil {
+				safeLogPrintf("writeback: in-window descendant %s landed under the old name after the rename", path)
+			}
+			continue
+		}
+		if _, terr := w.transferConflictMarker(ctx, path, target, renameFence{movedAt: movedAt, preGen: dstPreGen}, true); terr != nil {
+			safeLogPrintf("writeback: in-window descendant %s did not stay gone: %v", path, terr)
+		}
+	}
+	if w.queue != nil {
+		w.queue.RenameTerminalFailuresPrefix(prefix, strings.TrimSuffix(op.Path2, "/")+"/", dstLandedSnaps)
+	}
+}
+
+// retargetQueuedImage is retargetQueuedImageLocked plus the writeback path
+// locks, for callers that do not already hold them (the directory-rename
+// descendant loop).
+func (w *Writeback) retargetQueuedImage(oldPath, newPath string, fence renameFence) (uint64, error) {
+	unlock := w.lockRenamePaths(oldPath, newPath)
+	defer unlock()
+	installed, err := w.retargetQueuedImageLocked(oldPath, newPath, fence)
+	if err != nil {
+		w.recordTransferFailure(newPath, err)
+		return 0, err
+	}
+	return installed, nil
+}
+
+// retargetQueuedImageLocked moves a LIVE queued image — pending entry, shadow
+// bytes, and queue work — from oldPath to newPath while the caller holds both
+// writeback path locks, preserving the image's durability obligation at the
+// new name: the remote rename is metadata-only, so the object at newPath
+// still carries the base revision the image was staged against and the
+// re-driven upload CASes cleanly there. Letting the old entry run instead
+// would acknowledge the image at the obsolete pathname (or recreate it via
+// the upload's not-found retry) while the retargeted handle certifies a
+// remote image that never contained the staged bytes.
+//
+// The move reuses the conflict transfer's two-phase discipline so every
+// crash point keeps a recoverable metadata/payload pair: the prepared .meta
+// is persisted at the destination while the old name still holds BOTH its
+// .meta and its payload, the payload rename follows, and the commit drops
+// the old .meta only once the destination pair is durable. A failed payload
+// move aborts back to the old name (the prepared .meta is removed, the
+// source stays intact) and marks the source entry a conflict so recovery
+// preserves it for manual re-drive instead of re-uploading the dead name.
+func (w *Writeback) retargetQueuedImageLocked(oldPath, newPath string, fence renameFence) (uint64, error) {
+	st := w.opts.Staging
+	if w.queue == nil {
+		return 0, fmt.Errorf("writeback: no queue to carry the staged image of %s to %s", oldPath, newPath)
+	}
+	if st.Shadow != nil && !st.Shadow.Has(oldPath) {
+		// A live entry without a payload has nothing to pair at the new
+		// name; leave it in place for the caller's failure answer.
+		return 0, fmt.Errorf("writeback: staged image of %s has no payload to move to %s", oldPath, newPath)
+	}
+	srcGen, _, srcConflict, srcLive := w.pendingImageState(oldPath)
+	if !srcLive && !srcConflict {
+		return 0, fmt.Errorf("writeback: staged image of %s vanished before its move to %s", oldPath, newPath)
+	}
+	dstGen, dstConflict, dstLive, dstProtectedEntry := w.dstProtected(newPath, fence)
+	if (dstConflict || dstLive) && dstProtectedEntry {
+		// The destination already carries an image of the renamed object's
+		// NEW incarnation (published after the response arrived, staged over
+		// the renamed object's revision, or unreadable): retiring it as the
+		// replaced incumbent would discard acknowledged writes, and landing
+		// the older image over it would rewind them. Stop the old name's work
+		// (nothing may upload there), preserve the older image under the old
+		// name as a conflict (recovery must not re-drive it at the dead
+		// name), and answer EIO at the new name until the newer image lands
+		// and clears the record.
+		if err := w.preserveImageUnderOldName(oldPath, srcGen); err != nil {
+			return 0, err
+		}
+		return 0, fmt.Errorf("writeback: a newer image already sits at %s; the staged image of %s stayed preserved under the old name", newPath, oldPath)
+	}
+	// Stop the old name's queue work and fence its earlier fsync frames: the
+	// worker uploads to entry.Path, and a restart would replay the frames
+	// back under the dead name.
+	if err := w.queue.CancelQueuedForRename(oldPath); err != nil {
+		return 0, err
+	}
+	// A destination entry that is provably the replaced incumbent's belongs
+	// to the object incarnation the completed remote rename already retired:
+	// stop its queue work, retire its payload (confirmed, so the incoming
+	// metadata can never describe the dead bytes) and drop the entry,
+	// leaving the name clean.
+	if dstConflict || dstLive {
+		if err := w.queue.CancelQueuedForRename(newPath); err != nil {
+			return 0, err
+		}
+		if st.Shadow != nil {
+			st.Shadow.Remove(newPath)
+			if verr := st.Shadow.VerifyRemoved(newPath); verr != nil {
+				return 0, fmt.Errorf("retiring the replaced image of %s: %w", newPath, verr)
+			}
+		}
+		st.Pending.RemoveIfGeneration(newPath, dstGen)
+	}
+	// Two-phase move (prepare persists the destination .meta first; a crash
+	// leaves the old name fully intact, and the committed state leaves the
+	// destination pair durable before the old .meta dies).
+	transfer, ok, err := st.Pending.BeginConflictTransfer(oldPath, newPath, srcGen, 0, st.Shadow)
+	if err != nil || !ok {
+		return 0, fmt.Errorf("writeback: begin live-image transfer %s -> %s: ok=%v err=%v", oldPath, newPath, ok, err)
+	}
+	if !transfer.MovePayload() {
+		transfer.Abort()
+		if _, merr := st.Pending.MarkConflictIfGeneration(oldPath, srcGen); merr != nil {
+			safeLogPrintf("writeback: preserving %s after a failed move failed: %v", oldPath, merr)
+		}
+		return 0, fmt.Errorf("writeback: staged image of %s could not move to %s", oldPath, newPath)
+	}
+	committed, cerr := transfer.Commit()
+	if cerr != nil || !committed {
+		return 0, fmt.Errorf("writeback: committing the live-image transfer %s -> %s: committed=%v err=%v", oldPath, newPath, committed, cerr)
+	}
+	// Re-drive the landing at the new name from the moved state.
+	entry := w.queue.recoveredEntry(newPath)
+	if entry == nil {
+		return 0, fmt.Errorf("writeback: staged image of %s could not be re-driven at %s", oldPath, newPath)
+	}
+	// The moved image keeps its LIVE staging semantics: recoveredEntry stamps
+	// the restart-conservative payload-base fence (PayloadBaseRevSet), whose
+	// LWW refusal would terminally fail this entry where its original queue
+	// shape auto-resolved — a metadata-only rename must not change the
+	// image's conflict behavior. payloadBaseRevision() falls back to BaseRev,
+	// so clearing the stamp keeps the same provenance the stager recorded.
+	entry.PayloadBaseRev, entry.PayloadBaseRevSet = 0, false
+	if err := w.queue.Enqueue(entry); err != nil {
+		return 0, fmt.Errorf("writeback: re-driving %s after the rename: %w", newPath, err)
+	}
+	safeLogPrintf("writeback: staged image moved %s -> %s after the rename (pending gen %d, landing re-driven)", oldPath, newPath, entry.PendingIndexGen)
+	return entry.PendingIndexGen, nil
+}
+
+// preserveImageUnderOldName retires a staged image's queue work and marks its
+// pending entry a conflict while leaving bytes and metadata in place: the
+// image stays recoverable under the (now dead) old name, nothing re-drives
+// it there, and recovery preserves it for manual re-drive instead of
+// re-uploading the dead pathname.
+func (w *Writeback) preserveImageUnderOldName(oldPath string, gen uint64) error {
+	if err := w.queue.CancelQueuedForRename(oldPath); err != nil {
+		return err
+	}
+	if _, merr := w.opts.Staging.Pending.MarkConflictIfGeneration(oldPath, gen); merr != nil {
+		safeLogPrintf("writeback: preserving %s under the old name failed: %v", oldPath, merr)
+	}
+	return nil
+}
+
+// finishConflictTransfer drives an opened transfer through its payload move
+// and commit. A failed payload move publishes the marker at the destination
+// instead of restoring silence there — the remote name has already moved, so
+// that name must keep answering EIO for the image that never landed — and
+// additionally records the failure in memory: when the destination kept its
+// own live entry no durable marker could be installed, leaving that record
+// as the only witness for later barriers.
+func (w *Writeback) finishConflictTransfer(transfer *staging.PendingConflictTransfer, oldPath, newPath string) (uint64, error) {
+	if !transfer.MovePayload() {
+		// The remote rename already happened but the preserved bytes could
+		// not follow it. They stay at the old name with their own entry; the
+		// destination must also answer EIO — the object there whose newest
+		// image never landed must not report success.
+		if perr := transfer.PublishDestination(); perr != nil {
+			safeLogPrintf("writeback: publishing the failed transfer marker at %s failed: %v", newPath, perr)
+			w.recordTransferFailure(newPath, perr)
+			return 0, perr
+		}
+		err := fmt.Errorf("writeback: preserved image for %s could not follow the rename to %s", oldPath, newPath)
+		w.recordTransferFailure(newPath, err)
+		return 0, err
+	}
+	committed, cerr := transfer.Commit()
+	if cerr != nil {
+		// The payload moved but its metadata could not be persisted: report
+		// the failure so barriers still answer EIO, and let restart prune the
+		// half-written pair.
+		safeLogPrintf("writeback: committing conflict transfer %s -> %s failed: %v", oldPath, newPath, cerr)
+		w.recordTransferFailure(newPath, cerr)
+		return 0, cerr
+	}
+	if !committed {
+		safeLogPrintf("writeback: conflict transfer %s -> %s lost a fence; markers left in place", oldPath, newPath)
+	}
+	return transfer.PreparedGeneration(), nil
+}
+
+// recordTransferFailure records an in-memory terminal failure for a path whose
+// durable marker could not be installed: barriers on the new name must keep
+// answering EIO rather than certify data that never landed.
+func (w *Writeback) recordTransferFailure(path string, err error) {
+	if w.queue == nil {
+		return
+	}
+	w.queue.RecordTerminalFailureForPath(path, err)
+	// The in-memory record dies with the process, and a standalone failure
+	// has no pending entry at its path to carry a durable marker: install a
+	// shadowless conflict witness so a restart still answers EIO at the new
+	// name instead of certifying the stale destination image. An existing
+	// entry (a real marker or a live image) is left alone.
+	if w.opts.Staging != nil && w.opts.Staging.Pending != nil {
+		if terr := w.opts.Staging.Pending.EnsureConflictMarker(path); terr != nil {
+			safeLogPrintf("writeback: durable witness for the transfer failure at %s: %v", path, terr)
+		}
+	}
+}
+
 // Sync implements fs.Handle.
 func (h *bufferingHandle) Sync(ctx context.Context) error {
 	// interactive mode: fsync is a durability barrier served by
@@ -2137,22 +3068,34 @@ func (h *bufferingHandle) Sync(ctx context.Context) error {
 	}
 	// fsync is a durability barrier: under the async queue policy the image
 	// is staged+enqueued — wait for THIS path to land, not the whole queue
-	// (a foreign path's slow upload must not hold this fsync hostage).
+	// (a foreign path's slow upload must not hold this fsync hostage). The
+	// deadline scales with the image like the queue worker's own shadow-spill
+	// attempt (releaseTimeout): a fixed cap would give up on large uploads
+	// that the worker is still successfully streaming (v1 fsync waited out
+	// the size-scaled upload synchronously).
 	if h.w.queue != nil {
-		if err := h.w.queue.WaitPathOutcome(h.path, uploadTimeout); err != nil {
-			// Idle is not success: a terminally failed queued upload must
-			// surface at the fsync barrier, or this mount acknowledges
-			// durability for bytes that never landed.
-			return fs.StatusErrorOf(gofuse.Status(syscall.EIO))
+		h.mu.Lock()
+		deadlineSize := h.syncWaitDeadlineSizeLocked()
+		h.mu.Unlock()
+		// The idle wait is followed by the terminal-failure check below,
+		// which answers EIO for a path whose upload failed rather than
+		// landed — so an idle path is never mistaken for durability here.
+		if !h.w.queue.WaitPathDeadline(h.path, releaseTimeout(deadlineSize)) {
+			return fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
 		}
 	}
 	// A staged .dat/.meta snapshot is only locally durable; strict fsync
 	// pays the remote landing synchronously (v1 fsync on the write-back
-	// cache fast path).
+	// cache fast path). This landing also RETIRES a recorded terminal
+	// failure for the path: the staged image is a replacement the writer
+	// published after the failure, and landing it is the recovery — so it
+	// must run before the sticky-failure check below, or a rewritten file
+	// could never fsync successfully again.
 	h.mu.Lock()
 	staged := h.stagedToCache
 	h.mu.Unlock()
 	if staged && h.w.uploader != nil {
+		supersedesGen, failureSeq := h.stagedLandingFence()
 		rev, meta, err := h.w.uploader.uploadSyncWithMetadata(ctx, h.path)
 		if err != nil {
 			return err
@@ -2162,10 +3105,36 @@ func (h *bufferingHandle) Sync(ctx context.Context) error {
 		h.mu.Unlock()
 		if meta != nil {
 			h.markLanded(rev)
-			h.w.landedAt(h.path, rev, meta.Size)
+		}
+		h.w.resolveLandedStaging(h.path, rev, supersedesGen, failureSeq)
+	}
+	// The wait above also ends when the commit terminally failed and was
+	// dropped with local state preserved: an idle path is then
+	// indistinguishable from a landed commit, so consult the failure
+	// record and answer EIO — fsync must not claim remote durability for
+	// data that exists only locally. Anything a landing above already
+	// retired has been cleared (or generation-fenced out) by then.
+	if h.w.queue != nil {
+		if err := h.w.queue.PathTerminalFailure(h.path); err != nil {
+			return fs.StatusErrorOf(gofuse.Status(syscall.EIO))
 		}
 	}
 	return nil
+}
+
+// stagedLandingFence snapshots the fence state a synchronous staged landing
+// needs before it starts: the staged image's superseded pending generation
+// and the currently recorded terminal-failure stamp.
+func (h *bufferingHandle) stagedLandingFence() (supersedesGen, failureSeq uint64) {
+	if h.w.wbCache != nil {
+		if meta, ok := h.w.wbCache.GetMeta(h.path); ok && meta != nil {
+			supersedesGen = meta.SupersedesPendingGen
+		}
+	}
+	if h.w.queue != nil {
+		failureSeq = h.w.queue.PathTerminalFailureSeq(h.path)
+	}
+	return supersedesGen, failureSeq
 }
 
 // Flush implements fs.Handle.
@@ -2217,7 +3186,7 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 				ctx, detachCancel = h.w.detachCommitContext(ctx, 0)
 				defer detachCancel()
 			}
-			snapshot, err := h.stageToWriteCache(ctx)
+			snapshot, err := h.stageToWriteCache(ctx, stageFullDurable)
 			if errors.Is(err, errWriteCacheBypass) {
 				if h.w.queue != nil && h.w.opts.Staging != nil {
 					if err := h.stageAndEnqueueOpt(ctx, true, false, false); err != nil {
@@ -2239,14 +3208,17 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 			h.mu.Lock()
 			h.stagedToCache = true
 			h.mu.Unlock()
+			supersedesGen, failureSeq := h.stagedLandingFence()
 			rev, meta, err := h.w.uploader.uploadSyncWithMetadata(ctx, h.path)
 			if err != nil {
 				return err
 			}
-			// Only metadata consumed by this upload can settle this image.
-			if meta != nil {
-				h.w.landedAt(h.path, rev, meta.Size)
-			}
+			// Only metadata consumed by this upload can settle this image;
+			// its landed record was written at the upload's success point
+			// (the uploader's RecordLanding callback). This side retires
+			// exactly the failure state the image superseded.
+			_ = meta
+			h.w.resolveLandedStaging(h.path, rev, supersedesGen, failureSeq)
 			h.mu.Lock()
 			h.stagedToCache = false
 			// The image is on the remote now — for every create shape, not
@@ -2288,7 +3260,7 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 		if !dirty || unlinked {
 			return nil
 		}
-		snapshot, err := h.stageToWriteCache(ctx)
+		snapshot, err := h.stageToWriteCache(ctx, stageV1Ladder)
 		if !errors.Is(err, errWriteCacheBypass) {
 			if err != nil {
 				return err
@@ -2370,6 +3342,22 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 
 // Release implements fs.Handle.
 func (h *bufferingHandle) Release(ctx context.Context) error {
+	// The lazy ledger view's pinned shadow generation is dropped ONLY after
+	// every return path below has finished with the buffer — the close-time
+	// staging reads unloaded parts through that pin (EnsurePartsForWrite →
+	// the loader's ReadAtGen), so the pin must outlive the final commit.
+	// A defer covers the early returns too (the staged-to-cache fast path,
+	// a staging error): the retired backing would otherwise leak its fd and
+	// disk file forever, once per reopened spilled image.
+	defer func() {
+		h.mu.Lock()
+		gen := h.ledgerShadowGen
+		h.ledgerShadowGen = 0
+		h.mu.Unlock()
+		if gen != 0 && h.w.opts.Staging != nil {
+			h.w.opts.Staging.Shadow.Unpin(gen)
+		}
+	}()
 	// One identity snapshot for the whole close (a concurrent retarget
 	// rewrites h.path under h.mu — bare reads were a data race and could
 	// split a single Release's cancel/cleanup/submit across two names).
@@ -2440,7 +3428,7 @@ func (h *bufferingHandle) Release(ctx context.Context) error {
 				// snapshot is stale — refresh it from the current buffer
 				// before submitting (v1: the latest image always wins;
 				// submitting the stale snapshot loses the newer write).
-				if _, err := h.stageToWriteCache(ctx); errors.Is(err, errWriteCacheBypass) {
+				if _, err := h.stageToWriteCache(ctx, stageFullDurable); errors.Is(err, errWriteCacheBypass) {
 					useCache = false
 				} else if err != nil {
 					return err
@@ -2508,13 +3496,19 @@ func (w *Writeback) capturePendingImage(path string) []byte {
 	if size <= 0 || size > pendingServeMaterializeBytes {
 		return nil
 	}
-	if w.wbCache != nil {
-		if data, ok := w.wbCache.Get(path); ok && int64(len(data)) == size {
-			return data
-		}
-	}
+	// Ledger-owned paths (an in-flight enqueue or the recovery window)
+	// read their pending image from the SHADOW only: the write-cache pair
+	// under such a path may be a superseded image that merely matches the
+	// ledger entry's size — serving it would hand readers the stale bytes
+	// even after the ledger's image lands and the pair is retired.
 	if w.opts.Staging != nil && w.opts.Staging.Pending.HasPending(path) {
 		if data, ok := readShadowGenerationFenced(w.opts.Staging.Shadow, path, size); ok {
+			return data
+		}
+		return nil
+	}
+	if w.wbCache != nil {
+		if data, ok := w.wbCache.Get(path); ok && int64(len(data)) == size {
 			return data
 		}
 	}
@@ -2652,7 +3646,7 @@ func attrSize(res fs.Result) int64 {
 // the cache image, then a strict fsync staged the ledger image), and the
 // queue's landing is the authoritative one.
 func (w *Writeback) pendingAttr(path string) (fs.Attr, bool) {
-	if meta, ok := w.pendingMeta(path); ok {
+	if meta, ok := w.pendingImageMeta(path); ok {
 		return attrFromPendingMeta(meta)
 	}
 	return fs.Attr{}, false
@@ -2733,9 +3727,24 @@ func (w *Writeback) overlayPendingListAttrs(dir string, entries []fs.Entry) []fs
 // staged image's metadata, overridden by a live writer's buffer (its bytes
 // may not have reached staging yet — v1 snapshotted published write-back
 // metadata per listing).
+// pendingImageMeta is pendingMeta for callers that serve file METADATA from
+// the pending overlay: a witness-only marker (a rename's shadowless failure
+// evidence — no payload, Size deliberately zero) must not masquerade as a
+// staged image and overwrite the remote's real size in stat/list replies.
+func (w *Writeback) pendingImageMeta(path string) (*staging.WriteBackMeta, bool) {
+	meta, ok := w.pendingMeta(path)
+	if !ok || meta == nil {
+		return nil, false
+	}
+	if meta.Kind == staging.PendingConflict && meta.WitnessOnly {
+		return nil, false
+	}
+	return meta, true
+}
+
 func (w *Writeback) pendingListAttr(p string) (size int64, mode uint32, hasMode, ok bool) {
 	size = -1
-	if meta, mok := w.pendingMeta(p); mok && meta != nil {
+	if meta, mok := w.pendingImageMeta(p); mok && meta != nil {
 		size = meta.Size
 		if meta.HasMode {
 			mode, hasMode = meta.Mode&0o7777, true
@@ -3705,20 +4714,59 @@ func (w *Writeback) hasPendingLocalState(path string) bool {
 // replica and poisons the namespace cache with a negative row (the
 // close/write-sync modes land on every close, so this seam dominates
 // their ENOENT counts).
-func (w *Writeback) landedAt(path string, rev, size int64) {
+func (w *Writeback) landedAt(path string, rev, size int64, crc uint32, image []byte) {
 	if rev <= 0 {
 		return
+	}
+	if len(image) > landedImageBudget {
+		image = nil
 	}
 	w.landedMu.Lock()
 	if w.landed == nil {
 		w.landed = map[string]landedInfo{}
 	}
-	w.landed[path] = landedInfo{rev: rev, size: size, at: time.Now()}
+	// Retained landing bytes are bounded AGGREGATELY: when this record's
+	// image would push the total past the budget, the oldest retained
+	// images are evicted first (their metadata stays — only the payload
+	// proof goes; a proof-less record authorizes nothing). This keeps the
+	// identity store finite no matter how many paths land.
+	if old, ok := w.landed[path]; ok {
+		w.landedBytes -= int64(len(old.image))
+		// Clear the replaced image IN THE MAP before the eviction scan
+		// below: leaving it set lets the scan select it again and subtract
+		// its bytes a second time, corrupting the accounting.
+		old.image = nil
+		w.landed[path] = old
+	}
+	w.landedBytes += int64(len(image))
+	for w.landedBytes > landedImageBudget {
+		var oldestPath string
+		var oldestAt time.Time
+		found := false
+		for p2, info := range w.landed {
+			if info.image == nil {
+				continue
+			}
+			if !found || info.at.Before(oldestAt) {
+				oldestPath, oldestAt, found = p2, info.at, true
+			}
+		}
+		if !found {
+			break
+		}
+		info := w.landed[oldestPath]
+		w.landedBytes -= int64(len(info.image))
+		info.image = nil
+		w.landed[oldestPath] = info
+	}
+	w.landed[path] = landedInfo{rev: rev, size: size, crc: crc, image: image, at: time.Now()}
 	w.landedMu.Unlock()
-	// A publication of this pathname SUCCEEDED, so a failure remembered for
-	// an earlier publication of the same name must not keep surfacing: the
-	// error is keyed by pathname for want of a better handle, not because it
-	// describes every future file at that name.
+	// A publication of this pathname SUCCEEDED, so a failure recorded for an
+	// earlier publication of the same name must not keep surfacing: the
+	// record is keyed by pathname for want of a better handle, not because it
+	// describes every future file at that name. Taken AFTER releasing
+	// landedMu because the queue has its own lock (order: landedMu, then the
+	// queue's mu, never the reverse).
 	if w.queue != nil {
 		w.queue.ClearPathCommitErr(path)
 	}
@@ -3726,7 +4774,19 @@ func (w *Writeback) landedAt(path string, rev, size int64) {
 
 func (w *Writeback) forgetLanded(path string) {
 	w.landedMu.Lock()
+	if info, ok := w.landed[path]; ok {
+		w.landedBytes -= int64(len(info.image))
+	}
 	delete(w.landed, path)
+	w.landedMu.Unlock()
+}
+
+// clearLanded drops every same-origin watermark (a view checkout/reset:
+// none of the recorded landings is provably this view's anymore).
+func (w *Writeback) clearLanded() {
+	w.landedMu.Lock()
+	w.landed = nil
+	w.landedBytes = 0
 	w.landedMu.Unlock()
 }
 
@@ -3735,6 +4795,39 @@ func (w *Writeback) everLanded(path string) bool {
 	_, ok := w.landed[path]
 	w.landedMu.Unlock()
 	return ok
+}
+
+// landedPathsUnderPrefix lists the paths under prefix that have a landed
+// watermark in this process: the rename flow forgets the prefix's watermarks
+// before the remote RPC, so every path present in this set afterwards landed
+// DURING the RPC — including a REPEAT landing of a child that had already
+// landed before (the watermark is replaced in place, so set subtraction
+// could not see it) and ones whose worker finished before the response
+// arrived.
+func (w *Writeback) landedPathsUnderPrefix(prefix string) map[string]bool {
+	out := map[string]bool{}
+	w.landedMu.Lock()
+	for path := range w.landed {
+		if strings.HasPrefix(path, prefix) {
+			out[path] = true
+		}
+	}
+	w.landedMu.Unlock()
+	return out
+}
+
+// forgetLandedPrefix drops every landed watermark under prefix: the rename
+// flow clears the old prefix's landings before the remote RPC (the names are
+// dying anyway) so that any watermark re-appearing under it afterwards is
+// provably an in-window landing.
+func (w *Writeback) forgetLandedPrefix(prefix string) {
+	w.landedMu.Lock()
+	for path := range w.landed {
+		if strings.HasPrefix(path, prefix) {
+			delete(w.landed, path)
+		}
+	}
+	w.landedMu.Unlock()
 }
 
 // landedAttr answers a lookup from the recently-landed table (30s window).
@@ -3769,13 +4862,31 @@ func (w *Writeback) landedCoversInode(path string, rev int64) bool {
 // landedRevision returns this mount's newest recorded landing revision at
 // path.
 func (w *Writeback) landedRevision(path string) (int64, bool) {
+	rev, _, _, ok := w.landedRecord(path)
+	return rev, ok
+}
+
+// landedRecord returns the newest landing record at path: revision, size,
+// payload CRC, presence.
+func (w *Writeback) landedRecord(path string) (rev, size int64, crc uint32, ok bool) {
 	w.landedMu.Lock()
-	info, ok := w.landed[path]
+	info, has := w.landed[path]
 	w.landedMu.Unlock()
-	if !ok {
-		return 0, false
+	return info.rev, info.size, info.crc, has
+}
+
+// landedImage returns the bytes the newest landing at path uploaded, when
+// the record kept them. ok=false means the payload identity is unknown and
+// NOTHING may be proved from the record — not a size match, not a
+// checksum, and not the revision alone.
+func (w *Writeback) landedImage(path string) ([]byte, bool) {
+	w.landedMu.Lock()
+	info, has := w.landed[path]
+	w.landedMu.Unlock()
+	if !has || info.image == nil {
+		return nil, false
 	}
-	return info.rev, true
+	return info.image, true
 }
 
 // landedRevisionIs reports whether rev is a revision THIS mount landed at
@@ -3800,10 +4911,19 @@ func (w *Writeback) landedAttr(path string) (fs.Attr, bool) {
 	return fs.Attr{Kind: fs.KindFile, Mode: 0o644, Size: info.size, Rev: info.rev}, true
 }
 
+// landedImageBudget bounds the payload bytes landing records retain for
+// identity proofs (prefix/equality), AGGREGATELY across all paths: beyond
+// it the oldest retained images are evicted (their records stay, proof-
+// less). Landings whose image exceeds a per-record sanity share record
+// the checksum only and can prove nothing to adoption or repair.
+const landedImageBudget = 1 << 20
+
 type landedInfo struct {
-	rev  int64
-	size int64
-	at   time.Time
+	rev   int64
+	size  int64
+	crc   uint32 // payload CRC32 of the bytes actually uploaded
+	image []byte // the uploaded bytes while budget allows (nil = unknown)
+	at    time.Time
 }
 
 // pendingBaseRevOf resolves the CAS lineage for opening a path whose image
@@ -3939,12 +5059,63 @@ func (h *bufferingHandle) commitInline(ctx context.Context) error {
 	}
 	h.mu.Unlock()
 
+	// Streamed commits report no revision (the protocol carries none and a
+	// bare re-read cannot be attributed): digest the exact bytes via a
+	// LOCAL replay of the buffer — the multipart contract requires an
+	// io.ReaderAt, so the upload reader itself cannot be teed — so a LATER
+	// conflict on this descriptor can prove the remote row still equals
+	// this handle's previous image, the only sound way to attribute a
+	// continuation base. SHA-256, streamed: the whole-file content identity
+	// the multipart protocol itself trusts (Complete's checksum), O(1)
+	// memory, and no size budget — the verified read-back streams in
+	// windows. The digest covers BOTH rev-less shapes: the bufferReader
+	// stream and the materialized image that still streams because it
+	// exceeds the direct-PUT threshold (image bytes hash directly).
+	var streamSum [sha256.Size]byte
+	{
+		d := sha256.New()
+		var cerr error
+		if image != nil {
+			_, cerr = d.Write(image)
+		} else {
+			_, cerr = io.Copy(d, newReader())
+		}
+		if cerr == nil {
+			copy(streamSum[:], d.Sum(nil))
+		}
+	}
 	committedRev, err := h.w.commitReaderOpt(ctx, h.path, newReader, size, isNew && size == 0, baseRev)
+	if isStatusEAGAIN(err) {
+		// The conflict path could not attribute the row. If this handle
+		// streamed a previous image the server still holds byte-exactly,
+		// that proof attributes the row to US: adopt it as the continuation
+		// base and retry this commit against it once.
+		if h.mu.TryLock() {
+			selfSize, selfSum := h.selfLandSize, h.selfLandSum
+			h.mu.Unlock()
+			if selfSize > 0 {
+				if adopted, aerr := h.w.verifySelfLanding(ctx, h.path, selfSize, selfSum); aerr == nil && adopted.rev > baseRev {
+					h.mu.Lock()
+					h.baseRev = adopted.rev
+					h.selfLandSize, h.selfLandSum = 0, [sha256.Size]byte{}
+					h.mu.Unlock()
+					baseRev = adopted.rev
+					committedRev, err = h.w.commitReaderOpt(ctx, h.path, newReader, size, false, baseRev)
+				}
+			}
+		}
+	}
 	if err == nil {
 		if cacheGen != 0 {
 			h.w.wbCache.RemoveIfGeneration(h.path, cacheGen)
 		}
-		h.w.landedAt(h.path, committedRev, size)
+		var crc uint32
+		var img []byte
+		if image != nil {
+			crc = crc32.ChecksumIEEE(image)
+			img = image
+		}
+		h.w.landedAt(h.path, committedRev, size, crc, img)
 		if h.w.commitSeeder != nil && image != nil && h.w.commitSeedAllowed(int64(len(image))) {
 			h.w.commitSeeder(h.path, image, committedRev)
 		}
@@ -3954,6 +5125,12 @@ func (h *bufferingHandle) commitInline(ctx context.Context) error {
 		h.isNew = false
 		if committedRev > 0 {
 			h.baseRev = committedRev
+			h.selfLandSize, h.selfLandSum = 0, [sha256.Size]byte{}
+		} else {
+			// Rev-less streamed success: remember the content identity for
+			// the next write's continuation proof.
+			h.selfLandSize = size
+			h.selfLandSum = streamSum
 		}
 		h.mu.Unlock()
 		if h.w.opts.Policy == PolicyWriteSync || h.w.opts.Policy == PolicyCloseSync {
@@ -3963,6 +5140,61 @@ func (h *bufferingHandle) commitInline(ctx context.Context) error {
 		err = h.applyPendingMode(ctx)
 	}
 	return err
+}
+
+// selfLandVerifyWindow bounds each verified read-back REQUEST; the row is
+// hashed window by window, so the verification itself has no size budget.
+const selfLandVerifyWindow = 1 << 20
+
+type selfLandingProof struct{ rev int64 }
+
+// verifySelfLanding proves the CURRENT remote row carries this handle's
+// previously streamed image under the same whole-file SHA-256 — the content
+// identity the multipart protocol itself trusts (Complete's checksum) — and
+// returns its revision. Size or digest mismatch proves a foreign write: no
+// adoption, the conflict stands. The read-back streams in windows, so
+// arbitrarily large images verify without materializing.
+func (w *Writeback) verifySelfLanding(ctx context.Context, path string, size int64, want [sha256.Size]byte) (selfLandingProof, error) {
+	st, serr := w.opts.Client.StatCtx(ctx, w.remotePath(path))
+	if serr != nil || st == nil {
+		return selfLandingProof{}, serr
+	}
+	if st.Size != size {
+		// The row is not even the same size as our streamed image: a
+		// foreign write (or our own truncation) owns it now.
+		return selfLandingProof{}, nil
+	}
+	d := sha256.New()
+	for off := int64(0); off < size; off += selfLandVerifyWindow {
+		wantN := selfLandVerifyWindow
+		if off+int64(wantN) > size {
+			wantN = int(size - off)
+		}
+		chunk, rerr := w.opts.Client.ReadAtCtx(ctx, w.remotePath(path), off, int64(wantN))
+		if rerr != nil || len(chunk) != wantN {
+			return selfLandingProof{}, rerr
+		}
+		if _, werr := d.Write(chunk); werr != nil {
+			return selfLandingProof{}, werr
+		}
+	}
+	var got [sha256.Size]byte
+	copy(got[:], d.Sum(nil))
+	if got != want {
+		return selfLandingProof{}, nil
+	}
+	// The row's payload is the bytes WE streamed, under the content
+	// identity the upload protocol itself defines. The landed record stays
+	// identity-less (no retained bytes): this proof binds the ROW, not a
+	// cache entry, so nothing downstream may rebase on it.
+	w.landedAt(path, st.Revision, size, 0, nil)
+	return selfLandingProof{rev: st.Revision}, nil
+}
+
+// isStatusEAGAIN reports an fs.StatusError carrying EAGAIN.
+func isStatusEAGAIN(err error) bool {
+	var se *fs.StatusError
+	return errors.As(err, &se) && se.Status == gofuse.Status(syscall.EAGAIN)
 }
 
 // detachCommitContext ports v1 syncDataCommitContext: under interrupt-safe
@@ -4025,8 +5257,21 @@ func (w *Writeback) commitReaderOpt(ctx context.Context, path string, newReader 
 				return 0, mapErr(err)
 			}
 		}
-		st, werr := w.opts.Client.WriteStreamConditionalWithChecksum(ctx,
-			rp, newReader(), size, nil, expected, "")
+		// (see the routing comment above)
+		var werr error
+		if threshold := w.opts.Client.CachedSmallFileThreshold(); threshold > 0 && size < threshold {
+			data := make([]byte, size)
+			if n, rerr := io.ReadFull(newReader(), data); rerr == nil && int64(n) == size {
+				rev, perr := w.opts.Client.WriteCtxConditionalWithRevision(ctx, rp, data, expected)
+				if perr == nil {
+					return rev, nil
+				}
+				werr = perr
+			}
+		}
+		if werr == nil {
+			werr = w.opts.Client.WriteStreamConditional(ctx, rp, newReader(), size, nil, expected)
+		}
 		if werr != nil {
 			if errors.Is(werr, client.ErrConflict) {
 				if st, serr := w.opts.Client.StatCtx(ctx, rp); serr == nil && st != nil {
@@ -4045,11 +5290,7 @@ func (w *Writeback) commitReaderOpt(ctx context.Context, path string, newReader 
 			}
 			return 0, mapErr(werr)
 		}
-		rev := int64(0)
-		if st != nil {
-			rev = st.Revision
-		}
-		return rev, nil
+		return 0, nil
 	}
 	return 0, &fs.StatusError{Path: path, Status: gofuse.EAGAIN}
 }
@@ -4154,7 +5395,15 @@ func (h *bufferingHandle) ensureBufferLocked(ctx context.Context) error {
 			return nil
 		}
 	}
-	if !h.isNew && h.w.wbCache != nil {
+	// Ledger-owned paths (in-flight enqueue or the recovery window) must
+	// not preload from the write-cache pair beneath the ledger entry: it
+	// may be a superseded image — the ledger shadow branch below owns
+	// their bytes. Only this preload is gated; the shadow and truncation
+	// initializations below must still run (an early return here left a
+	// nil/empty buffer that Write then dereferenced, and skipped the
+	// O_TRUNC dirty initialization).
+	ledgerOwned := h.w.opts.Staging != nil && h.w.opts.Staging.Pending.HasPending(h.path)
+	if !h.isNew && h.w.wbCache != nil && !ledgerOwned {
 		// The write cache is LOCAL-path keyed (stageToWriteCache Put uses
 		// h.path): querying the remote name under a RemoteRoot subtree
 		// missed every not-yet-uploaded image and served the stale remote
@@ -4179,19 +5428,66 @@ func (h *bufferingHandle) ensureBufferLocked(ctx context.Context) error {
 		h.baseLoaded = true
 		return nil
 	}
-	if (h.isNew || h.inner == nil) && h.w.opts.Staging != nil {
+	if (h.isNew || h.inner == nil || ledgerOwned) && h.w.opts.Staging != nil {
 		// A pending image owns this path (queue track): preload the
-		// staged bytes so the handle reads its own image. Size-gated —
-		// a spilled multi-GiB image stays a view over the shadow.
-		if meta, ok := h.w.opts.Staging.Pending.GetMeta(h.path); ok && meta != nil &&
-			meta.Size > 0 && meta.Size <= pendingServeMaterializeBytes {
-			if data, err := h.w.opts.Staging.Shadow.ReadAll(h.path); err == nil && int64(len(data)) == meta.Size {
-				if _, werr := h.buf.Write(0, data); werr == nil {
-					h.buf.ClearDirty()
-					h.baseLoaded = true
-					return nil
+		// staged bytes so the handle reads its own image. Ledger-owned
+		// existing handles preload here too — their remote row may not
+		// exist yet (recovery window) or lags the ledger image, and the
+		// cache pair beneath the ledger entry is not theirs to read.
+		if meta, ok := h.w.opts.Staging.Pending.GetMeta(h.path); ok && meta != nil && meta.Size > 0 {
+			if meta.Size <= pendingServeMaterializeBytes {
+				// The ledger retains authority even when its shadow read
+				// fails or disagrees on length: falling through to the
+				// remote below would compose with the pre-ledger row, so a
+				// failed materialization is an error, not a fallback.
+				data, err := h.w.opts.Staging.Shadow.ReadAll(h.path)
+				if err != nil {
+					return fmt.Errorf("ledger shadow for %s: %w", h.path, err)
 				}
+				if int64(len(data)) != meta.Size {
+					return fmt.Errorf("ledger shadow %s: %d bytes, pending entry claims %d", h.path, len(data), meta.Size)
+				}
+				if _, werr := h.buf.Write(0, data); werr != nil {
+					return werr
+				}
+				h.buf.ClearDirty()
+				h.baseLoaded = true
+				return nil
 			}
+			// A spilled ledger image stays a lazy view — over the SHADOW,
+			// never the remote: the remote row is either the pre-ledger
+			// image or absent, and composing a partial write with it would
+			// expose superseded bytes under the ledger's acknowledged
+			// image. The backing generation is PINNED: the queue's landing
+			// removes the active generation and retires its file, and the
+			// acknowledged partial edit must keep reading the exact image
+			// it was opened over — the pin keeps the retired file's bytes
+			// readable until this buffer releases it.
+			if h.ledgerShadowGen == 0 {
+				h.ledgerShadowGen = h.w.opts.Staging.Shadow.Pin(h.path)
+			}
+			pinGen := h.ledgerShadowGen
+			lazySize := meta.Size
+			h.buf.SeedRemote(lazySize)
+			partSize := h.buf.PartSize()
+			h.buf.LoadPart = func(partNum int) ([]byte, error) {
+				start := int64(partNum-1) * partSize
+				end := start + partSize
+				if end > lazySize {
+					end = lazySize
+				}
+				if end <= start {
+					return nil, nil
+				}
+				part := make([]byte, end-start)
+				n, err := h.w.opts.Staging.Shadow.ReadAtGen(pinGen, start, part)
+				if err != nil || int64(n) != end-start {
+					return nil, fmt.Errorf("ledger shadow part %d of %s unavailable", partNum, h.path)
+				}
+				return part, nil
+			}
+			h.baseLoaded = true
+			return nil
 		}
 	}
 	if h.isNew || h.inner == nil || h.baseSize <= 0 {
@@ -4452,11 +5748,18 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 		return err
 	}
 	h.mu.Lock()
+	h.lastStageSize = size
+	h.stagedHist++
 	h.retireDirtyLocked(stageGen)
 	if h.wgen == stageGen {
 		h.stagedToCache = false
 	}
 	h.landed = true
+	// This staging's image is now part of this handle's content: a later
+	// write-cache staging of the same handle provably contains it (and only
+	// it — never a foreign writer's generation, which the handle's buffer
+	// was never composed over).
+	h.supersededPendingGen = pendingGen
 	// v1 publishStagedSnapshotLineageLocked: the staged snapshot becomes
 	// this handle's content identity — the next staging parents on it.
 	h.contentSnapshotID = snapshotID
@@ -4830,7 +6133,48 @@ type writeCacheSnapshot struct {
 // stageToWriteCache writes the buffered image into the .dat/.meta cache
 // (small-stage) and clears the in-memory buffer's dirty state. A nil result
 // means no image was staged; a snapshot remains valid after buffer invalidation.
-func (h *bufferingHandle) stageToWriteCache(ctx context.Context) (*writeCacheSnapshot, error) {
+// stageDurability selects the .dat/.meta snapshot's crash cost at the
+// staging boundary, restoring v1's close-path budget: v1 paid two barriers
+// (durable shadow Sync + WAL fsync) and wrote the write-back snapshot
+// cache itself NoSync.
+type stageDurability uint8
+
+const (
+	// stageFullDurable fsyncs each file and its directory rename — four
+	// barriers. For boundaries where the pair is the only durable authority
+	// (close-sync's flush, which owes remote durability at close(2) right
+	// after, and Release's final-image refresh).
+	stageFullDurable stageDurability = iota
+	// stageV1Ladder is v1's close-path cost scaled to this track's pair:
+	// both files' contents fsynced plus one directory fsync — three
+	// barriers instead of four. Lazy staging deliberately does NOT reach
+	// this tier: on this track the snapshot is the payload's only durable
+	// copy and nothing syncs it later (the background WAL syncer doesn't
+	// cover cache files), so a NoSync branch would turn the configured
+	// --writeback-sync-window into an unbounded power-loss window whenever
+	// the async upload is slow or unavailable. Lazy staging keeps
+	// governing the ledger track exactly as before.
+	stageV1Ladder
+)
+
+// putWriteCacheSnapshot writes the .dat/.meta snapshot at the selected
+// durability: the v1 ladder uses the three-barrier stage put (both file
+// contents + one directory sync); full durability keeps the four-barrier
+// put for the boundaries where the pair is the only authority.
+func (w *Writeback) putWriteCacheSnapshot(path string, image []byte, kind staging.PendingKind, baseRev int64, mode uint32, hasMode bool, dur stageDurability) (uint64, error) {
+	size := int64(len(image))
+	if dur == stageV1Ladder {
+		gen, _, err := w.wbCache.PutWithBaseRevAndModeAndLineageTimingsDirSync(path, image, size, kind, baseRev, mode, hasMode, "", "", false)
+		return gen, err
+	}
+	// The full-sync lineage put is the plain put's durability with the
+	// generation returned (same wbSyncFull path; the supersession mark and
+	// snapshot bookkeeping need the generation).
+	gen, _, err := w.wbCache.PutWithBaseRevAndModeAndLineageTimings(path, image, size, kind, baseRev, mode, hasMode, "", "", false)
+	return gen, err
+}
+
+func (h *bufferingHandle) stageToWriteCache(ctx context.Context, dur stageDurability) (*writeCacheSnapshot, error) {
 	// The #1023 fence for the writeback-cache track (close-sync and the
 	// small-file write-back flush both stage here): compose with the
 	// file's newest state before this staging refreshes the CAS base —
@@ -4898,23 +6242,60 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context) (*writeCacheSna
 	snapshot := &writeCacheSnapshot{wgen: h.wgen}
 	baseRev := h.baseRev
 	mode, hasMode := h.pendingMode, h.hasPendingMode
+	// Read the supersession fence in the SAME lock window that captured the
+	// image: it describes this handle's content, not whatever staging happens
+	// to be registered at the path when the meta is written.
+	supersedesGen := h.supersededPendingGen
 	h.mu.Unlock()
 	if isNew {
 		baseRev = 0
 	} else {
-		// The CAS base is the revision the BUFFER was built from. Only two
-		// cases may advance it: no lineage at all (a legacy open that never
-		// observed one), or the remote row is THIS mount's own landing
-		// (same-origin proof — its previous async upload advanced the
-		// revision under an unobserved open). A foreign write must stay a
-		// conflict: adopting its revision would let the stale image
-		// overwrite it silently (hello+X vs WORLD landed Xello).
-		if st, serr := h.w.opts.Client.StatCtx(ctx, h.w.remotePath(h.path)); serr == nil && st != nil {
-			if baseRev <= 0 || h.w.landedCoversInode(h.path, st.Revision) {
+		// No watermark advancement here, by design. Even a byte-carrying
+		// landed record cannot prove THIS buffer derives from its revision:
+		// a prefix match is not lineage (a handle over the pre-truncation
+		// image of a landing that shrank the file passes the prefix test,
+		// and adopting the landing's revision would let its upload restore
+		// the truncated-away bytes without ever surfacing a 409). A handle
+		// that produced a landing has its own base set at that boundary;
+		// every other handle keeps its open-time base, stages against it,
+		// and lets the conflict path decide (the repair there IS byte-
+		// exact, on the uploader's own payload). While the event stream is
+		// UNVERIFIED the table proves nothing anyway — an unobserved
+		// foreign delete+recreate may sit above the recorded incarnation.
+		if baseRev <= 0 {
+			// Lineage is MISSING: a second writable open of a live writer's
+			// path answers Attr.Rev 0 (#984 stat visibility zeroes the
+			// revision), so the handle carries no base and neither the
+			// open-time probe nor the watermark can recover one. v1
+			// discovered the authoritative revision at exactly this seam
+			// ("If BaseRev is still 0... fetch the authoritative revision");
+			// without it the writeback tier strands the entry (a
+			// PendingOverwrite without a base is rejected before upload,
+			// and recovery skips it) while close-sync degrades to an
+			// UNCONDITIONAL put that overwrites even a known-foreign row.
+			// One remote HEAD, only on this rare lineage-less path — and a
+			// failed or unusable discovery must not stage: persisting an
+			// unguarded PendingOverwrite would route close-sync through
+			// that same unconditional fallback. A 404 means the row is
+			// gone; the image stages as an expect-absent create instead.
+			st, serr := h.w.opts.Client.StatCtx(ctx, h.w.remotePath(h.path))
+			switch {
+			case serr == nil && st != nil && st.Revision > 0:
 				h.mu.Lock()
 				h.baseRev = st.Revision
 				h.mu.Unlock()
 				baseRev = st.Revision
+			case serr == nil:
+				// A stat without a usable revision (header missing or
+				// unparsable) is an unusable answer, not a success: staging
+				// anyway would silently skip both the local snapshot and
+				// the remote write below while reporting success.
+				return nil, fs.ErrUnsupported
+			case client.IsNotFound(serr):
+				isNew = true
+				baseRev = 0
+			default:
+				return nil, serr
 			}
 		}
 	}
@@ -4922,12 +6303,23 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context) (*writeCacheSna
 	if isNew {
 		kind = staging.PendingNew
 	}
+	// supersedesGen was read under the image-capture lock above: the staged
+	// image composed over every pending generation this handle's content
+	// actually includes — recorded when the handle staged through the queue
+	// or materialized a pending image on open. It is deliberately NOT a fresh
+	// Pending.Generation read here, because a writer that staged a newer
+	// generation after the capture would otherwise be stamped as superseded
+	// by an image that never contained its bytes.
 	// The write cache is LOCAL-path keyed; the uploader maps to the
 	// remote name itself (a remote key here made every subtree mount's
 	// upload silently no-op — the git-ops clone's config.lock never
 	// landed).
-	if err := h.w.wbCache.PutWithBaseRevAndMode(h.path, image, int64(len(image)), kind, baseRev, mode, hasMode); err != nil {
+	wbGen, err := h.w.putWriteCacheSnapshot(h.path, image, kind, baseRev, mode, hasMode, dur)
+	if err != nil {
 		return nil, err
+	}
+	if supersedesGen != 0 {
+		h.w.wbCache.MarkSupersedesPendingGen(h.path, supersedesGen, wbGen)
 	}
 	// v1 seeded the read cache with the staged image at the flush
 	// boundary: readers during the async landing serve these bytes instead
@@ -5083,4 +6475,23 @@ func compileExtentGlobs(patterns []string) []globMatcher {
 		}
 		return false
 	}}
+}
+
+// lockRenamePaths takes both pathname locks in a stable (lexicographic) order,
+// matching the queue's batch committer, so same-path staging and commits are
+// excluded for the duration and two renames cannot deadlock.
+func (w *Writeback) lockRenamePaths(a, b string) func() {
+	if a == b {
+		return w.pathLocks.lock(a)
+	}
+	first, second := a, b
+	if second < first {
+		first, second = second, first
+	}
+	u1 := w.pathLocks.lock(first)
+	u2 := w.pathLocks.lock(second)
+	return func() {
+		u2()
+		u1()
+	}
 }

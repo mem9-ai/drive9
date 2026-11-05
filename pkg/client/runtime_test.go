@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -396,5 +397,323 @@ func TestExecHTTPFailureClassification(t *testing.T) {
 		if IsRuntimeOutcomeUnknown(err) != tc.unknown || errors.As(err, &start) == tc.unknown {
 			t.Errorf("status %d: error = %T %v", tc.status, err, err)
 		}
+	}
+}
+
+// A server may remove a completed execution as soon as its stream disconnects.
+// Cancellation must reach it before that disconnect, not reinterpret a 404.
+func TestExecCancellationKeepsStreamUntilConfirmedStop(t *testing.T) {
+	for _, tc := range []struct {
+		name, terminal, ack       string
+		code                      int
+		wantCanceled, wantUnknown bool
+	}{
+		{"confirmed", `{"type":"error","execution_id":"rex_12345678","error_code":"canceled","message":"stopped"}`, `{"canceled":true}`, 200, true, false},
+		{"unknown stop", `{"type":"error","execution_id":"rex_12345678","error_code":"outcome_unknown","message":"unconfirmed"}`, `{"code":"outcome_unknown"}`, 503, false, true},
+		{"missing record", "", `{"error":"execution is not active"}`, 404, false, true},
+		{"completed before cancel", `{"type":"exit","execution_id":"rex_12345678","exit_code":0,"duration_ms":1}`, `{"error":"execution is not active"}`, 404, false, false},
+		{"corrupt terminal", `not json`, `{"canceled":true}`, 200, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			started := make(chan struct{})
+			cancelRequested := make(chan struct{})
+			streamEnded := make(chan struct{})
+			var execCalls, cancelCalls, earlyDisconnect atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/v1/runtime/exec":
+					execCalls.Add(1)
+					defer close(streamEnded)
+					w.Header().Set("Content-Type", "application/x-ndjson")
+					_, _ = fmt.Fprintln(w, `{"type":"started","execution_id":"rex_12345678"}`)
+					w.(http.Flusher).Flush()
+					select {
+					case <-cancelRequested:
+					case <-r.Context().Done():
+						earlyDisconnect.Add(1)
+						return
+					}
+					if tc.terminal != "" {
+						_, _ = fmt.Fprintln(w, tc.terminal)
+					}
+				case "/v1/runtime/executions/rex_12345678/cancel":
+					cancelCalls.Add(1)
+					select {
+					case <-streamEnded:
+						w.WriteHeader(404)
+						return
+					default:
+					}
+					close(cancelRequested)
+					w.WriteHeader(tc.code)
+					_, _ = fmt.Fprintln(w, tc.ack)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			result := make(chan error, 1)
+			go func() {
+				_, err := New(server.URL, "secret").Exec(ctx, ExecRequest{Argv: []string{"sleep", "60"}}, ExecOptions{OnStarted: func(ExecStarted) error { close(started); return nil }})
+				result <- err
+			}()
+			<-started
+			cancel()
+			err := <-result
+			var canceled *RuntimeCanceledError
+			if errors.As(err, &canceled) != tc.wantCanceled || IsRuntimeOutcomeUnknown(err) != tc.wantUnknown || (!tc.wantCanceled && !tc.wantUnknown && err != nil) {
+				t.Fatalf("error=%T %v", err, err)
+			}
+			if execCalls.Load() != 1 || cancelCalls.Load() != 1 || earlyDisconnect.Load() != 0 {
+				t.Fatalf("exec=%d cancel=%d premature disconnect=%d", execCalls.Load(), cancelCalls.Load(), earlyDisconnect.Load())
+			}
+		})
+	}
+}
+
+func TestExecAlreadyCanceledDoesNotSend(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { requests.Add(1); w.WriteHeader(500) }))
+	defer server.Close()
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, err := New(server.URL, "secret").Exec(ctx, ExecRequest{Argv: []string{"true"}}, ExecOptions{})
+	if !errors.Is(err, context.Canceled) || requests.Load() != 0 {
+		t.Fatalf("error=%v requests=%d", err, requests.Load())
+	}
+}
+
+type runtimeRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f runtimeRoundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+type runtimeReadCloser struct{ read func([]byte) (int, error) }
+
+func (r runtimeReadCloser) Read(p []byte) (int, error) { return r.read(p) }
+func (runtimeReadCloser) Close() error                 { return nil }
+
+func runtimeTestResponse(r *http.Request, body io.ReadCloser) *http.Response {
+	return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/x-ndjson"}}, Body: body, Request: r}
+}
+
+// Return a buffered started frame only after startup cancellation has aborted
+// the request. This pins the ID-publication race without scheduler sleeps.
+func TestExecCancelDuringStartedHandoff(t *testing.T) {
+	for _, bufferedStart := range []bool{false, true} {
+		t.Run(fmt.Sprintf("buffered-start=%t", bufferedStart), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			var execCalls, cancelCalls atomic.Int32
+			c := New("http://runtime.test", "secret")
+			c.httpClient.Transport = runtimeRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+				if strings.HasSuffix(r.URL.Path, "/cancel") {
+					cancelCalls.Add(1)
+					if r.URL.Path != "/v1/runtime/executions/rex_12345678/cancel" {
+						t.Errorf("cancel path = %s", r.URL.Path)
+					}
+					return runtimeTestResponse(r, io.NopCloser(strings.NewReader(`{"canceled":true}`))), nil
+				}
+				execCalls.Add(1)
+				read := false
+				return runtimeTestResponse(r, runtimeReadCloser{read: func(p []byte) (int, error) {
+					if read {
+						return 0, r.Context().Err()
+					}
+					read = true
+					cancel()
+					select {
+					case <-r.Context().Done():
+					case <-time.After(time.Second):
+						return 0, errors.New("startup cancellation did not abort the request")
+					}
+					if bufferedStart {
+						return copy(p, "{\"type\":\"started\",\"execution_id\":\"rex_12345678\"}\n"), nil
+					}
+					return 0, r.Context().Err()
+				}}), nil
+			})
+			began := time.Now()
+			_, err := c.Exec(ctx, ExecRequest{Argv: []string{"true"}}, ExecOptions{})
+			wantCancel := int32(0)
+			if bufferedStart {
+				wantCancel = 1
+			}
+			var unknown *RuntimeOutcomeUnknownError
+			if !errors.As(err, &unknown) || (bufferedStart && unknown.ExecutionID != "rex_12345678") {
+				t.Fatalf("error = %T %v", err, err)
+			}
+			if execCalls.Load() != 1 || cancelCalls.Load() != wantCancel || time.Since(began) >= time.Second {
+				t.Fatalf("exec=%d cancel=%d elapsed=%s", execCalls.Load(), cancelCalls.Load(), time.Since(began))
+			}
+		})
+	}
+}
+
+// Corrupt observations and local consumer failures must let the one in-flight
+// cancel finish, but must never turn its ACK into a valid execution result.
+func TestExecObservationFailureDoesNotAbortCancellation(t *testing.T) {
+	for _, mode := range []string{"json", "frame", "base64", "oversized", "contradictory", "callback", "output"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			cancelStarted, failureRead, releaseCancel := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			var releaseOnce sync.Once
+			release := func() { releaseOnce.Do(func() { close(releaseCancel) }) }
+			defer release()
+			var execCalls, cancelCalls atomic.Int32
+			cancelAborted := make(chan struct{}, 1)
+			c := New("http://runtime.test", "secret")
+			c.httpClient.Transport = runtimeRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+				if strings.HasSuffix(r.URL.Path, "/cancel") {
+					if cancelCalls.Add(1) == 1 {
+						close(cancelStarted)
+					}
+					select {
+					case <-r.Context().Done():
+						select {
+						case cancelAborted <- struct{}{}:
+						default:
+						}
+						return nil, r.Context().Err()
+					case <-releaseCancel:
+						return runtimeTestResponse(r, io.NopCloser(strings.NewReader(`{"canceled":true}`))), nil
+					}
+				}
+				execCalls.Add(1)
+				reads := 0
+				return runtimeTestResponse(r, runtimeReadCloser{read: func(p []byte) (int, error) {
+					reads++
+					if reads == 1 {
+						return copy(p, "{\"type\":\"started\",\"execution_id\":\"rex_12345678\"}\n"), nil
+					}
+					if mode == "oversized" {
+						if reads == 2 {
+							close(failureRead)
+						}
+						return copy(p, strings.Repeat("x", len(p))), nil
+					}
+					if reads > 2 {
+						return 0, io.EOF
+					}
+					close(failureRead)
+					frame := "not json\n"
+					switch mode {
+					case "contradictory":
+						frame = "{\"type\":\"error\",\"execution_id\":\"rex_12345678\",\"error_code\":\"start_failed\",\"message\":\"failed after start\"}\n"
+					case "frame":
+						frame = "{\"type\":\"exit\",\"execution_id\":\"rex_other000\",\"exit_code\":0,\"duration_ms\":1}\n"
+					case "base64":
+						frame = "{\"type\":\"stdout\",\"execution_id\":\"rex_12345678\",\"data_base64\":\"***\"}\n"
+					case "output":
+						frame = "{\"type\":\"stdout\",\"execution_id\":\"rex_12345678\",\"data_base64\":\"YQ==\"}\n"
+					}
+					return copy(p, frame), nil
+				}}), nil
+			})
+			result := make(chan error, 1)
+			go func() {
+				_, err := c.Exec(ctx, ExecRequest{Argv: []string{"true"}}, ExecOptions{
+					Stdout: shortRuntimeWriter{},
+					OnStarted: func(ExecStarted) error {
+						cancel()
+						<-cancelStarted
+						if mode == "callback" {
+							close(failureRead)
+							return errors.New("consumer stopped")
+						}
+						return nil
+					},
+				})
+				result <- err
+			}()
+			select {
+			case <-failureRead:
+			case <-time.After(time.Second):
+				t.Fatal("failure path was not reached")
+			}
+			select {
+			case <-cancelAborted:
+				t.Fatal("cleanup aborted the in-flight cancel")
+			case err := <-result:
+				t.Fatalf("returned before cancellation completed: %v", err)
+			case <-time.After(50 * time.Millisecond):
+			}
+			release()
+			select {
+			case err := <-result:
+				if !IsRuntimeOutcomeUnknown(err) {
+					t.Fatalf("error = %T %v", err, err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("Exec did not finish after cancel ACK")
+			}
+			if execCalls.Load() != 1 || cancelCalls.Load() != 1 {
+				t.Fatalf("exec=%d cancel=%d", execCalls.Load(), cancelCalls.Load())
+			}
+		})
+	}
+}
+
+func TestExecCancellationObservationIsBounded(t *testing.T) {
+	for _, acknowledge := range []bool{true, false} {
+		t.Run(fmt.Sprintf("acknowledged=%t", acknowledge), func(t *testing.T) {
+			t.Parallel()
+			started, streamClosed, cancelClosed := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			var execCalls, cancelCalls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/v1/runtime/exec" {
+					execCalls.Add(1)
+					defer close(streamClosed)
+					w.Header().Set("Content-Type", "application/x-ndjson")
+					_, _ = fmt.Fprintln(w, `{"type":"started","execution_id":"rex_12345678"}`)
+					w.(http.Flusher).Flush()
+					<-r.Context().Done() // Never send a terminal frame.
+					return
+				}
+				cancelCalls.Add(1)
+				defer close(cancelClosed)
+				if acknowledge {
+					_, _ = fmt.Fprintln(w, `{"canceled":true}`)
+					return
+				}
+				<-r.Context().Done() // Also exercise a stalled cancel RPC.
+			}))
+			defer server.Close()
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			result := make(chan error, 1)
+			go func() {
+				_, err := New(server.URL, "secret").Exec(ctx, ExecRequest{Argv: []string{"sleep", "60"}}, ExecOptions{OnStarted: func(ExecStarted) error { close(started); return nil }})
+				result <- err
+			}()
+			<-started
+			began := time.Now()
+			cancel()
+			select {
+			case err := <-result:
+				var canceled *RuntimeCanceledError
+				if errors.As(err, &canceled) != acknowledge || IsRuntimeOutcomeUnknown(err) == acknowledge {
+					t.Fatalf("error=%T %v", err, err)
+				}
+			case <-time.After(runtimeCancelTimeout + 5*time.Second):
+				server.CloseClientConnections()
+				t.Fatal("cancellation did not return within its observation bound")
+			}
+			if elapsed := time.Since(began); elapsed < runtimeCancelTimeout-time.Second {
+				t.Fatalf("stream abandoned before observation deadline: %v", elapsed)
+			}
+			for _, closed := range []chan struct{}{streamClosed, cancelClosed} {
+				select {
+				case <-closed:
+				case <-time.After(time.Second):
+					t.Fatal("request remained active after Exec returned")
+				}
+			}
+			if execCalls.Load() != 1 || cancelCalls.Load() != 1 {
+				t.Fatalf("exec=%d cancel=%d", execCalls.Load(), cancelCalls.Load())
+			}
+		})
 	}
 }
