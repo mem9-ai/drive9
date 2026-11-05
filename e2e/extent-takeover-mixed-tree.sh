@@ -53,7 +53,10 @@
 #   DRIVE9_API_KEY                  reuse an existing tenant instead of provisioning
 #   EXTENT_E2E_PROVISION_BODY        JSON body for POST /v1/provision (default: {})
 #   EXTENT_E2E_TAKEOVER_PROFILE      mount profile (default: none — the plain takeover mount; "extent" selects the full-engine profile)
-#   EXTENT_E2E_DURABILITY            optional --durability value; unset uses the CLI default
+#   EXTENT_E2E_DURABILITY            --durability value (default: fsync). The
+#                                   layout assertions are fsync barriers, so the
+#                                   suite pins strict fsync instead of letting
+#                                   `auto` resolve by RTT.
 #   EXTENT_E2E_BIG_KB                big payload KiB (default: 4x the server inline cutoff, floor 256)
 #   EXTENT_E2E_SMALL_KB              small payload KiB (default: 4)
 #   EXTENT_E2E_COMPACT_WRITES        fsynced random writes for compaction (default: 2600; 0 skips F)
@@ -85,7 +88,7 @@ CLI_RELEASE_VERSION="${CLI_RELEASE_VERSION:-}"
 
 EXTENT_E2E_PROVISION_BODY="${EXTENT_E2E_PROVISION_BODY:-{}}"
 EXTENT_E2E_TAKEOVER_PROFILE="${EXTENT_E2E_TAKEOVER_PROFILE:-none}"
-EXTENT_E2E_DURABILITY="${EXTENT_E2E_DURABILITY:-}"
+EXTENT_E2E_DURABILITY="${EXTENT_E2E_DURABILITY:-fsync}"
 EXTENT_E2E_BIG_KB="${EXTENT_E2E_BIG_KB:-}"
 EXTENT_E2E_SMALL_KB="${EXTENT_E2E_SMALL_KB:-4}"
 EXTENT_E2E_COMPACT_WRITES="${EXTENT_E2E_COMPACT_WRITES:-2600}"
@@ -616,43 +619,25 @@ expect_layout() {
   check_eq "$desc" "$(layout_of "$remote")" "$want"
 }
 
-layout_is() { [ "$(layout_of "$1")" = "$2" ]; }
-resource_id_present() { [ -n "$(inode_of "$1")" ]; }
-
-# wait_layout blocks until the path reports the expected content layout, then
-# records the check. Promotion-expected assertions MUST use it.
+# A bare `sync` flushes filesystem-wide writeback; it is NOT a per-file
+# durability barrier. Under the default write-back policy close(2) stages
+# locally and enqueues the remote commit, so a promotion becomes visible only
+# after an actual fsync(2) on the file. Every positive layout assertion below
+# is therefore preceded by fsync_mount, which runs `sync <file>` (coreutils
+# fsyncs that descriptor; `sync` alone does not).
 #
-# Under the default write-back policy close(2) stages locally and enqueues the
-# remote commit, so the promoted layout becomes visible AFTER close returns;
-# a bare sync(1) is a filesystem-wide writeback, not a per-file durability
-# barrier, and `truncate`/`cp` are followed by no fsync at all. An immediate
-# expect_layout therefore raced the queue and reported `single` for a file
-# that was extent a moment later (the bytes were always correct, and a
-# remount showed the extent layout). The byte checks already poll via
-# expect_remote_sha for the same reason.
-#
-# Negative assertions ("stays single") deliberately keep using expect_layout:
-# they describe a layout that must not change at any point.
-wait_layout() {
-  local desc="$1" remote="$2" want="$3"
-  if wait_until "layout of $remote to become $want" "$EXTENT_E2E_LAND_WAIT_S" layout_is "$remote" "$want"; then
-    check_eq "$desc" "$(layout_of "$remote")" "$want"
+# This is the contract the assertions describe: fsync(2) is the pay-up moment
+# for remote durability. Polling instead would let a broken barrier pass as
+# long as the background queue eventually caught up.
+fsync_mount() {
+  local desc="$1" local_path="$2"
+  if sync "$local_path" 2>/dev/null; then
     return 0
   fi
-  check_eq "$desc (waited ${EXTENT_E2E_LAND_WAIT_S}s)" "$(layout_of "$remote")" "$want"
-  return 1
-}
-
-# wait_resource_id blocks until the path reports a stable resource identity
-# (the extent inode is assigned when the promotion lands, not at close).
-wait_resource_id() {
-  local desc="$1" remote="$2"
-  if wait_until "resource id of $remote" "$EXTENT_E2E_LAND_WAIT_S" resource_id_present "$remote"; then
-    check_ne "$desc" "$(inode_of "$remote")" ""
-    return 0
-  fi
-  check_ne "$desc (waited ${EXTENT_E2E_LAND_WAIT_S}s)" "$(inode_of "$remote")" ""
-  return 1
+  # Record, but keep going: the assertion that follows reports the state.
+  echo "FAIL $desc (fsync(2) on $local_path returned an error)"
+  FAIL=$((FAIL + 1)); TOTAL=$((TOTAL + 1))
+  return 0
 }
 
 expect_inode() {
@@ -853,6 +838,9 @@ echo "[A] legacy multipart file compatibility (never converts)"
 mkdir -p "$M/legacy"
 LEG_SHA="$(make_payload "$RUN_ROOT/legacy-src.bin" "$BIG_KB" 1)"
 drive9_retry fs cp "$RUN_ROOT/legacy-src.bin" ":$ROOT_REMOTE/legacy/big.bin" >/dev/null
+# No fsync_mount here: this file was uploaded by the CLI, not written through
+# the mount, so there is no local descriptor to fsync — the upload already
+# completed synchronously before this assertion.
 expect_layout "A: CLI-uploaded big file is content_layout=single" "$ROOT_REMOTE/legacy/big.bin" "single"
 check_eq "A: mount reads the legacy bytes" "$(mount_sha "$M/legacy/big.bin")" "$LEG_SHA"
 expect_remote_sha "A: CLI cat agrees with the mount" "$ROOT_REMOTE/legacy/big.bin" "$LEG_SHA"
@@ -868,7 +856,7 @@ expect_remote_sha "A: CLI agrees after overwrite" "$ROOT_REMOTE/legacy/big.bin" 
 
 TR_SHA="$(make_payload "$RUN_ROOT/legacy-src2.bin" "$BIG_KB" 2)"
 cat "$RUN_ROOT/legacy-src2.bin" > "$M/legacy/big.bin"
-sync
+fsync_mount "A: truncate-rewrite keeps layout single (no conversion)" "$M/legacy/big.bin"
 check_eq "A: truncate-rewrite keeps layout single (no conversion)" "$(layout_of "$ROOT_REMOTE/legacy/big.bin")" "single"
 check_eq "A: truncate-rewrite bytes" "$(mount_sha "$M/legacy/big.bin")" "$TR_SHA"
 expect_remote_sha "A: CLI sees rewritten bytes" "$ROOT_REMOTE/legacy/big.bin" "$TR_SHA"
@@ -880,6 +868,7 @@ check_eq "A: chmod visible through the mount" "$(python3 -c 'import os,sys; prin
 mkdir -p "$M/legacy-mv"
 wait_remote_landed "A: pre-mv landing" "$ROOT_REMOTE/legacy/big.bin" "$M/legacy/big.bin"
 mv "$M/legacy/big.bin" "$M/legacy-mv/big.bin"
+fsync_mount "A: renamed legacy file stays single" "$M/legacy-mv/big.bin"
 expect_layout "A: renamed legacy file stays single" "$ROOT_REMOTE/legacy-mv/big.bin" "single"
 check_eq "A: renamed legacy bytes" "$(mount_sha "$M/legacy-mv/big.bin")" "$TR_SHA"
 check_eq "A: old legacy name is gone" "$(stat_status "$ROOT_REMOTE/legacy/big.bin")" "404"
@@ -892,35 +881,37 @@ check_eq "B: legacy file deleted" "$(stat_status "$ROOT_REMOTE/legacy-mv/big.bin
 
 BIG_SHA1="$(make_payload "$RUN_ROOT/rewrite-src.bin" "$BIG_KB" 3)"
 cp "$RUN_ROOT/rewrite-src.bin" "$M/rewrite.bin"
-sync
-wait_layout "B: same path rewritten past the cutoff becomes extent" "$ROOT_REMOTE/rewrite.bin" "extent"
-wait_resource_id "B: promoted file has a resource id" "$ROOT_REMOTE/rewrite.bin"
+fsync_mount "B: same path rewritten past the cutoff becomes extent" "$M/rewrite.bin"
+expect_layout "B: same path rewritten past the cutoff becomes extent" "$ROOT_REMOTE/rewrite.bin" "extent"
+check_ne "B: promoted file has a resource id" "$(inode_of "$ROOT_REMOTE/rewrite.bin")" ""
 check_eq "B: mount bytes of promoted file" "$(mount_sha "$M/rewrite.bin")" "$BIG_SHA1"
 expect_remote_sha "B: CLI reads the promoted file through the v2 read plan" "$ROOT_REMOTE/rewrite.bin" "$BIG_SHA1"
 PROMOTED_INO="$(inode_of "$ROOT_REMOTE/rewrite.bin")"
 
 GROW_SHA="$(write_growing "$M/grow.bin" "$((INLINE_THRESHOLD / 2))" "$((INLINE_THRESHOLD * 3))")"
-wait_layout "B: one-fd grow across the cutoff promotes" "$ROOT_REMOTE/grow.bin" "extent"
+fsync_mount "B: one-fd grow across the cutoff promotes" "$M/grow.bin"
+expect_layout "B: one-fd grow across the cutoff promotes" "$ROOT_REMOTE/grow.bin" "extent"
 check_eq "B: grow image bytes" "$(mount_sha "$M/grow.bin")" "$GROW_SHA"
 expect_remote_sha "B: CLI agrees on grown image" "$ROOT_REMOTE/grow.bin" "$GROW_SHA"
 
 write_append_only "$M/app.log" "$((INLINE_THRESHOLD * 3))"
-wait_layout "B: O_APPEND writer past the cutoff promotes" "$ROOT_REMOTE/app.log" "extent"
+fsync_mount "B: O_APPEND writer past the cutoff promotes" "$M/app.log"
+expect_layout "B: O_APPEND writer past the cutoff promotes" "$ROOT_REMOTE/app.log" "extent"
 check_eq "B: append-only size" "$(file_size "$M/app.log")" "$((INLINE_THRESHOLD * 3))"
 
 truncate -s $((64 * 1024 * 1024)) "$M/hole.bin"
-sync
-wait_layout "B: 64MiB truncate of a fresh path promotes" "$ROOT_REMOTE/hole.bin" "extent"
+fsync_mount "B: 64MiB truncate of a fresh path promotes" "$M/hole.bin"
+expect_layout "B: 64MiB truncate of a fresh path promotes" "$ROOT_REMOTE/hole.bin" "extent"
 check_eq "B: sparse size is logical" "$(file_size "$M/hole.bin")" "$((64 * 1024 * 1024))"
 
 rm "$M/seek.bin" 2>/dev/null || true
 write_sparse_seeks "$M/seek.bin" $((32 * 1024 * 1024))
-sync
-wait_layout "B: far sparse seek promotes (never multipart)" "$ROOT_REMOTE/seek.bin" "extent"
+fsync_mount "B: far sparse seek promotes (never multipart)" "$M/seek.bin"
+expect_layout "B: far sparse seek promotes (never multipart)" "$ROOT_REMOTE/seek.bin" "extent"
 check_eq "B: sparse seek size" "$(file_size "$M/seek.bin")" "$((32 * 1024 * 1024 + 1))"
 
 make_payload "$M/small-stays.bin" "$SMALL_KB" 4 >/dev/null
-sync
+fsync_mount "B: small file stays single" "$M/small-stays.bin"
 expect_layout "B: small file stays single" "$ROOT_REMOTE/small-stays.bin" "single"
 
 echo
@@ -929,7 +920,8 @@ echo "[B2] remount persistence of the takeover"
 stop_mount_at "$M" "$MOUNT_PID"
 MOUNT_PID="$(start_mount_at "$M" "$MOUNT_LOG" "${mount_profile_args[@]}")"
 check_cmd "remount is up" is_mounted "$M"
-wait_layout "B2: promoted file is extent after remount" "$ROOT_REMOTE/rewrite.bin" "extent"
+fsync_mount "B2: promoted file is extent after remount" "$M/rewrite.bin"
+expect_layout "B2: promoted file is extent after remount" "$ROOT_REMOTE/rewrite.bin" "extent"
 expect_inode "B2: same inode identity across remount" "$ROOT_REMOTE/rewrite.bin" "$PROMOTED_INO"
 check_eq "B2: promoted bytes after remount" "$(mount_sha "$M/rewrite.bin")" "$BIG_SHA1"
 append_bytes "$M/rewrite.bin" 2048 "beta"
@@ -945,13 +937,15 @@ make_payload "$M/tree/small.txt" "$SMALL_KB" 10 >/dev/null
 make_payload "$M/tree/big.bin" "$BIG_KB" 11 >/dev/null
 make_payload "$M/tree/sub/small2.txt" "$SMALL_KB" 12 >/dev/null
 make_payload "$M/tree/sub/big2.bin" "$BIG_KB" 13 >/dev/null
-sync
-wait_layout "C: tree/big.bin promoted" "$ROOT_REMOTE/tree/big.bin" "extent"
+fsync_mount "C: tree/big.bin promoted" "$M/tree/big.bin"
+expect_layout "C: tree/big.bin promoted" "$ROOT_REMOTE/tree/big.bin" "extent"
 BIG_INO="$(inode_of "$ROOT_REMOTE/tree/big.bin")"
 BIG_SHA="$(mount_sha "$M/tree/big.bin")"
-wait_layout "C: tree/sub/big2.bin promoted" "$ROOT_REMOTE/tree/sub/big2.bin" "extent"
+fsync_mount "C: tree/sub/big2.bin promoted" "$M/tree/sub/big2.bin"
+expect_layout "C: tree/sub/big2.bin promoted" "$ROOT_REMOTE/tree/sub/big2.bin" "extent"
 BIG2_INO="$(inode_of "$ROOT_REMOTE/tree/sub/big2.bin")"
 BIG2_SHA="$(mount_sha "$M/tree/sub/big2.bin")"
+fsync_mount "C: tree/small.txt stays single" "$M/tree/small.txt"
 expect_layout "C: tree/small.txt stays single" "$ROOT_REMOTE/tree/small.txt" "single"
 expect_remote_sha "C: small child bytes (CLI agrees)" "$ROOT_REMOTE/tree/small.txt" "$(mount_sha "$M/tree/small.txt")"
 
@@ -962,21 +956,23 @@ check_eq "C: stat size of extent child" "$(file_size "$M/tree/big.bin")" "$BIG_B
 check_contains "C: remote fs stat reports the size" "$(drive9_retry fs stat "$ROOT_REMOTE/tree/big.bin")" "$BIG_BYTES"
 
 mv "$M/tree/big.bin" "$M/tree/big.ren"
-wait_layout "C: extent->extent rename keeps extent" "$ROOT_REMOTE/tree/big.ren" "extent"
+fsync_mount "C: extent->extent rename keeps extent" "$M/tree/big.ren"
+expect_layout "C: extent->extent rename keeps extent" "$ROOT_REMOTE/tree/big.ren" "extent"
 expect_inode "C: rename keeps the inode identity" "$ROOT_REMOTE/tree/big.ren" "$BIG_INO"
 check_cmd_fail "C: old extent name is gone" test -e "$M/tree/big.bin"
 check_eq "C: bytes after rename" "$(mount_sha "$M/tree/big.ren")" "$BIG_SHA"
 
 mv "$M/tree/big.ren" "$M/tree/small.txt"
-wait_layout "C: extent over classic keeps extent layout" "$ROOT_REMOTE/tree/small.txt" "extent"
+fsync_mount "C: extent over classic keeps extent layout" "$M/tree/small.txt"
+expect_layout "C: extent over classic keeps extent layout" "$ROOT_REMOTE/tree/small.txt" "extent"
 check_eq "C: bytes after overwrite" "$(mount_sha "$M/tree/small.txt")" "$BIG_SHA"
 make_payload "$M/tree/big.bin" "$SMALL_KB" 14 >/dev/null
-sync
+fsync_mount "C: recreated old name is single again" "$M/tree/big.bin"
 expect_layout "C: recreated old name is single again" "$ROOT_REMOTE/tree/big.bin" "single"
 
 SMALL3_SHA="$(make_payload "$RUN_ROOT/small3.bin" "$SMALL_KB" 15)"
 cp "$RUN_ROOT/small3.bin" "$M/tree/small3.txt"
-sync
+fsync_mount "C: classic over extent becomes single" "$M/tree/small3.txt"
 mv "$M/tree/small3.txt" "$M/tree/small.txt"
 expect_layout "C: classic over extent becomes single" "$ROOT_REMOTE/tree/small.txt" "single"
 check_eq "C: classic overwrite bytes" "$(mount_sha "$M/tree/small.txt")" "$SMALL3_SHA"
@@ -985,17 +981,21 @@ make_payload "$M/tree/small3.txt" "$SMALL_KB" 16 >/dev/null
 check_cmd "C: re-creating a classic-over-extent source works" test -e "$M/tree/small3.txt"
 
 mv "$M/tree/sub/big2.bin" "$M/tree/big2.bin"
-wait_layout "C: cross-directory move keeps extent" "$ROOT_REMOTE/tree/big2.bin" "extent"
+fsync_mount "C: cross-directory move keeps extent" "$M/tree/big2.bin"
+expect_layout "C: cross-directory move keeps extent" "$ROOT_REMOTE/tree/big2.bin" "extent"
 expect_inode "C: cross-directory move keeps the identity" "$ROOT_REMOTE/tree/big2.bin" "$BIG2_INO"
 
 mv "$M/tree" "$M/tree2"
-wait_layout "C: directory rename keeps child extent" "$ROOT_REMOTE/tree2/big2.bin" "extent"
+fsync_mount "C: directory rename keeps child extent" "$M/tree2/big2.bin"
+expect_layout "C: directory rename keeps child extent" "$ROOT_REMOTE/tree2/big2.bin" "extent"
 check_eq "C: child bytes after directory rename" "$(mount_sha "$M/tree2/big2.bin")" "$BIG2_SHA"
 append_bytes "$M/tree2/big2.bin" 2048 "gamma"
-check_eq "C: child writable after directory rename" "$(layout_of "$ROOT_REMOTE/tree2/big2.bin")" "extent"
+fsync_mount "C: child writable after directory rename" "$M/tree2/big2.bin"
+expect_layout "C: child writable after directory rename" "$ROOT_REMOTE/tree2/big2.bin" "extent"
 
 cp -r "$M/tree2" "$M/tree3"
-wait_layout "C: cp -r of an extent child promotes the copy" "$ROOT_REMOTE/tree3/big2.bin" "extent"
+fsync_mount "C: cp -r of an extent child promotes the copy" "$M/tree3/big2.bin"
+expect_layout "C: cp -r of an extent child promotes the copy" "$ROOT_REMOTE/tree3/big2.bin" "extent"
 check_ne "C: copied extent file gets a fresh identity" "$(inode_of "$ROOT_REMOTE/tree3/big2.bin")" "$BIG2_INO"
 check_eq "C: copy carries the appended bytes" "$(mount_sha "$M/tree3/big2.bin")" "$(mount_sha "$M/tree2/big2.bin")"
 
@@ -1029,15 +1029,16 @@ echo "[D] cross-channel CLI namespace changes, then remount"
 
 mkdir -p "$M/tree5/sub"
 make_payload "$M/tree5/sub/x.bin" "$BIG_KB" 17 >/dev/null
-sync
-wait_layout "D: tree5 child is extent" "$ROOT_REMOTE/tree5/sub/x.bin" "extent"
+fsync_mount "D: tree5 child is extent" "$M/tree5/sub/x.bin"
+expect_layout "D: tree5 child is extent" "$ROOT_REMOTE/tree5/sub/x.bin" "extent"
 stop_mount_at "$M" "$MOUNT_PID"
 drive9_retry fs mv "$ROOT_REMOTE/tree2" "$ROOT_REMOTE/tree4" >/dev/null
 drive9_retry fs rm -r "$ROOT_REMOTE/tree5" >/dev/null
 check_eq "D: CLI removed tree5" "$(stat_status "$ROOT_REMOTE/tree5/sub/x.bin")" "404"
 MOUNT_PID="$(start_mount_at "$M" "$MOUNT_LOG" "${mount_profile_args[@]}")"
 check_cmd "D: remount is up" is_mounted "$M"
-wait_layout "D: CLI-renamed dir keeps child extent" "$ROOT_REMOTE/tree4/big2.bin" "extent"
+fsync_mount "D: CLI-renamed dir keeps child extent" "$M/tree4/big2.bin"
+expect_layout "D: CLI-renamed dir keeps child extent" "$ROOT_REMOTE/tree4/big2.bin" "extent"
 expect_remote_sha "D: CLI-renamed child bytes" "$ROOT_REMOTE/tree4/big2.bin" "$(mount_sha "$M/tree4/big2.bin")"
 check_cmd "D: CLI-renamed child is statable" test -e "$M/tree4/big2.bin"
 check_cmd_fail "D: CLI-removed tree absent in the fresh mount" test -e "$M/tree5"
@@ -1085,7 +1086,8 @@ echo "[F] server-side slice compaction of a heavily fsynced extent file"
 
 if [ "$EXTENT_E2E_COMPACT_WRITES" -gt 0 ]; then
   COMPACT_SHA="$(write_fsycled "$M/comp.bin" "$EXTENT_E2E_COMPACT_WRITES" "$EXTENT_E2E_COMPACT_SPAN_MB")"
-  wait_layout "F: fsync-cycled file is extent" "$ROOT_REMOTE/comp.bin" "extent"
+  fsync_mount "F: fsync-cycled file is extent" "$M/comp.bin"
+expect_layout "F: fsync-cycled file is extent" "$ROOT_REMOTE/comp.bin" "extent"
   check_eq "F: bytes before compaction" "$(mount_sha "$M/comp.bin")" "$COMPACT_SHA"
   expect_remote_sha "F: CLI reads the same bytes" "$ROOT_REMOTE/comp.bin" "$COMPACT_SHA"
   if [ "$EXTENT_E2E_SQL_CHECK" = "1" ]; then
@@ -1135,10 +1137,11 @@ echo "[G] two concurrent mounts agree"
 MOUNT2_PID="$(start_mount_at "$M2" "$MOUNT2_LOG" "${mount_profile_args[@]}")"
 check_cmd "G: second mount is up" is_mounted "$M2"
 check_eq "G: mount2 reads the promoted file" "$(mount_sha "$M2/rewrite.bin")" "$(mount_sha "$M/rewrite.bin")"
-wait_layout "G: mount2 sees the extent layout" "$ROOT_REMOTE/rewrite.bin" "extent"
+fsync_mount "G: mount2 sees the extent layout" "$M2/rewrite.bin"
+expect_layout "G: mount2 sees the extent layout" "$ROOT_REMOTE/rewrite.bin" "extent"
 make_payload "$M2/from2.bin" "$BIG_KB" 19 >/dev/null
-sync
-wait_layout "G: file promoted on mount2 is extent" "$ROOT_REMOTE/from2.bin" "extent"
+fsync_mount "G: file promoted on mount2 is extent" "$M2/from2.bin"
+expect_layout "G: file promoted on mount2 is extent" "$ROOT_REMOTE/from2.bin" "extent"
 sleep 3
 check_eq "G: mount1 sees mount2's file bytes" "$(mount_sha "$M/from2.bin")" "$(mount_sha "$M2/from2.bin")"
 
@@ -1152,8 +1155,8 @@ sleep 2
 check_eq "H: mid-write size visible to other processes" "$(file_size "$M/live.bin")" "$((INLINE_THRESHOLD * 3))"
 check_cmd "H: mid-write head readable" head -c 1024 "$M/live.bin" >/dev/null
 wait "$H_PID"
-sync
-wait_layout "H: file lands as extent after close" "$ROOT_REMOTE/live.bin" "extent"
+fsync_mount "H: file lands as extent after close" "$M/live.bin"
+expect_layout "H: file lands as extent after close" "$ROOT_REMOTE/live.bin" "extent"
 check_eq "H: final size after close" "$(file_size "$M/live.bin")" "$((INLINE_THRESHOLD * 3 + 1))"
 
 echo
