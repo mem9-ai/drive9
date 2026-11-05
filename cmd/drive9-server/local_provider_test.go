@@ -11,6 +11,20 @@ import (
 	"github.com/mem9-ai/drive9/pkg/tenant"
 )
 
+// keyFilePath returns a key path inside a private (0700) directory. t.TempDir()
+// is 0775 under a umask of 002, and a group-writable parent is refused.
+func keyFilePath(t *testing.T) string {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), "keys")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Join(dir, "keys.json")
+}
+
 func TestApplyLocalProviderEnvDefaults(t *testing.T) {
 	keys := []string{
 		"DRIVE9_TENANT_PROVIDER",
@@ -31,7 +45,7 @@ func TestApplyLocalProviderEnvDefaults(t *testing.T) {
 	restore := snapshotEnv(t, keys)
 	t.Cleanup(func() { restoreEnv(t, restore) })
 	unsetEnv(t, keys)
-	keyFile := filepath.Join(t.TempDir(), "local-dev-keys.json")
+	keyFile := keyFilePath(t)
 	t.Setenv(EnvLocalDevKeyFile, keyFile)
 
 	if err := applyLocalProviderEnvDefaults(""); err != nil {
@@ -80,7 +94,7 @@ func TestApplyLocalProviderEnvDefaultsPublicURLFollowsListen(t *testing.T) {
 	restore := snapshotEnv(t, keys)
 	t.Cleanup(func() { restoreEnv(t, restore) })
 	unsetEnv(t, keys)
-	t.Setenv(EnvLocalDevKeyFile, filepath.Join(t.TempDir(), "local-dev-keys.json"))
+	t.Setenv(EnvLocalDevKeyFile, keyFilePath(t))
 	if err := applyLocalProviderEnvDefaults("127.0.0.1:19009"); err != nil {
 		t.Fatalf("applyLocalProviderEnvDefaults: %v", err)
 	}
@@ -125,7 +139,7 @@ func TestRejectLocalProviderNonLoopbackDefaults(t *testing.T) {
 	}
 
 	t.Setenv("DRIVE9_LISTEN_ADDR", "127.0.0.1:9009")
-	t.Setenv(EnvLocalDevKeyFile, filepath.Join(t.TempDir(), "local-dev-keys.json"))
+	t.Setenv(EnvLocalDevKeyFile, keyFilePath(t))
 	if err := applyLocalProviderEnvDefaults("127.0.0.1:9009"); err != nil {
 		t.Fatalf("applyLocalProviderEnvDefaults: %v", err)
 	}
@@ -148,7 +162,7 @@ func TestRejectLocalProviderNonLoopbackDefaults(t *testing.T) {
 // The dev key file is the only source of local-provider keys: it must be
 // generated once, reused across restarts, and never emitted again in place.
 func TestLocalDevKeysAreGeneratedOnceAndReused(t *testing.T) {
-	keyFile := filepath.Join(t.TempDir(), "nested", "local-dev-keys.json")
+	keyFile := filepath.Join(filepath.Dir(keyFilePath(t)), "nested", "keys.json")
 	t.Setenv(EnvLocalDevKeyFile, keyFile)
 
 	first, path, err := loadOrCreateLocalDevKeys()
@@ -185,7 +199,7 @@ func TestLocalDevKeysAreGeneratedOnceAndReused(t *testing.T) {
 // An unreadable key file must fail closed: silently regenerating would leave
 // existing encrypted tenant data behind a key nobody holds.
 func TestLocalDevKeysRejectMalformedFile(t *testing.T) {
-	keyFile := filepath.Join(t.TempDir(), "local-dev-keys.json")
+	keyFile := keyFilePath(t)
 	t.Setenv(EnvLocalDevKeyFile, keyFile)
 	for _, body := range []string{
 		"not json",
@@ -204,7 +218,7 @@ func TestLocalDevKeysRejectMalformedFile(t *testing.T) {
 
 // Operator-supplied keys win and are not overwritten by the generated pair.
 func TestApplyLocalProviderDevKeysKeepsEnvironmentKeys(t *testing.T) {
-	keyFile := filepath.Join(t.TempDir(), "local-dev-keys.json")
+	keyFile := keyFilePath(t)
 	t.Setenv(EnvLocalDevKeyFile, keyFile)
 	t.Setenv("DRIVE9_MASTER_KEY", strings.Repeat("11", 32))
 	t.Setenv("DRIVE9_TOKEN_SIGNING_KEY", strings.Repeat("22", 32))
@@ -230,8 +244,8 @@ func TestLocalDevKeysRejectBroadPermissionsAndSymlinks(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("mode bits are not meaningful on Windows")
 	}
-	dir := t.TempDir()
-	keyFile := filepath.Join(dir, "local-dev-keys.json")
+	keyFile := keyFilePath(t)
+	dir := filepath.Dir(keyFile)
 	t.Setenv(EnvLocalDevKeyFile, keyFile)
 
 	keys, _, err := loadOrCreateLocalDevKeys()
@@ -281,7 +295,7 @@ func TestLocalDevKeysRejectBroadPermissionsAndSymlinks(t *testing.T) {
 // Two processes starting together must end up on the same pair: the second must
 // adopt the first's file instead of replacing it.
 func TestLocalDevKeysAdoptAnExistingFileInsteadOfReplacing(t *testing.T) {
-	keyFile := filepath.Join(t.TempDir(), "local-dev-keys.json")
+	keyFile := keyFilePath(t)
 	t.Setenv(EnvLocalDevKeyFile, keyFile)
 
 	winner := localDevKeys{
@@ -348,21 +362,25 @@ func TestLocalDevKeysLeaveExistingDirectoryPermissionsAlone(t *testing.T) {
 		t.Fatalf("parent directory mode = %04o, want 0755 unchanged", perm)
 	}
 
-	// A group-writable parent (umask 002 is common) is left as it is too; the
-	// file inside it is still 0600 and owned by us.
+	// A parent other users can write to is refused, not repaired: they could
+	// delete the key file, and the next start would rotate and strand the data.
 	if err := os.Chmod(shared, 0o775); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chmod(shared, 0o755) })
-	if _, _, err := loadOrCreateLocalDevKeys(); err != nil {
-		t.Fatalf("a 0775 parent directory must be usable: %v", err)
+	_, _, err = loadOrCreateLocalDevKeys()
+	if err == nil {
+		t.Fatal("accepted a group-writable key directory")
+	}
+	if !strings.Contains(err.Error(), "can delete the key file") {
+		t.Fatalf("error = %v, want the writable-parent rejection", err)
 	}
 	info, err = os.Stat(shared)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if perm := info.Mode().Perm(); perm != 0o775 {
-		t.Fatalf("parent directory mode = %04o, want 0775 unchanged", perm)
+		t.Fatalf("parent directory mode = %04o, want 0775 unchanged (no chmod)", perm)
 	}
 }
 

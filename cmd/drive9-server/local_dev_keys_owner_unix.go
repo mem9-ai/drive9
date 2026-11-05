@@ -38,23 +38,24 @@ func readLocalDevKeyFilePlatform(path string) ([]byte, error) {
 	return io.ReadAll(file)
 }
 
-// restrictLocalDevKeyDir verifies the key directory's identity without changing
-// its permissions.
+// checkLocalDevKeyDir verifies that the key directory cannot be modified by other
+// users, without changing its permissions.
 //
 // The directory is opened with O_NOFOLLOW, so a symlink planted at the path is
 // rejected outright instead of being followed, and the checks run on the inode
 // that was opened. An existing directory is never re-permissioned:
-// DRIVE9_LOCAL_DEV_KEY_FILE may legitimately point inside a directory this
-// process does not own the layout of, and chmod-ing it to 0700 would break
-// everything else that traverses it.
+// DRIVE9_LOCAL_DEV_KEY_FILE may legitimately live inside a directory this process
+// does not own the layout of, and chmod-ing it to 0700 would break everything
+// else that traverses it.
 //
-// Directory mode is not the boundary here either. The key material is protected
-// by the file itself — created 0600, read through O_NOFOLLOW, and rejected when
-// it is owned by another uid or readable by group/other. A directory another user
-// can write to therefore lets them delete the key file (a denial of service) but
-// not read it or substitute one: any replacement they own fails the ownership
-// check.
-func restrictLocalDevKeyDir(dir string) error {
+// Write access is the part that matters. A group or other member who can write
+// into the directory can delete the key file, and the next start treats a missing
+// file as a rotation request: it generates a new pair and everything encrypted
+// under the deleted one becomes unreadable. That is data loss, not just a denial
+// of service, so a writable parent is refused rather than repaired. Read-only
+// access (0755) is fine — the file itself is 0600, opened with O_NOFOLLOW, and
+// rejected when another uid owns it.
+func checkLocalDevKeyDir(dir string) error {
 	file, err := openLocalDevNoFollow(dir)
 	if err != nil {
 		return err
@@ -69,6 +70,11 @@ func restrictLocalDevKeyDir(dir string) error {
 	}
 	if permErr := checkLocalDevKeyOwner(dir, info); permErr != nil {
 		return permErr
+	}
+	if perm := info.Mode().Perm(); perm&0o022 != 0 {
+		return fmt.Errorf(
+			"local dev key dir %s is mode %04o, so other users can delete the key file and force a rotation; run 'chmod go-w %s' or point %s at a directory only this user can write",
+			dir, perm, dir, EnvLocalDevKeyFile)
 	}
 	return nil
 }

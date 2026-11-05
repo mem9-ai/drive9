@@ -62,6 +62,14 @@ func loadOrCreateLocalDevKeys() (localDevKeys, string, error) {
 	if err != nil {
 		return localDevKeys{}, "", err
 	}
+	// The directory is checked on read as well as on install: if another user can
+	// write into it they can delete the key file, and the next start would treat
+	// that as a rotation and strand every value encrypted under the old pair.
+	// Failing here keeps that from happening silently. A missing directory is
+	// fine — the first start creates it.
+	if dirErr := checkLocalDevKeyDir(filepath.Dir(path)); dirErr != nil && !errors.Is(dirErr, os.ErrNotExist) {
+		return localDevKeys{}, path, dirErr
+	}
 	raw, err := readLocalDevKeyFilePlatform(path)
 	switch {
 	case err == nil:
@@ -136,7 +144,7 @@ func installLocalDevKeys(path string, keys localDevKeys) (bool, error) {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return false, fmt.Errorf("create local dev key dir %s: %w", dir, err)
 		}
-		if dirErr := restrictLocalDevKeyDir(dir); dirErr != nil {
+		if dirErr := checkLocalDevKeyDir(dir); dirErr != nil {
 			return false, dirErr
 		}
 	}

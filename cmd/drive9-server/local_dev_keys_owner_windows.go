@@ -27,8 +27,8 @@ func readLocalDevKeyFilePlatform(path string) ([]byte, error) {
 	return os.ReadFile(path)
 }
 
-// restrictLocalDevKeyDir is a no-op on Windows: permissions are ACL-based.
-func restrictLocalDevKeyDir(dir string) error {
+// checkLocalDevKeyDir is a no-op on Windows: permissions are ACL-based.
+func checkLocalDevKeyDir(dir string) error {
 	_ = dir
 	return nil
 }
