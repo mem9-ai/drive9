@@ -363,6 +363,23 @@ type FsStat struct {
 // express this ("no opinion" and "drop" collapse).
 const OpenFlagDropKernelCache uint32 = 1 << 31
 
+// KernelCreate reports whether an OpCreate originates from a kernel CREATE:
+// the kernel resolved the path as missing immediately before (its lookup
+// answered negative), so existence needs no further probe. False for
+// synthesized ops (nil Kernel).
+func (op *Op) KernelCreate() bool {
+	_, ok := op.Kernel.(*gofuse.CreateIn)
+	return ok
+}
+
+// KernelOpenExisting reports whether an OpCreate originates from a kernel
+// OPEN: the kernel resolved an existing dentry for it (an O_CREAT|O_TRUNC
+// open of a live file arrives this way). False for synthesized ops.
+func (op *Op) KernelOpenExisting() bool {
+	_, ok := op.Kernel.(*gofuse.OpenIn)
+	return ok
+}
+
 // OpenFlags is the normalized open/create flag set for OpCreate and
 // Filesystem.Open.
 type OpenFlags uint32

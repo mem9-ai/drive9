@@ -78,11 +78,22 @@ func TestSyncUsesUploadedMetadataAfterRestage(t *testing.T) {
 
 func waitReviewSyncUploadGate(t *testing.T, ctx context.Context) {
 	t.Helper()
+	// Grow the dump buffer until it holds every goroutine: later tests in
+	// the package leak workers (retry backoffs, parked dispatches), and a
+	// truncated dump can simply not contain the frame this waits for —
+	// which reads as "Sync never reached the gate".
 	stack := make([]byte, 1<<20)
+	if n := runtime.Stack(stack, true); n == len(stack) {
+		stack = make([]byte, len(stack)*4)
+	}
 	ticker := time.NewTicker(time.Millisecond)
 	defer ticker.Stop()
 	for {
 		n := runtime.Stack(stack, true)
+		if n == len(stack) { // still saturated: regrow and rescrape
+			stack = make([]byte, len(stack)*4)
+			continue
+		}
 		for _, goroutine := range strings.Split(string(stack[:n]), "\n\n") {
 			if strings.Contains(goroutine, "TestSyncUsesUploadedMetadataAfterRestage.func") &&
 				strings.Contains(goroutine, "(*bufferingHandle).Sync") &&

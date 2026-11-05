@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"hash/crc32"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -234,7 +235,7 @@ func TestMissingUploadDoesNotAcknowledgeFromOldLanding(t *testing.T) {
 			backend.Seed("/f", []byte("former object"))
 			old, _ := backend.Node("/f")
 			chain, wb := newReviewDrainStack(t, backend, nil)
-			wb.landedAt("/f", old.Rev, int64(len(old.Data)))
+			wb.landedAt("/f", old.Rev, int64(len(old.Data)), crc32.ChecksumIEEE(old.Data), old.Data)
 			wb.landedMu.Lock()
 			info := wb.landed["/f"]
 			info.at = time.Now().Add(-time.Minute)

@@ -1930,7 +1930,7 @@ func TestSettleOldPrefixWithoutLedger(t *testing.T) {
 
 	// The in-window child landing: only the watermark remains (no pending
 	// entry exists to move), exactly what the fresh scan finds.
-	wb.landedAt("/d/f", 7, 7)
+	wb.landedAt("/d/f", 7, 7, 0, nil)
 	op := &fs.Op{Kind: fs.OpRename, Path: "/d", Path2: "/e"}
 	// Must not panic on the nil ledger.
 	wb.settleOldPrefixAfterMove(context.Background(), op, time.Now(), nil, map[string]bool{})

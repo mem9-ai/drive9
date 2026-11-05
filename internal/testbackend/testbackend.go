@@ -101,6 +101,10 @@ type uploadState struct {
 	parts     map[int][]byte
 	partSize  int64
 	totalSize int64
+	// expected carries the initiate's CAS revision: complete enforces it
+	// against the row like the real server's ErrRevisionConflict, so the
+	// conditional-upload contract is exercisable on the multipart track.
+	expected *int64
 }
 
 // partSizeFor returns the byte size of a 1-based part number.
@@ -321,6 +325,16 @@ func (b *Backend) ReplaceWithClassic(path string, data []byte) {
 }
 
 // ForceConflict arms N forced 409s for conditional writes to path.
+// forceConflictLocked consumes one forced-conflict request for path.
+// Caller holds b.mu.
+func (b *Backend) forceConflictLocked(path string) bool {
+	if b.forceConflict[path] > 0 {
+		b.forceConflict[path]--
+		return true
+	}
+	return false
+}
+
 func (b *Backend) ForceConflict(path string, n int) {
 	b.mu.Lock()
 	b.forceConflict[path] = n
@@ -394,11 +408,12 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			id := fmt.Sprintf("up-%d", b.uploadSeq)
 			partSize := int64(16 << 20)
 			total := req.TotalSize
+
 			nParts := (total + partSize - 1) / partSize
 			if nParts < 1 {
 				nParts = 1
 			}
-			b.uploads[id] = &uploadState{path: req.Path, parts: map[int][]byte{}, partSize: partSize, totalSize: total}
+			b.uploads[id] = &uploadState{path: req.Path, parts: map[int][]byte{}, partSize: partSize, totalSize: total, expected: req.ExpectedRevision}
 			b.mu.Unlock()
 			w.WriteHeader(http.StatusAccepted)
 			b.writeJSON(w, map[string]any{"upload_id": id, "key": req.Path, "part_size": partSize, "total_parts": nParts, "resumable": false})
@@ -472,6 +487,17 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					ChecksumSHA256 string `json:"checksum_sha256"`
 				}
 				_ = json.NewDecoder(r.Body).Decode(&req)
+				b.mu.Lock()
+				forced := b.forceConflictLocked(us.path)
+				b.mu.Unlock()
+				if forced {
+					// The forced-conflict test knob reaches the multipart
+					// track too: complete 409s once per request, exactly
+					// like the direct-PUT handler (same locked accessor —
+					// handlers run concurrently).
+					b.writeErr(w, http.StatusConflict, "forced conflict")
+					return
+				}
 				var image []byte
 				for _, pt := range req.Parts {
 					b.mu.Lock()

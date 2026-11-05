@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"os"
 	"path/filepath"
 	"strings"
@@ -122,6 +123,19 @@ type WriteBackMeta struct {
 	// below it: those images are contained in this one. Persisted so a
 	// post-restart landing keeps the same fence.
 	SupersedesPendingGen uint64 `json:"supersedes_pending_gen,omitempty"`
+	// DataCRC binds the .dat payload to this metadata record (CRC32 of
+	// the staged bytes), guarded by DataBound — zero is a LEGITIMATE
+	// checksum (an empty payload binds with CRC 0 and Size 0), so absence
+	// of the binding must not be inferred from the value. The batched-
+	// dir-sync put stages the pair through two renames that a crash
+	// between them can mix — a surviving new .meta over a stale .dat
+	// would serve or upload OLD bytes at the NEW base revision; the
+	// binding detects such a torn pair at read time (see viewMatchesMeta)
+	// and prunes it instead.
+	DataCRC uint32 `json:"data_crc,omitempty"`
+	// DataBound marks a record whose DataCRC/Size binding is authoritative
+	// (every put sets it); legacy records without it are unbound.
+	DataBound bool `json:"data_bound,omitempty"`
 	// LayerClean retains a remotely durable overlay for reads, not recovery.
 	// Every new staging publication resets it; legacy records remain dirty.
 	LayerClean bool `json:"layer_clean,omitempty"`
@@ -388,7 +402,7 @@ func (c *WriteBackCache) PutWithBaseRevAndModeTimings(remotePath string, data []
 // used by FileHandle staging. Legacy callers deliberately store empty lineage,
 // which is safe because such metadata cannot authorize a growth rebase.
 func (c *WriteBackCache) PutWithBaseRevAndModeAndLineageTimings(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, liveAncestors ...string) (uint64, WriteBackPutTimings, error) {
-	return c.putWithBaseRevAndModeAndLineage(remotePath, data, size, kind, baseRev, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted, true, liveAncestors)
+	return c.putWithBaseRevAndModeAndLineage(remotePath, data, size, kind, baseRev, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted, wbSyncFull, liveAncestors)
 }
 
 // PutWithBaseRevAndModeAndLineageTimingsNoSync is the non-durable variant of
@@ -398,7 +412,22 @@ func (c *WriteBackCache) PutWithBaseRevAndModeAndLineageTimings(remotePath strin
 // elsewhere — the shadow store + pending index — so at most the snapshot's
 // freshness (not its integrity) is lost on a crash.
 func (c *WriteBackCache) PutWithBaseRevAndModeAndLineageTimingsNoSync(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, liveAncestors ...string) (uint64, WriteBackPutTimings, error) {
-	return c.putWithBaseRevAndModeAndLineage(remotePath, data, size, kind, baseRev, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted, false, liveAncestors)
+	return c.putWithBaseRevAndModeAndLineage(remotePath, data, size, kind, baseRev, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted, wbSyncNone, liveAncestors)
+}
+
+// PutWithBaseRevAndModeAndLineageTimingsDirSync is the v1 close-path stage
+// variant of PutWithBaseRevAndModeAndLineageTimings: both files' contents
+// are fsynced before their renames and ONE directory fsync after both
+// renames makes the pair durable together — three barriers (two file syncs
+// + one directory sync) instead of the durable put's four. Once the call
+// returns the entry is durable and neither file's contents are torn. The
+// renames themselves are not ordered against each other before the shared
+// directory sync: a crash inside the call can leave a surviving new .meta
+// over a stale .dat, and the DataCRC binding catches exactly that at read
+// time (the entry is pruned — lost cleanly, matching v1's crash-before-
+// WAL-fsync window — instead of uploading stale bytes at the new base).
+func (c *WriteBackCache) PutWithBaseRevAndModeAndLineageTimingsDirSync(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, liveAncestors ...string) (uint64, WriteBackPutTimings, error) {
+	return c.putWithBaseRevAndModeAndLineage(remotePath, data, size, kind, baseRev, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted, wbSyncDirOnce, liveAncestors)
 }
 
 // Get reads the cached data for remotePath. Returns nil, false if not cached.
@@ -453,11 +482,28 @@ func (c *WriteBackCache) GetMeta(remotePath string) (*WriteBackMeta, bool) {
 	return &cp, true
 }
 
+// viewMatchesMeta reports whether a data image is the one its metadata
+// record describes: a bound record (DataBound — every put sets it) carries
+// the payload's length and CRC32, and zero is a legitimate checksum (an
+// empty payload binds with CRC 0 and Size 0). Unbound legacy records are
+// accepted as-is. A mismatch is a TORN PAIR — a crash between the two
+// renames of a batched-dir-sync put left a surviving .meta over a stale
+// .dat — and must never be served or uploaded: the stale bytes would
+// publish at the NEW base revision.
+func viewMatchesMeta(meta *WriteBackMeta, data []byte) bool {
+	if meta == nil || !meta.DataBound {
+		return true
+	}
+	return int64(len(data)) == meta.Size && crc32.ChecksumIEEE(data) == meta.DataCRC
+}
+
 // GetMetaAndView atomically reads both metadata and data for remotePath under
 // the same per-path lock, guaranteeing that meta and data are from the same
 // generation. This prevents an interleaving where a concurrent Put replaces
 // the .dat file between a separate GetMeta and getView call, causing the
 // uploader to upload new data with old meta (wrong baseRev/generation).
+// The view load itself enforces the metadata binding: a torn pair is pruned
+// by getViewLocked, never returned.
 func (c *WriteBackCache) GetMetaAndView(remotePath string) (*WriteBackMeta, []byte, bool) {
 	pl := c.AcquirePathLock(remotePath)
 	c.mu.Lock()
@@ -488,7 +534,8 @@ func (c *WriteBackCache) GetMetaAndView(remotePath string) (*WriteBackMeta, []by
 // lets callers atomically capture associated staging-store generations (e.g.
 // pendingIndex/shadowStore) under the same serialization window so a concurrent
 // same-path Put cannot race the snapshot and leave a stale upload holding newer
-// generations it is not responsible for.
+// generations it is not responsible for. The view load itself enforces the
+// metadata binding: a torn pair is pruned by getViewLocked, never returned.
 func (c *WriteBackCache) GetMetaAndViewWithCallback(remotePath string, onLocked func()) (*WriteBackMeta, []byte, bool) {
 	pl := c.AcquirePathLock(remotePath)
 	defer c.ReleasePathLock(remotePath, pl)
@@ -579,6 +626,47 @@ func (c *WriteBackCache) UpdateMode(remotePath string, mode uint32) error {
 	c.metas[remotePath] = &cp
 	c.mu.Unlock()
 	return nil
+}
+
+// RebaseBaseRevIfGeneration advances a staged entry's CAS base to baseRev
+// — the same-origin conflict repair: an entry that lost a duplicate-commit
+// race (another flush of this mount landed a newer revision between its
+// staging and its upload) retries against the revision the race winner
+// recorded instead of conflicting forever. The generation guard (checked
+// under the path lock) keeps a rebased upload from pairing with a fresher
+// same-path staging; the entry's generation is unchanged — its payload
+// did not change, and the uploader's success cleanup keys on it.
+func (c *WriteBackCache) RebaseBaseRevIfGeneration(remotePath string, generation uint64, baseRev int64) bool {
+	if baseRev <= 0 {
+		return false
+	}
+	pl := c.AcquirePathLock(remotePath)
+	defer c.ReleasePathLock(remotePath, pl)
+
+	c.mu.Lock()
+	meta, ok := c.metas[remotePath]
+	if !ok || meta.Generation != generation || baseRev <= meta.BaseRev {
+		c.mu.Unlock()
+		return false
+	}
+	updated := cloneWriteBackMeta(meta)
+	updated.BaseRev = baseRev
+	metaPath := c.MetaFile(remotePath)
+	c.mu.Unlock()
+
+	metaBytes, err := json.Marshal(updated)
+	if err != nil {
+		return false
+	}
+	if err := atomicWrite(metaPath, metaBytes); err != nil {
+		return false
+	}
+
+	c.mu.Lock()
+	cp := updated
+	c.metas[remotePath] = &cp
+	c.mu.Unlock()
+	return true
 }
 
 // RebasePendingNew carries a real create's revision to a newer pending image.
@@ -892,9 +980,68 @@ func (c *WriteBackCache) ListPending() []PendingEntry {
 			c.pruneEntryLocked(path, false)
 			continue
 		}
+		// Recovery admits the payload through the same binding check as
+		// every other load: caching a torn pair here would hand the stale
+		// bytes to later memory hits (getViewLocked's fast path skips the
+		// recheck) and to the uploader — republishing old contents at the
+		// new base revision instead of pruning the pair.
+		if !viewMatchesMeta(meta, data) {
+			c.pruneEntryLocked(path, true)
+			continue
+		}
 
 		c.cacheDataLocked(path, data, meta.Size)
 		result = append(result, PendingEntry{Meta: *meta, Data: data})
+	}
+	return result
+}
+
+// ListPendingMetas enumerates the pending entries' METADATA only. It is
+// the recovery-scheduling path: unlike ListPending it never loads a
+// payload, so a mount recovering a large on-disk backlog stays bounded by
+// the per-upload working set (the worker loads one image at a time through
+// GetMetaAndView) instead of materializing the backlog's total bytes.
+func (c *WriteBackCache) ListPendingMetas() []WriteBackMeta {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	entries, err := os.ReadDir(c.dir)
+	if err == nil {
+		for _, e := range entries {
+			name := e.Name()
+			if !strings.HasSuffix(name, ".meta") {
+				continue
+			}
+			metaPath := filepath.Join(c.dir, name)
+			raw, err := os.ReadFile(metaPath)
+			if err != nil {
+				continue
+			}
+			var meta WriteBackMeta
+			if err := json.Unmarshal(raw, &meta); err != nil {
+				c.pruneScannedEntry(name)
+				continue
+			}
+			if !c.validateScannedMeta(name, &meta) {
+				c.pruneScannedEntry(name)
+				continue
+			}
+			if _, ok := c.metas[meta.Path]; !ok {
+				cp := meta
+				c.metas[meta.Path] = &cp
+				if meta.Generation > c.nextGen.Load() {
+					c.nextGen.Store(meta.Generation)
+				}
+			}
+		}
+	}
+
+	result := make([]WriteBackMeta, 0, len(c.metas))
+	for _, meta := range c.metas {
+		if meta.Kind == PendingConflict {
+			continue
+		}
+		result = append(result, *meta)
 	}
 	return result
 }
@@ -912,7 +1059,28 @@ func (c *WriteBackCache) validateScannedMeta(scannedMetaName string, meta *Write
 	return scannedMetaName == HashPath(meta.Path)+".meta"
 }
 
-func (c *WriteBackCache) putWithBaseRevAndModeAndLineage(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, durable bool, liveAncestors []string) (uint64, WriteBackPutTimings, error) {
+// wbSyncMode selects a put's crash cost (see the exported variants).
+type wbSyncMode uint8
+
+const (
+	// wbSyncFull fsyncs each file and the directory rename after each
+	// rename — four barriers. The pair is the only durable authority.
+	wbSyncFull wbSyncMode = iota
+	// wbSyncDirOnce is the v1 close-path stage cost: fsync both files'
+	// contents before their renames, then ONE directory fsync publishing
+	// the pair together — three barriers. The two renames are not ordered
+	// against each other before that sync, so a crash in between can mix
+	// a surviving new .meta over a stale .dat; the DataCRC binding detects
+	// such a torn pair at read time and prunes it (a cleanly lost entry,
+	// never stale bytes uploaded at the new base). After the sync the pair
+	// is durable together.
+	wbSyncDirOnce
+	// wbSyncNone writes atomically without fsyncs; the durable authority
+	// must already exist elsewhere (shadow store + pending index).
+	wbSyncNone
+)
+
+func (c *WriteBackCache) putWithBaseRevAndModeAndLineage(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, syncMode wbSyncMode, liveAncestors []string) (uint64, WriteBackPutTimings, error) {
 	var t WriteBackPutTimings
 
 	// Phase 1: acquire per-path lock (serializes same-path Put/Remove/etc.)
@@ -927,12 +1095,23 @@ func (c *WriteBackCache) putWithBaseRevAndModeAndLineage(remotePath string, data
 	gen := c.nextGen.Add(1)
 
 	// Phase 2: file I/O outside global lock (only per-path serialized).
-	writeFn := atomicWrite
-	if !durable {
-		writeFn = atomicWriteNoSync
+	writeDat := atomicWrite
+	writeMeta := atomicWrite
+	switch syncMode {
+	case wbSyncNone:
+		writeDat = atomicWriteNoSync
+		writeMeta = atomicWriteNoSync
+	case wbSyncDirOnce:
+		// Both files' CONTENTS are synced before their renames; the single
+		// trailing directory sync (below) publishes the pair together. A
+		// per-file directory sync here would both cost a third barrier and
+		// make the new .dat recoverable ahead of the .meta that describes
+		// it.
+		writeDat = atomicWriteFileSyncOnly
+		writeMeta = atomicWriteFileSyncOnly
 	}
 	datStart := time.Now()
-	if err := writeFn(datPath, data); err != nil {
+	if err := writeDat(datPath, data); err != nil {
 		c.ReleasePathLock(remotePath, pl)
 		return 0, t, fmt.Errorf("writeback put data: %w", err)
 	}
@@ -949,6 +1128,8 @@ func (c *WriteBackCache) putWithBaseRevAndModeAndLineage(remotePath string, data
 		BaseRev:          baseRev,
 		Mode:             mode & posixPermissionModeMask,
 		HasMode:          hasMode,
+		DataCRC:          crc32.ChecksumIEEE(data),
+		DataBound:        true,
 		SnapshotID:       snapshotID,
 		ParentSnapshotID: parentSnapshotID,
 		lineageTrusted:   lineageTrusted,
@@ -960,13 +1141,23 @@ func (c *WriteBackCache) putWithBaseRevAndModeAndLineage(remotePath string, data
 		return 0, t, fmt.Errorf("writeback marshal meta: %w", err)
 	}
 	metaStart := time.Now()
-	if err := writeFn(metaPath, metaBytes); err != nil {
+	if err := writeMeta(metaPath, metaBytes); err != nil {
 		// Best-effort cleanup of the .dat file if meta write fails.
 		_ = os.Remove(datPath)
 		c.ReleasePathLock(remotePath, pl)
 		return 0, t, fmt.Errorf("writeback put meta: %w", err)
 	}
 	t.MetaWrite = time.Since(metaStart)
+	if syncMode == wbSyncDirOnce {
+		// One directory fsync makes both renames durable together — with
+		// the two content syncs above, three barriers total instead of the
+		// durable put's four (v1's close-path stage paid two for its
+		// shadow + WAL pair; this track's pair is one file larger).
+		if err := fsyncDir(filepath.Dir(datPath)); err != nil {
+			c.ReleasePathLock(remotePath, pl)
+			return 0, t, fmt.Errorf("writeback put dir sync: %w", err)
+		}
+	}
 
 	// Phase 3: publish in-memory state under global lock (fast, no I/O).
 	c.mu.Lock()
@@ -990,6 +1181,13 @@ func (c *WriteBackCache) pruneEntryLocked(remotePath string, removeDataFile bool
 
 // getViewLocked returns a read-only payload view for remotePath.
 // The caller must hold c.mu and must not mutate the returned slice.
+// A payload loaded from disk is validated against its metadata binding
+// BEFORE it is served or cached: a torn pair (a surviving .meta over a
+// stale .dat — see viewMatchesMeta) is pruned here, so every consumer —
+// Get, GetView, the meta+view getters, the pending-image capture, the
+// writable-open preload — is protected at the one choke point. In-memory
+// payloads skip the check: they were either written by a put (bound by
+// construction) or admitted through this validated load.
 func (c *WriteBackCache) getViewLocked(remotePath string) ([]byte, bool) {
 	if data, ok := c.data[remotePath]; ok {
 		c.touchDataLocked(remotePath)
@@ -1004,6 +1202,12 @@ func (c *WriteBackCache) getViewLocked(remotePath string) ([]byte, bool) {
 		if errors.Is(err, os.ErrNotExist) {
 			c.pruneEntryLocked(remotePath, false)
 		}
+		return nil, false
+	}
+	if !viewMatchesMeta(meta, data) {
+		// Torn pair: drop it — losing the entry cleanly beats serving or
+		// uploading stale bytes at the new base.
+		c.pruneEntryLocked(remotePath, true)
 		return nil, false
 	}
 	c.cacheDataLocked(remotePath, data, meta.Size)
@@ -1063,7 +1267,7 @@ func cloneWriteBackMeta(meta *WriteBackMeta) WriteBackMeta {
 
 // atomicWrite writes data to path atomically using a temp file + fsync + rename.
 func atomicWrite(path string, data []byte) error {
-	return atomicWriteOpt(path, data, true)
+	return atomicWriteMode(path, data, true, true)
 }
 
 // atomicWriteNoSync is atomicWrite without the durability fsyncs. The
@@ -1073,10 +1277,22 @@ func atomicWrite(path string, data []byte) error {
 // store + pending index), e.g. the post-durable-stage Flush snapshot —
 // see Dat9FS.snapshotWriteBackLocked.
 func atomicWriteNoSync(path string, data []byte) error {
-	return atomicWriteOpt(path, data, false)
+	return atomicWriteMode(path, data, false, false)
 }
 
-func atomicWriteOpt(path string, data []byte, sync bool) error {
+// atomicWriteFileSyncOnly syncs the file's contents before the rename but
+// leaves the directory entry change UNsynced: the caller batches its own
+// directory fsync once every rename of a group has happened, so the group
+// becomes durable together (no file of it is recoverable ahead of its
+// metadata) at the cost of one shared directory sync.
+func atomicWriteFileSyncOnly(path string, data []byte) error {
+	return atomicWriteMode(path, data, true, false)
+}
+
+// atomicWriteMode is atomicWrite with the two durability levers split:
+// syncFile fsyncs the temp file's contents before the rename, syncDir
+// fsyncs the parent directory after it.
+func atomicWriteMode(path string, data []byte, syncFile, syncDir bool) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, ".tmp-*")
 	if err != nil {
@@ -1092,7 +1308,7 @@ func atomicWriteOpt(path string, data []byte, sync bool) error {
 	}
 
 	// Fsync to ensure data reaches disk before rename.
-	if sync {
+	if syncFile {
 		if err := tmp.Sync(); err != nil {
 			_ = tmp.Close()
 			_ = os.Remove(tmpName)
@@ -1110,7 +1326,7 @@ func atomicWriteOpt(path string, data []byte, sync bool) error {
 		return err
 	}
 
-	if !sync {
+	if !syncDir {
 		return nil
 	}
 	// Fsync parent directory so the rename is durable across power loss.
