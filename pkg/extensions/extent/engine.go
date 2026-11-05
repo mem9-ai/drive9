@@ -2,7 +2,6 @@ package extent
 
 import (
 	"context"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -24,10 +23,6 @@ type EngineConfig struct {
 	CacheDir string
 	// CacheSize bounds the disk cache in bytes (0 = default).
 	CacheSize uint64
-	// CacheSizeConfigured marks CacheSize as an explicit operator choice, so
-	// 0 means "memory-only" rather than "unset". Without it a zero value is
-	// indistinguishable from a caller that never set a budget.
-	CacheSizeConfigured bool
 	// FreeSpaceRatio is the disk-cache free-space floor (JuiceFS
 	// free-space-ratio): eviction and staging both respect it so the
 	// cache never fills the volume. 0 = JuiceFS default (10%).
@@ -48,8 +43,7 @@ type EngineConfig struct {
 	// 40 on Linux). Caps the in-flight writeback byte footprint feeding the
 	// shared cache budget.
 	MaxStageWrite int
-	// ReadOnly mounts never mutate the remote: staged interactive
-	// barriers are NOT replayed (their commits are writes).
+	// ReadOnly mounts never mutate the remote.
 	ReadOnly bool
 }
 
@@ -74,28 +68,6 @@ type Engine struct {
 	Bridge *Bridge
 	Store  chunk.ChunkStore
 	VFS    *vfs.VFS
-	// juiceCacheSize is the chunk store's share of the cache allowance (the
-	// operator's total minus the staging reserve).
-	juiceCacheSize int64
-}
-
-// stagingReserveBytes is the share of the plane's allowance reserved for the
-// durable interactive-fsync staging tree: a quarter of the total, capped so a
-// large cache is not mostly reserve. The remainder stays with JuiceFS's own
-// chunk cache, and the two always sum to the operator's number.
-func stagingReserveBytes(total int64) int64 {
-	const cap = 256 << 20
-	if total <= 0 {
-		return 0
-	}
-	reserve := total / 4
-	if reserve > cap {
-		reserve = cap
-	}
-	if reserve < 1 {
-		reserve = 1
-	}
-	return reserve
 }
 
 // NewEngine builds a ready-to-use engine.
@@ -106,53 +78,17 @@ func NewEngine(cfg EngineConfig) *Engine {
 		NativeWriteback: cfg.Writeback && cfg.CacheDir != "",
 		WritebackWait:   cfg.WritebackWait,
 	}
-	// Interactive-durability staging lives with the engine's cache. It is
-	// charged to the SAME allowance (StagingBudget): the tree sits inside the
-	// cache directory but outside JuiceFS's raw/rawstaging accounting, so
-	// without this an interactive fsync could retain bytes the operator never
-	// budgeted for.
-	//
-	// CacheSize == 0 disables it: that is JuiceFS's explicit memory-only mode
-	// (reads bypass the cache, writeback is off), and arming a durable
-	// on-disk staging tree would retain exactly what the operator asked not
-	// to retain.
-	//
-	// The operator's number is ONE allowance for the whole plane, so it is
-	// SPLIT here rather than handed out twice: JuiceFS's CacheSize gets the
-	// remainder and this staging tree gets the reserve, so the two sum to the
-	// configured total by construction. (Handing both the same N — the
-	// previous shape — let the plane retain up to 2N.)
-	//
-	// The split has to be static: JuiceFS's used-byte count is not exposed
-	// (cacheStore.used is private, and scanCached only walks "raw"), so a
-	// runtime division would be guessing. A fixed reserve is deterministic
-	// and is what makes "sum ≤ N" a construction property instead of a hope.
-	cacheBudget := int64(cfg.CacheSize)
-	stagingBudget := int64(0)
-	if cfg.CacheDir != "" && (cfg.CacheSize > 0 || !cfg.CacheSizeConfigured) {
-		bcfg.StagingDir = filepath.Join(cfg.CacheDir, "commit-staging")
-		if cacheBudget > 0 {
-			stagingBudget = stagingReserveBytes(cacheBudget)
-			cacheBudget -= stagingBudget
-			bcfg.StagingBudget = stagingBudget
-		}
-		bcfg.FreeSpaceRatio = cfg.FreeSpaceRatio
-	}
 	b := NewBridge(bcfg)
-	// Seed the staging byte counter from whatever a previous mount left; every
-	// later delta is tracked at its own add/remove site.
-	b.seedStagingUsage()
-	if bcfg.StagingDir != "" && !cfg.ReadOnly {
-		// Barriers a previous mount spilled but never landed: re-commit
-		// them in the background; staged bytes are in the registry either
-		// way, so an open of the file can serve and commit them.
-		go b.ReplayStagedLocal(context.Background())
-	}
 	// CacheSize 0 means NO disk cache (JuiceFS's memory-only mode: reads
 	// bypass the cache, writeback is disabled by SelfCheck). It must not
 	// silently become a 1 GiB default — the mount wiring derives this value
 	// from --disk-read-cache-size-mb so the operator's budget is exact.
-	cacheSize := uint64(cacheBudget)
+	//
+	// The extent plane has no second consumer of this allowance: the
+	// durable interactive-fsync staging tree that used to be carved out of
+	// it is gone (the plane promises only JuiceFS's own close-to-open
+	// behavior), so the operator's number passes through verbatim.
+	cacheSize := uint64(cfg.CacheSize)
 	blockSize := blockSizeMiB << 20
 	chunkConf := chunk.Config{
 		BlockSize:  blockSize << 0,
@@ -224,7 +160,7 @@ func NewEngine(cfg EngineConfig) *Engine {
 		DirEntryTimeout: time.Second,
 	}
 	v := vfs.NewVFS(conf, b, store, nil, nil)
-	return &Engine{Bridge: b, Store: store, VFS: v, juiceCacheSize: int64(cacheSize)}
+	return &Engine{Bridge: b, Store: store, VFS: v}
 }
 
 // FlushFile commits any slice still pending on the engine's asynchronous

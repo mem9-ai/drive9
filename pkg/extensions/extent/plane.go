@@ -2,7 +2,6 @@ package extent
 
 import (
 	"context"
-	"fmt"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -34,17 +33,6 @@ type Options struct {
 	// matching paths ride the engine plane from byte zero even in hybrid
 	// mode.
 	Patterns []string
-	// SyncPolicy is the mount's --durability write policy. "write-sync"
-	// makes every Write remote-durable before returning (engine flush +
-	// bridge commit per write); the other policies commit at Flush/Release
-	// like the classic plane.
-	SyncPolicy string
-	// SyncMode is the mount's resolved fsync semantic: "interactive" makes
-	// fsync a LOCAL durability barrier (pending blocks spilled under the
-	// engine's staging dir; the remote commit lands at flush/close or the
-	// next mount's replay) exactly like the classic plane's staging
-	// ledger; "strict" (or empty) pays the remote commit synchronously.
-	SyncMode string
 	// Events, when set, drops the bridge's cached mappings when names
 	// vanish or change underneath the engine.
 	Events *fs.EventBus
@@ -66,16 +54,6 @@ type Handler struct {
 // New builds the engine-plane handler.
 func New(opts Options) *Handler {
 	h := &Handler{opts: opts, handles: make(map[string][]*engineHandle)}
-	if opts.SyncMode == "interactive" && opts.Engine != nil && opts.Engine.Bridge.HasStagingDir() {
-		// Interactive durability: fsync is a local barrier; commits defer
-		// to the flush/close boundary (or the next mount's replay).
-		//
-		// The barrier must actually EXIST for this to be a promise. With no
-		// staging directory (an explicit --extent-cache-size-mb=0 mount)
-		// deferring would make Sync a no-op that reports success while the
-		// bytes live only in memory, so those mounts keep strict fsync.
-		opts.Engine.Bridge.EnableDeferredCommits()
-	}
 	if opts.Events != nil {
 		// A rename rides EventWrite for the OLD name with RenamedTo set
 		// (pkg/fuse mutatedRename), followed by a plain EventDelete for
@@ -276,7 +254,7 @@ func (h *Handler) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, e
 			return res, err
 		}
 	case fs.OpRename:
-		if res, err, handled := h.renameWithDurableIntent(ctx, op, next); handled {
+		if res, err, handled := h.renameOverOpen(ctx, op, next); handled {
 			return res, err
 		}
 	case fs.OpSetAttr:
@@ -476,26 +454,17 @@ func (h *Handler) claimsPattern(path string) bool {
 	return false
 }
 
-// renameWithDurableIntent makes an interactive fsync barrier survive a
-// rename of its file (or of any ancestor directory): the pending
-// destination is written durably BEFORE the remote rename is issued, so
-// recovery accepts the staged object under either name. A local persistence
-// failure REFUSES the rename — acknowledging it would leave the record
-// naming a name that no longer holds the object, and the acknowledged bytes
-// would never be replayed. handled=false only for renames the plane does
-// not touch (no engine, no destination name).
-func (h *Handler) renameWithDurableIntent(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error, bool) {
+// renameOverOpen runs the rename, first preserving any OPEN engine file the
+// rename is about to displace (see tryRenameOverOpen). handled=false only for
+// renames the plane does not touch (no engine, no destination name).
+//
+// No durable intent is recorded: the extent plane keeps no local fsync
+// barrier, so there is no staged record whose name a rename could strand.
+// The rename itself is the remote operation the caller asked for.
+func (h *Handler) renameOverOpen(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error, bool) {
 	if h.opts.Engine == nil || op.Path2 == "" || op.Path2 == op.Path {
 		return fs.Result{}, nil, false
 	}
-	br := h.opts.Engine.Bridge
-	if err := br.StageRenameIntentLocal(op.Path, op.Path2); err != nil {
-		return fs.Result{}, fmt.Errorf("rename %s to %s: %w", op.Path, op.Path2, err), true
-	}
-	// The in-flight registration must end with this operation whatever the
-	// outcome; the DURABLE intents are what keep recovery correct.
-	defer br.ClearRenameIntentLocal(op.Path, op.Path2)
-
 	res, err, handled := h.tryRenameOverOpen(ctx, op, next)
 	if !handled {
 		// The helper declined to run the rename (e.g. the destination has an
@@ -505,20 +474,7 @@ func (h *Handler) renameWithDurableIntent(ctx context.Context, op *fs.Op, next f
 		// nothing, never that the rename happened.
 		res, err = next(ctx, op)
 	}
-	if err != nil {
-		// An error does NOT prove the remote rename failed to commit: a
-		// committed rename can lose its response, and the detached probes
-		// can fail during the same outage. Keep the durable destination —
-		// recovery then accepts the staged object at EITHER name — instead
-		// of clearing the only record of where the bytes may now live.
-		return res, err, true
-	}
-	// The rename landed: adopt the destination name and retire the intent
-	// in every staged record at or under the old name. Best-effort: a
-	// leftover intent stays recoverable (replay tries both names), so a
-	// failure here can only delay cleanup.
-	br.SettleRenameIntentLocal(op.Path, op.Path2)
-	return res, nil, true
+	return res, err, true
 }
 
 // tryRenameOverOpen preserves an OPEN engine file that a rename is about
@@ -705,17 +661,14 @@ func (e *engineHandle) Read(ctx context.Context, off int64, dest []byte) (int, e
 	return n, nil
 }
 
+// Write hands the bytes to the community writer and returns. Buffering,
+// upload and metadata publication all follow JuiceFS: the writer freezes a
+// slice and commits it once a chunk fills or the file is flushed. The extent
+// plane implements no --durability profile of its own, so a successful Write
+// promises nothing about remote visibility.
 func (e *engineHandle) Write(ctx context.Context, off int64, data []byte) error {
 	if errno := e.plane.opts.Engine.VFS.Write(e.vctx, e.ino, data, uint64(off), e.fh); errno != 0 {
 		return errno
-	}
-	if e.plane.opts.SyncPolicy == "write-sync" {
-		// --durability write-sync: each Write is remote-durable before it
-		// returns, mirroring the classic plane's per-Write commit.
-		if errno := e.plane.opts.Engine.VFS.Flush(e.vctx, e.ino, e.fh, 0); errno != 0 {
-			return errno
-		}
-		return e.plane.opts.Engine.FlushFile(ctx, uint64(e.ino))
 	}
 	return nil
 }
@@ -729,18 +682,11 @@ func (e *engineHandle) Sync(ctx context.Context) error {
 	// whose state the bridge preserved: FlushFile below retries it, and
 	// success resolves the fsync. (With nothing pending the errno above
 	// already returned.)
-	if errno == 0 && e.plane.opts.Engine.Bridge.DeferredCommits() {
-		// fsync is a local durability barrier on RTT-bound mounts, exactly
-		// like the classic plane's staging ledger: spill the pending blocks
-		// durably and return; the remote commit lands at the flush/close
-		// boundary or the next mount's replay of the staged record.
-		//
-		// Gated on deferred being ARMED, not on the configured sync mode: a
-		// mount with no staging directory never arms it, and must fall
-		// through to a real remote publication instead of acknowledging
-		// memory-only bytes.
-		return e.plane.opts.Engine.Bridge.StagePendingLocal(e.ino)
-	}
+	//
+	// fsync is REMOTE durability: the extent plane keeps no local barrier,
+	// so a successful fsync must have published before it returns. That is
+	// JuiceFS's own contract, and the only durability promise this plane
+	// makes.
 	if err := e.plane.opts.Engine.FlushFile(ctx, uint64(e.ino)); err != nil {
 		if errno != 0 {
 			return errno // the VFS-level failure still stands
@@ -749,10 +695,7 @@ func (e *engineHandle) Sync(ctx context.Context) error {
 	}
 	// A fresh EMPTY file has nothing to commit, so the flush above was a
 	// no-op — but fsync was still acknowledged, and the name must be durable
-	// at the boundary this mode promised. Strict/fsync semantics are
-	// REMOTE-durable (docs/design/fuse-durability-policy.md): a local
-	// barrier would not satisfy them, and with no staging directory there
-	// would be no copy at all. Materialize the name remotely.
+	// at the boundary fsync promised. Materialize the name remotely.
 	return e.plane.opts.Engine.Bridge.MaterializeEmpty(ctx, e.ino)
 }
 

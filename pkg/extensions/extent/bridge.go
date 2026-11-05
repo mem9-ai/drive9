@@ -38,7 +38,6 @@ import (
 	"hash/fnv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/meta"
@@ -52,19 +51,6 @@ type Config struct {
 	// RemoteRoot is the namespace subtree the bridge serves (the JuiceFS
 	// root inode maps onto it).
 	RemoteRoot string
-	// StagingDir arms the interactive-durability barrier: pending blocks
-	// are spilled there at fsync and re-committed by a later mount when a
-	// remote commit never landed. Empty disables the barrier.
-	StagingDir string
-	// StagingBudget bounds the durable staging tree in bytes (0 = unbounded).
-	// The tree lives inside the engine's cache directory but outside
-	// JuiceFS's raw/rawstaging accounting, so the engine SPLITS the operator's
-	// allowance between JuiceFS's CacheSize and this budget (their sum is the
-	// configured total).
-	StagingBudget int64
-	// FreeSpaceRatio is the free-space floor for the staging directory
-	// (0 disables the check), mirroring JuiceFS's own CacheFreeSpace.
-	FreeSpaceRatio float32
 	// NativeWriteback declares that the chunk store runs JuiceFS's own
 	// writeback pipeline: blocks are staged to the disk cache and handed
 	// to the store's asynchronous uploader, so objectStorage.Put may run
@@ -121,60 +107,11 @@ type Bridge struct {
 	// is only valid while the occupant is still THAT object.
 	layoutPendingID map[meta.Ino]string
 	verifyBase      map[meta.Ino]verifyBase
-	// pendingRenames maps an in-flight rename's source to its destination
-	// (full remote paths). A durable barrier STAGED while the remote rename
-	// is in flight inherits the intent: StagePendingLocal does not run under
-	// the plane's path locks, so a generation written between the intent
-	// scan and the rename would otherwise name only the OLD path, and a
-	// crash after the rename commits would make recovery skip it.
-	pendingRenames map[string]string
-	// stagingInFlight counts StagePendingLocal runs per pathname, and
-	// renameClearPending marks registrations whose retirement was requested
-	// while such a run was active. A rename that settles while an fsync is
-	// mid-stage must not erase the registration: the staging would then
-	// persist the OLD name with no intent, and a crash after the committed
-	// rename would strand the acknowledged bytes. The clear is deferred to
-	// the moment the last in-flight staging for that path exits.
-	stagingInFlight    map[string]int
-	renameClearPending map[string]bool
-	// stagingPause, when set, runs once inside StagePendingLocal after the
-	// block files are written and before the rename intent is resolved,
-	// letting a test interleave a whole rename into that window.
-	// stagingBytes tracks the bytes currently retained under StagingDir.
-	// It is an atomic counter rather than a directory scan: StagePendingLocal
-	// runs on every interactive fsync, and walking the tree per fsync would
-	// turn the fast path into O(files). Every add/remove site in this file
-	// knows its own delta, so the counter is exact; a single scan at
-	// construction seeds it from whatever a previous mount left behind.
-	stagingBytes atomic.Int64
-	stagingPause func()
-	// manifestMu serializes every durable-manifest read-modify-write: the
-	// staging publish, the rename intent stage/settle, and the inode
-	// retarget. It is always the OUTERMOST lock (manifestMu -> b.mu), which
-	// is why RemapLocal collects its retargets under b.mu and applies them
-	// after releasing it. A write-then-reverify was tried first and rejected
-	// in review: an unconditional replacement cannot be detected by reading
-	// it back, since the read returns exactly the bytes it just wrote.
-	manifestMu sync.Mutex
-	// manifestPause, when set, runs once INSIDE the manifest lock after the
-	// disk record has been read and before it is replaced. Only the lock
-	// makes that window safe, so this is the hook that actually exercises it.
-	manifestPause func()
-	// stagingPausePublish runs once AFTER this run's manifest is on disk and
-	// BEFORE it merges the on-disk state back in, so a test can interleave a
-	// rename into exactly that window.
-	stagingPausePublish func()
-
 	// classicOwned marks files whose fresh extent session silently
 	// degraded to a CLASSIC upload on a legacy server: the handle stays
 	// owned by this bridge, so commits and reads keep serving it through
 	// the classic wire surface instead of erroring on the layout.
 	classicOwned map[meta.Ino]bool
-	// deferred (interactive durability): meta.Write keeps slices pending
-	// locally instead of committing remotely at every writer flush; reads
-	// overlay the pending state and the remote commit lands at the
-	// flush/close boundary or the next mount's replay.
-	deferred atomic.Bool
 	// commitLocks serializes per-file commit lifecycles (FlushFile).
 	commitMu    sync.Mutex
 	commitLocks map[meta.Ino]*sync.Mutex
@@ -231,31 +168,28 @@ func NewBridge(cfg Config) *Bridge {
 		root = "/"
 	}
 	br := &Bridge{
-		cfg:                cfg,
-		format:             meta.Format{Name: "drive9", UUID: "drive9-extent-v2", Storage: "drive9-presign", BlockSize: blockSizeMiB << 20, TrashDays: 0, DirStats: false},
-		nextID:             uint64(1) << 63,
-		stagedSlices:       make(map[uint64]*stagedSlice),
-		blocks:             newBlockRegistry(),
-		paths:              map[meta.Ino]string{rootIno: root},
-		sizes:              make(map[meta.Ino]int64),
-		revs:               make(map[meta.Ino]int64),
-		pending:            make(map[meta.Ino][]pendingWrite),
-		truncs:             make(map[meta.Ino]int64),
-		modes:              make(map[meta.Ino]uint32),
-		sentinels:          make(map[string]meta.Ino),
-		nextHeldIno:        heldInoBase,
-		moved:              make(map[meta.Ino]string),
-		replacements:       make(map[string]meta.Ino),
-		commitLocks:        make(map[meta.Ino]*sync.Mutex),
-		classicOwned:       make(map[meta.Ino]bool),
-		layoutPending:      make(map[meta.Ino]bool),
-		layoutPendingID:    make(map[meta.Ino]string),
-		freshCreate:        make(map[meta.Ino]bool),
-		commitErr:          make(map[meta.Ino]error),
-		verifyBase:         make(map[meta.Ino]verifyBase),
-		pendingRenames:     make(map[string]string),
-		stagingInFlight:    make(map[string]int),
-		renameClearPending: make(map[string]bool),
+		cfg:             cfg,
+		format:          meta.Format{Name: "drive9", UUID: "drive9-extent-v2", Storage: "drive9-presign", BlockSize: blockSizeMiB << 20, TrashDays: 0, DirStats: false},
+		nextID:          uint64(1) << 63,
+		stagedSlices:    make(map[uint64]*stagedSlice),
+		blocks:          newBlockRegistry(),
+		paths:           map[meta.Ino]string{rootIno: root},
+		sizes:           make(map[meta.Ino]int64),
+		revs:            make(map[meta.Ino]int64),
+		pending:         make(map[meta.Ino][]pendingWrite),
+		truncs:          make(map[meta.Ino]int64),
+		modes:           make(map[meta.Ino]uint32),
+		sentinels:       make(map[string]meta.Ino),
+		nextHeldIno:     heldInoBase,
+		moved:           make(map[meta.Ino]string),
+		replacements:    make(map[string]meta.Ino),
+		commitLocks:     make(map[meta.Ino]*sync.Mutex),
+		classicOwned:    make(map[meta.Ino]bool),
+		layoutPending:   make(map[meta.Ino]bool),
+		layoutPendingID: make(map[meta.Ino]string),
+		freshCreate:     make(map[meta.Ino]bool),
+		commitErr:       make(map[meta.Ino]error),
+		verifyBase:      make(map[meta.Ino]verifyBase),
 	}
 	// Provenance refetch resolves through the inode's CURRENT mapping:
 	// open files move under renames and retention aliases, and a stale

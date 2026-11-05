@@ -181,9 +181,10 @@ func TestExtentCacheRootKeysOnMountNotCredential(t *testing.T) {
 }
 
 // Three INDEPENDENT disk budgets: classic read, classic write, and ONE
-// extent budget that covers the extent plane's read cache and writeback
-// staging together (JuiceFS accounts them in a single CacheSize). No plane
-// shares or halves another's number, and each defaults to 1 GiB at the CLI.
+// extent budget. The extent one has exactly one consumer — JuiceFS's chunk
+// cache: the plane keeps no staging tree of its own, so the number is never
+// split. No plane shares or halves another's number, and each defaults to
+// 1 GiB at the CLI.
 func TestThreeIndependentDiskBudgets(t *testing.T) {
 	// The extent budget is passed through verbatim — including 0, which is
 	// JuiceFS's memory-only mode (no silent default).

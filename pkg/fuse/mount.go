@@ -18,6 +18,8 @@ import (
 	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
+	"go.uber.org/zap"
+
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/extensions/appendlog"
 	"github.com/mem9-ai/drive9/pkg/extensions/cache"
@@ -34,6 +36,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/fs"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/perf"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/staging"
+	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/mountpath"
 	"github.com/mem9-ai/drive9/pkg/mountstate"
 )
@@ -1062,17 +1065,13 @@ func mountWithConfig(cfg MountConfig) error {
 			// --extent-write-cache-size-mb below (this is the fallback).
 			MaxStageWrite: 40,
 		}
-		// The extent plane's disk budget: ONE number for both its read
-		// cache and its writeback staging (JuiceFS accounts them together,
-		// so the plane's total retained bytes never exceed this value).
-		// The configured value passes through VERBATIM — 0 included: it is
-		// JuiceFS's memory-only mode (reads bypass the cache, writeback is
-		// disabled by SelfCheck), never a library default.
+		// The extent plane's disk budget IS JuiceFS's chunk cache: the plane
+		// no longer keeps a second copy of staged bytes (its local fsync
+		// barrier is gone), so the operator's number passes through
+		// verbatim — 0 included, which is JuiceFS's memory-only mode (reads
+		// bypass the cache, writeback is disabled by SelfCheck).
 		if cfg.ExtentCacheSize >= 0 {
 			engineConf.CacheSize = uint64(cfg.ExtentCacheSize)
-			// An explicit CLI value (0 included) decides whether the durable
-			// staging tree exists at all.
-			engineConf.CacheSizeConfigured = true
 		}
 
 		engine := extent.NewEngine(engineConf)
@@ -1081,12 +1080,24 @@ func mountWithConfig(cfg MountConfig) error {
 			// Hybrid: creation stays on the classic plane (promotion at
 			// the inline cutoff) unless the path matches an explicit
 			// --extent / [extent] pattern.
-			Threshold:  1,
-			Patterns:   cfg.ExtentPaths,
-			SyncPolicy: cfg.WritePolicy,
-			SyncMode:   syncMode,
-			Events:     bus,
+			Threshold: 1,
+			Patterns:  cfg.ExtentPaths,
+			Events:    bus,
 		})
+		// The extent plane implements JuiceFS's close-to-open contract
+		// and nothing else: it has no local fsync barrier and no
+		// per-Write publish (docs/design/fuse-durability-policy.md,
+		// "Extent plane"). A non-default --durability therefore applies
+		// only to paths this plane does not serve, and saying so is
+		// better than letting the weaker promise be silent.
+		if cfg.WritePolicy != string(WritePolicyWriteBack) || syncMode != "strict" {
+			logger.Warn(context.Background(), "extent_durability_override",
+				zap.String("durability_profile", cfg.Profile),
+				zap.String("write_policy", string(cfg.WritePolicy)),
+				zap.String("sync_mode", syncMode),
+				zap.Strings("extent_patterns", cfg.ExtentPaths),
+				zap.String("detail", "extent-served paths keep JuiceFS close-to-open semantics; --durability applies to other paths only"))
+		}
 	}
 
 	var appendExt *appendlog.AppendLog

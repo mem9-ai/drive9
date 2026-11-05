@@ -907,28 +907,6 @@ func TestEngineGetAttrOverlay(t *testing.T) {
 	}
 }
 
-func TestEngineWriteSyncCommitsPerWrite(t *testing.T) {
-	f := newFakeV2(t)
-	f.seedExtent(t, "/big.bin", "AAAA-EXTENT")
-	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: engineCacheDir(t)})
-	h := New(Options{Engine: eng, Threshold: 1 << 20, SyncPolicy: "write-sync"})
-	res, err, passed := dispatchCreate(context.Background(), h, "/big.bin", syscall.O_RDWR)
-	if err != nil || passed {
-		t.Fatalf("claim failed: %v passed=%v", err, passed)
-	}
-	eh := res.Handle.(*engineHandle)
-	if err := eh.Write(context.Background(), 0, []byte("NEWBYTES")); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	// write-sync: the PATCH commit landed during Write, not deferred.
-	f.mu.Lock()
-	patches := f.patches
-	f.mu.Unlock()
-	if patches == 0 {
-		t.Fatal("write-sync Write did not commit server-side")
-	}
-}
-
 func TestEngineTruncateIntercepted(t *testing.T) {
 	f := newFakeV2(t)
 	f.seedExtent(t, "/big.bin", "AAAA")
@@ -2860,84 +2838,6 @@ func TestFreshEngineCreateVisibleBeforeCommit(t *testing.T) {
 // Round-16: interactive fsync is a LOCAL barrier — no remote commit during
 // Sync, the commit lands at flush, and a mount that never flushed replays
 // the staged barrier.
-func TestInteractiveFsyncLocalBarrierAndReplay(t *testing.T) {
-	f := newFakeV2(t)
-	f.seedExtent(t, "/big.bin", "AAAA-BBBB-CCCC")
-	dir := engineCacheDir(t)
-	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: dir})
-	h := New(Options{Engine: eng, Threshold: 1 << 20, SyncMode: "interactive"})
-	eh := claimOpen(t, h, "/big.bin")
-
-	if err := eh.Write(context.Background(), 0, []byte("ZZZZ")); err != nil {
-		t.Fatal(err)
-	}
-	f.mu.Lock()
-	patchesBefore := f.patches
-	f.mu.Unlock()
-	if err := eh.Sync(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	f.mu.Lock()
-	patchesAfter := f.patches
-	f.mu.Unlock()
-	if patchesAfter != patchesBefore {
-		t.Fatal("interactive fsync performed a remote commit")
-	}
-	if got := readFront(t, eh, 16); got != "ZZZZ-BBBB-CCCC" {
-		t.Fatalf("read after interactive fsync = %q", got)
-	}
-	// The flush boundary lands the remote commit and clears the barrier.
-	if err := eh.Flush(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	f.mu.Lock()
-	patchesFlushed := f.patches
-	f.mu.Unlock()
-	if patchesFlushed == patchesBefore {
-		t.Fatal("flush did not land the deferred commit")
-	}
-	if got := f.contentOf("/big.bin"); got != "ZZZZ-BBBB-CCCC" {
-		t.Fatalf("server content after flush = %q", got)
-	}
-
-	// Crash before flush: a NEW engine over the same staging dir replays
-	// the barrier and lands the commit.
-	if err := eh.Write(context.Background(), 5, []byte("QQQQ")); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Sync(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	// Simulate the crash: a new engine with the same staging directory.
-	stagingRoot := filepath.Join(dir, "commit-staging")
-	if ents, err := os.ReadDir(stagingRoot); err != nil {
-		t.Logf("staging dir unreadable: %v", err)
-	} else {
-		for _, e := range ents {
-			t.Logf("staged: %s", e.Name())
-			if raw, rerr := os.ReadFile(filepath.Join(stagingRoot, e.Name(), "manifest.json")); rerr == nil {
-				t.Logf("manifest: %s", raw)
-			} else {
-				t.Logf("manifest read: %v", rerr)
-			}
-		}
-	}
-	eng2 := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: dir})
-	_ = eng2
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		if got := f.contentOf("/big.bin"); got == "ZZZZ-QQQQ-CCCC" {
-			return // replay landed
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Fatalf("replay never landed the staged commit; server has %q", f.contentOf("/big.bin"))
-}
-
-// Round-17: a fresh create whose extent session silently degraded to a
-// CLASSIC upload (legacy server) keeps the open handle usable — write →
-// fsync → write → fsync commits through the classic surface and reads
-// serve the composed content.
 func TestClassicFallbackKeepsHandleUsable(t *testing.T) {
 	f := newFakeV2(t)
 	f.setLegacy(true)
@@ -2976,71 +2876,15 @@ func TestClassicFallbackKeepsHandleUsable(t *testing.T) {
 	}
 }
 
-// Round-18: two interactive barriers without an intervening Flush leave ONE
-// superseding record (pending is cumulative), and a crash replays it whole.
-func TestInteractiveTwoBarriersCrashReplay(t *testing.T) {
-	f := newFakeV2(t)
-	f.seedExtent(t, "/big.bin", "ABCDEFGH")
-	dir := engineCacheDir(t)
-	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: dir})
-	h := New(Options{Engine: eng, Threshold: 1 << 20, SyncMode: "interactive"})
-	eh := claimOpen(t, h, "/big.bin")
-
-	if err := eh.Write(context.Background(), 2, []byte("ZZ")); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Sync(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	stagingRoot := filepath.Join(dir, "commit-staging")
-	if n := countDirs(t, stagingRoot); n != 1 {
-		t.Fatalf("staged dirs after the first barrier = %d, want 1", n)
-	}
-	if err := eh.Write(context.Background(), 4, []byte("QQ")); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Sync(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if n := countDirs(t, stagingRoot); n != 1 {
-		t.Fatalf("staged dirs after the second barrier = %d, want 1 (superseded)", n)
-	}
-	// Crash: a fresh engine replays the (single, cumulative) barrier.
-	eng2 := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: dir})
-	_ = eng2
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		if got := f.contentOf("/big.bin"); got == "ABZZQQGH" {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Fatalf("replay never landed the superseding barrier; server has %q", f.contentOf("/big.bin"))
-}
-
-func countDirs(t *testing.T, root string) int {
-	t.Helper()
-	ents, err := os.ReadDir(root)
-	if err != nil {
-		return 0
-	}
-	n := 0
-	for _, e := range ents {
-		if e.IsDir() {
-			n++
-		}
-	}
-	return n
-}
-
-// Round-18: a later pending write that covers only the MIDDLE of an
-// earlier one keeps the earlier write's suffix; the merged read shows the
-// composed bytes before any remote commit.
+// Round-18: a later write covering only the MIDDLE of an earlier one keeps
+// the earlier write's suffix, and fsync publishes the composed image. The
+// extent plane has no deferred-commit mode, so the very first fsync already
+// lands the bytes remotely — that is JuiceFS's close-to-open contract.
 func TestInteractiveOverlappingWritesKeepSuffix(t *testing.T) {
 	f := newFakeV2(t)
 	f.seedExtent(t, "/big.bin", "XXXXXXXX")
 	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: engineCacheDir(t)})
-	h2 := New(Options{Engine: eng, Threshold: 1 << 20, SyncMode: "interactive"})
+	h2 := New(Options{Engine: eng, Threshold: 1 << 20})
 	eh := claimOpen(t, h2, "/big.bin")
 
 	if err := eh.Write(context.Background(), 0, []byte("ABCDEFGH")); err != nil {
@@ -3058,8 +2902,9 @@ func TestInteractiveOverlappingWritesKeepSuffix(t *testing.T) {
 	if got := readFront(t, eh, 16); got != "ABZZEFGH" {
 		t.Fatalf("overlaid read = %q, want ABZZEFGH (the suffix must survive)", got)
 	}
-	if got := f.contentOf("/big.bin"); got != "XXXXXXXX" {
-		t.Fatalf("remote changed before flush: %q", got)
+	// The suffix survived the publication too, not only the local read.
+	if got := f.contentOf("/big.bin"); got != "ABZZEFGH" {
+		t.Fatalf("remote content = %q, want ABZZEFGH after fsync", got)
 	}
 }
 
@@ -3069,7 +2914,7 @@ func TestInteractiveFreshFilePendingRead(t *testing.T) {
 	f := newFakeV2(t)
 	f.setDir("/d", true)
 	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: engineCacheDir(t)})
-	h := New(Options{Engine: eng, Threshold: 0, SyncMode: "interactive"})
+	h := New(Options{Engine: eng, Threshold: 0})
 	if _, _, passed := dispatchCreate(context.Background(), h, "/d/new.bin", syscall.O_RDWR|syscall.O_CREAT); passed {
 		t.Fatal("full-mode create must be claimed")
 	}
@@ -3096,129 +2941,6 @@ func TestInteractiveFreshFilePendingRead(t *testing.T) {
 	want := "\x00\x00\x00\x00\x00\x00\x00\x00ABCD"
 	if string(buf[:n]) != want {
 		t.Fatalf("pending read = %q, want the leading hole + ABCD", string(buf[:n]))
-	}
-}
-
-// Round-18: recovery refuses to adopt whichever object occupies the saved
-// path — a renamed-away file's barrier is left in place, nothing is
-// resurrected or patched.
-func TestReplaySkipsOnIdentityMismatch(t *testing.T) {
-	f := newFakeV2(t)
-	f.seedExtent(t, "/a", "AAAA")
-	dir := engineCacheDir(t)
-	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: dir})
-	h := New(Options{Engine: eng, Threshold: 1 << 20, SyncMode: "interactive"})
-	eh := claimOpen(t, h, "/a")
-	if err := eh.Write(context.Background(), 0, []byte("ZZ")); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Sync(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	f.mu.Lock()
-	patchesBefore := f.patches
-	f.mu.Unlock()
-	// The file is renamed away (and a DIFFERENT file takes /a) while the
-	// barrier is outstanding.
-	f.rename(t, "/a", "/b")
-	f.seedExtent(t, "/a", "OTHER")
-
-	eng2 := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: dir})
-	_ = eng2
-	time.Sleep(500 * time.Millisecond)
-	f.mu.Lock()
-	patchesAfter := f.patches
-	f.mu.Unlock()
-	if patchesAfter != patchesBefore {
-		t.Fatal("recovery mutated the remote despite an identity mismatch")
-	}
-	if got := f.contentOf("/b"); got != "AAAA" {
-		t.Fatalf("/b = %q, want AAAA untouched", got)
-	}
-	if got := f.contentOf("/a"); got != "OTHER" {
-		t.Fatalf("/a = %q, want OTHER untouched", got)
-	}
-	if n := countDirs(t, filepath.Join(dir, "commit-staging")); n != 1 {
-		t.Fatalf("staged records = %d, want the skipped one preserved", n)
-	}
-}
-
-// Round-18: one unreadable block aborts the whole recovery unit — no
-// partial commit, no record deletion.
-func TestReplayAbortsOnMissingBlock(t *testing.T) {
-	f := newFakeV2(t)
-	f.seedExtent(t, "/big.bin", "ABCDEFGH")
-	dir := engineCacheDir(t)
-	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: dir})
-	h := New(Options{Engine: eng, Threshold: 1 << 20, SyncMode: "interactive"})
-	eh := claimOpen(t, h, "/big.bin")
-	if err := eh.Write(context.Background(), 0, []byte("ZZZZ")); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Sync(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	f.mu.Lock()
-	patchesBefore := f.patches
-	f.mu.Unlock()
-	// Corrupt the record: remove one block file.
-	root := filepath.Join(dir, "commit-staging")
-	ents, _ := os.ReadDir(root)
-	for _, e := range ents {
-		files, _ := os.ReadDir(filepath.Join(root, e.Name()))
-		for _, bf := range files {
-			name := bf.Name()
-			if name != "manifest.json" {
-				_ = os.Remove(filepath.Join(root, e.Name(), name))
-				break
-			}
-		}
-	}
-	eng2 := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: dir})
-	_ = eng2
-	time.Sleep(500 * time.Millisecond)
-	f.mu.Lock()
-	patchesAfter := f.patches
-	f.mu.Unlock()
-	if patchesAfter != patchesBefore {
-		t.Fatal("a partial recovery committed despite the missing block")
-	}
-	if got := f.contentOf("/big.bin"); got != "ABCDEFGH" {
-		t.Fatalf("server content = %q, want ABCDEFGH untouched", got)
-	}
-	if n := countDirs(t, root); n != 1 {
-		t.Fatalf("staged records = %d, want the failed unit preserved", n)
-	}
-}
-
-// Round-18: a read-only mount never runs recovery.
-func TestReadOnlyMountSkipsReplay(t *testing.T) {
-	f := newFakeV2(t)
-	f.seedExtent(t, "/big.bin", "ABCDEFGH")
-	dir := engineCacheDir(t)
-	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: dir})
-	h := New(Options{Engine: eng, Threshold: 1 << 20, SyncMode: "interactive"})
-	eh := claimOpen(t, h, "/big.bin")
-	if err := eh.Write(context.Background(), 0, []byte("ZZZZ")); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Sync(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	f.mu.Lock()
-	patchesBefore := f.patches
-	f.mu.Unlock()
-	eng2 := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: dir, ReadOnly: true})
-	_ = eng2
-	time.Sleep(500 * time.Millisecond)
-	f.mu.Lock()
-	patchesAfter := f.patches
-	f.mu.Unlock()
-	if patchesAfter != patchesBefore {
-		t.Fatal("a read-only mount replayed a barrier (mutating the remote)")
-	}
-	if got := f.contentOf("/big.bin"); got != "ABCDEFGH" {
-		t.Fatalf("server content = %q, want ABCDEFGH", got)
 	}
 }
 
@@ -3289,7 +3011,7 @@ func TestInteractiveClassicReadAfterWrite(t *testing.T) {
 	f.setLegacy(true)
 	f.setDir("/d", true)
 	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: engineCacheDir(t)})
-	h := New(Options{Engine: eng, Threshold: 0, SyncMode: "interactive"})
+	h := New(Options{Engine: eng, Threshold: 0})
 	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
 	eh := res.Handle.(*engineHandle)
 	if err := eh.Write(context.Background(), 0, []byte("AAAA")); err != nil {
@@ -3352,7 +3074,7 @@ func TestClassicOwnershipSurvivesRecovery(t *testing.T) {
 	f.setDir("/d", true)
 	dir := engineCacheDir(t)
 	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: dir})
-	h := New(Options{Engine: eng, Threshold: 0, SyncMode: "interactive"})
+	h := New(Options{Engine: eng, Threshold: 0})
 	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
 	eh := res.Handle.(*engineHandle)
 	if err := eh.Write(context.Background(), 0, []byte("AAAA")); err != nil {
@@ -3429,7 +3151,7 @@ func TestEmptyBarrierReplayCreatesFile(t *testing.T) {
 	f.setDir("/d", true)
 	dir := engineCacheDir(t)
 	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: dir})
-	h := New(Options{Engine: eng, Threshold: 0, SyncMode: "interactive"})
+	h := New(Options{Engine: eng, Threshold: 0})
 	res, _, passed := dispatchCreate(context.Background(), h, "/d/empty.bin", syscall.O_RDWR|syscall.O_CREAT)
 	if passed {
 		t.Fatal("full-mode create must be claimed")
@@ -3486,7 +3208,7 @@ func TestInteractiveClassicAppendRead(t *testing.T) {
 	f.setLegacy(true)
 	f.setDir("/d", true)
 	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: engineCacheDir(t)})
-	h := New(Options{Engine: eng, Threshold: 0, SyncMode: "interactive"})
+	h := New(Options{Engine: eng, Threshold: 0})
 	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
 	eh := res.Handle.(*engineHandle)
 	if err := eh.Write(context.Background(), 0, []byte("AAAA")); err != nil {
@@ -3642,7 +3364,7 @@ func TestDeferredExtentOverlayWriteOrder(t *testing.T) {
 	f := newFakeV2(t)
 	f.seedExtent(t, "/big.bin", "AAAAAAAA")
 	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: engineCacheDir(t)})
-	h := New(Options{Engine: eng, Threshold: 1 << 20, SyncMode: "interactive"})
+	h := New(Options{Engine: eng, Threshold: 1 << 20})
 	eh := claimOpen(t, h, "/big.bin")
 	if err := eh.Write(context.Background(), 4, []byte("AAAA")); err != nil {
 		t.Fatal(err)
@@ -3668,7 +3390,7 @@ func TestDeferredOverlayThreeWritesBackwards(t *testing.T) {
 	f := newFakeV2(t)
 	f.seedExtent(t, "/big.bin", "AAAAAAAAAAAA")
 	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: engineCacheDir(t)})
-	h := New(Options{Engine: eng, Threshold: 1 << 20, SyncMode: "interactive"})
+	h := New(Options{Engine: eng, Threshold: 1 << 20})
 	eh := claimOpen(t, h, "/big.bin")
 	for _, w := range []struct {
 		off  int64
@@ -3834,7 +3556,7 @@ func TestTruncateOnlyRecoveryRejectsReplacement(t *testing.T) {
 	f.seedExtent(t, "/a", "AAAAAAAA")
 	dir := engineCacheDir(t)
 	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: dir})
-	h := New(Options{Engine: eng, Threshold: 1 << 20, SyncMode: "interactive"})
+	h := New(Options{Engine: eng, Threshold: 1 << 20})
 	eh := claimOpen(t, h, "/a")
 	resID := func() string {
 		st, err := f.stat(t, "/a")
@@ -4198,7 +3920,7 @@ func TestOverlaidSliceNeverDemoted(t *testing.T) {
 	f.setLegacy(true)
 	f.setDir("/d", true)
 	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: engineCacheDir(t)})
-	h := New(Options{Engine: eng, Threshold: 0, SyncMode: "interactive"})
+	h := New(Options{Engine: eng, Threshold: 0})
 	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
 	eh := res.Handle.(*engineHandle)
 	if err := eh.Write(context.Background(), 0, []byte("AAAA")); err != nil {
@@ -4373,7 +4095,7 @@ func TestOverlayBytesAccountedAndReclaimed(t *testing.T) {
 	f.setLegacy(true)
 	f.setDir("/d", true)
 	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: engineCacheDir(t)})
-	h := New(Options{Engine: eng, Threshold: 0, SyncMode: "interactive"})
+	h := New(Options{Engine: eng, Threshold: 0})
 	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
 	eh := res.Handle.(*engineHandle)
 	if err := eh.Write(context.Background(), 0, []byte("AAAA")); err != nil {
@@ -4488,15 +4210,22 @@ func TestDemotedSliceSurvivesRename(t *testing.T) {
 	}
 }
 
-// Round-30: an overlay image containing a write that SURVIVED the commit
-// (appended mid-flight, still pending) stays protected — the flush of the
-// earlier snapshot does not make it remotely reproducible.
+// A commit's completion must not resolve the overlay-reproducibility flags
+// of images that still carry an UN-PUBLISHED write from the same inode: the
+// surgical delete removes only the commit's own snapshot, and a sibling
+// write appended mid-flight survives. Clearing the flags there would let
+// cache pressure demote an image whose bytes are the only copy of that
+// write.
+//
+// The mid-flight state is constructed directly (a survivor in b.pending
+// plus its staged bytes): with in-line commits there is no public sequence
+// that reliably parks two writes in that window.
 func TestOverlayWithSurvivingWriteStaysProtected(t *testing.T) {
 	f := newFakeV2(t)
 	f.setLegacy(true)
 	f.setDir("/d", true)
 	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: engineCacheDir(t)})
-	h := New(Options{Engine: eng, Threshold: 0, SyncMode: "interactive"})
+	h := New(Options{Engine: eng, Threshold: 0})
 	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
 	eh := res.Handle.(*engineHandle)
 	if err := eh.Write(context.Background(), 0, []byte("AAAA")); err != nil {
@@ -4505,41 +4234,32 @@ func TestOverlayWithSurvivingWriteStaysProtected(t *testing.T) {
 	if err := eh.Flush(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	// Deferred Z@0 (snapshot S1) — then, while S1's landing is emulated
-	// in-flight, Y@1 is staged and read (the ZYAA whole-chunk image).
-	if err := eh.Write(context.Background(), 0, []byte("Z")); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Sync(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Write(context.Background(), 1, []byte("Y")); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Sync(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	br := eng.Bridge
+	// Two un-published writes on top of the landed AAAA: Z@0 (the commit's
+	// own snapshot) and Y@1 (the survivor).
+	zSum, ySum := sha256Hex([]byte("Z")), sha256Hex([]byte("Y"))
+	br.StageBlockForTest(zSum, []byte("Z"))
+	br.StageBlockForTest(ySum, []byte("Y"))
+	br.AddPendingForTest(eh.ino, 0, 0, zSum, 1, 4)
+	br.AddPendingForTest(eh.ino, 0, 1, ySum, 1, 4)
 	old := classicReadCacheBytes
 	classicReadCacheBytes = 1
 	defer func() { classicReadCacheBytes = old }()
+	// The read overlays both pending writes on the remote base and stages
+	// the composed image as a LOCAL OVERLAY.
 	if got := readFront(t, eh, 4); got != "ZYAA" {
 		t.Fatalf("overlay read = %q, want ZYAA", got)
 	}
-	br := eng.Bridge
-	// Land ONLY S1 (Z@0): model by removing the Y fragment's pending entry
-	// is wrong — instead run a real Flush: everything pending lands (both
-	// Z and Y are in one pending list in this simplified flow). To target
-	// the interleaving deterministically, commit S1 through the bridge with
-	// Y appended mid-flight:
+	// Only Z lands. Y is still pending, so the image is NOT reproducible
+	// from the remote and its overlay flag must survive.
 	br.mu.Lock()
-	pend := br.pending[eh.ino]
-	s1 := append([]pendingWrite(nil), pend[:len(pend)-1]...) // Z only
-	br.pending[eh.ino] = pend                                // restore: surgical delete keeps Y
+	pend := append([]pendingWrite(nil), br.pending[eh.ino]...)
 	br.mu.Unlock()
-	_ = s1
-	// Direct: simulate releaseCommitted for S1 with Y still pending.
-	br.releaseCommitted(eh.ino, []pendingWrite{pend[0]})
-	// Pressure hard: the ZYAA image must stay (Y is un-published).
+	if len(pend) != 2 {
+		t.Fatalf("pending writes = %d, want 2 (Z and Y)", len(pend))
+	}
+	br.releaseCommitted(eh.ino, pend[:1])
+	// Pressure hard: the ZYAA image must stay.
 	for i := 0; i < 8; i++ {
 		d := make([]byte, 4096)
 		_, _ = rand.Read(d)
@@ -4547,56 +4267,6 @@ func TestOverlayWithSurvivingWriteStaysProtected(t *testing.T) {
 	}
 	if got := readFront(t, eh, 4); got != "ZYAA" {
 		t.Fatalf("post-pressure read = %q, want ZYAA (an image with a surviving pending write must not demote)", got)
-	}
-}
-
-// Round-31: the overlay-resolution decision is taken in the SAME critical
-// section as the pending check — a write staged between the snapshot and
-// the clear keeps its image protected.
-func TestOverlayDecisionAtomicWithPendingCheck(t *testing.T) {
-	f := newFakeV2(t)
-	f.setLegacy(true)
-	f.setDir("/d", true)
-	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: engineCacheDir(t)})
-	h := New(Options{Engine: eng, Threshold: 0, SyncMode: "interactive"})
-	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
-	eh := res.Handle.(*engineHandle)
-	if err := eh.Write(context.Background(), 0, []byte("AAAA")); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Flush(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Write(context.Background(), 0, []byte("Z")); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Sync(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	// The mid-flight Y lands BEFORE releaseCommitted samples the pending
-	// list (the exact window the separate-snapshot version missed).
-	if err := eh.Write(context.Background(), 1, []byte("Y")); err != nil {
-		t.Fatal(err)
-	}
-	old := classicReadCacheBytes
-	classicReadCacheBytes = 1
-	defer func() { classicReadCacheBytes = old }()
-	if got := readFront(t, eh, 4); got != "ZYAA" {
-		t.Fatalf("overlay read = %q, want ZYAA", got)
-	}
-	br := eng.Bridge
-	br.mu.Lock()
-	pend := br.pending[eh.ino]
-	br.mu.Unlock()
-	// Run releaseCommitted for the Z snapshot with Y already staged.
-	br.releaseCommitted(eh.ino, []pendingWrite{pend[0]})
-	for i := 0; i < 8; i++ {
-		d := make([]byte, 4096)
-		_, _ = rand.Read(d)
-		br.stageClassicChunk(sha256Hex(d), d, "/d/f.bin", int64(i+1)<<20, false, fmt.Sprintf("res-%d", i+2), 1)
-	}
-	if got := readFront(t, eh, 4); got != "ZYAA" {
-		t.Fatalf("post-pressure read = %q, want ZYAA (Y is still pending; its image must stay protected)", got)
 	}
 }
 
@@ -4666,9 +4336,6 @@ func TestEcholessReplacementBeforeClassificationRefuses(t *testing.T) {
 	f.completeEcho = false
 	f.setDir("/d", true)
 	h := newTestHandler(t, f, 0)
-	// Interactive staging: Write only stages; the commit (and its
-	// classification) happens at the flush boundary, after the replacement.
-	h.opts.Engine.Bridge.EnableDeferredCommits()
 	res, _, _ := dispatchCreate(context.Background(), h, "/d/n.bin", syscall.O_RDWR|syscall.O_CREAT)
 	eh := res.Handle.(*engineHandle)
 	if err := eh.Write(context.Background(), 0, []byte("AAAA")); err != nil {
@@ -4692,84 +4359,6 @@ func TestEcholessReplacementBeforeClassificationRefuses(t *testing.T) {
 // find the saved name pointing at nothing (or at a replacement) and the
 // acknowledged bytes would be stranded. The retarget rewrites the record
 // durably at the rename boundary.
-func TestStagedBarrierFollowsRename(t *testing.T) {
-	f := newFakeV2(t)
-	f.setDir("/d", true)
-	f.seedExtent(t, "/d/a.bin", "BASE-PAYLOAD")
-	cacheDir := engineCacheDir(t)
-	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: cacheDir})
-	br := eng.Bridge
-	ino := meta.Ino(1)
-	br.RememberPathForTest(ino, "/d/a.bin")
-	sum := sha256Hex([]byte("NEW!"))
-	br.StageBlockForTest(sum, []byte("NEW!"))
-	br.AddPendingForTest(ino, 0, 0, sum, 4, 4)
-	if err := br.StagePendingLocal(ino); err != nil {
-		t.Fatal(err)
-	}
-	manifestPath := func() string {
-		entries, err := os.ReadDir(br.cfg.StagingDir)
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, e := range entries {
-			if e.IsDir() {
-				return filepath.Join(br.cfg.StagingDir, e.Name(), "manifest.json")
-			}
-		}
-		t.Fatal("no staged manifest")
-		return ""
-	}
-	readPath := func() string {
-		raw, err := os.ReadFile(manifestPath())
-		if err != nil {
-			t.Fatal(err)
-		}
-		var m struct {
-			Path string `json:"path"`
-		}
-		if err := json.Unmarshal(raw, &m); err != nil {
-			t.Fatal(err)
-		}
-		return m.Path
-	}
-	if got := readPath(); got != "/d/a.bin" {
-		t.Fatalf("staged manifest path = %q, want /d/a.bin", got)
-	}
-	// Rename: the durable record must be retargeted before the syscall
-	// is acknowledged.
-	br.RemapLocal("/d/a.bin", "/d/b.bin")
-	if got := readPath(); got != "/d/b.bin" {
-		t.Fatalf("after rename, manifest path = %q, want /d/b.bin (record stranded at the old name)", got)
-	}
-}
-
-// Test-only bridge accessors: drive the durable-barrier path directly,
-// without an engine handle, so the test pins the manifest contract.
-func (b *Bridge) RememberPathForTest(ino meta.Ino, path string) {
-	b.mu.Lock()
-	full := b.fullPath(path)
-	b.paths[ino] = full
-	b.replacements[full] = ino // the descriptor owns the name
-	b.mu.Unlock()
-}
-
-func (b *Bridge) StageBlockForTest(sum string, data []byte) {
-	b.blocks.stagePinned(sum, data, true)
-}
-
-func (b *Bridge) AddPendingForTest(ino meta.Ino, chunk, off uint32, sum string, size int64, total int64) {
-	b.mu.Lock()
-	b.pending[ino] = append(b.pending[ino], pendingWrite{chunk: chunk, off: off, checksum: sum, size: size})
-	b.sizes[ino] = total
-	b.mu.Unlock()
-}
-
-// Round-49: with JuiceFS's native writeback armed, blocks are staged to the
-// engine's disk cache and uploaded by the chunk store asynchronously; the
-// meta side must wait for them before committing (the server verifies every
-// referenced block). A write+flush through a writeback engine must land the
-// same bytes as the direct path.
 func TestNativeWritebackCommitWaitsForStagedBlocks(t *testing.T) {
 	f := newFakeV2(t)
 	f.setDir("/d", true)
@@ -4784,7 +4373,7 @@ func TestNativeWritebackCommitWaitsForStagedBlocks(t *testing.T) {
 	if !eng.Bridge.NativeWritebackForTest() {
 		t.Fatal("native writeback was not armed on the bridge")
 	}
-	h := New(Options{Engine: eng, Threshold: 0, SyncMode: "interactive"})
+	h := New(Options{Engine: eng, Threshold: 0})
 	res, _, _ := dispatchCreate(context.Background(), h, "/d/w.bin", syscall.O_RDWR|syscall.O_CREAT)
 	eh := res.Handle.(*engineHandle)
 	if err := eh.Write(context.Background(), 0, []byte("WRITEBACK")); err != nil {
@@ -4874,9 +4463,6 @@ func TestEcholessSharedBlockIsNotIdentity(t *testing.T) {
 	f.completeEcho = false
 	f.setDir("/d", true)
 	h := newTestHandler(t, f, 0)
-	// Interactive staging: our image is fully built, then the replacement
-	// lands between our completion and the classification Stat.
-	h.opts.Engine.Bridge.EnableDeferredCommits()
 	payload := strings.Repeat("A", int(client.ExtentBlockSize)) + "OUR-TAIL"
 	res, _, _ := dispatchCreate(context.Background(), h, "/d/n.bin", syscall.O_RDWR|syscall.O_CREAT)
 	eh := res.Handle.(*engineHandle)
@@ -4910,7 +4496,6 @@ func TestUnattributedEmptyOccupantRefusedNotWritten(t *testing.T) {
 	f := newFakeV2(t)
 	f.setDir("/d", true)
 	h := newTestHandler(t, f, 0)
-	h.opts.Engine.Bridge.EnableDeferredCommits()
 	res, _, _ := dispatchCreate(context.Background(), h, "/d/e.bin", syscall.O_RDWR|syscall.O_CREAT)
 	eh := res.Handle.(*engineHandle)
 	if err := eh.Write(context.Background(), 0, []byte("OURS")); err != nil {
@@ -4952,133 +4537,6 @@ func TestUnattributedEmptyOccupantRefusedNotWritten(t *testing.T) {
 // renamed directory's inode leaves an open /d/a/p's manifest naming a path
 // that no longer holds the object; a crash before Flush would strand the
 // fsync-acknowledged bytes.
-func TestStagedBarrierFollowsDirectoryRename(t *testing.T) {
-	f := newFakeV2(t)
-	f.setDir("/d", true)
-	f.seedExtent(t, "/d/a.bin", "BASE")
-	cacheDir := engineCacheDir(t)
-	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: cacheDir})
-	br := eng.Bridge
-	childIno := meta.Ino(77)
-	br.RememberPathForTest(childIno, "/d/a.bin")
-	sum := sha256Hex([]byte("PEND"))
-	br.StageBlockForTest(sum, []byte("PEND"))
-	br.AddPendingForTest(childIno, 0, 0, sum, 4, 8)
-	if err := br.StagePendingLocal(childIno); err != nil {
-		t.Fatal(err)
-	}
-	if got := stagedManifestPath(t, br); got != "/d/a.bin" {
-		t.Fatalf("staged path = %q, want /d/a.bin", got)
-	}
-	// Rename the DIRECTORY: one event, one RemapLocal for /d → /e.
-	br.RemapLocal("/d", "/e")
-	if got := stagedManifestPath(t, br); got != "/e/a.bin" {
-		t.Fatalf("descendant manifest path after dir rename = %q, want /e/a.bin", got)
-	}
-}
-
-// Round-51: a rename must FAIL when the durable intent cannot be persisted.
-// Acknowledging it would leave the barrier naming a name that no longer
-// holds the object, stranding the fsync-acknowledged bytes forever.
-func TestRenameRefusedWhenIntentCannotPersist(t *testing.T) {
-	f := newFakeV2(t)
-	f.setDir("/d", true)
-	f.seedExtent(t, "/d/a.bin", "BASE")
-	cacheDir := engineCacheDir(t)
-	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: cacheDir})
-	br := eng.Bridge
-	ino := meta.Ino(11)
-	br.RememberPathForTest(ino, "/d/a.bin")
-	sum := sha256Hex([]byte("PEND"))
-	br.StageBlockForTest(sum, []byte("PEND"))
-	br.AddPendingForTest(ino, 0, 0, sum, 4, 8)
-	if err := br.StagePendingLocal(ino); err != nil {
-		t.Fatal(err)
-	}
-	// Make the staging tree unwritable: the manifest cannot be rewritten.
-	stagingDir := br.cfg.StagingDir
-	if err := os.Chmod(stagingDir, 0o500); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(stagingDir, 0o700) })
-	if err := br.StageRenameIntentLocal("/d/a.bin", "/d/b.bin"); err == nil {
-		t.Skip("the platform allowed the manifest rewrite; the refusal is covered by TestRenameIntentPrecedesRemoteRename")
-	}
-	// With the intent failing, the remote rename must not be issued: the
-	// stub below performs no rename itself but observes the operation.
-	h := New(Options{Engine: eng, Threshold: 0})
-	var chainRan bool
-	_, err, handled := h.renameWithDurableIntent(context.Background(),
-		&fs.Op{Kind: fs.OpRename, Path: "/d/a.bin", Path2: "/d/b.bin"},
-		func(context.Context, *fs.Op) (fs.Result, error) {
-			chainRan = true
-			return fs.Result{}, nil
-		})
-	if !handled {
-		t.Fatal("the plane must claim the rename it refused")
-	}
-	if err == nil {
-		t.Fatal("the rename must be refused when the durable intent cannot be written")
-	}
-	if chainRan {
-		t.Fatal("the remote rename ran despite the failed durable intent")
-	}
-	_ = os.Chmod(stagingDir, 0o700)
-}
-
-// Round-51: the intent must be DURABLE BEFORE the remote rename, so a crash
-// on either side of it leaves the barrier recoverable under one of the two
-// names.
-func TestRenameIntentPrecedesRemoteRename(t *testing.T) {
-	f := newFakeV2(t)
-	f.setDir("/d", true)
-	f.seedExtent(t, "/d/a.bin", "BASE")
-	cacheDir := engineCacheDir(t)
-	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: cacheDir})
-	br := eng.Bridge
-	ino := meta.Ino(21)
-	br.RememberPathForTest(ino, "/d/a.bin")
-	sum := sha256Hex([]byte("PEND"))
-	br.StageBlockForTest(sum, []byte("PEND"))
-	br.AddPendingForTest(ino, 0, 0, sum, 4, 8)
-	if err := br.StagePendingLocal(ino); err != nil {
-		t.Fatal(err)
-	}
-	h := New(Options{Engine: eng, Threshold: 0})
-	var atChainTime string
-	_, err, _ := h.renameWithDurableIntent(context.Background(),
-		&fs.Op{Kind: fs.OpRename, Path: "/d/a.bin", Path2: "/d/b.bin"},
-		func(context.Context, *fs.Op) (fs.Result, error) {
-			// Observe the record exactly when the chain would rename.
-			if recs, err := br.scanStaged(); err == nil && len(recs) == 1 {
-				for _, c := range recs[0].m.candidatePaths() {
-					if c == "/d/b.bin" {
-						atChainTime = c
-					}
-				}
-			}
-			return fs.Result{}, nil
-		})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if atChainTime != "/d/b.bin" {
-		t.Fatalf("intent at rename time = %q, want /d/b.bin (must precede the remote rename)", atChainTime)
-	}
-	if got := stagedManifestPath(t, br); got != "/d/b.bin" {
-		t.Fatalf("settled manifest path = %q, want /d/b.bin", got)
-	}
-	if rec := onlyStaged(t, br); rec.m.Path != "/d/b.bin" || len(rec.m.NextPaths) != 0 {
-		t.Fatalf("settled record = path %q / candidates %v, want path /d/b.bin and none pending",
-			rec.m.Path, rec.m.candidatePaths())
-	}
-}
-
-// Round-52: a not-handled helper result means only that the helper did
-// nothing — never that the rename landed. When the destination has an open
-// handle that is still local-only, RetainOpenAlias has no remote object to
-// retain and declines (empty sentinel, not handled); the wrapper must run the
-// chain itself instead of reporting success with the source untouched.
 func TestNotHandledRenameRunsTheChain(t *testing.T) {
 	f := newFakeV2(t)
 	f.setDir("/d", true)
@@ -5092,7 +4550,7 @@ func TestNotHandledRenameRunsTheChain(t *testing.T) {
 		t.Fatal("the local-only create must be claimed by the engine")
 	}
 	var chainRan bool
-	_, err, handled := h.renameWithDurableIntent(context.Background(),
+	_, err, handled := h.renameOverOpen(context.Background(),
 		&fs.Op{Kind: fs.OpRename, Path: "/d/src.bin", Path2: "/d/local.bin"},
 		func(context.Context, *fs.Op) (fs.Result, error) {
 			chainRan = true
@@ -5118,7 +4576,6 @@ func TestImageProofRejectsPartialBlockReference(t *testing.T) {
 	f.completeEcho = false
 	f.setDir("/d", true)
 	h := newTestHandler(t, f, 0)
-	h.opts.Engine.Bridge.EnableDeferredCommits()
 	block := strings.Repeat("Q", 4096)
 	res, _, _ := dispatchCreate(context.Background(), h, "/d/n.bin", syscall.O_RDWR|syscall.O_CREAT)
 	eh := res.Handle.(*engineHandle)
@@ -5140,19 +4597,6 @@ func TestImageProofRejectsPartialBlockReference(t *testing.T) {
 	if err := eh.Flush(context.Background()); err == nil {
 		t.Fatal("a partial reference to the same content must not be bound as our upload")
 	}
-}
-
-// stagedManifestPath reads the (single) staged record's saved pathname.
-func stagedManifestPath(t *testing.T, br *Bridge) string {
-	t.Helper()
-	recs, err := br.scanStaged()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(recs) != 1 {
-		t.Fatalf("staged records = %d, want 1", len(recs))
-	}
-	return recs[0].m.Path
 }
 
 // Round-53: an empty flush must not materialize a classic name while the
@@ -5233,178 +4677,12 @@ func (f *fakeV2) hashParsedLayout(path string) string {
 // to commit — a committed rename can lose its response. The durable
 // destination must therefore SURVIVE an ambiguous outcome, so recovery
 // accepts the staged object at every name it may hold.
-func TestAmbiguousRenameKeepsIntent(t *testing.T) {
-	f := newFakeV2(t)
-	f.setDir("/d", true)
-	f.seedExtent(t, "/d/a.bin", "BASE")
-	cacheDir := engineCacheDir(t)
-	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: cacheDir})
-	br := eng.Bridge
-	ino := meta.Ino(31)
-	br.RememberPathForTest(ino, "/d/a.bin")
-	sum := sha256Hex([]byte("PEND"))
-	br.StageBlockForTest(sum, []byte("PEND"))
-	br.AddPendingForTest(ino, 0, 0, sum, 4, 8)
-	if err := br.StagePendingLocal(ino); err != nil {
-		t.Fatal(err)
-	}
-	h := New(Options{Engine: eng, Threshold: 0})
-	boom := errors.New("remote rename response lost")
-	_, err, _ := h.renameWithDurableIntent(context.Background(),
-		&fs.Op{Kind: fs.OpRename, Path: "/d/a.bin", Path2: "/d/b.bin"},
-		func(context.Context, *fs.Op) (fs.Result, error) { return fs.Result{}, boom })
-	if !errors.Is(err, boom) {
-		t.Fatalf("rename error = %v, want the chain's failure", err)
-	}
-	rec := onlyStaged(t, br)
-	if !rec.hasCandidate("/d/b.bin") {
-		t.Fatalf("ambiguous rename lost the destination: candidates = %v", rec.m.candidatePaths())
-	}
-	// The PRE-rename name must remain a candidate too — the rename may not
-	// have committed.
-	if rec.m.Path != "/d/a.bin" {
-		t.Fatalf("saved path = %q, want /d/a.bin still", rec.m.Path)
-	}
-}
-
-// Round-53: a second rename must ADD its destination, not replace the
-// previous one. Until B -> C commits, the object may still be at B, so
-// recovery has to try it.
-func TestSecondRenameKeepsPreviousCandidate(t *testing.T) {
-	f := newFakeV2(t)
-	f.setDir("/d", true)
-	f.seedExtent(t, "/d/a.bin", "BASE")
-	cacheDir := engineCacheDir(t)
-	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: cacheDir})
-	br := eng.Bridge
-	ino := meta.Ino(41)
-	br.RememberPathForTest(ino, "/d/a.bin")
-	sum := sha256Hex([]byte("PEND"))
-	br.StageBlockForTest(sum, []byte("PEND"))
-	br.AddPendingForTest(ino, 0, 0, sum, 4, 8)
-	if err := br.StagePendingLocal(ino); err != nil {
-		t.Fatal(err)
-	}
-	// First rename: A -> B, committed but not settled (cleanup failed).
-	if err := br.StageRenameIntentLocal("/d/a.bin", "/d/b.bin"); err != nil {
-		t.Fatal(err)
-	}
-	br.ClearRenameIntentLocal("/d/a.bin", "/d/b.bin")
-	// Second rename: B -> C, staged but NOT committed yet.
-	if err := br.StageRenameIntentLocal("/d/b.bin", "/d/c.bin"); err != nil {
-		t.Fatal(err)
-	}
-	rec := onlyStaged(t, br)
-	// The object is still at B, so B must remain a candidate even though C
-	// was just recorded.
-	if !rec.hasCandidate("/d/b.bin") {
-		t.Fatalf("second rename dropped the still-current name: candidates = %v", rec.m.candidatePaths())
-	}
-	if !rec.hasCandidate("/d/c.bin") {
-		t.Fatalf("second rename did not record its destination: candidates = %v", rec.m.candidatePaths())
-	}
-	// And a definitive failure of that RPC leaves the record replayable at B.
-	br.ClearRenameIntentLocal("/d/b.bin", "/d/c.bin")
-	if !onlyStaged(t, br).hasCandidate("/d/b.bin") {
-		t.Fatal("a failed second rename must leave the object's current name replayable")
-	}
-}
-
-// Round-52: a barrier staged WHILE a rename is in flight must inherit its
-// destination, since StagePendingLocal does not run under the path locks.
-func TestConcurrentStageInheritsInFlightIntent(t *testing.T) {
-	f := newFakeV2(t)
-	f.setDir("/d", true)
-	f.seedExtent(t, "/d/a.bin", "BASE")
-	cacheDir := engineCacheDir(t)
-	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: cacheDir})
-	br := eng.Bridge
-	ino := meta.Ino(51)
-	br.RememberPathForTest(ino, "/d/a.bin")
-	sum := sha256Hex([]byte("PEND"))
-	br.StageBlockForTest(sum, []byte("PEND"))
-	br.AddPendingForTest(ino, 0, 0, sum, 4, 8)
-	if err := br.StageRenameIntentLocal("/d/a.bin", "/d/b.bin"); err != nil {
-		t.Fatal(err)
-	}
-	if err := br.StagePendingLocal(ino); err != nil {
-		t.Fatal(err)
-	}
-	if !onlyStaged(t, br).hasCandidate("/d/b.bin") {
-		t.Fatalf("mid-rename barrier missed the in-flight destination: %v", onlyStaged(t, br).m.candidatePaths())
-	}
-}
-
-// onlyStaged returns the single staged record.
-func onlyStaged(t *testing.T, br *Bridge) stagedRecord {
-	t.Helper()
-	recs, err := br.scanStaged()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(recs) != 1 {
-		t.Fatalf("staged records = %d, want 1", len(recs))
-	}
-	return recs[0]
-}
-
-// hasCandidate reports whether p is one of the record's candidate names.
-func (r stagedRecord) hasCandidate(p string) bool {
-	for _, c := range r.m.candidatePaths() {
-		if c == p {
-			return true
-		}
-	}
-	return false
-}
-
-// Round-54: a directory rename must record each DESCENDANT's own
-// destination, not the directory root. Staging /a -> /b for an object at
-// /a/file must record /b/file: recording /b leaves recovery probing a
-// directory and the missing old name while the bytes sit at /b/file.
-func TestDirRenameCandidateKeepsDescendantSuffix(t *testing.T) {
-	f := newFakeV2(t)
-	f.setDir("/a", true)
-	f.seedExtent(t, "/a/file.bin", "BASE")
-	cacheDir := engineCacheDir(t)
-	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: cacheDir})
-	br := eng.Bridge
-	ino := meta.Ino(61)
-	br.RememberPathForTest(ino, "/a/file.bin")
-	sum := sha256Hex([]byte("PEND"))
-	br.StageBlockForTest(sum, []byte("PEND"))
-	br.AddPendingForTest(ino, 0, 0, sum, 4, 8)
-	if err := br.StagePendingLocal(ino); err != nil {
-		t.Fatal(err)
-	}
-	// The directory rename arrives as one intent for /a.
-	if err := br.StageRenameIntentLocal("/a", "/b"); err != nil {
-		t.Fatal(err)
-	}
-	rec := onlyStaged(t, br)
-	if !rec.hasCandidate("/b/file.bin") {
-		t.Fatalf("descendant destination missing: candidates = %v, want /b/file.bin", rec.m.candidatePaths())
-	}
-	if rec.hasCandidate("/b") {
-		t.Fatalf("the directory ROOT was recorded as a file candidate: %v", rec.m.candidatePaths())
-	}
-	if !rec.hasCandidate("/a/file.bin") {
-		t.Fatal("the pre-rename name must stay a candidate until the rename is confirmed")
-	}
-}
-
-// Round-55: a STRICT fsync of a fresh empty file must be REMOTE-durable, not
-// merely local. `--durability=fsync` promises the drive9 server has the file
-// before fsync returns (docs/design/fuse-durability-policy.md), so a local
-// barrier — or, with no staging directory, nothing at all — does not satisfy
-// it. The name must exist remotely, and the descriptor must remain writable
-// afterwards because the created object is bound as its publication base.
 func TestStrictFsyncOfEmptyFileIsRemoteDurable(t *testing.T) {
 	f := newFakeV2(t)
 	f.setDir("/d", true)
 	cacheDir := engineCacheDir(t)
 	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: cacheDir})
-	h := New(Options{Engine: eng, Threshold: 0, SyncMode: "strict"})
+	h := New(Options{Engine: eng, Threshold: 0})
 	res, _, _ := dispatchCreate(context.Background(), h, "/d/e.bin", syscall.O_RDWR|syscall.O_CREAT)
 	eh := res.Handle.(*engineHandle)
 	if err := eh.Sync(context.Background()); err != nil {
@@ -5429,62 +4707,6 @@ func TestStrictFsyncOfEmptyFileIsRemoteDurable(t *testing.T) {
 // Round-55: the same strict fsync must work with NO staging directory: there
 // is no local place to record anything, so only a remote copy can make the
 // acknowledgment true.
-func TestStrictFsyncOfEmptyFileWithoutStagingDir(t *testing.T) {
-	f := newFakeV2(t)
-	f.setDir("/d", true)
-	// No CacheDir at all: no staging directory exists.
-	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/"})
-	if eng.Bridge.StagingDirForTest() != "" {
-		t.Fatal("precondition: this engine must have no staging directory")
-	}
-	h := New(Options{Engine: eng, Threshold: 0, SyncMode: "strict"})
-	res, _, _ := dispatchCreate(context.Background(), h, "/d/n.bin", syscall.O_RDWR|syscall.O_CREAT)
-	eh := res.Handle.(*engineHandle)
-	if err := eh.Sync(context.Background()); err != nil {
-		t.Fatalf("fsync: %v", err)
-	}
-	if n := f.hashParsedLayout("/d/n.bin"); n != "classic" {
-		t.Fatalf("with no staging dir a strict fsync must still create the remote file (layout %q)", n)
-	}
-}
-
-// Round-54: an intervening ordinary Flush must not delete the durable
-// barrier that an earlier interactive fsync wrote. An empty file has nothing
-// staged to make redundant; clearing here left it with neither a remote name
-// nor a local record.
-func TestInterveningFlushKeepsEmptyBarrier(t *testing.T) {
-	f := newFakeV2(t)
-	f.setDir("/d", true)
-	cacheDir := engineCacheDir(t)
-	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: cacheDir})
-	h := New(Options{Engine: eng, Threshold: 0, SyncMode: "interactive"})
-	res, _, _ := dispatchCreate(context.Background(), h, "/d/e.bin", syscall.O_RDWR|syscall.O_CREAT)
-	eh := res.Handle.(*engineHandle)
-	if err := eh.Sync(context.Background()); err != nil {
-		t.Fatalf("fsync: %v", err)
-	}
-	if recs, _ := eng.Bridge.scanStaged(); len(recs) != 1 {
-		t.Fatalf("precondition: staged barriers = %d, want 1", len(recs))
-	}
-	// An ordinary flush follows (libc does this between fsync and close).
-	if err := eh.Flush(context.Background()); err != nil {
-		t.Fatalf("flush: %v", err)
-	}
-	if recs, _ := eng.Bridge.scanStaged(); len(recs) != 1 {
-		t.Fatalf("the intervening flush deleted the only durable record (barriers = %d)", len(recs))
-	}
-	// And the file still materializes at close.
-	if err := eh.Release(context.Background()); err != nil {
-		t.Fatalf("release: %v", err)
-	}
-	if n := f.hashParsedLayout("/d/e.bin"); n != "classic" {
-		t.Fatalf("layout after close = %q, want classic", n)
-	}
-}
-
-// Round-54: closing ONE of several descriptors must not materialize the
-// empty name. Another handle is still open and may write; an unattributed
-// placeholder created by the first close would make its next write fail.
 func TestFirstCloseOfTwoKeepsHandleWritable(t *testing.T) {
 	f := newFakeV2(t)
 	f.setDir("/d", true)
@@ -5515,9 +4737,6 @@ func TestFirstCloseOfTwoKeepsHandleWritable(t *testing.T) {
 		t.Fatalf("content = %q, want STILL-OK", got)
 	}
 }
-
-// StagingDirForTest exposes the configured staging directory.
-func (b *Bridge) StagingDirForTest() string { return b.cfg.StagingDir }
 
 // Round-55: two overlapping closes must still produce exactly one owner of
 // the final publication. A plain "is another handle registered?" check lets
@@ -5567,118 +4786,25 @@ func TestOverlappingClosesMaterializeOnce(t *testing.T) {
 // run resumes, finds no registration and would otherwise persist only the
 // OLD name. In-flight tracking defers that retirement, and the run also
 // adopts the inode's current mapping.
-func TestRenameCompletedInsideStageWindowStillRecorded(t *testing.T) {
-	f := newFakeV2(t)
-	f.setDir("/d", true)
-	f.seedExtent(t, "/d/a.bin", "BASE")
-	cacheDir := engineCacheDir(t)
-	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: cacheDir})
-	br := eng.Bridge
-	ino := meta.Ino(71)
-	br.RememberPathForTest(ino, "/d/a.bin")
-	sum := sha256Hex([]byte("PEND"))
-	br.StageBlockForTest(sum, []byte("PEND"))
-	br.AddPendingForTest(ino, 0, 0, sum, 4, 8)
-
-	resumed := make(chan struct{})
-	paused := make(chan struct{})
-	br.stagingPause = func() {
-		br.stagingPause = nil
-		close(paused)
-		<-resumed
-	}
-	done := make(chan error, 1)
-	go func() { done <- br.StagePendingLocal(ino) }()
-	<-paused
-
-	// The whole rename runs to completion inside that window: registration,
-	// remote rename, settlement, and retirement.
-	h := New(Options{Engine: eng, Threshold: 0})
-	_, err, _ := h.renameWithDurableIntent(context.Background(),
-		&fs.Op{Kind: fs.OpRename, Path: "/d/a.bin", Path2: "/d/b.bin"},
-		func(context.Context, *fs.Op) (fs.Result, error) {
-			f.mu.Lock()
-			f.move("/d/a.bin", "/d/b.bin")
-			f.mu.Unlock()
-			br.RemapLocal("/d/a.bin", "/d/b.bin")
-			return fs.Result{}, nil
-		})
-	if err != nil {
-		t.Fatalf("rename: %v", err)
-	}
-	// The rename has fully committed and settled at this point. Its
-	// registration retirement was DEFERRED because this staging run is still
-	// in flight — that is precisely the protection under test.
-	close(resumed)
-	if err := <-done; err != nil {
-		t.Fatalf("staging: %v", err)
-	}
-	rec := onlyStaged(t, br)
-	if !rec.hasCandidate("/d/b.bin") {
-		t.Fatalf("the staged record lost the committed rename: candidates = %v", rec.m.candidatePaths())
-	}
-	// With the staging run finished, the deferred retirement has now run.
-	if br.hasPendingRenameForTest("/d/a.bin") {
-		t.Fatal("the deferred registration retirement never happened")
-	}
-}
-
-// hasPendingRenameForTest reports whether a rename is registered for path.
-func (b *Bridge) hasPendingRenameForTest(path string) bool {
+func (b *Bridge) RememberPathForTest(ino meta.Ino, path string) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	_, ok := b.pendingRenames[path]
-	return ok
+	full := b.fullPath(path)
+	b.paths[ino] = full
+	b.replacements[full] = ino // the descriptor owns the name
+	b.mu.Unlock()
 }
 
-// Round-59: a rename that completes BETWEEN the staging run's disk read and
-// its manifest replacement must not be lost. Only the manifest lock makes
-// that window safe — a write-then-reverify cannot, because the read-back
-// returns exactly the bytes the replacement just wrote.
-//
-// The rename is driven from a hook INSIDE the lock, i.e. exactly in the
-// window the lock has to protect.
-func TestRenameDuringStagePublishIsMerged(t *testing.T) {
-	f := newFakeV2(t)
-	f.setDir("/d", true)
-	f.seedExtent(t, "/d/a.bin", "BASE")
-	cacheDir := engineCacheDir(t)
-	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: cacheDir})
-	br := eng.Bridge
-	ino := meta.Ino(81)
-	br.RememberPathForTest(ino, "/d/a.bin")
-	sum := sha256Hex([]byte("PEND"))
-	br.StageBlockForTest(sum, []byte("PEND"))
-	br.AddPendingForTest(ino, 0, 0, sum, 4, 8)
-
-	// The concurrent writer: a rename landing while the publish holds the
-	// lock. It writes a NEW destination into the record.
-	done := make(chan struct{})
-	br.manifestPause = func() {
-		br.manifestPause = nil
-		go func() {
-			defer close(done)
-			if err := br.StageRenameIntentLocal("/d/a.bin", "/d/b.bin"); err != nil {
-				t.Errorf("stage rename intent: %v", err)
-			}
-		}()
-		// Give the rename every chance to run: it MUST block on the lock.
-		time.Sleep(150 * time.Millisecond)
-	}
-	if err := br.StagePendingLocal(ino); err != nil {
-		t.Fatalf("staging: %v", err)
-	}
-	<-done
-
-	rec := onlyStaged(t, br)
-	if !rec.hasCandidate("/d/b.bin") {
-		t.Fatalf("the publish lost a rename that committed inside its lock window: candidates = %v", rec.m.candidatePaths())
-	}
+func (b *Bridge) StageBlockForTest(sum string, data []byte) {
+	b.blocks.stagePinned(sum, data, true)
 }
 
-// Round-59: when the server echoes the created object's identity, the
-// binding MUST use it — never a follow-up Stat, whose answer a concurrent
-// replacement can turn into a stranger's identity.
+func (b *Bridge) AddPendingForTest(ino meta.Ino, chunk, off uint32, sum string, size int64, total int64) {
+	b.mu.Lock()
+	b.pending[ino] = append(b.pending[ino], pendingWrite{chunk: chunk, off: off, checksum: sum, size: size})
+	b.sizes[ino] = total
+	b.mu.Unlock()
+}
+
 func TestCreateEchoBindsWithoutStat(t *testing.T) {
 	f := newFakeV2(t)
 	f.setDir("/d", true)
@@ -5722,7 +4848,7 @@ func TestSyncRefusesForeignOccupantOfLocalCreate(t *testing.T) {
 	f.setDir("/d", true)
 	cacheDir := engineCacheDir(t)
 	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: cacheDir})
-	h := New(Options{Engine: eng, Threshold: 0, SyncMode: "strict"})
+	h := New(Options{Engine: eng, Threshold: 0})
 	res, _, _ := dispatchCreate(context.Background(), h, "/d/r.bin", syscall.O_RDWR|syscall.O_CREAT)
 	eh := res.Handle.(*engineHandle)
 	// Another client creates the same path first.
@@ -5790,7 +4916,7 @@ func TestStrictSyncAfterTruncateToZero(t *testing.T) {
 	f.setDir("/d", true)
 	f.seedExtent(t, "/d/t.bin", "PAYLOAD")
 	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: engineCacheDir(t)})
-	h := New(Options{Engine: eng, Threshold: 0, SyncMode: "strict"})
+	h := New(Options{Engine: eng, Threshold: 0})
 	res, _, _ := dispatchCreate(context.Background(), h, "/d/t.bin", syscall.O_RDWR)
 	eh, ok := res.Handle.(*engineHandle)
 	if !ok {
@@ -5922,7 +5048,7 @@ func TestEmptyStrictSyncRefusedBeforeCreate(t *testing.T) {
 	f.noIdentityCapability = true
 	cacheDir := engineCacheDir(t)
 	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: cacheDir})
-	h := New(Options{Engine: eng, Threshold: 0, SyncMode: "strict"})
+	h := New(Options{Engine: eng, Threshold: 0})
 	res, _, _ := dispatchCreate(context.Background(), h, "/d/e.bin", syscall.O_RDWR|syscall.O_CREAT)
 	eh := res.Handle.(*engineHandle)
 
@@ -5938,119 +5064,63 @@ func TestEmptyStrictSyncRefusedBeforeCreate(t *testing.T) {
 	}
 }
 
-// The operator's number is ONE allowance for the plane: it is split between
-// JuiceFS's chunk cache and the durable staging tree, and the two must sum to
-// it. Handing both the same N (the previous shape) let the plane retain 2N.
-func TestCacheAllowanceIsSplitWithStaging(t *testing.T) {
-	for _, total := range []int64{8 << 20, 1024 << 20, 8 << 30} {
-		eng := NewEngine(EngineConfig{
-			Client: client.New("http://127.0.0.1:1", ""), RemoteRoot: "/",
-			CacheDir: engineCacheDir(t), CacheSize: uint64(total), CacheSizeConfigured: true,
+// The extent plane makes exactly ONE durability promise: JuiceFS's own
+// close-to-open contract. It deliberately does NOT implement the mount's
+// --durability profiles (docs/design/fuse-durability-policy.md, "Extent
+// plane"), because its bytes travel JuiceFS's own write path and its
+// buffering cadence is the community writer's. This pins that: every profile
+// behaves identically, and the promise that DOES hold is close-to-open.
+//
+// The three observable boundaries are asserted for every profile:
+//   - Write alone publishes nothing (the writer buffers, as upstream does);
+//   - fsync publishes (remote-visible, not a local-only barrier);
+//   - after close the bytes are readable through a SECOND descriptor, which
+//     is what close-to-open means.
+func TestExtentDurabilityIsCloseToOpenForEveryProfile(t *testing.T) {
+	// The profile name is the only thing that varies: the plane does not
+	// accept a sync mode or write policy at all, which IS the contract.
+	profiles := []string{"auto", "interactive", "fsync", "close-sync", "write-sync"}
+	for _, profile := range profiles {
+		t.Run(profile, func(t *testing.T) {
+			f := newFakeV2(t)
+			f.seedExtent(t, "/big.bin", "XXXXXXXX")
+			eng := NewEngine(EngineConfig{
+				Client:     client.New(f.URL, ""),
+				RemoteRoot: "/",
+				CacheDir:   engineCacheDir(t),
+			})
+			h := New(Options{Engine: eng, Threshold: 1 << 20})
+			eh := claimOpen(t, h, "/big.bin")
+
+			// Write alone must not publish: the community writer buffers
+			// until a chunk fills or the file is flushed, whatever profile
+			// the mount selected. (write-sync is the documented exception
+			// in the CLASSIC plane; the extent plane has no such hook, and
+			// saying so here is the point of the test.)
+			if err := eh.Write(context.Background(), 0, []byte("ABCDEFGH")); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			if got := f.contentOf("/big.bin"); got != "XXXXXXXX" {
+				t.Fatalf("Write published early: remote = %q, want XXXXXXXX", got)
+			}
+
+			// fsync must publish remotely for EVERY profile — there is no
+			// local barrier in this plane.
+			if err := eh.Sync(context.Background()); err != nil {
+				t.Fatalf("fsync: %v", err)
+			}
+			if got := f.contentOf("/big.bin"); got != "ABCDEFGH" {
+				t.Fatalf("fsync did not publish remotely: remote = %q, want ABCDEFGH", got)
+			}
+
+			// Close, then reopen through a SECOND descriptor: close-to-open.
+			if err := eh.Release(context.Background()); err != nil {
+				t.Fatalf("release: %v", err)
+			}
+			eh2 := claimOpen(t, h, "/big.bin")
+			if got := readFront(t, eh2, 8); got != "ABCDEFGH" {
+				t.Fatalf("close-to-open read = %q, want ABCDEFGH", got)
+			}
 		})
-		staging := eng.Bridge.StagingBudgetForTest()
-		juice := eng.JuiceCacheSizeForTest()
-		if staging <= 0 {
-			t.Fatalf("total=%d: staging budget = %d, want a positive reserve", total, staging)
-		}
-		if got := staging + juice; got != total {
-			t.Fatalf("total=%d: staging(%d) + juicefs(%d) = %d, want exactly the configured allowance", total, staging, juice, got)
-		}
 	}
 }
-
-// Budget pressure must REFUSE the new fsync and leave every earlier
-// acknowledged barrier untouched: each record is a durability promise already
-// made to a caller, so it cannot be revoked to make room for a later write.
-func TestStagingBudgetRefusesRatherThanEvictingAcknowledgedBarriers(t *testing.T) {
-	const total = 8 << 20
-	f := newFakeV2(t)
-	f.setDir("/d", true)
-	eng := NewEngine(EngineConfig{
-		Client: client.New(f.URL, ""), RemoteRoot: "/",
-		CacheDir: engineCacheDir(t), CacheSize: total, CacheSizeConfigured: true,
-	})
-	br := eng.Bridge
-	budget := br.StagingBudgetForTest()
-	if budget <= 1 {
-		t.Fatalf("staging budget = %d, too small for this test", budget)
-	}
-	stageFile := func(i int) error {
-		ino := meta.Ino(300 + i)
-		path := fmt.Sprintf("/d/s%d.bin", i)
-		f.seedExtent(t, path, "")
-		br.RememberPathForTest(ino, path)
-		// Each barrier is sized to fill roughly half the reserve, so the
-		// second one cannot fit beside the first.
-		data := make([]byte, budget/2)
-		for j := range data {
-			data[j] = byte(i)
-		}
-		sum := sha256Hex(data)
-		br.StageBlockForTest(sum, data)
-		br.AddPendingForTest(ino, 0, 0, sum, int64(len(data)), int64(len(data)))
-		return br.StagePendingLocal(ino)
-	}
-
-	if err := stageFile(0); err != nil {
-		t.Fatalf("first fsync must succeed: %v", err)
-	}
-	entries, err := os.ReadDir(br.cfg.StagingDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) != 1 {
-		t.Fatalf("barriers after the first fsync = %d, want 1", len(entries))
-	}
-	firstDir := entries[0].Name()
-
-	if err := stageFile(1); err == nil {
-		t.Fatal("a fsync that would exceed the split allowance must fail, not silently evict")
-	}
-	entries, err = os.ReadDir(br.cfg.StagingDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) != 1 || entries[0].Name() != firstDir {
-		t.Fatalf("the acknowledged barrier was disturbed: entries=%v want [%s]", entries, firstDir)
-	}
-}
-
-// CacheSize == 0 is an explicit memory-only choice: no durable staging tree
-// may be armed behind the operator's back — and, crucially, fsync must still
-// keep its promise. With no barrier available the mount stays STRICT, so an
-// interactive sync publishes remotely instead of returning success for bytes
-// that exist only in memory.
-func TestExplicitZeroCacheSizeDisablesStaging(t *testing.T) {
-	f := newFakeV2(t)
-	f.setDir("/d", true)
-	eng := NewEngine(EngineConfig{
-		Client: client.New(f.URL, ""), RemoteRoot: "/",
-		CacheDir: engineCacheDir(t), CacheSize: 0, CacheSizeConfigured: true,
-	})
-	if eng.Bridge.StagingDirForTest() != "" {
-		t.Fatalf("staging dir = %q, want none for an explicit CacheSize=0", eng.Bridge.StagingDirForTest())
-	}
-	// Interactive mode, but with no barrier to defer onto: fsync must land
-	// remotely rather than acknowledge memory-only data.
-	h := New(Options{Engine: eng, Threshold: 0, SyncMode: "interactive"})
-	res, _, _ := dispatchCreate(context.Background(), h, "/d/z.bin", syscall.O_RDWR|syscall.O_CREAT)
-	eh := res.Handle.(*engineHandle)
-	if err := eh.Write(context.Background(), 0, []byte("NOCACHE")); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Sync(context.Background()); err != nil {
-		t.Fatalf("fsync must still be durable without a disk cache: %v", err)
-	}
-	if got := f.contentOf("/d/z.bin"); got != "NOCACHE" {
-		t.Fatalf("content after fsync = %q, want NOCACHE published remotely (not memory-only)", got)
-	}
-}
-
-// StagingBudgetForTest exposes the reserve carved out of the cache allowance.
-func (b *Bridge) StagingBudgetForTest() int64 { return b.cfg.StagingBudget }
-
-// JuiceCacheSizeForTest exposes the chunk store's share of the allowance.
-func (e *Engine) JuiceCacheSizeForTest() int64 { return e.juiceCacheSize }
-
-// StagingBytesForTest exposes the retained-bytes counter.
-func (b *Bridge) StagingBytesForTest() int64 { return b.stagingBytes.Load() }
