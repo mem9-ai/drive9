@@ -963,9 +963,10 @@ func (idx *PendingIndex) EnsureConflictMarker(remotePath string) error {
 		return nil
 	}
 	meta := WriteBackMeta{
-		Path:       remotePath,
-		Kind:       PendingConflict,
-		LayerClean: false,
+		Path:        remotePath,
+		Kind:        PendingConflict,
+		WitnessOnly: true,
+		LayerClean:  false,
 	}
 	gen := idx.nextGen.Add(1)
 	meta.Generation = gen

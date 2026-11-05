@@ -7,6 +7,7 @@ package writeback
 // answer EIO instead, stickily, until a later commit of the same path lands.
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -2161,5 +2162,215 @@ func TestMovedMarkerKeepsSupersessionChain(t *testing.T) {
 	cq.ResolveSupersededConflict("/b", gen) // the chain's source generation
 	if recovered.HasPending("/b") {
 		t.Fatal("a landing that superseded the chain's source generation did not resolve the moved marker")
+	}
+}
+
+// TestLargeChildLandingSurvivesClearLanded pins the >1MiB row of the
+// event-clear window: the queue's landed LANDMARK is a selective lineage
+// cache (no checksum above maxLandedPayloadBytes ⇒ no landmark), so a large
+// successor that fully lands under the obsolete prefix and whose writeback
+// watermark is then wiped by EventUnverified must still be detected — the
+// rename's commit-seq stamps carry every successful commit regardless of
+// size or entry provenance.
+func TestLargeChildLandingSurvivesClearLanded(t *testing.T) {
+	fb := &failingWritesBackend{backend: testbackend.NewBackend()}
+	ch, wb := newUploadStack(t, fb, Options{Policy: PolicyWriteBack})
+	ctx := context.Background()
+
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMkdir, Path: "/d", Mode: 0o755}); err != nil {
+		t.Fatal(err)
+	}
+	h := open(t, ch, "/d/f")
+	if err := h.Write(ctx, 0, []byte("child v1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// The rename's pre-RPC evidence wipe and commit-seq snapshot.
+	wb.forgetLanded("/d")
+	wb.forgetLandedPrefix("/d/")
+	snap := wb.queue.CommitSeqsUnderPrefix("/d/")
+	if err := wb.opts.Client.RenameCtx(ctx, wb.remotePath("/d"), wb.remotePath("/e")); err != nil {
+		t.Fatal(err)
+	}
+	// A >1MiB successor lands under the resurrected old name.
+	big := bytes.Repeat([]byte("L"), (1<<20)+64)
+	if err := h.Write(ctx, 0, big); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(40 * time.Second)
+	for time.Now().Before(deadline) {
+		if !wb.opts.Staging.Pending.HasPending("/d/f") {
+			if _, ok := nodeString(fb.backend, "/d/f"); ok {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if wb.opts.Staging.Pending.HasPending("/d/f") {
+		t.Fatal("the large successor never completed under the old prefix")
+	}
+	// The selective landmark must indeed be absent for this payload — that
+	// is the regression's premise — and the event stream wipes the
+	// writeback watermarks before the response is processed.
+	if seq := wb.queue.LandedSeq("/d/f"); seq != 0 {
+		t.Fatalf("premise broken: large payload has a landmark (%d); the row no longer pins the cache gap", seq)
+	}
+	wb.clearLanded()
+
+	// The handler's post-response union + settlement: commit-seq delta must
+	// catch the child, the strict check must find the resurrection, and the
+	// witness must land at /e/f.
+	moved := wb.queue.CommitSeqsUnderPrefix("/d/")
+	if moved["/d/f"] <= snap["/d/f"] {
+		t.Fatal("the large landing did not advance the commit-seq stamp")
+	}
+	wb.retarget("/d", "/e")
+	wb.settleOldPrefixAfterMove(ctx, &fs.Op{Kind: fs.OpRename, Path: "/d", Path2: "/e"}, time.Now(), nil, nil, snap, map[string]bool{"/d/f": true})
+	if err := wb.queue.PathTerminalFailure("/e/f"); err == nil {
+		t.Fatal("the large child landing left no failure witness at the new prefix")
+	}
+}
+
+// TestRekeyDeclinesAfterReDrivenLanding pins the original worker
+// interleaving: the transfer's live-image branch re-drives the replacement
+// through a RECOVERED entry (no SnapshotID, no landed landmark on success),
+// the worker lands it and clears the destination state, and the late rekey
+// must still decline — the commit-seq fence observes that landing even
+// though the lineage cache never recorded it.
+func TestRekeyDeclinesAfterReDrivenLanding(t *testing.T) {
+	fb := &failingWritesBackend{backend: testbackend.NewBackend()}
+	ch, wb := newUploadStack(t, fb, Options{Policy: PolicyWriteBack})
+	ctx := context.Background()
+
+	src := open(t, ch, "/rr-src.txt")
+	if err := src.Write(ctx, 0, []byte("v1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := src.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// The source's terminal failure record (standalone: no marker entry, so
+	// the successor staged below stays LIVE — re-staging over a conflict
+	// marker inherits the conflict, which is not the re-drive shape).
+	wb.queue.RecordTerminalFailureForPath("/rr-src.txt", errors.New("terminal before the rename"))
+	if err := wb.queue.PathTerminalFailure("/rr-src.txt"); err == nil {
+		t.Fatal("no failure record at the source")
+	}
+	// The writer's replacement staged during the rename window with uploads
+	// held by the outage — still LIVE at transfer time, the reviewer's shape.
+	fb.setFail(true)
+	if err := wb.opts.Staging.Shadow.WriteFull("/rr-src.txt", []byte("v3 re-driven"), 0); err != nil {
+		t.Fatal(err)
+	}
+	baseRev, _ := wb.landedRevision("/rr-src.txt")
+	if baseRev <= 0 {
+		t.Fatal("no landed revision for the base")
+	}
+	if _, err := wb.opts.Staging.Pending.PutWithBaseRev("/rr-src.txt", int64(len("v3 re-driven")), staging.PendingOverwrite, baseRev); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, live := wb.pendingImageState("/rr-src.txt"); !live {
+		t.Fatal("no live successor staged at the source")
+	}
+	fb.setFail(false)
+	if err := wb.opts.Client.RenameCtx(ctx, wb.remotePath("/rr-src.txt"), wb.remotePath("/rr-dst.txt")); err != nil {
+		t.Fatal(err)
+	}
+	fb.setFail(true)
+
+	// Pre-transfer commit-seq snapshot, then the transfer: the live image
+	// moves and its landing is re-driven at the destination through a
+	// recovered entry.
+	snaps := wb.queue.LandedSnapshotsForRename("/rr-dst.txt", "/rr-dst.txt/")
+	if _, terr := wb.retargetConflictMarkers(ctx, "/rr-src.txt", "/rr-dst.txt", renameFence{movedAt: time.Now()}, true); terr != nil {
+		t.Fatalf("transfer: %v", terr)
+	}
+	// The re-driven worker lands BEFORE the rekey runs; the recovered entry
+	// leaves no lineage landmark, but the commit-seq stamp advances.
+	fb.setFail(false)
+	deadline := time.Now().Add(40 * time.Second)
+	for time.Now().Before(deadline) {
+		if !wb.opts.Staging.Pending.HasPending("/rr-dst.txt") {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if wb.opts.Staging.Pending.HasPending("/rr-dst.txt") {
+		t.Fatal("the re-driven replacement never landed at the destination")
+	}
+	if seq := wb.queue.LandedSeq("/rr-dst.txt"); seq != 0 {
+		t.Fatalf("premise broken: the recovered entry recorded a landmark (%d)", seq)
+	}
+	// The late rekey must decline: the landing fulfilled the source record.
+	wb.queue.RenameTerminalFailure("/rr-src.txt", "/rr-dst.txt", snaps)
+	if err := wb.queue.PathTerminalFailure("/rr-dst.txt"); err != nil {
+		t.Fatalf("the rekey reinstalled stale EIO over the re-driven landing: %v", err)
+	}
+}
+
+// TestWitnessMarkerDoesNotForgeTruncation pins the metadata row of the
+// standalone witness: after the settlement installs the shadowless marker at
+// /e/f (whose remote image is the nonempty v1), stat and list must keep
+// reporting the real size — the witness carries an obligation, not a
+// zero-byte staged image.
+func TestWitnessMarkerDoesNotForgeTruncation(t *testing.T) {
+	fb := &failingWritesBackend{backend: testbackend.NewBackend()}
+	ch, wb := newUploadStack(t, fb, Options{Policy: PolicyWriteBack})
+	ctx := context.Background()
+
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMkdir, Path: "/d", Mode: 0o755}); err != nil {
+		t.Fatal(err)
+	}
+	h := open(t, ch, "/d/f")
+	if err := h.Write(ctx, 0, []byte("child v1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	const wantSize = int64(len("child v1"))
+	wb.forgetLanded("/d")
+	wb.forgetLandedPrefix("/d/")
+	if err := wb.opts.Client.RenameCtx(ctx, wb.remotePath("/d"), wb.remotePath("/e")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Write(ctx, 0, []byte("child v2 landed in the gap")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if !wb.opts.Staging.Pending.HasPending("/d/f") {
+			if _, ok := nodeString(fb.backend, "/d/f"); ok {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	wb.retarget("/d", "/e")
+	wb.settleOldPrefixAfterMove(ctx, &fs.Op{Kind: fs.OpRename, Path: "/d", Path2: "/e"}, time.Now(), nil, nil, nil, map[string]bool{})
+	marker, ok := wb.opts.Staging.Pending.GetMeta("/e/f")
+	if !ok || marker == nil || !marker.WitnessOnly {
+		t.Fatalf("witness marker = %+v ok=%v", marker, ok)
+	}
+
+	// The metadata overlays must skip the witness: stat keeps the remote's
+	// real size instead of the marker's zero.
+	if attr, ok := wb.pendingAttr("/e/f"); ok && attr.Size == 0 {
+		t.Fatalf("pendingAttr served the witness as a zero-byte image: %+v", attr)
+	}
+	if size, _, _, ok := wb.pendingListAttr("/e/f"); ok && size == 0 {
+		t.Fatal("pendingListAttr served the witness as a zero-byte image")
+	}
+	// And the barrier still answers EIO from it.
+	if err := wb.queue.PathTerminalFailure("/e/f"); err == nil {
+		t.Fatal("the witness stopped answering EIO")
 	}
 }

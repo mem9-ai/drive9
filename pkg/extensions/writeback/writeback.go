@@ -1068,7 +1068,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			// revalidation the close-time commit race would otherwise pin
 			// the pre-write size for the whole attr TTL (append is 20 on
 			// the mount, 22 remotely).
-			if meta, ok := w.pendingMeta(op.Path); ok && res.Attr.Kind != fs.KindDir {
+			if meta, ok := w.pendingImageMeta(op.Path); ok && res.Attr.Kind != fs.KindDir {
 				res.Attr.Size = meta.Size
 			}
 			// #984 stat visibility: a live writer's uncommitted image —
@@ -1651,13 +1651,15 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		w.forgetLandedPrefix(strings.TrimSuffix(op.Path, "/") + "/")
 		// The writeback landed table can be cleared mid-window by the event
 		// stream (EventUnverified/EventCheckout from #1080 drop every
-		// watermark, disconnects emit them regardless of actors). The queue's
-		// landed landmarks are bookkeeping, not same-origin proof: nothing
-		// clears them on events, so they are the durable witness for
-		// "completed during the window". Snapshot them for the old prefix.
+		// watermark, disconnects emit them regardless of actors), and the
+		// queue's landed LANDMARKS are only a selective lineage cache (no
+		// snapshot ID, no checksum above 1MiB ⇒ deleted). The queue's
+		// commit sequence stamps EVERY successful commit per path with no
+		// payload conditions: that is the durable witness for "completed
+		// during the window". Snapshot it for the old prefix.
 		queueLandedSnap := map[string]uint64{}
 		if w.queue != nil {
-			queueLandedSnap = w.queue.LandedSeqsUnderPrefix(strings.TrimSuffix(op.Path, "/") + "/")
+			queueLandedSnap = w.queue.CommitSeqsUnderPrefix(strings.TrimSuffix(op.Path, "/") + "/")
 		}
 		// A rename over an OPEN target replaces the object its descriptors
 		// were reading: mark them anonymous BEFORE the remote rename (their
@@ -1690,7 +1692,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		// possibly resurrecting, the obsolete name before the response
 		// arrived) left the queue idle but a landed watermark behind.
 		windowWork := (w.queue != nil && w.queue.HasPath(op.Path)) || w.everLanded(op.Path) ||
-			(w.queue != nil && w.queue.LandedSeq(op.Path) > queueLandedSnap[op.Path])
+			(w.queue != nil && w.queue.CommitSeq(op.Path) > queueLandedSnap[op.Path])
 		// The same for the old prefix's children: the pending set right after
 		// the rename plus any child that landed during the RPC (its pending
 		// entry is gone, so only the landed watermark records it); a child
@@ -1707,10 +1709,12 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			for p := range w.landedPathsUnderPrefix(prefix) {
 				windowDescendants[p] = true
 			}
-			// Queue-landmark deltas survive event-stream clears: a child
-			// whose watermark was wiped still shows here.
+			// Commit-seq deltas survive event-stream clears and carry no
+			// payload conditions: a child whose watermark was wiped (or
+			// whose landmark was never recorded — large payloads, recovered
+			// entries) still shows here.
 			if w.queue != nil {
-				for p, cur := range w.queue.LandedSeqsUnderPrefix(prefix) {
+				for p, cur := range w.queue.CommitSeqsUnderPrefix(prefix) {
 					if cur > queueLandedSnap[p] {
 						windowDescendants[p] = true
 					}
@@ -2752,11 +2756,12 @@ func (w *Writeback) settleOldPrefixAfterMove(ctx context.Context, op *fs.Op, mov
 	for p := range w.landedPathsUnderPrefix(prefix) {
 		windowDescendants[p] = true
 	}
-	// The queue-landmark deltas again, read at settle time: a child that
+	// The commit-seq deltas again, read at settle time: a child that
 	// completed between the response and the handle retarget is here even
-	// if the event stream cleared the writeback watermarks meanwhile.
+	// if the event stream cleared the writeback watermarks meanwhile, and
+	// regardless of payload size or entry provenance.
 	if w.queue != nil {
-		for p, cur := range w.queue.LandedSeqsUnderPrefix(prefix) {
+		for p, cur := range w.queue.CommitSeqsUnderPrefix(prefix) {
 			if cur > queueLandedSnap[p] {
 				windowDescendants[p] = true
 			}
@@ -3574,7 +3579,7 @@ func attrSize(res fs.Result) int64 {
 // the cache image, then a strict fsync staged the ledger image), and the
 // queue's landing is the authoritative one.
 func (w *Writeback) pendingAttr(path string) (fs.Attr, bool) {
-	if meta, ok := w.pendingMeta(path); ok {
+	if meta, ok := w.pendingImageMeta(path); ok {
 		return attrFromPendingMeta(meta)
 	}
 	return fs.Attr{}, false
@@ -3655,9 +3660,24 @@ func (w *Writeback) overlayPendingListAttrs(dir string, entries []fs.Entry) []fs
 // staged image's metadata, overridden by a live writer's buffer (its bytes
 // may not have reached staging yet — v1 snapshotted published write-back
 // metadata per listing).
+// pendingImageMeta is pendingMeta for callers that serve file METADATA from
+// the pending overlay: a witness-only marker (a rename's shadowless failure
+// evidence — no payload, Size deliberately zero) must not masquerade as a
+// staged image and overwrite the remote's real size in stat/list replies.
+func (w *Writeback) pendingImageMeta(path string) (*staging.WriteBackMeta, bool) {
+	meta, ok := w.pendingMeta(path)
+	if !ok || meta == nil {
+		return nil, false
+	}
+	if meta.Kind == staging.PendingConflict && meta.WitnessOnly {
+		return nil, false
+	}
+	return meta, true
+}
+
 func (w *Writeback) pendingListAttr(p string) (size int64, mode uint32, hasMode, ok bool) {
 	size = -1
-	if meta, mok := w.pendingMeta(p); mok && meta != nil {
+	if meta, mok := w.pendingImageMeta(p); mok && meta != nil {
 		size = meta.Size
 		if meta.HasMode {
 			mode, hasMode = meta.Mode&0o7777, true

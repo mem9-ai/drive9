@@ -132,6 +132,14 @@ type CommitQueue struct {
 	// replaced across a crash, so persisting this proof would be unsafe.
 	landed      map[string]pathCommitLandmark
 	landedClock uint64
+	// commitClock/commitSeq record EVERY successful commit per path with no
+	// payload conditions — unlike the landed landmarks, which are a
+	// selective lineage/rebase cache (no snapshot ID, no checksum above
+	// 1MiB ⇒ no landmark). The rename flow's in-window detection and
+	// failure-record rekey fences read these: they must observe a completed
+	// upload regardless of size, entry provenance, or event-stream state.
+	commitClock uint64
+	commitSeq   map[string]uint64
 	// terminalFailures records the most recent terminal commit failure per
 	// path so a durability barrier that waited on the path can report EIO
 	// instead of success: after onCommitTerminalFailure the path looks
@@ -2517,6 +2525,7 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 		committedRev = committedRevisionForExpectedRevision(expectedRevision, committedRev)
 	}
 	cq.rememberLanded(entry.Path, committedRev, entry.Size, cq.checksumLandedPayload(entry), entry.SnapshotID, entry.liveAncestors...)
+	cq.recordCommitSeq(entry.Path)
 	// The image landed remotely: a previously recorded terminal failure for
 	// this path must not fail later durability barriers. Clear it before the
 	// entry leaves the queue (same visibility window as rememberLanded).
@@ -3216,6 +3225,47 @@ func (cq *CommitQueue) CancelQueuedForRename(path string) error {
 	return nil
 }
 
+// recordCommitSeq stamps path's commit sequence — every successful commit,
+// unconditionally (see commitSeq). Guarded by cq.mu.
+func (cq *CommitQueue) recordCommitSeq(path string) {
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	cq.commitClock++
+	if cq.commitSeq == nil {
+		cq.commitSeq = make(map[string]uint64)
+	}
+	cq.commitSeq[path] = cq.commitClock
+}
+
+// CommitSeq reports path's unconditional commit stamp (0 when none). Unlike
+// LandedSeq this counts every completed upload: recovered/re-driven entries
+// and payloads above the checksum limit included.
+func (cq *CommitQueue) CommitSeq(path string) uint64 {
+	if cq == nil {
+		return 0
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	return cq.commitSeq[path]
+}
+
+// CommitSeqsUnderPrefix snapshots every unconditional commit stamp under
+// prefix.
+func (cq *CommitQueue) CommitSeqsUnderPrefix(prefix string) map[string]uint64 {
+	if cq == nil {
+		return nil
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	out := map[string]uint64{}
+	for path, seq := range cq.commitSeq {
+		if strings.HasPrefix(path, prefix) {
+			out[path] = seq
+		}
+	}
+	return out
+}
+
 // LandedSeq reports the landed landmark stamp for path (0 when none): the
 // rename flow snapshots it before the transfer so the failure-record rekey
 // can decline to move a record onto a destination whose re-driven upload
@@ -3231,10 +3281,13 @@ func (cq *CommitQueue) LandedSeq(path string) uint64 {
 	return cq.landed[path].lastUsed
 }
 
-// LandedSnapshotsForRename snapshots the landed landmark stamps a rename's
-// failure-record rekeys fence against: the destination name itself (its
-// landmark key carries no trailing slash, so a prefix scan alone misses it)
-// plus every path under the destination prefix.
+// LandedSnapshotsForRename snapshots the commit stamps a rename's
+// failure-record rekeys fence against: the destination name itself (no
+// trailing slash, so a prefix scan alone misses it) plus every path under
+// the destination prefix. These are the UNCONDITIONAL commit stamps — a
+// re-driven upload that succeeds always advances them, whether or not the
+// selective landed landmark was ever recorded (no snapshot ID, payloads
+// above the checksum limit).
 func (cq *CommitQueue) LandedSnapshotsForRename(newPath, newPrefix string) map[string]uint64 {
 	if cq == nil {
 		return nil
@@ -3242,9 +3295,9 @@ func (cq *CommitQueue) LandedSnapshotsForRename(newPath, newPrefix string) map[s
 	cq.mu.Lock()
 	defer cq.mu.Unlock()
 	out := map[string]uint64{}
-	for path, landmark := range cq.landed {
+	for path, seq := range cq.commitSeq {
 		if path == newPath || strings.HasPrefix(path, newPrefix) {
-			out[path] = landmark.lastUsed
+			out[path] = seq
 		}
 	}
 	return out
@@ -3285,7 +3338,7 @@ func (cq *CommitQueue) RenameTerminalFailure(oldPath, newPath string, landedSnap
 	// EIO. A non-nil snapshot map arms the fence for the whole destination
 	// universe (a path absent from the map simply had no landing yet: stamp
 	// 0, and any landing since declines the move).
-	if landedSnaps != nil && cq.landed[newPath].lastUsed > landedSnaps[newPath] {
+	if landedSnaps != nil && cq.commitSeq[newPath] > landedSnaps[newPath] {
 		delete(cq.terminalFailures, oldPath)
 		return
 	}
@@ -3325,7 +3378,7 @@ func (cq *CommitQueue) RenameTerminalFailuresPrefix(oldPrefix, newPrefix string,
 			// upload that landed after the snapshot fulfilled that record's
 			// obligation — drop the record instead of re-installing it over
 			// the landing (absent from the map = no landing yet = stamp 0).
-			if landedSnaps != nil && cq.landed[target].lastUsed > landedSnaps[target] {
+			if landedSnaps != nil && cq.commitSeq[target] > landedSnaps[target] {
 				delete(cq.terminalFailures, path)
 				continue
 			}

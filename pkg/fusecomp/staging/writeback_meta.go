@@ -136,6 +136,12 @@ type WriteBackMeta struct {
 	// DataBound marks a record whose DataCRC/Size binding is authoritative
 	// (every put sets it); legacy records without it are unbound.
 	DataBound bool `json:"data_bound,omitempty"`
+	// WitnessOnly marks a shadowless conflict marker installed purely as a
+	// failure witness (a rename's standalone terminal record): it carries no
+	// payload, and its Size/Mode are deliberately NOT authoritative file
+	// metadata — the metadata overlays must not serve it as a staged image
+	// (that would overwrite a nonempty remote's size with zero).
+	WitnessOnly bool `json:"witness_only,omitempty"`
 	// LayerClean retains a remotely durable overlay for reads, not recovery.
 	// Every new staging publication resets it; legacy records remain dirty.
 	LayerClean bool `json:"layer_clean,omitempty"`
