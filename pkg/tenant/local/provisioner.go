@@ -40,18 +40,6 @@ const (
 	embeddingApp = "app"
 )
 
-// DefaultTokenSigningKeyHex and DefaultMasterKeyHex are the loopback-only local
-// provider's fallback keys, used only when DRIVE9_TOKEN_SIGNING_KEY /
-// DRIVE9_MASTER_KEY are unset (local mode refuses a non-loopback listen
-// address). They are built from a repeated pattern instead of a 64-hex literal
-// so secret scanners do not flag every commit that carries them; the runtime
-// bytes are unchanged. Production deployments must set the environment keys,
-// which are also the rotation path.
-var (
-	DefaultTokenSigningKeyHex = strings.Repeat("0123456789abcdef", 4)
-	DefaultMasterKeyHex       = strings.Repeat("fedcba9876543210", 4)
-)
-
 // Provisioner implements tenant.Provisioner for a single existing TiDB
 // instance. It is not a ClustersAPI backend and not a production provider.
 type Provisioner struct {

@@ -47,19 +47,9 @@ func MountVault(opts *VaultMountOptions) error {
 		return err
 	}
 
-	vfs := NewVaultFS(c, opts.DirTTL)
+	vfs := NewVaultFSWithOptions(c, opts.DirTTL, opts.AllowOther)
 
-	fuseOpts := &gofuse.MountOptions{
-		FsName:     "drive9-vault",
-		Name:       "drive9-vault",
-		Debug:      opts.Debug,
-		AllowOther: opts.AllowOther,
-		// Always read-only at the kernel level too (belt-and-braces with
-		// the in-process EROFS rejections).
-		Options: []string{"ro"},
-	}
-
-	server, err := gofuse.NewServer(vfs, opts.MountPoint, fuseOpts)
+	server, err := gofuse.NewServer(vfs, opts.MountPoint, newVaultMountOptions(opts))
 	if err != nil {
 		return fmt.Errorf("fuse mount vault: %w", err)
 	}
@@ -120,6 +110,50 @@ func MountVault(opts *VaultMountOptions) error {
 	fmt.Fprintf(os.Stderr, "drive9: vault mounted on %s (server: %s, secrets: %d)\n", opts.MountPoint, opts.Server, len(secrets))
 	server.Wait()
 	return nil
+}
+
+// newVaultMountOptions assembles the kernel mount options for a vault mount.
+//
+// A private mount is already restricted by the kernel to the mounting user, so
+// the mode bits VaultFS reports are what protect it; sharing is an explicit
+// --allow-other opt-in, and on Linux default_permissions is what makes the kernel
+// enforce 0400/0500 (0444/0555 when shared) once other users may traverse it.
+// Without it, allow_other leaves the decision to the filesystem's own checks and
+// every local user can read the plaintext secrets. Mirrors newGoFuseMountOptions
+// in pkg/fuse.
+func newVaultMountOptions(opts *VaultMountOptions) *gofuse.MountOptions {
+	return newVaultMountOptionsFor(runtime.GOOS, opts)
+}
+
+// newVaultMountOptionsFor is the platform-parameterised form, so both branches
+// are testable on any host.
+func newVaultMountOptionsFor(goos string, opts *VaultMountOptions) *gofuse.MountOptions {
+	fuseOpts := &gofuse.MountOptions{
+		FsName:     "drive9-vault",
+		Name:       "drive9-vault",
+		Debug:      opts.Debug,
+		AllowOther: opts.AllowOther,
+		// Always read-only at the kernel level too (belt-and-braces with
+		// the in-process EROFS rejections).
+		Options: []string{"ro"},
+	}
+	if goos == "linux" {
+		if opts.AllowOther {
+			fuseOpts.Options = append(fuseOpts.Options, "default_permissions")
+		}
+	}
+	if goos == "darwin" {
+		// macFUSE has no default_permissions switch. defer_permissions defers the
+		// check to the filesystem's own handlers (pkg/fuse passes it for every
+		// mount); VaultFS implements no per-user handler, so the protection for a
+		// private mount is the kernel restricting the mount to the mounting user,
+		// and sharing is the explicit --allow-other opt-in.
+		fuseOpts.Options = append(fuseOpts.Options, "defer_permissions", "local")
+	}
+	// Other platforms (e.g. FreeBSD) take neither branch, so an allow_other vault
+	// mount there keeps the pre-change exposure. That matches pkg/fuse house
+	// behavior; a platform that supports it should add its own enforcement flag.
+	return fuseOpts
 }
 
 // probeVaultMount validates opts, constructs the vault client, and runs the

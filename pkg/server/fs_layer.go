@@ -904,6 +904,21 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 		writeFSLayerStoreError(w, r, err)
 		return
 	}
+	// Every return below happens while the layer is "committing", a state with no
+	// exit in the API: a re-commit requires active/sealed, rollback requires
+	// active/sealed/conflicted, and chain deletion refuses it. The transition is
+	// therefore a single deferred guard on a context that survives client
+	// cancellation — a disconnect cancels r.Context() and would otherwise skip the
+	// update and strand the layer.
+	commitCtx := context.WithoutCancel(r.Context())
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		_ = store.SetFSLayerStateIf(commitCtx, layer.LayerID,
+			[]datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
+	}()
 	// Child: flatten overlay then diff vs live main (D18/D19).
 	// Root: keep V1 ordered log replay.
 	var (
@@ -920,12 +935,10 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 		entries, err = store.ListFSLayerEntryLog(r.Context(), layer.LayerID)
 	}
 	if err != nil {
-		_ = store.SetFSLayerStateIf(r.Context(), layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
 		writeFSLayerStoreError(w, r, err)
 		return
 	}
 	if conflicts := validateFSLayerCommitScope(layer, entries); len(conflicts) > 0 {
-		_ = store.SetFSLayerStateIf(r.Context(), layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusConflict)
 		_ = json.NewEncoder(w).Encode(fsLayerCommitResponse{
@@ -937,7 +950,6 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 	}
 	conflicts := preflightFSLayerCommit(r.Context(), b, entries, false)
 	if len(conflicts) > 0 {
-		_ = store.SetFSLayerStateIf(r.Context(), layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusConflict)
 		_ = json.NewEncoder(w).Encode(fsLayerCommitResponse{
@@ -950,22 +962,25 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 	// Entries can predate the write-time source check (or arrive from a client
 	// that wrote them before a scope was narrowed), so re-authorize every
 	// object reference before it is aliased into main.
+	// Many entries can alias one blob; resolve each reference once for the request.
+	decisions := &fsLayerStorageRefDecisions{}
 	for i := range entries {
-		if !s.authorizeFSLayerStorageRefSource(w, r, store, &entries[i]) {
-			_ = store.SetFSLayerStateIf(r.Context(), layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
+		entry := &entries[i]
+		if err := s.authorizeFSLayerStorageRefWith(r.Context(), store, ScopeFromContext(r.Context()), entry, decisions); err != nil {
+			s.writeFSLayerStorageRefError(w, r, entry, err)
+			// Every refusal — policy denial or lookup failure — leaves the layer in
+			// conflicted through the deferred guard above, so the API can act on it.
 			return
 		}
 	}
 	snapshots, err := snapshotFSLayerCommit(r.Context(), b, entries)
 	if err != nil {
-		_ = store.SetFSLayerStateIf(r.Context(), layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
 		logger.Error(r.Context(), "fs_layer_commit_snapshot_budget_exceeded", eventFields(r.Context(), "fs_layer_commit_snapshot_budget_exceeded", "layer_id", layer.LayerID, "error", err)...)
 		metricEvent(r.Context(), "fs_layer_commit", "result", "rejected")
 		errJSON(w, http.StatusRequestEntityTooLarge, err.Error())
 		return
 	}
 	if err := validateFSLayerCommitSnapshots(snapshots); err != nil {
-		_ = store.SetFSLayerStateIf(r.Context(), layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
 		logger.Error(r.Context(), "fs_layer_commit_validate_failed", eventFields(r.Context(), "fs_layer_commit_validate_failed", "layer_id", layer.LayerID, "error", err)...)
 		writeBackendError(w, r, err)
 		return
@@ -989,7 +1004,7 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 		}
 		markFSLayerEntryTouched(touchedPaths, &entries[i])
 	}
-	if err := store.SetFSLayerStateIf(r.Context(), layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateCommitted); err != nil {
+	if err := store.SetFSLayerStateIf(commitCtx, layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateCommitted); err != nil {
 		rollbackErr := rollbackFSLayerCommit(rollbackCtx, b, snapshots)
 		_ = store.SetFSLayerStateIf(rollbackCtx, layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
 		if rollbackErr != nil {
@@ -1001,6 +1016,7 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 		writeBackendError(w, r, err)
 		return
 	}
+	committed = true
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(fsLayerCommitResponse{
 		Status:  "committed",
@@ -1122,7 +1138,7 @@ func validateFSLayerServerStorageRef(layer *datastore.FSLayer, entry *datastore.
 	return fmt.Errorf("fs layer storage_ref is not a server-issued object reference")
 }
 
-// authorizeFSLayerStorageRefSource rejects a layer entry whose "blobs/<fileID>"
+// authorizeFSLayerStorageRefSource rejects a layer entry whose "blobs/<key>"
 // reference aliases a file the caller may not read.
 //
 // A blobs/ reference names a file entity, not a path, and the layer endpoints
@@ -1133,37 +1149,127 @@ func validateFSLayerServerStorageRef(layer *datastore.FSLayer, entry *datastore.
 // its dentry paths and the caller must be able to read at least one of them;
 // content reachable inside the scope is legitimately readable, and a reference
 // with no remaining dentry is refused rather than treated as absent.
+//
+// It is the HTTP wrapper around authorizeFSLayerStorageRef, which every
+// byte-reading path shares.
 func (s *Server) authorizeFSLayerStorageRefSource(w http.ResponseWriter, r *http.Request, store *datastore.Store, entry *datastore.FSLayerEntry) bool {
-	if entry == nil || store == nil {
+	err := s.authorizeFSLayerStorageRef(r.Context(), store, ScopeFromContext(r.Context()), entry)
+	if err == nil {
 		return true
 	}
-	scope := ScopeFromContext(r.Context())
-	if scope == nil || !scope.IsScoped {
-		return true
+	s.writeFSLayerStorageRefError(w, r, entry, err)
+	return false
+}
+
+// writeFSLayerStorageRefError answers a policy refusal with 403 and a lookup
+// failure with 500, logging each once. Callers that also own state transitions
+// must apply them regardless of which answer was written.
+func (s *Server) writeFSLayerStorageRefError(w http.ResponseWriter, r *http.Request, entry *datastore.FSLayerEntry, err error) {
+	var denied *fsLayerStorageRefDenied
+	if errors.As(err, &denied) {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), denied.event,
+			"layer_id", entry.LayerID, "path", entry.Path, "blob_key", denied.blobKey, "parent_tenant_id", denied.parentTenantID)...)
+		errJSON(w, http.StatusForbidden, denied.message)
+		return
+	}
+	logger.Error(r.Context(), "fs_layer_storage_ref_lookup_failed", eventFields(r.Context(), "fs_layer_storage_ref_lookup_failed",
+		"layer_id", entry.LayerID, "blob_key", strings.TrimPrefix(strings.TrimSpace(entry.StorageRef), "blobs/"), "error", err)...)
+	errJSON(w, http.StatusInternalServerError, "failed to authorize fs layer storage reference")
+}
+
+// fsLayerStorageRefDenied is an authorization refusal, as opposed to a lookup
+// failure; the HTTP wrapper answers 403 for it and 500 for anything else.
+type fsLayerStorageRefDenied struct {
+	event          string
+	message        string
+	blobKey        string
+	parentTenantID string
+}
+
+func (e *fsLayerStorageRefDenied) Error() string { return e.message }
+
+// blobDentryPathLimit bounds how many dentry paths one blob lookup returns; the
+// callers only need one authorized path, and a higher fan-out would mean the blob
+// is shared by an implausible number of names.
+const blobDentryPathLimit = 64
+
+// fsLayerStorageRefDecisions memoizes the resolution of one storage_ref within a
+// single request, so a layer with many entries sharing a blob costs one DB
+// fan-out instead of one per entry.
+type fsLayerStorageRefDecisions struct {
+	paths map[string][]string
+}
+
+func (d *fsLayerStorageRefDecisions) resolve(ctx context.Context, store *datastore.Store, ref string) ([]string, error) {
+	if d == nil {
+		return store.ResolveStorageRefDentryPaths(ctx, ref, blobDentryPathLimit)
+	}
+	if paths, ok := d.paths[ref]; ok {
+		return paths, nil
+	}
+	paths, err := store.ResolveStorageRefDentryPaths(ctx, ref, blobDentryPathLimit)
+	if err != nil {
+		return nil, err
+	}
+	if d.paths == nil {
+		d.paths = make(map[string][]string)
+	}
+	d.paths[ref] = paths
+	return paths, nil
+}
+
+// authorizeFSLayerStorageRef is the request-independent form of the storage_ref
+// source check. Every path that reads a layer entry's bytes routes through it —
+// entry upsert, object read, commit, and the grep overlay — so one predicate
+// decides the question instead of each endpoint re-deriving it.
+func (s *Server) authorizeFSLayerStorageRef(ctx context.Context, store *datastore.Store, scope *TenantScope, entry *datastore.FSLayerEntry) error {
+	return s.authorizeFSLayerStorageRefWith(ctx, store, scope, entry, nil)
+}
+
+func (s *Server) authorizeFSLayerStorageRefWith(ctx context.Context, store *datastore.Store, scope *TenantScope, entry *datastore.FSLayerEntry, decisions *fsLayerStorageRefDecisions) error {
+	if entry == nil || store == nil || scope == nil {
+		return nil
 	}
 	ref := strings.TrimSpace(entry.StorageRef)
 	if !strings.HasPrefix(ref, "blobs/") {
-		// layers/<layerID>/... is minted for, and only readable through, this
-		// layer, which the caller's layer access already covers.
-		return true
+		// layers/<layerID>/... is minted per layer and already validated against
+		// it, and an inline entry has no object at all.
+		return nil
 	}
-	fileID := strings.TrimPrefix(ref, "blobs/")
-	paths, err := store.ListFileDentryPathsByFileID(r.Context(), fileID, 64)
+	if !scope.IsScoped && !scope.IsFork {
+		// A live tenant owns its whole storage namespace, so any blob in it is
+		// this tenant's data.
+		return nil
+	}
+	blobKey := strings.TrimPrefix(ref, "blobs/")
+	paths, err := decisions.resolve(ctx, store, ref)
 	if err != nil {
-		logger.Error(r.Context(), "fs_layer_storage_ref_lookup_failed", eventFields(r.Context(), "fs_layer_storage_ref_lookup_failed",
-			"layer_id", entry.LayerID, "file_id", fileID, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, "failed to authorize fs layer storage reference")
-		return false
+		return err
+	}
+	if !scope.IsScoped {
+		// Fork owner key: existence in this tenant's metadata is the whole
+		// requirement, because a fork's namespace is otherwise indistinguishable
+		// from its parent's in object storage.
+		if len(paths) > 0 {
+			return nil
+		}
+		return &fsLayerStorageRefDenied{
+			event:          "fs_layer_storage_ref_out_of_namespace",
+			message:        "storage_ref does not belong to this tenant's filesystem",
+			blobKey:        blobKey,
+			parentTenantID: scope.ParentTenantID,
+		}
 	}
 	for _, p := range paths {
 		if scope.AuthorizeFS(FSOpRead, p) == nil {
-			return true
+			return nil
 		}
 	}
-	logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "fs_layer_storage_ref_out_of_scope",
-		"layer_id", entry.LayerID, "path", entry.Path, "file_id", fileID)...)
-	errJSON(w, http.StatusForbidden, "storage_ref is outside the token's read scope")
-	return false
+	return &fsLayerStorageRefDenied{
+		event:   "fs_layer_storage_ref_out_of_scope",
+		message: "storage_ref is outside the token's read scope",
+		blobKey: blobKey,
+	}
 }
 
 func canonicalFSLayerServerPath(rawPath, op, kind string) (string, error) {
