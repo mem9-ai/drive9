@@ -1035,6 +1035,11 @@ func mountWithConfig(cfg MountConfig) error {
 	// cutoff (files that used to become multipart become extent instead);
 	// the engine serves them from the next open. Legacy servers degrade
 	// the promotion to classic multipart silently.
+	// extentPlane is captured for the write-back plane: after a promotion
+	// lands, the still-open descriptor must MIGRATE onto it. Without that
+	// handoff the fd keeps its classic whole-image staging while the remote
+	// is extent, so every fsync re-uploads the whole file.
+	var extentPlane *extent.Handler
 	if wantExt["extent"] {
 		engineConf := extent.EngineConfig{
 			Client:     cl,
@@ -1075,7 +1080,7 @@ func mountWithConfig(cfg MountConfig) error {
 		}
 
 		engine := extent.NewEngine(engineConf)
-		built["extent"] = extent.New(extent.Options{
+		extentPlane = extent.New(extent.Options{
 			Engine: engine,
 			// Hybrid: creation stays on the classic plane (promotion at
 			// the inline cutoff) unless the path matches an explicit
@@ -1084,6 +1089,7 @@ func mountWithConfig(cfg MountConfig) error {
 			Patterns:  cfg.ExtentPaths,
 			Events:    bus,
 		})
+		built["extent"] = extentPlane
 		// The extent plane implements JuiceFS's close-to-open contract
 		// and nothing else: it has no local fsync barrier and no
 		// per-Write publish (docs/design/fuse-durability-policy.md,
@@ -1164,6 +1170,10 @@ func mountWithConfig(cfg MountConfig) error {
 			ExtentMinSize:   extentPromotionCutoff(len(cfg.ExtentPaths) > 0, cl),
 			ExtentPatterns:  cfg.ExtentPaths,
 			ExtentThreshold: int64(extentInlineThreshold(cl)),
+			// Hand a promoted descriptor to the engine: the open fd must
+			// follow the layout it just created, not keep re-uploading a
+			// whole image through this plane.
+			ExtentOpener: extentPlane,
 			// gvisor-compat takes precedence and always keeps commits
 			// detached (v1).
 			InterruptibleCommits:    cfg.LegacyInterruptibleMutations && !cfg.GVisorCompat,

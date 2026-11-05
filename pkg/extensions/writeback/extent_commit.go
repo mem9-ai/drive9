@@ -225,8 +225,11 @@ func zeroGrowBlock(oldSize, newSize int64) client.ExtentBlockWrite {
 // entryReaderAt exposes the entry's staged image as an io.ReaderAt:
 // materialized payload when it fits in memory, the shadow file otherwise
 // (multi-GiB spill files stream block-by-block through the same interface).
-// The returned release func must be called when the upload is done; it is a
-// no-op for payload-backed readers.
+//
+// The returned release func releases EVERYTHING the call acquired — the
+// streaming fd and the path lock — and must be called when the upload is
+// done, on success and on error alike. It is a no-op for payload-backed
+// readers.
 //
 // A spilled entry is addressed by its CONTENT generation. That is the token
 // the entry carries and the one every other consumer (validate, cleanup,
@@ -259,11 +262,18 @@ func (cq *CommitQueue) entryReaderAt(ctx context.Context, entry *CommitEntry) (i
 		}
 		return nil, func() {}, err
 	}
-	if size != entry.Size {
+	// OpenIfGeneration hands back an fd the caller owns; its own release only
+	// drops the path lock. One descriptor per spilled upload (and per retry)
+	// would leak until a finalizer ran, so both resources are released here.
+	cleanup := func() {
+		_ = fd.Close()
 		release()
+	}
+	if size != entry.Size {
+		cleanup()
 		return nil, func() {}, fmt.Errorf("shadow %s is %d bytes, entry expects %d", entry.Path, size, entry.Size)
 	}
-	return fd, release, nil
+	return fd, cleanup, nil
 }
 
 // zeroBaseOnly reports whether an entry is a zero-based image with no staged

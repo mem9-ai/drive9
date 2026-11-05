@@ -210,6 +210,68 @@ func vfsCtx(c fs.Caller) vfs.LogContext {
 	return vfs.NewLogContext(meta.NewContext(c.Pid, c.Uid, []uint32{c.Gid}))
 }
 
+// openExistingLocked opens an engine handle for a path ALREADY known to hold
+// extent layout. The caller holds the path lock.
+func (h *Handler) openExistingLocked(ctx context.Context, path string, flags uint32, c fs.Caller) (fs.Handle, *fs.Attr, syscall.Errno) {
+	ino, errno := h.opts.Engine.ResolvePath(ctx, path)
+	if errno != 0 {
+		return nil, nil, errno
+	}
+	_, fh, errno := h.opts.Engine.VFS.Open(vfsCtx(c), meta.Ino(ino), flags)
+	if errno != 0 {
+		return nil, nil, errno
+	}
+	handle := h.register(path, ino, fh, c)
+	// Creation attributes let the facade populate its namespace cache (a
+	// handle-only reply leaves the entry uncached).
+	attr := &fs.Attr{Kind: fs.KindFile, Nlink: 1}
+	if st, serr := h.opts.Engine.Bridge.StatLocal(ctx, path); serr == nil {
+		attr.Size = st.Size
+		if st.HasMode {
+			attr.Mode = st.Mode
+		}
+	}
+	return handle, attr, 0
+}
+
+// OpenExisting hands an engine handle to a caller that promoted the file to
+// extent layout AFTER its descriptor was opened on another plane — the write
+// back plane's promotion does exactly that, and without this an open
+// descriptor keeps re-uploading its whole image at every fsync because its
+// classic handle never learns the remote is now extent.
+//
+// Reports ok=false (with a nil error) when the path is not extent layout or
+// holds a different revision than the caller expects, so the caller keeps
+// its current plane rather than adopting someone else's object.
+// The returned handle has no kernel fd; it is driven through fs.Handle only.
+func (h *Handler) OpenExisting(ctx context.Context, path string, flags uint32, expectRevision int64, c fs.Caller) (fs.Handle, bool, error) {
+	if h == nil || h.opts.Engine == nil {
+		return nil, false, nil
+	}
+	defer h.lockPaths(path)()
+	st, err := h.opts.Engine.Bridge.StatLocal(ctx, path)
+	if err != nil {
+		if client.IsNotFound(err) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	if st.ContentLayout != client.ContentLayoutExtent {
+		return nil, false, nil
+	}
+	// The promotion must still describe the object at this name: a
+	// replacement landed since (a different revision) is a different file,
+	// and migrating onto it would silently adopt its bytes.
+	if expectRevision > 0 && st.Revision != expectRevision {
+		return nil, false, nil
+	}
+	handle, _, errno := h.openExistingLocked(ctx, path, flags, c)
+	if errno != 0 {
+		return nil, false, errno
+	}
+	return handle, true, nil
+}
+
 // Do claims extent files (and, in full mode, fresh creates); everything
 // else passes through.
 func (h *Handler) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error) {
@@ -306,23 +368,9 @@ func (h *Handler) tryClaimOpen(ctx context.Context, op *fs.Op) (fs.Result, error
 		if st.ContentLayout != client.ContentLayoutExtent {
 			return fs.Result{}, nil, false
 		}
-		ino, errno := h.opts.Engine.ResolvePath(ctx, op.Path)
-		if errno != 0 {
-			return fs.Result{}, errno, false
-		}
-		_, fh, errno := h.opts.Engine.VFS.Open(vfsCtx(op.Caller), meta.Ino(ino), op.Flags)
+		handle, attr, errno := h.openExistingLocked(ctx, op.Path, op.Flags, op.Caller)
 		if errno != 0 {
 			return fs.Result{}, errno, true
-		}
-		handle := h.register(op.Path, ino, fh, op.Caller)
-		// Creation attributes let the facade populate its namespace cache
-		// (a handle-only reply leaves the entry uncached).
-		attr := &fs.Attr{Kind: fs.KindFile, Nlink: 1}
-		if st2, serr := h.opts.Engine.Bridge.StatLocal(ctx, op.Path); serr == nil {
-			attr.Size = st2.Size
-			if st2.HasMode {
-				attr.Mode = st2.Mode
-			}
 		}
 		return fs.Result{Handle: handle, Attr: attr}, nil, true
 	}
