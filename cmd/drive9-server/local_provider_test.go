@@ -320,6 +320,52 @@ func TestLocalDevKeysAdoptAnExistingFileInsteadOfReplacing(t *testing.T) {
 	}
 }
 
+// An existing directory may be shared with other tooling (a 0755 config dir, or
+// 0775 under a umask of 002), so the loader must neither re-permission it nor
+// refuse it. The key file's own mode and ownership are the boundary.
+func TestLocalDevKeysLeaveExistingDirectoryPermissionsAlone(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mode bits are not meaningful on Windows")
+	}
+	base := t.TempDir()
+	shared := filepath.Join(base, "config")
+	if err := os.MkdirAll(shared, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(shared, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(EnvLocalDevKeyFile, filepath.Join(shared, "keys.json"))
+
+	if _, _, err := loadOrCreateLocalDevKeys(); err != nil {
+		t.Fatalf("a 0755 parent directory must be usable: %v", err)
+	}
+	info, err := os.Stat(shared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o755 {
+		t.Fatalf("parent directory mode = %04o, want 0755 unchanged", perm)
+	}
+
+	// A group-writable parent (umask 002 is common) is left as it is too; the
+	// file inside it is still 0600 and owned by us.
+	if err := os.Chmod(shared, 0o775); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(shared, 0o755) })
+	if _, _, err := loadOrCreateLocalDevKeys(); err != nil {
+		t.Fatalf("a 0775 parent directory must be usable: %v", err)
+	}
+	info, err = os.Stat(shared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o775 {
+		t.Fatalf("parent directory mode = %04o, want 0775 unchanged", perm)
+	}
+}
+
 // The temp-dir fallback path is guessable, so a local attacker can pre-create the
 // key directory as a symlink to an unrelated directory. The loader must refuse it
 // instead of following the link, and must not chmod what the link points at.

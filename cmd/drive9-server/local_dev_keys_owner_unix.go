@@ -38,11 +38,22 @@ func readLocalDevKeyFilePlatform(path string) ([]byte, error) {
 	return io.ReadAll(file)
 }
 
-// restrictLocalDevKeyDir keeps the key directory out of reach of other users.
+// restrictLocalDevKeyDir verifies the key directory's identity without changing
+// its permissions.
 //
-// The requirement is checked and applied on the opened directory, so a symlink
-// planted at the path is rejected outright (O_NOFOLLOW) instead of being
-// followed by the chmod.
+// The directory is opened with O_NOFOLLOW, so a symlink planted at the path is
+// rejected outright instead of being followed, and the checks run on the inode
+// that was opened. An existing directory is never re-permissioned:
+// DRIVE9_LOCAL_DEV_KEY_FILE may legitimately point inside a directory this
+// process does not own the layout of, and chmod-ing it to 0700 would break
+// everything else that traverses it.
+//
+// Directory mode is not the boundary here either. The key material is protected
+// by the file itself — created 0600, read through O_NOFOLLOW, and rejected when
+// it is owned by another uid or readable by group/other. A directory another user
+// can write to therefore lets them delete the key file (a denial of service) but
+// not read it or substitute one: any replacement they own fails the ownership
+// check.
 func restrictLocalDevKeyDir(dir string) error {
 	file, err := openLocalDevNoFollow(dir)
 	if err != nil {
@@ -58,12 +69,6 @@ func restrictLocalDevKeyDir(dir string) error {
 	}
 	if permErr := checkLocalDevKeyOwner(dir, info); permErr != nil {
 		return permErr
-	}
-	if info.Mode().Perm()&0o077 == 0 {
-		return nil
-	}
-	if err := file.Chmod(0o700); err != nil {
-		return fmt.Errorf("local dev key dir %s must not be accessible to other users: %w", dir, err)
 	}
 	return nil
 }
