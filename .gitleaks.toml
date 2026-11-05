@@ -1,8 +1,10 @@
 # gitleaks configuration — https://github.com/gitleaks/gitleaks
 #
 # Extends the built-in rule set and allowlists values that gitleaks reports but
-# that are demonstrably not credentials: the loopback-only local-dev placeholder
-# keys, a CLI test JWT fixture, and documentation placeholders.
+# that are demonstrably not credentials: a CLI test JWT fixture, documentation
+# placeholders, and the retired local-dev placeholder keys that remain in history.
+# The local provider no longer ships any key material — it generates a key pair
+# per installation (cmd/drive9-server/local_dev_keys.go).
 #
 # Every expression is anchored with ^...$ so it matches a complete detected
 # secret; a longer credential that merely contains a fixture value is never
@@ -23,8 +25,10 @@ description = "Non-secret placeholders and test fixtures"
 
 # Matched against the detected secret itself (gitleaks' default regexTarget).
 regexes = [
-    # pkg/tenant/local: fixed placeholder keys of the loopback-only local dev
-    # provider (DRIVE9_TENANT_PROVIDER=local); overridable by env, not credentials.
+    # pkg/tenant/local, historical commits only: the local provider used to ship
+    # these fixed placeholder keys, and this branch no longer contains them (it
+    # generates keys per installation, see cmd/drive9-server/local_dev_keys.go).
+    # The scan targets history, so the old commits still need the exemption.
     "^0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef$",
     "^fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210$",
     # cmd/drive9/cli/ctx_test.go: fake JWT used to assert masking/reveal.

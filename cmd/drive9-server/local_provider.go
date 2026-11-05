@@ -25,15 +25,16 @@ func resolveServerListenAddr(cliAddr, envAddr string, localProvider bool) string
 	return defaultListenAddr
 }
 
-func applyLocalProviderEnvDefaults(listenAddr string) {
+func applyLocalProviderEnvDefaults(listenAddr string) error {
 	listenAddr = strings.TrimSpace(listenAddr)
 	if listenAddr == "" {
 		listenAddr = "127.0.0.1:9009"
 	}
 	_ = os.Setenv("DRIVE9_LISTEN_ADDR", listenAddr)
 	setEnvIfEmpty("DRIVE9_ENCRYPT_TYPE", "local_aes")
-	setEnvIfEmpty("DRIVE9_MASTER_KEY", local.DefaultMasterKeyHex)
-	setEnvIfEmpty("DRIVE9_TOKEN_SIGNING_KEY", local.DefaultTokenSigningKeyHex)
+	if err := applyLocalProviderDevKeys(); err != nil {
+		return err
+	}
 	setEnvIfEmpty("DRIVE9_LEADER_DISABLED", "1")
 	setEnvIfEmpty("DRIVE9_PUBLIC_URL", "http://"+listenAddr)
 	setEnvIfEmpty("DRIVE9_DISABLE_AUTO_EMBEDDING", "true")
@@ -49,6 +50,32 @@ func applyLocalProviderEnvDefaults(listenAddr string) {
 		setEnvIfEmpty(local.EnvAdminDSN, dsn)
 		setEnvIfEmpty(local.EnvLegacyDSN, dsn)
 	}
+	return nil
+}
+
+// applyLocalProviderDevKeys fills the two key slots the local provider needs.
+//
+// Environment values win; anything missing comes from a per-installation key
+// file that is generated on first start. Nothing is baked into the binary, so a
+// copied source tree holds no usable credential, and the file is the single
+// place to rotate.
+func applyLocalProviderDevKeys() error {
+	masterSet := strings.TrimSpace(os.Getenv("DRIVE9_MASTER_KEY")) != ""
+	tokenSet := strings.TrimSpace(os.Getenv("DRIVE9_TOKEN_SIGNING_KEY")) != ""
+	if masterSet && tokenSet {
+		return nil
+	}
+	keys, path, err := loadOrCreateLocalDevKeys()
+	if err != nil {
+		return err
+	}
+	setEnvIfEmpty("DRIVE9_MASTER_KEY", keys.MasterKeyHex)
+	setEnvIfEmpty("DRIVE9_TOKEN_SIGNING_KEY", keys.TokenSigningKeyHex)
+	_ = os.Setenv(envLocalDevKeysInUse, "1")
+	fmt.Fprintf(os.Stderr,
+		"drive9: local provider is using generated development keys from %s; delete that file (or set DRIVE9_MASTER_KEY and DRIVE9_TOKEN_SIGNING_KEY) to rotate\n",
+		path)
+	return nil
 }
 
 func localAdminDSN() string {
@@ -74,10 +101,8 @@ func rejectLocalProviderNonLoopbackDefaults(listenAddr string) error {
 	if localListenIsLoopback(addr) {
 		return nil
 	}
-	tok := strings.TrimSpace(os.Getenv("DRIVE9_TOKEN_SIGNING_KEY"))
-	master := strings.TrimSpace(os.Getenv("DRIVE9_MASTER_KEY"))
-	if tok == local.DefaultTokenSigningKeyHex || master == local.DefaultMasterKeyHex {
-		return fmt.Errorf("DRIVE9_TENANT_PROVIDER=local refuses non-loopback listen %q with default token/master keys; set DRIVE9_TOKEN_SIGNING_KEY and DRIVE9_MASTER_KEY or bind loopback", addr)
+	if os.Getenv(envLocalDevKeysInUse) == "1" {
+		return fmt.Errorf("DRIVE9_TENANT_PROVIDER=local refuses non-loopback listen %q while it is using generated development keys; set DRIVE9_TOKEN_SIGNING_KEY and DRIVE9_MASTER_KEY or bind loopback", addr)
 	}
 	return nil
 }
