@@ -1690,7 +1690,9 @@ func stagedGenOf(name string) int64 {
 // always carries a superset of every older one's bytes.
 func (b *Bridge) StagePendingLocal(ino meta.Ino) error {
 	if b.cfg.StagingDir == "" {
-		return nil // no barrier armed: the mount degrades to strict fsync
+		// Nothing can be made durable locally. Reporting success here would
+		// acknowledge an fsync whose bytes exist only in this process.
+		return fmt.Errorf("stage barrier: no staging directory configured, fsync cannot be made durable")
 	}
 	unlock := b.lockCommit(ino)
 	defer unlock()
@@ -1833,13 +1835,20 @@ func (b *Bridge) StagePendingLocal(ino meta.Ino) error {
 		return err
 	}
 	b.manifestMu.Unlock()
-	clean = false
-	// Supersede: pending is cumulative, so older generations of this file
-	// are redundant once this one is durable.
+	// Supersede BEFORE the budget check: this file's older generations are a
+	// strict subset of the new one, so retiring them is free and may bring
+	// the tree back under the allowance.
 	b.removeStagedGensLocked(ino, stagedGenOf(filepath.Base(dir)))
 	// The staging tree is not JuiceFS-accounted, so bound it here against the
-	// engine's own cache allowance.
-	return b.enforceStagingBudgetLocked(dir)
+	// engine's own cache allowance. A refusal must leave NOTHING behind: the
+	// record this call just wrote is removed so the overshoot is not retained
+	// (the caller learns the fsync did not achieve durability).
+	if err := b.enforceStagingBudgetLocked(dir); err != nil {
+		_ = os.RemoveAll(dir)
+		return err
+	}
+	clean = false
+	return nil
 }
 
 // ReplayStagedLocal re-commits every staged interactive barrier that never
@@ -2361,17 +2370,20 @@ func (b *Bridge) removeStagedGensLocked(ino meta.Ino, keepGen int64) {
 	}
 }
 
-// enforceStagingBudgetLocked bounds the durable staging tree by REMOVING the
-// oldest generations, never by exceeding the budget. The tree lives inside the
-// engine's own cache directory, so it must respect the same allowance the
-// user configured for that directory: without this, repeated interactive
-// fsyncs on different files retained bytes with no accounting at all, and the
-// JuiceFS raw/rawstaging accounting does not cover these files.
+// enforceStagingBudgetLocked bounds the durable staging tree by REFUSING the
+// publish that would exceed it.
 //
-// keepDir is the generation this call just wrote — it is never evicted.
-// Returns an error when that single generation alone exceeds the budget: an
-// fsync that cannot be honoured within the allowance must fail rather than
-// silently overshoot it.
+// It deliberately does NOT evict other files' generations. Every record in
+// this tree is an fsync that already returned success to its caller: deleting
+// one to make room for a later write would revoke an acknowledged durability
+// guarantee, and a crash before that file's flush would lose data the caller
+// was told was safe. Budget pressure therefore fails the NEW request instead —
+// the caller can surface an error, which is recoverable; silently dropping an
+// earlier acknowledgement is not.
+//
+// The supersede pass (removeStagedGensLocked) already retires THIS file's own
+// older generations, which is safe because they are a strict subset of the
+// newest one.
 func (b *Bridge) enforceStagingBudgetLocked(keepDir string) error {
 	if b.cfg.StagingBudget <= 0 {
 		return nil
@@ -2380,45 +2392,19 @@ func (b *Bridge) enforceStagingBudgetLocked(keepDir string) error {
 	if err != nil {
 		return nil // nothing readable to bound
 	}
-	type gen struct {
-		name string
-		size int64
-		gen  int64
-	}
-	var gens []gen
 	var total int64
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
 		}
-		dir := filepath.Join(b.cfg.StagingDir, e.Name())
-		var size int64
-		files, derr := os.ReadDir(dir)
+		files, derr := os.ReadDir(filepath.Join(b.cfg.StagingDir, e.Name()))
 		if derr != nil {
 			continue
 		}
 		for _, f := range files {
 			if info, ierr := f.Info(); ierr == nil {
-				size += info.Size()
+				total += info.Size()
 			}
-		}
-		gens = append(gens, gen{name: e.Name(), size: size, gen: stagedGenOf(e.Name())})
-		total += size
-	}
-	if total <= b.cfg.StagingBudget {
-		return nil
-	}
-	// Oldest first, and never the generation being published.
-	sort.Slice(gens, func(i, j int) bool { return gens[i].gen < gens[j].gen })
-	for _, g := range gens {
-		if total <= b.cfg.StagingBudget {
-			break
-		}
-		if g.name == keepDir || g.name == filepath.Base(keepDir) {
-			continue
-		}
-		if rerr := os.RemoveAll(filepath.Join(b.cfg.StagingDir, g.name)); rerr == nil {
-			total -= g.size
 		}
 	}
 	if total > b.cfg.StagingBudget {
@@ -2753,6 +2739,16 @@ func (b *Bridge) HasPending(ino meta.Ino) bool {
 	defer b.mu.Unlock()
 	return len(b.pending[ino]) > 0
 }
+
+// HasStagingDir reports whether interactive fsync has a durable local place
+// to put its barrier. Without one, deferring a commit would report success
+// for bytes that exist only in memory.
+func (b *Bridge) HasStagingDir() bool { return b.cfg.StagingDir != "" }
+
+// DeferredCommits reports whether interactive durability is armed — i.e.
+// whether a successful fsync may defer its remote commit onto a local
+// barrier. False means fsync must publish remotely.
+func (b *Bridge) DeferredCommits() bool { return b.deferred.Load() }
 
 // EnableDeferredCommits arms interactive durability: writer flushes stage
 // slices locally (reads overlay them) and the remote commit defers to the

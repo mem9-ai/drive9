@@ -5939,10 +5939,11 @@ func TestEmptyStrictSyncRefusedBeforeCreate(t *testing.T) {
 }
 
 // The durable staging tree sits inside the engine's cache directory but
-// outside JuiceFS's raw/rawstaging accounting, so it must be charged to the
-// configured allowance: an interactive fsync may not retain bytes the operator
-// never budgeted for.
-func TestStagingTreeIsBoundedByTheCacheAllowance(t *testing.T) {
+// outside JuiceFS's raw/rawstaging accounting, so it must be bounded by the
+// configured allowance. Budget pressure must FAIL the new fsync — never evict
+// another file's record, because every record in the tree is an fsync that
+// already returned success.
+func TestStagingBudgetRefusesRatherThanEvictingAcknowledgedBarriers(t *testing.T) {
 	const budget = 4 << 10
 	f := newFakeV2(t)
 	f.setDir("/d", true)
@@ -5951,9 +5952,7 @@ func TestStagingTreeIsBoundedByTheCacheAllowance(t *testing.T) {
 		CacheDir: engineCacheDir(t), CacheSize: budget, CacheSizeConfigured: true,
 	})
 	br := eng.Bridge
-	// Four separate files, each staging a full block: together they exceed
-	// the allowance, so the oldest generations must be evicted.
-	for i := 0; i < 4; i++ {
+	stageFile := func(i int) error {
 		ino := meta.Ino(300 + i)
 		path := fmt.Sprintf("/d/s%d.bin", i)
 		f.seedExtent(t, path, "")
@@ -5965,40 +5964,63 @@ func TestStagingTreeIsBoundedByTheCacheAllowance(t *testing.T) {
 		sum := sha256Hex(data)
 		br.StageBlockForTest(sum, data)
 		br.AddPendingForTest(ino, 0, 0, sum, int64(len(data)), int64(len(data)))
-		if err := br.StagePendingLocal(ino); err != nil {
-			t.Fatalf("stage %d: %v", i, err)
-		}
+		return br.StagePendingLocal(ino)
 	}
-	var total int64
+
+	// The first barrier fits and is ACKNOWLEDGED.
+	if err := stageFile(0); err != nil {
+		t.Fatalf("first fsync must succeed: %v", err)
+	}
 	entries, err := os.ReadDir(br.cfg.StagingDir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, e := range entries {
-		dir := filepath.Join(br.cfg.StagingDir, e.Name())
-		files, derr := os.ReadDir(dir)
-		if derr != nil {
-			continue
-		}
-		for _, fl := range files {
-			if info, ierr := fl.Info(); ierr == nil {
-				total += info.Size()
-			}
-		}
+	if len(entries) != 1 {
+		t.Fatalf("barriers after the first fsync = %d, want 1", len(entries))
 	}
-	if total > budget {
-		t.Fatalf("staging tree retained %d bytes for a %d-byte allowance", total, budget)
+	firstDir := entries[0].Name()
+
+	// The second would exceed the allowance: it must be REFUSED, and the
+	// first file's acknowledged record must survive untouched.
+	if err := stageFile(1); err == nil {
+		t.Fatal("a fsync that would exceed the staging allowance must fail, not silently evict")
+	}
+	entries, err = os.ReadDir(br.cfg.StagingDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != firstDir {
+		t.Fatalf("the acknowledged barrier was disturbed: entries=%v want [%s]", entries, firstDir)
 	}
 }
 
 // CacheSize == 0 is an explicit memory-only choice: no durable staging tree
-// may be armed behind the operator's back.
+// may be armed behind the operator's back — and, crucially, fsync must still
+// keep its promise. With no barrier available the mount stays STRICT, so an
+// interactive sync publishes remotely instead of returning success for bytes
+// that exist only in memory.
 func TestExplicitZeroCacheSizeDisablesStaging(t *testing.T) {
+	f := newFakeV2(t)
+	f.setDir("/d", true)
 	eng := NewEngine(EngineConfig{
-		Client: client.New("http://127.0.0.1:1", ""), RemoteRoot: "/",
+		Client: client.New(f.URL, ""), RemoteRoot: "/",
 		CacheDir: engineCacheDir(t), CacheSize: 0, CacheSizeConfigured: true,
 	})
 	if eng.Bridge.StagingDirForTest() != "" {
 		t.Fatalf("staging dir = %q, want none for an explicit CacheSize=0", eng.Bridge.StagingDirForTest())
+	}
+	// Interactive mode, but with no barrier to defer onto: fsync must land
+	// remotely rather than acknowledge memory-only data.
+	h := New(Options{Engine: eng, Threshold: 0, SyncMode: "interactive"})
+	res, _, _ := dispatchCreate(context.Background(), h, "/d/z.bin", syscall.O_RDWR|syscall.O_CREAT)
+	eh := res.Handle.(*engineHandle)
+	if err := eh.Write(context.Background(), 0, []byte("NOCACHE")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh.Sync(context.Background()); err != nil {
+		t.Fatalf("fsync must still be durable without a disk cache: %v", err)
+	}
+	if got := f.contentOf("/d/z.bin"); got != "NOCACHE" {
+		t.Fatalf("content after fsync = %q, want NOCACHE published remotely (not memory-only)", got)
 	}
 }

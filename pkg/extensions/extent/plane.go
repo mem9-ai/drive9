@@ -66,9 +66,14 @@ type Handler struct {
 // New builds the engine-plane handler.
 func New(opts Options) *Handler {
 	h := &Handler{opts: opts, handles: make(map[string][]*engineHandle)}
-	if opts.SyncMode == "interactive" && opts.Engine != nil {
+	if opts.SyncMode == "interactive" && opts.Engine != nil && opts.Engine.Bridge.HasStagingDir() {
 		// Interactive durability: fsync is a local barrier; commits defer
 		// to the flush/close boundary (or the next mount's replay).
+		//
+		// The barrier must actually EXIST for this to be a promise. With no
+		// staging directory (an explicit --extent-cache-size-mb=0 mount)
+		// deferring would make Sync a no-op that reports success while the
+		// bytes live only in memory, so those mounts keep strict fsync.
 		opts.Engine.Bridge.EnableDeferredCommits()
 	}
 	if opts.Events != nil {
@@ -724,11 +729,16 @@ func (e *engineHandle) Sync(ctx context.Context) error {
 	// whose state the bridge preserved: FlushFile below retries it, and
 	// success resolves the fsync. (With nothing pending the errno above
 	// already returned.)
-	if errno == 0 && e.plane.opts.SyncMode == "interactive" {
+	if errno == 0 && e.plane.opts.Engine.Bridge.DeferredCommits() {
 		// fsync is a local durability barrier on RTT-bound mounts, exactly
 		// like the classic plane's staging ledger: spill the pending blocks
 		// durably and return; the remote commit lands at the flush/close
 		// boundary or the next mount's replay of the staged record.
+		//
+		// Gated on deferred being ARMED, not on the configured sync mode: a
+		// mount with no staging directory never arms it, and must fall
+		// through to a real remote publication instead of acknowledging
+		// memory-only bytes.
 		return e.plane.opts.Engine.Bridge.StagePendingLocal(e.ino)
 	}
 	if err := e.plane.opts.Engine.FlushFile(ctx, uint64(e.ino)); err != nil {
