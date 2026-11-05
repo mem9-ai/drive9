@@ -2,6 +2,9 @@ package staging
 
 import (
 	"bytes"
+	"errors"
+	"io"
+	"os"
 	"testing"
 )
 
@@ -212,13 +215,20 @@ func TestRotationCopyPreservesRecoveredContent(t *testing.T) {
 	s1.Close()
 
 	// Reopen: the shadow is recovered from disk — no coverage tracking.
+	// A partial in-process write FIRST creates the distinguishing state
+	// (non-empty coverage that provably does NOT describe the whole
+	// image); the rotation under that partial coverage is the case the
+	// coverage-map implementation corrupted.
 	s2, err := NewShadowStore(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s2.Close()
-	gen := s2.Pin("/f")
 	if _, err := s2.WriteAt("/f", 0, []byte("r"), 1); err != nil {
+		t.Fatal(err)
+	}
+	gen := s2.Pin("/f")
+	if _, err := s2.WriteAt("/f", 9, []byte("i"), 1); err != nil {
 		t.Fatal(err)
 	}
 	s2.Unpin(gen)
@@ -226,8 +236,8 @@ func TestRotationCopyPreservesRecoveredContent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(data) != "rECOVERED-IMAGE" {
-		t.Fatalf("rotated image = %q, want rECOVERED-IMAGE (recovered regions preserved)", data)
+	if string(data) != "rECOVEREDiIMAGE" {
+		t.Fatalf("rotated image = %q, want rECOVEREDiIMAGE (recovered regions preserved under partial coverage)", data)
 	}
 }
 
@@ -292,4 +302,40 @@ func TestRotationSparseGuardUsesRealAllocation(t *testing.T) {
 		t.Fatalf("sparse rotation rejected: %v", err)
 	}
 	s.Unpin(gen)
+}
+
+// TestPreadFullRejectsShortRead pins the extent copy's short-read contract:
+// a pread that returns fewer bytes than requested (legal per pread(2)) must
+// be retried to completion, and an EOF inside a range that was reported as
+// data is an error — never a silent zero-fill of the remainder. Drives the
+// helper against a source that truncates mid-buffer via a pipe-backed fd.
+func TestPreadFullRejectsShortRead(t *testing.T) {
+	// A regular file that ends mid-request is the deterministic stand-in
+	// for a short pread: the first call returns only the available bytes.
+	src, err := os.CreateTemp(t.TempDir(), "short")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer src.Close()
+	if _, err := src.Write([]byte("12345")); err != nil {
+		t.Fatal(err)
+	}
+
+	buf := make([]byte, 8)
+	err = preadFull(int(src.Fd()), buf, 0)
+	if err == nil {
+		t.Fatalf("short source silently zero-filled: %q", buf)
+	}
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("err = %v, want ErrUnexpectedEOF", err)
+	}
+
+	// A fully available buffer fills exactly.
+	full := make([]byte, 5)
+	if err := preadFull(int(src.Fd()), full, 0); err != nil {
+		t.Fatal(err)
+	}
+	if string(full) != "12345" {
+		t.Fatalf("full read = %q", full)
+	}
 }

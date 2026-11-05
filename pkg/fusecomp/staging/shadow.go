@@ -1891,7 +1891,7 @@ func copyFileExtentsFD(out *os.File, fd int, size int64) error {
 				end = hole
 			}
 			chunk := buf[:end-at]
-			if _, err := unix.Pread(fd, chunk, at); err != nil {
+			if err := preadFull(fd, chunk, at); err != nil {
 				return err
 			}
 			if _, err := out.WriteAt(chunk, at); err != nil {
@@ -1908,6 +1908,31 @@ func extentSeekFallback(err error) error {
 		return errExtentSeekUnsupported
 	}
 	return err
+}
+
+// preadFull fills dst completely from fd at off. pread(2) may legitimately
+// return fewer bytes than requested with a nil error — the raw syscall
+// wrapper forwards that — so a short read is retried until the buffer is
+// full; EOF inside a range the caller knows holds data is a torn image, an
+// error, never a silent zero-fill of the remainder.
+func preadFull(fd int, dst []byte, off int64) error {
+	for len(dst) > 0 {
+		n, err := unix.Pread(fd, dst, off)
+		if n > 0 {
+			dst = dst[n:]
+			off += int64(n)
+		}
+		if err != nil {
+			if err == syscall.EINTR {
+				continue
+			}
+			return err
+		}
+		if n == 0 {
+			return io.ErrUnexpectedEOF
+		}
+	}
+	return nil
 }
 
 // copyFileDense is the whole-image fallback for filesystems without extent
