@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	iofs "io/fs"
 	"net/http"
 	"os"
 	"path"
@@ -1721,6 +1722,18 @@ func (b *Bridge) StagePendingLocal(ino meta.Ino) error {
 	} else if !client.IsNotFound(err) {
 		return fmt.Errorf("stage barrier for %s: identity unavailable: %w", path, err)
 	}
+	// Admit BEFORE writing a single byte: a rejected fsync must leave the
+	// tree exactly as it found it, and checking afterwards could fill the
+	// disk before the check ran (and force deleting the record just made).
+	var required int64
+	b.mu.Lock()
+	for _, p := range pending {
+		required += p.size
+	}
+	b.mu.Unlock()
+	if err := b.admitStaging(required); err != nil {
+		return fmt.Errorf("stage barrier for %s: %w", path, err)
+	}
 	dir := filepath.Join(b.cfg.StagingDir, fmt.Sprintf("%d-%d", uint64(ino), time.Now().UnixNano()))
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
@@ -1728,7 +1741,7 @@ func (b *Bridge) StagePendingLocal(ino meta.Ino) error {
 	clean := true
 	defer func() {
 		if clean {
-			_ = os.RemoveAll(dir)
+			b.removeStagedDir(dir)
 		}
 	}()
 	b.mu.Lock()
@@ -1748,7 +1761,7 @@ func (b *Bridge) StagePendingLocal(ino meta.Ino) error {
 			}
 		}
 		name := fmt.Sprintf("%06d-%s", i, p.checksum)
-		if err := writeFileSynced(filepath.Join(dir, name), data); err != nil {
+		if err := b.writeStagedFile(filepath.Join(dir, name), data); err != nil {
 			return err
 		}
 		m.Blocks = append(m.Blocks, struct {
@@ -1830,23 +1843,16 @@ func (b *Bridge) StagePendingLocal(ino meta.Ino) error {
 		b.manifestMu.Unlock()
 		return merr
 	}
-	if err := writeFileSynced(filepath.Join(dir, "manifest.json"), raw); err != nil {
+	if err := b.writeStagedFile(filepath.Join(dir, "manifest.json"), raw); err != nil {
 		b.manifestMu.Unlock()
 		return err
 	}
 	b.manifestMu.Unlock()
-	// Supersede BEFORE the budget check: this file's older generations are a
-	// strict subset of the new one, so retiring them is free and may bring
-	// the tree back under the allowance.
+	// Supersede this file's older generations: they are a strict subset of the
+	// new record, so retiring them frees budget without losing anything. (The
+	// budget was already admitted BEFORE these bytes were written, so this is
+	// only about keeping the tree small, not about passing the check.)
 	b.removeStagedGensLocked(ino, stagedGenOf(filepath.Base(dir)))
-	// The staging tree is not JuiceFS-accounted, so bound it here against the
-	// engine's own cache allowance. A refusal must leave NOTHING behind: the
-	// record this call just wrote is removed so the overshoot is not retained
-	// (the caller learns the fsync did not achieve durability).
-	if err := b.enforceStagingBudgetLocked(dir); err != nil {
-		_ = os.RemoveAll(dir)
-		return err
-	}
 	clean = false
 	return nil
 }
@@ -1960,7 +1966,7 @@ func (b *Bridge) ReplayStagedLocal(ctx context.Context) {
 		}
 		unlock()
 		if err == nil {
-			_ = os.RemoveAll(dir)
+			b.removeStagedDir(dir)
 		}
 		// A failed or skipped replay leaves the record for the next
 		// mount; the staged bytes are also live in this bridge's
@@ -1982,7 +1988,7 @@ func (b *Bridge) clearStagedLocal(ino meta.Ino) {
 	prefix := fmt.Sprintf("%d-", uint64(ino))
 	for _, e := range entries {
 		if strings.HasPrefix(e.Name(), prefix) {
-			_ = os.RemoveAll(filepath.Join(b.cfg.StagingDir, e.Name()))
+			b.removeStagedDir(filepath.Join(b.cfg.StagingDir, e.Name()))
 		}
 	}
 }
@@ -2365,52 +2371,89 @@ func (b *Bridge) removeStagedGensLocked(ino meta.Ino, keepGen int64) {
 			continue
 		}
 		if gen := stagedGenOf(e.Name()); gen < keepGen {
-			_ = os.RemoveAll(filepath.Join(b.cfg.StagingDir, e.Name()))
+			b.removeStagedDir(filepath.Join(b.cfg.StagingDir, e.Name()))
 		}
 	}
 }
 
-// enforceStagingBudgetLocked bounds the durable staging tree by REFUSING the
-// publish that would exceed it.
-//
-// It deliberately does NOT evict other files' generations. Every record in
-// this tree is an fsync that already returned success to its caller: deleting
-// one to make room for a later write would revoke an acknowledged durability
-// guarantee, and a crash before that file's flush would lose data the caller
-// was told was safe. Budget pressure therefore fails the NEW request instead —
-// the caller can surface an error, which is recoverable; silently dropping an
-// earlier acknowledgement is not.
-//
-// The supersede pass (removeStagedGensLocked) already retires THIS file's own
-// older generations, which is safe because they are a strict subset of the
-// newest one.
-func (b *Bridge) enforceStagingBudgetLocked(keepDir string) error {
-	if b.cfg.StagingBudget <= 0 {
-		return nil
+// seedStagingUsage initializes the staging byte counter from whatever a
+// previous mount left on disk. Called once at construction; every later delta
+// is tracked exactly at its own add/remove site.
+func (b *Bridge) seedStagingUsage() {
+	if b.cfg.StagingDir == "" {
+		return
 	}
-	entries, err := os.ReadDir(b.cfg.StagingDir)
-	if err != nil {
-		return nil // nothing readable to bound
-	}
+	b.stagingBytes.Store(dirUsageBytes(b.cfg.StagingDir))
+}
+
+// dirUsageBytes sums the sizes of the regular files under dir (0 when the
+// directory is unreadable).
+func dirUsageBytes(dir string) int64 {
 	var total int64
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
+	_ = filepath.WalkDir(dir, func(_ string, d iofs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
 		}
-		files, derr := os.ReadDir(filepath.Join(b.cfg.StagingDir, e.Name()))
-		if derr != nil {
-			continue
+		if info, ierr := d.Info(); ierr == nil {
+			total += info.Size()
 		}
-		for _, f := range files {
-			if info, ierr := f.Info(); ierr == nil {
-				total += info.Size()
+		return nil
+	})
+	return total
+}
+
+// admitStaging decides whether required more bytes may be written, BEFORE any
+// of them are. Returns syscall.ENOSPC when the staging budget or the
+// free-space floor would be violated.
+//
+// The order matters: a rejected fsync must leave the tree exactly as it
+// found it. Writing first and checking afterwards (the previous shape) could
+// fill the disk before the check ran, and it also had to delete a record it
+// had just created. (Both mirror the classic plane's ShadowStore quota:
+// checkByteQuota + checkFreeRatio.)
+func (b *Bridge) admitStaging(required int64) error {
+	if b.cfg.StagingBudget > 0 && required > 0 {
+		if cur := b.stagingBytes.Load(); required > b.cfg.StagingBudget-cur {
+			return fmt.Errorf("staging quota rejected: retained=%d required=%d budget=%d: %w",
+				cur, required, b.cfg.StagingBudget, syscall.ENOSPC)
+		}
+	}
+	if b.cfg.FreeSpaceRatio > 0 {
+		var stat syscall.Statfs_t
+		if err := syscall.Statfs(b.cfg.StagingDir, &stat); err == nil {
+			totalBytes := int64(stat.Blocks) * int64(stat.Bsize)
+			freeBytes := int64(stat.Bavail) * int64(stat.Bsize)
+			if totalBytes > 0 {
+				ratioAfter := float64(freeBytes-required) / float64(totalBytes)
+				if ratioAfter < float64(b.cfg.FreeSpaceRatio) {
+					return fmt.Errorf("staging free-space floor: free_bytes=%d required=%d ratio=%.4f floor=%.4f: %w",
+						freeBytes, required, ratioAfter, b.cfg.FreeSpaceRatio, syscall.ENOSPC)
+				}
 			}
 		}
-	}
-	if total > b.cfg.StagingBudget {
-		return fmt.Errorf("staging budget exceeded: %d bytes retained for a %d-byte allowance", total, b.cfg.StagingBudget)
+		// Statfs failure allows the write: the quota check above still
+		// applies, and refusing on an unreadable statfs would break mounts
+		// on filesystems this cannot query.
 	}
 	return nil
+}
+
+// writeStagedFile writes one staging file and charges it to the counter.
+func (b *Bridge) writeStagedFile(path string, data []byte) error {
+	if err := writeFileSynced(path, data); err != nil {
+		return err
+	}
+	b.stagingBytes.Add(int64(len(data)))
+	return nil
+}
+
+// removeStagedDir removes a generation directory and credits its bytes back.
+func (b *Bridge) removeStagedDir(dir string) {
+	size := dirUsageBytes(dir)
+	if err := os.RemoveAll(dir); err != nil {
+		return
+	}
+	b.stagingBytes.Add(-size)
 }
 
 // lockCommit serializes a file's commit lifecycle (snapshot -> remote

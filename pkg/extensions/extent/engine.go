@@ -74,6 +74,28 @@ type Engine struct {
 	Bridge *Bridge
 	Store  chunk.ChunkStore
 	VFS    *vfs.VFS
+	// juiceCacheSize is the chunk store's share of the cache allowance (the
+	// operator's total minus the staging reserve).
+	juiceCacheSize int64
+}
+
+// stagingReserveBytes is the share of the plane's allowance reserved for the
+// durable interactive-fsync staging tree: a quarter of the total, capped so a
+// large cache is not mostly reserve. The remainder stays with JuiceFS's own
+// chunk cache, and the two always sum to the operator's number.
+func stagingReserveBytes(total int64) int64 {
+	const cap = 256 << 20
+	if total <= 0 {
+		return 0
+	}
+	reserve := total / 4
+	if reserve > cap {
+		reserve = cap
+	}
+	if reserve < 1 {
+		reserve = 1
+	}
+	return reserve
 }
 
 // NewEngine builds a ready-to-use engine.
@@ -94,13 +116,32 @@ func NewEngine(cfg EngineConfig) *Engine {
 	// (reads bypass the cache, writeback is off), and arming a durable
 	// on-disk staging tree would retain exactly what the operator asked not
 	// to retain.
+	//
+	// The operator's number is ONE allowance for the whole plane, so it is
+	// SPLIT here rather than handed out twice: JuiceFS's CacheSize gets the
+	// remainder and this staging tree gets the reserve, so the two sum to the
+	// configured total by construction. (Handing both the same N — the
+	// previous shape — let the plane retain up to 2N.)
+	//
+	// The split has to be static: JuiceFS's used-byte count is not exposed
+	// (cacheStore.used is private, and scanCached only walks "raw"), so a
+	// runtime division would be guessing. A fixed reserve is deterministic
+	// and is what makes "sum ≤ N" a construction property instead of a hope.
+	cacheBudget := int64(cfg.CacheSize)
+	stagingBudget := int64(0)
 	if cfg.CacheDir != "" && (cfg.CacheSize > 0 || !cfg.CacheSizeConfigured) {
 		bcfg.StagingDir = filepath.Join(cfg.CacheDir, "commit-staging")
-		if cfg.CacheSize > 0 {
-			bcfg.StagingBudget = int64(cfg.CacheSize)
+		if cacheBudget > 0 {
+			stagingBudget = stagingReserveBytes(cacheBudget)
+			cacheBudget -= stagingBudget
+			bcfg.StagingBudget = stagingBudget
 		}
+		bcfg.FreeSpaceRatio = cfg.FreeSpaceRatio
 	}
 	b := NewBridge(bcfg)
+	// Seed the staging byte counter from whatever a previous mount left; every
+	// later delta is tracked at its own add/remove site.
+	b.seedStagingUsage()
 	if bcfg.StagingDir != "" && !cfg.ReadOnly {
 		// Barriers a previous mount spilled but never landed: re-commit
 		// them in the background; staged bytes are in the registry either
@@ -111,7 +152,7 @@ func NewEngine(cfg EngineConfig) *Engine {
 	// bypass the cache, writeback is disabled by SelfCheck). It must not
 	// silently become a 1 GiB default — the mount wiring derives this value
 	// from --disk-read-cache-size-mb so the operator's budget is exact.
-	cacheSize := cfg.CacheSize
+	cacheSize := uint64(cacheBudget)
 	blockSize := blockSizeMiB << 20
 	chunkConf := chunk.Config{
 		BlockSize:  blockSize << 0,
@@ -183,7 +224,7 @@ func NewEngine(cfg EngineConfig) *Engine {
 		DirEntryTimeout: time.Second,
 	}
 	v := vfs.NewVFS(conf, b, store, nil, nil)
-	return &Engine{Bridge: b, Store: store, VFS: v}
+	return &Engine{Bridge: b, Store: store, VFS: v, juiceCacheSize: int64(cacheSize)}
 }
 
 // FlushFile commits any slice still pending on the engine's asynchronous

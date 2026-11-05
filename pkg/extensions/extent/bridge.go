@@ -58,9 +58,13 @@ type Config struct {
 	StagingDir string
 	// StagingBudget bounds the durable staging tree in bytes (0 = unbounded).
 	// The tree lives inside the engine's cache directory but outside
-	// JuiceFS's raw/rawstaging accounting, so it must be charged to the same
-	// allowance the user configured for that directory.
+	// JuiceFS's raw/rawstaging accounting, so the engine SPLITS the operator's
+	// allowance between JuiceFS's CacheSize and this budget (their sum is the
+	// configured total).
 	StagingBudget int64
+	// FreeSpaceRatio is the free-space floor for the staging directory
+	// (0 disables the check), mirroring JuiceFS's own CacheFreeSpace.
+	FreeSpaceRatio float32
 	// NativeWriteback declares that the chunk store runs JuiceFS's own
 	// writeback pipeline: blocks are staged to the disk cache and handed
 	// to the store's asynchronous uploader, so objectStorage.Put may run
@@ -136,6 +140,13 @@ type Bridge struct {
 	// stagingPause, when set, runs once inside StagePendingLocal after the
 	// block files are written and before the rename intent is resolved,
 	// letting a test interleave a whole rename into that window.
+	// stagingBytes tracks the bytes currently retained under StagingDir.
+	// It is an atomic counter rather than a directory scan: StagePendingLocal
+	// runs on every interactive fsync, and walking the tree per fsync would
+	// turn the fast path into O(files). Every add/remove site in this file
+	// knows its own delta, so the counter is exact; a single scan at
+	// construction seeds it from whatever a previous mount left behind.
+	stagingBytes atomic.Int64
 	stagingPause func()
 	// manifestMu serializes every durable-manifest read-modify-write: the
 	// staging publish, the rename intent stage/settle, and the inode

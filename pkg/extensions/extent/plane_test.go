@@ -5938,26 +5938,50 @@ func TestEmptyStrictSyncRefusedBeforeCreate(t *testing.T) {
 	}
 }
 
-// The durable staging tree sits inside the engine's cache directory but
-// outside JuiceFS's raw/rawstaging accounting, so it must be bounded by the
-// configured allowance. Budget pressure must FAIL the new fsync — never evict
-// another file's record, because every record in the tree is an fsync that
-// already returned success.
+// The operator's number is ONE allowance for the plane: it is split between
+// JuiceFS's chunk cache and the durable staging tree, and the two must sum to
+// it. Handing both the same N (the previous shape) let the plane retain 2N.
+func TestCacheAllowanceIsSplitWithStaging(t *testing.T) {
+	for _, total := range []int64{8 << 20, 1024 << 20, 8 << 30} {
+		eng := NewEngine(EngineConfig{
+			Client: client.New("http://127.0.0.1:1", ""), RemoteRoot: "/",
+			CacheDir: engineCacheDir(t), CacheSize: uint64(total), CacheSizeConfigured: true,
+		})
+		staging := eng.Bridge.StagingBudgetForTest()
+		juice := eng.JuiceCacheSizeForTest()
+		if staging <= 0 {
+			t.Fatalf("total=%d: staging budget = %d, want a positive reserve", total, staging)
+		}
+		if got := staging + juice; got != total {
+			t.Fatalf("total=%d: staging(%d) + juicefs(%d) = %d, want exactly the configured allowance", total, staging, juice, got)
+		}
+	}
+}
+
+// Budget pressure must REFUSE the new fsync and leave every earlier
+// acknowledged barrier untouched: each record is a durability promise already
+// made to a caller, so it cannot be revoked to make room for a later write.
 func TestStagingBudgetRefusesRatherThanEvictingAcknowledgedBarriers(t *testing.T) {
-	const budget = 4 << 10
+	const total = 8 << 20
 	f := newFakeV2(t)
 	f.setDir("/d", true)
 	eng := NewEngine(EngineConfig{
 		Client: client.New(f.URL, ""), RemoteRoot: "/",
-		CacheDir: engineCacheDir(t), CacheSize: budget, CacheSizeConfigured: true,
+		CacheDir: engineCacheDir(t), CacheSize: total, CacheSizeConfigured: true,
 	})
 	br := eng.Bridge
+	budget := br.StagingBudgetForTest()
+	if budget <= 1 {
+		t.Fatalf("staging budget = %d, too small for this test", budget)
+	}
 	stageFile := func(i int) error {
 		ino := meta.Ino(300 + i)
 		path := fmt.Sprintf("/d/s%d.bin", i)
 		f.seedExtent(t, path, "")
 		br.RememberPathForTest(ino, path)
-		data := make([]byte, 3<<10)
+		// Each barrier is sized to fill roughly half the reserve, so the
+		// second one cannot fit beside the first.
+		data := make([]byte, budget/2)
 		for j := range data {
 			data[j] = byte(i)
 		}
@@ -5967,7 +5991,6 @@ func TestStagingBudgetRefusesRatherThanEvictingAcknowledgedBarriers(t *testing.T
 		return br.StagePendingLocal(ino)
 	}
 
-	// The first barrier fits and is ACKNOWLEDGED.
 	if err := stageFile(0); err != nil {
 		t.Fatalf("first fsync must succeed: %v", err)
 	}
@@ -5980,10 +6003,8 @@ func TestStagingBudgetRefusesRatherThanEvictingAcknowledgedBarriers(t *testing.T
 	}
 	firstDir := entries[0].Name()
 
-	// The second would exceed the allowance: it must be REFUSED, and the
-	// first file's acknowledged record must survive untouched.
 	if err := stageFile(1); err == nil {
-		t.Fatal("a fsync that would exceed the staging allowance must fail, not silently evict")
+		t.Fatal("a fsync that would exceed the split allowance must fail, not silently evict")
 	}
 	entries, err = os.ReadDir(br.cfg.StagingDir)
 	if err != nil {
@@ -6024,3 +6045,12 @@ func TestExplicitZeroCacheSizeDisablesStaging(t *testing.T) {
 		t.Fatalf("content after fsync = %q, want NOCACHE published remotely (not memory-only)", got)
 	}
 }
+
+// StagingBudgetForTest exposes the reserve carved out of the cache allowance.
+func (b *Bridge) StagingBudgetForTest() int64 { return b.cfg.StagingBudget }
+
+// JuiceCacheSizeForTest exposes the chunk store's share of the allowance.
+func (e *Engine) JuiceCacheSizeForTest() int64 { return e.juiceCacheSize }
+
+// StagingBytesForTest exposes the retained-bytes counter.
+func (b *Bridge) StagingBytesForTest() int64 { return b.stagingBytes.Load() }
