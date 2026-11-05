@@ -186,7 +186,48 @@ func (c *Client) Exec(ctx context.Context, input ExecRequest, options ExecOption
 	if err != nil {
 		return nil, newRuntimeStartError("", "invalid_request", fmt.Errorf("marshal exec request: %w", err))
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/runtime/exec", bytes.NewReader(body))
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	// Keep the execution stream open while requesting cancellation. Disconnecting
+	// first lets the server finish and remove its active record before /cancel
+	// arrives, making a confirmed stop indistinguishable from a missing record.
+	requestCtx, abortRequest := context.WithCancel(context.WithoutCancel(ctx))
+	startedID := make(chan string, 1)
+	cancelResult := make(chan error, 1)
+	finished, watcherDone := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(watcherDone)
+		select {
+		case <-finished:
+			return
+		case <-ctx.Done():
+		}
+		var id string
+		select {
+		case id = <-startedID:
+		default:
+			cancelResult <- ctx.Err()
+			abortRequest()
+			return
+		}
+		cancelCtx, stopCancel := context.WithTimeout(context.Background(), runtimeCancelTimeout)
+		defer stopCancel()
+		stop := context.AfterFunc(requestCtx, stopCancel)
+		defer stop()
+		cancelResult <- c.CancelRuntimeExecution(cancelCtx, id)
+		// A terminal frame is stronger evidence than a failed cancellation RPC.
+		// Continue draining it, but bound observation even if the server stalls.
+		select {
+		case <-finished:
+		case <-cancelCtx.Done():
+			abortRequest()
+		}
+	}()
+	defer func() { close(finished); abortRequest(); <-watcherDone }()
+
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodPost, c.baseURL+"/v1/runtime/exec", bytes.NewReader(body))
 	if err != nil {
 		return nil, newRuntimeStartError("", "invalid_request", fmt.Errorf("create exec request: %w", err))
 	}
@@ -210,25 +251,26 @@ func (c *Client) Exec(ctx context.Context, input ExecRequest, options ExecOption
 	for {
 		line, atEOF, readErr := readBoundedRuntimeLine(reader)
 		if readErr != nil {
-			return nil, c.runtimeObservationEnded(ctx, executionID, readErr)
+			return nil, runtimeObservationEnded(ctx, executionID, readErr, cancelResult)
 		}
 		if len(bytes.TrimSpace(line)) == 0 {
 			if atEOF {
-				return nil, c.runtimeObservationEnded(ctx, executionID, io.ErrUnexpectedEOF)
+				return nil, runtimeObservationEnded(ctx, executionID, io.ErrUnexpectedEOF, cancelResult)
 			}
 			continue
 		}
 		wire, decodeErr := decodeRuntimeWireFrame(line)
 		if decodeErr != nil {
-			return nil, c.runtimeObservationEnded(ctx, executionID, decodeErr)
+			return nil, runtimeUnknown(executionID, decodeErr)
 		}
 		if frameErr := validateRuntimeFrame(wire, started, executionID); frameErr != nil {
-			return nil, c.runtimeObservationEnded(ctx, executionID, frameErr)
+			return nil, runtimeUnknown(executionID, frameErr)
 		}
 		switch wire.Type {
 		case "started":
 			started = true
 			executionID, sandbox = wire.ExecutionID, wire.Sandbox
+			startedID <- executionID
 			if options.OnStarted != nil {
 				if err := options.OnStarted(ExecStarted{ExecutionID: executionID, Cwd: wire.Cwd, Sandbox: wire.Sandbox}); err != nil {
 					c.cancelAfterLostObservation(executionID)
@@ -238,7 +280,7 @@ func (c *Client) Exec(ctx context.Context, input ExecRequest, options ExecOption
 		case "stdout", "stderr":
 			data, decodeErr := base64.StdEncoding.Strict().DecodeString(wire.DataBase64)
 			if decodeErr != nil || len(data) == 0 {
-				return nil, c.runtimeObservationEnded(ctx, executionID, errors.New("invalid exec output encoding"))
+				return nil, runtimeUnknown(executionID, errors.New("invalid exec output encoding"))
 			}
 			writer := options.Stdout
 			if wire.Type == "stderr" {
@@ -260,16 +302,14 @@ func (c *Client) Exec(ctx context.Context, input ExecRequest, options ExecOption
 			return nil, runtimeTerminalError(wire, started)
 		}
 		if atEOF {
-			return nil, c.runtimeObservationEnded(ctx, executionID, io.ErrUnexpectedEOF)
+			return nil, runtimeObservationEnded(ctx, executionID, io.ErrUnexpectedEOF, cancelResult)
 		}
 	}
 }
 
-func (c *Client) runtimeObservationEnded(ctx context.Context, executionID string, cause error) error {
+func runtimeObservationEnded(ctx context.Context, executionID string, cause error, cancelResult <-chan error) error {
 	if ctx.Err() != nil && executionID != "" {
-		cancelCtx, cancel := context.WithTimeout(context.Background(), runtimeCancelTimeout)
-		err := c.CancelRuntimeExecution(cancelCtx, executionID)
-		cancel()
+		err := <-cancelResult
 		if err == nil {
 			return &RuntimeCanceledError{RuntimeExecutionError: &RuntimeExecutionError{
 				ExecutionID: executionID, Code: "canceled", Message: "the command was canceled",

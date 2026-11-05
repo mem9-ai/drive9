@@ -211,8 +211,8 @@ func runExec(ctx context.Context, args []string, rt execRuntime) error {
 			progress.stop()
 			rt.execID.set(info.ExecutionID)
 			if options.verbose {
-				_, _ = fmt.Fprintf(rt.stderr, "drive9: running in %s sandbox at %s (%s, ready in %s)\n",
-					sandboxLabel(info.Sandbox), info.Cwd, info.ExecutionID, time.Since(started).Round(100*time.Millisecond))
+				_, _ = fmt.Fprintf(rt.stderr, "drive9: running in %s at %s (%s, ready in %s)\n",
+					execBackendLabel(info.Sandbox), info.Cwd, info.ExecutionID, time.Since(started).Round(100*time.Millisecond))
 			}
 			return nil
 		},
@@ -303,11 +303,15 @@ func currentCredentialFingerprint() string {
 	return ""
 }
 
-func sandboxLabel(sandbox string) string {
-	if sandbox == client.RuntimeSandboxWarm {
-		return "a warm"
+func execBackendLabel(sandbox string) string {
+	switch sandbox {
+	case client.RuntimeSandboxWarm:
+		return "a warm sandbox"
+	case client.RuntimeSandboxNew:
+		return "a new sandbox"
+	default:
+		return "the remote executor"
 	}
-	return "a new"
 }
 
 // execProgress shows a transient one-line status on a terminal while the
@@ -321,7 +325,7 @@ type execProgress struct {
 }
 
 func newExecProgress(out io.Writer, enabled bool) *execProgress {
-	return newExecProgressMessage(out, enabled, "drive9: starting sandbox…")
+	return newExecProgressMessage(out, enabled, "drive9: starting command…")
 }
 
 func newExecProgressMessage(out io.Writer, enabled bool, message string) *execProgress {

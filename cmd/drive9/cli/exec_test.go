@@ -451,7 +451,7 @@ func TestExecShowsStartingSandboxOnlyWhileWaiting(t *testing.T) {
 	if err := runExec(t.Context(), []string{"true"}, rt); err != nil {
 		t.Fatal(err)
 	}
-	if got := stderr.String(); got != "drive9: starting sandbox…\r\033[K" {
+	if got := stderr.String(); got != "drive9: starting command…\r\033[K" {
 		t.Fatalf("stderr = %q", got)
 	}
 	if stdout.String() != "out" {
@@ -563,6 +563,14 @@ func TestExecRejectsDelegatedToken(t *testing.T) {
 	for _, kind := range []CredentialKind{CredentialOwner, CredentialFSScoped, CredentialNone} {
 		if err := execCredentialError(kind); err != nil {
 			t.Fatalf("kind %d: %v", kind, err)
+		}
+	}
+}
+
+func TestExecBackendLabelDoesNotInventSandbox(t *testing.T) {
+	for _, test := range []struct{ field, want string }{{"", "the remote executor"}, {"new", "a new sandbox"}, {"warm", "a warm sandbox"}, {"future", "the remote executor"}} {
+		if got := execBackendLabel(test.field); got != test.want {
+			t.Fatalf("backend %q = %q, want %q", test.field, got, test.want)
 		}
 	}
 }

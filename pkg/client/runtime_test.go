@@ -398,3 +398,150 @@ func TestExecHTTPFailureClassification(t *testing.T) {
 		}
 	}
 }
+
+// A server may remove a completed execution as soon as its stream disconnects.
+// Cancellation must reach it before that disconnect, not reinterpret a 404.
+func TestExecCancellationKeepsStreamUntilConfirmedStop(t *testing.T) {
+	for _, tc := range []struct {
+		name, terminal, ack       string
+		code                      int
+		wantCanceled, wantUnknown bool
+	}{
+		{"confirmed", `{"type":"error","execution_id":"rex_12345678","error_code":"canceled","message":"stopped"}`, `{"canceled":true}`, 200, true, false},
+		{"unknown stop", `{"type":"error","execution_id":"rex_12345678","error_code":"outcome_unknown","message":"unconfirmed"}`, `{"code":"outcome_unknown"}`, 503, false, true},
+		{"missing record", "", `{"error":"execution is not active"}`, 404, false, true},
+		{"completed before cancel", `{"type":"exit","execution_id":"rex_12345678","exit_code":0,"duration_ms":1}`, `{"error":"execution is not active"}`, 404, false, false},
+		{"corrupt terminal", `not json`, `{"canceled":true}`, 200, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			started := make(chan struct{})
+			cancelRequested := make(chan struct{})
+			streamEnded := make(chan struct{})
+			var execCalls, cancelCalls, earlyDisconnect atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/v1/runtime/exec":
+					execCalls.Add(1)
+					defer close(streamEnded)
+					w.Header().Set("Content-Type", "application/x-ndjson")
+					_, _ = fmt.Fprintln(w, `{"type":"started","execution_id":"rex_12345678"}`)
+					w.(http.Flusher).Flush()
+					select {
+					case <-cancelRequested:
+					case <-r.Context().Done():
+						earlyDisconnect.Add(1)
+						return
+					}
+					if tc.terminal != "" {
+						_, _ = fmt.Fprintln(w, tc.terminal)
+					}
+				case "/v1/runtime/executions/rex_12345678/cancel":
+					cancelCalls.Add(1)
+					select {
+					case <-streamEnded:
+						w.WriteHeader(404)
+						return
+					default:
+					}
+					close(cancelRequested)
+					w.WriteHeader(tc.code)
+					_, _ = fmt.Fprintln(w, tc.ack)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			result := make(chan error, 1)
+			go func() {
+				_, err := New(server.URL, "secret").Exec(ctx, ExecRequest{Argv: []string{"sleep", "60"}}, ExecOptions{OnStarted: func(ExecStarted) error { close(started); return nil }})
+				result <- err
+			}()
+			<-started
+			cancel()
+			err := <-result
+			var canceled *RuntimeCanceledError
+			if errors.As(err, &canceled) != tc.wantCanceled || IsRuntimeOutcomeUnknown(err) != tc.wantUnknown || (!tc.wantCanceled && !tc.wantUnknown && err != nil) {
+				t.Fatalf("error=%T %v", err, err)
+			}
+			if execCalls.Load() != 1 || cancelCalls.Load() != 1 || earlyDisconnect.Load() != 0 {
+				t.Fatalf("exec=%d cancel=%d premature disconnect=%d", execCalls.Load(), cancelCalls.Load(), earlyDisconnect.Load())
+			}
+		})
+	}
+}
+
+func TestExecAlreadyCanceledDoesNotSend(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { requests.Add(1); w.WriteHeader(500) }))
+	defer server.Close()
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, err := New(server.URL, "secret").Exec(ctx, ExecRequest{Argv: []string{"true"}}, ExecOptions{})
+	if !errors.Is(err, context.Canceled) || requests.Load() != 0 {
+		t.Fatalf("error=%v requests=%d", err, requests.Load())
+	}
+}
+
+func TestExecCancellationObservationIsBounded(t *testing.T) {
+	for _, acknowledge := range []bool{true, false} {
+		t.Run(fmt.Sprintf("acknowledged=%t", acknowledge), func(t *testing.T) {
+			t.Parallel()
+			started, streamClosed, cancelClosed := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			var execCalls, cancelCalls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/v1/runtime/exec" {
+					execCalls.Add(1)
+					defer close(streamClosed)
+					w.Header().Set("Content-Type", "application/x-ndjson")
+					_, _ = fmt.Fprintln(w, `{"type":"started","execution_id":"rex_12345678"}`)
+					w.(http.Flusher).Flush()
+					<-r.Context().Done() // Never send a terminal frame.
+					return
+				}
+				cancelCalls.Add(1)
+				defer close(cancelClosed)
+				if acknowledge {
+					_, _ = fmt.Fprintln(w, `{"canceled":true}`)
+					return
+				}
+				<-r.Context().Done() // Also exercise a stalled cancel RPC.
+			}))
+			defer server.Close()
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			result := make(chan error, 1)
+			go func() {
+				_, err := New(server.URL, "secret").Exec(ctx, ExecRequest{Argv: []string{"sleep", "60"}}, ExecOptions{OnStarted: func(ExecStarted) error { close(started); return nil }})
+				result <- err
+			}()
+			<-started
+			began := time.Now()
+			cancel()
+			select {
+			case err := <-result:
+				var canceled *RuntimeCanceledError
+				if errors.As(err, &canceled) != acknowledge || IsRuntimeOutcomeUnknown(err) == acknowledge {
+					t.Fatalf("error=%T %v", err, err)
+				}
+			case <-time.After(runtimeCancelTimeout + 5*time.Second):
+				server.CloseClientConnections()
+				t.Fatal("cancellation did not return within its observation bound")
+			}
+			if elapsed := time.Since(began); elapsed < runtimeCancelTimeout-time.Second {
+				t.Fatalf("stream abandoned before observation deadline: %v", elapsed)
+			}
+			for _, closed := range []chan struct{}{streamClosed, cancelClosed} {
+				select {
+				case <-closed:
+				case <-time.After(time.Second):
+					t.Fatal("request remained active after Exec returned")
+				}
+			}
+			if execCalls.Load() != 1 || cancelCalls.Load() != 1 {
+				t.Fatalf("exec=%d cancel=%d", execCalls.Load(), cancelCalls.Load())
+			}
+		})
+	}
+}
