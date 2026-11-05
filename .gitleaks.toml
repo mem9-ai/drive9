@@ -20,17 +20,25 @@ title = "drive9 gitleaks config"
 [extend]
 useDefault = true
 
+# The retired local-dev placeholder keys are exempt only in the commit that
+# introduced them (572e442d, before the local provider generated its own key
+# pair). Scoping by commit rather than by value means a reintroduction of those
+# strings in a new commit — as live defaults again — is still reported.
+[[allowlists]]
+description = "Retired local-dev placeholder keys, historical commit only"
+commits = ["572e442d6bfd1e7b34d3d349ca10361329929557"]
+paths = ["^pkg/tenant/local/provisioner\\.go$"]
+regexes = [
+    "^0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef$",
+    "^fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210$",
+]
+condition = "AND"
+
 [[allowlists]]
 description = "Non-secret placeholders and test fixtures"
 
 # Matched against the detected secret itself (gitleaks' default regexTarget).
 regexes = [
-    # pkg/tenant/local, historical commits only: the local provider used to ship
-    # these fixed placeholder keys, and this branch no longer contains them (it
-    # generates keys per installation, see cmd/drive9-server/local_dev_keys.go).
-    # The scan targets history, so the old commits still need the exemption.
-    "^0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef$",
-    "^fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210$",
     # cmd/drive9/cli/ctx_test.go: fake JWT used to assert masking/reveal.
     "^eyJhbGciOiJIUzI1NiJ9\\.eyJncmFudF9pZCI6ImdydF8xIn0\\.signature$",
     # docs/tidbcloud-native-provider-design.md: digest-auth placeholder pairs.

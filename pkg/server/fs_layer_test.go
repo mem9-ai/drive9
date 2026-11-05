@@ -14,6 +14,7 @@ import (
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/datastore"
+	"github.com/mem9-ai/drive9/pkg/tenant/token"
 )
 
 func TestFSLayerPathQueryPreservesControlWhitespace(t *testing.T) {
@@ -1719,5 +1720,58 @@ func TestFSLayerObjectReadForkOwnerKeyRejectsForeignBlob(t *testing.T) {
 	s.handleFSLayerObjectRead(rr, req, s.fallback, s.fallback.Store(), layer)
 	if rr.Code != http.StatusForbidden {
 		t.Fatalf("read status=%d body=%s, want 403", rr.Code, rr.Body.String())
+	}
+}
+
+// An overwrite keeps the file id but writes the bytes to a generated object key,
+// so "blobs/<key>" is not always a file id. A fork owner key must still be able
+// to reference such a blob, and a foreign key must still be refused.
+func TestFSLayerStorageRefForkResolvesOverwrittenBlobKey(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+
+	if _, err := s.fallback.WriteCtx(ctx, "/repo/large.bin", bytes.Repeat([]byte("x"), 8<<10), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	node, err := s.fallback.StatNodeCtx(ctx, "/repo/large.bin")
+	if err != nil {
+		t.Fatalf("stat file: %v", err)
+	}
+	if node.File == nil || node.File.FileID == "" {
+		t.Fatal("file has no id")
+	}
+	// Force the overwrite shape: same file identity, generated object key.
+	overwriteKey := "blobs/" + token.NewID()
+	refHash := datastore.StorageRefHash(overwriteKey)
+	if _, err := s.fallback.Store().DB().ExecContext(ctx,
+		`UPDATE contents SET storage_type = ?, storage_ref = ?, storage_ref_hash = ? WHERE inode_id = ?`,
+		datastore.StorageS3, overwriteKey, refHash, node.File.FileID); err != nil {
+		t.Fatalf("rewrite storage_ref: %v", err)
+	}
+
+	if err := s.fallback.Store().CreateFSLayer(ctx, &datastore.FSLayer{LayerID: "layer-ow", BaseRootPath: "/repo"}); err != nil {
+		t.Fatalf("CreateFSLayer: %v", err)
+	}
+	layer, err := s.fallback.Store().GetFSLayer(ctx, "layer-ow")
+	if err != nil {
+		t.Fatalf("GetFSLayer: %v", err)
+	}
+
+	forkOwner := &TenantScope{IsScoped: false, ParentTenantID: "tenant-parent"}
+	upsert := func(blobKey string) int {
+		body := fmt.Sprintf(`{"path":"/repo/alias.bin","op":"upsert","kind":"file","storage_ref":"blobs/%s"}`, blobKey)
+		req := httptest.NewRequest(http.MethodPost, "/v1/layers/layer-ow/entries", bytes.NewReader([]byte(body)))
+		req = req.WithContext(withScope(req.Context(), forkOwner))
+		rr := httptest.NewRecorder()
+		s.handleFSLayerEntryUpsert(rr, req, s.fallback, s.fallback.Store(), layer)
+		return rr.Code
+	}
+
+	if code := upsert(strings.TrimPrefix(overwriteKey, "blobs/")); code != http.StatusOK {
+		t.Fatalf("overwrite blob reference status=%d body=%s, want 200", code, "")
+	}
+	// A key with no file behind it in this tenant is still refused.
+	if code := upsert(token.NewID()); code != http.StatusForbidden {
+		t.Fatalf("foreign blob status=%d, want 403", code)
 	}
 }

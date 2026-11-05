@@ -129,8 +129,17 @@ func newVaultMountOptions(opts *VaultMountOptions) *gofuse.MountOptions {
 		// the in-process EROFS rejections).
 		Options: []string{"ro"},
 	}
-	if opts.AllowOther && runtime.GOOS == "linux" {
-		fuseOpts.Options = append(fuseOpts.Options, "default_permissions")
+	if runtime.GOOS == "linux" {
+		if opts.AllowOther {
+			fuseOpts.Options = append(fuseOpts.Options, "default_permissions")
+		}
+	}
+	if runtime.GOOS == "darwin" {
+		// macFUSE has no default_permissions switch; defer_permissions is the
+		// equivalent kernel-side enforcement, and pkg/fuse always passes it.
+		// Without it an allow_other mount falls back to user-space checks that
+		// VaultFS does not implement for other users.
+		fuseOpts.Options = append(fuseOpts.Options, "defer_permissions", "local")
 	}
 	return fuseOpts
 }

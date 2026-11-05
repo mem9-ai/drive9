@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // EnvLocalDevKeyFile overrides where the local provider keeps its generated
@@ -38,9 +39,10 @@ func localDevKeyFilePath() (string, error) {
 	}
 	dir, err := os.UserConfigDir()
 	if err != nil {
-		// Containers often run without HOME. Fall back to a per-uid file in the
-		// temp dir: still 0600 and still not shared between users.
-		return filepath.Join(os.TempDir(), fmt.Sprintf("drive9-local-dev-keys-%d.json", os.Getuid())), nil
+		// Containers often run without HOME. Fall back to a private per-uid
+		// directory in the temp dir; loadOrCreateLocalDevKeys proves it is ours
+		// before trusting anything inside it.
+		return filepath.Join(os.TempDir(), fmt.Sprintf("drive9-local-dev-%d", os.Getuid()), "keys.json"), nil
 	}
 	return filepath.Join(dir, "drive9", "local-dev-keys.json"), nil
 }
@@ -60,7 +62,7 @@ func loadOrCreateLocalDevKeys() (localDevKeys, string, error) {
 	if err != nil {
 		return localDevKeys{}, "", err
 	}
-	raw, err := os.ReadFile(path)
+	raw, err := readLocalDevKeyFile(path)
 	switch {
 	case err == nil:
 		var keys localDevKeys
@@ -83,10 +85,49 @@ func loadOrCreateLocalDevKeys() (localDevKeys, string, error) {
 	if err != nil {
 		return localDevKeys{}, path, err
 	}
-	if err := writeLocalDevKeys(path, keys); err != nil {
+	installed, err := installLocalDevKeys(path, keys)
+	if err != nil {
 		return localDevKeys{}, path, err
 	}
-	return keys, path, nil
+	if installed {
+		return keys, path, nil
+	}
+	// Another process won the race and installed its pair first. Ours never
+	// reached the file, so adopt theirs instead of running on keys nobody else
+	// holds.
+	existing, existingPath, retryErr := loadOrCreateLocalDevKeys()
+	if retryErr != nil {
+		return localDevKeys{}, path, retryErr
+	}
+	return existing, existingPath, nil
+}
+
+// readLocalDevKeyFile reads the key file only when the file itself is safe: a
+// regular file, owned by this user, with no group or other permission bits.
+//
+// The fallback location lives under the shared temp directory, where another
+// local user could pre-create a readable file holding keys they chose. Accepting
+// it would hand them this installation's master and signing keys.
+func readLocalDevKeyFile(path string) ([]byte, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("local dev key file %s is a symlink; refusing to read keys through it", path)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("local dev key file %s is not a regular file", path)
+	}
+	if perm := info.Mode().Perm(); perm&0o077 != 0 {
+		return nil, fmt.Errorf(
+			"local dev key file %s has mode %04o; it must not be readable by group or other users (chmod 600, or delete it to generate a new pair)",
+			path, perm)
+	}
+	if ownerErr := checkLocalDevKeyFileOwner(path, info); ownerErr != nil {
+		return nil, ownerErr
+	}
+	return os.ReadFile(path)
 }
 
 // newLocalDevKeys draws one random key per role.
@@ -110,21 +151,34 @@ func randomKeyHex() (string, error) {
 	return hex.EncodeToString(buf), nil
 }
 
-// writeLocalDevKeys persists keys with 0600 permissions, creating the directory
-// 0700 and replacing the file atomically.
-func writeLocalDevKeys(path string, keys localDevKeys) error {
+// installLocalDevKeys writes the pair only if no key file exists yet, and reports
+// whether this call installed it.
+//
+// os.Rename replaces an existing file, so two processes starting together would
+// both generate a pair, both rename, and the loser would keep running on keys the
+// file no longer holds — its tokens and data would stop working after a restart.
+// A hard link installs without replacing and publishes the finished content
+// atomically; filesystems that refuse links fall back to an exclusive create.
+func installLocalDevKeys(path string, keys localDevKeys) (bool, error) {
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return fmt.Errorf("create local dev key dir %s: %w", dir, err)
+			return false, fmt.Errorf("create local dev key dir %s: %w", dir, err)
+		}
+		if info, statErr := os.Lstat(dir); statErr == nil && info.Mode().Perm()&0o077 != 0 {
+			if chmodErr := os.Chmod(dir, 0o700); chmodErr != nil {
+				return false, fmt.Errorf("local dev key dir %s must not be accessible to other users: %w", dir, chmodErr)
+			}
 		}
 	}
 	raw, err := json.MarshalIndent(keys, "", "  ")
 	if err != nil {
-		return fmt.Errorf("encode local dev keys: %w", err)
+		return false, fmt.Errorf("encode local dev keys: %w", err)
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".local-dev-keys-*.tmp")
+	raw = append(raw, '\n')
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".local-dev-keys-*.tmp")
 	if err != nil {
-		return fmt.Errorf("create local dev key file in %s: %w", filepath.Dir(path), err)
+		return false, fmt.Errorf("create local dev key file in %s: %w", dir, err)
 	}
 	tmpName := tmp.Name()
 	defer func() {
@@ -134,20 +188,42 @@ func writeLocalDevKeys(path string, keys localDevKeys) error {
 	}()
 	if err := tmp.Chmod(0o600); err != nil {
 		_ = tmp.Close()
-		return fmt.Errorf("set local dev key permissions: %w", err)
+		return false, fmt.Errorf("set local dev key permissions: %w", err)
 	}
-	if _, err := tmp.Write(append(raw, '\n')); err != nil {
+	if _, err := tmp.Write(raw); err != nil {
 		_ = tmp.Close()
-		return fmt.Errorf("write local dev keys: %w", err)
+		return false, fmt.Errorf("write local dev keys: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close local dev keys: %w", err)
+		return false, fmt.Errorf("close local dev keys: %w", err)
 	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return fmt.Errorf("install local dev key file %s: %w", path, err)
+	// Publish without replacing: os.Link fails when the destination exists.
+	switch linkErr := os.Link(tmpName, path); {
+	case linkErr == nil:
+		return true, nil
+	case errors.Is(linkErr, os.ErrExist):
+		return false, nil
 	}
-	tmpName = ""
-	return nil
+	// Filesystems without hard links (or a destination on another device) fall
+	// back to an exclusive create. A reader racing this window sees a partial
+	// file, which fails closed on the JSON parse rather than being trusted.
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("install local dev key file %s: %w", path, err)
+	}
+	if _, err := file.Write(raw); err != nil {
+		_ = file.Close()
+		_ = os.Remove(path)
+		return false, fmt.Errorf("write local dev key file %s: %w", path, err)
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(path)
+		return false, fmt.Errorf("close local dev key file %s: %w", path, err)
+	}
+	return true, nil
 }
 
 func (k localDevKeys) validate() error {
@@ -175,4 +251,14 @@ func validateKeyHex(field, value string) error {
 		return fmt.Errorf("%s is not hex: %w", field, err)
 	}
 	return nil
+}
+
+// localDevKeysFileAge reports how long ago the key file was installed, so a
+// freshly generated pair can be called out on first start.
+func localDevKeysFileAge(path string) (time.Duration, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0, err
+	}
+	return time.Since(info.ModTime()), nil
 }

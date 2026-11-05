@@ -1,8 +1,10 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -219,5 +221,101 @@ func TestApplyLocalProviderDevKeysKeepsEnvironmentKeys(t *testing.T) {
 	}
 	if os.Getenv(envLocalDevKeysInUse) == "1" {
 		t.Fatal("environment keys were marked as generated dev keys")
+	}
+}
+
+// A key file that other users can read is not trusted: on the shared temp
+// fallback another user could pre-create it with keys of their choosing.
+func TestLocalDevKeysRejectBroadPermissionsAndSymlinks(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mode bits are not meaningful on Windows")
+	}
+	dir := t.TempDir()
+	keyFile := filepath.Join(dir, "local-dev-keys.json")
+	t.Setenv(EnvLocalDevKeyFile, keyFile)
+
+	keys, _, err := loadOrCreateLocalDevKeys()
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	if _, _, err := loadOrCreateLocalDevKeys(); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+
+	for _, perm := range []os.FileMode{0o644, 0o640, 0o604} {
+		if err := os.Chmod(keyFile, perm); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := loadOrCreateLocalDevKeys(); err == nil {
+			t.Fatalf("accepted a key file with mode %04o", perm)
+		}
+	}
+	if err := os.Chmod(keyFile, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := loadOrCreateLocalDevKeys(); err != nil {
+		t.Fatalf("rejected a 0600 key file: %v", err)
+	}
+	_ = keys
+
+	// A symlink at the key path would let a pre-creator redirect the read.
+	linkTarget := filepath.Join(dir, "real.json")
+	raw, err := os.ReadFile(keyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(linkTarget, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(keyFile); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(linkTarget, keyFile); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if _, _, err := loadOrCreateLocalDevKeys(); err == nil {
+		t.Fatal("accepted a symlinked key file")
+	}
+}
+
+// Two processes starting together must end up on the same pair: the second must
+// adopt the first's file instead of replacing it.
+func TestLocalDevKeysAdoptAnExistingFileInsteadOfReplacing(t *testing.T) {
+	keyFile := filepath.Join(t.TempDir(), "local-dev-keys.json")
+	t.Setenv(EnvLocalDevKeyFile, keyFile)
+
+	winner := localDevKeys{
+		MasterKeyHex:       strings.Repeat("3a", 32),
+		TokenSigningKeyHex: strings.Repeat("7b", 32),
+	}
+	raw, err := json.Marshal(winner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyFile, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, _, err := loadOrCreateLocalDevKeys()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got != winner {
+		t.Fatal("an existing key file was replaced instead of adopted")
+	}
+	// installLocalDevKeys reports false when the destination already exists.
+	installed, err := installLocalDevKeys(keyFile, localDevKeys{MasterKeyHex: strings.Repeat("cd", 32), TokenSigningKeyHex: strings.Repeat("ef", 32)})
+	if err != nil {
+		t.Fatalf("install over existing: %v", err)
+	}
+	if installed {
+		t.Fatal("installLocalDevKeys replaced an existing key file")
+	}
+	after, err := os.ReadFile(keyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(raw) {
+		t.Fatal("the installed key file changed under a concurrent start")
 	}
 }

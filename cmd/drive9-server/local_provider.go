@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/mem9-ai/drive9/pkg/tenant/local"
 )
@@ -75,6 +76,12 @@ func applyLocalProviderDevKeys() error {
 	fmt.Fprintf(os.Stderr,
 		"drive9: local provider is using generated development keys from %s; delete that file (or set DRIVE9_MASTER_KEY and DRIVE9_TOKEN_SIGNING_KEY) to rotate\n",
 		path)
+	if age, ageErr := localDevKeysFileAge(path); ageErr == nil && age < time.Minute {
+		// First generation. Keys are per installation, so data written by an
+		// older release that used its own built-in defaults cannot be read now.
+		fmt.Fprint(os.Stderr,
+			"drive9: if this installation ran an older drive9-server, its local tenant data was encrypted and signed with that release's built-in dev keys and will not decrypt; re-run with a fresh local tenant, or export the data with the old build first\n")
+	}
 	return nil
 }
 
