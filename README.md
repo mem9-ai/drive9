@@ -173,8 +173,9 @@ drive9 journal verify run-42
 
 ### Run Commands Against a Workspace
 
-When the server enables it, `drive9 exec` runs a command in a sandbox with your
-drive mounted at `/workspace`. Output streams live, writes are in Drive9
+When the server enables it, `drive9 exec` runs a command remotely against your
+drive at `/workspace`. The server selects a lightweight executor or a sandbox
+before starting. Output streams live, writes are in Drive9
 when it exits, and the exit status is the command's:
 
 ```bash
@@ -182,7 +183,7 @@ cd ~/drive9/repo && drive9 exec npm test   # inside a mount: your local edits, s
 drive9 exec -w repo 'npm ci && npm test'   # from anywhere
 ```
 
-Your consecutive commands reuse a warm sandbox, so packages you install stay
+Commands using a sandbox can reuse a warm one, so packages you install stay
 around between them; only `/workspace` is durable.
 
 ## Architecture
@@ -254,7 +255,7 @@ cat ~/drive9/run-42.txt
 
 ## Boundaries
 
-- Drive9 keeps workspace state. `drive9 exec` runs commands in sandboxes, but it
+- Drive9 keeps workspace state. `drive9 exec` runs remote commands, but it
   is not an agent loop or durable job system.
 - It does not preserve live processes, sockets, terminals, or in-memory model context.
 - It is not a Git replacement; Git remains the final review and history layer.

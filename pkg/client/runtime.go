@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -28,6 +29,8 @@ const (
 
 // ErrRuntimeNotEnabled means the server does not offer remote exec.
 var ErrRuntimeNotEnabled = errors.New("remote exec is not enabled on this server")
+
+var errRuntimeFrameTooLarge = fmt.Errorf("exec frame exceeds %d bytes", maxRuntimeFrameBytes)
 
 // RuntimeWorkspace selects where the command runs. The whole drive is at
 // /workspace; the command starts in /workspace/<Root>.
@@ -59,7 +62,8 @@ type ExecStarted struct {
 	ExecutionID string
 	// Cwd is the command's working directory inside the sandbox.
 	Cwd string
-	// Sandbox is RuntimeSandboxNew or RuntimeSandboxWarm.
+	// Sandbox is RuntimeSandboxNew or RuntimeSandboxWarm when a sandbox is used.
+	// It can be empty for another executor.
 	Sandbox string
 }
 
@@ -194,7 +198,22 @@ func (c *Client) Exec(ctx context.Context, input ExecRequest, options ExecOption
 	// first lets the server finish and remove its active record before /cancel
 	// arrives, making a confirmed stop indistinguishable from a missing record.
 	requestCtx, abortRequest := context.WithCancel(context.WithoutCancel(ctx))
-	startedID := make(chan string, 1)
+	var startedMu sync.Mutex
+	var startedID string
+	abandoned := false
+	// The reader and watcher share one cancellation attempt, including callback
+	// and output failures racing with caller cancellation.
+	var cancelOnce sync.Once
+	var remoteCancelErr error
+	cancelRemote := func(cancelCtx context.Context, id string) error {
+		cancelOnce.Do(func() { remoteCancelErr = c.CancelRuntimeExecution(cancelCtx, id) })
+		return remoteCancelErr
+	}
+	cancelAfterLostObservation := func(id string) {
+		cancelCtx, stopCancel := context.WithTimeout(context.Background(), runtimeCancelTimeout)
+		defer stopCancel()
+		_ = cancelRemote(cancelCtx, id)
+	}
 	cancelResult := make(chan error, 1)
 	finished, watcherDone := make(chan struct{}), make(chan struct{})
 	go func() {
@@ -204,10 +223,11 @@ func (c *Client) Exec(ctx context.Context, input ExecRequest, options ExecOption
 			return
 		case <-ctx.Done():
 		}
-		var id string
-		select {
-		case id = <-startedID:
-		default:
+		startedMu.Lock()
+		id := startedID
+		abandoned = id == ""
+		startedMu.Unlock()
+		if id == "" {
 			cancelResult <- ctx.Err()
 			abortRequest()
 			return
@@ -216,7 +236,7 @@ func (c *Client) Exec(ctx context.Context, input ExecRequest, options ExecOption
 		defer stopCancel()
 		stop := context.AfterFunc(requestCtx, stopCancel)
 		defer stop()
-		cancelResult <- c.CancelRuntimeExecution(cancelCtx, id)
+		cancelResult <- cancelRemote(cancelCtx, id)
 		// A terminal frame is stronger evidence than a failed cancellation RPC.
 		// Continue draining it, but bound observation even if the server stalls.
 		select {
@@ -248,9 +268,20 @@ func (c *Client) Exec(ctx context.Context, input ExecRequest, options ExecOption
 	reader := bufio.NewReaderSize(resp.Body, 32<<10)
 	executionID, sandbox := "", ""
 	started := false
+	invalidObservation := func(cause error) error {
+		if ctx.Err() != nil && executionID != "" {
+			// Finish the bounded cancellation before deferred stream teardown can
+			// abort it. A corrupt stream remains unknown even after a cancel ACK.
+			cancelAfterLostObservation(executionID)
+		}
+		return runtimeUnknown(executionID, cause)
+	}
 	for {
 		line, atEOF, readErr := readBoundedRuntimeLine(reader)
 		if readErr != nil {
+			if errors.Is(readErr, errRuntimeFrameTooLarge) {
+				return nil, invalidObservation(readErr)
+			}
 			return nil, runtimeObservationEnded(ctx, executionID, readErr, cancelResult)
 		}
 		if len(bytes.TrimSpace(line)) == 0 {
@@ -261,26 +292,35 @@ func (c *Client) Exec(ctx context.Context, input ExecRequest, options ExecOption
 		}
 		wire, decodeErr := decodeRuntimeWireFrame(line)
 		if decodeErr != nil {
-			return nil, runtimeUnknown(executionID, decodeErr)
+			return nil, invalidObservation(decodeErr)
 		}
 		if frameErr := validateRuntimeFrame(wire, started, executionID); frameErr != nil {
-			return nil, runtimeUnknown(executionID, frameErr)
+			return nil, invalidObservation(frameErr)
 		}
 		switch wire.Type {
 		case "started":
 			started = true
 			executionID, sandbox = wire.ExecutionID, wire.Sandbox
-			startedID <- executionID
+			startedMu.Lock()
+			startedID = executionID
+			lostBeforeStart := abandoned
+			startedMu.Unlock()
+			if lostBeforeStart {
+				// A buffered started frame can arrive after the watcher abandoned
+				// the request. Its ID still needs exactly one cleanup attempt.
+				cancelAfterLostObservation(executionID)
+				return nil, runtimeUnknown(executionID, ctx.Err())
+			}
 			if options.OnStarted != nil {
 				if err := options.OnStarted(ExecStarted{ExecutionID: executionID, Cwd: wire.Cwd, Sandbox: wire.Sandbox}); err != nil {
-					c.cancelAfterLostObservation(executionID)
+					cancelAfterLostObservation(executionID)
 					return nil, runtimeUnknown(executionID, fmt.Errorf("exec started callback: %w", err))
 				}
 			}
 		case "stdout", "stderr":
 			data, decodeErr := base64.StdEncoding.Strict().DecodeString(wire.DataBase64)
 			if decodeErr != nil || len(data) == 0 {
-				return nil, runtimeUnknown(executionID, errors.New("invalid exec output encoding"))
+				return nil, invalidObservation(errors.New("invalid exec output encoding"))
 			}
 			writer := options.Stdout
 			if wire.Type == "stderr" {
@@ -292,14 +332,18 @@ func (c *Client) Exec(ctx context.Context, input ExecRequest, options ExecOption
 					err = io.ErrShortWrite
 				}
 				if err != nil {
-					c.cancelAfterLostObservation(executionID)
+					cancelAfterLostObservation(executionID)
 					return nil, runtimeUnknown(executionID, fmt.Errorf("write %s: %w", wire.Type, err))
 				}
 			}
 		case "exit":
 			return &ExecResult{ExecutionID: executionID, ExitCode: *wire.ExitCode, DurationMS: *wire.DurationMS, Sandbox: sandbox}, nil
 		case "error":
-			return nil, runtimeTerminalError(wire, started)
+			terminalErr := runtimeTerminalError(wire, started)
+			if IsRuntimeOutcomeUnknown(terminalErr) {
+				return nil, invalidObservation(terminalErr)
+			}
+			return nil, terminalErr
 		}
 		if atEOF {
 			return nil, runtimeObservationEnded(ctx, executionID, io.ErrUnexpectedEOF, cancelResult)
@@ -307,6 +351,8 @@ func (c *Client) Exec(ctx context.Context, input ExecRequest, options ExecOption
 	}
 }
 
+// runtimeObservationEnded accepts a confirmed cancel ACK after transport loss.
+// Protocol violations must instead remain unknown, even if cancellation succeeds.
 func runtimeObservationEnded(ctx context.Context, executionID string, cause error, cancelResult <-chan error) error {
 	if ctx.Err() != nil && executionID != "" {
 		err := <-cancelResult
@@ -318,15 +364,6 @@ func runtimeObservationEnded(ctx context.Context, executionID string, cause erro
 		return runtimeUnknown(executionID, errors.Join(cause, fmt.Errorf("confirm remote cancellation: %w", err)))
 	}
 	return runtimeUnknown(executionID, cause)
-}
-
-func (c *Client) cancelAfterLostObservation(executionID string) {
-	if executionID == "" {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), runtimeCancelTimeout)
-	defer cancel()
-	_ = c.CancelRuntimeExecution(ctx, executionID)
 }
 
 // GetRuntimeCapabilities reports the server's remote exec support. It returns
@@ -505,7 +542,7 @@ func readBoundedRuntimeLine(reader *bufio.Reader) ([]byte, bool, error) {
 			payloadBytes--
 		}
 		if len(line)+payloadBytes > maxRuntimeFrameBytes {
-			return nil, false, fmt.Errorf("exec frame exceeds %d bytes", maxRuntimeFrameBytes)
+			return nil, false, errRuntimeFrameTooLarge
 		}
 		line = append(line, fragment...)
 		switch err {

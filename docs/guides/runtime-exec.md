@@ -1,7 +1,8 @@
 # Remote exec
 
-`drive9 exec` runs a command in a sandbox with your Drive9 drive mounted at
-`/workspace`. You do not create, mount, or clean up a sandbox yourself.
+`drive9 exec` runs a command remotely against your Drive9 drive at `/workspace`.
+The server selects a lightweight executor or a sandbox before starting. You do
+not create, mount, or clean up a sandbox yourself.
 
 ```bash
 cd ~/drive9/repo/web && drive9 exec npm test   # inside a local drive9 mount
@@ -22,20 +23,20 @@ The server must have remote exec enabled. Otherwise the command reports
   Only FUSE mounts are followed: inside a WebDAV mount (the default on macOS
   and Windows), pass `-w`. `-w` does not upload local changes first, so the
   command sees what the server already has.
-- **Who it runs as.** A normal user, `agent`, with `HOME=/home/agent`, so git,
+- **Who it runs as in a sandbox.** A normal user, `agent`, with `HOME=/home/agent`, so git,
   pip, npm, and go work as usual. It can edit any workspace file but cannot
   become root.
 - **What persists.** Files under `/workspace` are in Drive9 when the command
   exits. Everything else in the sandbox is disposable.
-- **Warm sandboxes.** Your consecutive commands (same API key) reuse one
+- **Warm sandboxes.** Commands using a sandbox (same API key) can reuse one
   sandbox for a while, whichever directory they run in (10 minutes idle by
   default), so
   packages you installed and files in `/tmp` are still there for the next
   command. Processes are not: each command starts with nothing left running
   from the previous one. `--fresh` starts over in a new sandbox; `-v` shows
   whether a command got a `new` or `warm` one.
-- **Feedback.** While a sandbox is starting, a terminal shows
-  `starting sandbox…`; the line disappears as soon as the command runs.
+- **Feedback.** While a command is starting, a terminal shows
+  `starting command…`; the line disappears as soon as the command runs.
   Colors are kept when your output is a terminal (`NO_COLOR` is respected).
 - **Output.** stdout and stderr stream live to your terminal, separately.
 - **Exit status.** `drive9 exec` exits with the command's status and adds no
@@ -45,12 +46,16 @@ The server must have remote exec enabled. Otherwise the command reports
   | --- | --- |
   | 124 | `-t` timeout reached; the command was stopped |
   | 126 / 127 | command not executable / not found |
-  | 130 | canceled with Ctrl-C |
-  | 255 | the connection was lost and the outcome is unknown |
+  | 130 | canceled before sending, server-confirmed cancellation, or detachment after a second Ctrl-C |
+  | 255 | the outcome could not be confirmed, including a lost or invalid result stream |
 
-- **Ctrl-C.** The first Ctrl-C stops the remote command and waits for the
-  workspace to drain. A second Ctrl-C detaches immediately; the command may keep
-  running.
+  Remote commands can also return these numeric statuses themselves. Read the
+  accompanying diagnostic; status 130 alone does not confirm a remote stop.
+
+- **Ctrl-C.** The first Ctrl-C requests cancellation and waits for the server
+  to confirm the command stopped and the workspace drained. If confirmation is
+  unavailable, the outcome remains unknown. A second Ctrl-C detaches immediately;
+  the command may keep running.
 - **Never retried.** If the outcome is unknown, the command may already have
   run. Check the workspace before running it again.
 
@@ -65,7 +70,7 @@ The server must have remote exec enabled. Otherwise the command reports
 | `--fresh` | start in a new sandbox instead of reusing the warm one |
 | `--layer REF` | use a LayerFS layer view (layer ID, name, or `tag:key=value`), for example one agent fork |
 | `--read-only` | mount the workspace read-only |
-| `-v, --verbose` | show the sandbox, working directory, and duration |
+| `-v, --verbose` | show the executor, working directory, and duration |
 
 A single argument that contains spaces or shell syntax runs through
 `/bin/sh -c`: `drive9 exec 'cd web && npm test'`. Anything else runs as-is,
@@ -106,7 +111,7 @@ command.
 
 ## Credentials
 
-The server mounts the workspace inside the sandbox with your API key via
+When a sandbox is used, the server mounts the workspace with your API key via
 `drive9 mount --no-persist-credentials`. The key lives only in the mount
 process's memory. It is not written to disk and is never visible to your
 command or its environment.

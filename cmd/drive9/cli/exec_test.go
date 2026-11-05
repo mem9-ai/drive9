@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/mountstate"
 )
 
@@ -231,6 +232,26 @@ func TestExecErrorsAreActionable(t *testing.T) {
 				if !errors.As(err, &coded) || coded.ExitCode() != tc.wantCode {
 					t.Fatalf("exit code for %v, want %d", err, tc.wantCode)
 				}
+			}
+		})
+	}
+}
+
+func TestExecCancellationErrorStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		code int
+	}{
+		{"before execution", context.Canceled, execExitCanceled},
+		{"wrapped before execution", fmt.Errorf("prepare: %w", context.Canceled), execExitCanceled},
+		{"unknown after dispatch", &client.RuntimeOutcomeUnknownError{ExecutionID: "rex_12345678", Cause: context.Canceled}, execExitUnknown},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := execError(tc.err, "")
+			var coded interface{ ExitCode() int }
+			if !errors.As(err, &coded) || coded.ExitCode() != tc.code {
+				t.Fatalf("error = %v, want status %d", err, tc.code)
 			}
 		})
 	}
