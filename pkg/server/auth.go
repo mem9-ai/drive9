@@ -27,7 +27,11 @@ type scopeKey int
 const tenantScopeKey scopeKey = iota
 
 type TenantScope struct {
-	TenantID           string
+	TenantID string
+	// ParentTenantID is set for a forked tenant. Forks inherit the parent's
+	// StorageNamespaceID, so object keys are shared across the fork boundary and
+	// checks that trust namespace ownership must fall back to metadata ownership.
+	ParentTenantID     string
 	APIKeyID           string
 	TokenVersion       int
 	Provider           string
@@ -418,6 +422,7 @@ func tenantAuthMiddlewareWithFSScopeLoader(metaStore *meta.Store, pool *tenant.P
 
 		scope := &TenantScope{
 			TenantID:           resolved.Tenant.ID,
+			ParentTenantID:     resolved.Tenant.ParentTenantID,
 			APIKeyID:           resolved.APIKey.ID,
 			TokenVersion:       resolved.APIKey.TokenVersion,
 			Provider:           resolved.Tenant.Provider,
@@ -485,6 +490,7 @@ func handleDeleteNoAcquireAuth(w http.ResponseWriter, r *http.Request, pool *ten
 
 	scope := &TenantScope{
 		TenantID:           resolved.Tenant.ID,
+		ParentTenantID:     resolved.Tenant.ParentTenantID,
 		APIKeyID:           resolved.APIKey.ID,
 		TokenVersion:       resolved.APIKey.TokenVersion,
 		Provider:           resolved.Tenant.Provider,

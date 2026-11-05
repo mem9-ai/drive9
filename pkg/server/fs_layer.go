@@ -1133,18 +1133,32 @@ func validateFSLayerServerStorageRef(layer *datastore.FSLayer, entry *datastore.
 // its dentry paths and the caller must be able to read at least one of them;
 // content reachable inside the scope is legitimately readable, and a reference
 // with no remaining dentry is refused rather than treated as absent.
+// authorizeFSLayerStorageRefSource keeps a caller-supplied blobs/ reference
+// inside the tenant's own filesystem.
+//
+// layers/<layerID>/... is minted by the server for one layer and already
+// validated against that layer, so it needs no further check here. blobs/<fileID>
+// names a main-filesystem object, and its meaning depends on who owns the storage
+// namespace: a live tenant owns its namespace outright, while a fork shares the
+// parent's (StorageNamespaceID is inherited), so a blob id that belongs to the
+// parent resolves in the same bucket for the child. An owner key on a fork must
+// therefore still prove the blob is reachable from the fork's own metadata, and a
+// scoped key must additionally keep it inside its read scope.
 func (s *Server) authorizeFSLayerStorageRefSource(w http.ResponseWriter, r *http.Request, store *datastore.Store, entry *datastore.FSLayerEntry) bool {
 	if entry == nil || store == nil {
 		return true
 	}
-	scope := ScopeFromContext(r.Context())
-	if scope == nil || !scope.IsScoped {
-		return true
-	}
 	ref := strings.TrimSpace(entry.StorageRef)
 	if !strings.HasPrefix(ref, "blobs/") {
-		// layers/<layerID>/... is minted for, and only readable through, this
-		// layer, which the caller's layer access already covers.
+		return true
+	}
+	scope := ScopeFromContext(r.Context())
+	if scope == nil {
+		return true
+	}
+	if !scope.IsScoped && scope.ParentTenantID == "" {
+		// A live tenant owns its whole storage namespace, so any blob in it is
+		// this tenant's data.
 		return true
 	}
 	fileID := strings.TrimPrefix(ref, "blobs/")
@@ -1153,6 +1167,18 @@ func (s *Server) authorizeFSLayerStorageRefSource(w http.ResponseWriter, r *http
 		logger.Error(r.Context(), "fs_layer_storage_ref_lookup_failed", eventFields(r.Context(), "fs_layer_storage_ref_lookup_failed",
 			"layer_id", entry.LayerID, "file_id", fileID, "error", err)...)
 		errJSON(w, http.StatusInternalServerError, "failed to authorize fs layer storage reference")
+		return false
+	}
+	if !scope.IsScoped {
+		// Fork owner key: existence in this tenant's metadata is the whole
+		// requirement, because a fork's namespace is otherwise indistinguishable
+		// from its parent's in object storage.
+		if len(paths) > 0 {
+			return true
+		}
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "fs_layer_storage_ref_out_of_namespace",
+			"layer_id", entry.LayerID, "path", entry.Path, "file_id", fileID, "parent_tenant_id", scope.ParentTenantID)...)
+		errJSON(w, http.StatusForbidden, "storage_ref does not belong to this tenant's filesystem")
 		return false
 	}
 	for _, p := range paths {

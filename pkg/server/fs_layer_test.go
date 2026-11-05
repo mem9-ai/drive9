@@ -1631,3 +1631,93 @@ func TestFSLayerStorageRefRequiresScopedReadOnSource(t *testing.T) {
 		t.Fatalf("in-scope upsert status=%d body=%s, want 200", rr.Code, rr.Body.String())
 	}
 }
+
+// A fork tenant inherits the parent's storage namespace, so a blob id that
+// belongs to the parent resolves in the same bucket for the child. An owner key
+// (unscoped) must not be able to alias a parent blob onto its own layer path:
+// existence in the fork's own metadata is what authorizes it.
+func TestFSLayerStorageRefForkOwnerKeyStaysInTenantNamespace(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+
+	if err := s.fallback.Store().CreateFSLayer(ctx, &datastore.FSLayer{LayerID: "layer-fork", BaseRootPath: "/repo"}); err != nil {
+		t.Fatalf("CreateFSLayer: %v", err)
+	}
+	layer, err := s.fallback.Store().GetFSLayer(ctx, "layer-fork")
+	if err != nil {
+		t.Fatalf("GetFSLayer: %v", err)
+	}
+
+	// An owner key of a forked tenant: full access, but the storage namespace is
+	// shared with the parent.
+	forkOwner := &TenantScope{IsScoped: false, ParentTenantID: "tenant-parent"}
+	upsert := func(scope *TenantScope, path, fileID string) int {
+		body := fmt.Sprintf(`{"path":%q,"op":"upsert","kind":"file","storage_ref":"blobs/%s"}`, path, fileID)
+		req := httptest.NewRequest(http.MethodPost, "/v1/layers/layer-fork/entries", bytes.NewReader([]byte(body)))
+		if scope != nil {
+			req = req.WithContext(withScope(req.Context(), scope))
+		}
+		rr := httptest.NewRecorder()
+		s.handleFSLayerEntryUpsert(rr, req, s.fallback, s.fallback.Store(), layer)
+		return rr.Code
+	}
+
+	// A blob id that exists only in the parent's namespace has no dentry here.
+	if code := upsert(forkOwner, "/repo/stolen.txt", "file-from-parent-tenant"); code != http.StatusForbidden {
+		t.Fatalf("fork owner upsert status=%d, want 403 (blob outside the fork's metadata)", code)
+	}
+
+	// The same reference is legitimate once the file exists in this tenant.
+	if _, err := s.fallback.WriteCtx(ctx, "/repo/own.txt", []byte("mine"), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate); err != nil {
+		t.Fatalf("write own file: %v", err)
+	}
+	own, err := s.fallback.StatNodeCtx(ctx, "/repo/own.txt")
+	if err != nil {
+		t.Fatalf("stat own file: %v", err)
+	}
+	if code := upsert(forkOwner, "/repo/copy.txt", own.File.FileID); code != http.StatusOK {
+		t.Fatalf("fork owner upsert of its own blob status=%d, want 200", code)
+	}
+
+	// A live tenant keeps the cheaper contract: its namespace is exclusive, so an
+	// owner key needs no per-blob check.
+	liveOwner := &TenantScope{IsScoped: false}
+	if code := upsert(liveOwner, "/repo/live.txt", "file-from-parent-tenant"); code != http.StatusOK {
+		t.Fatalf("live owner upsert status=%d, want 200", code)
+	}
+}
+
+// The read path must deny the same alias, not just entry creation.
+func TestFSLayerObjectReadForkOwnerKeyRejectsForeignBlob(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+
+	if err := s.fallback.Store().CreateFSLayer(ctx, &datastore.FSLayer{LayerID: "layer-fork-read", BaseRootPath: "/repo"}); err != nil {
+		t.Fatalf("CreateFSLayer: %v", err)
+	}
+	layer, err := s.fallback.Store().GetFSLayer(ctx, "layer-fork-read")
+	if err != nil {
+		t.Fatalf("GetFSLayer: %v", err)
+	}
+	// Store the entry directly so the read path is exercised on its own.
+	if err := s.fallback.Store().UpsertFSLayerEntry(ctx, &datastore.FSLayerEntry{
+		LayerID:     layer.LayerID,
+		Path:        "/repo/stolen.txt",
+		Op:          datastore.FSLayerEntryOpUpsert,
+		Kind:        datastore.FSLayerEntryKindFile,
+		StorageType: string(datastore.StorageS3),
+		StorageRef:  "blobs/file-from-parent-tenant",
+		SizeBytes:   4,
+	}); err != nil {
+		t.Fatalf("UpsertFSLayerEntry: %v", err)
+	}
+
+	forkOwner := &TenantScope{IsScoped: false, ParentTenantID: "tenant-parent"}
+	req := httptest.NewRequest(http.MethodGet, "/v1/layers/layer-fork-read/object?path=%2Frepo%2Fstolen.txt", nil)
+	req = req.WithContext(withScope(req.Context(), forkOwner))
+	rr := httptest.NewRecorder()
+	s.handleFSLayerObjectRead(rr, req, s.fallback, s.fallback.Store(), layer)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("read status=%d body=%s, want 403", rr.Code, rr.Body.String())
+	}
+}
