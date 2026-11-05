@@ -2333,7 +2333,6 @@ func TestWitnessMarkerDoesNotForgeTruncation(t *testing.T) {
 	if err := h.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
-	const wantSize = int64(len("child v1"))
 	wb.forgetLanded("/d")
 	wb.forgetLandedPrefix("/d/")
 	if err := wb.opts.Client.RenameCtx(ctx, wb.remotePath("/d"), wb.remotePath("/e")); err != nil {
@@ -2363,8 +2362,8 @@ func TestWitnessMarkerDoesNotForgeTruncation(t *testing.T) {
 
 	// The metadata overlays must skip the witness: stat keeps the remote's
 	// real size instead of the marker's zero.
-	if attr, ok := wb.pendingAttr("/e/f"); ok && attr.Size == 0 {
-		t.Fatalf("pendingAttr served the witness as a zero-byte image: %+v", attr)
+	if attr, ok := wb.pendingAttr("/e/f"); ok && attr.Size != int64(len("child v1")) {
+		t.Fatalf("pendingAttr served the witness instead of the remote size: %+v", attr)
 	}
 	if size, _, _, ok := wb.pendingListAttr("/e/f"); ok && size == 0 {
 		t.Fatal("pendingListAttr served the witness as a zero-byte image")
