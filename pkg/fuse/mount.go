@@ -1070,6 +1070,9 @@ func mountWithConfig(cfg MountConfig) error {
 		// disabled by SelfCheck), never a library default.
 		if cfg.ExtentCacheSize >= 0 {
 			engineConf.CacheSize = uint64(cfg.ExtentCacheSize)
+			// An explicit CLI value (0 included) decides whether the durable
+			// staging tree exists at all.
+			engineConf.CacheSizeConfigured = true
 		}
 
 		engine := extent.NewEngine(engineConf)

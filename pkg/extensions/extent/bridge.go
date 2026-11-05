@@ -56,6 +56,11 @@ type Config struct {
 	// are spilled there at fsync and re-committed by a later mount when a
 	// remote commit never landed. Empty disables the barrier.
 	StagingDir string
+	// StagingBudget bounds the durable staging tree in bytes (0 = unbounded).
+	// The tree lives inside the engine's cache directory but outside
+	// JuiceFS's raw/rawstaging accounting, so it must be charged to the same
+	// allowance the user configured for that directory.
+	StagingBudget int64
 	// NativeWriteback declares that the chunk store runs JuiceFS's own
 	// writeback pipeline: blocks are staged to the disk cache and handed
 	// to the store's asynchronous uploader, so objectStorage.Put may run

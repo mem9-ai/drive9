@@ -24,6 +24,10 @@ type EngineConfig struct {
 	CacheDir string
 	// CacheSize bounds the disk cache in bytes (0 = default).
 	CacheSize uint64
+	// CacheSizeConfigured marks CacheSize as an explicit operator choice, so
+	// 0 means "memory-only" rather than "unset". Without it a zero value is
+	// indistinguishable from a caller that never set a budget.
+	CacheSizeConfigured bool
 	// FreeSpaceRatio is the disk-cache free-space floor (JuiceFS
 	// free-space-ratio): eviction and staging both respect it so the
 	// cache never fills the volume. 0 = JuiceFS default (10%).
@@ -80,9 +84,21 @@ func NewEngine(cfg EngineConfig) *Engine {
 		NativeWriteback: cfg.Writeback && cfg.CacheDir != "",
 		WritebackWait:   cfg.WritebackWait,
 	}
-	if cfg.CacheDir != "" {
-		// Interactive-durability staging lives with the engine's cache.
+	// Interactive-durability staging lives with the engine's cache. It is
+	// charged to the SAME allowance (StagingBudget): the tree sits inside the
+	// cache directory but outside JuiceFS's raw/rawstaging accounting, so
+	// without this an interactive fsync could retain bytes the operator never
+	// budgeted for.
+	//
+	// CacheSize == 0 disables it: that is JuiceFS's explicit memory-only mode
+	// (reads bypass the cache, writeback is off), and arming a durable
+	// on-disk staging tree would retain exactly what the operator asked not
+	// to retain.
+	if cfg.CacheDir != "" && (cfg.CacheSize > 0 || !cfg.CacheSizeConfigured) {
 		bcfg.StagingDir = filepath.Join(cfg.CacheDir, "commit-staging")
+		if cfg.CacheSize > 0 {
+			bcfg.StagingBudget = int64(cfg.CacheSize)
+		}
 	}
 	b := NewBridge(bcfg)
 	if bcfg.StagingDir != "" && !cfg.ReadOnly {

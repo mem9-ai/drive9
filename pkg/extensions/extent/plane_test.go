@@ -5911,3 +5911,94 @@ func TestPublishRefusedBeforeUploadWithoutIdentityCapability(t *testing.T) {
 		t.Fatalf("published anyway: classic=%v extent=%v completes=%d", classic, extent, completes)
 	}
 }
+
+// The empty-create path reaches MaterializeEmpty with NO pending slices, so
+// the commit-path preflight never runs for it. Without its own check, an
+// older server's strict fsync would publish the empty file first and only
+// then fail — the exact ordering the preflight exists to prevent.
+func TestEmptyStrictSyncRefusedBeforeCreate(t *testing.T) {
+	f := newFakeV2(t)
+	f.setDir("/d", true)
+	f.noIdentityCapability = true
+	cacheDir := engineCacheDir(t)
+	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: cacheDir})
+	h := New(Options{Engine: eng, Threshold: 0, SyncMode: "strict"})
+	res, _, _ := dispatchCreate(context.Background(), h, "/d/e.bin", syscall.O_RDWR|syscall.O_CREAT)
+	eh := res.Handle.(*engineHandle)
+
+	if err := eh.Sync(context.Background()); err == nil {
+		t.Fatal("strict fsync must refuse before creating an unattributable empty file")
+	}
+	f.mu.Lock()
+	_, classic := f.classic["/d/e.bin"]
+	_, extent := f.extent["/d/e.bin"]
+	f.mu.Unlock()
+	if classic || extent {
+		t.Fatalf("the empty file was published anyway: classic=%v extent=%v", classic, extent)
+	}
+}
+
+// The durable staging tree sits inside the engine's cache directory but
+// outside JuiceFS's raw/rawstaging accounting, so it must be charged to the
+// configured allowance: an interactive fsync may not retain bytes the operator
+// never budgeted for.
+func TestStagingTreeIsBoundedByTheCacheAllowance(t *testing.T) {
+	const budget = 4 << 10
+	f := newFakeV2(t)
+	f.setDir("/d", true)
+	eng := NewEngine(EngineConfig{
+		Client: client.New(f.URL, ""), RemoteRoot: "/",
+		CacheDir: engineCacheDir(t), CacheSize: budget, CacheSizeConfigured: true,
+	})
+	br := eng.Bridge
+	// Four separate files, each staging a full block: together they exceed
+	// the allowance, so the oldest generations must be evicted.
+	for i := 0; i < 4; i++ {
+		ino := meta.Ino(300 + i)
+		path := fmt.Sprintf("/d/s%d.bin", i)
+		f.seedExtent(t, path, "")
+		br.RememberPathForTest(ino, path)
+		data := make([]byte, 3<<10)
+		for j := range data {
+			data[j] = byte(i)
+		}
+		sum := sha256Hex(data)
+		br.StageBlockForTest(sum, data)
+		br.AddPendingForTest(ino, 0, 0, sum, int64(len(data)), int64(len(data)))
+		if err := br.StagePendingLocal(ino); err != nil {
+			t.Fatalf("stage %d: %v", i, err)
+		}
+	}
+	var total int64
+	entries, err := os.ReadDir(br.cfg.StagingDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		dir := filepath.Join(br.cfg.StagingDir, e.Name())
+		files, derr := os.ReadDir(dir)
+		if derr != nil {
+			continue
+		}
+		for _, fl := range files {
+			if info, ierr := fl.Info(); ierr == nil {
+				total += info.Size()
+			}
+		}
+	}
+	if total > budget {
+		t.Fatalf("staging tree retained %d bytes for a %d-byte allowance", total, budget)
+	}
+}
+
+// CacheSize == 0 is an explicit memory-only choice: no durable staging tree
+// may be armed behind the operator's back.
+func TestExplicitZeroCacheSizeDisablesStaging(t *testing.T) {
+	eng := NewEngine(EngineConfig{
+		Client: client.New("http://127.0.0.1:1", ""), RemoteRoot: "/",
+		CacheDir: engineCacheDir(t), CacheSize: 0, CacheSizeConfigured: true,
+	})
+	if eng.Bridge.StagingDirForTest() != "" {
+		t.Fatalf("staging dir = %q, want none for an explicit CacheSize=0", eng.Bridge.StagingDirForTest())
+	}
+}

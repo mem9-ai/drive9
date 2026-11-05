@@ -1837,7 +1837,9 @@ func (b *Bridge) StagePendingLocal(ino meta.Ino) error {
 	// Supersede: pending is cumulative, so older generations of this file
 	// are redundant once this one is durable.
 	b.removeStagedGensLocked(ino, stagedGenOf(filepath.Base(dir)))
-	return nil
+	// The staging tree is not JuiceFS-accounted, so bound it here against the
+	// engine's own cache allowance.
+	return b.enforceStagingBudgetLocked(dir)
 }
 
 // ReplayStagedLocal re-commits every staged interactive barrier that never
@@ -2357,6 +2359,72 @@ func (b *Bridge) removeStagedGensLocked(ino meta.Ino, keepGen int64) {
 			_ = os.RemoveAll(filepath.Join(b.cfg.StagingDir, e.Name()))
 		}
 	}
+}
+
+// enforceStagingBudgetLocked bounds the durable staging tree by REMOVING the
+// oldest generations, never by exceeding the budget. The tree lives inside the
+// engine's own cache directory, so it must respect the same allowance the
+// user configured for that directory: without this, repeated interactive
+// fsyncs on different files retained bytes with no accounting at all, and the
+// JuiceFS raw/rawstaging accounting does not cover these files.
+//
+// keepDir is the generation this call just wrote — it is never evicted.
+// Returns an error when that single generation alone exceeds the budget: an
+// fsync that cannot be honoured within the allowance must fail rather than
+// silently overshoot it.
+func (b *Bridge) enforceStagingBudgetLocked(keepDir string) error {
+	if b.cfg.StagingBudget <= 0 {
+		return nil
+	}
+	entries, err := os.ReadDir(b.cfg.StagingDir)
+	if err != nil {
+		return nil // nothing readable to bound
+	}
+	type gen struct {
+		name string
+		size int64
+		gen  int64
+	}
+	var gens []gen
+	var total int64
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		dir := filepath.Join(b.cfg.StagingDir, e.Name())
+		var size int64
+		files, derr := os.ReadDir(dir)
+		if derr != nil {
+			continue
+		}
+		for _, f := range files {
+			if info, ierr := f.Info(); ierr == nil {
+				size += info.Size()
+			}
+		}
+		gens = append(gens, gen{name: e.Name(), size: size, gen: stagedGenOf(e.Name())})
+		total += size
+	}
+	if total <= b.cfg.StagingBudget {
+		return nil
+	}
+	// Oldest first, and never the generation being published.
+	sort.Slice(gens, func(i, j int) bool { return gens[i].gen < gens[j].gen })
+	for _, g := range gens {
+		if total <= b.cfg.StagingBudget {
+			break
+		}
+		if g.name == keepDir || g.name == filepath.Base(keepDir) {
+			continue
+		}
+		if rerr := os.RemoveAll(filepath.Join(b.cfg.StagingDir, g.name)); rerr == nil {
+			total -= g.size
+		}
+	}
+	if total > b.cfg.StagingBudget {
+		return fmt.Errorf("staging budget exceeded: %d bytes retained for a %d-byte allowance", total, b.cfg.StagingBudget)
+	}
+	return nil
 }
 
 // lockCommit serializes a file's commit lifecycle (snapshot -> remote
@@ -3227,6 +3295,15 @@ func (b *Bridge) MaterializeEmpty(ctx context.Context, ino meta.Ino) error {
 			return nil
 		}
 		return fmt.Errorf("materialize empty file %s: name occupied by an object this descriptor did not create", path)
+	}
+	// The SAME pre-publication boundary as the nonempty path: an older server
+	// that does not advertise completion_identity_v1 cannot attribute the
+	// object it is about to create, and discovering that AFTER the create
+	// leaves a published empty file whose descriptor can never be used.
+	// Check here too — Sync reaches MaterializeEmpty without any pending
+	// slices, so the commit-path preflight never runs for it.
+	if !b.cfg.Client.WarmCompletionIdentity(ctx) {
+		return fmt.Errorf("materialize empty file %s: server does not advertise completion_identity_v1, so the created object cannot be attributed to this descriptor", path)
 	}
 	rev, createdID, err := b.cfg.Client.CreateFileCreatedCtx(ctx, path)
 	if err != nil {
