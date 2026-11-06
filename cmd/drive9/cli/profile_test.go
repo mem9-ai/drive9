@@ -371,12 +371,23 @@ func TestBuiltinCodingAgentRoutesSQLiteToExtent(t *testing.T) {
 	// Every family member for every base suffix, so a database opened in any
 	// SQLite journal mode rides the plane from byte zero.
 	for _, base := range []string{"db", "db3", "sqlite", "sqlite3"} {
-		for _, suffix := range []string{"", "-wal", "-shm", "-journal", "-mj*"} {
+		for _, suffix := range []string{"", "-shm", "-journal", "-mj*"} {
 			want := "*." + base + suffix
 			if !has[want] {
 				t.Errorf("coding-agent [extent] is missing %q", want)
 			}
 		}
+		// `-wal` belongs to the append-log plane, which implements SQLite's
+		// WAL protocol (committed-header confirmation, salt-difference
+		// generation resets). Claiming it here would silently move the file
+		// off the code written for its wire format.
+		wal := "*." + base + "-wal"
+		if has[wal] {
+			t.Errorf("coding-agent [extent] claims %q, which the append-log plane must own", wal)
+		}
+	}
+	if len(cfg.AppendLogPatterns) == 0 {
+		t.Error("coding-agent lost its [append-log] WAL pattern")
 	}
 	// The round trip must preserve them: a profile copied with
 	// `drive9 profile show > ~/.drive9/profiles/...` keeps the routing.

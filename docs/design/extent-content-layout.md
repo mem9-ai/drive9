@@ -110,11 +110,18 @@ file from the database's own name, and a bare `*.db` does **not** match
 `app.db-wal`:
 
 ```
-*.db            *.db-wal        *.db-shm        *.db-journal   *.db-mj*
-*.db3           *.db3-wal       *.db3-shm       *.db3-journal  *.db3-mj*
-*.sqlite        *.sqlite-wal    *.sqlite-shm    *.sqlite-journal  *.sqlite-mj*
-*.sqlite3       *.sqlite3-wal   *.sqlite3-shm   *.sqlite3-journal *.sqlite3-mj*
+*.db            *.db-shm        *.db-journal   *.db-mj*
+*.db3           *.db3-shm       *.db3-journal  *.db3-mj*
+*.sqlite        *.sqlite-shm    *.sqlite-journal  *.sqlite-mj*
+*.sqlite3       *.sqlite3-shm   *.sqlite3-journal *.sqlite3-mj*
 ```
+
+`-wal` is deliberately **not** here. The append-log plane owns it
+(`[append-log] **/*-wal`) and implements SQLite's WAL protocol —
+committed-header confirmation, salt-difference detection for generation
+resets, and the header-only rewrite path. appendlog also sits outside the
+extent plane in the chain, so it would win the claim regardless; listing `-wal`
+under `[extent]` would only be a comment that lies.
 
 Patterns without a `/` match the BASENAME at any depth, so
 `~/proj/data/app.db` is covered. A whole database *directory* is deliberately
