@@ -286,6 +286,89 @@ func TestCompareReleaseVersions(t *testing.T) {
 	}
 }
 
+func TestUpdateRejectsEnvBaseURLOutsidePinnedHosts(t *testing.T) {
+	t.Setenv("DRIVE9_UPDATE_BASE_URL", "https://releases.attacker.example")
+
+	var stderr bytes.Buffer
+	err := updateWithDeps(nil, updateDeps{
+		currentVersion: "v0.1.0",
+		goos:           "linux",
+		goarch:         "amd64",
+		stdout:         &bytes.Buffer{},
+		stderr:         &stderr,
+	})
+	if err == nil || !strings.Contains(err.Error(), "not a pinned drive9 release host") {
+		t.Fatalf("update error = %v, want pinned-host rejection", err)
+	}
+}
+
+func TestIsPinnedUpdateHost(t *testing.T) {
+	tests := []struct {
+		name    string
+		baseURL string
+		want    bool
+	}{
+		{name: "default host", baseURL: "https://drive9.ai", want: true},
+		{name: "www subdomain", baseURL: "https://www.drive9.ai", want: true},
+		{name: "release subdomain", baseURL: "https://releases.drive9.ai", want: true},
+		{name: "suffix lookalike", baseURL: "https://drive9.ai.attacker.example", want: false},
+		{name: "hyphen lookalike", baseURL: "https://evil-drive9.ai", want: false},
+		{name: "path lookalike", baseURL: "https://attacker.example/drive9.ai", want: false},
+		{name: "empty", baseURL: "", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isPinnedUpdateHost(tt.baseURL); got != tt.want {
+				t.Fatalf("isPinnedUpdateHost(%q) = %v, want %v", tt.baseURL, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestUpdateExplicitBaseURLAllowsCustomHost(t *testing.T) {
+	payload := []byte("new-drive9")
+	sum := sha256.Sum256(payload)
+	target := filepath.Join(t.TempDir(), "drive9")
+	if err := os.WriteFile(target, []byte("old-drive9"), 0o755); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+
+	srv := httptest.NewServer(updateTestReleaseHandler(t, payload, fmt.Sprintf("%x", sum[:])))
+	defer srv.Close()
+
+	var stderr bytes.Buffer
+	err := updateWithDeps([]string{"--base-url", srv.URL}, updateDeps{
+		currentVersion:       "v0.1.0",
+		goos:                 "linux",
+		goarch:               "amd64",
+		executable:           func() (string, error) { return target, nil },
+		httpClient:           srv.Client(),
+		stdout:               &bytes.Buffer{},
+		stderr:               &stderr,
+		allowInsecureBaseURL: true,
+		replaceExecutable: func(newPath, targetPath string) error {
+			if err := os.Remove(targetPath); err != nil {
+				return err
+			}
+			return os.Rename(newPath, targetPath)
+		},
+	})
+	if err != nil {
+		t.Fatalf("update with explicit --base-url: %v", err)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read target: %v", err)
+	}
+	if string(got) != string(payload) {
+		t.Errorf("updated binary = %q, want %q", got, payload)
+	}
+	if !strings.Contains(stderr.String(), "custom release root") {
+		t.Errorf("stderr = %q, want custom release root warning", stderr.String())
+	}
+}
+
 func TestParseChecksumsRejectsPathQualifiedArtifactNames(t *testing.T) {
 	sum := strings.Repeat("a", sha256.Size*2)
 	_, err := parseChecksums([]byte(fmt.Sprintf("%s  releases/drive9-linux-amd64\n", sum)))
