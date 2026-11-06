@@ -1,8 +1,10 @@
 # gitleaks configuration — https://github.com/gitleaks/gitleaks
 #
 # Extends the built-in rule set and allowlists values that gitleaks reports but
-# that are demonstrably not credentials: the loopback-only local-dev placeholder
-# keys, a CLI test JWT fixture, and documentation placeholders.
+# that are demonstrably not credentials: a CLI test JWT fixture, documentation
+# placeholders, and the retired local-dev placeholder keys that remain in history.
+# The local provider no longer ships any key material — it generates a key pair
+# per installation (cmd/drive9-server/local_dev_keys.go).
 #
 # Every expression is anchored with ^...$ so it matches a complete detected
 # secret; a longer credential that merely contains a fixture value is never
@@ -18,15 +20,31 @@ title = "drive9 gitleaks config"
 [extend]
 useDefault = true
 
+# The retired local-dev placeholder keys are exempt only in the commit that
+# introduced them (572e442d, before the local provider generated its own key
+# pair). Scoping by commit rather than by value means a reintroduction of those
+# strings in a new commit — as live defaults again — is still reported.
+[[allowlists]]
+description = "Retired local-dev placeholder keys, historical commit only"
+# 572e442d is the squash-merge that introduced the values; b484fcc2 is the
+# pre-merge original, which only survives in local clones that still carry the
+# pre-rewrite feature branch.
+commits = [
+    "572e442d6bfd1e7b34d3d349ca10361329929557",
+    "b484fcc2434c182a2848d53693580a1e3d8a72d6",
+]
+paths = ["^pkg/tenant/local/provisioner\\.go$"]
+regexes = [
+    "^0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef$",
+    "^fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210$",
+]
+condition = "AND"
+
 [[allowlists]]
 description = "Non-secret placeholders and test fixtures"
 
 # Matched against the detected secret itself (gitleaks' default regexTarget).
 regexes = [
-    # pkg/tenant/local: fixed placeholder keys of the loopback-only local dev
-    # provider (DRIVE9_TENANT_PROVIDER=local); overridable by env, not credentials.
-    "^0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef$",
-    "^fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210$",
     # cmd/drive9/cli/ctx_test.go: fake JWT used to assert masking/reveal.
     "^eyJhbGciOiJIUzI1NiJ9\\.eyJncmFudF9pZCI6ImdydF8xIn0\\.signature$",
     # docs/tidbcloud-native-provider-design.md: digest-auth placeholder pairs.

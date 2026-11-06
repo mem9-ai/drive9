@@ -94,7 +94,7 @@ func main() {
 	localProvider := strings.TrimSpace(os.Getenv("DRIVE9_TENANT_PROVIDER")) == tenant.ProviderLocal
 	addr := resolveServerListenAddr(cliAddr, os.Getenv("DRIVE9_LISTEN_ADDR"), localProvider)
 	if localProvider {
-		applyLocalProviderEnvDefaults(addr)
+		die(applyLocalProviderEnvDefaults(addr))
 		die(rejectLocalProviderNonLoopbackDefaults(addr))
 	}
 

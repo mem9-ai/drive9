@@ -14,6 +14,7 @@ import (
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/datastore"
+	"github.com/mem9-ai/drive9/pkg/tenant/token"
 )
 
 func TestFSLayerPathQueryPreservesControlWhitespace(t *testing.T) {
@@ -1059,7 +1060,7 @@ func TestFSLayerSearchOverlayMergesLayerEntries(t *testing.T) {
 		t.Fatalf("Upsert layer file: %v", err)
 	}
 	base := []datastore.SearchResult{{Path: "/repo/base.txt", Name: "base.txt", SizeBytes: 11}}
-	grep, err := overlayFSLayerGrep(ctx, s.fallback, "layer-search", "needle", "/repo/", 20, base)
+	grep, err := s.overlayFSLayerGrep(ctx, s.fallback, nil, "layer-search", "needle", "/repo/", 20, base)
 	if err != nil {
 		t.Fatalf("overlayFSLayerGrep: %v", err)
 	}
@@ -1629,5 +1630,332 @@ func TestFSLayerStorageRefRequiresScopedReadOnSource(t *testing.T) {
 	s.handleFSLayerEntryUpsert(rr, req, s.fallback, s.fallback.Store(), layer)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("in-scope upsert status=%d body=%s, want 200", rr.Code, rr.Body.String())
+	}
+}
+
+// A fork tenant inherits the parent's storage namespace, so a blob id that
+// belongs to the parent resolves in the same bucket for the child. An owner key
+// (unscoped) must not be able to alias a parent blob onto its own layer path:
+// existence in the fork's own metadata is what authorizes it.
+func TestFSLayerStorageRefForkOwnerKeyStaysInTenantNamespace(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+
+	if err := s.fallback.Store().CreateFSLayer(ctx, &datastore.FSLayer{LayerID: "layer-fork", BaseRootPath: "/repo"}); err != nil {
+		t.Fatalf("CreateFSLayer: %v", err)
+	}
+	layer, err := s.fallback.Store().GetFSLayer(ctx, "layer-fork")
+	if err != nil {
+		t.Fatalf("GetFSLayer: %v", err)
+	}
+
+	// An owner key of a forked tenant: full access, but the storage namespace is
+	// shared with the parent.
+	forkOwner := &TenantScope{IsScoped: false, IsFork: true, ParentTenantID: "tenant-parent"}
+	upsert := func(scope *TenantScope, path, fileID string) int {
+		body := fmt.Sprintf(`{"path":%q,"op":"upsert","kind":"file","storage_ref":"blobs/%s"}`, path, fileID)
+		req := httptest.NewRequest(http.MethodPost, "/v1/layers/layer-fork/entries", bytes.NewReader([]byte(body)))
+		if scope != nil {
+			req = req.WithContext(withScope(req.Context(), scope))
+		}
+		rr := httptest.NewRecorder()
+		s.handleFSLayerEntryUpsert(rr, req, s.fallback, s.fallback.Store(), layer)
+		return rr.Code
+	}
+
+	// A blob id that exists only in the parent's namespace has no dentry here.
+	if code := upsert(forkOwner, "/repo/stolen.txt", "file-from-parent-tenant"); code != http.StatusForbidden {
+		t.Fatalf("fork owner upsert status=%d, want 403 (blob outside the fork's metadata)", code)
+	}
+
+	// The same reference is legitimate once the file exists in this tenant.
+	if _, err := s.fallback.WriteCtx(ctx, "/repo/own.txt", []byte("mine"), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate); err != nil {
+		t.Fatalf("write own file: %v", err)
+	}
+	own, err := s.fallback.StatNodeCtx(ctx, "/repo/own.txt")
+	if err != nil {
+		t.Fatalf("stat own file: %v", err)
+	}
+	if code := upsert(forkOwner, "/repo/copy.txt", own.File.FileID); code != http.StatusOK {
+		t.Fatalf("fork owner upsert of its own blob status=%d, want 200", code)
+	}
+
+	// A live tenant keeps the cheaper contract: its namespace is exclusive, so an
+	// owner key needs no per-blob check.
+	liveOwner := &TenantScope{IsScoped: false}
+	if code := upsert(liveOwner, "/repo/live.txt", "file-from-parent-tenant"); code != http.StatusOK {
+		t.Fatalf("live owner upsert status=%d, want 200", code)
+	}
+}
+
+// The read path must deny the same alias, not just entry creation.
+func TestFSLayerObjectReadForkOwnerKeyRejectsForeignBlob(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+
+	if err := s.fallback.Store().CreateFSLayer(ctx, &datastore.FSLayer{LayerID: "layer-fork-read", BaseRootPath: "/repo"}); err != nil {
+		t.Fatalf("CreateFSLayer: %v", err)
+	}
+	layer, err := s.fallback.Store().GetFSLayer(ctx, "layer-fork-read")
+	if err != nil {
+		t.Fatalf("GetFSLayer: %v", err)
+	}
+	// Store the entry directly so the read path is exercised on its own.
+	if err := s.fallback.Store().UpsertFSLayerEntry(ctx, &datastore.FSLayerEntry{
+		LayerID:     layer.LayerID,
+		Path:        "/repo/stolen.txt",
+		Op:          datastore.FSLayerEntryOpUpsert,
+		Kind:        datastore.FSLayerEntryKindFile,
+		StorageType: string(datastore.StorageS3),
+		StorageRef:  "blobs/file-from-parent-tenant",
+		SizeBytes:   4,
+	}); err != nil {
+		t.Fatalf("UpsertFSLayerEntry: %v", err)
+	}
+
+	forkOwner := &TenantScope{IsScoped: false, IsFork: true, ParentTenantID: "tenant-parent"}
+	req := httptest.NewRequest(http.MethodGet, "/v1/layers/layer-fork-read/object?path=%2Frepo%2Fstolen.txt", nil)
+	req = req.WithContext(withScope(req.Context(), forkOwner))
+	rr := httptest.NewRecorder()
+	s.handleFSLayerObjectRead(rr, req, s.fallback, s.fallback.Store(), layer)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("read status=%d body=%s, want 403", rr.Code, rr.Body.String())
+	}
+}
+
+// An overwrite keeps the file id but writes the bytes to a generated object key,
+// so "blobs/<key>" is not always a file id. A fork owner key must still be able
+// to reference such a blob, and a foreign key must still be refused.
+func TestFSLayerStorageRefForkResolvesOverwrittenBlobKey(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+
+	if _, err := s.fallback.WriteCtx(ctx, "/repo/large.bin", bytes.Repeat([]byte("x"), 8<<10), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	node, err := s.fallback.StatNodeCtx(ctx, "/repo/large.bin")
+	if err != nil {
+		t.Fatalf("stat file: %v", err)
+	}
+	if node.File == nil || node.File.FileID == "" {
+		t.Fatal("file has no id")
+	}
+	// Force the overwrite shape: same file identity, generated object key.
+	overwriteKey := "blobs/" + token.NewID()
+	refHash := datastore.StorageRefHash(overwriteKey)
+	if _, err := s.fallback.Store().DB().ExecContext(ctx,
+		`UPDATE contents SET storage_type = ?, storage_ref = ?, storage_ref_hash = ? WHERE inode_id = ?`,
+		datastore.StorageS3, overwriteKey, refHash, node.File.FileID); err != nil {
+		t.Fatalf("rewrite storage_ref: %v", err)
+	}
+
+	if err := s.fallback.Store().CreateFSLayer(ctx, &datastore.FSLayer{LayerID: "layer-ow", BaseRootPath: "/repo"}); err != nil {
+		t.Fatalf("CreateFSLayer: %v", err)
+	}
+	layer, err := s.fallback.Store().GetFSLayer(ctx, "layer-ow")
+	if err != nil {
+		t.Fatalf("GetFSLayer: %v", err)
+	}
+
+	forkOwner := &TenantScope{IsScoped: false, IsFork: true, ParentTenantID: "tenant-parent"}
+	upsert := func(blobKey string) int {
+		body := fmt.Sprintf(`{"path":"/repo/alias.bin","op":"upsert","kind":"file","storage_ref":"blobs/%s"}`, blobKey)
+		req := httptest.NewRequest(http.MethodPost, "/v1/layers/layer-ow/entries", bytes.NewReader([]byte(body)))
+		req = req.WithContext(withScope(req.Context(), forkOwner))
+		rr := httptest.NewRecorder()
+		s.handleFSLayerEntryUpsert(rr, req, s.fallback, s.fallback.Store(), layer)
+		return rr.Code
+	}
+
+	if code := upsert(strings.TrimPrefix(overwriteKey, "blobs/")); code != http.StatusOK {
+		t.Fatalf("overwrite blob reference status=%d body=%s, want 200", code, "")
+	}
+	// A key with no file behind it in this tenant is still refused.
+	if code := upsert(token.NewID()); code != http.StatusForbidden {
+		t.Fatalf("foreign blob status=%d, want 403", code)
+	}
+}
+
+// The grep overlay reads layer-entry bytes, so it has to apply the same
+// storage_ref source check as the object-read endpoint. Skipping it would leak a
+// match/no-match verdict for content the caller cannot read.
+func TestOverlayFSLayerGrepHonorsStorageRefScope(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+
+	// Above the inline threshold so the file is backed by an S3 object.
+	secretBody := append(bytes.Repeat([]byte("a"), 64<<10), []byte("needle in secret")...)
+	if _, err := s.fallback.WriteCtx(ctx, "/secret/out.txt", secretBody, 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate); err != nil {
+		t.Fatalf("write secret file: %v", err)
+	}
+	secret, err := s.fallback.StatNodeCtx(ctx, "/secret/out.txt")
+	if err != nil {
+		t.Fatalf("stat secret file: %v", err)
+	}
+	if secret.File == nil || !strings.HasPrefix(secret.File.StorageRef, "blobs/") {
+		t.Fatalf("secret file storage_ref = %q, want an S3 blob", secret.File.StorageRef)
+	}
+	if err := s.fallback.Store().CreateFSLayer(ctx, &datastore.FSLayer{LayerID: "layer-grep-scope", BaseRootPath: "/repo"}); err != nil {
+		t.Fatalf("CreateFSLayer: %v", err)
+	}
+	// An owner-created alias: the entry lives at a path the scoped key can read,
+	// but its bytes are the out-of-scope file's blob.
+	if err := s.fallback.Store().UpsertFSLayerEntry(ctx, &datastore.FSLayerEntry{
+		LayerID:     "layer-grep-scope",
+		Path:        "/repo/alias.txt",
+		Op:          datastore.FSLayerEntryOpUpsert,
+		Kind:        datastore.FSLayerEntryKindFile,
+		StorageType: string(datastore.StorageS3),
+		StorageRef:  secret.File.StorageRef,
+		SizeBytes:   secret.File.SizeBytes,
+	}); err != nil {
+		t.Fatalf("UpsertFSLayerEntry: %v", err)
+	}
+
+	scoped := &TenantScope{
+		IsScoped: true,
+		FSScopes: []FSScope{{Prefix: "/repo", Ops: map[FSOp]bool{FSOpRead: true}}},
+	}
+	results, err := s.overlayFSLayerGrep(ctx, s.fallback, scoped, "layer-grep-scope", "needle", "/repo/", 20, nil)
+	if err != nil {
+		t.Fatalf("overlayFSLayerGrep: %v", err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("grep leaked an out-of-scope match: %+v", results)
+	}
+
+	// The same entry matches once the source is inside the caller's scope.
+	wider := &TenantScope{
+		IsScoped: true,
+		FSScopes: []FSScope{{Prefix: "/", Ops: map[FSOp]bool{FSOpRead: true}}},
+	}
+	results, err = s.overlayFSLayerGrep(ctx, s.fallback, wider, "layer-grep-scope", "needle", "/repo/", 20, nil)
+	if err != nil {
+		t.Fatalf("overlayFSLayerGrep(wider): %v", err)
+	}
+	if len(results) != 1 || results[0].Path != "/repo/alias.txt" {
+		t.Fatalf("grep results = %+v, want the aliased entry for an in-scope source", results)
+	}
+}
+
+// The storage_ref resolution relies on an invariant the backend owns: a
+// blobs/<key> object is written once and never rewritten in place, so a key that
+// a fork's metadata can reach always holds the bytes that file id had. This pins
+// that invariant with a real overwrite rather than a fabricated row.
+func TestOverwriteMintsNewBlobKeyAndKeepsOriginalBytes(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+
+	if _, err := s.fallback.WriteCtx(ctx, "/repo/bin.dat", bytes.Repeat([]byte("one"), 64<<10), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	created, err := s.fallback.StatNodeCtx(ctx, "/repo/bin.dat")
+	if err != nil {
+		t.Fatalf("stat after create: %v", err)
+	}
+	originalRef := created.File.StorageRef
+	if !strings.HasPrefix(originalRef, "blobs/") {
+		t.Fatalf("storage_ref = %q, want an S3 blob", originalRef)
+	}
+	originalBytes, err := s.fallback.ReadCtx(ctx, "/repo/bin.dat", 0, -1)
+	if err != nil {
+		t.Fatalf("read original: %v", err)
+	}
+
+	if _, err := s.fallback.WriteCtx(ctx, "/repo/bin.dat", bytes.Repeat([]byte("two"), 64<<10), 0, filesystem.WriteFlagTruncate); err != nil {
+		t.Fatalf("overwrite: %v", err)
+	}
+	overwritten, err := s.fallback.StatNodeCtx(ctx, "/repo/bin.dat")
+	if err != nil {
+		t.Fatalf("stat after overwrite: %v", err)
+	}
+	if overwritten.File.FileID != created.File.FileID {
+		t.Fatalf("file id changed on overwrite (%s -> %s); the resolution assumes it is stable",
+			created.File.FileID, overwritten.File.FileID)
+	}
+	if overwritten.File.StorageRef == originalRef {
+		t.Fatalf("overwrite reused blob key %q; the storage-ref fallback assumes a fresh key per write", originalRef)
+	}
+	// The original object must still hold the original bytes: a fork whose
+	// metadata still points at originalRef reads history, not the new content.
+	staleBytes, err := s.fallback.ReadFSLayerEntryData(ctx, &datastore.FSLayerEntry{
+		StorageType: string(datastore.StorageS3),
+		StorageRef:  originalRef,
+	})
+	if err != nil {
+		t.Fatalf("original blob is gone after overwrite: %v", err)
+	}
+	if !bytes.Equal(staleBytes, originalBytes) {
+		t.Fatalf("the original blob was rewritten in place (%d bytes, want the pre-overwrite %d)",
+			len(staleBytes), len(originalBytes))
+	}
+	again, err := s.fallback.ReadCtx(ctx, "/repo/bin.dat", 0, -1)
+	if err != nil {
+		t.Fatalf("read after overwrite: %v", err)
+	}
+	if bytes.Equal(again, originalBytes) {
+		t.Fatal("overwrite did not change the visible content")
+	}
+}
+
+// A policy denial during commit must leave the layer in a state the API can still
+// act on. "committing" has no exit — re-commit needs active/sealed, rollback needs
+// active/sealed/conflicted, and chain deletion refuses it — so a scoped or fork key
+// denied here used to strand the layer.
+func TestFSLayerCommitDenialLeavesLayerConflicted(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+
+	if _, err := s.fallback.WriteCtx(ctx, "/secret/commit.txt", bytes.Repeat([]byte("s"), 64<<10), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate); err != nil {
+		t.Fatalf("write secret file: %v", err)
+	}
+	secret, err := s.fallback.StatNodeCtx(ctx, "/secret/commit.txt")
+	if err != nil {
+		t.Fatalf("stat secret: %v", err)
+	}
+	if !strings.HasPrefix(secret.File.StorageRef, "blobs/") {
+		t.Fatalf("storage_ref = %q, want an S3 blob", secret.File.StorageRef)
+	}
+	if err := s.fallback.Store().CreateFSLayer(ctx, &datastore.FSLayer{
+		LayerID: "layer-commit-deny", BaseRootPath: "/repo", State: datastore.FSLayerStateActive,
+	}); err != nil {
+		t.Fatalf("CreateFSLayer: %v", err)
+	}
+	// An alias to an out-of-scope blob, written before the scope was narrowed.
+	if err := s.fallback.Store().UpsertFSLayerEntry(ctx, &datastore.FSLayerEntry{
+		LayerID:     "layer-commit-deny",
+		Path:        "/repo/alias.txt",
+		Op:          datastore.FSLayerEntryOpUpsert,
+		Kind:        datastore.FSLayerEntryKindFile,
+		StorageType: string(datastore.StorageS3),
+		StorageRef:  secret.File.StorageRef,
+		SizeBytes:   secret.File.SizeBytes,
+	}); err != nil {
+		t.Fatalf("UpsertFSLayerEntry: %v", err)
+	}
+	layer, err := s.fallback.Store().GetFSLayer(ctx, "layer-commit-deny")
+	if err != nil {
+		t.Fatalf("GetFSLayer: %v", err)
+	}
+
+	scoped := &TenantScope{IsScoped: true, FSScopes: []FSScope{{Prefix: "/repo", Ops: map[FSOp]bool{FSOpRead: true, FSOpWrite: true}}}}
+	req := httptest.NewRequest(http.MethodPost, "/v1/layers/layer-commit-deny/commit", nil)
+	req = req.WithContext(withScope(req.Context(), scoped))
+	rr := httptest.NewRecorder()
+	s.handleFSLayerCommit(rr, req, s.fallback, s.fallback.Store(), layer)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("commit status=%d body=%s, want 403", rr.Code, rr.Body.String())
+	}
+
+	after, err := s.fallback.Store().GetFSLayer(ctx, "layer-commit-deny")
+	if err != nil {
+		t.Fatalf("GetFSLayer after denial: %v", err)
+	}
+	if after.State != datastore.FSLayerStateConflicted {
+		t.Fatalf("layer state = %s, want conflicted (a denial must not strand it in committing)", after.State)
+	}
+	// Conflicted is a state the API can leave.
+	if err := s.fallback.Store().RollbackFSLayer(ctx, "layer-commit-deny"); err != nil {
+		t.Fatalf("rollback after denial: %v", err)
 	}
 }

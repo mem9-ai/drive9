@@ -3173,6 +3173,153 @@ func shouldLogStoreOpFailure(result string) bool {
 	}
 }
 
+// ListFileDentryPathsByInodeID returns the dentry paths that reach one file's
+// inode. file_nodes indexes both file_id and inode_id; the inode is the stable
+// identity when a caller only knows a storage reference.
+func (s *Store) ListFileDentryPathsByInodeID(ctx context.Context, inodeID string, limit int) (out []string, err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "list_file_dentry_paths_by_inode_id", start, &err)
+
+	inodeID = strings.TrimSpace(inodeID)
+	if inodeID == "" {
+		return nil, fmt.Errorf("inode_id is required")
+	}
+	if limit <= 0 {
+		limit = 64
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT path FROM file_nodes WHERE `+s.scope.And(`inode_id = ?`)+`
+		ORDER BY path ASC LIMIT ?`, s.scope.Args(inodeID, limit)...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out, rows.Err()
+}
+
+// ResolveStorageRefDentryPaths returns the dentry paths through which a
+// "blobs/<key>" object reference is reachable.
+//
+// The key is a file id for a freshly created file, but an overwrite keeps the
+// file id and writes the bytes to a generated object key, and a layer entry
+// written before such an overwrite keeps pointing at the older key. Both
+// identities therefore have to be resolved, and both file_nodes identities
+// (file_id and inode_id) have to be consulted: legacy rows key the dentry by
+// file id, the inode model keys it by inode. Results are de-duplicated so one
+// name is never charged twice against limit.
+func (s *Store) ResolveStorageRefDentryPaths(ctx context.Context, storageRef string, limit int) (out []string, err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "resolve_storage_ref_dentry_paths", start, &err)
+
+	storageRef = strings.TrimSpace(storageRef)
+	if storageRef == "" {
+		return nil, fmt.Errorf("storage_ref is required")
+	}
+	if limit <= 0 {
+		limit = 64
+	}
+	seen := make(map[string]struct{}, limit)
+	add := func(paths []string) {
+		for _, p := range paths {
+			if len(out) >= limit {
+				return
+			}
+			if _, dup := seen[p]; dup {
+				continue
+			}
+			seen[p] = struct{}{}
+			out = append(out, p)
+		}
+	}
+
+	// A create-time reference is named after the file id.
+	createPaths, createErr := s.ListFileDentryPathsByFileID(ctx, strings.TrimPrefix(storageRef, "blobs/"), limit)
+	if createErr != nil {
+		return nil, createErr
+	}
+	add(createPaths)
+
+	// Overwrite-time and historical references are resolved through the stored
+	// storage_ref instead.
+	inodes, err := s.ListInodeIDsByStorageRef(ctx, storageRef, storageRefInodeLimit)
+	if err != nil {
+		return nil, err
+	}
+	for _, inodeID := range inodes {
+		if len(out) >= limit {
+			break
+		}
+		inodePaths, inodeErr := s.ListFileDentryPathsByInodeID(ctx, inodeID, limit-len(out))
+		if inodeErr != nil {
+			return nil, inodeErr
+		}
+		add(inodePaths)
+		if len(inodePaths) > 0 {
+			// The inode lookup found the names; the file-id lookup would only
+			// repeat them (file_id == inode_id in the standard model).
+			continue
+		}
+		filePaths, fileErr := s.ListFileDentryPathsByFileID(ctx, inodeID, limit-len(out))
+		if fileErr != nil {
+			return nil, fileErr
+		}
+		add(filePaths)
+	}
+	return out, nil
+}
+
+// storageRefInodeLimit bounds how many inodes one storage reference may resolve
+// to; a blob shared by more than a handful of files is already unusual.
+const storageRefInodeLimit = 8
+
+// ListInodeIDsByStorageRef returns the inodes whose content is stored at one
+// exact S3 object key. An overwrite keeps the file id and writes the bytes to a
+// generated key, so the object key alone identifies the inode; callers that were
+// handed a "blobs/<key>" reference must resolve it through here rather than
+// assuming the key is a file id.
+func (s *Store) ListInodeIDsByStorageRef(ctx context.Context, storageRef string, limit int) (out []string, err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "list_inode_ids_by_storage_ref", start, &err)
+
+	storageRef = strings.TrimSpace(storageRef)
+	if storageRef == "" {
+		return nil, fmt.Errorf("storage_ref is required")
+	}
+	if limit <= 0 {
+		limit = 8
+	}
+	// Hash first so the query can use idx_contents_storage_ref_hash, then compare
+	// the full ref instead of trusting the hash as identity.
+	rows, err := s.db.QueryContext(ctx, `SELECT inode_id FROM contents
+		WHERE `+s.scope.And(`storage_type = ? AND storage_ref_hash = ? AND storage_ref = ?`)+`
+		ORDER BY inode_id ASC LIMIT ?`,
+		s.scope.Args(StorageS3, StorageRefHash(storageRef), storageRef, limit)...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out, rows.Err()
+}
+
 // ListFileDentryPathsByFileID returns the dentry paths that reference a file
 // entity.
 //
