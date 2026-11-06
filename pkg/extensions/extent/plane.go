@@ -244,11 +244,25 @@ func (h *Handler) openExistingLocked(ctx context.Context, path string, flags uin
 // holds a different revision than the caller expects, so the caller keeps
 // its current plane rather than adopting someone else's object.
 // The returned handle has no kernel fd; it is driven through fs.Handle only.
+//
+// LOCKING: this deliberately does NOT take h.lockPaths. Its only caller is
+// the write-back plane's promotion migration, which holds ITS per-path lock
+// across the call; taking the extent path lock here would create the cycle
+//
+//	migration:  writeback path lock -> extent path lock
+//	rename:     extent path lock    -> writeback path lock (via next -> flush)
+//
+// which is an ABBA deadlock over two mutexes (no RPC deadline can break it).
+// The order that IS allowed is extent -> writeback, because rename needs to
+// flush the source writer while it holds the namespace lock. Everything this
+// function does is therefore lock-free with respect to the extent plane; the
+// revision check is what keeps a rename/replacement from being adopted, and
+// the caller re-checks the handle's state under its own lock before
+// installing the result.
 func (h *Handler) OpenExisting(ctx context.Context, path string, flags uint32, expectRevision int64, c fs.Caller) (fs.Handle, bool, error) {
 	if h == nil || h.opts.Engine == nil {
 		return nil, false, nil
 	}
-	defer h.lockPaths(path)()
 	st, err := h.opts.Engine.Bridge.StatLocal(ctx, path)
 	if err != nil {
 		if client.IsNotFound(err) {

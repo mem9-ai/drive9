@@ -675,9 +675,15 @@ func New(opts Options) (*Writeback, error) {
 			// keeps its classic buffering forever: every later fsync then
 			// re-stages and re-uploads the whole image to an object that is
 			// already extent (the 32 MiB x 2600-fsync quota exhaustion).
-			// The callback runs under this path's lock, the same lock the
-			// staging path takes, so no staging is in flight across the swap.
-			w.migrateHandleToExtent(entry.Path, entry.SnapshotID, committedRev)
+			// DEFERRED, not inline: this callback runs under the QUEUE's
+			// path lock, and the migration must call into the extent plane,
+			// which takes ITS path lock. Rename holds the extent lock across
+			// next(), whose writeback flush reaches stageAndEnqueueOpt and
+			// waits for the queue lock — so an inline migration here is one
+			// edge of an ABBA deadlock (both waits are mutex waits; no RPC
+			// deadline can break them). Handing it to a goroutine keeps the
+			// lock order one-directional.
+			w.scheduleExtentMigration(entry.Path, entry.SnapshotID, committedRev)
 			// Hand the landing to the handle that STAGED this image, found by
 			// the entry's snapshot ID: the newest handle at the path may be an
 			// unrelated writer, and the staging handle must learn its shadow is
@@ -2211,14 +2217,43 @@ func (w *Writeback) KeepForgotten(path string) bool {
 //     own buffering and migrates on a later landing;
 //   - the opener refuses a different revision, so a replacement landing in
 //     between leaves this handle where it is.
-func (w *Writeback) migrateHandleToExtent(path, snapshotID string, committedRev int64) {
+//
+// scheduleExtentMigration defers the handoff off the queue worker's stack.
+// It is intentionally fire-and-forget: a lost migration only means this
+// descriptor keeps its old (correct, if more expensive) publish path.
+func (w *Writeback) scheduleExtentMigration(path, snapshotID string, committedRev int64) {
 	if w.opts.ExtentOpener == nil || committedRev <= 0 {
 		return
 	}
+	// Resolve the handle HERE, while the snapshot registration still exists:
+	// the same callback retires it below (completeStagedLanding ->
+	// retireStagedSnapshotLocked), so a lookup from the goroutine would race
+	// that retirement and silently skip the migration.
 	h := w.handleForStagedSnapshot(snapshotID)
 	if h == nil {
 		return
 	}
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				safeLogPrintf("writeback: extent migration for %s panicked: %v", path, r)
+			}
+		}()
+		w.migrateHandleToExtent(h, path, committedRev)
+	}()
+}
+
+func (w *Writeback) migrateHandleToExtent(h *bufferingHandle, path string, committedRev int64) {
+	if w.opts.ExtentOpener == nil || committedRev <= 0 || h == nil {
+		return
+	}
+	// Serialized against same-path staging (and therefore against anything
+	// that could replace this descriptor's image) WITHOUT holding the
+	// extent plane's lock: the opener is lock-free for exactly this reason.
+	// Lock order: writeback path lock, then whatever the engine takes
+	// internally — never the reverse.
+	unlock := w.pathLocks.lock(path)
+	defer unlock()
 	// Cheap gate before taking any heavier state: only a promotion-sized
 	// image at a routed path can be extent.
 	if !h.extentRoutesImage() {
@@ -2268,6 +2303,18 @@ func (w *Writeback) adoptExtentHandle(h *bufferingHandle, e fs.Handle) bool {
 		return false
 	}
 	h.extent = e
+	// A chmod that arrived while the buffer was dirty was deferred to the
+	// next publication boundary (`pendingMode`). The engine handle does not
+	// know about it and this plane will never see another boundary for this
+	// descriptor, so the deferred mode has to be captured here and pushed
+	// out by the caller — otherwise a promoted file keeps the permissions
+	// it had before the chmod.
+	//
+	// Captured under h.mu so a concurrent chmod either lands in this value
+	// or records a NEW pending mode after the flag is cleared, and
+	// applyPendingMode publishes that one.
+	pendingMode, hasPendingMode := h.pendingMode, h.hasPendingMode
+	h.pendingMode, h.hasPendingMode = 0, false
 	// The engine owns the bytes now: retire the local staging state so a
 	// later flush cannot publish this stale image over the engine's.
 	h.dirty = false
@@ -2295,7 +2342,27 @@ func (w *Writeback) adoptExtentHandle(h *bufferingHandle, e fs.Handle) bool {
 	if snapshotFile != nil {
 		_ = snapshotFile.Close()
 	}
+	// Publish the deferred chmod now that this plane no longer owns a
+	// publication boundary for the descriptor. Best effort: the data plane
+	// has already moved, and applyPendingMode keeps a local copy on every
+	// error path it can retry from.
+	if hasPendingMode {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if err := w.applyDeferredMode(ctx, h, pendingMode); err != nil {
+			safeLogPrintf("writeback: apply deferred chmod after extent migration for %s: %v", h.path, err)
+		}
+		cancel()
+	}
 	return true
+}
+
+// applyDeferredMode pushes a chmod that was deferred past an open buffer.
+// The remote chmod goes through the client directly, which is exactly what
+// applyPendingMode did for this plane before the descriptor migrated.
+func (w *Writeback) applyDeferredMode(ctx context.Context, h *bufferingHandle, mode uint32) error {
+	return retryPostUploadMode(ctx, func() error {
+		return w.opts.Client.ChmodCtx(ctx, w.remotePath(h.path), mode&0o777)
+	})
 }
 
 // Unwrap exposes the terminal handle below so inner extensions can resolve
@@ -2310,10 +2377,18 @@ func (h *bufferingHandle) Unwrap() fs.Handle {
 }
 
 // extentHandle returns the engine handle after a promotion migration, or nil
-// while this descriptor still owns its own buffering.
+// while this descriptor still owns its own buffering. Callers that MUTATE
+// state must not use this: read h.extent under the same lock that guards the
+// mutation (see Write and Release), or adoption can land in between.
 func (h *bufferingHandle) extentHandle() fs.Handle {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	return h.extent
+}
+
+// migratedLocked reports the engine handle once this descriptor migrated.
+// The caller holds h.mu.
+func (h *bufferingHandle) migratedLocked() fs.Handle {
 	return h.extent
 }
 
@@ -2611,14 +2686,20 @@ func (h *bufferingHandle) readLiveWriter(ctx context.Context, off int64, dest []
 
 // Write implements fs.Handle.
 func (h *bufferingHandle) Write(ctx context.Context, off int64, data []byte) error {
-	// Migrated: the engine owns the bytes. Its writer buffers until a chunk
-	// fills or the handle is flushed, which is exactly the local buffering
-	// this plane would otherwise reimplement on top of it — twice the cost
-	// and twice the retention.
-	if e := h.extentHandle(); e != nil {
+	// The plane choice and the buffer mutation share ONE critical section.
+	// Adoption takes h.mu, so a write either observes the migration and
+	// forwards to the engine, or it completes on the buffer BEFORE adoption
+	// can inspect it — and adoption then sees a dirty/advanced buffer and
+	// refuses. Selecting the plane outside the lock let this sequence slip
+	// through: writer reads nil, adoption installs the engine handle while
+	// the buffer still looks clean, writer then mutates the OLD buffer, and
+	// every later Sync/Flush/Release publishes through the engine and never
+	// carries those acknowledged bytes.
+	h.mu.Lock()
+	if e := h.migratedLocked(); e != nil {
+		h.mu.Unlock()
 		return e.Write(ctx, off, data)
 	}
-	h.mu.Lock()
 	if err := h.ensureBufferLocked(ctx); err != nil {
 		h.mu.Unlock()
 		return err
@@ -2637,6 +2718,14 @@ func (h *bufferingHandle) Write(ctx context.Context, off int64, data []byte) err
 		}
 		if image != nil {
 			h.mu.Lock()
+			// A migration may have completed while the refresh ran: it
+			// released h.mu. Composing onto the buffer after adoption would
+			// strand these bytes, because the descriptor publishes through
+			// the engine from then on.
+			if e := h.migratedLocked(); e != nil {
+				h.mu.Unlock()
+				return e.Write(ctx, off, data)
+			}
 			cur := append([]byte(nil), h.buf.Bytes()...)
 			if !bytes.Equal(image, cur) || landedRev > h.baseRev {
 				if err := h.adoptAppendImageLocked(image, landedRev); err != nil {
@@ -2647,6 +2736,10 @@ func (h *bufferingHandle) Write(ctx context.Context, off int64, data []byte) err
 			h.mu.Unlock()
 		}
 		h.mu.Lock()
+		if e := h.migratedLocked(); e != nil {
+			h.mu.Unlock()
+			return e.Write(ctx, off, data)
+		}
 	}
 	// O_APPEND: the kernel may deliver off=0; the write lands at the
 	// buffer tail (append semantics for buffered handles).
@@ -3590,12 +3683,15 @@ func (h *bufferingHandle) Release(ctx context.Context) error {
 	// left the handle in the live registry forever: a stale live entry makes
 	// the plane believe a writer is still open at the path, so the mount's
 	// drain never completes and later namespace work blocks on it.
-	if e := h.extentHandle(); e != nil {
+	// Selecting the plane and claiming the teardown share ONE critical
+	// section: a migration that runs between the check and the flag would
+	// install an engine handle this Release never sees, leaving it with no
+	// releaser at all. adoptExtentHandle refuses while `releasing` is set.
+	h.mu.Lock()
+	if e := h.extent; e != nil {
+		h.mu.Unlock()
 		return h.releaseMigrated(ctx, e)
 	}
-	// A concurrent migration must not adopt a handle that is already
-	// tearing down (see adoptExtentHandle).
-	h.mu.Lock()
 	h.releasing = true
 	h.mu.Unlock()
 	// The lazy ledger view's pinned shadow generation is dropped ONLY after

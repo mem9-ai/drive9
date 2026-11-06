@@ -32,14 +32,15 @@ type migrationServer struct {
 	handler  http.Handler
 	partSize int64
 
-	mu       sync.Mutex
-	layout   string // "classic" | "extent"
-	revision int64
-	size     int64
-	sessions int            // whole-image extent sessions
-	patches  int            // incremental PATCH commits
-	parts    map[int][]byte // parts received in the LAST session
-	putBytes int64          // total bytes PUT across all sessions
+	mu        sync.Mutex
+	layout    string // "classic" | "extent"
+	revision  int64
+	size      int64
+	sessions  int            // whole-image extent sessions
+	patches   int            // incremental PATCH commits
+	parts     map[int][]byte // parts received in the LAST session
+	putBytes  int64          // total bytes PUT across all sessions
+	lastChmod uint32         // last mode pushed through the remote chmod
 }
 
 func newMigrationServer(t *testing.T) *migrationServer {
@@ -96,6 +97,18 @@ func newMigrationServer(t *testing.T) *migrationServer {
 			_ = json.NewEncoder(w).Encode(client.ExtentWritePlan{
 				UploadID: "patch", NewSize: body.NewSize, Blocks: blocks,
 			})
+		case http.MethodPost, http.MethodPut:
+			// chmod arrives as a POST/PUT on the path with a mode body.
+			var body struct {
+				Mode uint32 `json:"mode"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body.Mode != 0 {
+				s.mu.Lock()
+				s.lastChmod = body.Mode
+				s.mu.Unlock()
+			}
+			w.WriteHeader(http.StatusOK)
 		case http.MethodGet:
 			s.mu.Lock()
 			size := s.size
@@ -175,6 +188,20 @@ func (s *migrationServer) snapshot() (layout string, rev, size int64, sessions, 
 	return s.layout, s.revision, s.size, s.sessions, s.patches, s.putBytes
 }
 
+// waitMigrated blocks until the descriptor adopted an engine handle. The
+// migration is deliberately outside the queue's path lock (see
+// scheduleExtentMigration), so a queue wait alone does not imply it ran.
+func waitMigrated(t *testing.T, h *bufferingHandle) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for h.extentHandle() == nil {
+		if time.Now().After(deadline) {
+			t.Fatal("descriptor never migrated to the engine plane")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // newMigratingStack builds a write-back chain whose extent routes are armed
 // and whose opener hands out REAL engine handles from the extent plane.
 func newMigratingStack(t *testing.T, srv *migrationServer) (*fs.Chain, *Writeback, *extent.Handler) {
@@ -235,6 +262,7 @@ func TestPromotionMigratesOpenHandleToExtent(t *testing.T) {
 			t.Fatalf("wait for promotion landing: %v", err)
 		}
 	}
+	waitMigrated(t, h.(*bufferingHandle))
 	layout, _, _, sessionsAfterPromotion, _, _ := srv.snapshot()
 	if layout != "extent" {
 		t.Fatalf("remote layout = %q, want extent (the promotion never happened, so the test proves nothing)", layout)
@@ -297,9 +325,7 @@ func TestMigratedHandleReleaseRetiresThisPlane(t *testing.T) {
 	if !ok {
 		t.Fatalf("handle type = %T", res.Handle)
 	}
-	if h.extentHandle() == nil {
-		t.Fatal("precondition: the descriptor did not migrate, so this proves nothing")
-	}
+	waitMigrated(t, h)
 
 	if err := res.Handle.Release(ctx); err != nil {
 		t.Fatalf("release: %v", err)
