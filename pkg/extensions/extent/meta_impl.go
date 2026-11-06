@@ -1639,6 +1639,7 @@ func (b *Bridge) readClassic(ctx context.Context, ino meta.Ino, path string, sta
 	b.mu.Lock()
 	size := b.sizes[ino]
 	pending := append([]pendingWrite(nil), b.pending[ino]...)
+	_, hasTrunc := b.truncs[ino]
 	b.mu.Unlock()
 	length := chunkEnd + 1 - start
 	if size > 0 && start+length > size {
@@ -1648,19 +1649,62 @@ func (b *Bridge) readClassic(ctx context.Context, ino meta.Ino, path string, sta
 		*slices = nil
 		return 0
 	}
-	rc, err := b.cfg.Client.ReadStreamRange(ctx, path, start, length)
-	if err != nil {
-		return errnoOf(err)
+
+	// How many bytes the REMOTE must be able to serve. Local state that has
+	// not been published yet (pending writes, a pending truncate) makes
+	// b.sizes legitimately larger than the object, so the expectation is
+	// dropped in that case: the overlay below fills the rest.
+	remoteLength := length
+	if len(pending) > 0 || hasTrunc {
+		remoteLength = 0
 	}
-	// The identity is taken from the READ's own response headers when the
-	// server provides one (same-request binding); a separate later Stat
-	// could describe a replacement installed in between.
-	hdrID := rcHeaderResourceID(rc)
-	data, rerr := io.ReadAll(rc)
-	_ = rc.Close()
-	if rerr != nil {
-		// A partial body must never publish as a successful read.
-		return syscall.EIO
+	// A read must not serve an image SHORTER than the size this mount already
+	// published for the inode.
+	//
+	// The classic surface publishes with a CAS PUT and reads with a plain
+	// range GET. A GET answered by a replica that has not caught up returns
+	// the OLD object — for a file this mount just grew, that is a shorter
+	// body. Accepting it hands the caller a pre-write image: SQLite reads
+	// page 1 with a stale schema cookie, reports SQLITE_SCHEMA, reloads the
+	// schema, and then cannot find the table the previous statement created.
+	//
+	// The short body is the signal: we asked for exactly `length` bytes of a
+	// file we believe is `size` long, so anything less means the server is
+	// behind, not that the file shrank (a genuine shrink travels through the
+	// truncate path, which updates b.sizes first).
+	var data []byte
+	var hdrID string
+	var rerr error
+	for attempt, delay := range readPlanStaleDelays {
+		if delay > 0 {
+			select {
+			case <-ctx.Done():
+				return syscall.EINTR
+			case <-time.After(delay):
+			}
+		}
+		rc, err := b.cfg.Client.ReadStreamRange(ctx, path, start, length)
+		if err != nil {
+			return errnoOf(err)
+		}
+		// The identity is taken from the READ's own response headers when the
+		// server provides one (same-request binding); a separate later Stat
+		// could describe a replacement installed in between.
+		hdrID = rcHeaderResourceID(rc)
+		data, rerr = io.ReadAll(rc)
+		_ = rc.Close()
+		if rerr != nil {
+			// A partial body must never publish as a successful read.
+			return syscall.EIO
+		}
+		if remoteLength <= 0 || int64(len(data)) >= remoteLength {
+			break
+		}
+		if attempt == len(readPlanStaleDelays)-1 {
+			// Budget exhausted: keep the newest answer rather than turning
+			// replica lag into EIO for every reader.
+			break
+		}
 	}
 	// Deferred (interactive) writes overlay the remote base so
 	// read-after-write holds while publication is deferred.
