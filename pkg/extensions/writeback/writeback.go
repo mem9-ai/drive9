@@ -1182,9 +1182,11 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 					if meta, track := w.pendingMetaTrack(op.Path); meta != nil {
 						h.supersededPendingGen = meta.Generation
 						h.supersededPendingSource = track
-						h.cacheLineageGen = meta.CacheLineageGen
-						if h.cacheLineageGen == 0 {
-							h.cacheLineageGen = meta.Generation
+						if track == pendingGenCache {
+							h.cacheLineageGen = meta.CacheLineageGen
+							if h.cacheLineageGen == 0 {
+								h.cacheLineageGen = meta.Generation
+							}
 						}
 					}
 					if pb, ok := w.pendingBaseRevOf(op.Path); ok {
@@ -1218,9 +1220,11 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 						if meta != nil {
 							h.supersededPendingGen = meta.Generation
 							h.supersededPendingSource = track
-							h.cacheLineageGen = meta.CacheLineageGen
-							if h.cacheLineageGen == 0 {
-								h.cacheLineageGen = meta.Generation
+							if track == pendingGenCache {
+								h.cacheLineageGen = meta.CacheLineageGen
+								if h.cacheLineageGen == 0 {
+									h.cacheLineageGen = meta.Generation
+								}
 							}
 						}
 						if pb, ok := w.pendingBaseRevOf(op.Path); ok {
@@ -3680,7 +3684,8 @@ func (w *Writeback) acknowledgeUploadedCreate(path string, rev int64, generation
 				h.baseRev = rev
 			}
 		case source == pendingGenCache && cacheGeneration != 0 &&
-			(h.cacheLineageGen == cacheGeneration || h.supersededPendingGen == cacheGeneration):
+			(h.cacheLineageGen == cacheGeneration ||
+				(h.supersededPendingSource == pendingGenCache && h.supersededPendingGen == cacheGeneration)):
 			// This handle descends from the cache lineage the upload just
 			// published (possibly through several staged descendants). Its
 			// next append/overwrite is derived from that revision, not the
@@ -4692,6 +4697,13 @@ func (w *Writeback) openPendingWritable(op *fs.Op) (fs.Result, bool) {
 		return fs.Result{}, false
 	}
 	meta, track := w.pendingMetaTrack(op.Path)
+	if meta != nil && meta.Kind != staging.PendingNew && w.uploader != nil && w.uploader.InFlight(op.Path) {
+		// A PendingOverwrite whose PUT may already have published its own
+		// revision must not be opened from the pre-upload base. The
+		// uploader flag is released only after OnSuccess has advanced the
+		// cache entry and live handles.
+		return fs.Result{}, false
+	}
 	size := int64(0)
 	if meta != nil {
 		size = meta.Size
@@ -4736,9 +4748,11 @@ func (w *Writeback) openPendingWritable(op *fs.Op) (fs.Result, bool) {
 	if meta != nil {
 		h.supersededPendingGen = meta.Generation
 		h.supersededPendingSource = track
-		h.cacheLineageGen = meta.CacheLineageGen
-		if h.cacheLineageGen == 0 {
-			h.cacheLineageGen = meta.Generation
+		if track == pendingGenCache {
+			h.cacheLineageGen = meta.CacheLineageGen
+			if h.cacheLineageGen == 0 {
+				h.cacheLineageGen = meta.Generation
+			}
 		}
 		h.isNew = meta.Kind == staging.PendingNew
 		if meta.HasMode {

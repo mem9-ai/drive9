@@ -551,3 +551,50 @@ func TestPortCacheStageKeepsGenerationSpacesSeparate(t *testing.T) {
 		t.Fatalf("cache lineage = %d, want %d", meta.CacheLineageGen, gen1)
 	}
 }
+
+// A queue-sourced handle must not accept a cache acknowledgement that only
+// shares the number; source is part of the CAS lineage identity.
+func TestPortQueueHandleIgnoresCacheGenerationCollision(t *testing.T) {
+	b := testbackend.NewBackend()
+	ts := httptest.NewServer(b)
+	defer ts.Close()
+	wb, err := New(Options{Policy: PolicyWriteBack, Client: client.New(ts.URL, "")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &bufferingHandle{w: wb, path: "/f", baseRev: 1,
+		supersededPendingGen: 5, supersededPendingSource: pendingGenQueue}
+	wb.track(h)
+	wb.acknowledgeUploadedCreate("/f", 2, 5, pendingGenCache, 5)
+	h.mu.Lock()
+	baseRev := h.baseRev
+	h.mu.Unlock()
+	if baseRev != 1 {
+		t.Fatalf("cache ack advanced queue handle to %d, want 1", baseRev)
+	}
+}
+
+// A PendingOverwrite fast path must stand down while its upload is in flight:
+// the PUT may already be published but not acknowledged.
+func TestPortPendingOverwriteOpenWaitsForInflightUpload(t *testing.T) {
+	b := testbackend.NewBackend()
+	ts := httptest.NewServer(b)
+	defer ts.Close()
+	cl := client.New(ts.URL, "")
+	wbcache, err := staging.NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := wbcache.PutWithBaseRevAndModeTimings("/f", []byte("base"), 4, staging.PendingOverwrite, 1, 0o644, true); err != nil {
+		t.Fatal(err)
+	}
+	wb, err := New(Options{Policy: PolicyWriteBack, Client: cl, WriteCache: wbcache})
+	if err != nil {
+		t.Fatal(err)
+	}
+	release := wb.uploader.acquirePath("/f")
+	defer release()
+	if _, ok := wb.openPendingWritable(&fs.Op{Kind: fs.OpCreate, Path: "/f", Flags: uint32(syscall.O_WRONLY | syscall.O_APPEND)}); ok {
+		t.Fatal("pending overwrite opened while its upload was in flight")
+	}
+}
