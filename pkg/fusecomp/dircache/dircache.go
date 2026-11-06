@@ -129,6 +129,10 @@ type DirCache struct {
 	// that can invalidate an in-flight read, so a generation a token holds can
 	// never recur.
 	gen uint64
+	// resetEpoch advances on a whole-cache reset (SSE unverified/checkout).
+	// A cold parent has generation zero before and after the reset, so the
+	// per-directory generation cannot fence its outstanding response.
+	resetEpoch uint64
 	// mutationGenerations is a bounded LRU of directory-scoped namespace
 	// identities. Reads allocate but do not advance an identity; authoritative
 	// mutations advance only the affected directory (or prefix). Reallocating
@@ -305,6 +309,10 @@ func (dc *DirCache) putListingLocked(dirPath string, items []fs.DirEntryInfo, re
 	// retirement removed (an SSE reset discards the whole directory). It may
 	// answer the request that issued it, but republishing it into the cache
 	// would undo the invalidation until the entry lapsed on its own.
+	if request.reset != dc.resetEpoch {
+		dc.releaseRequestLocked(request)
+		return items, listingInstallReceipt{}
+	}
 	if retired := dc.retired[dirPath]; request.seq < retired {
 		// The request is settled (its response is served) even though nothing is
 		// installed, so it releases like any other completion.
@@ -561,6 +569,10 @@ type RequestToken struct {
 	// not by other requests merely starting, so concurrent reads of one
 	// directory do not supersede each other.
 	event uint64
+	// reset captures the whole-cache reset epoch. A delayed response from
+	// before InvalidateAll must not repopulate a cold parent, whose
+	// per-directory generation remains zero across the reset.
+	reset uint64
 	// install is the newest listing installation observed when the request
 	// started. Batch observations may merge around per-path HEAD results, but
 	// not around a listing installed while the batch was in flight: that
@@ -594,6 +606,7 @@ func (dc *DirCache) BeginRequest(dirPath string) RequestToken {
 		dir:     dirPath,
 		seq:     dc.nextGenerationLocked(),
 		event:   dc.generationLocked(dirPath),
+		reset:   dc.resetEpoch,
 		install: dc.latestInstallLocked(dirPath),
 		ref:     &requestRef{},
 		valid:   true,
@@ -703,6 +716,10 @@ func (dc *DirCache) Observe(parentPath string, item fs.DirEntryInfo, token Reque
 	defer dc.mu.Unlock()
 
 	if !token.valid || token.dir != parentPath {
+		return
+	}
+	if token.reset != dc.resetEpoch {
+		dc.releaseRequestLocked(token)
 		return
 	}
 	// The directory must still be at the value the read began against. A
@@ -1025,6 +1042,7 @@ func (dc *DirCache) Invalidate(dirPath string) {
 func (dc *DirCache) InvalidateAll() {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
+	dc.resetEpoch++
 	dc.mutationGenerations = make(map[string]directoryMutationState)
 	dc.mutationOrder.Init()
 

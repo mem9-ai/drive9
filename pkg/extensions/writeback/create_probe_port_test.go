@@ -753,3 +753,16 @@ func TestPortExistingFileReleaseAfterFlushDoesNotDeadlock(t *testing.T) {
 		t.Fatal("Release deadlocked after Flush")
 	}
 }
+
+// An outstanding predecessor must survive more than 64 later stages; the
+// ancestor list is bounded by upload completion, not by a fixed count.
+func TestPortAncestorListRetainsOutstandingGeneration(t *testing.T) {
+	gens := make([]uint64, 0, 100)
+	for i := uint64(1); i <= 100; i++ {
+		gens = append(gens, i)
+	}
+	list := mergeCacheAncestorGens(nil, gens...)
+	if !cacheGenInList(list, 1) || !cacheGenInList(list, 100) {
+		t.Fatalf("ancestor list dropped an outstanding generation: %v", list)
+	}
+}

@@ -240,11 +240,10 @@ const (
 	pendingGenQueue
 )
 
-const maxCacheAncestorGens = 64
-
-// mergeCacheAncestorGens returns a newest-first, deduplicated ancestor list
-// capped at maxCacheAncestorGens. The cap is far above any realistic ack
-// in-flight window; it only bounds metadata growth for pathological staging.
+// mergeCacheAncestorGens returns a newest-first, deduplicated ancestor list.
+// The list must not have a fixed count cap: an outstanding upload can remain
+// in flight across an unbounded number of later stages, and evicting its
+// generation would lose the acknowledgement's CAS lineage.
 func mergeCacheAncestorGens(base []uint64, add ...uint64) []uint64 {
 	out := make([]uint64, 0, len(base)+len(add))
 	seen := make(map[uint64]struct{}, len(base)+len(add))
@@ -257,9 +256,6 @@ func mergeCacheAncestorGens(base []uint64, add ...uint64) []uint64 {
 		}
 		seen[gen] = struct{}{}
 		out = append(out, gen)
-		if len(out) == maxCacheAncestorGens {
-			break
-		}
 	}
 	return out
 }
@@ -274,6 +270,19 @@ func cacheGenInList(list []uint64, gen uint64) bool {
 		}
 	}
 	return false
+}
+
+func removeCacheAncestorGen(list []uint64, gen uint64) []uint64 {
+	if gen == 0 {
+		return list
+	}
+	out := list[:0]
+	for _, g := range list {
+		if g != gen {
+			out = append(out, g)
+		}
+	}
+	return out
 }
 
 type bufferingHandle struct {
@@ -3749,6 +3758,7 @@ func (w *Writeback) acknowledgeUploadedCreate(path string, rev int64, generation
 			if rev > 0 {
 				h.baseRev = rev
 			}
+			h.cacheAncestorGens = removeCacheAncestorGen(h.cacheAncestorGens, cacheGeneration)
 		case source == pendingGenQueue && generation != 0 && h.supersededPendingGen == generation && h.supersededPendingSource == source:
 			if rev > 0 {
 				h.baseRev = rev
