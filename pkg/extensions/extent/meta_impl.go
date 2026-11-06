@@ -551,7 +551,14 @@ func (b *Bridge) Read(ctx meta.Context, ino meta.Ino, indx uint32, slices *[]met
 		return syscall.EIO
 	}
 	b.mu.Lock()
-	b.revs[ino] = plan.Revision
+	// Monotonic: a plan may be served by a lagging replica and must not pull
+	// the recorded revision BACKWARDS. Doing so armed the freshness guard
+	// once (the next read saw a lower base) and then let every later read
+	// accept the stale plan as current — which is exactly the same-descriptor
+	// staleness this plane is trying to prevent.
+	if plan.Revision > b.revs[ino] {
+		b.revs[ino] = plan.Revision
+	}
 	// A pending truncation is authoritative: the server's (older, larger)
 	// plan size must not resurrect a shrunk tail — the truncate-only
 	// flush would then see its own size back and silently drop the
