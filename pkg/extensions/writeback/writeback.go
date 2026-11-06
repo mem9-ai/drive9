@@ -6358,7 +6358,13 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, dur stageDurabi
 		if h.cacheLineageGen == 0 {
 			h.cacheLineageGen = lineage
 		}
-		if supersedesSource != pendingGenQueue {
+		if supersedesSource == pendingGenQueue {
+			// A queue-derived handle can later stage its buffer into the
+			// cache. That cache image is now its own newest content: keep
+			// the queue supersession marker, but remember the cache
+			// generation so the cache upload's ack still advances the handle.
+			h.cacheLineageGen = wbGen
+		} else {
 			// The staged image is now this handle's content; its next stage
 			// composes over this generation, and an ack for this image must
 			// advance the handle even though the cache lineage root is older.

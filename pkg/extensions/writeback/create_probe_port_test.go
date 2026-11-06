@@ -598,3 +598,27 @@ func TestPortPendingOverwriteOpenWaitsForInflightUpload(t *testing.T) {
 		t.Fatal("pending overwrite opened while its upload was in flight")
 	}
 }
+
+// A queue-derived handle that later stages its buffer into the cache must
+// still acknowledge that cache image; the queue marker and cache lineage are
+// different spaces.
+func TestPortQueueHandleAcksItsOwnLaterCacheStage(t *testing.T) {
+	b := testbackend.NewBackend()
+	ts := httptest.NewServer(b)
+	defer ts.Close()
+	wb, err := New(Options{Policy: PolicyWriteBack, Client: client.New(ts.URL, "")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &bufferingHandle{w: wb, path: "/f", baseRev: 1,
+		supersededPendingGen: 5, supersededPendingSource: pendingGenQueue,
+		cacheLineageGen: 9} // cache image staged by this handle
+	wb.track(h)
+	wb.acknowledgeUploadedCreate("/f", 2, 9, pendingGenCache, 9)
+	h.mu.Lock()
+	baseRev := h.baseRev
+	h.mu.Unlock()
+	if baseRev != 2 {
+		t.Fatalf("queue handle did not adopt its own cache stage: baseRev=%d, want 2", baseRev)
+	}
+}
