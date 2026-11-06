@@ -1365,6 +1365,22 @@ func (f *FS) attrTTLFor(path string) time.Duration {
 	return f.attrTTL
 }
 
+// ownerPresence resolves the split owner-presence flags. HasOwner is the
+// coarse "either field" form and is used only when neither split flag is
+// present; OR-ing it into both fields marked an absent owner authoritative.
+func ownerPresence(a *fs.Attr) (hasUID, hasGID bool) {
+	if a == nil {
+		return false, false
+	}
+	if a.HasUID || a.HasGID {
+		return a.HasUID, a.HasGID
+	}
+	if a.HasOwner {
+		return true, true
+	}
+	return false, false
+}
+
 func (f *FS) fillEntryOut(path string, a *fs.Attr, isDir bool, out *gofuse.EntryOut) {
 	var size int64
 	if a != nil {
@@ -1388,9 +1404,18 @@ func (f *FS) fillEntryOut(path string, a *fs.Attr, isDir bool, out *gofuse.Entry
 	}
 	out.NodeId = ino
 	if a != nil {
-		// Keep the inode's CAS base in sync with the reply. Open uses this
-		// row to avoid a probe for a writable handle; without it every
-		// Lookup → Open paid the stat Lookup had just answered.
+		hasUID, hasGID := ownerPresence(a)
+		if hasUID || hasGID {
+			// A lookup reply is authoritative for ownership too. Persisting it
+			// here is what lets the open gate use the real owner instead of the
+			// mount default (extent files owned by another uid are the concrete
+			// case: the reply carries Uid/Gid, but only the mode was stored).
+			f.inodes.UpdateOwner(ino, a.Uid, a.Gid, hasUID, hasGID)
+		}
+		// Keep the inode's CAS base in sync with the reply. Read-only Open
+		// may answer from a revision-bound row without re-stating; without
+		// persisting it here that row would carry revision 0 and every
+		// Lookup → Open would pay the stat Lookup had just answered.
 		if a.Rev > 0 {
 			f.inodes.UpdateRevision(ino, a.Rev)
 		}
@@ -1934,20 +1959,25 @@ func (f *FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name string, o
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 	mode := fs.Attr{Kind: fs.KindDir, Mode: input.Mode & 0o7777}
+	// Install the empty-directory marker BEFORE the remote mkdir can
+	// return. A foreign child created immediately after the mkdir can be
+	// invalidated while this call is still finishing; installing the marker
+	// afterwards would recreate the complete/session-miss authority over
+	// that invalidation and hide the child for a full directory TTL. With
+	// the marker in place first, the invalidation simply clears it.
+	dc, _ := f.Ctx.DirCache.(*dircache.DirCache)
+	if dc != nil {
+		dc.MarkSessionCreatedDir(child)
+	}
 	if _, st := f.dispatch(ctx, &fs.Op{Kind: fs.OpMkdir, Path: child, Mode: input.Mode & 0o7777, Ino: input.NodeId, Kernel: input, Caller: fs.CallerFrom(input.InHeader)}); st != gofuse.OK {
+		if dc != nil {
+			dc.Invalidate(child)
+		}
 		return st
 	}
 	f.mutated(fs.EventWrite, child)
 	f.fillEntryOut(child, &mode, true, out)
 	f.dirCacheUpsert(child, &mode)
-	// v1 Mkdir marked the new directory as a locally managed empty
-	// namespace: creators probing fresh names inside it answer ENOENT
-	// locally instead of paying one HEAD per name. The marker is still
-	// cleared by local mutations/SSE invalidation, so it cannot outlive a
-	// foreign change.
-	if dc, ok := f.Ctx.DirCache.(*dircache.DirCache); ok {
-		dc.MarkSessionCreatedDir(child)
-	}
 	caller := fs.CallerFrom(input.InHeader)
 	f.stampOwner(out.NodeId, caller)
 	out.Uid, out.Gid = caller.Uid, caller.Gid
@@ -2594,14 +2624,15 @@ func (f *FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse.Open
 				// chmod(000) answer of zero (requiring nonzero would skip
 				// the gate for exactly the mode it exists to enforce).
 				mode, modeKnown = st.Attr.Mode&0o777, true
-				if st.Attr.HasUID || st.Attr.HasGID || st.Attr.HasOwner {
-					if st.Attr.HasUID || st.Attr.HasOwner {
-						ownerUid = st.Attr.Uid
-					}
-					if st.Attr.HasGID || st.Attr.HasOwner {
-						ownerGid = st.Attr.Gid
-					}
-					f.inodes.UpdateOwner(input.NodeId, ownerUid, ownerGid, true, true)
+				hasUID, hasGID := ownerPresence(st.Attr)
+				if hasUID {
+					ownerUid = st.Attr.Uid
+				}
+				if hasGID {
+					ownerGid = st.Attr.Gid
+				}
+				if hasUID || hasGID {
+					f.inodes.UpdateOwner(input.NodeId, ownerUid, ownerGid, hasUID, hasGID)
 				}
 			}
 		}

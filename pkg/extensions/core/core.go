@@ -1169,7 +1169,13 @@ func (c *Core) createOp(ctx context.Context, op *fs.Op) (fs.Result, error) {
 	kernelExisting := op.KernelOpenExisting() &&
 		flags&uint32(syscall.O_CREAT) == 0 &&
 		flags&uint32(syscall.O_TRUNC) == 0
-	if kernelExisting && op.OpenAttr != nil && flags&uint32(syscall.O_ACCMODE) == uint32(syscall.O_RDONLY) {
+	if kernelExisting && op.OpenAttr != nil && op.OpenAttr.Rev > 0 &&
+		flags&uint32(syscall.O_ACCMODE) == uint32(syscall.O_RDONLY) {
+		// A row without a remote revision can be a local overlay or a
+		// just-created file whose backing name can disappear underneath the
+		// cached dentry (layer rollback, deferred delete). Those opens must
+		// still revalidate; only a revision-bound remote row is safe to
+		// answer without the terminal probe.
 		return fs.Result{Attr: op.OpenAttr, Handle: c.newSyncHandle(op.Path)}, nil
 	}
 

@@ -161,3 +161,80 @@ func TestPortWritableReopenServesPendingImage(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// A zero-byte pending create is a complete append base; capturePendingImage
+// rejects size<=0, but the fast path must still serve it (touch; echo x >>
+// file before the empty create lands).
+func TestPortZeroBytePendingAppend(t *testing.T) {
+	b := testbackend.NewBackend()
+	var heads atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/status" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.Method == http.MethodHead {
+			heads.Add(1)
+		}
+		b.ServeHTTP(w, r)
+	}))
+	defer ts.Close()
+	cl := client.New(ts.URL, "")
+	wbcache, err := staging.NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wbcache.PutWithBaseRevAndMode("/f", nil, 0, staging.PendingNew, 0, 0o644, true); err != nil {
+		t.Fatal(err)
+	}
+	wb, err := New(Options{Policy: PolicyWriteBack, Client: cl, WriteCache: wbcache})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := fs.NewChain(wb, terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	res, err := ch.Dispatch(ctx, &fs.Op{
+		Kind: fs.OpCreate, Path: "/f",
+		Flags:  uint32(syscall.O_WRONLY | syscall.O_APPEND),
+		Kernel: &gofuse.OpenIn{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Handle == nil {
+		t.Fatal("zero-byte pending append returned no handle")
+	}
+	if got := heads.Load(); got != 0 {
+		t.Fatalf("zero-byte pending append HEADs = %d, want 0", got)
+	}
+	if err := res.Handle.Write(ctx, 0, []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if err := res.Handle.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := res.Handle.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := wb.Drain(ctx); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if n, ok := b.Node("/f"); ok && string(n.Data) == "x" {
+			return
+		}
+		if time.Now().After(deadline) {
+			n, ok := b.Node("/f")
+			t.Fatalf("zero-byte append did not land: ok=%v data=%q", ok, n.Data)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}

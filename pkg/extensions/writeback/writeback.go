@@ -4577,20 +4577,39 @@ func (w *Writeback) openPendingWritable(op *fs.Op) (fs.Result, bool) {
 		// handoff/upload ordering (the P2 upload-ack gate depends on it).
 		return fs.Result{}, false
 	}
+	// Serialize with the uploader's OnSuccess path: it removes the cache
+	// entry, runs acknowledgeUploadedCreate over liveSet, and rebases the
+	// pending create. Capturing the image before registering the handle
+	// (the old order) let a completion slip in between and leave the
+	// opener with isNew=true and no committed base revision.
+	unlock := w.pathLocks.lock(op.Path)
+	defer unlock()
+	if !w.hasPendingLocalState(op.Path) {
+		return fs.Result{}, false
+	}
 	meta, _ := w.pendingMeta(op.Path)
 	size := int64(0)
 	if meta != nil {
 		size = meta.Size
 	}
 	image := w.capturePendingImage(op.Path)
+	if image == nil && meta != nil && meta.Kind == staging.PendingNew && meta.Size == 0 {
+		// A zero-byte create is a complete base. capturePendingImage
+		// rejects size<=0, but an empty append image must still stay on
+		// this fast path (touch; echo x >> file before the create lands).
+		image = []byte{}
+	}
 	shadowGen := w.pinPendingShadow(op.Path)
+	ledgerOwned := w.opts.Staging != nil && w.opts.Staging.Pending.HasPending(op.Path)
 	if image == nil {
 		// A pending OVERWRITE can still preload from the write-back cache
-		// in ensureBuffer; a pending NEW image (or a queue-track shadow)
-		// with no materialized copy has no base this writable handle can
-		// compose over — do not turn a partial write into a replacement.
-		if meta == nil || meta.Kind == staging.PendingNew ||
-			w.wbCache == nil {
+		// in ensureBuffer. A ledger-owned path must not: the pair under
+		// the ledger entry may be a superseded image, and a recovered
+		// spill larger than the materialization cap has no safe base here.
+		// A pending NEW image or queue-track shadow without a materialized
+		// copy is likewise rejected — do not turn a partial write into a
+		// replacement.
+		if ledgerOwned || meta == nil || meta.Kind == staging.PendingNew || w.wbCache == nil {
 			if shadowGen != 0 && w.opts.Staging != nil {
 				w.opts.Staging.Shadow.Unpin(shadowGen)
 			}
