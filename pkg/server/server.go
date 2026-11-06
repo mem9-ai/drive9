@@ -1540,6 +1540,23 @@ const (
 )
 
 // isLoopbackListenAddr reports whether addr only accepts loopback connections.
+// EnvTLSAllowPlaintext opts a deployment into serving the API over plaintext on a
+// non-loopback address, which is correct only when TLS is terminated in front of
+// this server (NLB/ALB/ingress).
+const EnvTLSAllowPlaintext = "DRIVE9_TLS_ALLOW_PLAINTEXT"
+
+// tlsPlaintextAllowed reports whether the operator explicitly allowed a plaintext
+// listener on a non-loopback address. Parsing is fail-closed: only an affirmative
+// value allows it.
+func tlsPlaintextAllowed() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(EnvTLSAllowPlaintext))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
 func isLoopbackListenAddr(addr string) bool {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -1573,9 +1590,17 @@ func (s *Server) ListenAndServe(addr string) error {
 		return fmt.Errorf("%s and %s must be set together", envTLSCertFile, envTLSKeyFile)
 	}
 	if tlsCertFile == "" && !isLoopbackListenAddr(addr) {
+		// Bearer tokens, vault plaintext and file bytes all cross this listener, so a
+		// non-loopback plaintext bind is a decision the operator has to make
+		// explicitly instead of something that happens by default. Ingress-terminated
+		// TLS is the common deployment, which is why the opt-out exists.
+		if !tlsPlaintextAllowed() {
+			return fmt.Errorf("refusing to serve plaintext on %q: set %s/%s to serve HTTPS, or %s=1 when TLS is terminated in front of this server",
+				addr, envTLSCertFile, envTLSKeyFile, EnvTLSAllowPlaintext)
+		}
 		logger.Warn(backgroundWithTrace(context.Background()), "server_plaintext_listener",
 			zap.String("addr", addr),
-			zap.String("hint", "set "+envTLSCertFile+"/"+envTLSKeyFile+" to serve HTTPS, or terminate TLS at the ingress"))
+			zap.String("hint", "set "+envTLSCertFile+"/"+envTLSKeyFile+" to serve HTTPS, or "+EnvTLSAllowPlaintext+"=1 when TLS is terminated in front of this server"))
 	}
 	s.httpSrvMu.Lock()
 	s.httpSrv = httpSrv

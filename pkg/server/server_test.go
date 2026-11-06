@@ -2573,3 +2573,24 @@ func TestListenAndServeRejectsHalfConfiguredTLS(t *testing.T) {
 		t.Fatalf("err = %v, want a certificate/key pairing error", err)
 	}
 }
+
+// A non-loopback plaintext listener carries bearer tokens and vault plaintext, so
+// it must be an explicit operator decision.
+func TestListenAndServeRefusesPlaintextOnWildcard(t *testing.T) {
+	t.Setenv(envTLSCertFile, "")
+	t.Setenv(envTLSKeyFile, "")
+	t.Setenv(EnvTLSAllowPlaintext, "")
+
+	err := (&Server{}).ListenAndServe(":9009")
+	if err == nil || !strings.Contains(err.Error(), EnvTLSAllowPlaintext) {
+		t.Fatalf("err = %v, want a plaintext-listener refusal naming %s", err, EnvTLSAllowPlaintext)
+	}
+
+	// The opt-out exists for ingress-terminated TLS and must be parsed strictly.
+	for _, value := range []string{"0", "false", "no", "off", "maybe"} {
+		t.Setenv(EnvTLSAllowPlaintext, value)
+		if err := (&Server{}).ListenAndServe(":9009"); err == nil || !strings.Contains(err.Error(), EnvTLSAllowPlaintext) {
+			t.Fatalf("opt-out %q allowed a plaintext listener: %v", value, err)
+		}
+	}
+}

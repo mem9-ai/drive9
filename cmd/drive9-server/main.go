@@ -658,6 +658,10 @@ environment:
   DRIVE9_ALLOW_ANONYMOUS_PROVISION accept POST /v1/provision without a caller TiDB Cloud
                         key pair, spending the server's default credential (default: false).
                         provider=local is always anonymous.
+  DRIVE9_TLS_ALLOW_PLAINTEXT
+                        set to 1 only when TLS is terminated in front of this
+                        server; without it a non-loopback listener refuses to
+                        start in plaintext
   DRIVE9_TLS_CERT_FILE  serve HTTPS directly: PEM certificate chain. Requires
   DRIVE9_TLS_KEY_FILE   the matching PEM private key. Without them the API listener is
                         plaintext; terminate TLS at the ingress or set these.
