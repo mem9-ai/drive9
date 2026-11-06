@@ -535,7 +535,7 @@ func New(opts Options) (*Writeback, error) {
 		up.OnSuccess = func(meta staging.WriteBackMeta, committedRev int64, gens StagingGens) {
 			unlock := w.pathLocks.lock(meta.Path)
 			defer unlock()
-			w.acknowledgeUploadedCreate(meta.Path, committedRev)
+			w.acknowledgeUploadedCreate(meta.Path, committedRev, meta.Generation)
 			if meta.Kind == staging.PendingChmod {
 				return
 			}
@@ -599,7 +599,7 @@ func New(opts Options) (*Writeback, error) {
 					w.wbCache.RemoveIfGeneration(entry.Path, gen)
 				}
 			}
-			w.acknowledgeUploadedCreate(entry.Path, committedRev)
+			w.acknowledgeUploadedCreate(entry.Path, committedRev, entry.PendingIndexGen)
 			if w.opts.Policy == PolicyWriteSync || w.opts.Policy == PolicyCloseSync {
 				w.armBypass(entry.Path, committedRev, entry.Size, "sync-commit")
 			}
@@ -3594,17 +3594,34 @@ func (h *bufferingHandle) checkoutDropCleanBuffer() {
 	h.buf = nil
 }
 
-func (w *Writeback) acknowledgeUploadedCreate(path string, rev int64) {
-	// Retire only the name claim; newer writes and truncations still own their bytes.
+func (w *Writeback) acknowledgeUploadedCreate(path string, rev int64, generation uint64) {
+	// Retire the name claim and, for an append opener composed over this
+	// generation, advance its CAS base. A pending-overwrite opener captured
+	// BaseRev R while the upload was in flight; leaving it at R stages its
+	// append against R after this mount already published R+1, which the
+	// uploader refuses as a conflict (only a byte-identical duplicate is
+	// rebased).
 	w.liveSet.Range(func(key, _ any) bool {
 		h, ok := key.(*bufferingHandle)
 		if !ok {
 			return true
 		}
 		h.mu.Lock()
-		if h.path == path && h.isNew && !h.unlinked {
+		if h.path != path || h.unlinked {
+			h.mu.Unlock()
+			return true
+		}
+		switch {
+		case h.isNew:
 			h.landed = true
 			h.isNew = false
+			if rev > 0 {
+				h.baseRev = rev
+			}
+		case generation != 0 && h.supersededPendingGen == generation:
+			// The handle's captured image includes the generation this
+			// upload just published. Its next append/overwrite is derived
+			// from that revision, not the pre-upload base.
 			if rev > 0 {
 				h.baseRev = rev
 			}
@@ -3615,6 +3632,22 @@ func (w *Writeback) acknowledgeUploadedCreate(path string, rev int64) {
 	if w.wbCache != nil {
 		if err := w.wbCache.RebasePendingNew(path, rev); err != nil {
 			safeLogPrintf("writeback: rebase pending create %s on revision %d: %v", path, rev, err)
+		}
+		if generation != 0 && rev > 0 {
+			if meta, ok := w.wbCache.GetMeta(path); ok && meta != nil {
+				switch {
+				case meta.Generation == generation:
+					// The uploaded entry can still be present while the
+					// uploader applies its deferred mode. Keep its retry
+					// base on the revision it just published.
+					_ = w.wbCache.RebaseBaseRevIfGeneration(path, generation, rev)
+				case meta.SupersedesPendingGen == generation:
+					// A newer staged image derives from the just-published
+					// revision; move its CAS base so it does not conflict
+					// with this mount's own landing.
+					_ = w.wbCache.RebaseBaseRevIfGeneration(path, meta.Generation, rev)
+				}
+			}
 		}
 	}
 }

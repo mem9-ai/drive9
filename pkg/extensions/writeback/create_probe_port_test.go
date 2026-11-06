@@ -238,3 +238,92 @@ func TestPortZeroBytePendingAppend(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// A pending-overwrite append opener must adopt the revision the in-flight
+// upload publishes. Otherwise its CAS base stays at the pre-upload R and the
+// append conflicts with this mount's own R+1.
+func TestPortPendingOverwriteAppendAdoptsUploadRevision(t *testing.T) {
+	b := testbackend.NewBackend()
+	ts := httptest.NewServer(b)
+	defer ts.Close()
+	cl := client.New(ts.URL, "")
+	wbcache, err := staging.NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gen, _, err := wbcache.PutWithBaseRevAndModeTimings("/f", []byte("base"), 4, staging.PendingOverwrite, 1, 0o644, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wb, err := New(Options{Policy: PolicyWriteBack, Client: cl, WriteCache: wbcache})
+	if err != nil {
+		t.Fatal(err)
+	}
+	op := &fs.Op{Kind: fs.OpCreate, Path: "/f", Flags: uint32(syscall.O_WRONLY | syscall.O_APPEND)}
+	res, ok := wb.openPendingWritable(op)
+	if !ok || res.Handle == nil {
+		t.Fatal("pending overwrite append did not take the fast path")
+	}
+	h, ok := res.Handle.(*bufferingHandle)
+	if !ok {
+		t.Fatalf("handle type = %T", res.Handle)
+	}
+	if h.baseRev != 1 || h.supersededPendingGen != gen {
+		t.Fatalf("before ack: baseRev=%d gen=%d, want 1/%d", h.baseRev, h.supersededPendingGen, gen)
+	}
+	wb.acknowledgeUploadedCreate("/f", 2, gen)
+	h.mu.Lock()
+	baseRev, supersedes := h.baseRev, h.supersededPendingGen
+	h.mu.Unlock()
+	if baseRev != 2 {
+		t.Fatalf("after ack baseRev = %d, want 2", baseRev)
+	}
+	if supersedes != gen {
+		t.Fatalf("after ack supersedes = %d, want %d", supersedes, gen)
+	}
+	if meta, ok := wbcache.GetMeta("/f"); !ok || meta.BaseRev != 2 {
+		t.Fatalf("pending meta after ack = %+v ok=%v, want base 2", meta, ok)
+	}
+	// A handle opened AFTER the acknowledgement (the deferred-mode window)
+	// must already start from the published revision.
+	res, ok = wb.openPendingWritable(op)
+	if !ok || res.Handle == nil {
+		t.Fatal("post-ack pending overwrite append did not take the fast path")
+	}
+	h2 := res.Handle.(*bufferingHandle)
+	if h2.baseRev != 2 {
+		t.Fatalf("post-ack baseRev = %d, want 2", h2.baseRev)
+	}
+}
+
+// If the append staged a newer pending image before the older upload
+// acknowledged, that newer entry is the one that needs rebasing.
+func TestPortPendingOverwriteAppendRebasesNewerStage(t *testing.T) {
+	b := testbackend.NewBackend()
+	ts := httptest.NewServer(b)
+	defer ts.Close()
+	cl := client.New(ts.URL, "")
+	wbcache, err := staging.NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gen1, _, err := wbcache.PutWithBaseRevAndModeTimings("/f", []byte("base"), 4, staging.PendingOverwrite, 1, 0o644, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gen2, _, err := wbcache.PutWithBaseRevAndModeTimings("/f", []byte("base+append"), 11, staging.PendingOverwrite, 1, 0o644, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !wbcache.MarkSupersedesPendingGen("/f", gen1, gen2) {
+		t.Fatal("mark supersedes failed")
+	}
+	wb, err := New(Options{Policy: PolicyWriteBack, Client: cl, WriteCache: wbcache})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wb.acknowledgeUploadedCreate("/f", 2, gen1)
+	if meta, ok := wbcache.GetMeta("/f"); !ok || meta.BaseRev != 2 {
+		t.Fatalf("newer staged meta after ack = %+v ok=%v, want base 2", meta, ok)
+	}
+}
