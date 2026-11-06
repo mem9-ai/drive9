@@ -113,3 +113,69 @@ func TestCommitRecordsEchoedRevision(t *testing.T) {
 		t.Fatalf("published revision = %d, want 8", got)
 	}
 }
+
+// A stat answered by a lagging replica must not lower the revision floor.
+//
+// The floor exists so a read refuses a plan older than what this mount
+// published. Recording every stat unconditionally let an older answer (from a
+// replica that had not caught up, or simply an out-of-date read) pull the floor
+// back down — and the very next read then accepted exactly the stale plan the
+// floor was there to reject. Opens and getattrs run this constantly, so the
+// guard was defeatable on the very descriptor that had just written.
+func TestStaleStatDoesNotLowerThePublishedRevision(t *testing.T) {
+	br := NewBridge(Config{RemoteRoot: "/"})
+	const ino = meta.Ino(51)
+
+	// This mount published revision 9.
+	br.recordLandedRevision(ino, 9)
+	if got := br.publishedRevision(ino); got != 9 {
+		t.Fatalf("published revision = %d, want 9", got)
+	}
+	// A lagging stat reports 7.
+	br.observeRevision(ino, 7)
+	if got := br.publishedRevision(ino); got != 9 {
+		t.Fatalf("a stale stat lowered the floor to %d; it must stay 9", got)
+	}
+	// A newer stat still advances it.
+	br.observeRevision(ino, 12)
+	if got := br.publishedRevision(ino); got != 12 {
+		t.Fatalf("published revision = %d, want 12", got)
+	}
+}
+
+// The wait budget is spent only right after this mount published. Otherwise a
+// plan below the recorded revision is a disagreement the wait cannot fix, and
+// stalling every read on it would turn one stale answer into a hang.
+func TestFreshnessRetryBudgetOnlyAfterOwnPublication(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Dat9-Content-Layout", "extent")
+		w.Header().Set("X-Dat9-Revision", "3")
+		_ = json.NewEncoder(w).Encode(client.ExtentReadPlan{Size: 4096})
+	}))
+	defer srv.Close()
+
+	br := NewBridge(Config{Client: client.New(srv.URL, ""), RemoteRoot: "/"})
+	const ino = meta.Ino(52)
+	// A revision learned from someone else's write, with no publication by
+	// this mount: no retry budget.
+	br.observeRevision(ino, 9)
+
+	if _, err := br.fetchFreshReadPlan(context.Background(), ino, "/t.db", 0, 4095); err != nil {
+		t.Fatalf("read plan: %v", err)
+	}
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("fetched %d plans, want exactly 1 (no publication to wait for)", n)
+	}
+	// A revision this mount just published DOES buy the retry budget.
+	br.recordLandedRevision(ino, 9)
+	calls.Store(0)
+	if _, err := br.fetchFreshReadPlan(context.Background(), ino, "/t.db", 0, 4095); err != nil {
+		t.Fatalf("read plan: %v", err)
+	}
+	if n := calls.Load(); n < 2 {
+		t.Fatalf("fetched %d plans, want retries after this mount's own publication", n)
+	}
+}

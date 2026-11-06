@@ -122,9 +122,14 @@ type Bridge struct {
 
 	// paths caches inode → remote path; inode values are content-stable
 	// hashes of the path so lookups survive restarts of the bridge.
-	paths   map[meta.Ino]string
-	sizes   map[meta.Ino]int64 // local view of file length (fresh writes)
-	revs    map[meta.Ino]int64 // last known server revision
+	paths map[meta.Ino]string
+	sizes map[meta.Ino]int64 // local view of file length (fresh writes)
+	revs  map[meta.Ino]int64 // newest revision known to be published
+	// revAt records when THIS mount last published an inode. Only then can a
+	// read legitimately disagree with the server (replica lag); a revision
+	// recorded from someone else's write, or a publication minutes ago, gives
+	// a read nothing to wait for.
+	revAt   map[meta.Ino]time.Time
 	pending map[meta.Ino][]pendingWrite
 	truncs  map[meta.Ino]int64 // truncate-only growth awaiting the next commit
 	// modes remembers fresh-create modes until the first commit applies
@@ -180,6 +185,7 @@ func NewBridge(cfg Config) *Bridge {
 		paths:           map[meta.Ino]string{rootIno: root},
 		sizes:           make(map[meta.Ino]int64),
 		revs:            make(map[meta.Ino]int64),
+		revAt:           make(map[meta.Ino]time.Time),
 		pending:         make(map[meta.Ino][]pendingWrite),
 		truncs:          make(map[meta.Ino]int64),
 		modes:           make(map[meta.Ino]uint32),

@@ -145,8 +145,8 @@ func (b *Bridge) Lookup(ctx meta.Context, parent meta.Ino, name string, inode *m
 		return errnoOf(err)
 	}
 	b.remember(ino, path)
+	b.observeRevision(ino, st.Revision)
 	b.mu.Lock()
-	b.revs[ino] = st.Revision
 	if _, has := b.sizes[ino]; !has {
 		b.sizes[ino] = st.Size
 	}
@@ -180,8 +180,8 @@ func (b *Bridge) GetAttr(ctx meta.Context, ino meta.Ino, attr *meta.Attr) syscal
 		}
 		return errnoOf(err)
 	}
+	b.observeRevision(ino, st.Revision)
 	b.mu.Lock()
-	b.revs[ino] = st.Revision
 	local, has := b.sizes[ino]
 	b.mu.Unlock()
 	if attr != nil {
@@ -345,6 +345,7 @@ func (b *Bridge) removeEntry(ctx meta.Context, parent meta.Ino, name string) sys
 	delete(b.paths, ino)
 	delete(b.sizes, ino)
 	delete(b.revs, ino)
+	delete(b.revAt, ino)
 	delete(b.pending, ino)
 	delete(b.truncs, ino)
 	delete(b.modes, ino)
@@ -477,9 +478,18 @@ var readPlanStaleDelays = []time.Duration{0, 10 * time.Millisecond, 25 * time.Mi
 // revision N; a read below N is stale by definition, not merely unlucky.
 func (b *Bridge) fetchFreshReadPlan(ctx context.Context, ino meta.Ino, path string, start, end int64) (*client.ExtentReadPlan, error) {
 	known := b.publishedRevision(ino)
+	// The retry budget is only meaningful right after a publication by THIS
+	// mount: that is when a replica can be genuinely behind, and when waiting
+	// a few milliseconds resolves it. Outside that window a plan below the
+	// recorded revision means something else, so the read proceeds rather than
+	// stalling on a disagreement the wait cannot fix.
+	delays := readPlanStaleDelays
+	if known <= 0 || !b.recentlyPublished(ino) {
+		delays = readPlanStaleDelays[:1]
+	}
 	var last *client.ExtentReadPlan
 	var err error
-	for _, delay := range readPlanStaleDelays {
+	for _, delay := range delays {
 		if delay > 0 {
 			select {
 			case <-ctx.Done():
@@ -992,8 +1002,8 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 			if serr != nil {
 				continue // transient; keep retrying
 			}
+			b.observeRevision(ino, nst.Revision)
 			b.mu.Lock()
-			b.revs[ino] = nst.Revision
 			savedID := b.layoutPendingID[ino]
 			b.mu.Unlock()
 			// The classification Stat must describe the object OUR
@@ -1051,9 +1061,7 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 			b.mu.Unlock()
 		}
 	} else if nst, err := b.cfg.Client.StatCtx(ctx, path); err == nil {
-		b.mu.Lock()
-		b.revs[ino] = nst.Revision
-		b.mu.Unlock()
+		b.observeRevision(ino, nst.Revision)
 	}
 
 	b.mu.Lock()
@@ -1176,7 +1184,13 @@ func (b *Bridge) commitClassic(ctx context.Context, ino meta.Ino, path string, p
 		}
 	}
 	b.mu.Lock()
+	// Unconditional BY DESIGN: this is the compare-and-set base for the next
+	// publication and must equal the revision this publication produced.
+	// (Every other site records monotonically; see observeRevision.)
 	b.revs[ino] = newRev
+	if newRev > 0 {
+		b.revAt[ino] = time.Now()
+	}
 	// A classic publication is SUCCESSFUL and bound: the identity stays (it
 	// is the ownership proof for later writes) while the revision advances
 	// to the one this publication produced. (The normal extent path retires
@@ -1244,6 +1258,27 @@ func (b *Bridge) recordLandedRevision(ino meta.Ino, rev int64) {
 	if rev > b.revs[ino] {
 		b.revs[ino] = rev
 	}
+	b.revAt[ino] = time.Now()
+	b.mu.Unlock()
+}
+
+// observeRevision records a revision seen in a stat, never moving the recorded
+// value BACKWARDS.
+//
+// The recorded revision is the floor a read refuses to go below: "this mount
+// already published revision N". A stat answered by a lagging replica reports
+// an older N, and assigning it unconditionally lowered that floor — so the
+// very next read accepted the stale plan the floor exists to reject. Reads,
+// opens and getattrs all hit this, which is why the freshness guard could be
+// defeated on the same descriptor that had just written.
+func (b *Bridge) observeRevision(ino meta.Ino, rev int64) {
+	if rev <= 0 {
+		return
+	}
+	b.mu.Lock()
+	if rev > b.revs[ino] {
+		b.revs[ino] = rev
+	}
 	b.mu.Unlock()
 }
 
@@ -1254,6 +1289,24 @@ func (b *Bridge) publishedRevision(ino meta.Ino) int64 {
 	defer b.mu.Unlock()
 	return b.revs[ino]
 }
+
+// recentlyPublished reports whether this mount published the inode within
+// storeLagWindow — the only window in which a read can legitimately observe a
+// server revision below the recorded one (a replica catching up).
+//
+// Outside that window a stale answer means something else entirely (an older
+// object, a server that does not report revisions, tests that fake the wire),
+// and waiting on it would turn a caller's read into a multi-second stall.
+func (b *Bridge) recentlyPublished(ino meta.Ino) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	at, ok := b.revAt[ino]
+	return ok && time.Since(at) < storeLagWindow
+}
+
+// storeLagWindow bounds how long a read waits for the namespace to catch up
+// with a publication this mount just made.
+const storeLagWindow = 500 * time.Millisecond
 
 // flushPending commits a file's pending slices (used on Close and fsync
 // paths). The snapshot -> commit -> cleanup sequence runs under the
@@ -1531,8 +1584,8 @@ func (b *Bridge) ResolveLocal(ctx context.Context, local string) (meta.Ino, sysc
 		return 0, syscall.EIO
 	}
 	b.remember(ino, full)
+	b.observeRevision(ino, st.Revision)
 	b.mu.Lock()
-	b.revs[ino] = st.Revision
 	if _, has := b.sizes[ino]; !has {
 		b.sizes[ino] = st.Size
 	}
@@ -2068,6 +2121,7 @@ func (b *Bridge) forgetInoLocked(ino meta.Ino) {
 	delete(b.paths, ino)
 	delete(b.sizes, ino)
 	delete(b.revs, ino)
+	delete(b.revAt, ino)
 	delete(b.pending, ino)
 	delete(b.truncs, ino)
 	delete(b.modes, ino)
