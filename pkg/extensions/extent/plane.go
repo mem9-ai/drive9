@@ -232,6 +232,12 @@ func (h *Handler) openExistingLocked(ctx context.Context, path string, flags uin
 	attr := &fs.Attr{Kind: fs.KindFile, Nlink: 1}
 	if st, serr := h.opts.Engine.Bridge.StatLocal(ctx, path); serr == nil {
 		attr.Size = st.Size
+		// The revision is the compare-and-set base a write needs. Dropping
+		// it made every later overwrite carry baseRev 0 ("unknown"), and a
+		// base-0 overwrite is refused outright — the write-back plane then
+		// never publishes and the file stays at its opened size. An empty
+		// database file hit exactly that.
+		attr.Rev = st.Revision
 		if st.HasMode {
 			attr.Mode = st.Mode
 		}
@@ -448,6 +454,10 @@ func (h *Handler) tryClaimOpen(ctx context.Context, op *fs.Op) (fs.Result, error
 		if size, mode, ok := h.opts.Engine.Bridge.LocalView(ino); ok {
 			attr.Size = size
 			attr.Mode = mode
+		}
+		// The revision is the compare-and-set base for later writes.
+		if st, serr := h.opts.Engine.Bridge.StatLocal(ctx, op.Path); serr == nil {
+			attr.Rev = st.Revision
 		}
 		return fs.Result{Handle: handle, Attr: attr}, nil, true
 	}
