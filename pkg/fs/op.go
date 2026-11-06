@@ -252,6 +252,10 @@ type Op struct {
 	Fh     uint64 // kernel file handle
 	Kernel any    // the raw kernel request the facade translated
 	Rev    int64  // compare-and-set base revision for writes; -1 = unconditional
+	// OpenAttr is the facade's cached inode view for a kernel OPEN. Core may
+	// answer the open from it instead of re-stating the remote; nil means the
+	// facade has no usable row and the terminal must probe.
+	OpenAttr *Attr
 
 	// Kind-dependent payloads: which fields apply depends on OpKind.
 	Offset int64  // read/write/fallocate start offset

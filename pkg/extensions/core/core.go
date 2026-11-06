@@ -111,6 +111,16 @@ type NamespaceCache interface {
 	LookupNamespace(parent, name string) (fs.DirEntryInfo, fs.LookupKind)
 }
 
+// namespaceObservationCache is the optional listing-install half of the
+// namespace cache. It is separate from NamespaceCache so a cache that only
+// answers lookups (tests, minimal facades) still satisfies Attach.
+type namespaceObservationCache interface {
+	BeginObservation(dir string) fs.Observation
+	ObserveObservation(parent string, item fs.DirEntryInfo, token fs.Observation)
+	InstallListing(dir string, items []fs.DirEntryInfo, token fs.Observation)
+	EndObservation(token fs.Observation)
+}
+
 // Core is the remote terminal: the last handler of the chain, serving
 // every op synchronously against the HTTP backend.
 type Core struct {
@@ -284,8 +294,14 @@ func (c *Core) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, erro
 		}
 	}
 	switch op.Kind {
-	case fs.OpLookup, fs.OpGetAttr:
-		return c.statOp(ctx, op.Path)
+	case fs.OpLookup:
+		// v1 Lookup served a fresh listing row without revalidating it;
+		// GetAttr never did (the attr reply feeds size/revision decisions).
+		// Keep that split: lookups may answer from listing observations,
+		// stats revalidate unless this mount itself wrote the row.
+		return c.statOp(ctx, op.Path, true)
+	case fs.OpGetAttr:
+		return c.statOp(ctx, op.Path, false)
 	case fs.OpList:
 		return c.listOp(ctx, op.Path)
 	case fs.OpRead:
@@ -843,9 +859,9 @@ func (c *Core) retargetSyncHandles(oldPath, newPath string) {
 // statOp serves OpLookup / OpGetAttr: the namespace cache first (positive
 // and negative rows), then a remote stat with transient-retry absorption,
 // with the legacy parent-listing fallback as the last resort.
-func (c *Core) statOp(ctx context.Context, path string) (fs.Result, error) {
+func (c *Core) statOp(ctx context.Context, path string, allowListing bool) (fs.Result, error) {
 	epoch := c.viewEpoch.Load()
-	if attr, ok := c.statFromNamespaceCache(path); ok {
+	if attr, ok := c.statFromNamespaceCacheMode(path, allowListing); ok {
 		if attr == nil {
 			// Cached-negative rows (negative entry, complete miss, session
 			// miss) answer ENOENT without a remote stat. Returning a nil
@@ -854,6 +870,16 @@ func (c *Core) statOp(ctx context.Context, path string) (fs.Result, error) {
 			return fs.Result{}, fs.ErrNotFound
 		}
 		return fs.Result{Attr: attr}, nil
+	}
+	var obs namespaceObservationCache
+	var obsToken fs.Observation
+	parent, name := splitDirBase(path)
+	if allowListing && parent != "" && name != "" && !strings.HasSuffix(name, ".lock") {
+		if o, ok := c.dirCache.(namespaceObservationCache); ok {
+			obs = o
+			obsToken = o.BeginObservation(parent)
+			defer o.EndObservation(obsToken)
+		}
 	}
 	st, err := c.statWithTransientRetry(ctx, path)
 	if err != nil {
@@ -883,11 +909,26 @@ func (c *Core) statOp(ctx context.Context, path string) (fs.Result, error) {
 					// installs the authoritative view (v1
 					// maybeListOnNegativeLookupStorm). A listing failure
 					// must not fail the stat — the ENOENT stands.
-					if _, lerr := c.cl.ListCtx(ctx, c.remotePath(parent)); lerr == nil {
+					inst, _ := c.dirCache.(namespaceObservationCache)
+					var token fs.Observation
+					if inst != nil {
+						token = inst.BeginObservation(parent)
+					}
+					infos, lerr := c.cl.ListCtx(ctx, c.remotePath(parent))
+					if lerr == nil {
+						// Install the response. #1026 discarded it, so every
+						// later new name in this directory paid another
+						// individual HEAD despite the listing having already
+						// proven it absent.
+						if inst != nil {
+							inst.InstallListing(parent, dirEntryInfos(infos), token)
+						}
 						// The listing is installed; re-answer from it.
-						if attr, ok := c.statFromNamespaceCache(path); ok && attr == nil {
+						if attr, ok := c.statFromNamespaceCacheMode(path, allowListing); ok && attr == nil {
 							return fs.Result{}, fs.ErrNotFound
 						}
+					} else if inst != nil {
+						inst.EndObservation(token)
 					}
 				}
 			}
@@ -897,7 +938,11 @@ func (c *Core) statOp(ctx context.Context, path string) (fs.Result, error) {
 		}
 		return fs.Result{}, c.mapErr(err)
 	}
-	return fs.Result{Attr: attrOf(st)}, nil
+	attr := attrOf(st)
+	if allowListing && obs != nil {
+		obs.ObserveObservation(parent, dirEntryInfoFromAttr(name, attr), obsToken)
+	}
+	return fs.Result{Attr: attr}, nil
 }
 
 // statFromParentListing serves a stat by matching the parent listing when
@@ -951,6 +996,10 @@ func (c *Core) statFromParentListing(ctx context.Context, path string, statErr e
 // (positive/negative/complete-miss rows). Lock files
 // never use it: O_CREAT|O_EXCL probes must revalidate against the remote.
 func (c *Core) statFromNamespaceCache(path string) (*fs.Attr, bool) {
+	return c.statFromNamespaceCacheMode(path, false)
+}
+
+func (c *Core) statFromNamespaceCacheMode(path string, allowListing bool) (*fs.Attr, bool) {
 	if c.dirCache == nil || path == "/" || path == "" {
 		return nil, false
 	}
@@ -961,7 +1010,7 @@ func (c *Core) statFromNamespaceCache(path string) (*fs.Attr, bool) {
 	item, kind := c.dirCache.LookupNamespace(parent, name)
 	switch kind {
 	case fs.LookupPositive:
-		if !c.trustLocalEvents && !item.LocalMutation {
+		if !allowListing && !c.trustLocalEvents && !item.LocalMutation {
 			// Listing-observed rows do not serve stats without
 			// revalidation on multi-server mounts (default): only the
 			// process-local trust flag — or a row this mount itself wrote
@@ -1042,104 +1091,168 @@ func (c *Core) listOp(ctx context.Context, dir string) (fs.Result, error) {
 	}
 	entries := make([]fs.Entry, 0, len(infos))
 	for _, fi := range infos {
-		if fi.Name == "" || fi.Name == "." || fi.Name == ".." ||
-			strings.ContainsRune(fi.Name, '/') || strings.ContainsRune(fi.Name, 0) {
+		attr, ok := attrFromFileInfo(fi)
+		if !ok {
 			continue
-		}
-		attr := fs.Attr{Size: fi.Size, Rev: fi.Revision, Mode: fi.Mode & 0o7777, Mtime: time.Unix(fi.Mtime, 0), Nlink: fi.Nlink, ResourceID: fi.ResourceID, ExtentIno: fi.ExtentIno}
-		if fi.IsDir {
-			attr.Kind = fs.KindDir
-			if !fi.HasMode {
-				attr.Mode = 0o755
-			}
-		} else if fi.HasMode && fi.Mode&uint32(syscall.S_IFMT) == uint32(syscall.S_IFLNK) {
-			attr.Kind = fs.KindSymlink
-			// Keep the type bit: cached entries restore the symlink kind
-			// from S_IFMT (a perms-only mask would retype the link as a
-			// regular file and break follow semantics).
-			attr.Mode = uint32(syscall.S_IFLNK) | 0o777
-		} else if !fi.HasMode {
-			attr.Mode = 0o644
 		}
 		entries = append(entries, fs.Entry{Name: fi.Name, Attr: attr})
 	}
 	return fs.Result{Entries: entries}, nil
 }
 
-// createOp serves OpCreate (open-or-create). The existence probe goes
-// through statOp: the namespace cache answers paths this mount just
-// created/committed, so an open racing backend replica lag reads the local
-// view instead of a stale remote stat.
+// attrFromFileInfo classifies one listing row. Unusable names are rejected.
+func attrFromFileInfo(fi client.FileInfo) (fs.Attr, bool) {
+	if fi.Name == "" || fi.Name == "." || fi.Name == ".." ||
+		strings.ContainsRune(fi.Name, '/') || strings.ContainsRune(fi.Name, 0) {
+		return fs.Attr{}, false
+	}
+	attr := fs.Attr{Size: fi.Size, Rev: fi.Revision, Mode: fi.Mode & 0o7777, Mtime: time.Unix(fi.Mtime, 0), Nlink: fi.Nlink, ResourceID: fi.ResourceID, ExtentIno: fi.ExtentIno}
+	if fi.IsDir {
+		attr.Kind = fs.KindDir
+		if !fi.HasMode {
+			attr.Mode = 0o755
+		}
+	} else if fi.HasMode && fi.Mode&uint32(syscall.S_IFMT) == uint32(syscall.S_IFLNK) {
+		attr.Kind = fs.KindSymlink
+		// Keep the type bit: cached entries restore the symlink kind
+		// from S_IFMT (a perms-only mask would retype the link as a
+		// regular file and break follow semantics).
+		attr.Mode = uint32(syscall.S_IFLNK) | 0o777
+	} else if !fi.HasMode {
+		attr.Mode = 0o644
+	}
+	return attr, true
+}
+
+// dirEntryInfos projects a listing response into namespace-cache rows.
+func dirEntryInfos(infos []client.FileInfo) []fs.DirEntryInfo {
+	out := make([]fs.DirEntryInfo, 0, len(infos))
+	for _, fi := range infos {
+		attr, ok := attrFromFileInfo(fi)
+		if !ok {
+			continue
+		}
+		out = append(out, dirEntryInfoFromAttr(fi.Name, &attr))
+	}
+	return out
+}
+
+// dirEntryInfoFromAttr reverses the cache projection for a remote read.
+func dirEntryInfoFromAttr(name string, attr *fs.Attr) fs.DirEntryInfo {
+	if attr == nil {
+		return fs.DirEntryInfo{Name: name}
+	}
+	item := fs.DirEntryInfo{
+		Name: name, IsDir: attr.IsDir(), Size: attr.Size, Mode: attr.Mode,
+		HasMode: true, Mtime: attr.Mtime, Rev: attr.Rev,
+		ResourceID: attr.ResourceID, Nlink: attr.Nlink, ExtentIno: attr.ExtentIno,
+		Uid: attr.Uid, HasUID: attr.HasUID, Gid: attr.Gid, HasGID: attr.HasGID,
+	}
+	if attr.Kind == fs.KindSymlink {
+		item.Mode = uint32(syscall.S_IFLNK) | (attr.Mode & 0o777)
+	}
+	return item
+}
+
+// statForWrite ensures a writable open gets a remote revision. A
+// LocalMutation row may be the just-created, not-yet-landed image with
+// Rev 0; staging an overwrite/truncation at that base is rejected by the
+// uploader ("missing base revision for overwrite"). The row is still the
+// read-your-writes answer, so keep it unless a revision is required.
+func (c *Core) statForWrite(ctx context.Context, path string) (fs.Result, error) {
+	res, err := c.statOp(ctx, path, false)
+	if err != nil || res.Attr == nil || res.Attr.Rev > 0 {
+		return res, err
+	}
+	st, serr := c.statWithTransientRetry(ctx, path)
+	if serr != nil {
+		return fs.Result{}, c.mapErr(serr)
+	}
+	return fs.Result{Attr: attrOf(st)}, nil
+}
+
+// createOp serves OpCreate (open-or-create). A kernel CREATE already proved
+// the name missing and a kernel OPEN already resolved an existing dentry, so
+// neither shape needs a synthetic existence probe: the terminal trusts the
+// kernel's resolution and reserves remote stats for synthesized ops and for
+// writable opens that need a CAS base.
 func (c *Core) createOp(ctx context.Context, op *fs.Op) (fs.Result, error) {
 	rp := c.remotePath(op.Path)
-	probe, statErr := c.statOp(ctx, op.Path)
-	exists := statErr == nil && probe.Attr != nil
-	if statErr != nil && statErr != fs.ErrNotFound {
-		return fs.Result{}, statErr
+	flags := op.Flags
+	// A read-only FUSE OPEN follows a successful lookup. The kernel owns the
+	// dentry, and the open reply does not carry attributes: re-stating here
+	// only adds a HEAD to every open (mdtest's read phase opens without
+	// reading). Writable opens still need the remote size/revision below.
+	kernelExisting := op.KernelOpenExisting() &&
+		flags&uint32(syscall.O_CREAT) == 0 &&
+		flags&uint32(syscall.O_TRUNC) == 0
+	if kernelExisting && op.OpenAttr != nil && op.OpenAttr.Rev > 0 &&
+		flags&uint32(syscall.O_ACCMODE) == uint32(syscall.O_RDONLY) {
+		// A row without a remote revision can be a local overlay or a
+		// just-created file whose backing name can disappear underneath the
+		// cached dentry (layer rollback, deferred delete). Those opens must
+		// still revalidate; only a revision-bound remote row is safe to
+		// answer without the terminal probe.
+		//
+		// The OPEN reply carries no attributes. Do not publish the inode's
+		// cached size as authoritative: a missed event can leave it behind a
+		// foreign append, and a read plane treating that prefix as the whole
+		// file returns EOF for the new tail even after GetAttr refreshed the
+		// inode. Size 0 means "unknown" to the read cache; the revision-bound
+		// range path still reads the remote.
+		attr := *op.OpenAttr
+		attr.Size = 0
+		return fs.Result{Attr: &attr, Handle: c.newSyncHandle(op.Path)}, nil
 	}
+
+	kernelCreate := op.KernelCreate() && flags&uint32(syscall.O_CREAT) != 0
+	exists := false
 	var st *client.StatResult
-	if exists {
-		st = &client.StatResult{
-			IsDir: probe.Attr.IsDir(), Size: probe.Attr.Size,
-			Revision: probe.Attr.Rev, Mtime: probe.Attr.Mtime,
-			Nlink: probe.Attr.Nlink,
+	if !kernelCreate {
+		// Writable opens keep the terminal probe: the inode's cached
+		// revision can trail a local commit (a hardlink write updates the
+		// shared object but not every alias's entry), and staging a
+		// truncation at that stale base silently loses the commit to a CAS
+		// conflict. Read-only opens above may use the cached row because
+		// they never stage a write. A synthesized open carrying OpenAttr
+		// (writeback's fresh conflict probe) is the one exception: that row
+		// was just observed, not cached on the inode.
+		if op.Kernel == nil && op.OpenAttr != nil && op.OpenAttr.Rev > 0 {
+			exists = true
+			st = &client.StatResult{
+				IsDir: op.OpenAttr.IsDir(), Size: op.OpenAttr.Size,
+				Revision: op.OpenAttr.Rev, Mtime: op.OpenAttr.Mtime,
+				Mode: op.OpenAttr.Mode, HasMode: true,
+				Nlink: op.OpenAttr.Nlink, ResourceID: op.OpenAttr.ResourceID,
+				ExtentIno: op.OpenAttr.ExtentIno,
+			}
+		} else {
+			probe, statErr := c.statForWrite(ctx, op.Path)
+			exists = statErr == nil && probe.Attr != nil
+			if statErr != nil && statErr != fs.ErrNotFound {
+				return fs.Result{}, statErr
+			}
+			if exists {
+				st = &client.StatResult{
+					IsDir: probe.Attr.IsDir(), Size: probe.Attr.Size,
+					Revision: probe.Attr.Rev, Mtime: probe.Attr.Mtime,
+					Mode: probe.Attr.Mode, HasMode: true,
+					Nlink: probe.Attr.Nlink, ResourceID: probe.Attr.ResourceID,
+					ExtentIno: probe.Attr.ExtentIno,
+				}
+			}
 		}
 	}
-	flags := op.Flags
 	if flags&uint32(syscall.O_CREAT) != 0 {
 		if exists && flags&uint32(syscall.O_EXCL) != 0 {
 			return fs.Result{}, syscall.EEXIST
 		}
 		if !exists {
-			commitCtx, cancel := c.namespaceMutationCommitContext(ctx)
-			_, err := c.cl.CreateFileCtx(commitCtx, rp)
-			cancel()
+			created, err := c.createRemoteFile(ctx, op, rp)
 			if err != nil {
-				// A conflict against a path this mount believes gone is
-				// backend replica lag (create-after-unlink/rename races a
-				// stale replica): re-probe detached and retry once before
-				// surfacing EEXIST (v1 createFile conflict tolerance).
-				if errors.Is(err, client.ErrConflict) {
-					// Bounded backoff: cross-pod replica lag on this
-					// backend outlasts sub-second ladders — budget a few
-					// seconds before surfacing EEXIST (v1's retry ladder).
-					for range 12 {
-						if _, serr := c.remoteStatDetached(rp); serr != nil && client.IsNotFound(serr) {
-							retryCtx, rcancel := c.namespaceMutationCommitContext(ctx)
-							_, err = c.cl.CreateFileCtx(retryCtx, rp)
-							rcancel()
-							if err == nil {
-								st, statErr := c.cl.StatCtx(ctx, rp)
-								if statErr != nil {
-									return fs.Result{}, c.mapErr(statErr)
-								}
-								return fs.Result{Attr: attrOf(st), Handle: c.newSyncHandle(op.Path)}, nil
-							}
-							if !errors.Is(err, client.ErrConflict) {
-								break
-							}
-						}
-						time.Sleep(250 * time.Millisecond)
-					}
-				}
-				return fs.Result{}, c.mapErr(err)
+				return fs.Result{}, err
 			}
-			// An explicit create mode is always meaningful (mode 0 must be
-			// applied, not skipped: pjdfstest creates 00-mode files); the
-			// full 0o7777 range keeps SUID/SGID at create (chmod/12).
-			if mode := op.Mode & 0o7777; mode != 0o644 {
-				if err := retryPostUploadMode(ctx, func() error {
-					// v1 masks the create-mode chmod to 0o777 at the
-					// wire (remoteChmodMode); SUID/SGID stays local.
-					return c.cl.ChmodCtx(ctx, rp, mode&0o777)
-				}); err != nil {
-					return fs.Result{}, c.mapErr(err)
-				}
-			}
-			st, statErr = c.cl.StatCtx(ctx, rp)
-			if statErr != nil {
-				return fs.Result{}, c.mapErr(statErr)
-			}
+			st = created
 		}
 	} else if !exists {
 		return fs.Result{}, fs.ErrNotFound
@@ -1151,11 +1264,130 @@ func (c *Core) createOp(ctx context.Context, op *fs.Op) (fs.Result, error) {
 	return fs.Result{Attr: attrOf(st), Handle: c.newSyncHandle(op.Path)}, nil
 }
 
+// truncateRemoteToZero publishes an empty image for a CREATE that lost to
+// an existing file but carried O_TRUNC. The commit CASes on the observed
+// revision and re-stats on conflict, mirroring setAttrOp's truncate ladder.
+func (c *Core) truncateRemoteToZero(ctx context.Context, rp string, st *client.StatResult) error {
+	rev := st.Revision
+	for attempt := 0; attempt < 3; attempt++ {
+		if rev <= 0 {
+			fresh, serr := c.remoteStatDetached(rp)
+			if serr != nil {
+				return c.mapErr(serr)
+			}
+			if fresh == nil {
+				return fs.StatusErrorOf(gofuse.Status(syscall.EIO))
+			}
+			rev = fresh.Revision
+		}
+		if rev <= 0 {
+			return fs.StatusErrorOf(gofuse.Status(syscall.EIO))
+		}
+		err := c.cl.WriteStreamConditional(ctx, rp, bytes.NewReader(nil), 0, nil, rev)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, client.ErrConflict) {
+			return c.mapErr(err)
+		}
+		fresh, serr := c.remoteStatDetached(rp)
+		if serr != nil {
+			return c.mapErr(serr)
+		}
+		if fresh == nil {
+			return fs.StatusErrorOf(gofuse.Status(syscall.EIO))
+		}
+		rev = fresh.Revision
+	}
+	return fs.StatusErrorOf(gofuse.Status(syscall.EIO))
+}
+
+// createRemoteFile creates a regular file and returns the attributes the
+// CREATE reply needs without a second round trip. The server's create reply
+// carries the revision; the terminal synthesizes the empty-file row from the
+// request mode (v1 Create answered from the inode it had just built).
+func (c *Core) createRemoteFile(ctx context.Context, op *fs.Op, rp string) (*client.StatResult, error) {
+	commitCtx, cancel := c.namespaceMutationCommitContext(ctx)
+	rev, err := c.cl.CreateFileCtx(commitCtx, rp)
+	cancel()
+	if err != nil {
+		if !errors.Is(err, client.ErrConflict) {
+			return nil, c.mapErr(err)
+		}
+		// A conflicting create means the name exists (a stale kernel
+		// negative or a concurrent creator). Without O_EXCL the open is an
+		// ordinary existing-file open; with O_EXCL it is EEXIST. Only a
+		// genuinely replica-lagged 404 enters the bounded retry ladder.
+		if st, serr := c.cl.StatCtx(ctx, rp); serr == nil && st != nil {
+			if op.Flags&uint32(syscall.O_EXCL) != 0 {
+				return nil, syscall.EEXIST
+			}
+			if op.Flags&uint32(syscall.O_TRUNC) != 0 {
+				// The kernel resolved a stale negative, so this CREATE
+				// conflicted with an existing file. A plain handle return
+				// defers the requested truncation to a later write; a crash
+				// before that write would leave the old suffix visible.
+				if err := c.truncateRemoteToZero(ctx, rp, st); err != nil {
+					return nil, err
+				}
+				if fresh, ferr := c.remoteStatDetached(rp); ferr == nil && fresh != nil {
+					return fresh, nil
+				}
+				st.Size, st.Revision = 0, 0
+			}
+			return st, nil
+		}
+		for range 12 {
+			if _, serr := c.remoteStatDetached(rp); serr != nil && client.IsNotFound(serr) {
+				retryCtx, rcancel := c.namespaceMutationCommitContext(ctx)
+				rev, err = c.cl.CreateFileCtx(retryCtx, rp)
+				rcancel()
+				if err == nil {
+					break
+				}
+				if !errors.Is(err, client.ErrConflict) {
+					return nil, c.mapErr(err)
+				}
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
+		if err != nil {
+			return nil, c.mapErr(err)
+		}
+	}
+	// An explicit create mode is always meaningful (mode 0 must be applied,
+	// not skipped: pjdfstest creates 00-mode files); the full 0o7777 range
+	// keeps SUID/SGID at create (chmod/12).
+	mode := op.Mode & 0o7777
+	if mode != 0o644 {
+		if err := retryPostUploadMode(ctx, func() error {
+			// v1 masks the create-mode chmod to 0o777 at the wire
+			// (remoteChmodMode); SUID/SGID stays local.
+			return c.cl.ChmodCtx(ctx, rp, mode&0o777)
+		}); err != nil {
+			return nil, c.mapErr(err)
+		}
+	}
+	if rev > 0 {
+		return &client.StatResult{
+			Size: 0, Revision: rev, Mtime: time.Now().Truncate(time.Second),
+			Mode: mode, HasMode: true, Nlink: 1,
+		}, nil
+	}
+	// Old servers answered create without a revision; fall back to the stat
+	// only on that legacy shape.
+	st, serr := c.cl.StatCtx(ctx, rp)
+	if serr != nil {
+		return nil, c.mapErr(serr)
+	}
+	return st, nil
+}
+
 // setAttrOp serves OpSetAttr. The probe comes first: it yields the kind (directory chmod goes to the
 // trailing-slash form), the truncate base revision, and the reply
 // attributes — no extra remote stat follows the mutations.
 func (c *Core) setAttrOp(ctx context.Context, op *fs.Op) (fs.Result, error) {
-	probe, statErr := c.statOp(ctx, op.Path)
+	probe, statErr := c.statOp(ctx, op.Path, false)
 	if statErr != nil {
 		return fs.Result{}, statErr
 	}
@@ -1272,7 +1504,7 @@ func (c *Core) mknodRegular(ctx context.Context, op *fs.Op) (fs.Result, error) {
 	// The existence probe goes through statOp so this mount's own negative
 	// rows answer first: a recreate right after this mount deleted the name
 	// must not race backend replica lag on the stale remote stat.
-	_, statErr := c.statOp(ctx, op.Path)
+	_, statErr := c.statOp(ctx, op.Path, false)
 	if statErr == nil {
 		return fs.Result{}, syscall.EEXIST
 	} else if !fs.IsNotFound(statErr) {

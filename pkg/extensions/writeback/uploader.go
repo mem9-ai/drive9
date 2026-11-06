@@ -178,6 +178,20 @@ func (u *WriteBackUploader) SetPerfCounters(perf *fusePerfCounters) {
 	u.perf = perf
 }
 
+// InFlight reports whether localPath currently has an upload in progress.
+// The flag stays set through OnSuccess, so a pending image seen while it is
+// true may already have a published revision that its deferred cleanup has
+// not acknowledged yet.
+func (u *WriteBackUploader) InFlight(localPath string) bool {
+	if u == nil {
+		return false
+	}
+	u.inflightMu.Lock()
+	_, ok := u.inflight[localPath]
+	u.inflightMu.Unlock()
+	return ok
+}
+
 // PendingStats returns queued and in-flight upload counts for observability.
 func (u *WriteBackUploader) PendingStats() (queued int, inFlight int) {
 	if u == nil {

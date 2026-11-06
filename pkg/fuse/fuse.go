@@ -1365,6 +1365,22 @@ func (f *FS) attrTTLFor(path string) time.Duration {
 	return f.attrTTL
 }
 
+// ownerPresence resolves the split owner-presence flags. HasOwner is the
+// coarse "either field" form and is used only when neither split flag is
+// present; OR-ing it into both fields marked an absent owner authoritative.
+func ownerPresence(a *fs.Attr) (hasUID, hasGID bool) {
+	if a == nil {
+		return false, false
+	}
+	if a.HasUID || a.HasGID {
+		return a.HasUID, a.HasGID
+	}
+	if a.HasOwner {
+		return true, true
+	}
+	return false, false
+}
+
 func (f *FS) fillEntryOut(path string, a *fs.Attr, isDir bool, out *gofuse.EntryOut) {
 	var size int64
 	if a != nil {
@@ -1388,6 +1404,21 @@ func (f *FS) fillEntryOut(path string, a *fs.Attr, isDir bool, out *gofuse.Entry
 	}
 	out.NodeId = ino
 	if a != nil {
+		hasUID, hasGID := ownerPresence(a)
+		if hasUID || hasGID {
+			// A lookup reply is authoritative for ownership too. Persisting it
+			// here is what lets the open gate use the real owner instead of the
+			// mount default (extent files owned by another uid are the concrete
+			// case: the reply carries Uid/Gid, but only the mode was stored).
+			f.inodes.UpdateOwner(ino, a.Uid, a.Gid, hasUID, hasGID)
+		}
+		// Keep the inode's CAS base in sync with the reply. Read-only Open
+		// may answer from a revision-bound row without re-stating; without
+		// persisting it here that row would carry revision 0 and every
+		// Lookup → Open would pay the stat Lookup had just answered.
+		if a.Rev > 0 {
+			f.inodes.UpdateRevision(ino, a.Rev)
+		}
 		f.fillAttr(*a, ino, &out.Attr)
 		mode := a.Mode
 		if mode&syscall.S_IFMT == 0 || mode&syscall.S_IFMT == syscall.S_IFREG {
@@ -1928,7 +1959,20 @@ func (f *FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name string, o
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 	mode := fs.Attr{Kind: fs.KindDir, Mode: input.Mode & 0o7777}
+	// Install the empty-directory marker BEFORE the remote mkdir can
+	// return. A foreign child created immediately after the mkdir can be
+	// invalidated while this call is still finishing; installing the marker
+	// afterwards would recreate the complete/session-miss authority over
+	// that invalidation and hide the child for a full directory TTL. With
+	// the marker in place first, the invalidation simply clears it.
+	dc, _ := f.Ctx.DirCache.(*dircache.DirCache)
+	if dc != nil {
+		dc.MarkSessionCreatedDir(child)
+	}
 	if _, st := f.dispatch(ctx, &fs.Op{Kind: fs.OpMkdir, Path: child, Mode: input.Mode & 0o7777, Ino: input.NodeId, Kernel: input, Caller: fs.CallerFrom(input.InHeader)}); st != gofuse.OK {
+		if dc != nil {
+			dc.Invalidate(child)
+		}
 		return st
 	}
 	f.mutated(fs.EventWrite, child)
@@ -2556,7 +2600,6 @@ func (f *FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse.Open
 	if !f.defaultPermissions {
 		mode, modeKnown := uint32(0), false
 		ownerUid, ownerGid := f.uid, f.gid
-		ownerKnown := false
 		if entry, eok := f.inodes.GetEntry(input.NodeId); eok {
 			if entry.HasUID {
 				ownerUid = entry.Uid
@@ -2564,38 +2607,32 @@ func (f *FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse.Open
 			if entry.HasGID {
 				ownerGid = entry.Gid
 			}
-			ownerKnown = entry.HasUID && entry.HasGID
 			if entry.HasMode {
 				mode, modeKnown = entry.Mode&0o777, true
 			}
 		}
-		if !modeKnown || !ownerKnown {
-			// The inode carries no recorded mode (a chain reply with
-			// mode 0 is ambiguous — a real chmod 000 and "unknown" are
-			// indistinguishable at the boundary), or no authoritative
-			// owner (without it the gate tested the MOUNT's uid and
-			// picked the wrong permission class for group-readable
-			// files owned by others): settle both with a fresh stat
-			// instead of skipping the gate — a plain Lookup → Open of a
-			// remote chmod(000) file read the contents otherwise.
+		if !modeKnown {
+			// A mode-less inode (a chain reply with mode 0 is ambiguous — a
+			// real chmod 000 and "unknown" are indistinguishable) needs one
+			// stat: a plain Lookup → Open of a remote chmod(000) file would
+			// otherwise read the contents. Ownership does NOT need a probe:
+			// v1 entryOwner fell back to the mount's uid/gid, and re-statting
+			// on every open of a remote file added a HEAD the kernel had
+			// already resolved.
 			if st, serr := f.dispatchErr(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: path, Ino: input.NodeId, Kernel: input, Caller: caller}); serr == nil && st.Attr != nil {
 				// A successful stat is authoritative — including a real
 				// chmod(000) answer of zero (requiring nonzero would skip
 				// the gate for exactly the mode it exists to enforce).
-				if !modeKnown {
-					mode, modeKnown = st.Attr.Mode&0o777, true
+				mode, modeKnown = st.Attr.Mode&0o777, true
+				hasUID, hasGID := ownerPresence(st.Attr)
+				if hasUID {
+					ownerUid = st.Attr.Uid
 				}
-				if !ownerKnown {
-					if st.Attr.HasUID || st.Attr.HasGID {
-						if st.Attr.HasUID {
-							ownerUid = st.Attr.Uid
-						}
-						if st.Attr.HasGID {
-							ownerGid = st.Attr.Gid
-						}
-					} else if st.Attr.HasOwner {
-						ownerUid, ownerGid = st.Attr.Uid, st.Attr.Gid
-					}
+				if hasGID {
+					ownerGid = st.Attr.Gid
+				}
+				if hasUID || hasGID {
+					f.inodes.UpdateOwner(input.NodeId, ownerUid, ownerGid, hasUID, hasGID)
 				}
 			}
 		}
@@ -2630,8 +2667,23 @@ func (f *FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse.Open
 			return st
 		}
 	}
+	var openAttr *fs.Attr
+	if entry, eok := f.inodes.GetEntry(input.NodeId); eok && entry.HasMode && !entry.Unlinked {
+		kind := fs.KindFile
+		if entry.IsDir {
+			kind = fs.KindDir
+		}
+		openAttr = &fs.Attr{
+			Kind: kind, Mode: entry.Mode & 0o7777, Size: entry.Size,
+			Rev: entry.Revision, Mtime: entry.Mtime, Nlink: entry.Nlink,
+			ResourceID: entry.ResourceID, ExtentIno: entry.ExtentIno,
+			Uid: entry.Uid, HasUID: entry.HasUID,
+			Gid: entry.Gid, HasGID: entry.HasGID,
+			HasOwner: entry.HasUID || entry.HasGID,
+		}
+	}
 	start := time.Now()
-	res, err := f.dispatchErr(ctx, &fs.Op{Kind: fs.OpCreate, Path: path, Flags: input.Flags, Ino: input.NodeId, Kernel: input, Caller: caller})
+	res, err := f.dispatchErr(ctx, &fs.Op{Kind: fs.OpCreate, Path: path, Flags: input.Flags, Ino: input.NodeId, Kernel: input, Caller: caller, OpenAttr: openAttr})
 	f.recordHandleOp(fs.OpCreate, start, err, 0)
 	if err != nil {
 		return fs.StatusOf(err)

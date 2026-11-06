@@ -228,6 +228,63 @@ type stripedLocks struct {
 // without round trips) and commits whole images per policy. New files are
 // created lazily: the remote sees nothing until the commit boundary, and
 // reads of never-written regions return zeros, matching the terminal.
+// pendingGenSource identifies which staging track issued a generation
+// number. The write-back cache and the commit-queue pending index use
+// independent counters, so a bare uint64 comparison can match a generation
+// from the other track.
+type pendingGenSource uint8
+
+const (
+	pendingGenNone pendingGenSource = iota
+	pendingGenCache
+	pendingGenQueue
+)
+
+// mergeCacheAncestorGens returns a newest-first, deduplicated ancestor list.
+// The list must not have a fixed count cap: an outstanding upload can remain
+// in flight across an unbounded number of later stages, and evicting its
+// generation would lose the acknowledgement's CAS lineage.
+func mergeCacheAncestorGens(base []uint64, add ...uint64) []uint64 {
+	out := make([]uint64, 0, len(base)+len(add))
+	seen := make(map[uint64]struct{}, len(base)+len(add))
+	for _, gen := range append(append([]uint64(nil), add...), base...) {
+		if gen == 0 {
+			continue
+		}
+		if _, ok := seen[gen]; ok {
+			continue
+		}
+		seen[gen] = struct{}{}
+		out = append(out, gen)
+	}
+	return out
+}
+
+func cacheGenInList(list []uint64, gen uint64) bool {
+	if gen == 0 {
+		return false
+	}
+	for _, g := range list {
+		if g == gen {
+			return true
+		}
+	}
+	return false
+}
+
+func removeCacheAncestorGen(list []uint64, gen uint64) []uint64 {
+	if gen == 0 {
+		return list
+	}
+	out := list[:0]
+	for _, g := range list {
+		if g != gen {
+			out = append(out, g)
+		}
+	}
+	return out
+}
+
 type bufferingHandle struct {
 	w    *Writeback
 	path string
@@ -264,6 +321,15 @@ type bufferingHandle struct {
 	// claimed as superseded by a landing, so a foreign writer's conflict
 	// marker cannot be retired by an image that never contained its bytes.
 	supersededPendingGen uint64
+	// supersededPendingSource binds the generation above to its track.
+	supersededPendingSource pendingGenSource
+	// cacheLineageGen is the write-back-cache generation root this handle's
+	// content descends from (its own staging when it has no pending parent).
+	cacheLineageGen uint64
+	// cacheAncestorGens lists the cache generations this handle's content
+	// composed over, newest first. It survives removal of the predecessor's
+	// cache entry before its upload acknowledgement.
+	cacheAncestorGens []uint64
 	// pendingFile backs a snapshot larger than the memory bound: the old
 	// object's bytes are streamed to a temp file (closed with the handle),
 	// so a 65MiB anonymous fd keeps its identity instead of falling back
@@ -535,7 +601,7 @@ func New(opts Options) (*Writeback, error) {
 		up.OnSuccess = func(meta staging.WriteBackMeta, committedRev int64, gens StagingGens) {
 			unlock := w.pathLocks.lock(meta.Path)
 			defer unlock()
-			w.acknowledgeUploadedCreate(meta.Path, committedRev)
+			w.acknowledgeUploadedCreate(meta.Path, committedRev, meta.Generation, pendingGenCache, meta.Generation)
 			if meta.Kind == staging.PendingChmod {
 				return
 			}
@@ -599,7 +665,10 @@ func New(opts Options) (*Writeback, error) {
 					w.wbCache.RemoveIfGeneration(entry.Path, gen)
 				}
 			}
-			w.acknowledgeUploadedCreate(entry.Path, committedRev)
+			// Queue entries carry PendingIndexGen, a generation space separate from
+			// the .dat/.meta cache; only use it for live-handle lineage, never
+			// to rebase a cache entry that merely shares the number.
+			w.acknowledgeUploadedCreate(entry.Path, committedRev, entry.PendingIndexGen, pendingGenQueue, 0)
 			if w.opts.Policy == PolicyWriteSync || w.opts.Policy == PolicyCloseSync {
 				w.armBypass(entry.Path, committedRev, entry.Size, "sync-commit")
 			}
@@ -1111,6 +1180,51 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		return res, nil
 	case fs.OpCreate:
 		flags := op.Flags
+		// A re-open whose newest image is still staged locally must serve that
+		// image, not probe the remote and wait for the previous upload. v1
+		// loaded the write-back cache here; #1026 dropped it, so append/reopen
+		// paid a 404 HEAD plus waitPathCommit/UploadSync per close.
+		if res, ok := w.openPendingWritable(op); ok {
+			return res, nil
+		}
+		if op.KernelCreate() && flags&uint32(syscall.O_EXCL) != 0 {
+			// O_EXCL must let the server arbitrate the create before the
+			// syscall reports success. The lazy PendingNew path returns a
+			// handle immediately and only discovers an existing row when the
+			// uploader runs, long after open(2).
+			res, err := next(ctx, op)
+			if err != nil || res.Handle == nil {
+				return res, err
+			}
+			size := attrSize(res)
+			rev := int64(0)
+			if res.Attr != nil {
+				rev = res.Attr.Rev
+			}
+			h := &bufferingHandle{w: w, path: op.Path, inner: res.Handle, flags: flags,
+				baseSize: size, baseRev: rev, forceSync: hasSyncOpenFlag(flags)}
+			mode := op.Mode & 0o7777
+			if mode != 0o644 && mode != 0 {
+				h.pendingMode = mode
+				h.hasPendingMode = true
+			}
+			w.track(h)
+			res.Handle = h
+			return res, nil
+		}
+		if !op.KernelCreate() && flags&uint32(syscall.O_CREAT) == 0 && flags&uint32(syscall.O_APPEND) != 0 &&
+			w.uploader != nil && w.wbCache != nil {
+			// The fast path declined a PendingOverwrite. Do not let the
+			// ordinary HEAD-open capture its pre-upload base: land the
+			// pending image synchronously (this also covers a queued upload
+			// that has not acquired the worker gate yet), then open the
+			// committed remote revision.
+			if meta, ok := w.wbCache.GetMeta(op.Path); ok && meta != nil && meta.Kind != staging.PendingNew {
+				if err := w.uploader.UploadSync(ctx, op.Path); err != nil && !w.uploader.IsLedgerOwnedError(err) {
+					return fs.Result{}, err
+				}
+			}
+		}
 		if flags&uint32(syscall.O_CREAT) == 0 {
 			// v1 close-to-open: a read-only re-open of a path whose image
 			// has not landed serves the pending bytes — the kernel's LOOKUP
@@ -1127,8 +1241,16 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 					// The handle serves this pending generation's image, so a
 					// later staging through it contains that generation — and
 					// only it.
-					if meta, ok := w.pendingMeta(op.Path); ok && meta != nil {
+					if meta, track := w.pendingMetaTrack(op.Path); meta != nil {
 						h.supersededPendingGen = meta.Generation
+						h.supersededPendingSource = track
+						if track == pendingGenCache {
+							h.cacheLineageGen = meta.CacheLineageGen
+							if h.cacheLineageGen == 0 {
+								h.cacheLineageGen = meta.Generation
+							}
+							h.cacheAncestorGens = mergeCacheAncestorGens(meta.CacheAncestorGens, meta.Generation)
+						}
 					}
 					if pb, ok := w.pendingBaseRevOf(op.Path); ok {
 						h.baseRev = pb
@@ -1146,7 +1268,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 				// need the mode.
 				if w.hasPendingLocalState(op.Path) {
 					size := int64(0)
-					meta, _ := w.pendingMeta(op.Path)
+					meta, track := w.pendingMetaTrack(op.Path)
 					if meta != nil {
 						size = meta.Size
 					}
@@ -1160,6 +1282,14 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 						// captured image IS this generation's content.
 						if meta != nil {
 							h.supersededPendingGen = meta.Generation
+							h.supersededPendingSource = track
+							if track == pendingGenCache {
+								h.cacheLineageGen = meta.CacheLineageGen
+								if h.cacheLineageGen == 0 {
+									h.cacheLineageGen = meta.Generation
+								}
+								h.cacheAncestorGens = mergeCacheAncestorGens(meta.CacheAncestorGens, meta.Generation)
+							}
 						}
 						if pb, ok := w.pendingBaseRevOf(op.Path); ok {
 							h.baseRev = pb
@@ -1277,7 +1407,12 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		// answer locally): a raw remote stat races backend replica lag right
 		// after this mount's own DELETE and resurrects the name as EEXIST
 		// (unlink/14's re-create).
-		st, statErr := w.probeExisting(ctx, next, op.Path)
+		var st fs.Attr
+		var statErr error
+		// A nonexclusive kernel CREATE can still lose the negative-lookup
+		// race to another client; probe so an existing row is opened instead
+		// of returning a lazy PendingNew the uploader can never land.
+		st, statErr = w.probeExisting(ctx, next, op.Path)
 		if statErr != nil && fs.IsNotFound(statErr) && w.queue != nil && w.queue.HasPath(op.Path) {
 			// pending-cache visibility: the path was flushed into the
 			// async queue but has not landed yet. Wait for OUR entry (it is
@@ -1304,7 +1439,20 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			return fs.Result{}, statErr
 		}
 		if statErr == nil {
-			res, err := next(ctx, op)
+			nextOp := op
+			if op.KernelCreate() {
+				// This CREATE lost the negative-lookup race. Re-enter the
+				// chain as a synthesized existing open with the fresh probe
+				// attrs; leaving KernelCreate set would make the terminal
+				// issue another create and pay a second HEAD to discover the
+				// same conflict.
+				cp := *op
+				attr := st
+				cp.Kernel = nil
+				cp.OpenAttr = &attr
+				nextOp = &cp
+			}
+			res, err := next(ctx, nextOp)
 			if err != nil || res.Handle == nil {
 				return res, err
 			}
@@ -3575,17 +3723,43 @@ func (h *bufferingHandle) checkoutDropCleanBuffer() {
 	h.buf = nil
 }
 
-func (w *Writeback) acknowledgeUploadedCreate(path string, rev int64) {
-	// Retire only the name claim; newer writes and truncations still own their bytes.
+func (w *Writeback) acknowledgeUploadedCreate(path string, rev int64, generation uint64, source pendingGenSource, cacheGeneration uint64) {
+	// Retire the name claim and, for an append opener composed over this
+	// generation, advance its CAS base. A pending-overwrite opener captured
+	// BaseRev R while the upload was in flight; leaving it at R stages its
+	// append against R after this mount already published R+1, which the
+	// uploader refuses as a conflict (only a byte-identical duplicate is
+	// rebased).
 	w.liveSet.Range(func(key, _ any) bool {
 		h, ok := key.(*bufferingHandle)
 		if !ok {
 			return true
 		}
 		h.mu.Lock()
-		if h.path == path && h.isNew && !h.unlinked {
+		if h.path != path || h.unlinked {
+			h.mu.Unlock()
+			return true
+		}
+		switch {
+		case h.isNew:
 			h.landed = true
 			h.isNew = false
+			if rev > 0 {
+				h.baseRev = rev
+			}
+		case source == pendingGenCache && cacheGeneration != 0 &&
+			(h.cacheLineageGen == cacheGeneration ||
+				cacheGenInList(h.cacheAncestorGens, cacheGeneration) ||
+				(h.supersededPendingSource == pendingGenCache && h.supersededPendingGen == cacheGeneration)):
+			// This handle descends from the cache lineage the upload just
+			// published (possibly through several staged descendants). Its
+			// next append/overwrite is derived from that revision, not the
+			// pre-upload base.
+			if rev > 0 {
+				h.baseRev = rev
+			}
+			h.cacheAncestorGens = removeCacheAncestorGen(h.cacheAncestorGens, cacheGeneration)
+		case source == pendingGenQueue && generation != 0 && h.supersededPendingGen == generation && h.supersededPendingSource == source:
 			if rev > 0 {
 				h.baseRev = rev
 			}
@@ -3596,6 +3770,20 @@ func (w *Writeback) acknowledgeUploadedCreate(path string, rev int64) {
 	if w.wbCache != nil {
 		if err := w.wbCache.RebasePendingNew(path, rev); err != nil {
 			safeLogPrintf("writeback: rebase pending create %s on revision %d: %v", path, rev, err)
+		}
+		if cacheGeneration != 0 && rev > 0 {
+			if meta, ok := w.wbCache.GetMeta(path); ok && meta != nil {
+				lineage := meta.CacheLineageGen
+				if lineage == 0 {
+					lineage = meta.Generation
+				}
+				if lineage == cacheGeneration || cacheGenInList(meta.CacheAncestorGens, cacheGeneration) {
+					// The uploaded entry (deferred-mode window) or a newer
+					// staged descendant still present on disk derives from
+					// the revision this upload just published.
+					_ = w.wbCache.RebaseBaseRevIfGeneration(path, meta.Generation, rev)
+				}
+			}
 		}
 	}
 }
@@ -3633,17 +3821,23 @@ func (w *Writeback) pendingAttr(path string) (fs.Attr, bool) {
 // pendingMeta returns the staged image's metadata from either pending
 // track (ledger first, mirroring pendingAttr's precedence).
 func (w *Writeback) pendingMeta(path string) (*staging.WriteBackMeta, bool) {
+	meta, _ := w.pendingMetaTrack(path)
+	return meta, meta != nil
+}
+
+// pendingMetaTrack is pendingMeta plus the generation's source track.
+func (w *Writeback) pendingMetaTrack(path string) (*staging.WriteBackMeta, pendingGenSource) {
 	if w.opts.Staging != nil {
 		if meta, ok := w.opts.Staging.Pending.GetMeta(path); ok {
-			return meta, true
+			return meta, pendingGenQueue
 		}
 	}
 	if w.wbCache != nil {
 		if meta, ok := w.wbCache.GetMeta(path); ok {
-			return meta, true
+			return meta, pendingGenCache
 		}
 	}
-	return nil, false
+	return nil, pendingGenNone
 }
 
 // attrFromPendingMeta builds the overlay reply for a staged image. Only a
@@ -4534,6 +4728,110 @@ func (w *Writeback) probeExisting(ctx context.Context, next fs.Next, path string
 		return fs.Attr{}, fs.ErrNotFound
 	}
 	return *res.Attr, nil
+}
+
+// openPendingWritable serves a writable re-open from the path's staged
+// image before any remote probe. v1's loadWritableHandleFromWriteBackLocked
+// did this; without it an append over a still-uploading close paid a 404
+// HEAD and then waited for the previous commit (or forced UploadSync).
+func (w *Writeback) openPendingWritable(op *fs.Op) (fs.Result, bool) {
+	if w == nil || op == nil || !w.hasPendingLocalState(op.Path) {
+		return fs.Result{}, false
+	}
+	flags := op.Flags
+	if flags&uint32(syscall.O_TRUNC) != 0 || flags&uint32(syscall.O_EXCL) != 0 {
+		return fs.Result{}, false
+	}
+	if flags&uint32(syscall.O_ACCMODE) == uint32(syscall.O_RDONLY) {
+		// The read-only pending path below owns this shape.
+		return fs.Result{}, false
+	}
+	if flags&uint32(syscall.O_APPEND) == 0 {
+		// Only append re-opens take this fast path. A second O_RDWR open
+		// owns the image's write side and must keep the existing
+		// handoff/upload ordering (the P2 upload-ack gate depends on it).
+		return fs.Result{}, false
+	}
+	// Serialize with the uploader's OnSuccess path: it removes the cache
+	// entry, runs acknowledgeUploadedCreate over liveSet, and rebases the
+	// pending create. Capturing the image before registering the handle
+	// (the old order) let a completion slip in between and leave the
+	// opener with isNew=true and no committed base revision.
+	unlock := w.pathLocks.lock(op.Path)
+	defer unlock()
+	if !w.hasPendingLocalState(op.Path) {
+		return fs.Result{}, false
+	}
+	meta, track := w.pendingMetaTrack(op.Path)
+	if meta != nil && meta.Kind != staging.PendingNew && w.uploader != nil && w.uploader.InFlight(op.Path) {
+		// A PendingOverwrite whose PUT may already have published its own
+		// revision must not be opened from the pre-upload base. The
+		// uploader flag is released only after OnSuccess has advanced the
+		// cache entry and live handles.
+		return fs.Result{}, false
+	}
+	size := int64(0)
+	if meta != nil {
+		size = meta.Size
+	}
+	image := w.capturePendingImage(op.Path)
+	if image == nil && meta != nil && meta.Kind == staging.PendingNew && meta.Size == 0 {
+		// A zero-byte create is a complete base. capturePendingImage
+		// rejects size<=0, but an empty append image must still stay on
+		// this fast path (touch; echo x >> file before the create lands).
+		image = []byte{}
+	}
+	shadowGen := w.pinPendingShadow(op.Path)
+	ledgerOwned := w.opts.Staging != nil && w.opts.Staging.Pending.HasPending(op.Path)
+	if image == nil {
+		// A pending OVERWRITE can still preload from the write-back cache
+		// in ensureBuffer. A ledger-owned path must not: the pair under
+		// the ledger entry may be a superseded image, and a recovered
+		// spill larger than the materialization cap has no safe base here.
+		// A pending NEW image or queue-track shadow without a materialized
+		// copy is likewise rejected — do not turn a partial write into a
+		// replacement.
+		if ledgerOwned || meta == nil || meta.Kind == staging.PendingNew || w.wbCache == nil {
+			if shadowGen != 0 && w.opts.Staging != nil {
+				w.opts.Staging.Shadow.Unpin(shadowGen)
+			}
+			return fs.Result{}, false
+		}
+		if _, ok := w.wbCache.Get(op.Path); !ok {
+			if shadowGen != 0 && w.opts.Staging != nil {
+				w.opts.Staging.Shadow.Unpin(shadowGen)
+			}
+			return fs.Result{}, false
+		}
+	}
+	attr, ok := w.pendingAttr(op.Path)
+	if !ok {
+		attr = fs.Attr{Kind: fs.KindFile, Mode: 0o644, Size: size}
+	}
+	h := &bufferingHandle{w: w, path: op.Path, flags: flags,
+		baseSize: size, forceSync: hasSyncOpenFlag(flags),
+		pendingImage: image, pendingShadowGen: shadowGen}
+	if meta != nil {
+		h.supersededPendingGen = meta.Generation
+		h.supersededPendingSource = track
+		if track == pendingGenCache {
+			h.cacheLineageGen = meta.CacheLineageGen
+			if h.cacheLineageGen == 0 {
+				h.cacheLineageGen = meta.Generation
+			}
+			h.cacheAncestorGens = mergeCacheAncestorGens(meta.CacheAncestorGens, meta.Generation)
+		}
+		h.isNew = meta.Kind == staging.PendingNew
+		if meta.HasMode {
+			h.pendingMode, h.hasPendingMode = meta.Mode, true
+		}
+	}
+	if pb, ok := w.pendingBaseRevOf(op.Path); ok {
+		h.baseRev = pb
+	}
+	w.track(h)
+	attrCopy := attr
+	return fs.Result{Attr: &attrCopy, Handle: h}, true
 }
 
 // hasPendingLocalState reports whether a not-yet-landed image owns the path
@@ -5584,6 +5882,8 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 	// it — never a foreign writer's generation, which the handle's buffer
 	// was never composed over).
 	h.supersededPendingGen = pendingGen
+	h.supersededPendingSource = pendingGenQueue
+	h.cacheLineageGen = 0
 	// v1 publishStagedSnapshotLineageLocked: the staged snapshot becomes
 	// this handle's content identity — the next staging parents on it.
 	h.contentSnapshotID = snapshotID
@@ -5957,16 +6257,16 @@ const (
 // durability: the v1 ladder uses the three-barrier stage put (both file
 // contents + one directory sync); full durability keeps the four-barrier
 // put for the boundaries where the pair is the only authority.
-func (w *Writeback) putWriteCacheSnapshot(path string, image []byte, kind staging.PendingKind, baseRev int64, mode uint32, hasMode bool, dur stageDurability) (uint64, error) {
+func (w *Writeback) putWriteCacheSnapshot(path string, image []byte, kind staging.PendingKind, baseRev int64, mode uint32, hasMode bool, cacheLineage uint64, cacheAncestors []uint64, dur stageDurability) (uint64, error) {
 	size := int64(len(image))
 	if dur == stageV1Ladder {
-		gen, _, err := w.wbCache.PutWithBaseRevAndModeAndLineageTimingsDirSync(path, image, size, kind, baseRev, mode, hasMode, "", "", false)
+		gen, _, err := w.wbCache.PutWithBaseRevAndModeAndLineageTimingsDirSyncCacheLineage(path, image, size, kind, baseRev, mode, hasMode, "", "", false, cacheLineage, cacheAncestors)
 		return gen, err
 	}
 	// The full-sync lineage put is the plain put's durability with the
 	// generation returned (same wbSyncFull path; the supersession mark and
 	// snapshot bookkeeping need the generation).
-	gen, _, err := w.wbCache.PutWithBaseRevAndModeAndLineageTimings(path, image, size, kind, baseRev, mode, hasMode, "", "", false)
+	gen, _, err := w.wbCache.PutWithBaseRevAndModeAndLineageTimingsCacheLineage(path, image, size, kind, baseRev, mode, hasMode, "", "", false, cacheLineage, cacheAncestors)
 	return gen, err
 }
 
@@ -6033,6 +6333,12 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, dur stageDurabi
 	// image: it describes this handle's content, not whatever staging happens
 	// to be registered at the path when the meta is written.
 	supersedesGen := h.supersededPendingGen
+	supersedesSource := h.supersededPendingSource
+	cacheLineage := h.cacheLineageGen
+	cacheAncestors := append([]uint64(nil), h.cacheAncestorGens...)
+	if supersedesSource == pendingGenCache {
+		cacheAncestors = mergeCacheAncestorGens(cacheAncestors, supersedesGen)
+	}
 	h.mu.Unlock()
 	if isNew {
 		baseRev = 0
@@ -6101,12 +6407,43 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, dur stageDurabi
 	// remote name itself (a remote key here made every subtree mount's
 	// upload silently no-op — the git-ops clone's config.lock never
 	// landed).
-	wbGen, err := h.w.putWriteCacheSnapshot(h.path, image, kind, baseRev, mode, hasMode, dur)
+	wbGen, err := h.w.putWriteCacheSnapshot(h.path, image, kind, baseRev, mode, hasMode, cacheLineage, cacheAncestors, dur)
 	if err != nil {
 		return nil, err
 	}
-	if supersedesGen != 0 {
-		h.w.wbCache.MarkSupersedesPendingGen(h.path, supersedesGen, wbGen)
+	if supersedesSource == pendingGenQueue {
+		if supersedesGen != 0 {
+			h.w.wbCache.MarkSupersedesPendingGen(h.path, supersedesGen, wbGen)
+		}
+		// A queue-derived handle can later stage its buffer into the cache.
+		// That cache image is now its own newest content: keep the queue
+		// supersession marker, but remember the cache generation so the cache
+		// upload's ack still advances the handle.
+		h.mu.Lock()
+		h.cacheLineageGen = wbGen
+		h.cacheAncestorGens = mergeCacheAncestorGens(h.cacheAncestorGens, wbGen)
+		h.mu.Unlock()
+	} else {
+		// Cache lineage is a separate generation space from the pending
+		// index. The put persisted the root in the same meta write (no
+		// extra fsync); never stamp it into SupersedesPendingGen, or the
+		// uploader would retire a pending-index conflict marker it never
+		// owned.
+		lineage := cacheLineage
+		if lineage == 0 {
+			lineage = wbGen
+		}
+		h.mu.Lock()
+		if h.cacheLineageGen == 0 {
+			h.cacheLineageGen = lineage
+		}
+		// The staged image is now this handle's content; its next stage
+		// composes over this generation, and an ack for this image must
+		// advance the handle even though the cache lineage root is older.
+		h.supersededPendingGen = wbGen
+		h.supersededPendingSource = pendingGenCache
+		h.cacheAncestorGens = mergeCacheAncestorGens(cacheAncestors, wbGen)
+		h.mu.Unlock()
 	}
 	// v1 seeded the read cache with the staged image at the flush
 	// boundary: readers during the async landing serve these bytes instead
