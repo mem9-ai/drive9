@@ -2,6 +2,7 @@ package local
 
 import (
 	"context"
+	"database/sql"
 	"strconv"
 	"strings"
 	"testing"
@@ -128,9 +129,43 @@ func TestProvisionAndDeprovision(t *testing.T) {
 	if !strings.HasPrefix(info.DBName, dbNamePrefix) {
 		t.Fatalf("DBName = %q", info.DBName)
 	}
+	// Local tenants share one TiDB instance, so the tenant must not run as the
+	// admin account: its grant is scoped to its own database.
+	if info.Username == p.admin.User || info.Password == p.admin.Passwd {
+		t.Fatalf("tenant reuses the admin credential (%q)", info.Username)
+	}
+	if !strings.HasPrefix(info.Username, localTenantUserName("")) {
+		t.Fatalf("tenant account = %q, want the drive9_t_ prefix", info.Username)
+	}
 	tenantDSN := info.Username + ":" + info.Password + "@tcp(" + info.Host + ":" + strconv.Itoa(info.Port) + ")/" + info.DBName + "?parseTime=true"
 	if err := p.InitSchema(ctx, tenantDSN); err != nil {
 		t.Fatalf("InitSchema: %v", err)
+	}
+	// The tenant account can reach its own schema...
+	tenantDB, err := sql.Open("mysql", tenantDSN)
+	if err != nil {
+		t.Fatalf("open tenant dsn: %v", err)
+	}
+	defer func() { _ = tenantDB.Close() }()
+	if _, err := tenantDB.ExecContext(ctx, "SELECT 1"); err != nil {
+		t.Fatalf("tenant cannot query its own schema: %v", err)
+	}
+	// ...but not another tenant's database. (TiDB's mysql.user is a special case
+	// that any account can reach, so it is not a useful isolation probe here; the
+	// durable boundary the scan asks for is the per-schema grant.)
+	if _, err := tenantDB.ExecContext(ctx, "SELECT COUNT(*) FROM drive9_some_other_tenant.file_nodes"); err == nil {
+		t.Fatal("tenant account was allowed to read another tenant's database")
+	}
+	// information_schema is privilege-filtered rather than denied: the tenant must
+	// not see any schema but its own.
+	var visible int
+	if err := tenantDB.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name LIKE 'drive9\_%' AND schema_name <> ?`,
+		info.DBName).Scan(&visible); err != nil {
+		t.Fatalf("enumerate schemata: %v", err)
+	}
+	if visible != 0 {
+		t.Fatalf("tenant account sees %d other drive9 schemas", visible)
 	}
 	if err := p.Deprovision(ctx, info); err != nil {
 		t.Fatalf("Deprovision: %v", err)

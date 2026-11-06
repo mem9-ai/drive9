@@ -7,7 +7,10 @@ package local
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"os"
@@ -93,6 +96,14 @@ func (p *Provisioner) Provision(ctx context.Context, tenantID string) (*tenant.C
 	if _, err := admin.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS "+quoteIdent(dbName)); err != nil {
 		return nil, fmt.Errorf("create local tenant database %s: %w", dbName, err)
 	}
+	// Every local tenant shares one TiDB instance, so lending each tenant the admin
+	// account would give it every other tenant's database (and the control plane,
+	// which lives on the same instance). The tenant gets its own account, granted
+	// only on its own schema.
+	credential, err := ensureLocalTenantAccount(ctx, admin, p.admin.Passwd, tenantID, dbName)
+	if err != nil {
+		return nil, err
+	}
 	host, port := splitAddr(p.admin.Addr)
 	return &tenant.ClusterInfo{
 		TenantID:       tenantID,
@@ -101,11 +112,78 @@ func (p *Provisioner) Provision(ctx context.Context, tenantID string) (*tenant.C
 		BranchID:       "main",
 		Host:           host,
 		Port:           port,
-		Username:       p.admin.User,
-		Password:       p.admin.Passwd,
+		Username:       credential.username,
+		Password:       credential.password,
 		DBName:         dbName,
 		Provider:       tenant.ProviderLocal,
 	}, nil
+}
+
+// localTenantGrant is the privilege set a tenant needs: schema DDL during init
+// and DML afterwards, on its own database only. SYSTEM_VARIABLES_ADMIN is
+// deliberately absent — no local tenant writes server variables.
+const localTenantGrant = "CREATE, ALTER, DROP, INDEX, SELECT, INSERT, UPDATE, DELETE"
+
+type localTenantCredential struct {
+	username string
+	password string
+}
+
+// ensureLocalTenantAccount creates or converges the MySQL account for one local
+// tenant and grants it access to that tenant's schema only.
+//
+// The password is derived deterministically from the admin secret and the tenant
+// id, so re-provisioning an existing tenant converges instead of rotating a
+// credential the metadata store already holds. The account name is derived the
+// same way, which keeps it stable across restarts.
+func ensureLocalTenantAccount(ctx context.Context, admin *sql.DB, adminPassword, tenantID, dbName string) (localTenantCredential, error) {
+	username := localTenantUserName(tenantID)
+	password := deriveLocalTenantPassword(adminPassword, tenantID)
+	if username == "" || password == "" {
+		return localTenantCredential{}, fmt.Errorf("derive local tenant credential for %s", tenantID)
+	}
+	user := quoteString(username) + "@'%'"
+	statements := []struct {
+		what string
+		sql  string
+	}{
+		{"create account", "CREATE USER IF NOT EXISTS " + user + " IDENTIFIED BY " + quoteString(password)},
+		{"grant schema access", "GRANT " + localTenantGrant + " ON " + quoteIdent(dbName) + ".* TO " + user},
+		{"grant future schema access", "GRANT " + localTenantGrant + " ON " + quoteIdent(dbName) + ".* TO " + user},
+		{"set password", "ALTER USER " + user + " IDENTIFIED BY " + quoteString(password)},
+	}
+	for _, stmt := range statements {
+		if _, err := admin.ExecContext(ctx, stmt.sql); err != nil {
+			return localTenantCredential{}, fmt.Errorf("%s for local tenant %s: %w", stmt.what, tenantID, err)
+		}
+	}
+	return localTenantCredential{username: username, password: password}, nil
+}
+
+// localTenantUserName is the MySQL account name for a local tenant. MySQL caps
+// account names at 32 characters, and a tenant id can be longer, so the derived
+// name is a fixed prefix plus a digest.
+func localTenantUserName(tenantID string) string {
+	tenantID = strings.TrimSpace(tenantID)
+	if tenantID == "" {
+		return ""
+	}
+	// 32 characters is the MySQL account-name limit: a 10-character prefix leaves
+	// room for 22 hex characters (11 bytes of digest).
+	sum := sha256.Sum256([]byte("drive9:local_tenant:" + tenantID))
+	return "drive9_t_" + hex.EncodeToString(sum[:11])
+}
+
+// deriveLocalTenantPassword follows the native provider's pattern: an HMAC over
+// the instance's admin secret keyed by the tenant id, so the credential is
+// reproducible without storing another secret and differs per tenant.
+func deriveLocalTenantPassword(adminPassword, tenantID string) string {
+	if strings.TrimSpace(tenantID) == "" {
+		return ""
+	}
+	mac := hmac.New(sha256.New, []byte(adminPassword))
+	_, _ = mac.Write([]byte("drive9:local_tenant_pw:" + tenantID))
+	return hex.EncodeToString(mac.Sum(nil))[:32]
 }
 
 func (p *Provisioner) InitSchema(ctx context.Context, dsn string) error {
@@ -141,6 +219,11 @@ func (p *Provisioner) Deprovision(ctx context.Context, cluster *tenant.ClusterIn
 	defer func() { _ = admin.Close() }()
 	if _, err := admin.ExecContext(ctx, "DROP DATABASE IF EXISTS "+quoteIdent(dbName)); err != nil {
 		return fmt.Errorf("drop local tenant database %s: %w", dbName, err)
+	}
+	if username := localTenantUserName(cluster.TenantID); username != "" {
+		if _, err := admin.ExecContext(ctx, "DROP USER IF EXISTS "+quoteString(username)+"@'%'"); err != nil {
+			return fmt.Errorf("drop local tenant account %s: %w", username, err)
+		}
 	}
 	return nil
 }
@@ -215,6 +298,18 @@ func validTenantDatabaseName(name string) bool {
 		}
 	}
 	return name != dbNamePrefix
+}
+
+// quoteString renders a MySQL string literal. Account names and passwords cannot
+// be bound parameters in CREATE/ALTER USER, so they are escaped here; the values
+// are derived hex digests, and this keeps the quoting correct anyway.
+func quoteString(value string) string {
+	escaped := strings.NewReplacer(
+		"\\", "\\\\",
+		"'", "\\'",
+		"\x00", "\\0",
+	).Replace(value)
+	return "'" + escaped + "'"
 }
 
 func quoteIdent(name string) string {
