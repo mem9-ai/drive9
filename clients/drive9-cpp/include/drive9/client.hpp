@@ -115,6 +115,10 @@ public:
     void Mkdir(const std::string &path);
     void Remove(const std::string &path);
     void Rename(const std::string &source, const std::string &target);
+    // Atomically clone the mapping of a whole-file locked handle. Shares immutable
+    // objects and replaces only expected_inode (0 = create-only). No payload I/O.
+    FileInfo Clone(uint64_t handle, const std::string &target, uint64_t expected_inode = 0);
+    bool CloneSupported() const;
     std::vector<DirectoryEntry> List(const std::string &path);
     void Shutdown();
     uint64_t SessionID() const;
