@@ -39,7 +39,10 @@ func (s *Server) authorizeTiDBCloudQuotaMutation(ctx context.Context, cred tenan
 }
 
 func (s *Server) resolveTiDBCloudAccessProfile(ctx context.Context, cred tenant.CredentialProvisionRequest, metricPath string) (*tiDBCloudAccessProfile, error) {
-	identity, err := s.resolveTiDBCloudIdentity(ctx, cred, metricPath)
+	// Organization-wide authority: only org:owner may act on every tenant in the
+	// organization. project:owner is project-scoped and has no project to be
+	// scoped to here.
+	identity, err := s.resolveTiDBCloudIdentity(ctx, cred, metricPath, tenant.TiDBCloudRoleOrgOwner)
 	if err != nil {
 		return nil, err
 	}
