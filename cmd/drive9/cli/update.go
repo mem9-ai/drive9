@@ -92,6 +92,14 @@ func updateWithDeps(args []string, deps updateDeps) error {
 	if baseURLFromFlag && !isPinnedUpdateHost(deps.baseURL) {
 		_, _ = fmt.Fprintf(deps.stderr, "warning: installing from custom release root %s; integrity relies on that origin serving releases/checksums.txt\n", deps.baseURL)
 	}
+	if isPinnedUpdateHost(deps.baseURL) {
+		// The pinned host is only the first hop: the default client follows up to
+		// ten redirects, so a pinned release root could still be served by any host
+		// reachable through a redirect (open redirect, compromised origin). Keep the
+		// whole chain pinned so the version, the checksum manifest, and the binary all
+		// come from the same trusted release hosts.
+		deps.httpClient = withPinnedUpdateRedirects(deps.httpClient, deps.allowInsecureBaseURL)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), updateCommandTimeout)
 	defer cancel()
@@ -585,6 +593,34 @@ func isPinnedUpdateHost(baseURL string) bool {
 		}
 	}
 	return false
+}
+
+// withPinnedUpdateRedirects returns a copy of client that refuses redirects to
+// hosts outside updateReleaseHosts, so pinning a release root also covers the
+// requests that follow redirects.
+func withPinnedUpdateRedirects(client *http.Client, allowInsecure bool) *http.Client {
+	if client == nil {
+		client = &http.Client{Timeout: updateCommandTimeout}
+	}
+	cloned := *client
+	next := client.CheckRedirect
+	cloned.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		// A custom CheckRedirect replaces the client's default ten-hop limit.
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
+		if !allowInsecure && req.URL.Scheme != "https" {
+			return fmt.Errorf("refusing redirect to %s: drive9 updates require https", req.URL.Redacted())
+		}
+		if !isPinnedUpdateHost(req.URL.String()) {
+			return fmt.Errorf("refusing redirect to %s: not a pinned drive9 release host (%s)", req.URL.Redacted(), strings.Join(updateReleaseHosts, ", "))
+		}
+		if next != nil {
+			return next(req, via)
+		}
+		return nil
+	}
+	return &cloned
 }
 
 func validateUpdateBaseURL(baseURL string, allowInsecure bool) error {
