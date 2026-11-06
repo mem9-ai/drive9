@@ -82,6 +82,27 @@ func adminTenantAuditAction(method, rest string) string {
 	return ""
 }
 
+// adminAuditRecorder wraps w so the middleware can read the status it produced.
+//
+// When the writer is already instrumented (it is in production: ServeHTTP wraps
+// every request), that writer is reused and only its status is read, so no
+// interface is lost. Otherwise a fresh observedResponseWriter is layered, with
+// http.Flusher preserved.
+func adminAuditRecorder(w http.ResponseWriter) (http.ResponseWriter, func() int) {
+	switch typed := w.(type) {
+	case *observedResponseWriter:
+		return w, func() int { return typed.status }
+	case *flusherResponseWriter:
+		return w, func() int { return typed.status }
+	}
+	ow := &observedResponseWriter{ResponseWriter: w}
+	if flusher, ok := w.(http.Flusher); ok {
+		rw := &flusherResponseWriter{observedResponseWriter: ow, flusher: flusher}
+		return rw, func() int { return ow.status }
+	}
+	return ow, func() int { return ow.status }
+}
+
 // adminAuditActor resolves who performed the request from what this server
 // already knows about the caller: the TiDB Cloud organization recorded on the
 // request scope, then the tenant/api-key scope, then the public key the caller
@@ -117,13 +138,13 @@ func (s *Server) adminAuditMiddleware(next http.Handler) http.Handler {
 			return
 		}
 		started := time.Now()
-		recorder, ok := w.(*observedResponseWriter)
-		if !ok {
-			recorder = &observedResponseWriter{ResponseWriter: w, status: http.StatusOK}
-		}
+		// Wrap the writer to capture the status, but keep every optional interface
+		// the original had: dropping http.Flusher here would break a streaming
+		// handler mounted behind the audit middleware.
+		recorder, statusFn := adminAuditRecorder(w)
 		next.ServeHTTP(recorder, r)
 
-		status := recorder.status
+		status := statusFn()
 		if status == 0 {
 			// The handler answered without an explicit status.
 			status = http.StatusOK

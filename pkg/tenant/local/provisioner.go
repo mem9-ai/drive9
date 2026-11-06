@@ -149,7 +149,8 @@ func ensureLocalTenantAccount(ctx context.Context, admin *sql.DB, adminPassword,
 	}{
 		{"create account", "CREATE USER IF NOT EXISTS " + user + " IDENTIFIED BY " + quoteString(password)},
 		{"grant schema access", "GRANT " + localTenantGrant + " ON " + quoteIdent(dbName) + ".* TO " + user},
-		{"grant future schema access", "GRANT " + localTenantGrant + " ON " + quoteIdent(dbName) + ".* TO " + user},
+		// Last, so a failed grant never leaves a credential the metadata store does
+		// not hold, and a retry converges on the derived password.
 		{"set password", "ALTER USER " + user + " IDENTIFIED BY " + quoteString(password)},
 	}
 	for _, stmt := range statements {

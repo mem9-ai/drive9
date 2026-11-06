@@ -134,8 +134,17 @@ func TestProvisionAndDeprovision(t *testing.T) {
 	if info.Username == p.admin.User || info.Password == p.admin.Passwd {
 		t.Fatalf("tenant reuses the admin credential (%q)", info.Username)
 	}
-	if !strings.HasPrefix(info.Username, localTenantUserName("")) {
-		t.Fatalf("tenant account = %q, want the drive9_t_ prefix", info.Username)
+	// Assert the derived name for this tenant, not a prefix of the empty string
+	// (which is always true).
+	wantUser := localTenantUserName("11111111-2222-3333-4444-555555555555")
+	if info.Username != wantUser {
+		t.Fatalf("tenant account = %q, want %q", info.Username, wantUser)
+	}
+	if len(info.Username) > 32 {
+		t.Fatalf("tenant account %q exceeds the MySQL 32-character limit", info.Username)
+	}
+	if info.Password != deriveLocalTenantPassword(p.admin.Passwd, "11111111-2222-3333-4444-555555555555") {
+		t.Fatal("tenant password is not the derived value")
 	}
 	tenantDSN := info.Username + ":" + info.Password + "@tcp(" + info.Host + ":" + strconv.Itoa(info.Port) + ")/" + info.DBName + "?parseTime=true"
 	if err := p.InitSchema(ctx, tenantDSN); err != nil {
@@ -150,11 +159,18 @@ func TestProvisionAndDeprovision(t *testing.T) {
 	if _, err := tenantDB.ExecContext(ctx, "SELECT 1"); err != nil {
 		t.Fatalf("tenant cannot query its own schema: %v", err)
 	}
-	// ...but not another tenant's database. (TiDB's mysql.user is a special case
-	// that any account can reach, so it is not a useful isolation probe here; the
-	// durable boundary the scan asks for is the per-schema grant.)
-	if _, err := tenantDB.ExecContext(ctx, "SELECT COUNT(*) FROM drive9_some_other_tenant.file_nodes"); err == nil {
-		t.Fatal("tenant account was allowed to read another tenant's database")
+	// ...but not another tenant's database. The other tenant is real, so the probe
+	// cannot pass on "table does not exist".
+	other, otherErr := p.Provision(ctx, "99999999-8888-7777-6666-555555555555")
+	if otherErr != nil {
+		t.Fatalf("provision second tenant: %v", otherErr)
+	}
+	t.Cleanup(func() { _ = p.Deprovision(context.Background(), other) })
+	if other.DBName == info.DBName {
+		t.Fatalf("both tenants resolved to %q", info.DBName)
+	}
+	if _, err := tenantDB.ExecContext(ctx, "SELECT COUNT(*) FROM "+quoteIdent(other.DBName)+".file_nodes"); err == nil {
+		t.Fatalf("tenant account was allowed to read %s", other.DBName)
 	}
 	// information_schema is privilege-filtered rather than denied: the tenant must
 	// not see any schema but its own.

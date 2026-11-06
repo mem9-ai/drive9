@@ -66,7 +66,7 @@ var systemSchemas = map[string]struct{}{
 // as. The classifier exists so an agent's raw SQL cannot mutate anything except
 // tags, and cannot read server state the tenant does not own.
 func classifyExecSQL(query string) (execSQLKind, string, error) {
-	norm, err := sanitizeSQL(query)
+	norm, identifiers, err := sanitizeSQLWithIdentifiers(query)
 	if err != nil {
 		return execSQLRejected, "", err
 	}
@@ -75,7 +75,7 @@ func classifyExecSQL(query string) (execSQLKind, string, error) {
 	if strings.Contains(strings.TrimSuffix(norm, ";"), ";") {
 		return execSQLRejected, norm, errExecSQLMultiStatement
 	}
-	if err := rejectSystemReads(norm); err != nil {
+	if err := rejectSystemReads(norm, identifiers); err != nil {
 		return execSQLRejected, norm, err
 	}
 
@@ -132,13 +132,26 @@ func classifyExecSQL(query string) (execSQLKind, string, error) {
 // words is not a reference. `@` is rejected wholesale: a tenant statement has no
 // legitimate use for a server or session variable, and rejecting the token avoids
 // modelling the `@@`, `@` and `@@session.` spellings separately.
-func rejectSystemReads(norm string) error {
+func rejectSystemReads(norm string, identifiers []string) error {
 	if strings.Contains(norm, "@") {
 		return errExecSQLSystemRead
 	}
 	for _, token := range sqlTokens(norm) {
 		if _, ok := systemSchemas[token]; ok {
 			return errExecSQLSystemRead
+		}
+	}
+	// Quoted identifiers are blanked out of the structural view, so they are
+	// checked on their own: ` + "`information_schema`" + ` is the same reference as the
+	// bare word.
+	for _, identifier := range identifiers {
+		if strings.Contains(identifier, "@") {
+			return errExecSQLSystemRead
+		}
+		for _, token := range sqlTokens(identifier) {
+			if _, ok := systemSchemas[token]; ok {
+				return errExecSQLSystemRead
+			}
 		}
 	}
 	return nil
@@ -291,6 +304,20 @@ func safeExecSQLMode(mode string) bool {
 // (checkExecSQLMode); this scanner relies on that check: backslash escapes active
 // in string literals and ANSI_QUOTES off.
 func sanitizeSQL(query string) (string, error) {
+	norm, _, err := sanitizeSQLWithIdentifiers(query)
+	return norm, err
+}
+
+// sanitizeSQLWithIdentifiers also returns the content of every backtick-quoted
+// identifier, upper-cased.
+//
+// Blanking a quoted identifier is what keeps `JOIN` or a comma inside one from
+// looking like structure, but it also hides a schema reference: `SELECT 1 FROM
+// ` + "`information_schema`" + `.tables` would otherwise lose the token that the
+// server-state check looks for. The structural view stays blanked; the identifier
+// contents are checked separately.
+func sanitizeSQLWithIdentifiers(query string) (string, []string, error) {
+	var identifiers []string
 	var b strings.Builder
 	b.Grow(len(query))
 	for i := 0; i < len(query); {
@@ -317,18 +344,18 @@ func sanitizeSQL(query string) (string, error) {
 			// MySQL executes /*! ... */ and /*!50700 ... */ comments, so they
 			// cannot be treated as inert noise.
 			if i+2 < len(query) && query[i+2] == '!' {
-				return "", fmt.Errorf("%w: executable /*! comment", errExecSQLUnparseable)
+				return "", nil, fmt.Errorf("%w: executable /*! comment", errExecSQLUnparseable)
 			}
 			end := strings.Index(query[i+2:], "*/")
 			if end < 0 {
-				return "", fmt.Errorf("%w: unterminated comment", errExecSQLUnparseable)
+				return "", nil, fmt.Errorf("%w: unterminated comment", errExecSQLUnparseable)
 			}
 			i += 2 + end + 2
 			b.WriteByte(' ')
 		case c == '\'' || c == '"':
 			end, ok := skipSQLQuoted(query, i, c, true)
 			if !ok {
-				return "", fmt.Errorf("%w: unterminated string literal", errExecSQLUnparseable)
+				return "", nil, fmt.Errorf("%w: unterminated string literal", errExecSQLUnparseable)
 			}
 			b.WriteByte(' ')
 			i = end
@@ -339,7 +366,10 @@ func sanitizeSQL(query string) (string, error) {
 			// let the scanner swallow following SQL as an identifier.
 			end, ok := skipSQLQuoted(query, i, c, false)
 			if !ok {
-				return "", fmt.Errorf("%w: unterminated quoted identifier", errExecSQLUnparseable)
+				return "", nil, fmt.Errorf("%w: unterminated quoted identifier", errExecSQLUnparseable)
+			}
+			if content := strings.TrimSpace(query[i+1 : end-1]); content != "" {
+				identifiers = append(identifiers, strings.ToUpper(content))
 			}
 			b.WriteByte(' ')
 			i = end
@@ -352,7 +382,7 @@ func sanitizeSQL(query string) (string, error) {
 			i++
 		}
 	}
-	return strings.Join(strings.Fields(b.String()), " "), nil
+	return strings.Join(strings.Fields(b.String()), " "), identifiers, nil
 }
 
 // skipSQLQuoted returns the index just past the closing quote of the literal or

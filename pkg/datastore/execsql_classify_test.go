@@ -80,6 +80,11 @@ func TestClassifyExecSQLRejectsServerState(t *testing.T) {
 		"SELECT * FROM performance_schema.session_variables",
 		"SELECT * FROM sys.x",
 		"SELECT 1 FROM metrics_schema.tidb_query_duration",
+		// A quoted identifier is the same reference; sanitisation blanks it out of
+		// the structural view, so it is checked separately.
+		"SELECT 1 FROM `information_schema`.tables",
+		"SELECT 1 FROM `mysql`.`user`",
+		"SELECT 1 FROM `performance_schema`.session_variables",
 	} {
 		kind, _, err := classifyExecSQL(query)
 		if err == nil {
