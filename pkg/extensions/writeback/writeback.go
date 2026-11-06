@@ -2451,6 +2451,13 @@ func (h *bufferingHandle) Unwrap() fs.Handle {
 	return h.inner
 }
 
+// UnwrapHandle is the name the FUSE facade's capability probes follow (it is
+// how the lock namespace is found). Without it the probe stops at this handle,
+// so a MIGRATED descriptor would never reach the engine's lock table and would
+// fall back to the facade's — two tables for one file, each blind to the
+// other.
+func (h *bufferingHandle) UnwrapHandle() fs.Handle { return h.Unwrap() }
+
 // extentHandle returns the engine handle after a promotion migration, or nil
 // while this descriptor still owns its own buffering. Callers that MUTATE
 // state must not use this: read h.extent under the same lock that guards the

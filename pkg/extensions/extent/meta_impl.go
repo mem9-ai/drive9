@@ -2635,3 +2635,194 @@ func (b *Bridge) Check(ctx meta.Context, fpath string, opt *meta.CheckOpt) error
 func (b *Bridge) Clone(ctx meta.Context, srcParentIno, srcIno, dstParentIno meta.Ino, dstName string, cmode uint8, cumask uint16, concurrency uint8, count, total *uint64) syscall.Errno {
 	return syscall.ENOTSUP
 }
+
+// Two Meta methods CANNOT be implemented from outside the JuiceFS module,
+// because their signatures mention unexported types:
+//
+//	ScanDeletedObject(ctx, trashSliceScan, pendingSliceScan, ...) — the scan
+//	  callbacks are unexported function types;
+//	GetDirStat(ctx, inode) (*dirStat, syscall.Errno) — returns an unexported
+//	  struct pointer.
+//
+// Both fall through to the embedded (nil) meta.Meta and would PANIC if ever
+// called. They are unreachable through this mount: the facade's namespace comes
+// from the bridge, so the community client's `.control` inode is just an
+// ordinary server-side name here. Depended-on behaviour must not go through
+// them.
+
+// ---- JuiceFS control-plane surface ----
+//
+// These serve the community client's maintenance commands (the `.control`
+// inode: rmr, summary, session cleanup, integrity checks). The drive9 facade
+// does not expose that inode — its namespace comes from the bridge, so
+// `.control` is an ordinary server-side name — which means none of them is
+// reachable through this mount today. They are implemented rather than left to
+// the embedded nil meta.Meta because a nil embed PANICS, and a future wiring
+// that does reach them should get an answer, not a crash.
+
+// Reset would wipe the volume. The extent plane's metadata lives on the
+// server; a client-side reset that only dropped local caches would report
+// success for something it cannot do.
+func (b *Bridge) Reset() error {
+	return fmt.Errorf("extent: reset is not supported by the client plane")
+}
+
+// CleanStaleSessions has nothing to clean: this plane keeps no session rows.
+func (b *Bridge) CleanStaleSessions(ctx meta.Context) {}
+
+// CleanupTrashBefore and CleanupDetachedNodesBefore are server-side retention
+// duties (the drive9 tenant worker owns them).
+func (b *Bridge) CleanupTrashBefore(ctx meta.Context, edge time.Time, increProgress func(int), stats *meta.CleanupTrashStats) syscall.Errno {
+	return 0
+}
+
+func (b *Bridge) CleanupDetachedNodesBefore(ctx meta.Context, edge time.Time, increProgress func()) {
+}
+
+// BatchUnlink removes several entries of one directory. The Meta contract's
+// per-entry primitive already routes through this bridge's Unlink, so batching
+// is a loop here: there is no batched wire call to gain from.
+func (b *Bridge) BatchUnlink(ctx meta.Context, parent meta.Ino, entries []*meta.Entry, count *uint64, skipCheckTrash bool) syscall.Errno {
+	var done uint64
+	for _, e := range entries {
+		if e == nil {
+			continue
+		}
+		if errno := b.Unlink(ctx, parent, string(e.Name)); errno != 0 {
+			if count != nil {
+				*count = done
+			}
+			return errno
+		}
+		done++
+	}
+	if count != nil {
+		*count = done
+	}
+	return 0
+}
+
+// NewDirHandler streams directory entries. The bridge's Readdir already
+// returns the whole listing, so there is no incremental handler to hand out;
+// ENOTSUP lets the caller fall back to Readdir instead of reading a nil.
+func (b *Bridge) NewDirHandler(ctx meta.Context, inode meta.Ino, plus bool, initEntries []*meta.Entry) (meta.DirHandler, syscall.Errno) {
+	return nil, syscall.ENOTSUP
+}
+
+// Remove deletes a subtree. The server's recursive delete owns this (the
+// drive9 backend exposes it), and this plane has no such call, so a recursive
+// walk is the only correct implementation available here.
+func (b *Bridge) Remove(ctx meta.Context, parent meta.Ino, name string, skipTrash bool, numThreads int, count *uint64) syscall.Errno {
+	path, ok := b.remotePath(parent)
+	if !ok {
+		return syscall.ESTALE
+	}
+	full := childPath(path, name)
+	if errno := b.removeTree(ctxOf(ctx), full, count); errno != 0 {
+		return errno
+	}
+	return 0
+}
+
+// removeTree walks and unlinks depth-first, counting attempted deletions.
+func (b *Bridge) removeTree(ctx context.Context, full string, count *uint64) syscall.Errno {
+	st, err := b.StatLocal(ctx, full)
+	if err != nil {
+		if client.IsNotFound(err) {
+			return syscall.ENOENT
+		}
+		return errnoOf(err)
+	}
+	if st.IsDir {
+		children, err := b.cfg.Client.ListCtx(ctx, full)
+		if err != nil {
+			return errnoOf(err)
+		}
+		for _, child := range children {
+			_ = b.removeTree(ctx, childPath(full, child.Name), count)
+		}
+	}
+	parentPath, base := SplitParent(full)
+	parentIno, ok := b.localInoOf(parentPath)
+	if !ok {
+		return syscall.ESTALE
+	}
+	var errno syscall.Errno
+	if st.IsDir {
+		errno = b.Rmdir(bgMetaCtx(), parentIno, base)
+	} else {
+		errno = b.Unlink(bgMetaCtx(), parentIno, base)
+	}
+	if errno == 0 && count != nil {
+		*count++
+	}
+	return errno
+}
+
+// localInoOf resolves a full path to the inode this bridge uses for it.
+func (b *Bridge) localInoOf(full string) (meta.Ino, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	ino := b.liveInoLocked(full)
+	p, ok := b.paths[ino]
+	if ok && p == full {
+		return ino, true
+	}
+	return inoFor(full), true
+}
+
+// GetSummary accumulates a node's usage. It is derivable from what this plane
+// already answers (Readdir + GetAttr), so it is computed rather than refused.
+func (b *Bridge) GetSummary(ctx meta.Context, inode meta.Ino, summary *meta.Summary, recursive bool, strict bool) syscall.Errno {
+	if summary == nil {
+		return syscall.EINVAL
+	}
+	path, ok := b.remotePath(inode)
+	if !ok {
+		return syscall.ESTALE
+	}
+	var walk func(p string) syscall.Errno
+	walk = func(p string) syscall.Errno {
+		infos, err := b.cfg.Client.ListCtx(ctxOf(ctx), p)
+		if err != nil {
+			if strict {
+				return errnoOf(err)
+			}
+			return 0
+		}
+		for _, fi := range infos {
+			child := childPath(p, fi.Name)
+			if fi.IsDir {
+				summary.Dirs++
+				if recursive {
+					if errno := walk(child); errno != 0 {
+						return errno
+					}
+				}
+				continue
+			}
+			summary.Files++
+			if st, serr := b.StatLocal(ctxOf(ctx), child); serr == nil {
+				summary.Length += uint64(st.Size)
+				summary.Size += uint64(st.Size)
+			}
+		}
+		return 0
+	}
+	if errno := walk(path); errno != 0 {
+		return errno
+	}
+	return 0
+}
+
+// GetTreeSummary is the depth/topN view of GetSummary. The strict tree shape
+// is a server-side aggregation this plane does not implement.
+func (b *Bridge) GetTreeSummary(ctx meta.Context, root *meta.TreeSummary, depth, topN uint8, strict bool, updateProgress func(count uint64, bytes uint64)) syscall.Errno {
+	return syscall.ENOTSUP
+}
+
+// bgMetaCtx is the meta.Context used by internal recursive work that has no
+// caller credentials of its own (the control-plane Remove walk). The extent
+// bridge does not enforce per-caller permissions — the drive9 server owns
+// authorization — so a root context is the correct one here.
+func bgMetaCtx() meta.Context { return meta.NewContext(0, 0, nil) }
