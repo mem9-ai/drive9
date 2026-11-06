@@ -111,6 +111,7 @@ func TestProvisionAndDeprovision(t *testing.T) {
 		t.Skip("no tidb test DSN")
 	}
 	t.Setenv(EnvAdminDSN, testDSN)
+	t.Setenv(EnvTenantPasswordSecret, strings.Repeat("test-secret-", 4))
 	p, err := NewProvisionerFromEnv()
 	if err != nil {
 		t.Fatalf("NewProvisionerFromEnv: %v", err)
@@ -143,11 +144,22 @@ func TestProvisionAndDeprovision(t *testing.T) {
 	if len(info.Username) > 32 {
 		t.Fatalf("tenant account %q exceeds the MySQL 32-character limit", info.Username)
 	}
-	// The password is random per provisioning, not derived from the (possibly
-	// empty) admin secret, and the grant scope escapes SQL wildcards so a sibling
-	// database cannot match it.
-	if len(info.Password) != 48 {
-		t.Fatalf("tenant password length = %d, want a 48-character random value", len(info.Password))
+	// The password is derived from the deployment secret (never the empty password
+	// of the default local DSN) so re-provisioning converges, and the grant scope
+	// escapes SQL wildcards so a sibling database cannot match it.
+	if info.Password != deriveLocalTenantPassword(p.tenantSecret, "11111111-2222-3333-4444-555555555555") {
+		t.Fatal("tenant password is not the derived value")
+	}
+	if len(info.Password) != 32 {
+		t.Fatalf("tenant password length = %d, want a 32-character derived value", len(info.Password))
+	}
+	// Re-provisioning must not rotate a credential the caller has already stored.
+	again, err := p.Provision(ctx, "11111111-2222-3333-4444-555555555555")
+	if err != nil {
+		t.Fatalf("re-provision: %v", err)
+	}
+	if again.Username != info.Username || again.Password != info.Password {
+		t.Fatalf("re-provision rotated the credential: %q -> %q", info.Username, again.Username)
 	}
 	if scope := localTenantGrantScope("drive9_abc_def"); strings.Contains(scope, "drive9_abc_def") {
 		t.Fatalf("grant scope %q does not escape the wildcard", scope)

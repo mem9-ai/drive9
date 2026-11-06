@@ -634,8 +634,16 @@ func slockOAuthCookieSecure(r *http.Request, publicURL string) bool {
 	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(publicURL)), "https://") {
 		return true
 	}
-	forwarded := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")[0])
-	return strings.EqualFold(forwarded, "https")
+	// Any hop claiming https counts. A proxy that appends rather than overwrites
+	// produces "http, https", and reading only the first value would then drop the
+	// Secure flag — the leak this helper exists to prevent. Erring on https can only
+	// harden the cookie.
+	for _, value := range strings.Split(r.Header.Get("X-Forwarded-Proto"), ",") {
+		if strings.EqualFold(strings.TrimSpace(value), "https") {
+			return true
+		}
+	}
+	return false
 }
 
 // appendURLQueryParam adds or replaces one query value without disturbing the rest

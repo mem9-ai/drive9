@@ -485,6 +485,10 @@ func TestSlockOAuthCookieSecureHonoursForwardedProto(t *testing.T) {
 	if !slockOAuthCookieSecure(req, "") {
 		t.Fatal("a forwarded https scheme must mark the cookie Secure")
 	}
+	req.Header.Set("X-Forwarded-Proto", "http, https")
+	if !slockOAuthCookieSecure(req, "") {
+		t.Fatal("an appended https hop must mark the cookie Secure")
+	}
 	req.Header.Set("X-Forwarded-Proto", "http")
 	if !slockOAuthCookieSecure(req, "https://drive9.example.com") {
 		t.Fatal("an https public URL must already make the cookie Secure")

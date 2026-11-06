@@ -137,11 +137,14 @@ func adminAuditActor(r *http.Request, bodyPublicKey string) (actorKind, orgID, a
 	if apiKeyID != "" {
 		return "tenant_api_key", "", apiKeyID, ""
 	}
-	if key := strings.TrimSpace(r.Header.Get(quotaPublicKeyHeader)); key != "" {
-		return "tidbcloud_api_key", "", "", key
-	}
+	// Body credentials win over the header, matching the handlers themselves
+	// (adminCredentials gives the JSON body precedence): a request that
+	// authenticates with one key must not be logged as another.
 	if bodyPublicKey != "" {
 		return "tidbcloud_api_key", "", "", bodyPublicKey
+	}
+	if key := strings.TrimSpace(r.Header.Get(quotaPublicKeyHeader)); key != "" {
+		return "tidbcloud_api_key", "", "", key
 	}
 	return "unknown", "", "", ""
 }
@@ -157,18 +160,26 @@ func adminAuditBodyPublicKey(r *http.Request) string {
 	if r.Body == nil || r.Method == http.MethodGet || r.Method == http.MethodHead {
 		return ""
 	}
-	raw, err := io.ReadAll(io.LimitReader(r.Body, adminAuditBodyPeekLimit))
-	_ = r.Body.Close()
+	// Read one byte past the limit so an oversized body is detectable, and rebuild
+	// the stream from what was read plus whatever is left. Closing or truncating
+	// here would hand the handler a different request than the client sent.
+	head, err := io.ReadAll(io.LimitReader(r.Body, adminAuditBodyPeekLimit+1))
+	remainder := r.Body
+	r.Body = struct {
+		io.Reader
+		io.Closer
+	}{Reader: io.MultiReader(bytes.NewReader(head), remainder), Closer: remainder}
 	if err != nil {
-		// The handler will see the truncated body it actually received.
-		r.Body = io.NopCloser(bytes.NewReader(raw))
 		return ""
 	}
-	r.Body = io.NopCloser(bytes.NewReader(raw))
+	if len(head) > adminAuditBodyPeekLimit {
+		// Too large to inspect; the caller's key, if any, is beyond the peek.
+		return ""
+	}
 	var payload struct {
 		PublicKey string `json:"public_key"`
 	}
-	if err := json.Unmarshal(raw, &payload); err != nil {
+	if err := json.Unmarshal(head, &payload); err != nil {
 		return ""
 	}
 	return strings.TrimSpace(payload.PublicKey)

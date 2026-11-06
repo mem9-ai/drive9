@@ -7,7 +7,7 @@ package local
 
 import (
 	"context"
-	"crypto/rand"
+	"crypto/hmac"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -35,6 +35,10 @@ const (
 	// EnvLegacyDSN is accepted as a fallback admin DSN (former drive9-server-local).
 	EnvLegacyDSN     = "DRIVE9_LOCAL_DSN"
 	EnvEmbeddingMode = "DRIVE9_LOCAL_EMBEDDING_MODE"
+	// EnvTenantPasswordSecret seeds the per-tenant database passwords. It falls back
+	// to DRIVE9_MASTER_KEY, which the local provider always sets, so the default
+	// local DSN's missing password never becomes the derivation key.
+	EnvTenantPasswordSecret = "DRIVE9_LOCAL_TENANT_SECRET"
 
 	DefaultOrganizationID = "local-org"
 
@@ -50,6 +54,11 @@ type Provisioner struct {
 	mode  string
 	orgID string
 	role  string
+	// tenantSecret seeds the per-tenant database passwords. Deriving them keeps
+	// Provision idempotent: re-provisioning must not rotate a credential the
+	// metadata store already holds, and the value must not be computable from the
+	// tenant id alone.
+	tenantSecret string
 }
 
 func NewProvisionerFromEnv() (*Provisioner, error) {
@@ -70,11 +79,20 @@ func NewProvisionerFromEnv() (*Provisioner, error) {
 	if err != nil {
 		return nil, err
 	}
+	secret := firstNonEmpty(
+		strings.TrimSpace(os.Getenv(EnvTenantPasswordSecret)),
+		strings.TrimSpace(os.Getenv("DRIVE9_MASTER_KEY")),
+		cfg.Passwd,
+	)
+	if secret == "" {
+		return nil, fmt.Errorf("%s (or DRIVE9_MASTER_KEY) is required to derive local tenant database passwords", EnvTenantPasswordSecret)
+	}
 	return &Provisioner{
-		admin: cfg,
-		mode:  mode,
-		orgID: DefaultOrganizationID,
-		role:  tenant.TiDBCloudRoleOrgOwner,
+		admin:        cfg,
+		mode:         mode,
+		orgID:        DefaultOrganizationID,
+		role:         tenant.TiDBCloudRoleOrgOwner,
+		tenantSecret: secret,
 	}, nil
 }
 
@@ -100,7 +118,7 @@ func (p *Provisioner) Provision(ctx context.Context, tenantID string) (*tenant.C
 	// account would give it every other tenant's database (and the control plane,
 	// which lives on the same instance). The tenant gets its own account, granted
 	// only on its own schema.
-	credential, err := ensureLocalTenantAccount(ctx, admin, tenantID, dbName)
+	credential, err := ensureLocalTenantAccount(ctx, admin, p.tenantSecret, tenantID, dbName)
 	if err != nil {
 		return nil, err
 	}
@@ -136,18 +154,18 @@ type localTenantCredential struct {
 // id, so re-provisioning an existing tenant converges instead of rotating a
 // credential the metadata store already holds. The account name is derived the
 // same way, which keeps it stable across restarts.
-func ensureLocalTenantAccount(ctx context.Context, admin *sql.DB, tenantID, dbName string) (localTenantCredential, error) {
+func ensureLocalTenantAccount(ctx context.Context, admin *sql.DB, tenantSecret, tenantID, dbName string) (localTenantCredential, error) {
 	username := localTenantUserName(tenantID)
 	if username == "" {
 		return localTenantCredential{}, fmt.Errorf("derive local tenant credential for %s", tenantID)
 	}
-	// A random per-tenant password, not one derived from the admin secret: the
-	// default local DSN has no password, and a derived value would then be a public
-	// function of the tenant id — anyone who can reach the instance could compute
-	// it. The caller persists this value encrypted, so a retry is consistent.
-	password, err := newLocalTenantPassword()
-	if err != nil {
-		return localTenantCredential{}, err
+	// Deterministic in (deployment secret, tenant id): re-provisioning an existing
+	// tenant must not rotate a credential the metadata store already holds, and the
+	// derivation key is a real secret (never the default local DSN's empty password),
+	// so the password is not computable from the tenant id alone.
+	password := deriveLocalTenantPassword(tenantSecret, tenantID)
+	if password == "" {
+		return localTenantCredential{}, fmt.Errorf("derive local tenant password for %s", tenantID)
 	}
 	user := quoteString(username) + "@'%'"
 	statements := []struct {
@@ -182,18 +200,20 @@ func localTenantUserName(tenantID string) string {
 	return "drive9_t_" + hex.EncodeToString(sum[:11])
 }
 
-// newLocalTenantPassword draws a random password for one local tenant.
+// deriveLocalTenantPassword renders one tenant's password from the deployment
+// secret.
 //
-// Deriving it from the admin secret would be reproducible but unsafe here: the
-// default local DSN authenticates as `root` with no password, so the derivation
-// key would be empty and every tenant password would be a public function of its
-// (API-visible) tenant id.
-func newLocalTenantPassword() (string, error) {
-	buf := make([]byte, 24)
-	if _, err := rand.Read(buf); err != nil {
-		return "", fmt.Errorf("generate local tenant password: %w", err)
+// A random password would be stronger, but re-provisioning has to leave an
+// existing account's credential alone, and MySQL never exposes a stored password,
+// so the value has to be reproducible. The key is the operator secret (or the
+// generated master key), never the empty password of the default local DSN.
+func deriveLocalTenantPassword(tenantSecret, tenantID string) string {
+	if strings.TrimSpace(tenantSecret) == "" || strings.TrimSpace(tenantID) == "" {
+		return ""
 	}
-	return hex.EncodeToString(buf), nil
+	mac := hmac.New(sha256.New, []byte(tenantSecret))
+	_, _ = mac.Write([]byte("drive9:local_tenant_pw:" + tenantID))
+	return hex.EncodeToString(mac.Sum(nil))[:32]
 }
 
 // localTenantGrantScope renders the database scope of a grant.

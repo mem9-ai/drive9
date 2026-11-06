@@ -658,6 +658,9 @@ environment:
   DRIVE9_ALLOW_ANONYMOUS_PROVISION accept POST /v1/provision without a caller TiDB Cloud
                         key pair, spending the server's default credential (default: false).
                         provider=local is always anonymous.
+  DRIVE9_LOCAL_TENANT_SECRET
+                        seeds the per-tenant database passwords of the local
+                        provider (defaults to DRIVE9_MASTER_KEY)
   DRIVE9_TLS_ALLOW_PLAINTEXT
                         set to 1 only when TLS is terminated in front of this
                         server; without it a non-loopback listener refuses to

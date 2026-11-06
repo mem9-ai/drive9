@@ -3503,6 +3503,9 @@ func storeOpResultForError(err error) string {
 		return "ok"
 	case errors.Is(err, ErrNotFound):
 		return "not_found"
+	case errors.Is(err, ErrExecSQLRejected):
+		// The statement was refused, not executed: client input, not a failure.
+		return "rejected"
 	case errors.Is(err, ErrPathConflict),
 		errors.Is(err, ErrDirectoryNotEmpty),
 		errors.Is(err, ErrRevisionConflict),

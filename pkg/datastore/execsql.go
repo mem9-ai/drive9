@@ -222,12 +222,16 @@ func (s *Store) ExecSQL(ctx context.Context, query string) (out []map[string]int
 	if modeErr := checkExecSQLMode(timeoutCtx, conn); modeErr != nil {
 		if errors.Is(modeErr, errExecSQLUnsafeSQLMode) {
 			// A permanently misconfigured tenant must not turn every request into an
-			// ERROR log: warn, and let the response/metric carry the rejection.
-			logger.Warn(timeoutCtx, "datastore_exec_sql_sql_mode_rejected", zap.Int("query_len", len(q)), zap.Error(modeErr))
-		} else {
-			logger.Error(timeoutCtx, "datastore_exec_sql_sql_mode_rejected", zap.Int("query_len", len(q)), zap.Error(modeErr))
+			// ERROR log: warn, and let the response/metric carry the rejection. The
+			// refusal is also marked as a policy error so upstream logging and the
+			// failure series treat it as client input.
+			err = markExecSQLPolicyError(modeErr)
+			logger.Warn(timeoutCtx, "datastore_exec_sql_sql_mode_rejected", zap.Int("query_len", len(q)), zap.Error(err))
+			return nil, err
 		}
-		return nil, modeErr
+		err = modeErr
+		logger.Error(timeoutCtx, "datastore_exec_sql_sql_mode_rejected", zap.Int("query_len", len(q)), zap.Error(err))
+		return nil, err
 	}
 
 	kind, _, err := classifyExecSQL(q)

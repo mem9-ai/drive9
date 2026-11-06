@@ -149,3 +149,54 @@ func TestAdminAuditMiddlewareAttributesBodyCredentials(t *testing.T) {
 		t.Fatalf("actor = %v/%v, want the body public key", fields["actor_kind"], fields["actor_public_key"])
 	}
 }
+
+// Body credentials win over a conflicting header, matching what the handlers
+// themselves use, and an oversized body must reach the handler intact.
+func TestAdminAuditCredentialPrecedenceAndBodyPreservation(t *testing.T) {
+	core, recorded := observer.New(zap.InfoLevel)
+	previous := logger.L()
+	logger.Set(zap.New(core))
+	t.Cleanup(func() { logger.Set(previous) })
+
+	t.Run("body key wins over header", func(t *testing.T) {
+		recorded.TakeAll()
+		s := &Server{}
+		handler := s.adminAuditMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+		req := httptest.NewRequest(http.MethodPost, "/v1/admin/tenants", strings.NewReader(`{"public_key":"BODY"}`))
+		req.Header.Set(quotaPublicKeyHeader, "HEADER")
+		handler.ServeHTTP(httptest.NewRecorder(), req)
+
+		var fields map[string]interface{}
+		for _, entry := range recorded.All() {
+			if entry.Message == "admin_audit" {
+				fields = entry.ContextMap()
+			}
+		}
+		if fields == nil {
+			t.Fatal("no admin_audit record")
+		}
+		if fields["actor_public_key"] != "BODY" {
+			t.Fatalf("actor_public_key = %v, want the body key", fields["actor_public_key"])
+		}
+	})
+
+	t.Run("oversized body is preserved", func(t *testing.T) {
+		big := strings.Repeat("x", 2*adminAuditBodyPeekLimit)
+		var got int
+		s := &Server{}
+		handler := s.adminAuditMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			raw, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Errorf("read body: %v", err)
+			}
+			got = len(raw)
+			w.WriteHeader(http.StatusOK)
+		}))
+		handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/admin/tenants", strings.NewReader(big)))
+		if got != len(big) {
+			t.Fatalf("handler read %d bytes, want %d", got, len(big))
+		}
+	})
+}
