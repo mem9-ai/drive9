@@ -1163,6 +1163,17 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			res.Handle = h
 			return res, nil
 		}
+		if !op.KernelCreate() && flags&uint32(syscall.O_CREAT) == 0 && flags&uint32(syscall.O_APPEND) != 0 &&
+			w.uploader != nil && w.uploader.InFlight(op.Path) {
+			// The fast path declined because a PendingOverwrite PUT is in
+			// flight. Do not let the ordinary HEAD-open capture the stale
+			// pre-upload base: wait for the acknowledgement, then retry the
+			// fast path so the opener receives the committed revision.
+			w.uploader.WaitPath(op.Path)
+			if res, ok := w.openPendingWritable(op); ok {
+				return res, nil
+			}
+		}
 		if flags&uint32(syscall.O_CREAT) == 0 {
 			// v1 close-to-open: a read-only re-open of a path whose image
 			// has not landed serves the pending bytes — the kernel's LOOKUP
@@ -6226,6 +6237,18 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, dur stageDurabi
 			h.mu.Unlock()
 		}
 	}
+	h.mu.Lock()
+	isNewStage := h.isNew
+	lineageStage, supersededStage := h.cacheLineageGen, h.supersededPendingGen
+	h.mu.Unlock()
+	if !isNewStage && (lineageStage != 0 || supersededStage != 0) && h.w.uploader != nil {
+		// Serialize a new cache generation behind the previous upload's
+		// acknowledgement. Otherwise a handle opened from G2 can stage G3
+		// while G2 is publishing; the G2 ack then cannot identify G3's
+		// ancestor and G3 stages at the pre-G2 base. Handles with no
+		// pending lineage (ordinary opens) need no fence.
+		h.w.uploader.WaitPath(h.path)
+	}
 	unlock := h.w.pathLocks.lock(h.path)
 	defer unlock()
 	if h.w.opts.Staging != nil && h.w.opts.Staging.Pending.HasPending(h.path) {
@@ -6344,6 +6367,13 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, dur stageDurabi
 		if supersedesGen != 0 {
 			h.w.wbCache.MarkSupersedesPendingGen(h.path, supersedesGen, wbGen)
 		}
+		// A queue-derived handle can later stage its buffer into the cache.
+		// That cache image is now its own newest content: keep the queue
+		// supersession marker, but remember the cache generation so the cache
+		// upload's ack still advances the handle.
+		h.mu.Lock()
+		h.cacheLineageGen = wbGen
+		h.mu.Unlock()
 	} else {
 		// Cache lineage is a separate generation space from the pending
 		// index. The put persisted the root in the same meta write (no
@@ -6358,19 +6388,11 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, dur stageDurabi
 		if h.cacheLineageGen == 0 {
 			h.cacheLineageGen = lineage
 		}
-		if supersedesSource == pendingGenQueue {
-			// A queue-derived handle can later stage its buffer into the
-			// cache. That cache image is now its own newest content: keep
-			// the queue supersession marker, but remember the cache
-			// generation so the cache upload's ack still advances the handle.
-			h.cacheLineageGen = wbGen
-		} else {
-			// The staged image is now this handle's content; its next stage
-			// composes over this generation, and an ack for this image must
-			// advance the handle even though the cache lineage root is older.
-			h.supersededPendingGen = wbGen
-			h.supersededPendingSource = pendingGenCache
-		}
+		// The staged image is now this handle's content; its next stage
+		// composes over this generation, and an ack for this image must
+		// advance the handle even though the cache lineage root is older.
+		h.supersededPendingGen = wbGen
+		h.supersededPendingSource = pendingGenCache
 		h.mu.Unlock()
 	}
 	// v1 seeded the read cache with the staged image at the flush
