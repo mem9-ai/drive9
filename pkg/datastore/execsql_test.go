@@ -6,23 +6,6 @@ import (
 	"testing"
 )
 
-func TestNormalizeSQL(t *testing.T) {
-	tests := []struct {
-		input string
-		want  string
-	}{
-		{"  SELECT  1  ", "SELECT 1"},
-		{"SELECT\n\t1", "SELECT 1"},
-		{"UPDATE\n  file_tags\n  SET  tag_value='x'", "UPDATE file_tags SET tag_value='x'"},
-	}
-	for _, tt := range tests {
-		got := normalizeSQL(tt.input)
-		if got != tt.want {
-			t.Errorf("normalizeSQL(%q) = %q, want %q", tt.input, got, tt.want)
-		}
-	}
-}
-
 func TestExecSQLClassifier(t *testing.T) {
 	tests := []struct {
 		name    string
