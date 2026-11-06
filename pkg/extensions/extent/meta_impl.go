@@ -182,7 +182,7 @@ func (b *Bridge) GetAttr(ctx meta.Context, ino meta.Ino, attr *meta.Attr) syscal
 	}
 	b.observeRevision(ino, st.Revision)
 	b.mu.Lock()
-	local, has := b.sizes[ino]
+	local, has := b.localLengthLocked(ino)
 	b.mu.Unlock()
 	if attr != nil {
 		*attr = *attrFromStat(ino, st, 0)
@@ -191,6 +191,23 @@ func (b *Bridge) GetAttr(ctx meta.Context, ino meta.Ino, attr *meta.Attr) syscal
 		}
 	}
 	return 0
+}
+
+// localLengthLocked is the file's observable length from this mount's point of
+// view: the committed size, or the further end the engine's writer is still
+// buffering. Caller holds b.mu.
+//
+// The buffered end matters because POSIX grows a file on write(2), not at
+// whatever point the storage engine happens to publish. A stat that answers
+// shorter than a preceding write makes the KERNEL reset its own i_size and
+// serve every following read as EOF — which is how a SQLite batch that creates
+// a table and then indexes it ended up reporting "no such table".
+func (b *Bridge) localLengthLocked(ino meta.Ino) (int64, bool) {
+	s, ok := b.sizes[ino]
+	if buf, has := b.buffered[ino]; has && (!ok || buf > s) {
+		return buf, true
+	}
+	return s, ok
 }
 
 func (b *Bridge) Resolve(ctx meta.Context, parent meta.Ino, path string, inode *meta.Ino, attr *meta.Attr, force bool) syscall.Errno {
@@ -1629,14 +1646,7 @@ func (b *Bridge) LocalSizeOf(local string) (int64, bool) {
 	full := b.fullPath(local)
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	ino := b.liveInoLocked(full)
-	s, ok := b.sizes[ino]
-	// Bytes the engine is still buffering are already part of the file's
-	// length as far as the caller is concerned (see noteBufferedLength).
-	if buf, has := b.buffered[ino]; has && buf > s {
-		return buf, true
-	}
-	return s, ok
+	return b.localLengthLocked(b.liveInoLocked(full))
 }
 
 // noteBufferedLength records that the engine holds bytes up to end for ino
@@ -1720,13 +1730,7 @@ func (b *Bridge) LocalResolve(local string) (meta.Ino, bool) {
 func (b *Bridge) LocalView(ino meta.Ino) (size int64, mode uint32, ok bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	size, ok = b.sizes[ino]
-	// Same rule as LocalSizeOf: the observable length includes bytes the
-	// engine is still buffering, or a getattr between write(2) and the
-	// publication reports a shorter file than the caller just wrote.
-	if buf, has := b.buffered[ino]; has && buf > size {
-		size, ok = buf, true
-	}
+	size, ok = b.localLengthLocked(ino)
 	mode = b.modes[ino]
 	return
 }
@@ -2192,6 +2196,13 @@ func (b *Bridge) TruncateLocal(ctx context.Context, local string, size int64) er
 	}
 	b.mu.Lock()
 	b.sizes[ino] = size
+	// A truncate SHRINKS the observable length, and the buffered mark is part
+	// of that length. Clamping it is what makes shrink work at all: the mark
+	// is otherwise monotonic, so a file truncated back to 0 would keep
+	// reporting the pre-truncate size — SQLite deletes its journal that way
+	// (truncate to zero) and would then stat a "non-empty" journal it had
+	// already finished with.
+	b.buffered[ino] = size
 	if _, has := b.truncs[ino]; !has {
 		b.truncs[ino] = size
 	}

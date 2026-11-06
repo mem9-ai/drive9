@@ -5,6 +5,8 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/juicedata/juicefs/pkg/meta"
+
 	"github.com/mem9-ai/drive9/pkg/fs"
 )
 
@@ -115,5 +117,67 @@ func TestTruncateShrinksAfterBufferedBytesArePublished(t *testing.T) {
 	}
 	if size, ok := h.opts.Engine.LocalAttr(ctx, "/d/a.db"); !ok || size != 4096 {
 		t.Fatalf("size after truncate = %d (ok=%v), want 4096", size, ok)
+	}
+}
+
+// A truncate must SHRINK the observable length, including the buffered mark.
+//
+// The mark is monotonic on purpose (a later stat must not report a shorter
+// file than an earlier write established), so it has to be clamped when the
+// caller explicitly truncates. SQLite deletes its rollback journal by
+// truncating it to zero: a journal that still stats as non-empty is a journal
+// the next connection tries to roll back.
+func TestTruncateClampsTheBufferedMark(t *testing.T) {
+	f := newFakeV2(t)
+	f.setDir("/d", true)
+	h := newTestHandler(t, f, 0)
+	ctx := context.Background()
+
+	res, err, _ := dispatchCreate(ctx, h, "/d/j.db-journal", syscall.O_RDWR|syscall.O_CREAT)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	eh := res.Handle.(*engineHandle)
+	if err := eh.Write(ctx, 0, make([]byte, 5120)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if size, _ := h.opts.Engine.LocalAttr(ctx, "/d/j.db-journal"); size != 5120 {
+		t.Fatalf("size = %d, want 5120", size)
+	}
+	// SQLite's journal delete: truncate to zero.
+	if err := h.opts.Engine.Bridge.TruncateLocal(ctx, "/d/j.db-journal", 0); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	if size, ok := h.opts.Engine.LocalAttr(ctx, "/d/j.db-journal"); !ok || size != 0 {
+		t.Fatalf("size after truncate-to-zero = %d (ok=%v), want 0; the buffered mark was not clamped", size, ok)
+	}
+}
+
+// A SECOND opener must see bytes the first hasn't published yet.
+//
+// JuiceFS records the length at open time (VFS.Open -> Meta.Open -> GetAttr).
+// If that answer comes only from the committed size, a process that opens the
+// database while another has buffered writes binds a short length and serves
+// EOF for the region the other just wrote. mptest runs five client processes
+// against one file, so every one of them is this case.
+func TestSecondOpenSeesBufferedLength(t *testing.T) {
+	f := newFakeV2(t)
+	f.setDir("/d", true)
+	h := newTestHandler(t, f, 0)
+	f.seedExtent(t, "/d/a.db", "committed") // materialized: GetAttr goes remote
+
+	br := h.opts.Engine.Bridge
+	// Pretend another descriptor buffered page 1 plus page 2.
+	ino := inoFor("/d/a.db")
+	br.remember(ino, "/d/a.db")
+	br.noteBufferedLength(ino, 8192)
+
+	// The length VFS.Open would report for a fresh opener.
+	attr := &meta.Attr{}
+	if errno := br.GetAttr(meta.NewContext(1, 0, []uint32{0}), ino, attr); errno != 0 {
+		t.Fatalf("GetAttr: %v", errno)
+	}
+	if attr.Length != 8192 {
+		t.Fatalf("open-time length = %d, want the buffered 8192", attr.Length)
 	}
 }
