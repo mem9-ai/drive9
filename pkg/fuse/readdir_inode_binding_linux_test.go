@@ -87,6 +87,17 @@ func testReadDirPlusReplacedInodeKernel(t *testing.T, mode string, oldSize, newS
 			}
 			b.WriteString(`]}`)
 			_, _ = w.Write([]byte(b.String()))
+		case req.Method == http.MethodPost && req.URL.Query().Has("create"):
+			mu.Lock()
+			if _, exists := remote[p]; !exists {
+				remote[p] = []byte{}
+				if resourceIDs[p] == "" {
+					nextResourceID++
+					resourceIDs[p] = fmt.Sprintf("resource-%d", nextResourceID)
+				}
+			}
+			mu.Unlock()
+			_, _ = w.Write([]byte(`{"revision":1}`))
 		case req.Method == http.MethodPut:
 			data, err := io.ReadAll(req.Body)
 			if err != nil {
