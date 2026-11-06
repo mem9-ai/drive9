@@ -42,6 +42,15 @@ import (
 //     namespaces in POSIX), tracked per owner.
 const lockEOF = ^uint64(0)
 
+// lockVFSUnlockEOF is JuiceFS's own "to EOF" sentinel: VFS.Flush and
+// VFS.Release drop a closing descriptor's record locks with
+// Setlk(..., F_UNLCK, 0, 0x7FFFFFFFFFFFFFFF, 0) (vfs/vfs.go). It must be
+// normalised to lockEOF before comparison, or an unlock that means "everything"
+// leaves the tail [0x8000000000000000, EOF] of a to-EOF lock behind — a lock
+// nobody holds and nobody can clear, which blocks the next writer's EXCLUSIVE
+// forever.
+const lockVFSUnlockEOF = uint64(0x7FFFFFFFFFFFFFFF)
+
 // lockRange is one held byte-range lock.
 type lockRange struct {
 	owner uint64
@@ -59,13 +68,26 @@ type lockTable struct {
 	plocks map[meta.Ino][]lockRange
 	// flocks are whole-file BSD locks, per inode, keyed by owner.
 	flocks map[meta.Ino]map[uint64]uint32
+	// changed is closed and replaced on every mutation so a BLOCKING request
+	// (F_SETLKW / flock LOCK_EX) can wait for the holder to let go instead of
+	// reporting "busy" at once. A caller that asked to block must block: the
+	// kernel does not retry it, so returning EAGAIN makes the syscall fail
+	// where the program expects it to wait.
+	changed chan struct{}
 }
 
 func newLockTable() *lockTable {
 	return &lockTable{
-		plocks: make(map[meta.Ino][]lockRange),
-		flocks: make(map[meta.Ino]map[uint64]uint32),
+		plocks:  make(map[meta.Ino][]lockRange),
+		flocks:  make(map[meta.Ino]map[uint64]uint32),
+		changed: make(chan struct{}),
 	}
+}
+
+// notifyLocked wakes every blocking waiter. Caller holds mu.
+func (t *lockTable) notifyLocked() {
+	close(t.changed)
+	t.changed = make(chan struct{})
 }
 
 // rangesOverlap reports whether [a1,a2] and [b1,b2] intersect, treating
@@ -74,19 +96,26 @@ func rangesOverlap(a1, a2, b1, b2 uint64) bool {
 	return a1 <= b2 && b1 <= a2
 }
 
-// normalizeRange converts an end past the file into lockEOF so a range that is
-// "to EOF now" stays "to EOF" as the file grows (POSIX: the lock extends).
+// normalizeRange puts a request into the table's internal form. An end at or
+// past JuiceFS's to-EOF sentinel becomes lockEOF, so a range that reaches the
+// end of time compares equal to a lock stored as "to EOF" (see
+// lockVFSUnlockEOF).
 func normalizeRange(start, end uint64) (uint64, uint64) {
 	if end < start {
 		return start, start - 1 // empty range; caller rejects it
+	}
+	if end >= lockVFSUnlockEOF {
+		return start, lockEOF
 	}
 	return start, end
 }
 
 // Setlk installs a byte-range lock for owner, replacing that owner's
 // overlapping ranges. block=false must not wait: returning EAGAIN lets the
-// caller (SQLite) decide, which is what F_SETLK means.
-func (t *lockTable) Setlk(ino meta.Ino, owner uint64, pid uint32, typ uint32, start, end uint64, block bool) syscall.Errno {
+// caller (SQLite) decide, which is what F_SETLK means. block=true is
+// F_SETLKW and WAITS for the holder to release, reporting EINTR only when
+// ctx is cancelled.
+func (t *lockTable) Setlk(ctx context.Context, ino meta.Ino, owner uint64, pid uint32, typ uint32, start, end uint64, block bool) syscall.Errno {
 	if typ != syscall.F_RDLCK && typ != syscall.F_WRLCK && typ != syscall.F_UNLCK {
 		return syscall.EINVAL
 	}
@@ -94,24 +123,35 @@ func (t *lockTable) Setlk(ino meta.Ino, owner uint64, pid uint32, typ uint32, st
 	if end < start {
 		return syscall.EINVAL
 	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if typ != syscall.F_UNLCK && t.conflictsLocked(ino, owner, typ, start, end) {
-		// POSIX F_SETLK answers EACCES/EAGAIN on contention; SQLite
-		// distinguishes only "busy" from "broken", and EAGAIN is what the
-		// kernel returns for fcntl(F_SETLK). A blocking request
-		// (F_SETLKW) cannot be serviced here — this table has no wait queue
-		// — so it reports the same contention.
-		return syscall.EAGAIN
+	for {
+		t.mu.Lock()
+		if typ == syscall.F_UNLCK || !t.conflictsLocked(ino, owner, typ, start, end) {
+			t.removeOwnerRangesLocked(ino, owner, start, end)
+			if typ != syscall.F_UNLCK {
+				t.plocks[ino] = append(t.plocks[ino], lockRange{owner: owner, pid: pid, typ: typ, start: start, end: end})
+			}
+			if len(t.plocks[ino]) == 0 {
+				delete(t.plocks, ino)
+			}
+			t.notifyLocked()
+			t.mu.Unlock()
+			return 0
+		}
+		if !block {
+			// POSIX F_SETLK answers EACCES/EAGAIN on contention; SQLite
+			// distinguishes only "busy" from "broken", and EAGAIN is what the
+			// kernel returns for fcntl(F_SETLK).
+			t.mu.Unlock()
+			return syscall.EAGAIN
+		}
+		changed := t.changed
+		t.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return syscall.EINTR
+		case <-changed:
+		}
 	}
-	t.removeOwnerRangesLocked(ino, owner, start, end)
-	if typ != syscall.F_UNLCK {
-		t.plocks[ino] = append(t.plocks[ino], lockRange{owner: owner, pid: pid, typ: typ, start: start, end: end})
-	}
-	if len(t.plocks[ino]) == 0 {
-		delete(t.plocks, ino)
-	}
-	return 0
 }
 
 // conflictsLocked reports whether any OTHER owner holds a conflicting range.
@@ -188,39 +228,60 @@ func (t *lockTable) Getlk(ino meta.Ino, owner uint64, typ uint32, start, end uin
 }
 
 // Flock installs a whole-file BSD lock. flock locks conflict regardless of the
-// range namespace, and are per owner.
-func (t *lockTable) Flock(ino meta.Ino, owner uint64, typ uint32, block bool) syscall.Errno {
+// range namespace, and are per owner. block=true (LOCK_EX/LOCK_SH without
+// LOCK_NB) waits for the holder, like F_SETLKW.
+func (t *lockTable) Flock(ctx context.Context, ino meta.Ino, owner uint64, typ uint32, block bool) syscall.Errno {
 	switch typ {
 	case syscall.F_RDLCK, syscall.F_WRLCK, syscall.F_UNLCK:
 	default:
 		return syscall.EINVAL
 	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if typ == syscall.F_UNLCK {
-		if m := t.flocks[ino]; m != nil {
-			delete(m, owner)
-			if len(m) == 0 {
-				delete(t.flocks, ino)
+	for {
+		t.mu.Lock()
+		if typ == syscall.F_UNLCK {
+			if m := t.flocks[ino]; m != nil {
+				delete(m, owner)
+				if len(m) == 0 {
+					delete(t.flocks, ino)
+				}
+			}
+			t.notifyLocked()
+			t.mu.Unlock()
+			return 0
+		}
+		blocked := false
+		for other, held := range t.flocks[ino] {
+			if other == owner {
+				continue
+			}
+			if held == syscall.F_WRLCK || typ == syscall.F_WRLCK {
+				blocked = true
+				break
 			}
 		}
-		return 0
-	}
-	for other, held := range t.flocks[ino] {
-		if other == owner {
-			continue
+		if !blocked {
+			m := t.flocks[ino]
+			if m == nil {
+				m = make(map[uint64]uint32)
+				t.flocks[ino] = m
+			}
+			m[owner] = typ
+			t.notifyLocked()
+			t.mu.Unlock()
+			return 0
 		}
-		if held == syscall.F_WRLCK || typ == syscall.F_WRLCK {
+		if !block {
+			t.mu.Unlock()
 			return syscall.EAGAIN
 		}
+		changed := t.changed
+		t.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return syscall.EINTR
+		case <-changed:
+		}
 	}
-	m := t.flocks[ino]
-	if m == nil {
-		m = make(map[uint64]uint32)
-		t.flocks[ino] = m
-	}
-	m[owner] = typ
-	return 0
 }
 
 // ListLocks reports every lock held on an inode, for the Meta contract
@@ -265,6 +326,7 @@ func (t *lockTable) ListLocks(ino meta.Ino) ([]meta.PLockItem, []meta.FLockItem)
 func (t *lockTable) ReleaseOwner(ino meta.Ino, owner uint64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	defer t.notifyLocked()
 	if m := t.flocks[ino]; m != nil {
 		delete(m, owner)
 		if len(m) == 0 {
@@ -288,25 +350,29 @@ func (t *lockTable) ReleaseOwner(ino meta.Ino, owner uint64) {
 	t.plocks[ino] = out
 }
 
-// ReleaseInode drops every lock on an inode, whatever the owner. Used when the
-// inode itself goes away (unlink of the last name, or a path forgetting).
+// ReleaseInode drops every lock on an inode, whatever the owner. There is no
+// production caller: per-owner release belongs to JuiceFS's VFS, which knows
+// which descriptor holds what and drops exactly that owner at FLUSH/RELEASE.
+// A blanket inode-wide drop would also be wrong for hardlinks, where closing
+// one name does not mean the inode's locks are gone. Kept for tests.
 func (t *lockTable) ReleaseInode(ino meta.Ino) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	delete(t.plocks, ino)
 	delete(t.flocks, ino)
+	t.notifyLocked()
 }
 
 // ---- Meta surface ----
 
 // Flock implements meta.Meta.
 func (b *Bridge) Flock(ctx meta.Context, ino meta.Ino, owner uint64, ltype uint32, block bool) syscall.Errno {
-	return b.locks.Flock(ino, owner, ltype, block)
+	return b.locks.Flock(ctxOf(ctx), ino, owner, ltype, block)
 }
 
 // Setlk implements meta.Meta.
 func (b *Bridge) Setlk(ctx meta.Context, ino meta.Ino, owner uint64, block bool, ltype uint32, start, end uint64, pid uint32) syscall.Errno {
-	return b.locks.Setlk(ino, owner, pid, ltype, start, end, block)
+	return b.locks.Setlk(ctxOf(ctx), ino, owner, pid, ltype, start, end, block)
 }
 
 // Getlk implements meta.Meta.
@@ -330,6 +396,8 @@ func (b *Bridge) ListLocks(ctx context.Context, inode meta.Ino) ([]meta.PLockIte
 	return pls, fls, nil
 }
 
-// ReleaseLocksForIno drops every lock on an inode. The plane calls it when a
-// file's last descriptor closes.
+// ReleaseLocksForIno drops every lock on an inode, whatever the owner. Not
+// used by the plane: JuiceFS's VFS releases the closing descriptor's own owner
+// at FLUSH/RELEASE, which is both narrower (hardlinks share an inode) and
+// accurate. Kept for tests that need to clear a table.
 func (b *Bridge) ReleaseLocksForIno(ino meta.Ino) { b.locks.ReleaseInode(ino) }

@@ -202,11 +202,14 @@ func (h *Handler) release(e *engineHandle) {
 	}
 	delete(h.handles, e.path)
 	h.mu.Unlock()
-	// POSIX: closing a descriptor drops that process's advisory locks on the
-	// file, and here the last descriptor on the inode means nothing is left
-	// to hold them. Without this a lock outlives the open it was taken on and
-	// the next opener sees a phantom conflict it can never clear.
-	h.opts.Engine.Bridge.ReleaseLocksForIno(e.ino)
+	// Advisory locks are NOT dropped here. Each descriptor's own FLUSH and
+	// RELEASE go through JuiceFS's VFS, which records which owner a handle
+	// holds locks for and unlocks exactly that owner (h.locks/h.ofdOwner/
+	// flockOwner in vfs/handle.go). An inode-wide sweep at the last close of
+	// one PATH would be both redundant and wrong: on a hardlink, the path
+	// closing is not the inode going away, and the sweep would release a live
+	// descriptor's locks — letting a second writer in while the first still
+	// believes it holds the file.
 	h.opts.Engine.Bridge.ForgetPath(e.path)
 	h.opts.Engine.Bridge.DropDeletedOpen(e.path)
 }
@@ -375,6 +378,24 @@ func (h *Handler) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, e
 				return res, err
 			}
 		}
+	case fs.OpFallocate:
+		// VFS owns this op end to end: it validates against the kernel's
+		// limits, takes the handle's write lock, and drives Meta.Fallocate
+		// (plus the writer/reader length bookkeeping) itself. Without this
+		// case the op fell through to the chain terminal as ENOSYS — an
+		// extent file answered "not supported" to an operation the engine
+		// underneath fully implements.
+		if res, err, handled := h.engineHandleOp(op, func(e *engineHandle) syscall.Errno {
+			return h.opts.Engine.VFS.Fallocate(e.vctx, e.ino, uint8(op.Flags), op.Offset, op.Size, e.fh)
+		}); handled {
+			return res, err
+		}
+	case fs.OpCopyFileRange:
+		// Same shape: VFS.CopyFileRange is the implementation (it reads
+		// through the source handle and writes through the destination's).
+		if res, err, handled := h.copyFileRangeOverEngine(op); handled {
+			return res, err
+		}
 	case fs.OpGetAttr:
 		h.mu.Lock()
 		_, open := h.handles[op.Path]
@@ -398,6 +419,81 @@ func (h *Handler) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, e
 		return res, err
 	}
 	return next(ctx, op)
+}
+
+// engineHandleOp runs a descriptor-scoped operation against the engine handle
+// that opened the op's fh, for ops JuiceFS's VFS already implements.
+//
+// The rule this encodes: the VFS is the implementation, this plane only
+// ROUTES. Anything VFS exposes for an open file belongs there — it knows the
+// handle's writer, reader and lock state, and it maintains them as a side
+// effect of the call. Reimplementing such an op against the bridge (or, worse,
+// letting it fall through to the chain terminal as ENOSYS) desynchronises that
+// state from what the engine believes.
+//
+// The fh must match EXACTLY. Batch operations act on the object the kernel
+// opened, and another descriptor at the same path may be a different
+// incarnation (replaced, renamed, or opened read-only) — acting through it
+// would apply the operation to the wrong open file.
+//
+// handled=false when this plane owns no such handle, so the op keeps its
+// normal route (classic files are none of this plane's business).
+func (h *Handler) engineHandleOp(op *fs.Op, call func(*engineHandle) syscall.Errno) (fs.Result, error, bool) {
+	if h.opts.Engine == nil || op.Fh == 0 {
+		return fs.Result{}, nil, false
+	}
+	h.mu.Lock()
+	var live *engineHandle
+	for _, e := range h.handles[op.Path] {
+		if e.fh == op.Fh {
+			live = e
+			break
+		}
+	}
+	h.mu.Unlock()
+	if live == nil {
+		return fs.Result{}, nil, false
+	}
+	if errno := call(live); errno != 0 {
+		return fs.Result{}, errno, true
+	}
+	return fs.Result{}, nil, true
+}
+
+// copyFileRangeOverEngine routes a copy to VFS.CopyFileRange when BOTH ends are
+// open engine files on this mount. VFS reads through the source handle and
+// writes through the destination's, which is why it needs both.
+//
+// A copy with either end outside this plane is left to the chain: VFS has no
+// handle to work through, and the classic path never supported the op either.
+func (h *Handler) copyFileRangeOverEngine(op *fs.Op) (fs.Result, error, bool) {
+	if h.opts.Engine == nil || op.Path2 == "" || op.Fh == 0 || op.Fh2 == 0 {
+		return fs.Result{}, nil, false
+	}
+	h.mu.Lock()
+	src := h.handleForLocked(op.Path, op.Fh)
+	dst := h.handleForLocked(op.Path2, op.Fh2)
+	h.mu.Unlock()
+	if src == nil || dst == nil {
+		return fs.Result{}, nil, false
+	}
+	copied, errno := h.opts.Engine.VFS.CopyFileRange(src.vctx, src.ino, src.fh,
+		uint64(op.Offset), dst.ino, dst.fh, uint64(op.Offset2), uint64(op.Limit), op.Flags)
+	if errno != 0 {
+		return fs.Result{}, errno, true
+	}
+	return fs.Result{Written: uint32(copied)}, nil, true
+}
+
+// handleForLocked resolves the live engine handle for path and fh. Caller
+// holds h.mu.
+func (h *Handler) handleForLocked(path string, fh uint64) *engineHandle {
+	for _, e := range h.handles[path] {
+		if e.fh == fh {
+			return e
+		}
+	}
+	return nil
 }
 
 // tryClaimOpen claims the op when the target is (or, in full mode, will
@@ -590,6 +686,10 @@ func (h *Handler) linkAfterLanding(ctx context.Context, op *fs.Op, next fs.Next)
 	//     gives a genuinely empty file its name (the engine materializes an
 	//     empty name only at the last close).
 	for _, e := range list {
+		// The lock owner is 0 on purpose here: this flush lands the source's
+		// bytes for a link, it is not that descriptor's close(2), so it must
+		// not drop the file's locks. (engineHandle.Flush, which IS a close
+		// boundary, passes the real owner.)
 		if errno := h.opts.Engine.VFS.Flush(e.vctx, e.ino, e.fh, 0); errno != 0 {
 			unlock()
 			return fs.Result{}, errno, true
@@ -815,20 +915,26 @@ type engineHandle struct {
 // Both are served by the bridge's mount-local table (locks.go): in-memory, one
 // daemon's lifetime, never persisted and never shared across mounts.
 //
-// fs.FileLock.End is documented as exclusive while FUSE hands us POSIX
-// inclusive ranges, so the end is adjusted by one in each direction. End == 0
-// is the kernel's "to EOF" and maps to lockEOF, so the lock keeps growing with
-// the file instead of pinning the current length.
+// Both sides of the boundary use INCLUSIVE ends, so the conversion is a
+// pass-through: FUSE's fuse_file_lock.end is inclusive (the kernel adds one
+// when it converts back to a struct file_lock), and locks.go stores inclusive
+// ranges. End == 0 is the kernel's "to EOF" and maps to lockEOF, so the lock
+// keeps growing with the file instead of pinning the current length.
+//
+// These route through VFS rather than calling the table directly, because
+// VFS is what remembers that a handle holds locks (h.locks/h.ofdOwner) and
+// therefore what releases them at FLUSH and RELEASE. Reaching past it into the
+// table leaves that bookkeeping empty, and the close-time release never runs.
 func (e *engineHandle) GetLk(ctx context.Context, lk fs.FileLock) (fs.FileLock, error) {
 	start, end := fuseRangeToLock(lk.Start, lk.End)
-	typ, gotStart, gotEnd, pid, errno := e.plane.opts.Engine.Bridge.locks.Getlk(e.ino, lk.Owner, lk.Type, start, end)
-	if errno != 0 {
+	typ, pid := lk.Type, lk.Pid
+	if errno := e.plane.opts.Engine.VFS.Getlk(e.vctx, e.ino, e.fh, lk.Owner, &start, &end, &typ, &pid); errno != 0 {
 		return fs.FileLock{}, errno
 	}
 	out := lk
 	out.Type = typ
-	out.Start = int64(gotStart)
-	out.End = lockRangeToFuseEnd(gotEnd)
+	out.Start = int64(start)
+	out.End = lockRangeToFuseEnd(end)
 	if typ == syscall.F_UNLCK {
 		out.Pid = 0
 	} else {
@@ -839,13 +945,13 @@ func (e *engineHandle) GetLk(ctx context.Context, lk fs.FileLock) (fs.FileLock, 
 
 func (e *engineHandle) SetLk(ctx context.Context, lk fs.FileLock, blocking bool) error {
 	if lk.Flock {
-		if errno := e.plane.opts.Engine.Bridge.locks.Flock(e.ino, lk.Owner, lk.Type, blocking); errno != 0 {
+		if errno := e.plane.opts.Engine.VFS.Flock(e.vctx, e.ino, e.fh, lk.Owner, lk.Type, blocking); errno != 0 {
 			return errno
 		}
 		return nil
 	}
 	start, end := fuseRangeToLock(lk.Start, lk.End)
-	if errno := e.plane.opts.Engine.Bridge.locks.Setlk(e.ino, lk.Owner, lk.Pid, lk.Type, start, end, blocking); errno != 0 {
+	if errno := e.plane.opts.Engine.VFS.Setlk(e.vctx, e.ino, e.fh, lk.Owner, start, end, lk.Type, lk.Pid, blocking); errno != 0 {
 		return errno
 	}
 	return nil
@@ -918,7 +1024,18 @@ func (e *engineHandle) Sync(ctx context.Context) error {
 }
 
 func (e *engineHandle) Flush(ctx context.Context) error {
-	if errno := e.plane.opts.Engine.VFS.Flush(e.vctx, e.ino, e.fh, 0); errno != 0 {
+	// The lock owner MUST be passed: VFS.Flush is where JuiceFS drops the
+	// closing descriptor's POSIX record locks (it calls Meta.Setlk with
+	// F_UNLCK for that owner). Passing 0 — as this call used to — releases
+	// owner 0, which holds nothing, so every lock outlived its descriptor.
+	//
+	// The mount negotiates FUSE_POSIX_LOCKS, so the kernel keeps no lock state
+	// here and never sends a close-time F_UNLCK: this is the only place the
+	// lock can die. A leaked lock starves SQLite's multi-process protocol —
+	// one closed or crashed writer's RESERVED keeps the next writer's
+	// EXCLUSIVE and hot-journal recovery waiting until the timeout kills the
+	// workload.
+	if errno := e.plane.opts.Engine.VFS.Flush(e.vctx, e.ino, e.fh, fs.FlushOwnerOf(ctx)); errno != 0 {
 		return errno
 	}
 	return e.plane.opts.Engine.FlushFile(ctx, uint64(e.ino))
