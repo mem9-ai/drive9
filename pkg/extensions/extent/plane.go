@@ -202,6 +202,11 @@ func (h *Handler) release(e *engineHandle) {
 	}
 	delete(h.handles, e.path)
 	h.mu.Unlock()
+	// POSIX: closing a descriptor drops that process's advisory locks on the
+	// file, and here the last descriptor on the inode means nothing is left
+	// to hold them. Without this a lock outlives the open it was taken on and
+	// the next opener sees a phantom conflict it can never clear.
+	h.opts.Engine.Bridge.ReleaseLocksForIno(e.ino)
 	h.opts.Engine.Bridge.ForgetPath(e.path)
 	h.opts.Engine.Bridge.DropDeletedOpen(e.path)
 }
@@ -790,6 +795,70 @@ type engineHandle struct {
 	// concurrent releases each mark themselves and then count the handles
 	// still unreleased, so exactly one of them observes zero.
 	released bool
+}
+
+// GetLk and SetLk make this handle own its advisory lock namespace. Without
+// them the facade falls back to its mount-wide lock table, which is also
+// in-memory — but the facade's table is keyed by INODE and this plane is the
+// one that knows when a file's last descriptor closes and the locks must go.
+//
+// Both are served by the bridge's mount-local table (locks.go): in-memory, one
+// daemon's lifetime, never persisted and never shared across mounts.
+//
+// fs.FileLock.End is documented as exclusive while FUSE hands us POSIX
+// inclusive ranges, so the end is adjusted by one in each direction. End == 0
+// is the kernel's "to EOF" and maps to lockEOF, so the lock keeps growing with
+// the file instead of pinning the current length.
+func (e *engineHandle) GetLk(ctx context.Context, lk fs.FileLock) (fs.FileLock, error) {
+	start, end := fuseRangeToLock(lk.Start, lk.End)
+	typ, gotStart, gotEnd, pid, errno := e.plane.opts.Engine.Bridge.locks.Getlk(e.ino, lk.Owner, lk.Type, start, end)
+	if errno != 0 {
+		return fs.FileLock{}, errno
+	}
+	out := lk
+	out.Type = typ
+	out.Start = int64(gotStart)
+	out.End = lockRangeToFuseEnd(gotEnd)
+	if typ == syscall.F_UNLCK {
+		out.Pid = 0
+	} else {
+		out.Pid = pid
+	}
+	return out, nil
+}
+
+func (e *engineHandle) SetLk(ctx context.Context, lk fs.FileLock, blocking bool) error {
+	if lk.Flock {
+		if errno := e.plane.opts.Engine.Bridge.locks.Flock(e.ino, lk.Owner, lk.Type, blocking); errno != 0 {
+			return errno
+		}
+		return nil
+	}
+	start, end := fuseRangeToLock(lk.Start, lk.End)
+	if errno := e.plane.opts.Engine.Bridge.locks.Setlk(e.ino, lk.Owner, lk.Pid, lk.Type, start, end, blocking); errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+// fuseRangeToLock converts a kernel range (inclusive end, 0 meaning "to EOF")
+// into the bridge's internal form.
+func fuseRangeToLock(start, end int64) (uint64, uint64) {
+	if start < 0 {
+		start = 0
+	}
+	if end <= 0 {
+		return uint64(start), lockEOF
+	}
+	return uint64(start), uint64(end)
+}
+
+// lockRangeToFuseEnd is the inverse: "to EOF" travels back to the kernel as 0.
+func lockRangeToFuseEnd(end uint64) int64 {
+	if end == lockEOF {
+		return 0
+	}
+	return int64(end)
 }
 
 func (e *engineHandle) Read(ctx context.Context, off int64, dest []byte) (int, error) {

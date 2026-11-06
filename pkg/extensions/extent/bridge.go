@@ -116,6 +116,10 @@ type Bridge struct {
 	commitMu    sync.Mutex
 	commitLocks map[meta.Ino]*sync.Mutex
 
+	// locks is the mount-local advisory lock table (POSIX byte ranges and
+	// BSD flock). In-memory and mount-scoped on purpose: see locks.go.
+	locks *lockTable
+
 	// paths caches inode → remote path; inode values are content-stable
 	// hashes of the path so lookups survive restarts of the bridge.
 	paths   map[meta.Ino]string
@@ -184,6 +188,7 @@ func NewBridge(cfg Config) *Bridge {
 		moved:           make(map[meta.Ino]string),
 		replacements:    make(map[string]meta.Ino),
 		commitLocks:     make(map[meta.Ino]*sync.Mutex),
+		locks:           newLockTable(),
 		classicOwned:    make(map[meta.Ino]bool),
 		layoutPending:   make(map[meta.Ino]bool),
 		layoutPendingID: make(map[meta.Ino]string),

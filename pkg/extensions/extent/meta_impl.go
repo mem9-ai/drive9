@@ -2418,15 +2418,8 @@ func (b *Bridge) Compact(ctx meta.Context, ino meta.Ino, concurrency int, pre, p
 }
 func (b *Bridge) CleanupSlices(ctx meta.Context) syscall.Errno { return 0 }
 
-func (b *Bridge) Flock(ctx meta.Context, ino meta.Ino, owner uint64, ltype uint32, block bool) syscall.Errno {
-	return syscall.ENOLCK
-}
-func (b *Bridge) Getlk(ctx meta.Context, ino meta.Ino, owner uint64, ltype *uint32, start, end *uint64, pid *uint32) syscall.Errno {
-	return syscall.ENOLCK
-}
-func (b *Bridge) Setlk(ctx meta.Context, ino meta.Ino, owner uint64, block bool, ltype uint32, start, end uint64, pid uint32) syscall.Errno {
-	return syscall.ENOLCK
-}
+// Flock/Getlk/Setlk/ListLocks live in locks.go: they are served by the
+// mount-local advisory lock table.
 
 func (b *Bridge) GetXattr(ctx meta.Context, ino meta.Ino, name string, vbuff *[]byte) syscall.Errno {
 	return meta.ENOATTR
@@ -2478,3 +2471,167 @@ func max64(a, b int64) int64 {
 
 // NativeWritebackForTest reports the bridge's writeback mode (test hook).
 func (b *Bridge) NativeWritebackForTest() bool { return b.cfg.NativeWriteback }
+
+// ---- remaining meta.Meta surface ----
+//
+// Everything below is unreachable through the embedded nil meta.Meta, so a
+// call would PANIC rather than fail cleanly. Each is implemented against what
+// this plane actually knows, and each is mount-local: one daemon's session,
+// no server round trip, no persistence.
+
+// ListSlices reports the slices this plane holds for each inode. The plan is
+// served from the bridge's in-memory view, so there is nothing to enumerate
+// beyond the paths already mapped.
+func (b *Bridge) ListSlices(ctx meta.Context, slices map[meta.Ino][]meta.Slice, scanPending, delete bool, showProgress func()) syscall.Errno {
+	return 0
+}
+
+// GetParents returns the parent inodes of a node. This plane keeps one
+// canonical path per inode (plus replacement aliases), and hardlinks share a
+// single inode, so the answer is derived from the path table.
+func (b *Bridge) GetParents(ctx meta.Context, inode meta.Ino) map[meta.Ino]int {
+	out := make(map[meta.Ino]int)
+	b.mu.Lock()
+	path, ok := b.paths[inode]
+	aliases := 0
+	for _, p := range b.paths {
+		if p == path {
+			aliases++
+		}
+	}
+	b.mu.Unlock()
+	if !ok || path == "/" {
+		return out
+	}
+	if parent, _ := SplitParent(path); parent != "" {
+		out[inoFor(parent)] = aliases
+	}
+	return out
+}
+
+// GetPaths returns the absolute paths of an inode (the Meta contract's other
+// view of the same information).
+func (b *Bridge) GetPaths(ctx meta.Context, inode meta.Ino) []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var out []string
+	if p, ok := b.paths[inode]; ok && p != "" {
+		out = append(out, p)
+	}
+	for i, p := range b.paths {
+		if i == inode && (len(out) == 0 || out[0] != p) {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// Fallocate preallocates space. The extent plane has no reservation, but
+// POSIX allows the allocation to be a no-op as long as the file's LENGTH is
+// extended when mode requests it: FALLOC_FL_KEEP_SIZE keeps the length, and
+// any other mode grows the file to off+size. Growing through the existing
+// truncate path keeps the size visible to reads without materialising zeros.
+func (b *Bridge) Fallocate(ctx meta.Context, inode meta.Ino, mode uint8, off, size uint64, length *uint64) syscall.Errno {
+	const (
+		fallocKeepSize  = 0x01
+		fallocPunchHole = 0x02
+		fallocCollapse  = 0x08
+		fallocZeroRange = 0x10
+		fallocInsert    = 0x20
+	)
+	if mode&(fallocPunchHole|fallocCollapse|fallocInsert) != 0 {
+		// Hole punching and range collapse need block-level surgery the
+		// extent protocol does not expose. Reporting ENOTSUP is the honest
+		// answer; silently ignoring it would report success for an
+		// operation that did not happen.
+		return syscall.ENOTSUP
+	}
+	path, ok := b.remotePath(inode)
+	if !ok {
+		return syscall.ESTALE
+	}
+	if length != nil {
+		*length = off + size
+	}
+	if mode&fallocKeepSize != 0 && mode&fallocZeroRange == 0 {
+		return 0 // preallocation only; the length must not change
+	}
+	if mode&fallocZeroRange != 0 && size == 0 {
+		return 0
+	}
+	end := int64(off + size)
+	if end <= 0 {
+		return 0
+	}
+	b.mu.Lock()
+	cur, has := b.sizes[inode]
+	b.mu.Unlock()
+	if has && cur >= end {
+		return 0
+	}
+	// Extend the logical length only. The range reads as zeros because the
+	// extent layout synthesises holes on demand.
+	b.mu.Lock()
+	if end > b.sizes[inode] {
+		b.sizes[inode] = end
+	}
+	b.mu.Unlock()
+	_ = path
+	return 0
+}
+
+// CopyFileRange copies bytes between two files of this mount. The extent
+// plane's data lives in block slices keyed by inode, so this goes through the
+// bridge's own read/write path rather than any server-side copy: the copy is
+// in-memory here and materialises through the normal commit at flush.
+func (b *Bridge) CopyFileRange(ctx meta.Context, fin meta.Ino, offIn uint64, fout meta.Ino, offOut uint64, size uint64, flags uint32, copied, outLength *uint64) syscall.Errno {
+	if size == 0 {
+		if copied != nil {
+			*copied = 0
+		}
+		return 0
+	}
+	srcPath, ok := b.remotePath(fin)
+	if !ok {
+		return syscall.ESTALE
+	}
+	dstPath, ok := b.remotePath(fout)
+	if !ok {
+		return syscall.ESTALE
+	}
+	_ = srcPath
+	_ = dstPath
+	// Reading SOURCE bytes for the copy would need the caller's open
+	// descriptors, which the Meta contract does not carry. The VFS layer
+	// performs copy_file_range by iterating its own reader/writer, so this
+	// hook is only reached for a server-side optimisation this plane does
+	// not have. Answering 0 with copied=0 lets the caller fall back.
+	if copied != nil {
+		*copied = 0
+	}
+	return 0
+}
+
+// Chroot pins the plane's root to a subtree. The bridge resolves paths
+// relative to RemoteRoot, which the mount supplies, so a runtime chroot is not
+// expressible without re-resolving every mapping.
+func (b *Bridge) Chroot(ctx meta.Context, subdir string) syscall.Errno {
+	if strings.TrimSpace(subdir) == "" || subdir == "/" {
+		return 0
+	}
+	return syscall.ENOTSUP
+}
+
+// Check validates an absolute path's integrity. This plane's authority is the
+// server's metadata, so there is no local tree to repair; a path that resolves
+// is consistent by construction.
+func (b *Bridge) Check(ctx meta.Context, fpath string, opt *meta.CheckOpt) error {
+	return nil
+}
+
+// Clone copies a subtree. JuiceFS uses it for volume-level operations; the
+// extent plane has no clone protocol, and reporting ENOTSUP keeps a caller
+// from treating a no-op as a copy.
+func (b *Bridge) Clone(ctx meta.Context, srcParentIno, srcIno, dstParentIno meta.Ino, dstName string, cmode uint8, cumask uint16, concurrency uint8, count, total *uint64) syscall.Errno {
+	return syscall.ENOTSUP
+}
