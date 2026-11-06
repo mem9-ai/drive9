@@ -535,7 +535,7 @@ func New(opts Options) (*Writeback, error) {
 		up.OnSuccess = func(meta staging.WriteBackMeta, committedRev int64, gens StagingGens) {
 			unlock := w.pathLocks.lock(meta.Path)
 			defer unlock()
-			w.acknowledgeUploadedCreate(meta.Path, committedRev, meta.Generation)
+			w.acknowledgeUploadedCreate(meta.Path, committedRev, meta.Generation, meta.Generation)
 			if meta.Kind == staging.PendingChmod {
 				return
 			}
@@ -599,7 +599,10 @@ func New(opts Options) (*Writeback, error) {
 					w.wbCache.RemoveIfGeneration(entry.Path, gen)
 				}
 			}
-			w.acknowledgeUploadedCreate(entry.Path, committedRev, entry.PendingIndexGen)
+			// Queue entries carry PendingIndexGen, a generation space separate from
+			// the .dat/.meta cache; only use it for live-handle lineage, never
+			// to rebase a cache entry that merely shares the number.
+			w.acknowledgeUploadedCreate(entry.Path, committedRev, entry.PendingIndexGen, 0)
 			if w.opts.Policy == PolicyWriteSync || w.opts.Policy == PolicyCloseSync {
 				w.armBypass(entry.Path, committedRev, entry.Size, "sync-commit")
 			}
@@ -3594,7 +3597,7 @@ func (h *bufferingHandle) checkoutDropCleanBuffer() {
 	h.buf = nil
 }
 
-func (w *Writeback) acknowledgeUploadedCreate(path string, rev int64, generation uint64) {
+func (w *Writeback) acknowledgeUploadedCreate(path string, rev int64, generation, cacheGeneration uint64) {
 	// Retire the name claim and, for an append opener composed over this
 	// generation, advance its CAS base. A pending-overwrite opener captured
 	// BaseRev R while the upload was in flight; leaving it at R stages its
@@ -3633,15 +3636,15 @@ func (w *Writeback) acknowledgeUploadedCreate(path string, rev int64, generation
 		if err := w.wbCache.RebasePendingNew(path, rev); err != nil {
 			safeLogPrintf("writeback: rebase pending create %s on revision %d: %v", path, rev, err)
 		}
-		if generation != 0 && rev > 0 {
+		if cacheGeneration != 0 && rev > 0 {
 			if meta, ok := w.wbCache.GetMeta(path); ok && meta != nil {
 				switch {
-				case meta.Generation == generation:
+				case meta.Generation == cacheGeneration:
 					// The uploaded entry can still be present while the
 					// uploader applies its deferred mode. Keep its retry
 					// base on the revision it just published.
-					_ = w.wbCache.RebaseBaseRevIfGeneration(path, generation, rev)
-				case meta.SupersedesPendingGen == generation:
+					_ = w.wbCache.RebaseBaseRevIfGeneration(path, cacheGeneration, rev)
+				case meta.SupersedesPendingGen == cacheGeneration:
 					// A newer staged image derives from the just-published
 					// revision; move its CAS base so it does not conflict
 					// with this mount's own landing.

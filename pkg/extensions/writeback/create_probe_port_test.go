@@ -271,7 +271,7 @@ func TestPortPendingOverwriteAppendAdoptsUploadRevision(t *testing.T) {
 	if h.baseRev != 1 || h.supersededPendingGen != gen {
 		t.Fatalf("before ack: baseRev=%d gen=%d, want 1/%d", h.baseRev, h.supersededPendingGen, gen)
 	}
-	wb.acknowledgeUploadedCreate("/f", 2, gen)
+	wb.acknowledgeUploadedCreate("/f", 2, gen, gen)
 	h.mu.Lock()
 	baseRev, supersedes := h.baseRev, h.supersededPendingGen
 	h.mu.Unlock()
@@ -322,7 +322,7 @@ func TestPortPendingOverwriteAppendRebasesNewerStage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wb.acknowledgeUploadedCreate("/f", 2, gen1)
+	wb.acknowledgeUploadedCreate("/f", 2, gen1, gen1)
 	if meta, ok := wbcache.GetMeta("/f"); !ok || meta.BaseRev != 2 {
 		t.Fatalf("newer staged meta after ack = %+v ok=%v, want base 2", meta, ok)
 	}
