@@ -56,6 +56,23 @@ func TestLinkAfterExtentCreatePublishesTheSource(t *testing.T) {
 			if !visibleDuringLink {
 				t.Fatal("the source name is still unpublished when the hardlink runs: the server answers ENOENT")
 			}
+			// Publishing the NAME is not enough: the linked object must carry
+			// the bytes too. A flush that stops at the bridge's pending list
+			// leaves the JuiceFS writer's buffer (and the new length) behind,
+			// so the source materializes as an EMPTY file and the alias reads
+			// EOF despite the successful write.
+			if tc.write > 0 {
+				f.mu.Lock()
+				got := f.extent["/d/a.bin"]
+				if got == "" {
+					got = f.classic["/d/a.bin"]
+				}
+				f.mu.Unlock()
+				if len(got) != tc.write {
+					t.Fatalf("source published %d bytes at link time, want %d: the writer buffer was not flushed",
+						len(got), tc.write)
+				}
+			}
 		})
 	}
 }

@@ -142,3 +142,88 @@ func TestMigrationPublishesDeferredMode(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 }
+
+// A chmod issued AFTER the migration must still reach the remote. The
+// descriptor stays registered here, so a mode-only SetAttr used to park the
+// value in pendingMode and return success — but this plane has no publication
+// boundary for a migrated descriptor, so nothing ever sent it.
+func TestChmodAfterMigrationReachesRemote(t *testing.T) {
+	srv := newMigrationServer(t)
+	ch, wb, _ := newMigratingStack(t, srv)
+	ctx := context.Background()
+
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/late.bin", Flags: syscall.O_RDWR | syscall.O_CREAT, Mode: 0o644, HasMode: true, Caller: fs.Caller{Pid: 1}})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	h := res.Handle.(*bufferingHandle)
+	if err := h.Write(ctx, 0, make([]byte, 1<<20)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := h.Flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if wb.queue != nil {
+		if err := wb.queue.WaitPathOutcome("/late.bin", 10*time.Second); err != nil {
+			t.Fatalf("wait for landing: %v", err)
+		}
+	}
+	waitMigrated(t, h)
+
+	// The chmod arrives AFTER the migration.
+	if _, err := ch.Dispatch(ctx, &fs.Op{
+		Kind: fs.OpSetAttr, Path: "/late.bin", Mode: 0o600, HasMode: true,
+		Handle: res.Handle, Caller: fs.Caller{Pid: 1},
+	}); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	srv.mu.Lock()
+	mode := srv.lastChmod
+	srv.mu.Unlock()
+	if mode != 0o600 {
+		t.Fatalf("remote mode after a post-migration chmod = %o, want 600: the value was acknowledged and dropped", mode)
+	}
+}
+
+// The failed-adoption branch must not hold the writeback path lock while the
+// engine handle is released: that Release takes the EXTENT path lock, which is
+// the other edge of the rename cycle.
+func TestRejectedAdoptionReleasesOutsideThePathLock(t *testing.T) {
+	srv := newMigrationServer(t)
+	ch, wb, _ := newMigratingStack(t, srv)
+	ctx := context.Background()
+
+	res, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/rej.bin", Flags: syscall.O_RDWR | syscall.O_CREAT, Mode: 0o644, HasMode: true, Caller: fs.Caller{Pid: 1}})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	h := res.Handle.(*bufferingHandle)
+	if err := h.Write(ctx, 0, make([]byte, 1<<20)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := h.Flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	// Dirty the buffer so adoption rejects, forcing the declined-handle
+	// release path.
+	if err := h.Write(ctx, 2048, []byte("dirty-during-migration")); err != nil {
+		t.Fatalf("dirty write: %v", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if wb.queue != nil {
+			_ = wb.queue.WaitPathOutcome("/rej.bin", 10*time.Second)
+		}
+		// Take the writeback path lock: with the release inside it, this would
+		// block behind the engine release and (in the rename shape) deadlock.
+		unlock := wb.pathLocks.lock("/rej.bin")
+		unlock()
+	}()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the declined-handle release blocked while holding the path lock")
+	}
+	_ = h.Release(ctx)
+}

@@ -564,10 +564,21 @@ func (h *Handler) linkAfterLanding(ctx context.Context, op *fs.Op, next fs.Next)
 		unlock()
 		return fs.Result{}, nil, false
 	}
-	// Land every descriptor on the source: the link must resolve a name the
-	// server can see, and the engine materializes an EMPTY file's name only
-	// at the last close (FlushFileFinal).
+	// Land every descriptor on the source, in TWO steps:
+	//
+	//  1. VFS.Flush pushes the JuiceFS writer's buffered bytes down to the
+	//     bridge. Without it the bytes (and the new length) can still live
+	//     only in the community writer: the bridge then sees size 0 and no
+	//     pending slice, materializes an EMPTY classic source, and the new
+	//     alias reads EOF despite the successful write that preceded it.
+	//  2. FlushFile publishes what the bridge now holds, and MaterializeEmpty
+	//     gives a genuinely empty file its name (the engine materializes an
+	//     empty name only at the last close).
 	for _, e := range list {
+		if errno := h.opts.Engine.VFS.Flush(e.vctx, e.ino, e.fh, 0); errno != 0 {
+			unlock()
+			return fs.Result{}, errno, true
+		}
 		if err := h.opts.Engine.FlushFile(ctx, uint64(e.ino)); err != nil {
 			unlock()
 			return fs.Result{}, err, true

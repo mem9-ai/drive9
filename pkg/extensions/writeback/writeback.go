@@ -2018,6 +2018,21 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			}
 			if h != nil {
 				h.mu.Lock()
+				// A MIGRATED descriptor has no publication boundary left on
+				// this plane: Sync/Flush/Release all delegate to the engine,
+				// so a value parked in pendingMode would be acknowledged and
+				// then dropped. Apply it to the remote right here instead —
+				// the engine holds the bytes and the name already exists.
+				migrated := h.extent != nil
+				h.mu.Unlock()
+				if migrated {
+					if err := w.applyDeferredMode(ctx, h, op.Mode&0o7777); err != nil {
+						return fs.Result{}, err
+					}
+					w.invalidate(op.Path, 0)
+					return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Mode: op.Mode & 0o7777, Size: h.sizeForAttr()}}, nil
+				}
+				h.mu.Lock()
 				h.pendingMode = op.Mode & 0o7777
 				h.hasPendingMode = true
 				size := h.baseSize
@@ -2273,34 +2288,49 @@ func (w *Writeback) migrateHandleToExtent(h *bufferingHandle, path, landedID str
 	// Lock order: writeback path lock, then whatever the engine takes
 	// internally — never the reverse.
 	unlock := w.pathLocks.lock(path)
-	defer unlock()
+	declined := w.adoptExtentLocked(h, path, landedID, committedRev)
+	unlock()
+	// The engine handle is released only AFTER the writeback path lock is
+	// gone. Its Release takes the EXTENT path lock, and holding the
+	// writeback lock across that wait recreates the cycle this ordering
+	// exists to avoid: rename holds the extent lock and waits for the
+	// writeback lock while it flushes this very writer.
+	if declined != nil {
+		_ = declined.Release(context.Background())
+	}
+}
+
+// adoptExtentLocked is the migration body. The caller holds the writeback
+// path lock. It returns an engine handle that must be released OUTSIDE that
+// lock (the caller did not adopt it).
+func (w *Writeback) adoptExtentLocked(h *bufferingHandle, path, landedID string, committedRev int64) fs.Handle {
 	// Cheap gate before taking any heavier state: only a promotion-sized
 	// image at a routed path can be extent.
 	if !h.extentRoutesImage() {
 		w.logMigrationRefusal(path, "path or size not routed to extent")
-		return
+		return nil
 	}
 	h.mu.Lock()
 	switch {
 	case h.extent != nil:
 		h.mu.Unlock()
-		return // already migrated: nothing to report
+		return nil // already migrated: nothing to report
 	case h.unlinked:
 		h.mu.Unlock()
 		w.logMigrationRefusal(path, "descriptor unlinked")
-		return
+		return nil
 	case h.releasing:
 		h.mu.Unlock()
 		w.logMigrationRefusal(path, "descriptor releasing")
-		return
+		return nil
 	case h.pendingImage != nil || h.pendingFile != nil:
 		h.mu.Unlock()
 		w.logMigrationRefusal(path, "descriptor still has a pending snapshot")
-		return
+		return nil
 	case !h.landed:
 		h.mu.Unlock()
 		w.logMigrationRefusal(path, "landing not recorded on the handle yet")
-		return
+		return nil
 	}
 	// Local bytes the remote does not hold must not be dropped by the swap.
 	// ContentVersion covers writes that landed during the upload; dirty
@@ -2308,7 +2338,7 @@ func (w *Writeback) migrateHandleToExtent(h *bufferingHandle, path, landedID str
 	if h.dirty || (h.buf != nil && h.buf.ContentVersion() != h.stagedContentVersion) {
 		h.mu.Unlock()
 		w.logMigrationRefusal(path, "buffer holds bytes the landing did not carry")
-		return
+		return nil
 	}
 	flags, callerIno := h.flags, h.ino
 	h.mu.Unlock()
@@ -2318,18 +2348,19 @@ func (w *Writeback) migrateHandleToExtent(h *bufferingHandle, path, landedID str
 		context.Background(), path, flags, landedID, committedRev, fs.Caller{})
 	if err != nil {
 		w.logMigrationRefusal(path, fmt.Sprintf("opening an engine handle failed: %v", err))
-		return
+		return nil
 	}
 	if !ok {
 		// Not extent (an existing classic target is never converted), a
 		// replacement took the name, or the open failed: keep this plane's
 		// buffering. A later landing retries.
 		w.logMigrationRefusal(path, "engine declined: layout not extent, or the name now holds another object")
-		return
+		return nil
 	}
 	if !w.adoptExtentHandle(h, handle) {
-		_ = handle.Release(context.Background())
+		return handle
 	}
+	return nil
 }
 
 // adoptExtentHandle installs e as the handle's data plane and drops the
@@ -6947,4 +6978,15 @@ func (w *Writeback) lockRenamePaths(a, b string) func() {
 		u2()
 		u1()
 	}
+}
+
+// sizeForAttr reports the handle's current logical size for an attribute
+// reply.
+func (h *bufferingHandle) sizeForAttr() int64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.buf != nil {
+		return h.buf.Size()
+	}
+	return h.baseSize
 }
