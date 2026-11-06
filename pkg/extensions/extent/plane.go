@@ -509,53 +509,63 @@ func (h *Handler) tryClaimOpen(ctx context.Context, op *fs.Op) (fs.Result, error
 	// replaced while this claim waited, and a classic replacement must
 	// pass through to the classic plane, never ride the engine.
 	defer h.lockPaths(op.Path)()
-	st, err := h.opts.Engine.Bridge.StatLocal(ctx, op.Path)
-	if err == nil {
-		if st.ContentLayout != client.ContentLayoutExtent {
+	// A kernel CREATE already resolved the name as missing. Its fresh
+	// path does not need a remote StatLocal: that HEAD is the per-file
+	// latency that made bulk small-file creation (unzip, git) slow.
+	// O_EXCL keeps the probe because it needs server-side arbitration.
+	freshKernelCreate := op.KernelCreate() && op.Flags&uint32(syscall.O_CREAT) != 0 &&
+		op.Flags&uint32(syscall.O_EXCL) == 0
+	if !freshKernelCreate {
+		st, err := h.opts.Engine.Bridge.StatLocal(ctx, op.Path)
+		if err == nil {
+			if st.ContentLayout != client.ContentLayoutExtent {
+				return fs.Result{}, nil, false
+			}
+			handle, attr, errno := h.openExistingLocked(ctx, op.Path, op.Flags, op.Caller)
+			if errno != 0 {
+				return fs.Result{}, errno, true
+			}
+			return fs.Result{Handle: handle, Attr: attr}, nil, true
+		}
+		if !client.IsNotFound(err) {
 			return fs.Result{}, nil, false
 		}
-		handle, attr, errno := h.openExistingLocked(ctx, op.Path, op.Flags, op.Caller)
-		if errno != 0 {
-			return fs.Result{}, errno, true
-		}
-		return fs.Result{Handle: handle, Attr: attr}, nil, true
-	}
-	if !client.IsNotFound(err) {
-		return fs.Result{}, nil, false
 	}
 	// A file that exists ONLY in the bridge (a fresh engine create whose
 	// remote materialization is pending) opens through the engine even
 	// without O_CREAT — the classic plane would answer ENOENT for a
 	// successfully created, still-open file.
-	if ino, local := h.opts.Engine.Bridge.LocalResolve(op.Path); local {
-		if op.Flags&syscall.O_CREAT != 0 && op.Flags&syscall.O_EXCL != 0 {
-			// The folded OpCreate contract includes create/open flags: an
-			// exclusive create of an existing (still-local) file is EEXIST.
-			return fs.Result{}, syscall.EEXIST, true
-		}
-		if op.Flags&syscall.O_TRUNC != 0 {
-			if errno := h.opts.Engine.VFS.Truncate(vfsCtx(op.Caller), ino, 0, 0, nil); errno != 0 {
+	if !freshKernelCreate {
+		if ino, local := h.opts.Engine.Bridge.LocalResolve(op.Path); local {
+			if op.Flags&syscall.O_CREAT != 0 && op.Flags&syscall.O_EXCL != 0 {
+				// The folded OpCreate contract includes create/open flags: an
+				// exclusive create of an existing (still-local) file is EEXIST.
+				return fs.Result{}, syscall.EEXIST, true
+			}
+			if op.Flags&syscall.O_TRUNC != 0 {
+				if errno := h.opts.Engine.VFS.Truncate(vfsCtx(op.Caller), ino, 0, 0, nil); errno != 0 {
+					return fs.Result{}, errno, true
+				}
+				if err := h.opts.Engine.Bridge.TruncateLocal(ctx, op.Path, 0); err != nil {
+					return fs.Result{}, err, true
+				}
+			}
+			_, fh, errno := h.opts.Engine.VFS.Open(vfsCtx(op.Caller), ino, op.Flags)
+			if errno != 0 {
 				return fs.Result{}, errno, true
 			}
-			if err := h.opts.Engine.Bridge.TruncateLocal(ctx, op.Path, 0); err != nil {
-				return fs.Result{}, err, true
+			handle := h.register(op.Path, uint64(ino), fh, op.Caller)
+			attr := &fs.Attr{Kind: fs.KindFile, Nlink: 1}
+			if size, mode, ok := h.opts.Engine.Bridge.LocalView(ino); ok {
+				attr.Size = size
+				attr.Mode = mode
 			}
+			// The revision is the compare-and-set base for later writes.
+			if st, serr := h.opts.Engine.Bridge.StatLocal(ctx, op.Path); serr == nil {
+				attr.Rev = st.Revision
+			}
+			return fs.Result{Handle: handle, Attr: attr}, nil, true
 		}
-		_, fh, errno := h.opts.Engine.VFS.Open(vfsCtx(op.Caller), ino, op.Flags)
-		if errno != 0 {
-			return fs.Result{}, errno, true
-		}
-		handle := h.register(op.Path, uint64(ino), fh, op.Caller)
-		attr := &fs.Attr{Kind: fs.KindFile, Nlink: 1}
-		if size, mode, ok := h.opts.Engine.Bridge.LocalView(ino); ok {
-			attr.Size = size
-			attr.Mode = mode
-		}
-		// The revision is the compare-and-set base for later writes.
-		if st, serr := h.opts.Engine.Bridge.StatLocal(ctx, op.Path); serr == nil {
-			attr.Rev = st.Revision
-		}
-		return fs.Result{Handle: handle, Attr: attr}, nil, true
 	}
 	// Fresh path: claim creates in full JuiceJS mode, or when the path
 	// matches an explicit --extent / [extent] pattern; otherwise creation
