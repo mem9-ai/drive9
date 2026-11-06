@@ -1272,8 +1272,11 @@ func (c *Core) truncateRemoteToZero(ctx context.Context, rp string, st *client.S
 	for attempt := 0; attempt < 3; attempt++ {
 		if rev <= 0 {
 			fresh, serr := c.remoteStatDetached(rp)
-			if serr != nil || fresh == nil {
+			if serr != nil {
 				return c.mapErr(serr)
+			}
+			if fresh == nil {
+				return fs.StatusErrorOf(gofuse.Status(syscall.EIO))
 			}
 			rev = fresh.Revision
 		}
@@ -1288,8 +1291,11 @@ func (c *Core) truncateRemoteToZero(ctx context.Context, rp string, st *client.S
 			return c.mapErr(err)
 		}
 		fresh, serr := c.remoteStatDetached(rp)
-		if serr != nil || fresh == nil {
+		if serr != nil {
 			return c.mapErr(serr)
+		}
+		if fresh == nil {
+			return fs.StatusErrorOf(gofuse.Status(syscall.EIO))
 		}
 		rev = fresh.Revision
 	}
