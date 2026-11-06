@@ -88,7 +88,7 @@ Directories are never extent objects. Patterns are matched against the **basenam
 
 | Profile | Contents | Use |
 |---|---|---|
-| `coding-agent` (default) | `[local]` overlay patterns (`node_modules`, `.venv`), gitignore-aware `[local-gitignore-aware]` patterns (`target`), workspace-routed `.git`, `[append-log] **/*-wal`, and `[extent]` for SQLite's file family (see below) | agent workspaces on a normal drive9 tree |
+| `coding-agent` (default) | `[local]` overlay patterns (`node_modules`, `.venv`), gitignore-aware `[local-gitignore-aware]` patterns (`target`), workspace-routed `.git`, and `[extent]` for SQLite's whole file family (see below; no `[append-log]`) | agent workspaces on a normal drive9 tree |
 | `coding-agent-extent` | `coding-agent` **plus** `[extent] *` | the SQLite/product gate: every file on the mount is `extent` |
 | `extent` | `[extent] *` only | a pure extent volume, no overlay rules |
 | `portable` | local-only patterns + `[pack] /` | pack/unpack archives |
@@ -110,18 +110,19 @@ file from the database's own name, and a bare `*.db` does **not** match
 `app.db-wal`:
 
 ```
-*.db            *.db-shm        *.db-journal   *.db-mj*
-*.db3           *.db3-shm       *.db3-journal  *.db3-mj*
-*.sqlite        *.sqlite-shm    *.sqlite-journal  *.sqlite-mj*
-*.sqlite3       *.sqlite3-shm   *.sqlite3-journal *.sqlite3-mj*
+*.db            *.db-wal        *.db-shm        *.db-journal   *.db-mj*
+*.db3           *.db3-wal       *.db3-shm       *.db3-journal  *.db3-mj*
+*.sqlite        *.sqlite-wal    *.sqlite-shm    *.sqlite-journal  *.sqlite-mj*
+*.sqlite3       *.sqlite3-wal   *.sqlite3-shm   *.sqlite3-journal *.sqlite3-mj*
 ```
 
-`-wal` is deliberately **not** here. The append-log plane owns it
-(`[append-log] **/*-wal`) and implements SQLite's WAL protocol —
-committed-header confirmation, salt-difference detection for generation
-resets, and the header-only rewrite path. appendlog also sits outside the
-extent plane in the chain, so it would win the claim regardless; listing `-wal`
-under `[extent]` would only be a comment that lies.
+The WAL is included on purpose: one database must not be split across two data
+planes. The default profile therefore carries **no** `[append-log]` rule. This
+matters beyond tidiness — appendlog sits OUTSIDE the extent plane in the chain
+order, so a profile-level `[append-log] **/*-wal` would win the WAL claim and
+silently pull it off the extent plane. Operations that want the append-log
+optimization pass `--append-log` explicitly or write their own profile; the
+builtin keeps every SQLite file on one plane.
 
 Patterns without a `/` match the BASENAME at any depth, so
 `~/proj/data/app.db` is covered. A whole database *directory* is deliberately

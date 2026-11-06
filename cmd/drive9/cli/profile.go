@@ -192,6 +192,11 @@ func builtinCodingAgentExtentPatterns() []string {
 		patterns = append(patterns,
 			// The database itself.
 			"*."+base,
+			// Write-ahead log. SQLite rewrites its header and cycles
+			// generations; the extent plane is where this profile puts all
+			// SQLite content, so the WAL rides it too and the file keeps one
+			// plane from first byte to last.
+			"*."+base+"-wal",
 			// Shared-memory index: no protocol of its own, so it rides the
 			// plane like the database.
 			"*."+base+"-shm",
@@ -201,14 +206,6 @@ func builtinCodingAgentExtentPatterns() []string {
 			"*."+base+"-mj*",
 		)
 	}
-	// `-wal` is deliberately ABSENT. The append-log plane owns it
-	// (`[append-log] **/*-wal`) and implements SQLite's WAL protocol:
-	// committed-header confirmation, salt-difference detection for
-	// generation resets, and a header-only rewrite path. Routing the WAL to
-	// the extent plane would take that file away from the code written for
-	// its exact wire format, and appendlog sits OUTSIDE the extent plane in
-	// the chain, so it would win the claim anyway — the entry here would be
-	// a comment that lies.
 	return patterns
 }
 
@@ -219,10 +216,13 @@ func builtinCodingAgentProfile() profileConfig {
 		LocalOnlyPatterns:           builtinCodingAgentLocalOnlyPatterns(),
 		RemoteOnlyPatterns:          nil,
 		LocalGitignoreAwarePatterns: builtinCodingAgentGitignoreAwarePatterns(),
-		AppendLogPatterns:           []string{"**/*-wal"},
-		ExtentPatterns:              builtinCodingAgentExtentPatterns(),
-		PackPaths:                   nil,
-		Builtin:                     true,
+		// No [append-log]: every SQLite file — the WAL included — is routed
+		// to the extent plane, so the profile never splits one database's
+		// files across two data planes.
+		AppendLogPatterns: nil,
+		ExtentPatterns:    builtinCodingAgentExtentPatterns(),
+		PackPaths:         nil,
+		Builtin:           true,
 	}
 }
 

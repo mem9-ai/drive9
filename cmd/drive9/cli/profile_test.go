@@ -35,10 +35,12 @@ func TestProfileAppendLogDefaults(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		// No builtin profile carries an [append-log] rule: coding-agent routes
+		// SQLite's files (the WAL included) to the extent plane, so a WAL
+		// rule here would split one database across two data planes. Users who
+		// want the append-log optimization pass --append-log or write their
+		// own profile.
 		want := "[append-log]\n# no append-log optimization paths\n"
-		if name == "" || name == "coding-agent" {
-			want = "[append-log]\n**/*-wal\n"
-		}
 		if out := formatProfileConfig(cfg); !strings.Contains(out, want) {
 			t.Fatalf("profile %q output = %q, want %q", name, out, want)
 		}
@@ -371,23 +373,20 @@ func TestBuiltinCodingAgentRoutesSQLiteToExtent(t *testing.T) {
 	// Every family member for every base suffix, so a database opened in any
 	// SQLite journal mode rides the plane from byte zero.
 	for _, base := range []string{"db", "db3", "sqlite", "sqlite3"} {
-		for _, suffix := range []string{"", "-shm", "-journal", "-mj*"} {
+		for _, suffix := range []string{"", "-wal", "-shm", "-journal", "-mj*"} {
 			want := "*." + base + suffix
 			if !has[want] {
 				t.Errorf("coding-agent [extent] is missing %q", want)
 			}
 		}
-		// `-wal` belongs to the append-log plane, which implements SQLite's
-		// WAL protocol (committed-header confirmation, salt-difference
-		// generation resets). Claiming it here would silently move the file
-		// off the code written for its wire format.
-		wal := "*." + base + "-wal"
-		if has[wal] {
-			t.Errorf("coding-agent [extent] claims %q, which the append-log plane must own", wal)
-		}
 	}
-	if len(cfg.AppendLogPatterns) == 0 {
-		t.Error("coding-agent lost its [append-log] WAL pattern")
+	// The profile routes SQLite's files to ONE plane. A leftover [append-log]
+	// rule would split a single database across two data planes — and, because
+	// appendlog sits outside the extent plane in the chain, it would win the
+	// WAL claim and silently override the [extent] entry above.
+	if len(cfg.AppendLogPatterns) != 0 {
+		t.Errorf("coding-agent still carries [append-log] %v; SQLite must stay on the extent plane",
+			cfg.AppendLogPatterns)
 	}
 	// The round trip must preserve them: a profile copied with
 	// `drive9 profile show > ~/.drive9/profiles/...` keeps the routing.

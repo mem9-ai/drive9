@@ -77,8 +77,15 @@ func TestMountProfileAppendLogCapabilities(t *testing.T) {
 			}))
 			t.Cleanup(srv.Close)
 			got := captureProfileMountOptions(t)
+			// The gate under test is the PROFILE-sourced one: an [append-log]
+			// rule from a profile is dropped when the server does not
+			// advertise append_log_v1. The builtin coding-agent profile no
+			// longer carries such a rule (SQLite's WAL rides the extent
+			// plane), so the profile is supplied explicitly here rather than
+			// through an --append-log flag, which is NOT capability-gated.
+			writeTestProfile(t, "capped", "[append-log]\n**/*-wal\n")
 			stderr, err := captureStderrE(t, func() error {
-				return MountCmd([]string{"--foreground", "--mode=fuse", "--server", srv.URL, "--api-key=sk-test", t.TempDir()})
+				return MountCmd([]string{"--foreground", "--mode=fuse", "--profile=capped", "--server", srv.URL, "--api-key=sk-test", t.TempDir()})
 			})
 			if err != nil || *got == nil {
 				t.Fatalf("mount = %v, opts = %v", err, *got)
@@ -191,9 +198,12 @@ func TestMountProfileAppendLogProbeFailures(t *testing.T) {
 				defer cancel()
 				return old(ctx, server, apiKey, token)
 			}
+			// Profile-sourced rule (the builtin no longer has one, and an
+			// explicit --append-log flag is not capability-gated).
+			writeTestProfile(t, "capped", "[append-log]\n**/*-wal\n")
 			got := captureProfileMountOptions(t)
 			stderr, err := captureStderrE(t, func() error {
-				return MountCmd([]string{"--foreground", "--mode=fuse", "--server", srv.URL, "--api-key=sk-test", t.TempDir()})
+				return MountCmd([]string{"--foreground", "--mode=fuse", "--profile=capped", "--server", srv.URL, "--api-key=sk-test", t.TempDir()})
 			})
 			if err != nil || *got == nil || len((*got).AppendLogPatterns) != 0 {
 				t.Fatalf("mount = %v, opts = %v", err, *got)
@@ -257,7 +267,9 @@ func TestMountProfileAppendLogWarningBeforeStart(t *testing.T) {
 			startMountBackground = func(mountBackgroundRequest) error { return check("legacy") }
 			startMountSupervisedBackground = func(mountSuperviseStartRequest) error { return check("background") }
 			runSuperviseForeground = func(mountSuperviseStartRequest) error { return check("supervise-foreground") }
-			args := []string{"--mode=fuse", "--server=https://unused.invalid", "--api-key=sk-test"}
+			// Profile-sourced rule: a mount cannot rely on the builtin for one.
+			writeTestProfile(t, "capped", "[append-log]\n**/*-wal\n")
+			args := []string{"--mode=fuse", "--profile=capped", "--server=https://unused.invalid", "--api-key=sk-test"}
 			switch mode {
 			case "foreground":
 				args = append(args, "--foreground")
