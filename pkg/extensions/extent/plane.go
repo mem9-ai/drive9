@@ -994,6 +994,13 @@ func (e *engineHandle) Write(ctx context.Context, off int64, data []byte) error 
 	if errno := e.plane.opts.Engine.VFS.Write(e.vctx, e.ino, data, uint64(off), e.fh); errno != 0 {
 		return errno
 	}
+	// Record the end offset immediately: these bytes are visible to the
+	// caller from now on, even though the engine has not published them yet
+	// (it buffers until a chunk fills or the file is flushed). A stat in
+	// between MUST report the grown length — POSIX grows the file on
+	// write(2), and answering "0 bytes" makes the kernel reset its own
+	// i_size and serve every following read as EOF.
+	e.plane.opts.Engine.Bridge.noteBufferedLength(e.ino, off+int64(len(data)))
 	return nil
 }
 

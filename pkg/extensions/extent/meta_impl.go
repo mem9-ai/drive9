@@ -344,6 +344,7 @@ func (b *Bridge) removeEntry(ctx meta.Context, parent meta.Ino, name string) sys
 	b.mu.Lock()
 	delete(b.paths, ino)
 	delete(b.sizes, ino)
+	delete(b.buffered, ino)
 	delete(b.revs, ino)
 	delete(b.revAt, ino)
 	delete(b.pending, ino)
@@ -1088,6 +1089,10 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 	b.mu.Unlock()
 	b.surgicalDeletePending(ino, pending)
 	b.releaseCommitted(ino, pending)
+	// The published length now covers everything this publication carried, so
+	// the buffered mark has served its purpose (anything still buffered past
+	// it came from a write after this snapshot and keeps its own mark).
+	b.clearBufferedLength(ino, size)
 	if fresh && mode != 0 && mode != 0o644 {
 		// The sequential extent create carries no mode; apply the one the
 		// creator asked for.
@@ -1624,8 +1629,40 @@ func (b *Bridge) LocalSizeOf(local string) (int64, bool) {
 	full := b.fullPath(local)
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	s, ok := b.sizes[b.liveInoLocked(full)]
+	ino := b.liveInoLocked(full)
+	s, ok := b.sizes[ino]
+	// Bytes the engine is still buffering are already part of the file's
+	// length as far as the caller is concerned (see noteBufferedLength).
+	if buf, has := b.buffered[ino]; has && buf > s {
+		return buf, true
+	}
 	return s, ok
+}
+
+// noteBufferedLength records that the engine holds bytes up to end for ino
+// without having published them. The value only grows: it is the file's
+// OBSERVABLE length, and a later stat must not report a shorter file than a
+// preceding write already established (the kernel resets i_size downward on a
+// smaller answer and serves reads as EOF).
+func (b *Bridge) noteBufferedLength(ino meta.Ino, end int64) {
+	if end <= 0 {
+		return
+	}
+	b.mu.Lock()
+	if end > b.buffered[ino] {
+		b.buffered[ino] = end
+	}
+	b.mu.Unlock()
+}
+
+// clearBufferedLength drops the buffered mark once a publication has covered
+// it. Called after a successful commit: from then on b.sizes is the truth.
+func (b *Bridge) clearBufferedLength(ino meta.Ino, published int64) {
+	b.mu.Lock()
+	if b.buffered[ino] <= published {
+		delete(b.buffered, ino)
+	}
+	b.mu.Unlock()
 }
 
 // StatLocal stats a mount-local path against RemoteRoot.
@@ -1684,6 +1721,12 @@ func (b *Bridge) LocalView(ino meta.Ino) (size int64, mode uint32, ok bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	size, ok = b.sizes[ino]
+	// Same rule as LocalSizeOf: the observable length includes bytes the
+	// engine is still buffering, or a getattr between write(2) and the
+	// publication reports a shorter file than the caller just wrote.
+	if buf, has := b.buffered[ino]; has && buf > size {
+		size, ok = buf, true
+	}
 	mode = b.modes[ino]
 	return
 }
@@ -2031,6 +2074,7 @@ func (b *Bridge) abandonIno(ino meta.Ino) {
 	delete(b.pending, ino)
 	delete(b.truncs, ino)
 	delete(b.sizes, ino)
+	delete(b.buffered, ino)
 	delete(b.paths, ino)
 	delete(b.replacements, "")
 	delete(b.classicOwned, ino)
@@ -2131,6 +2175,7 @@ func (b *Bridge) forgetInoLocked(ino meta.Ino) {
 	delete(b.classicOwned, ino)
 	delete(b.paths, ino)
 	delete(b.sizes, ino)
+	delete(b.buffered, ino)
 	delete(b.revs, ino)
 	delete(b.revAt, ino)
 	delete(b.pending, ino)

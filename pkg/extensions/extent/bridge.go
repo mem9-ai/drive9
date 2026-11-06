@@ -124,7 +124,17 @@ type Bridge struct {
 	// hashes of the path so lookups survive restarts of the bridge.
 	paths map[meta.Ino]string
 	sizes map[meta.Ino]int64 // local view of file length (fresh writes)
-	revs  map[meta.Ino]int64 // newest revision known to be published
+	// buffered is the end offset of bytes the engine's writer is holding but
+	// has not published yet. It is NOT a commit size: the engine buffers a
+	// chunk until it fills or the file is flushed, and until then nothing
+	// reaches the server. It exists because stat must already reflect those
+	// bytes — POSIX grows the file on write(2), and a stat that answers "0
+	// bytes" makes the KERNEL reset its own i_size to zero and serve every
+	// following read as EOF. SQLite writes page 1, stats, then re-reads the
+	// schema cookie; an EOF there reads as "no database" and the next
+	// statement in the same sqlite3_exec batch fails with "no such table".
+	buffered map[meta.Ino]int64
+	revs     map[meta.Ino]int64 // newest revision known to be published
 	// revAt records when THIS mount last published an inode. Only then can a
 	// read legitimately disagree with the server (replica lag); a revision
 	// recorded from someone else's write, or a publication minutes ago, gives
@@ -186,6 +196,7 @@ func NewBridge(cfg Config) *Bridge {
 		sizes:           make(map[meta.Ino]int64),
 		revs:            make(map[meta.Ino]int64),
 		revAt:           make(map[meta.Ino]time.Time),
+		buffered:        make(map[meta.Ino]int64),
 		pending:         make(map[meta.Ino][]pendingWrite),
 		truncs:          make(map[meta.Ino]int64),
 		modes:           make(map[meta.Ino]uint32),
