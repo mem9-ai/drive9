@@ -1454,7 +1454,7 @@ func (f *FS) fillEntryOut(path string, a *fs.Attr, isDir bool, out *gofuse.Entry
 		// revalidate immediately instead of trusting a cached ENOENT.
 		entryTTL = 0
 	}
-	attrTTL := f.attrTTL
+	attrTTL := f.attrTTLFor(path)
 	if attrTTL < entryTTL {
 		entryTTL = attrTTL
 	}
