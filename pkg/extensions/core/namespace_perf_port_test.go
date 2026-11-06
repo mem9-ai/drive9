@@ -174,3 +174,33 @@ func TestPortReadOnlyOpenSkipsProbe(t *testing.T) {
 		t.Fatalf("read-only open HEADs = %d, want 0", got)
 	}
 }
+
+// A just-created LocalMutation row can have Rev 0 until its create lands.
+// A writable open must re-stat in that case; otherwise an overwrite/truncate
+// stages PendingOverwrite at base 0 and the uploader rejects it as "missing
+// base revision for overwrite".
+func TestPortWritableOpenRevalidatesZeroRevisionRow(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/f", []byte("old"))
+	c, stop := newPerfCore(t, b)
+	defer stop()
+	dc := dircache.NewNamespaceCache(10*time.Second, time.Second, 1000)
+	c.Attach(dc)
+	dc.Upsert("/", fs.DirEntryInfo{
+		Name: "f", Size: 3, Rev: 0, Mode: 0o644, HasMode: true, LocalMutation: true,
+	})
+
+	res, err := c.createOp(context.Background(), &fs.Op{
+		Kind: fs.OpCreate, Path: "/f", Flags: uint32(syscall.O_WRONLY),
+		Kernel: &gofuse.OpenIn{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Attr == nil || res.Attr.Rev <= 0 {
+		t.Fatalf("writable open attr = %+v, want a remote revision", res.Attr)
+	}
+	if got := headCount(b, "/f"); got != 1 {
+		t.Fatalf("zero-revision writable open HEADs = %d, want 1", got)
+	}
+}

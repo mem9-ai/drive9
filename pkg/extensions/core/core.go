@@ -1154,6 +1154,23 @@ func dirEntryInfoFromAttr(name string, attr *fs.Attr) fs.DirEntryInfo {
 	return item
 }
 
+// statForWrite ensures a writable open gets a remote revision. A
+// LocalMutation row may be the just-created, not-yet-landed image with
+// Rev 0; staging an overwrite/truncation at that base is rejected by the
+// uploader ("missing base revision for overwrite"). The row is still the
+// read-your-writes answer, so keep it unless a revision is required.
+func (c *Core) statForWrite(ctx context.Context, path string) (fs.Result, error) {
+	res, err := c.statOp(ctx, path, false)
+	if err != nil || res.Attr == nil || res.Attr.Rev > 0 {
+		return res, err
+	}
+	st, serr := c.statWithTransientRetry(ctx, path)
+	if serr != nil {
+		return fs.Result{}, c.mapErr(serr)
+	}
+	return fs.Result{Attr: attrOf(st)}, nil
+}
+
 // createOp serves OpCreate (open-or-create). A kernel CREATE already proved
 // the name missing and a kernel OPEN already resolved an existing dentry, so
 // neither shape needs a synthetic existence probe: the terminal trusts the
@@ -1189,7 +1206,7 @@ func (c *Core) createOp(ctx context.Context, op *fs.Op) (fs.Result, error) {
 		// truncation at that stale base silently loses the commit to a CAS
 		// conflict. Read-only opens above may use the cached row because
 		// they never stage a write.
-		probe, statErr := c.statOp(ctx, op.Path, false)
+		probe, statErr := c.statForWrite(ctx, op.Path)
 		exists = statErr == nil && probe.Attr != nil
 		if statErr != nil && statErr != fs.ErrNotFound {
 			return fs.Result{}, statErr
