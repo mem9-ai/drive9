@@ -706,6 +706,22 @@ type redactedMountCause struct {
 func (e redactedMountCause) Error() string { return e.message }
 func (e redactedMountCause) Unwrap() error { return e.cause }
 
+// applyExtentCapabilityGate clears explicit extent patterns when the server
+// cannot attribute a published object to the creating descriptor (missing
+// completion_identity_v1). Local and legacy deployments fall back to the
+// classic plane instead of failing the first extent commit with EIO.
+func applyExtentCapabilityGate(cfg *MountConfig, cl *client.Client, wantExt map[string]bool) {
+	if len(cfg.ExtentPaths) == 0 || cl.CachedCompletionIdentitySupported() {
+		return
+	}
+	logger.Warn(context.Background(), "extent_patterns_disabled",
+		zap.String("server", cfg.Server),
+		zap.Strings("patterns", cfg.ExtentPaths),
+		zap.String("detail", "server does not advertise completion_identity_v1; falling back to the classic plane"))
+	cfg.ExtentPaths = nil
+	delete(wantExt, "extent")
+}
+
 func mountWithConfig(cfg MountConfig) error {
 	if cfg.APIKey != "" && cfg.Token != "" {
 		return fmt.Errorf("fuse: APIKey and Token are mutually exclusive")
@@ -758,6 +774,7 @@ func mountWithConfig(cfg MountConfig) error {
 	for _, name := range extOrder {
 		wantExt[name] = true
 	}
+	applyExtentCapabilityGate(&cfg, cl, wantExt)
 	// Each extension constructs independently into a registry; assembly
 	// walks the flag order in reverse below.
 	built := map[string]fs.Handler{}
