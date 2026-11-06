@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"sync"
 )
 
@@ -113,6 +114,21 @@ func (c *Client) GetExtentReadPlan(ctx context.Context, path string, start, end 
 	var plan ExtentReadPlan
 	if err := json.NewDecoder(resp.Body).Decode(&plan); err != nil {
 		return nil, fmt.Errorf("decode extent read plan: %w", err)
+	}
+	// The revision a plan represents travels in the RESPONSE HEADER, not in
+	// the plan body: the server writes setFileReadHeaders (ETag,
+	// X-Dat9-Resource-ID, X-Dat9-Revision) before it encodes the block plan,
+	// and the plan struct itself carries only size/blocks/next_offset. Left
+	// unread here, plan.Revision stays 0 on every response and any consumer
+	// that treats "no revision" as "cannot be judged" accepts whatever the
+	// server answered — including a plan from a replica that has not caught up
+	// with a commit this mount already published.
+	if plan.Revision <= 0 {
+		if raw := resp.Header.Get("X-Dat9-Revision"); raw != "" {
+			if rev, perr := strconv.ParseInt(raw, 10, 64); perr == nil && rev > 0 {
+				plan.Revision = rev
+			}
+		}
 	}
 	return &plan, nil
 }

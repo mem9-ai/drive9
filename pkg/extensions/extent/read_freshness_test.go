@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"sync/atomic"
 	"testing"
 
@@ -20,6 +21,11 @@ import (
 // caller a pre-commit image. For SQLite this is fatal: it reads page 1 with an
 // old schema cookie, reports SQLITE_SCHEMA, reloads the schema, and then
 // cannot find the table the previous statement just created.
+//
+// The revision arrives in the RESPONSE HEADER (X-Dat9-Revision), never in the
+// plan body — the server writes setFileReadHeaders before encoding the plan,
+// and the plan struct has only size/blocks/next_offset. This test models that
+// exactly: a body without a revision, a header that carries it.
 func TestReadRefusesPlanOlderThanPublishedRevision(t *testing.T) {
 	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -31,9 +37,10 @@ func TestReadRefusesPlanOlderThanPublishedRevision(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("X-Dat9-Content-Layout", "extent")
+		w.Header().Set("X-Dat9-Revision", strconv.FormatInt(rev, 10))
+		// Deliberately NO revision field in the body, as the server sends it.
 		_ = json.NewEncoder(w).Encode(client.ExtentReadPlan{
-			Size:     4096,
-			Revision: rev,
+			Size: 4096,
 			Blocks: []client.ExtentReadPlanBlock{
 				{FileOffset: 0, Length: 4096, Zero: true},
 			},
