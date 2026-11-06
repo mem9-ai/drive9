@@ -2,6 +2,7 @@ package writeback
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -315,8 +316,8 @@ func TestPortPendingOverwriteAppendRebasesNewerStage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !wbcache.MarkSupersedesPendingGen("/f", gen1, gen2) {
-		t.Fatal("mark supersedes failed")
+	if !wbcache.MarkCacheLineage("/f", gen1, gen2) {
+		t.Fatal("mark cache lineage failed")
 	}
 	wb, err := New(Options{Policy: PolicyWriteBack, Client: cl, WriteCache: wbcache})
 	if err != nil {
@@ -409,5 +410,144 @@ func TestPortKernelCreateReconcilesExistingNonexclusive(t *testing.T) {
 	}
 	if got := heads.Load(); got != 1 {
 		t.Fatalf("nonexclusive create probe HEADs = %d, want 1", got)
+	}
+}
+
+// A second append opener can materialize an intermediate generation G2
+// before the G1 upload acknowledges. The acknowledgement must reach that
+// descendant handle too, not just the direct G1 opener.
+func TestPortPendingAppendAckReachesDescendantHandle(t *testing.T) {
+	b := testbackend.NewBackend()
+	ts := httptest.NewServer(b)
+	defer ts.Close()
+	cl := client.New(ts.URL, "")
+	wbcache, err := staging.NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gen1, _, err := wbcache.PutWithBaseRevAndModeTimings("/f", []byte("base"), 4, staging.PendingOverwrite, 1, 0o644, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wb, err := New(Options{Policy: PolicyWriteBack, Client: cl, WriteCache: wbcache})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, ok := wb.openPendingWritable(&fs.Op{Kind: fs.OpCreate, Path: "/f", Flags: uint32(syscall.O_WRONLY | syscall.O_APPEND)})
+	if !ok {
+		t.Fatal("first opener did not take the fast path")
+	}
+	// A flush of the first opener would stage G2; model the same metadata
+	// directly so the second opener captures G2 while G1 is still in flight.
+	gen2, _, err := wbcache.PutWithBaseRevAndModeTimings("/f", []byte("base+one"), 8, staging.PendingOverwrite, 1, 0o644, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !wbcache.MarkCacheLineage("/f", gen1, gen2) {
+		t.Fatal("mark descendant lineage")
+	}
+	bb, ok := wb.openPendingWritable(&fs.Op{Kind: fs.OpCreate, Path: "/f", Flags: uint32(syscall.O_WRONLY | syscall.O_APPEND)})
+	if !ok {
+		t.Fatal("descendant opener did not take the fast path")
+	}
+	wb.acknowledgeUploadedCreate("/f", 2, gen1, pendingGenCache, gen1)
+	for name, res := range map[string]fs.Result{"ancestor": a, "descendant": bb} {
+		h := res.Handle.(*bufferingHandle)
+		h.mu.Lock()
+		baseRev := h.baseRev
+		h.mu.Unlock()
+		if baseRev != 2 {
+			t.Fatalf("%s baseRev after G1 = %d, want 2", name, baseRev)
+		}
+	}
+	// The descendant's own staged generation is the newer parent for its
+	// next append; the ancestor handle did not contain G2 and must not move.
+	wb.acknowledgeUploadedCreate("/f", 3, gen2, pendingGenCache, gen2)
+	bh := bb.Handle.(*bufferingHandle)
+	bh.mu.Lock()
+	baseRev := bh.baseRev
+	bh.mu.Unlock()
+	if baseRev != 3 {
+		t.Fatalf("descendant baseRev after G2 = %d, want 3", baseRev)
+	}
+	ah := a.Handle.(*bufferingHandle)
+	ah.mu.Lock()
+	baseRev = ah.baseRev
+	ah.mu.Unlock()
+	if baseRev != 2 {
+		t.Fatalf("ancestor baseRev after G2 = %d, want 2", baseRev)
+	}
+}
+
+// O_EXCL must get the server's create arbitration before open(2) returns,
+// not a lazy PendingNew that only discovers the conflict at upload time.
+func TestPortKernelCreateExclusiveChecksServer(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/f", []byte("old"))
+	ts := httptest.NewServer(b)
+	defer ts.Close()
+	cl := client.New(ts.URL, "")
+	wb, err := New(Options{Policy: PolicyWriteBack, Client: cl})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := fs.NewChain(wb, terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = ch.Dispatch(context.Background(), &fs.Op{
+		Kind: fs.OpCreate, Path: "/f",
+		Flags: uint32(syscall.O_CREAT | syscall.O_EXCL | syscall.O_WRONLY),
+		Mode:  0o644, HasMode: true, Kernel: &gofuse.CreateIn{},
+	})
+	if !errors.Is(err, syscall.EEXIST) {
+		t.Fatalf("O_EXCL existing create err = %v, want EEXIST", err)
+	}
+}
+
+// A cache-derived stage must persist its lineage in the cache field, not
+// stamp a cache generation into SupersedesPendingGen where the uploader
+// would treat it as a pending-index marker.
+func TestPortCacheStageKeepsGenerationSpacesSeparate(t *testing.T) {
+	b := testbackend.NewBackend()
+	ts := httptest.NewServer(b)
+	defer ts.Close()
+	cl := client.New(ts.URL, "")
+	wbcache, err := staging.NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gen1, _, err := wbcache.PutWithBaseRevAndModeTimings("/f", []byte("base"), 4, staging.PendingOverwrite, 1, 0o644, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wb, err := New(Options{Policy: PolicyWriteBack, Client: cl, WriteCache: wbcache})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, ok := wb.openPendingWritable(&fs.Op{Kind: fs.OpCreate, Path: "/f", Flags: uint32(syscall.O_WRONLY | syscall.O_APPEND)})
+	if !ok {
+		t.Fatal("pending overwrite append did not take the fast path")
+	}
+	h := res.Handle.(*bufferingHandle)
+	if err := h.Write(context.Background(), 4, []byte("+x")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	meta, ok := wbcache.GetMeta("/f")
+	if !ok || meta == nil {
+		t.Fatal("no staged meta")
+	}
+	if meta.SupersedesPendingGen != 0 {
+		t.Fatalf("cache stage stamped SupersedesPendingGen=%d, want 0", meta.SupersedesPendingGen)
+	}
+	if meta.CacheLineageGen != gen1 {
+		t.Fatalf("cache lineage = %d, want %d", meta.CacheLineageGen, gen1)
 	}
 }

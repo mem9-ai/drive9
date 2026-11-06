@@ -278,6 +278,9 @@ type bufferingHandle struct {
 	supersededPendingGen uint64
 	// supersededPendingSource binds the generation above to its track.
 	supersededPendingSource pendingGenSource
+	// cacheLineageGen is the write-back-cache generation root this handle's
+	// content descends from (its own staging when it has no pending parent).
+	cacheLineageGen uint64
 	// pendingFile backs a snapshot larger than the memory bound: the old
 	// object's bytes are streamed to a temp file (closed with the handle),
 	// so a 65MiB anonymous fd keeps its identity instead of falling back
@@ -1135,6 +1138,31 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		if res, ok := w.openPendingWritable(op); ok {
 			return res, nil
 		}
+		if op.KernelCreate() && flags&uint32(syscall.O_EXCL) != 0 {
+			// O_EXCL must let the server arbitrate the create before the
+			// syscall reports success. The lazy PendingNew path returns a
+			// handle immediately and only discovers an existing row when the
+			// uploader runs, long after open(2).
+			res, err := next(ctx, op)
+			if err != nil || res.Handle == nil {
+				return res, err
+			}
+			size := attrSize(res)
+			rev := int64(0)
+			if res.Attr != nil {
+				rev = res.Attr.Rev
+			}
+			h := &bufferingHandle{w: w, path: op.Path, inner: res.Handle, flags: flags,
+				baseSize: size, baseRev: rev, forceSync: hasSyncOpenFlag(flags)}
+			mode := op.Mode & 0o7777
+			if mode != 0o644 && mode != 0 {
+				h.pendingMode = mode
+				h.hasPendingMode = true
+			}
+			w.track(h)
+			res.Handle = h
+			return res, nil
+		}
 		if flags&uint32(syscall.O_CREAT) == 0 {
 			// v1 close-to-open: a read-only re-open of a path whose image
 			// has not landed serves the pending bytes — the kernel's LOOKUP
@@ -1154,6 +1182,10 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 					if meta, track := w.pendingMetaTrack(op.Path); meta != nil {
 						h.supersededPendingGen = meta.Generation
 						h.supersededPendingSource = track
+						h.cacheLineageGen = meta.CacheLineageGen
+						if h.cacheLineageGen == 0 {
+							h.cacheLineageGen = meta.Generation
+						}
 					}
 					if pb, ok := w.pendingBaseRevOf(op.Path); ok {
 						h.baseRev = pb
@@ -1186,6 +1218,10 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 						if meta != nil {
 							h.supersededPendingGen = meta.Generation
 							h.supersededPendingSource = track
+							h.cacheLineageGen = meta.CacheLineageGen
+							if h.cacheLineageGen == 0 {
+								h.cacheLineageGen = meta.Generation
+							}
 						}
 						if pb, ok := w.pendingBaseRevOf(op.Path); ok {
 							h.baseRev = pb
@@ -1305,16 +1341,10 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		// (unlink/14's re-create).
 		var st fs.Attr
 		var statErr error
-		if op.KernelCreate() && op.Flags&uint32(syscall.O_EXCL) != 0 {
-			// O_EXCL is the one shape whose creation the server itself
-			// arbitrates; a probe would only duplicate that answer. A
-			// nonexclusive kernel CREATE can still lose the race to another
-			// client after the negative lookup, and a lazy PendingNew would
-			// then be rejected forever by the existing remote row.
-			statErr = fs.ErrNotFound
-		} else {
-			st, statErr = w.probeExisting(ctx, next, op.Path)
-		}
+		// A nonexclusive kernel CREATE can still lose the negative-lookup
+		// race to another client; probe so an existing row is opened instead
+		// of returning a lazy PendingNew the uploader can never land.
+		st, statErr = w.probeExisting(ctx, next, op.Path)
 		if statErr != nil && fs.IsNotFound(statErr) && w.queue != nil && w.queue.HasPath(op.Path) {
 			// pending-cache visibility: the path was flushed into the
 			// async queue but has not landed yet. Wait for OUR entry (it is
@@ -3649,10 +3679,16 @@ func (w *Writeback) acknowledgeUploadedCreate(path string, rev int64, generation
 			if rev > 0 {
 				h.baseRev = rev
 			}
-		case generation != 0 && h.supersededPendingGen == generation && h.supersededPendingSource == source:
-			// The handle's captured image includes the generation this
-			// upload just published. Its next append/overwrite is derived
-			// from that revision, not the pre-upload base.
+		case source == pendingGenCache && cacheGeneration != 0 &&
+			(h.cacheLineageGen == cacheGeneration || h.supersededPendingGen == cacheGeneration):
+			// This handle descends from the cache lineage the upload just
+			// published (possibly through several staged descendants). Its
+			// next append/overwrite is derived from that revision, not the
+			// pre-upload base.
+			if rev > 0 {
+				h.baseRev = rev
+			}
+		case source == pendingGenQueue && generation != 0 && h.supersededPendingGen == generation && h.supersededPendingSource == source:
 			if rev > 0 {
 				h.baseRev = rev
 			}
@@ -3666,16 +3702,14 @@ func (w *Writeback) acknowledgeUploadedCreate(path string, rev int64, generation
 		}
 		if cacheGeneration != 0 && rev > 0 {
 			if meta, ok := w.wbCache.GetMeta(path); ok && meta != nil {
-				switch {
-				case meta.Generation == cacheGeneration:
-					// The uploaded entry can still be present while the
-					// uploader applies its deferred mode. Keep its retry
-					// base on the revision it just published.
-					_ = w.wbCache.RebaseBaseRevIfGeneration(path, cacheGeneration, rev)
-				case meta.SupersedesPendingGen == cacheGeneration:
-					// A newer staged image derives from the just-published
-					// revision; move its CAS base so it does not conflict
-					// with this mount's own landing.
+				lineage := meta.CacheLineageGen
+				if lineage == 0 {
+					lineage = meta.Generation
+				}
+				if lineage == cacheGeneration {
+					// The uploaded entry (deferred-mode window) or a newer
+					// staged descendant still present on disk derives from
+					// the revision this upload just published.
 					_ = w.wbCache.RebaseBaseRevIfGeneration(path, meta.Generation, rev)
 				}
 			}
@@ -4702,6 +4736,10 @@ func (w *Writeback) openPendingWritable(op *fs.Op) (fs.Result, bool) {
 	if meta != nil {
 		h.supersededPendingGen = meta.Generation
 		h.supersededPendingSource = track
+		h.cacheLineageGen = meta.CacheLineageGen
+		if h.cacheLineageGen == 0 {
+			h.cacheLineageGen = meta.Generation
+		}
 		h.isNew = meta.Kind == staging.PendingNew
 		if meta.HasMode {
 			h.pendingMode, h.hasPendingMode = meta.Mode, true
@@ -5764,6 +5802,7 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 	// was never composed over).
 	h.supersededPendingGen = pendingGen
 	h.supersededPendingSource = pendingGenQueue
+	h.cacheLineageGen = 0
 	// v1 publishStagedSnapshotLineageLocked: the staged snapshot becomes
 	// this handle's content identity — the next staging parents on it.
 	h.contentSnapshotID = snapshotID
@@ -6137,16 +6176,16 @@ const (
 // durability: the v1 ladder uses the three-barrier stage put (both file
 // contents + one directory sync); full durability keeps the four-barrier
 // put for the boundaries where the pair is the only authority.
-func (w *Writeback) putWriteCacheSnapshot(path string, image []byte, kind staging.PendingKind, baseRev int64, mode uint32, hasMode bool, dur stageDurability) (uint64, error) {
+func (w *Writeback) putWriteCacheSnapshot(path string, image []byte, kind staging.PendingKind, baseRev int64, mode uint32, hasMode bool, cacheLineage uint64, dur stageDurability) (uint64, error) {
 	size := int64(len(image))
 	if dur == stageV1Ladder {
-		gen, _, err := w.wbCache.PutWithBaseRevAndModeAndLineageTimingsDirSync(path, image, size, kind, baseRev, mode, hasMode, "", "", false)
+		gen, _, err := w.wbCache.PutWithBaseRevAndModeAndLineageTimingsDirSyncCacheLineage(path, image, size, kind, baseRev, mode, hasMode, "", "", false, cacheLineage)
 		return gen, err
 	}
 	// The full-sync lineage put is the plain put's durability with the
 	// generation returned (same wbSyncFull path; the supersession mark and
 	// snapshot bookkeeping need the generation).
-	gen, _, err := w.wbCache.PutWithBaseRevAndModeAndLineageTimings(path, image, size, kind, baseRev, mode, hasMode, "", "", false)
+	gen, _, err := w.wbCache.PutWithBaseRevAndModeAndLineageTimingsCacheLineage(path, image, size, kind, baseRev, mode, hasMode, "", "", false, cacheLineage)
 	return gen, err
 }
 
@@ -6213,6 +6252,8 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, dur stageDurabi
 	// image: it describes this handle's content, not whatever staging happens
 	// to be registered at the path when the meta is written.
 	supersedesGen := h.supersededPendingGen
+	supersedesSource := h.supersededPendingSource
+	cacheLineage := h.cacheLineageGen
 	h.mu.Unlock()
 	if isNew {
 		baseRev = 0
@@ -6281,12 +6322,36 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, dur stageDurabi
 	// remote name itself (a remote key here made every subtree mount's
 	// upload silently no-op — the git-ops clone's config.lock never
 	// landed).
-	wbGen, err := h.w.putWriteCacheSnapshot(h.path, image, kind, baseRev, mode, hasMode, dur)
+	wbGen, err := h.w.putWriteCacheSnapshot(h.path, image, kind, baseRev, mode, hasMode, cacheLineage, dur)
 	if err != nil {
 		return nil, err
 	}
-	if supersedesGen != 0 {
-		h.w.wbCache.MarkSupersedesPendingGen(h.path, supersedesGen, wbGen)
+	if supersedesSource == pendingGenQueue {
+		if supersedesGen != 0 {
+			h.w.wbCache.MarkSupersedesPendingGen(h.path, supersedesGen, wbGen)
+		}
+	} else {
+		// Cache lineage is a separate generation space from the pending
+		// index. The put persisted the root in the same meta write (no
+		// extra fsync); never stamp it into SupersedesPendingGen, or the
+		// uploader would retire a pending-index conflict marker it never
+		// owned.
+		lineage := cacheLineage
+		if lineage == 0 {
+			lineage = wbGen
+		}
+		h.mu.Lock()
+		if h.cacheLineageGen == 0 {
+			h.cacheLineageGen = lineage
+		}
+		if supersedesSource != pendingGenQueue {
+			// The staged image is now this handle's content; its next stage
+			// composes over this generation, and an ack for this image must
+			// advance the handle even though the cache lineage root is older.
+			h.supersededPendingGen = wbGen
+			h.supersededPendingSource = pendingGenCache
+		}
+		h.mu.Unlock()
 	}
 	// v1 seeded the read cache with the staged image at the flush
 	// boundary: readers during the async landing serve these bytes instead

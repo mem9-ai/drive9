@@ -123,6 +123,12 @@ type WriteBackMeta struct {
 	// below it: those images are contained in this one. Persisted so a
 	// post-restart landing keeps the same fence.
 	SupersedesPendingGen uint64 `json:"supersedes_pending_gen,omitempty"`
+	// CacheLineageGen is the write-back-cache generation root this image's
+	// content descends from. Unlike SupersedesPendingGen (pending-index
+	// space), this is persisted for cache-only lineage: an append opened over
+	// a still-uploading overwrite must adopt the revision of the ancestor
+	// landing even when several descendants staged in between.
+	CacheLineageGen uint64 `json:"cache_lineage_gen,omitempty"`
 	// DataCRC binds the .dat payload to this metadata record (CRC32 of
 	// the staged bytes), guarded by DataBound — zero is a LEGITIMATE
 	// checksum (an empty payload binds with CRC 0 and Size 0), so absence
@@ -408,7 +414,7 @@ func (c *WriteBackCache) PutWithBaseRevAndModeTimings(remotePath string, data []
 // used by FileHandle staging. Legacy callers deliberately store empty lineage,
 // which is safe because such metadata cannot authorize a growth rebase.
 func (c *WriteBackCache) PutWithBaseRevAndModeAndLineageTimings(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, liveAncestors ...string) (uint64, WriteBackPutTimings, error) {
-	return c.putWithBaseRevAndModeAndLineage(remotePath, data, size, kind, baseRev, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted, wbSyncFull, liveAncestors)
+	return c.putWithBaseRevAndModeAndLineage(remotePath, data, size, kind, baseRev, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted, 0, wbSyncFull, liveAncestors)
 }
 
 // PutWithBaseRevAndModeAndLineageTimingsNoSync is the non-durable variant of
@@ -418,7 +424,7 @@ func (c *WriteBackCache) PutWithBaseRevAndModeAndLineageTimings(remotePath strin
 // elsewhere — the shadow store + pending index — so at most the snapshot's
 // freshness (not its integrity) is lost on a crash.
 func (c *WriteBackCache) PutWithBaseRevAndModeAndLineageTimingsNoSync(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, liveAncestors ...string) (uint64, WriteBackPutTimings, error) {
-	return c.putWithBaseRevAndModeAndLineage(remotePath, data, size, kind, baseRev, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted, wbSyncNone, liveAncestors)
+	return c.putWithBaseRevAndModeAndLineage(remotePath, data, size, kind, baseRev, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted, 0, wbSyncNone, liveAncestors)
 }
 
 // PutWithBaseRevAndModeAndLineageTimingsDirSync is the v1 close-path stage
@@ -433,7 +439,21 @@ func (c *WriteBackCache) PutWithBaseRevAndModeAndLineageTimingsNoSync(remotePath
 // time (the entry is pruned — lost cleanly, matching v1's crash-before-
 // WAL-fsync window — instead of uploading stale bytes at the new base).
 func (c *WriteBackCache) PutWithBaseRevAndModeAndLineageTimingsDirSync(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, liveAncestors ...string) (uint64, WriteBackPutTimings, error) {
-	return c.putWithBaseRevAndModeAndLineage(remotePath, data, size, kind, baseRev, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted, wbSyncDirOnce, liveAncestors)
+	return c.putWithBaseRevAndModeAndLineage(remotePath, data, size, kind, baseRev, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted, 0, wbSyncDirOnce, liveAncestors)
+}
+
+// PutWithBaseRevAndModeAndLineageTimingsCacheLineage is the full-durability
+// variant that persists the write-back-cache lineage root in the same meta
+// write (no post-put rewrite/fsync).
+func (c *WriteBackCache) PutWithBaseRevAndModeAndLineageTimingsCacheLineage(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, cacheLineage uint64, liveAncestors ...string) (uint64, WriteBackPutTimings, error) {
+	return c.putWithBaseRevAndModeAndLineage(remotePath, data, size, kind, baseRev, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted, cacheLineage, wbSyncFull, liveAncestors)
+}
+
+// PutWithBaseRevAndModeAndLineageTimingsDirSyncCacheLineage is the
+// three-barrier close variant that persists the cache lineage root in the
+// same meta write.
+func (c *WriteBackCache) PutWithBaseRevAndModeAndLineageTimingsDirSyncCacheLineage(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, cacheLineage uint64, liveAncestors ...string) (uint64, WriteBackPutTimings, error) {
+	return c.putWithBaseRevAndModeAndLineage(remotePath, data, size, kind, baseRev, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted, cacheLineage, wbSyncDirOnce, liveAncestors)
 }
 
 // Get reads the cached data for remotePath. Returns nil, false if not cached.
@@ -781,6 +801,42 @@ func (c *WriteBackCache) MarkSupersedesPendingGen(remotePath string, supersedesG
 	return true
 }
 
+// MarkCacheLineage records the write-back-cache generation root an image
+// descends from. The expected generation fence is the same as
+// MarkSupersedesPendingGen's, and the rewrite is serialized by the path lock.
+func (c *WriteBackCache) MarkCacheLineage(remotePath string, lineage, expectedGen uint64) bool {
+	if lineage == 0 || expectedGen == 0 {
+		return false
+	}
+	pl := c.AcquirePathLock(remotePath)
+	defer c.ReleasePathLock(remotePath, pl)
+
+	c.mu.Lock()
+	meta, ok := c.metas[remotePath]
+	if !ok || meta.Generation != expectedGen {
+		c.mu.Unlock()
+		return false
+	}
+	updated := cloneWriteBackMeta(meta)
+	updated.CacheLineageGen = lineage
+	metaPath := c.MetaFile(remotePath)
+	c.mu.Unlock()
+
+	metaBytes, err := json.Marshal(updated)
+	if err != nil {
+		return false
+	}
+	if err := atomicWrite(metaPath, metaBytes); err != nil {
+		return false
+	}
+
+	c.mu.Lock()
+	cp := updated
+	c.metas[remotePath] = &cp
+	c.mu.Unlock()
+	return true
+}
+
 // RenamePending atomically moves a pending cache entry from oldPath to newPath.
 // The .dat file is moved via os.Rename (no data copy); only the .meta is
 // rewritten with the new path and a fresh generation.
@@ -1086,7 +1142,7 @@ const (
 	wbSyncNone
 )
 
-func (c *WriteBackCache) putWithBaseRevAndModeAndLineage(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, syncMode wbSyncMode, liveAncestors []string) (uint64, WriteBackPutTimings, error) {
+func (c *WriteBackCache) putWithBaseRevAndModeAndLineage(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, cacheLineage uint64, syncMode wbSyncMode, liveAncestors []string) (uint64, WriteBackPutTimings, error) {
 	var t WriteBackPutTimings
 
 	// Phase 1: acquire per-path lock (serializes same-path Put/Remove/etc.)
@@ -1123,9 +1179,13 @@ func (c *WriteBackCache) putWithBaseRevAndModeAndLineage(remotePath string, data
 	}
 	t.DatWrite = time.Since(datStart)
 
+	if cacheLineage == 0 {
+		cacheLineage = gen
+	}
 	now := time.Now()
 	meta := WriteBackMeta{
 		Path:             remotePath,
+		CacheLineageGen:  cacheLineage,
 		Size:             size,
 		Mtime:            now,
 		CreatedAt:        now,
