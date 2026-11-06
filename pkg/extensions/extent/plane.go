@@ -342,6 +342,10 @@ func (h *Handler) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, e
 		if res, err, claimed := h.tryClaimOpen(ctx, op); claimed {
 			return res, err
 		}
+	case fs.OpLink:
+		if res, err, handled := h.linkAfterLanding(ctx, op, next); handled {
+			return res, err
+		}
 	case fs.OpRename:
 		if res, err, handled := h.renameOverOpen(ctx, op, next); handled {
 			return res, err
@@ -529,7 +533,48 @@ func (h *Handler) claimsPattern(path string) bool {
 	return false
 }
 
-// renameOverOpen runs the rename, first preserving any OPEN engine file the
+// linkAfterLanding publishes the SOURCE before the remote hardlink is issued.
+//
+// The server's hardlink resolves the source BY NAME, so the name has to exist
+// remotely first. An extent create exists only in this bridge until its first
+// commit, so an immediate `link` after `create(2)` — pjdfstest link/06, link/07
+// and unlink/00 do exactly that — used to answer ENOENT even though create(2)
+// had already succeeded. The write-back plane has the same rule for its own
+// handles (writeback.Do, OpLink), but it cannot see engine handles: those live
+// in this plane, so the flush has to happen here.
+//
+// handled=false leaves unrelated links to the chain.
+func (h *Handler) linkAfterLanding(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error, bool) {
+	if h.opts.Engine == nil || op.Path2 == "" {
+		return fs.Result{}, nil, false
+	}
+	unlock := h.lockPaths(op.Path)
+	h.mu.Lock()
+	list := append([]*engineHandle(nil), h.handles[op.Path]...)
+	h.mu.Unlock()
+	if len(list) == 0 {
+		unlock()
+		return fs.Result{}, nil, false
+	}
+	// Land every descriptor on the source: the link must resolve a name the
+	// server can see, and the engine materializes an EMPTY file's name only
+	// at the last close (FlushFileFinal).
+	for _, e := range list {
+		if err := h.opts.Engine.FlushFile(ctx, uint64(e.ino)); err != nil {
+			unlock()
+			return fs.Result{}, err, true
+		}
+		if err := h.opts.Engine.Bridge.MaterializeEmpty(ctx, e.ino); err != nil {
+			unlock()
+			return fs.Result{}, err, true
+		}
+	}
+	unlock()
+	res, err := next(ctx, op)
+	return res, err, true
+}
+
+// renameOverOpen runs the rename, first preserving any OPEN engine file the// renameOverOpen runs the rename, first preserving any OPEN engine file the
 // rename is about to displace (see tryRenameOverOpen). handled=false only for
 // renames the plane does not touch (no engine, no destination name).
 //
