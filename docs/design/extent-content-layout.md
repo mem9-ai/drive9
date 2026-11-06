@@ -88,12 +88,38 @@ Directories are never extent objects. Patterns are matched against the **basenam
 
 | Profile | Contents | Use |
 |---|---|---|
-| `coding-agent` (default) | `[local]` overlay patterns (`node_modules`, `.venv`), gitignore-aware `[local-gitignore-aware]` patterns (`target`), and workspace-routed `.git` + `[append-log] **/*-wal` | agent workspaces on a normal drive9 tree |
+| `coding-agent` (default) | `[local]` overlay patterns (`node_modules`, `.venv`), gitignore-aware `[local-gitignore-aware]` patterns (`target`), workspace-routed `.git`, `[append-log] **/*-wal`, and `[extent]` for SQLite's file family (see below) | agent workspaces on a normal drive9 tree |
 | `coding-agent-extent` | `coding-agent` **plus** `[extent] *` | the SQLite/product gate: every file on the mount is `extent` |
 | `extent` | `[extent] *` only | a pure extent volume, no overlay rules |
 | `portable` | local-only patterns + `[pack] /` | pack/unpack archives |
 | `none` | no rules | raw tree, no overlay, no policy |
 | `interactive` | reserved | interactive shells |
+
+### SQLite in the default profile
+
+`coding-agent` routes SQLite's whole file family onto the extent plane from the
+FIRST byte, independent of the size cutoff. SQLite is the workload a size
+cutoff handles worst: a database starts at a few KiB, grows past the inline
+cutoff mid-session, and is then written through a descriptor that was opened
+while it was still classic — the descriptor/promotion mismatch that makes every
+fsync re-upload a whole image (and, before the handoff existed, exhausted the
+write-back quota).
+
+The family is enumerated per base suffix because SQLite derives every companion
+file from the database's own name, and a bare `*.db` does **not** match
+`app.db-wal`:
+
+```
+*.db            *.db-wal        *.db-shm        *.db-journal   *.db-mj*
+*.db3           *.db3-wal       *.db3-shm       *.db3-journal  *.db3-mj*
+*.sqlite        *.sqlite-wal    *.sqlite-shm    *.sqlite-journal  *.sqlite-mj*
+*.sqlite3       *.sqlite3-wal   *.sqlite3-shm   *.sqlite3-journal *.sqlite3-mj*
+```
+
+Patterns without a `/` match the BASENAME at any depth, so
+`~/proj/data/app.db` is covered. A whole database *directory* is deliberately
+not routed: SQLite's side files all keep a recognizable suffix, and a
+directory-wide rule would pull unrelated content onto the plane.
 
 `coding-agent-extent` exists so an agent workspace can keep the coding-agent overlay semantics while storing *all* file content through the extent data plane. `extent` is the same data plane without the overlay rules, for mounts that should behave like a plain shared filesystem.
 

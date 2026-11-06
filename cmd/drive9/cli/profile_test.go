@@ -350,3 +350,48 @@ func TestProfileShowPrintsCustomConfig(t *testing.T) {
 		}
 	}
 }
+
+// The default coding-agent profile routes SQLite's whole file family onto the
+// extent plane. A database starts small, crosses the inline cutoff mid-session,
+// and would otherwise be written through a handle opened while it was still
+// classic — the descriptor/promotion mismatch that makes every fsync re-upload
+// a whole image.
+func TestBuiltinCodingAgentRoutesSQLiteToExtent(t *testing.T) {
+	cfg, err := loadProfileConfig(defaultMountProfile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Builtin {
+		t.Fatal("coding-agent is not the builtin (a user profile shadowed it)")
+	}
+	has := map[string]bool{}
+	for _, p := range cfg.ExtentPatterns {
+		has[p] = true
+	}
+	// Every family member for every base suffix, so a database opened in any
+	// SQLite journal mode rides the plane from byte zero.
+	for _, base := range []string{"db", "db3", "sqlite", "sqlite3"} {
+		for _, suffix := range []string{"", "-wal", "-shm", "-journal", "-mj*"} {
+			want := "*." + base + suffix
+			if !has[want] {
+				t.Errorf("coding-agent [extent] is missing %q", want)
+			}
+		}
+	}
+	// The round trip must preserve them: a profile copied with
+	// `drive9 profile show > ~/.drive9/profiles/...` keeps the routing.
+	out := formatProfileConfig(cfg)
+	roundTrip, err := parseProfileConfig(cfg.Name, cfg.Source, out)
+	if err != nil {
+		t.Fatalf("round trip: %v", err)
+	}
+	// Order is not part of the contract (the parser de-duplicates through a
+	// set); the SET must survive.
+	gotSet := append([]string(nil), roundTrip.ExtentPatterns...)
+	wantSet := append([]string(nil), cfg.ExtentPatterns...)
+	sort.Strings(gotSet)
+	sort.Strings(wantSet)
+	if !reflect.DeepEqual(gotSet, wantSet) {
+		t.Fatalf("extent patterns did not survive the round trip:\n got %v\nwant %v", gotSet, wantSet)
+	}
+}
