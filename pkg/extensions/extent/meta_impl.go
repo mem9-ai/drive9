@@ -461,6 +461,49 @@ func (b *Bridge) Close(ctx meta.Context, ino meta.Ino) syscall.Errno {
 // offset zero; plan blocks do exactly that. Trailing zero blocks are
 // dropped (the reader zero-fills past coverage); interior holes become
 // synthesized zero slices served from memory by the storage adapter.
+// readPlanStaleRetries bounds how long a read waits for the namespace to catch
+// up with a revision this mount already published. The delays cover backend
+// replica lag without turning a genuinely stale image into a hang.
+var readPlanStaleDelays = []time.Duration{0, 10 * time.Millisecond, 25 * time.Millisecond, 50 * time.Millisecond, 100 * time.Millisecond}
+
+// fetchFreshReadPlan fetches a read plan for [start, end] and refuses one that
+// is OLDER than a revision this mount already published.
+//
+// The write path publishes through the server, and a following read may be
+// answered by a replica that has not caught up. Serving that plan hands the
+// caller a pre-commit image — for SQLite that means reading page 1 with an old
+// schema cookie, which surfaces as SQLITE_SCHEMA and then "no such table" on
+// the very statement that just created it. This mount KNOWS it published
+// revision N; a read below N is stale by definition, not merely unlucky.
+func (b *Bridge) fetchFreshReadPlan(ctx context.Context, ino meta.Ino, path string, start, end int64) (*client.ExtentReadPlan, error) {
+	known := b.publishedRevision(ino)
+	var last *client.ExtentReadPlan
+	var err error
+	for _, delay := range readPlanStaleDelays {
+		if delay > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(delay):
+			}
+		}
+		last, err = b.cfg.Client.GetExtentReadPlan(ctx, path, start, end)
+		if err != nil {
+			return last, err
+		}
+		// A plan that does not report a revision cannot be judged; accept it
+		// (old servers, or a zeroed plan for a not-yet-materialized file).
+		if known <= 0 || last.Revision <= 0 || last.Revision >= known {
+			return last, nil
+		}
+		// Still behind: keep the newest answer seen and retry.
+	}
+	// Exhausted the budget: return the freshest plan we got rather than
+	// failing the read — the caller already had no better option, and a hard
+	// error here would turn replica lag into EIO for every reader.
+	return last, nil
+}
+
 func (b *Bridge) Read(ctx meta.Context, ino meta.Ino, indx uint32, slices *[]meta.Slice) syscall.Errno {
 	path, ok := b.remotePath(ino)
 	if !ok {
@@ -471,7 +514,7 @@ func (b *Bridge) Read(ctx meta.Context, ino meta.Ino, indx uint32, slices *[]met
 	if b.isClassicOwned(ino) {
 		return b.readClassic(ctx, ino, path, start, chunkEnd, slices)
 	}
-	plan, err := b.cfg.Client.GetExtentReadPlan(ctxOf(ctx), path, start, chunkEnd)
+	plan, err := b.fetchFreshReadPlan(ctxOf(ctx), ino, path, start, chunkEnd)
 	if err != nil {
 		if !client.IsNotFound(err) {
 			return errnoOf(err)
@@ -496,7 +539,7 @@ func (b *Bridge) Read(ctx meta.Context, ino meta.Ino, indx uint32, slices *[]met
 			return syscall.EIO
 		}
 		prevNext = plan.NextOffset
-		plan, err = b.cfg.Client.GetExtentReadPlan(ctxOf(ctx), path, plan.NextOffset, chunkEnd)
+		plan, err = b.fetchFreshReadPlan(ctxOf(ctx), ino, path, plan.NextOffset, chunkEnd)
 		if err != nil {
 			return errnoOf(err)
 		}
@@ -1142,8 +1185,15 @@ func (b *Bridge) commitClassic(ctx context.Context, ino meta.Ino, path string, p
 
 func (b *Bridge) commitWithRetry(ctx context.Context, ino meta.Ino, path string, blocks []client.ExtentBlockWrite, size, rev int64) error {
 	expRes := b.publicationIdentity(ino)
-	err := b.cfg.Client.CommitExtentPatchExpectedResource(ctx, path, size, blocks, rev, expRes)
+	// Capture the revision the completion echoes for THIS publication. It is
+	// the only revision a later read may treat as already-published here:
+	// without it, a read can fetch a plan served by a lagging replica and
+	// hand the caller an image OLDER than one this mount already wrote.
+	var landedRev int64
+	pctx := client.WithCompletedRevisionSink(ctx, &landedRev)
+	err := b.cfg.Client.CommitExtentPatchExpectedResource(pctx, path, size, blocks, rev, expRes)
 	if err == nil {
+		b.recordLandedRevision(ino, landedRev)
 		return nil
 	}
 	if errors.Is(err, client.ErrResourceMismatch) {
@@ -1166,11 +1216,36 @@ func (b *Bridge) commitWithRetry(ctx context.Context, ino meta.Ino, path string,
 		b.abandonIno(ino)
 		return fmt.Errorf("target %s no longer holds the staged object", path)
 	}
-	err2 := b.cfg.Client.CommitExtentPatchExpectedResource(ctx, path, size, blocks, st.Revision, id2)
+	landedRev = 0
+	err2 := b.cfg.Client.CommitExtentPatchExpectedResource(client.WithCompletedRevisionSink(ctx, &landedRev), path, size, blocks, st.Revision, id2)
 	if errors.Is(err2, client.ErrResourceMismatch) {
 		b.abandonIno(ino)
 	}
+	if err2 == nil {
+		b.recordLandedRevision(ino, landedRev)
+	}
 	return err2
+}
+
+// recordLandedRevision remembers the newest revision this mount published for
+// an inode, so a later read can refuse an older plan.
+func (b *Bridge) recordLandedRevision(ino meta.Ino, rev int64) {
+	if rev <= 0 {
+		return
+	}
+	b.mu.Lock()
+	if rev > b.revs[ino] {
+		b.revs[ino] = rev
+	}
+	b.mu.Unlock()
+}
+
+// publishedRevision reports the newest revision this mount published for an
+// inode (0 when none is known).
+func (b *Bridge) publishedRevision(ino meta.Ino) int64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.revs[ino]
 }
 
 // flushPending commits a file's pending slices (used on Close and fsync
