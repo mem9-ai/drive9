@@ -531,12 +531,13 @@ func NewWithConfig(cfg Config) *Server {
 	mux.Handle("/v1/extent/meta", business)
 	mux.Handle("/v1/data-credential", business)
 	// Vault management API goes through tenant auth.
-	mux.Handle("/v1/vault/secrets", business)
-	mux.Handle("/v1/vault/secrets/", business)
-	mux.Handle("/v1/vault/tokens", business)
-	mux.Handle("/v1/vault/tokens/", business)
-	mux.Handle("/v1/vault/grants", business)
-	mux.Handle("/v1/vault/grants/", business)
+	// Vault mutations are audited (including refusals); the read surface is not.
+	mux.Handle("/v1/vault/secrets", s.adminAuditMiddleware(business))
+	mux.Handle("/v1/vault/secrets/", s.adminAuditMiddleware(business))
+	mux.Handle("/v1/vault/tokens", s.adminAuditMiddleware(business))
+	mux.Handle("/v1/vault/tokens/", s.adminAuditMiddleware(business))
+	mux.Handle("/v1/vault/grants", s.adminAuditMiddleware(business))
+	mux.Handle("/v1/vault/grants/", s.adminAuditMiddleware(business))
 	mux.Handle("/v1/vault/audit", business)
 	// Vault read (consumption) API: authenticated by capability token, NOT tenant token.
 	if s.vaultMK != nil && cfg.Pool != nil && cfg.Meta != nil {

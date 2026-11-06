@@ -40,6 +40,10 @@ func TestClassifyExecSQLStructuralForms(t *testing.T) {
 		{name: "statement chain rejected", query: "UPDATE file_tags SET tag_value = 'x'; DROP TABLE files", wantErr: "multiple statements"},
 		{name: "trailing semicolon allowed", query: "UPDATE file_tags SET tag_value = 'x';"},
 		{name: "executable comment rejected", query: "UPDATE file_tags /*!50000 JOIN files */ SET a = 1", wantErr: "unsupported SQL"},
+		// TiDB runs /*T! ... */ and /*T![feature] ... */; MariaDB runs /*M! ... */.
+		{name: "tidb executable comment rejected", query: "UPDATE file_tags /*T! JOIN files f ON 1=1 */ SET a = 1", wantErr: "unsupported SQL"},
+		{name: "tidb feature comment rejected", query: "UPDATE file_tags /*T![50000] JOIN files */ SET a = 1", wantErr: "unsupported SQL"},
+		{name: "mariadb executable comment rejected", query: "UPDATE file_tags /*M! JOIN files */ SET a = 1", wantErr: "unsupported SQL"},
 		{name: "unterminated literal rejected", query: "UPDATE file_tags SET tag_value = 'x", wantErr: "unsupported SQL"},
 		{name: "shadow table rejected", query: "UPDATE file_tags_shadow SET tag_value = 'x'", wantErr: "only SELECT"},
 

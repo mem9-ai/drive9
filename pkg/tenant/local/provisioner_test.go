@@ -143,8 +143,14 @@ func TestProvisionAndDeprovision(t *testing.T) {
 	if len(info.Username) > 32 {
 		t.Fatalf("tenant account %q exceeds the MySQL 32-character limit", info.Username)
 	}
-	if info.Password != deriveLocalTenantPassword(p.admin.Passwd, "11111111-2222-3333-4444-555555555555") {
-		t.Fatal("tenant password is not the derived value")
+	// The password is random per provisioning, not derived from the (possibly
+	// empty) admin secret, and the grant scope escapes SQL wildcards so a sibling
+	// database cannot match it.
+	if len(info.Password) != 48 {
+		t.Fatalf("tenant password length = %d, want a 48-character random value", len(info.Password))
+	}
+	if scope := localTenantGrantScope("drive9_abc_def"); strings.Contains(scope, "drive9_abc_def") {
+		t.Fatalf("grant scope %q does not escape the wildcard", scope)
 	}
 	tenantDSN := info.Username + ":" + info.Password + "@tcp(" + info.Host + ":" + strconv.Itoa(info.Port) + ")/" + info.DBName + "?parseTime=true"
 	if err := p.InitSchema(ctx, tenantDSN); err != nil {

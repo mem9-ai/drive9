@@ -2207,6 +2207,13 @@ func extractText(data []byte, contentType string, maxBytes int64) string {
 func (b *Dat9Backend) ExecSQL(ctx context.Context, query string) ([]map[string]interface{}, error) {
 	start := time.Now()
 	rows, err := b.store.ExecSQL(ctx, query)
+	if err != nil && errors.Is(err, datastore.ErrExecSQLRejected) {
+		// A statement the policy refused was never executed: that is client input,
+		// so it stays at warn level and out of the failure series.
+		observeBackend(ctx, b.tenantID, b.tidbCloudOrgID, "exec_sql", nil, start)
+		logger.Warn(ctx, "backend_exec_sql_rejected", zap.Int("query_len", len(query)), zap.Error(err))
+		return nil, err
+	}
 	observeBackend(ctx, b.tenantID, b.tidbCloudOrgID, "exec_sql", err, start)
 	if err != nil {
 		logger.Error(ctx, "backend_exec_sql_failed", zap.Int("query_len", len(query)), zap.Error(err))

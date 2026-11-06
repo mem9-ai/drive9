@@ -30,6 +30,10 @@ var (
 	// backslash escapes active and ANSI_QUOTES off; guessing under the other modes
 	// risks misclassifying a multi-table write, so SQL fails closed.
 	errExecSQLUnsafeSQLMode = errors.New("exec SQL is disabled: tenant sql_mode must not set NO_BACKSLASH_ESCAPES, ANSI_QUOTES or ANSI")
+	// ErrExecSQLRejected marks a policy refusal: the statement was not executed.
+	// Callers use it to keep their own logging at warn level — a client sending a
+	// rejected statement is not a server fault.
+	ErrExecSQLRejected = errors.New("exec SQL statement rejected by policy")
 	// errExecSQLSystemRead rejects statements that read outside the tenant's own
 	// tables: system variables (`@@GLOBAL.x` exposes operator-supplied provider
 	// credentials such as the auto-embedding API key) and the server's own
@@ -157,6 +161,23 @@ func rejectSystemReads(norm string, identifiers []string) error {
 	return nil
 }
 
+// execSQLPolicyError marks a classifier rejection while keeping its message
+// byte-identical: the API returns these errors to the client verbatim.
+type execSQLPolicyError struct{ err error }
+
+func (e *execSQLPolicyError) Error() string { return e.err.Error() }
+func (e *execSQLPolicyError) Unwrap() error { return e.err }
+func (e *execSQLPolicyError) Is(target error) bool {
+	return target == ErrExecSQLRejected
+}
+
+func markExecSQLPolicyError(err error) error {
+	if err == nil || errors.Is(err, ErrExecSQLRejected) {
+		return err
+	}
+	return &execSQLPolicyError{err: err}
+}
+
 func (s *Store) ExecSQL(ctx context.Context, query string) (out []map[string]interface{}, err error) {
 	start := time.Now()
 	defer observeStoreOp(ctx, "exec_sql", start, &err)
@@ -172,6 +193,14 @@ func (s *Store) ExecSQL(ctx context.Context, query string) (out []map[string]int
 		}
 		err = fmt.Errorf("database is closed")
 		logger.Error(ctx, "datastore_exec_sql_closed", zap.Error(err))
+		return nil, err
+	}
+
+	// Classify before touching the database: a rejected statement needs no
+	// connection, and it should not cost a sql_mode round trip.
+	if _, _, policyErr := classifyExecSQL(q); policyErr != nil {
+		err = markExecSQLPolicyError(policyErr)
+		logger.Warn(ctx, "datastore_exec_sql_rejected", zap.Int("query_len", len(q)), zap.Error(err))
 		return nil, err
 	}
 
@@ -203,8 +232,10 @@ func (s *Store) ExecSQL(ctx context.Context, query string) (out []map[string]int
 
 	kind, _, err := classifyExecSQL(q)
 	if err != nil {
+		// Unreachable in practice (classified above); kept so the statement that
+		// executes is always the statement that was classified.
 		logger.Warn(timeoutCtx, "datastore_exec_sql_rejected", zap.Int("query_len", len(q)), zap.Error(err))
-		return nil, err
+		return nil, markExecSQLPolicyError(err)
 	}
 
 	if kind == execSQLTagWrite {
@@ -341,10 +372,12 @@ func sanitizeSQLWithIdentifiers(query string) (string, []string, error) {
 			}
 			b.WriteByte(' ')
 		case c == '/' && i+1 < len(query) && query[i+1] == '*':
-			// MySQL executes /*! ... */ and /*!50700 ... */ comments, so they
-			// cannot be treated as inert noise.
-			if i+2 < len(query) && query[i+2] == '!' {
-				return "", nil, fmt.Errorf("%w: executable /*! comment", errExecSQLUnparseable)
+			// Executable comment dialects cannot be treated as inert noise: MySQL
+			// runs /*! ... */ and /*!50700 ... */, TiDB runs /*T! ... */ and
+			// /*T![feature] ... */, and MariaDB runs /*M! ... */. Blanking one would
+			// hide a JOIN from the classifier while the server still executes it.
+			if i+2 < len(query) && isExecutableCommentStart(query[i+2:]) {
+				return "", nil, fmt.Errorf("%w: executable comment", errExecSQLUnparseable)
 			}
 			end := strings.Index(query[i+2:], "*/")
 			if end < 0 {
@@ -405,6 +438,25 @@ func skipSQLQuoted(query string, start int, quote byte, backslashEscapes bool) (
 		return i + 1, true
 	}
 	return 0, false
+}
+
+// isExecutableCommentStart reports whether the text right after `/*` opens a
+// comment the server executes rather than ignores: `!`, or a vendor prefix letter
+// followed by `!` (TiDB's `T!`, MariaDB's `M!`).
+func isExecutableCommentStart(rest string) bool {
+	if rest == "" {
+		return false
+	}
+	if rest[0] == '!' {
+		return true
+	}
+	if len(rest) >= 2 && rest[1] == '!' {
+		switch rest[0] {
+		case 't', 'T', 'm', 'M':
+			return true
+		}
+	}
+	return false
 }
 
 func isMySQLSpace(c byte) bool {

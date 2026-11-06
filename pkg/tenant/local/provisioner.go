@@ -7,7 +7,7 @@ package local
 
 import (
 	"context"
-	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -100,7 +100,7 @@ func (p *Provisioner) Provision(ctx context.Context, tenantID string) (*tenant.C
 	// account would give it every other tenant's database (and the control plane,
 	// which lives on the same instance). The tenant gets its own account, granted
 	// only on its own schema.
-	credential, err := ensureLocalTenantAccount(ctx, admin, p.admin.Passwd, tenantID, dbName)
+	credential, err := ensureLocalTenantAccount(ctx, admin, tenantID, dbName)
 	if err != nil {
 		return nil, err
 	}
@@ -136,11 +136,18 @@ type localTenantCredential struct {
 // id, so re-provisioning an existing tenant converges instead of rotating a
 // credential the metadata store already holds. The account name is derived the
 // same way, which keeps it stable across restarts.
-func ensureLocalTenantAccount(ctx context.Context, admin *sql.DB, adminPassword, tenantID, dbName string) (localTenantCredential, error) {
+func ensureLocalTenantAccount(ctx context.Context, admin *sql.DB, tenantID, dbName string) (localTenantCredential, error) {
 	username := localTenantUserName(tenantID)
-	password := deriveLocalTenantPassword(adminPassword, tenantID)
-	if username == "" || password == "" {
+	if username == "" {
 		return localTenantCredential{}, fmt.Errorf("derive local tenant credential for %s", tenantID)
+	}
+	// A random per-tenant password, not one derived from the admin secret: the
+	// default local DSN has no password, and a derived value would then be a public
+	// function of the tenant id — anyone who can reach the instance could compute
+	// it. The caller persists this value encrypted, so a retry is consistent.
+	password, err := newLocalTenantPassword()
+	if err != nil {
+		return localTenantCredential{}, err
 	}
 	user := quoteString(username) + "@'%'"
 	statements := []struct {
@@ -148,9 +155,9 @@ func ensureLocalTenantAccount(ctx context.Context, admin *sql.DB, adminPassword,
 		sql  string
 	}{
 		{"create account", "CREATE USER IF NOT EXISTS " + user + " IDENTIFIED BY " + quoteString(password)},
-		{"grant schema access", "GRANT " + localTenantGrant + " ON " + quoteIdent(dbName) + ".* TO " + user},
+		{"grant schema access", "GRANT " + localTenantGrant + " ON " + localTenantGrantScope(dbName) + " TO " + user},
 		// Last, so a failed grant never leaves a credential the metadata store does
-		// not hold, and a retry converges on the derived password.
+		// not hold, and a retry converges on the returned password.
 		{"set password", "ALTER USER " + user + " IDENTIFIED BY " + quoteString(password)},
 	}
 	for _, stmt := range statements {
@@ -175,16 +182,33 @@ func localTenantUserName(tenantID string) string {
 	return "drive9_t_" + hex.EncodeToString(sum[:11])
 }
 
-// deriveLocalTenantPassword follows the native provider's pattern: an HMAC over
-// the instance's admin secret keyed by the tenant id, so the credential is
-// reproducible without storing another secret and differs per tenant.
-func deriveLocalTenantPassword(adminPassword, tenantID string) string {
-	if strings.TrimSpace(tenantID) == "" {
-		return ""
+// newLocalTenantPassword draws a random password for one local tenant.
+//
+// Deriving it from the admin secret would be reproducible but unsafe here: the
+// default local DSN authenticates as `root` with no password, so the derivation
+// key would be empty and every tenant password would be a public function of its
+// (API-visible) tenant id.
+func newLocalTenantPassword() (string, error) {
+	buf := make([]byte, 24)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("generate local tenant password: %w", err)
 	}
-	mac := hmac.New(sha256.New, []byte(adminPassword))
-	_, _ = mac.Write([]byte("drive9:local_tenant_pw:" + tenantID))
-	return hex.EncodeToString(mac.Sum(nil))[:32]
+	return hex.EncodeToString(buf), nil
+}
+
+// localTenantGrantScope renders the database scope of a grant.
+//
+// MySQL and TiDB treat `_` and `%` in a database-level GRANT scope as wildcards
+// even inside backticks, so `drive9_abc_def` would also grant `drive9_abcXdef`.
+// They are escaped to literals here.
+func localTenantGrantScope(dbName string) string {
+	escaped := strings.NewReplacer(
+		"\\", "\\\\",
+		"_", "\\_",
+		"%", "\\%",
+		"`", "``",
+	).Replace(dbName)
+	return "`" + escaped + "`.*"
 }
 
 func (p *Provisioner) InitSchema(ctx context.Context, dsn string) error {

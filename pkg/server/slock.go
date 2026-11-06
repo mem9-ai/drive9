@@ -468,10 +468,12 @@ func (s *Server) handleSlockCallback(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusUnauthorized, "slock login state is missing or expired")
 		return
 	}
-	// A provider that echoes the state parameter gives full login-CSRF binding;
-	// one that ignores it still leaves the signed cookie as proof that this
-	// browser started the login.
-	if state != "" && !hmac.Equal([]byte(state), []byte(nonce)) {
+	// The cookie only proves that this browser started *some* login; the nonce
+	// that comes back as `state` is what binds this authorization code to that
+	// login. Accepting a missing state would let an attacker who can get the
+	// victim's browser to start a login also hand it a code from their own Slock
+	// account, so a missing or mismatched value is refused.
+	if state == "" || !hmac.Equal([]byte(state), []byte(nonce)) {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "slock_callback_state_mismatch")...)
 		errJSON(w, http.StatusBadRequest, "invalid slock login state")
 		return
@@ -619,8 +621,21 @@ func clearSlockOAuthState(w http.ResponseWriter, r *http.Request, publicURL stri
 	})
 }
 
+// slockOAuthCookieSecure reports whether the login cookie may be marked Secure.
+//
+// Direct TLS and an https public URL are the obvious cases. Behind a TLS
+// terminating proxy neither is necessarily true, so a forwarded https scheme
+// counts too — it can only upgrade the decision, and a cookie that is not Secure
+// can leak over a plaintext request to the same host.
 func slockOAuthCookieSecure(r *http.Request, publicURL string) bool {
-	return r.TLS != nil || strings.HasPrefix(strings.ToLower(strings.TrimSpace(publicURL)), "https://")
+	if r.TLS != nil {
+		return true
+	}
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(publicURL)), "https://") {
+		return true
+	}
+	forwarded := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")[0])
+	return strings.EqualFold(forwarded, "https")
 }
 
 // appendURLQueryParam adds or replaces one query value without disturbing the rest

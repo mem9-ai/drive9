@@ -1,6 +1,9 @@
 package server
 
 import (
+	"bytes"
+	"encoding/json"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -39,6 +42,23 @@ func adminAuditAction(method, path string) string {
 			return "tenant_pool.update"
 		case http.MethodDelete:
 			return "tenant_pool.delete"
+		}
+	// Vault management mutates tenant secrets, tokens and grants; the existing
+	// vault events cover successful operations only.
+	case strings.HasPrefix(path, "/v1/vault/secrets"):
+		switch method {
+		case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+			return "vault.secret.mutate"
+		}
+	case strings.HasPrefix(path, "/v1/vault/tokens"):
+		switch method {
+		case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+			return "vault.token.mutate"
+		}
+	case strings.HasPrefix(path, "/v1/vault/grants"):
+		switch method {
+		case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+			return "vault.grant.mutate"
 		}
 	case path == "/v1/admin/object-backends" && method == http.MethodPost:
 		return "object_backend.create"
@@ -108,7 +128,7 @@ func adminAuditRecorder(w http.ResponseWriter) (http.ResponseWriter, func() int)
 // request scope, then the tenant/api-key scope, then the public key the caller
 // presented. The public key is not a secret and is still worth recording on a
 // refused request — that is the audit of an attempt.
-func adminAuditActor(r *http.Request) (actorKind, orgID, apiKeyID, publicKey string) {
+func adminAuditActor(r *http.Request, bodyPublicKey string) (actorKind, orgID, apiKeyID, publicKey string) {
 	tenantID, apiKeyID, _, scopeOrgID := requestMetricScope(r.Context())
 	_ = tenantID
 	if scopeOrgID != "" {
@@ -120,7 +140,38 @@ func adminAuditActor(r *http.Request) (actorKind, orgID, apiKeyID, publicKey str
 	if key := strings.TrimSpace(r.Header.Get(quotaPublicKeyHeader)); key != "" {
 		return "tidbcloud_api_key", "", "", key
 	}
+	if bodyPublicKey != "" {
+		return "tidbcloud_api_key", "", "", bodyPublicKey
+	}
 	return "unknown", "", "", ""
+}
+
+// adminAuditBodyPeekLimit bounds how much of a request body the audit middleware
+// buffers to find the caller's public key. The audited control-plane requests are
+// small JSON documents; a body larger than this is left alone.
+const adminAuditBodyPeekLimit = 1 << 20
+
+// adminAuditBodyPublicKey returns the `public_key` from a JSON request body and
+// restores the body for the handler.
+func adminAuditBodyPublicKey(r *http.Request) string {
+	if r.Body == nil || r.Method == http.MethodGet || r.Method == http.MethodHead {
+		return ""
+	}
+	raw, err := io.ReadAll(io.LimitReader(r.Body, adminAuditBodyPeekLimit))
+	_ = r.Body.Close()
+	if err != nil {
+		// The handler will see the truncated body it actually received.
+		r.Body = io.NopCloser(bytes.NewReader(raw))
+		return ""
+	}
+	r.Body = io.NopCloser(bytes.NewReader(raw))
+	var payload struct {
+		PublicKey string `json:"public_key"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(payload.PublicKey)
 }
 
 // adminAuditMiddleware emits one structured admin_audit record for every mutating
@@ -138,6 +189,11 @@ func (s *Server) adminAuditMiddleware(next http.Handler) http.Handler {
 			return
 		}
 		started := time.Now()
+		// Several audited routes authenticate from the JSON body
+		// ({"public_key": ...}), and the auth layer never gets to resolve them when
+		// it refuses the request. Peek at the body for the audit actor, then put it
+		// back for the handler.
+		auditBodyKey := adminAuditBodyPublicKey(r)
 		// Wrap the writer to capture the status, but keep every optional interface
 		// the original had: dropping http.Flusher here would break a streaming
 		// handler mounted behind the audit middleware.
@@ -153,7 +209,7 @@ func (s *Server) adminAuditMiddleware(next http.Handler) http.Handler {
 		if status >= http.StatusBadRequest {
 			result = "failed"
 		}
-		actorKind, orgID, apiKeyID, publicKey := adminAuditActor(r)
+		actorKind, orgID, apiKeyID, publicKey := adminAuditActor(r, auditBodyKey)
 		logger.Info(r.Context(), "admin_audit", eventFields(r.Context(), "admin_audit",
 			"action", action,
 			"target", r.URL.Path,

@@ -435,3 +435,58 @@ func TestSlockCallbackHTMLResponse(t *testing.T) {
 		t.Fatal("html response should show server URL section")
 	}
 }
+
+// The signed cookie only proves that this browser started some login. The
+// authorization code must come back with the matching nonce, or an attacker who
+// can make the victim's browser start a login can hand it their own code.
+func TestSlockCallbackRequiresMatchingState(t *testing.T) {
+	info := slockoauth.UserInfo{Sub: "sub-1", Type: "agent", ClientID: "drive9", ServerID: "server-1"}
+	srv, _, _ := newSlockTestServer(t, info)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	stateCookie, nonce := slockLoginState(t, ts.URL)
+
+	for _, tc := range []struct {
+		name  string
+		query string
+		want  int
+	}{
+		{name: "missing state", query: "code=attacker&format=json", want: http.StatusBadRequest},
+		{name: "wrong state", query: "code=attacker&format=json&state=not-the-nonce", want: http.StatusBadRequest},
+		{name: "matching state", query: "code=abc&format=json&state=" + nonce, want: http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodGet, ts.URL+"/v1/auth/slock/callback?"+tc.query, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.AddCookie(stateCookie)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			if resp.StatusCode != tc.want {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, tc.want)
+			}
+		})
+	}
+}
+
+// A cookie that is not Secure can leak over a plaintext request, so a forwarded
+// https scheme has to be honoured when TLS terminates in front of this server.
+func TestSlockOAuthCookieSecureHonoursForwardedProto(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/v1/auth/slock/login", nil)
+	if slockOAuthCookieSecure(req, "") {
+		t.Fatal("a plain request with no public URL must not be treated as secure")
+	}
+	req.Header.Set("X-Forwarded-Proto", "https")
+	if !slockOAuthCookieSecure(req, "") {
+		t.Fatal("a forwarded https scheme must mark the cookie Secure")
+	}
+	req.Header.Set("X-Forwarded-Proto", "http")
+	if !slockOAuthCookieSecure(req, "https://drive9.example.com") {
+		t.Fatal("an https public URL must already make the cookie Secure")
+	}
+}

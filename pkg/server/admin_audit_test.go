@@ -1,8 +1,10 @@
 package server
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/mem9-ai/drive9/pkg/logger"
@@ -31,11 +33,16 @@ func TestAdminAuditActionCoversDestructiveRoutes(t *testing.T) {
 		{http.MethodPost, "/v1/admin/tenant-pool", "tenant_pool.create"},
 		{http.MethodDelete, "/v1/admin/tenant-pool", "tenant_pool.delete"},
 		{http.MethodDelete, "/v1/admin/object-backends/ob1", "object_backend.delete"},
+		{http.MethodPost, "/v1/vault/secrets", "vault.secret.mutate"},
+		{http.MethodDelete, "/v1/vault/secrets/db", "vault.secret.mutate"},
+		{http.MethodPost, "/v1/vault/tokens", "vault.token.mutate"},
+		{http.MethodDelete, "/v1/vault/grants/g1", "vault.grant.mutate"},
 
 		// Reads are not audited.
 		{http.MethodGet, "/v1/admin/tenants", ""},
 		{http.MethodGet, "/v1/admin/tenants/t1", ""},
 		{http.MethodGet, "/healthz", ""},
+		{http.MethodGet, "/v1/vault/secrets", ""},
 	}
 	for _, tt := range tests {
 		if got := adminAuditAction(tt.method, tt.path); got != tt.want {
@@ -103,5 +110,42 @@ func TestAdminAuditMiddlewareIgnoresReads(t *testing.T) {
 		if entry.Message == "admin_audit" {
 			t.Fatal("a read produced an audit record")
 		}
+	}
+}
+
+// Routes that authenticate from the JSON body must still be attributed when auth
+// refuses the request; the body has to survive the peek for the handler.
+func TestAdminAuditMiddlewareAttributesBodyCredentials(t *testing.T) {
+	core, recorded := observer.New(zap.InfoLevel)
+	previous := logger.L()
+	logger.Set(zap.New(core))
+	t.Cleanup(func() { logger.Set(previous) })
+
+	var seenBody string
+	s := &Server{}
+	handler := s.adminAuditMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		seenBody = string(raw)
+		http.Error(w, "forbidden", http.StatusForbidden)
+	}))
+
+	body := `{"public_key":"PK-FROM-BODY","private_key":"secret"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/admin/tenants", strings.NewReader(body))
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+
+	if seenBody != body {
+		t.Fatalf("handler saw body %q, want the original body", seenBody)
+	}
+	var fields map[string]interface{}
+	for _, entry := range recorded.All() {
+		if entry.Message == "admin_audit" {
+			fields = entry.ContextMap()
+		}
+	}
+	if fields == nil {
+		t.Fatal("no admin_audit record")
+	}
+	if fields["actor_kind"] != "tidbcloud_api_key" || fields["actor_public_key"] != "PK-FROM-BODY" {
+		t.Fatalf("actor = %v/%v, want the body public key", fields["actor_kind"], fields["actor_public_key"])
 	}
 }
