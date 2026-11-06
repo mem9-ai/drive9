@@ -1524,10 +1524,17 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		// (unlink/14's re-create).
 		var st fs.Attr
 		var statErr error
-		// A nonexclusive kernel CREATE can still lose the negative-lookup
-		// race to another client; probe so an existing row is opened instead
-		// of returning a lazy PendingNew the uploader can never land.
-		st, statErr = w.probeExisting(ctx, next, op.Path)
+		if op.KernelCreate() && flags&uint32(syscall.O_EXCL) == 0 {
+			// Async create: the kernel's ordinary O_CREAT claims a fresh
+			// path without waiting on a remote HEAD. This is the v1
+			// behavior and the reason bulk small-file creation is fast;
+			// O_EXCL below still takes the server-arbitrated path. A
+			// raced existing row is reconciled when the pending image
+			// lands (the uploader owns that conflict resolution).
+			statErr = fs.ErrNotFound
+		} else {
+			st, statErr = w.probeExisting(ctx, next, op.Path)
+		}
 		if statErr != nil && fs.IsNotFound(statErr) && w.queue != nil && w.queue.HasPath(op.Path) {
 			// pending-cache visibility: the path was flushed into the
 			// async queue but has not landed yet. Wait for OUR entry (it is
