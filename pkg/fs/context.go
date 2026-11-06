@@ -179,6 +179,13 @@ const (
 	LookupPartialMiss                    // listing incomplete, name simply unknown
 )
 
+// Observation is an opaque namespace-cache request token. It is issued
+// before a remote listing/stat and consumed when the response is installed,
+// so a response that started before a local mutation cannot overwrite it.
+type Observation interface {
+	IsNamespaceObservation()
+}
+
 // DirListingCache caches directory listings for the facade: readdir
 // restarts consult it, fresh creates upsert into it, and removals drop
 // the affected listings. Owners install an implementation through the

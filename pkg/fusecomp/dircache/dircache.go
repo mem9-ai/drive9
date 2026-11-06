@@ -764,6 +764,44 @@ func (dc *DirCache) ObserveRemote(parentPath string, item fs.DirEntryInfo) {
 	dc.Observe(parentPath, item, token)
 }
 
+// IsNamespaceObservation marks RequestToken as an fs.Observation.
+func (RequestToken) IsNamespaceObservation() {}
+
+// BeginObservation registers a remote listing before it is issued.
+func (dc *DirCache) BeginObservation(dirPath string) fs.Observation {
+	return dc.BeginRequest(dirPath)
+}
+
+// InstallListing installs a listing fetched outside the facade's readdir
+// path (the terminal's negative-lookup storm escalation). The caller must
+// have begun the observation before issuing the request, so a local
+// mutation that raced the fetch keeps its row.
+func (dc *DirCache) InstallListing(dirPath string, items []fs.DirEntryInfo, token fs.Observation) {
+	if dc == nil || dirPath == "" {
+		return
+	}
+	request, ok := token.(RequestToken)
+	if !ok {
+		return
+	}
+	dc.PutListing(dirPath, items, request)
+}
+
+// EndObservation releases a listing observation that produced no install.
+func (dc *DirCache) EndObservation(token fs.Observation) {
+	if request, ok := token.(RequestToken); ok {
+		dc.EndRequest(request)
+	}
+}
+
+// ObserveObservation records a stat result with its pre-request token, so a
+// listing installed while the stat was in flight keeps the newer row.
+func (dc *DirCache) ObserveObservation(parentPath string, item fs.DirEntryInfo, token fs.Observation) {
+	if request, ok := token.(RequestToken); ok {
+		dc.Observe(parentPath, item, request)
+	}
+}
+
 // upsertInternal stores a child entry and advances the fencing generation.
 func (dc *DirCache) upsertInternal(parentPath string, item fs.DirEntryInfo) {
 	if item.Name == "" {

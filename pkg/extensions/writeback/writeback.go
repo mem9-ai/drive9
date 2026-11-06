@@ -1111,6 +1111,13 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		return res, nil
 	case fs.OpCreate:
 		flags := op.Flags
+		// A re-open whose newest image is still staged locally must serve that
+		// image, not probe the remote and wait for the previous upload. v1
+		// loaded the write-back cache here; #1026 dropped it, so append/reopen
+		// paid a 404 HEAD plus waitPathCommit/UploadSync per close.
+		if res, ok := w.openPendingWritable(op); ok {
+			return res, nil
+		}
 		if flags&uint32(syscall.O_CREAT) == 0 {
 			// v1 close-to-open: a read-only re-open of a path whose image
 			// has not landed serves the pending bytes — the kernel's LOOKUP
@@ -1277,7 +1284,19 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		// answer locally): a raw remote stat races backend replica lag right
 		// after this mount's own DELETE and resurrects the name as EEXIST
 		// (unlink/14's re-create).
-		st, statErr := w.probeExisting(ctx, next, op.Path)
+		var st fs.Attr
+		var statErr error
+		if op.KernelCreate() {
+			// The kernel resolved this create from a negative lookup: the
+			// name was missing immediately before the request. A stale
+			// negative (another client won the race) is reconciled at the
+			// commit boundary; probing here paid one HEAD per new file
+			// (fsmark/mdtest's create throughput) for an answer the kernel
+			// already had.
+			statErr = fs.ErrNotFound
+		} else {
+			st, statErr = w.probeExisting(ctx, next, op.Path)
+		}
 		if statErr != nil && fs.IsNotFound(statErr) && w.queue != nil && w.queue.HasPath(op.Path) {
 			// pending-cache visibility: the path was flushed into the
 			// async queue but has not landed yet. Wait for OUR entry (it is
@@ -4534,6 +4553,76 @@ func (w *Writeback) probeExisting(ctx context.Context, next fs.Next, path string
 		return fs.Attr{}, fs.ErrNotFound
 	}
 	return *res.Attr, nil
+}
+
+// openPendingWritable serves a writable re-open from the path's staged
+// image before any remote probe. v1's loadWritableHandleFromWriteBackLocked
+// did this; without it an append over a still-uploading close paid a 404
+// HEAD and then waited for the previous commit (or forced UploadSync).
+func (w *Writeback) openPendingWritable(op *fs.Op) (fs.Result, bool) {
+	if w == nil || op == nil || !w.hasPendingLocalState(op.Path) {
+		return fs.Result{}, false
+	}
+	flags := op.Flags
+	if flags&uint32(syscall.O_TRUNC) != 0 || flags&uint32(syscall.O_EXCL) != 0 {
+		return fs.Result{}, false
+	}
+	if flags&uint32(syscall.O_ACCMODE) == uint32(syscall.O_RDONLY) {
+		// The read-only pending path below owns this shape.
+		return fs.Result{}, false
+	}
+	if flags&uint32(syscall.O_APPEND) == 0 {
+		// Only append re-opens take this fast path. A second O_RDWR open
+		// owns the image's write side and must keep the existing
+		// handoff/upload ordering (the P2 upload-ack gate depends on it).
+		return fs.Result{}, false
+	}
+	meta, _ := w.pendingMeta(op.Path)
+	size := int64(0)
+	if meta != nil {
+		size = meta.Size
+	}
+	image := w.capturePendingImage(op.Path)
+	shadowGen := w.pinPendingShadow(op.Path)
+	if image == nil {
+		// A pending OVERWRITE can still preload from the write-back cache
+		// in ensureBuffer; a pending NEW image (or a queue-track shadow)
+		// with no materialized copy has no base this writable handle can
+		// compose over — do not turn a partial write into a replacement.
+		if meta == nil || meta.Kind == staging.PendingNew ||
+			w.wbCache == nil {
+			if shadowGen != 0 && w.opts.Staging != nil {
+				w.opts.Staging.Shadow.Unpin(shadowGen)
+			}
+			return fs.Result{}, false
+		}
+		if _, ok := w.wbCache.Get(op.Path); !ok {
+			if shadowGen != 0 && w.opts.Staging != nil {
+				w.opts.Staging.Shadow.Unpin(shadowGen)
+			}
+			return fs.Result{}, false
+		}
+	}
+	attr, ok := w.pendingAttr(op.Path)
+	if !ok {
+		attr = fs.Attr{Kind: fs.KindFile, Mode: 0o644, Size: size}
+	}
+	h := &bufferingHandle{w: w, path: op.Path, flags: flags,
+		baseSize: size, forceSync: hasSyncOpenFlag(flags),
+		pendingImage: image, pendingShadowGen: shadowGen}
+	if meta != nil {
+		h.supersededPendingGen = meta.Generation
+		h.isNew = meta.Kind == staging.PendingNew
+		if meta.HasMode {
+			h.pendingMode, h.hasPendingMode = meta.Mode, true
+		}
+	}
+	if pb, ok := w.pendingBaseRevOf(op.Path); ok {
+		h.baseRev = pb
+	}
+	w.track(h)
+	attrCopy := attr
+	return fs.Result{Attr: &attrCopy, Handle: h}, true
 }
 
 // hasPendingLocalState reports whether a not-yet-landed image owns the path
