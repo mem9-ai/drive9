@@ -1193,7 +1193,16 @@ func (c *Core) createOp(ctx context.Context, op *fs.Op) (fs.Result, error) {
 		// cached dentry (layer rollback, deferred delete). Those opens must
 		// still revalidate; only a revision-bound remote row is safe to
 		// answer without the terminal probe.
-		return fs.Result{Attr: op.OpenAttr, Handle: c.newSyncHandle(op.Path)}, nil
+		//
+		// The OPEN reply carries no attributes. Do not publish the inode's
+		// cached size as authoritative: a missed event can leave it behind a
+		// foreign append, and a read plane treating that prefix as the whole
+		// file returns EOF for the new tail even after GetAttr refreshed the
+		// inode. Size 0 means "unknown" to the read cache; the revision-bound
+		// range path still reads the remote.
+		attr := *op.OpenAttr
+		attr.Size = 0
+		return fs.Result{Attr: &attr, Handle: c.newSyncHandle(op.Path)}, nil
 	}
 
 	kernelCreate := op.KernelCreate() && flags&uint32(syscall.O_CREAT) != 0
@@ -1205,19 +1214,32 @@ func (c *Core) createOp(ctx context.Context, op *fs.Op) (fs.Result, error) {
 		// shared object but not every alias's entry), and staging a
 		// truncation at that stale base silently loses the commit to a CAS
 		// conflict. Read-only opens above may use the cached row because
-		// they never stage a write.
-		probe, statErr := c.statForWrite(ctx, op.Path)
-		exists = statErr == nil && probe.Attr != nil
-		if statErr != nil && statErr != fs.ErrNotFound {
-			return fs.Result{}, statErr
-		}
-		if exists {
+		// they never stage a write. A synthesized open carrying OpenAttr
+		// (writeback's fresh conflict probe) is the one exception: that row
+		// was just observed, not cached on the inode.
+		if op.Kernel == nil && op.OpenAttr != nil && op.OpenAttr.Rev > 0 {
+			exists = true
 			st = &client.StatResult{
-				IsDir: probe.Attr.IsDir(), Size: probe.Attr.Size,
-				Revision: probe.Attr.Rev, Mtime: probe.Attr.Mtime,
-				Mode: probe.Attr.Mode, HasMode: true,
-				Nlink: probe.Attr.Nlink, ResourceID: probe.Attr.ResourceID,
-				ExtentIno: probe.Attr.ExtentIno,
+				IsDir: op.OpenAttr.IsDir(), Size: op.OpenAttr.Size,
+				Revision: op.OpenAttr.Rev, Mtime: op.OpenAttr.Mtime,
+				Mode: op.OpenAttr.Mode, HasMode: true,
+				Nlink: op.OpenAttr.Nlink, ResourceID: op.OpenAttr.ResourceID,
+				ExtentIno: op.OpenAttr.ExtentIno,
+			}
+		} else {
+			probe, statErr := c.statForWrite(ctx, op.Path)
+			exists = statErr == nil && probe.Attr != nil
+			if statErr != nil && statErr != fs.ErrNotFound {
+				return fs.Result{}, statErr
+			}
+			if exists {
+				st = &client.StatResult{
+					IsDir: probe.Attr.IsDir(), Size: probe.Attr.Size,
+					Revision: probe.Attr.Rev, Mtime: probe.Attr.Mtime,
+					Mode: probe.Attr.Mode, HasMode: true,
+					Nlink: probe.Attr.Nlink, ResourceID: probe.Attr.ResourceID,
+					ExtentIno: probe.Attr.ExtentIno,
+				}
 			}
 		}
 	}
@@ -1242,6 +1264,38 @@ func (c *Core) createOp(ctx context.Context, op *fs.Op) (fs.Result, error) {
 	return fs.Result{Attr: attrOf(st), Handle: c.newSyncHandle(op.Path)}, nil
 }
 
+// truncateRemoteToZero publishes an empty image for a CREATE that lost to
+// an existing file but carried O_TRUNC. The commit CASes on the observed
+// revision and re-stats on conflict, mirroring setAttrOp's truncate ladder.
+func (c *Core) truncateRemoteToZero(ctx context.Context, rp string, st *client.StatResult) error {
+	rev := st.Revision
+	for attempt := 0; attempt < 3; attempt++ {
+		if rev <= 0 {
+			fresh, serr := c.remoteStatDetached(rp)
+			if serr != nil || fresh == nil {
+				return c.mapErr(serr)
+			}
+			rev = fresh.Revision
+		}
+		if rev <= 0 {
+			return fs.StatusErrorOf(gofuse.Status(syscall.EIO))
+		}
+		err := c.cl.WriteStreamConditional(ctx, rp, bytes.NewReader(nil), 0, nil, rev)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, client.ErrConflict) {
+			return c.mapErr(err)
+		}
+		fresh, serr := c.remoteStatDetached(rp)
+		if serr != nil || fresh == nil {
+			return c.mapErr(serr)
+		}
+		rev = fresh.Revision
+	}
+	return fs.StatusErrorOf(gofuse.Status(syscall.EIO))
+}
+
 // createRemoteFile creates a regular file and returns the attributes the
 // CREATE reply needs without a second round trip. The server's create reply
 // carries the revision; the terminal synthesizes the empty-file row from the
@@ -1261,6 +1315,19 @@ func (c *Core) createRemoteFile(ctx context.Context, op *fs.Op, rp string) (*cli
 		if st, serr := c.cl.StatCtx(ctx, rp); serr == nil && st != nil {
 			if op.Flags&uint32(syscall.O_EXCL) != 0 {
 				return nil, syscall.EEXIST
+			}
+			if op.Flags&uint32(syscall.O_TRUNC) != 0 {
+				// The kernel resolved a stale negative, so this CREATE
+				// conflicted with an existing file. A plain handle return
+				// defers the requested truncation to a later write; a crash
+				// before that write would leave the old suffix visible.
+				if err := c.truncateRemoteToZero(ctx, rp, st); err != nil {
+					return nil, err
+				}
+				if fresh, ferr := c.remoteStatDetached(rp); ferr == nil && fresh != nil {
+					return fresh, nil
+				}
+				st.Size, st.Revision = 0, 0
 			}
 			return st, nil
 		}

@@ -49,7 +49,7 @@ func TestPortKernelCreateSkipsExistenceProbe(t *testing.T) {
 	}
 	ctx := context.Background()
 	res, err := ch.Dispatch(ctx, &fs.Op{
-		Kind: fs.OpCreate, Path: "/f", Flags: uint32(syscall.O_CREAT | syscall.O_WRONLY),
+		Kind: fs.OpCreate, Path: "/f", Flags: uint32(syscall.O_CREAT | syscall.O_EXCL | syscall.O_WRONLY),
 		Mode: 0o644, HasMode: true, Kernel: &gofuse.CreateIn{},
 	})
 	if err != nil {
@@ -271,7 +271,7 @@ func TestPortPendingOverwriteAppendAdoptsUploadRevision(t *testing.T) {
 	if h.baseRev != 1 || h.supersededPendingGen != gen {
 		t.Fatalf("before ack: baseRev=%d gen=%d, want 1/%d", h.baseRev, h.supersededPendingGen, gen)
 	}
-	wb.acknowledgeUploadedCreate("/f", 2, gen, gen)
+	wb.acknowledgeUploadedCreate("/f", 2, gen, pendingGenCache, gen)
 	h.mu.Lock()
 	baseRev, supersedes := h.baseRev, h.supersededPendingGen
 	h.mu.Unlock()
@@ -322,8 +322,92 @@ func TestPortPendingOverwriteAppendRebasesNewerStage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wb.acknowledgeUploadedCreate("/f", 2, gen1, gen1)
+	wb.acknowledgeUploadedCreate("/f", 2, gen1, pendingGenCache, gen1)
 	if meta, ok := wbcache.GetMeta("/f"); !ok || meta.BaseRev != 2 {
 		t.Fatalf("newer staged meta after ack = %+v ok=%v, want base 2", meta, ok)
+	}
+}
+
+// Cache and pending-index generation counters are independent; a queue
+// acknowledgement with a coincidentally equal number must not advance a
+// cache-backed handle's base.
+func TestPortAckIgnoresMatchingNumberFromOtherTrack(t *testing.T) {
+	b := testbackend.NewBackend()
+	ts := httptest.NewServer(b)
+	defer ts.Close()
+	cl := client.New(ts.URL, "")
+	wbcache, err := staging.NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gen, _, err := wbcache.PutWithBaseRevAndModeTimings("/f", []byte("base"), 4, staging.PendingOverwrite, 1, 0o644, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wb, err := New(Options{Policy: PolicyWriteBack, Client: cl, WriteCache: wbcache})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, ok := wb.openPendingWritable(&fs.Op{Kind: fs.OpCreate, Path: "/f", Flags: uint32(syscall.O_WRONLY | syscall.O_APPEND)})
+	if !ok {
+		t.Fatal("pending overwrite append did not take the fast path")
+	}
+	h := res.Handle.(*bufferingHandle)
+	wb.acknowledgeUploadedCreate("/f", 2, gen, pendingGenQueue, 0)
+	h.mu.Lock()
+	baseRev := h.baseRev
+	h.mu.Unlock()
+	if baseRev != 1 {
+		t.Fatalf("queue ack changed cache handle baseRev to %d, want 1", baseRev)
+	}
+}
+
+// A nonexclusive kernel CREATE can lose the negative-lookup race to another
+// client. The writeback tier must reconcile against the existing remote row
+// instead of returning a lazy PendingNew that the uploader can never land.
+func TestPortKernelCreateReconcilesExistingNonexclusive(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/f", []byte("old"))
+	var heads atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/status" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.Method == http.MethodHead {
+			heads.Add(1)
+		}
+		b.ServeHTTP(w, r)
+	}))
+	defer ts.Close()
+	cl := client.New(ts.URL, "")
+	wb, err := New(Options{Policy: PolicyWriteBack, Client: cl})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := fs.NewChain(wb, terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := ch.Dispatch(context.Background(), &fs.Op{
+		Kind: fs.OpCreate, Path: "/f", Flags: uint32(syscall.O_CREAT | syscall.O_RDWR),
+		Mode: 0o644, HasMode: true, Kernel: &gofuse.CreateIn{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, ok := res.Handle.(*bufferingHandle)
+	if !ok {
+		t.Fatalf("handle type = %T", res.Handle)
+	}
+	if h.isNew || h.baseRev != 1 {
+		t.Fatalf("reconciled create isNew=%v baseRev=%d, want false/1", h.isNew, h.baseRev)
+	}
+	if got := heads.Load(); got != 1 {
+		t.Fatalf("nonexclusive create probe HEADs = %d, want 1", got)
 	}
 }

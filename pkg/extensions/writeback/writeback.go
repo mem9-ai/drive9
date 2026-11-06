@@ -228,6 +228,18 @@ type stripedLocks struct {
 // without round trips) and commits whole images per policy. New files are
 // created lazily: the remote sees nothing until the commit boundary, and
 // reads of never-written regions return zeros, matching the terminal.
+// pendingGenSource identifies which staging track issued a generation
+// number. The write-back cache and the commit-queue pending index use
+// independent counters, so a bare uint64 comparison can match a generation
+// from the other track.
+type pendingGenSource uint8
+
+const (
+	pendingGenNone pendingGenSource = iota
+	pendingGenCache
+	pendingGenQueue
+)
+
 type bufferingHandle struct {
 	w    *Writeback
 	path string
@@ -264,6 +276,8 @@ type bufferingHandle struct {
 	// claimed as superseded by a landing, so a foreign writer's conflict
 	// marker cannot be retired by an image that never contained its bytes.
 	supersededPendingGen uint64
+	// supersededPendingSource binds the generation above to its track.
+	supersededPendingSource pendingGenSource
 	// pendingFile backs a snapshot larger than the memory bound: the old
 	// object's bytes are streamed to a temp file (closed with the handle),
 	// so a 65MiB anonymous fd keeps its identity instead of falling back
@@ -535,7 +549,7 @@ func New(opts Options) (*Writeback, error) {
 		up.OnSuccess = func(meta staging.WriteBackMeta, committedRev int64, gens StagingGens) {
 			unlock := w.pathLocks.lock(meta.Path)
 			defer unlock()
-			w.acknowledgeUploadedCreate(meta.Path, committedRev, meta.Generation, meta.Generation)
+			w.acknowledgeUploadedCreate(meta.Path, committedRev, meta.Generation, pendingGenCache, meta.Generation)
 			if meta.Kind == staging.PendingChmod {
 				return
 			}
@@ -602,7 +616,7 @@ func New(opts Options) (*Writeback, error) {
 			// Queue entries carry PendingIndexGen, a generation space separate from
 			// the .dat/.meta cache; only use it for live-handle lineage, never
 			// to rebase a cache entry that merely shares the number.
-			w.acknowledgeUploadedCreate(entry.Path, committedRev, entry.PendingIndexGen, 0)
+			w.acknowledgeUploadedCreate(entry.Path, committedRev, entry.PendingIndexGen, pendingGenQueue, 0)
 			if w.opts.Policy == PolicyWriteSync || w.opts.Policy == PolicyCloseSync {
 				w.armBypass(entry.Path, committedRev, entry.Size, "sync-commit")
 			}
@@ -1137,8 +1151,9 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 					// The handle serves this pending generation's image, so a
 					// later staging through it contains that generation — and
 					// only it.
-					if meta, ok := w.pendingMeta(op.Path); ok && meta != nil {
+					if meta, track := w.pendingMetaTrack(op.Path); meta != nil {
 						h.supersededPendingGen = meta.Generation
+						h.supersededPendingSource = track
 					}
 					if pb, ok := w.pendingBaseRevOf(op.Path); ok {
 						h.baseRev = pb
@@ -1156,7 +1171,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 				// need the mode.
 				if w.hasPendingLocalState(op.Path) {
 					size := int64(0)
-					meta, _ := w.pendingMeta(op.Path)
+					meta, track := w.pendingMetaTrack(op.Path)
 					if meta != nil {
 						size = meta.Size
 					}
@@ -1170,6 +1185,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 						// captured image IS this generation's content.
 						if meta != nil {
 							h.supersededPendingGen = meta.Generation
+							h.supersededPendingSource = track
 						}
 						if pb, ok := w.pendingBaseRevOf(op.Path); ok {
 							h.baseRev = pb
@@ -1289,13 +1305,12 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		// (unlink/14's re-create).
 		var st fs.Attr
 		var statErr error
-		if op.KernelCreate() {
-			// The kernel resolved this create from a negative lookup: the
-			// name was missing immediately before the request. A stale
-			// negative (another client won the race) is reconciled at the
-			// commit boundary; probing here paid one HEAD per new file
-			// (fsmark/mdtest's create throughput) for an answer the kernel
-			// already had.
+		if op.KernelCreate() && op.Flags&uint32(syscall.O_EXCL) != 0 {
+			// O_EXCL is the one shape whose creation the server itself
+			// arbitrates; a probe would only duplicate that answer. A
+			// nonexclusive kernel CREATE can still lose the race to another
+			// client after the negative lookup, and a lazy PendingNew would
+			// then be rejected forever by the existing remote row.
 			statErr = fs.ErrNotFound
 		} else {
 			st, statErr = w.probeExisting(ctx, next, op.Path)
@@ -1326,7 +1341,20 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			return fs.Result{}, statErr
 		}
 		if statErr == nil {
-			res, err := next(ctx, op)
+			nextOp := op
+			if op.KernelCreate() {
+				// This CREATE lost the negative-lookup race. Re-enter the
+				// chain as a synthesized existing open with the fresh probe
+				// attrs; leaving KernelCreate set would make the terminal
+				// issue another create and pay a second HEAD to discover the
+				// same conflict.
+				cp := *op
+				attr := st
+				cp.Kernel = nil
+				cp.OpenAttr = &attr
+				nextOp = &cp
+			}
+			res, err := next(ctx, nextOp)
 			if err != nil || res.Handle == nil {
 				return res, err
 			}
@@ -3597,7 +3625,7 @@ func (h *bufferingHandle) checkoutDropCleanBuffer() {
 	h.buf = nil
 }
 
-func (w *Writeback) acknowledgeUploadedCreate(path string, rev int64, generation, cacheGeneration uint64) {
+func (w *Writeback) acknowledgeUploadedCreate(path string, rev int64, generation uint64, source pendingGenSource, cacheGeneration uint64) {
 	// Retire the name claim and, for an append opener composed over this
 	// generation, advance its CAS base. A pending-overwrite opener captured
 	// BaseRev R while the upload was in flight; leaving it at R stages its
@@ -3621,7 +3649,7 @@ func (w *Writeback) acknowledgeUploadedCreate(path string, rev int64, generation
 			if rev > 0 {
 				h.baseRev = rev
 			}
-		case generation != 0 && h.supersededPendingGen == generation:
+		case generation != 0 && h.supersededPendingGen == generation && h.supersededPendingSource == source:
 			// The handle's captured image includes the generation this
 			// upload just published. Its next append/overwrite is derived
 			// from that revision, not the pre-upload base.
@@ -3688,17 +3716,23 @@ func (w *Writeback) pendingAttr(path string) (fs.Attr, bool) {
 // pendingMeta returns the staged image's metadata from either pending
 // track (ledger first, mirroring pendingAttr's precedence).
 func (w *Writeback) pendingMeta(path string) (*staging.WriteBackMeta, bool) {
+	meta, _ := w.pendingMetaTrack(path)
+	return meta, meta != nil
+}
+
+// pendingMetaTrack is pendingMeta plus the generation's source track.
+func (w *Writeback) pendingMetaTrack(path string) (*staging.WriteBackMeta, pendingGenSource) {
 	if w.opts.Staging != nil {
 		if meta, ok := w.opts.Staging.Pending.GetMeta(path); ok {
-			return meta, true
+			return meta, pendingGenQueue
 		}
 	}
 	if w.wbCache != nil {
 		if meta, ok := w.wbCache.GetMeta(path); ok {
-			return meta, true
+			return meta, pendingGenCache
 		}
 	}
-	return nil, false
+	return nil, pendingGenNone
 }
 
 // attrFromPendingMeta builds the overlay reply for a staged image. Only a
@@ -4623,7 +4657,7 @@ func (w *Writeback) openPendingWritable(op *fs.Op) (fs.Result, bool) {
 	if !w.hasPendingLocalState(op.Path) {
 		return fs.Result{}, false
 	}
-	meta, _ := w.pendingMeta(op.Path)
+	meta, track := w.pendingMetaTrack(op.Path)
 	size := int64(0)
 	if meta != nil {
 		size = meta.Size
@@ -4667,6 +4701,7 @@ func (w *Writeback) openPendingWritable(op *fs.Op) (fs.Result, bool) {
 		pendingImage: image, pendingShadowGen: shadowGen}
 	if meta != nil {
 		h.supersededPendingGen = meta.Generation
+		h.supersededPendingSource = track
 		h.isNew = meta.Kind == staging.PendingNew
 		if meta.HasMode {
 			h.pendingMode, h.hasPendingMode = meta.Mode, true
@@ -5728,6 +5763,7 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 	// it — never a foreign writer's generation, which the handle's buffer
 	// was never composed over).
 	h.supersededPendingGen = pendingGen
+	h.supersededPendingSource = pendingGenQueue
 	// v1 publishStagedSnapshotLineageLocked: the staged snapshot becomes
 	// this handle's content identity — the next staging parents on it.
 	h.contentSnapshotID = snapshotID

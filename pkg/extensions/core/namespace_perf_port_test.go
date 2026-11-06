@@ -170,6 +170,9 @@ func TestPortReadOnlyOpenSkipsProbe(t *testing.T) {
 	if res.Handle == nil {
 		t.Fatal("read-only open returned no handle")
 	}
+	if res.Attr == nil || res.Attr.Size != 0 {
+		t.Fatalf("read-only open attr = %+v, want size 0 (unknown)", res.Attr)
+	}
 	if got := headCount(b, "/f"); got != 0 {
 		t.Fatalf("read-only open HEADs = %d, want 0", got)
 	}
@@ -202,5 +205,29 @@ func TestPortWritableOpenRevalidatesZeroRevisionRow(t *testing.T) {
 	}
 	if got := headCount(b, "/f"); got != 1 {
 		t.Fatalf("zero-revision writable open HEADs = %d, want 1", got)
+	}
+}
+
+// A kernel CREATE that loses to an existing file (stale negative) must
+// still honor O_TRUNC during CREATE handling; deferring it to a later write
+// leaves the old suffix visible if the writer crashes before writing.
+func TestPortKernelCreateConflictPreservesTruncate(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/f", []byte("abcdef"))
+	c, stop := newPerfCore(t, b)
+	defer stop()
+	res, err := c.createOp(context.Background(), &fs.Op{
+		Kind: fs.OpCreate, Path: "/f",
+		Flags: uint32(syscall.O_CREAT | syscall.O_TRUNC | syscall.O_WRONLY),
+		Mode:  0o644, HasMode: true, Kernel: &gofuse.CreateIn{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Attr == nil || res.Attr.Size != 0 {
+		t.Fatalf("create-conflict attr = %+v, want size 0", res.Attr)
+	}
+	if n, ok := b.Node("/f"); !ok || len(n.Data) != 0 {
+		t.Fatalf("remote after create-conflict truncate = %q ok=%v", n.Data, ok)
 	}
 }
