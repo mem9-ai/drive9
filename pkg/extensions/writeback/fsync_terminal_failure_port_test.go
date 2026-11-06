@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -32,13 +33,14 @@ import (
 // production symptom of the server-side 500s.
 //
 // renameGate, when set, parks the FIRST rename request until the channel
-// closes and reports the parking through gated once. The rename is applied
-// SERVER-SIDE first and only the response is held: a test can stage under
-// the old name while the namespace has already moved — the publication
-// window the pre-rename drain cannot see, including everything that happens
-// between the server-side change and the delayed response. The parked
-// request keeps the fail snapshot from its arrival, so the rename itself
-// still succeeds while everything staged meanwhile fails.
+// closes and reports through gated once the rename has been applied
+// SERVER-SIDE (gated proves the move completed, not merely that the request
+// arrived). Only the response is held: a test can stage under the old name
+// while the namespace has already moved — the publication window the
+// pre-rename drain cannot see, including everything that happens between
+// the server-side change and the delayed response. The parked request keeps
+// the fail snapshot from its arrival, so the rename itself still succeeds
+// while everything staged meanwhile fails.
 type failingWritesBackend struct {
 	backend *testbackend.Backend
 	mu      sync.Mutex
@@ -49,6 +51,13 @@ type failingWritesBackend struct {
 
 	renameGate chan struct{}
 	gated      chan struct{}
+
+	// statNeedle, when nonempty, arms counting of HEAD/GET requests whose
+	// URL path contains the needle: a test arms it at a precise point (the
+	// parked rename resuming) and asserts whether the flow probed a name it
+	// had no business statting afterwards.
+	statNeedle string
+	statHits   int
 }
 
 func (b *failingWritesBackend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -56,19 +65,23 @@ func (b *failingWritesBackend) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	fail := b.fail
 	failStat := b.failStat
 	gate := b.renameGate
+	statNeedle := b.statNeedle
 	if gate != nil && r.URL.Query().Has("rename") {
 		b.renameGate = nil
 		gated := b.gated
 		b.gated = nil
 		b.mu.Unlock()
+		// Apply the rename server-side FIRST, then signal, then hold only
+		// the response: the namespace has moved while the client still
+		// believes the RPC is in flight, and the gated signal now proves the
+		// move itself completed — the test's in-gap actions (staging under
+		// the old name, recreating it) run against the post-move namespace
+		// deterministically.
+		rec := httptest.NewRecorder()
+		b.backend.ServeHTTP(rec, r)
 		if gated != nil {
 			close(gated)
 		}
-		// Apply the rename server-side, then hold only the response: the
-		// namespace has moved while the client still believes the RPC is in
-		// flight.
-		rec := httptest.NewRecorder()
-		b.backend.ServeHTTP(rec, r)
 		<-gate
 		for k, v := range rec.Header() {
 			w.Header()[k] = v
@@ -78,6 +91,11 @@ func (b *failingWritesBackend) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	b.mu.Unlock()
+	if (r.Method == http.MethodGet || r.Method == http.MethodHead) && statNeedle != "" && strings.Contains(r.URL.Path, statNeedle) {
+		b.mu.Lock()
+		b.statHits++
+		b.mu.Unlock()
+	}
 	if failStat && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
 		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
 		return
@@ -87,6 +105,21 @@ func (b *failingWritesBackend) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	b.backend.ServeHTTP(w, r)
+}
+
+// armStatCounting starts counting HEAD/GET requests whose URL path contains
+// needle, resetting the hit count.
+func (b *failingWritesBackend) armStatCounting(needle string) {
+	b.mu.Lock()
+	b.statNeedle, b.statHits = needle, 0
+	b.mu.Unlock()
+}
+
+// statCount reports the armed counter's hits.
+func (b *failingWritesBackend) statCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.statHits
 }
 
 func (b *failingWritesBackend) setFail(fail bool) {
@@ -1611,6 +1644,9 @@ func TestPortRenameCarriesPublicationFromRetargetGap(t *testing.T) {
 	if terr != nil {
 		t.Fatalf("first transition pass: %v", terr)
 	}
+	// The second window's commit-stamp baseline, read where the handler
+	// reads it: with the first window's delta, before the gap opens.
+	baseline := wb.queue.CommitSeq("/gap-src.txt")
 	// THE GAP: locks released, handles not yet moved — the writer stages a
 	// fresh image under the old name and its Flush clears the dirty flag.
 	fb.setFail(true)
@@ -1624,7 +1660,7 @@ func TestPortRenameCarriesPublicationFromRetargetGap(t *testing.T) {
 	wb.retarget("/gap-src.txt", "/gap-dst.txt")
 	// The handler's second pass: the stranded old-name publication moves.
 	secondFence := renameFence{movedAt: fence.movedAt, ownGen: installedGen}
-	secondWork := (wb.queue != nil && wb.queue.HasPath("/gap-src.txt")) || wb.everLanded("/gap-src.txt")
+	secondWork := wb.renameWindowWork("/gap-src.txt", baseline)
 	if !secondWork {
 		t.Fatal("the gap publication was not detected as in-window work")
 	}
@@ -1645,6 +1681,266 @@ func TestPortRenameCarriesPublicationFromRetargetGap(t *testing.T) {
 	}
 	if _, recreated := nodeString(fb.backend, "/gap-src.txt"); recreated {
 		t.Fatal("the dead old name was resurrected")
+	}
+}
+
+// TestPortRenameSecondPassSeesCompletedOldNameLanding pins the second pass's
+// blind spot from #1083: the gap publication does not stay pending — it
+// COMPLETES fully under the obsolete source name (queue and pending cleanup
+// done, the old name resurrected by the upload), and the event stream then
+// wipes every landed watermark (EventUnverified/EventCheckout) before the
+// handle retarget. HasPath and everLanded are both false at the second pass;
+// only the unconditional commit-seq delta still witnesses the landing, and
+// the pass must run its strict old-name check and leave a failure witness at
+// the destination instead of certifying the stale v1 image.
+func TestPortRenameSecondPassSeesCompletedOldNameLanding(t *testing.T) {
+	fb := &failingWritesBackend{backend: testbackend.NewBackend()}
+	ch, wb := newUploadStack(t, fb, Options{Policy: PolicyWriteBack})
+	ctx := context.Background()
+
+	h := open(t, ch, "/old-land.txt")
+	if err := h.Write(ctx, 0, []byte("v1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// The server applies the rename; the handler's phases run manually.
+	if err := wb.opts.Client.RenameCtx(ctx, wb.remotePath("/old-land.txt"), wb.remotePath("/new-land.txt")); err != nil {
+		t.Fatal(err)
+	}
+	// First pass: the clean rename's transition (nothing was in-window).
+	fence := renameFence{movedAt: time.Now()}
+	installedGen, terr := wb.retargetConflictMarkers(ctx, "/old-land.txt", "/new-land.txt", fence, false)
+	if terr != nil {
+		t.Fatalf("first transition pass: %v", terr)
+	}
+	baseline := wb.queue.CommitSeq("/old-land.txt")
+
+	// THE GAP: the writer stages a fresh image under the old name, and its
+	// upload COMPLETES there — the not-found retry resurrects the obsolete
+	// name with v2 while the handles still point at it.
+	if err := h.Write(ctx, 0, []byte("landed v2")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if !wb.opts.Staging.Pending.HasPending("/old-land.txt") && !wb.queue.HasPath("/old-land.txt") {
+			if _, ok := nodeString(fb.backend, "/old-land.txt"); ok {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if wb.opts.Staging.Pending.HasPending("/old-land.txt") || wb.queue.HasPath("/old-land.txt") {
+		t.Fatal("the gap publication never completed under the old name")
+	}
+	// The event stream wipes every landed watermark before the retarget.
+	wb.clearLanded()
+
+	// The handle retarget, then the handler's second pass.
+	wb.retarget("/old-land.txt", "/new-land.txt")
+	if wb.queue.HasPath("/old-land.txt") || wb.everLanded("/old-land.txt") {
+		t.Fatal("precondition: the old detection signals must both be quiet")
+	}
+	secondFence := renameFence{movedAt: fence.movedAt, ownGen: installedGen}
+	if !wb.renameWindowWork("/old-land.txt", baseline) {
+		t.Fatal("the completed old-name landing was not detected as in-window work")
+	}
+	if _, terr := wb.retargetConflictMarkers(ctx, "/old-land.txt", "/new-land.txt", secondFence, true); terr == nil {
+		t.Fatal("the second pass certified the rename although v2 landed only under the obsolete name")
+	}
+	// The failure witness at the destination answers EIO at the barrier.
+	if err := wb.queue.PathTerminalFailure("/new-land.txt"); err == nil {
+		t.Fatal("no failure witness recorded at the destination")
+	}
+	if err := h.Sync(ctx); err == nil {
+		t.Fatal("strict Sync on the retargeted handle = nil, want EIO from the destination witness")
+	}
+	if got, ok := nodeString(fb.backend, "/old-land.txt"); !ok || got != "landed v2" {
+		t.Fatalf("remote image at the old name = %q ok=%v, want the resurrected gap landing", got, ok)
+	}
+	if got, ok := nodeString(fb.backend, "/new-land.txt"); !ok || got != "v1" {
+		t.Fatalf("remote image at the new name = %q ok=%v, want the renamed v1", got, ok)
+	}
+}
+
+// TestPortRenameHistoricalCommitIsNotInWindowWork pins the first pass's
+// endpoint baseline (the #1083 review finding): the source carries a commit
+// stamp from BEFORE the rename, and another client legitimately recreates
+// the old name after the server applies the rename but before this mount
+// receives the response. The old name is never under its own prefix (no
+// trailing slash), so the descendant snapshot carried no baseline for the
+// endpoint and any historical stamp read as "landed during the window"
+// against a zero: the strict old-name check stat'd the legitimately
+// recreated name, recorded a false failure witness at the destination, and
+// failed a clean rename with EIO. The pre-RPC endpoint baseline restricts
+// the comparison to commits that actually happened inside this rename's
+// window, so the rename succeeds without probing the old name at all.
+func TestPortRenameHistoricalCommitIsNotInWindowWork(t *testing.T) {
+	fb := &failingWritesBackend{backend: testbackend.NewBackend()}
+	gate := make(chan struct{})
+	gated := make(chan struct{})
+	fb.renameGate, fb.gated = gate, gated
+	ch, wb := newUploadStack(t, fb, Options{Policy: PolicyWriteBack})
+	ctx := context.Background()
+
+	// Committed history at the source: its commit stamp predates the rename.
+	h := open(t, ch, "/hist-a.txt")
+	if err := h.Write(ctx, 0, []byte("committed history")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if seq := wb.queue.CommitSeq("/hist-a.txt"); seq == 0 {
+		t.Fatal("the source never got a commit stamp")
+	}
+
+	// A second mount sharing only the backend plays the other client.
+	ch2, _ := newUploadStack(t, fb, Options{Policy: PolicyWriteBack})
+
+	renamed := make(chan error, 1)
+	go func() {
+		_, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/hist-a.txt", Path2: "/hist-b.txt"})
+		renamed <- err
+	}()
+	select {
+	case <-gated:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the rename request never reached the backend")
+	}
+	// The server has applied the rename and the response is parked: the
+	// other client legitimately recreates the old name in that gap. Nothing
+	// of THIS mount ever lands under it during the window.
+	other := open(t, ch2, "/hist-a.txt")
+	if err := other.Write(ctx, 0, []byte("recreated by another client")); err != nil {
+		t.Fatal(err)
+	}
+	if err := other.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// From here on (the response resuming), this rename has no in-window
+	// work and must not probe the old name.
+	fb.armStatCounting("/hist-a.txt")
+	close(gate)
+
+	select {
+	case err := <-renamed:
+		if err != nil {
+			t.Fatalf("clean rename reported %v, want success", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the rename never completed")
+	}
+	if err := wb.queue.PathTerminalFailure("/hist-b.txt"); err != nil {
+		t.Fatalf("a false failure witness was recorded at the destination: %v", err)
+	}
+	if m, ok := wb.opts.Staging.Pending.GetMeta("/hist-b.txt"); ok && m != nil && m.Kind == staging.PendingConflict {
+		t.Fatalf("destination pending entry = %+v, want no conflict marker", m)
+	}
+	if n := fb.statCount(); n != 0 {
+		t.Fatalf("the rename probed the old name %d times after the response, want none (no in-window work existed)", n)
+	}
+	// The renamed image stays intact and a clean fsync of the new name
+	// succeeds — no false witness poisons it.
+	fresh := open(t, ch, "/hist-b.txt")
+	if err := fresh.Sync(ctx); err != nil {
+		t.Fatalf("clean fsync on the renamed destination = %v, want nil", err)
+	}
+	if got, ok := nodeString(fb.backend, "/hist-a.txt"); !ok || got != "recreated by another client" {
+		t.Fatalf("remote image at the old name = %q ok=%v, want the other client's recreation untouched", got, ok)
+	}
+	if got, ok := nodeString(fb.backend, "/hist-b.txt"); !ok || got != "committed history" {
+		t.Fatalf("remote image at the new name = %q ok=%v, want the renamed history", got, ok)
+	}
+}
+
+// TestWitnessOnlyMarkerDoesNotFeedReadOverlay pins the read-data half of the
+// standalone witness from #1083: a recovered WitnessOnly conflict at /e/f
+// describes bytes preserved under a dead name — it carries no payload (Size
+// zero, no shadow) and must only answer EIO at fsync barriers. A read-only
+// open with no live writer falls through to the remote-backed handle, but
+// Read's pending overlay used the RAW pending meta: HasPending was true and
+// Size was 0, so every read at offset 0 returned a successful EOF before the
+// remote handle was ever touched — stat reported the real nonzero size while
+// reads came back empty. Reads must serve the remote image's bytes.
+func TestWitnessOnlyMarkerDoesNotFeedReadOverlay(t *testing.T) {
+	fb := &failingWritesBackend{backend: testbackend.NewBackend()}
+	ch, wb := newUploadStack(t, fb, Options{Policy: PolicyWriteBack})
+	ctx := context.Background()
+
+	// The TestStandaloneTransferFailureSurvivesRestart sequence: a child
+	// lands, the directory is renamed away, and the writer's gap publication
+	// lands fully under the resurrected old name — the settlement then
+	// installs the shadowless witness at the child's NEW name.
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpMkdir, Path: "/d", Mode: 0o755}); err != nil {
+		t.Fatal(err)
+	}
+	h := open(t, ch, "/d/f")
+	if err := h.Write(ctx, 0, []byte("child v1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	wb.forgetLanded("/d")
+	wb.forgetLandedPrefix("/d/")
+	if err := wb.opts.Client.RenameCtx(ctx, wb.remotePath("/d"), wb.remotePath("/e")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Write(ctx, 0, []byte("child v2 landed in the gap")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if !wb.opts.Staging.Pending.HasPending("/d/f") {
+			if _, ok := nodeString(fb.backend, "/d/f"); ok {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if wb.opts.Staging.Pending.HasPending("/d/f") {
+		t.Fatal("the gap successor never completed under the old prefix")
+	}
+	wb.retarget("/d", "/e")
+	wb.settleOldPrefixAfterMove(ctx, &fs.Op{Kind: fs.OpRename, Path: "/d", Path2: "/e"}, time.Now(), nil, nil, nil, map[string]bool{})
+
+	// The destination carries the standalone witness and a NONEMPTY remote
+	// image (the renamed v1).
+	marker, ok := wb.opts.Staging.Pending.GetMeta("/e/f")
+	if !ok || marker == nil || marker.Kind != staging.PendingConflict || !marker.WitnessOnly {
+		t.Fatalf("marker at /e/f = %+v ok=%v, want a witness-only conflict", marker, ok)
+	}
+	if got, ok := nodeString(fb.backend, "/e/f"); !ok || got != "child v1" {
+		t.Fatalf("remote image at /e/f = %q ok=%v, want the renamed child v1", got, ok)
+	}
+
+	// A read-only open with no live writer: reads serve the remote image's
+	// bytes — not a successful EOF manufactured from the witness's zero size.
+	ro := openRO(t, ch, "/e/f")
+	buf := make([]byte, len("child v1"))
+	n, rerr := ro.Read(ctx, 0, buf)
+	if rerr != nil {
+		t.Fatalf("read at 0 = %v, want the remote image", rerr)
+	}
+	if n != len("child v1") || string(buf[:n]) != "child v1" {
+		t.Fatalf("read at 0 = %q (n=%d), want %q", string(buf[:n]), n, "child v1")
+	}
+	// The witness keeps failing the durability barrier closed.
+	if err := wb.queue.PathTerminalFailure("/e/f"); err == nil {
+		t.Fatal("the witness stopped answering EIO at the barrier")
 	}
 }
 

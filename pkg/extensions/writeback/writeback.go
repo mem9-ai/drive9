@@ -1611,6 +1611,18 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			w.retarget(op.Path, op.Path2)
 			return fs.Result{}, nil
 		}
+		// The commit-stamp obligation window opens here and closes when the
+		// flow's LAST stamp comparison runs (settleOldPrefixAfterMove): every
+		// stamp snapshot below and every landing recorded inside the window's
+		// universe is pinned to the window, so the commit-stamp table's
+		// reclamation can never hide a landing a delta comparison or rekey
+		// fence still has to observe. The defer covers every exit below,
+		// including the EIO-returning transition failures.
+		var commitSeqWin *CommitSeqWindow
+		if w.queue != nil {
+			commitSeqWin = w.queue.BeginCommitSeqWindow(op.Path, op.Path2)
+			defer commitSeqWin.End()
+		}
 		// The destination's pending-generation snapshot, taken BEFORE the
 		// RPC: pending generations come from one global counter, so a
 		// destination entry still carrying the snapshotted generation is
@@ -1622,10 +1634,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		// released its locks, and a destination whose re-driven upload landed
 		// meanwhile has fulfilled the source record's obligation — the rekey
 		// declines instead of re-installing stale EIO over the landing.
-		dstLandedSnaps := map[string]uint64{}
-		if w.queue != nil {
-			dstLandedSnaps = w.queue.LandedSnapshotsForRename(op.Path2, strings.TrimSuffix(op.Path2, "/")+"/")
-		}
+		dstLandedSnaps := commitSeqWin.LandedSnapshotsForRename(op.Path2, strings.TrimSuffix(op.Path2, "/")+"/")
 		dstPreGen := map[string]uint64{}
 		if w.opts.Staging != nil && w.opts.Staging.Pending != nil {
 			if m, ok := w.opts.Staging.Pending.GetMeta(op.Path2); ok && m != nil {
@@ -1658,8 +1667,17 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		// payload conditions: that is the durable witness for "completed
 		// during the window". Snapshot it for the old prefix.
 		queueLandedSnap := map[string]uint64{}
+		// The endpoint's own pre-RPC baseline, read separately: the old name
+		// is never under its own prefix (no trailing slash), so the
+		// descendant snapshot below carries no stamp for it. Without this
+		// baseline every previously committed source reads as "landed during
+		// the window" against a zero, and a legitimate remote recreation of
+		// the old name by another client would fail a clean rename with EIO
+		// and a false destination witness.
+		preRPCCommitSeq := uint64(0)
 		if w.queue != nil {
-			queueLandedSnap = w.queue.CommitSeqsUnderPrefix(strings.TrimSuffix(op.Path, "/") + "/")
+			queueLandedSnap = commitSeqWin.CommitSeqsUnderPrefix(strings.TrimSuffix(op.Path, "/") + "/")
+			preRPCCommitSeq = w.queue.CommitSeq(op.Path)
 		}
 		// A rename over an OPEN target replaces the object its descriptors
 		// were reading: mark them anonymous BEFORE the remote rename (their
@@ -1686,13 +1704,20 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		// server-side change and this instant are fenced by revision instead
 		// (see renameFence).
 		movedAt := time.Now()
+		// The old name's unconditional commit stamp, read ONCE for both the
+		// first window's delta and the second pass's baseline: two separate
+		// reads would leave a landing between them invisible to both.
+		pathCommitSeq := uint64(0)
+		if w.queue != nil {
+			pathCommitSeq = w.queue.CommitSeq(op.Path)
+		}
 		// Whether any in-window work existed for the old name: the pre-drain
 		// left the path idle, so anything now queued or in-flight was staged
 		// during the RPC — and a worker that already FINISHED (landing, and
 		// possibly resurrecting, the obsolete name before the response
 		// arrived) left the queue idle but a landed watermark behind.
 		windowWork := (w.queue != nil && w.queue.HasPath(op.Path)) || w.everLanded(op.Path) ||
-			(w.queue != nil && w.queue.CommitSeq(op.Path) > queueLandedSnap[op.Path])
+			(w.queue != nil && pathCommitSeq > preRPCCommitSeq)
 		// The same for the old prefix's children: the pending set right after
 		// the rename plus any child that landed during the RPC (its pending
 		// entry is gone, so only the landed watermark records it); a child
@@ -1767,7 +1792,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		// handle retarget already happened, and the transition's failure
 		// records answer EIO at the new name.
 		secondFence := renameFence{movedAt: movedAt, preGen: dstPreGen, ownGen: installedGen}
-		secondWork := (w.queue != nil && w.queue.HasPath(op.Path)) || w.everLanded(op.Path)
+		secondWork := w.renameWindowWork(op.Path, pathCommitSeq)
 		if _, terr := w.retargetConflictMarkers(ctx, op.Path, op.Path2, secondFence, secondWork); terr != nil {
 			safeLogPrintf("writeback: rename %s -> %s could not carry a late old-name publication: %v", op.Path, op.Path2, terr)
 		}
@@ -2241,23 +2266,25 @@ func (h *bufferingHandle) Read(ctx context.Context, off int64, dest []byte) (int
 		// still 404s inside that window and the .dat/.meta entry is gone (the
 		// queue owns the upload), so serve the staged bytes. The pending
 		// meta's size is the image's size — the open-time base size is the
-		// pre-mutation remote row and would reject a truncated image.
+		// pre-mutation remote row and would reject a truncated image. A
+		// witness-only marker supplies none of that (its Size is deliberately
+		// zero and it has no shadow): it must not answer the read at all —
+		// the remote image under this fd is the data, and the witness only
+		// fails fsync barriers closed.
 		if h.w.opts.Staging != nil && h.w.opts.Staging.Pending.HasPending(h.path) {
-			size := h.baseSize
-			if meta, mok := h.w.pendingMeta(h.path); mok && meta != nil {
-				size = meta.Size
-			}
-			// The pending image is authoritative for this path: a read AT or
-			// beyond its size is EOF, not a fall-through to the stale
-			// remote/session tiers (a ftruncate to 5 then a read at 5 served
-			// four bytes of the pre-truncate remote).
-			if off >= size {
-				return 0, nil
-			}
-			if n, kok, rerr := readShadowRangeFenced(h.w.opts.Staging.Shadow, h.path, size, off, dest); rerr != nil {
-				return 0, rerr
-			} else if kok {
-				return n, nil
+			if meta, mok := h.w.pendingImageMeta(h.path); mok && meta != nil {
+				// The pending image is authoritative for this path: a read AT or
+				// beyond its size is EOF, not a fall-through to the stale
+				// remote/session tiers (a ftruncate to 5 then a read at 5 served
+				// four bytes of the pre-truncate remote).
+				if off >= meta.Size {
+					return 0, nil
+				}
+				if n, kok, rerr := readShadowRangeFenced(h.w.opts.Staging.Shadow, h.path, meta.Size, off, dest); rerr != nil {
+					return 0, rerr
+				} else if kok {
+					return n, nil
+				}
 			}
 		}
 		// #984 staged alias tier: a truncating sibling flushed on ITS
@@ -2545,6 +2572,24 @@ func (w *Writeback) pendingImageState(path string) (gen uint64, size int64, conf
 // only under the old name.
 func (w *Writeback) retargetConflictMarkers(ctx context.Context, oldPath, newPath string, fence renameFence, windowWork bool) (uint64, error) {
 	return w.transferConflictMarker(ctx, oldPath, newPath, fence, windowWork)
+}
+
+// renameWindowWork reports whether a rename pass may find in-window work left
+// at oldPath: a queue entry still keyed there, a landed watermark, or an
+// unconditional commit stamp advanced past baseline (0 = detect any stamp).
+// The stamp is the durable witness the watermarks are not: a landing that
+// completed fully (queue and pending cleanup done) and whose watermark the
+// event stream then wiped (EventUnverified/EventCheckout clear every
+// landed entry) still shows here, so the pass runs its strict old-name
+// check instead of taking the no-work early return.
+func (w *Writeback) renameWindowWork(oldPath string, baseline uint64) bool {
+	if w.queue != nil && w.queue.HasPath(oldPath) {
+		return true
+	}
+	if w.everLanded(oldPath) {
+		return true
+	}
+	return w.queue != nil && w.queue.CommitSeq(oldPath) > baseline
 }
 
 // conflictTransferAttempts bounds the fenced-out retries of one locked
@@ -3423,7 +3468,7 @@ const pendingServeMaterializeBytes = 16 << 20
 // image under the fresh staging).
 func (w *Writeback) capturePendingImage(path string) []byte {
 	size := int64(0)
-	if meta, ok := w.pendingMeta(path); ok && meta != nil {
+	if meta, ok := w.pendingImageMeta(path); ok && meta != nil {
 		size = meta.Size
 	}
 	if size <= 0 || size > pendingServeMaterializeBytes {
@@ -4046,9 +4091,11 @@ func (w *Writeback) markUnlinkedSnapshot(p string, under bool) ([]*bufferingHand
 // liveObjectSize is the size the snapshot must capture: the staged image
 // when the path has one (it can be newer than the remote), else the CURRENT
 // remote stat — never the handle's open-time baseSize, which a sibling
-// write may have outgrown.
+// write may have outgrown. A witness-only marker carries no payload (Size
+// zero by design), so it falls to the remote stat like any path without a
+// staged image.
 func (w *Writeback) liveObjectSize(ctx context.Context, h *bufferingHandle) int64 {
-	if meta, ok := w.pendingMeta(h.path); ok && meta != nil {
+	if meta, ok := w.pendingImageMeta(h.path); ok && meta != nil {
 		return meta.Size
 	}
 	if st, err := w.opts.Client.StatCtx(ctx, w.remotePath(h.path)); err == nil && st != nil {

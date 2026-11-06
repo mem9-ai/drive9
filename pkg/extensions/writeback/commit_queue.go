@@ -138,8 +138,20 @@ type CommitQueue struct {
 	// 1MiB ⇒ no landmark). The rename flow's in-window detection and
 	// failure-record rekey fences read these: they must observe a completed
 	// upload regardless of size, entry provenance, or event-stream state.
+	// The table is BOUNDED (trimCommitSeqLocked): a stamp carries no
+	// obligation once no rename window may still compare it, so pins — not
+	// retention — define the lifecycle (BeginCommitSeqWindow).
 	commitClock uint64
 	commitSeq   map[string]uint64
+	// commitSeqPins refcounts the stamps the OPEN windows may still compare
+	// (each window holds its own pin set; the refcount aggregates them for
+	// trimCommitSeqLocked's O(1) membership test). Pins are only ever taken
+	// for stamped paths, so the key set is a subset of commitSeq's.
+	commitSeqPins map[string]int
+	// commitSeqWindows holds the open windows keyed by their id.
+	commitSeqWindows map[uint64]*CommitSeqWindow
+	// commitSeqWindowSeq mints window ids.
+	commitSeqWindowSeq uint64
 	// terminalFailures records the most recent terminal commit failure per
 	// path so a durability barrier that waited on the path can report EIO
 	// instead of success: after onCommitTerminalFailure the path looks
@@ -3226,7 +3238,10 @@ func (cq *CommitQueue) CancelQueuedForRename(path string) error {
 }
 
 // recordCommitSeq stamps path's commit sequence — every successful commit,
-// unconditionally (see commitSeq). Guarded by cq.mu.
+// unconditionally (see commitSeq). Guarded by cq.mu. A stamp recorded while
+// a rename window is open may be the very landing that window's delta
+// comparisons or rekey fences still have to observe, so every window whose
+// universe covers the path pins it for its own lifetime.
 func (cq *CommitQueue) recordCommitSeq(path string) {
 	cq.mu.Lock()
 	defer cq.mu.Unlock()
@@ -3235,6 +3250,215 @@ func (cq *CommitQueue) recordCommitSeq(path string) {
 		cq.commitSeq = make(map[string]uint64)
 	}
 	cq.commitSeq[path] = cq.commitClock
+	for _, win := range cq.commitSeqWindows {
+		if win.covers(path) {
+			cq.pinCommitSeqToLocked(win, path)
+		}
+	}
+	cq.trimCommitSeqLocked()
+}
+
+// maxCommitSeqStamps bounds the unconditional commit-stamp table. Every
+// successful upload inserts its pathname, so an unbounded table would retain
+// every distinct name a long-lived mount ever committed — and each
+// CommitSeqsUnderPrefix/LandedSnapshotsForRename snapshot would scan all of
+// them under cq.mu, stalling queue work on already-deleted files.
+const maxCommitSeqStamps = 4096
+
+// commitSeqLimitLocked mirrors landedLimitLocked's bound rule.
+func (cq *CommitQueue) commitSeqLimitLocked() int {
+	limit := maxCommitSeqStamps
+	if cq.maxPending > limit/2 && cq.maxPending <= int(^uint(0)>>1)/2 {
+		limit = 2 * cq.maxPending
+	}
+	return limit
+}
+
+// trimCommitSeqLocked bounds the commit-stamp table: pinned paths (an open
+// rename window may still compare them) are never evicted; the oldest
+// UNPINNED stamps go first. Pins are only ever taken for stamped paths, so
+// the reclaimable mass is derivable WITHOUT a scan: when the unpinned
+// remainder already fits the target — the all-pinned case of a wide rename
+// window included — the O(n) candidate pass is skipped entirely, and a
+// later commit must not rescan an unreclaimable table under the mutex.
+// Otherwise the trim amortizes: one sorted batch per overflow, evicting down
+// to half the bound instead of rescanning on every later record.
+func (cq *CommitQueue) trimCommitSeqLocked() {
+	limit := cq.commitSeqLimitLocked()
+	if len(cq.commitSeq) <= limit {
+		return
+	}
+	// Evict down to half the bound (see the comment above).
+	overflow := len(cq.commitSeq) - limit/2
+	if len(cq.commitSeq)-len(cq.commitSeqPins) <= limit/2 {
+		return // nothing reclaimable can reach the target: skip the scan
+	}
+	type stamp struct {
+		path string
+		seq  uint64
+	}
+	candidates := make([]stamp, 0, len(cq.commitSeq))
+	for path, seq := range cq.commitSeq {
+		if _, pinned := cq.commitSeqPins[path]; pinned {
+			continue
+		}
+		candidates = append(candidates, stamp{path: path, seq: seq})
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].seq < candidates[j].seq })
+	if overflow > len(candidates) {
+		overflow = len(candidates)
+	}
+	for _, s := range candidates[:overflow] {
+		delete(cq.commitSeq, s.path)
+	}
+}
+
+// CommitSeqWindow scopes one rename flow's commit-stamp obligations. The
+// rename flow snapshots unconditional stamps before its remote RPC and
+// compares them after it (in-window landing detection, failure-record rekey
+// fences): the window pins, for its OWN lifetime — not a global union —
+// every stamp recorded for its endpoints or under either rename prefix plus
+// every stamp its snapshots return, so trimming can never hide a landing the
+// flow still has to observe while finished sibling windows reclaim freely.
+type CommitSeqWindow struct {
+	cq        *CommitQueue
+	id        uint64
+	oldPath   string
+	newPath   string
+	oldPrefix string
+	newPrefix string
+	pins      map[string]struct{}
+}
+
+// covers reports whether path belongs to the window's obligation universe:
+// one of the renamed endpoints, or any path under either rename prefix.
+func (win *CommitSeqWindow) covers(path string) bool {
+	return path == win.oldPath || path == win.newPath ||
+		strings.HasPrefix(path, win.oldPrefix) || strings.HasPrefix(path, win.newPrefix)
+}
+
+// BeginCommitSeqWindow opens a rename's commit-stamp obligation window for
+// the renamed endpoints. The caller MUST End the window once its last stamp
+// comparison ran; ending trims immediately, so an idle mount does not retain
+// the window's growth past its obligations.
+func (cq *CommitQueue) BeginCommitSeqWindow(oldPath, newPath string) *CommitSeqWindow {
+	if cq == nil {
+		return nil
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	cq.commitSeqWindowSeq++
+	if cq.commitSeqWindows == nil {
+		cq.commitSeqWindows = make(map[uint64]*CommitSeqWindow)
+	}
+	win := &CommitSeqWindow{
+		cq:        cq,
+		id:        cq.commitSeqWindowSeq,
+		oldPath:   oldPath,
+		newPath:   newPath,
+		oldPrefix: strings.TrimSuffix(oldPath, "/") + "/",
+		newPrefix: strings.TrimSuffix(newPath, "/") + "/",
+		pins:      make(map[string]struct{}),
+	}
+	cq.commitSeqWindows[win.id] = win
+	// The endpoints' PRE-EXISTING stamps feed the flow's delta baselines and
+	// must stay readable for the window's lifetime.
+	for _, p := range []string{oldPath, newPath} {
+		if _, ok := cq.commitSeq[p]; ok {
+			cq.pinCommitSeqToLocked(win, p)
+		}
+	}
+	return win
+}
+
+// End closes the window: exactly ITS pins die with it (overlapping windows
+// keep theirs), and the table is trimmed right away so the bound is restored
+// without waiting for unrelated future commits.
+func (win *CommitSeqWindow) End() {
+	if win == nil || win.cq == nil {
+		return
+	}
+	cq := win.cq
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	if _, ok := cq.commitSeqWindows[win.id]; !ok {
+		return // already ended
+	}
+	delete(cq.commitSeqWindows, win.id)
+	for path := range win.pins {
+		cq.unpinCommitSeqLocked(path)
+	}
+	cq.trimCommitSeqLocked()
+}
+
+// CommitSeqsUnderPrefix is the window-scoped variant of the queue's method:
+// every stamp the snapshot returns is pinned to THIS window, so the flow's
+// later delta comparisons still observe it even once trimming would
+// otherwise reclaim it.
+func (win *CommitSeqWindow) CommitSeqsUnderPrefix(prefix string) map[string]uint64 {
+	if win == nil || win.cq == nil {
+		return nil
+	}
+	cq := win.cq
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	out := map[string]uint64{}
+	for path, seq := range cq.commitSeq {
+		if strings.HasPrefix(path, prefix) {
+			out[path] = seq
+		}
+	}
+	for path := range out {
+		cq.pinCommitSeqToLocked(win, path)
+	}
+	return out
+}
+
+// LandedSnapshotsForRename is the window-scoped variant of the queue's
+// method: every stamp the snapshot returns is pinned to THIS window for the
+// flow's later rekey-fence comparisons.
+func (win *CommitSeqWindow) LandedSnapshotsForRename(newPath, newPrefix string) map[string]uint64 {
+	if win == nil || win.cq == nil {
+		return nil
+	}
+	cq := win.cq
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	out := map[string]uint64{}
+	for path, seq := range cq.commitSeq {
+		if path == newPath || strings.HasPrefix(path, newPrefix) {
+			out[path] = seq
+		}
+	}
+	for path := range out {
+		cq.pinCommitSeqToLocked(win, path)
+	}
+	return out
+}
+
+// pinCommitSeqToLocked adds path to the window's pin set and bumps the
+// global refcount on first pin.
+func (cq *CommitQueue) pinCommitSeqToLocked(win *CommitSeqWindow, path string) {
+	if _, ok := win.pins[path]; ok {
+		return
+	}
+	win.pins[path] = struct{}{}
+	if cq.commitSeqPins == nil {
+		cq.commitSeqPins = make(map[string]int)
+	}
+	cq.commitSeqPins[path]++
+}
+
+// unpinCommitSeqLocked drops one window's pin: the stamp becomes reclaimable
+// when the last interested window released it.
+func (cq *CommitQueue) unpinCommitSeqLocked(path string) {
+	if n, ok := cq.commitSeqPins[path]; ok {
+		if n <= 1 {
+			delete(cq.commitSeqPins, path)
+		} else {
+			cq.commitSeqPins[path] = n - 1
+		}
+	}
 }
 
 // CommitSeq reports path's unconditional commit stamp (0 when none). Unlike
@@ -3250,7 +3474,8 @@ func (cq *CommitQueue) CommitSeq(path string) uint64 {
 }
 
 // CommitSeqsUnderPrefix snapshots every unconditional commit stamp under
-// prefix.
+// prefix. The snapshot pins nothing: a rename flow whose later comparisons
+// must survive trimming takes it through its CommitSeqWindow instead.
 func (cq *CommitQueue) CommitSeqsUnderPrefix(prefix string) map[string]uint64 {
 	if cq == nil {
 		return nil
@@ -3287,7 +3512,9 @@ func (cq *CommitQueue) LandedSeq(path string) uint64 {
 // the destination prefix. These are the UNCONDITIONAL commit stamps — a
 // re-driven upload that succeeds always advances them, whether or not the
 // selective landed landmark was ever recorded (no snapshot ID, payloads
-// above the checksum limit).
+// above the checksum limit). The snapshot pins nothing: a rename flow whose
+// rekey comparisons must survive trimming takes it through its
+// CommitSeqWindow instead.
 func (cq *CommitQueue) LandedSnapshotsForRename(newPath, newPrefix string) map[string]uint64 {
 	if cq == nil {
 		return nil
