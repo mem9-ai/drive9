@@ -1164,14 +1164,16 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			return res, nil
 		}
 		if !op.KernelCreate() && flags&uint32(syscall.O_CREAT) == 0 && flags&uint32(syscall.O_APPEND) != 0 &&
-			w.uploader != nil && w.uploader.InFlight(op.Path) {
-			// The fast path declined because a PendingOverwrite PUT is in
-			// flight. Do not let the ordinary HEAD-open capture the stale
-			// pre-upload base: wait for the acknowledgement, then retry the
-			// fast path so the opener receives the committed revision.
-			w.uploader.WaitPath(op.Path)
-			if res, ok := w.openPendingWritable(op); ok {
-				return res, nil
+			w.uploader != nil && w.wbCache != nil {
+			// The fast path declined a PendingOverwrite. Do not let the
+			// ordinary HEAD-open capture its pre-upload base: land the
+			// pending image synchronously (this also covers a queued upload
+			// that has not acquired the worker gate yet), then open the
+			// committed remote revision.
+			if meta, ok := w.wbCache.GetMeta(op.Path); ok && meta != nil && meta.Kind != staging.PendingNew {
+				if err := w.uploader.UploadSync(ctx, op.Path); err != nil && !w.uploader.IsLedgerOwnedError(err) {
+					return fs.Result{}, err
+				}
 			}
 		}
 		if flags&uint32(syscall.O_CREAT) == 0 {
@@ -6239,15 +6241,21 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, dur stageDurabi
 	}
 	h.mu.Lock()
 	isNewStage := h.isNew
-	lineageStage, supersededStage := h.cacheLineageGen, h.supersededPendingGen
+	supersededStage, supersededSourceStage := h.supersededPendingGen, h.supersededPendingSource
 	h.mu.Unlock()
-	if !isNewStage && (lineageStage != 0 || supersededStage != 0) && h.w.uploader != nil {
-		// Serialize a new cache generation behind the previous upload's
-		// acknowledgement. Otherwise a handle opened from G2 can stage G3
-		// while G2 is publishing; the G2 ack then cannot identify G3's
-		// ancestor and G3 stages at the pre-G2 base. Handles with no
-		// pending lineage (ordinary opens) need no fence.
-		h.w.uploader.WaitPath(h.path)
+	if !isNewStage && supersededSourceStage == pendingGenCache && supersededStage != 0 &&
+		h.w.uploader != nil && h.w.wbCache != nil {
+		// Land the predecessor this handle composed over before staging a
+		// successor. WaitPath alone has a gap: the worker can acquire the
+		// gate after the wait returns, publish the predecessor, and leave
+		// the successor staged at the pre-upload base. UploadSync owns the
+		// gate through cache cleanup and its acknowledgement updates this
+		// handle.
+		if meta, ok := h.w.wbCache.GetMeta(h.path); ok && meta != nil && meta.Generation == supersededStage {
+			if err := h.w.uploader.UploadSync(ctx, h.path); err != nil && !h.w.uploader.IsLedgerOwnedError(err) {
+				return nil, err
+			}
+		}
 	}
 	unlock := h.w.pathLocks.lock(h.path)
 	defer unlock()

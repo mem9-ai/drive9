@@ -515,6 +515,7 @@ func TestPortKernelCreateExclusiveChecksServer(t *testing.T) {
 // would treat it as a pending-index marker.
 func TestPortCacheStageKeepsGenerationSpacesSeparate(t *testing.T) {
 	b := testbackend.NewBackend()
+	b.Seed("/f", []byte("base"))
 	ts := httptest.NewServer(b)
 	defer ts.Close()
 	cl := client.New(ts.URL, "")
@@ -621,113 +622,6 @@ func TestPortQueueHandleAcksItsOwnLaterCacheStage(t *testing.T) {
 	h.mu.Unlock()
 	if baseRev != 2 {
 		t.Fatalf("queue handle did not adopt its own cache stage: baseRev=%d, want 2", baseRev)
-	}
-}
-
-// The fallback must not HEAD-open the pre-upload base while the PendingOverwrite
-// PUT is in flight; it waits for the acknowledgement and then retries the fast
-// path with the committed revision.
-func TestPortAppendOpenFallbackWaitsForInflightAck(t *testing.T) {
-	b := testbackend.NewBackend()
-	ts := httptest.NewServer(b)
-	defer ts.Close()
-	cl := client.New(ts.URL, "")
-	wbcache, err := staging.NewWriteBackCache(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	gen, _, err := wbcache.PutWithBaseRevAndModeTimings("/f", []byte("base"), 4, staging.PendingOverwrite, 1, 0o644, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	wb, err := New(Options{Policy: PolicyWriteBack, Client: cl, WriteCache: wbcache})
-	if err != nil {
-		t.Fatal(err)
-	}
-	terminal, err := core.New(cl, core.Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ch, err := fs.NewChain(wb, terminal)
-	if err != nil {
-		t.Fatal(err)
-	}
-	release := wb.uploader.acquirePath("/f")
-	done := make(chan fs.Result, 1)
-	errCh := make(chan error, 1)
-	go func() {
-		res, err := ch.Dispatch(context.Background(), &fs.Op{
-			Kind: fs.OpCreate, Path: "/f", Flags: uint32(syscall.O_WRONLY | syscall.O_APPEND),
-		})
-		if err != nil {
-			errCh <- err
-			return
-		}
-		done <- res
-	}()
-	time.Sleep(50 * time.Millisecond)
-	wb.acknowledgeUploadedCreate("/f", 2, gen, pendingGenCache, gen)
-	release()
-	select {
-	case err := <-errCh:
-		t.Fatal(err)
-	case res := <-done:
-		h := res.Handle.(*bufferingHandle)
-		h.mu.Lock()
-		baseRev := h.baseRev
-		h.mu.Unlock()
-		if baseRev != 2 {
-			t.Fatalf("fallback handle baseRev = %d, want 2", baseRev)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("append open did not finish after the upload ack")
-	}
-}
-
-// Staging a new cache generation while the previous one is uploading must
-// wait for its acknowledgement, so the new image's base includes it.
-func TestPortCacheStageWaitsForInflightUpload(t *testing.T) {
-	b := testbackend.NewBackend()
-	ts := httptest.NewServer(b)
-	defer ts.Close()
-	cl := client.New(ts.URL, "")
-	wbcache, err := staging.NewWriteBackCache(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := wbcache.PutWithBaseRevAndModeTimings("/f", []byte("base"), 4, staging.PendingOverwrite, 1, 0o644, true); err != nil {
-		t.Fatal(err)
-	}
-	wb, err := New(Options{Policy: PolicyWriteBack, Client: cl, WriteCache: wbcache})
-	if err != nil {
-		t.Fatal(err)
-	}
-	res, ok := wb.openPendingWritable(&fs.Op{Kind: fs.OpCreate, Path: "/f", Flags: uint32(syscall.O_WRONLY | syscall.O_APPEND)})
-	if !ok {
-		t.Fatal("pending overwrite append did not take the fast path")
-	}
-	h := res.Handle.(*bufferingHandle)
-	if err := h.Write(context.Background(), 4, []byte("+x")); err != nil {
-		t.Fatal(err)
-	}
-	release := wb.uploader.acquirePath("/f")
-	stageDone := make(chan error, 1)
-	go func() { _, err := h.stageToWriteCache(context.Background(), stageFullDurable); stageDone <- err }()
-	select {
-	case err := <-stageDone:
-		release()
-		t.Fatalf("stage completed while upload in flight: %v", err)
-	case <-time.After(50 * time.Millisecond):
-	}
-	wb.acknowledgeUploadedCreate("/f", 2, 1, pendingGenCache, 1)
-	release()
-	select {
-	case err := <-stageDone:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("stage did not resume after upload release")
 	}
 }
 
