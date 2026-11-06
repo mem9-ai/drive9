@@ -124,6 +124,7 @@ func TestProvisionAndDeprovision(t *testing.T) {
 		}
 		t.Fatalf("Provision: %v", err)
 	}
+	t.Cleanup(func() { _ = p.Deprovision(context.Background(), info) })
 	if info.Provider != tenant.ProviderLocal || info.OrganizationID != DefaultOrganizationID {
 		t.Fatalf("cluster = %+v", info)
 	}
@@ -163,14 +164,20 @@ func TestProvisionAndDeprovision(t *testing.T) {
 	}
 	// The first credential still authenticates after the second Provision.
 	firstDSN := info.Username + ":" + info.Password + "@tcp(" + info.Host + ":" + strconv.Itoa(info.Port) + ")/" + info.DBName + "?parseTime=true"
-	firstDB, err := sql.Open("mysql", firstDSN)
-	if err != nil {
-		t.Fatalf("open first dsn: %v", err)
+	checkCredential := func(t *testing.T) {
+		t.Helper()
+		// A fresh pool: reusing one could answer from an already-authenticated
+		// connection instead of authenticating again.
+		db, err := sql.Open("mysql", firstDSN)
+		if err != nil {
+			t.Fatalf("open first dsn: %v", err)
+		}
+		defer func() { _ = db.Close() }()
+		if _, err := db.ExecContext(ctx, "SELECT 1"); err != nil {
+			t.Fatalf("credential from the first provision no longer works: %v", err)
+		}
 	}
-	defer func() { _ = firstDB.Close() }()
-	if _, err := firstDB.ExecContext(ctx, "SELECT 1"); err != nil {
-		t.Fatalf("credential from the first provision no longer works: %v", err)
-	}
+	checkCredential(t)
 	// A changed deployment secret must fail closed rather than silently rotate the
 	// account out from under the credential the caller already persisted.
 	rotated := *p
@@ -178,9 +185,7 @@ func TestProvisionAndDeprovision(t *testing.T) {
 	if _, err := rotated.Provision(ctx, "11111111-2222-3333-4444-555555555555"); err == nil {
 		t.Fatal("a changed tenant secret rotated the existing account instead of failing closed")
 	}
-	if _, err := firstDB.ExecContext(ctx, "SELECT 1"); err != nil {
-		t.Fatalf("the rejected rotation broke the existing credential: %v", err)
-	}
+	checkCredential(t)
 	if scope := localTenantGrantScope("drive9_abc_def"); strings.Contains(scope, "drive9_abc_def") {
 		t.Fatalf("grant scope %q does not escape the wildcard", scope)
 	}
@@ -221,6 +226,32 @@ func TestProvisionAndDeprovision(t *testing.T) {
 	if visible != 0 {
 		t.Fatalf("tenant account sees %d other drive9 schemas", visible)
 	}
+	// Interruption between account creation and the caller persisting the credential:
+	// the database and account exist, the metadata store does not know them yet, and
+	// a retry must hand back a credential that works.
+	interrupted, err := p.Provision(ctx, "77777777-1111-2222-3333-444444444444")
+	if err != nil {
+		t.Fatalf("provision interrupted tenant: %v", err)
+	}
+	retried, err := p.Provision(ctx, "77777777-1111-2222-3333-444444444444")
+	if err != nil {
+		t.Fatalf("retry after interruption: %v", err)
+	}
+	if retried.Username != interrupted.Username || retried.Password != interrupted.Password {
+		t.Fatalf("retry returned a different credential: %q -> %q", interrupted.Username, retried.Username)
+	}
+	retryDB, err := sql.Open("mysql", retried.Username+":"+retried.Password+"@tcp("+retried.Host+":"+strconv.Itoa(retried.Port)+")/"+retried.DBName+"?parseTime=true")
+	if err != nil {
+		t.Fatalf("open retried dsn: %v", err)
+	}
+	defer func() { _ = retryDB.Close() }()
+	if _, err := retryDB.ExecContext(ctx, "SELECT 1"); err != nil {
+		t.Fatalf("credential from the retry does not work: %v", err)
+	}
+	if err := p.Deprovision(ctx, retried); err != nil {
+		t.Fatalf("Deprovision(interrupted): %v", err)
+	}
+
 	if err := p.Deprovision(ctx, info); err != nil {
 		t.Fatalf("Deprovision: %v", err)
 	}

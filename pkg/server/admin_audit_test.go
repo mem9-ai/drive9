@@ -231,3 +231,44 @@ func TestAdminAuditMiddlewareRecordsAuthenticatedSubject(t *testing.T) {
 		t.Fatalf("actor = %v/%v, want the authenticated identity", fields["actor_org_id"], fields["actor_public_key"])
 	}
 }
+
+// Tenant token mutations are credentials: refusing to issue or revoke one must be
+// audited, and reads must not be.
+func TestAdminAuditCoversTokenMutations(t *testing.T) {
+	core, recorded := observer.New(zap.InfoLevel)
+	previous := logger.L()
+	logger.Set(zap.New(core))
+	t.Cleanup(func() { logger.Set(previous) })
+
+	s := &Server{}
+	cases := []struct {
+		method string
+		path   string
+		want   string
+	}{
+		{http.MethodPost, "/v1/tokens", "token.create"},
+		{http.MethodPost, "/v1/tokens/revoke", "token.revoke"},
+		{http.MethodDelete, "/v1/tokens/tok-1", "token.delete"},
+		{http.MethodGet, "/v1/tokens", ""},
+	}
+	for _, tc := range cases {
+		recorded.TakeAll()
+		handler := s.adminAuditMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+		}))
+		handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(tc.method, tc.path, nil))
+
+		var got string
+		for _, entry := range recorded.All() {
+			if entry.Message != "admin_audit" {
+				continue
+			}
+			if action, ok := entry.ContextMap()["action"].(string); ok {
+				got = action
+			}
+		}
+		if got != tc.want {
+			t.Errorf("%s %s recorded action %q, want %q", tc.method, tc.path, got, tc.want)
+		}
+	}
+}

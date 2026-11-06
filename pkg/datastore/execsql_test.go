@@ -58,3 +58,18 @@ func TestExecSQLClassifier(t *testing.T) {
 		})
 	}
 }
+
+// A refused statement was never executed: it must not be logged as a datastore
+// failure. The metrics still record the operation, with the "rejected" result.
+func TestShouldLogStoreOpFailureTreatsRejectedAsNonFailure(t *testing.T) {
+	for _, result := range []string{"rejected", "not_found", "conflict", "canceled", "deadline_exceeded", "conn_closed"} {
+		if shouldLogStoreOpFailure(result) {
+			t.Errorf("shouldLogStoreOpFailure(%q) = true, want false", result)
+		}
+	}
+	for _, result := range []string{"error", "internal", ""} {
+		if !shouldLogStoreOpFailure(result) {
+			t.Errorf("shouldLogStoreOpFailure(%q) = false, want true", result)
+		}
+	}
+}

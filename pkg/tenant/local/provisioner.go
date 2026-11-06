@@ -11,6 +11,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -121,7 +122,7 @@ func (p *Provisioner) Provision(ctx context.Context, tenantID string) (*tenant.C
 	// account would give it every other tenant's database (and the control plane,
 	// which lives on the same instance). The tenant gets its own account, granted
 	// only on its own schema.
-	credential, err := ensureLocalTenantAccount(ctx, admin, p.admin.Addr, p.tenantSecret, tenantID, dbName)
+	credential, err := ensureLocalTenantAccount(ctx, admin, p.admin, p.tenantSecret, tenantID, dbName)
 	if err != nil {
 		return nil, err
 	}
@@ -157,7 +158,7 @@ type localTenantCredential struct {
 // id, so re-provisioning an existing tenant converges instead of rotating a
 // credential the metadata store already holds. The account name is derived the
 // same way, which keeps it stable across restarts.
-func ensureLocalTenantAccount(ctx context.Context, admin *sql.DB, adminAddr, tenantSecret, tenantID, dbName string) (localTenantCredential, error) {
+func ensureLocalTenantAccount(ctx context.Context, admin *sql.DB, adminCfg *mysql.Config, tenantSecret, tenantID, dbName string) (localTenantCredential, error) {
 	username := localTenantUserName(tenantID)
 	if username == "" {
 		return localTenantCredential{}, fmt.Errorf("derive local tenant credential for %s", tenantID)
@@ -182,7 +183,7 @@ func ensureLocalTenantAccount(ctx context.Context, admin *sql.DB, adminAddr, ten
 		// If the derived password no longer works, the deployment secret changed
 		// under an existing account, which needs a deliberate rotation, not a silent
 		// one.
-		ok, verifyErr := localTenantAccountAuthenticates(ctx, username, password, adminAddr)
+		ok, verifyErr := localTenantAccountAuthenticates(ctx, adminCfg, username, password)
 		if verifyErr != nil {
 			return localTenantCredential{}, verifyErr
 		}
@@ -224,18 +225,24 @@ func localTenantAccountExists(ctx context.Context, admin *sql.DB, username strin
 }
 
 // localTenantAccountAuthenticates reports whether the derived password is the one
-// the existing account actually uses. It connects as the tenant, so a wrong
-// secret is detected without touching the account.
-func localTenantAccountAuthenticates(ctx context.Context, username, password, addr string) (bool, error) {
-	if strings.TrimSpace(addr) == "" {
-		return false, fmt.Errorf("local admin address is unknown")
+// the existing account actually uses.
+//
+// The probe copies the admin connection's network, address and TLS settings — a
+// Unix socket or a TLS-required server would otherwise fail the probe even with the
+// right password and be misreported as a changed secret. Only an authentication
+// failure means "different password"; any other error is returned so an operator can
+// see what actually went wrong.
+func localTenantAccountAuthenticates(ctx context.Context, admin *mysql.Config, username, password string) (bool, error) {
+	if admin == nil {
+		return false, fmt.Errorf("local admin config is unknown")
 	}
-	cfg := mysql.NewConfig()
+	cfg := admin.Clone()
 	cfg.User = username
 	cfg.Passwd = password
-	cfg.Net = "tcp"
-	cfg.Addr = addr
-	cfg.Timeout = 5 * time.Second
+	// No default database: the tenant account has no privileges on the admin's, and
+	// selecting it would fail with access-denied for the *database*, which is not a
+	// password mismatch.
+	cfg.DBName = ""
 	probe, openErr := sql.Open("mysql", cfg.FormatDSN())
 	if openErr != nil {
 		return false, fmt.Errorf("probe local tenant %s: %w", username, openErr)
@@ -244,7 +251,12 @@ func localTenantAccountAuthenticates(ctx context.Context, username, password, ad
 	pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	if pingErr := probe.PingContext(pingCtx); pingErr != nil {
-		return false, nil
+		var mysqlErr *mysql.MySQLError
+		if errors.As(pingErr, &mysqlErr) && (mysqlErr.Number == 1045 || mysqlErr.Number == 1044) {
+			// Access denied: the derived password is not the account's.
+			return false, nil
+		}
+		return false, fmt.Errorf("probe local tenant %s: %w", username, pingErr)
 	}
 	return true, nil
 }
