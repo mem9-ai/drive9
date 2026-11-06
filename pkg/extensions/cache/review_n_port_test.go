@@ -497,3 +497,25 @@ func TestPortRenameMigratesDirtyOwnership(t *testing.T) {
 		t.Fatal("the writer's boundary did not clear its mark")
 	}
 }
+
+// A revision-only open (size unknown, 0) must not answer from the warm
+// whole-file/range tiers: a missed foreign append can leave the cached image
+// shorter than the current file, and serving it truncates the read silently.
+func TestPortUnknownOpenSizeBypassesRevisionTiers(t *testing.T) {
+	c, err := New(Options{MaxSize: 1 << 20, MaxFileSize: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.mem.PutOwned("/f", []byte("OLD"), 7)
+	gh := &gatedHandle{gate: make(chan struct{}), release: make(chan struct{}), data: []byte("NEW")}
+	close(gh.release)
+	h := &cachingHandle{cache: c, inner: gh, path: "/f", rev: 7, size: 0}
+	buf := make([]byte, 3)
+	n, err := h.Read(context.Background(), 0, buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(buf[:n]); got != "NEW" {
+		t.Fatalf("read = %q, want NEW (inner plane, not stale cached OLD)", got)
+	}
+}

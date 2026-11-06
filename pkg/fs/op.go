@@ -73,6 +73,12 @@ type Attr struct {
 	HasGID bool
 	Rdev   uint32
 	Atime  time.Time
+	// ExtentIno is the object-store inode the server reports for
+	// extent-layout listing rows (0 = not an extent object). A listing row
+	// is the only layout signal readdir gets: when the row carries the
+	// inode the facade stamps it; when it does not, nothing may be invented
+	// and stale routing must be cleared.
+	ExtentIno uint64
 	// ResourceID is the server's object identity for the path: two paths
 	// sharing one are hardlinks of the same object and share a FUSE inode
 	// (v1 LookupWithIdentity). Empty = unknown.
@@ -89,6 +95,8 @@ func (a Attr) IsSymlink() bool { return a.Kind == KindSymlink }
 type Entry struct {
 	Name string
 	Attr Attr
+	// ExtentIno pins the extent-plane inode for a listing row.
+	ExtentIno uint64
 	// Ino pins the FUSE inode a directory snapshot resolved the entry to.
 	// Zero = unresolved; the consumer resolves it (the facade fills it in
 	// when a listing snapshot is taken). A pinned inode keeps every
@@ -246,6 +254,10 @@ type Op struct {
 	Fh     uint64 // kernel file handle
 	Kernel any    // the raw kernel request the facade translated
 	Rev    int64  // compare-and-set base revision for writes; -1 = unconditional
+	// OpenAttr is the facade's cached inode view for a kernel OPEN. Core may
+	// answer the open from it instead of re-stating the remote; nil means the
+	// facade has no usable row and the terminal must probe.
+	OpenAttr *Attr
 
 	// Kind-dependent payloads: which fields apply depends on OpKind.
 	Offset int64  // read/write/fallocate start offset

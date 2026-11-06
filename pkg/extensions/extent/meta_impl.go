@@ -1357,8 +1357,18 @@ func (b *Bridge) flushPendingLocked(ctx context.Context, ino meta.Ino) error {
 	b.mu.Lock()
 	pending := b.pending[ino]
 	size, has := b.sizes[ino]
+	_, truncating := b.truncs[ino]
 	b.mu.Unlock()
-	if len(pending) == 0 || !has {
+	if len(pending) == 0 {
+		// A truncate-only change has no staged slices but still needs a
+		// metadata publication. Dropping it here left the remote object at
+		// its old length after close (the FUSE smoke test's `: > file`).
+		if truncating {
+			return b.commit(ctx, ino, nil, size)
+		}
+		return nil
+	}
+	if !has {
 		return nil
 	}
 	return b.commit(ctx, ino, pending, size)

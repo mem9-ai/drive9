@@ -149,6 +149,9 @@ type DirEntryInfo struct {
 	Uid        uint32    // reported owner uid
 	HasGID     bool      // Gid was reported
 	Gid        uint32    // reported owner gid
+	// ExtentIno is the object-store inode for extent-layout entries;
+	// zero elsewhere.
+	ExtentIno uint64
 	// LocalMutation marks a row this mount itself wrote (create, write,
 	// landed commit, chown). Such a row is this process's own state even
 	// on a multi-server deployment, so a stat may serve it without
@@ -175,6 +178,13 @@ const (
 	LookupSessionMiss                    // listing created this session, name absent
 	LookupPartialMiss                    // listing incomplete, name simply unknown
 )
+
+// Observation is an opaque namespace-cache request token. It is issued
+// before a remote listing/stat and consumed when the response is installed,
+// so a response that started before a local mutation cannot overwrite it.
+type Observation interface {
+	IsNamespaceObservation()
+}
 
 // DirListingCache caches directory listings for the facade: readdir
 // restarts consult it, fresh creates upsert into it, and removals drop

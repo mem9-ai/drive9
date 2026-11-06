@@ -453,7 +453,7 @@ func TestLockIsMutuallyExclusiveUnderRace(t *testing.T) {
 			holders.Add(1)
 			time.Sleep(time.Millisecond)
 			concurrent.Add(-1)
-			lt.Setlk(context.Background(), ino, owner, uint32(owner), syscall.F_UNLCK, 0, 99, false)
+			_ = lt.Setlk(context.Background(), ino, owner, uint32(owner), syscall.F_UNLCK, 0, 99, false)
 		}(uint64(i + 1))
 	}
 	for i := 0; i < contenders; i++ {
