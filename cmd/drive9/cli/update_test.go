@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -281,6 +282,175 @@ func TestCompareReleaseVersions(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := compareReleaseVersions(tt.current, tt.latest); got != tt.want {
 				t.Fatalf("compareReleaseVersions(%q, %q) = %v, want %v", tt.current, tt.latest, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestUpdateRejectsEnvBaseURLWithoutRequests(t *testing.T) {
+	var requests int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	// The test server's 127.0.0.1 is not a pinned release host.
+	t.Setenv("DRIVE9_UPDATE_BASE_URL", srv.URL)
+
+	var stderr bytes.Buffer
+	err := updateWithDeps([]string{"--check"}, updateDeps{
+		currentVersion:       "v0.1.0",
+		goos:                 "linux",
+		goarch:               "amd64",
+		httpClient:           srv.Client(),
+		stdout:               &bytes.Buffer{},
+		stderr:               &stderr,
+		allowInsecureBaseURL: true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "not a pinned drive9 release host") {
+		t.Fatalf("update error = %v, want pinned-host rejection", err)
+	}
+	if requests != 0 {
+		t.Fatalf("requests = %d, want none before the pinned-host check", requests)
+	}
+}
+
+func TestIsPinnedUpdateHost(t *testing.T) {
+	tests := []struct {
+		name    string
+		baseURL string
+		want    bool
+	}{
+		{name: "default host", baseURL: "https://drive9.ai", want: true},
+		{name: "www subdomain", baseURL: "https://www.drive9.ai", want: true},
+		{name: "release subdomain", baseURL: "https://releases.drive9.ai", want: true},
+		{name: "suffix lookalike", baseURL: "https://drive9.ai.attacker.example", want: false},
+		{name: "hyphen lookalike", baseURL: "https://evil-drive9.ai", want: false},
+		{name: "path lookalike", baseURL: "https://attacker.example/drive9.ai", want: false},
+		{name: "userinfo lookalike", baseURL: "https://drive9.ai@attacker.example", want: false},
+		{name: "fragment lookalike", baseURL: "https://attacker.example#.drive9.ai", want: false},
+		{name: "uppercase pinned host", baseURL: "https://DRIVE9.AI", want: true},
+		{name: "pinned host with port", baseURL: "https://drive9.ai:8443", want: true},
+		{name: "empty", baseURL: "", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isPinnedUpdateHost(tt.baseURL); got != tt.want {
+				t.Fatalf("isPinnedUpdateHost(%q) = %v, want %v", tt.baseURL, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestUpdateExplicitBaseURLAllowsCustomHost(t *testing.T) {
+	payload := []byte("new-drive9")
+	sum := sha256.Sum256(payload)
+	target := filepath.Join(t.TempDir(), "drive9")
+	if err := os.WriteFile(target, []byte("old-drive9"), 0o755); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+
+	srv := httptest.NewServer(updateTestReleaseHandler(t, payload, fmt.Sprintf("%x", sum[:])))
+	defer srv.Close()
+
+	var stderr bytes.Buffer
+	err := updateWithDeps([]string{"--base-url", srv.URL}, updateDeps{
+		currentVersion:       "v0.1.0",
+		goos:                 "linux",
+		goarch:               "amd64",
+		executable:           func() (string, error) { return target, nil },
+		httpClient:           srv.Client(),
+		stdout:               &bytes.Buffer{},
+		stderr:               &stderr,
+		allowInsecureBaseURL: true,
+		replaceExecutable: func(newPath, targetPath string) error {
+			if err := os.Remove(targetPath); err != nil {
+				return err
+			}
+			return os.Rename(newPath, targetPath)
+		},
+	})
+	if err != nil {
+		t.Fatalf("update with explicit --base-url: %v", err)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read target: %v", err)
+	}
+	if string(got) != string(payload) {
+		t.Errorf("updated binary = %q, want %q", got, payload)
+	}
+	if !strings.Contains(stderr.String(), "custom release root") {
+		t.Errorf("stderr = %q, want custom release root warning", stderr.String())
+	}
+}
+
+type updateRedirectTransport struct {
+	target string
+	body   string
+	hops   int
+}
+
+func (tr *updateRedirectTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	tr.hops++
+	if tr.hops == 1 && tr.target != "" {
+		return &http.Response{
+			StatusCode: http.StatusFound,
+			Header:     http.Header{"Location": []string{tr.target}},
+			Body:       io.NopCloser(strings.NewReader("")),
+			Request:    req,
+		}, nil
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{},
+		Body:       io.NopCloser(strings.NewReader(tr.body)),
+		Request:    req,
+	}, nil
+}
+
+func TestUpdatePinsRedirectsForPinnedReleaseRoots(t *testing.T) {
+	tests := []struct {
+		name     string
+		location string
+		wantErr  string
+	}{
+		{name: "pinned subdomain", location: "https://releases.drive9.ai/latest/version"},
+		{name: "unpinned host", location: "https://releases.attacker.example/version", wantErr: "not a pinned drive9 release host"},
+		{name: "https downgrade", location: "http://drive9.ai/version", wantErr: "require https"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			transport := &updateRedirectTransport{target: tt.location, body: "v0.2.0\n"}
+			var stdout bytes.Buffer
+			err := updateWithDeps([]string{"--check"}, updateDeps{
+				baseURL:        "https://drive9.ai",
+				currentVersion: "v0.1.0",
+				goos:           "linux",
+				goarch:         "amd64",
+				httpClient:     &http.Client{Transport: transport},
+				stdout:         &stdout,
+			})
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("update error = %v, want %q", err, tt.wantErr)
+				}
+				if transport.hops != 1 {
+					t.Fatalf("hops = %d, want the redirect to be refused before it is followed", transport.hops)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("update --check through a pinned redirect: %v", err)
+			}
+			if transport.hops != 2 {
+				t.Fatalf("hops = %d, want the pinned redirect to be followed", transport.hops)
+			}
+			if !strings.Contains(stdout.String(), "update available: v0.1.0 -> v0.2.0") {
+				t.Errorf("stdout = %q, want update-available line", stdout.String())
 			}
 		})
 	}

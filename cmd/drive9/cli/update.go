@@ -28,6 +28,7 @@ const (
 
 type updateDeps struct {
 	baseURL              string
+	baseURLFromEnv       bool
 	currentVersion       string
 	goos                 string
 	goarch               string
@@ -74,6 +75,30 @@ func updateWithDeps(args []string, deps updateDeps) error {
 	deps.baseURL = normalizeUpdateBaseURL(*baseURL)
 	if err := validateUpdateBaseURL(deps.baseURL, deps.allowInsecureBaseURL); err != nil {
 		return err
+	}
+	baseURLFromFlag := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "base-url" {
+			baseURLFromFlag = true
+		}
+	})
+	// DRIVE9_UPDATE_BASE_URL is inherited by every child process, so it must not
+	// be able to relocate the release root (and with it the checksum manifest the
+	// download is verified against) to a host the user never chose. A release root
+	// outside the pinned hosts still requires the explicit --base-url flag.
+	if deps.baseURLFromEnv && !baseURLFromFlag && !isPinnedUpdateHost(deps.baseURL) {
+		return fmt.Errorf("DRIVE9_UPDATE_BASE_URL=%q is not a pinned drive9 release host (%s); pass --base-url explicitly to install from a custom release root", deps.baseURL, strings.Join(updateReleaseHosts, ", "))
+	}
+	if baseURLFromFlag && !isPinnedUpdateHost(deps.baseURL) {
+		_, _ = fmt.Fprintf(deps.stderr, "warning: installing from custom release root %s; integrity relies on that origin serving releases/checksums.txt\n", deps.baseURL)
+	}
+	if isPinnedUpdateHost(deps.baseURL) {
+		// The pinned host is only the first hop: the default client follows up to
+		// ten redirects, so a pinned release root could still be served by any host
+		// reachable through a redirect (open redirect, compromised origin). Keep the
+		// whole chain pinned so the version, the checksum manifest, and the binary all
+		// come from the same trusted release hosts.
+		deps.httpClient = withPinnedUpdateRedirects(deps.httpClient, deps.allowInsecureBaseURL)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), updateCommandTimeout)
@@ -155,12 +180,16 @@ func updateUsage() string {
 	return `usage: drive9 update [--check] [--force] [--base-url URL]
   --check          check for a newer release without installing
   --force          reinstall latest release even when versions match
-  --base-url URL   release base URL (default https://drive9.ai)` + updatePlatformUsageNote()
+  --base-url URL   release base URL (default https://drive9.ai)
+  DRIVE9_UPDATE_BASE_URL is honored only for drive9.ai release hosts` + updatePlatformUsageNote()
 }
 
 func fillUpdateDeps(deps updateDeps) updateDeps {
 	if deps.baseURL == "" {
-		deps.baseURL = strings.TrimSpace(os.Getenv("DRIVE9_UPDATE_BASE_URL"))
+		if envBaseURL := strings.TrimSpace(os.Getenv("DRIVE9_UPDATE_BASE_URL")); envBaseURL != "" {
+			deps.baseURL = envBaseURL
+			deps.baseURLFromEnv = true
+		}
 	}
 	if deps.baseURL == "" {
 		deps.baseURL = defaultUpdateBaseURL
@@ -545,6 +574,53 @@ func updateArtifactName(goos, goarch string) string {
 
 func normalizeUpdateBaseURL(baseURL string) string {
 	return strings.TrimRight(strings.TrimSpace(baseURL), "/")
+}
+
+// updateReleaseHosts are the release hosts the self-updater trusts when the
+// release root is supplied through the environment. Subdomains count as
+// pinned; any other host must be requested with an explicit --base-url.
+var updateReleaseHosts = []string{"drive9.ai"}
+
+func isPinnedUpdateHost(baseURL string) bool {
+	parsed, err := url.Parse(baseURL)
+	if err != nil || parsed.Host == "" {
+		return false
+	}
+	host := strings.ToLower(parsed.Hostname())
+	for _, pinned := range updateReleaseHosts {
+		if host == pinned || strings.HasSuffix(host, "."+pinned) {
+			return true
+		}
+	}
+	return false
+}
+
+// withPinnedUpdateRedirects returns a copy of client that refuses redirects to
+// hosts outside updateReleaseHosts, so pinning a release root also covers the
+// requests that follow redirects.
+func withPinnedUpdateRedirects(client *http.Client, allowInsecure bool) *http.Client {
+	if client == nil {
+		client = &http.Client{Timeout: updateCommandTimeout}
+	}
+	cloned := *client
+	next := client.CheckRedirect
+	cloned.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		// A custom CheckRedirect replaces the client's default ten-hop limit.
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
+		if !allowInsecure && req.URL.Scheme != "https" {
+			return fmt.Errorf("refusing redirect to %s: drive9 updates require https", req.URL.Redacted())
+		}
+		if !isPinnedUpdateHost(req.URL.String()) {
+			return fmt.Errorf("refusing redirect to %s: not a pinned drive9 release host (%s)", req.URL.Redacted(), strings.Join(updateReleaseHosts, ", "))
+		}
+		if next != nil {
+			return next(req, via)
+		}
+		return nil
+	}
+	return &cloned
 }
 
 func validateUpdateBaseURL(baseURL string, allowInsecure bool) error {
