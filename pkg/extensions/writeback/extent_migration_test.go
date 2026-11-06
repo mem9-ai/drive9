@@ -42,6 +42,8 @@ type migrationServer struct {
 	putBytes   int64          // total bytes PUT across all sessions
 	lastChmod  uint32         // last mode pushed through the remote chmod
 	resourceID string         // identity echoed by the last completion
+	totalSize  int64          // total_size of the last initiated session
+	exists     bool           // the name exists even at revision 0 / size 0
 }
 
 func newMigrationServer(t *testing.T) *migrationServer {
@@ -57,7 +59,12 @@ func newMigrationServer(t *testing.T) *migrationServer {
 			s.mu.Lock()
 			layout, rev, size := s.layout, s.revision, s.size
 			s.mu.Unlock()
-			if rev == 0 {
+			// An EXISTING object always answers, whatever its revision: a
+			// 0-byte file created and never rewritten is real, and the
+			// revision it reports may legitimately be 0. Answering 404 for
+			// it made "empty but present" indistinguishable from "absent",
+			// which hid the whole empty-occupant case.
+			if size == 0 && rev == 0 && !s.exists {
 				http.Error(w, "not found", http.StatusNotFound)
 				return
 			}
@@ -113,6 +120,14 @@ func newMigrationServer(t *testing.T) *migrationServer {
 				s.mu.Unlock()
 			}
 			w.WriteHeader(http.StatusOK)
+		case http.MethodDelete:
+			// RemoveAll for the empty-occupant reclaim.
+			s.mu.Lock()
+			s.size = 0
+			s.revision = 0
+			s.exists = false
+			s.mu.Unlock()
+			w.WriteHeader(http.StatusOK)
 		case http.MethodGet:
 			s.mu.Lock()
 			size := s.size
@@ -132,6 +147,7 @@ func newMigrationServer(t *testing.T) *migrationServer {
 		total := int((body.TotalSize + s.partSize - 1) / s.partSize)
 		s.mu.Lock()
 		s.sessions++
+		s.totalSize = body.TotalSize
 		s.parts = make(map[int][]byte)
 		s.mu.Unlock()
 		w.WriteHeader(http.StatusAccepted)
@@ -149,11 +165,22 @@ func newMigrationServer(t *testing.T) *migrationServer {
 			}
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			out := make([]map[string]any, 0, len(body.Parts))
+			// The client reads exactly Size bytes per part, so the LAST part
+			// must report the remainder of the image, not a full part:
+			// declaring partSize for a short tail fails every small upload
+			// with "short read".
+			s.mu.Lock()
+			total := s.totalSize
+			s.mu.Unlock()
 			for _, p := range body.Parts {
+				size := s.partSize
+				if off := int64(p.Number-1) * s.partSize; total > 0 && off+size > total {
+					size = total - off
+				}
 				out = append(out, map[string]any{
 					"number": p.Number,
 					"url":    fmt.Sprintf("http://%s/obj/%d", r.Host, p.Number),
-					"size":   s.partSize,
+					"size":   size,
 				})
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"parts": out})
