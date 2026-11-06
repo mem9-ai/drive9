@@ -513,8 +513,10 @@ func NewWithConfig(cfg Config) *Server {
 	mux.Handle("/v2/uploads/", business)
 	mux.Handle("/v1/tokens", business)
 	mux.Handle("/v1/tokens/", business)
-	mux.Handle("/v1/tenant", business)
-	mux.Handle("/v1/fork", business)
+	// Self-service destructive operations are audited too; the wrapper sits outside
+	// tenant auth so a refused attempt is recorded with the caller it presented.
+	mux.Handle("/v1/tenant", s.adminAuditMiddleware(business))
+	mux.Handle("/v1/fork", s.adminAuditMiddleware(business))
 	mux.Handle("/v1/sql", business)
 	mux.Handle("/v1/events", business)
 	mux.Handle("/v1/journals", business)
@@ -550,13 +552,16 @@ func NewWithConfig(cfg Config) *Server {
 		})))
 	}
 	mux.HandleFunc("/v1/status", s.handleTenantStatus)
-	mux.HandleFunc("/v1/provision", s.handleProvision)
-	mux.Handle("/v1/quota", s.quotaRootHandler(cfg))
-	mux.Handle("/v1/admin/tenant-pool", s.adminTenantPoolHandler())
-	mux.Handle("/v1/admin/tenants", s.adminTenantsRootHandler())
-	mux.Handle("/v1/admin/tenants/", s.adminTenantsItemHandler())
-	mux.Handle("/v1/admin/object-backends", s.adminObjectBackendsHandler())
-	mux.Handle("/v1/admin/object-backends/", s.adminObjectBackendsHandler())
+	// Control-plane mutations carry an audit record for every attempt, refused or
+	// not; the middleware wraps the handler so a request rejected before it runs is
+	// still recorded.
+	mux.Handle("/v1/provision", s.adminAuditMiddleware(http.HandlerFunc(s.handleProvision)))
+	mux.Handle("/v1/quota", s.adminAuditMiddleware(s.quotaRootHandler(cfg)))
+	mux.Handle("/v1/admin/tenant-pool", s.adminAuditMiddleware(s.adminTenantPoolHandler()))
+	mux.Handle("/v1/admin/tenants", s.adminAuditMiddleware(s.adminTenantsRootHandler()))
+	mux.Handle("/v1/admin/tenants/", s.adminAuditMiddleware(s.adminTenantsItemHandler()))
+	mux.Handle("/v1/admin/object-backends", s.adminAuditMiddleware(s.adminObjectBackendsHandler()))
+	mux.Handle("/v1/admin/object-backends/", s.adminAuditMiddleware(s.adminObjectBackendsHandler()))
 	mux.HandleFunc("/v1/auth/slock/login", s.handleSlockLogin)
 	mux.HandleFunc("/v1/auth/slock/callback", s.handleSlockCallback)
 	mux.HandleFunc("/healthz", s.handleHealthz)
