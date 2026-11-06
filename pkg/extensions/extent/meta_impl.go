@@ -958,7 +958,9 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 		// retry matches against (a replacement then rejects instead of
 		// receiving the staged bytes).
 		landed := ""
+		landedRev := int64(0)
 		upctx := client.WithCompletedResourceSink(ctx, &landed)
+		upctx = client.WithCompletedRevisionSink(upctx, &landedRev)
 		ra := &sparseImageAt{bridge: b, ctx: ctx, path: path, size: size, writes: pending}
 		if err := b.cfg.Client.WriteExtentStreamConditional(upctx, path, ra, size, nil, -1); err != nil {
 			return err
@@ -968,6 +970,15 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 			b.layoutPendingID[ino] = landed
 			b.mu.Unlock()
 		}
+		// Record the revision the COMPLETION echoed, as the patch path does.
+		// Without it a freshly created file has no authoritative floor at all:
+		// the only revision the bridge would learn is whatever a later Stat
+		// reports, and a Stat answered by a lagging replica records the OLD
+		// value — so the floor matches the stale image and the freshness guard
+		// can never fire. That is the first write of every new database, i.e.
+		// exactly the CREATE TABLE -> CREATE INDEX sequence mptest performs on
+		// a freshly created file.
+		b.recordLandedRevision(ino, landedRev)
 	} else {
 		blocks := make([]client.ExtentBlockWrite, 0, len(pending))
 		for _, p := range pending {
