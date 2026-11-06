@@ -6411,6 +6411,7 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, dur stageDurabi
 		// upload's ack still advances the handle.
 		h.mu.Lock()
 		h.cacheLineageGen = wbGen
+		h.cacheAncestorGens = mergeCacheAncestorGens(h.cacheAncestorGens, wbGen)
 		h.mu.Unlock()
 	} else {
 		// Cache lineage is a separate generation space from the pending
@@ -6431,6 +6432,7 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, dur stageDurabi
 		// advance the handle even though the cache lineage root is older.
 		h.supersededPendingGen = wbGen
 		h.supersededPendingSource = pendingGenCache
+		h.cacheAncestorGens = mergeCacheAncestorGens(cacheAncestors, wbGen)
 		h.mu.Unlock()
 	}
 	// v1 seeded the read cache with the staged image at the flush

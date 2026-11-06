@@ -552,6 +552,12 @@ func TestPortCacheStageKeepsGenerationSpacesSeparate(t *testing.T) {
 	if meta.CacheLineageGen != gen1 {
 		t.Fatalf("cache lineage = %d, want %d", meta.CacheLineageGen, gen1)
 	}
+	h.mu.Lock()
+	ancestors := append([]uint64(nil), h.cacheAncestorGens...)
+	h.mu.Unlock()
+	if !cacheGenInList(ancestors, meta.Generation) {
+		t.Fatalf("handle ancestors = %v, want staged generation %d", ancestors, meta.Generation)
+	}
 }
 
 // A queue-sourced handle must not accept a cache acknowledgement that only
