@@ -888,6 +888,33 @@ func (e *engineHandle) Write(ctx context.Context, off int64, data []byte) error 
 	if errno := e.plane.opts.Engine.VFS.Write(e.vctx, e.ino, data, uint64(off), e.fh); errno != 0 {
 		return errno
 	}
+	// Announce the mutation on the bus BEFORE returning.
+	//
+	// Outer planes (the read cache) key their tiers by path and drop a path's
+	// image either on EventWrite or on EventLanded. The extent plane emitted
+	// NEITHER, so a file written through the engine kept serving its
+	// PRE-WRITE image to the very descriptor that wrote it — and to every
+	// other reader. SQLite re-read page 1, saw a stale schema cookie,
+	// reported SQLITE_SCHEMA, and then could not find the table its previous
+	// statement had created.
+	//
+	// EventLanded (not EventWrite) is the right kind: it is what moves open
+	// readers onto the new revision instead of only dropping the cached
+	// image, and the write DID land in the engine's own writer, which is the
+	// authority this plane serves reads from.
+	if e.plane.opts.Events != nil {
+		size, _ := e.plane.opts.Engine.LocalAttr(ctx, e.path)
+		end := off + int64(len(data))
+		if end > size {
+			size = end
+		}
+		e.plane.opts.Events.Emit(fs.Event{
+			Kind:    fs.EventLanded,
+			Path:    e.path,
+			Size:    size,
+			HasSize: true,
+		})
+	}
 	return nil
 }
 
