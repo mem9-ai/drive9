@@ -18,6 +18,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/go-sql-driver/mysql"
+
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/metrics"
 	"github.com/mem9-ai/drive9/pkg/mysqlutil"
@@ -200,12 +202,36 @@ func OpenForTenantWithOrg(ctx context.Context, dsn, tenantID, tidbCloudOrgID str
 	return OpenForTenantScoped(ctx, dsn, tenantID, tidbCloudOrgID, StandaloneScope())
 }
 
+// rejectMultiStatementsDSN refuses a DSN that enables driver-side statement
+// chaining.
+//
+// The classifier authorizes one statement at a time, so anything after the first
+// `;` would otherwise run with the tag-write grant. The DSN is parsed rather than
+// substring-matched because go-sql-driver accepts multiStatements=true, =1, =T and
+// =TRUE.
+func rejectMultiStatementsDSN(dsn string) error {
+	cfg, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		// An unparseable DSN fails at open time with the driver's own message;
+		// nothing to inspect here.
+		return nil
+	}
+	if cfg.MultiStatements {
+		return fmt.Errorf("multiStatements is not allowed in production DSN")
+	}
+	return nil
+}
+
 // OpenForTenantScoped opens a Store whose SQL is shaped by scope. The scope
 // is fixed for the lifetime of the Store.
 func OpenForTenantScoped(ctx context.Context, dsn, tenantID, tidbCloudOrgID string, scope Scope) (*Store, error) {
-	lower := strings.ToLower(dsn)
-	if strings.Contains(lower, "multistatements=true") || strings.Contains(lower, "multistatements=1") {
-		return nil, fmt.Errorf("multiStatements is not allowed in production DSN")
+	// The statement classifier is single-statement, so a DSN that lets the driver
+	// chain statements would execute everything after the first `;` under the
+	// tag-write authorization. Parse the DSN instead of pattern-matching it: the
+	// driver accepts multiStatements=true/1/T/TRUE, and a substring test misses the
+	// short forms.
+	if err := rejectMultiStatementsDSN(dsn); err != nil {
+		return nil, err
 	}
 	db, err := mysqlutil.OpenInstrumentedForTenantWithOrg(ctx, dsn, mysqlutil.RoleUser, tenantID, tidbCloudOrgID)
 	if err != nil {
@@ -3477,6 +3503,9 @@ func storeOpResultForError(err error) string {
 		return "ok"
 	case errors.Is(err, ErrNotFound):
 		return "not_found"
+	case errors.Is(err, ErrExecSQLRejected):
+		// The statement was refused, not executed: client input, not a failure.
+		return "rejected"
 	case errors.Is(err, ErrPathConflict),
 		errors.Is(err, ErrDirectoryNotEmpty),
 		errors.Is(err, ErrRevisionConflict),
@@ -3501,7 +3530,7 @@ func storeOpResultForError(err error) string {
 
 func shouldLogStoreOpFailure(result string) bool {
 	switch result {
-	case "not_found", "conflict", "canceled", "deadline_exceeded", "conn_closed":
+	case "not_found", "conflict", "canceled", "deadline_exceeded", "conn_closed", "rejected":
 		return false
 	default:
 		return true

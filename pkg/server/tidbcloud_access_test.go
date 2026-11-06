@@ -92,7 +92,7 @@ func TestResolveTiDBCloudAccessProfileSharesPositivePlanAcrossCredentials(t *tes
 	provisioner := &accessTestProvisioner{
 		identities: map[string]tenant.TiDBCloudAPIKeyIdentity{
 			"key-a": {OrganizationID: "org-shared", Role: tenant.TiDBCloudRoleOrgOwner},
-			"key-b": {OrganizationID: "org-shared", Role: tenant.TiDBCloudRoleProjectOwner},
+			"key-b": {OrganizationID: "org-shared", Role: tenant.TiDBCloudRoleOrgOwner},
 		},
 		plan: tenant.TiDBCloudOrganizationPlan{IsFree: false},
 	}
@@ -202,4 +202,50 @@ func TestIsTiDBCloudBillingLookupErrorUsesTypedService(t *testing.T) {
 	}) {
 		t.Fatal("Cluster error was classified as Billing by operation text")
 	}
+}
+
+// project:owner is project-scoped. Drive9 has no project dimension to match it
+// against, so accepting it on an organization-wide surface would promote it to
+// organization admin — it must be refused there, while the tenant-bound paths
+// (which name their target and check the tenant's organization) keep accepting it.
+func TestProjectOwnerIsNotOrganizationAdmin(t *testing.T) {
+	newProjectOwnerRuntime := func(t *testing.T) *quotaRuntime {
+		t.Helper()
+		rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+		// The identity fixture list is consumed one entry per IAM call, so each
+		// assertion gets its own runtime and its own first-call identity.
+		rt.prov.iamIdentities = []*tenant.TiDBCloudAPIKeyIdentity{
+			{OrganizationID: "org-1", Role: tenant.TiDBCloudRoleProjectOwner},
+		}
+		return rt
+	}
+
+	t.Run("admin access", func(t *testing.T) {
+		rt := newProjectOwnerRuntime(t)
+		_, err := rt.server.authorizeTiDBCloudAdminAccess(context.Background(), tenant.CredentialProvisionRequest{
+			PublicKey: "pk", PrivateKey: "sk",
+		}, "test_role")
+		if err == nil || !isTiDBCloudRoleInsufficient(err) {
+			t.Fatalf("admin access for project:owner = %v, want an insufficient-role refusal", err)
+		}
+	})
+
+	t.Run("quota mutation", func(t *testing.T) {
+		rt := newProjectOwnerRuntime(t)
+		_, err := rt.server.authorizeTiDBCloudQuotaMutation(context.Background(), tenant.CredentialProvisionRequest{
+			PublicKey: "pk", PrivateKey: "sk",
+		}, "test_role")
+		if err == nil || !isTiDBCloudRoleInsufficient(err) {
+			t.Fatalf("quota mutation for project:owner = %v, want an insufficient-role refusal", err)
+		}
+	})
+
+	t.Run("tenant-bound path", func(t *testing.T) {
+		rt := newProjectOwnerRuntime(t)
+		if _, err := rt.server.resolveTiDBCloudIdentity(context.Background(), tenant.CredentialProvisionRequest{
+			PublicKey: "pk", PrivateKey: "sk",
+		}, "test_role", ""); err != nil {
+			t.Fatalf("tenant-bound identity for project:owner = %v, want acceptance", err)
+		}
+	})
 }

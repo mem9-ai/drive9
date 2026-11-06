@@ -61,6 +61,59 @@ func newSlockTestServer(t *testing.T, info slockoauth.UserInfo) (*Server, *meta.
 	return srv, dbi.Meta, tokenSecret
 }
 
+// slockLoginState performs the login hop and returns the state cookie and the
+// nonce the provider was given, which is what a real browser round trip carries
+// into the callback.
+func slockLoginState(t *testing.T, baseURL string) (*http.Cookie, string) {
+	t.Helper()
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	resp, err := client.Get(baseURL + "/v1/auth/slock/login")
+	if err != nil {
+		t.Fatalf("login: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("login status = %d, want 302", resp.StatusCode)
+	}
+	var stateCookie *http.Cookie
+	for _, cookie := range resp.Cookies() {
+		if cookie.Name == slockOAuthStateCookie {
+			stateCookie = cookie
+		}
+	}
+	if stateCookie == nil {
+		t.Fatal("login did not set the state cookie")
+	}
+	location, err := resp.Location()
+	if err != nil {
+		t.Fatalf("login redirect: %v", err)
+	}
+	nonce := location.Query().Get(slockOAuthStateParam)
+	if nonce == "" {
+		t.Fatal("login did not pass a state nonce to the provider")
+	}
+	return stateCookie, nonce
+}
+
+// slockCallbackGet issues a callback request carrying the browser-bound login
+// state, as a real browser would.
+func slockCallbackGet(t *testing.T, baseURL, query string) *http.Response {
+	t.Helper()
+	stateCookie, nonce := slockLoginState(t, baseURL)
+	req, err := http.NewRequest(http.MethodGet, baseURL+"/v1/auth/slock/callback?"+query+"&state="+nonce, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.AddCookie(stateCookie)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("callback: %v", err)
+	}
+	return resp
+}
+
 func TestSlockRoutesNotConfigured(t *testing.T) {
 	srv := NewWithConfig(Config{})
 	ts := httptest.NewServer(srv)
@@ -82,10 +135,7 @@ func TestSlockCallbackRequiresCode(t *testing.T) {
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
 
-	resp, err := http.Get(ts.URL + "/v1/auth/slock/callback?format=json")
-	if err != nil {
-		t.Fatal(err)
-	}
+	resp := slockCallbackGet(t, ts.URL, "format=json")
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", resp.StatusCode)
@@ -106,12 +156,7 @@ func TestSlockCallbackCreatesTenantBindingAndOwnerKey(t *testing.T) {
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
 
-	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/auth/slock/callback?code=abc&format=json", nil)
-	req.Header.Set("Accept", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
+	resp := slockCallbackGet(t, ts.URL, "code=abc&format=json")
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
@@ -170,10 +215,7 @@ func TestSlockCallbackReusesExistingBinding(t *testing.T) {
 
 	call := func(code string) slockCallbackResponse {
 		t.Helper()
-		resp, err := http.Get(ts.URL + "/v1/auth/slock/callback?code=" + code + "&format=json")
-		if err != nil {
-			t.Fatal(err)
-		}
+		resp := slockCallbackGet(t, ts.URL, "code="+code+"&format=json")
 		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status = %d, want 200", resp.StatusCode)
@@ -223,10 +265,7 @@ func TestSlockCallbackReprovisionsFailedBinding(t *testing.T) {
 
 	call := func(code string) slockCallbackResponse {
 		t.Helper()
-		resp, err := http.Get(ts.URL + "/v1/auth/slock/callback?code=" + code + "&format=json")
-		if err != nil {
-			t.Fatal(err)
-		}
+		resp := slockCallbackGet(t, ts.URL, "code="+code+"&format=json")
 		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status = %d, want 200", resp.StatusCode)
@@ -303,10 +342,7 @@ func TestSlockCallbackRejectsOversizedSubjectBeforeProvision(t *testing.T) {
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
 
-	resp, err := http.Get(ts.URL + "/v1/auth/slock/callback?code=oversized&format=json")
-	if err != nil {
-		t.Fatal(err)
-	}
+	resp := slockCallbackGet(t, ts.URL, "code=oversized&format=json")
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", resp.StatusCode)
@@ -350,10 +386,7 @@ func TestSlockCallbackRejectsOversizedMetadataBeforeProvision(t *testing.T) {
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
 
-	resp, err := http.Get(ts.URL + "/v1/auth/slock/callback?code=oversized-metadata&format=json")
-	if err != nil {
-		t.Fatal(err)
-	}
+	resp := slockCallbackGet(t, ts.URL, "code=oversized-metadata&format=json")
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", resp.StatusCode)
@@ -369,11 +402,13 @@ func TestSlockCallbackHTMLResponse(t *testing.T) {
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
 
-	req, err := http.NewRequest("GET", ts.URL+"/v1/auth/slock/callback?code=html", nil)
+	stateCookie, nonce := slockLoginState(t, ts.URL)
+	req, err := http.NewRequest("GET", ts.URL+"/v1/auth/slock/callback?code=html&state="+nonce, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	req.Header.Set("Accept", "text/html")
+	req.AddCookie(stateCookie)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -398,5 +433,71 @@ func TestSlockCallbackHTMLResponse(t *testing.T) {
 	}
 	if !strings.Contains(body, "Server URL") {
 		t.Fatal("html response should show server URL section")
+	}
+}
+
+// The signed cookie only proves that this browser started some login. The
+// authorization code must come back with the matching nonce, or an attacker who
+// can make the victim's browser start a login can hand it their own code.
+func TestSlockCallbackRequiresMatchingState(t *testing.T) {
+	info := slockoauth.UserInfo{Sub: "sub-1", Type: "agent", ClientID: "drive9", ServerID: "server-1"}
+	srv, _, _ := newSlockTestServer(t, info)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	stateCookie, nonce := slockLoginState(t, ts.URL)
+
+	for _, tc := range []struct {
+		name  string
+		query string
+		want  int
+	}{
+		{name: "missing state", query: "code=attacker&format=json", want: http.StatusBadRequest},
+		{name: "wrong state", query: "code=attacker&format=json&state=not-the-nonce", want: http.StatusBadRequest},
+		{name: "matching state", query: "code=abc&format=json&state=" + nonce, want: http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodGet, ts.URL+"/v1/auth/slock/callback?"+tc.query, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.AddCookie(stateCookie)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			if resp.StatusCode != tc.want {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, tc.want)
+			}
+		})
+	}
+}
+
+// A cookie that is not Secure can leak over a plaintext request, so a forwarded
+// https scheme has to be honoured when TLS terminates in front of this server.
+func TestSlockOAuthCookieSecureHonoursForwardedProto(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/v1/auth/slock/login", nil)
+	if slockOAuthCookieSecure(req, "") {
+		t.Fatal("a plain request with no public URL must not be treated as secure")
+	}
+	req.Header.Set("X-Forwarded-Proto", "https")
+	if !slockOAuthCookieSecure(req, "") {
+		t.Fatal("a forwarded https scheme must mark the cookie Secure")
+	}
+	req.Header.Set("X-Forwarded-Proto", "http, https")
+	if !slockOAuthCookieSecure(req, "") {
+		t.Fatal("an appended https hop must mark the cookie Secure")
+	}
+	// A proxy may also send several header fields; Get would only see the first.
+	req.Header.Del("X-Forwarded-Proto")
+	req.Header.Add("X-Forwarded-Proto", "http")
+	req.Header.Add("X-Forwarded-Proto", "https")
+	if !slockOAuthCookieSecure(req, "") {
+		t.Fatal("a second X-Forwarded-Proto field claiming https must mark the cookie Secure")
+	}
+	req.Header.Set("X-Forwarded-Proto", "http")
+	if !slockOAuthCookieSecure(req, "https://drive9.example.com") {
+		t.Fatal("an https public URL must already make the cookie Secure")
 	}
 }

@@ -511,10 +511,12 @@ func NewWithConfig(cfg Config) *Server {
 	mux.Handle("/v1/uploads", business)
 	mux.Handle("/v1/uploads/", business)
 	mux.Handle("/v2/uploads/", business)
-	mux.Handle("/v1/tokens", business)
-	mux.Handle("/v1/tokens/", business)
-	mux.Handle("/v1/tenant", business)
-	mux.Handle("/v1/fork", business)
+	mux.Handle("/v1/tokens", s.adminAuditMiddleware(business))
+	mux.Handle("/v1/tokens/", s.adminAuditMiddleware(business))
+	// Self-service destructive operations are audited too; the wrapper sits outside
+	// tenant auth so a refused attempt is recorded with the caller it presented.
+	mux.Handle("/v1/tenant", s.adminAuditMiddleware(business))
+	mux.Handle("/v1/fork", s.adminAuditMiddleware(business))
 	mux.Handle("/v1/sql", business)
 	mux.Handle("/v1/events", business)
 	mux.Handle("/v1/journals", business)
@@ -529,12 +531,13 @@ func NewWithConfig(cfg Config) *Server {
 	mux.Handle("/v1/extent/meta", business)
 	mux.Handle("/v1/data-credential", business)
 	// Vault management API goes through tenant auth.
-	mux.Handle("/v1/vault/secrets", business)
-	mux.Handle("/v1/vault/secrets/", business)
-	mux.Handle("/v1/vault/tokens", business)
-	mux.Handle("/v1/vault/tokens/", business)
-	mux.Handle("/v1/vault/grants", business)
-	mux.Handle("/v1/vault/grants/", business)
+	// Vault mutations are audited (including refusals); the read surface is not.
+	mux.Handle("/v1/vault/secrets", s.adminAuditMiddleware(business))
+	mux.Handle("/v1/vault/secrets/", s.adminAuditMiddleware(business))
+	mux.Handle("/v1/vault/tokens", s.adminAuditMiddleware(business))
+	mux.Handle("/v1/vault/tokens/", s.adminAuditMiddleware(business))
+	mux.Handle("/v1/vault/grants", s.adminAuditMiddleware(business))
+	mux.Handle("/v1/vault/grants/", s.adminAuditMiddleware(business))
 	mux.Handle("/v1/vault/audit", business)
 	// Vault read (consumption) API: authenticated by capability token, NOT tenant token.
 	if s.vaultMK != nil && cfg.Pool != nil && cfg.Meta != nil {
@@ -550,13 +553,16 @@ func NewWithConfig(cfg Config) *Server {
 		})))
 	}
 	mux.HandleFunc("/v1/status", s.handleTenantStatus)
-	mux.HandleFunc("/v1/provision", s.handleProvision)
-	mux.Handle("/v1/quota", s.quotaRootHandler(cfg))
-	mux.Handle("/v1/admin/tenant-pool", s.adminTenantPoolHandler())
-	mux.Handle("/v1/admin/tenants", s.adminTenantsRootHandler())
-	mux.Handle("/v1/admin/tenants/", s.adminTenantsItemHandler())
-	mux.Handle("/v1/admin/object-backends", s.adminObjectBackendsHandler())
-	mux.Handle("/v1/admin/object-backends/", s.adminObjectBackendsHandler())
+	// Control-plane mutations carry an audit record for every attempt, refused or
+	// not; the middleware wraps the handler so a request rejected before it runs is
+	// still recorded.
+	mux.Handle("/v1/provision", s.adminAuditMiddleware(http.HandlerFunc(s.handleProvision)))
+	mux.Handle("/v1/quota", s.adminAuditMiddleware(s.quotaRootHandler(cfg)))
+	mux.Handle("/v1/admin/tenant-pool", s.adminAuditMiddleware(s.adminTenantPoolHandler()))
+	mux.Handle("/v1/admin/tenants", s.adminAuditMiddleware(s.adminTenantsRootHandler()))
+	mux.Handle("/v1/admin/tenants/", s.adminAuditMiddleware(s.adminTenantsItemHandler()))
+	mux.Handle("/v1/admin/object-backends", s.adminAuditMiddleware(s.adminObjectBackendsHandler()))
+	mux.Handle("/v1/admin/object-backends/", s.adminAuditMiddleware(s.adminObjectBackendsHandler()))
 	mux.HandleFunc("/v1/auth/slock/login", s.handleSlockLogin)
 	mux.HandleFunc("/v1/auth/slock/callback", s.handleSlockCallback)
 	mux.HandleFunc("/healthz", s.handleHealthz)
@@ -1535,6 +1541,23 @@ const (
 )
 
 // isLoopbackListenAddr reports whether addr only accepts loopback connections.
+// EnvTLSAllowPlaintext opts a deployment into serving the API over plaintext on a
+// non-loopback address, which is correct only when TLS is terminated in front of
+// this server (NLB/ALB/ingress).
+const EnvTLSAllowPlaintext = "DRIVE9_TLS_ALLOW_PLAINTEXT"
+
+// tlsPlaintextAllowed reports whether the operator explicitly allowed a plaintext
+// listener on a non-loopback address. Parsing is fail-closed: only an affirmative
+// value allows it.
+func tlsPlaintextAllowed() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(EnvTLSAllowPlaintext))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
 func isLoopbackListenAddr(addr string) bool {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -1568,9 +1591,17 @@ func (s *Server) ListenAndServe(addr string) error {
 		return fmt.Errorf("%s and %s must be set together", envTLSCertFile, envTLSKeyFile)
 	}
 	if tlsCertFile == "" && !isLoopbackListenAddr(addr) {
+		// Bearer tokens, vault plaintext and file bytes all cross this listener, so a
+		// non-loopback plaintext bind is a decision the operator has to make
+		// explicitly instead of something that happens by default. Ingress-terminated
+		// TLS is the common deployment, which is why the opt-out exists.
+		if !tlsPlaintextAllowed() {
+			return fmt.Errorf("refusing to serve plaintext on %q: set %s/%s to serve HTTPS, or %s=1 when TLS is terminated in front of this server",
+				addr, envTLSCertFile, envTLSKeyFile, EnvTLSAllowPlaintext)
+		}
 		logger.Warn(backgroundWithTrace(context.Background()), "server_plaintext_listener",
 			zap.String("addr", addr),
-			zap.String("hint", "set "+envTLSCertFile+"/"+envTLSKeyFile+" to serve HTTPS, or terminate TLS at the ingress"))
+			zap.String("hint", "set "+envTLSCertFile+"/"+envTLSKeyFile+" to serve HTTPS, or "+EnvTLSAllowPlaintext+"=1 when TLS is terminated in front of this server"))
 	}
 	s.httpSrvMu.Lock()
 	s.httpSrv = httpSrv
