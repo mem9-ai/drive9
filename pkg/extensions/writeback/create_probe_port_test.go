@@ -666,3 +666,84 @@ func TestPortQueueStageInstallsCacheLineage(t *testing.T) {
 		t.Fatalf("queue supersession marker = %d, want 5", meta.SupersedesPendingGen)
 	}
 }
+
+// Even after the predecessor's cache entry is removed (uploadOne removes it
+// before OnSuccess), the successor's persisted ancestor list must let that
+// delayed acknowledgement rebase both the meta and the live handle.
+func TestPortAncestorAckSurvivesCacheRemoval(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/f", []byte("base"))
+	ts := httptest.NewServer(b)
+	defer ts.Close()
+	wbcache, err := staging.NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gen1, _, err := wbcache.PutWithBaseRevAndModeTimings("/f", []byte("base"), 4, staging.PendingOverwrite, 1, 0o644, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gen2, _, err := wbcache.PutWithBaseRevAndModeTimings("/f", []byte("base+2"), 6, staging.PendingOverwrite, 1, 0o644, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !wbcache.MarkCacheLineage("/f", gen1, gen2) {
+		t.Fatal("mark lineage")
+	}
+	wb, err := New(Options{Policy: PolicyWriteBack, Client: client.New(ts.URL, ""), WriteCache: wbcache})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, ok := wb.openPendingWritable(&fs.Op{Kind: fs.OpCreate, Path: "/f", Flags: uint32(syscall.O_WRONLY | syscall.O_APPEND)})
+	if !ok {
+		t.Fatal("fast path")
+	}
+	h := res.Handle.(*bufferingHandle)
+	if err := h.Write(context.Background(), 6, []byte("+3")); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate uploadOne removing G2's cache entry just before OnSuccess.
+	wbcache.Remove("/f")
+	if _, err := h.stageToWriteCache(context.Background(), stageFullDurable); err != nil {
+		t.Fatal(err)
+	}
+	wb.acknowledgeUploadedCreate("/f", 2, gen2, pendingGenCache, gen2)
+	h.mu.Lock()
+	baseRev := h.baseRev
+	h.mu.Unlock()
+	if baseRev != 2 {
+		t.Fatalf("handle base after delayed G2 ack = %d, want 2", baseRev)
+	}
+	meta, ok := wbcache.GetMeta("/f")
+	if !ok || meta.BaseRev != 2 || !cacheGenInList(meta.CacheAncestorGens, gen2) {
+		t.Fatalf("successor meta after ack = %+v ok=%v", meta, ok)
+	}
+}
+
+// Existing-file Write→Flush→Write→Release must not reacquire the upload gate
+// that Release already owns.
+func TestPortExistingFileReleaseAfterFlushDoesNotDeadlock(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.Seed("/f", []byte("old"))
+	chain, _, _ := newWriteCacheClientStack(t, PolicyWriteBack, b, Options{})
+	h := dispatchOpen(t, chain, "/f", uint32(syscall.O_RDWR))
+	if err := h.Write(context.Background(), 0, []byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Write(context.Background(), 0, []byte("newer")); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- h.Release(context.Background()) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Release deadlocked after Flush")
+	}
+}

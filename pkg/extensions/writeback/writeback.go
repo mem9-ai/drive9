@@ -240,6 +240,42 @@ const (
 	pendingGenQueue
 )
 
+const maxCacheAncestorGens = 64
+
+// mergeCacheAncestorGens returns a newest-first, deduplicated ancestor list
+// capped at maxCacheAncestorGens. The cap is far above any realistic ack
+// in-flight window; it only bounds metadata growth for pathological staging.
+func mergeCacheAncestorGens(base []uint64, add ...uint64) []uint64 {
+	out := make([]uint64, 0, len(base)+len(add))
+	seen := make(map[uint64]struct{}, len(base)+len(add))
+	for _, gen := range append(append([]uint64(nil), add...), base...) {
+		if gen == 0 {
+			continue
+		}
+		if _, ok := seen[gen]; ok {
+			continue
+		}
+		seen[gen] = struct{}{}
+		out = append(out, gen)
+		if len(out) == maxCacheAncestorGens {
+			break
+		}
+	}
+	return out
+}
+
+func cacheGenInList(list []uint64, gen uint64) bool {
+	if gen == 0 {
+		return false
+	}
+	for _, g := range list {
+		if g == gen {
+			return true
+		}
+	}
+	return false
+}
+
 type bufferingHandle struct {
 	w    *Writeback
 	path string
@@ -281,6 +317,10 @@ type bufferingHandle struct {
 	// cacheLineageGen is the write-back-cache generation root this handle's
 	// content descends from (its own staging when it has no pending parent).
 	cacheLineageGen uint64
+	// cacheAncestorGens lists the cache generations this handle's content
+	// composed over, newest first. It survives removal of the predecessor's
+	// cache entry before its upload acknowledgement.
+	cacheAncestorGens []uint64
 	// pendingFile backs a snapshot larger than the memory bound: the old
 	// object's bytes are streamed to a temp file (closed with the handle),
 	// so a 65MiB anonymous fd keeps its identity instead of falling back
@@ -1200,6 +1240,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 							if h.cacheLineageGen == 0 {
 								h.cacheLineageGen = meta.Generation
 							}
+							h.cacheAncestorGens = mergeCacheAncestorGens(meta.CacheAncestorGens, meta.Generation)
 						}
 					}
 					if pb, ok := w.pendingBaseRevOf(op.Path); ok {
@@ -1238,6 +1279,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 								if h.cacheLineageGen == 0 {
 									h.cacheLineageGen = meta.Generation
 								}
+								h.cacheAncestorGens = mergeCacheAncestorGens(meta.CacheAncestorGens, meta.Generation)
 							}
 						}
 						if pb, ok := w.pendingBaseRevOf(op.Path); ok {
@@ -3698,6 +3740,7 @@ func (w *Writeback) acknowledgeUploadedCreate(path string, rev int64, generation
 			}
 		case source == pendingGenCache && cacheGeneration != 0 &&
 			(h.cacheLineageGen == cacheGeneration ||
+				cacheGenInList(h.cacheAncestorGens, cacheGeneration) ||
 				(h.supersededPendingSource == pendingGenCache && h.supersededPendingGen == cacheGeneration)):
 			// This handle descends from the cache lineage the upload just
 			// published (possibly through several staged descendants). Its
@@ -3724,7 +3767,7 @@ func (w *Writeback) acknowledgeUploadedCreate(path string, rev int64, generation
 				if lineage == 0 {
 					lineage = meta.Generation
 				}
-				if lineage == cacheGeneration {
+				if lineage == cacheGeneration || cacheGenInList(meta.CacheAncestorGens, cacheGeneration) {
 					// The uploaded entry (deferred-mode window) or a newer
 					// staged descendant still present on disk derives from
 					// the revision this upload just published.
@@ -4766,6 +4809,7 @@ func (w *Writeback) openPendingWritable(op *fs.Op) (fs.Result, bool) {
 			if h.cacheLineageGen == 0 {
 				h.cacheLineageGen = meta.Generation
 			}
+			h.cacheAncestorGens = mergeCacheAncestorGens(meta.CacheAncestorGens, meta.Generation)
 		}
 		h.isNew = meta.Kind == staging.PendingNew
 		if meta.HasMode {
@@ -6203,16 +6247,16 @@ const (
 // durability: the v1 ladder uses the three-barrier stage put (both file
 // contents + one directory sync); full durability keeps the four-barrier
 // put for the boundaries where the pair is the only authority.
-func (w *Writeback) putWriteCacheSnapshot(path string, image []byte, kind staging.PendingKind, baseRev int64, mode uint32, hasMode bool, cacheLineage uint64, dur stageDurability) (uint64, error) {
+func (w *Writeback) putWriteCacheSnapshot(path string, image []byte, kind staging.PendingKind, baseRev int64, mode uint32, hasMode bool, cacheLineage uint64, cacheAncestors []uint64, dur stageDurability) (uint64, error) {
 	size := int64(len(image))
 	if dur == stageV1Ladder {
-		gen, _, err := w.wbCache.PutWithBaseRevAndModeAndLineageTimingsDirSyncCacheLineage(path, image, size, kind, baseRev, mode, hasMode, "", "", false, cacheLineage)
+		gen, _, err := w.wbCache.PutWithBaseRevAndModeAndLineageTimingsDirSyncCacheLineage(path, image, size, kind, baseRev, mode, hasMode, "", "", false, cacheLineage, cacheAncestors)
 		return gen, err
 	}
 	// The full-sync lineage put is the plain put's durability with the
 	// generation returned (same wbSyncFull path; the supersession mark and
 	// snapshot bookkeeping need the generation).
-	gen, _, err := w.wbCache.PutWithBaseRevAndModeAndLineageTimingsCacheLineage(path, image, size, kind, baseRev, mode, hasMode, "", "", false, cacheLineage)
+	gen, _, err := w.wbCache.PutWithBaseRevAndModeAndLineageTimingsCacheLineage(path, image, size, kind, baseRev, mode, hasMode, "", "", false, cacheLineage, cacheAncestors)
 	return gen, err
 }
 
@@ -6237,24 +6281,6 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, dur stageDurabi
 				}
 			}
 			h.mu.Unlock()
-		}
-	}
-	h.mu.Lock()
-	isNewStage := h.isNew
-	supersededStage, supersededSourceStage := h.supersededPendingGen, h.supersededPendingSource
-	h.mu.Unlock()
-	if !isNewStage && supersededSourceStage == pendingGenCache && supersededStage != 0 &&
-		h.w.uploader != nil && h.w.wbCache != nil {
-		// Land the predecessor this handle composed over before staging a
-		// successor. WaitPath alone has a gap: the worker can acquire the
-		// gate after the wait returns, publish the predecessor, and leave
-		// the successor staged at the pre-upload base. UploadSync owns the
-		// gate through cache cleanup and its acknowledgement updates this
-		// handle.
-		if meta, ok := h.w.wbCache.GetMeta(h.path); ok && meta != nil && meta.Generation == supersededStage {
-			if err := h.w.uploader.UploadSync(ctx, h.path); err != nil && !h.w.uploader.IsLedgerOwnedError(err) {
-				return nil, err
-			}
 		}
 	}
 	unlock := h.w.pathLocks.lock(h.path)
@@ -6299,6 +6325,10 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, dur stageDurabi
 	supersedesGen := h.supersededPendingGen
 	supersedesSource := h.supersededPendingSource
 	cacheLineage := h.cacheLineageGen
+	cacheAncestors := append([]uint64(nil), h.cacheAncestorGens...)
+	if supersedesSource == pendingGenCache {
+		cacheAncestors = mergeCacheAncestorGens(cacheAncestors, supersedesGen)
+	}
 	h.mu.Unlock()
 	if isNew {
 		baseRev = 0
@@ -6367,7 +6397,7 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, dur stageDurabi
 	// remote name itself (a remote key here made every subtree mount's
 	// upload silently no-op — the git-ops clone's config.lock never
 	// landed).
-	wbGen, err := h.w.putWriteCacheSnapshot(h.path, image, kind, baseRev, mode, hasMode, cacheLineage, dur)
+	wbGen, err := h.w.putWriteCacheSnapshot(h.path, image, kind, baseRev, mode, hasMode, cacheLineage, cacheAncestors, dur)
 	if err != nil {
 		return nil, err
 	}
