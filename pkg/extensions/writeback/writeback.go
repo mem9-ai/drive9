@@ -210,6 +210,9 @@ type Writeback struct {
 	// liveSet tracks every open bufferingHandle so unlink/rename can walk
 	// them; keeps this per-handle on FileHandle.
 	liveSet sync.Map
+	// liveByPath indexes open handles by path so create/release do not scan
+	// the whole liveSet (100k-file unzip made each close O(open handles)).
+	liveByPath map[string]map[*bufferingHandle]struct{}
 	// landedMu/landed is the recently-landed table (landedAt).
 	landedMu    sync.Mutex
 	landed      map[string]landedInfo
@@ -529,7 +532,7 @@ func New(opts Options) (*Writeback, error) {
 		preload = writebuffer.MaxPreloadSize
 	}
 	w := &Writeback{opts: opts, root: root, preload: preload, interactive: opts.SyncMode == "interactive",
-		perfShim: &fusePerfCounters{}}
+		perfShim: &fusePerfCounters{}, liveByPath: make(map[string]map[*bufferingHandle]struct{})}
 	w.extentGlobs = extentGlobs
 	w.extentMatchCutoff = opts.ExtentThreshold
 	w.perfShim.enabled.Store(true)
@@ -4246,15 +4249,17 @@ func (w *Writeback) acknowledgeUploadedCreate(path string, rev int64, generation
 	// append against R after this mount already published R+1, which the
 	// uploader refuses as a conflict (only a byte-identical duplicate is
 	// rebased).
-	w.liveSet.Range(func(key, _ any) bool {
-		h, ok := key.(*bufferingHandle)
-		if !ok {
-			return true
-		}
+	w.regMu.Lock()
+	handles := make([]*bufferingHandle, 0, len(w.liveByPath[path]))
+	for h := range w.liveByPath[path] {
+		handles = append(handles, h)
+	}
+	w.regMu.Unlock()
+	for _, h := range handles {
 		h.mu.Lock()
 		if h.path != path || h.unlinked {
 			h.mu.Unlock()
-			return true
+			continue
 		}
 		switch {
 		case h.isNew:
@@ -4281,8 +4286,7 @@ func (w *Writeback) acknowledgeUploadedCreate(path string, rev int64, generation
 			}
 		}
 		h.mu.Unlock()
-		return true
-	})
+	}
 	if w.wbCache != nil {
 		if err := w.wbCache.RebasePendingNew(path, rev); err != nil {
 			safeLogPrintf("writeback: rebase pending create %s on revision %d: %v", path, rev, err)
@@ -4729,28 +4733,23 @@ func (w *Writeback) track(h *bufferingHandle) {
 func (w *Writeback) trackLocked(h *bufferingHandle) {
 	w.live.Store(h.path, h)
 	w.liveSet.Store(h, h.infoSnapshot())
+	set := w.liveByPath[h.path]
+	if set == nil {
+		set = make(map[*bufferingHandle]struct{})
+		w.liveByPath[h.path] = set
+	}
+	set[h] = struct{}{}
 }
 
 // hasOtherTrackedHandle reports whether any handle other than except is
 // currently registered under path (identity from the lock-free snapshot).
 func (w *Writeback) hasOtherTrackedHandle(path string, except *bufferingHandle) bool {
-	found := false
-	w.liveSet.Range(func(key, v any) bool {
-		other, ok := key.(*bufferingHandle)
-		if !ok || other == except {
+	for other := range w.liveByPath[path] {
+		if other != except {
 			return true
 		}
-		info, iok := v.(*handleInfo)
-		if !iok {
-			info = other.infoSnapshot()
-		}
-		if info.path == path {
-			found = true
-			return false
-		}
-		return true
-	})
-	return found
+	}
+	return false
 }
 
 // handleInfo is the immutable registry snapshot carried in liveSet: the
@@ -4790,34 +4789,21 @@ func (w *Writeback) retireLocked(h *bufferingHandle) {
 	h.mu.Lock()
 	path := h.path
 	h.mu.Unlock()
+	set := w.liveByPath[path]
+	delete(set, h)
+	if len(set) == 0 {
+		delete(w.liveByPath, path)
+	}
 	if w.live.CompareAndDelete(path, h) {
-		w.liveSet.Range(func(key, v any) bool {
-			other, ok := key.(*bufferingHandle)
-			if !ok || other == h {
-				return true
-			}
-			info, iok := v.(*handleInfo)
-			if !iok {
-				info = other.infoSnapshot()
-			}
-			if info.path != path {
-				return true
-			}
+		for other := range set {
 			other.mu.Lock()
 			eligible := !other.unlinked
 			other.mu.Unlock()
-			// Promote only into an ABSENT slot: an open that registered
-			// after our CAS (it holds regMu too, but the slot may have
-			// been empty at its turn) is the newer owner — an
-			// unconditional Store would replace it with an older handle.
 			if eligible {
-				if _, exists := w.live.Load(path); !exists {
-					w.live.Store(path, other)
-				}
-				return false
+				w.live.Store(path, other)
+				break
 			}
-			return true
-		})
+		}
 	}
 	w.liveSet.Delete(h)
 }
