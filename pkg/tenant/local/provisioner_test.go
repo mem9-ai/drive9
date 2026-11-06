@@ -161,6 +161,26 @@ func TestProvisionAndDeprovision(t *testing.T) {
 	if again.Username != info.Username || again.Password != info.Password {
 		t.Fatalf("re-provision rotated the credential: %q -> %q", info.Username, again.Username)
 	}
+	// The first credential still authenticates after the second Provision.
+	firstDSN := info.Username + ":" + info.Password + "@tcp(" + info.Host + ":" + strconv.Itoa(info.Port) + ")/" + info.DBName + "?parseTime=true"
+	firstDB, err := sql.Open("mysql", firstDSN)
+	if err != nil {
+		t.Fatalf("open first dsn: %v", err)
+	}
+	defer func() { _ = firstDB.Close() }()
+	if _, err := firstDB.ExecContext(ctx, "SELECT 1"); err != nil {
+		t.Fatalf("credential from the first provision no longer works: %v", err)
+	}
+	// A changed deployment secret must fail closed rather than silently rotate the
+	// account out from under the credential the caller already persisted.
+	rotated := *p
+	rotated.tenantSecret = "a-different-secret"
+	if _, err := rotated.Provision(ctx, "11111111-2222-3333-4444-555555555555"); err == nil {
+		t.Fatal("a changed tenant secret rotated the existing account instead of failing closed")
+	}
+	if _, err := firstDB.ExecContext(ctx, "SELECT 1"); err != nil {
+		t.Fatalf("the rejected rotation broke the existing credential: %v", err)
+	}
 	if scope := localTenantGrantScope("drive9_abc_def"); strings.Contains(scope, "drive9_abc_def") {
 		t.Fatalf("grant scope %q does not escape the wildcard", scope)
 	}

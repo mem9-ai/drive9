@@ -200,3 +200,34 @@ func TestAdminAuditCredentialPrecedenceAndBodyPreservation(t *testing.T) {
 		}
 	})
 }
+
+// A successful mutation reports the identity the auth layer resolved, not just the
+// keys the request presented.
+func TestAdminAuditMiddlewareRecordsAuthenticatedSubject(t *testing.T) {
+	core, recorded := observer.New(zap.InfoLevel)
+	previous := logger.L()
+	logger.Set(zap.New(core))
+	t.Cleanup(func() { logger.Set(previous) })
+
+	s := &Server{}
+	handler := s.adminAuditMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		recordAdminAuditSubject(r.Context(), "org-resolved", "PK-RESOLVED")
+		w.WriteHeader(http.StatusOK)
+	}))
+	req := httptest.NewRequest(http.MethodDelete, "/v1/admin/tenants/t1", nil)
+	req.Header.Set(quotaPublicKeyHeader, "PK-HEADER")
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+
+	var fields map[string]interface{}
+	for _, entry := range recorded.All() {
+		if entry.Message == "admin_audit" {
+			fields = entry.ContextMap()
+		}
+	}
+	if fields == nil {
+		t.Fatal("no admin_audit record")
+	}
+	if fields["actor_org_id"] != "org-resolved" || fields["actor_public_key"] != "PK-RESOLVED" {
+		t.Fatalf("actor = %v/%v, want the authenticated identity", fields["actor_org_id"], fields["actor_public_key"])
+	}
+}

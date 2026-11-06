@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -42,6 +43,18 @@ func adminAuditAction(method, path string) string {
 			return "tenant_pool.update"
 		case http.MethodDelete:
 			return "tenant_pool.delete"
+		}
+	// Tenant API keys are credentials: issuing and revoking them is a privileged
+	// mutation, and a refused attempt deserves a record as much as a tenant delete.
+	case path == "/v1/tokens" && method == http.MethodPost:
+		return "token.create"
+	case strings.HasPrefix(path, "/v1/tokens/"):
+		rest := strings.Trim(strings.TrimPrefix(path, "/v1/tokens/"), "/")
+		switch {
+		case rest == "revoke" && method == http.MethodPost:
+			return "token.revoke"
+		case rest != "" && method == http.MethodDelete:
+			return "token.delete"
 		}
 	// Vault management mutates tenant secrets, tokens and grants; the existing
 	// vault events cover successful operations only.
@@ -123,12 +136,56 @@ func adminAuditRecorder(w http.ResponseWriter) (http.ResponseWriter, func() int)
 	return ow, func() int { return ow.status }
 }
 
+// adminAuditSubject is the identity the auth layer actually resolved during this
+// request. The middleware cannot see it any other way: it wraps the handler, and
+// a resolved organization lives only in the handler's own scope.
+type adminAuditSubject struct {
+	OrganizationID string
+	PublicKey      string
+}
+
+type adminAuditSubjectKeyType int
+
+const adminAuditSubjectKey adminAuditSubjectKeyType = 1
+
+func withAdminAuditSubject(ctx context.Context) (context.Context, *adminAuditSubject) {
+	subject := &adminAuditSubject{}
+	return context.WithValue(ctx, adminAuditSubjectKey, subject), subject
+}
+
+// recordAdminAuditSubject publishes the authenticated identity for the audit
+// record. Handlers and the auth layer call it after a successful resolution; a
+// refused request never reaches it, so the fallbacks still apply there.
+func recordAdminAuditSubject(ctx context.Context, organizationID, publicKey string) {
+	subject, ok := ctx.Value(adminAuditSubjectKey).(*adminAuditSubject)
+	if !ok || subject == nil {
+		return
+	}
+	if organizationID = strings.TrimSpace(organizationID); organizationID != "" {
+		subject.OrganizationID = organizationID
+	}
+	if publicKey = strings.TrimSpace(publicKey); publicKey != "" {
+		subject.PublicKey = publicKey
+	}
+}
+
+func adminAuditSubjectFromContext(ctx context.Context) *adminAuditSubject {
+	subject, _ := ctx.Value(adminAuditSubjectKey).(*adminAuditSubject)
+	return subject
+}
+
 // adminAuditActor resolves who performed the request from what this server
 // already knows about the caller: the TiDB Cloud organization recorded on the
 // request scope, then the tenant/api-key scope, then the public key the caller
 // presented. The public key is not a secret and is still worth recording on a
 // refused request — that is the audit of an attempt.
-func adminAuditActor(r *http.Request, bodyPublicKey string) (actorKind, orgID, apiKeyID, publicKey string) {
+func adminAuditActor(r *http.Request, bodyPublicKey string, subject *adminAuditSubject) (actorKind, orgID, apiKeyID, publicKey string) {
+	// An authenticated identity recorded during the request is the strongest
+	// evidence, and the only source of the organization for body-authenticated
+	// routes.
+	if subject != nil && (subject.OrganizationID != "" || subject.PublicKey != "") {
+		return "control_plane", subject.OrganizationID, "", subject.PublicKey
+	}
 	tenantID, apiKeyID, _, scopeOrgID := requestMetricScope(r.Context())
 	_ = tenantID
 	if scopeOrgID != "" {
@@ -205,6 +262,9 @@ func (s *Server) adminAuditMiddleware(next http.Handler) http.Handler {
 		// it refuses the request. Peek at the body for the audit actor, then put it
 		// back for the handler.
 		auditBodyKey := adminAuditBodyPublicKey(r)
+		// The handler publishes the identity it authenticated, if any.
+		ctx, _ := withAdminAuditSubject(r.Context())
+		r = r.WithContext(ctx)
 		// Wrap the writer to capture the status, but keep every optional interface
 		// the original had: dropping http.Flusher here would break a streaming
 		// handler mounted behind the audit middleware.
@@ -220,7 +280,7 @@ func (s *Server) adminAuditMiddleware(next http.Handler) http.Handler {
 		if status >= http.StatusBadRequest {
 			result = "failed"
 		}
-		actorKind, orgID, apiKeyID, publicKey := adminAuditActor(r, auditBodyKey)
+		actorKind, orgID, apiKeyID, publicKey := adminAuditActor(r, auditBodyKey, adminAuditSubjectFromContext(r.Context()))
 		logger.Info(r.Context(), "admin_audit", eventFields(r.Context(), "admin_audit",
 			"action", action,
 			"target", r.URL.Path,

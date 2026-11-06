@@ -489,6 +489,13 @@ func TestSlockOAuthCookieSecureHonoursForwardedProto(t *testing.T) {
 	if !slockOAuthCookieSecure(req, "") {
 		t.Fatal("an appended https hop must mark the cookie Secure")
 	}
+	// A proxy may also send several header fields; Get would only see the first.
+	req.Header.Del("X-Forwarded-Proto")
+	req.Header.Add("X-Forwarded-Proto", "http")
+	req.Header.Add("X-Forwarded-Proto", "https")
+	if !slockOAuthCookieSecure(req, "") {
+		t.Fatal("a second X-Forwarded-Proto field claiming https must mark the cookie Secure")
+	}
 	req.Header.Set("X-Forwarded-Proto", "http")
 	if !slockOAuthCookieSecure(req, "https://drive9.example.com") {
 		t.Fatal("an https public URL must already make the cookie Secure")

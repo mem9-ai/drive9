@@ -16,6 +16,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 
 	mysql "github.com/go-sql-driver/mysql"
@@ -79,10 +80,12 @@ func NewProvisionerFromEnv() (*Provisioner, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The derivation key must be a stable, high-entropy secret. The admin DSN's
+	// password is not: it can be empty (the default local DSN) or weak, and anyone
+	// holding one tenant's derived password could use it to guess the rest.
 	secret := firstNonEmpty(
 		strings.TrimSpace(os.Getenv(EnvTenantPasswordSecret)),
 		strings.TrimSpace(os.Getenv("DRIVE9_MASTER_KEY")),
-		cfg.Passwd,
 	)
 	if secret == "" {
 		return nil, fmt.Errorf("%s (or DRIVE9_MASTER_KEY) is required to derive local tenant database passwords", EnvTenantPasswordSecret)
@@ -118,7 +121,7 @@ func (p *Provisioner) Provision(ctx context.Context, tenantID string) (*tenant.C
 	// account would give it every other tenant's database (and the control plane,
 	// which lives on the same instance). The tenant gets its own account, granted
 	// only on its own schema.
-	credential, err := ensureLocalTenantAccount(ctx, admin, p.tenantSecret, tenantID, dbName)
+	credential, err := ensureLocalTenantAccount(ctx, admin, p.admin.Addr, p.tenantSecret, tenantID, dbName)
 	if err != nil {
 		return nil, err
 	}
@@ -154,7 +157,7 @@ type localTenantCredential struct {
 // id, so re-provisioning an existing tenant converges instead of rotating a
 // credential the metadata store already holds. The account name is derived the
 // same way, which keeps it stable across restarts.
-func ensureLocalTenantAccount(ctx context.Context, admin *sql.DB, tenantSecret, tenantID, dbName string) (localTenantCredential, error) {
+func ensureLocalTenantAccount(ctx context.Context, admin *sql.DB, adminAddr, tenantSecret, tenantID, dbName string) (localTenantCredential, error) {
 	username := localTenantUserName(tenantID)
 	if username == "" {
 		return localTenantCredential{}, fmt.Errorf("derive local tenant credential for %s", tenantID)
@@ -168,15 +171,37 @@ func ensureLocalTenantAccount(ctx context.Context, admin *sql.DB, tenantSecret, 
 		return localTenantCredential{}, fmt.Errorf("derive local tenant password for %s", tenantID)
 	}
 	user := quoteString(username) + "@'%'"
+	exists, err := localTenantAccountExists(ctx, admin, username)
+	if err != nil {
+		return localTenantCredential{}, err
+	}
+	if exists {
+		// Re-provisioning must converge, never rotate: the caller persists the
+		// returned credential only after Provision succeeds, so setting a new
+		// password here could leave the account and the metadata store disagreeing.
+		// If the derived password no longer works, the deployment secret changed
+		// under an existing account, which needs a deliberate rotation, not a silent
+		// one.
+		ok, verifyErr := localTenantAccountAuthenticates(ctx, username, password, adminAddr)
+		if verifyErr != nil {
+			return localTenantCredential{}, verifyErr
+		}
+		if !ok {
+			return localTenantCredential{}, fmt.Errorf(
+				"local tenant %s already has an account whose password was derived from a different %s; restore that secret (or set a new %s and re-provision after dropping the account), refusing to rotate it silently",
+				tenantID, EnvTenantPasswordSecret, EnvTenantPasswordSecret)
+		}
+		if _, err := admin.ExecContext(ctx, "GRANT "+localTenantGrant+" ON "+localTenantGrantScope(dbName)+" TO "+user); err != nil {
+			return localTenantCredential{}, fmt.Errorf("grant schema access for local tenant %s: %w", tenantID, err)
+		}
+		return localTenantCredential{username: username, password: password}, nil
+	}
 	statements := []struct {
 		what string
 		sql  string
 	}{
 		{"create account", "CREATE USER IF NOT EXISTS " + user + " IDENTIFIED BY " + quoteString(password)},
 		{"grant schema access", "GRANT " + localTenantGrant + " ON " + localTenantGrantScope(dbName) + " TO " + user},
-		// Last, so a failed grant never leaves a credential the metadata store does
-		// not hold, and a retry converges on the returned password.
-		{"set password", "ALTER USER " + user + " IDENTIFIED BY " + quoteString(password)},
 	}
 	for _, stmt := range statements {
 		if _, err := admin.ExecContext(ctx, stmt.sql); err != nil {
@@ -184,6 +209,44 @@ func ensureLocalTenantAccount(ctx context.Context, admin *sql.DB, tenantSecret, 
 		}
 	}
 	return localTenantCredential{username: username, password: password}, nil
+}
+
+// localTenantAccountExists reports whether the tenant's MySQL account exists.
+func localTenantAccountExists(ctx context.Context, admin *sql.DB, username string) (bool, error) {
+	var count int
+	err := admin.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM information_schema.user_privileges WHERE grantee = ?",
+		"'"+username+"'@'%'").Scan(&count)
+	if err != nil {
+		return false, fmt.Errorf("check local tenant account %s: %w", username, err)
+	}
+	return count > 0, nil
+}
+
+// localTenantAccountAuthenticates reports whether the derived password is the one
+// the existing account actually uses. It connects as the tenant, so a wrong
+// secret is detected without touching the account.
+func localTenantAccountAuthenticates(ctx context.Context, username, password, addr string) (bool, error) {
+	if strings.TrimSpace(addr) == "" {
+		return false, fmt.Errorf("local admin address is unknown")
+	}
+	cfg := mysql.NewConfig()
+	cfg.User = username
+	cfg.Passwd = password
+	cfg.Net = "tcp"
+	cfg.Addr = addr
+	cfg.Timeout = 5 * time.Second
+	probe, openErr := sql.Open("mysql", cfg.FormatDSN())
+	if openErr != nil {
+		return false, fmt.Errorf("probe local tenant %s: %w", username, openErr)
+	}
+	defer func() { _ = probe.Close() }()
+	pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if pingErr := probe.PingContext(pingCtx); pingErr != nil {
+		return false, nil
+	}
+	return true, nil
 }
 
 // localTenantUserName is the MySQL account name for a local tenant. MySQL caps

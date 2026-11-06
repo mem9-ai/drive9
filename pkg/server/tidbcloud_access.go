@@ -21,6 +21,7 @@ func (s *Server) authorizeTiDBCloudAdminAccess(ctx context.Context, cred tenant.
 	if err != nil {
 		return nil, err
 	}
+	recordAdminAuditSubject(ctx, profile.OrganizationID, cred.PublicKey)
 	if profile.IsFree {
 		return nil, tenant.ErrTiDBCloudFreeAdminForbidden
 	}
@@ -46,6 +47,9 @@ func (s *Server) resolveTiDBCloudAccessProfile(ctx context.Context, cred tenant.
 	if err != nil {
 		return nil, err
 	}
+	// Publish the authenticated identity for the audit record of this request: the
+	// organization it resolved, and the public key the caller actually used (the
+	// body credential, which is what authenticated, not a header).
 	organizationID := strings.TrimSpace(identity.OrganizationID)
 	if s.tidbCloudPlanCache.isNonFree(organizationID) {
 		metrics.RecordTiDBCloudBillingCacheRequest(metricPath, "hit")

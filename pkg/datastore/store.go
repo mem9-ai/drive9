@@ -3530,7 +3530,7 @@ func storeOpResultForError(err error) string {
 
 func shouldLogStoreOpFailure(result string) bool {
 	switch result {
-	case "not_found", "conflict", "canceled", "deadline_exceeded", "conn_closed":
+	case "not_found", "conflict", "canceled", "deadline_exceeded", "conn_closed", "rejected":
 		return false
 	default:
 		return true

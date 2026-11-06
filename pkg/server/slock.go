@@ -638,9 +638,13 @@ func slockOAuthCookieSecure(r *http.Request, publicURL string) bool {
 	// produces "http, https", and reading only the first value would then drop the
 	// Secure flag — the leak this helper exists to prevent. Erring on https can only
 	// harden the cookie.
-	for _, value := range strings.Split(r.Header.Get("X-Forwarded-Proto"), ",") {
-		if strings.EqualFold(strings.TrimSpace(value), "https") {
-			return true
+	// Every header field and every hop is considered: a proxy may append a value
+	// ("http, https") or send several fields, and a single https claim is enough.
+	for _, header := range r.Header.Values("X-Forwarded-Proto") {
+		for _, value := range strings.Split(header, ",") {
+			if strings.EqualFold(strings.TrimSpace(value), "https") {
+				return true
+			}
 		}
 	}
 	return false

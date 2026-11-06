@@ -511,8 +511,8 @@ func NewWithConfig(cfg Config) *Server {
 	mux.Handle("/v1/uploads", business)
 	mux.Handle("/v1/uploads/", business)
 	mux.Handle("/v2/uploads/", business)
-	mux.Handle("/v1/tokens", business)
-	mux.Handle("/v1/tokens/", business)
+	mux.Handle("/v1/tokens", s.adminAuditMiddleware(business))
+	mux.Handle("/v1/tokens/", s.adminAuditMiddleware(business))
 	// Self-service destructive operations are audited too; the wrapper sits outside
 	// tenant auth so a refused attempt is recorded with the caller it presented.
 	mux.Handle("/v1/tenant", s.adminAuditMiddleware(business))
