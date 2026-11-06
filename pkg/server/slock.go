@@ -2,12 +2,17 @@ package server
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,6 +25,22 @@ import (
 )
 
 const slockProvider = "slock"
+
+// OAuth callback binding. The callback re-serves the owner API key of the Slock
+// principal the authorization code belongs to, so it must only run in the browser
+// that started a login on this server. A short-lived signed cookie set by
+// /v1/auth/slock/login proves that, and the nonce is echoed through the provider's
+// state parameter so a provider that supports it also binds the code.
+// PKCE is deliberately absent: the provider's token endpoint has no code_verifier
+// support, and a challenge the provider ignores would be security theatre. The
+// state binding below is what keeps the callback in the browser that started it.
+const (
+	slockOAuthStateCookie  = "drive9_slock_oauth_state"
+	slockOAuthStateParam   = "state"
+	slockOAuthStateTTL     = 10 * time.Minute
+	slockOAuthStatePath    = "/v1/auth/slock"
+	slockOAuthStateSigSeed = "drive9-slock-oauth-state:"
+)
 
 const (
 	maxExternalSubjectKeyBytes = 512
@@ -404,7 +425,26 @@ func (s *Server) handleSlockLogin(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusNotImplemented, "login with slock is not configured")
 		return
 	}
-	http.Redirect(w, r, s.slockOAuth.LoginURL(), http.StatusFound)
+	if err := s.ensureSlockProvisioningEnabled(); err != nil {
+		errJSON(w, http.StatusNotFound, err.Error())
+		return
+	}
+	nonce, cookieValue, err := s.newSlockOAuthState()
+	if err != nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "slock_login_state_failed", "error", err)...)
+		errJSON(w, http.StatusInternalServerError, "failed to start slock login")
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     slockOAuthStateCookie,
+		Value:    cookieValue,
+		Path:     slockOAuthStatePath,
+		MaxAge:   int(slockOAuthStateTTL.Seconds()),
+		HttpOnly: true,
+		Secure:   slockOAuthCookieSecure(r, s.publicURL),
+		SameSite: http.SameSiteLaxMode,
+	})
+	http.Redirect(w, r, appendURLQueryParam(s.slockOAuth.LoginURL(), slockOAuthStateParam, nonce), http.StatusFound)
 }
 
 func (s *Server) handleSlockCallback(w http.ResponseWriter, r *http.Request) {
@@ -416,6 +456,27 @@ func (s *Server) handleSlockCallback(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusNotImplemented, "login with slock is not configured")
 		return
 	}
+	// Authenticate the callback before touching the authorization code (and
+	// therefore before any code exchange, binding lookup, key decryption, or key
+	// rotation): the request must belong to a login this server started for this
+	// browser.
+	state := strings.TrimSpace(r.URL.Query().Get(slockOAuthStateParam))
+	cookie, _ := r.Cookie(slockOAuthStateCookie)
+	nonce, stateOK := s.verifySlockOAuthState(cookie)
+	if !stateOK {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "slock_callback_state_rejected")...)
+		errJSON(w, http.StatusUnauthorized, "slock login state is missing or expired")
+		return
+	}
+	// A provider that echoes the state parameter gives full login-CSRF binding;
+	// one that ignores it still leaves the signed cookie as proof that this
+	// browser started the login.
+	if state != "" && !hmac.Equal([]byte(state), []byte(nonce)) {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "slock_callback_state_mismatch")...)
+		errJSON(w, http.StatusBadRequest, "invalid slock login state")
+		return
+	}
+	clearSlockOAuthState(w, r, s.publicURL)
 	if errMsg := strings.TrimSpace(r.URL.Query().Get("error")); errMsg != "" {
 		errJSON(w, http.StatusBadRequest, "slock oauth error: "+errMsg)
 		return
@@ -493,6 +554,90 @@ func (s *Server) ensureSlockProvisioningEnabled() error {
 		return fmt.Errorf("provisioner not configured")
 	}
 	return nil
+}
+
+// newSlockOAuthState mints the nonce echoed to the provider plus the signed
+// cookie value that proves the callback belongs to this browser's login.
+func (s *Server) newSlockOAuthState() (nonce, cookieValue string, err error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", "", err
+	}
+	nonce = base64.RawURLEncoding.EncodeToString(raw)
+	expires := time.Now().Add(slockOAuthStateTTL).Unix()
+	return nonce, slockOAuthStateCookieValue(s.tokenSecret, nonce, expires), nil
+}
+
+// verifySlockOAuthState returns the cookie's nonce when the signature is valid and
+// the state has not expired.
+func (s *Server) verifySlockOAuthState(cookie *http.Cookie) (string, bool) {
+	if cookie == nil || strings.TrimSpace(cookie.Value) == "" {
+		return "", false
+	}
+	parts := strings.Split(cookie.Value, ".")
+	if len(parts) != 3 {
+		return "", false
+	}
+	nonce, expiresRaw, signature := parts[0], parts[1], parts[2]
+	if nonce == "" || signature == "" {
+		return "", false
+	}
+	expires, err := strconv.ParseInt(expiresRaw, 10, 64)
+	if err != nil {
+		return "", false
+	}
+	if time.Now().Unix() > expires {
+		return "", false
+	}
+	want := slockOAuthStateSignature(s.tokenSecret, nonce, expires)
+	if !hmac.Equal([]byte(signature), []byte(want)) {
+		return "", false
+	}
+	return nonce, true
+}
+
+func slockOAuthStateCookieValue(secret []byte, nonce string, expires int64) string {
+	return nonce + "." + strconv.FormatInt(expires, 10) + "." + slockOAuthStateSignature(secret, nonce, expires)
+}
+
+func slockOAuthStateSignature(secret []byte, nonce string, expires int64) string {
+	mac := hmac.New(sha256.New, secret)
+	_, _ = fmt.Fprintf(mac, "%s%s.%d", slockOAuthStateSigSeed, nonce, expires)
+	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+func clearSlockOAuthState(w http.ResponseWriter, r *http.Request, publicURL string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     slockOAuthStateCookie,
+		Value:    "",
+		Path:     slockOAuthStatePath,
+		MaxAge:   -1,
+		Expires:  time.Unix(0, 0),
+		HttpOnly: true,
+		Secure:   slockOAuthCookieSecure(r, publicURL),
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
+func slockOAuthCookieSecure(r *http.Request, publicURL string) bool {
+	return r.TLS != nil || strings.HasPrefix(strings.ToLower(strings.TrimSpace(publicURL)), "https://")
+}
+
+// appendURLQueryParam adds or replaces one query value without disturbing the rest
+// of the login URL (including any provider-specific parameters).
+func appendURLQueryParam(rawURL, key, value string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		separator := "?"
+		if strings.Contains(rawURL, "?") {
+			separator = "&"
+		}
+		return rawURL + separator + url.QueryEscape(key) + "=" + url.QueryEscape(value)
+	}
+	query := parsed.Query()
+	query.Set(key, value)
+	parsed.RawQuery = query.Encode()
+	return parsed.String()
 }
 
 func (s *Server) slockProvisionForUserInfo(ctx context.Context, info slockoauth.UserInfo) (*slockCallbackResponse, error) {
