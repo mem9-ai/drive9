@@ -166,7 +166,7 @@ type Options struct {
 // replacement landing in between is a DIFFERENT object and migrating a live
 // descriptor onto it would adopt its bytes.
 type ExtentOpener interface {
-	OpenExisting(ctx context.Context, path string, flags uint32, expectRevision int64, c fs.Caller) (fs.Handle, bool, error)
+	OpenExisting(ctx context.Context, path string, flags uint32, expectResourceID string, expectRevision int64, c fs.Caller) (fs.Handle, bool, error)
 }
 
 // Writeback is the fs.Handler middleware installing buffered handles.
@@ -174,6 +174,10 @@ type Writeback struct {
 	// rolledBack fences every inline commit after a layer rollback.
 	rolledBack atomic.Bool
 	opts       Options
+	// migrationLogged/migrationLogMu rate-limit the migration-refusal line
+	// to one per path per minute.
+	migrationLogged map[string]time.Time
+	migrationLogMu  sync.Mutex
 	// extentGlobs/extentMatchCutoff are the compiled pattern-owned
 	// promotion rules (see Options.ExtentPatterns).
 	extentGlobs       []globMatcher
@@ -675,15 +679,6 @@ func New(opts Options) (*Writeback, error) {
 			// keeps its classic buffering forever: every later fsync then
 			// re-stages and re-uploads the whole image to an object that is
 			// already extent (the 32 MiB x 2600-fsync quota exhaustion).
-			// DEFERRED, not inline: this callback runs under the QUEUE's
-			// path lock, and the migration must call into the extent plane,
-			// which takes ITS path lock. Rename holds the extent lock across
-			// next(), whose writeback flush reaches stageAndEnqueueOpt and
-			// waits for the queue lock — so an inline migration here is one
-			// edge of an ABBA deadlock (both waits are mutex waits; no RPC
-			// deadline can break them). Handing it to a goroutine keeps the
-			// lock order one-directional.
-			w.scheduleExtentMigration(entry.Path, entry.SnapshotID, committedRev)
 			// Hand the landing to the handle that STAGED this image, found by
 			// the entry's snapshot ID: the newest handle at the path may be an
 			// unrelated writer, and the staging handle must learn its shadow is
@@ -699,6 +694,14 @@ func New(opts Options) (*Writeback, error) {
 						// cleanup must keep the shadow.
 						w.queue.RetainShadowForLanding(entry.Path, entry.ShadowGen)
 					}
+					// AFTER completeStagedLanding, because the migration
+					// refuses a descriptor whose landing it cannot see
+					// (h.landed) — and ON THE HANDLE already resolved above,
+					// because completeStagedLanding retires the snapshot
+					// registration the lookup depends on. Blocking here would
+					// re-introduce the queue/extent lock cycle, so the handoff
+					// is scheduled, not awaited.
+					w.scheduleExtentMigration(h, entry.Path, entry.LandedResourceID, committedRev)
 				}
 			}
 			// A recovery landing retires the superseded .dat/.meta pair it
@@ -2221,16 +2224,8 @@ func (w *Writeback) KeepForgotten(path string) bool {
 // scheduleExtentMigration defers the handoff off the queue worker's stack.
 // It is intentionally fire-and-forget: a lost migration only means this
 // descriptor keeps its old (correct, if more expensive) publish path.
-func (w *Writeback) scheduleExtentMigration(path, snapshotID string, committedRev int64) {
-	if w.opts.ExtentOpener == nil || committedRev <= 0 {
-		return
-	}
-	// Resolve the handle HERE, while the snapshot registration still exists:
-	// the same callback retires it below (completeStagedLanding ->
-	// retireStagedSnapshotLocked), so a lookup from the goroutine would race
-	// that retirement and silently skip the migration.
-	h := w.handleForStagedSnapshot(snapshotID)
-	if h == nil {
+func (w *Writeback) scheduleExtentMigration(h *bufferingHandle, path, landedID string, committedRev int64) {
+	if w.opts.ExtentOpener == nil || committedRev <= 0 || h == nil {
 		return
 	}
 	go func() {
@@ -2239,11 +2234,36 @@ func (w *Writeback) scheduleExtentMigration(path, snapshotID string, committedRe
 				safeLogPrintf("writeback: extent migration for %s panicked: %v", path, r)
 			}
 		}()
-		w.migrateHandleToExtent(h, path, committedRev)
+		w.migrateHandleToExtent(h, path, landedID, committedRev)
 	}()
 }
 
-func (w *Writeback) migrateHandleToExtent(h *bufferingHandle, path string, committedRev int64) {
+// logMigrationRefusal records WHY a descriptor stayed on this plane. Without
+// it, "the migration did not engage" is indistinguishable from "nothing tried",
+// which is exactly how a silent whole-image re-upload survived a local test
+// and only showed up against a remote server.
+//
+// At most one line per path per minute: the migration is retried on every
+// landing, and a busy writer would otherwise flood the log.
+func (w *Writeback) logMigrationRefusal(path, reason string) {
+	if w == nil {
+		return
+	}
+	now := time.Now()
+	w.migrationLogMu.Lock()
+	if last, ok := w.migrationLogged[path]; ok && now.Sub(last) < time.Minute {
+		w.migrationLogMu.Unlock()
+		return
+	}
+	if w.migrationLogged == nil {
+		w.migrationLogged = make(map[string]time.Time)
+	}
+	w.migrationLogged[path] = now
+	w.migrationLogMu.Unlock()
+	safeLogPrintf("writeback: extent migration for %s deferred: %s", path, reason)
+}
+
+func (w *Writeback) migrateHandleToExtent(h *bufferingHandle, path, landedID string, committedRev int64) {
 	if w.opts.ExtentOpener == nil || committedRev <= 0 || h == nil {
 		return
 	}
@@ -2257,11 +2277,29 @@ func (w *Writeback) migrateHandleToExtent(h *bufferingHandle, path string, commi
 	// Cheap gate before taking any heavier state: only a promotion-sized
 	// image at a routed path can be extent.
 	if !h.extentRoutesImage() {
+		w.logMigrationRefusal(path, "path or size not routed to extent")
 		return
 	}
 	h.mu.Lock()
-	if h.extent != nil || h.unlinked || h.releasing || h.pendingImage != nil || h.pendingFile != nil || !h.landed {
+	switch {
+	case h.extent != nil:
 		h.mu.Unlock()
+		return // already migrated: nothing to report
+	case h.unlinked:
+		h.mu.Unlock()
+		w.logMigrationRefusal(path, "descriptor unlinked")
+		return
+	case h.releasing:
+		h.mu.Unlock()
+		w.logMigrationRefusal(path, "descriptor releasing")
+		return
+	case h.pendingImage != nil || h.pendingFile != nil:
+		h.mu.Unlock()
+		w.logMigrationRefusal(path, "descriptor still has a pending snapshot")
+		return
+	case !h.landed:
+		h.mu.Unlock()
+		w.logMigrationRefusal(path, "landing not recorded on the handle yet")
 		return
 	}
 	// Local bytes the remote does not hold must not be dropped by the swap.
@@ -2269,6 +2307,7 @@ func (w *Writeback) migrateHandleToExtent(h *bufferingHandle, path string, commi
 	// covers the flag without a buffer.
 	if h.dirty || (h.buf != nil && h.buf.ContentVersion() != h.stagedContentVersion) {
 		h.mu.Unlock()
+		w.logMigrationRefusal(path, "buffer holds bytes the landing did not carry")
 		return
 	}
 	flags, callerIno := h.flags, h.ino
@@ -2276,11 +2315,16 @@ func (w *Writeback) migrateHandleToExtent(h *bufferingHandle, path string, commi
 	_ = callerIno
 
 	handle, ok, err := w.opts.ExtentOpener.OpenExisting(
-		context.Background(), path, flags, committedRev, fs.Caller{})
-	if err != nil || !ok {
+		context.Background(), path, flags, landedID, committedRev, fs.Caller{})
+	if err != nil {
+		w.logMigrationRefusal(path, fmt.Sprintf("opening an engine handle failed: %v", err))
+		return
+	}
+	if !ok {
 		// Not extent (an existing classic target is never converted), a
 		// replacement took the name, or the open failed: keep this plane's
 		// buffering. A later landing retries.
+		w.logMigrationRefusal(path, "engine declined: layout not extent, or the name now holds another object")
 		return
 	}
 	if !w.adoptExtentHandle(h, handle) {

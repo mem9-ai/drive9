@@ -259,7 +259,7 @@ func (h *Handler) openExistingLocked(ctx context.Context, path string, flags uin
 // revision check is what keeps a rename/replacement from being adopted, and
 // the caller re-checks the handle's state under its own lock before
 // installing the result.
-func (h *Handler) OpenExisting(ctx context.Context, path string, flags uint32, expectRevision int64, c fs.Caller) (fs.Handle, bool, error) {
+func (h *Handler) OpenExisting(ctx context.Context, path string, flags uint32, expectResourceID string, expectRevision int64, c fs.Caller) (fs.Handle, bool, error) {
 	if h == nil || h.opts.Engine == nil {
 		return nil, false, nil
 	}
@@ -274,9 +274,17 @@ func (h *Handler) OpenExisting(ctx context.Context, path string, flags uint32, e
 		return nil, false, nil
 	}
 	// The promotion must still describe the object at this name: a
-	// replacement landed since (a different revision) is a different file,
-	// and migrating onto it would silently adopt its bytes.
-	if expectRevision > 0 && st.Revision != expectRevision {
+	// replacement landed since is a different file, and migrating onto it
+	// would silently adopt its bytes. The RESOURCE IDENTITY is the proof —
+	// it names the object the commit produced. Revision equality is only a
+	// fallback for servers that do not echo one, and it is a weak proxy: a
+	// revision can advance for reasons that have nothing to do with who
+	// wrote the bytes.
+	if expectResourceID != "" {
+		if st.ResourceID != expectResourceID {
+			return nil, false, nil
+		}
+	} else if expectRevision > 0 && st.Revision != expectRevision {
 		return nil, false, nil
 	}
 	// The descriptor was opened BEFORE the promotion and every write it made

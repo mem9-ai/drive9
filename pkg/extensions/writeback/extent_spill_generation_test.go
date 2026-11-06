@@ -26,10 +26,12 @@ type extentSpillServer struct {
 	*httptest.Server
 	partSize int64
 
-	mu      sync.Mutex
-	parts   map[int][]byte // part number -> uploaded bytes
-	missing map[int]bool   // parts the server said were already present
-	initLen int
+	mu    sync.Mutex
+	parts map[int][]byte // part number -> uploaded bytes
+	// completeEchoID is what the completion echoes (completion_identity_v1).
+	completeEchoID string
+	missing        map[int]bool // parts the server said were already present
+	initLen        int
 }
 
 func newExtentSpillServer(t *testing.T, partSize int64) *extentSpillServer {
@@ -61,7 +63,13 @@ func newExtentSpillServer(t *testing.T, partSize int64) *extentSpillServer {
 	})
 	mux.HandleFunc("/v2/uploads/", func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasSuffix(r.URL.Path, "/presign-batch") {
-			_ = json.NewEncoder(w).Encode(map[string]any{"status": "completed"})
+			// completion_identity_v1: the real server echoes the identity of
+			// the object it published, and consumers depend on it.
+			s.mu.Lock()
+			s.completeEchoID = "echoed-res-1"
+			id := s.completeEchoID
+			s.mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "completed", "resource_id": id})
 			return
 		}
 		var body struct {

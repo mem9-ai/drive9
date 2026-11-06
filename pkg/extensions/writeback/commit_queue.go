@@ -78,6 +78,12 @@ type CommitEntry struct {
 	// based on an older revision are stale and must fail instead of overwriting
 	// that watermark through Release/CommitQueue.
 	DurableWatermarkRev int64
+	// LandedResourceID is the resource identity the object's completion
+	// ECHOED for this entry's publication (completion_identity_v1). It is the
+	// proof that the object now at the path is the one this commit produced,
+	// which is stronger than comparing revisions: a revision can legitimately
+	// advance for reasons unrelated to who wrote the bytes.
+	LandedResourceID string
 	// DirtyRanges carries the write buffer's dirty part ranges at enqueue
 	// time, coalesced and clipped to Size. Extent-layout commits upload only
 	// these ranges as dirty blocks (incremental PATCH); classic commits

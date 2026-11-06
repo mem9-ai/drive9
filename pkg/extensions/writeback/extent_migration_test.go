@@ -32,15 +32,16 @@ type migrationServer struct {
 	handler  http.Handler
 	partSize int64
 
-	mu        sync.Mutex
-	layout    string // "classic" | "extent"
-	revision  int64
-	size      int64
-	sessions  int            // whole-image extent sessions
-	patches   int            // incremental PATCH commits
-	parts     map[int][]byte // parts received in the LAST session
-	putBytes  int64          // total bytes PUT across all sessions
-	lastChmod uint32         // last mode pushed through the remote chmod
+	mu         sync.Mutex
+	layout     string // "classic" | "extent"
+	revision   int64
+	size       int64
+	sessions   int            // whole-image extent sessions
+	patches    int            // incremental PATCH commits
+	parts      map[int][]byte // parts received in the LAST session
+	putBytes   int64          // total bytes PUT across all sessions
+	lastChmod  uint32         // last mode pushed through the remote chmod
+	resourceID string         // identity echoed by the last completion
 }
 
 func newMigrationServer(t *testing.T) *migrationServer {
@@ -62,6 +63,9 @@ func newMigrationServer(t *testing.T) *migrationServer {
 			}
 			if layout == "extent" {
 				w.Header().Set("X-Dat9-Content-Layout", "extent")
+			}
+			if s.resourceID != "" {
+				w.Header().Set("X-Dat9-Resource-ID", s.resourceID)
 			}
 			w.Header().Set("X-Dat9-Revision", fmt.Sprint(rev))
 			w.Header().Set("Content-Length", fmt.Sprint(size))
@@ -164,7 +168,14 @@ func newMigrationServer(t *testing.T) *migrationServer {
 			s.size += int64(len(p))
 		}
 		s.mu.Unlock()
-		_ = json.NewEncoder(w).Encode(map[string]any{"status": "completed"})
+		// Echo the identity the completion actually published
+		// (completion_identity_v1): the migration uses it to prove the
+		// object it opens is the one this commit produced.
+		s.mu.Lock()
+		s.resourceID = fmt.Sprintf("res-%d", s.revision)
+		id := s.resourceID
+		s.mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "completed", "resource_id": id})
 	})
 	mux.HandleFunc("/obj/", func(w http.ResponseWriter, r *http.Request) {
 		var n int

@@ -120,7 +120,9 @@ func (cq *CommitQueue) uploadExtentEntry(ctx context.Context, entry *CommitEntry
 	// entry against an existing target keeps its absence-CAS conflict
 	// instead of adopting the routing Stat's revision.
 	var landedRev int64
+	landedID := ""
 	ectx := client.WithCompletedRevisionSink(ctx, &landedRev)
+	ectx = client.WithCompletedResourceSink(ectx, &landedID)
 	start := time.Now()
 	var upErr error
 	if extentTarget && len(entry.DirtyRanges) > 0 {
@@ -133,6 +135,9 @@ func (cq *CommitQueue) uploadExtentEntry(ctx context.Context, entry *CommitEntry
 	}
 	if upErr != nil {
 		return 0, true, upErr
+	}
+	if landedID != "" {
+		entry.LandedResourceID = landedID
 	}
 	return landedRev, true, nil
 }
