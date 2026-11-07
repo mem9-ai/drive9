@@ -178,6 +178,32 @@ func TestProvisionAndDeprovision(t *testing.T) {
 		}
 	}
 	checkCredential(t)
+	// A pre-existing account with an unknown password (created outside drive9, or
+	// under a different secret with a restricted admin whose USER_PRIVILEGES view is
+	// filtered) must not produce a "successful" credential that cannot authenticate:
+	// the creation branch is idempotent, so the only way to honour the contract is to
+	// authenticate before returning.
+	foreign := localTenantUserName("55555555-6666-7777-8888-999999999999")
+	adminDB, err := p.openAdmin()
+	if err != nil {
+		t.Fatalf("open admin: %v", err)
+	}
+	defer func() { _ = adminDB.Close() }()
+	if _, err := adminDB.ExecContext(ctx, "CREATE USER IF NOT EXISTS "+quoteString(foreign)+"@'%' IDENTIFIED BY 'some-other-password'"); err != nil {
+		t.Fatalf("create foreign account: %v", err)
+	}
+	t.Cleanup(func() {
+		cleanup, err := p.openAdmin()
+		if err != nil {
+			return
+		}
+		defer func() { _ = cleanup.Close() }()
+		_, _ = cleanup.ExecContext(context.Background(), "DROP USER IF EXISTS "+quoteString(foreign)+"@'%'")
+	})
+	if _, err := p.Provision(ctx, "55555555-6666-7777-8888-999999999999"); err == nil {
+		t.Fatal("provisioning returned success for an account whose password it does not know")
+	}
+
 	// A changed deployment secret must fail closed rather than silently rotate the
 	// account out from under the credential the caller already persisted.
 	rotated := *p

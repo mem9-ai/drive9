@@ -172,56 +172,38 @@ func ensureLocalTenantAccount(ctx context.Context, admin *sql.DB, adminCfg *mysq
 		return localTenantCredential{}, fmt.Errorf("derive local tenant password for %s", tenantID)
 	}
 	user := quoteString(username) + "@'%'"
-	exists, err := localTenantAccountExists(ctx, admin, username)
-	if err != nil {
-		return localTenantCredential{}, err
+	// Create-or-converge, then prove the credential works.
+	//
+	// Deliberately no existence query: TiDB filters information_schema.USER_PRIVILEGES
+	// to the caller's own account unless it may read the mysql schema, so an admin
+	// with CREATE USER but without that visibility sees zero rows for an account that
+	// exists. Branching on that would take the "create" path, let CREATE USER IF NOT
+	// EXISTS keep the old password, and return a credential that cannot authenticate.
+	//
+	// CREATE USER IF NOT EXISTS never rewrites an existing password, so this is
+	// idempotent, and authenticating in the same call is what makes a successful
+	// result mean "this credential works" regardless of visibility.
+	if _, err := admin.ExecContext(ctx, "CREATE USER IF NOT EXISTS "+user+" IDENTIFIED BY "+quoteString(password)); err != nil {
+		return localTenantCredential{}, fmt.Errorf("create account for local tenant %s: %w", tenantID, err)
 	}
-	if exists {
+	if _, err := admin.ExecContext(ctx, "GRANT "+localTenantGrant+" ON "+localTenantGrantScope(dbName)+" TO "+user); err != nil {
+		return localTenantCredential{}, fmt.Errorf("grant schema access for local tenant %s: %w", tenantID, err)
+	}
+	ok, verifyErr := localTenantAccountAuthenticates(ctx, adminCfg, username, password)
+	if verifyErr != nil {
+		return localTenantCredential{}, verifyErr
+	}
+	if !ok {
 		// Re-provisioning must converge, never rotate: the caller persists the
-		// returned credential only after Provision succeeds, so setting a new
-		// password here could leave the account and the metadata store disagreeing.
-		// If the derived password no longer works, the deployment secret changed
-		// under an existing account, which needs a deliberate rotation, not a silent
-		// one.
-		ok, verifyErr := localTenantAccountAuthenticates(ctx, adminCfg, username, password)
-		if verifyErr != nil {
-			return localTenantCredential{}, verifyErr
-		}
-		if !ok {
-			return localTenantCredential{}, fmt.Errorf(
-				"local tenant %s already has an account whose password was derived from a different %s; restore that secret (or set a new %s and re-provision after dropping the account), refusing to rotate it silently",
-				tenantID, EnvTenantPasswordSecret, EnvTenantPasswordSecret)
-		}
-		if _, err := admin.ExecContext(ctx, "GRANT "+localTenantGrant+" ON "+localTenantGrantScope(dbName)+" TO "+user); err != nil {
-			return localTenantCredential{}, fmt.Errorf("grant schema access for local tenant %s: %w", tenantID, err)
-		}
-		return localTenantCredential{username: username, password: password}, nil
-	}
-	statements := []struct {
-		what string
-		sql  string
-	}{
-		{"create account", "CREATE USER IF NOT EXISTS " + user + " IDENTIFIED BY " + quoteString(password)},
-		{"grant schema access", "GRANT " + localTenantGrant + " ON " + localTenantGrantScope(dbName) + " TO " + user},
-	}
-	for _, stmt := range statements {
-		if _, err := admin.ExecContext(ctx, stmt.sql); err != nil {
-			return localTenantCredential{}, fmt.Errorf("%s for local tenant %s: %w", stmt.what, tenantID, err)
-		}
+		// returned credential only after Provision succeeds, so silently setting a new
+		// password could leave the account and the metadata store disagreeing. A
+		// mismatch means the account predates this secret, which needs a deliberate
+		// rotation.
+		return localTenantCredential{}, fmt.Errorf(
+			"local tenant %s already has an account whose password was derived from a different %s; restore that secret (or drop the account deliberately and re-provision), refusing to return a credential that cannot authenticate",
+			tenantID, EnvTenantPasswordSecret)
 	}
 	return localTenantCredential{username: username, password: password}, nil
-}
-
-// localTenantAccountExists reports whether the tenant's MySQL account exists.
-func localTenantAccountExists(ctx context.Context, admin *sql.DB, username string) (bool, error) {
-	var count int
-	err := admin.QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM information_schema.user_privileges WHERE grantee = ?",
-		"'"+username+"'@'%'").Scan(&count)
-	if err != nil {
-		return false, fmt.Errorf("check local tenant account %s: %w", username, err)
-	}
-	return count > 0, nil
 }
 
 // localTenantAccountAuthenticates reports whether the derived password is the one
