@@ -2207,8 +2207,15 @@ func extractText(data []byte, contentType string, maxBytes int64) string {
 func (b *Dat9Backend) ExecSQL(ctx context.Context, query string) ([]map[string]interface{}, error) {
 	start := time.Now()
 	rows, err := b.store.ExecSQL(ctx, query)
+	// One observation per request: the result classifier maps a policy refusal to
+	// "rejected", so it is neither a success nor a failure.
 	observeBackend(ctx, b.tenantID, b.tidbCloudOrgID, "exec_sql", err, start)
 	if err != nil {
+		if errors.Is(err, datastore.ErrExecSQLRejected) {
+			// Never executed: client input, so warn rather than error.
+			logger.Warn(ctx, "backend_exec_sql_rejected", zap.Int("query_len", len(query)), zap.Error(err))
+			return nil, err
+		}
 		logger.Error(ctx, "backend_exec_sql_failed", zap.Int("query_len", len(query)), zap.Error(err))
 		return nil, err
 	}
@@ -2384,6 +2391,10 @@ func backendResultForError(err error) string {
 		return "ok"
 	case errors.Is(err, datastore.ErrNotFound):
 		return "not_found"
+	case errors.Is(err, datastore.ErrExecSQLRejected):
+		// Refused, not executed: a distinct result keeps it out of the success and
+		// failure series at the same time.
+		return "rejected"
 	case errors.Is(err, datastore.ErrPathConflict),
 		errors.Is(err, datastore.ErrRevisionConflict),
 		errors.Is(err, datastore.ErrUploadConflict),

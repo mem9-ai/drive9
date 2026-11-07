@@ -715,7 +715,7 @@ func (s *Server) recordTenantPoolCapacity(poolID, organizationID string, size, f
 }
 
 func (s *Server) firstManagedOrganization(ctx context.Context, cred tenant.CredentialProvisionRequest) (string, error) {
-	identity, err := s.resolveTiDBCloudIdentity(ctx, cred, "provision_org_resolve")
+	identity, err := s.resolveTiDBCloudIdentity(ctx, cred, "provision_org_resolve", tenant.TiDBCloudRoleOrgOwner)
 	if err != nil {
 		return "", err
 	}
