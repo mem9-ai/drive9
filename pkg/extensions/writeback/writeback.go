@@ -6413,6 +6413,13 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 	// a stale mode. Dropping it entirely (the old behavior) lost every chmod
 	// deferred onto an open writeback handle (chmod/12: 0777 → 0644).
 	mode, hasMode := h.pendingMode, h.hasPendingMode
+	// Fresh creates that never carried an explicit chmod still need the
+	// POSIX create mode published. The extent session does not take a mode
+	// field, so without this the promoted inode lands mode 000 and even
+	// root cannot reopen it (the file becomes invisible to fio/verify).
+	if isNew && !hasMode {
+		mode, hasMode = 0o644, true
+	}
 	h.pendingMode, h.hasPendingMode = 0, false
 	// Lineage (v1 ensureStagedSnapshotLineageLocked): a fresh snapshot ID
 	// per staging, parented on this handle's current content snapshot.

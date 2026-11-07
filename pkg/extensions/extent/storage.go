@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -73,12 +74,29 @@ func (s objectStorage) Put(ctx context.Context, key string, in io.Reader, getter
 	if size <= 0 || size > maxStageBytes {
 		return fmt.Errorf("staged slice size %d out of bounds", size)
 	}
-	data, err := io.ReadAll(io.LimitReader(in, size))
+	dir := ""
+	if s.bridge != nil {
+		dir = s.bridge.cfg.CacheDir
+	}
+	if dir == "" {
+		dir = os.TempDir()
+	}
+	f, err := os.CreateTemp(dir, "extent-stage-*")
 	if err != nil {
 		return err
 	}
-	if int64(len(data)) != size {
-		return fmt.Errorf("short staging read: %d of %d", len(data), size)
+	tmp := f.Name()
+	n, copyErr := io.Copy(f, io.LimitReader(in, size))
+	closeErr := f.Close()
+	if copyErr != nil || closeErr != nil || n != size {
+		_ = os.Remove(tmp)
+		if copyErr != nil {
+			return copyErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		return fmt.Errorf("short staging read: %d of %d", n, size)
 	}
 	// One slice object may span several blocks (Size > BlockSize); the
 	// store uploads them as separate keys with the same slice id. Stage
@@ -90,7 +108,11 @@ func (s objectStorage) Put(ctx context.Context, key string, in io.Reader, getter
 		sl = &stagedSlice{blocks: make(map[int64][]byte)}
 		s.bridge.stagedSlices[id] = sl
 	}
-	sl.blocks[indx] = data
+	sl.blocks[indx] = nil
+	if sl.paths == nil {
+		sl.paths = make(map[int64]string)
+	}
+	sl.paths[indx] = tmp
 	sl.total += size
 	return nil
 }
@@ -98,12 +120,27 @@ func (s objectStorage) Put(ctx context.Context, key string, in io.Reader, getter
 // stagedSlice accumulates the blocks of one not-yet-committed slice object.
 type stagedSlice struct {
 	blocks map[int64][]byte
+	paths  map[int64]string
 	total  int64
 }
 
 // join returns the concatenated slice object bytes.
 func (sl *stagedSlice) join() []byte {
 	out := make([]byte, 0, sl.total)
+	if len(sl.paths) > 0 {
+		for i := int64(0); int64(len(out)) < sl.total; i++ {
+			p, ok := sl.paths[i]
+			if !ok {
+				break
+			}
+			data, err := os.ReadFile(p)
+			if err != nil {
+				return nil
+			}
+			out = append(out, data...)
+		}
+		return out
+	}
 	for i := int64(0); int64(len(out)) < sl.total; i++ {
 		b, ok := sl.blocks[i]
 		if !ok {

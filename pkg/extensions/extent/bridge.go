@@ -60,6 +60,8 @@ type Config struct {
 	NativeWriteback bool
 	// WritebackWait bounds that wait (0 uses the upload timeout).
 	WritebackWait time.Duration
+	// CacheDir is the engine cache root; staged slices are streamed here.
+	CacheDir string
 }
 
 const (

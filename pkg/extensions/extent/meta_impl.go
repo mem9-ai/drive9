@@ -824,6 +824,9 @@ func (b *Bridge) Write(ctx meta.Context, ino meta.Ino, indx uint32, off uint32, 
 	data := sl.join()
 	sum := sha256Hex(data)
 	delete(b.stagedSlices, slice.Id)
+	for _, p := range sl.paths {
+		_ = os.Remove(p)
+	}
 	// Make the bytes findable by checksum for the commit path
 	// (assembleImage / blockBytes refetch), pinned against the classic
 	// read LRU: a pending commit still needs them.

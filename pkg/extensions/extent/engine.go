@@ -77,6 +77,7 @@ func NewEngine(cfg EngineConfig) *Engine {
 		RemoteRoot:      cfg.RemoteRoot,
 		NativeWriteback: cfg.Writeback && cfg.CacheDir != "",
 		WritebackWait:   cfg.WritebackWait,
+		CacheDir:        cfg.CacheDir,
 	}
 	b := NewBridge(bcfg)
 	// CacheSize 0 means NO disk cache (JuiceFS's memory-only mode: reads
