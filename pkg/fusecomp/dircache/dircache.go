@@ -1254,9 +1254,6 @@ func mergeCachedOwner(item, existing fs.DirEntryInfo) fs.DirEntryInfo {
 		item.Gid = existing.Gid
 		item.HasGID = true
 	}
-	if item.ExtentIno == 0 {
-		item.ExtentIno = existing.ExtentIno
-	}
 	return item
 }
 

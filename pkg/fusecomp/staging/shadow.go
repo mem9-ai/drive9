@@ -45,9 +45,9 @@ const quotaCopyBufSize = 32 << 10 // 32KB
 type ShadowFile struct {
 	fd           *os.File
 	size         int64
-	contentGen   uint64 // changes with every mutation; pin tokens only identify the fd
-	baseRev      int64  // server revision at open/write time
-	localNew     bool   // initialized locally at revision 0; never set by recovery
+	contentGen   ContentGen // changes with every mutation; pin tokens only identify the fd
+	baseRev      int64      // server revision at open/write time
+	localNew     bool       // initialized locally at revision 0; never set by recovery
 	written      shadowWrittenRanges
 	writtenBytes int64 // current-process coverage; zero for recovered shadows
 }
@@ -71,19 +71,19 @@ type ShadowStore struct {
 	// retires the shadow (removes from files, moves fd to retired map) so
 	// new writers get a fresh shadow. Old readers use their gen token to
 	// read/unpin the retired fd.
-	nextGen uint64                    // monotonic, 0 is reserved (no pin)
-	active  map[string]uint64         // path → generation of current active shadow
-	genFile map[uint64]*ShadowFile    // generation → active ShadowFile (for ReadAtGen on active gens)
-	refs    map[uint64]int32          // generation → active pin count
-	retired map[uint64]*retiredShadow // generation → retired shadow awaiting unpin
+	nextGen PinGen                    // monotonic, 0 is reserved (no pin)
+	active  map[string]PinGen         // path → lifecycle generation of current active shadow
+	genFile map[PinGen]*ShadowFile    // generation → active ShadowFile (for ReadAtGen on active gens)
+	refs    map[PinGen]int32          // generation → active pin count
+	retired map[PinGen]*retiredShadow // generation → retired shadow awaiting unpin
 
 	// writeGen tracks the content generation of each shadow file — bumped on
 	// every mutating write (WriteFull/WriteAt/Ensure/WriteStream/Truncate). It
 	// lets post-upload cleanup verify the shadow has not been overwritten by a
 	// concurrent same-path write since the upload started, so a stale upload
 	// does not remove a fresher shadow.
-	nextWriteGen atomic.Uint64     // monotonic content generation counter
-	writeGen     map[string]uint64 // path → content generation
+	nextWriteGen atomic.Uint64         // monotonic content generation counter
+	writeGen     map[string]ContentGen // path → content generation
 
 	// Write-back disk protection: configurable free-space ratio guard and
 	// optional byte quota. See CheckWriteBackQuota.
@@ -180,11 +180,11 @@ func NewShadowStoreWithQuota(dir string, freeRatio float64, maxBytes int64) (*Sh
 	ss := &ShadowStore{
 		dir:                 dir,
 		files:               make(map[string]*ShadowFile),
-		active:              make(map[string]uint64),
-		genFile:             make(map[uint64]*ShadowFile),
-		refs:                make(map[uint64]int32),
-		retired:             make(map[uint64]*retiredShadow),
-		writeGen:            make(map[string]uint64),
+		active:              make(map[string]PinGen),
+		genFile:             make(map[PinGen]*ShadowFile),
+		refs:                make(map[PinGen]int32),
+		retired:             make(map[PinGen]*retiredShadow),
+		writeGen:            make(map[string]ContentGen),
 		writeCacheFreeRatio: freeRatio,
 		writeCacheMaxBytes:  maxBytes,
 		pathLocks:           make(map[string]*shadowPathLock),
@@ -646,13 +646,30 @@ func (s *ShadowStore) WriteExtents(remotePath string, wb *writebuffer.WriteBuffe
 	return nil
 }
 
-// ReadAtGen reads from a shadow file identified by its generation token.
+// ContentGen identifies a shadow file's CONTENT generation: bumped by every
+// mutating write, so a caller can prove the bytes it is about to upload are
+// still the ones it staged.
+//
+// PinGen identifies a shadow file's LIFECYCLE generation: minted by Pin and
+// released by Unpin, so a reader keeps its image readable even after the
+// path's active shadow is retired or replaced.
+//
+// These are DIFFERENT number spaces drawn from different counters, and mixing
+// them up is silent: an id from one space simply does not resolve in the
+// other. They are distinct types so the compiler rejects a mix-up instead of
+// letting a lookup fail at runtime.
+type (
+	ContentGen uint64
+	PinGen     uint64
+)
+
+// ReadAtGen reads from a shadow file identified by its PIN token.
 // Works for both active generations (shadow still in files map) and retired
 // generations (shadow moved to retired map by Remove). Returns (0, error)
 // if the generation is unknown.
 // The read is performed under RLock to prevent WriteStream from swapping
 // the fd mid-read on active generations.
-func (s *ShadowStore) ReadAtGen(gen uint64, offset int64, buf []byte) (int, error) {
+func (s *ShadowStore) ReadAtGen(gen PinGen, offset int64, buf []byte) (int, error) {
 	s.mu.RLock()
 	if sf, ok := s.genFile[gen]; ok {
 		n, err := sf.fd.ReadAt(buf, offset)
@@ -671,7 +688,7 @@ func (s *ShadowStore) ReadAtGen(gen uint64, offset int64, buf []byte) (int, erro
 
 // SizeGen returns the size of a shadow file by generation token. Works for
 // both active and retired generations. Returns -1 if the generation is unknown.
-func (s *ShadowStore) SizeGen(gen uint64) int64 {
+func (s *ShadowStore) SizeGen(gen PinGen) int64 {
 	s.mu.RLock()
 	if sf, ok := s.genFile[gen]; ok {
 		sz := sf.size
@@ -753,7 +770,7 @@ func (s *ShadowStore) ReadAll(remotePath string) ([]byte, error) {
 // generation still matches expectedGen. Generation 0 preserves the historical
 // path-based fallback for recovered legacy entries that were created before
 // CommitEntry carried generation tokens.
-func (s *ShadowStore) ReadAllIfGeneration(remotePath string, expectedGen uint64) ([]byte, error) {
+func (s *ShadowStore) ReadAllIfGeneration(remotePath string, expectedGen ContentGen) ([]byte, error) {
 	if expectedGen == 0 {
 		return s.ReadAll(remotePath)
 	}
@@ -786,7 +803,7 @@ func (s *ShadowStore) ReadAllIfGeneration(remotePath string, expectedGen uint64)
 // only while its content generation still matches expectedGen. Unlike
 // ReadAllIfGeneration it never materializes the whole image: a four-byte READ
 // on a multi-GiB spill must not allocate the file.
-func (s *ShadowStore) ReadAtIfGeneration(remotePath string, expectedGen uint64, offset int64, buf []byte) (int, error) {
+func (s *ShadowStore) ReadAtIfGeneration(remotePath string, expectedGen ContentGen, offset int64, buf []byte) (int, error) {
 	if expectedGen == 0 {
 		return s.ReadAt(remotePath, offset, buf)
 	}
@@ -817,7 +834,7 @@ func (s *ShadowStore) ReadAtIfGeneration(remotePath string, expectedGen uint64, 
 // SyncIfGeneration fsyncs the active shadow only if its current content
 // generation still matches expectedGen. Generation 0 preserves the historical
 // path-based fallback for recovered legacy entries.
-func (s *ShadowStore) SyncIfGeneration(remotePath string, expectedGen uint64) error {
+func (s *ShadowStore) SyncIfGeneration(remotePath string, expectedGen ContentGen) error {
 	if s == nil {
 		return fmt.Errorf("nil shadow store")
 	}
@@ -881,7 +898,7 @@ func (s *ShadowStore) Open(remotePath string) (*os.File, int64, error) {
 // nonzero generation it holds the path-local shadow lock for the caller, so the
 // opened fd cannot observe concurrent same-path shadow mutations while it is
 // being streamed to a remote commit.
-func (s *ShadowStore) OpenIfGeneration(remotePath string, expectedGen uint64) (*os.File, int64, func(), error) {
+func (s *ShadowStore) OpenIfGeneration(remotePath string, expectedGen ContentGen) (*os.File, int64, func(), error) {
 	if expectedGen == 0 {
 		fd, size, err := s.Open(remotePath)
 		return fd, size, func() {}, err
@@ -954,7 +971,7 @@ func (s *ShadowStore) BaseRev(remotePath string) int64 {
 // Pin increments the reference count for the active shadow at remotePath and
 // returns a generation token. The caller must pass this token to Unpin on
 // Release. Use after creating a new shadow (e.g. ShadowSpill O_TRUNC).
-func (s *ShadowStore) Pin(remotePath string) uint64 {
+func (s *ShadowStore) Pin(remotePath string) PinGen {
 	// The path lock excludes the writers' rotate+mutate window: a pin
 	// taken here either sees the pre-rotation generation (whose fd the
 	// rotation then retires immutably) or the post-rotation fresh file —
@@ -981,7 +998,7 @@ func (s *ShadowStore) Pin(remotePath string) uint64 {
 // count. Returns a generation token and true, or (0, false) if no shadow
 // exists. Loading from disk handles post-crash recovery where pending
 // shadows are on disk but not yet in the files map.
-func (s *ShadowStore) PinIfExists(remotePath string) (uint64, bool) {
+func (s *ShadowStore) PinIfExists(remotePath string) (PinGen, bool) {
 	// Same path-lock exclusion as Pin — see the comment there.
 	pl := s.acquirePathLock(remotePath)
 	defer s.releasePathLock(remotePath, pl)
@@ -1024,7 +1041,7 @@ func (s *ShadowStore) PinIfExists(remotePath string) (uint64, bool) {
 // shadow. Misses do no disk I/O and take no path lock, so Read can retry when
 // a writer publishes a fresh shadow even without a committed-revision change.
 // Rejected images remain available to their staging owner.
-func (s *ShadowStore) PinResident(remotePath string, minRevision int64) (uint64, bool) {
+func (s *ShadowStore) PinResident(remotePath string, minRevision int64) (PinGen, bool) {
 	return s.pinReadable(remotePath, minRevision, 0)
 }
 
@@ -1032,7 +1049,7 @@ func (s *ShadowStore) PinResident(remotePath string, minRevision int64) (uint64,
 // generation was retired (Remove called while pinned) and the count reaches
 // zero, the retired fd is closed and the disk file deleted. Generation 0
 // is a no-op (handle was never pinned).
-func (s *ShadowStore) Unpin(gen uint64) {
+func (s *ShadowStore) Unpin(gen PinGen) {
 	if gen == 0 {
 		return
 	}
@@ -1092,7 +1109,7 @@ func (s *ShadowStore) Remove(remotePath string) {
 // rename or immediate remove), closing the window where a replacement write
 // could create its new shadow at the shared disk path after the in-memory
 // check but before the stale cleanup removed/renamed it.
-func (s *ShadowStore) RemoveIfGeneration(remotePath string, expectedGen uint64) bool {
+func (s *ShadowStore) RemoveIfGeneration(remotePath string, expectedGen ContentGen) bool {
 	return s.remove(remotePath, expectedGen, shadowRetiredInvalidated)
 }
 
@@ -1100,7 +1117,7 @@ func (s *ShadowStore) RemoveIfGeneration(remotePath string, expectedGen uint64) 
 // if no shadow exists. Bumped on every mutating write (WriteFull/WriteAt/
 // Ensure/WriteStream/Truncate) so callers can snapshot it before an upload and
 // verify the shadow has not been overwritten by a concurrent same-path write.
-func (s *ShadowStore) ActiveGeneration(remotePath string) uint64 {
+func (s *ShadowStore) ActiveGeneration(remotePath string) ContentGen {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.writeGen[remotePath]
@@ -1111,7 +1128,7 @@ func (s *ShadowStore) ActiveGeneration(remotePath string) uint64 {
 // generation for it. Recovered shadows start without memory-only writeGen
 // state; CommitQueue must mint one before binding a recovered CommitEntry so
 // later uploads and cleanup remain generation-scoped instead of path-wide.
-func (s *ShadowStore) EnsureActiveGeneration(remotePath string) uint64 {
+func (s *ShadowStore) EnsureActiveGeneration(remotePath string) ContentGen {
 	return s.ensureActiveGeneration(remotePath, 0)
 }
 
@@ -1272,10 +1289,10 @@ func (s *ShadowStore) Close() {
 		_ = rt.fd.Close()
 	}
 	s.files = make(map[string]*ShadowFile)
-	s.active = make(map[string]uint64)
-	s.genFile = make(map[uint64]*ShadowFile)
-	s.refs = make(map[uint64]int32)
-	s.retired = make(map[uint64]*retiredShadow)
+	s.active = make(map[string]PinGen)
+	s.genFile = make(map[PinGen]*ShadowFile)
+	s.refs = make(map[PinGen]int32)
+	s.retired = make(map[PinGen]*retiredShadow)
 }
 
 // RecoverFromDisk scans the shadow directory and loads shadow files into memory.
@@ -1335,7 +1352,7 @@ func (sf *ShadowFile) readableAtRevision(minRevision int64) bool {
 		(sf.localNew && sf.baseRev == 0 && minRevision == 0))
 }
 
-func (sf *ShadowFile) readableWithPending(minRevision int64, pendingGeneration uint64) bool {
+func (sf *ShadowFile) readableWithPending(minRevision int64, pendingGeneration ContentGen) bool {
 	return sf != nil && ((pendingGeneration != 0 && sf.contentGen == pendingGeneration) || sf.readableAtRevision(minRevision))
 }
 
@@ -1574,7 +1591,7 @@ func (s *ShadowStore) checkFreeRatioThrottled(requiredBytes int64) error {
 	return nil
 }
 
-func (s *ShadowStore) pinReadable(remotePath string, minRevision int64, pendingGeneration uint64) (uint64, bool) {
+func (s *ShadowStore) pinReadable(remotePath string, minRevision int64, pendingGeneration ContentGen) (PinGen, bool) {
 	if s == nil {
 		return 0, false
 	}
@@ -1601,7 +1618,7 @@ func (s *ShadowStore) pinReadable(remotePath string, minRevision int64, pendingG
 // does not match. This makes the generation check + retirement/removal atomic
 // so a concurrent same-path write cannot bump writeGen between the check and
 // the actual map deletions.
-func (s *ShadowStore) removeCoreLocked(remotePath string, expectedGen uint64, reason shadowRetirementReason) (shadowRemoveCleanup, bool) {
+func (s *ShadowStore) removeCoreLocked(remotePath string, expectedGen ContentGen, reason shadowRetirementReason) (shadowRemoveCleanup, bool) {
 	if expectedGen != 0 && s.writeGen[remotePath] != expectedGen {
 		return shadowRemoveCleanup{}, false
 	}
@@ -2020,7 +2037,7 @@ func (s *ShadowStore) runRemoveCleanup(cleanup shadowRemoveCleanup) {
 	}
 }
 
-func (s *ShadowStore) remove(remotePath string, expectedGen uint64, reason shadowRetirementReason) bool {
+func (s *ShadowStore) remove(remotePath string, expectedGen ContentGen, reason shadowRetirementReason) bool {
 	pl := s.acquirePathLock(remotePath)
 	defer s.releasePathLock(remotePath, pl)
 	s.mu.Lock()
@@ -2032,7 +2049,7 @@ func (s *ShadowStore) remove(remotePath string, expectedGen uint64, reason shado
 	return ok
 }
 
-func (s *ShadowStore) ensureActiveGeneration(remotePath string, minSize int64) uint64 {
+func (s *ShadowStore) ensureActiveGeneration(remotePath string, minSize int64) ContentGen {
 	if s == nil || remotePath == "" {
 		return 0
 	}
@@ -2077,13 +2094,13 @@ func (s *ShadowStore) ensureActiveGeneration(remotePath string, minSize int64) u
 // bumpWriteGenLocked increments the content generation for remotePath. Called
 // under s.mu on every mutating write so ActiveGeneration reflects the latest
 // write. Returns the new generation.
-func (s *ShadowStore) bumpWriteGenLocked(remotePath string) uint64 {
+func (s *ShadowStore) bumpWriteGenLocked(remotePath string) ContentGen {
 	g := s.nextWriteGen.Add(1)
-	s.writeGen[remotePath] = g
+	s.writeGen[remotePath] = ContentGen(g)
 	if sf := s.files[remotePath]; sf != nil {
-		sf.contentGen = g
+		sf.contentGen = ContentGen(g)
 	}
-	return g
+	return ContentGen(g)
 }
 
 func isRegular(e os.DirEntry) bool {

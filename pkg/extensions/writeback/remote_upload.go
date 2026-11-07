@@ -110,7 +110,7 @@ func isInlineShadowUpload(size, threshold int64) bool {
 // acknowledgement. localPath identifies the shadow; remotePath is the API path.
 // Remote-only durability requires an eligible generation-pinned foreground
 // source; the caller must wait for the remote commit before ACK.
-func uploadFromShadowRemote(ctx context.Context, c *client.Client, shadows *staging.ShadowStore, localPath, remotePath string, expectedRevision int64, expectedGen uint64, durability shadowUploadDurability) (int64, error) {
+func uploadFromShadowRemote(ctx context.Context, c *client.Client, shadows *staging.ShadowStore, localPath, remotePath string, expectedRevision int64, expectedGen staging.ContentGen, durability shadowUploadDurability) (int64, error) {
 	switch durability {
 	case shadowUploadLocalDurable:
 		if err := shadows.SyncIfGeneration(localPath, expectedGen); err != nil {
