@@ -918,6 +918,15 @@ func mountWithConfig(cfg MountConfig) error {
 			freeRatio = 0
 		}
 		cacheSizeMB := resolveWriteCacheSizeMB(cfg.WriteCacheSizeMB)
+		// The extent plane's writeback staging lands in this same shadow
+		// store. When it is armed, its disk budget must also bound the
+		// shadow quota; otherwise a large extent write hits the classic
+		// 1 GiB default even though --extent-cache-size-mb was raised.
+		if wantExt["extent"] && cfg.ExtentCacheSize > 0 {
+			if extentMB := cfg.ExtentCacheSize >> 20; extentMB > cacheSizeMB {
+				cacheSizeMB = extentMB
+			}
+		}
 		// The ledger's internal layout (shadow/, pending/, journal.wal) is
 		// the v1 mount-scoped one: root it at the mount hash directly.
 		stagingLedger, err = staging.NewStagingWithQuota(filepath.Join(cacheBase, mountHash), freeRatio, cacheSizeMB)
