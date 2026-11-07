@@ -225,8 +225,8 @@ func (b *Dat9Backend) checkStorageQuotaServerTx(ctx context.Context, tx *sql.Tx,
 }
 
 // QuotaConfigView exposes the per-tenant quota config through the same cache
-// the classic write path uses, so a caller outside this package (the extent
-// meta RPC) can enforce the same limits without opening a second source.
+// the classic write path uses, so a caller outside this package can enforce
+// the same limits without opening a second source.
 func (b *Dat9Backend) QuotaConfigView(ctx context.Context) *QuotaConfigView {
 	if b == nil {
 		return nil
@@ -339,9 +339,9 @@ func (b *Dat9Backend) mediaLLMQuotaExceededServerTx(ctx context.Context, tx *sql
 
 // PendingCentralStorageDelta exposes this process's logged-but-not-yet-applied
 // central storage mutations through the cache the classic soft admission uses,
-// so a caller outside this package (the extent meta RPC) can project the same
-// usage the classic path does. Without it the extent admission would read the
-// committed counters only and under-count every delta still in flight.
+// so a caller outside this package can project the same usage the classic path
+// does. Without it an admission check would read the committed counters only
+// and under-count every delta still in flight.
 func (b *Dat9Backend) PendingCentralStorageDelta(ctx context.Context) int64 {
 	storageDelta, _, _ := b.pendingCentralMutationDeltas(ctx)
 	return storageDelta

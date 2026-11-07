@@ -18,9 +18,10 @@ import (
 	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
+	"go.uber.org/zap"
+
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/extensions/appendlog"
-	"github.com/mem9-ai/drive9/pkg/extensions/bulkfile"
 	"github.com/mem9-ai/drive9/pkg/extensions/cache"
 	"github.com/mem9-ai/drive9/pkg/extensions/core"
 	"github.com/mem9-ai/drive9/pkg/extensions/extent"
@@ -35,6 +36,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/fs"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/perf"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/staging"
+	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/mountpath"
 	"github.com/mem9-ai/drive9/pkg/mountstate"
 )
@@ -51,11 +53,23 @@ type MountConfig struct {
 	MountPoint string
 	RemoteRoot string
 
-	CacheDir               string
-	CacheSize              int64
-	ReadCacheMaxFileBytes  int64
-	ReadCacheTTL           time.Duration
-	DiskReadCacheSize      int64
+	CacheDir              string
+	CacheSize             int64
+	ReadCacheMaxFileBytes int64
+	ReadCacheTTL          time.Duration
+	DiskReadCacheSize     int64
+	// ExtentCacheSize is the extent plane's disk cache budget in bytes.
+	// The three disk budgets are independent:
+	//
+	//   DiskReadCacheSize  classic read cache
+	//   WriteCacheSizeMB   classic writeback staging
+	//   ExtentCacheSize    extent plane (read cache + writeback staging)
+	//
+	// JuiceFS accounts its read cache and its writeback staging in ONE
+	// CacheSize, so the extent plane takes a single number: the engine's
+	// total retained disk bytes never exceed it, while the split between
+	// cached reads and staged writes stays JuiceFS's own LRU decision.
+	ExtentCacheSize        int64
 	DiskReadCacheFreeRatio float64
 
 	DirTTL           time.Duration
@@ -91,7 +105,12 @@ type MountConfig struct {
 
 	AppendLogPatterns []string
 	PackPaths         []string
-	ExtentPaths       []string
+	// ExtentPaths are path globs whose fresh creates ride the JuiceFS
+	// engine plane from byte zero (content_layout=extent); the builtin
+	// "extent" profile sets ["*"]. Default mounts stay hybrid — creation
+	// on the classic plane, large files promoted to extent at the inline
+	// cutoff.
+	ExtentPaths []string
 
 	UploadConcurrency     int
 	DirCacheMaxEntries    int
@@ -185,15 +204,15 @@ func (cfg MountConfig) toProfilingOptions() perf.ProfilingOptions {
 // It is the exact reverse of the historical wired chain, so the default
 // wires byte-identically to the pre-flag code.
 var defaultExtensionOrder = []string{
-	"core", "sse", "writeback", "xattr", "specials", "bulkfile",
-	"appendlog", "extent", "git", "layer", "localize", "renameguard", "cache",
+	"core", "sse", "writeback", "xattr", "specials", "extent",
+	"appendlog", "git", "layer", "localize", "renameguard", "cache",
 }
 
 // knownExtensionNames guards --extensions against typos (an unknown name
 // would otherwise silently not wire).
 var knownExtensionNames = map[string]bool{
-	"core": true, "sse": true, "writeback": true, "xattr": true,
-	"specials": true, "bulkfile": true, "appendlog": true, "extent": true,
+	"core": true, "sse": true, "extent": true, "writeback": true,
+	"xattr": true, "specials": true, "appendlog": true,
 	"git": true, "layer": true, "localize": true, "renameguard": true,
 	"cache": true,
 }
@@ -233,6 +252,35 @@ func parseExtensionOrder(list []string) ([]string, error) {
 		return nil, fmt.Errorf("fuse: --extensions must start with core (the chain terminal), got %q first", out[0])
 	}
 	return out, nil
+}
+
+// extentPromotionCutoff decides the write plane's promotion line: with
+// explicit [extent] patterns the layout is pattern-owned (a staged image
+// promotes only when its PATH matches — see extentRoute; the cutoff is
+// then 0 so size alone never promotes); pattern-less hybrid mounts
+// promote at the server's inline cutoff.
+func extentPromotionCutoff(patternConfigured bool, cl *client.Client) int64 {
+	if patternConfigured {
+		return 0
+	}
+	return extentInlineThreshold(cl)
+}
+
+// extentInlineThreshold returns the server's inline cutoff (the old
+// multipart upgrade line): staged images at or above it become extent.
+func extentInlineThreshold(cl *client.Client) int64 {
+	if t := cl.CachedSmallFileThreshold(); t > 0 {
+		return t
+	}
+	// The status cache may not be warm at construction time; ask once with
+	// a short budget. Fallback: the documented default inline cutoff.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	cl.Warm(ctx)
+	if t := cl.CachedSmallFileThreshold(); t > 0 {
+		return t
+	}
+	return 50_000
 }
 
 // SyncMode controls when Fsync is considered durable.
@@ -313,39 +361,42 @@ type MountOptions struct {
 	DisableBuiltinOverlayDefaults bool
 	AppendLogPatterns             []string // remote-persistent files eligible for append-log synchronization
 	PackPaths                     []string // local overlay paths auto-packed after unmount
-	ExtentPaths                   []string // path globs created as content_layout=extent
+	ExtentPaths                   []string // path globs created as content_layout=extent (--extent / [extent])
 	CommitQueueMaxPending         int      // CommitQueue backpressure bound (default 100; 0 default)
 	WriteBackBatchWindow          time.Duration
 	WriteBackBatchMaxFiles        int
 	WriteBackBatchMaxBytes        int64
 	WriteCacheFreeRatio           float64
 	WriteCacheSizeMB              int64
-	UploadConcurrency             int           // background upload workers (default 16)
-	ReadConcurrency               int           // concurrent backend reads (default 24)
-	ParallelReadConcurrency       int           // concurrent block reads per large FUSE read (default 4)
-	ParallelReadBlockSize         int64         // block size for parallel reads (default 1MiB)
-	SyncRead                      bool          // disable kernel async read dispatch
-	DirectMountStrict             bool          // Linux only: mount(2) without fusermount fallback
-	GVisorCompat                  bool          // gVisor FUSE compatibility behavior
-	LegacyInterruptibleMutations  bool          // FUSE interrupt cancels in-flight remote commits (legacy)
-	LookupRetryCount              int           // detached retries after transient stat failures (default 2)
-	LookupRetryTimeout            time.Duration // timeout per detached stat retry (default 250ms)
-	LegacyDirStatFallback         bool          // list parent when directory stat 404s (legacy servers)
-	ReadDirPrefetch               bool
-	PrefetchMaxFiles              int
-	PrefetchMaxFileBytes          int64
-	PrefetchMaxBytes              int64
-	PrefetchTimeout               time.Duration
-	DirCacheMaxEntries            int
-	TrustLocalEvents              bool
-	AllowOther                    bool
-	ReadOnly                      bool
-	Debug                         bool
-	PerfCounters                  bool
-	EnableGitWorkspaces           bool // enable git workspace overlay discovery (default off)
-	Profiling                     ProfilingOptions
-	WritebackLazyStaging          bool
-	WritebackSyncWindow           time.Duration
+	// ExtentCacheSize is the extent plane's disk cache budget (bytes;
+	// read cache and writeback staging share it).
+	ExtentCacheSize              int64
+	UploadConcurrency            int           // background upload workers (default 16)
+	ReadConcurrency              int           // concurrent backend reads (default 24)
+	ParallelReadConcurrency      int           // concurrent block reads per large FUSE read (default 4)
+	ParallelReadBlockSize        int64         // block size for parallel reads (default 1MiB)
+	SyncRead                     bool          // disable kernel async read dispatch
+	DirectMountStrict            bool          // Linux only: mount(2) without fusermount fallback
+	GVisorCompat                 bool          // gVisor FUSE compatibility behavior
+	LegacyInterruptibleMutations bool          // FUSE interrupt cancels in-flight remote commits (legacy)
+	LookupRetryCount             int           // detached retries after transient stat failures (default 2)
+	LookupRetryTimeout           time.Duration // timeout per detached stat retry (default 250ms)
+	LegacyDirStatFallback        bool          // list parent when directory stat 404s (legacy servers)
+	ReadDirPrefetch              bool
+	PrefetchMaxFiles             int
+	PrefetchMaxFileBytes         int64
+	PrefetchMaxBytes             int64
+	PrefetchTimeout              time.Duration
+	DirCacheMaxEntries           int
+	TrustLocalEvents             bool
+	AllowOther                   bool
+	ReadOnly                     bool
+	Debug                        bool
+	PerfCounters                 bool
+	EnableGitWorkspaces          bool // enable git workspace overlay discovery (default off)
+	Profiling                    ProfilingOptions
+	WritebackLazyStaging         bool
+	WritebackSyncWindow          time.Duration
 	// RemoteCommitWaitTimeout bounds how long a FUSE write/flush handler waits
 	// for a background commit before proceeding anyway (default 5s; 0 uses
 	// default; negative disables the timeout).
@@ -399,6 +450,7 @@ func mountConfigFromOptions(opts *MountOptions) MountConfig {
 		ReadCacheMaxFileBytes:         opts.ReadCacheMaxFileBytes,
 		ReadCacheTTL:                  opts.ReadCacheTTL,
 		DiskReadCacheSize:             opts.DiskReadCacheSize,
+		ExtentCacheSize:               opts.ExtentCacheSize,
 		DiskReadCacheFreeRatio:        opts.DiskReadCacheFreeRatio,
 		DirTTL:                        opts.DirTTL,
 		AttrTTL:                       opts.AttrTTL,
@@ -654,6 +706,22 @@ type redactedMountCause struct {
 func (e redactedMountCause) Error() string { return e.message }
 func (e redactedMountCause) Unwrap() error { return e.cause }
 
+// applyExtentCapabilityGate clears explicit extent patterns when the server
+// cannot attribute a published object to the creating descriptor (missing
+// completion_identity_v1). Local and legacy deployments fall back to the
+// classic plane instead of failing the first extent commit with EIO.
+func applyExtentCapabilityGate(cfg *MountConfig, cl *client.Client, wantExt map[string]bool) {
+	if len(cfg.ExtentPaths) == 0 || cl.CachedCompletionIdentitySupported() {
+		return
+	}
+	logger.Warn(context.Background(), "extent_patterns_disabled",
+		zap.String("server", cfg.Server),
+		zap.Strings("patterns", cfg.ExtentPaths),
+		zap.String("detail", "server does not advertise completion_identity_v1; falling back to the classic plane"))
+	cfg.ExtentPaths = nil
+	delete(wantExt, "extent")
+}
+
 func mountWithConfig(cfg MountConfig) error {
 	if cfg.APIKey != "" && cfg.Token != "" {
 		return fmt.Errorf("fuse: APIKey and Token are mutually exclusive")
@@ -706,6 +774,7 @@ func mountWithConfig(cfg MountConfig) error {
 	for _, name := range extOrder {
 		wantExt[name] = true
 	}
+	applyExtentCapabilityGate(&cfg, cl, wantExt)
 	// Each extension constructs independently into a registry; assembly
 	// walks the flag order in reverse below.
 	built := map[string]fs.Handler{}
@@ -785,7 +854,24 @@ func mountWithConfig(cfg MountConfig) error {
 			PrefetchMaxFileBytes: cfg.PrefetchMaxFileBytes,
 			PrefetchMaxBytes:     cfg.PrefetchMaxBytes,
 			PrefetchTimeout:      cfg.PrefetchTimeout,
-			Disk:                 diskCacheOpts(cacheScopedDir(cacheBase, readCacheHash, "read"), cfg.DiskReadCacheSize, cfg.DiskReadCacheFreeRatio),
+			Disk: func() cache.DiskReadCacheOptions {
+				// With the extent engine armed the mount runs two
+				// independently evicted disk caches; each gets half the
+				// configured budget so the AGGREGATE stays at the limit.
+				// Four independent budgets: the classic read cache gets
+				// exactly its configured size (no sharing with the extent
+				// plane, whose read and write budgets are separate knobs).
+				budget := cfg.DiskReadCacheSize
+				// A non-positive budget disables the disk read cache
+				// entirely (mirroring the extent engine, whose CacheSize 0
+				// means memory-only) instead of falling through to the
+				// cache plugin's own 1 MiB default.
+				dir := ""
+				if budget > 0 {
+					dir = cacheScopedDir(cacheBase, readCacheHash, "read")
+				}
+				return diskCacheOpts(dir, budget, cfg.DiskReadCacheFreeRatio)
+			}(),
 		})
 		if cerr != nil {
 			return fmt.Errorf("fuse: cache extension: %w", cerr)
@@ -958,31 +1044,83 @@ func mountWithConfig(cfg MountConfig) error {
 		}
 	}
 
-	// The extent plane claims ahead of the classic data path (cache and
-	// writeback never see extent files). Gated on the --extent paths /
-	// profile [extent] section only: the cache dir falls back to the
-	// per-user default like every other cache-backed component, so it is
-	// never the enabling condition.
-	var extentExt *extent.Extent
-	// Build the extent reader whenever the stack requests it, even with
-	// no local ExtentPaths: files created by another extent-enabled mount
-	// still carry ExtentIno in listings/stats, and the server answers
-	// their reads with 422 unless the JuiceFS-backed reader routes them.
-	// An empty ExtentPaths only skips the JuiceFS runtime discovery.
+	// The extent plane: the community JuiceFS engine (vfs + chunk store)
+	// on the v2 wire protocol, claiming extent files above the write
+	// plane — claimed handles own their buffering through the engine, not
+	// writeback. Armed by default: fresh creates ride the classic write
+	// plane, which promotes large images to extent layout at the inline
+	// cutoff (files that used to become multipart become extent instead);
+	// the engine serves them from the next open. Legacy servers degrade
+	// the promotion to classic multipart silently.
+	// extentPlane is captured for the write-back plane: after a promotion
+	// lands, the still-open descriptor must MIGRATE onto it. Without that
+	// handoff the fd keeps its classic whole-image staging while the remote
+	// is extent, so every fsync re-uploads the whole file.
+	var extentPlane *extent.Handler
 	if wantExt["extent"] {
-		extentExt, err = extent.New(extent.Options{
-			ExtentPaths: cfg.ExtentPaths,
-			Client:      cl,
-			RemoteRoot:  remoteRoot,
-			CacheDir:    cacheScopedDir(cacheBase, mountHash, "jfs"),
-			// v1: write-sync mounts pay a per-Write VFS flush on the extent
-			// plane too.
-			Policy: cfg.WritePolicy,
-		})
-		if err != nil {
-			return fmt.Errorf("fuse: extent extension: %w", err)
+		engineConf := extent.EngineConfig{
+			Client:     cl,
+			RemoteRoot: remoteRoot,
+			// Cache placement: inside the SAME drive9 cache directory the
+			// classic writeback/read caches live in, as one dedicated
+			// subdirectory of the MOUNT-scoped namespace
+			// (".../<mountHash>/extent"). That namespace deliberately does
+			// NOT fold in the credential: this directory is not only a
+			// disposable read cache — interactive fsync stages the file's
+			// durable barrier here and the next mount replays it. A rotated
+			// credential must find the same barriers, or acknowledged bytes
+			// are stranded in a scope nothing ever scans. (The engine
+			// suppresses JuiceFS's UUID cache namespace: the scope directory
+			// is already per-mount, so another segment would be redundant.)
+			CacheDir:       cacheScopedDir(cacheBase, mountHash, "extent"),
+			ReadOnly:       cfg.ReadOnly,
+			FreeSpaceRatio: float32(cfg.DiskReadCacheFreeRatio),
+			// JuiceFS's OWN writeback pipeline: blocks below the threshold
+			// are staged into the engine's disk cache and uploaded by the
+			// chunk store asynchronously; the bridge waits for the bytes at
+			// the meta-commit boundary (the server verifies blocks then).
+			// Memory-only mounts (no cache dir) keep the direct path, as
+			// JuiceFS itself disables writeback without a disk cache.
+			Writeback:              !cfg.ReadOnly && cacheBase != "",
+			WritebackThresholdSize: int(client.ExtentBlockSize) + 1,
+			// In-flight staging concurrency: raised/derived from
+			// --extent-write-cache-size-mb below (this is the fallback).
+			MaxStageWrite: 40,
 		}
-		built["extent"] = extentExt
+		// The extent plane's disk budget IS JuiceFS's chunk cache: the plane
+		// no longer keeps a second copy of staged bytes (its local fsync
+		// barrier is gone), so the operator's number passes through
+		// verbatim — 0 included, which is JuiceFS's memory-only mode (reads
+		// bypass the cache, writeback is disabled by SelfCheck).
+		if cfg.ExtentCacheSize >= 0 {
+			engineConf.CacheSize = uint64(cfg.ExtentCacheSize)
+		}
+
+		engine := extent.NewEngine(engineConf)
+		extentPlane = extent.New(extent.Options{
+			Engine: engine,
+			// Hybrid: creation stays on the classic plane (promotion at
+			// the inline cutoff) unless the path matches an explicit
+			// --extent / [extent] pattern.
+			Threshold: 1,
+			Patterns:  cfg.ExtentPaths,
+			Events:    bus,
+		})
+		built["extent"] = extentPlane
+		// The extent plane implements JuiceFS's close-to-open contract
+		// and nothing else: it has no local fsync barrier and no
+		// per-Write publish (docs/design/fuse-durability-policy.md,
+		// "Extent plane"). A non-default --durability therefore applies
+		// only to paths this plane does not serve, and saying so is
+		// better than letting the weaker promise be silent.
+		if cfg.WritePolicy != string(WritePolicyWriteBack) || syncMode != "strict" {
+			logger.Warn(context.Background(), "extent_durability_override",
+				zap.String("durability_profile", cfg.Profile),
+				zap.String("write_policy", string(cfg.WritePolicy)),
+				zap.String("sync_mode", syncMode),
+				zap.Strings("extent_patterns", cfg.ExtentPaths),
+				zap.String("detail", "extent-served paths keep JuiceFS close-to-open semantics; --durability applies to other paths only"))
+		}
 	}
 
 	var appendExt *appendlog.AppendLog
@@ -992,18 +1130,6 @@ func mountWithConfig(cfg MountConfig) error {
 			return fmt.Errorf("fuse: appendlog extension: %w", err)
 		}
 		built["appendlog"] = appendExt
-	}
-
-	// The bulk data plane claims fresh truncate-writers (S3 multipart for
-	// large images) only after the view/routing handlers have had their
-	// claim, and before the buffered write path. A write-sync mount commits
-	// every write inline below — the buffered-image claim stays out.
-	if wantExt["bulkfile"] {
-		bulkExt, berr := bulkfile.New(bulkfile.Options{Client: cl, RemoteRoot: remoteRoot, Events: bus, Policy: cfg.WritePolicy})
-		if berr != nil {
-			return fmt.Errorf("fuse: bulkfile extension: %w", berr)
-		}
-		built["bulkfile"] = bulkExt
 	}
 
 	if wantExt["specials"] {
@@ -1050,6 +1176,21 @@ func mountWithConfig(cfg MountConfig) error {
 			BatchWindow:           cfg.WriteBackBatchWindow,
 			BatchMaxFiles:         cfg.WriteBackBatchMaxFiles,
 			BatchMaxBytes:         cfg.WriteBackBatchMaxBytes,
+			// The extent plane and its write-plane branch arm together:
+			// the engine serves extent reads, the commit queue promotes
+			// fresh large files (multipart's successor). With explicit
+			// [extent] patterns the PATTERN owns the layout on the write
+			// plane too: matching staged images promote, non-matching ones
+			// stay classic however large (create-time stickiness).
+			// Pattern-less hybrid mounts promote at the inline cutoff.
+			ExtentTakeover:  wantExt["extent"],
+			ExtentMinSize:   extentPromotionCutoff(len(cfg.ExtentPaths) > 0, cl),
+			ExtentPatterns:  cfg.ExtentPaths,
+			ExtentThreshold: int64(extentInlineThreshold(cl)),
+			// Hand a promoted descriptor to the engine: the open fd must
+			// follow the layout it just created, not keep re-uploading a
+			// whole image through this plane.
+			ExtentOpener: extentPlane,
 			// gvisor-compat takes precedence and always keeps commits
 			// detached (v1).
 			InterruptibleCommits:    cfg.LegacyInterruptibleMutations && !cfg.GVisorCompat,
@@ -1480,6 +1621,15 @@ func remoteRootValidationError(remoteRoot string, err error) *MountExitError {
 
 // diskCacheOpts builds the on-disk read-cache options; an empty cache
 // directory disables the disk layer (memory-only, v1 default).
+// extentCacheSizeForTest mirrors the engine wiring's extent budget
+// mapping: the configured bytes pass through verbatim, 0 included.
+func extentCacheSizeForTest(bytes int64) uint64 {
+	if bytes <= 0 {
+		return 0
+	}
+	return uint64(bytes)
+}
+
 func diskCacheOpts(dir string, sizeMB int64, freeRatio float64) cache.DiskReadCacheOptions {
 	if dir == "" {
 		return cache.DiskReadCacheOptions{}

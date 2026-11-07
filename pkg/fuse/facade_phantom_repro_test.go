@@ -9,7 +9,6 @@ import (
 
 	"github.com/mem9-ai/drive9/internal/testbackend"
 	"github.com/mem9-ai/drive9/pkg/client"
-	"github.com/mem9-ai/drive9/pkg/extensions/bulkfile"
 	"github.com/mem9-ai/drive9/pkg/extensions/core"
 	"github.com/mem9-ai/drive9/pkg/extensions/git"
 	"github.com/mem9-ai/drive9/pkg/extensions/renameguard"
@@ -40,12 +39,11 @@ func phantomMountChain(t *testing.T) *FS {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bf, _ := bulkfile.New(bulkfile.Options{Client: cl, RemoteRoot: "/", Events: bus})
 	sp, _ := specials.New(specials.Options{})
 	xe, _ := xattr.New(xattr.Options{})
 	wb, _ := writeback.New(writeback.Options{Policy: writeback.PolicyWriteBack, SyncMode: "strict", Client: cl, RemoteRoot: "/", Events: bus})
 	se, _ := sse.New(sse.Options{Client: cl, Actor: "probe", RemoteRoot: "/", Events: bus})
-	f, err := New(Options{Extensions: []fs.Handler{rg, ge, bf, sp, xe, wb, se, terminal}, Events: bus, LocalDirAttrs: true})
+	f, err := New(Options{Extensions: []fs.Handler{rg, ge, sp, xe, wb, se, terminal}, Events: bus, LocalDirAttrs: true})
 	if err != nil {
 		t.Fatal(err)
 	}

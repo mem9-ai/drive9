@@ -559,6 +559,23 @@ Not part of the PR fuse-release-gate. `local-e2e.yml` runs it on post-merge,
 nightly, `run_all_e2e=1`, or `run_fuse_sqlite_commit_sequence=1`. Set
 `RUN_FUSE_SQLITE_COMMIT_SEQUENCE=1` to add it to `fuse-release-gate.sh`.
 
+### `extent-takeover-mixed-tree.sh`
+
+Host support: Linux and macOS. Manual-only: it needs a server speaking the
+extent content-layout v2 protocol (`content_layout=extent` read plans,
+PATCH sessions and presigned block PUTs) plus FUSE. Run it with
+`RUN_EXTENT_E2E=1` in `smoke-all.sh`, or directly with
+`DRIVE9_BASE=... bash e2e/extent-takeover-mixed-tree.sh`;
+`EXTENT_E2E_SQL_CHECK=1` adds server-table assertions via `/v1/sql`.
+
+Covers the extent takeover end to end: legacy multipart files never
+convert; fresh large files promote to the extent (JuiceFS engine) plane at
+the inline cutoff (including one-fd grow, O_APPEND and sparse
+truncate+seek); mixed trees survive renames in every plane combination,
+`cp -r` and `rm -r`; cross-channel CLI namespace changes persist across
+remounts; server-side compaction and block GC settle without byte
+changes; dual mounts agree; held-open writers stay visible.
+
 ### `extent-rename-mixed-dir.sh`
 
 Host support: Linux and macOS only. Manual-only: it needs a server whose

@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -136,4 +137,64 @@ func TestMountDefaultParallelReadBlockSize(t *testing.T) {
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
 	t.Fatalf("no 1MiB range request observed; saw lengths %v", rec.length)
+}
+
+// With explicit [extent] patterns the layout is pattern-owned: the
+// write plane's size-based promotion stays off, so a non-matching file
+// never flips to extent by crossing the inline cutoff. Pattern-less
+// hybrid mounts keep the promotion line.
+func TestExtentPromotionCutoffRespectsPatterns(t *testing.T) {
+	cl := client.New("http://promote.invalid", "")
+	if got := extentPromotionCutoff(true, cl); got != 0 {
+		t.Fatalf("pattern-configured promotion cutoff = %d, want 0 (pattern owns the layout)", got)
+	}
+	if got := extentPromotionCutoff(false, cl); got <= 0 {
+		t.Fatalf("hybrid promotion cutoff = %d, want the positive inline fallback", got)
+	}
+}
+
+// The engine's cache root must sit INSIDE the writeback-side cache
+// namespace (".../<mountHash>/extent", a sibling of "writecache"), and it
+// must NOT fold in the credential: interactive fsync stages durable
+// barriers there, so a rotated credential has to find the same directory.
+func TestExtentCacheRootKeysOnMountNotCredential(t *testing.T) {
+	base := "/tmp/d9cache"
+	mountHash := "mountscope"
+	engDir := cacheScopedDir(base, mountHash, "extent")
+	if want := filepath.Join(base, mountHash, "extent"); engDir != want {
+		t.Fatalf("engine cache = %q, want %q", engDir, want)
+	}
+	// A sibling of the classic writeback directory, not inside a
+	// credential-derived read-cache scope.
+	writeDir := cacheScopedDir(base, mountHash, "writecache")
+	if filepath.Dir(engDir) != filepath.Dir(writeDir) {
+		t.Fatalf("engine cache %q must share the classic writeback parent %q", engDir, writeDir)
+	}
+	readHash := "readscope-other-credential"
+	if other := cacheScopedDir(base, readHash, "extent"); engDir == other {
+		t.Fatalf("engine cache must not be credential-scoped (%q)", other)
+	}
+	// No cache base (memory-only) stays empty.
+	if got := cacheScopedDir("", mountHash, "extent"); got != "" {
+		t.Fatalf("memory-only cache dir = %q, want empty", got)
+	}
+}
+
+// Three INDEPENDENT disk budgets: classic read, classic write, and ONE
+// extent budget. The extent one has exactly one consumer — JuiceFS's chunk
+// cache: the plane keeps no staging tree of its own, so the number is never
+// split. No plane shares or halves another's number, and each defaults to
+// 1 GiB at the CLI.
+func TestThreeIndependentDiskBudgets(t *testing.T) {
+	// The extent budget is passed through verbatim — including 0, which is
+	// JuiceFS's memory-only mode (no silent default).
+	for _, tc := range []struct{ in, want int64 }{
+		{1024 << 20, 1024 << 20},
+		{0, 0},
+		{4096 << 20, 4096 << 20},
+	} {
+		if got := extentCacheSizeForTest(tc.in); int64(got) != tc.want {
+			t.Fatalf("extent cache size %d = %d, want %d (verbatim)", tc.in, got, tc.want)
+		}
+	}
 }

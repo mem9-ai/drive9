@@ -166,6 +166,49 @@ func builtinExtentProfile() profileConfig {
 	}
 }
 
+// builtinCodingAgentExtentPatterns routes SQLite's whole file family onto the
+// extent plane from the FIRST byte, regardless of size.
+//
+// SQLite is the workload the size cutoff handles worst. A database file starts
+// at a few KiB, crosses the inline cutoff mid-session, and is then written
+// through a handle that was opened while it was still classic — the exact
+// descriptor/promotion mismatch that made every fsync re-upload a whole image.
+// Its journal, WAL and shared-memory companions are the same story, and they
+// are small, hot, and rewritten constantly.
+//
+// Matching is by BASENAME at any depth (a pattern without '/' matches the base
+// name), so `*.db` covers `~/proj/data/app.db` as well as a top-level `app.db`.
+//
+// A database directory is NOT covered: SQLite may create side files with
+// arbitrary names, but every one of them keeps a recognizable suffix, and a
+// directory-wide pattern would pull unrelated content onto the plane.
+func builtinCodingAgentExtentPatterns() []string {
+	var patterns []string
+	// SQLite derives every companion file from the database's own name, so
+	// the family is enumerated per base suffix rather than guessed from a
+	// wildcard: `*.db` matches `app.db` but NOT `app.db-wal`, and a loose
+	// `*-mj*` would sweep unrelated names (image-mjpeg.jpg) onto the plane.
+	for _, base := range []string{"db", "db3", "sqlite", "sqlite3"} {
+		patterns = append(patterns,
+			// The database itself.
+			"*."+base,
+			// Write-ahead log. SQLite rewrites its header and cycles
+			// generations; the extent plane is where this profile puts all
+			// SQLite content, so the WAL rides it too and the file keeps one
+			// plane from first byte to last.
+			"*."+base+"-wal",
+			// Shared-memory index: no protocol of its own, so it rides the
+			// plane like the database.
+			"*."+base+"-shm",
+			// Rollback journal (the classic pre-WAL mode).
+			"*."+base+"-journal",
+			// Master journal: `<db>-mj<9 hex digits>`.
+			"*."+base+"-mj*",
+		)
+	}
+	return patterns
+}
+
 func builtinCodingAgentProfile() profileConfig {
 	return profileConfig{
 		Name:                        defaultMountProfile,
@@ -173,9 +216,13 @@ func builtinCodingAgentProfile() profileConfig {
 		LocalOnlyPatterns:           builtinCodingAgentLocalOnlyPatterns(),
 		RemoteOnlyPatterns:          nil,
 		LocalGitignoreAwarePatterns: builtinCodingAgentGitignoreAwarePatterns(),
-		AppendLogPatterns:           []string{"**/*-wal"},
-		PackPaths:                   nil,
-		Builtin:                     true,
+		// No [append-log]: every SQLite file — the WAL included — is routed
+		// to the extent plane, so the profile never splits one database's
+		// files across two data planes.
+		AppendLogPatterns: nil,
+		ExtentPatterns:    builtinCodingAgentExtentPatterns(),
+		PackPaths:         nil,
+		Builtin:           true,
 	}
 }
 

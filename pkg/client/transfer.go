@@ -67,12 +67,23 @@ type presignedPart struct {
 	ChecksumSHA256 string            `json:"checksum_sha256,omitempty"`
 	Headers        map[string]string `json:"headers,omitempty"`
 	ExpiresAt      time.Time         `json:"expires_at"`
+	// SkipUpload marks an extent block whose content the object store
+	// already holds (dedupe): the PUT is skipped and complete carries the
+	// checksum alone.
+	SkipUpload bool `json:"skip_upload,omitempty"`
 }
 
 // completePart is sent to the v2 complete endpoint.
 type completePart struct {
 	Number int    `json:"number"`
 	ETag   string `json:"etag"`
+	// Extent-layout sessions only: the slice this part published. Zero
+	// values on a sequential session derive from the part number, the
+	// session's part size, and its total size.
+	Chunk uint32 `json:"chunk,omitempty"`
+	Off   uint32 `json:"off,omitempty"`
+	BOff  uint32 `json:"boff,omitempty"`
+	Size  int64  `json:"size,omitempty"`
 }
 
 // ProgressFunc is called after each part upload completes.
@@ -384,6 +395,77 @@ func (c *Client) WriteStreamConditional(ctx context.Context, path string, r io.R
 	return err
 }
 
+// ErrResourceMismatch reports a publication refused because the path's
+// current occupant is not the expected resource object.
+var ErrResourceMismatch = errors.New("path occupant is not the expected resource")
+
+type expectedResourceCtxKey struct{}
+
+type completedResourceSinkKey struct{}
+
+// WithCompletedResourceSink installs a sink receiving the resource
+// identity echoed by a completed upload (when the server sends one).
+func WithCompletedResourceSink(ctx context.Context, sink *string) context.Context {
+	return context.WithValue(ctx, completedResourceSinkKey{}, sink)
+}
+
+func completedResourceSinkOf(ctx context.Context) *string {
+	v, _ := ctx.Value(completedResourceSinkKey{}).(*string)
+	return v
+}
+
+type completedRevisionSinkKey struct{}
+
+// WithCompletedRevisionSink installs a sink receiving the revision the
+// SERVER attributes to this context's completed upload (when the server
+// echoes one). Unlike a follow-up stat — which can observe a foreign
+// writer's later publication — the echoed revision is attributable to
+// exactly the publication the completion acknowledges.
+func WithCompletedRevisionSink(ctx context.Context, sink *int64) context.Context {
+	return context.WithValue(ctx, completedRevisionSinkKey{}, sink)
+}
+
+func completedRevisionSinkOf(ctx context.Context) *int64 {
+	v, _ := ctx.Value(completedRevisionSinkKey{}).(*int64)
+	return v
+}
+
+// WithExpectedResource binds a context's publications to the object's
+// resource identity: every upload initiate (and extent PATCH) under the
+// context carries X-Dat9-Expected-Resource, so the server can refuse a
+// publication into a replacement whose revision merely equals the saved
+// one. An empty ID leaves the context unbound.
+func WithExpectedResource(ctx context.Context, resourceID string) context.Context {
+	if resourceID == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, expectedResourceCtxKey{}, resourceID)
+}
+
+func expectedResourceOf(ctx context.Context) string {
+	v, _ := ctx.Value(expectedResourceCtxKey{}).(string)
+	return v
+}
+
+// WriteStreamConditionalExpectedResource binds the conditional upload to
+// the object's resource identity in addition to the revision (see
+// WithExpectedResource). A server answer of 409 Conflict while bound is
+// reported as ErrResourceMismatch.
+func (c *Client) WriteStreamConditionalExpectedResource(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, expectedRevision int64, expectedResourceID string) error {
+	err := c.WriteStreamConditional(WithExpectedResource(ctx, expectedResourceID), path, r, size, progress, expectedRevision)
+	if err == nil {
+		return nil
+	}
+	var se *StatusError
+	// 412 (precondition) is the identity refusal; 409 stays an ordinary
+	// revision conflict on the SAME object — conflating them abandoned
+	// recoverable state on a normal CAS retry.
+	if expectedResourceID != "" && errors.As(err, &se) && se.StatusCode == http.StatusPreconditionFailed {
+		return fmt.Errorf("%s: %w", path, ErrResourceMismatch)
+	}
+	return err
+}
+
 // WriteStreamConditionalWithChecksum performs one fresh conditional upload,
 // supplies the trusted whole-file checksum to Multipart Complete, and rereads
 // the committed Stat. Direct PUT ignores the supplied checksum because the
@@ -456,6 +538,12 @@ func (c *Client) WriteMultipartStreamConditional(ctx context.Context, path strin
 		TotalBytes: size,
 	}
 	err := c.writeStreamV2WithSummary(ctx, path, ra, size, progress, expectedRevision, summary, nil, "", "")
+	if err == errV2NotAvailable && expectedResourceOf(ctx) != "" {
+		// The publication is IDENTITY-BOUND; the V1 surface cannot carry
+		// the precondition, so silently publishing through it would
+		// unbind the operation. Refuse instead.
+		return fmt.Errorf("%s: %w (v1 fallback cannot carry the identity binding)", path, ErrResourceMismatch)
+	}
 	if err == errV2NotAvailable {
 		err = c.writeStreamV1WithSummary(ctx, path, ra, size, progress, expectedRevision, summary, nil, "", "")
 	}
@@ -524,6 +612,11 @@ func (c *Client) writeStreamConditionalWithSummaryAndPreCompleteCheck(ctx contex
 	// Every attempt is fresh. Prefer V2 and use V1 only when the endpoint is
 	// explicitly unavailable on an older Server.
 	err := c.writeStreamV2WithSummaryAndPreCompleteCheck(ctx, path, ra, size, progress, expectedRevision, summary, tags, description, checksumSHA256, preCompleteCheck)
+	if err == errV2NotAvailable && expectedResourceOf(ctx) != "" {
+		// Identity-bound publication: the V1 surface cannot carry the
+		// precondition — refuse instead of silently unbinding.
+		return nil, fmt.Errorf("%s: %w (v1 fallback cannot carry the identity binding)", path, ErrResourceMismatch)
+	}
 	if err == errV2NotAvailable {
 		// Server doesn't support v2 — fall back to v1.
 		if err := c.writeStreamV1WithSummaryAndPreCompleteCheck(ctx, path, ra, size, progress, expectedRevision, summary, tags, description, checksumSHA256, preCompleteCheck); err != nil {
@@ -703,6 +796,34 @@ func runPreCompleteCheck(ctx context.Context, check func() error) error {
 		return fmt.Errorf("pre-Complete check: %w", err)
 	}
 	return ctx.Err()
+}
+
+// uploadClassicSession drives the classic v2 pipeline on an
+// already-initiated session. Used by WriteExtentStreamConditional when a
+// legacy server ignored the layout field and answered a classic plan.
+func (c *Client) uploadClassicSession(ctx context.Context, plan *uploadPlanV2, ra io.ReaderAt, progress ProgressFunc) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	parallelism := boundedUploadParallelism(plan.PartSize, plan.TotalParts)
+	presignCh := make(chan presignedPart, parallelism)
+	presignErrCh := make(chan error, 1)
+	presignRecorder := &uploadDurationRecorder{}
+
+	go func() {
+		c.presignPipeline(ctx, plan, parallelism, presignCh, presignErrCh, presignRecorder)
+	}()
+
+	parts, err := c.uploadPartsV2(ctx, plan, ra, presignCh, presignErrCh, presignRecorder, progress)
+	if err != nil {
+		c.abortUploadV2BestEffort(ctx, plan.UploadID)
+		return err
+	}
+	if err := c.completeUploadV2WithOptions(ctx, plan.UploadID, parts, nil, ""); err != nil {
+		c.abortUploadV2BestEffort(ctx, plan.UploadID)
+		return err
+	}
+	return nil
 }
 
 type uploadInitiateRequest struct {
@@ -993,7 +1114,27 @@ func (c *Client) completeUploadWithOptions(ctx context.Context, uploadID string,
 	if resp.StatusCode >= 300 {
 		return markCommitAttempt(readError(resp))
 	}
+	// The server may echo the landed object's resource identity: publish
+	// it to any bound writer so a post-upload stat outage cannot lose the
+	// ownership proof.
+	if id, _ := completedEchoOf(resp); id != "" {
+		if out := completedResourceSinkOf(ctx); out != nil {
+			*out = id
+		}
+	}
 	return nil
+}
+
+// completedEchoOf decodes a completion response's echo block once: the
+// landed object's resource identity and, when the server attributes one,
+// the revision of exactly this publication.
+func completedEchoOf(resp *http.Response) (resourceID string, revision int64) {
+	var body struct {
+		ResourceID string `json:"resource_id"`
+		Revision   int64  `json:"revision"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&body)
+	return body.ResourceID, body.Revision
 }
 
 // --- v2 upload methods ---
@@ -1001,6 +1142,13 @@ func (c *Client) completeUploadWithOptions(ctx context.Context, uploadID string,
 // initiateUploadV2 calls POST /v2/uploads/initiate.
 // Returns errV2NotAvailable if the server responds with 404.
 func (c *Client) initiateUploadV2(ctx context.Context, path string, size int64, expectedRevision int64, description string) (*uploadPlanV2, error) {
+	return c.initiateUploadV2WithLayout(ctx, path, size, expectedRevision, description, "")
+}
+
+// initiateUploadV2WithLayout starts a v2 upload session; layout "extent"
+// asks for an extent sequential session. Servers that predate the field
+// ignore it and answer a classic plan (Key != "").
+func (c *Client) initiateUploadV2WithLayout(ctx context.Context, path string, size int64, expectedRevision int64, description, layout string) (*uploadPlanV2, error) {
 	if err := validateFSPath(path); err != nil {
 		return nil, err
 	}
@@ -1009,7 +1157,8 @@ func (c *Client) initiateUploadV2(ctx context.Context, path string, size int64, 
 		TotalSize        int64  `json:"total_size"`
 		ExpectedRevision *int64 `json:"expected_revision,omitempty"`
 		Description      string `json:"description,omitempty"`
-	}{Path: path, TotalSize: size, ExpectedRevision: expectedRevisionField(expectedRevision), Description: description})
+		Layout           string `json:"layout,omitempty"`
+	}{Path: path, TotalSize: size, ExpectedRevision: expectedRevisionField(expectedRevision), Description: description, Layout: layout})
 	if err != nil {
 		return nil, err
 	}
@@ -1018,12 +1167,18 @@ func (c *Client) initiateUploadV2(ctx context.Context, path string, size int64, 
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if id := expectedResourceOf(ctx); id != "" {
+		req.Header.Set("X-Dat9-Expected-Resource", id)
+	}
 	resp, err := c.do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	if resp.StatusCode == http.StatusPreconditionFailed && expectedResourceOf(ctx) != "" {
+		return nil, fmt.Errorf("%s: %w", path, ErrResourceMismatch)
+	}
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, errV2NotAvailable
 	}
@@ -1269,10 +1424,22 @@ func (c *Client) uploadOnePartV2(ctx context.Context, part presignedPart, data [
 	}
 	if resp.StatusCode >= 300 {
 		body := readPresignedErrorBody(resp)
-		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+		return "", &presignedPutStatusError{Status: resp.StatusCode, Body: string(body)}
 	}
 
 	return resp.Header.Get("ETag"), nil
+}
+
+// presignedPutStatusError is a non-2xx answer to a presigned PUT, keeping
+// the status so callers can tell a create-once conflict (409/412 on an
+// extent block address that is already taken) from a broken upload.
+type presignedPutStatusError struct {
+	Status int
+	Body   string
+}
+
+func (e *presignedPutStatusError) Error() string {
+	return fmt.Sprintf("HTTP %d: %s", e.Status, e.Body)
 }
 
 // presignOnePart fetches a fresh presigned URL for a single part via
@@ -1341,6 +1508,23 @@ func (c *Client) completeUploadV2WithOptions(ctx context.Context, uploadID strin
 	if resp.StatusCode >= 300 {
 		return markCommitAttempt(readError(resp))
 	}
+	// The server may echo the landed object's resource identity: publish
+	// it to any bound writer (the extent session AND the degraded classic
+	// session both complete here) so a post-upload stat outage cannot
+	// lose the ownership proof. The echoed revision, when present, is
+	// likewise attributable to THIS publication — the only revision a
+	// success callback may report as its own.
+	id, rev := completedEchoOf(resp)
+	if id != "" {
+		if out := completedResourceSinkOf(ctx); out != nil {
+			*out = id
+		}
+	}
+	if rev > 0 {
+		if out := completedRevisionSinkOf(ctx); out != nil {
+			*out = rev
+		}
+	}
 	return nil
 }
 
@@ -1380,20 +1564,18 @@ func newMultipartAbortContext(parent context.Context, timeout time.Duration) (co
 
 // ReadStream reads a file, following 302 redirects for large files.
 func (c *Client) ReadStream(ctx context.Context, path string) (io.ReadCloser, error) {
-	resp, err := c.readWithoutRedirect(ctx, path, "")
+	// The extent read-plan representation is opt-in on the wire: declare
+	// support on every plain read too — a classic server ignores the
+	// header, an extent server answers the plan (without it, 422).
+	resp, err := c.readWithoutRedirectOptIn(ctx, path, "", true)
 	if err != nil {
 		return nil, err
 	}
 
 	switch {
-	case resp.StatusCode == http.StatusUnprocessableEntity:
-		ino, length, ok := extentHintFromResponse(resp)
-		if !ok {
-			defer func() { _ = resp.Body.Close() }()
-			return nil, readError(resp)
-		}
-		_ = resp.Body.Close()
-		return c.openExtentStream(ctx, ino, length, 0, 0)
+	case resp.StatusCode < 300 && ContentLayout(resp.Header.Get("X-Dat9-Content-Layout")) == ContentLayoutExtent:
+		// Extent layout: the body is a JSON block read plan, not bytes.
+		return c.serveExtentPlan(ctx, path, resp, -1, -1)
 
 	case resp.StatusCode == http.StatusFound || resp.StatusCode == http.StatusTemporaryRedirect:
 		// Large file: follow presigned URL
@@ -1426,7 +1608,10 @@ func (c *Client) ReadStream(ctx context.Context, path string) (io.ReadCloser, er
 	}
 }
 
-func (c *Client) readWithoutRedirect(ctx context.Context, path, rangeHeader string) (*http.Response, error) {
+// readWithoutRedirectOptIn additionally declares support for the extent
+// block-plan representation (X-Dat9-Extent-Read-Plan): extent reads MUST
+// opt in or the server answers 422; classic reads leave it off.
+func (c *Client) readWithoutRedirectOptIn(ctx context.Context, path, rangeHeader string, extentPlan bool) (*http.Response, error) {
 	// Disable redirect following so we can detect 302. The request carries the
 	// same credentials as any other read (doWith), including X-Dat9-Actor: the
 	// actor header is read by the drive9 origin on this hop and is not forwarded
@@ -1434,6 +1619,9 @@ func (c *Client) readWithoutRedirect(ctx context.Context, path, rangeHeader stri
 	req, err := c.newFSRequest(ctx, http.MethodGet, path, "", nil)
 	if err != nil {
 		return nil, err
+	}
+	if extentPlan {
+		req.Header.Set("X-Dat9-Extent-Read-Plan", "1")
 	}
 	if rangeHeader != "" {
 		req.Header.Set("Range", rangeHeader)
@@ -1450,7 +1638,10 @@ func (c *Client) ResolveReadTarget(ctx context.Context, path string) (*ReadTarge
 }
 
 func (c *Client) resolveReadTarget(ctx context.Context, path string) (*ReadTarget, error) {
-	resp, err := c.readWithoutRedirect(ctx, path, "")
+	// Opt in to the extent plan representation: without the header an
+	// extent file answers 422 here and the download would abort with the
+	// destination already created.
+	resp, err := c.readWithoutRedirectOptIn(ctx, path, "", true)
 	if err != nil {
 		return nil, err
 	}
@@ -1464,16 +1655,13 @@ func (c *Client) resolveReadTarget(ctx context.Context, path string) (*ReadTarge
 		}
 		return &ReadTarget{ObjectURL: location}, nil
 
-	case resp.StatusCode == http.StatusUnprocessableEntity:
-		if _, _, ok := extentHintFromResponse(resp); ok {
-			return nil, errReadTargetNoRedirect
-		}
-		return nil, readError(resp)
-
 	case resp.StatusCode >= 300:
 		return nil, readError(resp)
 
 	default:
+		// A 200 (classic inline bytes, or an extent block PLAN with the
+		// opt-in) has no single object URL for the parallel range path —
+		// fall back to the sequential streaming reader, which serves both.
 		return nil, errReadTargetNoRedirect
 	}
 }
@@ -1519,20 +1707,19 @@ func (c *Client) ReadStreamRange(ctx context.Context, path string, offset, lengt
 		return nil, fmt.Errorf("offset + length overflows int64")
 	}
 
-	resp, err := c.readWithoutRedirect(ctx, path, fmt.Sprintf("bytes=%d-%d", offset, offset+length-1))
+	// Same opt-in as ReadStream: extent servers answer plans only when
+	// the client declares support.
+	resp, err := c.readWithoutRedirectOptIn(ctx, path, fmt.Sprintf("bytes=%d-%d", offset, offset+length-1), true)
 	if err != nil {
 		return nil, err
 	}
 
 	switch {
-	case resp.StatusCode == http.StatusUnprocessableEntity:
-		ino, fileLen, ok := extentHintFromResponse(resp)
-		if !ok {
-			defer func() { _ = resp.Body.Close() }()
-			return nil, readError(resp)
-		}
-		_ = resp.Body.Close()
-		return c.openExtentStream(ctx, ino, fileLen, offset, length)
+	case resp.StatusCode < 300 && ContentLayout(resp.Header.Get("X-Dat9-Content-Layout")) == ContentLayoutExtent:
+		// Extent layout: the plan tiles the requested window; the reader
+		// stays bounded so continuation chains cannot stream past the
+		// caller's length.
+		return c.serveExtentPlan(ctx, path, resp, length, offset+length-1)
 
 	case resp.StatusCode == http.StatusFound || resp.StatusCode == http.StatusTemporaryRedirect:
 		_ = resp.Body.Close()
@@ -1564,7 +1751,7 @@ func (c *Client) ReadStreamRange(ctx context.Context, path string, offset, lengt
 			}
 			// 200: server returned full body (Range not honored).
 			// Skip to offset and limit the read.
-			return c.sliceBody(resp2.Body, offset, length)
+			return c.sliceBodyWithHeader(resp2.Body, offset, length, resp2.Header.Clone())
 		}
 
 	case resp.StatusCode == http.StatusPartialContent:
@@ -1576,7 +1763,7 @@ func (c *Client) ReadStreamRange(ctx context.Context, path string, offset, lengt
 		// First-hop Range honored. The body already starts at offset, so
 		// bound it to the declared response range without skipping the
 		// offset a second time.
-		return &limitedReadCloser{r: io.LimitReader(resp.Body, end-offset+1), c: resp.Body}, nil
+		return &limitedReadCloser{r: io.LimitReader(resp.Body, end-offset+1), c: resp.Body, h: resp.Header.Clone()}, nil
 
 	case resp.StatusCode == http.StatusRequestedRangeNotSatisfiable:
 		_ = resp.Body.Close()
@@ -1589,7 +1776,7 @@ func (c *Client) ReadStreamRange(ctx context.Context, path string, offset, lengt
 	default:
 		// 200: server ignored Range (small inline file or old server).
 		// Skip to offset and limit the read.
-		return c.sliceBody(resp.Body, offset, length)
+		return c.sliceBodyWithHeader(resp.Body, offset, length, resp.Header.Clone())
 	}
 }
 
@@ -1641,7 +1828,9 @@ func (c *Client) readObjectRangeStrict(ctx context.Context, objectURL string, of
 
 // sliceBody skips offset bytes from rc, then returns a reader limited to
 // length bytes. The original rc is closed when the returned ReadCloser is closed.
-func (c *Client) sliceBody(rc io.ReadCloser, offset, length int64) (io.ReadCloser, error) {
+// sliceBodyWithHeader is sliceBody carrying the first-hop response headers
+// on the returned reader (the resource identity rides the same response).
+func (c *Client) sliceBodyWithHeader(rc io.ReadCloser, offset, length int64, h http.Header) (io.ReadCloser, error) {
 	if offset > 0 {
 		if _, err := io.CopyN(io.Discard, rc, offset); err != nil {
 			_ = rc.Close()
@@ -1652,7 +1841,7 @@ func (c *Client) sliceBody(rc io.ReadCloser, offset, length int64) (io.ReadClose
 			return nil, fmt.Errorf("skip to offset: %w", err)
 		}
 	}
-	return &limitedReadCloser{r: io.LimitReader(rc, length), c: rc}, nil
+	return &limitedReadCloser{r: io.LimitReader(rc, length), c: rc, h: h}, nil
 }
 
 // validatePartialContentRange checks that a first-hop 206 response carries a
@@ -1727,10 +1916,15 @@ func isDecimalDigits(s string) bool {
 type limitedReadCloser struct {
 	r io.Reader
 	c io.Closer
+	h http.Header
 }
 
 func (l *limitedReadCloser) Read(p []byte) (int, error) { return l.r.Read(p) }
 func (l *limitedReadCloser) Close() error               { return l.c.Close() }
+
+// Header exposes the first-hop response headers (including the resource
+// identity the server may echo on the read that supplied the bytes).
+func (l *limitedReadCloser) Header() http.Header { return l.h }
 
 // DownloadToFile downloads a remote file into a local path.
 func (c *Client) DownloadToFile(ctx context.Context, remotePath, localPath string, size int64) error {

@@ -147,19 +147,15 @@ type FS struct {
 	uid uint32
 	gid uint32
 
-	attrTTL     time.Duration
-	entryTTL    time.Duration
-	negEntryTTL time.Duration
-	epoch       *epochTable
+	attrTTL  time.Duration
+	entryTTL time.Duration
 	// ttlHinters clamp the kernel attr TTL for paths claimed by data planes
 	// with their own revalidation cadence (v1 extentAttrTimeoutFor).
 	ttlHinters []interface {
 		EntryTTLHint(path string) (time.Duration, bool)
 	}
-	// dirKeepCacheOff marks directories whose listings must not be cached
-	// across opens (v1: extent-attached dirs can gain jfs-side children the
-	// kernel's cached listing does not know).
-	dirKeepCacheOff []interface{ DirKeepCacheOff(path string) bool }
+	negEntryTTL time.Duration
+	epoch       *epochTable
 
 	localDirAttrs bool
 	// defaultPermissions mirrors the kernel mount option: when the kernel
@@ -304,9 +300,6 @@ func New(opts Options) (*FS, error) {
 			// revalidate at the JuiceFS ~1s rate) clamp the kernel TTLs.
 			f.ttlHinters = append(f.ttlHinters, th)
 		}
-		if dc, ok := h.(interface{ DirKeepCacheOff(path string) bool }); ok {
-			f.dirKeepCacheOff = append(f.dirKeepCacheOff, dc)
-		}
 		if rp, ok := h.(interface {
 			SetRemoteOpRecorder(func(name string, err error, dur time.Duration, bytes uint64))
 		}); ok {
@@ -324,8 +317,8 @@ func New(opts Options) (*FS, error) {
 	// v1 refreshes cached views after every mutation: directory listings
 	// for local namespace ops and data-plane commits, kernel entry drops
 	// only for removals and remote-origin changes. The facade subscribes
-	// once; every emitter (facade.mutated, writeback commits, bulkfile
-	// commits, the async queue, SSE) flows through here.
+	// once; every emitter (facade.mutated, writeback commits,
+	// the async queue, SSE) flows through here.
 	f.events.On(fs.EventWrite, f.onLocalMutation)
 	f.events.On(fs.EventLanded, f.onLocalMutation)
 	f.events.On(fs.EventDelete, f.onRemovedPath)
@@ -1321,8 +1314,7 @@ func (f *FS) fillAttr(a fs.Attr, ino uint64, out *gofuse.Attr) {
 	if entry != nil && entry.Rdev != 0 {
 		// A tracked Rdev overrides the reply (local mknod state); a zero
 		// entry value is simply "none recorded" and must not erase the
-		// stat's authoritative device number (extent device nodes
-		// answered 0:0 after their first lookup otherwise).
+		// stat's authoritative device number.
 		out.Rdev = entry.Rdev
 	}
 	nlink := a.Nlink
@@ -1641,7 +1633,7 @@ func (f *FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *gofus
 		f.inodes.SetIdentityWithKind(input.NodeId, res.Attr.ResourceID, res.Attr.Nlink, res.Attr.IsDir())
 	}
 	f.fillAttr(*res.Attr, input.NodeId, &out.Attr)
-	out.SetTimeout(f.attrTTLFor(path))
+	out.SetTimeout(f.attrTTL)
 	return gofuse.OK
 }
 
@@ -2154,6 +2146,13 @@ func (f *FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName stri
 	// (xattr subscribers), losing the attributes entirely.
 	f.mutatedRename(oldPath, newPath)
 	f.mutated(fs.EventDelete, oldPath)
+	// A rename that REPLACED a destination swaps the object behind the
+	// name: the read caches (whole-file and attribute tiers) still hold
+	// the replaced file's images under that path, so a post-close read
+	// would serve the old bytes instead of the new extent source (the
+	// rename suite's H2). EventInvalidated sweeps the path's tiers
+	// without bumping the namespace epoch.
+	f.mutated(fs.EventInvalidated, newPath)
 	// v1 notifyRenameTarget: invalidate ONLY the rename TARGET — the kernel
 	// moves the old name's dentry natively, and dropping it from userspace
 	// disturbs the bookkeeping for the next create of the same name in
@@ -2162,6 +2161,18 @@ func (f *FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName stri
 	// cached dentry (the EIO class).
 	if pino2, ok := f.inodes.GetInode(parentDirOf(newPath)); ok {
 		f.InvalidateEntry(pino2, pathpkg.Base(newPath))
+	}
+	// A rename that REPLACED a destination must also drop the destination
+	// inode's cached data: the kernel keeps the old name's pages and attrs
+	// under the still-live inode id, so a post-close read of the new name
+	// would serve the replaced file's bytes (H2: extent source renamed
+	// over an open classic destination).
+	if ino2, ok := f.inodes.GetInode(newPath); ok {
+		if e, eok := f.inodes.GetEntry(ino2); eok {
+			f.InvalidateContent(ino2, uint64(e.Size))
+		} else {
+			f.InvalidateContent(ino2, 0)
+		}
 	}
 	// v1 surgical rename bookkeeping, applied after the events so their
 	// invalidations don't wipe it: remove the old name and upsert the new
@@ -2880,7 +2891,7 @@ func (f *FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) gofuse.Status 
 	}
 	if h := f.openHandle(input.Fh); h != nil {
 		unlock := f.pathLocks.HandleLock(input.Fh)
-		// The kernel's lock owner rides the context: extent close-time
+		// The kernel's lock owner rides the context: close-time
 		// F_UNLCK must target exactly this owner (dup + close of one
 		// descriptor), not whoever opened the handle.
 		start := time.Now()
@@ -2962,8 +2973,7 @@ func lockPayloadOf(input *gofuse.LkIn) fs.FileLock {
 	}
 }
 
-// handleLockOps returns the open handle's foreign lock namespace, if any
-// (v1 routed extent handles to the JuiceFS VFS before the local table).
+// handleLockOps returns the open handle's foreign lock namespace, if any.
 func (f *FS) handleLockOps(fh uint64) fs.HandleLockOps {
 	if h, ok := f.handles.get(fh); ok && h.h != nil {
 		// Wrapper planes (the read cache) expose their terminal; probing
@@ -3103,23 +3113,12 @@ func (f *FS) OpenDir(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse.O
 		return gofuse.ENOENT
 	}
 	// v1 OpenDir is purely local: no getattr, and the kernel keeps its
-	// cached listing across opens (FOPEN_KEEP_CACHE) — except directories a
-	// foreign data plane mirrors (v1 extent dir handles): those can gain
-	// children the kernel's cached listing does not know, so they re-list.
-	keepCache := true
-	for _, dc := range f.dirKeepCacheOff {
-		if dc.DirKeepCacheOff(path) {
-			keepCache = false
-			break
-		}
-	}
+	// cached listing across opens (FOPEN_KEEP_CACHE).
 	dh := &dirHandle{path: path, ino: input.NodeId, attr: fs.Attr{Kind: fs.KindDir, Mode: 0o755}}
 	fh := f.nextFh.Add(1)
 	f.dirs.put(fh, dh)
 	out.Fh = fh
-	if keepCache {
-		out.OpenFlags = gofuse.FOPEN_KEEP_CACHE
-	}
+	out.OpenFlags = gofuse.FOPEN_KEEP_CACHE
 	f.recordFuseOp("opendir", gofuse.OK, 0, 0)
 	return gofuse.OK
 }
@@ -3144,12 +3143,10 @@ func (f *FS) loadDirEntries(cancel <-chan struct{}, input *gofuse.ReadIn, dh *di
 				entries = append(entries, fs.Entry{Name: ci.Name, Attr: fs.Attr{
 					Kind: kind, Mode: ci.Mode, Size: ci.Size, Mtime: ci.Mtime, Nlink: ci.Nlink,
 					// The row was written with the server identity; dropping
-					// it here split hardlinked aliases (ResourceID), cleared
-					// extent routing (ExtentIno) and published stale revs
-					// (Rev) on cached READDIRPLUS.
+					// it here split hardlinked aliases (ResourceID) and
+					// published stale revs (Rev) on cached READDIRPLUS.
 					Rev:        ci.Rev,
 					ResourceID: ci.ResourceID,
-					ExtentIno:  ci.ExtentIno,
 					Uid:        ci.Uid,
 					Gid:        ci.Gid,
 					HasOwner:   ci.HasUID || ci.HasGID,
@@ -3261,7 +3258,7 @@ func (f *FS) ReadDir(cancel <-chan struct{}, input *gofuse.ReadIn, out *gofuse.D
 			// first plain READDIR, or st_ino disagrees between aliases and
 			// the alias/kernel caches split.
 			e.Ino = f.inodes.EnsureInodeWithIdentity(childPathOf(dh.path, e.Name), e.Attr.ResourceID, e.Attr.Nlink, e.Attr.IsDir(), e.Attr.Size, e.Attr.Mtime)
-			f.syncExtentRouting(e.Ino, e)
+			f.syncEntrySize(e.Ino, e)
 		}
 		if !out.AddDirEntry(gofuse.DirEntry{Name: e.Name, Ino: e.Ino, Mode: modeBitsOf(e.Attr), Off: uint64(i + len(dots) + 1)}) {
 			break
@@ -3270,23 +3267,14 @@ func (f *FS) ReadDir(cancel <-chan struct{}, input *gofuse.ReadIn, out *gofuse.D
 	return gofuse.OK
 }
 
-// syncExtentRouting ports v1 cachedToDirEntries' extent rules: the listing
-// row is the only layout evidence readdir gets — a nonzero extent_ino
-// stamps the FUSE inode (shared across hardlink aliases), a zero one clears
-// stale routing (an id-less row cannot prove identity), and a live inode's
-// size wins over a listing that lags the open writer.
-func (f *FS) syncExtentRouting(ino uint64, e *fs.Entry) {
+// syncEntrySize ports v1 cachedToDirEntries' size rule: a listing that lags
+// the open writer must not publish i_size=0 (the kernel would return EOF
+// without a FUSE READ), so a live inode's known size wins over a zero row.
+func (f *FS) syncEntrySize(ino uint64, e *fs.Entry) {
 	if ino == 0 {
 		return
 	}
-	if e.Attr.ExtentIno != 0 {
-		f.inodes.SetExtentIno(ino, e.Attr.ExtentIno)
-	} else if entry, ok := f.inodes.GetEntry(ino); ok && entry.ExtentIno != 0 {
-		f.inodes.ClearExtentIno(ino)
-	}
 	if entry, ok := f.inodes.GetEntry(ino); ok && e.Attr.Size == 0 && entry.Size > 0 {
-		// v1 cachedToDirEntries: a listing that lags the open writer must
-		// not publish i_size=0 (kernel would EOF without a READ).
 		e.Attr.Size = entry.Size
 	}
 }
@@ -3356,12 +3344,12 @@ func (f *FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out *gofu
 		// identity-aware ensure keeps hardlink aliases on one inode.
 		if e.Ino == 0 {
 			e.Ino = f.inodes.EnsureInodeWithIdentity(childP, e.Attr.ResourceID, e.Attr.Nlink, e.Attr.IsDir(), e.Attr.Size, e.Attr.Mtime)
-			f.syncExtentRouting(e.Ino, e)
+			f.syncEntrySize(e.Ino, e)
 		} else if _, live := f.inodes.GetEntry(e.Ino); !live {
 			// The pinned mapping was forgotten mid-enumeration: re-resolve
 			// so this and later pages hand the kernel a live nodeid.
 			e.Ino = f.inodes.EnsureInodeWithIdentity(childP, e.Attr.ResourceID, e.Attr.Nlink, e.Attr.IsDir(), e.Attr.Size, e.Attr.Mtime)
-			f.syncExtentRouting(e.Ino, e)
+			f.syncEntrySize(e.Ino, e)
 		}
 		ino := e.Ino
 		eo := out.AddDirLookupEntry(gofuse.DirEntry{Name: e.Name, Ino: ino, Mode: modeBitsOf(e.Attr), Off: uint64(i + len(dots) + 1)})
@@ -3371,7 +3359,7 @@ func (f *FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out *gofu
 		f.inodes.IncrementLookup(ino)
 		eo.NodeId = ino
 		f.fillAttr(e.Attr, ino, &eo.Attr)
-		eo.SetAttrTimeout(f.attrTTLFor(childPathOf(dh.path, e.Name)))
+		eo.SetAttrTimeout(f.attrTTL)
 		eo.SetEntryTimeout(f.entryTTLFor(e.Name))
 	}
 	return gofuse.OK
@@ -3473,7 +3461,6 @@ func dirEntriesFrom(entries []fs.Entry) []fs.DirEntryInfo {
 			Mtime:      e.Attr.Mtime,
 			Rev:        e.Attr.Rev,
 			ResourceID: e.Attr.ResourceID,
-			ExtentIno:  e.Attr.ExtentIno,
 			// Listing rows are remote-observed, never this mount's own
 			// mutation.
 			LocalMutation: false,
@@ -3717,35 +3704,13 @@ func (f *FS) PerfSnapshotJSON() ([]byte, bool) {
 // HandleCount reports live file handles (queue stats probe).
 func (f *FS) HandleCount() int { return f.handles.len() }
 
-// InodeOf returns the FUSE inode currently owning path (test hook for the
-// extent-routing rows).
+// InodeOf returns the FUSE inode currently owning path.
 func (f *FS) InodeOf(path string) (uint64, bool) { return f.inodes.GetInode(path) }
-
-// ExtentRoutingOf returns the JuiceFS inode bound to path's FUSE inode.
-func (f *FS) ExtentRoutingOf(path string) (uint64, bool) {
-	ino, ok := f.inodes.GetInode(path)
-	if !ok {
-		return 0, false
-	}
-	entry, ok := f.inodes.GetEntry(ino)
-	if !ok || entry.ExtentIno == 0 {
-		return 0, false
-	}
-	return entry.ExtentIno, true
-}
-
-// InodeByExtentRouting resolves the FUSE inode owning a JuiceFS inode.
-func (f *FS) InodeByExtentRouting(extentIno uint64) (uint64, bool) {
-	return f.inodes.FindByExtentIno(extentIno)
-}
 
 // EnsureInodeForTest registers a live inode with a size (writer view).
 func (f *FS) EnsureInodeForTest(path string, isDir bool, size int64, mtime time.Time) uint64 {
 	return f.inodes.EnsureInode(path, isDir, size, mtime)
 }
-
-// SetExtentRoutingForTest binds a JuiceFS inode onto a FUSE inode.
-func (f *FS) SetExtentRoutingForTest(ino, extentIno uint64) { f.inodes.SetExtentIno(ino, extentIno) }
 
 // LiveInodeSizeForTest reports the live inode-table size of a path.
 func (f *FS) LiveInodeSizeForTest(path string) int64 {

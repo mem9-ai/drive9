@@ -41,7 +41,7 @@ type WriteBackSuccessFunc func(meta staging.WriteBackMeta, committedRev int64, g
 type StagingGens struct {
 	WriteBackGen       uint64
 	PendingIndexGen    uint64
-	ShadowGen          uint64
+	ShadowGen          staging.ContentGen
 	TerminalFailureSeq uint64
 }
 

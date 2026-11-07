@@ -1,6 +1,6 @@
 // v1 extent_policy rows that are facade-level in the new plane: the
 // non-owner chmod gate over the inode entry (kill-priv clear-setid
-// allowed, other modes EPERM) and the hardlink-extent routing exclusion.
+// allowed, other modes EPERM).
 package fuse
 
 import (

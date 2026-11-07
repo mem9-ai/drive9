@@ -301,50 +301,17 @@ func TestFsyncRacingUnlinkOfOpenFileStagesNothing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Park both sides on the same-path lock the unlink's cancel and the
-	// fsync's staging publication serialize on.
-	unlock := s.wb.pathLocks.lock(path)
-	syncErr := make(chan error, 1)
-	go func() { syncErr <- h.Sync(ctx) }()
-	marked := make(chan struct{})
-	markErr := make(chan error, 1)
-	go func() {
-		markErr <- s.wb.MarkPathUnlinked(path)
-		close(marked)
-	}()
-	// Wait for the unlink marking (it precedes the cancel's lock wait), so
-	// whichever goroutine wins the lock, the fsync's post-lock check sees it.
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		h.mu.Lock()
-		unlinked := h.unlinked
-		h.mu.Unlock()
-		if unlinked {
-			break
-		}
-		if time.Now().After(deadline) {
-			unlock()
-			t.Fatal("unlink marking never happened")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	unlock()
-
-	select {
-	case err := <-syncErr:
-		if err != nil {
-			t.Fatalf("racing fsync: %v", err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("racing fsync never returned")
-	}
-	select {
-	case <-marked:
-	case <-time.After(10 * time.Second):
-		t.Fatal("MarkPathUnlinked never returned")
-	}
-	if err := <-markErr; err != nil {
+	// The unlink's marking takes no path lock (a commit worker holds it
+	// across its upload); the race is closed by the staging side: the
+	// pre-enqueue guard, or — when the marking lands inside the
+	// check-to-enqueue window — the post-enqueue recheck that cancels the
+	// just-enqueued entry. Mark BEFORE the fsync runs: its guard must bar
+	// the staging outright.
+	if err := s.wb.MarkPathUnlinked(path); err != nil {
 		t.Fatalf("racing unlink marking: %v", err)
+	}
+	if err := h.Sync(ctx); err != nil {
+		t.Fatalf("racing fsync: %v", err)
 	}
 	if err := h.Release(ctx); err != nil {
 		t.Fatal(err)
@@ -548,5 +515,49 @@ func TestUnlinkMarkerAndCleanupFailureFailsUnlink(t *testing.T) {
 				t.Fatalf("lookup after the recovered fault = %+v, want a file", res.Attr)
 			}
 		})
+	}
+}
+
+// The inner check-to-enqueue window closes via the post-enqueue recheck,
+// whose cancel must run OUTSIDE the staging path lock: an in-lock
+// CancelPathPreserveLocal re-enters the same non-reentrant lock and
+// deadlocks both the fsync and the unlink. This parks the staging's
+// upload (queue path lock held across the network), marks in the window,
+// and requires both sides to complete.
+func TestFsyncMarkedDuringStagingWindowSelfCancelsWithoutDeadlock(t *testing.T) {
+	const path = "/window.txt"
+	s := newUnlinkWindowStack(t, path)
+	s.hold.Store(true)
+	ctx := context.Background()
+
+	h := open(t, s.ch, path).(*bufferingHandle)
+	if err := h.Write(ctx, 0, []byte("window")); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- h.Sync(ctx) }()
+	// The staging parks on the held upload with the queue's path lock
+	// held; the marking (which takes no lock) lands in the window.
+	time.Sleep(100 * time.Millisecond)
+	if err := s.wb.MarkPathUnlinked(path); err != nil {
+		t.Fatalf("window marking: %v", err)
+	}
+	s.hold.Store(false)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("windowed fsync: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("windowed fsync deadlocked on the staging path lock")
+	}
+	if err := h.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.wb.WaitCommitQueueIdle(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.backend.Node(path); ok {
+		t.Fatal("the windowed fsync published the unlinked name")
 	}
 }

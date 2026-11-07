@@ -8,7 +8,7 @@ func (idx *PendingIndex) SetShadowStore(shadows *ShadowStore) {
 
 // RecoverShadowSource selects the recovery payload for a pending entry;
 // exported bridge for the writeback extension's commit queue.
-func (idx *PendingIndex) RecoverShadowSource(path string, generation uint64, shadows *ShadowStore) uint64 {
+func (idx *PendingIndex) RecoverShadowSource(path string, generation uint64, shadows *ShadowStore) ContentGen {
 	return idx.recoverShadowSource(path, generation, shadows)
 }
 
@@ -25,7 +25,7 @@ func (idx *PendingIndex) setShadowStore(shadows *ShadowStore) {
 // recoverShadowSource selects a payload for startup recovery or the final
 // unmount drain. Ordinary reads never bind arbitrary disk bytes to previously
 // published metadata. The metadata CAS prevents binding a successor.
-func (idx *PendingIndex) recoverShadowSource(path string, metaGeneration uint64, shadows *ShadowStore) uint64 {
+func (idx *PendingIndex) recoverShadowSource(path string, metaGeneration uint64, shadows *ShadowStore) ContentGen {
 	if idx == nil || shadows == nil {
 		return 0
 	}

@@ -1041,11 +1041,7 @@ func (c *Core) statFromNamespaceCacheMode(path string, allowListing bool) (*fs.A
 		}
 		return &fs.Attr{Kind: itemKind, Mode: mode, Size: item.Size, Rev: item.Rev, Mtime: item.Mtime,
 			Nlink: item.Nlink, ResourceID: item.ResourceID,
-			// The extent plane routes by the ExtentIno a LOOKUP replies
-			// with; projecting the cached row without it sent an extent
-			// file's open to the ordinary HTTP data plane (422 there).
-			ExtentIno: item.ExtentIno,
-			Uid:       item.Uid, Gid: item.Gid,
+			Uid: item.Uid, Gid: item.Gid,
 			// Keep the two presence flags apart: a row written by a
 			// single-field chown carries the other field's preserve
 			// sentinel, which must never surface as an actual owner.
@@ -2048,5 +2044,5 @@ func attrOf(st *client.StatResult) *fs.Attr {
 			mode = 0o755
 		}
 	}
-	return &fs.Attr{Kind: kind, Mode: mode, Size: st.Size, Rev: st.Revision, Mtime: st.Mtime, Nlink: st.Nlink, ResourceID: st.ResourceID, ExtentIno: st.ExtentIno}
+	return &fs.Attr{Kind: kind, Mode: mode, Size: st.Size, Rev: st.Revision, Mtime: st.Mtime, Nlink: st.Nlink, ResourceID: st.ResourceID}
 }

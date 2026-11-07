@@ -364,10 +364,10 @@ func TestPortAckIgnoresMatchingNumberFromOtherTrack(t *testing.T) {
 	}
 }
 
-// A nonexclusive kernel CREATE can lose the negative-lookup race to another
-// client. The writeback tier must reconcile against the existing remote row
-// instead of returning a lazy PendingNew that the uploader can never land.
-func TestPortKernelCreateReconcilesExistingNonexclusive(t *testing.T) {
+// A nonexclusive kernel CREATE is asynchronous: the v1 path claims the
+// fresh name immediately and never pays a remote HEAD on open(2). A raced
+// existing row is reconciled by the uploader when the pending image lands.
+func TestPortKernelCreateAsyncDoesNotProbe(t *testing.T) {
 	b := testbackend.NewBackend()
 	b.Seed("/f", []byte("old"))
 	var heads atomic.Int32
@@ -406,11 +406,11 @@ func TestPortKernelCreateReconcilesExistingNonexclusive(t *testing.T) {
 	if !ok {
 		t.Fatalf("handle type = %T", res.Handle)
 	}
-	if h.isNew || h.baseRev != 1 {
-		t.Fatalf("reconciled create isNew=%v baseRev=%d, want false/1", h.isNew, h.baseRev)
+	if !h.isNew || h.baseRev != 0 {
+		t.Fatalf("async create isNew=%v baseRev=%d, want true/0", h.isNew, h.baseRev)
 	}
-	if got := heads.Load(); got != 1 {
-		t.Fatalf("nonexclusive create probe HEADs = %d, want 1", got)
+	if got := heads.Load(); got != 0 {
+		t.Fatalf("nonexclusive create probe HEADs = %d, want 0", got)
 	}
 }
 

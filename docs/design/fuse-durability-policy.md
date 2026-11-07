@@ -124,6 +124,46 @@ promoted to `WritePolicyWriteSync` regardless of the mount durability profile.
 This mirrors the operating-system model where per-descriptor sync behavior is
 chosen at open time.
 
+## Extent Plane
+
+The extent plane (`pkg/extensions/extent`) is deliberately outside this
+contract. Its bytes travel JuiceFS's own write path: the community
+`fileWriter` buffers, freezes slices and uploads through the chunk store, and
+the bridge publishes metadata when that writer commits. Duplicating that
+machinery to honour the profiles above would mean keeping a second copy of
+staged bytes on the side — a durable local barrier — which the plane no
+longer does.
+
+What the extent plane guarantees is exactly JuiceFS's **close-to-open**
+behavior:
+
+| Boundary | Extent plane |
+| --- | --- |
+| Write syscall | Buffered by the community writer. Nothing is promised about remote visibility. |
+| fsync syscall | Remote-durable before it returns: `FlushFile` publishes, and an empty file's name is materialized. |
+| Close syscall | Remote-durable: the final close publishes before returning. |
+| Reopen after close | Sees the closed bytes (close-to-open). |
+
+The mount's `--durability` profile does not change any of this: `auto`,
+`interactive`, `fsync`, `close-sync` and `write-sync` behave identically for
+paths served by the extent plane, and `TestExtentDurabilityIsCloseToOpenForEveryProfile`
+pins that. In particular `interactive` does not get a local fsync barrier
+here, and `write-sync` does not get a per-Write publish — both are classic
+plane features.
+
+Mounting with a non-default `--durability` while the extent plane is enabled
+therefore applies the profile only to the paths that are NOT served by extent.
+The mount logs a warning when that combination is requested, so the weaker
+promise on extent paths is never silent. See
+[Extent Cache](#extent-cache) for the one option that still applies.
+
+### Extent Cache
+
+`--extent-cache-size-mb` sizes JuiceFS's chunk cache and nothing else: the
+plane retains no staging tree of its own, so the operator's number has exactly
+one consumer and passes through verbatim (`0` keeps JuiceFS's memory-only
+mode).
+
 ## FUSE Placement
 
 go-fuse `Release` has no status return, so it cannot reliably report cloud

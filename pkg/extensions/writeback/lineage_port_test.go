@@ -209,7 +209,7 @@ func TestCommitQueueRebasesSupersededRewriteOntoLandedParent(t *testing.T) {
 	cq.DurableWatermark = func(string) int64 { return watermark.Load() }
 	cq.OnSuccess = func(_ *CommitEntry, rev int64) { watermark.Store(rev) }
 
-	stage := func(payload []byte, baseRev int64, snapshotID, parentSnapshotID string) (uint64, uint64) {
+	stage := func(payload []byte, baseRev int64, snapshotID, parentSnapshotID string) (staging.ContentGen, uint64) {
 		t.Helper()
 		if err := shadow.WriteFull(path, payload, baseRev); err != nil {
 			t.Fatal(err)
@@ -292,7 +292,7 @@ func TestCommitQueueRebasesLiveDescendantOntoWatermark(t *testing.T) {
 	cq.DurableWatermark = func(string) int64 { return watermark.Load() }
 	cq.OnSuccess = func(_ *CommitEntry, rev int64) { watermark.Store(rev) }
 
-	stage := func(payload []byte, baseRev int64) (uint64, uint64) {
+	stage := func(payload []byte, baseRev int64) (staging.ContentGen, uint64) {
 		t.Helper()
 		if err := shadow.WriteFull(path, payload, baseRev); err != nil {
 			t.Fatal(err)
@@ -368,7 +368,7 @@ func TestCommitQueueDivergentRewriteKeepsTerminalFence(t *testing.T) {
 	cq.DurableWatermark = func(string) int64 { return watermark.Load() }
 	cq.OnSuccess = func(_ *CommitEntry, rev int64) { watermark.Store(rev) }
 
-	stage := func(payload []byte, baseRev int64) (uint64, uint64) {
+	stage := func(payload []byte, baseRev int64) (staging.ContentGen, uint64) {
 		t.Helper()
 		if err := shadow.WriteFull(path, payload, baseRev); err != nil {
 			t.Fatal(err)
@@ -932,7 +932,7 @@ func TestCommitQueueDoesNotRebaseLargerStaleCheckpointOntoLandedMain(t *testing.
 	cq.DurableWatermark = func(string) int64 { return watermark.Load() }
 	cq.OnSuccess = func(_ *CommitEntry, rev int64) { watermark.Store(rev) }
 
-	stage := func(payload []byte, baseRev int64) (uint64, uint64) {
+	stage := func(payload []byte, baseRev int64) (staging.ContentGen, uint64) {
 		t.Helper()
 		if err := shadow.WriteFull(path, payload, baseRev); err != nil {
 			t.Fatal(err)
