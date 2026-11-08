@@ -11,6 +11,27 @@ import (
 	"testing"
 )
 
+// writeCheckpointRepo lays out a repository admin directory the way git validates
+// one (HEAD plus objects/ and refs/) with the given config body. The sanitizer only
+// rewrites config where git would read it, so fixtures must have that skeleton.
+func writeCheckpointRepo(t *testing.T, dir, config string) {
+	t.Helper()
+	for _, sub := range []string{"objects", "refs"} {
+		if err := os.MkdirAll(filepath.Join(dir, sub), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if config == "" {
+		return
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config"), []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // A checkpoint archive is tenant-writable but is restored as a live .git on the
 // mount host, so hooks and command-bearing config must not survive the restore.
 func TestSanitizeGitCheckpointDirStripsExecutionSurface(t *testing.T) {
@@ -624,63 +645,103 @@ func TestSanitizeGitCheckpointDirStripsSubmoduleConfig(t *testing.T) {
 	}
 }
 
-// A link inside the restored tree is neither followed nor needed: the archive's
-// link targets are validated to stay inside the extraction root, so the walk
-// reaches the target through its real path and sanitises it there.
-func TestSanitizeGitCheckpointDirDoesNotFollowLinks(t *testing.T) {
+// git resolves worktrees/<name> and modules/<name> by name, so a link there would
+// point git — and the sanitizer's rewrites — at a directory outside the restored
+// tree. Links are dropped rather than followed, and the target keeps its bytes.
+func TestSanitizeGitCheckpointDirDropsAdminDirLinks(t *testing.T) {
 	gitDir := t.TempDir()
+	writeCheckpointRepo(t, gitDir, "[core]\n\trepositoryformatversion = 0\n")
 	hostile := "[core]\n\tfsmonitor = /tmp/evil\n"
-	// A linked worktree admin directory reached through links only.
+	// A linked worktree admin directory and a linked submodule path component.
 	target := filepath.Join(gitDir, "real", "wt-1")
 	if err := os.MkdirAll(target, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(target, "config.worktree"), []byte(hostile), 0o600); err != nil {
+	victim := filepath.Join(target, "config.worktree")
+	if err := os.WriteFile(victim, []byte(hostile), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	// A linked namespace component under modules/ whose target holds a repo.
-	nested := filepath.Join(gitDir, "real", "libs", "foo")
-	if err := os.MkdirAll(filepath.Join(nested, "objects"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(filepath.Join(nested, "refs"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(nested, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(nested, "config"), []byte(hostile), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(filepath.Join(gitDir, "worktrees"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(filepath.Join(gitDir, "modules", "libs"), 0o755); err != nil {
-		t.Fatal(err)
+	for _, parent := range []string{filepath.Join(gitDir, "worktrees"), filepath.Join(gitDir, "modules", "libs")} {
+		if err := os.MkdirAll(parent, 0o755); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := os.Symlink(target, filepath.Join(gitDir, "worktrees", "wt-1")); err != nil {
 		t.Skipf("symlinks unavailable: %v", err)
 	}
-	if err := os.Symlink(filepath.Join("..", "..", "real", "libs", "foo"), filepath.Join(gitDir, "modules", "libs", "foo")); err != nil {
+	if err := os.Symlink(filepath.Join("..", "..", "real"), filepath.Join(gitDir, "modules", "libs", "foo")); err != nil {
 		t.Fatal(err)
 	}
 	if err := sanitizeGitCheckpointDir(gitDir); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Lstat(filepath.Join(gitDir, "worktrees", "wt-1")); err != nil {
-		t.Fatalf("linked worktree admin entry was removed: %v", err)
-	}
-	if _, err := os.Lstat(filepath.Join(gitDir, "modules", "libs", "foo")); err != nil {
-		t.Fatalf("linked submodule path component was removed: %v", err)
-	}
-	for _, path := range []string{filepath.Join(target, "config.worktree"), filepath.Join(nested, "config")} {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatalf("read %s: %v", path, err)
+	for _, link := range []string{
+		filepath.Join(gitDir, "worktrees", "wt-1"),
+		filepath.Join(gitDir, "modules", "libs", "foo"),
+	} {
+		if _, err := os.Lstat(link); !os.IsNotExist(err) {
+			t.Fatalf("admin directory link %s survived (err=%v)", link, err)
 		}
-		if strings.Contains(string(data), "fsmonitor") {
-			t.Fatalf("link target %s kept fsmonitor:\n%s", path, string(data))
+	}
+	if data, err := os.ReadFile(victim); err != nil || string(data) != hostile {
+		t.Fatalf("link target was rewritten: data=%q err=%v", string(data), err)
+	}
+}
+
+// A branch may be named "config". Its loose ref and reflog are not configuration,
+// and the restore must leave both exactly as they were.
+func TestSanitizeGitCheckpointDirPreservesBranchNamedConfig(t *testing.T) {
+	gitDir := t.TempDir()
+	writeCheckpointRepo(t, gitDir, "[core]\n\trepositoryformatversion = 0\n\tfsmonitor = /tmp/evil\n")
+	const oid = "0123456789abcdef0123456789abcdef01234567"
+	const reflog = "0000000000000000000000000000000000000000 " + oid + " A U Thor <a@example.com> 1 +0000\tcommit: x\n"
+	for path, body := range map[string]string{
+		filepath.Join(gitDir, "refs", "heads", "config"):         oid + "\n",
+		filepath.Join(gitDir, "logs", "refs", "heads", "config"): reflog,
+	} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
 		}
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := sanitizeGitCheckpointDir(gitDir); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(filepath.Join(gitDir, "refs", "heads", "config")); err != nil || string(data) != oid+"\n" {
+		t.Fatalf("branch named config was rewritten: data=%q err=%v", string(data), err)
+	}
+	if data, err := os.ReadFile(filepath.Join(gitDir, "logs", "refs", "heads", "config")); err != nil || string(data) != reflog {
+		t.Fatalf("reflog for the branch named config was rewritten: data=%q err=%v", string(data), err)
+	}
+	data, err := os.ReadFile(filepath.Join(gitDir, "config"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "fsmonitor") {
+		t.Fatalf("the repository config was not sanitized:\n%s", string(data))
+	}
+}
+
+// With a branch called config/topic, refs/heads/config is a directory. The walk must
+// not try to read it as a config file (EISDIR would abort the restore).
+func TestSanitizeGitCheckpointDirToleratesBranchDirectoryNamedConfig(t *testing.T) {
+	gitDir := t.TempDir()
+	writeCheckpointRepo(t, gitDir, "[core]\n\trepositoryformatversion = 0\n")
+	topic := filepath.Join(gitDir, "refs", "heads", "config", "topic")
+	if err := os.MkdirAll(filepath.Dir(topic), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const oid = "fedcba9876543210fedcba9876543210fedcba98\n"
+	if err := os.WriteFile(topic, []byte(oid), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := sanitizeGitCheckpointDir(gitDir); err != nil {
+		t.Fatalf("sanitize aborted on a branch directory named config: %v", err)
+	}
+	if data, err := os.ReadFile(topic); err != nil || string(data) != oid {
+		t.Fatalf("branch config/topic was rewritten: data=%q err=%v", string(data), err)
 	}
 }
 
@@ -824,13 +885,7 @@ func TestSanitizeGitCheckpointConfigDropsWorktreeConfigExtension(t *testing.T) {
 func TestSanitizeGitCheckpointDirStripsNestedSubmoduleName(t *testing.T) {
 	dir := t.TempDir()
 	moduleDir := filepath.Join(dir, "modules", "libs", "foo")
-	if err := os.MkdirAll(moduleDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	cfg := "[core]\n\trepositoryformatversion = 0\n\tfsmonitor = /tmp/evil\n"
-	if err := os.WriteFile(filepath.Join(moduleDir, "config"), []byte(cfg), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	writeCheckpointRepo(t, moduleDir, "[core]\n\trepositoryformatversion = 0\n\tfsmonitor = /tmp/evil\n")
 	if err := sanitizeGitCheckpointDir(dir); err != nil {
 		t.Fatal(err)
 	}
@@ -849,13 +904,7 @@ func TestSanitizeGitCheckpointDirStripsNestedSubmoduleName(t *testing.T) {
 func TestSanitizeGitCheckpointDirSanitizesDeepRepositoryNesting(t *testing.T) {
 	dir := t.TempDir()
 	deep := filepath.Join(dir, "modules", "a", "modules", "b", "modules", "c", "modules", "d", "modules", "e")
-	if err := os.MkdirAll(deep, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	cfg := "[core]\n\tpager = /tmp/evil-pager\n"
-	if err := os.WriteFile(filepath.Join(deep, "config"), []byte(cfg), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	writeCheckpointRepo(t, deep, "[core]\n\tpager = /tmp/evil-pager\n")
 	if err := sanitizeGitCheckpointDir(dir); err != nil {
 		t.Fatal(err)
 	}
@@ -875,17 +924,7 @@ func TestSanitizeGitCheckpointDirSanitizesDeepRepositoryNesting(t *testing.T) {
 func TestSanitizeGitCheckpointDirStripsInertNamedSubmodule(t *testing.T) {
 	dir := t.TempDir()
 	for _, name := range []string{"objects", "info", "refs"} {
-		moduleDir := filepath.Join(dir, "modules", name)
-		if err := os.MkdirAll(moduleDir, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(moduleDir, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		cfg := "[core]\n\trepositoryformatversion = 0\n\tfsmonitor = /tmp/evil\n"
-		if err := os.WriteFile(filepath.Join(moduleDir, "config"), []byte(cfg), 0o600); err != nil {
-			t.Fatal(err)
-		}
+		writeCheckpointRepo(t, filepath.Join(dir, "modules", name), "[core]\n\trepositoryformatversion = 0\n\tfsmonitor = /tmp/evil\n")
 	}
 	if err := sanitizeGitCheckpointDir(dir); err != nil {
 		t.Fatal(err)
