@@ -1164,3 +1164,129 @@ func TestSanitizeGitCheckpointDirPreservesBranchNamedWorktrees(t *testing.T) {
 		t.Fatalf("submodule config was not sanitized:\n%s", string(data))
 	}
 }
+
+// Git strips only the trailing line terminator from commondir, so a leading space is
+// part of the directory name. A sanitizer that trims it rewrites a different
+// directory than git reads.
+func TestSanitizeGitCheckpointDirResolvesCommondirLikeGit(t *testing.T) {
+	gitDir := t.TempDir()
+	sub := filepath.Join(gitDir, "modules", "dep")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A leading space is preserved by git, which resolves " shared" not "shared".
+	if err := os.WriteFile(filepath.Join(sub, "commondir"), []byte(" shared\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	shared := filepath.Join(sub, " shared")
+	for _, dir := range []string{filepath.Join(shared, "objects"), filepath.Join(shared, "refs"), filepath.Join(shared, "hooks")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(shared, "config"), []byte("[core]\n\tpager = /tmp/evil-pager\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(shared, "hooks", "post-checkout"), []byte("#!/bin/sh\ntrue\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := sanitizeGitCheckpointDir(gitDir); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(shared, "config"))
+	if err != nil {
+		t.Fatalf("space-prefixed common dir config: %v", err)
+	}
+	if strings.Contains(string(data), "pager") {
+		t.Fatalf("space-prefixed common dir kept pager:\n%s", string(data))
+	}
+	if _, err := os.Stat(filepath.Join(shared, "hooks", "post-checkout")); !os.IsNotExist(err) {
+		t.Fatalf("space-prefixed common dir kept its hook: %v", err)
+	}
+}
+
+// Git resolves commondir with realpath, so a symlink in the middle of the path makes
+// it read a directory the sanitizer would not pick if it resolved lexically.
+func TestSanitizeGitCheckpointDirResolvesCommondirThroughSymlinks(t *testing.T) {
+	gitDir := t.TempDir()
+	sub := filepath.Join(gitDir, "modules", "dep")
+	for _, dir := range []string{filepath.Join(sub, "objects", "real", "child"), filepath.Join(sub, "objects", "real", "shared"), filepath.Join(sub, "objects", "real", "shared", "hooks"), filepath.Join(sub, "refs")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(sub, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "commondir"), []byte("objects/link/../shared\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// objects/link is a symlink to objects/real/child, so git resolves
+	// objects/link/../shared to objects/real/shared. A lexical clean picks
+	// objects/shared instead.
+	if err := os.Symlink(filepath.Join("real", "child"), filepath.Join(sub, "objects", "link")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	// git resolves objects/link -> objects/real/child, so objects/link/../shared is
+	// objects/real/shared; a lexical clean would pick objects/shared instead.
+	real := filepath.Join(sub, "objects", "real", "shared")
+	if err := os.WriteFile(filepath.Join(real, "config"), []byte("[core]\n\tpager = /tmp/evil-pager\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(real, "hooks", "post-checkout"), []byte("#!/bin/sh\ntrue\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := sanitizeGitCheckpointDir(gitDir); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(real, "config"))
+	if err != nil {
+		t.Fatalf("realpath common dir config: %v", err)
+	}
+	if strings.Contains(string(data), "pager") {
+		t.Fatalf("realpath common dir kept pager:\n%s", string(data))
+	}
+	if _, err := os.Stat(filepath.Join(real, "hooks", "post-checkout")); !os.IsNotExist(err) {
+		t.Fatalf("realpath common dir kept its hook: %v", err)
+	}
+}
+
+// A namespace directory that carries repository markers must not hide a complete
+// submodule gitdir placed below one of its storage-shaped names: git rejects the
+// namespace's empty HEAD, so the child is the only repository there.
+func TestSanitizeGitCheckpointDirKeepsWalkingNamespaceStorageNames(t *testing.T) {
+	gitDir := t.TempDir()
+	ns := filepath.Join(gitDir, "modules", "ns")
+	for _, dir := range []string{filepath.Join(ns, "objects"), filepath.Join(ns, "refs")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(ns, "HEAD"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	child := filepath.Join(ns, "objects", "dep")
+	writeCheckpointRepo(t, child, "[core]\n\tfsmonitor = /tmp/evil\n")
+	if err := os.MkdirAll(filepath.Join(child, "hooks"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(child, "hooks", "post-checkout"), []byte("#!/bin/sh\ntrue\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := sanitizeGitCheckpointDir(gitDir); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(child, "config"))
+	if err != nil {
+		t.Fatalf("child gitdir below an objects directory was skipped: %v", err)
+	}
+	if strings.Contains(string(data), "fsmonitor") {
+		t.Fatalf("child gitdir below an objects directory kept fsmonitor:\n%s", string(data))
+	}
+	if _, err := os.Stat(filepath.Join(child, "hooks", "post-checkout")); !os.IsNotExist(err) {
+		t.Fatalf("child gitdir below an objects directory kept its hook: %v", err)
+	}
+}

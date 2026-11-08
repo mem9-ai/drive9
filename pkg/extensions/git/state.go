@@ -1243,33 +1243,6 @@ func splitGitConfigKeyValue(line string) (string, string) {
 	return strings.ToLower(strings.TrimSpace(key)), value
 }
 
-// gitCheckpointRepoStorageDirs are the directories a repository keeps for its own
-// object, ref and bookkeeping state. They are skipped while descending through a
-// directory that has been validated as a repository: a submodule path cannot sit
-// inside one (git places <name>'s admin directory at modules/<name>, which would
-// collide with the repository's own storage), and the repository's config — the
-// only thing that could register such a submodule — is sanitized first.
-var gitCheckpointRepoStorageDirs = map[string]bool{
-	"hooks":        true,
-	"objects":      true,
-	"refs":         true,
-	"reftable":     true,
-	"logs":         true,
-	"worktrees":    true,
-	"modules":      true,
-	"info":         true,
-	"lfs":          true,
-	"rr-cache":     true,
-	"svn":          true,
-	"filter-repo":  true,
-	"rebase-apply": true,
-	"rebase-merge": true,
-	"sequencer":    true,
-	"branches":     true,
-	"remotes":      true,
-	"lost-found":   true,
-}
-
 // gitCheckpointSanitizer walks the restored .git tree once and sanitises every
 // directory git reads configuration or hooks from.
 type gitCheckpointSanitizer struct {
@@ -1305,10 +1278,9 @@ func sanitizeGitCheckpointDir(gitDir string) error {
 // entry, and none of them is configuration.
 func (w *gitCheckpointSanitizer) repoDir(dir string) error {
 	dir = filepath.Clean(dir)
-	if _, ok := w.seen[dir]; ok {
+	if w.markVisited(dir) {
 		return nil
 	}
-	w.seen[dir] = struct{}{}
 	if err := sanitizeGitCheckpointRepoFiles(dir); err != nil {
 		return err
 	}
@@ -1348,20 +1320,28 @@ func (w *gitCheckpointSanitizer) repoDir(dir string) error {
 // be the next component of a submodule name, and a checkpoint that names a submodule
 // after git's own directories must not be able to hide it from the walk.
 func (w *gitCheckpointSanitizer) submodulePath(dir string) error {
-	repo := isGitCheckpointRepoDir(dir)
-	if repo {
-		if err := w.repoDir(dir); err != nil {
+	dir = filepath.Clean(dir)
+	if w.markVisited(dir) {
+		return nil
+	}
+	if isGitCheckpointRepoDir(dir) {
+		if err := sanitizeGitCheckpointRepoFiles(dir); err != nil {
+			return err
+		}
+		if err := w.commonDir(dir); err != nil {
 			return err
 		}
 	}
+	// Every child is kept, whatever it is called. Inside a repository below
+	// modules/ an entry named refs/ or objects/ looks like that repository's own
+	// storage, but git places a submodule "ns/objects/dep" at exactly
+	// modules/ns/objects/dep, and a checkpoint that names a submodule after git's
+	// own directories must not be able to hide it from the walk.
 	children, err := checkpointAdminDirs(dir)
 	if err != nil {
 		return err
 	}
 	for _, child := range children {
-		if repo && gitCheckpointRepoStorageDirs[filepath.Base(child)] {
-			continue
-		}
 		if err := w.submodulePath(child); err != nil {
 			return err
 		}
@@ -1369,9 +1349,24 @@ func (w *gitCheckpointSanitizer) submodulePath(dir string) error {
 	return nil
 }
 
+// markVisited records that dir has been sanitised, so a commondir pointer that
+// leads back into the tree cannot walk a directory twice or cycle forever.
+func (w *gitCheckpointSanitizer) markVisited(dir string) bool {
+	if _, ok := w.seen[dir]; ok {
+		return true
+	}
+	w.seen[dir] = struct{}{}
+	return false
+}
+
 // commonDir sanitises the directory a worktree's commondir pointer names. Git reads
-// the shared config and default hooks from there, so a checkpoint could keep them
-// out of the walk by putting them in a sibling directory that has no HEAD of its own.
+// the shared config and default hooks from there, so a checkpoint could keep them out
+// of the walk by putting them in a directory that has no HEAD of its own.
+//
+// The pointer has to be resolved the way git resolves it, or the sanitizer rewrites a
+// different directory than git reads: git strips only the trailing line terminator
+// (a leading space is part of the name) and resolves the result with realpath, so
+// symlinks inside the path are followed. Both disagreements were live bypasses.
 func (w *gitCheckpointSanitizer) commonDir(dir string) error {
 	raw, err := os.ReadFile(filepath.Join(dir, "commondir"))
 	if err != nil {
@@ -1380,10 +1375,10 @@ func (w *gitCheckpointSanitizer) commonDir(dir string) error {
 		}
 		return fmt.Errorf("read checkpoint commondir: %w", err)
 	}
-	target, ok := w.insideTree(dir, string(raw))
+	target, ok := w.resolveCommonDir(dir, string(raw))
 	if !ok {
-		// An absolute pointer, or one that climbs above the restored tree, would
-		// make git read an arbitrary host directory's config and run its hooks.
+		// A pointer that is absolute, climbs above the restored tree, or does not
+		// resolve would make git read a directory the sanitizer cannot vouch for.
 		// The restore writes the canonical relative pointer for a linked worktree,
 		// so the file is dropped instead of trusted.
 		if err := os.Remove(filepath.Join(dir, "commondir")); err != nil && !os.IsNotExist(err) {
@@ -1391,24 +1386,33 @@ func (w *gitCheckpointSanitizer) commonDir(dir string) error {
 		}
 		return nil
 	}
-	if target == "" {
-		return nil
-	}
 	return w.repoDir(target)
 }
 
-// insideTree resolves a commondir value against dir, reporting whether it stays
-// inside the extracted tree.
-func (w *gitCheckpointSanitizer) insideTree(dir, value string) (string, bool) {
-	value = strings.TrimSpace(value)
+// resolveCommonDir reproduces git's commondir resolution: strip the trailing CR/LF
+// only, join with the gitdir, then resolve the real path (symlinks included) and
+// require it to stay inside the extracted tree.
+func (w *gitCheckpointSanitizer) resolveCommonDir(dir, value string) (string, bool) {
+	value = strings.TrimRight(value, "\r\n")
 	if value == "" {
-		return "", true
-	}
-	if filepath.IsAbs(value) {
 		return "", false
 	}
-	resolved := filepath.Clean(filepath.Join(dir, filepath.FromSlash(value)))
-	if resolved == w.root || strings.HasPrefix(resolved, w.root+string(filepath.Separator)) {
+	path := filepath.FromSlash(value)
+	if !filepath.IsAbs(path) {
+		// Concatenate rather than filepath.Join: Join cleans the path lexically, so
+		// "objects/link/../shared" would become "objects/shared" before the symlink
+		// in it is ever resolved, which is exactly the disagreement with git.
+		path = dir + string(filepath.Separator) + path
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", false
+	}
+	root, err := filepath.EvalSymlinks(w.root)
+	if err != nil {
+		root = w.root
+	}
+	if resolved == root || strings.HasPrefix(resolved, root+string(filepath.Separator)) {
 		return resolved, true
 	}
 	return "", false
