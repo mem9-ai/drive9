@@ -1014,3 +1014,153 @@ func TestSanitizeGitCheckpointDirVisitsDeepChainOnce(t *testing.T) {
 		t.Fatalf("deepest config kept executable keys:\n%s", string(data))
 	}
 }
+
+// A worktree's commondir names the directory git reads the shared config and default
+// hooks from. A checkpoint can put them in a sibling directory that has no HEAD of
+// its own, where the repository predicate does not apply, so the pointer is followed
+// and that directory is sanitized too.
+func TestSanitizeGitCheckpointDirSanitizesCommonDir(t *testing.T) {
+	gitDir := t.TempDir()
+	sub := filepath.Join(gitDir, "modules", "dep")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "commondir"), []byte("shared\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	shared := filepath.Join(sub, "shared")
+	for _, dir := range []string{filepath.Join(shared, "objects"), filepath.Join(shared, "refs"), filepath.Join(shared, "hooks")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(shared, "config"), []byte("[core]\n\tpager = /tmp/evil-pager\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(shared, "hooks", "post-checkout"), []byte("#!/bin/sh\ntrue\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := sanitizeGitCheckpointDir(gitDir); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(shared, "config"))
+	if err != nil {
+		t.Fatalf("common dir config: %v", err)
+	}
+	if strings.Contains(string(data), "pager") {
+		t.Fatalf("common dir config kept pager:\n%s", string(data))
+	}
+	if _, err := os.Stat(filepath.Join(shared, "hooks", "post-checkout")); !os.IsNotExist(err) {
+		t.Fatalf("common dir hooks survived: %v", err)
+	}
+}
+
+// A commondir that leaves the restored tree would point git at an arbitrary host
+// directory, so it is dropped: the restore writes the canonical relative pointer for
+// a linked worktree afterwards.
+func TestSanitizeGitCheckpointDirDropsCommondirOutsideTree(t *testing.T) {
+	outside := t.TempDir()
+	victim := filepath.Join(outside, "config")
+	const hostile = "[core]\n\tpager = /tmp/evil-pager\n"
+	if err := os.WriteFile(victim, []byte(hostile), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range []string{victim, "../../../../../../tmp"} {
+		gitDir := t.TempDir()
+		writeCheckpointRepo(t, gitDir, "[core]\n\trepositoryformatversion = 0\n")
+		if err := os.WriteFile(filepath.Join(gitDir, "commondir"), []byte(value+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := sanitizeGitCheckpointDir(gitDir); err != nil {
+			t.Fatalf("commondir %q: %v", value, err)
+		}
+		if _, err := os.Lstat(filepath.Join(gitDir, "commondir")); !os.IsNotExist(err) {
+			t.Fatalf("commondir %q survived (err=%v)", value, err)
+		}
+	}
+	if data, err := os.ReadFile(victim); err != nil || string(data) != hostile {
+		t.Fatalf("a directory outside the tree was rewritten: data=%q err=%v", string(data), err)
+	}
+}
+
+// Git accepts a repository whose refs entry is an executable regular file and then
+// reads its config, so the repository predicate must not require a refs directory.
+func TestSanitizeGitCheckpointDirSanitizesExecutableRefsFileRepo(t *testing.T) {
+	gitDir := t.TempDir()
+	sub := filepath.Join(gitDir, "modules", "dep")
+	for _, dir := range []string{filepath.Join(sub, "objects"), filepath.Join(sub, "hooks")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(sub, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	refs := filepath.Join(sub, "refs")
+	if err := os.WriteFile(refs, nil, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(refs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "config"), []byte("[core]\n\tpager = /tmp/evil-pager\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "hooks", "post-checkout"), []byte("#!/bin/sh\ntrue\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := sanitizeGitCheckpointDir(gitDir); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(sub, "config"))
+	if err != nil {
+		t.Fatalf("repository with an executable refs file was skipped: %v", err)
+	}
+	if strings.Contains(string(data), "pager") {
+		t.Fatalf("repository with an executable refs file kept pager:\n%s", string(data))
+	}
+	if _, err := os.Stat(filepath.Join(sub, "hooks", "post-checkout")); !os.IsNotExist(err) {
+		t.Fatalf("repository with an executable refs file kept its hook: %v", err)
+	}
+}
+
+// A submodule branch may be named "worktrees/team/hooks": its loose ref and reflog
+// live below refs/ and logs/, and neither is an admin directory.
+func TestSanitizeGitCheckpointDirPreservesBranchNamedWorktrees(t *testing.T) {
+	gitDir := t.TempDir()
+	writeCheckpointRepo(t, gitDir, "[core]\n\trepositoryformatversion = 0\n")
+	sub := filepath.Join(gitDir, "modules", "dep")
+	writeCheckpointRepo(t, sub, "[core]\n\trepositoryformatversion = 0\n\tfsmonitor = /tmp/evil\n")
+	const oid = "0123456789abcdef0123456789abcdef01234567"
+	const reflog = "0000000000000000000000000000000000000000 " + oid + " A U Thor <a@example.com> 1 +0000\tcommit: x\n"
+	for path, body := range map[string]string{
+		filepath.Join(sub, "refs", "heads", "worktrees", "team", "hooks"):         oid + "\n",
+		filepath.Join(sub, "logs", "refs", "heads", "worktrees", "team", "hooks"): reflog,
+	} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := sanitizeGitCheckpointDir(gitDir); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(filepath.Join(sub, "refs", "heads", "worktrees", "team", "hooks")); err != nil || string(data) != oid+"\n" {
+		t.Fatalf("branch ref was rewritten: data=%q err=%v", string(data), err)
+	}
+	if data, err := os.ReadFile(filepath.Join(sub, "logs", "refs", "heads", "worktrees", "team", "hooks")); err != nil || string(data) != reflog {
+		t.Fatalf("branch reflog was rewritten: data=%q err=%v", string(data), err)
+	}
+	data, err := os.ReadFile(filepath.Join(sub, "config"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "fsmonitor") {
+		t.Fatalf("submodule config was not sanitized:\n%s", string(data))
+	}
+}

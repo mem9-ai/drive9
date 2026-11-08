@@ -1243,6 +1243,44 @@ func splitGitConfigKeyValue(line string) (string, string) {
 	return strings.ToLower(strings.TrimSpace(key)), value
 }
 
+// gitCheckpointRepoStorageDirs are the directories a repository keeps for its own
+// object, ref and bookkeeping state. They are skipped while descending through a
+// directory that has been validated as a repository: a submodule path cannot sit
+// inside one (git places <name>'s admin directory at modules/<name>, which would
+// collide with the repository's own storage), and the repository's config — the
+// only thing that could register such a submodule — is sanitized first.
+var gitCheckpointRepoStorageDirs = map[string]bool{
+	"hooks":        true,
+	"objects":      true,
+	"refs":         true,
+	"reftable":     true,
+	"logs":         true,
+	"worktrees":    true,
+	"modules":      true,
+	"info":         true,
+	"lfs":          true,
+	"rr-cache":     true,
+	"svn":          true,
+	"filter-repo":  true,
+	"rebase-apply": true,
+	"rebase-merge": true,
+	"sequencer":    true,
+	"branches":     true,
+	"remotes":      true,
+	"lost-found":   true,
+}
+
+// gitCheckpointSanitizer walks the restored .git tree once and sanitises every
+// directory git reads configuration or hooks from.
+type gitCheckpointSanitizer struct {
+	// root is the extracted tree. A commondir pointer that resolves outside it is
+	// dropped rather than followed.
+	root string
+	// seen keeps the walk linear when a worktree's commondir points back into a
+	// directory that was already sanitised.
+	seen map[string]struct{}
+}
+
 // sanitizeGitCheckpointDir removes the executable surface of a restored .git
 // directory: the hooks of every repository it holds and every config key or
 // section that can make git run a program. It is applied to the freshly extracted
@@ -1251,21 +1289,32 @@ func sanitizeGitCheckpointDir(gitDir string) error {
 	if gitDir == "" {
 		return nil
 	}
-	return sanitizeGitCheckpointRepoDir(gitDir)
+	w := &gitCheckpointSanitizer{root: filepath.Clean(gitDir), seen: map[string]struct{}{}}
+	return w.repoDir(gitDir)
 }
 
-// sanitizeGitCheckpointRepoDir sanitises one repository admin directory: the
-// config files git reads from it, its hooks, the admin directory of each linked
-// worktree, and every submodule repository below it.
+// repoDir sanitises one repository admin directory: the config files git reads
+// from it, its hooks, the common directory its commondir names, the admin
+// directory of each linked worktree and every submodule repository below it.
 //
-// It is only ever called for a directory that is — or, for the restore root, is
-// about to become — a repository admin directory, which is why it can rewrite
-// "config" unconditionally. Rewriting every file named config in the whole tree is
-// not equivalent: refs/heads/config is a loose ref, refs/heads/config/topic is a
-// directory, and logs/…/config is a reflog entry, and none of them is
-// configuration.
-func sanitizeGitCheckpointRepoDir(dir string) error {
+// It is only called for a directory that is an admin directory — by position for
+// the restore root and for worktrees/<name>, by isGitCheckpointRepoDir below
+// modules/ — which is why it can rewrite "config" unconditionally. Rewriting every
+// file named config in the tree would not be equivalent: refs/heads/config is a
+// loose ref, refs/heads/config/topic is a directory, and logs/…/config is a reflog
+// entry, and none of them is configuration.
+func (w *gitCheckpointSanitizer) repoDir(dir string) error {
+	dir = filepath.Clean(dir)
+	if _, ok := w.seen[dir]; ok {
+		return nil
+	}
+	w.seen[dir] = struct{}{}
 	if err := sanitizeGitCheckpointRepoFiles(dir); err != nil {
+		return err
+	}
+	// A linked worktree resolves its shared config and default hooks through the
+	// directory its commondir names, which is not necessarily this one.
+	if err := w.commonDir(dir); err != nil {
 		return err
 	}
 	worktrees, err := checkpointAdminDirs(filepath.Join(dir, "worktrees"))
@@ -1273,7 +1322,7 @@ func sanitizeGitCheckpointRepoDir(dir string) error {
 		return err
 	}
 	for _, worktree := range worktrees {
-		if err := sanitizeGitCheckpointRepoDir(worktree); err != nil {
+		if err := w.repoDir(worktree); err != nil {
 			return err
 		}
 	}
@@ -1282,33 +1331,26 @@ func sanitizeGitCheckpointRepoDir(dir string) error {
 		return err
 	}
 	for _, module := range modules {
-		if err := sanitizeGitCheckpointSubmodulePath(module); err != nil {
+		if err := w.submodulePath(module); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// sanitizeGitCheckpointSubmodulePath sanitises one directory below a modules/
-// registry. A submodule's admin path is <registry>/<name>, and <name> is its path
-// in the superproject, so a directory here can be a repository admin directory, a
-// path component of a deeper name, or both (submodules "libs" and "libs/foo" can
-// coexist).
+// submodulePath sanitises one directory below a modules/ registry. A submodule's
+// admin path is <registry>/<name>, and <name> is its path in the superproject, so a
+// directory here can be a repository admin directory, a path component of a deeper
+// name, or both (submodules "libs" and "libs/foo" can coexist).
 //
-// Every child is walked, whatever it is called. Inside a repository below
-// modules/ an entry named refs/ or objects/ looks like that repository's storage,
-// but it can equally be the next component of a submodule name, and a checkpoint
-// that names a submodule after git's own directories must not be able to hide it
-// from the walk. What the walk rewrites is decided by isGitCheckpointRepoDir, not
-// by the name of the directory it happens to be looking at.
-func sanitizeGitCheckpointSubmodulePath(dir string) error {
-	// Each directory is visited once: what gets rewritten here is decided by this
-	// directory's own layout, and the recursion only descends. Sanitising the
-	// registries of a directory that was just sanitised would visit the subtree
-	// below it a second time, and a chain of nested submodules would multiply that
-	// per level.
-	if isGitCheckpointRepoDir(dir) || isGitCheckpointWorktreeAdminDir(dir) {
-		if err := sanitizeGitCheckpointRepoFiles(dir); err != nil {
+// A directory that is not a repository keeps every child: inside a repository below
+// modules/ an entry named refs/ or objects/ looks like storage, but it can equally
+// be the next component of a submodule name, and a checkpoint that names a submodule
+// after git's own directories must not be able to hide it from the walk.
+func (w *gitCheckpointSanitizer) submodulePath(dir string) error {
+	repo := isGitCheckpointRepoDir(dir)
+	if repo {
+		if err := w.repoDir(dir); err != nil {
 			return err
 		}
 	}
@@ -1317,9 +1359,75 @@ func sanitizeGitCheckpointSubmodulePath(dir string) error {
 		return err
 	}
 	for _, child := range children {
-		if err := sanitizeGitCheckpointSubmodulePath(child); err != nil {
+		if repo && gitCheckpointRepoStorageDirs[filepath.Base(child)] {
+			continue
+		}
+		if err := w.submodulePath(child); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// commonDir sanitises the directory a worktree's commondir pointer names. Git reads
+// the shared config and default hooks from there, so a checkpoint could keep them
+// out of the walk by putting them in a sibling directory that has no HEAD of its own.
+func (w *gitCheckpointSanitizer) commonDir(dir string) error {
+	raw, err := os.ReadFile(filepath.Join(dir, "commondir"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read checkpoint commondir: %w", err)
+	}
+	target, ok := w.insideTree(dir, string(raw))
+	if !ok {
+		// An absolute pointer, or one that climbs above the restored tree, would
+		// make git read an arbitrary host directory's config and run its hooks.
+		// The restore writes the canonical relative pointer for a linked worktree,
+		// so the file is dropped instead of trusted.
+		if err := os.Remove(filepath.Join(dir, "commondir")); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove checkpoint commondir: %w", err)
+		}
+		return nil
+	}
+	if target == "" {
+		return nil
+	}
+	return w.repoDir(target)
+}
+
+// insideTree resolves a commondir value against dir, reporting whether it stays
+// inside the extracted tree.
+func (w *gitCheckpointSanitizer) insideTree(dir, value string) (string, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", true
+	}
+	if filepath.IsAbs(value) {
+		return "", false
+	}
+	resolved := filepath.Clean(filepath.Join(dir, filepath.FromSlash(value)))
+	if resolved == w.root || strings.HasPrefix(resolved, w.root+string(filepath.Separator)) {
+		return resolved, true
+	}
+	return "", false
+}
+
+// sanitizeGitCheckpointRepoFiles rewrites the config files of one repository admin
+// directory and removes its hooks.
+func sanitizeGitCheckpointRepoFiles(dir string) error {
+	// extensions.worktreeConfig moves core.* keys into config.worktree, so a
+	// checkpoint could hide a fsmonitor/pager there instead of in config.
+	for _, name := range [...]string{"config", "config.worktree"} {
+		if err := sanitizeGitCheckpointConfig(filepath.Join(dir, name)); err != nil {
+			return err
+		}
+	}
+	// Hooks are executable programs git runs from this repository. Nothing in a
+	// checkpoint needs them.
+	if err := os.RemoveAll(filepath.Join(dir, "hooks")); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove checkpoint hooks: %w", err)
 	}
 	return nil
 }
@@ -1362,30 +1470,14 @@ func checkpointAdminDirs(dir string) ([]string, error) {
 	return out, nil
 }
 
-// sanitizeGitCheckpointRepoFiles rewrites the config files of one repository admin
-// directory and removes its hooks.
-func sanitizeGitCheckpointRepoFiles(dir string) error {
-	// extensions.worktreeConfig moves core.* keys into config.worktree, so a
-	// checkpoint could hide a fsmonitor/pager there instead of in config.
-	for _, name := range [...]string{"config", "config.worktree"} {
-		if err := sanitizeGitCheckpointConfig(filepath.Join(dir, name)); err != nil {
-			return err
-		}
-	}
-	// Hooks are executable programs git runs from this repository. Nothing in a
-	// checkpoint needs them.
-	if err := os.RemoveAll(filepath.Join(dir, "hooks")); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("remove checkpoint hooks: %w", err)
-	}
-	return nil
-}
-
-// isGitCheckpointRepoDir reports whether dir is laid out the way git validates a
-// repository before reading anything from it: a HEAD file plus objects/ and a
-// refs/ (or reftable/) directory, or a commondir file for a linked worktree. Git
-// refuses a directory that fails this test, so no configuration or hook below it
-// can be read; adding the markers to a checkpoint only makes the walk sanitise
-// more, never less.
+// isGitCheckpointRepoDir reports whether dir is laid out the way git accepts a
+// repository before reading anything from it: a HEAD file, an objects entry and a
+// refs (or reftable) entry — git validates the last two with access(X_OK), so they
+// may be regular files as well as directories (an executable refs file is accepted
+// by git 2.50.1, which then reads the repository's config), or a commondir file for
+// a linked worktree. Existence is a superset of git's check, and sanitising more
+// than git accepts is safe; a directory that fails this test is not one git reads
+// configuration or hooks from.
 func isGitCheckpointRepoDir(dir string) bool {
 	head, err := os.Stat(filepath.Join(dir, "HEAD"))
 	if err != nil || !head.Mode().IsRegular() {
@@ -1394,24 +1486,15 @@ func isGitCheckpointRepoDir(dir string) bool {
 	if info, err := os.Stat(filepath.Join(dir, "commondir")); err == nil && info.Mode().IsRegular() {
 		return true
 	}
-	objects, err := os.Stat(filepath.Join(dir, "objects"))
-	if err != nil || !objects.IsDir() {
+	if _, err := os.Stat(filepath.Join(dir, "objects")); err != nil {
 		return false
 	}
 	for _, name := range [...]string{"refs", "reftable"} {
-		if info, err := os.Stat(filepath.Join(dir, name)); err == nil && info.IsDir() {
+		if _, err := os.Stat(filepath.Join(dir, name)); err == nil {
 			return true
 		}
 	}
 	return false
-}
-
-// isGitCheckpointWorktreeAdminDir reports whether dir is a linked worktree's admin
-// directory by position (…/worktrees/<name>). Git reads config.worktree from it, and
-// a checkpoint may ship it before the commondir pointer the restore repairs, so the
-// position is what makes it one.
-func isGitCheckpointWorktreeAdminDir(dir string) bool {
-	return filepath.Base(filepath.Dir(dir)) == "worktrees"
 }
 
 // sanitizeGitCheckpointConfig rewrites a git config file keeping only the
