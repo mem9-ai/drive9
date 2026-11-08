@@ -1308,6 +1308,11 @@ func sanitizeGitCheckpointTree(dir string) error {
 	if err != nil {
 		return fmt.Errorf("read checkpoint git directory: %w", err)
 	}
+	// The inert names only mean "git's own storage" inside a repository admin
+	// directory. A submodule can itself be named objects/ or info/ (its admin
+	// path is modules/<name>), and that directory is a repository whose config
+	// still has to be sanitized, so the skip is conditional on what dir is.
+	skipInert := isGitCheckpointRepoDir(dir)
 	for _, entry := range entries {
 		name := entry.Name()
 		entryPath := filepath.Join(dir, name)
@@ -1332,7 +1337,7 @@ func sanitizeGitCheckpointTree(dir string) error {
 			}
 			continue
 		}
-		if !info.IsDir() || gitCheckpointInertDirs[name] {
+		if !info.IsDir() || (skipInert && gitCheckpointInertDirs[name]) {
 			continue
 		}
 		if err := sanitizeGitCheckpointTree(entryPath); err != nil {
@@ -1340,6 +1345,17 @@ func sanitizeGitCheckpointTree(dir string) error {
 		}
 	}
 	return nil
+}
+
+// isGitCheckpointRepoDir reports whether dir looks like a repository's admin
+// directory rather than a path component of a submodule name.
+func isGitCheckpointRepoDir(dir string) bool {
+	for _, marker := range [...]string{"HEAD", "config", "commondir"} {
+		if info, err := os.Lstat(filepath.Join(dir, marker)); err == nil && !info.IsDir() {
+			return true
+		}
+	}
+	return false
 }
 
 // sanitizeGitCheckpointConfig rewrites a git config file keeping only the

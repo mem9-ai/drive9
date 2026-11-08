@@ -790,3 +790,58 @@ func TestSanitizeGitCheckpointDirDropsSymlinkedSubmodulePathComponent(t *testing
 		t.Fatalf("symlinked submodule path component survived (err=%v)", err)
 	}
 }
+
+// A submodule may carry one of git's own directory names ("objects", "info",
+// "refs"). Its admin directory is then modules/<that name> and is a repository
+// whose config must be sanitized, so the inert-name skip only applies inside a
+// repository's own directory.
+func TestSanitizeGitCheckpointDirStripsInertNamedSubmodule(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"objects", "info", "refs"} {
+		moduleDir := filepath.Join(dir, "modules", name)
+		if err := os.MkdirAll(moduleDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(moduleDir, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		cfg := "[core]\n\trepositoryformatversion = 0\n\tfsmonitor = /tmp/evil\n"
+		if err := os.WriteFile(filepath.Join(moduleDir, "config"), []byte(cfg), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := sanitizeGitCheckpointDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"objects", "info", "refs"} {
+		data, err := os.ReadFile(filepath.Join(dir, "modules", name, "config"))
+		if err != nil {
+			t.Fatalf("read modules/%s/config: %v", name, err)
+		}
+		if strings.Contains(string(data), "fsmonitor") {
+			t.Fatalf("submodule named %q kept fsmonitor:\n%s", name, string(data))
+		}
+	}
+}
+
+// The inert skip still applies inside a repository: its own objects/ tree is not
+// walked (and must not be emptied), while a repository nested under modules/ is.
+func TestSanitizeGitCheckpointDirKeepsRepoObjectsIntact(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	objDir := filepath.Join(dir, "objects", "ab")
+	if err := os.MkdirAll(objDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(objDir, "cdef"), []byte("object"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	if err := sanitizeGitCheckpointDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(filepath.Join(objDir, "cdef")); err != nil || string(data) != "object" {
+		t.Fatalf("objects/ content was touched: data=%q err=%v", string(data), err)
+	}
+}

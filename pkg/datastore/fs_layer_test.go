@@ -472,6 +472,7 @@ func TestHasFSLayerStorageRef(t *testing.T) {
 		StorageRefHash: "0000000000000000000000000000000000000000000000000000000000000000",
 		SizeBytes:      1,
 	}
+	staleHash := badEntry.StorageRefHash
 	if err := s.UpsertFSLayerEntry(ctx, badEntry); err != nil {
 		t.Fatalf("UpsertFSLayerEntry with a stale hash: %v", err)
 	}
@@ -482,9 +483,24 @@ func TestHasFSLayerStorageRef(t *testing.T) {
 	if stored.StorageRefHash != StorageRefHash(badRef) {
 		t.Fatalf("stored hash = %q, want the hash derived from the ref", stored.StorageRefHash)
 	}
-	if live, err := s.HasFSLayerStorageRef(ctx, badEntry.StorageRefHash, badRef); err != nil {
+	// The caller's hash is stale here on purpose: the read side re-derives it.
+	if live, err := s.HasFSLayerStorageRef(ctx, staleHash, badRef); err != nil {
 		t.Fatalf("HasFSLayerStorageRef with a stale hash: %v", err)
 	} else if !live {
 		t.Fatal("a stale stored hash hid a live payload claim from object GC")
+	}
+
+	// A row that already stored a wrong hash (written before the upsert derived
+	// it) is found through the ref fallback, so a legacy row cannot hide the
+	// claim either.
+	if _, err := s.DB().ExecContext(ctx,
+		`UPDATE fs_layer_entries SET storage_ref_hash = ? WHERE layer_id = ? AND path = ?`,
+		staleHash, "layer-gc-bad", "/repo/other.bin"); err != nil {
+		t.Fatalf("rewrite row hash: %v", err)
+	}
+	if live, err := s.HasFSLayerStorageRef(ctx, StorageRefHash(badRef), badRef); err != nil {
+		t.Fatalf("HasFSLayerStorageRef with a legacy row hash: %v", err)
+	} else if !live {
+		t.Fatal("a legacy row with a wrong stored hash hid a live payload claim from object GC")
 	}
 }

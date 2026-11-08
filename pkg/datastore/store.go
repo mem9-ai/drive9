@@ -1254,6 +1254,21 @@ func (s *Store) HasFSLayerStorageRef(ctx context.Context, storageRefHash, storag
 		WHERE `+s.scope.And(`storage_ref_hash = ? AND storage_ref = ?`)+`
 		LIMIT 1`, s.scope.Args(storageRefHash, storageRef)...)
 	var one int
+	err = row.Scan(&one)
+	if err == nil {
+		return true, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
+	// A row written before the upsert derived the hash can carry a nonempty but
+	// wrong value in this column, and the column is not backfilled. The ref is
+	// the identity, so fall back to it: this scan only runs for a layer payload
+	// the indexed lookup could not attribute, i.e. one about to be collected.
+	row = s.db.QueryRowContext(ctx, `SELECT 1
+		FROM fs_layer_entries
+		WHERE `+s.scope.And(`storage_ref = ?`)+`
+		LIMIT 1`, s.scope.Args(storageRef)...)
 	if err := row.Scan(&one); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return false, nil
