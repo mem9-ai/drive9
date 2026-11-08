@@ -1461,11 +1461,11 @@ func TestSanitizeGitCheckpointDirPreservesBranchNamedHooks(t *testing.T) {
 	const oid = "0123456789abcdef0123456789abcdef01234567"
 	const reflog = "0000000000000000000000000000000000000000 " + oid + " A U Thor <a@example.com> 1 +0000\tcommit: x\n"
 	paths := map[string]string{
-		filepath.Join(sub, "refs", "heads", "topic", "HEAD"):         oid + "\n",
-		filepath.Join(sub, "refs", "heads", "topic", "commondir"):    oid + "\n",
-		filepath.Join(sub, "refs", "heads", "topic", "hooks"):        oid + "\n",
-		filepath.Join(sub, "refs", "heads", "leaf", "hooks", "leaf"): oid + "\n",
-		filepath.Join(sub, "logs", "refs", "heads", "topic", "HEAD"): reflog,
+		filepath.Join(sub, "refs", "heads", "topic", "HEAD"):                   oid + "\n",
+		filepath.Join(sub, "refs", "heads", "topic", "commondir"):              oid + "\n",
+		filepath.Join(sub, "refs", "heads", "leaf", "hooks", "leaf"):           oid + "\n",
+		filepath.Join(sub, "refs", "heads", "topic", "hooks", "post-checkout"): oid + "\n",
+		filepath.Join(sub, "logs", "refs", "heads", "topic", "HEAD"):           reflog,
 	}
 	for path, body := range paths {
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -1494,5 +1494,96 @@ func TestSanitizeGitCheckpointDirPreservesBranchNamedHooks(t *testing.T) {
 	}
 	if data, err := os.ReadFile(reflogUnderHooks); err != nil || string(data) != reflog {
 		t.Fatalf("reflog under a hooks-named ref was rewritten: data=%q err=%v", string(data), err)
+	}
+}
+
+// Git's realpath works on a C string, so bytes after a NUL in commondir are ignored
+// while Go's path conversion rejects them. Cutting the value at the NUL is what makes
+// the sanitizer resolve the directory git will actually read.
+func TestSanitizeGitCheckpointDirResolvesCommondirAtNUL(t *testing.T) {
+	gitDir := t.TempDir()
+	shared := filepath.Join(gitDir, "shared")
+	for _, dir := range []string{filepath.Join(shared, "objects"), filepath.Join(shared, "refs"), filepath.Join(shared, "hooks")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(shared, "config"), []byte("[core]\n\tpager = /tmp/evil-pager\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(shared, "hooks", "post-checkout"), []byte("#!/bin/sh\ntrue\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sub := filepath.Join(gitDir, "modules", "dep")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "commondir"), []byte("../../shared\x00ignored\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := sanitizeGitCheckpointDir(gitDir); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(shared, "config"))
+	if err != nil {
+		t.Fatalf("NUL-terminated commondir target config: %v", err)
+	}
+	if strings.Contains(string(data), "pager") {
+		t.Fatalf("NUL-terminated commondir target kept pager:\n%s", string(data))
+	}
+	if _, err := os.Stat(filepath.Join(shared, "hooks", "post-checkout")); !os.IsNotExist(err) {
+		t.Fatalf("NUL-terminated commondir target kept its hook: %v", err)
+	}
+}
+
+// Executability, not the file name, decides what git can run: an upper-case hook name
+// (found on a case-insensitive filesystem) and a "ref: ...;id" one-liner are both
+// removed, while a non-executable hook-named file is inert and keeps its bytes.
+func TestSanitizeGitCheckpointDirRemovesExecutableHooksOnly(t *testing.T) {
+	gitDir := t.TempDir()
+	writeCheckpointRepo(t, gitDir, "[core]\n\trepositoryformatversion = 0\n")
+	hooks := filepath.Join(gitDir, "hooks")
+	if err := os.MkdirAll(hooks, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	executable := map[string]string{
+		"POST-CHECKOUT":       "ref: refs/heads/main;id\n",
+		"post-checkout":       "#!/bin/sh\ntrue\n",
+		"future-hook-unknown": "#!/bin/sh\ntrue\n",
+	}
+	for name, body := range executable {
+		if err := os.WriteFile(filepath.Join(hooks, name), []byte(body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A non-executable file git will not run, and which may be a branch ref.
+	inert := map[string]string{
+		"post-commit": "0123456789abcdef0123456789abcdef01234567\n",
+		"POST-MERGE":  "ref: refs/heads/main\n",
+	}
+	for name, body := range inert {
+		if err := os.WriteFile(filepath.Join(hooks, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := sanitizeGitCheckpointDir(gitDir); err != nil {
+		t.Fatal(err)
+	}
+	for name := range executable {
+		if _, err := os.Lstat(filepath.Join(hooks, name)); !os.IsNotExist(err) {
+			t.Fatalf("executable hook %s survived (err=%v)", name, err)
+		}
+	}
+	for name, body := range inert {
+		data, err := os.ReadFile(filepath.Join(hooks, name))
+		if err != nil {
+			t.Fatalf("inert file %s was removed: %v", name, err)
+		}
+		if string(data) != body {
+			t.Fatalf("inert file %s was rewritten: %q", name, string(data))
+		}
 	}
 }
