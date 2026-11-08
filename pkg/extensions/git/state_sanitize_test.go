@@ -590,14 +590,18 @@ func TestSanitizeGitCheckpointDirStripsLinkedWorktreeConfig(t *testing.T) {
 func TestSanitizeGitCheckpointDirStripsSubmoduleConfig(t *testing.T) {
 	dir := t.TempDir()
 	moduleDir := filepath.Join(dir, "modules", "dep")
-	if err := os.MkdirAll(moduleDir, 0o755); err != nil {
+	// A real submodule gitdir: HEAD plus the objects/ and refs/ directories git
+	// validates before it will run anything from the repository.
+	for _, sub := range []string{"objects", "refs", "hooks"} {
+		if err := os.MkdirAll(filepath.Join(moduleDir, sub), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(moduleDir, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	cfg := "[core]\n\trepositoryformatversion = 0\n\tfsmonitor = /tmp/evil\n\thooksPath = /tmp/evil-hooks\n"
 	if err := os.WriteFile(filepath.Join(moduleDir, "config"), []byte(cfg), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(filepath.Join(moduleDir, "hooks"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(moduleDir, "hooks", "post-checkout"), []byte("#!/bin/sh\ntouch /tmp/pwned\n"), 0o755); err != nil {
@@ -620,42 +624,145 @@ func TestSanitizeGitCheckpointDirStripsSubmoduleConfig(t *testing.T) {
 	}
 }
 
-// A symlinked worktree/module registry would point the sanitizer (and every
-// rewrite below it) at a directory outside the restored .git.
-func TestSanitizeGitCheckpointDirDropsSymlinkedAdminRegistry(t *testing.T) {
-	root := t.TempDir()
-	outside := filepath.Join(root, "outside")
-	if err := os.MkdirAll(filepath.Join(outside, "wt-1"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	victim := filepath.Join(outside, "wt-1", "config.worktree")
+// A link inside the restored tree is neither followed nor needed: the archive's
+// link targets are validated to stay inside the extraction root, so the walk
+// reaches the target through its real path and sanitises it there.
+func TestSanitizeGitCheckpointDirDoesNotFollowLinks(t *testing.T) {
+	gitDir := t.TempDir()
 	hostile := "[core]\n\tfsmonitor = /tmp/evil\n"
-	if err := os.WriteFile(victim, []byte(hostile), 0o600); err != nil {
+	// A linked worktree admin directory reached through links only.
+	target := filepath.Join(gitDir, "real", "wt-1")
+	if err := os.MkdirAll(target, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	gitDir := filepath.Join(root, "git")
-	if err := os.MkdirAll(filepath.Join(root, "real-worktrees", "wt-1"), 0o755); err != nil {
+	if err := os.WriteFile(filepath.Join(target, "config.worktree"), []byte(hostile), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(gitDir, 0o755); err != nil {
+	// A linked namespace component under modules/ whose target holds a repo.
+	nested := filepath.Join(gitDir, "real", "libs", "foo")
+	if err := os.MkdirAll(filepath.Join(nested, "objects"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink(outside, filepath.Join(gitDir, "worktrees")); err != nil {
+	if err := os.MkdirAll(filepath.Join(nested, "refs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nested, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nested, "config"), []byte(hostile), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(gitDir, "worktrees"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(gitDir, "modules", "libs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(gitDir, "worktrees", "wt-1")); err != nil {
 		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := os.Symlink(filepath.Join("..", "..", "real", "libs", "foo"), filepath.Join(gitDir, "modules", "libs", "foo")); err != nil {
+		t.Fatal(err)
 	}
 	if err := sanitizeGitCheckpointDir(gitDir); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Lstat(filepath.Join(gitDir, "worktrees")); !os.IsNotExist(err) {
-		t.Fatalf("symlinked worktree registry survived (err=%v)", err)
+	if _, err := os.Lstat(filepath.Join(gitDir, "worktrees", "wt-1")); err != nil {
+		t.Fatalf("linked worktree admin entry was removed: %v", err)
 	}
-	// The outside file is untouched: the walk never followed the link.
-	data, err := os.ReadFile(victim)
+	if _, err := os.Lstat(filepath.Join(gitDir, "modules", "libs", "foo")); err != nil {
+		t.Fatalf("linked submodule path component was removed: %v", err)
+	}
+	for _, path := range []string{filepath.Join(target, "config.worktree"), filepath.Join(nested, "config")} {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		if strings.Contains(string(data), "fsmonitor") {
+			t.Fatalf("link target %s kept fsmonitor:\n%s", path, string(data))
+		}
+	}
+}
+
+// A submodule may itself be named "hooks". Its gitdir is modules/.../hooks, and
+// its parent is a plain namespace directory, so the parent's hooks child is a
+// repository that must survive the walk.
+func TestSanitizeGitCheckpointDirPreservesSubmoduleNamedHooks(t *testing.T) {
+	gitDir := t.TempDir()
+	sub := filepath.Join(gitDir, "modules", "libs", "hooks")
+	for _, dir := range []string{filepath.Join(sub, "objects"), filepath.Join(sub, "refs"), filepath.Join(sub, "hooks")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(sub, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "config"), []byte("[core]\n\tfsmonitor = /tmp/evil\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "hooks", "post-checkout"), []byte("#!/bin/sh\ntrue\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := sanitizeGitCheckpointDir(gitDir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(sub, "HEAD")); err != nil {
+		t.Fatalf("submodule named hooks was deleted: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(sub, "config"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(data) != hostile {
-		t.Fatalf("sanitizer rewrote a file outside the restored .git:\n%s", string(data))
+	if strings.Contains(string(data), "fsmonitor") {
+		t.Fatalf("submodule named hooks kept fsmonitor:\n%s", string(data))
+	}
+	// Its own hooks directory is a hooks directory and still goes away.
+	if _, err := os.Stat(filepath.Join(sub, "hooks", "post-checkout")); !os.IsNotExist(err) {
+		t.Fatalf("hooks inside the submodule survived: %v", err)
+	}
+}
+
+// A HEAD (or config) marker written into modules/ must not make the walk treat the
+// namespace as a repository and skip a submodule below it.
+func TestSanitizeGitCheckpointDirIgnoresNamespaceMarkers(t *testing.T) {
+	gitDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(gitDir, "modules"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(gitDir, "modules", "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(gitDir, "modules", "config"), []byte("[core]\n\tfilemode = true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sub := filepath.Join(gitDir, "modules", "objects")
+	for _, dir := range []string{filepath.Join(sub, "objects"), filepath.Join(sub, "refs"), filepath.Join(sub, "hooks")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(sub, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "config"), []byte("[core]\n\tfsmonitor = /tmp/evil\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "hooks", "post-checkout"), []byte("#!/bin/sh\ntrue\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := sanitizeGitCheckpointDir(gitDir); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(sub, "config"))
+	if err != nil {
+		t.Fatalf("submodule named objects was skipped: %v", err)
+	}
+	if strings.Contains(string(data), "fsmonitor") {
+		t.Fatalf("submodule named objects kept fsmonitor:\n%s", string(data))
+	}
+	if _, err := os.Stat(filepath.Join(sub, "hooks", "post-checkout")); !os.IsNotExist(err) {
+		t.Fatalf("submodule named objects kept its hook: %v", err)
 	}
 }
 
@@ -758,36 +865,6 @@ func TestSanitizeGitCheckpointDirSanitizesDeepRepositoryNesting(t *testing.T) {
 	}
 	if strings.Contains(string(data), "pager") {
 		t.Fatalf("deeply nested config kept pager:\n%s", string(data))
-	}
-}
-
-// A symlinked path component inside modules/ would let a checkpoint point git at
-// a directory it controls elsewhere in the tree; the link is dropped instead of
-// followed.
-func TestSanitizeGitCheckpointDirDropsSymlinkedSubmodulePathComponent(t *testing.T) {
-	root := t.TempDir()
-	// The link target lives inside the restored tree, so the archive's
-	// link-target validation would have accepted the link itself.
-	target := filepath.Join(root, "real", "foo")
-	if err := os.MkdirAll(target, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	hostile := "[core]\n\tfsmonitor = /tmp/evil\n"
-	if err := os.WriteFile(filepath.Join(target, "config.worktree"), []byte(hostile), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	gitDir := filepath.Join(root, "git")
-	if err := os.MkdirAll(filepath.Join(gitDir, "modules"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(target, filepath.Join(gitDir, "modules", "libs")); err != nil {
-		t.Skipf("symlinks unavailable: %v", err)
-	}
-	if err := sanitizeGitCheckpointDir(gitDir); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Lstat(filepath.Join(gitDir, "modules", "libs")); !os.IsNotExist(err) {
-		t.Fatalf("symlinked submodule path component survived (err=%v)", err)
 	}
 }
 
