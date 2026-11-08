@@ -539,3 +539,174 @@ func TestSanitizeGitCheckpointConfigQuoteContinuationMatchesGit(t *testing.T) {
 		t.Fatalf("git lost the kept core key:\n%s", out)
 	}
 }
+
+// With extensions.worktreeConfig set, git reads a linked worktree's core.* keys
+// from <gitdir>/worktrees/<name>/config.worktree. Sanitizing only the top-level
+// config left that file live, so a checkpoint could still name a program to run.
+func TestSanitizeGitCheckpointDirStripsLinkedWorktreeConfig(t *testing.T) {
+	dir := t.TempDir()
+	adminDir := filepath.Join(dir, "worktrees", "wt-1")
+	if err := os.MkdirAll(adminDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(adminDir, "gitdir"), []byte("/repo/.git/worktrees/wt-1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	legacy := "[core]\n\trepositoryformatversion = 0\n\tfsmonitor = /tmp/evil\n\tfilemode = true\n"
+	if err := os.WriteFile(filepath.Join(adminDir, "config"), []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	worktreeConfig := "[core]\n\tfsmonitor = /tmp/evil\n\tpager = /tmp/evil-pager\n\tsshCommand = /tmp/evil-ssh\n\tfilemode = true\n"
+	if err := os.WriteFile(filepath.Join(adminDir, "config.worktree"), []byte(worktreeConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := sanitizeGitCheckpointDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"config", "config.worktree"} {
+		data, err := os.ReadFile(filepath.Join(adminDir, name))
+		if err != nil {
+			t.Fatalf("read worktree %s: %v", name, err)
+		}
+		got := string(data)
+		for _, banned := range []string{"fsmonitor", "pager", "sshCommand", "/tmp/evil"} {
+			if strings.Contains(got, banned) {
+				t.Fatalf("worktree %s kept executable surface %q:\n%s", name, banned, got)
+			}
+		}
+		if !strings.Contains(got, "filemode = true") {
+			t.Fatalf("worktree %s lost its safe core key:\n%s", name, got)
+		}
+	}
+	// The admin directory itself must survive: git needs it to resolve the
+	// worktree, and dropping it would break a legitimate restore.
+	if _, err := os.Stat(filepath.Join(adminDir, "gitdir")); err != nil {
+		t.Fatalf("worktree admin dir was removed: %v", err)
+	}
+}
+
+// `git submodule` commands run git inside the submodule's repository, so its
+// gitdir carries the same executable surface as the superproject's.
+func TestSanitizeGitCheckpointDirStripsSubmoduleConfig(t *testing.T) {
+	dir := t.TempDir()
+	moduleDir := filepath.Join(dir, "modules", "dep")
+	if err := os.MkdirAll(moduleDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := "[core]\n\trepositoryformatversion = 0\n\tfsmonitor = /tmp/evil\n\thooksPath = /tmp/evil-hooks\n"
+	if err := os.WriteFile(filepath.Join(moduleDir, "config"), []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(moduleDir, "hooks"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(moduleDir, "hooks", "post-checkout"), []byte("#!/bin/sh\ntouch /tmp/pwned\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := sanitizeGitCheckpointDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(moduleDir, "config"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, banned := range []string{"fsmonitor", "hooksPath"} {
+		if strings.Contains(string(data), banned) {
+			t.Fatalf("submodule config kept %q:\n%s", banned, string(data))
+		}
+	}
+	if _, err := os.Stat(filepath.Join(moduleDir, "hooks", "post-checkout")); !os.IsNotExist(err) {
+		t.Fatalf("submodule hook survived the sanitizer (err=%v)", err)
+	}
+}
+
+// A symlinked worktree/module registry would point the sanitizer (and every
+// rewrite below it) at a directory outside the restored .git.
+func TestSanitizeGitCheckpointDirDropsSymlinkedAdminRegistry(t *testing.T) {
+	root := t.TempDir()
+	outside := filepath.Join(root, "outside")
+	if err := os.MkdirAll(filepath.Join(outside, "wt-1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	victim := filepath.Join(outside, "wt-1", "config.worktree")
+	hostile := "[core]\n\tfsmonitor = /tmp/evil\n"
+	if err := os.WriteFile(victim, []byte(hostile), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitDir := filepath.Join(root, "git")
+	if err := os.MkdirAll(filepath.Join(root, "real-worktrees", "wt-1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(gitDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(gitDir, "worktrees")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := sanitizeGitCheckpointDir(gitDir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(gitDir, "worktrees")); !os.IsNotExist(err) {
+		t.Fatalf("symlinked worktree registry survived (err=%v)", err)
+	}
+	// The outside file is untouched: the walk never followed the link.
+	data, err := os.ReadFile(victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != hostile {
+		t.Fatalf("sanitizer rewrote a file outside the restored .git:\n%s", string(data))
+	}
+}
+
+// A config that is itself a symlink would make the rewrite edit its target
+// instead of the file git reads.
+func TestSanitizeGitCheckpointConfigDropsSymlinkedConfig(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "shared.conf")
+	const shared = "[core]\n\trepositoryformatversion = 0\n"
+	if err := os.WriteFile(target, []byte(shared), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "config")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := sanitizeGitCheckpointConfig(link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(link); !os.IsNotExist(err) {
+		t.Fatalf("symlinked config survived (err=%v)", err)
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != shared {
+		t.Fatalf("sanitizer rewrote the symlink target:\n%s", string(data))
+	}
+}
+
+// extensions.worktreeConfig decides whether git reads any per-worktree config at
+// all, so a restore must not let a checkpoint switch it on.
+func TestSanitizeGitCheckpointConfigDropsWorktreeConfigExtension(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config")
+	cfg := "[core]\n\trepositoryformatversion = 1\n[extensions]\n\tworktreeconfig = true\n\tobjectformat = sha256\n"
+	if err := os.WriteFile(path, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := sanitizeGitCheckpointConfig(path); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(data)
+	if strings.Contains(strings.ToLower(got), "worktreeconfig") {
+		t.Fatalf("extensions.worktreeConfig survived:\n%s", got)
+	}
+	if !strings.Contains(got, "objectformat = sha256") {
+		t.Fatalf("safe extension was dropped:\n%s", got)
+	}
+}

@@ -403,3 +403,56 @@ func TestFSLayerNotFound(t *testing.T) {
 		t.Fatalf("RollbackFSLayer missing err=%v, want ErrNotFound", err)
 	}
 }
+
+// Object GC asks whether a confirmable file or a layer entry still claims an
+// object. A layer payload stays live for as long as any entry row carries the
+// ref — abandoning a layer keeps its entries, so the payload must stay readable
+// for diffs, replay and later applies.
+func TestHasFSLayerStorageRef(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	const ref = "layers/layer-gc/obj-1"
+	hash := StorageRefHash(ref)
+	if live, err := s.HasFSLayerStorageRef(ctx, hash, ref); err != nil {
+		t.Fatalf("HasFSLayerStorageRef before entry: %v", err)
+	} else if live {
+		t.Fatal("ref reported live with no layer entry")
+	}
+	if err := s.CreateFSLayer(ctx, &FSLayer{LayerID: "layer-gc", BaseRootPath: "/repo"}); err != nil {
+		t.Fatalf("CreateFSLayer: %v", err)
+	}
+	entry := &FSLayerEntry{
+		LayerID:        "layer-gc",
+		Path:           "/repo/file.bin",
+		Op:             FSLayerEntryOpUpsert,
+		Kind:           FSLayerEntryKindFile,
+		StorageType:    string(StorageS3),
+		StorageRef:     ref,
+		StorageRefHash: hash,
+		SizeBytes:      5,
+	}
+	if err := s.UpsertFSLayerEntry(ctx, entry); err != nil {
+		t.Fatalf("UpsertFSLayerEntry: %v", err)
+	}
+	if live, err := s.HasFSLayerStorageRef(ctx, hash, ref); err != nil {
+		t.Fatalf("HasFSLayerStorageRef after entry: %v", err)
+	} else if !live {
+		t.Fatal("ref reported dead while a layer entry still carries it")
+	}
+	// A sibling object of the same layer is a different ref, not implied by the
+	// shared prefix.
+	other := "layers/layer-gc/obj-2"
+	if live, err := s.HasFSLayerStorageRef(ctx, StorageRefHash(other), other); err != nil {
+		t.Fatalf("HasFSLayerStorageRef for sibling ref: %v", err)
+	} else if live {
+		t.Fatalf("sibling ref %q reported live", other)
+	}
+	if err := s.DeleteFSLayer(ctx, "layer-gc", DeleteFSLayerOptions{}); err != nil {
+		t.Fatalf("DeleteFSLayer: %v", err)
+	}
+	if live, err := s.HasFSLayerStorageRef(ctx, hash, ref); err != nil {
+		t.Fatalf("HasFSLayerStorageRef after abandon: %v", err)
+	} else if !live {
+		t.Fatal("abandoning a layer dropped the payload claim its entries still hold")
+	}
+}

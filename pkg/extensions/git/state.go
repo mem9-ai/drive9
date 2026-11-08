@@ -1137,9 +1137,14 @@ var gitCheckpointSafeConfigKeys = map[string]bool{
 	// core.worktree is deliberately absent: it redirects the repository's
 	// worktree to an arbitrary host path, which tenant-controlled checkpoint
 	// state must never be able to do.
-	"extensions.objectformat":   true,
-	"extensions.worktreeconfig": true,
-	"gc.autodetach":             true,
+	"extensions.objectformat": true,
+	// extensions.worktreeConfig is deliberately absent as well: it moves core.*
+	// keys into a per-worktree config file, so keeping it let a checkpoint
+	// decide which files git reads next — including
+	// <gitdir>/worktrees/<name>/config.worktree, which the sanitizer only
+	// started rewriting below. A restore leaves the extension off; the
+	// workspace can re-enable it once its config files are known clean.
+	"gc.autodetach": true,
 }
 
 // gitCheckpointSafeConfigSections are the config sections a checkpoint may
@@ -1246,22 +1251,94 @@ func sanitizeGitCheckpointDir(gitDir string) error {
 	if gitDir == "" {
 		return nil
 	}
+	return sanitizeGitCheckpointRepo(gitDir, 0)
+}
+
+// gitCheckpointMaxRepoDepth bounds the nested-repository walk. Git reads config
+// from a repository's own gitdir, from the admin directory of each linked
+// worktree (<gitdir>/worktrees/<name>) and from the gitdir of each submodule's
+// repository (<gitdir>/modules/<name>); those nest (a submodule's own worktree,
+// a submodule of a submodule). The bound only stops a checkpoint that fabricates
+// deeper nesting from making the sanitizer spin.
+const gitCheckpointMaxRepoDepth = 4
+
+// sanitizeGitCheckpointRepo strips the executable surface of one repository
+// directory and recurses into the per-worktree and submodule admin directories
+// git reads for it.
+//
+// Sanitizing only <gitdir>/config[.worktree] left code execution reachable:
+// with extensions.worktreeConfig set, git reads
+// <gitdir>/worktrees/<name>/config.worktree, so a core.fsmonitor written there
+// ran on the next git command while the top-level config looked clean.
+// Submodule repositories are the same shape for the same reason: `git submodule`
+// commands run git inside them.
+func sanitizeGitCheckpointRepo(dir string, depth int) error {
 	// Hooks are executable programs in the repository. Nothing in a checkpoint
 	// needs them.
-	if err := os.RemoveAll(filepath.Join(gitDir, "hooks")); err != nil && !os.IsNotExist(err) {
+	if err := os.RemoveAll(filepath.Join(dir, "hooks")); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove checkpoint hooks: %w", err)
 	}
-	if err := sanitizeGitCheckpointConfig(filepath.Join(gitDir, "config")); err != nil {
+	if err := sanitizeGitCheckpointConfig(filepath.Join(dir, "config")); err != nil {
 		return err
 	}
-	// extensions.worktreeconfig moves core.* keys into config.worktree, so a
+	// extensions.worktreeConfig moves core.* keys into config.worktree, so a
 	// checkpoint could hide a fsmonitor/pager there instead of in config.
-	return sanitizeGitCheckpointConfig(filepath.Join(gitDir, "config.worktree"))
+	if err := sanitizeGitCheckpointConfig(filepath.Join(dir, "config.worktree")); err != nil {
+		return err
+	}
+	if depth >= gitCheckpointMaxRepoDepth {
+		return nil
+	}
+	for _, kind := range [...]string{"worktrees", "modules"} {
+		root := filepath.Join(dir, kind)
+		// A symlinked registry would point the walk — and every config rewrite
+		// below it — somewhere else on the host, so it is dropped rather than
+		// followed. No checkpoint needs one.
+		if info, err := os.Lstat(root); err == nil && info.Mode()&os.ModeSymlink != 0 {
+			if err := os.RemoveAll(root); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("remove checkpoint %s: %w", kind, err)
+			}
+			continue
+		}
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return fmt.Errorf("read checkpoint %s: %w", kind, err)
+		}
+		for _, entry := range entries {
+			entryPath := filepath.Join(root, entry.Name())
+			// Anything that is not a real admin directory (a symlink, a file) is
+			// not state git can use as one; dropping it keeps the walk inside
+			// the restored tree.
+			if !entry.IsDir() {
+				if err := os.RemoveAll(entryPath); err != nil && !os.IsNotExist(err) {
+					return fmt.Errorf("remove checkpoint %s/%s: %w", kind, entry.Name(), err)
+				}
+				continue
+			}
+			if err := sanitizeGitCheckpointRepo(entryPath, depth+1); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // sanitizeGitCheckpointConfig rewrites a git config file keeping only the
 // sections and keys that cannot execute a program.
 func sanitizeGitCheckpointConfig(path string) error {
+	// A checkpoint can ship the file as a symlink that resolves inside the
+	// extraction root; rewriting through it would edit whatever it points at
+	// instead of the config git is about to read. No restore needs a linked
+	// config, so it is dropped rather than followed.
+	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove checkpoint config symlink: %w", err)
+		}
+		return nil
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {

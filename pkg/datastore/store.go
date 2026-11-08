@@ -1227,6 +1227,36 @@ func (s *Store) HasConfirmedS3StorageRef(ctx context.Context, storageRefHash, st
 	return true, nil
 }
 
+// HasFSLayerStorageRef reports whether retained fs-layer history points at the
+// exact storage ref. Layer payloads are stored under layers/<layerID>/<object>
+// and stay readable for as long as any entry row carries the ref — abandoning a
+// layer keeps its entries — so the payload is still claimed whenever this
+// returns true.
+//
+// Layer refs are checked separately from the high-volume confirmed-content path
+// so ordinary blob GC keeps using its existing index; rows always carry the hash
+// (normalizeFSLayerEntry derives it), which is what
+// idx_fs_layer_entries_storage_ref makes this lookup cheap.
+func (s *Store) HasFSLayerStorageRef(ctx context.Context, storageRefHash, storageRef string) (out bool, err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "has_fs_layer_storage_ref", start, &err)
+	if storageRefHash == "" || storageRef == "" {
+		return false, nil
+	}
+	row := s.db.QueryRowContext(ctx, `SELECT 1
+		FROM fs_layer_entries
+		WHERE `+s.scope.And(`storage_ref_hash = ? AND storage_ref = ?`)+`
+		LIMIT 1`, s.scope.Args(storageRefHash, storageRef)...)
+	var one int
+	if err := row.Scan(&one); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
 func (s *Store) UpdateFileContent(ctx context.Context, fileID string, storageType StorageType, storageRef, contentType, checksum, contentText string, contentBlob []byte, size int64, description string) (newRevision int64, err error) {
 	start := time.Now()
 	defer observeStoreOp(ctx, "update_file_content", start, &err)
