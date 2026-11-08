@@ -36,6 +36,20 @@ type objectStorage struct {
 
 const maxStageBytes = 256 << 20
 
+// maxPinnedCommitBytes bounds the staged-byte volume pending commits may
+// pin in memory (see blockRegistry.pinnedBytes). Once the budget is full,
+// new slice ingestion blocks until commits drain — write backpressure
+// instead of unbounded growth. Overridable for bench work.
+var maxPinnedCommitBytes int64 = 1 << 30
+
+func init() {
+	if v := os.Getenv("DRIVE9_EXTENT_PINNED_BUDGET_BYTES"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			maxPinnedCommitBytes = n
+		}
+	}
+}
+
 func (s objectStorage) String() string { return "drive9-presign" }
 
 func (s objectStorage) Limits() object.Limits { return object.Limits{} }
@@ -322,25 +336,65 @@ func (r *blockRegistry) registerLocal(sha string, length int64) uint64 {
 func (r *blockRegistry) stagePinned(sha string, data []byte, pinned bool) uint64 {
 	id := r.stageBytes(sha, data)
 	if pinned {
-		r.pin(sha)
+		r.pin(sha, int64(len(data)))
 	}
 	return id
 }
 
-// pin marks a checksum as referenced by a pending commit.
-func (r *blockRegistry) pin(sha string) {
+// pin marks a checksum as referenced by a pending commit and accounts its
+// bytes against the pinned budget on the first reference.
+func (r *blockRegistry) pin(sha string, size int64) {
 	r.mu.Lock()
+	if r.pins[sha] == 0 {
+		r.pinSizes[sha] = size
+		r.pinnedBytes += size
+	}
 	r.pins[sha]++
 	r.mu.Unlock()
 }
 
-// unpin releases a pending-commit reference.
+// unpin releases a pending-commit reference; the last release retires the
+// checksum's budget share and wakes any budget waiter.
 func (r *blockRegistry) unpin(sha string) {
 	r.mu.Lock()
 	if r.pins[sha] > 0 {
 		r.pins[sha]--
+		if r.pins[sha] == 0 {
+			r.pinnedBytes -= r.pinSizes[sha]
+			delete(r.pinSizes, sha)
+			close(r.budgetCh)
+			r.budgetCh = make(chan struct{})
+		}
 	}
 	r.mu.Unlock()
+}
+
+// pinnedBudget reports the staged-byte volume currently pinned by pending
+// commits.
+func (r *blockRegistry) pinnedBudget() int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.pinnedBytes
+}
+
+// waitPinnedBudget blocks while pending commits hold at least limit staged
+// bytes, converting an unbounded in-memory backlog into write backpressure:
+// the caller (slice ingestion) parks, the kernel queues the WRITE, and the
+// writer throttles to commit speed instead of OOM-killing the worker.
+func (r *blockRegistry) waitPinnedBudget(ctx context.Context, limit int64) error {
+	r.mu.Lock()
+	for r.pinnedBytes >= limit {
+		ch := r.budgetCh
+		r.mu.Unlock()
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		r.mu.Lock()
+	}
+	r.mu.Unlock()
+	return nil
 }
 
 // issuePin increments the issued-reader count for a staged id (the
@@ -496,6 +550,7 @@ func (r *blockRegistry) releaseIfUnpinned(sha string) {
 		return
 	}
 	delete(r.pins, sha)
+	delete(r.pinSizes, sha)
 	delete(r.m, detID(sum))
 }
 

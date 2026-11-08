@@ -815,6 +815,15 @@ func (b *Bridge) Write(ctx meta.Context, ino meta.Ino, indx uint32, off uint32, 
 			return syscall.EIO
 		}
 	}
+	// Backpressure: staged-but-uncommitted slices stay pinned in memory
+	// until their commit lands. When the server side stalls, an unbounded
+	// backlog OOM-killed the worker (6 GiB seqwrite → 7.58 GiB RSS →
+	// kernel OOM → fio ECONNABORTED at ~5.5 GiB written). Park here while
+	// the budget is full instead: the kernel queues the WRITE and the
+	// writer throttles to commit speed.
+	if err := b.blocks.waitPinnedBudget(ctxOf(ctx), maxPinnedCommitBytes); err != nil {
+		return syscall.EIO
+	}
 	b.mu.Lock()
 	sl := b.stagedSlices[slice.Id]
 	if sl == nil || sl.total != int64(slice.Size) {

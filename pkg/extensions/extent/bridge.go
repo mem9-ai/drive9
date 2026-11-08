@@ -330,11 +330,25 @@ func detID(sum []byte) uint64 {
 
 // blockRegistry tracks content blocks seen in read plans: their sha256,
 // object URLs (with expiry), and the file provenance needed to refetch a
-// plan when a URL goes stale.
+// plan when a URL is stale.
 type blockRegistry struct {
 	mu   sync.Mutex
 	m    map[uint64]*blockEntry
 	pins map[string]int // checksum -> pending-commit references
+	// pinSizes remembers the byte volume accounted for each pinned
+	// checksum, so unpin retires exactly what pin added even if the entry
+	// was released or replaced in between.
+	pinSizes map[string]int64
+	// pinnedBytes is the staged-byte volume currently held by pending
+	// commits (checksums with pins > 0). Pinned entries are exempt from
+	// the classic-read LRU, so without a bound a commit-side stall grows
+	// this without limit: a 6 GiB seqwrite against a slow server OOM-killed
+	// the worker at 7.58 GiB RSS. waitPinnedBudget turns that cliff into
+	// write backpressure.
+	pinnedBytes int64
+	// budgetCh is closed (and replaced under mu) whenever pinnedBytes
+	// drops, waking waitPinnedBudget callers.
+	budgetCh chan struct{}
 	// issued tracks outstanding readers of staged classic ids: an issued
 	// entry is immune from LRU retirement until its fetch consumes the pin.
 	issued     map[uint64]int
@@ -358,7 +372,13 @@ type blockEntry struct {
 }
 
 func newBlockRegistry() *blockRegistry {
-	return &blockRegistry{m: make(map[uint64]*blockEntry), pins: make(map[string]int), issued: make(map[uint64]int)}
+	return &blockRegistry{
+		m:        make(map[uint64]*blockEntry),
+		pins:     make(map[string]int),
+		pinSizes: make(map[string]int64),
+		budgetCh: make(chan struct{}),
+		issued:   make(map[uint64]int),
+	}
 }
 
 // ctxOf adapts a meta.Context to a context.Context (meta.Context embeds
