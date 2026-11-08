@@ -1374,3 +1374,125 @@ func TestSanitizeGitCheckpointDirPreservesBranchNamedCommondir(t *testing.T) {
 		}
 	}
 }
+
+// A commondir written against the gitdir's FINAL path does not resolve while the tree
+// is still staged, but appears as soon as the rename publishes it. Absolute pointers
+// are dropped instead of trusted.
+func TestSanitizeGitCheckpointDirDropsAbsoluteCommondir(t *testing.T) {
+	gitDir := t.TempDir()
+	finalGitDir := filepath.Join(t.TempDir(), ".git")
+	sub := filepath.Join(gitDir, "modules", "dep")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "commondir"), []byte(filepath.Join(finalGitDir, "shared")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := sanitizeGitCheckpointDir(gitDir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(sub, "commondir")); !os.IsNotExist(err) {
+		t.Fatalf("absolute commondir survived (err=%v)", err)
+	}
+}
+
+// A relative pointer can climb out of the staged tree and resolve against the host
+// after the rename; it is dropped even when it does not resolve yet.
+func TestSanitizeGitCheckpointDirDropsEscapingCommondir(t *testing.T) {
+	gitDir := t.TempDir()
+	sub := filepath.Join(gitDir, "modules", "dep")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	escaping := filepath.Join("..", "..", "..", "..", "..", "..", "..", "tmp", "not-yet-there")
+	if err := os.WriteFile(filepath.Join(sub, "commondir"), []byte(escaping+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := sanitizeGitCheckpointDir(gitDir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(sub, "commondir")); !os.IsNotExist(err) {
+		t.Fatalf("escaping commondir survived (err=%v)", err)
+	}
+}
+
+// A hook is identified by its name, so a file that opens with "ref: " cannot pass
+// itself off as reference storage: git would run the shell lines after that one.
+func TestSanitizeGitCheckpointDirRemovesRefPrefixedHook(t *testing.T) {
+	gitDir := t.TempDir()
+	writeCheckpointRepo(t, gitDir, "[core]\n\trepositoryformatversion = 0\n")
+	hooks := filepath.Join(gitDir, "hooks")
+	if err := os.MkdirAll(hooks, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	hook := filepath.Join(hooks, "post-checkout")
+	if err := os.WriteFile(hook, []byte("ref: refs/heads/main\ntouch /tmp/pwned\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A name this build does not know yet still goes when it is executable.
+	unknown := filepath.Join(hooks, "future-hook")
+	if err := os.WriteFile(unknown, []byte("touch /tmp/pwned\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := sanitizeGitCheckpointDir(gitDir); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{hook, unknown} {
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			t.Fatalf("executable hook %s survived (err=%v)", filepath.Base(path), err)
+		}
+	}
+}
+
+// Branch "topic/hooks" makes the hooks entry a regular file, and a branch
+// "topic/hooks/leaf" puts a reflog under it. Neither is a program and both must keep
+// their bytes, including the reflog record that is not an object id.
+func TestSanitizeGitCheckpointDirPreservesBranchNamedHooks(t *testing.T) {
+	gitDir := t.TempDir()
+	writeCheckpointRepo(t, gitDir, "[core]\n\trepositoryformatversion = 0\n")
+	sub := filepath.Join(gitDir, "modules", "dep")
+	writeCheckpointRepo(t, sub, "[core]\n\trepositoryformatversion = 0\n")
+	const oid = "0123456789abcdef0123456789abcdef01234567"
+	const reflog = "0000000000000000000000000000000000000000 " + oid + " A U Thor <a@example.com> 1 +0000\tcommit: x\n"
+	paths := map[string]string{
+		filepath.Join(sub, "refs", "heads", "topic", "HEAD"):         oid + "\n",
+		filepath.Join(sub, "refs", "heads", "topic", "commondir"):    oid + "\n",
+		filepath.Join(sub, "refs", "heads", "topic", "hooks"):        oid + "\n",
+		filepath.Join(sub, "refs", "heads", "leaf", "hooks", "leaf"): oid + "\n",
+		filepath.Join(sub, "logs", "refs", "heads", "topic", "HEAD"): reflog,
+	}
+	for path, body := range paths {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// refs/heads/topic is classified as an admin directory, so its "hooks" child (a
+	// direct reflog namespace) must survive too.
+	reflogUnderHooks := filepath.Join(sub, "logs", "refs", "heads", "topic", "hooks", "leaf")
+	if err := os.MkdirAll(filepath.Dir(reflogUnderHooks), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(reflogUnderHooks, []byte(reflog), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := sanitizeGitCheckpointDir(gitDir); err != nil {
+		t.Fatalf("sanitize aborted on reference storage named hooks: %v", err)
+	}
+	for path := range paths {
+		if _, err := os.Lstat(path); err != nil {
+			t.Fatalf("%s was removed: %v", path, err)
+		}
+	}
+	if data, err := os.ReadFile(reflogUnderHooks); err != nil || string(data) != reflog {
+		t.Fatalf("reflog under a hooks-named ref was rewritten: data=%q err=%v", string(data), err)
+	}
+}

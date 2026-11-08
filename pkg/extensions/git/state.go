@@ -1246,9 +1246,10 @@ func splitGitConfigKeyValue(line string) (string, string) {
 // gitCheckpointSanitizer walks the restored .git tree once and sanitises every
 // directory git reads configuration or hooks from.
 type gitCheckpointSanitizer struct {
-	// root is the extracted tree. A commondir pointer that resolves outside it is
-	// dropped rather than followed.
-	root string
+	// root is the extracted tree as walked, and rootReal is its resolved path. A
+	// commondir pointer outside both is dropped rather than followed.
+	root     string
+	rootReal string
 	// walked keeps the traversal linear when a commondir pointer leads back into a
 	// subtree that was already descended.
 	walked map[string]struct{}
@@ -1268,7 +1269,11 @@ func sanitizeGitCheckpointDir(gitDir string) error {
 	if gitDir == "" {
 		return nil
 	}
-	w := &gitCheckpointSanitizer{root: filepath.Clean(gitDir), walked: map[string]struct{}{}, sanitized: map[string]struct{}{}}
+	root := filepath.Clean(gitDir)
+	w := &gitCheckpointSanitizer{root: root, rootReal: root, walked: map[string]struct{}{}, sanitized: map[string]struct{}{}}
+	if real, err := filepath.EvalSymlinks(root); err == nil {
+		w.rootReal = real
+	}
 	return w.repoDir(gitDir)
 }
 
@@ -1388,150 +1393,63 @@ func (w *gitCheckpointSanitizer) commonDir(dir string) error {
 		}
 		return fmt.Errorf("read checkpoint commondir: %w", err)
 	}
-	target, resolved := w.resolveCommonDir(dir, string(raw))
-	switch {
-	case resolved && target != nil:
-		return w.repoDir(*target)
-	case resolved:
-		// The pointer names a directory outside the restored tree: following it
-		// would let a checkpoint point git at a host directory's config and hooks.
-		// The restore writes the canonical relative pointer for a linked worktree,
-		// so the file is dropped instead of trusted.
-		if err := os.Remove(filepath.Join(dir, "commondir")); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("remove checkpoint commondir: %w", err)
-		}
-	default:
-		// The value does not resolve to a directory. Git then refuses the whole
-		// directory ("fatal: not a git repository"), so nothing can be read or run
-		// through it, and the file is left alone: a submodule may legitimately have
-		// related branches named HEAD and commondir, whose loose refs live under
-		// refs/heads/<name>/commondir and must keep their bytes.
+	value := strings.TrimRight(string(raw), "\r\n")
+	if value == "" {
+		// Git resolves an empty pointer to the gitdir itself, whose config and hooks
+		// this walk already handles.
 		return nil
 	}
-	return nil
-}
-
-// resolveCommonDir reproduces git's commondir resolution: strip the trailing CR/LF
-// only, join with the gitdir, then resolve the real path (symlinks included). The
-// second result reports whether the value resolved at all; a nil target means it
-// resolved outside the extracted tree.
-func (w *gitCheckpointSanitizer) resolveCommonDir(dir, value string) (*string, bool) {
-	value = strings.TrimRight(value, "\r\n")
-	if value == "" {
-		return nil, false
-	}
+	// An absolute pointer, or one whose lexical path climbs out of the tree, names a
+	// host directory and is dropped rather than resolved. That also covers a pointer
+	// written against the *final* path of this gitdir: it does not exist while the
+	// tree is still staged, but appears as soon as the rename publishes the tree. The
+	// restore writes the canonical relative pointer for a linked worktree.
 	path := filepath.FromSlash(value)
-	if !filepath.IsAbs(path) {
-		// Concatenate rather than filepath.Join: Join cleans the path lexically, so
-		// "objects/link/../shared" would become "objects/shared" before the symlink
-		// in it is ever resolved, which is exactly the disagreement with git.
-		path = dir + string(filepath.Separator) + path
+	if filepath.IsAbs(path) {
+		return w.dropCommonDir(dir)
+	}
+	// The escape check uses the cleaned path, while the resolution keeps the raw one:
+	// filepath.Clean would collapse "objects/link/../shared" to "objects/shared" before
+	// the symlink in it is resolved, which is a different directory from the one git
+	// reads.
+	path = dir + string(filepath.Separator) + path
+	if !w.insideTree(filepath.Clean(path)) {
+		return w.dropCommonDir(dir)
 	}
 	resolved, err := filepath.EvalSymlinks(path)
 	if err != nil {
-		return nil, false
+		// The target does not exist. Git refuses the whole directory then ("fatal: not
+		// a git repository"), and the rename that publishes the tree moves this
+		// directory and its target together, so a relative path missing here cannot
+		// resolve anywhere else later. The pointer is left alone: it may be a loose ref
+		// that happens to be named commondir.
+		return nil
 	}
-	root, err := filepath.EvalSymlinks(w.root)
-	if err != nil {
-		root = w.root
+	if !w.insideTree(resolved) {
+		return w.dropCommonDir(dir)
 	}
-	if resolved == root || strings.HasPrefix(resolved, root+string(filepath.Separator)) {
-		return &resolved, true
-	}
-	return nil, true
+	return w.repoDir(resolved)
 }
 
-// sanitizeGitCheckpointRepoFiles rewrites the config files of one repository admin
-// directory and removes its hooks.
-func sanitizeGitCheckpointRepoFiles(dir string) error {
-	// extensions.worktreeConfig moves core.* keys into config.worktree, so a
-	// checkpoint could hide a fsmonitor/pager there instead of in config.
-	for _, name := range [...]string{"config", "config.worktree"} {
-		if err := sanitizeGitCheckpointConfig(filepath.Join(dir, name)); err != nil {
-			return err
-		}
-	}
-	if err := scrubGitCheckpointHooks(dir); err != nil {
-		return err
+// dropCommonDir removes a commondir pointer the sanitizer cannot vouch for.
+func (w *gitCheckpointSanitizer) dropCommonDir(dir string) error {
+	if err := os.Remove(filepath.Join(dir, "commondir")); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove checkpoint commondir: %w", err)
 	}
 	return nil
 }
 
-// scrubGitCheckpointHooks removes the programs git would run from dir/hooks. A
-// directory can satisfy the repository predicate while being a branch namespace —
-// branches "topic/HEAD" and "topic/commondir" do — and that namespace's hooks/ entry
-// is a directory of loose refs, not hooks, so entries holding a loose ref (an object
-// id or a symref line) keep their bytes. Directories are left alone: git only runs
-// the regular files it finds directly in hooks/, never a subdirectory.
-func scrubGitCheckpointHooks(dir string) error {
-	hooksDir := filepath.Join(dir, "hooks")
-	entries, err := os.ReadDir(hooksDir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return fmt.Errorf("read checkpoint hooks: %w", err)
-	}
-	remaining := 0
-	for _, entry := range entries {
-		path := filepath.Join(hooksDir, entry.Name())
-		info, statErr := os.Lstat(path)
-		if statErr != nil {
-			if os.IsNotExist(statErr) {
-				continue
-			}
-			return fmt.Errorf("stat checkpoint hook %s: %w", path, statErr)
-		}
-		if info.IsDir() {
-			remaining++
+// insideTree reports whether an absolute path is inside the extracted tree.
+func (w *gitCheckpointSanitizer) insideTree(path string) bool {
+	for _, root := range [...]string{w.root, w.rootReal} {
+		if root == "" {
 			continue
 		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			// A link would be executed through its target; git resolves hooks by name
-			// in this directory, so the link itself goes.
-			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-				return fmt.Errorf("remove checkpoint hook link %s: %w", path, err)
-			}
-			continue
-		}
-		data, readErr := os.ReadFile(path)
-		if readErr != nil {
-			return fmt.Errorf("read checkpoint hook %s: %w", path, readErr)
-		}
-		if isGitCheckpointRefContent(data) {
-			remaining++
-			continue
-		}
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("remove checkpoint hook %s: %w", path, err)
+		if path == root || strings.HasPrefix(path, root+string(filepath.Separator)) {
+			return true
 		}
 	}
-	if remaining == 0 {
-		if err := os.Remove(hooksDir); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("remove checkpoint hooks: %w", err)
-		}
-	}
-	return nil
-}
-
-// isGitCheckpointRefContent reports whether a file holds a loose ref (an object id)
-// or a symref line rather than a program.
-func isGitCheckpointRefContent(data []byte) bool {
-	text := strings.TrimRight(string(data), "\r\n")
-	if strings.HasPrefix(text, "ref: ") {
-		return true
-	}
-	switch len(text) {
-	case 40, 64:
-	default:
-		return false
-	}
-	for _, r := range text {
-		if (r < '0' || r > '9') && (r < 'a' || r > 'f') && (r < 'A' || r > 'F') {
-			return false
-		}
-	}
-	return true
+	return false
 }
 
 // checkpointAdminDirs lists the child directories of dir that can be repository
@@ -1597,6 +1515,161 @@ func isGitCheckpointRepoDir(dir string) bool {
 		}
 	}
 	return false
+}
+
+// sanitizeGitCheckpointRepoFiles rewrites the config files of one repository admin
+// directory and removes its hooks.
+func sanitizeGitCheckpointRepoFiles(dir string) error {
+	// extensions.worktreeConfig moves core.* keys into config.worktree, so a
+	// checkpoint could hide a fsmonitor/pager there instead of in config.
+	for _, name := range [...]string{"config", "config.worktree"} {
+		if err := sanitizeGitCheckpointConfig(filepath.Join(dir, name)); err != nil {
+			return err
+		}
+	}
+	if err := scrubGitCheckpointHooks(dir); err != nil {
+		return err
+	}
+	return nil
+}
+
+// gitCheckpointHookNames are the names git runs from a hooks directory. A file with
+// one of these names is a hook whatever it contains; anything else under a path that a
+// namespace-style classification mistook for an admin directory is reference storage.
+var gitCheckpointHookNames = map[string]bool{
+	"applypatch-msg":        true,
+	"pre-applypatch":        true,
+	"post-applypatch":       true,
+	"pre-commit":            true,
+	"pre-merge-commit":      true,
+	"prepare-commit-msg":    true,
+	"commit-msg":            true,
+	"post-commit":           true,
+	"pre-rebase":            true,
+	"post-checkout":         true,
+	"post-merge":            true,
+	"pre-push":              true,
+	"pre-receive":           true,
+	"update":                true,
+	"proc-receive":          true,
+	"post-receive":          true,
+	"post-update":           true,
+	"reference-transaction": true,
+	"push-to-checkout":      true,
+	"pre-auto-gc":           true,
+	"post-rewrite":          true,
+	"sendemail-validate":    true,
+	"fsmonitor-watchman":    true,
+	"p4-changelist":         true,
+	"p4-prepare-changelist": true,
+	"p4-post-changelist":    true,
+	"p4-pre-submit":         true,
+	"post-index-change":     true,
+}
+
+// scrubGitCheckpointHooks removes the programs git would run from dir/hooks.
+//
+// A directory can satisfy the repository predicate while being a branch namespace —
+// branches "topic/HEAD" and "topic/commondir" do — and that namespace's hooks/ entry
+// is reference storage, not hooks. Two rules keep that data while leaving nothing
+// executable behind: a file named like a git hook goes whatever it contains (an
+// executable hook is found by name, and a script whose first line happens to read
+// "ref: ..." still runs the lines after it), and an executable file that is not a
+// loose ref goes too, which covers a hook name this list does not know yet.
+func scrubGitCheckpointHooks(dir string) error {
+	hooksDir := filepath.Join(dir, "hooks")
+	info, err := os.Lstat(hooksDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("stat checkpoint hooks: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		// Git resolves a hooks directory through the link; dropping the link keeps the
+		// walk (and execution) inside the restored tree.
+		if err := os.Remove(hooksDir); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove checkpoint hooks link: %w", err)
+		}
+		return nil
+	}
+	if !info.IsDir() {
+		// A branch named "hooks": its loose ref file keeps its bytes.
+		return nil
+	}
+	entries, err := os.ReadDir(hooksDir)
+	if err != nil {
+		return fmt.Errorf("read checkpoint hooks: %w", err)
+	}
+	remaining := 0
+	for _, entry := range entries {
+		name := entry.Name()
+		path := filepath.Join(hooksDir, name)
+		info, statErr := os.Lstat(path)
+		if statErr != nil {
+			if os.IsNotExist(statErr) {
+				continue
+			}
+			return fmt.Errorf("stat checkpoint hook %s: %w", path, statErr)
+		}
+		if info.IsDir() {
+			// Git only runs regular files found directly in hooks/.
+			remaining++
+			continue
+		}
+		remove := gitCheckpointHookNames[strings.TrimSuffix(name, ".sample")]
+		if !remove {
+			switch {
+			case info.Mode()&os.ModeSymlink != 0:
+				// Git would execute the link's target.
+				remove = true
+			case info.Mode()&0o111 != 0:
+				data, readErr := os.ReadFile(path)
+				if readErr != nil {
+					return fmt.Errorf("read checkpoint hook %s: %w", path, readErr)
+				}
+				// An executable loose ref keeps its bytes; everything else executable in
+				// a hooks directory is a program.
+				remove = !isGitCheckpointLooseRef(data)
+			}
+		}
+		if !remove {
+			remaining++
+			continue
+		}
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove checkpoint hook %s: %w", path, err)
+		}
+	}
+	if remaining == 0 {
+		if err := os.Remove(hooksDir); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove checkpoint hooks: %w", err)
+		}
+	}
+	return nil
+}
+
+// isGitCheckpointLooseRef reports whether data is a single loose ref: an object id or
+// a "ref: refs/..." symref, with nothing after it.
+func isGitCheckpointLooseRef(data []byte) bool {
+	text := strings.TrimRight(string(data), "\r\n")
+	if strings.ContainsAny(text, "\r\n") {
+		return false
+	}
+	if target, ok := strings.CutPrefix(text, "ref: "); ok {
+		return strings.HasPrefix(target, "refs/") && !strings.ContainsAny(target, " \t")
+	}
+	switch len(text) {
+	case 40, 64:
+	default:
+		return false
+	}
+	for _, r := range text {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') && (r < 'A' || r > 'F') {
+			return false
+		}
+	}
+	return true
 }
 
 // sanitizeGitCheckpointConfig rewrites a git config file keeping only the
