@@ -710,3 +710,83 @@ func TestSanitizeGitCheckpointConfigDropsWorktreeConfigExtension(t *testing.T) {
 		t.Fatalf("safe extension was dropped:\n%s", got)
 	}
 }
+
+// A submodule's admin path is <gitdir>/modules/<name>, and <name> is the
+// submodule's path in the superproject — so it may contain slashes and is not a
+// single directory entry. The walk has to descend through those components.
+func TestSanitizeGitCheckpointDirStripsNestedSubmoduleName(t *testing.T) {
+	dir := t.TempDir()
+	moduleDir := filepath.Join(dir, "modules", "libs", "foo")
+	if err := os.MkdirAll(moduleDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := "[core]\n\trepositoryformatversion = 0\n\tfsmonitor = /tmp/evil\n"
+	if err := os.WriteFile(filepath.Join(moduleDir, "config"), []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := sanitizeGitCheckpointDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(moduleDir, "config"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "fsmonitor") {
+		t.Fatalf("nested submodule config kept fsmonitor:\n%s", string(data))
+	}
+}
+
+// Nested repositories are not bounded by a fixed depth: a submodule chain or a
+// submodule of a submodule keeps nesting, and every level is still git config
+// git will read.
+func TestSanitizeGitCheckpointDirSanitizesDeepRepositoryNesting(t *testing.T) {
+	dir := t.TempDir()
+	deep := filepath.Join(dir, "modules", "a", "modules", "b", "modules", "c", "modules", "d", "modules", "e")
+	if err := os.MkdirAll(deep, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := "[core]\n\tpager = /tmp/evil-pager\n"
+	if err := os.WriteFile(filepath.Join(deep, "config"), []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := sanitizeGitCheckpointDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(deep, "config"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "pager") {
+		t.Fatalf("deeply nested config kept pager:\n%s", string(data))
+	}
+}
+
+// A symlinked path component inside modules/ would let a checkpoint point git at
+// a directory it controls elsewhere in the tree; the link is dropped instead of
+// followed.
+func TestSanitizeGitCheckpointDirDropsSymlinkedSubmodulePathComponent(t *testing.T) {
+	root := t.TempDir()
+	// The link target lives inside the restored tree, so the archive's
+	// link-target validation would have accepted the link itself.
+	target := filepath.Join(root, "real", "foo")
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	hostile := "[core]\n\tfsmonitor = /tmp/evil\n"
+	if err := os.WriteFile(filepath.Join(target, "config.worktree"), []byte(hostile), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitDir := filepath.Join(root, "git")
+	if err := os.MkdirAll(filepath.Join(gitDir, "modules"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(gitDir, "modules", "libs")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := sanitizeGitCheckpointDir(gitDir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(gitDir, "modules", "libs")); !os.IsNotExist(err) {
+		t.Fatalf("symlinked submodule path component survived (err=%v)", err)
+	}
+}

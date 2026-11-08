@@ -455,4 +455,36 @@ func TestHasFSLayerStorageRef(t *testing.T) {
 	} else if !live {
 		t.Fatal("abandoning a layer dropped the payload claim its entries still hold")
 	}
+
+	// The hash is derived from the ref on write and on read: a caller-supplied
+	// hash that disagrees with the ref must not hide the claim.
+	const badRef = "layers/layer-gc/obj-3"
+	if err := s.CreateFSLayer(ctx, &FSLayer{LayerID: "layer-gc-bad", BaseRootPath: "/repo"}); err != nil {
+		t.Fatalf("CreateFSLayer second: %v", err)
+	}
+	badEntry := &FSLayerEntry{
+		LayerID:        "layer-gc-bad",
+		Path:           "/repo/other.bin",
+		Op:             FSLayerEntryOpUpsert,
+		Kind:           FSLayerEntryKindFile,
+		StorageType:    string(StorageS3),
+		StorageRef:     badRef,
+		StorageRefHash: "0000000000000000000000000000000000000000000000000000000000000000",
+		SizeBytes:      1,
+	}
+	if err := s.UpsertFSLayerEntry(ctx, badEntry); err != nil {
+		t.Fatalf("UpsertFSLayerEntry with a stale hash: %v", err)
+	}
+	stored, err := s.GetFSLayerEntry(ctx, "layer-gc-bad", "/repo/other.bin")
+	if err != nil {
+		t.Fatalf("GetFSLayerEntry: %v", err)
+	}
+	if stored.StorageRefHash != StorageRefHash(badRef) {
+		t.Fatalf("stored hash = %q, want the hash derived from the ref", stored.StorageRefHash)
+	}
+	if live, err := s.HasFSLayerStorageRef(ctx, badEntry.StorageRefHash, badRef); err != nil {
+		t.Fatalf("HasFSLayerStorageRef with a stale hash: %v", err)
+	} else if !live {
+		t.Fatal("a stale stored hash hid a live payload claim from object GC")
+	}
 }

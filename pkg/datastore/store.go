@@ -1243,6 +1243,12 @@ func (s *Store) HasFSLayerStorageRef(ctx context.Context, storageRefHash, storag
 	if storageRefHash == "" || storageRef == "" {
 		return false, nil
 	}
+	// The hash is passed in by the GC candidate, not read from the row, so the
+	// query derives it from the ref again: a row that recorded a different hash
+	// must not be able to hide a live claim from collection.
+	if canonical := StorageRefHash(storageRef); canonical != storageRefHash {
+		storageRefHash = canonical
+	}
 	row := s.db.QueryRowContext(ctx, `SELECT 1
 		FROM fs_layer_entries
 		WHERE `+s.scope.And(`storage_ref_hash = ? AND storage_ref = ?`)+`
