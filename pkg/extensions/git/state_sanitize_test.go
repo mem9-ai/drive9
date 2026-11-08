@@ -1290,3 +1290,87 @@ func TestSanitizeGitCheckpointDirKeepsWalkingNamespaceStorageNames(t *testing.T)
 		t.Fatalf("child gitdir below an objects directory kept its hook: %v", err)
 	}
 }
+
+// A common store can be visited before the repository that points at it: os.ReadDir
+// sorts names, so modules/a-shared is walked (and, having no HEAD, not sanitized)
+// before modules/z-wt resolves its commondir to it. Having been walked is not proof
+// that its administrative files were handled.
+func TestSanitizeGitCheckpointDirSanitizesCommonDirWalkedFirst(t *testing.T) {
+	gitDir := t.TempDir()
+	shared := filepath.Join(gitDir, "modules", "a-shared")
+	for _, dir := range []string{filepath.Join(shared, "objects"), filepath.Join(shared, "refs"), filepath.Join(shared, "hooks")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(shared, "config"), []byte("[core]\n\tpager = /tmp/evil-pager\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(shared, "hooks", "post-checkout"), []byte("#!/bin/sh\ntrue\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// z-wt sorts after a-shared, so the common store is walked first.
+	worktree := filepath.Join(gitDir, "modules", "z-wt")
+	if err := os.MkdirAll(worktree, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, "commondir"), []byte("../a-shared\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := sanitizeGitCheckpointDir(gitDir); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(shared, "config"))
+	if err != nil {
+		t.Fatalf("common store config: %v", err)
+	}
+	if strings.Contains(string(data), "pager") {
+		t.Fatalf("common store walked first kept pager:\n%s", string(data))
+	}
+	if _, err := os.Stat(filepath.Join(shared, "hooks", "post-checkout")); !os.IsNotExist(err) {
+		t.Fatalf("common store walked first kept its hook: %v", err)
+	}
+}
+
+// Branches "topic/HEAD" and "topic/commondir" satisfy the repository predicate, so a
+// submodule's refs/heads/topic is classified as an admin directory. Its loose refs —
+// including the one named commondir, whose object id is not a path — must keep their
+// bytes, and so must the matching reflog.
+func TestSanitizeGitCheckpointDirPreservesBranchNamedCommondir(t *testing.T) {
+	gitDir := t.TempDir()
+	writeCheckpointRepo(t, gitDir, "[core]\n\trepositoryformatversion = 0\n")
+	sub := filepath.Join(gitDir, "modules", "dep")
+	writeCheckpointRepo(t, sub, "[core]\n\trepositoryformatversion = 0\n")
+	const oid = "0123456789abcdef0123456789abcdef01234567"
+	const reflog = "0000000000000000000000000000000000000000 " + oid + " A U Thor <a@example.com> 1 +0000\tcommit: x\n"
+	paths := map[string]string{
+		filepath.Join(sub, "refs", "heads", "topic", "HEAD"):              oid + "\n",
+		filepath.Join(sub, "refs", "heads", "topic", "commondir"):         oid + "\n",
+		filepath.Join(sub, "logs", "refs", "heads", "topic", "HEAD"):      reflog,
+		filepath.Join(sub, "logs", "refs", "heads", "topic", "commondir"): reflog,
+	}
+	for path, body := range paths {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := sanitizeGitCheckpointDir(gitDir); err != nil {
+		t.Fatal(err)
+	}
+	want := paths
+	for path, body := range want {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("%s was removed: %v", path, err)
+		}
+		if string(data) != body {
+			t.Fatalf("%s was rewritten: got %q want %q", path, string(data), body)
+		}
+	}
+}
