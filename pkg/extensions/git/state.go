@@ -1265,17 +1265,8 @@ func sanitizeGitCheckpointDir(gitDir string) error {
 // directory, and logs/…/config is a reflog entry, and none of them is
 // configuration.
 func sanitizeGitCheckpointRepoDir(dir string) error {
-	// extensions.worktreeConfig moves core.* keys into config.worktree, so a
-	// checkpoint could hide a fsmonitor/pager there instead of in config.
-	for _, name := range [...]string{"config", "config.worktree"} {
-		if err := sanitizeGitCheckpointConfig(filepath.Join(dir, name)); err != nil {
-			return err
-		}
-	}
-	// Hooks are executable programs git runs from this repository. Nothing in a
-	// checkpoint needs them.
-	if err := os.RemoveAll(filepath.Join(dir, "hooks")); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("remove checkpoint hooks: %w", err)
+	if err := sanitizeGitCheckpointRepoFiles(dir); err != nil {
+		return err
 	}
 	worktrees, err := checkpointAdminDirs(filepath.Join(dir, "worktrees"))
 	if err != nil {
@@ -1311,8 +1302,13 @@ func sanitizeGitCheckpointRepoDir(dir string) error {
 // from the walk. What the walk rewrites is decided by isGitCheckpointRepoDir, not
 // by the name of the directory it happens to be looking at.
 func sanitizeGitCheckpointSubmodulePath(dir string) error {
-	if isGitCheckpointRepoDir(dir) {
-		if err := sanitizeGitCheckpointRepoDir(dir); err != nil {
+	// Each directory is visited once: what gets rewritten here is decided by this
+	// directory's own layout, and the recursion only descends. Sanitising the
+	// registries of a directory that was just sanitised would visit the subtree
+	// below it a second time, and a chain of nested submodules would multiply that
+	// per level.
+	if isGitCheckpointRepoDir(dir) || isGitCheckpointWorktreeAdminDir(dir) {
+		if err := sanitizeGitCheckpointRepoFiles(dir); err != nil {
 			return err
 		}
 	}
@@ -1366,6 +1362,24 @@ func checkpointAdminDirs(dir string) ([]string, error) {
 	return out, nil
 }
 
+// sanitizeGitCheckpointRepoFiles rewrites the config files of one repository admin
+// directory and removes its hooks.
+func sanitizeGitCheckpointRepoFiles(dir string) error {
+	// extensions.worktreeConfig moves core.* keys into config.worktree, so a
+	// checkpoint could hide a fsmonitor/pager there instead of in config.
+	for _, name := range [...]string{"config", "config.worktree"} {
+		if err := sanitizeGitCheckpointConfig(filepath.Join(dir, name)); err != nil {
+			return err
+		}
+	}
+	// Hooks are executable programs git runs from this repository. Nothing in a
+	// checkpoint needs them.
+	if err := os.RemoveAll(filepath.Join(dir, "hooks")); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove checkpoint hooks: %w", err)
+	}
+	return nil
+}
+
 // isGitCheckpointRepoDir reports whether dir is laid out the way git validates a
 // repository before reading anything from it: a HEAD file plus objects/ and a
 // refs/ (or reftable/) directory, or a commondir file for a linked worktree. Git
@@ -1390,6 +1404,14 @@ func isGitCheckpointRepoDir(dir string) bool {
 		}
 	}
 	return false
+}
+
+// isGitCheckpointWorktreeAdminDir reports whether dir is a linked worktree's admin
+// directory by position (…/worktrees/<name>). Git reads config.worktree from it, and
+// a checkpoint may ship it before the commondir pointer the restore repairs, so the
+// position is what makes it one.
+func isGitCheckpointWorktreeAdminDir(dir string) bool {
+	return filepath.Base(filepath.Dir(dir)) == "worktrees"
 }
 
 // sanitizeGitCheckpointConfig rewrites a git config file keeping only the
@@ -1420,6 +1442,10 @@ func sanitizeGitCheckpointConfig(path string) error {
 		}
 		return fmt.Errorf("read checkpoint config: %w", err)
 	}
+	// Git accepts a UTF-8 byte-order mark at the start of a config file and parses
+	// the rest, so the mark is stripped before the format check and the rewrite.
+	// Leaving it would let a BOM-prefixed config skip sanitising entirely.
+	data = bytes.TrimPrefix(data, []byte{0xEF, 0xBB, 0xBF})
 	// Git requires section headers, so anything that is not a config file at all
 	// (a loose ref, a reflog entry, a payload a checkpoint happened to name
 	// config) is left exactly as it is instead of being rewritten into an empty

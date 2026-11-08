@@ -4,11 +4,13 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // writeCheckpointRepo lays out a repository admin directory the way git validates
@@ -959,5 +961,56 @@ func TestSanitizeGitCheckpointDirKeepsRepoObjectsIntact(t *testing.T) {
 	}
 	if data, err := os.ReadFile(filepath.Join(objDir, "cdef")); err != nil || string(data) != "object" {
 		t.Fatalf("objects/ content was touched: data=%q err=%v", string(data), err)
+	}
+}
+
+// Git parses a config that starts with a UTF-8 byte-order mark, so the sanitizer
+// has to strip the mark before deciding whether the file is configuration. Without
+// that, a BOM-prefixed config skipped sanitising entirely and its core.fsmonitor
+// stayed live.
+func TestSanitizeGitCheckpointConfigStripsBOM(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config")
+	body := append([]byte{0xEF, 0xBB, 0xBF}, []byte("[core]\n\trepositoryformatversion = 0\n\tfsmonitor = /tmp/evil\n")...)
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := sanitizeGitCheckpointConfig(path); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "fsmonitor") {
+		t.Fatalf("BOM-prefixed config kept fsmonitor:\n%s", string(data))
+	}
+	if !strings.Contains(string(data), "repositoryformatversion = 0") {
+		t.Fatalf("BOM-prefixed config lost its safe core key:\n%s", string(data))
+	}
+}
+
+// A long chain of nested submodules must be walked once per directory: sanitising a
+// directory's registries and then descending into them again multiplies the work
+// per level, so a checkpoint with a deep chain could make the restore crawl.
+func TestSanitizeGitCheckpointDirVisitsDeepChainOnce(t *testing.T) {
+	dir := t.TempDir()
+	deep := dir
+	for i := 0; i < 24; i++ {
+		deep = filepath.Join(deep, "modules", fmt.Sprintf("m%d", i))
+		writeCheckpointRepo(t, deep, "[core]\n\tfsmonitor = /tmp/evil\n\tpager = /tmp/evil-pager\n")
+	}
+	start := time.Now()
+	if err := sanitizeGitCheckpointDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("sanitising a 24-level chain took %s; the walk is no longer linear", elapsed)
+	}
+	data, err := os.ReadFile(filepath.Join(deep, "config"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "fsmonitor") || strings.Contains(string(data), "pager") {
+		t.Fatalf("deepest config kept executable keys:\n%s", string(data))
 	}
 }
