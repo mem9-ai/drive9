@@ -605,9 +605,15 @@ func TestPortLedgerShadowSurvivesQueueLanding(t *testing.T) {
 	}
 
 	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := wb.Stop(ctx); err != nil {
+		// Stop drains workers and does not enforce its context deadline.
+		// Cancel this fixture's only path first, including a pending upload
+		// left behind when a landing assertion fails, then join the workers.
+		if wb.queue != nil {
+			if err := wb.queue.CancelPath("/h"); err != nil {
+				t.Errorf("cancel fixture upload: %v", err)
+			}
+		}
+		if err := wb.Stop(context.Background()); err != nil {
 			t.Errorf("stop writeback: %v", err)
 		}
 	})
