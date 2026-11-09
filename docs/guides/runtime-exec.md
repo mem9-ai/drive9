@@ -66,8 +66,13 @@ The server must have remote exec enabled. Otherwise the command reports
 - **Never retried.** If the outcome is unknown, the command may already have
   run. Check the workspace before running it again.
 
-The lightweight executor has bounded file and matching budgets. It does not
-automatically rerun a command in a sandbox after execution has started. For a
+The lightweight executor has bounded file and matching budgets. Servers with
+input metadata preflight check supported literal file operands before execution
+and select a sandbox when an existing file exceeds the lightweight file budget.
+This requires the corresponding server and executor update; it is not enabled
+by updating the CLI alone. Files created or enlarged during execution still
+have to fit the selected executor's limits. The command is not automatically
+rerun in a sandbox after execution has started. For a
 read-only query that is safe to repeat, `--fresh` selects a new sandbox, at the
 cost of sandbox startup time. Check any earlier writes before rerunning a
 command that can modify files.
