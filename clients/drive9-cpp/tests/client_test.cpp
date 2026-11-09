@@ -35,12 +35,13 @@ public:
     std::map<std::string, std::string> objects;
     std::vector<Json> calls;
     int refs = 0, puts = 0, gets = 0, publications = 0, mints = 0;
-    bool exists = false, guarded = true, directory_projection = true, fail_ack = false, fail_put = false, removed = false;
+    bool exists = false, guarded = true, directory_projection = true, clone_capability = true, clone_lost_ack = false, clone_bad_ack = false, fail_ack = false, fail_put = false, removed = false;
     bool gate_put = false, put_entered = false, gate_get = false, get_entered = false;
     bool binding_change = false, refresh_auth = false;
     bool fail_cleanup = false;
     int cleanup_calls = 0, renewals = 0;
     std::string corrupt_op;
+    Json clone_override;
     Json corrupt_errno;
     Json credential = {{"scheme", "s3"}, {"endpoint", "http://object.test"}, {"bucket", "bucket"},
                        {"prefix", "tenant/"}, {"access_key_id", "test-access"}, {"secret_access_key", "test-secret"},
@@ -88,7 +89,7 @@ public:
             counter += delta; response["value"] = counter;
             reservations[request.at("name").get<std::string>()].push_back({counter, delta});
         }
-        else if (op == "new_session") { sid = request.at("sid"); response["session_guard"] = guarded; response["directory_projection"] = directory_projection; }
+        else if (op == "new_session") { sid = request.at("sid"); response["session_guard"] = guarded; response["directory_projection"] = directory_projection; response["clone_v1"] = clone_capability; }
         else if (op == "refresh_session") {
             if (removed) response["errno"] = 116;
             if (request.value("expire", int64_t(0)) > 1) { ++renewals; cv.notify_all(); }
@@ -117,6 +118,11 @@ public:
                 response["attr"] = attr; response["slices"] = detail::EncodeBase64(maps[index]);
                 if (fail_ack) throw Error("write committed but acknowledgement was lost");
             }
+        } else if (op == "clone") {
+            response["inode"] = request.at("new_inode"); response["attr"] = attr;
+            if (clone_bad_ack) response["inode"] = 42;
+            if (!clone_override.is_null()) response.merge_patch(clone_override);
+            if (clone_lost_ack) throw Error("clone committed but acknowledgement was lost");
         } else if (op == "truncate") { attr["Length"] = request.at("length"); response["attr"] = attr; maps.clear(); }
         if (op == corrupt_op) response["errno"] = corrupt_errno;
         return {200, {}, response.dump()};
@@ -597,8 +603,75 @@ void RenameNamespaceValidation() {
     fs.Rename("/source", "/target");
     Check(f.rename.at("src_path") == "/source/" && f.rename.at("dst_path") == "/target/", "capable directory rename lost its paths");
 }
+void AtomicCloneProtocol() {
+    Fixture f; f.exists = true; f.attr["Length"] = 8192;
+    ExtentFileSystem fs(f.ClientFor());
+    OpenOptions options; options.write = true; options.lock = Lock::Exclusive;
+    auto handle = fs.Open("/source", options);
+    auto result = fs.Clone(handle, "/published", 123);
+    Check(result.size == 8192 && result.inode > (1ULL << 53), "clone identity/length lost precision");
+    Check(f.puts == 0 && f.gets == 0, "metadata clone transferred object payloads");
+    Json request;
+    for (auto &call : f.calls) if (call.at("op") == "clone") request = call.at("body");
+    Check(request.at("inode") == 42 && request.at("owner") == handle, "clone did not bind source lock");
+    Check(request.at("caller_sid") == fs.SessionID(), "clone lost existing session");
+    Check(request.at("expected_inode") == 123 && request.at("proj_path") == "/published", "clone lost CAS/path");
+    Check(fs.Info(handle).inode == 42, "clone rebound the live writer");
+    fs.Close(handle);
+    auto unlocked = fs.Open("/source");
+    Fails([&] { fs.Clone(unlocked, "/unlocked"); }, "unlocked clone was accepted");
+    fs.Close(unlocked);
+}
+void CloneCapabilityAndFailures() {
+    for (bool guard : {false, true}) {
+        Fixture f; f.guarded = guard; f.clone_capability = !guard; f.exists = true;
+        ExtentFileSystem fs(f.ClientFor());
+        OpenOptions options; options.lock = Lock::Shared;
+        auto h = fs.Open("/source", options);
+        Check(!fs.CloneSupported(), "clone admitted incomplete server capabilities");
+        Fails([&] { fs.Clone(h, "/target"); }, "invalid clone succeeded");
+        for (auto &call : f.calls) Check(call.at("op") != "clone", "unsupported clone reached server");
+        fs.Close(h);
+    }
+    for (bool malformed : {false, true}) {
+    Fixture f; f.exists = true; f.clone_lost_ack = !malformed; f.clone_bad_ack = malformed;
+    ExtentFileSystem fs(f.ClientFor());
+    OpenOptions options; options.lock = Lock::Exclusive; options.write = true;
+    auto h = fs.Open("/source", options);
+    Fails([&] { fs.Clone(h, "/target"); }, "invalid clone succeeded");
+    Fails([&] { fs.WriteAt(h, "x", 1, 0); }, "write survived ambiguous clone");
+    Fails([&] { fs.Clone(h, "/target"); }, "invalid clone succeeded");
+    int count = 0; for (auto &call : f.calls) if (call.at("op") == "clone") ++count;
+    Check(count == 1 && f.puts == 0, "ambiguous clone was replayed or allowed a later write");
+    }
+    Fixture f; f.exists = true; f.corrupt_op = "clone"; f.corrupt_errno = 11;
+    ExtentFileSystem fs(f.ClientFor());
+    OpenOptions options; options.lock = Lock::Shared;
+    auto h = fs.Open("/source", options);
+    Fails([&] { fs.Clone(h, "/target", 100); }, "stale destination CAS succeeded");
+    f.corrupt_op.clear();
+    Check(fs.Clone(h, "/target", 101).exists, "definite conflict poisoned the session");
+    fs.Close(h);
+}
+void MalformedCloneAttributes() {
+    for (const auto &patch : std::vector<Json>{
+        {{"attr", {{"Typ", 257}}}}, {{"attr", {{"Typ", -255}}}}, {{"attr", {{"Typ", 1.5}}}},
+        {{"attr", {{"Length", -1}}}}, {{"attr", {{"Length", (1ULL << 58) + 1}}}},
+        {{"attr", {{"Length", 1.5}}}}, {{"attr", {{"Length", nullptr}}}}, {{"inode", 42.5}}
+    }) {
+        Fixture f; f.exists = true; f.clone_override = patch;
+        ExtentFileSystem fs(f.ClientFor());
+        OpenOptions options; options.write = true; options.lock = Lock::Exclusive;
+        auto h = fs.Open("/source", options);
+        Fails([&] { fs.Clone(h, "/target"); }, "malformed clone attributes accepted");
+        Fails([&] { fs.WriteAt(h, "x", 1, 0); }, "malformed clone allowed later writes");
+        int clones = 0; for (auto &call : f.calls) if (call.at("op") == "clone") ++clones;
+        Check(clones == 1 && f.puts == 0, "malformed clone was replayed");
+    }
+}
 int main() {
     try {
+        AtomicCloneProtocol(); CloneCapabilityAndFailures(); MalformedCloneAttributes();
         ShutdownRenewsActiveWrite(); ConcurrentShutdownDrainsRead();
         DirectoryProjectionCapability(); LegacyDirectoryRenameIsRejected(); RenameNamespaceValidation();
         PathsAndSlices(); DurableSparseAndReferences(); CompatibleIDReservations(); LostPublicationAck(); MalformedAcknowledgement(); UploadFailure(); LatePutRejected();
