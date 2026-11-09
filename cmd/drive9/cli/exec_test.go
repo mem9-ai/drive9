@@ -259,6 +259,16 @@ func TestExecCancellationErrorStatus(t *testing.T) {
 }
 
 func TestExecDistinguishesExecutorFailureFromCommandExit(t *testing.T) {
+	for _, code := range []string{"engine_error", "memory_limit"} {
+		t.Run("before execution "+code, func(t *testing.T) {
+			execTestServer(t, fmt.Sprintf(`{"type":"error","execution_id":"rex_12345678","error_code":%q,"message":"input inspection failed"}`, code))
+			stdout, stderr, err := runExecForTest(t, t.Context(), "cat", "file")
+			var status *execStatusError
+			if !errors.As(err, &status) || status.ExitCode() != 125 || !strings.Contains(err.Error(), code) || stdout != "" || stderr != "" {
+				t.Fatalf("error=%v stdout=%q stderr=%q", err, stdout, stderr)
+			}
+		})
+	}
 	for _, code := range []string{"engine_error", "cpu_limit", "output_limit", "resource_limit"} {
 		t.Run(code, func(t *testing.T) {
 			var calls atomic.Int32
