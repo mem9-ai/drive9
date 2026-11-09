@@ -220,3 +220,9 @@ func TestWatchAdminMigrationEventsDoesNotRetryMalformedBaseURL(t *testing.T) {
 		t.Fatalf("watch error = %v, want permanent request error", err)
 	}
 }
+
+func TestMigrationStreamReadErrorsAreRetryable(t *testing.T) {
+	if !isRetryableMigrationStreamError(errors.New("stream error: stream ID 1; INTERNAL_ERROR")) {
+		t.Fatal("HTTP/2 stream read failure must be retryable")
+	}
+}

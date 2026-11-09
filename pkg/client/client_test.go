@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -1464,5 +1465,30 @@ func TestMkdirDirectory(t *testing.T) {
 	}
 	if !stat.IsDir {
 		t.Fatalf("expected directory")
+	}
+}
+
+func TestGetMigrationStateBypassesLifetimeStatusCache(t *testing.T) {
+	var mu sync.Mutex
+	state := "syncing"
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		current := state
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"status":"active","tenant_id":"t1","migration_state":"`+current+`"}`)
+	}))
+	defer ts.Close()
+	c := New(ts.URL, "")
+	c.Warm(t.Context())
+	if _, err := c.GetMigrationState(t.Context()); err != nil || state != "syncing" {
+		t.Fatalf("initial state: %v", err)
+	}
+	mu.Lock()
+	state = "migrated"
+	mu.Unlock()
+	got, err := c.GetMigrationState(t.Context())
+	if err != nil || got != "migrated" {
+		t.Fatalf("state after transition = %q, err=%v", got, err)
 	}
 }

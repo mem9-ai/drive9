@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -299,10 +298,10 @@ func isRetryableMigrationStreamError(err error) bool {
 	if errors.As(err, &statusErr) {
 		return statusErr.StatusCode >= 500
 	}
-	// Connection failures are retryable; local request-construction errors and
-	// other permanent failures are not.
-	var netErr net.Error
-	return errors.As(err, &netErr)
+	// Stream-read failures from HTTP/2 resets do not necessarily implement
+	// net.Error. Everything not classified above is a transport/read failure and
+	// may resume from the retained Last-Event-ID.
+	return true
 }
 
 func (c *Client) streamAdminMigrationEvents(ctx context.Context, req AdminMigrationWatchRequest, handler func(AdminMigrationEvent) error, lastEventID *string) error {

@@ -718,7 +718,9 @@ func (c *Client) GetMigrationTenantID(ctx context.Context) (string, error) {
 // server advertises one. Empty means the tenant is not in a migration batch
 // (or the server predates the field).
 func (c *Client) GetMigrationState(ctx context.Context) (string, error) {
-	body, err := c.tenantStatus(ctx)
+	// Migration state is mutable while the immutable status cache lives for the
+	// Client's lifetime. Always fetch it instead of returning a warmed snapshot.
+	body, err := c.fetchTenantStatus(ctx)
 	if err != nil {
 		return "", fmt.Errorf("fetch migration state: %w", err)
 	}
