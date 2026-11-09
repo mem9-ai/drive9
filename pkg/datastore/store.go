@@ -1227,6 +1227,57 @@ func (s *Store) HasConfirmedS3StorageRef(ctx context.Context, storageRefHash, st
 	return true, nil
 }
 
+// HasFSLayerStorageRef reports whether retained fs-layer history points at the
+// exact storage ref. Layer payloads are stored under layers/<layerID>/<object>
+// and stay readable for as long as any entry row carries the ref — abandoning a
+// layer keeps its entries — so the payload is still claimed whenever this
+// returns true.
+//
+// Layer refs are checked separately from the high-volume confirmed-content path
+// so ordinary blob GC keeps using its existing index; rows always carry the hash
+// (normalizeFSLayerEntry derives it), which is what
+// idx_fs_layer_entries_storage_ref makes this lookup cheap.
+func (s *Store) HasFSLayerStorageRef(ctx context.Context, storageRefHash, storageRef string) (out bool, err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "has_fs_layer_storage_ref", start, &err)
+	if storageRefHash == "" || storageRef == "" {
+		return false, nil
+	}
+	// The hash is passed in by the GC candidate, not read from the row, so the
+	// query derives it from the ref again: a row that recorded a different hash
+	// must not be able to hide a live claim from collection.
+	if canonical := StorageRefHash(storageRef); canonical != storageRefHash {
+		storageRefHash = canonical
+	}
+	row := s.db.QueryRowContext(ctx, `SELECT 1
+		FROM fs_layer_entries
+		WHERE `+s.scope.And(`storage_ref_hash = ? AND storage_ref = ?`)+`
+		LIMIT 1`, s.scope.Args(storageRefHash, storageRef)...)
+	var one int
+	err = row.Scan(&one)
+	if err == nil {
+		return true, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
+	// A row written before the upsert derived the hash can carry a nonempty but
+	// wrong value in this column, and the column is not backfilled. The ref is
+	// the identity, so fall back to it: this scan only runs for a layer payload
+	// the indexed lookup could not attribute, i.e. one about to be collected.
+	row = s.db.QueryRowContext(ctx, `SELECT 1
+		FROM fs_layer_entries
+		WHERE `+s.scope.And(`storage_ref = ?`)+`
+		LIMIT 1`, s.scope.Args(storageRef)...)
+	if err := row.Scan(&one); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
 func (s *Store) UpdateFileContent(ctx context.Context, fileID string, storageType StorageType, storageRef, contentType, checksum, contentText string, contentBlob []byte, size int64, description string) (newRevision int64, err error) {
 	start := time.Now()
 	defer observeStoreOp(ctx, "update_file_content", start, &err)

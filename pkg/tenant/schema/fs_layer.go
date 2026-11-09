@@ -82,6 +82,11 @@ func FSLayerTiDBSchemaStatements() []string {
 		`CREATE INDEX idx_fs_layer_entries_parent ON fs_layer_entries(layer_id, parent_path_hash)`,
 		`CREATE INDEX idx_fs_layer_entries_seq ON fs_layer_entries(layer_id, entry_seq)`,
 		`CREATE INDEX idx_fs_layer_entries_op ON fs_layer_entries(layer_id, op)`,
+		// Object GC asks whether retained layer history still claims a payload
+		// ref (HasFSLayerStorageRef) and compares the full ref, so the index
+		// carries both columns: the hash for selectivity, the ref prefix so the
+		// comparison stays an index lookup instead of a table read.
+		`CREATE INDEX idx_fs_layer_entries_storage_ref ON fs_layer_entries(storage_ref_hash, storage_ref(255))`,
 
 		`CREATE TABLE IF NOT EXISTS fs_layer_events (
 			event_id        VARCHAR(64) PRIMARY KEY,
@@ -184,6 +189,7 @@ func FSLayerDB9SchemaStatements() []string {
 		`CREATE INDEX IF NOT EXISTS idx_fs_layer_entries_parent ON fs_layer_entries(layer_id, parent_path_hash)`,
 		`CREATE INDEX IF NOT EXISTS idx_fs_layer_entries_seq ON fs_layer_entries(layer_id, entry_seq)`,
 		`CREATE INDEX IF NOT EXISTS idx_fs_layer_entries_op ON fs_layer_entries(layer_id, op)`,
+		`CREATE INDEX IF NOT EXISTS idx_fs_layer_entries_storage_ref ON fs_layer_entries(storage_ref_hash, storage_ref)`,
 
 		`CREATE TABLE IF NOT EXISTS fs_layer_events (
 			event_id        VARCHAR(64) PRIMARY KEY,

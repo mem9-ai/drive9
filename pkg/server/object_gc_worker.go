@@ -125,7 +125,20 @@ func (w *objectGCWorker) processOnce(ctx context.Context) (fatal bool) {
 }
 
 func (w *objectGCWorker) processCandidate(ctx context.Context, candidate meta.ObjectGCCandidate) error {
-	if strings.HasPrefix(candidate.StorageRef, "blobs/") {
+	// Every object a namespace holds can be live in more than one branch of a
+	// fork family: a fork copies the parent's rows verbatim, so the same
+	// storage_ref stays referenced by the parent and by every sibling while a
+	// fork exists, while the reachability check below only sees the owner's
+	// branch. A candidate in one of the ref families a fork family shares
+	// therefore waits until the family has collapsed.
+	//
+	// "layers/" is the family this guard used to miss: applying a layer copies
+	// its payload ref (layers/<layerID>/<object>) into the base file's contents
+	// row, so overwriting that file in one branch enqueued the shared layer
+	// object for collection and every sibling that still read it lost the
+	// bytes. The upstream fs server guards "blobs/", "layers/" and
+	// "append-log/"; drive9 writes no append-log objects.
+	if strings.HasPrefix(candidate.StorageRef, "blobs/") || strings.HasPrefix(candidate.StorageRef, "layers/") {
 		hasFork, err := w.meta.NamespaceHasNonDeletedFork(ctx, candidate.NamespaceID)
 		if err != nil {
 			return err
