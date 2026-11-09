@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -247,8 +248,9 @@ func (c *Client) WatchAdminMigrationEvents(ctx context.Context, req AdminMigrati
 		return fmt.Errorf("migration event handler is required")
 	}
 	backoff := time.Second
+	lastEventID := ""
 	for {
-		err := c.streamAdminMigrationEvents(ctx, req, handler)
+		err := c.streamAdminMigrationEvents(ctx, req, handler, &lastEventID)
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -286,14 +288,25 @@ func isRetryableMigrationStreamError(err error) bool {
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, context.DeadlineExceeded) {
 		return true
 	}
+	// A single event larger than the scanner limit is permanent; retrying the
+	// same stream would loop until the caller cancels.
+	if errors.Is(err, bufio.ErrTooLong) {
+		return false
+	}
 	var statusErr *StatusError
 	if errors.As(err, &statusErr) {
 		return statusErr.StatusCode >= 500
 	}
-	return true
+	// Connection failures are retryable; local request-construction errors and
+	// other permanent failures are not.
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	return false
 }
 
-func (c *Client) streamAdminMigrationEvents(ctx context.Context, req AdminMigrationWatchRequest, handler func(AdminMigrationEvent) error) error {
+func (c *Client) streamAdminMigrationEvents(ctx context.Context, req AdminMigrationWatchRequest, handler func(AdminMigrationEvent) error, lastEventID *string) error {
 	query := url.Values{}
 	if req.BatchID != "" {
 		query.Set("batch_id", req.BatchID)
@@ -313,6 +326,9 @@ func (c *Client) streamAdminMigrationEvents(ctx context.Context, req AdminMigrat
 		return fmt.Errorf("create migration event request: %w", err)
 	}
 	httpReq.Header.Set("Accept", "text/event-stream")
+	if lastEventID != nil && *lastEventID != "" {
+		httpReq.Header.Set("Last-Event-ID", *lastEventID)
+	}
 	req.Credentials.setHeaders(httpReq)
 	resp, err := c.do(httpReq)
 	if err != nil {
@@ -325,31 +341,46 @@ func (c *Client) streamAdminMigrationEvents(ctx context.Context, req AdminMigrat
 
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 64*1024), 1<<20)
-	var eventType string
+	var eventType, eventID string
 	var dataLines []string
 	dispatch := func() error {
+		id := eventID
+		typ := eventType
+		eventType = ""
+		eventID = ""
 		if len(dataLines) == 0 {
-			eventType = ""
+			if id != "" && lastEventID != nil {
+				*lastEventID = id
+			}
 			return nil
 		}
-		event := AdminMigrationEvent{Type: eventType, Data: json.RawMessage(strings.Join(dataLines, "\n"))}
-		eventType = ""
+		event := AdminMigrationEvent{Type: typ, Data: json.RawMessage(strings.Join(dataLines, "\n"))}
 		dataLines = nil
 		if err := handler(event); err != nil {
 			return &migrationEventHandlerError{err: err}
 		}
+		if id != "" && lastEventID != nil {
+			*lastEventID = id
+		}
 		return nil
 	}
 	for scanner.Scan() {
-		line := scanner.Text()
+		line := strings.TrimSuffix(scanner.Text(), "\r")
 		if line == "" {
 			if err := dispatch(); err != nil {
 				return err
 			}
 			continue
 		}
+		if strings.HasPrefix(line, ":") {
+			continue
+		}
 		if strings.HasPrefix(line, "event:") {
 			eventType = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+			continue
+		}
+		if strings.HasPrefix(line, "id:") {
+			eventID = strings.TrimSpace(strings.TrimPrefix(line, "id:"))
 			continue
 		}
 		if strings.HasPrefix(line, "data:") {
@@ -358,7 +389,7 @@ func (c *Client) streamAdminMigrationEvents(ctx context.Context, req AdminMigrat
 			dataLines = append(dataLines, value)
 			continue
 		}
-		// id:, retry:, and comment lines are intentionally ignored.
+		// retry: and unknown fields are intentionally ignored.
 	}
 	if err := scanner.Err(); err != nil {
 		return fmt.Errorf("read migration event stream: %w", err)

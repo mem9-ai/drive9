@@ -832,13 +832,18 @@ func printAdminMigrationAction(raw json.RawMessage) error {
 
 func printAdminMigrationEvent(event client.AdminMigrationEvent, asJSON bool) error {
 	if asJSON {
-		payload := struct {
-			Event string          `json:"event"`
-			Data  json.RawMessage `json:"data,omitempty"`
-		}{Event: event.Type, Data: event.Data}
+		var data any
 		if len(event.Data) > 0 {
-			payload.Data = event.Data
+			if json.Valid(event.Data) {
+				data = event.Data
+			} else {
+				data = string(event.Data)
+			}
 		}
+		payload := struct {
+			Event string `json:"event"`
+			Data  any    `json:"data,omitempty"`
+		}{Event: event.Type, Data: data}
 		raw, err := json.Marshal(payload)
 		if err != nil {
 			return err

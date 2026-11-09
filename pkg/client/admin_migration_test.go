@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -152,5 +154,57 @@ func TestAdminCreateMigrationBatchOmitsEmptyName(t *testing.T) {
 	}
 	if !strings.Contains(gotBody, `"tenant_ids":["t1"]`) {
 		t.Fatalf("body = %s", gotBody)
+	}
+}
+
+func TestWatchAdminMigrationEventsResumesCRLFWithLastEventID(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var mu sync.Mutex
+	calls := 0
+	var lastIDs []string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls++
+		call := calls
+		lastIDs = append(lastIDs, r.Header.Get("Last-Event-ID"))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		if call == 1 {
+			_, _ = io.WriteString(w, "id: 7\r\nevent: state_changed\r\ndata: {\"tenant_id\":\"t1\",\"state\":\"switched\"}\r\n\r\n")
+			return
+		}
+		_, _ = io.WriteString(w, "id: 8\r\nevent: migrated\r\ndata: {\"tenant_id\":\"t1\",\"state\":\"migrated\"}\r\n\r\n")
+	}))
+	defer ts.Close()
+	var events []AdminMigrationEvent
+	err := New(ts.URL, "").WatchAdminMigrationEvents(ctx, AdminMigrationWatchRequest{
+		Credentials: AdminMigrationCredentials{PublicKey: "pub", PrivateKey: "priv"},
+	}, func(event AdminMigrationEvent) error {
+		events = append(events, event)
+		if len(events) == 2 {
+			cancel()
+		}
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("watch error = %v, want context.Canceled", err)
+	}
+	if len(events) != 2 || events[0].Type != "state_changed" || events[1].Type != "migrated" {
+		t.Fatalf("events = %+v", events)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(lastIDs) < 2 || lastIDs[1] != "7" {
+		t.Fatalf("Last-Event-ID headers = %v", lastIDs)
+	}
+}
+
+func TestMigrationStreamPermanentErrorsAreNotRetried(t *testing.T) {
+	if isRetryableMigrationStreamError(bufio.ErrTooLong) {
+		t.Fatal("oversized SSE event must be permanent")
+	}
+	if !isRetryableMigrationStreamError(io.ErrUnexpectedEOF) {
+		t.Fatal("unexpected EOF must be retryable")
 	}
 }

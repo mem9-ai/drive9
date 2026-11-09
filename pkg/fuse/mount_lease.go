@@ -94,6 +94,7 @@ func (l *mountLeaseReporter) run(ctx context.Context) {
 		_, err := l.cl.HeartbeatMountLease(callCtx, l.req.MountID, l.req.TTLSeconds)
 		cancel()
 		if err == nil {
+			reportedFailure = false
 			continue
 		}
 		if ctx.Err() != nil {

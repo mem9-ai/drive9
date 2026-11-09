@@ -929,9 +929,23 @@ var coveredClientMethods = map[string]bool{
 
 	// Migration V1 client contract.
 	"BatchStatWithOptionsCtx":                               true,
+	"AdminCreateMigrationBatch":                             true,
+	"AdminGetMigrationBatch":                                true,
+	"AdminGetMigrationTenant":                               true,
+	"AdminGetMigrationTenantState":                          true,
+	"AdminListMigrationTenants":                             true,
+	"AdminPauseMigration":                                   true,
+	"AdminResumeMigration":                                  true,
+	"AdminRollbackMigration":                                true,
+	"AdminStartMigration":                                   true,
+	"DeleteMountLease":                                      true,
 	"GetMigrationCapabilities":                              true,
+	"GetMigrationState":                                     true,
 	"GetMigrationTenantID":                                  true,
+	"HeartbeatMountLease":                                   true,
 	"PostMigrationEvent":                                    true,
+	"RegisterMountLease":                                    true,
+	"WatchAdminMigrationEvents":                             true,
 	"WriteStreamConditionalWithChecksum":                    true,
 	"WriteStreamConditionalWithChecksumAndPreCompleteCheck": true,
 }
