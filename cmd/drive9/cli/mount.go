@@ -708,6 +708,12 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 		}
 	}
 
+	if resolved == MountModeFUSE || resolved == MountModeWebDAV {
+		if err := refuseMigratedSourceMount(context.Background(), serverVal, apiKeyVal, tokenVal); err != nil {
+			return err
+		}
+	}
+
 	autoUnpack := overlayProfile && len(effectivePackPaths) > 0 && !*noAutoUnpack
 	if runtime.GOOS == "windows" && resolved == MountModeFUSE && len(unpackArchives) == 0 && !autoUnpack {
 		return mountFuse(&mountFuseOptions{
@@ -2814,4 +2820,30 @@ func parseExtensionsFlag(v string) []string {
 		}
 	}
 	return out
+}
+
+// refuseMigratedSourceMount closes the source-region mount path once the
+// controller has recorded the first target write. The check is best-effort for
+// old servers or transient status failures: the mount itself still enforces
+// auth and the read-only fence. A confirmed migrated state is terminal.
+func refuseMigratedSourceMount(ctx context.Context, server, apiKey, token string) error {
+	if strings.TrimSpace(server) == "" {
+		return nil
+	}
+	var c *client.Client
+	if strings.TrimSpace(token) != "" {
+		c = client.NewWithToken(server, token)
+	} else {
+		c = client.New(server, apiKey)
+	}
+	callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	state, err := c.GetMigrationState(callCtx)
+	if err != nil {
+		return nil
+	}
+	if state == "migrated" {
+		return fmt.Errorf("drive9 mount: tenant migration is complete (migrated); the source region is no longer mountable, mount the target region instead")
+	}
+	return nil
 }

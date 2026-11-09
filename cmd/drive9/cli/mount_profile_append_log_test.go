@@ -97,8 +97,10 @@ func TestMountProfileAppendLogCapabilities(t *testing.T) {
 			if n := strings.Count(stderr, "[append-log] ignored:"); n != wantWarnings {
 				t.Fatalf("warnings = %d, stderr = %q", n, stderr)
 			}
-			if calls.Load() != 1 {
-				t.Fatalf("status requests = %d, want 1", calls.Load())
+			// One status request probes append-log support; the mount
+			// migration gate performs its own status read before starting.
+			if calls.Load() != 2 {
+				t.Fatalf("status requests = %d, want 2", calls.Load())
 			}
 		})
 	}
