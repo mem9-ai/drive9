@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestAdminCreateMigrationBatchSendsCredentialsAndPayload(t *testing.T) {
@@ -206,5 +207,16 @@ func TestMigrationStreamPermanentErrorsAreNotRetried(t *testing.T) {
 	}
 	if !isRetryableMigrationStreamError(io.ErrUnexpectedEOF) {
 		t.Fatal("unexpected EOF must be retryable")
+	}
+}
+
+func TestWatchAdminMigrationEventsDoesNotRetryMalformedBaseURL(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	err := New("http://[::1", "").WatchAdminMigrationEvents(ctx, AdminMigrationWatchRequest{}, func(AdminMigrationEvent) error {
+		return nil
+	})
+	if err == nil || errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("watch error = %v, want permanent request error", err)
 	}
 }

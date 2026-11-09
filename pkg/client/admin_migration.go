@@ -24,6 +24,8 @@ type AdminMigrationCredentials struct {
 	PrivateKey string
 }
 
+var errPermanentMigrationStream = errors.New("permanent migration stream error")
+
 func (c AdminMigrationCredentials) setHeaders(req *http.Request) {
 	setQuotaHeaders(req, c.PublicKey, c.PrivateKey)
 }
@@ -290,7 +292,7 @@ func isRetryableMigrationStreamError(err error) bool {
 	}
 	// A single event larger than the scanner limit is permanent; retrying the
 	// same stream would loop until the caller cancels.
-	if errors.Is(err, bufio.ErrTooLong) {
+	if errors.Is(err, bufio.ErrTooLong) || errors.Is(err, errPermanentMigrationStream) {
 		return false
 	}
 	var statusErr *StatusError
@@ -320,7 +322,7 @@ func (c *Client) streamAdminMigrationEvents(ctx context.Context, req AdminMigrat
 	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
-		return fmt.Errorf("create migration event request: %w", err)
+		return fmt.Errorf("%w: create migration event request: %v", errPermanentMigrationStream, err)
 	}
 	httpReq.Header.Set("Accept", "text/event-stream")
 	if lastEventID != nil && *lastEventID != "" {
