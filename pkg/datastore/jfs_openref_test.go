@@ -526,48 +526,35 @@ func TestConcurrentCloseOpenWithReleaseFaults(t *testing.T) {
 	if st := rt.Meta.Close(ctx, ino); st != 0 {
 		t.Fatalf("close of the create handle: %v", st)
 	}
-	var wg sync.WaitGroup
-	stop := make(chan struct{})
-	armorDone := make(chan struct{})
-	// A fault armorer: alternate the two fault kinds while the churn runs. It
-	// waits on its own channel — joining the workers' WaitGroup would only be
-	// stoppable after Wait returned, and Wait would wait on it forever.
-	go func() {
-		defer close(armorDone)
-		for i := 0; ; i++ {
-			select {
-			case <-stop:
-				return
-			default:
-			}
-			if i%2 == 0 {
-				fault.arm(faultFailBeforeCommit)
-			} else {
-				fault.arm(faultDropAfterCommit)
-			}
-			time.Sleep(time.Millisecond)
+	// Each round ends with all four handles closed, so a last close consumes
+	// the armed fault. Switch fault kinds only after the round has joined;
+	// a timer can overwrite one kind without any release ever observing it.
+	for round := 0; round < 25; round++ {
+		if round%2 == 0 {
+			fault.arm(faultFailBeforeCommit)
+		} else {
+			fault.arm(faultDropAfterCommit)
 		}
-	}()
-	for g := 0; g < 4; g++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			var a jfsmeta.Attr
-			for i := 0; i < 25; i++ {
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		for g := 0; g < 4; g++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				var a jfsmeta.Attr
 				if st := rt.Meta.Open(ctx, ino, syscall.O_RDWR, &a); st != 0 {
 					t.Errorf("open during churn: %v", st)
 					return
 				}
 				if st := rt.Meta.Close(ctx, ino); st != 0 {
 					t.Errorf("close during churn: %v", st)
-					return
 				}
-			}
-		}()
+			}()
+		}
+		close(start)
+		wg.Wait()
 	}
-	wg.Wait()
-	close(stop)
-	<-armorDone
 	for _, mode := range []int{faultFailBeforeCommit, faultDropAfterCommit} {
 		if got := fault.deliveredOfKind(mode); got < 1 {
 			t.Fatalf("faults of kind %d delivered during churn = %d, want >= 1 (the churn must exercise both failure shapes)", mode, got)
