@@ -300,10 +300,7 @@ func isRetryableMigrationStreamError(err error) bool {
 	// Connection failures are retryable; local request-construction errors and
 	// other permanent failures are not.
 	var netErr net.Error
-	if errors.As(err, &netErr) {
-		return true
-	}
-	return false
+	return errors.As(err, &netErr)
 }
 
 func (c *Client) streamAdminMigrationEvents(ctx context.Context, req AdminMigrationWatchRequest, handler func(AdminMigrationEvent) error, lastEventID *string) error {
