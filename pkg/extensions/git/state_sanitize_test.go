@@ -1587,3 +1587,49 @@ func TestSanitizeGitCheckpointDirRemovesExecutableHooksOnly(t *testing.T) {
 		}
 	}
 }
+
+// A trailing space is part of a POSIX directory name, not a parsing ambiguity: git
+// strips only CR/LF from commondir, so "shared \n" names modules/dep/shared<space>.
+// Dropping that pointer would break a submodule whose admin directory legitimately
+// ends in a space.
+func TestSanitizeGitCheckpointDirPreservesTrailingSpaceCommondir(t *testing.T) {
+	gitDir := t.TempDir()
+	sub := filepath.Join(gitDir, "modules", "dep")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "commondir"), []byte("shared \n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	shared := filepath.Join(sub, "shared ")
+	for _, dir := range []string{filepath.Join(shared, "objects"), filepath.Join(shared, "refs"), filepath.Join(shared, "hooks")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(shared, "config"), []byte("[core]\n\tpager = /tmp/evil-pager\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(shared, "hooks", "post-checkout"), []byte("#!/bin/sh\ntrue\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := sanitizeGitCheckpointDir(gitDir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(sub, "commondir")); err != nil {
+		t.Fatalf("trailing-space commondir was removed: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(shared, "config"))
+	if err != nil {
+		t.Fatalf("trailing-space common dir config: %v", err)
+	}
+	if strings.Contains(string(data), "pager") {
+		t.Fatalf("trailing-space common dir kept pager:\n%s", string(data))
+	}
+	if _, err := os.Stat(filepath.Join(shared, "hooks", "post-checkout")); !os.IsNotExist(err) {
+		t.Fatalf("trailing-space common dir kept its hook: %v", err)
+	}
+}

@@ -1406,12 +1406,6 @@ func (w *gitCheckpointSanitizer) commonDir(dir string) error {
 		// this walk already handles.
 		return nil
 	}
-	if value != strings.TrimRight(value, " \t") {
-		// Trailing blanks are the one remaining place where git and this walk can read
-		// different paths; a real commondir is a plain relative path, so an odd one is
-		// dropped rather than guessed at.
-		return w.dropCommonDir(dir)
-	}
 	// An absolute pointer, or one whose lexical path climbs out of the tree, names a
 	// host directory and is dropped rather than resolved. That also covers a pointer
 	// written against the *final* path of this gitdir: it does not exist while the
