@@ -1481,8 +1481,8 @@ func TestGetMigrationStateBypassesLifetimeStatusCache(t *testing.T) {
 	defer ts.Close()
 	c := New(ts.URL, "")
 	c.Warm(t.Context())
-	if _, err := c.GetMigrationState(t.Context()); err != nil || state != "syncing" {
-		t.Fatalf("initial state: %v", err)
+	if got, err := c.GetMigrationState(t.Context()); err != nil || got != "syncing" {
+		t.Fatalf("initial state = %q, err=%v", got, err)
 	}
 	mu.Lock()
 	state = "migrated"

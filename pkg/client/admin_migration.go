@@ -392,7 +392,9 @@ func (c *Client) streamAdminMigrationEvents(ctx context.Context, req AdminMigrat
 	if err := scanner.Err(); err != nil {
 		return fmt.Errorf("read migration event stream: %w", err)
 	}
-	return dispatch()
+	// EOF before the blank-line terminator means the event was only partially
+	// received. Do not dispatch it or advance Last-Event-ID.
+	return nil
 }
 
 func truncateForError(raw []byte) string {
