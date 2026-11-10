@@ -32,6 +32,7 @@ type UploadPlan struct {
 
 // PartURL is a presigned URL for uploading one part.
 type PartURL struct {
+	SkipUpload     bool              `json:"skip_upload,omitempty"`
 	Number         int               `json:"number"`
 	URL            string            `json:"url"`
 	Size           int64             `json:"size"`
