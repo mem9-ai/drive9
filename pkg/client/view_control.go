@@ -171,8 +171,17 @@ func (c *Client) BeginViewWork(ctx context.Context, id, operationID string, ttl 
 		TTLMillis   int64  `json:"ttl_ms"`
 		Validation  bool   `json:"validation"`
 	}{operationID, ttl.Milliseconds(), validation}
-	err = c.doViewControl(ctx, "POST", path+"/work", req, &out)
-	return out, err
+	var receipt struct {
+		Work   ViewWork `json:"work"`
+		Launch *bool    `json:"launch"`
+	}
+	if err = c.doViewControl(ctx, "POST", path+"/work", req, &receipt); err != nil {
+		return ViewWorkClaim{}, err
+	}
+	if receipt.Launch == nil || receipt.Work.LayerID != id || receipt.Work.Validation != validation || receipt.Work.LeaseUntil.IsZero() || receipt.Work.Binding().Validate() != nil {
+		return ViewWorkClaim{}, fmt.Errorf("invalid work claim receipt; query the original operation_id without launching work")
+	}
+	return ViewWorkClaim{Work: receipt.Work, Launch: *receipt.Launch}, nil
 }
 func (c *Client) RenewViewWork(ctx context.Context, w ViewWork, ttl time.Duration) (ViewWork, error) {
 	var out ViewWork

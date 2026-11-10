@@ -121,7 +121,7 @@ func TestFixedViewControlDoesNotRetryOrGrantMissingLaunch(t *testing.T) {
 				requests++
 				w.Header().Set("Location", "/v1/views/a/work")
 				w.WriteHeader(status)
-				_, _ = w.Write([]byte(`{"work":{"layer_id":"a","work_id":"w","fence":2},"launch":false,"error":"query original operation"}`))
+				_, _ = w.Write([]byte(`{"work":{"layer_id":"a","work_id":"w","fence":2,"lease_until":"2026-01-01T00:00:00Z"},"launch":false,"error":"query original operation"}`))
 			}))
 			defer srv.Close()
 			c := New(srv.URL, "test-token")
@@ -135,6 +135,10 @@ func TestFixedViewControlDoesNotRetryOrGrantMissingLaunch(t *testing.T) {
 
 func TestFixedViewControlRejectsInvalidInputBeforeHTTP(t *testing.T) {
 	c := New("http://127.0.0.1:1", "test-token")
+	c.httpClient.Transport = viewControlRoundTripper(func(*http.Request) (*http.Response, error) {
+		t.Fatal("invalid input reached transport")
+		return nil, nil
+	})
 	ctx := context.Background()
 	for _, id := range []string{"", "main", "MAIN", "../a", "a/b", strings.Repeat("x", 65)} {
 		if _, err := c.GetFixedView(ctx, id); err == nil {
@@ -160,5 +164,30 @@ func TestFixedViewControlRejectsInvalidInputBeforeHTTP(t *testing.T) {
 	}
 	if _, err := c.SealFixedView(ctx, w, "seal"); err == nil {
 		t.Fatal("sealed incomplete work")
+	}
+}
+
+type viewControlRoundTripper func(*http.Request) (*http.Response, error)
+
+func (f viewControlRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestViewClaimRejectsIncompleteOrMismatchedReceipt(t *testing.T) {
+	for _, response := range []string{
+		`{"launch":true}`,
+		`{"work":{"layer_id":"a","work_id":"w","fence":1,"lease_until":"2026-01-01T00:00:00Z"}}`,
+		`{"launch":true,"work":{"layer_id":"b","work_id":"w","fence":1,"lease_until":"2026-01-01T00:00:00Z"}}`,
+		`{"launch":true,"work":{"layer_id":"a","work_id":"w","fence":1,"lease_until":"2026-01-01T00:00:00Z","validation":true}}`,
+		`{"launch":true,"work":{"layer_id":"a","work_id":"w","fence":0,"lease_until":"2026-01-01T00:00:00Z"}}`,
+		`{"launch":true,"work":{"layer_id":"a","work_id":"w","fence":1}}`,
+		`{"launch":true,"work":`,
+	} {
+		t.Run(response, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(response)) }))
+			defer srv.Close()
+			got, err := New(srv.URL, "test-token").BeginViewWork(context.Background(), "a", "begin", time.Minute, false)
+			if err == nil || got != (ViewWorkClaim{}) {
+				t.Fatalf("unsafe receipt %+v %v", got, err)
+			}
+		})
 	}
 }
