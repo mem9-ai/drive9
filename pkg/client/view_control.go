@@ -5,10 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
 	"time"
+
+	"github.com/mem9-ai/drive9/pkg/viewprotocol"
 )
 
 // FixedViewState is a control result, not a permission to launch or replay work.
@@ -103,12 +106,27 @@ func (c *Client) doViewControl(ctx context.Context, method, path string, body, o
 	if err != nil {
 		return err
 	}
-	defer func() { _ = resp.Body.Close() }()
+	bodyReader := resp.Body
+	defer func() { _ = bodyReader.Close() }()
 	if resp.StatusCode != http.StatusOK {
+		resp.Body = io.NopCloser(io.LimitReader(resp.Body, 64<<10))
 		return readError(resp)
 	}
-	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+	if err := decodeFixedResponse(resp.Body, out); err != nil {
 		return fmt.Errorf("decode view control response: %w", err)
+	}
+	return nil
+}
+
+// Control requests use the caller's stable identity and never retry. The
+// receiver may itself be bound to a different view, so do not derive error
+// identity from c.view.
+func (c *Client) doFixedControlMutation(ctx context.Context, layer, operation, method, path string, body, out any) error {
+	if err := viewprotocol.ValidateOperationID(operation); err != nil {
+		return err
+	}
+	if err := c.doViewControl(ctx, method, path, body, out); err != nil {
+		return &ViewOperationError{LayerID: layer, OperationID: operation, Err: err}
 	}
 	return nil
 }
@@ -130,7 +148,7 @@ func (c *Client) CreateFixedView(ctx context.Context, req FixedViewCreate) (Fixe
 			return out, err
 		}
 	}
-	err := c.doViewControl(ctx, "POST", "/v1/views", req, &out)
+	err := c.doFixedControlMutation(ctx, req.LayerID, req.OperationID, "POST", "/v1/views", req, &out)
 	return out, err
 }
 func (c *Client) ListFixedViews(ctx context.Context, after string, limit int) (FixedViewPage, error) {
@@ -175,11 +193,11 @@ func (c *Client) BeginViewWork(ctx context.Context, id, operationID string, ttl 
 		Work   ViewWork `json:"work"`
 		Launch *bool    `json:"launch"`
 	}
-	if err = c.doViewControl(ctx, "POST", path+"/work", req, &receipt); err != nil {
+	if err = c.doFixedControlMutation(ctx, id, operationID, "POST", path+"/work", req, &receipt); err != nil {
 		return ViewWorkClaim{}, err
 	}
 	if receipt.Launch == nil || receipt.Work.LayerID != id || receipt.Work.Validation != validation || receipt.Work.LeaseUntil.IsZero() || receipt.Work.Binding().Validate() != nil {
-		return ViewWorkClaim{}, fmt.Errorf("invalid work claim receipt; query the original operation_id without launching work")
+		return ViewWorkClaim{}, &ViewOperationError{LayerID: id, OperationID: operationID, Err: fmt.Errorf("invalid work claim receipt; query the original operation_id without launching work")}
 	}
 	return ViewWorkClaim{Work: receipt.Work, Launch: *receipt.Launch}, nil
 }
@@ -215,7 +233,7 @@ func (c *Client) SealFixedView(ctx context.Context, w ViewWork, operationID stri
 		OperationID string   `json:"operation_id"`
 		Work        ViewWork `json:"work"`
 	}{operationID, w}
-	err = c.doViewControl(ctx, "POST", path+"/seal", req, &out)
+	err = c.doFixedControlMutation(ctx, w.LayerID, operationID, "POST", path+"/seal", req, &out)
 	return out, err
 }
 func (c *Client) EndFixedView(ctx context.Context, id, operationID string, remove bool) (FixedViewOutcome, error) {
@@ -230,7 +248,7 @@ func (c *Client) EndFixedView(ctx context.Context, id, operationID string, remov
 	} else {
 		path += "/cancel"
 	}
-	err = c.doViewControl(ctx, method, path, struct {
+	err = c.doFixedControlMutation(ctx, id, operationID, method, path, struct {
 		OperationID string `json:"operation_id"`
 	}{operationID}, &out)
 	return out, err

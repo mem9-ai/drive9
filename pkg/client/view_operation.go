@@ -24,7 +24,7 @@ func WithViewOperationID(ctx context.Context, id string) (context.Context, error
 	return context.WithValue(ctx, viewOperationKey{}, id), nil
 }
 
-// ViewOperationError retains the identity needed to query GetViewOperation.
+// ViewOperationError retains the identity needed to query GetFixedViewOperation.
 // An error, including a timeout or 5xx, does not prove the mutation rolled back.
 type ViewOperationError struct {
 	LayerID, OperationID string
@@ -77,15 +77,21 @@ func (c *Client) decodeViewMutation(req *http.Request, resp *http.Response, out 
 	if c.view.LayerID == "" || req.Header.Get(viewprotocol.OperationHeader) == "" {
 		return json.NewDecoder(resp.Body).Decode(out)
 	}
+	return c.viewMutationError(req, decodeFixedResponse(resp.Body, out))
+}
+
+// A syntactically complete JSON prefix is not a complete response. In
+// particular, a launch grant is exposed only after bounded EOF and decoding.
+func decodeFixedResponse(body io.Reader, out any) error {
 	const maxResponse = 4 << 20
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponse+1))
+	raw, err := io.ReadAll(io.LimitReader(body, maxResponse+1))
 	if err == nil && len(raw) > maxResponse {
-		err = fmt.Errorf("mutation response exceeds %d bytes", maxResponse)
+		err = fmt.Errorf("fixed view response exceeds %d bytes", maxResponse)
 	}
 	if err == nil {
 		err = json.Unmarshal(raw, out)
 	}
-	return c.viewMutationError(req, err)
+	return err
 }
 func (c *Client) viewMutationError(req *http.Request, err error) error {
 	if err == nil || c.view.LayerID == "" || req.Header.Get(viewprotocol.OperationHeader) == "" {

@@ -3,11 +3,14 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -189,5 +192,86 @@ func TestViewClaimRejectsIncompleteOrMismatchedReceipt(t *testing.T) {
 				t.Fatalf("unsafe receipt %+v %v", got, err)
 			}
 		})
+	}
+}
+
+func TestFixedControlCompleteResponseBeforeLaunchOrSuccess(t *testing.T) {
+	const receipt = `{"layer_id":"a","phase":"OPEN","generation":1,"work":{"layer_id":"a","work_id":"w","fence":1,"lease_until":"2026-01-01T00:00:00Z"},"launch":true,"state":"DONE","layer":{"layer_id":"a","phase":"READY","generation":2}}`
+	for _, action := range []string{"create", "begin", "seal", "cancel", "delete"} {
+		for _, response := range []string{"complete", "short-body", "trailing", "oversize", "empty"} {
+			t.Run(action+"/"+response, func(t *testing.T) {
+				var requests atomic.Int32
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					requests.Add(1)
+					body := receipt
+					switch response {
+					case "short-body":
+						// The entire JSON prefix is present, but the HTTP response
+						// ends early. Decoder.Decode alone would grant launch.
+						w.Header().Set("Content-Length", strconv.Itoa(len(body)+32))
+					case "trailing":
+						body += ` {"launch":false}`
+					case "oversize":
+						body += strings.Repeat(" ", 4<<20)
+					case "empty":
+						body = ""
+					}
+					_, _ = w.Write([]byte(body))
+				}))
+				defer srv.Close()
+				c, err := New(srv.URL, "test-token").WithView(ViewBinding{LayerID: "other", WorkID: "old", Fence: 1})
+				if err != nil {
+					t.Fatal(err)
+				}
+				ctx := context.Background()
+				var claim ViewWorkClaim
+				switch action {
+				case "create":
+					_, err = c.CreateFixedView(ctx, FixedViewCreate{LayerID: "a", OperationID: "op"})
+				case "begin":
+					claim, err = c.BeginViewWork(ctx, "a", "op", time.Minute, false)
+				case "seal":
+					_, err = c.SealFixedView(ctx, ViewWork{LayerID: "a", ID: "w", Fence: 1}, "op")
+				case "cancel", "delete":
+					_, err = c.EndFixedView(ctx, "a", "op", action == "delete")
+				}
+				if requests.Load() != 1 {
+					t.Fatal("control retried", requests.Load())
+				}
+				if response == "complete" {
+					if err != nil || action == "begin" && !claim.Launch {
+						t.Fatal(claim, err)
+					}
+					return
+				}
+				var identified *ViewOperationError
+				if err == nil || !errors.As(err, &identified) || identified.LayerID != "a" || identified.OperationID != "op" || claim.Launch {
+					t.Fatal("incomplete response accepted or original identity lost", claim, err)
+				}
+			})
+		}
+	}
+}
+
+func TestFixedControlOperationIDValidatedBeforeTransport(t *testing.T) {
+	c := New("http://127.0.0.1:1", "test-token")
+	c.httpClient.Transport = viewControlRoundTripper(func(*http.Request) (*http.Response, error) {
+		t.Fatal("invalid operation reached transport")
+		return nil, nil
+	})
+	ctx := context.Background()
+	for _, id := range []string{"", "../invalid", strings.Repeat("x", 129)} {
+		if _, err := c.CreateFixedView(ctx, FixedViewCreate{LayerID: "a", OperationID: id}); err == nil {
+			t.Fatal(id)
+		}
+		if _, err := c.BeginViewWork(ctx, "a", id, time.Minute, false); err == nil {
+			t.Fatal(id)
+		}
+		if _, err := c.SealFixedView(ctx, ViewWork{LayerID: "a", ID: "w", Fence: 1}, id); err == nil {
+			t.Fatal(id)
+		}
+		if _, err := c.EndFixedView(ctx, "a", id, true); err == nil {
+			t.Fatal(id)
+		}
 	}
 }
