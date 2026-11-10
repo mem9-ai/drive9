@@ -47,6 +47,7 @@ type PartURL struct {
 // uploadPlanV2 mirrors the server's UploadPlanV2 response.
 type uploadPlanV2 struct {
 	UploadID         string           `json:"upload_id"`
+	ContentLayout    ContentLayout    `json:"content_layout"`
 	Key              string           `json:"key"`
 	PartSize         int64            `json:"part_size"`
 	TotalParts       int              `json:"total_parts"`
@@ -642,6 +643,12 @@ func (c *Client) writeStreamV2WithSummaryAndPreCompleteCheck(ctx context.Context
 	if err != nil {
 		return err
 	}
+	if plan.ContentLayout == ContentLayoutExtent {
+		return c.writeExtentUpload(ctx, plan, ra, size, progress, summary, tags, checksumSHA256, preCompleteCheck, time.Since(initiateStart))
+	}
+	if plan.ContentLayout != "" && plan.ContentLayout != ContentLayoutSingle {
+		return fmt.Errorf("unsupported upload content layout %q", plan.ContentLayout)
+	}
 	if summary != nil {
 		summary.Mode = "multipart_v2"
 		summary.InitiateSeconds = time.Since(initiateStart).Seconds()
@@ -1032,7 +1039,7 @@ func (c *Client) initiateUploadV2(ctx context.Context, path string, size int64, 
 		return nil, readError(resp)
 	}
 	var plan uploadPlanV2
-	if err := json.NewDecoder(resp.Body).Decode(&plan); err != nil {
+	if err := decodeFixedResponse(resp.Body, &plan); err != nil {
 		return nil, fmt.Errorf("decode v2 upload plan: %w", err)
 	}
 	return &plan, nil
