@@ -1346,6 +1346,9 @@ func (c *Client) completeUploadV2WithOptions(ctx context.Context, uploadID strin
 
 // abortUploadV2 sends POST /v2/uploads/{id}/abort.
 func (c *Client) abortUploadV2(ctx context.Context, uploadID string) error {
+	if c.view.LayerID != "" {
+		return fmt.Errorf("fixed upload cancellation requires AbortFixedUpload and an explicit operation ID")
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		c.baseURL+"/v2/uploads/"+uploadID+"/abort", nil)
 	if err != nil {
