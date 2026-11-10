@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -88,6 +89,10 @@ func (c *Client) decodeViewMutation(req *http.Request, resp *http.Response, out 
 }
 func (c *Client) viewMutationError(req *http.Request, err error) error {
 	if err == nil || c.view.LayerID == "" || req.Header.Get(viewprotocol.OperationHeader) == "" {
+		return err
+	}
+	var existing *ViewOperationError
+	if errors.As(err, &existing) {
 		return err
 	}
 	return &ViewOperationError{LayerID: c.view.LayerID, OperationID: req.Header.Get(viewprotocol.OperationHeader), Err: err}

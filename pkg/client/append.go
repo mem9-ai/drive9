@@ -50,7 +50,7 @@ func (c *Client) AppendStream(ctx context.Context, path string, r io.Reader, siz
 	partSize := s3client.CalcAdaptivePartSize(finalSize)
 	plan, err := c.initiateAppend(ctx, path, size, partSize, stat.Revision)
 	if err != nil {
-		if shouldRewriteAppend(err) {
+		if c.view.LayerID == "" && shouldRewriteAppend(err) {
 			return c.appendByRewrite(ctx, path, r, size, finalSize, stat.Revision, progress)
 		}
 		return err
@@ -121,11 +121,11 @@ func (c *Client) initiateAppend(ctx context.Context, path string, appendSize int
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusAccepted {
-		return nil, readError(resp)
+		return nil, c.viewMutationError(req, readError(resp))
 	}
 
 	var plan AppendPlan
-	if err := json.NewDecoder(resp.Body).Decode(&plan); err != nil {
+	if err := c.decodeViewMutation(req, resp, &plan); err != nil {
 		return nil, fmt.Errorf("decode append plan: %w", err)
 	}
 	return &plan, nil

@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -125,7 +126,7 @@ type cancelViewResponseRead struct {
 func (b cancelViewResponseRead) Read(p []byte) (int, error) { b.cancel(); return b.ReadCloser.Read(p) }
 
 func TestViewMutationBodyFailureRetainsOriginalOperation(t *testing.T) {
-	for _, method := range []string{"create", "write"} {
+	for _, method := range []string{"create", "write", "stream"} {
 		for _, failure := range []string{"truncated", "abort", "cancel", "empty", "missing-revision", "complete"} {
 			t.Run(method+"/"+failure, func(t *testing.T) {
 				var calls atomic.Int32
@@ -172,9 +173,12 @@ func TestViewMutationBodyFailureRetainsOriginalOperation(t *testing.T) {
 					})
 				}
 				var revision int64
-				if method == "create" {
+				switch method {
+				case "create":
 					revision, err = c.CreateFileCtx(ctx, "/file")
-				} else {
+				case "stream":
+					revision, err = c.WriteServerStreamConditional(ctx, "/file", strings.NewReader("data"), 4, 1)
+				default:
 					revision, err = c.WriteCtxConditionalWithRevision(ctx, "/file", []byte("data"), 1)
 				}
 				if calls.Load() != 1 {
@@ -214,5 +218,47 @@ func TestMainMutationRetainsLegacyResponseCompatibility(t *testing.T) {
 			}
 		}
 		ts.Close()
+	}
+}
+
+func TestFixedAppendResponsesKeepOperationIdentity(t *testing.T) {
+	for _, action := range []string{"append-log", "append"} {
+		for _, body := range []string{`{"revision":`, `{"revision":0,"size_bytes":5}`, `{"revision":7,"size_bytes":6}`, `{"revision":7,"size_bytes":5} {}`, `{"revision":7,"size_bytes":5}`} {
+			if action == "append" && body != `{"revision":` {
+				continue
+			}
+			t.Run(action+"/"+body, func(t *testing.T) {
+				id := make(chan string, 1)
+				ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					id <- r.Header.Get(viewprotocol.OperationHeader)
+					_, _ = io.Copy(io.Discard, r.Body)
+					if action == "append" {
+						w.WriteHeader(202)
+					}
+					_, _ = io.WriteString(w, body)
+				}))
+				defer ts.Close()
+				c, err := New(ts.URL, "test-token").WithView(ViewBinding{LayerID: "a", WorkID: "w", Fence: 1})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if action == "append-log" {
+					_, err = c.AppendLog(context.Background(), "/file", strings.NewReader("abc"), 3, 1, 2)
+				} else {
+					_, err = c.initiateAppend(context.Background(), "/file", 3, 5, 1)
+				}
+				original := <-id
+				if body == `{"revision":7,"size_bytes":5}` {
+					if err != nil {
+						t.Fatal(err)
+					}
+					return
+				}
+				var op *ViewOperationError
+				if !errors.As(err, &op) || op.OperationID == "" || op.OperationID != original || op.LayerID != "a" {
+					t.Fatal(err, original)
+				}
+			})
+		}
 	}
 }
