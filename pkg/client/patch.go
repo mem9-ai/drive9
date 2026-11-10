@@ -96,11 +96,11 @@ func (c *Client) PatchFile(ctx context.Context, path string, newSize int64, dirt
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusAccepted {
-		return readError(resp)
+		return c.viewMutationError(req, readError(resp))
 	}
 
 	var plan PatchPlan
-	if err := json.NewDecoder(resp.Body).Decode(&plan); err != nil {
+	if err := c.decodeViewMutation(req, resp, &plan); err != nil {
 		return fmt.Errorf("decode patch plan: %w", err)
 	}
 

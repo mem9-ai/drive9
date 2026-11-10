@@ -112,3 +112,107 @@ func TestViewMutationIdentityScopeAndValidation(t *testing.T) {
 		}
 	}
 }
+
+type viewResponseTransport func(*http.Request) (*http.Response, error)
+
+func (f viewResponseTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+type cancelViewResponseRead struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b cancelViewResponseRead) Read(p []byte) (int, error) { b.cancel(); return b.ReadCloser.Read(p) }
+
+func TestViewMutationBodyFailureRetainsOriginalOperation(t *testing.T) {
+	for _, method := range []string{"create", "write"} {
+		for _, failure := range []string{"truncated", "abort", "cancel", "empty", "missing-revision", "complete"} {
+			t.Run(method+"/"+failure, func(t *testing.T) {
+				var calls atomic.Int32
+				ids := make(chan string, 1)
+				ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					calls.Add(1)
+					ids <- r.Header.Get(viewprotocol.OperationHeader)
+					_, _ = io.Copy(io.Discard, r.Body)
+					w.Header().Set("Content-Type", "application/json")
+					switch failure {
+					case "complete":
+						_, _ = io.WriteString(w, `{"revision":7}`)
+					case "empty":
+						w.WriteHeader(200)
+					case "missing-revision":
+						_, _ = io.WriteString(w, `{}`)
+					default:
+						_, _ = io.WriteString(w, `{"revision":`)
+						w.(http.Flusher).Flush()
+						if failure == "abort" {
+							panic(http.ErrAbortHandler)
+						}
+						if failure == "cancel" {
+							<-r.Context().Done()
+						}
+					}
+				}))
+				defer ts.Close()
+				c, err := New(ts.URL, "test-token").WithView(ViewBinding{LayerID: "a", WorkID: "w", Fence: 1})
+				if err != nil {
+					t.Fatal(err)
+				}
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				if failure == "cancel" {
+					underlying := http.DefaultTransport.(*http.Transport).Clone()
+					defer underlying.CloseIdleConnections()
+					c.httpClient.Transport = viewResponseTransport(func(r *http.Request) (*http.Response, error) {
+						resp, err := underlying.RoundTrip(r)
+						if err == nil {
+							resp.Body = cancelViewResponseRead{resp.Body, cancel}
+						}
+						return resp, err
+					})
+				}
+				var revision int64
+				if method == "create" {
+					revision, err = c.CreateFileCtx(ctx, "/file")
+				} else {
+					revision, err = c.WriteCtxConditionalWithRevision(ctx, "/file", []byte("data"), 1)
+				}
+				if calls.Load() != 1 {
+					t.Fatal("retried", calls.Load())
+				}
+				id := <-ids
+				if failure == "complete" {
+					if err != nil || revision != 7 {
+						t.Fatal(revision, err)
+					}
+					return
+				}
+				var op *ViewOperationError
+				if revision != 0 || !errors.As(err, &op) || op.LayerID != "a" || id == "" || op.OperationID != id {
+					t.Fatal("lost outcome identity", revision, err, id)
+				}
+			})
+		}
+	}
+}
+
+func TestMainMutationRetainsLegacyResponseCompatibility(t *testing.T) {
+	for _, body := range []string{"", `{"revision":`} {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get(viewprotocol.OperationHeader) != "" {
+				t.Error("main received operation header")
+			}
+			_, _ = io.WriteString(w, body)
+		}))
+		c := New(ts.URL, "test-token")
+		if revision, err := c.WriteCtxConditionalWithRevision(context.Background(), "/file", nil, 0); err != nil || revision != 0 {
+			t.Fatal(revision, err)
+		}
+		if body == "" {
+			if revision, err := c.CreateFileCtx(context.Background(), "/file"); err != nil || revision != 0 {
+				t.Fatal(revision, err)
+			}
+		}
+		ts.Close()
+	}
+}

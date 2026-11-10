@@ -802,11 +802,11 @@ func (c *Client) initiateUploadLegacy(ctx context.Context, path string, size int
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusAccepted {
-		return UploadPlan{}, readError(resp)
+		return UploadPlan{}, c.viewMutationError(req, readError(resp))
 	}
 
 	var plan UploadPlan
-	if err := json.NewDecoder(resp.Body).Decode(&plan); err != nil {
+	if err := c.decodeViewMutation(req, resp, &plan); err != nil {
 		return UploadPlan{}, fmt.Errorf("decode upload plan: %w", err)
 	}
 	return plan, nil

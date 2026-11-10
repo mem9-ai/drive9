@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -66,4 +67,28 @@ func (c *Client) viewMutationOutcome(req *http.Request, resp *http.Response, err
 		_ = resp.Body.Close()
 	}
 	return nil, &ViewOperationError{LayerID: c.view.LayerID, OperationID: id, Err: err}
+}
+
+// Decode a bounded complete mutation response before exposing its result. JSON
+// decoding can fail after successful response headers; that is still an unknown
+// outcome under the original operation identity. Main retains legacy decoding.
+func (c *Client) decodeViewMutation(req *http.Request, resp *http.Response, out any) error {
+	if c.view.LayerID == "" || req.Header.Get(viewprotocol.OperationHeader) == "" {
+		return json.NewDecoder(resp.Body).Decode(out)
+	}
+	const maxResponse = 4 << 20
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponse+1))
+	if err == nil && len(raw) > maxResponse {
+		err = fmt.Errorf("mutation response exceeds %d bytes", maxResponse)
+	}
+	if err == nil {
+		err = json.Unmarshal(raw, out)
+	}
+	return c.viewMutationError(req, err)
+}
+func (c *Client) viewMutationError(req *http.Request, err error) error {
+	if err == nil || c.view.LayerID == "" || req.Header.Get(viewprotocol.OperationHeader) == "" {
+		return err
+	}
+	return &ViewOperationError{LayerID: c.view.LayerID, OperationID: req.Header.Get(viewprotocol.OperationHeader), Err: err}
 }

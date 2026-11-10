@@ -862,11 +862,14 @@ func (c *Client) CreateFileCtx(ctx context.Context, path string) (int64, error) 
 	var result struct {
 		Revision int64 `json:"revision"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		if errors.Is(err, io.EOF) {
+	if err := c.decodeViewMutation(req, resp, &result); err != nil {
+		if c.view.LayerID == "" && errors.Is(err, io.EOF) {
 			return 0, nil
 		}
 		return 0, fmt.Errorf("decode create file response: %w", err)
+	}
+	if c.view.LayerID != "" && result.Revision < 1 {
+		return 0, c.viewMutationError(req, fmt.Errorf("missing committed file revision"))
 	}
 	return result.Revision, nil
 }
@@ -958,9 +961,22 @@ func (c *Client) writeCtxConditionalFull(ctx context.Context, path string, data 
 	var result struct {
 		Revision int64 `json:"revision"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		// If response doesn't contain revision (old server), return 0.
+	if err := c.decodeViewMutation(req, resp, &result); err != nil {
+		if c.view.LayerID != "" {
+			if expectedRevision >= 0 {
+				err = markCommitAttempt(err)
+			}
+			return 0, err
+		}
+		// Main retains the old server compatibility behavior.
 		return 0, nil
+	}
+	if c.view.LayerID != "" && result.Revision < 1 {
+		err := c.viewMutationError(req, fmt.Errorf("missing committed file revision"))
+		if expectedRevision >= 0 {
+			err = markCommitAttempt(err)
+		}
+		return 0, err
 	}
 	return result.Revision, nil
 }
