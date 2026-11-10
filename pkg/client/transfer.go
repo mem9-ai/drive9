@@ -1384,9 +1384,12 @@ func newMultipartAbortContext(parent context.Context, timeout time.Duration) (co
 
 // ReadStream reads a file, following 302 redirects for large files.
 func (c *Client) ReadStream(ctx context.Context, path string) (io.ReadCloser, error) {
-	resp, err := c.readWithoutRedirect(ctx, path, "")
+	resp, err := c.readFileResponse(ctx, path, "", true, "")
 	if err != nil {
 		return nil, err
+	}
+	if c.isExtentPlanResponse(resp) {
+		return c.openExtentPlan(ctx, path, resp, 0, -1)
 	}
 
 	switch {
@@ -1431,6 +1434,10 @@ func (c *Client) ReadStream(ctx context.Context, path string) (io.ReadCloser, er
 }
 
 func (c *Client) readWithoutRedirect(ctx context.Context, path, rangeHeader string) (*http.Response, error) {
+	return c.readFileResponse(ctx, path, rangeHeader, false, "")
+}
+
+func (c *Client) readFileResponse(ctx context.Context, path, rangeHeader string, extentPlan bool, etag string) (*http.Response, error) {
 	// Disable redirect following so we can detect 302. The request carries the
 	// same credentials as any other read (doWith), including X-Dat9-Actor: the
 	// actor header is read by the drive9 origin on this hop and is not forwarded
@@ -1441,6 +1448,12 @@ func (c *Client) readWithoutRedirect(ctx context.Context, path, rangeHeader stri
 	}
 	if rangeHeader != "" {
 		req.Header.Set("Range", rangeHeader)
+	}
+	if extentPlan && c.view.LayerID == "" {
+		req.Header.Set(extentReadPlanHeader, "1")
+	}
+	if etag != "" {
+		req.Header.Set("If-Match", etag)
 	}
 	resp, err := c.doNoRedirect(req)
 	if err == nil && c.view.LayerID != "" && resp.StatusCode >= 300 && resp.StatusCode < 400 {
@@ -1455,7 +1468,7 @@ func (c *Client) readWithoutRedirect(ctx context.Context, path, rangeHeader stri
 // ResolveReadTarget resolves a large S3-backed file path to a reusable object
 // URL. Inline files and content_layout=extent files return an error matched by
 // IsReadTargetNoRedirect because there is no single object URL to reuse;
-// callers fall back to ReadStream (extent uses the JuiceFS DataReader).
+// callers fall back to ReadStream (extent uses the negotiated read plan).
 func (c *Client) ResolveReadTarget(ctx context.Context, path string) (*ReadTarget, error) {
 	return c.resolveReadTarget(ctx, path)
 }
@@ -1476,7 +1489,7 @@ func (c *Client) resolveReadTarget(ctx context.Context, path string) (*ReadTarge
 		return &ReadTarget{ObjectURL: location}, nil
 
 	case resp.StatusCode == http.StatusUnprocessableEntity:
-		if _, _, ok := extentHintFromResponse(resp); ok {
+		if ContentLayout(resp.Header.Get("X-Dat9-Content-Layout")) == ContentLayoutExtent {
 			return nil, errReadTargetNoRedirect
 		}
 		return nil, readError(resp)
@@ -1530,9 +1543,12 @@ func (c *Client) ReadStreamRange(ctx context.Context, path string, offset, lengt
 		return nil, fmt.Errorf("offset + length overflows int64")
 	}
 
-	resp, err := c.readWithoutRedirect(ctx, path, fmt.Sprintf("bytes=%d-%d", offset, offset+length-1))
+	resp, err := c.readFileResponse(ctx, path, fmt.Sprintf("bytes=%d-%d", offset, offset+length-1), true, "")
 	if err != nil {
 		return nil, err
+	}
+	if c.isExtentPlanResponse(resp) {
+		return c.openExtentPlan(ctx, path, resp, offset, length)
 	}
 
 	switch {
