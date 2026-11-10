@@ -42,5 +42,28 @@ parent's fixed result. The previous base-root, tag selector, mutable checkpoint,
 rollback and per-file commit commands are not sent to legacy Layer endpoints.
 Unsupported commands fail locally. Atomic merge and mount selection are wired
 separately; this control-command implementation does not claim they are ready.
-The remaining legacy `--layer` data-transfer and mount paths must be migrated
-before full end-to-end acceptance.
+Ordinary file commands now accept the same explicit work binding:
+
+```sh
+drive9 fs cat --layer attempt-1 --work WORK_ID --fence 1 /report.txt
+drive9 fs ls --layer attempt-1 --work WORK_ID --fence 1 /results/
+drive9 fs mkdir --layer attempt-1 --work WORK_ID --fence 1 /results/
+drive9 fs cp --layer attempt-1 --work WORK_ID --fence 1 ./report.txt :/report.txt
+```
+
+`cat`, `ls`, `stat`, `cp`, `mkdir`, `rm`, `mv`, `chmod`, `hardlink`, and `symlink`
+reuse the ordinary filesystem APIs through a bound client. Reads and writes use
+the same Layer, including destination checks and parent creation. Add
+`--validation` only with the work ID and fence of a validation claim. Omit all
+binding flags, or use `--layer main` alone, for main. Partial, duplicate or
+malformed bindings fail before filesystem requests.
+
+A fixed Layer is scoped to the selected workspace. Named-context operands
+(`other:/path`) and raw object-store paths are rejected for bound commands;
+select the workspace context first, then use its Layer and ordinary paths.
+Search, archive, task and shell commands do not yet accept fixed bindings.
+File writes retain an operation ID on uncertain outcomes; do not treat a
+failure as proof that no changes occurred.
+
+This is client wiring, not proof that all server upload paths or mount switching
+are complete. Their endpoint and real mount acceptance remains required.

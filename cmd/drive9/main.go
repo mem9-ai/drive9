@@ -356,6 +356,10 @@ func runFS(args []string) {
 	}
 
 	var err error
+	c, rest, err = cli.BindFilesystemView(c, sub, rest)
+	if err != nil {
+		fatal("fs "+sub, err)
+	}
 	switch sub {
 	case "cp":
 		err = cli.Cp(c, rest)

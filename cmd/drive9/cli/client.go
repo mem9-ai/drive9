@@ -114,7 +114,7 @@ func fsClientForRemoteArg(defaultClient *client.Client, raw string) (*client.Cli
 	if loc.Context == "" {
 		return defaultClient, loc.Path, "", true, nil
 	}
-	c, err := newFSClientForContext(loc.Context)
+	c, err := fsClientInContext(defaultClient, loc.Context)
 	if err != nil {
 		return nil, "", "", true, err
 	}

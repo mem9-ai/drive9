@@ -553,7 +553,7 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 					{Name: "rm [-r|--recursive] <path>", Desc: "remove a file or directory tree"},
 				}},
 				{Title: "Search", Flags: []visualHelpFlag{
-					{Name: "grep [--layer REF] <pattern> [dir]", Desc: "search file contents"},
+					{Name: "grep <pattern> [dir]", Desc: "search file contents"},
 					{Name: "find [dir] -name GLOB", Desc: "match filename glob"},
 					{Name: "find [dir] -tag key=value", Desc: "exact tag key/value match"},
 					{Name: "find [dir] -tag key", Desc: "tag-key existence match"},
@@ -569,6 +569,11 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 					{Name: "archive --profile <name>", Desc: "apply profile [local]/[remote] rules"},
 					{Name: "archive --stdout", Desc: "stream archive to stdout for piping"},
 					{Name: "archive --flat", Desc: "strip directory hierarchy; archive basenames only"},
+				}},
+				{Title: "File command view", Flags: []visualHelpFlag{
+					{Name: "--layer ID --work ID --fence N", Desc: "bind cat/ls/stat/cp and namespace commands to claimed Layer work"},
+					{Name: "--validation", Desc: "use the separately claimed read-only validation generation"},
+					{Name: "--layer main", Desc: "use main (also the default when binding flags are omitted)"},
 				}},
 				{Title: "Fixed Layers (JSON results)", Flags: []visualHelpFlag{
 					{Name: "layer create --operation <id> [--parent <layer>] <id>", Desc: "capture main or derive from a fixed Layer"},

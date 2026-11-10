@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"context"
 	"fmt"
 
 	"github.com/mem9-ai/drive9/pkg/client"
@@ -13,12 +12,8 @@ import (
 //	drive9 fs symlink /target :/link
 //	drive9 fs symlink ctx:/target ctx:/link
 func Symlink(c *client.Client, args []string) error {
-	layerRef, args, err := parseLayerFlag(args)
-	if err != nil {
-		return err
-	}
 	if len(args) != 2 {
-		return fmt.Errorf("usage: drive9 fs symlink [--layer <ref>] <target> <link>")
+		return fmt.Errorf("usage: drive9 fs symlink <target> <link>")
 	}
 	target := args[0]
 	linkPath := args[1]
@@ -39,9 +34,6 @@ func Symlink(c *client.Client, args []string) error {
 	c, linkPath, _, _, err = fsClientForRemoteArg(c, linkPath)
 	if err != nil {
 		return err
-	}
-	if layerRef != "" {
-		return symlinkLayerPath(context.Background(), c, layerRef, target, linkPath)
 	}
 	return c.Symlink(target, linkPath)
 }

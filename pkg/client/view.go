@@ -13,6 +13,14 @@ import (
 // APIs. Zero means main. It does not create or launch work, nor grant permission.
 type ViewBinding = viewprotocol.Binding
 
+// ViewBinding returns a copy of this client's immutable filesystem binding.
+func (c *Client) ViewBinding() ViewBinding {
+	if c == nil {
+		return ViewBinding{}
+	}
+	return c.view
+}
+
 // WithView returns an independent client fixed to one view. Existing requests,
 // extent state and handles on c retain their original binding. The caller must
 // separately drain and invalidate a mount before replacing its client.

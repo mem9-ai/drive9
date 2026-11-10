@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"context"
 	"fmt"
 
 	"github.com/mem9-ai/drive9/pkg/client"
@@ -9,12 +8,8 @@ import (
 
 // Hardlink creates a remote file hard link.
 func Hardlink(c *client.Client, args []string) error {
-	layerRef, args, err := parseLayerFlag(args)
-	if err != nil {
-		return err
-	}
 	if len(args) != 2 {
-		return fmt.Errorf("usage: drive9 fs hardlink [--layer <ref>] <target> <link>")
+		return fmt.Errorf("usage: drive9 fs hardlink <target> <link>")
 	}
 	srcLoc, err := Parse(args[0])
 	if err != nil {
@@ -41,21 +36,12 @@ func Hardlink(c *client.Client, args []string) error {
 		dstPath = dstLoc.Raw
 		dstRP = RemotePath{}
 	}
-	if layerRef != "" {
-		if err := requireNoLayerWithRemoteContext(layerRef, srcRP, args[0]); err != nil {
-			return err
-		}
-		if err := requireNoLayerWithRemoteContext(layerRef, dstRP, args[1]); err != nil {
-			return err
-		}
-		return hardlinkLayerPath(context.Background(), c, layerRef, srcPath, dstPath)
-	}
 
 	switch {
 	case srcRP.Context == "" && dstRP.Context == "":
 	case srcRP.Context != "" && dstRP.Context != "" && srcRP.Context == dstRP.Context:
 		var err error
-		c, err = newFSClientForContext(srcRP.Context)
+		c, err = fsClientInContext(c, srcRP.Context)
 		if err != nil {
 			return err
 		}
