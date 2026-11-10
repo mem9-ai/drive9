@@ -26,6 +26,7 @@ import (
 
 // Client is the drive9 HTTP client.
 type Client struct {
+	view                  ViewBinding // immutable per-client filesystem work binding
 	baseURL               string
 	apiKey                string
 	actor                 string // X-Dat9-Actor header value (per-mount ID)
@@ -754,6 +755,17 @@ func (c *Client) doNoRedirect(req *http.Request) (*http.Response, error) {
 // doWith applies the client's credential headers to req and executes it with
 // hc. Credential plumbing lives here so do and doNoRedirect cannot drift apart.
 func (c *Client) doWith(req *http.Request, hc *http.Client) (*http.Response, error) {
+	var err error
+	req, err = c.boundRequest(req)
+	if err != nil {
+		return nil, err
+	}
+	if c.view.LayerID != "" {
+		// A redirect cannot leave the bound API route and execute against main.
+		boundHTTP := *hc
+		boundHTTP.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+		hc = &boundHTTP
+	}
 	if c.apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	}
