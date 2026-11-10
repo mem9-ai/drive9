@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -1098,9 +1099,12 @@ func mountWithConfig(cfg MountConfig) error {
 	// view) must see dir GetAttrs go through the chain; every other stack
 	// serves root/dir attrs from the inode table (v1).
 	localDirAttrs := cfg.LocalRoot == "" && strings.TrimSpace(cfg.LayerRef) == ""
-	// The kernel enforces permissions when default_permissions is on;
-	// otherwise the daemon's open gate carries the mode contract.
-	defaultPermissions := cfg.AllowOther
+	// The daemon gate is redundant exactly when the mount options arm the kernel, so
+	// the flag is read off the options themselves: a second platform predicate would
+	// be a source of truth that can drift from the branches below (which is how the
+	// original allow-other hole appeared).
+	fuseOpts := newGoFuseMountOptions(cfg)
+	defaultPermissions := slices.Contains(fuseOpts.Options, "default_permissions")
 	// Assemble the chain as the REVERSE of the flag order: the flag lists
 	// extensions in build-up order (core first, each subsequent entry
 	// wrapping the previous ones), so the last flag entry is the outermost
@@ -1241,8 +1245,6 @@ func mountWithConfig(cfg MountConfig) error {
 			}
 		}()
 	}
-
-	fuseOpts := newGoFuseMountOptions(cfg)
 
 	// The mount point must exist before go-fuse mounts over it: several
 	// platforms fail NewServer with ENOENT on a missing directory (v1
@@ -1693,9 +1695,17 @@ func forceUnmount(mountpoint string) {
 }
 
 // newGoFuseMountOptions renders the kernel mount options from the config
-// (v1 newGoFuseMountOptions). Linux allow-other mounts bind
-// default_permissions — the ext4-parity EACCES contract from #1006.
+// (v1 newGoFuseMountOptions). Allow-other mounts bind default_permissions on both
+// Linux and macOS — the ext4-parity EACCES contract from #1006. Without it macFUSE
+// forwards every authorization to this daemon as an ACCESS message instead of
+// checking the mode bits in the kernel.
 func newGoFuseMountOptions(cfg MountConfig) *gofuse.MountOptions {
+	return newGoFuseMountOptionsFor(runtime.GOOS, cfg)
+}
+
+// newGoFuseMountOptionsFor is the platform-parameterised form, so both branches are
+// testable on any host.
+func newGoFuseMountOptionsFor(goos string, cfg MountConfig) *gofuse.MountOptions {
 	opts := &gofuse.MountOptions{
 		FsName:             "drive9",
 		Name:               "drive9",
@@ -1709,14 +1719,29 @@ func newGoFuseMountOptions(cfg MountConfig) *gofuse.MountOptions {
 		SyncRead:           cfg.SyncRead,
 		DirectMountStrict:  cfg.DirectMountStrict,
 	}
-	if runtime.GOOS == "linux" {
+	if goos == "linux" {
 		opts.MaxWrite = 1024 * 1024
 		if cfg.AllowOther {
 			opts.Options = append(opts.Options, "default_permissions")
 		}
 	}
-	if runtime.GOOS == "darwin" {
-		opts.Options = append(opts.Options, "defer_permissions", "local")
+	if goos == "darwin" {
+		// macFUSE checks mode bits in the kernel only when the mount says
+		// default_permissions; otherwise every authorization becomes an ACCESS
+		// message to this daemon. That is why an --allow-other mount needs the
+		// option: this branch passes no defer_permissions, so without
+		// default_permissions the only check would be FS.Access, whose group class
+		// reads the caller's supplementary groups from /proc/<pid>/status — a file
+		// macOS does not have — and it cannot distinguish a member from a
+		// non-member. A private mount stays on defer_permissions: the kernel already
+		// restricts it to the mounting user, and the option keeps the per-operation
+		// ACCESS upcall (with its chain stat) off the hot path. "local" carries the
+		// volume semantics on both branches.
+		if cfg.AllowOther {
+			opts.Options = append(opts.Options, "default_permissions", "local")
+		} else {
+			opts.Options = append(opts.Options, "defer_permissions", "local")
+		}
 	}
 	if cfg.ReadOnly {
 		opts.Options = append(opts.Options, "ro")
