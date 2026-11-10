@@ -21,21 +21,21 @@ import (
 // the hot path.
 func TestDarwinAllowOtherArmsKernelPermissions(t *testing.T) {
 	shared := newGoFuseMountOptionsFor("darwin", MountConfig{AllowOther: true})
-	if !hasMountOptionForTest(shared.Options, "default_permissions") {
+	if !slices.Contains(shared.Options, "default_permissions") {
 		t.Fatalf("darwin allowOther: default_permissions missing from %v; macFUSE would forward every check to FS.Access", shared.Options)
 	}
-	if hasMountOptionForTest(shared.Options, "defer_permissions") {
+	if slices.Contains(shared.Options, "defer_permissions") {
 		t.Fatalf("darwin allowOther: defer_permissions present in %v; the kernel would not check", shared.Options)
 	}
-	if !hasMountOptionForTest(shared.Options, "local") {
+	if !slices.Contains(shared.Options, "local") {
 		t.Fatalf("darwin allowOther: local option missing from %v", shared.Options)
 	}
 
 	private := newGoFuseMountOptionsFor("darwin", MountConfig{})
-	if hasMountOptionForTest(private.Options, "default_permissions") {
+	if slices.Contains(private.Options, "default_permissions") {
 		t.Fatalf("darwin private: default_permissions present in %v", private.Options)
 	}
-	if !hasMountOptionForTest(private.Options, "defer_permissions") || !hasMountOptionForTest(private.Options, "local") {
+	if !slices.Contains(private.Options, "defer_permissions") || !slices.Contains(private.Options, "local") {
 		t.Fatalf("darwin private: options = %v, want defer_permissions and local", private.Options)
 	}
 }
@@ -57,7 +57,7 @@ func TestAllowOtherKernelEnforcementContract(t *testing.T) {
 	}
 	for _, tc := range cases {
 		opts := newGoFuseMountOptionsFor(tc.goos, MountConfig{AllowOther: tc.allowOther})
-		if got := hasMountOptionForTest(opts.Options, "default_permissions"); got != tc.want {
+		if got := slices.Contains(opts.Options, "default_permissions"); got != tc.want {
 			t.Fatalf("%s allowOther=%t: default_permissions present=%t, want %t (options %v)", tc.goos, tc.allowOther, got, tc.want, opts.Options)
 		}
 	}
@@ -81,9 +81,4 @@ func TestPOSIXAccessDeniesGroupClassWithoutMembership(t *testing.T) {
 	if !hasPOSIXAccess(caller, 1001, 2000, 0o600, 0b110) {
 		t.Fatal("owner denied")
 	}
-}
-
-// hasMountOptionForTest reports whether the rendered options carry want.
-func hasMountOptionForTest(options []string, want string) bool {
-	return slices.Contains(options, want)
 }

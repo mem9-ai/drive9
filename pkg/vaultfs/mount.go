@@ -114,13 +114,13 @@ func MountVault(opts *VaultMountOptions) error {
 
 // newVaultMountOptions assembles the kernel mount options for a vault mount.
 //
-// A private mount is already restricted by the kernel to the mounting user, so
-// the mode bits VaultFS reports are what protect it; sharing is an explicit
-// --allow-other opt-in, and on Linux default_permissions is what makes the kernel
-// enforce 0400/0500 (0444/0555 when shared) once other users may traverse it.
-// Without it, allow_other leaves the decision to the filesystem's own checks and
-// every local user can read the plaintext secrets. Mirrors newGoFuseMountOptions
-// in pkg/fuse.
+// A private mount is already restricted by the kernel to the mounting user, so the
+// mode bits VaultFS reports are what protect it. Sharing is an explicit --allow-other
+// opt-in, and on a shared mount default_permissions is what makes the kernel enforce
+// 0400/0500 (0444/0555 when shared) once other users may traverse it — on Linux and on
+// macOS alike; without it macFUSE forwards the decision to VaultFS, which has no
+// per-user handler, and every local user can read the plaintext secrets. Mirrors
+// newGoFuseMountOptions in pkg/fuse.
 func newVaultMountOptions(opts *VaultMountOptions) *gofuse.MountOptions {
 	return newVaultMountOptionsFor(runtime.GOOS, opts)
 }
