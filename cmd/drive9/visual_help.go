@@ -570,13 +570,15 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 					{Name: "archive --stdout", Desc: "stream archive to stdout for piping"},
 					{Name: "archive --flat", Desc: "strip directory hierarchy; archive basenames only"},
 				}},
-				{Title: "Layers", Flags: []visualHelpFlag{
-					{Name: "layer create [flags] <base-root>", Desc: "create writable fs layer"},
-					{Name: "layer list [--json]", Desc: "list layers"},
-					{Name: "layer status|diff [--json] <layer>", Desc: "inspect layer state or diff"},
-					{Name: "layer checkpoint [flags] <layer>", Desc: "create a layer checkpoint"},
-					{Name: "layer rollback <layer>", Desc: "rollback a layer"},
-					{Name: "layer commit <layer>", Desc: "commit a layer into its base"},
+				{Title: "Fixed Layers (JSON results)", Flags: []visualHelpFlag{
+					{Name: "layer create --operation <id> [--parent <layer>] <id>", Desc: "capture main or derive from a fixed Layer"},
+					{Name: "layer list [--after <id>] [--limit <n>]", Desc: "read one page of Layers"},
+					{Name: "layer status <layer>", Desc: "inspect the current control state"},
+					{Name: "layer work --operation <id> --ttl <duration> [--validation] <layer>", Desc: "claim work; prints the claim without executing it"},
+					{Name: "layer renew --work <id> --fence <n> --ttl <duration> <layer>", Desc: "renew the existing generation"},
+					{Name: "layer seal --operation <id> --work <id> --fence <n> <layer>", Desc: "stop work and seal its result"},
+					{Name: "layer cancel|delete --operation <id> <layer>", Desc: "cancel work or delete a Layer"},
+					{Name: "layer operation <layer> <operation>", Desc: "query the original outcome after a timeout"},
 				}},
 			},
 			Examples: []visualHelpExample{
