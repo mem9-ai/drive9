@@ -1332,6 +1332,13 @@ func mountWithConfig(cfg MountConfig) error {
 	}
 	fmt.Fprint(os.Stderr, readyMessage(cfg.MountPoint, cfg.Server, actorID, cfg.ReadOnly, policyString(policy), cacheDesc, shadowDesc, cfg.OmitProcessStateCredentials))
 
+	// Keep a server-side mount lease alive while this process serves. The
+	// migration controller uses the lease, not a one-shot unmount report, to
+	// decide whether region A is still mounted. Best-effort: an older server
+	// without the endpoint must not fail the mount.
+	lease := startMountLease(context.Background(), cl, actorID, cfg.MountPoint, cfg.ReadOnly)
+	defer lease.Close()
+
 	// Graceful shutdown (v1 mount.go): on the first SIGINT/SIGTERM flush
 	// open handles, drain the chain, and Unmount with retries (EBUSY is
 	// transient); a second signal force-unmounts. Without this the worker

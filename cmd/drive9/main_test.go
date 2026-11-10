@@ -83,7 +83,7 @@ func TestDispatchLongHelpFlagShowsUsage(t *testing.T) {
 		"usage: drive9 <command> [arguments]",
 		"create [--name NAME] [--region-code CODE] [--server URL] [--json]",
 		"delete [--server URL] [--api-key KEY] [--json]",
-		"admin <tenant|pool> <command> [arguments]",
+		"admin <tenant|pool|migration> <command> [arguments]",
 		"ctx show [--json] [--reveal]",
 		"ctx use <name>",
 		"token <issue|revoke>",
