@@ -472,7 +472,12 @@ func (c *Client) newFSRequest(ctx context.Context, method, path, rawQuery string
 	if err != nil {
 		return nil, err
 	}
-	return http.NewRequestWithContext(ctx, method, reqURL+rawQuery, body)
+	req, err := http.NewRequestWithContext(ctx, method, reqURL+rawQuery, body)
+	if err != nil {
+		return nil, err
+	}
+	c.identifyViewMutation(req)
+	return req, nil
 }
 
 func escapeFSPath(path string) string {
@@ -776,7 +781,8 @@ func (c *Client) sendBoundRequest(req *http.Request, hc *http.Client) (*http.Res
 		boundHTTP.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 		hc = &boundHTTP
 	}
-	return hc.Do(bound)
+	resp, err := hc.Do(bound)
+	return c.viewMutationOutcome(bound, resp, err)
 }
 
 // Write uploads data to a remote path.
