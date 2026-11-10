@@ -51,6 +51,25 @@ including local validation via `drive9-server` with `DRIVE9_TENANT_PROVIDER=loca
 | `native-smoke-test.sh` | TiDB Cloud Native tenant lifecycle: CLI provision with credentials, status poll, basic fs ops (mkdir/cp/cat/ls/rm), delete + verification, trap cleanup on failure |
 | `smoke-all.sh` | PR-gate aggregator aligned with `local-e2e.yml`: api, cli, layer-fs, fuse-release-gate, fuse-patch-storage-class, git-ops, git-workspace-ondemand, pack, fuse-crash-recovery, fuse-supervision, fuse-write-perf-budget. Re-exports `DRIVE9_API_KEY` for existing-tenant mode. `RUN_FUSE_SMOKE=0` skips FUSE-related suites; `RUN_API_ONLY=1` keeps only api + cli; `RUN_JOURNAL_SMOKE=1` / `RUN_POSIX_SMOKE=1` / `RUN_GIT_WORKSPACE_SMOKE=1` add post-merge extras; `RUN_TOKENS_SMOKE=1` / `RUN_SSE_SMOKE=1` add HTTP tokens and SSE retention (off even on post-merge); `RUN_TASKS_SMOKE=1` adds the `fs tasks` wire-contract smoke (off even on post-merge) |
 
+## Fixed-view v10 isolation smoke
+
+`python3 e2e/fixed-view-smoke.py` requires explicit `DRIVE9_BASE` and
+`DRIVE9_API_KEY` for an authorized test tenant running the paired v10 server.
+It starts no services and does not provision or delete the tenant. It creates
+unique test paths and Layers, then cleans up those resources on success or
+failure. Uncertain requests are not automatically repeated; incomplete cleanup
+is reported with the owned resource identifiers. API keys and signed URLs are
+not logged.
+
+The suite uploads a 64 MiB + 3 byte extent fixture, captures two Layers, changes
+and deletes main files, and verifies fixed inline data plus a range crossing the
+64 MiB chunk boundary. It checks private hardlinks/deletions, independent child
+inheritance, directory listing, operation replay without repeated launch,
+sealed-write rejection, readonly validation, and child reads after parent
+Layer deletion. This suite covers the HTTP isolation contract; mount switching,
+transaction publication, quota integration and GC reclamation need separate
+coverage. It has not yet been run against a deployed v10 server.
+
 ## CI automation tiers
 
 Every script in this directory must be wired into one of these tiers (or be
@@ -63,7 +82,7 @@ without adding it to `.github/workflows/local-e2e.yml`.
 | Post-merge | `push` to `main` (local-e2e, coalesced via concurrency group) | PR gate + concurrency stress, POSIX/fsx, sqlite WAL/churn/concurrency, sqlite 1000-commit WAL FULL sequence, `smoke-all.sh` extras (journal, posix-permission, git-workspace), git feature smoke |
 | Nightly | cron 20:17 UTC (local-e2e) | Post-merge set + FUSE performance baseline/archive/compare (compare is report-only; hosted-runner noise) |
 | Manual all | Local E2E `workflow_dispatch` with `run_all_e2e=1` | Everything above |
-| Manual only | not wired, run by hand | `description-smoke-test.sh` (Docker + Ollama/stub embedder), `native-smoke-test.sh` (TiDB Cloud Native — requires credentials), `image-extract-config-smoke-test.sh` / `video-extract-config-smoke-test.sh` (hosted control-plane + billable vision provider), `embedding-config-smoke-test.sh` (hosted control-plane + billable embedding provider), `object-auth-smoke-test.sh` (tidbcloud-native + real object-store STS mint; `--auth=server` cannot run in local-e2e), `object-auth-s3-hosted-test.sh` / `object-auth-cos-hosted-test.sh` / `object-auth-tos-hosted-test.sh` (hosted S3/COS/TOS isolation/mount/refresh; same reason), `s3-express-append-log-smoke-test.sh` (hosted Directory Bucket HTTP smoke), `fuse-s3-express-append-log.sh` (hosted Directory Bucket + real FUSE; macOS/local provider cannot exercise S3 Express), `tokens-smoke-test.sh` (opt-in HTTP; needs `provider=local` mock IAM), `sse-retention-smoke-test.sh` (opt-in HTTP; needs `/v1/events` and a short retention), `tasks-smoke-test.sh` (opt-in HTTP; the handler lives in the external server repository, so the local CI build cannot exercise it), and `extent-rename-mixed-dir.sh` (`content_layout=extent` rename/directory semantics; needs a server whose extent data plane is live and is opt-in via `RUN_EXTENT_E2E=1`, not part of the PR gate) |
+| Manual only | not wired, run by hand | `fixed-view-smoke.py` (paired v10 server in the external server repository; current client CI server does not implement these routes), `description-smoke-test.sh` (Docker + Ollama/stub embedder), `native-smoke-test.sh` (TiDB Cloud Native — requires credentials), `image-extract-config-smoke-test.sh` / `video-extract-config-smoke-test.sh` (hosted control-plane + billable vision provider), `embedding-config-smoke-test.sh` (hosted control-plane + billable embedding provider), `object-auth-smoke-test.sh` (tidbcloud-native + real object-store STS mint; `--auth=server` cannot run in local-e2e), `object-auth-s3-hosted-test.sh` / `object-auth-cos-hosted-test.sh` / `object-auth-tos-hosted-test.sh` (hosted S3/COS/TOS isolation/mount/refresh; same reason), `s3-express-append-log-smoke-test.sh` (hosted Directory Bucket HTTP smoke), `fuse-s3-express-append-log.sh` (hosted Directory Bucket + real FUSE; macOS/local provider cannot exercise S3 Express), `tokens-smoke-test.sh` (opt-in HTTP; needs `provider=local` mock IAM), `sse-retention-smoke-test.sh` (opt-in HTTP; needs `/v1/events` and a short retention), `tasks-smoke-test.sh` (opt-in HTTP; the handler lives in the external server repository, so the local CI build cannot exercise it), and `extent-rename-mixed-dir.sh` (`content_layout=extent` rename/directory semantics; needs a server whose extent data plane is live and is opt-in via `RUN_EXTENT_E2E=1`, not part of the PR gate) |
 
 Scheduled and post-merge failures auto-file/append to a `ci-e2e-failure`
 GitHub issue, since GitHub only notifies the workflow author otherwise.
