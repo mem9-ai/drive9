@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -584,8 +585,8 @@ func TestVaultPermissionsAreOwnerOnlyUnlessShared(t *testing.T) {
 
 func TestVaultMountOptionsEnforceKernelPermissionsWhenShared(t *testing.T) {
 	// Both platform branches are asserted here regardless of the host, since the
-	// option set is pure: Linux relies on default_permissions, macFUSE on
-	// defer_permissions, and each must only apply on its own platform.
+	// option set is pure: a shared mount arms the kernel with default_permissions on
+	// Linux and macOS alike, and defer_permissions is a private-mount-only detail.
 	for _, goos := range []string{"linux", "darwin", "freebsd"} {
 		privateOpts := newVaultMountOptionsFor(goos, &VaultMountOptions{})
 		if hasMountOption(privateOpts.Options, "default_permissions") {
@@ -604,16 +605,22 @@ func TestVaultMountOptionsEnforceKernelPermissionsWhenShared(t *testing.T) {
 		t.Fatal("allow_other was not propagated")
 	}
 
-	// macFUSE has no default_permissions switch; without defer_permissions an
-	// allow_other mount falls back to user-space checks VaultFS does not implement.
-	for _, allowOther := range []bool{false, true} {
-		darwinOpts := newVaultMountOptionsFor("darwin", &VaultMountOptions{AllowOther: allowOther})
-		if !hasMountOption(darwinOpts.Options, "defer_permissions") || !hasMountOption(darwinOpts.Options, "local") {
-			t.Fatalf("darwin mount options = %v, want defer_permissions and local", darwinOpts.Options)
-		}
-		if hasMountOption(darwinOpts.Options, "default_permissions") {
-			t.Fatalf("darwin mount options = %v, must not carry the Linux-only default_permissions", darwinOpts.Options)
-		}
+	// macFUSE checks mode bits in the kernel only with default_permissions, so a
+	// shared mount arms it exactly like Linux; a private mount is already restricted
+	// to the mounting user and keeps defer_permissions.
+	sharedDarwin := newVaultMountOptionsFor("darwin", &VaultMountOptions{AllowOther: true})
+	if !hasMountOption(sharedDarwin.Options, "default_permissions") {
+		t.Fatalf("darwin allow_other without default_permissions sends every check to VaultFS: %v", sharedDarwin.Options)
+	}
+	if hasMountOption(sharedDarwin.Options, "defer_permissions") {
+		t.Fatalf("darwin allow_other mount options = %v, must not defer", sharedDarwin.Options)
+	}
+	privateDarwin := newVaultMountOptionsFor("darwin", &VaultMountOptions{})
+	if !hasMountOption(privateDarwin.Options, "defer_permissions") || !hasMountOption(privateDarwin.Options, "local") {
+		t.Fatalf("darwin private mount options = %v, want defer_permissions and local", privateDarwin.Options)
+	}
+	if hasMountOption(privateDarwin.Options, "default_permissions") {
+		t.Fatalf("darwin private mount options = %v, must not arm the kernel it is already restricted by", privateDarwin.Options)
 	}
 
 	// freebsd takes neither branch.
@@ -624,10 +631,5 @@ func TestVaultMountOptionsEnforceKernelPermissionsWhenShared(t *testing.T) {
 }
 
 func hasMountOption(opts []string, want string) bool {
-	for _, o := range opts {
-		if o == want {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(opts, want)
 }
