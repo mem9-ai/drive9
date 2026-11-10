@@ -1438,7 +1438,14 @@ func (c *Client) readWithoutRedirect(ctx context.Context, path, rangeHeader stri
 	if rangeHeader != "" {
 		req.Header.Set("Range", rangeHeader)
 	}
-	return c.doNoRedirect(req)
+	resp, err := c.doNoRedirect(req)
+	if err == nil && c.view.LayerID != "" && resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		// Fixed-view reads use the server's protected stream. A Location does not
+		// carry that version/lifetime contract and must never fall back to main.
+		_ = resp.Body.Close()
+		return nil, fmt.Errorf("fixed view read returned an unsupported redirect: HTTP %d", resp.StatusCode)
+	}
+	return resp, err
 }
 
 // ResolveReadTarget resolves a large S3-backed file path to a reusable object

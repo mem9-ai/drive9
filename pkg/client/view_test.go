@@ -163,3 +163,71 @@ func TestBoundClientValidationAndRepeatedRequest(t *testing.T) {
 		t.Fatalf("main reset %v", err)
 	}
 }
+
+func TestBoundEventStreamUsesSameView(t *testing.T) {
+	for _, binding := range []ViewBinding{{}, {LayerID: "a", WorkID: "w", Fence: 2}} {
+		t.Run(binding.LayerID, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				want := "/v1/events"
+				if binding.LayerID != "" {
+					want = "/v1/views/a/v1/events"
+				}
+				got, err := viewprotocol.Parse(r.Header)
+				if err != nil || got != binding || r.URL.Path != want || r.URL.Query().Get("since") != "17" || r.Header.Get("X-Dat9-Actor") != "watch-actor" || r.Header.Get("Authorization") != "Bearer test-token" {
+					t.Errorf("event binding: %s %v %+v %v", r.URL, r.Header, got, err)
+				}
+				_, _ = io.WriteString(w, "event: file_changed\ndata: {\"seq\":18,\"path\":\"/a\",\"op\":\"write\"}\n\nevent: heartbeat\ndata: {\"seq\":19}\n\n")
+			}))
+			defer srv.Close()
+			c, err := New(srv.URL, "test-token").WithView(binding)
+			if err != nil {
+				t.Fatal(err)
+			}
+			c.SetActor("default-actor")
+			var changed, current uint64
+			err = c.streamEvents(context.Background(), 17, "watch-actor", func(ev *ChangeEvent, _ *ResetEvent) { changed = ev.Seq }, func(seq uint64) { current = seq })
+			if err != nil || changed != 18 || current != 19 {
+				t.Fatalf("events %d %d %v", changed, current, err)
+			}
+		})
+	}
+}
+
+func TestBoundReadAndEventsRejectRedirect(t *testing.T) {
+	for _, status := range []int{302, 307} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			var followups int
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.HasPrefix(r.URL.Path, "/v1/views/") {
+					w.Header().Set("Location", "http://"+r.Host+"/v1/fs/main")
+					w.WriteHeader(status)
+					return
+				}
+				followups++
+				_, _ = io.WriteString(w, "wrong view")
+			}))
+			defer srv.Close()
+			c, err := New(srv.URL, "test-token").WithView(ViewBinding{LayerID: "a", WorkID: "w", Fence: 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := c.streamEvents(context.Background(), 0, "actor", func(*ChangeEvent, *ResetEvent) { t.Error("delivered redirected event") }, nil); err == nil {
+				t.Fatal("redirected SSE succeeded")
+			}
+			if body, err := c.ReadStream(context.Background(), "/a"); err == nil {
+				_ = body.Close()
+				t.Fatal("redirected stream succeeded")
+			}
+			if body, err := c.ReadStreamRange(context.Background(), "/a", 1, 2); err == nil {
+				_ = body.Close()
+				t.Fatal("redirected range succeeded")
+			}
+			if _, err := c.ResolveReadTarget(context.Background(), "/a"); err == nil {
+				t.Fatal("redirected target escaped")
+			}
+			if followups != 0 {
+				t.Fatalf("left view route %d times", followups)
+			}
+		})
+	}
+}
