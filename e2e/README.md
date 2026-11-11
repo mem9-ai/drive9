@@ -82,10 +82,37 @@ without adding it to `.github/workflows/local-e2e.yml`.
 | Post-merge | `push` to `main` (local-e2e, coalesced via concurrency group) | PR gate + concurrency stress, POSIX/fsx, sqlite WAL/churn/concurrency, sqlite 1000-commit WAL FULL sequence, `smoke-all.sh` extras (journal, posix-permission, git-workspace), git feature smoke |
 | Nightly | cron 20:17 UTC (local-e2e) | Post-merge set + FUSE performance baseline/archive/compare (compare is report-only; hosted-runner noise) |
 | Manual all | Local E2E `workflow_dispatch` with `run_all_e2e=1` | Everything above |
-| Manual only | not wired, run by hand | `fixed-view-smoke.py` (paired v10 server in the external server repository; current client CI server does not implement these routes), `description-smoke-test.sh` (Docker + Ollama/stub embedder), `native-smoke-test.sh` (TiDB Cloud Native — requires credentials), `image-extract-config-smoke-test.sh` / `video-extract-config-smoke-test.sh` (hosted control-plane + billable vision provider), `embedding-config-smoke-test.sh` (hosted control-plane + billable embedding provider), `object-auth-smoke-test.sh` (tidbcloud-native + real object-store STS mint; `--auth=server` cannot run in local-e2e), `object-auth-s3-hosted-test.sh` / `object-auth-cos-hosted-test.sh` / `object-auth-tos-hosted-test.sh` (hosted S3/COS/TOS isolation/mount/refresh; same reason), `s3-express-append-log-smoke-test.sh` (hosted Directory Bucket HTTP smoke), `fuse-s3-express-append-log.sh` (hosted Directory Bucket + real FUSE; macOS/local provider cannot exercise S3 Express), `tokens-smoke-test.sh` (opt-in HTTP; needs `provider=local` mock IAM), `sse-retention-smoke-test.sh` (opt-in HTTP; needs `/v1/events` and a short retention), `tasks-smoke-test.sh` (opt-in HTTP; the handler lives in the external server repository, so the local CI build cannot exercise it), and `extent-rename-mixed-dir.sh` (`content_layout=extent` rename/directory semantics; needs a server whose extent data plane is live and is opt-in via `RUN_EXTENT_E2E=1`, not part of the PR gate) |
+| Manual only | not wired, run by hand | `TestViewRootFenceKernelDelayedSetAttr` (local Linux kernel mount; requires explicit opt-in, `/dev/fuse` and CAP_SYS_ADMIN; see below), `fixed-view-smoke.py` (paired v10 server in the external server repository; current client CI server does not implement these routes), `description-smoke-test.sh` (Docker + Ollama/stub embedder), `native-smoke-test.sh` (TiDB Cloud Native — requires credentials), `image-extract-config-smoke-test.sh` / `video-extract-config-smoke-test.sh` (hosted control-plane + billable vision provider), `embedding-config-smoke-test.sh` (hosted control-plane + billable embedding provider), `object-auth-smoke-test.sh` (tidbcloud-native + real object-store STS mint; `--auth=server` cannot run in local-e2e), `object-auth-s3-hosted-test.sh` / `object-auth-cos-hosted-test.sh` / `object-auth-tos-hosted-test.sh` (hosted S3/COS/TOS isolation/mount/refresh; same reason), `s3-express-append-log-smoke-test.sh` (hosted Directory Bucket HTTP smoke), `fuse-s3-express-append-log.sh` (hosted Directory Bucket + real FUSE; macOS/local provider cannot exercise S3 Express), `tokens-smoke-test.sh` (opt-in HTTP; needs `provider=local` mock IAM), `sse-retention-smoke-test.sh` (opt-in HTTP; needs `/v1/events` and a short retention), `tasks-smoke-test.sh` (opt-in HTTP; the handler lives in the external server repository, so the local CI build cannot exercise it), and `extent-rename-mixed-dir.sh` (`content_layout=extent` rename/directory semantics; needs a server whose extent data plane is live and is opt-in via `RUN_EXTENT_E2E=1`, not part of the PR gate) |
 
 Scheduled and post-merge failures auto-file/append to a `ci-e2e-failure`
 GitHub issue, since GitHub only notifies the workflow author otherwise.
+
+## Fixed-view root reply ordering (manual Linux kernel test)
+
+This test holds an actual FUSE SETATTR reply after the filesystem callback has
+returned, then checks that the root notification fence waits for the kernel's
+metadata update. It also checks the new root mode after the final invalidation.
+It is one switch prerequisite, not a complete LayerFS switch acceptance test.
+The test prints the kernel version so results remain tied to the tested host.
+
+Run only on a disposable Linux test machine with `/dev/fuse` and CAP_SYS_ADMIN.
+It creates and removes one temporary local mount; it does not start TiDB, contact
+Drive9, or use object storage. Missing prerequisites fail after opt-in. Without
+the environment variable it skips, which is not a kernel verification pass.
+
+From the repository root (explicit files avoid unrelated package dependencies):
+
+```bash
+DRIVE9_RUN_FUSE_KERNEL_TEST=1 go test -race -v -count=1 -timeout=30s \
+  pkg/fuse/view_root.go pkg/fuse/view_root_linux.go \
+  pkg/fuse/view_admission.go pkg/fuse/view_requests.go \
+  pkg/fuse/view_root_kernel_linux_test.go
+```
+
+The delayed reply uses go-fuse's debug writer. The test sends the entry
+notification directly to a duplicate FUSE device descriptor, bypassing the debug
+logger mutex; otherwise the logger itself could make the test appear to pass.
+This test does not establish equivalent behavior for macFUSE or other kernels.
 
 ## Product-quality report & Feishu notifications
 

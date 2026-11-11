@@ -165,9 +165,10 @@ func (v *viewCacheReplyFS) Statx(_ <-chan struct{}, in *gofuse.StatxIn, out *gof
 func (v *viewCacheReplyFS) Lookup(_ <-chan struct{}, h *gofuse.InHeader, name string, out *gofuse.EntryOut) gofuse.Status {
 	out.SetEntryTimeout(time.Minute)
 	out.SetAttrTimeout(time.Minute)
-	if name == "exists" {
+	switch name {
+	case "exists":
 		out.NodeId = 9
-	} else if name == "root" {
+	case "root":
 		out.NodeId = 1
 	}
 	return gofuse.OK
