@@ -134,6 +134,26 @@ class MountProbeTest(unittest.TestCase):
                 self.assertNotIn("sensitive", str(error.exception))
                 self.assertEqual(run.call_count, 1)
 
+    def test_busy_reason_is_classified_without_echoing_details(self):
+        cases = {
+            "mount view has open handles or locks: sensitive": "handles_or_locks",
+            "mount view retains kernel lookup references: sensitive": "kernel_lookups",
+            "mount view retains references or private extension state (sensitive)": "final_preflight",
+            "mount view extension_state: sensitive": "extension_state",
+            "sensitive unknown message": "unclassified",
+        }
+        for error, reason in cases.items():
+            with self.subTest(reason=reason):
+                detail = smoke.switch_failure_details(json.dumps({"unknown": False, "response": {
+                    "error_kind": "BUSY", "error": error}}).encode())
+                self.assertEqual(detail, "kind=BUSY state=absent unknown=false busy=" + reason)
+                self.assertNotIn("sensitive", detail)
+        for error in (None, [], {"private": "sensitive"}, 42):
+            detail = smoke.switch_failure_details(json.dumps({"response": {
+                "error_kind": "BUSY", "error": error}}).encode())
+            self.assertTrue(detail.endswith("busy=unclassified"))
+            self.assertNotIn("sensitive", detail)
+
     def test_switch_failure_malformed_values_cannot_escape(self):
         for value in (None, [], "sensitive", {"unknown": "sensitive", "response": []},
                       {"unknown": True, "response": {"error_kind": ["sensitive"], "receipt": []}},

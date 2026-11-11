@@ -24,7 +24,7 @@ def binding(work=None):
 
 
 def switch_failure_details(raw):
-    # Only fixed protocol enums and a boolean may leave the captured response.
+    # Only fixed protocol enums, local refusal classes and a boolean may leave the captured response.
     # Paths, operation identities, server errors and stderr remain private.
     try:
         result = json.loads(raw[:1024 * 1024])
@@ -42,7 +42,19 @@ def switch_failure_details(raw):
     state = state if isinstance(state, str) and state in ("RECOVERING", "DONE") else "absent"
     unknown = result.get("unknown")
     unknown = str(unknown).lower() if type(unknown) is bool else "unavailable"
-    return f"kind={kind} state={state} unknown={unknown}"
+    detail = f"kind={kind} state={state} unknown={unknown}"
+    if kind == "BUSY":
+        error = response.get("error")
+        error = error if isinstance(error, str) else ""
+        reasons = {
+            "mount view has open handles or locks:": "handles_or_locks",
+            "mount view retains kernel lookup references:": "kernel_lookups",
+            "mount view retains references or private extension state (": "final_preflight",
+            "mount view extension_state:": "extension_state",
+        }
+        reason = next((value for prefix, value in reasons.items() if error.startswith(prefix)), "unclassified")
+        detail += f" busy={reason}"
+    return detail
 
 
 class MountProbe:
