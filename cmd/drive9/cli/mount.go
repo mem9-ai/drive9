@@ -95,8 +95,7 @@ var mountProfileAppendLogSupported = probeMountProfileAppendLogSupport
 // set would quietly accept write-path flags for a vault mount - that
 // would violate Row C (read-only) in a subtle, mount-time-visible way.
 //
-// Only the CURRENT supported subcommand/backend keywords ("vault", "drain") are
-// reserved here. Every other first positional falls through to the legacy parser,
+// Only implemented subcommand/backend keywords are reserved here. Every other first positional falls through to the legacy parser,
 // which enforces "exactly one mountpoint" so `drive9 mount kv /mnt/x` fails as a
 // positional-arity error rather than by pre-reserving backend-shaped words that do
 // not exist yet.
@@ -110,6 +109,10 @@ func MountCmd(args []string) error {
 			return MountDrainCmd(args[1:])
 		case "status":
 			return runMountStatus(args[1:])
+		case "switch":
+			return mountSwitchCmd(args[1:], false)
+		case "switch-operation":
+			return mountSwitchCmd(args[1:], true)
 		case "health":
 			return runMountHealth(args[1:])
 		case "ensure":

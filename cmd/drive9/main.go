@@ -483,6 +483,10 @@ func usage(code int) {
 			"                         mount drive9 or an object prefix (background FUSE by default)\n"+
 			"  mount drain [--timeout duration] [--json] <mountpoint>\n"+
 			"                         drain pending writes for a live FUSE mount\n"+
+			"  mount switch [flags] <mountpoint>\n"+
+			"                         switch a supporting FUSE mount to main or a Layer\n"+
+			"  mount switch-operation [flags] <mountpoint>\n"+
+			"                         query the original switch without applying it again\n"+
 			"  mount status [--json] <mountpoint>\n"+
 			"                         show supervised mount health/status\n"+
 			"  mount health <mountpoint>\n"+
