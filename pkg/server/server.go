@@ -1558,6 +1558,38 @@ func tlsPlaintextAllowed() bool {
 	}
 }
 
+// provisionRequiresAuthentication reports whether POST /v1/provision must carry a
+// caller credential. Anonymous provisioning is the explicit
+// DRIVE9_ALLOW_ANONYMOUS_PROVISION opt-in; the local development provider is the
+// only implicit exception, and it is limited to requests received over the loopback
+// interface so a server bound to a network address cannot be provisioned by an
+// unauthenticated remote caller.
+func (s *Server) provisionRequiresAuthentication(r *http.Request, provider string) bool {
+	if s.allowAnonymousProvision {
+		return false
+	}
+	if provider != tenant.ProviderLocal {
+		return true
+	}
+	return !requestIsLoopback(r)
+}
+
+// requestIsLoopback reports whether a request arrived over the loopback interface.
+// Forwarded headers are deliberately ignored: the caller controls them, and the
+// local provider's anonymous exception must not be relaxable by a header.
+func requestIsLoopback(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	remote := strings.TrimSpace(r.RemoteAddr)
+	host, _, err := net.SplitHostPort(remote)
+	if err != nil {
+		host = remote
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
+}
+
 func isLoopbackListenAddr(addr string) bool {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -4949,10 +4981,14 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 			errJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		// provider=local is the loopback-only development provider and stays
-		// anonymous; every other provider requires the explicit
-		// DRIVE9_ALLOW_ANONYMOUS_PROVISION opt-in.
-		if !s.allowAnonymousProvision && provider != tenant.ProviderLocal {
+		// provider=local is the loopback-only development provider and is the one
+		// provider that stays anonymous — but only for callers on the loopback
+		// interface. Every other provider requires the explicit
+		// DRIVE9_ALLOW_ANONYMOUS_PROVISION opt-in, and a non-loopback deployment
+		// must not create tenants unauthenticated just because the local provider
+		// is selected (the startup guard only refuses that bind while generated
+		// development keys are in use).
+		if s.provisionRequiresAuthentication(r, provider) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "provision_credentials_required", "provider", provider)...)
 			metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
 			errJSON(w, http.StatusUnauthorized, "provisioning requires authentication")

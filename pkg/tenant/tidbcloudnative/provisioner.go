@@ -1525,10 +1525,23 @@ func (p *Provisioner) resolveDatabaseName(raw string) (string, error) {
 func ensureSystemUser(ctx context.Context, db *sql.DB, dbName, username, password string) error {
 	for i, stmt := range systemUserStatements(dbName, username, password) {
 		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			// TiDB accepts REVOKE of a privilege that was never granted, but
+			// MySQL-compatible servers may answer ER_NONEXISTING_GRANT. The revoke is
+			// legacy cleanup, so that answer is not a setup failure.
+			if strings.HasPrefix(stmt, "REVOKE SYSTEM_VARIABLES_ADMIN") && isMissingGrantError(err) {
+				continue
+			}
 			return fmt.Errorf("execute native system user statement %d: %w", i+1, err)
 		}
 	}
 	return nil
+}
+
+// isMissingGrantError reports whether the server rejected a REVOKE because the
+// privilege was not granted in the first place.
+func isMissingGrantError(err error) bool {
+	var mysqlErr *mysql.MySQLError
+	return errors.As(err, &mysqlErr) && (mysqlErr.Number == 1141 || mysqlErr.Number == 1147)
 }
 
 func systemUserStatements(dbName, username, password string) []string {
@@ -1536,7 +1549,13 @@ func systemUserStatements(dbName, username, password string) []string {
 	return []string{
 		fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s", quoteIdent(dbName)),
 		fmt.Sprintf("CREATE ROLE IF NOT EXISTS %s", quoteString(roleName)),
-		fmt.Sprintf("GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO %s", quoteString(roleName)),
+		// Tenant SQL runs as this role, so it must not carry a cluster-wide dynamic
+		// privilege: SYSTEM_VARIABLES_ADMIN ON *.* lets the tenant SET GLOBAL on the
+		// shared instance, which is a whole-cluster escalation that the SQL
+		// classifier cannot be the only guard for. Nothing in the tenant runtime
+		// issues SET GLOBAL, so the legacy grant is revoked on every setup — an
+		// upgraded cluster loses the escalation the next time a tenant is finalized.
+		fmt.Sprintf("REVOKE SYSTEM_VARIABLES_ADMIN ON *.* FROM %s", quoteString(roleName)),
 		fmt.Sprintf("GRANT CREATE, ALTER, DROP, INDEX, SELECT, INSERT, UPDATE, DELETE ON %s.* TO %s", quoteIdent(dbName), quoteString(roleName)),
 		fmt.Sprintf("CREATE USER IF NOT EXISTS %s IDENTIFIED BY %s", quoteString(username), quoteString(password)),
 		fmt.Sprintf("ALTER USER %s IDENTIFIED BY %s", quoteString(username), quoteString(password)),
