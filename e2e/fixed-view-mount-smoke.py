@@ -74,7 +74,10 @@ class MountProbe:
         return current
 
     def read(self, path, expected):
-        result = subprocess.run(["cat", self.point + path], capture_output=True, timeout=30)
+        try:
+            result = subprocess.run(["cat", self.point + path], capture_output=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            raise http.ProbeFailure("mounted file read timed out") from None
         require(result.returncode == 0 and result.stdout == expected, "mounted view returned wrong file bytes")
 
 
@@ -113,15 +116,21 @@ def run(cli, probe):
                 require(process.poll() is None, "mount process exited before becoming ready")
                 require(time.monotonic() < deadline, "mount readiness timed out")
                 time.sleep(0.1)
+            print("CHECK mounted process ready; querying main binding", flush=True)
             initial = mounted.status()
             require(initial["binding"] == binding(), "unspecified mount view was not main")
             mount_id = kernel_mount_id(point)
+            print("CHECK main file read", flush=True)
             mounted.read(path, b"after")
+            print("CHECK switching main to Layer", flush=True)
             current = mounted.switch(initial, work)
+            print("CHECK Layer file read", flush=True)
             mounted.read(path, b"before")
             probe.request("PUT", probe.fs(path), data=b"latest", statuses=(200, 201))
             mounted.read(path, b"before")
+            print("CHECK switching Layer to main", flush=True)
             mounted.switch(current)
+            print("CHECK latest main file read", flush=True)
             mounted.read(path, b"latest")
             require(process.poll() is None and kernel_mount_id(point) == mount_id,
                     "switch replaced the mount process or kernel mount")
@@ -129,9 +138,14 @@ def run(cli, probe):
     finally:
         # Never recursively remove a directory while it might still expose remote data.
         if process is not None:
+            primary_error = sys.exc_info()[1]
+            print("CHECK unmount cleanup", flush=True)
             try:
                 subprocess.run([cli, "umount", "--timeout", "10s", point], env=mounted.env,
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+            except subprocess.TimeoutExpired:
+                detail = str(primary_error) if isinstance(primary_error, http.ProbeFailure) else type(primary_error).__name__
+                raise http.ProbeFailure("unmount cleanup timed out; prior failure: " + detail) from None
             finally:
                 if process.poll() is None:
                     process.terminate()

@@ -61,6 +61,13 @@ class MountProbeTest(unittest.TestCase):
                 self.assertEqual(run.call_args.args[0], ["cat", "/tmp/fixture/mount/file"])
                 self.assertEqual(run.call_count, 1)
 
+    def test_mounted_read_timeout_identifies_stage_without_output(self):
+        with patch.object(smoke.subprocess, "run", side_effect=subprocess.TimeoutExpired(
+                "sensitive path", 30, output=b"sensitive bytes")) as run:
+            with self.assertRaisesRegex(smoke.http.ProbeFailure, "^mounted file read timed out$"):
+                self.driver.read("/file", b"expected")
+        self.assertEqual(run.call_count, 1)
+
     def test_invalid_receipt_never_retries_switch(self):
         for field, value in (("state", "RECOVERING"), ("generation", 6), ("from_generation", 3),
                              ("target", smoke.binding()), ("operation_id", "other")):
@@ -114,6 +121,25 @@ class MountProbeTest(unittest.TestCase):
                 self.assertEqual(run.call_count, 1)
                 self.assertNotIn(self.probe.key, run.call_args.args[0])
                 self.assertEqual(run.call_args.kwargs["env"]["DRIVE9_API_KEY"], self.probe.key)
+
+    def test_cleanup_timeout_preserves_sanitized_primary_failure(self):
+        for primary, label in ((smoke.http.ProbeFailure("mounted file read timed out"), "mounted file read timed out"),
+                               (RuntimeError("sensitive message"), "RuntimeError")):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                process = Mock()
+                process.poll.return_value = 0
+                work = dict(self.work, layer_id=self.probe.prefix + "-mount")
+                with patch.object(smoke.sys, "platform", "linux"), patch.object(smoke.os.path, "exists", return_value=True), \
+                     patch.object(smoke.tempfile, "mkdtemp", return_value=directory), patch.object(self.probe, "request"), \
+                     patch.object(smoke.MountProbe, "call", side_effect=[{"layer_id": work["layer_id"]}, {"launch": True, "work": work}]), \
+                     patch.object(smoke.subprocess, "Popen", return_value=process), \
+                     patch.object(smoke.subprocess, "run", side_effect=subprocess.TimeoutExpired("sensitive argv", 15)), \
+                     patch.object(smoke.os.path, "ismount", return_value=True), \
+                     patch.object(smoke.MountProbe, "status", side_effect=primary), patch.object(smoke.shutil, "rmtree") as remove:
+                    with self.assertRaisesRegex(smoke.http.ProbeFailure, "unmount cleanup timed out; prior failure: " + label) as error:
+                        smoke.run("/paired/drive9", self.probe)
+                    self.assertNotIn("sensitive", str(error.exception))
+                    remove.assert_not_called()
 
     def test_cleanup_never_traverses_a_remaining_mount(self):
         with tempfile.TemporaryDirectory() as directory:
