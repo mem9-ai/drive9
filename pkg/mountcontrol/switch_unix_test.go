@@ -59,7 +59,7 @@ func socketSwitchFixture(t *testing.T, handler func(net.Conn)) string {
 }
 
 func TestSwitchControlReplies(t *testing.T) {
-	for _, name := range []string{"done", "main", "recovering", "busy", "unknown", "wrong-mount", "wrong-op", "wrong-target", "wrong-generation", "missing", "truncated", "oversized", "invalid-state"} {
+	for _, name := range []string{"done", "main", "recovering", "busy", "unknown", "wrong-mount", "wrong-op", "wrong-target", "wrong-generation", "missing", "truncated", "oversized", "second-json", "tail-garbage", "tail-oversized", "invalid-state"} {
 		t.Run(name, func(t *testing.T) {
 			req, resp := switchFixture()
 			switch name {
@@ -100,7 +100,11 @@ func TestSwitchControlReplies(t *testing.T) {
 				ops <- wire.Op
 				if wire.Op == "ping" {
 					_ = json.NewEncoder(conn).Encode(StatusResponse{OK: true, ViewSwitch: true, MountID: req.MountID})
-					return
+					if err := json.NewDecoder(conn).Decode(&wire); err != nil {
+						t.Error(err)
+						return
+					}
+					ops <- wire.Op
 				}
 				if wire.Op != "switch" || wire.SwitchRequest != req {
 					t.Errorf("changed request: %+v", wire)
@@ -110,6 +114,16 @@ func TestSwitchControlReplies(t *testing.T) {
 					_, _ = conn.Write([]byte(`{"mount_id":`))
 				case "oversized":
 					_, _ = conn.Write([]byte(`{"error":"` + strings.Repeat("x", 65<<10)))
+				case "second-json", "tail-garbage", "tail-oversized":
+					_ = json.NewEncoder(conn).Encode(resp)
+					tail := "{}"
+					if name == "tail-garbage" {
+						tail = "garbage"
+					}
+					if name == "tail-oversized" {
+						tail = strings.Repeat(" ", 65<<10)
+					}
+					_, _ = conn.Write([]byte(tail))
 				default:
 					_ = json.NewEncoder(conn).Encode(resp)
 				}
@@ -150,7 +164,11 @@ func TestSwitchControlUnknownThenQueryOriginal(t *testing.T) {
 		ops <- wire.Op
 		if wire.Op == "ping" {
 			_ = json.NewEncoder(conn).Encode(StatusResponse{OK: true, ViewSwitch: true, MountID: req.MountID})
-			return
+			if err := json.NewDecoder(conn).Decode(&wire); err != nil {
+				t.Error(err)
+				return
+			}
+			ops <- wire.Op
 		}
 		if wire.SwitchRequest != req {
 			t.Errorf("new identity on recovery: %+v", wire)
@@ -210,7 +228,10 @@ func TestSwitchControlCancellationPreservesIdentity(t *testing.T) {
 		}
 		if wire.Op == "ping" {
 			_ = json.NewEncoder(conn).Encode(StatusResponse{OK: true, ViewSwitch: true, MountID: req.MountID})
-			return
+			if err := json.NewDecoder(conn).Decode(&wire); err != nil {
+				t.Error(err)
+				return
+			}
 		}
 		close(received)
 		<-release
@@ -286,5 +307,134 @@ func TestSwitchControlCancellationDuringStatus(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("cancel did not interrupt status read")
+	}
+}
+
+func TestSwitchControlKeepsNegotiatedConnectionAfterSocketReplacement(t *testing.T) {
+	for _, query := range []bool{false, true} {
+		t.Run(map[bool]string{false: "switch", true: "query"}[query], func(t *testing.T) {
+			req, resp := switchFixture()
+			legacyCalls := make(chan string, 4)
+			var socket string
+			socket = socketSwitchFixture(t, func(conn net.Conn) {
+				var wire struct {
+					Op string
+					SwitchRequest
+				}
+				decoder := json.NewDecoder(conn)
+				if err := decoder.Decode(&wire); err != nil {
+					t.Error(err)
+					return
+				}
+				if wire.Op != "ping" {
+					t.Errorf("initial op=%s", wire.Op)
+					return
+				}
+				// A replacement daemon owns this path before negotiation returns.
+				// It implements the old fallthrough-to-drain behavior.
+				if err := os.Remove(socket); err != nil {
+					t.Error(err)
+					return
+				}
+				legacy, err := net.Listen("unix", socket)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				stopped := make(chan struct{})
+				t.Cleanup(func() { _ = legacy.Close(); <-stopped })
+				go func() {
+					defer close(stopped)
+					c, err := legacy.Accept()
+					if err != nil {
+						return
+					}
+					defer func() { _ = c.Close() }()
+					var old DrainRequest
+					if err := json.NewDecoder(c).Decode(&old); err != nil {
+						t.Error(err)
+						return
+					}
+					legacyCalls <- old.Op
+					_ = json.NewEncoder(c).Encode(DrainResponse{OK: true})
+				}()
+				_ = json.NewEncoder(conn).Encode(StatusResponse{OK: true, ViewSwitch: true, MountID: req.MountID})
+				if err := decoder.Decode(&wire); err != nil {
+					// A regressed client closes this negotiated connection and
+					// sends the operation to the replacement listener instead.
+					return
+				}
+				want := "switch"
+				if query {
+					want = "switch-operation"
+				}
+				if wire.Op != want || wire.SwitchRequest != req {
+					t.Errorf("request=%+v", wire)
+				}
+				_ = json.NewEncoder(conn).Encode(resp)
+			})
+			var got *SwitchResponse
+			var err error
+			if query {
+				got, err = QuerySwitch(t.Context(), socket, req)
+			} else {
+				got, err = RequestSwitch(t.Context(), socket, req)
+			}
+			if err != nil || got == nil || got.Receipt.State != "DONE" {
+				t.Fatalf("reply=%+v err=%v", got, err)
+			}
+			if len(legacyCalls) != 0 {
+				t.Fatalf("legacy daemon received %s", <-legacyCalls)
+			}
+		})
+	}
+}
+
+func TestSwitchControlCancellationAfterValidPrefix(t *testing.T) {
+	for _, query := range []bool{false, true} {
+		t.Run(map[bool]string{false: "switch", true: "query"}[query], func(t *testing.T) {
+			req, resp := switchFixture()
+			prefixSent, release := make(chan struct{}), make(chan struct{})
+			socket := socketSwitchFixture(t, func(conn net.Conn) {
+				var wire struct{ Op string }
+				decoder := json.NewDecoder(conn)
+				if err := decoder.Decode(&wire); err != nil {
+					t.Error(err)
+					return
+				}
+				_ = json.NewEncoder(conn).Encode(StatusResponse{OK: true, ViewSwitch: true, MountID: req.MountID})
+				if err := decoder.Decode(&wire); err != nil {
+					t.Error(err)
+					return
+				}
+				_ = json.NewEncoder(conn).Encode(resp)
+				close(prefixSent)
+				<-release // no EOF; the supposedly complete JSON is only a prefix
+			})
+			t.Cleanup(func() { close(release) })
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() {
+				var err error
+				if query {
+					_, err = QuerySwitch(ctx, socket, req)
+				} else {
+					_, err = RequestSwitch(ctx, socket, req)
+				}
+				done <- err
+			}()
+			<-prefixSent
+			cancel()
+			select {
+			case err := <-done:
+				var failure *SwitchError
+				if !errors.Is(err, context.Canceled) || !errors.As(err, &failure) || !failure.Unknown || failure.OperationID != req.OperationID {
+					t.Fatalf("prefix reported complete: %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("cancel did not interrupt final framing")
+			}
+		})
 	}
 }

@@ -30,7 +30,9 @@ type StatusResponse struct {
 	// workspace). Nil means the mount predates layer reporting.
 	Layer *string `json:"layer,omitempty"`
 	Error string  `json:"error,omitempty"`
-	// ViewSwitch is advertised only after the complete switch engine is installed.
+	// ViewSwitch promises same-connection ping -> switch/switch-operation
+	// negotiation and an EOF-terminated final reply. Advertise it only after
+	// the complete switch engine and connection handler are installed.
 	ViewSwitch bool   `json:"view_switch,omitempty"`
 	MountID    string `json:"mount_id,omitempty"`
 }

@@ -1,6 +1,7 @@
 package mountcontrol
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -63,7 +64,7 @@ func (e *SwitchError) Error() string {
 func (e *SwitchError) Unwrap() error { return e.Cause }
 
 // RequestSwitch sends exactly one switch after checking protocol support.
-// It performs no automatic retry. A preflight status check prevents old mount
+// It performs no automatic retry. A same-connection status check prevents old mount
 // daemons (which treated unknown operations as drain) from receiving this op.
 func RequestSwitch(ctx context.Context, socketPath string, req SwitchRequest) (*SwitchResponse, error) {
 	if err := req.Validate(); err != nil {
@@ -71,19 +72,6 @@ func RequestSwitch(ctx context.Context, socketPath string, req SwitchRequest) (*
 	}
 	ctx, cancel := context.WithTimeout(ctx, DefaultDrainTimeout)
 	defer cancel()
-	status, err := RequestStatus(ctx, socketPath, DefaultDrainTimeout)
-	if err != nil {
-		if ctx.Err() != nil {
-			err = ctx.Err()
-		}
-		return nil, switchError(req, true, err)
-	}
-	if !status.ViewSwitch {
-		return nil, switchError(req, true, ErrSwitchUnsupported)
-	}
-	if status.MountID != req.MountID {
-		return nil, switchError(req, true, errors.New("mount incarnation changed"))
-	}
 	return exchangeSwitch(ctx, socketPath, "switch", req)
 }
 
@@ -96,17 +84,6 @@ func QuerySwitch(ctx context.Context, socketPath string, req SwitchRequest) (*Sw
 	}
 	ctx, cancel := context.WithTimeout(ctx, DefaultDrainTimeout)
 	defer cancel()
-	// The same capability check avoids triggering a legacy drain on a query.
-	status, err := RequestStatus(ctx, socketPath, DefaultDrainTimeout)
-	if err != nil {
-		if ctx.Err() != nil {
-			err = ctx.Err()
-		}
-		return nil, switchError(req, true, err)
-	}
-	if !status.ViewSwitch || status.MountID != req.MountID {
-		return nil, switchError(req, true, ErrSwitchUnsupported)
-	}
 	return exchangeSwitch(ctx, socketPath, "switch-operation", req)
 }
 
@@ -134,14 +111,47 @@ func exchangeSwitch(ctx context.Context, socketPath, op string, req SwitchReques
 			return nil, switchError(req, true, err)
 		}
 	}
-	if err := json.NewEncoder(conn).Encode(wire); err != nil {
+	// Keep negotiation and operation on this exact stream. Reconnecting
+	// would let a replacement daemon receive an op it never advertised.
+	reader := bufio.NewReaderSize(conn, 64<<10)
+	if err := json.NewEncoder(conn).Encode(DrainRequest{Op: "ping"}); err != nil {
 		return nil, switchError(req, true, err)
 	}
-	var resp SwitchResponse
-	if err := json.NewDecoder(io.LimitReader(conn, 64<<10)).Decode(&resp); err != nil {
+	statusFrame, err := reader.ReadSlice('\n')
+	if err != nil {
 		if ctx.Err() != nil {
 			err = ctx.Err()
 		}
+		return nil, switchError(req, true, err)
+	}
+	var status StatusResponse
+	if err := json.Unmarshal(statusFrame, &status); err != nil {
+		return nil, switchError(req, true, err)
+	}
+	if !status.OK || !status.ViewSwitch {
+		return nil, switchError(req, true, ErrSwitchUnsupported)
+	}
+	if status.MountID != req.MountID {
+		return nil, switchError(req, true, errors.New("mount incarnation changed"))
+	}
+	if err := json.NewEncoder(conn).Encode(wire); err != nil {
+		return nil, switchError(req, true, err)
+	}
+	// A switch peer closes the stream after its final response. Read the
+	// complete bounded frame: a valid JSON prefix alone proves nothing
+	// about a truncated, extended or still-incomplete response.
+	data, err := io.ReadAll(io.LimitReader(reader, (64<<10)+1))
+	if err != nil {
+		if ctx.Err() != nil {
+			err = ctx.Err()
+		}
+		return nil, switchError(req, true, err)
+	}
+	if len(data) > 64<<10 {
+		return nil, switchError(req, true, errors.New("mount switch response exceeds limit"))
+	}
+	var resp SwitchResponse
+	if err := json.Unmarshal(data, &resp); err != nil {
 		return nil, switchError(req, true, err)
 	}
 	if err := validateSwitchResponse(req, resp); err != nil {
