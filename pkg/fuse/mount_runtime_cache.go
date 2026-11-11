@@ -10,7 +10,8 @@ import (
 )
 
 // mountRuntimeGeneration identifies one runtime in a switch journal. Both
-// fields are required together. Zero preserves the ordinary mount namespace.
+// fields are required together. Zero and the initial main generation preserve
+// the ordinary mount namespace so upgrading/restarting main recovers its WAL.
 // The switch owner must serialize construction/recovery of a given generation;
 // a distinct cache directory is not a lock or permission grant.
 type mountRuntimeGeneration struct {
@@ -34,11 +35,11 @@ func mountRuntimeCacheHashes(cfg MountConfig, binding viewprotocol.Binding, gene
 		writeHash = MountLayerHash(cfg.Server, cfg.MountPoint, cfg.RemoteRoot, cfg.LayerRef, cfg.CheckpointRef)
 	}
 	readHash := MountReadCacheHash(cfg.Server, cfg.MountPoint, cfg.RemoteRoot, mountCredentialKind(&cfg), mountCredentialSecret(&cfg))
-	if generation.MountID == "" && binding.LayerID == "" {
+	if binding.LayerID == "" && generation.Generation <= 1 {
 		return writeHash, readHash, nil
 	}
 
-	// Include the actual immutable client binding, not a user-supplied Layer
+	// After leaving initial main, include the immutable binding, not a supplied Layer
 	// name. Revisiting a view in a later generation must not recover a prior
 	// generation's dirty writes. The credential-derived read namespace is
 	// retained too. Only digests are used in filesystem paths.

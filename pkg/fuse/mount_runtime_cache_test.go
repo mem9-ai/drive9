@@ -92,7 +92,7 @@ func TestMountRuntimeCacheRejectsInvalidScopeBeforeCreatingFiles(t *testing.T) {
 }
 
 func TestMountRuntimeGenerationDoesNotRecoverAnotherViewsPendingWrites(t *testing.T) {
-	cfg := MountConfig{Server: "http://example.invalid", MountPoint: t.TempDir(), CacheDir: t.TempDir(), Extensions: []string{"core", "writeback"}, WritePolicy: "writeback", SyncMode: "strict"}
+	cfg := MountConfig{Server: "http://example.invalid", MountPoint: t.TempDir(), CacheDir: t.TempDir(), Extensions: []string{"core", "writeback"}, WritePolicy: "writeback", SyncMode: "strict", WriteCacheFreeRatio: -1}
 	base := client.New(cfg.Server, "")
 	bound, err := base.WithView(client.ViewBinding{LayerID: "A", WorkID: "work-A", Fence: 1})
 	if err != nil {
@@ -125,10 +125,14 @@ func TestMountRuntimeGenerationDoesNotRecoverAnotherViewsPendingWrites(t *testin
 	}{
 		{"layer", bound, mountRuntimeGeneration{MountID: "mount-1", Generation: 2}},
 		{"return-to-main", base, mountRuntimeGeneration{MountID: "mount-1", Generation: 3}},
-		{"other-mount", base, mountRuntimeGeneration{MountID: "mount-2", Generation: 1}},
+		{"other-mountpoint", base, mountRuntimeGeneration{MountID: "mount-2", Generation: 1}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			rt, err := buildMountRuntimeGeneration(cfg, tc.client, "/", "actor", tc.generation)
+			targetConfig := cfg
+			if tc.name == "other-mountpoint" {
+				targetConfig.MountPoint = t.TempDir()
+			}
+			rt, err := buildMountRuntimeGeneration(targetConfig, tc.client, "/", "actor", tc.generation)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -187,7 +191,7 @@ func TestMountRuntimeGenerationDiskReadsDoNotCrossViews(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := MountConfig{Server: server.URL, MountPoint: t.TempDir(), CacheDir: t.TempDir(), Extensions: []string{"core", "cache"}, SyncMode: "strict", ReadCacheMaxFileBytes: 1}
+	cfg := MountConfig{Server: server.URL, MountPoint: t.TempDir(), CacheDir: t.TempDir(), Extensions: []string{"core", "cache"}, SyncMode: "strict", ReadCacheMaxFileBytes: 1, DiskReadCacheFreeRatio: -1}
 	// All fixtures deliberately have the SAME pathname, revision and size.
 	// Their bytes differ, so only correct view/generation isolation can help.
 	for i, cl := range []*client.Client{base, bound, base} {
