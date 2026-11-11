@@ -662,7 +662,7 @@ type redactedMountCause struct {
 func (e redactedMountCause) Error() string { return e.message }
 func (e redactedMountCause) Unwrap() error { return e.cause }
 
-func mountWithConfig(cfg MountConfig) error {
+func mountWithConfig(cfg MountConfig) (resultErr error) {
 	if cfg.APIKey != "" && cfg.Token != "" {
 		return fmt.Errorf("fuse: APIKey and Token are mutually exclusive")
 	}
@@ -674,26 +674,19 @@ func mountWithConfig(cfg MountConfig) error {
 		return fmt.Errorf("fuse: normalize remote root: %w", err)
 	}
 
-	var cl *client.Client
-	if cfg.Token != "" {
-		cl = client.NewWithToken(cfg.Server, cfg.Token)
-	} else {
-		cl = client.New(cfg.Server, cfg.APIKey)
+	cl, err := mountClient(cfg)
+	if err != nil {
+		return err
 	}
-	cl.Warm(context.Background())
+	startCtx, startCancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer startCancel()
+	cl.Warm(startCtx)
 	// v1: one actor id tags this mount's own writes AND filters its SSE
 	// echo — separate ids would make every local commit look like a remote
 	// change and trigger needless kernel invalidations.
 	actorID := generateMountID()
 	cl.SetActor(actorID)
 
-	// v1 validateRemoteRoot: refuse to mount a remote source that does not
-	// exist (startup-permanent) before any kernel mount is established, and
-	// surface connectivity/auth trouble as startup-transient for the
-	// supervisor's retry ladder.
-	if err := validateRemoteRoot(context.Background(), cl, remoteRoot); err != nil {
-		return err
-	}
 	// A checkpoint without a layer is meaningless (the layer plane carries
 	// the checkpoint view) and previously passed silently: the layer
 	// extension was skipped, the checkpoint ignored, and an ordinary
@@ -702,11 +695,28 @@ func mountWithConfig(cfg MountConfig) error {
 		return fmt.Errorf("fuse: checkpoint %q requires --layer (the layer plane owns the checkpoint view)", cfg.CheckpointRef)
 	}
 
-	runtime, err := buildMountRuntime(cfg, cl, remoteRoot, actorID)
-	if err != nil {
-		return err
+	var view *mountView
+	var runtime *mountRuntime
+	if cfg.LayerRef == "" {
+		view, err = prepareMountView(startCtx, cfg, cl, actorID)
+		if err != nil {
+			return err
+		}
+		runtime = view.switcher.current
+		defer func() { resultErr = errors.Join(resultErr, view.close(context.Background())) }()
+	} else {
+		if cfg.MountID != "" {
+			return errors.New("fuse: mount-view-id cannot select a legacy layer")
+		}
+		if err := validateRemoteRoot(startCtx, cl, remoteRoot); err != nil {
+			return err
+		}
+		runtime, err = buildMountRuntime(cfg, cl, remoteRoot, actorID)
+		if err != nil {
+			return err
+		}
+		defer func() { resultErr = errors.Join(resultErr, runtime.stop(context.Background())) }()
 	}
-	defer func() { _ = runtime.stop(context.Background()) }()
 	f, wb := runtime.fs, runtime.writeback
 	cfg.LayerRef = runtime.layerRef
 	syncMode, policy := runtime.syncMode, runtime.policy
@@ -728,9 +738,17 @@ func mountWithConfig(cfg MountConfig) error {
 	perfRecorder.SetPerf(f.perf)
 	if wb != nil {
 		perfRecorder.SetQueueStats(func() *perf.QueueStats {
+			f, wb := f, wb
+			if view != nil {
+				current := view.currentRuntime()
+				f, wb = current.fs, current.writeback
+			}
 			stats := &perf.QueueStats{
 				OpenFileHandles:      f.HandleCount(),
 				OpenDirectoryHandles: f.DirCount(),
+			}
+			if wb == nil {
+				return stats
 			}
 			if q := wb.Queue(); q != nil {
 				stats.CommitPending = q.Pending()
@@ -749,8 +767,17 @@ func mountWithConfig(cfg MountConfig) error {
 	// `drive9 mount drain/umount/status` find this worker and its control
 	// socket; a supervised worker skips it — the supervisor owns the state
 	// file (v1 SkipProcessState: opts.Supervised).
-	ctrl, cerr := startMountControlServer(cfg.MountPoint, cfg.LayerRef, f)
+	var ctrl *mountControlServer
+	var cerr error
+	if view != nil {
+		ctrl, cerr = startMountViewControlServer(cfg.MountPoint, view.switcher)
+	} else {
+		ctrl, cerr = startMountControlServer(cfg.MountPoint, cfg.LayerRef, f)
+	}
 	if cerr != nil {
+		if view != nil {
+			return fmt.Errorf("fuse: mount view control server: %w", cerr)
+		}
 		fmt.Fprintf(os.Stderr, "drive9: mount control server failed: %v (continuing)\n", cerr)
 	} else {
 		defer ctrl.Close()
@@ -798,7 +825,17 @@ func mountWithConfig(cfg MountConfig) error {
 	if err := os.MkdirAll(cfg.MountPoint, 0o755); err != nil {
 		return fmt.Errorf("fuse: create mount point %s: %w", cfg.MountPoint, err)
 	}
-	server, err := gofuse.NewServer(f, cfg.MountPoint, fuseOpts)
+	// The pinned go-fuse constructor invokes Init before returning. Start
+	// under our deadline before entering it; Init then only attaches server.
+	f.Init2(startCtx)
+	if err := f.StartErr(); err != nil {
+		return ExitStartupTransientErr("extension start", err)
+	}
+	var raw gofuse.RawFileSystem = f
+	if view != nil {
+		raw = view.switcher.adapter
+	}
+	server, err := gofuse.NewServer(raw, cfg.MountPoint, fuseOpts)
 	if err != nil {
 		// v1 cleanupNewServerFailure: NewServer can fail after the kernel
 		// mount came up (post-mount INIT failure) with no Server handle to
@@ -810,11 +847,9 @@ func mountWithConfig(cfg MountConfig) error {
 		}
 		return ExitStartupTransientErr("fuse mount", err)
 	}
-	// Bound plugin Start (go-fuse runs Init inside the serve loop; a slow
-	// plugin must never stall the mount).
-	startCtx, startCancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer startCancel()
-	f.Init2(startCtx)
+	if view != nil {
+		view.server.Store(server)
+	}
 
 	// Serve must be reading /dev/fuse before WaitMount's pollHack opens the
 	// mountpoint: that open is a FUSE OPENDIR and would deadlock against a
@@ -824,22 +859,6 @@ func mountWithConfig(cfg MountConfig) error {
 		defer close(serveDone)
 		server.Serve()
 	}()
-	// A plugin that failed its Start leaves the stack degraded (a layer
-	// checkpoint that could not restore serves an empty/read-only view):
-	// the mount must fail instead of reporting success (review: Init2's
-	// startErr was saved but never checked).
-	if err := f.StartErr(); err != nil {
-		fmt.Fprintf(os.Stderr, "drive9: mount startup failed during extension start at %s: %v\n", cfg.MountPoint, err)
-		if uerr := server.Unmount(); uerr != nil {
-			fmt.Fprintf(os.Stderr, "drive9: cleanup after extension start failure: unmount failed: %v\n", uerr)
-			forceUnmount(cfg.MountPoint)
-		}
-		select {
-		case <-serveDone:
-		case <-time.After(10 * time.Second):
-		}
-		return ExitStartupTransientErr("extension start", err)
-	}
 	if err := server.WaitMount(); err != nil {
 		// v1 shouldContinueAfterWaitMountPermissionError: Linux pollHack can
 		// surface EACCES/EPERM for a mount that is actually serving; the
@@ -871,6 +890,10 @@ func mountWithConfig(cfg MountConfig) error {
 			return ExitStartupTransientErr("fuse wait mount", err)
 		}
 	}
+	if view != nil {
+		view.ready.Store(true)
+	}
+	startCancel()
 	cacheDesc, shadowDesc := "none", "none"
 	if cfg.CacheDir != "" {
 		cacheDesc = cfg.CacheDir + "/read"
@@ -889,18 +912,33 @@ func mountWithConfig(cfg MountConfig) error {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(sigCh)
 	go func() {
-		<-sigCh
+		select {
+		case <-serveDone:
+			return
+		case <-sigCh:
+		}
 		f.shutdownRequested.Store(true)
 		fmt.Fprintf(os.Stderr, "\ndrive9: unmounting %s...\n", cfg.MountPoint)
 		go func() {
-			<-sigCh
+			select {
+			case <-serveDone:
+				return
+			case <-sigCh:
+			}
 			fmt.Fprintf(os.Stderr, "drive9: force-quit\n")
 			ForceUnmount(cfg.MountPoint)
 		}()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		_ = f.flushOpenHandles(shutdownCtx)
-		_ = f.chain.Drain(shutdownCtx)
+		if ctrl != nil {
+			ctrl.Close()
+		}
+		if view != nil {
+			_ = view.drainShutdown(shutdownCtx)
+		} else {
+			_ = f.flushOpenHandles(shutdownCtx)
+			_ = f.chain.Drain(shutdownCtx)
+		}
 		for attempt := 0; attempt < 5; attempt++ {
 			if err := server.Unmount(); err == nil {
 				return
@@ -967,7 +1005,11 @@ func buildMountRuntime(cfg MountConfig, cl *client.Client, remoteRoot, actorID s
 	return buildMountRuntimeGeneration(cfg, cl, remoteRoot, actorID, mountRuntimeGeneration{})
 }
 
-func buildMountRuntimeGeneration(cfg MountConfig, cl *client.Client, remoteRoot, actorID string, generation mountRuntimeGeneration) (_ *mountRuntime, err error) {
+func buildMountRuntimeGeneration(cfg MountConfig, cl *client.Client, remoteRoot, actorID string, generation mountRuntimeGeneration) (*mountRuntime, error) {
+	return buildMountRuntimeWithCounters(cfg, cl, remoteRoot, actorID, generation, nil)
+}
+
+func buildMountRuntimeWithCounters(cfg MountConfig, cl *client.Client, remoteRoot, actorID string, generation mountRuntimeGeneration, sharedCounters *perf.Counters) (_ *mountRuntime, err error) {
 	mountHash, readCacheHash, err := mountRuntimeCacheHashes(cfg, cl.ViewBinding(), generation)
 	if err != nil {
 		return nil, err
@@ -979,7 +1021,9 @@ func buildMountRuntimeGeneration(cfg MountConfig, cl *client.Client, remoteRoot,
 	// sharedCounters exists before the extension chain: the git
 	// extension's refresh accounting needs the same instance the FS
 	// summary prints.
-	sharedCounters := perf.NewCounters(cfg.PerfCounters || cfg.PerfSamplesPath != "")
+	if sharedCounters == nil {
+		sharedCounters = perf.NewCounters(cfg.PerfCounters || cfg.PerfSamplesPath != "")
+	}
 	wantExt := make(map[string]bool, len(extOrder))
 	for _, name := range extOrder {
 		wantExt[name] = true
@@ -1250,8 +1294,10 @@ func buildMountRuntimeGeneration(cfg MountConfig, cl *client.Client, remoteRoot,
 	// no local ExtentPaths: files created by another extent-enabled mount
 	// still carry ExtentIno in listings/stats, and the server answers
 	// their reads with 422 unless the JuiceFS-backed reader routes them.
-	// An empty ExtentPaths only skips the JuiceFS runtime discovery.
-	if wantExt["extent"] {
+	// An empty ExtentPaths only skips the JuiceFS runtime discovery. Fixed
+	// views use the normal file API's extent-v2 read/upload plans, never the
+	// legacy JuiceFS or append-log endpoints.
+	if wantExt["extent"] && cl.ViewBinding().LayerID == "" {
 		extentExt, err = extent.New(extent.Options{
 			ExtentPaths: cfg.ExtentPaths,
 			Client:      cl,
@@ -1268,7 +1314,7 @@ func buildMountRuntimeGeneration(cfg MountConfig, cl *client.Client, remoteRoot,
 	}
 
 	var appendExt *appendlog.AppendLog
-	if wantExt["appendlog"] && len(cfg.AppendLogPatterns) > 0 && strings.TrimSpace(cfg.LayerRef) == "" {
+	if wantExt["appendlog"] && len(cfg.AppendLogPatterns) > 0 && strings.TrimSpace(cfg.LayerRef) == "" && cl.ViewBinding().LayerID == "" {
 		appendExt, err = appendlog.New(appendlog.Options{Patterns: cfg.AppendLogPatterns, Client: cl, RemoteRoot: remoteRoot, Events: bus, TempDir: appendLogSnapshotDir(cacheBase, mountHash), SyncPolicy: string(cfg.WritePolicy)})
 		if err != nil {
 			return nil, fmt.Errorf("fuse: appendlog extension: %w", err)
@@ -1379,7 +1425,7 @@ func buildMountRuntimeGeneration(cfg MountConfig, cl *client.Client, remoteRoot,
 	// View extensions that own directories (localize overlays, layer
 	// view) must see dir GetAttrs go through the chain; every other stack
 	// serves root/dir attrs from the inode table (v1).
-	localDirAttrs := cfg.LocalRoot == "" && strings.TrimSpace(cfg.LayerRef) == ""
+	localDirAttrs := cfg.LocalRoot == "" && strings.TrimSpace(cfg.LayerRef) == "" && cl.ViewBinding().LayerID == ""
 	// The kernel enforces permissions when default_permissions is on;
 	// otherwise the daemon's open gate carries the mode contract.
 	defaultPermissions := cfg.AllowOther

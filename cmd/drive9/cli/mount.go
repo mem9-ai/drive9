@@ -175,6 +175,8 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 	defaultOwner := fs.String("owner", "", "UID:GID to report for files without a stored owner (FUSE; default: the mounting user)")
 	noPersistCredentials := fs.Bool("no-persist-credentials", false, "do not store mount credentials in process state (FUSE only; requires --foreground or --no-supervise; disables credential-backed unmount helpers)")
 	supervised := fs.Bool("supervised", false, "internal: worker managed by supervisor")
+	var mountViewID mountViewIDFlag
+	fs.Var(&mountViewID, "mount-view-id", "internal: reopen an existing mount view journal")
 	maxRestarts := fs.Int("max-restarts", 5, "supervisor max restarts within restart window")
 	restartWindow := fs.Duration("restart-window", 10*time.Minute, "supervisor restart budget window")
 	healthInterval := fs.Duration("health-interval", 10*time.Second, "supervisor health probe interval")
@@ -325,6 +327,9 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 	explicitExtentPatterns := mergeProfileValues(envExtentPatterns, extentPatterns)
 	effectiveExtentPatterns := explicitExtentPatterns
 
+	if objectLoc != nil && mountViewID != "" {
+		return fmt.Errorf("drive9 mount: mount-view-id requires a Drive9 FUSE mount")
+	}
 	if objectLoc != nil {
 		if *noPersistCredentials {
 			return fmt.Errorf("drive9 mount: --no-persist-credentials is only supported with Drive9 FUSE mounts")
@@ -734,6 +739,10 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 		})
 	}
 
+	if mountViewID != "" && (resolved != MountModeFUSE || strings.TrimSpace(*layerRef) != "") {
+		return fmt.Errorf("drive9 mount: mount-view-id requires a fixed-view FUSE mount")
+	}
+
 	// Resolve supervision mode from flags + env.
 	// DRIVE9_MOUNT_SUPERVISE=off forces legacy behavior.
 	envSuperviseOff := strings.EqualFold(strings.TrimSpace(os.Getenv("DRIVE9_MOUNT_SUPERVISE")), "off")
@@ -744,6 +753,8 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 	if *superviseForeground {
 		// This process becomes the supervisor (blocks).
 		return runSuperviseForeground(mountSuperviseStartRequest{
+			MountID:           string(mountViewID),
+			LayerRef:          strings.TrimSpace(*layerRef),
 			OriginalArgs:      append([]string(nil), originalArgs...),
 			MountPoint:        mountPoint,
 			Server:            serverVal,
@@ -767,6 +778,8 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 	if background && !*foreground {
 		if wantSupervise && resolved == MountModeFUSE && runtime.GOOS != "windows" {
 			return startMountSupervisedBackground(mountSuperviseStartRequest{
+				MountID:           string(mountViewID),
+				LayerRef:          strings.TrimSpace(*layerRef),
 				OriginalArgs:      append([]string(nil), originalArgs...),
 				MountPoint:        mountPoint,
 				Server:            serverVal,
@@ -873,6 +886,7 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 
 	// FUSE path (existing behavior).
 	opts := &mountFuseOptions{
+		MountID:                      string(mountViewID),
 		Server:                       *server,
 		APIKey:                       *apiKey,
 		Token:                        token,
@@ -983,6 +997,8 @@ func (e mountCommandRedactedError) ExitCode() int {
 }
 
 type mountSuperviseStartRequest struct {
+	MountID           string
+	LayerRef          string
 	OriginalArgs      []string
 	MountPoint        string
 	Server            string
@@ -1071,6 +1087,11 @@ func superviseCommandArgs(req mountSuperviseStartRequest, logPath string) ([]str
 }
 
 func startMountSupervisedBackgroundImpl(req mountSuperviseStartRequest) error {
+	prepared, err := prepareSupervisedMountView(req)
+	if err != nil {
+		return err
+	}
+	req = prepared
 	exe, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("drive9 mount: locate executable: %w", err)
@@ -1117,6 +1138,11 @@ func startMountSupervisedBackgroundImpl(req mountSuperviseStartRequest) error {
 }
 
 func runSuperviseForegroundImpl(req mountSuperviseStartRequest) error {
+	prepared, err := prepareSupervisedMountView(req)
+	if err != nil {
+		return err
+	}
+	req = prepared
 	exe, err := os.Executable()
 	if err != nil {
 		return err
