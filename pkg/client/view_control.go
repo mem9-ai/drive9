@@ -217,8 +217,13 @@ func (c *Client) RenewViewWork(ctx context.Context, w ViewWork, ttl time.Duratio
 		Work      ViewWork `json:"work"`
 		TTLMillis int64    `json:"ttl_ms"`
 	}{w, ttl.Milliseconds()}
-	err = c.doViewControl(ctx, "POST", path+"/renew", req, &out)
-	return out, err
+	if err = c.doViewControl(ctx, "POST", path+"/renew", req, &out); err != nil {
+		return ViewWork{}, err
+	}
+	if out.LayerID != w.LayerID || out.ID != w.ID || out.Fence != w.Fence || out.Validation != w.Validation || out.LeaseUntil.IsZero() {
+		return ViewWork{}, fmt.Errorf("renewal response does not identify the original work generation")
+	}
+	return out, nil
 }
 func (c *Client) SealFixedView(ctx context.Context, w ViewWork, operationID string) (FixedViewOutcome, error) {
 	var out FixedViewOutcome
@@ -259,8 +264,16 @@ func (c *Client) GetFixedViewOperation(ctx context.Context, id, operationID stri
 	if err != nil {
 		return out, err
 	}
-	// The server validates the operation ID, including its length. Escaping here
-	// prevents malformed input from selecting another endpoint.
+	if err := viewprotocol.ValidateOperationID(operationID); err != nil {
+		return out, err
+	}
 	err = c.doViewControl(ctx, "GET", path+"/operations/"+url.PathEscape(operationID), nil, &out)
-	return out, err
+	if err == nil && (out.LayerID != id || out.OperationID != operationID || out.Kind == "" ||
+		out.State != "RUNNING" && out.State != "DONE" && out.State != "FAILED") {
+		err = fmt.Errorf("invalid operation receipt for the requested view and operation")
+	}
+	if err != nil {
+		return FixedViewOperation{}, &ViewOperationError{LayerID: id, OperationID: operationID, Err: err}
+	}
+	return out, nil
 }

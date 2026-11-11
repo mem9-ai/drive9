@@ -273,5 +273,123 @@ func TestFixedControlOperationIDValidatedBeforeTransport(t *testing.T) {
 		if _, err := c.EndFixedView(ctx, "a", id, true); err == nil {
 			t.Fatal(id)
 		}
+		if _, err := c.GetFixedViewOperation(ctx, "a", id); err == nil {
+			t.Fatal(id)
+		}
+	}
+}
+
+func TestFixedRenewalKeepsWorkIdentity(t *testing.T) {
+	original := ViewWork{LayerID: "a", ID: "w", Fence: 7, Validation: true,
+		LeaseUntil: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
+	for _, test := range []string{"valid", "layer", "work", "fence", "validation", "expiry", "null", "truncated", "trailing", "status"} {
+		t.Run(test, func(t *testing.T) {
+			renewed := original
+			renewed.LeaseUntil = renewed.LeaseUntil.Add(time.Minute)
+			switch test {
+			case "layer":
+				renewed.LayerID = "b"
+			case "work":
+				renewed.ID = "next-work"
+			case "fence":
+				renewed.Fence++
+			case "validation":
+				renewed.Validation = false
+			case "expiry":
+				renewed.LeaseUntil = time.Time{}
+			}
+			var calls atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				if r.Method != "POST" || r.URL.Path != "/v1/views/a/renew" {
+					t.Error(r.Method, r.URL)
+				}
+				body, _ := json.Marshal(renewed)
+				switch test {
+				case "null":
+					body = []byte("null")
+				case "truncated":
+					w.Header().Set("Content-Length", strconv.Itoa(len(body)+1))
+				case "trailing":
+					body = append(body, []byte(" {}")...)
+				case "status":
+					w.WriteHeader(http.StatusServiceUnavailable)
+				}
+				_, _ = w.Write(body)
+			}))
+			defer srv.Close()
+			got, err := New(srv.URL, "test-token").RenewViewWork(context.Background(), original, time.Minute)
+			if calls.Load() != 1 {
+				t.Fatal("renewal retried", calls.Load())
+			}
+			if test == "valid" {
+				if err != nil || got != renewed {
+					t.Fatal(got, err)
+				}
+			} else if err == nil || got != (ViewWork{}) {
+				t.Fatal("accepted a mismatched or partial work generation", got, err)
+			}
+		})
+	}
+}
+
+func TestFixedOperationQueryChecksReceiptIdentity(t *testing.T) {
+	for _, test := range []string{"RUNNING", "DONE", "FAILED", "layer", "operation", "kind", "state", "null", "truncated", "trailing", "status"} {
+		t.Run(test, func(t *testing.T) {
+			receipt := FixedViewOperation{LayerID: "a", OperationID: "original", Kind: "mutation", State: "DONE"}
+			switch test {
+			case "RUNNING", "DONE", "FAILED":
+				receipt.State = test
+			case "layer":
+				receipt.LayerID = "b"
+			case "operation":
+				receipt.OperationID = "another"
+			case "kind":
+				receipt.Kind = ""
+			case "state":
+				receipt.State = "UNKNOWN"
+			}
+			if receipt.State == "FAILED" {
+				receipt.Code = "AUTHORIZATION_FAILED"
+			}
+			var calls atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				if r.Method != "GET" || r.URL.Path != "/v1/views/a/operations/original" || r.Header.Get(viewprotocol.ViewHeader) != "" {
+					t.Error(r.Method, r.URL, r.Header)
+				}
+				body, _ := json.Marshal(receipt)
+				switch test {
+				case "null":
+					body = []byte("null")
+				case "truncated":
+					w.Header().Set("Content-Length", strconv.Itoa(len(body)+1))
+				case "trailing":
+					body = append(body, []byte(" {}")...)
+				case "status":
+					w.WriteHeader(http.StatusServiceUnavailable)
+				}
+				_, _ = w.Write(body)
+			}))
+			defer srv.Close()
+			c, err := New(srv.URL, "test-token").WithView(ViewBinding{LayerID: "different", WorkID: "other", Fence: 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := c.GetFixedViewOperation(context.Background(), "a", "original")
+			if calls.Load() != 1 {
+				t.Fatal("receipt query retried", calls.Load())
+			}
+			if test == "RUNNING" || test == "DONE" || test == "FAILED" {
+				if err != nil || !reflect.DeepEqual(got, receipt) {
+					t.Fatal(got, err)
+				}
+				return
+			}
+			var identified *ViewOperationError
+			if !errors.As(err, &identified) || identified.LayerID != "a" || identified.OperationID != "original" || !reflect.DeepEqual(got, FixedViewOperation{}) {
+				t.Fatal("query returned an unverified receipt or lost request identity", got, err)
+			}
+		})
 	}
 }
