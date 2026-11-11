@@ -47,6 +47,9 @@ type ProfilingOptions = perf.ProfilingOptions
 
 // MountConfig carries the mount inputs the fuse stack accepts.
 type MountConfig struct {
+	// MountID selects an already-created journal; an absent journal is fatal.
+	// Empty starts a new incarnation only for a standalone mount.
+	MountID    string
 	Server     string
 	APIKey     string
 	Token      string
@@ -283,6 +286,8 @@ func (p WritePolicy) String() string {
 // build-up ordering. Mount converts it to the internal MountConfig — the
 // wire-level semantics are unchanged.
 type MountOptions struct {
+	// MountID reopens a journal created by CreateMountViewJournal.
+	MountID                     string
 	Server                      string        // drive9 server URL
 	APIKey                      string        // owner API key (mutually exclusive with Token)
 	Token                       string        // delegated capability JWT (mutually exclusive with APIKey)
@@ -391,6 +396,7 @@ func Mount(opts *MountOptions) error {
 // conversion; kept separate so tests pin new option wiring.
 func mountConfigFromOptions(opts *MountOptions) MountConfig {
 	return MountConfig{
+		MountID:                       opts.MountID,
 		Server:                        opts.Server,
 		APIKey:                        opts.APIKey,
 		Token:                         opts.Token,
