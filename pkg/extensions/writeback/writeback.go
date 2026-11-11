@@ -25,6 +25,7 @@ import (
 	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/pingcap/failpoint"
 
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/fs"
@@ -204,6 +205,7 @@ type Writeback struct {
 	recoveryCacheGens map[string]uint64
 	lazy              bool
 	syncerCancel      context.CancelFunc
+	syncerDone        chan struct{}
 	// commitSeeder caches the just-committed image (readCache.Put at
 	// commit settle) so reads racing backend replica lag see this mount's
 	// own writes; nil disables seeding.
@@ -700,7 +702,12 @@ func New(opts Options) (*Writeback, error) {
 			if opts.SyncWindow > 0 {
 				syncerCtx, cancel := context.WithCancel(context.Background())
 				w.syncerCancel = cancel
-				go opts.Staging.Journal.SyncLoop(syncerCtx, opts.SyncWindow)
+				w.syncerDone = make(chan struct{})
+				go func() {
+					defer close(w.syncerDone)
+					opts.Staging.Journal.SyncLoop(syncerCtx, opts.SyncWindow)
+					failpoint.InjectCall("writebackSyncLoopExiting")
+				}()
 			}
 		}
 	}
@@ -859,6 +866,9 @@ func (w *Writeback) Drain(ctx context.Context) error {
 func (w *Writeback) Stop(ctx context.Context) error {
 	if w.syncerCancel != nil {
 		w.syncerCancel()
+		// The staging owner may close/reuse the journal after Stop returns.
+		// Cancellation alone does not finish a running fsync or compaction.
+		<-w.syncerDone
 	}
 	if w.uploader != nil {
 		w.uploader.DrainAll()
