@@ -67,3 +67,26 @@ failure as proof that no changes occurred.
 
 This is client wiring, not proof that all server upload paths or mount switching
 are complete. Their endpoint and real mount acceptance remains required.
+
+## SDK candidate preparation
+
+`Client.PrepareFixedView` composes creation, one work callback, sealing and one
+readonly validation callback. Supply four distinct, persisted operation IDs and
+explicit work/validation leases. Each callback receives a separate bound client
+and the server-issued work identity. It may issue multiple requests or renew
+explicitly; it must join its tool goroutines before returning.
+
+The method returns the last attempted stage and its operation ID on failure.
+A `ViewOperationError` from a tool request keeps that tool's original ID. There
+are no automatic retries, lease renewals, deletion or filesystem publication.
+A `RUNNING` seal or `FAILED/UPLOAD_PENDING` receipt stops preparation before
+validation. Recover a running seal using its original ID; after a terminal upload
+failure, resolve uploads before explicitly requesting a new seal. Repeating the
+whole preparation does not resume callbacks: an already claimed work generation
+returns `ErrViewLaunchUnavailable`.
+
+Successful validation only records the callback's result. A separate conditional
+merge must still verify permissions, cancellation, leases and dependencies. Public
+write/quota/merge integration remains required; the offline HTTP tests do not
+claim server or real-mount acceptance. A compile-tested usage example is in
+`examples/go-sdk-cookbook/fixed_view_test.go`.

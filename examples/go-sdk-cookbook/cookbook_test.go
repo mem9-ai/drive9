@@ -927,6 +927,21 @@ var coveredClientMethods = map[string]bool{
 	"WriteStreamWithSummaryAndTags":        true,
 	"WriteStreamWithTags":                  true,
 
+	// Fixed-view controls and preparation: fixed_view_test.go.
+	"AbortFixedUpload":       true,
+	"BeginViewWork":          true,
+	"CreateFixedView":        true,
+	"EndFixedView":           true,
+	"GetFixedView":           true,
+	"GetFixedViewOperation":  true,
+	"ListFixedViews":         true,
+	"PrepareFixedView":       true,
+	"PresignFixedExtentPart": true,
+	"RenewViewWork":          true,
+	"SealFixedView":          true,
+	"ViewBinding":            true,
+	"WithView":               true,
+
 	// Migration V1 client contract.
 	"BatchStatWithOptionsCtx":                               true,
 	"AdminCreateMigrationBatch":                             true,
