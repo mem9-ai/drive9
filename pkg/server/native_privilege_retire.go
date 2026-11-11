@@ -36,8 +36,9 @@ const (
 // Tenants finalized before this version keep the grant: their stored DSN already names
 // the restricted account, so the per-tenant setup never runs again for them, and the
 // grant is a whole-cluster escalation reachable from tenant SQL (SET GLOBAL). The pass
-// is leader-only, runs once per leadership generation, and is idempotent — a revoke of
-// an absent grant is tolerated both by TiDB and by the helper.
+// is leader-only, repeats every nativePrivilegeRetireInterval while that leader lives,
+// and is idempotent — a revoke of an absent grant is tolerated both by TiDB and by the
+// helper.
 func (s *Server) retireNativeTenantVariablesPrivilege(ctx context.Context) {
 	if s.meta == nil || s.pool == nil {
 		return

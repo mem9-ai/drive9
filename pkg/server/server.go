@@ -982,10 +982,22 @@ func (s *Server) startLeaderWorkers() {
 		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
 			s.resumeProvisioningTenantsWithCtx(workerCtx)
 		})
-		// One-time cleanup of the legacy cluster-wide SYSTEM_VARIABLES_ADMIN grant
-		// on already-active native tenants, whose per-tenant setup never runs again.
+		// Periodic cleanup of the legacy cluster-wide SYSTEM_VARIABLES_ADMIN grant on
+		// native tenants, whose per-tenant setup never runs again once they are active.
+		// Periodic rather than one-shot so a tenant that becomes active later, or a
+		// failed attempt, is retried without waiting for a leadership change.
 		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
+			ticker := time.NewTicker(nativePrivilegeRetireInterval)
+			defer ticker.Stop()
 			s.retireNativeTenantVariablesPrivilege(workerCtx)
+			for {
+				select {
+				case <-workerCtx.Done():
+					return
+				case <-ticker.C:
+					s.retireNativeTenantVariablesPrivilege(workerCtx)
+				}
+			}
 		})
 		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
 			defer close(forkStartupResumeDone)
