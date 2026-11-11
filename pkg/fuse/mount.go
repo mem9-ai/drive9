@@ -37,6 +37,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/fusecomp/staging"
 	"github.com/mem9-ai/drive9/pkg/mountpath"
 	"github.com/mem9-ai/drive9/pkg/mountstate"
+	"github.com/pingcap/failpoint"
 )
 
 // ProfilingOptions is the profiling knob bundle (perf.ProfilingOptions),
@@ -1089,6 +1090,7 @@ func buildMountRuntime(cfg MountConfig, cl *client.Client, remoteRoot, actorID s
 				stagingLedger.Close()
 			}
 		}()
+		failpoint.InjectCall("mountRuntimeStagingReady", stagingLedger)
 		if err := stagingLedger.Recover(); err != nil {
 			return nil, fmt.Errorf("fuse: staging recovery: %w", err)
 		}
