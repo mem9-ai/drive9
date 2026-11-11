@@ -694,460 +694,14 @@ func mountWithConfig(cfg MountConfig) error {
 		return fmt.Errorf("fuse: checkpoint %q requires --layer (the layer plane owns the checkpoint view)", cfg.CheckpointRef)
 	}
 
-	extOrder, err := parseExtensionOrder(cfg.Extensions)
+	runtime, err := buildMountRuntime(cfg, cl, remoteRoot, actorID)
 	if err != nil {
 		return err
 	}
-	// sharedCounters exists before the extension chain: the git
-	// extension's refresh accounting needs the same instance the FS
-	// summary prints.
-	sharedCounters := perf.NewCounters(cfg.PerfCounters || cfg.PerfSamplesPath != "")
-	wantExt := make(map[string]bool, len(extOrder))
-	for _, name := range extOrder {
-		wantExt[name] = true
-	}
-	// Each extension constructs independently into a registry; assembly
-	// walks the flag order in reverse below.
-	built := map[string]fs.Handler{}
-
-	// v1 cache base: an explicit cache dir, else the per-user default, so
-	// cache-backed components stay enabled without explicit configuration.
-	cacheBase := cfg.CacheDir
-	if cacheBase == "" {
-		if home, herr := os.UserHomeDir(); herr == nil {
-			cacheBase = filepath.Join(home, ".cache", "drive9")
-		}
-	}
-	// v1 mount-scoped cache namespaces: writeback-side state keys on the
-	// mount identity (layer mounts fold their refs into it), while the
-	// read-side caches also key on the credential because their entries
-	// hold remote bytes that survive remounts.
-	mountHash := ""
-	readCacheHash := ""
-	if cacheBase != "" {
-		mountHash = MountHash(cfg.Server, cfg.MountPoint, cfg.RemoteRoot)
-		if cfg.LayerRef != "" {
-			mountHash = MountLayerHash(cfg.Server, cfg.MountPoint, cfg.RemoteRoot, cfg.LayerRef, cfg.CheckpointRef)
-		}
-		readCacheHash = MountReadCacheHash(cfg.Server, cfg.MountPoint, cfg.RemoteRoot, mountCredentialKind(&cfg), mountCredentialSecret(&cfg))
-	}
-
-	// core constructs into the same registry as every other extension; the
-	// flag order places it (first entry = innermost terminal).
-	var coreExt *core.Core
-	if wantExt["core"] {
-		coreExt, err = core.New(cl, core.Options{
-			RemoteRoot:            remoteRoot,
-			StatRetryCount:        cfg.LookupRetryCount,
-			StatRetryTimeout:      cfg.LookupRetryTimeout,
-			ReadConcurrency:       cfg.ReadConcurrency,
-			LegacyDirStatFallback: cfg.LegacyDirStatFallback,
-			// Process-local trust only on single-server mounts that asked
-			// for it: default false keeps the remote revalidation that
-			// observes other servers' writes.
-			TrustLocalEvents: cfg.TrustLocalEvents,
-			// gvisor-compat takes precedence and always keeps commits
-			// detached (v1).
-			LegacyInterruptibleMutations: cfg.LegacyInterruptibleMutations && !cfg.GVisorCompat,
-		})
-		if err != nil {
-			return fmt.Errorf("fuse: core terminal: %w", err)
-		}
-		built["core"] = coreExt
-	}
-	bus := fs.NewEventBus()
-	if coreExt != nil {
-		coreExt.AttachEvents(bus)
-	}
-	var readCache *cache.Cache
-	if wantExt["cache"] {
-		// v1 always ran the in-memory read cache — it does not need a cache
-		// directory; the on-disk block cache rides --cache-dir. Zero limits
-		// fall back to the ported defaults (128MB / 30s / 4MB per file).
-		// The cache extension owns everything under the cache directory
-		// (landlord); for now that is the read cache; the staging ledger
-		// joins when writeback lands.
-		rc, cerr := cache.New(cache.Options{
-			Events:             bus,
-			MaxSize:            cfg.CacheSize,
-			TTL:                cfg.ReadCacheTTL,
-			MaxFileSize:        cfg.ReadCacheMaxFileBytes,
-			SequentialPrefetch: true,
-			PrefetchClient:     cl,
-			RemoteRoot:         remoteRoot,
-			// v1 --parallel-read-concurrency/block-size (defaults 4 x 1MiB).
-			ParallelReadConcurrency: cfg.ParallelReadConcurrency,
-			ParallelReadBlockSize:   cfg.ParallelReadBlockSize,
-			// v1 readdir content prefetch: --readdir-prefetch only (default
-			// off — the max-files knob alone does not enable it).
-			DirContentPrefetch:   cfg.ReadDirPrefetch,
-			PrefetchMaxFiles:     cfg.PrefetchMaxFiles,
-			PrefetchMaxFileBytes: cfg.PrefetchMaxFileBytes,
-			PrefetchMaxBytes:     cfg.PrefetchMaxBytes,
-			PrefetchTimeout:      cfg.PrefetchTimeout,
-			Disk:                 diskCacheOpts(cacheScopedDir(cacheBase, readCacheHash, "read"), cfg.DiskReadCacheSize, cfg.DiskReadCacheFreeRatio),
-		})
-		if cerr != nil {
-			return fmt.Errorf("fuse: cache extension: %w", cerr)
-		}
-		readCache = rc
-		built["cache"] = readCache
-	}
-
-	var policy writeback.Policy
-	switch cfg.WritePolicy {
-	case "write-sync":
-		policy = writeback.PolicyWriteSync
-	case "writeback", "":
-		policy = writeback.PolicyWriteBack
-	case "close-sync":
-		policy = writeback.PolicyCloseSync
-	default:
-		return fmt.Errorf("fuse: unknown write policy %q", cfg.WritePolicy)
-	}
-
-	// The v1 small-file writeback track (.dat/.meta + 16-worker uploader)
-	// rides the mount-scoped cache namespace under its own name.
-	writeCacheDir := cacheScopedDir(cacheBase, mountHash, "writecache")
-	// The staging ledger + commit queue serve the async writeback policy
-	// (shadow/pending/journal machinery); close-sync ALSO gets the ledger
-	// for its v1 shadow-backed large-file close uploads (bounded-memory
-	// staging + streamed landing). Write-sync commits inline per Write and
-	// needs none of it. The cache plugin stays regardless — its READ caches
-	// serve every policy; only its staging role is policy-bound.
-	var stagingLedger *staging.Staging
-	if !cfg.ReadOnly && (policy == writeback.PolicyWriteBack || policy == writeback.PolicyCloseSync) && cacheBase != "" && wantExt["writeback"] {
-		// wantExt gate: a core-only stack (--extensions core) keeps the
-		// default writeback policy but builds no writeback handler; the
-		// ledger would still be created, recovered, and compacted — a
-		// corrupt or unwritable cache dir failing a mount that never
-		// uses it.
-		// v1 write-cache quota (defaults freeRatio 0.10, 1024 MiB): the
-		// shadow store refuses writes past the budget with ENOSPC.
-		// v1 knobs: zero uses the default, negative disables the check.
-		freeRatio := cfg.WriteCacheFreeRatio
-		if freeRatio == 0 {
-			freeRatio = 0.10
-		} else if freeRatio < 0 {
-			freeRatio = 0
-		}
-		cacheSizeMB := resolveWriteCacheSizeMB(cfg.WriteCacheSizeMB)
-		// The ledger's internal layout (shadow/, pending/, journal.wal) is
-		// the v1 mount-scoped one: root it at the mount hash directly.
-		stagingLedger, err = staging.NewStagingWithQuota(filepath.Join(cacheBase, mountHash), freeRatio, cacheSizeMB)
-		if err != nil {
-			return fmt.Errorf("fuse: staging ledger: %w", err)
-		}
-		defer stagingLedger.Close()
-		if err := stagingLedger.Recover(); err != nil {
-			return fmt.Errorf("fuse: staging recovery: %w", err)
-		}
-		_ = stagingLedger.Compact()
-	}
-
-	// v1 sync-mode resolution: auto probes the server RTT (HEAD /, 5s
-	// bound); >10ms (or an unreachable probe) resolves interactive — fsync
-	// served by the local staging ledger — otherwise strict.
-	syncMode := strings.TrimSpace(cfg.SyncMode)
-	switch syncMode {
-	case "", "auto":
-		syncMode = resolveSyncModeByRTT(cfg.Server)
-	case "strict", "interactive":
-	default:
-		return fmt.Errorf("fuse: unknown sync mode %q", cfg.SyncMode)
-	}
-	fmt.Fprintf(os.Stderr, "drive9: sync mode: %s\n", syncMode)
-
-	// A sandbox presents the workspace as owned by its unprivileged
-	// application user (v1 DefaultOwner); everything else reports the
-	// mounting process.
-	uid, gid := uint32(os.Getuid()), uint32(os.Getgid())
-	if cfg.DefaultOwner != nil {
-		uid, gid = cfg.DefaultOwner.UID, cfg.DefaultOwner.GID
-	}
-
-	// The POSIX rename preflight sits early so its attribute lookups see
-	// the view handlers below it (lazy-create overlays answer for
-	// not-yet-committed files).
-	var renameGuard *renameguard.RenameGuard
-	if wantExt["renameguard"] {
-		renameGuard, err = renameguard.New(renameguard.Options{
-			Uid: uid,
-			Gid: gid,
-		})
-		if err != nil {
-			return fmt.Errorf("fuse: renameguard extension: %w", err)
-		}
-		built["renameguard"] = renameGuard
-	}
-
-	// v1 EnableGitWorkspaces (default off): the git extension's workspace
-	// discovery is opt-in — overlay mounts (LocalRoot) arm it via the CLI.
-	// Constructed before localize so its declarative routing (a workspace's
-	// .git stays local, v1 gitDirShouldBeLocalOverlay) wires into the
-	// overlay router.
-	var gitExt *git.Git
-	if wantExt["git"] && cfg.EnableGitWorkspaces {
-		var gerr error
-		gitExt, gerr = git.New(git.Options{Client: cl, Events: bus, LocalRoot: cfg.LocalRoot, RemoteRoot: remoteRoot, SyncPolicy: string(cfg.WritePolicy),
-			OnWorkspaceRefresh: sharedCounters.RecordGitWorkspaceRefresh})
-		if gerr != nil {
-			return fmt.Errorf("fuse: git extension: %w", gerr)
-		}
-		built["git"] = gitExt
-	}
-
-	// localize routes declared local-only paths to the local overlay
-	// (v1 local_overlay/local_policy semantics).
-	if wantExt["localize"] && cfg.LocalRoot != "" {
-		localizeOpts := localize.Options{
-			LocalRoot:                   cfg.LocalRoot,
-			LocalOnlyPatterns:           cfg.LocalOnlyPatterns,
-			LocalGitignoreAwarePatterns: cfg.LocalGitignoreAwarePatterns,
-			RemoteOnlyPatterns:          cfg.RemoteOnlyPatterns,
-			Profile:                     cfg.Profile,
-			ApplyBuiltinDefaults:        !cfg.DisableBuiltinOverlayDefaults,
-		}
-		if gitExt != nil {
-			// v1 gitDirShouldBeLocalOverlay: a discovered workspace's .git
-			// routes to the local overlay (the restored .git state backs
-			// git's own file traffic, not the remote).
-			localizeOpts.DeclarativeLocal = gitExt.RoutesLocal
-		}
-		if cacheBase != "" && !cfg.ReadOnly {
-			// SQLite WAL-index sidecars (-shm) are mount-local scratch:
-			// they live in the read-cache namespace in a fresh per-mount
-			// directory, so a crashed mount's leftovers are never reused.
-			// Creation failure only disables that plane (sidecars then
-			// stay on their classified route).
-			transientRoot := transientOverlayRoot(cacheBase, readCacheHash)
-			if err := os.MkdirAll(transientRoot, 0o700); err != nil {
-				fmt.Fprintf(os.Stderr, "drive9: transient local overlay init failed: %v (continuing without)\n", err)
-			} else {
-				localizeOpts.TransientRoot = transientRoot
-			}
-		}
-		localizeExt, lerr := localize.New(localizeOpts)
-		if lerr != nil {
-			return fmt.Errorf("fuse: localize extension: %w", lerr)
-		}
-		built["localize"] = localizeExt
-	}
-
-	// The layer view sits outermost (v1: layer over base), git next.
-	var layerExt *layer.Layer
-	if wantExt["layer"] && strings.TrimSpace(cfg.LayerRef) != "" {
-		layerExt, err = layer.New(layer.Options{
-			Policy:        cfg.WritePolicy,
-			LayerRef:      cfg.LayerRef,
-			CheckpointRef: cfg.CheckpointRef,
-			RemoteRoot:    remoteRoot,
-			Client:        cl,
-			Events:        bus,
-		})
-		if err != nil {
-			return fmt.Errorf("fuse: layer extension: %w", err)
-		}
-		built["layer"] = layerExt
-		// Control/session consumers resolve the layer AGAIN (drive9 exec
-		// on the mount directory): report the PINNED id, or a name/tag
-		// that later points elsewhere sends them to a different layer
-		// than the one this mount reads/writes.
-		if pinned := layerExt.PinnedRef(); pinned != "" {
-			cfg.LayerRef = pinned
-		}
-	}
-
-	// The extent plane claims ahead of the classic data path (cache and
-	// writeback never see extent files). Gated on the --extent paths /
-	// profile [extent] section only: the cache dir falls back to the
-	// per-user default like every other cache-backed component, so it is
-	// never the enabling condition.
-	var extentExt *extent.Extent
-	// Build the extent reader whenever the stack requests it, even with
-	// no local ExtentPaths: files created by another extent-enabled mount
-	// still carry ExtentIno in listings/stats, and the server answers
-	// their reads with 422 unless the JuiceFS-backed reader routes them.
-	// An empty ExtentPaths only skips the JuiceFS runtime discovery.
-	if wantExt["extent"] {
-		extentExt, err = extent.New(extent.Options{
-			ExtentPaths: cfg.ExtentPaths,
-			Client:      cl,
-			RemoteRoot:  remoteRoot,
-			CacheDir:    cacheScopedDir(cacheBase, mountHash, "jfs"),
-			// v1: write-sync mounts pay a per-Write VFS flush on the extent
-			// plane too.
-			Policy: cfg.WritePolicy,
-		})
-		if err != nil {
-			return fmt.Errorf("fuse: extent extension: %w", err)
-		}
-		built["extent"] = extentExt
-	}
-
-	var appendExt *appendlog.AppendLog
-	if wantExt["appendlog"] && len(cfg.AppendLogPatterns) > 0 && strings.TrimSpace(cfg.LayerRef) == "" {
-		appendExt, err = appendlog.New(appendlog.Options{Patterns: cfg.AppendLogPatterns, Client: cl, RemoteRoot: remoteRoot, Events: bus, TempDir: appendLogSnapshotDir(cacheBase, mountHash), SyncPolicy: string(cfg.WritePolicy)})
-		if err != nil {
-			return fmt.Errorf("fuse: appendlog extension: %w", err)
-		}
-		built["appendlog"] = appendExt
-	}
-
-	// The bulk data plane claims fresh truncate-writers (S3 multipart for
-	// large images) only after the view/routing handlers have had their
-	// claim, and before the buffered write path. A write-sync mount commits
-	// every write inline below — the buffered-image claim stays out.
-	if wantExt["bulkfile"] {
-		bulkExt, berr := bulkfile.New(bulkfile.Options{Client: cl, RemoteRoot: remoteRoot, Events: bus, Policy: cfg.WritePolicy})
-		if berr != nil {
-			return fmt.Errorf("fuse: bulkfile extension: %w", berr)
-		}
-		built["bulkfile"] = bulkExt
-	}
-
-	if wantExt["specials"] {
-		specialsExt, sperr := specials.New(specials.Options{Events: bus})
-		if sperr != nil {
-			return fmt.Errorf("fuse: specials extension: %w", sperr)
-		}
-		built["specials"] = specialsExt
-	}
-
-	if wantExt["xattr"] {
-		xattrExt, xerr := xattr.New(xattr.Options{Events: bus})
-		if xerr != nil {
-			return fmt.Errorf("fuse: xattr extension: %w", xerr)
-		}
-		built["xattr"] = xattrExt
-	}
-
-	var wb *writeback.Writeback
-	// A read-only mount serves reads only (the kernel's "ro" option
-	// rejects mutations): constructing the writeback plane here would
-	// RECOVER a previous mount's staging ledger, journal and uploader and
-	// start re-uploading its pending writes — data traffic a read-only
-	// mount must never produce.
-	if wantExt["writeback"] && !cfg.ReadOnly {
-		flushDebounce := cfg.FlushDebounce
-		if cfg.Profile == "interactive" {
-			// v1 ApplyInteractiveProfile disables the debouncer outright
-			// ("replaced by shadow writes").
-			flushDebounce = 0
-		}
-		var werr error
-		wb, werr = writeback.New(writeback.Options{
-			Policy:                policy,
-			SyncMode:              syncMode,
-			WriteCacheDir:         writeCacheDir,
-			Client:                cl,
-			RemoteRoot:            remoteRoot,
-			Events:                bus,
-			Staging:               stagingLedger,
-			FlushDebounce:         flushDebounce,
-			UploadConcurrency:     cfg.UploadConcurrency,
-			CommitQueueMaxPending: cfg.CommitQueueMaxPending,
-			BatchWindow:           cfg.WriteBackBatchWindow,
-			BatchMaxFiles:         cfg.WriteBackBatchMaxFiles,
-			BatchMaxBytes:         cfg.WriteBackBatchMaxBytes,
-			// gvisor-compat takes precedence and always keeps commits
-			// detached (v1).
-			InterruptibleCommits:    cfg.LegacyInterruptibleMutations && !cfg.GVisorCompat,
-			RemoteCommitWaitTimeout: cfg.RemoteCommitWaitTimeout,
-			// v1 --writeback-lazy-staging / --writeback-sync-window.
-			LazyStaging: cfg.WritebackLazyStaging,
-			SyncWindow:  cfg.WritebackSyncWindow,
-		})
-		if werr != nil {
-			return fmt.Errorf("fuse: writeback extension: %w", werr)
-		}
-		built["writeback"] = wb
-	}
-
-	if readCache != nil && wb != nil {
-		// v1 seeded the read cache with the committed image at every
-		// inline-commit settle, and read its write-side base preloads
-		// through the same cache: reads racing backend replica lag then see
-		// this mount's own writes (read-your-writes), and preloads cannot
-		// 404 inside the lag window.
-		wb.SetCommitSeeder(readCache.SeedCommit)
-		wb.SetCommitSeedLimit(readCache.MaxFileSize())
-		wb.SetPendingSeeder(readCache.SeedPending)
-		wb.SetBaseReader(func(path string) ([]byte, bool) {
-			return readCache.ReadCached(path, 0)
-		})
-	}
-
-	var sseExt *sse.SSE
-	if wantExt["sse"] {
-		var serr error
-		sseExt, serr = sse.New(sse.Options{Client: cl, Actor: actorID, RemoteRoot: remoteRoot, Events: bus})
-		if serr != nil {
-			return fmt.Errorf("fuse: sse extension: %w", serr)
-		}
-		built["sse"] = sseExt
-	}
-
-	// v1 setDefaults: kernel attr/entry caches default to 60s (30s attr on
-	// the coding-agent profile), negative entries 1s, listings 10s. The
-	// interactive profile (v1 ApplyInteractiveProfile) drops attr/entry to
-	// 1s, listings to 2s, and disables the flush debounce — zero values
-	// only, so explicit flags still win.
-	attrTTL, entryTTL, dirTTL := resolveKernelTTLDefaults(cfg.Profile, cfg.AttrTTL, cfg.EntryTTL, cfg.DirTTL)
-	// View extensions that own directories (localize overlays, layer
-	// view) must see dir GetAttrs go through the chain; every other stack
-	// serves root/dir attrs from the inode table (v1).
-	localDirAttrs := cfg.LocalRoot == "" && strings.TrimSpace(cfg.LayerRef) == ""
-	// The kernel enforces permissions when default_permissions is on;
-	// otherwise the daemon's open gate carries the mode contract.
-	defaultPermissions := cfg.AllowOther
-	// Assemble the chain as the REVERSE of the flag order: the flag lists
-	// extensions in build-up order (core first, each subsequent entry
-	// wrapping the previous ones), so the last flag entry is the outermost
-	// handler and core is the terminal. Entries whose config prerequisites
-	// are absent (cache without --cache-dir, layer without --layer, ...)
-	// construct nothing and are skipped.
-	var chainHandlers []fs.Handler
-	for i := len(extOrder) - 1; i >= 0; i-- {
-		if h := built[extOrder[i]]; h != nil {
-			chainHandlers = append(chainHandlers, h)
-		}
-	}
-	f, err := New(Options{
-		OwnerSet:           cfg.DefaultOwner != nil,
-		Extensions:         chainHandlers,
-		Events:             bus,
-		AttrTTL:            attrTTL,
-		EntryTTL:           entryTTL,
-		NegEntryTTL:        cfg.NegativeEntryTTL,
-		DirTTL:             dirTTL,
-		DirCacheMaxEntries: cfg.DirCacheMaxEntries,
-		LocalDirAttrs:      localDirAttrs,
-		DefaultPermissions: defaultPermissions,
-		Perf:               cfg.PerfCounters || cfg.PerfSamplesPath != "",
-		PerfCounters:       sharedCounters,
-		Debug:              cfg.Debug,
-		GVisorCompat:       cfg.GVisorCompat,
-		Uid:                uid,
-		Gid:                gid,
-	})
-	if err != nil {
-		return fmt.Errorf("fuse: assemble facade: %w", err)
-	}
-	// The POSIX rename preflight compares sticky ownership against the
-	// facade's inode table (mount-local chown authority, v1), not the chain's
-	// stat view.
-	if renameGuard != nil {
-		renameGuard.SetOwnerLookup(f.OwnerOf)
-	}
-	// Hand the facade-owned namespace cache to the terminal: fresh listings
-	// answer Lookups/GetAttrs without a remote stat (v1 lookupFromDirCache).
-	if coreExt != nil {
-		if dc, ok := f.Ctx.DirCache.(core.NamespaceCache); ok {
-			coreExt.Attach(dc)
-		}
-	}
-	f.mountPt, f.rootTag, f.srvTag = cfg.MountPoint, remoteRoot, cfg.Server
+	defer runtime.closeStaging()
+	f, wb := runtime.fs, runtime.writeback
+	cfg.LayerRef = runtime.layerRef
+	syncMode, policy := runtime.syncMode, runtime.policy
 
 	profiler, err := perf.StartProfiler(cfg.toProfilingOptions())
 	if err != nil {
@@ -1180,20 +734,6 @@ func mountWithConfig(cfg MountConfig) error {
 		})
 	}
 	defer perfRecorder.Stop()
-	if sseExt != nil {
-		sseExt.Attach(f.Ctx.Inodes, f.Ctx.Notify)
-	}
-	if layerExt != nil {
-		// The layer event watcher resets the kernel view after a remote
-		// refresh (v1 resetMountView on fs_layer_events).
-		layerExt.Attach(f.Ctx.Notify)
-		// A layer rollback fences the write plane: the commit queue halts
-		// and later inline commits fail with the rolled-back error.
-		if wb != nil {
-			layerExt.OnRollback(wb.AbandonLayerForRollback)
-		}
-	}
-
 	// Control server + mount process state (v1 mount.go) run BEFORE the
 	// FUSE mount: the pidfile's EvalSymlinks stats the mountpoint, which
 	// after NewServer is served by a serve loop that does not exist yet —
@@ -1379,6 +919,501 @@ func mountWithConfig(cfg MountConfig) error {
 	// serve loop dies. Give the row a short settling window — the loop can
 	// exit marginally before the umount(2) that triggered it completes.
 	return classifyServeExit(cfg.MountPoint, unmountedKernel)
+}
+
+// mountRuntime owns one immutable client binding and its independent extension
+// chain/caches. The kernel mount and its control socket have a separate lifetime.
+// Construction does not start the chain; the caller starts it before serving.
+type mountRuntime struct {
+	fs        *FS
+	writeback *writeback.Writeback
+	staging   *staging.Staging
+	layerRef  string
+	syncMode  string
+	policy    writeback.Policy
+}
+
+func (r *mountRuntime) closeStaging() {
+	if r.staging != nil {
+		r.staging.Close()
+	}
+}
+
+func buildMountRuntime(cfg MountConfig, cl *client.Client, remoteRoot, actorID string) (_ *mountRuntime, err error) {
+	extOrder, err := parseExtensionOrder(cfg.Extensions)
+	if err != nil {
+		return nil, err
+	}
+	// sharedCounters exists before the extension chain: the git
+	// extension's refresh accounting needs the same instance the FS
+	// summary prints.
+	sharedCounters := perf.NewCounters(cfg.PerfCounters || cfg.PerfSamplesPath != "")
+	wantExt := make(map[string]bool, len(extOrder))
+	for _, name := range extOrder {
+		wantExt[name] = true
+	}
+	// Each extension constructs independently into a registry; assembly
+	// walks the flag order in reverse below.
+	built := map[string]fs.Handler{}
+
+	// v1 cache base: an explicit cache dir, else the per-user default, so
+	// cache-backed components stay enabled without explicit configuration.
+	cacheBase := cfg.CacheDir
+	if cacheBase == "" {
+		if home, herr := os.UserHomeDir(); herr == nil {
+			cacheBase = filepath.Join(home, ".cache", "drive9")
+		}
+	}
+	// v1 mount-scoped cache namespaces: writeback-side state keys on the
+	// mount identity (layer mounts fold their refs into it), while the
+	// read-side caches also key on the credential because their entries
+	// hold remote bytes that survive remounts.
+	mountHash := ""
+	readCacheHash := ""
+	if cacheBase != "" {
+		mountHash = MountHash(cfg.Server, cfg.MountPoint, cfg.RemoteRoot)
+		if cfg.LayerRef != "" {
+			mountHash = MountLayerHash(cfg.Server, cfg.MountPoint, cfg.RemoteRoot, cfg.LayerRef, cfg.CheckpointRef)
+		}
+		readCacheHash = MountReadCacheHash(cfg.Server, cfg.MountPoint, cfg.RemoteRoot, mountCredentialKind(&cfg), mountCredentialSecret(&cfg))
+	}
+
+	// core constructs into the same registry as every other extension; the
+	// flag order places it (first entry = innermost terminal).
+	var coreExt *core.Core
+	if wantExt["core"] {
+		coreExt, err = core.New(cl, core.Options{
+			RemoteRoot:            remoteRoot,
+			StatRetryCount:        cfg.LookupRetryCount,
+			StatRetryTimeout:      cfg.LookupRetryTimeout,
+			ReadConcurrency:       cfg.ReadConcurrency,
+			LegacyDirStatFallback: cfg.LegacyDirStatFallback,
+			// Process-local trust only on single-server mounts that asked
+			// for it: default false keeps the remote revalidation that
+			// observes other servers' writes.
+			TrustLocalEvents: cfg.TrustLocalEvents,
+			// gvisor-compat takes precedence and always keeps commits
+			// detached (v1).
+			LegacyInterruptibleMutations: cfg.LegacyInterruptibleMutations && !cfg.GVisorCompat,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("fuse: core terminal: %w", err)
+		}
+		built["core"] = coreExt
+	}
+	bus := fs.NewEventBus()
+	if coreExt != nil {
+		coreExt.AttachEvents(bus)
+	}
+	var readCache *cache.Cache
+	if wantExt["cache"] {
+		// v1 always ran the in-memory read cache — it does not need a cache
+		// directory; the on-disk block cache rides --cache-dir. Zero limits
+		// fall back to the ported defaults (128MB / 30s / 4MB per file).
+		// The cache extension owns everything under the cache directory
+		// (landlord); for now that is the read cache; the staging ledger
+		// joins when writeback lands.
+		rc, cerr := cache.New(cache.Options{
+			Events:             bus,
+			MaxSize:            cfg.CacheSize,
+			TTL:                cfg.ReadCacheTTL,
+			MaxFileSize:        cfg.ReadCacheMaxFileBytes,
+			SequentialPrefetch: true,
+			PrefetchClient:     cl,
+			RemoteRoot:         remoteRoot,
+			// v1 --parallel-read-concurrency/block-size (defaults 4 x 1MiB).
+			ParallelReadConcurrency: cfg.ParallelReadConcurrency,
+			ParallelReadBlockSize:   cfg.ParallelReadBlockSize,
+			// v1 readdir content prefetch: --readdir-prefetch only (default
+			// off — the max-files knob alone does not enable it).
+			DirContentPrefetch:   cfg.ReadDirPrefetch,
+			PrefetchMaxFiles:     cfg.PrefetchMaxFiles,
+			PrefetchMaxFileBytes: cfg.PrefetchMaxFileBytes,
+			PrefetchMaxBytes:     cfg.PrefetchMaxBytes,
+			PrefetchTimeout:      cfg.PrefetchTimeout,
+			Disk:                 diskCacheOpts(cacheScopedDir(cacheBase, readCacheHash, "read"), cfg.DiskReadCacheSize, cfg.DiskReadCacheFreeRatio),
+		})
+		if cerr != nil {
+			return nil, fmt.Errorf("fuse: cache extension: %w", cerr)
+		}
+		readCache = rc
+		built["cache"] = readCache
+	}
+
+	var policy writeback.Policy
+	switch cfg.WritePolicy {
+	case "write-sync":
+		policy = writeback.PolicyWriteSync
+	case "writeback", "":
+		policy = writeback.PolicyWriteBack
+	case "close-sync":
+		policy = writeback.PolicyCloseSync
+	default:
+		return nil, fmt.Errorf("fuse: unknown write policy %q", cfg.WritePolicy)
+	}
+
+	// The v1 small-file writeback track (.dat/.meta + 16-worker uploader)
+	// rides the mount-scoped cache namespace under its own name.
+	writeCacheDir := cacheScopedDir(cacheBase, mountHash, "writecache")
+	// The staging ledger + commit queue serve the async writeback policy
+	// (shadow/pending/journal machinery); close-sync ALSO gets the ledger
+	// for its v1 shadow-backed large-file close uploads (bounded-memory
+	// staging + streamed landing). Write-sync commits inline per Write and
+	// needs none of it. The cache plugin stays regardless — its READ caches
+	// serve every policy; only its staging role is policy-bound.
+	var stagingLedger *staging.Staging
+	if !cfg.ReadOnly && (policy == writeback.PolicyWriteBack || policy == writeback.PolicyCloseSync) && cacheBase != "" && wantExt["writeback"] {
+		// wantExt gate: a core-only stack (--extensions core) keeps the
+		// default writeback policy but builds no writeback handler; the
+		// ledger would still be created, recovered, and compacted — a
+		// corrupt or unwritable cache dir failing a mount that never
+		// uses it.
+		// v1 write-cache quota (defaults freeRatio 0.10, 1024 MiB): the
+		// shadow store refuses writes past the budget with ENOSPC.
+		// v1 knobs: zero uses the default, negative disables the check.
+		freeRatio := cfg.WriteCacheFreeRatio
+		if freeRatio == 0 {
+			freeRatio = 0.10
+		} else if freeRatio < 0 {
+			freeRatio = 0
+		}
+		cacheSizeMB := resolveWriteCacheSizeMB(cfg.WriteCacheSizeMB)
+		// The ledger's internal layout (shadow/, pending/, journal.wal) is
+		// the v1 mount-scoped one: root it at the mount hash directly.
+		stagingLedger, err = staging.NewStagingWithQuota(filepath.Join(cacheBase, mountHash), freeRatio, cacheSizeMB)
+		if err != nil {
+			return nil, fmt.Errorf("fuse: staging ledger: %w", err)
+		}
+		defer func() {
+			if err != nil {
+				stagingLedger.Close()
+			}
+		}()
+		if err := stagingLedger.Recover(); err != nil {
+			return nil, fmt.Errorf("fuse: staging recovery: %w", err)
+		}
+		_ = stagingLedger.Compact()
+	}
+
+	// v1 sync-mode resolution: auto probes the server RTT (HEAD /, 5s
+	// bound); >10ms (or an unreachable probe) resolves interactive — fsync
+	// served by the local staging ledger — otherwise strict.
+	syncMode := strings.TrimSpace(cfg.SyncMode)
+	switch syncMode {
+	case "", "auto":
+		syncMode = resolveSyncModeByRTT(cfg.Server)
+	case "strict", "interactive":
+	default:
+		return nil, fmt.Errorf("fuse: unknown sync mode %q", cfg.SyncMode)
+	}
+	fmt.Fprintf(os.Stderr, "drive9: sync mode: %s\n", syncMode)
+
+	// A sandbox presents the workspace as owned by its unprivileged
+	// application user (v1 DefaultOwner); everything else reports the
+	// mounting process.
+	uid, gid := uint32(os.Getuid()), uint32(os.Getgid())
+	if cfg.DefaultOwner != nil {
+		uid, gid = cfg.DefaultOwner.UID, cfg.DefaultOwner.GID
+	}
+
+	// The POSIX rename preflight sits early so its attribute lookups see
+	// the view handlers below it (lazy-create overlays answer for
+	// not-yet-committed files).
+	var renameGuard *renameguard.RenameGuard
+	if wantExt["renameguard"] {
+		renameGuard, err = renameguard.New(renameguard.Options{
+			Uid: uid,
+			Gid: gid,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("fuse: renameguard extension: %w", err)
+		}
+		built["renameguard"] = renameGuard
+	}
+
+	// v1 EnableGitWorkspaces (default off): the git extension's workspace
+	// discovery is opt-in — overlay mounts (LocalRoot) arm it via the CLI.
+	// Constructed before localize so its declarative routing (a workspace's
+	// .git stays local, v1 gitDirShouldBeLocalOverlay) wires into the
+	// overlay router.
+	var gitExt *git.Git
+	if wantExt["git"] && cfg.EnableGitWorkspaces {
+		var gerr error
+		gitExt, gerr = git.New(git.Options{Client: cl, Events: bus, LocalRoot: cfg.LocalRoot, RemoteRoot: remoteRoot, SyncPolicy: string(cfg.WritePolicy),
+			OnWorkspaceRefresh: sharedCounters.RecordGitWorkspaceRefresh})
+		if gerr != nil {
+			return nil, fmt.Errorf("fuse: git extension: %w", gerr)
+		}
+		built["git"] = gitExt
+	}
+
+	// localize routes declared local-only paths to the local overlay
+	// (v1 local_overlay/local_policy semantics).
+	if wantExt["localize"] && cfg.LocalRoot != "" {
+		localizeOpts := localize.Options{
+			LocalRoot:                   cfg.LocalRoot,
+			LocalOnlyPatterns:           cfg.LocalOnlyPatterns,
+			LocalGitignoreAwarePatterns: cfg.LocalGitignoreAwarePatterns,
+			RemoteOnlyPatterns:          cfg.RemoteOnlyPatterns,
+			Profile:                     cfg.Profile,
+			ApplyBuiltinDefaults:        !cfg.DisableBuiltinOverlayDefaults,
+		}
+		if gitExt != nil {
+			// v1 gitDirShouldBeLocalOverlay: a discovered workspace's .git
+			// routes to the local overlay (the restored .git state backs
+			// git's own file traffic, not the remote).
+			localizeOpts.DeclarativeLocal = gitExt.RoutesLocal
+		}
+		if cacheBase != "" && !cfg.ReadOnly {
+			// SQLite WAL-index sidecars (-shm) are mount-local scratch:
+			// they live in the read-cache namespace in a fresh per-mount
+			// directory, so a crashed mount's leftovers are never reused.
+			// Creation failure only disables that plane (sidecars then
+			// stay on their classified route).
+			transientRoot := transientOverlayRoot(cacheBase, readCacheHash)
+			if err := os.MkdirAll(transientRoot, 0o700); err != nil {
+				fmt.Fprintf(os.Stderr, "drive9: transient local overlay init failed: %v (continuing without)\n", err)
+			} else {
+				localizeOpts.TransientRoot = transientRoot
+			}
+		}
+		localizeExt, lerr := localize.New(localizeOpts)
+		if lerr != nil {
+			return nil, fmt.Errorf("fuse: localize extension: %w", lerr)
+		}
+		built["localize"] = localizeExt
+	}
+
+	// The layer view sits outermost (v1: layer over base), git next.
+	var layerExt *layer.Layer
+	if wantExt["layer"] && strings.TrimSpace(cfg.LayerRef) != "" {
+		layerExt, err = layer.New(layer.Options{
+			Policy:        cfg.WritePolicy,
+			LayerRef:      cfg.LayerRef,
+			CheckpointRef: cfg.CheckpointRef,
+			RemoteRoot:    remoteRoot,
+			Client:        cl,
+			Events:        bus,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("fuse: layer extension: %w", err)
+		}
+		built["layer"] = layerExt
+		// Control/session consumers resolve the layer AGAIN (drive9 exec
+		// on the mount directory): report the PINNED id, or a name/tag
+		// that later points elsewhere sends them to a different layer
+		// than the one this mount reads/writes.
+		if pinned := layerExt.PinnedRef(); pinned != "" {
+			cfg.LayerRef = pinned
+		}
+	}
+
+	// The extent plane claims ahead of the classic data path (cache and
+	// writeback never see extent files). Gated on the --extent paths /
+	// profile [extent] section only: the cache dir falls back to the
+	// per-user default like every other cache-backed component, so it is
+	// never the enabling condition.
+	var extentExt *extent.Extent
+	// Build the extent reader whenever the stack requests it, even with
+	// no local ExtentPaths: files created by another extent-enabled mount
+	// still carry ExtentIno in listings/stats, and the server answers
+	// their reads with 422 unless the JuiceFS-backed reader routes them.
+	// An empty ExtentPaths only skips the JuiceFS runtime discovery.
+	if wantExt["extent"] {
+		extentExt, err = extent.New(extent.Options{
+			ExtentPaths: cfg.ExtentPaths,
+			Client:      cl,
+			RemoteRoot:  remoteRoot,
+			CacheDir:    cacheScopedDir(cacheBase, mountHash, "jfs"),
+			// v1: write-sync mounts pay a per-Write VFS flush on the extent
+			// plane too.
+			Policy: cfg.WritePolicy,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("fuse: extent extension: %w", err)
+		}
+		built["extent"] = extentExt
+	}
+
+	var appendExt *appendlog.AppendLog
+	if wantExt["appendlog"] && len(cfg.AppendLogPatterns) > 0 && strings.TrimSpace(cfg.LayerRef) == "" {
+		appendExt, err = appendlog.New(appendlog.Options{Patterns: cfg.AppendLogPatterns, Client: cl, RemoteRoot: remoteRoot, Events: bus, TempDir: appendLogSnapshotDir(cacheBase, mountHash), SyncPolicy: string(cfg.WritePolicy)})
+		if err != nil {
+			return nil, fmt.Errorf("fuse: appendlog extension: %w", err)
+		}
+		built["appendlog"] = appendExt
+	}
+
+	// The bulk data plane claims fresh truncate-writers (S3 multipart for
+	// large images) only after the view/routing handlers have had their
+	// claim, and before the buffered write path. A write-sync mount commits
+	// every write inline below — the buffered-image claim stays out.
+	if wantExt["bulkfile"] {
+		bulkExt, berr := bulkfile.New(bulkfile.Options{Client: cl, RemoteRoot: remoteRoot, Events: bus, Policy: cfg.WritePolicy})
+		if berr != nil {
+			return nil, fmt.Errorf("fuse: bulkfile extension: %w", berr)
+		}
+		built["bulkfile"] = bulkExt
+	}
+
+	if wantExt["specials"] {
+		specialsExt, sperr := specials.New(specials.Options{Events: bus})
+		if sperr != nil {
+			return nil, fmt.Errorf("fuse: specials extension: %w", sperr)
+		}
+		built["specials"] = specialsExt
+	}
+
+	if wantExt["xattr"] {
+		xattrExt, xerr := xattr.New(xattr.Options{Events: bus})
+		if xerr != nil {
+			return nil, fmt.Errorf("fuse: xattr extension: %w", xerr)
+		}
+		built["xattr"] = xattrExt
+	}
+
+	var wb *writeback.Writeback
+	// A read-only mount serves reads only (the kernel's "ro" option
+	// rejects mutations): constructing the writeback plane here would
+	// RECOVER a previous mount's staging ledger, journal and uploader and
+	// start re-uploading its pending writes — data traffic a read-only
+	// mount must never produce.
+	if wantExt["writeback"] && !cfg.ReadOnly {
+		flushDebounce := cfg.FlushDebounce
+		if cfg.Profile == "interactive" {
+			// v1 ApplyInteractiveProfile disables the debouncer outright
+			// ("replaced by shadow writes").
+			flushDebounce = 0
+		}
+		var werr error
+		wb, werr = writeback.New(writeback.Options{
+			Policy:                policy,
+			SyncMode:              syncMode,
+			WriteCacheDir:         writeCacheDir,
+			Client:                cl,
+			RemoteRoot:            remoteRoot,
+			Events:                bus,
+			Staging:               stagingLedger,
+			FlushDebounce:         flushDebounce,
+			UploadConcurrency:     cfg.UploadConcurrency,
+			CommitQueueMaxPending: cfg.CommitQueueMaxPending,
+			BatchWindow:           cfg.WriteBackBatchWindow,
+			BatchMaxFiles:         cfg.WriteBackBatchMaxFiles,
+			BatchMaxBytes:         cfg.WriteBackBatchMaxBytes,
+			// gvisor-compat takes precedence and always keeps commits
+			// detached (v1).
+			InterruptibleCommits:    cfg.LegacyInterruptibleMutations && !cfg.GVisorCompat,
+			RemoteCommitWaitTimeout: cfg.RemoteCommitWaitTimeout,
+			// v1 --writeback-lazy-staging / --writeback-sync-window.
+			LazyStaging: cfg.WritebackLazyStaging,
+			SyncWindow:  cfg.WritebackSyncWindow,
+		})
+		if werr != nil {
+			return nil, fmt.Errorf("fuse: writeback extension: %w", werr)
+		}
+		built["writeback"] = wb
+	}
+
+	if readCache != nil && wb != nil {
+		// v1 seeded the read cache with the committed image at every
+		// inline-commit settle, and read its write-side base preloads
+		// through the same cache: reads racing backend replica lag then see
+		// this mount's own writes (read-your-writes), and preloads cannot
+		// 404 inside the lag window.
+		wb.SetCommitSeeder(readCache.SeedCommit)
+		wb.SetCommitSeedLimit(readCache.MaxFileSize())
+		wb.SetPendingSeeder(readCache.SeedPending)
+		wb.SetBaseReader(func(path string) ([]byte, bool) {
+			return readCache.ReadCached(path, 0)
+		})
+	}
+
+	var sseExt *sse.SSE
+	if wantExt["sse"] {
+		var serr error
+		sseExt, serr = sse.New(sse.Options{Client: cl, Actor: actorID, RemoteRoot: remoteRoot, Events: bus})
+		if serr != nil {
+			return nil, fmt.Errorf("fuse: sse extension: %w", serr)
+		}
+		built["sse"] = sseExt
+	}
+
+	// v1 setDefaults: kernel attr/entry caches default to 60s (30s attr on
+	// the coding-agent profile), negative entries 1s, listings 10s. The
+	// interactive profile (v1 ApplyInteractiveProfile) drops attr/entry to
+	// 1s, listings to 2s, and disables the flush debounce — zero values
+	// only, so explicit flags still win.
+	attrTTL, entryTTL, dirTTL := resolveKernelTTLDefaults(cfg.Profile, cfg.AttrTTL, cfg.EntryTTL, cfg.DirTTL)
+	// View extensions that own directories (localize overlays, layer
+	// view) must see dir GetAttrs go through the chain; every other stack
+	// serves root/dir attrs from the inode table (v1).
+	localDirAttrs := cfg.LocalRoot == "" && strings.TrimSpace(cfg.LayerRef) == ""
+	// The kernel enforces permissions when default_permissions is on;
+	// otherwise the daemon's open gate carries the mode contract.
+	defaultPermissions := cfg.AllowOther
+	// Assemble the chain as the REVERSE of the flag order: the flag lists
+	// extensions in build-up order (core first, each subsequent entry
+	// wrapping the previous ones), so the last flag entry is the outermost
+	// handler and core is the terminal. Entries whose config prerequisites
+	// are absent (cache without --cache-dir, layer without --layer, ...)
+	// construct nothing and are skipped.
+	var chainHandlers []fs.Handler
+	for i := len(extOrder) - 1; i >= 0; i-- {
+		if h := built[extOrder[i]]; h != nil {
+			chainHandlers = append(chainHandlers, h)
+		}
+	}
+	f, err := New(Options{
+		OwnerSet:           cfg.DefaultOwner != nil,
+		Extensions:         chainHandlers,
+		Events:             bus,
+		AttrTTL:            attrTTL,
+		EntryTTL:           entryTTL,
+		NegEntryTTL:        cfg.NegativeEntryTTL,
+		DirTTL:             dirTTL,
+		DirCacheMaxEntries: cfg.DirCacheMaxEntries,
+		LocalDirAttrs:      localDirAttrs,
+		DefaultPermissions: defaultPermissions,
+		Perf:               cfg.PerfCounters || cfg.PerfSamplesPath != "",
+		PerfCounters:       sharedCounters,
+		Debug:              cfg.Debug,
+		GVisorCompat:       cfg.GVisorCompat,
+		Uid:                uid,
+		Gid:                gid,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("fuse: assemble facade: %w", err)
+	}
+	// The POSIX rename preflight compares sticky ownership against the
+	// facade's inode table (mount-local chown authority, v1), not the chain's
+	// stat view.
+	if renameGuard != nil {
+		renameGuard.SetOwnerLookup(f.OwnerOf)
+	}
+	// Hand the facade-owned namespace cache to the terminal: fresh listings
+	// answer Lookups/GetAttrs without a remote stat (v1 lookupFromDirCache).
+	if coreExt != nil {
+		if dc, ok := f.Ctx.DirCache.(core.NamespaceCache); ok {
+			coreExt.Attach(dc)
+		}
+	}
+	f.mountPt, f.rootTag, f.srvTag = cfg.MountPoint, remoteRoot, cfg.Server
+
+	if sseExt != nil {
+		sseExt.Attach(f.Ctx.Inodes, f.Ctx.Notify)
+	}
+	if layerExt != nil {
+		// The layer event watcher resets the kernel view after a remote
+		// refresh (v1 resetMountView on fs_layer_events).
+		layerExt.Attach(f.Ctx.Notify)
+		// A layer rollback fences the write plane: the commit queue halts
+		// and later inline commits fail with the rolled-back error.
+		if wb != nil {
+			layerExt.OnRollback(wb.AbandonLayerForRollback)
+		}
+	}
+
+	return &mountRuntime{fs: f, writeback: wb, staging: stagingLedger, layerRef: cfg.LayerRef, syncMode: syncMode, policy: policy}, nil
 }
 
 // classifyServeExit classifies a serve-loop exit by the KERNEL mount row
