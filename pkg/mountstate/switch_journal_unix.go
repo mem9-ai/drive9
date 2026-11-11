@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"sync"
 
+	"github.com/pingcap/failpoint"
 	"golang.org/x/sys/unix"
 
 	"github.com/mem9-ai/drive9/pkg/viewprotocol"
@@ -294,7 +295,12 @@ func (j *SwitchJournal) append(rec switchRecord) error {
 		err = io.ErrShortWrite
 	}
 	if err == nil {
-		err = j.writer.Sync()
+		// Exercise cancellation and uncertain durability at the actual sync
+		// boundary without changing the failpoint-off write path.
+		failpoint.InjectCall("switchJournalBeforeSync", &err)
+		if err == nil {
+			err = j.writer.Sync()
+		}
 	}
 	if err != nil {
 		j.failed = true

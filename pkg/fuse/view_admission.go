@@ -148,6 +148,8 @@ func (p *viewPause) resume() error {
 // resumeAtIdle completes a local durable decision and reopens admission in one
 // idle section. complete may sync the local journal, but must not notify the
 // kernel, wait for callbacks or reenter the gate. A failure keeps admission closed.
+// The context check in atIdle is the cancellation cutoff: after complete starts,
+// its durable success wins over cancellation and admission is reopened.
 func (p *viewPause) resumeAtIdle(ctx context.Context, complete func() error) error {
 	return p.atIdle(ctx, func() error {
 		if err := complete(); err != nil {

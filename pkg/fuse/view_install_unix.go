@@ -57,7 +57,10 @@ func newViewInstallation(journal *mountstate.SwitchJournal, adapter *viewRequest
 // invalidate the same plan without installing another generation. Only a
 // confirmed completion record permits reopening; old successful replays have
 // no side effects. A nil receipt on error means the journal could not confirm
-// this attempt's result, not that the decision was undone.
+// this attempt's result, not that the decision was undone. Cancellation is
+// honored until entering the final idle section. Once journal completion starts,
+// it is not canceled: confirmed durability resumes I/O and returns DONE even if
+// the request expired meanwhile; uncertain durability keeps admission closed.
 func (i *viewInstallation) finish(ctx context.Context) (*mountstate.SwitchReceipt, error) {
 	if !i.mu.TryLock() {
 		return nil, mountstate.ErrSwitchPending
