@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestViewAdmissionPauseDrainsAndRejectsNewWork(t *testing.T) {
@@ -223,5 +224,106 @@ func TestViewAdmissionIdleDecisionFailureDoesNotResume(t *testing.T) {
 	}
 	if err := next.resume(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestViewAdmissionWaitsForQueuedForgetAndCompleteCleanup(t *testing.T) {
+	current := newXattrFS(t)
+	adapter := &viewRequestFS{inner: current}
+	ino := current.inodes.Lookup("/queued", false, 0, time.Time{})
+	current.inodes.Lookup("/queued", false, 0, time.Time{})
+	pause, err := adapter.admission.pause()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	observed := make(chan int, 3)
+	done := make(chan error, 1)
+	go func() {
+		done <- pause.waitForCleanup(ctx, func() bool {
+			n := current.nonRootKernelLookupCount()
+			observed <- n
+			return n == 0
+		})
+	}()
+	if n := <-observed; n != 2 {
+		t.Fatalf("initial refs=%d", n)
+	}
+	// No callback was active at the first check. A FORGET delivered later
+	// must wake the waiter without resuming ordinary I/O or losing a wakeup.
+	adapter.Forget(ino, 1)
+	if n := <-observed; n != 1 {
+		t.Fatalf("partial forget refs=%d", n)
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("accepted remaining reference: %v", err)
+	default:
+	}
+	// Even a zero lookup count cannot complete before the whole cleanup
+	// callback has exited (it may still be changing other old-view state).
+	leave := adapter.admission.enterCleanup()
+	current.Forget(ino, 1)
+	select {
+	case err := <-done:
+		t.Fatalf("accepted active cleanup: %v", err)
+	default:
+	}
+	leave()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if n := <-observed; n != 0 {
+		t.Fatalf("final refs=%d", n)
+	}
+	if _, err := adapter.admission.enter(); !errors.Is(err, errViewAdmissionPaused) {
+		t.Fatalf("wait resumed ordinary I/O: %v", err)
+	}
+	if err := pause.resume(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestViewAdmissionCleanupWaitCancellationAndOwnership(t *testing.T) {
+	for _, mode := range []string{"cancel", "resume"} {
+		t.Run(mode, func(t *testing.T) {
+			var gate viewAdmission
+			pause, err := gate.pause()
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			checked, done := make(chan struct{}), make(chan error, 1)
+			go func() {
+				done <- pause.waitForCleanup(ctx, func() bool { close(checked); return false })
+			}()
+			<-checked
+			want := context.Canceled
+			switch mode {
+			case "cancel":
+				cancel()
+			case "resume":
+				want = errViewPauseLost
+				if err := pause.resume(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := <-done; !errors.Is(err, want) {
+				t.Fatalf("wait=%v want=%v", err, want)
+			}
+			if mode != "resume" {
+				if _, err := gate.enter(); !errors.Is(err, errViewAdmissionPaused) {
+					t.Fatal("expired wait reopened admission")
+				}
+				if err := pause.resume(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := pause.waitForCleanup(t.Context(), func() bool { t.Fatal("stale owner checked state"); return true }); !errors.Is(err, errViewPauseLost) {
+				t.Fatal(err)
+			}
+		})
 	}
 }

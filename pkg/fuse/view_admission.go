@@ -57,6 +57,8 @@ func (g *viewAdmission) trackLocked() func() {
 			g.active--
 			if g.active == 0 && g.paused != nil {
 				close(g.paused.idle)
+				close(g.paused.progress)
+				g.paused.progress = make(chan struct{})
 			}
 		})
 	}
@@ -71,7 +73,7 @@ func (g *viewAdmission) pause() (*viewPause, error) {
 	if g.paused != nil {
 		return nil, errViewAdmissionPaused
 	}
-	p := &viewPause{gate: g, idle: make(chan struct{}), released: make(chan struct{})}
+	p := &viewPause{gate: g, idle: make(chan struct{}), progress: make(chan struct{}), released: make(chan struct{})}
 	g.paused = p
 	if g.active == 0 {
 		close(p.idle)
@@ -82,6 +84,7 @@ func (g *viewAdmission) pause() (*viewPause, error) {
 type viewPause struct {
 	gate     *viewAdmission
 	idle     chan struct{}
+	progress chan struct{} // complete callbacks while paused, including queued cleanup
 	released chan struct{}
 }
 
@@ -107,6 +110,38 @@ func (p *viewPause) wait(ctx context.Context) error {
 		case <-p.released:
 			return errViewPauseLost
 		case <-idle:
+		}
+	}
+}
+
+// waitForCleanup waits for a condition checked at idle, including cleanup
+// callbacks which have not entered yet. Unlike wait, an initially idle gate
+// does not satisfy the wait by itself. ready runs under the admission lock and
+// must not enter the gate or issue kernel notifications. The caller bounds the
+// wait; expiry never means the condition became true.
+func (p *viewPause) waitForCleanup(ctx context.Context, ready func() bool) error {
+	for {
+		p.gate.mu.Lock()
+		if p.gate.paused != p {
+			p.gate.mu.Unlock()
+			return errViewPauseLost
+		}
+		if err := ctx.Err(); err != nil {
+			p.gate.mu.Unlock()
+			return err
+		}
+		if p.gate.active == 0 && ready() {
+			p.gate.mu.Unlock()
+			return nil
+		}
+		progress := p.progress
+		p.gate.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-p.released:
+			return errViewPauseLost
+		case <-progress:
 		}
 	}
 }

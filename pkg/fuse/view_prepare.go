@@ -5,7 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"syscall"
+	"time"
 )
+
+// Kernel invalidation queues FORGET separately from its notification reply.
+// Give those callbacks a bounded opportunity to retire idle lookup references;
+// references still held by a cwd, fd or mapping remain BUSY after this budget.
+const viewForgetWait = time.Second
 
 // prepareViewSwitch pauses ordinary callbacks, drains the current runtime and
 // evicts reclaimable kernel references before checking what remains pinned.
@@ -60,7 +66,18 @@ func (v *viewRequestFS) prepareViewSwitch(ctx context.Context, current *FS, noti
 	if err = fenceRoot(ctx); err != nil {
 		return pause, plan, err
 	}
-	if err = pause.wait(ctx); err != nil {
+	forgetCtx, cancel := context.WithTimeout(ctx, viewForgetWait)
+	defer cancel()
+	err = pause.waitForCleanup(forgetCtx, func() bool {
+		return v.unmounted.Load() || current.unmounted.Load() || current.nonRootKernelLookupCount() == 0
+	})
+	if err != nil {
+		if ctx.Err() != nil {
+			return pause, plan, ctx.Err()
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			return pause, plan, fmt.Errorf("mount view retains kernel lookup references: %w", syscall.EBUSY)
+		}
 		return pause, plan, err
 	}
 	err = pause.atIdle(ctx, func() error { return v.checkViewSwitch(current) })
