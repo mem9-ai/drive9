@@ -940,7 +940,15 @@ func (r *mountRuntime) closeStaging() {
 	}
 }
 
-func buildMountRuntime(cfg MountConfig, cl *client.Client, remoteRoot, actorID string) (_ *mountRuntime, err error) {
+func buildMountRuntime(cfg MountConfig, cl *client.Client, remoteRoot, actorID string) (*mountRuntime, error) {
+	return buildMountRuntimeGeneration(cfg, cl, remoteRoot, actorID, mountRuntimeGeneration{})
+}
+
+func buildMountRuntimeGeneration(cfg MountConfig, cl *client.Client, remoteRoot, actorID string, generation mountRuntimeGeneration) (_ *mountRuntime, err error) {
+	mountHash, readCacheHash, err := mountRuntimeCacheHashes(cfg, cl.ViewBinding(), generation)
+	if err != nil {
+		return nil, err
+	}
 	extOrder, err := parseExtensionOrder(cfg.Extensions)
 	if err != nil {
 		return nil, err
@@ -964,19 +972,6 @@ func buildMountRuntime(cfg MountConfig, cl *client.Client, remoteRoot, actorID s
 		if home, herr := os.UserHomeDir(); herr == nil {
 			cacheBase = filepath.Join(home, ".cache", "drive9")
 		}
-	}
-	// v1 mount-scoped cache namespaces: writeback-side state keys on the
-	// mount identity (layer mounts fold their refs into it), while the
-	// read-side caches also key on the credential because their entries
-	// hold remote bytes that survive remounts.
-	mountHash := ""
-	readCacheHash := ""
-	if cacheBase != "" {
-		mountHash = MountHash(cfg.Server, cfg.MountPoint, cfg.RemoteRoot)
-		if cfg.LayerRef != "" {
-			mountHash = MountLayerHash(cfg.Server, cfg.MountPoint, cfg.RemoteRoot, cfg.LayerRef, cfg.CheckpointRef)
-		}
-		readCacheHash = MountReadCacheHash(cfg.Server, cfg.MountPoint, cfg.RemoteRoot, mountCredentialKind(&cfg), mountCredentialSecret(&cfg))
 	}
 
 	// core constructs into the same registry as every other extension; the
