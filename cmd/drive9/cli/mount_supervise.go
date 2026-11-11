@@ -171,10 +171,12 @@ func runMountStatus(args []string) error {
 	}
 	mp := fs.Arg(0)
 	snap := mountsupervisor.CollectStatus(mp)
+	view, viewErr := readMountStatusView(mp)
 	if *asJSON {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(snap)
+		return writeMountStatusJSON(os.Stdout, snap, view, viewErr)
+	}
+	if err := writeMountStatusView(os.Stdout, view, viewErr); err != nil {
+		return err
 	}
 	fmt.Printf("mountpoint: %s\n", snap.MountPoint)
 	fmt.Printf("state: %s\n", snap.State)

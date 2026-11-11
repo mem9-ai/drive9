@@ -22,8 +22,8 @@ type SwitchReceipt struct {
 // SwitchSnapshot reports the selected target even when installation is pending.
 // It never falls back to main after a durable switch decision.
 type SwitchSnapshot struct {
-	MountID    string
-	Generation uint64
-	Binding    viewprotocol.Binding
-	Pending    *SwitchReceipt
+	MountID    string               `json:"mount_id"`
+	Generation uint64               `json:"generation"`
+	Binding    viewprotocol.Binding `json:"binding"`
+	Pending    *SwitchReceipt       `json:"pending,omitempty"`
 }
