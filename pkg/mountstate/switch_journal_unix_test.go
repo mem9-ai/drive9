@@ -28,7 +28,7 @@ func switchTestJournal(t *testing.T) (*SwitchJournal, string) {
 		t.Fatal(err)
 	}
 	path := filepath.Join(dir, "switch.log")
-	j, err := CreateSwitchJournal(path, "mount-1", viewprotocol.Binding{})
+	j, err := CreateSwitchJournal(path, "mount-1", "scope-1", viewprotocol.Binding{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +56,7 @@ func TestSwitchJournalRecoverAndReplay(t *testing.T) {
 	if err := j.Close(); err != nil {
 		t.Fatal(err)
 	}
-	j, err = OpenSwitchJournal(path, "mount-1", viewprotocol.Binding{})
+	j, err = OpenSwitchJournal(path, "mount-1", "scope-1", viewprotocol.Binding{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +103,7 @@ func TestSwitchJournalRecoverAndReplay(t *testing.T) {
 	if err := j.Close(); err != nil {
 		t.Fatal(err)
 	}
-	j, err = OpenSwitchJournal(path, "mount-1", viewprotocol.Binding{})
+	j, err = OpenSwitchJournal(path, "mount-1", "scope-1", viewprotocol.Binding{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +116,7 @@ func TestSwitchJournalRecoverAndReplay(t *testing.T) {
 
 func TestSwitchJournalExclusiveOwnerAndIncarnation(t *testing.T) {
 	j, path := switchTestJournal(t)
-	if other, err := OpenSwitchJournal(path, "mount-1", viewprotocol.Binding{}); err == nil {
+	if other, err := OpenSwitchJournal(path, "mount-1", "scope-1", viewprotocol.Binding{}); err == nil {
 		_ = other.Close()
 		t.Fatal("two writers")
 	}
@@ -129,7 +129,7 @@ func TestSwitchJournalExclusiveOwnerAndIncarnation(t *testing.T) {
 	}{
 		{"mount-2", viewprotocol.Binding{}}, {"mount-1", switchTarget("a")},
 	} {
-		if other, err := OpenSwitchJournal(path, tc.id, tc.initial); !errors.Is(err, ErrSwitchJournalInvalid) {
+		if other, err := OpenSwitchJournal(path, tc.id, "scope-1", tc.initial); !errors.Is(err, ErrSwitchJournalInvalid) {
 			if other != nil {
 				_ = other.Close()
 			}
@@ -188,7 +188,7 @@ func TestSwitchJournalUnknownDecisionRemainsClosed(t *testing.T) {
 			if err := j.Close(); err != nil {
 				t.Fatal(err)
 			}
-			j, err = OpenSwitchJournal(path, "mount-1", viewprotocol.Binding{})
+			j, err = OpenSwitchJournal(path, "mount-1", "scope-1", viewprotocol.Binding{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -240,7 +240,7 @@ func TestSwitchJournalTornOrCorruptTailDoesNotFallback(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			other, err := OpenSwitchJournal(path, "mount-1", viewprotocol.Binding{})
+			other, err := OpenSwitchJournal(path, "mount-1", "scope-1", viewprotocol.Binding{})
 			if other != nil {
 				_ = other.Close()
 			}
@@ -254,11 +254,11 @@ func TestSwitchJournalTornOrCorruptTailDoesNotFallback(t *testing.T) {
 func TestSwitchJournalDirectorySyncAndSafePaths(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "journal")
-	_, err := openSwitchJournal(path, "mount-1", viewprotocol.Binding{}, true, func(string) error { return io.ErrClosedPipe })
+	_, err := openSwitchJournal(path, "mount-1", "scope-1", viewprotocol.Binding{}, true, func(string) error { return io.ErrClosedPipe })
 	if !errors.Is(err, ErrSwitchUncertain) {
 		t.Fatalf("directory durability: %v", err)
 	}
-	j, err := OpenSwitchJournal(path, "mount-1", viewprotocol.Binding{})
+	j, err := OpenSwitchJournal(path, "mount-1", "scope-1", viewprotocol.Binding{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -269,14 +269,14 @@ func TestSwitchJournalDirectorySyncAndSafePaths(t *testing.T) {
 	if err := os.Symlink(path, link); err != nil {
 		t.Fatal(err)
 	}
-	if j, err := OpenSwitchJournal(link, "mount-1", viewprotocol.Binding{}); err == nil {
+	if j, err := OpenSwitchJournal(link, "mount-1", "scope-1", viewprotocol.Binding{}); err == nil {
 		_ = j.Close()
 		t.Fatal("followed symlink")
 	}
 	if err := os.Chmod(path, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if j, err := OpenSwitchJournal(path, "mount-1", viewprotocol.Binding{}); err == nil {
+	if j, err := OpenSwitchJournal(path, "mount-1", "scope-1", viewprotocol.Binding{}); err == nil {
 		_ = j.Close()
 		t.Fatal("accepted public journal")
 	}
@@ -348,7 +348,7 @@ func TestSwitchJournalCreateAndRecoveryNeverReplaceMissingFacts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if other, err := CreateSwitchJournal(path, "mount-2", viewprotocol.Binding{}); !os.IsExist(err) {
+	if other, err := CreateSwitchJournal(path, "mount-2", "scope-1", viewprotocol.Binding{}); !os.IsExist(err) {
 		if other != nil {
 			_ = other.Close()
 		}
@@ -361,7 +361,7 @@ func TestSwitchJournalCreateAndRecoveryNeverReplaceMissingFacts(t *testing.T) {
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
 	}
-	if other, err := OpenSwitchJournal(path, "mount-1", viewprotocol.Binding{}); !os.IsNotExist(err) {
+	if other, err := OpenSwitchJournal(path, "mount-1", "scope-1", viewprotocol.Binding{}); !os.IsNotExist(err) {
 		if other != nil {
 			_ = other.Close()
 		}
@@ -378,7 +378,7 @@ func TestSwitchJournalProcessHelper(t *testing.T) {
 		t.Skip("subprocess helper")
 	}
 	mode := os.Getenv("DRIVE9_SWITCH_JOURNAL_TEST_MODE")
-	j, err := OpenSwitchJournal(path, "mount-1", viewprotocol.Binding{})
+	j, err := OpenSwitchJournal(path, "mount-1", "scope-1", viewprotocol.Binding{})
 	if mode == "locked" {
 		if j != nil {
 			_ = j.Close()
@@ -444,7 +444,7 @@ func TestSwitchJournalProcessLockAndCrashRecovery(t *testing.T) {
 	if err != nil || line != "locked\n" {
 		t.Fatalf("holder readiness: %q %v", line, err)
 	}
-	if other, err := OpenSwitchJournal(path, "mount-1", viewprotocol.Binding{}); !errors.Is(err, unix.EWOULDBLOCK) {
+	if other, err := OpenSwitchJournal(path, "mount-1", "scope-1", viewprotocol.Binding{}); !errors.Is(err, unix.EWOULDBLOCK) {
 		if other != nil {
 			_ = other.Close()
 		}

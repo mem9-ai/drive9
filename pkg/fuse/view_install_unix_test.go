@@ -25,7 +25,7 @@ func viewInstallFixture(t *testing.T) (*viewInstallation, *viewCacheProbe, strin
 		t.Fatal(err)
 	}
 	path := filepath.Join(dir, "switch.log")
-	journal, err := mountstate.CreateSwitchJournal(path, "mount-1", viewprotocol.Binding{})
+	journal, err := mountstate.CreateSwitchJournal(path, "mount-1", "scope-1", viewprotocol.Binding{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,7 +98,7 @@ func TestViewInstallationCompletesAfterNotificationsAndReplaysWithoutSideEffects
 	if err := i.journal.Close(); err != nil {
 		t.Fatal(err)
 	}
-	journal, err := mountstate.OpenSwitchJournal(path, "mount-1", viewprotocol.Binding{})
+	journal, err := mountstate.OpenSwitchJournal(path, "mount-1", "scope-1", viewprotocol.Binding{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,7 +226,7 @@ func TestViewInstallationUnconfirmedJournalCompletionStaysClosed(t *testing.T) {
 	if err == nil || r != nil {
 		t.Fatalf("unconfirmed result claimed: %+v %v", r, err)
 	}
-	journal, err := mountstate.OpenSwitchJournal(path, "mount-1", viewprotocol.Binding{})
+	journal, err := mountstate.OpenSwitchJournal(path, "mount-1", "scope-1", viewprotocol.Binding{})
 	if err != nil {
 		t.Fatal(err)
 	}

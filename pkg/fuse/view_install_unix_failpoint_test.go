@@ -80,7 +80,7 @@ func TestViewInstallationCancellationDuringJournalCompletion(t *testing.T) {
 			}
 			// The uncertain write may have reached the file. Recovery syncs it
 			// again and reports the original target; it never invents main.
-			journal, err := mountstate.OpenSwitchJournal(path, "mount-1", viewprotocol.Binding{})
+			journal, err := mountstate.OpenSwitchJournal(path, "mount-1", "scope-1", viewprotocol.Binding{})
 			if err != nil {
 				t.Fatal(err)
 			}

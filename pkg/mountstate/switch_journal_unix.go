@@ -38,6 +38,7 @@ type switchRecord struct {
 	Version int                  `json:"version"`
 	Kind    string               `json:"kind"`
 	MountID string               `json:"mount_id,omitempty"`
+	Scope   string               `json:"scope,omitempty"`
 	Initial viewprotocol.Binding `json:"initial,omitempty"`
 	Receipt *SwitchReceipt       `json:"receipt,omitempty"`
 }
@@ -56,6 +57,7 @@ type SwitchJournal struct {
 	writer     switchJournalWriter
 	failed     bool
 	bytes      int64
+	scope      string
 	mountID    string
 	initial    viewprotocol.Binding
 	generation uint64
@@ -65,21 +67,22 @@ type SwitchJournal struct {
 }
 
 // CreateSwitchJournal creates the durable identity for a new mount incarnation.
+// scope is the authenticated filesystem/server/root/mountpoint digest.
 // An existing pathname is never overwritten, including an empty/corrupt file.
-func CreateSwitchJournal(path, mountID string, initial viewprotocol.Binding) (*SwitchJournal, error) {
-	return openSwitchJournal(path, mountID, initial, true, syncSwitchDirectory)
+func CreateSwitchJournal(path, mountID, scope string, initial viewprotocol.Binding) (*SwitchJournal, error) {
+	return openSwitchJournal(path, mountID, scope, initial, true, syncSwitchDirectory)
 }
 
 // OpenSwitchJournal reopens an existing mount incarnation. A missing journal
 // is an error, not permission to initialize main. path must be in a private,
 // current-user-owned directory. Existing complete records are synced again
 // before recovery is reported. Torn/corrupt tails fail closed.
-func OpenSwitchJournal(path, mountID string, initial viewprotocol.Binding) (*SwitchJournal, error) {
-	return openSwitchJournal(path, mountID, initial, false, syncSwitchDirectory)
+func OpenSwitchJournal(path, mountID, scope string, initial viewprotocol.Binding) (*SwitchJournal, error) {
+	return openSwitchJournal(path, mountID, scope, initial, false, syncSwitchDirectory)
 }
 
-func openSwitchJournal(path, mountID string, initial viewprotocol.Binding, create bool, syncDir func(string) error) (*SwitchJournal, error) {
-	if viewprotocol.ValidateOperationID(mountID) != nil || initial.Validate() != nil || !filepath.IsAbs(path) {
+func openSwitchJournal(path, mountID, scope string, initial viewprotocol.Binding, create bool, syncDir func(string) error) (*SwitchJournal, error) {
+	if viewprotocol.ValidateOperationID(mountID) != nil || viewprotocol.ValidateOperationID(scope) != nil || initial.Validate() != nil || !filepath.IsAbs(path) {
 		return nil, ErrSwitchJournalInvalid
 	}
 	dir := filepath.Dir(path)
@@ -122,9 +125,9 @@ func openSwitchJournal(path, mountID string, initial viewprotocol.Binding, creat
 	if info.Size() > maxSwitchJournalBytes {
 		return nil, ErrSwitchJournalLimit
 	}
-	j := &SwitchJournal{file: f, writer: f, mountID: mountID, initial: initial, receipts: make(map[string]SwitchReceipt)}
+	j := &SwitchJournal{file: f, writer: f, mountID: mountID, scope: scope, initial: initial, receipts: make(map[string]SwitchReceipt)}
 	if create {
-		rec := switchRecord{Version: 1, Kind: "init", MountID: mountID, Initial: initial}
+		rec := switchRecord{Version: 1, Kind: "init", MountID: mountID, Scope: scope, Initial: initial}
 		if err := j.append(rec); err != nil {
 			return nil, err
 		}
@@ -360,13 +363,13 @@ func (j *SwitchJournal) replay(rec switchRecord) error {
 		return ErrSwitchJournalInvalid
 	}
 	if rec.Kind == "init" {
-		if j.generation != 0 || rec.Receipt != nil || rec.MountID != j.mountID || rec.Initial != j.initial || rec.Initial.Validate() != nil {
+		if j.generation != 0 || rec.Receipt != nil || rec.MountID != j.mountID || rec.Scope != j.scope || rec.Initial != j.initial || rec.Initial.Validate() != nil {
 			return ErrSwitchJournalInvalid
 		}
 		j.generation, j.binding = 1, rec.Initial
 		return nil
 	}
-	if j.generation == 0 || rec.MountID != "" || rec.Initial != (viewprotocol.Binding{}) || rec.Receipt == nil {
+	if j.generation == 0 || rec.MountID != "" || rec.Scope != "" || rec.Initial != (viewprotocol.Binding{}) || rec.Receipt == nil {
 		return ErrSwitchJournalInvalid
 	}
 	r := *rec.Receipt

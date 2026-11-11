@@ -38,7 +38,7 @@ func viewSwitchFixture(t *testing.T) (*mountViewSwitch, *viewCacheProbe, mountco
 	if err := os.Chmod(dir, 0700); err != nil {
 		t.Fatal(err)
 	}
-	j, err := mountstate.CreateSwitchJournal(filepath.Join(dir, "switch.log"), "mount-1", viewprotocol.Binding{})
+	j, err := mountstate.CreateSwitchJournal(filepath.Join(dir, "switch.log"), "mount-1", "scope-1", viewprotocol.Binding{})
 	if err != nil {
 		t.Fatal(err)
 	}
