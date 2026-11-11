@@ -91,7 +91,8 @@ func (f *FS) invalidateViewCache(ctx context.Context, plan viewCacheInvalidation
 // Call only after the binding decision, with foreground I/O still closed, and
 // without admission/inode locks: kernel notifications may require callbacks.
 // An error leaves the switch RECOVERING. Retry the same full plan; notifications
-// are idempotent and ENOENT means the kernel has already forgotten the target.
+// are idempotent. ENOENT is allowed only for non-root targets: the root must
+// still belong to this live mount connection, not have disappeared on unmount.
 // Cancellation is checked between calls; go-fuse cannot cancel a notify syscall.
 func (p viewCacheInvalidation) invalidate(ctx context.Context, notifier viewCacheNotifier) error {
 	if notifier == nil {
@@ -103,7 +104,7 @@ func (p viewCacheInvalidation) invalidate(ctx context.Context, notifier viewCach
 		}
 		// off=0, len=0 invalidates attributes and all cached data, including
 		// root directory state. No goroutine hides a partial failure.
-		if status := notifier.InodeNotify(ino, 0, 0); status != gofuse.OK && status != gofuse.ENOENT {
+		if status := notifier.InodeNotify(ino, 0, 0); status != gofuse.OK && (status != gofuse.ENOENT || ino == gofuse.FUSE_ROOT_ID) {
 			return fmt.Errorf("fuse: invalidate inode %d: %w", ino, syscall.Errno(status))
 		}
 	}

@@ -88,15 +88,38 @@ func TestViewCacheInvalidationWaitsAndReportsPartialFailure(t *testing.T) {
 	if err := <-done; !errors.Is(err, syscall.EIO) {
 		t.Fatalf("lost failure: %v", err)
 	}
-	// A later attempt repeats the original plan. Missing targets are already
-	// invalid, but unsupported notification is not success.
+	// A missing root means the same live mount cannot be established.
 	probe.inode = func(uint64) gofuse.Status { return gofuse.ENOENT }
-	if err := plan.invalidate(context.Background(), probe); err != nil {
-		t.Fatal(err)
+	if err := plan.invalidate(context.Background(), probe); !errors.Is(err, syscall.ENOENT) {
+		t.Fatalf("missing root accepted: %v", err)
 	}
 	probe.inode = func(uint64) gofuse.Status { return gofuse.ENOSYS }
 	if err := plan.invalidate(context.Background(), probe); !errors.Is(err, syscall.ENOSYS) {
 		t.Fatalf("unsupported notification accepted: %v", err)
+	}
+}
+
+func TestViewCacheInvalidationAllowsForgottenNonRoot(t *testing.T) {
+	inodes := NewInodeToPath()
+	inodes.Lookup("/gone", false, 0, time.Time{})
+	plan, err := prepareViewCacheInvalidation(inodes.Snapshot())
+	if err != nil {
+		t.Fatal(err)
+	}
+	probe := &viewCacheProbe{
+		inode: func(ino uint64) gofuse.Status {
+			if ino == gofuse.FUSE_ROOT_ID {
+				return gofuse.OK
+			}
+			return gofuse.ENOENT
+		},
+		entry: func(uint64, string) gofuse.Status { return gofuse.ENOENT },
+	}
+	if err := plan.invalidate(context.Background(), probe); err != nil {
+		t.Fatal(err)
+	}
+	if len(probe.calls) != 3 {
+		t.Fatalf("incomplete invalidation: %v", probe.calls)
 	}
 }
 
