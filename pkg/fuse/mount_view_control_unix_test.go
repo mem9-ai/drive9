@@ -133,9 +133,12 @@ func TestMountViewControlLostResponseCanQueryOriginal(t *testing.T) {
 func TestMountViewControlCloseCancelsAndJoinsHandlers(t *testing.T) {
 	s, _, req, _ := viewSwitchFixture(t)
 	entered, exited := make(chan struct{}), make(chan struct{})
+	canceled, release := make(chan struct{}), make(chan struct{})
 	s.validate = func(ctx context.Context, _ viewprotocol.Binding) error {
 		close(entered)
 		<-ctx.Done()
+		close(canceled)
+		<-release
 		close(exited)
 		return ctx.Err()
 	}
@@ -146,7 +149,21 @@ func TestMountViewControlCloseCancelsAndJoinsHandlers(t *testing.T) {
 		requestDone <- err
 	}()
 	<-entered
-	server.Close()
+	closed := make(chan struct{})
+	go func() { server.Close(); close(closed) }()
+	<-canceled
+	listener, lock, listenErr := listenMountControl(server.SocketPath())
+	if listener != nil {
+		_ = listener.Close()
+	}
+	if lock != nil {
+		_ = lock.Close()
+	}
+	close(release)
+	<-closed
+	if listenErr == nil {
+		t.Fatal("control lock released before old handler finished")
+	}
 	select {
 	case <-exited:
 	default:

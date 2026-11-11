@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -23,6 +22,7 @@ import (
 )
 
 type mountControlServer struct {
+	lock       *os.File
 	view       *mountViewSwitch
 	closeOnce  sync.Once
 	connMu     sync.Mutex
@@ -52,19 +52,12 @@ func startMountViewControlServer(mountPoint string, view *mountViewSwitch) (*mou
 
 func startMountControlServerWithView(mountPoint, layer string, fs *FS, view *mountViewSwitch) (*mountControlServer, error) {
 	socketPath := mountstate.ControlSocketPath(mountPoint)
-	socketDir := filepath.Dir(socketPath)
-	if err := os.MkdirAll(socketDir, 0o700); err != nil {
-		return nil, err
-	}
-	_ = os.Chmod(socketDir, 0o700)
-	_ = os.Remove(socketPath)
-	ln, err := net.Listen("unix", socketPath)
+	ln, lock, err := listenMountControl(socketPath)
 	if err != nil {
 		return nil, err
 	}
-	_ = os.Chmod(socketPath, 0o600)
 	s := &mountControlServer{
-		view: view, conns: make(map[net.Conn]context.CancelFunc),
+		view: view, lock: lock, conns: make(map[net.Conn]context.CancelFunc),
 		fs:         fs,
 		listener:   ln,
 		socketPath: socketPath,
@@ -99,6 +92,9 @@ func (s *mountControlServer) Close() {
 		s.handlers.Wait()
 		if s.socketPath != "" {
 			_ = os.Remove(s.socketPath)
+		}
+		if s.lock != nil {
+			_ = s.lock.Close()
 		}
 	})
 }
