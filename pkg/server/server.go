@@ -977,6 +977,11 @@ func (s *Server) startLeaderWorkers() {
 		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
 			s.resumeProvisioningTenantsWithCtx(workerCtx)
 		})
+		// One-time cleanup of the legacy cluster-wide SYSTEM_VARIABLES_ADMIN grant
+		// on already-active native tenants, whose per-tenant setup never runs again.
+		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
+			s.retireNativeTenantVariablesPrivilege(workerCtx)
+		})
 		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
 			defer close(forkStartupResumeDone)
 			s.resumeDeletingForkTenantsWithCtx(workerCtx)
@@ -1574,11 +1579,21 @@ func (s *Server) provisionRequiresAuthentication(r *http.Request, provider strin
 	return !requestIsLoopback(r)
 }
 
-// requestIsLoopback reports whether a request arrived over the loopback interface.
-// Forwarded headers are deliberately ignored: the caller controls them, and the
-// local provider's anonymous exception must not be relaxable by a header.
+// requestIsLoopback reports whether a request reached this process directly over the
+// loopback interface.
+//
+// A forwarding header means it did not: a reverse proxy, ingress or sidecar in front
+// of the server connects over loopback too, so the peer address alone would let a
+// remote caller through a proxied hop look local. The headers are not trusted for the
+// opposite reason as well — the caller controls them — so their presence is treated as
+// "not a direct loopback request" and the anonymous local exception is refused. An
+// operator who really wants anonymous provisioning through a proxy sets
+// DRIVE9_ALLOW_ANONYMOUS_PROVISION, which bypasses this check deliberately.
 func requestIsLoopback(r *http.Request) bool {
 	if r == nil {
+		return false
+	}
+	if requestLooksProxied(r) {
 		return false
 	}
 	remote := strings.TrimSpace(r.RemoteAddr)
@@ -1588,6 +1603,16 @@ func requestIsLoopback(r *http.Request) bool {
 	}
 	ip := net.ParseIP(strings.Trim(host, "[]"))
 	return ip != nil && ip.IsLoopback()
+}
+
+// requestLooksProxied reports whether any proxy-forwarding header is present.
+func requestLooksProxied(r *http.Request) bool {
+	for _, header := range [...]string{"Forwarded", "X-Forwarded-For", "X-Real-Ip", "X-Forwarded-Host", "X-Forwarded-Proto"} {
+		if strings.TrimSpace(r.Header.Get(header)) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func isLoopbackListenAddr(addr string) bool {

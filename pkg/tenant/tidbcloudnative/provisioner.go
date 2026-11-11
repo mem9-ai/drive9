@@ -1564,6 +1564,53 @@ func systemUserStatements(dbName, username, password string) []string {
 	}
 }
 
+// RetireLegacySystemUserPrivilege revokes the legacy cluster-wide
+// SYSTEM_VARIABLES_ADMIN grant from the tenant role through the cluster root
+// principal.
+//
+// Tenants finalized before this version granted the privilege and stored a DSN that
+// already names the restricted account, so the per-tenant setup never runs again for
+// them. The stored password is the cluster root password (both the legacy and the
+// current setup reuse cfg.Passwd), so it still authenticates as <prefix>.root, which
+// is the principal that can revoke the grant. A DSN that already names a root-format
+// user, or whose password no longer authenticates as root, is left alone.
+func RetireLegacySystemUserPrivilege(ctx context.Context, dsn string) error {
+	cfg, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		return fmt.Errorf("parse native tenant DSN: %w", err)
+	}
+	rootUser, ok := systemRootUserFor(cfg.User)
+	if !ok {
+		return nil
+	}
+	if strings.TrimSpace(cfg.Passwd) == "" {
+		return fmt.Errorf("native tenant DSN password is empty")
+	}
+	rootCfg := cfg.Clone()
+	rootCfg.User = rootUser
+	db, err := sql.Open("mysql", rootCfg.FormatDSN())
+	if err != nil {
+		return fmt.Errorf("open native tenant database as root: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+	stmt := fmt.Sprintf("REVOKE SYSTEM_VARIABLES_ADMIN ON *.* FROM %s", quoteString("tdc_fs_admin"))
+	if _, err := db.ExecContext(ctx, stmt); err != nil && !isMissingGrantError(err) {
+		return fmt.Errorf("revoke legacy system variables grant: %w", err)
+	}
+	return nil
+}
+
+// systemRootUserFor maps the restricted tenant account name back to the cluster root
+// principal that shares its password: <prefix>.tdc_fs_sys -> <prefix>.root.
+func systemRootUserFor(currentUsername string) (string, bool) {
+	currentUsername = strings.TrimSpace(currentUsername)
+	prefix, ok := strings.CutSuffix(currentUsername, ".tdc_fs_sys")
+	if !ok || prefix == "" {
+		return "", false
+	}
+	return prefix + ".root", true
+}
+
 func systemUsernameForCurrent(currentUsername string) (string, bool, error) {
 	currentUsername = strings.TrimSpace(currentUsername)
 	if currentUsername == "" {

@@ -3093,3 +3093,35 @@ func TestIsMissingGrantError(t *testing.T) {
 		t.Fatal("unrelated errors classified as a missing grant")
 	}
 }
+
+// Retiring the legacy privilege needs the cluster root principal, which shares the
+// stored password with the restricted tenant account.
+func TestSystemRootUserFor(t *testing.T) {
+	cases := map[string]string{
+		"22ipQWBXXq2wN2S.tdc_fs_sys": "22ipQWBXXq2wN2S.root",
+		"prefix.tdc_fs_sys":          "prefix.root",
+	}
+	for in, want := range cases {
+		got, ok := systemRootUserFor(in)
+		if !ok || got != want {
+			t.Fatalf("systemRootUserFor(%q) = %q ok=%t, want %q", in, got, ok, want)
+		}
+	}
+	for _, in := range []string{"", "root", "u1.admin", "u1.root", ".tdc_fs_sys"} {
+		if _, ok := systemRootUserFor(in); ok {
+			t.Fatalf("systemRootUserFor(%q) mapped a non-tenant account", in)
+		}
+	}
+}
+
+// Retiring the legacy privilege is a no-op for a DSN that already names the root
+// principal (nothing to remediate) and refuses a DSN without a password instead of
+// dialling with an empty one.
+func TestRetireLegacySystemUserPrivilegeDSNHandling(t *testing.T) {
+	if err := RetireLegacySystemUserPrivilege(t.Context(), "22ipQWBXXq2wN2S.root@tcp(127.0.0.1:1)/db"); err != nil {
+		t.Fatalf("root-principal DSN: %v", err)
+	}
+	if err := RetireLegacySystemUserPrivilege(t.Context(), "22ipQWBXXq2wN2S.tdc_fs_sys@tcp(127.0.0.1:1)/db"); err == nil {
+		t.Fatal("a DSN without a password was accepted")
+	}
+}

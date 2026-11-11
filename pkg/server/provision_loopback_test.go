@@ -67,3 +67,25 @@ func TestRequestIsLoopback(t *testing.T) {
 		t.Fatal("nil request must not be loopback")
 	}
 }
+
+// A proxy in front of the server connects over loopback too, so the peer address
+// alone would let a remote caller through: any forwarding header means the request
+// did not arrive directly and loses the anonymous local exception.
+func TestRequestIsLoopbackRefusesProxiedRequests(t *testing.T) {
+	for _, header := range []string{"Forwarded", "X-Forwarded-For", "X-Real-Ip", "X-Forwarded-Host", "X-Forwarded-Proto"} {
+		req := &http.Request{
+			RemoteAddr: "127.0.0.1:5555",
+			Header:     http.Header{header: []string{"example"}},
+		}
+		if requestIsLoopback(req) {
+			t.Fatalf("%s: a proxied request was treated as a direct loopback request", header)
+		}
+		if !(&Server{}).provisionRequiresAuthentication(req, tenant.ProviderLocal) {
+			t.Fatalf("%s: anonymous local provisioning allowed through a proxy hop", header)
+		}
+	}
+	// A direct loopback request with an empty header value still counts as direct.
+	if !requestIsLoopback(&http.Request{RemoteAddr: "127.0.0.1:5555", Header: http.Header{"X-Forwarded-For": []string{" "}}}) {
+		t.Fatal("an empty forwarding header does not make the request proxied")
+	}
+}
