@@ -43,6 +43,8 @@ type Extent struct {
 	// policy mirrors Options.Policy (write-sync pays per-Write flushes).
 	policy string
 
+	extentStopMu   sync.Mutex
+	extentStopErr  error
 	extentMu       sync.Mutex
 	extentBuild    extentBuildState
 	extentTornDown bool
@@ -629,6 +631,5 @@ func (e *Extent) Start(ctx context.Context) error { return nil }
 func (e *Extent) Drain(ctx context.Context) error { return nil }
 
 func (e *Extent) Stop(ctx context.Context) error {
-	e.closeRuntime()
-	return nil
+	return e.closeRuntime(ctx)
 }
