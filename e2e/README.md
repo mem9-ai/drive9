@@ -66,20 +66,25 @@ and deletes main files, and verifies fixed inline data plus a range crossing the
 64 MiB chunk boundary. It checks private hardlinks/deletions, independent child
 inheritance, directory listing, operation replay without repeated launch,
 sealed-write rejection, readonly validation, and child reads after parent
-Layer deletion. This suite covers the HTTP isolation contract; mount switching,
-transaction publication, quota integration and GC reclamation need separate
-coverage. The paired `tidbcloud/fs` Local E2E workflow checks out a pinned
-client commit and invokes `e2e/fixed-view-ci.sh` against the server under test.
-This entry uses `--provision-local` to provision exactly one tenant on the
-explicit loopback endpoint; it rejects an existing API key and a remote host.
+Layer deletion. The HTTP suite covers isolation; the paired CI entry also builds
+the matching CLI and runs `fixed-view-mount-smoke.py` on Linux with `/dev/fuse` required.
+That probe creates and claims a Layer through the CLI, mounts main, switches
+into the fixed Layer and back to main, and checks current versus captured
+bytes. It verifies the same foreground process and kernel mount survive,
+and queries/replays each original switch request without another generation
+advance. The mount is read-only; writable FUSE, transaction publication,
+quota integration and GC reclamation still need separate coverage. The paired
+`tidbcloud/fs` Local E2E workflow checks out a pinned client commit and invokes `e2e/fixed-view-ci.sh` against the server under test.
+The HTTP and mount probes each provision exactly one tenant on the
+explicit loopback endpoint; both reject an existing API key and a remote host.
 The CI harness owns teardown of the local server and test databases. An
 uncertain provision response is not retried. Tenant readiness polling is
 bounded and verifies the authenticated status identity against provisioning.
 
 The client repository's historical server does not implement v10 routes.
 Its legacy Layer smoke is not evidence for fixed-view isolation; it still needs
-replacement with the complete paired CLI/FUSE acceptance suite. HTTP isolation
-CI is additional coverage and does not waive that remaining work.
+replacement with the complete paired CLI/FUSE acceptance suite. These paired
+CI probes are additional coverage and does not waive that remaining work.
 
 ## CI automation tiers
 
@@ -90,7 +95,7 @@ without adding it to `.github/workflows/local-e2e.yml`.
 | Tier | Trigger | What runs |
 |------|---------|-----------|
 | PR gate | `pull_request` to `main` (local-e2e) | api, cli, object-store, layer-fs, fuse-release-gate (smoke + correctness + sqlite rollback + node fs), fuse-patch-storage-class, git-ops, git-workspace-ondemand, portable pack/unpack, fuse-crash-recovery, fuse-supervision, fuse-write-perf-budget |
-| Paired server PR gate | `tidbcloud/fs` Local E2E | `fixed-view-ci.sh` / `fixed-view-smoke.py` against the server PR and a pinned client commit; existing baseline E2E remains enabled |
+| Paired server PR gate | `tidbcloud/fs` Local E2E | `fixed-view-ci.sh`: HTTP isolation plus new CLI/FUSE read/switch against the server PR and a pinned client commit; existing baseline E2E remains enabled |
 | Post-merge | `push` to `main` (local-e2e, coalesced via concurrency group) | PR gate + concurrency stress, POSIX/fsx, sqlite WAL/churn/concurrency, sqlite 1000-commit WAL FULL sequence, `smoke-all.sh` extras (journal, posix-permission, git-workspace), git feature smoke |
 | Nightly | cron 20:17 UTC (local-e2e) | Post-merge set + FUSE performance baseline/archive/compare (compare is report-only; hosted-runner noise) |
 | Manual all | Local E2E `workflow_dispatch` with `run_all_e2e=1` | Everything above |

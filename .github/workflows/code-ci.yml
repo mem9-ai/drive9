@@ -15,6 +15,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Test fixed-view E2E drivers without services
+        run: python3 -m unittest discover -s e2e -p 'test_fixed_view*_smoke.py'
+
       - name: Test hosted config smoke guards
         run: bash scripts/test-hosted-config-smoke-guards.sh
 
