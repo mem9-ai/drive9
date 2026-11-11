@@ -105,7 +105,7 @@ From the repository root (explicit files avoid unrelated package dependencies):
 ```bash
 DRIVE9_RUN_FUSE_KERNEL_TEST=1 go test -race -v -count=1 -timeout=30s \
   pkg/fuse/view_root.go pkg/fuse/view_root_linux.go \
-  pkg/fuse/view_admission.go pkg/fuse/view_requests.go \
+  pkg/fuse/view_admission.go pkg/fuse/view_requests.go pkg/fuse/view_dispatch.go \
   pkg/fuse/view_root_kernel_linux_test.go
 ```
 
