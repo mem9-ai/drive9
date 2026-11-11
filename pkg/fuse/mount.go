@@ -37,6 +37,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/fusecomp/staging"
 	"github.com/mem9-ai/drive9/pkg/mountpath"
 	"github.com/mem9-ai/drive9/pkg/mountstate"
+	"github.com/mem9-ai/drive9/pkg/viewprotocol"
 	"github.com/pingcap/failpoint"
 )
 
@@ -926,12 +927,14 @@ func mountWithConfig(cfg MountConfig) error {
 // chain/caches. The kernel mount and its control socket have a separate lifetime.
 // Construction does not start the chain; the caller starts it before serving.
 type mountRuntime struct {
-	fs        *FS
-	writeback *writeback.Writeback
-	staging   *staging.Staging
-	layerRef  string
-	syncMode  string
-	policy    writeback.Policy
+	binding    viewprotocol.Binding
+	generation mountRuntimeGeneration
+	fs         *FS
+	writeback  *writeback.Writeback
+	staging    *staging.Staging
+	layerRef   string
+	syncMode   string
+	policy     writeback.Policy
 }
 
 func (r *mountRuntime) closeStaging() {
@@ -1410,7 +1413,7 @@ func buildMountRuntimeGeneration(cfg MountConfig, cl *client.Client, remoteRoot,
 		}
 	}
 
-	return &mountRuntime{fs: f, writeback: wb, staging: stagingLedger, layerRef: cfg.LayerRef, syncMode: syncMode, policy: policy}, nil
+	return &mountRuntime{binding: cl.ViewBinding(), generation: generation, fs: f, writeback: wb, staging: stagingLedger, layerRef: cfg.LayerRef, syncMode: syncMode, policy: policy}, nil
 }
 
 // classifyServeExit classifies a serve-loop exit by the KERNEL mount row
