@@ -24,11 +24,11 @@ func TestFixedLayerCLIControlRoutes(t *testing.T) {
 		{[]string{"list", "--after", "a", "--limit", "2"}, "GET", "/v1/views?after=a&limit=2", `{"layers":[{"layer_id":"b"}],"next_after":"b"}`, nil},
 		{[]string{"status", "a"}, "GET", "/v1/views/a", `{"layer_id":"a","phase":"OPEN"}`, nil},
 		{[]string{"work", "--operation", "work", "--ttl", "30m", "a"}, "POST", "/v1/views/a/work", work, map[string]any{"operation_id": "work", "ttl_ms": float64(1800000), "validation": false}},
-		{[]string{"renew", "--work", "w", "--fence", "3", "--ttl", "1m", "a"}, "POST", "/v1/views/a/renew", `{"layer_id":"a","work_id":"w","fence":3}`, nil},
+		{[]string{"renew", "--work", "w", "--fence", "3", "--ttl", "1m", "a"}, "POST", "/v1/views/a/renew", `{"layer_id":"a","work_id":"w","fence":3,"lease_until":"2026-11-10T12:01:00Z"}`, nil},
 		{[]string{"seal", "--operation", "seal", "--work", "w", "--fence", "3", "a"}, "POST", "/v1/views/a/seal", `{"state":"DONE","layer":{"layer_id":"a","phase":"READY"}}`, nil},
 		{[]string{"cancel", "--operation", "cancel", "a"}, "POST", "/v1/views/a/cancel", `{"state":"DONE","layer":{"layer_id":"a","phase":"ABORTED"}}`, map[string]any{"operation_id": "cancel"}},
 		{[]string{"delete", "--operation", "delete", "a"}, "DELETE", "/v1/views/a", `{"state":"DONE","layer":{"layer_id":"a","phase":"DELETED"}}`, map[string]any{"operation_id": "delete"}},
-		{[]string{"operation", "a", "original"}, "GET", "/v1/views/a/operations/original", `{"operation_id":"original","layer_id":"a","state":"DONE"}`, nil},
+		{[]string{"operation", "a", "original"}, "GET", "/v1/views/a/operations/original", `{"operation_id":"original","layer_id":"a","kind":"seal","state":"DONE"}`, nil},
 	}
 	for _, tc := range cases {
 		t.Run(tc.args[0], func(t *testing.T) {
@@ -60,6 +60,12 @@ func TestFixedLayerCLIControlRoutes(t *testing.T) {
 			}
 			if tc.args[0] == "list" && value["next_after"] != "b" {
 				t.Fatal("pagination cursor lost", out)
+			}
+			if tc.args[0] == "renew" && (value["work_id"] != "w" || value["fence"] != float64(3) || value["lease_until"] != "2026-11-10T12:01:00Z") {
+				t.Fatal("renewed work identity or deadline lost", out)
+			}
+			if tc.args[0] == "operation" && (value["operation_id"] != "original" || value["kind"] != "seal" || value["state"] != "DONE") {
+				t.Fatal("operation receipt lost", out)
 			}
 		})
 	}
@@ -115,6 +121,38 @@ func TestFixedLayerCLIPreservesFailureReceiptAndUnknownIdentity(t *testing.T) {
 				var op *client.ViewOperationError
 				if !errors.As(err, &op) || op.OperationID != "original" || op.LayerID != "a" || out != "" {
 					t.Fatal(out, err)
+				}
+			}
+		})
+	}
+}
+
+func TestFixedLayerCLIRejectsIncompleteControlReceipts(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		args     []string
+		response string
+	}{
+		{"renew without deadline", []string{"renew", "--work", "w", "--fence", "3", "--ttl", "1m", "a"}, `{"layer_id":"a","work_id":"w","fence":3}`},
+		{"operation without kind", []string{"operation", "a", "original"}, `{"operation_id":"original","layer_id":"a","state":"DONE"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				_, _ = w.Write([]byte(tc.response))
+			}))
+			defer srv.Close()
+			out, err := captureStdoutE(t, func() error {
+				return Layer(client.New(srv.URL, "test-token"), tc.args)
+			})
+			if err == nil || out != "" || calls.Load() != 1 {
+				t.Fatalf("incomplete receipt printed or retried: output=%q error=%v calls=%d", out, err, calls.Load())
+			}
+			if tc.args[0] == "operation" {
+				var identified *client.ViewOperationError
+				if !errors.As(err, &identified) || identified.LayerID != "a" || identified.OperationID != "original" {
+					t.Fatalf("original operation identity lost: %v", err)
 				}
 			}
 		})
