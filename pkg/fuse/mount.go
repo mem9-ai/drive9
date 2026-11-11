@@ -700,7 +700,7 @@ func mountWithConfig(cfg MountConfig) error {
 	if err != nil {
 		return err
 	}
-	defer runtime.closeStaging()
+	defer func() { _ = runtime.stop(context.Background()) }()
 	f, wb := runtime.fs, runtime.writeback
 	cfg.LayerRef = runtime.layerRef
 	syncMode, policy := runtime.syncMode, runtime.policy
@@ -941,6 +941,20 @@ func (r *mountRuntime) closeStaging() {
 	if r.staging != nil {
 		r.staging.Close()
 	}
+}
+
+// stop retains staging until every old publisher and detached notification has
+// finished. Call only after foreground callbacks are drained or before serving.
+// Failure retains ownership; the caller must retry this runtime before reuse.
+func (r *mountRuntime) stop(ctx context.Context) error {
+	if err := r.fs.chain.Stop(ctx); err != nil {
+		return err
+	}
+	if err := r.fs.notifications.wait(ctx); err != nil {
+		return err
+	}
+	r.closeStaging()
+	return nil
 }
 
 func buildMountRuntime(cfg MountConfig, cl *client.Client, remoteRoot, actorID string) (*mountRuntime, error) {

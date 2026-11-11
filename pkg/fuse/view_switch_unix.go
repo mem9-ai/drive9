@@ -17,7 +17,7 @@ import (
 // mountViewSwitch coordinates one live mount. Construction and kernel ownership
 // remain with the mount entry: notifier/fence must name that same connection,
 // validate must check the server-issued target qualification, and build must
-// return a started runtime bound to that connection and exact generation.
+// return an unstarted runtime bound to that connection and exact generation.
 // A failed build must clean up its partial runtime. No callback may run work.
 // This coordinator does not reopen journals or transparently recover a dead
 // FUSE connection. A reopened pending journal requires explicit mount recovery.
@@ -146,13 +146,9 @@ func (s *mountViewSwitch) finish(ctx context.Context, resp mountcontrol.SwitchRe
 	if !p.oldStopped {
 		// No new ordinary callback can construct a runtime or enqueue a write.
 		// Stop must report actual completion, not just request cancellation.
-		if err := s.current.fs.chain.Stop(ctx); err != nil {
+		if err := s.current.stop(ctx); err != nil {
 			return fail(fmt.Errorf("stop old mount view: %w", err))
 		}
-		if err := s.current.fs.notifications.wait(ctx); err != nil {
-			return fail(err)
-		}
-		s.current.closeStaging()
 		p.oldStopped = true
 	}
 	if p.target == nil {
@@ -169,6 +165,18 @@ func (s *mountViewSwitch) finish(ctx context.Context, resp mountcontrol.SwitchRe
 		}
 		p.target = target
 	}
+	// Start is attempted exactly once for each constructed runtime. If it
+	// fails, keep the failed runtime until its real cleanup completes. Only
+	// then can a retry build a replacement in this decided generation.
+	p.target.fs.Init2(ctx)
+	if startErr := p.target.fs.StartErr(); startErr != nil {
+		if stopErr := p.target.stop(ctx); stopErr != nil {
+			return fail(errors.Join(startErr, stopErr))
+		}
+		p.target = nil
+		return fail(startErr)
+	}
+
 	if p.installation == nil {
 		installation, err := newViewInstallation(s.journal, s.adapter, p.pause, p.target.fs, p.plan, s.notifier, s.fence)
 		if err != nil {

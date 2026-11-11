@@ -11,10 +11,13 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 
+	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/fs"
+	"github.com/mem9-ai/drive9/pkg/fusecomp/staging"
 	"github.com/mem9-ai/drive9/pkg/mountcontrol"
 	"github.com/mem9-ai/drive9/pkg/mountstate"
 	"github.com/mem9-ai/drive9/pkg/viewprotocol"
@@ -53,7 +56,6 @@ func viewSwitchFixture(t *testing.T) (*mountViewSwitch, *viewCacheProbe, mountco
 	s.build = func(ctx context.Context, b viewprotocol.Binding, g mountRuntimeGeneration) (*mountRuntime, error) {
 		events = append(events, "build")
 		f := newXattrFS(t)
-		f.Init2(ctx)
 		return &mountRuntime{fs: f, binding: b, generation: g}, f.StartErr()
 	}
 	req := mountcontrol.SwitchRequest{MountID: "mount-1", OperationID: "switch-a", ExpectedGeneration: 1, Target: viewprotocol.Binding{LayerID: "a", WorkID: "work-a", Fence: 1}}
@@ -283,5 +285,83 @@ func TestViewSwitchConcurrentSameIDIsNotDefiniteRefusal(t *testing.T) {
 	close(release)
 	if got := <-done; got.ErrorKind != "TARGET_UNAVAILABLE" {
 		t.Fatal(got)
+	}
+}
+
+type viewSwitchStartFailure struct {
+	starts, stops int
+	stopErr       error
+}
+
+func (p *viewSwitchStartFailure) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error) {
+	return next(ctx, op)
+}
+func (p *viewSwitchStartFailure) Start(context.Context) error {
+	p.starts++
+	return errors.New("start failed")
+}
+func (p *viewSwitchStartFailure) Drain(context.Context) error { return nil }
+func (p *viewSwitchStartFailure) Stop(context.Context) error  { p.stops++; return p.stopErr }
+
+func TestViewSwitchRetainsFailedStartUntilCleanupThenRebuilds(t *testing.T) {
+	s, _, req, _ := viewSwitchFixture(t)
+	original := s.build
+	failed := &viewSwitchStartFailure{stopErr: errors.New("cleanup incomplete")}
+	builds := 0
+	var rejected *mountRuntime
+	s.build = func(ctx context.Context, b viewprotocol.Binding, g mountRuntimeGeneration) (*mountRuntime, error) {
+		builds++
+		if builds > 1 {
+			return original(ctx, b, g)
+		}
+		// Use the actual constructor, including cache, writeback queue and lazy
+		// journal worker; append one failing startup handler at the chain edge.
+		cfg := MountConfig{Server: "http://example.invalid", MountPoint: t.TempDir(), CacheDir: t.TempDir(), Extensions: []string{"core", "writeback", "cache"}, WritePolicy: "writeback", SyncMode: "strict", WritebackLazyStaging: true, WritebackSyncWindow: time.Hour}
+		cl, err := client.New(cfg.Server, "").WithView(b)
+		if err != nil {
+			return nil, err
+		}
+		rt, err := buildMountRuntimeGeneration(cfg, cl, "/", "actor", g)
+		if err != nil {
+			return nil, err
+		}
+		rt.fs.chain, err = fs.NewChain(append([]fs.Handler{failed}, rt.fs.chain.Handlers()...)...)
+		rejected = rt
+		return rt, err
+	}
+	t.Cleanup(func() {
+		if rejected != nil {
+			failed.stopErr = nil
+			_ = rejected.stop(context.Background())
+		}
+	})
+	if got := s.apply(t.Context(), req); got.ErrorKind != "RECOVERING" || got.Receipt == nil {
+		t.Fatalf("failed start: %+v", got)
+	}
+	if builds != 1 || failed.starts != 1 || failed.stops != 1 || s.pending.target != rejected {
+		t.Fatal("lost failed runtime")
+	}
+	if s.adapter.currentTarget().generation != 1 {
+		t.Fatal("installed partially started target")
+	}
+	entry := staging.JournalEntry{Op: staging.JournalCommit, Path: "/owner-retained"}
+	if err := rejected.staging.Journal.Append(entry); err != nil {
+		t.Fatal("closed resources while cleanup incomplete", err)
+	}
+	failed.stopErr = nil
+	if got := s.apply(t.Context(), req); got.ErrorKind != "RECOVERING" || s.pending.target != nil {
+		t.Fatalf("cleanup retry: %+v", got)
+	}
+	if builds != 1 || failed.starts != 1 || failed.stops != 2 {
+		t.Fatal("restarted failed target before cleanup")
+	}
+	if err := rejected.staging.Journal.Append(entry); err == nil {
+		t.Fatal("successful cleanup left journal open")
+	}
+	if got := s.apply(t.Context(), req); got.Error != "" || got.Receipt.State != mountstate.SwitchDone {
+		t.Fatalf("rebuild: %+v", got)
+	}
+	if builds != 2 {
+		t.Fatalf("build attempts=%d", builds)
 	}
 }
