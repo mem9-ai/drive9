@@ -6,6 +6,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
 import unittest
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("fixed_view_smoke", Path(__file__).with_name("fixed-view-smoke.py"))
 smoke = importlib.util.module_from_spec(spec)
@@ -38,6 +39,66 @@ class SmokeDriverTest(unittest.TestCase):
 
         self.addCleanup(close)
         return smoke.Probe(f"http://127.0.0.1:{server.server_port}", "unit-test-placeholder")
+
+    def test_local_provision_uses_one_request_and_authenticated_status(self):
+        requests = []
+
+        def respond(handler):
+            requests.append((handler.command, handler.path, handler.headers.get("Authorization")))
+            if handler.command == "POST":
+                payload = {"tenant_id": "test-tenant", "api_key": "unit-test-placeholder"}
+            else:
+                payload = {"tenant_id": "test-tenant", "status": "active" if len(requests) == 3 else "provisioning"}
+            raw = json.dumps(payload).encode()
+            handler.send_response(202 if handler.command == "POST" else 200)
+            handler.send_header("Content-Length", str(len(raw)))
+            handler.end_headers()
+            handler.wfile.write(raw)
+
+        probe = self.start(respond)
+        probe.key = ""
+        with patch.object(smoke.time, "sleep"):
+            probe.provision_local()
+        self.assertEqual(requests, [("POST", "/v1/provision", None),
+                                    ("GET", "/v1/status", "Bearer unit-test-placeholder"),
+                                    ("GET", "/v1/status", "Bearer unit-test-placeholder")])
+
+    def test_local_provision_rejects_unsafe_inputs_and_readiness_failures(self):
+        for base, key in (("https://remote.example", ""), ("http://localhost:9009", "existing")):
+            with self.subTest(base=base, key=key):
+                probe = smoke.Probe(base, key)
+                with patch.object(probe, "api") as api, self.assertRaises(smoke.ProbeFailure):
+                    probe.provision_local()
+                api.assert_not_called()
+        for result in ({"tenant_id": "t"}, {"api_key": "unit-test-placeholder"},
+                       {"tenant_id": "t", "api_key": "bad\nkey"}):
+            probe = smoke.Probe("http://localhost:9009", "")
+            with patch.object(probe, "api", return_value=result) as api, self.assertRaises(smoke.ProbeFailure):
+                probe.provision_local()
+            self.assertEqual(api.call_count, 1)
+        for status in ({"tenant_id": "other", "status": "active"},
+                       {"tenant_id": "t", "status": "failed"}):
+            probe = smoke.Probe("http://localhost:9009", "")
+            with patch.object(probe, "api", side_effect=[{"tenant_id": "t", "api_key": "unit-test-placeholder"}, status]) as api:
+                with self.assertRaises(smoke.ProbeFailure):
+                    probe.provision_local()
+                self.assertEqual(api.call_count, 2)
+        probe = smoke.Probe("http://localhost:9009", "")
+        with patch.object(probe, "api", side_effect=smoke.ProbeFailure("uncertain provision")) as api:
+            with self.assertRaises(smoke.ProbeFailure):
+                probe.provision_local()
+            self.assertEqual(api.call_count, 1)
+
+    def test_local_provision_rejects_readiness_after_deadline(self):
+        probe = smoke.Probe("http://localhost:9009", "")
+        responses = [{"tenant_id": "t", "api_key": "unit-test-placeholder"},
+                     {"tenant_id": "t", "status": "active"}]
+        with patch.object(probe, "api", side_effect=responses) as api:
+            with patch.object(smoke.time, "monotonic", side_effect=[0, 1, 3]):
+                with self.assertRaisesRegex(smoke.ProbeFailure, "timed out"):
+                    probe.provision_local(timeout=2)
+        self.assertEqual(api.call_count, 2)
+        self.assertEqual(api.call_args.kwargs["timeout"], 1)
 
     def test_mutation_query_and_receipt_keep_original_identity(self):
         requests = []

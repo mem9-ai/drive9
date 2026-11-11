@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -42,7 +43,7 @@ class Probe:
         return f"{self.prefix}-{self.op_number}"
 
     def request(self, method, path, *, data=None, value=None, work=None,
-                headers=None, statuses=(200,), limit=4 << 20, object_url=False):
+                headers=None, statuses=(200,), limit=4 << 20, object_url=False, timeout=120):
         url = urllib.parse.urljoin(self.base + "/", path) if object_url else self.base + path
         supplied = dict(headers or {})
         if object_url:
@@ -52,7 +53,7 @@ class Probe:
             forbidden = {"authorization", "x-api-key", "x-dat9-actor"}
             require(not any(k.lower() in forbidden or k.lower().startswith("x-drive9-")
                             for k in supplied), "object grant included filesystem credentials")
-        else:
+        elif self.key:
             supplied["Authorization"] = "Bearer " + self.key
         if work is not None:
             supplied.update({"X-Drive9-View": work["layer_id"],
@@ -65,7 +66,7 @@ class Probe:
             supplied["Content-Type"] = "application/json"
         req = urllib.request.Request(url, data=data, headers=supplied, method=method)
         try:
-            response = urllib.request.build_opener(NoRedirect()).open(req, timeout=120)
+            response = urllib.request.build_opener(NoRedirect()).open(req, timeout=timeout)
         except urllib.error.HTTPError as error:
             response = error
         except Exception as error:
@@ -85,6 +86,29 @@ class Probe:
     def api(self, method, path, **kwargs):
         raw, _ = self.request(method, path, **kwargs)
         return json.loads(raw) if raw else None
+
+    def provision_local(self, timeout=120):
+        parsed = urllib.parse.urlsplit(self.base)
+        require(parsed.hostname in ("127.0.0.1", "::1", "localhost") and not self.key,
+                "local provisioning requires a loopback server and no existing API key")
+        require(timeout > 0, "provision timeout must be positive")
+        deadline = time.monotonic() + timeout
+        # Provision exactly once. An uncertain response never creates a second tenant.
+        result = self.api("POST", "/v1/provision", statuses=(202,), timeout=timeout)
+        tenant, key = result.get("tenant_id"), result.get("api_key")
+        require(isinstance(tenant, str) and tenant and isinstance(key, str) and key
+                and not any(c.isspace() for c in key), "provision omitted tenant identity or API key")
+        self.key = key
+        while True:
+            remaining = deadline - time.monotonic()
+            require(remaining > 0, "local tenant readiness timed out")
+            status = self.api("GET", "/v1/status", timeout=remaining)
+            require(status.get("tenant_id") == tenant, "status tenant identity differs from provision")
+            require(time.monotonic() < deadline, "local tenant readiness timed out")
+            if status.get("status") == "active":
+                return
+            require(status.get("status") == "provisioning", "local tenant did not become active")
+            time.sleep(min(1, max(0, deadline - time.monotonic())))
 
     def fs(self, path, work=None):
         prefix = "/v1/views/" + work["layer_id"] if work else ""
@@ -262,13 +286,17 @@ class Probe:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.parse_args()
+    parser.add_argument("--provision-local", action="store_true",
+                        help="create one test tenant on an explicitly configured loopback server")
+    args = parser.parse_args()
     base, key = os.environ.get("DRIVE9_BASE", ""), os.environ.get("DRIVE9_API_KEY", "")
-    require(base and key, "set DRIVE9_BASE and DRIVE9_API_KEY for an authorized test tenant")
+    require(base and (key or args.provision_local), "set DRIVE9_BASE and DRIVE9_API_KEY for an authorized test tenant")
     parsed = urllib.parse.urlsplit(base)
     require(parsed.scheme in ("http", "https") and parsed.netloc and not parsed.username
             and not parsed.query and not parsed.fragment, "invalid DRIVE9_BASE")
     probe = Probe(base, key)
+    if args.provision_local:
+        probe.provision_local()
     print("Fixture:", probe.root, "(requires a v10 server; does not start services)")
     try:
         probe.run()
