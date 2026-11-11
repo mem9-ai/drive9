@@ -3,12 +3,20 @@
 package mountstate
 
 import (
+	"bufio"
+	"context"
+	"fmt"
+	"os/exec"
+	"time"
+
 	"errors"
 	"io"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/mem9-ai/drive9/pkg/viewprotocol"
 )
@@ -361,5 +369,94 @@ func TestSwitchJournalCreateAndRecoveryNeverReplaceMissingFacts(t *testing.T) {
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("recovery created file: %v", err)
+	}
+}
+
+func TestSwitchJournalProcessHelper(t *testing.T) {
+	path := os.Getenv("DRIVE9_SWITCH_JOURNAL_TEST_PATH")
+	if path == "" {
+		t.Skip("subprocess helper")
+	}
+	mode := os.Getenv("DRIVE9_SWITCH_JOURNAL_TEST_MODE")
+	j, err := OpenSwitchJournal(path, "mount-1", viewprotocol.Binding{})
+	if mode == "locked" {
+		if j != nil {
+			_ = j.Close()
+			t.Fatal("acquired another process lock")
+		}
+		if !errors.Is(err, unix.EWOULDBLOCK) {
+			t.Fatalf("expected lock conflict, got %v", err)
+		}
+		return
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = j.Close() }()
+	if mode == "hold" {
+		if _, err := j.Decide("child-op", 1, switchTarget("child-layer")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fmt.Fprintln(os.Stdout, "locked"); err != nil {
+			t.Fatal(err)
+		}
+		var b [1]byte
+		_, _ = os.Stdin.Read(b[:])
+		return
+	}
+	s, err := j.Snapshot()
+	if err != nil || s.Generation != 2 || s.Binding != switchTarget("child-layer") || s.Pending == nil {
+		t.Fatalf("child recovery: %+v %v", s, err)
+	}
+}
+
+func switchJournalChild(ctx context.Context, path, mode string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestSwitchJournalProcessHelper$")
+	cmd.Env = append(os.Environ(), "DRIVE9_SWITCH_JOURNAL_TEST_PATH="+path, "DRIVE9_SWITCH_JOURNAL_TEST_MODE="+mode)
+	return cmd
+}
+
+func TestSwitchJournalProcessLockAndCrashRecovery(t *testing.T) {
+	j, path := switchTestJournal(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if out, err := switchJournalChild(ctx, path, "locked").CombinedOutput(); err != nil {
+		t.Fatalf("competing child: %v %s", err, out)
+	}
+	if err := j.Close(); err != nil {
+		t.Fatal(err)
+	}
+	holder := switchJournalChild(ctx, path, "hold")
+	stdout, err := holder.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdin, err := holder.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = stdin.Close() }()
+	if err := holder.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = holder.Process.Kill(); _ = holder.Wait() }()
+	line, err := bufio.NewReader(stdout).ReadString('\n')
+	if err != nil || line != "locked\n" {
+		t.Fatalf("holder readiness: %q %v", line, err)
+	}
+	if other, err := OpenSwitchJournal(path, "mount-1", viewprotocol.Binding{}); !errors.Is(err, unix.EWOULDBLOCK) {
+		if other != nil {
+			_ = other.Close()
+		}
+		t.Fatalf("parent bypassed child lock: %v", err)
+	}
+	if err := holder.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	if err := holder.Wait(); err == nil {
+		t.Fatal("holder did not terminate abnormally")
+	}
+	if out, err := switchJournalChild(ctx, path, "recover").CombinedOutput(); err != nil {
+		t.Fatalf("recovery child: %v %s", err, out)
 	}
 }
