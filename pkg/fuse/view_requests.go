@@ -7,7 +7,10 @@ import (
 // viewRequestFS gates complete foreground callbacks, including local handle
 // and cache publication, rather than only their remote requests. Cleanup notifications are admitted even while paused, but their side effects
 // are counted until they return. Lifecycle notifications always pass through. This adapter
-// alone is NOT a kernel reply/cache barrier or a view identity router.
+// alone is NOT a kernel reply/cache barrier or a view identity router. Root
+// attributes and negative lookups carry zero TTL even before a switch starts.
+// This prevents their delayed replies from extending cache lifetime; it does
+// not prove that all kernel post-processing or permission checks have finished.
 //
 // Deliberately do not embed RawFileSystem: adding a kernel callback must force
 // an explicit decision here about ordinary admission versus cleanup.
@@ -32,7 +35,17 @@ func (v *viewRequestFS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, 
 		return gofuse.EAGAIN
 	}
 	defer leave()
-	return v.inner.Lookup(cancel, header, name, out)
+	status = v.inner.Lookup(cancel, header, name, out)
+	if status == gofuse.OK && out.NodeId == 0 {
+		// A negative reply can reach the kernel after this callback returns.
+		// It has no inode lookup reference to make the switch preflight BUSY.
+		out.SetEntryTimeout(0)
+		out.SetAttrTimeout(0)
+	}
+	if status == gofuse.OK && out.NodeId == gofuse.FUSE_ROOT_ID {
+		out.SetAttrTimeout(0)
+	}
+	return status
 }
 
 func (v *viewRequestFS) Forget(nodeid, nlookup uint64) {
@@ -47,7 +60,13 @@ func (v *viewRequestFS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn,
 		return gofuse.EAGAIN
 	}
 	defer leave()
-	return v.inner.GetAttr(cancel, input, out)
+	code = v.inner.GetAttr(cancel, input, out)
+	if code == gofuse.OK && input.NodeId == gofuse.FUSE_ROOT_ID {
+		// The root is the only inode reused across selected views. Do not
+		// let a delayed response extend its cached attribute lifetime.
+		out.SetTimeout(0)
+	}
+	return code
 }
 
 func (v *viewRequestFS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *gofuse.AttrOut) (code gofuse.Status) {
@@ -56,7 +75,13 @@ func (v *viewRequestFS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn,
 		return gofuse.EAGAIN
 	}
 	defer leave()
-	return v.inner.SetAttr(cancel, input, out)
+	code = v.inner.SetAttr(cancel, input, out)
+	if code == gofuse.OK && input.NodeId == gofuse.FUSE_ROOT_ID {
+		// The root is the only inode reused across selected views. Do not
+		// let a delayed response extend its cached attribute lifetime.
+		out.SetTimeout(0)
+	}
+	return code
 }
 
 func (v *viewRequestFS) Mknod(cancel <-chan struct{}, input *gofuse.MknodIn, name string, out *gofuse.EntryOut) (code gofuse.Status) {
@@ -365,7 +390,13 @@ func (v *viewRequestFS) Statx(cancel <-chan struct{}, input *gofuse.StatxIn, out
 		return gofuse.EAGAIN
 	}
 	defer leave()
-	return v.inner.Statx(cancel, input, out)
+	code = v.inner.Statx(cancel, input, out)
+	if code == gofuse.OK && input.NodeId == gofuse.FUSE_ROOT_ID {
+		// The root is the only inode reused across selected views. Do not
+		// let a delayed response extend its cached attribute lifetime.
+		out.SetTimeout(0)
+	}
+	return code
 }
 
 func (v *viewRequestFS) Init(server *gofuse.Server) {
