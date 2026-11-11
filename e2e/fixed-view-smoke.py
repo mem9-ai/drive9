@@ -106,6 +106,41 @@ class Probe:
         require(replay["launch"] is False and replay["work"] == claim["work"], "work replay relaunched")
         return claim["work"]
 
+    def seal_and_validate(self, work):
+        layer = work["layer_id"]
+        seal_request = {"operation_id": self.op(), "work": work}
+        route = f"/v1/views/{layer}"
+        sealed = self.api("POST", route + "/seal", value=seal_request)
+        state = sealed.get("layer", {})
+        require(sealed.get("state") == "DONE" and not sealed.get("code")
+                and state.get("layer_id") == layer and state.get("phase") == "READY"
+                and state.get("fence") == work["fence"] and state.get("admission_closed") is True,
+                "seal did not confirm the original ready candidate")
+        require(self.api("POST", route + "/seal", value=seal_request) == sealed,
+                "seal replay changed its receipt")
+        receipt = self.api("GET", route + "/operations/" + seal_request["operation_id"])
+        require(receipt.get("operation_id") == seal_request["operation_id"]
+                and receipt.get("layer_id") == layer and receipt.get("kind") == "seal"
+                and receipt.get("state") == "DONE" and receipt.get("result") == sealed,
+                "seal query disagreed with its original receipt")
+
+        begin = {"operation_id": self.op(), "ttl_ms": 3600000, "validation": True}
+        claim = self.api("POST", route + "/work", value=begin)
+        validation = claim.get("work", {})
+        require(claim.get("launch") is True and validation.get("validation") is True
+                and validation.get("layer_id") == layer and bool(validation.get("work_id"))
+                and validation.get("fence", 0) > work["fence"] and bool(validation.get("lease_until")),
+                "validation did not grant a fresh readonly work generation")
+        replay = self.api("POST", route + "/work", value=begin)
+        require(replay.get("launch") is False and replay.get("work") == validation,
+                "validation replay relaunched or changed identity")
+        receipt = self.api("GET", route + "/operations/" + begin["operation_id"])
+        require(receipt.get("operation_id") == begin["operation_id"]
+                and receipt.get("layer_id") == layer and receipt.get("kind") == "begin-work"
+                and receipt.get("state") == "DONE" and receipt.get("result") == replay,
+                "validation query granted execution or changed the receipt")
+        return validation
+
     def mutate(self, method, path, work, *, headers=None, value=None):
         supplied = dict(headers or {})
         supplied["Idempotency-Key"] = self.op()
@@ -196,19 +231,15 @@ class Probe:
         require({"private.txt", "small.txt", "gone.txt", "extent.bin"} <= names, "child listing lost inherited entries")
         print("PASS independent layers, cumulative child inheritance and operation replay")
 
-        seal = self.api("POST", f"/v1/views/{a['layer_id']}/seal", value={"operation_id": self.op(), "work": a})
-        require(seal["state"] == "DONE", "seal did not finish")
+        validation = self.seal_and_validate(a)
         self.request("DELETE", self.fs(small, a), work=a, headers={"Idempotency-Key": self.op()}, statuses=(409,))
-        validation = self.api("POST", f"/v1/views/{a['layer_id']}/work",
-                              value={"operation_id": self.op(), "ttl_ms": 3600000, "validation": True})
-        require(validation["launch"] is True, "validation launch missing")
-        self.read(small, b"before", validation["work"])
-        self.request("DELETE", self.fs(small, validation["work"]), work=validation["work"],
+        self.read(small, b"before", validation)
+        self.request("DELETE", self.fs(small, validation), work=validation,
                      headers={"Idempotency-Key": self.op()}, statuses=(409,))
         self.api("DELETE", f"/v1/views/{a['layer_id']}", value={"operation_id": self.op()})
         self.read(private, b"before", child)
         self.read(large, b"xxxxend", child, f"bytes={(64 << 20)-4}-{(64 << 20)+2}")
-        print("PASS sealed write rejection, readonly validation and child survival after parent deletion")
+        print("PASS seal/validation receipt replay, sealed write rejection and child survival after parent deletion")
 
     def cleanup(self):
         failures = []

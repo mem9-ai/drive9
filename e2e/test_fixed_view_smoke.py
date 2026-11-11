@@ -81,6 +81,81 @@ class SmokeDriverTest(unittest.TestCase):
             self.assertNotIn("not-for-logs", str(failure.exception))
         self.assertEqual(requests, ["/truncated", "/redirect"])
 
+    def test_seal_and_validation_replay_and_query_keep_original_ids(self):
+        requests = []
+        work = {"layer_id": "a", "work_id": "w", "fence": 1}
+        validation = {"layer_id": "a", "work_id": "v", "fence": 2,
+                      "validation": True, "lease_until": "2099-01-01T00:00:00Z"}
+        sealed = {"state": "DONE", "layer": {"layer_id": "a", "phase": "READY",
+                                             "fence": 1, "admission_closed": True}}
+        receipts = {}
+
+        def respond(handler):
+            body = handler.rfile.read(int(handler.headers.get("Content-Length", "0")))
+            req = json.loads(body) if body else None
+            requests.append((handler.command, handler.path, req))
+            if handler.command == "GET":
+                operation = handler.path.rsplit("/", 1)[1]
+                payload = receipts[operation]
+            else:
+                operation = req["operation_id"]
+                if handler.path.endswith("/seal"):
+                    self.assertEqual(req["work"], work)
+                    payload = sealed
+                    kind = "seal"
+                else:
+                    self.assertIs(req["validation"], True)
+                    payload = {"launch": operation not in receipts, "work": validation}
+                    kind = "begin-work"
+                result = sealed if kind == "seal" else {"launch": False, "work": validation}
+                receipts[operation] = {"operation_id": operation, "layer_id": "a", "kind": kind,
+                                       "state": "DONE", "result": result}
+            raw = json.dumps(payload).encode()
+            handler.send_response(200)
+            handler.send_header("Content-Length", str(len(raw)))
+            handler.end_headers()
+            handler.wfile.write(raw)
+
+        probe = self.start(respond)
+        self.assertEqual(probe.seal_and_validate(work), validation)
+        self.assertEqual(len(requests), 6)
+        self.assertEqual(requests[0], requests[1])
+        self.assertEqual(requests[3], requests[4])
+        self.assertTrue(requests[2][1].endswith(requests[0][2]["operation_id"]))
+        self.assertTrue(requests[5][1].endswith(requests[3][2]["operation_id"]))
+        self.assertNotEqual(requests[0][2]["operation_id"], requests[3][2]["operation_id"])
+
+    def test_unfinished_or_mismatched_seal_never_claims_validation(self):
+        for kind in ("running", "upload-pending", "wrong-fence", "wrong-layer", "open"):
+            with self.subTest(kind=kind):
+                requests = []
+                sealed = {"state": "DONE", "layer": {"layer_id": "a", "phase": "READY",
+                                                     "fence": 1, "admission_closed": True}}
+                if kind == "running":
+                    sealed["state"] = "RUNNING"
+                elif kind == "upload-pending":
+                    sealed.update(state="FAILED", code="UPLOAD_PENDING")
+                elif kind == "wrong-fence":
+                    sealed["layer"]["fence"] = 2
+                elif kind == "wrong-layer":
+                    sealed["layer"]["layer_id"] = "other"
+                else:
+                    sealed["layer"]["phase"] = "OPEN"
+
+                def respond(handler):
+                    requests.append(handler.path)
+                    handler.rfile.read(int(handler.headers.get("Content-Length", "0")))
+                    raw = json.dumps(sealed).encode()
+                    handler.send_response(200)
+                    handler.send_header("Content-Length", str(len(raw)))
+                    handler.end_headers()
+                    handler.wfile.write(raw)
+
+                probe = self.start(respond)
+                with self.assertRaises(smoke.ProbeFailure):
+                    probe.seal_and_validate({"layer_id": "a", "work_id": "w", "fence": 1})
+                self.assertEqual(requests, ["/v1/views/a/seal"])
+
     def test_object_request_does_not_inherit_api_or_work_credentials(self):
         requests = []
 
