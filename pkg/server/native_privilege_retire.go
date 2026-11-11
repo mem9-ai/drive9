@@ -21,6 +21,13 @@ const (
 	// nativePrivilegeRetireTimeout bounds one tenant's database work so a wedged
 	// tenant cannot stall the leader's pass.
 	nativePrivilegeRetireTimeout = 30 * time.Second
+	// nativePrivilegeRetireInterval paces the pass for as long as this pod leads. A
+	// tenant that becomes active after a pass (a resumed provisioning flow, a fork
+	// that starts serving) must not have to wait for the next leadership change to
+	// lose the legacy grant, so the cleanup is periodic rather than one-shot.
+	nativePrivilegeRetireInterval = time.Hour
+	// nativePrivilegeRetireMaxBackoff caps a failing tenant's retry delay.
+	nativePrivilegeRetireMaxBackoff = 30 * time.Minute
 )
 
 // retireNativeTenantVariablesPrivilege strips the legacy SYSTEM_VARIABLES_ADMIN ON *.*
@@ -32,12 +39,13 @@ const (
 // is leader-only, runs once per leadership generation, and is idempotent — a revoke of
 // an absent grant is tolerated both by TiDB and by the helper.
 func (s *Server) retireNativeTenantVariablesPrivilege(ctx context.Context) {
-	if s.meta == nil || s.pool == nil || s.provisioner == nil {
+	if s.meta == nil || s.pool == nil {
 		return
 	}
-	if s.provisioner.ProviderType() != tenant.ProviderTiDBCloudNative {
-		return
-	}
+	// No deployment-level provider gate: a native tenant recorded by an earlier
+	// deployment outlives a provider switch, and the per-tenant check below decides
+	// from the stored record. The remediation itself only needs the tenant's own
+	// DSN and password.
 	cursor := time.Time{}
 	afterID := ""
 	retired, skipped, failed := 0, 0, 0
@@ -84,6 +92,9 @@ func (s *Server) retireNativeTenantVariablesPrivilegeFor(ctx context.Context, t 
 	if t == nil || t.Provider != tenant.ProviderTiDBCloudNative {
 		return nativePrivilegeRetireSkipped
 	}
+	if s.nativePrivilegeRetireBackoff(t.ID) {
+		return nativePrivilegeRetireSkipped
+	}
 	// Only tenants whose stored user is the restricted account can carry the legacy
 	// grant; a DSN still naming the root principal is handled by the setup path when
 	// the tenant is finalized.
@@ -108,9 +119,51 @@ func (s *Server) retireNativeTenantVariablesPrivilegeFor(ctx context.Context, t 
 		}
 		logger.Warn(ctx, "native_privilege_retire_failed", zap.String("tenant_id", t.ID), zap.Error(err))
 		metrics.RecordOperation("user_db_access", "native_privilege_retire", "error", 0)
+		s.recordNativePrivilegeRetireFailure(t.ID)
 		return nativePrivilegeRetireFailed
 	}
+	s.clearNativePrivilegeRetireFailure(t.ID)
 	return nativePrivilegeRetireDone
+}
+
+// nativePrivilegeRetireBackoff reports whether a tenant that failed recently is still
+// inside its retry delay.
+func (s *Server) nativePrivilegeRetireBackoff(tenantID string) bool {
+	s.nativePrivilegeRetireMu.Lock()
+	defer s.nativePrivilegeRetireMu.Unlock()
+	retryAt, ok := s.nativePrivilegeRetireRetryAt[tenantID]
+	return ok && time.Now().Before(retryAt)
+}
+
+// recordNativePrivilegeRetireFailure schedules the next attempt for a tenant with
+// exponential backoff, capped so a permanently unreachable tenant keeps being retried
+// while this pod leads.
+func (s *Server) recordNativePrivilegeRetireFailure(tenantID string) {
+	s.nativePrivilegeRetireMu.Lock()
+	defer s.nativePrivilegeRetireMu.Unlock()
+	if s.nativePrivilegeRetireFailures == nil {
+		s.nativePrivilegeRetireFailures = map[string]int{}
+	}
+	if s.nativePrivilegeRetireRetryAt == nil {
+		s.nativePrivilegeRetireRetryAt = map[string]time.Time{}
+	}
+	s.nativePrivilegeRetireFailures[tenantID]++
+	delay := nativePrivilegeRetireMaxBackoff
+	if shift := s.nativePrivilegeRetireFailures[tenantID] - 1; shift < 6 {
+		if candidate := time.Minute << shift; candidate < delay {
+			delay = candidate
+		}
+	}
+	s.nativePrivilegeRetireRetryAt[tenantID] = time.Now().Add(delay)
+}
+
+// clearNativePrivilegeRetireFailure forgets a tenant's retry state after a successful
+// pass.
+func (s *Server) clearNativePrivilegeRetireFailure(tenantID string) {
+	s.nativePrivilegeRetireMu.Lock()
+	defer s.nativePrivilegeRetireMu.Unlock()
+	delete(s.nativePrivilegeRetireFailures, tenantID)
+	delete(s.nativePrivilegeRetireRetryAt, tenantID)
 }
 
 // isAccessDenied reports whether err is the server rejecting the credentials

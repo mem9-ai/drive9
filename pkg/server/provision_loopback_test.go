@@ -3,6 +3,7 @@ package server
 import (
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/mem9-ai/drive9/pkg/tenant"
 )
@@ -84,8 +85,52 @@ func TestRequestIsLoopbackRefusesProxiedRequests(t *testing.T) {
 			t.Fatalf("%s: anonymous local provisioning allowed through a proxy hop", header)
 		}
 	}
-	// A direct loopback request with an empty header value still counts as direct.
-	if !requestIsLoopback(&http.Request{RemoteAddr: "127.0.0.1:5555", Header: http.Header{"X-Forwarded-For": []string{" "}}}) {
-		t.Fatal("an empty forwarding header does not make the request proxied")
+	// Presence is what matters: an empty or whitespace-only value still means a proxy
+	// hop handled the request, and a caller must not be able to suppress the signal.
+	for _, value := range []string{"", " ", "\t"} {
+		req := &http.Request{
+			RemoteAddr: "127.0.0.1:5555",
+			Header:     http.Header{"X-Forwarded-For": []string{value}},
+		}
+		if requestIsLoopback(req) {
+			t.Fatalf("forwarding header %q was ignored", value)
+		}
+		if !(&Server{}).provisionRequiresAuthentication(req, tenant.ProviderLocal) {
+			t.Fatalf("forwarding header %q allowed anonymous local provisioning", value)
+		}
+	}
+}
+
+// A failing tenant is retried with backoff rather than on every pass, and the delay
+// is capped so it keeps being retried while this pod leads.
+func TestNativePrivilegeRetireRetryBackoff(t *testing.T) {
+	s := &Server{}
+	if s.nativePrivilegeRetireBackoff("tenant-a") {
+		t.Fatal("a tenant without a failure is in backoff")
+	}
+	s.recordNativePrivilegeRetireFailure("tenant-a")
+	if !s.nativePrivilegeRetireBackoff("tenant-a") {
+		t.Fatal("no backoff after a failure")
+	}
+	for i := 0; i < 10; i++ {
+		s.recordNativePrivilegeRetireFailure("tenant-a")
+	}
+	s.nativePrivilegeRetireMu.Lock()
+	attempts := s.nativePrivilegeRetireFailures["tenant-a"]
+	retryAt := s.nativePrivilegeRetireRetryAt["tenant-a"]
+	s.nativePrivilegeRetireMu.Unlock()
+	if attempts != 11 {
+		t.Fatalf("attempt count = %d, want 11", attempts)
+	}
+	if delay := time.Until(retryAt); delay > nativePrivilegeRetireMaxBackoff+time.Minute {
+		t.Fatalf("retry delay %s exceeds the cap %s", delay, nativePrivilegeRetireMaxBackoff)
+	}
+	// Another tenant is unaffected.
+	if s.nativePrivilegeRetireBackoff("tenant-b") {
+		t.Fatal("a failure leaked to another tenant")
+	}
+	s.clearNativePrivilegeRetireFailure("tenant-a")
+	if s.nativePrivilegeRetireBackoff("tenant-a") {
+		t.Fatal("retry state survived a success")
 	}
 }

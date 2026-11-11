@@ -262,6 +262,11 @@ type Server struct {
 	leaderWorkerMu       sync.Mutex
 	leaderWorkersStarted bool
 	leaderWorkerStopDone chan struct{}
+	// nativePrivilegeRetire* carry per-tenant retry state for the legacy-grant
+	// cleanup, so a failing tenant is retried with backoff instead of on every pass.
+	nativePrivilegeRetireMu       sync.Mutex
+	nativePrivilegeRetireFailures map[string]int
+	nativePrivilegeRetireRetryAt  map[string]time.Time
 	// replayWorker and expirySweepWorker are leader-gated central quota
 	// workers owned by the server (single callback owner). Started in
 	// startLeaderWorkers and stopped in stopLeaderWorkers so they follow
@@ -1605,10 +1610,13 @@ func requestIsLoopback(r *http.Request) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-// requestLooksProxied reports whether any proxy-forwarding header is present.
+// requestLooksProxied reports whether any proxy-forwarding header is present. Presence
+// is what counts, not the value: an empty or whitespace-only header still means a
+// proxy hop added it, and letting a caller suppress the signal by sending an empty
+// value would reopen the loopback exception it exists to close.
 func requestLooksProxied(r *http.Request) bool {
 	for _, header := range [...]string{"Forwarded", "X-Forwarded-For", "X-Real-Ip", "X-Forwarded-Host", "X-Forwarded-Proto"} {
-		if strings.TrimSpace(r.Header.Get(header)) != "" {
+		if len(r.Header.Values(header)) > 0 {
 			return true
 		}
 	}
