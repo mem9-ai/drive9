@@ -9,6 +9,9 @@ import (
 	"fmt"
 	"net"
 	"time"
+
+	"github.com/mem9-ai/drive9/pkg/mountstate"
+	"github.com/mem9-ai/drive9/pkg/viewprotocol"
 )
 
 const DefaultDrainTimeout = 30 * time.Second
@@ -33,8 +36,11 @@ type StatusResponse struct {
 	// ViewSwitch promises same-connection ping -> switch/switch-operation
 	// negotiation and an EOF-terminated final reply. Advertise it only after
 	// the complete switch engine and connection handler are installed.
-	ViewSwitch bool   `json:"view_switch,omitempty"`
-	MountID    string `json:"mount_id,omitempty"`
+	ViewSwitch bool                      `json:"view_switch,omitempty"`
+	MountID    string                    `json:"mount_id,omitempty"`
+	Generation uint64                    `json:"generation,omitempty"`
+	Binding    *viewprotocol.Binding     `json:"binding,omitempty"`
+	Pending    *mountstate.SwitchReceipt `json:"pending,omitempty"`
 }
 
 func (r DrainRequest) Timeout() time.Duration {
