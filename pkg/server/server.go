@@ -357,9 +357,11 @@ const DefaultTenantPoolRefillFreeRatio = 0.8
 // shape is per-tenant so future tenant-scoped quotas plug in without a
 // protocol change.
 type TenantStatusResponse struct {
-	Status  string `json:"status"`
-	Kind    string `json:"kind,omitempty"`
-	Message string `json:"message,omitempty"`
+	// TenantID is the identity resolved from the authenticated API key.
+	TenantID string `json:"tenant_id"`
+	Status   string `json:"status"`
+	Kind     string `json:"kind,omitempty"`
+	Message  string `json:"message,omitempty"`
 
 	MaxUploadBytes int64 `json:"max_upload_bytes"`
 	// InlineThreshold is the server's DB-inline vs S3 storage cutoff. Clients
@@ -2113,6 +2115,7 @@ func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_ok", "tenant_id", resolved.Tenant.ID, "status", resolved.Tenant.Status)...)
 	_ = json.NewEncoder(w).Encode(TenantStatusResponse{
+		TenantID:        resolved.Tenant.ID,
 		Status:          string(resolved.Tenant.Status),
 		Kind:            string(resolved.Tenant.Kind),
 		Message:         s.tenantStatusMessage(&resolved.Tenant),
@@ -2180,6 +2183,7 @@ func (s *Server) handleLocalTenantStatus(w http.ResponseWriter, r *http.Request)
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_ok", "tenant_id", "local", "status", "active")...)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(TenantStatusResponse{
+		TenantID:        "local",
 		Status:          "active",
 		Kind:            "live",
 		MaxUploadBytes:  s.maxUploadBytes,
