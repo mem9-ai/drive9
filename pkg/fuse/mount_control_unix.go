@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -114,6 +115,15 @@ func (s *mountControlServer) handleConn(conn net.Conn) {
 			StartedAt:  started,
 			Layer:      &s.layer,
 		})
+		return
+	}
+	// Unknown operations must never fall through to a write drain. In
+	// particular an older mount must reject a newer switch protocol.
+	if op != "" && op != "drain" {
+		resp := mountcontrol.NewDrainResponse(s.mountPoint(), time.Now().UTC())
+		resp.Fail("unsupported_operation", "", fmt.Errorf("unsupported mount operation %q", op))
+		resp.Finish(time.Now().UTC())
+		_ = json.NewEncoder(conn).Encode(resp)
 		return
 	}
 	timeout := req.Timeout()

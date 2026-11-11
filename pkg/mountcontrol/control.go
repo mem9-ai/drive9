@@ -30,6 +30,9 @@ type StatusResponse struct {
 	// workspace). Nil means the mount predates layer reporting.
 	Layer *string `json:"layer,omitempty"`
 	Error string  `json:"error,omitempty"`
+	// ViewSwitch is advertised only after the complete switch engine is installed.
+	ViewSwitch bool   `json:"view_switch,omitempty"`
+	MountID    string `json:"mount_id,omitempty"`
 }
 
 func (r DrainRequest) Timeout() time.Duration {
@@ -145,6 +148,8 @@ func RequestStatus(ctx context.Context, socketPath string, timeout time.Duration
 		return nil, fmt.Errorf("dial mount control socket %s: %w", socketPath, err)
 	}
 	defer func() { _ = conn.Close() }()
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(deadline)
 	}
