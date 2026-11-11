@@ -2,6 +2,7 @@ package fuse
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"testing"
 
@@ -52,6 +53,7 @@ type viewRequestProbe struct {
 	gofuse.RawFileSystem
 	lookup      func(*gofuse.EntryOut) gofuse.Status
 	release     *gofuse.ReleaseIn
+	onRelease   func()
 	releaseDir  *gofuse.ReleaseIn
 	forgotten   [2]uint64
 	initialized bool
@@ -61,11 +63,16 @@ type viewRequestProbe struct {
 func (p *viewRequestProbe) Lookup(_ <-chan struct{}, _ *gofuse.InHeader, _ string, out *gofuse.EntryOut) gofuse.Status {
 	return p.lookup(out)
 }
-func (p *viewRequestProbe) Release(_ <-chan struct{}, in *gofuse.ReleaseIn) { p.release = in }
-func (p *viewRequestProbe) ReleaseDir(in *gofuse.ReleaseIn)                 { p.releaseDir = in }
-func (p *viewRequestProbe) Forget(ino, n uint64)                            { p.forgotten = [2]uint64{ino, n} }
-func (p *viewRequestProbe) Init(*gofuse.Server)                             { p.initialized = true }
-func (p *viewRequestProbe) OnUnmount()                                      { p.unmounted = true }
+func (p *viewRequestProbe) Release(_ <-chan struct{}, in *gofuse.ReleaseIn) {
+	p.release = in
+	if p.onRelease != nil {
+		p.onRelease()
+	}
+}
+func (p *viewRequestProbe) ReleaseDir(in *gofuse.ReleaseIn) { p.releaseDir = in }
+func (p *viewRequestProbe) Forget(ino, n uint64)            { p.forgotten = [2]uint64{ino, n} }
+func (p *viewRequestProbe) Init(*gofuse.Server)             { p.initialized = true }
+func (p *viewRequestProbe) OnUnmount()                      { p.unmounted = true }
 
 func TestViewRequestsDrainIncludesCallbackLocalPublication(t *testing.T) {
 	entered, remoteFinished, publish := make(chan struct{}), make(chan struct{}), make(chan struct{})
@@ -163,6 +170,40 @@ func TestViewRequestsCleanupContinuesWhilePaused(t *testing.T) {
 		t.Fatalf("lost cleanup/lifecycle: %+v", probe)
 	}
 	if err := p.resume(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestViewRequestsLateReleaseMustFinishBeforeDecision(t *testing.T) {
+	dropped, finish := make(chan struct{}), make(chan struct{})
+	v := &viewRequestFS{inner: &viewRequestProbe{onRelease: func() {
+		// FS.Release drops the handle before doing its final release/writeback.
+		close(dropped)
+		<-finish
+	}}}
+	pause, err := v.admission.pause()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pause.wait(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() { v.Release(nil, &gofuse.ReleaseIn{Fh: 9}); close(done) }()
+	<-dropped
+	called := false
+	if err := pause.atIdle(context.Background(), func() error { called = true; return nil }); !errors.Is(err, errViewCallbacksActive) || called {
+		t.Fatalf("unfinished release accepted: called=%v err=%v", called, err)
+	}
+	close(finish)
+	<-done
+	if err := pause.wait(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := pause.atIdle(context.Background(), func() error { called = true; return nil }); err != nil || !called {
+		t.Fatalf("finished release: called=%v err=%v", called, err)
+	}
+	if err := pause.resume(); err != nil {
 		t.Fatal(err)
 	}
 }

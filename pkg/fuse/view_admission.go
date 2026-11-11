@@ -9,6 +9,7 @@ import (
 var (
 	errViewAdmissionPaused = errors.New("mount view admission paused")
 	errViewPauseLost       = errors.New("mount view pause no longer owned")
+	errViewCallbacksActive = errors.New("mount callbacks still active")
 )
 
 // viewAdmission counts complete foreground operations, including their local
@@ -20,8 +21,8 @@ type viewAdmission struct {
 	paused *viewPause
 }
 
-// enter is deliberately nonblocking: a caller cannot occupy a FUSE request
-// worker while waiting for a switch which itself needs kernel notifications.
+// enter returns a paused error rather than waiting for resumption: a caller
+// must not occupy a FUSE worker waiting for kernel notifications to complete.
 // The adapter must handle cleanup callbacks separately rather than discard a
 // release/forget notification when ordinary admission is closed.
 func (g *viewAdmission) enter() (func(), error) {
@@ -29,6 +30,23 @@ func (g *viewAdmission) enter() (func(), error) {
 	defer g.mu.Unlock()
 	if g.paused != nil {
 		return nil, errViewAdmissionPaused
+	}
+	return g.trackLocked(), nil
+}
+
+// enterCleanup admits mandatory release/forget notifications even while ordinary
+// I/O is paused, but counts their entire side effects before a binding decision.
+func (g *viewAdmission) enterCleanup() func() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.trackLocked()
+}
+
+func (g *viewAdmission) trackLocked() func() {
+	if g.active == 0 && g.paused != nil {
+		// Cleanup may arrive after a previous idle observation. Give subsequent
+		// waiters a fresh notification; idle is a condition, not a permanent latch.
+		g.paused.idle = make(chan struct{})
 	}
 	g.active++
 	var once sync.Once
@@ -41,7 +59,7 @@ func (g *viewAdmission) enter() (func(), error) {
 				close(g.paused.idle)
 			}
 		})
-	}, nil
+	}
 }
 
 // pause closes admission before observing outstanding operations. The returned
@@ -68,22 +86,50 @@ type viewPause struct {
 }
 
 func (p *viewPause) wait(ctx context.Context) error {
-	if err := ctx.Err(); err != nil {
-		return err
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		p.gate.mu.Lock()
+		if p.gate.paused != p {
+			p.gate.mu.Unlock()
+			return errViewPauseLost
+		}
+		if p.gate.active == 0 {
+			p.gate.mu.Unlock()
+			return nil
+		}
+		idle := p.idle
+		p.gate.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-p.released:
+			return errViewPauseLost
+		case <-idle:
+		}
 	}
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-p.released:
-		return errViewPauseLost
-	case <-p.idle:
-	}
+}
+
+// atIdle rechecks quiescence and prevents cleanup admission throughout a short
+// binding-decision section. Waiting for idle alone is insufficient: a Release
+// may start immediately afterwards and publish a final write. fn must not wait
+// for callbacks, issue kernel notifications, or reenter the admission gate.
+// Cache invalidation and other work which needs cleanup progress happen outside
+// this section, with ordinary I/O still paused.
+func (p *viewPause) atIdle(ctx context.Context, fn func() error) error {
 	p.gate.mu.Lock()
 	defer p.gate.mu.Unlock()
 	if p.gate.paused != p {
 		return errViewPauseLost
 	}
-	return ctx.Err()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if p.gate.active != 0 {
+		return errViewCallbacksActive
+	}
+	return fn()
 }
 
 // resume cannot reopen a successor's pause. The caller may use it only before

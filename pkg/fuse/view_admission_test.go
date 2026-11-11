@@ -160,3 +160,68 @@ func TestViewAdmissionConcurrentCompletion(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestViewAdmissionCleanupAfterIdleObservation(t *testing.T) {
+	var g viewAdmission
+	p, err := g.pause()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.wait(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	leave := g.enterCleanup()
+	called := false
+	if err := p.atIdle(context.Background(), func() error { called = true; return nil }); !errors.Is(err, errViewCallbacksActive) || called {
+		t.Fatalf("late cleanup escaped barrier: called=%v err=%v", called, err)
+	}
+	select {
+	case <-p.idle:
+		t.Fatal("late cleanup reused closed idle notification")
+	default:
+	}
+	leave()
+	if err := p.atIdle(context.Background(), func() error { called = true; return nil }); err != nil || !called {
+		t.Fatalf("idle decision: called=%v err=%v", called, err)
+	}
+	if _, err := g.enter(); !errors.Is(err, errViewAdmissionPaused) {
+		t.Fatalf("decision resumed admission: %v", err)
+	}
+	if err := p.resume(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestViewAdmissionIdleDecisionFailureDoesNotResume(t *testing.T) {
+	var g viewAdmission
+	p, err := g.pause()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := errors.New("decision failed")
+	if err := p.atIdle(context.Background(), func() error { return want }); !errors.Is(err, want) {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	called := false
+	if err := p.atIdle(ctx, func() error { called = true; return nil }); !errors.Is(err, context.Canceled) || called {
+		t.Fatalf("canceled decision: called=%v err=%v", called, err)
+	}
+	if _, err := g.enter(); !errors.Is(err, errViewAdmissionPaused) {
+		t.Fatalf("failure resumed admission: %v", err)
+	}
+	if err := p.resume(); err != nil {
+		t.Fatal(err)
+	}
+	next, err := g.pause()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.atIdle(context.Background(), func() error { called = true; return nil }); !errors.Is(err, errViewPauseLost) || called {
+		t.Fatalf("stale decision: called=%v err=%v", called, err)
+	}
+	if err := next.resume(); err != nil {
+		t.Fatal(err)
+	}
+}

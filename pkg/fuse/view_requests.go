@@ -5,8 +5,8 @@ import (
 )
 
 // viewRequestFS gates complete foreground callbacks, including local handle
-// and cache publication, rather than only their remote requests. Cleanup and
-// lifecycle notifications must always reach the original facade. This adapter
+// and cache publication, rather than only their remote requests. Cleanup notifications are admitted even while paused, but their side effects
+// are counted until they return. Lifecycle notifications always pass through. This adapter
 // alone is NOT a kernel reply/cache barrier or a view identity router.
 //
 // Deliberately do not embed RawFileSystem: adding a kernel callback must force
@@ -36,6 +36,8 @@ func (v *viewRequestFS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, 
 }
 
 func (v *viewRequestFS) Forget(nodeid, nlookup uint64) {
+	leave := v.admission.enterCleanup()
+	defer leave()
 	v.inner.Forget(nodeid, nlookup)
 }
 
@@ -238,6 +240,8 @@ func (v *viewRequestFS) SetLkw(cancel <-chan struct{}, input *gofuse.LkIn) (code
 }
 
 func (v *viewRequestFS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
+	leave := v.admission.enterCleanup()
+	defer leave()
 	v.inner.Release(cancel, input)
 }
 
@@ -323,6 +327,8 @@ func (v *viewRequestFS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn
 }
 
 func (v *viewRequestFS) ReleaseDir(input *gofuse.ReleaseIn) {
+	leave := v.admission.enterCleanup()
+	defer leave()
 	v.inner.ReleaseDir(input)
 }
 
