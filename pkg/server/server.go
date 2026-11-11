@@ -982,23 +982,6 @@ func (s *Server) startLeaderWorkers() {
 		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
 			s.resumeProvisioningTenantsWithCtx(workerCtx)
 		})
-		// Periodic cleanup of the legacy cluster-wide SYSTEM_VARIABLES_ADMIN grant on
-		// native tenants, whose per-tenant setup never runs again once they are active.
-		// Periodic rather than one-shot so a tenant that becomes active later, or a
-		// failed attempt, is retried without waiting for a leadership change.
-		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
-			ticker := time.NewTicker(nativePrivilegeRetireInterval)
-			defer ticker.Stop()
-			s.retireNativeTenantVariablesPrivilege(workerCtx)
-			for {
-				select {
-				case <-workerCtx.Done():
-					return
-				case <-ticker.C:
-					s.retireNativeTenantVariablesPrivilege(workerCtx)
-				}
-			}
-		})
 		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
 			defer close(forkStartupResumeDone)
 			s.resumeDeletingForkTenantsWithCtx(workerCtx)
@@ -1032,6 +1015,29 @@ func (s *Server) startLeaderWorkers() {
 				}
 			})
 		}
+	}
+	// Periodic cleanup of the legacy cluster-wide SYSTEM_VARIABLES_ADMIN grant on
+	// native tenants, whose per-tenant setup never runs again once they are active.
+	// Deliberately outside the provisioner-gated block: the pass needs only meta and
+	// pool, and it must keep running when a deployment switched its provider and its
+	// provisioner no longer constructs — which is exactly the state that leaves old
+	// native tenants behind. Periodic rather than one-shot so a tenant that becomes
+	// active later, or a failed attempt, is retried without waiting for a leadership
+	// change.
+	if s.meta != nil && s.pool != nil {
+		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
+			ticker := time.NewTicker(nativePrivilegeRetireInterval)
+			defer ticker.Stop()
+			s.retireNativeTenantVariablesPrivilege(workerCtx)
+			for {
+				select {
+				case <-workerCtx.Done():
+					return
+				case <-ticker.C:
+					s.retireNativeTenantVariablesPrivilege(workerCtx)
+				}
+			}
+		})
 	}
 	// Central-quota workers: the server owns these as the single leader-callback
 	// owner so they start/stop with leadership transitions (previously they were
@@ -1627,9 +1633,14 @@ func requestIsLoopback(r *http.Request) bool {
 // proxy hop added it, and letting a caller suppress the signal by sending an empty
 // value would reopen the loopback exception it exists to close.
 func requestLooksProxied(r *http.Request) bool {
-	for _, header := range [...]string{"Forwarded", "X-Forwarded-For", "X-Real-Ip", "X-Forwarded-Host", "X-Forwarded-Proto"} {
-		if len(r.Header.Values(header)) > 0 {
-			return true
+	// Match the keys case-insensitively rather than through Header.Values: the server
+	// canonicalizes incoming names, but a header added by in-process middleware or a
+	// test with a non-canonical spelling must not slip past the check.
+	for name := range r.Header {
+		for _, want := range [...]string{"Forwarded", "X-Forwarded-For", "X-Real-Ip", "X-Forwarded-Host", "X-Forwarded-Proto", "Via", "True-Client-IP"} {
+			if strings.EqualFold(name, want) {
+				return true
+			}
 		}
 	}
 	return false

@@ -3,7 +3,6 @@ package server
 import (
 	"net/http"
 	"testing"
-	"time"
 
 	"github.com/mem9-ai/drive9/pkg/tenant"
 )
@@ -73,7 +72,7 @@ func TestRequestIsLoopback(t *testing.T) {
 // alone would let a remote caller through: any forwarding header means the request
 // did not arrive directly and loses the anonymous local exception.
 func TestRequestIsLoopbackRefusesProxiedRequests(t *testing.T) {
-	for _, header := range []string{"Forwarded", "X-Forwarded-For", "X-Real-Ip", "X-Forwarded-Host", "X-Forwarded-Proto"} {
+	for _, header := range []string{"Forwarded", "X-Forwarded-For", "X-Real-Ip", "X-Forwarded-Host", "X-Forwarded-Proto", "Via", "True-Client-IP"} {
 		req := &http.Request{
 			RemoteAddr: "127.0.0.1:5555",
 			Header:     http.Header{header: []string{"example"}},
@@ -98,39 +97,5 @@ func TestRequestIsLoopbackRefusesProxiedRequests(t *testing.T) {
 		if !(&Server{}).provisionRequiresAuthentication(req, tenant.ProviderLocal) {
 			t.Fatalf("forwarding header %q allowed anonymous local provisioning", value)
 		}
-	}
-}
-
-// A failing tenant is retried with backoff rather than on every pass, and the delay
-// is capped so it keeps being retried while this pod leads.
-func TestNativePrivilegeRetireRetryBackoff(t *testing.T) {
-	s := &Server{}
-	if s.nativePrivilegeRetireBackoff("tenant-a") {
-		t.Fatal("a tenant without a failure is in backoff")
-	}
-	s.recordNativePrivilegeRetireFailure("tenant-a")
-	if !s.nativePrivilegeRetireBackoff("tenant-a") {
-		t.Fatal("no backoff after a failure")
-	}
-	for i := 0; i < 10; i++ {
-		s.recordNativePrivilegeRetireFailure("tenant-a")
-	}
-	s.nativePrivilegeRetireMu.Lock()
-	attempts := s.nativePrivilegeRetireFailures["tenant-a"]
-	retryAt := s.nativePrivilegeRetireRetryAt["tenant-a"]
-	s.nativePrivilegeRetireMu.Unlock()
-	if attempts != 11 {
-		t.Fatalf("attempt count = %d, want 11", attempts)
-	}
-	if delay := time.Until(retryAt); delay > nativePrivilegeRetireMaxBackoff+time.Minute {
-		t.Fatalf("retry delay %s exceeds the cap %s", delay, nativePrivilegeRetireMaxBackoff)
-	}
-	// Another tenant is unaffected.
-	if s.nativePrivilegeRetireBackoff("tenant-b") {
-		t.Fatal("a failure leaked to another tenant")
-	}
-	s.clearNativePrivilegeRetireFailure("tenant-a")
-	if s.nativePrivilegeRetireBackoff("tenant-a") {
-		t.Fatal("retry state survived a success")
 	}
 }

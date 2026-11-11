@@ -15,9 +15,11 @@ import (
 	"go.uber.org/zap"
 )
 
+// nativePrivilegeRetireBatchSize bounds one page of the tenant scan. A variable so a
+// test can force the multi-page path without seeding a hundred tenants.
+var nativePrivilegeRetireBatchSize = 100
+
 const (
-	// nativePrivilegeRetireBatch bounds one page of the tenant scan.
-	nativePrivilegeRetireBatch = 100
 	// nativePrivilegeRetireTimeout bounds one tenant's database work so a wedged
 	// tenant cannot stall the leader's pass.
 	nativePrivilegeRetireTimeout = 30 * time.Second
@@ -25,8 +27,10 @@ const (
 	// tenant that becomes active after a pass (a resumed provisioning flow, a fork
 	// that starts serving) must not have to wait for the next leadership change to
 	// lose the legacy grant, so the cleanup is periodic rather than one-shot.
-	nativePrivilegeRetireInterval = time.Hour
-	// nativePrivilegeRetireMaxBackoff caps a failing tenant's retry delay.
+	nativePrivilegeRetireInterval = 15 * time.Minute
+	// nativePrivilegeRetireMaxBackoff caps a failing tenant's retry delay. It is
+	// longer than one interval so a persistently failing tenant is skipped on some
+	// passes instead of being attempted every tick.
 	nativePrivilegeRetireMaxBackoff = 30 * time.Minute
 )
 
@@ -51,10 +55,21 @@ func (s *Server) retireNativeTenantVariablesPrivilege(ctx context.Context) {
 	afterID := ""
 	retired, skipped, failed := 0, 0, 0
 	for {
-		page, err := s.meta.ListTenantsByStatusAfter(ctx, meta.TenantActive, cursor, afterID, nativePrivilegeRetireBatch)
+		page, err := s.meta.ListTenantsByStatusAfter(ctx, meta.TenantActive, cursor, afterID, nativePrivilegeRetireBatchSize)
 		if err != nil {
-			logger.Warn(ctx, "native_privilege_retire_scan_failed", zap.Error(err))
-			return
+			if ctx.Err() != nil {
+				// Shutdown mid-scan is not a failure of the pass.
+				return
+			}
+			// One transient meta blip must not cost a whole interval: retry the page
+			// once before giving up until the next tick.
+			page, err = s.meta.ListTenantsByStatusAfter(ctx, meta.TenantActive, cursor, afterID, nativePrivilegeRetireBatchSize)
+			if err != nil {
+				if ctx.Err() == nil {
+					logger.Warn(ctx, "native_privilege_retire_scan_failed", zap.Error(err))
+				}
+				return
+			}
 		}
 		if len(page) == 0 {
 			break
@@ -71,7 +86,7 @@ func (s *Server) retireNativeTenantVariablesPrivilege(ctx context.Context) {
 		}
 		last := page[len(page)-1]
 		cursor, afterID = last.CreatedAt, last.ID
-		if len(page) < nativePrivilegeRetireBatch {
+		if len(page) < nativePrivilegeRetireBatchSize {
 			break
 		}
 	}
