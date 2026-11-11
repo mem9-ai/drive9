@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -303,6 +304,9 @@ func runMountEnsure(args []string) error {
 	}
 	if len(sanitized) == 0 {
 		return fmt.Errorf("drive9 mount ensure: no stored mount args for %s; run drive9 mount explicitly", mp)
+	}
+	if err := refuseMigratedSourceMount(context.Background(), storedServer, storedAPIKey, storedToken); err != nil {
+		return err
 	}
 	// Ensure must not re-enter a blocking --supervise-foreground process.
 	sanitized = stripEnsureBlockingFlags(sanitized)

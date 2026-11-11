@@ -60,6 +60,7 @@ type tenantStatusResponse struct {
 	MaxUploadBytes        int64                  `json:"max_upload_bytes"`
 	InlineThreshold       int64                  `json:"inline_threshold,omitempty"`
 	MigrationCapabilities *MigrationCapabilities `json:"migration_capabilities,omitempty"`
+	MigrationState        string                 `json:"migration_state,omitempty"`
 	StorageCapabilities   *StorageCapabilities   `json:"storage_capabilities,omitempty"`
 }
 
@@ -717,6 +718,19 @@ func (c *Client) GetMigrationTenantID(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("%w: status omitted a valid tenant_id", ErrMigrationUnsupported)
 	}
 	return body.TenantID, nil
+}
+
+// GetMigrationState returns the controller's durable migration state when the
+// server advertises one. Empty means the tenant is not in a migration batch
+// (or the server predates the field).
+func (c *Client) GetMigrationState(ctx context.Context) (string, error) {
+	// Migration state is mutable while the immutable status cache lives for the
+	// Client's lifetime. Always fetch it instead of returning a warmed snapshot.
+	body, err := c.fetchTenantStatus(ctx)
+	if err != nil {
+		return "", fmt.Errorf("fetch migration state: %w", err)
+	}
+	return strings.TrimSpace(body.MigrationState), nil
 }
 
 // PostMigrationEvent sends one diagnostic event to the optional Server

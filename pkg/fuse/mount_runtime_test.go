@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -136,5 +137,27 @@ func TestMountRuntimeConstructionRejectsInvalidOptions(t *testing.T) {
 				t.Fatalf("runtime=%v err=%v", runtime, err)
 			}
 		})
+	}
+}
+
+func TestMountRuntimeKeepsKernelPermissionContractAcrossViews(t *testing.T) {
+	for _, allowOther := range []bool{false, true} {
+		for _, binding := range []client.ViewBinding{{}, {LayerID: "a", WorkID: "w", Fence: 1}} {
+			cl, err := client.New("http://127.0.0.1:1", "").WithView(binding)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg := MountConfig{Server: "http://127.0.0.1:1", MountPoint: t.TempDir(), CacheDir: t.TempDir(),
+				Extensions: []string{"core"}, WritePolicy: "write-sync", SyncMode: "strict", AllowOther: allowOther}
+			r, err := buildMountRuntime(cfg, cl, "/", "permission-test")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer r.closeStaging()
+			kernelChecks := slices.Contains(newGoFuseMountOptions(cfg).Options, "default_permissions")
+			if r.fs.defaultPermissions != kernelChecks {
+				t.Fatalf("view=%+v allow-other=%t daemon skips checks=%t kernel checks=%t", binding, allowOther, r.fs.defaultPermissions, kernelChecks)
+			}
+		}
 	}
 }

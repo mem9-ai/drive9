@@ -80,8 +80,9 @@ type Options struct {
 	// snapshot reuse would hide concurrent changes from it (v1).
 	GVisorCompat bool
 
-	// DefaultPermissions reports the kernel default_permissions mount
-	// option (the daemon's open gate is redundant when set).
+	// DefaultPermissions reports that the mount options make the kernel enforce the
+	// mode bits (the default_permissions mount option, which Linux and macFUSE both
+	// accept), so the daemon's open gate would be redundant.
 	DefaultPermissions bool
 	// LocalDirAttrs answers GetAttr for the root and directories from the
 	// inode table without a remote stat (v1: dirs never revalidate). View
@@ -2278,10 +2279,11 @@ func (f *FS) Readlink(cancel <-chan struct{}, header *gofuse.InHeader) ([]byte, 
 	return res.Data, gofuse.OK
 }
 
-// hasPOSIXAccess ports v1 hasPOSIXAccess: permission-class check
-// (owner/group/other) of the requested mask bits against the mode. Group
-// membership reduces to the caller's primary gid (v1 additionally consulted
-// supplementary groups via /proc).
+// hasPOSIXAccess applies the POSIX permission classes to a FUSE caller: root first,
+// then owner, group (the caller's primary gid and the supplementary groups read from
+// /proc/<pid>/status) and other, using the mode bits the mount reports. When the group
+// list cannot be read the caller counts as a non-member, so group bits are never
+// granted on a guess.
 func hasPOSIXAccess(caller fs.Caller, ownerUid, ownerGid uint32, mode uint32, mask uint32) bool {
 	if caller.Uid == 0 {
 		// POSIX root rule: R_OK/W_OK always granted; X_OK granted when
