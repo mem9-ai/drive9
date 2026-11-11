@@ -23,6 +23,28 @@ def binding(work=None):
             "Fence": work["fence"] if work else 0, "Validation": False}
 
 
+def switch_failure_details(raw):
+    # Only fixed protocol enums and a boolean may leave the captured response.
+    # Paths, operation identities, server errors and stderr remain private.
+    try:
+        result = json.loads(raw[:1024 * 1024])
+    except (ValueError, UnicodeError, RecursionError):
+        return "receipt=unavailable"
+    if not isinstance(result, dict):
+        return "receipt=unavailable"
+    response = result.get("response")
+    response = response if isinstance(response, dict) else {}
+    receipt = response.get("receipt")
+    receipt = receipt if isinstance(receipt, dict) else {}
+    kind = response.get("error_kind")
+    state = receipt.get("state")
+    kind = kind if isinstance(kind, str) and kind in ("BUSY", "INVALID", "CONFLICT", "FORBIDDEN", "UNSUPPORTED", "RECOVERING") else "unclassified"
+    state = state if isinstance(state, str) and state in ("RECOVERING", "DONE") else "absent"
+    unknown = result.get("unknown")
+    unknown = str(unknown).lower() if type(unknown) is bool else "unavailable"
+    return f"kind={kind} state={state} unknown={unknown}"
+
+
 class MountProbe:
     def __init__(self, cli, probe, point):
         self.cli, self.probe, self.point = cli, probe, point
@@ -34,7 +56,9 @@ class MountProbe:
             result = subprocess.run([self.cli, *args], env=self.env, capture_output=True, timeout=timeout)
         except subprocess.TimeoutExpired:
             raise http.ProbeFailure("CLI request timed out; no automatic mutation retry") from None
-        require(result.returncode == 0, "CLI " + " ".join(args[:2]) + " failed; no automatic mutation retry")
+        if result.returncode != 0:
+            details = "; " + switch_failure_details(result.stdout) if args[:2] in (["mount", "switch"], ["mount", "switch-operation"]) else ""
+            raise http.ProbeFailure("CLI " + " ".join(args[:2]) + " failed" + details + "; no automatic mutation retry")
         try:
             return json.loads(result.stdout)
         except (ValueError, UnicodeError):

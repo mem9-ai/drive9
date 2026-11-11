@@ -122,6 +122,29 @@ class MountProbeTest(unittest.TestCase):
                 self.assertNotIn(self.probe.key, run.call_args.args[0])
                 self.assertEqual(run.call_args.kwargs["env"]["DRIVE9_API_KEY"], self.probe.key)
 
+    def test_switch_failure_only_reports_protocol_enums(self):
+        for kind in ("BUSY", "INVALID", "CONFLICT", "FORBIDDEN", "UNSUPPORTED", "RECOVERING"):
+            body = json.dumps({"unknown": False, "error": "sensitive server error", "response": {
+                "error_kind": kind, "error": "sensitive path", "receipt": {
+                    "state": "RECOVERING", "operation_id": "sensitive identity"}}}).encode()
+            with patch.object(smoke.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, body, b"sensitive stderr")) as run:
+                with self.assertRaises(smoke.http.ProbeFailure) as error:
+                    self.driver.call(["mount", "switch", "/tmp/fixture/mount"])
+                self.assertIn(f"kind={kind} state=RECOVERING unknown=false", str(error.exception))
+                self.assertNotIn("sensitive", str(error.exception))
+                self.assertEqual(run.call_count, 1)
+
+    def test_switch_failure_malformed_values_cannot_escape(self):
+        for value in (None, [], "sensitive", {"unknown": "sensitive", "response": []},
+                      {"unknown": True, "response": {"error_kind": ["sensitive"], "receipt": []}},
+                      {"response": {"error_kind": "sensitive", "receipt": {"state": "sensitive"}}}):
+            detail = smoke.switch_failure_details(json.dumps(value).encode())
+            self.assertNotIn("sensitive", detail)
+        for raw in (b"sensitive non-json", b"\xff", b"[" * 2000, b"x" * (1024 * 1024 + 1)):
+            self.assertEqual(smoke.switch_failure_details(raw), "receipt=unavailable")
+        self.assertEqual(smoke.switch_failure_details(b'{"unknown":true,"response":{"receipt":{"state":"DONE"}}}'),
+                         "kind=unclassified state=DONE unknown=true")
+
     def test_cleanup_timeout_preserves_sanitized_primary_failure(self):
         for primary, label in ((smoke.http.ProbeFailure("mounted file read timed out"), "mounted file read timed out"),
                                (RuntimeError("sensitive message"), "RuntimeError")):
