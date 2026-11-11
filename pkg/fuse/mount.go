@@ -967,6 +967,24 @@ func buildMountRuntimeGeneration(cfg MountConfig, cl *client.Client, remoteRoot,
 	// Each extension constructs independently into a registry; assembly
 	// walks the flag order in reverse below.
 	built := map[string]fs.Handler{}
+	var stagingLedger *staging.Staging
+	defer func() {
+		if err == nil {
+			return
+		}
+		// Constructors may already own cache workers or recover upload queues.
+		// Stop in the same order as Chain.Stop, before closing their ledger.
+		for _, name := range extOrder {
+			if lifecycle, ok := built[name].(fs.Lifecycle); ok {
+				if stopErr := lifecycle.Stop(context.Background()); stopErr != nil {
+					err = errors.Join(err, fmt.Errorf("fuse: clean up %s: %w", name, stopErr))
+				}
+			}
+		}
+		if stagingLedger != nil {
+			stagingLedger.Close()
+		}
+	}()
 
 	// v1 cache base: an explicit cache dir, else the per-user default, so
 	// cache-backed components stay enabled without explicit configuration.
@@ -1060,7 +1078,6 @@ func buildMountRuntimeGeneration(cfg MountConfig, cl *client.Client, remoteRoot,
 	// staging + streamed landing). Write-sync commits inline per Write and
 	// needs none of it. The cache plugin stays regardless — its READ caches
 	// serve every policy; only its staging role is policy-bound.
-	var stagingLedger *staging.Staging
 	if !cfg.ReadOnly && (policy == writeback.PolicyWriteBack || policy == writeback.PolicyCloseSync) && cacheBase != "" && wantExt["writeback"] {
 		// wantExt gate: a core-only stack (--extensions core) keeps the
 		// default writeback policy but builds no writeback handler; the
@@ -1083,11 +1100,6 @@ func buildMountRuntimeGeneration(cfg MountConfig, cl *client.Client, remoteRoot,
 		if err != nil {
 			return nil, fmt.Errorf("fuse: staging ledger: %w", err)
 		}
-		defer func() {
-			if err != nil {
-				stagingLedger.Close()
-			}
-		}()
 		failpoint.InjectCall("mountRuntimeStagingReady", stagingLedger)
 		if err := stagingLedger.Recover(); err != nil {
 			return nil, fmt.Errorf("fuse: staging recovery: %w", err)
@@ -1362,6 +1374,10 @@ func buildMountRuntimeGeneration(cfg MountConfig, cl *client.Client, remoteRoot,
 		if h := built[extOrder[i]]; h != nil {
 			chainHandlers = append(chainHandlers, h)
 		}
+	}
+	failpoint.InjectCall("mountRuntimeHandlersReady", built, &err)
+	if err != nil {
+		return nil, err
 	}
 	f, err := New(Options{
 		OwnerSet:           cfg.DefaultOwner != nil,

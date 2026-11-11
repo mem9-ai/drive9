@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sync"
 	"syscall"
 	"testing"
 
@@ -233,13 +234,18 @@ func TestViewSwitchPendingRetriesSameTargetAndQueryDoesNoWork(t *testing.T) {
 func TestViewSwitchWaitsForDetachedOldNotification(t *testing.T) {
 	s, _, req, events := viewSwitchFixture(t)
 	entered, release := make(chan struct{}), make(chan struct{})
-	defer close(release)
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
 	ctx, cancel := context.WithCancel(t.Context())
 	stop := s.current.fs.chain.Handlers()[0].(*viewSwitchLifecycle)
+	stopCalls := 0
 	stop.stop = func(context.Context) error {
-		s.current.fs.notifications.run(func() { close(entered); <-release })
-		<-entered
-		cancel()
+		stopCalls++
+		if stopCalls == 1 {
+			s.current.fs.notifications.run(func() { close(entered); <-release })
+			<-entered
+			cancel()
+		}
 		return nil
 	}
 	got := s.apply(ctx, req)
@@ -253,6 +259,13 @@ func TestViewSwitchWaitsForDetachedOldNotification(t *testing.T) {
 		if event == "build" {
 			t.Fatal("built while old notifier active")
 		}
+	}
+	releaseOnce.Do(func() { close(release) })
+	if got := s.apply(t.Context(), req); got.Error != "" || got.Receipt == nil || got.Receipt.State != mountstate.SwitchDone {
+		t.Fatalf("notification retry: %+v", got)
+	}
+	if stopCalls != 2 {
+		t.Fatalf("stop attempts=%d", stopCalls)
 	}
 }
 
