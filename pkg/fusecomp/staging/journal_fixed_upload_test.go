@@ -2,6 +2,7 @@ package staging
 
 import (
 	"bytes"
+	"encoding/binary"
 	"os"
 	"path/filepath"
 	"testing"
@@ -209,13 +210,16 @@ func TestJournalFixedUploadRejectsInvalidAndFailedPreparation(t *testing.T) {
 }
 
 func TestJournalFixedUploadRejectsCorruptionAndWrongSettlement(t *testing.T) {
-	for _, failure := range []string{"crc", "body", "settlement-path", "changed-body"} {
+	for _, failure := range []string{"crc", "length", "prefix-length", "short-tail", "truncated-prepare", "body", "settlement-path", "changed-body"} {
 		t.Run(failure, func(t *testing.T) {
 			j, err := NewJournal(filepath.Join(t.TempDir(), "journal.wal"))
 			if err != nil {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { _ = j.Close() })
+			if failure == "prefix-length" {
+				mustAppend(t, j, JournalEntry{Op: JournalWrite, Path: "/old"})
+			}
 			if err := j.PrepareFixedUpload("original", "/a", []byte(`{"generation":1}`)); err != nil {
 				t.Fatal(err)
 			}
@@ -226,6 +230,22 @@ func TestJournalFixedUploadRejectsCorruptionAndWrongSettlement(t *testing.T) {
 					t.Fatal(err)
 				}
 				raw[len(raw)-1] ^= 1
+				if err := os.WriteFile(j.path, raw, 0600); err != nil {
+					t.Fatal(err)
+				}
+			case "length", "prefix-length", "short-tail", "truncated-prepare":
+				raw, err := os.ReadFile(j.path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				switch failure {
+				case "length", "prefix-length":
+					binary.LittleEndian.PutUint32(raw[:4], uint32(len(raw)+1024))
+				case "short-tail":
+					raw = append(raw, 1, 2, 3)
+				case "truncated-prepare":
+					raw = raw[:4]
+				}
 				if err := os.WriteFile(j.path, raw, 0600); err != nil {
 					t.Fatal(err)
 				}
@@ -251,5 +271,32 @@ func TestJournalFixedUploadRejectsCorruptionAndWrongSettlement(t *testing.T) {
 				t.Fatal("failed compaction changed recovery source", err)
 			}
 		})
+	}
+}
+
+func TestJournalFixedUploadIdentityHistoryEndsAtCompaction(t *testing.T) {
+	j, err := NewJournal(filepath.Join(t.TempDir(), "journal.wal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = j.Close() })
+	payload := []byte(`{"generation":1}`)
+	if err := j.PrepareFixedUpload("original", "/a", payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.SettleFixedUpload("original"); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.PrepareFixedUpload("original", "/a", payload); err == nil {
+		t.Fatal("retained settled identity was reused")
+	}
+	if err := j.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	// Compaction keeps only unresolved work. This intentionally demonstrates
+	// why uploaders must mint unique IDs rather than use the WAL as a permanent
+	// ID registry: an old ID is no longer distinguishable from a new one here.
+	if err := j.PrepareFixedUpload("original", "/a", payload); err != nil {
+		t.Fatal(err)
 	}
 }

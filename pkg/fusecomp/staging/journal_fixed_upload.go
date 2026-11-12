@@ -13,7 +13,9 @@ import (
 
 // PrepareFixedUpload durably records an immutable completion request BEFORE
 // publication. payload belongs to the uploader; it must include the original
-// work binding and local generation. Callers must never reuse operationID.
+// work binding and local generation. The caller owns globally unique operation
+// IDs and must never reuse one, even after settlement. The WAL detects conflicts
+// only while their records remain; compaction discards settled identity history.
 // This record survives later path writes, unlink markers and WAL compaction.
 func (j *Journal) PrepareFixedUpload(operationID, path string, payload []byte) error {
 	if viewprotocol.ValidateOperationID(operationID) != nil || path == "" || len(payload) == 0 || len(payload) > 64<<10 || !json.Valid(payload) {
@@ -77,6 +79,8 @@ func (j *Journal) SettleFixedUpload(operationID string) error {
 
 // PendingFixedUploads returns unresolved requests in journal order, independent
 // of the current pending-file index. The returned bytes are caller-owned.
+// Damaged or incomplete frames fail closed and retain the WAL for repair; this
+// API does not guess whether a truncated tail was acknowledged before a crash.
 func (j *Journal) PendingFixedUploads() ([]JournalEntry, error) {
 	entries, _, err := j.fixedUploadState()
 	return entries, err

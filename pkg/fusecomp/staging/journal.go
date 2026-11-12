@@ -492,13 +492,16 @@ func (j *Journal) compact(force bool) (err error) {
 
 // scanJournalFrames walks the wire format, skipping corrupt or truncated
 // frames, and calls fn with each decoded entry and its raw frame bytes.
+// The return value also marks incomplete tails: a fixed-upload reader cannot
+// distinguish an interrupted append from damage hiding an acknowledged record.
 func scanJournalFrames(data []byte, fn func(entry JournalEntry, frame []byte)) (corrupt bool) {
 	pos := 0
 	for pos+8 <= len(data) { // need at least 4 (len) + 4 (crc)
 		payloadLen := binary.LittleEndian.Uint32(data[pos : pos+4])
 		frameEnd := pos + 4 + int(payloadLen) + 4
 		if frameEnd > len(data) {
-			break // truncated entry
+			corrupt = true
+			break // truncated entry; strict recovery must retain the source
 		}
 		payload := data[pos+4 : pos+4+int(payloadLen)]
 		storedCRC := binary.LittleEndian.Uint32(data[pos+4+int(payloadLen):])
@@ -517,5 +520,5 @@ func scanJournalFrames(data []byte, fn func(entry JournalEntry, frame []byte)) (
 		fn(entry, data[pos:frameEnd])
 		pos = frameEnd
 	}
-	return corrupt
+	return corrupt || pos != len(data)
 }
