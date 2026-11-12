@@ -39,11 +39,14 @@ func validateExtentUploadPlan(plan *uploadPlanV2, size int64) error {
 
 // writeExtentUpload uses the same bounded buffers as multipart, but each part
 // is a create-once object identified by its bytes. Complete receives SHA-256
-// addresses, never object-store ETags. The fixed-view publication protocol is
-// wired separately because it needs a durable operation identity.
+// addresses, never object-store ETags. Fixed views reuse transfer and buffer
+// handling, then publish with their separate durable completion protocol.
 func (c *Client) writeExtentUpload(ctx context.Context, plan *uploadPlanV2, ra io.ReaderAt, size int64, progress ProgressFunc, summary *UploadSummary, tags map[string]string, wholeChecksum string, preCompleteCheck func() error, initiateDuration time.Duration) (err error) {
 	if c.view.LayerID != "" {
-		return errors.New("fixed extent upload requires the fixed publication protocol")
+		id, _ := ctx.Value(viewOperationKey{}).(string)
+		if viewprotocol.ValidateOperationID(id) != nil || validateFixedUploadPlan(plan, size) != nil || len(tags) != 0 || wholeChecksum != "" {
+			return errors.New("invalid fixed extent upload preparation")
+		}
 	}
 	if err := validateExtentUploadPlan(plan, size); err != nil {
 		return err
@@ -106,10 +109,21 @@ func (c *Client) writeExtentUpload(ctx context.Context, plan *uploadPlanV2, ra i
 		summary.UploadedParts, summary.UploadSeconds = plan.TotalParts, time.Since(started).Seconds()
 	}
 	started = time.Now()
-	if err := c.completeExtentUpload(ctx, plan.UploadID, parts, tags, wholeChecksum); err != nil {
+	completeErr := error(nil)
+	if c.view.LayerID != "" {
+		id, _ := ctx.Value(viewOperationKey{}).(string)
+		var receipt FixedUploadCompletion
+		receipt, completeErr = c.CompleteFixedExtentUpload(ctx, id, plan.UploadID, parts)
+		if completeErr == nil && receipt.Size != size {
+			completeErr = markCommitAttempt(&ViewOperationError{LayerID: c.view.LayerID, OperationID: id, Err: errors.New("fixed upload completion size mismatch")})
+		}
+	} else {
+		completeErr = c.completeExtentUpload(ctx, plan.UploadID, parts, tags, wholeChecksum)
+	}
+	if completeErr != nil {
 		// The server may have published despite a lost or malformed response.
 		// Keep the session available for query; never initiate again or abort here.
-		return err
+		return completeErr
 	}
 	if summary != nil {
 		summary.CompleteSeconds = time.Since(started).Seconds()

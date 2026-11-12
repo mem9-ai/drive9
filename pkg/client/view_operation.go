@@ -17,6 +17,10 @@ type viewOperationKey struct{}
 // WithViewOperationID supplies the stable identity for a single fixed-view
 // filesystem mutation. Reuse it only with the identical request to reconcile
 // an unknown outcome. Do not reuse this context across different mutations.
+// For seekable extent uploads this is the completion ID; initiation uses a
+// separate derived ID. After an unknown completion, use CompleteFixedExtentUpload
+// with the saved upload ID and parts, or query GetFixedViewOperation. Restarting
+// the whole transfer is not a completion retry.
 func WithViewOperationID(ctx context.Context, id string) (context.Context, error) {
 	if err := viewprotocol.ValidateOperationID(id); err != nil {
 		return nil, err

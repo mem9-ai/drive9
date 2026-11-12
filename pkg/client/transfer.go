@@ -635,6 +635,9 @@ func (c *Client) writeStreamV2WithSummary(ctx context.Context, path string, ra i
 }
 
 func (c *Client) writeStreamV2WithSummaryAndPreCompleteCheck(ctx context.Context, path string, ra io.ReaderAt, size int64, progress ProgressFunc, expectedRevision int64, summary *UploadSummary, tags map[string]string, description, checksumSHA256 string, preCompleteCheck func() error) error {
+	if c.view.LayerID != "" {
+		return c.writeFixedExtentStream(ctx, path, ra, size, progress, expectedRevision, summary, tags, description, checksumSHA256, preCompleteCheck)
+	}
 	if err := validateTags(tags); err != nil {
 		return err
 	}
@@ -1382,6 +1385,10 @@ func (c *Client) abortUploadV2BestEffort(parent context.Context, uploadID string
 	}
 	ctx, cancel := newMultipartAbortContext(parent, timeout)
 	defer cancel()
+	if c.view.LayerID != "" {
+		_, _ = c.AbortFixedUpload(ctx, fixedUploadPhaseID("abort", uploadID), uploadID)
+		return
+	}
 	_ = c.abortUploadV2(ctx, uploadID)
 }
 
