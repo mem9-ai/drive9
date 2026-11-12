@@ -25,11 +25,13 @@ func (idx *PendingIndex) RetireFixedUploadGeneration(remotePath string, generati
 	journal := idx.journal
 	matches := exists && current.Generation == generation
 	idx.mu.RUnlock()
-	if exists && !matches {
-		return false, nil
-	}
+	// Even a skipped cleanup must reserve the old identity until settlement:
+	// the newer entry may itself disappear before a crash and old replay.
 	if err := idx.fixedRetired.advance(idx.dir, generation, &idx.nextGen); err != nil {
 		return false, err
+	}
+	if exists && !matches {
+		return false, nil
 	}
 	// Publish under the path lock, so no newer pending frame can precede this
 	// marker. Even a retry with absent metadata must fence older WAL frames.
@@ -64,11 +66,11 @@ func (c *WriteBackCache) RetireFixedUploadGeneration(remotePath string, generati
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	meta, exists := c.metas[remotePath]
-	if exists && meta.Generation != generation {
-		return false, nil
-	}
 	if err := c.fixedRetired.advance(c.dir, generation, &c.nextGen); err != nil {
 		return false, err
+	}
+	if exists && meta.Generation != generation {
+		return false, nil
 	}
 	for _, file := range []string{c.MetaFile(remotePath), c.DatFile(remotePath)} {
 		if err := os.Remove(file); err != nil && !errors.Is(err, os.ErrNotExist) {

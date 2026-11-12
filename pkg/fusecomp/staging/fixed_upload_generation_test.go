@@ -101,3 +101,73 @@ func TestFixedUploadRetirementAdvancesEmptyLiveCounter(t *testing.T) {
 		t.Fatal(m.Generation)
 	}
 }
+
+func TestFixedUploadSkippedCleanupStillReservesOldIdentity(t *testing.T) {
+	idx, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	old, err := idx.Put("/file", 1, PendingNew)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := idx.Put("/file", 2, PendingNew); err != nil {
+		t.Fatal(err)
+	}
+	if owned, err := idx.RetireFixedUploadGeneration("/file", old); err != nil || owned {
+		t.Fatal(owned, err)
+	}
+	// A separate owner removes its own newer image, but the old completion
+	// has not settled. Its ID still must not be minted after an empty restart.
+	idx.Remove("/file")
+	idx, err = NewPendingIndex(idx.Dir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.RecoverFromDisk(); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := idx.Put("/file", 3, PendingNew)
+	if err != nil || fresh <= old {
+		t.Fatal(fresh, err)
+	}
+	if owned, err := idx.RetireFixedUploadGeneration("/file", old); err != nil || owned {
+		t.Fatal(owned, err)
+	}
+	if m, ok := idx.GetMeta("/file"); !ok || m.Size != 3 {
+		t.Fatal(m, ok)
+	}
+
+	c, err := NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Put("/file", []byte("old"), 3, PendingNew); err != nil {
+		t.Fatal(err)
+	}
+	original, _ := c.GetMeta("/file")
+	if err := c.Put("/file", []byte("next"), 4, PendingNew); err != nil {
+		t.Fatal(err)
+	}
+	if owned, err := c.RetireFixedUploadGeneration("/file", original.Generation); err != nil || owned {
+		t.Fatal(owned, err)
+	}
+	c.Remove("/file")
+	c, err = NewWriteBackCache(c.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Put("/file", []byte("fresh"), 5, PendingNew); err != nil {
+		t.Fatal(err)
+	}
+	current, _ := c.GetMeta("/file")
+	if current.Generation <= original.Generation {
+		t.Fatal(current.Generation)
+	}
+	if owned, err := c.RetireFixedUploadGeneration("/file", original.Generation); err != nil || owned {
+		t.Fatal(owned, err)
+	}
+	if data, ok := c.Get("/file"); !ok || string(data) != "fresh" {
+		t.Fatal(string(data), ok)
+	}
+}
