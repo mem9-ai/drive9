@@ -1528,7 +1528,7 @@ func ensureSystemUser(ctx context.Context, db *sql.DB, dbName, username, passwor
 			// TiDB accepts REVOKE of a privilege that was never granted, but
 			// MySQL-compatible servers may answer ER_NONEXISTING_GRANT. The revoke is
 			// legacy cleanup, so that answer is not a setup failure.
-			if strings.HasPrefix(stmt, "REVOKE SYSTEM_VARIABLES_ADMIN") && isMissingGrantError(err) {
+			if strings.HasPrefix(stmt, "REVOKE SYSTEM_VARIABLES_ADMIN") && IsMissingGrantError(err) {
 				continue
 			}
 			return fmt.Errorf("execute native system user statement %d: %w", i+1, err)
@@ -1537,9 +1537,9 @@ func ensureSystemUser(ctx context.Context, db *sql.DB, dbName, username, passwor
 	return nil
 }
 
-// isMissingGrantError reports whether the server rejected a REVOKE because the
+// IsMissingGrantError reports whether the server rejected a REVOKE because the
 // privilege was not granted in the first place.
-func isMissingGrantError(err error) bool {
+func IsMissingGrantError(err error) bool {
 	var mysqlErr *mysql.MySQLError
 	return errors.As(err, &mysqlErr) && (mysqlErr.Number == 1141 || mysqlErr.Number == 1147)
 }
@@ -1594,20 +1594,32 @@ func RetireLegacySystemUserPrivilege(ctx context.Context, dsn string) error {
 	}
 	defer func() { _ = db.Close() }()
 	stmt := fmt.Sprintf("REVOKE SYSTEM_VARIABLES_ADMIN ON *.* FROM %s", quoteString("tdc_fs_admin"))
-	if _, err := db.ExecContext(ctx, stmt); err != nil && !isMissingGrantError(err) {
+	if _, err := db.ExecContext(ctx, stmt); err != nil && !IsMissingGrantError(err) {
 		return fmt.Errorf("revoke legacy system variables grant: %w", err)
 	}
 	return nil
+}
+
+// RestrictedSystemUserNameSuffix marks the per-tenant account the native setup creates.
+// Callers that decide from a stored DSN use IsRestrictedSystemUser instead of spelling
+// the suffix themselves, so a scheme change cannot silently stop matching.
+const RestrictedSystemUserNameSuffix = ".tdc_fs_sys"
+
+// IsRestrictedSystemUser reports whether username names the restricted per-tenant
+// account rather than a cluster principal.
+func IsRestrictedSystemUser(username string) bool {
+	prefix, ok := strings.CutSuffix(strings.TrimSpace(username), RestrictedSystemUserNameSuffix)
+	return ok && prefix != ""
 }
 
 // systemRootUserFor maps the restricted tenant account name back to the cluster root
 // principal that shares its password: <prefix>.tdc_fs_sys -> <prefix>.root.
 func systemRootUserFor(currentUsername string) (string, bool) {
 	currentUsername = strings.TrimSpace(currentUsername)
-	prefix, ok := strings.CutSuffix(currentUsername, ".tdc_fs_sys")
-	if !ok || prefix == "" {
+	if !IsRestrictedSystemUser(currentUsername) {
 		return "", false
 	}
+	prefix := strings.TrimSuffix(currentUsername, RestrictedSystemUserNameSuffix)
 	return prefix + ".root", true
 }
 

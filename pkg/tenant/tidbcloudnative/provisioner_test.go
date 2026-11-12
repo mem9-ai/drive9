@@ -3086,11 +3086,26 @@ func TestSystemUserStatementsRevokeClusterWidePrivilege(t *testing.T) {
 // A missing legacy grant is not a setup failure: TiDB accepts the revoke, but a
 // MySQL-compatible server answers ER_NONEXISTING_GRANT.
 func TestIsMissingGrantError(t *testing.T) {
-	if !isMissingGrantError(&mysql.MySQLError{Number: 1147}) || !isMissingGrantError(&mysql.MySQLError{Number: 1141}) {
+	if !IsMissingGrantError(&mysql.MySQLError{Number: 1147}) || !IsMissingGrantError(&mysql.MySQLError{Number: 1141}) {
 		t.Fatal("missing-grant errors not recognised")
 	}
-	if isMissingGrantError(&mysql.MySQLError{Number: 1045}) || isMissingGrantError(errors.New("boom")) {
+	if IsMissingGrantError(&mysql.MySQLError{Number: 1045}) || IsMissingGrantError(errors.New("boom")) {
 		t.Fatal("unrelated errors classified as a missing grant")
+	}
+}
+
+// The restricted-account predicate is shared with the server's legacy-grant pass, so a
+// scheme change has one place to happen instead of two that can drift apart.
+func TestIsRestrictedSystemUser(t *testing.T) {
+	for _, in := range []string{"u1.tdc_fs_sys", " 22ipQWBXXq2wN2S.tdc_fs_sys "} {
+		if !IsRestrictedSystemUser(in) {
+			t.Fatalf("IsRestrictedSystemUser(%q) = false", in)
+		}
+	}
+	for _, in := range []string{"", "root", "u1.root", ".tdc_fs_sys", "u1.tdc_fs_sys.x", "tdc_fs_sys"} {
+		if IsRestrictedSystemUser(in) {
+			t.Fatalf("IsRestrictedSystemUser(%q) = true", in)
+		}
 	}
 }
 

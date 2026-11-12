@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"time"
 
@@ -57,6 +58,10 @@ func (s *Server) retireNativeTenantVariablesPrivilege(ctx context.Context) {
 	// from the stored record. The remediation itself only needs the tenant's own
 	// DSN and password.
 	retired, skipped, failed := 0, 0, 0
+	// The revoke is cluster-global (the fixed role lives on the instance), so tenants
+	// sharing a cluster must not each open a connection: the first success retires the
+	// cluster and the rest are memoized without a dial.
+	clusterRetired := map[string]bool{}
 	// Suspended tenants keep their database and therefore the legacy grant; each status
 	// is scanned with its own keyset cursor.
 	for _, status := range [...]meta.TenantStatus{meta.TenantActive, meta.TenantSuspended} {
@@ -89,8 +94,17 @@ func (s *Server) retireNativeTenantVariablesPrivilege(ctx context.Context) {
 				if ctx.Err() != nil {
 					return
 				}
-				switch s.retireNativeTenantVariablesPrivilegeFor(ctx, &page[i]) {
+				t := &page[i]
+				if cluster := nativePrivilegeRetireClusterKey(t); cluster != "" && clusterRetired[cluster] && nativePrivilegeRetireEligible(t) {
+					s.markNativePrivilegeRetireDone(t.ID)
+					skipped++
+					continue
+				}
+				switch s.retireNativeTenantVariablesPrivilegeFor(ctx, t) {
 				case nativePrivilegeRetireDone:
+					if cluster := nativePrivilegeRetireClusterKey(t); cluster != "" {
+						clusterRetired[cluster] = true
+					}
 					retired++
 				case nativePrivilegeRetireSkipped:
 					skipped++
@@ -119,8 +133,16 @@ const (
 	nativePrivilegeRetireFailed
 )
 
+// nativePrivilegeRetireEligible reports whether a tenant's stored record can carry the
+// legacy grant at all: only native tenants whose stored user is the restricted account
+// reach the fixed role. A DSN still naming the root principal is handled by the setup
+// path when the tenant is finalized.
+func nativePrivilegeRetireEligible(t *meta.Tenant) bool {
+	return t != nil && t.Provider == tenant.ProviderTiDBCloudNative && tidbcloudnative.IsRestrictedSystemUser(t.DBUser)
+}
+
 func (s *Server) retireNativeTenantVariablesPrivilegeFor(ctx context.Context, t *meta.Tenant) nativePrivilegeRetireResult {
-	if t == nil || t.Provider != tenant.ProviderTiDBCloudNative {
+	if !nativePrivilegeRetireEligible(t) {
 		return nativePrivilegeRetireSkipped
 	}
 	if s.nativePrivilegeRetireRecentlyDone(t.ID) {
@@ -129,26 +151,26 @@ func (s *Server) retireNativeTenantVariablesPrivilegeFor(ctx context.Context, t 
 	if s.nativePrivilegeRetireBackoff(t.ID) {
 		return nativePrivilegeRetireSkipped
 	}
-	// Only tenants whose stored user is the restricted account can carry the legacy
-	// grant; a DSN still naming the root principal is handled by the setup path when
-	// the tenant is finalized.
-	if !strings.HasSuffix(strings.TrimSpace(t.DBUser), ".tdc_fs_sys") {
-		return nativePrivilegeRetireSkipped
-	}
 	plain, err := s.pool.Decrypt(ctx, t.DBPasswordCipher)
 	if err != nil {
+		// A wrong master key or corrupt cipher fails identically on every pass: back it
+		// off like any other failure instead of dialling and logging every tick.
 		logger.Warn(ctx, "native_privilege_retire_decrypt_failed", zap.String("tenant_id", t.ID), zap.Error(err))
+		metrics.RecordOperation("user_db_access", "native_privilege_retire", "error", 0)
+		s.recordNativePrivilegeRetireFailure(t.ID)
 		return nativePrivilegeRetireFailed
 	}
 	dsn := tenantDSN(t.DBUser, string(plain), t.DBHost, t.DBPort, t.DBName, t.DBTLS, t.Provider)
 	retireCtx, cancel := context.WithTimeout(ctx, nativePrivilegeRetireTimeout)
 	defer cancel()
 	if err := tidbcloudnative.RetireLegacySystemUserPrivilege(retireCtx, dsn); err != nil {
-		// A password that no longer authenticates as the cluster root means the
-		// credential was rotated by an operator, who already owns the account: record
-		// it and keep going so one tenant cannot stall the pass.
 		if isAccessDenied(err) {
+			// The stored password no longer authenticates as the cluster root: an operator
+			// rotated the credential and owns the account now. Memoize it like a remediation
+			// so the pass stops attempting a root login against that cluster every tick, and
+			// re-check daily; one tenant cannot stall the pass meanwhile.
 			logger.Info(ctx, "native_privilege_retire_skipped_rotated", zap.String("tenant_id", t.ID))
+			s.markNativePrivilegeRetireDone(t.ID)
 			return nativePrivilegeRetireSkipped
 		}
 		logger.Warn(ctx, "native_privilege_retire_failed", zap.String("tenant_id", t.ID), zap.Error(err))
@@ -167,7 +189,16 @@ func (s *Server) nativePrivilegeRetireRecentlyDone(tenantID string) bool {
 	s.nativePrivilegeRetireMu.Lock()
 	defer s.nativePrivilegeRetireMu.Unlock()
 	doneAt, ok := s.nativePrivilegeRetireDone[tenantID]
-	return ok && time.Since(doneAt) < nativePrivilegeRetireRecheckInterval
+	if !ok {
+		return false
+	}
+	if time.Since(doneAt) < nativePrivilegeRetireRecheckInterval {
+		return true
+	}
+	// A tenant deleted after remediation would otherwise keep its entry for the life of
+	// the process; the first stale lookup drops it.
+	delete(s.nativePrivilegeRetireDone, tenantID)
+	return false
 }
 
 // markNativePrivilegeRetireDone records a successful retire.
@@ -186,7 +217,24 @@ func (s *Server) nativePrivilegeRetireBackoff(tenantID string) bool {
 	s.nativePrivilegeRetireMu.Lock()
 	defer s.nativePrivilegeRetireMu.Unlock()
 	retryAt, ok := s.nativePrivilegeRetireRetryAt[tenantID]
-	return ok && time.Now().Before(retryAt)
+	if !ok {
+		return false
+	}
+	if time.Now().Before(retryAt) {
+		return true
+	}
+	delete(s.nativePrivilegeRetireRetryAt, tenantID)
+	delete(s.nativePrivilegeRetireFailures, tenantID)
+	return false
+}
+
+// nativePrivilegeRetireClusterKey identifies the cluster a tenant's database lives on,
+// which is the scope of the revoke.
+func nativePrivilegeRetireClusterKey(t *meta.Tenant) string {
+	if t == nil || strings.TrimSpace(t.DBHost) == "" {
+		return ""
+	}
+	return t.DBHost + ":" + strconv.Itoa(t.DBPort)
 }
 
 // recordNativePrivilegeRetireFailure schedules the next attempt for a tenant with
