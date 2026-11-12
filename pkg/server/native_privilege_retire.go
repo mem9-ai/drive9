@@ -195,8 +195,9 @@ func (s *Server) nativePrivilegeRetireRecentlyDone(tenantID string) bool {
 	if time.Since(doneAt) < nativePrivilegeRetireRecheckInterval {
 		return true
 	}
-	// A tenant deleted after remediation would otherwise keep its entry for the life of
-	// the process; the first stale lookup drops it.
+	// Prune the expired entry instead of letting it sit there: this only fires for a
+	// tenant the scan still visits, so it bounds the map for live tenants rather than
+	// sweeping up entries whose tenant was deleted while memoized.
 	delete(s.nativePrivilegeRetireDone, tenantID)
 	return false
 }
@@ -240,13 +241,10 @@ func nativePrivilegeRetireClusterKey(t *meta.Tenant) string {
 	if t == nil || strings.TrimSpace(t.DBHost) == "" {
 		return ""
 	}
-	user := strings.TrimSpace(t.DBUser)
-	prefix := strings.TrimSuffix(user, tidbcloudnative.RestrictedSystemUserNameSuffix)
-	if prefix == user {
-		// Not a restricted account: fall back to the account name so distinct principals
-		// on one endpoint are never folded together.
-		prefix = user
-	}
+	// A stored name outside the restricted form keeps its full account name here, so two
+	// distinct principals on one endpoint are never folded together, while tenants of one
+	// instance still share a key.
+	prefix := strings.TrimSuffix(strings.TrimSpace(t.DBUser), tidbcloudnative.RestrictedSystemUserNameSuffix)
 	return strings.TrimSpace(t.DBHost) + ":" + strconv.Itoa(t.DBPort) + "|" + prefix
 }
 

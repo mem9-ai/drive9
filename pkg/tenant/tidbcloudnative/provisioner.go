@@ -1544,23 +1544,30 @@ func IsMissingGrantError(err error) bool {
 	return errors.As(err, &mysqlErr) && (mysqlErr.Number == 1141 || mysqlErr.Number == 1147)
 }
 
+// tenantRoleName is the fixed role the native setup creates on the tenant's instance
+// and grants the tenant account. It is package-level because the setup statements and
+// the legacy-grant remediation must name the same role: a drift between them would make
+// the revoke hit a role that does not exist, which IsMissingGrantError deliberately
+// tolerates as "nothing to do", and the real grant would survive while the pass reports
+// success.
+const tenantRoleName = "tdc_fs_admin"
+
 func systemUserStatements(dbName, username, password string) []string {
-	const roleName = "tdc_fs_admin"
 	return []string{
 		fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s", quoteIdent(dbName)),
-		fmt.Sprintf("CREATE ROLE IF NOT EXISTS %s", quoteString(roleName)),
+		fmt.Sprintf("CREATE ROLE IF NOT EXISTS %s", quoteString(tenantRoleName)),
 		// Tenant SQL runs as this role, so it must not carry a cluster-wide dynamic
 		// privilege: SYSTEM_VARIABLES_ADMIN ON *.* lets the tenant SET GLOBAL on the
 		// shared instance, which is a whole-cluster escalation that the SQL
 		// classifier cannot be the only guard for. Nothing in the tenant runtime
 		// issues SET GLOBAL, so the legacy grant is revoked on every setup — an
 		// upgraded cluster loses the escalation the next time a tenant is finalized.
-		fmt.Sprintf("REVOKE SYSTEM_VARIABLES_ADMIN ON *.* FROM %s", quoteString(roleName)),
-		fmt.Sprintf("GRANT CREATE, ALTER, DROP, INDEX, SELECT, INSERT, UPDATE, DELETE ON %s.* TO %s", quoteIdent(dbName), quoteString(roleName)),
+		fmt.Sprintf("REVOKE SYSTEM_VARIABLES_ADMIN ON *.* FROM %s", quoteString(tenantRoleName)),
+		fmt.Sprintf("GRANT CREATE, ALTER, DROP, INDEX, SELECT, INSERT, UPDATE, DELETE ON %s.* TO %s", quoteIdent(dbName), quoteString(tenantRoleName)),
 		fmt.Sprintf("CREATE USER IF NOT EXISTS %s IDENTIFIED BY %s", quoteString(username), quoteString(password)),
 		fmt.Sprintf("ALTER USER %s IDENTIFIED BY %s", quoteString(username), quoteString(password)),
-		fmt.Sprintf("GRANT %s TO %s", quoteString(roleName), quoteString(username)),
-		fmt.Sprintf("SET DEFAULT ROLE %s TO %s", quoteString(roleName), quoteString(username)),
+		fmt.Sprintf("GRANT %s TO %s", quoteString(tenantRoleName), quoteString(username)),
+		fmt.Sprintf("SET DEFAULT ROLE %s TO %s", quoteString(tenantRoleName), quoteString(username)),
 	}
 }
 
@@ -1593,7 +1600,7 @@ func RetireLegacySystemUserPrivilege(ctx context.Context, dsn string) error {
 		return fmt.Errorf("open native tenant database as root: %w", err)
 	}
 	defer func() { _ = db.Close() }()
-	stmt := fmt.Sprintf("REVOKE SYSTEM_VARIABLES_ADMIN ON *.* FROM %s", quoteString("tdc_fs_admin"))
+	stmt := fmt.Sprintf("REVOKE SYSTEM_VARIABLES_ADMIN ON *.* FROM %s", quoteString(tenantRoleName))
 	if _, err := db.ExecContext(ctx, stmt); err != nil && !IsMissingGrantError(err) {
 		return fmt.Errorf("revoke legacy system variables grant: %w", err)
 	}
