@@ -24,10 +24,13 @@ import (
 	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
+	"go.uber.org/zap"
+
 	"github.com/mem9-ai/drive9/pkg/extensions/core"
 	"github.com/mem9-ai/drive9/pkg/fs"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/dircache"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/perf"
+	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/mountcontrol"
 	"github.com/mem9-ai/drive9/pkg/pathutil"
 )
@@ -105,8 +108,9 @@ type FS struct {
 	inodes  *InodeToPath
 	bypass  *kernelCacheBypassTable
 	openIdx *OpenHandleIndex
-	// deferredUnlinks holds ino→path for unlink-of-open-file deferrals.
-	deferredUnlinks map[uint64]string
+	// Entries remain registered until remote deletion and cache updates finish.
+	// Each entry serializes its last-close and same-name replacement callers.
+	deferredUnlinks map[string]*deferredUnlink
 	perf            *perf.Counters
 	mountPt         string
 	rootTag         string
@@ -210,7 +214,7 @@ func New(opts Options) (*FS, error) {
 		handles:         &handleTable{m: map[uint64]*fileHandle{}},
 		dirs:            &dirTable{m: map[uint64]*dirHandle{}},
 		pathLocks:       &lockTable{},
-		deferredUnlinks: make(map[uint64]string),
+		deferredUnlinks: make(map[string]*deferredUnlink),
 		uid:             uid,
 		gid:             gid,
 	}
@@ -523,110 +527,109 @@ func (f *FS) stampOwner(ino uint64, caller fs.Caller) {
 	}
 }
 
-// touchParentMtime advances the parent directory's mtime after a namespace
-// mutation inside it (v1 touchDirectoryChangeTime): rmdir/mkdir rows compare
-// parent mtimes around child changes.
-// isDeferredUnlink reports a name whose remote deletion waits for the last
-// close of its open handles.
+type deferredUnlink struct {
+	mu   sync.Mutex
+	path string
+	ino  uint64
+}
+
+// isDeferredUnlink also includes deletions whose remote request is in flight.
 func (f *FS) isDeferredUnlink(path string) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	for _, p := range f.deferredUnlinks {
-		if p == path {
-			return true
-		}
-	}
-	return false
+	return f.deferredUnlinks[path] != nil
 }
 
-// maybeRunDeferredUnlink fires the postponed remote deletion once the last
-// handle of the unlinked inode closes.
+// maybeRunDeferredUnlink fires postponed remote deletions once the last
+// handle of the unlinked inode closes. Each hardlink alias owns its deletion.
 func (f *FS) maybeRunDeferredUnlink(ino uint64) {
 	f.mu.Lock()
-	path, ok := f.deferredUnlinks[ino]
-	if !ok {
-		f.mu.Unlock()
-		return
+	var pending []*deferredUnlink
+	for _, entry := range f.deferredUnlinks {
+		if entry.ino == ino {
+			pending = append(pending, entry)
+		}
 	}
-	if f.openIdx.HasOpenInode(ino) {
-		f.mu.Unlock()
-		return
-	}
-	delete(f.deferredUnlinks, ino)
 	f.mu.Unlock()
-	// The deferred delete belongs to the object captured at unlink time. A
-	// path that has since been rebound to a NEWER object (unlink + recreate
-	// before the last handle closed) must not be deleted on the old
-	// object's behalf — the replacement's own landing owns the name now.
-	if cur, ok := f.inodes.GetInode(path); ok && cur != ino {
-		return
+	for _, entry := range pending {
+		if err := f.runDeferredUnlink(entry, true); err != nil {
+			// Release cannot return an error to the unlink caller. Keep the
+			// pending entry so a replacement retries cleanup before proceeding.
+			logger.L().Error("deferred unlink failed", zap.String("path", entry.path), zap.Error(err))
+		}
 	}
-	// Synchronous with a detached budget (v1: release completes the
-	// survivor deletion before replying, so the storage is gone at close).
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(context.Background()), 30*time.Second)
-	defer cancel()
-	if _, err := f.chain.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: path}); err != nil {
-		// The unlink syscall already returned OK; nothing can surface this
-		// to its caller — but a silently-lost deletion must at least be
-		// visible to the operator (v1 surfaced it inline).
-		fmt.Fprintf(os.Stderr, "drive9: deferred unlink of %s failed: %v\n", path, err)
+}
+
+// runDeferredUnlink serializes cleanup without holding the filesystem mutex
+// during I/O. Waiters recheck ownership after acquiring the entry's lock: a
+// completed deletion must never run again against a replacement object.
+func (f *FS) runDeferredUnlink(pending *deferredUnlink, requireClosed bool) error {
+	pending.mu.Lock()
+	defer pending.mu.Unlock()
+	f.mu.Lock()
+	current := f.deferredUnlinks[pending.path] == pending
+	f.mu.Unlock()
+	if !current || (requireClosed && f.openIdx.HasOpenInode(pending.ino)) {
+		return nil
 	}
-	f.markNameNegative(path)
+	path := pending.path
+	// A name rebound to a newer inode is not the old object's to delete.
+	if cur, ok := f.inodes.GetInode(path); !ok || cur == pending.ino {
+		// Detached budget: release completes deletion before replying, even
+		// if the caller's original request has already been cancelled.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if _, err := f.chain.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: path}); err != nil && fs.StatusOf(err) != gofuse.ENOENT {
+			return err
+		}
+		f.markNameNegative(path)
+	}
+	f.mu.Lock()
+	if f.deferredUnlinks[path] == pending {
+		delete(f.deferredUnlinks, path)
+	}
+	f.mu.Unlock()
+	return nil
 }
 
 // flushDeferredUnlink lands a postponed deletion now: a fresh creator of
 // the same name (create/mkdir/mknod/symlink/link/rename target) must not
 // collide with the old entry's not-yet-deleted remote inode.
-func (f *FS) flushDeferredUnlink(path string) {
+func (f *FS) flushDeferredUnlink(path string) error {
 	f.mu.Lock()
-	found := false
-	var deferredIno uint64
-	for i, p := range f.deferredUnlinks {
-		if p == path {
-			found = true
-			deferredIno = i
-			delete(f.deferredUnlinks, i)
-			break
-		}
-	}
+	pending := f.deferredUnlinks[path]
 	f.mu.Unlock()
-	if !found {
-		return
+	if pending == nil {
+		return nil
 	}
-	// Same identity fence as maybeRunDeferredUnlink: a name rebound to a
-	// newer object is not this deferred delete's to remove.
-	if cur, ok := f.inodes.GetInode(path); ok && cur != deferredIno {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(context.Background()), 30*time.Second)
-	defer cancel()
-	_, _ = f.chain.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: path})
-	f.markNameNegative(path)
+	return f.runDeferredUnlink(pending, false)
 }
 
 // flushDeferredUnlinksUnder lands every postponed deletion under dir/ —
 // removing the directory itself must not race the last-close deferral
 // (rmdir would otherwise hit ENOTEMPTY against a name that is already gone
 // from the namespace).
-func (f *FS) flushDeferredUnlinksUnder(dir string) {
+func (f *FS) flushDeferredUnlinksUnder(dir string) error {
 	prefix := strings.TrimSuffix(dir, "/") + "/"
 	f.mu.Lock()
-	var pending []string
-	for ino, p := range f.deferredUnlinks {
-		if strings.HasPrefix(p, prefix) {
-			pending = append(pending, p)
-			delete(f.deferredUnlinks, ino)
+	var pending []*deferredUnlink
+	for path, entry := range f.deferredUnlinks {
+		if strings.HasPrefix(path, prefix) {
+			pending = append(pending, entry)
 		}
 	}
 	f.mu.Unlock()
-	for _, p := range pending {
-		ctx, cancel := context.WithTimeout(context.WithoutCancel(context.Background()), 30*time.Second)
-		_, _ = f.chain.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: p})
-		cancel()
-		f.markNameNegative(p)
+	for _, entry := range pending {
+		if err := f.runDeferredUnlink(entry, false); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
+// touchParentMtime advances the parent directory's mtime after a namespace
+// mutation inside it (v1 touchDirectoryChangeTime): rmdir/mkdir rows compare
+// parent mtimes around child changes.
 func (f *FS) touchParentMtime(parentIno uint64) {
 	if parentIno == 0 || parentIno == 1 {
 		return
@@ -1922,7 +1925,9 @@ func (f *FS) Mknod(cancel <-chan struct{}, input *gofuse.MknodIn, name string, o
 	if st != gofuse.OK {
 		return st
 	}
-	f.flushDeferredUnlink(child)
+	if err := f.flushDeferredUnlink(child); err != nil {
+		return fs.StatusOf(err)
+	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 	start := time.Now()
@@ -1956,7 +1961,9 @@ func (f *FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name string, o
 	if st != gofuse.OK {
 		return st
 	}
-	f.flushDeferredUnlink(child)
+	if err := f.flushDeferredUnlink(child); err != nil {
+		return fs.StatusOf(err)
+	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 	mode := fs.Attr{Kind: fs.KindDir, Mode: input.Mode & 0o7777}
@@ -2045,7 +2052,7 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 		f.inodes.RemoveLinkPreserve(child)
 		if iok {
 			f.mu.Lock()
-			f.deferredUnlinks[ino] = child
+			f.deferredUnlinks[child] = &deferredUnlink{path: child, ino: ino}
 			f.mu.Unlock()
 		}
 		f.touchParentMtime(header.NodeId)
@@ -2070,7 +2077,8 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 
 // dropSiblingRows invalidates the cached listing rows of a hardlink's
 // surviving aliases after one alias is removed: their recorded link count
-// is stale until the next listing (the stat answered the pre-unlink count).
+// is stale. Invalidate the parent as well so a missing row cannot become an
+// authoritative ENOENT in a complete listing or a session-created directory.
 func (f *FS) dropSiblingRows(removed string, siblings []string) {
 	if f.Ctx.DirCache == nil {
 		return
@@ -2079,9 +2087,7 @@ func (f *FS) dropSiblingRows(removed string, siblings []string) {
 		if p == removed {
 			continue
 		}
-		if dc, ok := f.Ctx.DirCache.(*dircache.DirCache); ok {
-			dc.Remove(parentDirOf(p), pathpkg.Base(p))
-		}
+		f.Ctx.DirCache.Invalidate(parentDirOf(p))
 	}
 }
 
@@ -2090,7 +2096,9 @@ func (f *FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name string)
 	if st != gofuse.OK {
 		return st
 	}
-	f.flushDeferredUnlinksUnder(child)
+	if err := f.flushDeferredUnlinksUnder(child); err != nil {
+		return fs.StatusOf(err)
+	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 	if _, st := f.dispatch(ctx, &fs.Op{Kind: fs.OpRmdir, Path: child, Ino: header.NodeId, Kernel: header, Caller: fs.CallerFrom(*header)}); st != gofuse.OK {
@@ -2128,7 +2136,9 @@ func (f *FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName stri
 		return gofuse.OK
 	}
 	f.debugf("rename start old=%s new=%s", oldPath, newPath)
-	f.flushDeferredUnlink(newPath)
+	if err := f.flushDeferredUnlink(newPath); err != nil {
+		return fs.StatusOf(err)
+	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 	start := time.Now()
@@ -2202,6 +2212,9 @@ func (f *FS) Link(cancel <-chan struct{}, input *gofuse.LinkIn, filename string,
 	if st != gofuse.OK {
 		return st
 	}
+	if err := f.flushDeferredUnlink(newPath); err != nil {
+		return fs.StatusOf(err)
+	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 	res, st := f.dispatch(ctx, &fs.Op{Kind: fs.OpLink, Path: oldPath, Path2: newPath, Ino: input.NodeId, Ino2: input.Oldnodeid, Kernel: input, Caller: fs.CallerFrom(input.InHeader)})
@@ -2255,7 +2268,9 @@ func (f *FS) Symlink(cancel <-chan struct{}, header *gofuse.InHeader, pointedTo 
 	if st != gofuse.OK {
 		return st
 	}
-	f.flushDeferredUnlink(child)
+	if err := f.flushDeferredUnlink(child); err != nil {
+		return fs.StatusOf(err)
+	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 	if _, st := f.dispatch(ctx, &fs.Op{Kind: fs.OpSymlink, Path: child, Target: pointedTo, Ino: header.NodeId, Kernel: header, Caller: fs.CallerFrom(*header)}); st != gofuse.OK {
@@ -2547,7 +2562,9 @@ func (f *FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name string,
 	if st != gofuse.OK {
 		return st
 	}
-	f.flushDeferredUnlink(child)
+	if err := f.flushDeferredUnlink(child); err != nil {
+		return fs.StatusOf(err)
+	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 	start := time.Now()
