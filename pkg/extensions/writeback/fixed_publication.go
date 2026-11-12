@@ -45,10 +45,13 @@ func (p fixedExtentPublication) validate(c *client.Client) error {
 	return nil
 }
 
-// publishFixedExtent records the exact completion before sending it. Failure
-// leaves recovery in the WAL, including a save failure whose durability is
-// unknown. Never abort or allocate a replacement operation after this call.
-// The caller settles the WAL only AFTER durable, generation-checked cleanup.
+// publishFixedExtent records the exact completion before sending it. Validation
+// and local-identity protection failures do not attempt a new WAL append or HTTP
+// request. Once PrepareFixedUpload is called, a save error can leave a request
+// with unknown durability. The caller must retain the original publication and
+// inspect/replay its WAL identity; an error alone never justifies aborting the
+// upload or allocating a replacement operation. Settle the WAL only AFTER
+// durable, generation-checked cleanup.
 func publishFixedExtent(ctx context.Context, c *client.Client, journal *staging.Journal, pending *staging.PendingIndex, cache *staging.WriteBackCache, publication fixedExtentPublication) (client.FixedUploadCompletion, error) {
 	if err := publication.validate(c); err != nil {
 		return client.FixedUploadCompletion{}, err
