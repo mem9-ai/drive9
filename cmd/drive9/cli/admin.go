@@ -26,6 +26,8 @@ func Admin(args []string) error {
 		return adminTenantPool(args[1:])
 	case "object-backend":
 		return adminObjectBackend(args[1:])
+	case "migration":
+		return AdminMigration(args[1:])
 	default:
 		return fmt.Errorf("unknown admin command %q\n%s", args[0], adminUsage())
 	}
@@ -687,6 +689,7 @@ commands:
   tenant object-namespace <get|set|clear>  bind a customer object prefix id
   tenant logs --tenant-id ID        query one tenant's logs
   object-backend <add|get|ls|update|rm>  org object-store credentials
+  migration <command> [flags]       cross-cloud tenant migration operations
   pool <command> [flags]            manage the tenant pool
 
 global admin flags:

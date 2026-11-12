@@ -1770,7 +1770,7 @@ func TestAdminTenantGetUsesIAMOrganizationAuthorizationAndReturnsQuota(t *testin
 		t.Fatal(err)
 	}
 	rt.prov.iamIdentities = []*tenant.TiDBCloudAPIKeyIdentity{{
-		OrganizationID: "org-1", Role: tenant.TiDBCloudRoleProjectOwner,
+		OrganizationID: "org-1", Role: tenant.TiDBCloudRoleOrgOwner,
 	}}
 	ts := httptest.NewServer(rt.server)
 	defer ts.Close()
@@ -3427,7 +3427,7 @@ func TestAdminTenantQuotaSetRejectsProvisioningTenant(t *testing.T) {
 		t.Fatal(err)
 	}
 	rt.prov.iamIdentities = []*tenant.TiDBCloudAPIKeyIdentity{{
-		OrganizationID: "org-1", Role: tenant.TiDBCloudRoleProjectOwner,
+		OrganizationID: "org-1", Role: tenant.TiDBCloudRoleOrgOwner,
 	}}
 	ts := httptest.NewServer(rt.server)
 	defer ts.Close()

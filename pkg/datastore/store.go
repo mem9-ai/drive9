@@ -15,6 +15,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-sql-driver/mysql"
+
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/metrics"
 	"github.com/mem9-ai/drive9/pkg/mysqlutil"
@@ -166,12 +168,36 @@ func OpenForTenantWithOrg(ctx context.Context, dsn, tenantID, tidbCloudOrgID str
 	return OpenForTenantScoped(ctx, dsn, tenantID, tidbCloudOrgID, StandaloneScope())
 }
 
+// rejectMultiStatementsDSN refuses a DSN that enables driver-side statement
+// chaining.
+//
+// The classifier authorizes one statement at a time, so anything after the first
+// `;` would otherwise run with the tag-write grant. The DSN is parsed rather than
+// substring-matched because go-sql-driver accepts multiStatements=true, =1, =T and
+// =TRUE.
+func rejectMultiStatementsDSN(dsn string) error {
+	cfg, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		// An unparseable DSN fails at open time with the driver's own message;
+		// nothing to inspect here.
+		return nil
+	}
+	if cfg.MultiStatements {
+		return fmt.Errorf("multiStatements is not allowed in production DSN")
+	}
+	return nil
+}
+
 // OpenForTenantScoped opens a Store whose SQL is shaped by scope. The scope
 // is fixed for the lifetime of the Store.
 func OpenForTenantScoped(ctx context.Context, dsn, tenantID, tidbCloudOrgID string, scope Scope) (*Store, error) {
-	lower := strings.ToLower(dsn)
-	if strings.Contains(lower, "multistatements=true") || strings.Contains(lower, "multistatements=1") {
-		return nil, fmt.Errorf("multiStatements is not allowed in production DSN")
+	// The statement classifier is single-statement, so a DSN that lets the driver
+	// chain statements would execute everything after the first `;` under the
+	// tag-write authorization. Parse the DSN instead of pattern-matching it: the
+	// driver accepts multiStatements=true/1/T/TRUE, and a substring test misses the
+	// short forms.
+	if err := rejectMultiStatementsDSN(dsn); err != nil {
+		return nil, err
 	}
 	db, err := mysqlutil.OpenInstrumentedForTenantWithOrg(ctx, dsn, mysqlutil.RoleUser, tenantID, tidbCloudOrgID)
 	if err != nil {
@@ -1019,6 +1045,57 @@ func (s *Store) HasConfirmedS3StorageRef(ctx context.Context, storageRefHash, st
 		WHERE `+scopeWhereAnd(s.scope, `c.storage_type = ? AND i.status = ? AND c.storage_ref_hash = ? AND c.storage_ref = ?`, "c", "i")+`
 		LIMIT 1`, scopeWhereArgs(s.scope, 2, StorageS3, StatusConfirmed, storageRefHash, storageRef)...)
 	var one int
+	if err := row.Scan(&one); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// HasFSLayerStorageRef reports whether retained fs-layer history points at the
+// exact storage ref. Layer payloads are stored under layers/<layerID>/<object>
+// and stay readable for as long as any entry row carries the ref — abandoning a
+// layer keeps its entries — so the payload is still claimed whenever this
+// returns true.
+//
+// Layer refs are checked separately from the high-volume confirmed-content path
+// so ordinary blob GC keeps using its existing index; rows always carry the hash
+// (normalizeFSLayerEntry derives it), which is what
+// idx_fs_layer_entries_storage_ref makes this lookup cheap.
+func (s *Store) HasFSLayerStorageRef(ctx context.Context, storageRefHash, storageRef string) (out bool, err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "has_fs_layer_storage_ref", start, &err)
+	if storageRefHash == "" || storageRef == "" {
+		return false, nil
+	}
+	// The hash is passed in by the GC candidate, not read from the row, so the
+	// query derives it from the ref again: a row that recorded a different hash
+	// must not be able to hide a live claim from collection.
+	if canonical := StorageRefHash(storageRef); canonical != storageRefHash {
+		storageRefHash = canonical
+	}
+	row := s.db.QueryRowContext(ctx, `SELECT 1
+		FROM fs_layer_entries
+		WHERE `+s.scope.And(`storage_ref_hash = ? AND storage_ref = ?`)+`
+		LIMIT 1`, s.scope.Args(storageRefHash, storageRef)...)
+	var one int
+	err = row.Scan(&one)
+	if err == nil {
+		return true, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
+	// A row written before the upsert derived the hash can carry a nonempty but
+	// wrong value in this column, and the column is not backfilled. The ref is
+	// the identity, so fall back to it: this scan only runs for a layer payload
+	// the indexed lookup could not attribute, i.e. one about to be collected.
+	row = s.db.QueryRowContext(ctx, `SELECT 1
+		FROM fs_layer_entries
+		WHERE `+s.scope.And(`storage_ref = ?`)+`
+		LIMIT 1`, s.scope.Args(storageRef)...)
 	if err := row.Scan(&one); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return false, nil
@@ -3142,6 +3219,9 @@ func storeOpResultForError(err error) string {
 		return "ok"
 	case errors.Is(err, ErrNotFound):
 		return "not_found"
+	case errors.Is(err, ErrExecSQLRejected):
+		// The statement was refused, not executed: client input, not a failure.
+		return "rejected"
 	case errors.Is(err, ErrPathConflict),
 		errors.Is(err, ErrDirectoryNotEmpty),
 		errors.Is(err, ErrRevisionConflict),
@@ -3166,7 +3246,7 @@ func storeOpResultForError(err error) string {
 
 func shouldLogStoreOpFailure(result string) bool {
 	switch result {
-	case "not_found", "conflict", "canceled", "deadline_exceeded", "conn_closed":
+	case "not_found", "conflict", "canceled", "deadline_exceeded", "conn_closed", "rejected":
 		return false
 	default:
 		return true

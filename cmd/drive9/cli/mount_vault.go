@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -71,6 +72,9 @@ func vaultMountCmd(args []string, background bool) error {
 
 	serverVal, apiKeyVal, tokenVal, err := resolveMountCredentials(ResolveCredentials(), *server, *apiKey)
 	if err != nil {
+		return err
+	}
+	if err := refuseMigratedSourceMount(context.Background(), serverVal, apiKeyVal, tokenVal); err != nil {
 		return err
 	}
 

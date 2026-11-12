@@ -45,6 +45,7 @@ The server must have remote exec enabled. Otherwise the command reports
   | Status | Meaning |
   | --- | --- |
   | 124 | `-t` timeout reached; the command was stopped |
+  | 125 | the executor failed, for example because it exceeded a CPU, output, or interpreter resource limit |
   | 126 / 127 | command not executable / not found |
   | 130 | canceled before sending, server-confirmed cancellation, or detachment after a second Ctrl-C |
   | 255 | the outcome could not be confirmed, including a lost or invalid result stream |
@@ -52,12 +53,29 @@ The server must have remote exec enabled. Otherwise the command reports
   Remote commands can also return these numeric statuses themselves. Read the
   accompanying diagnostic; status 130 alone does not confirm a remote stop.
 
+  An executor failure reports its error category and execution ID on stderr.
+  Its output or writes may be partial; it does not mean a search found no
+  matches. A completed `grep` with no matches still returns 1. File read errors,
+  including the lightweight executor's file limit, remain command errors
+  (`grep` returns 2 with a diagnostic).
+
 - **Ctrl-C.** The first Ctrl-C requests cancellation and waits for the server
   to confirm the command stopped and the workspace drained. If confirmation is
   unavailable, the outcome remains unknown. A second Ctrl-C detaches immediately;
   the command may keep running.
 - **Never retried.** If the outcome is unknown, the command may already have
   run. Check the workspace before running it again.
+
+The lightweight executor has bounded file and matching budgets. Servers with
+input metadata preflight check supported literal file operands before execution
+and select a sandbox when an existing file exceeds the lightweight file budget.
+This requires the corresponding server and executor update; it is not enabled
+by updating the CLI alone. Files created or enlarged during execution still
+have to fit the selected executor's limits. The command is not automatically
+rerun in a sandbox after execution has started. For a
+read-only query that is safe to repeat, `--fresh` selects a new sandbox, at the
+cost of sandbox startup time. Check any earlier writes before rerunning a
+command that can modify files.
 
 ## Flags
 

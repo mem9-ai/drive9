@@ -1089,7 +1089,13 @@ func normalizeFSLayerEntry(entry *FSLayerEntry) error {
 			entry.Mode = 0o755
 		}
 	}
-	if entry.StorageRefHash == "" && entry.StorageRef != "" {
+	// Derive the hash from the ref instead of keeping a caller-supplied value:
+	// object GC asks whether a layer entry still claims a payload by hash, so a
+	// nonempty but wrong hash would hide the claim and let the payload be
+	// collected while this entry still reads it.
+	if entry.StorageRef == "" {
+		entry.StorageRefHash = ""
+	} else {
 		entry.StorageRefHash = StorageRefHash(entry.StorageRef)
 	}
 	return nil

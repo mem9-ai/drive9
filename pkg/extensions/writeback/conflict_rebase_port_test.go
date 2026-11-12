@@ -604,6 +604,20 @@ func TestPortLedgerShadowSurvivesQueueLanding(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	t.Cleanup(func() {
+		// Stop drains workers and does not enforce its context deadline.
+		// Cancel this fixture's only path first, including a pending upload
+		// left behind when a landing assertion fails, then join the workers.
+		if wb.queue != nil {
+			if err := wb.queue.CancelPath("/h"); err != nil {
+				t.Errorf("cancel fixture upload: %v", err)
+			}
+		}
+		if err := wb.Stop(context.Background()); err != nil {
+			t.Errorf("stop writeback: %v", err)
+		}
+	})
+
 	// A spilled (17 MiB) ledger image G2 over a DIFFERENT 17 MiB remote row
 	// G1 — the lazy branch, not the materialize branch.
 	ledgerImage := bytes.Repeat([]byte("L"), 17<<20)
@@ -634,11 +648,11 @@ func TestPortLedgerShadowSurvivesQueueLanding(t *testing.T) {
 	}
 	deadline := time.Now().Add(20 * time.Second)
 	for {
-		if n, ok := b.Node("/h"); ok && string(n.Data[:7]) == "LLLLLLL" {
+		if n, ok := b.Node("/h"); ok && string(n.Data[:7]) == "LLLLLLL" && !ledger.Shadow.Has("/h") {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("ledger image never landed")
+			t.Fatal("ledger image did not finish landing and shadow cleanup")
 		}
 		time.Sleep(50 * time.Millisecond)
 	}

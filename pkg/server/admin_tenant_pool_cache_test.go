@@ -16,7 +16,7 @@ func TestFirstManagedOrganizationUsesIAMIdentityCache(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	rt.prov.iamIdentities = []*tenant.TiDBCloudAPIKeyIdentity{
 		{OrganizationID: "org-cached-1", Role: tenant.TiDBCloudRoleOrgOwner},
-		{OrganizationID: "org-cached-2", Role: tenant.TiDBCloudRoleProjectOwner},
+		{OrganizationID: "org-cached-2", Role: tenant.TiDBCloudRoleOrgOwner},
 	}
 	ctx := context.Background()
 	cred := tenant.CredentialProvisionRequest{PublicKey: "pk", PrivateKey: "sk"}
@@ -57,7 +57,7 @@ func TestResolveTiDBCloudIdentityRejectsInsufficientRole(t *testing.T) {
 	rt.prov.iamErr = tenant.ErrTiDBCloudRoleInsufficient
 	_, err := rt.server.resolveTiDBCloudIdentity(context.Background(), tenant.CredentialProvisionRequest{
 		PublicKey: "pk", PrivateKey: "sk",
-	}, "test_role")
+	}, "test_role", "")
 	if err == nil || !isTiDBCloudRoleInsufficient(err) {
 		t.Fatalf("error = %v, want insufficient role", err)
 	}

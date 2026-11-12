@@ -114,13 +114,13 @@ func MountVault(opts *VaultMountOptions) error {
 
 // newVaultMountOptions assembles the kernel mount options for a vault mount.
 //
-// A private mount is already restricted by the kernel to the mounting user, so
-// the mode bits VaultFS reports are what protect it; sharing is an explicit
-// --allow-other opt-in, and on Linux default_permissions is what makes the kernel
-// enforce 0400/0500 (0444/0555 when shared) once other users may traverse it.
-// Without it, allow_other leaves the decision to the filesystem's own checks and
-// every local user can read the plaintext secrets. Mirrors newGoFuseMountOptions
-// in pkg/fuse.
+// A private mount is already restricted by the kernel to the mounting user, so the
+// mode bits VaultFS reports are what protect it. Sharing is an explicit --allow-other
+// opt-in, and on a shared mount default_permissions is what makes the kernel enforce
+// 0400/0500 (0444/0555 when shared) once other users may traverse it — on Linux and on
+// macOS alike; without it macFUSE forwards the decision to VaultFS, which has no
+// per-user handler, and every local user can read the plaintext secrets. Mirrors
+// newGoFuseMountOptions in pkg/fuse.
 func newVaultMountOptions(opts *VaultMountOptions) *gofuse.MountOptions {
 	return newVaultMountOptionsFor(runtime.GOOS, opts)
 }
@@ -143,16 +143,21 @@ func newVaultMountOptionsFor(goos string, opts *VaultMountOptions) *gofuse.Mount
 		}
 	}
 	if goos == "darwin" {
-		// macFUSE has no default_permissions switch. defer_permissions defers the
-		// check to the filesystem's own handlers (pkg/fuse passes it for every
-		// mount); VaultFS implements no per-user handler, so the protection for a
-		// private mount is the kernel restricting the mount to the mounting user,
-		// and sharing is the explicit --allow-other opt-in.
-		fuseOpts.Options = append(fuseOpts.Options, "defer_permissions", "local")
+		// macFUSE checks mode bits in the kernel only with default_permissions;
+		// without it every authorization is an ACCESS upcall to VaultFS, which has no
+		// per-user handler. A shared mount therefore arms the kernel like the Linux
+		// branch, while a private one is already kernel-restricted to the mounting
+		// user and keeps defer_permissions to stay off the per-operation path.
+		if opts.AllowOther {
+			fuseOpts.Options = append(fuseOpts.Options, "default_permissions", "local")
+		} else {
+			fuseOpts.Options = append(fuseOpts.Options, "defer_permissions", "local")
+		}
 	}
 	// Other platforms (e.g. FreeBSD) take neither branch, so an allow_other vault
-	// mount there keeps the pre-change exposure. That matches pkg/fuse house
-	// behavior; a platform that supports it should add its own enforcement flag.
+	// mount there keeps the pre-change exposure: VaultFS has no daemon-side gate of
+	// its own, unlike pkg/fuse, which falls back to its daemon gate where the kernel
+	// is not armed. A platform that supports a kernel-side flag should add it here.
 	return fuseOpts
 }
 

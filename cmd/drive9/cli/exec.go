@@ -24,6 +24,7 @@ import (
 // They follow shell conventions (timeout(1), SIGINT, ssh).
 const (
 	execExitTimedOut = 124
+	execExitFailure  = 125
 	execExitCanceled = 130
 	execExitUnknown  = 255
 )
@@ -37,7 +38,10 @@ const execUsage = `usage: drive9 exec [flags] [--] command [arg...]
 
 Run a command remotely against your drive9 drive at /workspace.
 The server selects a lightweight executor or a sandbox before starting.
-Output streams live; the exit status is the command's.
+Output streams live; a completed command keeps its own exit status.
+Executor failures (including resource limits) return 125 with a diagnostic;
+they are not a command result such as grep's 1 for no matches. Output or writes
+may be partial. Commands are not automatically retried.
 
 Inside a local drive9 mount, the command runs in the matching directory,
 after your local changes are uploaded.
@@ -363,10 +367,11 @@ func (p *execProgress) stop() {
 
 func execError(err error, executionID string) error {
 	var (
-		busy     *client.RuntimeBusyError
-		timeout  *client.RuntimeTimeoutError
-		canceled *client.RuntimeCanceledError
-		start    *client.RuntimeStartError
+		busy      *client.RuntimeBusyError
+		timeout   *client.RuntimeTimeoutError
+		canceled  *client.RuntimeCanceledError
+		start     *client.RuntimeStartError
+		execution *client.RuntimeExecutionError
 	)
 	switch {
 	case errors.Is(err, client.ErrRuntimeNotEnabled):
@@ -385,6 +390,12 @@ func execError(err error, executionID string) error {
 		return &execStatusError{code: execExitUnknown, message: message}
 	case errors.As(err, &start):
 		return errors.New(start.Message)
+	case errors.As(err, &execution):
+		message := fmt.Sprintf("remote executor failed (%s): %s; output or writes may be partial", execution.Code, execution.Message)
+		if execution.ExecutionID != "" {
+			message += " (" + execution.ExecutionID + ")"
+		}
+		return &execStatusError{code: execExitFailure, message: message}
 	case errors.Is(err, context.Canceled):
 		return &execStatusError{code: execExitCanceled, message: "command canceled before execution"}
 	}

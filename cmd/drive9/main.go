@@ -442,7 +442,7 @@ func usage(code int) {
 			"  delete [--server URL] [--api-key KEY] [--json]\n"+
 			"                         [--tidbcloud-public-key KEY] [--tidbcloud-private-key KEY]\n"+
 			"                         delete current tenant with owner API key\n"+
-			"  admin <tenant|pool> <command> [arguments]\n"+
+			"  admin <tenant|pool|migration> <command> [arguments]\n"+
 			"                         TiDBCloud Mode admin operations\n"+
 			"  ctx show [--json] [--reveal]\n"+
 			"                         show current context\n"+
