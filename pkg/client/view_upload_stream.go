@@ -60,10 +60,16 @@ func (e *FixedExtentCompletionError) Retry(ctx context.Context) (FixedUploadComp
 	if e == nil || e.client == nil {
 		return FixedUploadCompletion{}, errors.New("missing fixed completion request")
 	}
-	return e.client.completeFixedExtentStream(ctx, e.operationID, e.uploadID, e.parts, e.size)
+	return e.client.CompleteFixedExtentUploadWithSize(ctx, e.operationID, e.uploadID, e.parts, e.size)
 }
 
-func (c *Client) completeFixedExtentStream(ctx context.Context, id, uploadID string, parts []completePart, size int64) (FixedUploadCompletion, error) {
+// CompleteFixedExtentUploadWithSize completes a saved request and checks its
+// original file size. Any completion failure retains the original request in
+// FixedExtentCompletionError, including malformed or mismatched receipts.
+func (c *Client) CompleteFixedExtentUploadWithSize(ctx context.Context, id, uploadID string, parts []FixedExtentPart, size int64) (FixedUploadCompletion, error) {
+	if size <= 0 || size > 256*(64<<20) {
+		return FixedUploadCompletion{}, errors.New("invalid fixed completion size")
+	}
 	receipt, err := c.CompleteFixedExtentUpload(ctx, id, uploadID, parts)
 	if err == nil && receipt.Size != size {
 		err = markCommitAttempt(&ViewOperationError{LayerID: c.view.LayerID, OperationID: id, Err: errors.New("fixed upload completion size mismatch")})

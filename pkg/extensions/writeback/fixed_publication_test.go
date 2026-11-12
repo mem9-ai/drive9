@@ -3,6 +3,7 @@ package writeback
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -136,8 +137,20 @@ func TestFixedPublicationRejectsBeforeNetwork(t *testing.T) {
 }
 
 func TestFixedPublicationWrongReceiptRetainsRecovery(t *testing.T) {
+	var calls atomic.Int32
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(client.FixedUploadCompletion{Status: "completed", OperationID: "original", View: client.FixedViewState{LayerID: "a", Generation: 2, Fence: 1}, ResourceID: "inode", Revision: 8, Size: 5})
+		if r.URL.Path != "/v1/views/a/v2/uploads/upload/complete" || r.Header.Get(viewprotocol.OperationHeader) != "original" {
+			t.Error("recovery changed request identity", r.URL.Path)
+		}
+		var body struct{ Parts []client.FixedExtentPart }
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body.Parts) != 1 || body.Parts[0] != fixedPublicationFixture().Parts[0] {
+			t.Error(body, err)
+		}
+		size := int64(5)
+		if calls.Add(1) > 1 {
+			size = 6
+		}
+		_ = json.NewEncoder(w).Encode(client.FixedUploadCompletion{Status: "completed", OperationID: "original", View: client.FixedViewState{LayerID: "a", Generation: 2, Fence: 1}, ResourceID: "inode", Revision: 8, Size: size})
 	}))
 	defer api.Close()
 	journal, err := staging.NewJournal(filepath.Join(t.TempDir(), "journal.wal"))
@@ -147,11 +160,21 @@ func TestFixedPublicationWrongReceiptRetainsRecovery(t *testing.T) {
 	defer func() { _ = journal.Close() }()
 	p := fixedPublicationFixture()
 	c, _ := client.New(api.URL, "").WithView(p.Binding)
-	if result, err := publishFixedExtent(context.Background(), c, journal, p); err == nil || result.Revision != 0 {
+	result, err := publishFixedExtent(context.Background(), c, journal, p)
+	var operation *client.ViewOperationError
+	var completion *client.FixedExtentCompletionError
+	if err == nil || result != (client.FixedUploadCompletion{}) || !client.IsCommitAttempted(err) || !errors.As(err, &operation) || operation.OperationID != p.OperationID || operation.LayerID != p.Binding.LayerID || !errors.As(err, &completion) {
 		t.Fatal(result, err)
 	}
 	if pending, err := loadFixedExtentPublications(c, journal); err != nil || len(pending) != 1 {
 		t.Fatal(pending, err)
+	}
+	result, err = completion.Retry(context.Background())
+	if err != nil || result.Size != 6 || result.Revision != 8 || calls.Load() != 2 {
+		t.Fatal(result, err, calls.Load())
+	}
+	if pending, err := loadFixedExtentPublications(c, journal); err != nil || len(pending) != 1 {
+		t.Fatal("remote retry prematurely settled local state", pending, err)
 	}
 }
 

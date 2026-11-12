@@ -71,14 +71,7 @@ func (p fixedExtentPublication) complete(ctx context.Context, c *client.Client) 
 	if err := p.validate(c); err != nil {
 		return client.FixedUploadCompletion{}, err
 	}
-	receipt, err := c.CompleteFixedExtentUpload(ctx, p.OperationID, p.UploadID, p.Parts)
-	if err != nil {
-		return client.FixedUploadCompletion{}, err
-	}
-	if receipt.Size != p.Size {
-		return client.FixedUploadCompletion{}, fmt.Errorf("fixed extent publication receipt size mismatch")
-	}
-	return receipt, nil
+	return c.CompleteFixedExtentUploadWithSize(ctx, p.OperationID, p.UploadID, p.Parts, p.Size)
 }
 
 // loadFixedExtentPublications validates every unresolved record before returning

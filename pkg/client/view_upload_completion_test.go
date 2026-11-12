@@ -40,7 +40,7 @@ func TestFixedCompletionRetryPreservesRequestAndChecksReceipt(t *testing.T) {
 		t.Fatal(err)
 	}
 	parts := []completePart{{Number: 1, ETag: strings.Repeat("a", 64)}}
-	_, err = c.completeFixedExtentStream(context.Background(), "original", "upload", parts, 6)
+	_, err = c.CompleteFixedExtentUploadWithSize(context.Background(), "original", "upload", parts, 6)
 	var pending *FixedExtentCompletionError
 	if !errors.As(err, &pending) || !IsCommitAttempted(err) {
 		t.Fatal(err)
@@ -63,5 +63,21 @@ func TestFixedCompletionRetryPreservesRequestAndChecksReceipt(t *testing.T) {
 		if _, err := empty.Retry(ctx); err == nil {
 			t.Fatal("empty completion request accepted")
 		}
+	}
+}
+
+func TestFixedCompletionRejectsInvalidExpectedSizeBeforeRequest(t *testing.T) {
+	var calls atomic.Int32
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls.Add(1); w.WriteHeader(500) }))
+	defer api.Close()
+	c, _ := New(api.URL, "").WithView(ViewBinding{LayerID: "a", WorkID: "work", Fence: 1})
+	parts := []FixedExtentPart{{Number: 1, ETag: strings.Repeat("a", 64)}}
+	for _, size := range []int64{-1, 0, 256*(64<<20) + 1} {
+		if result, err := c.CompleteFixedExtentUploadWithSize(context.Background(), "original", "upload", parts, size); err == nil || result.Revision != 0 || IsCommitAttempted(err) {
+			t.Fatal(result, err)
+		}
+	}
+	if calls.Load() != 0 {
+		t.Fatal("invalid size issued completion", calls.Load())
 	}
 }

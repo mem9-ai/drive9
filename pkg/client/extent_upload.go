@@ -73,7 +73,7 @@ func (c *Client) writeExtentUpload(ctx context.Context, plan *uploadPlanV2, ra i
 	completeErr := error(nil)
 	if c.view.LayerID != "" {
 		id, _ := ctx.Value(viewOperationKey{}).(string)
-		_, completeErr = c.completeFixedExtentStream(ctx, id, plan.UploadID, parts, size)
+		_, completeErr = c.CompleteFixedExtentUploadWithSize(ctx, id, plan.UploadID, parts, size)
 	} else {
 		completeErr = c.completeExtentUpload(ctx, plan.UploadID, parts, tags, wholeChecksum)
 	}
