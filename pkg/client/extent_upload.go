@@ -62,6 +62,36 @@ func (c *Client) writeExtentUpload(ctx context.Context, plan *uploadPlanV2, ra i
 		summary.PartSizeBytes, summary.TotalParts, summary.Parallelism = plan.PartSize, plan.TotalParts, parallelism
 	}
 	started := time.Now()
+	parts, err := c.uploadExtentParts(ctx, plan, ra, size, progress, preCompleteCheck)
+	if err != nil {
+		return err
+	}
+	if summary != nil {
+		summary.UploadedParts, summary.UploadSeconds = plan.TotalParts, time.Since(started).Seconds()
+	}
+	started = time.Now()
+	completeErr := error(nil)
+	if c.view.LayerID != "" {
+		id, _ := ctx.Value(viewOperationKey{}).(string)
+		_, completeErr = c.completeFixedExtentStream(ctx, id, plan.UploadID, parts, size)
+	} else {
+		completeErr = c.completeExtentUpload(ctx, plan.UploadID, parts, tags, wholeChecksum)
+	}
+	if completeErr != nil {
+		// The server may have published despite a lost or malformed response.
+		// Keep the session available for query; never initiate again or abort here.
+		return completeErr
+	}
+	if summary != nil {
+		summary.CompleteSeconds = time.Since(started).Seconds()
+	}
+	return nil
+}
+
+// uploadExtentParts transfers bytes without publishing the file. Callers validate
+// the plan first and retain the source generation until this method returns.
+func (c *Client) uploadExtentParts(ctx context.Context, plan *uploadPlanV2, ra io.ReaderAt, size int64, progress ProgressFunc, preCompleteCheck func() error) ([]completePart, error) {
+	parallelism := boundedUploadParallelism(plan.PartSize, plan.TotalParts)
 	parts := make([]completePart, plan.TotalParts)
 	buffers := newUploadBufferPool(plan.PartSize, parallelism)
 	group, uploadCtx := errgroup.WithContext(ctx)
@@ -99,32 +129,13 @@ func (c *Client) writeExtentUpload(ctx context.Context, plan *uploadPlanV2, ra i
 	}
 	if err := group.Wait(); err != nil {
 		c.abortUploadV2BestEffort(ctx, plan.UploadID)
-		return err
+		return nil, err
 	}
 	if err := runPreCompleteCheck(ctx, preCompleteCheck); err != nil {
 		c.abortUploadV2BestEffort(ctx, plan.UploadID)
-		return err
+		return nil, err
 	}
-	if summary != nil {
-		summary.UploadedParts, summary.UploadSeconds = plan.TotalParts, time.Since(started).Seconds()
-	}
-	started = time.Now()
-	completeErr := error(nil)
-	if c.view.LayerID != "" {
-		id, _ := ctx.Value(viewOperationKey{}).(string)
-		_, completeErr = c.completeFixedExtentStream(ctx, id, plan.UploadID, parts, size)
-	} else {
-		completeErr = c.completeExtentUpload(ctx, plan.UploadID, parts, tags, wholeChecksum)
-	}
-	if completeErr != nil {
-		// The server may have published despite a lost or malformed response.
-		// Keep the session available for query; never initiate again or abort here.
-		return completeErr
-	}
-	if summary != nil {
-		summary.CompleteSeconds = time.Since(started).Seconds()
-	}
-	return nil
+	return parts, nil
 }
 
 func (c *Client) uploadExtentPart(ctx context.Context, uploadID string, number int, data []byte, checksum string) error {

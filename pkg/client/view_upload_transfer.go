@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -93,6 +94,22 @@ func validateFixedUploadPlan(p *uploadPlanV2, size int64) error {
 		}
 	}
 	return fmt.Errorf("fixed extent upload requires SHA-256")
+}
+
+// UploadFixedExtentParts uploads a saved plan's blocks without publishing the
+// file. The caller must keep source immutable until return, then durably save
+// the returned parts together with the plan's upload ID, file size, completion
+// operation ID and filesystem/work binding BEFORE calling CompleteFixedExtentUpload.
+// After an unknown completion, replay only that saved completion request; do not
+// call this method again. Transfer failure cancels the upload best effort.
+func (c *Client) UploadFixedExtentParts(ctx context.Context, plan FixedExtentUploadPlan, source io.ReaderAt, size int64, progress ProgressFunc) ([]FixedExtentPart, error) {
+	if c == nil || c.view.LayerID == "" || c.view.Validation || c.view.Validate() != nil {
+		return nil, viewprotocol.ErrBinding
+	}
+	if source == nil || validateFixedUploadPlan(&plan, size) != nil || validateExtentUploadPlan(&plan, size) != nil {
+		return nil, fmt.Errorf("invalid fixed extent upload preparation")
+	}
+	return c.uploadExtentParts(ctx, &plan, source, size, progress, nil)
 }
 
 // CompleteFixedExtentUpload publishes only the saved session's target. A 503
