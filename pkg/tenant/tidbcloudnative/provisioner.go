@@ -1660,7 +1660,9 @@ func systemUsernameForCurrent(currentUsername string) (string, bool, error) {
 	if IsRestrictedSystemUser(currentUsername) {
 		return currentUsername, false, nil
 	}
-	return "", false, fmt.Errorf("native database username %q is not a root or tdc_fs_sys account", currentUsername)
+	// The message names no suffix: it must stay true if the scheme changes, and the
+	// constants above are the only place that spelling is allowed to live.
+	return "", false, fmt.Errorf("native database username %q is neither the root principal nor the restricted account for an instance", currentUsername)
 }
 
 func quoteIdent(value string) string {
