@@ -2049,15 +2049,24 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 			f.openIdx.RelinkPath(child, handles)
 			return fs.StatusOf(markErr)
 		}
+		pending := &deferredUnlink{path: child, ino: ino}
+		pending.mu.Lock()
 		f.inodes.RemoveLinkPreserve(child)
 		if iok {
 			f.mu.Lock()
-			f.deferredUnlinks[child] = &deferredUnlink{path: child, ino: ino}
+			f.deferredUnlinks[child] = pending
 			f.mu.Unlock()
 		}
 		f.touchParentMtime(header.NodeId)
 		f.mutated(fs.EventDelete, child)
 		f.markNameNegative(child)
+		pending.mu.Unlock()
+		// The last Release may have completed while MarkPathUnlinked was
+		// preparing the anonymous handle state, before registration existed.
+		// Recheck after publication so that close cannot strand the delete.
+		if iok {
+			f.maybeRunDeferredUnlink(ino)
+		}
 		return gofuse.OK
 	}
 	if _, st := f.dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: child, Ino: header.NodeId, Kernel: header, Caller: fs.CallerFrom(*header)}); st != gofuse.OK {
@@ -2136,6 +2145,14 @@ func (f *FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName stri
 		return gofuse.OK
 	}
 	f.debugf("rename start old=%s new=%s", oldPath, newPath)
+	// Land hidden children before their parent moves (or is replaced).
+	// The unlink handlers preserve open descriptors' anonymous data. A
+	// failed cleanup leaves the directory in place and remains retryable.
+	for _, dir := range []string{oldPath, newPath} {
+		if err := f.flushDeferredUnlinksUnder(dir); err != nil {
+			return fs.StatusOf(err)
+		}
+	}
 	if err := f.flushDeferredUnlink(newPath); err != nil {
 		return fs.StatusOf(err)
 	}

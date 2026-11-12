@@ -348,7 +348,7 @@ jobs:
         continue-on-error: true
         env:
           DRIVE9_REQUIRE_KERNEL_FUSE: "1"
-        run: make test TEST_PKGS=./pkg/fuse TEST_RUN='^Test(ReadDirPlus(PendingKernel|ReplacedInodeKernel)|SSEDisconnectReadKernel|Unlink(Hardlink|Recreate)Kernel)$' TEST_TIMEOUT=2m
+        run: make test TEST_PKGS=./pkg/fuse TEST_RUN='^Test(ReadDirPlus(PendingKernel|ReplacedInodeKernel)|SSEDisconnectReadKernel|Unlink(Hardlink|Recreate|ParentRename)Kernel)$' TEST_TIMEOUT=2m
 
       - name: Run FUSE release gate
         id: fuse-smoke

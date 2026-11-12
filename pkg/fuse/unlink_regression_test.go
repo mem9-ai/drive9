@@ -375,3 +375,138 @@ func TestDeferredUnlinkKeepsEveryOpenHardlinkAlias(t *testing.T) {
 		}
 	}
 }
+
+type unlinkMarkGate struct {
+	entered chan struct{}
+	proceed chan struct{}
+}
+
+func (g *unlinkMarkGate) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error) {
+	return next(ctx, op)
+}
+
+func (g *unlinkMarkGate) MarkPathUnlinked(string) error {
+	close(g.entered)
+	<-g.proceed
+	return nil
+}
+
+func TestDeferredUnlinkLastCloseBeforeRegistration(t *testing.T) {
+	backend := newMemCore()
+	gate := &unlinkMarkGate{entered: make(chan struct{}), proceed: make(chan struct{})}
+	f := newTestFS(t, backend, gate)
+	var old gofuse.CreateOut
+	if st := f.Create(nil, exclusiveCreateInput(), "same", &old); st != gofuse.OK {
+		t.Fatal(st)
+	}
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(gate.proceed) }) }
+	t.Cleanup(unblock)
+	unlinked := make(chan gofuse.Status, 1)
+	go func() { unlinked <- f.Unlink(nil, rootHeader(), "same") }()
+	awaitUnlinkTest(t, gate.entered)
+	releaseUnlinkFixture(f, old)
+	unblock()
+	if st := awaitUnlinkTest(t, unlinked); st != gofuse.OK {
+		t.Fatal(st)
+	}
+	if _, exists := backend.get("/same"); exists || f.isDeferredUnlink("/same") {
+		t.Fatalf("last close missed cleanup: exists=%v pending=%v", exists, f.isDeferredUnlink("/same"))
+	}
+}
+
+func TestDeferredUnlinkParentRenamePreservesOpenData(t *testing.T) {
+	backend := testbackend.NewBackend()
+	backend.SeedDir("/dir", 0755)
+	backend.Seed("/dir/file", []byte("old content"))
+	f := newPerfFS(t, backend)
+	dir := lookupFacade(t, f, "dir")
+	var entry gofuse.EntryOut
+	if st := f.Lookup(nil, &gofuse.InHeader{NodeId: dir}, "file", &entry); st != gofuse.OK {
+		t.Fatal(st)
+	}
+	var opened gofuse.OpenOut
+	if st := f.Open(nil, &gofuse.OpenIn{InHeader: gofuse.InHeader{NodeId: entry.NodeId}}, &opened); st != gofuse.OK {
+		t.Fatal(st)
+	}
+	if st := f.Unlink(nil, &gofuse.InHeader{NodeId: dir}, "file"); st != gofuse.OK {
+		t.Fatal(st)
+	}
+	if st := f.Rename(nil, &gofuse.RenameIn{InHeader: *rootHeader(), Newdir: 1}, "dir", "moved"); st != gofuse.OK {
+		t.Fatal(st)
+	}
+	data := make([]byte, 64)
+	n, err := f.openHandle(opened.Fh).Read(context.Background(), 0, data)
+	if err != nil || string(data[:n]) != "old content" {
+		t.Fatalf("anonymous handle after parent rename: %q, %v", data[:n], err)
+	}
+	f.Release(nil, &gofuse.ReleaseIn{InHeader: gofuse.InHeader{NodeId: entry.NodeId}, Fh: opened.Fh})
+	for _, path := range []string{"/dir/file", "/moved/file"} {
+		if _, exists := backend.Node(path); exists || f.isDeferredUnlink(path) {
+			t.Fatalf("hidden child survived rename: %s exists=%v pending=%v", path, exists, f.isDeferredUnlink(path))
+		}
+	}
+	if st := f.Rmdir(nil, rootHeader(), "moved"); st != gofuse.OK {
+		t.Fatalf("rmdir after parent rename = %v", st)
+	}
+}
+
+func TestDeferredUnlinkParentRenameWaitsAndKeepsFailure(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		t.Run(map[bool]string{false: "success", true: "failure"}[fail], func(t *testing.T) {
+			backend := newMemCore()
+			entered, proceed := make(chan struct{}), make(chan struct{})
+			var startOnce, finishOnce sync.Once
+			unblock := func() { finishOnce.Do(func() { close(proceed) }) }
+			t.Cleanup(unblock)
+			var renames atomic.Int32
+			gate := fs.HandlerFunc(func(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error) {
+				if op.Kind == fs.OpUnlink {
+					startOnce.Do(func() { close(entered) })
+					<-proceed
+					if fail {
+						return fs.Result{}, syscall.EIO
+					}
+				}
+				if op.Kind == fs.OpRename {
+					renames.Add(1)
+				}
+				return next(ctx, op)
+			})
+			f := newTestFS(t, backend, gate)
+			var dir gofuse.EntryOut
+			if st := f.Mkdir(nil, &gofuse.MkdirIn{InHeader: *rootHeader(), Mode: 0755}, "dir", &dir); st != gofuse.OK {
+				t.Fatal(st)
+			}
+			input := exclusiveCreateInput()
+			input.NodeId = dir.NodeId
+			var file gofuse.CreateOut
+			if st := f.Create(nil, input, "file", &file); st != gofuse.OK {
+				t.Fatal(st)
+			}
+			if st := f.Unlink(nil, &gofuse.InHeader{NodeId: dir.NodeId}, "file"); st != gofuse.OK {
+				t.Fatal(st)
+			}
+			closed := make(chan struct{}, 1)
+			go func() { releaseUnlinkFixture(f, file); closed <- struct{}{} }()
+			awaitUnlinkTest(t, entered)
+			renamed := make(chan gofuse.Status, 1)
+			go func() { renamed <- f.Rename(nil, &gofuse.RenameIn{InHeader: *rootHeader(), Newdir: 1}, "dir", "moved") }()
+			select {
+			case st := <-renamed:
+				t.Fatalf("rename overtook child cleanup: %v", st)
+			case <-time.After(100 * time.Millisecond):
+			}
+			unblock()
+			awaitUnlinkTest(t, closed)
+			st := awaitUnlinkTest(t, renamed)
+			if fail {
+				if st != gofuse.EIO || renames.Load() != 0 || !f.isDeferredUnlink("/dir/file") {
+					t.Fatalf("failed cleanup: rename=%v dispatched=%d pending=%v", st, renames.Load(), f.isDeferredUnlink("/dir/file"))
+				}
+			} else if st != gofuse.OK || renames.Load() != 1 || f.isDeferredUnlink("/dir/file") {
+				t.Fatalf("successful cleanup: rename=%v dispatched=%d", st, renames.Load())
+			}
+		})
+	}
+}

@@ -104,3 +104,38 @@ func TestUnlinkRecreateKernel(t *testing.T) {
 		t.Fatalf("replacement = %q, %v", got, err)
 	}
 }
+
+func TestUnlinkParentRenameKernel(t *testing.T) {
+	backend := testbackend.NewBackend()
+	backend.SeedDir("/dir", 0755)
+	backend.Seed("/dir/file", []byte("old content"))
+	ts := httptest.NewServer(backend)
+	t.Cleanup(ts.Close)
+	stack := mountPendingKernelStack(t, ts.URL, "strict")
+	dir := filepath.Join(stack.mp, "dir")
+	file, err := os.Open(filepath.Join(dir, "file"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = file.Close() })
+	if err := os.Remove(filepath.Join(dir, "file")); err != nil {
+		t.Fatal(err)
+	}
+	moved := filepath.Join(stack.mp, "moved")
+	if err := os.Rename(dir, moved); err != nil {
+		t.Fatal(err)
+	}
+	data := make([]byte, 11)
+	if n, err := file.ReadAt(data, 0); n != len(data) || err != nil || string(data) != "old content" {
+		t.Fatalf("open file after parent rename: %q, %v", data, err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(moved, "file")); !os.IsNotExist(err) {
+		t.Fatalf("unlinked child reappeared after parent rename: %v", err)
+	}
+	if err := os.Remove(moved); err != nil {
+		t.Fatalf("remove renamed directory: %v", err)
+	}
+}
