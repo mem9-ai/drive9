@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"database/sql"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -40,9 +41,53 @@ func TestNativePrivilegeRetireRetryBackoff(t *testing.T) {
 	if s.nativePrivilegeRetireBackoff("tenant-b") {
 		t.Fatal("a failure leaked to another tenant")
 	}
+	// An expired delay leaves the attempt count alone, so the next failure continues
+	// towards the cap instead of restarting at one attempt on every pass.
+	s.nativePrivilegeRetireMu.Lock()
+	s.nativePrivilegeRetireRetryAt["tenant-a"] = time.Now().Add(-time.Second)
+	s.nativePrivilegeRetireMu.Unlock()
+	if s.nativePrivilegeRetireBackoff("tenant-a") {
+		t.Fatal("an expired delay still reports backoff")
+	}
+	s.nativePrivilegeRetireMu.Lock()
+	attempts = s.nativePrivilegeRetireFailures["tenant-a"]
+	s.nativePrivilegeRetireMu.Unlock()
+	if attempts != 11 {
+		t.Fatalf("attempt count after an expired delay = %d, want 11", attempts)
+	}
+	s.recordNativePrivilegeRetireFailure("tenant-a")
+	s.nativePrivilegeRetireMu.Lock()
+	retryAt = s.nativePrivilegeRetireRetryAt["tenant-a"]
+	s.nativePrivilegeRetireMu.Unlock()
+	if delay := time.Until(retryAt); delay < nativePrivilegeRetireMaxBackoff-time.Minute {
+		t.Fatalf("retry delay %s restarted below the cap %s", delay, nativePrivilegeRetireMaxBackoff)
+	}
 	s.clearNativePrivilegeRetireFailure("tenant-a")
 	if s.nativePrivilegeRetireBackoff("tenant-a") {
 		t.Fatal("retry state survived a success")
+	}
+	s.nativePrivilegeRetireMu.Lock()
+	attempts = s.nativePrivilegeRetireFailures["tenant-a"]
+	s.nativePrivilegeRetireMu.Unlock()
+	if attempts != 0 {
+		t.Fatalf("attempt count survived a success: %d", attempts)
+	}
+}
+
+// One gateway endpoint can front several instances, so the endpoint alone must not fold
+// two instances into one dedupe key: the account prefix names the instance.
+func TestNativePrivilegeRetireClusterKey(t *testing.T) {
+	a := &meta.Tenant{DBHost: "gateway01.example", DBPort: 4000, DBUser: "insta.tdc_fs_sys"}
+	b := &meta.Tenant{DBHost: "gateway01.example", DBPort: 4000, DBUser: "instb.tdc_fs_sys"}
+	same := &meta.Tenant{DBHost: "gateway01.example", DBPort: 4000, DBUser: "insta.tdc_fs_sys"}
+	if nativePrivilegeRetireClusterKey(a) == nativePrivilegeRetireClusterKey(b) {
+		t.Fatal("two instances behind one endpoint share a dedupe key")
+	}
+	if nativePrivilegeRetireClusterKey(a) != nativePrivilegeRetireClusterKey(same) {
+		t.Fatal("tenants on the same instance do not share a dedupe key")
+	}
+	if nativePrivilegeRetireClusterKey(nil) != "" || nativePrivilegeRetireClusterKey(&meta.Tenant{DBUser: "x"}) != "" {
+		t.Fatal("a tenant without an endpoint got a cluster key")
 	}
 }
 
@@ -104,8 +149,14 @@ func TestNativePrivilegeRetireRevokesLegacyGrant(t *testing.T) {
 	t.Cleanup(func() { _ = admin.Close() })
 
 	const role = "tdc_fs_admin"
-	const rootUser = "ti-retire.root"
 	const password = "drive9-retire-test"
+	// A principal unique to this run: the fixture then never has to delete an account it
+	// did not create, and cannot leave a fixed-name privileged principal behind either.
+	// The name has to keep the <prefix>.root form the remediation derives from
+	// <prefix>.tdc_fs_sys.
+	prefix := "ti" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	rootUser := prefix + ".root"
+	tenantUser := prefix + ".tdc_fs_sys"
 	// The revoke targets the fixed production role, so a cluster that already has it is
 	// not a safe fixture: setup would add a grant and the pass would strip a grant that
 	// belongs to real tenants. Refuse instead of mutating a shared instance.
@@ -143,7 +194,6 @@ func TestNativePrivilegeRetireRevokesLegacyGrant(t *testing.T) {
 		stmt string
 		flag *bool
 	}{
-		{"DROP USER IF EXISTS '" + rootUser + "'@'%'", nil},
 		{"CREATE USER '" + rootUser + "'@'%' IDENTIFIED BY '" + password + "'", &principalCreated},
 		{"GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO '" + rootUser + "'@'%' WITH GRANT OPTION", nil},
 		// The remediation DSN names the tenant database, so the root principal needs
@@ -162,10 +212,10 @@ func TestNativePrivilegeRetireRevokesLegacyGrant(t *testing.T) {
 		}
 	}
 
-	rt.insertPrivilegeRetireTenantWithPassword(t, "native-revocable", tenant.ProviderTiDBCloudNative, "ti-retire.tdc_fs_sys", password)
+	rt.insertPrivilegeRetireTenantWithPassword(t, "native-revocable", tenant.ProviderTiDBCloudNative, tenantUser, password)
 	// A second tenant on the same cluster: the revoke is cluster-global, so the pass must
 	// retire it without opening its own connection.
-	rt.insertPrivilegeRetireTenantWithPassword(t, "native-sibling", tenant.ProviderTiDBCloudNative, "ti-retire.tdc_fs_sys", password)
+	rt.insertPrivilegeRetireTenantWithPassword(t, "native-sibling", tenant.ProviderTiDBCloudNative, tenantUser, password)
 
 	srv := &Server{meta: rt.meta, pool: rt.pool}
 	srv.retireNativeTenantVariablesPrivilege(ctx)

@@ -223,18 +223,31 @@ func (s *Server) nativePrivilegeRetireBackoff(tenantID string) bool {
 	if time.Now().Before(retryAt) {
 		return true
 	}
+	// Only the expired scheduling entry goes: the attempt count has to survive so a
+	// persistently failing tenant keeps backing off towards the cap instead of restarting
+	// at one attempt on every pass. A success clears both through
+	// clearNativePrivilegeRetireFailure.
 	delete(s.nativePrivilegeRetireRetryAt, tenantID)
-	delete(s.nativePrivilegeRetireFailures, tenantID)
 	return false
 }
 
 // nativePrivilegeRetireClusterKey identifies the cluster a tenant's database lives on,
-// which is the scope of the revoke.
+// which is the scope of the revoke. The endpoint alone is not enough: one TiDB Cloud
+// gateway can front several instances, and the account prefix is what names the
+// instance, so deduping on host and port would let one instance's success skip another
+// instance's tenants without ever connecting to them.
 func nativePrivilegeRetireClusterKey(t *meta.Tenant) string {
 	if t == nil || strings.TrimSpace(t.DBHost) == "" {
 		return ""
 	}
-	return t.DBHost + ":" + strconv.Itoa(t.DBPort)
+	user := strings.TrimSpace(t.DBUser)
+	prefix := strings.TrimSuffix(user, tidbcloudnative.RestrictedSystemUserNameSuffix)
+	if prefix == user {
+		// Not a restricted account: fall back to the account name so distinct principals
+		// on one endpoint are never folded together.
+		prefix = user
+	}
+	return strings.TrimSpace(t.DBHost) + ":" + strconv.Itoa(t.DBPort) + "|" + prefix
 }
 
 // recordNativePrivilegeRetireFailure schedules the next attempt for a tenant with
