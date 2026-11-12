@@ -28,6 +28,11 @@ const (
 	// that starts serving) must not have to wait for the next leadership change to
 	// lose the legacy grant, so the cleanup is periodic rather than one-shot.
 	nativePrivilegeRetireInterval = 15 * time.Minute
+	// nativePrivilegeRetireRecheckInterval memoizes a successful retire. The grant
+	// cannot come back (setup no longer grants it and re-setup revokes it), so a
+	// remediated tenant does not need a fresh connection on every pass; it is
+	// re-checked once a day to catch an operator re-granting it.
+	nativePrivilegeRetireRecheckInterval = 24 * time.Hour
 	// nativePrivilegeRetireMaxBackoff caps a failing tenant's retry delay. It is
 	// longer than one interval so a persistently failing tenant is skipped on some
 	// passes instead of being attempted every tick.
@@ -51,43 +56,53 @@ func (s *Server) retireNativeTenantVariablesPrivilege(ctx context.Context) {
 	// deployment outlives a provider switch, and the per-tenant check below decides
 	// from the stored record. The remediation itself only needs the tenant's own
 	// DSN and password.
-	cursor := time.Time{}
-	afterID := ""
 	retired, skipped, failed := 0, 0, 0
-	for {
-		page, err := s.meta.ListTenantsByStatusAfter(ctx, meta.TenantActive, cursor, afterID, nativePrivilegeRetireBatchSize)
-		if err != nil {
+	// Suspended tenants keep their database and therefore the legacy grant; each status
+	// is scanned with its own keyset cursor.
+	for _, status := range [...]meta.TenantStatus{meta.TenantActive, meta.TenantSuspended} {
+		cursor := time.Time{}
+		afterID := ""
+		for {
 			if ctx.Err() != nil {
-				// Shutdown mid-scan is not a failure of the pass.
 				return
 			}
-			// One transient meta blip must not cost a whole interval: retry the page
-			// once before giving up until the next tick.
-			page, err = s.meta.ListTenantsByStatusAfter(ctx, meta.TenantActive, cursor, afterID, nativePrivilegeRetireBatchSize)
+			page, err := s.meta.ListTenantsByStatusAfter(ctx, status, cursor, afterID, nativePrivilegeRetireBatchSize)
 			if err != nil {
-				if ctx.Err() == nil {
-					logger.Warn(ctx, "native_privilege_retire_scan_failed", zap.Error(err))
+				if ctx.Err() != nil {
+					// Shutdown mid-scan is not a failure of the pass.
+					return
 				}
-				return
+				// One transient meta blip must not cost a whole interval: retry the page
+				// once before giving up until the next tick.
+				page, err = s.meta.ListTenantsByStatusAfter(ctx, status, cursor, afterID, nativePrivilegeRetireBatchSize)
+				if err != nil {
+					if ctx.Err() == nil {
+						logger.Warn(ctx, "native_privilege_retire_scan_failed", zap.Error(err))
+					}
+					return
+				}
 			}
-		}
-		if len(page) == 0 {
-			break
-		}
-		for i := range page {
-			switch s.retireNativeTenantVariablesPrivilegeFor(ctx, &page[i]) {
-			case nativePrivilegeRetireDone:
-				retired++
-			case nativePrivilegeRetireSkipped:
-				skipped++
-			case nativePrivilegeRetireFailed:
-				failed++
+			if len(page) == 0 {
+				break
 			}
-		}
-		last := page[len(page)-1]
-		cursor, afterID = last.CreatedAt, last.ID
-		if len(page) < nativePrivilegeRetireBatchSize {
-			break
+			for i := range page {
+				if ctx.Err() != nil {
+					return
+				}
+				switch s.retireNativeTenantVariablesPrivilegeFor(ctx, &page[i]) {
+				case nativePrivilegeRetireDone:
+					retired++
+				case nativePrivilegeRetireSkipped:
+					skipped++
+				case nativePrivilegeRetireFailed:
+					failed++
+				}
+			}
+			last := page[len(page)-1]
+			cursor, afterID = last.CreatedAt, last.ID
+			if len(page) < nativePrivilegeRetireBatchSize {
+				break
+			}
 		}
 	}
 	if retired > 0 || failed > 0 {
@@ -106,6 +121,9 @@ const (
 
 func (s *Server) retireNativeTenantVariablesPrivilegeFor(ctx context.Context, t *meta.Tenant) nativePrivilegeRetireResult {
 	if t == nil || t.Provider != tenant.ProviderTiDBCloudNative {
+		return nativePrivilegeRetireSkipped
+	}
+	if s.nativePrivilegeRetireRecentlyDone(t.ID) {
 		return nativePrivilegeRetireSkipped
 	}
 	if s.nativePrivilegeRetireBackoff(t.ID) {
@@ -139,7 +157,27 @@ func (s *Server) retireNativeTenantVariablesPrivilegeFor(ctx context.Context, t 
 		return nativePrivilegeRetireFailed
 	}
 	s.clearNativePrivilegeRetireFailure(t.ID)
+	s.markNativePrivilegeRetireDone(t.ID)
 	return nativePrivilegeRetireDone
+}
+
+// nativePrivilegeRetireRecentlyDone reports whether a tenant was remediated inside the
+// memo window, so a steady-state pass does not open a connection per tenant every tick.
+func (s *Server) nativePrivilegeRetireRecentlyDone(tenantID string) bool {
+	s.nativePrivilegeRetireMu.Lock()
+	defer s.nativePrivilegeRetireMu.Unlock()
+	doneAt, ok := s.nativePrivilegeRetireDone[tenantID]
+	return ok && time.Since(doneAt) < nativePrivilegeRetireRecheckInterval
+}
+
+// markNativePrivilegeRetireDone records a successful retire.
+func (s *Server) markNativePrivilegeRetireDone(tenantID string) {
+	s.nativePrivilegeRetireMu.Lock()
+	defer s.nativePrivilegeRetireMu.Unlock()
+	if s.nativePrivilegeRetireDone == nil {
+		s.nativePrivilegeRetireDone = map[string]time.Time{}
+	}
+	s.nativePrivilegeRetireDone[tenantID] = time.Now()
 }
 
 // nativePrivilegeRetireBackoff reports whether a tenant that failed recently is still

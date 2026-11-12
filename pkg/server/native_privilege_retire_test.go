@@ -3,9 +3,12 @@ package server
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/go-sql-driver/mysql"
 	"github.com/mem9-ai/drive9/pkg/meta"
 	"github.com/mem9-ai/drive9/pkg/tenant"
 )
@@ -68,6 +71,9 @@ func TestNativePrivilegeRetireScanPagesAndClassifies(t *testing.T) {
 	if !srv.nativePrivilegeRetireBackoff("native-unreachable") {
 		t.Fatal("an unreachable native tenant did not schedule a retry")
 	}
+	if srv.nativePrivilegeRetireRecentlyDone("native-unreachable") {
+		t.Fatal("a failed retire was memoized as done")
+	}
 	for _, id := range []string{"tidb-zero", "native-root"} {
 		if srv.nativePrivilegeRetireBackoff(id) {
 			t.Fatalf("skipped tenant %s scheduled a retry", id)
@@ -88,7 +94,9 @@ func TestNativePrivilegeRetireRevokesLegacyGrant(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = admin.Close() }()
+	// Close last: the cleanup below needs a live handle, and a bare defer would run
+	// before t.Cleanup and leave the fixture's privileged principal behind.
+	t.Cleanup(func() { _ = admin.Close() })
 
 	const role = "tdc_fs_admin"
 	const rootUser = "ti-retire.root"
@@ -112,8 +120,16 @@ func TestNativePrivilegeRetireRevokesLegacyGrant(t *testing.T) {
 		}
 	}
 	t.Cleanup(func() {
-		_, _ = admin.ExecContext(context.Background(), "REVOKE SYSTEM_VARIABLES_ADMIN ON *.* FROM '"+role+"'")
-		_, _ = admin.ExecContext(context.Background(), "DROP USER IF EXISTS '"+rootUser+"'@'%'")
+		ctx := context.Background()
+		if _, err := admin.ExecContext(ctx, "REVOKE SYSTEM_VARIABLES_ADMIN ON *.* FROM '"+role+"'"); err != nil && !missingRoleGrant(err) {
+			t.Errorf("cleanup: revoke role grant: %v", err)
+		}
+		if _, err := admin.ExecContext(ctx, "DROP ROLE IF EXISTS '"+role+"'"); err != nil {
+			t.Errorf("cleanup: drop role: %v", err)
+		}
+		if _, err := admin.ExecContext(ctx, "DROP USER IF EXISTS '"+rootUser+"'@'%'"); err != nil {
+			t.Errorf("cleanup: drop privileged principal: %v", err)
+		}
 	})
 
 	rt.insertPrivilegeRetireTenantWithPassword(t, "native-revocable", tenant.ProviderTiDBCloudNative, "ti-retire.tdc_fs_sys", password)
@@ -123,6 +139,9 @@ func TestNativePrivilegeRetireRevokesLegacyGrant(t *testing.T) {
 
 	if srv.nativePrivilegeRetireBackoff("native-revocable") {
 		t.Fatal("the revoke failed and scheduled a retry")
+	}
+	if !srv.nativePrivilegeRetireRecentlyDone("native-revocable") {
+		t.Fatal("a successful retire was not memoized; every pass would dial it again")
 	}
 	grants := roleGrants(t, admin, role)
 	if containsGrant(grants, "SYSTEM_VARIABLES_ADMIN") {
@@ -156,10 +175,8 @@ func roleGrants(t *testing.T, db *sql.DB, role string) []string {
 
 func containsGrant(grants []string, want string) bool {
 	for _, g := range grants {
-		for i := 0; i+len(want) <= len(g); i++ {
-			if g[i:i+len(want)] == want {
-				return true
-			}
+		if strings.Contains(g, want) {
+			return true
 		}
 	}
 	return false
@@ -169,10 +186,17 @@ func containsGrant(grants []string, want string) bool {
 // encrypted with the test pool, so the pass can decrypt it like a real row.
 func (rt *objectGCTestRuntime) insertPrivilegeRetireTenant(t *testing.T, id string, provider, dbUser, host string, port int) {
 	t.Helper()
-	rt.insertPrivilegeRetireTenantWithPassword(t, id, provider, dbUser, rt.dbPass)
+	rt.insertPrivilegeRetireTenantAt(t, id, provider, dbUser, rt.dbPass, host, port)
 }
 
 func (rt *objectGCTestRuntime) insertPrivilegeRetireTenantWithPassword(t *testing.T, id string, provider, dbUser, password string) {
+	t.Helper()
+	rt.insertPrivilegeRetireTenantAt(t, id, provider, dbUser, password, rt.dbHost, rt.dbPort)
+}
+
+// insertPrivilegeRetireTenantAt stores the endpoint the caller names, so a test can
+// point a tenant at a closed port instead of silently inheriting the live instance.
+func (rt *objectGCTestRuntime) insertPrivilegeRetireTenantAt(t *testing.T, id string, provider, dbUser, password, host string, port int) {
 	t.Helper()
 	ctx := context.Background()
 	cipher, err := rt.pool.Encrypt(ctx, []byte(password))
@@ -184,8 +208,8 @@ func (rt *objectGCTestRuntime) insertPrivilegeRetireTenantWithPassword(t *testin
 		ID:               id,
 		Status:           meta.TenantActive,
 		Kind:             meta.TenantKindLive,
-		DBHost:           rt.dbHost,
-		DBPort:           rt.dbPort,
+		DBHost:           host,
+		DBPort:           port,
 		DBUser:           dbUser,
 		DBPasswordCipher: cipher,
 		DBName:           rt.dbName,
@@ -196,4 +220,11 @@ func (rt *objectGCTestRuntime) insertPrivilegeRetireTenantWithPassword(t *testin
 	}); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// missingRoleGrant reports whether the server rejected a REVOKE because the role did
+// not hold the privilege (the cleanup tolerates that, nothing else).
+func missingRoleGrant(err error) bool {
+	var mysqlErr *mysql.MySQLError
+	return errors.As(err, &mysqlErr) && (mysqlErr.Number == 1141 || mysqlErr.Number == 1147)
 }

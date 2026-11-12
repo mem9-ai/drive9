@@ -267,6 +267,7 @@ type Server struct {
 	nativePrivilegeRetireMu       sync.Mutex
 	nativePrivilegeRetireFailures map[string]int
 	nativePrivilegeRetireRetryAt  map[string]time.Time
+	nativePrivilegeRetireDone     map[string]time.Time
 	// replayWorker and expirySweepWorker are leader-gated central quota
 	// workers owned by the server (single callback owner). Started in
 	// startLeaderWorkers and stopped in stopLeaderWorkers so they follow
