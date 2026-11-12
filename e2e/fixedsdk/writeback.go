@@ -54,6 +54,15 @@ func writebackEdits(ctx context.Context, c *client.Client, data []byte) error {
 		flushErr := error(nil)
 		if writeErr == nil {
 			flushErr = h.Flush(ctx)
+			if i == 0 {
+				// The paired server fixture drops this completion response
+				// AFTER the normal handler has committed and settled quota.
+				if flushErr == nil || !client.IsCommitAttempted(flushErr) {
+					_ = h.Release(ctx)
+					return errors.New("writeback lost-completion injection")
+				}
+				flushErr = h.Flush(ctx)
+			}
 		}
 		releaseErr := h.Release(ctx)
 		if writeErr != nil || flushErr != nil || releaseErr != nil {

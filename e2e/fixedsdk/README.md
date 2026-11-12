@@ -14,7 +14,10 @@ The probe covers a three-part seekable upload, cross-part reading, conditional
 replacement, stale-revision refusal, child/main isolation, initiation replay,
 cancellation, seal and validation. It also runs partial and sequential writes
 through the actual writeback/core chain with preload disabled; fixed views
-currently upload the complete file for either edit. It does not cover kernel
+currently upload the complete file for either edit. The paired fixture changes
+the first writeback completion response to 503 after the normal server handler
+has succeeded. The probe requires that failure, then retries Flush with the
+original completion and verifies stored bytes and isolation. It does not cover kernel
 FUSE, same-mount switching or final merge.
 `go test -race ./e2e/fixedsdk` only checks the probe's endpoint and failure handling;
 it is not the paired integration run.
