@@ -1,6 +1,8 @@
-"""Offline switch-driver tests; subprocesses and kernel mounts are mocked."""
+"""Offline switch-driver tests; no server or kernel mount is started."""
 import importlib.util
 import json
+import os
+import sys
 from pathlib import Path
 import subprocess
 import tempfile
@@ -176,7 +178,7 @@ class MountProbeTest(unittest.TestCase):
                      patch.object(smoke.tempfile, "mkdtemp", return_value=directory), patch.object(self.probe, "request"), \
                      patch.object(smoke.MountProbe, "call", side_effect=[{"layer_id": work["layer_id"]}, {"launch": True, "work": work}]), \
                      patch.object(smoke.subprocess, "Popen", return_value=process), \
-                     patch.object(smoke.subprocess, "run", side_effect=subprocess.TimeoutExpired("sensitive argv", 15)), \
+                     patch.object(smoke, "unmount_owned_process", side_effect=subprocess.TimeoutExpired("sensitive argv", 60)), \
                      patch.object(smoke.os.path, "ismount", return_value=True), \
                      patch.object(smoke.MountProbe, "status", side_effect=primary), patch.object(smoke.shutil, "rmtree") as remove:
                     with self.assertRaisesRegex(smoke.http.ProbeFailure, "unmount cleanup timed out; prior failure: " + label) as error:
@@ -203,11 +205,68 @@ class MountProbeTest(unittest.TestCase):
                 work = dict(self.work, layer_id=self.probe.prefix + "-mount")
                 with patch.object(smoke.MountProbe, "call", side_effect=[{"layer_id": work["layer_id"]}, {"launch": True, "work": work}]), \
                      patch.object(smoke.subprocess, "Popen", return_value=process), \
-                     patch.object(smoke.subprocess, "run"), patch.object(smoke.os.path, "ismount", return_value=True), \
+                     patch.object(smoke, "unmount_owned_process"), patch.object(smoke.os.path, "ismount", return_value=True), \
                      patch.object(smoke.MountProbe, "status", side_effect=smoke.http.ProbeFailure("status failed")):
                     with self.assertRaisesRegex(smoke.http.ProbeFailure, "cleanup incomplete"):
                         smoke.run("/paired/drive9", self.probe)
                 remove.assert_not_called()
+
+
+class UnmountOwnedProcessTest(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "Unix child process lifecycle")
+    def test_reaps_foreground_child_while_unmount_waits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cli = Path(directory) / "fake-cli"
+            cli.write_text("#!" + sys.executable + "\n" + """
+import os, signal, sys, time
+assert sys.argv[1:] == ["umount", "--timeout", "10s", "--no-auto-pack", "/fixture"]
+pid = int(os.environ["OWNED_TEST_CHILD"])
+os.kill(pid, signal.SIGTERM)
+deadline = time.monotonic() + 3
+while time.monotonic() < deadline:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        sys.exit(0)
+    time.sleep(0.01)
+sys.exit(1)
+""")
+            cli.chmod(0o700)
+            child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+            try:
+                smoke.unmount_owned_process(str(cli), dict(os.environ, OWNED_TEST_CHILD=str(child.pid)),
+                                            "/fixture", child)
+                self.assertIsNotNone(child.returncode)
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(child.pid, 0)
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                child.wait(timeout=5)
+
+    def test_nonzero_exit_fails_even_if_mount_already_exited(self):
+        child, cleanup = Mock(), Mock()
+        child.poll.return_value = 0
+        cleanup.wait.return_value = 1
+        cleanup.poll.return_value = 1
+        with patch.object(smoke.subprocess, "Popen", return_value=cleanup):
+            with self.assertRaisesRegex(smoke.http.ProbeFailure, "^unmount cleanup failed$"):
+                smoke.unmount_owned_process("/paired/drive9", {}, "/fixture", child)
+        cleanup.kill.assert_not_called()
+        child.poll.assert_called_once()
+
+    def test_deadline_kills_and_reaps_cleanup_command(self):
+        child, cleanup = Mock(), Mock()
+        cleanup.wait.side_effect = [subprocess.TimeoutExpired("sensitive argv", 0.1), 0]
+        cleanup.poll.return_value = None
+        with patch.object(smoke.subprocess, "Popen", return_value=cleanup), \
+             patch.object(smoke.time, "monotonic", side_effect=[100, 160]):
+            with self.assertRaises(subprocess.TimeoutExpired) as error:
+                smoke.unmount_owned_process("/paired/drive9", {}, "/fixture", child)
+        self.assertNotIn("sensitive", str(error.exception))
+        cleanup.kill.assert_called_once()
+        self.assertEqual(cleanup.wait.call_args.kwargs, {"timeout": 5})
+        child.poll.assert_called_once()
 
 
 if __name__ == "__main__":

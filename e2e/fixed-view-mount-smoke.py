@@ -125,6 +125,31 @@ def kernel_mount_id(point):
     raise http.ProbeFailure("test directory is not a kernel mount")
 
 
+
+def unmount_owned_process(cli, env, point, process):
+    # The foreground mount is our child. Reap it while the CLI waits for its
+    # PID to disappear; blocking in subprocess.run leaves an exited child as
+    # a zombie and makes the CLI's kill(pid, 0) check report it as still alive.
+    cleanup = subprocess.Popen([cli, "umount", "--timeout", "10s", "--no-auto-pack", point],
+                               env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # CLI --timeout applies to each wait phase, not the complete command.
+    deadline = time.monotonic() + 60
+    try:
+        while True:
+            process.poll()
+            try:
+                code = cleanup.wait(timeout=0.1)
+                require(code == 0, "unmount cleanup failed")
+                return
+            except subprocess.TimeoutExpired:
+                if time.monotonic() >= deadline:
+                    raise subprocess.TimeoutExpired("unmount cleanup", 60) from None
+    finally:
+        if cleanup.poll() is None:
+            cleanup.kill()
+            cleanup.wait(timeout=5)
+
+
 def run(cli, probe):
     require(sys.platform == "linux" and os.path.exists("/dev/fuse"), "Linux /dev/fuse is required; this test cannot skip")
     path = probe.root + "/mount.txt"
@@ -176,12 +201,13 @@ def run(cli, probe):
         if process is not None:
             primary_error = sys.exc_info()[1]
             print("CHECK unmount cleanup", flush=True)
+            detail = str(primary_error) if isinstance(primary_error, http.ProbeFailure) else type(primary_error).__name__
             try:
-                subprocess.run([cli, "umount", "--timeout", "10s", point], env=mounted.env,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+                unmount_owned_process(cli, mounted.env, point, process)
             except subprocess.TimeoutExpired:
-                detail = str(primary_error) if isinstance(primary_error, http.ProbeFailure) else type(primary_error).__name__
                 raise http.ProbeFailure("unmount cleanup timed out; prior failure: " + detail) from None
+            except http.ProbeFailure as error:
+                raise http.ProbeFailure(str(error) + "; prior failure: " + detail) from None
             finally:
                 if process.poll() is None:
                     process.terminate()
