@@ -750,7 +750,7 @@ func (a *LocalClustersAPI) bootstrapUsers(ctx context.Context, host string, port
 	}
 	defer func() { _ = db.Close() }()
 
-	user := localUserPrefix + ".root"
+	user := systemRootUsernameFor(localUserPrefix)
 	stmts := []string{
 		fmt.Sprintf("CREATE USER IF NOT EXISTS %s IDENTIFIED BY %s", quoteString(user), quoteString(password)),
 		fmt.Sprintf("ALTER USER %s IDENTIFIED BY %s", quoteString(user), quoteString(password)),
