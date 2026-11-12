@@ -6102,6 +6102,11 @@ func (h *bufferingHandle) commitLocked(ctx context.Context) error {
 // active part stream (its own finish path), or an observed non-patchable
 // storage class — leaving the caller the full-write path.
 func (h *bufferingHandle) commitPatched(ctx context.Context) (rev int64, attempted bool, err error) {
+	// Fixed views currently publish a complete file with a durable completion
+	// receipt. The main multipart PATCH protocol does not provide that binding.
+	if h.w.opts.Client.ViewBinding().LayerID != "" {
+		return 0, false, nil
+	}
 	threshold := h.w.opts.Client.CachedSmallFileThreshold()
 	h.mu.Lock()
 	size := h.buf.Size()
@@ -6186,6 +6191,11 @@ func (h *bufferingHandle) commitPatched(ctx context.Context) (rev int64, attempt
 // parts in parallel while the write stream continues. Parts flow through
 // WriteBuffer.OnPartFull; FinishStreaming publishes at the commit boundary.
 func (h *bufferingHandle) maybeArmStreaming() error {
+	// Keep the buffered image intact for the fixed seekable upload at commit.
+	// The legacy StreamWriter uses main's multipart completion protocol.
+	if h.w.opts.Client.ViewBinding().LayerID != "" {
+		return nil
+	}
 	if h.streamArmed || h.isNew || h.w.opts.Policy == PolicyWriteSync || h.forceSync {
 		return nil
 	}

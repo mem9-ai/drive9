@@ -64,8 +64,8 @@ func run(ctx context.Context, base string) error {
 	if err != nil || before.Revision < 1 {
 		return errors.New("inherited stat")
 	}
-	// Two parts, including bytes across the exact 4 MiB boundary.
-	data := bytes.Repeat([]byte("a"), (4<<20)+37)
+	// Three upload parts, also exceeding writeback's 8 MiB buffer part.
+	data := bytes.Repeat([]byte("a"), (8<<20)+37)
 	copy(data[(4<<20)-4:], []byte("part-boundary"))
 	writeCtx, err := client.WithViewOperationID(ctx, "write-large")
 	if err != nil {
@@ -105,6 +105,12 @@ func run(ctx context.Context, base string) error {
 	}
 	if !readEquals(ctx, child, "/file", data) || !readEquals(ctx, view, "/file", next) || !readEquals(ctx, c, "/file", seed) {
 		return errors.New("derived view overwrite isolation")
+	}
+	if err := writebackEdits(ctx, view, next); err != nil {
+		return err
+	}
+	if !readEquals(ctx, child, "/file", data) || !readEquals(ctx, c, "/file", seed) {
+		return errors.New("writeback child/main isolation")
 	}
 	plan, err := view.InitiateFixedExtentUpload(ctx, "cancel-init", "/cancelled", 6, 0, "")
 	if err != nil {
