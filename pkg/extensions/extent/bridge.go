@@ -224,6 +224,7 @@ func NewBridge(cfg Config) *Bridge {
 		p, ok := br.paths[ino]
 		return p, ok
 	}
+	debugRegisterBridge(br)
 	return br
 }
 

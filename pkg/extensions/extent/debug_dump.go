@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -48,6 +49,7 @@ func startDebugStackDump() {
 			}
 			n := runtime.Stack(buf, true)
 			fmt.Fprintf(f, "==== stacks %s ====\n", time.Now().UTC().Format(time.RFC3339))
+			fmt.Fprintf(f, "---- proc ----\n%s%s", debugProcSnapshot(), debugSelfStatus())
 			if b := debugBridge.Load(); b != nil {
 				fmt.Fprintf(f, "---- bridge state ----\n%s", b.debugState())
 			}
@@ -56,6 +58,40 @@ func startDebugStackDump() {
 			time.Sleep(interval)
 		}
 	}()
+}
+
+// debugProcSnapshot captures the memory lines a wedge diagnosis needs; on
+// a starved box nothing else may ever get to read /proc/meminfo.
+func debugProcSnapshot() string {
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return fmt.Sprintf("meminfo: %v\n", err)
+	}
+	var out string
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "MemTotal") || strings.HasPrefix(line, "MemFree") ||
+			strings.HasPrefix(line, "MemAvailable") || strings.HasPrefix(line, "Dirty") ||
+			strings.HasPrefix(line, "Writeback") || strings.HasPrefix(line, "AnonPages") ||
+			strings.HasPrefix(line, "SUnreclaim") || strings.HasPrefix(line, "Slab") {
+			out += line + "\n"
+		}
+	}
+	return out
+}
+
+func debugSelfStatus() string {
+	data, err := os.ReadFile("/proc/self/status")
+	if err != nil {
+		return fmt.Sprintf("status: %v\n", err)
+	}
+	var out string
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "VmRSS") || strings.HasPrefix(line, "VmSwap") ||
+			strings.HasPrefix(line, "Threads") || strings.HasPrefix(line, "State") {
+			out += line + "\n"
+		}
+	}
+	return out
 }
 
 // debugState summarizes the commit machinery under b.mu. The pinned
