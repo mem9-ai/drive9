@@ -227,3 +227,184 @@ func TestFixedUploadCleanupRejectsUnknownGenerationAndJournalFailure(t *testing.
 		t.Fatal(string(data), ok)
 	}
 }
+
+// Model a crash after local cleanup and before SettleFixedUpload. The old
+// completion can be retried even after reopening and admitting a new write.
+func TestFixedUploadCleanupAfterRestartPreservesNewWrite(t *testing.T) {
+	t.Run("pending", func(t *testing.T) {
+		dir := t.TempDir()
+		j, err := NewJournal(filepath.Join(dir, "journal.wal"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		idx, err := NewPendingIndex(filepath.Join(dir, "pending"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		idx.SetJournal(j)
+		original, err := idx.Put("/file", 3, PendingNew)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := j.PrepareFixedUpload("original", "/file", []byte(`{"generation":1}`)); err != nil {
+			t.Fatal(err)
+		}
+		if owned, err := idx.RetireFixedUploadGeneration("/file", original); err != nil || !owned {
+			t.Fatal(owned, err)
+		}
+		if err := j.Compact(); err != nil {
+			t.Fatal(err)
+		}
+		if err := j.Close(); err != nil {
+			t.Fatal(err)
+		}
+		j, err = NewJournal(filepath.Join(dir, "journal.wal"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = j.Close() }()
+		idx, err = NewPendingIndex(idx.Dir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		idx.SetJournal(j)
+		if err := idx.RecoverFromDisk(); err != nil {
+			t.Fatal(err)
+		}
+		if err := ReplayJournalIntoPending(j, idx, nil); err != nil {
+			t.Fatal(err)
+		}
+		fresh, err := idx.Put("/file", 5, PendingNew)
+		if err != nil || fresh <= original {
+			t.Fatal(fresh, err)
+		}
+		if owned, err := idx.RetireFixedUploadGeneration("/file", original); err != nil || owned {
+			t.Fatal(owned, err)
+		}
+		if meta, ok := idx.GetMeta("/file"); !ok || meta.Generation != fresh || meta.Size != 5 {
+			t.Fatal(meta, ok)
+		}
+		if pending, err := j.PendingFixedUploads(); err != nil || len(pending) != 1 {
+			t.Fatal(pending, err)
+		}
+		if err := j.SettleFixedUpload("original"); err != nil {
+			t.Fatal(err)
+		}
+		if err := j.Compact(); err != nil {
+			t.Fatal(err)
+		}
+		idx, err = NewPendingIndex(idx.Dir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := idx.RecoverFromDisk(); err != nil {
+			t.Fatal(err)
+		}
+		if err := ReplayJournalIntoPending(j, idx, nil); err != nil {
+			t.Fatal(err)
+		}
+		if meta, ok := idx.GetMeta("/file"); !ok || meta.Generation != fresh || meta.Size != 5 {
+			t.Fatal("new publication lost after replay", meta, ok)
+		}
+	})
+	t.Run("cache", func(t *testing.T) {
+		c, err := NewWriteBackCache(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Put("/file", []byte("old"), 3, PendingNew); err != nil {
+			t.Fatal(err)
+		}
+		original, _ := c.GetMeta("/file")
+		if owned, err := c.RetireFixedUploadGeneration("/file", original.Generation); err != nil || !owned {
+			t.Fatal(owned, err)
+		}
+		c, err = NewWriteBackCache(c.dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Put("/file", []byte("newer"), 5, PendingNew); err != nil {
+			t.Fatal(err)
+		}
+		fresh, _ := c.GetMeta("/file")
+		if fresh.Generation <= original.Generation {
+			t.Fatal("reused generation", fresh.Generation)
+		}
+		if owned, err := c.RetireFixedUploadGeneration("/file", original.Generation); err != nil || owned {
+			t.Fatal(owned, err)
+		}
+		c, err = NewWriteBackCache(c.dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if data, ok := c.Get("/file"); !ok || string(data) != "newer" {
+			t.Fatal(string(data), ok)
+		}
+	})
+}
+
+func TestFixedUploadGenerationFloorFailurePreservesMetadata(t *testing.T) {
+	for _, kind := range []string{"pending", "cache"} {
+		t.Run(kind, func(t *testing.T) {
+			dir := t.TempDir()
+			var retire func() (bool, error)
+			var check func()
+			if kind == "pending" {
+				idx, err := NewPendingIndex(dir)
+				if err != nil {
+					t.Fatal(err)
+				}
+				gen, err := idx.Put("/file", 3, PendingNew)
+				if err != nil {
+					t.Fatal(err)
+				}
+				retire = func() (bool, error) { return idx.RetireFixedUploadGeneration("/file", gen) }
+				check = func() {
+					fresh, err := NewPendingIndex(dir)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := fresh.RecoverFromDisk(); err != nil {
+						t.Fatal(err)
+					}
+					if m, ok := fresh.GetMeta("/file"); !ok || m.Generation != gen {
+						t.Fatal(m, ok)
+					}
+				}
+			} else {
+				c, err := NewWriteBackCache(dir)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := c.Put("/file", []byte("old"), 3, PendingNew); err != nil {
+					t.Fatal(err)
+				}
+				m, _ := c.GetMeta("/file")
+				retire = func() (bool, error) { return c.RetireFixedUploadGeneration("/file", m.Generation) }
+				check = func() {
+					fresh, err := NewWriteBackCache(dir)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if data, ok := fresh.Get("/file"); !ok || string(data) != "old" {
+						t.Fatal(string(data), ok)
+					}
+				}
+			}
+			floor := filepath.Join(dir, fixedUploadGenerationFile)
+			if err := os.Mkdir(floor, 0700); err != nil {
+				t.Fatal(err)
+			}
+			if owned, err := retire(); err == nil || owned {
+				t.Fatal("failed floor save permitted cleanup", owned, err)
+			}
+			if err := os.Remove(floor); err != nil {
+				t.Fatal(err)
+			}
+			check()
+			if owned, err := retire(); err != nil || !owned {
+				t.Fatal("retry", owned, err)
+			}
+		})
+	}
+}

@@ -9,7 +9,9 @@ import (
 
 // RetireFixedUploadGeneration durably retires only a remotely confirmed pending
 // generation. The index must already be recovered. A newer generation is left
-// intact. Unlike ordinary best-effort cleanup, errors keep the completion's WAL
+// intact, including after an empty index is reopened: the retired generation
+// floor is persisted before deleting metadata. Unlike best-effort cleanup, errors
+// keep the completion's WAL
 // record outstanding so the caller can retry before SettleFixedUpload.
 // The bool reports whether this call owned the matching pending metadata.
 func (idx *PendingIndex) RetireFixedUploadGeneration(remotePath string, generation uint64) (bool, error) {
@@ -25,6 +27,9 @@ func (idx *PendingIndex) RetireFixedUploadGeneration(remotePath string, generati
 	idx.mu.RUnlock()
 	if exists && !matches {
 		return false, nil
+	}
+	if err := idx.fixedRetired.advance(idx.dir, generation, &idx.nextGen); err != nil {
+		return false, err
 	}
 	// Publish under the path lock, so no newer pending frame can precede this
 	// marker. Even a retry with absent metadata must fence older WAL frames.
@@ -61,6 +66,9 @@ func (c *WriteBackCache) RetireFixedUploadGeneration(remotePath string, generati
 	meta, exists := c.metas[remotePath]
 	if exists && meta.Generation != generation {
 		return false, nil
+	}
+	if err := c.fixedRetired.advance(c.dir, generation, &c.nextGen); err != nil {
+		return false, err
 	}
 	for _, file := range []string{c.MetaFile(remotePath), c.DatFile(remotePath)} {
 		if err := os.Remove(file); err != nil && !errors.Is(err, os.ErrNotExist) {

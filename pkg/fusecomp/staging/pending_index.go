@@ -26,6 +26,7 @@ type PendingIndex struct {
 	items              map[string]*WriteBackMeta // path → metadata
 	dir                string                    // directory for .meta persistence
 	nextGen            atomic.Uint64
+	fixedRetired       fixedUploadGenerationFloor
 	pathLocks          map[string]*pendingPathLock
 	// journal, when set, is the durable publication channel for new pending
 	// entries: one group-committed WAL fsync replaces the per-entry
@@ -60,6 +61,10 @@ func NewPendingIndex(dir string) (*PendingIndex, error) {
 		dir:       dir,
 		pathLocks: make(map[string]*pendingPathLock),
 	}
+	if err := idx.fixedRetired.load(dir); err != nil {
+		return nil, err
+	}
+	idx.nextGen.Store(idx.fixedRetired.generation)
 	return idx, nil
 }
 
@@ -107,7 +112,7 @@ func (idx *PendingIndex) RecoverFromDisk() error {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
-	var maxGen uint64
+	maxGen := idx.nextGen.Load()
 	for _, e := range entries {
 		name := e.Name()
 		if !strings.HasSuffix(name, ".meta") {

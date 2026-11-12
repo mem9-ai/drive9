@@ -72,9 +72,10 @@ type PathLockEntry struct {
 // serialized per-path by pathLocks. This allows different files to write
 // concurrently while keeping same-path operations safe.
 type WriteBackCache struct {
-	dir     string // e.g. ~/.cache/drive9/{mount-hash}/pending
-	mu      sync.Mutex
-	nextGen atomic.Uint64
+	dir          string // e.g. ~/.cache/drive9/{mount-hash}/pending
+	mu           sync.Mutex
+	nextGen      atomic.Uint64
+	fixedRetired fixedUploadGenerationFloor
 	// metas is the authoritative in-memory metadata index.
 	// Kept in sync with disk by Put/Remove/RenamePending so that GetMeta and
 	// ListPendingPaths avoid local disk I/O and JSON parsing on hot paths.
@@ -210,9 +211,12 @@ func NewWriteBackCache(dir string) (*WriteBackCache, error) {
 		dataMaxBytes: defaultWriteBackDataCacheMaxSize,
 		pathLocks:    make(map[string]*PathLockEntry),
 	}
+	if err := c.fixedRetired.load(dir); err != nil {
+		return nil, err
+	}
 	// Populate in-memory index from disk (crash recovery).
 	entries, _ := os.ReadDir(dir)
-	var maxGen uint64
+	maxGen := c.fixedRetired.generation
 	for _, e := range entries {
 		name := e.Name()
 		if !strings.HasSuffix(name, ".meta") {
