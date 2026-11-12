@@ -262,6 +262,12 @@ type Server struct {
 	leaderWorkerMu       sync.Mutex
 	leaderWorkersStarted bool
 	leaderWorkerStopDone chan struct{}
+	// nativePrivilegeRetire* carry per-tenant retry state for the legacy-grant
+	// cleanup, so a failing tenant is retried with backoff instead of on every pass.
+	nativePrivilegeRetireMu       sync.Mutex
+	nativePrivilegeRetireFailures map[string]int
+	nativePrivilegeRetireRetryAt  map[string]time.Time
+	nativePrivilegeRetireDone     map[string]time.Time
 	// replayWorker and expirySweepWorker are leader-gated central quota
 	// workers owned by the server (single callback owner). Started in
 	// startLeaderWorkers and stopped in stopLeaderWorkers so they follow
@@ -1010,6 +1016,29 @@ func (s *Server) startLeaderWorkers() {
 				}
 			})
 		}
+	}
+	// Periodic cleanup of the legacy cluster-wide SYSTEM_VARIABLES_ADMIN grant on
+	// native tenants, whose per-tenant setup never runs again once they are active.
+	// Deliberately outside the provisioner-gated block: the pass needs only meta and
+	// pool, and it must keep running when a deployment switched its provider and its
+	// provisioner no longer constructs — which is exactly the state that leaves old
+	// native tenants behind. Periodic rather than one-shot so a tenant that becomes
+	// active later, or a failed attempt, is retried without waiting for a leadership
+	// change.
+	if s.meta != nil && s.pool != nil {
+		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
+			ticker := time.NewTicker(nativePrivilegeRetireInterval)
+			defer ticker.Stop()
+			s.retireNativeTenantVariablesPrivilege(workerCtx)
+			for {
+				select {
+				case <-workerCtx.Done():
+					return
+				case <-ticker.C:
+					s.retireNativeTenantVariablesPrivilege(workerCtx)
+				}
+			}
+		})
 	}
 	// Central-quota workers: the server owns these as the single leader-callback
 	// owner so they start/stop with leadership transitions (previously they were
@@ -4949,10 +4978,14 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 			errJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		// provider=local is the loopback-only development provider and stays
-		// anonymous; every other provider requires the explicit
-		// DRIVE9_ALLOW_ANONYMOUS_PROVISION opt-in.
-		if !s.allowAnonymousProvision && provider != tenant.ProviderLocal {
+		// provider=local is the loopback-only development provider and is the one
+		// provider that stays anonymous — but only for callers on the loopback
+		// interface. Every other provider requires the explicit
+		// DRIVE9_ALLOW_ANONYMOUS_PROVISION opt-in, and a non-loopback deployment
+		// must not create tenants unauthenticated just because the local provider
+		// is selected (the startup guard only refuses that bind while generated
+		// development keys are in use).
+		if s.provisionRequiresAuthentication(r, provider) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "provision_credentials_required", "provider", provider)...)
 			metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
 			errJSON(w, http.StatusUnauthorized, "provisioning requires authentication")

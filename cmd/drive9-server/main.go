@@ -657,7 +657,10 @@ environment:
                         /metrics is never served on the API listener.
   DRIVE9_ALLOW_ANONYMOUS_PROVISION accept POST /v1/provision without a caller TiDB Cloud
                         key pair, spending the server's default credential (default: false).
-                        provider=local is always anonymous.
+                        provider=local is anonymous only for requests received directly
+                        over loopback (a forwarding header such as Forwarded or
+                        X-Forwarded-For counts as remote). Set this to allow anonymous
+                        provisioning from a network address, including through a proxy.
   DRIVE9_LOCAL_TENANT_SECRET
                         seeds the per-tenant database passwords of the local
                         provider (defaults to DRIVE9_MASTER_KEY)
