@@ -18,3 +18,8 @@ currently upload the complete file for either edit. It does not cover kernel
 FUSE, same-mount switching or final merge.
 `go test -race ./e2e/fixedsdk` only checks the probe's endpoint and failure handling;
 it is not the paired integration run.
+
+The writeback offline regressions also cover retrying a lost extent completion
+response on the same open handle. They keep its original upload/operation and
+part list, then retire only the confirmed buffer generation. This recovery value
+is in memory; these cases do not establish crash recovery of a staging queue.

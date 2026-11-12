@@ -112,11 +112,7 @@ func (c *Client) writeExtentUpload(ctx context.Context, plan *uploadPlanV2, ra i
 	completeErr := error(nil)
 	if c.view.LayerID != "" {
 		id, _ := ctx.Value(viewOperationKey{}).(string)
-		var receipt FixedUploadCompletion
-		receipt, completeErr = c.CompleteFixedExtentUpload(ctx, id, plan.UploadID, parts)
-		if completeErr == nil && receipt.Size != size {
-			completeErr = markCommitAttempt(&ViewOperationError{LayerID: c.view.LayerID, OperationID: id, Err: errors.New("fixed upload completion size mismatch")})
-		}
+		_, completeErr = c.completeFixedExtentStream(ctx, id, plan.UploadID, parts, size)
 	} else {
 		completeErr = c.completeExtentUpload(ctx, plan.UploadID, parts, tags, wholeChecksum)
 	}

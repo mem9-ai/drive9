@@ -288,8 +288,11 @@ func removeCacheAncestorGen(list []uint64, gen uint64) []uint64 {
 }
 
 type bufferingHandle struct {
-	w    *Writeback
-	path string
+	// Fixed commits serialize completion recovery before publishing another image.
+	fixedCommitMu   sync.Mutex
+	fixedCompletion *pendingFixedCompletion
+	w               *Writeback
+	path            string
 	// baseLoaded marks a buffer that published a real base (or the lazy
 	// seed): a provisional buffer whose preload failed is discarded so a
 	// retried write re-initializes instead of committing a replacement
@@ -5173,6 +5176,20 @@ func (r *bufferReader) ReadAt(p []byte, off int64) (int, error) {
 // the image is too large for the whole-image tracks (v1's large-file
 // bypass of the .dat/.meta track).
 func (h *bufferingHandle) commitInline(ctx context.Context) error {
+	if h.w.opts.Client.ViewBinding().LayerID != "" {
+		h.fixedCommitMu.Lock()
+		defer h.fixedCommitMu.Unlock()
+		if err := h.resumeFixedCompletion(ctx); err != nil {
+			return err
+		}
+		h.mu.Lock()
+		dirty := h.dirty
+		h.mu.Unlock()
+		if !dirty {
+			return nil
+		}
+	}
+
 	var cacheGen uint64
 	if h.w.wbCache != nil {
 		if meta, ok := h.w.wbCache.GetMeta(h.path); ok {
@@ -5246,6 +5263,11 @@ func (h *bufferingHandle) commitInline(ctx context.Context) error {
 				}
 			}
 		}
+	}
+	var pending *client.FixedExtentCompletionError
+	if errors.As(err, &pending) {
+		h.fixedCompletion = &pendingFixedCompletion{request: pending, generation: commitGen, size: size, cacheGeneration: cacheGen}
+		return errors.Join(mapErr(err), err)
 	}
 	if err == nil {
 		if cacheGen != 0 {
@@ -5415,6 +5437,10 @@ func (w *Writeback) commitReaderOpt(ctx context.Context, path string, newReader 
 			werr = w.opts.Client.WriteStreamConditional(ctx, rp, newReader(), size, nil, expected)
 		}
 		if werr != nil {
+			var pending *client.FixedExtentCompletionError
+			if errors.As(werr, &pending) {
+				return 0, werr
+			}
 			if errors.Is(werr, client.ErrConflict) {
 				if st, serr := w.opts.Client.StatCtx(ctx, rp); serr == nil && st != nil {
 					// Retry only when the conflict did not advance the row
