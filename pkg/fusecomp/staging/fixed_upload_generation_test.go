@@ -171,3 +171,50 @@ func TestFixedUploadSkippedCleanupStillReservesOldIdentity(t *testing.T) {
 		t.Fatal(string(data), ok)
 	}
 }
+
+func TestFixedUploadGenerationProtectionRequiresCurrentOwner(t *testing.T) {
+	idx, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gen, err := idx.Put("/file", 3, PendingNew)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, wrong := range []uint64{0, gen + 1} {
+		if err := idx.ProtectFixedUploadGeneration("/file", wrong); err == nil {
+			t.Fatal("wrong pending owner accepted", wrong)
+		}
+	}
+	if err := idx.ProtectFixedUploadGeneration("/missing", gen); err == nil {
+		t.Fatal("missing pending owner accepted")
+	}
+	if err := idx.ProtectFixedUploadGeneration("/file", gen); err != nil {
+		t.Fatal(err)
+	}
+	if m, ok := idx.GetMeta("/file"); !ok || m.Generation != gen || m.Size != 3 {
+		t.Fatal(m, ok)
+	}
+	c, err := NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Put("/file", []byte("old"), 3, PendingNew); err != nil {
+		t.Fatal(err)
+	}
+	meta, _ := c.GetMeta("/file")
+	for _, wrong := range []uint64{0, meta.Generation + 1} {
+		if err := c.ProtectFixedUploadGeneration("/file", wrong); err == nil {
+			t.Fatal("wrong cache owner accepted", wrong)
+		}
+	}
+	if err := c.ProtectFixedUploadGeneration("/missing", meta.Generation); err == nil {
+		t.Fatal("missing cache owner accepted")
+	}
+	if err := c.ProtectFixedUploadGeneration("/file", meta.Generation); err != nil {
+		t.Fatal(err)
+	}
+	if data, ok := c.Get("/file"); !ok || string(data) != "old" {
+		t.Fatal(string(data), ok)
+	}
+}

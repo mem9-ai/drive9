@@ -27,7 +27,7 @@ func (idx *PendingIndex) RetireFixedUploadGeneration(remotePath string, generati
 	idx.mu.RUnlock()
 	// Even a skipped cleanup must reserve the old identity until settlement:
 	// the newer entry may itself disappear before a crash and old replay.
-	if err := idx.fixedRetired.advance(idx.dir, generation, &idx.nextGen); err != nil {
+	if err := idx.fixedFloor.advance(idx.dir, generation, &idx.nextGen); err != nil {
 		return false, err
 	}
 	if exists && !matches {
@@ -66,7 +66,7 @@ func (c *WriteBackCache) RetireFixedUploadGeneration(remotePath string, generati
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	meta, exists := c.metas[remotePath]
-	if err := c.fixedRetired.advance(c.dir, generation, &c.nextGen); err != nil {
+	if err := c.fixedFloor.advance(c.dir, generation, &c.nextGen); err != nil {
 		return false, err
 	}
 	if exists && meta.Generation != generation {

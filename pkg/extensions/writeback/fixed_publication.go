@@ -49,12 +49,31 @@ func (p fixedExtentPublication) validate(c *client.Client) error {
 // leaves recovery in the WAL, including a save failure whose durability is
 // unknown. Never abort or allocate a replacement operation after this call.
 // The caller settles the WAL only AFTER durable, generation-checked cleanup.
-func publishFixedExtent(ctx context.Context, c *client.Client, journal *staging.Journal, publication fixedExtentPublication) (client.FixedUploadCompletion, error) {
+func publishFixedExtent(ctx context.Context, c *client.Client, journal *staging.Journal, pending *staging.PendingIndex, cache *staging.WriteBackCache, publication fixedExtentPublication) (client.FixedUploadCompletion, error) {
 	if err := publication.validate(c); err != nil {
 		return client.FixedUploadCompletion{}, err
 	}
 	if journal == nil {
 		return client.FixedUploadCompletion{}, fmt.Errorf("fixed extent publication requires a journal")
+	}
+	// Reserve both local identities before writing a recoverable request. A
+	// newer image or unlink may remove their metadata before completion, so
+	// reserving only during post-commit cleanup would be too late.
+	if publication.PendingGeneration != 0 {
+		if pending == nil {
+			return client.FixedUploadCompletion{}, fmt.Errorf("fixed extent publication requires its pending index")
+		}
+		if err := pending.ProtectFixedUploadGeneration(publication.Path, publication.PendingGeneration); err != nil {
+			return client.FixedUploadCompletion{}, err
+		}
+	}
+	if publication.CacheGeneration != 0 {
+		if cache == nil {
+			return client.FixedUploadCompletion{}, fmt.Errorf("fixed extent publication requires its cache")
+		}
+		if err := cache.ProtectFixedUploadGeneration(publication.Path, publication.CacheGeneration); err != nil {
+			return client.FixedUploadCompletion{}, err
+		}
 	}
 	raw, err := json.Marshal(publication)
 	if err != nil {
