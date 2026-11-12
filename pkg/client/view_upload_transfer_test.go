@@ -18,7 +18,10 @@ import (
 
 func TestFixedUploadTransferOriginalIdentityAndBoundedResponses(t *testing.T) {
 	for _, completing := range []bool{false, true} {
-		for _, kind := range []string{"valid", "expired-plan", "truncated", "trailing", "invalid", "redirect", "unavailable", "missing"} {
+		for _, kind := range []string{"valid", "expired-plan", "truncated", "trailing", "invalid", "redirect", "unavailable", "missing", "zero-size", "missing-size", "null-size"} {
+			if !completing && strings.HasSuffix(kind, "-size") {
+				continue
+			}
 			t.Run(map[bool]string{false: "initiate/", true: "complete/"}[completing]+kind, func(t *testing.T) {
 				var calls atomic.Int32
 				api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -54,6 +57,24 @@ func TestFixedUploadTransferOriginalIdentityAndBoundedResponses(t *testing.T) {
 							p.ExpiresAt = time.Now().Add(-time.Hour).Format(time.RFC3339)
 							result = p
 						}
+					case "zero-size", "missing-size", "null-size":
+						raw, err := json.Marshal(result)
+						if err != nil {
+							t.Fatal(err)
+						}
+						var changed map[string]any
+						if err := json.Unmarshal(raw, &changed); err != nil {
+							t.Fatal(err)
+						}
+						switch kind {
+						case "zero-size":
+							changed["size_bytes"] = 0
+						case "null-size":
+							changed["size_bytes"] = nil
+						case "missing-size":
+							delete(changed, "size_bytes")
+						}
+						result = changed
 					case "truncated":
 						w.Header().Set("Content-Length", "10000")
 					case "invalid":

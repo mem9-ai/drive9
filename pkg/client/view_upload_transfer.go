@@ -136,7 +136,7 @@ func (c *Client) CompleteFixedExtentUpload(ctx context.Context, operationID, upl
 		return FixedUploadCompletion{}, markCommitAttempt(err)
 	}
 	if resp.StatusCode != http.StatusOK || out.Status != "completed" || out.OperationID != operationID || out.View.LayerID != c.view.LayerID || out.View.Fence != c.view.Fence ||
-		out.View.Generation < 1 || out.Revision < 1 || out.Size < 0 || viewprotocol.ValidateOperationID(out.ResourceID) != nil {
+		out.View.Generation < 1 || out.Revision < 1 || out.Size <= 0 || viewprotocol.ValidateOperationID(out.ResourceID) != nil {
 		return FixedUploadCompletion{}, markCommitAttempt(c.viewMutationError(req, fmt.Errorf("invalid fixed upload completion receipt")))
 	}
 	return out, nil
