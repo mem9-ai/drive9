@@ -21,7 +21,14 @@ import (
 
 func zeroTruncateFS(t *testing.T, backend http.Handler, cached bool) *FS {
 	t.Helper()
-	server := httptest.NewServer(backend)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			// These fixtures model ordinary single-layout files. The shared
+			// backend otherwise models older servers without a layout header.
+			w.Header().Set("X-Dat9-Content-Layout", "single")
+		}
+		backend.ServeHTTP(w, r)
+	}))
 	t.Cleanup(server.Close)
 	cl := client.New(server.URL, "")
 	bus := fs.NewEventBus()
@@ -313,5 +320,45 @@ func TestCloseSyncZeroTruncateRejectsConcurrentRemoteWrite(t *testing.T) {
 	releaseZeroTruncate(f, ino, fh)
 	if n, _ := b.Node("/file"); string(n.Data) != "foreign" || attempts.Load() != 1 {
 		t.Fatalf("conflict retried or overwrote remote: body=%q attempts=%d", n.Data, attempts.Load())
+	}
+}
+
+func TestCloseSyncZeroTruncateStatFailure(t *testing.T) {
+	for _, disconnect := range []bool{false, true} {
+		t.Run(fmt.Sprintf("disconnect-%t", disconnect), func(t *testing.T) {
+			b := testbackend.NewBackend()
+			var fail atomic.Bool
+			var puts atomic.Int32
+			f := zeroTruncateFS(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if fail.Load() {
+					if r.Method == http.MethodPut {
+						puts.Add(1)
+					}
+					if r.Method == http.MethodHead {
+						if disconnect {
+							conn, _, err := w.(http.Hijacker).Hijack()
+							if err != nil {
+								t.Error(err)
+								return
+							}
+							_ = conn.Close()
+						} else {
+							http.Error(w, "denied", http.StatusForbidden)
+						}
+						return
+					}
+				}
+				b.ServeHTTP(w, r)
+			}), true)
+			ino, fh := zeroTruncateSeed(t, f)
+			fail.Store(true)
+			if code := zeroTruncate(t, f, ino, 0); code == gofuse.OK {
+				t.Fatal("failed stat reported truncate success")
+			}
+			releaseZeroTruncate(f, ino, fh)
+			if n, _ := b.Node("/file"); string(n.Data) != "seed" || puts.Load() != 0 {
+				t.Fatalf("stat failure changed file: body=%q PUTs=%d", n.Data, puts.Load())
+			}
+		})
 	}
 }

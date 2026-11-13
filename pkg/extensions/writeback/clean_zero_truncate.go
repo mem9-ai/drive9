@@ -6,11 +6,12 @@ import (
 	"io"
 	"syscall"
 
+	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/fs"
 )
 
 // truncateCleanMainToZero commits a pathname truncate independently of clean
-// handles awaiting RELEASE. A dirty handle or pending upload still owns its
+// single-layout handles awaiting RELEASE. A dirty handle or pending upload still owns its
 // image and uses the existing local truncate path instead.
 func (w *Writeback) truncateCleanMainToZero(ctx context.Context, op *fs.Op) (fs.Result, error, bool) {
 	if w.opts.Policy != PolicyCloseSync || op.Size != 0 || op.Handle != nil || w.opts.Client.ViewBinding().LayerID != "" {
@@ -46,7 +47,15 @@ func (w *Writeback) truncateCleanMainToZero(ctx context.Context, op *fs.Op) (fs.
 	path := w.remotePath(op.Path)
 	st, err := w.opts.Client.StatCtx(ctx, path)
 	if err != nil {
+		if errors.Is(err, io.EOF) {
+			err = errors.Join(syscall.EIO, err)
+		}
 		return fs.Result{}, mapErr(err), true
+	}
+	// Ordinary PUT cannot replace append-log or extent content. Unknown
+	// layouts also retain the existing path; only explicit single is eligible.
+	if st.ContentLayout != client.ContentLayoutSingle {
+		return fs.Result{}, nil, false
 	}
 	if st.Revision <= 0 {
 		return fs.Result{}, syscall.EIO, true
