@@ -2193,6 +2193,12 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			return res, err
 		}
 		if op.Size >= 0 {
+			if res, err, handled := w.truncateCleanMainToZero(ctx, op); handled {
+				if err == nil {
+					w.invalidateRev(op.Path, res.Attr.Rev, op.Size)
+				}
+				return res, err
+			}
 			// A size change on a path with a live writer is local:
 			// the kernel delivers open(O_TRUNC) on an existing file as
 			// OPEN + SETATTR(size=0, fh) — the handle's buffer must

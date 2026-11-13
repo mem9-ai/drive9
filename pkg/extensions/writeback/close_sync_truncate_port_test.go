@@ -77,11 +77,9 @@ func (f *fakeInodeTable) Aliases(ino uint64) []string {
 }
 
 // v1 TestCloseSyncPathTruncateBeforeDelayedRelease (portable rows): the
-// truncate adopts the live handle's buffer locally; the remote keeps the
-// pre-truncation image until the owning write's commit boundary, and the
-// final published image is the truncated base plus the trailing write. The
-// v1 release-ordering rows collapse here: Release commits synchronously, so
-// only the reuse-vs-second-handle distinction remains.
+// clean zero truncate commits before returning; nonzero truncates retain
+// their existing local ownership. Actual FUSE delayed RELEASE orderings are
+// covered by TestCloseSyncZeroTruncateBeforeDelayedRelease in pkg/fuse.
 func TestPortPathTruncateBeforeDelayedRelease(t *testing.T) {
 	for _, size := range []int64{0, 2, 8} {
 		for _, order := range []string{"reuse-live-handle", "open-second-handle"} {
@@ -101,10 +99,12 @@ func TestPortPathTruncateBeforeDelayedRelease(t *testing.T) {
 				if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpSetAttr, Path: "/race.txt", Size: size}); err != nil {
 					t.Fatalf("truncate: %v", err)
 				}
-				// The live handle owns the truncation locally; the remote
-				// keeps the pre-truncation image until the commit boundary.
-				if n, _ := b.Node("/race.txt"); string(n.Data) != "seed" {
-					t.Fatalf("remote after truncate = %q, want seed (local adoption)", n.Data)
+				wantRemote := "seed"
+				if size == 0 {
+					wantRemote = ""
+				}
+				if n, _ := b.Node("/race.txt"); string(n.Data) != wantRemote {
+					t.Fatalf("remote after truncate = %q, want %q", n.Data, wantRemote)
 				}
 
 				writer := old
