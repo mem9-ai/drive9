@@ -123,11 +123,14 @@ func ReplayJournalIntoPending(j *Journal, idx *PendingIndex, shadows *ShadowStor
 		return nil
 	}
 
+	hasFixedUploads := false
 	latestData := make(map[string]JournalEntry) // path → latest fsync entry
 	latestMeta := make(map[string]JournalEntry) // path → latest pending-meta entry
 	latestDone := make(map[string]uint64)       // path → latest commit/unlink seq
 	if err := j.Replay(func(e JournalEntry) {
 		switch e.Op {
+		case JournalFixedUpload, JournalFixedUploadDone:
+			hasFixedUploads = true
 		case JournalCommit, JournalUnlink:
 			if e.Seq > latestDone[e.Path] {
 				latestDone[e.Path] = e.Seq
@@ -145,6 +148,17 @@ func ReplayJournalIntoPending(j *Journal, idx *PendingIndex, shadows *ShadowStor
 		}
 	}); err != nil {
 		return err
+	}
+
+	protectedPaths := map[string]bool{}
+	if hasFixedUploads {
+		records, err := j.PendingFixedUploads()
+		if err != nil {
+			return err
+		}
+		for _, record := range records {
+			protectedPaths[record.Path] = true
+		}
 	}
 
 	// A path can have both frame kinds (close published a meta frame, a later
@@ -176,7 +190,10 @@ func ReplayJournalIntoPending(j *Journal, idx *PendingIndex, shadows *ShadowStor
 			// kinds upload from the shadow file, and a lazy overwrite of a
 			// pre-existing file would otherwise CAS-commit truncated content
 			// over a good remote revision.
-			if shadows != nil {
+			// An unresolved completion owns independent recovery facts. Missing
+			// bytes may mean cleanup already succeeded before a crash. Rebuild
+			// metadata first, including later generations, without pruning here.
+			if shadows != nil && !protectedPaths[path] {
 				if size, ok := shadows.ContentSize(path); !ok || size < meta.Size {
 					shadows.Remove(path)
 					// This frame never became the selected publication. Preserve

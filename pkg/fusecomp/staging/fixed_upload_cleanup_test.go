@@ -408,3 +408,55 @@ func TestFixedUploadGenerationFloorFailurePreservesMetadata(t *testing.T) {
 		})
 	}
 }
+
+func TestFixedUploadJournalRecoveryKeepsOwnerBeforePublicationCleanup(t *testing.T) {
+	for _, size := range []int64{-1, 1} {
+		dir := t.TempDir()
+		s, err := NewStagingWithQuota(dir, 0, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Shadow.WriteFull("/file", []byte("bytes"), 0); err != nil {
+			t.Fatal(err)
+		}
+		gen, err := s.Pending.Put("/file", 5, PendingNew)
+		if err != nil {
+			t.Fatal(err)
+		}
+		token, err := s.Shadow.ProtectFixedShadow("/file", s.Shadow.ActiveGeneration("/file"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Journal.PrepareFixedUpload("original", "/file", []byte(`{"size":5}`)); err != nil {
+			t.Fatal(err)
+		}
+		s.Close()
+		shadow := filepath.Join(dir, "shadow", HashPath("/file")+".shadow")
+		if size < 0 {
+			err = os.Remove(shadow)
+		} else {
+			err = os.Truncate(shadow, size)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		fresh, err := NewStagingWithQuota(dir, 0, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := fresh.Recover(); err != nil {
+			t.Fatal(err)
+		}
+		if m, ok := fresh.Pending.GetMeta("/file"); !ok || m.Generation != gen {
+			t.Fatal(m, ok)
+		}
+		marker, err := os.ReadFile(filepath.Join(dir, "shadow", HashPath("/file")+fixedShadowSuffix))
+		if err != nil || string(marker) != token {
+			t.Fatal(string(marker), err)
+		}
+		if retired, err := fresh.Pending.RetireFixedShadowUpload("/file", gen, fresh.Shadow, token); err != nil || !retired {
+			t.Fatal(retired, err)
+		}
+		fresh.Close()
+	}
+}
