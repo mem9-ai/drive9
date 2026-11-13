@@ -68,7 +68,7 @@ func runMerge(ctx context.Context, base string) error {
 	if !readEquals(ctx, c, "/file", data) || !readEquals(ctx, observer, "/file", seed) || !readEquals(ctx, c, "/unrelated", []byte("concurrent")) {
 		return errors.New("merge published isolation")
 	}
-	if err := c.WriteCtx(ctx, "/file", []byte("newer main")); err != nil {
+	if err := overwriteMergedMain(ctx, c); err != nil {
 		return errors.New("merge newer write")
 	}
 	second, err := c.MergeFixedView(ctx, validation.Work, "merge-original")
@@ -76,4 +76,14 @@ func runMerge(ctx context.Context, base string) error {
 		return errors.New("merge replay changed main")
 	}
 	return nil
+}
+
+// The merged candidate has extent layout even when its next body is small.
+func overwriteMergedMain(ctx context.Context, c *client.Client) error {
+	current, err := c.StatCtx(ctx, "/file")
+	if err != nil || current.Revision < 1 || current.ContentLayout != client.ContentLayoutExtent {
+		return errors.New("merge current extent stat")
+	}
+	data := []byte("newer main")
+	return c.WriteMultipartStreamConditional(ctx, "/file", bytes.NewReader(data), int64(len(data)), nil, current.Revision)
 }
