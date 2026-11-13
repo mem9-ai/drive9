@@ -88,6 +88,13 @@ CI probes are additional coverage and does not waive that remaining work.
 
 ## CI automation tiers
 
+The `e2e/fixedsdk` executable is paired with an exact server commit by the
+server repository’s isolated LayerFS CI jobs. Its merge mode requires the new
+merge and quota handlers; it is intentionally excluded from generic
+`local-e2e.yml` runs against independently released server versions. The paired
+`layerfs-merge-ci.yml` builds it and runs `TestFixedMergePairedSDK`.
+
+
 Every script in this directory must be wired into one of these tiers (or be
 explicitly listed as manual-only with a reason). Do not merge a new e2e script
 without adding it to `.github/workflows/local-e2e.yml`.

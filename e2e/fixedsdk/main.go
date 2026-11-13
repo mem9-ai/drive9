@@ -162,7 +162,11 @@ func main() {
 		}
 		os.Exit(0)
 	}
-	if err := run(ctx, os.Getenv("DRIVE9_FIXED_SDK_BASE")); err != nil {
+	probe := run
+	if os.Getenv("DRIVE9_FIXED_SDK_MERGE") == "1" {
+		probe = runMerge
+	}
+	if err := probe(ctx, os.Getenv("DRIVE9_FIXED_SDK_BASE")); err != nil {
 		// run returns only fixed stage labels, never server bodies or signed URLs.
 		fmt.Fprintln(os.Stderr, "fixed sdk probe failed:", err)
 		os.Exit(1)

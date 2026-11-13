@@ -43,3 +43,11 @@ The same real writeback/core chain also opens the recovered extent file, unlinks
 its last name, recreates that name, and checks the old descriptor's full bytes,
 EOF, and anonymous write/flush isolation from the replacement. This exercises
 the userspace handle path and does not replace kernel FUSE acceptance.
+
+The paired merge fixture sets `DRIVE9_FIXED_SDK_MERGE=1`. This selects a separate
+scenario: capture main, upload a two-part extent candidate, seal and validate,
+publish while preserving an unrelated main edit and an older observer view,
+then retry the original merge after the server drops its successful response.
+A later replay must preserve a newer main overwrite. This is wired into the
+server repository's isolated `layerfs-merge-ci.yml` job, which pins the client
+commit; it is not run against a hosted tenant or an unmatched released server.

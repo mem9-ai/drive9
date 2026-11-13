@@ -51,3 +51,17 @@ func TestQueuePhaseRejectsInvalidConfigurationBeforeIO(t *testing.T) {
 		t.Fatal("accepted validation binding")
 	}
 }
+
+func TestMergeProbeRejectsEndpointAndHidesFailureDetail(t *testing.T) {
+	if err := runMerge(t.Context(), "https://example.invalid"); err == nil || err.Error() != "invalid loopback endpoint" {
+		t.Fatal(err)
+	}
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(503)
+		_, _ = w.Write([]byte("private server detail"))
+	}))
+	defer s.Close()
+	if err := runMerge(t.Context(), s.URL); err == nil || err.Error() != "merge seed" {
+		t.Fatal(err)
+	}
+}
