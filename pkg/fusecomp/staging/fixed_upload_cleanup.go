@@ -20,6 +20,10 @@ func (idx *PendingIndex) RetireFixedUploadGeneration(remotePath string, generati
 	}
 	pl := idx.acquirePathLock(remotePath)
 	defer idx.releasePathLock(remotePath, pl)
+	return idx.retireFixedUploadGenerationLocked(remotePath, generation)
+}
+
+func (idx *PendingIndex) retireFixedUploadGenerationLocked(remotePath string, generation uint64) (bool, error) {
 	idx.mu.RLock()
 	current, exists := idx.items[remotePath]
 	journal := idx.journal
@@ -83,4 +87,35 @@ func (c *WriteBackCache) RetireFixedUploadGeneration(remotePath string, generati
 	delete(c.metas, remotePath)
 	c.deleteDataLocked(remotePath)
 	return exists, nil
+}
+
+// RetireFixedShadowUpload serializes the two local owners. A later pending
+// generation may still depend on the shadow, so neither is removed in that case.
+func (idx *PendingIndex) RetireFixedShadowUpload(path string, generation uint64, shadows *ShadowStore, token string) (bool, error) {
+	if generation == 0 || shadows == nil {
+		return false, fmt.Errorf("fixed shadow cleanup requires its owners")
+	}
+	pl := idx.acquirePathLock(path)
+	defer idx.releasePathLock(path, pl)
+	if err := idx.fixedFloor.advance(idx.dir, generation, &idx.nextGen); err != nil {
+		return false, err
+	}
+	idx.mu.RLock()
+	current, exists := idx.items[path]
+	newer := exists && current.Generation != generation
+	idx.mu.RUnlock()
+	if newer {
+		return false, nil
+	}
+	retired, err := shadows.RetireFixedShadow(path, token)
+	if err != nil {
+		return false, err
+	}
+	if !retired {
+		return false, fmt.Errorf("fixed shadow changed without matching pending metadata")
+	}
+	if _, err := idx.retireFixedUploadGenerationLocked(path, generation); err != nil {
+		return false, err
+	}
+	return true, nil
 }

@@ -62,9 +62,12 @@ type DirtyExtent struct {
 // Shadow files live at <dir>/<hash>.shadow and support pread/pwrite for
 // efficient partial I/O without full-file materialization.
 type ShadowStore struct {
-	dir   string
-	mu    sync.RWMutex
-	files map[string]*ShadowFile // remote path → active shadow file
+	fixedEnabled   atomic.Bool
+	fixedMu        sync.Mutex
+	fixedProtected map[string]bool // hash -> durable publication marker
+	dir            string
+	mu             sync.RWMutex
+	files          map[string]*ShadowFile // remote path → active shadow file
 
 	// Generation-based pin for safe concurrent reads during commit cleanup.
 	// Pin/PinIfExists return a generation token. Remove on a pinned path
@@ -304,6 +307,9 @@ func (s *ShadowStore) Ensure(remotePath string, size int64, baseRev int64) error
 		}
 	}
 
+	if err := s.invalidateFixedShadow(remotePath); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	if err := sf.fd.Truncate(size); err != nil {
 		s.mu.Unlock()
@@ -358,6 +364,9 @@ func (s *ShadowStore) WriteAt(remotePath string, offset int64, data []byte, base
 	// acknowledged pinned image and its generation exactly as they were.
 	// The rotation copies the image, so this partial write composes with
 	// the existing bytes on the private copy.
+	if err := s.invalidateFixedShadow(remotePath); err != nil {
+		return 0, err
+	}
 	if err := s.rotatePinnedIfNeeded(remotePath); err != nil {
 		return 0, err
 	}
@@ -397,6 +406,9 @@ func (s *ShadowStore) WriteFull(remotePath string, data []byte, baseRev int64) e
 	// rotation's copy is discarded by the truncate below — the content
 	// preservation matters for WriteAt/Truncate, not for this full
 	// replacement, but the uniform primitive keeps one code path.
+	if err := s.invalidateFixedShadow(remotePath); err != nil {
+		return err
+	}
 	if err := s.rotatePinnedIfNeeded(remotePath); err != nil {
 		return err
 	}
@@ -487,6 +499,10 @@ func (s *ShadowStore) WriteStream(remotePath string, r io.Reader, baseRev int64)
 
 	delta := n - oldSize
 
+	if err := s.invalidateFixedShadow(remotePath); err != nil {
+		_ = os.Remove(tmpPath)
+		return 0, err
+	}
 	// Commit: swap temp file over the shadow file.
 	shadowFile := s.shadowPath(remotePath)
 	if err := os.Rename(tmpPath, shadowFile); err != nil {
@@ -541,6 +557,9 @@ func (s *ShadowStore) Truncate(remotePath string, size int64, baseRev int64) err
 	}
 	// Rotation only AFTER the quota gate; the copy preserves the prefix a
 	// shrink keeps, so the pinned generation's image survives intact.
+	if err := s.invalidateFixedShadow(remotePath); err != nil {
+		return err
+	}
 	if err := s.rotatePinnedIfNeeded(remotePath); err != nil {
 		return err
 	}
@@ -611,6 +630,9 @@ func (s *ShadowStore) WriteExtents(remotePath string, wb *writebuffer.WriteBuffe
 		planned.add(e.Offset, e.Length)
 	}
 	if err := s.checkQuotaForDelta(planned.truncate(newSize) - oldWritten); err != nil {
+		return err
+	}
+	if err := s.invalidateFixedShadow(remotePath); err != nil {
 		return err
 	}
 	for _, e := range extents {
@@ -1135,6 +1157,14 @@ func (s *ShadowStore) Rename(oldPath, newPath string) bool {
 		return true
 	}
 
+	s.mu.Unlock()
+	if err := s.invalidateFixedShadow(oldPath); err != nil {
+		return false
+	}
+	if err := s.invalidateFixedShadow(newPath); err != nil {
+		return false
+	}
+	s.mu.Lock()
 	oldSP := s.shadowPath(oldPath)
 	newSP := s.shadowPath(newPath)
 	if err := os.Rename(oldSP, newSP); err != nil {
@@ -2023,6 +2053,17 @@ func (s *ShadowStore) runRemoveCleanup(cleanup shadowRemoveCleanup) {
 func (s *ShadowStore) remove(remotePath string, expectedGen uint64, reason shadowRetirementReason) bool {
 	pl := s.acquirePathLock(remotePath)
 	defer s.releasePathLock(remotePath, pl)
+	if s.fixedEnabled.Load() {
+		s.mu.RLock()
+		matches := expectedGen == 0 || s.writeGen[remotePath] == expectedGen
+		s.mu.RUnlock()
+		if !matches {
+			return false
+		}
+		if err := s.invalidateFixedShadow(remotePath); err != nil {
+			return false
+		}
+	}
 	s.mu.Lock()
 	cleanup, ok := s.removeCoreLocked(remotePath, expectedGen, reason)
 	s.mu.Unlock()
