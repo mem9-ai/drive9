@@ -500,8 +500,11 @@ func (h *Handler) handleForLocked(path string, fh uint64) *engineHandle {
 // become) an engine file.
 func (h *Handler) tryClaimOpen(ctx context.Context, op *fs.Op) (fs.Result, error, bool) {
 	if h.opts.Engine == nil {
+		claimDebug("decline engine-nil path=%s", op.Path)
 		return fs.Result{}, nil, false
 	}
+	claimDebug("probe path=%s flags=%#x kernelCreate=%v patterns=%d threshold=%d",
+		op.Path, op.Flags, op.KernelCreate(), len(h.opts.Patterns), h.opts.Threshold)
 	// Serialized against retention for this name (unlink or rename-over):
 	// a claim straddling a retention boundary would attach a descriptor
 	// for the retained file onto the replaceable name. The layout decision
@@ -519,15 +522,18 @@ func (h *Handler) tryClaimOpen(ctx context.Context, op *fs.Op) (fs.Result, error
 		st, err := h.opts.Engine.Bridge.StatLocal(ctx, op.Path)
 		if err == nil {
 			if st.ContentLayout != client.ContentLayoutExtent {
+				claimDebug("decline exists-classic-layout path=%s", op.Path)
 				return fs.Result{}, nil, false
 			}
 			handle, attr, errno := h.openExistingLocked(ctx, op.Path, op.Flags, op.Caller)
 			if errno != 0 {
 				return fs.Result{}, errno, true
 			}
+			claimDebug("open-existing-extent path=%s", op.Path)
 			return fs.Result{Handle: handle, Attr: attr}, nil, true
 		}
 		if !client.IsNotFound(err) {
+			claimDebug("decline stat-error path=%s err=%v", op.Path, err)
 			return fs.Result{}, nil, false
 		}
 	}
@@ -571,11 +577,14 @@ func (h *Handler) tryClaimOpen(ctx context.Context, op *fs.Op) (fs.Result, error
 	// matches an explicit --extent / [extent] pattern; otherwise creation
 	// stays on the classic plane (hybrid promotion).
 	if op.Flags&syscall.O_CREAT == 0 || (h.opts.Threshold != 0 && !h.claimsPattern(op.Path)) {
+		claimDebug("decline guard path=%s ocreat=%v patternMatched=%v",
+			op.Path, op.Flags&syscall.O_CREAT != 0, h.claimsPattern(op.Path))
 		return fs.Result{}, nil, false
 	}
 	parent, name := SplitParent(op.Path)
 	parentIno, errno := h.opts.Engine.ResolvePath(ctx, parent)
 	if errno != 0 {
+		claimDebug("decline resolve-parent-error path=%s errno=%d", op.Path, errno)
 		return fs.Result{}, errno, true
 	}
 	mode := op.Mode
@@ -584,18 +593,21 @@ func (h *Handler) tryClaimOpen(ctx context.Context, op *fs.Op) (fs.Result, error
 	}
 	_, fh, errno := h.opts.Engine.VFS.Create(vfsCtx(op.Caller), meta.Ino(parentIno), name, uint16(mode&0o7777), 0, op.Flags)
 	if errno != 0 {
+		claimDebug("decline vfs-create-error path=%s errno=%d", op.Path, errno)
 		return fs.Result{}, errno, true
 	}
 	ino, errno := h.opts.Engine.ResolvePath(ctx, op.Path)
 	if errno != 0 {
 		// The bridge registered the mapping during Create; resolve again
 		// defensively (fresh files resolve locally).
+		claimDebug("decline resolve-after-create path=%s errno=%d", op.Path, errno)
 		return fs.Result{}, errno, true
 	}
 	// This descriptor CREATED the name: its first publication must
 	// establish an attributable identity before writing any occupant.
 	h.opts.Engine.Bridge.MarkFreshCreate(meta.Ino(ino))
 	handle := h.register(op.Path, ino, fh, op.Caller)
+	claimDebug("claimed-fresh path=%s ino=%d", op.Path, ino)
 	return fs.Result{Handle: handle, Attr: &fs.Attr{Kind: fs.KindFile, Mode: mode, Nlink: 1}}, nil, true
 }
 
