@@ -23,6 +23,9 @@ drive9 fs layer seal --operation seal-attempt-1 --work WORK_ID --fence 1 attempt
 # After seal, claim a separate read-only validation generation.
 drive9 fs layer work --operation validate-attempt-1 --ttl 10m --validation attempt-1
 
+# After validation, publish conditionally with that validation work identity.
+drive9 fs layer merge --operation merge-attempt-1 --work VALIDATION_WORK_ID --fence 2 attempt-1
+
 # Resolve a lost response using the original operation identity.
 drive9 fs layer operation attempt-1 seal-attempt-1
 
@@ -40,8 +43,8 @@ operation queries do not authorize a second execution.
 Create captures the whole managed workspace. `--parent` derives from the
 parent's fixed result. The previous base-root, tag selector, mutable checkpoint,
 rollback and per-file commit commands are not sent to legacy Layer endpoints.
-Unsupported commands fail locally. Atomic merge and mount selection are wired
-separately; this control-command implementation does not claim they are ready.
+Unsupported commands fail locally. Merge requires the validation work ID and
+fence. It sends one conditional publication request, without rerunning work.
 Ordinary file commands now accept the same explicit work binding:
 
 ```sh
@@ -85,10 +88,15 @@ failure, resolve uploads before explicitly requesting a new seal. Repeating the
 whole preparation does not resume callbacks: an already claimed work generation
 returns `ErrViewLaunchUnavailable`.
 
-Successful validation only records the callback's result. A separate conditional
-merge must still verify permissions, cancellation, leases and dependencies. Public
-write/quota/merge integration remains required; the offline HTTP tests do not
-claim server or real-mount acceptance. A compile-tested usage example is in
+Successful validation only records the callback's result. Call
+`Client.MergeFixedView(ctx, validationWork, operationID)` separately to publish.
+The server verifies permissions, cancellation, leases and dependencies. A
+`RUNNING` result requires a later retry with the same work and operation ID;
+`FAILED` is a terminal rejection. `ACCOUNTING_PENDING` means main was committed
+but quota bookkeeping still needs the original POST retried. A GET receipt
+marked DONE does not prove that bookkeeping finished. Neither SDK nor CLI
+automatically retries or reruns callbacks. Offline HTTP tests do not replace
+server or real-mount acceptance. A compile-tested preparation example is in
 `examples/go-sdk-cookbook/fixed_view_test.go`.
 
 

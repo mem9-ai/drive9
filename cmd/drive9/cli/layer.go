@@ -15,7 +15,7 @@ import (
 )
 
 func layerUsage() string {
-	return "usage: drive9 fs layer <create|list|status|work|renew|seal|cancel|delete|operation> [flags]"
+	return "usage: drive9 fs layer <create|list|status|work|renew|seal|merge|cancel|delete|operation> [flags]"
 }
 
 type fixedLayerOptions struct {
@@ -60,6 +60,9 @@ func parseFixedLayerOptions(args []string) (fixedLayerOptions, bool, error) {
 	f := flag.NewFlagSet("fs layer "+o.action, flag.ContinueOnError)
 	f.SetOutput(io.Discard)
 	operated := false
+	if o.action == "merge" {
+		o.validation = true
+	}
 	switch o.action {
 	case "create":
 		operated = true
@@ -72,7 +75,7 @@ func parseFixedLayerOptions(args []string) (fixedLayerOptions, bool, error) {
 	case "renew":
 		f.DurationVar(&o.ttl, "ttl", 0, "required renewed lifetime, 1ms through 1h")
 		f.BoolVar(&o.validation, "validation", false, "renew the validation generation")
-	case "seal", "cancel", "delete":
+	case "seal", "merge", "cancel", "delete":
 		operated = true
 	case "list":
 		f.StringVar(&o.after, "after", "", "continue after the previous next_after value")
@@ -84,7 +87,7 @@ func parseFixedLayerOptions(args []string) (fixedLayerOptions, bool, error) {
 	if operated {
 		f.StringVar(&o.operation, "operation", "", "required stable operation ID; retain it after timeout")
 	}
-	if o.action == "renew" || o.action == "seal" {
+	if o.action == "renew" || o.action == "seal" || o.action == "merge" {
 		f.StringVar(&o.work, "work", "", "work_id returned by the work claim")
 		f.Int64Var(&o.fence, "fence", 0, "fence returned by the work claim")
 	}
@@ -123,7 +126,7 @@ func parseFixedLayerOptions(args []string) (fixedLayerOptions, bool, error) {
 			return o, false, errors.New("--ttl is required and must be between 1ms and 1h")
 		}
 	}
-	if o.action == "renew" || o.action == "seal" {
+	if o.action == "renew" || o.action == "seal" || o.action == "merge" {
 		if err := (client.ViewBinding{LayerID: o.layer, WorkID: o.work, Fence: o.fence, Validation: o.validation}).Validate(); err != nil || o.layer == "" {
 			return o, false, errors.New("--work and --fence must identify the claimed Layer generation")
 		}
@@ -146,6 +149,8 @@ func runFixedLayerControl(ctx context.Context, c *client.Client, o fixedLayerOpt
 		return c.RenewViewWork(ctx, work, o.ttl)
 	case "seal":
 		return c.SealFixedView(ctx, work, o.operation)
+	case "merge":
+		return c.MergeFixedView(ctx, work, o.operation)
 	case "cancel", "delete":
 		return c.EndFixedView(ctx, o.layer, o.operation, o.action == "delete")
 	case "operation":
