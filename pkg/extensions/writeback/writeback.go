@@ -536,6 +536,9 @@ func New(opts Options) (*Writeback, error) {
 			workers = defaultUploadConcurrency
 		}
 		up := NewWriteBackUploader(opts.Client, w.wbCache, workers, root)
+		if opts.Staging != nil {
+			up.fixedJournal = opts.Staging.Journal
+		}
 		// The snapshot callback runs under the write-back cache's path lock at
 		// upload time: the failure stamp it captures is the one this landing
 		// may clear, and never a failure recorded after the upload started.
@@ -786,7 +789,15 @@ func (w *Writeback) Start(ctx context.Context) error {
 	}
 	if w.opts.Staging != nil && w.opts.Staging.Pending != nil {
 		if err := w.opts.Staging.Pending.RecoverFromDisk(); err != nil {
+			if w.opts.Client.ViewBinding().LayerID != "" {
+				return err
+			}
 			fmt.Fprintf(os.Stderr, "drive9: pending index recovery: %v\n", err)
+		}
+	}
+	if w.uploader != nil && w.opts.Client.ViewBinding().LayerID != "" {
+		if err := w.uploader.recoverFixedCache(ctx); err != nil {
+			return fmt.Errorf("recover fixed cache publications: %w", err)
 		}
 	}
 	// Recovery ownership is snapshotted BEFORE either track starts: the
@@ -890,6 +901,11 @@ func (w *Writeback) Stop(ctx context.Context) error {
 // then fail the unlink instead of acknowledging a deletion that a restart
 // would undo. The anonymous marking is rolled back on that path.
 func (w *Writeback) MarkPathUnlinked(p string) error {
+	unlock, err := w.uploader.lockFixedNamespace(p)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	marked, _ := w.markUnlinkedSnapshot(p, false)
 	// The name is going away NOW (the facade invokes this before FS.Unlink
 	// replies OK): the pending overlays must stop answering lookups for it,
@@ -1083,6 +1099,15 @@ func (w *Writeback) SetBypassArmer(a fs.CacheBypassArmer) { w.bypass = a }
 func (w *Writeback) ReexecRefusal() (string, int) {
 	if w == nil {
 		return "", 0
+	}
+	if w.opts.Client.ViewBinding().LayerID != "" && w.opts.Staging != nil && w.opts.Staging.Journal != nil {
+		records, err := w.opts.Staging.Journal.PendingFixedUploads()
+		if err != nil {
+			return "fixed_upload_recovery_error", 1
+		}
+		if len(records) > 0 {
+			return "fixed_upload_pending", len(records)
+		}
 	}
 	if w.queue != nil {
 		if snap := w.queue.Snapshot(); snap.Pending > 0 || snap.InFlight > 0 || snap.Delayed > 0 || snap.Conflicts > 0 {
@@ -1534,6 +1559,11 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 					if w.queue != nil {
 						w.waitPathCommit(op.Path)
 					}
+					unlock, err := w.uploader.lockFixedNamespace(op.Path)
+					if err != nil {
+						return fs.Result{}, err
+					}
+					defer unlock()
 					w.retarget(op.Path, survivor)
 					if _, err := next(ctx, op); err != nil {
 						// DELETE failed: bind back so nothing is lost.
@@ -1558,6 +1588,11 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		if w.uploader != nil {
 			w.uploader.WaitPath(op.Path)
 		}
+		unlock, err := w.uploader.lockFixedNamespace(op.Path)
+		if err != nil {
+			return fs.Result{}, err
+		}
+		defer unlock()
 		// Staged entries die with their path — but only AFTER the remote
 		// delete succeeds: wbCache/queue cleanup is irreversible, and a
 		// 503'd DELETE with the staging already removed lost the only
@@ -1658,6 +1693,11 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 				_ = w.uploader.UploadSync(ctx, op.Path)
 			}
 		}
+		unlock, err := w.uploader.lockFixedNamespace(op.Path, op.Path2)
+		if err != nil {
+			return fs.Result{}, err
+		}
+		defer unlock()
 		return next(ctx, op)
 
 	case fs.OpRename:
@@ -1757,6 +1797,11 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		if err := land(op.Path); err != nil {
 			return fs.Result{}, fmt.Errorf("land flushed image before rename %s: %w", op.Path, err)
 		}
+		unlock, err := w.uploader.lockFixedNamespace(op.Path, op.Path2)
+		if err != nil {
+			return fs.Result{}, err
+		}
+		defer unlock()
 		// A lazy-created writer that never landed has no remote entry to
 		// rename: its buffer simply moves (PrepareRename's local
 		// phase). Otherwise the remote rename runs first and the open

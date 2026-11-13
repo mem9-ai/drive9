@@ -106,18 +106,20 @@ type PendingKind int
 // WriteBackMeta stores metadata alongside cached file data so that the
 // background uploader (and crash-recovery) knows the remote path and size.
 type WriteBackMeta struct {
-	Path             string      `json:"path"`
-	Size             int64       `json:"size"`
-	Mtime            time.Time   `json:"mtime"`
-	CreatedAt        time.Time   `json:"created_at"`
-	Generation       uint64      `json:"generation,omitempty"`
-	Kind             PendingKind `json:"kind"`
-	BaseRev          int64       `json:"base_rev,omitempty"`
-	ShadowSpill      bool        `json:"shadow_spill,omitempty"`
-	Mode             uint32      `json:"mode,omitempty"`
-	HasMode          bool        `json:"has_mode,omitempty"`
-	SnapshotID       string      `json:"-"`
-	ParentSnapshotID string      `json:"-"`
+	FixedUploadSeed           string      `json:"fixed_upload_seed,omitempty"`
+	FixedUploadSeedGeneration uint64      `json:"fixed_upload_seed_generation,omitempty"`
+	Path                      string      `json:"path"`
+	Size                      int64       `json:"size"`
+	Mtime                     time.Time   `json:"mtime"`
+	CreatedAt                 time.Time   `json:"created_at"`
+	Generation                uint64      `json:"generation,omitempty"`
+	Kind                      PendingKind `json:"kind"`
+	BaseRev                   int64       `json:"base_rev,omitempty"`
+	ShadowSpill               bool        `json:"shadow_spill,omitempty"`
+	Mode                      uint32      `json:"mode,omitempty"`
+	HasMode                   bool        `json:"has_mode,omitempty"`
+	SnapshotID                string      `json:"-"`
+	ParentSnapshotID          string      `json:"-"`
 	// SupersedesPendingGen records the pending-index generation this image
 	// composed over at staging time (0 = unknown/legacy). A later landing of
 	// this entry may retire failure state whose pending generation is at or

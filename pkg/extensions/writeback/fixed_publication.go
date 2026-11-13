@@ -25,6 +25,8 @@ type fixedExtentPublication struct {
 	Size              int64                    `json:"size"`
 	PendingGeneration uint64                   `json:"pending_generation,omitempty"`
 	CacheGeneration   uint64                   `json:"cache_generation,omitempty"`
+	RemotePath        string                   `json:"remote_path,omitempty"`
+	CacheMetadata     *staging.WriteBackMeta   `json:"cache_metadata,omitempty"`
 	Parts             []client.FixedExtentPart `json:"parts"`
 }
 
@@ -35,6 +37,14 @@ func (p fixedExtentPublication) validate(c *client.Client) error {
 		p.PendingGeneration == 0 && p.CacheGeneration == 0 || viewprotocol.ValidateOperationID(p.OperationID) != nil || viewprotocol.ValidateOperationID(p.UploadID) != nil ||
 		len(p.Parts) < 1 || len(p.Parts) > 256 {
 		return fmt.Errorf("invalid fixed extent publication record")
+	}
+	if p.CacheMetadata != nil {
+		m := p.CacheMetadata
+		remote, err := pathutil.Canonicalize(p.RemotePath)
+		if p.PendingGeneration != 0 || p.CacheGeneration == 0 || m.Generation != p.CacheGeneration || m.Path != p.Path || m.Size != p.Size ||
+			err != nil || remote != p.RemotePath || remote == "/" || (m.Kind != staging.PendingNew && m.Kind != staging.PendingOverwrite) {
+			return fmt.Errorf("invalid fixed cache publication owner")
+		}
 	}
 	for i, part := range p.Parts {
 		digest, err := hex.DecodeString(part.ETag)
