@@ -62,7 +62,11 @@ func queuePhase(ctx context.Context, base, phase, dir string, binding client.Vie
 	if err := ledger.Recover(); err != nil {
 		return errors.New("queue journal replay")
 	}
-	w, err := writeback.New(writeback.Options{Client: c, Staging: ledger, Policy: writeback.PolicyWriteBack, UploadConcurrency: 1})
+	cache, err := staging.NewWriteBackCache(filepath.Join(dir, "cache"))
+	if err != nil {
+		return errors.New("queue cache")
+	}
+	w, err := writeback.New(writeback.Options{Client: c, Staging: ledger, WriteCache: cache, Policy: writeback.PolicyWriteBack, UploadConcurrency: 1})
 	if err != nil {
 		return errors.New("queue runtime")
 	}
@@ -77,7 +81,11 @@ func queuePhase(ctx context.Context, base, phase, dir string, binding client.Vie
 		if err := w.Queue().WaitIdle(ctx); err != nil {
 			return errors.New("queue recovery idle")
 		}
-		if ledger.Pending.HasPending("/queue-file") || ledger.Shadow.Has("/queue-file") {
+		if err := w.Drain(ctx); err != nil {
+			return errors.New("queue recovery drain")
+		}
+		_, cached := cache.GetMeta("/queue-file")
+		if cached || ledger.Pending.HasPending("/queue-file") || ledger.Shadow.Has("/queue-file") {
 			return errors.New("queue recovery cleanup")
 		}
 		records, err = ledger.Journal.PendingFixedUploads()
@@ -93,6 +101,12 @@ func queuePhase(ctx context.Context, base, phase, dir string, binding client.Vie
 	}
 	if err := w.Start(ctx); err != nil {
 		return errors.New("queue initial start")
+	}
+	// Reproduce a cache-to-queue handoff interrupted before old cache removal.
+	// The restart must not hand these stale bytes to the cache uploader after
+	// the queue's original completion removes its pending owner.
+	if err := cache.PutWithBaseRevAndMode("/queue-file", []byte("stale"), 5, staging.PendingNew, 0, 0, false); err != nil {
+		return errors.New("queue stale cache fixture")
 	}
 	data := queueProbeData()
 	if err := ledger.Shadow.WriteFull("/queue-file", data, 0); err != nil {
@@ -115,7 +129,8 @@ func queuePhase(ctx context.Context, base, phase, dir string, binding client.Vie
 		return errors.New("queue lost-completion injection")
 	}
 	records, err := ledger.Journal.PendingFixedUploads()
-	if err != nil || len(records) != 1 || !ledger.Pending.HasPending("/queue-file") || !ledger.Shadow.Has("/queue-file") {
+	_, cached := cache.GetMeta("/queue-file")
+	if err != nil || len(records) != 1 || !cached || !ledger.Pending.HasPending("/queue-file") || !ledger.Shadow.Has("/queue-file") {
 		return errors.New("queue lost local recovery")
 	}
 	// Intentionally no runtime Stop, journal Close, or local settlement here.
