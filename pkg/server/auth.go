@@ -127,6 +127,9 @@ func backendErrorStatus(ctx context.Context, err error) int {
 	if isQuotaError(err) {
 		return http.StatusPaymentRequired
 	}
+	if errors.Is(err, errChmodForbidden) {
+		return http.StatusForbidden
+	}
 	if isSchemaMigrationError(err) {
 		return http.StatusBadGateway
 	}
