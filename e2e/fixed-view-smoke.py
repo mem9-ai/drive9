@@ -43,7 +43,7 @@ class Probe:
         return f"{self.prefix}-{self.op_number}"
 
     def request(self, method, path, *, data=None, value=None, work=None,
-                headers=None, statuses=(200,), limit=4 << 20, object_url=False, timeout=120):
+                headers=None, statuses=(200,), limit=4 << 20, object_url=False, timeout=120, with_status=False):
         url = urllib.parse.urljoin(self.base + "/", path) if object_url else self.base + path
         supplied = dict(headers or {})
         if object_url:
@@ -81,6 +81,8 @@ class Probe:
                 require(declared.isdecimal() and len(raw) == int(declared), "incomplete response body")
             require(response.status in statuses,
                     f"{method} {'object PUT' if object_url else path} returned HTTP {response.status}, expected {statuses}")
+            if with_status:
+                return raw, response.headers, response.status
             return raw, response.headers
 
     def api(self, method, path, **kwargs):

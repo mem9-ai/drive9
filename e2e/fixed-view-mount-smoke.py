@@ -192,6 +192,58 @@ class MountProbe:
 
 
 
+def wait_retained_accounting(probe, work, timeout=240):
+    """Wait via real admission requests, never by setting SQL quota counters.
+
+    Initiation checks accounting before reserving/registering a session. Only
+    its explicit accounting-unavailable response can retry the original ID.
+    Success is cancelled immediately; no object or file is published here.
+    """
+    require(0 < timeout <= 240, "invalid accounting readiness timeout")
+    deadline = time.monotonic() + timeout
+    operation = probe.op()
+    route = "/v1/views/" + work["layer_id"] + "/v2/uploads"
+    request = {"path": probe.root + "/accounting-readiness", "total_size": 1,
+               "expected_revision": 0, "layout": "extent"}
+
+    def remaining():
+        left = deadline - time.monotonic()
+        require(left > 0, "retained accounting readiness timed out")
+        return min(10, left)
+
+    while True:
+        raw, headers, status = probe.request("POST", route + "/initiate", value=request, work=work,
+            headers={"Idempotency-Key": operation}, statuses=(202, 503), limit=8192,
+            timeout=remaining(), with_status=True)
+        remaining()  # A late response cannot turn an expired wait into success.
+        require(headers.get("Idempotency-Key") == operation, "accounting readiness response lost operation identity")
+        try:
+            result = json.loads(raw)
+        except (ValueError, UnicodeError, RecursionError):
+            raise http.ProbeFailure("invalid accounting readiness response") from None
+        if status == 503:
+            require(result == {"error": "fixed-view content accounting is not available"},
+                    "unexpected accounting readiness failure; no automatic retry")
+            time.sleep(min(1, remaining()))
+            continue
+        require(isinstance(result, dict), "invalid accounting readiness plan")
+        upload = result.get("upload_id")
+        require(isinstance(upload, str) and 0 < len(upload) <= 128
+                and all(c in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for c in upload)
+                and result.get("content_layout") == "extent" and result.get("total_parts") == 1
+                and type(result.get("part_size")) is int and result["part_size"] >= 1,
+                "invalid accounting readiness plan")
+        cancel = probe.op()
+        outcome = probe.api("POST", route + "/" + upload + "/abort", work=work,
+                            headers={"Idempotency-Key": cancel}, timeout=remaining())
+        remaining()
+        require(outcome == {"operation_id": cancel, "upload_id": upload, "status": "ABORTED"},
+                "accounting readiness reservation was not cancelled")
+        print("CHECK retained accounting admitted and temporary reservation cancelled", flush=True)
+        return
+
+
+
 def finish_write_merge(mounted, current, work, path):
     data = b"m" * ((4 << 20) + 19)
     mounted.write(path, data)
@@ -263,6 +315,8 @@ def run(cli, probe, write_merge=False):
         work = claim.get("work", {})
         require(claim.get("launch") is True and work.get("layer_id") == layer and work.get("work_id")
                 and work.get("fence", 0) > 0 and not work.get("validation"), "CLI did not claim the requested work")
+        if write_merge:
+            wait_retained_accounting(probe, work)
         if not write_merge:
             probe.request("PUT", probe.fs(path), data=b"after", statuses=(200, 201))
         with open(directory + "/mount.log", "wb") as log:
