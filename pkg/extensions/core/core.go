@@ -883,6 +883,17 @@ func (c *Core) statOp(ctx context.Context, path string, allowListing bool) (fs.R
 	}
 	st, err := c.statWithTransientRetry(ctx, path)
 	if err != nil {
+		// A main mount may authorize listing its root without authorizing
+		// HEAD. Recheck that exact directory, never a parent or cached list.
+		// This supplies only mount-root attributes; content and mutations
+		// still use their own server authorization. Fixed views require HEAD.
+		var statusErr *client.StatusError
+		if path == "/" && c.cl.ViewBinding().LayerID == "" && errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusForbidden {
+			if _, listErr := c.cl.ListCtx(ctx, c.remotePath(path)); listErr != nil {
+				return fs.Result{}, c.mapErr(listErr)
+			}
+			return fs.Result{Attr: &fs.Attr{Kind: fs.KindDir, Mode: 0o755}}, nil
+		}
 		if client.IsNotFound(err) {
 			// v1 cacheRemoteNotFoundPath: a remote-observed miss seeds a
 			// short-lived negative row (the storm escalation rides along;
