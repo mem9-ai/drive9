@@ -90,3 +90,24 @@ merge must still verify permissions, cancellation, leases and dependencies. Publ
 write/quota/merge integration remains required; the offline HTTP tests do not
 claim server or real-mount acceptance. A compile-tested usage example is in
 `examples/go-sdk-cookbook/fixed_view_test.go`.
+
+
+## Local content when switching a mount
+
+A Layer has its own persistent local directory for profile-local paths such as
+`node_modules` and `.git`. Fork and switch do not copy these files. Returning to
+that Layer reopens its existing directory, independently of the new work or mount
+generation. Main keeps its existing local root. Dirty-write recovery still uses
+the separate generation-specific cache; it is not reused as local profile data.
+
+A switch drains I/O and joins the old Git discovery, restore, and checkpoint work
+before starting the target runtime. Open files/directories, kernel references,
+locks, in-memory special nodes/xattrs and live temporary shared memory can still
+make a switch return BUSY. This does not relax the process re-exec gates.
+
+Accelerated `drive9 git` workspace commands and explicit `pack --mount` /
+`unpack --mount` use main-only APIs. They require the mounted view to be main and
+hold a root directory descriptor to prevent switching during the command.
+Ordinary filesystem Git commands in a Layer use that Layer's files and its local
+`.git`; they do not use main's accelerated workspace service. Real Linux mount
+acceptance is separate from the offline coordinator and CLI regression tests.

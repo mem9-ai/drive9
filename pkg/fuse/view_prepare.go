@@ -51,7 +51,7 @@ func (v *viewRequestFS) prepareViewSwitch(ctx context.Context, current *FS, noti
 	if drained := current.Drain(ctx); !drained.OK {
 		return pause, plan, fmt.Errorf("drain old mount view (%s): %s", drained.ErrorKind, drained.Error)
 	}
-	for _, refusal := range current.ReexecPreflight().Refusals {
+	for _, refusal := range current.viewSwitchPreflight().Refusals {
 		if refusal.Gate != "inode_nlookup" {
 			return pause, plan, fmt.Errorf("mount view %s: %s: %w", refusal.Gate, refusal.Reason, syscall.EBUSY)
 		}
@@ -94,7 +94,7 @@ func (v *viewRequestFS) checkViewSwitch(current *FS) error {
 	if v.currentTarget().fs != current {
 		return errViewGenerationConflict
 	}
-	if result := current.ReexecPreflight(); !result.OK {
+	if result := current.viewSwitchPreflight(); !result.OK {
 		return fmt.Errorf("mount view retains references or private extension state (%v): %w", result.Refusals, syscall.EBUSY)
 	}
 	return nil

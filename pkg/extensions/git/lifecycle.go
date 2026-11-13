@@ -6,6 +6,17 @@ type gitBackgroundTask struct {
 	cancel context.CancelFunc
 }
 
+// ViewSwitchRefusal permits the disk-backed workspace to remain in its own
+// local directory. Stop must join every background owner before replacement.
+func (g *Git) ViewSwitchRefusal() (string, int) {
+	n := 0
+	g.openHandles.Range(func(_, _ any) bool { n++; return true })
+	if n > 0 {
+		return "git workspace has open handles", n
+	}
+	return "", 0
+}
+
 // runBackground owns discovery and restore work until Stop joins it. A restore
 // has its own hydrate budget instead of inheriting the short discovery request's
 // deadline, but it must still stop with the runtime that owns its directory.

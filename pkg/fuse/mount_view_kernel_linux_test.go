@@ -23,6 +23,11 @@ func TestMountViewKernelSameConnectionSwitch(t *testing.T) {
 		t.Skip("manual Linux kernel test: set DRIVE9_RUN_FUSE_KERNEL_TEST=1")
 	}
 	cfg, _, _, _ := mountViewFixture(t)
+	cfg.LocalRoot = t.TempDir()
+	cfg.Profile = "coding-agent"
+	cfg.EnableGitWorkspaces = true
+	cfg.Extensions = []string{"core", "git", "localize"}
+	cfg.LocalOnlyPatterns = []string{"**/.git/**"}
 	dir, err := os.MkdirTemp("/tmp", "d9mv")
 	if err != nil {
 		t.Fatal(err)
@@ -82,6 +87,18 @@ func TestMountViewKernelSameConnectionSwitch(t *testing.T) {
 		}
 	}
 	read("a", "main")
+	writeLocal := func(content string) {
+		t.Helper()
+		for _, p := range []string{"node_modules/pkg/data", ".git/config"} {
+			if err := os.MkdirAll(filepath.Dir(p), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(p, []byte(content), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	writeLocal("main-local")
 	request := mountcontrol.SwitchRequest{MountID: mountID, OperationID: "kernel-switch-a", ExpectedGeneration: 1, Target: viewprotocol.Binding{LayerID: "a", WorkID: "work-a", Fence: 1}}
 	held, err := os.Open("a")
 	if err != nil {
@@ -112,7 +129,27 @@ func TestMountViewKernelSameConnectionSwitch(t *testing.T) {
 			time.Sleep(20 * time.Millisecond)
 		}
 	}
+	// Main-only CLI helpers use this same root-directory pin. A fresh
+	// status observation is insufficient unless this descriptor blocks switch.
+	rootHandle, err := os.Open(cfg.MountPoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err = mountcontrol.RequestSwitch(t.Context(), socket, request)
+	if err == nil || response == nil || response.ErrorKind != "BUSY" || response.Receipt != nil {
+		_ = rootHandle.Close()
+		t.Fatalf("open root must refuse before deciding: %+v %v", response, err)
+	}
+	if err := rootHandle.Close(); err != nil {
+		t.Fatal(err)
+	}
 	switchView(request)
+	for _, p := range []string{"node_modules/pkg/data", ".git/config"} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Fatalf("new Layer inherited main local file %s: %v", p, err)
+		}
+	}
+	writeLocal("layer-local")
 	read("a", "private") // cwd was already the root before switching.
 	read(filepath.Join(cfg.MountPoint, "a"), "private")
 	status, err = mountcontrol.RequestStatus(t.Context(), socket, time.Second)
@@ -122,4 +159,10 @@ func TestMountViewKernelSameConnectionSwitch(t *testing.T) {
 	request.OperationID, request.ExpectedGeneration, request.Target = "kernel-switch-main", 2, viewprotocol.Binding{}
 	switchView(request)
 	read("a", "main")
+	read("node_modules/pkg/data", "main-local")
+	read(".git/config", "main-local")
+	request.OperationID, request.ExpectedGeneration, request.Target = "kernel-switch-a-again", 3, viewprotocol.Binding{LayerID: "a", WorkID: "work-a", Fence: 1}
+	switchView(request)
+	read("node_modules/pkg/data", "layer-local")
+	read(".git/config", "layer-local")
 }

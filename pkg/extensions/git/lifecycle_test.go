@@ -130,3 +130,22 @@ func TestGitStopBeforeStartFlushesPendingCheckpoint(t *testing.T) {
 		t.Fatalf("Stop = %v, checkpoints = %d", err, calls.Load())
 	}
 }
+
+func TestGitViewSwitchKeepsOpenHandleRestriction(t *testing.T) {
+	g := &Git{}
+	if reason, n := g.ViewSwitchRefusal(); reason != "" || n != 0 {
+		t.Fatalf("idle runtime refused: %s %d", reason, n)
+	}
+	h := &gitHandle{}
+	g.openHandles.Store(h, "/repo/f")
+	if reason, n := g.ViewSwitchRefusal(); reason == "" || n != 1 {
+		t.Fatalf("open handle accepted: %s %d", reason, n)
+	}
+	g.openHandles.Delete(h)
+	if reason, n := g.ViewSwitchRefusal(); reason != "" || n != 0 {
+		t.Fatalf("released handle refused: %s %d", reason, n)
+	}
+	if _, n := g.ReexecRefusal(); n == 0 {
+		t.Fatal("process re-exec restriction was relaxed")
+	}
+}

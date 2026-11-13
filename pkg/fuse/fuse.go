@@ -111,9 +111,12 @@ type FS struct {
 	mountPt         string
 	rootTag         string
 	srvTag          string
-	locks           *fuseLockTable
-	handles         *handleTable
-	dirs            *dirTable
+	// viewLocalState is set only by the runtime builder that scopes persistent
+	// local directories per view and supplies joined lifecycle cleanup.
+	viewLocalState bool
+	locks          *fuseLockTable
+	handles        *handleTable
+	dirs           *dirTable
 	// viewGen fences listing installs across view resets: a READDIR that
 	// started before a checkout must not install its pre-reset page.
 	// viewMu makes the generation CHECK and the cache publication ATOMIC

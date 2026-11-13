@@ -1022,6 +1022,10 @@ func buildMountRuntimeWithCounters(cfg MountConfig, cl *client.Client, remoteRoo
 	if err != nil {
 		return nil, err
 	}
+	localRoot, err := mountstate.ViewLocalRoot(cfg.LocalRoot, cl.ViewBinding())
+	if err != nil {
+		return nil, err
+	}
 	extOrder, err := parseExtensionOrder(cfg.Extensions)
 	if err != nil {
 		return nil, err
@@ -1221,9 +1225,9 @@ func buildMountRuntimeWithCounters(cfg MountConfig, cl *client.Client, remoteRoo
 	// .git stays local, v1 gitDirShouldBeLocalOverlay) wires into the
 	// overlay router.
 	var gitExt *git.Git
-	if wantExt["git"] && cfg.EnableGitWorkspaces {
+	if wantExt["git"] && cfg.EnableGitWorkspaces && cl.ViewBinding().LayerID == "" {
 		var gerr error
-		gitExt, gerr = git.New(git.Options{Client: cl, Events: bus, LocalRoot: cfg.LocalRoot, RemoteRoot: remoteRoot, SyncPolicy: string(cfg.WritePolicy),
+		gitExt, gerr = git.New(git.Options{Client: cl, Events: bus, LocalRoot: localRoot, RemoteRoot: remoteRoot, SyncPolicy: string(cfg.WritePolicy),
 			OnWorkspaceRefresh: sharedCounters.RecordGitWorkspaceRefresh})
 		if gerr != nil {
 			return nil, fmt.Errorf("fuse: git extension: %w", gerr)
@@ -1235,12 +1239,17 @@ func buildMountRuntimeWithCounters(cfg MountConfig, cl *client.Client, remoteRoo
 	// (v1 local_overlay/local_policy semantics).
 	if wantExt["localize"] && cfg.LocalRoot != "" {
 		localizeOpts := localize.Options{
-			LocalRoot:                   cfg.LocalRoot,
+			LocalRoot:                   localRoot,
 			LocalOnlyPatterns:           cfg.LocalOnlyPatterns,
 			LocalGitignoreAwarePatterns: cfg.LocalGitignoreAwarePatterns,
 			RemoteOnlyPatterns:          cfg.RemoteOnlyPatterns,
 			Profile:                     cfg.Profile,
 			ApplyBuiltinDefaults:        !cfg.DisableBuiltinOverlayDefaults,
+		}
+		if cfg.EnableGitWorkspaces && cl.ViewBinding().LayerID != "" {
+			// Fixed views use ordinary filesystem Git traffic. The accelerated
+			// workspace API serves main only; its .git state must not be reused.
+			localizeOpts.LocalOnlyPatterns = append(append([]string(nil), cfg.LocalOnlyPatterns...), "**/.git/**")
 		}
 		if gitExt != nil {
 			// v1 gitDirShouldBeLocalOverlay: a discovered workspace's .git
@@ -1489,6 +1498,7 @@ func buildMountRuntimeWithCounters(cfg MountConfig, cl *client.Client, remoteRoo
 			coreExt.Attach(dc)
 		}
 	}
+	f.viewLocalState = generation.MountID != ""
 	f.mountPt, f.rootTag, f.srvTag = cfg.MountPoint, remoteRoot, cfg.Server
 
 	if sseExt != nil {

@@ -185,3 +185,28 @@ func TestViewPrepareDrainFailureDoesNotInvalidateOrDecide(t *testing.T) {
 		t.Fatalf("changed on failed drain: %+v", got)
 	}
 }
+
+// CLI helpers pin a root directory while using main-only side APIs. Root path
+// lookup follows the selected view, but an OPEN root descriptor still blocks a
+// switch; otherwise a status check followed by a CLI mutation would race it.
+func TestViewPrepareOpenRootDirectoryBlocksSwitch(t *testing.T) {
+	current := newXattrFS(t)
+	current.viewLocalState = true
+	adapter := &viewRequestFS{inner: current}
+	var opened gofuse.OpenOut
+	if status := adapter.OpenDir(nil, &gofuse.OpenIn{InHeader: gofuse.InHeader{NodeId: 1}}, &opened); status != gofuse.OK {
+		t.Fatal(status)
+	}
+	probe := &viewCacheProbe{}
+	if pause, _, err := adapter.prepareViewSwitch(t.Context(), current, probe, func(context.Context) error { return nil }); pause != nil || !errors.Is(err, syscall.EBUSY) || len(probe.calls) != 0 {
+		t.Fatalf("open root accepted: pause=%v err=%v notifications=%v", pause, err, probe.calls)
+	}
+	adapter.ReleaseDir(&gofuse.ReleaseIn{InHeader: gofuse.InHeader{NodeId: 1}, Fh: opened.Fh})
+	pause, _, err := adapter.prepareViewSwitch(t.Context(), current, probe, func(context.Context) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pause.resume(); err != nil {
+		t.Fatal(err)
+	}
+}
