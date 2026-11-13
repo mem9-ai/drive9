@@ -2106,6 +2106,17 @@ func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusUnauthorized, "invalid API key")
 		return
 	}
+	// The status response is the capability negotiation surface. An fs_scoped key must not
+	// read it: the batch content+mode contract is owner-only, and a scoped mount that
+	// negotiated it would attach hasMode to every writeback and be denied per item. The
+	// scoped allowlist never sees this route (it is registered directly on the mux), so
+	// the refusal has to live here.
+	if !statusAllowedForKey(&resolved.APIKey) {
+		metricEvent(r.Context(), "auth", "result", "scope_kind_unsupported")
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_scoped_key_denied", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID)...)
+		errJSON(w, http.StatusForbidden, "status is owner-only")
+		return
+	}
 	if resolved.APIKey.Status != meta.APIKeyActive {
 		metricEvent(r.Context(), "auth", "result", "key_inactive")
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_key_inactive", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID, "status", resolved.APIKey.Status)...)
@@ -2148,6 +2159,20 @@ func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 		MaxUploadBytes:  s.maxUploadBytes,
 		InlineThreshold: s.inlineThreshold,
 	})
+}
+
+// statusAllowedForKey reports whether the status capability contract may be served to
+// this token. Scoped keys are excluded: every capability it advertises is an owner
+// contract today.
+func statusAllowedForKey(key *meta.APIKey) bool {
+	if key == nil {
+		return false
+	}
+	scopeKind := key.ScopeKind
+	if scopeKind == "" {
+		scopeKind = meta.APIKeyScopeKindOwner
+	}
+	return scopeKind != meta.APIKeyScopeKindFS
 }
 
 func (s *Server) tenantStatusMessage(t *meta.Tenant) string {

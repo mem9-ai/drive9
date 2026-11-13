@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -454,6 +455,73 @@ func TestFSLayerScopedCommitRefusesRenameChainModeChange(t *testing.T) {
 	}
 	if nf.Mode&0o777 != 0o600 {
 		t.Fatalf("live mode = %o, want 600", nf.Mode&0o777)
+	}
+}
+
+// A plan that creates a path and then restyles it must commit for a scoped token: the
+// second entry writes a mode to an inode this commit just made, so there is no live mode
+// to change. Regression for the apply-time re-check denying on the plan's own creation.
+func TestFSLayerScopedCommitAllowsRestylingAPlanCreatedPath(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	store := s.fallback.Store()
+	scoped := &TenantScope{
+		Backend:  s.fallback,
+		IsScoped: true,
+		FSScopes: []FSScope{{Prefix: "/zone", Ops: map[FSOp]bool{FSOpRead: true, FSOpWrite: true, FSOpDelete: true}}},
+	}
+	for idx, entries := range [][]string{
+		{
+			`{"path":"/zone/a.txt","op":"upsert","kind":"file","mode":420,"content_text":"one"}`,
+			`{"path":"/zone/a.txt","op":"upsert","kind":"file","mode":384,"content_text":"two"}`,
+		},
+		{
+			`{"path":"/zone/d/","op":"mkdir","kind":"dir","mode":448}`,
+			`{"path":"/zone/d/","op":"upsert","kind":"dir","mode":493}`,
+		},
+	} {
+		layerID := fmt.Sprintf("layer-restyle-%d", idx)
+		if err := store.CreateFSLayer(ctx, &datastore.FSLayer{LayerID: layerID, BaseRootPath: "/zone"}); err != nil {
+			t.Fatal(err)
+		}
+		layer, err := store.GetFSLayer(ctx, layerID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, body := range entries {
+			req := httptest.NewRequest(http.MethodPost, "/v1/layers/"+layerID+"/entries", bytes.NewReader([]byte(body)))
+			req = req.WithContext(withScope(req.Context(), scoped))
+			rr := httptest.NewRecorder()
+			s.handleFSLayerEntryUpsert(rr, req, s.fallback, store, layer)
+			if rr.Code != http.StatusOK {
+				t.Fatalf("scoped staging %s status=%d body=%s, want 200", body, rr.Code, rr.Body.String())
+			}
+		}
+		req := httptest.NewRequest(http.MethodPost, "/v1/layers/"+layerID+"/commit", nil)
+		req = req.WithContext(withScope(req.Context(), scoped))
+		rr := httptest.NewRecorder()
+		layer, err = store.GetFSLayer(ctx, layerID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.handleFSLayerCommit(rr, req, s.fallback, store, layer)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("scoped commit of a restyled plan status=%d body=%s, want 200", rr.Code, rr.Body.String())
+		}
+	}
+	nf, err := s.fallback.StatNodeCtx(ctx, "/zone/a.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nf.Mode&0o777 != 0o600 {
+		t.Fatalf("restyled file mode = %o, want 600", nf.Mode&0o777)
+	}
+	nf, err = s.fallback.StatNodeCtx(ctx, "/zone/d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fsLayerNodeMode(nf) & 0o777; got != 0o755 {
+		t.Fatalf("restyled dir mode = %o, want 755", got)
 	}
 }
 

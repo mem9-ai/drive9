@@ -164,6 +164,30 @@ func fsLayerNodePath(nf *datastore.NodeWithFile, fallback string) string {
 	return fallback
 }
 
+// classify reports what path names after the moves replayed so far, falling back to live
+// main once. A path live main does not have is a plan creation, which is the fact the
+// commit loop also records when the entry actually creates it.
+func (st fsLayerPlanState) classify(ctx context.Context, b *backendpkg.Dat9Backend, rawPath string) (fsLayerPlanNode, error) {
+	if node, ok := st.resolve(rawPath); ok {
+		return node, nil
+	}
+	path := strings.TrimSuffix(rawPath, "/")
+	nf, err := b.StatNodeCtx(ctx, path)
+	if errors.Is(err, datastore.ErrNotFound) {
+		return fsLayerPlanNode{created: true}, nil
+	}
+	if err != nil {
+		return fsLayerPlanNode{}, err
+	}
+	return fsLayerPlanNode{livePath: fsLayerNodePath(nf, path)}, nil
+}
+
+// recordCreated marks a name the plan itself owns, so a later entry at the same path is a
+// creation-mode write rather than a chmod of the inode the commit just made.
+func (st fsLayerPlanState) recordCreated(rawPath string) {
+	st[strings.TrimSuffix(rawPath, "/")] = fsLayerPlanNode{created: true}
+}
+
 // entryChangesMode reports whether entry, executed after the moves replayed so far,
 // would change an existing path's permission bits. This is the only place the decision is
 // written: the entry gate, the commit scan and the apply-time re-check all call it with
@@ -172,12 +196,12 @@ func (st fsLayerPlanState) entryChangesMode(ctx context.Context, b *backendpkg.D
 	if b == nil || !fsLayerEntryCarriesMode(entry) {
 		return false, nil
 	}
-	node, ok := st.resolve(entry.Path)
-	if ok && (node.created || node.vacated) {
-		return false, nil
+	node, err := st.classify(ctx, b, entry.Path)
+	if err != nil {
+		return false, err
 	}
-	if !ok {
-		node = fsLayerPlanNode{livePath: strings.TrimSuffix(entry.Path, "/")}
+	if node.created || node.vacated {
+		return false, nil
 	}
 	if entry.Op == datastore.FSLayerEntryOpChmod {
 		// A mode-only entry names a path the plan has not created, so it changes that

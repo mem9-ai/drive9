@@ -22,6 +22,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/pathutil"
 	"github.com/mem9-ai/drive9/pkg/s3client"
+	"go.uber.org/zap"
 )
 
 const maxFSLayerBodyBytes = 1 << 20
@@ -1014,47 +1015,62 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 	rollbackCtx, rollbackCancel := context.WithTimeout(context.WithoutCancel(r.Context()), fsLayerRollbackTimeout)
 	defer rollbackCancel()
 	touchedPaths := make(map[string]struct{})
+	// failCommit rolls back to the given snapshot boundary and records the state the
+	// layer API expects after a refused or failed commit. One place, so the three call
+	// sites cannot drift on the entries[:i] vs [:i+1] boundary.
+	failCommit := func(rollbackSnapshots []fsLayerBaseSnapshot, event, path string, err error) {
+		rollbackErr := rollbackFSLayerCommit(rollbackCtx, b, rollbackSnapshots)
+		_ = store.SetFSLayerStateIf(rollbackCtx, layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
+		fields := eventFields(r.Context(), event, "error", err)
+		if path != "" {
+			fields = append(fields, zap.String("path", path))
+		}
+		if rollbackErr != nil {
+			fields = append(fields, zap.Error(rollbackErr))
+		}
+		logger.Error(r.Context(), event, fields...)
+		writeBackendError(w, r, err)
+	}
 	// The path->inode map is materialized here so the apply step can re-verify each
 	// mode-carrying entry against live main at the moment it runs: an owner chmod that
 	// lands mid-commit then refuses the entry instead of being silently reverted.
+	//
+	// Moves replay *before* they are applied. A rename's source has to be stat'ed while it
+	// still names the live inode — replaying afterwards would find it missing and record
+	// the target as a creation, which is exactly the shapes this check exists for.
 	planState := fsLayerPlanState{}
 	for i := range entries {
-		modeMayBeSuperseded := fsLayerEntryModeSuperseded(entries, i)
-		if err := applyFSLayerEntry(r.Context(), b, &entries[i], touchedPaths, fsLayerApplyOptions{modeMayBeSuperseded: modeMayBeSuperseded, canChmod: canChmod, planState: planState}); err != nil {
-			rollbackErr := rollbackFSLayerCommit(rollbackCtx, b, filterFSLayerSnapshotsForEntries(snapshots, entries[:i]))
-			_ = store.SetFSLayerStateIf(rollbackCtx, layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
-			if rollbackErr != nil {
-				logger.Error(r.Context(), "fs_layer_commit_apply_failed", eventFields(r.Context(), "fs_layer_commit_apply_failed", "path", entries[i].Path, "error", err, "rollback_error", rollbackErr)...)
-				writeBackendError(w, r, err)
+		entry := &entries[i]
+		if entry.Op == datastore.FSLayerEntryOpRename || entry.Op == datastore.FSLayerEntryOpWhiteout {
+			if err := planState.replayMove(r.Context(), b, entry); err != nil {
+				failCommit(filterFSLayerSnapshotsForEntries(snapshots, entries[:i]), "fs_layer_commit_apply_failed", entry.Path, err)
 				return
 			}
-			logger.Error(r.Context(), "fs_layer_commit_apply_failed", eventFields(r.Context(), "fs_layer_commit_apply_failed", "path", entries[i].Path, "error", err)...)
-			writeBackendError(w, r, err)
+		}
+		// A mode-carrying entry that creates its path makes the plan the owner of that
+		// name: later entries at the same path are creation-mode writes, not chmods of
+		// the inode this commit just made.
+		createsPath := false
+		if !canChmod && fsLayerEntryCarriesMode(entry) && entry.Op != datastore.FSLayerEntryOpChmod {
+			node, classifyErr := planState.classify(r.Context(), b, entry.Path)
+			if classifyErr != nil {
+				failCommit(filterFSLayerSnapshotsForEntries(snapshots, entries[:i]), "fs_layer_commit_apply_failed", entry.Path, classifyErr)
+				return
+			}
+			createsPath = node.created || node.vacated
+		}
+		modeMayBeSuperseded := fsLayerEntryModeSuperseded(entries, i)
+		if err := applyFSLayerEntry(r.Context(), b, entry, touchedPaths, fsLayerApplyOptions{modeMayBeSuperseded: modeMayBeSuperseded, canChmod: canChmod, planState: planState}); err != nil {
+			failCommit(filterFSLayerSnapshotsForEntries(snapshots, entries[:i]), "fs_layer_commit_apply_failed", entry.Path, err)
 			return
 		}
-		markFSLayerEntryTouched(touchedPaths, &entries[i])
-		if err := planState.replayMove(r.Context(), b, &entries[i]); err != nil {
-			rollbackErr := rollbackFSLayerCommit(rollbackCtx, b, filterFSLayerSnapshotsForEntries(snapshots, entries[:i+1]))
-			_ = store.SetFSLayerStateIf(rollbackCtx, layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
-			if rollbackErr != nil {
-				logger.Error(r.Context(), "fs_layer_commit_apply_failed", eventFields(r.Context(), "fs_layer_commit_apply_failed", "path", entries[i].Path, "error", err, "rollback_error", rollbackErr)...)
-				writeBackendError(w, r, err)
-				return
-			}
-			writeBackendError(w, r, err)
-			return
+		markFSLayerEntryTouched(touchedPaths, entry)
+		if createsPath {
+			planState.recordCreated(entry.Path)
 		}
 	}
 	if err := store.SetFSLayerStateIf(commitCtx, layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateCommitted); err != nil {
-		rollbackErr := rollbackFSLayerCommit(rollbackCtx, b, snapshots)
-		_ = store.SetFSLayerStateIf(rollbackCtx, layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
-		if rollbackErr != nil {
-			logger.Error(r.Context(), "fs_layer_commit_finalize_failed", eventFields(r.Context(), "fs_layer_commit_finalize_failed", "layer_id", layer.LayerID, "error", err, "rollback_error", rollbackErr)...)
-			writeBackendError(w, r, err)
-			return
-		}
-		logger.Error(r.Context(), "fs_layer_commit_finalize_failed", eventFields(r.Context(), "fs_layer_commit_finalize_failed", "layer_id", layer.LayerID, "error", err)...)
-		writeBackendError(w, r, err)
+		failCommit(snapshots, "fs_layer_commit_finalize_failed", "", err)
 		return
 	}
 	committed = true
