@@ -5,6 +5,7 @@ package fuse
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -38,7 +39,13 @@ func TestMountViewKernelSameConnectionSwitch(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- MountWithConfig(cfg) }()
 	t.Cleanup(func() {
-		_ = unix.Unmount(cfg.MountPoint, 0)
+		// CI runs as an unprivileged user. The same fusermount helper that
+		// created the mount must perform teardown; raw umount returns EPERM.
+		unmountCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if output, err := exec.CommandContext(unmountCtx, "fusermount3", "-u", "--", cfg.MountPoint).CombinedOutput(); err != nil {
+			t.Errorf("unmount: %v: %s", err, output)
+		}
 		select {
 		case err := <-done:
 			if err != nil {
