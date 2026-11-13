@@ -212,6 +212,71 @@ class MountProbeTest(unittest.TestCase):
                 remove.assert_not_called()
 
 
+class MountedMergeTest(unittest.TestCase):
+    def test_write_waits_for_fsync_and_reports_failure_without_retry(self):
+        driver = smoke.MountProbe("cli", smoke.http.Probe("http://127.0.0.1:9009", ""), "/mount")
+        for result in (subprocess.CompletedProcess([], 0, b"", b""),
+                       subprocess.CompletedProcess([], 1, b"private", b"private"),
+                       subprocess.TimeoutExpired("private", 60)):
+            with patch.object(smoke.subprocess, "run") as run:
+                if isinstance(result, Exception):
+                    run.side_effect = result
+                else:
+                    run.return_value = result
+                if getattr(result, "returncode", None) == 0:
+                    driver.write("/file", b"content")
+                else:
+                    with self.assertRaises(smoke.http.ProbeFailure) as error:
+                        driver.write("/file", b"content")
+                    self.assertNotIn("private", str(error.exception))
+                self.assertEqual(run.call_count, 1)
+                self.assertIn("os.fsync", run.call_args.args[0][2])
+                self.assertEqual(run.call_args.kwargs["input"], b"content")
+
+    def test_merge_after_switch_validates_and_replays_original_request(self):
+        for failure in (None, "write", "validation", "merge", "replay"):
+            with self.subTest(failure=failure):
+                driver = Mock()
+                work = {"layer_id":"a", "work_id":"work", "fence":1}
+                validation = dict(work, work_id="validation", fence=2, validation=True)
+                driver.probe.seal_and_validate.return_value = validation
+                driver.probe.op.return_value = "merge-original"
+                done = {"state":"DONE", "layer":{"layer_id":"a", "phase":"MERGED"}}
+                driver.call.side_effect = [done, done]
+                if failure == "write": driver.write.side_effect = smoke.http.ProbeFailure("write")
+                if failure == "validation": driver.read_validation.side_effect = smoke.http.ProbeFailure("validation")
+                if failure == "merge": driver.call.side_effect = [{"state":"RUNNING"}]
+                if failure == "replay": driver.call.side_effect = [done, {"state":"FAILED"}]
+                if failure:
+                    with self.assertRaises(smoke.http.ProbeFailure):
+                        smoke.finish_write_merge(driver, {"generation":3}, work, "/file")
+                else:
+                    smoke.finish_write_merge(driver, {"generation":3}, work, "/file")
+                    names = [c[0] for c in driver.mock_calls]
+                    self.assertLess(names.index("switch"), names.index("probe.seal_and_validate"))
+                    self.assertLess(names.index("read_validation"), names.index("call"))
+                    self.assertEqual(driver.call.call_args_list[0], driver.call.call_args_list[1])
+                    self.assertIn("validation", driver.call.call_args.args[0])
+                    self.assertIn("merge-original", driver.call.call_args.args[0])
+                    data = driver.write.call_args.args[1]
+                    self.assertGreater(len(data), 4 << 20)
+                    self.assertEqual(driver.read.call_args.args, ("/file", data))
+                if failure in ("write", "validation"):
+                    driver.call.assert_not_called()
+                if failure == "merge": self.assertEqual(driver.call.call_count, 1)
+
+    def test_validation_read_binds_readonly_work(self):
+        driver = smoke.MountProbe("cli", smoke.http.Probe("http://127.0.0.1:9009", ""), "/mount")
+        work = {"layer_id":"a", "work_id":"validation", "fence":2}
+        for code, body in ((0,b"expected"),(0,b"stale"),(1,b"expected")):
+            with patch.object(smoke.subprocess,"run",return_value=subprocess.CompletedProcess([],code,body,b"")) as run:
+                if code == 0 and body == b"expected":
+                    driver.read_validation("/file",b"expected",work)
+                else:
+                    with self.assertRaises(smoke.http.ProbeFailure): driver.read_validation("/file",b"expected",work)
+                self.assertEqual(run.call_args.args[0], ["cli","fs","cat","--layer","a","--work","validation","--fence","2","--validation","/file"])
+
+
 class UnmountOwnedProcessTest(unittest.TestCase):
     @unittest.skipIf(os.name == "nt", "Unix child process lifecycle")
     def test_reaps_foreground_child_while_unmount_waits(self):

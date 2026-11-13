@@ -511,3 +511,12 @@ FUSE_PROFILE=coding-agent-extent RUN_FUSE_ALL_WORKLOADS=1 \
 - `CLI_UPLOAD_LIMIT_BYTES` controls the boundary value checked by CLI e2e (default `10737418240`).
 - `fuse-smoke-test.sh` will `SKIP` when host prerequisites are missing (for example no `/dev/fuse`) unless `FUSE_STRICT_PREREQS=1`.
 - `fuse-release-gate.sh` is the strict CI/release entry point and enables git clone/status/log, durable `umount --timeout` remount checks, mount-log audit, manifest read correctness, and SQLite rollback-journal correctness. Set `RUN_FUSE_ALL_WORKLOADS=1` to add concurrency stress, fsx-style POSIX coverage, and threshold-free performance metrics in one command. Set `RUN_FUSE_SQLITE_CORRECTNESS=0` to skip SQLite temporarily while diagnosing host-specific FUSE failures, `RUN_FUSE_CONCURRENCY_STRESS=1` to add bounded concurrency stress, `RUN_FUSE_POSIX_FSX=1` to add fsx-style POSIX coverage, or `RUN_FUSE_PERFORMANCE_BASELINE=1` to add threshold-free performance metrics.
+
+The `fixed-view-mount-ci.sh` entry runs the writable same-mount flow: create a Layer,
+write and fsync more than one extent block through FUSE, switch back to main,
+seal and validate using the bound CLI, then merge and read the published bytes
+through the original mount. It requires Linux FUSE and a paired v10 server with
+retained quota enabled. It is manual-only from this client repository until the
+paired server API is released; the server's isolated LayerFS acceptance workflow
+runs it against the matching server branch. It provisions a fresh local tenant,
+requires explicit success, and propagates write, switch, merge and cleanup failures.
