@@ -1,6 +1,7 @@
 package go_sdk_cookbook_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -97,4 +98,106 @@ func ExampleClient_fixedUploadControls() {
 	}
 	// This example explicitly abandons the upload instead of publishing it.
 	_, _ = bound.AbortFixedUpload(ctx, "abort-upload-1", "issued-upload")
+}
+
+// Empty files use a conditional PUT; chmod uses the returned file identity.
+func ExampleClient_fixedEmptyFileAndMode() {
+	ctx := context.Background()
+	c := drive9.New("https://drive9.example.com", "api-key")
+	bound, err := c.WithView(drive9.ViewBinding{LayerID: "candidate", WorkID: "issued-work", Fence: 1})
+	if err != nil {
+		return
+	}
+	// Persist both operation IDs and their request inputs before sending.
+	file, err := bound.WriteFixedEmptyFile(ctx, "create-empty-1", "/empty.txt", 0)
+	if err != nil {
+		return // Recover the original PUT; do not adopt a newer path revision.
+	}
+	_, err = bound.ChmodFixedFile(ctx, "chmod-empty-1", "/empty.txt", file.ResourceID, file.Revision, 0o600)
+	if err != nil {
+		return // Retry only the same chmod inputs and operation ID.
+	}
+}
+
+func ExampleClient_fixedExtentUpload() {
+	ctx := context.Background()
+	c := drive9.New("https://drive9.example.com", "api-key")
+	bound, err := c.WithView(drive9.ViewBinding{LayerID: "candidate", WorkID: "issued-work", Fence: 1})
+	if err != nil {
+		return
+	}
+	data := []byte("immutable upload source")
+	size := int64(len(data))
+	// Save the binding, path, size, expected revision and distinct phase IDs.
+	plan, err := bound.InitiateFixedExtentUpload(ctx, "initiate-file-1", "/file.bin", size, 0, "")
+	if err != nil {
+		return // An uncertain initiation is retried with identical inputs.
+	}
+	parts, err := bound.UploadFixedExtentParts(ctx, plan, bytes.NewReader(data), size, nil)
+	if err != nil {
+		return // Transfer failure attempts cancellation; do not publish parts.
+	}
+	// Durably save plan.UploadID, parts, size, binding and "complete-file-1"
+	// BEFORE this call. Persist them in the application's recovery journal.
+	receipt, err := bound.CompleteFixedExtentUploadWithSize(ctx, "complete-file-1", plan.UploadID, parts, size)
+	if err != nil {
+		// Keep that saved request. Do not cancel or initiate another upload:
+		// publication may have succeeded. FixedExtentCompletionError also
+		// supports explicit Retry while this process remains alive.
+		return
+	}
+	_ = receipt.ResourceID
+	_ = receipt.Revision
+}
+
+func ExampleClient_fixedExtentCompletionReplay() {
+	ctx := context.Background()
+	c := drive9.New("https://drive9.example.com", "api-key")
+	bound, err := c.WithView(drive9.ViewBinding{LayerID: "candidate", WorkID: "issued-work", Fence: 1})
+	if err != nil {
+		return
+	}
+	// In a recovery program, load the exact binding, upload ID, operation ID
+	// and part list saved BEFORE the original completion. These illustrative
+	// values represent one uploaded part, whose ETag is its SHA-256 address.
+	digest := sha256.Sum256([]byte("part"))
+	parts := []drive9.FixedExtentPart{{Number: 1, ETag: hex.EncodeToString(digest[:])}}
+	receipt, err := bound.CompleteFixedExtentUpload(ctx, "complete-part-1", "issued-upload", parts)
+	if err != nil {
+		return // Retain the same saved request for later explicit recovery.
+	}
+	// The lower-level method validates a positive size. Compare the original
+	// size here, or prefer CompleteFixedExtentUploadWithSize above.
+	if receipt.Size != 4 {
+		return // A mismatched receipt does not prove rollback; retain identity.
+	}
+}
+
+func ExampleClient_mergeFixedView() {
+	ctx := context.Background()
+	c := drive9.New("https://drive9.example.com", "api-key")
+	// Use the actual validation claim AFTER the application has validated its
+	// candidate. Persist it together with the merge operation ID beforehand.
+	validation := drive9.ViewWork{LayerID: "candidate", ID: "issued-validation", Fence: 2, Validation: true}
+	out, err := c.MergeFixedView(ctx, validation, "merge-candidate-1")
+	if err != nil || out.State == "RUNNING" {
+		return // Retry this POST with the same inputs, never rerun candidate work.
+	}
+	if out.State == "FAILED" {
+		_ = out.Code // Terminal rejection; main was not published by this request.
+		return
+	}
+	// DONE from this POST includes quota bookkeeping. A GET receipt alone
+	// does not resolve ACCOUNTING_PENDING after an earlier lost response.
+}
+
+func ExampleClient_writeMainExtent() {
+	ctx := context.Background()
+	c := drive9.New("https://drive9.example.com", "api-key")
+	data := []byte("replacement extent body")
+	// Explicit extent layout, even for a short body. Use an observed positive
+	// revision for replacement, or zero to require an absent main path.
+	if err := c.WriteExtentStreamConditional(ctx, "/main.bin", bytes.NewReader(data), int64(len(data)), nil, 0); err != nil {
+		return
+	}
 }
