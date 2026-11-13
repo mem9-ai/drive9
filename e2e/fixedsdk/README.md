@@ -38,3 +38,8 @@ request used by the asynchronous runtime.
 The queue restart also verifies that the superseded cache is removed before it
 can be uploaded as another owner. Both background tracks must drain, and the
 queue shadow, pending entry, cache entry, and completion WAL must all be settled.
+
+The same real writeback/core chain also opens the recovered extent file, unlinks
+its last name, recreates that name, and checks the old descriptor's full bytes,
+EOF, and anonymous write/flush isolation from the replacement. This exercises
+the userspace handle path and does not replace kernel FUSE acceptance.

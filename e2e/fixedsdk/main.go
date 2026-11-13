@@ -116,6 +116,9 @@ func run(ctx context.Context, base string) error {
 	if err := queueRecovery(ctx, base, view.ViewBinding()); err != nil {
 		return err
 	}
+	if err := unlinkedQueueHandle(ctx, view); err != nil {
+		return err
+	}
 	if !readEquals(ctx, c, "/file", seed) || !readEquals(ctx, child, "/file", data) {
 		return errors.New("queue main/child isolation")
 	}
