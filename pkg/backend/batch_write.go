@@ -30,6 +30,26 @@ type BatchWriteResult struct {
 // ErrBatchWriteDirectory reports an item attempted to write over a directory.
 var ErrBatchWriteDirectory = errors.New("batch write target is a directory")
 
+// ErrBatchWriteModeDenied reports an item carrying permission bits from a caller that
+// is not authorized to change them. chmod is owner-only, and a batch item that silently
+// applied Mode would be a second, unchecked chmod path.
+var ErrBatchWriteModeDenied = errors.New("batch write mode change is owner-only")
+
+type batchWriteModeChangesKey struct{}
+
+// WithBatchWriteModeChanges marks ctx as authorized to apply the permission bits a
+// batch write item carries. The HTTP layer decides this from the caller's token: owner
+// tokens may chmod, scoped agent tokens may not. The backend refuses unmarked items so
+// a caller that forgets the check cannot reopen the escalation the chmod gate closes.
+func WithBatchWriteModeChanges(ctx context.Context) context.Context {
+	return context.WithValue(ctx, batchWriteModeChangesKey{}, true)
+}
+
+func batchWriteModeChangesAllowed(ctx context.Context) bool {
+	allowed, _ := ctx.Value(batchWriteModeChangesKey{}).(bool)
+	return allowed
+}
+
 type preparedBatchWriteItem struct {
 	path             string
 	data             []byte
@@ -133,6 +153,9 @@ func (b *Dat9Backend) prepareBatchWriteItem(ctx context.Context, item BatchWrite
 	if !b.shouldStoreInDB(size) {
 		return nil, fmt.Errorf("%w: batch write only supports inline files below %d bytes", ErrUploadTooLarge, b.inlineThreshold)
 	}
+	if item.HasMode && !batchWriteModeChangesAllowed(ctx) {
+		return nil, ErrBatchWriteModeDenied
+	}
 	data := append([]byte(nil), item.Data...)
 	contentType := detectContentType(path, data)
 	return &preparedBatchWriteItem{
@@ -192,6 +215,9 @@ func (b *Dat9Backend) batchWriteCreateTx(ctx context.Context, tx *sql.Tx, result
 		return err
 	}
 	if item.hasMode {
+		if !batchWriteModeChangesAllowed(ctx) {
+			return ErrBatchWriteModeDenied
+		}
 		if err := b.store.UpdateInodeModeTx(tx, item.fileID, item.mode&0o777); err != nil {
 			return err
 		}
@@ -279,6 +305,9 @@ func (b *Dat9Backend) batchWriteOverwriteTx(ctx context.Context, tx *sql.Tx, res
 		return err
 	}
 	if item.hasMode {
+		if !batchWriteModeChangesAllowed(ctx) {
+			return ErrBatchWriteModeDenied
+		}
 		if err := b.store.UpdateInodeModeTx(tx, existing.File.FileID, item.mode&0o777); err != nil {
 			return err
 		}
@@ -329,6 +358,7 @@ func isBatchWritePerItemError(err error) bool {
 		errors.Is(err, ErrMediaLLMQuotaExceeded) ||
 		errors.Is(err, datastore.ErrInvalidRootDentry) ||
 		errors.Is(err, ErrBatchWriteDirectory) ||
+		errors.Is(err, ErrBatchWriteModeDenied) ||
 		// Per item, not per batch: one extent target must not fail the others.
 		errors.Is(err, ErrExtentLayoutWrite)
 }

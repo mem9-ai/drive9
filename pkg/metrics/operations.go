@@ -406,6 +406,21 @@ func boundedHTTPMethod(method string) string {
 	}
 }
 
+// BoundedMethodLabel bounds a caller-controlled HTTP method for use as an action
+// label in tenant metrics. It is the lower-case twin of boundedHTTPMethod: the action
+// label historically holds the method in lower case, and a caller-chosen method such as
+// "X1", "X2", ... would mint a new series (and a permanent map entry) per request.
+func BoundedMethodLabel(method string) string {
+	if strings.TrimSpace(method) == "" {
+		return "other"
+	}
+	label := strings.ToLower(boundedHTTPMethod(method))
+	if label == "unknown" {
+		return "other"
+	}
+	return label
+}
+
 func RecordHTTPRequest(method, route string, status int, d time.Duration) {
 	RegisterModule("server")
 	httpRequestsTotal.Add(1,
@@ -452,7 +467,7 @@ func RecordTenantRequestCountWithOrg(tenantID, tidbCloudOrgID, surface, action s
 	tenantID = cleanMetricValue(tenantID, "unknown")
 	tidbCloudOrgID = cleanTiDBCloudOrgID(tidbCloudOrgID)
 	surface = cleanMetricValue(surface, "other")
-	action = cleanMetricValue(action, "other")
+	action = metricActionLabel(action)
 	statusClass := statusClass(status)
 	RegisterModule("tenant_usage")
 	attrs := []Attribute{
@@ -520,6 +535,20 @@ func metricLabelValue(labels []string, key string) string {
 	return "unknown"
 }
 
+// maxMetricActionLabelBytes bounds the length of the action label. Cardinality is
+// bounded where the fixed action sets live — the request classifiers and the datastore
+// op dispatch — because only those know the permitted values; this cap keeps a
+// caller-derived string from inflating the size of every series it touches.
+const maxMetricActionLabelBytes = 48
+
+func metricActionLabel(action string) string {
+	action = cleanMetricValue(action, "other")
+	if len(action) > maxMetricActionLabelBytes {
+		action = action[:maxMetricActionLabelBytes]
+	}
+	return action
+}
+
 func RecordTenantRequest(tenantID, surface, action string, status int, d time.Duration) {
 	RecordTenantRequestWithOrg(tenantID, "", surface, action, status, d)
 }
@@ -528,7 +557,7 @@ func RecordTenantRequestWithOrg(tenantID, tidbCloudOrgID, surface, action string
 	tenantID = cleanMetricValue(tenantID, "unknown")
 	tidbCloudOrgID = cleanTiDBCloudOrgID(tidbCloudOrgID)
 	surface = cleanMetricValue(surface, "other")
-	action = cleanMetricValue(action, "other")
+	action = metricActionLabel(action)
 	statusClass := "unknown"
 	if status > 0 {
 		statusClass = strconv.Itoa(status/100) + "xx"

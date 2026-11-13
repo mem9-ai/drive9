@@ -544,29 +544,29 @@ func classifyTenantRequest(r *http.Request) tenantRequestClass {
 	case strings.HasPrefix(path, "/v2/uploads/"):
 		return tenantRequestClass{surface: "upload", action: classifyV2UploadAction(r)}
 	case path == "/v1/sql":
-		return tenantRequestClass{surface: "sql", action: strings.ToLower(r.Method)}
+		return tenantRequestClass{surface: "sql", action: metrics.BoundedMethodLabel(r.Method)}
 	case path == sseEventsRoute:
-		return tenantRequestClass{surface: "events", action: strings.ToLower(r.Method)}
+		return tenantRequestClass{surface: "events", action: metrics.BoundedMethodLabel(r.Method)}
 	case path == "/v1/tokens" || strings.HasPrefix(path, "/v1/tokens/"):
 		return tenantRequestClass{surface: "tokens", action: classifyTokenAction(r)}
 	case path == "/v1/journals" || strings.HasPrefix(path, "/v1/journals/") || path == "/v1/journal-entries":
-		return tenantRequestClass{surface: "journal", action: strings.ToLower(r.Method)}
+		return tenantRequestClass{surface: "journal", action: metrics.BoundedMethodLabel(r.Method)}
 	case path == "/v1/git-workspaces" || strings.HasPrefix(path, "/v1/git-workspaces/"):
-		return tenantRequestClass{surface: "git_workspace", action: strings.ToLower(r.Method)}
+		return tenantRequestClass{surface: "git_workspace", action: metrics.BoundedMethodLabel(r.Method)}
 	case strings.HasPrefix(path, "/v1/vault/"):
 		return tenantRequestClass{surface: "vault", action: classifyVaultAction(r)}
 	case strings.HasPrefix(path, "/s3/"):
 		return tenantRequestClass{surface: "object_store", action: classifyS3Action(r)}
 	case path == "/v1/status":
-		return tenantRequestClass{surface: "status", action: strings.ToLower(r.Method)}
+		return tenantRequestClass{surface: "status", action: metrics.BoundedMethodLabel(r.Method)}
 	case path == "/v1/provision":
-		return tenantRequestClass{surface: "provision", action: strings.ToLower(r.Method)}
+		return tenantRequestClass{surface: "provision", action: metrics.BoundedMethodLabel(r.Method)}
 	case path == "/v1/quota":
-		return tenantRequestClass{surface: "quota", action: strings.ToLower(r.Method)}
+		return tenantRequestClass{surface: "quota", action: metrics.BoundedMethodLabel(r.Method)}
 	case path == "/v1/tenant":
-		return tenantRequestClass{surface: "tenant", action: strings.ToLower(r.Method)}
+		return tenantRequestClass{surface: "tenant", action: metrics.BoundedMethodLabel(r.Method)}
 	default:
-		return tenantRequestClass{surface: "other", action: strings.ToLower(r.Method)}
+		return tenantRequestClass{surface: "other", action: metrics.BoundedMethodLabel(r.Method)}
 	}
 }
 
@@ -604,14 +604,14 @@ func classifyFSAction(r *http.Request) string {
 		}
 		return "post"
 	default:
-		return strings.ToLower(r.Method)
+		return metrics.BoundedMethodLabel(r.Method)
 	}
 }
 
 func classifyV1UploadAction(r *http.Request) string {
 	rest := strings.TrimPrefix(r.URL.Path, "/v1/uploads/")
 	if rest == "" {
-		return strings.ToLower(r.Method)
+		return metrics.BoundedMethodLabel(r.Method)
 	}
 	parts := strings.SplitN(rest, "/", 2)
 	if len(parts) == 1 {
@@ -638,7 +638,7 @@ func classifyV2UploadAction(r *http.Request) string {
 	rest := strings.TrimPrefix(r.URL.Path, "/v2/uploads/")
 	parts := strings.SplitN(rest, "/", 2)
 	if len(parts) == 0 || parts[0] == "" {
-		return strings.ToLower(r.Method)
+		return metrics.BoundedMethodLabel(r.Method)
 	}
 	if parts[0] == "initiate" {
 		return "initiate"
@@ -664,17 +664,17 @@ func classifyVaultAction(r *http.Request) string {
 	path := r.URL.Path
 	switch {
 	case strings.HasPrefix(path, "/v1/vault/secrets"):
-		return "secrets_" + strings.ToLower(r.Method)
+		return "secrets_" + metrics.BoundedMethodLabel(r.Method)
 	case strings.HasPrefix(path, "/v1/vault/tokens"):
-		return "tokens_" + strings.ToLower(r.Method)
+		return "tokens_" + metrics.BoundedMethodLabel(r.Method)
 	case strings.HasPrefix(path, "/v1/vault/grants"):
-		return "grants_" + strings.ToLower(r.Method)
+		return "grants_" + metrics.BoundedMethodLabel(r.Method)
 	case strings.HasPrefix(path, "/v1/vault/read"):
 		return "read"
 	case path == "/v1/vault/audit":
 		return "audit"
 	default:
-		return strings.ToLower(r.Method)
+		return metrics.BoundedMethodLabel(r.Method)
 	}
 }
 
@@ -687,7 +687,7 @@ func classifyTokenAction(r *http.Request) string {
 	case strings.HasPrefix(r.URL.Path, "/v1/tokens/") && r.Method == http.MethodDelete:
 		return "revoke"
 	default:
-		return strings.ToLower(r.Method)
+		return metrics.BoundedMethodLabel(r.Method)
 	}
 }
 
@@ -698,7 +698,7 @@ func classifyS3Action(r *http.Request) string {
 	if strings.Contains(r.URL.Path, "/objects/") && r.Method == http.MethodGet {
 		return "get_object"
 	}
-	return strings.ToLower(r.Method)
+	return metrics.BoundedMethodLabel(r.Method)
 }
 
 func requestTenantID(r *http.Request) string {

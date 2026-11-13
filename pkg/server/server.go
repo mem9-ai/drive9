@@ -3275,10 +3275,10 @@ func (s *Server) handleBatchWrite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	scope := ScopeFromContext(r.Context())
 	results := make([]batchWriteResult, len(req.Items))
 	allowedIndexes := make([]int, 0, len(req.Items))
 	backendItems := make([]backend.BatchWriteItem, 0, len(req.Items))
-	scope := ScopeFromContext(r.Context())
 	var totalBytes int64
 	for i, item := range req.Items {
 		results[i].Path = item.Path
@@ -3292,6 +3292,17 @@ func (s *Server) handleBatchWrite(w http.ResponseWriter, r *http.Request) {
 		if err := validateBatchWritePath(item.Path); err != nil {
 			results[i].Status = http.StatusBadRequest
 			results[i].Error = err.Error()
+			continue
+		}
+		// chmod is owner-only (handleChmod), and a batch item's mode bits are the
+		// same escalation: an fs_scoped agent token would otherwise set arbitrary
+		// permission bits on a path it can write. Per-item 403 rather than a failed
+		// request, so the content-only items of the same batch still commit — the
+		// rejection contract BatchWriteResult documents for this capability.
+		if item.HasMode && !scope.CanChmod() {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "batch_write_mode_denied", "path", item.Path)...)
+			results[i].Status = http.StatusForbidden
+			results[i].Error = chmodOwnerOnlyMessage
 			continue
 		}
 		if s.maxUploadBytes > 0 && itemBytes > s.maxUploadBytes {
@@ -3314,7 +3325,13 @@ func (s *Server) handleBatchWrite(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	backendResults, err := b.BatchWriteCtx(r.Context(), backendItems)
+	// Only an owner token's items may carry permission bits; the backend refuses
+	// them otherwise, so a future handler cannot skip this decision.
+	batchCtx := r.Context()
+	if scope.CanChmod() {
+		batchCtx = backend.WithBatchWriteModeChanges(batchCtx)
+	}
+	backendResults, err := b.BatchWriteCtx(batchCtx, backendItems)
 	if err != nil {
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "batch_write_failed", "error", err)...)
 		errJSONInternalStorage(w, r, err)
@@ -3854,7 +3871,7 @@ func (s *Server) handleChmod(w http.ResponseWriter, r *http.Request, path string
 	// POST /v1/fs/*?chmod, so reaching this handler with a scoped token
 	// indicates a defense-in-depth gap somewhere upstream — fail closed.
 	if scope := ScopeFromContext(r.Context()); scope != nil && scope.IsScoped {
-		errJSON(w, http.StatusForbidden, "chmod is owner-only")
+		errJSON(w, http.StatusForbidden, chmodOwnerOnlyMessage)
 		return
 	}
 	b := backendFromRequest(r)

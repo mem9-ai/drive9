@@ -31,6 +31,48 @@ func hasMetricLineWith(text, metric string, fragments ...string) bool {
 	return false
 }
 
+// net/http accepts any token as a method, and the action label is derived from it, so
+// an attacker-chosen method must never become its own series.
+func TestBoundedMethodLabel(t *testing.T) {
+	cases := map[string]string{
+		http.MethodGet:     "get",
+		http.MethodPost:    "post",
+		http.MethodPut:     "put",
+		http.MethodPatch:   "patch",
+		http.MethodDelete:  "delete",
+		http.MethodHead:    "head",
+		http.MethodOptions: "options",
+		" get ":            "get",
+		"x1":               "other",
+		"":                 "other",
+		"   ":              "other",
+	}
+	for in, want := range cases {
+		if got := BoundedMethodLabel(in); got != want {
+			t.Fatalf("BoundedMethodLabel(%q) = %q, want %q", in, got, want)
+		}
+	}
+	// The point of the mapping: distinct attacker tokens collapse onto "other".
+	for _, method := range []string{"X1", "X2", "a", "b"} {
+		if got := BoundedMethodLabel(method); got != "other" {
+			t.Fatalf("BoundedMethodLabel(%q) = %q, want other", method, got)
+		}
+	}
+}
+
+func TestRecordTenantRequestCapsActionLabelLength(t *testing.T) {
+	long := strings.Repeat("a", 4*maxMetricActionLabelBytes)
+	if got := metricActionLabel(long); len(got) != maxMetricActionLabelBytes {
+		t.Fatalf("metricActionLabel length = %d, want %d", len(got), maxMetricActionLabelBytes)
+	}
+	if got := metricActionLabel("  "); got != "other" {
+		t.Fatalf("metricActionLabel(blank) = %q, want other", got)
+	}
+	if got := metricActionLabel("batch_write"); got != "batch_write" {
+		t.Fatalf("metricActionLabel kept action = %q", got)
+	}
+}
+
 func TestResultForError(t *testing.T) {
 	tests := []struct {
 		name string

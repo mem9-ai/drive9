@@ -45,6 +45,17 @@ type TenantScope struct {
 	FSScopes           []FSScope
 }
 
+const chmodOwnerOnlyMessage = "chmod is owner-only"
+
+// CanChmod is the policy for explicit chmod and for the mode bits a batch write item
+// carries: only an owner token may change permission bits. A missing scope denies here;
+// handlers report missing authentication separately. Creation-time mkdir modes and layer
+// operations have their own contracts, so this predicate does not claim a universal mode
+// policy across every API surface.
+func (s *TenantScope) CanChmod() bool {
+	return s != nil && !s.IsScoped
+}
+
 const (
 	JournalPermissionCreate        = "journal:create"
 	JournalPermissionAppend        = "journal:append"

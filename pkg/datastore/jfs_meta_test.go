@@ -3,6 +3,7 @@ package datastore
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"syscall"
 	"testing"
 )
@@ -16,18 +17,11 @@ import (
 // Two intentional shapes: "compact" is served by the runCompactOp short-circuit
 // before the dispatch, and "complete_compact" is the compact-task lifecycle's
 // own op.
-func TestExtentMetaAnswersEveryClientOp(t *testing.T) {
-	s := newTestStore(t)
-	ctx := context.Background()
-
-	// Provision the tenant so the ops work against a real tree.
-	if _, errno, err := s.RunExtentMetaOp(ctx, "init", json.RawMessage(`{}`), nil); err != nil || errno != 0 {
-		t.Fatalf("init errno=%d err=%v", errno, err)
-	}
-
-	// Bodies are deliberately minimal: any errno but ENOSYS proves the op was
-	// routed somewhere that understands it.
-	ops := map[string]string{
+// extentMetaClientOpBodies is the set of ops the JuiceFS client sends, with a minimal
+// body for each. It is shared by the dispatch test and the metric-label test so the two
+// cannot drift: an op that gains a handler must also keep its own metric series.
+func extentMetaClientOpBodies() map[string]string {
+	return map[string]string{
 		"get_counter":         `{"name":"nextInode"}`,
 		"incr_counter":        `{"name":"nextInode","value":0}`,
 		"set_if_small":        `{"name":"nextInode","value":0,"diff":0}`,
@@ -60,6 +54,20 @@ func TestExtentMetaAnswersEveryClientOp(t *testing.T) {
 		"complete_compact":    `{"task_id":""}`,
 		"compact":             `{"inode":1,"indx":0}`,
 	}
+}
+
+func TestExtentMetaAnswersEveryClientOp(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	// Provision the tenant so the ops work against a real tree.
+	if _, errno, err := s.RunExtentMetaOp(ctx, "init", json.RawMessage(`{}`), nil); err != nil || errno != 0 {
+		t.Fatalf("init errno=%d err=%v", errno, err)
+	}
+
+	// Bodies are deliberately minimal: any errno but ENOSYS proves the op was
+	// routed somewhere that understands it.
+	ops := extentMetaClientOpBodies()
 	for op, body := range ops {
 		t.Run(op, func(t *testing.T) {
 			_, errno, err := s.RunExtentMetaOp(ctx, op, json.RawMessage(body), nil)
@@ -74,5 +82,33 @@ func TestExtentMetaAnswersEveryClientOp(t *testing.T) {
 
 	if _, errno, _ := s.RunExtentMetaOp(ctx, "not_an_op", json.RawMessage(`{}`), nil); errno != int(syscall.ENOSYS) {
 		t.Fatalf("an unknown op must report ENOSYS, got errno=%d", errno)
+	}
+}
+
+// The op arrives in a request header, so the metric label has to be bounded to the ops
+// the bridge dispatches. Sharing the client op list keeps the allowlist honest: an op
+// that gains a handler must also keep its own series instead of collapsing to "other".
+func TestExtentMetaOpMetricLabelCoversClientOps(t *testing.T) {
+	for op := range extentMetaClientOpBodies() {
+		if got := extentMetaOpMetricLabel(op); got != op {
+			t.Fatalf("extentMetaOpMetricLabel(%q) = %q, want the op itself", op, got)
+		}
+	}
+	for _, op := range []string{"", "x1", "x2", "not_an_op", "GET", " getattr ", "getattr\n"} {
+		want := "other"
+		if trimmed := strings.TrimSpace(op); trimmed == "getattr" {
+			want = "getattr"
+		}
+		if got := extentMetaOpMetricLabel(op); got != want {
+			t.Fatalf("extentMetaOpMetricLabel(%q) = %q, want %q", op, got, want)
+		}
+	}
+	// The point of the mapping: arbitrary caller strings collapse onto one label.
+	seen := map[string]struct{}{}
+	for _, op := range []string{"X1", "X2", "a", "b", "c"} {
+		seen[extentMetaOpMetricLabel(op)] = struct{}{}
+	}
+	if len(seen) != 1 {
+		t.Fatalf("caller-chosen ops produced %d labels: %v", len(seen), seen)
 	}
 }
