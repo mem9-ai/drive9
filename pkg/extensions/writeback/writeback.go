@@ -1298,11 +1298,13 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		return res, nil
 	case fs.OpCreate:
 		flags := op.Flags
+		wbCreateDebugf("op path=%s flags=%#x kernelCreate=%v", op.Path, flags, op.KernelCreate())
 		// A re-open whose newest image is still staged locally must serve that
 		// image, not probe the remote and wait for the previous upload. v1
 		// loaded the write-back cache here; #1026 dropped it, so append/reopen
 		// paid a 404 HEAD plus waitPathCommit/UploadSync per close.
 		if res, ok := w.openPendingWritable(op); ok {
+			wbCreateDebugf("openPendingWritable hit path=%s", op.Path)
 			return res, nil
 		}
 		if op.KernelCreate() && flags&uint32(syscall.O_EXCL) != 0 {
@@ -1623,6 +1625,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			h.pendingMode = mode
 			h.hasPendingMode = true
 		}
+		wbCreateDebugf("lazy PendingNew path=%s flags=%#x", op.Path, op.Flags)
 		w.track(h)
 		return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Mode: mode}, Handle: h}, nil
 	case fs.OpUnlink, fs.OpRmdir:
