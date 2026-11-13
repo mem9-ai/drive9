@@ -522,6 +522,21 @@ func (h *Handler) tryClaimOpen(ctx context.Context, op *fs.Op) (fs.Result, error
 		st, err := h.opts.Engine.Bridge.StatLocal(ctx, op.Path)
 		if err == nil {
 			if st.ContentLayout != client.ContentLayoutExtent {
+				// This bridge's own zero-write materialization occupies the
+				// name (a claimed create's final close with no bytes): the
+				// engine-created name stays on the engine plane. The claim
+				// re-verifies the occupant is still the empty classic file;
+				// the descriptor rides the engine as the fresh create it
+				// semantically is, and its first commit replaces the
+				// placeholder with an extent create (see Bridge.commit).
+				// O_EXCL declines instead: the name exists, and the classic
+				// plane's server-arbitrated EEXIST is the honest answer.
+				if st.Size == 0 && op.Flags&uint32(syscall.O_EXCL) == 0 &&
+					h.opts.Engine.Bridge.EmptyPlaceholderFor(op.Path) {
+					res, err := h.createOnEngine(ctx, op)
+					claimDebug("reclaimed-empty-placeholder path=%s err=%v", op.Path, err)
+					return res, err, true
+				}
 				claimDebug("decline exists-classic-layout path=%s", op.Path)
 				return fs.Result{}, nil, false
 			}
@@ -581,11 +596,23 @@ func (h *Handler) tryClaimOpen(ctx context.Context, op *fs.Op) (fs.Result, error
 			op.Path, op.Flags&syscall.O_CREAT != 0, h.claimsPattern(op.Path))
 		return fs.Result{}, nil, false
 	}
+	res, err := h.createOnEngine(ctx, op)
+	if err == nil {
+		claimDebug("claimed-fresh path=%s", op.Path)
+	}
+	return res, err, true
+}
+
+// createOnEngine claims the name as a fresh engine create: the bridge
+// registers a local mapping (the server sees nothing until the first
+// commit) and the descriptor must establish an attributable identity at
+// its first publication. Shared by the ordinary pattern-matched create and
+// the reclaim of this bridge's own zero-byte classic placeholder.
+func (h *Handler) createOnEngine(ctx context.Context, op *fs.Op) (fs.Result, error) {
 	parent, name := SplitParent(op.Path)
 	parentIno, errno := h.opts.Engine.ResolvePath(ctx, parent)
 	if errno != 0 {
-		claimDebug("decline resolve-parent-error path=%s errno=%d", op.Path, errno)
-		return fs.Result{}, errno, true
+		return fs.Result{}, errno
 	}
 	mode := op.Mode
 	if !op.HasMode {
@@ -593,22 +620,19 @@ func (h *Handler) tryClaimOpen(ctx context.Context, op *fs.Op) (fs.Result, error
 	}
 	_, fh, errno := h.opts.Engine.VFS.Create(vfsCtx(op.Caller), meta.Ino(parentIno), name, uint16(mode&0o7777), 0, op.Flags)
 	if errno != 0 {
-		claimDebug("decline vfs-create-error path=%s errno=%d", op.Path, errno)
-		return fs.Result{}, errno, true
+		return fs.Result{}, errno
 	}
 	ino, errno := h.opts.Engine.ResolvePath(ctx, op.Path)
 	if errno != 0 {
 		// The bridge registered the mapping during Create; resolve again
 		// defensively (fresh files resolve locally).
-		claimDebug("decline resolve-after-create path=%s errno=%d", op.Path, errno)
-		return fs.Result{}, errno, true
+		return fs.Result{}, errno
 	}
 	// This descriptor CREATED the name: its first publication must
 	// establish an attributable identity before writing any occupant.
 	h.opts.Engine.Bridge.MarkFreshCreate(meta.Ino(ino))
 	handle := h.register(op.Path, ino, fh, op.Caller)
-	claimDebug("claimed-fresh path=%s ino=%d", op.Path, ino)
-	return fs.Result{Handle: handle, Attr: &fs.Attr{Kind: fs.KindFile, Mode: mode, Nlink: 1}}, nil, true
+	return fs.Result{Handle: handle, Attr: &fs.Attr{Kind: fs.KindFile, Mode: mode, Nlink: 1}}, nil
 }
 
 // lookupLocalOnly answers namespace operations for files that exist ONLY

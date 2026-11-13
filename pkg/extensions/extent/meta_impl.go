@@ -895,6 +895,25 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 	if err != nil && !fresh {
 		return err
 	}
+	// This bridge's own zero-write materialization occupies the name: a
+	// 0-byte classic file has no content to preserve, and the descriptor
+	// is semantically the fresh create it started as. Removing the
+	// placeholder restores that fresh-create publication path; the extent
+	// session's create-only completion (an absent expected_revision means
+	// the target must STILL be absent at completion, under the dentry
+	// lock) keeps the removal-to-landing window race-free against a
+	// competing writer. The attribution is mount-local and re-verified
+	// live: a foreign occupant with content (size > 0) or an extent
+	// replacement never enters this branch, and only a descriptor THIS
+	// bridge created (fresh create, no recovery constraint) may spend it.
+	if !fresh && err == nil && st.ContentLayout != client.ContentLayoutExtent && st.Size == 0 &&
+		b.isFreshCreate(ino) && b.EmptyPlaceholderFull(path) {
+		if rmErr := b.cfg.Client.RemoveAllCtx(ctx, path); rmErr != nil {
+			return fmt.Errorf("remove empty placeholder %s: %w", path, rmErr)
+		}
+		b.takeEmptyPlaceholderFull(path)
+		fresh = true
+	}
 	// An identity-verified recovery (durable replay) constrains EVERY
 	// publication of this data: the occupant must still be the staged
 	// object. The constraint SURVIVES failures and retries (it is only
@@ -1700,6 +1719,67 @@ func (b *Bridge) clearBufferedLength(ino meta.Ino, published int64) {
 // StatLocal stats a mount-local path against RemoteRoot.
 func (b *Bridge) StatLocal(ctx context.Context, local string) (*client.StatResult, error) {
 	return b.cfg.Client.StatCtx(ctx, b.fullPath(local))
+}
+
+// maxEmptyPlaceholderRecords bounds the recency window of empty-placeholder
+// attribution. Each entry is one path this bridge materialized empty; bulk
+// empty-create workloads would otherwise grow the record for the mount's
+// whole lifetime. Beyond the cap the OLDEST attribution ages out — such
+// names simply stop being re-claimable (they keep behaving like any other
+// classic file), which is a graceful degradation, not a correctness loss.
+const maxEmptyPlaceholderRecords = 1 << 16
+
+// markEmptyPlaceholder records that this bridge just materialized `full`
+// (already the FULL remote path) as a zero-byte classic file.
+func (b *Bridge) markEmptyPlaceholder(full string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.emptyPlaceholders[full] {
+		return
+	}
+	b.emptyPlaceholders[full] = true
+	b.emptyPlaceholderOrd = append(b.emptyPlaceholderOrd, full)
+	if len(b.emptyPlaceholderOrd) > maxEmptyPlaceholderRecords {
+		oldest := b.emptyPlaceholderOrd[0]
+		b.emptyPlaceholderOrd = b.emptyPlaceholderOrd[1:]
+		delete(b.emptyPlaceholders, oldest)
+	}
+}
+
+// EmptyPlaceholderFor reports whether this bridge recorded a zero-byte
+// classic materialization of the mount-local path. The answer is only an
+// ATTRIBUTION hint: every consumer must re-verify the occupant is still a
+// 0-byte classic file before acting on it.
+func (b *Bridge) EmptyPlaceholderFor(local string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.emptyPlaceholders[b.fullPath(local)]
+}
+
+// EmptyPlaceholderFull is EmptyPlaceholderFor for a FULL remote path.
+func (b *Bridge) EmptyPlaceholderFull(full string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.emptyPlaceholders[full]
+}
+
+// takeEmptyPlaceholderFull consumes the attribution for a FULL remote path
+// (the name is no longer this bridge's placeholder) and reports whether it
+// existed.
+func (b *Bridge) takeEmptyPlaceholderFull(full string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.emptyPlaceholders[full] {
+		return false
+	}
+	delete(b.emptyPlaceholders, full)
+	for i, p := range b.emptyPlaceholderOrd {
+		if p == full {
+			b.emptyPlaceholderOrd = append(b.emptyPlaceholderOrd[:i], b.emptyPlaceholderOrd[i+1:]...)
+			break
+		}
+	}
+	return true
 }
 
 // ForgetPath drops every cached mapping for a mount-local path (the name
@@ -2568,12 +2648,17 @@ func (b *Bridge) flushFile(ctx context.Context, ino meta.Ino, finalize bool) err
 			if _, err := b.cfg.Client.CreateFileCtx(ctx, path); err != nil {
 				return err
 			}
-			// No placeholder identity is recorded: CreateFileCtx returns a
+			// The placeholder's NAME is attributed mount-locally so a
+			// later open can re-claim the name through the engine and the
+			// next commit can replace the placeholder with the fresh
+			// extent create this descriptor semantically is (see commit).
+			// No placeholder IDENTITY is recorded: CreateFileCtx returns a
 			// revision and no resource id, and a follow-up Stat is a
 			// separate request whose answer may describe another client's
-			// replacement. Binding that answer would authorize deleting a
-			// foreign object, so the identity stays unknown and a later
-			// promotion commits through the classic surface instead.
+			// replacement; binding it would authorize deleting a foreign
+			// object. The attribution is only a hint — every consumer
+			// re-verifies the occupant is still a 0-byte classic file.
+			b.markEmptyPlaceholder(path)
 			// Keep the inode mapping: the engine handle is still open, and
 			// a later write through the same descriptor commits via this
 			// path (the size-0 classic target is replaced with a fresh

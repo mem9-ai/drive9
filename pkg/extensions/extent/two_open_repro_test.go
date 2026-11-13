@@ -2,6 +2,7 @@ package extent
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -108,22 +109,54 @@ func TestClaimedFreshReleaseThenReopenLive(t *testing.T) {
 		t.Fatalf("release: %v", err)
 	}
 
-	// Phase 3: what does the server hold now?
+	// Phase 3: the server holds the materialized 0-byte classic name, and
+	// the bridge attributes it as its own empty placeholder.
 	st, serr := cl.StatCtx(ctx, path)
 	if serr != nil {
-		t.Logf("after release: server holds nothing (%v)", serr)
-	} else {
-		t.Fatalf("after release: server already holds an occupant layout=%q size=%d rev=%d — the reopen will be stolen from the engine plane",
-			st.ContentLayout, st.Size, st.Revision)
+		t.Fatalf("after release: the created name must exist (POSIX close), got %v", serr)
+	}
+	if st.ContentLayout != "single" || st.Size != 0 {
+		t.Fatalf("after release: occupant layout=%q size=%d, want the 0-byte classic placeholder", st.ContentLayout, st.Size)
+	}
+	if !eng.Bridge.EmptyPlaceholderFor(path) {
+		t.Fatal("the placeholder must carry the bridge's empty attribution")
 	}
 
-	// Phase 4: fio's IO open (O_RDWR|O_DIRECT|O_LARGEFILE, no O_CREAT).
+	// Phase 4: fio's IO open (O_RDWR|O_DIRECT, no O_CREAT) re-claims the
+	// name through the engine.
 	res2, err2 := h.Do(ctx, &fs.Op{Kind: fs.OpCreate, Path: path,
 		Flags: 0xc002, Mode: 0o644, HasMode: true, Kernel: &gofuse.OpenIn{}, Caller: fs.Caller{Pid: 1}}, next)
 	if err2 != nil {
 		t.Fatalf("reopen: %v", err2)
 	}
-	if _, ok := res2.Handle.(*engineHandle); !ok {
-		t.Fatalf("reopen handle = %T, want *engineHandle (engine-created names must stay on the engine plane)", res2.Handle)
+	eh2, ok := res2.Handle.(*engineHandle)
+	if !ok {
+		t.Fatalf("reopen handle = %T, want re-claimed *engineHandle", res2.Handle)
 	}
+
+	// Phase 5: the image publishes as extent, replacing the placeholder.
+	payload := make([]byte, 5*(1<<20)+1234) // two 4 MiB parts + tail
+	if _, err := randRead(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := eh2.Write(ctx, 0, payload); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := eh2.Flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	st2, serr2 := cl.StatCtx(ctx, path)
+	if serr2 != nil {
+		t.Fatalf("after flush: %v", serr2)
+	}
+	if st2.ContentLayout != "extent" || st2.Size != int64(len(payload)) {
+		t.Fatalf("after flush: layout=%q size=%d, want extent of %d bytes", st2.ContentLayout, st2.Size, len(payload))
+	}
+	if eng.Bridge.EmptyPlaceholderFor(path) {
+		t.Fatal("a completed publication must consume the placeholder attribution")
+	}
+}
+
+func randRead(b []byte) (int, error) {
+	return cryptorand.Read(b)
 }

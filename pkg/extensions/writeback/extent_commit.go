@@ -85,17 +85,24 @@ func (cq *CommitQueue) uploadExtentEntry(ctx context.Context, entry *CommitEntry
 		return 0, false, nil
 	}
 	st, statErr := cq.client.StatCtx(ctx, apiPath)
+	replacedEmpty := false
 	if statErr == nil && st.ContentLayout != client.ContentLayoutExtent {
-		if st.Size == 0 && entry.Kind == staging.PendingNew {
-			// An O_CREAT's empty-create materialization landed classically
-			// before the buffered image grew past the cutoff. A 0-byte
-			// classic name has no content to preserve: drop it and treat
-			// this as the fresh create it semantically is, so the image
-			// still promotes to extent.
+		// A 0-byte classic occupant has no content any writer could be
+		// relying on, so it may be dropped to publish the buffered image
+		// as the fresh extent create it semantically is. Two descriptors
+		// may hold that attribution: this queue's own O_CREAT
+		// materialization (PendingNew), and a descriptor that OPENED the
+		// empty occupant (its BaseRev is exactly the occupant's revision —
+		// the tie proves nothing replaced it since). Anything else is an
+		// existing classic target: never converted.
+		openedThisEmpty := entry.Kind == staging.PendingOverwrite &&
+			entry.BaseRev > 0 && entry.BaseRev == st.Revision
+		if st.Size == 0 && (entry.Kind == staging.PendingNew || openedThisEmpty) {
 			if err := cq.client.RemoveAllCtx(ctx, apiPath); err != nil {
 				return 0, false, nil
 			}
 			st = nil
+			replacedEmpty = true
 		} else {
 			return 0, false, nil // existing classic target: never converted
 		}
@@ -127,6 +134,14 @@ func (cq *CommitQueue) uploadExtentEntry(ctx context.Context, entry *CommitEntry
 	var upErr error
 	if extentTarget && len(entry.DirtyRanges) > 0 {
 		upErr = cq.commitExtentPatch(ectx, apiPath, entry, ra, st.Size)
+	} else if replacedEmpty {
+		// The removal above leaves the path absent: publish as a create
+		// (absent expected_revision — the server requires the target to
+		// STILL be absent at completion, which closes the removal-to-
+		// landing window against a competing writer). The entry's own
+		// BaseRev names the occupant that no longer exists; sending it
+		// would bind the session to a stale target.
+		upErr = cq.client.WriteExtentStreamConditional(ectx, apiPath, ra, entry.Size, nil, -1)
 	} else {
 		upErr = cq.client.WriteExtentStreamConditional(ectx, apiPath, ra, entry.Size, nil, expectedRevision)
 	}

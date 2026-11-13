@@ -114,6 +114,18 @@ type Bridge struct {
 	// owned by this bridge, so commits and reads keep serving it through
 	// the classic wire surface instead of erroring on the layout.
 	classicOwned map[meta.Ino]bool
+	// emptyPlaceholders records the FULL remote paths this bridge
+	// materialized as zero-byte classic files (a claimed create's final
+	// close with no writes — the extent plane has no zero-size session).
+	// The record is the mount-local attribution that lets a later open
+	// re-claim the name through the engine and the next commit replace
+	// the placeholder with the fresh extent create the descriptor
+	// semantically is; without it a size-0 classic occupant is
+	// indistinguishable from a foreign file and must stay classic.
+	// Re-verification is always live (the occupant must still be a
+	// 0-byte classic file), so stale entries are inert.
+	emptyPlaceholders    map[string]bool
+	emptyPlaceholderOrd  []string // FIFO for the bounded-recency cap below
 	// commitLocks serializes per-file commit lifecycles (FlushFile).
 	commitMu    sync.Mutex
 	commitLocks map[meta.Ino]*sync.Mutex
@@ -214,6 +226,7 @@ func NewBridge(cfg Config) *Bridge {
 		freshCreate:     make(map[meta.Ino]bool),
 		commitErr:       make(map[meta.Ino]error),
 		verifyBase:      make(map[meta.Ino]verifyBase),
+		emptyPlaceholders: make(map[string]bool),
 	}
 	// Provenance refetch resolves through the inode's CURRENT mapping:
 	// open files move under renames and retention aliases, and a stale

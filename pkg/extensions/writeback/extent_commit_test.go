@@ -489,3 +489,92 @@ func TestUploadExtentEntryPatternRouting(t *testing.T) {
 		t.Fatalf("nested basename match: handled=%v err=%v (want extent)", handled, err)
 	}
 }
+
+// A descriptor that OPENED a 0-byte classic occupant (fio's two-phase open:
+// O_CREAT materializes the empty name classically, the IO re-open probes it
+// and carries its revision as BaseRev) must still promote its image to
+// extent: the occupant has no content, so the commit drops it and publishes
+// through a create-only extent session (no expected_revision — the server
+// requires the target to still be absent at completion, which closes the
+// removal-to-landing race).
+func TestUploadExtentEntryReplacesOpenedEmptyClassic(t *testing.T) {
+	var mu sync.Mutex
+	deleted := 0
+	var initiates []map[string]any
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/fs/", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", "0")
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.WriteHeader(http.StatusOK)
+		case http.MethodDelete:
+			mu.Lock()
+			deleted++
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.Error(w, "unexpected", http.StatusMethodNotAllowed)
+		}
+	})
+	mux.HandleFunc("/obj/", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
+	mux.HandleFunc("/v2/uploads/initiate", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		mu.Lock()
+		initiates = append(initiates, body)
+		mu.Unlock()
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"upload_id": "s1", "key": "", "part_size": 4 << 20, "total_parts": 1,
+			"checksum_contract": map[string]any{"supported": []string{"SHA-256"}, "required": true},
+		})
+	})
+	mux.HandleFunc("/v2/uploads/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v2/uploads/s1/presign-batch" {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"parts": []any{map[string]any{"number": 1, "url": "http://" + r.Host + "/obj/1"}},
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "completed"})
+	})
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+
+	cq := &CommitQueue{client: client.New(ts.URL, ""), extentTakeover: true}
+	entry := extentTestEntry(make([]byte, 1<<20))
+	entry.Kind = staging.PendingOverwrite // opened the existing occupant
+	entry.BaseRev = 1                     // exactly the placeholder's revision
+	_, handled, err := cq.uploadExtentEntry(context.Background(), entry, "/x.bin", 1)
+	if err != nil || !handled {
+		t.Fatalf("handled=%v err=%v", handled, err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if deleted != 1 {
+		t.Fatalf("placeholder deletions = %d, want 1", deleted)
+	}
+	if len(initiates) != 1 || initiates[0]["layout"] != "extent" {
+		t.Fatalf("initiates = %+v", initiates)
+	}
+	if _, has := initiates[0]["expected_revision"]; has {
+		t.Fatalf("post-removal create must be create-only (no expected_revision), got %+v", initiates[0])
+	}
+
+	// A BaseRev that does not match the occupant (something replaced it
+	// since the open) must NOT rescue: the occupant is foreign now.
+	initiates = nil
+	deleted = 0
+	entry2 := extentTestEntry(make([]byte, 1<<20))
+	entry2.Kind = staging.PendingOverwrite
+	entry2.BaseRev = 7 // not the occupant's revision
+	_, handled, err = cq.uploadExtentEntry(context.Background(), entry2, "/x.bin", 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if handled || deleted != 0 {
+		t.Fatalf("stale-base overwrite: handled=%v deletions=%d, want the classic path", handled, deleted)
+	}
+}
