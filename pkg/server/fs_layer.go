@@ -314,137 +314,6 @@ func fsLayerRenameTarget(entry *datastore.FSLayerEntry) string {
 	return string(entry.ContentBlob)
 }
 
-// authorizeFSLayerEntryMode rejects an entry that would change an existing path's
-// permission bits unless the caller may chmod. Entries that merely stamp a creation mode
-// on a new path are allowed: that is the same power mkdir/create already has.
-func (s *Server) authorizeFSLayerEntryMode(w http.ResponseWriter, r *http.Request, b *backendpkg.Dat9Backend, entry *datastore.FSLayerEntry) bool {
-	changesMode, err := fsLayerEntryModeMutation(r.Context(), b, entry)
-	if err != nil {
-		writeBackendError(w, r, err)
-		return false
-	}
-	if changesMode && !ScopeFromContext(r.Context()).CanChmod() {
-		errJSON(w, http.StatusForbidden, chmodOwnerOnlyMessage)
-		return false
-	}
-	return true
-}
-
-// errChmodForbidden is the apply-time twin of the HTTP-layer chmod denial: a layer
-// entry reached the backend that would change an existing path's permission bits and
-// the caller is not allowed to chmod. The handler rejects such a plan before applying
-// anything, so this fires only if that check is ever bypassed.
-var errChmodForbidden = errors.New(chmodOwnerOnlyMessage)
-
-// fsLayerEntryModeMutation reports whether storing this entry would change an existing
-// path's permission bits, as opposed to stamping a creation mode on a path that does not
-// exist yet. Layer entries are how a workspace writes a whole tree at once, so they are
-// a chmod path of their own; the owner-only rule has to hold here too.
-func fsLayerEntryModeMutation(ctx context.Context, b *backendpkg.Dat9Backend, entry *datastore.FSLayerEntry) (bool, error) {
-	if entry == nil || b == nil {
-		return false, nil
-	}
-	if entry.Op == datastore.FSLayerEntryOpChmod {
-		return entry.Mode != 0, nil
-	}
-	if entry.Mode == 0 {
-		return false, nil
-	}
-	switch entry.Op {
-	case datastore.FSLayerEntryOpUpsert, datastore.FSLayerEntryOpMkdir:
-	default:
-		return false, nil
-	}
-	nf, err := b.StatNodeCtx(ctx, entry.Path)
-	if errors.Is(err, datastore.ErrNotFound) {
-		// A new path takes the entry's mode as its creation mode.
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	return fsLayerNodeMode(nf)&0o777 != entry.Mode&0o777, nil
-}
-
-// fsLayerEntriesChangeExistingMode reports whether committing this plan would change an
-// existing path's mode. The check runs at commit time as well as at entry creation, so a
-// layer prepared by one principal cannot be committed by another that may not chmod.
-func fsLayerEntriesChangeExistingMode(ctx context.Context, b *backendpkg.Dat9Backend, entries []datastore.FSLayerEntry) (bool, error) {
-	for i := range entries {
-		entry := &entries[i]
-		if entry.Op == datastore.FSLayerEntryOpChmod {
-			if entry.Mode != 0 {
-				return true, nil
-			}
-			continue
-		}
-		if entry.Mode == 0 {
-			continue
-		}
-		switch entry.Op {
-		case datastore.FSLayerEntryOpUpsert, datastore.FSLayerEntryOpMkdir:
-		default:
-			continue
-		}
-		// A file moved by a directory rename is still the same inode: resolve the
-		// destination back to its source before falling back to live main.
-		if source, ok := fsLayerRenameSourceForPath(entries, entry.Path); ok {
-			nf, err := b.StatNodeCtx(ctx, source)
-			if err == nil {
-				if fsLayerNodeMode(nf)&0o777 != entry.Mode&0o777 {
-					return true, nil
-				}
-				continue
-			}
-			if !errors.Is(err, datastore.ErrNotFound) {
-				return false, err
-			}
-		}
-		changes, err := fsLayerEntryModeMutation(ctx, b, entry)
-		if err != nil {
-			return false, err
-		}
-		if changes {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-// fsLayerRenameSourceForPath maps a rename destination back to the live source path it
-// originated from, so a descendant of a renamed directory is treated as an existing
-// inode rather than a new file created under the destination name.
-func fsLayerRenameSourceForPath(entries []datastore.FSLayerEntry, path string) (string, bool) {
-	for i := range entries {
-		entry := &entries[i]
-		if entry.Op != datastore.FSLayerEntryOpRename {
-			continue
-		}
-		target := strings.TrimSuffix(fsLayerRenameTarget(entry), "/")
-		if target == "" {
-			continue
-		}
-		if path != target && !strings.HasPrefix(path, target+"/") {
-			continue
-		}
-		source := strings.TrimSuffix(entry.Path, "/") + strings.TrimPrefix(path, target)
-		return source, true
-	}
-	return "", false
-}
-
-// fsLayerNodeMode is the permission bits a stat row reports, preferring the file row
-// when it carries one.
-func fsLayerNodeMode(nf *datastore.NodeWithFile) uint32 {
-	if nf == nil {
-		return 0
-	}
-	if nf.File != nil && nf.File.Mode != 0 {
-		return nf.File.Mode
-	}
-	return nf.Mode
-}
-
 func (s *Server) handleFSLayerObject(w http.ResponseWriter, r *http.Request, b *backendpkg.Dat9Backend, store *datastore.Store) {
 	rest := strings.TrimPrefix(r.URL.Path, "/v1/layers/")
 	rawID, sub, hasSub := strings.Cut(rest, "/")
@@ -760,9 +629,7 @@ func (s *Server) handleFSLayerObjectUpload(w http.ResponseWriter, r *http.Reques
 	if mode, ok := parseFSLayerModeQuery(r, "mode"); ok {
 		prepared.Mode = mode
 	}
-	if prepared.Mode == 0 {
-		prepared.Mode = 0o644
-	}
+	defaultFSLayerEntryMode(&prepared)
 	if err := normalizeAndValidateFSLayerServerEntry(layer, &prepared); err != nil {
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
@@ -773,7 +640,7 @@ func (s *Server) handleFSLayerObjectUpload(w http.ResponseWriter, r *http.Reques
 	// chmod is owner-only, and an entry that rewrites an existing path's mode is a
 	// chmod by another name: a scoped token may write inside its zone but must not
 	// change permission bits there.
-	if !s.authorizeFSLayerEntryMode(w, r, b, &prepared) {
+	if !s.authorizeFSLayerEntryMode(w, r, b, store, layer, &prepared) {
 		return
 	}
 	fillFSLayerBaseSnapshot(r.Context(), b, &prepared)
@@ -845,6 +712,7 @@ func (s *Server) handleFSLayerEntryUpsert(w http.ResponseWriter, r *http.Request
 		SizeBytes:              req.SizeBytes,
 		Mode:                   req.Mode,
 	}
+	defaultFSLayerEntryMode(&entry)
 	if err := normalizeAndValidateFSLayerServerEntry(layer, &entry); err != nil {
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
@@ -852,7 +720,7 @@ func (s *Server) handleFSLayerEntryUpsert(w http.ResponseWriter, r *http.Request
 	if !authorizeFSLayerEntryMutation(w, r, &entry) {
 		return
 	}
-	if !s.authorizeFSLayerEntryMode(w, r, b, &entry) {
+	if !s.authorizeFSLayerEntryMode(w, r, b, store, layer, &entry) {
 		return
 	}
 	if !s.authorizeFSLayerStorageRefSource(w, r, store, &entry) {
@@ -1090,13 +958,19 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 	}
 	// The plan, not just the entry writes, decides: entries created by an owner (or
 	// before a scope narrowed) must not be committed by a principal that may not
-	// chmod. The deferred guard above leaves the layer conflicted on this return.
-	if changesMode, err := fsLayerEntriesChangeExistingMode(r.Context(), b, entries); err != nil {
-		writeBackendError(w, r, err)
-		return
-	} else if changesMode && !ScopeFromContext(r.Context()).CanChmod() {
-		errJSON(w, http.StatusForbidden, chmodOwnerOnlyMessage)
-		return
+	// chmod. Only such a caller pays for the scan — an owner commit cannot be refused by
+	// it, so it would be pure cost plus a new way to fail. The deferred guard above
+	// leaves the layer conflicted on this return.
+	if !ScopeFromContext(r.Context()).CanChmod() {
+		changesMode, err := fsLayerPlanChangesExistingMode(r.Context(), b, entries)
+		if err != nil {
+			writeBackendError(w, r, err)
+			return
+		}
+		if changesMode {
+			errJSON(w, http.StatusForbidden, chmodOwnerOnlyMessage)
+			return
+		}
 	}
 	conflicts := preflightFSLayerCommit(r.Context(), b, entries, false)
 	if len(conflicts) > 0 {
@@ -1141,7 +1015,7 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 	canChmod := ScopeFromContext(r.Context()).CanChmod()
 	for i := range entries {
 		modeMayBeSuperseded := fsLayerEntryModeSuperseded(entries, i)
-		if err := applyFSLayerEntry(r.Context(), b, &entries[i], false, touchedPaths, modeMayBeSuperseded, canChmod); err != nil {
+		if err := applyFSLayerEntry(r.Context(), b, &entries[i], touchedPaths, fsLayerApplyOptions{modeMayBeSuperseded: modeMayBeSuperseded, canChmod: canChmod}); err != nil {
 			rollbackErr := rollbackFSLayerCommit(rollbackCtx, b, filterFSLayerSnapshotsForEntries(snapshots, entries[:i]))
 			_ = store.SetFSLayerStateIf(rollbackCtx, layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
 			if rollbackErr != nil {
@@ -2355,8 +2229,17 @@ func fsLayerEntryModeSuperseded(entries []datastore.FSLayerEntry, idx int) bool 
 	return false
 }
 
-func applyFSLayerEntry(ctx context.Context, b *backendpkg.Dat9Backend, entry *datastore.FSLayerEntry, recoveringCommit bool, touched map[string]struct{}, modeMayBeSuperseded, canChmod bool) error {
-	if recoveringCommit {
+// fsLayerApplyOptions are the flags that change how applyFSLayerEntry behaves. A
+// struct, not positional booleans: three adjacent bools invite a transposition that
+// compiles and silently tests or runs the wrong path.
+type fsLayerApplyOptions struct {
+	recoveringCommit    bool
+	modeMayBeSuperseded bool
+	canChmod            bool
+}
+
+func applyFSLayerEntry(ctx context.Context, b *backendpkg.Dat9Backend, entry *datastore.FSLayerEntry, touched map[string]struct{}, opts fsLayerApplyOptions) error {
+	if opts.recoveringCommit {
 		applied, err := fsLayerEntryAlreadyApplied(ctx, b, entry)
 		if err != nil {
 			return err
@@ -2371,8 +2254,8 @@ func applyFSLayerEntry(ctx context.Context, b *backendpkg.Dat9Backend, entry *da
 	// Defense in depth for the commit-time check: refuse to apply a mode change the
 	// caller could not have requested through chmod. Creation modes (a path that does
 	// not exist yet) are not mode changes and stay allowed.
-	if !canChmod {
-		changesMode, err := fsLayerEntryModeMutation(ctx, b, entry)
+	if !opts.canChmod {
+		changesMode, err := fsLayerEntryModeChange(ctx, b, []datastore.FSLayerEntry{*entry}, 0)
 		if err != nil {
 			return err
 		}
@@ -2398,7 +2281,7 @@ func applyFSLayerEntry(ctx context.Context, b *backendpkg.Dat9Backend, entry *da
 					return err
 				}
 				if entry.Mode != 0 {
-					return applyFSLayerEntryMode(ctx, b, entry.Path, entry.Mode&0o777, modeMayBeSuperseded)
+					return applyFSLayerEntryMode(ctx, b, entry.Path, entry.Mode&0o777, opts.modeMayBeSuperseded)
 				}
 				return nil
 			}
@@ -2426,7 +2309,7 @@ func applyFSLayerEntry(ctx context.Context, b *backendpkg.Dat9Backend, entry *da
 			}
 		}
 		if entry.Mode != 0 {
-			return applyFSLayerEntryMode(ctx, b, entry.Path, entry.Mode&0o777, modeMayBeSuperseded)
+			return applyFSLayerEntryMode(ctx, b, entry.Path, entry.Mode&0o777, opts.modeMayBeSuperseded)
 		}
 		return nil
 	case datastore.FSLayerEntryOpMkdir:
@@ -2461,7 +2344,7 @@ func applyFSLayerEntry(ctx context.Context, b *backendpkg.Dat9Backend, entry *da
 		if mode == 0 {
 			return nil
 		}
-		return applyFSLayerEntryMode(ctx, b, entry.Path, mode&0o777, modeMayBeSuperseded)
+		return applyFSLayerEntryMode(ctx, b, entry.Path, mode&0o777, opts.modeMayBeSuperseded)
 	case datastore.FSLayerEntryOpSymlink:
 		target := entry.ContentText
 		if target == "" && len(entry.ContentBlob) > 0 {

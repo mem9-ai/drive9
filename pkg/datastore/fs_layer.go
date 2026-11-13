@@ -1042,6 +1042,14 @@ func scanFSLayerCheckpoint(row interface{ Scan(dest ...any) error }) (*FSLayerCh
 	return &checkpoint, nil
 }
 
+// The mode a layer entry gets when the caller names none. Exported so the server
+// decides "unspecified" with the same values the store stamps: an authorization check
+// that sees a different number than the row will deny a value it never stored.
+const (
+	FSLayerDefaultFileMode = 0o644
+	FSLayerDefaultDirMode  = 0o755
+)
+
 func normalizeFSLayerEntry(entry *FSLayerEntry) error {
 	entry.LayerID = strings.TrimSpace(entry.LayerID)
 	if entry.LayerID == "" {
@@ -1084,9 +1092,9 @@ func normalizeFSLayerEntry(entry *FSLayerEntry) error {
 	entry.ParentPathHash = fsLayerPathHash(entry.ParentPath)
 	entry.Name = pathutil.BaseName(p)
 	if entry.Mode == 0 {
-		entry.Mode = 0o644
+		entry.Mode = FSLayerDefaultFileMode
 		if entry.Kind == FSLayerEntryKindDir {
-			entry.Mode = 0o755
+			entry.Mode = FSLayerDefaultDirMode
 		}
 	}
 	// Derive the hash from the ref instead of keeping a caller-supplied value:

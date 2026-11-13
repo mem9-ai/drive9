@@ -45,6 +45,7 @@ func extentMetaClientOpBodies() map[string]string {
 		"delete_sustained":    `{"sid":1,"inode":1}`,
 		"flock":               `{"inode":1,"sid":1,"owner":1,"ltype":1}`,
 		"getlk":               `{"inode":1,"sid":1,"owner":1,"ltype":1,"start":0,"end":0}`,
+		"open_ref":            `{"inode":1}`,
 		"setlk":               `{"inode":1,"sid":1,"owner":1,"ltype":1,"start":0,"end":0}`,
 		"find_stale_sessions": `{"limit":1}`,
 		"clean_stale_session": `{"sid":1}`,

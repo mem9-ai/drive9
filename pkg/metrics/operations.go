@@ -411,14 +411,12 @@ func boundedHTTPMethod(method string) string {
 // label historically holds the method in lower case, and a caller-chosen method such as
 // "X1", "X2", ... would mint a new series (and a permanent map entry) per request.
 func BoundedMethodLabel(method string) string {
+	// The empty case is handled here because boundedHTTPMethod keeps its historical
+	// "UNKNOWN" label for HTTP metrics; an action label has always fallen back to "other".
 	if strings.TrimSpace(method) == "" {
 		return "other"
 	}
-	label := strings.ToLower(boundedHTTPMethod(method))
-	if label == "unknown" {
-		return "other"
-	}
-	return label
+	return strings.ToLower(boundedHTTPMethod(method))
 }
 
 func RecordHTTPRequest(method, route string, status int, d time.Duration) {

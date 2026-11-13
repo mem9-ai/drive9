@@ -181,6 +181,100 @@ func TestFSLayerScopedObjectUploadRefusesModeChange(t *testing.T) {
 	}
 }
 
+// Plan order decides whether an upsert rewrites a live inode's mode or creates a new
+// file: a path vacated by an earlier rename or whiteout is a creation, while an upsert
+// before the rename still overwrites the live inode.
+func TestFSLayerModeChangeRespectsPlanOrder(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	if _, err := s.fallback.WriteCtx(ctx, "/zone/f.txt", []byte("live"), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.fallback.ChmodCtx(ctx, "/zone/f.txt", 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	rename := datastore.FSLayerEntry{Path: "/zone/f.txt", Op: datastore.FSLayerEntryOpRename, Kind: datastore.FSLayerEntryKindFile, ContentText: "/zone/g.txt"}
+	upsertAtSource := datastore.FSLayerEntry{Path: "/zone/f.txt", Op: datastore.FSLayerEntryOpUpsert, Kind: datastore.FSLayerEntryKindFile, Mode: 0o644}
+
+	// Rename first: the upsert creates a fresh file at the vacated path, so its 0644 is
+	// a creation mode, not a change to the live 0600 inode.
+	changes, err := fsLayerEntryModeChange(ctx, s.fallback, []datastore.FSLayerEntry{rename, upsertAtSource}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changes {
+		t.Fatal("an upsert at a vacated path was treated as a mode change")
+	}
+	// Upsert first: it overwrites the live inode, which is a mode change.
+	changes, err = fsLayerEntryModeChange(ctx, s.fallback, []datastore.FSLayerEntry{upsertAtSource, rename}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changes {
+		t.Fatal("an upsert before the rename was treated as a creation")
+	}
+	// A whiteout vacates the path the same way.
+	whiteout := datastore.FSLayerEntry{Path: "/zone/f.txt", Op: datastore.FSLayerEntryOpWhiteout, Kind: datastore.FSLayerEntryKindFile}
+	changes, err = fsLayerEntryModeChange(ctx, s.fallback, []datastore.FSLayerEntry{whiteout, upsertAtSource}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changes {
+		t.Fatal("an upsert after a whiteout was treated as a mode change")
+	}
+	// A rename destination still resolves to its live source inode.
+	upsertAtTarget := datastore.FSLayerEntry{Path: "/zone/g.txt", Op: datastore.FSLayerEntryOpUpsert, Kind: datastore.FSLayerEntryKindFile, Mode: 0o777}
+	changes, err = fsLayerEntryModeChange(ctx, s.fallback, []datastore.FSLayerEntry{rename, upsertAtTarget}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changes {
+		t.Fatal("an upsert at a rename destination bypassed the live-inode mode comparison")
+	}
+}
+
+// The entries route decides with the same plan semantics as commit, so a plan that
+// renames a 0600 file and then recreates the source path is allowed for a scoped token.
+func TestFSLayerEntryWriteAllowsVacatedPathForScopedToken(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	store := s.fallback.Store()
+	if _, err := s.fallback.WriteCtx(ctx, "/zone/f.txt", []byte("live"), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.fallback.ChmodCtx(ctx, "/zone/f.txt", 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateFSLayer(ctx, &datastore.FSLayer{LayerID: "layer-vacate", BaseRootPath: "/zone"}); err != nil {
+		t.Fatal(err)
+	}
+	layer, err := store.GetFSLayer(ctx, "layer-vacate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	scoped := &TenantScope{
+		Backend:  s.fallback,
+		IsScoped: true,
+		FSScopes: []FSScope{{Prefix: "/zone", Ops: map[FSOp]bool{FSOpRead: true, FSOpWrite: true, FSOpDelete: true}}},
+	}
+	owner := &TenantScope{Backend: s.fallback}
+	post := func(scope *TenantScope, body string) int {
+		req := httptest.NewRequest(http.MethodPost, "/v1/layers/layer-vacate/entries", bytes.NewReader([]byte(body)))
+		req = req.WithContext(withScope(req.Context(), scope))
+		rr := httptest.NewRecorder()
+		s.handleFSLayerEntryUpsert(rr, req, s.fallback, store, layer)
+		return rr.Code
+	}
+	// The owner stages the rename, then the scoped token recreates the vacated path.
+	if got := post(owner, `{"path":"/zone/f.txt","op":"rename","kind":"file","content_text":"/zone/g.txt"}`); got != http.StatusOK {
+		t.Fatalf("owner rename status=%d, want 200", got)
+	}
+	if got := post(scoped, `{"path":"/zone/f.txt","op":"upsert","kind":"file","content_text":"new"}`); got != http.StatusOK {
+		t.Fatalf("scoped upsert at the vacated path status=%d, want 200", got)
+	}
+}
+
 // The apply-time guard is the second layer: even if a handler decides to apply a
 // mode-changing entry, the apply itself refuses without chmod authority.
 func TestApplyFSLayerEntryRefusesModeChangeWithoutChmod(t *testing.T) {
@@ -190,7 +284,7 @@ func TestApplyFSLayerEntryRefusesModeChangeWithoutChmod(t *testing.T) {
 		t.Fatal(err)
 	}
 	entry := datastore.FSLayerEntry{Path: "/f.txt", Op: datastore.FSLayerEntryOpChmod, Kind: datastore.FSLayerEntryKindFile, Mode: 0o777}
-	err := applyFSLayerEntry(ctx, s.fallback, &entry, false, map[string]struct{}{}, false, false)
+	err := applyFSLayerEntry(ctx, s.fallback, &entry, map[string]struct{}{}, fsLayerApplyOptions{})
 	if !errors.Is(err, errChmodForbidden) {
 		t.Fatalf("apply err=%v, want errChmodForbidden", err)
 	}
@@ -198,7 +292,7 @@ func TestApplyFSLayerEntryRefusesModeChangeWithoutChmod(t *testing.T) {
 		t.Fatalf("mode change applied without chmod authority: mode=%o err=%v", nf.Mode&0o777, statErr)
 	}
 	// With authority the same entry applies.
-	if err := applyFSLayerEntry(ctx, s.fallback, &entry, false, map[string]struct{}{}, false, true); err != nil {
+	if err := applyFSLayerEntry(ctx, s.fallback, &entry, map[string]struct{}{}, fsLayerApplyOptions{canChmod: true}); err != nil {
 		t.Fatalf("owner apply: %v", err)
 	}
 	if nf, err := s.fallback.StatNodeCtx(ctx, "/f.txt"); err != nil || nf.Mode&0o777 != 0o777 {

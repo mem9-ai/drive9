@@ -3299,6 +3299,11 @@ func (s *Server) handleBatchWrite(w http.ResponseWriter, r *http.Request) {
 		// permission bits on a path it can write. Per-item 403 rather than a failed
 		// request, so the content-only items of the same batch still commit — the
 		// rejection contract BatchWriteResult documents for this capability.
+		//
+		// This denial is only correct while a scoped token is never told the
+		// content+mode contract exists: if storage_capabilities.batch_write_mode_v1 is
+		// ever advertised, it has to be per token scope (owner only), or a scoped mount
+		// will attach hasMode to every commit and be denied on each writeback cycle.
 		if item.HasMode && !scope.CanChmod() {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "batch_write_mode_denied", "path", item.Path)...)
 			results[i].Status = http.StatusForbidden
@@ -3381,6 +3386,10 @@ func batchWriteStatusForError(err error) int {
 		return http.StatusNotFound
 	case errors.Is(err, datastore.ErrInvalidRootDentry):
 		return http.StatusBadRequest
+	case errors.Is(err, backend.ErrBatchWriteModeDenied):
+		// The backend refuses mode bits the HTTP layer did not authorize; report it as
+		// the same per-item 403 the handler's own denial uses, not a storage error.
+		return http.StatusForbidden
 	default:
 		return http.StatusInternalServerError
 	}
@@ -3870,7 +3879,7 @@ func (s *Server) handleChmod(w http.ResponseWriter, r *http.Request, path string
 	// regardless of zone. The dispatcher already denies scoped tokens on
 	// POST /v1/fs/*?chmod, so reaching this handler with a scoped token
 	// indicates a defense-in-depth gap somewhere upstream — fail closed.
-	if scope := ScopeFromContext(r.Context()); scope != nil && scope.IsScoped {
+	if scope := ScopeFromContext(r.Context()); scope != nil && !scope.CanChmod() {
 		errJSON(w, http.StatusForbidden, chmodOwnerOnlyMessage)
 		return
 	}

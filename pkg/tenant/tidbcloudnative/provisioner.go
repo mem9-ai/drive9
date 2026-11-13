@@ -1607,31 +1607,29 @@ func RetireLegacySystemUserPrivilege(ctx context.Context, dsn string) error {
 	return nil
 }
 
-// The instance account scheme is <prefix>.root for the cluster root principal and
-// <prefix>.tdc_fs_sys for the per-tenant account the native setup creates. The suffixes
-// are named here because building a name and parsing one back have to agree: a drift
-// would compile, silently stop matching, and leave a stored DSN pointing at an account
-// that is never provisioned.
+// The instance account scheme is owned by pkg/tenant so the server, the native
+// provisioner and the legacy starter path cannot drift apart on it: a drift between
+// building a name and parsing one back compiles, silently stops matching, and leaves a
+// stored DSN pointing at an account that is never provisioned.
 const (
 	// RestrictedSystemUserNameSuffix marks the per-tenant account. Callers that decide
 	// from a stored DSN use IsRestrictedSystemUser instead of spelling the suffix
 	// themselves, so a scheme change cannot silently stop matching.
-	RestrictedSystemUserNameSuffix = ".tdc_fs_sys"
+	RestrictedSystemUserNameSuffix = tenant.RestrictedSystemUserNameSuffix
 	// RootUserNameSuffix marks the cluster root principal, which shares the password of
 	// the restricted account with the same prefix.
-	RootUserNameSuffix = ".root"
+	RootUserNameSuffix = tenant.RootUserNameSuffix
 )
 
 // IsRestrictedSystemUser reports whether username names the restricted per-tenant
 // account rather than a cluster principal.
 func IsRestrictedSystemUser(username string) bool {
-	prefix, ok := strings.CutSuffix(strings.TrimSpace(username), RestrictedSystemUserNameSuffix)
-	return ok && prefix != ""
+	return tenant.IsRestrictedSystemUsername(username)
 }
 
 // systemRootUsernameFor builds the cluster root principal for an instance prefix.
 func systemRootUsernameFor(prefix string) string {
-	return prefix + RootUserNameSuffix
+	return tenant.RootUsernameFor(prefix)
 }
 
 // systemRootUserFor maps the restricted tenant account name back to the cluster root

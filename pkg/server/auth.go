@@ -111,6 +111,11 @@ func sanitizeClientError(err error) string {
 	if isSchemaMigrationError(err) {
 		return "tenant metadata error"
 	}
+	if errors.Is(err, errChmodForbidden) {
+		// The policy message is the point: a caller that may not chmod needs to see why,
+		// not a generic backend failure.
+		return chmodOwnerOnlyMessage
+	}
 	return "backend unavailable"
 }
 
