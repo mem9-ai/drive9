@@ -676,8 +676,9 @@ func New(opts Options) (*Writeback, error) {
 			// overtook (see recoveryCacheGens): without this the stale pair
 			// keeps answering pending reads and future recoveries long
 			// after its successor landed. Generation-guarded against any
-			// flush staged after the snapshot.
-			if w.recoveryCacheGens != nil && w.wbCache != nil {
+			// flush staged after the snapshot. Fixed-view recovery performs checked
+			// cleanup before removing the durable pending owner instead.
+			if opts.Client.ViewBinding().LayerID == "" && w.recoveryCacheGens != nil && w.wbCache != nil {
 				if gen, ok := w.recoveryCacheGens[entry.Path]; ok {
 					w.wbCache.RemoveIfGeneration(entry.Path, gen)
 				}
@@ -810,19 +811,13 @@ func (w *Writeback) Start(ctx context.Context) error {
 		}
 	}
 
-	if w.opts.Client.ViewBinding().LayerID != "" {
-		if err := w.recoverFixedPublications(ctx); err != nil {
-			return fmt.Errorf("recover fixed publications: %w", err)
-		}
-	}
-
 	// Recovery ownership is snapshotted BEFORE either track starts: the
 	// queue's workers begin inside RecoverPending, and a path they land and
 	// remove before the uploader's filter evaluates would pass a live
 	// HasPending check and get the stale .dat/.meta submitted as a second
 	// recovery owner — a permanent conflict, or a same-origin rebase
 	// republishing the stale bytes. The immutable snapshot owns the split,
-	// and the queue's success retires exactly the snapshotted pair (a
+	// and cleanup retires exactly the snapshotted pair (a
 	// crash can leave it behind between the ledger publication and the
 	// enqueue's cache removal; anything staged after the snapshot carries
 	// a newer generation and survives).
@@ -834,9 +829,24 @@ func (w *Writeback) Start(ctx context.Context) error {
 		if w.wbCache != nil && len(ledgerOwned) > 0 {
 			w.recoveryCacheGens = make(map[string]uint64, len(ledgerOwned))
 			for _, m := range w.wbCache.ListPendingMetas() {
+				if _, owned := ledgerOwned[m.Path]; !owned {
+					continue
+				}
+				if w.opts.Client.ViewBinding().LayerID != "" && m.SupersedesPendingGen != 0 {
+					if pending, ok := w.opts.Staging.Pending.GetMeta(m.Path); ok && m.SupersedesPendingGen >= pending.Generation {
+						continue // This cache contains the pending image and must survive it.
+					}
+				}
 				w.recoveryCacheGens[m.Path] = m.Generation
 			}
 		}
+	}
+	if w.opts.Client.ViewBinding().LayerID != "" {
+		if err := w.recoverFixedPublications(ctx); err != nil {
+			return fmt.Errorf("recover fixed publications: %w", err)
+		}
+	}
+	if w.queue != nil {
 		w.queue.RecoverPending()
 	}
 	if w.uploader != nil {

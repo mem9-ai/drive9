@@ -438,3 +438,123 @@ func TestFixedQueueMainKeepsConditionalPUTAndNoPublicationRecords(t *testing.T) 
 		})
 	}
 }
+
+// A queue WAL can coexist with the .dat/.meta pair left by an interrupted
+// cache-to-queue handoff. Start must fix ownership before replay removes pending.
+func TestFixedQueueStartRetiresOnlySupersededCache(t *testing.T) {
+	for _, scenario := range []string{"stale", "new_after_snapshot", "new_before_restart", "cleanup_failure"} {
+		t.Run(scenario, func(t *testing.T) {
+			dir := t.TempDir()
+			api := &fixedCacheAPI{t: t, size: 6}
+			api.failComplete.Store(true)
+			ts := httptest.NewServer(http.HandlerFunc(api.serve))
+			defer ts.Close()
+			c, _ := client.New(ts.URL, "").WithView(client.ViewBinding{LayerID: "a", WorkID: "work", Fence: 1})
+			open := func() (*Writeback, *staging.Staging) {
+				l, err := staging.NewStagingWithQuota(filepath.Join(dir, "ledger"), 0, 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				w, err := New(Options{Client: c, Staging: l, WriteCacheDir: filepath.Join(dir, "cache"), RemoteRoot: "/team", Policy: PolicyWriteBack, UploadConcurrency: 1})
+				if err != nil {
+					l.Close()
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = w.Stop(context.Background()); l.Close() })
+				api.journal = l.Journal
+				return w, l
+			}
+			put := func(w *Writeback, data string) uint64 {
+				if err := w.wbCache.PutWithBaseRevAndMode("/file", []byte(data), int64(len(data)), staging.PendingNew, 0, 0, false); err != nil {
+					t.Fatal(err)
+				}
+				m, _ := w.wbCache.GetMeta("/file")
+				return m.Generation
+			}
+			w, l := open()
+			oldGen := put(w, "stale!")
+			entry := stageFixedQueueImage(t, l, []byte("queued"), 0, false)
+			if err := w.queue.CommitNow(context.Background(), entry); err == nil {
+				t.Fatal("completion loss succeeded")
+			}
+			if scenario == "new_before_restart" {
+				gen := put(w, "newer cache")
+				if !w.wbCache.MarkSupersedesPendingGen("/file", entry.PendingIndexGen, gen) {
+					t.Fatal("mark newer cache")
+				}
+			}
+			_ = w.Stop(context.Background())
+			l.Close()
+			fresh, l2 := open()
+			api.failComplete.Store(false)
+			if scenario == "new_after_snapshot" {
+				api.beforeComplete = func() { put(fresh, "newer cache") }
+			}
+			if scenario == "cleanup_failure" {
+				// Meta deletion succeeds, but payload removal fails. No completion
+				// replay or pending retirement may precede checked cache cleanup.
+				blocked := fresh.wbCache.DatFile("/file")
+				if err := os.Remove(blocked); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Mkdir(blocked, 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(blocked, "block"), nil, 0600); err != nil {
+					t.Fatal(err)
+				}
+				if err := fresh.Start(context.Background()); err == nil {
+					t.Fatal("cleanup failure ignored")
+				}
+				if !l2.Pending.HasPending("/file") || !l2.Shadow.Has("/file") {
+					t.Fatal("removed recovery owner on cleanup failure")
+				}
+				records, err := l2.Journal.PendingFixedUploads()
+				if err != nil || len(records) != 1 {
+					t.Fatal(records, err)
+				}
+				if len(api.completeIDs) != 1 {
+					t.Fatal("replayed before cleanup succeeded")
+				}
+				_ = fresh.Stop(context.Background())
+				l2.Close()
+				if err := os.RemoveAll(blocked); err != nil {
+					t.Fatal(err)
+				}
+				fresh, l2 = open()
+			}
+			if err := fresh.Start(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			if err := fresh.queue.WaitIdle(ctx); err != nil {
+				t.Fatal(err)
+			}
+			newer := strings.HasPrefix(scenario, "new_")
+			if err := fresh.uploader.WaitIdle(ctx); (err != nil) != newer {
+				t.Fatal("only a retained newer cache should remain unresolved", err)
+			}
+			if l2.Pending.HasPending("/file") || l2.Shadow.Has("/file") {
+				t.Fatal("queue image not retired")
+			}
+			records, err := l2.Journal.PendingFixedUploads()
+			if err != nil || len(records) != 0 {
+				t.Fatal(records, err)
+			}
+			m, data, exists := fresh.wbCache.GetMetaAndView("/file")
+			if newer {
+				if !exists || m.Generation <= oldGen || string(data) != "newer cache" {
+					t.Fatal("newer cache lost", m, string(data), exists)
+				}
+			} else if exists {
+				t.Fatal("stale cache survived", m)
+			}
+			api.mu.Lock()
+			defer api.mu.Unlock()
+			if len(api.initIDs) != 1 || api.transfers.Load() != 1 || len(api.completeIDs) != 2 || api.completeIDs[0] != api.completeIDs[1] {
+				t.Fatal("recovery uploaded stale cache or changed identity", api.initIDs, api.completeIDs)
+			}
+		})
+	}
+}

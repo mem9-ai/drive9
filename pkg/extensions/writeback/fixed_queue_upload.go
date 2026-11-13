@@ -277,6 +277,16 @@ func (w *Writeback) recoverFixedPublications(ctx context.Context) error {
 			return fmt.Errorf("fixed publication recovery owner unavailable")
 		}
 	}
+	// Retire the stale cache BEFORE a recovered queue publication can remove
+	// its durable pending owner. A cleanup error leaves that owner and the WAL
+	// intact for the next Start; the ordinary success callback is best-effort
+	// and is too late to provide this guarantee. A cache staged after the
+	// startup snapshot has a different generation and is retained.
+	for path, gen := range w.recoveryCacheGens {
+		if _, err := w.wbCache.RetireFixedUploadGeneration(path, gen); err != nil {
+			return fmt.Errorf("retire superseded recovery cache: %w", err)
+		}
+	}
 	for _, p := range records {
 		receipt, err := p.complete(ctx, w.opts.Client)
 		if err != nil {
