@@ -19,6 +19,21 @@ import (
 	"github.com/mem9-ai/drive9/pkg/viewprotocol"
 )
 
+// WriteExtentStreamConditional replaces a main file using the extent upload
+// protocol, including when the new body is smaller than the direct PUT limit.
+// expectedRevision is zero for create or positive for update. Fixed views use
+// WriteStreamConditional and their separate operation-identity protocol.
+func (c *Client) WriteExtentStreamConditional(ctx context.Context, path string, source io.ReaderAt, size int64, progress ProgressFunc, expectedRevision int64) error {
+	if c.view.LayerID != "" || source == nil || size <= 0 || expectedRevision < 0 {
+		return errors.New("extent stream requires main, a source, positive size and nonnegative revision")
+	}
+	plan, err := c.initiateUploadV2Layout(ctx, path, size, expectedRevision, "", ContentLayoutExtent)
+	if err != nil {
+		return err
+	}
+	return c.writeExtentUpload(ctx, plan, source, size, progress, nil, nil, "", nil, 0)
+}
+
 func validateExtentUploadPlan(plan *uploadPlanV2, size int64) error {
 	if plan == nil || plan.ContentLayout != ContentLayoutExtent || viewprotocol.ValidateOperationID(plan.UploadID) != nil || size <= 0 ||
 		(plan.PartSize != 4<<20 && plan.PartSize != 64<<20) || plan.TotalParts < 1 || plan.TotalParts > 10000 ||

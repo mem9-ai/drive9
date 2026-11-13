@@ -85,5 +85,5 @@ func overwriteMergedMain(ctx context.Context, c *client.Client) error {
 		return errors.New("merge current extent stat")
 	}
 	data := []byte("newer main")
-	return c.WriteMultipartStreamConditional(ctx, "/file", bytes.NewReader(data), int64(len(data)), nil, current.Revision)
+	return c.WriteExtentStreamConditional(ctx, "/file", bytes.NewReader(data), int64(len(data)), nil, current.Revision)
 }

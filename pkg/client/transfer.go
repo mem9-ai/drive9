@@ -1012,15 +1012,20 @@ func (c *Client) completeUploadWithOptions(ctx context.Context, uploadID string,
 // initiateUploadV2 calls POST /v2/uploads/initiate.
 // Returns errV2NotAvailable if the server responds with 404.
 func (c *Client) initiateUploadV2(ctx context.Context, path string, size int64, expectedRevision int64, description string) (*uploadPlanV2, error) {
+	return c.initiateUploadV2Layout(ctx, path, size, expectedRevision, description, "")
+}
+
+func (c *Client) initiateUploadV2Layout(ctx context.Context, path string, size int64, expectedRevision int64, description string, layout ContentLayout) (*uploadPlanV2, error) {
 	if err := validateFSPath(path); err != nil {
 		return nil, err
 	}
 	body, err := json.Marshal(struct {
-		Path             string `json:"path"`
-		TotalSize        int64  `json:"total_size"`
-		ExpectedRevision *int64 `json:"expected_revision,omitempty"`
-		Description      string `json:"description,omitempty"`
-	}{Path: path, TotalSize: size, ExpectedRevision: expectedRevisionField(expectedRevision), Description: description})
+		Path             string        `json:"path"`
+		TotalSize        int64         `json:"total_size"`
+		ExpectedRevision *int64        `json:"expected_revision,omitempty"`
+		Description      string        `json:"description,omitempty"`
+		Layout           ContentLayout `json:"layout,omitempty"`
+	}{Path: path, TotalSize: size, ExpectedRevision: expectedRevisionField(expectedRevision), Description: description, Layout: layout})
 	if err != nil {
 		return nil, err
 	}

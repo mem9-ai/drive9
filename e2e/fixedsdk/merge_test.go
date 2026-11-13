@@ -14,7 +14,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/client"
 )
 
-func TestMergeProbeOverwritesExtentThroughMultipart(t *testing.T) {
+func TestMergeProbeOverwritesExtentThroughExplicitLayout(t *testing.T) {
 	for _, failure := range []string{"", "stat", "layout", "initiate", "complete"} {
 		t.Run(failure, func(t *testing.T) {
 			var calls atomic.Int32
@@ -38,10 +38,11 @@ func TestMergeProbeOverwritesExtentThroughMultipart(t *testing.T) {
 				case "/v2/uploads/initiate":
 					var in struct {
 						Path             string
-						TotalSize        int64 `json:"total_size"`
-						ExpectedRevision int64 `json:"expected_revision"`
+						Layout           string `json:"layout"`
+						TotalSize        int64  `json:"total_size"`
+						ExpectedRevision int64  `json:"expected_revision"`
 					}
-					if err := json.NewDecoder(r.Body).Decode(&in); err != nil || in.Path != "/file" || in.TotalSize != 10 || in.ExpectedRevision != 7 {
+					if err := json.NewDecoder(r.Body).Decode(&in); err != nil || in.Path != "/file" || in.TotalSize != 10 || in.ExpectedRevision != 7 || in.Layout != "extent" {
 						t.Error(in, err)
 						w.WriteHeader(400)
 						return
