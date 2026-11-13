@@ -154,3 +154,9 @@ func TestPortFacadeHonorsDropCacheMarker(t *testing.T) {
 		t.Fatalf("facade leaked the drop-cache marker to the kernel: %#x", out.OpenFlags)
 	}
 }
+
+func TestServeExitUsesKernelPresenceForUnmountedPath(t *testing.T) {
+	if err := classifyServeExit(t.TempDir(), mountedKernel); err != nil {
+		t.Fatalf("unmounted path classified as a surviving mount: %v", err)
+	}
+}

@@ -972,7 +972,7 @@ func mountWithConfig(cfg MountConfig) (resultErr error) {
 	// clean external unmount removes it; a hung mount keeps it after the
 	// serve loop dies. Give the row a short settling window — the loop can
 	// exit marginally before the umount(2) that triggered it completes.
-	return classifyServeExit(cfg.MountPoint, unmountedKernel)
+	return classifyServeExit(cfg.MountPoint, mountedKernel)
 }
 
 // mountRuntime owns one immutable client binding and its independent extension
@@ -1537,19 +1537,20 @@ func classifyServeExit(mountPoint string, mountStillPresent func(string) bool) e
 	return ExitServeAbnormalErr(fmt.Sprintf("serve loop ended at %s with the kernel mount still present", mountPoint))
 }
 
-// unmountedKernel reports whether the mountpoint is no longer a FUSE mount.
-func unmountedKernel(mountPoint string) bool {
+// mountedKernel reports whether the kernel still lists this FUSE mount.
+func mountedKernel(mountPoint string) bool {
 	mnts, err := os.ReadFile("/proc/self/mountinfo")
 	if err != nil {
-		// Non-Linux or unreadable: fall back to the handshake flag only.
-		return true
+		// Preserve the non-Linux fallback: unavailable mountinfo does not
+		// establish that a kernel mount survives the completed serve loop.
+		return false
 	}
 	for _, line := range strings.Split(string(mnts), "\n") {
 		if strings.Contains(line, " "+mountPoint+" ") && strings.Contains(line, "fuse") {
-			return false
+			return true
 		}
 	}
-	return true
+	return false
 }
 
 // validateRemoteRoot ports v1's startup preflight: the remote source must
