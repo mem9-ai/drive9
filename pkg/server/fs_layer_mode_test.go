@@ -484,11 +484,13 @@ func TestFSLayerScopedCommitAllowsRestylingAPlanCreatedPath(t *testing.T) {
 	s := newTestServer(t)
 	ctx := context.Background()
 	store := s.fallback.Store()
-	if _, err := s.fallback.WriteCtx(ctx, "/zone/rot.txt", []byte("live"), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.fallback.ChmodCtx(ctx, "/zone/rot.txt", 0o644); err != nil {
-		t.Fatal(err)
+	for _, path := range []string{"/zone/rot.txt", "/zone/rep.txt", "/zone/w-gone.txt"} {
+		if _, err := s.fallback.WriteCtx(ctx, path, []byte("live"), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.fallback.ChmodCtx(ctx, path, 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
 	scoped := &TenantScope{
 		Backend:  s.fallback,
@@ -516,6 +518,21 @@ func TestFSLayerScopedCommitAllowsRestylingAPlanCreatedPath(t *testing.T) {
 			// entry at its path is still a creation-mode write.
 			`{"path":"/zone/link","op":"symlink","kind":"symlink","content_text":"rot.txt"}`,
 			`{"path":"/zone/link","op":"upsert","kind":"file","mode":384,"content_text":"through"}`,
+		},
+		{
+			// A whiteout elsewhere in the plan must not disturb the created name's
+			// ownership: the restyle still targets the plan's own inode.
+			`{"path":"/zone/w.txt","op":"upsert","kind":"file","mode":420,"content_text":"one"}`,
+			`{"path":"/zone/w-gone.txt","op":"whiteout","kind":"file"}`,
+			`{"path":"/zone/w.txt","op":"upsert","kind":"file","mode":384,"content_text":"two"}`,
+		},
+		{
+			// Recreate a live path, rename the plan-created inode away and restyle it
+			// there: the rename has to carry the recorded inode id, not erase it.
+			`{"path":"/zone/rep.txt","op":"whiteout","kind":"file"}`,
+			`{"path":"/zone/rep.txt","op":"upsert","kind":"file","mode":420,"content_text":"one"}`,
+			`{"path":"/zone/rep.txt","op":"rename","kind":"file","content_text":"/zone/rep2.txt"}`,
+			`{"path":"/zone/rep2.txt","op":"upsert","kind":"file","mode":384,"content_text":"two"}`,
 		},
 	} {
 		layerID := fmt.Sprintf("layer-restyle-%d", idx)
@@ -573,6 +590,21 @@ func TestFSLayerScopedCommitAllowsRestylingAPlanCreatedPath(t *testing.T) {
 	}
 	if got := fsLayerNodeMode(nf) & 0o777; got != 0o600 {
 		t.Fatalf("symlink-path write mode = %o, want 600", got)
+	}
+	// A whiteout of an unrelated path must not wipe the plan's ownership: the restyle in
+	// that plan landed on the plan's own inode.
+	if nf, err = s.fallback.StatNodeCtx(ctx, "/zone/w.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if got := fsLayerNodeMode(nf) & 0o777; got != 0o600 {
+		t.Fatalf("restyle-after-whiteout mode = %o, want 600", got)
+	}
+	// The recreate -> rename -> restyle plan kept the recorded inode through the rename.
+	if nf, err = s.fallback.StatNodeCtx(ctx, "/zone/rep2.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if got := fsLayerNodeMode(nf) & 0o777; got != 0o600 {
+		t.Fatalf("recreated-then-renamed mode = %o, want 600", got)
 	}
 	nf, err = s.fallback.StatNodeCtx(ctx, "/zone/d")
 	if err != nil {
@@ -873,7 +905,7 @@ func TestApplyFSLayerEntryRefusesModeChangeWithoutChmod(t *testing.T) {
 		t.Fatal(err)
 	}
 	entry := datastore.FSLayerEntry{Path: "/f.txt", Op: datastore.FSLayerEntryOpChmod, Kind: datastore.FSLayerEntryKindFile, Mode: 0o777}
-	err := applyFSLayerEntry(ctx, s.fallback, &entry, map[string]struct{}{}, fsLayerApplyOptions{})
+	_, err := applyFSLayerEntry(ctx, s.fallback, &entry, map[string]struct{}{}, fsLayerApplyOptions{})
 	if !errors.Is(err, errChmodForbidden) {
 		t.Fatalf("apply err=%v, want errChmodForbidden", err)
 	}
@@ -881,7 +913,7 @@ func TestApplyFSLayerEntryRefusesModeChangeWithoutChmod(t *testing.T) {
 		t.Fatalf("mode change applied without chmod authority: mode=%o err=%v", nf.Mode&0o777, statErr)
 	}
 	// With authority the same entry applies.
-	if err := applyFSLayerEntry(ctx, s.fallback, &entry, map[string]struct{}{}, fsLayerApplyOptions{canChmod: true}); err != nil {
+	if _, err := applyFSLayerEntry(ctx, s.fallback, &entry, map[string]struct{}{}, fsLayerApplyOptions{canChmod: true}); err != nil {
 		t.Fatalf("owner apply: %v", err)
 	}
 	if nf, err := s.fallback.StatNodeCtx(ctx, "/f.txt"); err != nil || nf.Mode&0o777 != 0o777 {

@@ -1664,10 +1664,23 @@ func (s *Store) ChmodInode(ctx context.Context, inodeID string, mode uint32) (er
 		return qerr
 	}
 	mode = (mode & permissionModeMask) | (currentMode & fileTypeModeMask)
-	if _, uerr := tx.ExecContext(ctx, `UPDATE jfs_node SET mode = ? WHERE inode = (SELECT extent_ino FROM file_nodes WHERE `+
-		s.scope.And(`file_id = ?`)+` AND COALESCE(extent_ino, 0) <> 0)`,
-		append([]any{mode & permissionModeMask}, s.scope.Args(inodeID)...)...); uerr != nil {
-		return uerr
+	// A hardlinked extent file has several file_nodes rows sharing one file_id and
+	// extent_ino, so a scalar subquery answers ERROR 1242. The rows agree by construction,
+	// so aggregate them; 0 means this inode has no extent plane at all.
+	var extentIno sql.NullInt64
+	if qerr := tx.QueryRowContext(ctx, `SELECT MIN(COALESCE(extent_ino, 0)) FROM file_nodes WHERE `+
+		s.scope.And(`file_id = ?`), s.scope.Args(inodeID)...).Scan(&extentIno); qerr != nil && !errors.Is(qerr, sql.ErrNoRows) {
+		return qerr
+	}
+	if extentIno.Valid && extentIno.Int64 != 0 {
+		// Mirror the by-path Chmod: a remote chmod has to look like a mounted one, ctime
+		// included.
+		now := time.Now().UnixNano()
+		ctime, csec := jfsSplitTime(now)
+		if _, uerr := tx.ExecContext(ctx, `UPDATE jfs_node SET mode = ?, ctime = ?, ctimensec = ? WHERE inode = ?`,
+			mode&permissionModeMask, ctime, csec, uint64(extentIno.Int64)); uerr != nil {
+			return uerr
+		}
 	}
 	if _, uerr := tx.ExecContext(ctx, `UPDATE inodes SET mode = ? WHERE `+s.scope.And(`inode_id = ? AND status = 'CONFIRMED'`),
 		append([]any{mode}, s.scope.Args(inodeID)...)...); uerr != nil {

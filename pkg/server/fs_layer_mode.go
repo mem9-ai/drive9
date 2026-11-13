@@ -358,13 +358,20 @@ const (
 	ownershipLive
 )
 
+// fsLayerOwnedName is one recorded name: what it is and, for a name this commit created,
+// the inode it created there. One value instead of two maps so "owned" and "pinned" cannot
+// desynchronize — a rename carries both fields together.
+type fsLayerOwnedName struct {
+	kind    fsLayerOwnershipKind
+	inodeID string
+}
+
 type fsLayerPlanOwnership struct {
-	kinds  map[string]fsLayerOwnershipKind
-	inodes map[string]string
+	names map[string]fsLayerOwnedName
 }
 
 func newFSLayerPlanOwnership() fsLayerPlanOwnership {
-	return fsLayerPlanOwnership{kinds: map[string]fsLayerOwnershipKind{}, inodes: map[string]string{}}
+	return fsLayerPlanOwnership{names: map[string]fsLayerOwnedName{}}
 }
 
 func trimLayerPath(rawPath string) string {
@@ -376,7 +383,7 @@ func trimLayerPath(rawPath string) string {
 func (o fsLayerPlanOwnership) owns(rawPath string) bool {
 	path := trimLayerPath(rawPath)
 	for name := path; ; {
-		switch o.kinds[name] {
+		switch o.names[name].kind {
 		case ownershipLive:
 			return false
 		case ownershipPlan:
@@ -390,120 +397,100 @@ func (o fsLayerPlanOwnership) owns(rawPath string) bool {
 	}
 }
 
-// own records a name this commit created.
+// createdInode returns the inode this commit recorded at a name, if any.
+func (o fsLayerPlanOwnership) createdInode(rawPath string) string {
+	return o.names[trimLayerPath(rawPath)].inodeID
+}
+
+// own records a name this commit created, keeping any inode already recorded for it.
 func (o fsLayerPlanOwnership) own(rawPath string) {
 	path := trimLayerPath(rawPath)
-	delete(o.inodes, path)
-	o.kinds[path] = ownershipPlan
+	name := o.names[path]
+	name.kind = ownershipPlan
+	o.names[path] = name
 }
 
 // noteCreated records a name this commit created together with the inode it created there.
 func (o fsLayerPlanOwnership) noteCreated(rawPath, inodeID string) {
 	path := trimLayerPath(rawPath)
-	o.kinds[path] = ownershipPlan
-	if inodeID != "" {
-		o.inodes[path] = inodeID
-	}
+	o.names[path] = fsLayerOwnedName{kind: ownershipPlan, inodeID: inodeID}
 }
 
 // markLive records a name that holds a live inode even though an owned ancestor exists.
 func (o fsLayerPlanOwnership) markLive(rawPath string) {
-	path := trimLayerPath(rawPath)
-	delete(o.inodes, path)
-	o.kinds[path] = ownershipLive
+	o.names[trimLayerPath(rawPath)] = fsLayerOwnedName{kind: ownershipLive}
 }
 
 // drop forgets the name and everything below it.
 func (o fsLayerPlanOwnership) drop(rawPath string) {
 	path := trimLayerPath(rawPath)
-	for name := range o.kinds {
+	for name := range o.names {
 		if name == path || strings.HasPrefix(name, path+"/") {
-			delete(o.kinds, name)
-		}
-	}
-	for name := range o.inodes {
-		if name == path || strings.HasPrefix(name, path+"/") {
-			delete(o.inodes, name)
+			delete(o.names, name)
 		}
 	}
 }
 
 // rekey moves every recorded name strictly below oldPrefix to the same relative place
-// below newPrefix. A directory rename carries its subtree, so ownership and live
-// exclusions have to move with it; dropping them is how a live inode gets laundered into a
-// plan-owned directory.
+// below newPrefix, carrying its kind and inode id. A directory rename carries its subtree,
+// so ownership and live exclusions have to move with it; dropping them is how a live inode
+// gets laundered into a plan-owned directory.
 func (o fsLayerPlanOwnership) rekey(oldPrefix, newPrefix string) {
 	if oldPrefix == "" || newPrefix == "" || oldPrefix == newPrefix {
 		return
 	}
-	movedKinds := make(map[string]fsLayerOwnershipKind)
-	for name, kind := range o.kinds {
+	moved := make(map[string]fsLayerOwnedName)
+	for name, recorded := range o.names {
 		suffix, ok := strings.CutPrefix(name, oldPrefix+"/")
 		if !ok {
 			continue
 		}
-		movedKinds[newPrefix+"/"+suffix] = kind
-		delete(o.kinds, name)
+		moved[newPrefix+"/"+suffix] = recorded
+		delete(o.names, name)
 	}
-	for name, kind := range movedKinds {
-		o.kinds[name] = kind
-	}
-	movedInodes := make(map[string]string)
-	for name, id := range o.inodes {
-		suffix, ok := strings.CutPrefix(name, oldPrefix+"/")
-		if !ok {
-			continue
-		}
-		movedInodes[newPrefix+"/"+suffix] = id
-		delete(o.inodes, name)
-	}
-	for name, id := range movedInodes {
-		o.inodes[name] = id
+	for name, recorded := range moved {
+		o.names[name] = recorded
 	}
 }
 
 // noteMove applies a rename or whiteout to the ownership set. A rename carries the names
-// below the source to the target and keeps each one's kind: a name this commit owns stays
-// owned, a moved live inode stays live (so later entries there are compared against it as
-// it is now).
+// below the source to the target and keeps each one's kind and inode id: a name this
+// commit owns stays owned and stays pinned to the inode it created, a moved live inode
+// stays live so later entries there are compared against it as it is now.
 func (o fsLayerPlanOwnership) noteMove(entry *datastore.FSLayerEntry) {
 	if entry == nil {
 		return
 	}
+	source := trimLayerPath(entry.Path)
 	switch entry.Op {
-	case datastore.FSLayerEntryOpRename, datastore.FSLayerEntryOpWhiteout:
+	case datastore.FSLayerEntryOpWhiteout:
+		// A whiteout removes the name and its subtree; it has no target to move.
+		o.drop(source)
+		return
+	case datastore.FSLayerEntryOpRename:
 	default:
 		// Not a move: leave the name alone. Dropping here would forget the creation the
 		// same entry just recorded.
 		return
 	}
-	source := trimLayerPath(entry.Path)
-	target := ""
-	if entry.Op == datastore.FSLayerEntryOpRename {
-		target = trimLayerPath(fsLayerRenameTarget(entry))
-	}
+	target := trimLayerPath(fsLayerRenameTarget(entry))
 	// A self-rename is a backend no-op, so it must not disturb ownership of the name.
-	if target == source {
+	if target == "" || target == source {
 		return
 	}
-	sourceKind := o.kinds[source]
+	sourceName, recorded := o.names[source]
 	// A pre-existing target is replaced by the rename; drop it before re-keying so the
 	// moved subtree is not erased.
 	o.drop(target)
 	o.rekey(source, target)
-	if entry.Op != datastore.FSLayerEntryOpRename || target == "" {
-		o.drop(source)
+	o.drop(source)
+	// The target now holds the source's inode. A source the commit created keeps its kind
+	// and its inode pin; anything else means a live inode moved there.
+	if recorded && sourceName.kind == ownershipPlan {
+		o.names[target] = sourceName
 		return
 	}
-	// The source name itself is now empty; the target holds the source's inode. A source
-	// the commit does not own is a live inode (or absent from live main), so the target is
-	// marked live and later entries there are compared against it.
-	o.drop(source)
-	if sourceKind == ownershipPlan {
-		o.own(target)
-	} else {
-		o.markLive(target)
-	}
+	o.markLive(target)
 }
 
 // createsPath reports whether applying entry will create its path: the commit does not own
@@ -567,7 +554,7 @@ func (o fsLayerPlanOwnership) appliedModeChange(ctx context.Context, b *backendp
 	// A name this commit created is only its own while the inode there is still the one it
 	// recorded; a concurrent rename can park a live inode on the name.
 	if o.owns(path) {
-		if recorded := o.inodes[path]; recorded != "" && recorded == inodeID {
+		if recorded := o.createdInode(path); recorded != "" && recorded == inodeID {
 			return false, inodeID, nil
 		}
 	}
@@ -575,11 +562,9 @@ func (o fsLayerPlanOwnership) appliedModeChange(ctx context.Context, b *backendp
 		// A live inode holds the name: changing its bits needs chmod authority.
 		return true, inodeID, nil
 	}
-	differs, err := fsLayerModesDiffer(ctx, b, path, entry.Mode)
-	if err != nil {
-		return false, "", err
-	}
-	if differs {
+	// Decide from the row already read: a second stat of the name would only add a window
+	// in which a rename could swap the inode the decision is about.
+	if fsLayerNodeMode(nf)&0o777 != entry.Mode&0o777 {
 		return true, inodeID, nil
 	}
 	// The requested mode already matches; it is safe to re-apply to this inode.
