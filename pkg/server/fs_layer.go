@@ -16,13 +16,14 @@ import (
 	"time"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
+	"go.uber.org/zap"
+
 	backendpkg "github.com/mem9-ai/drive9/pkg/backend"
 	"github.com/mem9-ai/drive9/pkg/datastore"
 	"github.com/mem9-ai/drive9/pkg/journal"
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/pathutil"
 	"github.com/mem9-ai/drive9/pkg/s3client"
-	"go.uber.org/zap"
 )
 
 const maxFSLayerBodyBytes = 1 << 20
@@ -1021,53 +1022,42 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 	failCommit := func(rollbackSnapshots []fsLayerBaseSnapshot, event, path string, err error) {
 		rollbackErr := rollbackFSLayerCommit(rollbackCtx, b, rollbackSnapshots)
 		_ = store.SetFSLayerStateIf(rollbackCtx, layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
-		fields := eventFields(r.Context(), event, "error", err)
+		fields := eventFields(r.Context(), event, "layer_id", layer.LayerID, "error", err)
 		if path != "" {
 			fields = append(fields, zap.String("path", path))
 		}
 		if rollbackErr != nil {
-			fields = append(fields, zap.Error(rollbackErr))
+			// A distinct key: reusing "error" would shadow the failure that caused the
+			// rollback in consumers that keep the last duplicate.
+			fields = append(fields, zap.NamedError("rollback_error", rollbackErr))
 		}
 		logger.Error(r.Context(), event, fields...)
 		writeBackendError(w, r, err)
 	}
-	// The path->inode map is materialized here so the apply step can re-verify each
-	// mode-carrying entry against live main at the moment it runs: an owner chmod that
-	// lands mid-commit then refuses the entry instead of being silently reverted.
-	//
-	// Moves replay *before* they are applied. A rename's source has to be stat'ed while it
-	// still names the live inode — replaying afterwards would find it missing and record
-	// the target as a creation, which is exactly the shapes this check exists for.
-	planState := fsLayerPlanState{}
+	// The apply-time guard runs in the world this commit is mutating, so it tracks which
+	// names the commit already owns instead of replaying live-main paths: a live path
+	// recorded before the loop goes stale as soon as the plan moves or replaces the inode
+	// it named. Any entry that creates its path — file, directory, symlink — makes the
+	// commit own that name, so later entries there are creation-mode writes rather than
+	// chmods of an inode this commit just made.
+	ownership := fsLayerPlanOwnership{}
 	for i := range entries {
 		entry := &entries[i]
-		if entry.Op == datastore.FSLayerEntryOpRename || entry.Op == datastore.FSLayerEntryOpWhiteout {
-			if err := planState.replayMove(r.Context(), b, entry); err != nil {
-				failCommit(filterFSLayerSnapshotsForEntries(snapshots, entries[:i]), "fs_layer_commit_apply_failed", entry.Path, err)
-				return
-			}
-		}
-		// A mode-carrying entry that creates its path makes the plan the owner of that
-		// name: later entries at the same path are creation-mode writes, not chmods of
-		// the inode this commit just made.
-		createsPath := false
-		if !canChmod && fsLayerEntryCarriesMode(entry) && entry.Op != datastore.FSLayerEntryOpChmod {
-			node, classifyErr := planState.classify(r.Context(), b, entry.Path)
-			if classifyErr != nil {
-				failCommit(filterFSLayerSnapshotsForEntries(snapshots, entries[:i]), "fs_layer_commit_apply_failed", entry.Path, classifyErr)
-				return
-			}
-			createsPath = node.created || node.vacated
+		willCreate, classifyErr := ownership.createsPath(r.Context(), b, entry)
+		if classifyErr != nil {
+			failCommit(filterFSLayerSnapshotsForEntries(snapshots, entries[:i]), "fs_layer_commit_apply_failed", entry.Path, classifyErr)
+			return
 		}
 		modeMayBeSuperseded := fsLayerEntryModeSuperseded(entries, i)
-		if err := applyFSLayerEntry(r.Context(), b, entry, touchedPaths, fsLayerApplyOptions{modeMayBeSuperseded: modeMayBeSuperseded, canChmod: canChmod, planState: planState}); err != nil {
+		if err := applyFSLayerEntry(r.Context(), b, entry, touchedPaths, fsLayerApplyOptions{modeMayBeSuperseded: modeMayBeSuperseded, canChmod: canChmod, ownership: ownership}); err != nil {
 			failCommit(filterFSLayerSnapshotsForEntries(snapshots, entries[:i]), "fs_layer_commit_apply_failed", entry.Path, err)
 			return
 		}
 		markFSLayerEntryTouched(touchedPaths, entry)
-		if createsPath {
-			planState.recordCreated(entry.Path)
+		if willCreate {
+			ownership.own(entry.Path)
 		}
+		ownership.noteMove(entry)
 	}
 	if err := store.SetFSLayerStateIf(commitCtx, layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateCommitted); err != nil {
 		failCommit(snapshots, "fs_layer_commit_finalize_failed", "", err)
@@ -2267,12 +2257,10 @@ func fsLayerEntryModeSuperseded(entries []datastore.FSLayerEntry, idx int) bool 
 type fsLayerApplyOptions struct {
 	modeMayBeSuperseded bool
 	canChmod            bool
-	// planState is what the names involved in this plan refer to, replayed up to this
-	// entry. applyFSLayerEntry re-runs the decision against it, so a caller cannot apply
-	// permission bits the plan check did not approve — a directory an earlier plan entry
-	// created counts as a creation — and a concurrent owner chmod is caught here instead
-	// of being reverted silently.
-	planState fsLayerPlanState
+	// ownership is the set of names this commit already created. applyFSLayerEntry refuses
+	// permission bits on any name the commit does not own once an owner chmod has changed
+	// them, and allows them on the plan's own creations.
+	ownership fsLayerPlanOwnership
 }
 
 func applyFSLayerEntry(ctx context.Context, b *backendpkg.Dat9Backend, entry *datastore.FSLayerEntry, touched map[string]struct{}, opts fsLayerApplyOptions) error {
@@ -2280,7 +2268,7 @@ func applyFSLayerEntry(ctx context.Context, b *backendpkg.Dat9Backend, entry *da
 		return err
 	}
 	if !opts.canChmod && fsLayerEntryCarriesMode(entry) {
-		changes, err := opts.planState.entryChangesMode(ctx, b, entry)
+		changes, err := opts.ownership.appliedModeChange(ctx, b, entry)
 		if err != nil {
 			return err
 		}

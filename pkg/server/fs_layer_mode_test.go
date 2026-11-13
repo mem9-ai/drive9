@@ -465,6 +465,12 @@ func TestFSLayerScopedCommitAllowsRestylingAPlanCreatedPath(t *testing.T) {
 	s := newTestServer(t)
 	ctx := context.Background()
 	store := s.fallback.Store()
+	if _, err := s.fallback.WriteCtx(ctx, "/zone/rot.txt", []byte("live"), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.fallback.ChmodCtx(ctx, "/zone/rot.txt", 0o644); err != nil {
+		t.Fatal(err)
+	}
 	scoped := &TenantScope{
 		Backend:  s.fallback,
 		IsScoped: true,
@@ -478,6 +484,19 @@ func TestFSLayerScopedCommitAllowsRestylingAPlanCreatedPath(t *testing.T) {
 		{
 			`{"path":"/zone/d/","op":"mkdir","kind":"dir","mode":448}`,
 			`{"path":"/zone/d/","op":"upsert","kind":"dir","mode":493}`,
+		},
+		{
+			// Log rotation: a live inode moves aside, a new file is written at the old
+			// name, and the rotated file keeps its own mode.
+			`{"path":"/zone/rot.txt","op":"rename","kind":"file","content_text":"/zone/rot.txt.1"}`,
+			`{"path":"/zone/rot.txt","op":"upsert","kind":"file","mode":384,"content_text":"fresh"}`,
+			`{"path":"/zone/rot.txt.1","op":"upsert","kind":"file","mode":420,"content_text":"rotated"}`,
+		},
+		{
+			// A symlink is the one creation that carries no mode of its own; a later
+			// entry at its path is still a creation-mode write.
+			`{"path":"/zone/link","op":"symlink","kind":"symlink","content_text":"rot.txt"}`,
+			`{"path":"/zone/link","op":"upsert","kind":"file","mode":384,"content_text":"through"}`,
 		},
 	} {
 		layerID := fmt.Sprintf("layer-restyle-%d", idx)
@@ -494,7 +513,7 @@ func TestFSLayerScopedCommitAllowsRestylingAPlanCreatedPath(t *testing.T) {
 			rr := httptest.NewRecorder()
 			s.handleFSLayerEntryUpsert(rr, req, s.fallback, store, layer)
 			if rr.Code != http.StatusOK {
-				t.Fatalf("scoped staging %s status=%d body=%s, want 200", body, rr.Code, rr.Body.String())
+				t.Fatalf("case %d: scoped staging %s status=%d body=%s, want 200", idx, body, rr.Code, rr.Body.String())
 			}
 		}
 		req := httptest.NewRequest(http.MethodPost, "/v1/layers/"+layerID+"/commit", nil)
@@ -506,7 +525,7 @@ func TestFSLayerScopedCommitAllowsRestylingAPlanCreatedPath(t *testing.T) {
 		}
 		s.handleFSLayerCommit(rr, req, s.fallback, store, layer)
 		if rr.Code != http.StatusOK {
-			t.Fatalf("scoped commit of a restyled plan status=%d body=%s, want 200", rr.Code, rr.Body.String())
+			t.Fatalf("case %d: scoped commit of a restyled plan status=%d body=%s, want 200", idx, rr.Code, rr.Body.String())
 		}
 	}
 	nf, err := s.fallback.StatNodeCtx(ctx, "/zone/a.txt")
@@ -516,12 +535,75 @@ func TestFSLayerScopedCommitAllowsRestylingAPlanCreatedPath(t *testing.T) {
 	if nf.Mode&0o777 != 0o600 {
 		t.Fatalf("restyled file mode = %o, want 600", nf.Mode&0o777)
 	}
+	// The rotation kept the live inode's mode and gave the new file the requested one.
+	if nf, err = s.fallback.StatNodeCtx(ctx, "/zone/rot.txt.1"); err != nil {
+		t.Fatal(err)
+	}
+	if got := fsLayerNodeMode(nf) & 0o777; got != 0o644 {
+		t.Fatalf("rotated file mode = %o, want the live 644", got)
+	}
+	if nf, err = s.fallback.StatNodeCtx(ctx, "/zone/rot.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if got := fsLayerNodeMode(nf) & 0o777; got != 0o600 {
+		t.Fatalf("recreated log file mode = %o, want 600", got)
+	}
+	// The symlink's path was plan-created too, so the write after it is a creation mode.
+	if nf, err = s.fallback.StatNodeCtx(ctx, "/zone/link"); err != nil {
+		t.Fatal(err)
+	}
+	if got := fsLayerNodeMode(nf) & 0o777; got != 0o600 {
+		t.Fatalf("symlink-path write mode = %o, want 600", got)
+	}
 	nf, err = s.fallback.StatNodeCtx(ctx, "/zone/d")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got := fsLayerNodeMode(nf) & 0o777; got != 0o755 {
 		t.Fatalf("restyled dir mode = %o, want 755", got)
+	}
+}
+
+// The apply-time guard compares a renamed live inode as it is now, not the path it used
+// to have: otherwise the drift check would be vacuous for exactly the shapes it exists
+// for.
+func TestFSLayerAppliedModeChangeFollowsRenamedInode(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	if _, err := s.fallback.WriteCtx(ctx, "/zone/a.txt", []byte("live"), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.fallback.RenameCtx(ctx, "/zone/a.txt", "/zone/b.txt"); err != nil {
+		t.Fatal(err)
+	}
+	ownership := fsLayerPlanOwnership{}
+	ownership.noteMove(&datastore.FSLayerEntry{Path: "/zone/a.txt", Op: datastore.FSLayerEntryOpRename, Kind: datastore.FSLayerEntryKindFile, ContentText: "/zone/b.txt"})
+	if ownership.owns("/zone/b.txt") {
+		t.Fatal("a rename of a live inode made the target plan-owned")
+	}
+	changes, err := ownership.appliedModeChange(ctx, s.fallback, &datastore.FSLayerEntry{Path: "/zone/b.txt", Op: datastore.FSLayerEntryOpUpsert, Mode: 0o777})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changes {
+		t.Fatal("a mode change on the renamed live inode was not detected")
+	}
+	// Once the commit owns the name, there is no live inode to protect.
+	ownership.own("/zone/b.txt")
+	changes, err = ownership.appliedModeChange(ctx, s.fallback, &datastore.FSLayerEntry{Path: "/zone/b.txt", Op: datastore.FSLayerEntryOpUpsert, Mode: 0o777})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changes {
+		t.Fatal("a plan-owned name was still treated as a live inode")
+	}
+	// A chmod on a path the commit does not own and live main does not have is a no-op.
+	changes, err = ownership.appliedModeChange(ctx, s.fallback, &datastore.FSLayerEntry{Path: "/zone/missing.txt", Op: datastore.FSLayerEntryOpChmod, Mode: 0o700})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changes {
+		t.Fatal("a chmod of a missing path was reported as a live change")
 	}
 }
 

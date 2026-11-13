@@ -18,13 +18,20 @@ import (
 // not exist yet is a creation mode, which the same token may already set through create
 // and mkdir.
 //
-// What a path names at a given point in the plan is not live main: a rename moves an
-// inode and takes its name away, a whiteout removes one, and a rename into a path an
-// earlier entry vacated re-occupies it. So the policy replays the plan's rename/whiteout
-// entries — and only those; their content is irrelevant — into a map from path to the
-// live-main inode that name now refers to, and decides each mode-carrying entry against
-// that view. Entry write, commit scan and apply-time guard all use this one simulation so
-// they cannot disagree.
+// There are two worlds, and conflating them is how the checks drift:
+//
+//   - Before anything applies, a rename moves an inode and takes its name away, a
+//     whiteout removes one, and a rename into a path an earlier entry vacated re-occupies
+//     it. The entry gate and the commit scan both decide in this world, replaying the
+//     plan's rename/whiteout entries — only those; their content is irrelevant — into
+//     fsLayerPlanState, a map from path to the live-main inode that name refers to.
+//   - The commit loop runs in a world it is itself mutating. A live-main path recorded
+//     above is stale there, so the apply-time guard does not reuse it: it asks only
+//     whether the commit already owns the name (fsLayerPlanOwnership) and, when it does
+//     not, compares against the path as it is right now.
+//
+// Both are needed: the first authorizes the plan before any mutation, the second refuses
+// an entry whose live inode changed since that decision.
 
 // errChmodForbidden is the apply-time twin of the HTTP-layer chmod denial: a layer entry
 // reached the backend that would change an existing path's permission bits and the
@@ -165,8 +172,7 @@ func fsLayerNodePath(nf *datastore.NodeWithFile, fallback string) string {
 }
 
 // classify reports what path names after the moves replayed so far, falling back to live
-// main once. A path live main does not have is a plan creation, which is the fact the
-// commit loop also records when the entry actually creates it.
+// main once. A path live main does not have is a creation.
 func (st fsLayerPlanState) classify(ctx context.Context, b *backendpkg.Dat9Backend, rawPath string) (fsLayerPlanNode, error) {
 	if node, ok := st.resolve(rawPath); ok {
 		return node, nil
@@ -182,16 +188,10 @@ func (st fsLayerPlanState) classify(ctx context.Context, b *backendpkg.Dat9Backe
 	return fsLayerPlanNode{livePath: fsLayerNodePath(nf, path)}, nil
 }
 
-// recordCreated marks a name the plan itself owns, so a later entry at the same path is a
-// creation-mode write rather than a chmod of the inode the commit just made.
-func (st fsLayerPlanState) recordCreated(rawPath string) {
-	st[strings.TrimSuffix(rawPath, "/")] = fsLayerPlanNode{created: true}
-}
-
-// entryChangesMode reports whether entry, executed after the moves replayed so far,
-// would change an existing path's permission bits. This is the only place the decision is
-// written: the entry gate, the commit scan and the apply-time re-check all call it with
-// the same state, so they cannot drift.
+// entryChangesMode reports whether entry, executed after the moves replayed so far, would
+// change an existing path's permission bits. The entry gate and the commit scan decide
+// with it. It is *not* the apply-time guard: that one runs in a world this commit is
+// mutating, and uses fsLayerPlanOwnership instead.
 func (st fsLayerPlanState) entryChangesMode(ctx context.Context, b *backendpkg.Dat9Backend, entry *datastore.FSLayerEntry) (bool, error) {
 	if b == nil || !fsLayerEntryCarriesMode(entry) {
 		return false, nil
@@ -204,8 +204,9 @@ func (st fsLayerPlanState) entryChangesMode(ctx context.Context, b *backendpkg.D
 		return false, nil
 	}
 	if entry.Op == datastore.FSLayerEntryOpChmod {
-		// A mode-only entry names a path the plan has not created, so it changes that
-		// live inode's bits.
+		// A mode-only entry names a path the plan has not created, so whatever live inode
+		// is there loses its bits. A path live main does not have is not a live inode, and
+		// the apply step tolerates the missing target.
 		return true, nil
 	}
 	return fsLayerModesDiffer(ctx, b, node.livePath, entry.Mode)
@@ -314,4 +315,120 @@ func (s *Server) authorizeFSLayerEntryMode(w http.ResponseWriter, r *http.Reques
 		return false
 	}
 	return true
+}
+
+// fsLayerPlanOwnership is the apply-time view: the names this commit created (or moved a
+// created inode into). It never stores a live path, because the world it is consulted in
+// is the one the commit is mutating — a recorded live path goes stale the moment the
+// plan moves or overwrites the inode it named.
+type fsLayerPlanOwnership map[string]struct{}
+
+func trimLayerPath(rawPath string) string {
+	return strings.TrimSuffix(rawPath, "/")
+}
+
+// owns reports whether the commit owns the name or any ancestor of it: everything below a
+// directory this commit created is a creation too.
+func (o fsLayerPlanOwnership) owns(rawPath string) bool {
+	path := trimLayerPath(rawPath)
+	for name := path; ; {
+		if _, ok := o[name]; ok {
+			return true
+		}
+		idx := strings.LastIndex(name, "/")
+		if idx <= 0 {
+			return false
+		}
+		name = name[:idx]
+	}
+}
+
+// own records a name this commit created.
+func (o fsLayerPlanOwnership) own(rawPath string) {
+	o[trimLayerPath(rawPath)] = struct{}{}
+}
+
+// drop forgets the name and everything below it.
+func (o fsLayerPlanOwnership) drop(rawPath string) {
+	path := trimLayerPath(rawPath)
+	for name := range o {
+		if name == path || strings.HasPrefix(name, path+"/") {
+			delete(o, name)
+		}
+	}
+}
+
+// noteMove applies a rename or whiteout to the ownership set. A rename of a name this
+// commit owns moves the ownership; a rename of a live inode leaves the target unowned, so
+// later entries there are compared against that live inode as it is now.
+func (o fsLayerPlanOwnership) noteMove(entry *datastore.FSLayerEntry) {
+	if entry == nil {
+		return
+	}
+	switch entry.Op {
+	case datastore.FSLayerEntryOpRename, datastore.FSLayerEntryOpWhiteout:
+	default:
+		// Not a move: leave the name alone. Dropping here would forget the creation the
+		// same entry just recorded.
+		return
+	}
+	owned := o.owns(entry.Path)
+	o.drop(entry.Path)
+	if entry.Op != datastore.FSLayerEntryOpRename {
+		return
+	}
+	target := trimLayerPath(fsLayerRenameTarget(entry))
+	if target == "" || target == trimLayerPath(entry.Path) {
+		return
+	}
+	o.drop(target)
+	if owned {
+		o.own(target)
+	}
+}
+
+// createsPath reports whether applying entry will create its path: the commit does not own
+// the name and live main has nothing there. A whiteout/rename/chmod never creates.
+func (o fsLayerPlanOwnership) createsPath(ctx context.Context, b *backendpkg.Dat9Backend, entry *datastore.FSLayerEntry) (bool, error) {
+	if entry == nil || b == nil {
+		return false, nil
+	}
+	switch entry.Op {
+	case datastore.FSLayerEntryOpUpsert, datastore.FSLayerEntryOpMkdir, datastore.FSLayerEntryOpSymlink:
+	default:
+		return false, nil
+	}
+	if o.owns(entry.Path) {
+		return false, nil
+	}
+	_, err := b.StatNodeCtx(ctx, trimLayerPath(entry.Path))
+	if errors.Is(err, datastore.ErrNotFound) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+// appliedModeChange reports whether applying entry now would change the permission bits of
+// an inode this commit does not own — the drift check for an owner chmod landing between
+// the plan scan and this entry. A path this commit created, or that sits under one, has no
+// live inode to protect.
+func (o fsLayerPlanOwnership) appliedModeChange(ctx context.Context, b *backendpkg.Dat9Backend, entry *datastore.FSLayerEntry) (bool, error) {
+	if b == nil || !fsLayerEntryCarriesMode(entry) || o.owns(entry.Path) {
+		return false, nil
+	}
+	if entry.Op == datastore.FSLayerEntryOpChmod {
+		// Nothing to change when the plan has not put anything at this path.
+		_, err := b.StatNodeCtx(ctx, trimLayerPath(entry.Path))
+		if errors.Is(err, datastore.ErrNotFound) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	return fsLayerModesDiffer(ctx, b, trimLayerPath(entry.Path), entry.Mode)
 }
