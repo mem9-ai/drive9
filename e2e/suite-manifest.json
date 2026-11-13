@@ -22,6 +22,13 @@
       "owner_hint": "cli",
       "failure_class": "correctness"
     },
+    "fixed-view-contracts": {
+      "title": "Fixed-view offline contracts",
+      "product_area": "filesystem",
+      "product_promise": "Fixed-view HTTP and mount driver contracts pass offline; live paired acceptance runs in server CI",
+      "owner_hint": "fs",
+      "failure_class": "correctness"
+    },
     "layer-fs-smoke": {
       "title": "Layer FS smoke",
       "product_area": "filesystem",
