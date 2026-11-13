@@ -159,6 +159,43 @@ func TestSyncWithoutDataUploadDoesNotInventLanding(t *testing.T) {
 	}
 }
 
+// A chmod denied with 403 means the token may never change permission bits (an fs_scoped
+// mount), so retrying cannot succeed: the upload is acknowledged and only the mode is
+// dropped. Any other failure stays retryable and keeps the mode pending.
+func TestUploadSyncChmodForbiddenDropsMode(t *testing.T) {
+	b := testbackend.NewBackend()
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Has("chmod") {
+			http.Error(w, `{"error":"chmod is owner-only"}`, http.StatusForbidden)
+			return
+		}
+		b.ServeHTTP(w, r)
+	})
+	cache, err := staging.NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, wb := newUploadStack(t, handler, Options{Policy: PolicyWriteBack, WriteCache: cache})
+	stopSSETestWriteback(t, wb)
+	ctx := context.Background()
+	if err := cache.PutWithBaseRevAndMode("/f", []byte("data"), 4, staging.PendingNew, 0, 0o600, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wb.uploader.UploadSyncWithRevision(ctx, "/f"); err != nil {
+		t.Fatalf("a forbidden chmod must not fail the upload: %v", err)
+	}
+	node, exists := b.Node("/f")
+	if !exists || string(node.Data) != "data" {
+		t.Fatalf("content did not commit: %+v exists=%v", node, exists)
+	}
+	if node.Mode&0o777 == 0o600 {
+		t.Fatalf("denied mode was applied: %o", node.Mode&0o777)
+	}
+	if marker, exists := cache.GetMeta("/f"); exists && marker.Kind == staging.PendingChmod {
+		t.Fatalf("a forbidden chmod left a retry marker: %+v", marker)
+	}
+}
+
 func TestUploadSyncNoDataOutcomeMetadata(t *testing.T) {
 	for _, kind := range []string{"no-cache", "chmod-only"} {
 		t.Run(kind, func(t *testing.T) {
@@ -169,7 +206,7 @@ func TestUploadSyncNoDataOutcomeMetadata(t *testing.T) {
 			rejectMode.Store(true)
 			handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Query().Has("chmod") && rejectMode.Load() {
-					http.Error(w, "chmod denied", http.StatusForbidden)
+					http.Error(w, "chmod denied", http.StatusInternalServerError)
 					return
 				}
 				b.ServeHTTP(w, r)
@@ -233,7 +270,7 @@ func TestCreateChmodRetrySyncDoesNotRepublishContent(t *testing.T) {
 			rejectMode.Store(true)
 			handler := recorder.wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Query().Has("chmod") && rejectMode.Load() {
-					http.Error(w, "chmod denied", http.StatusForbidden)
+					http.Error(w, "chmod denied", http.StatusInternalServerError)
 					return
 				}
 				b.ServeHTTP(w, r)

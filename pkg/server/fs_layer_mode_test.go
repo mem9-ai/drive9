@@ -243,6 +243,19 @@ func TestFSLayerModeChangeRespectsPlanOrder(t *testing.T) {
 	if !decide(whiteout("/x/f.txt"), rename("/x/g.txt", "/x/f.txt"), upsert("/x/f.txt", 0o644)) {
 		t.Fatal("a rename into a vacated path lost its live inode identity")
 	}
+	// A self-rename is a backend no-op, so the path keeps its live inode and an upsert
+	// with a different mode is a change.
+	if !decide(rename("/x/f.txt", "/x/f.txt"), upsert("/x/f.txt", 0o644)) {
+		t.Fatal("a self-rename vacated its own path and masked a live mode change")
+	}
+	if !decide(rename("/x/f.txt", "/x/f.txt"), datastore.FSLayerEntry{Path: "/x/f.txt", Op: datastore.FSLayerEntryOpChmod, Mode: 0o644}) {
+		t.Fatal("a self-rename masked a chmod of a live inode")
+	}
+	// Two sources renamed into one target: the second replaces the first, so the final
+	// name holds /x/g.txt's live inode and compares against that.
+	if !decide(rename("/x/f.txt", "/x/t.txt"), rename("/x/g.txt", "/x/t.txt"), upsert("/x/t.txt", 0o644)) {
+		t.Fatal("the last rename into a shared target did not define the inode")
+	}
 	// The mode already matches, so nothing changes.
 	if decide(rename("/x/f.txt", "/x/g.txt"), upsert("/x/g.txt", 0o600)) {
 		t.Fatal("a matching mode was reported as a change")
@@ -294,6 +307,163 @@ func TestFSLayerEntryWriteAllowsVacatedPathForScopedToken(t *testing.T) {
 	}
 	if got := post(scoped, `{"path":"/zone/f.txt","op":"upsert","kind":"file","content_text":"new"}`); got != http.StatusOK {
 		t.Fatalf("scoped upsert at the vacated path status=%d, want 200", got)
+	}
+}
+
+// The blocking case from the review, end to end: a self-rename is a backend no-op, so a
+// scoped token must not be able to stage it and then rewrite the live file's mode under
+// the cover of "the path was vacated".
+func TestFSLayerSelfRenameCannotMaskModeChange(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	store := s.fallback.Store()
+	if _, err := s.fallback.WriteCtx(ctx, "/zone/f.txt", []byte("live"), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.fallback.ChmodCtx(ctx, "/zone/f.txt", 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateFSLayer(ctx, &datastore.FSLayer{LayerID: "layer-self", BaseRootPath: "/zone"}); err != nil {
+		t.Fatal(err)
+	}
+	layer, err := store.GetFSLayer(ctx, "layer-self")
+	if err != nil {
+		t.Fatal(err)
+	}
+	scoped := &TenantScope{
+		Backend:  s.fallback,
+		IsScoped: true,
+		FSScopes: []FSScope{{Prefix: "/zone", Ops: map[FSOp]bool{FSOpRead: true, FSOpWrite: true, FSOpDelete: true}}},
+	}
+	owner := &TenantScope{Backend: s.fallback}
+	post := func(scope *TenantScope, body string) int {
+		req := httptest.NewRequest(http.MethodPost, "/v1/layers/layer-self/entries", bytes.NewReader([]byte(body)))
+		req = req.WithContext(withScope(req.Context(), scope))
+		rr := httptest.NewRecorder()
+		s.handleFSLayerEntryUpsert(rr, req, s.fallback, store, layer)
+		return rr.Code
+	}
+	if got := post(owner, `{"path":"/zone/f.txt","op":"rename","kind":"file","content_text":"/zone/f.txt"}`); got != http.StatusOK {
+		t.Fatalf("owner self-rename status=%d, want 200", got)
+	}
+	// The upsert names a different mode for a path the self-rename left untouched.
+	if got := post(scoped, `{"path":"/zone/f.txt","op":"upsert","kind":"file","mode":511,"content_text":"new"}`); got != http.StatusForbidden {
+		t.Fatalf("scoped upsert after a self-rename status=%d, want 403", got)
+	}
+	if got := post(scoped, `{"path":"/zone/f.txt","op":"chmod","kind":"file","mode":511}`); got != http.StatusForbidden {
+		t.Fatalf("scoped chmod after a self-rename status=%d, want 403", got)
+	}
+	nf, err := s.fallback.StatNodeCtx(ctx, "/zone/f.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nf.Mode&0o777 != 0o600 {
+		t.Fatalf("live mode = %o, want 600", nf.Mode&0o777)
+	}
+	// A scoped commit of an owner-staged self-rename plan is refused as well.
+	ownerLayer := datastore.FSLayer{LayerID: "layer-self-commit", BaseRootPath: "/zone"}
+	if err := store.CreateFSLayer(ctx, &ownerLayer); err != nil {
+		t.Fatal(err)
+	}
+	commitLayer, err := store.GetFSLayer(ctx, "layer-self-commit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	postTo := func(scope *TenantScope, layer *datastore.FSLayer, body string) int {
+		req := httptest.NewRequest(http.MethodPost, "/v1/layers/"+layer.LayerID+"/entries", bytes.NewReader([]byte(body)))
+		req = req.WithContext(withScope(req.Context(), scope))
+		rr := httptest.NewRecorder()
+		s.handleFSLayerEntryUpsert(rr, req, s.fallback, store, layer)
+		return rr.Code
+	}
+	if got := postTo(owner, commitLayer, `{"path":"/zone/f.txt","op":"rename","kind":"file","content_text":"/zone/f.txt"}`); got != http.StatusOK {
+		t.Fatalf("owner self-rename on commit layer status=%d", got)
+	}
+	if got := postTo(owner, commitLayer, `{"path":"/zone/f.txt","op":"chmod","kind":"file","mode":511}`); got != http.StatusOK {
+		t.Fatalf("owner chmod entry status=%d", got)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/layers/layer-self-commit/commit", nil)
+	req = req.WithContext(withScope(req.Context(), scoped))
+	rr := httptest.NewRecorder()
+	commitLayer, err = store.GetFSLayer(ctx, "layer-self-commit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.handleFSLayerCommit(rr, req, s.fallback, store, commitLayer)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("scoped commit of a self-rename plan status=%d body=%s, want 403", rr.Code, rr.Body.String())
+	}
+}
+
+// The chain/reoccupy families are also refused through the real commit handler, not only
+// at the predicate: a scoped token committing an owner-staged two-hop rename plan that
+// ends on a live inode's mode gets 403.
+func TestFSLayerScopedCommitRefusesRenameChainModeChange(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	store := s.fallback.Store()
+	if _, err := s.fallback.WriteCtx(ctx, "/zone/f.txt", []byte("live"), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.fallback.ChmodCtx(ctx, "/zone/f.txt", 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateFSLayer(ctx, &datastore.FSLayer{LayerID: "layer-chain", BaseRootPath: "/zone"}); err != nil {
+		t.Fatal(err)
+	}
+	layer, err := store.GetFSLayer(ctx, "layer-chain")
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := &TenantScope{Backend: s.fallback}
+	post := func(body string) int {
+		req := httptest.NewRequest(http.MethodPost, "/v1/layers/layer-chain/entries", bytes.NewReader([]byte(body)))
+		req = req.WithContext(withScope(req.Context(), owner))
+		rr := httptest.NewRecorder()
+		s.handleFSLayerEntryUpsert(rr, req, s.fallback, store, layer)
+		return rr.Code
+	}
+	if got := post(`{"path":"/zone/f.txt","op":"rename","kind":"file","content_text":"/zone/g.txt"}`); got != http.StatusOK {
+		t.Fatalf("owner rename 1 status=%d", got)
+	}
+	if got := post(`{"path":"/zone/g.txt","op":"rename","kind":"file","content_text":"/zone/h.txt"}`); got != http.StatusOK {
+		t.Fatalf("owner rename 2 status=%d", got)
+	}
+	if got := post(`{"path":"/zone/h.txt","op":"upsert","kind":"file","mode":511,"content_text":"new"}`); got != http.StatusOK {
+		t.Fatalf("owner upsert at the chain end status=%d", got)
+	}
+	scoped := &TenantScope{
+		Backend:  s.fallback,
+		IsScoped: true,
+		FSScopes: []FSScope{{Prefix: "/zone", Ops: map[FSOp]bool{FSOpRead: true, FSOpWrite: true, FSOpDelete: true}}},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/layers/layer-chain/commit", nil)
+	req = req.WithContext(withScope(req.Context(), scoped))
+	rr := httptest.NewRecorder()
+	layer, err = store.GetFSLayer(ctx, "layer-chain")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.handleFSLayerCommit(rr, req, s.fallback, store, layer)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("scoped commit of a rename-chain mode change status=%d body=%s, want 403", rr.Code, rr.Body.String())
+	}
+	nf, err := s.fallback.StatNodeCtx(ctx, "/zone/f.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nf.Mode&0o777 != 0o600 {
+		t.Fatalf("live mode = %o, want 600", nf.Mode&0o777)
+	}
+}
+
+// A body that names op=mkdir without a kind is a directory for the store, so it has to be
+// one for the default mode too: 0644 would create an untraversable directory.
+func TestFSLayerKindlessMkdirDefaultsToDirMode(t *testing.T) {
+	entry := datastore.FSLayerEntry{Path: "/zone/d/", Op: datastore.FSLayerEntryOpMkdir}
+	defaultFSLayerEntryMode(&entry)
+	if entry.Mode != datastore.FSLayerDefaultDirMode {
+		t.Fatalf("kindless mkdir mode = %o, want %o", entry.Mode, datastore.FSLayerDefaultDirMode)
 	}
 }
 

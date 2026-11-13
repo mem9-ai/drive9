@@ -41,7 +41,9 @@ func defaultFSLayerEntryMode(entry *datastore.FSLayerEntry) {
 		return
 	}
 	entry.Mode = datastore.FSLayerDefaultFileMode
-	if entry.Kind == datastore.FSLayerEntryKindDir {
+	// The store derives Kind from Op before its own default, so `op=mkdir` with no kind is
+	// a directory there and must be one here too.
+	if entry.Kind == datastore.FSLayerEntryKindDir || entry.Op == datastore.FSLayerEntryOpMkdir {
 		entry.Mode = datastore.FSLayerDefaultDirMode
 	}
 }
@@ -123,6 +125,14 @@ func (st fsLayerPlanState) applyMove(ctx context.Context, b *backendpkg.Dat9Back
 		// A rename without a target moves nothing.
 		return nil
 	}
+	if target == source {
+		// Every layer rename target is validated to be a canonical path, so source ==
+		// target is a legal request. The backend answers it as a successful no-op
+		// (RenameFileNoReplaceCtx returns early, preflightFSLayerRename allows it), so
+		// the path keeps its inode: marking it vacated here would classify the next
+		// upsert as a creation and let a scoped token chmod a live file.
+		return nil
+	}
 	resolved, ok := st.resolve(source)
 	if !ok {
 		// First mention of the source: ask live main what it holds. A source the plan
@@ -154,19 +164,15 @@ func fsLayerNodePath(nf *datastore.NodeWithFile, fallback string) string {
 	return fallback
 }
 
-// fsLayerEntryModeChange reports whether entry, executed after moves, would change an
-// existing path's permission bits.
-func fsLayerEntryModeChange(ctx context.Context, b *backendpkg.Dat9Backend, moves []datastore.FSLayerPlanMove, entry *datastore.FSLayerEntry) (bool, error) {
+// entryChangesMode reports whether entry, executed after the moves replayed so far,
+// would change an existing path's permission bits. This is the only place the decision is
+// written: the entry gate, the commit scan and the apply-time re-check all call it with
+// the same state, so they cannot drift.
+func (st fsLayerPlanState) entryChangesMode(ctx context.Context, b *backendpkg.Dat9Backend, entry *datastore.FSLayerEntry) (bool, error) {
 	if b == nil || !fsLayerEntryCarriesMode(entry) {
 		return false, nil
 	}
-	state := fsLayerPlanState{}
-	for _, move := range moves {
-		if err := state.applyMove(ctx, b, move); err != nil {
-			return false, err
-		}
-	}
-	node, ok := state.resolve(entry.Path)
+	node, ok := st.resolve(entry.Path)
 	if ok && (node.created || node.vacated) {
 		return false, nil
 	}
@@ -179,6 +185,26 @@ func fsLayerEntryModeChange(ctx context.Context, b *backendpkg.Dat9Backend, move
 		return true, nil
 	}
 	return fsLayerModesDiffer(ctx, b, node.livePath, entry.Mode)
+}
+
+// replayMove advances the state past one entry, for callers walking a plan.
+func (st fsLayerPlanState) replayMove(ctx context.Context, b *backendpkg.Dat9Backend, entry *datastore.FSLayerEntry) error {
+	if entry == nil {
+		return nil
+	}
+	return st.applyMove(ctx, b, fslayerMoveFor(entry))
+}
+
+// fsLayerEntryModeChange reports whether entry, executed after moves, would change an
+// existing path's permission bits.
+func fsLayerEntryModeChange(ctx context.Context, b *backendpkg.Dat9Backend, moves []datastore.FSLayerPlanMove, entry *datastore.FSLayerEntry) (bool, error) {
+	state := fsLayerPlanState{}
+	for _, move := range moves {
+		if err := state.applyMove(ctx, b, move); err != nil {
+			return false, err
+		}
+	}
+	return state.entryChangesMode(ctx, b, entry)
 }
 
 // fsLayerModesDiffer reports whether the live inode at livePath has permission bits other
@@ -200,28 +226,15 @@ func fsLayerPlanChangesExistingMode(ctx context.Context, b *backendpkg.Dat9Backe
 	state := fsLayerPlanState{}
 	for i := range entries {
 		entry := &entries[i]
-		if !fsLayerEntryCarriesMode(entry) {
-			if err := state.applyMove(ctx, b, fslayerMoveFor(entry)); err != nil {
-				return false, err
-			}
-			continue
-		}
-		node, ok := state.resolve(entry.Path)
-		if ok && (node.created || node.vacated) {
-			continue
-		}
-		if !ok {
-			node = fsLayerPlanNode{livePath: strings.TrimSuffix(entry.Path, "/")}
-		}
-		if entry.Op == datastore.FSLayerEntryOpChmod {
-			return true, nil
-		}
-		differs, err := fsLayerModesDiffer(ctx, b, node.livePath, entry.Mode)
+		changes, err := state.entryChangesMode(ctx, b, entry)
 		if err != nil {
 			return false, err
 		}
-		if differs {
+		if changes {
 			return true, nil
+		}
+		if err := state.replayMove(ctx, b, entry); err != nil {
+			return false, err
 		}
 	}
 	return false, nil

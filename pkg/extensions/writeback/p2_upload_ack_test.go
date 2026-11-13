@@ -290,7 +290,7 @@ func TestChmodOnlyConsumerAcknowledgesNewCreate(t *testing.T) {
 	bus.On(fs.EventLanded, func(fs.Event) { contentEvents.Add(1) })
 	chain, wb := newUploadStack(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Has("chmod") && rejectMode.Load() {
-			http.Error(w, "chmod denied", http.StatusForbidden)
+			http.Error(w, "chmod denied", http.StatusInternalServerError)
 			return
 		}
 		backend.ServeHTTP(w, r)
@@ -356,7 +356,7 @@ func TestFailedChmodAcknowledgesActualRevisionBeforeForeignWrite(t *testing.T) {
 			}
 			chain, wb := newUploadStack(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Query().Has("chmod") && rejectMode.Load() {
-					http.Error(w, "chmod denied", http.StatusForbidden)
+					http.Error(w, "chmod denied", http.StatusInternalServerError)
 					return
 				}
 				backend.ServeHTTP(w, r)

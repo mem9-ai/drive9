@@ -963,7 +963,6 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 	// entry is applied, is what keeps a denial from becoming a mid-commit rollback. The
 	// deferred guard above leaves the layer conflicted on this return.
 	canChmod := ScopeFromContext(r.Context()).CanChmod()
-	modeAuthorized := canChmod
 	if !canChmod {
 		changesMode, err := fsLayerPlanChangesExistingMode(r.Context(), b, entries)
 		if err != nil {
@@ -974,7 +973,6 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 			errJSON(w, http.StatusForbidden, chmodOwnerOnlyMessage)
 			return
 		}
-		modeAuthorized = true
 	}
 	conflicts := preflightFSLayerCommit(r.Context(), b, entries, false)
 	if len(conflicts) > 0 {
@@ -1016,9 +1014,13 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 	rollbackCtx, rollbackCancel := context.WithTimeout(context.WithoutCancel(r.Context()), fsLayerRollbackTimeout)
 	defer rollbackCancel()
 	touchedPaths := make(map[string]struct{})
+	// The path->inode map is materialized here so the apply step can re-verify each
+	// mode-carrying entry against live main at the moment it runs: an owner chmod that
+	// lands mid-commit then refuses the entry instead of being silently reverted.
+	planState := fsLayerPlanState{}
 	for i := range entries {
 		modeMayBeSuperseded := fsLayerEntryModeSuperseded(entries, i)
-		if err := applyFSLayerEntry(r.Context(), b, &entries[i], touchedPaths, fsLayerApplyOptions{modeMayBeSuperseded: modeMayBeSuperseded, canChmod: canChmod, modeAuthorized: modeAuthorized}); err != nil {
+		if err := applyFSLayerEntry(r.Context(), b, &entries[i], touchedPaths, fsLayerApplyOptions{modeMayBeSuperseded: modeMayBeSuperseded, canChmod: canChmod, planState: planState}); err != nil {
 			rollbackErr := rollbackFSLayerCommit(rollbackCtx, b, filterFSLayerSnapshotsForEntries(snapshots, entries[:i]))
 			_ = store.SetFSLayerStateIf(rollbackCtx, layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
 			if rollbackErr != nil {
@@ -1031,6 +1033,17 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 			return
 		}
 		markFSLayerEntryTouched(touchedPaths, &entries[i])
+		if err := planState.replayMove(r.Context(), b, &entries[i]); err != nil {
+			rollbackErr := rollbackFSLayerCommit(rollbackCtx, b, filterFSLayerSnapshotsForEntries(snapshots, entries[:i+1]))
+			_ = store.SetFSLayerStateIf(rollbackCtx, layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
+			if rollbackErr != nil {
+				logger.Error(r.Context(), "fs_layer_commit_apply_failed", eventFields(r.Context(), "fs_layer_commit_apply_failed", "path", entries[i].Path, "error", err, "rollback_error", rollbackErr)...)
+				writeBackendError(w, r, err)
+				return
+			}
+			writeBackendError(w, r, err)
+			return
+		}
 	}
 	if err := store.SetFSLayerStateIf(commitCtx, layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateCommitted); err != nil {
 		rollbackErr := rollbackFSLayerCommit(rollbackCtx, b, snapshots)
@@ -2238,20 +2251,26 @@ func fsLayerEntryModeSuperseded(entries []datastore.FSLayerEntry, idx int) bool 
 type fsLayerApplyOptions struct {
 	modeMayBeSuperseded bool
 	canChmod            bool
-	// modeAuthorized marks an entry whose mode application the plan-aware check
-	// approved: either the caller may chmod, or the plan-wide check passed and this
-	// entry's mode is a creation mode. applyFSLayerEntry refuses permission bits it was
-	// not handed authority for, so a caller that skips the plan check cannot apply one
-	// silently — and a directory an earlier plan entry created is a creation too.
-	modeAuthorized bool
+	// planState is what the names involved in this plan refer to, replayed up to this
+	// entry. applyFSLayerEntry re-runs the decision against it, so a caller cannot apply
+	// permission bits the plan check did not approve — a directory an earlier plan entry
+	// created counts as a creation — and a concurrent owner chmod is caught here instead
+	// of being reverted silently.
+	planState fsLayerPlanState
 }
 
 func applyFSLayerEntry(ctx context.Context, b *backendpkg.Dat9Backend, entry *datastore.FSLayerEntry, touched map[string]struct{}, opts fsLayerApplyOptions) error {
 	if err := ensureFSLayerEntryBaseStillMatches(ctx, b, entry, touched); err != nil {
 		return err
 	}
-	if !opts.canChmod && fsLayerEntryCarriesMode(entry) && !opts.modeAuthorized {
-		return errChmodForbidden
+	if !opts.canChmod && fsLayerEntryCarriesMode(entry) {
+		changes, err := opts.planState.entryChangesMode(ctx, b, entry)
+		if err != nil {
+			return err
+		}
+		if changes {
+			return errChmodForbidden
+		}
 	}
 	switch entry.Op {
 	case datastore.FSLayerEntryOpUpsert:
