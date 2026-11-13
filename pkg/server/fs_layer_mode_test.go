@@ -280,12 +280,14 @@ func TestFSLayerModeChangeRespectsPlanOrder(t *testing.T) {
 	if decide(rename("/x/f.txt", "/x/g.txt"), upsert("/x/g.txt", 0o600)) {
 		t.Fatal("a matching mode was reported as a change")
 	}
-	// A chmod entry on a live path is always a change, and on a plan-created one is not.
+	// A chmod entry is refused for a caller that may not chmod whichever inode it targets:
+	// the apply step never applies one, so staging a plan around it would only produce a
+	// commit that cannot succeed. The scan therefore reports it, live target or not.
 	if !decide(rename("/x/f.txt", "/x/g.txt"), datastore.FSLayerEntry{Path: "/x/g.txt", Op: datastore.FSLayerEntryOpChmod, Mode: 0o600}) {
 		t.Fatal("a chmod entry on a live inode was not reported as a change")
 	}
-	if decide(rename("/x/f.txt", "/x/g.txt"), upsert("/x/f.txt", 0o644), datastore.FSLayerEntry{Path: "/x/f.txt", Op: datastore.FSLayerEntryOpChmod, Mode: 0o700}) {
-		t.Fatal("a chmod entry on a plan-created path was reported as a live change")
+	if !decide(rename("/x/f.txt", "/x/g.txt"), upsert("/x/f.txt", 0o644), datastore.FSLayerEntry{Path: "/x/f.txt", Op: datastore.FSLayerEntryOpChmod, Mode: 0o700}) {
+		t.Fatal("a chmod entry on a plan-created path was treated as applicable")
 	}
 }
 
@@ -546,13 +548,13 @@ func TestFSLayerScopedCommitModeSemantics(t *testing.T) {
 			want: http.StatusForbidden,
 		},
 		{
-			// An implicitly created parent is a creation for the upsert, but a later chmod of
-			// that directory is a mode change on an existing inode: fs refuses it, so this
-			// plan is refused rather than left half-applied.
+			// An implicitly created parent is a creation for the upsert, but a later entry
+			// that gives it other bits changes an existing inode: fs refuses it, and the scan
+			// has to refuse it before anything applies rather than leave the plan half-applied.
 			name: "implicit-parent-restyle",
 			entries: []string{
 				`{"path":"/zone/n/f.txt","op":"upsert","kind":"file","mode":420,"content_text":"x"}`,
-				`{"path":"/zone/n/","op":"chmod","kind":"dir","mode":448}`,
+				`{"path":"/zone/n/","op":"upsert","kind":"dir","mode":448,"content_text":""}`,
 			},
 			want: http.StatusForbidden,
 		},
@@ -623,6 +625,41 @@ func TestFSLayerScopedCommitModeSemantics(t *testing.T) {
 	}
 }
 
+// A chmod entry can never apply for a caller that may not chmod, so staging it is refused
+// even when the target is a path the same plan creates — otherwise the layer accepts an
+// entry that no commit can apply.
+func TestFSLayerScopedChmodEntryOnPlanCreatedPathRefused(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	store := s.fallback.Store()
+	scoped := &TenantScope{
+		Backend:  s.fallback,
+		IsScoped: true,
+		FSScopes: []FSScope{{Prefix: "/zone", Ops: map[FSOp]bool{FSOpRead: true, FSOpWrite: true}}},
+	}
+	if err := store.CreateFSLayer(ctx, &datastore.FSLayer{LayerID: "layer-plan-chmod", BaseRootPath: "/zone"}); err != nil {
+		t.Fatal(err)
+	}
+	layer, err := store.GetFSLayer(ctx, "layer-plan-chmod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stage := func(body string) int {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/v1/layers/layer-plan-chmod/entries", bytes.NewReader([]byte(body)))
+		req = req.WithContext(withScope(req.Context(), scoped))
+		rr := httptest.NewRecorder()
+		s.handleFSLayerEntryUpsert(rr, req, s.fallback, store, layer)
+		return rr.Code
+	}
+	if code := stage(`{"path":"/zone/fresh.txt","op":"upsert","kind":"file","mode":384,"content_text":"x"}`); code != http.StatusOK {
+		t.Fatalf("staging the creating upsert status=%d, want 200", code)
+	}
+	if code := stage(`{"path":"/zone/fresh.txt","op":"chmod","kind":"file","mode":448}`); code != http.StatusForbidden {
+		t.Fatalf("staging a chmod entry status=%d, want 403", code)
+	}
+}
+
 // The apply-time backstop refuses a mode application on an inode that already carries other
 // bits — which is what a renamed or concurrently chmod-ed inode looks like to a caller that
 // may not chmod.
@@ -659,6 +696,114 @@ func TestFSLayerKindlessMkdirDefaultsToDirMode(t *testing.T) {
 	}
 }
 
+// A plan may stage the same object-backed path more than once — a mounted file flushes
+// repeatedly — so the second apply has to overwrite the inode the first one created instead
+// of inserting again and failing the whole commit.
+func TestFSLayerCommitAppliesRepeatedObjectUpsertToSamePath(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	store := s.fallback.Store()
+	layerID := "layer-object-repeat"
+	if err := store.CreateFSLayer(ctx, &datastore.FSLayer{LayerID: layerID, BaseRootPath: "/zone"}); err != nil {
+		t.Fatal(err)
+	}
+	layer, err := store.GetFSLayer(ctx, layerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := []string{
+		`{"path":"/zone/append.bin","op":"upsert","kind":"file","storage_type":"s3","storage_ref":"layers/layer-object-repeat/o1","size_bytes":3}`,
+		`{"path":"/zone/append.bin","op":"upsert","kind":"file","storage_type":"s3","storage_ref":"layers/layer-object-repeat/o2","size_bytes":5}`,
+	}
+	owner := &TenantScope{Backend: s.fallback}
+	for _, body := range entries {
+		req := httptest.NewRequest(http.MethodPost, "/v1/layers/"+layerID+"/entries", bytes.NewReader([]byte(body)))
+		req = req.WithContext(withScope(req.Context(), owner))
+		rr := httptest.NewRecorder()
+		s.handleFSLayerEntryUpsert(rr, req, s.fallback, store, layer)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("staging %s status=%d body=%s", body, rr.Code, rr.Body.String())
+		}
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/layers/"+layerID+"/commit", nil)
+	req = req.WithContext(withScope(req.Context(), owner))
+	rr := httptest.NewRecorder()
+	s.handleFSLayerCommit(rr, req, s.fallback, store, layer)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("commit status=%d body=%s, want 200", rr.Code, rr.Body.String())
+	}
+	nf, err := s.fallback.StatNodeCtx(ctx, "/zone/append.bin")
+	if err != nil {
+		t.Fatalf("stat committed file: %v", err)
+	}
+	if nf.File == nil || nf.File.StorageRef != "layers/layer-object-repeat/o2" || nf.File.SizeBytes != 5 {
+		t.Fatalf("committed file = %+v, want the second upsert's payload", nf.File)
+	}
+}
+
+// Re-uploading over an existing file through a layer commit is the ordinary object-backed
+// upsert, and it has to work for an owner and for a scoped token alike: the write finds the
+// path taken, applies as an overwrite, and reports no created inode.
+func TestFSLayerCommitOverwritesExistingObjectBackedFile(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		scoped bool
+	}{
+		{name: "owner"},
+		{name: "scoped", scoped: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestServer(t)
+			ctx := context.Background()
+			store := s.fallback.Store()
+			if _, err := s.fallback.WriteCtx(ctx, "/zone/upload.bin", []byte("live"), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.fallback.ChmodCtx(ctx, "/zone/upload.bin", 0o644); err != nil {
+				t.Fatal(err)
+			}
+			layerID := "layer-object-overwrite"
+			if err := store.CreateFSLayer(ctx, &datastore.FSLayer{LayerID: layerID, BaseRootPath: "/zone"}); err != nil {
+				t.Fatal(err)
+			}
+			layer, err := store.GetFSLayer(ctx, layerID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			scope := &TenantScope{Backend: s.fallback}
+			if tc.scoped {
+				scope = &TenantScope{
+					Backend:  s.fallback,
+					IsScoped: true,
+					FSScopes: []FSScope{{Prefix: "/zone", Ops: map[FSOp]bool{FSOpRead: true, FSOpWrite: true}}},
+				}
+			}
+			req := httptest.NewRequest(http.MethodPost, "/v1/layers/"+layerID+"/entries",
+				bytes.NewReader([]byte(`{"path":"/zone/upload.bin","op":"upsert","kind":"file","storage_type":"s3","storage_ref":"layers/layer-object-overwrite/o1","size_bytes":9,"mode":420}`)))
+			req = req.WithContext(withScope(req.Context(), scope))
+			rr := httptest.NewRecorder()
+			s.handleFSLayerEntryUpsert(rr, req, s.fallback, store, layer)
+			if rr.Code != http.StatusOK {
+				t.Fatalf("staging status=%d body=%s, want 200", rr.Code, rr.Body.String())
+			}
+			req = httptest.NewRequest(http.MethodPost, "/v1/layers/"+layerID+"/commit", nil)
+			req = req.WithContext(withScope(req.Context(), scope))
+			rr = httptest.NewRecorder()
+			s.handleFSLayerCommit(rr, req, s.fallback, store, layer)
+			if rr.Code != http.StatusOK {
+				t.Fatalf("commit status=%d body=%s, want 200", rr.Code, rr.Body.String())
+			}
+			nf, err := s.fallback.StatNodeCtx(ctx, "/zone/upload.bin")
+			if err != nil {
+				t.Fatalf("stat committed file: %v", err)
+			}
+			if nf.File == nil || nf.File.StorageRef != "layers/layer-object-overwrite/o1" || nf.File.SizeBytes != 9 {
+				t.Fatalf("committed file = %+v, want the uploaded payload", nf.File)
+			}
+		})
+	}
+}
+
 // The apply-time guard is the second layer: even if a handler decides to apply a
 // mode-changing entry, the apply itself refuses without chmod authority.
 func TestApplyFSLayerEntryRefusesModeChangeWithoutChmod(t *testing.T) {
@@ -681,5 +826,182 @@ func TestApplyFSLayerEntryRefusesModeChangeWithoutChmod(t *testing.T) {
 	}
 	if nf, err := s.fallback.StatNodeCtx(ctx, "/f.txt"); err != nil || nf.Mode&0o777 != 0o777 {
 		t.Fatalf("owner apply mode=%o err=%v, want 777", nf.Mode&0o777, err)
+	}
+}
+
+// The commit scan has to model what the plan itself creates: an entry that gives other
+// bits to a name an earlier entry in the same plan created is a mode change on an existing
+// inode by the time it applies, and the scan is where a refusal must happen so the commit
+// never applies half a plan and rolls it back.
+func TestFSLayerPlanScanSeesPlanCreations(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	if _, err := s.fallback.WriteCtx(ctx, "/zone/live.txt", []byte("live"), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.fallback.ChmodCtx(ctx, "/zone/live.txt", 0o644); err != nil {
+		t.Fatal(err)
+	}
+	type scanCase struct {
+		name    string
+		entries []datastore.FSLayerEntry
+		want    bool
+	}
+	cases := []scanCase{
+		{
+			name:    "creation only",
+			entries: []datastore.FSLayerEntry{{Path: "/zone/c1.txt", Op: datastore.FSLayerEntryOpUpsert, Kind: datastore.FSLayerEntryKindFile, Mode: 0o600}},
+			want:    false,
+		},
+		{
+			name: "restyle of a plan-created path",
+			entries: []datastore.FSLayerEntry{
+				{Path: "/zone/c2.txt", Op: datastore.FSLayerEntryOpUpsert, Kind: datastore.FSLayerEntryKindFile, Mode: 0o644},
+				{Path: "/zone/c2.txt", Op: datastore.FSLayerEntryOpUpsert, Kind: datastore.FSLayerEntryKindFile, Mode: 0o600},
+			},
+			want: true,
+		},
+		{
+			name: "second write with the creation's own bits",
+			entries: []datastore.FSLayerEntry{
+				{Path: "/zone/c3.txt", Op: datastore.FSLayerEntryOpUpsert, Kind: datastore.FSLayerEntryKindFile, Mode: 0o644},
+				{Path: "/zone/c3.txt", Op: datastore.FSLayerEntryOpUpsert, Kind: datastore.FSLayerEntryKindFile, Mode: 0o644},
+			},
+			want: false,
+		},
+		{
+			name: "sibling creation under an implicitly created parent",
+			entries: []datastore.FSLayerEntry{
+				{Path: "/zone/p1/f1.txt", Op: datastore.FSLayerEntryOpUpsert, Kind: datastore.FSLayerEntryKindFile, Mode: 0o644},
+				{Path: "/zone/p1/f2.txt", Op: datastore.FSLayerEntryOpUpsert, Kind: datastore.FSLayerEntryKindFile, Mode: 0o600},
+			},
+			want: false,
+		},
+		{
+			name: "restyle of an implicitly created parent",
+			entries: []datastore.FSLayerEntry{
+				{Path: "/zone/p2/f.txt", Op: datastore.FSLayerEntryOpUpsert, Kind: datastore.FSLayerEntryKindFile, Mode: 0o644},
+				{Path: "/zone/p2/", Op: datastore.FSLayerEntryOpChmod, Kind: datastore.FSLayerEntryKindDir, Mode: 0o700},
+			},
+			want: true,
+		},
+		{
+			name: "whiteout then recreate",
+			entries: []datastore.FSLayerEntry{
+				{Path: "/zone/live.txt", Op: datastore.FSLayerEntryOpWhiteout, Kind: datastore.FSLayerEntryKindFile},
+				{Path: "/zone/live.txt", Op: datastore.FSLayerEntryOpUpsert, Kind: datastore.FSLayerEntryKindFile, Mode: 0o600},
+			},
+			want: false,
+		},
+		{
+			name: "mkdir then a differing mode",
+			entries: []datastore.FSLayerEntry{
+				{Path: "/zone/d1/", Op: datastore.FSLayerEntryOpMkdir, Kind: datastore.FSLayerEntryKindDir, Mode: 0o755},
+				{Path: "/zone/d1/", Op: datastore.FSLayerEntryOpUpsert, Kind: datastore.FSLayerEntryKindDir, Mode: 0o700},
+			},
+			want: true,
+		},
+		{
+			name: "rename of a plan-created directory keeps its bits",
+			entries: []datastore.FSLayerEntry{
+				{Path: "/zone/d2/", Op: datastore.FSLayerEntryOpMkdir, Kind: datastore.FSLayerEntryKindDir, Mode: 0o755},
+				{Path: "/zone/d2/", Op: datastore.FSLayerEntryOpRename, Kind: datastore.FSLayerEntryKindDir, ContentText: "/zone/d3/"},
+				{Path: "/zone/d3/", Op: datastore.FSLayerEntryOpUpsert, Kind: datastore.FSLayerEntryKindDir, Mode: 0o755},
+			},
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		got, err := fsLayerPlanChangesExistingMode(ctx, s.fallback, tc.entries)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if got != tc.want {
+			t.Fatalf("%s: changesMode=%v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// A creation reports every inode it made, parents included: a rollback bound needs the
+// directories, not just the file. An apply onto a path that already exists reports none.
+func TestApplyFSLayerEntryReportsCreatedInodes(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	entry := datastore.FSLayerEntry{Path: "/zone/n/f.txt", Op: datastore.FSLayerEntryOpUpsert, Kind: datastore.FSLayerEntryKindFile, Mode: 0o600, ContentBlob: []byte("x")}
+	created, err := applyFSLayerEntry(ctx, s.fallback, &entry, map[string]struct{}{}, fsLayerApplyOptions{canChmod: true})
+	if err != nil {
+		t.Fatalf("apply creation: %v", err)
+	}
+	want := []string{}
+	for _, path := range []string{"/zone/", "/zone/n/", "/zone/n/f.txt"} {
+		nf, statErr := s.fallback.StatNodeCtx(ctx, path)
+		if statErr != nil {
+			t.Fatalf("stat %s: %v", path, statErr)
+		}
+		want = append(want, fsLayerNodeInodeID(nf))
+	}
+	if len(created) != len(want) {
+		t.Fatalf("created ids = %v, want %v", created, want)
+	}
+	for i := range want {
+		if created[i] != want[i] {
+			t.Fatalf("created ids = %v, want %v", created, want)
+		}
+	}
+	// The commit loop marks a path it has applied, so a repeated entry is applied as an
+	// overwrite rather than behind a revision expectation.
+	again, err := applyFSLayerEntry(ctx, s.fallback, &entry, map[string]struct{}{entry.Path: {}}, fsLayerApplyOptions{canChmod: true})
+	if err != nil {
+		t.Fatalf("apply onto existing path: %v", err)
+	}
+	if len(again) != 0 {
+		t.Fatalf("overwrite reported created ids %v, want none", again)
+	}
+}
+
+// The rollback predicate is what keeps a failed commit from deleting a concurrent writer's
+// tree: a non-empty directory at a name the snapshot says was empty is force-removed only
+// while the inode there is still the one the commit created.
+func TestRemoveFSLayerBasePathBoundsForceRemove(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	created, err := s.fallback.MkdirCreatedCtx(ctx, "/zone/own/", 0o755)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.fallback.WriteCtx(ctx, "/zone/own/child.txt", []byte("own"), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate); err != nil {
+		t.Fatal(err)
+	}
+	createdSet := map[string]struct{}{}
+	for _, id := range created {
+		createdSet[id] = struct{}{}
+	}
+	ownsInode := func(p string) bool {
+		nf, statErr := s.fallback.StatNodeCtx(ctx, p)
+		if statErr != nil || nf == nil {
+			return false
+		}
+		_, ok := createdSet[fsLayerNodeInodeID(nf)]
+		return ok
+	}
+	if err := removeFSLayerBasePathIfExists(ctx, s.fallback, "/zone/own/", ownsInode); err != nil {
+		t.Fatalf("force remove of the commit's own directory: %v", err)
+	}
+	if _, err := s.fallback.StatNodeCtx(ctx, "/zone/own/"); !errors.Is(err, datastore.ErrNotFound) {
+		t.Fatalf("own directory survived rollback: err=%v", err)
+	}
+	// A directory this commit did not create is left in place, and the rollback reports
+	// that it could not restore the path rather than deleting foreign state.
+	if _, err := s.fallback.MkdirCreatedCtx(ctx, "/zone/foreign/", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.fallback.WriteCtx(ctx, "/zone/foreign/child.txt", []byte("foreign"), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeFSLayerBasePathIfExists(ctx, s.fallback, "/zone/foreign/", ownsInode); err == nil {
+		t.Fatal("a foreign non-empty directory was force-removed")
+	}
+	if _, err := s.fallback.StatNodeCtx(ctx, "/zone/foreign/child.txt"); err != nil {
+		t.Fatalf("foreign child removed by rollback: %v", err)
 	}
 }

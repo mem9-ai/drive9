@@ -86,10 +86,12 @@ func (b *Dat9Backend) OpenFSLayerEntryData(ctx context.Context, entry *datastore
 	return io.NopCloser(bytes.NewReader(entry.ContentBlob)), nil
 }
 
-// WriteStoredObjectCreatedCtxIfRevision creates a new file backed by an already-uploaded
-// object and reports the inode ids it created (parents first, then the file). It is the
-// object-backed twin of createAndWriteCtx, so a layer commit binds the creation mode to the
-// inode rather than chmod-ing the name afterwards.
+// WriteStoredObjectCreatedCtxIfRevision applies an already-uploaded object: it creates the
+// file (and its missing parents) when the path is free and reports the inode ids it created,
+// parents first and then the file. An apply onto a path that already exists is an overwrite
+// and reports no created ids, so the caller can tell a creation from an overwrite without
+// probing the name itself. It is the object-backed twin of createAndWriteCtx, so a layer
+// commit binds the creation mode to the inode rather than chmod-ing the name afterwards.
 func (b *Dat9Backend) WriteStoredObjectCreatedCtxIfRevision(ctx context.Context, path string, entry *datastore.FSLayerEntry) (revision int64, createdIDs []string, err error) {
 	if entry == nil {
 		return 0, nil, fmt.Errorf("nil fs layer entry")
@@ -155,10 +157,17 @@ func (b *Dat9Backend) WriteStoredObjectCreatedCtxIfRevision(ctx context.Context,
 		})
 	})
 	if err != nil {
-		if errors.Is(err, datastore.ErrPathConflict) {
-			return 0, nil, datastore.ErrRevisionConflict
+		if !errors.Is(err, datastore.ErrPathConflict) {
+			return 0, nil, err
 		}
-		return 0, nil, err
+		// The path is not free after all: a second upsert of the same path in one plan, or a
+		// concurrent write that landed between the insert and now. That apply is an
+		// overwrite of an inode this commit did not create, so it reports no created id and
+		// the caller's mode rules treat it like any other existing inode. The insert is what
+		// makes the two cases distinguishable: probing the name first would let a concurrent
+		// creation be mistaken for this commit's own.
+		rev, upsertErr := b.WriteStoredObjectCtxIfRevision(ctx, canonical, entry)
+		return rev, nil, upsertErr
 	}
 	// Same post-commit bookkeeping as every other creation path: skipping it would let
 	// object-backed layer files escape central quota accounting.

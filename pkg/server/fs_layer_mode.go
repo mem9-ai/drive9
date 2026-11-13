@@ -8,6 +8,7 @@ import (
 
 	backendpkg "github.com/mem9-ai/drive9/pkg/backend"
 	"github.com/mem9-ai/drive9/pkg/datastore"
+	"github.com/mem9-ai/drive9/pkg/pathutil"
 )
 
 // The owner-only chmod policy for the fs layer surface.
@@ -20,18 +21,18 @@ import (
 //
 // There are two worlds, and conflating them is how the checks drift:
 //
-//   - Before anything applies, a rename moves an inode and takes its name away, a
-//     whiteout removes one, and a rename into a path an earlier entry vacated re-occupies
-//     it. The entry gate and the commit scan both decide in this world, replaying the
-//     plan's rename/whiteout entries — only those; their content is irrelevant — into
-//     fsLayerPlanState, a map from path to the live-main inode that name refers to.
-//   - The commit loop runs in a world it is itself mutating. A live-main path recorded
-//     above is stale there, so the apply-time guard does not reuse it: it asks only
-//     whether the commit already owns the name (fsLayerPlanOwnership) and, when it does
-//     not, compares against the path as it is right now.
+//   - Before anything applies, the plan is replayed into fsLayerPlanState: a rename moves
+//     an inode and takes its name away, a whiteout removes one, an upsert or mkdir creates
+//     one, and each creation fixes the bits that name will have by the time a later entry
+//     reaches it. The entry gate and the commit scan both decide in this world, and the
+//     scan is what keeps a denial from becoming a mid-commit rollback.
+//   - The commit loop runs in a world it is itself mutating, so a path recorded above is
+//     stale there. The apply step therefore does not reuse it: it asks the write itself
+//     whether it created the inode (the created ids) and, when it did not, compares
+//     against the path as it is right now.
 //
-// Both are needed: the first authorizes the plan before any mutation, the second refuses
-// an entry whose live inode changed since that decision.
+// Both are needed: the first authorizes the plan before any mutation, the second binds the
+// decision to the inode that actually exists when the entry applies.
 
 // errChmodForbidden is the apply-time twin of the HTTP-layer chmod denial: a layer entry
 // reached the backend that would change an existing path's permission bits and the
@@ -76,9 +77,16 @@ type fsLayerPlanNode struct {
 	// created marks an inode the plan made; vacated marks a name the plan emptied.
 	created bool
 	vacated bool
+	// createdMode is the permission bits the plan gave an inode it created, and
+	// createdModeSet marks that those bits are known: a later entry that carries other
+	// bits changes an existing inode by the time it applies, so it is the same violation
+	// as a chmod of a live path.
+	createdMode    uint32
+	createdModeSet bool
 }
 
-// fsLayerPlanState replays rename/whiteout entries into the path -> inode view.
+// fsLayerPlanState replays the plan's moves and creations into the path -> inode view, so a
+// later entry is decided against what the namespace will look like when it applies.
 type fsLayerPlanState map[string]fsLayerPlanNode
 
 // resolve reports what rawPath names, following the longest mapped ancestor so a moved
@@ -97,7 +105,10 @@ func (st fsLayerPlanState) resolve(rawPath string) (fsLayerPlanNode, bool) {
 		ancestor = ancestor[:idx]
 		if node, ok := st[ancestor]; ok {
 			if node.vacated || node.created {
-				return node, true
+				// Everything below a name the plan created (or emptied) is that name's
+				// content: the plan creates it, but the directory's own bits say nothing
+				// about the bits of a path below it.
+				return fsLayerPlanNode{created: true}, true
 			}
 			return fsLayerPlanNode{livePath: node.livePath + strings.TrimPrefix(path, ancestor)}, true
 		}
@@ -212,10 +223,10 @@ func (st fsLayerPlanState) classify(ctx context.Context, b *backendpkg.Dat9Backe
 	return fsLayerPlanNode{livePath: fsLayerNodePath(nf, path)}, nil
 }
 
-// entryChangesMode reports whether entry, executed after the moves replayed so far, would
-// change an existing path's permission bits. The entry gate and the commit scan decide
-// with it. It is *not* the apply-time guard: that one runs in a world this commit is
-// mutating, and uses fsLayerPlanOwnership instead.
+// entryChangesMode reports whether entry, executed after the entries replayed so far, would
+// change an existing path's permission bits. The entry gate and the commit scan decide with
+// it. It is *not* the apply-time guard: that one runs in a world this commit is mutating and
+// decides from the inode ids the write itself reports.
 func (st fsLayerPlanState) entryChangesMode(ctx context.Context, b *backendpkg.Dat9Backend, entry *datastore.FSLayerEntry) (bool, error) {
 	if b == nil || !fsLayerEntryCarriesMode(entry) {
 		return false, nil
@@ -224,16 +235,86 @@ func (st fsLayerPlanState) entryChangesMode(ctx context.Context, b *backendpkg.D
 	if err != nil {
 		return false, err
 	}
-	if node.created || node.vacated {
-		return false, nil
-	}
+	// A chmod entry is refused by the apply step for every caller that may not chmod, so it
+	// is refused here too rather than at the backstop: whether the target exists or the plan
+	// is about to create it makes no difference to that rule.
 	if entry.Op == datastore.FSLayerEntryOpChmod {
-		// A mode-only entry names a path the plan has not created, so whatever live inode
-		// is there loses its bits. A path live main does not have is not a live inode, and
-		// the apply step tolerates the missing target.
 		return true, nil
 	}
+	if node.createdModeSet {
+		// The plan creates this inode earlier in the same plan, so at apply time it is an
+		// existing inode whose bits come from that creation: only the same bits are not a
+		// change. Letting it through here would make the gate disagree with the apply step.
+		return node.createdMode&0o777 != entry.Mode&0o777, nil
+	}
+	if node.created || node.vacated {
+		// This entry is the one that creates the path, or the name is empty and it takes it.
+		return false, nil
+	}
 	return fsLayerModesDiffer(ctx, b, node.livePath, entry.Mode)
+}
+
+// noteEntry records what an entry leaves behind for the entries after it: the name it
+// creates and the bits that creation gets, plus the directories it creates implicitly as
+// parents. Without that record a later mode entry on a name the plan itself created reads as
+// another creation, the scan lets the plan through, and the apply step refuses it mid-commit
+// — exactly the rollback the pre-apply scan exists to prevent.
+func (st fsLayerPlanState) noteEntry(ctx context.Context, b *backendpkg.Dat9Backend, entry *datastore.FSLayerEntry) error {
+	if b == nil || entry == nil {
+		return nil
+	}
+	switch entry.Op {
+	case datastore.FSLayerEntryOpUpsert, datastore.FSLayerEntryOpMkdir, datastore.FSLayerEntryOpSymlink:
+	default:
+		return nil
+	}
+	path := strings.TrimSuffix(entry.Path, "/")
+	if path == "" || path == "/" {
+		return nil
+	}
+	node, err := st.classify(ctx, b, path)
+	if err != nil {
+		return err
+	}
+	if node.created && !node.createdModeSet {
+		st[path] = fsLayerPlanNode{
+			created:        true,
+			createdMode:    fsLayerEntryCreatedMode(entry),
+			createdModeSet: true,
+		}
+	}
+	for parent := pathutil.ParentPath(path); parent != "" && parent != "/"; parent = pathutil.ParentPath(parent) {
+		if _, ok := st[parent]; ok {
+			continue
+		}
+		nf, err := b.StatNodeCtx(ctx, parent)
+		if errors.Is(err, datastore.ErrNotFound) {
+			// An implicit parent is created with the default directory bits, and a later
+			// entry that would give it other bits changes an existing inode by then.
+			st[parent] = fsLayerPlanNode{created: true, createdMode: datastore.FSLayerDefaultDirMode, createdModeSet: true}
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		st[parent] = fsLayerPlanNode{livePath: fsLayerNodePath(nf, parent)}
+	}
+	return nil
+}
+
+// fsLayerEntryCreatedMode is the bits a creating entry leaves on the inode it makes: the
+// entry's own mode, or the default the store would apply when the entry names none.
+func fsLayerEntryCreatedMode(entry *datastore.FSLayerEntry) uint32 {
+	if entry == nil {
+		return 0
+	}
+	if entry.Mode != 0 {
+		return entry.Mode & 0o777
+	}
+	if entry.Kind == datastore.FSLayerEntryKindDir || entry.Op == datastore.FSLayerEntryOpMkdir {
+		return datastore.FSLayerDefaultDirMode
+	}
+	return datastore.FSLayerDefaultFileMode
 }
 
 // replayMove advances the state past one entry, for callers walking a plan.
@@ -285,6 +366,9 @@ func fsLayerPlanChangesExistingMode(ctx context.Context, b *backendpkg.Dat9Backe
 		if err := state.replayMove(ctx, b, entry); err != nil {
 			return false, err
 		}
+		if err := state.noteEntry(ctx, b, entry); err != nil {
+			return false, err
+		}
 	}
 	return false, nil
 }
@@ -314,6 +398,19 @@ func fsLayerNodeMode(nf *datastore.NodeWithFile) uint32 {
 		return nf.File.Mode
 	}
 	return nf.Mode
+}
+
+// fsLayerNodeInodeID is the identity a stat row reports for the inode at its path: the file
+// id when the row backs a file, the node id otherwise. It is the id a creation reports, so
+// it is what lets a caller ask whether the inode at a name is still the one it created.
+func fsLayerNodeInodeID(nf *datastore.NodeWithFile) string {
+	if nf == nil {
+		return ""
+	}
+	if nf.File != nil && nf.File.FileID != "" {
+		return nf.File.FileID
+	}
+	return nf.Node.InodeID
 }
 
 // authorizeFSLayerEntryMode rejects staging an entry that would change an existing

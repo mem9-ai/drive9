@@ -1016,11 +1016,23 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 	rollbackCtx, rollbackCancel := context.WithTimeout(context.WithoutCancel(r.Context()), fsLayerRollbackTimeout)
 	defer rollbackCancel()
 	touchedPaths := make(map[string]struct{})
+	// createdInodes are the inodes this commit's applies created. A rollback restores paths
+	// that did not exist before the commit, so it may force away whatever an interrupted
+	// plan left under such a name — but only while that name is still the inode this commit
+	// created. A concurrent writer's inode is a different id and is left alone.
+	createdInodes := make(map[string]struct{})
 	// failCommit rolls back to the given snapshot boundary and records the state the
 	// layer API expects after a refused or failed commit. One place, so the three call
 	// sites cannot drift on the entries[:i] vs [:i+1] boundary.
 	failCommit := func(rollbackSnapshots []fsLayerBaseSnapshot, event, path string, err error) {
-		rollbackErr := rollbackFSLayerCommit(rollbackCtx, b, rollbackSnapshots, func(string) bool { return true })
+		rollbackErr := rollbackFSLayerCommit(rollbackCtx, b, rollbackSnapshots, func(p string) bool {
+			nf, statErr := b.StatNodeCtx(rollbackCtx, p)
+			if statErr != nil || nf == nil {
+				return false
+			}
+			_, ok := createdInodes[fsLayerNodeInodeID(nf)]
+			return ok
+		})
 		_ = store.SetFSLayerStateIf(rollbackCtx, layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
 		fields := eventFields(r.Context(), event, "layer_id", layer.LayerID, "error", err)
 		if path != "" {
@@ -1037,9 +1049,15 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 	for i := range entries {
 		entry := &entries[i]
 		modeMayBeSuperseded := fsLayerEntryModeSuperseded(entries, i)
-		if _, applyErr := applyFSLayerEntry(r.Context(), b, entry, touchedPaths, fsLayerApplyOptions{modeMayBeSuperseded: modeMayBeSuperseded, canChmod: canChmod}); applyErr != nil {
+		createdIDs, applyErr := applyFSLayerEntry(r.Context(), b, entry, touchedPaths, fsLayerApplyOptions{modeMayBeSuperseded: modeMayBeSuperseded, canChmod: canChmod})
+		if applyErr != nil {
 			failCommit(filterFSLayerSnapshotsForEntries(snapshots, entries[:i]), "fs_layer_commit_apply_failed", entry.Path, applyErr)
 			return
+		}
+		for _, id := range createdIDs {
+			if id != "" {
+				createdInodes[id] = struct{}{}
+			}
 		}
 		markFSLayerEntryTouched(touchedPaths, entry)
 	}
@@ -1646,9 +1664,11 @@ func removeFSLayerBasePathIfExists(ctx context.Context, b *backendpkg.Dat9Backen
 	if nf.Node.IsDirectory {
 		if err := b.RemoveDirCtx(ctx, path); err != nil {
 			// A rollback restores a path that did not exist before the commit. When the
-			// commit owns the name, whatever the interrupted plan left under it is its own
-			// work: force it away rather than abandon live main half-applied because
-			// RemoveDir refuses a non-empty directory.
+			// inode at that name is one this commit created, whatever the interrupted plan
+			// left under it is its own work: force it away rather than abandon live main
+			// half-applied because RemoveDir refuses a non-empty directory. `ownedByCommit`
+			// answers that question, so a concurrent writer's inode at the same name is not
+			// removed.
 			if errors.Is(err, datastore.ErrDirectoryNotEmpty) && ownedByCommit != nil && ownedByCommit(path) {
 				if forceErr := forceRemoveFSLayerDir(ctx, b, path); forceErr != nil {
 					return fmt.Errorf("rollback %s: %w (force remove: %v)", path, err, forceErr)
@@ -2289,12 +2309,12 @@ type fsLayerApplyOptions struct {
 	canChmod            bool
 }
 
-// applyFSLayerEntry applies one plan entry and returns the inode it created or verified at
-// the entry's path, so the caller can pin later decisions to that inode instead of
-// re-reading the name.
-func applyFSLayerEntry(ctx context.Context, b *backendpkg.Dat9Backend, entry *datastore.FSLayerEntry, touched map[string]struct{}, opts fsLayerApplyOptions) (createdInodeID string, err error) {
+// applyFSLayerEntry applies one plan entry and reports the inode ids the apply created
+// (parents first, then the created name; empty when the entry changed an existing path), so
+// the caller can bound a rollback to this commit's own work without re-reading the name.
+func applyFSLayerEntry(ctx context.Context, b *backendpkg.Dat9Backend, entry *datastore.FSLayerEntry, touched map[string]struct{}, opts fsLayerApplyOptions) (createdIDs []string, err error) {
 	if err := ensureFSLayerEntryBaseStillMatches(ctx, b, entry, touched); err != nil {
-		return "", err
+		return nil, err
 	}
 	switch entry.Op {
 	case datastore.FSLayerEntryOpUpsert:
@@ -2308,26 +2328,25 @@ func applyFSLayerEntry(ctx context.Context, b *backendpkg.Dat9Backend, entry *da
 			if errors.Is(err, datastore.ErrPathConflict) {
 				nf, statErr := b.StatNodeCtx(ctx, entry.Path)
 				if statErr != nil {
-					return "", statErr
+					return nil, statErr
 				}
 				if !nf.Node.IsDirectory {
-					return "", err
+					return nil, err
 				}
 				if entry.Mode != 0 {
 					if !opts.canChmod {
-						return "", fsLayerRequireModeMatch(ctx, b, entry.Path, entry.Mode&0o777, opts.modeMayBeSuperseded)
+						return nil, fsLayerRequireModeMatch(ctx, b, entry.Path, entry.Mode&0o777, opts.modeMayBeSuperseded)
 					}
-					return "", applyFSLayerEntryMode(ctx, b, entry.Path, entry.Mode&0o777, opts.modeMayBeSuperseded)
+					return nil, applyFSLayerEntryMode(ctx, b, entry.Path, entry.Mode&0o777, opts.modeMayBeSuperseded)
 				}
-				return "", nil
+				return nil, nil
 			}
 			if err != nil {
-				return "", err
+				return nil, err
 			}
-			return lastCreatedID(createdIDs), nil
+			return createdIDs, nil
 		}
 		external := entry.StorageRef != "" || entry.StorageType == string(datastore.StorageS3)
-		var createdIDs []string
 		var writeErr error
 		if external {
 			writeEntry := *entry
@@ -2346,10 +2365,10 @@ func applyFSLayerEntry(ctx context.Context, b *backendpkg.Dat9Backend, entry *da
 			)
 		}
 		if writeErr != nil {
-			return "", writeErr
+			return nil, writeErr
 		}
 		if entry.Mode == 0 {
-			return lastCreatedID(createdIDs), nil
+			return createdIDs, nil
 		}
 		// createdIDs is non-empty only when this write created the inode, the one signal a
 		// rename cannot forge: a missing-path probe is not enough, an owner can create the
@@ -2357,17 +2376,17 @@ func applyFSLayerEntry(ctx context.Context, b *backendpkg.Dat9Backend, entry *da
 		if len(createdIDs) > 0 {
 			createdID := createdIDs[len(createdIDs)-1]
 			if opts.canChmod {
-				return createdID, applyFSLayerEntryMode(ctx, b, entry.Path, entry.Mode&0o777, opts.modeMayBeSuperseded)
+				return createdIDs, applyFSLayerEntryMode(ctx, b, entry.Path, entry.Mode&0o777, opts.modeMayBeSuperseded)
 			}
 			if chmodErr := b.ChmodInodeCtx(ctx, createdID, entry.Mode&0o777); chmodErr != nil && !errors.Is(chmodErr, datastore.ErrNotFound) {
-				return createdID, chmodErr
+				return createdIDs, chmodErr
 			}
-			return createdID, nil
+			return createdIDs, nil
 		}
 		if !opts.canChmod {
-			return "", fsLayerRequireModeMatch(ctx, b, entry.Path, entry.Mode&0o777, opts.modeMayBeSuperseded)
+			return nil, fsLayerRequireModeMatch(ctx, b, entry.Path, entry.Mode&0o777, opts.modeMayBeSuperseded)
 		}
-		return "", applyFSLayerEntryMode(ctx, b, entry.Path, entry.Mode&0o777, opts.modeMayBeSuperseded)
+		return nil, applyFSLayerEntryMode(ctx, b, entry.Path, entry.Mode&0o777, opts.modeMayBeSuperseded)
 	case datastore.FSLayerEntryOpMkdir:
 		mode := entry.Mode
 		if mode == 0 {
@@ -2375,74 +2394,61 @@ func applyFSLayerEntry(ctx context.Context, b *backendpkg.Dat9Backend, entry *da
 		}
 		createdIDs, err := b.MkdirCreatedCtx(ctx, entry.Path, mode)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
-		return lastCreatedID(createdIDs), nil
+		return createdIDs, nil
 	case datastore.FSLayerEntryOpWhiteout:
 		var err error
 		if entry.Kind == datastore.FSLayerEntryKindDir || strings.HasSuffix(entry.Path, "/") {
 			children, readErr := b.ReadDirCtx(ctx, entry.Path)
 			if errors.Is(readErr, datastore.ErrNotFound) {
-				return "", nil
+				return nil, nil
 			}
 			if readErr != nil {
-				return "", readErr
+				return nil, readErr
 			}
 			if len(children) > 0 {
-				return "", fmt.Errorf("directory whiteout requires empty directory")
+				return nil, fmt.Errorf("directory whiteout requires empty directory")
 			}
 			err = b.RemoveDirCtx(ctx, entry.Path)
 		} else {
 			err = b.RemoveCtx(ctx, entry.Path)
 		}
 		if errors.Is(err, datastore.ErrNotFound) {
-			return "", nil
+			return nil, nil
 		}
-		return "", err
+		return nil, err
 	case datastore.FSLayerEntryOpChmod:
 		mode := entry.Mode
 		if mode == 0 {
-			return "", nil
+			return nil, nil
 		}
 		if !opts.canChmod {
 			// chmod is owner-only; the gates normally reject it, this is the apply backstop.
-			return "", errChmodForbidden
+			return nil, errChmodForbidden
 		}
-		return "", applyFSLayerEntryMode(ctx, b, entry.Path, mode&0o777, opts.modeMayBeSuperseded)
+		return nil, applyFSLayerEntryMode(ctx, b, entry.Path, mode&0o777, opts.modeMayBeSuperseded)
 	case datastore.FSLayerEntryOpSymlink:
 		target := entry.ContentText
 		if target == "" && len(entry.ContentBlob) > 0 {
 			target = string(entry.ContentBlob)
 		}
 		if target == "" {
-			return "", fmt.Errorf("symlink target is required")
+			return nil, fmt.Errorf("symlink target is required")
 		}
-		createdIDs, err := b.CreateSymlinkCreatedCtx(ctx, entry.Path, target)
-		if err != nil {
-			return "", err
-		}
-		return lastCreatedID(createdIDs), nil
+		return b.CreateSymlinkCreatedCtx(ctx, entry.Path, target)
 	case datastore.FSLayerEntryOpRename:
 		target := fsLayerRenameTarget(entry)
 		if target == "" {
-			return "", fmt.Errorf("rename target is required")
+			return nil, fmt.Errorf("rename target is required")
 		}
 		if entry.Kind == datastore.FSLayerEntryKindDir || strings.HasSuffix(entry.Path, "/") {
-			return "", b.RenameCtx(ctx, entry.Path, target)
+			return nil, b.RenameCtx(ctx, entry.Path, target)
 		}
-		return "", b.RenameFileNoReplaceCtx(ctx, entry.Path, target)
+		return nil, b.RenameFileNoReplaceCtx(ctx, entry.Path, target)
 	default:
-		return "", fmt.Errorf("unsupported fs layer op %q", entry.Op)
+		return nil, fmt.Errorf("unsupported fs layer op %q", entry.Op)
 	}
-}
-
-// lastCreatedID is the innermost inode a creation reported: the file for a write, the
-// directory for a mkdir.
-func lastCreatedID(createdIDs []string) string {
-	if len(createdIDs) == 0 {
-		return ""
-	}
-	return createdIDs[len(createdIDs)-1]
 }
 
 func applyFSLayerEntryMode(ctx context.Context, b *backendpkg.Dat9Backend, path string, mode uint32, allowMissing bool) error {
