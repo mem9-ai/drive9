@@ -2,6 +2,7 @@
 """Linux fixed-view CLI/FUSE switching probe against an already running server."""
 
 import argparse
+import errno
 import importlib.util
 import json
 import os
@@ -55,6 +56,60 @@ def switch_failure_details(raw):
         reason = next((value for prefix, value in reasons.items() if error.startswith(prefix)), "unclassified")
         detail += f" busy={reason}"
     return detail
+
+
+MOUNTED_WRITE_SCRIPT = """import json, os, sys
+stage = "open"
+try:
+    f = open(sys.argv[1], "wb")
+    stage = "write"
+    f.write(sys.stdin.buffer.read())
+    stage = "flush"
+    f.flush()
+    stage = "fsync"
+    os.fsync(f.fileno())
+    stage = "close"
+    f.close()
+except Exception as error:
+    print(json.dumps({"stage": stage, "errno": error.errno if isinstance(error, OSError) else None}))
+    sys.exit(1)
+"""
+
+
+def write_failure_details(raw):
+    try:
+        result = json.loads(raw[:4096])
+    except (ValueError, UnicodeError, RecursionError):
+        return "stage=unknown errno=unknown"
+    if not isinstance(result, dict):
+        return "stage=unknown errno=unknown"
+    stage = result.get("stage")
+    stage = stage if isinstance(stage, str) and stage in ("open", "write", "flush", "fsync", "close") else "unknown"
+    number = result.get("errno")
+    code = errno.errorcode.get(number, "unknown") if type(number) is int else "unknown"
+    return f"stage={stage} errno={code}"
+
+
+def mount_failure_categories(path):
+    # Client errors can contain paths and response bodies. Only fixed labels
+    # leave the captured log; cap the read and never echo an unknown message.
+    patterns = {
+        "fixed-view content accounting is not available": "accounting_unavailable",
+        "complete retained storage usage is unavailable": "retained_unavailable",
+        "revision conflict": "revision_conflict",
+        "fixed view operation conflicts with current state": "view_conflict",
+        "context deadline exceeded": "deadline",
+        "permission denied": "permission",
+        "operation not supported": "unsupported",
+    }
+    try:
+        with open(path, "rb") as log:
+            log.seek(0, os.SEEK_END)
+            log.seek(max(0, log.tell() - (4 << 20)))
+            text = log.read(4 << 20).decode("utf-8", errors="replace").lower()
+    except OSError:
+        return "unavailable"
+    return ",".join(label for pattern, label in patterns.items() if pattern in text) or "unclassified"
 
 
 class MountProbe:
@@ -119,13 +174,12 @@ class MountProbe:
 
     def write(self, path, data):
         # A child bounds a blocked FUSE write/fsync; credentials never enter argv.
-        script = "import os,sys; f=open(sys.argv[1],'wb'); f.write(sys.stdin.buffer.read()); f.flush(); os.fsync(f.fileno()); f.close()"
         try:
-            result = subprocess.run([sys.executable, "-c", script, self.point + path],
+            result = subprocess.run([sys.executable, "-c", MOUNTED_WRITE_SCRIPT, self.point + path],
                                     input=data, capture_output=True, timeout=60)
         except subprocess.TimeoutExpired:
             raise http.ProbeFailure("mounted file write timed out; no automatic retry") from None
-        require(result.returncode == 0, "mounted file write or fsync failed")
+        require(result.returncode == 0, "mounted file write or fsync failed; " + write_failure_details(result.stdout))
 
     def read_validation(self, path, expected, work):
         args = [self.cli, "fs", "cat", "--layer", work["layer_id"], "--work", work["work_id"],
@@ -248,6 +302,8 @@ def run(cli, probe, write_merge=False):
         # Never recursively remove a directory while it might still expose remote data.
         if process is not None:
             primary_error = sys.exc_info()[1]
+            if primary_error is not None:
+                print("CHECK mount error categories=" + mount_failure_categories(directory + "/mount.log"), flush=True)
             print("CHECK unmount cleanup", flush=True)
             detail = str(primary_error) if isinstance(primary_error, http.ProbeFailure) else type(primary_error).__name__
             try:

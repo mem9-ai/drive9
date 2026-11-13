@@ -1,4 +1,5 @@
 """Offline switch-driver tests; no server or kernel mount is started."""
+import errno
 import importlib.util
 import json
 import os
@@ -210,6 +211,64 @@ class MountProbeTest(unittest.TestCase):
                     with self.assertRaisesRegex(smoke.http.ProbeFailure, "cleanup incomplete"):
                         smoke.run("/paired/drive9", self.probe)
                 remove.assert_not_called()
+
+
+class MountedWriteDiagnosticTest(unittest.TestCase):
+    def test_actual_child_writes_and_fsyncs_without_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "file"
+            result = subprocess.run([sys.executable, "-c", smoke.MOUNTED_WRITE_SCRIPT, str(path)],
+                                    input=b"content", capture_output=True, timeout=5)
+            self.assertEqual((result.returncode, result.stdout, result.stderr), (0, b"", b""))
+            self.assertEqual(path.read_bytes(), b"content")
+
+    def test_actual_child_open_error_omits_path_and_traceback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "private" / "file")
+            result = subprocess.run([sys.executable, "-c", smoke.MOUNTED_WRITE_SCRIPT, path],
+                                    input=b"private content", capture_output=True, timeout=5)
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(smoke.write_failure_details(result.stdout), "stage=open errno=ENOENT")
+            self.assertEqual(result.stderr, b"")
+            self.assertNotIn(b"private", result.stdout)
+
+    def test_actual_child_reports_fsync_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "file")
+            inject = "import os\ndef fail(fd): raise OSError(5, 'private error')\nos.fsync = fail\n"
+            result = subprocess.run([sys.executable, "-c", inject + smoke.MOUNTED_WRITE_SCRIPT, path],
+                                    input=b"content", capture_output=True, timeout=5)
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(smoke.write_failure_details(result.stdout), "stage=fsync errno=EIO")
+            self.assertEqual(result.stderr, b"")
+            self.assertNotIn(b"private", result.stdout)
+
+    def test_failure_fields_are_validated_before_reporting(self):
+        for stage in ("open", "write", "flush", "fsync", "close"):
+            self.assertEqual(smoke.write_failure_details(json.dumps({"stage":stage, "errno":errno.EIO}).encode()),
+                             f"stage={stage} errno=EIO")
+        for value in (None, [], "private", {"stage": ["private"], "errno":[]},
+                      {"stage": "private", "errno":"private"}, {"errno": True}, {"errno": -1}):
+            self.assertEqual(smoke.write_failure_details(json.dumps(value).encode()), "stage=unknown errno=unknown")
+        for raw in (b"private", b"\xff", b"[" * 5000):
+            self.assertEqual(smoke.write_failure_details(raw), "stage=unknown errno=unknown")
+
+    def test_mount_log_reports_only_fixed_categories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "log"
+            path.write_text("private path: fixed-view content accounting is not available; private response\n"
+                            "revision conflict; context deadline exceeded\n")
+            self.assertEqual(smoke.mount_failure_categories(path), "accounting_unavailable,revision_conflict,deadline")
+            path.write_text("private unknown error")
+            self.assertEqual(smoke.mount_failure_categories(path), "unclassified")
+            path.unlink()
+            self.assertEqual(smoke.mount_failure_categories(path), "unavailable")
+
+    def test_mount_log_read_is_bounded_to_tail(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "log"
+            path.write_bytes(b"permission denied\n" + b"x" * (4 << 20) + b"context deadline exceeded\n")
+            self.assertEqual(smoke.mount_failure_categories(path), "deadline")
 
 
 class MountedMergeTest(unittest.TestCase):
