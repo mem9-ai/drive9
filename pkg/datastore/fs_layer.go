@@ -588,6 +588,50 @@ ORDER BY entry_seq ASC, path ASC`, args...)
 	return out, nil
 }
 
+// FSLayerPlanMove is the path-identity part of a layer entry: a rename takes a path away
+// and gives another one the inode, and a whiteout takes a path away. The mode policy
+// needs only this, never the staged bytes.
+type FSLayerPlanMove struct {
+	Op     FSLayerEntryOp
+	Path   string
+	Target string
+}
+
+// ListFSLayerPlanMoves returns the plan's path-identity entries in plan order, without
+// loading any staged content. A caller that authorizes mode changes has to replay this
+// to know which inode a path names at a given point, and must not pull N payloads to do
+// it: content_blob/content_text of file entries are never needed, and only a rename's
+// target is read here (the server writes it as a canonical path in content_text).
+func (s *Store) ListFSLayerPlanMoves(ctx context.Context, layerID string) ([]FSLayerPlanMove, error) {
+	layerID = strings.TrimSpace(layerID)
+	if layerID == "" {
+		return nil, fmt.Errorf("fs layer id is required")
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT op, path, content_text
+FROM fs_layer_entries
+WHERE `+s.scope.And("layer_id = ?")+` AND op IN (?, ?)
+ORDER BY entry_seq ASC, path ASC`, s.scope.Args(layerID, string(FSLayerEntryOpRename), string(FSLayerEntryOpWhiteout))...)
+	if err != nil {
+		return nil, fmt.Errorf("list fs layer plan moves: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []FSLayerPlanMove
+	for rows.Next() {
+		var (
+			op, path, target string
+		)
+		if err := rows.Scan(&op, &path, &target); err != nil {
+			return nil, fmt.Errorf("scan fs layer plan move: %w", err)
+		}
+		out = append(out, FSLayerPlanMove{Op: FSLayerEntryOp(op), Path: path, Target: target})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list fs layer plan moves: %w", err)
+	}
+	return out, nil
+}
+
 func (s *Store) UpsertFSLayerEntry(ctx context.Context, entry *FSLayerEntry) error {
 	if entry == nil {
 		return fmt.Errorf("fs layer entry is required")

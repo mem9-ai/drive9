@@ -959,9 +959,12 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 	// The plan, not just the entry writes, decides: entries created by an owner (or
 	// before a scope narrowed) must not be committed by a principal that may not
 	// chmod. Only such a caller pays for the scan — an owner commit cannot be refused by
-	// it, so it would be pure cost plus a new way to fail. The deferred guard above
-	// leaves the layer conflicted on this return.
-	if !ScopeFromContext(r.Context()).CanChmod() {
+	// it, so it would be pure cost plus a new way to fail. Running it here, before any
+	// entry is applied, is what keeps a denial from becoming a mid-commit rollback. The
+	// deferred guard above leaves the layer conflicted on this return.
+	canChmod := ScopeFromContext(r.Context()).CanChmod()
+	modeAuthorized := canChmod
+	if !canChmod {
 		changesMode, err := fsLayerPlanChangesExistingMode(r.Context(), b, entries)
 		if err != nil {
 			writeBackendError(w, r, err)
@@ -971,6 +974,7 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 			errJSON(w, http.StatusForbidden, chmodOwnerOnlyMessage)
 			return
 		}
+		modeAuthorized = true
 	}
 	conflicts := preflightFSLayerCommit(r.Context(), b, entries, false)
 	if len(conflicts) > 0 {
@@ -1012,10 +1016,9 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 	rollbackCtx, rollbackCancel := context.WithTimeout(context.WithoutCancel(r.Context()), fsLayerRollbackTimeout)
 	defer rollbackCancel()
 	touchedPaths := make(map[string]struct{})
-	canChmod := ScopeFromContext(r.Context()).CanChmod()
 	for i := range entries {
 		modeMayBeSuperseded := fsLayerEntryModeSuperseded(entries, i)
-		if err := applyFSLayerEntry(r.Context(), b, &entries[i], touchedPaths, fsLayerApplyOptions{modeMayBeSuperseded: modeMayBeSuperseded, canChmod: canChmod}); err != nil {
+		if err := applyFSLayerEntry(r.Context(), b, &entries[i], touchedPaths, fsLayerApplyOptions{modeMayBeSuperseded: modeMayBeSuperseded, canChmod: canChmod, modeAuthorized: modeAuthorized}); err != nil {
 			rollbackErr := rollbackFSLayerCommit(rollbackCtx, b, filterFSLayerSnapshotsForEntries(snapshots, entries[:i]))
 			_ = store.SetFSLayerStateIf(rollbackCtx, layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
 			if rollbackErr != nil {
@@ -2233,35 +2236,22 @@ func fsLayerEntryModeSuperseded(entries []datastore.FSLayerEntry, idx int) bool 
 // struct, not positional booleans: three adjacent bools invite a transposition that
 // compiles and silently tests or runs the wrong path.
 type fsLayerApplyOptions struct {
-	recoveringCommit    bool
 	modeMayBeSuperseded bool
 	canChmod            bool
+	// modeAuthorized marks an entry whose mode application the plan-aware check
+	// approved: either the caller may chmod, or the plan-wide check passed and this
+	// entry's mode is a creation mode. applyFSLayerEntry refuses permission bits it was
+	// not handed authority for, so a caller that skips the plan check cannot apply one
+	// silently — and a directory an earlier plan entry created is a creation too.
+	modeAuthorized bool
 }
 
 func applyFSLayerEntry(ctx context.Context, b *backendpkg.Dat9Backend, entry *datastore.FSLayerEntry, touched map[string]struct{}, opts fsLayerApplyOptions) error {
-	if opts.recoveringCommit {
-		applied, err := fsLayerEntryAlreadyApplied(ctx, b, entry)
-		if err != nil {
-			return err
-		}
-		if applied {
-			return nil
-		}
-	}
 	if err := ensureFSLayerEntryBaseStillMatches(ctx, b, entry, touched); err != nil {
 		return err
 	}
-	// Defense in depth for the commit-time check: refuse to apply a mode change the
-	// caller could not have requested through chmod. Creation modes (a path that does
-	// not exist yet) are not mode changes and stay allowed.
-	if !opts.canChmod {
-		changesMode, err := fsLayerEntryModeChange(ctx, b, []datastore.FSLayerEntry{*entry}, 0)
-		if err != nil {
-			return err
-		}
-		if changesMode {
-			return errChmodForbidden
-		}
+	if !opts.canChmod && fsLayerEntryCarriesMode(entry) && !opts.modeAuthorized {
+		return errChmodForbidden
 	}
 	switch entry.Op {
 	case datastore.FSLayerEntryOpUpsert:

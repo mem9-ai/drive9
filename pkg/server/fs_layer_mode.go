@@ -18,11 +18,13 @@ import (
 // not exist yet is a creation mode, which the same token may already set through create
 // and mkdir.
 //
-// The decision is made in three places, all through the predicates below so they cannot
-// disagree: at entry write (with the layer's stored plan as context), over the whole plan
-// at commit, and per entry at apply time. Plan order matters — an upsert at a path an
-// earlier entry vacated (rename source or whiteout) creates a new file, it does not
-// rewrite the live inode's mode.
+// What a path names at a given point in the plan is not live main: a rename moves an
+// inode and takes its name away, a whiteout removes one, and a rename into a path an
+// earlier entry vacated re-occupies it. So the policy replays the plan's rename/whiteout
+// entries — and only those; their content is irrelevant — into a map from path to the
+// live-main inode that name now refers to, and decides each mode-carrying entry against
+// that view. Entry write, commit scan and apply-time guard all use this one simulation so
+// they cannot disagree.
 
 // errChmodForbidden is the apply-time twin of the HTTP-layer chmod denial: a layer entry
 // reached the backend that would change an existing path's permission bits and the
@@ -32,138 +34,212 @@ var errChmodForbidden = errors.New(chmodOwnerOnlyMessage)
 
 // defaultFSLayerEntryMode stamps the mode a layer entry gets when the caller names none.
 // It is decided here, before any authorization check, so the entry-write gate, the stored
-// row and the commit-time scan all see the same value. datastore uses the same defaults
-// when a row reaches it without a mode.
+// row and the commit-time scan all see the same value. The defaults are the store's own
+// constants, and the directory condition matches normalizeFSLayerEntry's.
 func defaultFSLayerEntryMode(entry *datastore.FSLayerEntry) {
 	if entry == nil || entry.Mode != 0 {
 		return
 	}
 	entry.Mode = datastore.FSLayerDefaultFileMode
-	if entry.Kind == datastore.FSLayerEntryKindDir || entry.Op == datastore.FSLayerEntryOpMkdir {
+	if entry.Kind == datastore.FSLayerEntryKindDir {
 		entry.Mode = datastore.FSLayerDefaultDirMode
 	}
 }
 
 // fsLayerEntryCarriesMode reports whether the entry can carry permission bits at all.
-// One spelling for all three call sites, so a future op that carries a mode is added in
-// one place instead of three.
 func fsLayerEntryCarriesMode(entry *datastore.FSLayerEntry) bool {
 	if entry == nil {
 		return false
 	}
 	switch entry.Op {
-	case datastore.FSLayerEntryOpChmod:
-		return entry.Mode != 0
-	case datastore.FSLayerEntryOpUpsert, datastore.FSLayerEntryOpMkdir:
+	case datastore.FSLayerEntryOpChmod, datastore.FSLayerEntryOpUpsert, datastore.FSLayerEntryOpMkdir:
 		return entry.Mode != 0
 	default:
 		return false
 	}
 }
 
-// fsLayerEntryModeChange reports whether plan[index] would change an existing path's
-// permission bits.
-//
-// Only entries *before* index matter: they are the ones that can have vacated the path or
-// moved the live inode it names. An upsert placed before a rename still overwrites the
-// live inode, and stays a mode change.
-func fsLayerEntryModeChange(ctx context.Context, b *backendpkg.Dat9Backend, plan []datastore.FSLayerEntry, index int) (bool, error) {
-	if b == nil || index < 0 || index >= len(plan) {
-		return false, nil
+// fsLayerPlanNode is what a path names after the plan entries replayed so far.
+type fsLayerPlanNode struct {
+	// livePath is the live-main path of the inode this name refers to, or "" when the
+	// name holds an inode the plan itself created.
+	livePath string
+	// created marks an inode the plan made; vacated marks a name the plan emptied.
+	created bool
+	vacated bool
+}
+
+// fsLayerPlanState replays rename/whiteout entries into the path -> inode view.
+type fsLayerPlanState map[string]fsLayerPlanNode
+
+// resolve reports what rawPath names, following the longest mapped ancestor so a moved
+// directory keeps its identity for the paths below it.
+func (st fsLayerPlanState) resolve(rawPath string) (fsLayerPlanNode, bool) {
+	path := strings.TrimSuffix(rawPath, "/")
+	node, ok := st[path]
+	if ok {
+		return node, true
 	}
-	entry := &plan[index]
-	if !fsLayerEntryCarriesMode(entry) {
-		return false, nil
-	}
-	if entry.Op == datastore.FSLayerEntryOpChmod {
-		// An explicit mode-only entry targets whatever path it names.
-		return true, nil
-	}
-	earlier := plan[:index]
-	if fsLayerPathVacatedBy(earlier, entry.Path) {
-		// The path an earlier entry vacated is created fresh here, so the mode is a
-		// creation mode.
-		return false, nil
-	}
-	// A file moved by a directory rename is still the same inode: resolve the
-	// destination back to its source before falling back to live main.
-	if source, ok := fsLayerRenameSourceForPath(earlier, entry.Path); ok {
-		nf, err := b.StatNodeCtx(ctx, source)
-		if err == nil {
-			return fsLayerNodeMode(nf)&0o777 != entry.Mode&0o777, nil
+	for ancestor := path; ; {
+		idx := strings.LastIndex(ancestor, "/")
+		if idx <= 0 {
+			return fsLayerPlanNode{}, false
 		}
-		if !errors.Is(err, datastore.ErrNotFound) {
+		ancestor = ancestor[:idx]
+		if node, ok := st[ancestor]; ok {
+			if node.vacated || node.created {
+				return node, true
+			}
+			return fsLayerPlanNode{livePath: node.livePath + strings.TrimPrefix(path, ancestor)}, true
+		}
+	}
+}
+
+// prune drops the name and every name below it: after a move or a whiteout, the entries
+// recorded for its descendants describe paths that no longer exist.
+func (st fsLayerPlanState) prune(rawPath string) {
+	path := strings.TrimSuffix(rawPath, "/")
+	for key := range st {
+		if key == path || strings.HasPrefix(key, path+"/") {
+			delete(st, key)
+		}
+	}
+}
+
+// applyMove replays one rename or whiteout.
+func (st fsLayerPlanState) applyMove(ctx context.Context, b *backendpkg.Dat9Backend, move datastore.FSLayerPlanMove) error {
+	source := strings.TrimSuffix(move.Path, "/")
+	switch move.Op {
+	case datastore.FSLayerEntryOpWhiteout:
+		st.prune(source)
+		st[source] = fsLayerPlanNode{vacated: true}
+		return nil
+	case datastore.FSLayerEntryOpRename:
+	default:
+		return nil
+	}
+	target := strings.TrimSuffix(move.Target, "/")
+	if target == "" {
+		// A rename without a target moves nothing.
+		return nil
+	}
+	resolved, ok := st.resolve(source)
+	if !ok {
+		// First mention of the source: ask live main what it holds. A source the plan
+		// created (or already vacated) needs no stat.
+		nf, err := b.StatNodeCtx(ctx, source)
+		switch {
+		case err == nil:
+			resolved = fsLayerPlanNode{livePath: fsLayerNodePath(nf, source)}
+		case errors.Is(err, datastore.ErrNotFound):
+			resolved = fsLayerPlanNode{created: true}
+		default:
+			return err
+		}
+	}
+	st.prune(source)
+	st.prune(target)
+	st[target] = resolved
+	st[source] = fsLayerPlanNode{vacated: true}
+	return nil
+}
+
+// fsLayerNodePath reports the live path a stat row belongs to. The node is authoritative
+// when it carries one, because a path can already name a newer inode than the caller's
+// snapshot.
+func fsLayerNodePath(nf *datastore.NodeWithFile, fallback string) string {
+	if nf != nil && nf.Node.Path != "" {
+		return strings.TrimSuffix(nf.Node.Path, "/")
+	}
+	return fallback
+}
+
+// fsLayerEntryModeChange reports whether entry, executed after moves, would change an
+// existing path's permission bits.
+func fsLayerEntryModeChange(ctx context.Context, b *backendpkg.Dat9Backend, moves []datastore.FSLayerPlanMove, entry *datastore.FSLayerEntry) (bool, error) {
+	if b == nil || !fsLayerEntryCarriesMode(entry) {
+		return false, nil
+	}
+	state := fsLayerPlanState{}
+	for _, move := range moves {
+		if err := state.applyMove(ctx, b, move); err != nil {
 			return false, err
 		}
 	}
-	nf, err := b.StatNodeCtx(ctx, entry.Path)
+	node, ok := state.resolve(entry.Path)
+	if ok && (node.created || node.vacated) {
+		return false, nil
+	}
+	if !ok {
+		node = fsLayerPlanNode{livePath: strings.TrimSuffix(entry.Path, "/")}
+	}
+	if entry.Op == datastore.FSLayerEntryOpChmod {
+		// A mode-only entry names a path the plan has not created, so it changes that
+		// live inode's bits.
+		return true, nil
+	}
+	return fsLayerModesDiffer(ctx, b, node.livePath, entry.Mode)
+}
+
+// fsLayerModesDiffer reports whether the live inode at livePath has permission bits other
+// than mode. A missing path is a creation, so it does not differ.
+func fsLayerModesDiffer(ctx context.Context, b *backendpkg.Dat9Backend, livePath string, mode uint32) (bool, error) {
+	nf, err := b.StatNodeCtx(ctx, livePath)
 	if errors.Is(err, datastore.ErrNotFound) {
 		return false, nil
 	}
 	if err != nil {
 		return false, err
 	}
-	return fsLayerNodeMode(nf)&0o777 != entry.Mode&0o777, nil
+	return fsLayerNodeMode(nf)&0o777 != mode&0o777, nil
 }
 
 // fsLayerPlanChangesExistingMode reports whether committing the plan would change an
-// existing path's permission bits.
-func fsLayerPlanChangesExistingMode(ctx context.Context, b *backendpkg.Dat9Backend, plan []datastore.FSLayerEntry) (bool, error) {
-	for i := range plan {
-		changes, err := fsLayerEntryModeChange(ctx, b, plan, i)
+// existing path's permission bits, replaying the plan once in order.
+func fsLayerPlanChangesExistingMode(ctx context.Context, b *backendpkg.Dat9Backend, entries []datastore.FSLayerEntry) (bool, error) {
+	state := fsLayerPlanState{}
+	for i := range entries {
+		entry := &entries[i]
+		if !fsLayerEntryCarriesMode(entry) {
+			if err := state.applyMove(ctx, b, fslayerMoveFor(entry)); err != nil {
+				return false, err
+			}
+			continue
+		}
+		node, ok := state.resolve(entry.Path)
+		if ok && (node.created || node.vacated) {
+			continue
+		}
+		if !ok {
+			node = fsLayerPlanNode{livePath: strings.TrimSuffix(entry.Path, "/")}
+		}
+		if entry.Op == datastore.FSLayerEntryOpChmod {
+			return true, nil
+		}
+		differs, err := fsLayerModesDiffer(ctx, b, node.livePath, entry.Mode)
 		if err != nil {
 			return false, err
 		}
-		if changes {
+		if differs {
 			return true, nil
 		}
 	}
 	return false, nil
 }
 
-// fsLayerPathVacatedBy reports whether an earlier plan entry removed the path (or an
-// ancestor directory) from live main: a whiteout at or above it, or a rename whose source
-// is it or an ancestor.
-func fsLayerPathVacatedBy(earlier []datastore.FSLayerEntry, path string) bool {
-	path = strings.TrimSuffix(path, "/")
-	for i := range earlier {
-		entry := &earlier[i]
-		switch entry.Op {
-		case datastore.FSLayerEntryOpWhiteout:
-			source := strings.TrimSuffix(entry.Path, "/")
-			if source == path || strings.HasPrefix(path, source+"/") {
-				return true
-			}
-		case datastore.FSLayerEntryOpRename:
-			source := strings.TrimSuffix(entry.Path, "/")
-			if source == path || strings.HasPrefix(path, source+"/") {
-				return true
-			}
-		}
+// fslayerMoveFor projects an entry onto the path-identity move it performs, if any.
+func fslayerMoveFor(entry *datastore.FSLayerEntry) datastore.FSLayerPlanMove {
+	if entry == nil {
+		return datastore.FSLayerPlanMove{}
 	}
-	return false
-}
-
-// fsLayerRenameSourceForPath maps a rename destination back to the live source path it
-// originated from, so a descendant of a renamed directory is treated as an existing
-// inode rather than a new file created under the destination name.
-func fsLayerRenameSourceForPath(entries []datastore.FSLayerEntry, path string) (string, bool) {
-	for i := range entries {
-		entry := &entries[i]
-		if entry.Op != datastore.FSLayerEntryOpRename {
-			continue
-		}
-		target := strings.TrimSuffix(fsLayerRenameTarget(entry), "/")
-		if target == "" {
-			continue
-		}
-		if path != target && !strings.HasPrefix(path, target+"/") {
-			continue
-		}
-		source := strings.TrimSuffix(entry.Path, "/") + strings.TrimPrefix(path, target)
-		return source, true
+	switch entry.Op {
+	case datastore.FSLayerEntryOpRename:
+		return datastore.FSLayerPlanMove{Op: entry.Op, Path: entry.Path, Target: fsLayerRenameTarget(entry)}
+	case datastore.FSLayerEntryOpWhiteout:
+		return datastore.FSLayerPlanMove{Op: entry.Op, Path: entry.Path}
+	default:
+		return datastore.FSLayerPlanMove{}
 	}
-	return "", false
 }
 
 // fsLayerNodeMode is the permission bits a stat row reports, preferring the file row
@@ -179,22 +255,19 @@ func fsLayerNodeMode(nf *datastore.NodeWithFile) uint32 {
 }
 
 // authorizeFSLayerEntryMode rejects staging an entry that would change an existing
-// path's permission bits unless the caller may chmod. The layer's stored entries are the
-// plan prefix, so a path an earlier rename or whiteout vacated is treated as a creation
-// here exactly as it will be at commit.
+// path's permission bits unless the caller may chmod. The layer's rename/whiteout
+// entries are the plan prefix — metadata only, so this does not reload staged content —
+// and the decision is the same one commit will make.
 func (s *Server) authorizeFSLayerEntryMode(w http.ResponseWriter, r *http.Request, b *backendpkg.Dat9Backend, store *datastore.Store, layer *datastore.FSLayer, candidate *datastore.FSLayerEntry) bool {
 	if !fsLayerEntryCarriesMode(candidate) || ScopeFromContext(r.Context()).CanChmod() {
 		return true
 	}
-	stored, err := store.ListFSLayerEntryLog(r.Context(), layer.LayerID)
+	moves, err := store.ListFSLayerPlanMoves(r.Context(), layer.LayerID)
 	if err != nil {
 		writeFSLayerStoreError(w, r, err)
 		return false
 	}
-	plan := make([]datastore.FSLayerEntry, 0, len(stored)+1)
-	plan = append(plan, stored...)
-	plan = append(plan, *candidate)
-	changes, err := fsLayerEntryModeChange(r.Context(), b, plan, len(plan)-1)
+	changes, err := fsLayerEntryModeChange(r.Context(), b, moves, candidate)
 	if err != nil {
 		writeBackendError(w, r, err)
 		return false

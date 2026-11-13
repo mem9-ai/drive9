@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 var operationDurationBounds = []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600}
@@ -541,10 +542,16 @@ const maxMetricActionLabelBytes = 48
 
 func metricActionLabel(action string) string {
 	action = cleanMetricValue(action, "other")
-	if len(action) > maxMetricActionLabelBytes {
-		action = action[:maxMetricActionLabelBytes]
+	if len(action) <= maxMetricActionLabelBytes {
+		return action
 	}
-	return action
+	// Cut on a rune boundary: a byte cut can leave invalid UTF-8, and every action
+	// source is ASCII today but the cap is a backstop, not a place to corrupt labels.
+	cut := maxMetricActionLabelBytes
+	for cut > 0 && !utf8.RuneStart(action[cut]) {
+		cut--
+	}
+	return action[:cut]
 }
 
 func RecordTenantRequest(tenantID, surface, action string, status int, d time.Duration) {

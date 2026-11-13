@@ -3134,19 +3134,19 @@ func TestSystemRootUserFor(t *testing.T) {
 func TestSystemUsernameForCurrentRoundTrips(t *testing.T) {
 	for _, prefix := range []string{"22ipQWBXXq2wN2S", "prefix", "tiabc123"} {
 		root := systemRootUsernameFor(prefix)
-		tenant, needsSetup, err := systemUsernameForCurrent(root)
-		if err != nil || !needsSetup || tenant != prefix+RestrictedSystemUserNameSuffix {
-			t.Fatalf("systemUsernameForCurrent(%q) = %q needsSetup=%t err=%v", root, tenant, needsSetup, err)
+		restricted, needsSetup, err := systemUsernameForCurrent(root)
+		if err != nil || !needsSetup || restricted != prefix+RestrictedSystemUserNameSuffix {
+			t.Fatalf("systemUsernameForCurrent(%q) = %q needsSetup=%t err=%v", root, restricted, needsSetup, err)
 		}
 		// The restricted name resolves to itself and needs no setup.
-		same, needsSetup, err := systemUsernameForCurrent(tenant)
-		if err != nil || needsSetup || same != tenant {
-			t.Fatalf("systemUsernameForCurrent(%q) = %q needsSetup=%t err=%v", tenant, same, needsSetup, err)
+		same, needsSetup, err := systemUsernameForCurrent(restricted)
+		if err != nil || needsSetup || same != restricted {
+			t.Fatalf("systemUsernameForCurrent(%q) = %q needsSetup=%t err=%v", restricted, same, needsSetup, err)
 		}
 		// A root name and its restricted sibling agree on the instance prefix.
-		back, ok := systemRootUserFor(tenant)
+		back, ok := systemRootUserFor(restricted)
 		if !ok || back != root {
-			t.Fatalf("systemRootUserFor(%q) = %q ok=%t, want %q", tenant, back, ok, root)
+			t.Fatalf("systemRootUserFor(%q) = %q ok=%t, want %q", restricted, back, ok, root)
 		}
 	}
 	for _, in := range []string{"", "root", ".root", "u1.admin", "u1.tdc_fs_sys.x"} {

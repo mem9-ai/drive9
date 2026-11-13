@@ -143,9 +143,9 @@ func TestCommitQueueBatchModeRequiresCapability(t *testing.T) {
 			if tc.combined {
 				wantChmods = 0
 			}
-			if tc.denyChmod {
-				wantSuccesses = 0
-			}
+			// A denied chmod is terminal-but-non-fatal: the content is already durable,
+			// so the entry commits and only the mode is dropped. Retrying instead would
+			// keep a scoped mount in a deny/retry loop for ever.
 			if batches != 1 || chmods != wantChmods || successes != wantSuccesses {
 				t.Fatalf("batch=%d chmod=%d successes=%d, want 1/%d/%d", batches, chmods, successes, wantChmods, wantSuccesses)
 			}
@@ -160,8 +160,8 @@ func TestCommitQueueBatchModeRequiresCapability(t *testing.T) {
 				if got := files[entry.Path]; got.data != "new" || got.mode != wantMode || got.rev != entry.BaseRev+1 {
 					t.Errorf("remote %s = %+v, want new/%o/revision %d", entry.Path, got, wantMode, entry.BaseRev+1)
 				}
-				if pending.HasPending(entry.Path) != tc.denyChmod || shadow.Has(entry.Path) != tc.denyChmod {
-					t.Errorf("staging for %s must be retained only when chmod fails", entry.Path)
+				if pending.HasPending(entry.Path) || shadow.Has(entry.Path) {
+					t.Errorf("staging for %s must be cleared: a denied chmod is not a pending commit", entry.Path)
 				}
 			}
 		})

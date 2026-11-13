@@ -3399,6 +3399,11 @@ func batchWriteErrorMessage(err error, status int) string {
 	if status == http.StatusInternalServerError {
 		return internalStorageErrorMessage
 	}
+	if errors.Is(err, backend.ErrBatchWriteModeDenied) {
+		// One denial, one message: the handler's own 403 and the backend defense must
+		// read the same way to a client.
+		return chmodOwnerOnlyMessage
+	}
 	return err.Error()
 }
 

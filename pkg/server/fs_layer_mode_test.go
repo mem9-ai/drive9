@@ -182,55 +182,77 @@ func TestFSLayerScopedObjectUploadRefusesModeChange(t *testing.T) {
 }
 
 // Plan order decides whether an upsert rewrites a live inode's mode or creates a new
-// file: a path vacated by an earlier rename or whiteout is a creation, while an upsert
-// before the rename still overwrites the live inode.
+// file: a path recoccupied by a later rename is not a creation, a vacated path is, and an
+// upsert before the rename still overwrites the live inode. The predicate follows rename
+// chains to a fixpoint, so a plan cannot smuggle a live inode's mode through two hops.
 func TestFSLayerModeChangeRespectsPlanOrder(t *testing.T) {
 	s := newTestServer(t)
 	ctx := context.Background()
-	if _, err := s.fallback.WriteCtx(ctx, "/zone/f.txt", []byte("live"), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate); err != nil {
-		t.Fatal(err)
+	for _, path := range []string{"/x/f.txt", "/x/g.txt"} {
+		if _, err := s.fallback.WriteCtx(ctx, path, []byte("live"), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.fallback.ChmodCtx(ctx, path, 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if err := s.fallback.ChmodCtx(ctx, "/zone/f.txt", 0o600); err != nil {
-		t.Fatal(err)
+	rename := func(from, to string) datastore.FSLayerEntry {
+		return datastore.FSLayerEntry{Path: from, Op: datastore.FSLayerEntryOpRename, Kind: datastore.FSLayerEntryKindFile, ContentText: to}
+	}
+	upsert := func(path string, mode uint32) datastore.FSLayerEntry {
+		return datastore.FSLayerEntry{Path: path, Op: datastore.FSLayerEntryOpUpsert, Kind: datastore.FSLayerEntryKindFile, Mode: mode}
+	}
+	whiteout := func(path string) datastore.FSLayerEntry {
+		return datastore.FSLayerEntry{Path: path, Op: datastore.FSLayerEntryOpWhiteout, Kind: datastore.FSLayerEntryKindFile}
+	}
+	decide := func(plan ...datastore.FSLayerEntry) bool {
+		t.Helper()
+		changes, err := fsLayerPlanChangesExistingMode(ctx, s.fallback, plan)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return changes
 	}
 
-	rename := datastore.FSLayerEntry{Path: "/zone/f.txt", Op: datastore.FSLayerEntryOpRename, Kind: datastore.FSLayerEntryKindFile, ContentText: "/zone/g.txt"}
-	upsertAtSource := datastore.FSLayerEntry{Path: "/zone/f.txt", Op: datastore.FSLayerEntryOpUpsert, Kind: datastore.FSLayerEntryKindFile, Mode: 0o644}
-
-	// Rename first: the upsert creates a fresh file at the vacated path, so its 0644 is
-	// a creation mode, not a change to the live 0600 inode.
-	changes, err := fsLayerEntryModeChange(ctx, s.fallback, []datastore.FSLayerEntry{rename, upsertAtSource}, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if changes {
+	// The live 0600 inode moves away and the path is recreated: a creation mode.
+	if decide(rename("/x/f.txt", "/x/g.txt"), upsert("/x/f.txt", 0o644)) {
 		t.Fatal("an upsert at a vacated path was treated as a mode change")
 	}
-	// Upsert first: it overwrites the live inode, which is a mode change.
-	changes, err = fsLayerEntryModeChange(ctx, s.fallback, []datastore.FSLayerEntry{upsertAtSource, rename}, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !changes {
+	// The upsert comes first: it overwrites the live inode.
+	if !decide(upsert("/x/f.txt", 0o644), rename("/x/f.txt", "/x/g.txt")) {
 		t.Fatal("an upsert before the rename was treated as a creation")
 	}
 	// A whiteout vacates the path the same way.
-	whiteout := datastore.FSLayerEntry{Path: "/zone/f.txt", Op: datastore.FSLayerEntryOpWhiteout, Kind: datastore.FSLayerEntryKindFile}
-	changes, err = fsLayerEntryModeChange(ctx, s.fallback, []datastore.FSLayerEntry{whiteout, upsertAtSource}, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if changes {
+	if decide(whiteout("/x/f.txt"), upsert("/x/f.txt", 0o644)) {
 		t.Fatal("an upsert after a whiteout was treated as a mode change")
 	}
-	// A rename destination still resolves to its live source inode.
-	upsertAtTarget := datastore.FSLayerEntry{Path: "/zone/g.txt", Op: datastore.FSLayerEntryOpUpsert, Kind: datastore.FSLayerEntryKindFile, Mode: 0o777}
-	changes, err = fsLayerEntryModeChange(ctx, s.fallback, []datastore.FSLayerEntry{rename, upsertAtTarget}, 1)
-	if err != nil {
-		t.Fatal(err)
+	// A rename destination resolves to the live source inode.
+	if !decide(rename("/x/f.txt", "/x/g.txt"), upsert("/x/g.txt", 0o777)) {
+		t.Fatal("an upsert at a rename destination bypassed the live-inode comparison")
 	}
-	if !changes {
-		t.Fatal("an upsert at a rename destination bypassed the live-inode mode comparison")
+	// Two hops: the plan renames the live 0600 inode twice, so the upsert at the final
+	// name still owns that inode.
+	if !decide(rename("/x/f.txt", "/x/g.txt"), rename("/x/g.txt", "/x/h.txt"), upsert("/x/h.txt", 0o644)) {
+		t.Fatal("a two-hop rename chain ended in a live inode but was treated as a creation")
+	}
+	// Renamed away and back: the original inode returns to its own path.
+	if !decide(rename("/x/f.txt", "/x/g.txt"), rename("/x/g.txt", "/x/f.txt"), upsert("/x/f.txt", 0o644)) {
+		t.Fatal("a rename that lands back on its source was treated as a creation")
+	}
+	// Vacated, then re-occupied by another live inode: the vacate must not short-circuit.
+	if !decide(whiteout("/x/f.txt"), rename("/x/g.txt", "/x/f.txt"), upsert("/x/f.txt", 0o644)) {
+		t.Fatal("a rename into a vacated path lost its live inode identity")
+	}
+	// The mode already matches, so nothing changes.
+	if decide(rename("/x/f.txt", "/x/g.txt"), upsert("/x/g.txt", 0o600)) {
+		t.Fatal("a matching mode was reported as a change")
+	}
+	// A chmod entry on a live path is always a change, and on a plan-created one is not.
+	if !decide(rename("/x/f.txt", "/x/g.txt"), datastore.FSLayerEntry{Path: "/x/g.txt", Op: datastore.FSLayerEntryOpChmod, Mode: 0o600}) {
+		t.Fatal("a chmod entry on a live inode was not reported as a change")
+	}
+	if decide(rename("/x/f.txt", "/x/g.txt"), upsert("/x/f.txt", 0o644), datastore.FSLayerEntry{Path: "/x/f.txt", Op: datastore.FSLayerEntryOpChmod, Mode: 0o700}) {
+		t.Fatal("a chmod entry on a plan-created path was reported as a live change")
 	}
 }
 
