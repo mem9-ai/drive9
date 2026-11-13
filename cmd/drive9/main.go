@@ -27,6 +27,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"runtime/pprof"
@@ -429,8 +430,10 @@ func fatal(cmd string, err error) {
 		}
 	}
 	fmt.Fprintf(os.Stderr, "%s: %v\n", cmd, msg)
-	if ec, ok := err.(exitCoder); ok && ec.ExitCode() > 0 {
+	var ec exitCoder
+	if errors.As(err, &ec) && ec.ExitCode() > 0 {
 		exitWithCode(ec.ExitCode())
+		return
 	}
 	exitWithCode(1)
 }
