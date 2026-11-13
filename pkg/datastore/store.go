@@ -1074,7 +1074,7 @@ func (s *Store) EnsureParentDirs(ctx context.Context, path string, genID func() 
 		if err != nil {
 			return err
 		}
-		err = s.ensureParentDirsWithExecer(ctx, tx, path, genID)
+		_, err = s.ensureParentDirsWithExecer(ctx, tx, path, genID)
 		if err != nil {
 			_ = tx.Rollback()
 			if isDeadlock(err) && attempt < maxAttempts-1 {
@@ -1690,7 +1690,16 @@ func (s *Store) ChmodInode(ctx context.Context, inodeID string, mode uint32) (er
 }
 
 func (s *Store) EnsureParentDirsTx(db execer, path string, genID func() string) error {
-	return s.ensureParentDirsWithExecer(context.Background(), db, path, genID)
+	_, err := s.EnsureParentDirsTxCreated(context.Background(), db, path, genID)
+	return err
+}
+
+// EnsureParentDirsTxCreated is EnsureParentDirsTx plus the inode ids of the parent
+// directories it actually created, so a caller can bind something (a creation mode, a
+// permission decision) to those inodes without re-reading the namespace and racing a
+// concurrent writer.
+func (s *Store) EnsureParentDirsTxCreated(ctx context.Context, db execer, path string, genID func() string) ([]string, error) {
+	return s.ensureParentDirsWithExecer(ctx, db, path, genID)
 }
 
 // deterministicNodeID returns a stable 64-char hex ID derived from the path.
@@ -1715,7 +1724,7 @@ func deterministicNodeID(path string) string {
 // derived from the path so concurrent attempts to create the same missing
 // parent cannot leak orphan inodes, even on TiDB which does not support gap
 // locking for SELECT ... FOR UPDATE on non-existing rows.
-func (s *Store) ensureParentDirsWithExecer(ctx context.Context, db execer, path string, genID func() string) error {
+func (s *Store) ensureParentDirsWithExecer(ctx context.Context, db execer, path string, genID func() string) ([]string, error) {
 	var ancestors []string
 	cur := path
 	for {
@@ -1727,6 +1736,7 @@ func (s *Store) ensureParentDirsWithExecer(ctx context.Context, db execer, path 
 		cur = parent
 	}
 	now := time.Now().UTC()
+	var created []string
 	for i := len(ancestors) - 1; i >= 0; i-- {
 		dirPath := ancestors[i]
 		pp := parentPath(dirPath)
@@ -1742,7 +1752,7 @@ func (s *Store) ensureParentDirsWithExecer(ctx context.Context, db execer, path 
 			continue
 		}
 		if selectErr != nil && !errors.Is(selectErr, sql.ErrNoRows) {
-			return fmt.Errorf("check parent dir %s: %w", dirPath, selectErr)
+			return nil, fmt.Errorf("check parent dir %s: %w", dirPath, selectErr)
 		}
 
 		// Use a deterministic ID so concurrent creators for the same missing
@@ -1755,7 +1765,7 @@ func (s *Store) ensureParentDirsWithExecer(ctx context.Context, db execer, path 
 			VALUES (`+s.scope.InsVals(`?, 0, 1, ?, 'CONFIRMED', ?, ?`)+`)`,
 			s.scope.Args(nodeID, 0o755, now, now)...)
 		if err != nil {
-			return fmt.Errorf("ensure parent inode %s: %w", dirPath, err)
+			return nil, fmt.Errorf("ensure parent inode %s: %w", dirPath, err)
 		}
 
 		if selectErr == nil && !existingInodeID.Valid {
@@ -1765,7 +1775,7 @@ func (s *Store) ensureParentDirsWithExecer(ctx context.Context, db execer, path 
 				`UPDATE file_nodes SET inode_id = ? WHERE `+s.scope.And(`path_hash = ? AND path = ? AND is_directory = 1`),
 				append([]any{nodeID}, s.scope.Args(fileNodePathHash(dirPath), dirPath)...)...)
 			if err != nil {
-				return fmt.Errorf("backfill parent inode_id %s: %w", dirPath, err)
+				return nil, fmt.Errorf("backfill parent inode_id %s: %w", dirPath, err)
 			}
 			continue
 		}
@@ -1777,10 +1787,11 @@ func (s *Store) ensureParentDirsWithExecer(ctx context.Context, db execer, path 
 			ON DUPLICATE KEY UPDATE node_id = node_id`,
 			s.scope.Args(nodeID, dirPath, fileNodePathHash(dirPath), pp, fileNodePathHash(pp), name, nodeID, now)...)
 		if err != nil && !isUniqueViolation(err) {
-			return fmt.Errorf("ensure parent %s: %w", dirPath, err)
+			return nil, fmt.Errorf("ensure parent %s: %w", dirPath, err)
 		}
+		created = append(created, nodeID)
 	}
-	return nil
+	return created, nil
 }
 
 func (s *Store) InsertNodeTx(db execer, n *FileNode) error {

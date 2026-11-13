@@ -1016,20 +1016,11 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 	rollbackCtx, rollbackCancel := context.WithTimeout(context.WithoutCancel(r.Context()), fsLayerRollbackTimeout)
 	defer rollbackCancel()
 	touchedPaths := make(map[string]struct{})
-	// Only a caller that may not chmod needs the ownership set: the apply guard is its only
-	// reader, and an owner commit must not pay a stat per entry for information nothing
-	// consults. It also tells the rollback which names are this commit's own work.
-	ownership := newFSLayerPlanOwnership()
 	// failCommit rolls back to the given snapshot boundary and records the state the
 	// layer API expects after a refused or failed commit. One place, so the three call
 	// sites cannot drift on the entries[:i] vs [:i+1] boundary.
 	failCommit := func(rollbackSnapshots []fsLayerBaseSnapshot, event, path string, err error) {
-		// An owner commit never populates the ownership set (its cost is only paid where the
-		// guard reads it), so the rollback stays owner-aware: an owner may force-remove what
-		// its own failed commit created.
-		rollbackErr := rollbackFSLayerCommit(rollbackCtx, b, rollbackSnapshots, func(path string) bool {
-			return canChmod || ownership.owns(path)
-		})
+		rollbackErr := rollbackFSLayerCommit(rollbackCtx, b, rollbackSnapshots, func(string) bool { return true })
 		_ = store.SetFSLayerStateIf(rollbackCtx, layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
 		fields := eventFields(r.Context(), event, "layer_id", layer.LayerID, "error", err)
 		if path != "" {
@@ -1043,46 +1034,14 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 		logger.Error(r.Context(), event, fields...)
 		writeBackendError(w, r, err)
 	}
-	// The apply-time guard runs in the world this commit is mutating, so it tracks which
-	// names the commit already owns instead of replaying live-main paths: a live path
-	// recorded before the loop goes stale as soon as the plan moves or replaces the inode
-	// it named. Any entry that creates its path — file, directory, symlink — makes the
-	// commit own that name, so later entries there are creation-mode writes rather than
-	// chmods of an inode this commit just made.
 	for i := range entries {
 		entry := &entries[i]
-		willCreate := false
-		var missingAncestors []string
-		if !canChmod {
-			var classifyErr error
-			willCreate, missingAncestors, classifyErr = ownership.createsPath(r.Context(), b, entry)
-			if classifyErr != nil {
-				failCommit(filterFSLayerSnapshotsForEntries(snapshots, entries[:i]), "fs_layer_commit_apply_failed", entry.Path, classifyErr)
-				return
-			}
-		}
 		modeMayBeSuperseded := fsLayerEntryModeSuperseded(entries, i)
-		appliedInodeID, applyErr := applyFSLayerEntry(r.Context(), b, entry, touchedPaths, fsLayerApplyOptions{modeMayBeSuperseded: modeMayBeSuperseded, canChmod: canChmod, ownership: ownership})
-		if applyErr != nil {
+		if _, applyErr := applyFSLayerEntry(r.Context(), b, entry, touchedPaths, fsLayerApplyOptions{modeMayBeSuperseded: modeMayBeSuperseded, canChmod: canChmod}); applyErr != nil {
 			failCommit(filterFSLayerSnapshotsForEntries(snapshots, entries[:i]), "fs_layer_commit_apply_failed", entry.Path, applyErr)
 			return
 		}
 		markFSLayerEntryTouched(touchedPaths, entry)
-		if !canChmod {
-			// Record the inode this commit created at every name it created, implicit
-			// parent directories included: the guard treats a name as the plan's own only
-			// while that inode is still the one there.
-			if willCreate {
-				ownership.noteCreated(entry.Path, appliedInodeID)
-			}
-			// Implicit parents get the deterministic id ensureParentDirs derives from their
-			// path, so recording them needs no post-apply stat that a concurrent writer
-			// could have raced; a foreign inode at that name will not match the pin later.
-			for _, path := range missingAncestors {
-				ownership.noteCreated(path, datastore.DeterministicDirInodeID(trimLayerPath(path)))
-			}
-			ownership.noteMove(entry)
-		}
 	}
 	if err := store.SetFSLayerStateIf(commitCtx, layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateCommitted); err != nil {
 		failCommit(snapshots, "fs_layer_commit_finalize_failed", "", err)
@@ -2328,10 +2287,6 @@ func fsLayerEntryModeSuperseded(entries []datastore.FSLayerEntry, idx int) bool 
 type fsLayerApplyOptions struct {
 	modeMayBeSuperseded bool
 	canChmod            bool
-	// ownership is the set of names this commit already created, with the inode id it
-	// created at each. applyFSLayerEntry refuses permission bits on a name whose inode is
-	// not the one the commit recorded, so a concurrent rename cannot redirect the chmod.
-	ownership fsLayerPlanOwnership
 }
 
 // applyFSLayerEntry applies one plan entry and returns the inode it created or verified at
@@ -2341,19 +2296,6 @@ func applyFSLayerEntry(ctx context.Context, b *backendpkg.Dat9Backend, entry *da
 	if err := ensureFSLayerEntryBaseStillMatches(ctx, b, entry, touched); err != nil {
 		return "", err
 	}
-	modeInodeID := ""
-	if !opts.canChmod && fsLayerEntryCarriesMode(entry) {
-		changes, inodeID, decideErr := opts.ownership.appliedModeChange(ctx, b, entry)
-		if decideErr != nil {
-			return "", decideErr
-		}
-		if changes {
-			return "", errChmodForbidden
-		}
-		// Apply the planned mode to the inode the guard verified, not to whatever the name
-		// points at when the chmod runs.
-		modeInodeID = inodeID
-	}
 	switch entry.Op {
 	case datastore.FSLayerEntryOpUpsert:
 		expectedRevision := fsLayerApplyExpectedRevision(entry, touched)
@@ -2362,7 +2304,7 @@ func applyFSLayerEntry(ctx context.Context, b *backendpkg.Dat9Backend, entry *da
 			if mode == 0 {
 				mode = 0o755
 			}
-			err := b.MkdirCtx(ctx, entry.Path, mode&0o777)
+			createdIDs, err := b.MkdirCreatedCtx(ctx, entry.Path, mode&0o777)
 			if errors.Is(err, datastore.ErrPathConflict) {
 				nf, statErr := b.StatNodeCtx(ctx, entry.Path)
 				if statErr != nil {
@@ -2372,41 +2314,27 @@ func applyFSLayerEntry(ctx context.Context, b *backendpkg.Dat9Backend, entry *da
 					return "", err
 				}
 				if entry.Mode != 0 {
-					return "", applyFSLayerEntryModePinned(ctx, b, entry.Path, modeInodeID, entry.Mode&0o777, opts.modeMayBeSuperseded)
+					if !opts.canChmod {
+						return "", fsLayerRequireModeMatch(ctx, b, entry.Path, entry.Mode&0o777, opts.modeMayBeSuperseded)
+					}
+					return "", applyFSLayerEntryMode(ctx, b, entry.Path, entry.Mode&0o777, opts.modeMayBeSuperseded)
 				}
 				return "", nil
 			}
 			if err != nil {
 				return "", err
 			}
-			return fsLayerCreatedInode(ctx, b, entry.Path)
+			return lastCreatedID(createdIDs), nil
 		}
 		external := entry.StorageRef != "" || entry.StorageType == string(datastore.StorageS3)
-		if !opts.canChmod && modeInodeID == "" {
-			// The entry creates the path and the caller may not chmod: apply the creation
-			// mode inside the insert transaction. Nothing is chmod-ed by name afterwards, so
-			// a rename racing this entry cannot redirect the bits, and the returned inode is
-			// the one this commit records.
-			var created string
-			var writeErr error
-			if external {
-				created, _, writeErr = b.WriteStoredObjectCreateCtx(ctx, entry.Path, entry, entry.Mode)
-			} else {
-				created, _, writeErr = b.WriteLayerCreateCtx(ctx, entry.Path, entry.ContentBlob, expectedRevision, entry.Mode)
-			}
-			if writeErr != nil {
-				return "", writeErr
-			}
-			return created, nil
-		}
+		var createdIDs []string
+		var writeErr error
 		if external {
 			writeEntry := *entry
 			writeEntry.BaseRevision = expectedRevision
-			if _, writeErr := b.WriteStoredObjectCtxIfRevision(ctx, entry.Path, &writeEntry); writeErr != nil {
-				return "", writeErr
-			}
+			_, createdIDs, writeErr = b.WriteStoredObjectCreatedCtxIfRevision(ctx, entry.Path, &writeEntry)
 		} else {
-			if _, _, writeErr := b.WriteCtxIfRevisionWithTagsResult(
+			createdIDs, writeErr = b.WriteCtxIfRevisionWithCreatedID(
 				ctx,
 				entry.Path,
 				entry.ContentBlob,
@@ -2415,17 +2343,31 @@ func applyFSLayerEntry(ctx context.Context, b *backendpkg.Dat9Backend, entry *da
 				expectedRevision,
 				nil,
 				"",
-			); writeErr != nil {
-				return "", writeErr
-			}
+			)
+		}
+		if writeErr != nil {
+			return "", writeErr
 		}
 		if entry.Mode == 0 {
-			return "", nil
+			return lastCreatedID(createdIDs), nil
 		}
-		if applyErr := applyFSLayerEntryModePinned(ctx, b, entry.Path, modeInodeID, entry.Mode&0o777, opts.modeMayBeSuperseded); applyErr != nil {
-			return createdInodeID, applyErr
+		// createdIDs is non-empty only when this write created the inode, the one signal a
+		// rename cannot forge: a missing-path probe is not enough, an owner can create the
+		// path between the probe and the write.
+		if len(createdIDs) > 0 {
+			createdID := createdIDs[len(createdIDs)-1]
+			if opts.canChmod {
+				return createdID, applyFSLayerEntryMode(ctx, b, entry.Path, entry.Mode&0o777, opts.modeMayBeSuperseded)
+			}
+			if chmodErr := b.ChmodInodeCtx(ctx, createdID, entry.Mode&0o777); chmodErr != nil && !errors.Is(chmodErr, datastore.ErrNotFound) {
+				return createdID, chmodErr
+			}
+			return createdID, nil
 		}
-		return createdInodeID, nil
+		if !opts.canChmod {
+			return "", fsLayerRequireModeMatch(ctx, b, entry.Path, entry.Mode&0o777, opts.modeMayBeSuperseded)
+		}
+		return "", applyFSLayerEntryMode(ctx, b, entry.Path, entry.Mode&0o777, opts.modeMayBeSuperseded)
 	case datastore.FSLayerEntryOpMkdir:
 		mode := entry.Mode
 		if mode == 0 {
@@ -2461,11 +2403,11 @@ func applyFSLayerEntry(ctx context.Context, b *backendpkg.Dat9Backend, entry *da
 		if mode == 0 {
 			return "", nil
 		}
-		// The guard already decided a missing target is nothing to change for a caller
-		// that may not chmod; tolerate it here instead of turning a no-op into a
-		// conflicted layer. An owner chmod keeps its error.
-		allowMissing := opts.modeMayBeSuperseded || !opts.canChmod
-		return "", applyFSLayerEntryModePinned(ctx, b, entry.Path, modeInodeID, mode&0o777, allowMissing)
+		if !opts.canChmod {
+			// chmod is owner-only; the gates normally reject it, this is the apply backstop.
+			return "", errChmodForbidden
+		}
+		return "", applyFSLayerEntryMode(ctx, b, entry.Path, mode&0o777, opts.modeMayBeSuperseded)
 	case datastore.FSLayerEntryOpSymlink:
 		target := entry.ContentText
 		if target == "" && len(entry.ContentBlob) > 0 {
@@ -2504,20 +2446,13 @@ func fsLayerCreatedInode(ctx context.Context, b *backendpkg.Dat9Backend, path st
 	return fsLayerNodeIdentity(nf), nil
 }
 
-// applyFSLayerEntryModePinned applies mode to a specific inode when the caller verified
-// one, so a concurrent rename of the name cannot redirect the change; otherwise it falls
-// back to the path.
-func applyFSLayerEntryModePinned(ctx context.Context, b *backendpkg.Dat9Backend, path, inodeID string, mode uint32, allowMissing bool) error {
-	if inodeID == "" {
-		return applyFSLayerEntryMode(ctx, b, path, mode, allowMissing)
+// lastCreatedID is the innermost inode a creation reported: the file for a write, the
+// directory for a mkdir.
+func lastCreatedID(createdIDs []string) string {
+	if len(createdIDs) == 0 {
+		return ""
 	}
-	if err := b.ChmodInodeCtx(ctx, inodeID, mode); err != nil {
-		if allowMissing && errors.Is(err, datastore.ErrNotFound) {
-			return nil
-		}
-		return fmt.Errorf("chmod fs layer inode %s (%s): %w", inodeID, path, err)
-	}
-	return nil
+	return createdIDs[len(createdIDs)-1]
 }
 
 func applyFSLayerEntryMode(ctx context.Context, b *backendpkg.Dat9Backend, path string, mode uint32, allowMissing bool) error {

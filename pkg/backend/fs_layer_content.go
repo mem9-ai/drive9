@@ -86,27 +86,29 @@ func (b *Dat9Backend) OpenFSLayerEntryData(ctx context.Context, entry *datastore
 	return io.NopCloser(bytes.NewReader(entry.ContentBlob)), nil
 }
 
-// WriteStoredObjectCreateCtx creates a new file backed by an already-uploaded object, with
-// mode applied inside the insert transaction, and returns the inode it created.
-func (b *Dat9Backend) WriteStoredObjectCreateCtx(ctx context.Context, path string, entry *datastore.FSLayerEntry, mode uint32) (inodeID string, revision int64, err error) {
+// WriteStoredObjectCreatedCtxIfRevision creates a new file backed by an already-uploaded
+// object and reports the inode ids it created (parents first, then the file). It is the
+// object-backed twin of createAndWriteCtx, so a layer commit binds the creation mode to the
+// inode rather than chmod-ing the name afterwards.
+func (b *Dat9Backend) WriteStoredObjectCreatedCtxIfRevision(ctx context.Context, path string, entry *datastore.FSLayerEntry) (revision int64, createdIDs []string, err error) {
 	if entry == nil {
-		return "", 0, fmt.Errorf("nil fs layer entry")
+		return 0, nil, fmt.Errorf("nil fs layer entry")
 	}
 	canonical, err := pathutil.Canonicalize(path)
 	if err != nil {
-		return "", 0, err
+		return 0, nil, err
 	}
 	if err := rejectRootFileNodePath(canonical); err != nil {
-		return "", 0, err
+		return 0, nil, err
 	}
 	if entry.StorageType != string(datastore.StorageS3) || entry.StorageRef == "" {
-		return "", 0, fmt.Errorf("missing fs layer external payload for %s", canonical)
+		return 0, nil, fmt.Errorf("missing fs layer external payload for %s", canonical)
 	}
 	if err := b.ensureUploadSizeAllowed(entry.SizeBytes); err != nil {
-		return "", 0, err
+		return 0, nil, err
 	}
 	if err := b.ensureFileSizeQuota(ctx, entry.SizeBytes); err != nil {
-		return "", 0, err
+		return 0, nil, err
 	}
 	storageEncryptionMode := entry.StorageEncryptionMode
 	if storageEncryptionMode == "" {
@@ -114,6 +116,7 @@ func (b *Dat9Backend) WriteStoredObjectCreateCtx(ctx context.Context, path strin
 	}
 	now := time.Now()
 	fileID := b.genID()
+	var createdParents []string
 	err = b.store.InTx(ctx, func(tx *sql.Tx) error {
 		if err := b.ensureStorageQuota(ctx, tx, canonical, entry.SizeBytes); err != nil {
 			return err
@@ -131,16 +134,17 @@ func (b *Dat9Backend) WriteStoredObjectCreateCtx(ctx context.Context, path strin
 			SizeBytes:              entry.SizeBytes,
 			ChecksumSHA256:         entry.ChecksumSHA256,
 			Revision:               1,
-			Mode:                   mode & 0o777,
 			Status:                 datastore.StatusConfirmed,
 			CreatedAt:              now,
 			ConfirmedAt:            &now,
 		}); err != nil {
 			return err
 		}
-		if err := b.store.EnsureParentDirsTx(tx, canonical, b.genID); err != nil {
+		parents, err := b.store.EnsureParentDirsTxCreated(ctx, tx, canonical, b.genID)
+		if err != nil {
 			return err
 		}
+		createdParents = parents
 		return b.store.InsertNodeTx(tx, &datastore.FileNode{
 			NodeID:     b.genID(),
 			Path:       canonical,
@@ -152,11 +156,11 @@ func (b *Dat9Backend) WriteStoredObjectCreateCtx(ctx context.Context, path strin
 	})
 	if err != nil {
 		if errors.Is(err, datastore.ErrPathConflict) {
-			return "", 0, datastore.ErrRevisionConflict
+			return 0, nil, datastore.ErrRevisionConflict
 		}
-		return "", 0, err
+		return 0, nil, err
 	}
-	return fileID, 1, nil
+	return 1, append(append([]string{}, createdParents...), fileID), nil
 }
 
 // WriteStoredObjectCtxIfRevision applies an already-stored layer payload to the
