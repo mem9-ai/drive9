@@ -576,7 +576,7 @@ func TestFSLayerAppliedModeChangeFollowsRenamedInode(t *testing.T) {
 	if err := s.fallback.RenameCtx(ctx, "/zone/a.txt", "/zone/b.txt"); err != nil {
 		t.Fatal(err)
 	}
-	ownership := fsLayerPlanOwnership{}
+	ownership := newFSLayerPlanOwnership()
 	ownership.noteMove(&datastore.FSLayerEntry{Path: "/zone/a.txt", Op: datastore.FSLayerEntryOpRename, Kind: datastore.FSLayerEntryKindFile, ContentText: "/zone/b.txt"})
 	if ownership.owns("/zone/b.txt") {
 		t.Fatal("a rename of a live inode made the target plan-owned")
@@ -604,6 +604,137 @@ func TestFSLayerAppliedModeChangeFollowsRenamedInode(t *testing.T) {
 	}
 	if changes {
 		t.Fatal("a chmod of a missing path was reported as a live change")
+	}
+
+	// A self-rename is a backend no-op: it must not drop ownership of a name the commit
+	// created, or the next entry there is compared against that very inode.
+	self := newFSLayerPlanOwnership()
+	self.own("/zone/own.txt")
+	self.noteMove(&datastore.FSLayerEntry{Path: "/zone/own.txt", Op: datastore.FSLayerEntryOpRename, Kind: datastore.FSLayerEntryKindFile, ContentText: "/zone/own.txt"})
+	if !self.owns("/zone/own.txt") {
+		t.Fatal("a self-rename dropped ownership of a plan-created name")
+	}
+
+	// A live inode renamed under a plan-created directory stays live: the guard must not
+	// inherit it as plan-owned through the ancestor walk.
+	nested := newFSLayerPlanOwnership()
+	nested.own("/zone/d")
+	nested.noteMove(&datastore.FSLayerEntry{Path: "/zone/live.txt", Op: datastore.FSLayerEntryOpRename, Kind: datastore.FSLayerEntryKindFile, ContentText: "/zone/d/live.txt"})
+	if nested.owns("/zone/d/live.txt") {
+		t.Fatal("a live inode under a plan-created directory was treated as plan-owned")
+	}
+	if !nested.owns("/zone/d/other.txt") {
+		t.Fatal("a name under a plan-created directory lost its inherited ownership")
+	}
+}
+
+// The scoped delete-then-recreate flow the vacated-path rule blesses has to survive the
+// gate: a staged whiteout stores a NULL target, so the moves projection used to fail the
+// next staging with a scan error.
+func TestFSLayerScopedStageDeleteThenRecreate(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	store := s.fallback.Store()
+	if _, err := s.fallback.WriteCtx(ctx, "/zone/w.txt", []byte("live"), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateFSLayer(ctx, &datastore.FSLayer{LayerID: "layer-recreate", BaseRootPath: "/zone"}); err != nil {
+		t.Fatal(err)
+	}
+	layer, err := store.GetFSLayer(ctx, "layer-recreate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	scoped := &TenantScope{
+		Backend:  s.fallback,
+		IsScoped: true,
+		FSScopes: []FSScope{{Prefix: "/zone", Ops: map[FSOp]bool{FSOpRead: true, FSOpWrite: true, FSOpDelete: true}}},
+	}
+	post := func(body string) int {
+		req := httptest.NewRequest(http.MethodPost, "/v1/layers/layer-recreate/entries", bytes.NewReader([]byte(body)))
+		req = req.WithContext(withScope(req.Context(), scoped))
+		rr := httptest.NewRecorder()
+		s.handleFSLayerEntryUpsert(rr, req, s.fallback, store, layer)
+		return rr.Code
+	}
+	if got := post(`{"path":"/zone/w.txt","op":"whiteout","kind":"file"}`); got != http.StatusOK {
+		t.Fatalf("scoped whiteout staging status=%d, want 200", got)
+	}
+	if got := post(`{"path":"/zone/w.txt","op":"upsert","kind":"file","mode":384,"content_text":"recreated"}`); got != http.StatusOK {
+		t.Fatalf("scoped recreate staging status=%d, want 200", got)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/layers/layer-recreate/commit", nil)
+	req = req.WithContext(withScope(req.Context(), scoped))
+	rr := httptest.NewRecorder()
+	layer, err = store.GetFSLayer(ctx, "layer-recreate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.handleFSLayerCommit(rr, req, s.fallback, store, layer)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("scoped recreate commit status=%d body=%s, want 200", rr.Code, rr.Body.String())
+	}
+	nf, err := s.fallback.StatNodeCtx(ctx, "/zone/w.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fsLayerNodeMode(nf) & 0o777; got != 0o600 {
+		t.Fatalf("recreated mode = %o, want 600", got)
+	}
+}
+
+// A self-rename of a name the plan created is a no-op, so the restyle entry after it is
+// still a creation-mode write on the plan's own inode.
+func TestFSLayerScopedCommitAllowsRestyleAfterSelfRename(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	store := s.fallback.Store()
+	if _, err := s.fallback.WriteCtx(ctx, "/zone/a.txt", []byte("live"), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateFSLayer(ctx, &datastore.FSLayer{LayerID: "layer-self-restyle", BaseRootPath: "/zone"}); err != nil {
+		t.Fatal(err)
+	}
+	layer, err := store.GetFSLayer(ctx, "layer-self-restyle")
+	if err != nil {
+		t.Fatal(err)
+	}
+	scoped := &TenantScope{
+		Backend:  s.fallback,
+		IsScoped: true,
+		FSScopes: []FSScope{{Prefix: "/zone", Ops: map[FSOp]bool{FSOpRead: true, FSOpWrite: true, FSOpDelete: true}}},
+	}
+	for _, body := range []string{
+		`{"path":"/zone/a.txt","op":"rename","kind":"file","content_text":"/zone/c.txt"}`,
+		`{"path":"/zone/a.txt","op":"upsert","kind":"file","mode":384,"content_text":"new"}`,
+		`{"path":"/zone/a.txt","op":"rename","kind":"file","content_text":"/zone/a.txt"}`,
+		`{"path":"/zone/a.txt","op":"upsert","kind":"file","mode":420,"content_text":"newer"}`,
+	} {
+		req := httptest.NewRequest(http.MethodPost, "/v1/layers/layer-self-restyle/entries", bytes.NewReader([]byte(body)))
+		req = req.WithContext(withScope(req.Context(), scoped))
+		rr := httptest.NewRecorder()
+		s.handleFSLayerEntryUpsert(rr, req, s.fallback, store, layer)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("scoped staging %s status=%d body=%s, want 200", body, rr.Code, rr.Body.String())
+		}
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/layers/layer-self-restyle/commit", nil)
+	req = req.WithContext(withScope(req.Context(), scoped))
+	rr := httptest.NewRecorder()
+	layer, err = store.GetFSLayer(ctx, "layer-self-restyle")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.handleFSLayerCommit(rr, req, s.fallback, store, layer)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("scoped commit after self-rename status=%d body=%s, want 200", rr.Code, rr.Body.String())
+	}
+	nf, err := s.fallback.StatNodeCtx(ctx, "/zone/a.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fsLayerNodeMode(nf) & 0o777; got != 0o644 {
+		t.Fatalf("final mode = %o, want 644", got)
 	}
 }
 

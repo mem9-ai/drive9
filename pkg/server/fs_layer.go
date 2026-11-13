@@ -1040,13 +1040,19 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 	// it named. Any entry that creates its path — file, directory, symlink — makes the
 	// commit own that name, so later entries there are creation-mode writes rather than
 	// chmods of an inode this commit just made.
-	ownership := fsLayerPlanOwnership{}
+	// Only a caller that may not chmod needs it: the guard is the only reader, and an owner
+	// commit must not pay a stat per entry for information nothing consults.
+	ownership := newFSLayerPlanOwnership()
 	for i := range entries {
 		entry := &entries[i]
-		willCreate, classifyErr := ownership.createsPath(r.Context(), b, entry)
-		if classifyErr != nil {
-			failCommit(filterFSLayerSnapshotsForEntries(snapshots, entries[:i]), "fs_layer_commit_apply_failed", entry.Path, classifyErr)
-			return
+		willCreate := false
+		if !canChmod {
+			var classifyErr error
+			willCreate, classifyErr = ownership.createsPath(r.Context(), b, entry)
+			if classifyErr != nil {
+				failCommit(filterFSLayerSnapshotsForEntries(snapshots, entries[:i]), "fs_layer_commit_apply_failed", entry.Path, classifyErr)
+				return
+			}
 		}
 		modeMayBeSuperseded := fsLayerEntryModeSuperseded(entries, i)
 		if err := applyFSLayerEntry(r.Context(), b, entry, touchedPaths, fsLayerApplyOptions{modeMayBeSuperseded: modeMayBeSuperseded, canChmod: canChmod, ownership: ownership}); err != nil {
@@ -1054,10 +1060,12 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 			return
 		}
 		markFSLayerEntryTouched(touchedPaths, entry)
-		if willCreate {
-			ownership.own(entry.Path)
+		if !canChmod {
+			if willCreate {
+				ownership.own(entry.Path)
+			}
+			ownership.noteMove(entry)
 		}
-		ownership.noteMove(entry)
 	}
 	if err := store.SetFSLayerStateIf(commitCtx, layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateCommitted); err != nil {
 		failCommit(snapshots, "fs_layer_commit_finalize_failed", "", err)
@@ -2357,7 +2365,11 @@ func applyFSLayerEntry(ctx context.Context, b *backendpkg.Dat9Backend, entry *da
 		if mode == 0 {
 			return nil
 		}
-		return applyFSLayerEntryMode(ctx, b, entry.Path, mode&0o777, opts.modeMayBeSuperseded)
+		// The guard already decided a missing target is nothing to change for a caller
+		// that may not chmod; tolerate it here instead of turning a no-op into a
+		// conflicted layer. An owner chmod keeps its error.
+		allowMissing := opts.modeMayBeSuperseded || !opts.canChmod
+		return applyFSLayerEntryMode(ctx, b, entry.Path, mode&0o777, allowMissing)
 	case datastore.FSLayerEntryOpSymlink:
 		target := entry.ContentText
 		if target == "" && len(entry.ContentBlob) > 0 {

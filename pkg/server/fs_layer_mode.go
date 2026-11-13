@@ -321,18 +321,32 @@ func (s *Server) authorizeFSLayerEntryMode(w http.ResponseWriter, r *http.Reques
 // created inode into). It never stores a live path, because the world it is consulted in
 // is the one the commit is mutating — a recorded live path goes stale the moment the
 // plan moves or overwrites the inode it named.
-type fsLayerPlanOwnership map[string]struct{}
+//
+// liveNames is the exception the ancestor walk needs: a live inode renamed *into* a
+// directory this commit created is still a live inode, so a later mode entry at it must
+// be compared rather than inherited as plan-owned.
+type fsLayerPlanOwnership struct {
+	owned     map[string]struct{}
+	liveNames map[string]struct{}
+}
+
+func newFSLayerPlanOwnership() fsLayerPlanOwnership {
+	return fsLayerPlanOwnership{owned: map[string]struct{}{}, liveNames: map[string]struct{}{}}
+}
 
 func trimLayerPath(rawPath string) string {
 	return strings.TrimSuffix(rawPath, "/")
 }
 
-// owns reports whether the commit owns the name or any ancestor of it: everything below a
-// directory this commit created is a creation too.
+// owns reports whether the commit owns the name: it created the name or an ancestor, and
+// the name is not a live inode the plan moved underneath an owned directory.
 func (o fsLayerPlanOwnership) owns(rawPath string) bool {
 	path := trimLayerPath(rawPath)
 	for name := path; ; {
-		if _, ok := o[name]; ok {
+		if _, ok := o.liveNames[name]; ok {
+			return false
+		}
+		if _, ok := o.owned[name]; ok {
 			return true
 		}
 		idx := strings.LastIndex(name, "/")
@@ -345,22 +359,37 @@ func (o fsLayerPlanOwnership) owns(rawPath string) bool {
 
 // own records a name this commit created.
 func (o fsLayerPlanOwnership) own(rawPath string) {
-	o[trimLayerPath(rawPath)] = struct{}{}
+	path := trimLayerPath(rawPath)
+	delete(o.liveNames, path)
+	o.owned[path] = struct{}{}
+}
+
+// markLive records a name that holds a live inode even though an owned ancestor exists.
+func (o fsLayerPlanOwnership) markLive(rawPath string) {
+	path := trimLayerPath(rawPath)
+	delete(o.owned, path)
+	o.liveNames[path] = struct{}{}
 }
 
 // drop forgets the name and everything below it.
 func (o fsLayerPlanOwnership) drop(rawPath string) {
 	path := trimLayerPath(rawPath)
-	for name := range o {
+	for name := range o.owned {
 		if name == path || strings.HasPrefix(name, path+"/") {
-			delete(o, name)
+			delete(o.owned, name)
+		}
+	}
+	for name := range o.liveNames {
+		if name == path || strings.HasPrefix(name, path+"/") {
+			delete(o.liveNames, name)
 		}
 	}
 }
 
 // noteMove applies a rename or whiteout to the ownership set. A rename of a name this
-// commit owns moves the ownership; a rename of a live inode leaves the target unowned, so
-// later entries there are compared against that live inode as it is now.
+// commit owns moves the ownership; a rename of a live inode leaves the target live, so
+// later entries there are compared against that inode as it is now even when the target
+// sits under a directory this commit created.
 func (o fsLayerPlanOwnership) noteMove(entry *datastore.FSLayerEntry) {
 	if entry == nil {
 		return
@@ -372,19 +401,26 @@ func (o fsLayerPlanOwnership) noteMove(entry *datastore.FSLayerEntry) {
 		// same entry just recorded.
 		return
 	}
-	owned := o.owns(entry.Path)
-	o.drop(entry.Path)
-	if entry.Op != datastore.FSLayerEntryOpRename {
+	source := trimLayerPath(entry.Path)
+	target := ""
+	if entry.Op == datastore.FSLayerEntryOpRename {
+		target = trimLayerPath(fsLayerRenameTarget(entry))
+	}
+	// A self-rename is a backend no-op, so it must not disturb ownership of the name.
+	if target == source {
 		return
 	}
-	target := trimLayerPath(fsLayerRenameTarget(entry))
-	if target == "" || target == trimLayerPath(entry.Path) {
+	owned := o.owns(source)
+	o.drop(source)
+	if entry.Op != datastore.FSLayerEntryOpRename || target == "" {
 		return
 	}
 	o.drop(target)
 	if owned {
 		o.own(target)
+		return
 	}
+	o.markLive(target)
 }
 
 // createsPath reports whether applying entry will create its path: the commit does not own
@@ -414,7 +450,7 @@ func (o fsLayerPlanOwnership) createsPath(ctx context.Context, b *backendpkg.Dat
 // appliedModeChange reports whether applying entry now would change the permission bits of
 // an inode this commit does not own — the drift check for an owner chmod landing between
 // the plan scan and this entry. A path this commit created, or that sits under one, has no
-// live inode to protect.
+// live inode to protect unless a rename moved a live inode there.
 func (o fsLayerPlanOwnership) appliedModeChange(ctx context.Context, b *backendpkg.Dat9Backend, entry *datastore.FSLayerEntry) (bool, error) {
 	if b == nil || !fsLayerEntryCarriesMode(entry) || o.owns(entry.Path) {
 		return false, nil

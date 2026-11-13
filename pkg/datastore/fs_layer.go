@@ -607,8 +607,10 @@ func (s *Store) ListFSLayerPlanMoves(ctx context.Context, layerID string) ([]FSL
 	if layerID == "" {
 		return nil, fmt.Errorf("fs layer id is required")
 	}
+	// content_text is NULL for a whiteout (no target), so coalesce it: the op alone
+	// carries the meaning, and a plain string scan would fail the whole gate.
 	rows, err := s.db.QueryContext(ctx, `
-SELECT op, path, content_text
+SELECT op, path, COALESCE(content_text, '')
 FROM fs_layer_entries
 WHERE `+s.scope.And("layer_id = ?")+` AND op IN (?, ?)
 ORDER BY entry_seq ASC, path ASC`, s.scope.Args(layerID, string(FSLayerEntryOpRename), string(FSLayerEntryOpWhiteout))...)
