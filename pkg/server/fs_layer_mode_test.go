@@ -189,7 +189,7 @@ func TestFSLayerScopedObjectUploadRefusesModeChange(t *testing.T) {
 func TestFSLayerModeChangeRespectsPlanOrder(t *testing.T) {
 	s := newTestServer(t)
 	ctx := context.Background()
-	for _, path := range []string{"/x/f.txt", "/x/g.txt"} {
+	for _, path := range []string{"/x/f.txt", "/x/g.txt", "/zone/live.txt"} {
 		if _, err := s.fallback.WriteCtx(ctx, path, []byte("live"), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate); err != nil {
 			t.Fatal(err)
 		}
@@ -244,6 +244,25 @@ func TestFSLayerModeChangeRespectsPlanOrder(t *testing.T) {
 	if !decide(whiteout("/x/f.txt"), rename("/x/g.txt", "/x/f.txt"), upsert("/x/f.txt", 0o644)) {
 		t.Fatal("a rename into a vacated path lost its live inode identity")
 	}
+	// A directory rename carries the subtree: a live file moved inside, then the container
+	// renamed, must still be recognised as that live inode.
+	{
+		plan := []datastore.FSLayerEntry{
+			{Path: "/zone/d/", Op: datastore.FSLayerEntryOpWhiteout, Kind: datastore.FSLayerEntryKindDir},
+			{Path: "/zone/d/", Op: datastore.FSLayerEntryOpMkdir, Kind: datastore.FSLayerEntryKindDir, Mode: 0o755},
+			{Path: "/zone/live.txt", Op: datastore.FSLayerEntryOpRename, Kind: datastore.FSLayerEntryKindFile, ContentText: "/zone/d/live.txt"},
+			{Path: "/zone/d/", Op: datastore.FSLayerEntryOpRename, Kind: datastore.FSLayerEntryKindDir, ContentText: "/zone/e/"},
+			{Path: "/zone/e/live.txt", Op: datastore.FSLayerEntryOpChmod, Kind: datastore.FSLayerEntryKindFile, Mode: 0o777},
+		}
+		changes, err := fsLayerPlanChangesExistingMode(ctx, s.fallback, plan)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !changes {
+			t.Fatal("a directory rename laundered a live inode past the pre-apply scan")
+		}
+	}
+
 	// A self-rename is a backend no-op, so the path keeps its live inode and an upsert
 	// with a different mode is a change.
 	if !decide(rename("/x/f.txt", "/x/f.txt"), upsert("/x/f.txt", 0o644)) {
@@ -626,6 +645,19 @@ func TestFSLayerAppliedModeChangeFollowsRenamedInode(t *testing.T) {
 	if !nested.owns("/zone/d/other.txt") {
 		t.Fatal("a name under a plan-created directory lost its inherited ownership")
 	}
+
+	// A directory rename carries its subtree: the live exclusion must move with it, or the
+	// live inode is laundered into the renamed plan-owned container.
+	renamed := newFSLayerPlanOwnership()
+	renamed.own("/zone/d")
+	renamed.markLive("/zone/d/live.txt")
+	renamed.noteMove(&datastore.FSLayerEntry{Path: "/zone/d", Op: datastore.FSLayerEntryOpRename, Kind: datastore.FSLayerEntryKindDir, ContentText: "/zone/e"})
+	if !renamed.owns("/zone/e") {
+		t.Fatal("the renamed container lost its plan ownership")
+	}
+	if renamed.owns("/zone/e/live.txt") {
+		t.Fatal("a directory rename laundered a live inode into plan ownership")
+	}
 }
 
 // The scoped delete-then-recreate flow the vacated-path rule blesses has to survive the
@@ -735,6 +767,61 @@ func TestFSLayerScopedCommitAllowsRestyleAfterSelfRename(t *testing.T) {
 	}
 	if got := fsLayerNodeMode(nf) & 0o777; got != 0o644 {
 		t.Fatalf("final mode = %o, want 644", got)
+	}
+}
+
+// The five-entry laundering attempt from the review, end to end: a live file is moved
+// into a plan-created directory, the container is renamed, and the chmod under the new
+// name is refused because the rename carries the subtree's live identity with it.
+func TestFSLayerScopedStageRefusesModeChangeThroughDirectoryRename(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	store := s.fallback.Store()
+	if _, err := s.fallback.WriteCtx(ctx, "/zone/live.txt", []byte("live"), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.fallback.ChmodCtx(ctx, "/zone/live.txt", 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateFSLayer(ctx, &datastore.FSLayer{LayerID: "layer-launder", BaseRootPath: "/zone"}); err != nil {
+		t.Fatal(err)
+	}
+	layer, err := store.GetFSLayer(ctx, "layer-launder")
+	if err != nil {
+		t.Fatal(err)
+	}
+	scoped := &TenantScope{
+		Backend:  s.fallback,
+		IsScoped: true,
+		FSScopes: []FSScope{{Prefix: "/zone", Ops: map[FSOp]bool{FSOpRead: true, FSOpWrite: true, FSOpDelete: true}}},
+	}
+	post := func(body string) int {
+		req := httptest.NewRequest(http.MethodPost, "/v1/layers/layer-launder/entries", bytes.NewReader([]byte(body)))
+		req = req.WithContext(withScope(req.Context(), scoped))
+		rr := httptest.NewRecorder()
+		s.handleFSLayerEntryUpsert(rr, req, s.fallback, store, layer)
+		return rr.Code
+	}
+	for _, body := range []string{
+		`{"path":"/zone/d/","op":"whiteout","kind":"dir"}`,
+		`{"path":"/zone/d/","op":"mkdir","kind":"dir","mode":493}`,
+		`{"path":"/zone/live.txt","op":"rename","kind":"file","content_text":"/zone/d/live.txt"}`,
+		`{"path":"/zone/d/","op":"rename","kind":"dir","content_text":"/zone/e/"}`,
+	} {
+		if got := post(body); got != http.StatusOK {
+			t.Fatalf("scoped staging %s status=%d, want 200", body, got)
+		}
+	}
+	// The chmod is the escalation attempt: refused at staging, before any commit.
+	if got := post(`{"path":"/zone/e/live.txt","op":"chmod","kind":"file","mode":511}`); got != http.StatusForbidden {
+		t.Fatalf("scoped chmod through a directory rename status=%d, want 403", got)
+	}
+	nf, err := s.fallback.StatNodeCtx(ctx, "/zone/live.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fsLayerNodeMode(nf) & 0o777; got != 0o644 {
+		t.Fatalf("live mode = %o, want 644", got)
 	}
 }
 

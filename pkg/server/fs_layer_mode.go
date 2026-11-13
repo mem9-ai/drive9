@@ -154,11 +154,35 @@ func (st fsLayerPlanState) applyMove(ctx context.Context, b *backendpkg.Dat9Back
 			return err
 		}
 	}
-	st.prune(source)
+	// A directory rename carries everything below it: re-key the descendants instead of
+	// discarding them, or their live identity is lost and a later mode entry under the
+	// target reads as a creation. The pre-existing target subtree goes first, so the
+	// re-key is not pruned away.
 	st.prune(target)
+	st.rekey(source, target)
 	st[target] = resolved
 	st[source] = fsLayerPlanNode{vacated: true}
 	return nil
+}
+
+// rekey moves every name strictly below oldPrefix to the same relative place below
+// newPrefix, preserving each node's live-main identity.
+func (st fsLayerPlanState) rekey(oldPrefix, newPrefix string) {
+	if oldPrefix == "" || newPrefix == "" || oldPrefix == newPrefix {
+		return
+	}
+	moved := make(map[string]fsLayerPlanNode)
+	for key, node := range st {
+		suffix, ok := strings.CutPrefix(key, oldPrefix+"/")
+		if !ok {
+			continue
+		}
+		moved[newPrefix+"/"+suffix] = node
+		delete(st, key)
+	}
+	for key, node := range moved {
+		st[key] = node
+	}
 }
 
 // fsLayerNodePath reports the live path a stat row belongs to. The node is authoritative
@@ -317,21 +341,24 @@ func (s *Server) authorizeFSLayerEntryMode(w http.ResponseWriter, r *http.Reques
 	return true
 }
 
-// fsLayerPlanOwnership is the apply-time view: the names this commit created (or moved a
-// created inode into). It never stores a live path, because the world it is consulted in
-// is the one the commit is mutating — a recorded live path goes stale the moment the
-// plan moves or overwrites the inode it named.
+// fsLayerPlanOwnership is the apply-time view: for the names the commit touched, whether
+// this commit owns them (it created the name or an ancestor) or whether they hold a live
+// inode the plan moved there. It never stores a live path, because the world it is
+// consulted in is the one the commit is mutating.
 //
-// liveNames is the exception the ancestor walk needs: a live inode renamed *into* a
-// directory this commit created is still a live inode, so a later mode entry at it must
-// be compared rather than inherited as plan-owned.
-type fsLayerPlanOwnership struct {
-	owned     map[string]struct{}
-	liveNames map[string]struct{}
-}
+// One map with a kind rather than two sets: a name is owned or live, never both, so the
+// invariant is structural and every writer touches one entry.
+type fsLayerOwnershipKind uint8
+
+const (
+	ownershipPlan fsLayerOwnershipKind = iota + 1
+	ownershipLive
+)
+
+type fsLayerPlanOwnership map[string]fsLayerOwnershipKind
 
 func newFSLayerPlanOwnership() fsLayerPlanOwnership {
-	return fsLayerPlanOwnership{owned: map[string]struct{}{}, liveNames: map[string]struct{}{}}
+	return fsLayerPlanOwnership{}
 }
 
 func trimLayerPath(rawPath string) string {
@@ -343,10 +370,10 @@ func trimLayerPath(rawPath string) string {
 func (o fsLayerPlanOwnership) owns(rawPath string) bool {
 	path := trimLayerPath(rawPath)
 	for name := path; ; {
-		if _, ok := o.liveNames[name]; ok {
+		switch o[name] {
+		case ownershipLive:
 			return false
-		}
-		if _, ok := o.owned[name]; ok {
+		case ownershipPlan:
 			return true
 		}
 		idx := strings.LastIndex(name, "/")
@@ -359,37 +386,50 @@ func (o fsLayerPlanOwnership) owns(rawPath string) bool {
 
 // own records a name this commit created.
 func (o fsLayerPlanOwnership) own(rawPath string) {
-	path := trimLayerPath(rawPath)
-	delete(o.liveNames, path)
-	o.owned[path] = struct{}{}
+	o[trimLayerPath(rawPath)] = ownershipPlan
 }
 
 // markLive records a name that holds a live inode even though an owned ancestor exists.
 func (o fsLayerPlanOwnership) markLive(rawPath string) {
-	path := trimLayerPath(rawPath)
-	delete(o.owned, path)
-	o.liveNames[path] = struct{}{}
+	o[trimLayerPath(rawPath)] = ownershipLive
 }
 
 // drop forgets the name and everything below it.
 func (o fsLayerPlanOwnership) drop(rawPath string) {
 	path := trimLayerPath(rawPath)
-	for name := range o.owned {
+	for name := range o {
 		if name == path || strings.HasPrefix(name, path+"/") {
-			delete(o.owned, name)
-		}
-	}
-	for name := range o.liveNames {
-		if name == path || strings.HasPrefix(name, path+"/") {
-			delete(o.liveNames, name)
+			delete(o, name)
 		}
 	}
 }
 
-// noteMove applies a rename or whiteout to the ownership set. A rename of a name this
-// commit owns moves the ownership; a rename of a live inode leaves the target live, so
-// later entries there are compared against that inode as it is now even when the target
-// sits under a directory this commit created.
+// rekey moves every recorded name strictly below oldPrefix to the same relative place
+// below newPrefix. A directory rename carries its subtree, so ownership and live
+// exclusions have to move with it; dropping them is how a live inode gets laundered into a
+// plan-owned directory.
+func (o fsLayerPlanOwnership) rekey(oldPrefix, newPrefix string) {
+	if oldPrefix == "" || newPrefix == "" || oldPrefix == newPrefix {
+		return
+	}
+	moved := make(map[string]fsLayerOwnershipKind)
+	for name, kind := range o {
+		suffix, ok := strings.CutPrefix(name, oldPrefix+"/")
+		if !ok {
+			continue
+		}
+		moved[newPrefix+"/"+suffix] = kind
+		delete(o, name)
+	}
+	for name, kind := range moved {
+		o[name] = kind
+	}
+}
+
+// noteMove applies a rename or whiteout to the ownership set. A rename carries the names
+// below the source to the target and keeps each one's kind: a name this commit owns stays
+// owned, a moved live inode stays live (so later entries there are compared against it as
+// it is now).
 func (o fsLayerPlanOwnership) noteMove(entry *datastore.FSLayerEntry) {
 	if entry == nil {
 		return
@@ -410,17 +450,24 @@ func (o fsLayerPlanOwnership) noteMove(entry *datastore.FSLayerEntry) {
 	if target == source {
 		return
 	}
-	owned := o.owns(source)
-	o.drop(source)
-	if entry.Op != datastore.FSLayerEntryOpRename || target == "" {
-		return
-	}
+	sourceKind := o[source]
+	// A pre-existing target is replaced by the rename; drop it before re-keying so the
+	// moved subtree is not erased.
 	o.drop(target)
-	if owned {
-		o.own(target)
+	o.rekey(source, target)
+	if entry.Op != datastore.FSLayerEntryOpRename || target == "" {
+		o.drop(source)
 		return
 	}
-	o.markLive(target)
+	// The source name itself is now empty; the target holds the source's inode. A source
+	// the commit does not own is a live inode (or absent from live main), so the target is
+	// marked live and later entries there are compared against it.
+	o.drop(source)
+	if sourceKind == ownershipPlan {
+		o.own(target)
+	} else {
+		o.markLive(target)
+	}
 }
 
 // createsPath reports whether applying entry will create its path: the commit does not own
