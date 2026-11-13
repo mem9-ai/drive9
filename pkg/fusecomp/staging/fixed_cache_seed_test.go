@@ -85,3 +85,92 @@ func TestFixedCacheSeedRefusesMissingOrCorruptMetadata(t *testing.T) {
 		})
 	}
 }
+
+func TestFixedCacheSeedRenewalPreservesImageAndReplays(t *testing.T) {
+	dir := t.TempDir()
+	c, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.PutWithBaseRev("/f", []byte("bytes"), 5, PendingOverwrite, 4); err != nil {
+		t.Fatal(err)
+	}
+	gen := c.MetaGeneration("/f")
+	seed, err := c.FixedUploadSeed("/f", gen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.RenewFixedUploadSeedAfterAbort("/f", gen, seed); err != nil {
+		t.Fatal(err)
+	}
+	next, err := c.FixedUploadSeed("/f", gen)
+	if err != nil || next == seed {
+		t.Fatal(next, err)
+	}
+	if err := c.RenewFixedUploadSeedAfterAbort("/f", gen, seed); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := reopened.FixedUploadSeed("/f", gen)
+	if err != nil || again != next {
+		t.Fatal(again, err)
+	}
+	meta, data, ok := reopened.GetMetaAndView("/f")
+	if !ok || string(data) != "bytes" || meta.BaseRev != 4 || meta.Generation != gen {
+		t.Fatal("changed image")
+	}
+	if err := reopened.Put("/f", []byte("newer"), 5, PendingNew); err != nil {
+		t.Fatal(err)
+	}
+	newGen := reopened.MetaGeneration("/f")
+	current, err := reopened.FixedUploadSeed("/f", newGen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.RenewFixedUploadSeedAfterAbort("/f", gen, next); err != nil {
+		t.Fatal(err)
+	}
+	if after, err := reopened.FixedUploadSeed("/f", newGen); err != nil || after != current {
+		t.Fatal("renewed newer attempt", after, err)
+	}
+}
+
+func TestFixedCacheSeedRenewalRejectsCorruptMetadata(t *testing.T) {
+	c, err := NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Put("/f", []byte("bytes"), 5, PendingNew); err != nil {
+		t.Fatal(err)
+	}
+	gen := c.MetaGeneration("/f")
+	seed, err := c.FixedUploadSeed("/f", gen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(c.MetaFile("/f"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(c.MetaFile("/f"), []byte("{"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.RenewFixedUploadSeedAfterAbort("/f", gen, seed); err == nil {
+		t.Fatal("advanced corrupt metadata")
+	}
+	if err := os.WriteFile(c.MetaFile("/f"), raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if after, err := c.FixedUploadSeed("/f", gen); err != nil || after != seed {
+		t.Fatal(after, err)
+	}
+	if err := c.RenewFixedUploadSeedAfterAbort("/f", 0, seed); err == nil {
+		t.Fatal("zero generation accepted")
+	}
+	if err := c.RenewFixedUploadSeedAfterAbort("/f", gen, "bad/id"); err == nil {
+		t.Fatal("invalid attempt accepted")
+	}
+}

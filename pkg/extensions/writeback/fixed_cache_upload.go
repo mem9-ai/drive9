@@ -6,9 +6,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/staging"
@@ -110,6 +112,21 @@ func (u *WriteBackUploader) uploadFixedCache(ctx context.Context, path string) (
 		}
 		parts, err := u.client.UploadFixedExtentParts(ctx, plan, bytes.NewReader(data), meta.Size, nil)
 		if err != nil {
+			// The transfer helper may already have canceled the session. Only
+			// a confirmed terminal outcome permits a fresh attempt on these
+			// same bytes; a lost cancellation reply retains the original seed.
+			cancelCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			outcome, abortErr := u.client.AbortFixedUpload(cancelCtx, fixedCacheModeID("abort:"+initiationID), plan.UploadID)
+			cancel()
+			if abortErr != nil {
+				return 0, nil, true, errors.Join(err, abortErr)
+			}
+			if outcome.Status != "ABORTED" && outcome.Status != "EXPIRED" {
+				return 0, nil, true, fmt.Errorf("fixed cache transfer unexpectedly published: %w", err)
+			}
+			if renewErr := u.cache.RenewFixedUploadSeedAfterAbort(path, meta.Generation, seed); renewErr != nil {
+				return 0, nil, true, errors.Join(err, renewErr)
+			}
 			return 0, nil, true, err
 		}
 		p.UploadID, p.Parts = plan.UploadID, parts
