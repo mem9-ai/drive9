@@ -375,3 +375,29 @@ func TestFixedPublicationSupportsEitherLocalStore(t *testing.T) {
 		})
 	}
 }
+
+func TestFixedPublicationEmptyRejectsMixedParameters(t *testing.T) {
+	c, _ := client.New("http://localhost.invalid", "").WithView(client.ViewBinding{LayerID: "a", WorkID: "work", Fence: 1})
+	for _, bad := range []string{"", "parts", "session", "size", "condition", "owner"} {
+		t.Run(bad, func(t *testing.T) {
+			expected := int64(0)
+			p := fixedExtentPublication{Version: 1, Binding: c.ViewBinding(), Path: "/file", RemotePath: "/team/file", OperationID: "empty", Size: 0, CacheGeneration: 1, EmptyExpectedRevision: &expected, CacheMetadata: &staging.WriteBackMeta{Path: "/file", Generation: 1, Size: 0, Kind: staging.PendingNew}}
+			switch bad {
+			case "parts":
+				p.Parts = []client.FixedExtentPart{{Number: 1, ETag: strings.Repeat("a", 64)}}
+			case "session":
+				p.UploadID = "upload"
+			case "size":
+				p.Size = 1
+			case "condition":
+				expected = 1
+			case "owner":
+				p.CacheMetadata = nil
+			}
+			err := p.validate(c)
+			if (err != nil) != (bad != "") {
+				t.Fatal(bad, err)
+			}
+		})
+	}
+}

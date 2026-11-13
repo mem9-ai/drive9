@@ -28,15 +28,27 @@ type fixedExtentPublication struct {
 	RemotePath        string                   `json:"remote_path,omitempty"`
 	CacheMetadata     *staging.WriteBackMeta   `json:"cache_metadata,omitempty"`
 	Parts             []client.FixedExtentPart `json:"parts"`
+	// EmptyExpectedRevision selects an empty PUT; no upload session or parts exist.
+	EmptyExpectedRevision *int64 `json:"empty_expected_revision,omitempty"`
 }
 
 func (p fixedExtentPublication) validate(c *client.Client) error {
 	normalized, pathErr := pathutil.Canonicalize(p.Path)
 	if p.Version != 1 || p.Binding.LayerID == "" || p.Binding.Validation || p.Binding.Validate() != nil || c == nil || c.ViewBinding() != p.Binding ||
-		p.Path == "/" || pathErr != nil || normalized != p.Path || p.Size <= 0 || p.Size > 256*(64<<20) ||
-		p.PendingGeneration == 0 && p.CacheGeneration == 0 || viewprotocol.ValidateOperationID(p.OperationID) != nil || viewprotocol.ValidateOperationID(p.UploadID) != nil ||
-		len(p.Parts) < 1 || len(p.Parts) > 256 {
+		p.Path == "/" || pathErr != nil || normalized != p.Path || p.Size < 0 || p.Size > 256*(64<<20) ||
+		p.PendingGeneration == 0 && p.CacheGeneration == 0 || viewprotocol.ValidateOperationID(p.OperationID) != nil {
 		return fmt.Errorf("invalid fixed extent publication record")
+	}
+	if p.EmptyExpectedRevision != nil {
+		if p.Size != 0 || *p.EmptyExpectedRevision < 0 || p.UploadID != "" || len(p.Parts) != 0 || p.CacheMetadata == nil {
+			return fmt.Errorf("invalid fixed empty publication")
+		}
+		expected, err := expectedRevisionForWriteBack(p.CacheMetadata)
+		if err != nil || expected != *p.EmptyExpectedRevision {
+			return fmt.Errorf("fixed empty publication changed condition")
+		}
+	} else if p.Size == 0 || viewprotocol.ValidateOperationID(p.UploadID) != nil || len(p.Parts) < 1 || len(p.Parts) > 256 {
+		return fmt.Errorf("invalid fixed extent publication")
 	}
 	if p.CacheMetadata != nil {
 		m := p.CacheMetadata
@@ -102,6 +114,9 @@ func publishFixedExtent(ctx context.Context, c *client.Client, journal *staging.
 func (p fixedExtentPublication) complete(ctx context.Context, c *client.Client) (client.FixedUploadCompletion, error) {
 	if err := p.validate(c); err != nil {
 		return client.FixedUploadCompletion{}, err
+	}
+	if p.EmptyExpectedRevision != nil {
+		return c.WriteFixedEmptyFile(ctx, p.OperationID, p.RemotePath, *p.EmptyExpectedRevision)
 	}
 	return c.CompleteFixedExtentUploadWithSize(ctx, p.OperationID, p.UploadID, p.Parts, p.Size)
 }

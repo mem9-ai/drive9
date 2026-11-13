@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -26,6 +27,7 @@ type fixedCacheAPI struct {
 	t                                *testing.T
 	journal                          *staging.Journal
 	size                             int64
+	expected                         int64
 	mu                               sync.Mutex
 	initIDs, completeIDs, modeIDs    []string
 	transfers                        atomic.Int32
@@ -50,7 +52,7 @@ func (a *fixedCacheAPI) serve(w http.ResponseWriter, r *http.Request) {
 			Size     int64 `json:"total_size"`
 			Revision int64 `json:"expected_revision"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Path != "/team/file" || req.Size != a.size || req.Revision != 0 {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Path != "/team/file" || req.Size != a.size || req.Revision != a.expected {
 			a.t.Error(req, err)
 		}
 		if a.failInit.Load() {
@@ -88,6 +90,19 @@ func (a *fixedCacheAPI) serve(w http.ResponseWriter, r *http.Request) {
 			a.afterComplete()
 		}
 	case "/v1/views/a/v1/fs/team/file":
+		if r.Method == "PUT" {
+			a.completeIDs = append(a.completeIDs, id)
+			records, err := a.journal.PendingFixedUploads()
+			if a.size != 0 || r.ContentLength != 0 || r.Header.Get("X-Dat9-Expected-Revision") != strconv.FormatInt(a.expected, 10) || err != nil || len(records) != 1 || records[0].OperationID != id || a.journal.DurableSeq() < records[0].Seq {
+				a.t.Error("empty write preceded original durable request", err)
+			}
+			if a.failComplete.Load() {
+				w.WriteHeader(503)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(client.FixedUploadCompletion{Status: "ok", OperationID: id, View: client.FixedViewState{LayerID: "a", Generation: 2, Fence: 1}, ResourceID: "inode", Revision: 7, Size: 0})
+			return
+		}
 		if r.Method != "POST" || r.URL.RawQuery != "chmod" {
 			a.t.Error("unexpected file mutation", r.Method, r.URL)
 			w.WriteHeader(400)
@@ -537,5 +552,55 @@ func TestFixedCacheSettleFailureReopensWithoutPayload(t *testing.T) {
 	defer api.mu.Unlock()
 	if len(api.completeIDs) != 2 || api.completeIDs[0] != api.completeIDs[1] || len(api.initIDs) != 1 {
 		t.Fatal("changed original request")
+	}
+}
+
+func TestFixedCacheEmptyPutRecovery(t *testing.T) {
+	for _, kind := range []staging.PendingKind{staging.PendingNew, staging.PendingOverwrite} {
+		for _, hasMode := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%d-mode-%t", kind, hasMode), func(t *testing.T) {
+				dir := t.TempDir()
+				api := &fixedCacheAPI{t: t, size: 0}
+				if kind == staging.PendingOverwrite {
+					api.expected = 6
+				}
+				api.failComplete.Store(true)
+				server := httptest.NewServer(http.HandlerFunc(api.serve))
+				defer server.Close()
+				c, _ := client.New(server.URL, "").WithView(client.ViewBinding{LayerID: "a", WorkID: "work", Fence: 1})
+				u, j, cache := newFixedCacheUploader(t, c, dir)
+				api.journal = j
+				if err := cache.PutWithBaseRevAndMode("/file", nil, 0, kind, api.expected, 0, hasMode); err != nil {
+					t.Fatal(err)
+				}
+				if err := u.UploadSync(context.Background(), "/file"); err == nil {
+					t.Fatal("unknown empty PUT accepted")
+				}
+				if cache.MetaGeneration("/file") == 0 {
+					t.Fatal("discarded empty file metadata")
+				}
+				u.DrainAll()
+				if err := j.Close(); err != nil {
+					t.Fatal(err)
+				}
+				u2, j2, cache2 := newFixedCacheUploader(t, c, dir)
+				api.mu.Lock()
+				api.journal = j2
+				api.mu.Unlock()
+				api.failComplete.Store(false)
+				if err := (&Writeback{opts: Options{Client: c}, uploader: u2}).Start(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+				records, err := j2.PendingFixedUploads()
+				if err != nil || len(records) != 0 || cache2.MetaGeneration("/file") != 0 || api.transfers.Load() != 0 {
+					t.Fatal("bad empty recovery", records, err)
+				}
+				api.mu.Lock()
+				defer api.mu.Unlock()
+				if len(api.initIDs) != 0 || len(api.completeIDs) != 2 || api.completeIDs[0] != api.completeIDs[1] || len(api.modeIDs) != map[bool]int{false: 0, true: 1}[hasMode] {
+					t.Fatal("wrong replay phases")
+				}
+			})
+		}
 	}
 }

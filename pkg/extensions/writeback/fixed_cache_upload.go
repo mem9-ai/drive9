@@ -48,7 +48,7 @@ func (u *WriteBackUploader) fixedCachePublications() ([]fixedExtentPublication, 
 
 // Called under the uploader path gate. First resolve old durable requests even
 // if their local payload has disappeared or a newer generation now owns it.
-// Empty files retain the existing buffered protocol; they have no extent plan.
+// Empty files save a conditional PUT in the same journal before sending it.
 func (u *WriteBackUploader) uploadFixedCache(ctx context.Context, path string) (int64, *staging.WriteBackMeta, bool, error) {
 	records, err := u.fixedCachePublications()
 	if err != nil {
@@ -77,9 +77,6 @@ func (u *WriteBackUploader) uploadFixedCache(ctx context.Context, path string) (
 	if meta.Kind == staging.PendingChmod {
 		return 0, nil, true, fmt.Errorf("fixed cache mode lacks an original file receipt")
 	}
-	if meta.Size == 0 {
-		return 0, nil, false, nil
-	}
 	if u.ledgerOwnedRefused(path) {
 		return 0, nil, true, errLedgerOwned
 	}
@@ -103,15 +100,20 @@ func (u *WriteBackUploader) uploadFixedCache(ctx context.Context, path string) (
 	sum := sha256.Sum256(request)
 	initiationID := hex.EncodeToString(sum[:])
 	id := fixedCacheModeID("complete:" + initiationID)
-	plan, err := u.client.InitiateFixedExtentUpload(ctx, initiationID, u.remotePath(path), meta.Size, expected, "")
-	if err != nil {
-		return 0, nil, true, err
+	p := fixedExtentPublication{Version: 1, Binding: u.client.ViewBinding(), Path: path, RemotePath: u.remotePath(path), OperationID: id, Size: meta.Size, CacheGeneration: meta.Generation, CacheMetadata: meta}
+	if meta.Size == 0 {
+		p.EmptyExpectedRevision = &expected
+	} else {
+		plan, err := u.client.InitiateFixedExtentUpload(ctx, initiationID, u.remotePath(path), meta.Size, expected, "")
+		if err != nil {
+			return 0, nil, true, err
+		}
+		parts, err := u.client.UploadFixedExtentParts(ctx, plan, bytes.NewReader(data), meta.Size, nil)
+		if err != nil {
+			return 0, nil, true, err
+		}
+		p.UploadID, p.Parts = plan.UploadID, parts
 	}
-	parts, err := u.client.UploadFixedExtentParts(ctx, plan, bytes.NewReader(data), meta.Size, nil)
-	if err != nil {
-		return 0, nil, true, err
-	}
-	p := fixedExtentPublication{Version: 1, Binding: u.client.ViewBinding(), Path: path, RemotePath: u.remotePath(path), OperationID: id, UploadID: plan.UploadID, Size: meta.Size, CacheGeneration: meta.Generation, CacheMetadata: meta, Parts: parts}
 	receipt, err := publishFixedExtent(ctx, u.client, u.fixedJournal, nil, u.cache, p)
 	if err != nil {
 		return 0, nil, true, err
