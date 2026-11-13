@@ -160,6 +160,13 @@ func (b *Dat9Backend) WriteStoredObjectCreatedCtxIfRevision(ctx context.Context,
 		}
 		return 0, nil, err
 	}
+	// Same post-commit bookkeeping as every other creation path: skipping it would let
+	// object-backed layer files escape central quota accounting.
+	quotaCtx, cancelQuota := postCommitQuotaMutationContext()
+	defer cancelQuota()
+	if err := b.recordCentralFileCreateMutation(quotaCtx, fileID, entry.SizeBytes, detectContentType(canonical, nil)); err != nil {
+		return 0, nil, postCommitQuotaMutationError("record central quota file create", err)
+	}
 	return 1, append(append([]string{}, createdParents...), fileID), nil
 }
 

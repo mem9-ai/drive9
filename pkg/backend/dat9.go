@@ -347,26 +347,33 @@ func (b *Dat9Backend) CreateCtx(ctx context.Context, path string) (err error) {
 // CreateSymlinkCtx creates a symbolic link whose target is stored as the file
 // payload and whose inode mode carries the POSIX symlink file type bits.
 func (b *Dat9Backend) CreateSymlinkCtx(ctx context.Context, linkPath, target string) (err error) {
+	_, err = b.CreateSymlinkCreatedCtx(ctx, linkPath, target)
+	return err
+}
+
+// CreateSymlinkCreatedCtx creates a symlink and reports the inode id it generated, so a
+// caller never re-reads the name after the create.
+func (b *Dat9Backend) CreateSymlinkCreatedCtx(ctx context.Context, linkPath, target string) (createdIDs []string, err error) {
 	start := time.Now()
 	defer func() { observeBackend(ctx, b.tenantID, b.tidbCloudOrgID, "create_symlink", err, start) }()
 
 	data := []byte(target)
 	if target == "" || strings.ContainsRune(target, 0) || len(data) > MaxSymlinkTargetBytes {
-		return ErrInvalidSymlinkTarget
+		return nil, ErrInvalidSymlinkTarget
 	}
 	linkPath, err = pathutil.Canonicalize(linkPath)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := rejectRootFileNodePath(linkPath); err != nil {
-		return err
+		return nil, err
 	}
 
 	if err := b.ensureUploadSizeAllowed(int64(len(data))); err != nil {
-		return err
+		return nil, err
 	}
 	if err := b.ensureFileSizeQuota(ctx, int64(len(data))); err != nil {
-		return err
+		return nil, err
 	}
 	fileID := b.genID()
 	now := time.Now()
@@ -408,14 +415,14 @@ func (b *Dat9Backend) CreateSymlinkCtx(ctx context.Context, linkPath, target str
 		return nil
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	quotaCtx, cancelQuota := postCommitQuotaMutationContext()
 	defer cancelQuota()
 	if err := b.recordCentralFileCreateMutation(quotaCtx, fileID, int64(len(data)), symlinkContentType); err != nil {
-		return postCommitQuotaMutationError("record central quota file create", err)
+		return nil, postCommitQuotaMutationError("record central quota file create", err)
 	}
-	return nil
+	return []string{fileID}, nil
 }
 
 func (b *Dat9Backend) Mkdir(path string, perm uint32) error {
@@ -423,19 +430,26 @@ func (b *Dat9Backend) Mkdir(path string, perm uint32) error {
 }
 
 func (b *Dat9Backend) MkdirCtx(ctx context.Context, path string, perm uint32) (err error) {
+	_, err = b.MkdirCreatedCtx(ctx, path, perm)
+	return err
+}
+
+// MkdirCreatedCtx creates a directory and reports the inode ids it created (parents first,
+// then the directory). The id is the one the insert generated, so a caller never has to
+// re-read the name after the create and race a concurrent rename.
+func (b *Dat9Backend) MkdirCreatedCtx(ctx context.Context, path string, perm uint32) (createdIDs []string, err error) {
 	start := time.Now()
 	defer func() { observeBackend(ctx, b.tenantID, b.tidbCloudOrgID, "mkdir", err, start) }()
 
 	dirPath, err := pathutil.CanonicalizeDir(path)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if dirPath == "/" {
-		return nil
+		return nil, nil
 	}
-	err = b.store.EnsureParentDirs(ctx, dirPath, b.genID)
-	if err != nil {
-		return err
+	if err := b.store.EnsureParentDirs(ctx, dirPath, b.genID); err != nil {
+		return nil, err
 	}
 	now := time.Now()
 	nodeID := b.genID()
@@ -461,9 +475,9 @@ func (b *Dat9Backend) MkdirCtx(ctx context.Context, path string, perm uint32) (e
 			CreatedAt:   now,
 		})
 	}); err != nil {
-		return err
+		return nil, err
 	}
-	return nil
+	return []string{nodeID}, nil
 }
 
 func (b *Dat9Backend) Chmod(path string, mode uint32) error {
@@ -873,22 +887,6 @@ func (b *Dat9Backend) WriteCtxIfRevisionWithCreatedID(ctx context.Context, path 
 	}
 	_, _, err = b.WriteCtxIfRevisionWithTagsResult(ctx, path, data, offset, flags, expectedRevision, tags, description)
 	return nil, err
-}
-
-// MkdirCreatedCtx creates a directory and reports the inode ids it created. The last id is
-// the directory itself.
-func (b *Dat9Backend) MkdirCreatedCtx(ctx context.Context, path string, perm uint32) (createdIDs []string, err error) {
-	if err := b.MkdirCtx(ctx, path, perm); err != nil {
-		return nil, err
-	}
-	nf, err := b.StatNodeCtx(ctx, path)
-	if err != nil {
-		return nil, err
-	}
-	if nf.Node.InodeID != "" {
-		return []string{nf.Node.InodeID}, nil
-	}
-	return nil, nil
 }
 
 // createAndWriteCtx inserts a new file. mode, when non-zero, becomes the inode's

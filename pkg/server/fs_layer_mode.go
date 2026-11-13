@@ -358,15 +358,3 @@ func fsLayerRequireModeMatch(ctx context.Context, b *backendpkg.Dat9Backend, pat
 	}
 	return nil
 }
-
-// fsLayerNodeIdentity is a stable id for the inode a stat row describes: the file id when
-// there is one, else the directory inode id.
-func fsLayerNodeIdentity(nf *datastore.NodeWithFile) string {
-	if nf == nil {
-		return ""
-	}
-	if nf.File != nil && nf.File.FileID != "" {
-		return nf.File.FileID
-	}
-	return nf.Node.InodeID
-}

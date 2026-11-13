@@ -2373,10 +2373,11 @@ func applyFSLayerEntry(ctx context.Context, b *backendpkg.Dat9Backend, entry *da
 		if mode == 0 {
 			mode = 0o755
 		}
-		if err := b.MkdirCtx(ctx, entry.Path, mode); err != nil {
+		createdIDs, err := b.MkdirCreatedCtx(ctx, entry.Path, mode)
+		if err != nil {
 			return "", err
 		}
-		return fsLayerCreatedInode(ctx, b, entry.Path)
+		return lastCreatedID(createdIDs), nil
 	case datastore.FSLayerEntryOpWhiteout:
 		var err error
 		if entry.Kind == datastore.FSLayerEntryKindDir || strings.HasSuffix(entry.Path, "/") {
@@ -2416,10 +2417,11 @@ func applyFSLayerEntry(ctx context.Context, b *backendpkg.Dat9Backend, entry *da
 		if target == "" {
 			return "", fmt.Errorf("symlink target is required")
 		}
-		if err := b.CreateSymlinkCtx(ctx, entry.Path, target); err != nil {
+		createdIDs, err := b.CreateSymlinkCreatedCtx(ctx, entry.Path, target)
+		if err != nil {
 			return "", err
 		}
-		return fsLayerCreatedInode(ctx, b, entry.Path)
+		return lastCreatedID(createdIDs), nil
 	case datastore.FSLayerEntryOpRename:
 		target := fsLayerRenameTarget(entry)
 		if target == "" {
@@ -2432,18 +2434,6 @@ func applyFSLayerEntry(ctx context.Context, b *backendpkg.Dat9Backend, entry *da
 	default:
 		return "", fmt.Errorf("unsupported fs layer op %q", entry.Op)
 	}
-}
-
-// fsLayerCreatedInode reports the inode now at a path the caller just created.
-func fsLayerCreatedInode(ctx context.Context, b *backendpkg.Dat9Backend, path string) (string, error) {
-	nf, err := b.StatNodeCtx(ctx, path)
-	if errors.Is(err, datastore.ErrNotFound) {
-		return "", nil
-	}
-	if err != nil {
-		return "", err
-	}
-	return fsLayerNodeIdentity(nf), nil
 }
 
 // lastCreatedID is the innermost inode a creation reported: the file for a write, the

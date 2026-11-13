@@ -546,6 +546,17 @@ func TestFSLayerScopedCommitModeSemantics(t *testing.T) {
 			want: http.StatusForbidden,
 		},
 		{
+			// An implicitly created parent is a creation for the upsert, but a later chmod of
+			// that directory is a mode change on an existing inode: fs refuses it, so this
+			// plan is refused rather than left half-applied.
+			name: "implicit-parent-restyle",
+			entries: []string{
+				`{"path":"/zone/n/f.txt","op":"upsert","kind":"file","mode":420,"content_text":"x"}`,
+				`{"path":"/zone/n/","op":"chmod","kind":"dir","mode":448}`,
+			},
+			want: http.StatusForbidden,
+		},
+		{
 			name: "restyle-after-rename",
 			entries: []string{
 				`{"path":"/zone/rep.txt","op":"whiteout","kind":"file"}`,
