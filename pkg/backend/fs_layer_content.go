@@ -86,6 +86,79 @@ func (b *Dat9Backend) OpenFSLayerEntryData(ctx context.Context, entry *datastore
 	return io.NopCloser(bytes.NewReader(entry.ContentBlob)), nil
 }
 
+// WriteStoredObjectCreateCtx creates a new file backed by an already-uploaded object, with
+// mode applied inside the insert transaction, and returns the inode it created.
+func (b *Dat9Backend) WriteStoredObjectCreateCtx(ctx context.Context, path string, entry *datastore.FSLayerEntry, mode uint32) (inodeID string, revision int64, err error) {
+	if entry == nil {
+		return "", 0, fmt.Errorf("nil fs layer entry")
+	}
+	canonical, err := pathutil.Canonicalize(path)
+	if err != nil {
+		return "", 0, err
+	}
+	if err := rejectRootFileNodePath(canonical); err != nil {
+		return "", 0, err
+	}
+	if entry.StorageType != string(datastore.StorageS3) || entry.StorageRef == "" {
+		return "", 0, fmt.Errorf("missing fs layer external payload for %s", canonical)
+	}
+	if err := b.ensureUploadSizeAllowed(entry.SizeBytes); err != nil {
+		return "", 0, err
+	}
+	if err := b.ensureFileSizeQuota(ctx, entry.SizeBytes); err != nil {
+		return "", 0, err
+	}
+	storageEncryptionMode := entry.StorageEncryptionMode
+	if storageEncryptionMode == "" {
+		storageEncryptionMode = datastore.StorageEncryptionNone
+	}
+	now := time.Now()
+	fileID := b.genID()
+	err = b.store.InTx(ctx, func(tx *sql.Tx) error {
+		if err := b.ensureStorageQuota(ctx, tx, canonical, entry.SizeBytes); err != nil {
+			return err
+		}
+		if err := b.ensureFileCountQuotaServer(ctx, tx, 1); err != nil {
+			return err
+		}
+		if err := b.store.InsertFileTx(tx, &datastore.File{
+			FileID:                 fileID,
+			StorageType:            datastore.StorageType(entry.StorageType),
+			StorageRef:             entry.StorageRef,
+			StorageEncryptionMode:  storageEncryptionMode,
+			StorageEncryptionKeyID: entry.StorageEncryptionKeyID,
+			ContentType:            detectContentType(canonical, nil),
+			SizeBytes:              entry.SizeBytes,
+			ChecksumSHA256:         entry.ChecksumSHA256,
+			Revision:               1,
+			Mode:                   mode & 0o777,
+			Status:                 datastore.StatusConfirmed,
+			CreatedAt:              now,
+			ConfirmedAt:            &now,
+		}); err != nil {
+			return err
+		}
+		if err := b.store.EnsureParentDirsTx(tx, canonical, b.genID); err != nil {
+			return err
+		}
+		return b.store.InsertNodeTx(tx, &datastore.FileNode{
+			NodeID:     b.genID(),
+			Path:       canonical,
+			ParentPath: pathutil.ParentPath(canonical),
+			Name:       pathutil.BaseName(canonical),
+			FileID:     fileID,
+			CreatedAt:  now,
+		})
+	})
+	if err != nil {
+		if errors.Is(err, datastore.ErrPathConflict) {
+			return "", 0, datastore.ErrRevisionConflict
+		}
+		return "", 0, err
+	}
+	return fileID, 1, nil
+}
+
 // WriteStoredObjectCtxIfRevision applies an already-stored layer payload to the
 // base filesystem without routing the bytes through content_blob.
 func (b *Dat9Backend) WriteStoredObjectCtxIfRevision(ctx context.Context, path string, entry *datastore.FSLayerEntry) (int64, error) {

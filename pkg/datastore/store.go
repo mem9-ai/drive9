@@ -1698,6 +1698,13 @@ func (s *Store) EnsureParentDirsTx(db execer, path string, genID func() string) 
 // parent path will collide on the same inode_id; INSERT IGNORE swallows the
 // duplicate, so no orphan inode is ever created. This works on TiDB as well
 // as MySQL because it does not rely on gap locking.
+// DeterministicDirInodeID is the inode id ensureParentDirs assigns to an implicitly created
+// parent directory: the id is derived from the path, so a caller can recognise the directory
+// its own write created without re-reading the namespace afterwards.
+func DeterministicDirInodeID(path string) string {
+	return deterministicNodeID(path)
+}
+
 func deterministicNodeID(path string) string {
 	h := sha256.Sum256([]byte(path))
 	return hex.EncodeToString(h[:])

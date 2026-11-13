@@ -728,7 +728,7 @@ func (b *Dat9Backend) WriteCtxIfRevisionWithTagsResult(ctx context.Context, path
 		if timingEnabled {
 			implementationStart = time.Now()
 		}
-		n, err := b.createAndWriteCtx(ctx, path, data, tags, description)
+		n, _, err := b.createAndWriteCtx(ctx, path, data, tags, description, 0)
 		if timingEnabled {
 			implementationDuration = time.Since(implementationStart)
 		}
@@ -764,7 +764,7 @@ func (b *Dat9Backend) WriteCtxIfRevisionWithTagsResult(ctx context.Context, path
 		if timingEnabled {
 			implementationStart = time.Now()
 		}
-		n, err := b.createAndWriteCtx(ctx, path, data, tags, description)
+		n, _, err := b.createAndWriteCtx(ctx, path, data, tags, description, 0)
 		if timingEnabled {
 			implementationDuration = time.Since(implementationStart)
 		}
@@ -852,7 +852,11 @@ func cloneFileTags(tags map[string]string) map[string]string {
 	return out
 }
 
-func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data []byte, tags map[string]string, description string) (written int64, err error) {
+// createAndWriteCtx inserts a new file. mode, when non-zero, becomes the inode's
+// permission bits inside the same transaction: a caller that may not chmod applies a
+// creation mode this way instead of chmod-ing the name afterwards, which a concurrent
+// rename could redirect.
+func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data []byte, tags map[string]string, description string, mode uint32) (written int64, inodeID string, err error) {
 	timingEnabled := logger.BenchTimingLogEnabled()
 	start := time.Time{}
 	if timingEnabled {
@@ -903,10 +907,10 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 		logger.InfoBenchTiming(ctx, "backend_write_create_timing", fields...)
 	}()
 	if err := b.ensureUploadSizeAllowed(int64(len(data))); err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	if err := b.ensureFileSizeQuota(ctx, int64(len(data))); err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	fileID := b.genID()
 	now := time.Now()
@@ -930,7 +934,7 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 		contentBlob = append([]byte(nil), data...)
 	} else {
 		if b.s3 == nil {
-			return 0, fmt.Errorf("s3 client not configured")
+			return 0, "", fmt.Errorf("s3 client not configured")
 		}
 		storageType = datastore.StorageS3
 		storageRef = "blobs/" + fileID
@@ -946,7 +950,7 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 				s3PutDuration = time.Since(s3PutStart)
 			}
 			logger.Error(ctx, "backend_create_and_write_put_object_failed", zap.String("path", path), zap.String("storage_ref", storageRef), zap.Int("bytes", len(data)), zap.Error(err))
-			return 0, fmt.Errorf("put object: %w", err)
+			return 0, "", fmt.Errorf("put object: %w", err)
 		}
 		if timingEnabled {
 			s3PutDuration = time.Since(s3PutStart)
@@ -978,6 +982,7 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 		fileRev := int64(1)
 		insertFile := &datastore.File{
 			FileID: fileID, StorageType: storageType, StorageRef: storageRef,
+			Mode:                   mode,
 			StorageEncryptionMode:  storageEncryptionMode,
 			StorageEncryptionKeyID: storageEncryptionKeyID,
 			ContentBlob:            contentBlob,
@@ -1063,7 +1068,7 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 		if storageType == datastore.StorageS3 {
 			b.deleteBlobCtx(ctx, storageRef)
 		}
-		return 0, err
+		return 0, "", err
 	}
 	if timingEnabled {
 		tenantTxDuration = time.Since(txStart)
@@ -1081,12 +1086,12 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 		if timingEnabled {
 			centralQuotaDuration = time.Since(centralQuotaStart)
 		}
-		return 0, postCommitQuotaMutationError("record central quota file create", err)
+		return 0, "", postCommitQuotaMutationError("record central quota file create", err)
 	}
 	if timingEnabled {
 		centralQuotaDuration = time.Since(centralQuotaStart)
 	}
-	return int64(len(data)), nil
+	return int64(len(data)), fileID, nil
 }
 
 // ErrExtentLayoutWrite is returned when a whole-object (CLI/HTTP/SDK) write
@@ -1123,6 +1128,27 @@ func (b *Dat9Backend) refuseExtentWholeObjectWrite(ctx context.Context, path str
 		return fmt.Errorf("%w: %s", ErrExtentLayoutWrite, path)
 	}
 	return nil
+}
+
+// WriteLayerCreateCtx creates a new file with mode applied inside the insert transaction
+// and returns the inode it created. A layer commit uses this instead of writing and then
+// chmod-ing the name, so a concurrent rename cannot redirect the creation mode.
+func (b *Dat9Backend) WriteLayerCreateCtx(ctx context.Context, path string, data []byte, expectedRevision int64, mode uint32) (inodeID string, revision int64, err error) {
+	start := time.Now()
+	defer func() { observeBackend(ctx, b.tenantID, b.tidbCloudOrgID, "write_layer_create", err, start) }()
+	if expectedRevision > 0 {
+		// The caller expects an existing file; a creation is then a conflict.
+		return "", 0, datastore.ErrRevisionConflict
+	}
+	written, fileID, err := b.createAndWriteCtx(ctx, path, data, nil, "", mode&0o777)
+	if err != nil {
+		if errors.Is(err, datastore.ErrPathConflict) {
+			return "", 0, datastore.ErrRevisionConflict
+		}
+		return "", 0, err
+	}
+	_ = written
+	return fileID, 1, nil
 }
 
 func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore.NodeWithFile, data []byte, offset int64, flags filesystem.WriteFlag, expectedRevision int64, tags map[string]string, description string) (written int64, newRevision int64, err error) {

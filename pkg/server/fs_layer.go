@@ -1024,7 +1024,12 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 	// layer API expects after a refused or failed commit. One place, so the three call
 	// sites cannot drift on the entries[:i] vs [:i+1] boundary.
 	failCommit := func(rollbackSnapshots []fsLayerBaseSnapshot, event, path string, err error) {
-		rollbackErr := rollbackFSLayerCommit(rollbackCtx, b, rollbackSnapshots, ownership.owns)
+		// An owner commit never populates the ownership set (its cost is only paid where the
+		// guard reads it), so the rollback stays owner-aware: an owner may force-remove what
+		// its own failed commit created.
+		rollbackErr := rollbackFSLayerCommit(rollbackCtx, b, rollbackSnapshots, func(path string) bool {
+			return canChmod || ownership.owns(path)
+		})
 		_ = store.SetFSLayerStateIf(rollbackCtx, layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
 		fields := eventFields(r.Context(), event, "layer_id", layer.LayerID, "error", err)
 		if path != "" {
@@ -1070,13 +1075,11 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 			if willCreate {
 				ownership.noteCreated(entry.Path, appliedInodeID)
 			}
+			// Implicit parents get the deterministic id ensureParentDirs derives from their
+			// path, so recording them needs no post-apply stat that a concurrent writer
+			// could have raced; a foreign inode at that name will not match the pin later.
 			for _, path := range missingAncestors {
-				if nf, statErr := b.StatNodeCtx(r.Context(), trimLayerPath(path)); statErr == nil {
-					ownership.noteCreated(path, fsLayerNodeIdentity(nf))
-				} else if !errors.Is(statErr, datastore.ErrNotFound) {
-					failCommit(filterFSLayerSnapshotsForEntries(snapshots, entries[:i+1]), "fs_layer_commit_apply_failed", path, statErr)
-					return
-				}
+				ownership.noteCreated(path, datastore.DeterministicDirInodeID(trimLayerPath(path)))
 			}
 			ownership.noteMove(entry)
 		}
@@ -2378,17 +2381,32 @@ func applyFSLayerEntry(ctx context.Context, b *backendpkg.Dat9Backend, entry *da
 			}
 			return fsLayerCreatedInode(ctx, b, entry.Path)
 		}
-		wroteRevision := int64(0)
-		if entry.StorageRef != "" || entry.StorageType == string(datastore.StorageS3) {
-			writeEntry := *entry
-			writeEntry.BaseRevision = expectedRevision
-			rev, writeErr := b.WriteStoredObjectCtxIfRevision(ctx, entry.Path, &writeEntry)
+		external := entry.StorageRef != "" || entry.StorageType == string(datastore.StorageS3)
+		if !opts.canChmod && modeInodeID == "" {
+			// The entry creates the path and the caller may not chmod: apply the creation
+			// mode inside the insert transaction. Nothing is chmod-ed by name afterwards, so
+			// a rename racing this entry cannot redirect the bits, and the returned inode is
+			// the one this commit records.
+			var created string
+			var writeErr error
+			if external {
+				created, _, writeErr = b.WriteStoredObjectCreateCtx(ctx, entry.Path, entry, entry.Mode)
+			} else {
+				created, _, writeErr = b.WriteLayerCreateCtx(ctx, entry.Path, entry.ContentBlob, expectedRevision, entry.Mode)
+			}
 			if writeErr != nil {
 				return "", writeErr
 			}
-			wroteRevision = rev
+			return created, nil
+		}
+		if external {
+			writeEntry := *entry
+			writeEntry.BaseRevision = expectedRevision
+			if _, writeErr := b.WriteStoredObjectCtxIfRevision(ctx, entry.Path, &writeEntry); writeErr != nil {
+				return "", writeErr
+			}
 		} else {
-			_, rev, writeErr := b.WriteCtxIfRevisionWithTagsResult(
+			if _, _, writeErr := b.WriteCtxIfRevisionWithTagsResult(
 				ctx,
 				entry.Path,
 				entry.ContentBlob,
@@ -2397,31 +2415,12 @@ func applyFSLayerEntry(ctx context.Context, b *backendpkg.Dat9Backend, entry *da
 				expectedRevision,
 				nil,
 				"",
-			)
-			if writeErr != nil {
+			); writeErr != nil {
 				return "", writeErr
 			}
-			wroteRevision = rev
 		}
 		if entry.Mode == 0 {
 			return "", nil
-		}
-		if !opts.canChmod && modeInodeID == "" {
-			// The entry created the path, so there is nothing to pin yet: read the inode the
-			// write produced, witnessed by the revision it returned. A rename that swapped a
-			// decoy onto the name in between cannot report that revision.
-			nf, statErr := b.StatNodeCtx(ctx, entry.Path)
-			if errors.Is(statErr, datastore.ErrNotFound) {
-				return "", nil
-			}
-			if statErr != nil {
-				return "", statErr
-			}
-			if nf.File == nil || nf.File.Revision != wroteRevision {
-				return "", errChmodForbidden
-			}
-			modeInodeID = fsLayerNodeIdentity(nf)
-			createdInodeID = modeInodeID
 		}
 		if applyErr := applyFSLayerEntryModePinned(ctx, b, entry.Path, modeInodeID, entry.Mode&0o777, opts.modeMayBeSuperseded); applyErr != nil {
 			return createdInodeID, applyErr
