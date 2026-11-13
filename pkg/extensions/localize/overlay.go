@@ -1,6 +1,7 @@
 package localize
 
 import (
+	"errors"
 	iofs "io/fs"
 	"os"
 	"path/filepath"
@@ -36,7 +37,16 @@ func (o *Overlay) Chmod(viewPath string, mode uint32) error {
 	if err != nil {
 		return err
 	}
-	return os.Chmod(abs, posixFileMode(mode))
+	err = os.Chmod(abs, posixFileMode(mode))
+	if !errors.Is(err, syscall.ENAMETOOLONG) {
+		return err
+	}
+	root, rel, err := o.openPathRoot(abs)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Close() }()
+	return root.Chmod(rel, posixFileMode(mode))
 }
 
 // Chtimes sets the backing file's access and modification times.
@@ -45,7 +55,16 @@ func (o *Overlay) Chtimes(viewPath string, mtime time.Time) error {
 	if err != nil {
 		return err
 	}
-	return os.Chtimes(abs, mtime, mtime)
+	err = os.Chtimes(abs, mtime, mtime)
+	if !errors.Is(err, syscall.ENAMETOOLONG) {
+		return err
+	}
+	root, rel, err := o.openPathRoot(abs)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Close() }()
+	return root.Chtimes(rel, mtime, mtime)
 }
 
 // EnsureRoot creates the backing root directory.
@@ -66,10 +85,23 @@ func (o *Overlay) Link(oldPath, newPath string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(newAbs), 0o755); err != nil {
+	if err := o.ensureParent(newAbs); err != nil {
 		return err
 	}
-	return os.Link(oldAbs, newAbs)
+	err = os.Link(oldAbs, newAbs)
+	if !errors.Is(err, syscall.ENAMETOOLONG) {
+		return err
+	}
+	root, oldRel, err := o.openPathRoot(oldAbs)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Close() }()
+	newRel, err := filepath.Rel(o.root, newAbs)
+	if err != nil {
+		return err
+	}
+	return root.Link(oldRel, newRel)
 }
 
 // Lstat stats the backing file without following a trailing symlink.
@@ -78,7 +110,16 @@ func (o *Overlay) Lstat(viewPath string) (iofs.FileInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	return os.Lstat(abs)
+	info, err := os.Lstat(abs)
+	if !errors.Is(err, syscall.ENAMETOOLONG) {
+		return info, err
+	}
+	root, rel, err := o.openPathRoot(abs)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = root.Close() }()
+	return root.Lstat(rel)
 }
 
 // Mkdir creates the backing directory, materializing implicit parents.
@@ -87,10 +128,19 @@ func (o *Overlay) Mkdir(viewPath string, mode uint32) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+	if err := o.ensureParent(abs); err != nil {
 		return err
 	}
-	return os.Mkdir(abs, posixFileMode(mode))
+	err = os.Mkdir(abs, posixFileMode(mode))
+	if !errors.Is(err, syscall.ENAMETOOLONG) {
+		return err
+	}
+	root, rel, err := o.openPathRoot(abs)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Close() }()
+	return root.Mkdir(rel, posixFileMode(mode))
 }
 
 // OpenFile opens (and with O_CREAT, creates) the backing file, materializing
@@ -101,11 +151,24 @@ func (o *Overlay) OpenFile(viewPath string, flags uint32, mode uint32) (*os.File
 		return nil, err
 	}
 	if flags&syscall.O_CREAT != 0 {
-		if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+		if err := o.ensureParent(abs); err != nil {
 			return nil, err
 		}
 	}
-	return os.OpenFile(abs, int(flags), posixFileMode(mode))
+	return o.openFile(abs, int(flags), posixFileMode(mode))
+}
+
+func (o *Overlay) openFile(abs string, flags int, mode os.FileMode) (*os.File, error) {
+	file, err := os.OpenFile(abs, flags, mode)
+	if !errors.Is(err, syscall.ENAMETOOLONG) {
+		return file, err
+	}
+	root, rel, err := o.openPathRoot(abs)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = root.Close() }()
+	return root.OpenFile(rel, flags, mode)
 }
 
 // ReadDir lists the backing directory.
@@ -114,7 +177,16 @@ func (o *Overlay) ReadDir(viewPath string) ([]os.DirEntry, error) {
 	if err != nil {
 		return nil, err
 	}
-	return os.ReadDir(abs)
+	entries, err := os.ReadDir(abs)
+	if !errors.Is(err, syscall.ENAMETOOLONG) {
+		return entries, err
+	}
+	root, rel, err := o.openPathRoot(abs)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = root.Close() }()
+	return iofs.ReadDir(root.FS(), rel)
 }
 
 // Readlink reads the symlink target at viewPath.
@@ -123,7 +195,16 @@ func (o *Overlay) Readlink(viewPath string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return os.Readlink(abs)
+	target, err := os.Readlink(abs)
+	if !errors.Is(err, syscall.ENAMETOOLONG) {
+		return target, err
+	}
+	root, rel, err := o.openPathRoot(abs)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = root.Close() }()
+	return root.Readlink(rel)
 }
 
 // Remove unlinks a file, or removes an empty directory (os.Remove falls
@@ -134,7 +215,16 @@ func (o *Overlay) Remove(viewPath string) error {
 	if err != nil {
 		return err
 	}
-	return os.Remove(abs)
+	err = os.Remove(abs)
+	if !errors.Is(err, syscall.ENAMETOOLONG) {
+		return err
+	}
+	root, rel, err := o.openPathRoot(abs)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Close() }()
+	return root.Remove(rel)
 }
 
 // Rename moves a backing path. rename(2) atomically replaces an existing
@@ -149,10 +239,53 @@ func (o *Overlay) Rename(oldPath, newPath string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(newAbs), 0o755); err != nil {
+	if err := o.ensureParent(newAbs); err != nil {
 		return err
 	}
-	return os.Rename(oldAbs, newAbs)
+	err = os.Rename(oldAbs, newAbs)
+	if errors.Is(err, syscall.ENAMETOOLONG) {
+		return o.renameLongPath(oldAbs, newAbs)
+	}
+	return err
+}
+
+// openPathRoot resolves long backing paths relative to the overlay directory.
+// Root walks individual components on Unix, so adding the local-root prefix
+// cannot turn a valid remote path into an ENAMETOOLONG overlay probe. It still
+// reports invalid components and I/O errors, and keeps resolution in the root.
+func (o *Overlay) openPathRoot(abs string) (*os.Root, string, error) {
+	rel, err := filepath.Rel(o.root, abs)
+	if err != nil {
+		return nil, "", err
+	}
+	root, err := os.OpenRoot(o.root)
+	return root, rel, err
+}
+
+func (o *Overlay) renameLongPath(oldAbs, newAbs string) error {
+	root, oldRel, err := o.openPathRoot(oldAbs)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Close() }()
+	newRel, err := filepath.Rel(o.root, newAbs)
+	if err != nil {
+		return err
+	}
+	return root.Rename(oldRel, newRel)
+}
+
+func (o *Overlay) ensureParent(abs string) error {
+	err := os.MkdirAll(filepath.Dir(abs), 0o755)
+	if !errors.Is(err, syscall.ENAMETOOLONG) {
+		return err
+	}
+	root, rel, err := o.openPathRoot(abs)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Close() }()
+	return root.MkdirAll(filepath.Dir(rel), 0o755)
 }
 
 // Root reports the backing root path ("" for a disabled overlay).
@@ -169,10 +302,19 @@ func (o *Overlay) Symlink(target, viewPath string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+	if err := o.ensureParent(abs); err != nil {
 		return err
 	}
-	return os.Symlink(target, abs)
+	err = os.Symlink(target, abs)
+	if !errors.Is(err, syscall.ENAMETOOLONG) {
+		return err
+	}
+	root, rel, err := o.openPathRoot(abs)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Close() }()
+	return root.Symlink(target, rel)
 }
 
 // SyncDir flushes the backing directory entry for viewPath (fsync on the
@@ -182,7 +324,7 @@ func (o *Overlay) SyncDir(viewPath string) error {
 	if err != nil {
 		return err
 	}
-	dir, err := os.Open(abs)
+	dir, err := o.openFile(abs, os.O_RDONLY, 0)
 	if err != nil {
 		return err
 	}
@@ -196,7 +338,16 @@ func (o *Overlay) Truncate(viewPath string, size int64) error {
 	if err != nil {
 		return err
 	}
-	return os.Truncate(abs, size)
+	err = os.Truncate(abs, size)
+	if !errors.Is(err, syscall.ENAMETOOLONG) {
+		return err
+	}
+	file, err := o.openFile(abs, os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = file.Close() }()
+	return file.Truncate(size)
 }
 
 func (o *Overlay) abs(viewPath string) (string, error) {
