@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -112,6 +113,12 @@ func run(ctx context.Context, base string) error {
 	if !readEquals(ctx, child, "/file", data) || !readEquals(ctx, c, "/file", seed) {
 		return errors.New("writeback child/main isolation")
 	}
+	if err := queueRecovery(ctx, base, view.ViewBinding()); err != nil {
+		return err
+	}
+	if !readEquals(ctx, c, "/file", seed) || !readEquals(ctx, child, "/file", data) {
+		return errors.New("queue main/child isolation")
+	}
 	plan, err := view.InitiateFixedExtentUpload(ctx, "cancel-init", "/cancelled", 6, 0, "")
 	if err != nil {
 		return errors.New("explicit initiation")
@@ -142,6 +149,16 @@ func run(ctx context.Context, base string) error {
 func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
+	if phase := os.Getenv("DRIVE9_FIXED_SDK_QUEUE_PHASE"); phase != "" {
+		var binding client.ViewBinding
+		if err := json.Unmarshal([]byte(os.Getenv("DRIVE9_FIXED_SDK_QUEUE_BINDING")), &binding); err != nil {
+			os.Exit(1)
+		}
+		if err := queuePhase(ctx, os.Getenv("DRIVE9_FIXED_SDK_BASE"), phase, os.Getenv("DRIVE9_FIXED_SDK_QUEUE_DIR"), binding); err != nil {
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
 	if err := run(ctx, os.Getenv("DRIVE9_FIXED_SDK_BASE")); err != nil {
 		// run returns only fixed stage labels, never server bodies or signed URLs.
 		fmt.Fprintln(os.Stderr, "fixed sdk probe failed:", err)

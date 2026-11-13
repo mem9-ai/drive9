@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"github.com/mem9-ai/drive9/pkg/client"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -30,5 +31,23 @@ func TestProbeFailureDoesNotPrintServerBody(t *testing.T) {
 	}
 	if err := run(context.Background(), "invalid"); err == nil || err.Error() != "invalid loopback endpoint" {
 		t.Fatal(err)
+	}
+}
+
+func TestQueuePhaseRejectsInvalidConfigurationBeforeIO(t *testing.T) {
+	for _, phase := range []string{"", "unknown", "stage", "recover"} {
+		if err := queuePhase(context.Background(), "http://example.invalid:80", phase, t.TempDir(), client.ViewBinding{}); err == nil || err.Error() != "invalid queue probe configuration" {
+			t.Fatal(phase, err)
+		}
+	}
+	binding := client.ViewBinding{LayerID: "a", WorkID: "work", Fence: 1}
+	for _, dir := range []string{"", "relative"} {
+		if err := queuePhase(context.Background(), "http://127.0.0.1:1", "stage", dir, binding); err == nil {
+			t.Fatal("accepted relative staging")
+		}
+	}
+	binding.Validation = true
+	if err := queuePhase(context.Background(), "http://127.0.0.1:1", "recover", t.TempDir(), binding); err == nil {
+		t.Fatal("accepted validation binding")
 	}
 }

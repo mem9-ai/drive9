@@ -17,12 +17,20 @@ through the actual writeback/core chain with preload disabled; fixed views
 currently upload the complete file for either edit. The paired fixture changes
 the first writeback completion response to 503 after the normal server handler
 has succeeded. The probe requires that failure, then retries Flush with the
-original completion and verifies stored bytes and isolation. It does not cover kernel
+original completion and verifies stored bytes and isolation. The probe then launches a queue child process, writes a three-part shadow image,
+and requires another injected 503 after the server commits it. That child exits
+without stopping writeback or closing staging. A fresh process performs the
+mount-order WAL recovery and runtime Start, replays the original request, checks
+its bytes, and verifies local cleanup. The paired fixture requires identical
+operation, upload, body and returned revision, with no intervening initiation.
+This exercises process exit after a known failure boundary, not arbitrary
+power-loss durability. It does not cover kernel
 FUSE, same-mount switching or final merge.
 `go test -race ./e2e/fixedsdk` only checks the probe's endpoint and failure handling;
 it is not the paired integration run.
 
 The writeback offline regressions also cover retrying a lost extent completion
 response on the same open handle. They keep its original upload/operation and
-part list, then retire only the confirmed buffer generation. This recovery value
-is in memory; these cases do not establish crash recovery of a staging queue.
+part list, then retire only the confirmed buffer generation. The same-handle recovery value
+is in memory; the separate queue subprocess case above verifies the persistent
+request used by the asynchronous runtime.
