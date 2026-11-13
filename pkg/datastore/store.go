@@ -1639,6 +1639,43 @@ func (s *Store) Chmod(ctx context.Context, path string, mode uint32) (err error)
 	return tx.Commit()
 }
 
+// ChmodInode applies permission bits to a specific inode without resolving a path. A
+// caller that has already verified which inode a name refers to uses this so a concurrent
+// rename of the name cannot redirect the change.
+func (s *Store) ChmodInode(ctx context.Context, inodeID string, mode uint32) (err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "chmod_inode", start, &err)
+	inodeID = strings.TrimSpace(inodeID)
+	if inodeID == "" {
+		return ErrNotFound
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var currentMode uint32
+	if qerr := tx.QueryRowContext(ctx, `SELECT mode FROM inodes WHERE `+
+		s.scope.And(`inode_id = ? AND status = 'CONFIRMED'`)+` FOR UPDATE`,
+		s.scope.Args(inodeID)...).Scan(&currentMode); qerr != nil {
+		if errors.Is(qerr, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return qerr
+	}
+	mode = (mode & permissionModeMask) | (currentMode & fileTypeModeMask)
+	if _, uerr := tx.ExecContext(ctx, `UPDATE jfs_node SET mode = ? WHERE inode = (SELECT extent_ino FROM file_nodes WHERE `+
+		s.scope.And(`file_id = ?`)+` AND COALESCE(extent_ino, 0) <> 0)`,
+		append([]any{mode & permissionModeMask}, s.scope.Args(inodeID)...)...); uerr != nil {
+		return uerr
+	}
+	if _, uerr := tx.ExecContext(ctx, `UPDATE inodes SET mode = ? WHERE `+s.scope.And(`inode_id = ? AND status = 'CONFIRMED'`),
+		append([]any{mode}, s.scope.Args(inodeID)...)...); uerr != nil {
+		return uerr
+	}
+	return tx.Commit()
+}
+
 func (s *Store) EnsureParentDirsTx(db execer, path string, genID func() string) error {
 	return s.ensureParentDirsWithExecer(context.Background(), db, path, genID)
 }

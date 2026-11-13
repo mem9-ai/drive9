@@ -8,6 +8,7 @@ import (
 
 	backendpkg "github.com/mem9-ai/drive9/pkg/backend"
 	"github.com/mem9-ai/drive9/pkg/datastore"
+	"github.com/mem9-ai/drive9/pkg/pathutil"
 )
 
 // The owner-only chmod policy for the fs layer surface.
@@ -343,11 +344,13 @@ func (s *Server) authorizeFSLayerEntryMode(w http.ResponseWriter, r *http.Reques
 
 // fsLayerPlanOwnership is the apply-time view: for the names the commit touched, whether
 // this commit owns them (it created the name or an ancestor) or whether they hold a live
-// inode the plan moved there. It never stores a live path, because the world it is
-// consulted in is the one the commit is mutating.
+// inode the plan moved there, plus the inode identity of every name the commit created.
 //
-// One map with a kind rather than two sets: a name is owned or live, never both, so the
-// invariant is structural and every writer touches one entry.
+// The identity map is what makes the guard race-safe. Names are not stable — the commit
+// does not lock the tenant against ordinary FS writes, so a concurrent rename can move a
+// victim inode onto a plan-owned name between two entries. A name the commit created is
+// therefore only treated as the plan's own while the inode there is still the one it
+// recorded, and the planned mode is applied to that inode id rather than to the name.
 type fsLayerOwnershipKind uint8
 
 const (
@@ -355,10 +358,13 @@ const (
 	ownershipLive
 )
 
-type fsLayerPlanOwnership map[string]fsLayerOwnershipKind
+type fsLayerPlanOwnership struct {
+	kinds  map[string]fsLayerOwnershipKind
+	inodes map[string]string
+}
 
 func newFSLayerPlanOwnership() fsLayerPlanOwnership {
-	return fsLayerPlanOwnership{}
+	return fsLayerPlanOwnership{kinds: map[string]fsLayerOwnershipKind{}, inodes: map[string]string{}}
 }
 
 func trimLayerPath(rawPath string) string {
@@ -370,7 +376,7 @@ func trimLayerPath(rawPath string) string {
 func (o fsLayerPlanOwnership) owns(rawPath string) bool {
 	path := trimLayerPath(rawPath)
 	for name := path; ; {
-		switch o[name] {
+		switch o.kinds[name] {
 		case ownershipLive:
 			return false
 		case ownershipPlan:
@@ -386,20 +392,38 @@ func (o fsLayerPlanOwnership) owns(rawPath string) bool {
 
 // own records a name this commit created.
 func (o fsLayerPlanOwnership) own(rawPath string) {
-	o[trimLayerPath(rawPath)] = ownershipPlan
+	path := trimLayerPath(rawPath)
+	delete(o.inodes, path)
+	o.kinds[path] = ownershipPlan
+}
+
+// noteCreated records a name this commit created together with the inode it created there.
+func (o fsLayerPlanOwnership) noteCreated(rawPath, inodeID string) {
+	path := trimLayerPath(rawPath)
+	o.kinds[path] = ownershipPlan
+	if inodeID != "" {
+		o.inodes[path] = inodeID
+	}
 }
 
 // markLive records a name that holds a live inode even though an owned ancestor exists.
 func (o fsLayerPlanOwnership) markLive(rawPath string) {
-	o[trimLayerPath(rawPath)] = ownershipLive
+	path := trimLayerPath(rawPath)
+	delete(o.inodes, path)
+	o.kinds[path] = ownershipLive
 }
 
 // drop forgets the name and everything below it.
 func (o fsLayerPlanOwnership) drop(rawPath string) {
 	path := trimLayerPath(rawPath)
-	for name := range o {
+	for name := range o.kinds {
 		if name == path || strings.HasPrefix(name, path+"/") {
-			delete(o, name)
+			delete(o.kinds, name)
+		}
+	}
+	for name := range o.inodes {
+		if name == path || strings.HasPrefix(name, path+"/") {
+			delete(o.inodes, name)
 		}
 	}
 }
@@ -412,17 +436,29 @@ func (o fsLayerPlanOwnership) rekey(oldPrefix, newPrefix string) {
 	if oldPrefix == "" || newPrefix == "" || oldPrefix == newPrefix {
 		return
 	}
-	moved := make(map[string]fsLayerOwnershipKind)
-	for name, kind := range o {
+	movedKinds := make(map[string]fsLayerOwnershipKind)
+	for name, kind := range o.kinds {
 		suffix, ok := strings.CutPrefix(name, oldPrefix+"/")
 		if !ok {
 			continue
 		}
-		moved[newPrefix+"/"+suffix] = kind
-		delete(o, name)
+		movedKinds[newPrefix+"/"+suffix] = kind
+		delete(o.kinds, name)
 	}
-	for name, kind := range moved {
-		o[name] = kind
+	for name, kind := range movedKinds {
+		o.kinds[name] = kind
+	}
+	movedInodes := make(map[string]string)
+	for name, id := range o.inodes {
+		suffix, ok := strings.CutPrefix(name, oldPrefix+"/")
+		if !ok {
+			continue
+		}
+		movedInodes[newPrefix+"/"+suffix] = id
+		delete(o.inodes, name)
+	}
+	for name, id := range movedInodes {
+		o.inodes[name] = id
 	}
 }
 
@@ -450,7 +486,7 @@ func (o fsLayerPlanOwnership) noteMove(entry *datastore.FSLayerEntry) {
 	if target == source {
 		return
 	}
-	sourceKind := o[source]
+	sourceKind := o.kinds[source]
 	// A pre-existing target is replaced by the rename; drop it before re-keying so the
 	// moved subtree is not erased.
 	o.drop(target)
@@ -472,46 +508,92 @@ func (o fsLayerPlanOwnership) noteMove(entry *datastore.FSLayerEntry) {
 
 // createsPath reports whether applying entry will create its path: the commit does not own
 // the name and live main has nothing there. A whiteout/rename/chmod never creates.
-func (o fsLayerPlanOwnership) createsPath(ctx context.Context, b *backendpkg.Dat9Backend, entry *datastore.FSLayerEntry) (bool, error) {
+func (o fsLayerPlanOwnership) createsPath(ctx context.Context, b *backendpkg.Dat9Backend, entry *datastore.FSLayerEntry) (bool, []string, error) {
 	if entry == nil || b == nil {
-		return false, nil
+		return false, nil, nil
 	}
 	switch entry.Op {
 	case datastore.FSLayerEntryOpUpsert, datastore.FSLayerEntryOpMkdir, datastore.FSLayerEntryOpSymlink:
 	default:
-		return false, nil
+		return false, nil, nil
 	}
-	if o.owns(entry.Path) {
-		return false, nil
+	path := trimLayerPath(entry.Path)
+	if o.owns(path) {
+		return false, nil, nil
 	}
-	_, err := b.StatNodeCtx(ctx, trimLayerPath(entry.Path))
-	if errors.Is(err, datastore.ErrNotFound) {
-		return true, nil
+	_, err := b.StatNodeCtx(ctx, path)
+	if err == nil {
+		return false, nil, nil
 	}
-	if err != nil {
-		return false, err
+	if !errors.Is(err, datastore.ErrNotFound) {
+		return false, nil, err
 	}
-	return false, nil
+	// The entry creates its path; any ancestor that is missing right now will be created
+	// implicitly by the same apply, so the commit owns those names too.
+	var missing []string
+	for ancestor := pathutil.ParentPath(path); ancestor != "" && ancestor != "/"; ancestor = pathutil.ParentPath(ancestor) {
+		if o.owns(ancestor) {
+			break
+		}
+		if _, statErr := b.StatNodeCtx(ctx, trimLayerPath(ancestor)); statErr == nil {
+			break
+		} else if !errors.Is(statErr, datastore.ErrNotFound) {
+			return false, nil, statErr
+		}
+		missing = append(missing, ancestor)
+	}
+	return true, missing, nil
 }
 
 // appliedModeChange reports whether applying entry now would change the permission bits of
 // an inode this commit does not own — the drift check for an owner chmod landing between
 // the plan scan and this entry. A path this commit created, or that sits under one, has no
 // live inode to protect unless a rename moved a live inode there.
-func (o fsLayerPlanOwnership) appliedModeChange(ctx context.Context, b *backendpkg.Dat9Backend, entry *datastore.FSLayerEntry) (bool, error) {
-	if b == nil || !fsLayerEntryCarriesMode(entry) || o.owns(entry.Path) {
-		return false, nil
+func (o fsLayerPlanOwnership) appliedModeChange(ctx context.Context, b *backendpkg.Dat9Backend, entry *datastore.FSLayerEntry) (bool, string, error) {
+	if b == nil || !fsLayerEntryCarriesMode(entry) {
+		return false, "", nil
+	}
+	path := trimLayerPath(entry.Path)
+	nf, err := b.StatNodeCtx(ctx, path)
+	if errors.Is(err, datastore.ErrNotFound) {
+		// Nothing at the name yet: an upsert creates it with this mode, a chmod is a
+		// no-op.
+		return false, "", nil
+	}
+	if err != nil {
+		return false, "", err
+	}
+	inodeID := fsLayerNodeIdentity(nf)
+	// A name this commit created is only its own while the inode there is still the one it
+	// recorded; a concurrent rename can park a live inode on the name.
+	if o.owns(path) {
+		if recorded := o.inodes[path]; recorded != "" && recorded == inodeID {
+			return false, inodeID, nil
+		}
 	}
 	if entry.Op == datastore.FSLayerEntryOpChmod {
-		// Nothing to change when the plan has not put anything at this path.
-		_, err := b.StatNodeCtx(ctx, trimLayerPath(entry.Path))
-		if errors.Is(err, datastore.ErrNotFound) {
-			return false, nil
-		}
-		if err != nil {
-			return false, err
-		}
-		return true, nil
+		// A live inode holds the name: changing its bits needs chmod authority.
+		return true, inodeID, nil
 	}
-	return fsLayerModesDiffer(ctx, b, trimLayerPath(entry.Path), entry.Mode)
+	differs, err := fsLayerModesDiffer(ctx, b, path, entry.Mode)
+	if err != nil {
+		return false, "", err
+	}
+	if differs {
+		return true, inodeID, nil
+	}
+	// The requested mode already matches; it is safe to re-apply to this inode.
+	return false, inodeID, nil
+}
+
+// fsLayerNodeIdentity is a stable id for the inode a stat row describes: the file id when
+// there is one, else the directory inode id.
+func fsLayerNodeIdentity(nf *datastore.NodeWithFile) string {
+	if nf == nil {
+		return ""
+	}
+	if nf.File != nil && nf.File.FileID != "" {
+		return nf.File.FileID
+	}
+	return nf.Node.InodeID
 }

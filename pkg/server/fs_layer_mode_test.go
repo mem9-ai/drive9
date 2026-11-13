@@ -600,24 +600,53 @@ func TestFSLayerAppliedModeChangeFollowsRenamedInode(t *testing.T) {
 	if ownership.owns("/zone/b.txt") {
 		t.Fatal("a rename of a live inode made the target plan-owned")
 	}
-	changes, err := ownership.appliedModeChange(ctx, s.fallback, &datastore.FSLayerEntry{Path: "/zone/b.txt", Op: datastore.FSLayerEntryOpUpsert, Mode: 0o777})
+	changes, _, err := ownership.appliedModeChange(ctx, s.fallback, &datastore.FSLayerEntry{Path: "/zone/b.txt", Op: datastore.FSLayerEntryOpUpsert, Mode: 0o777})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !changes {
 		t.Fatal("a mode change on the renamed live inode was not detected")
 	}
-	// Once the commit owns the name, there is no live inode to protect.
-	ownership.own("/zone/b.txt")
-	changes, err = ownership.appliedModeChange(ctx, s.fallback, &datastore.FSLayerEntry{Path: "/zone/b.txt", Op: datastore.FSLayerEntryOpUpsert, Mode: 0o777})
+	// Once the commit owns the name AND recorded the inode there, there is nothing to
+	// protect; the recorded id is what the mode application is pinned to.
+	moved, err := s.fallback.StatNodeCtx(ctx, "/zone/b.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownership.noteCreated("/zone/b.txt", fsLayerNodeIdentity(moved))
+	changes, target, err := ownership.appliedModeChange(ctx, s.fallback, &datastore.FSLayerEntry{Path: "/zone/b.txt", Op: datastore.FSLayerEntryOpUpsert, Mode: 0o777})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if changes {
 		t.Fatal("a plan-owned name was still treated as a live inode")
 	}
+	if target != fsLayerNodeIdentity(moved) {
+		t.Fatalf("mode target = %q, want the recorded inode %q", target, fsLayerNodeIdentity(moved))
+	}
+	// A concurrent rename parks a different inode on the same name: the recorded id no
+	// longer matches, so the guard falls back to comparing that live inode.
+	if _, err := s.fallback.WriteCtx(ctx, "/zone/victim.txt", []byte("victim"), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.fallback.ChmodCtx(ctx, "/zone/victim.txt", 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.fallback.RenameCtx(ctx, "/zone/b.txt", "/zone/parked.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.fallback.RenameCtx(ctx, "/zone/victim.txt", "/zone/b.txt"); err != nil {
+		t.Fatal(err)
+	}
+	changes, _, err = ownership.appliedModeChange(ctx, s.fallback, &datastore.FSLayerEntry{Path: "/zone/b.txt", Op: datastore.FSLayerEntryOpChmod, Mode: 0o777})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changes {
+		t.Fatal("a live inode moved onto a plan-owned name was treated as the commit's own")
+	}
 	// A chmod on a path the commit does not own and live main does not have is a no-op.
-	changes, err = ownership.appliedModeChange(ctx, s.fallback, &datastore.FSLayerEntry{Path: "/zone/missing.txt", Op: datastore.FSLayerEntryOpChmod, Mode: 0o700})
+	changes, _, err = ownership.appliedModeChange(ctx, s.fallback, &datastore.FSLayerEntry{Path: "/zone/missing.txt", Op: datastore.FSLayerEntryOpChmod, Mode: 0o700})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -488,6 +488,14 @@ func (b *Dat9Backend) ChmodCtx(ctx context.Context, path string, mode uint32) (e
 	return b.store.Chmod(ctx, resolvedPath, mode)
 }
 
+// ChmodInodeCtx sets the permission bits of a specific inode. A caller that has verified
+// which inode holds a name uses this so a concurrent rename cannot redirect the change.
+func (b *Dat9Backend) ChmodInodeCtx(ctx context.Context, inodeID string, mode uint32) (err error) {
+	start := time.Now()
+	defer func() { observeBackend(ctx, b.tenantID, b.tidbCloudOrgID, "chmod_inode", err, start) }()
+	return b.store.ChmodInode(ctx, inodeID, mode)
+}
+
 func (b *Dat9Backend) Remove(path string) error {
 	return b.RemoveCtx(backgroundWithTrace(), path)
 }
