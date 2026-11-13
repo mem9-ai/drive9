@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/mem9-ai/drive9/pkg/viewprotocol"
+	"github.com/pingcap/failpoint"
 )
 
 const fixedShadowSuffix = ".fixed-upload"
@@ -83,18 +84,26 @@ func (s *ShadowStore) ProtectFixedShadow(path string, generation uint64) (string
 	token := ""
 	if s.fixedProtected[hash] {
 		raw, err := os.ReadFile(file)
-		if err != nil {
+
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return "", err
 		}
-		token = string(raw)
-		if viewprotocol.ValidateOperationID(token) != nil {
-			return "", fmt.Errorf("invalid fixed shadow marker")
+		if err == nil {
+			token = string(raw)
+			if viewprotocol.ValidateOperationID(token) != nil {
+				return "", fmt.Errorf("invalid fixed shadow marker")
+			}
 		}
-	} else {
+	}
+	// A failed save before rename (or a confirmed cancellation's interrupted
+	// directory sync) can leave only the in-memory flag. There is no persisted
+	// identity to reuse; the new marker is synchronized before any request.
+	if token == "" {
 		token = "shadow-" + rand.Text()
 	}
 	// Mark it before the save: a failed directory fsync can leave a renamed file.
 	s.fixedProtected[hash] = true
+	failpoint.Inject("fixedShadowBeforeSave", func() { failpoint.Return("", fmt.Errorf("injected fixed shadow save failure")) })
 	if err := atomicWrite(file, []byte(token)); err != nil {
 		return "", err
 	}
@@ -189,6 +198,10 @@ func (s *ShadowStore) ReleaseFixedShadowAttempt(path, token string) error {
 	file := filepath.Join(s.dir, hash+fixedShadowSuffix)
 	raw, err := os.ReadFile(file)
 	if errors.Is(err, os.ErrNotExist) {
+		if err := fsyncDir(s.dir); err != nil {
+			return err
+		}
+		delete(s.fixedProtected, hash)
 		return nil
 	}
 	if err != nil {
@@ -200,6 +213,7 @@ func (s *ShadowStore) ReleaseFixedShadowAttempt(path, token string) error {
 	if err := os.Remove(file); err != nil {
 		return err
 	}
+	failpoint.Inject("fixedShadowAfterReleaseRemove", func() { failpoint.Return(fmt.Errorf("injected fixed shadow release sync failure")) })
 	if err := fsyncDir(s.dir); err != nil {
 		return err
 	}
