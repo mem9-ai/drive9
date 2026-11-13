@@ -445,6 +445,11 @@ func New(opts Options) (*Writeback, error) {
 	if opts.Client == nil {
 		return nil, fmt.Errorf("writeback: client is required")
 	}
+	if opts.Client.ViewBinding().LayerID != "" && opts.Staging != nil && opts.Staging.Shadow != nil {
+		if err := opts.Staging.Shadow.EnableFixedUploadRecovery(); err != nil {
+			return nil, err
+		}
+	}
 	root := strings.TrimSpace(opts.RemoteRoot)
 	if root == "" || root == "/" {
 		root = "/"
@@ -654,6 +659,10 @@ func New(opts Options) (*Writeback, error) {
 			workers = defaultUploadConcurrency
 		}
 		q := NewCommitQueue(opts.Client, opts.Staging.Shadow, opts.Staging.Pending, opts.Staging.Journal, workers, opts.CommitQueueMaxPending, root)
+		if w.uploader != nil {
+			q.fixedNamespaceMu = &w.uploader.fixedNamespaceMu
+			q.fixedCache = w.uploader
+		}
 		q.SetPerfCounters(w.perfShim)
 		if opts.BatchWindow > 0 || opts.BatchMaxFiles > 0 || opts.BatchMaxBytes > 0 {
 			q.ConfigureBatchWrite(opts.BatchWindow, opts.BatchMaxFiles, opts.BatchMaxBytes)
@@ -795,11 +804,18 @@ func (w *Writeback) Start(ctx context.Context) error {
 			fmt.Fprintf(os.Stderr, "drive9: pending index recovery: %v\n", err)
 		}
 	}
-	if w.uploader != nil && w.opts.Client.ViewBinding().LayerID != "" {
-		if err := w.uploader.recoverFixedCache(ctx); err != nil {
-			return fmt.Errorf("recover fixed cache publications: %w", err)
+	if w.opts.Client.ViewBinding().LayerID != "" && w.opts.Staging != nil {
+		if err := w.opts.Staging.Recover(); err != nil {
+			return err
 		}
 	}
+
+	if w.opts.Client.ViewBinding().LayerID != "" {
+		if err := w.recoverFixedPublications(ctx); err != nil {
+			return fmt.Errorf("recover fixed publications: %w", err)
+		}
+	}
+
 	// Recovery ownership is snapshotted BEFORE either track starts: the
 	// queue's workers begin inside RecoverPending, and a path they land and
 	// remove before the uploader's filter evaluates would pass a live
@@ -901,7 +917,7 @@ func (w *Writeback) Stop(ctx context.Context) error {
 // then fail the unlink instead of acknowledging a deletion that a restart
 // would undo. The anonymous marking is rolled back on that path.
 func (w *Writeback) MarkPathUnlinked(p string) error {
-	unlock, err := w.uploader.lockFixedNamespace(p)
+	unlock, err := w.lockFixedNamespace(p)
 	if err != nil {
 		return err
 	}
@@ -1559,7 +1575,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 					if w.queue != nil {
 						w.waitPathCommit(op.Path)
 					}
-					unlock, err := w.uploader.lockFixedNamespace(op.Path)
+					unlock, err := w.lockFixedNamespace(op.Path)
 					if err != nil {
 						return fs.Result{}, err
 					}
@@ -1588,7 +1604,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		if w.uploader != nil {
 			w.uploader.WaitPath(op.Path)
 		}
-		unlock, err := w.uploader.lockFixedNamespace(op.Path)
+		unlock, err := w.lockFixedNamespace(op.Path)
 		if err != nil {
 			return fs.Result{}, err
 		}
@@ -1693,7 +1709,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 				_ = w.uploader.UploadSync(ctx, op.Path)
 			}
 		}
-		unlock, err := w.uploader.lockFixedNamespace(op.Path, op.Path2)
+		unlock, err := w.lockFixedNamespace(op.Path, op.Path2)
 		if err != nil {
 			return fs.Result{}, err
 		}
@@ -1797,7 +1813,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		if err := land(op.Path); err != nil {
 			return fs.Result{}, fmt.Errorf("land flushed image before rename %s: %w", op.Path, err)
 		}
-		unlock, err := w.uploader.lockFixedNamespace(op.Path, op.Path2)
+		unlock, err := w.lockFixedNamespace(op.Path, op.Path2)
 		if err != nil {
 			return fs.Result{}, err
 		}

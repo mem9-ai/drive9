@@ -8,8 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
-	"syscall"
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/client"
@@ -22,30 +20,7 @@ func fixedCacheModeID(id string) string {
 }
 
 func (u *WriteBackUploader) fixedCachePublications() ([]fixedExtentPublication, error) {
-	records, err := loadFixedExtentPublications(u.client, u.fixedJournal)
-	if err != nil {
-		return nil, err
-	}
-	// Validate all owners before any request, including records whose cache was
-	// already removed before a crash. Recovery never adopts a different root.
-	for _, p := range records {
-		if p.CacheMetadata == nil || p.RemotePath != u.remotePath(p.Path) {
-			return nil, fmt.Errorf("fixed cache recovery has an unsupported publication owner")
-		}
-	}
-	// A prior Prepare may have appended successfully but failed its fsync. A
-	// readable record is not enough evidence to send completion: retry the
-	// same immutable save before any recovered request is sent.
-	for _, p := range records {
-		raw, err := json.Marshal(p)
-		if err != nil {
-			return nil, err
-		}
-		if err := u.fixedJournal.PrepareFixedUpload(p.OperationID, p.Path, raw); err != nil {
-			return nil, err
-		}
-	}
-	return records, nil
+	return durableFixedPublications(u.client, u.fixedJournal, u.remoteRoot)
 }
 
 // Called under the uploader path gate. First resolve old durable requests even
@@ -61,6 +36,9 @@ func (u *WriteBackUploader) uploadFixedCache(ctx context.Context, path string) (
 	for _, p := range records {
 		if p.Path != path {
 			continue
+		}
+		if p.CacheMetadata == nil {
+			return 0, nil, true, fmt.Errorf("fixed queue publication must settle before cache upload")
 		}
 		receipt, err := p.complete(ctx, u.client)
 		if err != nil {
@@ -175,6 +153,9 @@ func (u *WriteBackUploader) recoverFixedCache(ctx context.Context) error {
 		return err
 	}
 	for _, p := range records {
+		if p.CacheMetadata == nil {
+			return fmt.Errorf("fixed queue recovery requires its queue")
+		}
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -195,20 +176,5 @@ func (u *WriteBackUploader) lockFixedNamespace(paths ...string) (func(), error) 
 	if u == nil || u.client.ViewBinding().LayerID == "" {
 		return func() {}, nil
 	}
-	u.fixedNamespaceMu.Lock()
-	records, err := u.fixedCachePublications()
-	if err == nil {
-		for _, p := range records {
-			for _, path := range paths {
-				if p.Path == path || strings.HasPrefix(p.Path, strings.TrimSuffix(path, "/")+"/") {
-					err = syscall.EAGAIN
-				}
-			}
-		}
-	}
-	if err != nil {
-		u.fixedNamespaceMu.Unlock()
-		return nil, err
-	}
-	return u.fixedNamespaceMu.Unlock, nil
+	return lockFixedPublicationNamespace(u.client, u.fixedJournal, u.remoteRoot, &u.fixedNamespaceMu, paths...)
 }

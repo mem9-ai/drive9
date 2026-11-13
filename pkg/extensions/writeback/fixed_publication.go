@@ -5,6 +5,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/mem9-ai/drive9/pkg/mountpath"
+	"strings"
+	"sync"
+	"syscall"
 
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/staging"
@@ -16,7 +20,16 @@ import (
 // identifies only the image whose parts have already been uploaded. Generations
 // are the persisted pending-index/cache tokens, never process-local shadow IDs.
 // The mount's journal scope supplies the authenticated filesystem identity.
+type fixedQueueMetadata struct {
+	BaseRevision int64               `json:"base_revision"`
+	Kind         staging.PendingKind `json:"kind"`
+	Mode         uint32              `json:"mode"`
+	HasMode      bool                `json:"has_mode"`
+}
+
 type fixedExtentPublication struct {
+	QueueMetadata     *fixedQueueMetadata      `json:"queue_metadata,omitempty"`
+	ShadowToken       string                   `json:"shadow_token,omitempty"`
 	Version           int                      `json:"version"`
 	Binding           client.ViewBinding       `json:"binding"`
 	Path              string                   `json:"path"`
@@ -40,10 +53,15 @@ func (p fixedExtentPublication) validate(c *client.Client) error {
 		return fmt.Errorf("invalid fixed extent publication record")
 	}
 	if p.EmptyExpectedRevision != nil {
-		if p.Size != 0 || *p.EmptyExpectedRevision < 0 || p.UploadID != "" || len(p.Parts) != 0 || p.CacheMetadata == nil {
+		if p.Size != 0 || *p.EmptyExpectedRevision < 0 || p.UploadID != "" || len(p.Parts) != 0 || p.CacheMetadata == nil && p.QueueMetadata == nil {
 			return fmt.Errorf("invalid fixed empty publication")
 		}
-		expected, err := expectedRevisionForWriteBack(p.CacheMetadata)
+		expected, err := int64(0), error(nil)
+		if p.CacheMetadata != nil {
+			expected, err = expectedRevisionForWriteBack(p.CacheMetadata)
+		} else {
+			expected = p.QueueMetadata.BaseRevision
+		}
 		if err != nil || expected != *p.EmptyExpectedRevision {
 			return fmt.Errorf("fixed empty publication changed condition")
 		}
@@ -57,6 +75,15 @@ func (p fixedExtentPublication) validate(c *client.Client) error {
 			err != nil || remote != p.RemotePath || remote == "/" || (m.Kind != staging.PendingNew && m.Kind != staging.PendingOverwrite) {
 			return fmt.Errorf("invalid fixed cache publication owner")
 		}
+	}
+	if p.QueueMetadata != nil {
+		q := p.QueueMetadata
+		remote, err := pathutil.Canonicalize(p.RemotePath)
+		if p.CacheMetadata != nil || p.CacheGeneration != 0 || p.PendingGeneration == 0 || viewprotocol.ValidateOperationID(p.ShadowToken) != nil || err != nil || remote != p.RemotePath || remote == "/" || q.BaseRevision < 0 || q.Kind != staging.PendingNew && q.Kind != staging.PendingOverwrite || q.Kind == staging.PendingOverwrite && q.BaseRevision == 0 {
+			return fmt.Errorf("invalid fixed queue publication owner")
+		}
+	} else if p.ShadowToken != "" {
+		return fmt.Errorf("fixed shadow without queue owner")
 	}
 	for i, part := range p.Parts {
 		digest, err := hex.DecodeString(part.ETag)
@@ -146,4 +173,46 @@ func loadFixedExtentPublications(c *client.Client, journal *staging.Journal) ([]
 		publications = append(publications, p)
 	}
 	return publications, nil
+}
+
+// Every runtime owner is validated before any replay. Re-fsync even a readable
+// record: a previous save may have renamed/appended but failed synchronization.
+func durableFixedPublications(c *client.Client, journal *staging.Journal, root string) ([]fixedExtentPublication, error) {
+	records, err := loadFixedExtentPublications(c, journal)
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range records {
+		if p.CacheMetadata == nil && p.QueueMetadata == nil || p.RemotePath != mountpath.ToRemote(root, p.Path) {
+			return nil, fmt.Errorf("fixed recovery owner or root mismatch")
+		}
+	}
+	for _, p := range records {
+		raw, err := json.Marshal(p)
+		if err != nil {
+			return nil, err
+		}
+		if err := journal.PrepareFixedUpload(p.OperationID, p.Path, raw); err != nil {
+			return nil, err
+		}
+	}
+	return records, nil
+}
+func lockFixedPublicationNamespace(c *client.Client, journal *staging.Journal, root string, mu *sync.RWMutex, paths ...string) (func(), error) {
+	mu.Lock()
+	records, err := durableFixedPublications(c, journal, root)
+	if err == nil {
+		for _, p := range records {
+			for _, path := range paths {
+				if p.Path == path || strings.HasPrefix(p.Path, strings.TrimSuffix(path, "/")+"/") {
+					err = syscall.EAGAIN
+				}
+			}
+		}
+	}
+	if err != nil {
+		mu.Unlock()
+		return nil, err
+	}
+	return mu.Unlock, nil
 }
