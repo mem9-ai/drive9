@@ -49,7 +49,7 @@ including local validation via `drive9-server` with `DRIVE9_TENANT_PROVIDER=loca
 | `object-auth-cos-hosted-test.sh` | Same 44-check hosted coverage as S3, against Tencent COS (`tccli`). Needs a dedicated test bucket + CAM user; never point at prod COS. Set `DRIVE9_E2E_OBJECT_REGION` and `DRIVE9_E2E_OBJECT_ACCOUNT_ID` (APPID) |
 | `object-auth-tos-hosted-test.sh` | Same hosted coverage against Volcengine TOS (`tosutil`). AssumeRole only: `DRIVE9_E2E_OBJECT_ROLE_ARN` is required, plus region |
 | `native-smoke-test.sh` | TiDB Cloud Native tenant lifecycle: CLI provision with credentials, status poll, basic fs ops (mkdir/cp/cat/ls/rm), delete + verification, trap cleanup on failure |
-| `smoke-all.sh` | PR-gate aggregator aligned with `local-e2e.yml`: api, cli, layer-fs, fuse-release-gate, fuse-patch-storage-class, git-ops, git-workspace-ondemand, pack, fuse-crash-recovery, fuse-supervision, fuse-write-perf-budget. Re-exports `DRIVE9_API_KEY` for existing-tenant mode. `RUN_FUSE_SMOKE=0` skips FUSE-related suites; `RUN_API_ONLY=1` keeps only api + cli; `RUN_JOURNAL_SMOKE=1` / `RUN_POSIX_SMOKE=1` / `RUN_GIT_WORKSPACE_SMOKE=1` add post-merge extras; `RUN_TOKENS_SMOKE=1` / `RUN_SSE_SMOKE=1` add HTTP tokens and SSE retention (off even on post-merge); `RUN_TASKS_SMOKE=1` adds the `fs tasks` wire-contract smoke (off even on post-merge) |
+| `smoke-all.sh` | PR-gate aggregator aligned with `local-e2e.yml`: api, cli, fuse-release-gate, fuse-patch-storage-class, git-ops, git-workspace-ondemand, pack, fuse-crash-recovery, fuse-supervision, fuse-write-perf-budget. Re-exports `DRIVE9_API_KEY` for existing-tenant mode. `RUN_FUSE_SMOKE=0` skips FUSE-related suites; `RUN_API_ONLY=1` keeps only api + cli; `RUN_JOURNAL_SMOKE=1` / `RUN_POSIX_SMOKE=1` / `RUN_GIT_WORKSPACE_SMOKE=1` add post-merge extras; `RUN_TOKENS_SMOKE=1` / `RUN_SSE_SMOKE=1` add HTTP tokens and SSE retention (off even on post-merge); `RUN_TASKS_SMOKE=1` adds the `fs tasks` wire-contract smoke (off even on post-merge) |
 
 ## Fixed-view v10 isolation smoke
 
@@ -84,7 +84,10 @@ bounded and verifies the authenticated status identity against provisioning.
 The client repository's historical server does not implement v10 routes.
 The `layer-fs-smoke-test.sh` entry now invokes the fixed-view suite. Running it
 against that historical server fails; it does not fall back to legacy Layer
-endpoints. CI must pair the new client with the matching v10 server. Both
+endpoints. The server repository owns real Layer acceptance and pins the client commit.
+Client Local E2E keeps ordinary main tests against its historical server and
+runs the fixed-view driver contracts offline; that job is not Layer integration
+acceptance. Both repository checks must pass before this paired change ships. Both
 `fixed-view-ci.sh` and the Layer smoke entry require Linux FUSE and propagate
 HTTP, CLI build, mounted write, merge and cleanup failures.
 
@@ -103,8 +106,8 @@ without adding it to `.github/workflows/local-e2e.yml`.
 
 | Tier | Trigger | What runs |
 |------|---------|-----------|
-| PR gate | `pull_request` to `main` (local-e2e) | api, cli, object-store, layer-fs, fuse-release-gate (smoke + correctness + sqlite rollback + node fs), fuse-patch-storage-class, git-ops, git-workspace-ondemand, portable pack/unpack, fuse-crash-recovery, fuse-supervision, fuse-write-perf-budget |
-| Paired server PR gate | `tidbcloud/fs` Local E2E | `fixed-view-ci.sh`: HTTP isolation plus new CLI/FUSE read/switch against the server PR and a pinned client commit; existing baseline E2E remains enabled |
+| PR gate | `pull_request` to `main` (local-e2e) | offline fixed-view contracts, api, cli, object-store, fuse-release-gate (smoke + correctness + sqlite rollback + node fs), fuse-patch-storage-class, git-ops, git-workspace-ondemand, portable pack/unpack, fuse-crash-recovery, fuse-supervision, fuse-write-perf-budget |
+| Paired server PR gate | `tidbcloud/fs` Local E2E | `fixed-view-ci.sh`: HTTP isolation plus real CLI/FUSE write/switch/validate/merge against the server PR and a pinned client commit; existing baseline E2E remains enabled |
 | Post-merge | `push` to `main` (local-e2e, coalesced via concurrency group) | PR gate + concurrency stress, POSIX/fsx, sqlite WAL/churn/concurrency, sqlite 1000-commit WAL FULL sequence, `smoke-all.sh` extras (journal, posix-permission, git-workspace), git feature smoke |
 | Nightly | cron 20:17 UTC (local-e2e) | Post-merge set + FUSE performance baseline/archive/compare (compare is report-only; hosted-runner noise) |
 | Manual all | Local E2E `workflow_dispatch` with `run_all_e2e=1` | Everything above |
@@ -519,3 +522,8 @@ retained quota enabled. It is manual-only from this client repository until the
 paired server API is released; the server's isolated LayerFS acceptance workflow
 runs it against the matching server branch. It provisions a fresh local tenant,
 requires explicit success, and propagates write, switch, merge and cleanup failures.
+
+`smoke-all.sh` leaves fixed-view integration to the paired server gate by default.
+Set `RUN_FIXED_VIEW_SMOKE=1` to include it against a matching v10 server; any Layer
+failure still fails the aggregate. The standalone Layer entry always runs its
+full HTTP and mounted flow. No private-server credential is added to client CI.

@@ -7,15 +7,17 @@
 #    and reuse that tenant. The key is re-exported so run_case cannot drop it.
 #
 # Default set matches `.github/workflows/local-e2e.yml` PR steps:
-#  api, cli, object-store, layer-fs, fuse-release-gate, fuse-patch-storage-class,
+#  api, cli, object-store, fuse-release-gate, fuse-patch-storage-class,
 #  git-ops, git-workspace-ondemand, pack, fuse-crash-recovery, fuse-supervision,
 #  fuse-write-perf-budget.
 #
+# Fixed-view Layer acceptance runs in the paired server CI.
+# Set RUN_FIXED_VIEW_SMOKE=1 only with the matching server and Linux FUSE.
 # Subset knobs:
 #  - RUN_API_ONLY=1 — api + cli only.
 #  - RUN_FUSE_SMOKE=0 — skip FUSE-related suites (release-gate, patch,
 #    crash-recovery, supervision, write-perf, git-ops, git-ondemand) and
-#    layer-fs FUSE restore. macOS WebDAV cannot satisfy those asserts.
+#    ordinary mount suites. macOS WebDAV cannot satisfy those asserts.
 #  - RUN_JOURNAL_SMOKE=1 / RUN_POSIX_SMOKE=1 / RUN_GIT_WORKSPACE_SMOKE=1 —
 #    extras used by post-merge local-e2e, not part of the PR default.
 #  - RUN_TOKENS_SMOKE=1 / RUN_SSE_SMOKE=1 — HTTP tokens + SSE retention
@@ -34,8 +36,11 @@ if [ -n "${DRIVE9_API_KEY:-}" ]; then
 fi
 RUN_API_ONLY="${RUN_API_ONLY:-0}"
 RUN_FUSE_SMOKE="${RUN_FUSE_SMOKE:-1}"
-RUN_LAYER_FUSE_SMOKE="${RUN_LAYER_FUSE_SMOKE:-$RUN_FUSE_SMOKE}"
-export RUN_LAYER_FUSE_SMOKE
+RUN_FIXED_VIEW_SMOKE="${RUN_FIXED_VIEW_SMOKE:-0}"
+case "$RUN_FIXED_VIEW_SMOKE" in
+  0|1) ;;
+  *) echo "RUN_FIXED_VIEW_SMOKE must be 0 or 1" >&2; exit 2 ;;
+esac
 if [ "$RUN_API_ONLY" = "1" ]; then
   RUN_OBJECT_STORE_SMOKE="${RUN_OBJECT_STORE_SMOKE:-0}"
 else
@@ -51,7 +56,6 @@ RUN_TASKS_SMOKE="${RUN_TASKS_SMOKE:-0}"
 
 if [ "$RUN_FUSE_SMOKE" = "1" ]; then
   export FUSE_STRICT_PREREQS="${FUSE_STRICT_PREREQS:-1}"
-  export LAYER_FUSE_STRICT_PREREQS="${LAYER_FUSE_STRICT_PREREQS:-1}"
   export RUN_FUSE_CONCURRENCY_STRESS="${RUN_FUSE_CONCURRENCY_STRESS:-0}"
   export RUN_FUSE_POSIX_FSX="${RUN_FUSE_POSIX_FSX:-0}"
 fi
@@ -128,7 +132,11 @@ if [ "$RUN_API_ONLY" = "1" ]; then
   skip_case "fuse-supervision" "e2e/fuse-supervision-test.sh" "set RUN_API_ONLY=0"
   skip_case "fuse-write-perf-budget" "e2e/fuse-write-perf-budget-test.sh" "set RUN_API_ONLY=0"
 else
-  run_case "layer-fs" "e2e/layer-fs-smoke-test.sh"
+  if [ "$RUN_FIXED_VIEW_SMOKE" = "1" ]; then
+    run_case "layer-fs" "e2e/layer-fs-smoke-test.sh"
+  else
+    skip_case "layer-fs" "e2e/layer-fs-smoke-test.sh" "requires paired server CI; set RUN_FIXED_VIEW_SMOKE=1 with v10"
+  fi
   run_fuse_case "fuse-release-gate" "e2e/fuse-release-gate.sh"
   run_fuse_case "fuse-patch-storage-class" "e2e/fuse-patch-storage-class.sh"
   run_fuse_case "git-ops" "e2e/git-ops-smoke-test.sh"

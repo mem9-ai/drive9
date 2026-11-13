@@ -335,13 +335,13 @@ jobs:
           OBJECT_STRICT_CROSS: "1"
         run: bash e2e/object-store-smoke-test.sh
 
-      - name: Run layer FS smoke
-        id: layer-fs-smoke
+      # This repository's historical server has no fixed-view protocol.
+      # Real Layer acceptance is mandatory in tidbcloud/fs Local E2E, which
+      # pins this client and tests its current server without sharing secrets.
+      - name: Test fixed-view contracts without services
+        id: fixed-view-contracts
         continue-on-error: true
-        env:
-          RUN_LAYER_FUSE_SMOKE: "1"
-          LAYER_FUSE_STRICT_PREREQS: "1"
-        run: bash e2e/layer-fs-smoke-test.sh
+        run: python3 -m unittest discover -s e2e -p 'test_fixed_view*.py'
 
       - name: Test READDIRPLUS and SSE disconnects through Linux FUSE
         id: fuse-readdir-pending
@@ -540,7 +540,7 @@ jobs:
             echo "| API smoke | ${{ steps.api-smoke.outcome || 'skipped' }} |"
             echo "| CLI smoke | ${{ steps.cli-smoke.outcome || 'skipped' }} |"
             echo "| Object-store smoke | ${{ steps.object-store-smoke.outcome || 'skipped' }} |"
-            echo "| Layer FS smoke | ${{ steps.layer-fs-smoke.outcome || 'skipped' }} |"
+            echo "| Fixed-view contracts (offline) | ${{ steps.fixed-view-contracts.outcome || 'skipped' }} |"
             echo "| FUSE pending READDIRPLUS | ${{ steps.fuse-readdir-pending.outcome || 'skipped' }} |"
             echo "| FUSE release gate | ${{ steps.fuse-smoke.outcome || 'skipped' }} |"
             echo "| FUSE patch storage-class e2e | ${{ steps.fuse-patch-storage-class.outcome || 'skipped' }} |"
@@ -588,7 +588,7 @@ jobs:
             "api-smoke": "${{ steps.api-smoke.outcome }}",
             "cli-smoke": "${{ steps.cli-smoke.outcome }}",
             "object-store-smoke": "${{ steps.object-store-smoke.outcome }}",
-            "layer-fs-smoke": "${{ steps.layer-fs-smoke.outcome }}",
+            "fixed-view-contracts": "${{ steps.fixed-view-contracts.outcome }}",
             "fuse-readdir-pending": "${{ steps.fuse-readdir-pending.outcome }}",
             "fuse-smoke": "${{ steps.fuse-smoke.outcome }}",
             "fuse-patch-storage-class": "${{ steps.fuse-patch-storage-class.outcome }}",
@@ -695,7 +695,7 @@ jobs:
           check_required "API smoke" "${{ steps.api-smoke.outcome }}"
           check_required "CLI smoke" "${{ steps.cli-smoke.outcome }}"
           check_required "Object-store smoke" "${{ steps.object-store-smoke.outcome }}"
-          check_required "Layer FS smoke" "${{ steps.layer-fs-smoke.outcome }}"
+          check_required "Fixed-view contracts (offline)" "${{ steps.fixed-view-contracts.outcome }}"
           check_required "FUSE pending READDIRPLUS" "${{ steps.fuse-readdir-pending.outcome }}"
           check_required "FUSE release gate" "${{ steps.fuse-smoke.outcome }}"
           check_required "Git operations smoke" "${{ steps.git-ops-smoke.outcome }}"
