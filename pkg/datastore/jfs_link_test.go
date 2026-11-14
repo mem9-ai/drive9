@@ -672,3 +672,51 @@ func TestOrphanCleanupReleasesInodeAfterConcurrentSiblingDelete(t *testing.T) {
 		t.Fatalf("the released inode %s is %q, want %q (the last dentry must release the entity)", entityID, status, StatusDeleted)
 	}
 }
+
+// ChmodInode has to work on a hardlinked extent file: several file_nodes rows share one
+// file_id and extent_ino, so a scalar subquery for the extent inode answers ERROR 1242.
+// The layer commit applies creation modes through this path.
+func TestChmodInodeUpdatesHardlinkedExtentFile(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	create, _ := json.Marshal(map[string]any{
+		"parent": 1, "name": "hard.db", "type": 1, "mode": 0644,
+		"inode": 11, "proj_path": "/hard.db",
+		"attr": ExtentAttr{Typ: 1, Mode: 0644, Nlink: 1, Parent: 1, Full: true},
+	})
+	if _, errno, err := s.RunExtentMetaOp(ctx, "mknod", create, nil); err != nil || errno != 0 {
+		t.Fatalf("mknod errno=%d err=%v", errno, err)
+	}
+	if err := s.LinkFileNode(ctx, "/hard.db", "/hard-alias.db", "/", "hard-alias.db", "link-h1", time.Now()); err != nil {
+		t.Fatalf("LinkFileNode: %v", err)
+	}
+	var rows int
+	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM file_nodes WHERE extent_ino = 11`).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows < 2 {
+		t.Fatalf("extent file_nodes rows = %d, want the hardlink to share the file", rows)
+	}
+	var fileID string
+	if err := s.DB().QueryRow(`SELECT file_id FROM file_nodes WHERE extent_ino = 11 LIMIT 1`).Scan(&fileID); err != nil {
+		t.Fatal(err)
+	}
+	var before int64
+	if err := s.DB().QueryRow(`SELECT ctime FROM jfs_node WHERE inode = 11`).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ChmodInode(ctx, fileID, 0o600); err != nil {
+		t.Fatalf("ChmodInode on a hardlinked extent file: %v", err)
+	}
+	var mode uint32
+	var ctime int64
+	if err := s.DB().QueryRow(`SELECT mode, ctime FROM jfs_node WHERE inode = 11`).Scan(&mode, &ctime); err != nil {
+		t.Fatal(err)
+	}
+	if mode&0o777 != 0o600 {
+		t.Fatalf("extent mode = %o, want 600", mode&0o777)
+	}
+	if ctime <= before {
+		t.Fatalf("extent ctime = %d, want > %d after chmod", ctime, before)
+	}
+}

@@ -564,6 +564,13 @@ func (u *WriteBackUploader) applyMode(ctx context.Context, meta *staging.WriteBa
 		return applyErr
 	})
 	if err != nil {
+		// The same rule as the commit queue: the content is already uploaded, and a token
+		// that may not chmod (an fs_scoped mount) can never succeed here, so retrying
+		// would keep the mode pending for ever. Drop it with a warning instead.
+		if client.IsForbidden(err) {
+			safeLogPrintf("writeback upload: chmod denied for %s (token may not chmod); proceeding without mode update", meta.Path)
+			return nil
+		}
 		return fmt.Errorf("writeback upload chmod %s to %o: %w", meta.Path, mode, err)
 	}
 	return nil

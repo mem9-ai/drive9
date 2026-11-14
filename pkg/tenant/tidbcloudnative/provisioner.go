@@ -1607,16 +1607,29 @@ func RetireLegacySystemUserPrivilege(ctx context.Context, dsn string) error {
 	return nil
 }
 
-// RestrictedSystemUserNameSuffix marks the per-tenant account the native setup creates.
-// Callers that decide from a stored DSN use IsRestrictedSystemUser instead of spelling
-// the suffix themselves, so a scheme change cannot silently stop matching.
-const RestrictedSystemUserNameSuffix = ".tdc_fs_sys"
+// The instance account scheme is owned by pkg/tenant so the server, the native
+// provisioner and the legacy starter path cannot drift apart on it: a drift between
+// building a name and parsing one back compiles, silently stops matching, and leaves a
+// stored DSN pointing at an account that is never provisioned.
+const (
+	// RestrictedSystemUserNameSuffix marks the per-tenant account. Callers that decide
+	// from a stored DSN use IsRestrictedSystemUser instead of spelling the suffix
+	// themselves, so a scheme change cannot silently stop matching.
+	RestrictedSystemUserNameSuffix = tenant.RestrictedSystemUserNameSuffix
+	// RootUserNameSuffix marks the cluster root principal, which shares the password of
+	// the restricted account with the same prefix.
+	RootUserNameSuffix = tenant.RootUserNameSuffix
+)
 
 // IsRestrictedSystemUser reports whether username names the restricted per-tenant
 // account rather than a cluster principal.
 func IsRestrictedSystemUser(username string) bool {
-	prefix, ok := strings.CutSuffix(strings.TrimSpace(username), RestrictedSystemUserNameSuffix)
-	return ok && prefix != ""
+	return tenant.IsRestrictedSystemUsername(username)
+}
+
+// systemRootUsernameFor builds the cluster root principal for an instance prefix.
+func systemRootUsernameFor(prefix string) string {
+	return tenant.RootUsernameFor(prefix)
 }
 
 // systemRootUserFor maps the restricted tenant account name back to the cluster root
@@ -1627,7 +1640,7 @@ func systemRootUserFor(currentUsername string) (string, bool) {
 		return "", false
 	}
 	prefix := strings.TrimSuffix(currentUsername, RestrictedSystemUserNameSuffix)
-	return prefix + ".root", true
+	return systemRootUsernameFor(prefix), true
 }
 
 func systemUsernameForCurrent(currentUsername string) (string, bool, error) {
@@ -1635,17 +1648,19 @@ func systemUsernameForCurrent(currentUsername string) (string, bool, error) {
 	if currentUsername == "" {
 		return "", false, fmt.Errorf("native database username is empty")
 	}
-	prefix, ok := strings.CutSuffix(currentUsername, ".root")
+	prefix, ok := strings.CutSuffix(currentUsername, RootUserNameSuffix)
 	if ok {
 		if prefix == "" {
 			return "", false, fmt.Errorf("native root username %q missing user prefix", currentUsername)
 		}
-		return prefix + ".tdc_fs_sys", true, nil
+		return prefix + RestrictedSystemUserNameSuffix, true, nil
 	}
-	if prefix, ok := strings.CutSuffix(currentUsername, ".tdc_fs_sys"); ok && prefix != "" {
+	if IsRestrictedSystemUser(currentUsername) {
 		return currentUsername, false, nil
 	}
-	return "", false, fmt.Errorf("native database username %q is not a root or tdc_fs_sys account", currentUsername)
+	// The message names no suffix: it must stay true if the scheme changes, and the
+	// constants above are the only place that spelling is allowed to live.
+	return "", false, fmt.Errorf("native database username %q is neither the root principal nor the restricted account for an instance", currentUsername)
 }
 
 func quoteIdent(value string) string {
@@ -2088,7 +2103,7 @@ func (p *Provisioner) clusterInfoFromResponse(tenantID, dbName, password string,
 		Provider:       tenant.ProviderTiDBCloudNative,
 	}
 	if info.UserPrefix != "" {
-		out.Username = info.UserPrefix + ".root"
+		out.Username = systemRootUsernameFor(info.UserPrefix)
 	}
 	return out, nil
 }
@@ -2162,7 +2177,7 @@ func (p *Provisioner) fillBranchEndpoint(out *tenant.ClusterInfo, branch *branch
 		return err
 	}
 	if branch.UserPrefix != "" {
-		out.Username = branch.UserPrefix + ".root"
+		out.Username = systemRootUsernameFor(branch.UserPrefix)
 	}
 	out.Host = host
 	out.Port = port
@@ -2245,7 +2260,7 @@ func (p *Provisioner) WaitForBranchUserWithCredentials(ctx context.Context, clus
 			return "", err
 		}
 		if info.UserPrefix != "" {
-			return info.UserPrefix + ".root", nil
+			return systemRootUsernameFor(info.UserPrefix), nil
 		}
 		p.recordMetadataNotReadyAlert(ctx, "branch_user", clusterID, branchID, "user_prefix_missing", started, &notReadyAlertRecorded)
 		if time.Now().After(deadline) {

@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 var operationDurationBounds = []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600}
@@ -406,6 +407,19 @@ func boundedHTTPMethod(method string) string {
 	}
 }
 
+// BoundedMethodLabel bounds a caller-controlled HTTP method for use as an action
+// label in tenant metrics. It is the lower-case twin of boundedHTTPMethod: the action
+// label historically holds the method in lower case, and a caller-chosen method such as
+// "X1", "X2", ... would mint a new series (and a permanent map entry) per request.
+func BoundedMethodLabel(method string) string {
+	// The empty case is handled here because boundedHTTPMethod keeps its historical
+	// "UNKNOWN" label for HTTP metrics; an action label has always fallen back to "other".
+	if strings.TrimSpace(method) == "" {
+		return "other"
+	}
+	return strings.ToLower(boundedHTTPMethod(method))
+}
+
 func RecordHTTPRequest(method, route string, status int, d time.Duration) {
 	RegisterModule("server")
 	httpRequestsTotal.Add(1,
@@ -452,7 +466,7 @@ func RecordTenantRequestCountWithOrg(tenantID, tidbCloudOrgID, surface, action s
 	tenantID = cleanMetricValue(tenantID, "unknown")
 	tidbCloudOrgID = cleanTiDBCloudOrgID(tidbCloudOrgID)
 	surface = cleanMetricValue(surface, "other")
-	action = cleanMetricValue(action, "other")
+	action = metricActionLabel(action)
 	statusClass := statusClass(status)
 	RegisterModule("tenant_usage")
 	attrs := []Attribute{
@@ -520,6 +534,26 @@ func metricLabelValue(labels []string, key string) string {
 	return "unknown"
 }
 
+// maxMetricActionLabelBytes bounds the length of the action label. Cardinality is
+// bounded where the fixed action sets live — the request classifiers and the datastore
+// op dispatch — because only those know the permitted values; this cap keeps a
+// caller-derived string from inflating the size of every series it touches.
+const maxMetricActionLabelBytes = 48
+
+func metricActionLabel(action string) string {
+	action = cleanMetricValue(action, "other")
+	if len(action) <= maxMetricActionLabelBytes {
+		return action
+	}
+	// Cut on a rune boundary: a byte cut can leave invalid UTF-8, and every action
+	// source is ASCII today but the cap is a backstop, not a place to corrupt labels.
+	cut := maxMetricActionLabelBytes
+	for cut > 0 && !utf8.RuneStart(action[cut]) {
+		cut--
+	}
+	return action[:cut]
+}
+
 func RecordTenantRequest(tenantID, surface, action string, status int, d time.Duration) {
 	RecordTenantRequestWithOrg(tenantID, "", surface, action, status, d)
 }
@@ -528,7 +562,7 @@ func RecordTenantRequestWithOrg(tenantID, tidbCloudOrgID, surface, action string
 	tenantID = cleanMetricValue(tenantID, "unknown")
 	tidbCloudOrgID = cleanTiDBCloudOrgID(tidbCloudOrgID)
 	surface = cleanMetricValue(surface, "other")
-	action = cleanMetricValue(action, "other")
+	action = metricActionLabel(action)
 	statusClass := "unknown"
 	if status > 0 {
 		statusClass = strconv.Itoa(status/100) + "xx"

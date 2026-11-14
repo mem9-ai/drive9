@@ -2582,6 +2582,12 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 			// commit for this path.
 			if client.IsNotFound(err) {
 				safeLogPrintf("commit queue: post-upload chmod not found for %s (concurrent write likely replaced it); proceeding without mode update", entry.Path)
+			} else if client.IsForbidden(err) {
+				// chmod is owner-only. A mount authenticated with an fs_scoped key can
+				// write content but may not change permission bits, and retrying cannot
+				// change that: the entry would stay pending and be denied again on every
+				// commit cycle. Content is already durable, so drop the mode and proceed.
+				safeLogPrintf("commit queue: post-upload chmod denied for %s (token may not chmod); proceeding without mode update", entry.Path)
 			} else {
 				return fmt.Errorf("%w: chmod %s to %o: %w", errCommitPostUpload, entry.Path, mode, err)
 			}

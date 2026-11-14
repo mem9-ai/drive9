@@ -2140,6 +2140,19 @@ func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The status response is the capability negotiation surface, and every capability it
+	// carries is an owner contract (batch_write_mode_v1 enforces owner-only mode bits). An
+	// fs_scoped key must not read it: its mount would attach hasMode to every writeback and
+	// be denied per item on each cycle. The scoped allowlist never runs for this route — it
+	// is registered directly on the mux — so the refusal lives here, after authentication
+	// (a revoked scoped key still answers 401, not 403). Trade-off, accepted: a scoped
+	// client also loses inline_threshold negotiation, so its uploads take the multipart path.
+	if !statusAllowedForKey(&resolved.APIKey) {
+		metricEvent(r.Context(), "auth", "result", "scope_kind_unsupported")
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_scoped_key_denied", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID, "scope_kind", resolved.APIKey.ScopeKind)...)
+		errJSON(w, http.StatusForbidden, "status is owner-only")
+		return
+	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_ok", "tenant_id", resolved.Tenant.ID, "status", resolved.Tenant.Status)...)
 	_ = json.NewEncoder(w).Encode(TenantStatusResponse{
 		Status:          string(resolved.Tenant.Status),
@@ -2148,6 +2161,20 @@ func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 		MaxUploadBytes:  s.maxUploadBytes,
 		InlineThreshold: s.inlineThreshold,
 	})
+}
+
+// statusAllowedForKey reports whether the status capability contract may be served to
+// this token. Scoped keys are excluded: every capability it advertises is an owner
+// contract today.
+func statusAllowedForKey(key *meta.APIKey) bool {
+	if key == nil {
+		return false
+	}
+	scopeKind := key.ScopeKind
+	if scopeKind == "" {
+		scopeKind = meta.APIKeyScopeKindOwner
+	}
+	return scopeKind != meta.APIKeyScopeKindFS
 }
 
 func (s *Server) tenantStatusMessage(t *meta.Tenant) string {
@@ -3275,10 +3302,10 @@ func (s *Server) handleBatchWrite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	scope := ScopeFromContext(r.Context())
 	results := make([]batchWriteResult, len(req.Items))
 	allowedIndexes := make([]int, 0, len(req.Items))
 	backendItems := make([]backend.BatchWriteItem, 0, len(req.Items))
-	scope := ScopeFromContext(r.Context())
 	var totalBytes int64
 	for i, item := range req.Items {
 		results[i].Path = item.Path
@@ -3292,6 +3319,22 @@ func (s *Server) handleBatchWrite(w http.ResponseWriter, r *http.Request) {
 		if err := validateBatchWritePath(item.Path); err != nil {
 			results[i].Status = http.StatusBadRequest
 			results[i].Error = err.Error()
+			continue
+		}
+		// chmod is owner-only (handleChmod), and a batch item's mode bits are the
+		// same escalation: an fs_scoped agent token would otherwise set arbitrary
+		// permission bits on a path it can write. Per-item 403 rather than a failed
+		// request, so the content-only items of the same batch still commit — the
+		// rejection contract BatchWriteResult documents for this capability.
+		//
+		// This denial is only correct while a scoped token is never told the
+		// content+mode contract exists: if storage_capabilities.batch_write_mode_v1 is
+		// ever advertised, it has to be per token scope (owner only), or a scoped mount
+		// will attach hasMode to every commit and be denied on each writeback cycle.
+		if item.HasMode && !scope.CanChmod() {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "batch_write_mode_denied", "path", item.Path)...)
+			results[i].Status = http.StatusForbidden
+			results[i].Error = chmodOwnerOnlyMessage
 			continue
 		}
 		if s.maxUploadBytes > 0 && itemBytes > s.maxUploadBytes {
@@ -3314,7 +3357,13 @@ func (s *Server) handleBatchWrite(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	backendResults, err := b.BatchWriteCtx(r.Context(), backendItems)
+	// Only an owner token's items may carry permission bits; the backend refuses
+	// them otherwise, so a future handler cannot skip this decision.
+	batchCtx := r.Context()
+	if scope.CanChmod() {
+		batchCtx = backend.WithBatchWriteModeChanges(batchCtx)
+	}
+	backendResults, err := b.BatchWriteCtx(batchCtx, backendItems)
 	if err != nil {
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "batch_write_failed", "error", err)...)
 		errJSONInternalStorage(w, r, err)
@@ -3364,6 +3413,10 @@ func batchWriteStatusForError(err error) int {
 		return http.StatusNotFound
 	case errors.Is(err, datastore.ErrInvalidRootDentry):
 		return http.StatusBadRequest
+	case errors.Is(err, backend.ErrBatchWriteModeDenied):
+		// The backend refuses mode bits the HTTP layer did not authorize; report it as
+		// the same per-item 403 the handler's own denial uses, not a storage error.
+		return http.StatusForbidden
 	default:
 		return http.StatusInternalServerError
 	}
@@ -3372,6 +3425,11 @@ func batchWriteStatusForError(err error) int {
 func batchWriteErrorMessage(err error, status int) string {
 	if status == http.StatusInternalServerError {
 		return internalStorageErrorMessage
+	}
+	if errors.Is(err, backend.ErrBatchWriteModeDenied) {
+		// One denial, one message: the handler's own 403 and the backend defense must
+		// read the same way to a client.
+		return chmodOwnerOnlyMessage
 	}
 	return err.Error()
 }
@@ -3853,8 +3911,8 @@ func (s *Server) handleChmod(w http.ResponseWriter, r *http.Request, path string
 	// regardless of zone. The dispatcher already denies scoped tokens on
 	// POST /v1/fs/*?chmod, so reaching this handler with a scoped token
 	// indicates a defense-in-depth gap somewhere upstream — fail closed.
-	if scope := ScopeFromContext(r.Context()); scope != nil && scope.IsScoped {
-		errJSON(w, http.StatusForbidden, "chmod is owner-only")
+	if scope := ScopeFromContext(r.Context()); scope != nil && !scope.CanChmod() {
+		errJSON(w, http.StatusForbidden, chmodOwnerOnlyMessage)
 		return
 	}
 	b := backendFromRequest(r)
