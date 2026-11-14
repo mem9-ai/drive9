@@ -438,3 +438,52 @@ func TestSwitchControlCancellationAfterValidPrefix(t *testing.T) {
 		})
 	}
 }
+
+func TestSwitchCallerBudgetReachesWire(t *testing.T) {
+	for _, query := range []bool{false, true} {
+		for _, budget := range []time.Duration{0, 10 * time.Second, 10 * time.Minute} {
+			req, resp := switchFixture()
+			budgets := make(chan time.Duration, 1)
+			socket := socketSwitchFixture(t, func(conn net.Conn) {
+				dec := json.NewDecoder(conn)
+				var wire struct {
+					DrainRequest
+					SwitchRequest
+				}
+				if err := dec.Decode(&wire); err != nil {
+					t.Error(err)
+					return
+				}
+				_ = json.NewEncoder(conn).Encode(StatusResponse{OK: true, ViewSwitch: true, MountID: req.MountID})
+				if err := dec.Decode(&wire); err != nil {
+					t.Error(err)
+					return
+				}
+				budgets <- wire.Timeout()
+				_ = json.NewEncoder(conn).Encode(resp)
+			})
+			ctx := context.Background()
+			cancel := func() {}
+			if budget > 0 {
+				ctx, cancel = context.WithTimeout(ctx, budget)
+			}
+			var err error
+			if query {
+				_, err = QuerySwitch(ctx, socket, req)
+			} else {
+				_, err = RequestSwitch(ctx, socket, req)
+			}
+			cancel()
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := budget
+			if want == 0 {
+				want = DefaultDrainTimeout
+			}
+			if got := <-budgets; got > want+time.Millisecond || got < want-time.Second {
+				t.Fatalf("query=%v budget=%v wire=%v", query, budget, got)
+			}
+		}
+	}
+}

@@ -150,7 +150,9 @@ func (s *mountControlServer) handleConn(parent context.Context, conn net.Conn) {
 			s.writeControlError(conn, "unsupported_operation", errors.New("expected negotiated view operation"))
 			return
 		}
-		ctx, cancel := context.WithTimeout(parent, mountcontrol.DefaultDrainTimeout)
+		timeout := req.Timeout()
+		_ = conn.SetDeadline(time.Now().Add(timeout + 5*time.Second))
+		ctx, cancel := context.WithTimeout(parent, timeout)
 		defer cancel()
 		var response mountcontrol.SwitchResponse
 		if req.Op == "switch" {

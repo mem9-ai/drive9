@@ -216,3 +216,26 @@ func TestMountControlFrameBoundaries(t *testing.T) {
 		t.Fatalf("missing newline: %v", err)
 	}
 }
+
+func TestMountViewControlHonorsSwitchDeadline(t *testing.T) {
+	for _, timeout := range []time.Duration{10 * time.Second, 10 * time.Minute} {
+		t.Run(timeout.String(), func(t *testing.T) {
+			s, _, req, _ := viewSwitchFixture(t)
+			remaining := make(chan time.Duration, 1)
+			s.validate = func(ctx context.Context, _ viewprotocol.Binding) error {
+				deadline, _ := ctx.Deadline()
+				remaining <- time.Until(deadline)
+				return errors.New("stop after checking the request deadline")
+			}
+			server := startViewControlFixture(t, s)
+			ctx, cancel := context.WithTimeout(t.Context(), timeout)
+			defer cancel()
+			if _, err := mountcontrol.RequestSwitch(ctx, server.SocketPath(), req); err == nil {
+				t.Fatal("validation refusal lost")
+			}
+			if got := <-remaining; got > timeout+time.Millisecond || got < timeout-time.Second {
+				t.Fatalf("handler budget=%v want=%v", got, timeout)
+			}
+		})
+	}
+}

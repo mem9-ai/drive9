@@ -9,6 +9,7 @@ import (
 	"io"
 	"math"
 	"net"
+	"time"
 
 	"github.com/mem9-ai/drive9/pkg/mountstate"
 	"github.com/mem9-ai/drive9/pkg/viewprotocol"
@@ -70,7 +71,7 @@ func RequestSwitch(ctx context.Context, socketPath string, req SwitchRequest) (*
 	if err := req.Validate(); err != nil {
 		return nil, switchError(req, false, err)
 	}
-	ctx, cancel := context.WithTimeout(ctx, DefaultDrainTimeout)
+	ctx, cancel := switchContext(ctx)
 	defer cancel()
 	return exchangeSwitch(ctx, socketPath, "switch", req)
 }
@@ -82,9 +83,18 @@ func QuerySwitch(ctx context.Context, socketPath string, req SwitchRequest) (*Sw
 	if err := req.Validate(); err != nil {
 		return nil, switchError(req, false, err)
 	}
-	ctx, cancel := context.WithTimeout(ctx, DefaultDrainTimeout)
+	ctx, cancel := switchContext(ctx)
 	defer cancel()
 	return exchangeSwitch(ctx, socketPath, "switch-operation", req)
+}
+
+// Preserve an explicit caller budget; only callers without a deadline use
+// the default. The remaining budget is also sent to the mount daemon.
+func switchContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if _, ok := ctx.Deadline(); ok {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, DefaultDrainTimeout)
 }
 
 func switchError(req SwitchRequest, unknown bool, err error) *SwitchError {
@@ -93,9 +103,9 @@ func switchError(req SwitchRequest, unknown bool, err error) *SwitchError {
 
 func exchangeSwitch(ctx context.Context, socketPath, op string, req SwitchRequest) (*SwitchResponse, error) {
 	wire := struct {
-		Op string `json:"op"`
+		DrainRequest
 		SwitchRequest
-	}{Op: op, SwitchRequest: req}
+	}{DrainRequest: DrainRequest{Op: op}, SwitchRequest: req}
 	dialer := net.Dialer{}
 	conn, err := dialer.DialContext(ctx, "unix", socketPath)
 	if err != nil {
@@ -133,6 +143,13 @@ func exchangeSwitch(ctx context.Context, socketPath, op string, req SwitchReques
 	}
 	if status.MountID != req.MountID {
 		return nil, switchError(req, true, errors.New("mount incarnation changed"))
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, switchError(req, true, err)
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		// Round up sub-millisecond budgets so zero never selects the default.
+		wire.TimeoutMS = int64(max(1, (time.Until(deadline)+time.Millisecond-1)/time.Millisecond))
 	}
 	if err := json.NewEncoder(conn).Encode(wire); err != nil {
 		return nil, switchError(req, true, err)
