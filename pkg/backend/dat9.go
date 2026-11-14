@@ -66,6 +66,10 @@ const (
 	MaxSymlinkTargetBytes = 4 << 10
 
 	symlinkMode        uint32 = 0o120000 | 0o777
+	// SymlinkPermissionBits is the permission part of symlinkMode: what a symlink inode
+	// reports from a stat. Kept next to symlinkMode so the two cannot drift, and read by the
+	// server when it models a creation the apply step performs with the symlink mode.
+	SymlinkPermissionBits uint32 = symlinkMode & 0o777
 	symlinkContentType        = "application/x-symlink"
 )
 
@@ -1899,10 +1903,9 @@ func renamePlacedInodeID(node *datastore.FileNode) string {
 	return node.InodeID
 }
 
-// RenameFileNoReplaceCtx renames a file and fails with datastore.ErrPathConflict
-// if the target path already exists.
-// RenameFileNoReplaceCtx renames a file without replacing an existing target. Callers that
-// have to undo or bound their own work use RenameFileNoReplacePlacedCtx.
+// RenameFileNoReplaceCtx renames a file and fails with datastore.ErrPathConflict if the
+// target path already exists. Callers that have to undo or bound their own work use
+// RenameFileNoReplacePlacedCtx.
 func (b *Dat9Backend) RenameFileNoReplaceCtx(ctx context.Context, oldPath, newPath string) error {
 	_, err := b.RenameFileNoReplacePlacedCtx(ctx, oldPath, newPath)
 	return err

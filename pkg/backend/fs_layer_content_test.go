@@ -117,3 +117,28 @@ func TestStoredObjectApplyConflictsWhenBasePathIsGone(t *testing.T) {
 		t.Fatal("creation reported no created inode")
 	}
 }
+
+// A symlink inode carries SymlinkPermissionBits, and the server models a created symlink's
+// bits from that same constant: this pins the constant to what a real created symlink
+// reports, so the two packages cannot drift apart silently.
+func TestSymlinkPermissionBitsMatchCreatedInode(t *testing.T) {
+	b := newTestBackendWithS3(t)
+	ctx := context.Background()
+	if err := b.CreateSymlinkCtx(ctx, "/zone/link", "/zone/target"); err != nil {
+		t.Fatal(err)
+	}
+	nf, err := b.StatNodeCtx(ctx, "/zone/link")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mode := nf.Mode
+	if nf.File != nil && nf.File.Mode != 0 {
+		mode = nf.File.Mode
+	}
+	if mode&0o170000 != 0o120000 {
+		t.Fatalf("created symlink mode %o is not a symlink inode", mode)
+	}
+	if got := mode & 0o777; got != SymlinkPermissionBits {
+		t.Fatalf("created symlink reports %o, want SymlinkPermissionBits %o", got, SymlinkPermissionBits)
+	}
+}

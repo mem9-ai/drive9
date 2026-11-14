@@ -122,9 +122,9 @@ func (b *Dat9Backend) WriteStoredObjectCreatedCtxIfRevision(ctx context.Context,
 		return 0, nil, statErr
 	}
 	if statErr == nil {
-		// Overwrite only: what this stat saw is what the update addresses, so a path that
-		// vanished since is a conflict at the update's compare-and-set rather than a
-		// creation this call would report.
+		// Overwrite only: what this stat saw is what the update addresses, so a row that
+		// vanished since surfaces as the update's own not-found (its confirmed-status select
+		// misses) instead of a creation this call would report.
 		rev, err := b.overwriteStoredObjectCtx(ctx, canonical, nf, entry)
 		return rev, nil, err
 	}
@@ -181,7 +181,8 @@ func (b *Dat9Backend) WriteStoredObjectCreatedCtxIfRevision(ctx context.Context,
 	if err != nil {
 		if errors.Is(err, datastore.ErrPathConflict) {
 			// The path appeared after the stat. It is not this commit's creation, so it is
-			// not reported as one — and it is not silently overwritten either.
+			// not reported as one — and it is not silently overwritten either: the caller
+			// gets the revision conflict the race is.
 			return 0, nil, datastore.ErrRevisionConflict
 		}
 		return 0, nil, err

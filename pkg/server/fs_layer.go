@@ -1022,9 +1022,10 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 	// only while that name is still one of these. A concurrent writer's inode is a different
 	// id and is left alone.
 	appliedInodes := make(map[string]struct{})
-	// failCommit rolls back to the given snapshot boundary and records the state the
-	// layer API expects after a refused or failed commit. One place, so the three call
-	// sites cannot drift on the entries[:i] vs [:i+1] boundary.
+	// failCommit rolls back to the given snapshot boundary and records the state the layer
+	// API expects after a refused or failed commit. One place, so the call sites cannot drift
+	// on the entries[:i] vs [:i+1] boundary: a pre-apply refusal restores what was applied so
+	// far ([:i]), a failure inside the apply loop includes the failing entry ([:i+1]).
 	failCommit := func(rollbackSnapshots []fsLayerBaseSnapshot, event, path string, err error) {
 		rollbackErr := rollbackFSLayerCommit(rollbackCtx, b, rollbackSnapshots, func(p string) bool {
 			nf, statErr := b.StatNodeCtx(rollbackCtx, p)
@@ -1062,8 +1063,11 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 		if applyErr != nil {
 			// entries[:i+1], not [:i]: the failing entry may have created parents or the
 			// inode itself before the step that failed, and its own snapshot is how the
-			// rollback reaches that work. Restoring a snapshot for an entry that mutated
-			// nothing is a no-op.
+			// rollback reaches that work. When the entry was refused before touching anything
+			// its snapshot is restored too, and a file restore rewrites the content rather
+			// than skipping it — that is what the snapshot keeps (bytes and mode), so the
+			// boundary trades a rewrite of an untouched file for never leaving a failed
+			// entry's partial work behind.
 			failCommit(filterFSLayerSnapshotsForEntries(snapshots, entries[:i+1]), "fs_layer_commit_apply_failed", entry.Path, applyErr)
 			return
 		}

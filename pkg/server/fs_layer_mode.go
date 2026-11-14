@@ -309,19 +309,16 @@ func (st fsLayerPlanState) noteEntry(ctx context.Context, b *backendpkg.Dat9Back
 	return nil
 }
 
-// fsLayerSymlinkPermissionBits is what a created symlink's inode carries. The apply step
-// creates a symlink with the backend's symlink mode and never applies the entry's mode to it,
-// so its bits are not the entry's.
-const fsLayerSymlinkPermissionBits uint32 = 0o777
-
 // fsLayerEntryCreatedMode is the bits a creating entry leaves on the inode it makes: the
-// entry's own mode, or what the apply step actually creates when the entry names none.
+// entry's own mode, or what the apply step actually creates when the entry names none. A
+// symlink is the second case — the apply step creates it with the backend's symlink mode and
+// never applies the entry's mode to it, so the bits come from the backend.
 func fsLayerEntryCreatedMode(entry *datastore.FSLayerEntry) uint32 {
 	if entry == nil {
 		return 0
 	}
 	if entry.Op == datastore.FSLayerEntryOpSymlink {
-		return fsLayerSymlinkPermissionBits
+		return backendpkg.SymlinkPermissionBits
 	}
 	if entry.Mode != 0 {
 		return entry.Mode & 0o777
