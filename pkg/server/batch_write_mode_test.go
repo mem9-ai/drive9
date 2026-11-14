@@ -85,7 +85,38 @@ func TestBatchWriteRejectsModeFromScopedToken(t *testing.T) {
 		t.Fatalf("denied batch item changed the file: before=%+v after=%+v", before, after)
 	}
 
-	// The same token may still write bytes; only the mode is owner-only.
+	// A mode field without hasMode is refused too: the backend would ignore it, and a
+	// silently dropped bit pattern is the ambiguity this endpoint must not have.
+	w = doBatchWrite(t, s, scoped, batchWriteRequest{Items: []batchWriteItem{
+		{Path: "/allowed/f.txt", ExpectedRevision: 1, Data: []byte("mode only"), Mode: 0o777},
+	}})
+	if w.Code != http.StatusOK {
+		t.Fatalf("scoped batch write status = %d, want 200 with a per-item 403: %s", w.Code, w.Body.String())
+	}
+	out = batchWriteResponse{}
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Results) != 1 || out.Results[0].Status != http.StatusForbidden || out.Results[0].Error != chmodOwnerOnlyMessage {
+		t.Fatalf("scoped mode-only item = %+v, want a per-item 403", out.Results)
+	}
+
+	// hasMode with mode zero is the same request: the capability is the field, not the bits.
+	w = doBatchWrite(t, s, scoped, batchWriteRequest{Items: []batchWriteItem{
+		{Path: "/allowed/f.txt", ExpectedRevision: 1, Data: []byte("x"), HasMode: true},
+	}})
+	if w.Code != http.StatusOK {
+		t.Fatalf("scoped batch write status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	out = batchWriteResponse{}
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Results) != 1 || out.Results[0].Status != http.StatusForbidden {
+		t.Fatalf("scoped hasMode item with mode 0 = %+v, want a per-item 403", out.Results)
+	}
+
+	// The same token may still write content; only the mode is owner-only.
 	w = doBatchWrite(t, s, scoped, batchWriteRequest{Items: []batchWriteItem{
 		{Path: "/allowed/f.txt", ExpectedRevision: 1, Data: []byte("new")},
 	}})
