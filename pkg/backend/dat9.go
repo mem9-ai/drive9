@@ -893,10 +893,6 @@ func (b *Dat9Backend) WriteCtxIfRevisionWithCreatedID(ctx context.Context, path 
 	return nil, err
 }
 
-// createAndWriteCtx inserts a new file. mode, when non-zero, becomes the inode's
-// permission bits inside the same transaction: a caller that may not chmod applies a
-// creation mode this way instead of chmod-ing the name afterwards, which a concurrent
-// rename could redirect.
 // createAndWriteCtx inserts a new file and reports the inode ids it created (parents first,
 // then the file), so a caller can bind a creation mode to the inodes instead of chmod-ing
 // the name afterwards.
@@ -1845,6 +1841,8 @@ func (b *Dat9Backend) Rename(oldPath, newPath string) error {
 	return b.RenameCtx(backgroundWithTrace(), oldPath, newPath)
 }
 
+// RenameCtx renames a path. Callers that have to undo or bound their own work use
+// RenamePlacedCtx, which also reports the inode now at the target.
 func (b *Dat9Backend) RenameCtx(ctx context.Context, oldPath, newPath string) error {
 	_, err := b.RenamePlacedCtx(ctx, oldPath, newPath)
 	return err
@@ -1889,7 +1887,8 @@ func (b *Dat9Backend) RenamePlacedCtx(ctx context.Context, oldPath, newPath stri
 	return placed, nil
 }
 
-// renamePlacedInodeID is the identity a stat of the target reports after a rename.
+// renamePlacedInodeID is the identity a stat of the target reports after a rename, in the
+// same form fsLayerNodeInodeID reads: the file id for a file, the inode id for a directory.
 func renamePlacedInodeID(node *datastore.FileNode) string {
 	if node == nil {
 		return ""
@@ -1897,14 +1896,13 @@ func renamePlacedInodeID(node *datastore.FileNode) string {
 	if node.FileID != "" {
 		return node.FileID
 	}
-	if node.InodeID != "" {
-		return node.InodeID
-	}
-	return node.NodeID
+	return node.InodeID
 }
 
 // RenameFileNoReplaceCtx renames a file and fails with datastore.ErrPathConflict
 // if the target path already exists.
+// RenameFileNoReplaceCtx renames a file without replacing an existing target. Callers that
+// have to undo or bound their own work use RenameFileNoReplacePlacedCtx.
 func (b *Dat9Backend) RenameFileNoReplaceCtx(ctx context.Context, oldPath, newPath string) error {
 	_, err := b.RenameFileNoReplacePlacedCtx(ctx, oldPath, newPath)
 	return err

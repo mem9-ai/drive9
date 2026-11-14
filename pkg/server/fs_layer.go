@@ -1052,15 +1052,19 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 		modeMayBeSuperseded := fsLayerEntryModeSuperseded(entries, i)
 		createdIDs, applyErr := applyFSLayerEntry(r.Context(), b, entry, touchedPaths, fsLayerApplyOptions{modeMayBeSuperseded: modeMayBeSuperseded, canChmod: canChmod})
 		// Record the ids before the error check: an entry that created inodes and then failed
-		// (a creation whose mode application was refused) still left them behind, and the
-		// rollback has to be allowed to remove them.
+		// (a creation whose mode application or post-commit quota mutation failed) still left
+		// them behind, and the rollback has to be allowed to remove them.
 		for _, id := range createdIDs {
 			if id != "" {
 				appliedInodes[id] = struct{}{}
 			}
 		}
 		if applyErr != nil {
-			failCommit(filterFSLayerSnapshotsForEntries(snapshots, entries[:i]), "fs_layer_commit_apply_failed", entry.Path, applyErr)
+			// entries[:i+1], not [:i]: the failing entry may have created parents or the
+			// inode itself before the step that failed, and its own snapshot is how the
+			// rollback reaches that work. Restoring a snapshot for an entry that mutated
+			// nothing is a no-op.
+			failCommit(filterFSLayerSnapshotsForEntries(snapshots, entries[:i+1]), "fs_layer_commit_apply_failed", entry.Path, applyErr)
 			return
 		}
 		markFSLayerEntryTouched(touchedPaths, entry)

@@ -287,30 +287,41 @@ func (st fsLayerPlanState) noteEntry(ctx context.Context, b *backendpkg.Dat9Back
 	}
 	// Parents are recorded under the same trimmed form resolve reads, or the record could
 	// never be found and a later entry on an implicit parent would read as a creation.
+	// The classification goes through the replayed plan, not a live stat: an ancestor this
+	// plan vacated is still in live main, but by the time the entry applies it is gone and
+	// the entry recreates it.
 	for parent := strings.TrimSuffix(pathutil.ParentPath(path), "/"); parent != ""; parent = strings.TrimSuffix(pathutil.ParentPath(parent), "/") {
 		if _, ok := st[parent]; ok {
 			continue
 		}
-		nf, err := b.StatNodeCtx(ctx, parent)
-		if errors.Is(err, datastore.ErrNotFound) {
+		node, err := st.classify(ctx, b, parent)
+		if err != nil {
+			return err
+		}
+		if node.vacated || node.created {
 			// An implicit parent is created with the default directory bits, and a later
 			// entry that would give it other bits changes an existing inode by then.
 			st[parent] = fsLayerPlanNode{created: true, createdMode: datastore.FSLayerDefaultDirMode, createdModeSet: true}
 			continue
 		}
-		if err != nil {
-			return err
-		}
-		st[parent] = fsLayerPlanNode{livePath: fsLayerNodePath(nf, parent)}
+		st[parent] = fsLayerPlanNode{livePath: node.livePath}
 	}
 	return nil
 }
 
+// fsLayerSymlinkPermissionBits is what a created symlink's inode carries. The apply step
+// creates a symlink with the backend's symlink mode and never applies the entry's mode to it,
+// so its bits are not the entry's.
+const fsLayerSymlinkPermissionBits uint32 = 0o777
+
 // fsLayerEntryCreatedMode is the bits a creating entry leaves on the inode it makes: the
-// entry's own mode, or the default the store would apply when the entry names none.
+// entry's own mode, or what the apply step actually creates when the entry names none.
 func fsLayerEntryCreatedMode(entry *datastore.FSLayerEntry) uint32 {
 	if entry == nil {
 		return 0
+	}
+	if entry.Op == datastore.FSLayerEntryOpSymlink {
+		return fsLayerSymlinkPermissionBits
 	}
 	if entry.Mode != 0 {
 		return entry.Mode & 0o777

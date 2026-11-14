@@ -852,6 +852,11 @@ func TestFSLayerPlanScanSeesPlanCreations(t *testing.T) {
 	if err := s.fallback.ChmodCtx(ctx, "/zone/live.txt", 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// A directory the plan vacates: live main still has it, at the same bits the plan names
+	// for the path after the entry recreates it implicitly.
+	if _, err := s.fallback.MkdirCreatedCtx(ctx, "/zone/vac/sub/", 0o700); err != nil {
+		t.Fatal(err)
+	}
 	type scanCase struct {
 		name    string
 		entries []datastore.FSLayerEntry
@@ -884,6 +889,36 @@ func TestFSLayerPlanScanSeesPlanCreations(t *testing.T) {
 			entries: []datastore.FSLayerEntry{
 				{Path: "/zone/p1/f1.txt", Op: datastore.FSLayerEntryOpUpsert, Kind: datastore.FSLayerEntryKindFile, Mode: 0o644},
 				{Path: "/zone/p1/f2.txt", Op: datastore.FSLayerEntryOpUpsert, Kind: datastore.FSLayerEntryKindFile, Mode: 0o600},
+			},
+			want: false,
+		},
+		{
+			// A parent the plan vacated and the entry refilled is a creation of the plan, not
+			// the live directory the raw stat would find: by apply time the entry has made it
+			// with the default bits, so the mode entry changes an existing inode.
+			name: "restyle a parent the plan vacated and refilled",
+			entries: []datastore.FSLayerEntry{
+				{Path: "/zone/vac/", Op: datastore.FSLayerEntryOpRename, Kind: datastore.FSLayerEntryKindDir, ContentText: "/zone/vac2/"},
+				{Path: "/zone/vac/sub/f.txt", Op: datastore.FSLayerEntryOpUpsert, Kind: datastore.FSLayerEntryKindFile, Mode: 0o644},
+				{Path: "/zone/vac/sub/", Op: datastore.FSLayerEntryOpUpsert, Kind: datastore.FSLayerEntryKindDir, Mode: 0o700},
+			},
+			want: true,
+		},
+		{
+			// A created symlink's inode carries 0777, not the entry's 0644 default, so a write
+			// that names 0644 for the linked path would move existing bits.
+			name: "write over a symlink the plan created",
+			entries: []datastore.FSLayerEntry{
+				{Path: "/zone/l1", Op: datastore.FSLayerEntryOpSymlink, Kind: datastore.FSLayerEntryKindFile, ContentText: "/zone/live.txt"},
+				{Path: "/zone/l1", Op: datastore.FSLayerEntryOpUpsert, Kind: datastore.FSLayerEntryKindFile, Mode: 0o644},
+			},
+			want: true,
+		},
+		{
+			name: "write over a symlink with the symlink's own bits",
+			entries: []datastore.FSLayerEntry{
+				{Path: "/zone/l2", Op: datastore.FSLayerEntryOpSymlink, Kind: datastore.FSLayerEntryKindFile, ContentText: "/zone/live.txt"},
+				{Path: "/zone/l2", Op: datastore.FSLayerEntryOpUpsert, Kind: datastore.FSLayerEntryKindFile, Mode: 0o777},
 			},
 			want: false,
 		},

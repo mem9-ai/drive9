@@ -11,7 +11,6 @@ import (
 	"io"
 	"time"
 
-	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
 	"github.com/mem9-ai/drive9/pkg/datastore"
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/pathutil"
@@ -118,11 +117,15 @@ func (b *Dat9Backend) WriteStoredObjectCreatedCtxIfRevision(ctx context.Context,
 	// its file-count cap. The creation signal stays the insert itself — a path that appears
 	// between this stat and the insert fails that insert and is reported as a conflict, not
 	// as this commit's own creation.
-	if _, statErr := b.store.Stat(ctx, canonical); !errorsIsNotFound(statErr) {
-		if statErr != nil {
-			return 0, nil, statErr
-		}
-		rev, err := b.WriteStoredObjectCtxIfRevision(ctx, canonical, entry)
+	nf, statErr := b.store.Stat(ctx, canonical)
+	if statErr != nil && !errorsIsNotFound(statErr) {
+		return 0, nil, statErr
+	}
+	if statErr == nil {
+		// Overwrite only: what this stat saw is what the update addresses, so a path that
+		// vanished since is a conflict at the update's compare-and-set rather than a
+		// creation this call would report.
+		rev, err := b.overwriteStoredObjectCtx(ctx, canonical, nf, entry)
 		return rev, nil, err
 	}
 	// The path is free, but a base revision says it was not when the plan was staged: the
@@ -193,113 +196,29 @@ func (b *Dat9Backend) WriteStoredObjectCreatedCtxIfRevision(ctx context.Context,
 	return 1, append(append([]string{}, createdParents...), fileID), nil
 }
 
-// WriteStoredObjectCtxIfRevision applies an already-stored layer payload to the
-// base filesystem without routing the bytes through content_blob.
-func (b *Dat9Backend) WriteStoredObjectCtxIfRevision(ctx context.Context, path string, entry *datastore.FSLayerEntry) (int64, error) {
-	if entry == nil {
-		return 0, fmt.Errorf("nil fs layer entry")
+// overwriteStoredObjectCtx points an existing file at the layer payload. It is the only way
+// the object-backed apply changes a path that is already there: the caller decided that from
+// the row it passes, so there is no creation branch to drift into.
+func (b *Dat9Backend) overwriteStoredObjectCtx(ctx context.Context, canonical string, nf *datastore.NodeWithFile, entry *datastore.FSLayerEntry) (int64, error) {
+	if nf == nil || nf.File == nil {
+		return 0, fmt.Errorf("no file entity")
 	}
-	canonical, err := pathutil.Canonicalize(path)
-	if err != nil {
-		return 0, err
-	}
-	if err := rejectRootFileNodePath(canonical); err != nil {
-		return 0, err
-	}
-	if entry.StorageRef == "" && (entry.StorageType == "" || entry.StorageType == string(datastore.StorageDB9)) {
-		_, rev, err := b.WriteCtxIfRevisionWithTagsResult(ctx, canonical, entry.ContentBlob, 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate, entry.BaseRevision, nil, "")
-		return rev, err
-	}
-	if entry.StorageType == "" {
-		return 0, fmt.Errorf("missing fs layer storage_type for external payload %s", entry.Path)
-	}
-	if entry.StorageType != string(datastore.StorageS3) {
-		return 0, fmt.Errorf("unsupported fs layer storage type %q", entry.StorageType)
-	}
-	if entry.StorageRef == "" {
-		return 0, fmt.Errorf("missing fs layer storage_ref for %s", entry.Path)
-	}
-	if err := b.ensureUploadSizeAllowed(entry.SizeBytes); err != nil {
-		return 0, err
-	}
-	if err := b.ensureFileSizeQuota(ctx, entry.SizeBytes); err != nil {
-		return 0, err
+	if nf.Node.IsDirectory {
+		return 0, datastore.ErrPathConflict
 	}
 	storageEncryptionMode := entry.StorageEncryptionMode
 	if storageEncryptionMode == "" {
 		storageEncryptionMode = datastore.StorageEncryptionNone
 	}
 	storageEncryptionKeyID := entry.StorageEncryptionKeyID
-
 	contentType := detectContentType(canonical, nil)
-	now := time.Now()
-	nf, statErr := b.store.Stat(ctx, canonical)
-	if errorsIsNotFound(statErr) {
-		fileID := b.genID()
-		err := b.store.InTx(ctx, func(tx *sql.Tx) error {
-			if err := b.ensureStorageQuota(ctx, tx, canonical, entry.SizeBytes); err != nil {
-				return err
-			}
-			if err := b.ensureFileCountQuotaServer(ctx, tx, 1); err != nil {
-				return err
-			}
-			if err := b.store.InsertFileTx(tx, &datastore.File{
-				FileID:                 fileID,
-				StorageType:            datastore.StorageType(entry.StorageType),
-				StorageRef:             entry.StorageRef,
-				StorageEncryptionMode:  storageEncryptionMode,
-				StorageEncryptionKeyID: storageEncryptionKeyID,
-				ContentType:            contentType,
-				SizeBytes:              entry.SizeBytes,
-				ChecksumSHA256:         entry.ChecksumSHA256,
-				Revision:               1,
-				Status:                 datastore.StatusConfirmed,
-				CreatedAt:              now,
-				ConfirmedAt:            &now,
-			}); err != nil {
-				return err
-			}
-			if err := b.store.EnsureParentDirsTx(tx, canonical, b.genID); err != nil {
-				return err
-			}
-			if err := b.store.InsertNodeTx(tx, &datastore.FileNode{
-				NodeID:     b.genID(),
-				Path:       canonical,
-				ParentPath: pathutil.ParentPath(canonical),
-				Name:       pathutil.BaseName(canonical),
-				FileID:     fileID,
-				CreatedAt:  now,
-			}); err != nil {
-				return err
-			}
-			return nil
-		})
-		if err != nil {
-			return 0, err
-		}
-		quotaCtx, cancelQuota := postCommitQuotaMutationContext()
-		defer cancelQuota()
-		if err := b.recordCentralFileCreateMutation(quotaCtx, fileID, entry.SizeBytes, contentType); err != nil {
-			return 0, postCommitQuotaMutationError("record central quota file create", err)
-		}
-		return 1, nil
-	}
-	if statErr != nil {
-		return 0, statErr
-	}
-	if nf.File == nil {
-		return 0, fmt.Errorf("no file entity")
-	}
-	if nf.Node.IsDirectory {
-		return 0, datastore.ErrPathConflict
-	}
 
 	oldStorageType := nf.File.StorageType
 	oldStorageRef := nf.File.StorageRef
 	oldSize := nf.File.SizeBytes
 	oldContentType := nf.File.ContentType
 	var newRev int64
-	err = b.store.InTx(ctx, func(tx *sql.Tx) error {
+	err := b.store.InTx(ctx, func(tx *sql.Tx) error {
 		currentMeta, err := b.store.GetFileStorageMetaForUpdateTx(tx, nf.File.FileID)
 		if err != nil {
 			return err
