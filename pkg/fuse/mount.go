@@ -1018,6 +1018,12 @@ func buildMountRuntimeGeneration(cfg MountConfig, cl *client.Client, remoteRoot,
 }
 
 func buildMountRuntimeWithCounters(cfg MountConfig, cl *client.Client, remoteRoot, actorID string, generation mountRuntimeGeneration, sharedCounters *perf.Counters) (_ *mountRuntime, err error) {
+	// The existing kernel connection may be writable. A validation runtime
+	// must neither recover write queues nor admit mutations in userspace.
+	validation := cl.ViewBinding().Validation
+	if validation {
+		cfg.ReadOnly = true
+	}
 	mountHash, readCacheHash, err := mountRuntimeCacheHashes(cfg, cl.ViewBinding(), generation)
 	if err != nil {
 		return nil, err
@@ -1499,6 +1505,7 @@ func buildMountRuntimeWithCounters(cfg MountConfig, cl *client.Client, remoteRoo
 		}
 	}
 	f.viewLocalState = generation.MountID != ""
+	f.validationReadOnly = validation
 	f.mountPt, f.rootTag, f.srvTag = cfg.MountPoint, remoteRoot, cfg.Server
 
 	if sseExt != nil {

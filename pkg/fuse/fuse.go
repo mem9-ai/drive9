@@ -113,10 +113,11 @@ type FS struct {
 	srvTag          string
 	// viewLocalState is set only by the runtime builder that scopes persistent
 	// local directories per view and supplies joined lifecycle cleanup.
-	viewLocalState bool
-	locks          *fuseLockTable
-	handles        *handleTable
-	dirs           *dirTable
+	viewLocalState     bool
+	validationReadOnly bool // immutable for the lifetime of this runtime
+	locks              *fuseLockTable
+	handles            *handleTable
+	dirs               *dirTable
 	// viewGen fences listing installs across view resets: a READDIR that
 	// started before a checkout must not install its pre-reset page.
 	// viewMu makes the generation CHECK and the cache publication ATOMIC
@@ -1745,6 +1746,9 @@ func (f *FS) checkSetAttrModeForCaller(caller fs.Caller, entry *InodeEntry, inpu
 }
 
 func (f *FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *gofuse.AttrOut) gofuse.Status {
+	if f.validationReadOnly {
+		return gofuse.Status(syscall.EROFS)
+	}
 	// A detached inode has no name to mutate, and the backend has no
 	// object-bound metadata capability: a descriptor's recorded path names
 	// the REPLACEMENT object at best (Core.setAttrOp dispatches by op.Path
@@ -1909,6 +1913,9 @@ func (f *FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *gofus
 }
 
 func (f *FS) Mknod(cancel <-chan struct{}, input *gofuse.MknodIn, name string, out *gofuse.EntryOut) gofuse.Status {
+	if f.validationReadOnly {
+		return gofuse.Status(syscall.EROFS)
+	}
 	child, st := f.childOf(input.NodeId, name)
 	if st != gofuse.OK {
 		return st
@@ -1943,6 +1950,9 @@ func (f *FS) Mknod(cancel <-chan struct{}, input *gofuse.MknodIn, name string, o
 }
 
 func (f *FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name string, out *gofuse.EntryOut) gofuse.Status {
+	if f.validationReadOnly {
+		return gofuse.Status(syscall.EROFS)
+	}
 	child, st := f.childOf(input.NodeId, name)
 	if st != gofuse.OK {
 		return st
@@ -1979,6 +1989,9 @@ func (f *FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name string, o
 }
 
 func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string) gofuse.Status {
+	if f.validationReadOnly {
+		return gofuse.Status(syscall.EROFS)
+	}
 	child, st := f.childOf(header.NodeId, name)
 	if st != gofuse.OK {
 		return st
@@ -2077,6 +2090,9 @@ func (f *FS) dropSiblingRows(removed string, siblings []string) {
 }
 
 func (f *FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name string) gofuse.Status {
+	if f.validationReadOnly {
+		return gofuse.Status(syscall.EROFS)
+	}
 	child, st := f.childOf(header.NodeId, name)
 	if st != gofuse.OK {
 		return st
@@ -2095,6 +2111,9 @@ func (f *FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name string)
 }
 
 func (f *FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName string, newName string) gofuse.Status {
+	if f.validationReadOnly {
+		return gofuse.Status(syscall.EROFS)
+	}
 	// renameat2 flags are not implemented (v1): drive9 rename always
 	// replaces the target, so doing a plain rename for RENAME_NOREPLACE
 	// would silently clobber the destination and RENAME_EXCHANGE would
@@ -2185,6 +2204,9 @@ func (f *FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName stri
 }
 
 func (f *FS) Link(cancel <-chan struct{}, input *gofuse.LinkIn, filename string, out *gofuse.EntryOut) gofuse.Status {
+	if f.validationReadOnly {
+		return gofuse.Status(syscall.EROFS)
+	}
 	oldPath, ok := f.inodes.GetPath(input.Oldnodeid)
 	if !ok {
 		return gofuse.ENOENT
@@ -2242,6 +2264,9 @@ func (f *FS) SurvivorAlias(path string) (string, bool) {
 }
 
 func (f *FS) Symlink(cancel <-chan struct{}, header *gofuse.InHeader, pointedTo string, linkName string, out *gofuse.EntryOut) gofuse.Status {
+	if f.validationReadOnly {
+		return gofuse.Status(syscall.EROFS)
+	}
 	child, st := f.childOf(header.NodeId, linkName)
 	if st != gofuse.OK {
 		return st
@@ -2312,6 +2337,9 @@ func hasPOSIXAccess(caller fs.Caller, ownerUid, ownerGid uint32, mode uint32, ma
 }
 
 func (f *FS) Access(cancel <-chan struct{}, input *gofuse.AccessIn) gofuse.Status {
+	if f.validationReadOnly && input.Mask&2 != 0 {
+		return gofuse.Status(syscall.EROFS)
+	}
 	path, ok := f.inodes.GetPath(input.NodeId)
 	if !ok {
 		return gofuse.ENOENT
@@ -2502,6 +2530,9 @@ func (f *FS) ListXAttr(cancel <-chan struct{}, header *gofuse.InHeader, dest []b
 }
 
 func (f *FS) SetXAttr(cancel <-chan struct{}, input *gofuse.SetXAttrIn, attr string, data []byte) gofuse.Status {
+	if f.validationReadOnly {
+		return gofuse.Status(syscall.EROFS)
+	}
 	path, ok := f.inodes.GetPath(input.NodeId)
 	if !ok {
 		return gofuse.ENOENT
@@ -2516,6 +2547,9 @@ func (f *FS) SetXAttr(cancel <-chan struct{}, input *gofuse.SetXAttrIn, attr str
 }
 
 func (f *FS) RemoveXAttr(cancel <-chan struct{}, header *gofuse.InHeader, attr string) gofuse.Status {
+	if f.validationReadOnly {
+		return gofuse.Status(syscall.EROFS)
+	}
 	path, ok := f.inodes.GetPath(header.NodeId)
 	if !ok {
 		return gofuse.ENOENT
@@ -2534,6 +2568,9 @@ func (f *FS) RemoveXAttr(cancel <-chan struct{}, header *gofuse.InHeader, attr s
 // ---------------------------------------------------------------------------
 
 func (f *FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name string, out *gofuse.CreateOut) gofuse.Status {
+	if f.validationReadOnly {
+		return gofuse.Status(syscall.EROFS)
+	}
 	child, st := f.childOf(input.NodeId, name)
 	if st != gofuse.OK {
 		return st
@@ -2580,6 +2617,9 @@ func (f *FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name string,
 }
 
 func (f *FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse.OpenOut) gofuse.Status {
+	if f.validationReadOnly && validationMutation(&fs.Op{Kind: fs.OpCreate, Flags: input.Flags}) {
+		return gofuse.Status(syscall.EROFS)
+	}
 	path, ok := f.inodes.GetPath(input.NodeId)
 	if !ok {
 		return gofuse.ENOENT
@@ -2800,6 +2840,9 @@ func (f *FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte) (gof
 }
 
 func (f *FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []byte) (uint32, gofuse.Status) {
+	if f.validationReadOnly {
+		return 0, gofuse.Status(syscall.EROFS)
+	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 	if h := f.openHandle(input.Fh); h != nil {
@@ -3022,6 +3065,9 @@ func (f *FS) SetLkw(cancel <-chan struct{}, input *gofuse.LkIn) gofuse.Status {
 }
 
 func (f *FS) Fallocate(cancel <-chan struct{}, input *gofuse.FallocateIn) gofuse.Status {
+	if f.validationReadOnly {
+		return gofuse.Status(syscall.EROFS)
+	}
 	// Mutating op: a detached inode's descriptor cannot preserve the
 	// opened object's identity (see SetAttr) — reject, never mutate the
 	// replacement the old path may name now.
@@ -3043,6 +3089,9 @@ func (f *FS) Fallocate(cancel <-chan struct{}, input *gofuse.FallocateIn) gofuse
 }
 
 func (f *FS) CopyFileRange(cancel <-chan struct{}, input *gofuse.CopyFileRangeIn) (uint32, gofuse.Status) {
+	if f.validationReadOnly {
+		return 0, gofuse.Status(syscall.EROFS)
+	}
 	// Mutating op (see SetAttr): a detached endpoint's descriptor cannot
 	// preserve the opened object's identity — reject rather than copy
 	// through a path that may name the replacement object.
@@ -3572,7 +3621,7 @@ func fuseCtx(cancel <-chan struct{}) (context.Context, context.CancelFunc) {
 
 func (f *FS) dispatch(ctx context.Context, op *fs.Op) (fs.Result, gofuse.Status) {
 	start := time.Now()
-	res, err := f.chain.Dispatch(ctx, op)
+	res, err := f.dispatchErr(ctx, op)
 	st := gofuse.OK
 	if err != nil {
 		st = fs.StatusOf(err)
@@ -3628,6 +3677,9 @@ func opBytes(op *fs.Op, res fs.Result) uint64 {
 }
 
 func (f *FS) dispatchErr(ctx context.Context, op *fs.Op) (fs.Result, error) {
+	if f.validationReadOnly && validationMutation(op) {
+		return fs.Result{}, syscall.EROFS
+	}
 	return f.chain.Dispatch(ctx, op)
 }
 
