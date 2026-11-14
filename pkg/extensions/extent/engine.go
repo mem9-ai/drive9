@@ -44,17 +44,21 @@ type EngineConfig struct {
 	// shared cache budget.
 	MaxStageWrite int
 	// MaxUpload bounds the chunk store's concurrent staging-file uploads
-	// (0 = default below). The writeback drain is paced by this worker
-	// count times each staging file's read+publish cycle: 4 kept a 6 GiB
-	// close-drain at ~30 MB/s end to end even though the PUT bursts ran at
-	// line rate. Upstream mounts default --max-uploads to 20.
+	// (0 = defaultMaxUpload). The writeback drain is paced by this worker
+	// count, but values above 4 have only been validated to expose
+	// staging-eviction races — treat anything higher as experimental.
 	MaxUpload int
 	// ReadOnly mounts never mutate the remote.
 	ReadOnly bool
 }
 
-// defaultMaxUpload is the engine's staging-upload worker count.
-const defaultMaxUpload = 16
+// defaultMaxUpload is the engine's staging-upload worker count. Raising it
+// past 4 triggered staging-file eviction races on staging (the uploader
+// opened files free-space eviction had already deleted — uploadStagingFile
+// "no such file" storms and a silently truncated 6 GiB landing), so the
+// safe default stays 4 until that interaction is understood; the knob
+// exists for controlled experiments.
+const defaultMaxUpload = 4
 
 // upstreamChunkDefaultsForTest exposes the chunk-store defaults the engine
 // installs (test hook: they must match JuiceFS's own mount defaults).
