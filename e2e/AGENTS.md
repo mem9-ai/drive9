@@ -415,7 +415,7 @@ each suite provisions a fresh tenant.
     → `DELETE` abort `200` → gone from listing → `resume` after abort `409`.
     V2 round-trip: `initiate` → `presign` → `presign-batch` → presigned
     part `PUT` (ETag) → `complete` (`status=completed` + revision) → `?stat`
-    size + downloaded sha256; plus `abort` and `complete`-after-abort `404`
+    size + downloaded sha256; plus `abort` and `complete`-after-abort `409`
 24. Mount leases: register/`GET …/{id}`/heartbeat (extends `expires_at`)/
     list/`DELETE` `204`/released `404`/idempotent re-release. A server without
     `/v1/mounts` SKIPs the group
