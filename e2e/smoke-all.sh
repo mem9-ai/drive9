@@ -135,7 +135,7 @@ else
   if [ "$RUN_FIXED_VIEW_SMOKE" = "1" ]; then
     run_case "layer-fs" "e2e/layer-fs-smoke-test.sh"
   else
-    skip_case "layer-fs" "e2e/layer-fs-smoke-test.sh" "requires paired server CI; set RUN_FIXED_VIEW_SMOKE=1 with v10"
+    skip_case "layer-fs" "e2e/layer-fs-smoke-test.sh" "requires paired server CI; set RUN_FIXED_VIEW_SMOKE=1 with the paired fixed-view server harness"
   fi
   run_fuse_case "fuse-release-gate" "e2e/fuse-release-gate.sh"
   run_fuse_case "fuse-patch-storage-class" "e2e/fuse-patch-storage-class.sh"

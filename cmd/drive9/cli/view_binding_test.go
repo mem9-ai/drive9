@@ -183,3 +183,53 @@ func TestFixedFilesystemCLIWriteFailureKeepsOperation(t *testing.T) {
 		t.Fatal(err, count.Load())
 	}
 }
+
+func TestBoundMutationFailureSurfacesOriginalOperation(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		call func(*client.Client, []string) error
+	}{
+		{"mkdir", []string{"/new"}, Mkdir}, {"rm", []string{"/file"}, Rm},
+		{"chmod", []string{"640", "/file"}, Chmod}, {"mv", []string{"/file", "/target"}, Mv},
+		{"hardlink", []string{"/file", "/target"}, Hardlink}, {"symlink", []string{"../file", "/target"}, Symlink},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ids := make(chan string, 4)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == "GET" || r.Method == "HEAD" {
+					_, _ = io.WriteString(w, `{"size":3,"revision":2,"resource_id":"inode"}`)
+					return
+				}
+				id, err := viewprotocol.ParseOperationID(r.Header)
+				if err != nil {
+					t.Error(err)
+				}
+				ids <- id
+				// A gateway 503 does not establish whether the mutation committed.
+				w.WriteHeader(http.StatusServiceUnavailable)
+			}))
+			defer server.Close()
+			c, args, err := BindFilesystemView(client.New(server.URL, "test-key"), tc.name, append([]string{"--layer=a", "--work=w", "--fence=1"}, tc.args...))
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = captureStdoutE(t, func() error { return tc.call(c, args) })
+			var outcome *client.ViewOperationError
+			if !errors.As(err, &outcome) || outcome.LayerID != "a" {
+				t.Fatalf("missing operation outcome: %v", err)
+			}
+			select {
+			case id := <-ids:
+				if id == "" || outcome.OperationID != id || !strings.Contains(err.Error(), id) {
+					t.Fatalf("identity not printable: id=%q err=%v", id, err)
+				}
+			default:
+				t.Fatal("no mutation sent")
+			}
+			if len(ids) != 0 {
+				t.Fatal("automatically retried uncertain mutation")
+			}
+		})
+	}
+}

@@ -40,6 +40,9 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Test fixed-view SDK probes without services
+        run: go test -race ./e2e/fixedsdk
+
       - name: Cache golangci-lint binary
         uses: actions/cache@v4
         with:
