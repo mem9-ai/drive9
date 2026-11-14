@@ -99,6 +99,10 @@ func parseKey(key string) (id uint64, indx int64, size int64, err error) {
 }
 
 func (s objectStorage) Put(ctx context.Context, key string, in io.Reader, getters ...object.AttrGetter) error {
+	putStart := time.Now()
+	defer func() {
+		commitTrace("put size=%d ms=%d", sizeOfPut(key), time.Since(putStart).Milliseconds())
+	}()
 	id, indx, size, err := parseKey(key)
 	if err != nil {
 		return err

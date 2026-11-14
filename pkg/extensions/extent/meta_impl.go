@@ -1177,6 +1177,7 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 // client's PATCH path uploads them at bounded concurrency.
 func (b *Bridge) commitExtentExisting(ctx context.Context, ino meta.Ino, path string, pending []pendingWrite, size, rev int64) error {
 	const piece = int64(client.ExtentBlockSize)
+	assembleStart := time.Now()
 	blocks := make([]client.ExtentBlockWrite, 0, len(pending)*2)
 	for _, p := range pending {
 		data, err := b.blockBytes(ctx, p, path)
@@ -1199,7 +1200,11 @@ func (b *Bridge) commitExtentExisting(ctx context.Context, ino meta.Ino, path st
 			})
 		}
 	}
-	if err := b.commitWithRetry(ctx, ino, path, blocks, size, rev); err != nil {
+	publishStart := time.Now()
+	err := b.commitWithRetry(ctx, ino, path, blocks, size, rev)
+	commitTrace("commit ino=%d pending=%d blocks=%d bytes=%d assemble_ms=%d publish_ms=%d err=%v",
+		ino, len(pending), len(blocks), size, publishStart.Sub(assembleStart).Milliseconds(), time.Since(publishStart).Milliseconds(), err)
+	if err != nil {
 		return err
 	}
 	b.surgicalDeletePending(ino, pending)

@@ -43,9 +43,18 @@ type EngineConfig struct {
 	// 40 on Linux). Caps the in-flight writeback byte footprint feeding the
 	// shared cache budget.
 	MaxStageWrite int
+	// MaxUpload bounds the chunk store's concurrent staging-file uploads
+	// (0 = default below). The writeback drain is paced by this worker
+	// count times each staging file's read+publish cycle: 4 kept a 6 GiB
+	// close-drain at ~30 MB/s end to end even though the PUT bursts ran at
+	// line rate. Upstream mounts default --max-uploads to 20.
+	MaxUpload int
 	// ReadOnly mounts never mutate the remote.
 	ReadOnly bool
 }
+
+// defaultMaxUpload is the engine's staging-upload worker count.
+const defaultMaxUpload = 16
 
 // upstreamChunkDefaultsForTest exposes the chunk-store defaults the engine
 // installs (test hook: they must match JuiceFS's own mount defaults).
@@ -91,6 +100,10 @@ func NewEngine(cfg EngineConfig) *Engine {
 	// behavior), so the operator's number passes through verbatim.
 	cacheSize := uint64(cfg.CacheSize)
 	blockSize := blockSizeMiB << 20
+	maxUpload := cfg.MaxUpload
+	if maxUpload <= 0 {
+		maxUpload = defaultMaxUpload
+	}
 	chunkConf := chunk.Config{
 		BlockSize:  blockSize << 0,
 		CacheDir:   cfg.CacheDir,
@@ -109,7 +122,7 @@ func NewEngine(cfg EngineConfig) *Engine {
 		OSCache:        true,
 		Readahead:      8 * blockSize,
 		Prefetch:       1,
-		MaxUpload:      4,
+		MaxUpload:      maxUpload,
 		MaxDownload:    4,
 		// BufferSize is JuiceFS's TOTAL read/write buffering budget, and it
 		// is not just a soft throttle: the data reader derives its global
