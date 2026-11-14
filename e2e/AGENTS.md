@@ -352,12 +352,21 @@ each suite provisions a fresh tenant.
 1. `POST /v1/provision` returns `202` with `tenant_id`, `api_key`, and `status`
    — honors `DRIVE9_API_KEY`: when set, step 1 skips provision (emits SKIP
    checks) and reuses the existing tenant
-2. `GET /v1/status` polled until `active`
+2. `GET /v1/status` polled until `active`, then the capability negotiation
+   surface is asserted: `tenant_id` (must match the provisioned tenant),
+   positive `max_upload_bytes` and `inline_threshold`, object-typed
+   `migration_capabilities`, and `storage_capabilities`
+   (`batch_write_mode_v1`, `completion_identity_v1`, `append_log_v1`,
+   `batch_upload_presigned_v1`). The upload-limit boundary derives its limit
+   from `max_upload_bytes`; `UPLOAD_LIMIT_BYTES` still wins when set.
+   A field an older server omits SKIPs instead of failing.
 3. `GET /v1/fs/?list` returns `entries[]`
 4. Nested `mkdir` (`/team/...`) across multi-level paths
 5. Multi-file `PUT` + `GET` content verification
 6. Batch small-file writes (`N` files) + list count + sample reads
-7. Search checks (`GET ?grep=...`, `GET ?find=...`)
+7. Search checks (`GET ?grep=...`, `GET ?find=...`); the `find` assertions
+   match the exact absolute path, so a missing file cannot be papered over by
+   another file with the same extension
 8. Image upload (`.jpg`) + image query check (`GET ?find=&name=*.jpg`)
 9. Semantic text recall checks (`GET ?grep=feline%20sofa`, `GET ?grep=canine%20field`) with async polling
 10. Image-associated recall check (`GET ?grep=feline%20face%20icon`) with async polling + image discoverability
@@ -365,10 +374,60 @@ each suite provisions a fresh tenant.
 12. `copy`, `hardlink`, `rename`, `delete`
 13. Final `list` verifies expected structure after mutations
 14. Large multipart upload (`POST /v1/uploads/initiate` + presigned part uploads + complete + download checksum)
+15. Upload-limit boundary (`limit` initiate accepted, `limit+1` rejected with
+    `413`); the accepted session is aborted so its reservation does not poison
+    the next run
+16. Wire contract: `?stat` projection (size/isdir/revision/mtime/btime/
+    resource_id/content_type/tags/description), `HEAD` `X-Dat9-*` headers,
+    strong `ETag`, `Accept-Ranges`, synthetic root stat, `?list` entry fields
+17. Conditional write: `X-Dat9-Expected-Revision` as a CAS (`0` = must not
+    exist, stale → `409`, malformed → `400`), `X-Dat9-Content-Length` mismatch
+    → `400`; read validators: `Range` → `206` + exact bytes + `Content-Range`,
+    unsatisfiable → `416`, stale `If-Range` → full `200`, stale `If-Match` →
+    `412`, `ETag` changes after overwrite
+18. Metadata: `?create` (revision `1`, `409`, resource-id echo when
+    `completion_identity_v1`), `PUT` `X-Dat9-Tag`/`X-Dat9-Description`,
+    `?setmeta` (+ its `400` cases), `?find=&tag=k=v` and `?find=&tag=k` with a
+    negative case
+19. Path handling: unicode + spaces + `#`/`?` round-trip, base64url
+    `X-Dat9-Path-Encoding` source headers for `?copy`/`?rename`, unsupported
+    encoding → `400`
+20. Delete/link contract: non-empty dir → `409`, invalid `?kind` → `400`,
+    `?recursive` → `200`, `?kind=file` twice → `200`/`404`, symlink create
+    (`409` on duplicate, `400` on empty target) and delete
+21. Error/routing contract: missing file/`?stat`/`HEAD` → `404`, no action
+    selector → `400`, `?copy`/`?rename` without source → `400`, `mkdir` over an
+    existing directory → `409`, wrong method → `405`, missing/invalid bearer →
+    `401`, unknown route → `404`, `/healthz`
+22. Batch endpoints: `batch-stat` per-item status/size/isDir/hasMode/revision,
+    `include_checksum` sha256, mixed existing+missing+dir, 256-path limit;
+    `batch-read-small` missing → per-item `404`, 128-path limit;
+    `batch-write` create with `expected_revision:0`, overwrite with the current
+    revision, directory/stale → per-item `409`, `expected_revision:0` on an
+    existing path → `409` (create-only CAS), 128-item limit. The inline-only
+    parts (batch-read-small happy path, per-item `413`, the whole batch-write
+    matrix, over-`inline_threshold` `413`, owner `hasMode` item) run only when
+    `/v1/status` advertises `storage_capabilities.batch_write_mode_v1`
+23. Upload lifecycle: V1 `initiate` (with one part checksum; an empty
+    `part_checksums` is `400`) → `GET /v1/uploads?path=` (`UPLOADING`,
+    `total_size`, one live session) → `POST`/`GET …/resume` (`400` without
+    checksums) → re-initiate `202` superseding the old id with one live session
+    → `DELETE` abort `200` → gone from listing → `resume` after abort `409`.
+    V2 round-trip: `initiate` → `presign` → `presign-batch` → presigned
+    part `PUT` (ETag) → `complete` (`status=completed` + revision) → `?stat`
+    size + downloaded sha256; plus `abort` and `complete`-after-abort `404`
+24. Mount leases: register/`GET …/{id}`/heartbeat (extends `expires_at`)/
+    list/`DELETE` `204`/released `404`/idempotent re-release. A server without
+    `/v1/mounts` SKIPs the group
+25. Cleanup test tree (existing-tenant mode only): `DELETE /v1/fs/team-${TS}?recursive`;
+    steps 16-24 keep every fixture under that tree
 
-15. Upload-limit boundary (`10GiB` initiate accepted, `10GiB+1` rejected)
-16. Cleanup test tree (existing-tenant mode only): `DELETE /v1/fs/team-${TS}?recursive`
-    removes the timestamped test tree so an existing tenant is not polluted
+Steps 16-24 are opt-out (`RUN_CONTRACT_CHECKS`, `RUN_BATCH_CHECKS`,
+`RUN_UPLOAD_LIFECYCLE_CHECKS`, `RUN_MOUNT_LEASE_CHECKS`, all default `1`).
+Assertions are never weakened for an older server: a missing route SKIPs, a
+wrong answer FAILs. Provider-dependent behavior (append-log, PATCH dirty
+parts, `/v1/fs:batch-upload`, `/v1/object-credentials`, tenant delete) is not
+covered here yet.
 
 ### `cli-smoke-test.sh`
 
@@ -929,7 +988,11 @@ Manual-only: requires TiDB Cloud API credentials. Not wired into CI.
 | `REQUEST_MAX_RETRIES` | `8` | `api-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-sqlite-commit-sequence.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh`, `fuse-nodefs-smoke-test.sh` |
 | `REQUEST_RETRY_SLEEP_S` | `2` | `api-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-sqlite-commit-sequence.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh`, `fuse-nodefs-smoke-test.sh` |
 | `RUN_UPLOAD_LIMIT_BOUNDARY` | `1` (defaults to `0` when `DRIVE9_API_KEY` is set) | `api-smoke-test.sh` |
-| `UPLOAD_LIMIT_BYTES` | `10737418240` | `api-smoke-test.sh` |
+| `UPLOAD_LIMIT_BYTES` | *(derived from `GET /v1/status` `max_upload_bytes`; `10737418240` when the server omits it)* | `api-smoke-test.sh` |
+| `RUN_CONTRACT_CHECKS` | `1` | `api-smoke-test.sh` (steps 16-21: stat/HEAD, conditional write + range, metadata/tags, path handling, delete/link, error contract) |
+| `RUN_BATCH_CHECKS` | `1` | `api-smoke-test.sh` (step 22: `batch-stat` / `batch-read-small` / `batch-write`) |
+| `RUN_UPLOAD_LIFECYCLE_CHECKS` | `1` | `api-smoke-test.sh` (step 23: V1 list/resume/abort + V2 presigned round-trip) |
+| `RUN_MOUNT_LEASE_CHECKS` | `1` (group SKIPs when the server does not serve `/v1/mounts`) | `api-smoke-test.sh` (step 24) |
 | `RUN_SEMANTIC_CHECKS` | `0` | `api-smoke-test.sh` |
 | `RUN_SQL_CHECKS` | `0` | `api-smoke-test.sh` |
 | `SEMANTIC_TIMEOUT_S` | `90` | `api-smoke-test.sh` |
