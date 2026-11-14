@@ -5281,9 +5281,11 @@ func (h *bufferingHandle) commitInline(ctx context.Context) error {
 	isNew := h.isNew
 	baseRev := h.baseRev
 	commitGen := h.wgen
+	threshold := h.w.opts.Client.CachedSmallFileThreshold()
+	fixedDirect := h.w.opts.Client.ViewBinding().LayerID != "" && (size == 0 || threshold > 0 && size < threshold)
 	var newReader func() io.Reader
 	var image []byte
-	if size >= commitInlineStreamThreshold {
+	if size >= commitInlineStreamThreshold && !fixedDirect {
 		newReader = func() io.Reader { return &bufferReader{h: h, size: size} }
 	} else {
 		if err := h.buf.LoadMissingParts(); err != nil {
@@ -5294,6 +5296,9 @@ func (h *bufferingHandle) commitInline(ctx context.Context) error {
 		newReader = func() io.Reader { return bytes.NewReader(image) }
 	}
 	h.mu.Unlock()
+	if fixedDirect {
+		return h.commitFixedDirect(ctx, image, isNew && size == 0, baseRev, commitGen, cacheGen)
+	}
 
 	// Streamed commits report no revision (the protocol carries none and a
 	// bare re-read cannot be attributed): digest the exact bytes via a
