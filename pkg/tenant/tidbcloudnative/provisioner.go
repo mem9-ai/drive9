@@ -1525,24 +1525,109 @@ func (p *Provisioner) resolveDatabaseName(raw string) (string, error) {
 func ensureSystemUser(ctx context.Context, db *sql.DB, dbName, username, password string) error {
 	for i, stmt := range systemUserStatements(dbName, username, password) {
 		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			// TiDB accepts REVOKE of a privilege that was never granted, but
+			// MySQL-compatible servers may answer ER_NONEXISTING_GRANT. The revoke is
+			// legacy cleanup, so that answer is not a setup failure.
+			if strings.HasPrefix(stmt, "REVOKE SYSTEM_VARIABLES_ADMIN") && IsMissingGrantError(err) {
+				continue
+			}
 			return fmt.Errorf("execute native system user statement %d: %w", i+1, err)
 		}
 	}
 	return nil
 }
 
+// IsMissingGrantError reports whether the server rejected a REVOKE because the
+// privilege was not granted in the first place.
+func IsMissingGrantError(err error) bool {
+	var mysqlErr *mysql.MySQLError
+	return errors.As(err, &mysqlErr) && (mysqlErr.Number == 1141 || mysqlErr.Number == 1147)
+}
+
+// tenantRoleName is the fixed role the native setup creates on the tenant's instance
+// and grants the tenant account. It is package-level because the setup statements and
+// the legacy-grant remediation must name the same role: a drift between them would make
+// the revoke hit a role that does not exist, which IsMissingGrantError deliberately
+// tolerates as "nothing to do", and the real grant would survive while the pass reports
+// success.
+const tenantRoleName = "tdc_fs_admin"
+
 func systemUserStatements(dbName, username, password string) []string {
-	const roleName = "tdc_fs_admin"
 	return []string{
 		fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s", quoteIdent(dbName)),
-		fmt.Sprintf("CREATE ROLE IF NOT EXISTS %s", quoteString(roleName)),
-		fmt.Sprintf("GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO %s", quoteString(roleName)),
-		fmt.Sprintf("GRANT CREATE, ALTER, DROP, INDEX, SELECT, INSERT, UPDATE, DELETE ON %s.* TO %s", quoteIdent(dbName), quoteString(roleName)),
+		fmt.Sprintf("CREATE ROLE IF NOT EXISTS %s", quoteString(tenantRoleName)),
+		// Tenant SQL runs as this role, so it must not carry a cluster-wide dynamic
+		// privilege: SYSTEM_VARIABLES_ADMIN ON *.* lets the tenant SET GLOBAL on the
+		// shared instance, which is a whole-cluster escalation that the SQL
+		// classifier cannot be the only guard for. Nothing in the tenant runtime
+		// issues SET GLOBAL, so the legacy grant is revoked on every setup — an
+		// upgraded cluster loses the escalation the next time a tenant is finalized.
+		fmt.Sprintf("REVOKE SYSTEM_VARIABLES_ADMIN ON *.* FROM %s", quoteString(tenantRoleName)),
+		fmt.Sprintf("GRANT CREATE, ALTER, DROP, INDEX, SELECT, INSERT, UPDATE, DELETE ON %s.* TO %s", quoteIdent(dbName), quoteString(tenantRoleName)),
 		fmt.Sprintf("CREATE USER IF NOT EXISTS %s IDENTIFIED BY %s", quoteString(username), quoteString(password)),
 		fmt.Sprintf("ALTER USER %s IDENTIFIED BY %s", quoteString(username), quoteString(password)),
-		fmt.Sprintf("GRANT %s TO %s", quoteString(roleName), quoteString(username)),
-		fmt.Sprintf("SET DEFAULT ROLE %s TO %s", quoteString(roleName), quoteString(username)),
+		fmt.Sprintf("GRANT %s TO %s", quoteString(tenantRoleName), quoteString(username)),
+		fmt.Sprintf("SET DEFAULT ROLE %s TO %s", quoteString(tenantRoleName), quoteString(username)),
 	}
+}
+
+// RetireLegacySystemUserPrivilege revokes the legacy cluster-wide
+// SYSTEM_VARIABLES_ADMIN grant from the tenant role through the cluster root
+// principal.
+//
+// Tenants finalized before this version granted the privilege and stored a DSN that
+// already names the restricted account, so the per-tenant setup never runs again for
+// them. The stored password is the cluster root password (both the legacy and the
+// current setup reuse cfg.Passwd), so it still authenticates as <prefix>.root, which
+// is the principal that can revoke the grant. A DSN that already names a root-format
+// user, or whose password no longer authenticates as root, is left alone.
+func RetireLegacySystemUserPrivilege(ctx context.Context, dsn string) error {
+	cfg, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		return fmt.Errorf("parse native tenant DSN: %w", err)
+	}
+	rootUser, ok := systemRootUserFor(cfg.User)
+	if !ok {
+		return nil
+	}
+	if strings.TrimSpace(cfg.Passwd) == "" {
+		return fmt.Errorf("native tenant DSN password is empty")
+	}
+	rootCfg := cfg.Clone()
+	rootCfg.User = rootUser
+	db, err := sql.Open("mysql", rootCfg.FormatDSN())
+	if err != nil {
+		return fmt.Errorf("open native tenant database as root: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+	stmt := fmt.Sprintf("REVOKE SYSTEM_VARIABLES_ADMIN ON *.* FROM %s", quoteString(tenantRoleName))
+	if _, err := db.ExecContext(ctx, stmt); err != nil && !IsMissingGrantError(err) {
+		return fmt.Errorf("revoke legacy system variables grant: %w", err)
+	}
+	return nil
+}
+
+// RestrictedSystemUserNameSuffix marks the per-tenant account the native setup creates.
+// Callers that decide from a stored DSN use IsRestrictedSystemUser instead of spelling
+// the suffix themselves, so a scheme change cannot silently stop matching.
+const RestrictedSystemUserNameSuffix = ".tdc_fs_sys"
+
+// IsRestrictedSystemUser reports whether username names the restricted per-tenant
+// account rather than a cluster principal.
+func IsRestrictedSystemUser(username string) bool {
+	prefix, ok := strings.CutSuffix(strings.TrimSpace(username), RestrictedSystemUserNameSuffix)
+	return ok && prefix != ""
+}
+
+// systemRootUserFor maps the restricted tenant account name back to the cluster root
+// principal that shares its password: <prefix>.tdc_fs_sys -> <prefix>.root.
+func systemRootUserFor(currentUsername string) (string, bool) {
+	currentUsername = strings.TrimSpace(currentUsername)
+	if !IsRestrictedSystemUser(currentUsername) {
+		return "", false
+	}
+	prefix := strings.TrimSuffix(currentUsername, RestrictedSystemUserNameSuffix)
+	return prefix + ".root", true
 }
 
 func systemUsernameForCurrent(currentUsername string) (string, bool, error) {

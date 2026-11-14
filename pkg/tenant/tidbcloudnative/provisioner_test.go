@@ -20,6 +20,7 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
 
+	"github.com/go-sql-driver/mysql"
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/metrics"
 	"github.com/mem9-ai/drive9/pkg/tenant"
@@ -2473,7 +2474,7 @@ func TestSystemUserStatements(t *testing.T) {
 	want := []string{
 		"CREATE DATABASE IF NOT EXISTS `tidbcloud_fs`",
 		"CREATE ROLE IF NOT EXISTS 'tdc_fs_admin'",
-		"GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO 'tdc_fs_admin'",
+		"REVOKE SYSTEM_VARIABLES_ADMIN ON *.* FROM 'tdc_fs_admin'",
 		"GRANT CREATE, ALTER, DROP, INDEX, SELECT, INSERT, UPDATE, DELETE ON `tidbcloud_fs`.* TO 'tdc_fs_admin'",
 		"CREATE USER IF NOT EXISTS '22ipQWBXXq2wN2S.tdc_fs_sys' IDENTIFIED BY 'pass123'",
 		"ALTER USER '22ipQWBXXq2wN2S.tdc_fs_sys' IDENTIFIED BY 'pass123'",
@@ -3062,5 +3063,80 @@ func TestBatchProvisionFreeClustersReturnsSpendingLimitOnPartialFailure(t *testi
 	}
 	if cloudCfg.TiDBCloudSpendingLimitMonthly == nil || *cloudCfg.TiDBCloudSpendingLimitMonthly != int64(defaultLimit) {
 		t.Fatalf("spending limit = %#v, want %d", cloudCfg.TiDBCloudSpendingLimitMonthly, defaultLimit)
+	}
+}
+
+// The tenant role must not carry a cluster-wide dynamic privilege: tenant SQL runs
+// as this account and SET GLOBAL would affect every tenant on the instance, with the
+// lexical SQL classifier as the only guard. A legacy grant is revoked on setup.
+func TestSystemUserStatementsRevokeClusterWidePrivilege(t *testing.T) {
+	got := strings.Join(systemUserStatements("tidbcloud_fs", "u.tdc_fs_sys", "p"), "\n")
+	if strings.Contains(got, "GRANT SYSTEM_VARIABLES_ADMIN") {
+		t.Fatalf("system user statements still grant the cluster-wide privilege:\n%s", got)
+	}
+	if !strings.Contains(got, "REVOKE SYSTEM_VARIABLES_ADMIN ON *.* FROM 'tdc_fs_admin'") {
+		t.Fatalf("system user statements do not revoke the legacy privilege:\n%s", got)
+	}
+	// The tenant keeps exactly the schema privileges it needs.
+	if !strings.Contains(got, "GRANT CREATE, ALTER, DROP, INDEX, SELECT, INSERT, UPDATE, DELETE ON `tidbcloud_fs`.* TO 'tdc_fs_admin'") {
+		t.Fatalf("system user statements lost the tenant schema grant:\n%s", got)
+	}
+}
+
+// A missing legacy grant is not a setup failure: TiDB accepts the revoke, but a
+// MySQL-compatible server answers ER_NONEXISTING_GRANT.
+func TestIsMissingGrantError(t *testing.T) {
+	if !IsMissingGrantError(&mysql.MySQLError{Number: 1147}) || !IsMissingGrantError(&mysql.MySQLError{Number: 1141}) {
+		t.Fatal("missing-grant errors not recognised")
+	}
+	if IsMissingGrantError(&mysql.MySQLError{Number: 1045}) || IsMissingGrantError(errors.New("boom")) {
+		t.Fatal("unrelated errors classified as a missing grant")
+	}
+}
+
+// The restricted-account predicate is shared with the server's legacy-grant pass, so a
+// scheme change has one place to happen instead of two that can drift apart.
+func TestIsRestrictedSystemUser(t *testing.T) {
+	for _, in := range []string{"u1.tdc_fs_sys", " 22ipQWBXXq2wN2S.tdc_fs_sys "} {
+		if !IsRestrictedSystemUser(in) {
+			t.Fatalf("IsRestrictedSystemUser(%q) = false", in)
+		}
+	}
+	for _, in := range []string{"", "root", "u1.root", ".tdc_fs_sys", "u1.tdc_fs_sys.x", "tdc_fs_sys"} {
+		if IsRestrictedSystemUser(in) {
+			t.Fatalf("IsRestrictedSystemUser(%q) = true", in)
+		}
+	}
+}
+
+// Retiring the legacy privilege needs the cluster root principal, which shares the
+// stored password with the restricted tenant account.
+func TestSystemRootUserFor(t *testing.T) {
+	cases := map[string]string{
+		"22ipQWBXXq2wN2S.tdc_fs_sys": "22ipQWBXXq2wN2S.root",
+		"prefix.tdc_fs_sys":          "prefix.root",
+	}
+	for in, want := range cases {
+		got, ok := systemRootUserFor(in)
+		if !ok || got != want {
+			t.Fatalf("systemRootUserFor(%q) = %q ok=%t, want %q", in, got, ok, want)
+		}
+	}
+	for _, in := range []string{"", "root", "u1.admin", "u1.root", ".tdc_fs_sys"} {
+		if _, ok := systemRootUserFor(in); ok {
+			t.Fatalf("systemRootUserFor(%q) mapped a non-tenant account", in)
+		}
+	}
+}
+
+// Retiring the legacy privilege is a no-op for a DSN that already names the root
+// principal (nothing to remediate) and refuses a DSN without a password instead of
+// dialling with an empty one.
+func TestRetireLegacySystemUserPrivilegeDSNHandling(t *testing.T) {
+	if err := RetireLegacySystemUserPrivilege(t.Context(), "22ipQWBXXq2wN2S.root@tcp(127.0.0.1:1)/db"); err != nil {
+		t.Fatalf("root-principal DSN: %v", err)
+	}
+	if err := RetireLegacySystemUserPrivilege(t.Context(), "22ipQWBXXq2wN2S.tdc_fs_sys@tcp(127.0.0.1:1)/db"); err == nil {
+		t.Fatal("a DSN without a password was accepted")
 	}
 }

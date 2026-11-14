@@ -1,6 +1,8 @@
 package fuse
 
 import (
+	"errors"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -8,11 +10,12 @@ import (
 func TestDeferredUnlinkReadOnlyAdmission(t *testing.T) {
 	for _, tc := range []struct {
 		name string
-		run  func(*FS, uint64)
+		run  func(*FS, uint64) error
 	}{
-		{"last-close", func(f *FS, ino uint64) { f.maybeRunDeferredUnlink(ino) }},
-		{"same-name", func(f *FS, _ uint64) { f.flushDeferredUnlink("/file") }},
-		{"directory", func(f *FS, _ uint64) { f.flushDeferredUnlinksUnder("/") }},
+		{"last-close", func(f *FS, ino uint64) error { f.maybeRunDeferredUnlink(ino); return nil }},
+		{"same-name", func(f *FS, _ uint64) error { return f.flushDeferredUnlink("/file") }},
+		{"directory", func(f *FS, _ uint64) error { return f.flushDeferredUnlinksUnder("/") }},
+		{"shared-runner", func(f *FS, _ uint64) error { return f.runDeferredUnlink(f.deferredUnlinks["/file"], false) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, readOnly := range []bool{false, true} {
@@ -23,8 +26,15 @@ func TestDeferredUnlinkReadOnlyAdmission(t *testing.T) {
 				ino := f.EnsureInodeForTest("/file", false, 4, time.Now())
 				// Validation cannot enqueue this through Unlink. Inject a stale
 				// entry to ensure internal callers still fail before local effects.
-				f.deferredUnlinks[ino] = "/file"
-				tc.run(f, ino)
+				f.deferredUnlinks["/file"] = &deferredUnlink{path: "/file", ino: ino}
+				err := tc.run(f, ino)
+				if readOnly && tc.name != "last-close" {
+					if !errors.Is(err, syscall.EROFS) {
+						t.Fatalf("read-only cleanup: %v", err)
+					}
+				} else if err != nil {
+					t.Fatal(err)
+				}
 				entry, exists := core.get("/file")
 				if exists != readOnly {
 					t.Fatalf("readOnly=%v file exists=%v", readOnly, exists)
@@ -47,9 +57,11 @@ func TestDeferredUnlinkPreservesReboundName(t *testing.T) {
 		f := newTestFS(t, core)
 		ino := f.EnsureInodeForTest("/file", false, 11, time.Now())
 		old := ino + 1
-		f.deferredUnlinks[old] = "/file"
+		f.deferredUnlinks["/file"] = &deferredUnlink{path: "/file", ino: old}
 		if flush {
-			f.flushDeferredUnlink("/file")
+			if err := f.flushDeferredUnlink("/file"); err != nil {
+				t.Fatal(err)
+			}
 		} else {
 			f.maybeRunDeferredUnlink(old)
 		}

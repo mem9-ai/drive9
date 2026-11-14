@@ -343,12 +343,12 @@ jobs:
         continue-on-error: true
         run: python3 -m unittest discover -s e2e -p 'test_fixed_view*.py'
 
-      - name: Test READDIRPLUS and SSE disconnects through Linux FUSE
+      - name: Test READDIRPLUS, rename, unlink and SSE disconnects through Linux FUSE
         id: fuse-readdir-pending
         continue-on-error: true
         env:
           DRIVE9_REQUIRE_KERNEL_FUSE: "1"
-        run: make test TEST_PKGS=./pkg/fuse TEST_RUN='^Test(ReadDirPlus(PendingKernel|ReplacedInodeKernel)|SSEDisconnectReadKernel)$' TEST_TIMEOUT=2m
+        run: make test TEST_PKGS=./pkg/fuse TEST_RUN='^Test(ReadDirPlus(PendingKernel|ReplacedInodeKernel)|SSEDisconnectReadKernel|Unlink(Hardlink|Recreate|ParentRename)Kernel|RenameLongPathKernel)$' TEST_TIMEOUT=2m
 
       - name: Run FUSE release gate
         id: fuse-smoke
