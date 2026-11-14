@@ -1167,14 +1167,37 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 
 // commitExtentExisting lands pending blocks as an incremental PATCH
 // against a known revision (the identity-verified recovery path).
+//
+// The engine coalesces streaming writes into chunk-sized slices (one
+// 64 MiB slice per chunk), and a commit that carries such a slice as ONE
+// dirty block PUTs the whole span through a single stream — every commit
+// was paced by one 64 MiB upload. Cutting each pending span into
+// ExtentBlockSize pieces keeps the publish identical server-side (the
+// pieces tile the same byte range under the same revision CAS) while the
+// client's PATCH path uploads them at bounded concurrency.
 func (b *Bridge) commitExtentExisting(ctx context.Context, ino meta.Ino, path string, pending []pendingWrite, size, rev int64) error {
-	blocks := make([]client.ExtentBlockWrite, 0, len(pending))
+	const piece = int64(client.ExtentBlockSize)
+	blocks := make([]client.ExtentBlockWrite, 0, len(pending)*2)
 	for _, p := range pending {
 		data, err := b.blockBytes(ctx, p, path)
 		if err != nil {
 			return err
 		}
-		blocks = append(blocks, client.ExtentBlockWrite{Chunk: p.chunk, Off: p.off, Data: data})
+		if int64(len(data)) <= piece {
+			blocks = append(blocks, client.ExtentBlockWrite{Chunk: p.chunk, Off: p.off, Data: data})
+			continue
+		}
+		for off := int64(0); off < int64(len(data)); off += piece {
+			end := off + piece
+			if end > int64(len(data)) {
+				end = int64(len(data))
+			}
+			blocks = append(blocks, client.ExtentBlockWrite{
+				Chunk: p.chunk,
+				Off:   p.off + uint32(off),
+				Data:  data[off:end],
+			})
+		}
 	}
 	if err := b.commitWithRetry(ctx, ino, path, blocks, size, rev); err != nil {
 		return err
