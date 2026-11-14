@@ -48,6 +48,19 @@ The paired merge fixture sets `DRIVE9_FIXED_SDK_MERGE=1`. This selects a separat
 scenario: capture main, upload a two-part extent candidate, seal and validate,
 publish while preserving an unrelated main edit and an older observer view,
 then retry the original merge after the server drops its successful response.
-A later replay must preserve a newer main overwrite. This is wired into the
-server repository's isolated `layerfs-merge-ci.yml` job, which pins the client
-commit; it is not run against a hosted tenant or an unmatched released server.
+A later replay must preserve a newer main overwrite. The optional SDK fixtures run only when `DRIVE9_FIXED_SDK_PROBE` is supplied;
+the offline probe tests do not execute them.
+
+Live acceptance for these paired PRs is the server repository's
+[Local E2E / Drive9 E2E workflow](https://github.com/tidbcloud/fs/blob/dev2/layerfs-v10/.github/workflows/local-e2e.yml).
+It checks out this client at a full commit SHA, then uses isolated TiKV and
+object storage to run actual mounted Layer writes, same-mount switching,
+validation and merge, followed by the ordinary main suite. Its final step
+requires both suites to succeed; a failure or skip is not acceptance.
+The [Executor Linux FUSE corpus](https://github.com/tidbcloud/fs/blob/dev2/layerfs-v10/.github/workflows/executor.yml)
+also pins the client SHA and checks ordinary filesystem behavior.
+
+A client-only CI pass is insufficient for a new client revision: update both
+server workflow pins and require successful paired runs against that revision.
+Record the tested server merge commit and client SHA in the PR evidence. These
+jobs use isolated fixtures, not a hosted tenant or an unmatched released server.

@@ -5282,7 +5282,7 @@ func (h *bufferingHandle) commitInline(ctx context.Context) error {
 	baseRev := h.baseRev
 	commitGen := h.wgen
 	threshold := h.w.opts.Client.CachedSmallFileThreshold()
-	fixedDirect := h.w.opts.Client.ViewBinding().LayerID != "" && (size == 0 || threshold > 0 && size < threshold)
+	fixedDirect := h.w.opts.Client.ViewBinding().LayerID != "" && client.UseDirectPUT(size, threshold)
 	var newReader func() io.Reader
 	var image []byte
 	if size >= commitInlineStreamThreshold && !fixedDirect {
@@ -5505,7 +5505,7 @@ func (w *Writeback) commitReaderOpt(ctx context.Context, path string, newReader 
 		}
 		// (see the routing comment above)
 		var werr error
-		if threshold := w.opts.Client.CachedSmallFileThreshold(); threshold > 0 && size < threshold {
+		if threshold := w.opts.Client.CachedSmallFileThreshold(); client.UseDirectPUT(size, threshold) {
 			data := make([]byte, size)
 			if n, rerr := io.ReadFull(newReader(), data); rerr == nil && int64(n) == size {
 				rev, perr := w.opts.Client.WriteCtxConditionalWithRevision(ctx, rp, data, expected)
@@ -6218,7 +6218,7 @@ func (h *bufferingHandle) commitPatched(ctx context.Context) (rev int64, attempt
 	threshold := h.w.opts.Client.CachedSmallFileThreshold()
 	h.mu.Lock()
 	size := h.buf.Size()
-	directPUT := size == 0 || (threshold > 0 && size < threshold)
+	directPUT := client.UseDirectPUT(size, threshold)
 	applicable := !directPUT && threshold > 0 && !h.isNew &&
 		h.baseSize >= threshold && size <= h.baseSize &&
 		h.storageClass != client.StorageTypeDB9 &&

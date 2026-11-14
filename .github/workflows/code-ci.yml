@@ -40,6 +40,9 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # Offline checks only. Live Layer/main acceptance runs against the pinned
+      # client in tidbcloud/fs: .github/workflows/local-e2e.yml (see
+      # e2e/fixedsdk/README.md for workflow links and exact-version requirements).
       - name: Test fixed-view SDK probes without services
         run: go test -race ./e2e/fixedsdk
 

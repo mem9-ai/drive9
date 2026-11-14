@@ -546,6 +546,9 @@ func (f *FS) isDeferredUnlink(path string) bool {
 // maybeRunDeferredUnlink fires the postponed remote deletion once the last
 // handle of the unlinked inode closes.
 func (f *FS) maybeRunDeferredUnlink(ino uint64) {
+	if f.validationReadOnly {
+		return
+	}
 	f.mu.Lock()
 	path, ok := f.deferredUnlinks[ino]
 	if !ok {
@@ -569,7 +572,7 @@ func (f *FS) maybeRunDeferredUnlink(ino uint64) {
 	// survivor deletion before replying, so the storage is gone at close).
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(context.Background()), 30*time.Second)
 	defer cancel()
-	if _, err := f.chain.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: path}); err != nil {
+	if _, err := f.dispatchErr(ctx, &fs.Op{Kind: fs.OpUnlink, Path: path}); err != nil {
 		// The unlink syscall already returned OK; nothing can surface this
 		// to its caller — but a silently-lost deletion must at least be
 		// visible to the operator (v1 surfaced it inline).
@@ -582,6 +585,9 @@ func (f *FS) maybeRunDeferredUnlink(ino uint64) {
 // the same name (create/mkdir/mknod/symlink/link/rename target) must not
 // collide with the old entry's not-yet-deleted remote inode.
 func (f *FS) flushDeferredUnlink(path string) {
+	if f.validationReadOnly {
+		return
+	}
 	f.mu.Lock()
 	found := false
 	var deferredIno uint64
@@ -604,7 +610,7 @@ func (f *FS) flushDeferredUnlink(path string) {
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(context.Background()), 30*time.Second)
 	defer cancel()
-	_, _ = f.chain.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: path})
+	_, _ = f.dispatchErr(ctx, &fs.Op{Kind: fs.OpUnlink, Path: path})
 	f.markNameNegative(path)
 }
 
@@ -613,6 +619,9 @@ func (f *FS) flushDeferredUnlink(path string) {
 // (rmdir would otherwise hit ENOTEMPTY against a name that is already gone
 // from the namespace).
 func (f *FS) flushDeferredUnlinksUnder(dir string) {
+	if f.validationReadOnly {
+		return
+	}
 	prefix := strings.TrimSuffix(dir, "/") + "/"
 	f.mu.Lock()
 	var pending []string
@@ -625,7 +634,7 @@ func (f *FS) flushDeferredUnlinksUnder(dir string) {
 	f.mu.Unlock()
 	for _, p := range pending {
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(context.Background()), 30*time.Second)
-		_, _ = f.chain.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: p})
+		_, _ = f.dispatchErr(ctx, &fs.Op{Kind: fs.OpUnlink, Path: p})
 		cancel()
 		f.markNameNegative(p)
 	}

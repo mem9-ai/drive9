@@ -496,7 +496,7 @@ func (c *Client) writeStreamConditionalWithSummaryAndPreCompleteCheck(ctx contex
 	// Multipart is always accepted, so we route any non-zero-size upload
 	// through it until /v1/status warmup populates the cache. Zero-byte
 	// files keep using simple PUT because V2 initiate rejects total_size=0.
-	useDirectPUT := size == 0 || (threshold > 0 && size < threshold)
+	useDirectPUT := UseDirectPUT(size, threshold)
 	if useDirectPUT {
 		summary.Mode = "direct_put"
 		summary.PartSizeBytes = size
