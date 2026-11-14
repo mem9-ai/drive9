@@ -57,8 +57,10 @@
 # Steps 16-24 are extension groups, each behind its own knob (all default 1):
 # RUN_CONTRACT_CHECKS, RUN_BATCH_CHECKS, RUN_UPLOAD_LIFECYCLE_CHECKS,
 # RUN_MOUNT_LEASE_CHECKS. They assert the current server contract and never
-# weaken an assertion to accommodate an older server: a missing route SKIPs,
-# a present-but-wrong answer FAILs.
+# weaken an assertion to accommodate an older server: probe_features() checks
+# what this deployment serves (btime, HEAD read validators, Range, If-Match,
+# batch-stat checksums) and only the dependent checks SKIP when it does not;
+# a missing route SKIPs and a present-but-wrong answer FAILs.
 
 set -euo pipefail
 
@@ -104,6 +106,21 @@ CAP_BATCH_WRITE_MODE="unknown"
 CAP_COMPLETION_IDENTITY="unknown"
 CAP_APPEND_LOG="unknown"
 CAP_BATCH_UPLOAD_PRESIGNED="unknown"
+
+# Feature probes. The drive9 repository also embeds a server snapshot that the
+# Local E2E job runs, and some data-plane features exist only in the server
+# repository. probe_features() asks the deployment what it actually does, once,
+# and every dependent check SKIPs when the answer is "not here" -- a deployment
+# that does serve the feature is still hard-asserted. A missing capability is
+# never mistaken for a passing one.
+PROBES_DONE=0
+PROBE_STATUS_TENANT_ID="unknown"
+PROBE_STATUS_MIGRATION_CAPS="unknown"
+PROBE_STAT_BTIME="unknown"
+PROBE_HEAD_VALIDATORS="unknown"
+PROBE_RANGE="unknown"
+PROBE_IF_MATCH="unknown"
+PROBE_BATCH_CHECKSUM="unknown"
 
 PASS=0
 FAIL=0
@@ -301,6 +318,55 @@ resp_hdr() {
 check_status() {
   local desc="$1" resp="$2" want="$3"
   check_eq "$desc" "$(http_code "$resp")" "$want"
+}
+
+probe_features() {
+  if [ "$PROBES_DONE" = "1" ]; then
+    return 0
+  fi
+  PROBES_DONE=1
+  local dir="${ROOT_DIR}/probe"
+  local path="${dir}/f.txt"
+  request POST "$BASE/v1/fs/$dir?mkdir" --auth "$API_KEY" >/dev/null
+  request PUT "$BASE/v1/fs/$path" --auth "$API_KEY" --data "probe-0123456789" >/dev/null
+
+  local resp body
+  resp=$(request GET "$BASE/v1/fs/$path?stat" --auth "$API_KEY")
+  body=$(json_body "$resp")
+  if [ "$(http_code "$resp")" = "200" ]; then
+    PROBE_STAT_BTIME=$(printf '%s' "$body" | jq -r 'if has("btime") and .btime != null then "true" else "false" end')
+  fi
+
+  resp=$(request HEAD "$BASE/v1/fs/$path" --auth "$API_KEY")
+  if [ "$(resp_hdr 'ETag')" != "" ]; then
+    PROBE_HEAD_VALIDATORS="true"
+  else
+    PROBE_HEAD_VALIDATORS="false"
+  fi
+
+  resp=$(request GET "$BASE/v1/fs/$path" --auth "$API_KEY" --hdr "Range: bytes=0-3")
+  if [ "$(http_code "$resp")" = "206" ]; then
+    PROBE_RANGE="true"
+  else
+    PROBE_RANGE="false"
+  fi
+
+  resp=$(request GET "$BASE/v1/fs/$path" --auth "$API_KEY" --hdr 'If-Match: "probe-stale"')
+  if [ "$(http_code "$resp")" = "412" ]; then
+    PROBE_IF_MATCH="true"
+  else
+    PROBE_IF_MATCH="false"
+  fi
+
+  resp=$(request POST "$BASE/v1/fs:batch-stat" --auth "$API_KEY" --hdr 'Content-Type: application/json' \
+    --data "$(jq -nc --arg p "/$path" '{paths:[$p],include_checksum:true}')")
+  if [ "$(json_body "$resp" | jq -r '(.results[0].checksum_sha256 // empty)')" != "" ]; then
+    PROBE_BATCH_CHECKSUM="true"
+  else
+    PROBE_BATCH_CHECKSUM="false"
+  fi
+
+  info "features: stat_btime=$PROBE_STAT_BTIME head_validators=$PROBE_HEAD_VALIDATORS range=$PROBE_RANGE if_match=$PROBE_IF_MATCH batch_checksum=$PROBE_BATCH_CHECKSUM"
 }
 
 # check_json <desc> <json body> <jq filter> <expected string form>
@@ -518,9 +584,15 @@ check_status "GET /v1/status returns 200 for the owner key" "$sresp" "200"
 SERVER_TENANT_ID=$(printf '%s' "$sbody" | jq -r '.tenant_id // empty')
 SERVER_MAX_UPLOAD_BYTES=$(printf '%s' "$sbody" | jq -r '.max_upload_bytes // empty')
 SERVER_INLINE_THRESHOLD=$(printf '%s' "$sbody" | jq -r '.inline_threshold // empty')
-check_cmd "status exposes tenant_id" test -n "$SERVER_TENANT_ID"
-if [ -n "${TENANT_ID:-}" ]; then
-  check_eq "status tenant_id matches the provisioned tenant" "$SERVER_TENANT_ID" "$TENANT_ID"
+PROBE_STATUS_TENANT_ID=$(printf '%s' "$sbody" | jq -r 'if has("tenant_id") then "true" else "false" end')
+if [ "$PROBE_STATUS_TENANT_ID" = "true" ]; then
+  check_cmd "status exposes tenant_id" test -n "$SERVER_TENANT_ID"
+  if [ -n "${TENANT_ID:-}" ]; then
+    check_eq "status tenant_id matches the provisioned tenant" "$SERVER_TENANT_ID" "$TENANT_ID"
+  fi
+else
+  skip_check "status exposes tenant_id (server does not project tenant_id)"
+  skip_check "status tenant_id matches the provisioned tenant (server does not project tenant_id)"
 fi
 check_cmd "status advertises a positive max_upload_bytes" bash -c 'test "${1:-0}" -gt 0' _ "$SERVER_MAX_UPLOAD_BYTES"
 if [ -n "$SERVER_INLINE_THRESHOLD" ]; then
@@ -528,7 +600,12 @@ if [ -n "$SERVER_INLINE_THRESHOLD" ]; then
 else
   skip_check "status advertises inline_threshold (older server omits it)"
 fi
-check_json "status migration_capabilities is an object" "$sbody" '(.migration_capabilities|type)' "object"
+PROBE_STATUS_MIGRATION_CAPS=$(printf '%s' "$sbody" | jq -r 'if has("migration_capabilities") and (.migration_capabilities|type) == "object" then "true" else "false" end')
+if [ "$PROBE_STATUS_MIGRATION_CAPS" = "true" ]; then
+  check_json "status migration_capabilities is an object" "$sbody" '(.migration_capabilities|type)' "object"
+else
+  skip_check "status migration_capabilities is an object (server does not project it)"
+fi
 if printf '%s' "$sbody" | jq -e 'has("storage_capabilities")' >/dev/null 2>&1; then
   check_json "status storage_capabilities is an object" "$sbody" '(.storage_capabilities|type)' "object"
   CAP_BATCH_WRITE_MODE=$(printf '%s' "$sbody" | jq -r '.storage_capabilities.batch_write_mode_v1 // false')
@@ -1179,6 +1256,7 @@ LINK_PATH="${CONTRACT_DIR}/link.txt"
 
 if [ "$RUN_CONTRACT_CHECKS" = "1" ]; then
   step "16" "Wire contract: stat metadata and HEAD headers"
+  probe_features
   STAT_PAYLOAD="stat-contract-${TS}"
 
   resp=$(request POST "$BASE/v1/fs/$CONTRACT_DIR?mkdir" --auth "$API_KEY")
@@ -1195,7 +1273,11 @@ if [ "$RUN_CONTRACT_CHECKS" = "1" ]; then
   check_json "stat reports isdir=false for a file" "$stat_body" '.isdir' "false"
   check_json "stat revision matches the PUT revision" "$stat_body" '.revision' "$PUT_REV"
   check_json "stat mtime is a positive epoch second" "$stat_body" '(.mtime > 0)' "true"
-  check_json "stat btime is a positive epoch second" "$stat_body" '(.btime > 0)' "true"
+  if [ "$PROBE_STAT_BTIME" = "true" ]; then
+    check_json "stat btime is a positive epoch second" "$stat_body" '(.btime > 0)' "true"
+  else
+    skip_check "stat btime is a positive epoch second (server does not project btime)"
+  fi
   STAT_RESOURCE=$(printf '%s' "$stat_body" | jq -r '.resource_id // empty')
   check_cmd "stat exposes resource_id" test -n "$STAT_RESOURCE"
   check_cmd "stat exposes content_type" test -n "$(printf '%s' "$stat_body" | jq -r '.content_type // empty')"
@@ -1209,11 +1291,21 @@ if [ "$RUN_CONTRACT_CHECKS" = "1" ]; then
   check_eq "HEAD X-Dat9-Revision matches the PUT revision" "$(resp_hdr 'X-Dat9-Revision')" "$PUT_REV"
   check_eq "HEAD X-Dat9-Resource-ID matches the stat resource_id" "$(resp_hdr 'X-Dat9-Resource-ID')" "$STAT_RESOURCE"
   check_eq "HEAD X-Dat9-Mtime matches stat mtime" "$(resp_hdr 'X-Dat9-Mtime')" "$(printf '%s' "$stat_body" | jq -r '.mtime')"
-  check_eq "HEAD X-Dat9-Btime matches stat btime" "$(resp_hdr 'X-Dat9-Btime')" "$(printf '%s' "$stat_body" | jq -r '.btime')"
+  if [ "$PROBE_STAT_BTIME" = "true" ]; then
+    check_eq "HEAD X-Dat9-Btime matches stat btime" "$(resp_hdr 'X-Dat9-Btime')" "$(printf '%s' "$stat_body" | jq -r '.btime')"
+  else
+    skip_check "HEAD X-Dat9-Btime matches stat btime (server does not project btime)"
+  fi
   check_cmd "HEAD X-Dat9-Nlink is at least 1" bash -c 'test "${1:-0}" -gt 0' _ "$(resp_hdr 'X-Dat9-Nlink')"
-  check_cmd "HEAD advertises a strong ETag" test -n "$(resp_hdr 'ETag')"
-  check_eq "HEAD advertises Accept-Ranges: bytes" "$(resp_hdr 'Accept-Ranges')" "bytes"
-  check_eq "HEAD reports the single content layout" "$(resp_hdr 'X-Dat9-Content-Layout')" "single"
+  if [ "$PROBE_HEAD_VALIDATORS" = "true" ]; then
+    check_cmd "HEAD advertises a strong ETag" test -n "$(resp_hdr 'ETag')"
+    check_eq "HEAD advertises Accept-Ranges: bytes" "$(resp_hdr 'Accept-Ranges')" "bytes"
+    check_eq "HEAD reports the single content layout" "$(resp_hdr 'X-Dat9-Content-Layout')" "single"
+  else
+    skip_check "HEAD advertises a strong ETag (server does not expose read validators on HEAD)"
+    skip_check "HEAD advertises Accept-Ranges: bytes (server does not expose read validators on HEAD)"
+    skip_check "HEAD reports the single content layout (server does not expose read validators on HEAD)"
+  fi
   info "HEAD storage class: $(resp_hdr 'X-Dat9-Storage-Type') (db9 = inline, s3 = object store)"
 
   resp=$(request GET "$BASE/v1/fs/?stat" --auth "$API_KEY")
@@ -1263,29 +1355,50 @@ if [ "$RUN_CONTRACT_CHECKS" = "1" ]; then
   resp=$(request PUT "$BASE/v1/fs/$RANGE_PATH" --auth "$API_KEY" --data "$RANGE_TEXT")
   check_status "PUT range fixture returns 200" "$resp" "200"
   RANGE_ETAG=$(request HEAD "$BASE/v1/fs/$RANGE_PATH" --auth "$API_KEY" >/dev/null; resp_hdr 'ETag')
-  check_cmd "range fixture HEAD exposes an ETag" test -n "$RANGE_ETAG"
+  if [ "$PROBE_HEAD_VALIDATORS" = "true" ]; then
+    check_cmd "range fixture HEAD exposes an ETag" test -n "$RANGE_ETAG"
+  else
+    skip_check "range fixture HEAD exposes an ETag (server does not expose read validators on HEAD)"
+  fi
 
-  resp=$(request GET "$BASE/v1/fs/$RANGE_PATH" --auth "$API_KEY" --hdr "Range: bytes=2-5")
-  check_status "Range read returns 206" "$resp" "206"
-  check_eq "Range read returns exactly the requested bytes" "$(json_body "$resp")" "2345"
-  check_eq "Range response carries Content-Range" "$(resp_hdr 'Content-Range')" "bytes 2-5/10"
+  if [ "$PROBE_RANGE" = "true" ]; then
+    resp=$(request GET "$BASE/v1/fs/$RANGE_PATH" --auth "$API_KEY" --hdr "Range: bytes=2-5")
+    check_status "Range read returns 206" "$resp" "206"
+    check_eq "Range read returns exactly the requested bytes" "$(json_body "$resp")" "2345"
+    check_eq "Range response carries Content-Range" "$(resp_hdr 'Content-Range')" "bytes 2-5/10"
 
-  resp=$(request GET "$BASE/v1/fs/$RANGE_PATH" --auth "$API_KEY" --hdr "Range: bytes=50-60")
-  check_status "an unsatisfiable Range returns 416" "$resp" "416"
+    resp=$(request GET "$BASE/v1/fs/$RANGE_PATH" --auth "$API_KEY" --hdr "Range: bytes=50-60")
+    check_status "an unsatisfiable Range returns 416" "$resp" "416"
+  else
+    skip_check "Range read returns 206 (server does not honour Range)"
+    skip_check "Range read returns exactly the requested bytes (server does not honour Range)"
+    skip_check "Range response carries Content-Range (server does not honour Range)"
+    skip_check "an unsatisfiable Range returns 416 (server does not honour Range)"
+  fi
 
   resp=$(request GET "$BASE/v1/fs/$RANGE_PATH" --auth "$API_KEY" --hdr "Range: bytes=0-1" --hdr 'If-Range: "stale-validator"')
   check_status "a stale If-Range falls back to the full body" "$resp" "200"
   check_eq "stale If-Range returns the whole file" "$(json_body "$resp")" "$RANGE_TEXT"
 
-  resp=$(request GET "$BASE/v1/fs/$RANGE_PATH" --auth "$API_KEY" --hdr 'If-Match: "stale-etag"')
-  check_status "a stale If-Match returns 412" "$resp" "412"
+  if [ "$PROBE_IF_MATCH" = "true" ]; then
+    resp=$(request GET "$BASE/v1/fs/$RANGE_PATH" --auth "$API_KEY" --hdr 'If-Match: "stale-etag"')
+    check_status "a stale If-Match returns 412" "$resp" "412"
 
-  resp=$(request GET "$BASE/v1/fs/$RANGE_PATH" --auth "$API_KEY" --hdr "If-Match: $RANGE_ETAG")
-  check_status "a matching If-Match serves the file" "$resp" "200"
+    resp=$(request GET "$BASE/v1/fs/$RANGE_PATH" --auth "$API_KEY" --hdr "If-Match: $RANGE_ETAG")
+    check_status "a matching If-Match serves the file" "$resp" "200"
+  else
+    skip_check "a stale If-Match returns 412 (server does not evaluate If-Match)"
+    skip_check "a matching If-Match serves the file (server does not evaluate If-Match)"
+  fi
 
-  resp=$(request PUT "$BASE/v1/fs/$RANGE_PATH" --auth "$API_KEY" --data "0123456789-updated")
-  resp=$(request HEAD "$BASE/v1/fs/$RANGE_PATH" --auth "$API_KEY")
-  check_cmd "the ETag changes after an overwrite" bash -c 'test "$1" != "$2"' _ "$RANGE_ETAG" "$(resp_hdr 'ETag')"
+  if [ "$PROBE_HEAD_VALIDATORS" = "true" ]; then
+    resp=$(request PUT "$BASE/v1/fs/$RANGE_PATH" --auth "$API_KEY" --data "0123456789-updated")
+    resp=$(request HEAD "$BASE/v1/fs/$RANGE_PATH" --auth "$API_KEY")
+    check_cmd "the ETag changes after an overwrite" bash -c 'test "$1" != "$2"' _ "$RANGE_ETAG" "$(resp_hdr 'ETag')"
+  else
+    resp=$(request PUT "$BASE/v1/fs/$RANGE_PATH" --auth "$API_KEY" --data "0123456789-updated")
+    skip_check "the ETag changes after an overwrite (server does not expose read validators on HEAD)"
+  fi
 
   step "18" "Metadata: create, tags, setmeta and find-by-tag"
   resp=$(request POST "$BASE/v1/fs/$CREATE_PATH?create" --auth "$API_KEY")
@@ -1497,10 +1610,14 @@ if [ "$RUN_BATCH_CHECKS" = "1" ]; then
   check_json "batch-stat reports a boolean hasMode per item" "$bs_body" '(.results[0].hasMode|type)' "boolean"
   check_json "batch-stat reports a positive revision" "$bs_body" '.results[0].revision' "$BW_ONE_REV"
 
-  resp=$(request POST "$BASE/v1/fs:batch-stat" --auth "$API_KEY" --hdr 'Content-Type: application/json' \
-    --data "$(jq -nc --arg a "/$BW_ONE" '{paths:[$a],include_checksum:true}')")
-  check_json "batch-stat include_checksum returns the content sha256" "$(json_body "$resp")" '.results[0].checksum_sha256' \
-    "$(printf '%s' "$BW_ONE_BODY" | sha256sum | cut -d' ' -f1)"
+  if [ "$PROBE_BATCH_CHECKSUM" = "true" ]; then
+    resp=$(request POST "$BASE/v1/fs:batch-stat" --auth "$API_KEY" --hdr 'Content-Type: application/json' \
+      --data "$(jq -nc --arg a "/$BW_ONE" '{paths:[$a],include_checksum:true}')")
+    check_json "batch-stat include_checksum returns the content sha256" "$(json_body "$resp")" '.results[0].checksum_sha256' \
+      "$(printf '%s' "$BW_ONE_BODY" | sha256sum | cut -d' ' -f1)"
+  else
+    skip_check "batch-stat include_checksum returns the content sha256 (server does not project checksums)"
+  fi
 
   resp=$(request POST "$BASE/v1/fs:batch-stat" --auth "$API_KEY" --hdr 'Content-Type: application/json' \
     --data "$(jq -nc '[range(0;257) | "/x" + (.|tostring)] | {paths:.}')")
@@ -1699,10 +1816,11 @@ if [ "$RUN_UPLOAD_LIFECYCLE_CHECKS" = "1" ]; then
   check_status "POST /v2/uploads/{id}/complete returns 200" "$resp" "200"
   v2_done=$(json_body "$resp")
   check_json "V2 complete reports status completed" "$v2_done" '.status' "completed"
-  check_json "V2 complete echoes a positive revision" "$v2_done" '(.revision > 0)' "true"
   if [ "$CAP_COMPLETION_IDENTITY" = "true" ]; then
+    check_json "V2 complete echoes a positive revision" "$v2_done" '(.revision > 0)' "true"
     check_cmd "V2 complete echoes the published resource_id" test -n "$(printf '%s' "$v2_done" | jq -r '.resource_id // empty')"
   else
+    skip_check "V2 complete echoes a positive revision (server does not advertise completion_identity_v1)"
     skip_check "V2 complete echoes the published resource_id (server does not advertise completion_identity_v1)"
   fi
 

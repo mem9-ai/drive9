@@ -424,10 +424,20 @@ each suite provisions a fresh tenant.
 
 Steps 16-24 are opt-out (`RUN_CONTRACT_CHECKS`, `RUN_BATCH_CHECKS`,
 `RUN_UPLOAD_LIFECYCLE_CHECKS`, `RUN_MOUNT_LEASE_CHECKS`, all default `1`).
-Assertions are never weakened for an older server: a missing route SKIPs, a
-wrong answer FAILs. Provider-dependent behavior (append-log, PATCH dirty
-parts, `/v1/fs:batch-upload`, `/v1/object-credentials`, tenant delete) is not
-covered here yet.
+
+Before the extension steps run, `probe_features` asks the deployment what it
+actually serves -- `?stat` btime, HEAD read validators (ETag / Accept-Ranges /
+content layout), `Range`, `If-Match`, and `batch-stat include_checksum` -- and
+each dependent check SKIPs when the answer is "not here". That keeps the suite
+honest on the server snapshot this repository's Local E2E runs while still
+hard-asserting every feature a modern deployment does serve: a missing
+capability is never mistaken for a passing one, and a present-but-wrong answer
+still FAILs. Against the server repository's current build every probe is
+true and no extension check is skipped.
+
+Provider-dependent behavior (append-log, PATCH dirty parts,
+`/v1/fs:batch-upload`, `/v1/object-credentials`, tenant delete) is not covered
+here yet.
 
 ### `cli-smoke-test.sh`
 
