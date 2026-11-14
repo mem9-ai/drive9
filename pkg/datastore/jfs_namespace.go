@@ -293,7 +293,7 @@ func (s *Store) jfsMknodTx(ctx context.Context, tx *sql.Tx, parent uint64, name 
 			return 0, nil, int(syscall.EINVAL), err
 		}
 		if createProjection {
-			err := s.ensureParentDirsWithExecer(ctx, tx, dirPath, func() string { return strings.ToLower(ulid.Make().String()) })
+			_, err := s.ensureParentDirsWithExecer(ctx, tx, dirPath, func() string { return strings.ToLower(ulid.Make().String()) })
 			if err != nil {
 				return 0, nil, 0, err
 			}

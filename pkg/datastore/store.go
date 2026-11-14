@@ -1059,8 +1059,15 @@ func (s *Store) LinkFileNodeTx(ctx context.Context, tx *sql.Tx, srcPath, dstPath
 }
 
 func (s *Store) EnsureParentDirs(ctx context.Context, path string, genID func() string) error {
+	_, err := s.EnsureParentDirsCreated(ctx, path, genID)
+	return err
+}
+
+// EnsureParentDirsCreated is EnsureParentDirs plus the inode ids of the parent directories
+// it created, so a caller that must undo or bound its own work does not have to re-read the
+// namespace for them.
+func (s *Store) EnsureParentDirsCreated(ctx context.Context, path string, genID func() string) (created []string, err error) {
 	start := time.Now()
-	var err error
 	defer observeStoreOp(ctx, "ensure_parent_dirs", start, &err)
 
 	// Run inside a transaction so the sequence of per-parent inserts is
@@ -1072,27 +1079,29 @@ func (s *Store) EnsureParentDirs(ctx context.Context, path string, genID func() 
 		var tx *sql.Tx
 		tx, err = s.db.BeginTx(ctx, nil)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		err = s.ensureParentDirsWithExecer(ctx, tx, path, genID)
+		created, err = s.ensureParentDirsWithExecer(ctx, tx, path, genID)
 		if err != nil {
 			_ = tx.Rollback()
+			created = nil
 			if isDeadlock(err) && attempt < maxAttempts-1 {
 				continue
 			}
-			return err
+			return nil, err
 		}
 		err = tx.Commit()
 		if err != nil {
 			_ = tx.Rollback()
+			created = nil
 			if isDeadlock(err) && attempt < maxAttempts-1 {
 				continue
 			}
-			return err
+			return nil, err
 		}
-		return nil
+		return created, nil
 	}
-	return err
+	return nil, err
 }
 
 // --- files operations ---
@@ -1639,8 +1648,67 @@ func (s *Store) Chmod(ctx context.Context, path string, mode uint32) (err error)
 	return tx.Commit()
 }
 
+// ChmodInode applies permission bits to a specific inode without resolving a path. A
+// caller that has already verified which inode a name refers to uses this so a concurrent
+// rename of the name cannot redirect the change.
+func (s *Store) ChmodInode(ctx context.Context, inodeID string, mode uint32) (err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "chmod_inode", start, &err)
+	inodeID = strings.TrimSpace(inodeID)
+	if inodeID == "" {
+		return ErrNotFound
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var currentMode uint32
+	if qerr := tx.QueryRowContext(ctx, `SELECT mode FROM inodes WHERE `+
+		s.scope.And(`inode_id = ? AND status = 'CONFIRMED'`)+` FOR UPDATE`,
+		s.scope.Args(inodeID)...).Scan(&currentMode); qerr != nil {
+		if errors.Is(qerr, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return qerr
+	}
+	mode = (mode & permissionModeMask) | (currentMode & fileTypeModeMask)
+	// A hardlinked extent file has several file_nodes rows sharing one file_id and
+	// extent_ino, so a scalar subquery answers ERROR 1242. The rows agree by construction,
+	// so aggregate them; 0 means this inode has no extent plane at all.
+	var extentIno sql.NullInt64
+	if qerr := tx.QueryRowContext(ctx, `SELECT MIN(COALESCE(extent_ino, 0)) FROM file_nodes WHERE `+
+		s.scope.And(`file_id = ?`), s.scope.Args(inodeID)...).Scan(&extentIno); qerr != nil && !errors.Is(qerr, sql.ErrNoRows) {
+		return qerr
+	}
+	if extentIno.Valid && extentIno.Int64 != 0 {
+		// Mirror the by-path Chmod: a remote chmod has to look like a mounted one, ctime
+		// included.
+		now := time.Now().UnixNano()
+		ctime, csec := jfsSplitTime(now)
+		if _, uerr := tx.ExecContext(ctx, `UPDATE jfs_node SET mode = ?, ctime = ?, ctimensec = ? WHERE inode = ?`,
+			mode&permissionModeMask, ctime, csec, uint64(extentIno.Int64)); uerr != nil {
+			return uerr
+		}
+	}
+	if _, uerr := tx.ExecContext(ctx, `UPDATE inodes SET mode = ? WHERE `+s.scope.And(`inode_id = ? AND status = 'CONFIRMED'`),
+		append([]any{mode}, s.scope.Args(inodeID)...)...); uerr != nil {
+		return uerr
+	}
+	return tx.Commit()
+}
+
 func (s *Store) EnsureParentDirsTx(db execer, path string, genID func() string) error {
-	return s.ensureParentDirsWithExecer(context.Background(), db, path, genID)
+	_, err := s.EnsureParentDirsTxCreated(context.Background(), db, path, genID)
+	return err
+}
+
+// EnsureParentDirsTxCreated is EnsureParentDirsTx plus the inode ids of the parent
+// directories it actually created, so a caller can bind something (a creation mode, a
+// permission decision) to those inodes without re-reading the namespace and racing a
+// concurrent writer.
+func (s *Store) EnsureParentDirsTxCreated(ctx context.Context, db execer, path string, genID func() string) ([]string, error) {
+	return s.ensureParentDirsWithExecer(ctx, db, path, genID)
 }
 
 // deterministicNodeID returns a stable 64-char hex ID derived from the path.
@@ -1658,7 +1726,7 @@ func deterministicNodeID(path string) string {
 // derived from the path so concurrent attempts to create the same missing
 // parent cannot leak orphan inodes, even on TiDB which does not support gap
 // locking for SELECT ... FOR UPDATE on non-existing rows.
-func (s *Store) ensureParentDirsWithExecer(ctx context.Context, db execer, path string, genID func() string) error {
+func (s *Store) ensureParentDirsWithExecer(ctx context.Context, db execer, path string, genID func() string) ([]string, error) {
 	var ancestors []string
 	cur := path
 	for {
@@ -1670,6 +1738,7 @@ func (s *Store) ensureParentDirsWithExecer(ctx context.Context, db execer, path 
 		cur = parent
 	}
 	now := time.Now().UTC()
+	var created []string
 	for i := len(ancestors) - 1; i >= 0; i-- {
 		dirPath := ancestors[i]
 		pp := parentPath(dirPath)
@@ -1685,7 +1754,7 @@ func (s *Store) ensureParentDirsWithExecer(ctx context.Context, db execer, path 
 			continue
 		}
 		if selectErr != nil && !errors.Is(selectErr, sql.ErrNoRows) {
-			return fmt.Errorf("check parent dir %s: %w", dirPath, selectErr)
+			return nil, fmt.Errorf("check parent dir %s: %w", dirPath, selectErr)
 		}
 
 		// Use a deterministic ID so concurrent creators for the same missing
@@ -1698,7 +1767,7 @@ func (s *Store) ensureParentDirsWithExecer(ctx context.Context, db execer, path 
 			VALUES (`+s.scope.InsVals(`?, 0, 1, ?, 'CONFIRMED', ?, ?`)+`)`,
 			s.scope.Args(nodeID, 0o755, now, now)...)
 		if err != nil {
-			return fmt.Errorf("ensure parent inode %s: %w", dirPath, err)
+			return nil, fmt.Errorf("ensure parent inode %s: %w", dirPath, err)
 		}
 
 		if selectErr == nil && !existingInodeID.Valid {
@@ -1708,7 +1777,7 @@ func (s *Store) ensureParentDirsWithExecer(ctx context.Context, db execer, path 
 				`UPDATE file_nodes SET inode_id = ? WHERE `+s.scope.And(`path_hash = ? AND path = ? AND is_directory = 1`),
 				append([]any{nodeID}, s.scope.Args(fileNodePathHash(dirPath), dirPath)...)...)
 			if err != nil {
-				return fmt.Errorf("backfill parent inode_id %s: %w", dirPath, err)
+				return nil, fmt.Errorf("backfill parent inode_id %s: %w", dirPath, err)
 			}
 			continue
 		}
@@ -1720,10 +1789,11 @@ func (s *Store) ensureParentDirsWithExecer(ctx context.Context, db execer, path 
 			ON DUPLICATE KEY UPDATE node_id = node_id`,
 			s.scope.Args(nodeID, dirPath, fileNodePathHash(dirPath), pp, fileNodePathHash(pp), name, nodeID, now)...)
 		if err != nil && !isUniqueViolation(err) {
-			return fmt.Errorf("ensure parent %s: %w", dirPath, err)
+			return nil, fmt.Errorf("ensure parent %s: %w", dirPath, err)
 		}
+		created = append(created, nodeID)
 	}
-	return nil
+	return created, nil
 }
 
 func (s *Store) InsertNodeTx(db execer, n *FileNode) error {

@@ -86,6 +86,113 @@ func (b *Dat9Backend) OpenFSLayerEntryData(ctx context.Context, entry *datastore
 	return io.NopCloser(bytes.NewReader(entry.ContentBlob)), nil
 }
 
+// WriteStoredObjectCreatedCtxIfRevision applies an already-uploaded object: it creates the
+// file (and its missing parents) when the path is free and reports the inode ids it created,
+// parents first and then the file. An apply onto a path that already exists is an overwrite
+// and reports no created ids, so the caller can tell a creation from an overwrite without
+// probing the name itself. It is the object-backed twin of createAndWriteCtx, so a layer
+// commit binds the creation mode to the inode rather than chmod-ing the name afterwards.
+func (b *Dat9Backend) WriteStoredObjectCreatedCtxIfRevision(ctx context.Context, path string, entry *datastore.FSLayerEntry) (revision int64, createdIDs []string, err error) {
+	if entry == nil {
+		return 0, nil, fmt.Errorf("nil fs layer entry")
+	}
+	canonical, err := pathutil.Canonicalize(path)
+	if err != nil {
+		return 0, nil, err
+	}
+	if err := rejectRootFileNodePath(canonical); err != nil {
+		return 0, nil, err
+	}
+	if entry.StorageType != string(datastore.StorageS3) || entry.StorageRef == "" {
+		return 0, nil, fmt.Errorf("missing fs layer external payload for %s", canonical)
+	}
+	if err := b.ensureUploadSizeAllowed(entry.SizeBytes); err != nil {
+		return 0, nil, err
+	}
+	if err := b.ensureFileSizeQuota(ctx, entry.SizeBytes); err != nil {
+		return 0, nil, err
+	}
+	// Decide create-or-overwrite before the transaction, like the inline twin:
+	// ensureFileCountQuotaServer below admits a *new* file, so running it ahead of the
+	// statement that discovers the path is taken would refuse an overwrite on a tenant at
+	// its file-count cap. The creation signal stays the insert itself — a path that appears
+	// between this stat and the insert fails that insert and is reported as a conflict, not
+	// as this commit's own creation.
+	if _, statErr := b.store.Stat(ctx, canonical); !errorsIsNotFound(statErr) {
+		if statErr != nil {
+			return 0, nil, statErr
+		}
+		rev, err := b.WriteStoredObjectCtxIfRevision(ctx, canonical, entry)
+		return rev, nil, err
+	}
+	// The path is free, but a base revision says it was not when the plan was staged: the
+	// file was removed since, so this entry would resurrect it. The inline twin refuses the
+	// same shape for the same reason.
+	if entry.BaseRevision > 0 {
+		return 0, nil, datastore.ErrRevisionConflict
+	}
+	storageEncryptionMode := entry.StorageEncryptionMode
+	if storageEncryptionMode == "" {
+		storageEncryptionMode = datastore.StorageEncryptionNone
+	}
+	now := time.Now()
+	fileID := b.genID()
+	var createdParents []string
+	err = b.store.InTx(ctx, func(tx *sql.Tx) error {
+		if err := b.ensureStorageQuota(ctx, tx, canonical, entry.SizeBytes); err != nil {
+			return err
+		}
+		if err := b.ensureFileCountQuotaServer(ctx, tx, 1); err != nil {
+			return err
+		}
+		if err := b.store.InsertFileTx(tx, &datastore.File{
+			FileID:                 fileID,
+			StorageType:            datastore.StorageType(entry.StorageType),
+			StorageRef:             entry.StorageRef,
+			StorageEncryptionMode:  storageEncryptionMode,
+			StorageEncryptionKeyID: entry.StorageEncryptionKeyID,
+			ContentType:            detectContentType(canonical, nil),
+			SizeBytes:              entry.SizeBytes,
+			ChecksumSHA256:         entry.ChecksumSHA256,
+			Revision:               1,
+			Status:                 datastore.StatusConfirmed,
+			CreatedAt:              now,
+			ConfirmedAt:            &now,
+		}); err != nil {
+			return err
+		}
+		parents, err := b.store.EnsureParentDirsTxCreated(ctx, tx, canonical, b.genID)
+		if err != nil {
+			return err
+		}
+		createdParents = parents
+		return b.store.InsertNodeTx(tx, &datastore.FileNode{
+			NodeID:     b.genID(),
+			Path:       canonical,
+			ParentPath: pathutil.ParentPath(canonical),
+			Name:       pathutil.BaseName(canonical),
+			FileID:     fileID,
+			CreatedAt:  now,
+		})
+	})
+	if err != nil {
+		if errors.Is(err, datastore.ErrPathConflict) {
+			// The path appeared after the stat. It is not this commit's creation, so it is
+			// not reported as one — and it is not silently overwritten either.
+			return 0, nil, datastore.ErrRevisionConflict
+		}
+		return 0, nil, err
+	}
+	// Same post-commit bookkeeping as every other creation path: skipping it would let
+	// object-backed layer files escape central quota accounting.
+	quotaCtx, cancelQuota := postCommitQuotaMutationContext()
+	defer cancelQuota()
+	if err := b.recordCentralFileCreateMutation(quotaCtx, fileID, entry.SizeBytes, detectContentType(canonical, nil)); err != nil {
+		return 0, nil, postCommitQuotaMutationError("record central quota file create", err)
+	}
+	return 1, append(append([]string{}, createdParents...), fileID), nil
+}
+
 // WriteStoredObjectCtxIfRevision applies an already-stored layer payload to the
 // base filesystem without routing the bytes through content_blob.
 func (b *Dat9Backend) WriteStoredObjectCtxIfRevision(ctx context.Context, path string, entry *datastore.FSLayerEntry) (int64, error) {

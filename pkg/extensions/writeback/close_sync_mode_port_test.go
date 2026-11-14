@@ -317,7 +317,7 @@ func TestPortCloseSyncModeFailureKeepsCommittedContent(t *testing.T) {
 	b := testbackend.NewBackend()
 	ts := httptest.NewServer(rec.wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Has("chmod") {
-			http.Error(w, `{"error":"chmod is owner-only"}`, http.StatusForbidden)
+			http.Error(w, `{"error":"transient chmod failure"}`, http.StatusInternalServerError)
 			return
 		}
 		b.ServeHTTP(w, r)
@@ -396,7 +396,7 @@ func TestPortCloseSyncConcurrentChmodDuringUpload(t *testing.T) {
 					<-release
 				}
 				if r.URL.Query().Has("chmod") && tc.chmodFails {
-					http.Error(w, `{"error":"chmod is owner-only"}`, http.StatusForbidden)
+					http.Error(w, `{"error":"transient chmod failure"}`, http.StatusInternalServerError)
 					return
 				}
 				b.ServeHTTP(w, r)

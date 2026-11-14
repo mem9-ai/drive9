@@ -347,30 +347,38 @@ func (b *Dat9Backend) CreateCtx(ctx context.Context, path string) (err error) {
 // CreateSymlinkCtx creates a symbolic link whose target is stored as the file
 // payload and whose inode mode carries the POSIX symlink file type bits.
 func (b *Dat9Backend) CreateSymlinkCtx(ctx context.Context, linkPath, target string) (err error) {
+	_, err = b.CreateSymlinkCreatedCtx(ctx, linkPath, target)
+	return err
+}
+
+// CreateSymlinkCreatedCtx creates a symlink and reports the inode id it generated, so a
+// caller never re-reads the name after the create.
+func (b *Dat9Backend) CreateSymlinkCreatedCtx(ctx context.Context, linkPath, target string) (createdIDs []string, err error) {
 	start := time.Now()
 	defer func() { observeBackend(ctx, b.tenantID, b.tidbCloudOrgID, "create_symlink", err, start) }()
 
 	data := []byte(target)
 	if target == "" || strings.ContainsRune(target, 0) || len(data) > MaxSymlinkTargetBytes {
-		return ErrInvalidSymlinkTarget
+		return nil, ErrInvalidSymlinkTarget
 	}
 	linkPath, err = pathutil.Canonicalize(linkPath)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := rejectRootFileNodePath(linkPath); err != nil {
-		return err
+		return nil, err
 	}
 
 	if err := b.ensureUploadSizeAllowed(int64(len(data))); err != nil {
-		return err
+		return nil, err
 	}
 	if err := b.ensureFileSizeQuota(ctx, int64(len(data))); err != nil {
-		return err
+		return nil, err
 	}
 	fileID := b.genID()
 	now := time.Now()
 	checksum := sha256sum(data)
+	var parentIDs []string
 
 	err = b.store.InTx(ctx, func(tx *sql.Tx) error {
 		if err := b.ensureStorageQuota(ctx, tx, linkPath, int64(len(data))); err != nil {
@@ -396,9 +404,11 @@ func (b *Dat9Backend) CreateSymlinkCtx(ctx context.Context, linkPath, target str
 		}); err != nil {
 			return err
 		}
-		if err := b.store.EnsureParentDirsTx(tx, linkPath, b.genID); err != nil {
+		parents, err := b.store.EnsureParentDirsTxCreated(ctx, tx, linkPath, b.genID)
+		if err != nil {
 			return err
 		}
+		parentIDs = parents
 		if err := b.store.InsertNodeTx(tx, &datastore.FileNode{
 			NodeID: b.genID(), Path: linkPath, ParentPath: pathutil.ParentPath(linkPath),
 			Name: pathutil.BaseName(linkPath), FileID: fileID, CreatedAt: now,
@@ -408,14 +418,14 @@ func (b *Dat9Backend) CreateSymlinkCtx(ctx context.Context, linkPath, target str
 		return nil
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	quotaCtx, cancelQuota := postCommitQuotaMutationContext()
 	defer cancelQuota()
 	if err := b.recordCentralFileCreateMutation(quotaCtx, fileID, int64(len(data)), symlinkContentType); err != nil {
-		return postCommitQuotaMutationError("record central quota file create", err)
+		return nil, postCommitQuotaMutationError("record central quota file create", err)
 	}
-	return nil
+	return append(parentIDs, fileID), nil
 }
 
 func (b *Dat9Backend) Mkdir(path string, perm uint32) error {
@@ -423,19 +433,27 @@ func (b *Dat9Backend) Mkdir(path string, perm uint32) error {
 }
 
 func (b *Dat9Backend) MkdirCtx(ctx context.Context, path string, perm uint32) (err error) {
+	_, err = b.MkdirCreatedCtx(ctx, path, perm)
+	return err
+}
+
+// MkdirCreatedCtx creates a directory and reports the inode ids it created (parents first,
+// then the directory). The id is the one the insert generated, so a caller never has to
+// re-read the name after the create and race a concurrent rename.
+func (b *Dat9Backend) MkdirCreatedCtx(ctx context.Context, path string, perm uint32) (createdIDs []string, err error) {
 	start := time.Now()
 	defer func() { observeBackend(ctx, b.tenantID, b.tidbCloudOrgID, "mkdir", err, start) }()
 
 	dirPath, err := pathutil.CanonicalizeDir(path)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if dirPath == "/" {
-		return nil
+		return nil, nil
 	}
-	err = b.store.EnsureParentDirs(ctx, dirPath, b.genID)
+	parentIDs, err := b.store.EnsureParentDirsCreated(ctx, dirPath, b.genID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	now := time.Now()
 	nodeID := b.genID()
@@ -461,9 +479,9 @@ func (b *Dat9Backend) MkdirCtx(ctx context.Context, path string, perm uint32) (e
 			CreatedAt:   now,
 		})
 	}); err != nil {
-		return err
+		return nil, err
 	}
-	return nil
+	return append(parentIDs, nodeID), nil
 }
 
 func (b *Dat9Backend) Chmod(path string, mode uint32) error {
@@ -486,6 +504,14 @@ func (b *Dat9Backend) ChmodCtx(ctx context.Context, path string, mode uint32) (e
 		return err
 	}
 	return b.store.Chmod(ctx, resolvedPath, mode)
+}
+
+// ChmodInodeCtx sets the permission bits of a specific inode. A caller that has verified
+// which inode holds a name uses this so a concurrent rename cannot redirect the change.
+func (b *Dat9Backend) ChmodInodeCtx(ctx context.Context, inodeID string, mode uint32) (err error) {
+	start := time.Now()
+	defer func() { observeBackend(ctx, b.tenantID, b.tidbCloudOrgID, "chmod_inode", err, start) }()
+	return b.store.ChmodInode(ctx, inodeID, mode)
 }
 
 func (b *Dat9Backend) Remove(path string) error {
@@ -720,7 +746,7 @@ func (b *Dat9Backend) WriteCtxIfRevisionWithTagsResult(ctx context.Context, path
 		if timingEnabled {
 			implementationStart = time.Now()
 		}
-		n, err := b.createAndWriteCtx(ctx, path, data, tags, description)
+		n, _, err := b.createAndWriteCtx(ctx, path, data, tags, description)
 		if timingEnabled {
 			implementationDuration = time.Since(implementationStart)
 		}
@@ -756,7 +782,7 @@ func (b *Dat9Backend) WriteCtxIfRevisionWithTagsResult(ctx context.Context, path
 		if timingEnabled {
 			implementationStart = time.Now()
 		}
-		n, err := b.createAndWriteCtx(ctx, path, data, tags, description)
+		n, _, err := b.createAndWriteCtx(ctx, path, data, tags, description)
 		if timingEnabled {
 			implementationDuration = time.Since(implementationStart)
 		}
@@ -844,7 +870,37 @@ func cloneFileTags(tags map[string]string) map[string]string {
 	return out
 }
 
-func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data []byte, tags map[string]string, description string) (written int64, err error) {
+// WriteCtxIfRevisionWithCreatedID writes inline content and reports the inode ids it
+// created (parents first, then the file), nil when the call only overwrote an existing
+// file. A layer commit binds a creation mode to that last id.
+func (b *Dat9Backend) WriteCtxIfRevisionWithCreatedID(ctx context.Context, path string, data []byte, offset int64, flags filesystem.WriteFlag, expectedRevision int64, tags map[string]string, description string) (createdIDs []string, err error) {
+	if _, statErr := b.store.Stat(ctx, path); errors.Is(statErr, datastore.ErrNotFound) {
+		if flags&filesystem.WriteFlagCreate == 0 {
+			return nil, datastore.ErrNotFound
+		}
+		if expectedRevision > 0 {
+			return nil, datastore.ErrRevisionConflict
+		}
+		_, createdIDs, err = b.createAndWriteCtx(ctx, path, data, tags, description)
+		if errors.Is(err, datastore.ErrPathConflict) {
+			return nil, datastore.ErrRevisionConflict
+		}
+		return createdIDs, err
+	} else if statErr != nil {
+		return nil, statErr
+	}
+	_, _, err = b.WriteCtxIfRevisionWithTagsResult(ctx, path, data, offset, flags, expectedRevision, tags, description)
+	return nil, err
+}
+
+// createAndWriteCtx inserts a new file. mode, when non-zero, becomes the inode's
+// permission bits inside the same transaction: a caller that may not chmod applies a
+// creation mode this way instead of chmod-ing the name afterwards, which a concurrent
+// rename could redirect.
+// createAndWriteCtx inserts a new file and reports the inode ids it created (parents first,
+// then the file), so a caller can bind a creation mode to the inodes instead of chmod-ing
+// the name afterwards.
+func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data []byte, tags map[string]string, description string) (written int64, createdIDs []string, err error) {
 	timingEnabled := logger.BenchTimingLogEnabled()
 	start := time.Time{}
 	if timingEnabled {
@@ -895,12 +951,13 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 		logger.InfoBenchTiming(ctx, "backend_write_create_timing", fields...)
 	}()
 	if err := b.ensureUploadSizeAllowed(int64(len(data))); err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	if err := b.ensureFileSizeQuota(ctx, int64(len(data))); err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	fileID := b.genID()
+	var createdParents []string
 	now := time.Now()
 
 	prepareStart := time.Time{}
@@ -922,7 +979,7 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 		contentBlob = append([]byte(nil), data...)
 	} else {
 		if b.s3 == nil {
-			return 0, fmt.Errorf("s3 client not configured")
+			return 0, nil, fmt.Errorf("s3 client not configured")
 		}
 		storageType = datastore.StorageS3
 		storageRef = "blobs/" + fileID
@@ -938,7 +995,7 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 				s3PutDuration = time.Since(s3PutStart)
 			}
 			logger.Error(ctx, "backend_create_and_write_put_object_failed", zap.String("path", path), zap.String("storage_ref", storageRef), zap.Int("bytes", len(data)), zap.Error(err))
-			return 0, fmt.Errorf("put object: %w", err)
+			return 0, nil, fmt.Errorf("put object: %w", err)
 		}
 		if timingEnabled {
 			s3PutDuration = time.Since(s3PutStart)
@@ -989,7 +1046,7 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 		}
 
 		done = backendTimingStep(timingEnabled, &ensureParentDirsDuration)
-		err = b.store.EnsureParentDirsTx(tx, path, b.genID)
+		createdParents, err = b.store.EnsureParentDirsTxCreated(ctx, tx, path, b.genID)
 		done()
 		if err != nil {
 			return err
@@ -1055,7 +1112,7 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 		if storageType == datastore.StorageS3 {
 			b.deleteBlobCtx(ctx, storageRef)
 		}
-		return 0, err
+		return 0, nil, err
 	}
 	if timingEnabled {
 		tenantTxDuration = time.Since(txStart)
@@ -1073,12 +1130,12 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 		if timingEnabled {
 			centralQuotaDuration = time.Since(centralQuotaStart)
 		}
-		return 0, postCommitQuotaMutationError("record central quota file create", err)
+		return 0, nil, postCommitQuotaMutationError("record central quota file create", err)
 	}
 	if timingEnabled {
 		centralQuotaDuration = time.Since(centralQuotaStart)
 	}
-	return int64(len(data)), nil
+	return int64(len(data)), append(append([]string{}, createdParents...), fileID), nil
 }
 
 // ErrExtentLayoutWrite is returned when a whole-object (CLI/HTTP/SDK) write
@@ -1788,69 +1845,102 @@ func (b *Dat9Backend) Rename(oldPath, newPath string) error {
 	return b.RenameCtx(backgroundWithTrace(), oldPath, newPath)
 }
 
-func (b *Dat9Backend) RenameCtx(ctx context.Context, oldPath, newPath string) (err error) {
+func (b *Dat9Backend) RenameCtx(ctx context.Context, oldPath, newPath string) error {
+	_, err := b.RenamePlacedCtx(ctx, oldPath, newPath)
+	return err
+}
+
+// RenamePlacedCtx renames a path and reports the inode ids the rename put under the target:
+// the moved inode, then the directories the target needed. The moved inode is not this
+// call's creation, but it is the inode this caller placed there, which is what a rollback
+// has to be allowed to undo instead of refusing to empty a name the caller filled.
+func (b *Dat9Backend) RenamePlacedCtx(ctx context.Context, oldPath, newPath string) (placedIDs []string, err error) {
 	start := time.Now()
 	defer func() { observeBackend(ctx, b.tenantID, b.tidbCloudOrgID, "rename", err, start) }()
 
 	oldPath, node, err := b.resolveNodePath(ctx, oldPath)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	newPath = canonicalizePathForKind(newPath, node.IsDirectory)
 	if oldPath == "/" || newPath == "/" {
-		return datastore.ErrInvalidRootDentry
+		return nil, datastore.ErrInvalidRootDentry
 	}
 	if oldPath == newPath {
-		return nil
+		return nil, nil
 	}
-	if node.IsDirectory {
-		err = b.store.EnsureParentDirs(ctx, newPath, b.genID)
-		if err != nil {
-			return err
-		}
-		_, err = b.store.RenameDir(ctx, oldPath, newPath)
-		return err
-	}
-	err = b.store.EnsureParentDirs(ctx, newPath, b.genID)
+	parentIDs, err := b.store.EnsureParentDirsCreated(ctx, newPath, b.genID)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	_, err = b.store.RenameFileReplacingTarget(ctx, oldPath, newPath, pathutil.ParentPath(newPath), pathutil.BaseName(newPath))
-	if err == nil {
-		// RenameFileReplacingTarget may enqueue a file_gc task for the replaced
-		// target file's old blob.
-		b.notifyWorkEnqueued(BackendWorkFileGC)
+	placed := append(parentIDs, renamePlacedInodeID(node))
+	if node.IsDirectory {
+		if _, err := b.store.RenameDir(ctx, oldPath, newPath); err != nil {
+			return nil, err
+		}
+		return placed, nil
 	}
-	return err
+	if _, err := b.store.RenameFileReplacingTarget(ctx, oldPath, newPath, pathutil.ParentPath(newPath), pathutil.BaseName(newPath)); err != nil {
+		return nil, err
+	}
+	// RenameFileReplacingTarget may enqueue a file_gc task for the replaced
+	// target file's old blob.
+	b.notifyWorkEnqueued(BackendWorkFileGC)
+	return placed, nil
+}
+
+// renamePlacedInodeID is the identity a stat of the target reports after a rename.
+func renamePlacedInodeID(node *datastore.FileNode) string {
+	if node == nil {
+		return ""
+	}
+	if node.FileID != "" {
+		return node.FileID
+	}
+	if node.InodeID != "" {
+		return node.InodeID
+	}
+	return node.NodeID
 }
 
 // RenameFileNoReplaceCtx renames a file and fails with datastore.ErrPathConflict
 // if the target path already exists.
-func (b *Dat9Backend) RenameFileNoReplaceCtx(ctx context.Context, oldPath, newPath string) (err error) {
+func (b *Dat9Backend) RenameFileNoReplaceCtx(ctx context.Context, oldPath, newPath string) error {
+	_, err := b.RenameFileNoReplacePlacedCtx(ctx, oldPath, newPath)
+	return err
+}
+
+// RenameFileNoReplacePlacedCtx is RenameFileNoReplaceCtx plus the inode ids the rename put
+// under the target, for the same reason RenamePlacedCtx reports them.
+func (b *Dat9Backend) RenameFileNoReplacePlacedCtx(ctx context.Context, oldPath, newPath string) (placedIDs []string, err error) {
 	start := time.Now()
 	defer func() { observeBackend(ctx, b.tenantID, b.tidbCloudOrgID, "rename_file_no_replace", err, start) }()
 
 	oldPath, node, err := b.resolveNodePath(ctx, oldPath)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if node.IsDirectory {
-		return fmt.Errorf("source is a directory: %s", oldPath)
+		return nil, fmt.Errorf("source is a directory: %s", oldPath)
 	}
 	newPath, err = pathutil.Canonicalize(newPath)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if oldPath == "/" || newPath == "/" {
-		return datastore.ErrInvalidRootDentry
+		return nil, datastore.ErrInvalidRootDentry
 	}
 	if oldPath == newPath {
-		return nil
+		return nil, nil
 	}
-	if err := b.store.EnsureParentDirs(ctx, newPath, b.genID); err != nil {
-		return err
+	parentIDs, err := b.store.EnsureParentDirsCreated(ctx, newPath, b.genID)
+	if err != nil {
+		return nil, err
 	}
-	return b.store.RenameFileNoReplace(ctx, oldPath, newPath, pathutil.ParentPath(newPath), pathutil.BaseName(newPath))
+	if err := b.store.RenameFileNoReplace(ctx, oldPath, newPath, pathutil.ParentPath(newPath), pathutil.BaseName(newPath)); err != nil {
+		return nil, err
+	}
+	return append(parentIDs, renamePlacedInodeID(node)), nil
 }
 
 func (b *Dat9Backend) Open(path string) (io.ReadCloser, error) {

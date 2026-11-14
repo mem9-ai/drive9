@@ -241,7 +241,7 @@ func fillBranchEndpoint(out *tenant.ClusterInfo, branch *starterBranchInfo) erro
 	}
 	out.Host = branch.Endpoints.Public.Host
 	out.Port = branch.Endpoints.Public.Port
-	out.Username = branch.UserPrefix + ".root"
+	out.Username = tenant.RootUsernameFor(branch.UserPrefix)
 	return nil
 }
 

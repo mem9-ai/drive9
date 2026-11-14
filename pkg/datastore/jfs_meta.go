@@ -162,9 +162,58 @@ func (q *ExtentQuotaLimit) admit(oldLen, newLen uint64) int {
 	return 0
 }
 
+// extentMetaOpNames is the fixed set of ops the meta bridge dispatches. It exists so the
+// op — which arrives in a request header — can be bounded to a known metric label
+// instead of minting a new Prometheus series per request.
+var extentMetaOpNames = map[string]struct{}{
+	"claim_compact":       {},
+	"clean_stale_session": {},
+	"compact":             {},
+	"complete_compact":    {},
+	"delete_slice":        {},
+	"delete_sustained":    {},
+	"find_stale_sessions": {},
+	"flock":               {},
+	"get_session":         {},
+	"getattr":             {},
+	"get_counter":         {},
+	"getlk":               {},
+	"incr_counter":        {},
+	"init":                {},
+	"load":                {},
+	"lookup":              {},
+	"mknod":               {},
+	"new_session":         {},
+	"open_ref":            {},
+	"read":                {},
+	"readdir":             {},
+	"readlink":            {},
+	"refresh_session":     {},
+	"rename":              {},
+	"requeue_compact":     {},
+	"rmdir":               {},
+	"set_if_small":        {},
+	"setattr":             {},
+	"setlk":               {},
+	"truncate":            {},
+	"unlink":              {},
+	"write":               {},
+}
+
+// extentMetaOpMetricLabel bounds a caller-supplied extent meta op before it becomes a
+// metric label. An unknown op still reaches the dispatch (and answers ENOSYS) as before;
+// it only loses the ability to create a series of its own.
+func extentMetaOpMetricLabel(op string) string {
+	op = strings.TrimSpace(op)
+	if _, ok := extentMetaOpNames[op]; ok {
+		return op
+	}
+	return "other"
+}
+
 func (s *Store) RunExtentMetaOp(ctx context.Context, op string, raw json.RawMessage, quota *ExtentQuotaLimit) (json.RawMessage, int, error) {
 	opStart := time.Now()
-	defer func() { observeStoreOp(ctx, "extent_"+op, opStart, nil) }()
+	defer func() { observeStoreOp(ctx, "extent_"+extentMetaOpMetricLabel(op), opStart, nil) }()
 	var (
 		out   any
 		errno int

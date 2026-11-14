@@ -3129,6 +3129,33 @@ func TestSystemRootUserFor(t *testing.T) {
 	}
 }
 
+// Building a name and parsing one back have to agree, or a stored DSN ends up naming an
+// account nothing ever provisions.
+func TestSystemUsernameForCurrentRoundTrips(t *testing.T) {
+	for _, prefix := range []string{"22ipQWBXXq2wN2S", "prefix", "tiabc123"} {
+		root := systemRootUsernameFor(prefix)
+		restricted, needsSetup, err := systemUsernameForCurrent(root)
+		if err != nil || !needsSetup || restricted != prefix+RestrictedSystemUserNameSuffix {
+			t.Fatalf("systemUsernameForCurrent(%q) = %q needsSetup=%t err=%v", root, restricted, needsSetup, err)
+		}
+		// The restricted name resolves to itself and needs no setup.
+		same, needsSetup, err := systemUsernameForCurrent(restricted)
+		if err != nil || needsSetup || same != restricted {
+			t.Fatalf("systemUsernameForCurrent(%q) = %q needsSetup=%t err=%v", restricted, same, needsSetup, err)
+		}
+		// A root name and its restricted sibling agree on the instance prefix.
+		back, ok := systemRootUserFor(restricted)
+		if !ok || back != root {
+			t.Fatalf("systemRootUserFor(%q) = %q ok=%t, want %q", restricted, back, ok, root)
+		}
+	}
+	for _, in := range []string{"", "root", ".root", "u1.admin", "u1.tdc_fs_sys.x"} {
+		if _, _, err := systemUsernameForCurrent(in); err == nil {
+			t.Fatalf("systemUsernameForCurrent(%q) accepted a non-instance account", in)
+		}
+	}
+}
+
 // Retiring the legacy privilege is a no-op for a DSN that already names the root
 // principal (nothing to remediate) and refuses a DSN without a password instead of
 // dialling with an empty one.
