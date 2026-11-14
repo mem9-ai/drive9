@@ -13,7 +13,16 @@ import (
 	"net/http"
 	"strconv"
 	"sync"
+
+	"golang.org/x/sync/errgroup"
 )
+
+// extentPatchPutConcurrency bounds the parallel presigned block PUTs one
+// PATCH commit issues (the completion verifies every part, so the round
+// trips are independent). Eight parallel 4 MiB PUTs keep a dirty batch
+// from being paced by a single stream's latency without stampeding the
+// object store.
+const extentPatchPutConcurrency = 8
 
 // Extent content layout v2. The server owns the block layout (64 MiB chunks
 // of content-addressed 4 MiB blocks) and all maintenance; the client speaks
@@ -440,16 +449,19 @@ func (c *Client) CommitExtentPatchExpectedResource(ctx context.Context, path str
 		return err
 	}
 	parts := make([]completePart, 0, len(blocks))
+	type putJob struct {
+		url     string
+		headers map[string]string
+		data    []byte
+	}
+	var puts []putJob
 	for i, b := range blocks {
 		wb := extentPlanBlockFor(plan, dirty[i])
 		if wb == nil {
 			return fmt.Errorf("extent patch plan lacks block %d/%d", dirty[i].Chunk, dirty[i].Off)
 		}
 		if !wb.Exists && wb.URL != "" {
-			if err := c.putExtentBlock(ctx, wb.URL, wb.Headers, b.Data); err != nil {
-				c.abortUploadV2BestEffort(ctx, plan.UploadID)
-				return err
-			}
+			puts = append(puts, putJob{url: wb.URL, headers: wb.Headers, data: b.Data})
 		}
 		parts = append(parts, completePart{
 			Number: i + 1,
@@ -458,6 +470,24 @@ func (c *Client) CommitExtentPatchExpectedResource(ctx context.Context, path str
 			Off:    b.Off,
 			Size:   int64(len(b.Data)),
 		})
+	}
+	// The presigned PUTs address distinct content-addressed objects and the
+	// completion verifies each part, so they are independent round trips:
+	// run them at bounded concurrency instead of one-by-one, so a dirty
+	// batch is not paced by a single block's upload latency.
+	if len(puts) > 0 {
+		g, gctx := errgroup.WithContext(ctx)
+		g.SetLimit(extentPatchPutConcurrency)
+		for _, job := range puts {
+			job := job
+			g.Go(func() error {
+				return c.putExtentBlock(gctx, job.url, job.headers, job.data)
+			})
+		}
+		if err := g.Wait(); err != nil {
+			c.abortUploadV2BestEffort(ctx, plan.UploadID)
+			return err
+		}
 	}
 	if err := c.completeUploadV2WithOptions(ctx, plan.UploadID, parts, nil, ""); err != nil {
 		return err

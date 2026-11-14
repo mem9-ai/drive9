@@ -42,10 +42,28 @@ const maxStageBytes = 256 << 20
 // instead of unbounded growth. Overridable for bench work.
 var maxPinnedCommitBytes int64 = 1 << 30
 
+// commitBatchBytes is the pending-byte volume Bridge.Write lets accumulate
+// for a file before it drives a commit. The engine hands over one 4 MiB
+// slice per call; committing each one serialized a full publish round trip
+// (stat → PATCH plan → PUT → complete) per 4 MiB, which paced large-file
+// drains to a single block's latency. Accumulating to this threshold
+// publishes the same slices in fewer, multi-block PATCH commits; the
+// pinned budget above still backpressures a stalled commit pipeline, and
+// flush/close publish whatever remains regardless (close-to-open is
+// unchanged — mid-write publication was always best-effort). A remembered
+// commit error skips the batching so every write keeps retrying recovery.
+// Zero restores per-slice commits. Overridable for bench work.
+var commitBatchBytes int64 = 64 << 20
+
 func init() {
 	if v := os.Getenv("DRIVE9_EXTENT_PINNED_BUDGET_BYTES"); v != "" {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
 			maxPinnedCommitBytes = n
+		}
+	}
+	if v := os.Getenv("DRIVE9_EXTENT_COMMIT_BATCH_BYTES"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n >= 0 {
+			commitBatchBytes = n
 		}
 	}
 }

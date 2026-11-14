@@ -845,7 +845,23 @@ func (b *Bridge) Write(ctx meta.Context, ino meta.Ino, indx uint32, off uint32, 
 	if end > b.sizes[ino] {
 		b.sizes[ino] = end
 	}
+	// Batch publication: below the batch threshold the slices stay pending
+	// (pinned, backpressured by the budget above) and publish with a later
+	// batch or at flush/close — mid-write publication is best-effort, so
+	// close-to-open semantics are unchanged. A remembered commit error
+	// bypasses batching: every write keeps driving recovery, as before.
+	var pendingBytes int64
+	for _, w := range b.pending[ino] {
+		pendingBytes += w.size
+	}
+	batchHold := commitBatchBytes > 0 && pendingBytes < commitBatchBytes
+	if _, failed := b.commitErr[ino]; failed {
+		batchHold = false
+	}
 	b.mu.Unlock()
+	if batchHold {
+		return 0
+	}
 
 	// The commit lifecycle (snapshot above included) is serialized per
 	// file: the snapshot is re-taken under the lock so a concurrent
