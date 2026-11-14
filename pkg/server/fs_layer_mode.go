@@ -276,14 +276,18 @@ func (st fsLayerPlanState) noteEntry(ctx context.Context, b *backendpkg.Dat9Back
 	if err != nil {
 		return err
 	}
-	if node.created && !node.createdModeSet {
+	// A name the plan empties and then fills again is a creation for the entries after it,
+	// exactly like a name that was empty all along.
+	if (node.created || node.vacated) && !node.createdModeSet {
 		st[path] = fsLayerPlanNode{
 			created:        true,
 			createdMode:    fsLayerEntryCreatedMode(entry),
 			createdModeSet: true,
 		}
 	}
-	for parent := pathutil.ParentPath(path); parent != "" && parent != "/"; parent = pathutil.ParentPath(parent) {
+	// Parents are recorded under the same trimmed form resolve reads, or the record could
+	// never be found and a later entry on an implicit parent would read as a creation.
+	for parent := strings.TrimSuffix(pathutil.ParentPath(path), "/"); parent != ""; parent = strings.TrimSuffix(pathutil.ParentPath(parent), "/") {
 		if _, ok := st[parent]; ok {
 			continue
 		}

@@ -1016,11 +1016,12 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 	rollbackCtx, rollbackCancel := context.WithTimeout(context.WithoutCancel(r.Context()), fsLayerRollbackTimeout)
 	defer rollbackCancel()
 	touchedPaths := make(map[string]struct{})
-	// createdInodes are the inodes this commit's applies created. A rollback restores paths
-	// that did not exist before the commit, so it may force away whatever an interrupted
-	// plan left under such a name — but only while that name is still the inode this commit
-	// created. A concurrent writer's inode is a different id and is left alone.
-	createdInodes := make(map[string]struct{})
+	// appliedInodes are the inodes this commit's applies placed: the ones they created and
+	// the ones a rename moved. A rollback restores paths that did not exist before the
+	// commit, so it may force away whatever an interrupted plan left under such a name — but
+	// only while that name is still one of these. A concurrent writer's inode is a different
+	// id and is left alone.
+	appliedInodes := make(map[string]struct{})
 	// failCommit rolls back to the given snapshot boundary and records the state the
 	// layer API expects after a refused or failed commit. One place, so the three call
 	// sites cannot drift on the entries[:i] vs [:i+1] boundary.
@@ -1030,7 +1031,7 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 			if statErr != nil || nf == nil {
 				return false
 			}
-			_, ok := createdInodes[fsLayerNodeInodeID(nf)]
+			_, ok := appliedInodes[fsLayerNodeInodeID(nf)]
 			return ok
 		})
 		_ = store.SetFSLayerStateIf(rollbackCtx, layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
@@ -1050,14 +1051,17 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 		entry := &entries[i]
 		modeMayBeSuperseded := fsLayerEntryModeSuperseded(entries, i)
 		createdIDs, applyErr := applyFSLayerEntry(r.Context(), b, entry, touchedPaths, fsLayerApplyOptions{modeMayBeSuperseded: modeMayBeSuperseded, canChmod: canChmod})
+		// Record the ids before the error check: an entry that created inodes and then failed
+		// (a creation whose mode application was refused) still left them behind, and the
+		// rollback has to be allowed to remove them.
+		for _, id := range createdIDs {
+			if id != "" {
+				appliedInodes[id] = struct{}{}
+			}
+		}
 		if applyErr != nil {
 			failCommit(filterFSLayerSnapshotsForEntries(snapshots, entries[:i]), "fs_layer_commit_apply_failed", entry.Path, applyErr)
 			return
-		}
-		for _, id := range createdIDs {
-			if id != "" {
-				createdInodes[id] = struct{}{}
-			}
 		}
 		markFSLayerEntryTouched(touchedPaths, entry)
 	}
@@ -2309,9 +2313,10 @@ type fsLayerApplyOptions struct {
 	canChmod            bool
 }
 
-// applyFSLayerEntry applies one plan entry and reports the inode ids the apply created
-// (parents first, then the created name; empty when the entry changed an existing path), so
-// the caller can bound a rollback to this commit's own work without re-reading the name.
+// applyFSLayerEntry applies one plan entry and reports the inode ids the apply put under the
+// entry's path (parents first, then the created or moved inode; empty when the entry only
+// changed an existing path in place), so the caller can bound a rollback to this commit's own
+// work without re-reading the name.
 func applyFSLayerEntry(ctx context.Context, b *backendpkg.Dat9Backend, entry *datastore.FSLayerEntry, touched map[string]struct{}, opts fsLayerApplyOptions) (createdIDs []string, err error) {
 	if err := ensureFSLayerEntryBaseStillMatches(ctx, b, entry, touched); err != nil {
 		return nil, err
@@ -2442,10 +2447,12 @@ func applyFSLayerEntry(ctx context.Context, b *backendpkg.Dat9Backend, entry *da
 		if target == "" {
 			return nil, fmt.Errorf("rename target is required")
 		}
+		// A rename places an inode this commit did not create, but it is the inode the
+		// commit put under the target, so a rollback has to be able to empty that name.
 		if entry.Kind == datastore.FSLayerEntryKindDir || strings.HasSuffix(entry.Path, "/") {
-			return nil, b.RenameCtx(ctx, entry.Path, target)
+			return b.RenamePlacedCtx(ctx, entry.Path, target)
 		}
-		return nil, b.RenameFileNoReplaceCtx(ctx, entry.Path, target)
+		return b.RenameFileNoReplacePlacedCtx(ctx, entry.Path, target)
 	default:
 		return nil, fmt.Errorf("unsupported fs layer op %q", entry.Op)
 	}

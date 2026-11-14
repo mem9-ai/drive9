@@ -112,6 +112,25 @@ func (b *Dat9Backend) WriteStoredObjectCreatedCtxIfRevision(ctx context.Context,
 	if err := b.ensureFileSizeQuota(ctx, entry.SizeBytes); err != nil {
 		return 0, nil, err
 	}
+	// Decide create-or-overwrite before the transaction, like the inline twin:
+	// ensureFileCountQuotaServer below admits a *new* file, so running it ahead of the
+	// statement that discovers the path is taken would refuse an overwrite on a tenant at
+	// its file-count cap. The creation signal stays the insert itself — a path that appears
+	// between this stat and the insert fails that insert and is reported as a conflict, not
+	// as this commit's own creation.
+	if _, statErr := b.store.Stat(ctx, canonical); !errorsIsNotFound(statErr) {
+		if statErr != nil {
+			return 0, nil, statErr
+		}
+		rev, err := b.WriteStoredObjectCtxIfRevision(ctx, canonical, entry)
+		return rev, nil, err
+	}
+	// The path is free, but a base revision says it was not when the plan was staged: the
+	// file was removed since, so this entry would resurrect it. The inline twin refuses the
+	// same shape for the same reason.
+	if entry.BaseRevision > 0 {
+		return 0, nil, datastore.ErrRevisionConflict
+	}
 	storageEncryptionMode := entry.StorageEncryptionMode
 	if storageEncryptionMode == "" {
 		storageEncryptionMode = datastore.StorageEncryptionNone
@@ -157,17 +176,12 @@ func (b *Dat9Backend) WriteStoredObjectCreatedCtxIfRevision(ctx context.Context,
 		})
 	})
 	if err != nil {
-		if !errors.Is(err, datastore.ErrPathConflict) {
-			return 0, nil, err
+		if errors.Is(err, datastore.ErrPathConflict) {
+			// The path appeared after the stat. It is not this commit's creation, so it is
+			// not reported as one — and it is not silently overwritten either.
+			return 0, nil, datastore.ErrRevisionConflict
 		}
-		// The path is not free after all: a second upsert of the same path in one plan, or a
-		// concurrent write that landed between the insert and now. That apply is an
-		// overwrite of an inode this commit did not create, so it reports no created id and
-		// the caller's mode rules treat it like any other existing inode. The insert is what
-		// makes the two cases distinguishable: probing the name first would let a concurrent
-		// creation be mistaken for this commit's own.
-		rev, upsertErr := b.WriteStoredObjectCtxIfRevision(ctx, canonical, entry)
-		return rev, nil, upsertErr
+		return 0, nil, err
 	}
 	// Same post-commit bookkeeping as every other creation path: skipping it would let
 	// object-backed layer files escape central quota accounting.

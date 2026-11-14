@@ -378,6 +378,7 @@ func (b *Dat9Backend) CreateSymlinkCreatedCtx(ctx context.Context, linkPath, tar
 	fileID := b.genID()
 	now := time.Now()
 	checksum := sha256sum(data)
+	var parentIDs []string
 
 	err = b.store.InTx(ctx, func(tx *sql.Tx) error {
 		if err := b.ensureStorageQuota(ctx, tx, linkPath, int64(len(data))); err != nil {
@@ -403,9 +404,11 @@ func (b *Dat9Backend) CreateSymlinkCreatedCtx(ctx context.Context, linkPath, tar
 		}); err != nil {
 			return err
 		}
-		if err := b.store.EnsureParentDirsTx(tx, linkPath, b.genID); err != nil {
+		parents, err := b.store.EnsureParentDirsTxCreated(ctx, tx, linkPath, b.genID)
+		if err != nil {
 			return err
 		}
+		parentIDs = parents
 		if err := b.store.InsertNodeTx(tx, &datastore.FileNode{
 			NodeID: b.genID(), Path: linkPath, ParentPath: pathutil.ParentPath(linkPath),
 			Name: pathutil.BaseName(linkPath), FileID: fileID, CreatedAt: now,
@@ -422,7 +425,7 @@ func (b *Dat9Backend) CreateSymlinkCreatedCtx(ctx context.Context, linkPath, tar
 	if err := b.recordCentralFileCreateMutation(quotaCtx, fileID, int64(len(data)), symlinkContentType); err != nil {
 		return nil, postCommitQuotaMutationError("record central quota file create", err)
 	}
-	return []string{fileID}, nil
+	return append(parentIDs, fileID), nil
 }
 
 func (b *Dat9Backend) Mkdir(path string, perm uint32) error {
@@ -448,7 +451,8 @@ func (b *Dat9Backend) MkdirCreatedCtx(ctx context.Context, path string, perm uin
 	if dirPath == "/" {
 		return nil, nil
 	}
-	if err := b.store.EnsureParentDirs(ctx, dirPath, b.genID); err != nil {
+	parentIDs, err := b.store.EnsureParentDirsCreated(ctx, dirPath, b.genID)
+	if err != nil {
 		return nil, err
 	}
 	now := time.Now()
@@ -477,7 +481,7 @@ func (b *Dat9Backend) MkdirCreatedCtx(ctx context.Context, path string, perm uin
 	}); err != nil {
 		return nil, err
 	}
-	return []string{nodeID}, nil
+	return append(parentIDs, nodeID), nil
 }
 
 func (b *Dat9Backend) Chmod(path string, mode uint32) error {
@@ -1841,69 +1845,102 @@ func (b *Dat9Backend) Rename(oldPath, newPath string) error {
 	return b.RenameCtx(backgroundWithTrace(), oldPath, newPath)
 }
 
-func (b *Dat9Backend) RenameCtx(ctx context.Context, oldPath, newPath string) (err error) {
+func (b *Dat9Backend) RenameCtx(ctx context.Context, oldPath, newPath string) error {
+	_, err := b.RenamePlacedCtx(ctx, oldPath, newPath)
+	return err
+}
+
+// RenamePlacedCtx renames a path and reports the inode ids the rename put under the target:
+// the moved inode, then the directories the target needed. The moved inode is not this
+// call's creation, but it is the inode this caller placed there, which is what a rollback
+// has to be allowed to undo instead of refusing to empty a name the caller filled.
+func (b *Dat9Backend) RenamePlacedCtx(ctx context.Context, oldPath, newPath string) (placedIDs []string, err error) {
 	start := time.Now()
 	defer func() { observeBackend(ctx, b.tenantID, b.tidbCloudOrgID, "rename", err, start) }()
 
 	oldPath, node, err := b.resolveNodePath(ctx, oldPath)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	newPath = canonicalizePathForKind(newPath, node.IsDirectory)
 	if oldPath == "/" || newPath == "/" {
-		return datastore.ErrInvalidRootDentry
+		return nil, datastore.ErrInvalidRootDentry
 	}
 	if oldPath == newPath {
-		return nil
+		return nil, nil
 	}
-	if node.IsDirectory {
-		err = b.store.EnsureParentDirs(ctx, newPath, b.genID)
-		if err != nil {
-			return err
-		}
-		_, err = b.store.RenameDir(ctx, oldPath, newPath)
-		return err
-	}
-	err = b.store.EnsureParentDirs(ctx, newPath, b.genID)
+	parentIDs, err := b.store.EnsureParentDirsCreated(ctx, newPath, b.genID)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	_, err = b.store.RenameFileReplacingTarget(ctx, oldPath, newPath, pathutil.ParentPath(newPath), pathutil.BaseName(newPath))
-	if err == nil {
-		// RenameFileReplacingTarget may enqueue a file_gc task for the replaced
-		// target file's old blob.
-		b.notifyWorkEnqueued(BackendWorkFileGC)
+	placed := append(parentIDs, renamePlacedInodeID(node))
+	if node.IsDirectory {
+		if _, err := b.store.RenameDir(ctx, oldPath, newPath); err != nil {
+			return nil, err
+		}
+		return placed, nil
 	}
-	return err
+	if _, err := b.store.RenameFileReplacingTarget(ctx, oldPath, newPath, pathutil.ParentPath(newPath), pathutil.BaseName(newPath)); err != nil {
+		return nil, err
+	}
+	// RenameFileReplacingTarget may enqueue a file_gc task for the replaced
+	// target file's old blob.
+	b.notifyWorkEnqueued(BackendWorkFileGC)
+	return placed, nil
+}
+
+// renamePlacedInodeID is the identity a stat of the target reports after a rename.
+func renamePlacedInodeID(node *datastore.FileNode) string {
+	if node == nil {
+		return ""
+	}
+	if node.FileID != "" {
+		return node.FileID
+	}
+	if node.InodeID != "" {
+		return node.InodeID
+	}
+	return node.NodeID
 }
 
 // RenameFileNoReplaceCtx renames a file and fails with datastore.ErrPathConflict
 // if the target path already exists.
-func (b *Dat9Backend) RenameFileNoReplaceCtx(ctx context.Context, oldPath, newPath string) (err error) {
+func (b *Dat9Backend) RenameFileNoReplaceCtx(ctx context.Context, oldPath, newPath string) error {
+	_, err := b.RenameFileNoReplacePlacedCtx(ctx, oldPath, newPath)
+	return err
+}
+
+// RenameFileNoReplacePlacedCtx is RenameFileNoReplaceCtx plus the inode ids the rename put
+// under the target, for the same reason RenamePlacedCtx reports them.
+func (b *Dat9Backend) RenameFileNoReplacePlacedCtx(ctx context.Context, oldPath, newPath string) (placedIDs []string, err error) {
 	start := time.Now()
 	defer func() { observeBackend(ctx, b.tenantID, b.tidbCloudOrgID, "rename_file_no_replace", err, start) }()
 
 	oldPath, node, err := b.resolveNodePath(ctx, oldPath)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if node.IsDirectory {
-		return fmt.Errorf("source is a directory: %s", oldPath)
+		return nil, fmt.Errorf("source is a directory: %s", oldPath)
 	}
 	newPath, err = pathutil.Canonicalize(newPath)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if oldPath == "/" || newPath == "/" {
-		return datastore.ErrInvalidRootDentry
+		return nil, datastore.ErrInvalidRootDentry
 	}
 	if oldPath == newPath {
-		return nil
+		return nil, nil
 	}
-	if err := b.store.EnsureParentDirs(ctx, newPath, b.genID); err != nil {
-		return err
+	parentIDs, err := b.store.EnsureParentDirsCreated(ctx, newPath, b.genID)
+	if err != nil {
+		return nil, err
 	}
-	return b.store.RenameFileNoReplace(ctx, oldPath, newPath, pathutil.ParentPath(newPath), pathutil.BaseName(newPath))
+	if err := b.store.RenameFileNoReplace(ctx, oldPath, newPath, pathutil.ParentPath(newPath), pathutil.BaseName(newPath)); err != nil {
+		return nil, err
+	}
+	return append(parentIDs, renamePlacedInodeID(node)), nil
 }
 
 func (b *Dat9Backend) Open(path string) (io.ReadCloser, error) {

@@ -1059,8 +1059,15 @@ func (s *Store) LinkFileNodeTx(ctx context.Context, tx *sql.Tx, srcPath, dstPath
 }
 
 func (s *Store) EnsureParentDirs(ctx context.Context, path string, genID func() string) error {
+	_, err := s.EnsureParentDirsCreated(ctx, path, genID)
+	return err
+}
+
+// EnsureParentDirsCreated is EnsureParentDirs plus the inode ids of the parent directories
+// it created, so a caller that must undo or bound its own work does not have to re-read the
+// namespace for them.
+func (s *Store) EnsureParentDirsCreated(ctx context.Context, path string, genID func() string) (created []string, err error) {
 	start := time.Now()
-	var err error
 	defer observeStoreOp(ctx, "ensure_parent_dirs", start, &err)
 
 	// Run inside a transaction so the sequence of per-parent inserts is
@@ -1072,27 +1079,29 @@ func (s *Store) EnsureParentDirs(ctx context.Context, path string, genID func() 
 		var tx *sql.Tx
 		tx, err = s.db.BeginTx(ctx, nil)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		_, err = s.ensureParentDirsWithExecer(ctx, tx, path, genID)
+		created, err = s.ensureParentDirsWithExecer(ctx, tx, path, genID)
 		if err != nil {
 			_ = tx.Rollback()
+			created = nil
 			if isDeadlock(err) && attempt < maxAttempts-1 {
 				continue
 			}
-			return err
+			return nil, err
 		}
 		err = tx.Commit()
 		if err != nil {
 			_ = tx.Rollback()
+			created = nil
 			if isDeadlock(err) && attempt < maxAttempts-1 {
 				continue
 			}
-			return err
+			return nil, err
 		}
-		return nil
+		return created, nil
 	}
-	return err
+	return nil, err
 }
 
 // --- files operations ---

@@ -280,15 +280,6 @@ func TestFSLayerModeChangeRespectsPlanOrder(t *testing.T) {
 	if decide(rename("/x/f.txt", "/x/g.txt"), upsert("/x/g.txt", 0o600)) {
 		t.Fatal("a matching mode was reported as a change")
 	}
-	// A chmod entry is refused for a caller that may not chmod whichever inode it targets:
-	// the apply step never applies one, so staging a plan around it would only produce a
-	// commit that cannot succeed. The scan therefore reports it, live target or not.
-	if !decide(rename("/x/f.txt", "/x/g.txt"), datastore.FSLayerEntry{Path: "/x/g.txt", Op: datastore.FSLayerEntryOpChmod, Mode: 0o600}) {
-		t.Fatal("a chmod entry on a live inode was not reported as a change")
-	}
-	if !decide(rename("/x/f.txt", "/x/g.txt"), upsert("/x/f.txt", 0o644), datastore.FSLayerEntry{Path: "/x/f.txt", Op: datastore.FSLayerEntryOpChmod, Mode: 0o700}) {
-		t.Fatal("a chmod entry on a plan-created path was treated as applicable")
-	}
 }
 
 // The entries route decides with the same plan semantics as commit, so a plan that
@@ -368,12 +359,11 @@ func TestFSLayerSelfRenameCannotMaskModeChange(t *testing.T) {
 	if got := post(owner, `{"path":"/zone/f.txt","op":"rename","kind":"file","content_text":"/zone/f.txt"}`); got != http.StatusOK {
 		t.Fatalf("owner self-rename status=%d, want 200", got)
 	}
-	// The upsert names a different mode for a path the self-rename left untouched.
+	// The upsert names a different mode for a path the self-rename left untouched, which is
+	// the masking this test is about (a chmod entry is refused by policy, see
+	// TestFSLayerScopedChmodEntryOnPlanCreatedPathRefused, so it cannot pin this).
 	if got := post(scoped, `{"path":"/zone/f.txt","op":"upsert","kind":"file","mode":511,"content_text":"new"}`); got != http.StatusForbidden {
 		t.Fatalf("scoped upsert after a self-rename status=%d, want 403", got)
-	}
-	if got := post(scoped, `{"path":"/zone/f.txt","op":"chmod","kind":"file","mode":511}`); got != http.StatusForbidden {
-		t.Fatalf("scoped chmod after a self-rename status=%d, want 403", got)
 	}
 	nf, err := s.fallback.StatNodeCtx(ctx, "/zone/f.txt")
 	if err != nil {
@@ -658,6 +648,26 @@ func TestFSLayerScopedChmodEntryOnPlanCreatedPathRefused(t *testing.T) {
 	if code := stage(`{"path":"/zone/fresh.txt","op":"chmod","kind":"file","mode":448}`); code != http.StatusForbidden {
 		t.Fatalf("staging a chmod entry status=%d, want 403", code)
 	}
+	// The commit scan decides the same way for a plan that predates the caller's scope: a
+	// chmod entry can never apply, on a live inode, on one the plan creates, or on a missing
+	// path.
+	ctx2 := context.Background()
+	for _, plan := range [][]datastore.FSLayerEntry{
+		{{Path: "/zone/live.txt", Op: datastore.FSLayerEntryOpChmod, Kind: datastore.FSLayerEntryKindFile, Mode: 0o600}},
+		{
+			{Path: "/zone/created.txt", Op: datastore.FSLayerEntryOpUpsert, Kind: datastore.FSLayerEntryKindFile, Mode: 0o644},
+			{Path: "/zone/created.txt", Op: datastore.FSLayerEntryOpChmod, Kind: datastore.FSLayerEntryKindFile, Mode: 0o600},
+		},
+		{{Path: "/zone/absent.txt", Op: datastore.FSLayerEntryOpChmod, Kind: datastore.FSLayerEntryKindFile, Mode: 0o600}},
+	} {
+		changes, err := fsLayerPlanChangesExistingMode(ctx2, s.fallback, plan)
+		if err != nil {
+			t.Fatalf("scan %v: %v", plan, err)
+		}
+		if !changes {
+			t.Fatalf("the scan let a scoped chmod plan through: %v", plan)
+		}
+	}
 }
 
 // The apply-time backstop refuses a mode application on an inode that already carries other
@@ -878,10 +888,13 @@ func TestFSLayerPlanScanSeesPlanCreations(t *testing.T) {
 			want: false,
 		},
 		{
+			// The recording is keyed like resolve reads, so an implicit parent is a real
+			// record: by the time the second entry applies, that directory exists with the
+			// default bits.
 			name: "restyle of an implicitly created parent",
 			entries: []datastore.FSLayerEntry{
 				{Path: "/zone/p2/f.txt", Op: datastore.FSLayerEntryOpUpsert, Kind: datastore.FSLayerEntryKindFile, Mode: 0o644},
-				{Path: "/zone/p2/", Op: datastore.FSLayerEntryOpChmod, Kind: datastore.FSLayerEntryKindDir, Mode: 0o700},
+				{Path: "/zone/p2/", Op: datastore.FSLayerEntryOpUpsert, Kind: datastore.FSLayerEntryKindDir, Mode: 0o700},
 			},
 			want: true,
 		},
@@ -892,6 +905,28 @@ func TestFSLayerPlanScanSeesPlanCreations(t *testing.T) {
 				{Path: "/zone/live.txt", Op: datastore.FSLayerEntryOpUpsert, Kind: datastore.FSLayerEntryKindFile, Mode: 0o600},
 			},
 			want: false,
+		},
+		{
+			// A name the plan empties and refills is a creation for the entries after it,
+			// exactly like a name that was empty all along.
+			name: "restyle of a name recreated after a whiteout",
+			entries: []datastore.FSLayerEntry{
+				{Path: "/zone/live.txt", Op: datastore.FSLayerEntryOpWhiteout, Kind: datastore.FSLayerEntryKindFile},
+				{Path: "/zone/live.txt", Op: datastore.FSLayerEntryOpUpsert, Kind: datastore.FSLayerEntryKindFile, Mode: 0o644},
+				{Path: "/zone/live.txt", Op: datastore.FSLayerEntryOpUpsert, Kind: datastore.FSLayerEntryKindFile, Mode: 0o600},
+			},
+			want: true,
+		},
+		{
+			// The creation identity follows the name through a rename of the recreated path.
+			name: "restyle of a recreated and renamed path",
+			entries: []datastore.FSLayerEntry{
+				{Path: "/zone/live.txt", Op: datastore.FSLayerEntryOpWhiteout, Kind: datastore.FSLayerEntryKindFile},
+				{Path: "/zone/live.txt", Op: datastore.FSLayerEntryOpUpsert, Kind: datastore.FSLayerEntryKindFile, Mode: 0o644},
+				{Path: "/zone/live.txt", Op: datastore.FSLayerEntryOpRename, Kind: datastore.FSLayerEntryKindFile, ContentText: "/zone/moved.txt"},
+				{Path: "/zone/moved.txt", Op: datastore.FSLayerEntryOpUpsert, Kind: datastore.FSLayerEntryKindFile, Mode: 0o600},
+			},
+			want: true,
 		},
 		{
 			name: "mkdir then a differing mode",
@@ -1003,5 +1038,110 @@ func TestRemoveFSLayerBasePathBoundsForceRemove(t *testing.T) {
 	}
 	if _, err := s.fallback.StatNodeCtx(ctx, "/zone/foreign/child.txt"); err != nil {
 		t.Fatalf("foreign child removed by rollback: %v", err)
+	}
+}
+
+// A failed commit must undo the rename it already applied. The moved inode is not this
+// commit's creation, but the target name is one the commit filled, so the rollback has to be
+// allowed to empty it — otherwise a later entry's failure leaves the tree at the target and
+// the source empty.
+func TestFSLayerCommitRollbackUndoesAppliedRename(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	store := s.fallback.Store()
+	if _, err := s.fallback.MkdirCreatedCtx(ctx, "/zone/src/", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.fallback.WriteCtx(ctx, "/zone/src/child.txt", []byte("payload"), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate); err != nil {
+		t.Fatal(err)
+	}
+	layerID := "layer-rollback-rename"
+	if err := store.CreateFSLayer(ctx, &datastore.FSLayer{LayerID: layerID, BaseRootPath: "/zone"}); err != nil {
+		t.Fatal(err)
+	}
+	owner := &TenantScope{Backend: s.fallback}
+	stage := func(body string) {
+		t.Helper()
+		layer, err := store.GetFSLayer(ctx, layerID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/v1/layers/"+layerID+"/entries", bytes.NewReader([]byte(body)))
+		req = req.WithContext(withScope(req.Context(), owner))
+		rr := httptest.NewRecorder()
+		s.handleFSLayerEntryUpsert(rr, req, s.fallback, store, layer)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("staging %s status=%d body=%s", body, rr.Code, rr.Body.String())
+		}
+	}
+	stage(`{"path":"/zone/src/","op":"rename","kind":"dir","content_text":"/zone/dst/"}`)
+	// A chmod of a path that does not exist cannot apply, so the commit fails after the
+	// rename has been applied.
+	stage(`{"path":"/zone/missing.txt","op":"chmod","kind":"file","mode":384}`)
+	layer, err := store.GetFSLayer(ctx, layerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/layers/"+layerID+"/commit", nil)
+	req = req.WithContext(withScope(req.Context(), owner))
+	rr := httptest.NewRecorder()
+	s.handleFSLayerCommit(rr, req, s.fallback, store, layer)
+	if rr.Code == http.StatusOK {
+		t.Fatalf("commit succeeded, want the chmod entry to fail it: %s", rr.Body.String())
+	}
+	if _, err := s.fallback.StatNodeCtx(ctx, "/zone/dst/"); !errors.Is(err, datastore.ErrNotFound) {
+		t.Fatalf("the failed commit kept the rename target: err=%v", err)
+	}
+	content, err := s.fallback.ReadCtx(ctx, "/zone/src/child.txt", 0, -1)
+	if err != nil {
+		t.Fatalf("the failed commit did not restore the source tree: %v", err)
+	}
+	if string(content) != "payload" {
+		t.Fatalf("restored content = %q, want payload", content)
+	}
+}
+
+// Parents an entry creates implicitly are the commit's own work, so a failed commit must
+// remove them instead of leaving an empty tree behind.
+func TestFSLayerCommitRollbackRemovesCreatedParents(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	store := s.fallback.Store()
+	layerID := "layer-rollback-parents"
+	if err := store.CreateFSLayer(ctx, &datastore.FSLayer{LayerID: layerID, BaseRootPath: "/zone"}); err != nil {
+		t.Fatal(err)
+	}
+	owner := &TenantScope{Backend: s.fallback}
+	stage := func(body string) {
+		t.Helper()
+		layer, err := store.GetFSLayer(ctx, layerID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/v1/layers/"+layerID+"/entries", bytes.NewReader([]byte(body)))
+		req = req.WithContext(withScope(req.Context(), owner))
+		rr := httptest.NewRecorder()
+		s.handleFSLayerEntryUpsert(rr, req, s.fallback, store, layer)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("staging %s status=%d body=%s", body, rr.Code, rr.Body.String())
+		}
+	}
+	stage(`{"path":"/zone/deep/nested/","op":"mkdir","kind":"dir","mode":493}`)
+	stage(`{"path":"/zone/missing.txt","op":"chmod","kind":"file","mode":384}`)
+	layer, err := store.GetFSLayer(ctx, layerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/layers/"+layerID+"/commit", nil)
+	req = req.WithContext(withScope(req.Context(), owner))
+	rr := httptest.NewRecorder()
+	s.handleFSLayerCommit(rr, req, s.fallback, store, layer)
+	if rr.Code == http.StatusOK {
+		t.Fatalf("commit succeeded, want the chmod entry to fail it: %s", rr.Body.String())
+	}
+	for _, path := range []string{"/zone/deep/", "/zone/deep/nested/"} {
+		if _, err := s.fallback.StatNodeCtx(ctx, path); !errors.Is(err, datastore.ErrNotFound) {
+			t.Fatalf("the failed commit kept %s: err=%v", path, err)
+		}
 	}
 }
