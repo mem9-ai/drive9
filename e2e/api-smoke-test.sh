@@ -121,6 +121,8 @@ PROBE_HEAD_VALIDATORS="unknown"
 PROBE_RANGE="unknown"
 PROBE_IF_MATCH="unknown"
 PROBE_BATCH_CHECKSUM="unknown"
+PROBE_BATCH_ROUTES="unknown"
+PROBE_V2_UPLOADS="unknown"
 
 PASS=0
 FAIL=0
@@ -196,7 +198,7 @@ curl_body_code() {
       return
     fi
 
-    info "throttled (429), retrying ${attempt}/${REQUEST_MAX_RETRIES}: $method $url"
+    info "throttled (429), retrying ${attempt}/${REQUEST_MAX_RETRIES}: $method $url" >&2
     rm -f "$body_file"
     attempt=$((attempt + 1))
     sleep "$REQUEST_RETRY_SLEEP_S"
@@ -279,9 +281,9 @@ request() {
     if [ -n "$auth" ]; then
       args+=(-H "Authorization: Bearer $auth")
     fi
-    local h
-    for h in ${hdrs[@]+"${hdrs[@]}"}; do
-      args+=(-H "$h")
+    local i
+    for ((i = 0; i < ${#hdrs[@]}; i++)); do
+      args+=(-H "${hdrs[$i]}")
     done
     if [ -n "$data_file" ]; then
       args+=(--data-binary "@$data_file")
@@ -292,7 +294,9 @@ request() {
     code=$(curl "${args[@]}" "$url")
 
     if [ "$code" = "429" ] && [ "$attempt" -lt "$REQUEST_MAX_RETRIES" ]; then
-      info "throttled (429), retrying ${attempt}/${REQUEST_MAX_RETRIES}: $method $url"
+      # stderr: `resp=$(request ...)` captures stdout, so a diagnostic written
+      # there would end up inside the response body.
+      info "throttled (429), retrying ${attempt}/${REQUEST_MAX_RETRIES}: $method $url" >&2
       rm -f "$body_file"
       attempt=$((attempt + 1))
       sleep "$REQUEST_RETRY_SLEEP_S"
@@ -366,7 +370,24 @@ probe_features() {
     PROBE_BATCH_CHECKSUM="false"
   fi
 
-  info "features: stat_btime=$PROBE_STAT_BTIME head_validators=$PROBE_HEAD_VALIDATORS range=$PROBE_RANGE if_match=$PROBE_IF_MATCH batch_checksum=$PROBE_BATCH_CHECKSUM"
+  resp=$(request POST "$BASE/v1/fs:batch-stat" --auth "$API_KEY" --hdr 'Content-Type: application/json' \
+    --data '{"paths":[]}')
+  if [ "$(http_code "$resp")" = "404" ]; then
+    PROBE_BATCH_ROUTES="false"
+  else
+    PROBE_BATCH_ROUTES="true"
+  fi
+
+  # An invalid body is enough to prove the route exists; a 404 means it does not.
+  resp=$(request POST "$BASE/v2/uploads/initiate" --auth "$API_KEY" --hdr 'Content-Type: application/json' \
+    --data '{}')
+  if [ "$(http_code "$resp")" = "404" ]; then
+    PROBE_V2_UPLOADS="false"
+  else
+    PROBE_V2_UPLOADS="true"
+  fi
+
+  info "features: stat_btime=$PROBE_STAT_BTIME head_validators=$PROBE_HEAD_VALIDATORS range=$PROBE_RANGE if_match=$PROBE_IF_MATCH batch_checksum=$PROBE_BATCH_CHECKSUM batch_routes=$PROBE_BATCH_ROUTES v2_uploads=$PROBE_V2_UPLOADS"
 }
 
 # check_json <desc> <json body> <jq filter> <expected string form>
@@ -386,11 +407,20 @@ body_has_path() {
 
 # body_lacks_path <json array body> <path>: the inverse, used for negative
 # search assertions (a wrong tag value must NOT return the tagged file).
+# Only a successful evaluation of a JSON array proves absence: an error object
+# or a malformed body must not read as "path absent". An empty result may be
+# encoded either as [] or as null (the embedded server snapshot does the
+# latter), so null counts as "no rows", nothing else does.
 body_lacks_path() {
-  if printf '%s' "$1" | jq -e --arg p "$2" 'any(.[]; .path==$p)' >/dev/null 2>&1; then
-    return 1
+  local verdict
+  verdict=$(printf '%s' "$1" | jq -r --arg p "$2" '
+    if type == "null" then "false"
+    elif type == "array" then (any(.[]; .path==$p)|tostring)
+    else "invalid" end' 2>/dev/null) || return 1
+  if [ "$verdict" = "false" ]; then
+    return 0
   fi
-  return 0
+  return 1
 }
 
 url_encode() {
@@ -1431,6 +1461,7 @@ if [ "$RUN_CONTRACT_CHECKS" = "1" ]; then
   check_cmd "find by tag key (existence) returns the tagged file" body_has_path "$(json_body "$resp")" "/$TAG_PATH"
 
   resp=$(request GET "$BASE/v1/fs/$CONTRACT_DIR?find=&tag=e2e=other-${TS}" --auth "$API_KEY")
+  check_status "find by a different tag value returns 200" "$resp" "200"
   check_cmd "find by a different tag value excludes the file" body_lacks_path "$(json_body "$resp")" "/$TAG_PATH"
 
   resp=$(request POST "$BASE/v1/fs/$TAG_PATH?setmeta" --auth "$API_KEY" --hdr 'Content-Type: application/json' \
@@ -1583,7 +1614,15 @@ else
   skip_check "error and routing contract (RUN_CONTRACT_CHECKS=0)"
 fi
 
-if [ "$RUN_BATCH_CHECKS" = "1" ]; then
+if [ "$RUN_BATCH_CHECKS" != "1" ]; then
+  info "batch endpoint checks skipped (RUN_BATCH_CHECKS=$RUN_BATCH_CHECKS)"
+  skip_check "batch endpoints: batch-stat / batch-read-small / batch-write (RUN_BATCH_CHECKS=0)"
+else
+  probe_features
+  if [ "$PROBE_BATCH_ROUTES" != "true" ]; then
+    info "server does not serve the /v1/fs:batch-* routes; batch checks skipped"
+    skip_check "batch endpoints: batch-stat / batch-read-small / batch-write (routes absent)"
+  else
   step "22" "Batch endpoints: batch-stat, batch-read-small, batch-write"
   BW_DIR="${ROOT_DIR}/batch-wire"
   BW_ONE="${BW_DIR}/one.txt"
@@ -1686,11 +1725,28 @@ if [ "$RUN_BATCH_CHECKS" = "1" ]; then
     check_json "batch-write treats expected_revision 0 as create-only" "$(json_body "$resp")" '.results[0].status' "409"
 
     if [ -n "$SERVER_INLINE_THRESHOLD" ] && [ "$SERVER_INLINE_THRESHOLD" -le 1048576 ]; then
-      oversize_b64=$(python3 -c 'import base64, sys; print(base64.b64encode(b"x" * int(sys.argv[1])).decode())' "$((SERVER_INLINE_THRESHOLD + 1))")
+      # Built in python and sent as a file: a multi-MiB base64 value does not fit
+      # in one argv string (Linux caps it at 32 pages), so `jq --arg` would fail
+      # before curl ever ran.
+      oversize_body=$(mktemp)
+      python3 - "$SERVER_INLINE_THRESHOLD" "/$BW_DIR/oversize.bin" > "$oversize_body" <<'PY'
+import base64
+import json
+import sys
+
+size = int(sys.argv[1]) + 1
+print(json.dumps({
+    "items": [{
+        "path": sys.argv[2],
+        "expected_revision": 0,
+        "data": base64.b64encode(b"x" * size).decode(),
+    }],
+}))
+PY
       resp=$(request POST "$BASE/v1/fs:batch-write" --auth "$API_KEY" --hdr 'Content-Type: application/json' \
-        --data "$(jq -nc --arg p "/$BW_DIR/oversize.bin" --arg d "$oversize_b64" \
-          '{items:[{path:$p, expected_revision:0, data:$d}]}')")
+        --data-file "$oversize_body")
       check_json "batch-write rejects an item over inline_threshold with per-item 413" "$(json_body "$resp")" '.results[0].status' "413"
+      rm -f "$oversize_body"
     else
       skip_check "batch-write rejects an item over inline_threshold with per-item 413 (inline_threshold not advertised or too large to probe)"
     fi
@@ -1714,13 +1770,12 @@ if [ "$RUN_BATCH_CHECKS" = "1" ]; then
     skip_check "batch-write owner hasMode item (inline storage not advertised)"
   fi
 
-else
-  info "batch endpoint checks skipped (RUN_BATCH_CHECKS=$RUN_BATCH_CHECKS)"
-  skip_check "batch endpoints: batch-stat / batch-read-small / batch-write (RUN_BATCH_CHECKS=0)"
+  fi
 fi
 
 if [ "$RUN_UPLOAD_LIFECYCLE_CHECKS" = "1" ]; then
   step "23" "Upload lifecycle: V1 list/resume/abort and V2 presigned round-trip"
+  probe_features
   V1_UP_PATH="${CONTRACT_DIR}/v1-lifecycle.bin"
   # 2 MiB = one 8 MiB part. part_checksums is mandatory on V1 initiate and
   # resume (an empty list answers 400 "missing part_checksums"); a 4-byte
@@ -1776,6 +1831,10 @@ if [ "$RUN_UPLOAD_LIFECYCLE_CHECKS" = "1" ]; then
     --hdr 'Content-Type: application/json' --data "$V1_CHECKSUMS")
   check_status "resuming an aborted session returns 409" "$resp" "409"
 
+  if [ "$PROBE_V2_UPLOADS" != "true" ]; then
+    info "server does not serve /v2/uploads; V2 round-trip skipped"
+    skip_check "V2 presigned round-trip: initiate/presign/presign-batch/part PUT/complete (route absent)"
+  else
   V2_PATH="${CONTRACT_DIR}/v2-roundtrip.bin"
   V2_LOCAL="/tmp/drive9-e2e-v2-${TS}.bin"
   V2_DOWNLOADED="/tmp/drive9-e2e-v2-${TS}.download.bin"
@@ -1844,6 +1903,7 @@ if [ "$RUN_UPLOAD_LIFECYCLE_CHECKS" = "1" ]; then
   check_status "completing an aborted V2 session returns 409 (upload is not active)" "$resp" "409"
 
   rm -f "$v2_part_file" "$V2_LOCAL" "$V2_DOWNLOADED"
+  fi
 else
   info "upload lifecycle checks skipped (RUN_UPLOAD_LIFECYCLE_CHECKS=$RUN_UPLOAD_LIFECYCLE_CHECKS)"
   skip_check "upload lifecycle: V1 list/resume/abort + V2 round-trip (RUN_UPLOAD_LIFECYCLE_CHECKS=0)"
