@@ -1,0 +1,418 @@
+package fuse
+
+import (
+	"sync/atomic"
+
+	gofuse "github.com/hanwen/go-fuse/v2/fuse"
+)
+
+// viewRequestFS gates complete foreground callbacks, including local handle
+// and cache publication, rather than only their remote requests. Cleanup and
+// lifecycle notifications pass through even while paused, but their complete
+// effects are counted. This adapter alone is NOT a kernel reply/cache barrier
+// or an inode/handle router. Root
+// attributes and negative lookups carry zero TTL even before a switch starts.
+// This prevents their delayed replies from extending cache lifetime; it does
+// not prove that all kernel post-processing or permission checks have finished.
+//
+// Deliberately do not embed RawFileSystem: adding a kernel callback must force
+// an explicit decision here about ordinary admission versus cleanup.
+type viewRequestFS struct {
+	inner     gofuse.RawFileSystem // immutable initial delegate (generation 1)
+	selected  atomic.Pointer[viewRequestTarget]
+	unmounted atomic.Bool
+	admission viewAdmission
+}
+
+var _ gofuse.RawFileSystem = (*viewRequestFS)(nil)
+
+func (v *viewRequestFS) String() string {
+	return v.currentTarget().fs.String()
+}
+
+func (v *viewRequestFS) SetDebug(debug bool) {
+	v.currentTarget().fs.SetDebug(debug)
+}
+
+func (v *viewRequestFS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name string, out *gofuse.EntryOut) (status gofuse.Status) {
+	leave, err := v.admission.enter()
+	if err != nil {
+		return gofuse.EAGAIN
+	}
+	defer leave()
+	status = v.currentTarget().fs.Lookup(cancel, header, name, out)
+	if status == gofuse.OK && out.NodeId == 0 {
+		// A negative reply can reach the kernel after this callback returns.
+		// It has no inode lookup reference to make the switch preflight BUSY.
+		out.SetEntryTimeout(0)
+		out.SetAttrTimeout(0)
+	}
+	if status == gofuse.OK && out.NodeId == gofuse.FUSE_ROOT_ID {
+		out.SetAttrTimeout(0)
+	}
+	return status
+}
+
+func (v *viewRequestFS) Forget(nodeid, nlookup uint64) {
+	leave := v.admission.enterCleanup()
+	defer leave()
+	v.currentTarget().fs.Forget(nodeid, nlookup)
+}
+
+func (v *viewRequestFS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *gofuse.AttrOut) (code gofuse.Status) {
+	leave, err := v.admission.enter()
+	if err != nil {
+		return gofuse.EAGAIN
+	}
+	defer leave()
+	code = v.currentTarget().fs.GetAttr(cancel, input, out)
+	if code == gofuse.OK && input.NodeId == gofuse.FUSE_ROOT_ID {
+		// The root is the only inode reused across selected views. Do not
+		// let a delayed response extend its cached attribute lifetime.
+		out.SetTimeout(0)
+	}
+	return code
+}
+
+func (v *viewRequestFS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *gofuse.AttrOut) (code gofuse.Status) {
+	leave, err := v.admission.enter()
+	if err != nil {
+		return gofuse.EAGAIN
+	}
+	defer leave()
+	code = v.currentTarget().fs.SetAttr(cancel, input, out)
+	if code == gofuse.OK && input.NodeId == gofuse.FUSE_ROOT_ID {
+		// The root is the only inode reused across selected views. Do not
+		// let a delayed response extend its cached attribute lifetime.
+		out.SetTimeout(0)
+	}
+	return code
+}
+
+func (v *viewRequestFS) Mknod(cancel <-chan struct{}, input *gofuse.MknodIn, name string, out *gofuse.EntryOut) (code gofuse.Status) {
+	leave, err := v.admission.enter()
+	if err != nil {
+		return gofuse.EAGAIN
+	}
+	defer leave()
+	return v.currentTarget().fs.Mknod(cancel, input, name, out)
+}
+
+func (v *viewRequestFS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name string, out *gofuse.EntryOut) (code gofuse.Status) {
+	leave, err := v.admission.enter()
+	if err != nil {
+		return gofuse.EAGAIN
+	}
+	defer leave()
+	return v.currentTarget().fs.Mkdir(cancel, input, name, out)
+}
+
+func (v *viewRequestFS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string) (code gofuse.Status) {
+	leave, err := v.admission.enter()
+	if err != nil {
+		return gofuse.EAGAIN
+	}
+	defer leave()
+	return v.currentTarget().fs.Unlink(cancel, header, name)
+}
+
+func (v *viewRequestFS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name string) (code gofuse.Status) {
+	leave, err := v.admission.enter()
+	if err != nil {
+		return gofuse.EAGAIN
+	}
+	defer leave()
+	return v.currentTarget().fs.Rmdir(cancel, header, name)
+}
+
+func (v *viewRequestFS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName string, newName string) (code gofuse.Status) {
+	leave, err := v.admission.enter()
+	if err != nil {
+		return gofuse.EAGAIN
+	}
+	defer leave()
+	return v.currentTarget().fs.Rename(cancel, input, oldName, newName)
+}
+
+func (v *viewRequestFS) Link(cancel <-chan struct{}, input *gofuse.LinkIn, filename string, out *gofuse.EntryOut) (code gofuse.Status) {
+	leave, err := v.admission.enter()
+	if err != nil {
+		return gofuse.EAGAIN
+	}
+	defer leave()
+	return v.currentTarget().fs.Link(cancel, input, filename, out)
+}
+
+func (v *viewRequestFS) Symlink(cancel <-chan struct{}, header *gofuse.InHeader, pointedTo string, linkName string, out *gofuse.EntryOut) (code gofuse.Status) {
+	leave, err := v.admission.enter()
+	if err != nil {
+		return gofuse.EAGAIN
+	}
+	defer leave()
+	return v.currentTarget().fs.Symlink(cancel, header, pointedTo, linkName, out)
+}
+
+func (v *viewRequestFS) Readlink(cancel <-chan struct{}, header *gofuse.InHeader) (out []byte, code gofuse.Status) {
+	leave, err := v.admission.enter()
+	if err != nil {
+		return nil, gofuse.EAGAIN
+	}
+	defer leave()
+	return v.currentTarget().fs.Readlink(cancel, header)
+}
+
+func (v *viewRequestFS) Access(cancel <-chan struct{}, input *gofuse.AccessIn) (code gofuse.Status) {
+	leave, err := v.admission.enter()
+	if err != nil {
+		return gofuse.EAGAIN
+	}
+	defer leave()
+	return v.currentTarget().fs.Access(cancel, input)
+}
+
+func (v *viewRequestFS) GetXAttr(cancel <-chan struct{}, header *gofuse.InHeader, attr string, dest []byte) (sz uint32, code gofuse.Status) {
+	leave, err := v.admission.enter()
+	if err != nil {
+		return 0, gofuse.EAGAIN
+	}
+	defer leave()
+	return v.currentTarget().fs.GetXAttr(cancel, header, attr, dest)
+}
+
+func (v *viewRequestFS) ListXAttr(cancel <-chan struct{}, header *gofuse.InHeader, dest []byte) (uint32, gofuse.Status) {
+	leave, err := v.admission.enter()
+	if err != nil {
+		return 0, gofuse.EAGAIN
+	}
+	defer leave()
+	return v.currentTarget().fs.ListXAttr(cancel, header, dest)
+}
+
+func (v *viewRequestFS) SetXAttr(cancel <-chan struct{}, input *gofuse.SetXAttrIn, attr string, data []byte) gofuse.Status {
+	leave, err := v.admission.enter()
+	if err != nil {
+		return gofuse.EAGAIN
+	}
+	defer leave()
+	return v.currentTarget().fs.SetXAttr(cancel, input, attr, data)
+}
+
+func (v *viewRequestFS) RemoveXAttr(cancel <-chan struct{}, header *gofuse.InHeader, attr string) (code gofuse.Status) {
+	leave, err := v.admission.enter()
+	if err != nil {
+		return gofuse.EAGAIN
+	}
+	defer leave()
+	return v.currentTarget().fs.RemoveXAttr(cancel, header, attr)
+}
+
+func (v *viewRequestFS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name string, out *gofuse.CreateOut) (code gofuse.Status) {
+	leave, err := v.admission.enter()
+	if err != nil {
+		return gofuse.EAGAIN
+	}
+	defer leave()
+	return v.currentTarget().fs.Create(cancel, input, name, out)
+}
+
+func (v *viewRequestFS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse.OpenOut) (status gofuse.Status) {
+	leave, err := v.admission.enter()
+	if err != nil {
+		return gofuse.EAGAIN
+	}
+	defer leave()
+	return v.currentTarget().fs.Open(cancel, input, out)
+}
+
+func (v *viewRequestFS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte) (gofuse.ReadResult, gofuse.Status) {
+	leave, err := v.admission.enter()
+	if err != nil {
+		return nil, gofuse.EAGAIN
+	}
+	defer leave()
+	return v.currentTarget().fs.Read(cancel, input, buf)
+}
+
+func (v *viewRequestFS) Lseek(cancel <-chan struct{}, in *gofuse.LseekIn, out *gofuse.LseekOut) gofuse.Status {
+	leave, err := v.admission.enter()
+	if err != nil {
+		return gofuse.EAGAIN
+	}
+	defer leave()
+	return v.currentTarget().fs.Lseek(cancel, in, out)
+}
+
+func (v *viewRequestFS) GetLk(cancel <-chan struct{}, input *gofuse.LkIn, out *gofuse.LkOut) (code gofuse.Status) {
+	leave, err := v.admission.enter()
+	if err != nil {
+		return gofuse.EAGAIN
+	}
+	defer leave()
+	return v.currentTarget().fs.GetLk(cancel, input, out)
+}
+
+func (v *viewRequestFS) SetLk(cancel <-chan struct{}, input *gofuse.LkIn) (code gofuse.Status) {
+	leave, err := v.admission.enter()
+	if err != nil {
+		return gofuse.EAGAIN
+	}
+	defer leave()
+	return v.currentTarget().fs.SetLk(cancel, input)
+}
+
+func (v *viewRequestFS) SetLkw(cancel <-chan struct{}, input *gofuse.LkIn) (code gofuse.Status) {
+	leave, err := v.admission.enter()
+	if err != nil {
+		return gofuse.EAGAIN
+	}
+	defer leave()
+	return v.currentTarget().fs.SetLkw(cancel, input)
+}
+
+func (v *viewRequestFS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
+	leave := v.admission.enterCleanup()
+	defer leave()
+	v.currentTarget().fs.Release(cancel, input)
+}
+
+func (v *viewRequestFS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []byte) (written uint32, code gofuse.Status) {
+	leave, err := v.admission.enter()
+	if err != nil {
+		return 0, gofuse.EAGAIN
+	}
+	defer leave()
+	return v.currentTarget().fs.Write(cancel, input, data)
+}
+
+func (v *viewRequestFS) CopyFileRange(cancel <-chan struct{}, input *gofuse.CopyFileRangeIn) (written uint32, code gofuse.Status) {
+	leave, err := v.admission.enter()
+	if err != nil {
+		return 0, gofuse.EAGAIN
+	}
+	defer leave()
+	return v.currentTarget().fs.CopyFileRange(cancel, input)
+}
+
+func (v *viewRequestFS) Ioctl(cancel <-chan struct{}, input *gofuse.IoctlIn, inbuf []byte, output *gofuse.IoctlOut, outbuf []byte) (code gofuse.Status) {
+	leave, err := v.admission.enter()
+	if err != nil {
+		return gofuse.EAGAIN
+	}
+	defer leave()
+	return v.currentTarget().fs.Ioctl(cancel, input, inbuf, output, outbuf)
+}
+
+func (v *viewRequestFS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) gofuse.Status {
+	leave, err := v.admission.enter()
+	if err != nil {
+		return gofuse.EAGAIN
+	}
+	defer leave()
+	return v.currentTarget().fs.Flush(cancel, input)
+}
+
+func (v *viewRequestFS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (code gofuse.Status) {
+	leave, err := v.admission.enter()
+	if err != nil {
+		return gofuse.EAGAIN
+	}
+	defer leave()
+	return v.currentTarget().fs.Fsync(cancel, input)
+}
+
+func (v *viewRequestFS) Fallocate(cancel <-chan struct{}, input *gofuse.FallocateIn) (code gofuse.Status) {
+	leave, err := v.admission.enter()
+	if err != nil {
+		return gofuse.EAGAIN
+	}
+	defer leave()
+	return v.currentTarget().fs.Fallocate(cancel, input)
+}
+
+func (v *viewRequestFS) OpenDir(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse.OpenOut) (status gofuse.Status) {
+	leave, err := v.admission.enter()
+	if err != nil {
+		return gofuse.EAGAIN
+	}
+	defer leave()
+	return v.currentTarget().fs.OpenDir(cancel, input, out)
+}
+
+func (v *viewRequestFS) ReadDir(cancel <-chan struct{}, input *gofuse.ReadIn, out *gofuse.DirEntryList) gofuse.Status {
+	leave, err := v.admission.enter()
+	if err != nil {
+		return gofuse.EAGAIN
+	}
+	defer leave()
+	return v.currentTarget().fs.ReadDir(cancel, input, out)
+}
+
+func (v *viewRequestFS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out *gofuse.DirEntryList) gofuse.Status {
+	leave, err := v.admission.enter()
+	if err != nil {
+		return gofuse.EAGAIN
+	}
+	defer leave()
+	return v.currentTarget().fs.ReadDirPlus(cancel, input, out)
+}
+
+func (v *viewRequestFS) ReleaseDir(input *gofuse.ReleaseIn) {
+	leave := v.admission.enterCleanup()
+	defer leave()
+	v.currentTarget().fs.ReleaseDir(input)
+}
+
+func (v *viewRequestFS) FsyncDir(cancel <-chan struct{}, input *gofuse.FsyncIn) (code gofuse.Status) {
+	leave, err := v.admission.enter()
+	if err != nil {
+		return gofuse.EAGAIN
+	}
+	defer leave()
+	return v.currentTarget().fs.FsyncDir(cancel, input)
+}
+
+func (v *viewRequestFS) StatFs(cancel <-chan struct{}, input *gofuse.InHeader, out *gofuse.StatfsOut) (code gofuse.Status) {
+	leave, err := v.admission.enter()
+	if err != nil {
+		return gofuse.EAGAIN
+	}
+	defer leave()
+	return v.currentTarget().fs.StatFs(cancel, input, out)
+}
+
+func (v *viewRequestFS) SyncFs(cancel <-chan struct{}, input *gofuse.InHeader) (code gofuse.Status) {
+	leave, err := v.admission.enter()
+	if err != nil {
+		return gofuse.EAGAIN
+	}
+	defer leave()
+	return v.currentTarget().fs.SyncFs(cancel, input)
+}
+
+func (v *viewRequestFS) Statx(cancel <-chan struct{}, input *gofuse.StatxIn, out *gofuse.StatxOut) (code gofuse.Status) {
+	leave, err := v.admission.enter()
+	if err != nil {
+		return gofuse.EAGAIN
+	}
+	defer leave()
+	code = v.currentTarget().fs.Statx(cancel, input, out)
+	if code == gofuse.OK && input.NodeId == gofuse.FUSE_ROOT_ID {
+		// The root is the only inode reused across selected views. Do not
+		// let a delayed response extend its cached attribute lifetime.
+		out.SetTimeout(0)
+	}
+	return code
+}
+
+func (v *viewRequestFS) Init(server *gofuse.Server) {
+	leave := v.admission.enterCleanup()
+	defer leave()
+	v.currentTarget().fs.Init(server)
+}
+
+func (v *viewRequestFS) OnUnmount() {
+	leave := v.admission.enterCleanup()
+	defer leave()
+	v.unmounted.Store(true)
+	v.currentTarget().fs.OnUnmount()
+}

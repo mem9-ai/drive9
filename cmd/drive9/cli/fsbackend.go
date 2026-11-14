@@ -84,6 +84,9 @@ func fsHandleForArgOpts(defaultClient *client.Client, raw string, forCopy bool) 
 		}
 		return fsHandle{Loc: loc, Path: "-"}, nil
 	case KindObject:
+		if defaultClient.ViewBinding().LayerID != "" {
+			return fsHandle{}, fmt.Errorf("object-store paths are outside the fixed Layer")
+		}
 		b, err := openObjectAuthenticated(context.Background(), defaultClient, loc, objectAuthLocal)
 		if err != nil {
 			return fsHandle{}, err
@@ -92,7 +95,7 @@ func fsHandleForArgOpts(defaultClient *client.Client, raw string, forCopy bool) 
 	case KindDrive9:
 		c := defaultClient
 		if loc.Context != "" {
-			c, err = newFSClientForContext(loc.Context)
+			c, err = fsClientInContext(defaultClient, loc.Context)
 			if err != nil {
 				return fsHandle{}, err
 			}
@@ -131,6 +134,9 @@ func newDrive9FS(c *client.Client) *drive9FS {
 	if c != nil {
 		sum := sha256.Sum256([]byte(c.APIKey()))
 		id = "drive9\n" + c.BaseURL() + "\n" + hex.EncodeToString(sum[:])
+		if b := c.ViewBinding(); b.LayerID != "" {
+			id += fmt.Sprintf("\n%s\n%s\n%d\n%t", b.LayerID, b.WorkID, b.Fence, b.Validation)
+		}
 	}
 	return &drive9FS{c: c, identity: id}
 }

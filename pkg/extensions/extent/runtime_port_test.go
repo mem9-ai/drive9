@@ -110,7 +110,9 @@ func TestPortTeardownStopsAndClosesRuntime(t *testing.T) {
 		t.Fatal("mount was not marked torn down")
 	}
 
-	e.closeRuntime()
+	if err := e.closeRuntime(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	if e.rt.Load() != nil {
 		t.Fatal("runtime pointer still set after teardown")
 	}
@@ -153,7 +155,9 @@ func TestPortRuntimePointerRace(t *testing.T) {
 	// Teardown runs while the reader is still looping, so the read/write
 	// window is actually exercised.
 	e.stopRuntimeLoop()
-	e.closeRuntime()
+	if err := e.closeRuntime(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	stop.Store(true)
 	wg.Wait()
 	if e.rt.Load() != nil {

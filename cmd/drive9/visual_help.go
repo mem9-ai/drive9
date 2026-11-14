@@ -553,7 +553,7 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 					{Name: "rm [-r|--recursive] <path>", Desc: "remove a file or directory tree"},
 				}},
 				{Title: "Search", Flags: []visualHelpFlag{
-					{Name: "grep [--layer REF] <pattern> [dir]", Desc: "search file contents"},
+					{Name: "grep <pattern> [dir]", Desc: "search file contents"},
 					{Name: "find [dir] -name GLOB", Desc: "match filename glob"},
 					{Name: "find [dir] -tag key=value", Desc: "exact tag key/value match"},
 					{Name: "find [dir] -tag key", Desc: "tag-key existence match"},
@@ -570,13 +570,20 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 					{Name: "archive --stdout", Desc: "stream archive to stdout for piping"},
 					{Name: "archive --flat", Desc: "strip directory hierarchy; archive basenames only"},
 				}},
-				{Title: "Layers", Flags: []visualHelpFlag{
-					{Name: "layer create [flags] <base-root>", Desc: "create writable fs layer"},
-					{Name: "layer list [--json]", Desc: "list layers"},
-					{Name: "layer status|diff [--json] <layer>", Desc: "inspect layer state or diff"},
-					{Name: "layer checkpoint [flags] <layer>", Desc: "create a layer checkpoint"},
-					{Name: "layer rollback <layer>", Desc: "rollback a layer"},
-					{Name: "layer commit <layer>", Desc: "commit a layer into its base"},
+				{Title: "File command view", Flags: []visualHelpFlag{
+					{Name: "--layer ID --work ID --fence N", Desc: "bind cat/ls/stat/cp and namespace commands to claimed Layer work"},
+					{Name: "--validation", Desc: "use the separately claimed read-only validation generation"},
+					{Name: "--layer main", Desc: "use main (also the default when binding flags are omitted)"},
+				}},
+				{Title: "Fixed Layers (JSON results)", Flags: []visualHelpFlag{
+					{Name: "layer create --operation <id> [--parent <layer>] <id>", Desc: "capture main or derive from a fixed Layer"},
+					{Name: "layer list [--after <id>] [--limit <n>]", Desc: "read one page of Layers"},
+					{Name: "layer status <layer>", Desc: "inspect the current control state"},
+					{Name: "layer work --operation <id> --ttl <duration> [--validation] <layer>", Desc: "claim work; prints the claim without executing it"},
+					{Name: "layer renew --work <id> --fence <n> --ttl <duration> <layer>", Desc: "renew the existing generation"},
+					{Name: "layer seal --operation <id> --work <id> --fence <n> <layer>", Desc: "stop work and seal its result"},
+					{Name: "layer cancel|delete --operation <id> <layer>", Desc: "cancel work or delete a Layer"},
+					{Name: "layer operation <layer> <operation>", Desc: "query the original outcome after a timeout"},
 				}},
 			},
 			Examples: []visualHelpExample{

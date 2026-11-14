@@ -26,6 +26,7 @@ import (
 
 // Client is the drive9 HTTP client.
 type Client struct {
+	view                  ViewBinding // immutable per-client filesystem work binding
 	baseURL               string
 	apiKey                string
 	actor                 string // X-Dat9-Actor header value (per-mount ID)
@@ -472,7 +473,12 @@ func (c *Client) newFSRequest(ctx context.Context, method, path, rawQuery string
 	if err != nil {
 		return nil, err
 	}
-	return http.NewRequestWithContext(ctx, method, reqURL+rawQuery, body)
+	req, err := http.NewRequestWithContext(ctx, method, reqURL+rawQuery, body)
+	if err != nil {
+		return nil, err
+	}
+	c.identifyViewMutation(req)
+	return req, nil
 }
 
 func escapeFSPath(path string) string {
@@ -774,7 +780,23 @@ func (c *Client) doWith(req *http.Request, hc *http.Client) (*http.Response, err
 	if c.actor != "" {
 		req.Header.Set("X-Dat9-Actor", c.actor)
 	}
-	return hc.Do(req)
+	return c.sendBoundRequest(req, hc)
+}
+
+// sendBoundRequest preserves the caller's already selected headers (including
+// the SSE mount actor) while applying view routing and redirect confinement.
+func (c *Client) sendBoundRequest(req *http.Request, hc *http.Client) (*http.Response, error) {
+	bound, err := c.boundRequest(req)
+	if err != nil {
+		return nil, err
+	}
+	if c.view.LayerID != "" {
+		boundHTTP := *hc
+		boundHTTP.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+		hc = &boundHTTP
+	}
+	resp, err := hc.Do(bound)
+	return c.viewMutationOutcome(bound, resp, err)
 }
 
 // Write uploads data to a remote path.
@@ -854,11 +876,14 @@ func (c *Client) CreateFileCtx(ctx context.Context, path string) (int64, error) 
 	var result struct {
 		Revision int64 `json:"revision"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		if errors.Is(err, io.EOF) {
+	if err := c.decodeViewMutation(req, resp, &result); err != nil {
+		if c.view.LayerID == "" && errors.Is(err, io.EOF) {
 			return 0, nil
 		}
 		return 0, fmt.Errorf("decode create file response: %w", err)
+	}
+	if c.view.LayerID != "" && result.Revision < 1 {
+		return 0, c.viewMutationError(req, fmt.Errorf("missing committed file revision"))
 	}
 	return result.Revision, nil
 }
@@ -950,9 +975,22 @@ func (c *Client) writeCtxConditionalFull(ctx context.Context, path string, data 
 	var result struct {
 		Revision int64 `json:"revision"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		// If response doesn't contain revision (old server), return 0.
+	if err := c.decodeViewMutation(req, resp, &result); err != nil {
+		if c.view.LayerID != "" {
+			if expectedRevision >= 0 {
+				err = markCommitAttempt(err)
+			}
+			return 0, err
+		}
+		// Main retains the old server compatibility behavior.
 		return 0, nil
+	}
+	if c.view.LayerID != "" && result.Revision < 1 {
+		err := c.viewMutationError(req, fmt.Errorf("missing committed file revision"))
+		if expectedRevision >= 0 {
+			err = markCommitAttempt(err)
+		}
+		return 0, err
 	}
 	return result.Revision, nil
 }
@@ -965,8 +1003,8 @@ func (c *Client) Read(path string) ([]byte, error) {
 // ReadCtx downloads a file's content with context support.
 func (c *Client) ReadCtx(ctx context.Context, path string) ([]byte, error) {
 	// ReadStream validates the path (newFSRequest), follows presigned
-	// redirects, and routes content_layout=extent reads to the JuiceFS data
-	// plane when the server answers 422 with the extent hint.
+	// redirects, and consumes extent read plans. The old numeric-inode
+	// response remains supported for servers returning a legacy 422 hint.
 	rc, err := c.ReadStream(ctx, path)
 	if err != nil {
 		return nil, err

@@ -684,6 +684,25 @@ func (f *Localize) ReexecRefusal() (string, int) {
 	if f.overlay != nil {
 		return "user/profile local overlay is enabled", 1
 	}
+	return f.ViewSwitchRefusal()
+}
+
+// ViewSwitchRefusal allows ordinary disk-backed local content to remain in its
+// view's persistent directory. Special-node metadata exists only in memory;
+// open descriptors and transient shared memory cannot be abandoned either.
+func (f *Localize) ViewSwitchRefusal() (string, int) {
+	f.specialMu.Lock()
+	special := len(f.specialAttrs)
+	f.specialMu.Unlock()
+	f.openDBMu.Lock()
+	open := len(f.openDBs)
+	f.openDBMu.Unlock()
+	if special > 0 {
+		return "local overlay has in-memory special nodes", special
+	}
+	if open > 0 {
+		return "local overlay has open handles", open
+	}
 	if n := f.transientEntryCount(); n != 0 {
 		if n < 0 {
 			return "transient local overlay root cannot be read", 1

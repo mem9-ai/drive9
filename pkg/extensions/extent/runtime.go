@@ -23,7 +23,7 @@ import (
 var errExtentTornDown = errors.New("extent runtime: mount is tearing down")
 
 // extentMetaDrainTimeout bounds closeExtentRuntime's wait for in-flight
-// metadata RPCs before it releases the session anyway (logged).
+// metadata RPCs. Timeout leaves the runtime retained for a later retry.
 const extentMetaDrainTimeout = extent.MetaCallTimeout + 5*time.Second
 
 // extentMetaHold counts in-flight metadata RPCs so teardown can wait for them
@@ -74,24 +74,28 @@ func (h *extentMetaHold) leave() {
 }
 
 func (h *extentMetaHold) closeAndWait(timeout time.Duration) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return h.closeAndWaitContext(ctx) == nil
+}
+
+func (h *extentMetaHold) closeAndWaitContext(ctx context.Context) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.closed = true
-	deadline := time.Now().Add(timeout)
+	wake := context.AfterFunc(ctx, func() {
+		h.mu.Lock()
+		h.cond.Broadcast()
+		h.mu.Unlock()
+	})
+	defer wake()
 	for h.active > 0 {
-		remain := time.Until(deadline)
-		if remain <= 0 {
-			return false
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-		timer := time.AfterFunc(remain, func() {
-			h.mu.Lock()
-			h.cond.Broadcast()
-			h.mu.Unlock()
-		})
 		h.cond.Wait()
-		timer.Stop()
 	}
-	return true
+	return nil
 }
 
 // extentBuildState single-flights the unlocked runtime build.
@@ -106,9 +110,6 @@ type extentRuntime struct {
 	rt   *extent.Runtime
 	hold *extentMetaHold
 	stop context.CancelFunc
-	// closeOnce makes closeExtentRuntime idempotent even if two callers race
-	// past the pointer clear.
-	closeOnce sync.Once
 	// wg tracks the background compaction loop.
 	wg sync.WaitGroup
 }
@@ -153,32 +154,39 @@ func (e *Extent) stopRuntimeLoop() {
 	er.wg.Wait()
 }
 
-// closeRuntime releases the JuiceFS session and object store and clears
-// the pointer, so a torn-down mount never advertises a dead runtime as
-// healthy.
-func (e *Extent) closeRuntime() {
+// closeRuntime confirms metadata calls have drained before releasing the
+// session/store. A timeout retains the runtime for retry. A CloseSession failure
+// remains sticky: repeating Stop cannot reinterpret an uncertain close as a
+// successful old-view shutdown just because the runtime pointer was cleared.
+func (e *Extent) closeRuntime(ctx context.Context) error {
+	e.extentStopMu.Lock()
+	defer e.extentStopMu.Unlock()
+	if e.extentStopErr != nil {
+		return e.extentStopErr
+	}
 	e.stopRuntimeLoop()
-	e.extentMu.Lock()
 	er := e.rt.Load()
+	if er == nil {
+		return nil
+	}
+	if er.hold != nil {
+		waitCtx, cancel := context.WithTimeout(ctx, extentMetaDrainTimeout)
+		err := er.hold.closeAndWaitContext(waitCtx)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("extent metadata drain: %w", err)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	// CloseSession has no context API. Once started, await its actual result;
+	// cancellation cannot turn that result into permission to resume old work.
+	e.extentStopErr = extent.CloseRuntime(er.rt)
+	e.extentMu.Lock()
 	e.rt.Store(nil)
 	e.extentMu.Unlock()
-	if er == nil {
-		return
-	}
-	er.closeOnce.Do(func() {
-		// Refuse new metadata RPCs and wait for the in-flight ones before
-		// closing the session, so a late handler cannot use a closed one.
-		// The session-cleanup RPC CloseRuntime issues next is exempt from
-		// the gate: refusing it would leave the JuiceFS session open.
-		if er.hold != nil {
-			if !er.hold.closeAndWait(extentMetaDrainTimeout) {
-				fmt.Fprintf(os.Stderr, "drive9: extent metadata drain timed out after %s; closing the session anyway\n", extentMetaDrainTimeout)
-			}
-		}
-		if err := extent.CloseRuntime(er.rt); err != nil {
-			fmt.Fprintf(os.Stderr, "drive9: close extent runtime: %v\n", err)
-		}
-	})
+	return e.extentStopErr
 }
 
 // ensureRuntime builds the JuiceFS session single-flighted.

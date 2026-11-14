@@ -347,8 +347,14 @@ type Git struct {
 	// server-side after this mount started (git clone --fast) is
 	// discovered on the next overlay miss, not only at mount start.
 	lastListAt time.Time
-	// rescanCancel stops the periodic workspace rescan (Start arms it).
-	rescanCancel context.CancelFunc
+	// backgroundMu serializes task admission with Stop. Once stopping, no
+	// discovery or restore may start against this runtime's local directory.
+	backgroundMu sync.Mutex
+	backgroundWG sync.WaitGroup
+	background   map[*gitBackgroundTask]struct{}
+	started      bool
+	stopping     bool
+	stopDone     chan struct{}
 
 	// live indexes claimed workspace handles by path (SetAttr
 	// interception, unlink/rename retargeting).
@@ -509,7 +515,7 @@ func (g *Git) ensureWorkspaceState(ctx context.Context, w *workspace) error {
 	if w.restoreLatched {
 		return nil
 	}
-	rctx, cancel := context.WithTimeout(context.Background(), gitWorkspaceHydrateTimeout)
+	rctx, cancel := context.WithTimeout(ctx, gitWorkspaceHydrateTimeout)
 	defer cancel()
 	if err := g.restoreWorkspaceState(rctx, w); err != nil {
 		// Not latched: a transient failure (or a checkpoint the CLI
@@ -775,9 +781,9 @@ func (g *Git) ensure(ctx context.Context) {
 		// checkpoint raced the discovery) retries on the next reload —
 		// the success latch makes repeat attempts a no-op.
 		if g.localRoot != "" {
-			go func(w *workspace) {
-				_ = g.ensureWorkspaceState(ctx, w)
-			}(w)
+			g.runBackground(func(restoreCtx context.Context) {
+				_ = g.ensureWorkspaceState(restoreCtx, w)
+			})
 		}
 	}
 }
@@ -840,7 +846,18 @@ func (g *Git) workspaceFor(path string) (*workspace, string, bool) {
 // gitWorkspaceIndexRescanInterval) arms workspaces registered after the
 // mount without a remount.
 func (g *Git) Start(ctx context.Context) error {
-	go func() {
+	g.backgroundMu.Lock()
+	if g.stopping {
+		g.backgroundMu.Unlock()
+		return fmt.Errorf("git: runtime is stopped")
+	}
+	if g.started {
+		g.backgroundMu.Unlock()
+		return nil
+	}
+	g.started = true
+	g.backgroundMu.Unlock()
+	g.runBackground(func(startCtx context.Context) {
 		// v1 starts DORMANT: no initial ListGitWorkspaces. Local arm
 		// signals or a non-empty remote index arm the first list; an
 		// armed mount's checkpointed workspaces then restore.
@@ -849,7 +866,7 @@ func (g *Git) Start(ctx context.Context) error {
 		armed := g.armed
 		g.mu.RUnlock()
 		if !armed {
-			probeCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			probeCtx, cancel := context.WithTimeout(startCtx, 15*time.Second)
 			g.maybeArmFromIndex(probeCtx)
 			cancel()
 			g.mu.RLock()
@@ -857,7 +874,7 @@ func (g *Git) Start(ctx context.Context) error {
 			g.mu.RUnlock()
 		}
 		if armed {
-			reloadCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			reloadCtx, cancel := context.WithTimeout(startCtx, 15*time.Second)
 			g.Reload(reloadCtx)
 			cancel()
 		}
@@ -866,7 +883,7 @@ func (g *Git) Start(ctx context.Context) error {
 			workspaces := make([]*workspace, len(g.workspaces))
 			copy(workspaces, g.workspaces)
 			g.mu.RUnlock()
-			restoreCtx, restoreCancel := context.WithTimeout(context.Background(), gitWorkspaceHydrateTimeout)
+			restoreCtx, restoreCancel := context.WithTimeout(startCtx, gitWorkspaceHydrateTimeout)
 			defer restoreCancel()
 			for _, w := range workspaces {
 				// All restore entry points (mount start, discovery, lazy
@@ -876,10 +893,8 @@ func (g *Git) Start(ctx context.Context) error {
 				_ = g.ensureWorkspaceState(restoreCtx, w)
 			}
 		}
-	}()
-	rescanCtx, rescanCancel := context.WithCancel(context.Background())
-	g.rescanCancel = rescanCancel
-	go func() {
+	})
+	g.runBackground(func(rescanCtx context.Context) {
 		ticker := time.NewTicker(gitWorkspaceRescanInterval)
 		defer ticker.Stop()
 		for {
@@ -887,7 +902,7 @@ func (g *Git) Start(ctx context.Context) error {
 			case <-rescanCtx.Done():
 				return
 			case <-ticker.C:
-				rescanCtx2, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				rescanCtx2, cancel := context.WithTimeout(rescanCtx, 15*time.Second)
 				g.tryArmFromLocalSignals()
 				g.maybeRescanRemoteIndex(rescanCtx2)
 				g.mu.RLock()
@@ -899,7 +914,7 @@ func (g *Git) Start(ctx context.Context) error {
 				cancel()
 			}
 		}
-	}()
+	})
 	return nil
 }
 
@@ -908,14 +923,5 @@ func (g *Git) Drain(ctx context.Context) error {
 	if g.checkpoints != nil {
 		g.checkpoints.FlushAll()
 	}
-	return nil
-}
-
-// Stop checkpoints every workspace's state at shutdown.
-func (g *Git) Stop(ctx context.Context) error {
-	if g.rescanCancel != nil {
-		g.rescanCancel()
-	}
-	g.checkpointAllGitWorkspaces()
 	return nil
 }

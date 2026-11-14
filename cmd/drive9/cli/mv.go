@@ -18,12 +18,8 @@ func Mv(c *client.Client, args []string) error {
 		return err
 	}
 	defer withObjectAuthLocal(authLocal)()
-	layerRef, args, err := parseLayerFlag(args)
-	if err != nil {
-		return err
-	}
 	if len(args) != 2 {
-		return fmt.Errorf("usage: drive9 fs mv [--layer <ref>] [--auth=local|server] <old> <new>")
+		return fmt.Errorf("usage: drive9 fs mv [--auth=local|server] <old> <new>")
 	}
 	oldLoc, err := Parse(args[0])
 	if err != nil {
@@ -37,9 +33,6 @@ func Mv(c *client.Client, args []string) error {
 	newLoc = promoteBareFSArg(newLoc)
 
 	if oldLoc.Kind == KindObject || newLoc.Kind == KindObject {
-		if layerRef != "" {
-			return fmt.Errorf("--layer is drive9-only")
-		}
 		if oldLoc.Kind != KindObject || newLoc.Kind != KindObject {
 			return fmt.Errorf("cross-scheme mv not supported: %q -> %q (use cp + rm)", args[0], args[1])
 		}
@@ -82,21 +75,12 @@ func Mv(c *client.Client, args []string) error {
 		newPath = newLoc.Raw
 		newRP = RemotePath{}
 	}
-	if layerRef != "" {
-		if err := requireNoLayerWithRemoteContext(layerRef, oldRP, args[0]); err != nil {
-			return err
-		}
-		if err := requireNoLayerWithRemoteContext(layerRef, newRP, args[1]); err != nil {
-			return err
-		}
-		return renameLayerPath(context.Background(), c, layerRef, oldPath, newPath)
-	}
 
 	switch {
 	case oldRP.Context == "" && newRP.Context == "":
 	case oldRP.Context != "" && newRP.Context != "" && oldRP.Context == newRP.Context:
 		var err error
-		c, err = newFSClientForContext(oldRP.Context)
+		c, err = fsClientInContext(c, oldRP.Context)
 		if err != nil {
 			return err
 		}

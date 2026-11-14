@@ -967,6 +967,7 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/v1/status" && r.Method == http.MethodGet {
 		b.writeJSON(w, map[string]any{
 			"status":               "ok",
+			"tenant_id":            "test-filesystem",
 			"max_upload_bytes":     1 << 30,
 			"inline_threshold":     1 << 20,
 			"storage_capabilities": map[string]any{"append_log_v1": true},

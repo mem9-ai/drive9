@@ -3,6 +3,8 @@
 package fuse
 
 import (
+	"encoding/json"
+	"net"
 	"os"
 	"testing"
 	"time"
@@ -27,6 +29,37 @@ func TestMountControlStatusReportsResolvedLayer(t *testing.T) {
 		server.Close()
 		if err != nil || status.Layer == nil || *status.Layer != layer {
 			t.Fatalf("layer %q: status = %#v, %v", layer, status, err)
+		}
+	}
+}
+
+func TestMountControlUnknownOperationDoesNotDrain(t *testing.T) {
+	runtimeDir, err := os.MkdirTemp("/tmp", "d9rt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(runtimeDir) })
+	t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
+	t.Setenv("TMPDIR", runtimeDir)
+	server, err := startMountControlServer(t.TempDir(), "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	for _, op := range []string{"switch", "switch-operation", "mistyped-drain"} {
+		conn, err := net.Dial("unix", server.SocketPath())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := json.NewEncoder(conn).Encode(map[string]string{"op": op}); err != nil {
+			_ = conn.Close()
+			t.Fatal(err)
+		}
+		var response mountcontrol.DrainResponse
+		err = json.NewDecoder(conn).Decode(&response)
+		_ = conn.Close()
+		if err != nil || response.OK || response.ErrorKind != "unsupported_operation" {
+			t.Fatalf("op=%s response=%+v err=%v", op, response, err)
 		}
 	}
 }

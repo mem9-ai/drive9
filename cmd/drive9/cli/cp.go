@@ -47,7 +47,6 @@ func Cp(c *client.Client, args []string) error {
 	appendMode := false
 	recursive := false
 	force := false
-	layerRef := ""
 	var tags map[string]string
 	var description string
 	filtered := make([]string, 0, len(args))
@@ -62,14 +61,8 @@ func Cp(c *client.Client, args []string) error {
 			recursive = true
 		case a == "-f" || a == "--force":
 			force = true
-		case a == "--layer":
-			if i+1 >= len(args) {
-				return fmt.Errorf("--layer requires argument")
-			}
-			i++
-			layerRef = strings.TrimSpace(args[i])
-		case strings.HasPrefix(a, "--layer="):
-			layerRef = strings.TrimSpace(strings.TrimPrefix(a, "--layer="))
+		case a == "--layer" || strings.HasPrefix(a, "--layer="):
+			return fmt.Errorf("Layer binding must include --work and --fence through the fs command")
 		case a == "--tag":
 			if i+1 >= len(args) {
 				return fmt.Errorf("--tag requires key=value argument")
@@ -108,23 +101,6 @@ func Cp(c *client.Client, args []string) error {
 	if resume && appendMode {
 		return fmt.Errorf("--resume and --append cannot be used together")
 	}
-	if layerRef != "" {
-		if recursive {
-			return layerRefMustBeEmpty(layerRef, "-r/--recursive")
-		}
-		if appendMode {
-			return layerRefMustBeEmpty(layerRef, "--append")
-		}
-		if resume {
-			return layerRefMustBeEmpty(layerRef, "--resume")
-		}
-		if len(tags) > 0 {
-			return layerRefMustBeEmpty(layerRef, "--tag")
-		}
-		if description != "" {
-			return layerRefMustBeEmpty(layerRef, "--description")
-		}
-	}
 	if appendMode && len(tags) > 0 {
 		return fmt.Errorf("--append and --tag cannot be used together")
 	}
@@ -154,9 +130,6 @@ func Cp(c *client.Client, args []string) error {
 		return err
 	}
 	if srcLoc.Kind == KindObject || dstLoc.Kind == KindObject {
-		if layerRef != "" {
-			return fmt.Errorf("--layer is drive9-only")
-		}
 		if appendMode {
 			return fmt.Errorf("--append is only supported for uploads to drive9")
 		}
@@ -171,9 +144,6 @@ func Cp(c *client.Client, args []string) error {
 	// D14: cross-context drive9 copy streams through the laptop.
 	if srcLoc.Kind == KindDrive9 && dstLoc.Kind == KindDrive9 &&
 		srcLoc.Context != dstLoc.Context {
-		if layerRef != "" {
-			return fmt.Errorf("--layer is not supported for cross-context copy")
-		}
 		if appendMode {
 			return fmt.Errorf("--append is not supported for cross-context copy")
 		}
@@ -228,7 +198,7 @@ func Cp(c *client.Client, args []string) error {
 		case !srcIsRemote && dstIsRemote:
 			if dstRP.Context != "" {
 				var err error
-				c, err = newFSClientForContext(dstRP.Context)
+				c, err = fsClientInContext(c, dstRP.Context)
 				if err != nil {
 					return err
 				}
@@ -237,7 +207,7 @@ func Cp(c *client.Client, args []string) error {
 		case srcIsRemote && !dstIsRemote:
 			if srcRP.Context != "" {
 				var err error
-				c, err = newFSClientForContext(srcRP.Context)
+				c, err = fsClientInContext(c, srcRP.Context)
 				if err != nil {
 					return err
 				}
@@ -248,7 +218,7 @@ func Cp(c *client.Client, args []string) error {
 			case srcRP.Context == "" && dstRP.Context == "":
 			case srcRP.Context != "" && dstRP.Context != "" && srcRP.Context == dstRP.Context:
 				var err error
-				c, err = newFSClientForContext(srcRP.Context)
+				c, err = fsClientInContext(c, srcRP.Context)
 				if err != nil {
 					return err
 				}
@@ -263,12 +233,9 @@ func Cp(c *client.Client, args []string) error {
 
 	switch {
 	case src == "-" && dstIsRemote:
-		if err := requireNoLayerWithRemoteContext(layerRef, dstRP, dst); err != nil {
-			return err
-		}
 		if dstRP.Context != "" {
 			var err error
-			c, err = newFSClientForContext(dstRP.Context)
+			c, err = fsClientInContext(c, dstRP.Context)
 			if err != nil {
 				return err
 			}
@@ -280,9 +247,6 @@ func Cp(c *client.Client, args []string) error {
 		data, err := readAllStdin()
 		if err != nil {
 			return err
-		}
-		if layerRef != "" {
-			return uploadBytesToLayer(ctx, c, layerRef, resolvedDst, data, 0o644, true)
 		}
 		if appendMode {
 			return c.AppendStream(ctx, resolvedDst, bytes.NewReader(data), int64(len(data)), printProgress)
@@ -304,7 +268,7 @@ func Cp(c *client.Client, args []string) error {
 	case srcIsRemote && dst == "-":
 		if srcRP.Context != "" {
 			var err error
-			c, err = newFSClientForContext(srcRP.Context)
+			c, err = fsClientInContext(c, srcRP.Context)
 			if err != nil {
 				return err
 			}
@@ -312,12 +276,9 @@ func Cp(c *client.Client, args []string) error {
 		return streamToStdout(ctx, c, srcRP.Path)
 
 	case !srcIsRemote && dstIsRemote:
-		if err := requireNoLayerWithRemoteContext(layerRef, dstRP, dst); err != nil {
-			return err
-		}
 		if dstRP.Context != "" {
 			var err error
-			c, err = newFSClientForContext(dstRP.Context)
+			c, err = fsClientInContext(c, dstRP.Context)
 			if err != nil {
 				return err
 			}
@@ -325,9 +286,6 @@ func Cp(c *client.Client, args []string) error {
 		resolvedDst, err := resolveRemoteCopyTarget(ctx, c, dstRP.Path, filepath.Base(src))
 		if err != nil {
 			return err
-		}
-		if layerRef != "" {
-			return uploadLocalFileToLayer(ctx, c, layerRef, src, resolvedDst)
 		}
 		if appendMode {
 			return appendFile(ctx, c, src, resolvedDst)
@@ -338,12 +296,9 @@ func Cp(c *client.Client, args []string) error {
 		return uploadFileWithTagsAndDescription(ctx, c, src, resolvedDst, tags, description)
 
 	case srcIsRemote && !dstIsRemote:
-		if layerRef != "" {
-			return fmt.Errorf("--layer is only supported for uploads or remote-to-remote copy targets")
-		}
 		if srcRP.Context != "" {
 			var err error
-			c, err = newFSClientForContext(srcRP.Context)
+			c, err = fsClientInContext(c, srcRP.Context)
 			if err != nil {
 				return err
 			}
@@ -355,19 +310,11 @@ func Cp(c *client.Client, args []string) error {
 		return downloadFile(ctx, c, srcRP.Path, resolvedDst)
 
 	case srcIsRemote && dstIsRemote:
-		if layerRef != "" {
-			if err := requireNoLayerWithRemoteContext(layerRef, srcRP, src); err != nil {
-				return err
-			}
-			if err := requireNoLayerWithRemoteContext(layerRef, dstRP, dst); err != nil {
-				return err
-			}
-		}
 		switch {
 		case srcRP.Context == "" && dstRP.Context == "":
 		case srcRP.Context != "" && dstRP.Context != "" && srcRP.Context == dstRP.Context:
 			var err error
-			c, err = newFSClientForContext(srcRP.Context)
+			c, err = fsClientInContext(c, srcRP.Context)
 			if err != nil {
 				return err
 			}
@@ -377,19 +324,6 @@ func Cp(c *client.Client, args []string) error {
 		resolvedDst, err := resolveRemoteCopyTarget(ctx, c, dstRP.Path, pathpkg.Base(srcRP.Path))
 		if err != nil {
 			return err
-		}
-		if layerRef != "" {
-			data, err := c.ReadCtx(ctx, srcRP.Path)
-			if err != nil {
-				return err
-			}
-			mode := uint32(0)
-			hasMode := false
-			if stat, err := c.StatCtx(ctx, srcRP.Path); err == nil && stat.HasMode {
-				mode = stat.Mode & 0o777
-				hasMode = true
-			}
-			return uploadBytesToLayer(ctx, c, layerRef, resolvedDst, data, mode, hasMode)
 		}
 		return c.Copy(srcRP.Path, resolvedDst)
 
@@ -822,4 +756,12 @@ func emitUploadSummary(ctx context.Context, summary *client.UploadSummary, local
 		zap.String("remote_path", summary.RemotePath),
 		zap.String("local_path", localPath),
 	)
+}
+
+func readAllStdin() ([]byte, error) {
+	data, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return nil, fmt.Errorf("read stdin: %w", err)
+	}
+	return data, nil
 }

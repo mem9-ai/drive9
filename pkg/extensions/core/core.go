@@ -883,6 +883,17 @@ func (c *Core) statOp(ctx context.Context, path string, allowListing bool) (fs.R
 	}
 	st, err := c.statWithTransientRetry(ctx, path)
 	if err != nil {
+		// A main mount may authorize listing its root without authorizing
+		// HEAD. Recheck that exact directory, never a parent or cached list.
+		// This supplies only mount-root attributes; content and mutations
+		// still use their own server authorization. Fixed views require HEAD.
+		var statusErr *client.StatusError
+		if path == "/" && c.cl.ViewBinding().LayerID == "" && errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusForbidden {
+			if _, listErr := c.cl.ListCtx(ctx, c.remotePath(path)); listErr != nil {
+				return fs.Result{}, c.mapErr(listErr)
+			}
+			return fs.Result{Attr: &fs.Attr{Kind: fs.KindDir, Mode: 0o755}}, nil
+		}
 		if client.IsNotFound(err) {
 			// v1 cacheRemoteNotFoundPath: a remote-observed miss seeds a
 			// short-lived negative row (the storm escalation rides along;
@@ -1307,8 +1318,9 @@ func (c *Core) truncateRemoteToZero(ctx context.Context, rp string, st *client.S
 // carries the revision; the terminal synthesizes the empty-file row from the
 // request mode (v1 Create answered from the inode it had just built).
 func (c *Core) createRemoteFile(ctx context.Context, op *fs.Op, rp string) (*client.StatResult, error) {
+	mode := op.Mode & 0o7777
 	commitCtx, cancel := c.namespaceMutationCommitContext(ctx)
-	rev, err := c.cl.CreateFileCtx(commitCtx, rp)
+	rev, modeApplied, err := c.createEmptyRemote(commitCtx, rp, mode)
 	cancel()
 	if err != nil {
 		if !errors.Is(err, client.ErrConflict) {
@@ -1340,7 +1352,7 @@ func (c *Core) createRemoteFile(ctx context.Context, op *fs.Op, rp string) (*cli
 		for range 12 {
 			if _, serr := c.remoteStatDetached(rp); serr != nil && client.IsNotFound(serr) {
 				retryCtx, rcancel := c.namespaceMutationCommitContext(ctx)
-				rev, err = c.cl.CreateFileCtx(retryCtx, rp)
+				rev, modeApplied, err = c.createEmptyRemote(retryCtx, rp, mode)
 				rcancel()
 				if err == nil {
 					break
@@ -1358,8 +1370,7 @@ func (c *Core) createRemoteFile(ctx context.Context, op *fs.Op, rp string) (*cli
 	// An explicit create mode is always meaningful (mode 0 must be applied,
 	// not skipped: pjdfstest creates 00-mode files); the full 0o7777 range
 	// keeps SUID/SGID at create (chmod/12).
-	mode := op.Mode & 0o7777
-	if mode != 0o644 {
+	if mode != 0o644 && !modeApplied {
 		if err := retryPostUploadMode(ctx, func() error {
 			// v1 masks the create-mode chmod to 0o777 at the wire
 			// (remoteChmodMode); SUID/SGID stays local.

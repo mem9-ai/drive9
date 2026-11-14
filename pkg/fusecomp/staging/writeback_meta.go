@@ -72,9 +72,10 @@ type PathLockEntry struct {
 // serialized per-path by pathLocks. This allows different files to write
 // concurrently while keeping same-path operations safe.
 type WriteBackCache struct {
-	dir     string // e.g. ~/.cache/drive9/{mount-hash}/pending
-	mu      sync.Mutex
-	nextGen atomic.Uint64
+	dir        string // e.g. ~/.cache/drive9/{mount-hash}/pending
+	mu         sync.Mutex
+	nextGen    atomic.Uint64
+	fixedFloor fixedUploadGenerationFloor
 	// metas is the authoritative in-memory metadata index.
 	// Kept in sync with disk by Put/Remove/RenamePending so that GetMeta and
 	// ListPendingPaths avoid local disk I/O and JSON parsing on hot paths.
@@ -105,18 +106,20 @@ type PendingKind int
 // WriteBackMeta stores metadata alongside cached file data so that the
 // background uploader (and crash-recovery) knows the remote path and size.
 type WriteBackMeta struct {
-	Path             string      `json:"path"`
-	Size             int64       `json:"size"`
-	Mtime            time.Time   `json:"mtime"`
-	CreatedAt        time.Time   `json:"created_at"`
-	Generation       uint64      `json:"generation,omitempty"`
-	Kind             PendingKind `json:"kind"`
-	BaseRev          int64       `json:"base_rev,omitempty"`
-	ShadowSpill      bool        `json:"shadow_spill,omitempty"`
-	Mode             uint32      `json:"mode,omitempty"`
-	HasMode          bool        `json:"has_mode,omitempty"`
-	SnapshotID       string      `json:"-"`
-	ParentSnapshotID string      `json:"-"`
+	FixedUploadSeed           string      `json:"fixed_upload_seed,omitempty"`
+	FixedUploadSeedGeneration uint64      `json:"fixed_upload_seed_generation,omitempty"`
+	Path                      string      `json:"path"`
+	Size                      int64       `json:"size"`
+	Mtime                     time.Time   `json:"mtime"`
+	CreatedAt                 time.Time   `json:"created_at"`
+	Generation                uint64      `json:"generation,omitempty"`
+	Kind                      PendingKind `json:"kind"`
+	BaseRev                   int64       `json:"base_rev,omitempty"`
+	ShadowSpill               bool        `json:"shadow_spill,omitempty"`
+	Mode                      uint32      `json:"mode,omitempty"`
+	HasMode                   bool        `json:"has_mode,omitempty"`
+	SnapshotID                string      `json:"-"`
+	ParentSnapshotID          string      `json:"-"`
 	// SupersedesPendingGen records the pending-index generation this image
 	// composed over at staging time (0 = unknown/legacy). A later landing of
 	// this entry may retire failure state whose pending generation is at or
@@ -210,9 +213,12 @@ func NewWriteBackCache(dir string) (*WriteBackCache, error) {
 		dataMaxBytes: defaultWriteBackDataCacheMaxSize,
 		pathLocks:    make(map[string]*PathLockEntry),
 	}
+	if err := c.fixedFloor.load(dir); err != nil {
+		return nil, err
+	}
 	// Populate in-memory index from disk (crash recovery).
 	entries, _ := os.ReadDir(dir)
-	var maxGen uint64
+	maxGen := c.fixedFloor.generation
 	for _, e := range entries {
 		name := e.Name()
 		if !strings.HasSuffix(name, ".meta") {
