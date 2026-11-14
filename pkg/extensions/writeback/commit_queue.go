@@ -1875,7 +1875,7 @@ func (cq *CommitQueue) batchWriteEligible(entry *CommitEntry) bool {
 		return false
 	}
 	threshold := cq.directPutThreshold()
-	return entry.Size == 0 || (threshold > 0 && entry.Size < threshold)
+	return client.UseDirectPUT(entry.Size, threshold)
 }
 
 func (cq *CommitQueue) commitBatch(entries []*CommitEntry) {
@@ -2394,15 +2394,9 @@ func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) (int
 		return 0, fmt.Errorf("read shadow: %w", err)
 	}
 
-	// Route based on entry.Size (metadata at enqueue time), NOT len(data).
-	// Files under directPutThreshold use direct PUT to skip the multipart
-	// initiate/presign/complete/finalize overhead (~440ms). When threshold
-	// is 0 (no server value cached) we deliberately do not direct-PUT
-	// non-empty files: the server may be configured below 50KB and would
-	// reject the simple PUT. Zero-byte files keep direct PUT because V2
-	// initiate rejects total_size=0.
+	// Preserve the enqueue-time size when selecting the upload protocol.
 	threshold := cq.directPutThreshold()
-	useDirectPUT := entry.Size == 0 || (threshold > 0 && entry.Size < threshold)
+	useDirectPUT := client.UseDirectPUT(entry.Size, threshold)
 	if useDirectPUT {
 		start := time.Now()
 		committedRev, err := cq.client.WriteCtxConditionalWithRevision(ctx, apiPath, data, expectedRevision)

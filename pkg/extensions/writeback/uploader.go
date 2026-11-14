@@ -484,7 +484,7 @@ func (u *WriteBackUploader) uploadSyncWithMetadata(ctx context.Context, localPat
 
 	var committedRev int64
 	threshold := u.directPutThreshold()
-	useDirectPUT := meta.Size == 0 || (threshold > 0 && meta.Size < threshold)
+	useDirectPUT := client.UseDirectPUT(meta.Size, threshold)
 	put := func(ctx context.Context, rev int64) (int64, error) {
 		if useDirectPUT {
 			return u.client.WriteCtxConditionalWithRevision(ctx, u.remotePath(localPath), data, rev)

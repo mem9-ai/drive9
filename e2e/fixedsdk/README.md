@@ -52,12 +52,12 @@ A later replay must preserve a newer main overwrite. The optional SDK fixtures r
 the offline probe tests do not execute them.
 
 Live acceptance for these paired PRs is the server repository's
-[Local E2E / Drive9 E2E workflow](https://github.com/tidbcloud/fs/blob/dev2/layerfs-v10/.github/workflows/local-e2e.yml).
+[Local E2E / Drive9 E2E workflow](https://github.com/tidbcloud/fs/blob/5ec6b1888f9f076b1e710cd9d489a136e1453321/.github/workflows/local-e2e.yml).
 It checks out this client at a full commit SHA, then uses isolated TiKV and
 object storage to run actual mounted Layer writes, same-mount switching,
 validation and merge, followed by the ordinary main suite. Its final step
 requires both suites to succeed; a failure or skip is not acceptance.
-The [Executor Linux FUSE corpus](https://github.com/tidbcloud/fs/blob/dev2/layerfs-v10/.github/workflows/executor.yml)
+The [Executor Linux FUSE corpus](https://github.com/tidbcloud/fs/blob/5ec6b1888f9f076b1e710cd9d489a136e1453321/.github/workflows/executor.yml)
 also pins the client SHA and checks ordinary filesystem behavior.
 
 A client-only CI pass is insufficient for a new client revision: update both

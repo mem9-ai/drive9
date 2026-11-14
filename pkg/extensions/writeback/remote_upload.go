@@ -91,7 +91,7 @@ func uploadBufferedRemoteFileWithRevision(ctx context.Context, c *client.Client,
 	// landings report 0 and the caller records no payload identity for
 	// them — conservative, exactly like the ledger track.
 	threshold := c.CachedSmallFileThreshold()
-	if len(data) == 0 || (threshold > 0 && int64(len(data)) < threshold) {
+	if client.UseDirectPUT(int64(len(data)), threshold) {
 		return c.WriteCtxConditionalWithRevision(ctx, remotePath, data, expectedRevision)
 	}
 	if err := c.WriteStreamConditional(ctx, remotePath, bytes.NewReader(data), int64(len(data)), nil, expectedRevision); err != nil {
@@ -103,7 +103,7 @@ func uploadBufferedRemoteFileWithRevision(ctx context.Context, c *client.Client,
 // isInlineShadowUpload is shared by the ordinary uploader and combined-mode
 // eligibility. Empty files have their own direct-PUT path.
 func isInlineShadowUpload(size, threshold int64) bool {
-	return size > 0 && threshold > 0 && size < threshold
+	return size > 0 && client.UseDirectPUT(size, threshold)
 }
 
 // uploadFromShadowRemote streams a shadow with generation fencing through remote

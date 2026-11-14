@@ -5,6 +5,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+
+	"github.com/mem9-ai/drive9/pkg/client"
 )
 
 // uploadShadowSpill binds only small, generation-checked images. The private
@@ -27,7 +29,7 @@ func (cq *CommitQueue) uploadShadowSpill(ctx context.Context, entry *CommitEntry
 		entry.bindPayload(data)
 	}
 	threshold := cq.directPutThreshold()
-	if entry.Size == 0 || (threshold > 0 && entry.Size < threshold) {
+	if client.UseDirectPUT(entry.Size, threshold) {
 		return cq.client.WriteCtxConditionalWithRevision(ctx, apiPath, entry.payload, expectedRevision)
 	}
 	err := cq.client.WriteMultipartStreamConditional(ctx, apiPath, bytes.NewReader(entry.payload), entry.Size, nil, expectedRevision)
