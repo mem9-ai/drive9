@@ -94,10 +94,12 @@ the **current** key.
    manifest it came from is still signed with the old one, so updating *from* the transition
    binary fails verification until step 4.
 4. Replace `DRIVE9_RELEASE_SIGNING_KEY` with the new private key and publish the next
-   release. From that point clients running the transition release verify the new key, and
-   `drive9 update` works again in both directions.
+   release. Confirm a **transition client** (installed at step 3) installs it: that update
+   crosses the trust change and is the proof the rotation finished. A client still running a
+   pre-transition binary cannot verify this manifest — old-key binaries reject new-key
+   signatures, which is step 5's problem, not a step 4 failure.
 5. Keep the transition release's artifacts published until the fleet has moved. A client that
-   missed it still trusts the old key and will reject new-key-signed manifests; recover it
+   missed it still trusts the old key and rejects every new-key-signed manifest; recover it
    with a manual install of the target release (download the artifact for its platform and
    place it on `PATH`, or reinstall from the transition release while it is still served).
 
