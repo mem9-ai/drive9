@@ -500,11 +500,8 @@ func (h *Handler) handleForLocked(path string, fh uint64) *engineHandle {
 // become) an engine file.
 func (h *Handler) tryClaimOpen(ctx context.Context, op *fs.Op) (fs.Result, error, bool) {
 	if h.opts.Engine == nil {
-		claimDebug("decline engine-nil path=%s", op.Path)
 		return fs.Result{}, nil, false
 	}
-	claimDebug("probe path=%s flags=%#x kernelCreate=%v patterns=%d threshold=%d",
-		op.Path, op.Flags, op.KernelCreate(), len(h.opts.Patterns), h.opts.Threshold)
 	// Serialized against retention for this name (unlink or rename-over):
 	// a claim straddling a retention boundary would attach a descriptor
 	// for the retained file onto the replaceable name. The layout decision
@@ -534,21 +531,17 @@ func (h *Handler) tryClaimOpen(ctx context.Context, op *fs.Op) (fs.Result, error
 				if st.Size == 0 && op.Flags&uint32(syscall.O_EXCL) == 0 &&
 					h.opts.Engine.Bridge.EmptyPlaceholderFor(op.Path) {
 					res, err := h.createOnEngine(ctx, op)
-					claimDebug("reclaimed-empty-placeholder path=%s err=%v", op.Path, err)
 					return res, err, true
 				}
-				claimDebug("decline exists-classic-layout path=%s", op.Path)
 				return fs.Result{}, nil, false
 			}
 			handle, attr, errno := h.openExistingLocked(ctx, op.Path, op.Flags, op.Caller)
 			if errno != 0 {
 				return fs.Result{}, errno, true
 			}
-			claimDebug("open-existing-extent path=%s", op.Path)
 			return fs.Result{Handle: handle, Attr: attr}, nil, true
 		}
 		if !client.IsNotFound(err) {
-			claimDebug("decline stat-error path=%s err=%v", op.Path, err)
 			return fs.Result{}, nil, false
 		}
 	}
@@ -592,14 +585,9 @@ func (h *Handler) tryClaimOpen(ctx context.Context, op *fs.Op) (fs.Result, error
 	// matches an explicit --extent / [extent] pattern; otherwise creation
 	// stays on the classic plane (hybrid promotion).
 	if op.Flags&syscall.O_CREAT == 0 || (h.opts.Threshold != 0 && !h.claimsPattern(op.Path)) {
-		claimDebug("decline guard path=%s ocreat=%v patternMatched=%v",
-			op.Path, op.Flags&syscall.O_CREAT != 0, h.claimsPattern(op.Path))
 		return fs.Result{}, nil, false
 	}
 	res, err := h.createOnEngine(ctx, op)
-	if err == nil {
-		claimDebug("claimed-fresh path=%s", op.Path)
-	}
 	return res, err, true
 }
 

@@ -30,12 +30,13 @@ type createOnceTestServer struct {
 	requiredHeaders map[string]string // PUT is rejected unless these are sent
 	ignorePresence  int               // presign/PATCH calls that pretend nothing is stored yet
 
-	objects      map[string][]byte
-	putAttempts  []string // keys PUT was attempted on, in order
-	patchCalls   int
-	presignCalls int
-	completes    []map[string]any
-	aborted      []string
+	objects               map[string][]byte
+	putAttempts           []string // keys PUT was attempted on, in order
+	patchCalls            int
+	patchExpectedResource []string
+	presignCalls          int
+	completes             []map[string]any
+	aborted               []string
 }
 
 func newCreateOnceTestServer(t *testing.T, conflictStatus int, required map[string]string) *createOnceTestServer {
@@ -93,6 +94,7 @@ func newCreateOnceTestServer(t *testing.T, conflictStatus int, required map[stri
 		ts.mu.Lock()
 		defer ts.mu.Unlock()
 		ts.patchCalls++
+		ts.patchExpectedResource = append(ts.patchExpectedResource, r.Header.Get("X-Dat9-Expected-Resource"))
 		dirty, _ := body["dirty_blocks"].([]any)
 		blocks := make([]ExtentWritePlanBlock, 0, len(dirty))
 		for i := range dirty {
@@ -317,5 +319,72 @@ func TestUploadExtentSequentialResumesAfterInterruptedUpload(t *testing.T) {
 	}
 	if ts.presignCalls != 2 || len(ts.completes) != 1 {
 		t.Fatalf("presign=%d completes=%d, want 2/1", ts.presignCalls, len(ts.completes))
+	}
+}
+
+func TestCommitExtentPatchExpectedResourceReplansOnCreateOnceConflict(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+	}{
+		{"gcs-412", http.StatusPreconditionFailed},
+		{"azure-403", http.StatusForbidden},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := newCreateOnceTestServer(t, tc.status, gcsLikeHeaders)
+			data := []byte("expected resource conflict block")
+			ts.objects[sha256Hex(data)] = data
+			ts.ignorePresence = 1
+
+			cl := New(ts.URL, "")
+			if err := cl.CommitExtentPatchExpectedResource(context.Background(), "/f.bin", 4096, []ExtentBlockWrite{{Chunk: 0, Off: 0, Data: data}}, 2, "res-42"); err != nil {
+				t.Fatalf("CommitExtentPatchExpectedResource after conflict: %v", err)
+			}
+			ts.mu.Lock()
+			defer ts.mu.Unlock()
+			if ts.patchCalls != 2 || len(ts.completes) != 1 || len(ts.aborted) == 0 {
+				t.Fatalf("patch=%d completes=%d aborted=%v", ts.patchCalls, len(ts.completes), ts.aborted)
+			}
+			for i, got := range ts.patchExpectedResource {
+				if got != "res-42" {
+					t.Fatalf("patch %d X-Dat9-Expected-Resource = %q, want res-42", i, got)
+				}
+			}
+		})
+	}
+}
+
+func TestCommitExtentPatchExpectedResourceDeduplicatesBatchPut(t *testing.T) {
+	ts := newCreateOnceTestServer(t, http.StatusPreconditionFailed, gcsLikeHeaders)
+	ts.ignorePresence = 1
+	dup := bytes.Repeat([]byte{0x55}, 4<<20)
+	cl := New(ts.URL, "")
+	err := cl.CommitExtentPatchExpectedResource(context.Background(), "/dup.bin", 8<<20, []ExtentBlockWrite{
+		{Chunk: 0, Off: 0, Data: dup},
+		{Chunk: 0, Off: 4 << 20, Data: dup},
+	}, 5, "res-dup")
+	if err != nil {
+		t.Fatalf("CommitExtentPatchExpectedResource dup batch: %v", err)
+	}
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	if len(ts.putAttempts) != 1 {
+		t.Fatalf("PUT attempts = %d, want 1 deduped PUT for identical batch blocks", len(ts.putAttempts))
+	}
+	if len(ts.completes) != 1 {
+		t.Fatalf("completes = %d, want 1", len(ts.completes))
+	}
+}
+
+func TestCommitExtentPatchMetadataOnlyResize(t *testing.T) {
+	ts := newCreateOnceTestServer(t, http.StatusPreconditionFailed, gcsLikeHeaders)
+	cl := New(ts.URL, "")
+	if err := cl.CommitExtentPatchExpectedResource(context.Background(), "/resize.bin", 8192, nil, 3, "res-size"); err != nil {
+		t.Fatalf("CommitExtentPatchExpectedResource resize: %v", err)
+	}
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	if ts.patchCalls != 1 || len(ts.putAttempts) != 0 || len(ts.completes) != 1 {
+		t.Fatalf("patch=%d puts=%d completes=%d, want 1/0/1", ts.patchCalls, len(ts.putAttempts), len(ts.completes))
 	}
 }

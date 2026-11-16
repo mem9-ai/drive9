@@ -2,6 +2,8 @@ package extent
 
 import (
 	"context"
+	"os"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -52,13 +54,30 @@ type EngineConfig struct {
 	ReadOnly bool
 }
 
-// defaultMaxUpload is the engine's staging-upload worker count. Raising it
-// past 4 triggered staging-file eviction races on staging (the uploader
-// opened files free-space eviction had already deleted — uploadStagingFile
-// "no such file" storms and a silently truncated 6 GiB landing), so the
-// safe default stays 4 until that interaction is understood; the knob
-// exists for controlled experiments.
-const defaultMaxUpload = 4
+const (
+	// defaultMaxUpload is the direct in-memory staging concurrency used
+	// when JuiceFS native Writeback is disabled.
+	defaultMaxUpload = 16
+	// defaultWritebackMaxUpload bounds upload workers when native
+	// rawstaging Writeback is explicitly enabled (avoids free-space
+	// staging-eviction races under disk pressure).
+	defaultWritebackMaxUpload = 4
+	defaultMaxDownload        = 16
+)
+
+// envMaxUpload overrides the default upload concurrency when
+// DRIVE9_EXTENT_MAX_UPLOAD is set.
+func envMaxUpload(nativeWriteback bool) int {
+	if v := os.Getenv("DRIVE9_EXTENT_MAX_UPLOAD"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	if nativeWriteback {
+		return defaultWritebackMaxUpload
+	}
+	return defaultMaxUpload
+}
 
 // upstreamChunkDefaultsForTest exposes the chunk-store defaults the engine
 // installs (test hook: they must match JuiceFS's own mount defaults).
@@ -104,9 +123,10 @@ func NewEngine(cfg EngineConfig) *Engine {
 	// behavior), so the operator's number passes through verbatim.
 	cacheSize := uint64(cfg.CacheSize)
 	blockSize := blockSizeMiB << 20
+	nativeWriteback := cfg.Writeback && cfg.CacheDir != ""
 	maxUpload := cfg.MaxUpload
 	if maxUpload <= 0 {
-		maxUpload = defaultMaxUpload
+		maxUpload = envMaxUpload(nativeWriteback)
 	}
 	chunkConf := chunk.Config{
 		BlockSize:  blockSize << 0,
@@ -127,7 +147,7 @@ func NewEngine(cfg EngineConfig) *Engine {
 		Readahead:      8 * blockSize,
 		Prefetch:       1,
 		MaxUpload:      maxUpload,
-		MaxDownload:    4,
+		MaxDownload:    defaultMaxDownload,
 		// BufferSize is JuiceFS's TOTAL read/write buffering budget, and it
 		// is not just a soft throttle: the data reader derives its global
 		// read-ahead budget from it (80% of this value gates every read

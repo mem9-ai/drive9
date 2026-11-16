@@ -1177,7 +1177,6 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 // client's PATCH path uploads them at bounded concurrency.
 func (b *Bridge) commitExtentExisting(ctx context.Context, ino meta.Ino, path string, pending []pendingWrite, size, rev int64) error {
 	const piece = int64(client.ExtentBlockSize)
-	assembleStart := time.Now()
 	blocks := make([]client.ExtentBlockWrite, 0, len(pending)*2)
 	for _, p := range pending {
 		data, err := b.blockBytes(ctx, p, path)
@@ -1200,10 +1199,7 @@ func (b *Bridge) commitExtentExisting(ctx context.Context, ino meta.Ino, path st
 			})
 		}
 	}
-	publishStart := time.Now()
 	err := b.commitWithRetry(ctx, ino, path, blocks, size, rev)
-	commitTrace("commit ino=%d pending=%d blocks=%d bytes=%d assemble_ms=%d publish_ms=%d err=%v",
-		ino, len(pending), len(blocks), size, publishStart.Sub(assembleStart).Milliseconds(), time.Since(publishStart).Milliseconds(), err)
 	if err != nil {
 		return err
 	}
@@ -1433,20 +1429,33 @@ func (b *Bridge) flushPendingLocked(ctx context.Context, ino meta.Ino) error {
 	pending := b.pending[ino]
 	size, has := b.sizes[ino]
 	_, truncating := b.truncs[ino]
+	prevErr := b.commitErr[ino]
 	b.mu.Unlock()
 	if len(pending) == 0 {
 		// A truncate-only change has no staged slices but still needs a
 		// metadata publication. Dropping it here left the remote object at
 		// its old length after close (the FUSE smoke test's `: > file`).
 		if truncating {
-			return b.commit(ctx, ino, nil, size)
+			if err := b.commit(ctx, ino, nil, size); err != nil {
+				return err
+			}
+			b.mu.Lock()
+			delete(b.commitErr, ino)
+			b.mu.Unlock()
+			return nil
 		}
-		return nil
+		return prevErr
 	}
 	if !has {
-		return nil
+		return prevErr
 	}
-	return b.commit(ctx, ino, pending, size)
+	if err := b.commit(ctx, ino, pending, size); err != nil {
+		return err
+	}
+	b.mu.Lock()
+	delete(b.commitErr, ino)
+	b.mu.Unlock()
+	return nil
 }
 
 // flushTruncateOnly handles a pure truncate whose size changed but no
@@ -1499,68 +1508,14 @@ func (b *Bridge) flushTruncateOnly(ctx context.Context, ino meta.Ino, size int64
 		}
 		return nil
 	}
-	var blocks []client.ExtentBlockWrite
-	switch {
-	case size == 0:
-		// Truncation-only PATCH: no dirty blocks, NewSize drives the
-		// commit's truncation (drops the removed slices and dereferences
-		// their blocks).
-		blocks = nil
-	case size > st.Size:
-		n := int64(4096)
-		if rem := size - st.Size; rem < n {
-			n = rem
-		}
-		// A declared block never crosses a 64 MiB chunk boundary.
-		if remain := client.ExtentChunkSize - (st.Size % client.ExtentChunkSize); n > remain {
-			n = remain
-		}
-		if n <= 0 {
-			return fmt.Errorf("truncate growth at a chunk boundary needs a server protocol change: %s", path)
-		}
-		chunk, off, _ := client.ChunkOffset(st.Size)
-		blocks = []client.ExtentBlockWrite{{Chunk: chunk, Off: off, Data: make([]byte, n)}}
-	default:
-		// Shrink: re-declare the head block verbatim — the server already
-		// holds its content (dedupe skips the upload) and the commit
-		// carries the truncation.
-		plan, err := b.cfg.Client.GetExtentReadPlan(ctx, path, 0, 0)
-		if err != nil {
-			return err
-		}
-		if len(plan.Blocks) == 0 {
-			return fmt.Errorf("extent file %s has no blocks to re-declare for truncation", path)
-		}
-		blk := plan.Blocks[0]
-		chunk, off, _ := client.ChunkOffset(blk.FileOffset)
-		if blk.Zero {
-			n := blk.Length
-			if blk.FileOffset+n > size {
-				n = size - blk.FileOffset
-			}
-			blocks = []client.ExtentBlockWrite{{Chunk: chunk, Off: off, Data: make([]byte, n)}}
-		} else {
-			length := blk.Length
-			if blk.FileOffset+length > size {
-				length = size - blk.FileOffset
-			}
-			rc, err := b.cfg.Client.FetchExtentBlockRange(ctx, blk.URL, blk.BlockOffset, length)
-			if err != nil {
-				return err
-			}
-			data, err := io.ReadAll(rc)
-			_ = rc.Close()
-			if err != nil {
-				return err
-			}
-			blocks = []client.ExtentBlockWrite{{Chunk: chunk, Off: off, Data: data}}
-		}
-	}
-	if err := b.commitWithRetry(ctx, ino, path, blocks, size, st.Revision); err != nil {
+	// Metadata-only resize PATCH: empty dirty blocks works for zero, shrink,
+	// and sparse grow without downloading existing content or synthesizing blocks.
+	if err := b.commitWithRetry(ctx, ino, path, nil, size, st.Revision); err != nil {
 		return err // marker retained: the truncate has NOT landed
 	}
 	b.mu.Lock()
 	delete(b.truncs, ino)
+	delete(b.commitErr, ino)
 	b.mu.Unlock()
 	return nil
 }

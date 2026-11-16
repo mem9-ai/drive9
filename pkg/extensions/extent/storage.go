@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -99,10 +100,6 @@ func parseKey(key string) (id uint64, indx int64, size int64, err error) {
 }
 
 func (s objectStorage) Put(ctx context.Context, key string, in io.Reader, getters ...object.AttrGetter) error {
-	putStart := time.Now()
-	defer func() {
-		commitTrace("put size=%d ms=%d", sizeOfPut(key), time.Since(putStart).Milliseconds())
-	}()
 	id, indx, size, err := parseKey(key)
 	if err != nil {
 		return err
@@ -110,10 +107,35 @@ func (s objectStorage) Put(ctx context.Context, key string, in io.Reader, getter
 	if size <= 0 || size > maxStageBytes {
 		return fmt.Errorf("staged slice size %d out of bounds", size)
 	}
-	dir := ""
-	if s.bridge != nil {
-		dir = s.bridge.cfg.CacheDir
+	// When JuiceFS native Writeback is disabled, stage blocks directly in
+	// memory — avoiding double disk staging (rawstaging + temp file) and
+	// freeing NVMe IOPS during large writes.
+	if s.bridge == nil || !s.bridge.cfg.NativeWriteback {
+		buf := make([]byte, size)
+		if _, err := io.ReadFull(in, buf); err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				return fmt.Errorf("short staging read: %w", err)
+			}
+			return err
+		}
+		if s.bridge == nil {
+			return nil
+		}
+		s.bridge.mu.Lock()
+		defer s.bridge.mu.Unlock()
+		sl := s.bridge.stagedSlices[id]
+		if sl == nil {
+			sl = &stagedSlice{blocks: make(map[int64][]byte)}
+			s.bridge.stagedSlices[id] = sl
+		}
+		if prev, exists := sl.blocks[indx]; exists {
+			sl.total -= int64(len(prev))
+		}
+		sl.blocks[indx] = buf
+		sl.total += size
+		return nil
 	}
+	dir := s.bridge.cfg.CacheDir
 	if dir == "" {
 		dir = os.TempDir()
 	}
@@ -144,6 +166,9 @@ func (s objectStorage) Put(ctx context.Context, key string, in io.Reader, getter
 		sl = &stagedSlice{blocks: make(map[int64][]byte)}
 		s.bridge.stagedSlices[id] = sl
 	}
+	if prevPath, exists := sl.paths[indx]; exists && prevPath != tmp {
+		_ = os.Remove(prevPath)
+	}
 	sl.blocks[indx] = nil
 	if sl.paths == nil {
 		sl.paths = make(map[int64]string)
@@ -162,6 +187,11 @@ type stagedSlice struct {
 
 // join returns the concatenated slice object bytes.
 func (sl *stagedSlice) join() []byte {
+	if len(sl.paths) == 0 && len(sl.blocks) == 1 {
+		if b, ok := sl.blocks[0]; ok && int64(len(b)) == sl.total {
+			return b
+		}
+	}
 	out := make([]byte, 0, sl.total)
 	if len(sl.paths) > 0 {
 		for i := int64(0); int64(len(out)) < sl.total; i++ {
@@ -213,6 +243,12 @@ func (s objectStorage) Get(ctx context.Context, key string, off, limit int64, ge
 	// across their separate Gets.
 	s.bridge.mu.Lock()
 	sl := s.bridge.stagedSlices[id]
+	var staged []byte
+	if sl != nil && len(sl.paths) == 0 {
+		// Copy or reference snapshot safely under bridge lock so concurrent Put
+		// cannot race map reads on sl.blocks.
+		staged = sl.join()
+	}
 	s.bridge.mu.Unlock()
 	if sl == nil {
 		// A fetch pins for its OWN duration only (a concurrent stage
@@ -229,7 +265,9 @@ func (s objectStorage) Get(ctx context.Context, key string, off, limit int64, ge
 		s.bridge.blocks.releaseIssuePin(id)       // drain one handout pin
 	}
 	if sl != nil {
-		staged := sl.join()
+		if staged == nil {
+			staged = sl.join()
+		}
 		if objOff > int64(len(staged)) {
 			return io.NopCloser(bytes.NewReader(nil)), nil
 		}

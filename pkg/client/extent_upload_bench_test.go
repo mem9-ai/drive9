@@ -52,7 +52,7 @@ func TestExtentSequentialUpload6GiBBench(t *testing.T) {
 	}
 	size := int64(6 << 30)
 	if v := os.Getenv("DRIVE9_EXTENT_UPLOAD_BENCH_SIZE"); v != "" {
-		fmt.Sscanf(v, "%d", &size)
+		_, _ = fmt.Sscanf(v, "%d", &size)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()

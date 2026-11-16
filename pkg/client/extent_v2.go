@@ -19,10 +19,10 @@ import (
 
 // extentPatchPutConcurrency bounds the parallel presigned block PUTs one
 // PATCH commit issues (the completion verifies every part, so the round
-// trips are independent). Eight parallel 4 MiB PUTs keep a dirty batch
+// trips are independent). Sixteen parallel 4 MiB PUTs keep a dirty batch
 // from being paced by a single stream's latency without stampeding the
 // object store.
-const extentPatchPutConcurrency = 8
+const extentPatchPutConcurrency = 16
 
 // Extent content layout v2. The server owns the block layout (64 MiB chunks
 // of content-addressed 4 MiB blocks) and all maintenance; the client speaks
@@ -427,11 +427,19 @@ func ChunkOffset(fileOffset int64) (chunk uint32, off uint32, ok bool) {
 // CommitExtentPatch uploads dirty blocks and commits the patch session in
 // one call: PATCH → PUT each non-existing block → complete with explicit
 // part records. expectedRevision must match the server's current revision.
+// CommitExtentPatchExpectedResource uploads dirty blocks and commits the
+// patch session, bound to expectedResourceID when non-empty.
 func (c *Client) CommitExtentPatchExpectedResource(ctx context.Context, path string, newSize int64, blocks []ExtentBlockWrite, expectedRevision int64, expectedResourceID string) error {
-	// Same contract as CommitExtentPatch, bound to the object's resource
-	// identity (see InitiateExtentPatchExpectedResource).
-	if len(blocks) == 0 && newSize != 0 {
-		return fmt.Errorf("extent patch requires at least one dirty block")
+	return c.commitExtentPatch(ctx, path, newSize, blocks, expectedRevision, expectedResourceID)
+}
+
+func (c *Client) CommitExtentPatch(ctx context.Context, path string, newSize int64, blocks []ExtentBlockWrite, expectedRevision int64) error {
+	return c.commitExtentPatch(ctx, path, newSize, blocks, expectedRevision, "")
+}
+
+func (c *Client) commitExtentPatch(ctx context.Context, path string, newSize int64, blocks []ExtentBlockWrite, expectedRevision int64, expectedResourceID string) error {
+	if newSize < 0 {
+		return fmt.Errorf("extent patch requires non-negative new size")
 	}
 	dirty := make([]ExtentDirtyBlock, len(blocks))
 	for i, b := range blocks {
@@ -448,76 +456,10 @@ func (c *Client) CommitExtentPatchExpectedResource(ctx context.Context, path str
 	if err != nil {
 		return err
 	}
-	parts := make([]completePart, 0, len(blocks))
-	type putJob struct {
-		url     string
-		headers map[string]string
-		data    []byte
-	}
-	var puts []putJob
-	for i, b := range blocks {
-		wb := extentPlanBlockFor(plan, dirty[i])
-		if wb == nil {
-			return fmt.Errorf("extent patch plan lacks block %d/%d", dirty[i].Chunk, dirty[i].Off)
-		}
-		if !wb.Exists && wb.URL != "" {
-			puts = append(puts, putJob{url: wb.URL, headers: wb.Headers, data: b.Data})
-		}
-		parts = append(parts, completePart{
-			Number: i + 1,
-			ETag:   dirty[i].Checksum,
-			Chunk:  b.Chunk,
-			Off:    b.Off,
-			Size:   int64(len(b.Data)),
-		})
-	}
-	// The presigned PUTs address distinct content-addressed objects and the
-	// completion verifies each part, so they are independent round trips:
-	// run them at bounded concurrency instead of one-by-one, so a dirty
-	// batch is not paced by a single block's upload latency.
-	if len(puts) > 0 {
-		g, gctx := errgroup.WithContext(ctx)
-		g.SetLimit(extentPatchPutConcurrency)
-		for _, job := range puts {
-			job := job
-			g.Go(func() error {
-				return c.putExtentBlock(gctx, job.url, job.headers, job.data)
-			})
-		}
-		if err := g.Wait(); err != nil {
-			c.abortUploadV2BestEffort(ctx, plan.UploadID)
-			return err
-		}
-	}
-	if err := c.completeUploadV2WithOptions(ctx, plan.UploadID, parts, nil, ""); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (c *Client) CommitExtentPatch(ctx context.Context, path string, newSize int64, blocks []ExtentBlockWrite, expectedRevision int64) error {
-	if len(blocks) == 0 && newSize != 0 {
-		return fmt.Errorf("extent patch requires at least one dirty block")
-	}
-	dirty := make([]ExtentDirtyBlock, len(blocks))
-	for i, b := range blocks {
-		if len(b.Data) == 0 {
-			return fmt.Errorf("dirty block %d is empty", i)
-		}
-		if int64(len(b.Data)) > ExtentChunkSize {
-			return fmt.Errorf("dirty block %d exceeds the chunk span", i)
-		}
-		sum := sha256.Sum256(b.Data)
-		dirty[i] = ExtentDirtyBlock{Chunk: b.Chunk, Off: b.Off, Size: int64(len(b.Data)), Checksum: hex.EncodeToString(sum[:])}
-	}
-	plan, err := c.InitiateExtentPatch(ctx, path, newSize, dirty, expectedRevision)
-	if err != nil {
-		return err
-	}
 	// Block objects are create-once: a PUT that finds the address already
-	// taken (a repeated block, an earlier interrupted attempt, a concurrent
-	// writer of the same bytes) is not a failure. Re-plan once — the server
-	// HEADs create-once stores and marks present blocks exists — and PUT only
+	// taken (an earlier interrupted attempt or a concurrent writer of the
+	// same bytes) is not a failure. Re-plan once — the server HEADs
+	// create-once stores and marks present blocks exists — and PUT only
 	// what is still missing.
 	for attempt := 0; ; attempt++ {
 		err := c.putExtentPlanBlocks(ctx, plan, dirty, blocks)
@@ -528,7 +470,7 @@ func (c *Client) CommitExtentPatch(ctx context.Context, path string, newSize int
 		if attempt > 0 || !isExtentBlockConflict(err) {
 			return err
 		}
-		if plan, err = c.InitiateExtentPatch(ctx, path, newSize, dirty, expectedRevision); err != nil {
+		if plan, err = c.InitiateExtentPatchExpectedResource(ctx, path, newSize, dirty, expectedRevision, expectedResourceID); err != nil {
 			return err
 		}
 	}
@@ -548,9 +490,16 @@ func (c *Client) CommitExtentPatch(ctx context.Context, path string, newSize int
 	return nil
 }
 
-// putExtentPlanBlocks PUTs every block the plan does not already hold, in
-// plan order, with the headers the plan prescribes for each URL.
+// putExtentPlanBlocks PUTs every distinct block the plan does not already
+// hold, in bounded parallel, with the headers the plan prescribes.
 func (c *Client) putExtentPlanBlocks(ctx context.Context, plan *ExtentWritePlan, dirty []ExtentDirtyBlock, blocks []ExtentBlockWrite) error {
+	type putJob struct {
+		url     string
+		headers map[string]string
+		data    []byte
+	}
+	seenChecksum := make(map[string]struct{}, len(blocks))
+	puts := make([]putJob, 0, len(blocks))
 	for i, b := range blocks {
 		wb := extentPlanBlockFor(plan, dirty[i])
 		if wb == nil {
@@ -559,12 +508,23 @@ func (c *Client) putExtentPlanBlocks(ctx context.Context, plan *ExtentWritePlan,
 		if wb.Exists || wb.URL == "" {
 			continue
 		}
-		if err := c.putExtentBlock(ctx, wb.URL, wb.Headers, b.Data); err != nil {
-			return err
+		if _, dup := seenChecksum[dirty[i].Checksum]; dup {
+			continue
 		}
-		wb.Exists = true
+		seenChecksum[dirty[i].Checksum] = struct{}{}
+		puts = append(puts, putJob{url: wb.URL, headers: wb.Headers, data: b.Data})
 	}
-	return nil
+	if len(puts) == 0 {
+		return nil
+	}
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(extentPatchPutConcurrency)
+	for _, job := range puts {
+		g.Go(func() error {
+			return c.putExtentBlock(gctx, job.url, job.headers, job.data)
+		})
+	}
+	return g.Wait()
 }
 
 func extentPlanBlockFor(plan *ExtentWritePlan, d ExtentDirtyBlock) *ExtentWritePlanBlock {

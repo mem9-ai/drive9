@@ -1076,17 +1076,12 @@ func mountWithConfig(cfg MountConfig) error {
 			CacheDir:       cacheScopedDir(cacheBase, mountHash, "extent"),
 			ReadOnly:       cfg.ReadOnly,
 			FreeSpaceRatio: float32(cfg.DiskReadCacheFreeRatio),
-			// JuiceFS's OWN writeback pipeline: blocks below the threshold
-			// are staged into the engine's disk cache and uploaded by the
-			// chunk store asynchronously; the bridge waits for the bytes at
-			// the meta-commit boundary (the server verifies blocks then).
-			// Memory-only mounts (no cache dir) keep the direct path, as
-			// JuiceFS itself disables writeback without a disk cache.
-			Writeback:              !cfg.ReadOnly && cacheBase != "",
-			WritebackThresholdSize: int(client.ExtentBlockSize) + 1,
-			// In-flight staging concurrency: raised/derived from
-			// --extent-write-cache-size-mb below (this is the fallback).
-			MaxStageWrite: 40,
+			// Keep JuiceFS native Writeback off on mounts: the bridge owns
+			// commit batching, pinned-memory backpressure, and close-to-open
+			// durability directly, avoiding redundant rawstaging disk I/O
+			// and free-space staging-eviction races while keeping CacheDir
+			// active for block read cache and readahead.
+			Writeback: false,
 		}
 		// The extent plane's disk budget IS JuiceFS's chunk cache: the plane
 		// no longer keeps a second copy of staged bytes (its local fsync
