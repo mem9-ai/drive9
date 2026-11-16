@@ -110,9 +110,16 @@ CAP_BATCH_UPLOAD_PRESIGNED="unknown"
 # Feature probes. The drive9 repository also embeds a server snapshot that the
 # Local E2E job runs, and some data-plane features exist only in the server
 # repository. probe_features() asks the deployment what it actually does, once,
-# and every dependent check SKIPs when the answer is "not here" -- a deployment
-# that does serve the feature is still hard-asserted. A missing capability is
-# never mistaken for a passing one.
+# so a deployment without a feature can SKIP the dependent checks.
+#
+# The values are tri-state on purpose:
+#   "true"    -- the deployment serves the feature, assert it
+#   "false"   -- the deployment cleanly does not serve it, SKIP the dependents
+#   "unknown" -- the probe could not reach a verdict (fixture failure, throttling,
+#                unexpected status), so the dependents still run and fail loudly
+# Gates therefore skip only on a *confirmed* "false". A present-but-broken
+# response (weak ETag, 5xx, ignored-but-claimed support) must never be read as
+# "feature absent", or a broken implementation would pass the suite.
 PROBES_DONE=0
 PROBE_STATUS_TENANT_ID="unknown"
 PROBE_STATUS_MIGRATION_CAPS="unknown"
@@ -123,6 +130,7 @@ PROBE_IF_MATCH="unknown"
 PROBE_BATCH_CHECKSUM="unknown"
 PROBE_BATCH_ROUTES="unknown"
 PROBE_V2_UPLOADS="unknown"
+PROBE_FIXTURE_OK="unknown"
 
 PASS=0
 FAIL=0
@@ -356,65 +364,98 @@ probe_features() {
     return 0
   fi
   PROBES_DONE=1
+  PROBE_FIXTURE_OK=1
   local dir="${ROOT_DIR}/probe"
   local path="${dir}/f.txt"
-  request POST "$BASE/v1/fs/$dir?mkdir" --auth "$API_KEY" >/dev/null
-  request PUT "$BASE/v1/fs/$path" --auth "$API_KEY" --data "probe-0123456789" >/dev/null
+  local resp body code
 
-  local resp body
-  resp=$(request GET "$BASE/v1/fs/$path?stat" --auth "$API_KEY")
-  body=$(json_body "$resp")
-  if [ "$(http_code "$resp")" = "200" ]; then
-    PROBE_STAT_BTIME=$(printf '%s' "$body" | jq -r 'if has("btime") and .btime != null then "true" else "false" end')
+  resp=$(request POST "$BASE/v1/fs/$dir?mkdir" --auth "$API_KEY")
+  mkdir_code=$(http_code "$resp")
+  resp=$(request PUT "$BASE/v1/fs/$path" --auth "$API_KEY" --data "probe-0123456789")
+  put_code=$(http_code "$resp")
+  case "$mkdir_code:$put_code" in
+    200:200) ;;
+    *)
+      # Without a usable fixture every probe below is meaningless. Leave the
+      # probes at "unknown" so the dependent assertions run (and fail with real
+      # evidence) instead of skipping on a fixture problem.
+      PROBE_FIXTURE_OK=0
+      fail "probe fixture is writable (mkdir=$mkdir_code put=$put_code)"
+      ;;
+  esac
+
+  if [ "$PROBE_FIXTURE_OK" = "1" ]; then
+    resp=$(request GET "$BASE/v1/fs/$path?stat" --auth "$API_KEY")
+    code=$(http_code "$resp")
+    body=$(json_body "$resp")
+    if [ "$code" = "200" ]; then
+      PROBE_STAT_BTIME=$(printf '%s' "$body" | jq -r 'if has("btime") and .btime != null then "true" else "false" end')
+    else
+      info "stat probe returned $code; btime checks will run"
+    fi
+
+    # Presence of the header decides support: a weak validator is a present but
+    # broken feature, so the strong-ETag assertion must run and fail.
+    resp=$(request HEAD "$BASE/v1/fs/$path" --auth "$API_KEY")
+    if [ "$(resp_hdr 'ETag')" = "" ]; then
+      PROBE_HEAD_VALIDATORS="false"
+    else
+      PROBE_HEAD_VALIDATORS="true"
+    fi
+
+    # 200 is the HTTP-legal "this server ignores Range" answer; 404/501 are the
+    # documented unsupported answers. Anything else (5xx, 4xx) is a broken
+    # implementation, so the Range assertions run against it.
+    resp=$(request GET "$BASE/v1/fs/$path" --auth "$API_KEY" --hdr "Range: bytes=0-3")
+    code=$(http_code "$resp")
+    case "$code" in
+      206) PROBE_RANGE="true" ;;
+      200|404|501) PROBE_RANGE="false" ;;
+      *) info "Range probe returned $code; Range checks will run and fail" ;;
+    esac
+
+    resp=$(request GET "$BASE/v1/fs/$path" --auth "$API_KEY" --hdr 'If-Match: "probe-stale"')
+    code=$(http_code "$resp")
+    case "$code" in
+      412) PROBE_IF_MATCH="true" ;;
+      200|404|501) PROBE_IF_MATCH="false" ;;
+      *) info "If-Match probe returned $code; If-Match checks will run and fail" ;;
+    esac
+
+    resp=$(request POST "$BASE/v1/fs:batch-stat" --auth "$API_KEY" \
+      --hdr 'Content-Type: application/json' \
+      --data "$(jq -nc --arg p "/$path" '{paths:[$p],include_checksum:true}')")
+    code=$(http_code "$resp")
+    if [ "$code" = "200" ]; then
+      if [ "$(json_body "$resp" | jq -r '(.results[0].checksum_sha256 // empty)')" = "" ]; then
+        PROBE_BATCH_CHECKSUM="false"
+      else
+        PROBE_BATCH_CHECKSUM="true"
+      fi
+    else
+      info "batch-stat probe returned $code; checksum check will run and fail"
+    fi
+
+    # Route presence: only a 404 proves the route is absent.
+    resp=$(request POST "$BASE/v1/fs:batch-stat" --auth "$API_KEY" \
+      --hdr 'Content-Type: application/json' --data '{"paths":[]}')
+    if [ "$(http_code "$resp")" = "404" ]; then
+      PROBE_BATCH_ROUTES="false"
+    else
+      PROBE_BATCH_ROUTES="true"
+    fi
+
+    # An invalid body is enough to prove the route exists; a 404 means it does not.
+    resp=$(request POST "$BASE/v2/uploads/initiate" --auth "$API_KEY" \
+      --hdr 'Content-Type: application/json' --data '{}')
+    if [ "$(http_code "$resp")" = "404" ]; then
+      PROBE_V2_UPLOADS="false"
+    else
+      PROBE_V2_UPLOADS="true"
+    fi
   fi
 
-  resp=$(request HEAD "$BASE/v1/fs/$path" --auth "$API_KEY")
-  if is_strong_etag "$(resp_hdr 'ETag')"; then
-    PROBE_HEAD_VALIDATORS="true"
-  else
-    PROBE_HEAD_VALIDATORS="false"
-  fi
-
-  resp=$(request GET "$BASE/v1/fs/$path" --auth "$API_KEY" --hdr "Range: bytes=0-3")
-  if [ "$(http_code "$resp")" = "206" ]; then
-    PROBE_RANGE="true"
-  else
-    PROBE_RANGE="false"
-  fi
-
-  resp=$(request GET "$BASE/v1/fs/$path" --auth "$API_KEY" --hdr 'If-Match: "probe-stale"')
-  if [ "$(http_code "$resp")" = "412" ]; then
-    PROBE_IF_MATCH="true"
-  else
-    PROBE_IF_MATCH="false"
-  fi
-
-  resp=$(request POST "$BASE/v1/fs:batch-stat" --auth "$API_KEY" --hdr 'Content-Type: application/json' \
-    --data "$(jq -nc --arg p "/$path" '{paths:[$p],include_checksum:true}')")
-  if [ "$(json_body "$resp" | jq -r '(.results[0].checksum_sha256 // empty)')" != "" ]; then
-    PROBE_BATCH_CHECKSUM="true"
-  else
-    PROBE_BATCH_CHECKSUM="false"
-  fi
-
-  resp=$(request POST "$BASE/v1/fs:batch-stat" --auth "$API_KEY" --hdr 'Content-Type: application/json' \
-    --data '{"paths":[]}')
-  if [ "$(http_code "$resp")" = "404" ]; then
-    PROBE_BATCH_ROUTES="false"
-  else
-    PROBE_BATCH_ROUTES="true"
-  fi
-
-  # An invalid body is enough to prove the route exists; a 404 means it does not.
-  resp=$(request POST "$BASE/v2/uploads/initiate" --auth "$API_KEY" --hdr 'Content-Type: application/json' \
-    --data '{}')
-  if [ "$(http_code "$resp")" = "404" ]; then
-    PROBE_V2_UPLOADS="false"
-  else
-    PROBE_V2_UPLOADS="true"
-  fi
-
-  info "features: stat_btime=$PROBE_STAT_BTIME head_validators=$PROBE_HEAD_VALIDATORS range=$PROBE_RANGE if_match=$PROBE_IF_MATCH batch_checksum=$PROBE_BATCH_CHECKSUM batch_routes=$PROBE_BATCH_ROUTES v2_uploads=$PROBE_V2_UPLOADS"
+  info "features: fixture=$PROBE_FIXTURE_OK stat_btime=$PROBE_STAT_BTIME head_validators=$PROBE_HEAD_VALIDATORS range=$PROBE_RANGE if_match=$PROBE_IF_MATCH batch_checksum=$PROBE_BATCH_CHECKSUM batch_routes=$PROBE_BATCH_ROUTES v2_uploads=$PROBE_V2_UPLOADS"
 }
 
 # check_json <desc> <json body> <jq filter> <expected string form>
@@ -642,7 +683,7 @@ SERVER_TENANT_ID=$(printf '%s' "$sbody" | jq -r '.tenant_id // empty')
 SERVER_MAX_UPLOAD_BYTES=$(printf '%s' "$sbody" | jq -r '.max_upload_bytes // empty')
 SERVER_INLINE_THRESHOLD=$(printf '%s' "$sbody" | jq -r '.inline_threshold // empty')
 PROBE_STATUS_TENANT_ID=$(printf '%s' "$sbody" | jq -r 'if has("tenant_id") then "true" else "false" end')
-if [ "$PROBE_STATUS_TENANT_ID" = "true" ]; then
+if [ "$PROBE_STATUS_TENANT_ID" != "false" ]; then
   check_cmd "status exposes tenant_id" test -n "$SERVER_TENANT_ID"
   if [ -n "${TENANT_ID:-}" ]; then
     check_eq "status tenant_id matches the provisioned tenant" "$SERVER_TENANT_ID" "$TENANT_ID"
@@ -657,8 +698,10 @@ if [ -n "$SERVER_INLINE_THRESHOLD" ]; then
 else
   skip_check "status advertises inline_threshold (older server omits it)"
 fi
-PROBE_STATUS_MIGRATION_CAPS=$(printf '%s' "$sbody" | jq -r 'if has("migration_capabilities") and (.migration_capabilities|type) == "object" then "true" else "false" end')
-if [ "$PROBE_STATUS_MIGRATION_CAPS" = "true" ]; then
+# Presence decides support; a present field with the wrong type must fail the
+# assertion below rather than be read as absent.
+PROBE_STATUS_MIGRATION_CAPS=$(printf '%s' "$sbody" | jq -r 'if has("migration_capabilities") then "true" else "false" end')
+if [ "$PROBE_STATUS_MIGRATION_CAPS" != "false" ]; then
   check_json "status migration_capabilities is an object" "$sbody" '(.migration_capabilities|type)' "object"
 else
   skip_check "status migration_capabilities is an object (server does not project it)"
@@ -671,6 +714,12 @@ if printf '%s' "$sbody" | jq -e 'has("storage_capabilities")' >/dev/null 2>&1; t
   CAP_BATCH_UPLOAD_PRESIGNED=$(printf '%s' "$sbody" | jq -r '.storage_capabilities.batch_upload_presigned_v1 // false')
   info "capabilities: batch_write_mode=$CAP_BATCH_WRITE_MODE completion_identity=$CAP_COMPLETION_IDENTITY append_log=$CAP_APPEND_LOG batch_upload_presigned=$CAP_BATCH_UPLOAD_PRESIGNED"
 else
+  # No capability document at all: every advertised bit is absent, which is a
+  # confirmed "not served" rather than an unknown.
+  CAP_BATCH_WRITE_MODE="false"
+  CAP_COMPLETION_IDENTITY="false"
+  CAP_APPEND_LOG="false"
+  CAP_BATCH_UPLOAD_PRESIGNED="false"
   skip_check "status advertises storage_capabilities (older server omits it)"
 fi
 if [ -z "$UPLOAD_LIMIT_BYTES" ]; then
@@ -1330,7 +1379,7 @@ if [ "$RUN_CONTRACT_CHECKS" = "1" ]; then
   check_json "stat reports isdir=false for a file" "$stat_body" '.isdir' "false"
   check_json "stat revision matches the PUT revision" "$stat_body" '.revision' "$PUT_REV"
   check_json "stat mtime is a positive epoch second" "$stat_body" '(.mtime > 0)' "true"
-  if [ "$PROBE_STAT_BTIME" = "true" ]; then
+  if [ "$PROBE_STAT_BTIME" != "false" ]; then
     check_json "stat btime is a positive epoch second" "$stat_body" '(.btime > 0)' "true"
   else
     skip_check "stat btime is a positive epoch second (server does not project btime)"
@@ -1354,7 +1403,7 @@ if [ "$RUN_CONTRACT_CHECKS" = "1" ]; then
     skip_check "HEAD X-Dat9-Btime matches stat btime (server does not project btime)"
   fi
   check_cmd "HEAD X-Dat9-Nlink is at least 1" bash -c 'test "${1:-0}" -gt 0' _ "$(resp_hdr 'X-Dat9-Nlink')"
-  if [ "$PROBE_HEAD_VALIDATORS" = "true" ]; then
+  if [ "$PROBE_HEAD_VALIDATORS" != "false" ]; then
     check_cmd "HEAD advertises a strong ETag" is_strong_etag "$(resp_hdr 'ETag')"
     check_eq "HEAD advertises Accept-Ranges: bytes" "$(resp_hdr 'Accept-Ranges')" "bytes"
     check_eq "HEAD reports the single content layout" "$(resp_hdr 'X-Dat9-Content-Layout')" "single"
@@ -1418,7 +1467,7 @@ if [ "$RUN_CONTRACT_CHECKS" = "1" ]; then
     skip_check "range fixture HEAD exposes an ETag (server does not expose read validators on HEAD)"
   fi
 
-  if [ "$PROBE_RANGE" = "true" ]; then
+  if [ "$PROBE_RANGE" != "false" ]; then
     resp=$(request GET "$BASE/v1/fs/$RANGE_PATH" --auth "$API_KEY" --hdr "Range: bytes=2-5")
     check_status "Range read returns 206" "$resp" "206"
     check_eq "Range read returns exactly the requested bytes" "$(json_body "$resp")" "2345"
@@ -1437,7 +1486,7 @@ if [ "$RUN_CONTRACT_CHECKS" = "1" ]; then
   check_status "a stale If-Range falls back to the full body" "$resp" "200"
   check_eq "stale If-Range returns the whole file" "$(json_body "$resp")" "$RANGE_TEXT"
 
-  if [ "$PROBE_IF_MATCH" = "true" ]; then
+  if [ "$PROBE_IF_MATCH" != "false" ]; then
     resp=$(request GET "$BASE/v1/fs/$RANGE_PATH" --auth "$API_KEY" --hdr 'If-Match: "stale-etag"')
     check_status "a stale If-Match returns 412" "$resp" "412"
 
@@ -1451,7 +1500,12 @@ if [ "$RUN_CONTRACT_CHECKS" = "1" ]; then
   if [ "$PROBE_HEAD_VALIDATORS" = "true" ]; then
     resp=$(request PUT "$BASE/v1/fs/$RANGE_PATH" --auth "$API_KEY" --data "0123456789-updated")
     resp=$(request HEAD "$BASE/v1/fs/$RANGE_PATH" --auth "$API_KEY")
-    check_cmd "the ETag changes after an overwrite" bash -c 'test "$1" != "$2"' _ "$RANGE_ETAG" "$(resp_hdr 'ETag')"
+    # A missing or weak validator must not read as "changed": require a usable
+    # ETag first, then compare the two validators separately.
+    check_status "HEAD after the overwrite returns 200" "$resp" "200"
+    overwrite_etag=$(resp_hdr 'ETag')
+    check_cmd "HEAD after the overwrite advertises a strong ETag" is_strong_etag "$overwrite_etag"
+    check_cmd "the ETag changes after an overwrite" bash -c 'test "$1" != "$2"' _ "$RANGE_ETAG" "$overwrite_etag"
   else
     resp=$(request PUT "$BASE/v1/fs/$RANGE_PATH" --auth "$API_KEY" --data "0123456789-updated")
     skip_check "the ETag changes after an overwrite (server does not expose read validators on HEAD)"
@@ -1603,6 +1657,7 @@ if [ "$RUN_CONTRACT_CHECKS" = "1" ]; then
   check_status "the symlink is deletable" "$resp" "200"
 
   step "21" "Error and routing contract"
+  probe_features
   resp=$(request GET "$BASE/v1/fs/$CONTRACT_DIR/does-not-exist.txt" --auth "$API_KEY")
   check_status "GET a missing path returns 404" "$resp" "404"
   resp=$(request GET "$BASE/v1/fs/$CONTRACT_DIR/does-not-exist.txt?stat" --auth "$API_KEY")
@@ -1618,8 +1673,12 @@ if [ "$RUN_CONTRACT_CHECKS" = "1" ]; then
   check_status "POST ?rename without a source header returns 400" "$resp" "400"
   resp=$(request POST "$BASE/v1/fs/$CONTRACT_DIR?mkdir" --auth "$API_KEY")
   check_status "mkdir over an existing directory returns 409" "$resp" "409"
-  resp=$(request DELETE "$BASE/v1/fs:batch-stat" --auth "$API_KEY")
-  check_status "a wrong method on /v1/fs:batch-stat returns 405" "$resp" "405"
+  if [ "$PROBE_BATCH_ROUTES" = "false" ]; then
+    skip_check "a wrong method on /v1/fs:batch-stat returns 405 (route absent)"
+  else
+    resp=$(request DELETE "$BASE/v1/fs:batch-stat" --auth "$API_KEY")
+    check_status "a wrong method on /v1/fs:batch-stat returns 405" "$resp" "405"
+  fi
 
   resp=$(request GET "$BASE/v1/fs/$STAT_PATH")
   check_status "an unauthenticated FS read returns 401" "$resp" "401"
@@ -1646,7 +1705,7 @@ if [ "$RUN_BATCH_CHECKS" != "1" ]; then
   skip_check "batch endpoints: batch-stat / batch-read-small / batch-write (RUN_BATCH_CHECKS=0)"
 else
   probe_features
-  if [ "$PROBE_BATCH_ROUTES" != "true" ]; then
+  if [ "$PROBE_BATCH_ROUTES" = "false" ]; then
     info "server does not serve the /v1/fs:batch-* routes; batch checks skipped"
     skip_check "batch endpoints: batch-stat / batch-read-small / batch-write (routes absent)"
   else
@@ -1676,7 +1735,7 @@ else
   check_json "batch-stat reports a boolean hasMode per item" "$bs_body" '(.results[0].hasMode|type)' "boolean"
   check_json "batch-stat reports a positive revision" "$bs_body" '.results[0].revision' "$BW_ONE_REV"
 
-  if [ "$PROBE_BATCH_CHECKSUM" = "true" ]; then
+  if [ "$PROBE_BATCH_CHECKSUM" != "false" ]; then
     resp=$(request POST "$BASE/v1/fs:batch-stat" --auth "$API_KEY" --hdr 'Content-Type: application/json' \
       --data "$(jq -nc --arg a "/$BW_ONE" '{paths:[$a],include_checksum:true}')")
     check_json "batch-stat include_checksum returns the content sha256" "$(json_body "$resp")" '.results[0].checksum_sha256' \
@@ -1858,7 +1917,7 @@ if [ "$RUN_UPLOAD_LIFECYCLE_CHECKS" = "1" ]; then
     --hdr 'Content-Type: application/json' --data "$V1_CHECKSUMS")
   check_status "resuming an aborted session returns 409" "$resp" "409"
 
-  if [ "$PROBE_V2_UPLOADS" != "true" ]; then
+  if [ "$PROBE_V2_UPLOADS" = "false" ]; then
     info "server does not serve /v2/uploads; V2 round-trip skipped"
     skip_check "V2 presigned round-trip: initiate/presign/presign-batch/part PUT/complete (route absent)"
   else
