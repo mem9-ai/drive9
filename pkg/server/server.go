@@ -3303,6 +3303,9 @@ func (s *Server) handleBatchWrite(w http.ResponseWriter, r *http.Request) {
 	}
 
 	scope := ScopeFromContext(r.Context())
+	// chmod is owner-only for the whole request: the per-item denial and the mode fields
+	// that reach the backend both read this one decision.
+	chmodAuthorized := scope.CanChmod()
 	results := make([]batchWriteResult, len(req.Items))
 	allowedIndexes := make([]int, 0, len(req.Items))
 	backendItems := make([]backend.BatchWriteItem, 0, len(req.Items))
@@ -3321,22 +3324,6 @@ func (s *Server) handleBatchWrite(w http.ResponseWriter, r *http.Request) {
 			results[i].Error = err.Error()
 			continue
 		}
-		// chmod is owner-only (handleChmod), and a batch item's mode bits are the
-		// same escalation: an fs_scoped agent token would otherwise set arbitrary
-		// permission bits on a path it can write. Per-item 403 rather than a failed
-		// request, so the content-only items of the same batch still commit — the
-		// rejection contract BatchWriteResult documents for this capability.
-		//
-		// This denial is only correct while a scoped token is never told the
-		// content+mode contract exists: if storage_capabilities.batch_write_mode_v1 is
-		// ever advertised, it has to be per token scope (owner only), or a scoped mount
-		// will attach hasMode to every commit and be denied on each writeback cycle.
-		if item.HasMode && !scope.CanChmod() {
-			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "batch_write_mode_denied", "path", item.Path)...)
-			results[i].Status = http.StatusForbidden
-			results[i].Error = chmodOwnerOnlyMessage
-			continue
-		}
 		if s.maxUploadBytes > 0 && itemBytes > s.maxUploadBytes {
 			results[i].Status = http.StatusRequestEntityTooLarge
 			results[i].Error = fmt.Sprintf("upload too large: max %d bytes", s.maxUploadBytes)
@@ -3347,20 +3334,47 @@ func (s *Server) handleBatchWrite(w http.ResponseWriter, r *http.Request) {
 			results[i].Error = msg
 			continue
 		}
-		allowedIndexes = append(allowedIndexes, i)
-		backendItems = append(backendItems, backend.BatchWriteItem{
+		// chmod is owner-only (handleChmod), and a batch item's permission bits are the
+		// same escalation: an fs_scoped agent token would otherwise set arbitrary bits on
+		// a path it can write. Both fields count — mode is refused even without hasMode,
+		// because a silently ignored bit pattern is exactly the ambiguity a future
+		// refactor resolves in the wrong direction. Per-item 403 rather than a failed
+		// request, so the content-only items of the same batch still commit — the
+		// rejection contract BatchWriteResult documents for this capability. Ordered after
+		// the per-path authorization, as in the sibling repo: a path outside the caller's
+		// scope is answered by the scope check, not by the mode policy.
+		//
+		// This denial is only correct while a scoped token is never told the
+		// content+mode contract exists: if storage_capabilities.batch_write_mode_v1 is
+		// ever advertised, it has to be per token scope (owner only), or a scoped mount
+		// will attach hasMode to every commit and be denied on each writeback cycle.
+		if (item.HasMode || item.Mode != 0) && !chmodAuthorized {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "batch_write_mode_denied", "path", item.Path)...)
+			results[i].Status = http.StatusForbidden
+			results[i].Error = chmodOwnerOnlyMessage
+			continue
+		}
+		// The mode fields reach the backend only for a caller that may chmod. That is the
+		// same decision the denial above makes, applied to the data instead of the response:
+		// nothing below this handler — backend, mutation worker, or a future stage added
+		// between them — can observe permission bits a scoped request asked for.
+		backendItem := backend.BatchWriteItem{
 			Path:             item.Path,
 			Data:             item.Data,
 			ExpectedRevision: item.ExpectedRevision,
-			Mode:             item.Mode,
-			HasMode:          item.HasMode,
-		})
+		}
+		if chmodAuthorized {
+			backendItem.Mode = item.Mode
+			backendItem.HasMode = item.HasMode
+		}
+		allowedIndexes = append(allowedIndexes, i)
+		backendItems = append(backendItems, backendItem)
 	}
 
-	// Only an owner token's items may carry permission bits; the backend refuses
+	// Only a chmod-authorized token's items may carry permission bits; the backend refuses
 	// them otherwise, so a future handler cannot skip this decision.
 	batchCtx := r.Context()
-	if scope.CanChmod() {
+	if chmodAuthorized {
 		batchCtx = backend.WithBatchWriteModeChanges(batchCtx)
 	}
 	backendResults, err := b.BatchWriteCtx(batchCtx, backendItems)
