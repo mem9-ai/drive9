@@ -15,6 +15,20 @@ import (
 // replay identity. Save all inputs before calling. The returned file identity
 // is the durable PUT receipt (Status is "ok"), not a later pathname lookup.
 func (c *Client) WriteFixedEmptyFile(ctx context.Context, operationID, path string, expectedRevision int64) (FixedUploadCompletion, error) {
+	return c.writeFixedEmptyFile(ctx, operationID, path, expectedRevision, nil)
+}
+
+// CreateFixedFileCtx creates an absent fixed-view file with its initial mode in
+// the same commit. WithViewOperationID preserves an explicit replay identity;
+// otherwise ViewOperationError carries the generated identity on failure.
+func (c *Client) CreateFixedFileCtx(ctx context.Context, path string, mode uint32) (FixedUploadCompletion, error) {
+	if mode > 0o777 {
+		return FixedUploadCompletion{}, fmt.Errorf("invalid initial file mode")
+	}
+	return c.writeFixedEmptyFile(ctx, viewMutationID(ctx), path, 0, &mode)
+}
+
+func (c *Client) writeFixedEmptyFile(ctx context.Context, operationID, path string, expectedRevision int64, mode *uint32) (FixedUploadCompletion, error) {
 	if c == nil || c.view.LayerID == "" || c.view.Validation || c.view.Validate() != nil {
 		return FixedUploadCompletion{}, viewprotocol.ErrBinding
 	}
@@ -28,6 +42,9 @@ func (c *Client) WriteFixedEmptyFile(ctx context.Context, operationID, path stri
 	req, err := c.newFSRequest(ctx, http.MethodPut, path, "", bytes.NewReader(nil))
 	if err != nil {
 		return FixedUploadCompletion{}, err
+	}
+	if mode != nil {
+		req.Header.Set("X-Dat9-Mode", strconv.FormatUint(uint64(*mode), 10))
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("X-Dat9-Expected-Revision", strconv.FormatInt(expectedRevision, 10))

@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -138,7 +139,11 @@ func TestViewMutationBodyFailureRetainsOriginalOperation(t *testing.T) {
 					w.Header().Set("Content-Type", "application/json")
 					switch failure {
 					case "complete":
-						_, _ = io.WriteString(w, `{"revision":7}`)
+						if method == "create" {
+							_ = json.NewEncoder(w).Encode(FixedUploadCompletion{Status: "ok", OperationID: r.Header.Get(viewprotocol.OperationHeader), View: FixedViewState{LayerID: "a", Fence: 1, Generation: 1}, ResourceID: "file", Revision: 7, Size: 0})
+						} else {
+							_, _ = io.WriteString(w, `{"revision":7}`)
+						}
 					case "empty":
 						w.WriteHeader(200)
 					case "missing-revision":

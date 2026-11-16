@@ -11,7 +11,11 @@ import (
 // creation. A separate chmod advances the inode revision and invalidates the
 // create receipt before the first buffered write can use it.
 func (c *Core) createEmptyRemote(ctx context.Context, path string, mode uint32) (int64, bool, error) {
-	if mode == 0o644 || c.cl.ViewBinding().LayerID != "" || !c.cl.CachedBatchWriteModeSupported() {
+	if c.cl.ViewBinding().LayerID != "" {
+		out, err := c.cl.CreateFixedFileCtx(ctx, path, mode&0o777)
+		return out.Revision, true, err
+	}
+	if mode == 0o644 || !c.cl.CachedBatchWriteModeSupported() {
 		rev, err := c.cl.CreateFileCtx(ctx, path)
 		return rev, false, err
 	}
