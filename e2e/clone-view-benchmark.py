@@ -36,7 +36,9 @@ def failure_categories(raw):
                 "unable to read": "git_read", "read error": "read_error",
                 "mmap failed": "mmap_failure", "could not mmap": "mmap_failure",
                 "invalid index-pack output": "invalid_pack", "early eof": "early_eof",
-                "bad object": "bad_object", "corrupt": "corruption"}
+                "bad object": "bad_object", "corrupt": "corruption",
+                "fixed view operation conflicts with current state": "view_conflict",
+                "invalid filesystem view record": "invalid_view"}
     return ",".join(value for key, value in patterns.items() if key in text) or "unclassified"
 
 
@@ -73,7 +75,7 @@ def syscall_failure_counts(raw):
              "readlinkat", "chmod", "fchmod", "fchmodat", "stat", "lstat", "newfstatat", "statx",
              "access", "faccessat", "faccessat2", "fsync", "fdatasync", "close", "utimensat",
              "read", "pread64", "write", "pwrite64", "ftruncate"}
-    errors = {"EIO", "EACCES", "EPERM", "EINVAL", "EROFS", "ENOSYS", "EOPNOTSUPP", "ENOSPC", "ESTALE"}
+    errors = {"EIO", "EACCES", "EPERM", "EINVAL", "EROFS", "ENOSYS", "EOPNOTSUPP", "ENOSPC", "ESTALE", "EEXIST"}
     paths = (("/.git/hooks/", "git_hooks"), ("/.git/objects/", "git_objects"),
              ("/.git/refs/", "git_refs"), ("/.git/config", "git_config"), ("/.git/HEAD", "git_head"))
     counts = {}
@@ -84,10 +86,32 @@ def syscall_failure_counts(raw):
         if name not in calls or not error or error.group(1) not in errors:
             continue
         category = next((value for pattern, value in paths if pattern in line), "other")
-        key = (name, error.group(1), category)
+        flags = ()
+        if name in {"open", "openat"}:
+            flags = tuple(flag for flag in ("O_RDONLY", "O_WRONLY", "O_RDWR", "O_CREAT", "O_EXCL", "O_TRUNC")
+                          if re.search(r"\b" + flag + r"\b", line))
+        key = (name, error.group(1), category, flags)
         counts[key] = counts.get(key, 0) + 1
-    return [{"syscall": op, "errno": error, "path_class": category, "count": count}
-            for (op, error, category), count in sorted(counts.items())]
+    return [{"syscall": op, "errno": error, "path_class": category, "count": count,
+             **({"open_flags": list(flags)} if flags else {})}
+            for (op, error, category, flags), count in sorted(counts.items())]
+
+
+def diagnose_remote_config(probe, work):
+    # Read only two known fixture paths before cleanup; never print bodies,
+    # headers, credentials, path values or exception messages.
+    for name in ("config", "config.lock"):
+        for method in ("HEAD", "GET"):
+            try:
+                route = probe.fs(probe.root + "/repo/.git/" + name, work)
+                raw, _, status = probe.request(method, route, work=work, timeout=10, limit=4096,
+                                                headers={"Range": "bytes=0-255"} if method == "GET" else {},
+                                                statuses=tuple(range(100, 600)), with_status=True)
+                require(type(status) is int and 100 <= status < 600, "invalid diagnostic status")
+                category = failure_categories(raw) if status >= 400 else "ok"
+                print(f"CHECK config HTTP file={name} method={method} status={status} categories={category}", flush=True)
+            except Exception:
+                print(f"CHECK config HTTP file={name} method={method} unavailable", flush=True)
 
 
 def signal_mapping_counts(raw):
@@ -283,7 +307,12 @@ def sample(cli, base, source, manifest_file, case, index, root, trace_primary=Fa
             target = point / probe.root.lstrip("/") / "repo"
             started = time.monotonic()
             print("CHECK phase=clone", flush=True)
-            clone_fixture(source, target, root / "clone.strace", trace_primary=trace_primary)
+            try:
+                clone_fixture(source, target, root / "clone.strace", trace_primary=trace_primary)
+            except http.ProbeFailure:
+                if trace_primary:
+                    diagnose_remote_config(probe, work)
+                raise
             cloned = time.monotonic()
             print("CHECK phase=sync", flush=True)
             command([sys.executable, __file__, "--operation=sync", "--tree", str(target)], timeout=300)

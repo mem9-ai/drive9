@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch, Mock
+from contextlib import nullcontext
 
 spec = importlib.util.spec_from_file_location("bench", Path(__file__).with_name("clone-view-benchmark.py"))
 bench = importlib.util.module_from_spec(spec)
@@ -81,6 +82,82 @@ class BenchmarkTests(unittest.TestCase):
             self.assertNotIn(private, str(rows))
         self.assertEqual(bench.signal_mapping_counts(raw + b"x" * (4 << 20)), [])
         self.assertEqual(bench.signal_mapping_counts(b"malformed or private input"), [])
+
+    def test_existing_config_error_keeps_only_known_open_flags(self):
+        rows = bench.syscall_failure_counts(
+            b'123 openat(AT_FDCWD, "/private/.git/config", O_RDONLY|O_CLOEXEC) = -1 EEXIST (File exists)\n'
+            b'123 openat(AT_FDCWD, "/private/.git/config.lock", O_WRONLY|O_CREAT|O_EXCL|PRIVATE_FLAG, 0666) = -1 EEXIST (File exists)\n'
+            b'123 rename("/private/.git/config.lock", "/private/.git/config") = -1 EEXIST (File exists)\n')
+        self.assertEqual(rows, [
+            {"syscall": "openat", "errno": "EEXIST", "path_class": "git_config", "count": 1,
+             "open_flags": ["O_RDONLY"]},
+            {"syscall": "openat", "errno": "EEXIST", "path_class": "git_config", "count": 1,
+             "open_flags": ["O_WRONLY", "O_CREAT", "O_EXCL"]},
+            {"syscall": "rename", "errno": "EEXIST", "path_class": "git_config", "count": 1}])
+        for private in ("private", "PRIVATE_FLAG", "O_CLOEXEC", "0666"):
+            self.assertNotIn(private, str(rows))
+
+    def test_config_diagnostic_is_read_only_bounded_and_view_bound(self):
+        probe = Mock(root="/private-fixture")
+        work = {"layer_id": "private-view"}
+        probe.fs.side_effect = lambda path, selected: "/route" + path
+        probe.request.side_effect = [
+            (b"private-body", {"private-header": "secret"}, 200),
+            (b"fixed view operation conflicts with current state secret", {}, 409),
+            (b"", {}, 404), (b"invalid filesystem view record secret", {}, 500)]
+        with patch("builtins.print") as printed:
+            bench.diagnose_remote_config(probe, work)
+        calls = probe.request.call_args_list
+        self.assertEqual([call.args[0] for call in calls], ["HEAD", "GET", "HEAD", "GET"])
+        for index, call in enumerate(calls):
+            name = "config" if index < 2 else "config.lock"
+            self.assertEqual(call.args[1], "/route/private-fixture/repo/.git/" + name)
+            self.assertIs(call.kwargs["work"], work)
+            self.assertEqual(call.kwargs["limit"], 4096)
+            self.assertEqual(call.kwargs["timeout"], 10)
+            self.assertEqual(call.kwargs["headers"], {"Range": "bytes=0-255"} if index % 2 else {})
+            self.assertTrue(call.kwargs["with_status"])
+        for call in probe.fs.call_args_list:
+            self.assertIs(call.args[1], work)
+        output = str(printed.call_args_list)
+        for category in ("categories=ok", "categories=view_conflict", "categories=invalid_view"):
+            self.assertIn(category, output)
+        for private in ("private", "secret", "/route"):
+            self.assertNotIn(private, output)
+
+    def test_config_diagnostic_hides_failures_and_invalid_statuses(self):
+        probe = Mock(root="/private-fixture")
+        probe.request.side_effect = [OSError("private credential"), (b"secret", {}, "private-status"),
+                                     (b"secret", {}, 600), (b"secret", {}, True)]
+        with patch("builtins.print") as printed:
+            bench.diagnose_remote_config(probe, {"layer_id": "private"})
+        self.assertEqual(probe.request.call_count, 4)
+        self.assertEqual(str(printed.call_args_list).count("unavailable"), 4)
+        self.assertNotIn("private", str(printed.call_args_list))
+        self.assertNotIn("secret", str(printed.call_args_list))
+        probe.fs.side_effect = ValueError("private path")
+        with patch("builtins.print") as printed:
+            bench.diagnose_remote_config(probe, None)
+        self.assertEqual(str(printed.call_args_list).count("unavailable"), 4)
+        self.assertNotIn("private", str(printed.call_args_list))
+
+    def test_config_diagnostic_preserves_clone_failure_before_cleanup(self):
+        original = bench.http.ProbeFailure("original clone failure")
+        for traced in (False, True):
+            probe = Mock(root="/fixture")
+            probe.fs.return_value = "/route"
+            probe.request.side_effect = [None] + [OSError("private diagnostic failure")] * 4
+            with patch.object(bench.http, "Probe", return_value=probe), \
+                    patch.object(bench.mount, "wait_retained_accounting"), \
+                    patch.object(bench, "mounted", return_value=nullcontext(Path("/mount"))), \
+                    patch.object(bench, "clone_fixture", side_effect=original), \
+                    patch("builtins.print"):
+                with self.assertRaises(bench.http.ProbeFailure) as caught:
+                    bench.sample("cli", "base", Path("/source"), Path("/manifest"),
+                                 "layer_cow", 1, Path("/root"), trace_primary=traced)
+            self.assertIs(caught.exception, original)
+            self.assertEqual(probe.request.call_count, 5 if traced else 1)
+            self.assertEqual(probe.method_calls[-1][0], "cleanup")
 
     def test_unmapped_or_replaced_ranges_do_not_name_stale_file(self):
         start = b'12 mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, 3</private/.git/index>, 0) = 0x1000\n'
