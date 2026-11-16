@@ -373,14 +373,14 @@ probe_features() {
   mkdir_code=$(http_code "$resp")
   resp=$(request PUT "$BASE/v1/fs/$path" --auth "$API_KEY" --data "probe-0123456789")
   put_code=$(http_code "$resp")
+  check_eq "probe fixture is writable (mkdir/PUT)" "$mkdir_code:$put_code" "200:200"
   case "$mkdir_code:$put_code" in
     200:200) ;;
     *)
-      # Without a usable fixture every probe below is meaningless. Leave the
-      # probes at "unknown" so the dependent assertions run (and fail with real
-      # evidence) instead of skipping on a fixture problem.
+      # Without a usable fixture every probe below is meaningless, and leaving
+      # the probes "unknown" only makes the dependents run -- it does not make
+      # the run fail. Record a counted failure here instead of printing one.
       PROBE_FIXTURE_OK=0
-      fail "probe fixture is writable (mkdir=$mkdir_code put=$put_code)"
       ;;
   esac
 
@@ -394,13 +394,21 @@ probe_features() {
       info "stat probe returned $code; btime checks will run"
     fi
 
+    # Only a successful HEAD can establish that the server omits the validators.
+    # A failed request (5xx/401/429) proves nothing, so the probe stays unknown
+    # and the dependent assertions run and fail on that same failure.
     # Presence of the header decides support: a weak validator is a present but
     # broken feature, so the strong-ETag assertion must run and fail.
     resp=$(request HEAD "$BASE/v1/fs/$path" --auth "$API_KEY")
-    if [ "$(resp_hdr 'ETag')" = "" ]; then
-      PROBE_HEAD_VALIDATORS="false"
+    code=$(http_code "$resp")
+    if [ "$code" = "200" ]; then
+      if [ "$(resp_hdr 'ETag')" = "" ]; then
+        PROBE_HEAD_VALIDATORS="false"
+      else
+        PROBE_HEAD_VALIDATORS="true"
+      fi
     else
-      PROBE_HEAD_VALIDATORS="true"
+      info "HEAD probe returned $code; HEAD validator checks will run and fail"
     fi
 
     # 200 is the HTTP-legal "this server ignores Range" answer; 404/501 are the
@@ -1397,7 +1405,7 @@ if [ "$RUN_CONTRACT_CHECKS" = "1" ]; then
   check_eq "HEAD X-Dat9-Revision matches the PUT revision" "$(resp_hdr 'X-Dat9-Revision')" "$PUT_REV"
   check_eq "HEAD X-Dat9-Resource-ID matches the stat resource_id" "$(resp_hdr 'X-Dat9-Resource-ID')" "$STAT_RESOURCE"
   check_eq "HEAD X-Dat9-Mtime matches stat mtime" "$(resp_hdr 'X-Dat9-Mtime')" "$(printf '%s' "$stat_body" | jq -r '.mtime')"
-  if [ "$PROBE_STAT_BTIME" = "true" ]; then
+  if [ "$PROBE_STAT_BTIME" != "false" ]; then
     check_eq "HEAD X-Dat9-Btime matches stat btime" "$(resp_hdr 'X-Dat9-Btime')" "$(printf '%s' "$stat_body" | jq -r '.btime')"
   else
     skip_check "HEAD X-Dat9-Btime matches stat btime (server does not project btime)"
@@ -1461,7 +1469,7 @@ if [ "$RUN_CONTRACT_CHECKS" = "1" ]; then
   resp=$(request PUT "$BASE/v1/fs/$RANGE_PATH" --auth "$API_KEY" --data "$RANGE_TEXT")
   check_status "PUT range fixture returns 200" "$resp" "200"
   RANGE_ETAG=$(request HEAD "$BASE/v1/fs/$RANGE_PATH" --auth "$API_KEY" >/dev/null; resp_hdr 'ETag')
-  if [ "$PROBE_HEAD_VALIDATORS" = "true" ]; then
+  if [ "$PROBE_HEAD_VALIDATORS" != "false" ]; then
     check_cmd "range fixture HEAD exposes an ETag" test -n "$RANGE_ETAG"
   else
     skip_check "range fixture HEAD exposes an ETag (server does not expose read validators on HEAD)"
@@ -1497,7 +1505,7 @@ if [ "$RUN_CONTRACT_CHECKS" = "1" ]; then
     skip_check "a matching If-Match serves the file (server does not evaluate If-Match)"
   fi
 
-  if [ "$PROBE_HEAD_VALIDATORS" = "true" ]; then
+  if [ "$PROBE_HEAD_VALIDATORS" != "false" ]; then
     resp=$(request PUT "$BASE/v1/fs/$RANGE_PATH" --auth "$API_KEY" --data "0123456789-updated")
     resp=$(request HEAD "$BASE/v1/fs/$RANGE_PATH" --auth "$API_KEY")
     # A missing or weak validator must not read as "changed": require a usable
@@ -1515,7 +1523,7 @@ if [ "$RUN_CONTRACT_CHECKS" = "1" ]; then
   resp=$(request POST "$BASE/v1/fs/$CREATE_PATH?create" --auth "$API_KEY")
   check_status "POST ?create returns 200" "$resp" "200"
   check_json "?create reports revision 1" "$(json_body "$resp")" '.revision' "1"
-  if [ "$CAP_COMPLETION_IDENTITY" = "true" ]; then
+  if [ "$CAP_COMPLETION_IDENTITY" != "false" ]; then
     check_cmd "?create echoes the created resource_id (completion_identity_v1)" \
       test -n "$(json_body "$resp" | jq -r '.resource_id // empty')"
   else
@@ -1760,7 +1768,7 @@ else
   # inline storage, and batch-read-small rejects non-inline objects with a
   # per-item 413. /v1/status advertises that readiness as
   # storage_capabilities.batch_write_mode_v1.
-  if [ "$CAP_BATCH_WRITE_MODE" = "true" ]; then
+  if [ "$CAP_BATCH_WRITE_MODE" != "false" ]; then
     resp=$(request POST "$BASE/v1/fs:batch-read-small" --auth "$API_KEY" --hdr 'Content-Type: application/json' \
       --data "$(jq -nc --arg a "/$BW_ONE" '{paths:[$a]}')")
     brs_body=$(json_body "$resp")
@@ -1961,7 +1969,7 @@ if [ "$RUN_UPLOAD_LIFECYCLE_CHECKS" = "1" ]; then
   check_status "POST /v2/uploads/{id}/complete returns 200" "$resp" "200"
   v2_done=$(json_body "$resp")
   check_json "V2 complete reports status completed" "$v2_done" '.status' "completed"
-  if [ "$CAP_COMPLETION_IDENTITY" = "true" ]; then
+  if [ "$CAP_COMPLETION_IDENTITY" != "false" ]; then
     check_json "V2 complete echoes a positive revision" "$v2_done" '(.revision > 0)' "true"
     check_cmd "V2 complete echoes the published resource_id" test -n "$(printf '%s' "$v2_done" | jq -r '.resource_id // empty')"
   else
