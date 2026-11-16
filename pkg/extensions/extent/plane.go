@@ -225,6 +225,17 @@ func (h *Handler) openExistingLocked(ctx context.Context, path string, flags uin
 	if errno != 0 {
 		return nil, nil, errno
 	}
+	if flags&uint32(syscall.O_TRUNC) != 0 {
+		if errno := h.opts.Engine.VFS.Truncate(vfsCtx(c), meta.Ino(ino), 0, 0, nil); errno != 0 {
+			return nil, nil, errno
+		}
+		if err := h.opts.Engine.Bridge.TruncateLocal(ctx, path, 0); err != nil {
+			if e, ok := err.(syscall.Errno); ok {
+				return nil, nil, e
+			}
+			return nil, nil, syscall.EIO
+		}
+	}
 	_, fh, errno := h.opts.Engine.VFS.Open(vfsCtx(c), meta.Ino(ino), flags)
 	if errno != 0 {
 		return nil, nil, errno
@@ -244,6 +255,9 @@ func (h *Handler) openExistingLocked(ctx context.Context, path string, flags uin
 		if st.HasMode {
 			attr.Mode = st.Mode
 		}
+	}
+	if flags&uint32(syscall.O_TRUNC) != 0 {
+		attr.Size = 0
 	}
 	return handle, attr, 0
 }
@@ -496,6 +510,18 @@ func (h *Handler) handleForLocked(path string, fh uint64) *engineHandle {
 	return nil
 }
 
+// TryClaimExistingOpen claims an open when the target ALREADY exists locally
+// in the bridge or remotely with extent layout (used when an inner plane
+// finished waiting on an asynchronous promotion and re-checks layout).
+func (h *Handler) TryClaimExistingOpen(ctx context.Context, op *fs.Op) (fs.Result, bool, error) {
+	if h == nil || h.opts.Engine == nil || op == nil {
+		return fs.Result{}, false, nil
+	}
+	defer h.lockPaths(op.Path)()
+	res, err, claimed := h.tryClaimExistingLocked(ctx, op, false)
+	return res, claimed, err
+}
+
 // tryClaimOpen claims the op when the target is (or, in full mode, will
 // become) an engine file.
 func (h *Handler) tryClaimOpen(ctx context.Context, op *fs.Op) (fs.Result, error, bool) {
@@ -515,6 +541,22 @@ func (h *Handler) tryClaimOpen(ctx context.Context, op *fs.Op) (fs.Result, error
 	// O_EXCL keeps the probe because it needs server-side arbitration.
 	freshKernelCreate := op.KernelCreate() && op.Flags&uint32(syscall.O_CREAT) != 0 &&
 		op.Flags&uint32(syscall.O_EXCL) == 0
+	if res, err, claimed := h.tryClaimExistingLocked(ctx, op, freshKernelCreate); claimed {
+		return res, err, true
+	}
+	// Fresh path: claim creates in full JuiceFS mode, or when the path
+	// matches an explicit --extent / [extent] pattern; otherwise creation
+	// stays on the classic plane (hybrid promotion).
+	if op.Flags&syscall.O_CREAT == 0 || (h.opts.Threshold != 0 && !h.claimsPattern(op.Path)) {
+		return fs.Result{}, nil, false
+	}
+	res, err := h.createOnEngine(ctx, op)
+	return res, err, true
+}
+
+// tryClaimExistingLocked claims opens for files that already exist locally in
+// the bridge or remotely with extent layout. Caller holds h.lockPaths(op.Path).
+func (h *Handler) tryClaimExistingLocked(ctx context.Context, op *fs.Op, freshKernelCreate bool) (fs.Result, error, bool) {
 	if !freshKernelCreate {
 		st, err := h.opts.Engine.Bridge.StatLocal(ctx, op.Path)
 		if err == nil {
@@ -534,6 +576,9 @@ func (h *Handler) tryClaimOpen(ctx context.Context, op *fs.Op) (fs.Result, error
 					return res, err, true
 				}
 				return fs.Result{}, nil, false
+			}
+			if op.Flags&uint32(syscall.O_CREAT) != 0 && op.Flags&uint32(syscall.O_EXCL) != 0 {
+				return fs.Result{}, syscall.EEXIST, true
 			}
 			handle, attr, errno := h.openExistingLocked(ctx, op.Path, op.Flags, op.Caller)
 			if errno != 0 {
@@ -581,14 +626,7 @@ func (h *Handler) tryClaimOpen(ctx context.Context, op *fs.Op) (fs.Result, error
 			return fs.Result{Handle: handle, Attr: attr}, nil, true
 		}
 	}
-	// Fresh path: claim creates in full JuiceJS mode, or when the path
-	// matches an explicit --extent / [extent] pattern; otherwise creation
-	// stays on the classic plane (hybrid promotion).
-	if op.Flags&syscall.O_CREAT == 0 || (h.opts.Threshold != 0 && !h.claimsPattern(op.Path)) {
-		return fs.Result{}, nil, false
-	}
-	res, err := h.createOnEngine(ctx, op)
-	return res, err, true
+	return fs.Result{}, nil, false
 }
 
 // createOnEngine claims the name as a fresh engine create: the bridge

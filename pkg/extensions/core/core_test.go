@@ -556,3 +556,87 @@ func allZero(b []byte) bool {
 	}
 	return true
 }
+
+func TestSetAttrTruncateExtentFileUsesPatch(t *testing.T) {
+	var mu sync.Mutex
+	rev := int64(2)
+	size := int64(12 << 20)
+	resID := "res-ext"
+	classicWriteAttempted := false
+	patchSizes := []int64{}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/status", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"status":"ok","inline_threshold":50000,"storage_capabilities":{"completion_identity_v1":true}}`))
+	})
+	mux.HandleFunc("/v1/fs/", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Content-Layout", "extent")
+			w.Header().Set("X-Dat9-Revision", fmt.Sprint(rev))
+			w.Header().Set("X-Dat9-Resource-ID", resID)
+			w.Header().Set("X-Dat9-Mode", "420")
+			w.Header().Set("Content-Length", fmt.Sprint(size))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodPatch:
+			var body struct {
+				NewSize int64 `json:"new_size"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			patchSizes = append(patchSizes, body.NewSize)
+			size = body.NewSize
+			rev++
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{"upload_id": "up1", "new_size": body.NewSize})
+		case http.MethodPut:
+			classicWriteAttempted = true
+			http.Error(w, `{"error":"content layout mismatch"}`, http.StatusInternalServerError)
+		default:
+			http.Error(w, "unexpected", http.StatusMethodNotAllowed)
+		}
+	})
+	mux.HandleFunc("/v2/uploads/initiate", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		classicWriteAttempted = true
+		mu.Unlock()
+		http.Error(w, `{"error":"content layout mismatch"}`, http.StatusInternalServerError)
+	})
+	mux.HandleFunc("/v2/uploads/up1/complete", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		curRev := rev
+		curRes := resID
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "completed", "revision": curRev, "resource_id": curRes})
+	})
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c, err := New(client.New(srv.URL, ""), Options{RemoteRoot: "/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	for _, target := range []int64{5 << 20, 9 << 20, 4096, 0} {
+		res, err := c.Do(ctx, &fs.Op{Kind: fs.OpSetAttr, Path: "/ext.bin", Size: target}, nil)
+		if err != nil {
+			t.Fatalf("OpSetAttr(size=%d): %v", target, err)
+		}
+		if res.Attr == nil || res.Attr.Size != target {
+			t.Fatalf("OpSetAttr(size=%d) attr=%+v", target, res.Attr)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if classicWriteAttempted {
+		t.Fatal("classic PUT or multipart initiate attempted against extent-layout file")
+	}
+	if len(patchSizes) != 4 || patchSizes[0] != 5<<20 || patchSizes[3] != 0 {
+		t.Fatalf("patchSizes = %v, want [5MiB 9MiB 4096 0]", patchSizes)
+	}
+}

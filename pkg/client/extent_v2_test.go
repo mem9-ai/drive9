@@ -468,3 +468,100 @@ func TestExtentV2BlockRangeGETWithPlain200(t *testing.T) {
 		t.Fatalf("plain-200 slice = %q, want 456", got)
 	}
 }
+
+func TestTruncateExtentConditional(t *testing.T) {
+	var mu sync.Mutex
+	rev := int64(3)
+	size := int64(8 << 20)
+	resID := "res-extent-1"
+	conflictsRemaining := 1
+	patchRevs := []int64{}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/fs/ext.bin", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("X-Dat9-Content-Layout", string(ContentLayoutExtent))
+			w.Header().Set("X-Dat9-Revision", fmt.Sprint(rev))
+			w.Header().Set("X-Dat9-Resource-ID", resID)
+			w.Header().Set("Content-Length", fmt.Sprint(size))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodPatch:
+			var body struct {
+				NewSize          int64 `json:"new_size"`
+				ExpectedRevision int64 `json:"expected_revision"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			patchRevs = append(patchRevs, body.ExpectedRevision)
+			if conflictsRemaining > 0 {
+				conflictsRemaining--
+				rev++
+				http.Error(w, `{"error":"revision conflict"}`, http.StatusConflict)
+				return
+			}
+			rev++
+			size = body.NewSize
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(ExtentWritePlan{UploadID: "p-trunc", NewSize: body.NewSize})
+		default:
+			http.Error(w, "unexpected", http.StatusMethodNotAllowed)
+		}
+	})
+	mux.HandleFunc("/v2/uploads/p-trunc/complete", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		curRev := rev
+		curRes := resID
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "completed", "revision": curRev, "resource_id": curRes})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	cl := New(srv.URL, "")
+	st := &StatResult{Size: 8 << 20, Revision: 3, ResourceID: resID, ContentLayout: ContentLayoutExtent}
+	updated, err := cl.TruncateExtentConditional(context.Background(), "/ext.bin", st, 0)
+	if err != nil {
+		t.Fatalf("TruncateExtentConditional(0): %v", err)
+	}
+	if updated.Size != 0 || updated.Revision != 5 || len(patchRevs) != 2 {
+		t.Fatalf("updated=%+v patchRevs=%v, want size=0 rev=5 attempts=2", updated, patchRevs)
+	}
+
+	// Changing ResourceID across a conflict aborts instead of truncating a replacement.
+	mu.Lock()
+	conflictsRemaining = 1
+	rev = 5
+	size = 4096
+	mu.Unlock()
+	mux2 := http.NewServeMux()
+	mux2.HandleFunc("/v1/fs/rep.bin", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if r.Method == http.MethodHead {
+			w.Header().Set("X-Dat9-Content-Layout", string(ContentLayoutExtent))
+			w.Header().Set("X-Dat9-Revision", fmt.Sprint(rev))
+			w.Header().Set("X-Dat9-Resource-ID", resID)
+			w.Header().Set("Content-Length", fmt.Sprint(size))
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.Method == http.MethodPatch {
+			resID = "res-extent-2"
+			http.Error(w, `{"error":"revision conflict"}`, http.StatusConflict)
+			return
+		}
+		http.Error(w, "unexpected", http.StatusMethodNotAllowed)
+	})
+	srv2 := httptest.NewServer(mux2)
+	defer srv2.Close()
+	cl2 := New(srv2.URL, "")
+	_, err = cl2.TruncateExtentConditional(context.Background(), "/rep.bin", &StatResult{
+		Size: 4096, Revision: 5, ResourceID: "res-extent-1", ContentLayout: ContentLayoutExtent,
+	}, 0)
+	if !errors.Is(err, ErrResourceMismatch) {
+		t.Fatalf("resource change err = %v, want ErrResourceMismatch", err)
+	}
+}

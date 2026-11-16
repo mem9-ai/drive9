@@ -215,3 +215,61 @@ func TestBridgeReadFallbackOnNotFound416AndClassic(t *testing.T) {
 		}
 	}
 }
+
+func TestTryClaimExistingOpenAndTruncateGetAttr(t *testing.T) {
+	f := newFakeV2(t)
+	f.setDir("/d", true)
+	payload := strings.Repeat("Z", 8192)
+	f.seedExtent(t, "/d/ext.bin", payload)
+
+	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/"})
+	h := New(Options{Engine: eng, Threshold: 1})
+
+	// Non-matching classic file declines.
+	f.mu.Lock()
+	f.classic["/d/classic.txt"] = "hi"
+	f.ids["/d/classic.txt"] = "c1"
+	f.mu.Unlock()
+	if _, claimed, err := h.TryClaimExistingOpen(context.Background(), &fs.Op{
+		Kind: fs.OpCreate, Path: "/d/classic.txt", Flags: syscall.O_RDWR,
+	}); err != nil || claimed {
+		t.Fatalf("classic file: claimed=%v err=%v", claimed, err)
+	}
+
+	// Extent file is claimed (e.g. after writeback queue finishes landing it),
+	// and O_EXCL is rejected.
+	if _, claimed, err := h.TryClaimExistingOpen(context.Background(), &fs.Op{
+		Kind: fs.OpCreate, Path: "/d/ext.bin", Flags: syscall.O_CREAT | syscall.O_EXCL | syscall.O_RDWR,
+	}); !claimed || !errors.Is(err, syscall.EEXIST) {
+		t.Fatalf("O_EXCL on existing extent: claimed=%v err=%v", claimed, err)
+	}
+
+	res, claimed, err := h.TryClaimExistingOpen(context.Background(), &fs.Op{
+		Kind: fs.OpCreate, Path: "/d/ext.bin", Flags: syscall.O_RDWR,
+	})
+	if err != nil || !claimed || res.Handle == nil {
+		t.Fatalf("TryClaimExistingOpen(/d/ext.bin): claimed=%v err=%v", claimed, err)
+	}
+	eh := res.Handle.(*engineHandle)
+
+	// Truncating an open extent file to 0 must immediately surface Length=0
+	// through Bridge.GetAttr and commit size=0 cleanly on Flush/Release.
+	if _, terr, handled := h.tryTruncate(context.Background(), &fs.Op{
+		Kind: fs.OpSetAttr, Path: "/d/ext.bin", HasSize: true, Size: 0,
+	}, nil); !handled || terr != nil {
+		t.Fatalf("tryTruncate(0): handled=%v err=%v", handled, terr)
+	}
+	var attr meta.Attr
+	if errno := eng.Bridge.GetAttr(meta.Background(), eh.ino, &attr); errno != 0 {
+		t.Fatalf("Bridge.GetAttr after truncate(0): %v", errno)
+	}
+	if attr.Length != 0 {
+		t.Fatalf("Bridge.GetAttr length = %d after truncate(0), want 0", attr.Length)
+	}
+	if err := eh.Release(context.Background()); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	if got := f.contentOf("/d/ext.bin"); got != "" {
+		t.Fatalf("remote content after truncate(0)+Release = %q, want empty", got)
+	}
+}

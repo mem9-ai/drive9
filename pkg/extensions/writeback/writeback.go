@@ -167,6 +167,14 @@ type Options struct {
 // descriptor onto it would adopt its bytes.
 type ExtentOpener interface {
 	OpenExisting(ctx context.Context, path string, flags uint32, expectResourceID string, expectRevision int64, c fs.Caller) (fs.Handle, bool, error)
+	TryClaimExistingOpen(ctx context.Context, op *fs.Op) (fs.Result, bool, error)
+}
+
+func (w *Writeback) tryClaimExtentOpen(ctx context.Context, op *fs.Op) (fs.Result, bool, error) {
+	if w == nil || w.opts.ExtentOpener == nil {
+		return fs.Result{}, false, nil
+	}
+	return w.opts.ExtentOpener.TryClaimExistingOpen(ctx, op)
 }
 
 // Writeback is the fs.Handler middleware installing buffered handles.
@@ -1437,9 +1445,13 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			}
 			// pending-cache visibility (plain opens too): a path flushed
 			// into the async queue but not yet landed waits for its own
-			// image before the chain below stats it.
+			// image before the chain below stats it. When extent takeover
+			// is active, writable opens also wait on queued overwrites that
+			// may promote a placeholder onto extent layout.
 			if w.queue != nil && w.queue.HasPath(op.Path) {
 				if _, serr := w.opts.Client.StatCtx(ctx, w.remotePath(op.Path)); serr != nil && client.IsNotFound(serr) {
+					w.waitPathCommit(op.Path)
+				} else if w.opts.ExtentOpener != nil && flags&(uint32(syscall.O_WRONLY)|uint32(syscall.O_RDWR)) != 0 {
 					w.waitPathCommit(op.Path)
 				}
 			}
@@ -1461,6 +1473,12 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 						}
 					}
 				}
+			}
+			// If an asynchronous promotion just landed the file as extent
+			// layout while waiting above (or concurrently), hand the open to
+			// the extent engine instead of opening a classic bufferingHandle.
+			if res, claimed, cerr := w.tryClaimExtentOpen(ctx, op); claimed || cerr != nil {
+				return res, cerr
 			}
 			// open of an existing file: the chain below serves it, wrap
 			// the returned handle with buffering on first write
@@ -1536,6 +1554,9 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			// lands (the uploader owns that conflict resolution).
 			statErr = fs.ErrNotFound
 		} else {
+			if w.opts.ExtentOpener != nil && w.queue != nil && w.queue.HasPath(op.Path) {
+				w.waitPathCommit(op.Path)
+			}
 			st, statErr = w.probeExisting(ctx, next, op.Path)
 		}
 		if statErr != nil && fs.IsNotFound(statErr) && w.queue != nil && w.queue.HasPath(op.Path) {
@@ -1564,6 +1585,9 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			return fs.Result{}, statErr
 		}
 		if statErr == nil {
+			if res, claimed, cerr := w.tryClaimExtentOpen(ctx, op); claimed || cerr != nil {
+				return res, cerr
+			}
 			nextOp := op
 			if op.KernelCreate() {
 				// This CREATE lost the negative-lookup race. Re-enter the
@@ -2270,6 +2294,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			}
 			if h != nil {
 				h.mu.Lock()
+				migrated := h.extent != nil
 				unlinked := h.unlinked
 				mode, hasMode := h.pendingMode, h.hasPendingMode
 				h.mu.Unlock()
@@ -2280,6 +2305,10 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 					if err := h.truncateLocal(ctx, op.Size); err == nil {
 						return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Mode: modeOr644(mode, hasMode), Size: op.Size}}, nil
 					}
+				} else if migrated && !unlinked {
+					// A migrated handle's data plane lives on the extent
+					// handler; refuse to dirty its retired buffer.
+					return fs.Result{}, fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
 				} else if !unlinked {
 					// #984 fd-truncate admission: refuse while an
 					// independently dirty sibling holds the inode (two
@@ -2343,8 +2372,26 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			// prefix is fetched lazily part-by-part through a ReaderAt, so
 			// truncating a huge file never materializes the image.
 			if op.Size > maxPathTruncateInMemoryBytes {
-				if attr, ok := w.statForTruncate(ctx, op.Path); ok {
-					if err := uploadRemoteTruncateFile(ctx, w.opts.Client, w.remotePath(op.Path), attr.Size, op.Size, -1); err != nil {
+				if st, ok := w.statForTruncate(ctx, op.Path); ok {
+					if st.ContentLayout == client.ContentLayoutExtent {
+						updated, err := w.opts.Client.TruncateExtentConditional(ctx, w.remotePath(op.Path), st, op.Size)
+						if err != nil {
+							return fs.Result{}, mapErr(err)
+						}
+						rev := int64(0)
+						if updated != nil {
+							rev = updated.Revision
+						}
+						w.invalidateRev(op.Path, rev, op.Size)
+						var mode uint32
+						if st.HasMode {
+							mode = st.Mode & 0o7777
+						} else {
+							mode = w.currentModeOf(ctx, op.Path)
+						}
+						return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Mode: mode, Size: op.Size, Rev: rev}}, nil
+					}
+					if err := uploadRemoteTruncateFile(ctx, w.opts.Client, w.remotePath(op.Path), st.Size, op.Size, -1); err != nil {
 						return fs.Result{}, mapErr(err)
 					}
 					w.invalidate(op.Path, op.Size)
@@ -4557,12 +4604,12 @@ func (w *Writeback) currentModeOf(ctx context.Context, path string) uint32 {
 	return 0o644
 }
 
-func (w *Writeback) statForTruncate(ctx context.Context, path string) (fs.Attr, bool) {
+func (w *Writeback) statForTruncate(ctx context.Context, path string) (*client.StatResult, bool) {
 	st, err := w.opts.Client.StatCtx(ctx, w.remotePath(path))
 	if err != nil || st == nil {
-		return fs.Attr{}, false
+		return nil, false
 	}
-	return fs.Attr{Kind: fs.KindFile, Size: st.Size}, true
+	return st, true
 }
 
 func (w *Writeback) armBypass(path string, rev, size int64, reason string) {
@@ -6041,14 +6088,27 @@ func (w *Writeback) commitReaderOpt(ctx context.Context, path string, newReader 
 		}
 		// (see the routing comment above)
 		var werr error
-		if threshold := w.opts.Client.CachedSmallFileThreshold(); threshold > 0 && size < threshold {
-			data := make([]byte, size)
-			if n, rerr := io.ReadFull(newReader(), data); rerr == nil && int64(n) == size {
-				rev, perr := w.opts.Client.WriteCtxConditionalWithRevision(ctx, rp, data, expected)
-				if perr == nil {
-					return rev, nil
+		if w.opts.ExtentTakeover && size == 0 && !emptyCreate && expected > 0 {
+			if st, serr := w.opts.Client.StatCtx(ctx, rp); serr == nil && st != nil && st.ContentLayout == client.ContentLayoutExtent {
+				var landedRev int64
+				pctx := client.WithCompletedRevisionSink(ctx, &landedRev)
+				if perr := w.opts.Client.CommitExtentPatch(pctx, rp, 0, nil, expected); perr == nil {
+					return landedRev, nil
+				} else {
+					werr = perr
 				}
-				werr = perr
+			}
+		}
+		if werr == nil {
+			if threshold := w.opts.Client.CachedSmallFileThreshold(); threshold > 0 && size < threshold {
+				data := make([]byte, size)
+				if n, rerr := io.ReadFull(newReader(), data); rerr == nil && int64(n) == size {
+					rev, perr := w.opts.Client.WriteCtxConditionalWithRevision(ctx, rp, data, expected)
+					if perr == nil {
+						return rev, nil
+					}
+					werr = perr
+				}
 			}
 		}
 		if werr == nil {

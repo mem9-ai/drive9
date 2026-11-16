@@ -70,6 +70,25 @@ func (cq *CommitQueue) uploadExtentEntry(ctx context.Context, entry *CommitEntry
 	if !cq.extentTakeover {
 		return 0, false, nil
 	}
+	// Overwrites reduced to zero bytes must still check whether the remote target
+	// already uses extent layout — classic 0-byte PUT is rejected on extent files.
+	if entry.Kind == staging.PendingOverwrite && entry.Size <= 0 && expectedRevision > 0 && cq.client != nil {
+		st, statErr := cq.client.StatCtx(ctx, apiPath)
+		if statErr == nil && st != nil && st.ContentLayout == client.ContentLayoutExtent {
+			var landedRev int64
+			landedID := ""
+			ectx := client.WithCompletedRevisionSink(ctx, &landedRev)
+			ectx = client.WithCompletedResourceSink(ectx, &landedID)
+			if err := cq.client.CommitExtentPatch(ectx, apiPath, 0, nil, expectedRevision); err != nil {
+				return 0, true, err
+			}
+			if landedID != "" {
+				entry.LandedResourceID = landedID
+			}
+			return landedRev, true, nil
+		}
+		return 0, false, nil
+	}
 	// The extent plane has no zero-size session (server: total_size must
 	// be positive) and streamed overwrites without a base revision ride
 	// the classic shadow-spill pipeline; both stay classic.

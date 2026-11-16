@@ -188,10 +188,11 @@ func (b *Bridge) GetAttr(ctx meta.Context, ino meta.Ino, attr *meta.Attr) syscal
 	b.observeRevision(ino, st.Revision)
 	b.mu.Lock()
 	local, has := b.localLengthLocked(ino)
+	_, truncating := b.truncs[ino]
 	b.mu.Unlock()
 	if attr != nil {
 		*attr = *attrFromStat(ino, st, 0)
-		if has && local > st.Size {
+		if has && (truncating || local > st.Size) {
 			attr.Length = uint64(local)
 		}
 	}

@@ -594,3 +594,62 @@ func TestUploadExtentEntryReplacesOpenedEmptyClassic(t *testing.T) {
 		t.Fatalf("stale-base overwrite: handled=%v deletions=%d, want the classic path", handled, deleted)
 	}
 }
+
+func TestUploadExtentEntryZeroOverwriteOnExtentTarget(t *testing.T) {
+	var mu sync.Mutex
+	patchNewSize := int64(-1)
+	classicPUT := false
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/status", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"inline_threshold":50000,"storage_capabilities":{"completion_identity_v1":true}}`))
+	})
+	mux.HandleFunc("/v1/fs/zeroed.bin", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("X-Dat9-Content-Layout", "extent")
+			w.Header().Set("X-Dat9-Revision", "4")
+			w.Header().Set("X-Dat9-Resource-ID", "res-z")
+			w.Header().Set("Content-Length", "1048576")
+			w.WriteHeader(http.StatusOK)
+		case http.MethodPatch:
+			var body struct {
+				NewSize int64 `json:"new_size"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			patchNewSize = body.NewSize
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{"upload_id": "pz", "new_size": body.NewSize})
+		case http.MethodPut:
+			classicPUT = true
+			http.Error(w, `{"error":"content layout mismatch"}`, http.StatusInternalServerError)
+		default:
+			http.Error(w, "unexpected", http.StatusMethodNotAllowed)
+		}
+	})
+	mux.HandleFunc("/v2/uploads/pz/complete", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "completed", "revision": 5, "resource_id": "res-z"})
+	})
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+
+	cq := &CommitQueue{client: client.New(ts.URL, ""), extentTakeover: true}
+	entry := &CommitEntry{
+		Path:    "/zeroed.bin",
+		Size:    0,
+		Kind:    staging.PendingOverwrite,
+		BaseRev: 4,
+	}
+	rev, handled, err := cq.uploadExtentEntry(context.Background(), entry, "/zeroed.bin", 4)
+	if err != nil || !handled || rev != 5 {
+		t.Fatalf("uploadExtentEntry(0): rev=%d handled=%v err=%v, want rev=5 handled=true err=nil", rev, handled, err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if classicPUT || patchNewSize != 0 {
+		t.Fatalf("classicPUT=%v patchNewSize=%d, want false / 0", classicPUT, patchNewSize)
+	}
+}

@@ -15,8 +15,10 @@ import (
 	"syscall"
 
 	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/extensions/core"
 	"github.com/mem9-ai/drive9/pkg/extensions/extent"
 	"github.com/mem9-ai/drive9/pkg/fs"
+	"github.com/mem9-ai/drive9/pkg/fusecomp/staging"
 )
 
 // migrationServer models just enough of the v2 extent surface for the
@@ -433,5 +435,220 @@ func TestMigrationDoesNotReplayOpenIntent(t *testing.T) {
 	if size2 < int64(len(payload)) {
 		t.Fatalf("post-migration remote size shrank to %d from %d: the open's O_TRUNC was replayed",
 			size2, len(payload))
+	}
+}
+
+func TestHybridQueuedPromotionReopenTruncateZeroAndClosedSetAttr(t *testing.T) {
+	var mu sync.Mutex
+	exists := false
+	layout := ""
+	rev := int64(0)
+	size := int64(0)
+	resID := ""
+	initiateGate := make(chan struct{})
+	inInitiate := make(chan struct{})
+	classicWriteHit := false
+	patchCount := 0
+	var initiatesTotalSize int64
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/status", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"status":"ok","inline_threshold":50000,"storage_capabilities":{"completion_identity_v1":true}}`))
+	})
+	mux.HandleFunc("/v1/fs/hyb-zero.bin", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			mu.Lock()
+			ex, lay, curRev, curSize, curID := exists, layout, rev, size, resID
+			mu.Unlock()
+			if !ex {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+			if lay != "" {
+				w.Header().Set("X-Dat9-Content-Layout", lay)
+			}
+			if curID != "" {
+				w.Header().Set("X-Dat9-Resource-ID", curID)
+			}
+			w.Header().Set("X-Dat9-Revision", fmt.Sprint(curRev))
+			w.Header().Set("X-Dat9-Mode", "420")
+			w.Header().Set("Content-Length", fmt.Sprint(curSize))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodPatch:
+			var body struct {
+				NewSize int64 `json:"new_size"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			mu.Lock()
+			rev++
+			size = body.NewSize
+			patchCount++
+			curRev := rev
+			mu.Unlock()
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{"upload_id": fmt.Sprintf("patch-%d", curRev), "new_size": body.NewSize})
+		case http.MethodPut:
+			if r.URL.Query().Has("write") {
+				mu.Lock()
+				lay := layout
+				mu.Unlock()
+				if lay == "extent" {
+					mu.Lock()
+					classicWriteHit = true
+					mu.Unlock()
+					http.Error(w, `{"error":"content layout mismatch"}`, http.StatusInternalServerError)
+					return
+				}
+			}
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.Error(w, "unexpected", http.StatusMethodNotAllowed)
+		}
+	})
+	mux.HandleFunc("/v2/uploads/initiate", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Layout    string `json:"layout"`
+			TotalSize int64  `json:"total_size"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		mu.Lock()
+		lay := layout
+		if lay == "extent" || body.Layout != "extent" {
+			classicWriteHit = true
+			mu.Unlock()
+			http.Error(w, `{"error":"content layout mismatch"}`, http.StatusInternalServerError)
+			return
+		}
+		initiatesTotalSize = body.TotalSize
+		mu.Unlock()
+		close(inInitiate)
+		<-initiateGate
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"upload_id": "init1", "key": "", "part_size": 4 << 20, "total_parts": 1,
+			"checksum_contract": map[string]any{"supported": []string{"SHA-256"}, "required": true},
+		})
+	})
+	mux.HandleFunc("/v2/uploads/", func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/presign-batch") {
+			mu.Lock()
+			total := initiatesTotalSize
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"parts": []any{map[string]any{"number": 1, "url": "http://" + r.Host + "/obj/1", "size": total}},
+			})
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/complete") {
+			mu.Lock()
+			if layout == "" {
+				exists = true
+				layout = "extent"
+				rev = 1
+				size = initiatesTotalSize
+				resID = "res-hyb-1"
+			}
+			curRev := rev
+			curID := resID
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "completed", "revision": curRev, "resource_id": curID})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/obj/", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusOK)
+	})
+
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	cl := client.New(srv.URL, "")
+	ledger, err := staging.NewStaging(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(ledger.Close)
+
+	eng := extent.NewEngine(extent.EngineConfig{Client: cl, RemoteRoot: "/"})
+	plane := extent.New(extent.Options{Engine: eng, Threshold: 1, Patterns: []string{"*.db"}})
+	wb, err := New(Options{
+		Client:         cl,
+		Policy:         PolicyWriteBack,
+		Staging:        ledger,
+		ExtentTakeover: true,
+		ExtentPatterns: []string{"*.db"},
+		ExtentMinSize:  50_000,
+		ExtentOpener:   plane,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := fs.NewChain(plane, wb, terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if wb.queue != nil {
+			wb.queue.DrainAll()
+		}
+	})
+	ctx := context.Background()
+
+	// Step 1: open("wb") writes 100 KiB (>= 50 KB hybrid cutoff) & closes ->
+	// CommitQueue begins promoting to extent asynchronously.
+	createRes, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/hyb-zero.bin", Flags: syscall.O_WRONLY | syscall.O_CREAT | syscall.O_TRUNC, Mode: 0o644, HasMode: true, Caller: fs.Caller{Pid: 1}})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := createRes.Handle.Write(ctx, 0, make([]byte, 100_000)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := createRes.Handle.Flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if err := createRes.Handle.Release(ctx); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+
+	<-inInitiate
+	// Allow promotion upload to finish AFTER the concurrent reopen enters writeback.
+	time.AfterFunc(40*time.Millisecond, func() { close(initiateGate) })
+
+	// Step 2: immediately reopen r+b and truncate(0) while CommitQueue holds the in-flight upload.
+	reopenRes, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpCreate, Path: "/hyb-zero.bin", Flags: syscall.O_RDWR, Caller: fs.Caller{Pid: 1}})
+	if err != nil {
+		t.Fatalf("reopen r+b: %v", err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpSetAttr, Path: "/hyb-zero.bin", Size: 0, HasSize: true, Handle: reopenRes.Handle, Caller: fs.Caller{Pid: 1}}); err != nil {
+		t.Fatalf("ftruncate(0): %v", err)
+	}
+	if err := reopenRes.Handle.Flush(ctx); err != nil {
+		t.Fatalf("reopen flush: %v", err)
+	}
+	if err := reopenRes.Handle.Release(ctx); err != nil {
+		t.Fatalf("reopen release: %v", err)
+	}
+
+	// Step 3: closed-path OpSetAttr grow & re-zero on an extent file must also use PATCH.
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpSetAttr, Path: "/hyb-zero.bin", Size: 100_000, HasSize: true, Caller: fs.Caller{Pid: 1}}); err != nil {
+		t.Fatalf("closed truncate grow: %v", err)
+	}
+	if _, err := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpSetAttr, Path: "/hyb-zero.bin", Size: 0, HasSize: true, Caller: fs.Caller{Pid: 1}}); err != nil {
+		t.Fatalf("closed truncate zero: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if classicWriteHit {
+		t.Fatal("classic PUT or multipart initiate hit extent file")
+	}
+	if size != 0 || patchCount < 3 {
+		t.Fatalf("final size=%d patchCount=%d, want size=0 patchCount>=3", size, patchCount)
 	}
 }

@@ -499,6 +499,61 @@ func (c *Client) commitExtentPatch(ctx context.Context, path string, newSize int
 	return nil
 }
 
+// TruncateExtentConditional resizes an existing extent-layout file via a
+// metadata-only PATCH (no block downloads or uploads), bound to the initial
+// resource identity across bounded CAS retries.
+func (c *Client) TruncateExtentConditional(ctx context.Context, path string, st *StatResult, newSize int64) (*StatResult, error) {
+	if newSize < 0 {
+		return nil, fmt.Errorf("extent truncate requires non-negative size")
+	}
+	var err error
+	if st == nil {
+		st, err = c.StatCtx(ctx, path)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if st.Size == newSize {
+		return st, nil
+	}
+	origResID := st.ResourceID
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 || st.Revision <= 0 {
+			st, err = c.StatCtx(ctx, path)
+			if err != nil {
+				return nil, err
+			}
+			if origResID != "" && st.ResourceID != origResID {
+				return nil, fmt.Errorf("%s: %w", path, ErrResourceMismatch)
+			}
+			if st.Size == newSize {
+				return st, nil
+			}
+		}
+		if st.Revision <= 0 {
+			return nil, fmt.Errorf("%s: missing revision for extent truncate", path)
+		}
+		var landedRev int64
+		pctx := WithCompletedRevisionSink(ctx, &landedRev)
+		err = c.CommitExtentPatchExpectedResource(pctx, path, newSize, nil, st.Revision, st.ResourceID)
+		if err == nil {
+			updated := *st
+			updated.Size = newSize
+			updated.ContentLayout = ContentLayoutExtent
+			if landedRev > 0 {
+				updated.Revision = landedRev
+			} else if fresh, serr := c.StatCtx(ctx, path); serr == nil && fresh != nil {
+				updated = *fresh
+			}
+			return &updated, nil
+		}
+		if !errors.Is(err, ErrConflict) {
+			return nil, err
+		}
+	}
+	return nil, err
+}
+
 // putExtentPlanBlocks PUTs every distinct block the plan does not already
 // hold, in bounded parallel, with the headers the plan prescribes.
 func (c *Client) putExtentPlanBlocks(ctx context.Context, plan *ExtentWritePlan, dirty []ExtentDirtyBlock, blocks []ExtentBlockWrite) error {

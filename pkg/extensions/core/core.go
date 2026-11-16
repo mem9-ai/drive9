@@ -1264,6 +1264,10 @@ func (c *Core) createOp(ctx context.Context, op *fs.Op) (fs.Result, error) {
 // an existing file but carried O_TRUNC. The commit CASes on the observed
 // revision and re-stats on conflict, mirroring setAttrOp's truncate ladder.
 func (c *Core) truncateRemoteToZero(ctx context.Context, rp string, st *client.StatResult) error {
+	if st != nil && st.ContentLayout == client.ContentLayoutExtent {
+		_, err := c.resizeExtentFile(ctx, rp, st, 0)
+		return err
+	}
 	rev := st.Revision
 	for attempt := 0; attempt < 3; attempt++ {
 		if rev <= 0 {
@@ -1296,6 +1300,17 @@ func (c *Core) truncateRemoteToZero(ctx context.Context, rp string, st *client.S
 		rev = fresh.Revision
 	}
 	return fs.StatusErrorOf(gofuse.Status(syscall.EIO))
+}
+
+func (c *Core) resizeExtentFile(ctx context.Context, rp string, st *client.StatResult, newSize int64) (*client.StatResult, error) {
+	updated, err := c.cl.TruncateExtentConditional(ctx, rp, st, newSize)
+	if err != nil {
+		if errors.Is(err, client.ErrResourceMismatch) {
+			return nil, fs.StatusErrorOf(gofuse.EIO)
+		}
+		return nil, c.mapErr(err)
+	}
+	return updated, nil
 }
 
 // createRemoteFile creates a regular file and returns the attributes the
@@ -1426,6 +1441,21 @@ func (c *Core) setAttrOp(ctx context.Context, op *fs.Op) (fs.Result, error) {
 			// instead of attempting the allocation.
 			return fs.Result{}, fs.StatusErrorOf(gofuse.Status(syscall.EFBIG))
 		}
+		st, serr := c.remoteStatDetached(rp)
+		if serr == nil && st != nil && st.ContentLayout == client.ContentLayoutExtent {
+			updated, rerr := c.resizeExtentFile(ctx, rp, st, op.Size)
+			if rerr != nil {
+				return fs.Result{}, rerr
+			}
+			attr.Size = op.Size
+			if updated != nil && updated.Revision > 0 {
+				attr.Rev = updated.Revision
+			} else if cur, cerr := c.remoteStatDetached(rp); cerr == nil && cur != nil {
+				attr.Rev = cur.Revision
+			}
+			c.emitLanded(op.Path, attr.Rev, op.Size)
+			return fs.Result{Attr: &attr}, nil
+		}
 		// Truncate (v1): read only the kept prefix — min(newSize, oldSize)
 		// — and zero-extend to the target, so a shrink or a truncate-to-
 		// zero never downloads the discarded tail. The commit CASes on the
@@ -1451,7 +1481,9 @@ func (c *Core) setAttrOp(ctx context.Context, op *fs.Op) (fs.Result, error) {
 		// path to be absent" and fails with a conflict. Take a fresh
 		// detached stat before CASing.
 		if attr.Rev <= 0 {
-			if st, serr := c.remoteStatDetached(rp); serr == nil && st != nil {
+			if serr == nil && st != nil && st.Revision > 0 {
+				attr.Rev = st.Revision
+			} else if st, serr := c.remoteStatDetached(rp); serr == nil && st != nil {
 				attr.Rev = st.Revision
 			}
 		}
