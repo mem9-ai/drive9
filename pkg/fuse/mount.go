@@ -267,6 +267,19 @@ func extentPromotionCutoff(patternConfigured bool, cl *client.Client) int64 {
 	return extentInlineThreshold(cl)
 }
 
+// extentHybridCutoff resolves write-plane size promotion: pattern-less hybrid
+// mounts and the default coding-agent profile (whose SQLite globs only pull
+// database files into extent at size 0) still promote large non-matching files
+// at the server's inline cutoff instead of falling back to multipart. Explicit
+// non-coding-agent pattern mounts preserve pattern-only promotion via
+// extentPromotionCutoff.
+func extentHybridCutoff(profile string, patternConfigured bool, cl *client.Client) int64 {
+	if patternConfigured && profile != "coding-agent" {
+		return extentPromotionCutoff(true, cl)
+	}
+	return extentPromotionCutoff(false, cl)
+}
+
 // extentInlineThreshold returns the server's inline cutoff (the old
 // multipart upgrade line): staged images at or above it become extent.
 func extentInlineThreshold(cl *client.Client) int64 {
@@ -1180,7 +1193,7 @@ func mountWithConfig(cfg MountConfig) error {
 			// stay classic however large (create-time stickiness).
 			// Pattern-less hybrid mounts promote at the inline cutoff.
 			ExtentTakeover:  wantExt["extent"],
-			ExtentMinSize:   extentPromotionCutoff(len(cfg.ExtentPaths) > 0, cl),
+			ExtentMinSize:   extentHybridCutoff(cfg.Profile, len(cfg.ExtentPaths) > 0, cl),
 			ExtentPatterns:  cfg.ExtentPaths,
 			ExtentThreshold: int64(extentInlineThreshold(cl)),
 			// Hand a promoted descriptor to the engine: the open fd must

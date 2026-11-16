@@ -488,6 +488,22 @@ func TestUploadExtentEntryPatternRouting(t *testing.T) {
 	if _, handled, err := cq.uploadExtentEntry(context.Background(), entry4, "/mix/a.db", 9); err != nil || !handled {
 		t.Fatalf("nested basename match: handled=%v err=%v (want extent)", handled, err)
 	}
+
+	// Hybrid + pattern mode (used by default coding-agent): matching patterns
+	// promote at matchedCutoff while non-matching large files >= minSize still
+	// upgrade to extent instead of multipart, and small non-matching files stay classic.
+	cqHybrid := &CommitQueue{client: client.New(rs.URL, ""), extentTakeover: true}
+	cqHybrid.SetExtentRouting([]string{"*.db"}, 1, 50_000)
+	smallPlain := extentTestEntry(small)
+	smallPlain.Path = "/small.txt"
+	if _, handled, err := cqHybrid.uploadExtentEntry(context.Background(), smallPlain, "/small.txt", 9); err != nil || handled {
+		t.Fatalf("hybrid small non-matching: handled=%v err=%v (want classic)", handled, err)
+	}
+	largePlain := extentTestEntry(big)
+	largePlain.Path = "/large.bin"
+	if _, handled, err := cqHybrid.uploadExtentEntry(context.Background(), largePlain, "/large.bin", 9); err != nil || !handled {
+		t.Fatalf("hybrid large non-matching: handled=%v err=%v (want extent)", handled, err)
+	}
 }
 
 // A descriptor that OPENED a 0-byte classic occupant (fio's two-phase open:

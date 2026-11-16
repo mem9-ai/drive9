@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -218,6 +219,46 @@ func TestExtentV2GetExtentReadPlan(t *testing.T) {
 	}
 	if len(plan.Blocks) != 3 || !plan.Blocks[1].Zero || plan.Blocks[0].BlockKey != "a" {
 		t.Fatalf("unexpected blocks: %+v", plan.Blocks)
+	}
+}
+
+func TestExtentV2GetExtentReadPlanNotFoundAndNonExtent(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/fs/missing", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":"not found","code":"not_found"}`))
+	})
+	mux.HandleFunc("/v1/fs/unsatisfiable", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+		_, _ = w.Write([]byte(`{"error":"invalid range"}`))
+	})
+	mux.HandleFunc("/v1/fs/classic", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Dat9-Content-Layout", "single")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("classic"))
+	})
+	mux.HandleFunc("/v1/fs/redirect", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "http://example.invalid/obj")
+		w.WriteHeader(http.StatusTemporaryRedirect)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	cl := New(srv.URL, "")
+	if _, err := cl.GetExtentReadPlan(context.Background(), "/missing", 0, 1023); !IsNotFound(err) {
+		t.Fatalf("404 GetExtentReadPlan err = %v, want IsNotFound", err)
+	}
+	var se *StatusError
+	if _, err := cl.GetExtentReadPlan(context.Background(), "/unsatisfiable", 0, 1023); !errors.As(err, &se) || se.StatusCode != http.StatusRequestedRangeNotSatisfiable {
+		t.Fatalf("416 GetExtentReadPlan err = %v, want 416 StatusError", err)
+	}
+	if _, err := cl.GetExtentReadPlan(context.Background(), "/classic", 0, 1023); !errors.Is(err, ErrExtentNotServed) {
+		t.Fatalf("200 classic GetExtentReadPlan err = %v, want ErrExtentNotServed", err)
+	}
+	if _, err := cl.GetExtentReadPlan(context.Background(), "/redirect", 0, 1023); !errors.Is(err, ErrExtentNotServed) {
+		t.Fatalf("307 redirect GetExtentReadPlan err = %v, want ErrExtentNotServed", err)
 	}
 }
 

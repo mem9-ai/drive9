@@ -733,7 +733,7 @@ func New(opts Options) (*Writeback, error) {
 		// turns a promotion-sized staged image into an extent sequential
 		// session (or an incremental PATCH) instead of a classic upload.
 		q.SetExtentTakeover(opts.ExtentTakeover)
-		q.SetExtentPatterns(opts.ExtentPatterns, opts.ExtentThreshold)
+		q.SetExtentRouting(opts.ExtentPatterns, opts.ExtentThreshold, opts.ExtentMinSize)
 		q.SetPerfCounters(w.perfShim)
 		if opts.BatchWindow > 0 || opts.BatchMaxFiles > 0 || opts.BatchMaxBytes > 0 {
 			q.ConfigureBatchWrite(opts.BatchWindow, opts.BatchMaxFiles, opts.BatchMaxBytes)
@@ -7225,10 +7225,7 @@ func (w *Writeback) extentRouteAllowed(path string, size int64) bool {
 	if !w.opts.ExtentTakeover || size <= 0 {
 		return false
 	}
-	if len(w.extentGlobs) > 0 {
-		if !matchExtentPattern(w.extentGlobs, path) {
-			return false
-		}
+	if len(w.extentGlobs) > 0 && matchExtentPattern(w.extentGlobs, path) {
 		return size >= w.extentMatchCutoff
 	}
 	return w.opts.ExtentMinSize > 0 && size >= w.opts.ExtentMinSize

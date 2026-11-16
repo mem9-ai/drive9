@@ -120,6 +120,9 @@ func (c *Client) GetExtentReadPlan(ctx context.Context, path string, start, end 
 		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 400 {
+		return nil, readError(resp)
+	}
 	if ContentLayout(resp.Header.Get("X-Dat9-Content-Layout")) != ContentLayoutExtent {
 		return nil, ErrExtentNotServed
 	}

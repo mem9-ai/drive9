@@ -4,11 +4,15 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
+
+	"github.com/juicedata/juicefs/pkg/meta"
 
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/fs"
@@ -164,6 +168,50 @@ func TestAssemblePatchBlocksSplitsChunkSpanToBlockSize(t *testing.T) {
 		if blk.Chunk != 1 || blk.Off != wantOffs[i] || len(blk.Data) != wantLens[i] {
 			t.Fatalf("block %d = (chunk=%d off=%d len=%d), want (1 %d %d)",
 				i, blk.Chunk, blk.Off, len(blk.Data), wantOffs[i], wantLens[i])
+		}
+	}
+}
+
+func TestBridgeReadFallbackOnNotFound416AndClassic(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/fs/missing.db-shm", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":"not found","code":"not_found"}`, http.StatusNotFound)
+	})
+	mux.HandleFunc("/v1/fs/empty.db-shm", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", "0")
+			w.Header().Set("X-Dat9-Content-Layout", "extent")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		http.Error(w, `{"error":"invalid range"}`, http.StatusRequestedRangeNotSatisfiable)
+	})
+	mux.HandleFunc("/v1/fs/classic.txt", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "5")
+		w.Header().Set("X-Dat9-Content-Layout", "single")
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		_, _ = w.Write([]byte("HELLO"))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := NewBridge(Config{Client: client.New(srv.URL, ""), RemoteRoot: "/"})
+
+	for _, name := range []string{"/missing.db-shm", "/empty.db-shm", "/classic.txt"} {
+		ino := inoFor(name)
+		b.remember(ino, name)
+		b.mu.Lock()
+		b.sizes[ino] = 5
+		b.mu.Unlock()
+		var slices []meta.Slice
+		if errno := b.Read(meta.Background(), ino, 0, &slices); errno != 0 {
+			t.Fatalf("Read(%s) errno = %v, want 0 (no SIGBUS EIO)", name, errno)
+		}
+		if name == "/classic.txt" && len(slices) != 1 {
+			t.Fatalf("Read(/classic.txt) slices = %d, want 1", len(slices))
 		}
 	}
 }

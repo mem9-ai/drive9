@@ -112,6 +112,11 @@ func errnoOf(err error) syscall.Errno {
 	return syscall.EIO
 }
 
+func isRangeNotSatisfiable(err error) bool {
+	var se *client.StatusError
+	return errors.As(err, &se) && se.StatusCode == http.StatusRequestedRangeNotSatisfiable
+}
+
 // ---- namespace ----
 
 func (b *Bridge) Lookup(ctx meta.Context, parent meta.Ino, name string, inode *meta.Ino, attr *meta.Attr, checkPerm bool) syscall.Errno {
@@ -544,12 +549,15 @@ func (b *Bridge) Read(ctx meta.Context, ino meta.Ino, indx uint32, slices *[]met
 	}
 	plan, err := b.fetchFreshReadPlan(ctxOf(ctx), ino, path, start, chunkEnd)
 	if err != nil {
-		if !client.IsNotFound(err) {
+		if errors.Is(err, client.ErrExtentNotServed) {
+			return b.readClassic(ctx, ino, path, start, chunkEnd, slices)
+		}
+		if !client.IsNotFound(err) && !isRangeNotSatisfiable(err) {
 			return errnoOf(err)
 		}
 		// No remote representation (a fresh interactive file before its
-		// first commit): an empty plan — the pending overlay below still
-		// serves the locally staged bytes, which must not read as zeros.
+		// first commit or a 0-byte remote placeholder): an empty plan —
+		// the pending overlay below still serves locally staged/truncated bytes.
 		plan = &client.ExtentReadPlan{}
 	}
 	// A single plan page need not cover the chunk: the server caps a plan
@@ -1518,10 +1526,21 @@ func (b *Bridge) flushTruncateOnly(ctx context.Context, ino meta.Ino, size int64
 		// resurrect the discarded tail on the next open.
 		return b.commitClassic(ctx, ino, path, nil, size, st.Revision)
 	}
-	if st.Size == size || st.ContentLayout != client.ContentLayoutExtent {
-		if st.Size == size {
+	if st.Size == size {
+		b.mu.Lock()
+		delete(b.truncs, ino)
+		b.mu.Unlock()
+		return nil
+	}
+	if st.ContentLayout != client.ContentLayoutExtent {
+		if st.Size == 0 && size > 0 {
+			if err := b.commitClassic(ctx, ino, path, nil, size, st.Revision); err != nil {
+				return err
+			}
 			b.mu.Lock()
+			b.classicOwned[ino] = true
 			delete(b.truncs, ino)
+			delete(b.commitErr, ino)
 			b.mu.Unlock()
 		}
 		return nil
@@ -1922,6 +1941,9 @@ func (b *Bridge) readClassic(ctx context.Context, ino meta.Ino, path string, sta
 		}
 		rc, err := b.cfg.Client.ReadStreamRange(ctx, path, start, length)
 		if err != nil {
+			if client.IsNotFound(err) || (remoteLength == 0 && isRangeNotSatisfiable(err)) {
+				break
+			}
 			return errnoOf(err)
 		}
 		// The identity is taken from the READ's own response headers when the

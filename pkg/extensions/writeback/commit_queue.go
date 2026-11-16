@@ -190,6 +190,7 @@ type CommitQueue struct {
 	retainedShadows   sync.Map
 	extentGlobs       []globMatcher
 	extentMatchCutoff int64
+	extentMinSize     int64
 	index             *staging.PendingIndex
 	journal           *staging.Journal
 	wg                sync.WaitGroup
@@ -323,11 +324,14 @@ func (cq *CommitQueue) SetExtentTakeover(enabled bool) {
 	cq.mu.Unlock()
 }
 
-// SetExtentPatterns arms the pattern-owned extent routing: with a
-// non-empty pattern set, a queued image promotes to an extent session
-// only when its (mount-relative) path matches, at or above the matched
-// cutoff; an empty set keeps the size-only hybrid promotion.
+// SetExtentPatterns arms pattern-only extent routing with zero size fallback.
 func (cq *CommitQueue) SetExtentPatterns(patterns []string, matchedCutoff int64) {
+	cq.SetExtentRouting(patterns, matchedCutoff, 0)
+}
+
+// SetExtentRouting arms both pattern-matched extent routing (at matchedCutoff)
+// and optional hybrid size-cutoff fallback (minSize > 0) for non-matching paths.
+func (cq *CommitQueue) SetExtentRouting(patterns []string, matchedCutoff, minSize int64) {
 	if cq == nil {
 		return
 	}
@@ -335,19 +339,20 @@ func (cq *CommitQueue) SetExtentPatterns(patterns []string, matchedCutoff int64)
 	cq.mu.Lock()
 	cq.extentGlobs = globs
 	cq.extentMatchCutoff = matchedCutoff
+	cq.extentMinSize = minSize
 	cq.mu.Unlock()
 }
 
 // extentRouteFor reports the extent routing decision for a queued path.
 func (cq *CommitQueue) extentRouteFor(path string, size int64) bool {
 	cq.mu.Lock()
-	globs, cutoff := cq.extentGlobs, cq.extentMatchCutoff
+	globs, cutoff, minSize := cq.extentGlobs, cq.extentMatchCutoff, cq.extentMinSize
 	cq.mu.Unlock()
 	if len(globs) > 0 {
-		if !matchExtentPattern(globs, path) {
-			return false
+		if matchExtentPattern(globs, path) {
+			return size >= cutoff
 		}
-		return size >= cutoff
+		return minSize > 0 && size >= minSize
 	}
 	threshold := cq.directPutThreshold()
 	if threshold <= 0 {

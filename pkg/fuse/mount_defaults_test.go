@@ -151,6 +151,12 @@ func TestExtentPromotionCutoffRespectsPatterns(t *testing.T) {
 	if got := extentPromotionCutoff(false, cl); got <= 0 {
 		t.Fatalf("hybrid promotion cutoff = %d, want the positive inline fallback", got)
 	}
+	if got := extentHybridCutoff("coding-agent", true, cl); got <= 0 {
+		t.Fatalf("coding-agent hybrid cutoff = %d, want positive inline threshold", got)
+	}
+	if got := extentHybridCutoff("custom", true, cl); got != 0 {
+		t.Fatalf("custom pattern-only cutoff = %d, want 0", got)
+	}
 }
 
 // The engine's cache root must sit INSIDE the writeback-side cache
