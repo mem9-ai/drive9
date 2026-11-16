@@ -39,6 +39,11 @@ class BenchmarkTests(unittest.TestCase):
                     bench.command(["git"])
                 self.assertNotIn("private output", str(error.exception))
 
+    def test_error_classification_does_not_echo_raw_output(self):
+        self.assertEqual(bench.failure_categories(b"fatal: private-path: Permission denied"), "permission")
+        self.assertEqual(bench.failure_categories(b"private-path and secret bytes"), "unclassified")
+        self.assertEqual(bench.failure_categories(b"x" * 65536 + b"Permission denied"), "unclassified")
+
     def test_summary_requires_both_verified_cases(self):
         rows = [{"case": case, "trial": 1, "clone_seconds": n, "durable_seconds": n,
                  "remount_verify_seconds": n, "verified": True}

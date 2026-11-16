@@ -23,12 +23,23 @@ MOUNT_OPTIONS = ["--mode=fuse", "--foreground", "--no-persist-credentials", "--p
                  "--extensions=core,sse,cache,writeback", "--durability=close-sync", "--flush-debounce=0"]
 
 
+def failure_categories(raw):
+    text = raw[:65536].decode("utf-8", errors="replace").lower()
+    patterns = {"operation not supported": "unsupported", "permission denied": "permission",
+                "invalid argument": "invalid", "input/output error": "io", "no such file or directory": "not_found",
+                "file exists": "exists", "read-only file system": "read_only", "could not write config file": "git_config",
+                "unable to write": "git_write", "could not create work tree dir": "git_worktree",
+                "unable to access": "git_access", "failed to write": "git_write_failure"}
+    return ",".join(value for key, value in patterns.items() if key in text) or "unclassified"
+
+
 def command(args, *, env=None, timeout=300):
     try:
         result = subprocess.run(args, env=env, capture_output=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         raise http.ProbeFailure("benchmark subprocess timed out; sample rejected") from None
-    require(result.returncode == 0, "benchmark subprocess failed; sample rejected")
+    require(result.returncode == 0, "benchmark subprocess failed; exit=" + str(result.returncode)
+            + " categories=" + failure_categories(result.stderr) + "; sample rejected")
     return result.stdout
 
 
@@ -74,6 +85,8 @@ def mounted(cli, probe, directory, work):
             yield point
     finally:
         if process is not None:
+            if sys.exc_info()[0] is not None:
+                print("CHECK mount categories=" + mount.mount_failure_categories(directory / "mount.log"), flush=True)
             try:
                 mount.unmount_owned_process(cli, wrapper.env, str(point), process)
                 require(process.wait(timeout=10) == 0, "mount exited with an error")
@@ -137,14 +150,17 @@ def sample(cli, base, source, manifest_file, case, index, root):
         with mounted(cli, probe, root / "write", work) as point:
             target = point / probe.root.lstrip("/") / "repo"
             started = time.monotonic()
+            print("CHECK phase=clone", flush=True)
             command(["git", "-c", "protocol.file.allow=always", "clone", "--no-local", source.as_uri(), str(target)], timeout=600)
             cloned = time.monotonic()
+            print("CHECK phase=sync", flush=True)
             command([sys.executable, __file__, "--operation=sync", "--tree", str(target)], timeout=300)
             synced = time.monotonic()
         unmounted = time.monotonic()
         # New kernel mount and empty read/write cache prove server persistence.
         with mounted(cli, probe, root / "read", work) as point:
             target = point / probe.root.lstrip("/") / "repo"
+            print("CHECK phase=remount_verify", flush=True)
             verify_start = time.monotonic()
             command([sys.executable, __file__, "--operation=verify", "--tree", str(target), "--manifest", str(manifest_file)], timeout=600)
             verified = time.monotonic()
