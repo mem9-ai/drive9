@@ -78,6 +78,20 @@ class BenchmarkTests(unittest.TestCase):
             rows = bench.signal_mapping_counts(start + event + fault)
             self.assertEqual(rows[0]["mapping_class"], category)
 
+    def test_only_successful_exec_discards_prior_address_space(self):
+        start = b'12 mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, 3</private/.git/objects/pack/secret>, 0) = 0x1000\n'
+        fault = b'12 --- SIGBUS {si_signo=SIGBUS, si_code=BUS_ADRERR, si_addr=0x1010} ---\n'
+        for event, category in ((b'12 execve("/private/git", [], []) = 0\n', "unknown"),
+                                (b'12 execveat(AT_FDCWD, "/private/git", [], [], 0) = 0\n', "unknown"),
+                                (b'12 <... execve resumed>) = 0\n', "unknown"),
+                                (b'12 execve("/private/git", [], []) = -1 ENOENT (missing)\n', "git_objects")):
+            with self.subTest(event=event):
+                rows = bench.signal_mapping_counts(start + event + fault)
+                self.assertEqual(rows[0]["mapping_class"], category)
+        # The new image can establish its own independently observed mapping.
+        rows = bench.signal_mapping_counts(start + b'12 execve("/git", [], []) = 0\n' + start.replace(b"/.git/objects/pack/secret", b"/.git/index") + fault)
+        self.assertEqual(rows[0]["mapping_class"], "git_index")
+
     def test_diagnostic_timeout_kills_only_its_process_group(self):
         process = Mock(pid=1234)
         process.wait.side_effect = [subprocess.TimeoutExpired("strace", 60), 0]

@@ -79,6 +79,9 @@ def signal_mapping_counts(raw):
     for line in raw[-(4 << 20):].decode("utf-8", errors="replace").splitlines():
         prefix = re.match(r"^(?:(\d+) +)?(.*)$", line)
         pid, event = prefix.groups()
+        if re.match(r"(?:execve(?:at)?\(.*|<\.\.\. execve(?:at)? resumed>.*) = 0$", event):
+            mappings.pop(pid, None)
+            continue
         mapped = re.match(r"mmap\([^,]+, (\d+),.*\) = (0x[0-9a-f]+)$", event)
         unmapped = re.match(r"munmap\((0x[0-9a-f]+), (\d+)\) = 0$", event)
         if mapped or unmapped:
