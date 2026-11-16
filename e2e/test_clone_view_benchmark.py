@@ -57,6 +57,27 @@ class BenchmarkTests(unittest.TestCase):
         self.assertNotIn("private", str(rows))
         self.assertNotIn("secret", str(rows))
 
+    def test_fault_mapping_classification_is_bounded_and_private(self):
+        raw = (b'12 mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, 3</private/.git/objects/pack/secret>, 0) = 0x1000\n'
+               b'12 --- SIGBUS {si_signo=SIGBUS, si_code=BUS_ADRERR, si_addr=0x1010} ---\n'
+               b'13 --- SIGBUS {si_signo=SIGBUS, si_code=PRIVATE_CODE, si_addr=0x1010} ---\n')
+        rows = bench.signal_mapping_counts(raw)
+        self.assertEqual(rows, [
+            {"signal": "SIGBUS", "code": "BUS_ADRERR", "mapping_class": "git_objects", "count": 1},
+            {"signal": "SIGBUS", "code": "unknown", "mapping_class": "unknown", "count": 1}])
+        for private in ("private", "secret", "0x1010", "PRIVATE_CODE"):
+            self.assertNotIn(private, str(rows))
+        self.assertEqual(bench.signal_mapping_counts(raw + b"x" * (4 << 20)), [])
+        self.assertEqual(bench.signal_mapping_counts(b"malformed or private input"), [])
+
+    def test_unmapped_or_replaced_ranges_do_not_name_stale_file(self):
+        start = b'12 mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, 3</private/.git/index>, 0) = 0x1000\n'
+        fault = b'12 --- SIGBUS {si_signo=SIGBUS, si_code=BUS_ADRERR, si_addr=0x1010} ---\n'
+        for event, category in ((b'12 munmap(0x1000, 4096) = 0\n', "unknown"),
+                                (b'12 mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, 4</other>, 0) = 0x1000\n', "other")):
+            rows = bench.signal_mapping_counts(start + event + fault)
+            self.assertEqual(rows[0]["mapping_class"], category)
+
     def test_diagnostic_timeout_kills_only_its_process_group(self):
         process = Mock(pid=1234)
         process.wait.side_effect = [subprocess.TimeoutExpired("strace", 60), 0]

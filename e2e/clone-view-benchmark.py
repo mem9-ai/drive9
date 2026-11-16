@@ -69,6 +69,39 @@ def syscall_failure_counts(raw):
             for (op, error, category), count in sorted(counts.items())]
 
 
+def signal_mapping_counts(raw):
+    # Correlate only addresses observed in this bounded trace tail. Missing,
+    # resumed or inherited mappings remain unknown; no path/address is output.
+    mappings = {}
+    counts = {}
+    classes = (("/.git/objects/", "git_objects"), ("/.git/index", "git_index"),
+               ("/.git/config", "git_config"))
+    for line in raw[-(4 << 20):].decode("utf-8", errors="replace").splitlines():
+        prefix = re.match(r"^(?:(\d+) +)?(.*)$", line)
+        pid, event = prefix.groups()
+        mapped = re.match(r"mmap\([^,]+, (\d+),.*\) = (0x[0-9a-f]+)$", event)
+        unmapped = re.match(r"munmap\((0x[0-9a-f]+), (\d+)\) = 0$", event)
+        if mapped or unmapped:
+            start = int(mapped.group(2) if mapped else unmapped.group(1), 16)
+            length = int(mapped.group(1) if mapped else unmapped.group(2))
+            end = start + length
+            # A partial unmap conservatively discards the whole old range.
+            current = [(a, b, c) for a, b, c in mappings.get(pid, []) if b <= start or a >= end]
+            if mapped:
+                category = next((c for path, c in classes if path in event), "other")
+                current.append((start, end, category))
+            mappings[pid] = current
+        fault = re.match(r"--- (SIGBUS|SIGSEGV) \{.*si_code=([A-Z_]+).*si_addr=(0x[0-9a-f]+).*", event)
+        if fault:
+            address = int(fault.group(3), 16)
+            category = next((c for a, b, c in reversed(mappings.get(pid, [])) if a <= address < b), "unknown")
+            code = fault.group(2) if fault.group(2) in {"BUS_ADRALN", "BUS_ADRERR", "BUS_OBJERR", "SEGV_MAPERR", "SEGV_ACCERR"} else "unknown"
+            key = (fault.group(1), code, category)
+            counts[key] = counts.get(key, 0) + 1
+    return [{"signal": sig, "code": code, "mapping_class": category, "count": count}
+            for (sig, code, category), count in sorted(counts.items())]
+
+
 def diagnose_clone_failure(args, trace):
     # A separate, unmeasured destination preserves the failed sample. Raw trace
     # and Git output stay in the temporary fixture and are never uploaded.
@@ -77,7 +110,7 @@ def diagnose_clone_failure(args, trace):
         return
     with trace.with_suffix(".stderr").open("wb") as stderr:
         process = subprocess.Popen(["strace", "-f", "-qq", "-yy", "-e",
-                                    "trace=%file,fsync,fdatasync,close,fchmod,ftruncate,read,pread64,write,pwrite64",
+                                    "trace=%file,mmap,munmap,fsync,fdatasync,close,fchmod,ftruncate,read,pread64,write,pwrite64",
                                     "-e", "raw=read,pread64,write,pwrite64", "-o", str(trace), *args],
                                    stdout=subprocess.DEVNULL, stderr=stderr, start_new_session=True)
         try:
@@ -90,8 +123,11 @@ def diagnose_clone_failure(args, trace):
     with trace.open("rb") as source:
         source.seek(0, os.SEEK_END)
         source.seek(max(0, source.tell() - (4 << 20)))
-        failures = syscall_failure_counts(source.read(4 << 20))
-    print("CHECK clone diagnostic exit=" + str(result) + " failures=" + json.dumps(failures, sort_keys=True), flush=True)
+        raw = source.read(4 << 20)
+        failures = syscall_failure_counts(raw)
+        signals = signal_mapping_counts(raw)
+    print("CHECK clone diagnostic exit=" + str(result) + " failures=" + json.dumps(failures, sort_keys=True)
+          + " signals=" + json.dumps(signals, sort_keys=True), flush=True)
 
 
 def clone_fixture(source, target, trace):
