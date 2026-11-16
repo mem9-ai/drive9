@@ -3,6 +3,7 @@ package writeback
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -58,6 +59,17 @@ func TestFixedDirectCompletionRecovery(t *testing.T) {
 							if operation == "" || operation != id {
 								result = httptest.NewRecorder()
 								backend.ServeHTTP(result, r)
+								if result.Code == 200 && r.Header.Get("X-Dat9-Mode") != "" {
+									// Production fixed create returns the full durable PUT receipt.
+									var created struct {
+										Revision int64 `json:"revision"`
+									}
+									if err := json.Unmarshal(result.Body.Bytes(), &created); err != nil {
+										t.Error(err)
+									}
+									result.Body.Reset()
+									_ = json.NewEncoder(result.Body).Encode(client.FixedUploadCompletion{Status: "ok", OperationID: id, View: client.FixedViewState{LayerID: "a", Fence: 1, Generation: 1}, ResourceID: "file", Revision: created.Revision})
+								}
 								if result.Code < 300 {
 									publications++
 								}

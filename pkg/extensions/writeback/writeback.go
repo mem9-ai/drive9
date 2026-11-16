@@ -1268,7 +1268,8 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			h := &bufferingHandle{w: w, path: op.Path, inner: res.Handle, flags: flags,
 				baseSize: size, baseRev: rev, forceSync: hasSyncOpenFlag(flags)}
 			mode := op.Mode & 0o7777
-			if mode != 0o644 && mode != 0 {
+			// Fixed creation already committed the mode atomically with the file.
+			if w.opts.Client.ViewBinding().LayerID == "" && mode != 0o644 && mode != 0 {
 				h.pendingMode = mode
 				h.hasPendingMode = true
 			}

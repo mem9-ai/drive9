@@ -99,3 +99,54 @@ func TestFixedEmptyFileInvalidBeforeHTTP(t *testing.T) {
 		t.Fatal("sent invalid request")
 	}
 }
+
+func TestFixedCreateFileCtxUsesOriginalRequest(t *testing.T) {
+	var calls atomic.Int32
+	var originalID string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := calls.Add(1)
+		id := r.Header.Get(viewprotocol.OperationHeader)
+		if r.Method != "PUT" || r.URL.RawQuery != "" || r.Header.Get("X-Dat9-Expected-Revision") != "0" || r.Header.Get("X-Dat9-Mode") != "420" || r.ContentLength != 0 {
+			t.Error("incorrect fixed creation request")
+		}
+		if n == 1 {
+			originalID = id
+			w.Header().Set("Content-Length", "99999")
+			return
+		}
+		if id == "" || id != originalID {
+			t.Error("changed operation identity")
+		}
+		_ = json.NewEncoder(w).Encode(FixedUploadCompletion{Status: "ok", OperationID: id, View: FixedViewState{LayerID: "a", Fence: 1, Generation: 1}, ResourceID: "file", Revision: 1})
+	}))
+	defer server.Close()
+	c, _ := New(server.URL, "").WithView(ViewBinding{LayerID: "a", WorkID: "w", Fence: 1})
+	rev, err := c.CreateFileCtx(t.Context(), "/file")
+	var op *ViewOperationError
+	if rev != 0 || !errors.As(err, &op) || op.OperationID == "" || !IsCommitAttempted(err) {
+		t.Fatal(rev, err)
+	}
+	ctx, err := WithViewOperationID(t.Context(), op.OperationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rev, err = c.CreateFileCtx(ctx, "/file")
+	if err != nil || rev != 1 || calls.Load() != 2 {
+		t.Fatal(rev, err, calls.Load())
+	}
+}
+
+func TestFixedCreateModeInvalidBeforeHTTP(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls.Add(1); w.WriteHeader(500) }))
+	defer server.Close()
+	c, _ := New(server.URL, "").WithView(ViewBinding{LayerID: "a", WorkID: "w", Fence: 1})
+	for _, mode := range []uint32{0o1000, 0xffffffff} {
+		if _, err := c.CreateFixedFileCtx(t.Context(), "/file", mode); err == nil {
+			t.Fatal("accepted mode", mode)
+		}
+	}
+	if calls.Load() != 0 {
+		t.Fatal("sent invalid request")
+	}
+}

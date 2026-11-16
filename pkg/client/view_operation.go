@@ -47,11 +47,14 @@ func (c *Client) identifyViewMutation(req *http.Request) {
 	if c.view.LayerID == "" || req.Method == http.MethodGet || req.Method == http.MethodHead {
 		return
 	}
-	id, _ := req.Context().Value(viewOperationKey{}).(string)
-	if id == "" {
-		id = "fs-" + rand.Text()
+	req.Header.Set(viewprotocol.OperationHeader, viewMutationID(req.Context()))
+}
+
+func viewMutationID(ctx context.Context) string {
+	if id, _ := ctx.Value(viewOperationKey{}).(string); id != "" {
+		return id
 	}
-	req.Header.Set(viewprotocol.OperationHeader, id)
+	return "fs-" + rand.Text()
 }
 
 func (c *Client) viewMutationOutcome(req *http.Request, resp *http.Response, err error) (*http.Response, error) {

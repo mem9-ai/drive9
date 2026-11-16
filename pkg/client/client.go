@@ -861,6 +861,10 @@ func (c *Client) CreateFile(path string) (int64, error) {
 // CreateFileCtx creates an empty file with context support and returns the
 // committed file revision when the server reports it.
 func (c *Client) CreateFileCtx(ctx context.Context, path string) (int64, error) {
+	if c.view.LayerID != "" {
+		out, err := c.CreateFixedFileCtx(ctx, path, 0o644)
+		return out.Revision, err
+	}
 	req, err := c.newFSRequest(ctx, http.MethodPost, path, "?create=1", nil)
 	if err != nil {
 		return 0, err
