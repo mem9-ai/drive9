@@ -113,21 +113,26 @@ func (s objectStorage) Put(ctx context.Context, key string, in io.Reader, getter
 	// freeing NVMe IOPS during large writes.
 	if s.bridge == nil || !s.bridge.cfg.NativeWriteback {
 		if s.bridge != nil {
-			s.bridge.mu.Lock()
-			existingSlice := s.bridge.stagedSlices[id] != nil
-			hasInFlight := len(s.bridge.stagedSlices) > 0 || s.bridge.blocks.pinnedBudget() > 0
-			s.bridge.mu.Unlock()
-			// Backpressure BEFORE allocating/returning a new slice so JuiceFS
-			// FreeMemory stays gated on commit drain rate; blocks of an already
-			// admitted slice never wait so an in-progress slice always finishes.
-			if !existingSlice && hasInFlight {
-				if err := s.bridge.blocks.waitTotalStagingBudget(ctx, maxPinnedCommitBytes); err != nil {
-					return err
-				}
+			est := size
+			if size == client.ExtentBlockSize {
+				est = int64(client.ExtentBlockSize) * 16
 			}
+			// Admit slice by ascending slice ID and reserve its expected chunk
+			// budget upfront so MaxUpload workers cannot flood >maxPinnedCommitBytes
+			// or starve older slices behind newer ones.
+			if err := s.bridge.blocks.waitSliceAdmission(ctx, id, est, maxPinnedCommitBytes); err != nil {
+				return err
+			}
+			s.bridge.blocks.beginSliceWrite(id)
 		}
 		buf := make([]byte, size)
 		if _, err := io.ReadFull(in, buf); err != nil {
+			// Wait: also drop abort check race — if another writer already wrote to
+			// this slice (sliceUsed > 0) or is still reading (sliceWriters > 0), keep
+			// the reservation active.
+			if s.bridge != nil {
+				s.bridge.blocks.abortSliceWrite(id, true)
+			}
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				return fmt.Errorf("short staging read: %w", err)
 			}
@@ -150,7 +155,7 @@ func (s objectStorage) Put(ctx context.Context, key string, in io.Reader, getter
 		sl.blocks[indx] = buf
 		sl.total += size
 		s.bridge.mu.Unlock()
-		s.bridge.blocks.addStagedMem(size - prevLen)
+		s.bridge.blocks.finishSliceWrite(id, size-prevLen)
 		return nil
 	}
 	dir := s.bridge.cfg.CacheDir
@@ -510,6 +515,148 @@ func (r *blockRegistry) waitPinnedBudget(ctx context.Context, limit int64) error
 // hold at least limit bytes in RAM.
 func (r *blockRegistry) waitTotalStagingBudget(ctx context.Context, limit int64) error {
 	return r.waitBudget(ctx, func() bool { return r.pinnedBytes+r.stagedMemBytes >= limit })
+}
+
+func (r *blockRegistry) hasSmallerWaiterLocked(sliceID uint64) bool {
+	for id, cnt := range r.waitingSlices {
+		if cnt > 0 && id < sliceID {
+			return true
+		}
+	}
+	return false
+}
+
+// waitSliceAdmission admits a staging slice in ascending slice ID order and
+// reserves its estimated footprint up front so concurrent upload workers stay
+// bounded below limit without starving older slices.
+func (r *blockRegistry) waitSliceAdmission(ctx context.Context, sliceID uint64, est, limit int64) error {
+	r.mu.Lock()
+	if _, ok := r.sliceTarget[sliceID]; ok {
+		r.mu.Unlock()
+		return nil
+	}
+	if r.waitingSlices == nil {
+		r.waitingSlices = make(map[uint64]int)
+	}
+	r.waitingSlices[sliceID]++
+	admitted := false
+	defer func() {
+		r.waitingSlices[sliceID]--
+		if r.waitingSlices[sliceID] == 0 {
+			delete(r.waitingSlices, sliceID)
+		}
+		if !admitted || r.pinnedBytes+r.stagedMemBytes < limit || r.waitingSlices[sliceID] > 0 {
+			close(r.budgetCh)
+			r.budgetCh = make(chan struct{})
+		}
+		r.mu.Unlock()
+	}()
+	for ((r.pinnedBytes+r.stagedMemBytes >= limit) && (r.pinnedBytes > 0 || r.stagedMemBytes > 0)) || r.hasSmallerWaiterLocked(sliceID) {
+		ch := r.budgetCh
+		r.mu.Unlock()
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			r.mu.Lock()
+			return ctx.Err()
+		}
+		r.mu.Lock()
+		if _, ok := r.sliceTarget[sliceID]; ok {
+			admitted = true
+			return nil
+		}
+	}
+	if r.sliceTarget == nil {
+		r.sliceTarget = make(map[uint64]int64)
+	}
+	r.sliceTarget[sliceID] = est
+	r.stagedMemBytes += est
+	admitted = true
+	return nil
+}
+
+func (r *blockRegistry) beginSliceWrite(sliceID uint64) {
+	r.mu.Lock()
+	if r.sliceWriters == nil {
+		r.sliceWriters = make(map[uint64]int)
+	}
+	r.sliceWriters[sliceID]++
+	r.mu.Unlock()
+}
+
+func (r *blockRegistry) finishSliceWrite(sliceID uint64, delta int64) {
+	r.mu.Lock()
+	if r.sliceWriters[sliceID] > 0 {
+		r.sliceWriters[sliceID]--
+		if r.sliceWriters[sliceID] == 0 {
+			delete(r.sliceWriters, sliceID)
+		}
+	}
+	if r.sliceUsed == nil {
+		r.sliceUsed = make(map[uint64]int64)
+	}
+	oldTarget := r.sliceTarget[sliceID]
+	oldUsed := r.sliceUsed[sliceID]
+	newUsed := oldUsed + delta
+	if newUsed < 0 {
+		newUsed = 0
+	}
+	r.sliceUsed[sliceID] = newUsed
+	oldContrib := oldUsed
+	if oldTarget > oldContrib {
+		oldContrib = oldTarget
+	}
+	newContrib := newUsed
+	if oldTarget > newContrib {
+		newContrib = oldTarget
+	}
+	diff := newContrib - oldContrib
+	r.stagedMemBytes += diff
+	if r.stagedMemBytes < 0 {
+		r.stagedMemBytes = 0
+	}
+	if diff < 0 {
+		close(r.budgetCh)
+		r.budgetCh = make(chan struct{})
+	}
+	r.mu.Unlock()
+}
+
+func (r *blockRegistry) abortSliceWrite(sliceID uint64, releaseIfIdle bool) {
+	r.mu.Lock()
+	if r.sliceWriters[sliceID] > 0 {
+		r.sliceWriters[sliceID]--
+		if r.sliceWriters[sliceID] == 0 {
+			delete(r.sliceWriters, sliceID)
+		}
+	}
+	if releaseIfIdle && r.sliceWriters[sliceID] == 0 && r.sliceUsed[sliceID] == 0 {
+		r.retireSliceMemLocked(sliceID)
+	}
+	r.mu.Unlock()
+}
+
+func (r *blockRegistry) retireSliceMem(sliceID uint64) {
+	r.mu.Lock()
+	r.retireSliceMemLocked(sliceID)
+	r.mu.Unlock()
+}
+
+func (r *blockRegistry) retireSliceMemLocked(sliceID uint64) {
+	contrib := r.sliceUsed[sliceID]
+	if t := r.sliceTarget[sliceID]; t > contrib {
+		contrib = t
+	}
+	delete(r.sliceTarget, sliceID)
+	delete(r.sliceUsed, sliceID)
+	if contrib > 0 {
+		r.stagedMemBytes -= contrib
+		if r.stagedMemBytes < 0 {
+			r.stagedMemBytes = 0
+		}
+		close(r.budgetCh)
+		r.budgetCh = make(chan struct{})
+	}
 }
 
 // issuePin increments the issued-reader count for a staged id (the

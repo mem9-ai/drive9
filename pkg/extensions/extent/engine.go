@@ -128,6 +128,13 @@ func NewEngine(cfg EngineConfig) *Engine {
 	if maxUpload <= 0 {
 		maxUpload = envMaxUpload(nativeWriteback)
 	}
+	putTimeout := time.Minute
+	if !nativeWriteback {
+		// In-memory staging throttles objectStorage.Put via waitSliceAdmission
+		// while serial PATCH commits drain; keep PutTimeout generous so queuing
+		// behind normal commit backpressure never triggers retry storms.
+		putTimeout = 10 * time.Minute
+	}
 	chunkConf := chunk.Config{
 		BlockSize:  blockSize << 0,
 		CacheDir:   cfg.CacheDir,
@@ -158,7 +165,7 @@ func NewEngine(cfg EngineConfig) *Engine {
 		// is the right shape for this plane too.
 		BufferSize: 300 << 20,
 		GetTimeout: time.Minute,
-		PutTimeout: time.Minute,
+		PutTimeout: putTimeout,
 		// Writeback (JuiceFS native pipeline): blocks below the threshold
 		// are staged to the disk cache and uploaded asynchronously, with
 		// the cache's own eviction/free-space accounting bounding the

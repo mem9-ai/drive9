@@ -118,3 +118,89 @@ func TestWaitTotalStagingBudgetTracksStagedMemAndWakes(t *testing.T) {
 		t.Fatal("waitTotalStagingBudget did not wake after stagedMem release")
 	}
 }
+
+func TestWaitSliceAdmissionOrderedAndBounded(t *testing.T) {
+	r := newBlockRegistry()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Admit slice 1 reserving 600 of a 1000-byte limit.
+	if err := r.waitSliceAdmission(ctx, 1, 600, 1000); err != nil {
+		t.Fatalf("admit slice 1: %v", err)
+	}
+	// Admit slice 2 reserving 400 -> total reaches 1000 (limit).
+	if err := r.waitSliceAdmission(ctx, 2, 400, 1000); err != nil {
+		t.Fatalf("admit slice 2: %v", err)
+	}
+	if got := r.totalStagingBudget(); got != 1000 {
+		t.Fatalf("totalStagingBudget = %d, want 1000", got)
+	}
+	// Another block of already-admitted slice 2 bypasses admission wait.
+	if err := r.waitSliceAdmission(ctx, 2, 400, 1000); err != nil {
+		t.Fatalf("re-admit slice 2: %v", err)
+	}
+
+	// Enqueue slice 10 then slice 5; slice 5 must be admitted before slice 10.
+	admitted := make(chan uint64, 2)
+	go func() {
+		if err := r.waitSliceAdmission(ctx, 10, 400, 1000); err == nil {
+			admitted <- 10
+		}
+	}()
+	// Wait until slice 10 is parked in waitingSlices before queueing slice 5.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		r.mu.Lock()
+		n := r.waitingSlices[10]
+		r.mu.Unlock()
+		if n > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	go func() {
+		if err := r.waitSliceAdmission(ctx, 5, 400, 1000); err == nil {
+			admitted <- 5
+		}
+	}()
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		r.mu.Lock()
+		n := r.waitingSlices[5]
+		r.mu.Unlock()
+		if n > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Retire slice 1 (600) -> only one waiter fits cleanly under 1000 after slice 5 takes 400.
+	// Note 400 (slice 2) + 400 (slice 5) = 800 < 1000, so wait: release slice 2 (400 -> 600)
+	// after retiring slice 2 first -> total = 600, wait for 5 first!
+	r.retireSliceMem(2) // 1000 -> 600 < 1000, enough for ONE 400 slice (5, NOT 10)!
+	select {
+	case id := <-admitted:
+		if id != 5 {
+			t.Fatalf("admitted slice %d first, want smaller ID 5", id)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for slice 5 admission")
+	}
+
+	// Now 600 + 400 = 1000; slice 10 must still be waiting until slice 1 retires.
+	select {
+	case id := <-admitted:
+		t.Fatalf("unexpectedly admitted %d while budget full", id)
+	case <-time.After(80 * time.Millisecond):
+	}
+
+	r.retireSliceMem(1)
+	select {
+	case id := <-admitted:
+		if id != 10 {
+			t.Fatalf("admitted slice %d, want 10", id)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for slice 10 admission")
+	}
+}

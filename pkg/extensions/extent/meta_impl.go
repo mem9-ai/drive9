@@ -842,16 +842,16 @@ func (b *Bridge) Write(ctx meta.Context, ino meta.Ino, indx uint32, off uint32, 
 	}
 	if int64(len(data)) != int64(slice.Size) {
 		if !b.cfg.NativeWriteback {
-			b.blocks.addStagedMem(-sl.total)
+			b.blocks.retireSliceMem(slice.Id)
 		}
 		return syscall.EIO
 	}
 	sum := sha256Hex(data)
-	// Account pinned bytes BEFORE releasing stagedMemBytes so total tracked
+	// Account pinned bytes BEFORE releasing slice staging memory so total tracked
 	// in-memory budget stays monotonic and never admits extra slices prematurely.
 	b.blocks.stagePinned(sum, data, true)
 	if !b.cfg.NativeWriteback {
-		b.blocks.addStagedMem(-sl.total)
+		b.blocks.retireSliceMem(slice.Id)
 	}
 
 	b.mu.Lock()
@@ -870,7 +870,7 @@ func (b *Bridge) Write(ctx meta.Context, ino meta.Ino, indx uint32, off uint32, 
 		pendingBytes += w.size
 	}
 	batchHold := commitBatchBytes > 0 && pendingBytes < commitBatchBytes &&
-		b.blocks.totalStagingBudget() < maxPinnedCommitBytes/2
+		b.blocks.totalStagingBudget() < maxPinnedCommitBytes*3/4
 	if _, failed := b.commitErr[ino]; failed {
 		batchHold = false
 	}
@@ -1060,7 +1060,10 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 		// exactly the CREATE TABLE -> CREATE INDEX sequence mptest performs on
 		// a freshly created file.
 		b.recordLandedRevision(ino, landedRev)
-	} else {
+	}
+	revBefore := int64(0)
+	if !fresh {
+		revBefore = b.publishedRevision(ino)
 		blocks, err := b.assemblePatchBlocks(ctx, path, pending)
 		if err != nil {
 			return err
@@ -1148,8 +1151,10 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 			b.classicOwned[ino] = true
 			b.mu.Unlock()
 		}
-	} else if nst, err := b.cfg.Client.StatCtx(ctx, path); err == nil {
-		b.observeRevision(ino, nst.Revision)
+	} else if b.publishedRevision(ino) <= revBefore {
+		if nst, err := b.cfg.Client.StatCtx(ctx, path); err == nil {
+			b.observeRevision(ino, nst.Revision)
+		}
 	}
 
 	b.mu.Lock()

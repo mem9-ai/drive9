@@ -359,11 +359,22 @@ type blockRegistry struct {
 	// the worker at 7.58 GiB RSS. waitPinnedBudget turns that cliff into
 	// write backpressure.
 	pinnedBytes int64
-	// stagedMemBytes tracks slice bytes currently buffered in Bridge.stagedSlices
-	// (non-Writeback in-memory staging) before Bridge.Write moves them into pins.
+	// stagedMemBytes tracks slice bytes currently buffered or reserved in
+	// Bridge.stagedSlices (non-Writeback in-memory staging) before Bridge.Write
+	// moves them into pins.
 	stagedMemBytes int64
+	// waitingSlices tracks slice IDs parked in waitSliceAdmission so freed
+	// budget admits the lowest slice ID first instead of starving older slices.
+	waitingSlices map[uint64]int
+	// sliceTarget / sliceUsed / sliceWriters track per-slice headroom
+	// reservation so admitting block 0 of a 4 MiB-blocked slice accounts its
+	// expected 64 MiB chunk footprint immediately instead of letting MaxUpload
+	// workers admit 16 concurrent slices in parallel before subsequent blocks fit.
+	sliceTarget  map[uint64]int64
+	sliceUsed    map[uint64]int64
+	sliceWriters map[uint64]int
 	// budgetCh is closed (and replaced under mu) whenever pinnedBytes or
-	// stagedMemBytes drops, waking waitPinnedBudget callers.
+	// stagedMemBytes drops or a waiter departs, waking budget waiters.
 	budgetCh chan struct{}
 	// issued tracks outstanding readers of staged classic ids: an issued
 	// entry is immune from LRU retirement until its fetch consumes the pin.
@@ -389,11 +400,15 @@ type blockEntry struct {
 
 func newBlockRegistry() *blockRegistry {
 	return &blockRegistry{
-		m:        make(map[uint64]*blockEntry),
-		pins:     make(map[string]int),
-		pinSizes: make(map[string]int64),
-		budgetCh: make(chan struct{}),
-		issued:   make(map[uint64]int),
+		m:             make(map[uint64]*blockEntry),
+		pins:          make(map[string]int),
+		pinSizes:      make(map[string]int64),
+		waitingSlices: make(map[uint64]int),
+		sliceTarget:   make(map[uint64]int64),
+		sliceUsed:     make(map[uint64]int64),
+		sliceWriters:  make(map[uint64]int),
+		budgetCh:      make(chan struct{}),
+		issued:        make(map[uint64]int),
 	}
 }
 
