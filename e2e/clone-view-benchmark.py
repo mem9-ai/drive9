@@ -40,6 +40,22 @@ def failure_categories(raw):
     return ",".join(value for key, value in patterns.items() if key in text) or "unclassified"
 
 
+def failure_word_counts(raw):
+    # Fixed vocabulary, without word order, paths or unknown words. This also
+    # describes Git errors that do not match a known complete phrase above.
+    allowed = set("fatal error unable cannot could failed invalid expected bad too many "
+                  "object objects pack index config repository directory file files read write "
+                  "rename create copy open close remove stat seek mmap size length empty "
+                  "truncated corrupt inflate deflate checksum offset permission denied lock "
+                  "not found exists no space device memory data short end early eof ref refs "
+                  "remote local transport symlink link protocol worktree tree head".split())
+    counts = {}
+    for word in re.findall(r"[a-z]+", raw[:65536].decode("utf-8", errors="replace").lower()):
+        if word in allowed:
+            counts[word] = min(255, counts.get(word, 0) + 1)
+    return dict(sorted(counts.items()))
+
+
 def command(args, *, env=None, timeout=300):
     try:
         result = subprocess.run(args, env=env, capture_output=True, timeout=timeout)
@@ -110,9 +126,9 @@ def signal_mapping_counts(raw):
             for (sig, code, category), count in sorted(counts.items())]
 
 
-def diagnose_clone_failure(args, trace):
-    # A separate, unmeasured destination preserves the failed sample. Raw trace
-    # and Git output stay in the temporary fixture and are never uploaded.
+def diagnose_clone_failure(args, trace, timeout=60):
+    # Raw trace and Git output stay in the temporary fixture and are never
+    # uploaded. A traced clone is diagnostic and cannot be a timing sample.
     if shutil.which("strace") is None:
         print("CHECK clone diagnostic unavailable", flush=True)
         return
@@ -122,7 +138,7 @@ def diagnose_clone_failure(args, trace):
                                     "-e", "raw=read,pread64,write,pwrite64", "-o", str(trace), *args],
                                    stdout=subprocess.DEVNULL, stderr=stderr, start_new_session=True)
         try:
-            result = process.wait(timeout=60)
+            result = process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             os.killpg(process.pid, signal.SIGKILL)
             process.wait(timeout=5)
@@ -135,13 +151,20 @@ def diagnose_clone_failure(args, trace):
         failures = syscall_failure_counts(raw)
         signals = signal_mapping_counts(raw)
     with trace.with_suffix(".stderr").open("rb") as source:
-        categories = failure_categories(source.read(65536))
+        stderr = source.read(65536)
     print("CHECK clone diagnostic exit=" + str(result) + " failures=" + json.dumps(failures, sort_keys=True)
-          + " signals=" + json.dumps(signals, sort_keys=True) + " categories=" + categories, flush=True)
+          + " signals=" + json.dumps(signals, sort_keys=True) + " categories=" + failure_categories(stderr)
+          + " words=" + json.dumps(failure_word_counts(stderr), sort_keys=True), flush=True)
+    return result
 
 
-def clone_fixture(source, target, trace):
+def clone_fixture(source, target, trace, trace_primary=False):
     args = ["git", "-c", "protocol.file.allow=always", "clone", "--no-local", source.as_uri()]
+    if trace_primary:
+        # Trace the original attempt; a second clone can fail differently.
+        result = diagnose_clone_failure([*args, str(target)], trace, timeout=180)
+        require(result == 0, "traced clone failed or unavailable; no performance sample")
+        return
     try:
         command([*args, str(target)], timeout=600)
     except http.ProbeFailure:
@@ -245,7 +268,7 @@ def worker(args):
         verify(Path(args.tree), value["files"], value["commit"])
 
 
-def sample(cli, base, source, manifest_file, case, index, root):
+def sample(cli, base, source, manifest_file, case, index, root, trace_primary=False):
     probe = http.Probe(base, "")
     probe.provision_local()
     work = None
@@ -260,7 +283,7 @@ def sample(cli, base, source, manifest_file, case, index, root):
             target = point / probe.root.lstrip("/") / "repo"
             started = time.monotonic()
             print("CHECK phase=clone", flush=True)
-            clone_fixture(source, target, root / "clone.strace")
+            clone_fixture(source, target, root / "clone.strace", trace_primary=trace_primary)
             cloned = time.monotonic()
             print("CHECK phase=sync", flush=True)
             command([sys.executable, __file__, "--operation=sync", "--tree", str(target)], timeout=300)
@@ -276,7 +299,7 @@ def sample(cli, base, source, manifest_file, case, index, root):
         result = {"case": case, "trial": index, "clone_seconds": cloned-started,
                   "sync_seconds": synced-cloned, "unmount_seconds": unmounted-synced,
                   "durable_seconds": unmounted-started, "remount_verify_seconds": verified-verify_start,
-                  "verified": True}
+                  "verified": True, "traced": trace_primary}
         print("SAMPLE " + json.dumps(result, sort_keys=True), flush=True)
         return result
     finally:
@@ -284,6 +307,7 @@ def sample(cli, base, source, manifest_file, case, index, root):
 
 
 def summary(samples, trials):
+    require(not any(s.get("traced", False) for s in samples), "traced diagnostic cannot produce a performance ratio")
     result = {}
     for case in ("main_no_layer", "layer_cow"):
         rows = [s for s in samples if s["case"] == case]
@@ -301,6 +325,8 @@ def main():
     parser.add_argument("--output")
     parser.add_argument("--files", type=int, default=64)
     parser.add_argument("--trials", type=int, default=3)
+    parser.add_argument("--diagnose-clone", action="store_true",
+                        help="trace one fresh Layer clone; never report a performance ratio")
     parser.add_argument("--operation", choices=("sync", "verify"))
     parser.add_argument("--tree")
     parser.add_argument("--manifest")
@@ -318,14 +344,25 @@ def main():
             and not os.environ.get("DRIVE9_API_KEY"), "requires fresh tenants on explicit loopback test server")
     root = Path(tempfile.mkdtemp(prefix="d9-clone-bench-", dir="/tmp"))
     output = Path(args.output)
-    report = {"complete": False, "comparison": "current PR main vs existing Layer COW; not main-COW implementation",
+    report = {"complete": False, "diagnostic": args.diagnose_clone,
+              "comparison": ("traced Layer diagnostic only; no performance comparison" if args.diagnose_clone
+                             else "current PR main vs existing Layer COW; not main-COW implementation"),
               "mount_options": MOUNT_OPTIONS, "fixture_files": args.files, "bytes_per_file": 1024,
-              "trials": args.trials, "git_version": command(["git", "--version"]).decode().strip(), "samples": []}
+              "trials": 1 if args.diagnose_clone else args.trials,
+              "git_version": command(["git", "--version"]).decode().strip(), "samples": []}
     try:
         manifest, commit = fixture(root / "source", args.files)
         report["source_commit"] = commit
         mf = root / "manifest.json"
         mf.write_text(json.dumps({"files": manifest, "commit": commit}))
+        if args.diagnose_clone:
+            trial = root / "1-layer_cow"
+            trial.mkdir()
+            report["samples"].append(sample(os.path.abspath(args.cli), base, root / "source", mf,
+                                            "layer_cow", 1, trial, trace_primary=True))
+            report["diagnostic_complete"] = True
+            print("DIAGNOSTIC COMPLETE: traced Layer clone and remount verified; no performance ratio", flush=True)
+            return
         for i in range(1, args.trials+1):
             cases = ("main_no_layer", "layer_cow") if i % 2 else ("layer_cow", "main_no_layer")
             for case in cases:

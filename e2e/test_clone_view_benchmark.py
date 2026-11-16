@@ -1,4 +1,5 @@
 import importlib.util
+import json
 from pathlib import Path
 import subprocess
 import tempfile
@@ -47,6 +48,13 @@ class BenchmarkTests(unittest.TestCase):
                               (b"fatal: mmap failed on private object", "mmap_failure"),
                               (b"fatal: invalid index-pack output: private", "invalid_pack")):
             self.assertEqual(bench.failure_categories(raw), category)
+
+    def test_error_words_are_fixed_bounded_and_unordered(self):
+        self.assertEqual(bench.failure_word_counts(b"fatal: cannot read /private/secret-name"),
+                         {"cannot": 1, "fatal": 1, "read": 1})
+        self.assertEqual(bench.failure_word_counts(b"secret unknown words"), {})
+        self.assertEqual(bench.failure_word_counts(b"x" * 65536 + b" fatal"), {})
+        self.assertEqual(bench.failure_word_counts(b"fatal " * 300), {"fatal": 255})
 
     def test_syscall_summary_is_bounded_and_allowlisted(self):
         raw = (b'123 openat(AT_FDCWD, "/private/.git/hooks/hook", 0) = -1 EIO (Input/output error)\n'
@@ -133,12 +141,83 @@ class BenchmarkTests(unittest.TestCase):
             command.assert_called_once()
             self.assertEqual(diagnostic.call_args.args[0][-1], "/mount/diagnostic-repo")
 
+    def test_primary_diagnostic_traces_exactly_one_original_clone(self):
+        for result in (0, 128, -9, None):
+            with self.subTest(result=result), \
+                    patch.object(bench, "command") as command, \
+                    patch.object(bench, "diagnose_clone_failure", return_value=result) as diagnostic:
+                args = (Path("/source"), Path("/mount/repo"), Path("/trace"))
+                if result == 0:
+                    bench.clone_fixture(*args, trace_primary=True)
+                else:
+                    with self.assertRaises(bench.http.ProbeFailure):
+                        bench.clone_fixture(*args, trace_primary=True)
+                command.assert_not_called()
+                diagnostic.assert_called_once()
+                self.assertEqual(diagnostic.call_args.args[0][-1], "/mount/repo")
+                self.assertEqual(diagnostic.call_args.kwargs, {"timeout": 180})
+
+    def test_diagnostic_mode_never_publishes_benchmark_completion(self):
+        for fails in (False, True):
+            with self.subTest(fails=fails), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "report.json"
+                argv = ["benchmark", "--cli", bench.sys.executable, "--output", str(output), "--diagnose-clone"]
+                result = {"case": "layer_cow", "trial": 1, "verified": True, "traced": True}
+                exists = bench.os.path.exists
+                with patch.object(bench.sys, "argv", argv), patch.object(bench.sys, "platform", "linux"), \
+                        patch.object(bench.os.path, "exists", side_effect=lambda p: p == "/dev/fuse" or exists(p)), \
+                        patch.dict(bench.os.environ, {"DRIVE9_BASE": "http://127.0.0.1:9009", "DRIVE9_API_KEY": ""}), \
+                        patch.object(bench, "fixture", return_value=({}, "fixture-commit")), \
+                        patch.object(bench, "command", return_value=b"git version fixture\n"), \
+                        patch.object(bench, "sample", return_value=result,
+                                     side_effect=bench.http.ProbeFailure("failed clone") if fails else None) as sample, \
+                        patch.object(bench, "summary") as summary, patch("builtins.print") as printed:
+                    if fails:
+                        with self.assertRaises(bench.http.ProbeFailure):
+                            bench.main()
+                    else:
+                        bench.main()
+                    sample.assert_called_once()
+                    self.assertEqual(sample.call_args.args[4:6], ("layer_cow", 1))
+                    self.assertEqual(sample.call_args.kwargs, {"trace_primary": True})
+                    summary.assert_not_called()
+                    self.assertNotIn("BENCHMARK COMPLETE", str(printed.call_args_list))
+                report = json.loads(output.read_text())
+                self.assertFalse(report["complete"])
+                self.assertTrue(report["diagnostic"])
+                self.assertEqual(report.get("diagnostic_complete", False), not fails)
+                self.assertNotIn("summary", report)
+
+    def test_shell_diagnostic_flag_is_explicit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, script in (("make", "#!/bin/sh\nexit 0\n"),
+                                 ("python3", '#!/bin/sh\nprintf "%s\\n" "$@" > "$BENCH_ARGV_FILE"\n')):
+                executable = root / name
+                executable.write_text(script)
+                executable.chmod(0o700)
+            argv_file = root / "argv"
+            env = dict(bench.os.environ, PATH=str(root) + ":" + bench.os.environ["PATH"],
+                       CLONE_BENCH_OUTPUT=str(root / "report"), BENCH_ARGV_FILE=str(argv_file))
+            for flag in ("0", "1", "invalid-private-value"):
+                argv_file.unlink(missing_ok=True)
+                result = subprocess.run(["bash", str(Path(__file__).with_name("clone-view-benchmark.sh"))],
+                                        env=dict(env, CLONE_BENCH_DIAGNOSE=flag), capture_output=True, timeout=10)
+                if flag in ("0", "1"):
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual("--diagnose-clone" in argv_file.read_text().splitlines(), flag == "1")
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(argv_file.exists())
+                    self.assertNotIn(b"private-value", result.stderr)
+
     def test_summary_requires_both_verified_cases(self):
         rows = [{"case": case, "trial": 1, "clone_seconds": n, "durable_seconds": n,
                  "remount_verify_seconds": n, "verified": True}
                 for case, n in (("main_no_layer", 2), ("layer_cow", 4))]
         self.assertEqual(bench.summary(rows, 1)["layer_over_main_durable_ratio"], 2)
-        for incomplete in (rows[:1], rows + rows[:1], [dict(row, verified=False) for row in rows]):
+        for incomplete in (rows[:1], rows + rows[:1], [dict(row, verified=False) for row in rows],
+                           [dict(row, traced=True) for row in rows]):
             with self.assertRaises(bench.http.ProbeFailure):
                 bench.summary(incomplete, 1)
 
