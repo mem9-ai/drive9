@@ -37,9 +37,12 @@ With the repository's own verifier (same code the CLI embeds):
 curl -fsSLO https://drive9.ai/releases/checksums.txt
 curl -fsSLO https://drive9.ai/releases/checksums.txt.sig
 DRIVE9_RELEASE_PUBLIC_KEY="<base64 public key>" \
-  go run ./cmd/drive9-release-sign -verify checksums.txt
-sha256sum --check checksums.txt   # proves the artifact bytes too
+  go run ./cmd/drive9-release-sign -verify checksums.txt \
+  && sha256sum --check checksums.txt   # artifact bytes, only after the signature
 ```
+
+`drive9-release-sign -verify` exits non-zero when the signature does not verify, so the
+checksum step cannot run on an unauthenticated manifest.
 
 With OpenSSL 3.x, no Go needed. The embedded key is a raw 32-byte ed25519 public key, so
 wrap it in the fixed `SubjectPublicKeyInfo` prefix first:
@@ -75,20 +78,28 @@ DRIVE9_RELEASE_SIGNING_KEY=<base64 seed> go run ./cmd/drive9-release-sign dist/c
 
 ## Rotating the key
 
-Installed CLIs only trust the key embedded in the build they are running, so a rotation is a
-two-release dance. Publish the transition release **with the current key**, then switch:
+Installed CLIs only trust the key embedded in the binary they are running, so a rotation is a
+two-release dance: the transition release that carries the new key must itself be signed with
+the **current** key.
 
-1. Generate a new pair (`openssl genpkey -algorithm ed25519` or a small Go program). Put the
-   new private key in `DRIVE9_RELEASE_SIGNING_KEY` **only at step 4**; the release job signs
-   with whichever secret is configured, and step 3 must still be signed by the key that
-   installed CLIs trust.
+1. Generate a new pair. Keep its private key at hand, but do **not** put it in
+   `DRIVE9_RELEASE_SIGNING_KEY` yet: the release job signs with whatever is in that secret,
+   and the next release must be signed with the current key.
 2. Land a release that embeds the **new** public key in
-   `cmd/drive9/cli/update_signing.go` while `DRIVE9_RELEASE_SIGNING_KEY` still holds the
-   **current** key. This is the transition release: installed CLIs accept it because it is
-   signed by the key they already have, and the binary it installs carries the new key.
-3. Confirm the transition release published and that `drive9 update` on it works.
-4. Replace `DRIVE9_RELEASE_SIGNING_KEY` with the new private key and publish normally from
-   then on; clients that installed the transition release verify the new key.
+   `cmd/drive9/cli/update_signing.go`, with `DRIVE9_RELEASE_SIGNING_KEY` still holding the
+   **current** private key. That is the transition release.
+3. Confirm an **existing** client — one whose binary predates the transition release —
+   installs it: `drive9 update` succeeds and the reported version is the transition version.
+   Do not test the other direction yet: the transition binary trusts the new key, and the
+   manifest it came from is still signed with the old one, so updating *from* the transition
+   binary fails verification until step 4.
+4. Replace `DRIVE9_RELEASE_SIGNING_KEY` with the new private key and publish the next
+   release. From that point clients running the transition release verify the new key, and
+   `drive9 update` works again in both directions.
+5. Keep the transition release's artifacts published until the fleet has moved. A client that
+   missed it still trusts the old key and will reject new-key-signed manifests; recover it
+   with a manual install of the target release (download the artifact for its platform and
+   place it on `PATH`, or reinstall from the transition release while it is still served).
 
 There is no revocation list: a compromised key is rotated by the same steps, starting from a
 release signed with the compromised key (or a support-assisted manual install if the key is
