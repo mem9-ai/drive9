@@ -40,9 +40,25 @@ func TestCLIReleasePublishesLegacyManifests(t *testing.T) {
 	if generate == "" || upload == "" {
 		t.Fatal("missing release generation/upload step")
 	}
-	for _, name := range []string{"drive9-*", "kubectl-drive9-migration-*", "version", "SHA256SUMS", "checksums.txt", "migration-kube-plugin-checksums.txt"} {
+	for _, name := range []string{"drive9-*", "kubectl-drive9-migration-*", "version", "SHA256SUMS", "checksums.txt", "checksums.txt.sig", "migration-kube-plugin-checksums.txt"} {
 		if !strings.Contains(upload, "--include \""+name+"\"") {
 			t.Errorf("S3 upload omits %s", name)
+		}
+	}
+	// The self-updater refuses a manifest it cannot authenticate, so a release that skips
+	// signing is a release nobody can update to.
+	var signStep string
+	for _, step := range workflow.Jobs["release"].Steps {
+		if step.Name == "Sign release manifest" {
+			signStep = step.Run
+		}
+	}
+	if signStep == "" {
+		t.Fatal("release workflow has no manifest signing step")
+	}
+	for _, want := range []string{"drive9-release-sign", "DRIVE9_RELEASE_SIGNING_KEY", "exit 1"} {
+		if !strings.Contains(signStep, want) {
+			t.Errorf("signing step omits %q", want)
 		}
 	}
 	for _, failure := range []string{"none", "checksum mismatch", "missing manifest"} {

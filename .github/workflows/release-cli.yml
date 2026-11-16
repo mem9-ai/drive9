@@ -64,6 +64,21 @@ jobs:
           sha256sum --check migration-kube-plugin-checksums.txt
           cat SHA256SUMS
 
+      - name: Sign release manifest
+        # The CLI verifies this signature before installing: a manifest served by the same
+        # origin as the binary proves integrity, not authenticity, so an unsigned release is
+        # a release that cannot be updated to. Fail closed when the key is missing.
+        env:
+          DRIVE9_RELEASE_SIGNING_KEY: ${{ secrets.DRIVE9_RELEASE_SIGNING_KEY }}
+        run: |
+          if [ -z "${DRIVE9_RELEASE_SIGNING_KEY}" ]; then
+            echo "DRIVE9_RELEASE_SIGNING_KEY is not set; refusing to publish an unsigned self-update manifest" >&2
+            exit 1
+          fi
+          go run ./cmd/drive9-release-sign dist/checksums.txt
+          test -s dist/checksums.txt.sig
+          base64 -d dist/checksums.txt.sig | wc -c | grep -qx 64
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
         with:
@@ -78,6 +93,7 @@ jobs:
             --include "kubectl-drive9-migration-*" \
             --include "SHA256SUMS" \
             --include "checksums.txt" \
+            --include "checksums.txt.sig" \
             --include "migration-kube-plugin-checksums.txt" \
             --include "version" \
             --cache-control "public, max-age=300" \

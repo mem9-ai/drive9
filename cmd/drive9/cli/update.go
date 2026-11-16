@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mem9-ai/drive9/internal/releasesign"
 	"github.com/mem9-ai/drive9/pkg/buildinfo"
 )
 
@@ -39,6 +40,9 @@ type updateDeps struct {
 	allowInsecureBaseURL bool
 	preflightReplace     func() error
 	replaceExecutable    func(string, string) error
+	// signingKey is the base64 ed25519 key the release manifest is verified with. Empty
+	// resolves to the build's embedded key; the build refuses to update without one.
+	signingKey string
 }
 
 func defaultUpdateDeps() updateDeps {
@@ -104,10 +108,15 @@ func updateWithDeps(args []string, deps updateDeps) error {
 	ctx, cancel := context.WithTimeout(context.Background(), updateCommandTimeout)
 	defer cancel()
 
-	latestVersion, err := fetchLatestVersion(ctx, deps)
+	// The manifest is the only trusted input: it carries both the version to compare
+	// against and the hashes the binary is verified with, and it is signed. The version file
+	// next to it is not read at all — an origin that could rewrite it could otherwise make a
+	// signed older binary look like an upgrade.
+	manifest, err := fetchReleaseManifest(ctx, deps)
 	if err != nil {
 		return err
 	}
+	latestVersion := manifest.version
 	artifact := updateArtifactName(deps.goos, deps.goarch)
 	latestURL := releaseURL(deps.baseURL, artifact)
 	relation := compareReleaseVersions(deps.currentVersion, latestVersion)
@@ -147,13 +156,9 @@ func updateWithDeps(args []string, deps updateDeps) error {
 	if err != nil {
 		return err
 	}
-	checksums, err := fetchReleaseChecksums(ctx, deps)
-	if err != nil {
-		return err
-	}
-	want, ok := checksums[artifact]
+	want, ok := manifest.checksums[artifact]
 	if !ok {
-		return fmt.Errorf("checksum for %s not found in %s", artifact, releaseURL(deps.baseURL, "checksums.txt"))
+		return fmt.Errorf("checksum for %s not found in the signed release manifest %s", artifact, releaseURL(deps.baseURL, "checksums.txt"))
 	}
 
 	tmpPath, err := downloadUpdateBinary(ctx, deps, latestURL, target, want)
@@ -181,7 +186,13 @@ func updateUsage() string {
   --check          check for a newer release without installing
   --force          reinstall latest release even when versions match
   --base-url URL   release base URL (default https://drive9.ai)
-  DRIVE9_UPDATE_BASE_URL is honored only for drive9.ai release hosts` + updatePlatformUsageNote()
+  DRIVE9_UPDATE_BASE_URL is honored only for drive9.ai release hosts
+
+The release manifest is verified against the drive9 release key before anything is
+installed, so a mirror, a --base-url host, or a compromised release origin cannot
+substitute a binary. A build with no embedded key refuses to update; rebuild with
+-X github.com/mem9-ai/drive9/cmd/drive9/cli.updateManifestPublicKey=<base64 key>
+to install from your own signed releases.` + updatePlatformUsageNote()
 }
 
 func fillUpdateDeps(deps updateDeps) updateDeps {
@@ -209,6 +220,9 @@ func fillUpdateDeps(deps updateDeps) updateDeps {
 	}
 	if deps.httpClient == nil {
 		deps.httpClient = &http.Client{Timeout: updateCommandTimeout}
+	}
+	if deps.signingKey == "" {
+		deps.signingKey = updateManifestPublicKey
 	}
 	if deps.stdout == nil {
 		deps.stdout = os.Stdout
@@ -397,31 +411,22 @@ func displayVersion(version string) string {
 	return version
 }
 
-func fetchLatestVersion(ctx context.Context, deps updateDeps) (string, error) {
-	body, err := httpGetBytes(ctx, deps.httpClient, releaseURL(deps.baseURL, "version"), 4096)
-	if err != nil {
-		return "", fmt.Errorf("fetch latest drive9 version: %w", err)
-	}
-	version := strings.TrimSpace(string(body))
-	if version == "" {
-		return "", errors.New("fetch latest drive9 version: empty response")
-	}
-	return version, nil
-}
-
-func fetchReleaseChecksums(ctx context.Context, deps updateDeps) (map[string]string, error) {
+// fetchReleaseManifest downloads the release manifest and its detached signature from the
+// release root, verifies the signature, and only then parses anything. The two files coming
+// from the same origin is exactly why the signature — not the origin — is the trust anchor.
+func fetchReleaseManifest(ctx context.Context, deps updateDeps) (releaseManifest, error) {
 	body, err := httpGetBytes(ctx, deps.httpClient, releaseURL(deps.baseURL, "checksums.txt"), 1<<20)
 	if err != nil {
-		return nil, fmt.Errorf("fetch release checksums: %w", err)
+		return releaseManifest{}, fmt.Errorf("fetch release manifest: %w", err)
 	}
-	checksums, err := parseChecksums(body)
+	signature, err := httpGetBytes(ctx, deps.httpClient, releaseURL(deps.baseURL, releasesign.SignatureName), 4096)
 	if err != nil {
-		return nil, err
+		return releaseManifest{}, fmt.Errorf("fetch release manifest signature: %w", err)
 	}
-	if len(checksums) == 0 {
-		return nil, errors.New("fetch release checksums: empty checksum list")
+	if err := verifyUpdateManifestSignature(body, signature, deps.signingKey); err != nil {
+		return releaseManifest{}, err
 	}
-	return checksums, nil
+	return parseReleaseManifest(body)
 }
 
 func httpGetBytes(ctx context.Context, client *http.Client, url string, limit int64) ([]byte, error) {
@@ -451,7 +456,9 @@ func parseChecksums(data []byte) (map[string]string, error) {
 	checksums := map[string]string{}
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
-		if line == "" {
+		if line == "" || strings.HasPrefix(line, "#") {
+			// sha256sum --check ignores comment lines too, so the manifest keeps the
+			// signed version line and the release tooling keeps working unchanged.
 			continue
 		}
 		fields := strings.Fields(line)
