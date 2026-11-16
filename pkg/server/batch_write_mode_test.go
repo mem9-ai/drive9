@@ -53,6 +53,18 @@ func TestBatchWriteRejectsModeFromScopedToken(t *testing.T) {
 		Backend:  b,
 		FSScopes: []FSScope{{Prefix: "/allowed", Ops: map[FSOp]bool{FSOpRead: true, FSOpWrite: true}}},
 	}
+	// Every denied shape must leave the target byte-identical: the per-item 403 is only
+	// half the contract, the other half is that nothing was written or chmod-ed.
+	assertUnchanged := func(step string) {
+		t.Helper()
+		after, err := b.StatNodeCtx(ctx, "/allowed/f.txt")
+		if err != nil {
+			t.Fatalf("%s: stat: %v", step, err)
+		}
+		if after.Mode&0o777 != before.Mode&0o777 || after.File == nil || after.File.Revision != before.File.Revision {
+			t.Fatalf("%s changed the file: before=%+v after=%+v", step, before, after)
+		}
+	}
 
 	// The mode item is refused with the per-item 403 the BatchWriteResult contract
 	// documents, and the content-only item of the same batch still commits. The
@@ -77,13 +89,7 @@ func TestBatchWriteRejectsModeFromScopedToken(t *testing.T) {
 	if got := out.Results[1]; got.Status != http.StatusOK {
 		t.Fatalf("content-only item = %+v, want it to commit", got)
 	}
-	after, err := b.StatNodeCtx(ctx, "/allowed/f.txt")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if after.Mode&0o777 != before.Mode&0o777 || after.File == nil || after.File.Revision != before.File.Revision {
-		t.Fatalf("denied batch item changed the file: before=%+v after=%+v", before, after)
-	}
+	assertUnchanged("denied hasMode item")
 
 	// A mode field without hasMode is refused too: the backend would ignore it, and a
 	// silently dropped bit pattern is the ambiguity this endpoint must not have.
@@ -100,6 +106,7 @@ func TestBatchWriteRejectsModeFromScopedToken(t *testing.T) {
 	if len(out.Results) != 1 || out.Results[0].Status != http.StatusForbidden || out.Results[0].Error != chmodOwnerOnlyMessage {
 		t.Fatalf("scoped mode-only item = %+v, want a per-item 403", out.Results)
 	}
+	assertUnchanged("denied mode-only item")
 
 	// hasMode with mode zero is the same request: the capability is the field, not the bits.
 	w = doBatchWrite(t, s, scoped, batchWriteRequest{Items: []batchWriteItem{
@@ -115,6 +122,7 @@ func TestBatchWriteRejectsModeFromScopedToken(t *testing.T) {
 	if len(out.Results) != 1 || out.Results[0].Status != http.StatusForbidden {
 		t.Fatalf("scoped hasMode item with mode 0 = %+v, want a per-item 403", out.Results)
 	}
+	assertUnchanged("denied hasMode item with mode 0")
 
 	// The same token may still write content; only the mode is owner-only.
 	w = doBatchWrite(t, s, scoped, batchWriteRequest{Items: []batchWriteItem{
@@ -132,7 +140,7 @@ func TestBatchWriteRejectsModeFromScopedToken(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("owner batch write with mode status = %d, want 200: %s", w.Code, w.Body.String())
 	}
-	after, err = b.StatNodeCtx(ctx, "/allowed/f.txt")
+	after, err := b.StatNodeCtx(ctx, "/allowed/f.txt")
 	if err != nil {
 		t.Fatal(err)
 	}
