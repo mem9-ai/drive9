@@ -246,25 +246,15 @@ func (b *Bridge) SetAttr(ctx meta.Context, ino meta.Ino, set uint16, sggidclearm
 		// Mode/time changes ride the classic plane; report current attrs.
 		return b.GetAttr(ctx, ino, attr)
 	}
-	b.mu.Lock()
-	old, has := b.sizes[ino]
-	if !has {
-		old = -1
-	}
-	b.mu.Unlock()
 	var newSize int64 = -1
 	if attr != nil && attr.Length != 0 {
 		newSize = int64(attr.Length)
 	} else if attr != nil {
 		newSize = 0
 	}
-	_ = old
-	b.mu.Lock()
-	b.sizes[ino] = newSize
-	if _, has := b.truncs[ino]; !has && newSize >= 0 {
-		b.truncs[ino] = newSize
+	if newSize >= 0 {
+		b.recordTruncate(ino, newSize)
 	}
-	b.mu.Unlock()
 	_ = path
 	return b.GetAttr(ctx, ino, attr)
 }
@@ -619,8 +609,12 @@ func (b *Bridge) Read(ctx meta.Context, ino meta.Ino, indx uint32, slices *[]met
 	// overwrite semantics) and the merged run is re-built with explicit
 	// holes.
 	b.mu.Lock()
+	truncFloor, truncating := b.truncs[ino]
 	pending := append([]pendingWrite(nil), b.pending[ino]...)
 	b.mu.Unlock()
+	if truncating {
+		blocks = clipPlanBlocks(blocks, truncFloor)
+	}
 	if len(pending) == 0 {
 		out := make([]meta.Slice, 0, len(blocks))
 		for _, blk := range blocks {
@@ -1073,12 +1067,17 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 	revBefore := int64(0)
 	if !fresh {
 		revBefore = b.publishedRevision(ino)
+		if st.ContentLayout == client.ContentLayoutExtent {
+			if ferr := b.applyTruncateFloor(ctx, ino, path, st, size); ferr != nil {
+				return ferr
+			}
+		}
 		blocks, err := b.assemblePatchBlocks(ctx, path, pending)
 		if err != nil {
 			return err
 		}
-		if err := b.commitWithRetry(ctx, ino, path, blocks, size, st.Revision); err != nil {
-			return err
+		if _, cerr := b.commitWithRetry(ctx, ino, path, blocks, size, st.Revision); cerr != nil {
+			return cerr
 		}
 	}
 
@@ -1172,6 +1171,7 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 	delete(b.verifyBase, ino)
 	delete(b.layoutPending, ino)
 	delete(b.freshCreate, ino)
+	delete(b.truncs, ino)
 	// layoutPendingID SURVIVES the landing: it is the identity binding
 	// for every later publication of this descriptor (the PATCH's
 	// expected-resource), not merely the pending-classification proof.
@@ -1201,6 +1201,12 @@ func (b *Bridge) assemblePatchBlocks(ctx context.Context, path string, pending [
 		if err != nil {
 			return nil, err
 		}
+		if p.size >= 0 && int64(len(data)) > p.size {
+			data = data[:p.size]
+		}
+		if len(data) == 0 {
+			continue
+		}
 		if int64(len(data)) <= piece {
 			blocks = append(blocks, client.ExtentBlockWrite{Chunk: p.chunk, Off: p.off, Data: data})
 			continue
@@ -1227,9 +1233,12 @@ func (b *Bridge) commitExtentExisting(ctx context.Context, ino meta.Ino, path st
 	if err != nil {
 		return err
 	}
-	if err := b.commitWithRetry(ctx, ino, path, blocks, size, rev); err != nil {
+	if _, err := b.commitWithRetry(ctx, ino, path, blocks, size, rev); err != nil {
 		return err
 	}
+	b.mu.Lock()
+	delete(b.truncs, ino)
+	b.mu.Unlock()
 	b.surgicalDeletePending(ino, pending)
 	b.releaseCommitted(ino, pending)
 	return nil
@@ -1266,6 +1275,12 @@ func (b *Bridge) commitClassic(ctx context.Context, ino meta.Ino, path string, p
 	} else if !client.IsNotFound(err) {
 		return err
 	}
+	b.mu.Lock()
+	truncLow, truncating := b.truncs[ino]
+	b.mu.Unlock()
+	if truncating && int64(len(image)) > truncLow {
+		image = image[:truncLow]
+	}
 	for _, p := range pending {
 		off := int64(p.chunk)*meta.ChunkSize + int64(p.off)
 		end := off + p.size
@@ -1301,6 +1316,7 @@ func (b *Bridge) commitClassic(ctx context.Context, ino meta.Ino, path string, p
 	}
 	b.mu.Lock()
 	delete(b.commitErr, ino)
+	delete(b.truncs, ino)
 	b.mu.Unlock()
 	b.surgicalDeletePending(ino, pending)
 	b.releaseCommitted(ino, pending)
@@ -1335,7 +1351,7 @@ func (b *Bridge) commitClassic(ctx context.Context, ino meta.Ino, path string, p
 	return nil
 }
 
-func (b *Bridge) commitWithRetry(ctx context.Context, ino meta.Ino, path string, blocks []client.ExtentBlockWrite, size, rev int64) error {
+func (b *Bridge) commitWithRetry(ctx context.Context, ino meta.Ino, path string, blocks []client.ExtentBlockWrite, size, rev int64) (int64, error) {
 	expRes := b.publicationIdentity(ino)
 	// Capture the revision the completion echoes for THIS publication. It is
 	// the only revision a later read may treat as already-published here:
@@ -1346,11 +1362,11 @@ func (b *Bridge) commitWithRetry(ctx context.Context, ino meta.Ino, path string,
 	err := b.cfg.Client.CommitExtentPatchExpectedResource(pctx, path, size, blocks, rev, expRes)
 	if err == nil {
 		b.recordLandedRevision(ino, landedRev)
-		return nil
+		return landedRev, nil
 	}
 	if errors.Is(err, client.ErrResourceMismatch) {
 		b.abandonIno(ino)
-		return err
+		return 0, err
 	}
 	// Revision conflict: re-base and retry once — blocks are
 	// content-addressed, nothing is re-uploaded. The re-stat is
@@ -1358,7 +1374,7 @@ func (b *Bridge) commitWithRetry(ctx context.Context, ino meta.Ino, path string,
 	// against a replacement must never publish the staged data into it.
 	st, serr := b.cfg.Client.StatCtx(ctx, path)
 	if serr != nil {
-		return err
+		return 0, err
 	}
 	// The re-stat must still hold OUR object — a layout-pending upload's
 	// captured identity constrains conflict retries exactly like a
@@ -1366,7 +1382,7 @@ func (b *Bridge) commitWithRetry(ctx context.Context, ino meta.Ino, path string,
 	id2 := b.publicationIdentity(ino)
 	if id2 != "" && st.ResourceID != id2 {
 		b.abandonIno(ino)
-		return fmt.Errorf("target %s no longer holds the staged object", path)
+		return 0, fmt.Errorf("target %s no longer holds the staged object", path)
 	}
 	landedRev = 0
 	err2 := b.cfg.Client.CommitExtentPatchExpectedResource(client.WithCompletedRevisionSink(ctx, &landedRev), path, size, blocks, st.Revision, id2)
@@ -1375,8 +1391,56 @@ func (b *Bridge) commitWithRetry(ctx context.Context, ino meta.Ino, path string,
 	}
 	if err2 == nil {
 		b.recordLandedRevision(ino, landedRev)
+		return landedRev, nil
 	}
-	return err2
+	return 0, err2
+}
+
+func (b *Bridge) applyTruncateFloor(ctx context.Context, ino meta.Ino, path string, st *client.StatResult, size int64) error {
+	b.mu.Lock()
+	truncLow, truncating := b.truncs[ino]
+	b.mu.Unlock()
+	if !truncating || truncLow >= st.Size || truncLow >= size {
+		return nil
+	}
+	nextRev, err := b.commitWithRetry(ctx, ino, path, nil, truncLow, st.Revision)
+	if err != nil {
+		return err
+	}
+	if nextRev <= 0 {
+		nst, serr := b.cfg.Client.StatCtx(ctx, path)
+		if serr != nil {
+			return serr
+		}
+		nextRev = nst.Revision
+	}
+	st.Revision = nextRev
+	st.Size = truncLow
+	b.mu.Lock()
+	if cur, ok := b.truncs[ino]; ok && cur == truncLow {
+		b.truncs[ino] = size
+	}
+	b.mu.Unlock()
+	return nil
+}
+
+func clipPlanBlocks(blocks []client.ExtentReadPlanBlock, limit int64) []client.ExtentReadPlanBlock {
+	if limit <= 0 {
+		return nil
+	}
+	out := blocks[:0]
+	for _, blk := range blocks {
+		if blk.FileOffset >= limit {
+			continue
+		}
+		if blk.FileOffset+blk.Length > limit {
+			blk.Length = limit - blk.FileOffset
+		}
+		if blk.Length > 0 {
+			out = append(out, blk)
+		}
+	}
+	return out
 }
 
 // recordLandedRevision remembers the newest revision this mount published for
@@ -1527,13 +1591,16 @@ func (b *Bridge) flushTruncateOnly(ctx context.Context, ino meta.Ino, size int64
 		// resurrect the discarded tail on the next open.
 		return b.commitClassic(ctx, ino, path, nil, size, st.Revision)
 	}
-	if st.Size == size {
-		b.mu.Lock()
-		delete(b.truncs, ino)
-		b.mu.Unlock()
-		return nil
-	}
 	if st.ContentLayout != client.ContentLayoutExtent {
+		if b.isClassicOwned(ino) {
+			return b.commitClassic(ctx, ino, path, nil, size, st.Revision)
+		}
+		if st.Size == size {
+			b.mu.Lock()
+			delete(b.truncs, ino)
+			b.mu.Unlock()
+			return nil
+		}
 		if st.Size == 0 && size > 0 {
 			if err := b.commitClassic(ctx, ino, path, nil, size, st.Revision); err != nil {
 				return err
@@ -1546,9 +1613,21 @@ func (b *Bridge) flushTruncateOnly(ctx context.Context, ino meta.Ino, size int64
 		}
 		return nil
 	}
+	// If the file shrunk below its remote size and then grew before flushing,
+	// apply the lowest truncate floor first so cleared tail bytes stay zero.
+	if err := b.applyTruncateFloor(ctx, ino, path, st, size); err != nil {
+		return err
+	}
+	if st.Size == size {
+		b.mu.Lock()
+		delete(b.truncs, ino)
+		delete(b.commitErr, ino)
+		b.mu.Unlock()
+		return nil
+	}
 	// Metadata-only resize PATCH: empty dirty blocks works for zero, shrink,
 	// and sparse grow without downloading existing content or synthesizing blocks.
-	if err := b.commitWithRetry(ctx, ino, path, nil, size, st.Revision); err != nil {
+	if _, err := b.commitWithRetry(ctx, ino, path, nil, size, st.Revision); err != nil {
 		return err // marker retained: the truncate has NOT landed
 	}
 	b.mu.Lock()
@@ -2336,6 +2415,14 @@ func (b *Bridge) TruncateLocal(ctx context.Context, local string, size int64) er
 	if errno != 0 {
 		return errno
 	}
+	b.recordTruncate(ino, size)
+	return nil
+}
+
+// recordTruncate updates the observable size and lowest uncommitted truncate
+// floor for ino and clips any buffered pending slices past size.
+func (b *Bridge) recordTruncate(ino meta.Ino, size int64) {
+	var dropped []pendingWrite
 	b.mu.Lock()
 	b.sizes[ino] = size
 	// A truncate SHRINKS the observable length, and the buffered mark is part
@@ -2345,11 +2432,36 @@ func (b *Bridge) TruncateLocal(ctx context.Context, local string, size int64) er
 	// (truncate to zero) and would then stat a "non-empty" journal it had
 	// already finished with.
 	b.buffered[ino] = size
-	if _, has := b.truncs[ino]; !has {
+	if cur, has := b.truncs[ino]; !has || size < cur {
 		b.truncs[ino] = size
 	}
+	if pend := b.pending[ino]; len(pend) > 0 {
+		kept := pend[:0]
+		for _, p := range pend {
+			off := int64(p.chunk)*meta.ChunkSize + int64(p.off)
+			if off >= size {
+				dropped = append(dropped, p)
+				continue
+			}
+			if off+p.size > size {
+				p.size = size - off
+			}
+			if p.size > 0 {
+				kept = append(kept, p)
+			} else {
+				dropped = append(dropped, p)
+			}
+		}
+		if len(kept) == 0 {
+			delete(b.pending, ino)
+		} else {
+			b.pending[ino] = kept
+		}
+	}
 	b.mu.Unlock()
-	return nil
+	if len(dropped) > 0 {
+		b.releaseCommitted(ino, dropped)
+	}
 }
 
 // releaseCommitted drops the staged bytes of a successful commit — but

@@ -273,3 +273,58 @@ func TestTryClaimExistingOpenAndTruncateGetAttr(t *testing.T) {
 		t.Fatalf("remote content after truncate(0)+Release = %q, want empty", got)
 	}
 }
+
+func TestShrinkThenGrowClearsTruncatedTailAndReadsZero(t *testing.T) {
+	f := newFakeV2(t)
+	f.setDir("/d", true)
+	orig := strings.Repeat("ABCDEFGH", 1536) // 12 KiB non-zero
+	f.seedExtent(t, "/d/hyb-trunc.bin", orig)
+
+	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/"})
+	h := New(Options{Engine: eng, Threshold: 1})
+
+	res, err := h.Do(context.Background(), &fs.Op{
+		Kind: fs.OpCreate, Path: "/d/hyb-trunc.bin", Flags: syscall.O_RDWR,
+	}, nil)
+	if err != nil || res.Handle == nil {
+		t.Fatalf("open: err=%v handle=%v", err, res.Handle)
+	}
+	eh := res.Handle.(*engineHandle)
+
+	// Shrink to 5 KiB then grow to 9 KiB before flush/close: [5 KiB .. 9 KiB)
+	// must become zero both locally (pre-flush) and remotely (post-close).
+	for _, sz := range []int64{5 << 10, 9 << 10} {
+		if _, terr, handled := h.tryTruncate(context.Background(), &fs.Op{
+			Kind: fs.OpSetAttr, Path: "/d/hyb-trunc.bin", HasSize: true, Size: sz,
+		}, nil); !handled || terr != nil {
+			t.Fatalf("tryTruncate(%d): handled=%v err=%v", sz, handled, terr)
+		}
+	}
+
+	// Pre-flush read must already see zeros past 5 KiB.
+	buf := make([]byte, 9<<10)
+	n, rerr := eh.Read(context.Background(), 0, buf)
+	if rerr != nil || n != len(buf) {
+		t.Fatalf("pre-flush Read: n=%d err=%v", n, rerr)
+	}
+	if string(buf[:5<<10]) != orig[:5<<10] {
+		t.Fatal("pre-flush prefix [0..5KiB) corrupted")
+	}
+	if !bytes.Equal(buf[5<<10:], make([]byte, 4<<10)) {
+		t.Fatal("pre-flush [5KiB..9KiB) retained stale tail bytes after shrink+grow")
+	}
+
+	if err := eh.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if err := eh.Release(context.Background()); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	got := f.contentOf("/d/hyb-trunc.bin")
+	if len(got) != 9<<10 {
+		t.Fatalf("remote len = %d, want %d", len(got), 9<<10)
+	}
+	if got[:5<<10] != orig[:5<<10] || got[5<<10:] != string(make([]byte, 4<<10)) {
+		t.Fatal("remote [5KiB..9KiB) retained stale bytes instead of zeros")
+	}
+}
