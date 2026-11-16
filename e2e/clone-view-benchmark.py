@@ -31,7 +31,12 @@ def failure_categories(raw):
                 "invalid argument": "invalid", "input/output error": "io", "no such file or directory": "not_found",
                 "file exists": "exists", "read-only file system": "read_only", "could not write config file": "git_config",
                 "unable to write": "git_write", "could not create work tree dir": "git_worktree",
-                "unable to access": "git_access", "failed to write": "git_write_failure"}
+                "unable to access": "git_access", "failed to write": "git_write_failure",
+                "died of signal 7": "git_sigbus", "bus error": "bus_error",
+                "unable to read": "git_read", "read error": "read_error",
+                "mmap failed": "mmap_failure", "could not mmap": "mmap_failure",
+                "invalid index-pack output": "invalid_pack", "early eof": "early_eof",
+                "bad object": "bad_object", "corrupt": "corruption"}
     return ",".join(value for key, value in patterns.items() if key in text) or "unclassified"
 
 
@@ -121,16 +126,18 @@ def diagnose_clone_failure(args, trace):
         except subprocess.TimeoutExpired:
             os.killpg(process.pid, signal.SIGKILL)
             process.wait(timeout=5)
-            print("CHECK clone diagnostic timed out", flush=True)
-            return
+            print("CHECK clone diagnostic timed out; summarizing partial trace", flush=True)
+            result = -signal.SIGKILL
     with trace.open("rb") as source:
         source.seek(0, os.SEEK_END)
         source.seek(max(0, source.tell() - (4 << 20)))
         raw = source.read(4 << 20)
         failures = syscall_failure_counts(raw)
         signals = signal_mapping_counts(raw)
+    with trace.with_suffix(".stderr").open("rb") as source:
+        categories = failure_categories(source.read(65536))
     print("CHECK clone diagnostic exit=" + str(result) + " failures=" + json.dumps(failures, sort_keys=True)
-          + " signals=" + json.dumps(signals, sort_keys=True), flush=True)
+          + " signals=" + json.dumps(signals, sort_keys=True) + " categories=" + categories, flush=True)
 
 
 def clone_fixture(source, target, trace):

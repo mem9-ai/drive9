@@ -43,6 +43,10 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(bench.failure_categories(b"fatal: private-path: Permission denied"), "permission")
         self.assertEqual(bench.failure_categories(b"private-path and secret bytes"), "unclassified")
         self.assertEqual(bench.failure_categories(b"x" * 65536 + b"Permission denied"), "unclassified")
+        for raw, category in ((b"private child died of signal 7", "git_sigbus"),
+                              (b"fatal: mmap failed on private object", "mmap_failure"),
+                              (b"fatal: invalid index-pack output: private", "invalid_pack")):
+            self.assertEqual(bench.failure_categories(raw), category)
 
     def test_syscall_summary_is_bounded_and_allowlisted(self):
         raw = (b'123 openat(AT_FDCWD, "/private/.git/hooks/hook", 0) = -1 EIO (Input/output error)\n'
@@ -98,8 +102,15 @@ class BenchmarkTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, \
                 patch.object(bench.shutil, "which", return_value="/bin/strace"), \
                 patch.object(bench.subprocess, "Popen", return_value=process) as popen, \
-                patch.object(bench.os, "killpg") as kill, patch("builtins.print"):
-            bench.diagnose_clone_failure(["git", "clone", "source", "diagnostic-repo"], Path(directory) / "trace")
+                patch.object(bench.os, "killpg") as kill, patch("builtins.print") as output:
+            trace = Path(directory) / "trace"
+            trace.write_bytes(b'123 openat(AT_FDCWD, "/private/.git/objects/secret", 0) = -1 EIO (Input/output error)\n')
+            bench.diagnose_clone_failure(["git", "clone", "source", "diagnostic-repo"], trace)
+            summary = str(output.call_args_list)
+            self.assertIn("summarizing partial trace", summary)
+            self.assertIn('"errno": "EIO"', summary)
+            self.assertNotIn("private", summary)
+            self.assertNotIn("secret", summary)
         self.assertTrue(popen.call_args.kwargs["start_new_session"])
         kill.assert_called_once_with(1234, bench.signal.SIGKILL)
         self.assertEqual(process.wait.call_count, 2)
