@@ -6,6 +6,8 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
+import signal
 from pathlib import Path
 import shutil
 import statistics
@@ -41,6 +43,67 @@ def command(args, *, env=None, timeout=300):
     require(result.returncode == 0, "benchmark subprocess failed; exit=" + str(result.returncode)
             + " categories=" + failure_categories(result.stderr) + "; sample rejected")
     return result.stdout
+
+
+def syscall_failure_counts(raw):
+    # Only enumerated operation/error/path classes leave this local trace.
+    calls = {"open", "openat", "creat", "mkdir", "mkdirat", "rename", "renameat", "renameat2",
+             "unlink", "unlinkat", "rmdir", "link", "linkat", "symlink", "symlinkat", "readlink",
+             "readlinkat", "chmod", "fchmod", "fchmodat", "stat", "lstat", "newfstatat", "statx",
+             "access", "faccessat", "faccessat2", "fsync", "fdatasync", "close", "utimensat",
+             "read", "pread64", "write", "pwrite64", "ftruncate"}
+    errors = {"EIO", "EACCES", "EPERM", "EINVAL", "EROFS", "ENOSYS", "EOPNOTSUPP", "ENOSPC", "ESTALE"}
+    paths = (("/.git/hooks/", "git_hooks"), ("/.git/objects/", "git_objects"),
+             ("/.git/refs/", "git_refs"), ("/.git/config", "git_config"), ("/.git/HEAD", "git_head"))
+    counts = {}
+    for line in raw[-(4 << 20):].decode("utf-8", errors="replace").splitlines():
+        op = re.match(r"^(?:[0-9]+ +)?(?:([a-z0-9_]+)\(|<\.\.\. ([a-z0-9_]+) resumed>)", line)
+        error = re.search(r"= -1 (E[A-Z0-9]+) \(", line)
+        name = (op.group(1) or op.group(2)) if op else None
+        if name not in calls or not error or error.group(1) not in errors:
+            continue
+        category = next((value for pattern, value in paths if pattern in line), "other")
+        key = (name, error.group(1), category)
+        counts[key] = counts.get(key, 0) + 1
+    return [{"syscall": op, "errno": error, "path_class": category, "count": count}
+            for (op, error, category), count in sorted(counts.items())]
+
+
+def diagnose_clone_failure(args, trace):
+    # A separate, unmeasured destination preserves the failed sample. Raw trace
+    # and Git output stay in the temporary fixture and are never uploaded.
+    if shutil.which("strace") is None:
+        print("CHECK clone diagnostic unavailable", flush=True)
+        return
+    with trace.with_suffix(".stderr").open("wb") as stderr:
+        process = subprocess.Popen(["strace", "-f", "-qq", "-yy", "-e",
+                                    "trace=%file,fsync,fdatasync,close,fchmod,ftruncate,read,pread64,write,pwrite64",
+                                    "-e", "raw=read,pread64,write,pwrite64", "-o", str(trace), *args],
+                                   stdout=subprocess.DEVNULL, stderr=stderr, start_new_session=True)
+        try:
+            result = process.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)
+            print("CHECK clone diagnostic timed out", flush=True)
+            return
+    with trace.open("rb") as source:
+        source.seek(0, os.SEEK_END)
+        source.seek(max(0, source.tell() - (4 << 20)))
+        failures = syscall_failure_counts(source.read(4 << 20))
+    print("CHECK clone diagnostic exit=" + str(result) + " failures=" + json.dumps(failures, sort_keys=True), flush=True)
+
+
+def clone_fixture(source, target, trace):
+    args = ["git", "-c", "protocol.file.allow=always", "clone", "--no-local", source.as_uri()]
+    try:
+        command([*args, str(target)], timeout=600)
+    except http.ProbeFailure:
+        try:
+            diagnose_clone_failure([*args, str(target.with_name("diagnostic-repo"))], trace)
+        except Exception:
+            print("CHECK clone diagnostic unavailable", flush=True)
+        raise
 
 
 def fixture(root, count):
@@ -151,7 +214,7 @@ def sample(cli, base, source, manifest_file, case, index, root):
             target = point / probe.root.lstrip("/") / "repo"
             started = time.monotonic()
             print("CHECK phase=clone", flush=True)
-            command(["git", "-c", "protocol.file.allow=always", "clone", "--no-local", source.as_uri(), str(target)], timeout=600)
+            clone_fixture(source, target, root / "clone.strace")
             cloned = time.monotonic()
             print("CHECK phase=sync", flush=True)
             command([sys.executable, __file__, "--operation=sync", "--tree", str(target)], timeout=300)

@@ -542,3 +542,9 @@ Mount/provision time is excluded; clone, fsync, unmount and remount verification
 are reported separately. This is a small serial checkout workload on one runner,
 not a production latency or concurrency benchmark. Any error rejects the sample;
 an incomplete run produces no comparison ratio. Production source is unchanged.
+
+The clone comparison runs an unmeasured `strace` reproduction in a separate
+destination only after a clone failure. It always preserves the failed sample.
+Only fixed syscall/error/path categories are printed; raw traces and Git output
+stay inside the temporary fixture and are not uploaded. The diagnostic process
+group has a 60-second limit. This requires `strace` on the diagnostic CI runner.
