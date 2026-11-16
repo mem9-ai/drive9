@@ -929,6 +929,7 @@ var coveredClientMethods = map[string]bool{
 
 	// Fixed-view controls and preparation: fixed_view_test.go.
 	"ChmodFixedFile":                    true,
+	"CreateFixedFileCtx":                true,
 	"CompleteFixedExtentUpload":         true,
 	"CompleteFixedExtentUploadWithSize": true,
 	"InitiateFixedExtentUpload":         true,

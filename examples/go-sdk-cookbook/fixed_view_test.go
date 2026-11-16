@@ -100,6 +100,28 @@ func ExampleClient_fixedUploadControls() {
 	_, _ = bound.AbortFixedUpload(ctx, "abort-upload-1", "issued-upload")
 }
 
+// Initial permissions can be committed with fixed-view creation in one PUT.
+func ExampleClient_CreateFixedFileCtx() {
+	ctx := context.Background()
+	c := drive9.New("https://drive9.example.com", "api-key")
+	bound, err := c.WithView(drive9.ViewBinding{LayerID: "candidate", WorkID: "issued-work", Fence: 1})
+	if err != nil {
+		return
+	}
+	// Persist the binding, path, mode and operation ID before sending.
+	ctx, err = drive9.WithViewOperationID(ctx, "create-private-1")
+	if err != nil {
+		return
+	}
+	file, err := bound.CreateFixedFileCtx(ctx, "/private.txt", 0o600)
+	if err != nil {
+		return // Recover with the same saved inputs and operation ID.
+	}
+	// The receipt identifies the file created with mode 0600; no chmod needed.
+	_ = file.ResourceID
+	_ = file.Revision
+}
+
 // Empty files use a conditional PUT; chmod uses the returned file identity.
 func ExampleClient_fixedEmptyFileAndMode() {
 	ctx := context.Background()
