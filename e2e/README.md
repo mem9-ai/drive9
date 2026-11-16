@@ -527,3 +527,18 @@ requires explicit success, and propagates write, switch, merge and cleanup failu
 Set `RUN_FIXED_VIEW_SMOKE=1` to include it against a matching v10 server; any Layer
 failure still fails the aggregate. The standalone Layer entry always runs its
 full HTTP and mounted flow. No private-server credential is added to client CI.
+
+### Manual clone comparison diagnostic
+
+`clone-view-benchmark.sh` is manual-only: a performance experiment for the
+LayerFS design discussion, not a correctness release gate. Run only through
+the paired disposable Linux/TiKV server CI with explicit `CLONE_BENCH_OUTPUT`.
+It provisions fresh loopback tenants and compares current PR main (no Layer)
+with the existing Layer COW path. It does not implement or measure a hypothetical
+full-COW main. The deterministic 64-file, 1 KiB/file fixture uses `file://` Git
+transport, three alternating trials, `close-sync`, no local path routing and
+a fresh-cache remount/content/fsck check. `.git` also travels through FUSE.
+Mount/provision time is excluded; clone, fsync, unmount and remount verification
+are reported separately. This is a small serial checkout workload on one runner,
+not a production latency or concurrency benchmark. Any error rejects the sample;
+an incomplete run produces no comparison ratio. Production source is unchanged.
