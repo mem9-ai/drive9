@@ -136,3 +136,34 @@ func TestFlushPendingSurfacesAndClearsCommitErr(t *testing.T) {
 		t.Fatalf("FlushFile after clearing commitErr: %v", err)
 	}
 }
+
+func TestAssemblePatchBlocksSplitsChunkSpanToBlockSize(t *testing.T) {
+	f := newFakeV2(t)
+	f.setDir("/d", true)
+	f.seedExtent(t, "/d/split.bin", "SEED")
+	b := NewBridge(Config{Client: client.New(f.URL, ""), RemoteRoot: "/"})
+
+	// Stage one 9 MiB pending slice (> 4 MiB ExtentBlockSize) and verify
+	// assemblePatchBlocks cuts it into 4 MiB, 4 MiB, and 1 MiB pieces.
+	span := bytes.Repeat([]byte("S"), (9<<20)+512)
+	sum := sha256Hex(span)
+	b.blocks.stagePinned(sum, span, true)
+
+	blocks, err := b.assemblePatchBlocks(context.Background(), "/d/split.bin", []pendingWrite{
+		{chunk: 1, off: 0, checksum: sum, size: int64(len(span))},
+	})
+	if err != nil {
+		t.Fatalf("assemblePatchBlocks: %v", err)
+	}
+	if len(blocks) != 3 {
+		t.Fatalf("assembled %d blocks, want 3 (4MiB + 4MiB + 1MiB+512)", len(blocks))
+	}
+	wantOffs := []uint32{0, uint32(client.ExtentBlockSize), uint32(2 * client.ExtentBlockSize)}
+	wantLens := []int{int(client.ExtentBlockSize), int(client.ExtentBlockSize), (1 << 20) + 512}
+	for i, blk := range blocks {
+		if blk.Chunk != 1 || blk.Off != wantOffs[i] || len(blk.Data) != wantLens[i] {
+			t.Fatalf("block %d = (chunk=%d off=%d len=%d), want (1 %d %d)",
+				i, blk.Chunk, blk.Off, len(blk.Data), wantOffs[i], wantLens[i])
+		}
+	}
+}

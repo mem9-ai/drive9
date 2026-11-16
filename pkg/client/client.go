@@ -203,6 +203,9 @@ func newClient(baseURL, credential string) *Client {
 	}
 	transport.MaxIdleConns = 256
 	transport.MaxIdleConnsPerHost = 64
+	transport.TLSHandshakeTimeout = 15 * time.Second
+	transport.ResponseHeaderTimeout = 60 * time.Second
+	transport.IdleConnTimeout = 90 * time.Second
 
 	// Custom DialContext: fall back to public DNS (8.8.8.8, 1.1.1.1) when the
 	// system resolver fails. Fixes DNS on Termux and minimal containers that

@@ -830,16 +830,31 @@ func (b *Bridge) Write(ctx meta.Context, ino meta.Ino, indx uint32, off uint32, 
 		b.mu.Unlock()
 		return syscall.EIO
 	}
-	data := sl.join()
-	sum := sha256Hex(data)
 	delete(b.stagedSlices, slice.Id)
+	b.mu.Unlock()
+
+	// Concatenate, remove temp files, and hash OUTSIDE b.mu so concurrent
+	// objectStorage.Put and metadata lookups do not block on slice copy/hash.
+	data := sl.join()
+	sl.blocks = nil
 	for _, p := range sl.paths {
 		_ = os.Remove(p)
 	}
-	// Make the bytes findable by checksum for the commit path
-	// (assembleImage / blockBytes refetch), pinned against the classic
-	// read LRU: a pending commit still needs them.
+	if int64(len(data)) != int64(slice.Size) {
+		if !b.cfg.NativeWriteback {
+			b.blocks.addStagedMem(-sl.total)
+		}
+		return syscall.EIO
+	}
+	sum := sha256Hex(data)
+	// Account pinned bytes BEFORE releasing stagedMemBytes so total tracked
+	// in-memory budget stays monotonic and never admits extra slices prematurely.
 	b.blocks.stagePinned(sum, data, true)
+	if !b.cfg.NativeWriteback {
+		b.blocks.addStagedMem(-sl.total)
+	}
+
+	b.mu.Lock()
 	b.pending[ino] = append(b.pending[ino], pendingWrite{chunk: indx, off: off, checksum: sum, size: int64(slice.Len)})
 	end := int64(indx)*meta.ChunkSize + int64(off) + int64(slice.Len)
 	if end > b.sizes[ino] {
@@ -854,7 +869,8 @@ func (b *Bridge) Write(ctx meta.Context, ino meta.Ino, indx uint32, off uint32, 
 	for _, w := range b.pending[ino] {
 		pendingBytes += w.size
 	}
-	batchHold := commitBatchBytes > 0 && pendingBytes < commitBatchBytes
+	batchHold := commitBatchBytes > 0 && pendingBytes < commitBatchBytes &&
+		b.blocks.totalStagingBudget() < maxPinnedCommitBytes/2
 	if _, failed := b.commitErr[ino]; failed {
 		batchHold = false
 	}
@@ -1045,13 +1061,9 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 		// a freshly created file.
 		b.recordLandedRevision(ino, landedRev)
 	} else {
-		blocks := make([]client.ExtentBlockWrite, 0, len(pending))
-		for _, p := range pending {
-			data, err := b.blockBytes(ctx, p, path)
-			if err != nil {
-				return err
-			}
-			blocks = append(blocks, client.ExtentBlockWrite{Chunk: p.chunk, Off: p.off, Data: data})
+		blocks, err := b.assemblePatchBlocks(ctx, path, pending)
+		if err != nil {
+			return err
 		}
 		if err := b.commitWithRetry(ctx, ino, path, blocks, size, st.Revision); err != nil {
 			return err
@@ -1165,23 +1177,15 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 	return nil
 }
 
-// commitExtentExisting lands pending blocks as an incremental PATCH
-// against a known revision (the identity-verified recovery path).
-//
-// The engine coalesces streaming writes into chunk-sized slices (one
-// 64 MiB slice per chunk), and a commit that carries such a slice as ONE
-// dirty block PUTs the whole span through a single stream — every commit
-// was paced by one 64 MiB upload. Cutting each pending span into
-// ExtentBlockSize pieces keeps the publish identical server-side (the
-// pieces tile the same byte range under the same revision CAS) while the
-// client's PATCH path uploads them at bounded concurrency.
-func (b *Bridge) commitExtentExisting(ctx context.Context, ino meta.Ino, path string, pending []pendingWrite, size, rev int64) error {
+// assemblePatchBlocks gathers pending slices and splits chunk-sized spans into
+// ExtentBlockSize pieces so PATCH commits upload blocks at bounded concurrency.
+func (b *Bridge) assemblePatchBlocks(ctx context.Context, path string, pending []pendingWrite) ([]client.ExtentBlockWrite, error) {
 	const piece = int64(client.ExtentBlockSize)
 	blocks := make([]client.ExtentBlockWrite, 0, len(pending)*2)
 	for _, p := range pending {
 		data, err := b.blockBytes(ctx, p, path)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if int64(len(data)) <= piece {
 			blocks = append(blocks, client.ExtentBlockWrite{Chunk: p.chunk, Off: p.off, Data: data})
@@ -1199,8 +1203,17 @@ func (b *Bridge) commitExtentExisting(ctx context.Context, ino meta.Ino, path st
 			})
 		}
 	}
-	err := b.commitWithRetry(ctx, ino, path, blocks, size, rev)
+	return blocks, nil
+}
+
+// commitExtentExisting lands pending blocks as an incremental PATCH
+// against a known revision (the identity-verified recovery path).
+func (b *Bridge) commitExtentExisting(ctx context.Context, ino meta.Ino, path string, pending []pendingWrite, size, rev int64) error {
+	blocks, err := b.assemblePatchBlocks(ctx, path, pending)
 	if err != nil {
+		return err
+	}
+	if err := b.commitWithRetry(ctx, ino, path, blocks, size, rev); err != nil {
 		return err
 	}
 	b.surgicalDeletePending(ino, pending)

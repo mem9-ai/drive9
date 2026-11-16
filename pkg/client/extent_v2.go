@@ -13,16 +13,22 @@ import (
 	"net/http"
 	"strconv"
 	"sync"
+	"time"
 
 	"golang.org/x/sync/errgroup"
 )
 
-// extentPatchPutConcurrency bounds the parallel presigned block PUTs one
-// PATCH commit issues (the completion verifies every part, so the round
-// trips are independent). Sixteen parallel 4 MiB PUTs keep a dirty batch
-// from being paced by a single stream's latency without stampeding the
-// object store.
-const extentPatchPutConcurrency = 16
+const (
+	// extentPatchPutConcurrency bounds the parallel presigned block PUTs one
+	// PATCH commit issues (the completion verifies every part, so the round
+	// trips are independent). Sixteen parallel 4 MiB PUTs keep a dirty batch
+	// from being paced by a single stream's latency without stampeding the
+	// object store.
+	extentPatchPutConcurrency = 16
+	// extentBlockPutTimeout bounds one block PUT attempt so a silent TCP/TLS
+	// stall against object storage cannot wedge commit locks indefinitely.
+	extentBlockPutTimeout = 2 * time.Minute
+)
 
 // Extent content layout v2. The server owns the block layout (64 MiB chunks
 // of content-addressed 4 MiB blocks) and all maintenance; the client speaks
@@ -544,7 +550,9 @@ func extentPlanBlockFor(plan *ExtentWritePlan, d ExtentDirtyBlock) *ExtentWriteP
 // prescribes none signs only the S3 flexible checksum, which the client can
 // derive from the bytes.
 func (c *Client) putExtentBlock(ctx context.Context, url string, headers map[string]string, data []byte) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(data))
+	putCtx, cancel := context.WithTimeout(ctx, extentBlockPutTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(putCtx, http.MethodPut, url, bytes.NewReader(data))
 	if err != nil {
 		return err
 	}

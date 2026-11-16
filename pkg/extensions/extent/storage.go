@@ -37,11 +37,12 @@ type objectStorage struct {
 
 const maxStageBytes = 256 << 20
 
-// maxPinnedCommitBytes bounds the staged-byte volume pending commits may
-// pin in memory (see blockRegistry.pinnedBytes). Once the budget is full,
-// new slice ingestion blocks until commits drain — write backpressure
-// instead of unbounded growth. Overridable for bench work.
-var maxPinnedCommitBytes int64 = 1 << 30
+// maxPinnedCommitBytes bounds the staged-byte volume pending commits (and
+// non-Writeback in-memory slice staging) may hold at once. Keeping this at
+// 384 MiB keeps live heap + JuiceFS BufferSize well below a 3 GiB container
+// memory ceiling while still pipelining multiple 64 MiB batches concurrently.
+// Overridable via DRIVE9_EXTENT_PINNED_BUDGET_BYTES.
+var maxPinnedCommitBytes int64 = 384 << 20
 
 // commitBatchBytes is the pending-byte volume Bridge.Write lets accumulate
 // for a file before it drives a commit. The engine hands over one 4 MiB
@@ -111,6 +112,20 @@ func (s objectStorage) Put(ctx context.Context, key string, in io.Reader, getter
 	// memory — avoiding double disk staging (rawstaging + temp file) and
 	// freeing NVMe IOPS during large writes.
 	if s.bridge == nil || !s.bridge.cfg.NativeWriteback {
+		if s.bridge != nil {
+			s.bridge.mu.Lock()
+			existingSlice := s.bridge.stagedSlices[id] != nil
+			hasInFlight := len(s.bridge.stagedSlices) > 0 || s.bridge.blocks.pinnedBudget() > 0
+			s.bridge.mu.Unlock()
+			// Backpressure BEFORE allocating/returning a new slice so JuiceFS
+			// FreeMemory stays gated on commit drain rate; blocks of an already
+			// admitted slice never wait so an in-progress slice always finishes.
+			if !existingSlice && hasInFlight {
+				if err := s.bridge.blocks.waitTotalStagingBudget(ctx, maxPinnedCommitBytes); err != nil {
+					return err
+				}
+			}
+		}
 		buf := make([]byte, size)
 		if _, err := io.ReadFull(in, buf); err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
@@ -122,17 +137,20 @@ func (s objectStorage) Put(ctx context.Context, key string, in io.Reader, getter
 			return nil
 		}
 		s.bridge.mu.Lock()
-		defer s.bridge.mu.Unlock()
 		sl := s.bridge.stagedSlices[id]
 		if sl == nil {
 			sl = &stagedSlice{blocks: make(map[int64][]byte)}
 			s.bridge.stagedSlices[id] = sl
 		}
+		var prevLen int64
 		if prev, exists := sl.blocks[indx]; exists {
-			sl.total -= int64(len(prev))
+			prevLen = int64(len(prev))
+			sl.total -= prevLen
 		}
 		sl.blocks[indx] = buf
 		sl.total += size
+		s.bridge.mu.Unlock()
+		s.bridge.blocks.addStagedMem(size - prevLen)
 		return nil
 	}
 	dir := s.bridge.cfg.CacheDir
@@ -437,13 +455,36 @@ func (r *blockRegistry) pinnedBudget() int64 {
 	return r.pinnedBytes
 }
 
-// waitPinnedBudget blocks while pending commits hold at least limit staged
-// bytes, converting an unbounded in-memory backlog into write backpressure:
-// the caller (slice ingestion) parks, the kernel queues the WRITE, and the
-// writer throttles to commit speed instead of OOM-killing the worker.
-func (r *blockRegistry) waitPinnedBudget(ctx context.Context, limit int64) error {
+// totalStagingBudget reports combined pinned-commit and in-memory staged-slice
+// bytes currently retained in RAM.
+func (r *blockRegistry) totalStagingBudget() int64 {
 	r.mu.Lock()
-	for r.pinnedBytes >= limit {
+	defer r.mu.Unlock()
+	return r.pinnedBytes + r.stagedMemBytes
+}
+
+// addStagedMem adjusts the byte volume retained in Bridge.stagedSlices and
+// wakes budget waiters when bytes are released.
+func (r *blockRegistry) addStagedMem(delta int64) {
+	if delta == 0 {
+		return
+	}
+	r.mu.Lock()
+	r.stagedMemBytes += delta
+	if r.stagedMemBytes < 0 {
+		r.stagedMemBytes = 0
+	}
+	if delta < 0 {
+		close(r.budgetCh)
+		r.budgetCh = make(chan struct{})
+	}
+	r.mu.Unlock()
+}
+
+// waitBudgetLocked blocks while full() reports true under r.mu.
+func (r *blockRegistry) waitBudget(ctx context.Context, full func() bool) error {
+	r.mu.Lock()
+	for full() {
 		ch := r.budgetCh
 		r.mu.Unlock()
 		select {
@@ -455,6 +496,20 @@ func (r *blockRegistry) waitPinnedBudget(ctx context.Context, limit int64) error
 	}
 	r.mu.Unlock()
 	return nil
+}
+
+// waitPinnedBudget blocks while pending commits hold at least limit staged
+// bytes, converting an unbounded in-memory backlog into write backpressure:
+// the caller (slice ingestion) parks, the kernel queues the WRITE, and the
+// writer throttles to commit speed instead of OOM-killing the worker.
+func (r *blockRegistry) waitPinnedBudget(ctx context.Context, limit int64) error {
+	return r.waitBudget(ctx, func() bool { return r.pinnedBytes >= limit })
+}
+
+// waitTotalStagingBudget blocks while combined stagedSlices + pinned commits
+// hold at least limit bytes in RAM.
+func (r *blockRegistry) waitTotalStagingBudget(ctx context.Context, limit int64) error {
+	return r.waitBudget(ctx, func() bool { return r.pinnedBytes+r.stagedMemBytes >= limit })
 }
 
 // issuePin increments the issued-reader count for a staged id (the

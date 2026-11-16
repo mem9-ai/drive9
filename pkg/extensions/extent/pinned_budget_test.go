@@ -87,3 +87,34 @@ func TestWaitPinnedBudgetRespectsContext(t *testing.T) {
 		t.Fatal("waitPinnedBudget with full budget and expiring context must error")
 	}
 }
+
+func TestWaitTotalStagingBudgetTracksStagedMemAndWakes(t *testing.T) {
+	r := newBlockRegistry()
+	a := shaHex([]byte("pinned-part"))
+	r.stagePinned(a, make([]byte, 600), true)
+	r.addStagedMem(500)
+	if got := r.totalStagingBudget(); got != 1100 {
+		t.Fatalf("totalStagingBudget = %d, want 1100", got)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- r.waitTotalStagingBudget(ctx, 1024) }()
+
+	select {
+	case err := <-done:
+		t.Fatalf("waitTotalStagingBudget returned early while combined bytes 1100 >= 1024: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	r.addStagedMem(-500)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("waitTotalStagingBudget error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("waitTotalStagingBudget did not wake after stagedMem release")
+	}
+}

@@ -359,8 +359,11 @@ type blockRegistry struct {
 	// the worker at 7.58 GiB RSS. waitPinnedBudget turns that cliff into
 	// write backpressure.
 	pinnedBytes int64
-	// budgetCh is closed (and replaced under mu) whenever pinnedBytes
-	// drops, waking waitPinnedBudget callers.
+	// stagedMemBytes tracks slice bytes currently buffered in Bridge.stagedSlices
+	// (non-Writeback in-memory staging) before Bridge.Write moves them into pins.
+	stagedMemBytes int64
+	// budgetCh is closed (and replaced under mu) whenever pinnedBytes or
+	// stagedMemBytes drops, waking waitPinnedBudget callers.
 	budgetCh chan struct{}
 	// issued tracks outstanding readers of staged classic ids: an issued
 	// entry is immune from LRU retirement until its fetch consumes the pin.
