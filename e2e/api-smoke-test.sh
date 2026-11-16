@@ -324,6 +324,33 @@ check_status() {
   check_eq "$desc" "$(http_code "$resp")" "$want"
 }
 
+# is_strong_etag <value>: a validator is strong only when it is present and not
+# the weak form `W/"..."`. A HEAD that downgrades to a weak validator must not
+# silently satisfy a check that claims strong-validator coverage.
+is_strong_etag() {
+  case "$1" in
+    "") return 1 ;;
+    W/*|w/*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# rfc3339_epoch <timestamp>: epoch seconds, so ordering compares real instants
+# rather than the trimmed fractional digits of RFC3339Nano strings.
+rfc3339_epoch() {
+  python3 - "$1" <<'PY'
+import datetime
+import sys
+
+raw = sys.argv[1].strip()
+if not raw:
+    raise SystemExit("empty timestamp")
+if raw.endswith("Z"):
+    raw = raw[:-1] + "+00:00"
+print(int(datetime.datetime.fromisoformat(raw).timestamp()))
+PY
+}
+
 probe_features() {
   if [ "$PROBES_DONE" = "1" ]; then
     return 0
@@ -342,7 +369,7 @@ probe_features() {
   fi
 
   resp=$(request HEAD "$BASE/v1/fs/$path" --auth "$API_KEY")
-  if [ "$(resp_hdr 'ETag')" != "" ]; then
+  if is_strong_etag "$(resp_hdr 'ETag')"; then
     PROBE_HEAD_VALIDATORS="true"
   else
     PROBE_HEAD_VALIDATORS="false"
@@ -1328,7 +1355,7 @@ if [ "$RUN_CONTRACT_CHECKS" = "1" ]; then
   fi
   check_cmd "HEAD X-Dat9-Nlink is at least 1" bash -c 'test "${1:-0}" -gt 0' _ "$(resp_hdr 'X-Dat9-Nlink')"
   if [ "$PROBE_HEAD_VALIDATORS" = "true" ]; then
-    check_cmd "HEAD advertises a strong ETag" test -n "$(resp_hdr 'ETag')"
+    check_cmd "HEAD advertises a strong ETag" is_strong_etag "$(resp_hdr 'ETag')"
     check_eq "HEAD advertises Accept-Ranges: bytes" "$(resp_hdr 'Accept-Ranges')" "bytes"
     check_eq "HEAD reports the single content layout" "$(resp_hdr 'X-Dat9-Content-Layout')" "single"
   else
@@ -1913,7 +1940,7 @@ if [ "$RUN_MOUNT_LEASE_CHECKS" = "1" ]; then
   step "24" "Mount lease lifecycle"
   MOUNT_ID="e2e-${TS}"
   resp=$(request POST "$BASE/v1/mounts" --auth "$API_KEY" --hdr 'Content-Type: application/json' \
-    --data "$(jq -nc --arg id "$MOUNT_ID" '{mount_id:$id,mount_point:"/tmp/drive9-e2e",host:"e2e-runner",pid:4242,mode:"read_write",ttl_seconds:600}')")
+    --data "$(jq -nc --arg id "$MOUNT_ID" '{mount_id:$id,mount_point:"/tmp/drive9-e2e",host:"e2e-runner",pid:4242,mode:"read_write",ttl_seconds:60}')")
   if [ "$(http_code "$resp")" = "404" ]; then
     # /v1/mounts is newer than the oldest supported server build. A route the
     # server does not serve is a SKIP, never a FAIL.
@@ -1935,16 +1962,21 @@ if [ "$RUN_MOUNT_LEASE_CHECKS" = "1" ]; then
     check_cmd "the lease carries an expires_at" test -n "$(printf '%s' "$mount_body" | jq -r '.expires_at // empty')"
     check_json "the lease advertises a positive heartbeat interval" "$mount_body" '(.heartbeat_interval_seconds > 0)' "true"
     mount_expires=$(printf '%s' "$mount_body" | jq -r '.expires_at')
+    mount_expires_epoch=$(rfc3339_epoch "$mount_expires")
 
     resp=$(request GET "$BASE/v1/mounts/$MOUNT_ID" --auth "$API_KEY")
     check_status "GET /v1/mounts/{id} returns the lease" "$resp" "200"
     check_json "the fetched lease echoes mount_id" "$(json_body "$resp")" '.mount_id' "$MOUNT_ID"
 
+    # The lease store clamps ttl_seconds to a 10s..300s window, so both values
+    # stay inside it: 60s -> 180s makes the extension observable at second
+    # granularity instead of hiding it in sub-second drift.
     resp=$(request POST "$BASE/v1/mounts/$MOUNT_ID/heartbeat" --auth "$API_KEY" \
-      --hdr 'Content-Type: application/json' --data '{"ttl_seconds":900}')
+      --hdr 'Content-Type: application/json' --data '{"ttl_seconds":180}')
     check_status "POST /v1/mounts/{id}/heartbeat extends the lease" "$resp" "200"
-    check_cmd "a heartbeat extends expires_at" bash -c 'test "$1" != "$2"' _ \
-      "$mount_expires" "$(json_body "$resp" | jq -r '.expires_at')"
+    heartbeat_expires=$(json_body "$resp" | jq -r '.expires_at')
+    check_cmd "a heartbeat extends expires_at" bash -c 'test "${2:-0}" -gt "${1:-0}"' _ \
+      "$mount_expires_epoch" "$(rfc3339_epoch "$heartbeat_expires")"
 
     resp=$(request GET "$BASE/v1/mounts" --auth "$API_KEY")
     check_status "GET /v1/mounts lists the lease" "$resp" "200"
