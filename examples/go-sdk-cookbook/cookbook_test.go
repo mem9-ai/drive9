@@ -785,6 +785,12 @@ func ExampleClient_extentBlockDataPlane() {
 	// Identity-only stat: the resource ID of whatever currently occupies
 	// the path (cheap fencing check before a bound publication).
 	_, _ = c.StatResourceID(ctx, "/workspace/large.bin")
+
+	// Zero-byte extent creation, metadata-only / RMW extent resize, and
+	// revision/resource-bound file deletion.
+	rev, resID, _, _ := c.CreateExtentFileCreatedCtx(ctx, "/workspace/empty-extent.bin")
+	_, _ = c.TruncateExtentConditional(ctx, "/workspace/empty-extent.bin", &drive9.StatResult{Revision: rev, ResourceID: resID}, 0)
+	_ = c.DeleteFileConditionalCtx(ctx, "/workspace/empty-extent.bin", rev, resID)
 }
 
 var coveredClientMethods = map[string]bool{
@@ -837,10 +843,12 @@ var coveredClientMethods = map[string]bool{
 	"CreateFSLayer":                          true,
 	"DeleteFSLayer":                          true,
 	"CreateJournal":                          true,
+	"CreateExtentFileCreatedCtx":             true,
 	"CreateVaultSecret":                      true,
 	"Delete":                                 true,
 	"DeleteCtx":                              true,
 	"DeleteDirCtx":                           true,
+	"DeleteFileConditionalCtx":               true,
 	"DeleteFileCtx":                          true,
 	"DeleteGitWorkspace":                     true,
 	"DeleteVaultSecret":                      true,
@@ -956,6 +964,7 @@ var coveredClientMethods = map[string]bool{
 	"StatMetadataCtx":                        true,
 	"Symlink":                                true,
 	"SymlinkCtx":                             true,
+	"TruncateExtentConditional":              true,
 	"UpdateVaultSecret":                      true,
 	"UploadFSLayerFile":                      true,
 	"UpsertFSLayerEntry":                     true,
