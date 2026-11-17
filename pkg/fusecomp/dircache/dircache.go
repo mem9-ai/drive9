@@ -1254,15 +1254,16 @@ func mergeCachedOwner(item, existing fs.DirEntryInfo) fs.DirEntryInfo {
 		item.Gid = existing.Gid
 		item.HasGID = true
 	}
-	if item.ExtentIno == 0 {
-		item.ExtentIno = existing.ExtentIno
-	}
 	return item
 }
 
 func (e *dirCacheEntry) remove(name string) {
+	_, existed := e.items[name]
 	delete(e.items, name)
 	delete(e.negatives, name)
+	if !existed {
+		return
+	}
 	for i, existing := range e.order {
 		if existing == name {
 			e.order = append(e.order[:i], e.order[i+1:]...)

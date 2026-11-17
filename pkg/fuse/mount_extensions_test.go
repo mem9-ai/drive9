@@ -16,7 +16,7 @@ func TestParseExtensionOrder(t *testing.T) {
 	if !reflect.DeepEqual(got, defaultExtensionOrder) {
 		t.Fatalf("empty input = %v, want default", got)
 	}
-	if len(defaultExtensionOrder) != 13 || defaultExtensionOrder[0] != "core" {
+	if len(defaultExtensionOrder) != 12 || defaultExtensionOrder[0] != "core" {
 		t.Fatalf("default order = %v", defaultExtensionOrder)
 	}
 

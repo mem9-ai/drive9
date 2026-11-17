@@ -228,3 +228,47 @@ func TestJournalSyncLoopBounded(t *testing.T) {
 	}
 	t.Fatal("SyncLoop did not make the frame durable within the window")
 }
+
+// TestWriteBackCacheSyncLoopBoundedAndPendingBytes verifies lazy-staged
+// .dat/.meta entries become durable within SyncLoop's window and maintain O(1)
+// PendingBytes accounting across put, overwrite, and remove.
+func TestWriteBackCacheSyncLoopBoundedAndPendingBytes(t *testing.T) {
+	c, err := NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatalf("cache: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go c.SyncLoop(ctx, 20*time.Millisecond)
+
+	gen1, _, err := c.PutWithBaseRevAndModeAndLineageTimingsNoSyncCacheLineage("/a", []byte("hello"), 5, PendingNew, 0, 0o644, false, "", "", false, 0, nil)
+	if err != nil {
+		t.Fatalf("put /a: %v", err)
+	}
+	if got := c.PendingBytes(); got != 5 {
+		t.Fatalf("PendingBytes after /a = %d, want 5", got)
+	}
+	gen2, _, err := c.PutWithBaseRevAndModeAndLineageTimingsNoSyncCacheLineage("/a", []byte("hello-world"), 11, PendingNew, 0, 0o644, false, "", "", false, gen1, []uint64{gen1})
+	if err != nil {
+		t.Fatalf("overwrite /a: %v", err)
+	}
+	if got := c.PendingBytes(); got != 11 {
+		t.Fatalf("PendingBytes after overwrite = %d, want 11", got)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if c.DurableGeneration() >= gen2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if c.DurableGeneration() < gen2 {
+		t.Fatalf("SyncLoop did not sync lazy cache entries: durable=%d want>=%d", c.DurableGeneration(), gen2)
+	}
+
+	c.RemoveIfGeneration("/a", gen2)
+	if got := c.PendingBytes(); got != 0 {
+		t.Fatalf("PendingBytes after remove = %d, want 0", got)
+	}
+}

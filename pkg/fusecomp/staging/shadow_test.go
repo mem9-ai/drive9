@@ -1672,9 +1672,15 @@ func TestShadowRecoveredGenerationIsNotRevisionVerified(t *testing.T) {
 			}
 			defer ss.Unpin(pin)
 			// v1 canReadGeneration: the pin must bind to the path's pending
-			// generation (not to some other retired image).
-			if pin != ss.ActiveGeneration(path) {
-				t.Fatal("pending authority and committed-cache proof were conflated")
+			// image (not to some other retired image). Pin tokens and content
+			// generations are DIFFERENT number spaces, so the binding is
+			// asserted by CONTENT: both handles must see the same bytes.
+			pinned := make([]byte, len("recovered"))
+			if n, rerr := ss.ReadAtGen(pin, 0, pinned); rerr != nil || n != len(pinned) || string(pinned) != "recovered" {
+				t.Fatalf("pin did not bind the pending image: n=%d data=%q err=%v", n, pinned, rerr)
+			}
+			if active := ss.ActiveGeneration(path); active == 0 {
+				t.Fatal("the pending image has no content generation")
 			}
 			if got, err := ss.ReadAllIfGeneration(path, gen); err != nil || string(got) != "recovered" {
 				t.Fatalf("recovery data=%q err=%v", got, err)

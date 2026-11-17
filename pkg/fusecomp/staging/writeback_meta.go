@@ -2,6 +2,7 @@ package staging
 
 import (
 	"container/list"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -17,6 +18,8 @@ import (
 
 	"github.com/mem9-ai/drive9/pkg/fusecomp/writebuffer"
 )
+
+var errSyncfsUnsupported = errors.New("syncfs unsupported")
 
 // local write-back cache during Flush. Files larger than this are uploaded
 // directly (streaming or multipart) to avoid filling local disk.
@@ -78,7 +81,13 @@ type WriteBackCache struct {
 	// metas is the authoritative in-memory metadata index.
 	// Kept in sync with disk by Put/Remove/RenamePending so that GetMeta and
 	// ListPendingPaths avoid local disk I/O and JSON parsing on hot paths.
-	metas map[string]*WriteBackMeta
+	metas      map[string]*WriteBackMeta
+	totalBytes int64
+	// unsynced tracks entries written with wbSyncNone whose .dat/.meta files
+	// have not yet been covered by SyncPending.
+	unsynced   map[string]uint64
+	syncMu     sync.Mutex
+	durableGen atomic.Uint64
 	// data keeps small cached payloads in memory so writable reopen/read paths
 	// can avoid re-reading the .dat file from disk.
 	data map[string][]byte
@@ -204,6 +213,7 @@ func NewWriteBackCache(dir string) (*WriteBackCache, error) {
 	c := &WriteBackCache{
 		dir:          dir,
 		metas:        make(map[string]*WriteBackMeta),
+		unsynced:     make(map[string]uint64),
 		data:         make(map[string][]byte),
 		dataOrder:    list.New(),
 		dataElems:    make(map[string]*list.Element),
@@ -232,12 +242,13 @@ func NewWriteBackCache(dir string) (*WriteBackCache, error) {
 			continue
 		}
 		cp := meta
-		c.metas[meta.Path] = &cp
+		c.setMetaLocked(meta.Path, &cp)
 		if meta.Generation > maxGen {
 			maxGen = meta.Generation
 		}
 	}
 	c.nextGen.Store(maxGen)
+	c.durableGen.Store(maxGen)
 	return c, nil
 }
 
@@ -329,7 +340,49 @@ func (c *WriteBackCache) DropInMemoryPayload(remotePath string) {
 func (c *WriteBackCache) PublishMeta(meta WriteBackMeta) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.metas[meta.Path] = &meta
+	c.setMetaLocked(meta.Path, &meta)
+}
+
+func (c *WriteBackCache) setMetaLocked(remotePath string, meta *WriteBackMeta) {
+	if meta == nil {
+		c.deleteMetaLocked(remotePath)
+		return
+	}
+	if prev, ok := c.metas[remotePath]; ok && prev != nil {
+		c.totalBytes -= prev.Size
+	}
+	c.metas[remotePath] = meta
+	c.totalBytes += meta.Size
+}
+
+func (c *WriteBackCache) deleteMetaLocked(remotePath string) {
+	if prev, ok := c.metas[remotePath]; ok && prev != nil {
+		c.totalBytes -= prev.Size
+	}
+	delete(c.metas, remotePath)
+	delete(c.unsynced, remotePath)
+}
+
+// HasMeta reports whether remotePath currently has an in-memory pending record.
+func (c *WriteBackCache) HasMeta(remotePath string) bool {
+	if c == nil {
+		return false
+	}
+	c.mu.Lock()
+	_, ok := c.metas[remotePath]
+	c.mu.Unlock()
+	return ok
+}
+
+// PendingBytes reports the total byte size of all cached pending entries in O(1).
+func (c *WriteBackCache) PendingBytes() int64 {
+	if c == nil {
+		return 0
+	}
+	c.mu.Lock()
+	b := c.totalBytes
+	c.mu.Unlock()
+	return b
 }
 
 // MetaGeneration reports the current metadata generation of one path
@@ -459,6 +512,13 @@ func (c *WriteBackCache) PutWithBaseRevAndModeAndLineageTimingsCacheLineage(remo
 // same meta write.
 func (c *WriteBackCache) PutWithBaseRevAndModeAndLineageTimingsDirSyncCacheLineage(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, cacheLineage uint64, cacheAncestors []uint64, liveAncestors ...string) (uint64, WriteBackPutTimings, error) {
 	return c.putWithBaseRevAndModeAndLineage(remotePath, data, size, kind, baseRev, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted, cacheLineage, cacheAncestors, wbSyncDirOnce, liveAncestors)
+}
+
+// PutWithBaseRevAndModeAndLineageTimingsNoSyncCacheLineage stages a .dat/.meta
+// pair via atomic tmp+rename without per-close fsync barriers (--writeback-sync-window
+// lazy staging), marking the entry unsynced for background SyncPending/SyncLoop.
+func (c *WriteBackCache) PutWithBaseRevAndModeAndLineageTimingsNoSyncCacheLineage(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool, snapshotID, parentSnapshotID string, lineageTrusted bool, cacheLineage uint64, cacheAncestors []uint64, liveAncestors ...string) (uint64, WriteBackPutTimings, error) {
+	return c.putWithBaseRevAndModeAndLineage(remotePath, data, size, kind, baseRev, mode, hasMode, snapshotID, parentSnapshotID, lineageTrusted, cacheLineage, cacheAncestors, wbSyncNone, liveAncestors)
 }
 
 // Get reads the cached data for remotePath. Returns nil, false if not cached.
@@ -654,7 +714,7 @@ func (c *WriteBackCache) UpdateMode(remotePath string, mode uint32) error {
 
 	c.mu.Lock()
 	cp := updated
-	c.metas[remotePath] = &cp
+	c.setMetaLocked(remotePath, &cp)
 	c.mu.Unlock()
 	return nil
 }
@@ -695,7 +755,7 @@ func (c *WriteBackCache) RebaseBaseRevIfGeneration(remotePath string, generation
 
 	c.mu.Lock()
 	cp := updated
-	c.metas[remotePath] = &cp
+	c.setMetaLocked(remotePath, &cp)
 	c.mu.Unlock()
 	return true
 }
@@ -728,7 +788,7 @@ func (c *WriteBackCache) RebasePendingNew(remotePath string, baseRev int64) erro
 		return fmt.Errorf("writeback persist create acknowledgement: %w", err)
 	}
 	c.mu.Lock()
-	c.metas[remotePath] = &updated
+	c.setMetaLocked(remotePath, &updated)
 	c.mu.Unlock()
 	return nil
 }
@@ -764,7 +824,7 @@ func (c *WriteBackCache) MarkChmodPending(remotePath string, generation uint64) 
 
 	c.mu.Lock()
 	cp := updated
-	c.metas[remotePath] = &cp
+	c.setMetaLocked(remotePath, &cp)
 	c.mu.Unlock()
 	return true, nil
 }
@@ -801,7 +861,7 @@ func (c *WriteBackCache) MarkSupersedesPendingGen(remotePath string, supersedesG
 
 	c.mu.Lock()
 	cp := updated
-	c.metas[remotePath] = &cp
+	c.setMetaLocked(remotePath, &cp)
 	c.mu.Unlock()
 	return true
 }
@@ -837,7 +897,7 @@ func (c *WriteBackCache) MarkCacheLineage(remotePath string, lineage, expectedGe
 
 	c.mu.Lock()
 	cp := updated
-	c.metas[remotePath] = &cp
+	c.setMetaLocked(remotePath, &cp)
 	c.mu.Unlock()
 	return true
 }
@@ -897,9 +957,9 @@ func (c *WriteBackCache) RenamePending(oldPath, newPath string) bool {
 
 	// Remove old meta and update index.
 	_ = os.Remove(oldMeta)
-	delete(c.metas, oldPath)
+	c.deleteMetaLocked(oldPath)
 	cp := updated
-	c.metas[newPath] = &cp
+	c.setMetaLocked(newPath, &cp)
 	if data, ok := c.data[oldPath]; ok {
 		c.deleteDataLocked(oldPath)
 		c.deleteDataLocked(newPath)
@@ -943,15 +1003,13 @@ func (c *WriteBackCache) PendingSummary() (count int, bytes int64, firstPath str
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	count = len(c.metas)
+	bytes = c.totalBytes
 	for path, meta := range c.metas {
-		if meta == nil {
-			continue
-		}
-		if firstPath == "" {
+		if meta != nil {
 			firstPath = path
+			break
 		}
-		count++
-		bytes += meta.Size
 	}
 	return count, bytes, firstPath
 }
@@ -1023,7 +1081,7 @@ func (c *WriteBackCache) ListPending() []PendingEntry {
 			}
 			if _, ok := c.metas[meta.Path]; !ok {
 				cp := meta
-				c.metas[meta.Path] = &cp
+				c.setMetaLocked(meta.Path, &cp)
 				if meta.Generation > c.nextGen.Load() {
 					c.nextGen.Store(meta.Generation)
 				}
@@ -1095,7 +1153,7 @@ func (c *WriteBackCache) ListPendingMetas() []WriteBackMeta {
 			}
 			if _, ok := c.metas[meta.Path]; !ok {
 				cp := meta
-				c.metas[meta.Path] = &cp
+				c.setMetaLocked(meta.Path, &cp)
 				if meta.Generation > c.nextGen.Load() {
 					c.nextGen.Store(meta.Generation)
 				}
@@ -1234,7 +1292,21 @@ func (c *WriteBackCache) putWithBaseRevAndModeAndLineage(remotePath string, data
 	// Phase 3: publish in-memory state under global lock (fast, no I/O).
 	c.mu.Lock()
 	cp := meta
-	c.metas[remotePath] = &cp
+	c.setMetaLocked(remotePath, &cp)
+	if syncMode == wbSyncNone {
+		if c.unsynced == nil {
+			c.unsynced = make(map[string]uint64)
+		}
+		c.unsynced[remotePath] = gen
+	} else {
+		delete(c.unsynced, remotePath)
+		for {
+			cur := c.durableGen.Load()
+			if gen <= cur || c.durableGen.CompareAndSwap(cur, gen) {
+				break
+			}
+		}
+	}
 	c.cacheDataLocked(remotePath, data, size)
 	c.mu.Unlock()
 
@@ -1242,12 +1314,110 @@ func (c *WriteBackCache) putWithBaseRevAndModeAndLineage(remotePath string, data
 	return gen, t, nil
 }
 
+// DurableGeneration reports the highest cache generation guaranteed synced to disk.
+func (c *WriteBackCache) DurableGeneration() uint64 {
+	if c == nil {
+		return 0
+	}
+	return c.durableGen.Load()
+}
+
+// SyncPending flushes all wbSyncNone entries currently awaiting disk sync.
+func (c *WriteBackCache) SyncPending() error {
+	if c == nil {
+		return nil
+	}
+	c.syncMu.Lock()
+	defer c.syncMu.Unlock()
+
+	c.mu.Lock()
+	if len(c.unsynced) == 0 {
+		c.mu.Unlock()
+		return nil
+	}
+	snapshot := make(map[string]uint64, len(c.unsynced))
+	var maxGen uint64
+	for p, g := range c.unsynced {
+		snapshot[p] = g
+		if g > maxGen {
+			maxGen = g
+		}
+	}
+	c.mu.Unlock()
+
+	if err := syncFilesystemDir(c.dir); err != nil {
+		if !errors.Is(err, errSyncfsUnsupported) {
+			return err
+		}
+		for p := range snapshot {
+			if err := syncExistingFile(c.DatFile(p)); err != nil {
+				return err
+			}
+			if err := syncExistingFile(c.MetaFile(p)); err != nil {
+				return err
+			}
+		}
+		if err := fsyncDir(c.dir); err != nil {
+			return err
+		}
+	}
+
+	c.mu.Lock()
+	for p, g := range snapshot {
+		if cur, ok := c.unsynced[p]; ok && cur <= g {
+			delete(c.unsynced, p)
+		}
+	}
+	for {
+		cur := c.durableGen.Load()
+		if maxGen <= cur || c.durableGen.CompareAndSwap(cur, maxGen) {
+			break
+		}
+	}
+	c.mu.Unlock()
+	return nil
+}
+
+// SyncLoop periodically calls SyncPending to bound the power-loss window of
+// lazy-staged small-file entries (--writeback-sync-window).
+func (c *WriteBackCache) SyncLoop(ctx context.Context, interval time.Duration) {
+	if c == nil || interval <= 0 {
+		return
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			_ = c.SyncPending()
+		}
+	}
+}
+
+func syncExistingFile(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	err = f.Sync()
+	_ = f.Close()
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}
+
 func (c *WriteBackCache) pruneEntryLocked(remotePath string, removeDataFile bool) {
 	if removeDataFile {
 		_ = os.Remove(c.DatFile(remotePath))
 	}
 	_ = os.Remove(c.MetaFile(remotePath))
-	delete(c.metas, remotePath)
+	c.deleteMetaLocked(remotePath)
 	c.deleteDataLocked(remotePath)
 }
 

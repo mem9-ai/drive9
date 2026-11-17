@@ -382,7 +382,7 @@ func TestCommitQueueBatchWriteFallsBackWhenUnsupported(t *testing.T) {
 		t.Fatal(err)
 	}
 	type stagingGen struct {
-		shadow  uint64
+		shadow  staging.ContentGen
 		pending uint64
 	}
 	gens := make(map[string]stagingGen)
@@ -459,7 +459,7 @@ func TestCommitQueueBatchWriteFallsBackPerItemConflict(t *testing.T) {
 		t.Fatal(err)
 	}
 	type stagingGen struct {
-		shadow  uint64
+		shadow  staging.ContentGen
 		pending uint64
 	}
 	gens := make(map[string]stagingGen)

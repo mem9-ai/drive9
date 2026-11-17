@@ -95,6 +95,8 @@ func (a Attr) IsSymlink() bool { return a.Kind == KindSymlink }
 type Entry struct {
 	Name string
 	Attr Attr
+	// ExtentIno pins the extent-plane inode for a listing row.
+	ExtentIno uint64
 	// Ino pins the FUSE inode a directory snapshot resolved the entry to.
 	// Zero = unresolved; the consumer resolves it (the facade fills it in
 	// when a listing snapshot is taken). A pinned inode keeps every
@@ -292,6 +294,7 @@ type Op struct {
 	Name    string   // xattr name for Op{Get,Set,Remove}Xattr
 	Mask    uint32   // OpAccess mask
 	Fh2     uint64   // destination handle identity for OpCopyFileRange
+	Handle2 any      // destination handle token for OpCopyFileRange
 	Offset2 int64    // OpCopyFileRange destination offset
 	Lock    FileLock // OpGetLk / OpSetLk / OpSetLkw payload
 }

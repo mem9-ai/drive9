@@ -20,7 +20,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/mem9-ai/drive9/pkg/extent"
 	"github.com/mem9-ai/drive9/pkg/tagutil"
 )
 
@@ -46,9 +45,6 @@ type Client struct {
 	// raced with concurrent uploads.
 	statusMax    atomic.Int64 // tenant max_upload_bytes from /v1/status; 0 if unavailable
 	statusInline atomic.Int64 // server inline_threshold from /v1/status; 0 if unavailable
-
-	extentMu sync.Mutex
-	extentRT *extent.Runtime
 }
 
 // tenantStatusResponse mirrors the server's TenantStatusResponse JSON shape.
@@ -70,6 +66,12 @@ type StorageCapabilities struct {
 	// BatchWriteModeV1 promises atomic content+mode create, owner-only mode
 	// authorization, and the definite-rejection contract on BatchWriteResult.
 	BatchWriteModeV1 bool `json:"batch_write_mode_v1"`
+	// CompletionIdentityV1 promises that create and V2 upload-complete
+	// responses echo `resource_id` — the identity of the object the operation
+	// actually published. A caller that must bind later writes to that object
+	// checks this BEFORE publishing: without it, a successful publication
+	// leaves no attributable identity and no safe inference.
+	CompletionIdentityV1 bool `json:"completion_identity_v1"`
 }
 
 // MigrationCapabilities is the bounded Server contract. A missing object
@@ -201,6 +203,9 @@ func newClient(baseURL, credential string) *Client {
 	}
 	transport.MaxIdleConns = 256
 	transport.MaxIdleConnsPerHost = 64
+	transport.TLSHandshakeTimeout = 15 * time.Second
+	transport.ResponseHeaderTimeout = 60 * time.Second
+	transport.IdleConnTimeout = 90 * time.Second
 
 	// Custom DialContext: fall back to public DNS (8.8.8.8, 1.1.1.1) when the
 	// system resolver fails. Fixes DNS on Termux and minimal containers that
@@ -619,6 +624,31 @@ func (c *Client) CachedBatchWriteModeSupported() bool {
 	return body != nil && body.StorageCapabilities != nil && body.StorageCapabilities.BatchWriteModeV1
 }
 
+// WarmCompletionIdentity fetches the tenant status (bounded by ctx) so a
+// later CachedCompletionIdentitySupported reflects the server's advertised
+// contract. Callers that must decide BEFORE publishing use this: an
+// un-warmed cache reads as "unsupported" and would refuse on a capable
+// server.
+func (c *Client) WarmCompletionIdentity(ctx context.Context) bool {
+	if c == nil {
+		return false
+	}
+	c.ensureTenantStatus(ctx)
+	return c.CachedCompletionIdentitySupported()
+}
+
+// CachedCompletionIdentitySupported reports the negotiated completion-identity
+// contract without I/O. Missing, failed or older status responses disable it,
+// so a caller that requires an attributable identity treats "unknown" exactly
+// like "absent" — the safe side.
+func (c *Client) CachedCompletionIdentitySupported() bool {
+	if c == nil {
+		return false
+	}
+	body := c.statusBody.Load()
+	return body != nil && body.StorageCapabilities != nil && body.StorageCapabilities.CompletionIdentityV1
+}
+
 // ensureTenantStatus is the compatibility warm path. Legacy getters
 // intentionally ignore the concrete error and keep their zero-value fallback;
 // Migration preflight uses tenantStatus directly and never ignores failures.
@@ -839,28 +869,77 @@ func (c *Client) CreateFile(path string) (int64, error) {
 // CreateFileCtx creates an empty file with context support and returns the
 // committed file revision when the server reports it.
 func (c *Client) CreateFileCtx(ctx context.Context, path string) (int64, error) {
+	rev, _, err := c.CreateFileCreatedCtx(ctx, path)
+	return rev, err
+}
+
+// CreateFileCreatedCtx also reports the identity of the object the create
+// produced, when the server echoes one. That echo is the ONLY attributable
+// proof of ownership for an absence-CAS create: a follow-up stat is a
+// separate request and may describe a replacement that took the pathname in
+// between, so binding its answer would let this descriptor write into a
+// stranger's file. Servers that predate the echo leave it empty.
+func (c *Client) CreateFileCreatedCtx(ctx context.Context, path string) (int64, string, error) {
 	req, err := c.newFSRequest(ctx, http.MethodPost, path, "?create=1", nil)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	resp, err := c.do(req)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
-		return 0, readError(resp)
+		return 0, "", readError(resp)
 	}
 	var result struct {
-		Revision int64 `json:"revision"`
+		Revision   int64  `json:"revision"`
+		ResourceID string `json:"resource_id"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		if errors.Is(err, io.EOF) {
-			return 0, nil
+			return 0, "", nil
 		}
-		return 0, fmt.Errorf("decode create file response: %w", err)
+		return 0, "", fmt.Errorf("decode create file response: %w", err)
 	}
-	return result.Revision, nil
+	return result.Revision, result.ResourceID, nil
+}
+
+// CreateExtentFileCreatedCtx creates an empty file requesting native extent
+// layout (`POST ?create=1&layout=extent`). It returns nativeExtent=true when
+// the server echoes `content_layout == "extent"`. Against older servers that
+// reject `?layout=extent` (e.g. scoped query allowlist) or ignore it, it
+// falls back to `?create=1` with nativeExtent=false so the caller can track a
+// 0-byte placeholder and upgrade it on first write.
+func (c *Client) CreateExtentFileCreatedCtx(ctx context.Context, path string) (rev int64, resourceID string, nativeExtent bool, err error) {
+	req, err := c.newFSRequest(ctx, http.MethodPost, path, "?create=1&layout=extent", nil)
+	if err != nil {
+		return 0, "", false, err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return 0, "", false, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusForbidden {
+		rev, id, ferr := c.CreateFileCreatedCtx(ctx, path)
+		return rev, id, false, ferr
+	}
+	if resp.StatusCode >= 300 {
+		return 0, "", false, readError(resp)
+	}
+	var result struct {
+		Revision      int64  `json:"revision"`
+		ResourceID    string `json:"resource_id"`
+		ContentLayout string `json:"content_layout"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		if errors.Is(err, io.EOF) {
+			return 0, "", false, nil
+		}
+		return 0, "", false, fmt.Errorf("decode create extent file response: %w", err)
+	}
+	return result.Revision, result.ResourceID, ContentLayout(result.ContentLayout) == ContentLayoutExtent, nil
 }
 
 // Symlink creates a symbolic link at linkPath pointing to target.
@@ -925,6 +1004,12 @@ func (c *Client) writeCtxConditionalFull(ctx context.Context, path string, data 
 	if expectedRevision >= 0 {
 		req.Header.Set("X-Dat9-Expected-Revision", strconv.FormatInt(expectedRevision, 10))
 	}
+	if id := expectedResourceOf(ctx); id != "" {
+		// The identity precondition rides EVERY bound publication route,
+		// direct PUT included, and INDEPENDENTLY of the numeric revision
+		// CAS (a bound call with -1 still binds).
+		req.Header.Set("X-Dat9-Expected-Resource", id)
+	}
 	if err := setTagHeaders(req, tags); err != nil {
 		return 0, err
 	}
@@ -940,6 +1025,11 @@ func (c *Client) writeCtxConditionalFull(ctx context.Context, path string, data 
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
+		if resp.StatusCode == http.StatusPreconditionFailed && expectedResourceOf(ctx) != "" {
+			// Identity refusal (not an ordinary revision conflict): the
+			// path's occupant is not the bound object.
+			return 0, fmt.Errorf("%s: %w", path, ErrResourceMismatch)
+		}
 		err := readError(resp)
 		if expectedRevision >= 0 {
 			err = markCommitAttempt(err)
@@ -953,6 +1043,15 @@ func (c *Client) writeCtxConditionalFull(ctx context.Context, path string, data 
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		// If response doesn't contain revision (old server), return 0.
 		return 0, nil
+	}
+	// Publish the revision to a bound sink: the direct-PUT path is a
+	// publication like the V2 completion, and callers that must attribute a
+	// revision to exactly this write (the extent meta layer's CAS base)
+	// cannot rely on a follow-up Stat, which may observe a later writer.
+	if result.Revision > 0 {
+		if out := completedRevisionSinkOf(ctx); out != nil {
+			*out = result.Revision
+		}
 	}
 	return result.Revision, nil
 }
@@ -1260,6 +1359,15 @@ func (c *Client) Stat(path string) (*StatResult, error) {
 //
 // StatCtx is the context-aware form of the lightweight HEAD-based Stat
 // interface. Use StatMetadataCompatCtx when enriched metadata is required.
+// StatResourceID stats a path for its resource identity only.
+func (c *Client) StatResourceID(ctx context.Context, path string) (string, error) {
+	st, err := c.StatCtx(ctx, path)
+	if err != nil {
+		return "", err
+	}
+	return st.ResourceID, nil
+}
+
 func (c *Client) StatCtx(ctx context.Context, path string) (*StatResult, error) {
 	req, err := c.newFSRequest(ctx, http.MethodHead, path, "", nil)
 	if err != nil {
@@ -1409,6 +1517,31 @@ func (c *Client) DeleteCtx(ctx context.Context, path string) error {
 // DeleteFileCtx removes a file with a server-side type hint.
 func (c *Client) DeleteFileCtx(ctx context.Context, path string) error {
 	return c.deleteCtx(ctx, path, false, "file")
+}
+
+// DeleteFileConditionalCtx removes a regular file (?kind=file, never recursive)
+// carrying optional revision and resource-identity preconditions.
+func (c *Client) DeleteFileConditionalCtx(ctx context.Context, path string, expectedRev int64, expectedResourceID string) error {
+	req, err := c.newFSRequest(ctx, http.MethodDelete, path, "?kind=file", nil)
+	if err != nil {
+		return err
+	}
+	if expectedRev > 0 {
+		req.Header.Set("X-Dat9-Expected-Revision", strconv.FormatInt(expectedRev, 10))
+	}
+	if expectedResourceID != "" {
+		req.Header.Set("X-Dat9-Expected-Resource", expectedResourceID)
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 400 {
+		return readError(resp)
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxDeleteSuccessBodyBytes))
+	return nil
 }
 
 // DeleteDirCtx removes an empty directory with a server-side type hint.
