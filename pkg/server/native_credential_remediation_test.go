@@ -580,3 +580,49 @@ func TestNativeCredentialRemediationRecoversFromUnpersistedRotation(t *testing.T
 		t.Fatalf("recorded credential state = %d, want remediated", state)
 	}
 }
+
+// A tenant that stopped between finalization and activation resumes finalization with the
+// restricted account and its derived password already stored. That call cannot verify a
+// grant this server already revoked, so it must not downgrade the recorded remediation —
+// otherwise a tenant that is fine gets flagged on every following pass.
+func TestFinalizeKeepsRecordedRemediationWhenUnverified(t *testing.T) {
+	rt := newObjectGCTestRuntime(t)
+	ctx := context.Background()
+	const tenantID = "native-refinalize"
+	const password = "derived-pass"
+	rt.insertRemediationTenantWithPassword(t, tenantID, tenant.ProviderTiDBCloudNative, "t9.tdc_fs_sys", password)
+	if err := rt.meta.SetTenantCredentialState(ctx, tenantID, meta.TenantCredentialRemediated, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := &Server{
+		meta: rt.meta,
+		pool: rt.pool,
+		provisioner: &fakeProvisioner{
+			provider:             tenant.ProviderTiDBCloudNative,
+			systemUsername:       "t9.tdc_fs_sys",
+			systemPassword:       password,
+			systemUserUnverified: true,
+		},
+	}
+	dsn := tenantDSN("t9.tdc_fs_sys", password, rt.dbHost, rt.dbPort, rt.dbName, false, tenant.ProviderTiDBCloudNative)
+	if err := srv.finalizeTenantSchemaInit(ctx, tenantID, dsn, tenant.ProviderTiDBCloudNative); err != nil {
+		t.Fatalf("refinalize: %v", err)
+	}
+
+	state, reason, err := rt.meta.TenantCredentialState(ctx, tenantID)
+	if err != nil {
+		t.Fatalf("read recorded credential state: %v", err)
+	}
+	if state != meta.TenantCredentialRemediated {
+		t.Fatalf("recorded credential state = %d/%q, want the remediation preserved", state, reason)
+	}
+	if got := rt.tenantCredential(t, tenantID); got != password {
+		t.Fatalf("stored credential = %q, want %q", got, password)
+	}
+	// And the pass still skips it, which is what the preserved marker buys.
+	srv.remediateNativeTenantCredentials(ctx)
+	if srv.nativeCredentialRemediationBackoff(tenantID) {
+		t.Fatal("a remediated tenant was dialled again after refinalization")
+	}
+}

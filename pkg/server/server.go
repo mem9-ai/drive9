@@ -6333,8 +6333,22 @@ func (s *Server) finalizeTenantSchemaInit(ctx context.Context, tenantID, tenantD
 		// The account is operator-managed, so this call changed nothing and cannot vouch for
 		// the grant. Recording that here keeps a later pass from treating the tenant either
 		// as remediated or as something it can fix.
-		update.State = meta.TenantCredentialReviewRequired
-		update.StateReason = "finalization could not verify the legacy grant: stored credential is not root-equivalent"
+		//
+		// Unless it was already remediated: a tenant that stopped mid-provisioning resumes
+		// finalization with exactly this shape — the restricted account and its derived
+		// password — and no root credential to re-verify a grant this server already revoked.
+		// Downgrading that record would flag a tenant that is fine on every following pass,
+		// so an existing remediation wins over a probe that cannot see it.
+		recorded, _, err := s.meta.TenantCredentialState(ctx, tenantID)
+		switch {
+		case err == nil && recorded == meta.TenantCredentialRemediated:
+			// Leave State unset: the update writes no state, so the recorded outcome stands.
+		case err == nil, errors.Is(err, meta.ErrNotFound):
+			update.State = meta.TenantCredentialReviewRequired
+			update.StateReason = "finalization could not verify the legacy grant: stored credential is not root-equivalent"
+		default:
+			return fmt.Errorf("read native tenant credential state: %w", err)
+		}
 	}
 	updated, err := s.meta.UpdateTenantDBCredentialIf(ctx, tenantID, update)
 	if err != nil {
