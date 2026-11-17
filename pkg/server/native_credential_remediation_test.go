@@ -96,6 +96,16 @@ func TestNativeCredentialRemediationScanPagesAndClassifies(t *testing.T) {
 	// A suspended tenant keeps its grant too, and is now behind its own cursor in a
 	// later pass, so the retry only appears if that pass reads suspended records.
 	rt.insertRemediationTenantAt(t, meta.TenantSuspended, "native-suspended", tenant.ProviderTiDBCloudNative, "t4.tdc_fs_sys", rt.dbPass, "127.0.0.1", 1)
+	// Recorded outcomes are authoritative: neither is dialled, so neither can schedule a
+	// retry from a closed port.
+	rt.insertRemediationTenantAt(t, meta.TenantActive, "native-review", tenant.ProviderTiDBCloudNative, "t5.tdc_fs_sys", rt.dbPass, "127.0.0.1", 1)
+	if err := rt.meta.SetTenantCredentialState(ctx, "native-review", meta.TenantCredentialReviewRequired, "legacy grant unverifiable"); err != nil {
+		t.Fatal(err)
+	}
+	rt.insertRemediationTenantAt(t, meta.TenantActive, "native-remediated", tenant.ProviderTiDBCloudNative, "t6.tdc_fs_sys", rt.dbPass, "127.0.0.1", 1)
+	if err := rt.meta.SetTenantCredentialState(ctx, "native-remediated", meta.TenantCredentialRemediated, ""); err != nil {
+		t.Fatal(err)
+	}
 
 	srv := &Server{meta: rt.meta, pool: rt.pool}
 	srv.remediateNativeTenantCredentials(ctx)
@@ -109,7 +119,7 @@ func TestNativeCredentialRemediationScanPagesAndClassifies(t *testing.T) {
 	if !srv.nativeCredentialRemediationBackoff("native-suspended") {
 		t.Fatal("a suspended tenant was not scanned")
 	}
-	for _, id := range []string{"tidb-zero", "native-root"} {
+	for _, id := range []string{"tidb-zero", "native-root", "native-review", "native-remediated"} {
 		if srv.nativeCredentialRemediationBackoff(id) {
 			t.Fatalf("skipped tenant %s scheduled a retry", id)
 		}
@@ -241,6 +251,75 @@ func TestNativeCredentialRemediationRotatesLegacyCredential(t *testing.T) {
 	}
 	if err := pingAs(t, rt, tenantUser, rotated); err != nil {
 		t.Fatalf("the persisted credential does not authenticate: %v", err)
+	}
+	// The outcome is recorded, so the next leader does not dial this tenant again.
+	state, _, err := rt.meta.TenantCredentialState(ctx, "native-revocable")
+	if err != nil {
+		t.Fatalf("read recorded credential state: %v", err)
+	}
+	if state != meta.TenantCredentialRemediated {
+		t.Fatalf("recorded credential state = %d, want remediated", state)
+	}
+}
+
+// A tenant whose stored credential no longer authenticates as the cluster root cannot have
+// its legacy grant checked or revoked from here. That is recorded as "still possibly
+// exposed", never as remediated, so an operator sees it instead of a silent pass.
+func TestNativeCredentialRemediationRecordsUnverifiableTenant(t *testing.T) {
+	rt := newObjectGCTestRuntime(t)
+	if rt.dbUser != "root" {
+		t.Skip("needs the test TiDB root account to create the tenant principals")
+	}
+	ctx := context.Background()
+	admin, err := sql.Open("mysql", testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = admin.Close() })
+
+	prefix := "tu" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	rootUser := prefix + ".root"
+	tenantUser := prefix + ".tdc_fs_sys"
+	t.Cleanup(func() {
+		ctx := context.Background()
+		for _, user := range []string{rootUser, tenantUser} {
+			if _, err := admin.ExecContext(ctx, "DROP USER IF EXISTS '"+user+"'@'%'"); err != nil {
+				t.Errorf("cleanup: drop %s: %v", user, err)
+			}
+		}
+	})
+	// The tenant account exists with a password the root principal does not share, which is
+	// exactly the state an operator rotation leaves behind.
+	for _, stmt := range []string{
+		"CREATE USER '" + rootUser + "'@'%' IDENTIFIED BY 'root-only-password'",
+		"CREATE USER '" + tenantUser + "'@'%' IDENTIFIED BY 'operator-set-password'",
+	} {
+		if _, err := admin.ExecContext(ctx, stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	rt.insertRemediationTenantWithPassword(t, "native-unverifiable", tenant.ProviderTiDBCloudNative, tenantUser, "operator-set-password")
+
+	srv := &Server{meta: rt.meta, pool: rt.pool}
+	srv.remediateNativeTenantCredentials(ctx)
+
+	state, reason, err := rt.meta.TenantCredentialState(ctx, "native-unverifiable")
+	if err != nil {
+		t.Fatalf("read recorded credential state: %v", err)
+	}
+	if state != meta.TenantCredentialReviewRequired {
+		t.Fatalf("recorded credential state = %d, want review required", state)
+	}
+	if !strings.Contains(reason, "root-equivalent") {
+		t.Fatalf("review reason = %q, want the reason the grant could not be verified", reason)
+	}
+	if srv.nativeCredentialRemediationBackoff("native-unverifiable") {
+		t.Fatal("a recorded review state scheduled a retry")
+	}
+	// The stored credential is untouched: the pass must not invent a rotation it could not
+	// perform.
+	if got := rt.tenantCredential(t, "native-unverifiable"); got != "operator-set-password" {
+		t.Fatalf("stored credential = %q, want the operator-set password unchanged", got)
 	}
 }
 

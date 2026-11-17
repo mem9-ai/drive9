@@ -6321,6 +6321,12 @@ func (s *Server) finalizeTenantSchemaInit(ctx context.Context, tenantID, tenantD
 	if err != nil {
 		return fmt.Errorf("persist native system user credential: %w", err)
 	}
+	// Finalization always sets the derived credential and runs the setup that revokes the
+	// legacy grant, so record the outcome: without the marker a later remediation pass would
+	// find a non-root credential and record the tenant for manual review on every leader.
+	if err := s.meta.SetTenantCredentialState(ctx, tenantID, meta.TenantCredentialRemediated, ""); err != nil {
+		return fmt.Errorf("record native tenant credential state: %w", err)
+	}
 	if !updated {
 		logger.Info(ctx, "native_system_user_credential_update_skipped",
 			zap.String("tenant_id", tenantID),

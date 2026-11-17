@@ -2086,3 +2086,41 @@ func TestIsSafeModifyColumnRepairSQLRejectsOtherCases(t *testing.T) {
 		}
 	}
 }
+
+// The remediation records its outcome so a later pass neither re-dials a remediated tenant
+// nor silently claims one it could not verify.
+func TestTenantCredentialStateRoundTrips(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	if _, _, err := s.TenantCredentialState(ctx, "credential-state-tenant"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("state for an unknown tenant = %v, want ErrNotFound", err)
+	}
+	if err := s.SetTenantCredentialState(ctx, "credential-state-tenant", TenantCredentialReviewRequired, "legacy grant unverifiable"); err != nil {
+		t.Fatal(err)
+	}
+	state, reason, err := s.TenantCredentialState(ctx, "credential-state-tenant")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state != TenantCredentialReviewRequired || reason != "legacy grant unverifiable" {
+		t.Fatalf("state = %d/%q, want the review marker", state, reason)
+	}
+	// A later successful remediation overwrites the marker rather than adding a row.
+	if err := s.SetTenantCredentialState(ctx, "credential-state-tenant", TenantCredentialRemediated, ""); err != nil {
+		t.Fatal(err)
+	}
+	state, reason, err = s.TenantCredentialState(ctx, "credential-state-tenant")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state != TenantCredentialRemediated || reason != "" {
+		t.Fatalf("state = %d/%q, want remediated", state, reason)
+	}
+	var rows int
+	if err := s.DB().QueryRow("SELECT COUNT(*) FROM tenant_credential_state WHERE tenant_id = ?", "credential-state-tenant").Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 1 {
+		t.Fatalf("state rows = %d, want one", rows)
+	}
+}

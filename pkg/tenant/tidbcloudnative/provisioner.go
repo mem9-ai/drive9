@@ -543,6 +543,12 @@ func rotateLegacySystemUser(ctx context.Context, cfg *mysql.Config, username, db
 	return true, nil
 }
 
+// ErrLegacyGrantUnverifiable means the stored credential no longer authenticates as the
+// cluster root, so this server cannot check or revoke the legacy cluster-wide grant. It is
+// reported instead of a silently skipped remediation: the caller has to record the tenant as
+// possibly exposed rather than claim it was fixed.
+var ErrLegacyGrantUnverifiable = errors.New("legacy tenant grant cannot be verified: stored credential is not root-equivalent")
+
 // RotateLegacySystemUserCredential moves an already-provisioned restricted tenant account
 // off the cluster root password, and strips the legacy cluster-wide grant while it has root
 // access. It returns the new password and true only when it actually rotated the account.
@@ -577,8 +583,11 @@ func RotateLegacySystemUserCredential(ctx context.Context, dsn, tenantID string)
 	}
 	password := deriveSystemUserPassword(cfg.Passwd, tenantID)
 	rotated, err := rotateLegacySystemUser(ctx, cfg, username, dbName, password)
-	if err != nil || !rotated {
+	if err != nil {
 		return "", false, err
+	}
+	if !rotated {
+		return "", false, ErrLegacyGrantUnverifiable
 	}
 	return password, true, nil
 }

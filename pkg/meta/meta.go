@@ -578,6 +578,22 @@ func metaInitSchemaStatements() []string {
 			INDEX idx_tenant_namespace (storage_namespace_id, kind, status),
 			INDEX idx_tenant_parent (parent_tenant_id)
 		)`,
+		// tenant_credential_state records what the native credential remediation did
+		// for a tenant, so a later pass does not have to re-derive it from a connection
+		// it may no longer be able to make.
+		//
+		// state 1 means this server rotated the restricted account off the cluster root
+		// password and revoked the legacy cluster-wide grant in the same setup. state 2
+		// means the stored credential could not verify either: the account no longer
+		// authenticates as the cluster root, so the grant cannot be checked or revoked
+		// from here and an operator has to look. Absent means the tenant has never been
+		// remediated.
+		`CREATE TABLE IF NOT EXISTS tenant_credential_state (
+			tenant_id  VARCHAR(64) PRIMARY KEY,
+			state      TINYINT UNSIGNED NOT NULL,
+			reason     VARCHAR(255) NOT NULL DEFAULT '',
+			updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
+		)`,
 		`CREATE TABLE IF NOT EXISTS tenant_auto_embedding_profiles (
 			tenant_id      VARCHAR(64) PRIMARY KEY,
 			embedding_mode VARCHAR(32) NULL,
@@ -3544,6 +3560,51 @@ func (s *Store) ClearTenantProvisionMetadata(ctx context.Context, tenantID strin
 	}
 	s.apiKeys.evictTenant(tenantID)
 	return nil
+}
+
+// TenantCredentialState is what the native credential remediation recorded for a tenant.
+type TenantCredentialState int
+
+const (
+	// TenantCredentialRemediated means this server rotated the restricted account off the
+	// cluster root password and revoked the legacy cluster-wide grant in the same setup.
+	TenantCredentialRemediated TenantCredentialState = 1
+	// TenantCredentialReviewRequired means the stored credential neither authenticated as
+	// the cluster root nor proved the grant was gone, so the tenant is recorded as still
+	// possibly exposed instead of being claimed as remediated.
+	TenantCredentialReviewRequired TenantCredentialState = 2
+)
+
+// SetTenantCredentialState records the outcome of a native credential remediation. Unset
+// (no row) means the tenant has never been remediated, which is what makes the leader pass
+// pick it up.
+func (s *Store) SetTenantCredentialState(ctx context.Context, tenantID string, state TenantCredentialState, reason string) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "set_tenant_credential_state", start, &err)
+	if strings.TrimSpace(tenantID) == "" {
+		return fmt.Errorf("tenant id is required")
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT INTO tenant_credential_state (tenant_id, state, reason)
+		VALUES (?, ?, ?)
+		ON DUPLICATE KEY UPDATE state = VALUES(state), reason = VALUES(reason)`,
+		tenantID, int(state), reason)
+	return err
+}
+
+// TenantCredentialState returns the recorded remediation state, or ErrNotFound when the
+// tenant has none.
+func (s *Store) TenantCredentialState(ctx context.Context, tenantID string) (state TenantCredentialState, reason string, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "tenant_credential_state", start, &err)
+	var raw int
+	row := s.db.QueryRowContext(ctx, `SELECT state, reason FROM tenant_credential_state WHERE tenant_id = ?`, tenantID)
+	if err = row.Scan(&raw, &reason); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, "", ErrNotFound
+		}
+		return 0, "", err
+	}
+	return TenantCredentialState(raw), reason, nil
 }
 
 // UpdateTenantDBCredentialIf replaces a tenant's database credential when the row still

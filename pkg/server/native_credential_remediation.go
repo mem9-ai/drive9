@@ -59,7 +59,7 @@ func (s *Server) remediateNativeTenantCredentials(ctx context.Context) {
 	// deployment outlives a provider switch, and the per-tenant check below decides
 	// from the stored record. The remediation itself only needs the tenant's own
 	// DSN and password.
-	remediated, skipped, failed := 0, 0, 0
+	remediated, skipped, failed, reviewRequired := 0, 0, 0, 0
 	// No cluster-level dedupe: the revoke is cluster-global, but the credential rotation is
 	// per account, so every tenant needs its own connection at least once. Steady state is
 	// bounded by the per-tenant memo below instead (one dial per tenant per recheck window).
@@ -103,6 +103,8 @@ func (s *Server) remediateNativeTenantCredentials(ctx context.Context) {
 					skipped++
 				case nativeCredentialRemediationFailed:
 					failed++
+				case nativeCredentialRemediationReviewRequired:
+					reviewRequired++
 				}
 			}
 			last := page[len(page)-1]
@@ -112,9 +114,10 @@ func (s *Server) remediateNativeTenantCredentials(ctx context.Context) {
 			}
 		}
 	}
-	if remediated > 0 || failed > 0 {
+	if remediated > 0 || failed > 0 || reviewRequired > 0 {
 		logger.Info(ctx, "native_credential_remediation_complete",
-			zap.Int("remediated", remediated), zap.Int("skipped", skipped), zap.Int("failed", failed))
+			zap.Int("remediated", remediated), zap.Int("skipped", skipped), zap.Int("failed", failed),
+			zap.Int("review_required", reviewRequired))
 	}
 }
 
@@ -124,6 +127,10 @@ const (
 	nativeCredentialRemediationSkipped nativeCredentialRemediationResult = iota
 	nativeCredentialRemediationDone
 	nativeCredentialRemediationFailed
+	// nativeCredentialRemediationReviewRequired means the tenant was recorded as still
+	// possibly exposed instead of being claimed as remediated. It is reported separately so
+	// the pass's log distinguishes "nothing to do" from "someone has to look".
+	nativeCredentialRemediationReviewRequired
 )
 
 // nativeCredentialRemediationEligible reports whether a tenant's stored record can carry the
@@ -136,6 +143,26 @@ func nativeCredentialRemediationEligible(t *meta.Tenant) bool {
 
 func (s *Server) remediateNativeTenantCredentialFor(ctx context.Context, t *meta.Tenant) nativeCredentialRemediationResult {
 	if !nativeCredentialRemediationEligible(t) {
+		return nativeCredentialRemediationSkipped
+	}
+	// A recorded outcome is authoritative: a remediated tenant needs no connection, and a
+	// tenant awaiting review must not be retried as if a retry could fix it. Both are read
+	// from the control plane so a restart or another leader does not re-dial them.
+	if state, _, err := s.meta.TenantCredentialState(ctx, t.ID); err != nil {
+		if !errors.Is(err, meta.ErrNotFound) {
+			logger.Warn(ctx, "native_credential_state_read_failed", zap.String("tenant_id", t.ID), zap.Error(err))
+			s.recordNativeCredentialRemediationFailure(t.ID)
+			return nativeCredentialRemediationFailed
+		}
+	} else {
+		if state == meta.TenantCredentialReviewRequired {
+			logger.Warn(ctx, "native_credential_review_required",
+				zap.String("tenant_id", t.ID),
+				zap.String("detail", "stored credential does not authenticate as the cluster root, so the legacy cluster-wide grant could not be verified or revoked from here"),
+				zap.Error(tidbcloudnative.ErrLegacyGrantUnverifiable))
+			metrics.RecordOperation("user_db_access", "native_credential_remediation", "review_required", 0)
+		}
+		s.markNativeCredentialRemediationDone(t.ID)
 		return nativeCredentialRemediationSkipped
 	}
 	if s.nativeCredentialRemediationRecentlyDone(t.ID) {
@@ -158,14 +185,40 @@ func (s *Server) remediateNativeTenantCredentialFor(ctx context.Context, t *meta
 	defer cancel()
 	rotatedPassword, rotated, err := tidbcloudnative.RotateLegacySystemUserCredential(remediateCtx, dsn, t.ID)
 	if err != nil {
-		if isAccessDenied(err) {
-			// The stored password no longer authenticates as the cluster root: an operator
-			// rotated the credential and owns the account now. Memoize it like a remediation
-			// so the pass stops attempting a root login against that cluster every tick, and
-			// re-check daily; one tenant cannot stall the pass meanwhile.
-			logger.Info(ctx, "native_credential_remediation_skipped_rotated", zap.String("tenant_id", t.ID))
+		if errors.Is(err, tidbcloudnative.ErrLegacyGrantUnverifiable) {
+			// The stored credential does not authenticate as the cluster root, so this server
+			// cannot check or revoke the legacy cluster-wide grant: the tenant is recorded as
+			// still possibly exposed for an operator, never as remediated. Recording it also
+			// stops the pass re-dialling a cluster it has no authority over every tick.
+			if stateErr := s.meta.SetTenantCredentialState(ctx, t.ID, meta.TenantCredentialReviewRequired,
+				"stored credential is not root-equivalent: legacy grant unverifiable"); stateErr != nil {
+				logger.Warn(ctx, "native_credential_state_write_failed", zap.String("tenant_id", t.ID), zap.Error(stateErr))
+				s.recordNativeCredentialRemediationFailure(t.ID)
+				return nativeCredentialRemediationFailed
+			}
+			logger.Warn(ctx, "native_credential_review_required",
+				zap.String("tenant_id", t.ID),
+				zap.String("detail", "stored credential does not authenticate as the cluster root, so the legacy cluster-wide grant could not be verified or revoked from here"))
+			metrics.RecordOperation("user_db_access", "native_credential_remediation", "review_required", 0)
+			s.clearNativeCredentialRemediationFailure(t.ID)
 			s.markNativeCredentialRemediationDone(t.ID)
-			return nativeCredentialRemediationSkipped
+			return nativeCredentialRemediationReviewRequired
+		}
+		if isAccessDenied(err) {
+			// A statement was refused for lack of privilege: the account is managed by an
+			// operator, and the grant state is theirs to own. Record it the same way.
+			if stateErr := s.meta.SetTenantCredentialState(ctx, t.ID, meta.TenantCredentialReviewRequired,
+				"privilege refused while remediating: tenant account is operator-managed"); stateErr != nil {
+				logger.Warn(ctx, "native_credential_state_write_failed", zap.String("tenant_id", t.ID), zap.Error(stateErr))
+				s.recordNativeCredentialRemediationFailure(t.ID)
+				return nativeCredentialRemediationFailed
+			}
+			logger.Warn(ctx, "native_credential_review_required", zap.String("tenant_id", t.ID),
+				zap.String("detail", "the tenant account is operator-managed; the legacy cluster-wide grant could not be revoked from here"))
+			metrics.RecordOperation("user_db_access", "native_credential_remediation", "review_required", 0)
+			s.clearNativeCredentialRemediationFailure(t.ID)
+			s.markNativeCredentialRemediationDone(t.ID)
+			return nativeCredentialRemediationReviewRequired
 		}
 		logger.Warn(ctx, "native_credential_remediation_failed", zap.String("tenant_id", t.ID), zap.Error(err))
 		metrics.RecordOperation("user_db_access", "native_credential_remediation", "error", 0)
@@ -188,6 +241,14 @@ func (s *Server) remediateNativeTenantCredentialFor(ctx context.Context, t *meta
 		// password, and peers are told through the outbox signal the update writes.
 		if s.pool != nil {
 			s.pool.Invalidate(t.ID)
+		}
+		if stateErr := s.meta.SetTenantCredentialState(ctx, t.ID, meta.TenantCredentialRemediated, ""); stateErr != nil {
+			// The password is rotated, so the next pass sees a non-root credential. Without
+			// the marker it would read that as unverifiable and record the tenant for review,
+			// so a failure here must stay a failure and be retried.
+			logger.Warn(ctx, "native_credential_state_write_failed", zap.String("tenant_id", t.ID), zap.Error(stateErr))
+			s.recordNativeCredentialRemediationFailure(t.ID)
+			return nativeCredentialRemediationFailed
 		}
 		logger.Info(ctx, "native_credential_rotated", zap.String("tenant_id", t.ID))
 	}
