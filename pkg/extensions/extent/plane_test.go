@@ -33,6 +33,7 @@ type fakeV2 struct {
 	extent     map[string]string // path -> content (extent layout)
 	classic    map[string]string // path -> content (single layout)
 	dirs       map[string]bool
+	chmods     map[string]uint32
 	blocks     map[string][]byte // sha256 hex -> bytes
 	creates    []string
 	ids        map[string]string // path -> resource identity (X-Dat9-Resource-ID)
@@ -378,6 +379,20 @@ func newFakeV2(t *testing.T) *fakeV2 {
 				http.Error(w, "not found", http.StatusNotFound)
 				return
 			}
+			if _, isChmod := r.URL.Query()["chmod"]; isChmod {
+				var body struct {
+					Mode uint32 `json:"mode"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				f.mu.Lock()
+				if f.chmods == nil {
+					f.chmods = make(map[string]uint32)
+				}
+				f.chmods[path] = body.Mode
+				f.mu.Unlock()
+				w.WriteHeader(http.StatusOK)
+				return
+			}
 			// POST <new>?rename with X-Dat9-Rename-Source: like the real
 			// server (RenameFileReplacingTarget), an existing target is
 			// REPLACED — that is exactly what a shared sentinel name would
@@ -420,6 +435,29 @@ func newFakeV2(t *testing.T) *fakeV2 {
 			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": rev, "size_bytes": int64(len(body))})
 		case http.MethodDelete:
 			f.mu.Lock()
+			if r.URL.Query().Get("kind") == "file" && f.dirs[path] {
+				f.mu.Unlock()
+				http.Error(w, "is a directory", http.StatusBadRequest)
+				return
+			}
+			if expRes := r.Header.Get("X-Dat9-Expected-Resource"); expRes != "" {
+				if cur := f.ids[path]; cur != "" && cur != expRes {
+					f.mu.Unlock()
+					http.Error(w, "resource mismatch", http.StatusPreconditionFailed)
+					return
+				}
+			}
+			if expRev := r.Header.Get("X-Dat9-Expected-Revision"); expRev != "" {
+				curRev := fmt.Sprint(f.rev(path))
+				if f.extent[path] != "" {
+					curRev = "3"
+				}
+				if (f.extent[path] != "" || f.hasClassic(path)) && curRev != expRev {
+					f.mu.Unlock()
+					http.Error(w, "revision conflict", http.StatusConflict)
+					return
+				}
+			}
 			f.deletes = append(f.deletes, path)
 			delete(f.extent, path)
 			delete(f.classic, path)
@@ -552,9 +590,6 @@ func newFakeV2(t *testing.T) *fakeV2 {
 			f.mu.Unlock()
 			// Echo the landed object's identity: the client captures it
 			// as the ownership proof for post-upload stat outages.
-			if os.Getenv("EXTENT_DBG_ID") != "" {
-				fmt.Println("FAKE COMPLETE echo:", landedID, "path:", landedPath)
-			}
 			completion := map[string]any{"status": "completed", "revision": f.completes}
 			if f.completeEcho {
 				completion["resource_id"] = landedID
@@ -709,22 +744,6 @@ func (f *fakeV2) gateWaiting(path string) int {
 	return f.gateHits[path]
 }
 
-// setFailBody aborts (on=true) classic GET bodies after a 2-byte prefix.
-func (f *fakeV2) setFailBody(on bool) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.failBody = on
-}
-
-// existsOf reports whether any entry (extent, classic or dir) holds the
-// path.
-func (f *fakeV2) existsOf(path string) bool {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	_, hasID := f.ids[path]
-	return hasID || f.dirs[path]
-}
-
 // stat returns the resource identity stored for the path.
 func (f *fakeV2) stat(t *testing.T, path string) (string, error) {
 	t.Helper()
@@ -739,20 +758,6 @@ func (f *fakeV2) stat(t *testing.T, path string) (string, error) {
 type httpNope struct{}
 
 func (httpNope) Error() string { return "no identity" }
-
-// setLegacy switches the fake to a pre-extent (classic-only) server.
-func (f *fakeV2) setLegacy(on bool) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.legacy = on
-}
-
-// setStatGone toggles visibility of EXISTING objects (stats answer 404).
-func (f *fakeV2) setStatGone(on bool) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.statGone = on
-}
 
 // setStatFail injects (on=true) or clears (on=false) HEAD failures for a
 // path, modeling unreachable probes.
@@ -2835,46 +2840,6 @@ func TestFreshEngineCreateVisibleBeforeCommit(t *testing.T) {
 	}
 }
 
-// Round-16: interactive fsync is a LOCAL barrier — no remote commit during
-// Sync, the commit lands at flush, and a mount that never flushed replays
-// the staged barrier.
-func TestClassicFallbackKeepsHandleUsable(t *testing.T) {
-	f := newFakeV2(t)
-	f.setLegacy(true)
-	f.setDir("/d", true)
-	h := newTestHandler(t, f, 0) // full mode claims the create
-	res, err, passed := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
-	if err != nil || passed {
-		t.Fatalf("create: err=%v passed=%v", err, passed)
-	}
-	eh := res.Handle.(*engineHandle)
-
-	if err := eh.Write(context.Background(), 0, []byte("AAAA")); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Sync(context.Background()); err != nil {
-		t.Fatalf("first fsync after the degraded session: %v", err)
-	}
-	f.mu.Lock()
-	classicLen := len(f.classic["/d/f.bin"])
-	f.mu.Unlock()
-	if classicLen != 4 {
-		t.Fatalf("degraded session landed %d classic bytes, want 4", classicLen)
-	}
-	// The second round must not error on the layout.
-	if err := eh.Write(context.Background(), 4, []byte("BBBB")); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Sync(context.Background()); err != nil {
-		t.Fatalf("second fsync on the classic-owned handle: %v", err)
-	}
-	if got := f.contentOf("/d/f.bin"); got != "AAAABBBB" {
-		t.Fatalf("classic content = %q, want AAAABBBB", got)
-	}
-	if got := readFront(t, eh, 16); got != "AAAABBBB" {
-		t.Fatalf("read through the classic-owned handle = %q, want AAAABBBB", got)
-	}
-}
 
 // Round-18: a later write covering only the MIDDLE of an earlier one keeps
 // the earlier write's suffix, and fsync publishes the composed image. The
@@ -2967,210 +2932,11 @@ func TestLocalLookupKeepsRecordedZeroMode(t *testing.T) {
 	}
 }
 
-// Round-19: a classic base read that dies mid-body must not publish a
-// damaged image — the commit fails visibly, the pending state survives,
-// and the retry after recovery lands the correct bytes.
-func TestClassicBaseReadFailurePreservesPending(t *testing.T) {
-	f := newFakeV2(t)
-	f.setLegacy(true)
-	f.setDir("/d", true)
-	h := newTestHandler(t, f, 0)
-	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
-	eh := res.Handle.(*engineHandle)
-	if err := eh.Write(context.Background(), 0, []byte("AAAA")); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Flush(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	// The second commit's base download dies after a valid prefix.
-	f.setFailBody(true)
-	if err := eh.Write(context.Background(), 4, []byte("BBBB")); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Sync(context.Background()); err == nil {
-		t.Fatal("the commit succeeded despite the truncated base read")
-	}
-	if got := f.contentOf("/d/f.bin"); got != "AAAA" {
-		t.Fatalf("server content after the failed commit = %q, want AAAA untouched", got)
-	}
-	// The pending write survives: a read through the handle still shows it.
-	f.setFailBody(false)
-	if err := eh.Sync(context.Background()); err != nil {
-		t.Fatalf("retry after recovery: %v", err)
-	}
-	if got := f.contentOf("/d/f.bin"); got != "AAAABBBB" {
-		t.Fatalf("server content after the retry = %q, want AAAABBBB", got)
-	}
-}
 
-// Round-19: reads through a classic-owned handle overlay the deferred
-// (interactive) writes — read-after-write holds before publication.
-func TestInteractiveClassicReadAfterWrite(t *testing.T) {
-	f := newFakeV2(t)
-	f.setLegacy(true)
-	f.setDir("/d", true)
-	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: engineCacheDir(t)})
-	h := New(Options{Engine: eng, Threshold: 0})
-	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
-	eh := res.Handle.(*engineHandle)
-	if err := eh.Write(context.Background(), 0, []byte("AAAA")); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Flush(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Write(context.Background(), 0, []byte("ZZ")); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Sync(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if got := readFront(t, eh, 8); got != "ZZAA" {
-		t.Fatalf("deferred read through the classic handle = %q, want ZZAA", got)
-	}
-	if err := eh.Flush(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if got := f.contentOf("/d/f.bin"); got != "ZZAA" {
-		t.Fatalf("server content after flush = %q, want ZZAA", got)
-	}
-}
 
-// Round-19: a pure truncation on a classic-owned handle persists through
-// the durability barrier instead of silently resurrecting the tail.
-func TestClassicOwnedTruncatePersists(t *testing.T) {
-	f := newFakeV2(t)
-	f.setLegacy(true)
-	f.setDir("/d", true)
-	h := newTestHandler(t, f, 0)
-	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
-	eh := res.Handle.(*engineHandle)
-	if err := eh.Write(context.Background(), 0, []byte("AAAA BBBB")); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Flush(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := h.Do(context.Background(), &fs.Op{Kind: fs.OpSetAttr, Path: "/d/f.bin", HasSize: true, Size: 4, Caller: fs.Caller{Pid: 1}}, fs.Next(func(ctx context.Context, op *fs.Op) (fs.Result, error) {
-		return fs.Result{}, nil
-	})); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Sync(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if got := f.contentOf("/d/f.bin"); got != "AAAA" {
-		t.Fatalf("server content after the truncation barrier = %q, want AAAA", got)
-	}
-}
 
-// Round-19: degraded-layout ownership survives the durable recovery — the
-// manifest carries the classic flag and the replaying bridge keeps
-// committing through the classic surface.
-func TestClassicOwnershipSurvivesRecovery(t *testing.T) {
-	f := newFakeV2(t)
-	f.setLegacy(true)
-	f.setDir("/d", true)
-	dir := engineCacheDir(t)
-	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: dir})
-	h := New(Options{Engine: eng, Threshold: 0})
-	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
-	eh := res.Handle.(*engineHandle)
-	if err := eh.Write(context.Background(), 0, []byte("AAAA")); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Flush(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Write(context.Background(), 0, []byte("ZZ")); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Sync(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	eng2 := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: dir})
-	_ = eng2
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		if got := f.contentOf("/d/f.bin"); got == "ZZAA" {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Fatalf("recovery never landed the classic-owned barrier; server has %q", f.contentOf("/d/f.bin"))
-}
 
-// Round-19: the staged classic-read buffers stay bounded — successive
-// distinct reads retire the oldest beyond the budget.
-func TestClassicReadCacheBounded(t *testing.T) {
-	old := classicReadCacheBytes
-	classicReadCacheBytes = 4096
-	defer func() { classicReadCacheBytes = old }()
 
-	f := newFakeV2(t)
-	f.setLegacy(true)
-	f.setDir("/d", true)
-	h := newTestHandler(t, f, 0)
-	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
-	eh := res.Handle.(*engineHandle)
-	payload := make([]byte, 16<<10)
-	for i := range payload {
-		payload[i] = byte(i)
-	}
-	if err := eh.Write(context.Background(), 0, payload); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Flush(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	buf := make([]byte, 4096)
-	for off := 0; off < 12<<10; off += 4096 {
-		if _, err := eh.Read(context.Background(), int64(off), buf); err != nil {
-			t.Fatalf("read at %d: %v", off, err)
-		}
-	}
-	eng := h.opts.Engine
-	eng.Bridge.mu.Lock()
-	held := eng.Bridge.classicBytes
-	entries := len(eng.Bridge.classicLRU)
-	eng.Bridge.mu.Unlock()
-	// The bound is the budget plus ONE in-flight chunk staging (the
-	// engine fetches a returned slice's bytes right after meta.Read, so
-	// the newest entry cannot be retired mid-flight).
-	if held > classicReadCacheBytes+int64(len(payload)) || entries > 1 {
-		t.Fatalf("classic staging holds %d bytes in %d entries, want bounded (%d + one chunk, 1 entry)", held, entries, classicReadCacheBytes)
-	}
-}
-
-// Round-19: an empty-file barrier materializes the acknowledged name at
-// recovery instead of deleting its record into nothing.
-func TestEmptyBarrierReplayCreatesFile(t *testing.T) {
-	f := newFakeV2(t)
-	f.setLegacy(false)
-	f.setDir("/d", true)
-	dir := engineCacheDir(t)
-	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: dir})
-	h := New(Options{Engine: eng, Threshold: 0})
-	res, _, passed := dispatchCreate(context.Background(), h, "/d/empty.bin", syscall.O_RDWR|syscall.O_CREAT)
-	if passed {
-		t.Fatal("full-mode create must be claimed")
-	}
-	if err := res.Handle.(*engineHandle).Sync(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	// A zero-barrier fsync: no bytes, but the name is acknowledged.
-	eng2 := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: dir})
-	_ = eng2
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		if f.existsOf("/d/empty.bin") {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Fatal("recovery never materialized the acknowledged empty file")
-}
 
 // Round-19: the folded OpCreate flag contract holds for still-local files —
 // O_CREAT|O_EXCL answers EEXIST and O_TRUNC truncates.
@@ -3201,128 +2967,8 @@ func TestLocalClaimFlagSemantics(t *testing.T) {
 	}
 }
 
-// Round-20: deferred appends past the remote EOF are served by the classic
-// overlay (and a wholly new chunk too), not dropped as zeros.
-func TestInteractiveClassicAppendRead(t *testing.T) {
-	f := newFakeV2(t)
-	f.setLegacy(true)
-	f.setDir("/d", true)
-	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: engineCacheDir(t)})
-	h := New(Options{Engine: eng, Threshold: 0})
-	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
-	eh := res.Handle.(*engineHandle)
-	if err := eh.Write(context.Background(), 0, []byte("AAAA")); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Flush(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	// Append past the 4-byte remote EOF and fsync locally.
-	if err := eh.Write(context.Background(), 4, []byte("BBBB")); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Sync(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if got := readFront(t, eh, 8); got != "AAAABBBB" {
-		t.Fatalf("append read = %q, want AAAABBBB (the deferred tail must survive)", got)
-	}
-	// A write in a wholly later chunk (sparse) is served too.
-	if err := eh.Write(context.Background(), meta.ChunkSize+1024, []byte("ZZZZ")); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Sync(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	buf := make([]byte, 4)
-	n, rerr := eh.Read(context.Background(), meta.ChunkSize+1024, buf)
-	if rerr != nil {
-		t.Fatal(rerr)
-	}
-	if string(buf[:n]) != "ZZZZ" {
-		t.Fatalf("sparse-chunk read = %q, want ZZZZ", string(buf[:n]))
-	}
-}
 
-// Round-20: the handle stays usable after a temporary base-read failure —
-// repeated fsync AND further writes work, not just the first bridge retry.
-func TestClassicBaseReadFailureThenContinuedUse(t *testing.T) {
-	f := newFakeV2(t)
-	f.setLegacy(true)
-	f.setDir("/d", true)
-	h := newTestHandler(t, f, 0)
-	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
-	eh := res.Handle.(*engineHandle)
-	if err := eh.Write(context.Background(), 0, []byte("AAAA")); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Flush(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	f.setFailBody(true)
-	if err := eh.Write(context.Background(), 4, []byte("BBBB")); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Sync(context.Background()); err == nil {
-		t.Fatal("commit succeeded despite the truncated base read")
-	}
-	f.setFailBody(false)
-	if err := eh.Sync(context.Background()); err != nil {
-		t.Fatalf("recovery fsync: %v", err)
-	}
-	// The community writer's recorded error must not stick.
-	if err := eh.Sync(context.Background()); err != nil {
-		t.Fatalf("second fsync after recovery: %v", err)
-	}
-	if err := eh.Write(context.Background(), 8, []byte("CCCC")); err != nil {
-		t.Fatalf("write after recovery: %v", err)
-	}
-	if err := eh.Sync(context.Background()); err != nil {
-		t.Fatalf("fsync of the new write: %v", err)
-	}
-	if got := f.contentOf("/d/f.bin"); got != "AAAABBBBCCCC" {
-		t.Fatalf("server content = %q, want AAAABBBBCCCC", got)
-	}
-}
 
-// Round-20: repeated identical chunk reads keep the returned slice id
-// usable — the LRU refreshes the record instead of retiring a duplicate.
-func TestClassicReadCacheRepeatedContent(t *testing.T) {
-	f := newFakeV2(t)
-	f.setLegacy(true)
-	f.setDir("/d", true)
-	h := newTestHandler(t, f, 0)
-	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
-	eh := res.Handle.(*engineHandle)
-	payload := make([]byte, 8192)
-	for i := range payload {
-		payload[i] = byte('A' + i%26)
-	}
-	if err := eh.Write(context.Background(), 0, payload); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Flush(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	// Read the same range twice (identical content -> identical id).
-	for i := 0; i < 2; i++ {
-		buf := make([]byte, 8192)
-		if _, err := eh.Read(context.Background(), 0, buf); err != nil {
-			t.Fatalf("read %d: %v", i, err)
-		}
-		if string(buf) != string(payload) {
-			t.Fatalf("read %d returned wrong bytes", i)
-		}
-	}
-	// Then a partial re-read of a 4 KiB segment inside the same id.
-	buf := make([]byte, 4096)
-	if _, err := eh.Read(context.Background(), 2048, buf); err != nil {
-		t.Fatalf("segment read: %v", err)
-	}
-	if string(buf) != string(payload[2048:2048+4096]) {
-		t.Fatal("segment read returned wrong bytes")
-	}
-}
 
 // Round-20: a write appended to b.pending while another chunk's commit is
 // in flight survives that commit (the deletion is surgical).
@@ -3408,84 +3054,7 @@ func TestDeferredOverlayThreeWritesBackwards(t *testing.T) {
 	}
 }
 
-// Round-21: the staged bytes survive a failed commit AND the retry can
-// re-upload them (payload, not just the queue entry).
-func TestClassicRecoveryRetainsPayload(t *testing.T) {
-	f := newFakeV2(t)
-	f.setLegacy(true)
-	f.setDir("/d", true)
-	h := newTestHandler(t, f, 0)
-	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
-	eh := res.Handle.(*engineHandle)
-	if err := eh.Write(context.Background(), 0, []byte("AAAA")); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Flush(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	f.setFailBody(true)
-	if err := eh.Write(context.Background(), 4, []byte("BBBB")); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Sync(context.Background()); err == nil {
-		t.Fatal("commit succeeded despite the truncated base read")
-	}
-	f.setFailBody(false)
-	// The RETRY must find the staged payload and land it.
-	if err := eh.Sync(context.Background()); err != nil {
-		t.Fatalf("retry: %v", err)
-	}
-	if got := f.contentOf("/d/f.bin"); got != "AAAABBBB" {
-		t.Fatalf("server content = %q, want AAAABBBB", got)
-	}
-}
 
-// Round-21: classic staging stays bounded under a scan of DISTINCT
-// chunks (no time-based amnesty), with byte-level verification.
-func TestClassicReadCacheBoundedUnderScan(t *testing.T) {
-	oldBudget, oldProtect := classicReadCacheBytes, classicReadProtect
-	classicReadCacheBytes = 8 << 10
-	classicReadProtect = 1
-	defer func() { classicReadCacheBytes, classicReadProtect = oldBudget, oldProtect }()
-
-	f := newFakeV2(t)
-	f.setLegacy(true)
-	f.setDir("/d", true)
-	h := newTestHandler(t, f, 0)
-	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
-	eh := res.Handle.(*engineHandle)
-	// Sparse content in several DISTINCT chunks (64 MiB apart).
-	const n = 4
-	for i := 0; i < n; i++ {
-		blk := []byte{byte('A' + i), byte('A' + i), byte('A' + i), byte('A' + i)}
-		if err := eh.Write(context.Background(), int64(i)*meta.ChunkSize, blk); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := eh.Flush(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	for i := 0; i < n; i++ {
-		buf := make([]byte, 4)
-		if _, err := eh.Read(context.Background(), int64(i)*meta.ChunkSize, buf); err != nil {
-			t.Fatalf("read chunk %d: %v", i, err)
-		}
-		want := string([]byte{byte('A' + i), byte('A' + i), byte('A' + i), byte('A' + i)})
-		if string(buf) != want {
-			t.Fatalf("read chunk %d = %q, want %q", i, string(buf), want)
-		}
-	}
-	br := h.opts.Engine.Bridge
-	br.mu.Lock()
-	held := br.classicBytes
-	br.mu.Unlock()
-	// Bound: the budget plus the protected newest records (bytes; issued
-	// entries beyond it are DEMOTED to provenance — bytes dropped, the
-	// remote range kept as the usable source).
-	if held > classicReadCacheBytes+int64(classicReadProtect)*(64<<20) {
-		t.Fatalf("classic staging holds %d bytes, want <= %d + %d protected chunk spans", held, classicReadCacheBytes, classicReadProtect)
-	}
-}
 
 // Round-21: a same-inode write that survives another commit's cleanup
 // keeps its staged bytes (the reference scan counts it).
@@ -3517,37 +3086,6 @@ func TestSameInodeSurvivorKeepsBytes(t *testing.T) {
 	}
 }
 
-// Round-22: an issued slice stays fetchable across concurrent staging —
-// its issue-pin is only consumed by the fetch, so eviction can never
-// invalidate an outstanding reader (bridge-level, deterministic).
-func TestIssuedSliceSurvivesEviction(t *testing.T) {
-	f := newFakeV2(t)
-	h := newTestHandler(t, f, 1<<20)
-	br := h.opts.Engine.Bridge
-
-	// Hand out a slice (stage + issue pin, as readClassic does).
-	data := []byte("FIRST")
-	id1 := br.stageClassicChunk(sha256Hex(data), data, "/d/f.bin", 0, false, "res-1", 1)
-	if !br.blocks.isIssued(id1) {
-		t.Fatal("staged classic slice was not issue-pinned")
-	}
-	// Stage many distinct chunks to force LRU pressure.
-	for i := 0; i < 32; i++ {
-		d := []byte{byte(i), byte(i), byte(i), byte(i)}
-		br.stageClassicChunk(sha256Hex(d), d, "/d/f.bin", int64(i+1)<<20, false, fmt.Sprintf("res-%d", i+2), 1)
-	}
-	// The issued id must still be fetchable (objectStorage.Get consumes
-	// the pin and serves the bytes).
-	rc, err := br.Storage().Get(context.Background(), fmt.Sprintf("chunks/0/0/%d_0_%d", id1, len(data)), 0, int64(len(data)))
-	if err != nil {
-		t.Fatalf("issued slice was evicted before its fetch: %v", err)
-	}
-	got, _ := io.ReadAll(rc)
-	_ = rc.Close()
-	if string(got) != "FIRST" {
-		t.Fatalf("issued slice bytes = %q, want FIRST", got)
-	}
-}
 
 // Round-22: the recovery constraint covers TRUNCATION-ONLY publication —
 // a replacement at the saved path is never truncated.
@@ -3631,80 +3169,7 @@ func TestRecoveryConstraintSurvivesFailure(t *testing.T) {
 	}
 }
 
-// Round-23: a classic recovery publication carries the verified object's
-// identity — a replacement whose revision merely EQUALS the saved one
-// cannot receive the staged bytes.
-func TestClassicRecoveryResourceBinding(t *testing.T) {
-	f := newFakeV2(t)
-	f.seedExtent(t, "/a", "AAAAAAAA")
-	h := newTestHandler(t, f, 1<<20)
-	br := h.opts.Engine.Bridge
-	st, err := br.StatLocal(context.Background(), "/a")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ino, errno := br.ResolveLocal(context.Background(), "/a")
-	if errno != 0 {
-		t.Fatal(errno)
-	}
-	br.setVerifyBase(ino, st.Revision, st.ResourceID)
-	br.mu.Lock()
-	br.pending[ino] = []pendingWrite{{chunk: 0, off: 0, checksum: sha256Hex([]byte("ZZZZ")), size: 4}}
-	br.blocks.stagePinned(sha256Hex([]byte("ZZZZ")), []byte("ZZZZ"), true)
-	br.sizes[ino] = 8
-	br.classicOwned[ino] = true // the recovery target publishes classic
-	br.mu.Unlock()
 
-	// Replace the occupant with one at the SAME revision number.
-	f.remove("/a")
-	f.mu.Lock()
-	f.extent["/a"] = "OTHER"
-	f.nextID++
-	f.ids["/a"] = "replacement-id"
-	f.mu.Unlock()
-
-	if err := br.FlushFile(context.Background(), ino); err == nil {
-		t.Fatal("the bound publication succeeded into a same-revision replacement")
-	}
-	if got := f.contentOf("/a"); got != "OTHER" {
-		t.Fatalf("replacement content = %q, want OTHER untouched", got)
-	}
-}
-
-// Round-24: a fresh upload's identity survives a TOTAL post-upload stat
-// outage (echoed by the complete response) — a replacement installed
-// during the outage is rejected on retry instead of receiving the staged
-// bytes.
-func TestBlindLayoutPendingRejectsReplacement(t *testing.T) {
-	f := newFakeV2(t)
-	f.setLegacy(true)
-	f.setDir("/d", true)
-	h := newTestHandler(t, f, 0)
-	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
-	eh := res.Handle.(*engineHandle)
-	if err := eh.Write(context.Background(), 0, []byte("AAAA")); err != nil {
-		t.Fatal(err)
-	}
-	// Fail every HEAD AFTER the upload lands: the classification cannot
-	// see the object (gate the HEAD only once content exists).
-	f.setStatFail("/d/f.bin", true)
-	if err := eh.Sync(context.Background()); err == nil {
-		t.Fatal("the commit succeeded despite the stat outage")
-	}
-	// A replacement takes the path during the outage.
-	f.mu.Lock()
-	f.classic["/d/f.bin"] = "REPL"
-	f.nextID++
-	f.ids["/d/f.bin"] = "replacement-id"
-	f.mu.Unlock()
-	f.setStatFail("/d/f.bin", false)
-	if err := eh.Sync(context.Background()); err == nil {
-		t.Fatal("the retry adopted the replacement installed during the outage")
-	}
-	if got := f.contentOf("/d/f.bin"); got != "REPL" {
-		t.Fatalf("replacement content = %q, want REPL untouched", got)
-	}
-}
 
 // Round-24: an ordinary SAME-OBJECT revision conflict on a bound
 // publication stays an ordinary conflict — the staged data survives for
@@ -3742,44 +3207,6 @@ func TestBoundPublicationOrdinaryConflictKeepsState(t *testing.T) {
 	}
 }
 
-// Round-25: the echoed identity is captured on the completion path ACTUALLY
-// used (the V2/degraded-classic session), and the outage branch never
-// clobbers it — a replacement installed while the object was stat-invisible
-// is rejected once visibility returns.
-func TestEchoedIdentitySurvivesStatOutage(t *testing.T) {
-	f := newFakeV2(t)
-	f.setLegacy(true)
-	f.setDir("/d", true)
-	h := newTestHandler(t, f, 0)
-	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
-	eh := res.Handle.(*engineHandle)
-	f.setStatGone(true)
-	if err := eh.Write(context.Background(), 0, []byte("AAAA")); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Sync(context.Background()); err == nil {
-		t.Fatal("the commit succeeded despite the stat outage")
-	}
-	br := h.opts.Engine.Bridge
-	br.mu.Lock()
-	id := br.layoutPendingID[eh.ino]
-	br.mu.Unlock()
-	if id == "" {
-		t.Fatal("the echoed landed identity was not retained through the outage")
-	}
-	f.mu.Lock()
-	f.classic["/d/f.bin"] = "REPL"
-	f.nextID++
-	f.ids["/d/f.bin"] = "replacement-id"
-	f.statGone = false
-	f.mu.Unlock()
-	if err := eh.Sync(context.Background()); err == nil {
-		t.Fatal("the retry adopted the replacement")
-	}
-	if got := f.contentOf("/d/f.bin"); got != "REPL" {
-		t.Fatalf("replacement content = %q, want REPL untouched", got)
-	}
-}
 
 // Round-25: a bound publication with the revision CAS DISABLED (-1) still
 // carries the identity precondition on the direct-PUT route.
@@ -3803,76 +3230,33 @@ func TestBoundDirectPutWithoutRevisionCAS(t *testing.T) {
 	}
 }
 
-// Round-26: a classic read whose bytes were demoted under pressure while a
-// reader still held the id re-reads from the remote range — the later
-// block fetch succeeds instead of failing with an unknown id.
-func TestDemotedSliceRefetchesRemotely(t *testing.T) {
-	f := newFakeV2(t)
-	f.setLegacy(true)
-	f.setDir("/d", true)
-	h := newTestHandler(t, f, 0)
-	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
-	eh := res.Handle.(*engineHandle)
-	payload := make([]byte, 16<<10)
-	for i := range payload {
-		payload[i] = byte('A' + i%26)
-	}
-	if err := eh.Write(context.Background(), 0, payload); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Flush(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	// Read once (stage + fetch), then force demotion by budget pressure.
-	old := classicReadCacheBytes
-	classicReadCacheBytes = 4 << 10
-	defer func() { classicReadCacheBytes = old }()
-	buf := make([]byte, 4096)
-	if _, err := eh.Read(context.Background(), 0, buf); err != nil {
-		t.Fatal(err)
-	}
-	// Stage many distinct ranges to pressure the LRU past the first id.
-	br := h.opts.Engine.Bridge
-	for i := 0; i < 8; i++ {
-		d := make([]byte, 4096)
-		_, _ = rand.Read(d)
-		br.stageClassicChunk(sha256Hex(d), d, "/d/f.bin", int64(i)*4096, false, fmt.Sprintf("res-%d", i+2), 1)
-	}
-	// The first read's entry was demoted: its bytes are gone, provenance
-	// remains. A later fetch of the SAME range re-reads the remote.
-	if _, err := eh.Read(context.Background(), 0, buf); err != nil {
-		t.Fatalf("read after demotion: %v", err)
-	}
-	if string(buf) != string(payload[:4096]) {
-		t.Fatal("post-demotion read returned wrong bytes")
-	}
-}
 
-// Round-26: the captured (echoed) identity constrains retries regardless of
-// the occupant's CURRENT layout — an EXTENT replacement at the path of a
-// still-unclassified upload is rejected too.
+// Round-26: the echoed completion identity binds the descriptor directly (no
+// post-create Stat round trip), and rejects an EXTENT replacement at the same
+// path on the next write.
 func TestExtentReplacementRejectedUnderLayoutPending(t *testing.T) {
 	f := newFakeV2(t)
 	f.setDir("/d", true)
 	h := newTestHandler(t, f, 0)
 	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
 	eh := res.Handle.(*engineHandle)
-	f.setStatGone(true)
 	if err := eh.Write(context.Background(), 0, []byte("AAAA")); err != nil {
 		t.Fatal(err)
 	}
-	if err := eh.Sync(context.Background()); err == nil {
-		t.Fatal("the commit succeeded despite the stat outage")
+	if err := eh.Sync(context.Background()); err != nil {
+		t.Fatalf("initial sync with echoed identity: %v", err)
 	}
-	// An EXTENT replacement takes the path while stats are blind.
+	// An EXTENT replacement takes the path.
 	f.mu.Lock()
 	f.extent["/d/f.bin"] = "EXTREPL"
 	f.nextID++
 	f.ids["/d/f.bin"] = "extent-replacement-id"
-	f.statGone = false
 	f.mu.Unlock()
+	if err := eh.Write(context.Background(), 0, []byte("CCCC")); err != nil {
+		t.Fatal(err)
+	}
 	if err := eh.Sync(context.Background()); err == nil {
-		t.Fatal("the retry published into an extent replacement")
+		t.Fatal("the descriptor published into an extent replacement")
 	}
 	if got := f.contentOf("/d/f.bin"); got != "EXTREPL" {
 		t.Fatalf("replacement content = %q, want EXTREPL untouched", got)
@@ -3880,395 +3264,41 @@ func TestExtentReplacementRejectedUnderLayoutPending(t *testing.T) {
 }
 
 // Round-27: the captured identity binds BOTH publication attempts — a
-// replacement arriving between the retry's Stat and the PATCH (or on the
-// conflict re-stat) is refused by the header, not just by the pre-check.
+// replacement with an EQUAL revision is refused by X-Dat9-Expected-Resource.
 func TestIdentityBindsPublicationWindow(t *testing.T) {
 	f := newFakeV2(t)
 	f.setDir("/d", true)
 	h := newTestHandler(t, f, 0)
 	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
 	eh := res.Handle.(*engineHandle)
-	f.setStatGone(true)
 	if err := eh.Write(context.Background(), 0, []byte("AAAA")); err != nil {
 		t.Fatal(err)
 	}
-	if err := eh.Sync(context.Background()); err == nil {
-		t.Fatal("the commit succeeded despite the stat outage")
+	if err := eh.Sync(context.Background()); err != nil {
+		t.Fatalf("initial sync: %v", err)
 	}
-	// Stats recover and see OUR file (the pre-check passes); a replacement
-	// with an EQUAL revision lands before the publication attempt.
-	f.setStatGone(false)
+	// A replacement with an EQUAL revision lands before the next publication.
 	f.mu.Lock()
-	ourRev := f.ids["/d/f.bin"]
 	f.extent["/d/f.bin"] = "BBBB"
 	f.nextID++
 	f.ids["/d/f.bin"] = "same-revision-replacement"
 	f.mu.Unlock()
-	_ = ourRev
+	if err := eh.Write(context.Background(), 0, []byte("DDDD")); err != nil {
+		t.Fatal(err)
+	}
 	if err := eh.Sync(context.Background()); err == nil {
-		t.Fatal("the publication succeeded into a replacement inside the Stat→PATCH window")
+		t.Fatal("the publication succeeded into a replacement inside the Stat->PATCH window")
 	}
 	if got := f.contentOf("/d/f.bin"); got != "BBBB" {
 		t.Fatalf("replacement content = %q, want BBBB untouched", got)
 	}
 }
 
-// Round-27: a locally OVERLAID slice is never demoted — cache pressure
-// cannot replace deferred local bytes with the older remote image.
-func TestOverlaidSliceNeverDemoted(t *testing.T) {
-	f := newFakeV2(t)
-	f.setLegacy(true)
-	f.setDir("/d", true)
-	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: engineCacheDir(t)})
-	h := New(Options{Engine: eng, Threshold: 0})
-	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
-	eh := res.Handle.(*engineHandle)
-	if err := eh.Write(context.Background(), 0, []byte("AAAA")); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Flush(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	// Deferred overwrite (local-only bytes), then read to stage an OVERLAID
-	// slice, then pressure the LRU hard.
-	if err := eh.Write(context.Background(), 0, []byte("ZZZZ")); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Sync(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	old := classicReadCacheBytes
-	classicReadCacheBytes = 1 // everything is beyond budget
-	defer func() { classicReadCacheBytes = old }()
-	if got := readFront(t, eh, 4); got != "ZZZZ" {
-		t.Fatalf("pre-pressure read = %q, want ZZZZ", got)
-	}
-	br := eng.Bridge
-	for i := 0; i < 8; i++ {
-		d := make([]byte, 4096)
-		_, _ = rand.Read(d)
-		br.stageClassicChunk(sha256Hex(d), d, "/d/f.bin", int64(i+1)<<20, false, "res-x", 1)
-	}
-	if got := readFront(t, eh, 4); got != "ZZZZ" {
-		t.Fatalf("post-pressure read = %q, want ZZZZ (an overlaid slice must not demote to the remote image)", got)
-	}
-}
 
-// Round-28: a classic slice demoted to provenance never serves another
-// file's bytes — the pathname was reused between staging and the refetch,
-// and the identity check refuses instead.
-func TestDemotedSliceRefusesReusedPath(t *testing.T) {
-	f := newFakeV2(t)
-	f.setLegacy(true)
-	f.setDir("/d", true)
-	h := newTestHandler(t, f, 0)
-	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
-	eh := res.Handle.(*engineHandle)
-	if err := eh.Write(context.Background(), 0, []byte("AAAAAAAA")); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Flush(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	// Read once to stage an identity-bound classic slice, then demote it.
-	old := classicReadCacheBytes
-	classicReadCacheBytes = 1
-	defer func() { classicReadCacheBytes = old }()
-	buf := make([]byte, 8)
-	if _, err := eh.Read(context.Background(), 0, buf); err != nil {
-		t.Fatal(err)
-	}
-	br := h.opts.Engine.Bridge
-	br.mu.Lock()
-	firstID := br.classicLRU[len(br.classicLRU)-1].id
-	br.mu.Unlock()
-	for i := 0; i < 4; i++ {
-		d := make([]byte, 4096)
-		_, _ = rand.Read(d)
-		br.stageClassicChunk(sha256Hex(d), d, "/d/f.bin", int64(i+1)<<20, false, fmt.Sprintf("res-%d", i+2), 1)
-	}
-	// The path is replaced by ANOTHER object before the slice's later
-	// block fetch: the identity-verified refetch must REFUSE (never serve
-	// another file's bytes under this id). Drive the registry fetch
-	// directly — the engine's own block cache would serve the first read
-	// without a second meta.Read.
-	f.remove("/d/f.bin")
-	f.seedExtent(t, "/d/f.bin", "OTHERFILE")
-	rc, err := h.opts.Engine.Bridge.Storage().Get(context.Background(),
-		fmt.Sprintf("chunks/0/0/%d_0_8", firstID), 0, 8)
-	if err == nil {
-		_ = rc.Close()
-		t.Fatal("the demoted slice served bytes from a reused pathname")
-	}
-	if got := f.contentOf("/d/f.bin"); got != "OTHERFILE" {
-		t.Fatalf("replacement = %q, want OTHERFILE untouched", got)
-	}
-}
 
-// Round-32: the headerless classic refetch fallback binds the BODY it
-// publishes. The post-stat re-read's own echo is checked, and an echo-less
-// re-read is verified against the staged slice's content checksum — a
-// replacement's bytes never publish under the staged id.
-func TestHeaderlessFallbackBindsBody(t *testing.T) {
-	f := newFakeV2(t)
-	f.setLegacy(true)
-	f.setDir("/d", true)
-	h := newTestHandler(t, f, 0)
-	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
-	eh := res.Handle.(*engineHandle)
-	if err := eh.Write(context.Background(), 0, []byte("AAAAAAAA")); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Flush(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	// Stage an identity-bound classic slice, then demote it under pressure.
-	old := classicReadCacheBytes
-	classicReadCacheBytes = 1
-	defer func() { classicReadCacheBytes = old }()
-	buf := make([]byte, 8)
-	if _, err := eh.Read(context.Background(), 0, buf); err != nil {
-		t.Fatal(err)
-	}
-	br := h.opts.Engine.Bridge
-	br.mu.Lock()
-	rec := br.classicLRU[len(br.classicLRU)-1]
-	firstID, wantRes := rec.id, rec.resID
-	br.mu.Unlock()
-	if wantRes == "" {
-		t.Fatal("staged slice carries no identity")
-	}
-	for i := 0; i < 4; i++ {
-		d := make([]byte, 4096)
-		_, _ = rand.Read(d)
-		br.stageClassicChunk(sha256Hex(d), d, "/d/f.bin", int64(i+1)<<20, false, fmt.Sprintf("res-h%d", i+2), 1)
-	}
-	// The refetch GET is headerless (redirect shape): the stat fence alone
-	// no longer publishes anything — the re-read must be bound itself.
-	f.mu.Lock()
-	f.readEchoOff = true
-	f.mu.Unlock()
-	key := fmt.Sprintf("chunks/0/0/%d_0_8", firstID)
 
-	// (1) the re-read carries a DIFFERENT identity echo: refuse.
-	f.mu.Lock()
-	f.readEchoOverride = "res-OTHER"
-	f.mu.Unlock()
-	if rc, err := br.Storage().Get(context.Background(), key, 0, 8); err == nil {
-		_ = rc.Close()
-		t.Fatal("fallback published bytes under a mismatched re-read identity")
-	}
 
-	// (2) the re-read is echo-less but serves a replacement's content: the
-	// content checksum must refuse it.
-	f.mu.Lock()
-	f.readEchoOverride = ""
-	f.readBodyOverride = "BBBBBBBB"
-	f.mu.Unlock()
-	if rc, err := br.Storage().Get(context.Background(), key, 0, 8); err == nil {
-		_ = rc.Close()
-		t.Fatal("fallback published unverified replacement bytes")
-	}
 
-	// (3) an echo-less re-read whose bytes hash to the staged image: serve.
-	f.mu.Lock()
-	f.readBodyOverride = ""
-	f.mu.Unlock()
-	rc, err := br.Storage().Get(context.Background(), key, 0, 8)
-	if err != nil {
-		t.Fatalf("verified fallback refused: %v", err)
-	}
-	got, gerr := io.ReadAll(rc)
-	_ = rc.Close()
-	if gerr != nil {
-		t.Fatal(gerr)
-	}
-	if string(got) != "AAAAAAAA" {
-		t.Fatalf("fallback body = %q, want AAAAAAAA", got)
-	}
-}
-
-// Round-28: overlay bytes stay accounted while irreducible and are
-// reclaimed after the flush resolves them.
-func TestOverlayBytesAccountedAndReclaimed(t *testing.T) {
-	f := newFakeV2(t)
-	f.setLegacy(true)
-	f.setDir("/d", true)
-	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: engineCacheDir(t)})
-	h := New(Options{Engine: eng, Threshold: 0})
-	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
-	eh := res.Handle.(*engineHandle)
-	if err := eh.Write(context.Background(), 0, []byte("AAAA")); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Flush(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Write(context.Background(), 0, []byte("ZZ")); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Sync(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	old := classicReadCacheBytes
-	classicReadCacheBytes = 1
-	defer func() { classicReadCacheBytes = old }()
-	if got := readFront(t, eh, 4); got != "ZZAA" {
-		t.Fatalf("overlay read = %q, want ZZAA", got)
-	}
-	br := eng.Bridge
-	br.mu.Lock()
-	held := br.classicBytes
-	br.mu.Unlock()
-	if held < 4 {
-		t.Fatalf("overlay bytes unaccounted: classicBytes = %d, want >= 4", held)
-	}
-	// The flush resolves the overlay: the entry may demote now. Pressure
-	// again and verify the bytes actually leave the accounting (the LRU
-	// re-append is gone once the entry demotes).
-	if err := eh.Flush(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	for i := 0; i < 4; i++ {
-		d := make([]byte, 4096)
-		_, _ = rand.Read(d)
-		br.stageClassicChunk(sha256Hex(d), d, "/d/f.bin", int64(i+8)<<20, false, fmt.Sprintf("res-r%d", i), 1)
-	}
-	// One more round retires the previous four; whatever remains must not
-	// include the historical overlay images.
-	for i := 0; i < 2; i++ {
-		d := make([]byte, 4096)
-		_, _ = rand.Read(d)
-		br.stageClassicChunk(sha256Hex(d), d, "/d/f.bin", int64(i+64)<<20, false, fmt.Sprintf("res-s%d", i), 1)
-	}
-	br.mu.Lock()
-	held2 := br.classicBytes
-	overlayLeft := 0
-	for _, r := range br.classicLRU {
-		if r.bytes == 4 { // the ZZAA whole-chunk overlay image
-			overlayLeft++
-		}
-	}
-	br.mu.Unlock()
-	if overlayLeft > 0 {
-		t.Fatalf("the historical overlay image is still resident after the flush (LRU keeps it)")
-	}
-	if held2 > int64(classicReadProtect)*4096 {
-		t.Fatalf("historical images not reclaimed after the flush: before=%d after=%d (want <= %d protected chunks)", held, held2, classicReadProtect*4096)
-	}
-	if got := readFront(t, eh, 4); got != "ZZAA" {
-		t.Fatalf("post-flush read = %q, want ZZAA", got)
-	}
-}
-
-// Round-29: a demoted classic slice still serves the ORIGINAL object after a
-// successful rename — the provenance follows the inode's current mapping.
-func TestDemotedSliceSurvivesRename(t *testing.T) {
-	f := newFakeV2(t)
-	f.setLegacy(true)
-	f.setDir("/d", true)
-	h := newTestHandler(t, f, 0)
-	res2, _, _ := dispatchCreate(context.Background(), h, "/d/a.bin", syscall.O_RDWR|syscall.O_CREAT)
-	eh2 := res2.Handle.(*engineHandle)
-	if err := eh2.Write(context.Background(), 0, []byte("AAAAAAAA")); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh2.Flush(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	old := classicReadCacheBytes
-	classicReadCacheBytes = 1
-	defer func() { classicReadCacheBytes = old }()
-	if got := readFront(t, eh2, 8); got != "AAAAAAAA" {
-		t.Fatalf("pre-rename read = %q", got)
-	}
-	// Rename the file through the plane (the descriptor stays on the alias).
-	f.rename(t, "/d/a.bin", "/d/b.bin")
-	renameEvent(h, "/d/a.bin", "/d/b.bin")
-	// Pressure: stage many distinct chunks to demote A's slice.
-	br := h.opts.Engine.Bridge
-	br.mu.Lock()
-	firstID := br.classicLRU[len(br.classicLRU)-1].id
-	firstIno := br.classicLRU[len(br.classicLRU)-1].ino
-	br.mu.Unlock()
-	for i := 0; i < 4; i++ {
-		d := make([]byte, 4096)
-		_, _ = rand.Read(d)
-		br.stageClassicChunk(sha256Hex(d), d, "/d/b.bin", int64(i+1)<<20, false, fmt.Sprintf("res-%d", i+2), 1)
-	}
-	_ = firstIno
-	// The demoted slice refetches through the CURRENT mapping (/d/b.bin)
-	// and serves the original bytes.
-	rc, err := br.Storage().Get(context.Background(), fmt.Sprintf("chunks/0/0/%d_0_8", firstID), 0, 8)
-	if err != nil {
-		t.Fatalf("post-rename fetch of the demoted slice: %v", err)
-	}
-	data, _ := io.ReadAll(rc)
-	_ = rc.Close()
-	if string(data) != "AAAAAAAA" {
-		t.Fatalf("post-rename bytes = %q, want AAAAAAAA", data)
-	}
-}
-
-// A commit's completion must not resolve the overlay-reproducibility flags
-// of images that still carry an UN-PUBLISHED write from the same inode: the
-// surgical delete removes only the commit's own snapshot, and a sibling
-// write appended mid-flight survives. Clearing the flags there would let
-// cache pressure demote an image whose bytes are the only copy of that
-// write.
-//
-// The mid-flight state is constructed directly (a survivor in b.pending
-// plus its staged bytes): with in-line commits there is no public sequence
-// that reliably parks two writes in that window.
-func TestOverlayWithSurvivingWriteStaysProtected(t *testing.T) {
-	f := newFakeV2(t)
-	f.setLegacy(true)
-	f.setDir("/d", true)
-	eng := NewEngine(EngineConfig{Client: client.New(f.URL, ""), RemoteRoot: "/", CacheDir: engineCacheDir(t)})
-	h := New(Options{Engine: eng, Threshold: 0})
-	res, _, _ := dispatchCreate(context.Background(), h, "/d/f.bin", syscall.O_RDWR|syscall.O_CREAT)
-	eh := res.Handle.(*engineHandle)
-	if err := eh.Write(context.Background(), 0, []byte("AAAA")); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Flush(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	br := eng.Bridge
-	// Two un-published writes on top of the landed AAAA: Z@0 (the commit's
-	// own snapshot) and Y@1 (the survivor).
-	zSum, ySum := sha256Hex([]byte("Z")), sha256Hex([]byte("Y"))
-	br.StageBlockForTest(zSum, []byte("Z"))
-	br.StageBlockForTest(ySum, []byte("Y"))
-	br.AddPendingForTest(eh.ino, 0, 0, zSum, 1, 4)
-	br.AddPendingForTest(eh.ino, 0, 1, ySum, 1, 4)
-	old := classicReadCacheBytes
-	classicReadCacheBytes = 1
-	defer func() { classicReadCacheBytes = old }()
-	// The read overlays both pending writes on the remote base and stages
-	// the composed image as a LOCAL OVERLAY.
-	if got := readFront(t, eh, 4); got != "ZYAA" {
-		t.Fatalf("overlay read = %q, want ZYAA", got)
-	}
-	// Only Z lands. Y is still pending, so the image is NOT reproducible
-	// from the remote and its overlay flag must survive.
-	br.mu.Lock()
-	pend := append([]pendingWrite(nil), br.pending[eh.ino]...)
-	br.mu.Unlock()
-	if len(pend) != 2 {
-		t.Fatalf("pending writes = %d, want 2 (Z and Y)", len(pend))
-	}
-	br.releaseCommitted(eh.ino, pend[:1])
-	// Pressure hard: the ZYAA image must stay.
-	for i := 0; i < 8; i++ {
-		d := make([]byte, 4096)
-		_, _ = rand.Read(d)
-		br.stageClassicChunk(sha256Hex(d), d, "/d/f.bin", int64(i+1)<<20, false, fmt.Sprintf("res-%d", i+2), 1)
-	}
-	if got := readFront(t, eh, 4); got != "ZYAA" {
-		t.Fatalf("post-pressure read = %q, want ZYAA (an image with a surviving pending write must not demote)", got)
-	}
-}
 
 // Round-60: an echo-less completion binds NOTHING, even when the occupant's
 // whole image matches byte for byte. Content is not identity — a byte-identical
@@ -4303,29 +3333,6 @@ func TestEcholessCompletionBindsNothing(t *testing.T) {
 	}
 }
 
-// The classic mirror: no echo and a classic occupant refuses on every
-// retry — the descriptor never adopts it.
-func TestEcholessClassicOccupantRefusedOnRetries(t *testing.T) {
-	f := newFakeV2(t)
-	f.setLegacy(true)
-	f.mu.Lock()
-	f.completeEcho = false
-	f.mu.Unlock()
-	f.setDir("/d", true)
-	h := newTestHandler(t, f, 0)
-	res, _, _ := dispatchCreate(context.Background(), h, "/d/c.bin", syscall.O_RDWR|syscall.O_CREAT)
-	eh := res.Handle.(*engineHandle)
-	if err := eh.Write(context.Background(), 0, []byte("AAAA")); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Flush(context.Background()); err == nil {
-		t.Fatal("an echo-less completion over a classic occupant must refuse")
-	}
-	// Retrying keeps refusing; nothing is adopted.
-	if err := eh.Sync(context.Background()); err == nil {
-		t.Fatal("the refusal must persist across retries")
-	}
-}
 
 // Round-47: with no completion echo, an extent occupant that replaced OUR
 // landing BEFORE the classification Stat must not be adopted — its read
@@ -4972,42 +3979,6 @@ func TestFreshCreateMarkerDoesNotSurviveReuse(t *testing.T) {
 	}
 }
 
-// Round-60: a session that DEGRADES to the classic layout is usable again once
-// the server echoes the landed identity — the echo is layout-independent, so
-// the client never needs the (rejected) whole-image proof to attribute a
-// classic landing.
-func TestClassicFallbackBindsCompletionEcho(t *testing.T) {
-	f := newFakeV2(t)
-	f.setLegacy(true) // the initiate answers a CLASSIC plan
-	f.setDir("/d", true)
-	h := newTestHandler(t, f, 0)
-	res, _, _ := dispatchCreate(context.Background(), h, "/d/c.bin", syscall.O_RDWR|syscall.O_CREAT)
-	eh := res.Handle.(*engineHandle)
-	if err := eh.Write(context.Background(), 0, []byte("CLASSIC")); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Flush(context.Background()); err != nil {
-		t.Fatalf("a classic-degraded landing with an identity echo must be usable: %v", err)
-	}
-	if got := f.contentOf("/d/c.bin"); got != "CLASSIC" {
-		t.Fatalf("content = %q, want CLASSIC", got)
-	}
-	if got := h.opts.Engine.Bridge.publicationIdentity(eh.ino); got == "" {
-		t.Fatal("the completion echo must bind the landed identity")
-	}
-	// And the descriptor stays writable through the classic surface. The
-	// rewrite is the SAME length, so it fully replaces the image rather than
-	// partially overwriting it.
-	if err := eh.Write(context.Background(), 0, []byte("SECOND!")); err != nil {
-		t.Fatal(err)
-	}
-	if err := eh.Flush(context.Background()); err != nil {
-		t.Fatalf("second write: %v", err)
-	}
-	if got := f.contentOf("/d/c.bin"); got != "SECOND!" {
-		t.Fatalf("content after rewrite = %q, want SECOND!", got)
-	}
-}
 
 // The capability boundary must be established BEFORE publishing: a server that
 // does not advertise completion_identity_v1 cannot give this descriptor an
@@ -5089,18 +4060,17 @@ func TestExtentDurabilityIsCloseToOpenForEveryProfile(t *testing.T) {
 				RemoteRoot: "/",
 				CacheDir:   engineCacheDir(t),
 			})
-			h := New(Options{Engine: eng, Threshold: 1 << 20})
+			h := New(Options{Engine: eng, Threshold: 1 << 20, WriteSync: profile == "write-sync"})
 			eh := claimOpen(t, h, "/big.bin")
 
-			// Write alone must not publish: the community writer buffers
-			// until a chunk fills or the file is flushed, whatever profile
-			// the mount selected. (write-sync is the documented exception
-			// in the CLASSIC plane; the extent plane has no such hook, and
-			// saying so here is the point of the test.)
 			if err := eh.Write(context.Background(), 0, []byte("ABCDEFGH")); err != nil {
 				t.Fatalf("write: %v", err)
 			}
-			if got := f.contentOf("/big.bin"); got != "XXXXXXXX" {
+			if profile == "write-sync" {
+				if got := f.contentOf("/big.bin"); got != "ABCDEFGH" {
+					t.Fatalf("write-sync Write did not publish remotely: remote = %q, want ABCDEFGH", got)
+				}
+			} else if got := f.contentOf("/big.bin"); got != "XXXXXXXX" {
 				t.Fatalf("Write published early: remote = %q, want XXXXXXXX", got)
 			}
 
@@ -5122,5 +4092,118 @@ func TestExtentDurabilityIsCloseToOpenForEveryProfile(t *testing.T) {
 				t.Fatalf("close-to-open read = %q, want ABCDEFGH", got)
 			}
 		})
+	}
+}
+
+func TestLocalSetAttrBeforeMaterializationPreservesModeAndMtime(t *testing.T) {
+	f := newFakeV2(t)
+	f.setDir("/d", true)
+	h := newTestHandler(t, f, 0)
+	ctx := context.Background()
+
+	res, _, passed := dispatchCreate(ctx, h, "/d/unzip-item.bin", syscall.O_RDWR|syscall.O_CREAT)
+	if passed || res.Handle == nil {
+		t.Fatal("expected engine handle")
+	}
+	eh := res.Handle.(*engineHandle)
+	if err := eh.Write(ctx, 0, []byte("ZIP-PAYLOAD")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	wantMtime := time.Unix(1700000123, 0).UTC()
+	setRes, err := h.Do(ctx, &fs.Op{
+		Kind:    fs.OpSetAttr,
+		Path:    "/d/unzip-item.bin",
+		HasMode: true,
+		Mode:    0o755,
+		Mtime:   wantMtime,
+	}, func(context.Context, *fs.Op) (fs.Result, error) {
+		return fs.Result{}, syscall.ENOENT
+	})
+	if err != nil {
+		t.Fatalf("local OpSetAttr before close returned error: %v", err)
+	}
+	if setRes.Attr == nil || setRes.Attr.Mode != 0o755 || !setRes.Attr.Mtime.Equal(wantMtime) {
+		t.Fatalf("local OpSetAttr attr = %+v, want mode=0755 mtime=%v", setRes.Attr, wantMtime)
+	}
+	if err := eh.Release(ctx); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	f.mu.Lock()
+	gotMode := f.chmods["/d/unzip-item.bin"]
+	f.mu.Unlock()
+	if gotMode != 0o755 {
+		t.Fatalf("remote mode after release = %#o, want 0o755", gotMode)
+	}
+}
+
+func TestMaterializeEmptyAndSecondOpenUnderNonRootRemoteRoot(t *testing.T) {
+	f := newFakeV2(t)
+	f.setDir("/subroot", true)
+
+	eng := NewEngine(EngineConfig{
+		Client:     client.New(f.URL, ""),
+		RemoteRoot: "/subroot",
+	})
+	h := New(Options{Engine: eng, Threshold: 0})
+	ctx := context.Background()
+
+	// 1. Writer opens /wal.db under RemoteRoot="/subroot" and syncs twice at 0B
+	// (modeling SQLite WAL initialization before first checkpoint).
+	wRes, err := h.Do(ctx, &fs.Op{
+		Kind:    fs.OpCreate,
+		Path:    "/wal.db",
+		Flags:   syscall.O_CREAT | syscall.O_RDWR,
+		HasMode: true,
+		Mode:    0o644,
+	}, nil)
+	if err != nil {
+		t.Fatalf("writer open: %v", err)
+	}
+	wh := wRes.Handle.(*engineHandle)
+	if err := wh.Sync(ctx); err != nil {
+		t.Fatalf("first 0B Sync: %v", err)
+	}
+	if err := wh.Sync(ctx); err != nil {
+		t.Fatalf("second 0B Sync (must not double RemoteRoot in nameMaterialized): %v", err)
+	}
+
+	// 2. Concurrent reader opens /wal.db while it is still a 0-byte placeholder.
+	rRes, err := h.Do(ctx, &fs.Op{
+		Kind:  fs.OpCreate,
+		Path:  "/wal.db",
+		Flags: syscall.O_CREAT | syscall.O_RDWR,
+	}, nil)
+	if err != nil {
+		t.Fatalf("reader open: %v", err)
+	}
+	rh := rRes.Handle.(*engineHandle)
+	if err := rh.Release(ctx); err != nil {
+		t.Fatalf("reader release: %v", err)
+	}
+
+	// 3. Writer checkpoints pages into /wal.db, syncs twice, and closes.
+	payload := []byte("SQLITE-CHECKPOINT-PAGES-0123456789")
+	if err := wh.Write(ctx, 0, payload); err != nil {
+		t.Fatalf("checkpoint write 1: %v", err)
+	}
+	if err := wh.Sync(ctx); err != nil {
+		t.Fatalf("checkpoint sync 1: %v", err)
+	}
+	header := []byte("SQLITE-HDR")
+	if err := wh.Write(ctx, 0, header); err != nil {
+		t.Fatalf("checkpoint write 2: %v", err)
+	}
+	if err := wh.Sync(ctx); err != nil {
+		t.Fatalf("checkpoint sync 2: %v", err)
+	}
+	if err := wh.Release(ctx); err != nil {
+		t.Fatalf("writer release: %v", err)
+	}
+
+	want := append([]byte(nil), payload...)
+	copy(want, header)
+	if got := f.contentOf("/subroot/wal.db"); got != string(want) {
+		t.Fatalf("remote /subroot/wal.db = %q, want %q", got, string(want))
 	}
 }

@@ -514,6 +514,10 @@ func (b *Dat9Backend) RemoveCtx(ctx context.Context, path string) (err error) {
 }
 
 func (b *Dat9Backend) RemoveFileCtx(ctx context.Context, path string) (err error) {
+	return b.RemoveFileConditionalCtx(ctx, path, 0, "")
+}
+
+func (b *Dat9Backend) RemoveFileConditionalCtx(ctx context.Context, path string, expectedRevision int64, expectedFileID string) (err error) {
 	start := time.Now()
 	defer func() { observeBackend(ctx, b.tenantID, b.tidbCloudOrgID, "remove_file", err, start) }()
 
@@ -524,7 +528,7 @@ func (b *Dat9Backend) RemoveFileCtx(ctx context.Context, path string) (err error
 	if err := rejectRootFileNodePath(path); err != nil {
 		return err
 	}
-	_, err = b.store.DeleteFileWithRefCheck(ctx, path)
+	_, err = b.store.DeleteFileWithRefCheckConditional(ctx, path, expectedRevision, expectedFileID)
 	if err == nil {
 		b.notifyWorkEnqueued(BackendWorkFileGC)
 	}

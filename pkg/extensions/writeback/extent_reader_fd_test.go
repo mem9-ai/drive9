@@ -32,6 +32,11 @@ func TestSpilledExtentUploadClosesItsReader(t *testing.T) {
 		}
 		return len(ents)
 	}
+	// Warm the HTTP transport's keep-alive pool for parallel 4 MiB part PUTs so
+	// idle socket pooling is not miscounted as leaked shadow file descriptors.
+	if _, err := cq.uploadEntry(context.Background(), entry); err != nil {
+		t.Fatalf("warmup upload: %v", err)
+	}
 	before := countFDs()
 	const uploads = 40
 	for i := 0; i < uploads; i++ {

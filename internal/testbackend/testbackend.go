@@ -1202,6 +1202,7 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		b.writeJSON(w, map[string]any{"revision": rev})
 
 	case r.Method == http.MethodDelete:
+		expRev, _ := strconv.ParseInt(r.Header.Get("X-Dat9-Expected-Revision"), 10, 64)
 		b.mu.Lock()
 		if b.failDelete[p] > 0 {
 			b.failDelete[p]--
@@ -1210,12 +1211,23 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		n := b.files[p]
-		delete(b.files, p)
-		b.mu.Unlock()
 		if n == nil {
+			b.mu.Unlock()
 			b.writeErr(w, http.StatusNotFound, "not found")
 			return
 		}
+		if q.Get("kind") == "file" && n.IsDir {
+			b.mu.Unlock()
+			b.writeErr(w, http.StatusNotFound, "not found")
+			return
+		}
+		if expRev > 0 && n.Rev != expRev {
+			b.mu.Unlock()
+			b.writeErr(w, http.StatusConflict, "revision conflict")
+			return
+		}
+		delete(b.files, p)
+		b.mu.Unlock()
 		w.WriteHeader(http.StatusOK)
 
 	case q.Has("append-log"):

@@ -104,35 +104,39 @@ type Engine struct {
 
 // NewEngine builds a ready-to-use engine.
 func NewEngine(cfg EngineConfig) *Engine {
-	bcfg := Config{
-		Client:          cfg.Client,
-		RemoteRoot:      cfg.RemoteRoot,
-		NativeWriteback: cfg.Writeback && cfg.CacheDir != "",
-		WritebackWait:   cfg.WritebackWait,
-		CacheDir:        cfg.CacheDir,
-	}
-	b := NewBridge(bcfg)
-	// CacheSize 0 means NO disk cache (JuiceFS's memory-only mode: reads
-	// bypass the cache, writeback is disabled by SelfCheck). It must not
-	// silently become a 1 GiB default — the mount wiring derives this value
-	// from --disk-read-cache-size-mb so the operator's budget is exact.
-	//
-	// The extent plane has no second consumer of this allowance: the
-	// durable interactive-fsync staging tree that used to be carved out of
-	// it is gone (the plane promises only JuiceFS's own close-to-open
-	// behavior), so the operator's number passes through verbatim.
 	cacheSize := uint64(cfg.CacheSize)
-	blockSize := blockSizeMiB << 20
-	nativeWriteback := cfg.Writeback && cfg.CacheDir != ""
+	var spoolBudget int64
+	if cfg.CacheDir != "" && cacheSize >= 16<<20 {
+		reserve := cacheSize / 4
+		if reserve > 256<<20 {
+			reserve = 256 << 20
+		}
+		spoolBudget = int64(reserve)
+		cacheSize -= reserve
+	}
+	freeRatio := float64(cfg.FreeSpaceRatio)
+	if freeRatio == 0 {
+		freeRatio = 0.10
+	}
+	nativeWriteback := cfg.Writeback && cfg.CacheDir != "" && spoolBudget > 0
 	maxUpload := cfg.MaxUpload
 	if maxUpload <= 0 {
 		maxUpload = envMaxUpload(nativeWriteback)
 	}
+	bcfg := Config{
+		Client:          cfg.Client,
+		RemoteRoot:      cfg.RemoteRoot,
+		NativeWriteback: nativeWriteback,
+		WritebackWait:   cfg.WritebackWait,
+		CacheDir:        cfg.CacheDir,
+		SpoolBudget:     spoolBudget,
+		FreeSpaceRatio:  freeRatio,
+		MaxUpload:       maxUpload,
+	}
+	b := NewBridge(bcfg)
+	blockSize := blockSizeMiB << 20
 	putTimeout := time.Minute
 	if !nativeWriteback {
-		// In-memory staging throttles objectStorage.Put via waitSliceAdmission
-		// while serial PATCH commits drain; keep PutTimeout generous so queuing
-		// behind normal commit backpressure never triggers retry storms.
 		putTimeout = 10 * time.Minute
 	}
 	chunkConf := chunk.Config{

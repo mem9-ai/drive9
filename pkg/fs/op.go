@@ -294,6 +294,7 @@ type Op struct {
 	Name    string   // xattr name for Op{Get,Set,Remove}Xattr
 	Mask    uint32   // OpAccess mask
 	Fh2     uint64   // destination handle identity for OpCopyFileRange
+	Handle2 any      // destination handle token for OpCopyFileRange
 	Offset2 int64    // OpCopyFileRange destination offset
 	Lock    FileLock // OpGetLk / OpSetLk / OpSetLkw payload
 }

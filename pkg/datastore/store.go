@@ -2040,6 +2040,10 @@ func (s *Store) ListDir(ctx context.Context, parentPath string) (out []*NodeWith
 }
 
 func (s *Store) DeleteFileWithRefCheck(ctx context.Context, path string) (out *File, err error) {
+	return s.DeleteFileWithRefCheckConditional(ctx, path, 0, "")
+}
+
+func (s *Store) DeleteFileWithRefCheckConditional(ctx context.Context, path string, expectedRevision int64, expectedFileID string) (out *File, err error) {
 	start := time.Now()
 	defer observeStoreOp(ctx, "delete_file_with_ref_check", start, &err)
 
@@ -2056,6 +2060,12 @@ func (s *Store) DeleteFileWithRefCheck(ctx context.Context, path string) (out *F
 
 	if candidate.isDir {
 		return nil, ErrNotFound
+	}
+	if expectedFileID != "" && candidate.fileID != expectedFileID {
+		return nil, ErrRevisionConflict
+	}
+	if expectedRevision > 0 && candidate.revision != expectedRevision {
+		return nil, ErrRevisionConflict
 	}
 
 	if _, err := tx.Exec(`DELETE FROM file_nodes WHERE `+s.scope.And(`path_hash = ? AND path = ?`),
@@ -2178,9 +2188,10 @@ func (s *Store) DeleteDirRecursive(ctx context.Context, dirPath string) (out []*
 }
 
 type deleteCandidate struct {
-	fileID string
-	isDir  bool
-	file   *File
+	fileID   string
+	revision int64
+	isDir    bool
+	file     *File
 }
 
 const deleteFileIDBatchSize = 1000
@@ -2198,7 +2209,7 @@ func (s *Store) scanDeleteCandidateTx(ctx context.Context, tx *sql.Tx, path stri
 		return scanLegacyDeleteCandidate(row)
 	}
 	row := tx.QueryRowContext(ctx, `SELECT fn.file_id, fn.is_directory,
-		c.storage_type, c.storage_ref, i.size_bytes, COALESCE(c.content_type, ''),
+		c.storage_type, c.storage_ref, i.size_bytes, i.revision, COALESCE(c.content_type, ''),
 		s.embedding_revision
 		FROM file_nodes fn
 		LEFT JOIN inodes i ON `+s.scope.AndOn(`i.inode_id = fn.file_id`, "i")+`
@@ -2227,8 +2238,9 @@ func scanLegacyDeleteCandidate(row *sql.Row) (*deleteCandidate, error) {
 		return nil, err
 	}
 	c := &deleteCandidate{
-		fileID: nodeFileID.String,
-		isDir:  isDir,
+		fileID:   nodeFileID.String,
+		revision: revision.Int64,
+		isDir:    isDir,
 	}
 	if fFileID.Valid {
 		c.file = fileFromLegacyGCScan(fFileID.String, storageType, storageRef, encMode, encKeyID,
@@ -2242,8 +2254,8 @@ func scanSplitDeleteCandidate(row *sql.Row) (*deleteCandidate, error) {
 	var nodeFileID sql.NullString
 	var isDir bool
 	var storageType, storageRef, contentType sql.NullString
-	var sizeBytes, embeddingRevision sql.NullInt64
-	err := row.Scan(&nodeFileID, &isDir, &storageType, &storageRef, &sizeBytes, &contentType, &embeddingRevision)
+	var sizeBytes, revision, embeddingRevision sql.NullInt64
+	err := row.Scan(&nodeFileID, &isDir, &storageType, &storageRef, &sizeBytes, &revision, &contentType, &embeddingRevision)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
@@ -2251,8 +2263,9 @@ func scanSplitDeleteCandidate(row *sql.Row) (*deleteCandidate, error) {
 		return nil, err
 	}
 	c := &deleteCandidate{
-		fileID: nodeFileID.String,
-		isDir:  isDir,
+		fileID:   nodeFileID.String,
+		revision: revision.Int64,
+		isDir:    isDir,
 	}
 	if nodeFileID.Valid && storageType.Valid {
 		f := &File{

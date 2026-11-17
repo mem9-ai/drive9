@@ -36,6 +36,8 @@ import (
 	"context"
 	"encoding/binary"
 	"hash/fnv"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -62,6 +64,13 @@ type Config struct {
 	WritebackWait time.Duration
 	// CacheDir is the engine cache root; staged slices are streamed here.
 	CacheDir string
+	// SpoolBudget bounds on-disk staging spool bytes carved out of CacheSize.
+	SpoolBudget int64
+	// FreeSpaceRatio is the minimum filesystem free-space ratio for disk spooling.
+	FreeSpaceRatio float64
+	// MaxUpload mirrors the chunk store's upload concurrency so memory-only
+	// staging never blocks all upload workers simultaneously.
+	MaxUpload int
 }
 
 const (
@@ -82,16 +91,7 @@ type Bridge struct {
 	// blocks maps deterministic ids (content sha256, or the zero-block ids)
 	// to their URL registry entry.
 	blocks *blockRegistry
-	// classicLRU bounds the staging bytes retained for classic-owned
-	// reads (oldest-first retirement beyond classicReadCacheBytes).
-	classicLRU   []classicRef
-	classicBytes int64
 
-	// layoutPending marks a fresh upload of OURS whose landed layout
-	// could not be classified (stat outage) — proof of ownership that a
-	// foreign replacement can never carry. verifyBase carries an
-	// identity-verified recovery's expected revision/resource, consumed
-	// by the next commit as its CAS base.
 	// commitErr remembers the last landing failure for an inode so the
 	// flush/close boundary (FlushFile) surfaces it — Bridge.Write itself
 	// returns success to keep the community writer clean (its sticky
@@ -105,27 +105,15 @@ type Bridge struct {
 	// whoever happens to hold the name).
 	freshCreate map[meta.Ino]bool
 	// layoutPendingID is the resource identity of OUR landed upload for
-	// an inode whose classification failed: adopting the classic surface
-	// is only valid while the occupant is still THAT object.
+	// an inode, carried forward as X-Dat9-Expected-Resource on PATCH commits.
 	layoutPendingID map[meta.Ino]string
 	verifyBase      map[meta.Ino]verifyBase
-	// classicOwned marks files whose fresh extent session silently
-	// degraded to a CLASSIC upload on a legacy server: the handle stays
-	// owned by this bridge, so commits and reads keep serving it through
-	// the classic wire surface instead of erroring on the layout.
-	classicOwned map[meta.Ino]bool
 	// emptyPlaceholders records the FULL remote paths this bridge
-	// materialized as zero-byte classic files (a claimed create's final
-	// close with no writes — the extent plane has no zero-size session).
-	// The record is the mount-local attribution that lets a later open
-	// re-claim the name through the engine and the next commit replace
-	// the placeholder with the fresh extent create the descriptor
-	// semantically is; without it a size-0 classic occupant is
-	// indistinguishable from a foreign file and must stay classic.
-	// Re-verification is always live (the occupant must still be a
-	// 0-byte classic file), so stale entries are inert.
-	emptyPlaceholders    map[string]bool
-	emptyPlaceholderOrd  []string // FIFO for the bounded-recency cap below
+	// materialized as zero-byte classic files when talking to an older server
+	// that predates native 0-byte extent creation (?create=1&layout=extent),
+	// together with the created revision and resource identity.
+	emptyPlaceholders   map[string]verifyBase
+	emptyPlaceholderOrd []string // FIFO for the bounded-recency cap below
 	// commitLocks serializes per-file commit lifecycles (FlushFile).
 	commitMu    sync.Mutex
 	commitLocks map[meta.Ino]*sync.Mutex
@@ -149,16 +137,22 @@ type Bridge struct {
 	// statement in the same sqlite3_exec batch fails with "no such table".
 	buffered map[meta.Ino]int64
 	revs     map[meta.Ino]int64 // newest revision known to be published
+	pubSizes map[meta.Ino]int64 // remote size corresponding to revs[ino]
 	// revAt records when THIS mount last published an inode. Only then can a
 	// read legitimately disagree with the server (replica lag); a revision
 	// recorded from someone else's write, or a publication minutes ago, gives
 	// a read nothing to wait for.
-	revAt   map[meta.Ino]time.Time
-	pending map[meta.Ino][]pendingWrite
-	truncs  map[meta.Ino]int64 // truncate-only growth awaiting the next commit
-	// modes remembers fresh-create modes until the first commit applies
-	// them server-side (the sequential create itself has no mode field).
-	modes map[meta.Ino]uint32
+	revAt    map[meta.Ino]time.Time
+	pending  map[meta.Ino][]pendingWrite
+	truncs   map[meta.Ino]int64  // truncate-only growth awaiting the next commit
+	truncSeq map[meta.Ino]uint64 // monotonic counter fencing b.truncs cleanup
+	retryRunning bool
+	retryStop    chan struct{}
+	retryOnce    sync.Once
+	// modes and mtimes remember local-only create/setattr values until the
+	// first remote publication applies them server-side.
+	modes  map[meta.Ino]uint32
+	mtimes map[meta.Ino]time.Time
 	// sentinels tracks the hidden keep-alive names THIS bridge created
 	// (silly-rename); only registered names may be deleted at last close —
 	// a user filename that merely contains ".d9open-" is never ours.
@@ -200,34 +194,50 @@ func NewBridge(cfg Config) *Bridge {
 	if root == "" {
 		root = "/"
 	}
-	br := &Bridge{
-		cfg:             cfg,
-		format:          meta.Format{Name: "drive9", UUID: "drive9-extent-v2", Storage: "drive9-presign", BlockSize: blockSizeMiB << 20, TrashDays: 0, DirStats: false},
-		nextID:          uint64(1) << 63,
-		stagedSlices:    make(map[uint64]*stagedSlice),
-		blocks:          newBlockRegistry(),
-		paths:           map[meta.Ino]string{rootIno: root},
-		sizes:           make(map[meta.Ino]int64),
-		revs:            make(map[meta.Ino]int64),
-		revAt:           make(map[meta.Ino]time.Time),
-		buffered:        make(map[meta.Ino]int64),
-		pending:         make(map[meta.Ino][]pendingWrite),
-		truncs:          make(map[meta.Ino]int64),
-		modes:           make(map[meta.Ino]uint32),
-		sentinels:       make(map[string]meta.Ino),
-		nextHeldIno:     heldInoBase,
-		moved:           make(map[meta.Ino]string),
-		replacements:    make(map[string]meta.Ino),
-		commitLocks:     make(map[meta.Ino]*sync.Mutex),
-		locks:           newLockTable(),
-		classicOwned:    make(map[meta.Ino]bool),
-		layoutPending:   make(map[meta.Ino]bool),
-		layoutPendingID: make(map[meta.Ino]string),
-		freshCreate:     make(map[meta.Ino]bool),
-		commitErr:       make(map[meta.Ino]error),
-		verifyBase:      make(map[meta.Ino]verifyBase),
-		emptyPlaceholders: make(map[string]bool),
+	if cfg.CacheDir != "" {
+		if entries, err := os.ReadDir(cfg.CacheDir); err == nil {
+			for _, ent := range entries {
+				if strings.HasPrefix(ent.Name(), "extent-stage-") || strings.HasPrefix(ent.Name(), "extent-spill-") {
+					_ = os.Remove(filepath.Join(cfg.CacheDir, ent.Name()))
+				}
+			}
+		}
 	}
+	br := &Bridge{
+		cfg:               cfg,
+		format:            meta.Format{Name: "drive9", UUID: "drive9-extent-v2", Storage: "drive9-presign", BlockSize: blockSizeMiB << 20, TrashDays: 0, DirStats: false},
+		nextID:            uint64(1) << 63,
+		stagedSlices:      make(map[uint64]*stagedSlice),
+		blocks:            newBlockRegistry(),
+		paths:             map[meta.Ino]string{rootIno: root},
+		sizes:             make(map[meta.Ino]int64),
+		revs:              make(map[meta.Ino]int64),
+		pubSizes:          make(map[meta.Ino]int64),
+		revAt:             make(map[meta.Ino]time.Time),
+		buffered:          make(map[meta.Ino]int64),
+		pending:           make(map[meta.Ino][]pendingWrite),
+		truncs:            make(map[meta.Ino]int64),
+		truncSeq:          make(map[meta.Ino]uint64),
+		retryStop:         make(chan struct{}),
+		modes:             make(map[meta.Ino]uint32),
+		mtimes:            make(map[meta.Ino]time.Time),
+		sentinels:         make(map[string]meta.Ino),
+		nextHeldIno:       heldInoBase,
+		moved:             make(map[meta.Ino]string),
+		replacements:      make(map[string]meta.Ino),
+		commitLocks:       make(map[meta.Ino]*sync.Mutex),
+		locks:             newLockTable(),
+		layoutPending:     make(map[meta.Ino]bool),
+		layoutPendingID:   make(map[meta.Ino]string),
+		freshCreate:       make(map[meta.Ino]bool),
+		commitErr:         make(map[meta.Ino]error),
+		verifyBase:        make(map[meta.Ino]verifyBase),
+		emptyPlaceholders: make(map[string]verifyBase),
+	}
+	br.blocks.cacheDir = cfg.CacheDir
+	br.blocks.diskBudget = cfg.SpoolBudget
+	br.blocks.freeRatio = cfg.FreeSpaceRatio
+	br.blocks.maxUpload = cfg.MaxUpload
 	// Provenance refetch resolves through the inode's CURRENT mapping:
 	// open files move under renames and retention aliases, and a stale
 	// plan path belongs to a replacement file or nothing at all.
@@ -245,23 +255,6 @@ type verifyBase struct {
 	rev   int64
 	resID string
 }
-
-// classicRef is one staged classic chunk read on the bounded LRU.
-type classicRef struct {
-	sum   string
-	id    uint64
-	bytes int64
-	at    time.Time
-	path  string // classic remote source (provenance fallback)
-	start int64
-	resID string // the source object's identity when staged
-	ino   meta.Ino
-}
-
-// newBridgeFinish installs cross-referencing hooks that need the assembled
-// Bridge (the block registry resolves provenance inodes through the
-// bridge's CURRENT path mappings — open files move under renames and
-// retention aliases).
 
 // Storage returns the object backend for the chunk store.
 func (b *Bridge) Storage() objectStorage {
@@ -370,16 +363,17 @@ type blockRegistry struct {
 	// reservation so admitting block 0 of a 4 MiB-blocked slice accounts its
 	// expected 64 MiB chunk footprint immediately instead of letting MaxUpload
 	// workers admit 16 concurrent slices in parallel before subsequent blocks fit.
-	sliceTarget  map[uint64]int64
-	sliceUsed    map[uint64]int64
-	sliceWriters map[uint64]int
+	sliceTarget     map[uint64]int64
+	sliceUsed       map[uint64]int64
+	stagedDiskBytes int64
+	diskBudget      int64
+	freeRatio       float64
+	cacheDir        string
+	maxUpload       int
+	putWaiters      int
 	// budgetCh is closed (and replaced under mu) whenever pinnedBytes or
 	// stagedMemBytes drops or a waiter departs, waking budget waiters.
 	budgetCh chan struct{}
-	// issued tracks outstanding readers of staged classic ids: an issued
-	// entry is immune from LRU retirement until its fetch consumes the pin.
-	issued     map[uint64]int
-	issueOrder []uint64 // handout insertion order (oldest first)
 	// currentPath resolves an inode to the remote path it maps to NOW.
 	currentPath func(ino meta.Ino) (string, bool)
 }
@@ -392,9 +386,6 @@ type blockEntry struct {
 	path            string // provenance for plan refetch
 	provenanceStart int64
 	provenanceIno   meta.Ino // whose mapping the provenance path belongs to
-	classicRange    int64    // >0: classic-read provenance of this many bytes (re-fetch via ReadStreamRange)
-	localOverlay    bool     // cached bytes include local-only writes: never demote to the remote range
-	provResID       string   // classic provenance: the source object's identity (refetch verifies)
 	cached          []byte
 }
 
@@ -406,9 +397,7 @@ func newBlockRegistry() *blockRegistry {
 		waitingSlices: make(map[uint64]int),
 		sliceTarget:   make(map[uint64]int64),
 		sliceUsed:     make(map[uint64]int64),
-		sliceWriters:  make(map[uint64]int),
 		budgetCh:      make(chan struct{}),
-		issued:        make(map[uint64]int),
 	}
 }
 

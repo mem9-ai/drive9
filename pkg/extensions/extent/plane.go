@@ -36,6 +36,8 @@ type Options struct {
 	// Events, when set, drops the bridge's cached mappings when names
 	// vanish or change underneath the engine.
 	Events *fs.EventBus
+	// WriteSync enforces remote publication before Write returns (--durability write-sync).
+	WriteSync bool
 }
 
 // Handler routes extent files onto the engine plane.
@@ -218,6 +220,13 @@ func vfsCtx(c fs.Caller) vfs.LogContext {
 	return vfs.NewLogContext(meta.NewContext(c.Pid, c.Uid, []uint32{c.Gid}))
 }
 
+func vfsCtxWith(ctx context.Context, c fs.Caller) vfs.LogContext {
+	if ctx == nil {
+		return vfsCtx(c)
+	}
+	return vfs.NewLogContext(meta.WrapWithoutCancel(ctx, c.Pid, c.Uid, []uint32{c.Gid}))
+}
+
 // openExistingLocked opens an engine handle for a path ALREADY known to hold
 // extent layout. The caller holds the path lock.
 func (h *Handler) openExistingLocked(ctx context.Context, path string, flags uint32, c fs.Caller) (fs.Handle, *fs.Attr, syscall.Errno) {
@@ -392,6 +401,9 @@ func (h *Handler) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, e
 				return res, err
 			}
 		}
+		if res, handled := h.setAttrLocalOnly(ctx, op); handled {
+			return res, nil
+		}
 	case fs.OpFallocate:
 		// VFS owns this op end to end: it validates against the kernel's
 		// limits, takes the handle's write lock, and drives Meta.Fallocate
@@ -405,9 +417,7 @@ func (h *Handler) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, e
 			return res, err
 		}
 	case fs.OpCopyFileRange:
-		// Same shape: VFS.CopyFileRange is the implementation (it reads
-		// through the source handle and writes through the destination's).
-		if res, err, handled := h.copyFileRangeOverEngine(op); handled {
+		if res, err, handled := h.copyFileRangeOverEngine(ctx, op); handled {
 			return res, err
 		}
 	case fs.OpGetAttr:
@@ -452,19 +462,46 @@ func (h *Handler) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, e
 //
 // handled=false when this plane owns no such handle, so the op keeps its
 // normal route (classic files are none of this plane's business).
-func (h *Handler) engineHandleOp(op *fs.Op, call func(*engineHandle) syscall.Errno) (fs.Result, error, bool) {
-	if h.opts.Engine == nil || op.Fh == 0 {
-		return fs.Result{}, nil, false
-	}
-	h.mu.Lock()
-	var live *engineHandle
-	for _, e := range h.handles[op.Path] {
-		if e.fh == op.Fh {
-			live = e
-			break
+func resolveEngineHandle(raw any) *engineHandle {
+	cur := raw
+	for cur != nil {
+		if eh, ok := cur.(*engineHandle); ok {
+			return eh
+		}
+		switch u := cur.(type) {
+		case interface{ UnwrapHandle() fs.Handle }:
+			next := u.UnwrapHandle()
+			if next == nil || next == cur {
+				return nil
+			}
+			cur = next
+		case interface{ Unwrap() fs.Handle }:
+			next := u.Unwrap()
+			if next == nil || next == cur {
+				return nil
+			}
+			cur = next
+		default:
+			return nil
 		}
 	}
-	h.mu.Unlock()
+	return nil
+}
+
+func (h *Handler) engineHandleOp(op *fs.Op, call func(*engineHandle) syscall.Errno) (fs.Result, error, bool) {
+	if h.opts.Engine == nil {
+		return fs.Result{}, nil, false
+	}
+	var live *engineHandle
+	if op.Handle != nil {
+		if eh := resolveEngineHandle(op.Handle); eh != nil && eh.plane == h {
+			live = eh
+		}
+	} else if op.Fh != 0 {
+		h.mu.Lock()
+		live = h.handleForLocked(op.Path, op.Fh)
+		h.mu.Unlock()
+	}
 	if live == nil {
 		return fs.Result{}, nil, false
 	}
@@ -474,29 +511,90 @@ func (h *Handler) engineHandleOp(op *fs.Op, call func(*engineHandle) syscall.Err
 	return fs.Result{}, nil, true
 }
 
-// copyFileRangeOverEngine routes a copy to VFS.CopyFileRange when BOTH ends are
-// open engine files on this mount. VFS reads through the source handle and
-// writes through the destination's, which is why it needs both.
-//
-// A copy with either end outside this plane is left to the chain: VFS has no
-// handle to work through, and the classic path never supported the op either.
-func (h *Handler) copyFileRangeOverEngine(op *fs.Op) (fs.Result, error, bool) {
-	if h.opts.Engine == nil || op.Path2 == "" || op.Fh == 0 || op.Fh2 == 0 {
+// copyFileRangeOverEngine copies bytes between two open engine handles on this
+// mount via their VFS reader/writer paths.
+func (h *Handler) copyFileRangeOverEngine(ctx context.Context, op *fs.Op) (fs.Result, error, bool) {
+	if h.opts.Engine == nil {
 		return fs.Result{}, nil, false
 	}
-	h.mu.Lock()
-	src := h.handleForLocked(op.Path, op.Fh)
-	dst := h.handleForLocked(op.Path2, op.Fh2)
-	h.mu.Unlock()
+	var src, dst *engineHandle
+	if op.Handle != nil {
+		if eh := resolveEngineHandle(op.Handle); eh != nil && eh.plane == h {
+			src = eh
+		}
+	} else if op.Fh != 0 {
+		h.mu.Lock()
+		src = h.handleForLocked(op.Path, op.Fh)
+		h.mu.Unlock()
+	}
+	if op.Handle2 != nil {
+		if eh := resolveEngineHandle(op.Handle2); eh != nil && eh.plane == h {
+			dst = eh
+		}
+	} else if op.Fh2 != 0 && op.Path2 != "" {
+		h.mu.Lock()
+		dst = h.handleForLocked(op.Path2, op.Fh2)
+		h.mu.Unlock()
+	}
 	if src == nil || dst == nil {
 		return fs.Result{}, nil, false
 	}
-	copied, errno := h.opts.Engine.VFS.CopyFileRange(src.vctx, src.ino, src.fh,
-		uint64(op.Offset), dst.ino, dst.fh, uint64(op.Offset2), uint64(op.Limit), op.Flags)
-	if errno != 0 {
-		return fs.Result{}, errno, true
+	if op.Flags != 0 {
+		return fs.Result{}, syscall.EINVAL, true
 	}
-	return fs.Result{Written: uint32(copied)}, nil, true
+	if op.Limit < 0 || op.Offset < 0 || op.Offset2 < 0 {
+		return fs.Result{}, syscall.EINVAL, true
+	}
+	if op.Limit == 0 {
+		return fs.Result{Written: 0}, nil, true
+	}
+	if src.ino == dst.ino {
+		inEnd := op.Offset + op.Limit
+		outEnd := op.Offset2 + op.Limit
+		if op.Offset < outEnd && op.Offset2 < inEnd {
+			return fs.Result{}, syscall.EINVAL, true
+		}
+	}
+	const maxChunk = 1 << 20
+	bufLen := op.Limit
+	if bufLen > maxChunk {
+		bufLen = maxChunk
+	}
+	buf := make([]byte, bufLen)
+	var total int64
+	for total < op.Limit {
+		step := op.Limit - total
+		if step > int64(len(buf)) {
+			step = int64(len(buf))
+		}
+		n, rerr := src.Read(ctx, op.Offset+total, buf[:step])
+		if rerr != nil {
+			if total > 0 {
+				break
+			}
+			return fs.Result{}, rerr, true
+		}
+		if n == 0 {
+			break
+		}
+		if errno := h.opts.Engine.VFS.Write(dst.vctx, dst.ino, buf[:n], uint64(op.Offset2+total), dst.fh); errno != 0 {
+			if total > 0 {
+				break
+			}
+			return fs.Result{}, errno, true
+		}
+		h.opts.Engine.Bridge.noteBufferedLength(dst.ino, op.Offset2+total+int64(n))
+		total += int64(n)
+		if int64(n) < step {
+			break
+		}
+	}
+	if total > 0 && h.opts.WriteSync {
+		if err := dst.Sync(ctx); err != nil {
+			return fs.Result{}, err, true
+		}
+	}
+	return fs.Result{Written: uint32(total)}, nil, true
 }
 
 // handleForLocked resolves the live engine handle for path and fh. Caller
@@ -518,7 +616,7 @@ func (h *Handler) TryClaimExistingOpen(ctx context.Context, op *fs.Op) (fs.Resul
 		return fs.Result{}, false, nil
 	}
 	defer h.lockPaths(op.Path)()
-	res, err, claimed := h.tryClaimExistingLocked(ctx, op, false)
+	res, claimed, _, err := h.tryClaimExistingLocked(ctx, op, false)
 	return res, claimed, err
 }
 
@@ -535,14 +633,21 @@ func (h *Handler) tryClaimOpen(ctx context.Context, op *fs.Op) (fs.Result, error
 	// replaced while this claim waited, and a classic replacement must
 	// pass through to the classic plane, never ride the engine.
 	defer h.lockPaths(op.Path)()
-	// A kernel CREATE already resolved the name as missing. Its fresh
-	// path does not need a remote StatLocal: that HEAD is the per-file
-	// latency that made bulk small-file creation (unzip, git) slow.
-	// O_EXCL keeps the probe because it needs server-side arbitration.
+	// A truncating kernel CREATE can claim a fresh path without waiting on a
+	// remote StatLocal: bulk file extraction (unzip, tar, cp) passes O_CREAT|O_TRUNC.
+	// Non-truncating O_CREAT and O_EXCL probe first so any existing file's
+	// contents and layout (classic vs extent) are preserved before open returns.
 	freshKernelCreate := op.KernelCreate() && op.Flags&uint32(syscall.O_CREAT) != 0 &&
-		op.Flags&uint32(syscall.O_EXCL) == 0
-	if res, err, claimed := h.tryClaimExistingLocked(ctx, op, freshKernelCreate); claimed {
+		op.Flags&uint32(syscall.O_EXCL) == 0 && op.Flags&uint32(syscall.O_TRUNC) != 0
+	res, claimed, remoteClassic, err := h.tryClaimExistingLocked(ctx, op, freshKernelCreate)
+	if claimed {
 		return res, err, true
+	}
+	if remoteClassic {
+		// An existing classic/multipart file must remain on the classic
+		// plane even when opened with O_CREAT (e.g. sqlite3 O_RDWR|O_CREAT
+		// or --profile extent).
+		return fs.Result{}, nil, false
 	}
 	// Fresh path: claim creates in full JuiceFS mode, or when the path
 	// matches an explicit --extent / [extent] pattern; otherwise creation
@@ -550,13 +655,13 @@ func (h *Handler) tryClaimOpen(ctx context.Context, op *fs.Op) (fs.Result, error
 	if op.Flags&syscall.O_CREAT == 0 || (h.opts.Threshold != 0 && !h.claimsPattern(op.Path)) {
 		return fs.Result{}, nil, false
 	}
-	res, err := h.createOnEngine(ctx, op)
+	res, err = h.createOnEngine(ctx, op)
 	return res, err, true
 }
 
 // tryClaimExistingLocked claims opens for files that already exist locally in
 // the bridge or remotely with extent layout. Caller holds h.lockPaths(op.Path).
-func (h *Handler) tryClaimExistingLocked(ctx context.Context, op *fs.Op, freshKernelCreate bool) (fs.Result, error, bool) {
+func (h *Handler) tryClaimExistingLocked(ctx context.Context, op *fs.Op, freshKernelCreate bool) (fs.Result, bool, bool, error) {
 	if !freshKernelCreate {
 		st, err := h.opts.Engine.Bridge.StatLocal(ctx, op.Path)
 		if err == nil {
@@ -571,23 +676,32 @@ func (h *Handler) tryClaimExistingLocked(ctx context.Context, op *fs.Op, freshKe
 				// O_EXCL declines instead: the name exists, and the classic
 				// plane's server-arbitrated EEXIST is the honest answer.
 				if st.Size == 0 && op.Flags&uint32(syscall.O_EXCL) == 0 &&
-					h.opts.Engine.Bridge.EmptyPlaceholderFor(op.Path) {
-					res, err := h.createOnEngine(ctx, op)
-					return res, err, true
+					h.opts.Engine.Bridge.MatchesEmptyPlaceholder(op.Path, st) {
+					if _, local := h.opts.Engine.Bridge.LocalResolve(op.Path); !local {
+						res, err := h.createOnEngine(ctx, op)
+						return res, true, false, err
+					}
+					// An open engine handle already owns this placeholder in the
+					// bridge (e.g. MaterializeEmpty during SQLite WAL startup);
+					// fall through to the LocalResolve branch below so the
+					// second handle joins the existing inode without resetting
+					// freshCreate.
+				} else {
+					return fs.Result{}, false, true, nil
 				}
-				return fs.Result{}, nil, false
+			} else {
+				if op.Flags&uint32(syscall.O_CREAT) != 0 && op.Flags&uint32(syscall.O_EXCL) != 0 {
+					return fs.Result{}, true, false, syscall.EEXIST
+				}
+				handle, attr, errno := h.openExistingLocked(ctx, op.Path, op.Flags, op.Caller)
+				if errno != 0 {
+					return fs.Result{}, true, false, errno
+				}
+				return fs.Result{Handle: handle, Attr: attr}, true, false, nil
 			}
-			if op.Flags&uint32(syscall.O_CREAT) != 0 && op.Flags&uint32(syscall.O_EXCL) != 0 {
-				return fs.Result{}, syscall.EEXIST, true
-			}
-			handle, attr, errno := h.openExistingLocked(ctx, op.Path, op.Flags, op.Caller)
-			if errno != 0 {
-				return fs.Result{}, errno, true
-			}
-			return fs.Result{Handle: handle, Attr: attr}, nil, true
 		}
 		if !client.IsNotFound(err) {
-			return fs.Result{}, nil, false
+			return fs.Result{}, false, false, nil
 		}
 	}
 	// A file that exists ONLY in the bridge (a fresh engine create whose
@@ -599,19 +713,19 @@ func (h *Handler) tryClaimExistingLocked(ctx context.Context, op *fs.Op, freshKe
 			if op.Flags&syscall.O_CREAT != 0 && op.Flags&syscall.O_EXCL != 0 {
 				// The folded OpCreate contract includes create/open flags: an
 				// exclusive create of an existing (still-local) file is EEXIST.
-				return fs.Result{}, syscall.EEXIST, true
+				return fs.Result{}, true, false, syscall.EEXIST
 			}
 			if op.Flags&syscall.O_TRUNC != 0 {
 				if errno := h.opts.Engine.VFS.Truncate(vfsCtx(op.Caller), ino, 0, 0, nil); errno != 0 {
-					return fs.Result{}, errno, true
+					return fs.Result{}, true, false, errno
 				}
 				if err := h.opts.Engine.Bridge.TruncateLocal(ctx, op.Path, 0); err != nil {
-					return fs.Result{}, err, true
+					return fs.Result{}, true, false, err
 				}
 			}
 			_, fh, errno := h.opts.Engine.VFS.Open(vfsCtx(op.Caller), ino, op.Flags)
 			if errno != 0 {
-				return fs.Result{}, errno, true
+				return fs.Result{}, true, false, errno
 			}
 			handle := h.register(op.Path, uint64(ino), fh, op.Caller)
 			attr := &fs.Attr{Kind: fs.KindFile, Nlink: 1}
@@ -623,10 +737,10 @@ func (h *Handler) tryClaimExistingLocked(ctx context.Context, op *fs.Op, freshKe
 			if st, serr := h.opts.Engine.Bridge.StatLocal(ctx, op.Path); serr == nil {
 				attr.Rev = st.Revision
 			}
-			return fs.Result{Handle: handle, Attr: attr}, nil, true
+			return fs.Result{Handle: handle, Attr: attr}, true, false, nil
 		}
 	}
-	return fs.Result{}, nil, false
+	return fs.Result{}, false, false, nil
 }
 
 // createOnEngine claims the name as a fresh engine create: the bridge
@@ -685,7 +799,50 @@ func (h *Handler) lookupLocalOnly(ctx context.Context, path string) (*fs.Attr, b
 	if m, ok := br.ModeOf(ino); ok {
 		mode = m // a recorded mode is authoritative, including 0000
 	}
-	return &fs.Attr{Kind: fs.KindFile, Mode: mode, Size: size, Nlink: 1}, true
+	attr := &fs.Attr{Kind: fs.KindFile, Mode: mode, Size: size, Nlink: 1}
+	if mt, ok := br.MtimeOf(ino); ok && !mt.IsZero() {
+		attr.Mtime = mt
+	}
+	return attr, true
+}
+
+// setAttrLocalOnly absorbs mode/mtime updates on a fresh engine file that has
+// not yet materialized server-side, preventing fchmod/futimens before close()
+// from falling through to the classic terminal and returning ENOENT.
+func (h *Handler) setAttrLocalOnly(ctx context.Context, op *fs.Op) (fs.Result, bool) {
+	if h.opts.Engine == nil {
+		return fs.Result{}, false
+	}
+	h.mu.Lock()
+	_, open := h.handles[op.Path]
+	h.mu.Unlock()
+	if !open {
+		return fs.Result{}, false
+	}
+	br := h.opts.Engine.Bridge
+	ino, ok := br.LocalResolve(op.Path)
+	if !ok {
+		return fs.Result{}, false
+	}
+	if _, err := br.StatLocal(ctx, op.Path); err == nil || !client.IsNotFound(err) {
+		return fs.Result{}, false
+	}
+	if op.HasMode {
+		br.SetModeLocal(ino, op.Mode&0o7777)
+	}
+	if !op.Mtime.IsZero() {
+		br.SetMtimeLocal(ino, op.Mtime)
+	}
+	size, _, _ := br.LocalView(ino)
+	mode := uint32(0o644)
+	if m, ok := br.ModeOf(ino); ok {
+		mode = m
+	}
+	attr := &fs.Attr{Kind: fs.KindFile, Mode: mode, Size: size, Nlink: 1}
+	if mt, ok := br.MtimeOf(ino); ok && !mt.IsZero() {
+		attr.Mtime = mt
+	}
+	return fs.Result{Attr: attr}, true
 }
 
 // claimsPattern reports whether a fresh create of the path is explicitly
@@ -945,9 +1102,12 @@ func (h *Handler) tryTruncate(ctx context.Context, op *fs.Op, next fs.Next) (fs.
 		}
 		return fs.Result{Attr: attr}, nil, true
 	}
-	// Mixed setattr: the size landed in the bridge, the rest goes classic.
+	// Mixed setattr: if still local-only, apply locally; otherwise forward rest.
 	rest := *op
 	rest.HasSize = false
+	if res, localHandled := h.setAttrLocalOnly(ctx, &rest); localHandled {
+		return res, nil, true
+	}
 	res, err := next(ctx, &rest)
 	if err == nil && res.Attr != nil {
 		if size, ok := h.opts.Engine.LocalAttr(ctx, op.Path); ok && size > res.Attr.Size {
@@ -958,7 +1118,7 @@ func (h *Handler) tryTruncate(ctx context.Context, op *fs.Op, next fs.Next) (fs.
 }
 
 func (h *Handler) register(path string, ino uint64, fh uint64, c fs.Caller) *engineHandle {
-	eh := &engineHandle{plane: h, path: path, ino: meta.Ino(ino), fh: fh, vctx: vfsCtx(c)}
+	eh := &engineHandle{plane: h, path: path, ino: meta.Ino(ino), fh: fh, caller: c, vctx: vfsCtx(c)}
 	h.mu.Lock()
 	h.handles[path] = append(h.handles[path], eh)
 	h.mu.Unlock()
@@ -967,11 +1127,12 @@ func (h *Handler) register(path string, ino uint64, fh uint64, c fs.Caller) *eng
 
 // engineHandle adapts one open engine file to the chain's data plane.
 type engineHandle struct {
-	plane *Handler
-	path  string
-	ino   meta.Ino
-	fh    uint64
-	vctx  vfs.LogContext
+	plane  *Handler
+	path   string
+	ino    meta.Ino
+	fh     uint64
+	caller fs.Caller
+	vctx   vfs.LogContext
 	// released is set (under Handler.mu) by the Release that is retiring
 	// this handle. It makes the "am I the last close" decision atomic: two
 	// concurrent releases each mark themselves and then count the handles
@@ -979,28 +1140,10 @@ type engineHandle struct {
 	released bool
 }
 
-// GetLk and SetLk make this handle own its advisory lock namespace. Without
-// them the facade falls back to its mount-wide lock table, which is also
-// in-memory — but the facade's table is keyed by INODE and this plane is the
-// one that knows when a file's last descriptor closes and the locks must go.
-//
-// Both are served by the bridge's mount-local table (locks.go): in-memory, one
-// daemon's lifetime, never persisted and never shared across mounts.
-//
-// Both sides of the boundary use INCLUSIVE ends, so the conversion is a
-// pass-through: FUSE's fuse_file_lock.end is inclusive (the kernel adds one
-// when it converts back to a struct file_lock), and locks.go stores inclusive
-// ranges. End == 0 is the kernel's "to EOF" and maps to lockEOF, so the lock
-// keeps growing with the file instead of pinning the current length.
-//
-// These route through VFS rather than calling the table directly, because
-// VFS is what remembers that a handle holds locks (h.locks/h.ofdOwner) and
-// therefore what releases them at FLUSH and RELEASE. Reaching past it into the
-// table leaves that bookkeeping empty, and the close-time release never runs.
 func (e *engineHandle) GetLk(ctx context.Context, lk fs.FileLock) (fs.FileLock, error) {
 	start, end := fuseRangeToLock(lk.Start, lk.End)
 	typ, pid := lk.Type, lk.Pid
-	if errno := e.plane.opts.Engine.VFS.Getlk(e.vctx, e.ino, e.fh, lk.Owner, &start, &end, &typ, &pid); errno != 0 {
+	if errno := e.plane.opts.Engine.VFS.Getlk(vfsCtxWith(ctx, e.caller), e.ino, e.fh, lk.Owner, &start, &end, &typ, &pid); errno != 0 {
 		return fs.FileLock{}, errno
 	}
 	out := lk
@@ -1016,35 +1159,37 @@ func (e *engineHandle) GetLk(ctx context.Context, lk fs.FileLock) (fs.FileLock, 
 }
 
 func (e *engineHandle) SetLk(ctx context.Context, lk fs.FileLock, blocking bool) error {
+	lctx := vfsCtxWith(ctx, e.caller)
 	if lk.Flock {
-		if errno := e.plane.opts.Engine.VFS.Flock(e.vctx, e.ino, e.fh, lk.Owner, lk.Type, blocking); errno != 0 {
+		if errno := e.plane.opts.Engine.VFS.Flock(lctx, e.ino, e.fh, lk.Owner, lk.Type, blocking); errno != 0 {
 			return errno
 		}
 		return nil
 	}
 	start, end := fuseRangeToLock(lk.Start, lk.End)
-	if errno := e.plane.opts.Engine.VFS.Setlk(e.vctx, e.ino, e.fh, lk.Owner, start, end, lk.Type, lk.Pid, blocking); errno != 0 {
+	if errno := e.plane.opts.Engine.VFS.Setlk(lctx, e.ino, e.fh, lk.Owner, start, end, lk.Type, lk.Pid, blocking); errno != 0 {
 		return errno
 	}
 	return nil
 }
 
-// fuseRangeToLock converts a kernel range (inclusive end, 0 meaning "to EOF")
-// into the bridge's internal form.
+// fuseRangeToLock converts an inclusive FUSE lock range into the bridge's
+// internal form. FUSE encodes EOF as OFFSET_MAX ((1<<63)-1 = lockVFSUnlockEOF),
+// whereas [0, 0] is a legitimate 1-byte lock on byte zero.
 func fuseRangeToLock(start, end int64) (uint64, uint64) {
 	if start < 0 {
 		start = 0
 	}
-	if end <= 0 {
+	if end < 0 || uint64(end) >= lockVFSUnlockEOF {
 		return uint64(start), lockEOF
 	}
 	return uint64(start), uint64(end)
 }
 
-// lockRangeToFuseEnd is the inverse: "to EOF" travels back to the kernel as 0.
+// lockRangeToFuseEnd converts the internal EOF sentinel back to FUSE OFFSET_MAX.
 func lockRangeToFuseEnd(end uint64) int64 {
-	if end == lockEOF {
-		return 0
+	if end >= lockVFSUnlockEOF {
+		return int64(lockVFSUnlockEOF)
 	}
 	return int64(end)
 }
@@ -1057,11 +1202,6 @@ func (e *engineHandle) Read(ctx context.Context, off int64, dest []byte) (int, e
 	return n, nil
 }
 
-// Write hands the bytes to the community writer and returns. Buffering,
-// upload and metadata publication all follow JuiceFS: the writer freezes a
-// slice and commits it once a chunk fills or the file is flushed. The extent
-// plane implements no --durability profile of its own, so a successful Write
-// promises nothing about remote visibility.
 func (e *engineHandle) Write(ctx context.Context, off int64, data []byte) error {
 	if errno := e.plane.opts.Engine.VFS.Write(e.vctx, e.ino, data, uint64(off), e.fh); errno != 0 {
 		return errno
@@ -1073,47 +1213,29 @@ func (e *engineHandle) Write(ctx context.Context, off int64, data []byte) error 
 	// write(2), and answering "0 bytes" makes the kernel reset its own
 	// i_size and serve every following read as EOF.
 	e.plane.opts.Engine.Bridge.noteBufferedLength(e.ino, off+int64(len(data)))
+	if e.plane.opts.WriteSync {
+		return e.Sync(ctx)
+	}
 	return nil
 }
 
 func (e *engineHandle) Sync(ctx context.Context) error {
+	e.plane.opts.Engine.Bridge.kickPendingFlush()
 	errno := e.plane.opts.Engine.VFS.Fsync(e.vctx, e.ino, 0, e.fh)
 	if errno != 0 && !e.plane.opts.Engine.Bridge.HasPending(e.ino) {
 		return errno
 	}
-	// A failed VFS-level flush may itself be a failed COMMIT attempt
-	// whose state the bridge preserved: FlushFile below retries it, and
-	// success resolves the fsync. (With nothing pending the errno above
-	// already returned.)
-	//
-	// fsync is REMOTE durability: the extent plane keeps no local barrier,
-	// so a successful fsync must have published before it returns. That is
-	// JuiceFS's own contract, and the only durability promise this plane
-	// makes.
 	if err := e.plane.opts.Engine.FlushFile(ctx, uint64(e.ino)); err != nil {
 		if errno != 0 {
 			return errno // the VFS-level failure still stands
 		}
 		return err
 	}
-	// A fresh EMPTY file has nothing to commit, so the flush above was a
-	// no-op — but fsync was still acknowledged, and the name must be durable
-	// at the boundary fsync promised. Materialize the name remotely.
 	return e.plane.opts.Engine.Bridge.MaterializeEmpty(ctx, e.ino)
 }
 
 func (e *engineHandle) Flush(ctx context.Context) error {
-	// The lock owner MUST be passed: VFS.Flush is where JuiceFS drops the
-	// closing descriptor's POSIX record locks (it calls Meta.Setlk with
-	// F_UNLCK for that owner). Passing 0 — as this call used to — releases
-	// owner 0, which holds nothing, so every lock outlived its descriptor.
-	//
-	// The mount negotiates FUSE_POSIX_LOCKS, so the kernel keeps no lock state
-	// here and never sends a close-time F_UNLCK: this is the only place the
-	// lock can die. A leaked lock starves SQLite's multi-process protocol —
-	// one closed or crashed writer's RESERVED keeps the next writer's
-	// EXCLUSIVE and hot-journal recovery waiting until the timeout kills the
-	// workload.
+	e.plane.opts.Engine.Bridge.kickPendingFlush()
 	if errno := e.plane.opts.Engine.VFS.Flush(e.vctx, e.ino, e.fh, fs.FlushOwnerOf(ctx)); errno != 0 {
 		return errno
 	}

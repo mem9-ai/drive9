@@ -661,20 +661,16 @@ func isExtentBlockConflict(err error) bool {
 }
 
 // WriteExtentStreamConditional uploads a whole file as an extent sequential
-// session (layout=extent, 4 MiB parts). Against a server that predates the
-// layout field the session silently degrades to a classic multipart upload —
-// the two flows are client-identical apart from the initiate body. Use for
-// fresh large files; existing extent files with small dirty sets should use
-// CommitExtentPatch instead.
+// session (layout=extent, 4 MiB parts). Use for fresh large files; existing
+// extent files with small dirty sets should use CommitExtentPatch instead.
 func (c *Client) WriteExtentStreamConditional(ctx context.Context, path string, ra io.ReaderAt, size int64, progress ProgressFunc, expectedRevision int64) error {
 	plan, err := c.initiateUploadV2WithLayout(ctx, path, size, expectedRevision, "", "extent")
 	if err != nil {
 		return err
 	}
 	if plan.Key != "" {
-		// Legacy server: the layout field was ignored and a classic session
-		// was created. Run the classic pipeline on the same session.
-		return c.uploadClassicSession(ctx, plan, ra, progress)
+		c.abortUploadV2BestEffort(ctx, plan.UploadID)
+		return fmt.Errorf("server ignored layout=extent on %s", path)
 	}
 	if err := c.uploadExtentSequential(ctx, plan, ra, size, progress); err != nil {
 		c.abortUploadV2BestEffort(ctx, plan.UploadID)
@@ -683,55 +679,74 @@ func (c *Client) WriteExtentStreamConditional(ctx context.Context, path string, 
 	return nil
 }
 
-// uploadExtentSequential drives an extent sequential session: for each batch
-// of parts, hash the part contents, presign with checksums (deduped parts
-// come back skip_upload), PUT the rest, then complete with the checksum
-// etags. The server derives each part's slice from its part number.
+// uploadExtentSequential drives an extent sequential session: for each bounded
+// batch of parts (32 * 4 MiB = 128 MiB max in-flight RAM), read each part once
+// from ra, SHA-256 hash, presign with checksums (deduped parts return
+// skip_upload), upload the non-deduped parts in parallel (16-way), and complete
+// with the checksum etags.
 func (c *Client) uploadExtentSequential(ctx context.Context, plan *uploadPlanV2, ra io.ReaderAt, size int64, progress ProgressFunc) error {
-	const batchParts = 128
-	var parts []completePart
+	const batchParts = 32
+	parts := make([]completePart, 0, plan.TotalParts)
+	var progMu sync.Mutex
+	reportProgress := func(num int, bytes int64) {
+		if progress == nil {
+			return
+		}
+		progMu.Lock()
+		progress(num, plan.TotalParts, bytes)
+		progMu.Unlock()
+	}
+
 	for first := 1; first <= plan.TotalParts; first += batchParts {
 		last := first + batchParts - 1
 		if last > plan.TotalParts {
 			last = plan.TotalParts
 		}
-		batch, err := c.presignExtentBatch(ctx, plan, ra, size, first, last)
+		batch, err := c.presignExtentBatchLoaded(ctx, plan, ra, size, first, last)
 		if err != nil {
 			return err
 		}
-		for _, p := range batch {
-			if p.skipUpload {
-				if progress != nil {
-					progress(p.number, plan.TotalParts, 0)
-				}
+		g, gctx := errgroup.WithContext(ctx)
+		g.SetLimit(extentPatchPutConcurrency)
+		for i := range batch {
+			item := batch[i]
+			batch[i].data = nil // drop slice header reference after worker finishes
+			if item.skipUpload {
+				reportProgress(item.number, 0)
 				continue
 			}
-			data, derr := extentPartBytes(ra, plan.PartSize, p.number, size)
-			if derr != nil {
-				return derr
-			}
-			if _, err := c.uploadOnePartV2(ctx, p.part, data); err != nil {
-				if !isExtentBlockConflict(err) {
-					return err
-				}
-				// The create-once address is already taken — this file
-				// repeats the block, an interrupted earlier session landed
-				// it, or a concurrent writer did — or the URL expired.
-				// Re-presign this part: the server answers skip_upload when
-				// the object is present and a fresh URL otherwise.
-				fresh, perr := c.presignExtentBatch(ctx, plan, ra, size, p.number, p.number)
-				if perr != nil {
-					return perr
-				}
-				if !fresh[0].skipUpload {
-					if _, err := c.uploadOnePartV2(ctx, fresh[0].part, data); err != nil {
+			g.Go(func() error {
+				putCtx, cancel := context.WithTimeout(gctx, extentBlockPutTimeout)
+				_, err := c.uploadOnePartV2(putCtx, item.part, item.data)
+				cancel()
+				if err != nil {
+					if !isExtentBlockConflict(err) {
 						return err
 					}
+					// Create-once address already taken or URL expired: re-presign
+					// this single part with its already-computed checksum.
+					fresh, perr := c.presignExtentChecksums(gctx, plan.UploadID, []extentPresignedBatchItem{{
+						number:   item.number,
+						checksum: item.checksum,
+					}})
+					if perr != nil {
+						return perr
+					}
+					if !fresh[0].skipUpload {
+						retryCtx, retryCancel := context.WithTimeout(gctx, extentBlockPutTimeout)
+						_, rerr := c.uploadOnePartV2(retryCtx, fresh[0].part, item.data)
+						retryCancel()
+						if rerr != nil {
+							return rerr
+						}
+					}
 				}
-			}
-			if progress != nil {
-				progress(p.number, plan.TotalParts, int64(len(data)))
-			}
+				reportProgress(item.number, int64(len(item.data)))
+				return nil
+			})
+		}
+		if err := g.Wait(); err != nil {
+			return err
 		}
 		for _, p := range batch {
 			parts = append(parts, completePart{Number: p.number, ETag: p.checksum})
@@ -743,42 +758,60 @@ func (c *Client) uploadExtentSequential(ctx context.Context, plan *uploadPlanV2,
 type extentPresignedBatchItem struct {
 	part       presignedPart
 	checksum   string
+	data       []byte
 	skipUpload bool
 	number     int
 }
 
-// presignExtentBatch hashes parts [first,last] from ra, asks the server for
-// their presigned URLs (with checksums, so dedupe can answer skip_upload),
-// and returns them in order.
-func (c *Client) presignExtentBatch(ctx context.Context, plan *uploadPlanV2, ra io.ReaderAt, size int64, first, last int) ([]extentPresignedBatchItem, error) {
+// presignExtentBatchLoaded reads parts [first,last] once from ra, hashes them
+// concurrently, and requests their presigned URLs in one batch RPC.
+func (c *Client) presignExtentBatchLoaded(ctx context.Context, plan *uploadPlanV2, ra io.ReaderAt, size int64, first, last int) ([]extentPresignedBatchItem, error) {
+	count := last - first + 1
+	items := make([]extentPresignedBatchItem, count)
+	for i := 0; i < count; i++ {
+		n := first + i
+		data, derr := extentPartBytes(ra, plan.PartSize, n, size)
+		if derr != nil {
+			return nil, derr
+		}
+		items[i] = extentPresignedBatchItem{number: n, data: data}
+	}
+	hg, _ := errgroup.WithContext(ctx)
+	hg.SetLimit(extentPatchPutConcurrency)
+	for i := range items {
+		i := i
+		hg.Go(func() error {
+			sum := sha256.Sum256(items[i].data)
+			items[i].checksum = hex.EncodeToString(sum[:])
+			return nil
+		})
+	}
+	_ = hg.Wait()
+	return c.presignExtentChecksums(ctx, plan.UploadID, items)
+}
+
+func (c *Client) presignExtentChecksums(ctx context.Context, uploadID string, items []extentPresignedBatchItem) ([]extentPresignedBatchItem, error) {
 	type reqPart struct {
 		Number   int             `json:"part_number"`
 		Checksum presignChecksum `json:"checksum"`
 	}
 	body := struct {
 		Parts []reqPart `json:"parts"`
-	}{}
-	items := make([]extentPresignedBatchItem, 0, last-first+1)
-	for n := first; n <= last; n++ {
-		data, derr := extentPartBytes(ra, plan.PartSize, n, size)
-		if derr != nil {
-			return nil, derr
-		}
-		sum := sha256.Sum256(data)
-		items = append(items, extentPresignedBatchItem{number: n, checksum: hex.EncodeToString(sum[:])})
+	}{
+		Parts: make([]reqPart, len(items)),
 	}
 	for i := range items {
-		body.Parts = append(body.Parts, reqPart{
+		body.Parts[i] = reqPart{
 			Number:   items[i].number,
 			Checksum: presignChecksum{Algorithm: "sha256", Value: items[i].checksum},
-		})
+		}
 	}
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		c.baseURL+"/v2/uploads/"+plan.UploadID+"/presign-batch", bytes.NewReader(raw))
+		c.baseURL+"/v2/uploads/"+uploadID+"/presign-batch", bytes.NewReader(raw))
 	if err != nil {
 		return nil, err
 	}
@@ -803,6 +836,9 @@ func (c *Client) presignExtentBatch(ctx context.Context, plan *uploadPlanV2, ra 
 	for i := range items {
 		items[i].part = out.Parts[i]
 		items[i].skipUpload = out.Parts[i].SkipUpload
+		if items[i].skipUpload {
+			items[i].data = nil
+		}
 	}
 	return items, nil
 }

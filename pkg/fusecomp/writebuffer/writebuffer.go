@@ -1068,6 +1068,37 @@ func (wb *WriteBuffer) StreamedPartIndices() map[int]bool {
 	return wb.uploadedParts
 }
 
+// MemoryUsage returns the byte volume currently held in memory across buffered parts.
+func (wb *WriteBuffer) MemoryUsage() int64 {
+	return wb.curMemory
+}
+
+// SpillResidentParts invokes spill(partIdx, data) on every in-memory part except
+// skipPartIdx and evicts each part for which spill reports true. Used to bound
+// Go heap usage even when kernel FUSE worker threads deliver writes slightly
+// out of offset order (which disables wb.sequential).
+func (wb *WriteBuffer) SpillResidentParts(skipPartIdx int, spill func(partIdx int, data []byte) bool) {
+	if wb == nil || wb.smallFileData != nil || len(wb.parts) == 0 {
+		return
+	}
+	indices := make([]int, 0, len(wb.parts))
+	for idx := range wb.parts {
+		if idx == skipPartIdx {
+			continue
+		}
+		indices = append(indices, idx)
+	}
+	for _, idx := range indices {
+		data := wb.PartData(idx + 1)
+		if len(data) == 0 {
+			continue
+		}
+		if spill(idx, data) {
+			wb.EvictPart(idx)
+		}
+	}
+}
+
 // DirtyStreamedParts returns parts that were evicted (streamed) but later
 // back-written. These need to be re-uploaded at flush time.
 // Returns a map of 1-based partNum → part data.

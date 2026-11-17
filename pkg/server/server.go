@@ -3554,7 +3554,17 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, path strin
 		case "":
 			err = b.RemoveCtx(r.Context(), path)
 		case "file":
-			err = b.RemoveFileCtx(r.Context(), path)
+			expRev, revErr := parseExpectedRevisionHeader(r.Header.Get("X-Dat9-Expected-Revision"))
+			if revErr != nil {
+				errJSON(w, http.StatusBadRequest, "invalid X-Dat9-Expected-Revision header")
+				return
+			}
+			expRes := r.Header.Get("X-Dat9-Expected-Resource")
+			if expRev > 0 || expRes != "" {
+				err = b.RemoveFileConditionalCtx(r.Context(), path, expRev, expRes)
+			} else {
+				err = b.RemoveFileCtx(r.Context(), path)
+			}
 		case "dir":
 			err = b.RemoveDirCtx(r.Context(), path)
 		default:

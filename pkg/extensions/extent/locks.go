@@ -180,7 +180,7 @@ func (t *lockTable) removeOwnerRangesLocked(ino meta.Ino, owner uint64, start, e
 	if len(in) == 0 {
 		return
 	}
-	out := in[:0]
+	out := make([]lockRange, 0, len(in)+1)
 	for _, l := range in {
 		if l.owner != owner || !rangesOverlap(l.start, l.end, start, end) {
 			out = append(out, l)
@@ -337,7 +337,7 @@ func (t *lockTable) ReleaseOwner(ino meta.Ino, owner uint64) {
 	if len(in) == 0 {
 		return
 	}
-	out := in[:0]
+	out := make([]lockRange, 0, len(in)+1)
 	for _, l := range in {
 		if l.owner != owner {
 			out = append(out, l)

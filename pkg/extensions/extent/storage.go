@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/meta"
@@ -108,134 +109,185 @@ func (s objectStorage) Put(ctx context.Context, key string, in io.Reader, getter
 	if size <= 0 || size > maxStageBytes {
 		return fmt.Errorf("staged slice size %d out of bounds", size)
 	}
-	// When JuiceFS native Writeback is disabled, stage blocks directly in
-	// memory — avoiding double disk staging (rawstaging + temp file) and
-	// freeing NVMe IOPS during large writes.
-	if s.bridge == nil || !s.bridge.cfg.NativeWriteback {
-		if s.bridge != nil {
-			est := size
-			if size == client.ExtentBlockSize {
-				est = int64(client.ExtentBlockSize) * 16
-			}
-			// Admit slice by ascending slice ID and reserve its expected chunk
-			// budget upfront so MaxUpload workers cannot flood >maxPinnedCommitBytes
-			// or starve older slices behind newer ones.
-			if err := s.bridge.blocks.waitSliceAdmission(ctx, id, est, maxPinnedCommitBytes); err != nil {
-				return err
-			}
-			s.bridge.blocks.beginSliceWrite(id)
-		}
+	if s.bridge == nil {
 		buf := make([]byte, size)
-		if _, err := io.ReadFull(in, buf); err != nil {
-			// Wait: also drop abort check race — if another writer already wrote to
-			// this slice (sliceUsed > 0) or is still reading (sliceWriters > 0), keep
-			// the reservation active.
-			if s.bridge != nil {
-				s.bridge.blocks.abortSliceWrite(id, true)
-			}
-			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-				return fmt.Errorf("short staging read: %w", err)
-			}
-			return err
-		}
-		if s.bridge == nil {
-			return nil
-		}
-		s.bridge.mu.Lock()
-		sl := s.bridge.stagedSlices[id]
-		if sl == nil {
-			sl = &stagedSlice{blocks: make(map[int64][]byte)}
-			s.bridge.stagedSlices[id] = sl
-		}
-		var prevLen int64
-		if prev, exists := sl.blocks[indx]; exists {
-			prevLen = int64(len(prev))
-			sl.total -= prevLen
-		}
-		sl.blocks[indx] = buf
-		sl.total += size
-		s.bridge.mu.Unlock()
-		s.bridge.blocks.finishSliceWrite(id, size-prevLen)
-		return nil
-	}
-	dir := s.bridge.cfg.CacheDir
-	if dir == "" {
-		dir = os.TempDir()
-	}
-	f, err := os.CreateTemp(dir, "extent-stage-*")
-	if err != nil {
+		_, err := io.ReadFull(in, buf)
 		return err
 	}
-	tmp := f.Name()
-	n, copyErr := io.Copy(f, io.LimitReader(in, size))
-	closeErr := f.Close()
-	if copyErr != nil || closeErr != nil || n != size {
-		_ = os.Remove(tmp)
-		if copyErr != nil {
-			return copyErr
+	if !s.bridge.cfg.NativeWriteback {
+		alreadyActive := s.bridge.hasStagedSlice(id)
+		if s.bridge.blocks.tryReserveBlockMem(id, size, maxPinnedCommitBytes) {
+			return s.putSliceMem(id, indx, size, in)
 		}
-		if closeErr != nil {
-			return closeErr
+		s.bridge.kickPendingFlush()
+		if s.bridge.blocks.tryReserveDiskSpool(size) {
+			return s.putSliceSpool(id, indx, size, in)
 		}
-		return fmt.Errorf("short staging read: %d of %d", n, size)
+		if err := s.bridge.blocks.reserveBlockMemPutSafe(ctx, id, size, maxPinnedCommitBytes, alreadyActive, s.bridge.kickPendingFlush); err != nil {
+			return err
+		}
+		return s.putSliceMem(id, indx, size, in)
 	}
-	// One slice object may span several blocks (Size > BlockSize); the
-	// store uploads them as separate keys with the same slice id. Stage
-	// per block index; meta.Write concatenates in order.
+	if s.bridge.cfg.CacheDir == "" {
+		return fmt.Errorf("extent native writeback requires CacheDir")
+	}
+	if err := s.bridge.blocks.waitDiskSpool(ctx, size, s.bridge.kickPendingFlush); err != nil {
+		return err
+	}
+	return s.putSliceSpool(id, indx, size, in)
+}
+
+func (s objectStorage) putSliceMem(id uint64, indx, size int64, in io.Reader) error {
+	buf := make([]byte, size)
+	if _, err := io.ReadFull(in, buf); err != nil {
+		s.bridge.blocks.releaseBlockMem(id, size)
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return fmt.Errorf("short staging read: %w", err)
+		}
+		return err
+	}
+	var prevLen int64
+	var prevFile *os.File
+	var prevSpool int64
 	s.bridge.mu.Lock()
-	defer s.bridge.mu.Unlock()
 	sl := s.bridge.stagedSlices[id]
 	if sl == nil {
 		sl = &stagedSlice{blocks: make(map[int64][]byte)}
 		s.bridge.stagedSlices[id] = sl
 	}
-	if prevPath, exists := sl.paths[indx]; exists && prevPath != tmp {
-		_ = os.Remove(prevPath)
+	if prev, exists := sl.blocks[indx]; exists && prev != nil {
+		prevLen = int64(len(prev))
+		sl.total -= prevLen
 	}
-	sl.blocks[indx] = nil
-	if sl.paths == nil {
-		sl.paths = make(map[int64]string)
+	if sl.files != nil {
+		if pf, exists := sl.files[indx]; exists && pf.f != nil {
+			prevFile = pf.f
+			prevSpool = pf.size
+			delete(sl.files, indx)
+			sl.total -= prevSpool
+		}
 	}
-	sl.paths[indx] = tmp
+	sl.blocks[indx] = buf
 	sl.total += size
+	s.bridge.mu.Unlock()
+	if prevLen > 0 {
+		s.bridge.blocks.releaseBlockMem(id, prevLen)
+	}
+	if prevFile != nil {
+		_ = prevFile.Close()
+		s.bridge.blocks.releaseDiskSpool(prevSpool)
+	}
 	return nil
+}
+
+func (s objectStorage) putSliceSpool(id uint64, indx, size int64, in io.Reader) error {
+	dir := s.bridge.cfg.CacheDir
+	if dir == "" {
+		s.bridge.blocks.releaseDiskSpool(size)
+		return fmt.Errorf("missing extent cache directory for disk spool")
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		s.bridge.blocks.releaseDiskSpool(size)
+		return err
+	}
+	f, err := os.CreateTemp(dir, "extent-spill-*")
+	if err != nil {
+		s.bridge.blocks.releaseDiskSpool(size)
+		return err
+	}
+	_ = os.Remove(f.Name())
+	n, copyErr := io.Copy(f, io.LimitReader(in, size))
+	if copyErr != nil || n != size {
+		_ = f.Close()
+		s.bridge.blocks.releaseDiskSpool(size)
+		if copyErr != nil {
+			return copyErr
+		}
+		return fmt.Errorf("short staging read: %d of %d", n, size)
+	}
+	var prevLen int64
+	var prevFile *os.File
+	var prevSpool int64
+	s.bridge.mu.Lock()
+	sl := s.bridge.stagedSlices[id]
+	if sl == nil {
+		sl = &stagedSlice{blocks: make(map[int64][]byte)}
+		s.bridge.stagedSlices[id] = sl
+	}
+	if prev, exists := sl.blocks[indx]; exists && prev != nil {
+		prevLen = int64(len(prev))
+		delete(sl.blocks, indx)
+		sl.total -= prevLen
+	}
+	if sl.files == nil {
+		sl.files = make(map[int64]spooledBlock)
+	}
+	if pf, exists := sl.files[indx]; exists && pf.f != nil {
+		prevFile = pf.f
+		prevSpool = pf.size
+		sl.total -= prevSpool
+	}
+	sl.files[indx] = spooledBlock{f: f, size: size}
+	sl.total += size
+	s.bridge.mu.Unlock()
+	if prevLen > 0 {
+		s.bridge.blocks.releaseBlockMem(id, prevLen)
+	}
+	if prevFile != nil {
+		_ = prevFile.Close()
+		s.bridge.blocks.releaseDiskSpool(prevSpool)
+	}
+	return nil
+}
+
+type spooledBlock struct {
+	f    *os.File
+	size int64
 }
 
 // stagedSlice accumulates the blocks of one not-yet-committed slice object.
 type stagedSlice struct {
 	blocks map[int64][]byte
-	paths  map[int64]string
+	files  map[int64]spooledBlock
 	total  int64
+}
+
+// closeAndSpoolBytes closes any open spooled block descriptors and returns the
+// total spooled byte count to release back to blockRegistry.
+func (sl *stagedSlice) closeAndSpoolBytes() int64 {
+	var spooled int64
+	for k, sb := range sl.files {
+		if sb.f != nil {
+			_ = sb.f.Close()
+		}
+		spooled += sb.size
+		delete(sl.files, k)
+	}
+	return spooled
 }
 
 // join returns the concatenated slice object bytes.
 func (sl *stagedSlice) join() []byte {
-	if len(sl.paths) == 0 && len(sl.blocks) == 1 {
+	if len(sl.files) == 0 && len(sl.blocks) == 1 {
 		if b, ok := sl.blocks[0]; ok && int64(len(b)) == sl.total {
 			return b
 		}
 	}
 	out := make([]byte, 0, sl.total)
-	if len(sl.paths) > 0 {
-		for i := int64(0); int64(len(out)) < sl.total; i++ {
-			p, ok := sl.paths[i]
-			if !ok {
-				break
-			}
-			data, err := os.ReadFile(p)
-			if err != nil {
+	for i := int64(0); int64(len(out)) < sl.total; i++ {
+		if b, ok := sl.blocks[i]; ok && b != nil {
+			out = append(out, b...)
+			continue
+		}
+		if sb, ok := sl.files[i]; ok && sb.f != nil {
+			buf := make([]byte, sb.size)
+			if _, err := sb.f.ReadAt(buf, 0); err != nil {
 				return nil
 			}
-			out = append(out, data...)
+			out = append(out, buf...)
+			continue
 		}
-		return out
-	}
-	for i := int64(0); int64(len(out)) < sl.total; i++ {
-		b, ok := sl.blocks[i]
-		if !ok {
-			break
-		}
-		out = append(out, b...)
+		break
 	}
 	return out
 }
@@ -258,39 +310,14 @@ func (s objectStorage) Get(ctx context.Context, key string, off, limit int64, ge
 	if limit <= 0 {
 		return io.NopCloser(bytes.NewReader(nil)), nil
 	}
-	// An issued classic slice stays fetchable for its whole reader
-	// lifetime: this Get ACQUIRES a pin before touching the registry (a
-	// concurrent stageClassicChunk cannot retire the entry between the
-	// pin and the snapshot) and releases ONE pin on exit — the handout
-	// issued one pin per block, so multi-block slices stay protected
-	// across their separate Gets.
 	s.bridge.mu.Lock()
 	sl := s.bridge.stagedSlices[id]
 	var staged []byte
-	if sl != nil && len(sl.paths) == 0 {
-		// Copy or reference snapshot safely under bridge lock so concurrent Put
-		// cannot race map reads on sl.blocks.
+	if sl != nil {
 		staged = sl.join()
 	}
 	s.bridge.mu.Unlock()
-	if sl == nil {
-		// A fetch pins for its OWN duration only (a concurrent stage
-		// cannot retire the entry between the pin and the snapshot —
-		// retirement checks issued under the same registry lock). The
-		// HANDOUT pins are NOT consumed here: a block boundary is not the
-		// end of an outstanding slice user (rSlice loads blocks one at a
-		// time, and other readers may hold the same id), so clearing on a
-		// block boundary would strip protection mid-slice and from other
-		// readers. Handout pins drain when the entry is re-staged fresh
-		// (the reader set turned over) or stay accounted until then.
-		s.bridge.blocks.issuePin(id)              // transient: acquire-to-snapshot
-		defer s.bridge.blocks.releaseIssuePin(id) // transient out
-		s.bridge.blocks.releaseIssuePin(id)       // drain one handout pin
-	}
 	if sl != nil {
-		if staged == nil {
-			staged = sl.join()
-		}
 		if objOff > int64(len(staged)) {
 			return io.NopCloser(bytes.NewReader(nil)), nil
 		}
@@ -386,8 +413,10 @@ func (r *blockRegistry) register(sha, url string, length int64, path string, fil
 	// upload zeros for real content. Bytes retire only via
 	// releaseCommitted's reference-aware path.
 	if e, ok := r.m[id]; ok {
-		e.url = url
-		e.expires = time.Now().Add(urlTTL)
+		if url != "" {
+			e.url = url
+			e.expires = time.Now().Add(urlTTL)
+		}
 		e.path = path
 		e.provenanceStart = fileOffset
 		e.provenanceIno = ino
@@ -395,7 +424,11 @@ func (r *blockRegistry) register(sha, url string, length int64, path string, fil
 			e.size = length
 		}
 	} else {
-		r.m[id] = &blockEntry{sha256: sha, size: length, url: url, expires: time.Now().Add(urlTTL), path: path, provenanceStart: fileOffset, provenanceIno: ino}
+		var exp time.Time
+		if url != "" {
+			exp = time.Now().Add(urlTTL)
+		}
+		r.m[id] = &blockEntry{sha256: sha, size: length, url: url, expires: exp, path: path, provenanceStart: fileOffset, provenanceIno: ino}
 	}
 	r.mu.Unlock()
 	return id
@@ -575,64 +608,167 @@ func (r *blockRegistry) waitSliceAdmission(ctx context.Context, sliceID uint64, 
 	return nil
 }
 
-func (r *blockRegistry) beginSliceWrite(sliceID uint64) {
+// tryReserveBlockMem reserves exact block bytes in memory when within limit.
+func (r *blockRegistry) tryReserveBlockMem(sliceID uint64, size, limit int64) bool {
 	r.mu.Lock()
-	if r.sliceWriters == nil {
-		r.sliceWriters = make(map[uint64]int)
-	}
-	r.sliceWriters[sliceID]++
-	r.mu.Unlock()
-}
-
-func (r *blockRegistry) finishSliceWrite(sliceID uint64, delta int64) {
-	r.mu.Lock()
-	if r.sliceWriters[sliceID] > 0 {
-		r.sliceWriters[sliceID]--
-		if r.sliceWriters[sliceID] == 0 {
-			delete(r.sliceWriters, sliceID)
-		}
+	defer r.mu.Unlock()
+	if limit > 0 && r.pinnedBytes+r.stagedMemBytes+size > limit && (r.pinnedBytes > 0 || r.stagedMemBytes > 0) {
+		return false
 	}
 	if r.sliceUsed == nil {
 		r.sliceUsed = make(map[uint64]int64)
 	}
-	oldTarget := r.sliceTarget[sliceID]
-	oldUsed := r.sliceUsed[sliceID]
-	newUsed := oldUsed + delta
-	if newUsed < 0 {
-		newUsed = 0
+	r.sliceUsed[sliceID] += size
+	r.stagedMemBytes += size
+	return true
+}
+
+func (r *blockRegistry) releaseBlockMem(sliceID uint64, size int64) {
+	if size <= 0 {
+		return
 	}
-	r.sliceUsed[sliceID] = newUsed
-	oldContrib := oldUsed
-	if oldTarget > oldContrib {
-		oldContrib = oldTarget
+	r.mu.Lock()
+	if r.sliceUsed[sliceID] <= size {
+		delete(r.sliceUsed, sliceID)
+	} else {
+		r.sliceUsed[sliceID] -= size
 	}
-	newContrib := newUsed
-	if oldTarget > newContrib {
-		newContrib = oldTarget
-	}
-	diff := newContrib - oldContrib
-	r.stagedMemBytes += diff
+	r.stagedMemBytes -= size
 	if r.stagedMemBytes < 0 {
 		r.stagedMemBytes = 0
 	}
-	if diff < 0 {
-		close(r.budgetCh)
-		r.budgetCh = make(chan struct{})
-	}
+	close(r.budgetCh)
+	r.budgetCh = make(chan struct{})
 	r.mu.Unlock()
 }
 
-func (r *blockRegistry) abortSliceWrite(sliceID uint64, releaseIfIdle bool) {
+// reserveBlockMemPutSafe waits for memory budget ONLY when sliceID has not yet
+// started staging and fewer than half of the upload workers are parked, leaving
+// upload slots free so already-admitted slices can always finish and reach
+// Bridge.Write (where commit backpressure holds no upload slots).
+func (r *blockRegistry) reserveBlockMemPutSafe(ctx context.Context, sliceID uint64, size, limit int64, alreadyActive bool, onWait func()) error {
 	r.mu.Lock()
-	if r.sliceWriters[sliceID] > 0 {
-		r.sliceWriters[sliceID]--
-		if r.sliceWriters[sliceID] == 0 {
-			delete(r.sliceWriters, sliceID)
+	maxWaiters := r.maxUpload / 2
+	if maxWaiters < 1 {
+		maxWaiters = 1
+	}
+	if alreadyActive || r.putWaiters >= maxWaiters {
+		if r.sliceUsed == nil {
+			r.sliceUsed = make(map[uint64]int64)
+		}
+		r.sliceUsed[sliceID] += size
+		r.stagedMemBytes += size
+		r.mu.Unlock()
+		return nil
+	}
+	r.putWaiters++
+	defer func() {
+		r.putWaiters--
+		r.mu.Unlock()
+	}()
+	for limit > 0 && r.pinnedBytes+r.stagedMemBytes+size > limit && (r.pinnedBytes > 0 || r.stagedMemBytes > 0) {
+		ch := r.budgetCh
+		r.mu.Unlock()
+		if onWait != nil {
+			onWait()
+		}
+		t := time.NewTimer(250 * time.Millisecond)
+		select {
+		case <-ch:
+			t.Stop()
+		case <-t.C:
+		case <-ctx.Done():
+			t.Stop()
+			r.mu.Lock()
+			return ctx.Err()
+		}
+		r.mu.Lock()
+	}
+	if r.sliceUsed == nil {
+		r.sliceUsed = make(map[uint64]int64)
+	}
+	r.sliceUsed[sliceID] += size
+	r.stagedMemBytes += size
+	return nil
+}
+
+func (r *blockRegistry) checkDiskFreeRatio(size int64) bool {
+	if r.freeRatio <= 0 || r.cacheDir == "" {
+		return true
+	}
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(r.cacheDir, &st); err != nil {
+		return true
+	}
+	total := int64(st.Blocks) * int64(st.Bsize)
+	free := int64(st.Bavail) * int64(st.Bsize)
+	if total <= 0 {
+		return true
+	}
+	return float64(free-size)/float64(total) >= r.freeRatio
+}
+
+func (r *blockRegistry) tryReserveDiskSpool(size int64) bool {
+	if r.cacheDir == "" || r.diskBudget <= 0 || size <= 0 {
+		return false
+	}
+	if !r.checkDiskFreeRatio(size) {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.stagedDiskBytes+size > r.diskBudget {
+		return false
+	}
+	r.stagedDiskBytes += size
+	return true
+}
+
+func (r *blockRegistry) waitDiskSpool(ctx context.Context, size int64, onWait func()) error {
+	if r.cacheDir == "" || r.diskBudget <= 0 {
+		return fmt.Errorf("extent disk spool is disabled")
+	}
+	if size > r.diskBudget {
+		return syscall.ENOSPC
+	}
+	for {
+		if !r.checkDiskFreeRatio(size) {
+			return syscall.ENOSPC
+		}
+		r.mu.Lock()
+		if r.stagedDiskBytes+size <= r.diskBudget {
+			r.stagedDiskBytes += size
+			r.mu.Unlock()
+			return nil
+		}
+		ch := r.budgetCh
+		r.mu.Unlock()
+		if onWait != nil {
+			onWait()
+		}
+		t := time.NewTimer(250 * time.Millisecond)
+		select {
+		case <-ch:
+			t.Stop()
+		case <-t.C:
+		case <-ctx.Done():
+			t.Stop()
+			return ctx.Err()
 		}
 	}
-	if releaseIfIdle && r.sliceWriters[sliceID] == 0 && r.sliceUsed[sliceID] == 0 {
-		r.retireSliceMemLocked(sliceID)
+}
+
+func (r *blockRegistry) releaseDiskSpool(size int64) {
+	if size <= 0 {
+		return
 	}
+	r.mu.Lock()
+	r.stagedDiskBytes -= size
+	if r.stagedDiskBytes < 0 {
+		r.stagedDiskBytes = 0
+	}
+	close(r.budgetCh)
+	r.budgetCh = make(chan struct{})
 	r.mu.Unlock()
 }
 
@@ -657,163 +793,6 @@ func (r *blockRegistry) retireSliceMemLocked(sliceID uint64) {
 		close(r.budgetCh)
 		r.budgetCh = make(chan struct{})
 	}
-}
-
-// issuePin increments the issued-reader count for a staged id (the
-// registry entry is immune from LRU retirement until fetched).
-func (r *blockRegistry) issuePin(id uint64) {
-	if id == 0 {
-		return
-	}
-	r.mu.Lock()
-	if r.issued[id] == 0 {
-		r.issueOrder = append(r.issueOrder, id)
-	}
-	r.issued[id]++
-	r.mu.Unlock()
-}
-
-// releaseIssuePin decrements an id's issued-reader count; true when a pin
-// existed.
-func (r *blockRegistry) releaseIssuePin(id uint64) bool {
-	if id == 0 {
-		return false
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.issued[id] <= 0 {
-		return false
-	}
-	r.issued[id]--
-	if r.issued[id] == 0 {
-		delete(r.issued, id)
-		for i, v := range r.issueOrder {
-			if v == id {
-				r.issueOrder = append(r.issueOrder[:i], r.issueOrder[i+1:]...)
-				break
-			}
-		}
-	}
-	return true
-}
-
-// markLocalOverlay flags an entry whose cached bytes include local-only
-// writes (a deferred overlay): demotion would replace them with the older
-// remote image, so the bytes are irreducible.
-func (r *blockRegistry) markLocalOverlay(id uint64, ino meta.Ino) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if e, ok := r.m[id]; ok {
-		e.localOverlay = true
-		if ino != 0 {
-			e.provenanceIno = ino
-		}
-	}
-}
-
-// demoteToProvenance drops a classic entry's cached bytes while keeping
-// the id fetchable: the remote range is the usable source for any
-// outstanding reader's later block fetches. Entries whose bytes are NOT
-// reproducible from the remote range — locally overlaid slices (deferred
-// writes only exist here) or checksums a pending commit still references
-// — are NOT demoted; their bytes stay (accounted by the LRU re-append in
-// the caller).
-func (r *blockRegistry) demoteToProvenance(id uint64, sum, path string, start int64, resID string, ino meta.Ino) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	e, ok := r.m[id]
-	if !ok || e.cached == nil {
-		return true // nothing to keep
-	}
-	if r.pins[sum] > 0 {
-		return false // a pending commit still references these bytes
-	}
-	if e.localOverlay {
-		// Local-only bytes are irreducible: keep them RESIDENT (the
-		// reader must see them) — the CALLER re-appends the LRU record so
-		// they stay accounted, and the entry self-clears the overlay flag
-		// once a flush's releaseCommitted retires its pending fragments
-		// (the then-pure-remote image becomes demotable again).
-		return false
-	}
-	if resID == "" {
-		// No identity for the source: the pathname is REUSABLE (renames,
-		// replacements) and cannot be trusted as this slice's source —
-		// keep the bytes resident instead of risking cross-file service.
-		return false
-	}
-	e.cached = nil
-	e.path = path
-	e.provenanceStart = start
-	e.classicRange = e.size
-	e.provResID = resID
-	e.provenanceIno = ino // rename-following: fetch resolves the CURRENT mapping
-	return true
-}
-
-// setProvenanceIdentity records the source object's identity on a staged
-// classic entry (the demotion refetch verifies it).
-func (r *blockRegistry) setProvenanceIdentity(id uint64, resID string, ino meta.Ino) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if e, ok := r.m[id]; ok {
-		e.provResID = resID
-		if ino != 0 {
-			e.provenanceIno = ino
-		}
-	}
-}
-
-// resolveOverlaysFor clears the local-overlay flag of every classic
-// entry staged from one inode: after the flush landed that inode's
-// pending fragments, the whole-chunk overlay images (whose checksums
-// differ from the fragment checksums) match the remote object again and
-// may demote.
-func (r *blockRegistry) resolveOverlaysFor(ino meta.Ino) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for _, e := range r.m {
-		if e.provenanceIno == ino && e.localOverlay {
-			e.localOverlay = false
-		}
-	}
-}
-
-// trimIssued is a no-op retained for call-site symmetry: pins belonging
-// to outstanding readers are NEVER revoked by cache pressure (revoking
-// them makes valid reads fail with no reconstructable source). The
-// memory bound comes from the LRU accounting (issued entries stay
-// counted) plus entry reuse: re-staging the same id refreshes the entry,
-// and the byte budget bounds the non-issued population. A hard
-// outstanding-set cap would reintroduce reader failure and is
-// deliberately not implemented.
-func (r *blockRegistry) trimIssued(keep int) {
-	_ = keep
-}
-
-// isIssued reports whether an outstanding reader holds the staged id.
-func (r *blockRegistry) isIssued(id uint64) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.issued[id] > 0
-}
-
-// releaseIfUnpinned drops a staged entry nothing references — pinned by
-// neither a pending commit NOR an outstanding reader (one critical
-// section: the issued check and the deletion are atomic).
-func (r *blockRegistry) releaseIfUnpinned(sha string) {
-	sum, err := hex.DecodeString(sha)
-	if err != nil || len(sum) < 8 {
-		return
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.pins[sha] > 0 || r.issued[detID(sum)] > 0 {
-		return
-	}
-	delete(r.pins, sha)
-	delete(r.pinSizes, sha)
-	delete(r.m, detID(sum))
 }
 
 func (r *blockRegistry) stageBytes(sha string, data []byte) uint64 {
@@ -910,65 +889,6 @@ func (r *blockRegistry) fetch(ctx context.Context, c fetchClient, id uint64, off
 			path = cur
 		}
 	}
-	if snap.classicRange > 0 {
-		// Classic-read provenance: the bytes were dropped under cache
-		// pressure while a reader still held the id. The refetch's proof
-		// is the READ's OWN response identity (the pre-stat only fences
-		// the obvious): a mismatch or absent echo errors — never wrong
-		// bytes under this id.
-		if snap.provResID == "" {
-			return nil, fmt.Errorf("classic slice %d has no verified source", id)
-		}
-		rc, rerr := c.ReadStreamRange(ctx, path, snap.provenanceStart+off, limit)
-		if rerr != nil {
-			return nil, rerr
-		}
-		if got := rcHeaderResourceID(rc); got != "" {
-			if got != snap.provResID {
-				_ = rc.Close()
-				return nil, fmt.Errorf("classic slice %d source no longer holds the staged object", id)
-			}
-			return rc, nil
-		}
-		// Redirected (302/307) and legacy-inline reads carry no echo. A
-		// stat fence alone cannot bind the BODY of the re-read that
-		// follows it — the pathname can be replaced between the stat and
-		// the response, and the re-read's own echo (when it carries one)
-		// must not go unchecked either. The fallback therefore re-reads
-		// the WHOLE slice and verifies it against the entry's content
-		// checksum: only bytes hashing to the staged image are published
-		// under this id (a replacement's bytes never match), regardless
-		// of what the intermediate stat observed.
-		_ = rc.Close()
-		curID, serr := c.StatResourceID(ctx, path)
-		if serr != nil || curID != snap.provResID {
-			return nil, fmt.Errorf("classic slice %d source no longer holds the staged object", id)
-		}
-		frc, ferr := c.ReadStreamRange(ctx, path, snap.provenanceStart, snap.size)
-		if ferr != nil {
-			return nil, ferr
-		}
-		if got := rcHeaderResourceID(frc); got != "" && got != snap.provResID {
-			_ = frc.Close()
-			return nil, fmt.Errorf("classic slice %d source no longer holds the staged object", id)
-		}
-		data, derr := io.ReadAll(frc)
-		_ = frc.Close()
-		if derr != nil {
-			return nil, derr
-		}
-		if sha256Hex(data) != snap.sha256 {
-			return nil, fmt.Errorf("classic slice %d refetch content mismatch", id)
-		}
-		if off > int64(len(data)) {
-			return io.NopCloser(bytes.NewReader(nil)), nil
-		}
-		end := off + limit
-		if end > int64(len(data)) {
-			end = int64(len(data))
-		}
-		return io.NopCloser(bytes.NewReader(data[off:end])), nil
-	}
 	plan, err := c.GetExtentReadPlan(ctx, path, snap.provenanceStart, snap.provenanceStart+snap.size)
 	if err != nil {
 		return nil, err
@@ -991,8 +911,6 @@ func (r *blockRegistry) fetch(ctx context.Context, c fetchClient, id uint64, off
 type fetchClient interface {
 	FetchExtentBlockRange(ctx context.Context, url string, offset, length int64) (io.ReadCloser, error)
 	GetExtentReadPlan(ctx context.Context, path string, start, end int64) (*client.ExtentReadPlan, error)
-	ReadStreamRange(ctx context.Context, path string, offset, length int64) (io.ReadCloser, error)
-	StatResourceID(ctx context.Context, path string) (string, error)
 }
 
 func sha256Hex(b []byte) string {

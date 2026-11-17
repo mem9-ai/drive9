@@ -192,6 +192,14 @@ func NewShadowStoreWithQuota(dir string, freeRatio float64, maxBytes int64) (*Sh
 	return ss, nil
 }
 
+// Dir returns the on-disk directory backing this shadow store.
+func (s *ShadowStore) Dir() string {
+	if s == nil {
+		return ""
+	}
+	return s.dir
+}
+
 // CheckWriteBackQuota checks whether a write of requiredBytes would violate
 // the write-back disk protection policy. Returns nil if the write is allowed,
 // or syscall.ENOSPC if it would breach either the free-space ratio or the

@@ -905,6 +905,43 @@ func (c *Client) CreateFileCreatedCtx(ctx context.Context, path string) (int64, 
 	return result.Revision, result.ResourceID, nil
 }
 
+// CreateExtentFileCreatedCtx creates an empty file requesting native extent
+// layout (`POST ?create=1&layout=extent`). It returns nativeExtent=true when
+// the server echoes `content_layout == "extent"`. Against older servers that
+// reject `?layout=extent` (e.g. scoped query allowlist) or ignore it, it
+// falls back to `?create=1` with nativeExtent=false so the caller can track a
+// 0-byte placeholder and upgrade it on first write.
+func (c *Client) CreateExtentFileCreatedCtx(ctx context.Context, path string) (rev int64, resourceID string, nativeExtent bool, err error) {
+	req, err := c.newFSRequest(ctx, http.MethodPost, path, "?create=1&layout=extent", nil)
+	if err != nil {
+		return 0, "", false, err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return 0, "", false, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusForbidden {
+		rev, id, ferr := c.CreateFileCreatedCtx(ctx, path)
+		return rev, id, false, ferr
+	}
+	if resp.StatusCode >= 300 {
+		return 0, "", false, readError(resp)
+	}
+	var result struct {
+		Revision      int64  `json:"revision"`
+		ResourceID    string `json:"resource_id"`
+		ContentLayout string `json:"content_layout"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		if errors.Is(err, io.EOF) {
+			return 0, "", false, nil
+		}
+		return 0, "", false, fmt.Errorf("decode create extent file response: %w", err)
+	}
+	return result.Revision, result.ResourceID, ContentLayout(result.ContentLayout) == ContentLayoutExtent, nil
+}
+
 // Symlink creates a symbolic link at linkPath pointing to target.
 func (c *Client) Symlink(target, linkPath string) error {
 	return c.SymlinkCtx(context.Background(), target, linkPath)
@@ -1480,6 +1517,31 @@ func (c *Client) DeleteCtx(ctx context.Context, path string) error {
 // DeleteFileCtx removes a file with a server-side type hint.
 func (c *Client) DeleteFileCtx(ctx context.Context, path string) error {
 	return c.deleteCtx(ctx, path, false, "file")
+}
+
+// DeleteFileConditionalCtx removes a regular file (?kind=file, never recursive)
+// carrying optional revision and resource-identity preconditions.
+func (c *Client) DeleteFileConditionalCtx(ctx context.Context, path string, expectedRev int64, expectedResourceID string) error {
+	req, err := c.newFSRequest(ctx, http.MethodDelete, path, "?kind=file", nil)
+	if err != nil {
+		return err
+	}
+	if expectedRev > 0 {
+		req.Header.Set("X-Dat9-Expected-Revision", strconv.FormatInt(expectedRev, 10))
+	}
+	if expectedResourceID != "" {
+		req.Header.Set("X-Dat9-Expected-Resource", expectedResourceID)
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 400 {
+		return readError(resp)
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxDeleteSuccessBodyBytes))
+	return nil
 }
 
 // DeleteDirCtx removes an empty directory with a server-side type hint.

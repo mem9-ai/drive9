@@ -798,33 +798,10 @@ func runPreCompleteCheck(ctx context.Context, check func() error) error {
 	return ctx.Err()
 }
 
-// uploadClassicSession drives the classic v2 pipeline on an
-// already-initiated session. Used by WriteExtentStreamConditional when a
-// legacy server ignored the layout field and answered a classic plan.
-func (c *Client) uploadClassicSession(ctx context.Context, plan *uploadPlanV2, ra io.ReaderAt, progress ProgressFunc) error {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	parallelism := boundedUploadParallelism(plan.PartSize, plan.TotalParts)
-	presignCh := make(chan presignedPart, parallelism)
-	presignErrCh := make(chan error, 1)
-	presignRecorder := &uploadDurationRecorder{}
-
-	go func() {
-		c.presignPipeline(ctx, plan, parallelism, presignCh, presignErrCh, presignRecorder)
-	}()
-
-	parts, err := c.uploadPartsV2(ctx, plan, ra, presignCh, presignErrCh, presignRecorder, progress)
-	if err != nil {
-		c.abortUploadV2BestEffort(ctx, plan.UploadID)
-		return err
-	}
-	if err := c.completeUploadV2WithOptions(ctx, plan.UploadID, parts, nil, ""); err != nil {
-		c.abortUploadV2BestEffort(ctx, plan.UploadID)
-		return err
-	}
-	return nil
-}
+// TODO(extent): switch CLI/SDK default large-file WriteStream/Upload above
+// uploadThreshold from classic V2 multipart (`layout=""`) to extent sequential
+// upload (`WriteExtentStreamConditional`, `layout="extent"`) once non-FUSE
+// rollout is enabled.
 
 type uploadInitiateRequest struct {
 	Path             string   `json:"path"`

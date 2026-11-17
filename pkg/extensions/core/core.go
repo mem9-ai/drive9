@@ -910,6 +910,10 @@ func (c *Core) statOp(ctx context.Context, path string, allowListing bool) (fs.R
 					// maybeListOnNegativeLookupStorm). A listing failure
 					// must not fail the stat — the ENOENT stands.
 					inst, _ := c.dirCache.(namespaceObservationCache)
+					deferrer, _ := c.dirCache.(interface {
+						DeferEscalation(dirPath string)
+						CanAnswerMisses(dirPath string) bool
+					})
 					var token fs.Observation
 					if inst != nil {
 						token = inst.BeginObservation(parent)
@@ -923,12 +927,20 @@ func (c *Core) statOp(ctx context.Context, path string, allowListing bool) (fs.R
 						if inst != nil {
 							inst.InstallListing(parent, dirEntryInfos(infos), token)
 						}
+						if deferrer != nil && !deferrer.CanAnswerMisses(parent) {
+							deferrer.DeferEscalation(parent)
+						}
 						// The listing is installed; re-answer from it.
 						if attr, ok := c.statFromNamespaceCacheMode(path, allowListing); ok && attr == nil {
 							return fs.Result{}, fs.ErrNotFound
 						}
-					} else if inst != nil {
-						inst.EndObservation(token)
+					} else {
+						if inst != nil {
+							inst.EndObservation(token)
+						}
+						if deferrer != nil {
+							deferrer.DeferEscalation(parent)
+						}
 					}
 				}
 			}

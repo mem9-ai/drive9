@@ -395,8 +395,9 @@ func TestPortKernelCreateAsyncDoesNotProbe(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Truncating kernel CREATE (O_CREAT|O_TRUNC) claims asynchronously with 0 HEADs.
 	res, err := ch.Dispatch(context.Background(), &fs.Op{
-		Kind: fs.OpCreate, Path: "/f", Flags: uint32(syscall.O_CREAT | syscall.O_RDWR),
+		Kind: fs.OpCreate, Path: "/fresh", Flags: uint32(syscall.O_CREAT | syscall.O_TRUNC | syscall.O_RDWR),
 		Mode: 0o644, HasMode: true, Kernel: &gofuse.CreateIn{},
 	})
 	if err != nil {
@@ -407,11 +408,35 @@ func TestPortKernelCreateAsyncDoesNotProbe(t *testing.T) {
 		t.Fatalf("handle type = %T", res.Handle)
 	}
 	if !h.isNew || h.baseRev != 0 {
-		t.Fatalf("async create isNew=%v baseRev=%d, want true/0", h.isNew, h.baseRev)
+		t.Fatalf("async truncating create isNew=%v baseRev=%d, want true/0", h.isNew, h.baseRev)
 	}
 	if got := heads.Load(); got != 0 {
-		t.Fatalf("nonexclusive create probe HEADs = %d, want 0", got)
+		t.Fatalf("truncating create probe HEADs = %d, want 0", got)
 	}
+	_ = h.Release(context.Background())
+
+	// Non-truncating kernel CREATE (O_CREAT|O_RDWR without O_TRUNC) reconciles
+	// an existing remote file so its contents and attributes are preserved.
+	res2, err := ch.Dispatch(context.Background(), &fs.Op{
+		Kind: fs.OpCreate, Path: "/f", Flags: uint32(syscall.O_CREAT | syscall.O_RDWR),
+		Mode: 0o644, HasMode: true, Kernel: &gofuse.CreateIn{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h2, ok := res2.Handle.(*bufferingHandle)
+	if !ok {
+		t.Fatalf("handle type = %T", res2.Handle)
+	}
+	if h2.isNew || h2.baseRev != 1 {
+		t.Fatalf("non-truncating create isNew=%v baseRev=%d, want false/1", h2.isNew, h2.baseRev)
+	}
+	buf := make([]byte, 8)
+	n, rerr := h2.Read(context.Background(), 0, buf)
+	if rerr != nil || string(buf[:n]) != "old" {
+		t.Fatalf("Read existing after non-truncating create = %q, %v; want %q", string(buf[:n]), rerr, "old")
+	}
+	_ = h2.Release(context.Background())
 }
 
 // A second append opener can materialize an intermediate generation G2

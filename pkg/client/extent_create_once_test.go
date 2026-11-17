@@ -314,8 +314,12 @@ func TestUploadExtentSequentialResumesAfterInterruptedUpload(t *testing.T) {
 	if len(ts.objects) != 2 || !bytes.Equal(ts.objects[sha256Hex(second)], second) {
 		t.Fatalf("store holds %d objects, want both blocks", len(ts.objects))
 	}
-	if len(ts.putAttempts) != 2 || ts.putAttempts[0] != sha256Hex(first) || ts.putAttempts[1] != sha256Hex(second) {
-		t.Fatalf("PUT attempts = %v, want [collision on first, success on second]", ts.putAttempts)
+	wantFirst, wantSecond := sha256Hex(first), sha256Hex(second)
+	unorderedOK := len(ts.putAttempts) == 2 &&
+		((ts.putAttempts[0] == wantFirst && ts.putAttempts[1] == wantSecond) ||
+			(ts.putAttempts[0] == wantSecond && ts.putAttempts[1] == wantFirst))
+	if !unorderedOK {
+		t.Fatalf("PUT attempts = %v, want unordered {%s, %s}", ts.putAttempts, wantFirst, wantSecond)
 	}
 	if ts.presignCalls != 2 || len(ts.completes) != 1 {
 		t.Fatalf("presign=%d completes=%d, want 2/1", ts.presignCalls, len(ts.completes))

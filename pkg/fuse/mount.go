@@ -1114,21 +1114,19 @@ func mountWithConfig(cfg MountConfig) error {
 			Threshold: 1,
 			Patterns:  cfg.ExtentPaths,
 			Events:    bus,
+			WriteSync: cfg.WritePolicy == string(WritePolicyWriteSync),
 		})
 		built["extent"] = extentPlane
-		// The extent plane implements JuiceFS's close-to-open contract
-		// and nothing else: it has no local fsync barrier and no
-		// per-Write publish (docs/design/fuse-durability-policy.md,
-		// "Extent plane"). A non-default --durability therefore applies
-		// only to paths this plane does not serve, and saying so is
-		// better than letting the weaker promise be silent.
-		if cfg.WritePolicy != string(WritePolicyWriteBack) || syncMode != "strict" {
+		// Extent-served paths honor write-sync (per-Write remote publish) and
+		// strict fsync/close-to-open; interactive/local-only fsync modes still
+		// publish remotely at fsync on the extent plane.
+		if syncMode != "strict" {
 			logger.Warn(context.Background(), "extent_durability_override",
 				zap.String("durability_profile", cfg.Profile),
 				zap.String("write_policy", string(cfg.WritePolicy)),
 				zap.String("sync_mode", syncMode),
 				zap.Strings("extent_patterns", cfg.ExtentPaths),
-				zap.String("detail", "extent-served paths keep JuiceFS close-to-open semantics; --durability applies to other paths only"))
+				zap.String("detail", "extent-served paths have no local-only fsync staging; fsync publishes remotely"))
 		}
 	}
 
@@ -1175,6 +1173,8 @@ func mountWithConfig(cfg MountConfig) error {
 			Policy:                policy,
 			SyncMode:              syncMode,
 			WriteCacheDir:         writeCacheDir,
+			WriteCacheSizeMB:      resolveWriteCacheSizeMB(cfg.WriteCacheSizeMB),
+			WriteCacheFreeRatio:   cfg.WriteCacheFreeRatio,
 			Client:                cl,
 			RemoteRoot:            remoteRoot,
 			Events:                bus,

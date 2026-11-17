@@ -3053,7 +3053,7 @@ func (f *FS) Fallocate(cancel <-chan struct{}, input *gofuse.FallocateIn) gofuse
 	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
-	_, st := f.dispatch(ctx, &fs.Op{Kind: fs.OpFallocate, Path: path, Ino: input.NodeId, Fh: input.Fh, Offset: int64(input.Offset), Size: int64(input.Length), Flags: input.Mode, Kernel: input, Caller: fs.CallerFrom(input.InHeader)})
+	_, st := f.dispatch(ctx, &fs.Op{Kind: fs.OpFallocate, Path: path, Ino: input.NodeId, Fh: input.Fh, Handle: f.openHandle(input.Fh), Offset: int64(input.Offset), Size: int64(input.Length), Flags: input.Mode, Kernel: input, Caller: fs.CallerFrom(input.InHeader)})
 	if st != gofuse.OK {
 		return st
 	}
@@ -3089,6 +3089,8 @@ func (f *FS) CopyFileRange(cancel <-chan struct{}, input *gofuse.CopyFileRangeIn
 		Ino2:    input.NodeIdOut,
 		Fh:      input.FhIn,
 		Fh2:     input.FhOut,
+		Handle:  f.openHandle(input.FhIn),
+		Handle2: f.openHandle(input.FhOut),
 		Offset:  int64(input.OffIn),
 		Offset2: int64(input.OffOut),
 		Limit:   int64(input.Len),

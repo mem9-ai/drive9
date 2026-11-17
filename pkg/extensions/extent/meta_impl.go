@@ -1,13 +1,11 @@
 package extent
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"path"
 	"sort"
 	"strings"
@@ -55,7 +53,20 @@ func (b *Bridge) GetFormat() meta.Format {
 	return b.format
 }
 
-func (b *Bridge) Shutdown() error { return nil }
+func (b *Bridge) Shutdown() error {
+	b.retryOnce.Do(func() { close(b.retryStop) })
+	b.mu.Lock()
+	var spooled int64
+	for id, sl := range b.stagedSlices {
+		spooled += sl.closeAndSpoolBytes()
+		delete(b.stagedSlices, id)
+	}
+	b.mu.Unlock()
+	if spooled > 0 {
+		b.blocks.releaseDiskSpool(spooled)
+	}
+	return nil
+}
 
 func (b *Bridge) OnReload(cb func(*meta.Format)) {}
 
@@ -150,7 +161,7 @@ func (b *Bridge) Lookup(ctx meta.Context, parent meta.Ino, name string, inode *m
 		return errnoOf(err)
 	}
 	b.remember(ino, path)
-	b.observeRevision(ino, st.Revision)
+	b.observeRevisionWithSize(ino, st.Revision, st.Size)
 	b.mu.Lock()
 	if _, has := b.sizes[ino]; !has {
 		b.sizes[ino] = st.Size
@@ -185,7 +196,7 @@ func (b *Bridge) GetAttr(ctx meta.Context, ino meta.Ino, attr *meta.Attr) syscal
 		}
 		return errnoOf(err)
 	}
-	b.observeRevision(ino, st.Revision)
+	b.observeRevisionWithSize(ino, st.Revision, st.Size)
 	b.mu.Lock()
 	local, has := b.localLengthLocked(ino)
 	_, truncating := b.truncs[ino]
@@ -228,6 +239,7 @@ func (b *Bridge) Resolve(ctx meta.Context, parent meta.Ino, path string, inode *
 	}
 	ino := inoFor(full)
 	b.remember(ino, full)
+	b.observeRevisionWithSize(ino, st.Revision, st.Size)
 	if inode != nil {
 		*inode = ino
 	}
@@ -253,7 +265,9 @@ func (b *Bridge) SetAttr(ctx meta.Context, ino meta.Ino, set uint16, sggidclearm
 		newSize = 0
 	}
 	if newSize >= 0 {
+		unlock := b.lockCommit(ino)
 		b.recordTruncate(ino, newSize)
+		unlock()
 	}
 	_ = path
 	return b.GetAttr(ctx, ino, attr)
@@ -359,9 +373,11 @@ func (b *Bridge) removeEntry(ctx meta.Context, parent meta.Ino, name string) sys
 	delete(b.sizes, ino)
 	delete(b.buffered, ino)
 	delete(b.revs, ino)
+	delete(b.pubSizes, ino)
 	delete(b.revAt, ino)
 	delete(b.pending, ino)
 	delete(b.truncs, ino)
+	delete(b.truncSeq, ino)
 	delete(b.modes, ino)
 	for i, e := range b.paths {
 		if strings.HasPrefix(e, path+"/") {
@@ -491,14 +507,9 @@ var readPlanStaleDelays = []time.Duration{0, 10 * time.Millisecond, 25 * time.Mi
 // the very statement that just created it. This mount KNOWS it published
 // revision N; a read below N is stale by definition, not merely unlucky.
 func (b *Bridge) fetchFreshReadPlan(ctx context.Context, ino meta.Ino, path string, start, end int64) (*client.ExtentReadPlan, error) {
-	known := b.publishedRevision(ino)
-	// The retry budget is only meaningful right after a publication by THIS
-	// mount: that is when a replica can be genuinely behind, and when waiting
-	// a few milliseconds resolves it. Outside that window a plan below the
-	// recorded revision means something else, so the read proceeds rather than
-	// stalling on a disagreement the wait cannot fix.
+	known, pubSize := b.publishedState(ino)
 	delays := readPlanStaleDelays
-	if known <= 0 || !b.recentlyPublished(ino) {
+	if known <= 0 {
 		delays = readPlanStaleDelays[:1]
 	}
 	var last *client.ExtentReadPlan
@@ -513,6 +524,9 @@ func (b *Bridge) fetchFreshReadPlan(ctx context.Context, ino meta.Ino, path stri
 		}
 		last, err = b.cfg.Client.GetExtentReadPlan(ctx, path, start, end)
 		if err != nil {
+			if known > 0 && start < pubSize && (client.IsNotFound(err) || isRangeNotSatisfiable(err)) {
+				continue
+			}
 			return last, err
 		}
 		// A plan that does not report a revision cannot be judged; accept it
@@ -520,12 +534,53 @@ func (b *Bridge) fetchFreshReadPlan(ctx context.Context, ino meta.Ino, path stri
 		if known <= 0 || last.Revision <= 0 || last.Revision >= known {
 			return last, nil
 		}
-		// Still behind: keep the newest answer seen and retry.
+		// Still behind: keep retrying.
 	}
-	// Exhausted the budget: return the freshest plan we got rather than
-	// failing the read — the caller already had no better option, and a hard
-	// error here would turn replica lag into EIO for every reader.
+	if err != nil {
+		return nil, err
+	}
+	if known > 0 && last != nil && last.Revision > 0 && last.Revision < known {
+		return nil, fmt.Errorf("extent read plan revision %d is older than published revision %d", last.Revision, known)
+	}
 	return last, nil
+}
+
+// synthesizeUnconvertedReadPlan serves a single-chunk read fallback via classic
+// HTTP range streaming when a defensive read hits Content-Layout != extent
+// (avoiding EIO / mmap SIGBUS without any persistent classic-ownership state).
+func (b *Bridge) synthesizeUnconvertedReadPlan(ctx context.Context, ino meta.Ino, path string, start int64) (*client.ExtentReadPlan, error) {
+	known, pubSize := b.publishedState(ino)
+	rc, err := b.cfg.Client.ReadStreamRange(ctx, path, start, meta.ChunkSize)
+	if err != nil {
+		if client.IsNotFound(err) || isRangeNotSatisfiable(err) {
+			if known > 0 && start < pubSize {
+				return nil, err
+			}
+			return &client.ExtentReadPlan{}, nil
+		}
+		return nil, err
+	}
+	data, rerr := io.ReadAll(rc)
+	_ = rc.Close()
+	if rerr != nil {
+		return nil, rerr
+	}
+	plan := &client.ExtentReadPlan{Size: start + int64(len(data))}
+	for off := 0; off < len(data); off += int(client.ExtentBlockSize) {
+		end := off + int(client.ExtentBlockSize)
+		if end > len(data) {
+			end = len(data)
+		}
+		piece := data[off:end]
+		sha := sha256Hex(piece)
+		b.blocks.stageBytes(sha, piece)
+		plan.Blocks = append(plan.Blocks, client.ExtentReadPlanBlock{
+			FileOffset: start + int64(off),
+			Length:     int64(len(piece)),
+			BlockKey:   sha,
+		})
+	}
+	return plan, nil
 }
 
 func (b *Bridge) Read(ctx meta.Context, ino meta.Ino, indx uint32, slices *[]meta.Slice) syscall.Errno {
@@ -535,21 +590,34 @@ func (b *Bridge) Read(ctx meta.Context, ino meta.Ino, indx uint32, slices *[]met
 	}
 	start := int64(indx) * meta.ChunkSize
 	chunkEnd := start + meta.ChunkSize - 1
-	if b.isClassicOwned(ino) {
-		return b.readClassic(ctx, ino, path, start, chunkEnd, slices)
-	}
 	plan, err := b.fetchFreshReadPlan(ctxOf(ctx), ino, path, start, chunkEnd)
 	if err != nil {
 		if errors.Is(err, client.ErrExtentNotServed) {
-			return b.readClassic(ctx, ino, path, start, chunkEnd, slices)
-		}
-		if !client.IsNotFound(err) && !isRangeNotSatisfiable(err) {
+			var serr error
+			plan, serr = b.synthesizeUnconvertedReadPlan(ctxOf(ctx), ino, path, start)
+			if serr != nil {
+				return errnoOf(serr)
+			}
+		} else if !client.IsNotFound(err) && !isRangeNotSatisfiable(err) {
 			return errnoOf(err)
+		} else {
+			known, pubSize := b.publishedState(ino)
+			b.mu.Lock()
+			truncFloor, truncating := b.truncs[ino]
+			b.mu.Unlock()
+			if known > 0 && start < pubSize && (!truncating || start < truncFloor) {
+				if st, serr := b.cfg.Client.StatCtx(ctxOf(ctx), path); serr == nil && st.Revision >= known && st.Size <= start {
+					b.observeRevisionWithSize(ino, st.Revision, st.Size)
+				} else {
+					return syscall.EIO
+				}
+			}
+			// No remote representation (a fresh interactive file before its
+			// first commit, a 0-byte placeholder, or a read beyond EOF): an
+			// empty plan — the pending overlay below still serves locally
+			// staged/truncated bytes.
+			plan = &client.ExtentReadPlan{}
 		}
-		// No remote representation (a fresh interactive file before its
-		// first commit or a 0-byte remote placeholder): an empty plan —
-		// the pending overlay below still serves locally staged/truncated bytes.
-		plan = &client.ExtentReadPlan{}
 	}
 	// A single plan page need not cover the chunk: the server caps a plan
 	// at 512 distinct block URLs and stops early on a presign failure,
@@ -585,6 +653,9 @@ func (b *Bridge) Read(ctx meta.Context, ino meta.Ino, indx uint32, slices *[]met
 	// staleness this plane is trying to prevent.
 	if plan.Revision > b.revs[ino] {
 		b.revs[ino] = plan.Revision
+		b.pubSizes[ino] = plan.Size
+	} else if plan.Revision > 0 && plan.Revision == b.revs[ino] {
+		b.pubSizes[ino] = plan.Size
 	}
 	// A pending truncation is authoritative: the server's (older, larger)
 	// plan size must not resurrect a shrunk tail — the truncate-only
@@ -794,6 +865,117 @@ func (b *Bridge) NewSlice(ctx meta.Context, id *uint64) syscall.Errno {
 	return 0
 }
 
+func (b *Bridge) hasStagedSlice(id uint64) bool {
+	b.mu.Lock()
+	_, ok := b.stagedSlices[id]
+	b.mu.Unlock()
+	return ok
+}
+
+func (b *Bridge) flushAnyPending(ctx context.Context) {
+	b.mu.Lock()
+	seen := make(map[meta.Ino]struct{}, len(b.pending)+len(b.commitErr))
+	inos := make([]meta.Ino, 0, len(b.pending)+len(b.commitErr))
+	for ino, list := range b.pending {
+		if len(list) > 0 {
+			seen[ino] = struct{}{}
+			inos = append(inos, ino)
+		}
+	}
+	for ino := range b.commitErr {
+		if _, ok := seen[ino]; !ok {
+			seen[ino] = struct{}{}
+			inos = append(inos, ino)
+		}
+	}
+	b.mu.Unlock()
+	for _, ino := range inos {
+		if ctx.Err() != nil {
+			return
+		}
+		_ = b.FlushFile(ctx, ino)
+	}
+}
+
+func (b *Bridge) waitPinnedBudgetWithFlush(ctx context.Context, limit int64) error {
+	for {
+		b.blocks.mu.Lock()
+		if b.blocks.pinnedBytes < limit {
+			b.blocks.mu.Unlock()
+			return nil
+		}
+		b.blocks.mu.Unlock()
+
+		b.flushAnyPending(ctx)
+
+		b.blocks.mu.Lock()
+		if b.blocks.pinnedBytes < limit {
+			b.blocks.mu.Unlock()
+			return nil
+		}
+		ch := b.blocks.budgetCh
+		b.blocks.mu.Unlock()
+
+		timer := time.NewTimer(250 * time.Millisecond)
+		select {
+		case <-ch:
+			timer.Stop()
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		}
+	}
+}
+
+func (b *Bridge) kickPendingFlush() {
+	b.mu.Lock()
+	if b.retryRunning || len(b.commitErr) == 0 {
+		b.mu.Unlock()
+		return
+	}
+	select {
+	case <-b.retryStop:
+		b.mu.Unlock()
+		return
+	default:
+	}
+	b.retryRunning = true
+	b.mu.Unlock()
+
+	go func() {
+		delays := []time.Duration{100 * time.Millisecond, 250 * time.Millisecond, 500 * time.Millisecond, time.Second}
+		step := 0
+		for {
+			d := delays[step]
+			if step+1 < len(delays) {
+				step++
+			}
+			timer := time.NewTimer(d)
+			select {
+			case <-b.retryStop:
+				timer.Stop()
+				b.mu.Lock()
+				b.retryRunning = false
+				b.mu.Unlock()
+				return
+			case <-timer.C:
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			b.flushAnyPending(ctx)
+			cancel()
+
+			b.mu.Lock()
+			if len(b.commitErr) == 0 {
+				b.retryRunning = false
+				b.mu.Unlock()
+				return
+			}
+			b.mu.Unlock()
+		}
+	}()
+}
+
 // Write records one uploaded slice and commits every pending slice of the
 // file. The engine uploads whole-block slices (RMW merges full blocks), so
 // Off is always zero; the staged object bytes were captured by the storage
@@ -819,12 +1001,10 @@ func (b *Bridge) Write(ctx meta.Context, ino meta.Ino, indx uint32, off uint32, 
 		}
 	}
 	// Backpressure: staged-but-uncommitted slices stay pinned in memory
-	// until their commit lands. When the server side stalls, an unbounded
-	// backlog OOM-killed the worker (6 GiB seqwrite → 7.58 GiB RSS →
-	// kernel OOM → fio ECONNABORTED at ~5.5 GiB written). Park here while
-	// the budget is full instead: the kernel queues the WRITE and the
-	// writer throttles to commit speed.
-	if err := b.blocks.waitPinnedBudget(ctxOf(ctx), maxPinnedCommitBytes); err != nil {
+	// until their commit lands. Before sleeping on a full budget, actively
+	// attempt to flush pending commits so recovered servers drain immediately
+	// without deadlocking behind the wait.
+	if err := b.waitPinnedBudgetWithFlush(ctxOf(ctx), maxPinnedCommitBytes); err != nil {
 		return syscall.EIO
 	}
 	b.mu.Lock()
@@ -836,12 +1016,13 @@ func (b *Bridge) Write(ctx meta.Context, ino meta.Ino, indx uint32, off uint32, 
 	delete(b.stagedSlices, slice.Id)
 	b.mu.Unlock()
 
-	// Concatenate, remove temp files, and hash OUTSIDE b.mu so concurrent
+	// Concatenate, close spooled files, and hash OUTSIDE b.mu so concurrent
 	// objectStorage.Put and metadata lookups do not block on slice copy/hash.
 	data := sl.join()
+	spooled := sl.closeAndSpoolBytes()
 	sl.blocks = nil
-	for _, p := range sl.paths {
-		_ = os.Remove(p)
+	if spooled > 0 {
+		b.blocks.releaseDiskSpool(spooled)
 	}
 	if int64(len(data)) != int64(slice.Size) {
 		if !b.cfg.NativeWriteback {
@@ -903,6 +1084,7 @@ func (b *Bridge) Write(ctx meta.Context, ino meta.Ino, indx uint32, off uint32, 
 			b.commitErr[ino] = err
 		}
 		b.mu.Unlock()
+		b.kickPendingFlush()
 		return 0
 	}
 	b.mu.Lock()
@@ -921,6 +1103,9 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 	if len(pending) == 0 {
 		return b.flushTruncateOnly(ctx, ino, size)
 	}
+	b.mu.Lock()
+	snapTruncSeq := b.truncSeq[ino]
+	b.mu.Unlock()
 	path, ok := b.remotePath(ino)
 	if !ok {
 		return fmt.Errorf("no path for inode %d", ino)
@@ -930,117 +1115,53 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 	if err != nil && !fresh {
 		return err
 	}
-	// This bridge's own zero-write materialization occupies the name: a
-	// 0-byte classic file has no content to preserve, and the descriptor
-	// is semantically the fresh create it started as. Removing the
-	// placeholder restores that fresh-create publication path; the extent
-	// session's create-only completion (an absent expected_revision means
-	// the target must STILL be absent at completion, under the dentry
-	// lock) keeps the removal-to-landing window race-free against a
-	// competing writer. The attribution is mount-local and re-verified
-	// live: a foreign occupant with content (size > 0) or an extent
-	// replacement never enters this branch, and only a descriptor THIS
-	// bridge created (fresh create, no recovery constraint) may spend it.
-	if !fresh && err == nil && st.ContentLayout != client.ContentLayoutExtent && st.Size == 0 &&
-		b.isFreshCreate(ino) && b.EmptyPlaceholderFull(path) {
-		if rmErr := b.cfg.Client.RemoveAllCtx(ctx, path); rmErr != nil {
-			return fmt.Errorf("remove empty placeholder %s: %w", path, rmErr)
-		}
-		b.takeEmptyPlaceholderFull(path)
-		fresh = true
+	if !fresh && st.IsDir {
+		return fmt.Errorf("target %s is a directory", path)
 	}
-	// An identity-verified recovery (durable replay) constrains EVERY
-	// publication of this data: the occupant must still be the staged
-	// object. The constraint SURVIVES failures and retries (it is only
-	// consumed by a completed publication) — and when the occupant is a
-	// replacement, the staged data is abandoned (mappings dropped) so no
-	// later unconstrained flush can publish into the replacement.
-	if v, bounded := b.peekVerifyBase(ino); bounded {
+	// An identity-verified recovery (or MaterializeEmpty binding) constrains
+	// EVERY publication of this data: the occupant must still be that exact
+	// object. When a replacement holds the path, abandon staged state rather
+	// than publishing into a stranger's file.
+	v, bounded := b.peekVerifyBase(ino)
+	if bounded {
 		if fresh || st.ResourceID != v.resID {
 			b.abandonIno(ino)
 			return fmt.Errorf("recovery target %s no longer holds the staged object", path)
 		}
 		st.Revision = v.rev
 	}
-	// A captured (echoed) landed identity constrains EVERY retry of a
-	// live handle whose classification never completed — regardless of the
-	// occupant's CURRENT layout: an extent replacement at the path must be
-	// rejected exactly like a classic one, not published into via the
-	// plain PATCH path.
-	if !fresh && b.isLayoutPending(ino) && !b.isClassicOwned(ino) {
+	// If this bridge materialized a 0-byte classic placeholder (on a server
+	// predating native `?create=1&layout=extent`), replace it with the fresh
+	// extent create this descriptor semantically represents. Conditional file
+	// delete fences on revision + resource identity and refuses directories.
+	if !fresh && err == nil && b.matchesEmptyPlaceholderFull(path, st) && (bounded || b.isFreshCreate(ino)) {
+		if rmErr := b.cfg.Client.DeleteFileConditionalCtx(ctx, path, st.Revision, st.ResourceID); rmErr != nil {
+			return fmt.Errorf("remove empty placeholder %s: %w", path, rmErr)
+		}
+		b.takeEmptyPlaceholderFull(path)
+		if bounded {
+			b.mu.Lock()
+			delete(b.verifyBase, ino)
+			b.mu.Unlock()
+		}
+		fresh = true
+	}
+	if !fresh && b.isLayoutPending(ino) {
 		if !b.layoutPendingMatches(ino, st.ResourceID) {
 			return fmt.Errorf("target %s no longer holds our upload", path)
 		}
 	}
 	if !fresh && b.needsFreshIdentity(ino) {
-		// A locally-created descriptor whose landing never established an
-		// attributable identity (no completion echo, no bound
-		// classification) must not write into whoever currently holds the
-		// name. An empty classic occupant is NOT an exception: publishing
-		// into it is an unconditional conditional-write against a foreign
-		// object (publicationIdentity is empty, so the request carries no
-		// expected resource and simply succeeds), and deleting it would be
-		// equally unauthorized. Refuse — the descriptor may not mutate an
-		// object it was never bound to.
 		return fmt.Errorf("fresh create of %s has no attributable identity for the current occupant", path)
 	}
 	if !fresh && st.ContentLayout != client.ContentLayoutExtent {
-		if b.isClassicOwned(ino) || b.isLayoutPending(ino) {
-			// A fresh session of ours degraded to a classic upload on a
-			// legacy server (or its post-upload classification never
-			// completed): keep the open handle usable — commit through
-			// the classic surface instead of rejecting a target we own.
-			// "Ours" is IDENTITY-BOUND: when the classification ever saw
-			// our landed upload, the occupant must still be THAT object —
-			// a foreign replacement is rejected exactly like the plain
-			// non-extent case.
-			if b.isLayoutPending(ino) && !b.isClassicOwned(ino) {
-				if !b.layoutPendingMatches(ino, st.ResourceID) {
-					return fmt.Errorf("target %s is not extent layout", path)
-				}
-				// The pending classification may have recovered by now.
-				for _, delay := range []time.Duration{0, 200 * time.Millisecond} {
-					time.Sleep(delay)
-					nst, serr := b.cfg.Client.StatCtx(ctx, path)
-					if serr == nil && nst.ContentLayout == client.ContentLayoutExtent && nst.ResourceID == st.ResourceID {
-						b.clearLayoutPending(ino)
-						return b.commitExtentExisting(ctx, ino, path, pending, size, nst.Revision)
-					}
-				}
-				b.mu.Lock()
-				b.layoutPending[ino] = false
-				b.classicOwned[ino] = true // ours, and not extent: classic
-				b.mu.Unlock()
-			}
-			return b.commitClassic(ctx, ino, path, pending, size, st.Revision)
-		}
-		// No ownership of this classic occupant. It must not be deleted
-		// (that would destroy another client's file) and must not be
-		// written through the classic surface either (that would mutate
-		// it). Refuse both, whatever its size: an empty occupant is no
-		// more attributable than a non-empty one, and routing it to
-		// commitClassic would also materialize the whole image for a
-		// sparse write.
 		return fmt.Errorf("target %s is not extent layout", path)
 	}
 
 	if fresh {
-		// Establish the capability boundary BEFORE publishing: a server that
-		// does not echo the published object's identity cannot give this
-		// descriptor an attributable one afterwards, and every client-side
-		// substitute (content equality, a later Stat, a bare revision) has
-		// been shown to adopt a stranger's object. Refusing here keeps the
-		// data OUT of the remote namespace; refusing after the upload leaves
-		// a published file whose descriptor is permanently unusable.
 		if !b.cfg.Client.WarmCompletionIdentity(ctx) {
 			return fmt.Errorf("create %s: server does not advertise completion_identity_v1, so the landed object cannot be attributed to this descriptor", path)
 		}
-		// Sparse: holes are synthesized on demand — a small write at a
-		// huge offset must not materialize the whole logical image. The
-		// completed upload's echoed resource identity is captured even if
-		// every post-upload Stat fails: it is the ownership proof the
-		// retry matches against (a replacement then rejects instead of
-		// receiving the staged bytes).
 		landed := ""
 		landedRev := int64(0)
 		upctx := client.WithCompletedResourceSink(ctx, &landed)
@@ -1049,28 +1170,25 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 		if err := b.cfg.Client.WriteExtentStreamConditional(upctx, path, ra, size, nil, -1); err != nil {
 			return err
 		}
-		if landed != "" {
+		if landed == "" {
 			b.mu.Lock()
-			b.layoutPendingID[ino] = landed
+			b.layoutPending[ino] = true
 			b.mu.Unlock()
+			return fmt.Errorf("verify landed layout of %s: completion carried no resource identity", path)
 		}
-		// Record the revision the COMPLETION echoed, as the patch path does.
-		// Without it a freshly created file has no authoritative floor at all:
-		// the only revision the bridge would learn is whatever a later Stat
-		// reports, and a Stat answered by a lagging replica records the OLD
-		// value — so the floor matches the stale image and the freshness guard
-		// can never fire. That is the first write of every new database, i.e.
-		// exactly the CREATE TABLE -> CREATE INDEX sequence mptest performs on
-		// a freshly created file.
-		b.recordLandedRevision(ino, landedRev)
-	}
-	revBefore := int64(0)
-	if !fresh {
-		revBefore = b.publishedRevision(ino)
-		if st.ContentLayout == client.ContentLayoutExtent {
-			if ferr := b.applyTruncateFloor(ctx, ino, path, st, size); ferr != nil {
-				return ferr
+		b.mu.Lock()
+		b.layoutPendingID[ino] = landed
+		b.mu.Unlock()
+		b.recordLandedRevisionWithSize(ino, landedRev, size)
+		if landedRev <= 0 {
+			if nst, serr := b.cfg.Client.StatCtx(ctx, path); serr == nil && nst.ResourceID == landed {
+				b.observeRevisionWithSize(ino, nst.Revision, nst.Size)
 			}
+		}
+	} else {
+		revBefore := b.publishedRevision(ino)
+		if ferr := b.applyTruncateFloor(ctx, ino, path, st, size); ferr != nil {
+			return ferr
 		}
 		blocks, err := b.assemblePatchBlocks(ctx, path, pending)
 		if err != nil {
@@ -1079,123 +1197,44 @@ func (b *Bridge) commit(ctx context.Context, ino meta.Ino, pending []pendingWrit
 		if _, cerr := b.commitWithRetry(ctx, ino, path, blocks, size, st.Revision); cerr != nil {
 			return cerr
 		}
-	}
-
-	if fresh {
-		// Classify the landed layout BEFORE any cleanup: a classification
-		// failure must leave the pending list AND the staged bytes intact
-		// (retiring them first made the retry unable to re-upload). The
-		// stat is retried; a failure marks the layout PENDING — proof of
-		// OUR upload, distinct from a foreign replacement — so the next
-		// attempt classifies instead of rejecting.
-		classic := false
-		classified := false
-		// The echoed identity (complete response) is the fallback proof
-		// when no Stat succeeds.
-		b.mu.Lock()
-		landedID := b.layoutPendingID[ino]
-		b.mu.Unlock()
-		for _, delay := range []time.Duration{0, 200 * time.Millisecond, 500 * time.Millisecond} {
-			time.Sleep(delay)
-			nst, serr := b.cfg.Client.StatCtx(ctx, path)
-			if serr != nil {
-				continue // transient; keep retrying
+		if b.publishedRevision(ino) <= revBefore {
+			if nst, serr := b.cfg.Client.StatCtx(ctx, path); serr == nil {
+				b.observeRevisionWithSize(ino, nst.Revision, nst.Size)
 			}
-			b.observeRevision(ino, nst.Revision)
-			b.mu.Lock()
-			savedID := b.layoutPendingID[ino]
-			b.mu.Unlock()
-			// The classification Stat must describe the object OUR
-			// completion echoed: a replacement landing between the
-			// completion and this Stat presents a different identity
-			// (and possibly a classic layout), and marking the handle
-			// classic-owned off it would let this descriptor write into
-			// a foreign file.
-			if savedID != "" && nst.ResourceID != savedID {
-				// The echo names OUR object and this Stat describes
-				// another: a replacement, whatever its layout.
-				b.mu.Lock()
-				b.layoutPending[ino] = true
-				b.mu.Unlock()
-				return fmt.Errorf("verify landed layout of %s: occupant replaced our upload", path)
-			}
-			// CONTENT IS NOT IDENTITY, so there is no adoption here: an
-			// echo-less completion binds nothing, even when the occupant's
-			// whole image matches byte for byte. A byte-identical
-			// replacement is still a DIFFERENT object, and adopting its
-			// resource ID would let this descriptor's later writes overwrite
-			// it under its own revision. The identity must come from the
-			// server's completion echo; without one the create stays refused
-			// (and the completion contract is the thing to fix, not this
-			// check).
-			if savedID == "" {
-				b.mu.Lock()
-				b.layoutPending[ino] = true
-				b.mu.Unlock()
-				return fmt.Errorf("verify landed layout of %s: completion carried no resource identity", path)
-			}
-			landedID = nst.ResourceID
-			classic = nst.ContentLayout != client.ContentLayoutExtent
-			classified = true
-			break
-		}
-		if !classified {
-			b.mu.Lock()
-			b.layoutPending[ino] = true
-			// The completion path's ECHOED identity is the ownership proof
-			// even when no Stat ever succeeded; never clobber a captured
-			// identity with the empty stat-derived one.
-			if landedID != "" {
-				b.layoutPendingID[ino] = landedID
-			}
-			b.mu.Unlock()
-			// The pending list is INTACT (cleanup runs only after
-			// classification) — nothing to restore, and re-appending
-			// would duplicate the snapshot.
-			return fmt.Errorf("verify landed layout of %s: stat unavailable", path)
-		}
-		if classic {
-			b.mu.Lock()
-			b.classicOwned[ino] = true
-			b.mu.Unlock()
-		}
-	} else if b.publishedRevision(ino) <= revBefore {
-		if nst, err := b.cfg.Client.StatCtx(ctx, path); err == nil {
-			b.observeRevision(ino, nst.Revision)
 		}
 	}
 
 	b.mu.Lock()
 	mode := b.modes[ino]
-	delete(b.commitErr, ino) // a successful landing resolves the memory
+	delete(b.commitErr, ino)
 	delete(b.verifyBase, ino)
 	delete(b.layoutPending, ino)
 	delete(b.freshCreate, ino)
-	delete(b.truncs, ino)
-	// layoutPendingID SURVIVES the landing: it is the identity binding
-	// for every later publication of this descriptor (the PATCH's
-	// expected-resource), not merely the pending-classification proof.
-	// It is dropped with the inode mapping itself (abandon/forget).
+	if b.truncSeq[ino] == snapTruncSeq {
+		delete(b.truncs, ino)
+	}
 	b.mu.Unlock()
 	b.surgicalDeletePending(ino, pending)
 	b.releaseCommitted(ino, pending)
-	// The published length now covers everything this publication carried, so
-	// the buffered mark has served its purpose (anything still buffered past
-	// it came from a write after this snapshot and keeps its own mark).
 	b.clearBufferedLength(ino, size)
 	if fresh && mode != 0 && mode != 0o644 {
-		// The sequential extent create carries no mode; apply the one the
-		// creator asked for.
 		_ = b.cfg.Client.ChmodCtx(ctx, path, uint32(mode))
 	}
 	return nil
 }
 
-// assemblePatchBlocks gathers pending slices and splits chunk-sized spans into
-// ExtentBlockSize pieces so PATCH commits upload blocks at bounded concurrency.
+// assemblePatchBlocks composes overlapping/repeated pending writes per chunk in
+// chronological order (so later writes overwrite earlier bytes at the same
+// position without duplicate PATCH offsets) and splits spans into
+// ExtentBlockSize pieces.
 func (b *Bridge) assemblePatchBlocks(ctx context.Context, path string, pending []pendingWrite) ([]client.ExtentBlockWrite, error) {
 	const piece = int64(client.ExtentBlockSize)
-	blocks := make([]client.ExtentBlockWrite, 0, len(pending)*2)
+	type byteSpan struct {
+		off  uint32
+		data []byte
+	}
+	var chunkOrder []uint32
+	byChunk := make(map[uint32][]byteSpan)
 	for _, p := range pending {
 		data, err := b.blockBytes(ctx, p, path)
 		if err != nil {
@@ -1207,148 +1246,52 @@ func (b *Bridge) assemblePatchBlocks(ctx context.Context, path string, pending [
 		if len(data) == 0 {
 			continue
 		}
-		if int64(len(data)) <= piece {
-			blocks = append(blocks, client.ExtentBlockWrite{Chunk: p.chunk, Off: p.off, Data: data})
-			continue
+		wStart := p.off
+		wEnd := p.off + uint32(len(data))
+		cur, exists := byChunk[p.chunk]
+		if !exists {
+			chunkOrder = append(chunkOrder, p.chunk)
 		}
-		for off := int64(0); off < int64(len(data)); off += piece {
-			end := off + piece
-			if end > int64(len(data)) {
-				end = int64(len(data))
+		next := make([]byteSpan, 0, len(cur)+2)
+		for _, s := range cur {
+			sEnd := s.off + uint32(len(s.data))
+			if sEnd <= wStart || s.off >= wEnd {
+				next = append(next, s)
+				continue
 			}
-			blocks = append(blocks, client.ExtentBlockWrite{
-				Chunk: p.chunk,
-				Off:   p.off + uint32(off),
-				Data:  data[off:end],
-			})
+			if s.off < wStart {
+				next = append(next, byteSpan{off: s.off, data: s.data[:wStart-s.off]})
+			}
+			if sEnd > wEnd {
+				next = append(next, byteSpan{off: wEnd, data: s.data[wEnd-s.off:]})
+			}
+		}
+		next = append(next, byteSpan{off: wStart, data: data})
+		sort.Slice(next, func(i, j int) bool { return next[i].off < next[j].off })
+		byChunk[p.chunk] = next
+	}
+	sort.Slice(chunkOrder, func(i, j int) bool { return chunkOrder[i] < chunkOrder[j] })
+	blocks := make([]client.ExtentBlockWrite, 0, len(pending)*2)
+	for _, ch := range chunkOrder {
+		for _, s := range byChunk[ch] {
+			if int64(len(s.data)) <= piece {
+				blocks = append(blocks, client.ExtentBlockWrite{Chunk: ch, Off: s.off, Data: s.data})
+				continue
+			}
+			for off := int64(0); off < int64(len(s.data)); off += piece {
+				end := off + piece
+				if end > int64(len(s.data)) {
+					end = int64(len(s.data))
+				}
+				blocks = append(blocks, client.ExtentBlockWrite{
+					Chunk: ch,
+					Off:   s.off + uint32(off),
+					Data:  s.data[off:end],
+				})
+			}
 		}
 	}
 	return blocks, nil
-}
-
-// commitExtentExisting lands pending blocks as an incremental PATCH
-// against a known revision (the identity-verified recovery path).
-func (b *Bridge) commitExtentExisting(ctx context.Context, ino meta.Ino, path string, pending []pendingWrite, size, rev int64) error {
-	blocks, err := b.assemblePatchBlocks(ctx, path, pending)
-	if err != nil {
-		return err
-	}
-	if _, err := b.commitWithRetry(ctx, ino, path, blocks, size, rev); err != nil {
-		return err
-	}
-	b.mu.Lock()
-	delete(b.truncs, ino)
-	b.mu.Unlock()
-	b.surgicalDeletePending(ino, pending)
-	b.releaseCommitted(ino, pending)
-	return nil
-}
-
-// isClassicOwned reports whether this bridge owns a file whose extent
-// session degraded to a classic upload (legacy server).
-func (b *Bridge) isClassicOwned(ino meta.Ino) bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.classicOwned[ino]
-}
-
-// commitClassic continues a degraded fresh create: the composed image
-// (current remote content with the pending fragments shadowed, truncated
-// or grown to the local size) re-uploads through the classic conditional
-// write. A compatibility path for legacy servers; it materializes the
-// image — the engine plane is not the promotion path there.
-func (b *Bridge) commitClassic(ctx context.Context, ino meta.Ino, path string, pending []pendingWrite, size, rev int64) error {
-	var image []byte
-	if rc, err := b.cfg.Client.ReadStream(ctx, path); err == nil {
-		var rerr error
-		// The body must be fully consumed before the image is trusted: a
-		// truncated download with a discarded error would zero-pad the
-		// missing tail and upload a damaged image under a valid revision.
-		image, rerr = io.ReadAll(rc)
-		_ = rc.Close()
-		if rerr != nil {
-			if os.Getenv("EXTENT_DBG") != "" {
-				fmt.Println("DBG commitClassic base read fail:", rerr)
-			}
-			return fmt.Errorf("read classic base %s: %w", path, rerr)
-		}
-	} else if !client.IsNotFound(err) {
-		return err
-	}
-	b.mu.Lock()
-	truncLow, truncating := b.truncs[ino]
-	b.mu.Unlock()
-	if truncating && int64(len(image)) > truncLow {
-		image = image[:truncLow]
-	}
-	for _, p := range pending {
-		off := int64(p.chunk)*meta.ChunkSize + int64(p.off)
-		end := off + p.size
-		if int64(len(image)) < end {
-			image = append(image, make([]byte, end-int64(len(image)))...)
-		}
-		data, err := b.blockBytes(ctx, p, path)
-		if err != nil {
-			return err
-		}
-		copy(image[off:end], data)
-	}
-	if int64(len(image)) > size {
-		image = image[:size]
-	}
-	for int64(len(image)) < size {
-		image = append(image, 0)
-	}
-	// The classic publication is bound to the verified object's identity
-	// when a recovery constraint is active: the request carries the
-	// expected resource (header), so a replacement whose revision merely
-	// equals the saved one cannot receive the staged bytes.
-	// The completion echo carries the revision the server attributed to THIS
-	// publication; capture it so the constraint below advances to it rather
-	// than reusing the pre-write base.
-	var landedRev int64
-	wctx := client.WithCompletedRevisionSink(ctx, &landedRev)
-	if err := b.cfg.Client.WriteStreamConditionalExpectedResource(wctx, path, bytes.NewReader(image), int64(len(image)), nil, rev, b.publicationIdentity(ino)); err != nil {
-		if errors.Is(err, client.ErrResourceMismatch) {
-			b.abandonIno(ino)
-		}
-		return err
-	}
-	b.mu.Lock()
-	delete(b.commitErr, ino)
-	delete(b.truncs, ino)
-	b.mu.Unlock()
-	b.surgicalDeletePending(ino, pending)
-	b.releaseCommitted(ino, pending)
-	newRev := landedRev
-	if newRev <= 0 {
-		// No echo: fall back to the stat, but only to ADVANCE the base. A
-		// stale base would make every later publication send an obsolete
-		// expected revision and fail with 409 forever — the constraint must
-		// track the publication that just succeeded.
-		if nst, err := b.cfg.Client.StatCtx(ctx, path); err == nil {
-			newRev = nst.Revision
-		}
-	}
-	b.mu.Lock()
-	// Unconditional BY DESIGN: this is the compare-and-set base for the next
-	// publication and must equal the revision this publication produced.
-	// (Every other site records monotonically; see observeRevision.)
-	b.revs[ino] = newRev
-	if newRev > 0 {
-		b.revAt[ino] = time.Now()
-	}
-	// A classic publication is SUCCESSFUL and bound: the identity stays (it
-	// is the ownership proof for later writes) while the revision advances
-	// to the one this publication produced. (The normal extent path retires
-	// verifyBase because its own commit already carried the identity
-	// forward; the classic path has no such carrier, so it must update.)
-	if v, ok := b.verifyBase[ino]; ok && newRev > 0 {
-		v.rev = newRev
-		b.verifyBase[ino] = v
-	}
-	b.mu.Unlock()
-	return nil
 }
 
 func (b *Bridge) commitWithRetry(ctx context.Context, ino meta.Ino, path string, blocks []client.ExtentBlockWrite, size, rev int64) (int64, error) {
@@ -1361,7 +1304,7 @@ func (b *Bridge) commitWithRetry(ctx context.Context, ino meta.Ino, path string,
 	pctx := client.WithCompletedRevisionSink(ctx, &landedRev)
 	err := b.cfg.Client.CommitExtentPatchExpectedResource(pctx, path, size, blocks, rev, expRes)
 	if err == nil {
-		b.recordLandedRevision(ino, landedRev)
+		b.recordLandedRevisionWithSize(ino, landedRev, size)
 		return landedRev, nil
 	}
 	if errors.Is(err, client.ErrResourceMismatch) {
@@ -1390,7 +1333,7 @@ func (b *Bridge) commitWithRetry(ctx context.Context, ino meta.Ino, path string,
 		b.abandonIno(ino)
 	}
 	if err2 == nil {
-		b.recordLandedRevision(ino, landedRev)
+		b.recordLandedRevisionWithSize(ino, landedRev, size)
 		return landedRev, nil
 	}
 	return 0, err2
@@ -1457,15 +1400,22 @@ func (b *Bridge) recordLandedRevision(ino meta.Ino, rev int64) {
 	b.mu.Unlock()
 }
 
+func (b *Bridge) recordLandedRevisionWithSize(ino meta.Ino, rev, size int64) {
+	b.mu.Lock()
+	if rev > 0 {
+		if rev >= b.revs[ino] {
+			b.revs[ino] = rev
+			b.pubSizes[ino] = size
+		}
+		b.revAt[ino] = time.Now()
+	} else if b.revs[ino] > 0 {
+		b.pubSizes[ino] = size
+	}
+	b.mu.Unlock()
+}
+
 // observeRevision records a revision seen in a stat, never moving the recorded
 // value BACKWARDS.
-//
-// The recorded revision is the floor a read refuses to go below: "this mount
-// already published revision N". A stat answered by a lagging replica reports
-// an older N, and assigning it unconditionally lowered that floor — so the
-// very next read accepted the stale plan the floor exists to reject. Reads,
-// opens and getattrs all hit this, which is why the freshness guard could be
-// defeated on the same descriptor that had just written.
 func (b *Bridge) observeRevision(ino meta.Ino, rev int64) {
 	if rev <= 0 {
 		return
@@ -1473,6 +1423,18 @@ func (b *Bridge) observeRevision(ino meta.Ino, rev int64) {
 	b.mu.Lock()
 	if rev > b.revs[ino] {
 		b.revs[ino] = rev
+	}
+	b.mu.Unlock()
+}
+
+func (b *Bridge) observeRevisionWithSize(ino meta.Ino, rev, size int64) {
+	if rev <= 0 {
+		return
+	}
+	b.mu.Lock()
+	if rev >= b.revs[ino] {
+		b.revs[ino] = rev
+		b.pubSizes[ino] = size
 	}
 	b.mu.Unlock()
 }
@@ -1485,23 +1447,11 @@ func (b *Bridge) publishedRevision(ino meta.Ino) int64 {
 	return b.revs[ino]
 }
 
-// recentlyPublished reports whether this mount published the inode within
-// storeLagWindow — the only window in which a read can legitimately observe a
-// server revision below the recorded one (a replica catching up).
-//
-// Outside that window a stale answer means something else entirely (an older
-// object, a server that does not report revisions, tests that fake the wire),
-// and waiting on it would turn a caller's read into a multi-second stall.
-func (b *Bridge) recentlyPublished(ino meta.Ino) bool {
+func (b *Bridge) publishedState(ino meta.Ino) (rev, size int64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	at, ok := b.revAt[ino]
-	return ok && time.Since(at) < storeLagWindow
+	return b.revs[ino], b.pubSizes[ino]
 }
-
-// storeLagWindow bounds how long a read waits for the namespace to catch up
-// with a publication this mount just made.
-const storeLagWindow = 500 * time.Millisecond
 
 // flushPending commits a file's pending slices (used on Close and fsync
 // paths). The snapshot -> commit -> cleanup sequence runs under the
@@ -1549,6 +1499,69 @@ func (b *Bridge) flushPendingLocked(ctx context.Context, ino meta.Ino) error {
 	return nil
 }
 
+func (b *Bridge) publishPureSparseExtent(ctx context.Context, ino meta.Ino, path string, size int64, snapTruncSeq uint64) error {
+	if !b.cfg.Client.WarmCompletionIdentity(ctx) {
+		return fmt.Errorf("create %s: server does not advertise completion_identity_v1, so the landed object cannot be attributed to this descriptor", path)
+	}
+	rev, createdID, nativeExtent, err := b.cfg.Client.CreateExtentFileCreatedCtx(ctx, path)
+	if err != nil {
+		return err
+	}
+	if nativeExtent {
+		b.mu.Lock()
+		if createdID != "" {
+			b.layoutPendingID[ino] = createdID
+		}
+		delete(b.verifyBase, ino)
+		b.mu.Unlock()
+		b.recordLandedRevisionWithSize(ino, rev, 0)
+		if size > 0 {
+			if _, perr := b.commitWithRetry(ctx, ino, path, nil, size, rev); perr != nil {
+				return perr
+			}
+		}
+	} else {
+		if rmErr := b.cfg.Client.DeleteFileConditionalCtx(ctx, path, rev, createdID); rmErr != nil {
+			return fmt.Errorf("remove fallback placeholder %s: %w", path, rmErr)
+		}
+		landed := ""
+		landedRev := int64(0)
+		upctx := client.WithCompletedResourceSink(ctx, &landed)
+		upctx = client.WithCompletedRevisionSink(upctx, &landedRev)
+		ra := &sparseImageAt{bridge: b, ctx: ctx, path: path, size: size}
+		if err := b.cfg.Client.WriteExtentStreamConditional(upctx, path, ra, size, nil, -1); err != nil {
+			return err
+		}
+		if landed == "" {
+			b.mu.Lock()
+			b.layoutPending[ino] = true
+			b.mu.Unlock()
+			return fmt.Errorf("verify landed layout of %s: completion carried no resource identity", path)
+		}
+		b.mu.Lock()
+		b.layoutPendingID[ino] = landed
+		b.mu.Unlock()
+		b.recordLandedRevisionWithSize(ino, landedRev, size)
+	}
+	b.mu.Lock()
+	mode := b.modes[ino]
+	delete(b.verifyBase, ino)
+	delete(b.layoutPending, ino)
+	delete(b.freshCreate, ino)
+	if b.truncSeq[ino] == snapTruncSeq {
+		delete(b.truncs, ino)
+	}
+	delete(b.commitErr, ino)
+	delete(b.modes, ino)
+	delete(b.mtimes, ino)
+	b.mu.Unlock()
+	b.clearBufferedLength(ino, size)
+	if mode != 0 && mode != 0o644 {
+		_ = b.cfg.Client.ChmodCtx(ctx, path, uint32(mode))
+	}
+	return nil
+}
+
 // flushTruncateOnly handles a pure truncate whose size changed but no
 // slices were written. The server accepts a truncation-only PATCH (no
 // dirty blocks, including a shrink to zero). The pending marker is only
@@ -1561,6 +1574,7 @@ func (b *Bridge) flushTruncateOnly(ctx context.Context, ino meta.Ino, size int64
 	}
 	b.mu.Lock()
 	_, tracked := b.truncs[ino]
+	snapTruncSeq := b.truncSeq[ino]
 	b.mu.Unlock()
 	if !tracked {
 		return nil
@@ -1568,50 +1582,58 @@ func (b *Bridge) flushTruncateOnly(ctx context.Context, ino meta.Ino, size int64
 	st, err := b.cfg.Client.StatCtx(ctx, path)
 	if err != nil {
 		if client.IsNotFound(err) {
+			if size > 0 && b.isFreshCreate(ino) {
+				return b.publishPureSparseExtent(ctx, ino, path, size, snapTruncSeq)
+			}
 			b.mu.Lock()
-			delete(b.truncs, ino)
+			if b.truncSeq[ino] == snapTruncSeq {
+				delete(b.truncs, ino)
+			}
 			b.mu.Unlock()
 			return nil
 		}
 		return err
 	}
+	if st.IsDir {
+		return fmt.Errorf("target %s is a directory", path)
+	}
 	// A recovery constraint applies to metadata-only publication too: a
 	// replacement at the saved path must never be truncated with the
 	// staged object's size.
-	if v, bounded := b.peekVerifyBase(ino); bounded {
+	v, bounded := b.peekVerifyBase(ino)
+	if bounded {
 		if st.ResourceID != v.resID {
 			b.abandonIno(ino)
 			return fmt.Errorf("recovery target %s no longer holds the staged object", path)
 		}
 		st.Revision = v.rev
 	}
-	if b.isClassicOwned(ino) && st.ContentLayout != client.ContentLayoutExtent {
-		// A degraded (classic) target: compose the truncated image and
-		// re-upload through the classic surface — a silent success would
-		// resurrect the discarded tail on the next open.
-		return b.commitClassic(ctx, ino, path, nil, size, st.Revision)
-	}
 	if st.ContentLayout != client.ContentLayoutExtent {
-		if b.isClassicOwned(ino) {
-			return b.commitClassic(ctx, ino, path, nil, size, st.Revision)
-		}
-		if st.Size == size {
-			b.mu.Lock()
-			delete(b.truncs, ino)
-			b.mu.Unlock()
-			return nil
-		}
-		if st.Size == 0 && size > 0 {
-			if err := b.commitClassic(ctx, ino, path, nil, size, st.Revision); err != nil {
-				return err
+		if b.matchesEmptyPlaceholderFull(path, st) && (bounded || b.isFreshCreate(ino)) {
+			if size == 0 {
+				b.mu.Lock()
+				if b.truncSeq[ino] == snapTruncSeq {
+					delete(b.truncs, ino)
+				}
+				b.mu.Unlock()
+				return nil
 			}
-			b.mu.Lock()
-			b.classicOwned[ino] = true
-			delete(b.truncs, ino)
-			delete(b.commitErr, ino)
-			b.mu.Unlock()
+			if rmErr := b.cfg.Client.DeleteFileConditionalCtx(ctx, path, st.Revision, st.ResourceID); rmErr != nil {
+				return fmt.Errorf("remove empty placeholder %s: %w", path, rmErr)
+			}
+			b.takeEmptyPlaceholderFull(path)
+			return b.publishPureSparseExtent(ctx, ino, path, size, snapTruncSeq)
 		}
-		return nil
+		if b.needsFreshIdentity(ino) {
+			return fmt.Errorf("fresh create of %s has no attributable identity for the current occupant", path)
+		}
+		return fmt.Errorf("target %s is not extent layout", path)
+	}
+	if b.isLayoutPending(ino) && !b.layoutPendingMatches(ino, st.ResourceID) {
+		return fmt.Errorf("target %s no longer holds our upload", path)
+	}
+	if b.needsFreshIdentity(ino) {
+		return fmt.Errorf("fresh create of %s has no attributable identity for the current occupant", path)
 	}
 	// If the file shrunk below its remote size and then grew before flushing,
 	// apply the lowest truncate floor first so cleared tail bytes stay zero.
@@ -1620,7 +1642,9 @@ func (b *Bridge) flushTruncateOnly(ctx context.Context, ino meta.Ino, size int64
 	}
 	if st.Size == size {
 		b.mu.Lock()
-		delete(b.truncs, ino)
+		if b.truncSeq[ino] == snapTruncSeq {
+			delete(b.truncs, ino)
+		}
 		delete(b.commitErr, ino)
 		b.mu.Unlock()
 		return nil
@@ -1631,7 +1655,9 @@ func (b *Bridge) flushTruncateOnly(ctx context.Context, ino meta.Ino, size int64
 		return err // marker retained: the truncate has NOT landed
 	}
 	b.mu.Lock()
-	delete(b.truncs, ino)
+	if b.truncSeq[ino] == snapTruncSeq {
+		delete(b.truncs, ino)
+	}
 	delete(b.commitErr, ino)
 	b.mu.Unlock()
 	return nil
@@ -1687,20 +1713,37 @@ func (s *sparseImageAt) ReadAt(p []byte, off int64) (int, error) {
 	}
 	pos := off
 	for pos < end {
-		// Find the pending write covering pos, if any.
-		var cover *pendingWrite
-		for i := range s.writes {
+		// Find the newest pending write covering pos, honoring clipped w.size.
+		coverIdx := -1
+		var coverStart int64
+		var coverData []byte
+		for i := len(s.writes) - 1; i >= 0; i-- {
 			w := &s.writes[i]
+			if w.size <= 0 {
+				continue
+			}
 			wStart := int64(w.chunk)*meta.ChunkSize + int64(w.off)
-			if pos >= wStart && pos < wStart+int64(len(blockData(s.bridge, s.ctx, s.path, w))) {
-				cover = w
+			if pos < wStart || pos >= wStart+w.size {
+				continue
+			}
+			data := blockData(s.bridge, s.ctx, s.path, w)
+			if int64(len(data)) > w.size {
+				data = data[:w.size]
+			}
+			if pos >= wStart && pos < wStart+int64(len(data)) {
+				coverIdx = i
+				coverStart = wStart
+				coverData = data
 				break
 			}
 		}
-		if cover == nil {
+		if coverIdx < 0 {
 			// Zero gap up to the next write start or the request end.
 			gapEnd := end
 			for i := range s.writes {
+				if s.writes[i].size <= 0 {
+					continue
+				}
 				wStart := int64(s.writes[i].chunk)*meta.ChunkSize + int64(s.writes[i].off)
 				if wStart > pos && wStart < gapEnd {
 					gapEnd = wStart
@@ -1710,9 +1753,23 @@ func (s *sparseImageAt) ReadAt(p []byte, off int64) (int, error) {
 			pos = gapEnd
 			continue
 		}
-		data := blockData(s.bridge, s.ctx, s.path, cover)
-		wStart := int64(cover.chunk)*meta.ChunkSize + int64(cover.off)
-		n := copy(p[pos-off:end-off], data[pos-wStart:])
+		copyEnd := end
+		if wEnd := coverStart + int64(len(coverData)); wEnd < copyEnd {
+			copyEnd = wEnd
+		}
+		for j := coverIdx + 1; j < len(s.writes); j++ {
+			if s.writes[j].size <= 0 {
+				continue
+			}
+			jStart := int64(s.writes[j].chunk)*meta.ChunkSize + int64(s.writes[j].off)
+			if jStart > pos && jStart < copyEnd {
+				copyEnd = jStart
+			}
+		}
+		n := copy(p[pos-off:copyEnd-off], coverData[pos-coverStart:])
+		if n == 0 {
+			return int(pos - off), io.ErrUnexpectedEOF
+		}
 		pos += int64(n)
 	}
 	if end-off < int64(len(p)) {
@@ -1774,7 +1831,7 @@ func (b *Bridge) ResolveLocal(ctx context.Context, local string) (meta.Ino, sysc
 		return 0, syscall.EIO
 	}
 	b.remember(ino, full)
-	b.observeRevision(ino, st.Revision)
+	b.observeRevisionWithSize(ino, st.Revision, st.Size)
 	b.mu.Lock()
 	if _, has := b.sizes[ino]; !has {
 		b.sizes[ino] = st.Size
@@ -1846,37 +1903,62 @@ func (b *Bridge) StatLocal(ctx context.Context, local string) (*client.StatResul
 const maxEmptyPlaceholderRecords = 1 << 16
 
 // markEmptyPlaceholder records that this bridge just materialized `full`
-// (already the FULL remote path) as a zero-byte classic file.
-func (b *Bridge) markEmptyPlaceholder(full string) {
+// (already the FULL remote path) as a zero-byte classic file with its
+// created revision and resource identity.
+func (b *Bridge) markEmptyPlaceholder(full string, rev int64, resID string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.emptyPlaceholders[full] {
-		return
+	if _, exists := b.emptyPlaceholders[full]; !exists {
+		b.emptyPlaceholderOrd = append(b.emptyPlaceholderOrd, full)
+		if len(b.emptyPlaceholderOrd) > maxEmptyPlaceholderRecords {
+			oldest := b.emptyPlaceholderOrd[0]
+			b.emptyPlaceholderOrd = b.emptyPlaceholderOrd[1:]
+			delete(b.emptyPlaceholders, oldest)
+		}
 	}
-	b.emptyPlaceholders[full] = true
-	b.emptyPlaceholderOrd = append(b.emptyPlaceholderOrd, full)
-	if len(b.emptyPlaceholderOrd) > maxEmptyPlaceholderRecords {
-		oldest := b.emptyPlaceholderOrd[0]
-		b.emptyPlaceholderOrd = b.emptyPlaceholderOrd[1:]
-		delete(b.emptyPlaceholders, oldest)
-	}
+	b.emptyPlaceholders[full] = verifyBase{rev: rev, resID: resID}
 }
 
 // EmptyPlaceholderFor reports whether this bridge recorded a zero-byte
-// classic materialization of the mount-local path. The answer is only an
-// ATTRIBUTION hint: every consumer must re-verify the occupant is still a
-// 0-byte classic file before acting on it.
+// classic materialization of the mount-local path.
 func (b *Bridge) EmptyPlaceholderFor(local string) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.emptyPlaceholders[b.fullPath(local)]
+	_, ok := b.emptyPlaceholders[b.fullPath(local)]
+	return ok
 }
 
 // EmptyPlaceholderFull is EmptyPlaceholderFor for a FULL remote path.
 func (b *Bridge) EmptyPlaceholderFull(full string) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.emptyPlaceholders[full]
+	_, ok := b.emptyPlaceholders[full]
+	return ok
+}
+
+func (b *Bridge) matchesEmptyPlaceholderFull(full string, st *client.StatResult) bool {
+	if st == nil || st.IsDir || st.Size != 0 || st.ContentLayout == client.ContentLayoutExtent {
+		return false
+	}
+	b.mu.Lock()
+	rec, ok := b.emptyPlaceholders[full]
+	b.mu.Unlock()
+	if !ok {
+		return false
+	}
+	if rec.resID != "" && st.ResourceID != "" && st.ResourceID != rec.resID {
+		return false
+	}
+	if rec.rev > 0 && st.Revision > 0 && st.Revision != rec.rev {
+		return false
+	}
+	return true
+}
+
+// MatchesEmptyPlaceholder reports whether `st` still matches the zero-byte
+// classic placeholder THIS bridge materialized at `local`.
+func (b *Bridge) MatchesEmptyPlaceholder(local string, st *client.StatResult) bool {
+	return b.matchesEmptyPlaceholderFull(b.fullPath(local), st)
 }
 
 // takeEmptyPlaceholderFull consumes the attribution for a FULL remote path
@@ -1885,7 +1967,7 @@ func (b *Bridge) EmptyPlaceholderFull(full string) bool {
 func (b *Bridge) takeEmptyPlaceholderFull(full string) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if !b.emptyPlaceholders[full] {
+	if _, ok := b.emptyPlaceholders[full]; !ok {
 		return false
 	}
 	delete(b.emptyPlaceholders, full)
@@ -1968,228 +2050,6 @@ func (b *Bridge) lockCommit(ino meta.Ino) func() {
 	return mu.Unlock
 }
 
-// readClassic serves a chunk of a file whose extent session degraded to
-// a classic upload: fetch the raw range and expose it as one staged slice
-// (the extent plan surface cannot describe this file).
-func (b *Bridge) readClassic(ctx context.Context, ino meta.Ino, path string, start, chunkEnd int64, slices *[]meta.Slice) syscall.Errno {
-	b.mu.Lock()
-	size := b.sizes[ino]
-	pending := append([]pendingWrite(nil), b.pending[ino]...)
-	_, hasTrunc := b.truncs[ino]
-	b.mu.Unlock()
-	length := chunkEnd + 1 - start
-	if size > 0 && start+length > size {
-		length = size - start
-	}
-	if length <= 0 {
-		*slices = nil
-		return 0
-	}
-
-	// How many bytes the REMOTE must be able to serve. Local state that has
-	// not been published yet (pending writes, a pending truncate) makes
-	// b.sizes legitimately larger than the object, so the expectation is
-	// dropped in that case: the overlay below fills the rest.
-	remoteLength := length
-	if len(pending) > 0 || hasTrunc {
-		remoteLength = 0
-	}
-	// A read must not serve an image SHORTER than the size this mount already
-	// published for the inode.
-	//
-	// The classic surface publishes with a CAS PUT and reads with a plain
-	// range GET. A GET answered by a replica that has not caught up returns
-	// the OLD object — for a file this mount just grew, that is a shorter
-	// body. Accepting it hands the caller a pre-write image: SQLite reads
-	// page 1 with a stale schema cookie, reports SQLITE_SCHEMA, reloads the
-	// schema, and then cannot find the table the previous statement created.
-	//
-	// The short body is the signal: we asked for exactly `length` bytes of a
-	// file we believe is `size` long, so anything less means the server is
-	// behind, not that the file shrank (a genuine shrink travels through the
-	// truncate path, which updates b.sizes first).
-	var data []byte
-	var hdrID string
-	var rerr error
-	for attempt, delay := range readPlanStaleDelays {
-		if delay > 0 {
-			select {
-			case <-ctx.Done():
-				return syscall.EINTR
-			case <-time.After(delay):
-			}
-		}
-		rc, err := b.cfg.Client.ReadStreamRange(ctx, path, start, length)
-		if err != nil {
-			if client.IsNotFound(err) || (remoteLength == 0 && isRangeNotSatisfiable(err)) {
-				break
-			}
-			return errnoOf(err)
-		}
-		// The identity is taken from the READ's own response headers when the
-		// server provides one (same-request binding); a separate later Stat
-		// could describe a replacement installed in between.
-		hdrID = rcHeaderResourceID(rc)
-		data, rerr = io.ReadAll(rc)
-		_ = rc.Close()
-		if rerr != nil {
-			// A partial body must never publish as a successful read.
-			return syscall.EIO
-		}
-		if remoteLength <= 0 || int64(len(data)) >= remoteLength {
-			break
-		}
-		if attempt == len(readPlanStaleDelays)-1 {
-			// Budget exhausted: keep the newest answer rather than turning
-			// replica lag into EIO for every reader.
-			break
-		}
-	}
-	// Deferred (interactive) writes overlay the remote base so
-	// read-after-write holds while publication is deferred.
-	for _, p := range pending {
-		off := int64(p.chunk)*meta.ChunkSize + int64(p.off)
-		end := off + p.size
-		// Bounded by the REQUESTED range (clamped to the local size
-		// above), never by the downloaded base length: appends and sparse
-		// writes live past the remote EOF until publication.
-		if end <= start || off >= start+length {
-			continue
-		}
-		pdata, err := b.blockBytes(ctx, p, path)
-		if err != nil {
-			return syscall.EIO
-		}
-		if off < start {
-			pdata = pdata[start-off:]
-			off = start
-		}
-		if end > start+length {
-			pdata = pdata[:start+length-off]
-			end = start + length
-		}
-		if end > start+int64(len(data)) {
-			data = append(data, make([]byte, end-start-int64(len(data)))...)
-		}
-		copy(data[off-start:], pdata)
-	}
-	sum := sha256Hex(data)
-	// The refetch verifies the READ RESPONSE's identity; a stat-derived
-	// fallback cannot (the redirect/206 and legacy no-echo wire paths carry
-	// no echo, and a later stat may describe a replacement). Without a
-	// same-read identity the entry simply never demotes — its bytes stay
-	// resident and accounted instead of becoming an unreadable source.
-	id := b.stageClassicChunk(sum, data, path, start, len(pending) > 0, hdrID, ino)
-	*slices = []meta.Slice{{Id: id, Size: uint32(len(data)), Len: uint32(len(data))}}
-	return 0
-}
-
-// classicReadCacheBytes bounds the staged bytes retained for reads of
-// classic-owned (degraded) files. A var so tests can shrink it.
-var classicReadCacheBytes int64 = 64 << 20
-
-// classicReadProtect is how many of the most recently handed-out records
-// are immune from retirement: the engine fetches a returned slice's bytes
-// right after meta.Read (and a readahead may hold several), so the newest
-// few ids must stay fetchable. Everything older is bounded by the byte
-// budget ALONE — no time-based amnesty: 30s of scanning distinct 64 MiB
-// chunks must not retain gigabytes.
-var classicReadProtect = 4
-
-// stageClassicChunk publishes a classic chunk read under its deterministic
-// id and retires the OLDEST classic-sourced entries beyond the budget.
-// Records are deduplicated by id (repeated content refreshes its record —
-// retiring a duplicate would delete the id an earlier reader was just
-// handed), records inside the grace window are immune (in-flight fetches),
-// and pinned entries (a pending commit still references their checksum)
-// are never retired.
-func (b *Bridge) stageClassicChunk(sum string, data []byte, path string, start int64, overlaid bool, resID string, ino meta.Ino) uint64 {
-	id := b.blocks.stagePinned(sum, data, false)
-	if overlaid {
-		b.blocks.markLocalOverlay(id, ino)
-	}
-	if resID != "" {
-		b.blocks.setProvenanceIdentity(id, resID, ino)
-	}
-	b.mu.Lock()
-	now := time.Now()
-	// Refresh an existing record for this id instead of appending a
-	// duplicate — and RE-PIN it: the second reader carries its own
-	// outstanding lifetime.
-	for i := range b.classicLRU {
-		if b.classicLRU[i].id == id {
-			rec := b.classicLRU[i]
-			rec.at = now
-			b.classicLRU = append(b.classicLRU[:i], b.classicLRU[i+1:]...)
-			b.classicLRU = append(b.classicLRU, rec)
-			b.mu.Unlock()
-			// A refreshed handout issues a fresh handout's worth of pins
-			// WITHOUT clearing existing ones: another outstanding reader
-			// may still hold the id (clearing would strip its
-			// protection). Stale pins age out with the entry (kept
-			// accounted by the retirement re-append; a fresh staging of
-			// the same id only ever ADDS readers).
-			for issued := (rec.bytes + client.ExtentBlockSize - 1) / client.ExtentBlockSize; issued > 0; issued-- {
-				b.blocks.issuePin(id)
-			}
-			return id
-		}
-	}
-	b.classicLRU = append(b.classicLRU, classicRef{sum: sum, id: id, bytes: int64(len(data)), at: now, path: path, start: start, resID: resID, ino: ino})
-	b.classicBytes += int64(len(data))
-	var retire []classicRef
-	for b.classicBytes > classicReadCacheBytes {
-		if len(b.classicLRU) <= classicReadProtect {
-			break // the newest handed-out records stay fetchable
-		}
-		oldest := b.classicLRU[0]
-		b.classicLRU = b.classicLRU[1:]
-		b.classicBytes -= oldest.bytes
-		retire = append(retire, oldest)
-	}
-	b.mu.Unlock()
-	var retained []classicRef
-	for _, r := range retire {
-		// DEMOTE first whenever a provenance exists (issued or not): the
-		// cached bytes are dropped (freeing the budget) while the id stays
-		// fetchable through the IDENTITY-VERIFIED, rename-following
-		// source. Entries that cannot demote (local-only bytes, a pending
-		// reference, or no recorded source identity) KEEP their bytes and
-		// are re-appended so they stay ACCOUNTED and reclaimable (the
-		// overlay flag self-clears at the flush).
-		if b.blocks.demoteToProvenance(r.id, r.sum, r.path, r.start, r.resID, r.ino) {
-			continue
-		}
-		if b.blocks.isIssued(r.id) {
-			retained = append(retained, r)
-			continue
-		}
-		b.blocks.releaseIfUnpinned(r.sum)
-	}
-	if len(retained) > 0 {
-		b.mu.Lock()
-		b.classicLRU = append(b.classicLRU, retained...)
-		for _, r := range retained {
-			b.classicBytes += r.bytes
-		}
-		b.mu.Unlock()
-	}
-	// One pin per BLOCK the reader may fetch: a 64 MiB slice is consumed
-	// by sixteen separate 4 MiB Gets, and pins are NOT consumed by any
-	// block fetch (a block boundary is not the end of an outstanding
-	// user; clearing there would strip mid-slice and cross-reader
-	// protection). The OUTSTANDING set is bounded instead: a handout
-	// beyond classicReadProtect distinct issued ids releases the OLDEST
-	// issued id's pins — a stalled reader behind that many newer distinct
-	// chunk reads loses protection (documented residual), while ordinary
-	// multi-block and concurrent-reader lifetimes stay covered.
-	for issued := (int64(len(data)) + client.ExtentBlockSize - 1) / client.ExtentBlockSize; issued > 0; issued-- {
-		b.blocks.issuePin(id)
-	}
-	b.blocks.trimIssued(classicReadProtect)
-	return id
-}
-
 // surgicalDeletePending removes exactly the given snapshot entries from
 // the inode's pending list: writes appended while a commit was in flight
 // survive it.
@@ -2216,56 +2076,31 @@ func (b *Bridge) surgicalDeletePending(ino meta.Ino, pending []pendingWrite) {
 	} else {
 		delete(b.pending, ino)
 	}
-	delete(b.truncs, ino)
 	delete(b.modes, ino)
+	delete(b.mtimes, ino)
 	b.mu.Unlock()
 }
 
 // isLayoutPending reports whether OUR fresh upload awaits layout
-// classification (a stat outage after a successful upload).
+// classification.
 func (b *Bridge) isLayoutPending(ino meta.Ino) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.layoutPending[ino]
 }
 
-// layoutPendingMatches reports whether the pending-classification upload
-// is still the occupant. With a recorded identity the occupant must match
-// it exactly. Without one — a total stat outage around OUR successful
-// fresh upload — the upload PROVABLY created this path's occupant (the
-// path did not exist before), so recovery adopts whichever object is
-// there: refusing would strand the handle forever after a transient
-// outage, and the residual risk is a replacement installed DURING a
-// complete outage, which no client-side evidence can distinguish.
 func (b *Bridge) layoutPendingMatches(ino meta.Ino, occupantID string) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if !b.layoutPending[ino] {
 		return false
 	}
-	// An UNKNOWN identity authorizes nothing — across retries and layouts
-	// alike: without the completion echo there is no evidence tying the
-	// pathname's occupant to OUR upload, so adopting it (this attempt or
-	// a later one, classic or extent) would hand this descriptor a
-	// replacement's bytes under its own revision. The pending state stays
-	// refused until a completion supplies the identity.
 	return b.layoutPendingID[ino] != "" && b.layoutPendingID[ino] == occupantID
 }
 
-// rcHeaderResourceID extracts an identity echoed by a read response, when
-// the server provides one on the same request that supplied the bytes.
-func rcHeaderResourceID(rc io.ReadCloser) string {
-	type headerer interface{ Header() http.Header }
-	if h, ok := rc.(headerer); ok {
-		return h.Header().Get("X-Dat9-Resource-ID")
-	}
-	return ""
-}
-
 // publicationIdentity returns the resource identity this inode's next
-// publication must be bound to: a verified recovery's constraint, or a
-// still-unclassified upload's captured (echoed) identity. Empty when
-// neither applies.
+// publication must be bound to: a verified recovery's constraint, or the
+// descriptor's echoed landing identity. Empty when neither applies.
 func (b *Bridge) publicationIdentity(ino meta.Ino) string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -2288,28 +2123,23 @@ func (b *Bridge) peekVerifyBase(ino meta.Ino) (verifyBase, bool) {
 // publication.
 func (b *Bridge) abandonIno(ino meta.Ino) {
 	b.mu.Lock()
-	delete(b.freshCreate, ino)
-	b.mu.Unlock()
-
-	b.mu.Lock()
 	defer b.mu.Unlock()
+	delete(b.freshCreate, ino)
 	delete(b.verifyBase, ino)
 	delete(b.layoutPending, ino)
 	delete(b.layoutPendingID, ino)
 	delete(b.pending, ino)
 	delete(b.truncs, ino)
+	delete(b.truncSeq, ino)
+	delete(b.revs, ino)
+	delete(b.pubSizes, ino)
+	delete(b.revAt, ino)
 	delete(b.sizes, ino)
 	delete(b.buffered, ino)
 	delete(b.paths, ino)
+	delete(b.modes, ino)
+	delete(b.mtimes, ino)
 	delete(b.replacements, "")
-	delete(b.classicOwned, ino)
-}
-
-// clearLayoutPending drops the pending-classification marker.
-func (b *Bridge) clearLayoutPending(ino meta.Ino) {
-	b.mu.Lock()
-	delete(b.layoutPending, ino)
-	b.mu.Unlock()
 }
 
 // setVerifyBase arms an identity-verified recovery's publication
@@ -2329,9 +2159,8 @@ func (b *Bridge) HasPending(ino meta.Ino) bool {
 }
 
 // MarkFreshCreate records that this inode is a descriptor WE created: its
-// first publication must establish an attributable identity (completion
-// echo, or the content-addressed classification proof) before writing any
-// pathname occupant.
+// first publication must establish an attributable identity before writing
+// any pathname occupant.
 func (b *Bridge) MarkFreshCreate(ino meta.Ino) {
 	b.mu.Lock()
 	b.freshCreate[ino] = true
@@ -2339,9 +2168,7 @@ func (b *Bridge) MarkFreshCreate(ino meta.Ino) {
 }
 
 // waitStagedSlice blocks until the store has delivered all blocks of the
-// slice (or the bounded wait expires). JuiceFS writeback stages blocks to
-// its disk cache and signals the writer before the object PUT completes,
-// so the meta side must not assume the bytes are present.
+// slice (or the bounded wait expires).
 func (b *Bridge) waitStagedSlice(ctx context.Context, id uint64, size int64) bool {
 	wait := b.cfg.WritebackWait
 	if wait <= 0 {
@@ -2368,17 +2195,14 @@ func (b *Bridge) waitStagedSlice(ctx context.Context, id uint64, size int64) boo
 }
 
 // needsFreshIdentity reports whether this inode is a locally-created
-// descriptor whose identity was never established (no verifyBase, no
-// bound landing identity, not classic-owned, no recorded placeholder).
+// descriptor whose identity was never established.
 func (b *Bridge) needsFreshIdentity(ino meta.Ino) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.freshCreate[ino] && b.verifyBase[ino].resID == "" &&
-		b.layoutPendingID[ino] == "" &&
-		!b.classicOwned[ino]
+	return b.freshCreate[ino] && b.verifyBase[ino].resID == "" && b.layoutPendingID[ino] == ""
 }
 
-// ModeOf reports the mode recorded for the inode at creation (Mknod).
+// ModeOf reports the mode recorded for the inode locally.
 func (b *Bridge) ModeOf(ino meta.Ino) (uint32, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -2386,26 +2210,46 @@ func (b *Bridge) ModeOf(ino meta.Ino) (uint32, bool) {
 	return m, ok
 }
 
+// SetModeLocal records a mode change on a local-only (not yet committed) inode.
+func (b *Bridge) SetModeLocal(ino meta.Ino, mode uint32) {
+	b.mu.Lock()
+	b.modes[ino] = mode & 0o7777
+	b.mu.Unlock()
+}
+
+// MtimeOf reports the mtime recorded locally for an uncommitted inode.
+func (b *Bridge) MtimeOf(ino meta.Ino) (time.Time, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	t, ok := b.mtimes[ino]
+	return t, ok
+}
+
+// SetMtimeLocal records an mtime change on a local-only uncommitted inode.
+func (b *Bridge) SetMtimeLocal(ino meta.Ino, mtime time.Time) {
+	b.mu.Lock()
+	b.mtimes[ino] = mtime
+	b.mu.Unlock()
+}
+
 // forgetInoLocked drops one inode's cached state; the caller holds b.mu.
 func (b *Bridge) forgetInoLocked(ino meta.Ino) {
 	delete(b.layoutPendingID, ino)
 	delete(b.layoutPending, ino)
-	// freshCreate describes THIS incarnation's create. Inodes are derived
-	// from pathnames, so a closed file's marker must not survive into a
-	// later, unrelated file that reuses the same path: it would tell the
-	// new descriptor's Sync that it created an occupant it never created.
 	delete(b.freshCreate, ino)
 	delete(b.verifyBase, ino)
 	delete(b.commitErr, ino)
-	delete(b.classicOwned, ino)
 	delete(b.paths, ino)
 	delete(b.sizes, ino)
 	delete(b.buffered, ino)
 	delete(b.revs, ino)
+	delete(b.pubSizes, ino)
 	delete(b.revAt, ino)
 	delete(b.pending, ino)
 	delete(b.truncs, ino)
+	delete(b.truncSeq, ino)
 	delete(b.modes, ino)
+	delete(b.mtimes, ino)
 }
 
 // TruncateLocal records a size change on a mount-local path (committed
@@ -2415,7 +2259,9 @@ func (b *Bridge) TruncateLocal(ctx context.Context, local string, size int64) er
 	if errno != 0 {
 		return errno
 	}
+	unlock := b.lockCommit(ino)
 	b.recordTruncate(ino, size)
+	unlock()
 	return nil
 }
 
@@ -2435,6 +2281,7 @@ func (b *Bridge) recordTruncate(ino meta.Ino, size int64) {
 	if cur, has := b.truncs[ino]; !has || size < cur {
 		b.truncs[ino] = size
 	}
+	b.truncSeq[ino]++
 	if pend := b.pending[ino]; len(pend) > 0 {
 		kept := pend[:0]
 		for _, p := range pend {
@@ -2481,14 +2328,6 @@ func (b *Bridge) releaseCommitted(ino meta.Ino, pending []pendingWrite) {
 	// exists.
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	// Whole-chunk overlay images from this inode become remotely
-	// reproducible only when NOTHING survives un-published: the surgical
-	// deletion preserved writes appended during the commit, and their
-	// bytes exist only inside those images. Resolving by commit snapshot
-	// (per checksum) left such images demotable with Y still pending.
-	if len(b.pending[ino]) == 0 {
-		defer b.blocks.resolveOverlaysFor(ino)
-	}
 	refs := make(map[string]int, len(pending))
 	// The surgical deletion has already removed THIS inode's committed
 	// snapshot, so its remaining list holds only writes that SURVIVED the
@@ -2794,28 +2633,30 @@ func (b *Bridge) flushFile(ctx context.Context, ino meta.Ino, finalize bool) err
 	b.mu.Lock()
 	size, has := b.sizes[ino]
 	path, mapped := b.paths[ino]
+	mode, hasMode := b.modes[ino]
 	b.mu.Unlock()
 	if finalize && has && mapped && size == 0 {
-		if _, err := b.StatLocal(ctx, path); err != nil && client.IsNotFound(err) {
-			if _, err := b.cfg.Client.CreateFileCtx(ctx, path); err != nil {
+		if _, err := b.cfg.Client.StatCtx(ctx, path); err != nil && client.IsNotFound(err) {
+			rev, createdID, nativeExtent, err := b.cfg.Client.CreateExtentFileCreatedCtx(ctx, path)
+			if err != nil {
 				return err
 			}
-			// The placeholder's NAME is attributed mount-locally so a
-			// later open can re-claim the name through the engine and the
-			// next commit can replace the placeholder with the fresh
-			// extent create this descriptor semantically is (see commit).
-			// No placeholder IDENTITY is recorded: CreateFileCtx returns a
-			// revision and no resource id, and a follow-up Stat is a
-			// separate request whose answer may describe another client's
-			// replacement; binding it would authorize deleting a foreign
-			// object. The attribution is only a hint — every consumer
-			// re-verifies the occupant is still a 0-byte classic file.
-			b.markEmptyPlaceholder(path)
-			// Keep the inode mapping: the engine handle is still open, and
-			// a later write through the same descriptor commits via this
-			// path (the size-0 classic target is replaced with a fresh
-			// extent create in commit). Forgetting the mapping turned that
-			// write into EIO.
+			if nativeExtent {
+				b.mu.Lock()
+				if createdID != "" {
+					b.layoutPendingID[ino] = createdID
+				}
+				delete(b.freshCreate, ino)
+				delete(b.modes, ino)
+				delete(b.mtimes, ino)
+				b.mu.Unlock()
+				b.recordLandedRevisionWithSize(ino, rev, 0)
+			} else {
+				b.markEmptyPlaceholder(path, rev, createdID)
+			}
+			if hasMode && mode != 0 && mode != 0o644 {
+				_ = b.cfg.Client.ChmodCtx(ctx, path, mode)
+			}
 		}
 	}
 	if !has {
@@ -2838,10 +2679,10 @@ func (b *Bridge) isFreshCreate(ino meta.Ino) bool {
 	return b.freshCreate[ino]
 }
 
-// nameMaterialized reports whether the file's name currently exists
+// nameMaterialized reports whether the full remote path currently exists
 // server-side (a fresh empty engine file may have none yet).
-func (b *Bridge) nameMaterialized(ctx context.Context, path string) bool {
-	_, err := b.StatLocal(ctx, path)
+func (b *Bridge) nameMaterialized(ctx context.Context, fullPath string) bool {
+	_, err := b.cfg.Client.StatCtx(ctx, fullPath)
 	return err == nil
 }
 
@@ -2896,26 +2737,28 @@ func (b *Bridge) MaterializeEmpty(ctx context.Context, ino meta.Ino) error {
 	if !b.cfg.Client.WarmCompletionIdentity(ctx) {
 		return fmt.Errorf("materialize empty file %s: server does not advertise completion_identity_v1, so the created object cannot be attributed to this descriptor", path)
 	}
-	rev, createdID, err := b.cfg.Client.CreateFileCreatedCtx(ctx, path)
+	rev, createdID, nativeExtent, err := b.cfg.Client.CreateExtentFileCreatedCtx(ctx, path)
 	if err != nil {
 		return fmt.Errorf("materialize empty file %s: %w", path, err)
 	}
-	if createdID != "" {
-		// The server echoed the identity of the object IT created. Bind
-		// that — never a follow-up stat, which a concurrent replacement
-		// can turn into a stranger's identity.
-		b.setVerifyBase(ino, rev, createdID)
-		b.mu.Lock()
-		b.classicOwned[ino] = true
-		b.mu.Unlock()
-		return nil
+	if createdID == "" {
+		return fmt.Errorf("materialize empty file %s: server did not echo the created object's identity", path)
 	}
-	// The create landed but the server did not echo what it created, so this
-	// descriptor still has no attributable identity. A follow-up Stat cannot
-	// supply one — a replacement landing in that window would be adopted as
-	// ours — so strict durability cannot be honoured here and the call must
-	// fail rather than acknowledge an object we cannot prove we created.
-	return fmt.Errorf("materialize empty file %s: server did not echo the created object's identity", path)
+	b.setVerifyBase(ino, rev, createdID)
+	b.recordLandedRevisionWithSize(ino, rev, 0)
+	if !nativeExtent {
+		b.markEmptyPlaceholder(path, rev, createdID)
+	}
+	b.mu.Lock()
+	mode, hasMode := b.modes[ino]
+	if nativeExtent {
+		delete(b.freshCreate, ino)
+	}
+	b.mu.Unlock()
+	if hasMode && mode != 0 && mode != 0o644 {
+		_ = b.cfg.Client.ChmodCtx(ctx, path, mode)
+	}
+	return nil
 }
 
 func (b *Bridge) CompactAll(ctx meta.Context, threads int, bar *utils.Bar) syscall.Errno { return 0 }
@@ -3044,78 +2887,80 @@ func (b *Bridge) Fallocate(ctx meta.Context, inode meta.Ino, mode uint8, off, si
 		fallocCollapse  = 0x08
 		fallocZeroRange = 0x10
 		fallocInsert    = 0x20
+		maxFileOffset   = uint64(1<<63 - 1)
 	)
-	if mode&(fallocPunchHole|fallocCollapse|fallocInsert) != 0 {
-		// Hole punching and range collapse need block-level surgery the
-		// extent protocol does not expose. Reporting ENOTSUP is the honest
-		// answer; silently ignoring it would report success for an
-		// operation that did not happen.
+	if mode&(fallocPunchHole|fallocCollapse|fallocZeroRange|fallocInsert) != 0 {
+		// Hole punching, zeroing existing ranges, and range collapse/insert
+		// require block-level surgery this plane does not implement.
 		return syscall.ENOTSUP
 	}
 	path, ok := b.remotePath(inode)
 	if !ok {
 		return syscall.ESTALE
 	}
-	if length != nil {
-		*length = off + size
-	}
-	if mode&fallocKeepSize != 0 && mode&fallocZeroRange == 0 {
-		return 0 // preallocation only; the length must not change
-	}
-	if mode&fallocZeroRange != 0 && size == 0 {
-		return 0
-	}
-	end := int64(off + size)
-	if end <= 0 {
-		return 0
-	}
 	b.mu.Lock()
-	cur, has := b.sizes[inode]
+	cur, has := b.localLengthLocked(inode)
 	b.mu.Unlock()
-	if has && cur >= end {
-		return 0
+	if !has {
+		st, err := b.cfg.Client.StatCtx(ctxOf(ctx), path)
+		if err != nil {
+			if !client.IsNotFound(err) {
+				return errnoOf(err)
+			}
+			cur = 0
+		} else {
+			cur = st.Size
+			b.observeRevisionWithSize(inode, st.Revision, st.Size)
+			b.mu.Lock()
+			if _, ok := b.sizes[inode]; !ok {
+				b.sizes[inode] = cur
+			}
+			b.mu.Unlock()
+		}
 	}
-	// Extend the logical length only. The range reads as zeros because the
-	// extent layout synthesises holes on demand.
-	b.mu.Lock()
-	if end > b.sizes[inode] {
-		b.sizes[inode] = end
-	}
-	b.mu.Unlock()
-	_ = path
-	return 0
-}
-
-// CopyFileRange copies bytes between two files of this mount. The extent
-// plane's data lives in block slices keyed by inode, so this goes through the
-// bridge's own read/write path rather than any server-side copy: the copy is
-// in-memory here and materialises through the normal commit at flush.
-func (b *Bridge) CopyFileRange(ctx meta.Context, fin meta.Ino, offIn uint64, fout meta.Ino, offOut uint64, size uint64, flags uint32, copied, outLength *uint64) syscall.Errno {
-	if size == 0 {
-		if copied != nil {
-			*copied = 0
+	if size == 0 || mode&fallocKeepSize != 0 {
+		if length != nil {
+			*length = uint64(max64(cur, 0))
 		}
 		return 0
 	}
-	srcPath, ok := b.remotePath(fin)
-	if !ok {
-		return syscall.ESTALE
+	if off > maxFileOffset || size > maxFileOffset-off {
+		return syscall.EFBIG
 	}
-	dstPath, ok := b.remotePath(fout)
-	if !ok {
-		return syscall.ESTALE
+	end := int64(off + size)
+	if end <= cur {
+		if length != nil {
+			*length = uint64(cur)
+		}
+		return 0
 	}
-	_ = srcPath
-	_ = dstPath
-	// Reading SOURCE bytes for the copy would need the caller's open
-	// descriptors, which the Meta contract does not carry. The VFS layer
-	// performs copy_file_range by iterating its own reader/writer, so this
-	// hook is only reached for a server-side optimisation this plane does
-	// not have. Answering 0 with copied=0 lets the caller fall back.
-	if copied != nil {
-		*copied = 0
+	unlock := b.lockCommit(inode)
+	b.mu.Lock()
+	curNow, hasNow := b.localLengthLocked(inode)
+	if hasNow && curNow >= end {
+		b.mu.Unlock()
+		unlock()
+		if length != nil {
+			*length = uint64(curNow)
+		}
+		return 0
+	}
+	b.mu.Unlock()
+	b.recordTruncate(inode, end)
+	unlock()
+	if length != nil {
+		*length = uint64(end)
 	}
 	return 0
+}
+
+// CopyFileRange is unsupported at the metadata layer (the extent plane has no
+// server-side object-slice clone). Returning ENOTSUP ensures VFS.CopyFileRange
+// never mistakes a zero-byte metadata no-op for EOF or clobbers the destination
+// writer's length; handle-to-handle copies are executed in plane.go over the
+// opened engine handles' Read/Write paths.
+func (b *Bridge) CopyFileRange(ctx meta.Context, fin meta.Ino, offIn uint64, fout meta.Ino, offOut uint64, size uint64, flags uint32, copied, outLength *uint64) syscall.Errno {
+	return syscall.ENOTSUP
 }
 
 // Chroot pins the plane's root to a subtree. The bridge resolves paths
@@ -3232,7 +3077,7 @@ func (b *Bridge) Remove(ctx meta.Context, parent meta.Ino, name string, skipTras
 
 // removeTree walks and unlinks depth-first, counting attempted deletions.
 func (b *Bridge) removeTree(ctx context.Context, full string, count *uint64) syscall.Errno {
-	st, err := b.StatLocal(ctx, full)
+	st, err := b.cfg.Client.StatCtx(ctx, full)
 	if err != nil {
 		if client.IsNotFound(err) {
 			return syscall.ENOENT
@@ -3308,7 +3153,7 @@ func (b *Bridge) GetSummary(ctx meta.Context, inode meta.Ino, summary *meta.Summ
 				continue
 			}
 			summary.Files++
-			if st, serr := b.StatLocal(ctxOf(ctx), child); serr == nil {
+			if st, serr := b.cfg.Client.StatCtx(ctxOf(ctx), child); serr == nil {
 				summary.Length += uint64(st.Size)
 				summary.Size += uint64(st.Size)
 			}

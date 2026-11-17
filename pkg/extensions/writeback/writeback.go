@@ -208,8 +208,9 @@ type Writeback struct {
 
 	// wbCache/uploader form the small-file writeback track (.dat/.meta
 	// disk cache + 16-worker uploader), active when WriteCacheDir is set.
-	wbCache  *staging.WriteBackCache
-	uploader *WriteBackUploader
+	wbCache         *staging.WriteBackCache
+	wbCacheMaxBytes int64
+	uploader        *WriteBackUploader
 	// pathLocks serializes queue callbacks against same-path staging.
 	pathLocks stripedLocks
 	// live maps path → *bufferingHandle for open writers (Setattr deferral
@@ -400,6 +401,10 @@ type bufferingHandle struct {
 	// snapshotFile keeps a disk snapshot alive for the buffer's lazy part
 	// loader after the snapshot itself stopped serving reads directly.
 	snapshotFile *os.File
+	// liveSpillFile backs evicted full parts during pre-close sequential writes
+	// past commitInlineStreamThreshold so multi-GiB files never accumulate in
+	// Go heap RAM before Flush/Release.
+	liveSpillFile *os.File
 	// flags is the open mode: O_APPEND writes track the buffer tail.
 	flags uint32
 	// pendingMode defers a chmod past a dirty handle to its commit (
@@ -437,6 +442,9 @@ type bufferingHandle struct {
 	// success callback running under this path's lock (the same lock the
 	// staging path takes), so no staging can be in flight across the swap.
 	extent fs.Handle
+	// migrationDone closes when the latest scheduled extent handle migration
+	// completes, allowing strict fsync to return only after migration finishes.
+	migrationDone chan struct{}
 	// releasing marks a descriptor whose teardown has begun. Migration must
 	// not adopt it: the engine handle it opened would then have no releaser.
 	releasing bool
@@ -604,6 +612,9 @@ func New(opts Options) (*Writeback, error) {
 	if debounce != 0 {
 		w.debounce = flushdebounce.NewFlushDebouncer(debounce)
 	}
+	if opts.WriteCacheSizeMB > 0 {
+		w.wbCacheMaxBytes = opts.WriteCacheSizeMB << 20
+	}
 	if opts.WriteCache != nil {
 		w.wbCache = opts.WriteCache
 	}
@@ -730,6 +741,9 @@ func New(opts Options) (*Writeback, error) {
 		}
 		w.uploader = up
 		up.SetPerfCounters(w.perfShim)
+		if opts.BatchWindow > 0 || opts.BatchMaxFiles > 0 || opts.BatchMaxBytes > 0 {
+			up.ConfigureBatchWrite(opts.BatchWindow, opts.BatchMaxFiles, opts.BatchMaxBytes)
+		}
 	}
 	if opts.Staging != nil {
 		workers := opts.UploadConcurrency
@@ -818,16 +832,22 @@ func New(opts Options) (*Writeback, error) {
 		}
 		q.PathLock = w.pathLocks.lock
 		w.queue = q
-		// v1 lazy-staging wiring (issue #964): WAL frames stop fsyncing on
-		// Put and a background syncer bounds the power-loss window instead.
-		w.lazy = opts.LazyStaging
 		if opts.LazyStaging {
 			opts.Staging.Pending.SetJournalSyncOnPut(false)
-			if opts.SyncWindow > 0 {
-				syncerCtx, cancel := context.WithCancel(context.Background())
-				w.syncerCancel = cancel
-				go opts.Staging.Journal.SyncLoop(syncerCtx, opts.SyncWindow)
-			}
+		}
+	}
+	// v1 lazy-staging wiring (issue #964): close stages into the page cache
+	// and background syncers bound the power-loss window on both the WAL
+	// ledger track and the small-file .dat/.meta cache track.
+	w.lazy = opts.LazyStaging
+	if opts.LazyStaging && opts.SyncWindow > 0 && (opts.Staging != nil || w.wbCache != nil) {
+		syncerCtx, cancel := context.WithCancel(context.Background())
+		w.syncerCancel = cancel
+		if opts.Staging != nil && opts.Staging.Journal != nil {
+			go opts.Staging.Journal.SyncLoop(syncerCtx, opts.SyncWindow)
+		}
+		if w.wbCache != nil {
+			go w.wbCache.SyncLoop(syncerCtx, opts.SyncWindow)
 		}
 	}
 	return w, nil
@@ -991,6 +1011,9 @@ func (w *Writeback) Stop(ctx context.Context) error {
 	}
 	if w.queue != nil {
 		w.queue.DrainAll()
+	}
+	if w.wbCache != nil {
+		_ = w.wbCache.SyncPending()
 	}
 	return nil
 }
@@ -1545,19 +1568,26 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		// (unlink/14's re-create).
 		var st fs.Attr
 		var statErr error
-		if op.KernelCreate() && flags&uint32(syscall.O_EXCL) == 0 {
-			// Async create: the kernel's ordinary O_CREAT claims a fresh
-			// path without waiting on a remote HEAD. This is the v1
-			// behavior and the reason bulk small-file creation is fast;
-			// O_EXCL below still takes the server-arbitrated path. A
-			// raced existing row is reconciled when the pending image
-			// lands (the uploader owns that conflict resolution).
+		if op.KernelCreate() && flags&uint32(syscall.O_EXCL) == 0 && flags&uint32(syscall.O_TRUNC) != 0 {
+			// Async truncating create: O_CREAT|O_TRUNC (used by unzip, cp, tar,
+			// os.Create, shell redirection) discards any prior contents anyway,
+			// so it claims a fresh path without waiting on a remote HEAD.
+			// Non-truncating O_CREAT and O_EXCL probe first so an existing file's
+			// contents, revision, and layout are preserved before open(2) returns.
 			statErr = fs.ErrNotFound
 		} else {
 			if w.opts.ExtentOpener != nil && w.queue != nil && w.queue.HasPath(op.Path) {
 				w.waitPathCommit(op.Path)
 			}
 			st, statErr = w.probeExisting(ctx, next, op.Path)
+			if op.KernelCreate() && flags&uint32(syscall.O_EXCL) == 0 && statErr != nil && fs.IsNotFound(statErr) {
+				if rst, rerr := w.probeRemoteAuthoritative(ctx, op.Path); rerr == nil {
+					w.invalidate(op.Path, 0)
+					st, statErr = rst, nil
+				} else if !fs.IsNotFound(rerr) {
+					statErr = rerr
+				}
+			}
 		}
 		if statErr != nil && fs.IsNotFound(statErr) && w.queue != nil && w.queue.HasPath(op.Path) {
 			// pending-cache visibility: the path was flushed into the
@@ -2200,29 +2230,30 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			}
 			if h != nil {
 				h.mu.Lock()
-				// A MIGRATED descriptor has no publication boundary left on
-				// this plane: Sync/Flush/Release all delegate to the engine,
-				// so a value parked in pendingMode would be acknowledged and
-				// then dropped. Apply it to the remote right here instead —
-				// the engine holds the bytes and the name already exists.
 				migrated := h.extent != nil
+				var size int64
+				var anonymous bool
+				if !migrated {
+					h.pendingMode = op.Mode & 0o7777
+					h.hasPendingMode = true
+					size = h.baseSize
+					if h.buf != nil {
+						size = h.buf.Size()
+					}
+					anonymous = h.unlinked
+				}
 				h.mu.Unlock()
 				if migrated {
 					if err := w.applyDeferredMode(ctx, h, op.Mode&0o7777); err != nil {
 						return fs.Result{}, err
 					}
+					h.mu.Lock()
+					h.pendingMode = 0
+					h.hasPendingMode = false
+					h.mu.Unlock()
 					w.invalidate(op.Path, 0)
 					return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Mode: op.Mode & 0o7777, Size: h.sizeForAttr()}}, nil
 				}
-				h.mu.Lock()
-				h.pendingMode = op.Mode & 0o7777
-				h.hasPendingMode = true
-				size := h.baseSize
-				if h.buf != nil {
-					size = h.buf.Size()
-				}
-				anonymous := h.unlinked
-				h.mu.Unlock()
 				// v1 setPendingMetadataMode: journal the mode onto the staged
 				// ledger meta too — the queue entry snapshotted its mode at
 				// enqueue, and a chmod newer than that snapshot (killpriv on
@@ -2244,26 +2275,40 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			}
 			// A staged .dat/.meta image journals the mode onto the pending
 			// meta (setPendingMetadataMode): the uploader applies it
-			// post-landing. The reply carries the requested mode for the
-			// same attr-cache reason as the live-handle deferral above.
+			// post-landing (or atomically inside batch-write). Hold the
+			// uploader's per-path gate across GetMeta+UpdateMode so an
+			// already in-flight upload finishes first instead of racing
+			// UpdateMode's generation bump and leaking .dat/.meta.
 			if w.wbCache != nil {
-				if meta, ok := w.wbCache.GetMeta(op.Path); ok {
-					// The write-back cache is keyed by the LOCAL path
-					// (GetMeta/staging writes); RemoteRoot applies only at
-					// the HTTP boundary. Updating the remote key silently
-					// missed and left the uploaded mode stale.
-					if err := w.wbCache.UpdateMode(op.Path, op.Mode&0o7777); err == nil {
+				var releaseUpload func()
+				if w.uploader != nil {
+					releaseUpload = w.uploader.acquirePath(op.Path)
+				}
+				meta, ok := w.wbCache.GetMeta(op.Path)
+				if ok {
+					err := w.wbCache.UpdateMode(op.Path, op.Mode&0o7777)
+					if releaseUpload != nil {
+						releaseUpload()
+					}
+					if err == nil {
 						return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Mode: op.Mode & 0o7777, Size: meta.Size}}, nil
 					}
+				} else if releaseUpload != nil {
+					releaseUpload()
 				}
 			}
 			res, err := next(ctx, op)
-			if err != nil && fs.IsNotFound(err) && w.queue != nil && w.queue.HasPath(op.Path) {
-				// The chmod raced the path's own enqueue (RELEASE is
-				// processed asynchronously, so the queue entry can appear
-				// after the checks above): wait for the landing and retry
-				// the remote chmod once.
-				if w.waitPathCommit(op.Path) {
+			if err != nil && fs.IsNotFound(err) {
+				if w.queue != nil && w.queue.HasPath(op.Path) {
+					// The chmod raced the path's own enqueue (RELEASE is
+					// processed asynchronously, so the queue entry can appear
+					// after the checks above): wait for the landing and retry
+					// the remote chmod once.
+					if w.waitPathCommit(op.Path) {
+						res, err = next(ctx, op)
+					}
+				} else if w.uploader != nil && w.uploader.InFlight(op.Path) {
+					w.uploader.WaitPath(op.Path)
 					res, err = next(ctx, op)
 				}
 			}
@@ -2409,6 +2454,31 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			}
 			return res, err
 		}
+		if !op.HasSetUID && !op.HasSetGID {
+			if h := w.handleFor(op.Path); h != nil {
+				h.mu.Lock()
+				unlinked := h.unlinked
+				mode, hasMode := h.pendingMode, h.hasPendingMode
+				size := h.baseSize
+				if h.buf != nil {
+					size = h.buf.Size()
+				}
+				h.mu.Unlock()
+				if !unlinked {
+					return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Mode: modeOr644(mode, hasMode), Size: size, Mtime: op.Mtime}}, nil
+				}
+			}
+			if w.wbCache != nil {
+				if meta, ok := w.wbCache.GetMeta(op.Path); ok && meta != nil {
+					return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Mode: modeOr644(meta.Mode, meta.HasMode), Size: meta.Size, Mtime: op.Mtime}}, nil
+				}
+			}
+			if w.opts.Staging != nil && w.opts.Staging.Pending != nil {
+				if meta, ok := w.opts.Staging.Pending.GetMeta(op.Path); ok && meta != nil {
+					return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Mode: modeOr644(meta.Mode, meta.HasMode), Size: meta.Size, Mtime: op.Mtime}}, nil
+				}
+			}
+		}
 	}
 	return next(ctx, op)
 }
@@ -2448,7 +2518,12 @@ func (w *Writeback) scheduleExtentMigration(h *bufferingHandle, path, landedID s
 	if w.opts.ExtentOpener == nil || committedRev <= 0 || h == nil {
 		return
 	}
+	done := make(chan struct{})
+	h.mu.Lock()
+	h.migrationDone = done
+	h.mu.Unlock()
 	go func() {
+		defer close(done)
 		defer func() {
 			if r := recover(); r != nil {
 				safeLogPrintf("writeback: extent migration for %s panicked: %v", path, r)
@@ -2590,11 +2665,10 @@ func (w *Writeback) adoptExtentHandle(h *bufferingHandle, e fs.Handle) bool {
 	// out by the caller — otherwise a promoted file keeps the permissions
 	// it had before the chmod.
 	//
-	// Captured under h.mu so a concurrent chmod either lands in this value
-	// or records a NEW pending mode after the flag is cleared, and
-	// applyPendingMode publishes that one.
+	// Keep pendingMode/hasPendingMode armed on h until applyDeferredMode
+	// succeeds below; if that best-effort attempt fails, migrated Sync, Flush,
+	// and Release retry and surface any remaining error instead of dropping it.
 	pendingMode, hasPendingMode := h.pendingMode, h.hasPendingMode
-	h.pendingMode, h.hasPendingMode = 0, false
 	// The engine owns the bytes now: retire the local staging state so a
 	// later flush cannot publish this stale image over the engine's.
 	h.dirty = false
@@ -2606,11 +2680,13 @@ func (w *Writeback) adoptExtentHandle(h *bufferingHandle, e fs.Handle) bool {
 	pendingShadow := h.pendingShadowGen
 	pendingFile := h.pendingFile
 	snapshotFile := h.snapshotFile
+	liveSpillFile := h.liveSpillFile
 	h.pendingShadowGen = 0
 	h.pendingImage = nil
 	h.pendingFile = nil
 	h.pendingFileSize = 0
 	h.snapshotFile = nil
+	h.liveSpillFile = nil
 	h.mu.Unlock()
 
 	if pendingShadow != 0 && w.opts.Staging != nil {
@@ -2622,18 +2698,44 @@ func (w *Writeback) adoptExtentHandle(h *bufferingHandle, e fs.Handle) bool {
 	if snapshotFile != nil {
 		_ = snapshotFile.Close()
 	}
-	// Publish the deferred chmod now that this plane no longer owns a
-	// publication boundary for the descriptor. Best effort: the data plane
-	// has already moved, and applyPendingMode keeps a local copy on every
-	// error path it can retry from.
+	if liveSpillFile != nil {
+		_ = liveSpillFile.Close()
+	}
 	if hasPendingMode {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		if err := w.applyDeferredMode(ctx, h, pendingMode); err != nil {
 			safeLogPrintf("writeback: apply deferred chmod after extent migration for %s: %v", h.path, err)
+		} else {
+			h.mu.Lock()
+			if h.hasPendingMode && h.pendingMode == pendingMode {
+				h.pendingMode = 0
+				h.hasPendingMode = false
+			}
+			h.mu.Unlock()
 		}
 		cancel()
 	}
 	return true
+}
+
+func (h *bufferingHandle) flushMigratedMode(ctx context.Context) error {
+	h.mu.Lock()
+	mode, has := h.pendingMode, h.hasPendingMode
+	unlinked := h.unlinked
+	h.mu.Unlock()
+	if !has || unlinked || h.w == nil || h.w.opts.Client == nil {
+		return nil
+	}
+	if err := h.w.applyDeferredMode(ctx, h, mode); err != nil {
+		return err
+	}
+	h.mu.Lock()
+	if h.hasPendingMode && h.pendingMode == mode {
+		h.pendingMode = 0
+		h.hasPendingMode = false
+	}
+	h.mu.Unlock()
+	return nil
 }
 
 // applyDeferredMode pushes a chmod that was deferred past an open buffer.
@@ -3041,6 +3143,7 @@ func (h *bufferingHandle) Write(ctx context.Context, off int64, data []byte) err
 		h.mu.Unlock()
 		return err
 	}
+	h.maybeSpillLivePartsLocked(off)
 	h.wgen++
 	h.dirty = true
 	// Stamp the mutation epoch (#984): sibling readers compare epochs to
@@ -3667,7 +3770,10 @@ func (w *Writeback) recordTransferFailure(path string, err error) {
 func (h *bufferingHandle) Sync(ctx context.Context) error {
 	// Migrated: fsync publishes through the engine (JuiceFS close-to-open).
 	if e := h.extentHandle(); e != nil {
-		return e.Sync(ctx)
+		if err := e.Sync(ctx); err != nil {
+			return err
+		}
+		return h.flushMigratedMode(ctx)
 	}
 	// interactive mode: fsync is a durability barrier served by
 	// the local staging ledger — stage + async enqueue, and the queue lands the
@@ -3735,6 +3841,15 @@ func (h *bufferingHandle) Sync(ctx context.Context) error {
 			return fs.StatusErrorOf(gofuse.Status(syscall.EIO))
 		}
 	}
+	h.mu.Lock()
+	migDone := h.migrationDone
+	h.mu.Unlock()
+	if migDone != nil {
+		select {
+		case <-migDone:
+		case <-ctx.Done():
+		}
+	}
 	return nil
 }
 
@@ -3759,7 +3874,10 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 	// the community writer has frozen. Reimplementing the close-to-open
 	// boundary here would upload the image a second time.
 	if e := h.extentHandle(); e != nil {
-		return e.Flush(ctx)
+		if err := e.Flush(ctx); err != nil {
+			return err
+		}
+		return h.flushMigratedMode(ctx)
 	}
 	// Inline-path writeback coalesces rapid flushes of one path into one
 	// upload (flushHandleDebounced): without a staging ledger every
@@ -3992,9 +4110,14 @@ func (h *bufferingHandle) Release(ctx context.Context) error {
 		h.mu.Lock()
 		gen := h.ledgerShadowGen
 		h.ledgerShadowGen = 0
+		lf := h.liveSpillFile
+		h.liveSpillFile = nil
 		h.mu.Unlock()
 		if gen != 0 && h.w.opts.Staging != nil {
 			h.w.opts.Staging.Shadow.Unpin(gen)
+		}
+		if lf != nil {
+			_ = lf.Close()
 		}
 	}()
 	// One identity snapshot for the whole close (a concurrent retarget
@@ -4121,7 +4244,11 @@ func (h *bufferingHandle) Release(ctx context.Context) error {
 // the registry entry, so both must still be retired here.
 func (h *bufferingHandle) releaseMigrated(ctx context.Context, e fs.Handle) error {
 	path := h.infoSnapshot().path
+	modeErr := h.flushMigratedMode(ctx)
 	err := e.Release(ctx)
+	if err == nil && modeErr != nil {
+		err = modeErr
+	}
 
 	h.mu.Lock()
 	ledgerGen := h.ledgerShadowGen
@@ -5326,6 +5453,18 @@ func (w *Writeback) retarget(oldPath, newPath string) {
 		}
 		h.mu.Unlock()
 		if slotOld != "" {
+			if set := w.liveByPath[slotOld]; set != nil {
+				delete(set, h)
+				if len(set) == 0 {
+					delete(w.liveByPath, slotOld)
+				}
+			}
+			dstSet := w.liveByPath[next]
+			if dstSet == nil {
+				dstSet = make(map[*bufferingHandle]struct{})
+				w.liveByPath[next] = dstSet
+			}
+			dstSet[h] = struct{}{}
 			// Compare-and-delete: a newer claim that took the slot is
 			// never evicted by an older fd's rename.
 			if w.live.CompareAndDelete(slotOld, h) {
@@ -5416,6 +5555,43 @@ func (w *Writeback) probeExisting(ctx context.Context, next fs.Next, path string
 		return fs.Attr{}, fs.ErrNotFound
 	}
 	return *res.Attr, nil
+}
+
+func (w *Writeback) probeRemoteAuthoritative(ctx context.Context, path string) (fs.Attr, error) {
+	if w == nil || w.opts.Client == nil {
+		return fs.Attr{}, fs.ErrNotFound
+	}
+	base := context.WithoutCancel(ctx)
+	probeCtx, cancel := context.WithTimeout(base, probeDeadline)
+	if dl, ok := ctx.Deadline(); ok && dl.Before(time.Now().Add(probeDeadline)) {
+		probeCtx, cancel = context.WithDeadline(base, dl)
+	}
+	defer cancel()
+	st, err := w.opts.Client.StatCtx(probeCtx, w.remotePath(path))
+	if err != nil {
+		if client.IsNotFound(err) {
+			return fs.Attr{}, fs.ErrNotFound
+		}
+		return fs.Attr{}, err
+	}
+	attr := fs.Attr{
+		Kind:   fs.KindFile,
+		Size:   st.Size,
+		Rev:    st.Revision,
+		Mtime:  st.Mtime,
+		Nlink:  st.Nlink,
+		ExtentIno: st.ExtentIno,
+	}
+	if st.IsDir {
+		attr.Kind = fs.KindDir
+		attr.Mode = 0o755
+	} else {
+		attr.Mode = 0o644
+	}
+	if st.HasMode {
+		attr.Mode = st.Mode
+	}
+	return attr, nil
 }
 
 // openPendingWritable serves a writable re-open from the path's staged
@@ -6149,10 +6325,15 @@ func (h *bufferingHandle) truncateLocal(ctx context.Context, size int64) error {
 	// v1: a truncate invalidates everything the streamer already uploaded —
 	// reset the streamed-part bookkeeping and abandon the active stream so
 	// finishStreaming cannot publish pre-truncation bytes past the new size.
-	h.stream = nil
-	h.buf.ResetStreamingState()
+	if h.stream != nil {
+		h.stream = nil
+		h.buf.ResetStreamingState()
+	}
 	if err := h.buf.Truncate(size); err != nil {
 		return err
+	}
+	if h.liveSpillFile != nil {
+		_ = h.liveSpillFile.Truncate(size)
 	}
 	h.wgen++
 	h.dirty = true
@@ -6628,22 +6809,6 @@ func (h *bufferingHandle) spillToShadow(st *staging.Staging, buf *writebuffer.Wr
 		return fmt.Errorf("writeback: spill without part size: %s", h.path)
 	}
 	size := buf.Size()
-	// The shadow becomes the buffer's authoritative backing: evicted parts
-	// restore from it, and future sequential writes spill through it.
-	// Drain leaves the writer open: keep its already-resident parts usable
-	// after queue cleanup removes the shadow, without materializing sparse holes.
-	if !retainBuffer {
-		buf.RestorePart = func(partNum int) ([]byte, error) {
-			return restoreShadowPart(st.Shadow, h.path, buf, partNum)
-		}
-		buf.OnPartFull = func(partIdx int, data []byte) {
-			if _, err := st.Shadow.WriteAt(h.path, int64(partIdx)*partSize, data, baseRev); err != nil {
-				safeLogPrintf("writeback: shadow spill of part %d for %s failed: %v", partIdx, h.path, err)
-				return
-			}
-			buf.EvictPart(partIdx)
-		}
-	}
 	// v1's spill wrote only the parts the writer touched: a one-byte
 	// write at 2GiB+1 never materialized 2GiB of zeros on the disk, and
 	// the shadow byte quota rejected the port's full-image rewrite
@@ -6658,9 +6823,11 @@ func (h *bufferingHandle) spillToShadow(st *staging.Staging, buf *writebuffer.Wr
 			dirty[pn] = true
 		}
 	}
+	streamed := buf.StreamedPartIndices()
 	for start := int64(0); start < size; start += partSize {
-		partNum := int(start/partSize) + 1
-		if zeroBase && !dirty[partNum] && !buf.IsPartLoaded(partNum-1) {
+		partIdx := int(start / partSize)
+		partNum := partIdx + 1
+		if zeroBase && !dirty[partNum] && !buf.IsPartLoaded(partIdx) && (h.liveSpillFile == nil || !streamed[partIdx]) {
 			continue
 		}
 		end := start + partSize
@@ -6683,6 +6850,25 @@ func (h *bufferingHandle) spillToShadow(st *staging.Staging, buf *writebuffer.Wr
 	}
 	if err := st.Shadow.Truncate(h.path, size, baseRev); err != nil {
 		return err
+	}
+	// Switch the buffer's authoritative backing onto st.Shadow AFTER copying
+	// any pre-close liveSpillFile parts into st.Shadow, then close the
+	// temporary liveSpillFile so its disk blocks are reclaimed immediately.
+	if !retainBuffer {
+		if h.liveSpillFile != nil {
+			_ = h.liveSpillFile.Close()
+			h.liveSpillFile = nil
+		}
+		buf.RestorePart = func(partNum int) ([]byte, error) {
+			return restoreShadowPart(st.Shadow, h.path, buf, partNum)
+		}
+		buf.OnPartFull = func(partIdx int, data []byte) {
+			if _, err := st.Shadow.WriteAt(h.path, int64(partIdx)*partSize, data, baseRev); err != nil {
+				safeLogPrintf("writeback: shadow spill of part %d for %s failed: %v", partIdx, h.path, err)
+				return
+			}
+			buf.EvictPart(partIdx)
+		}
 	}
 	return nil
 }
@@ -6953,6 +7139,75 @@ func (h *bufferingHandle) maybeArmStreaming() error {
 	return nil
 }
 
+// maybeSpillLivePartsLocked bounds Go heap usage to commitInlineStreamThreshold
+// (64 MiB) during large buffered writes before Flush/Release — even when Linux
+// FUSE worker goroutines deliver 128 KiB writes slightly out of offset order
+// (which disables WriteBuffer.sequential and OnPartFull). Caller holds h.mu.
+func (h *bufferingHandle) maybeSpillLivePartsLocked(currentOff int64) {
+	if h.w.opts.Policy == PolicyWriteSync || h.forceSync || h.stream != nil {
+		return
+	}
+	buf := h.buf
+	if buf == nil || buf.MemoryUsage() < commitInlineStreamThreshold {
+		return
+	}
+	partSize := buf.PartSize()
+	if partSize <= 0 {
+		return
+	}
+	if h.liveSpillFile == nil {
+		if buf.RestorePart != nil {
+			// Already backed by st.Shadow (post-Flush/Sync): spill resident
+			// parts directly to st.Shadow if Staging is present.
+			if h.w.opts.Staging != nil && h.w.opts.Staging.Shadow != nil {
+				st := h.w.opts.Staging
+				baseRev := h.baseRev
+				skipIdx := int(currentOff / partSize)
+				buf.SpillResidentParts(skipIdx, func(partIdx int, partData []byte) bool {
+					_, err := st.Shadow.WriteAt(h.path, int64(partIdx)*partSize, partData, baseRev)
+					return err == nil
+				})
+			}
+			return
+		}
+		spillDir := ""
+		if h.w.opts.Staging != nil && h.w.opts.Staging.Shadow != nil {
+			spillDir = h.w.opts.Staging.Shadow.Dir()
+		}
+		if spillDir == "" {
+			return
+		}
+		f, err := os.CreateTemp(spillDir, "wb-live-*")
+		if err != nil {
+			return
+		}
+		_ = os.Remove(f.Name())
+		h.liveSpillFile = f
+		buf.RestorePart = func(partNum int) ([]byte, error) {
+			start := int64(partNum-1) * partSize
+			end := start + partSize
+			if sz := buf.Size(); end > sz {
+				end = sz
+			}
+			if end <= start {
+				return nil, nil
+			}
+			out := make([]byte, end-start)
+			_, rerr := f.ReadAt(out, start)
+			if rerr != nil && !errors.Is(rerr, io.EOF) {
+				return nil, rerr
+			}
+			return out, nil
+		}
+	}
+	f := h.liveSpillFile
+	skipIdx := int(currentOff / partSize)
+	buf.SpillResidentParts(skipIdx, func(partIdx int, partData []byte) bool {
+		_, werr := f.WriteAt(partData, int64(partIdx)*partSize)
+		return werr == nil
+	})
+}
+
 // finishStreaming publishes the streamed multipart image (// FinishStreaming at the commit boundary); non-streamed handles fall back
 // to the whole-image path.
 func (h *bufferingHandle) finishStreaming(ctx context.Context) error {
@@ -7015,6 +7270,10 @@ const (
 func (w *Writeback) putWriteCacheSnapshot(path string, image []byte, kind staging.PendingKind, baseRev int64, mode uint32, hasMode bool, cacheLineage uint64, cacheAncestors []uint64, dur stageDurability) (uint64, error) {
 	size := int64(len(image))
 	if dur == stageV1Ladder {
+		if w.lazy {
+			gen, _, err := w.wbCache.PutWithBaseRevAndModeAndLineageTimingsNoSyncCacheLineage(path, image, size, kind, baseRev, mode, hasMode, "", "", false, cacheLineage, cacheAncestors)
+			return gen, err
+		}
 		gen, _, err := w.wbCache.PutWithBaseRevAndModeAndLineageTimingsDirSyncCacheLineage(path, image, size, kind, baseRev, mode, hasMode, "", "", false, cacheLineage, cacheAncestors)
 		return gen, err
 	}
@@ -7082,6 +7341,10 @@ func (h *bufferingHandle) stageToWriteCache(ctx context.Context, dur stageDurabi
 	path := h.path
 	promoteToExtent := h.w.extentRouteAllowed(path, size)
 	if size >= commitInlineStreamThreshold || promoteToExtent {
+		h.mu.Unlock()
+		return nil, errWriteCacheBypass
+	}
+	if h.w.wbCacheMaxBytes > 0 && h.w.wbCache != nil && h.w.wbCache.PendingBytes()+size > h.w.wbCacheMaxBytes && !h.w.wbCache.HasMeta(path) {
 		h.mu.Unlock()
 		return nil, errWriteCacheBypass
 	}

@@ -143,10 +143,7 @@ func TestStaleStatDoesNotLowerThePublishedRevision(t *testing.T) {
 	}
 }
 
-// The wait budget is spent only right after this mount published. Otherwise a
-// plan below the recorded revision is a disagreement the wait cannot fix, and
-// stalling every read on it would turn one stale answer into a hang.
-func TestFreshnessRetryBudgetOnlyAfterOwnPublication(t *testing.T) {
+func TestFreshnessRetryExhaustionFailsClosedEvenPastWindow(t *testing.T) {
 	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
@@ -159,23 +156,21 @@ func TestFreshnessRetryBudgetOnlyAfterOwnPublication(t *testing.T) {
 
 	br := NewBridge(Config{Client: client.New(srv.URL, ""), RemoteRoot: "/"})
 	const ino = meta.Ino(52)
-	// A revision learned from someone else's write, with no publication by
-	// this mount: no retry budget.
 	br.observeRevision(ino, 9)
 
-	if _, err := br.fetchFreshReadPlan(context.Background(), ino, "/t.db", 0, 4095); err != nil {
-		t.Fatalf("read plan: %v", err)
-	}
-	if n := calls.Load(); n != 1 {
-		t.Fatalf("fetched %d plans, want exactly 1 (no publication to wait for)", n)
-	}
-	// A revision this mount just published DOES buy the retry budget.
-	br.recordLandedRevision(ino, 9)
-	calls.Store(0)
-	if _, err := br.fetchFreshReadPlan(context.Background(), ino, "/t.db", 0, 4095); err != nil {
-		t.Fatalf("read plan: %v", err)
+	if _, err := br.fetchFreshReadPlan(context.Background(), ino, "/t.db", 0, 4095); err == nil {
+		t.Fatal("expected exhausted stale plan (rev 3 < 9) to fail closed")
 	}
 	if n := calls.Load(); n < 2 {
-		t.Fatalf("fetched %d plans, want retries after this mount's own publication", n)
+		t.Fatalf("fetched %d plans, want retries before failing closed", n)
+	}
+
+	br.recordLandedRevision(ino, 9)
+	calls.Store(0)
+	if _, err := br.fetchFreshReadPlan(context.Background(), ino, "/t.db", 0, 4095); err == nil {
+		t.Fatal("expected exhausted stale plan after own publication to fail closed")
+	}
+	if n := calls.Load(); n < 2 {
+		t.Fatalf("fetched %d plans, want retries after own publication", n)
 	}
 }

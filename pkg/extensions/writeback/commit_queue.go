@@ -2505,19 +2505,7 @@ func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) (int
 	// overwrite the exact parent revision this live queue just landed.
 	expectedRevision := entry.BaseRev
 	if entry.Kind == staging.PendingOverwrite && expectedRevision <= 0 {
-		// A descriptor opened on an EMPTY object can legitimately hold no base
-		// revision: the server reports no revision for a 0-byte file on some
-		// paths, and `expected_revision: 0` means "the path must NOT exist" —
-		// not "unknown" — so sending it would be a conflict rather than a
-		// write. An empty occupant carries no content to preserve, so the
-		// honest recovery is to treat this commit as the fresh create it
-		// semantically is.
-		//
-		// This is exactly what SQLite does at startup: create an empty
-		// database file, open it, write the schema. Without this the schema
-		// never lands and every later statement sees an empty database
-		// (SQLITE_SCHEMA on the first CREATE INDEX).
-		emptied, err := cq.reclaimEmptyOccupant(ctx, apiPath)
+		resolvedRev, emptied, err := cq.reclaimEmptyOccupant(ctx, entry, apiPath)
 		if err != nil {
 			return 0, err
 		}
@@ -2527,7 +2515,7 @@ func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) (int
 			// object whose revision cannot be named.
 			return 0, fmt.Errorf("missing base revision for overwrite: %s", entry.Path)
 		}
-		expectedRevision = 0
+		expectedRevision = resolvedRev
 	}
 
 	// Extent content layout: route large commits through the extent block
@@ -3978,23 +3966,30 @@ func (entry *CommitEntry) bindPayload(data []byte) []byte {
 // such a file revision 1 with no bytes, so re-creating it loses nothing. A
 // non-empty object — or one we cannot stat — is left alone and the caller
 // keeps refusing.
-func (cq *CommitQueue) reclaimEmptyOccupant(ctx context.Context, apiPath string) (bool, error) {
+func (cq *CommitQueue) reclaimEmptyOccupant(ctx context.Context, entry *CommitEntry, apiPath string) (int64, bool, error) {
 	if cq == nil || cq.client == nil {
-		return false, nil
+		return 0, false, nil
 	}
 	st, err := cq.client.StatCtx(ctx, apiPath)
 	if err != nil {
 		if client.IsNotFound(err) {
 			// The path is already gone: the create can proceed on its own.
-			return true, nil
+			return 0, true, nil
 		}
-		return false, nil
+		return 0, false, nil
 	}
-	if st.Size != 0 {
-		return false, nil
+	if st.IsDir || st.Size != 0 {
+		return 0, false, nil
 	}
-	if err := cq.client.RemoveAllCtx(ctx, apiPath); err != nil {
-		return false, fmt.Errorf("reclaim empty occupant of %s: %w", apiPath, err)
+	promoteExtent := cq.extentTakeover && entry != nil && entry.Size > 0 &&
+		cq.extentRouteFor(entry.Path, entry.Size) && st.ContentLayout != client.ContentLayoutExtent
+	if st.Revision > 0 && !promoteExtent {
+		// CAS directly against the empty file's current revision instead of
+		// issuing a separate DELETE.
+		return st.Revision, true, nil
 	}
-	return true, nil
+	if err := cq.client.DeleteFileConditionalCtx(ctx, apiPath, st.Revision, st.ResourceID); err != nil {
+		return 0, false, fmt.Errorf("reclaim empty occupant of %s: %w", apiPath, err)
+	}
+	return 0, true, nil
 }

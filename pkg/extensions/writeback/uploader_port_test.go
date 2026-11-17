@@ -475,17 +475,18 @@ func TestWriteBackUploader_SubmitAndUpload(t *testing.T) {
 }
 
 // TestWriteBackUploader_SubmitBackpressureNeverDrops verifies Submit's
-// backpressure contract: while the upload channel stays full, Submit must
-// block until a worker frees space (or time out into the synchronous
-// fallback) — it must never return while silently dropping the path.
+// non-blocking queue contract: even when workers are stalled and thousands of
+// paths accumulate past the historical 256-slot limit, Submit returns
+// immediately without dropping acknowledged work or falling back to
+// synchronous uploads on FUSE_RELEASE callers.
 func TestWriteBackUploader_SubmitBackpressureNeverDrops(t *testing.T) {
-	const total = 300 // > uploadCh capacity (256) + workers, so Submit must wait
+	const total = 2000 // >> historical 256-slot channel limit
 	release := make(chan struct{})
 	var puts atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPut {
 			puts.Add(1)
-			<-release // hold every upload until the queue is provably saturated
+			<-release // hold the active upload while the queue fills
 			w.WriteHeader(http.StatusOK)
 			return
 		}
@@ -499,45 +500,51 @@ func TestWriteBackUploader_SubmitBackpressureNeverDrops(t *testing.T) {
 		t.Fatal(err)
 	}
 	c := newTestClient(ts.URL)
+	perf := &fusePerfCounters{}
 	uploader := NewWriteBackUploader(c, cache, 1)
+	uploader.SetPerfCounters(perf)
 
 	for i := 0; i < total; i++ {
 		// NoSync staging: the test only needs the entries readable by the
 		// uploader, not durable.
-		if _, _, err := cache.PutWithBaseRevAndModeAndLineageTimingsNoSync(fmt.Sprintf("/bp/f%03d.txt", i), []byte("x"), 1, staging.PendingNew, 0, 0, false, "", "", false); err != nil {
+		if _, _, err := cache.PutWithBaseRevAndModeAndLineageTimingsNoSync(fmt.Sprintf("/bp/f%04d.txt", i), []byte("x"), 1, staging.PendingNew, 0, 0, false, "", "", false); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	var submitted atomic.Int32
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for i := 0; i < total; i++ {
-			submitted.Add(1)
-			uploader.Submit(fmt.Sprintf("/bp/f%03d.txt", i))
+	start := time.Now()
+	for i := 0; i < total; i++ {
+		p := fmt.Sprintf("/bp/f%04d.txt", i)
+		uploader.Submit(p)
+		// Duplicate submissions while queued must coalesce in place.
+		if i > 10 {
+			uploader.Submit(p)
 		}
-	}()
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("Submit blocked while worker stalled: %v", elapsed)
+	}
+	if fb := perf.uploaderSyncFallback.load(); fb != 0 {
+		t.Fatalf("uploaderSyncFallback = %d, want 0 while uploader is running", fb)
+	}
 
-	// Saturation: the queue is full and the submitter has counted past what
-	// capacity can hold — that Submit is inside its backpressure wait (or,
-	// in the regression, already returned without enqueuing).
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if len(uploader.uploadCh) == cap(uploader.uploadCh) && int(submitted.Load()) >= cap(uploader.uploadCh)+1 {
+		if puts.Load() >= 1 {
 			break
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	if len(uploader.uploadCh) != cap(uploader.uploadCh) || int(submitted.Load()) < cap(uploader.uploadCh)+1 {
-		t.Fatalf("queue never saturated: submitted=%d queued=%d", submitted.Load(), len(uploader.uploadCh))
+	queued, inFlight := uploader.PendingStats()
+	if queued+inFlight != total {
+		t.Fatalf("PendingStats() = (queued=%d, inFlight=%d), sum=%d want %d", queued, inFlight, queued+inFlight, total)
 	}
+
 	close(release)
-	<-done
 	uploader.DrainAll()
 
 	if n := puts.Load(); n != total {
-		t.Fatalf("uploaded %d of %d submitted paths — Submit dropped acknowledged work under backpressure", n, total)
+		t.Fatalf("uploaded %d of %d submitted paths — Submit dropped acknowledged work", n, total)
 	}
 }
 

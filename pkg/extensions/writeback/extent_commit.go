@@ -116,8 +116,8 @@ func (cq *CommitQueue) uploadExtentEntry(ctx context.Context, entry *CommitEntry
 		// existing classic target: never converted.
 		openedThisEmpty := entry.Kind == staging.PendingOverwrite &&
 			entry.BaseRev > 0 && entry.BaseRev == st.Revision
-		if st.Size == 0 && (entry.Kind == staging.PendingNew || openedThisEmpty) {
-			if err := cq.client.RemoveAllCtx(ctx, apiPath); err != nil {
+		if !st.IsDir && st.Size == 0 && openedThisEmpty {
+			if err := cq.client.DeleteFileConditionalCtx(ctx, apiPath, st.Revision, st.ResourceID); err != nil {
 				return 0, false, nil
 			}
 			st = nil
