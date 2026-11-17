@@ -69,12 +69,15 @@ func TestCLIReleasePublishesLegacyManifests(t *testing.T) {
 			t.Errorf("signing step omits %q", want)
 		}
 	}
-	// Signing is not enough: the signature must verify against the key the release binary
-	// embeds, read from the same file the build embeds.
-	for _, want := range []string{"-verify", "cmd/drive9/cli/update_key.txt", "dist/release.txt"} {
+	// Signing is not enough: the published pair must pass the updater's own bundle check
+	// against the key the release binary embeds, read from the same file the build embeds.
+	for _, want := range []string{"-verify-release", "cmd/drive9/cli/update_key.txt", "dist/checksums.txt"} {
 		if !strings.Contains(signStep, want) {
-			t.Errorf("signing step does not sign/verify the full release pair: missing %q", want)
+			t.Errorf("signing step does not verify the full release bundle: missing %q", want)
 		}
+	}
+	if strings.Contains(signStep, "-verify -pubkey") {
+		t.Error("signing step verifies the two files separately instead of using the bundle check, so the digest binding and the manifest structure go unchecked")
 	}
 	// Binaries first, manifests last: the updater reads the manifest pair in two requests and
 	// both sort ahead of the artifacts.

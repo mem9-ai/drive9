@@ -44,18 +44,20 @@ var (
 	ErrNoPublicKey = errors.New("no release-signing public key configured")
 	// ErrInvalidPublicKey means a configured key is not base64 or not a 32-byte ed25519 key.
 	ErrInvalidPublicKey = errors.New("release-signing public key is invalid")
-	// ErrNoSignature means the signature file is missing or empty.
-	ErrNoSignature = errors.New("release manifest signature is missing or empty")
+	// ErrNoSignature means the signature file is missing or empty. It is caller-agnostic:
+	// both checksums.txt.sig and release.txt.sig use it, so the wrapping caller names the file.
+	ErrNoSignature = errors.New("release signature is missing or empty")
 	// ErrInvalidSignature means the signature file is not a base64 64-byte ed25519 signature.
-	ErrInvalidSignature = errors.New("release manifest signature is malformed")
-	// ErrSignatureMismatch means no configured key verifies the manifest.
-	ErrSignatureMismatch = errors.New("release manifest signature does not verify against any trusted release key")
+	ErrInvalidSignature = errors.New("release signature is malformed")
+	// ErrSignatureMismatch means no configured key verifies the signed file.
+	ErrSignatureMismatch = errors.New("release signature does not verify against any trusted release key")
 	// ErrInvalidPrivateKey means the signing secret is not a usable ed25519 private key.
 	ErrInvalidPrivateKey = errors.New("release-signing private key is invalid")
 )
 
-// Manifest is a parsed, signed release manifest: the version to compare against and the
-// artifact checksums to verify downloaded bytes with.
+// Manifest is an authenticated release: the version to compare against and the artifact
+// checksums to verify downloaded bytes with. It is only ever produced by VerifyBundle, so a
+// value of this type has been through both signature checks and the binding check.
 type Manifest struct {
 	Version   string
 	Checksums map[string]string
@@ -113,13 +115,44 @@ func Verify(manifest, signature []byte, publicKeys string) error {
 	return ErrSignatureMismatch
 }
 
+// VerifyBundle authenticates a whole release: both signed files, then the digest in
+// release.txt that binds the version to exactly this checksums.txt, then the manifest
+// structure. It is the one implementation behind every consumer — the updater before it
+// installs anything, `drive9-release-sign -verify-release` in the release job and in the
+// manual procedure — so those cannot disagree about what an installable release is, and the
+// returned Manifest is proof the checks ran rather than a parsed file that merely looks right.
+//
+// A genuine release.txt from one release paired with a genuine checksums.txt from another
+// fails here, even though both signatures are individually valid: the signature proves who
+// wrote a file, the digest proves which release the pair describes.
+func VerifyBundle(manifest, manifestSignature, releaseInfo, releaseInfoSignature []byte, publicKeys string) (Manifest, error) {
+	if err := Verify(manifest, manifestSignature, publicKeys); err != nil {
+		return Manifest{}, fmt.Errorf("verify %s: %w", ManifestName, err)
+	}
+	if err := Verify(releaseInfo, releaseInfoSignature, publicKeys); err != nil {
+		return Manifest{}, fmt.Errorf("verify %s: %w", ReleaseInfoName, err)
+	}
+	info, err := ParseReleaseInfo(releaseInfo)
+	if err != nil {
+		return Manifest{}, fmt.Errorf("parse %s: %w", ReleaseInfoName, err)
+	}
+	if err := info.ValidateManifest(manifest); err != nil {
+		return Manifest{}, err
+	}
+	checksums, err := ParseChecksums(manifest)
+	if err != nil {
+		return Manifest{}, fmt.Errorf("parse %s: %w", ManifestName, err)
+	}
+	return Manifest{Version: info.Version, Checksums: checksums}, nil
+}
+
 // DecodeSignature parses a signature file. Only the bare base64 form is accepted: a file
 // with extra structure is not something the release tooling writes, and guessing at formats
 // is how a signature check turns into a formality.
 func DecodeSignature(body []byte) ([]byte, error) {
 	text := strings.TrimSpace(string(body))
 	if text == "" {
-		return nil, fmt.Errorf("%w (%s)", ErrNoSignature, SignatureName)
+		return nil, ErrNoSignature
 	}
 	signature, err := base64.StdEncoding.DecodeString(text)
 	if err != nil {

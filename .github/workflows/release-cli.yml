@@ -80,16 +80,17 @@ jobs:
           test -s dist/release.txt.sig
           base64 -d dist/checksums.txt.sig | wc -c | grep -qx 64
           base64 -d dist/release.txt.sig | wc -c | grep -qx 64
-          # Verify both signatures against the keys this release's binary embeds, read from
-          # the same file the build embeds. A stale or mistyped secret signs happily and
-          # would publish a release no updated CLI can install; this step fails instead.
-          # The file is passed through untouched: normalizing its separators here would
+          # Run the updater's own bundle check against the artifacts just signed: both
+          # signatures against the keys this release's binary embeds (read from the same
+          # file the build embeds), the digest binding release.txt to checksums.txt, and the
+          # manifest structure. A stale or mistyped secret signs happily and would publish a
+          # release no updated CLI can install; this step fails instead.
+          # The key file is passed through untouched: normalizing its separators here would
           # check a key set the shipped binary never parses, so a file the binary cannot
           # read would publish a release that cannot update. One line per key is fine —
           # the parser accepts commas or whitespace.
           KEYS="$(cat cmd/drive9/cli/update_key.txt)"
-          go run ./cmd/drive9-release-sign -verify -pubkey "$KEYS" dist/checksums.txt
-          go run ./cmd/drive9-release-sign -verify -pubkey "$KEYS" dist/release.txt
+          go run ./cmd/drive9-release-sign -verify-release -pubkey "$KEYS" dist/checksums.txt
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2

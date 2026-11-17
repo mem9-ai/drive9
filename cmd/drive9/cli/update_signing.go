@@ -2,7 +2,9 @@ package cli
 
 import (
 	_ "embed"
+	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/mem9-ai/drive9/internal/releasesign"
 )
@@ -40,13 +42,32 @@ func trustedUpdateManifestKeys() string {
 	return updateManifestPublicKey
 }
 
-// verifyUpdateManifestSignature is the updater's entry point into the shared signature
-// contract: the trusted pin, then the caller-specific rebuild hint.
-func verifyUpdateManifestSignature(manifest, signature []byte, publicKeys string) error {
-	if err := releasesign.Verify(manifest, signature, publicKeys); err != nil {
-		return fmt.Errorf("%w (this build trusts: %s; rebuild with -X "+
-			"github.com/mem9-ai/drive9/cmd/drive9/cli.updateManifestPublicKey=<key>[,<key>])",
-			err, publicKeys)
+// verifyUpdateRelease is the updater's entry point into the shared release contract: the same
+// bundle verification the release tooling and the documented manual check run, plus the
+// build-specific rebuild hint a key failure needs to be actionable.
+func verifyUpdateRelease(manifest, manifestSignature, releaseInfo, releaseInfoSignature []byte, publicKeys string) (releasesign.Manifest, error) {
+	release, err := releasesign.VerifyBundle(manifest, manifestSignature, releaseInfo, releaseInfoSignature, publicKeys)
+	if err != nil {
+		return releasesign.Manifest{}, updateSigningKeyHint(err, publicKeys)
 	}
-	return nil
+	return release, nil
+}
+
+// updateSigningKeyHint explains a failed signature check in terms of the key this build pins.
+// Only key failures get the hint: a malformed manifest or a digest mismatch is not something
+// rebuilding fixes, and telling the user to rebuild then would just mislead.
+func updateSigningKeyHint(err error, publicKeys string) error {
+	keyFailure := errors.Is(err, releasesign.ErrNoPublicKey) ||
+		errors.Is(err, releasesign.ErrInvalidPublicKey) ||
+		errors.Is(err, releasesign.ErrSignatureMismatch)
+	if !keyFailure {
+		return err
+	}
+	trusted := strings.Join(strings.Fields(publicKeys), ",")
+	if trusted == "" {
+		trusted = "(none)"
+	}
+	return fmt.Errorf("%w (this build trusts: %s; rebuild with -X "+
+		"github.com/mem9-ai/drive9/cmd/drive9/cli.updateManifestPublicKey=<key>[,<key>])",
+		err, trusted)
 }

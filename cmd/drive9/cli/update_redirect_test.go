@@ -26,9 +26,9 @@ func TestUpdateThroughLegacyReleaseRedirect(t *testing.T) {
 				if err := os.WriteFile(target, []byte("old executable"), 0700); err != nil {
 					t.Fatal(err)
 				}
-				// The updater now reads the signed manifest for both the version and the
-				// checksums, so the legacy origin serves the same shapes the release job
-				// publishes: checksums.txt with a version line, and its detached signature.
+				// The updater takes both the version and the checksums from the signed
+				// pair, so the origin serves exactly what the release job publishes:
+				// checksums.txt, release.txt, and their detached signatures.
 				version := "v0.2.0"
 				if strings.Contains(failure, "hash") {
 					version = "ab9c86b"

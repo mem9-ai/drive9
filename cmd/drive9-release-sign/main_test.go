@@ -131,20 +131,28 @@ func TestRunRefusesManifestTheUpdaterWouldReject(t *testing.T) {
 		t.Fatalf("a rejected manifest was signed anyway: %v", err)
 	}
 
-	// release.txt that describes a different manifest.
+	// A valid manifest, then a release.txt that describes a different one: signing it would
+	// publish a version bound to the wrong checksums, so the digest check has to refuse it.
 	if err := os.WriteFile(badManifest, []byte(strings.Repeat("a", 64)+"  drive9-linux-amd64\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	infoPath := filepath.Join(dir, releasesign.ReleaseInfoName)
-	pending := filepath.Join(dir, "pending.txt")
 	info := []byte("version v1\nchecksums-sha256 " + releasesign.ManifestDigest([]byte("another manifest\n")) + "\n")
-	if err := os.WriteFile(infoPath+".tmp", info, 0o644); err != nil {
+	if err := os.WriteFile(infoPath, info, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Rename(infoPath+".tmp", pending); err != nil {
-		t.Fatal(err)
+	if err := run([]string{infoPath}); err == nil || !strings.Contains(err.Error(), "release info describes manifest") {
+		t.Fatalf("run on a release.txt that describes another manifest error = %v, want a digest mismatch", err)
 	}
+	if _, err := os.Stat(infoPath + ".sig"); !os.IsNotExist(err) {
+		t.Fatalf("a mismatched release.txt was signed anyway: %v", err)
+	}
+
 	// A file that is not one of the two the updater reads is refused outright.
+	pending := filepath.Join(dir, "pending.txt")
+	if err := os.WriteFile(pending, info, 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if err := run([]string{pending}); err == nil || !strings.Contains(err.Error(), "not a release artifact") {
 		t.Fatalf("run on an unknown file error = %v, want a refusal", err)
 	}
