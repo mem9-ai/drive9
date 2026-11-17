@@ -313,3 +313,43 @@ func TestAdminMigrationAcceptSendsPlanAndPrintsTable(t *testing.T) {
 		t.Fatalf("empty --source-region err = %v", err)
 	}
 }
+
+func TestAdminMigrationAcceptHandlesEmptyBody(t *testing.T) {
+	withIsolatedHome(t)
+	clearProvisionEnv(t)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer ts.Close()
+
+	stdout, err := captureStdoutE(t, func() error {
+		return Admin([]string{
+			"migration", "accept", "plan_acme",
+			"--server", ts.URL,
+			"--tidbcloud-public-key", "tgt-pub",
+			"--tidbcloud-private-key", "tgt-priv",
+		})
+	})
+	if err != nil {
+		t.Fatalf("accept empty body (table): %v", err)
+	}
+	if strings.TrimSpace(stdout) != "ok" {
+		t.Fatalf("table stdout = %q, want ok", stdout)
+	}
+
+	jsonOut, err := captureStdoutE(t, func() error {
+		return Admin([]string{
+			"migration", "accept", "plan_acme",
+			"--server", ts.URL,
+			"--tidbcloud-public-key", "tgt-pub",
+			"--tidbcloud-private-key", "tgt-priv",
+			"--json",
+		})
+	})
+	if err != nil {
+		t.Fatalf("accept empty body (--json): %v", err)
+	}
+	if strings.TrimSpace(jsonOut) != "{}" {
+		t.Fatalf("json stdout = %q, want {}", jsonOut)
+	}
+}

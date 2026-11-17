@@ -14,9 +14,12 @@ import (
 	"strings"
 	"syscall"
 	"text/tabwriter"
+	"time"
 
 	"github.com/mem9-ai/drive9/pkg/client"
 )
+
+const adminMigrationAcceptTimeout = 30 * time.Second
 
 // AdminMigration implements `drive9 admin migration`. It is the customer-facing
 // control surface for the cross-cloud tenant migration; the controller and the
@@ -222,7 +225,9 @@ func adminMigrationAccept(args []string) error {
 	if err != nil {
 		return err
 	}
-	raw, err := client.New(server, "").AdminAcceptMigrationPlan(context.Background(), client.AdminMigrationAcceptRequest{
+	ctx, cancel := context.WithTimeout(context.Background(), adminMigrationAcceptTimeout)
+	defer cancel()
+	raw, err := client.New(server, "").AdminAcceptMigrationPlan(ctx, client.AdminMigrationAcceptRequest{
 		Credentials:  creds,
 		PlanID:       planID,
 		SourceRegion: strings.TrimSpace(sourceRegion),
@@ -733,6 +738,11 @@ type adminMigrationAcceptView struct {
 }
 
 func printAdminMigrationAccept(raw json.RawMessage) error {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 {
+		_, err := fmt.Fprintln(os.Stdout, "ok")
+		return err
+	}
 	var view adminMigrationAcceptView
 	if err := json.Unmarshal(raw, &view); err != nil {
 		return fmt.Errorf("decode migration plan acceptance: %w", err)

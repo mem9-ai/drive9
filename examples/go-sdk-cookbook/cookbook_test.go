@@ -741,6 +741,19 @@ func ExampleClient_extentDataPlane() {
 	}
 }
 
+func ExampleClient_adminMigration() {
+	ctx := context.Background()
+	targetAdmin := drive9.New("https://target.drive9.example.com", "")
+	_, _ = targetAdmin.AdminAcceptMigrationPlan(ctx, drive9.AdminMigrationAcceptRequest{
+		Credentials: drive9.AdminMigrationCredentials{
+			PublicKey:  "target-tidbcloud-public-key",
+			PrivateKey: "target-tidbcloud-private-key",
+		},
+		PlanID:       "plan-1",
+		SourceRegion: "ap-beijing",
+	})
+}
+
 var coveredClientMethods = map[string]bool{
 	"AdminCreateTenant":                    true,
 	"AdminCreateTenantPool":                true,
@@ -929,6 +942,7 @@ var coveredClientMethods = map[string]bool{
 
 	// Migration V1 client contract.
 	"BatchStatWithOptionsCtx":                               true,
+	"AdminAcceptMigrationPlan":                              true,
 	"AdminCreateMigrationBatch":                             true,
 	"AdminGetMigrationBatch":                                true,
 	"AdminGetMigrationTenant":                               true,
