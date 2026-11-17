@@ -48,9 +48,20 @@ const ExtentChunkSize = int64(1 << 26)
 // ranges are cut into blocks of at most this size before a patch commit.
 const ExtentBlockSize = int64(4 << 20)
 
-// Centralized extent v2 server error wire contract (mirrors tidbcloud/fs/pkg/server).
+// Centralized extent v2 server error wire contract (verified against tidbcloud/fs/pkg/server).
 // Classifiers match HTTP status + optional machine-readable StatusError.Code first,
-// then fall back to these pinned server wire literals.
+// then fall back to these pinned server wire literals:
+//   - HTTP 409 Conflict: ErrExtentLayoutMismatch ("content layout mismatch...") on
+//     V2 upload initiate (server.go:5926, extent_maintenance.go:220).
+//   - HTTP 400 Bad Request / 501 Not Implemented: s3client.ErrLengthBoundedPresignUnsupported
+//     ("store cannot enforce a declared upload length at write time", extent_blocks.go:268)
+//     when surfaced as a client/capability status on presign-batch. (Note: until
+//     tidbcloud/fs registers ErrLengthBoundedPresignUnsupported in ClientCausedSentinels,
+//     handleV2PresignBatch at server.go:6076 masks it behind 500 "internal storage error".)
+//   - HTTP 400 Bad Request: "total_size must be positive" on V2 upload initiate
+//     (tidbcloud/fs server.go:5891, drive9 server.go:4617).
+//   - HTTP 500 Internal Server Error: exact "internal storage error" from handleWrite's
+//     errJSONInternalStorage (tidbcloud/fs server.go:8345) when direct PUT hits a sticky extent inode.
 const (
 	extentErrCodeLayoutMismatch           = "extent_layout_mismatch"
 	extentErrMsgLayoutMismatch            = "content layout mismatch"
@@ -770,7 +781,7 @@ func isExtentLayoutMismatchError(err error) bool {
 
 func isExtentPresignUnsupportedError(err error) bool {
 	var se *StatusError
-	if !errors.As(err, &se) || se.StatusCode != http.StatusBadRequest {
+	if !errors.As(err, &se) || (se.StatusCode != http.StatusBadRequest && se.StatusCode != http.StatusNotImplemented) {
 		return false
 	}
 	if se.Code == extentErrCodePresignLengthUnsupported {
@@ -1098,7 +1109,7 @@ func (c *Client) writeExtentBytesConditional(ctx context.Context, path string, d
 					metaOpts.Description = &desc
 				}
 				if merr := c.SetMetadataCtx(ctx, path, metaOpts); merr != nil {
-					return 0, merr
+					return 0, fmt.Errorf("apply metadata to %s (0-byte content written, tags/description not applied): %w", path, merr)
 				}
 			}
 			if landedRev > 0 && callerSink != nil {
@@ -1152,12 +1163,9 @@ func (c *Client) fallbackZeroSizeExtentWrite(ctx context.Context, path string, e
 		if expectedResourceOf(ctx) != "" {
 			return 0, fmt.Errorf("%s: %w", path, ErrResourceMismatch)
 		}
-		rev, _, native, err := c.CreateExtentFileCreatedCtx(ctx, path)
+		rev, err := c.createNativeExtentFileCtx(ctx, path)
 		if err != nil {
 			return 0, err
-		}
-		if !native {
-			return 0, fmt.Errorf("server does not support 0-byte extent file creation on %s", path)
 		}
 		if rev > 0 {
 			if out := completedRevisionSinkOf(ctx); out != nil {
@@ -1187,12 +1195,9 @@ func (c *Client) fallbackZeroSizeExtentWrite(ctx context.Context, path string, e
 			if expectedResourceOf(ctx) != "" {
 				return 0, fmt.Errorf("%s: %w", path, ErrResourceMismatch)
 			}
-			rev, _, native, cerr := c.CreateExtentFileCreatedCtx(ctx, path)
+			rev, cerr := c.createNativeExtentFileCtx(ctx, path)
 			if cerr != nil {
 				return 0, cerr
-			}
-			if !native {
-				return 0, fmt.Errorf("server does not support 0-byte extent file creation on %s", path)
 			}
 			if rev > 0 {
 				if out := completedRevisionSinkOf(ctx); out != nil {
@@ -1209,6 +1214,37 @@ func (c *Client) fallbackZeroSizeExtentWrite(ctx context.Context, path string, e
 	}
 	setZeroSummary()
 	return updated.Revision, nil
+}
+
+// createNativeExtentFileCtx issues POST ?create=1&layout=extent without falling
+// back to classic ?create=1, cleaning up best-effort if a legacy server ignored
+// layout=extent and created a single-layout placeholder.
+func (c *Client) createNativeExtentFileCtx(ctx context.Context, path string) (int64, error) {
+	req, err := c.newFSRequest(ctx, http.MethodPost, path, "?create=1&layout=extent", nil)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return 0, readError(resp)
+	}
+	var result struct {
+		Revision      int64  `json:"revision"`
+		ResourceID    string `json:"resource_id"`
+		ContentLayout string `json:"content_layout"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil && !errors.Is(err, io.EOF) {
+		return 0, fmt.Errorf("decode create extent file response: %w", err)
+	}
+	if ContentLayout(result.ContentLayout) != ContentLayoutExtent {
+		_ = c.DeleteFileConditionalCtx(ctx, path, result.Revision, result.ResourceID)
+		return 0, fmt.Errorf("server does not support 0-byte extent file creation on %s", path)
+	}
+	return result.Revision, nil
 }
 
 type extentAppendSlice struct {

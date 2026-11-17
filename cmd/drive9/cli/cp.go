@@ -443,60 +443,52 @@ func Cp(c *client.Client, args []string) error {
 }
 
 func resolveRemoteCopyTarget(ctx context.Context, c *client.Client, remotePath, sourceBase string) (string, error) {
-	if strings.HasSuffix(remotePath, "/") {
-		if sourceBase == "" {
-			return "", fmt.Errorf("destination %q requires a file name", remotePath)
-		}
-		return pathpkg.Join(remotePath, sourceBase), nil
-	}
-	info, err := c.StatCtx(ctx, remotePath)
-	if err == nil && info.IsDir {
-		if sourceBase == "" {
-			return "", fmt.Errorf("destination %q requires a file name", remotePath)
-		}
-		return pathpkg.Join(remotePath, sourceBase), nil
-	}
-	if err != nil && !client.IsNotFound(err) {
-		return "", err
-	}
-	return remotePath, nil
+	resolved, _, _, err := resolveRemoteCopyTargetCore(ctx, c, remotePath, sourceBase)
+	return resolved, err
 }
 
 // resolveRemoteCopyTargetWithLayout resolves a remote upload destination path
 // and observes any existing leaf file's ContentLayout so uploads preserve
 // sticky layouts and reject contradictory --layout flags up front.
 func resolveRemoteCopyTargetWithLayout(ctx context.Context, c *client.Client, remotePath, sourceBase string) (string, client.ContentLayout, error) {
-	statLeaf := func(leaf string) (string, client.ContentLayout, error) {
-		leafInfo, lerr := c.StatCtx(ctx, leaf)
-		if lerr != nil && !client.IsNotFound(lerr) {
-			return "", "", lerr
-		}
-		if lerr == nil && leafInfo != nil && !leafInfo.IsDir {
-			return leaf, leafInfo.ContentLayout, nil
-		}
-		return leaf, "", nil
+	resolved, resolvedFromDir, directInfo, err := resolveRemoteCopyTargetCore(ctx, c, remotePath, sourceBase)
+	if err != nil {
+		return "", "", err
 	}
+	if !resolvedFromDir {
+		if directInfo != nil && !directInfo.IsDir {
+			return resolved, directInfo.ContentLayout, nil
+		}
+		return resolved, "", nil
+	}
+	leafInfo, lerr := c.StatCtx(ctx, resolved)
+	if lerr != nil && !client.IsNotFound(lerr) {
+		return "", "", lerr
+	}
+	if lerr == nil && leafInfo != nil && !leafInfo.IsDir {
+		return resolved, leafInfo.ContentLayout, nil
+	}
+	return resolved, "", nil
+}
+
+func resolveRemoteCopyTargetCore(ctx context.Context, c *client.Client, remotePath, sourceBase string) (string, bool, *client.StatResult, error) {
 	if strings.HasSuffix(remotePath, "/") {
 		if sourceBase == "" {
-			return "", "", fmt.Errorf("destination %q requires a file name", remotePath)
+			return "", false, nil, fmt.Errorf("destination %q requires a file name", remotePath)
 		}
-		return statLeaf(pathpkg.Join(remotePath, sourceBase))
+		return pathpkg.Join(remotePath, sourceBase), true, nil, nil
 	}
 	info, err := c.StatCtx(ctx, remotePath)
 	if err == nil && info.IsDir {
 		if sourceBase == "" {
-			return "", "", fmt.Errorf("destination %q requires a file name", remotePath)
+			return "", false, nil, fmt.Errorf("destination %q requires a file name", remotePath)
 		}
-		return statLeaf(pathpkg.Join(remotePath, sourceBase))
+		return pathpkg.Join(remotePath, sourceBase), true, nil, nil
 	}
 	if err != nil && !client.IsNotFound(err) {
-		return "", "", err
+		return "", false, nil, err
 	}
-	var targetLayout client.ContentLayout
-	if err == nil && info != nil && !info.IsDir {
-		targetLayout = info.ContentLayout
-	}
-	return remotePath, targetLayout, nil
+	return remotePath, false, info, nil
 }
 
 func wrapExplicitLayoutError(layout string, err error) error {

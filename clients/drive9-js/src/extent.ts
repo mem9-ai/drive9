@@ -17,9 +17,15 @@ export const ExtentChunkSize = 64 * 1024 * 1024;
 export const ExtentBlockSize = 4 * 1024 * 1024;
 
 /**
- * Centralized extent v2 server error wire contract (mirrors tidbcloud/fs/pkg/server):
- * classifiers match HTTP status + optional machine `code` first, then the pinned
- * server wire literal so prose is never scattered across call sites.
+ * Centralized extent v2 server error wire contract (verified against tidbcloud/fs/pkg/server):
+ * - HTTP 409 Conflict: ErrExtentLayoutMismatch ("content layout mismatch...") on V2 upload initiate.
+ * - HTTP 400 Bad Request / 501 Not Implemented: ErrLengthBoundedPresignUnsupported
+ *   ("store cannot enforce a declared upload length at write time") when surfaced as a client/capability
+ *   status on presign-batch. (Until tidbcloud/fs registers ErrLengthBoundedPresignUnsupported in
+ *   ClientCausedSentinels, handleV2PresignBatch at server.go:6076 masks it behind 500 "internal storage error".)
+ * - HTTP 400 Bad Request: "total_size must be positive" on V2 upload initiate.
+ * - HTTP 500 Internal Server Error: exact "internal storage error" from handleWrite's errJSONInternalStorage
+ *   when direct PUT hits a sticky extent inode.
  */
 export const EXTENT_ERR_CODE_LAYOUT_MISMATCH = "extent_layout_mismatch";
 export const EXTENT_ERR_MSG_LAYOUT_MISMATCH = "content layout mismatch";
@@ -156,7 +162,7 @@ export function isExtentLayoutMismatchError(err: unknown): boolean {
 }
 
 export function isExtentPresignUnsupportedError(err: unknown): boolean {
-  if (!(err instanceof StatusError) || err.statusCode !== 400) {
+  if (!(err instanceof StatusError) || (err.statusCode !== 400 && err.statusCode !== 501)) {
     return false;
   }
   if (err.code === EXTENT_ERR_CODE_PRESIGN_LENGTH_UNSUPPORTED) {
@@ -975,11 +981,8 @@ export async function writeExtentBytesImpl(
         if (options.expectedResourceId) {
           throw new ResourceMismatchError(path);
         }
-        const created = await createExtentFileImpl(client, path);
-        if (!created.native_extent) {
-          throw new Drive9Error(`server does not support 0-byte extent file creation on ${path}`);
-        }
-        result = { revision: created.revision, partSize: 0, totalParts: 0, uploadedParts: 0 };
+        const rev = await createNativeExtentFileImpl(client, path);
+        result = { revision: rev, partSize: 0, totalParts: 0, uploadedParts: 0 };
       } else if (options.expectedRevision > 0) {
         const rev = await commitExtentPatchImpl(client, path, 0, [], options.expectedRevision, options.expectedResourceId);
         result = { revision: rev, partSize: 0, totalParts: 0, uploadedParts: 0 };
@@ -1006,15 +1009,21 @@ export async function writeExtentBytesImpl(
           if (options.expectedResourceId) {
             throw new ResourceMismatchError(path);
           }
-          const created = await createExtentFileImpl(client, path);
-          if (!created.native_extent) {
-            throw new Drive9Error(`server does not support 0-byte extent file creation on ${path}`);
-          }
-          result = { revision: created.revision, partSize: 0, totalParts: 0, uploadedParts: 0 };
+          const rev = await createNativeExtentFileImpl(client, path);
+          result = { revision: rev, partSize: 0, totalParts: 0, uploadedParts: 0 };
         }
       }
       if (options.tags || options.description) {
-        await setFileMetadataImpl(client, path, options.tags, options.description);
+        try {
+          await setFileMetadataImpl(client, path, options.tags, options.description);
+        } catch (merr) {
+          throw new Drive9Error(
+            `apply metadata to ${path} (0-byte content written, tags/description not applied): ${
+              merr instanceof Error ? merr.message : String(merr)
+            }`,
+            { cause: merr }
+          );
+        }
       }
       return result;
     }
@@ -1036,6 +1045,22 @@ export async function writeExtentBytesImpl(
     await abortUploadV2BestEffort(client, plan.upload_id);
     throw err;
   }
+}
+
+async function createNativeExtentFileImpl(client: Client, path: string): Promise<number> {
+  const resp = await fetch(`${client.fsUrl(path)}?create=1&layout=extent`, {
+    method: "POST",
+    headers: client.authHeaders(),
+  });
+  await checkError(resp);
+  const body = (await resp.json().catch(() => undefined)) as
+    | { revision?: number; resource_id?: string; content_layout?: string }
+    | undefined;
+  if (body?.content_layout !== "extent") {
+    await deleteFileConditionalImpl(client, path, body?.revision || 0, body?.resource_id || "").catch(() => {});
+    throw new Drive9Error(`server does not support 0-byte extent file creation on ${path}`);
+  }
+  return body.revision || 0;
 }
 
 async function setFileMetadataImpl(

@@ -1011,6 +1011,36 @@ describe("Extent layout v2 support in TypeScript SDK", () => {
     expect(directTruncSt.revision).toBe(99); // truncateExtentImpl re-stats for StatResult parity
     server.resetHandlers();
 
+    // Rejected ?create=1&layout=extent does NOT fall back to classic ?create=1, and setmeta failure notes partial outcome.
+    let classicCreateFallbackCalled = false;
+    server.use(
+      http.post("http://localhost:9009/v2/uploads/initiate", () =>
+        HttpResponse.json({ error: "total_size must be positive" }, { status: 400 })
+      ),
+      http.post("http://localhost:9009/v1/fs/reject-ext-create.bin", ({ request }) => {
+        if (new URL(request.url).searchParams.get("layout") === "extent") {
+          return HttpResponse.json({ error: "scoped query rejected" }, { status: 403 });
+        }
+        classicCreateFallbackCalled = true;
+        return HttpResponse.json({ revision: 1 }, { status: 201 });
+      }),
+      http.head("http://localhost:9009/v1/fs/setmeta-fail.bin", () => new HttpResponse(null, { status: 404 })),
+      http.post("http://localhost:9009/v1/fs/setmeta-fail.bin", ({ request }) => {
+        if (new URL(request.url).searchParams.has("setmeta")) {
+          return HttpResponse.json({ error: "tags forbidden" }, { status: 403 });
+        }
+        return HttpResponse.json({ revision: 1, resource_id: "r1", content_layout: "extent" }, { status: 201 });
+      })
+    );
+    await expect(
+      writeExtentBytesImpl(client, "/reject-ext-create.bin", new Uint8Array(0), { expectedRevision: 0 })
+    ).rejects.toMatchObject({ statusCode: 403 });
+    expect(classicCreateFallbackCalled).toBe(false);
+    await expect(
+      writeExtentBytesImpl(client, "/setmeta-fail.bin", new Uint8Array(0), { expectedRevision: -1, tags: { k: "v" } })
+    ).rejects.toThrow(/0-byte content written, tags\/description not applied/);
+    server.resetHandlers();
+
     // 5. Multi-block commitExtentPatchImpl drains all in-flight PUT workers before aborting and replanning.
     let block2FinishedBeforeAbort = false;
     let block2Finished = false;

@@ -877,6 +877,22 @@ func TestExtentReviewRegressions(t *testing.T) {
 					return
 				}
 				_, _ = w.Write([]byte(`{"status":"ok"}`))
+			case r.Method == http.MethodPost && r.URL.Path == "/v1/fs/reject-ext-create.bin":
+				if r.URL.Query().Get("layout") == string(ContentLayoutExtent) {
+					w.WriteHeader(http.StatusForbidden)
+					_, _ = w.Write([]byte(`{"error":"scoped query rejected"}`))
+					return
+				}
+				t.Errorf("unexpected classic ?create=1 fallback on rejected native extent create")
+				w.WriteHeader(http.StatusInternalServerError)
+			case r.Method == http.MethodPost && r.URL.Path == "/v1/fs/setmeta-fail.bin" && r.URL.Query().Has("create"):
+				w.WriteHeader(http.StatusCreated)
+				_, _ = w.Write([]byte(`{"revision":1,"resource_id":"r1","content_layout":"extent"}`))
+			case r.Method == http.MethodPost && r.URL.Path == "/v1/fs/setmeta-fail.bin" && r.URL.Query().Has("setmeta"):
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = w.Write([]byte(`{"error":"tags forbidden"}`))
+			case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/setmeta-fail.bin":
+				w.WriteHeader(http.StatusNotFound)
 			case r.Method == http.MethodGet && r.URL.Path == "/v1/fs/header-rev.bin":
 				w.Header().Set("X-Dat9-Content-Layout", string(ContentLayoutExtent))
 				if strings.HasPrefix(r.Header.Get("Range"), "bytes=4-") {
@@ -944,8 +960,17 @@ func TestExtentReviewRegressions(t *testing.T) {
 			t.Fatalf("ReadAll(header-rev) err = %v, want revision 5 -> 6 drift error", rerr)
 		}
 
-		// 5. Unconditional 0B extent write with tags/description applies ?setmeta=1; conditional 0B rejects upfront;
-		// expectedRevision == 0 with expectedResource rejects before create.
+		// 5. Unconditional 0B extent write with tags/description applies ?setmeta=1 (reporting partial outcome if setmeta fails);
+		// conditional 0B rejects upfront; expectedRevision == 0 with expectedResource rejects before create;
+		// rejected ?create=1&layout=extent does NOT create a classic single-layout placeholder.
+		_, err = c.writeExtentBytesConditional(context.Background(), "/reject-ext-create.bin", nil, 0, nil, "", nil, nil)
+		if !IsForbidden(err) {
+			t.Fatalf("writeExtentBytesConditional(rejected extent create) err = %v, want 403 StatusError without classic fallback", err)
+		}
+		_, err = c.writeExtentBytesConditional(context.Background(), "/setmeta-fail.bin", nil, -1, map[string]string{"k": "v"}, "", nil, nil)
+		if err == nil || !strings.Contains(err.Error(), "0-byte content written, tags/description not applied") {
+			t.Fatalf("writeExtentBytesConditional(setmeta fail) err = %v, want partial-outcome message", err)
+		}
 		_, err = c.writeExtentBytesConditional(WithExpectedResource(context.Background(), "res-old"), "/create-zero.bin", nil, 0, nil, "", nil, nil)
 		if !errors.Is(err, ErrResourceMismatch) {
 			t.Fatalf("writeExtentBytesConditional(0B rev=0 with expectedResource) err = %v, want ErrResourceMismatch", err)
