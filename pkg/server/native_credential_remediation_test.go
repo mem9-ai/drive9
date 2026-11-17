@@ -526,6 +526,21 @@ func TestNativeCredentialRemediationRecoversFromUnpersistedRotation(t *testing.T
 	const tenantID = "native-recovery"
 	rt.insertRemediationTenantWithPassword(t, tenantID, tenant.ProviderTiDBCloudNative, f.tenantUser, f.password)
 
+	// The legacy shape: the restricted account exists and shares the cluster root password,
+	// so "the retired password is refused" later is a change of state and not an account that
+	// was never there.
+	for _, stmt := range []string{
+		"CREATE USER '" + f.tenantUser + "'@'%' IDENTIFIED BY '" + f.password + "'",
+		"GRANT SELECT ON `" + rt.dbName + "`.* TO '" + f.tenantUser + "'@'%'",
+	} {
+		if _, err := f.admin.ExecContext(ctx, stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	if err := pingAs(t, rt, f.tenantUser, f.password); err != nil {
+		t.Fatalf("the legacy account does not accept the shared root password before rotation: %v", err)
+	}
+
 	// Reproduce the window exactly: apply the database half and leave metadata untouched.
 	dsn := tenantDSN(f.tenantUser, f.password, rt.dbHost, rt.dbPort, rt.dbName, false, tenant.ProviderTiDBCloudNative)
 	rotatedPassword, rotated, err := tidbcloudnative.RotateLegacySystemUserCredential(ctx, dsn, tenantID)
