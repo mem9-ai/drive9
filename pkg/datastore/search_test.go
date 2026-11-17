@@ -70,3 +70,89 @@ func TestBuildVectorSearchByTextQuerySkipsEmptyQuery(t *testing.T) {
 		t.Fatalf("expected empty query text to short-circuit, got query=%q args=%#v", q, args)
 	}
 }
+
+// The full-text search text is quoted into the statement rather than bound (the TiDB
+// full-text planner reads it from the function argument while it plans), so the quoting
+// itself is the security boundary. It must keep every input inside one string literal and
+// must not silently rewrite what the user searched for.
+func TestFTSQueryLiteralEscapesWithoutRewriting(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		query string
+		want  string
+	}{
+		{name: "plain", query: "needle", want: `'needle'`},
+		{name: "apostrophe", query: "it's", want: `'it''s'`},
+		{name: "quote then statement", query: "'; DROP TABLE file_nodes; --", want: `'''; DROP TABLE file_nodes; --'`},
+		{name: "backslash", query: `a\`, want: `'a\\'`},
+		{name: "backslash before quote", query: `a\'b`, want: `'a\\''b'`},
+		{name: "comment markers stay searchable", query: "a--b/*c*/", want: `'a--b/*c*/'`},
+		{name: "semicolon stays searchable", query: "a;b", want: `'a;b'`},
+		{name: "unicode", query: "蓝牙耳机", want: `'蓝牙耳机'`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ftsQueryLiteral(tc.query)
+			if err != nil {
+				t.Fatalf("ftsQueryLiteral(%q): %v", tc.query, err)
+			}
+			if got != tc.want {
+				t.Fatalf("ftsQueryLiteral(%q) = %s, want %s", tc.query, got, tc.want)
+			}
+			if !closesAsOneLiteral(got) {
+				t.Fatalf("ftsQueryLiteral(%q) = %s does not render as a single closed literal", tc.query, got)
+			}
+		})
+	}
+	if _, err := ftsQueryLiteral("a\x00b"); err == nil || !strings.Contains(err.Error(), "NUL") {
+		t.Fatalf("ftsQueryLiteral with a NUL byte error = %v, want a refusal", err)
+	}
+}
+
+// closesAsOneLiteral replays the parser's view of a single-quoted MySQL literal: it must
+// open and close with the delimiter, and every interior quote must appear doubled. A quote
+// that is not doubled would end the literal early, which is the injection this guards
+// against.
+func closesAsOneLiteral(literal string) bool {
+	if len(literal) < 2 || literal[0] != '\'' || literal[len(literal)-1] != '\'' {
+		return false
+	}
+	body := literal[1 : len(literal)-1]
+	for i := 0; i < len(body); i++ {
+		if body[i] != '\'' {
+			continue
+		}
+		if i+1 >= len(body) || body[i+1] != '\'' {
+			return false
+		}
+		i++
+	}
+	return true
+}
+
+func TestBuildFTSSearchQueryInlinesTheQuotedQuery(t *testing.T) {
+	literal, err := ftsQueryLiteral("it's 50% off -- really")
+	if err != nil {
+		t.Fatal(err)
+	}
+	q, args := buildFTSSearchQuery(StandaloneScope(), literal, "/docs/", 5)
+	for _, want := range []string{
+		"fts_match_word('it''s 50% off -- really', content_text)",
+		"fts_match_word('it''s 50% off -- really', description)",
+	} {
+		if !strings.Contains(q, want) {
+			t.Fatalf("full-text search SQL missing %q: %s", want, q)
+		}
+	}
+	if got, want := strings.Count(q, "?"), len(args); got != want {
+		t.Fatalf("placeholders = %d, args = %d, want one arg per placeholder", got, want)
+	}
+	for _, arg := range args {
+		if text, ok := arg.(string); ok && strings.Contains(text, "it's") {
+			t.Fatalf("search text %q is bound as an argument as well as quoted into the statement", text)
+		}
+	}
+	wantArgs := []any{5, "/docs", "/docs/%"}
+	if !reflect.DeepEqual(args, wantArgs) {
+		t.Fatalf("args = %#v, want the limit and then the path subtree", args)
+	}
+}

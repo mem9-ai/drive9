@@ -2,6 +2,8 @@ package datastore
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -265,20 +267,13 @@ func buildVectorSearchDescriptionByTextQueryScoped(scope Scope, queryText, pathP
 	return q, args, true
 }
 
-func ftsSafe(s string) string {
-	s = strings.ReplaceAll(s, `\`, `\\`)
-	s = strings.ReplaceAll(s, `'`, `''`)
-	s = strings.ReplaceAll(s, `;`, "")
-	s = strings.ReplaceAll(s, `--`, "")
-	s = strings.ReplaceAll(s, `/*`, "")
-	s = strings.ReplaceAll(s, `*/`, "")
-	s = strings.ReplaceAll(s, "\x00", "")
-	return s
-}
-
 // FTSSearch runs a full-text search over files.content_text and files.description.
 func (s *Store) FTSSearch(ctx context.Context, query, pathPrefix string, limit int) ([]SearchResult, error) {
-	q, allArgs := buildFTSSearchQuery(s.scope, ftsSafe(query), pathPrefix, limit)
+	literal, err := ftsQueryLiteral(query)
+	if err != nil {
+		return nil, err
+	}
+	q, allArgs := buildFTSSearchQuery(s.scope, literal, pathPrefix, limit)
 	rows, err := s.db.QueryContext(ctx, q, allArgs...)
 	if err != nil {
 		return nil, err
@@ -301,11 +296,41 @@ func (s *Store) FTSSearch(ctx context.Context, query, pathPrefix string, limit i
 	return out, nil
 }
 
-// buildFTSSearchQuery assembles the full-text search query for the given
-// schema-shape scope. safeQuery must already be escaped with ftsSafe.
-func buildFTSSearchQuery(scope Scope, safeQuery, pathPrefix string, limit int) (string, []any) {
-	contentExpr := "fts_match_word('" + safeQuery + "', content_text)"
-	descExpr := "fts_match_word('" + safeQuery + "', description)"
+// ErrInvalidFTSQuery means the search text cannot be represented in a statement.
+var ErrInvalidFTSQuery = errors.New("full-text search query is not usable")
+
+// ftsQueryLiteral renders search text as one MySQL string literal for fts_match_word.
+//
+// The text has to be part of the statement instead of a bind parameter, and that is a
+// property of the full-text planner, not a shortcut: TiDB reads the search text out of the
+// function argument while it builds the plan (it records that constant as the FTS query text
+// it sends to the columnar index), so a `?` placeholder would hand the index an empty query
+// and every full-text search would silently match nothing. Quoting therefore happens here,
+// once, and has to be right rather than merely defensive:
+//
+//   - a literal quote is escaped by doubling it, which is valid both with and without
+//     NO_BACKSLASH_ESCAPES;
+//   - a backslash is doubled so it cannot escape the closing quote in the default sql_mode
+//     (under NO_BACKSLASH_ESCAPES it simply stays a backslash);
+//   - nothing is stripped. Deleting substrings that "look dangerous" changes what the user
+//     searched for and hides the attempt instead of making it inert — `don't`, `a--b` and
+//     `x/*y` are ordinary search text.
+func ftsQueryLiteral(query string) (string, error) {
+	if strings.IndexByte(query, 0) >= 0 {
+		// A NUL cannot be quoted portably: the text and binary protocols disagree about
+		// whether it survives as data, and it is never part of a real query.
+		return "", fmt.Errorf("%w: it contains a NUL byte", ErrInvalidFTSQuery)
+	}
+	query = strings.ReplaceAll(query, `\`, `\\`)
+	query = strings.ReplaceAll(query, `'`, `''`)
+	return "'" + query + "'", nil
+}
+
+// buildFTSSearchQuery assembles the full-text search query for the given schema-shape
+// scope. literal is the search text already rendered by ftsQueryLiteral.
+func buildFTSSearchQuery(scope Scope, literal, pathPrefix string, limit int) (string, []any) {
+	contentExpr := "fts_match_word(" + literal + ", content_text)"
+	descExpr := "fts_match_word(" + literal + ", description)"
 
 	innerQ := `SELECT inode_id, MAX(score) AS score FROM (
 		SELECT inode_id, ` + contentExpr + ` AS score
