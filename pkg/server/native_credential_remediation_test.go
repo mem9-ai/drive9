@@ -134,91 +134,10 @@ func TestNativeCredentialRemediationScanPagesAndClassifies(t *testing.T) {
 // account the stored credential authenticates as.
 func TestNativeCredentialRemediationRotatesLegacyCredential(t *testing.T) {
 	rt := newObjectGCTestRuntime(t)
-	if rt.dbUser != "root" {
-		t.Skip("needs the test TiDB root account to create the tenant principals")
-	}
+	f := setupLegacyNativeAccount(t, rt)
 	ctx := context.Background()
-	admin, err := sql.Open("mysql", testDSN)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Close last: the cleanup below needs a live handle, and a bare defer would run
-	// before t.Cleanup and leave the fixture's privileged principal behind.
-	t.Cleanup(func() { _ = admin.Close() })
 
-	const role = "tdc_fs_admin"
-	const password = "drive9-retire-test"
-	// A principal unique to this run: the fixture then never has to delete an account it
-	// did not create, and cannot leave a fixed-name privileged principal behind either.
-	// The name has to keep the <prefix>.root form the remediation derives from
-	// <prefix>.tdc_fs_sys.
-	prefix := "ti" + strconv.FormatInt(time.Now().UnixNano(), 36)
-	rootUser := prefix + ".root"
-	tenantUser := prefix + ".tdc_fs_sys"
-	// The revoke targets the fixed production role, so a cluster that already has it is
-	// not a safe fixture: setup would add a grant and the pass would strip a grant that
-	// belongs to real tenants. Refuse instead of mutating a shared instance.
-	var probe string
-	if err := admin.QueryRowContext(ctx, "SHOW GRANTS FOR '"+role+"'").Scan(&probe); err == nil {
-		t.Skipf("role %s already exists on this cluster", role)
-	} else if !tidbcloudnative.IsMissingGrantError(err) {
-		t.Fatalf("probe role %s: %v", role, err)
-	}
-	// The stored credential has to authenticate as <prefix>.root, and that principal
-	// needs the privilege WITH GRANT OPTION to revoke it from the role.
-	// Teardown first: a mid-setup failure must not leave the privileged principal or the
-	// cluster-wide role grant behind on a persistent instance. Everything it does is
-	// idempotent, and it only undoes what setup actually created.
-	var roleCreated, principalCreated bool
-	t.Cleanup(func() {
-		ctx := context.Background()
-		if roleCreated {
-			if _, err := admin.ExecContext(ctx, "REVOKE SYSTEM_VARIABLES_ADMIN ON *.* FROM '"+role+"'"); err != nil && !tidbcloudnative.IsMissingGrantError(err) {
-				t.Errorf("cleanup: revoke role grant: %v", err)
-			}
-		}
-		if roleCreated {
-			if _, err := admin.ExecContext(ctx, "DROP ROLE IF EXISTS '"+role+"'"); err != nil {
-				t.Errorf("cleanup: drop role: %v", err)
-			}
-		}
-		// The pass creates the restricted account itself, so clean it up too.
-		if _, err := admin.ExecContext(ctx, "DROP USER IF EXISTS '"+tenantUser+"'@'%'"); err != nil {
-			t.Errorf("cleanup: drop tenant principal: %v", err)
-		}
-		if principalCreated {
-			if _, err := admin.ExecContext(ctx, "DROP USER IF EXISTS '"+rootUser+"'@'%'"); err != nil {
-				t.Errorf("cleanup: drop privileged principal: %v", err)
-			}
-		}
-	})
-	setup := []struct {
-		stmt string
-		flag *bool
-	}{
-		{"CREATE USER '" + rootUser + "'@'%' IDENTIFIED BY '" + password + "'", &principalCreated},
-		{"GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO '" + rootUser + "'@'%' WITH GRANT OPTION", nil},
-		// The rotation runs the full tenant setup through this principal — create the role,
-		// create the account, grant the role and switch its password — so it needs the
-		// global privileges a real cluster root has.
-		{"GRANT ALL PRIVILEGES ON *.* TO '" + rootUser + "'@'%' WITH GRANT OPTION", nil},
-		// The remediation DSN names the tenant database, so the root principal needs
-		// access to it as a real cluster root would.
-		{"GRANT ALL ON `" + rt.dbName + "`.* TO '" + rootUser + "'@'%'", nil},
-		{"CREATE ROLE IF NOT EXISTS '" + role + "'", &roleCreated},
-		{"GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO '" + role + "'", nil},
-		{"GRANT SELECT ON `" + rt.dbName + "`.* TO '" + role + "'", nil},
-	}
-	for _, step := range setup {
-		if _, err := admin.ExecContext(ctx, step.stmt); err != nil {
-			t.Fatalf("%s: %v", step.stmt, err)
-		}
-		if step.flag != nil {
-			*step.flag = true
-		}
-	}
-
-	rt.insertRemediationTenantWithPassword(t, "native-revocable", tenant.ProviderTiDBCloudNative, tenantUser, password)
+	rt.insertRemediationTenantWithPassword(t, "native-revocable", tenant.ProviderTiDBCloudNative, f.tenantUser, f.password)
 
 	srv := &Server{meta: rt.meta, pool: rt.pool}
 	srv.remediateNativeTenantCredentials(ctx)
@@ -229,7 +148,7 @@ func TestNativeCredentialRemediationRotatesLegacyCredential(t *testing.T) {
 	if !srv.nativeCredentialRemediationRecentlyDone("native-revocable") {
 		t.Fatal("the tenant was not memoized after the rotation")
 	}
-	grants := roleGrants(t, admin, role)
+	grants := roleGrants(t, f.admin, f.role)
 	if containsGrant(grants, "SYSTEM_VARIABLES_ADMIN") {
 		t.Fatalf("legacy cluster-wide grant survived: %v", grants)
 	}
@@ -240,16 +159,16 @@ func TestNativeCredentialRemediationRotatesLegacyCredential(t *testing.T) {
 	// The account must no longer accept the cluster root password, and the credential the
 	// pass persisted must work: the tenant would otherwise be locked out of its database.
 	rotated := rt.tenantCredential(t, "native-revocable")
-	if rotated == password {
+	if rotated == f.password {
 		t.Fatal("the tenant account still uses the cluster root password")
 	}
 	if len(rotated) != 32 {
 		t.Fatalf("derived credential = %q, want a 32-character derived secret", rotated)
 	}
-	if err := pingAs(t, rt, tenantUser, password); err == nil {
+	if err := pingAs(t, rt, f.tenantUser, f.password); err == nil {
 		t.Fatal("the rotated account still accepts the cluster root password")
 	}
-	if err := pingAs(t, rt, tenantUser, rotated); err != nil {
+	if err := pingAs(t, rt, f.tenantUser, rotated); err != nil {
 		t.Fatalf("the persisted credential does not authenticate: %v", err)
 	}
 	// The outcome is recorded, so the next leader does not dial this tenant again.
@@ -493,5 +412,156 @@ func TestFinalizeRecordsRemediatedCredential(t *testing.T) {
 	}
 	if got := rt.tenantCredential(t, tenantID); got != "derived-pass" {
 		t.Fatalf("stored credential = %q, want the provisioner's derived password", got)
+	}
+}
+
+// legacyNativeAccount is the live fixture the remediation needs: a cluster-root principal
+// standing in for the account a legacy credential authenticates as, plus the fixed role the
+// setup revokes from.
+type legacyNativeAccount struct {
+	admin      *sql.DB
+	role       string
+	rootUser   string
+	tenantUser string
+	password   string
+}
+
+// setupLegacyNativeAccount creates that fixture and registers its teardown. It skips when the
+// cluster cannot host it: the test TiDB has to be reachable as root, and the fixed production
+// role must not already exist, since setup would otherwise add a grant the pass then strips
+// from a real tenant.
+func setupLegacyNativeAccount(t *testing.T, rt *objectGCTestRuntime) *legacyNativeAccount {
+	t.Helper()
+	if rt.dbUser != "root" {
+		t.Skip("needs the test TiDB root account to create the tenant principals")
+	}
+	ctx := context.Background()
+	admin, err := sql.Open("mysql", testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Close last: the cleanup below needs a live handle, and a bare defer would run before
+	// t.Cleanup and leave the fixture's privileged principal behind.
+	t.Cleanup(func() { _ = admin.Close() })
+
+	const role = "tdc_fs_admin"
+	const password = "drive9-retire-test"
+	// A principal unique to this run, so the fixture never deletes an account it did not
+	// create. The name has to keep the <prefix>.root form the remediation derives from
+	// <prefix>.tdc_fs_sys.
+	prefix := "ti" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	f := &legacyNativeAccount{
+		admin:      admin,
+		role:       role,
+		rootUser:   prefix + ".root",
+		tenantUser: prefix + ".tdc_fs_sys",
+		password:   password,
+	}
+	var probe string
+	if err := admin.QueryRowContext(ctx, "SHOW GRANTS FOR '"+role+"'").Scan(&probe); err == nil {
+		t.Skipf("role %s already exists on this cluster", role)
+	} else if !tidbcloudnative.IsMissingGrantError(err) {
+		t.Fatalf("probe role %s: %v", role, err)
+	}
+	// Teardown first: a mid-setup failure must not leave the privileged principal or the
+	// cluster-wide role grant behind on a persistent instance.
+	var roleCreated, principalCreated bool
+	t.Cleanup(func() {
+		ctx := context.Background()
+		if roleCreated {
+			if _, err := admin.ExecContext(ctx, "REVOKE SYSTEM_VARIABLES_ADMIN ON *.* FROM '"+role+"'"); err != nil && !tidbcloudnative.IsMissingGrantError(err) {
+				t.Errorf("cleanup: revoke role grant: %v", err)
+			}
+			if _, err := admin.ExecContext(ctx, "DROP ROLE IF EXISTS '"+role+"'"); err != nil {
+				t.Errorf("cleanup: drop role: %v", err)
+			}
+		}
+		// The pass creates the restricted account itself, so clean it up too.
+		if _, err := admin.ExecContext(ctx, "DROP USER IF EXISTS '"+f.tenantUser+"'@'%'"); err != nil {
+			t.Errorf("cleanup: drop tenant principal: %v", err)
+		}
+		if principalCreated {
+			if _, err := admin.ExecContext(ctx, "DROP USER IF EXISTS '"+f.rootUser+"'@'%'"); err != nil {
+				t.Errorf("cleanup: drop privileged principal: %v", err)
+			}
+		}
+	})
+	setup := []struct {
+		stmt string
+		flag *bool
+	}{
+		{"CREATE USER '" + f.rootUser + "'@'%' IDENTIFIED BY '" + password + "'", &principalCreated},
+		{"GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO '" + f.rootUser + "'@'%' WITH GRANT OPTION", nil},
+		// The rotation runs the full tenant setup through this principal — create the role,
+		// create the account, grant the role and switch its password — so it needs the global
+		// privileges a real cluster root has.
+		{"GRANT ALL PRIVILEGES ON *.* TO '" + f.rootUser + "'@'%' WITH GRANT OPTION", nil},
+		// The remediation DSN names the tenant database, so the root principal needs access to
+		// it as a real cluster root would.
+		{"GRANT ALL ON `" + rt.dbName + "`.* TO '" + f.rootUser + "'@'%'", nil},
+		{"CREATE ROLE IF NOT EXISTS '" + role + "'", &roleCreated},
+		{"GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO '" + role + "'", nil},
+		{"GRANT SELECT ON `" + rt.dbName + "`.* TO '" + role + "'", nil},
+	}
+	for _, step := range setup {
+		if _, err := admin.ExecContext(ctx, step.stmt); err != nil {
+			t.Fatalf("%s: %v", step.stmt, err)
+		}
+		if step.flag != nil {
+			*step.flag = true
+		}
+	}
+	return f
+}
+
+// A rotation changes the database password before the metadata write. If that write fails or
+// the pod dies between the two, the tenant's stored credential is behind its database until a
+// retry lands. The retry has to be able to finish the job: the derived password is a pure
+// function of the (unchanged) root secret and the tenant, so re-running the same rotation is
+// idempotent rather than a second different password.
+func TestNativeCredentialRemediationRecoversFromUnpersistedRotation(t *testing.T) {
+	rt := newObjectGCTestRuntime(t)
+	f := setupLegacyNativeAccount(t, rt)
+	ctx := context.Background()
+	const tenantID = "native-recovery"
+	rt.insertRemediationTenantWithPassword(t, tenantID, tenant.ProviderTiDBCloudNative, f.tenantUser, f.password)
+
+	// Reproduce the window exactly: apply the database half and leave metadata untouched.
+	dsn := tenantDSN(f.tenantUser, f.password, rt.dbHost, rt.dbPort, rt.dbName, false, tenant.ProviderTiDBCloudNative)
+	rotatedPassword, rotated, err := tidbcloudnative.RotateLegacySystemUserCredential(ctx, dsn, tenantID)
+	if err != nil || !rotated || rotatedPassword == "" {
+		t.Fatalf("apply the rotation: password=%q rotated=%v err=%v", rotatedPassword, rotated, err)
+	}
+	if got := rt.tenantCredential(t, tenantID); got != f.password {
+		t.Fatalf("metadata credential = %q, want the stale one in this window", got)
+	}
+	if err := pingAs(t, rt, f.tenantUser, f.password); err == nil {
+		t.Fatal("the database still accepts the retired password, so there is no window to recover from")
+	}
+
+	// The next pass must notice, re-apply the same rotation and persist it. Recovery is the
+	// point of deriving the password instead of generating one.
+	srv := &Server{meta: rt.meta, pool: rt.pool}
+	srv.remediateNativeTenantCredentials(ctx)
+
+	if srv.nativeCredentialRemediationBackoff(tenantID) {
+		t.Fatal("the retry after an unpersisted rotation failed")
+	}
+	recovered := rt.tenantCredential(t, tenantID)
+	if recovered == f.password {
+		t.Fatal("the retry did not persist the rotated credential")
+	}
+	if recovered != rotatedPassword {
+		t.Fatalf("recovered credential differs from the applied rotation, so a retry would rotate again")
+	}
+	if err := pingAs(t, rt, f.tenantUser, recovered); err != nil {
+		t.Fatalf("the tenant cannot connect with its persisted credential after recovery: %v", err)
+	}
+	state, _, err := rt.meta.TenantCredentialState(ctx, tenantID)
+	if err != nil {
+		t.Fatalf("read recorded credential state: %v", err)
+	}
+	if state != meta.TenantCredentialRemediated {
+		t.Fatalf("recorded credential state = %d, want remediated", state)
 	}
 }
