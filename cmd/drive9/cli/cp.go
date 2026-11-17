@@ -48,6 +48,7 @@ func Cp(c *client.Client, args []string) error {
 	recursive := false
 	force := false
 	layerRef := ""
+	layout := ""
 	var tags map[string]string
 	var description string
 	filtered := make([]string, 0, len(args))
@@ -70,6 +71,14 @@ func Cp(c *client.Client, args []string) error {
 			layerRef = strings.TrimSpace(args[i])
 		case strings.HasPrefix(a, "--layer="):
 			layerRef = strings.TrimSpace(strings.TrimPrefix(a, "--layer="))
+		case a == "--layout":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--layout requires extent or single")
+			}
+			i++
+			layout = strings.TrimSpace(args[i])
+		case strings.HasPrefix(a, "--layout="):
+			layout = strings.TrimSpace(strings.TrimPrefix(a, "--layout="))
 		case a == "--tag":
 			if i+1 >= len(args) {
 				return fmt.Errorf("--tag requires key=value argument")
@@ -98,12 +107,15 @@ func Cp(c *client.Client, args []string) error {
 	}
 	args = filtered
 
+	if layout != "" && layout != string(client.ContentLayoutSingle) && layout != string(client.ContentLayoutExtent) {
+		return fmt.Errorf("invalid --layout %q (want extent or single)", layout)
+	}
 	if utf8.RuneCountInString(description) > backend.MaxDescriptionLen {
 		return fmt.Errorf("description exceeds %d characters", backend.MaxDescriptionLen)
 	}
 
 	if len(args) != 2 {
-		return fmt.Errorf("usage: drive9 fs cp [-r|--recursive] [-f|--force] [--auth=local|server] [--resume] [--append] [--tag key=value]... [--description <text>] <src> <dst>")
+		return fmt.Errorf("usage: drive9 fs cp [-r|--recursive] [-f|--force] [--auth=local|server] [--resume] [--append] [--layout extent|single] [--tag key=value]... [--description <text>] <src> <dst>")
 	}
 	if resume && appendMode {
 		return fmt.Errorf("--resume and --append cannot be used together")
@@ -118,6 +130,9 @@ func Cp(c *client.Client, args []string) error {
 		if resume {
 			return layerRefMustBeEmpty(layerRef, "--resume")
 		}
+		if layout != "" {
+			return layerRefMustBeEmpty(layerRef, "--layout")
+		}
 		if len(tags) > 0 {
 			return layerRefMustBeEmpty(layerRef, "--tag")
 		}
@@ -131,17 +146,23 @@ func Cp(c *client.Client, args []string) error {
 	if appendMode && description != "" {
 		return fmt.Errorf("--append and --description cannot be used together")
 	}
+	if appendMode && layout != "" {
+		return fmt.Errorf("--append and --layout cannot be used together")
+	}
 	if resume && description != "" {
 		return fmt.Errorf("--resume and --description cannot be used together")
+	}
+	if resume && layout != "" {
+		return fmt.Errorf("--resume and --layout cannot be used together")
 	}
 	// -r is intentionally orthogonal to the single-file ergonomics
 	// flags. Tree copy doesn't compose with --append (per-file
 	// append semantics ambiguous), --resume (resume is single-file
 	// multipart upload state, not tree-level), or single-file
-	// description/tags (those apply to one upload only). Reject up
+	// description/tags/layout (those apply to one upload only). Reject up
 	// front instead of silently picking which file gets the metadata.
-	if recursive && (appendMode || resume || description != "" || len(tags) > 0) {
-		return fmt.Errorf("-r/--recursive cannot be combined with --append, --resume, --tag, or --description")
+	if recursive && (appendMode || resume || description != "" || len(tags) > 0 || layout != "") {
+		return fmt.Errorf("-r/--recursive cannot be combined with --append, --resume, --layout, --tag, or --description")
 	}
 	src, dst := args[0], args[1]
 
@@ -163,10 +184,10 @@ func Cp(c *client.Client, args []string) error {
 		if resume {
 			return fmt.Errorf("--resume is not supported for object-store URIs")
 		}
-		if dstLoc.Kind != KindDrive9 && (len(tags) > 0 || description != "") {
-			return fmt.Errorf("--tag/--description are only supported for uploads to drive9")
+		if dstLoc.Kind != KindDrive9 && (len(tags) > 0 || description != "" || layout != "") {
+			return fmt.Errorf("--tag/--description/--layout are only supported for uploads to drive9")
 		}
-		return cpViaBackend(context.Background(), c, srcLoc, dstLoc, recursive, force, tags, description)
+		return cpViaBackend(context.Background(), c, srcLoc, dstLoc, recursive, force, tags, description, layout)
 	}
 	// D14: cross-context drive9 copy streams through the laptop.
 	if srcLoc.Kind == KindDrive9 && dstLoc.Kind == KindDrive9 &&
@@ -180,7 +201,7 @@ func Cp(c *client.Client, args []string) error {
 		if resume {
 			return fmt.Errorf("--resume is not supported for cross-context copy")
 		}
-		return cpViaBackend(context.Background(), c, srcLoc, dstLoc, recursive, force, tags, description)
+		return cpViaBackend(context.Background(), c, srcLoc, dstLoc, recursive, force, tags, description, layout)
 	}
 
 	if srcLoc.Scheme == SchemeFile && srcLoc.Local != "" {
@@ -201,6 +222,12 @@ func Cp(c *client.Client, args []string) error {
 		descriptionSupported := dstIsRemote && !appendMode && !resume && (src == "-" || !srcIsRemote)
 		if !descriptionSupported {
 			return fmt.Errorf("--description is only supported for local/stdin uploads to a remote path")
+		}
+	}
+	if layout != "" {
+		layoutSupported := dstIsRemote && !appendMode && !resume && (src == "-" || !srcIsRemote)
+		if !layoutSupported {
+			return fmt.Errorf("--layout is only supported for local/stdin uploads to a remote path")
 		}
 	}
 	if appendMode && src == "-" {
@@ -273,7 +300,7 @@ func Cp(c *client.Client, args []string) error {
 				return err
 			}
 		}
-		resolvedDst, err := resolveRemoteCopyTarget(ctx, c, dstRP.Path, "")
+		resolvedDst, targetLayout, err := resolveRemoteCopyTargetWithLayout(ctx, c, dstRP.Path, "")
 		if err != nil {
 			return err
 		}
@@ -293,6 +320,12 @@ func Cp(c *client.Client, args []string) error {
 		}
 		if description != "" {
 			opts = append(opts, client.WithDescription(description))
+		}
+		if layout != "" {
+			opts = append(opts, client.WithContentLayout(client.ContentLayout(layout)))
+		}
+		if targetLayout != "" {
+			opts = append(opts, client.WithTargetLayout(targetLayout))
 		}
 		summary, err := c.WriteStreamWithSummary(ctx, resolvedDst, bytes.NewReader(data), int64(len(data)), printProgress, opts...)
 		if err != nil {
@@ -322,7 +355,7 @@ func Cp(c *client.Client, args []string) error {
 				return err
 			}
 		}
-		resolvedDst, err := resolveRemoteCopyTarget(ctx, c, dstRP.Path, filepath.Base(src))
+		resolvedDst, targetLayout, err := resolveRemoteCopyTargetWithLayout(ctx, c, dstRP.Path, filepath.Base(src))
 		if err != nil {
 			return err
 		}
@@ -335,7 +368,7 @@ func Cp(c *client.Client, args []string) error {
 		if resume {
 			return resumeUploadWithTags(ctx, c, src, resolvedDst, tags)
 		}
-		return uploadFileWithTagsAndDescription(ctx, c, src, resolvedDst, tags, description)
+		return uploadFileWithOptions(ctx, c, src, resolvedDst, tags, description, client.ContentLayout(layout), targetLayout)
 
 	case srcIsRemote && !dstIsRemote:
 		if layerRef != "" {
@@ -399,23 +432,32 @@ func Cp(c *client.Client, args []string) error {
 }
 
 func resolveRemoteCopyTarget(ctx context.Context, c *client.Client, remotePath, sourceBase string) (string, error) {
+	resolved, _, err := resolveRemoteCopyTargetWithLayout(ctx, c, remotePath, sourceBase)
+	return resolved, err
+}
+
+func resolveRemoteCopyTargetWithLayout(ctx context.Context, c *client.Client, remotePath, sourceBase string) (string, client.ContentLayout, error) {
 	if strings.HasSuffix(remotePath, "/") {
 		if sourceBase == "" {
-			return "", fmt.Errorf("destination %q requires a file name", remotePath)
+			return "", "", fmt.Errorf("destination %q requires a file name", remotePath)
 		}
-		return pathpkg.Join(remotePath, sourceBase), nil
+		return pathpkg.Join(remotePath, sourceBase), "", nil
 	}
 	info, err := c.StatCtx(ctx, remotePath)
 	if err == nil && info.IsDir {
 		if sourceBase == "" {
-			return "", fmt.Errorf("destination %q requires a file name", remotePath)
+			return "", "", fmt.Errorf("destination %q requires a file name", remotePath)
 		}
-		return pathpkg.Join(remotePath, sourceBase), nil
+		return pathpkg.Join(remotePath, sourceBase), "", nil
 	}
 	if err != nil && !client.IsNotFound(err) {
-		return "", err
+		return "", "", err
 	}
-	return remotePath, nil
+	var targetLayout client.ContentLayout
+	if err == nil && info != nil && !info.IsDir {
+		targetLayout = info.ContentLayout
+	}
+	return remotePath, targetLayout, nil
 }
 
 func resolveLocalCopyTarget(localPath, sourceBase string) (string, error) {
@@ -464,6 +506,10 @@ func parseAndMergeTag(tags map[string]string, raw string) (map[string]string, er
 }
 
 func uploadFileWithTagsAndDescription(ctx context.Context, c *client.Client, localPath, remotePath string, tags map[string]string, description string) error {
+	return uploadFileWithOptions(ctx, c, localPath, remotePath, tags, description, "", "")
+}
+
+func uploadFileWithOptions(ctx context.Context, c *client.Client, localPath, remotePath string, tags map[string]string, description string, layout, targetLayout client.ContentLayout) error {
 	f, size, err := openLocalFile(localPath)
 	if err != nil {
 		return err
@@ -476,6 +522,12 @@ func uploadFileWithTagsAndDescription(ctx context.Context, c *client.Client, loc
 	}
 	if description != "" {
 		opts = append(opts, client.WithDescription(description))
+	}
+	if layout != "" {
+		opts = append(opts, client.WithContentLayout(layout))
+	}
+	if targetLayout != "" {
+		opts = append(opts, client.WithTargetLayout(targetLayout))
 	}
 	summary, err := c.WriteStreamWithSummary(ctx, remotePath, f, size, printProgress, opts...)
 	if err != nil {
@@ -550,7 +602,7 @@ func streamToStdout(ctx context.Context, c *client.Client, remotePath string) er
 	return err
 }
 
-func cpViaBackend(ctx context.Context, defaultClient *client.Client, src, dst Location, recursive bool, force bool, tags map[string]string, description string) error {
+func cpViaBackend(ctx context.Context, defaultClient *client.Client, src, dst Location, recursive bool, force bool, tags map[string]string, description string, layout string) error {
 	if src.Kind == KindObject || dst.Kind == KindObject {
 		var cancel context.CancelFunc
 		ctx, cancel = withObjectCopyTimeout(ctx)
@@ -597,11 +649,17 @@ func cpViaBackend(ctx context.Context, defaultClient *client.Client, src, dst Lo
 		if dstH.Loc.DirHint || strings.HasSuffix(dstH.Loc.Path, "/") || strings.HasSuffix(dstH.Loc.Local, string(filepath.Separator)) {
 			return fmt.Errorf("destination %q is a directory; supply a file name", dst.Raw)
 		}
+		targetLayout := ""
+		if st, err := dstH.Backend.Stat(ctx, dstH.Loc); err == nil && st != nil && !st.IsDir {
+			targetLayout = st.ContentLayout
+		}
 		wh, err := dstH.Backend.OpenWrite(ctx, dstH.Loc, WriteOpts{
-			Size:        -1,
-			Overwrite:   objectCopyOverwrite(force, dstH.Loc),
-			Tags:        tags,
-			Description: description,
+			Size:         -1,
+			Overwrite:    objectCopyOverwrite(force, dstH.Loc),
+			Tags:         tags,
+			Description:  description,
+			Layout:       layout,
+			TargetLayout: targetLayout,
 		})
 		if err != nil {
 			return err
@@ -621,20 +679,25 @@ func cpViaBackend(ctx context.Context, defaultClient *client.Client, src, dst Lo
 		return fmt.Errorf("source %q is a directory (use -r)", src.Raw)
 	}
 	finalDst := dstH.Loc
+	targetLayout := ""
 	if dstH.Loc.DirHint || strings.HasSuffix(dstH.Loc.Path, "/") || strings.HasSuffix(dstH.Loc.Local, "/") {
 		finalDst = joinDest(dstH.Loc, copyLeafName(srcH.Loc))
 	} else {
 		st, err := dstH.Backend.Stat(ctx, dstH.Loc)
 		if err == nil && st.IsDir {
 			finalDst = joinDest(dstH.Loc, copyLeafName(srcH.Loc))
+		} else if err == nil && st != nil {
+			targetLayout = st.ContentLayout
 		} else if err != nil && !errors.Is(err, objectfs.ErrNotFound) && !errors.Is(err, ErrNotFound) && !client.IsNotFound(err) && !os.IsNotExist(err) {
 			return err
 		}
 	}
 	return Copy(ctx, srcH.Backend, dstH.Backend, srcH.Loc, finalDst, info, CopyOpts{
-		Overwrite:   objectCopyOverwrite(force, finalDst),
-		Tags:        tags,
-		Description: description,
+		Overwrite:    objectCopyOverwrite(force, finalDst),
+		Tags:         tags,
+		Description:  description,
+		Layout:       layout,
+		TargetLayout: targetLayout,
 	})
 }
 

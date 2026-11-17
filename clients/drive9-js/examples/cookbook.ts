@@ -17,8 +17,10 @@ export const coveredClientMethods = new Set([
   "cancelRuntimeExecution",
   "checkpointFSLayer",
   "chmod",
+  "commitExtentPatch",
   "commitFSLayer",
   "copy",
+  "createExtentFile",
   "createFSLayer",
   "createFile",
   "createJournal",
@@ -26,6 +28,7 @@ export const coveredClientMethods = new Set([
   "delete",
   "deleteDir",
   "deleteFile",
+  "deleteFileConditional",
   "deleteFSLayer",
   "deleteGitWorkspace",
   "deleteVaultSecret",
@@ -33,9 +36,11 @@ export const coveredClientMethods = new Set([
   "downloadDir",
   "downloadToFile",
   "exec",
+  "fetchExtentBlockRange",
   "find",
   "forkFSLayer",
   "fsUrl",
+  "getExtentReadPlan",
   "getFSLayer",
   "getFSLayerCheckpoint",
   "getFSLayerEntry",
@@ -47,6 +52,7 @@ export const coveredClientMethods = new Set([
   "grep",
   "grepWithLayer",
   "hardlink",
+  "initiateExtentPatch",
   "issueScopedToken",
   "issueVaultGrant",
   "issueVaultToken",
@@ -99,6 +105,7 @@ export const coveredClientMethods = new Set([
   "statMetadataCompat",
   "status",
   "symlink",
+  "truncateExtent",
   "upsertFSLayerEntry",
   "uploadFSLayerFile",
   "upsertGitState",
@@ -144,7 +151,22 @@ export async function filesystemCookbook(client: Client): Promise<void> {
 export async function streamingCookbook(client: Client, data: Uint8Array): Promise<void> {
   await client.writeStreamWithSummary("/sdk-ts/large.bin", data, data.length, {
     tags: { example: "typescript-sdk" },
+    layout: "extent",
   });
+  const plan = await client.getExtentReadPlan("/sdk-ts/large.bin", 0, Math.max(0, data.length - 1));
+  if (plan.blocks[0]?.url) {
+    const blkStream = await client.fetchExtentBlockRange(plan.blocks[0].url, plan.blocks[0].block_offset, 1);
+    void blkStream.cancel().catch(() => {});
+  }
+  await client.commitExtentPatch(
+    "/sdk-ts/large.bin",
+    data.length,
+    [{ chunk: 0, off: 0, data: data.subarray(0, Math.min(4, data.length)) }],
+    plan.revision || 1
+  );
+  await client.truncateExtent("/sdk-ts/large.bin", 0);
+  const created = await client.createExtentFile("/sdk-ts/empty-extent.bin");
+  await client.deleteFileConditional("/sdk-ts/empty-extent.bin", created.revision, created.resource_id);
   const writer = client.newStreamWriter("/sdk-ts/manual.bin", data.length);
   await writer.writePart(1, data);
   await writer.complete(0, new Uint8Array());

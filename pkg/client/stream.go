@@ -2,6 +2,8 @@ package client
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"sync"
 )
@@ -78,6 +80,10 @@ func (sw *StreamWriter) initLocked(ctx context.Context) error {
 		return nil
 	}
 	plan, err := sw.client.initiateUploadV2(ctx, sw.path, sw.totalSize, sw.expectedRevision, sw.description)
+	if isExtentLayoutMismatchError(err) {
+		// Existing target uses sticky extent layout: open an extent sequential session.
+		plan, err = sw.client.initiateUploadV2WithLayout(ctx, sw.path, sw.totalSize, sw.expectedRevision, sw.description, string(ContentLayoutExtent))
+	}
 	if err == errV2NotAvailable {
 		return fmt.Errorf("streaming upload requires v2 protocol: %w", err)
 	}
@@ -87,6 +93,58 @@ func (sw *StreamWriter) initLocked(ctx context.Context) error {
 	sw.plan = plan
 	sw.started = true
 	return nil
+}
+
+func (sw *StreamWriter) uploadPartForPlan(ctx context.Context, plan *uploadPlanV2, partNum int, buf []byte) (completePart, error) {
+	if isExtentUploadPlan(plan) {
+		sum := sha256.Sum256(buf)
+		checksum := hex.EncodeToString(sum[:])
+		batch, err := sw.client.presignExtentChecksums(ctx, plan.UploadID, []extentPresignedBatchItem{{
+			number:   partNum,
+			checksum: checksum,
+		}})
+		if err != nil {
+			return completePart{}, fmt.Errorf("presign part %d: %w", partNum, err)
+		}
+		if !batch[0].skipUpload {
+			_, err = sw.client.uploadOnePartV2(ctx, batch[0].part, buf)
+			if err != nil {
+				if !isExtentBlockConflict(err) {
+					return completePart{}, fmt.Errorf("upload part %d: %w", partNum, err)
+				}
+				fresh, perr := sw.client.presignExtentChecksums(ctx, plan.UploadID, []extentPresignedBatchItem{{
+					number:   partNum,
+					checksum: checksum,
+				}})
+				if perr != nil {
+					return completePart{}, fmt.Errorf("re-presign part %d: %w", partNum, perr)
+				}
+				if !fresh[0].skipUpload {
+					if _, rerr := sw.client.uploadOnePartV2(ctx, fresh[0].part, buf); rerr != nil {
+						return completePart{}, fmt.Errorf("upload part %d: %w", partNum, rerr)
+					}
+				}
+			}
+		}
+		return completePart{Number: partNum, ETag: checksum}, nil
+	}
+
+	pp, err := sw.client.presignOnePart(ctx, plan.UploadID, partNum)
+	if err != nil {
+		return completePart{}, fmt.Errorf("presign part %d: %w", partNum, err)
+	}
+	etag, err := sw.client.uploadOnePartV2(ctx, *pp, buf)
+	if err == errPresignExpired {
+		pp2, err2 := sw.client.presignOnePart(ctx, plan.UploadID, partNum)
+		if err2 != nil {
+			return completePart{}, fmt.Errorf("re-presign part %d: %w", partNum, err2)
+		}
+		etag, err = sw.client.uploadOnePartV2(ctx, *pp2, buf)
+	}
+	if err != nil {
+		return completePart{}, fmt.Errorf("upload part %d: %w", partNum, err)
+	}
+	return completePart{Number: partNum, ETag: etag}, nil
 }
 
 // WritePart uploads a single part in the background. partNum is 1-based.
@@ -143,31 +201,14 @@ func (sw *StreamWriter) WritePart(ctx context.Context, partNum int, data []byte)
 		defer sw.inflight.Done()
 		defer func() { <-sw.sem }()
 
-		// Presign this part
-		pp, err := sw.client.presignOnePart(ctx, plan.UploadID, partNum)
+		cp, err := sw.uploadPartForPlan(ctx, plan, partNum, buf)
 		if err != nil {
-			sw.setError(fmt.Errorf("presign part %d: %w", partNum, err))
-			return
-		}
-
-		// Upload
-		etag, err := sw.client.uploadOnePartV2(ctx, *pp, buf)
-		if err == errPresignExpired {
-			// Retry with fresh presign
-			pp2, err2 := sw.client.presignOnePart(ctx, plan.UploadID, partNum)
-			if err2 != nil {
-				sw.setError(fmt.Errorf("re-presign part %d: %w", partNum, err2))
-				return
-			}
-			etag, err = sw.client.uploadOnePartV2(ctx, *pp2, buf)
-		}
-		if err != nil {
-			sw.setError(fmt.Errorf("upload part %d: %w", partNum, err))
+			sw.setError(err)
 			return
 		}
 
 		sw.mu.Lock()
-		sw.uploaded[partNum] = completePart{Number: partNum, ETag: etag}
+		sw.uploaded[partNum] = cp
 		sw.mu.Unlock()
 	}()
 
@@ -214,16 +255,12 @@ func (sw *StreamWriter) Complete(ctx context.Context, finalPartNum int, finalPar
 
 	// Upload final part synchronously if provided
 	if len(finalPartData) > 0 {
-		pp, err := sw.client.presignOnePart(ctx, plan.UploadID, finalPartNum)
+		cp, err := sw.uploadPartForPlan(ctx, plan, finalPartNum, finalPartData)
 		if err != nil {
-			return fmt.Errorf("presign final part %d: %w", finalPartNum, err)
-		}
-		etag, err := sw.client.uploadOnePartV2(ctx, *pp, finalPartData)
-		if err != nil {
-			return fmt.Errorf("upload final part %d: %w", finalPartNum, err)
+			return fmt.Errorf("final %w", err)
 		}
 		sw.mu.Lock()
-		sw.uploaded[finalPartNum] = completePart{Number: finalPartNum, ETag: etag}
+		sw.uploaded[finalPartNum] = cp
 		sw.mu.Unlock()
 	}
 

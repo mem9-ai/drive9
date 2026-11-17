@@ -9,10 +9,12 @@ import (
 
 // CopyOpts configures StreamCopy.
 type CopyOpts struct {
-	Overwrite   bool
-	Progress    func(n int64)
-	Tags        map[string]string
-	Description string
+	Overwrite    bool
+	Progress     func(n int64)
+	Tags         map[string]string
+	Description  string
+	Layout       string
+	TargetLayout string
 }
 
 // StreamCopy pipes src → dst without creating a whole-file tempfile.
@@ -29,10 +31,12 @@ func StreamCopy(ctx context.Context, srcB, dstB Backend, src, dst Location, srcI
 	defer func() { _ = rc.Close() }()
 
 	wh, err := dstB.OpenWrite(ctx, dst, WriteOpts{
-		Size:        size,
-		Overwrite:   opts.Overwrite,
-		Tags:        opts.Tags,
-		Description: opts.Description,
+		Size:         size,
+		Overwrite:    opts.Overwrite,
+		Tags:         opts.Tags,
+		Description:  opts.Description,
+		Layout:       opts.Layout,
+		TargetLayout: opts.TargetLayout,
 	})
 	if err != nil {
 		return fmt.Errorf("create %s: %w", dst.Raw, err)

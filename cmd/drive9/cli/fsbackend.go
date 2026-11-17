@@ -164,13 +164,14 @@ func (a *drive9FS) Stat(ctx context.Context, loc Location) (*FileInfo, error) {
 		name = "/"
 	}
 	return &FileInfo{
-		Name:    name,
-		Path:    loc.Path,
-		Size:    st.Size,
-		IsDir:   st.IsDir,
-		Mtime:   st.Mtime,
-		Mode:    st.Mode,
-		HasMode: st.HasMode,
+		Name:          name,
+		Path:          loc.Path,
+		Size:          st.Size,
+		IsDir:         st.IsDir,
+		Mtime:         st.Mtime,
+		Mode:          st.Mode,
+		HasMode:       st.HasMode,
+		ContentLayout: string(st.ContentLayout),
 	}, nil
 }
 
@@ -310,6 +311,12 @@ func (w *drive9Write) Close() error {
 	}
 	if w.opts.Description != "" {
 		opts = append(opts, client.WithDescription(w.opts.Description))
+	}
+	if w.opts.Layout != "" {
+		opts = append(opts, client.WithContentLayout(client.ContentLayout(w.opts.Layout)))
+	}
+	if w.opts.TargetLayout != "" {
+		opts = append(opts, client.WithTargetLayout(client.ContentLayout(w.opts.TargetLayout)))
 	}
 	_, err = w.a.c.WriteStreamWithSummary(w.ctx, w.loc.Path, w.f, fi.Size(), nil, opts...)
 	if err != nil {

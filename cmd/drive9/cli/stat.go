@@ -82,6 +82,9 @@ func Stat(c *client.Client, args []string) error {
 		fmt.Printf("mtime: %s\n", time.Unix(*m.Mtime, 0).UTC().Format(time.RFC3339))
 	}
 	fmt.Printf("content_type: %s\n", m.ContentType)
+	if m.ContentLayout != "" {
+		fmt.Printf("content_layout: %s\n", m.ContentLayout)
+	}
 	fmt.Printf("semantic_text: %s\n", m.SemanticText)
 	if m.Description != "" {
 		fmt.Printf("description: %s\n", m.Description)

@@ -351,7 +351,7 @@ summary, err := c.WriteStreamWithSummary(
 if err != nil {
 	return err
 }
-_ = summary.Mode // direct_put, multipart_v2, or multipart_v1
+_ = summary.Mode // direct_put, extent_v2, multipart_v2, or multipart_v1
 ```
 
 Large uploads require a seekable source:

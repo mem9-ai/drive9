@@ -1,3 +1,9 @@
+export type ContentLayout = "single" | "append_log" | "extent" | (string & {});
+export type StorageType = "db9" | "s3" | "extent" | (string & {});
+
+export const ExtentChunkSize = 64 * 1024 * 1024;
+export const ExtentBlockSize = 4 * 1024 * 1024;
+
 export interface FileInfo {
   name: string;
   size: number;
@@ -19,6 +25,8 @@ export interface StatResult {
   hasMode?: boolean;
   resource_id?: string;
   nlink?: number;
+  storage_type?: StorageType;
+  content_layout?: ContentLayout;
 }
 
 export interface StatMetadataResult {
@@ -29,7 +37,10 @@ export interface StatMetadataResult {
   revision: number;
   mtime?: number;
   content_type: string;
+  storage_type?: StorageType;
+  content_layout?: ContentLayout;
   semantic_text: string;
+  description?: string;
   tags: Record<string, string>;
   degraded?: boolean;
 }
@@ -71,8 +82,13 @@ export interface BatchReadSmallResult {
 
 export interface WriteOptions {
   expectedRevision?: number;
+  expectedResourceId?: string;
   tags?: Record<string, string>;
   description?: string;
+  /** Explicit physical content layout ("extent" or "single"). Omit for automatic selection. */
+  layout?: ContentLayout;
+  /** Observed ContentLayout of an existing destination to avoid speculative mismatch round trips. */
+  targetLayout?: ContentLayout;
 }
 
 export interface TenantStatus {
@@ -124,7 +140,7 @@ export interface UploadMeta {
 
 export interface UploadSummary {
   type: "upload";
-  mode: "direct_put" | "multipart_v1" | "multipart_v2";
+  mode: "direct_put" | "multipart_v1" | "multipart_v2" | "extent_v2";
   started_at: string;
   finished_at: string;
   elapsed_seconds: number;
@@ -211,13 +227,75 @@ export interface VaultAuditEvent {
 export interface CompletePart {
   number: number;
   etag: string;
+  chunk?: number;
+  off?: number;
+  boff?: number;
+  size?: number;
 }
 
 export interface PresignedPart {
   number: number;
   url: string;
   size: number;
+  checksum_sha256?: string;
   headers?: Record<string, unknown>;
+  skip_upload?: boolean;
+}
+
+export interface ExtentReadPlanBlock {
+  file_offset: number;
+  length: number;
+  block_key?: string;
+  block_offset: number;
+  url?: string;
+  zero?: boolean;
+}
+
+export interface ExtentReadPlan {
+  size: number;
+  revision?: number;
+  blocks: ExtentReadPlanBlock[];
+  next_offset?: number;
+}
+
+export interface ExtentDirtyBlock {
+  chunk: number;
+  off: number;
+  size: number;
+  checksum: string;
+}
+
+export interface ExtentWritePlanBlock {
+  chunk: number;
+  off: number;
+  size: number;
+  checksum: string;
+  url: string;
+  headers?: Record<string, string>;
+  exists: boolean;
+}
+
+export interface ExtentWritePlan {
+  upload_id: string;
+  new_size: number;
+  expires_at?: string;
+  blocks: ExtentWritePlanBlock[];
+  checksum_contract?: {
+    supported?: string[];
+    required?: boolean;
+  };
+}
+
+export interface ExtentBlockWrite {
+  chunk: number;
+  off: number;
+  data: Uint8Array;
+}
+
+export interface CreateExtentFileResult {
+  revision: number;
+  resource_id?: string;
+  native_extent: boolean;
 }
 
 export interface UploadPlanV2 {

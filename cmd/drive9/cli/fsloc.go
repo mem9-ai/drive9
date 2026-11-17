@@ -120,15 +120,16 @@ func (c Capability) Has(want Capability) bool {
 
 // FileInfo is a backend-neutral directory or stat entry.
 type FileInfo struct {
-	Name        string
-	Path        string
-	Size        int64
-	IsDir       bool
-	Mtime       time.Time
-	ETag        string
-	Mode        uint32
-	HasMode     bool
-	ContentType string
+	Name          string
+	Path          string
+	Size          int64
+	IsDir         bool
+	Mtime         time.Time
+	ETag          string
+	Mode          uint32
+	HasMode       bool
+	ContentType   string
+	ContentLayout string
 }
 
 // ListOpts controls one page of listing.
@@ -146,11 +147,13 @@ type ListPage struct {
 
 // WriteOpts configures OpenWrite.
 type WriteOpts struct {
-	Size        int64 // -1 = unknown
-	Overwrite   bool
-	ContentType string
-	Tags        map[string]string
-	Description string
+	Size          int64 // -1 = unknown
+	Overwrite     bool
+	ContentType   string
+	Tags          map[string]string
+	Description   string
+	Layout        string
+	TargetLayout  string
 }
 
 // WriteHandle is a streaming write that can complete or abort.

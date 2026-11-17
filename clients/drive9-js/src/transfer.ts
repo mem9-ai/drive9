@@ -1,7 +1,29 @@
-import { Client } from "./client.js";
+import type { Client } from "./client.js";
 import { bodyInit } from "./compat.js";
 import { Drive9Error, StatusError, checkError } from "./error.js";
-import type { CompletePart, PresignedPart, UploadMeta, UploadPlan, UploadPlanV2, UploadSummary, WriteOptions } from "./models.js";
+import {
+  ExtentPresignUnsupportedError,
+  abortUploadV2BestEffort,
+  initiateUploadV2WithLayout,
+  isExtentLayoutMismatchError,
+  isExtentUploadPlan,
+  mayBeExtentDirectWriteRejection,
+  serveExtentPlanStream,
+  uploadExtentSequentialImpl,
+  validateRequestedWriteLayout,
+  writeDirectOnlyImpl,
+  writeExtentBytesImpl,
+} from "./extent.js";
+import type {
+  CompletePart,
+  ExtentReadPlan,
+  PresignedPart,
+  UploadMeta,
+  UploadPlan,
+  UploadPlanV2,
+  UploadSummary,
+  WriteOptions,
+} from "./models.js";
 import { Semaphore } from "./utils.js";
 
 const PART_SIZE = 8 * 1024 * 1024;
@@ -63,7 +85,7 @@ export async function readStreamImpl(client: Client, path: string): Promise<Read
   const baseUrl = client.fsUrl(path);
   const resp = await fetch(baseUrl, {
     method: "GET",
-    headers: client["authHeaders"](),
+    headers: client["authHeaders"]({ "X-Dat9-Extent-Read-Plan": "1" }),
     redirect: "manual",
   });
   const status = resp.status;
@@ -79,6 +101,10 @@ export async function readStreamImpl(client: Client, path: string): Promise<Read
     if (!resp2.body) throw new Drive9Error("empty response body");
     return resp2.body;
   }
+  if (status < 300 && resp.headers.get("x-dat9-content-layout") === "extent") {
+    const plan = (await resp.json()) as ExtentReadPlan;
+    return serveExtentPlanStream(client, path, plan, -1, -1);
+  }
   await checkError(resp);
   if (!resp.body) throw new Drive9Error("empty response body");
   return resp.body;
@@ -90,40 +116,64 @@ export async function readStreamRangeImpl(
   offset: number,
   length: number
 ): Promise<ReadableStream<Uint8Array>> {
-  if (length <= 0) {
+  if (offset < 0) {
+    throw new Drive9Error("read offset must be >= 0");
+  }
+  if (length < 0) {
+    throw new Drive9Error("read length must be >= 0");
+  }
+  if (length === 0) {
     return new ReadableStream({
       start(controller) {
         controller.close();
       },
     });
   }
-  const resp = await fetch(client.fsUrl(path), {
+  const baseUrl = client.fsUrl(path);
+  const rangeHeader = `bytes=${offset}-${offset + length - 1}`;
+  const resp = await fetch(baseUrl, {
     method: "GET",
-    headers: client["authHeaders"](),
+    headers: client["authHeaders"]({
+      "X-Dat9-Extent-Read-Plan": "1",
+      Range: rangeHeader,
+    }),
     redirect: "manual",
   });
   const status = resp.status;
   if (status === 302 || status === 307) {
     const location = resp.headers.get("location") || resp.headers.get("Location");
     if (!location) throw new Drive9Error("302 without Location header");
-    const resp2 = await fetch(location, {
+    const absLocation = new URL(location, baseUrl).toString();
+    const resp2 = await fetch(absLocation, {
       method: "GET",
-      headers: { Range: `bytes=${offset}-${offset + length - 1}` },
+      headers: { Range: rangeHeader },
     });
     if (resp2.status === 416) {
+      await resp2.text().catch(() => "");
       return new ReadableStream({ start(c) { c.close(); } });
     }
     await checkError(resp2);
     if (!resp2.body) throw new Drive9Error("empty response body");
-    if (resp2.status === 206) return resp2.body;
+    if (resp2.status === 206) return sliceStream(resp2.body, 0, length);
     // 200: server ignored range; slice locally
     return sliceStream(resp2.body, offset, length);
+  }
+  if (status === 416) {
+    await resp.text().catch(() => "");
+    return new ReadableStream({ start(c) { c.close(); } });
+  }
+  if (status < 300 && resp.headers.get("x-dat9-content-layout") === "extent") {
+    const plan = (await resp.json()) as ExtentReadPlan;
+    return serveExtentPlanStream(client, path, plan, length, offset + length - 1);
   }
   if (resp.status >= 300) {
     await checkError(resp);
     throw new StatusError(`HTTP ${resp.status}`, resp.status);
   }
   if (!resp.body) throw new Drive9Error("empty response body");
+  if (status === 206) {
+    return sliceStream(resp.body, 0, length);
+  }
   return sliceStream(resp.body, offset, length);
 }
 
@@ -181,6 +231,7 @@ export async function writeStreamWithSummaryImpl(
   options?: number | WriteOptions
 ): Promise<UploadSummary> {
   const opts = normalizeWriteOptions(options);
+  validateRequestedWriteLayout(opts.layout);
   const started = new Date();
   const threshold = client["smallFileThreshold"];
   let data: Uint8Array;
@@ -201,16 +252,107 @@ export async function writeStreamWithSummaryImpl(
     data = await streamToUint8Array(stream, size);
     effectiveSize = data.length;
   }
-  if (effectiveSize === 0 || effectiveSize < threshold) {
-    await client.write(path, data, opts);
-    return uploadSummary(path, effectiveSize, "direct_put", started);
+
+  const forceExtent = opts.layout === "extent" || (!opts.layout && opts.targetLayout === "extent");
+  if (forceExtent && effectiveSize === 0) {
+    const res = await writeExtentBytesImpl(client, path, data, opts);
+    return uploadSummary(path, 0, "extent_v2", started, res.partSize || undefined, res.totalParts, res.uploadedParts);
   }
+  if (!forceExtent && (effectiveSize === 0 || effectiveSize < threshold)) {
+    try {
+      await writeDirectOnlyImpl(client, path, data, opts);
+      return uploadSummary(path, effectiveSize, "direct_put", started);
+    } catch (err) {
+      if (opts.layout !== "single" && mayBeExtentDirectWriteRejection(err, opts.expectedRevision)) {
+        let isExtentTarget = false;
+        try {
+          const st = await client.stat(path);
+          isExtentTarget = !st.isDir && st.content_layout === "extent";
+        } catch {
+          throw err;
+        }
+        if (isExtentTarget) {
+          const res = await writeExtentBytesImpl(client, path, data, opts);
+          return uploadSummary(
+            path,
+            effectiveSize,
+            "extent_v2",
+            started,
+            res.partSize || undefined,
+            res.totalParts,
+            res.uploadedParts
+          );
+        }
+      }
+      throw err;
+    }
+  }
+
+  const wantExtent = forceExtent || (opts.layout !== "single" && opts.targetLayout !== "single");
+  if (wantExtent) {
+    let plan: UploadPlanV2 | undefined;
+    try {
+      plan = await initiateUploadV2WithLayout(
+        client,
+        path,
+        data.length,
+        opts.expectedRevision,
+        opts.description || "",
+        "extent",
+        opts.expectedResourceId
+      );
+    } catch (initErr) {
+      if (opts.layout === "extent") {
+        throw initErr;
+      }
+      const msg = initErr instanceof Error ? initErr.message : String(initErr);
+      if (msg.includes("v2 upload API not available")) {
+        const v1Plan = await writeStreamV1(client, path, data, opts);
+        return uploadSummary(path, effectiveSize, "multipart_v1", started, v1Plan.part_size, v1Plan.parts.length, v1Plan.parts.length);
+      }
+      if (!isExtentLayoutMismatchError(initErr)) {
+        throw initErr;
+      }
+    }
+
+    if (plan) {
+      if (isExtentUploadPlan(plan) || (opts.layout === "extent" && !plan.key)) {
+        try {
+          const { uploadedParts } = await uploadExtentSequentialImpl(client, plan, data, opts.tags);
+          return uploadSummary(path, effectiveSize, "extent_v2", started, plan.part_size, plan.total_parts, uploadedParts);
+        } catch (extErr) {
+          await abortUploadV2BestEffort(client, plan.upload_id);
+          if (opts.layout === "extent" || !(extErr instanceof ExtentPresignUnsupportedError)) {
+            throw extErr;
+          }
+        }
+      } else {
+        if (opts.layout === "extent") {
+          await abortUploadV2BestEffort(client, plan.upload_id);
+          throw new Drive9Error(`server ignored layout=extent on ${path}`);
+        }
+        try {
+          const parts = await uploadPartsV2(client, plan, data);
+          await completeUploadV2(client, plan.upload_id, parts, opts.tags);
+          return uploadSummary(path, effectiveSize, "multipart_v2", started, plan.part_size, plan.total_parts, plan.total_parts);
+        } catch (classicErr) {
+          await abortUploadV2BestEffort(client, plan.upload_id);
+          throw classicErr;
+        }
+      }
+    }
+  }
+
   try {
     const plan = await writeStreamV2(client, path, data, opts);
     return uploadSummary(path, effectiveSize, "multipart_v2", started, plan.part_size, plan.total_parts, plan.total_parts);
   } catch (err) {
+    if (!opts.layout && isExtentLayoutMismatchError(err)) {
+      const res = await writeExtentBytesImpl(client, path, data, opts);
+      return uploadSummary(path, effectiveSize, "extent_v2", started, res.partSize || undefined, res.totalParts, res.uploadedParts);
+    }
     const msg = err instanceof Error ? err.message : String(err);
-    if (msg.includes("v2 upload API not available")) {
+    if (opts.layout !== "extent" && msg.includes("v2 upload API not available")) {
       const plan = await writeStreamV1(client, path, data, opts);
       return uploadSummary(path, effectiveSize, "multipart_v1", started, plan.part_size, plan.parts.length, plan.parts.length);
     } else {
@@ -221,7 +363,14 @@ export async function writeStreamWithSummaryImpl(
 
 function normalizeWriteOptions(options?: number | WriteOptions): Required<Pick<WriteOptions, "expectedRevision">> & Omit<WriteOptions, "expectedRevision"> {
   if (typeof options === "number") return { expectedRevision: options };
-  return { expectedRevision: options?.expectedRevision ?? -1, tags: options?.tags, description: options?.description };
+  return {
+    expectedRevision: options?.expectedRevision ?? -1,
+    expectedResourceId: options?.expectedResourceId,
+    tags: options?.tags,
+    description: options?.description,
+    layout: options?.layout,
+    targetLayout: options?.targetLayout,
+  };
 }
 
 function uploadSummary(
@@ -271,7 +420,15 @@ async function writeStreamV2(
   data: Uint8Array,
   options: Required<Pick<WriteOptions, "expectedRevision">> & Omit<WriteOptions, "expectedRevision">
 ): Promise<UploadPlanV2> {
-  const plan = await initiateUploadV2(client, path, data.length, options.expectedRevision, options.description || "");
+  const plan = await initiateUploadV2WithLayout(
+    client,
+    path,
+    data.length,
+    options.expectedRevision,
+    options.description || "",
+    "",
+    options.expectedResourceId
+  );
   try {
     const parts = await uploadPartsV2(client, plan, data);
     await completeUploadV2(client, plan.upload_id, parts, options.tags);
@@ -416,25 +573,6 @@ async function completeUpload(client: Client, uploadId: string, tags?: Record<st
     body,
   });
   await checkError(resp);
-}
-
-async function initiateUploadV2(
-  client: Client,
-  path: string,
-  size: number,
-  expectedRevision: number,
-  description: string
-): Promise<UploadPlanV2> {
-  const resp = await fetch(`${client.baseUrl}/v2/uploads/initiate`, {
-    method: "POST",
-    headers: client["authHeaders"]({ "Content-Type": "application/json" }),
-    body: JSON.stringify({ path, total_size: size, ...expectedRevisionPayload(expectedRevision), description }),
-  });
-  if (resp.status === 404) {
-    throw new Drive9Error("v2 upload API not available");
-  }
-  await checkError(resp);
-  return (await resp.json()) as UploadPlanV2;
 }
 
 async function uploadPartsV2(client: Client, plan: UploadPlanV2, data: Uint8Array): Promise<CompletePart[]> {

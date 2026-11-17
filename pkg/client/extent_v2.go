@@ -11,8 +11,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -248,6 +251,19 @@ func (r *extentPlanReader) Read(p []byte) (int, error) {
 			// A block may start mid-object (a plan window starts at the
 			// requested offset): narrow the presigned GET to the slice.
 			rc, err := r.c.FetchExtentBlockRange(r.ctx, blk.URL, blk.BlockOffset, blk.Length)
+			if IsPresignExpired(err) {
+				end := r.rangeEnd
+				if r.limit >= 0 {
+					if lim := blk.FileOffset + r.limit - 1; end < 0 || lim < end {
+						end = lim
+					}
+				}
+				if fresh, perr := r.c.GetExtentReadPlan(r.ctx, r.path, blk.FileOffset, end); perr == nil && len(fresh.Blocks) > 0 {
+					r.plan = fresh
+					r.bi = 0
+					continue
+				}
+			}
 			if err != nil {
 				return total, err
 			}
@@ -336,6 +352,9 @@ func (c *Client) FetchExtentBlockRange(ctx context.Context, blockURL string, off
 	default:
 		body := readPresignedErrorBody(resp)
 		_ = resp.Body.Close()
+		if resp.StatusCode == http.StatusForbidden {
+			return nil, fmt.Errorf("extent block range GET: HTTP %d: %s (%w)", resp.StatusCode, string(body), errPresignExpired)
+		}
 		return nil, fmt.Errorf("extent block range GET: HTTP %d: %s", resp.StatusCode, string(body))
 	}
 }
@@ -660,6 +679,51 @@ func isExtentBlockConflict(err error) bool {
 	return false
 }
 
+// errExtentPresignUnsupported reports that an extent session could not mint
+// length-bounded block PUT URLs on the backing store (e.g. Azure Blob), so
+// automatic callers may abort and fall back to classic V2 multipart.
+var errExtentPresignUnsupported = errors.New("extent block presign unsupported on store")
+
+// isExtentUploadPlan reports whether a V2 initiate response describes an
+// extent sequential session rather than a classic multipart session. Real
+// extent plans omit Key and require SHA-256 part checksums; classic servers
+// (and classic test fakes) either populate Key or leave Required false.
+func isExtentUploadPlan(plan *uploadPlanV2) bool {
+	return plan != nil && plan.Key == "" && plan.ChecksumContract.Required
+}
+
+func isExtentLayoutMismatchError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "content layout mismatch")
+}
+
+func isExtentPresignUnsupportedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "cannot enforce a declared upload length")
+}
+
+// mayBeExtentDirectWriteRejection reports whether a direct PUT failure may
+// have been caused by an existing extent-layout occupant at path. Create-only
+// requests (expectedRevision == 0) fail revision CAS with 409 before the
+// layout guard runs, so a 500 there is never a layout mismatch.
+func mayBeExtentDirectWriteRejection(err error, expectedRevision int64) bool {
+	if isExtentLayoutMismatchError(err) {
+		return true
+	}
+	if expectedRevision == 0 {
+		return false
+	}
+	var se *StatusError
+	if errors.As(err, &se) && se.StatusCode == http.StatusInternalServerError {
+		return strings.EqualFold(strings.TrimSpace(se.Message), "internal storage error")
+	}
+	return false
+}
+
 // WriteExtentStreamConditional uploads a whole file as an extent sequential
 // session (layout=extent, 4 MiB parts). Use for fresh large files; existing
 // extent files with small dirty sets should use CommitExtentPatch instead.
@@ -685,8 +749,28 @@ func (c *Client) WriteExtentStreamConditional(ctx context.Context, path string, 
 // skip_upload), upload the non-deduped parts in parallel (16-way), and complete
 // with the checksum etags.
 func (c *Client) uploadExtentSequential(ctx context.Context, plan *uploadPlanV2, ra io.ReaderAt, size int64, progress ProgressFunc) error {
+	return c.uploadExtentSequentialWithSummary(ctx, plan, ra, size, progress, nil, nil, nil)
+}
+
+func (c *Client) uploadExtentSequentialWithSummary(ctx context.Context, plan *uploadPlanV2, ra io.ReaderAt, size int64, progress ProgressFunc, summary *UploadSummary, tags map[string]string, preCompleteCheck func() error) error {
 	const batchParts = 32
+	if summary != nil {
+		summary.Mode = "extent_v2"
+		summary.PartSizeBytes = plan.PartSize
+		summary.TotalParts = plan.TotalParts
+		parallelism := extentPatchPutConcurrency
+		if plan.TotalParts > 0 && parallelism > plan.TotalParts {
+			parallelism = plan.TotalParts
+		}
+		if plan.TotalParts == 0 {
+			parallelism = 1
+		}
+		summary.Parallelism = parallelism
+	}
+
 	parts := make([]completePart, 0, plan.TotalParts)
+	var uploadedCount atomic.Int64
+	var checksumDur, presignDur, uploadDur time.Duration
 	var progMu sync.Mutex
 	reportProgress := func(num int, bytes int64) {
 		if progress == nil {
@@ -702,10 +786,16 @@ func (c *Client) uploadExtentSequential(ctx context.Context, plan *uploadPlanV2,
 		if last > plan.TotalParts {
 			last = plan.TotalParts
 		}
-		batch, err := c.presignExtentBatchLoaded(ctx, plan, ra, size, first, last)
+		batch, hashElapsed, presignElapsed, err := c.presignExtentBatchLoadedTimed(ctx, plan, ra, size, first, last)
+		checksumDur += hashElapsed
+		presignDur += presignElapsed
 		if err != nil {
+			if first == 1 && isExtentPresignUnsupportedError(err) {
+				return fmt.Errorf("%w: %w", errExtentPresignUnsupported, err)
+			}
 			return err
 		}
+		batchUploadStart := time.Now()
 		g, gctx := errgroup.WithContext(ctx)
 		g.SetLimit(extentPatchPutConcurrency)
 		for i := range batch {
@@ -719,6 +809,7 @@ func (c *Client) uploadExtentSequential(ctx context.Context, plan *uploadPlanV2,
 				putCtx, cancel := context.WithTimeout(gctx, extentBlockPutTimeout)
 				_, err := c.uploadOnePartV2(putCtx, item.part, item.data)
 				cancel()
+				skippedOnRetry := false
 				if err != nil {
 					if !isExtentBlockConflict(err) {
 						return err
@@ -732,7 +823,9 @@ func (c *Client) uploadExtentSequential(ctx context.Context, plan *uploadPlanV2,
 					if perr != nil {
 						return perr
 					}
-					if !fresh[0].skipUpload {
+					if fresh[0].skipUpload {
+						skippedOnRetry = true
+					} else {
 						retryCtx, retryCancel := context.WithTimeout(gctx, extentBlockPutTimeout)
 						_, rerr := c.uploadOnePartV2(retryCtx, fresh[0].part, item.data)
 						retryCancel()
@@ -741,18 +834,41 @@ func (c *Client) uploadExtentSequential(ctx context.Context, plan *uploadPlanV2,
 						}
 					}
 				}
-				reportProgress(item.number, int64(len(item.data)))
+				if skippedOnRetry {
+					reportProgress(item.number, 0)
+				} else {
+					uploadedCount.Add(1)
+					reportProgress(item.number, int64(len(item.data)))
+				}
 				return nil
 			})
 		}
 		if err := g.Wait(); err != nil {
 			return err
 		}
+		uploadDur += time.Since(batchUploadStart)
 		for _, p := range batch {
 			parts = append(parts, completePart{Number: p.number, ETag: p.checksum})
 		}
 	}
-	return c.completeUploadV2WithOptions(ctx, plan.UploadID, parts, nil, "")
+
+	if summary != nil {
+		summary.ChecksumSeconds = checksumDur.Seconds()
+		summary.PresignSeconds = presignDur.Seconds()
+		summary.UploadSeconds = uploadDur.Seconds()
+		summary.UploadedParts = int(uploadedCount.Load())
+	}
+	if err := runPreCompleteCheck(ctx, preCompleteCheck); err != nil {
+		return err
+	}
+	completeStart := time.Now()
+	if err := c.completeUploadV2WithOptions(ctx, plan.UploadID, parts, tags, ""); err != nil {
+		return err
+	}
+	if summary != nil {
+		summary.CompleteSeconds = time.Since(completeStart).Seconds()
+	}
+	return nil
 }
 
 type extentPresignedBatchItem struct {
@@ -763,19 +879,20 @@ type extentPresignedBatchItem struct {
 	number     int
 }
 
-// presignExtentBatchLoaded reads parts [first,last] once from ra, hashes them
-// concurrently, and requests their presigned URLs in one batch RPC.
-func (c *Client) presignExtentBatchLoaded(ctx context.Context, plan *uploadPlanV2, ra io.ReaderAt, size int64, first, last int) ([]extentPresignedBatchItem, error) {
+// presignExtentBatchLoadedTimed reads parts [first,last] once from ra, hashes
+// them concurrently, and requests their presigned URLs in one batch RPC.
+func (c *Client) presignExtentBatchLoadedTimed(ctx context.Context, plan *uploadPlanV2, ra io.ReaderAt, size int64, first, last int) ([]extentPresignedBatchItem, time.Duration, time.Duration, error) {
 	count := last - first + 1
 	items := make([]extentPresignedBatchItem, count)
 	for i := 0; i < count; i++ {
 		n := first + i
 		data, derr := extentPartBytes(ra, plan.PartSize, n, size)
 		if derr != nil {
-			return nil, derr
+			return nil, 0, 0, derr
 		}
 		items[i] = extentPresignedBatchItem{number: n, data: data}
 	}
+	hashStart := time.Now()
 	hg, _ := errgroup.WithContext(ctx)
 	hg.SetLimit(extentPatchPutConcurrency)
 	for i := range items {
@@ -787,7 +904,12 @@ func (c *Client) presignExtentBatchLoaded(ctx context.Context, plan *uploadPlanV
 		})
 	}
 	_ = hg.Wait()
-	return c.presignExtentChecksums(ctx, plan.UploadID, items)
+	hashDur := time.Since(hashStart)
+
+	presignStart := time.Now()
+	out, err := c.presignExtentChecksums(ctx, plan.UploadID, items)
+	presignDur := time.Since(presignStart)
+	return out, hashDur, presignDur, err
 }
 
 func (c *Client) presignExtentChecksums(ctx context.Context, uploadID string, items []extentPresignedBatchItem) ([]extentPresignedBatchItem, error) {
@@ -869,4 +991,394 @@ func extentPartBytes(ra io.ReaderAt, partSize int64, n int, total int64) ([]byte
 		return nil, fmt.Errorf("extent part %d short read: %d of %d", n, got, length)
 	}
 	return buf, nil
+}
+
+// writeExtentBytesConditional writes an in-memory payload (including 0 bytes)
+// through the extent upload plane, returning the committed revision when the
+// server echoes one. Used when the caller requests ContentLayoutExtent on a
+// small file or overwrites an existing extent-layout file via direct write.
+func (c *Client) writeExtentBytesConditional(ctx context.Context, path string, data []byte, expectedRevision int64, tags map[string]string, description string, summary *UploadSummary, preCompleteCheck func() error) (int64, error) {
+	if err := validateTags(tags); err != nil {
+		return 0, err
+	}
+	var landedRev int64
+	rctx := WithCompletedRevisionSink(ctx, &landedRev)
+	size := int64(len(data))
+
+	initiateStart := time.Now()
+	plan, err := c.initiateUploadV2WithLayout(rctx, path, size, expectedRevision, description, string(ContentLayoutExtent))
+	if err != nil {
+		// Compatibility with pre-0B-initiate extent servers when no tags or
+		// description need to ride V2 initiate/complete.
+		if size == 0 && tags == nil && description == "" && isZeroSizeExtentInitiateError(err) {
+			return c.fallbackZeroSizeExtentWrite(rctx, path, expectedRevision, summary, preCompleteCheck)
+		}
+		return 0, err
+	}
+	if summary != nil {
+		summary.InitiateSeconds = time.Since(initiateStart).Seconds()
+	}
+	if plan.Key != "" {
+		c.abortUploadV2BestEffort(rctx, plan.UploadID)
+		return 0, fmt.Errorf("server ignored layout=extent on %s", path)
+	}
+	if err := c.uploadExtentSequentialWithSummary(rctx, plan, bytes.NewReader(data), size, nil, summary, tags, preCompleteCheck); err != nil {
+		c.abortUploadV2BestEffort(rctx, plan.UploadID)
+		return 0, err
+	}
+	return landedRev, nil
+}
+
+func isZeroSizeExtentInitiateError(err error) bool {
+	var se *StatusError
+	if !errors.As(err, &se) || se.StatusCode != http.StatusBadRequest {
+		return false
+	}
+	return strings.Contains(strings.ToLower(se.Message), "total_size must be positive")
+}
+
+func (c *Client) fallbackZeroSizeExtentWrite(ctx context.Context, path string, expectedRevision int64, summary *UploadSummary, preCompleteCheck func() error) (int64, error) {
+	if err := runPreCompleteCheck(ctx, preCompleteCheck); err != nil {
+		return 0, err
+	}
+	if expectedRevision == 0 {
+		rev, _, native, err := c.CreateExtentFileCreatedCtx(ctx, path)
+		if err != nil {
+			return 0, err
+		}
+		if !native {
+			return 0, fmt.Errorf("server does not support 0-byte extent file creation on %s", path)
+		}
+		if summary != nil {
+			summary.Mode = "extent_v2"
+			summary.TotalParts = 0
+			summary.UploadedParts = 0
+			summary.Parallelism = 1
+		}
+		return rev, nil
+	}
+	var st *StatResult
+	if expectedRevision > 0 {
+		st = &StatResult{Revision: expectedRevision, ResourceID: expectedResourceOf(ctx), ContentLayout: ContentLayoutExtent}
+	}
+	updated, err := c.TruncateExtentConditional(ctx, path, st, 0)
+	if err != nil {
+		return 0, err
+	}
+	if summary != nil {
+		summary.Mode = "extent_v2"
+		summary.TotalParts = 0
+		summary.UploadedParts = 0
+		summary.Parallelism = 1
+	}
+	return updated.Revision, nil
+}
+
+type extentAppendSlice struct {
+	streamOff int64
+	chunk     uint32
+	off       uint32
+	size      int64
+	checksum  string
+}
+
+// buildExtentAppendSlices tiles [baseSize, baseSize+appendSize) into dirty
+// blocks that never cross a 64 MiB chunk boundary and align interior blocks on
+// the 4 MiB block grid.
+func buildExtentAppendSlices(baseSize, appendSize int64) ([]extentAppendSlice, error) {
+	finalSize := baseSize + appendSize
+	var slices []extentAppendSlice
+	for fileOff := baseSize; fileOff < finalSize; {
+		chunkEnd := (fileOff/ExtentChunkSize + 1) * ExtentChunkSize
+		blkEnd := finalSize
+		if finalSize-fileOff >= ExtentBlockSize {
+			gridEnd := (fileOff/ExtentBlockSize + 1) * ExtentBlockSize
+			if gridEnd < blkEnd {
+				blkEnd = gridEnd
+			}
+		}
+		if blkEnd > chunkEnd {
+			blkEnd = chunkEnd
+		}
+		chunk, off, ok := ChunkOffset(fileOff)
+		if !ok {
+			return nil, fmt.Errorf("invalid append offset %d", fileOff)
+		}
+		slices = append(slices, extentAppendSlice{
+			streamOff: fileOff - baseSize,
+			chunk:     chunk,
+			off:       off,
+			size:      blkEnd - fileOff,
+		})
+		fileOff = blkEnd
+	}
+	return slices, nil
+}
+
+// appendExtentStream appends appendSize bytes from r onto an existing
+// extent-layout file via an atomic PATCH session without reading existing file
+// bytes. Memory stays bounded regardless of appendSize.
+func (c *Client) appendExtentStream(ctx context.Context, path string, st *StatResult, r io.Reader, appendSize int64, progress ProgressFunc) error {
+	const inMemoryAppendCap = 16 << 20
+	var ra io.ReaderAt
+	if readerAt, ok := r.(io.ReaderAt); ok {
+		ra = readerAt
+	} else if appendSize <= inMemoryAppendCap {
+		buf := make([]byte, appendSize)
+		if _, err := io.ReadFull(r, buf); err != nil {
+			return fmt.Errorf("read append bytes: %w", err)
+		}
+		ra = bytes.NewReader(buf)
+	} else {
+		tmp, err := os.CreateTemp("", "drive9-extent-append-*")
+		if err != nil {
+			return fmt.Errorf("create append temp file: %w", err)
+		}
+		defer func() {
+			_ = tmp.Close()
+			_ = os.Remove(tmp.Name())
+		}()
+		written, err := io.Copy(tmp, io.LimitReader(r, appendSize))
+		if err != nil {
+			return fmt.Errorf("spool append data: %w", err)
+		}
+		if written != appendSize {
+			return fmt.Errorf("spool append data: got %d bytes, want %d", written, appendSize)
+		}
+		ra = tmp
+	}
+
+	slices, err := buildExtentAppendSlices(st.Size, appendSize)
+	if err != nil {
+		return err
+	}
+
+	// Hash all dirty blocks with bounded buffer memory before initiating PATCH.
+	pool := newUploadBufferPool(ExtentBlockSize, min(extentPatchPutConcurrency, max(1, len(slices))))
+	hg, hctx := errgroup.WithContext(ctx)
+	hg.SetLimit(extentPatchPutConcurrency)
+	for i := range slices {
+		i := i
+		hg.Go(func() error {
+			buf, berr := pool.get(hctx)
+			if berr != nil {
+				return berr
+			}
+			defer pool.put(buf)
+			data := buf[:slices[i].size]
+			got, rerr := ra.ReadAt(data, slices[i].streamOff)
+			if rerr != nil && rerr != io.EOF {
+				return fmt.Errorf("read append block %d: %w", i+1, rerr)
+			}
+			if int64(got) != slices[i].size {
+				return fmt.Errorf("short read for append block %d: got %d want %d", i+1, got, slices[i].size)
+			}
+			sum := sha256.Sum256(data)
+			slices[i].checksum = hex.EncodeToString(sum[:])
+			return nil
+		})
+	}
+	if err := hg.Wait(); err != nil {
+		return err
+	}
+
+	dirty := make([]ExtentDirtyBlock, len(slices))
+	for i, s := range slices {
+		dirty[i] = ExtentDirtyBlock{Chunk: s.chunk, Off: s.off, Size: s.size, Checksum: s.checksum}
+	}
+	finalSize := st.Size + appendSize
+	plan, err := c.InitiateExtentPatchExpectedResource(ctx, path, finalSize, dirty, st.Revision, st.ResourceID)
+	if err != nil {
+		return err
+	}
+
+	var progMu sync.Mutex
+	reportProgress := func(num int, bytes int64) {
+		if progress == nil {
+			return
+		}
+		progMu.Lock()
+		progress(num, len(slices), bytes)
+		progMu.Unlock()
+	}
+
+	for attempt := 0; ; attempt++ {
+		err := c.putExtentAppendSlices(ctx, plan, slices, ra, pool, reportProgress)
+		if err == nil {
+			break
+		}
+		c.abortUploadV2BestEffort(ctx, plan.UploadID)
+		if attempt > 0 || !isExtentBlockConflict(err) {
+			return err
+		}
+		if plan, err = c.InitiateExtentPatchExpectedResource(ctx, path, finalSize, dirty, st.Revision, st.ResourceID); err != nil {
+			return err
+		}
+	}
+
+	parts := make([]completePart, len(slices))
+	for i, s := range slices {
+		parts[i] = completePart{
+			Number: i + 1,
+			ETag:   s.checksum,
+			Chunk:  s.chunk,
+			Off:    s.off,
+			Size:   s.size,
+		}
+	}
+	return c.completeUploadV2WithOptions(ctx, plan.UploadID, parts, nil, "")
+}
+
+func (c *Client) putExtentAppendSlices(ctx context.Context, plan *ExtentWritePlan, slices []extentAppendSlice, ra io.ReaderAt, pool *uploadBufferPool, reportProgress func(int, int64)) error {
+	type putItem struct {
+		num     int
+		slice   extentAppendSlice
+		url     string
+		headers map[string]string
+	}
+	seenChecksum := make(map[string]struct{}, len(slices))
+	var jobs []putItem
+	for i, s := range slices {
+		d := ExtentDirtyBlock{Chunk: s.chunk, Off: s.off, Size: s.size, Checksum: s.checksum}
+		wb := extentPlanBlockFor(plan, d)
+		if wb == nil {
+			return fmt.Errorf("extent patch plan lacks block %d/%d", s.chunk, s.off)
+		}
+		if wb.Exists || wb.URL == "" {
+			reportProgress(i+1, 0)
+			continue
+		}
+		if _, dup := seenChecksum[s.checksum]; dup {
+			reportProgress(i+1, 0)
+			continue
+		}
+		seenChecksum[s.checksum] = struct{}{}
+		jobs = append(jobs, putItem{num: i + 1, slice: s, url: wb.URL, headers: wb.Headers})
+	}
+	if len(jobs) == 0 {
+		return nil
+	}
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(extentPatchPutConcurrency)
+	for _, job := range jobs {
+		job := job
+		g.Go(func() error {
+			buf, berr := pool.get(gctx)
+			if berr != nil {
+				return berr
+			}
+			defer pool.put(buf)
+			data := buf[:job.slice.size]
+			got, rerr := ra.ReadAt(data, job.slice.streamOff)
+			if rerr != nil && rerr != io.EOF {
+				return fmt.Errorf("read append block %d: %w", job.num, rerr)
+			}
+			if int64(got) != job.slice.size {
+				return fmt.Errorf("short read for append block %d: got %d want %d", job.num, got, job.slice.size)
+			}
+			if err := c.putExtentBlock(gctx, job.url, job.headers, data); err != nil {
+				return err
+			}
+			reportProgress(job.num, job.slice.size)
+			return nil
+		})
+	}
+	return g.Wait()
+}
+
+// downloadExtentToFileParallel downloads an extent-layout file using the
+// already-fetched initial read plan (plus any NextOffset continuations),
+// preallocating sparse zero runs via Truncate and writing data blocks in
+// parallel via WriteAt.
+func (c *Client) downloadExtentToFileParallel(ctx context.Context, remotePath, localPath string, out *os.File, firstPlan *ExtentReadPlan) (*DownloadSummary, error) {
+	startedAt := time.Now()
+	var dataBlocks []ExtentReadPlanBlock
+	cur := firstPlan
+	for {
+		for _, blk := range cur.Blocks {
+			if blk.Zero || blk.Length <= 0 {
+				continue
+			}
+			dataBlocks = append(dataBlocks, blk)
+		}
+		if cur.NextOffset <= 0 || cur.NextOffset >= cur.Size {
+			break
+		}
+		prevNext := cur.NextOffset
+		next, err := c.GetExtentReadPlan(ctx, remotePath, prevNext, -1)
+		if err != nil {
+			return nil, err
+		}
+		if next.NextOffset > 0 && next.NextOffset <= prevNext {
+			return nil, fmt.Errorf("extent read plan continuation did not advance at offset %d", prevNext)
+		}
+		cur = next
+	}
+
+	if err := out.Truncate(firstPlan.Size); err != nil {
+		return nil, fmt.Errorf("preallocate %s: %w", localPath, err)
+	}
+	concurrency := 1
+	if len(dataBlocks) > 0 {
+		concurrency = min(downloadMaxConcurrency, len(dataBlocks))
+		g, gctx := errgroup.WithContext(ctx)
+		g.SetLimit(concurrency)
+		for _, blk := range dataBlocks {
+			blk := blk
+			g.Go(func() error {
+				if blk.URL == "" {
+					return fmt.Errorf("extent plan block at %d has no URL", blk.FileOffset)
+				}
+				rc, err := c.FetchExtentBlockRange(gctx, blk.URL, blk.BlockOffset, blk.Length)
+				if IsPresignExpired(err) {
+					fresh, perr := c.GetExtentReadPlan(gctx, remotePath, blk.FileOffset, blk.FileOffset+blk.Length-1)
+					if perr != nil {
+						return fmt.Errorf("refresh extent read plan for %s: %w", remotePath, perr)
+					}
+					if len(fresh.Blocks) == 0 || fresh.Blocks[0].Zero || fresh.Blocks[0].URL == "" {
+						return fmt.Errorf("refreshed extent read plan for %s missing data block at %d", remotePath, blk.FileOffset)
+					}
+					fb := fresh.Blocks[0]
+					rc, err = c.FetchExtentBlockRange(gctx, fb.URL, fb.BlockOffset, blk.Length)
+				}
+				if err != nil {
+					return err
+				}
+				data, readErr := io.ReadAll(rc)
+				closeErr := rc.Close()
+				if readErr != nil {
+					return fmt.Errorf("read extent block offset=%d length=%d: %w", blk.FileOffset, blk.Length, readErr)
+				}
+				if closeErr != nil {
+					return fmt.Errorf("close extent block offset=%d length=%d: %w", blk.FileOffset, blk.Length, closeErr)
+				}
+				if int64(len(data)) != blk.Length {
+					return fmt.Errorf("short extent block read at offset=%d: got %d bytes, want %d", blk.FileOffset, len(data), blk.Length)
+				}
+				if _, err := out.WriteAt(data, blk.FileOffset); err != nil {
+					return fmt.Errorf("write extent block offset=%d length=%d: %w", blk.FileOffset, blk.Length, err)
+				}
+				return nil
+			})
+		}
+		if err := g.Wait(); err != nil {
+			return nil, err
+		}
+	}
+	if err := out.Sync(); err != nil {
+		return nil, fmt.Errorf("sync %s: %w", localPath, err)
+	}
+	finishedAt := time.Now()
+	return &DownloadSummary{
+		Type:           "download_summary",
+		Mode:           "parallel_extent_blocks",
+		Concurrency:    concurrency,
+		ChunkSizeBytes: ExtentBlockSize,
+		RangeCount:     len(dataBlocks),
+		StartedAt:      startedAt,
+		FinishedAt:     finishedAt,
+		ElapsedSeconds: finishedAt.Sub(startedAt).Seconds(),
+		RemotePath:     remotePath,
+		LocalPath:      localPath,
+	}, nil
 }

@@ -1,5 +1,6 @@
 import type { Client } from "./client.js";
 import { Drive9Error, StatusError, checkError } from "./error.js";
+import { appendExtentImpl, isExtentLayoutMismatchError } from "./extent.js";
 import type { PatchPartURL, PatchPlan, StatResult, WriteOptions } from "./models.js";
 import { uploadPatchPart } from "./patch.js";
 
@@ -48,10 +49,18 @@ export async function appendStreamImpl(
   }
 
   const expectedRevision = options?.expectedRevision ?? stat.revision;
+  if (stat.content_layout === "extent") {
+    await appendExtentImpl(client, path, stat, data, expectedRevision, options);
+    return;
+  }
   let plan: AppendPlan;
   try {
     plan = await initiateAppend(client, path, size, expectedRevision);
   } catch (err) {
+    if (isExtentLayoutMismatchError(err)) {
+      await appendExtentImpl(client, path, stat, data, expectedRevision, options);
+      return;
+    }
     if (shouldRewriteAppend(err)) {
       await appendByBoundedRewrite(client, path, stat, data, expectedRevision, options);
       return;

@@ -46,6 +46,9 @@ func (c *Client) AppendStream(ctx context.Context, path string, r io.Reader, siz
 	if finalSize < stat.Size {
 		return fmt.Errorf("append size overflows file size")
 	}
+	if stat.ContentLayout == ContentLayoutExtent {
+		return c.appendExtentStream(ctx, path, stat, r, size, progress)
+	}
 
 	partSize := s3client.CalcAdaptivePartSize(finalSize)
 	plan, err := c.initiateAppend(ctx, path, size, partSize, stat.Revision)

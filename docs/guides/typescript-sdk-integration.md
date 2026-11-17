@@ -164,7 +164,7 @@ const summary = await client.writeStreamWithSummary(
   }
 );
 
-console.log(summary.mode); // direct_put, multipart_v2, or multipart_v1
+console.log(summary.mode); // direct_put, extent_v2, multipart_v2, or multipart_v1
 ```
 
 Compare-and-set upload semantics use `expectedRevision`:

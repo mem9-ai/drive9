@@ -77,7 +77,8 @@ export class Drive9Fs implements IFileSystem {
     const resolved = await this.resolve(path, true, true);
     if (resolved.info) this.requireFile(resolved.info, path);
     const data = bytes(content, options);
-    await this.io(path, () => this.client.writeStream(this.remote(resolved.path), data, data.length));
+    const targetOpts = resolved.info?.content_layout ? { targetLayout: resolved.info.content_layout } : undefined;
+    await this.io(path, () => this.client.writeStream(this.remote(resolved.path), data, data.length, targetOpts));
   }
 
   async appendFile(path: string, content: FileContent, options?: WriteOptions): Promise<void> {
