@@ -64,26 +64,70 @@ jobs:
           sha256sum --check migration-kube-plugin-checksums.txt
           cat SHA256SUMS
 
+      - name: Sign release manifest
+        # The CLI verifies this signature before installing: a manifest served by the same
+        # origin as the binary proves integrity, not authenticity, so an unsigned release is
+        # a release that cannot be updated to. Fail closed when the key is missing.
+        env:
+          DRIVE9_RELEASE_SIGNING_KEY: ${{ secrets.DRIVE9_RELEASE_SIGNING_KEY }}
+        run: |
+          if [ -z "${DRIVE9_RELEASE_SIGNING_KEY}" ]; then
+            echo "DRIVE9_RELEASE_SIGNING_KEY is not set; refusing to publish an unsigned self-update manifest" >&2
+            exit 1
+          fi
+          go run ./cmd/drive9-release-sign dist/checksums.txt dist/release.txt
+          test -s dist/checksums.txt.sig
+          test -s dist/release.txt.sig
+          base64 -d dist/checksums.txt.sig | wc -c | grep -qx 64
+          base64 -d dist/release.txt.sig | wc -c | grep -qx 64
+          # Run the updater's own bundle check against the artifacts just signed: both
+          # signatures against the keys this release's binary embeds (read from the same
+          # file the build embeds), the digest binding release.txt to checksums.txt, and the
+          # manifest structure. A stale or mistyped secret signs happily and would publish a
+          # release no updated CLI can install; this step fails instead.
+          # The key file is passed through untouched: normalizing its separators here would
+          # check a key set the shipped binary never parses, so a file the binary cannot
+          # read would publish a release that cannot update. One line per key is fine —
+          # the parser accepts commas or whitespace.
+          KEYS="$(cat cmd/drive9/cli/update_key.txt)"
+          go run ./cmd/drive9-release-sign -verify-release -pubkey "$KEYS" dist/checksums.txt
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: us-west-2
 
+      # Two passes, binaries first. The updater fetches the manifest and its signature as two
+      # requests, and both sort ahead of the artifacts, so publishing manifests after the
+      # binaries means a reader that sees a manifest can also read the artifacts it names.
+      # Manifests get a short TTL so a rollback propagates quickly.
       - name: Upload CLI binaries to S3 (latest)
         run: |
           aws s3 sync dist/ s3://drive9-releases/latest/ \
             --exclude "*" \
             --include "drive9-*" \
             --include "kubectl-drive9-migration-*" \
-            --include "SHA256SUMS" \
-            --include "checksums.txt" \
-            --include "migration-kube-plugin-checksums.txt" \
-            --include "version" \
             --cache-control "public, max-age=300" \
             --content-type "application/octet-stream" \
             --no-progress
-          echo "Uploaded ${{ env.VERSION }} to s3://drive9-releases/latest/"
+          echo "Uploaded ${{ env.VERSION }} binaries to s3://drive9-releases/latest/"
+
+      - name: Publish release manifests to S3 (latest, last)
+        run: |
+          aws s3 sync dist/ s3://drive9-releases/latest/ \
+            --exclude "*" \
+            --include "SHA256SUMS" \
+            --include "checksums.txt" \
+            --include "checksums.txt.sig" \
+            --include "release.txt" \
+            --include "release.txt.sig" \
+            --include "migration-kube-plugin-checksums.txt" \
+            --include "version" \
+            --cache-control "public, max-age=60" \
+            --content-type "application/octet-stream" \
+            --no-progress
+          echo "Published ${{ env.VERSION }} manifests to s3://drive9-releases/latest/"
           aws s3 ls s3://drive9-releases/latest/
 
       - name: Invalidate CloudFront cache

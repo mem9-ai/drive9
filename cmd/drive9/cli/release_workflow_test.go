@@ -1,7 +1,10 @@
 package cli
 
 import (
+	"bytes"
+	"crypto/ed25519"
 	"crypto/sha256"
+	"encoding/base64"
 	"fmt"
 	"os"
 	"os/exec"
@@ -10,6 +13,8 @@ import (
 	"testing"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/mem9-ai/drive9/internal/releasesign"
 )
 
 func TestCLIReleasePublishesLegacyManifests(t *testing.T) {
@@ -40,10 +45,55 @@ func TestCLIReleasePublishesLegacyManifests(t *testing.T) {
 	if generate == "" || upload == "" {
 		t.Fatal("missing release generation/upload step")
 	}
-	for _, name := range []string{"drive9-*", "kubectl-drive9-migration-*", "version", "SHA256SUMS", "checksums.txt", "migration-kube-plugin-checksums.txt"} {
+	for _, name := range []string{"drive9-*", "kubectl-drive9-migration-*"} {
 		if !strings.Contains(upload, "--include \""+name+"\"") {
-			t.Errorf("S3 upload omits %s", name)
+			t.Errorf("S3 binary upload omits %s", name)
 		}
+	}
+	// The self-updater refuses a manifest it cannot authenticate, so a release that skips
+	// signing is a release nobody can update to.
+	var signStep, manifestUpload string
+	for _, step := range workflow.Jobs["release"].Steps {
+		switch step.Name {
+		case "Sign release manifest":
+			signStep = step.Run
+		case "Publish release manifests to S3 (latest, last)":
+			manifestUpload = step.Run
+		}
+	}
+	if signStep == "" {
+		t.Fatal("release workflow has no manifest signing step")
+	}
+	for _, want := range []string{"drive9-release-sign", "DRIVE9_RELEASE_SIGNING_KEY", "exit 1"} {
+		if !strings.Contains(signStep, want) {
+			t.Errorf("signing step omits %q", want)
+		}
+	}
+	// Signing is not enough: the published pair must pass the updater's own bundle check
+	// against the key the release binary embeds, read from the same file the build embeds.
+	for _, want := range []string{"-verify-release", "cmd/drive9/cli/update_key.txt", "dist/checksums.txt"} {
+		if !strings.Contains(signStep, want) {
+			t.Errorf("signing step does not verify the full release bundle: missing %q", want)
+		}
+	}
+	if strings.Contains(signStep, "-verify -pubkey") {
+		t.Error("signing step verifies the two files separately instead of using the bundle check, so the digest binding and the manifest structure go unchecked")
+	}
+	// Binaries first, manifests last: the updater reads the manifest pair in two requests and
+	// both sort ahead of the artifacts.
+	if manifestUpload == "" {
+		t.Fatal("release workflow has no separate manifest upload step")
+	}
+	if strings.Contains(upload, `--include "checksums.txt"`) || strings.Contains(upload, `--include "SHA256SUMS"`) {
+		t.Error("binary upload still publishes the manifest, so the manifest can appear before its artifacts")
+	}
+	for _, name := range []string{"checksums.txt", "checksums.txt.sig", "release.txt", "release.txt.sig", "SHA256SUMS", "version"} {
+		if !strings.Contains(manifestUpload, `--include "`+name+`"`) {
+			t.Errorf("manifest upload omits %s", name)
+		}
+	}
+	if !strings.Contains(manifestUpload, "max-age=60") {
+		t.Error("manifest upload should use a short cache TTL so a rollback propagates")
 	}
 	for _, failure := range []string{"none", "checksum mismatch", "missing manifest"} {
 		t.Run(failure, func(t *testing.T) {
@@ -68,6 +118,7 @@ func TestCLIReleasePublishesLegacyManifests(t *testing.T) {
 				sum := sha256.Sum256(payload)
 				line := fmt.Sprintf("%x  %s\n", sum, artifact.binary)
 				all.WriteString(line)
+				manifestBody := line
 				if failure == "checksum mismatch" && artifact.manifest == "checksums.txt" {
 					payload = []byte("changed binary")
 				}
@@ -75,7 +126,7 @@ func TestCLIReleasePublishesLegacyManifests(t *testing.T) {
 					t.Fatal(err)
 				}
 				if failure != "missing manifest" || artifact.manifest != "checksums.txt" {
-					if err := os.WriteFile(filepath.Join(dist, artifact.manifest), []byte(line), 0600); err != nil {
+					if err := os.WriteFile(filepath.Join(dist, artifact.manifest), []byte(manifestBody), 0600); err != nil {
 						t.Fatal(err)
 					}
 				}
@@ -93,5 +144,58 @@ func TestCLIReleasePublishesLegacyManifests(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// The signing step verifies the manifest against the key file the build embeds. It has to
+// hand that file over untouched: if it normalizes separators first, a key file the shipped
+// binary cannot parse still passes the check, and the release publishes with a CLI that can
+// never update again. The parser accepts commas or whitespace, so no normalization is needed.
+func TestReleaseWorkflowVerifiesTheEmbeddedKeyFileVerbatim(t *testing.T) {
+	data, err := os.ReadFile("../../../.github/workflows/release-cli.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var workflow struct {
+		Jobs map[string]struct {
+			Steps []struct{ Name, Run string }
+		}
+	}
+	if err := yaml.Unmarshal(data, &workflow); err != nil {
+		t.Fatal(err)
+	}
+	var signStep string
+	for _, step := range workflow.Jobs["release"].Steps {
+		if step.Name == "Sign release manifest" {
+			signStep = step.Run
+		}
+	}
+	if signStep == "" {
+		t.Fatal("release workflow has no manifest signing step")
+	}
+	for _, forbidden := range []string{"tr -s", "sed 's/^,/", "paste -sd"} {
+		if strings.Contains(signStep, forbidden) {
+			t.Errorf("signing step rewrites the key file separators (%q), so it verifies a key set the shipped binary never parses", forbidden)
+		}
+	}
+	if !strings.Contains(signStep, "cat cmd/drive9/cli/update_key.txt") {
+		t.Error("signing step does not read the embedded key file verbatim")
+	}
+
+	// One key per line and comma-separated are the same key set, which is what lets the file
+	// be passed through as-is.
+	rotating := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{0x37}, ed25519.SeedSize))
+	secondPublic := base64.StdEncoding.EncodeToString(rotating.Public().(ed25519.PublicKey))
+	for _, fileBody := range []string{
+		updateTestSigningPublicKey + "\n" + secondPublic + "\n",
+		updateTestSigningPublicKey + "," + secondPublic + "\n",
+	} {
+		keys, err := releasesign.ParsePublicKeys(strings.TrimSuffix(fileBody, "\n"))
+		if err != nil {
+			t.Fatalf("key file %q: %v", fileBody, err)
+		}
+		if len(keys) != 2 {
+			t.Fatalf("key file %q parsed %d keys, want 2", fileBody, len(keys))
+		}
 	}
 }

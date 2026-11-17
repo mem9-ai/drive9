@@ -262,6 +262,12 @@ type Server struct {
 	leaderWorkerMu       sync.Mutex
 	leaderWorkersStarted bool
 	leaderWorkerStopDone chan struct{}
+	// nativePrivilegeRetire* carry per-tenant retry state for the legacy-grant
+	// cleanup, so a failing tenant is retried with backoff instead of on every pass.
+	nativePrivilegeRetireMu       sync.Mutex
+	nativePrivilegeRetireFailures map[string]int
+	nativePrivilegeRetireRetryAt  map[string]time.Time
+	nativePrivilegeRetireDone     map[string]time.Time
 	// replayWorker and expirySweepWorker are leader-gated central quota
 	// workers owned by the server (single callback owner). Started in
 	// startLeaderWorkers and stopped in stopLeaderWorkers so they follow
@@ -1007,6 +1013,29 @@ func (s *Server) startLeaderWorkers() {
 				}
 			})
 		}
+	}
+	// Periodic cleanup of the legacy cluster-wide SYSTEM_VARIABLES_ADMIN grant on
+	// native tenants, whose per-tenant setup never runs again once they are active.
+	// Deliberately outside the provisioner-gated block: the pass needs only meta and
+	// pool, and it must keep running when a deployment switched its provider and its
+	// provisioner no longer constructs — which is exactly the state that leaves old
+	// native tenants behind. Periodic rather than one-shot so a tenant that becomes
+	// active later, or a failed attempt, is retried without waiting for a leadership
+	// change.
+	if s.meta != nil && s.pool != nil {
+		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
+			ticker := time.NewTicker(nativePrivilegeRetireInterval)
+			defer ticker.Stop()
+			s.retireNativeTenantVariablesPrivilege(workerCtx)
+			for {
+				select {
+				case <-workerCtx.Done():
+					return
+				case <-ticker.C:
+					s.retireNativeTenantVariablesPrivilege(workerCtx)
+				}
+			}
+		})
 	}
 	// Central-quota workers: the server owns these as the single leader-callback
 	// owner so they start/stop with leadership transitions (previously they were
@@ -2104,6 +2133,19 @@ func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The status response is the capability negotiation surface, and every capability it
+	// carries is an owner contract (batch_write_mode_v1 enforces owner-only mode bits). An
+	// fs_scoped key must not read it: its mount would attach hasMode to every writeback and
+	// be denied per item on each cycle. The scoped allowlist never runs for this route — it
+	// is registered directly on the mux — so the refusal lives here, after authentication
+	// (a revoked scoped key still answers 401, not 403). Trade-off, accepted: a scoped
+	// client also loses inline_threshold negotiation, so its uploads take the multipart path.
+	if !statusAllowedForKey(&resolved.APIKey) {
+		metricEvent(r.Context(), "auth", "result", "scope_kind_unsupported")
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_scoped_key_denied", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID, "scope_kind", resolved.APIKey.ScopeKind)...)
+		errJSON(w, http.StatusForbidden, "status is owner-only")
+		return
+	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_ok", "tenant_id", resolved.Tenant.ID, "status", resolved.Tenant.Status)...)
 	_ = json.NewEncoder(w).Encode(TenantStatusResponse{
 		Status:          string(resolved.Tenant.Status),
@@ -2112,6 +2154,20 @@ func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 		MaxUploadBytes:  s.maxUploadBytes,
 		InlineThreshold: s.inlineThreshold,
 	})
+}
+
+// statusAllowedForKey reports whether the status capability contract may be served to
+// this token. Scoped keys are excluded: every capability it advertises is an owner
+// contract today.
+func statusAllowedForKey(key *meta.APIKey) bool {
+	if key == nil {
+		return false
+	}
+	scopeKind := key.ScopeKind
+	if scopeKind == "" {
+		scopeKind = meta.APIKeyScopeKindOwner
+	}
+	return scopeKind != meta.APIKeyScopeKindFS
 }
 
 func (s *Server) tenantStatusMessage(t *meta.Tenant) string {
@@ -3218,10 +3274,13 @@ func (s *Server) handleBatchWrite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	scope := ScopeFromContext(r.Context())
+	// chmod is owner-only for the whole request: the per-item denial and the mode fields
+	// that reach the backend both read this one decision.
+	chmodAuthorized := scope.CanChmod()
 	results := make([]batchWriteResult, len(req.Items))
 	allowedIndexes := make([]int, 0, len(req.Items))
 	backendItems := make([]backend.BatchWriteItem, 0, len(req.Items))
-	scope := ScopeFromContext(r.Context())
 	var totalBytes int64
 	for i, item := range req.Items {
 		results[i].Path = item.Path
@@ -3247,17 +3306,50 @@ func (s *Server) handleBatchWrite(w http.ResponseWriter, r *http.Request) {
 			results[i].Error = msg
 			continue
 		}
-		allowedIndexes = append(allowedIndexes, i)
-		backendItems = append(backendItems, backend.BatchWriteItem{
+		// chmod is owner-only (handleChmod), and a batch item's permission bits are the
+		// same escalation: an fs_scoped agent token would otherwise set arbitrary bits on
+		// a path it can write. Both fields count — mode is refused even without hasMode,
+		// because a silently ignored bit pattern is exactly the ambiguity a future
+		// refactor resolves in the wrong direction. Per-item 403 rather than a failed
+		// request, so the content-only items of the same batch still commit — the
+		// rejection contract BatchWriteResult documents for this capability. Ordered after
+		// the per-path authorization, as in the sibling repo: a path outside the caller's
+		// scope is answered by the scope check, not by the mode policy.
+		//
+		// This denial is only correct while a scoped token is never told the
+		// content+mode contract exists: if storage_capabilities.batch_write_mode_v1 is
+		// ever advertised, it has to be per token scope (owner only), or a scoped mount
+		// will attach hasMode to every commit and be denied on each writeback cycle.
+		if (item.HasMode || item.Mode != 0) && !chmodAuthorized {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "batch_write_mode_denied", "path", item.Path)...)
+			results[i].Status = http.StatusForbidden
+			results[i].Error = chmodOwnerOnlyMessage
+			continue
+		}
+		// The mode fields reach the backend only for a caller that may chmod. That is the
+		// same decision the denial above makes, applied to the data instead of the response:
+		// nothing below this handler — backend, mutation worker, or a future stage added
+		// between them — can observe permission bits a scoped request asked for.
+		backendItem := backend.BatchWriteItem{
 			Path:             item.Path,
 			Data:             item.Data,
 			ExpectedRevision: item.ExpectedRevision,
-			Mode:             item.Mode,
-			HasMode:          item.HasMode,
-		})
+		}
+		if chmodAuthorized {
+			backendItem.Mode = item.Mode
+			backendItem.HasMode = item.HasMode
+		}
+		allowedIndexes = append(allowedIndexes, i)
+		backendItems = append(backendItems, backendItem)
 	}
 
-	backendResults, err := b.BatchWriteCtx(r.Context(), backendItems)
+	// Only a chmod-authorized token's items may carry permission bits; the backend refuses
+	// them otherwise, so a future handler cannot skip this decision.
+	batchCtx := r.Context()
+	if chmodAuthorized {
+		batchCtx = backend.WithBatchWriteModeChanges(batchCtx)
+	}
+	backendResults, err := b.BatchWriteCtx(batchCtx, backendItems)
 	if err != nil {
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "batch_write_failed", "error", err)...)
 		errJSONInternalStorage(w, r, err)
@@ -3307,6 +3399,10 @@ func batchWriteStatusForError(err error) int {
 		return http.StatusNotFound
 	case errors.Is(err, datastore.ErrInvalidRootDentry):
 		return http.StatusBadRequest
+	case errors.Is(err, backend.ErrBatchWriteModeDenied):
+		// The backend refuses mode bits the HTTP layer did not authorize; report it as
+		// the same per-item 403 the handler's own denial uses, not a storage error.
+		return http.StatusForbidden
 	default:
 		return http.StatusInternalServerError
 	}
@@ -3315,6 +3411,11 @@ func batchWriteStatusForError(err error) int {
 func batchWriteErrorMessage(err error, status int) string {
 	if status == http.StatusInternalServerError {
 		return internalStorageErrorMessage
+	}
+	if errors.Is(err, backend.ErrBatchWriteModeDenied) {
+		// One denial, one message: the handler's own 403 and the backend defense must
+		// read the same way to a client.
+		return chmodOwnerOnlyMessage
 	}
 	return err.Error()
 }
@@ -3797,8 +3898,8 @@ func (s *Server) handleChmod(w http.ResponseWriter, r *http.Request, path string
 	// regardless of zone. The dispatcher already denies scoped tokens on
 	// POST /v1/fs/*?chmod, so reaching this handler with a scoped token
 	// indicates a defense-in-depth gap somewhere upstream — fail closed.
-	if scope := ScopeFromContext(r.Context()); scope != nil && scope.IsScoped {
-		errJSON(w, http.StatusForbidden, "chmod is owner-only")
+	if scope := ScopeFromContext(r.Context()); scope != nil && !scope.CanChmod() {
+		errJSON(w, http.StatusForbidden, chmodOwnerOnlyMessage)
 		return
 	}
 	b := backendFromRequest(r)
@@ -4922,10 +5023,14 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 			errJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		// provider=local is the loopback-only development provider and stays
-		// anonymous; every other provider requires the explicit
-		// DRIVE9_ALLOW_ANONYMOUS_PROVISION opt-in.
-		if !s.allowAnonymousProvision && provider != tenant.ProviderLocal {
+		// provider=local is the loopback-only development provider and is the one
+		// provider that stays anonymous — but only for callers on the loopback
+		// interface. Every other provider requires the explicit
+		// DRIVE9_ALLOW_ANONYMOUS_PROVISION opt-in, and a non-loopback deployment
+		// must not create tenants unauthenticated just because the local provider
+		// is selected (the startup guard only refuses that bind while generated
+		// development keys are in use).
+		if s.provisionRequiresAuthentication(r, provider) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "provision_credentials_required", "provider", provider)...)
 			metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
 			errJSON(w, http.StatusUnauthorized, "provisioning requires authentication")

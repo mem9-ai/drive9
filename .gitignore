@@ -42,6 +42,7 @@ tmp/
 /dat9
 /drive9
 /drive9-server
+/drive9-release-sign
 .gstack/
 __pycache__/
 
