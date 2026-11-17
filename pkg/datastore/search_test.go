@@ -98,10 +98,30 @@ func TestFTSQueryLiteralEscapesWithoutRewriting(t *testing.T) {
 			if got != tc.want {
 				t.Fatalf("ftsQueryLiteral(%q) = %s, want %s", tc.query, got, tc.want)
 			}
-			if !closesAsOneLiteral(got) {
+			if !closesAsOneLiteral(got, false) {
 				t.Fatalf("ftsQueryLiteral(%q) = %s does not render as a single closed literal", tc.query, got)
 			}
 		})
+	}
+	// The replay must reject the shapes a broken quoting implementation would produce, or it
+	// would green-light the very literals it is meant to catch.
+	for _, broken := range []string{`'a''`, `'a''b' OR 1=1 -- '`, `'\'' OR 1=1 -- '`, `'a\'`, `noquote`, `'`} {
+		if closesAsOneLiteral(broken, false) {
+			t.Fatalf("%q was accepted as one closed literal", broken)
+		}
+	}
+	for _, good := range []string{`''`, `'a''b'`, `'a\\'`, `'a\\''b'`} {
+		if !closesAsOneLiteral(good, false) {
+			t.Fatalf("%q was rejected as a closed literal", good)
+		}
+	}
+	// Mode matters for a trailing backslash: with escapes on it swallows the closing quote,
+	// with NO_BACKSLASH_ESCAPES it is data and the literal closes.
+	if closesAsOneLiteral(`'a\'`, false) {
+		t.Fatal("a backslash-escaped quote was accepted as closing the literal")
+	}
+	if !closesAsOneLiteral(`'a\'`, true) {
+		t.Fatal("under NO_BACKSLASH_ESCAPES a trailing backslash is data, so the literal closes")
 	}
 	if _, err := ftsQueryLiteral("a\x00b", false); err == nil || !strings.Contains(err.Error(), "NUL") {
 		t.Fatalf("ftsQueryLiteral with a NUL byte error = %v, want a refusal", err)
@@ -122,25 +142,33 @@ func TestFTSQueryLiteralEscapesWithoutRewriting(t *testing.T) {
 	}
 }
 
-// closesAsOneLiteral replays the parser's view of a single-quoted MySQL literal: it must
-// open and close with the delimiter, and every interior quote must appear doubled. A quote
-// that is not doubled would end the literal early, which is the injection this guards
-// against.
-func closesAsOneLiteral(literal string) bool {
-	if len(literal) < 2 || literal[0] != '\'' || literal[len(literal)-1] != '\'' {
+// closesAsOneLiteral replays the parser's view of a single-quoted MySQL literal. It must open
+// with the delimiter and read to the end without being closed early: `''` and, in the default
+// mode, `\` followed by any byte are escapes, so an interior quote that is neither doubled
+// nor backslash-escaped ends the literal — the breakout this guards against.
+func closesAsOneLiteral(literal string, noBackslashEscapes bool) bool {
+	if literal == "" || literal[0] != '\'' {
 		return false
 	}
-	body := literal[1 : len(literal)-1]
-	for i := 0; i < len(body); i++ {
-		if body[i] != '\'' {
-			continue
+	closed := false
+	for i := 1; i < len(literal); i++ {
+		switch literal[i] {
+		case '\\':
+			if noBackslashEscapes {
+				continue
+			}
+			// An escape consumes the next byte, so a quote after it is data.
+			i++
+		case '\'':
+			if i+1 < len(literal) && literal[i+1] == '\'' {
+				i++
+				continue
+			}
+			closed = i == len(literal)-1
+			i = len(literal)
 		}
-		if i+1 >= len(body) || body[i+1] != '\'' {
-			return false
-		}
-		i++
 	}
-	return true
+	return closed
 }
 
 func TestBuildFTSSearchQueryInlinesTheQuotedQuery(t *testing.T) {

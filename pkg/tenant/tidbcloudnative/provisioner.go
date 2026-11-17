@@ -448,31 +448,11 @@ func (p *Provisioner) EnsureDatabase(ctx context.Context, dsn string) error {
 // result is not a failure: it means the stored credential could not prove the grant state
 // (an operator rotated the root password), so the caller must not claim remediation.
 func (p *Provisioner) EnsureSystemUser(ctx context.Context, dsn, tenantID string) (string, string, bool, error) {
-	cfg, err := mysql.ParseDSN(dsn)
+	target, err := resolveSystemUserTarget(dsn, tenantID)
 	if err != nil {
-		return "", "", false, fmt.Errorf("parse native tenant DSN: %w", err)
+		return "", "", false, err
 	}
-	username, needsSetup, err := systemUsernameForCurrent(cfg.User)
-	if err != nil {
-		return "", "", false, fmt.Errorf("resolve native system username: %w", err)
-	}
-	if cfg.Passwd == "" {
-		return "", "", false, fmt.Errorf("native tenant DSN password is empty")
-	}
-	dbName, err := normalizeDatabaseName(cfg.DBName)
-	if err != nil {
-		return "", "", false, fmt.Errorf("resolve native system user database: %w", err)
-	}
-	tenantID = strings.TrimSpace(tenantID)
-	if tenantID == "" {
-		return "", "", false, fmt.Errorf("tenant id is required for native system user setup")
-	}
-	// The tenant's restricted account must never reuse the cluster root password: a
-	// leaked tenant credential would then be a credential for every database on the
-	// instance. Derive it from the root secret and the tenant instead of storing a
-	// generated one, so concurrent finalizers agree on a single value and the last
-	// ALTER cannot desync the persisted credential.
-	password := deriveSystemUserPassword(cfg.Passwd, tenantID)
+	cfg, username, dbName, needsSetup, password := target.cfg, target.username, target.dbName, target.needsSetup, target.password
 	if !needsSetup {
 		// The DSN already names the restricted account. Either this version created it
 		// (derived password) or the legacy setup did, which copied the cluster root
@@ -499,6 +479,50 @@ func (p *Provisioner) EnsureSystemUser(ctx context.Context, dsn, tenantID string
 		return "", "", false, fmt.Errorf("ensure native system user: %w", err)
 	}
 	return username, password, true, nil
+}
+
+// systemUserTarget is everything a credential setup or rotation needs from a tenant DSN, so
+// the two entry points cannot drift on how they parse one.
+type systemUserTarget struct {
+	cfg        *mysql.Config
+	username   string
+	dbName     string
+	password   string
+	needsSetup bool
+}
+
+// resolveSystemUserTarget parses the DSN and derives this tenant's credential. The derivation
+// is the reason both paths agree on one password: concurrent finalizers, a retry after a
+// partial failure and the leader's rotation all compute the same value.
+func resolveSystemUserTarget(dsn, tenantID string) (systemUserTarget, error) {
+	cfg, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		return systemUserTarget{}, fmt.Errorf("parse native tenant DSN: %w", err)
+	}
+	username, needsSetup, err := systemUsernameForCurrent(cfg.User)
+	if err != nil {
+		return systemUserTarget{}, fmt.Errorf("resolve native system username: %w", err)
+	}
+	if cfg.Passwd == "" {
+		return systemUserTarget{}, fmt.Errorf("native tenant DSN password is empty")
+	}
+	dbName, err := normalizeDatabaseName(cfg.DBName)
+	if err != nil {
+		return systemUserTarget{}, fmt.Errorf("resolve native system user database: %w", err)
+	}
+	tenantID = strings.TrimSpace(tenantID)
+	if tenantID == "" {
+		return systemUserTarget{}, fmt.Errorf("tenant id is required for native system user setup")
+	}
+	// The tenant's restricted account must never reuse the cluster root password: a leaked
+	// tenant credential would then be a credential for every database on the instance.
+	return systemUserTarget{
+		cfg:        cfg,
+		username:   username,
+		dbName:     dbName,
+		password:   deriveSystemUserPassword(cfg.Passwd, tenantID),
+		needsSetup: needsSetup,
+	}, nil
 }
 
 // deriveSystemUserPassword returns the restricted tenant account's password: a value
@@ -564,38 +588,22 @@ var ErrLegacyGrantUnverifiable = errors.New("legacy tenant grant cannot be verif
 // nothing to remediate from the stored credential. Every error is a real failure to remediate
 // and should be retried, because the stored credential is still root-equivalent.
 func RotateLegacySystemUserCredential(ctx context.Context, dsn, tenantID string) (string, bool, error) {
-	cfg, err := mysql.ParseDSN(dsn)
+	target, err := resolveSystemUserTarget(dsn, tenantID)
 	if err != nil {
-		return "", false, fmt.Errorf("parse native tenant DSN: %w", err)
+		return "", false, err
 	}
-	username, needsSetup, err := systemUsernameForCurrent(cfg.User)
-	if err != nil {
-		return "", false, fmt.Errorf("resolve native system username: %w", err)
-	}
-	if needsSetup {
+	if target.needsSetup {
 		// The DSN still names the root principal; the provisioning path owns that setup.
 		return "", false, nil
 	}
-	if cfg.Passwd == "" {
-		return "", false, fmt.Errorf("native tenant DSN password is empty")
-	}
-	dbName, err := normalizeDatabaseName(cfg.DBName)
-	if err != nil {
-		return "", false, fmt.Errorf("resolve native system user database: %w", err)
-	}
-	tenantID = strings.TrimSpace(tenantID)
-	if tenantID == "" {
-		return "", false, fmt.Errorf("tenant id is required for native system user rotation")
-	}
-	password := deriveSystemUserPassword(cfg.Passwd, tenantID)
-	rotated, err := rotateLegacySystemUser(ctx, cfg, username, dbName, password)
+	rotated, err := rotateLegacySystemUser(ctx, target.cfg, target.username, target.dbName, target.password)
 	if err != nil {
 		return "", false, err
 	}
 	if !rotated {
 		return "", false, ErrLegacyGrantUnverifiable
 	}
-	return password, true, nil
+	return target.password, true, nil
 }
 
 // isAuthenticationDeniedError reports whether the server refused the *login*: the stored

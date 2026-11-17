@@ -28,7 +28,7 @@ func TestTenantOutboxPollerShardFilter(t *testing.T) {
 	// In single-pod mode (shardFn nil → owns everything), all sharded kicks pass.
 	buses := newEventBuses()
 	k := &mockKicker{}
-	p := newTenantOutboxPoller(nil, buses, k, nil, "pod1", 0, 0)
+	p := newTenantOutboxPoller(nil, buses, k, nil, nil, "pod1", 0, 0)
 	row := meta.TenantNotifyRow{ID: 1, TenantID: "t1", WorkMask: WorkSemantic | WorkSSE, CreatedAt: time.Now()}
 	p.dispatch(context.Background(), row)
 	if len(k.kicks) != 1 {
@@ -42,7 +42,7 @@ func TestTenantOutboxPollerShardFilter(t *testing.T) {
 func TestTenantOutboxPollerPassesOrgToWorker(t *testing.T) {
 	buses := newEventBuses()
 	k := &mockKicker{}
-	p := newTenantOutboxPoller(nil, buses, k, nil, "pod1", 0, 0)
+	p := newTenantOutboxPoller(nil, buses, k, nil, nil, "pod1", 0, 0)
 	row := meta.TenantNotifyRow{ID: 1, TenantID: "tenant-outbox-org-metric", TiDBCloudOrgID: "org-outbox-metric", WorkMask: WorkFileGC, CreatedAt: time.Now()}
 	p.dispatch(context.Background(), row)
 	if len(k.kicks) != 1 {
@@ -66,7 +66,7 @@ func TestTenantOutboxPollerSSEOnlyNoKick(t *testing.T) {
 	t.Parallel()
 	buses := newEventBuses()
 	k := &mockKicker{}
-	p := newTenantOutboxPoller(nil, buses, k, nil, "pod1", 0, 0)
+	p := newTenantOutboxPoller(nil, buses, k, nil, nil, "pod1", 0, 0)
 	// SSE-only row: should wake bus but NOT kick the worker.
 	row := meta.TenantNotifyRow{ID: 1, TenantID: "t1", WorkMask: WorkSSE, CreatedAt: time.Now()}
 	p.dispatch(context.Background(), row)
@@ -85,7 +85,7 @@ func TestTenantOutboxPollerMetricsCleanupIsBroadcast(t *testing.T) {
 	k := &mockKicker{}
 	// A shard-rejected pod must still clean its local metric registry because
 	// cleanup is broadcast, unlike semantic and file-GC work.
-	p := newTenantOutboxPoller(nil, buses, k, func(string) bool { return false }, "pod1", 0, 0)
+	p := newTenantOutboxPoller(nil, buses, k, func(string) bool { return false }, nil, "pod1", 0, 0)
 	p.dispatch(context.Background(), meta.TenantNotifyRow{
 		ID:        1,
 		TenantID:  tenantID,
@@ -128,7 +128,7 @@ func TestTenantOutboxPollerAPIKeyCacheCleanupIsBroadcastWithoutDeletingMetrics(t
 	}
 
 	metrics.RecordTenantOperationWithOrg(rt.tenantID, "org-live", "event_bus", "publish", "error", 0)
-	p := newTenantOutboxPoller(rt.meta, newEventBuses(), &mockKicker{}, func(string) bool { return false }, "pod1", 0, 0)
+	p := newTenantOutboxPoller(rt.meta, newEventBuses(), &mockKicker{}, func(string) bool { return false }, nil, "pod1", 0, 0)
 	p.dispatch(ctx, meta.TenantNotifyRow{
 		ID:        1,
 		TenantID:  rt.tenantID,
@@ -157,8 +157,10 @@ func TestTenantOutboxPollerCredentialCleanupEvictsTenantCredential(t *testing.T)
 	rt := newTenantDeleteRuntime(t, tenant.ProviderTiDBZero, meta.APIKeyScopeKindOwner)
 	ctx := context.Background()
 
-	k := &credentialKicker{}
-	p := newTenantOutboxPoller(rt.meta, newEventBuses(), k, func(string) bool { return false }, "pod1", 0, 0)
+	k := &mockKicker{}
+	var invalidated []string
+	p := newTenantOutboxPoller(rt.meta, newEventBuses(), k, func(string) bool { return false },
+		func(tenantID string) { invalidated = append(invalidated, tenantID) }, "pod1", 0, 0)
 	p.dispatch(ctx, meta.TenantNotifyRow{
 		ID:        1,
 		TenantID:  rt.tenantID,
@@ -166,23 +168,14 @@ func TestTenantOutboxPollerCredentialCleanupEvictsTenantCredential(t *testing.T)
 		CreatedAt: time.Now(),
 	})
 
-	if !slices.Contains(k.invalidated, rt.tenantID) {
-		t.Fatalf("credential cleanup did not evict the tenant backend: %v", k.invalidated)
+	if !slices.Contains(invalidated, rt.tenantID) {
+		t.Fatalf("credential cleanup did not evict the tenant backend: %v", invalidated)
 	}
 	if len(k.kicks) != 0 {
 		t.Fatalf("credential cleanup kicked tenant work: %#v", k.kicks)
 	}
 }
 
-// credentialKicker is a worker that implements the invalidation hook the poller looks for.
-type credentialKicker struct {
-	mockKicker
-	invalidated []string
-}
-
-func (k *credentialKicker) InvalidateTenantCredential(tenantID string) {
-	k.invalidated = append(k.invalidated, tenantID)
-}
 
 func TestTenantOutboxPollerShardRejects(t *testing.T) {
 	t.Parallel()
@@ -190,7 +183,7 @@ func TestTenantOutboxPollerShardRejects(t *testing.T) {
 	k := &mockKicker{}
 	// shardFn always returns false → this pod doesn't own the tenant.
 	shardFn := func(string) bool { return false }
-	p := newTenantOutboxPoller(nil, buses, k, shardFn, "pod1", 0, 0)
+	p := newTenantOutboxPoller(nil, buses, k, shardFn, nil, "pod1", 0, 0)
 	row := meta.TenantNotifyRow{ID: 1, TenantID: "t1", WorkMask: WorkSemantic, CreatedAt: time.Now()}
 	p.dispatch(context.Background(), row)
 	if len(k.kicks) != 0 {
@@ -200,7 +193,7 @@ func TestTenantOutboxPollerShardRejects(t *testing.T) {
 
 func TestTenantOutboxPollerDefaults(t *testing.T) {
 	t.Parallel()
-	p := newTenantOutboxPoller(nil, nil, nil, nil, "", 0, 0)
+	p := newTenantOutboxPoller(nil, nil, nil, nil, nil, "", 0, 0)
 	if p.interval != defaultTenantOutboxPollInterval {
 		t.Fatalf("expected default interval, got %v", p.interval)
 	}

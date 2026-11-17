@@ -363,7 +363,7 @@ func TestFinalizeRecordsUnverifiedCredentialForReview(t *testing.T) {
 		},
 	}
 	dsn := tenantDSN("t7.tdc_fs_sys", password, rt.dbHost, rt.dbPort, rt.dbName, false, tenant.ProviderTiDBCloudNative)
-	if err := srv.finalizeTenantSchemaInit(ctx, tenantID, dsn, tenant.ProviderTiDBCloudNative); err != nil {
+	if _, err := srv.finalizeTenantSchemaInit(ctx, tenantID, dsn, tenant.ProviderTiDBCloudNative); err != nil {
 		t.Fatalf("finalize: %v", err)
 	}
 
@@ -400,7 +400,7 @@ func TestFinalizeRecordsRemediatedCredential(t *testing.T) {
 		},
 	}
 	dsn := tenantDSN("t8.root", "db-pass", rt.dbHost, rt.dbPort, rt.dbName, false, tenant.ProviderTiDBCloudNative)
-	if err := srv.finalizeTenantSchemaInit(ctx, tenantID, dsn, tenant.ProviderTiDBCloudNative); err != nil {
+	if _, err := srv.finalizeTenantSchemaInit(ctx, tenantID, dsn, tenant.ProviderTiDBCloudNative); err != nil {
 		t.Fatalf("finalize: %v", err)
 	}
 	state, reason, err := rt.meta.TenantCredentialState(ctx, tenantID)
@@ -502,6 +502,11 @@ func setupLegacyNativeAccount(t *testing.T, rt *objectGCTestRuntime) *legacyNati
 		{"CREATE ROLE IF NOT EXISTS '" + role + "'", &roleCreated},
 		{"GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO '" + role + "'", nil},
 		{"GRANT SELECT ON `" + rt.dbName + "`.* TO '" + role + "'", nil},
+		// The legacy shape: the restricted account already exists and shares the cluster root
+		// password. Creating it here is what makes every rotation test depend on ALTER USER
+		// rather than on CREATE USER happening to set the right password.
+		{"CREATE USER '" + f.tenantUser + "'@'%' IDENTIFIED BY '" + password + "'", nil},
+		{"GRANT SELECT ON `" + rt.dbName + "`.* TO '" + f.tenantUser + "'@'%'", nil},
 	}
 	for _, step := range setup {
 		if _, err := admin.ExecContext(ctx, step.stmt); err != nil {
@@ -526,17 +531,8 @@ func TestNativeCredentialRemediationRecoversFromUnpersistedRotation(t *testing.T
 	const tenantID = "native-recovery"
 	rt.insertRemediationTenantWithPassword(t, tenantID, tenant.ProviderTiDBCloudNative, f.tenantUser, f.password)
 
-	// The legacy shape: the restricted account exists and shares the cluster root password,
-	// so "the retired password is refused" later is a change of state and not an account that
-	// was never there.
-	for _, stmt := range []string{
-		"CREATE USER '" + f.tenantUser + "'@'%' IDENTIFIED BY '" + f.password + "'",
-		"GRANT SELECT ON `" + rt.dbName + "`.* TO '" + f.tenantUser + "'@'%'",
-	} {
-		if _, err := f.admin.ExecContext(ctx, stmt); err != nil {
-			t.Fatalf("%s: %v", stmt, err)
-		}
-	}
+	// The fixture leaves the restricted account on the shared cluster root password, so
+	// "the retired password is refused" later is a change of state and not an absent account.
 	if err := pingAs(t, rt, f.tenantUser, f.password); err != nil {
 		t.Fatalf("the legacy account does not accept the shared root password before rotation: %v", err)
 	}
@@ -606,7 +602,7 @@ func TestFinalizeKeepsRecordedRemediationWhenUnverified(t *testing.T) {
 		},
 	}
 	dsn := tenantDSN("t9.tdc_fs_sys", password, rt.dbHost, rt.dbPort, rt.dbName, false, tenant.ProviderTiDBCloudNative)
-	if err := srv.finalizeTenantSchemaInit(ctx, tenantID, dsn, tenant.ProviderTiDBCloudNative); err != nil {
+	if _, err := srv.finalizeTenantSchemaInit(ctx, tenantID, dsn, tenant.ProviderTiDBCloudNative); err != nil {
 		t.Fatalf("refinalize: %v", err)
 	}
 
@@ -624,5 +620,50 @@ func TestFinalizeKeepsRecordedRemediationWhenUnverified(t *testing.T) {
 	srv.remediateNativeTenantCredentials(ctx)
 	if srv.nativeCredentialRemediationBackoff(tenantID) {
 		t.Fatal("a remediated tenant was dialled again after refinalization")
+	}
+}
+
+// A crash between ALTER USER and the metadata write leaves the tenant's stored password
+// behind its database. The provisioning flow runs schema init before finalization, so every
+// retry would be refused (1045) without a recovery step: it has to notice the refusal,
+// recover the credential and retry once with the effective DSN.
+func TestSchemaInitRecoversFromUnpersistedRotation(t *testing.T) {
+	rt := newObjectGCTestRuntime(t)
+	f := setupLegacyNativeAccount(t, rt)
+	ctx := context.Background()
+	const tenantID = "native-schema-recovery"
+	rt.insertRemediationTenantWithPassword(t, tenantID, tenant.ProviderTiDBCloudNative, f.tenantUser, f.password)
+
+	// The database half of the rotation lands; the metadata write does not.
+	stale := tenantDSN(f.tenantUser, f.password, rt.dbHost, rt.dbPort, rt.dbName, false, tenant.ProviderTiDBCloudNative)
+	if _, rotated, err := tidbcloudnative.RotateLegacySystemUserCredential(ctx, stale, tenantID); err != nil || !rotated {
+		t.Fatalf("apply the rotation: rotated=%v err=%v", rotated, err)
+	}
+	if err := pingAs(t, rt, f.tenantUser, f.password); err == nil {
+		t.Fatal("the retired password still authenticates, so there is nothing to recover")
+	}
+
+	srv := &Server{meta: rt.meta, pool: rt.pool, provisioner: &tidbcloudnative.Provisioner{}}
+	schemaInit := func(ctx context.Context, dsn string) error {
+		db, err := sql.Open("mysql", dsn)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = db.Close() }()
+		return db.PingContext(ctx)
+	}
+	effective, err := srv.schemaInitWithCredentialRecovery(ctx, tenantID, stale, tenant.ProviderTiDBCloudNative, schemaInit)
+	if err != nil {
+		t.Fatalf("schema init recovery: %v", err)
+	}
+	if effective == stale {
+		t.Fatal("recovery returned the refused DSN instead of the restored credential")
+	}
+	if err := schemaInit(ctx, effective); err != nil {
+		t.Fatalf("the recovered DSN does not work: %v", err)
+	}
+	// And the recovery persisted it, so the next attempt does not need to recover again.
+	if got := rt.tenantCredential(t, tenantID); tenantDSN(f.tenantUser, got, rt.dbHost, rt.dbPort, rt.dbName, false, tenant.ProviderTiDBCloudNative) != effective {
+		t.Fatal("recovery did not persist the credential it returned")
 	}
 }

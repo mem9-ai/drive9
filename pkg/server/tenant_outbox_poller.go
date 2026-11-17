@@ -23,14 +23,6 @@ type outboxTenantForgetter interface {
 	ForgetTenant(tenantID string)
 }
 
-// outboxTenantCredentialInvalidator drops the tenant's cached database credential so the
-// next acquire re-reads the row and dials with the password the database now accepts.
-// Dropping the cached backend is the only way a peer notices a rotation: its connections
-// were authenticated with the previous password and new ones would be refused.
-type outboxTenantCredentialInvalidator interface {
-	InvalidateTenantCredential(tenantID string)
-}
-
 const (
 	// defaultTenantOutboxPollInterval is the poller's tick interval. At 200ms,
 	// cross-pod work delivery is bounded to ~200ms. The target is the
@@ -59,10 +51,16 @@ const (
 // per-tenant TiDB scanning. Idle tenant TiDBs can scale to zero because the
 // poller never touches them — it only reads the central meta DB.
 type tenantOutboxPoller struct {
-	metaStore        *meta.Store
-	buses            *eventBuses
-	worker           outboxKicker
-	shardFn          func(string) bool
+	metaStore *meta.Store
+	buses     *eventBuses
+	worker    outboxKicker
+	shardFn   func(string) bool
+	// poolEvict drops a tenant's cached backend. It is the only way a peer notices a
+	// database credential rotation: the peer's pooled connections were authenticated with
+	// the retired password, so new ones would be refused. It is deliberately the pool's own
+	// Invalidate and not the worker's deletion teardown, which would also drop queued
+	// background kicks for a tenant that is still alive.
+	poolEvict        func(tenantID string)
 	podID            string
 	interval         time.Duration
 	cursorFlushEvery time.Duration
@@ -78,6 +76,7 @@ func newTenantOutboxPoller(
 	buses *eventBuses,
 	worker outboxKicker,
 	shardFn func(string) bool,
+	poolEvict func(tenantID string),
 	podID string,
 	interval time.Duration,
 	cursorFlushEvery time.Duration,
@@ -96,6 +95,7 @@ func newTenantOutboxPoller(
 		buses:            buses,
 		worker:           worker,
 		shardFn:          shardFn,
+		poolEvict:        poolEvict,
 		podID:            podID,
 		interval:         interval,
 		cursorFlushEvery: cursorFlushEvery,
@@ -229,8 +229,11 @@ func (p *tenantOutboxPoller) dispatch(ctx context.Context, row meta.TenantNotify
 		if p.metaStore != nil {
 			p.metaStore.InvalidateAPIKeyResolveCacheForTenant(row.TenantID)
 		}
-		if invalidator, ok := p.worker.(outboxTenantCredentialInvalidator); ok {
-			invalidator.InvalidateTenantCredential(row.TenantID)
+		// The credential in the pool's cached backend is stale, so drop the backend. The
+		// tenant is alive: its queued worker kicks must survive, which is why this is the
+		// pool's eviction and not the deletion teardown.
+		if p.poolEvict != nil {
+			p.poolEvict(row.TenantID)
 		}
 	}
 	if row.WorkMask&WorkMetricsCleanup != 0 {

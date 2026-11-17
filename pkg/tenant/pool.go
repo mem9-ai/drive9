@@ -1,6 +1,7 @@
 package tenant
 
 import (
+	"bytes"
 	"container/list"
 	"context"
 	"database/sql"
@@ -202,7 +203,13 @@ type entry struct {
 	tenantID           string
 	storageNamespaceID string
 	s3EncryptionPolicy meta.S3EncryptionPolicy
-	backend            *backend.Dat9Backend
+	// dbUser and dbPasswordCipher are the credential this backend was opened with. A
+	// rotation, or a peer's cached tenant row that predates one, must not keep reusing a
+	// backend whose replacement connections would authenticate with a retired password: the
+	// cache hit is only valid for the credential the row currently carries.
+	dbUser           string
+	dbPasswordCipher []byte
+	backend          *backend.Dat9Backend
 	store              *datastore.Store
 	elem               *list.Element
 	refs               int
@@ -287,7 +294,7 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 	var toClose []*entry
 	p.mu.Lock()
 	if e, ok := p.items[t.ID]; ok {
-		if e.s3EncryptionPolicy == s3EncryptionPolicy && (storageNamespaceID == "" || e.storageNamespaceID == storageNamespaceID) {
+		if e.matches(t, s3EncryptionPolicy, storageNamespaceID) {
 			e.refs++
 			p.order.MoveToFront(e.elem)
 			e.lastUsed = time.Now()
@@ -344,7 +351,17 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 			toClose = append(toClose, removed)
 		}
 	}
-	e := &entry{tenantID: t.ID, storageNamespaceID: t.StorageNamespaceID, s3EncryptionPolicy: s3EncryptionPolicy, backend: b, store: st, refs: 1, lastUsed: time.Now()}
+	e := &entry{
+		tenantID:           t.ID,
+		storageNamespaceID: t.StorageNamespaceID,
+		s3EncryptionPolicy: s3EncryptionPolicy,
+		dbUser:             t.DBUser,
+		dbPasswordCipher:   append([]byte(nil), t.DBPasswordCipher...),
+		backend:            b,
+		store:              st,
+		refs:               1,
+		lastUsed:           time.Now(),
+	}
 	e.elem = p.order.PushFront(e)
 	p.items[t.ID] = e
 	for p.order.Len() > p.maxSize {
@@ -455,7 +472,7 @@ func (p *Pool) acquireCached(t *meta.Tenant, refreshActivity bool) (b *backend.D
 		}
 		return nil, nil, false
 	}
-	if e.s3EncryptionPolicy != s3EncryptionPolicy || (t.StorageNamespaceID != "" && e.storageNamespaceID != t.StorageNamespaceID) {
+	if !e.matches(t, s3EncryptionPolicy, t.StorageNamespaceID) {
 		p.mu.Unlock()
 		if !refreshActivity {
 			// Stale-skip: the cached backend's encryption policy / storage namespace
@@ -1112,6 +1129,20 @@ func (p *Pool) removeLockedWithoutMetrics(elem *list.Element) *entry {
 
 func (p *Pool) recordCachedBackendCountLocked() {
 	metrics.RecordGauge("tenant_pool", "cached_backends", float64(len(p.items)))
+}
+
+// matches reports whether the cached backend can serve this tenant row: same shape, and the
+// same database credential. Comparing the credential bounds any eviction race — a peer that
+// filled its cache just before the invalidation signal arrived, or an outbox row it already
+// skipped — to the next Acquire instead of leaving it broken indefinitely.
+func (e *entry) matches(t *meta.Tenant, s3EncryptionPolicy meta.S3EncryptionPolicy, storageNamespaceID string) bool {
+	if e.s3EncryptionPolicy != s3EncryptionPolicy {
+		return false
+	}
+	if storageNamespaceID != "" && e.storageNamespaceID != storageNamespaceID {
+		return false
+	}
+	return e.dbUser == t.DBUser && bytes.Equal(e.dbPasswordCipher, t.DBPasswordCipher)
 }
 
 func (p *Pool) makeRelease(e *entry) func() {

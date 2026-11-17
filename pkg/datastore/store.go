@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/go-sql-driver/mysql"
@@ -155,9 +154,6 @@ type Store struct {
 	db             *sql.DB
 	useLegacyFiles bool // true when the legacy `files` table exists and needs dual-write
 	scope          Scope
-	// noBackslashEscapes caches whether this store's sessions treat a backslash in a
-	// string literal as an escape. See sqlModeNoBackslashEscapes.
-	noBackslashEscapes atomic.Int32 // 0 unknown, 1 default mode, 2 NO_BACKSLASH_ESCAPES
 }
 
 func Open(dsn string) (*Store, error) {

@@ -2,6 +2,7 @@ package datastore
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"sort"
@@ -269,22 +270,38 @@ func buildVectorSearchDescriptionByTextQueryScoped(scope Scope, queryText, pathP
 
 // FTSSearch runs a full-text search over files.content_text and files.description.
 func (s *Store) FTSSearch(ctx context.Context, query, pathPrefix string, limit int) ([]SearchResult, error) {
-	noBackslashEscapes := false
-	var err error
-	if strings.IndexByte(query, '\\') >= 0 {
-		// Only a query with a backslash needs the session's escaping mode; asking costs a
-		// round trip, and the answer is cached for the life of the store.
-		noBackslashEscapes, err = s.sqlModeNoBackslashEscapes(ctx)
+	// A query without a backslash is quoted identically in both modes, so it keeps the plain
+	// pooled path. One with a backslash needs the mode of the session that will lex it, which
+	// means pinning a connection for the probe and the statement together.
+	if strings.IndexByte(query, '\\') < 0 {
+		literal, err := ftsQueryLiteral(query, false)
 		if err != nil {
-			return nil, fmt.Errorf("read sql_mode: %w", err)
+			return nil, err
 		}
+		q, allArgs := buildFTSSearchQuery(s.scope, literal, pathPrefix, limit)
+		return s.scanFTSSearch(ctx, s.db.QueryContext, q, allArgs)
+	}
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("acquire connection for full-text search: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+	noBackslashEscapes, err := sqlModeNoBackslashEscapes(ctx, conn)
+	if err != nil {
+		return nil, fmt.Errorf("read sql_mode: %w", err)
 	}
 	literal, err := ftsQueryLiteral(query, noBackslashEscapes)
 	if err != nil {
 		return nil, err
 	}
 	q, allArgs := buildFTSSearchQuery(s.scope, literal, pathPrefix, limit)
-	rows, err := s.db.QueryContext(ctx, q, allArgs...)
+	return s.scanFTSSearch(ctx, conn.QueryContext, q, allArgs)
+}
+
+// scanFTSSearch runs the assembled query through either the pool or a pinned connection and
+// collects the rows.
+func (s *Store) scanFTSSearch(ctx context.Context, query func(context.Context, string, ...any) (*sql.Rows, error), q string, args []any) ([]SearchResult, error) {
+	rows, err := query(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -338,35 +355,25 @@ func ftsQueryLiteral(query string, noBackslashEscapes bool) (string, error) {
 	return "'" + query + "'", nil
 }
 
-// sqlModeNoBackslashEscapes reports whether this store's sessions parse a backslash in a
-// string literal as an escape. It is asked once per store, and only when a quote is needed
-// for text that actually contains a backslash, so the common search path stays one query.
+// sqlModeNoBackslashEscapes reports whether the given session parses a backslash in a string
+// literal as an escape.
 //
-// Our own connections never change sql_mode, so every connection in the pool agrees; a
-// deployment that changes the account default is answered on the first search.
-func (s *Store) sqlModeNoBackslashEscapes(ctx context.Context) (bool, error) {
-	switch s.noBackslashEscapes.Load() {
-	case 1:
-		return false, nil
-	case 2:
-		return true, nil
-	}
+// It has to be asked on the connection that will run the statement, and never cached on the
+// Store: sql_mode is a session property, and a pooled connection can disagree with the next
+// one (a @@GLOBAL.sql_mode change, a proxy that injects a session init, connection turnover).
+// Caching "escapes are off" from one session and then sending an un-doubled backslash to a
+// session where they are on is exactly the literal breakout the quoting exists to prevent.
+func sqlModeNoBackslashEscapes(ctx context.Context, conn *sql.Conn) (bool, error) {
 	var mode string
-	if err := s.db.QueryRowContext(ctx, "SELECT @@SESSION.sql_mode").Scan(&mode); err != nil {
+	if err := conn.QueryRowContext(ctx, "SELECT @@SESSION.sql_mode").Scan(&mode); err != nil {
 		return false, err
 	}
-	noBackslashEscapes := false
 	for _, flag := range strings.Split(mode, ",") {
 		if strings.EqualFold(strings.TrimSpace(flag), "NO_BACKSLASH_ESCAPES") {
-			noBackslashEscapes = true
+			return true, nil
 		}
 	}
-	if noBackslashEscapes {
-		s.noBackslashEscapes.Store(2)
-	} else {
-		s.noBackslashEscapes.Store(1)
-	}
-	return noBackslashEscapes, nil
+	return false, nil
 }
 
 // buildFTSSearchQuery assembles the full-text search query for the given schema-shape

@@ -1119,3 +1119,68 @@ func TestIdleEvictionStartAutoEvictsAndCloseStops(t *testing.T) {
 	}
 	assertStoreClosed(t, store)
 }
+
+// A cached backend is only valid for the credential it was opened with. A rotation, and a
+// peer whose cached tenant row still predates one, must not keep handing out a backend whose
+// new connections would authenticate with a retired password.
+func TestPoolAcquireRecreatesBackendWhenCredentialChanges(t *testing.T) {
+	pool, tenant := newTestPoolAndTenant(t, 2, "tenant-credential")
+	ctx := context.Background()
+
+	first, releaseFirst, err := pool.Acquire(ctx, tenant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer releaseFirst()
+
+	// Model the row a peer still holds after a rotation: same tenant, a different (and
+	// decryptable) credential, so the comparison is about identity and not about a broken
+	// cipher.
+	plain, err := pool.Decrypt(ctx, tenant.DBPasswordCipher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotatedCipher, err := pool.Encrypt(ctx, append(append([]byte(nil), plain...), 'x'))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotated := *tenant
+	rotated.DBPasswordCipher = rotatedCipher
+
+	// The warm-only path the safety-net uses must not hand out the stale backend.
+	if _, release, ok := pool.AcquireCached(&rotated); ok {
+		release()
+		t.Fatal("acquireCached handed out a backend opened with the previous credential")
+	}
+	// The request path refuses to reuse it too: the rotated password cannot authenticate, so
+	// the call fails, and the important part is that the stale backend is gone rather than
+	// still serving.
+	if _, release, err := pool.Acquire(ctx, &rotated); err == nil {
+		release()
+		t.Fatal("acquire succeeded with a credential the database rejects")
+	}
+	pool.mu.Lock()
+	_, stillCached := pool.items[tenant.ID]
+	pool.mu.Unlock()
+	if stillCached {
+		t.Fatal("the backend opened with the previous credential stayed cached")
+	}
+
+	// With the current row it rebuilds, and the new backend is not the old one.
+	second, releaseSecond, err := pool.Acquire(ctx, tenant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer releaseSecond()
+	if second == first {
+		t.Fatal("the pool reused the backend whose credential no longer matches")
+	}
+
+	// The same rule covers a change of database user.
+	renamed := *tenant
+	renamed.DBUser = tenant.DBUser + "-previous"
+	if _, release, ok := pool.AcquireCached(&renamed); ok {
+		release()
+		t.Fatal("acquireCached handed out a backend for a different database user")
+	}
+}

@@ -37,6 +37,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/tagutil"
 	"github.com/mem9-ai/drive9/pkg/tenant"
 	tenantschema "github.com/mem9-ai/drive9/pkg/tenant/schema"
+	"github.com/mem9-ai/drive9/pkg/tenant/tidbcloudnative"
 	"github.com/mem9-ai/drive9/pkg/tenant/token"
 	"github.com/mem9-ai/drive9/pkg/traceid"
 	"github.com/mem9-ai/drive9/pkg/vault"
@@ -779,9 +780,13 @@ func (s *Server) startNotifyInfrastructure(cfg Config) {
 
 	// Unified outbox poller: reads the central outbox on every pod and
 	// dispatches by work_mask.
+	var poolEvict func(string)
+	if s.pool != nil {
+		poolEvict = s.pool.Invalidate
+	}
 	poller := newTenantOutboxPoller(
 		s.meta, s.events, s.tenantWorker, resolver.ownsTenantFn(),
-		cfg.PodID, cfg.TenantOutboxPollInterval, cfg.TenantOutboxCursorFlushInterval,
+		poolEvict, cfg.PodID, cfg.TenantOutboxPollInterval, cfg.TenantOutboxCursorFlushInterval,
 	)
 	// Initialize the poller cursor synchronously BEFORE starting the goroutine
 	// and BEFORE the server accepts live traffic. On restart the cursor is
@@ -6154,12 +6159,19 @@ func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN,
 		if !s.tenantSchemaInitStillProvisioning(ctx, tenantID, provider, "before_attempt") {
 			return
 		}
-		err := schemaInit(ctx, tenantDSN)
+		var err error
+		tenantDSN, err = s.schemaInitWithCredentialRecovery(ctx, tenantID, tenantDSN, provider, schemaInit)
 		if err == nil {
 			if !s.tenantSchemaInitStillProvisioning(ctx, tenantID, provider, "before_finalize") {
 				return
 			}
-			err = s.finalizeTenantSchemaInit(ctx, tenantID, tenantDSN, provider)
+			var effectiveDSN string
+			effectiveDSN, err = s.finalizeTenantSchemaInit(ctx, tenantID, tenantDSN, provider)
+			if err == nil && effectiveDSN != "" {
+				// Finalization may have rotated the credential; later attempts must dial the
+				// account the tenant now has.
+				tenantDSN = effectiveDSN
+			}
 			if err == nil {
 				if versionErr := s.updateTenantSchemaVersionForProfile(ctx, tenantID, provider); versionErr != nil {
 					logger.Error(ctx, "server_event", eventFields(ctx, "schema_init_version_persist_failed", "tenant_id", tenantID, "provider", provider, "attempt", attempt, "error", versionErr)...)
@@ -6290,35 +6302,82 @@ func (s *Server) tenantSchemaInitStillProvisioning(ctx context.Context, tenantID
 	return true
 }
 
-func (s *Server) finalizeTenantSchemaInit(ctx context.Context, tenantID, tenantDSN, provider string) error {
+// schemaInitWithCredentialRecovery runs schema initialization and, when the server refuses
+// the login because a rotation it performed was never persisted, recovers the credential and
+// retries once. Without it a crash between ALTER USER and the metadata write would strand the
+// tenant on the schema-init step until an operator intervened.
+func (s *Server) schemaInitWithCredentialRecovery(ctx context.Context, tenantID, tenantDSN, provider string, schemaInit func(context.Context, string) error) (string, error) {
+	err := schemaInit(ctx, tenantDSN)
+	if err == nil || provider != tenant.ProviderTiDBCloudNative || !isCredentialRejectedError(err) {
+		return tenantDSN, err
+	}
+	cfg, parseErr := mysql.ParseDSN(tenantDSN)
+	if parseErr != nil || !tidbcloudnative.IsRestrictedSystemUser(cfg.User) {
+		return tenantDSN, err
+	}
+	// The account was rotated but the control plane never learned the new password. The stored
+	// password still authenticates as the cluster root, so finalization can re-apply the
+	// rotation — the derived value is deterministic, so it is the password the earlier attempt
+	// already set — and persist it.
+	effective, finalizeErr := s.finalizeTenantSchemaInit(ctx, tenantID, tenantDSN, provider)
+	if finalizeErr != nil {
+		return tenantDSN, fmt.Errorf("schema init was refused (%v) and credential recovery failed: %w", err, finalizeErr)
+	}
+	return effective, schemaInit(ctx, effective)
+}
+
+// isCredentialRejectedError reports whether the server refused the login, which is what a
+// credential this server rotated but could not persist looks like on the next attempt.
+func isCredentialRejectedError(err error) bool {
+	var mysqlErr *mysql.MySQLError
+	return errors.As(err, &mysqlErr) && mysqlErr.Number == 1045
+}
+
+// finalizeTenantSchemaInit applies the tenant's runtime credential and returns the DSN a
+// caller must dial afterwards. The returned DSN matters: finalization can rotate the
+// restricted account's password, so the caller's own DSN is stale by the time this returns,
+// and every post-finalization step has to use the effective one.
+func (s *Server) finalizeTenantSchemaInit(ctx context.Context, tenantID, tenantDSN, provider string) (string, error) {
 	if provider != tenant.ProviderTiDBCloudNative {
-		return nil
+		return tenantDSN, nil
 	}
 	if s.provisioner == nil {
-		return fmt.Errorf("server misconfigured: native tenant provider is missing")
+		return tenantDSN, fmt.Errorf("server misconfigured: native tenant provider is missing")
 	}
 	systemUserProvisioner, ok := s.provisioner.(nativeSystemUserProvisioner)
 	if !ok {
-		return fmt.Errorf("native provisioner does not support system user setup")
+		return tenantDSN, fmt.Errorf("native provisioner does not support system user setup")
 	}
 	cfg, err := mysql.ParseDSN(tenantDSN)
 	if err != nil {
-		return fmt.Errorf("parse native tenant DSN for credential finalization: %w", err)
+		return tenantDSN, fmt.Errorf("parse native tenant DSN for credential finalization: %w", err)
 	}
 	fromDBUser := strings.TrimSpace(cfg.User)
 	if fromDBUser == "" {
-		return fmt.Errorf("native tenant DSN has empty username")
+		return tenantDSN, fmt.Errorf("native tenant DSN has empty username")
+	}
+	// A resumed finalization for a tenant this server already remediated has nothing to do:
+	// dialling the cluster root again cannot add information, and rewriting the credential
+	// would emit another invalidation signal for an unchanged row.
+	if tidbcloudnative.IsRestrictedSystemUser(fromDBUser) {
+		recorded, _, stateErr := s.meta.TenantCredentialState(ctx, tenantID)
+		switch {
+		case stateErr == nil && recorded == meta.TenantCredentialRemediated:
+			return tenantDSN, nil
+		case stateErr != nil && !errors.Is(stateErr, meta.ErrNotFound):
+			return tenantDSN, fmt.Errorf("read native tenant credential state: %w", stateErr)
+		}
 	}
 	username, password, grantVerified, err := systemUserProvisioner.EnsureSystemUser(ctx, tenantDSN, tenantID)
 	if err != nil {
-		return fmt.Errorf("ensure native system user: %w", err)
+		return tenantDSN, fmt.Errorf("ensure native system user: %w", err)
 	}
 	if username == "" || password == "" {
-		return fmt.Errorf("native system user setup returned empty credential")
+		return tenantDSN, fmt.Errorf("native system user setup returned empty credential")
 	}
 	cipherPass, err := s.pool.Encrypt(ctx, []byte(password))
 	if err != nil {
-		return fmt.Errorf("encrypt native system user password: %w", err)
+		return tenantDSN, fmt.Errorf("encrypt native system user password: %w", err)
 	}
 	update := meta.TenantDBCredentialUpdate{
 		FromDBUser:     fromDBUser,
@@ -6347,12 +6406,12 @@ func (s *Server) finalizeTenantSchemaInit(ctx context.Context, tenantID, tenantD
 			update.State = meta.TenantCredentialReviewRequired
 			update.StateReason = "finalization could not verify the legacy grant: stored credential is not root-equivalent"
 		default:
-			return fmt.Errorf("read native tenant credential state: %w", err)
+			return tenantDSN, fmt.Errorf("read native tenant credential state: %w", err)
 		}
 	}
 	updated, err := s.meta.UpdateTenantDBCredentialIf(ctx, tenantID, update)
 	if err != nil {
-		return fmt.Errorf("persist native system user credential: %w", err)
+		return tenantDSN, fmt.Errorf("persist native system user credential: %w", err)
 	}
 	if !updated {
 		logger.Info(ctx, "native_system_user_credential_update_skipped",
@@ -6360,7 +6419,12 @@ func (s *Server) finalizeTenantSchemaInit(ctx context.Context, tenantID, tenantD
 			zap.String("from_db_user", fromDBUser),
 			zap.String("db_user", username))
 	}
-	return nil
+	// The caller's DSN may still name the account this call just rotated, so hand back the
+	// credential the tenant now uses.
+	effective := cfg.Clone()
+	effective.User = username
+	effective.Passwd = password
+	return effective.FormatDSN(), nil
 }
 
 func errJSON(w http.ResponseWriter, code int, msg string) {
