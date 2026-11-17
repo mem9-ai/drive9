@@ -28,9 +28,10 @@ headers, no version line. A CLI built before any of this exists parses it unchan
 not verify signatures). Putting the version inside `checksums.txt` would have broken exactly
 those clients out of self-update.
 
-The build pins a **set** of public keys (`cmd/drive9/cli/update_key.txt`, comma-separated). A
-release whose files verify under any pinned key installs, which is what lets a rotation
-overlap instead of switching in one release.
+The build pins a **set** of public keys (`cmd/drive9/cli/update_key.txt`, one per line or
+comma-separated — both work, in the file and on the command line). A release whose files
+verify under any pinned key installs, which is what lets a rotation overlap instead of
+switching in one release.
 
 ## Verifying a release by hand
 
@@ -110,9 +111,9 @@ The updater trusts the key set embedded in the binary it runs, and that set may 
 one key, so a rotation overlaps instead of switching in a single release:
 
 1. Generate a new pair. Add its public key to `cmd/drive9/cli/update_key.txt` **next to the
-   current key** (comma-separated) and ship that release with `DRIVE9_RELEASE_SIGNING_KEY`
-   still holding the **current** private key. Installed clients accept it (they trust the old
-   key), and the binary they install now trusts both.
+   current key** (its own line, or comma-separated) and ship that release with
+   `DRIVE9_RELEASE_SIGNING_KEY` still holding the **current** private key. Installed clients
+   accept it (they trust the old key), and the binary they install now trusts both.
 2. Keep publishing releases signed with the old key for at least one cycle. `drive9 update`
    and `drive9 update --check` work on pre-change clients (old key), on overlap clients
    (either key) and on new clients (both keys).

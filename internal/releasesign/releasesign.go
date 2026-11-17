@@ -61,34 +61,41 @@ type Manifest struct {
 	Checksums map[string]string
 }
 
-// ParsePublicKeys decodes a comma-separated list of base64 ed25519 public keys. A set is
-// allowed so a key rotation can overlap: the release that introduces a new key pins
-// "old,new" and keeps being signed with the old one, so installed clients keep updating
-// throughout the switch. Every entry is validated up front, so an empty or malformed element
-// fails closed instead of silently shrinking the trusted set.
+// ParsePublicKeys decodes a set of base64 ed25519 public keys. A set is allowed so a key
+// rotation can overlap: the release that introduces a new key pins "old,new" and keeps being
+// signed with the old one, so installed clients keep updating throughout the switch. Every
+// entry is validated up front, so an empty or malformed element fails closed instead of
+// silently shrinking the trusted set.
+//
+// Commas and whitespace both separate keys, because hand-written strings reach this parser
+// from two places: the embedded update_key.txt (one key per line reads best) and the
+// -X/-pubkey flag (a comma-separated list). Accepting either means the release workflow can
+// hand over the key file verbatim — the exact bytes the shipped binary embeds — instead of
+// normalizing it first and verifying a key set no binary will ever parse.
 func ParsePublicKeys(encoded string) ([]ed25519.PublicKey, error) {
-	encoded = strings.TrimSpace(encoded)
-	if encoded == "" {
+	if strings.TrimSpace(encoded) == "" {
 		return nil, ErrNoPublicKey
 	}
-	parts := strings.Split(encoded, ",")
-	keys := make([]ed25519.PublicKey, 0, len(parts))
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if part == "" {
+	groups := strings.Split(encoded, ",")
+	keys := make([]ed25519.PublicKey, 0, len(groups))
+	for _, group := range groups {
+		entries := strings.Fields(group)
+		if len(entries) == 0 {
 			return nil, fmt.Errorf("%w: empty entry in the key list", ErrInvalidPublicKey)
 		}
-		raw, err := base64.StdEncoding.DecodeString(part)
-		if err != nil || len(raw) != ed25519.PublicKeySize {
-			return nil, fmt.Errorf("%w: %q is not a base64 %d-byte ed25519 public key", ErrInvalidPublicKey, part, ed25519.PublicKeySize)
+		for _, entry := range entries {
+			raw, err := base64.StdEncoding.DecodeString(entry)
+			if err != nil || len(raw) != ed25519.PublicKeySize {
+				return nil, fmt.Errorf("%w: %q is not a base64 %d-byte ed25519 public key", ErrInvalidPublicKey, entry, ed25519.PublicKeySize)
+			}
+			keys = append(keys, ed25519.PublicKey(raw))
 		}
-		keys = append(keys, ed25519.PublicKey(raw))
 	}
 	return keys, nil
 }
 
-// Verify checks a detached signature over the exact manifest bytes against a comma-separated
-// key set, succeeding when any trusted key verifies it.
+// Verify checks a detached signature over the exact manifest bytes against a key set
+// (comma- or whitespace-separated), succeeding when any trusted key verifies it.
 func Verify(manifest, signature []byte, publicKeys string) error {
 	keys, err := ParsePublicKeys(publicKeys)
 	if err != nil {

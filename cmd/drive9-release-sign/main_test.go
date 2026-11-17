@@ -168,9 +168,9 @@ func TestRunVerifyReleaseBundle(t *testing.T) {
 		info := []byte("version " + version + "\nchecksums-sha256 " + releasesign.ManifestDigest(manifest) + "\n")
 		artifact := []byte(artifactBody)
 		for name, body := range map[string][]byte{
-			releasesign.ManifestName: manifest,
+			releasesign.ManifestName:    manifest,
 			releasesign.ReleaseInfoName: info,
-			"drive9-linux-amd64":     artifact,
+			"drive9-linux-amd64":        artifact,
 		} {
 			if err := os.WriteFile(filepath.Join(sub, name), body, 0o644); err != nil {
 				t.Fatal(err)

@@ -1,7 +1,10 @@
 package cli
 
 import (
+	"bytes"
+	"crypto/ed25519"
 	"crypto/sha256"
+	"encoding/base64"
 	"fmt"
 	"os"
 	"os/exec"
@@ -10,6 +13,8 @@ import (
 	"testing"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/mem9-ai/drive9/internal/releasesign"
 )
 
 func TestCLIReleasePublishesLegacyManifests(t *testing.T) {
@@ -136,5 +141,58 @@ func TestCLIReleasePublishesLegacyManifests(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// The signing step verifies the manifest against the key file the build embeds. It has to
+// hand that file over untouched: if it normalizes separators first, a key file the shipped
+// binary cannot parse still passes the check, and the release publishes with a CLI that can
+// never update again. The parser accepts commas or whitespace, so no normalization is needed.
+func TestReleaseWorkflowVerifiesTheEmbeddedKeyFileVerbatim(t *testing.T) {
+	data, err := os.ReadFile("../../../.github/workflows/release-cli.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var workflow struct {
+		Jobs map[string]struct {
+			Steps []struct{ Name, Run string }
+		}
+	}
+	if err := yaml.Unmarshal(data, &workflow); err != nil {
+		t.Fatal(err)
+	}
+	var signStep string
+	for _, step := range workflow.Jobs["release"].Steps {
+		if step.Name == "Sign release manifest" {
+			signStep = step.Run
+		}
+	}
+	if signStep == "" {
+		t.Fatal("release workflow has no manifest signing step")
+	}
+	for _, forbidden := range []string{"tr -s", "sed 's/^,/", "paste -sd"} {
+		if strings.Contains(signStep, forbidden) {
+			t.Errorf("signing step rewrites the key file separators (%q), so it verifies a key set the shipped binary never parses", forbidden)
+		}
+	}
+	if !strings.Contains(signStep, "cat cmd/drive9/cli/update_key.txt") {
+		t.Error("signing step does not read the embedded key file verbatim")
+	}
+
+	// One key per line and comma-separated are the same key set, which is what lets the file
+	// be passed through as-is.
+	rotating := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{0x37}, ed25519.SeedSize))
+	secondPublic := base64.StdEncoding.EncodeToString(rotating.Public().(ed25519.PublicKey))
+	for _, fileBody := range []string{
+		updateTestSigningPublicKey + "\n" + secondPublic + "\n",
+		updateTestSigningPublicKey + "," + secondPublic + "\n",
+	} {
+		keys, err := releasesign.ParsePublicKeys(strings.TrimSuffix(fileBody, "\n"))
+		if err != nil {
+			t.Fatalf("key file %q: %v", fileBody, err)
+		}
+		if len(keys) != 2 {
+			t.Fatalf("key file %q parsed %d keys, want 2", fileBody, len(keys))
+		}
 	}
 }

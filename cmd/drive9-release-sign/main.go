@@ -187,7 +187,7 @@ func verifySignedFile(path string, body []byte, publicKey string) error {
 		return fmt.Errorf("read %s: %w", signaturePath, err)
 	}
 	if err := releasesign.Verify(body, signature, publicKey); err != nil {
-		return fmt.Errorf("%s: %w (pass the release key with -pubkey or $%s; a comma-separated set is accepted)", filepath.Base(path), err, publicKeyEnv)
+		return fmt.Errorf("%s: %w (pass the release key with -pubkey or $%s; a comma- or newline-separated set is accepted)", filepath.Base(path), err, publicKeyEnv)
 	}
 	return nil
 }

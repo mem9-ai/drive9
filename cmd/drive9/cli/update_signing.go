@@ -8,9 +8,10 @@ import (
 )
 
 // updateManifestKeyFile is the release key set this build trusts: base64 ed25519 public
-// keys, comma-separated. It is embedded rather than duplicated in source so the release
-// workflow can verify a manifest against the exact keys the shipped binary carries — the
-// same file, not a copy that can drift.
+// keys, comma- or newline-separated (one per line reads best when a rotation pins two). It
+// is embedded rather than duplicated in source so the release workflow can verify a manifest
+// against the exact keys the shipped binary carries — the same bytes, not a copy that can
+// drift or a normalization the binary never performs.
 //
 //go:embed update_key.txt
 var updateManifestKeyFile string

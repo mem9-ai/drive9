@@ -89,6 +89,15 @@ func TestVerifyAcceptsAnyTrustedKey(t *testing.T) {
 		{name: "empty element", public: oldPublic + ",", wantErr: "empty entry in the key list"},
 		{name: "malformed element", public: oldPublic + ",not-base64", wantErr: "is not a base64"},
 		{name: "empty set", public: " , ", wantErr: "empty entry in the key list"},
+		// The key file is embedded and read verbatim by both the shipped binary and the
+		// release workflow, so every shape a hand-edited file can take has to parse the same.
+		{name: "one key per line", public: newPublic + "\n" + oldPublic + "\n"},
+		{name: "blank lines between keys", public: newPublic + "\n\n" + oldPublic},
+		{name: "trailing blank lines", public: newPublic + "\n" + oldPublic + "\n\n\n"},
+		{name: "crlf line endings", public: newPublic + "\r\n" + oldPublic + "\r\n"},
+		{name: "space separated", public: newPublic + " " + oldPublic},
+		{name: "tab separated", public: newPublic + "\t" + oldPublic},
+		{name: "comma and newline mixed", public: newPublic + ",\n" + oldPublic},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := Verify(manifest, signature, tc.public)

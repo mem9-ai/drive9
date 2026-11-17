@@ -83,9 +83,11 @@ jobs:
           # Verify both signatures against the keys this release's binary embeds, read from
           # the same file the build embeds. A stale or mistyped secret signs happily and
           # would publish a release no updated CLI can install; this step fails instead.
-          # The key file is comma-separated; tolerate whitespace/newlines by folding them
-          # into the same separator.
-          KEYS="$(tr -s '[:space:]' ',' < cmd/drive9/cli/update_key.txt | sed 's/^,//; s/,$//')"
+          # The file is passed through untouched: normalizing its separators here would
+          # check a key set the shipped binary never parses, so a file the binary cannot
+          # read would publish a release that cannot update. One line per key is fine —
+          # the parser accepts commas or whitespace.
+          KEYS="$(cat cmd/drive9/cli/update_key.txt)"
           go run ./cmd/drive9-release-sign -verify -pubkey "$KEYS" dist/checksums.txt
           go run ./cmd/drive9-release-sign -verify -pubkey "$KEYS" dist/release.txt
 
