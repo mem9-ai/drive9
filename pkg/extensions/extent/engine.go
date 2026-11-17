@@ -56,8 +56,12 @@ type EngineConfig struct {
 
 const (
 	// defaultMaxUpload is the direct in-memory staging concurrency used
-	// when JuiceFS native Writeback is disabled.
-	defaultMaxUpload = 16
+	// when JuiceFS native Writeback is disabled. objectStorage.Put only
+	// stages bytes locally (real network S3 PUTs run in Bridge.commit under
+	// patchPutConcurrency), and 256 exceeds 2*BufferSize/BlockSize (150
+	// blocks), guaranteeing admitted slices always find free upload slots
+	// to complete while un-admitted slices wait on the hard 384 MiB bound.
+	defaultMaxUpload = 256
 	// defaultWritebackMaxUpload bounds upload workers when native
 	// rawstaging Writeback is explicitly enabled (avoids free-space
 	// staging-eviction races under disk pressure).

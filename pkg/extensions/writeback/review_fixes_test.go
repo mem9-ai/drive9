@@ -2,11 +2,14 @@ package writeback
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/mem9-ai/drive9/internal/testbackend"
 	"github.com/mem9-ai/drive9/pkg/client"
@@ -224,4 +227,143 @@ func TestReclaimEmptyOccupantFencesAgainstCompetingWriterAndDirs(t *testing.T) {
 	if _, ok, err := cq.reclaimEmptyOccupant(context.Background(), &CommitEntry{Path: "/f", Size: 4096, Kind: staging.PendingOverwrite}, "/f"); err == nil || ok {
 		t.Fatalf("raced extent empty reclaim = (ok=%v, err=%v), want conflict error", ok, err)
 	}
+}
+
+// Finding #6 (ordering): Adoption-time deferred chmod (0644) must never
+// overwrite a newer acknowledged chmod (0600), whether adoption pauses before
+// entering flushMigratedMode or mid-flight inside ChmodCtx.
+func TestAdoptExtentHandleDoesNotOverwriteNewerAcknowledgedChmod(t *testing.T) {
+	t.Run("adoption-paused-before-flush", func(t *testing.T) {
+		var remoteMode atomic.Uint32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if _, ok := r.URL.Query()["chmod"]; ok {
+				var body struct {
+					Mode uint32 `json:"mode"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				remoteMode.Store(body.Mode)
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"status":"ok"}`))
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer srv.Close()
+
+		cl := client.New(srv.URL, "")
+		wb, err := New(Options{Policy: PolicyWriteBack, Client: cl})
+		if err != nil {
+			t.Fatal(err)
+		}
+		paused := make(chan struct{})
+		resume := make(chan struct{})
+		wb.testBeforeAdoptModeFlush = func() {
+			close(paused)
+			<-resume
+		}
+
+		h := &bufferingHandle{
+			w:              wb,
+			path:           "/order1.bin",
+			landed:         true,
+			pendingMode:    0o644,
+			hasPendingMode: true,
+		}
+		wb.track(h)
+		defer wb.untrack(h)
+
+		adoptDone := make(chan bool, 1)
+		go func() {
+			adoptDone <- wb.adoptExtentHandle(h, &noopExtentHandle{})
+		}()
+		<-paused
+
+		// Concurrent chmod(0600) arrives after h.extent is installed and succeeds.
+		if _, err := wb.Do(context.Background(), &fs.Op{
+			Kind: fs.OpSetAttr, Path: "/order1.bin", Handle: h,
+			HasMode: true, Mode: 0o600,
+		}, nil); err != nil {
+			t.Fatalf("migrated chmod 0600: %v", err)
+		}
+		if got := remoteMode.Load(); got != 0o600 {
+			t.Fatalf("remoteMode after chmod 0600 = %o, want 0600", got)
+		}
+
+		close(resume)
+		if !<-adoptDone {
+			t.Fatal("adoptExtentHandle returned false")
+		}
+		if got := remoteMode.Load(); got != 0o600 {
+			t.Fatalf("adoption overwrote acknowledged chmod: remoteMode = %o, want 0600", got)
+		}
+	})
+
+	t.Run("adoption-paused-in-flight", func(t *testing.T) {
+		var remoteMode atomic.Uint32
+		firstEntered := make(chan struct{})
+		releaseFirst := make(chan struct{})
+		var once sync.Once
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if _, ok := r.URL.Query()["chmod"]; ok {
+				var body struct {
+					Mode uint32 `json:"mode"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				if body.Mode == 0o644 {
+					once.Do(func() {
+						close(firstEntered)
+						<-releaseFirst
+					})
+				}
+				remoteMode.Store(body.Mode)
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"status":"ok"}`))
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer srv.Close()
+
+		cl := client.New(srv.URL, "")
+		wb, err := New(Options{Policy: PolicyWriteBack, Client: cl})
+		if err != nil {
+			t.Fatal(err)
+		}
+		h := &bufferingHandle{
+			w:              wb,
+			path:           "/order2.bin",
+			landed:         true,
+			pendingMode:    0o644,
+			hasPendingMode: true,
+		}
+		wb.track(h)
+		defer wb.untrack(h)
+
+		adoptDone := make(chan bool, 1)
+		go func() {
+			adoptDone <- wb.adoptExtentHandle(h, &noopExtentHandle{})
+		}()
+		<-firstEntered
+
+		chmodDone := make(chan error, 1)
+		go func() {
+			_, cerr := wb.Do(context.Background(), &fs.Op{
+				Kind: fs.OpSetAttr, Path: "/order2.bin", Handle: h,
+				HasMode: true, Mode: 0o600,
+			}, nil)
+			chmodDone <- cerr
+		}()
+		// Give OpSetattr a moment to record modeSeq=2 and queue on modeMu.
+		time.Sleep(20 * time.Millisecond)
+		close(releaseFirst)
+
+		if err := <-chmodDone; err != nil {
+			t.Fatalf("migrated chmod 0600: %v", err)
+		}
+		<-adoptDone
+		if got := remoteMode.Load(); got != 0o600 {
+			t.Fatalf("final remoteMode = %o, want 0600", got)
+		}
+	})
 }

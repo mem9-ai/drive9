@@ -114,33 +114,30 @@ func (s objectStorage) Put(ctx context.Context, key string, in io.Reader, getter
 		_, err := io.ReadFull(in, buf)
 		return err
 	}
-	if !s.bridge.cfg.NativeWriteback {
-		alreadyActive := s.bridge.hasStagedSlice(id)
-		if s.bridge.blocks.tryReserveBlockMem(id, size, maxPinnedCommitBytes) {
-			return s.putSliceMem(id, indx, size, in)
-		}
-		s.bridge.kickPendingFlush()
-		if s.bridge.blocks.tryReserveDiskSpool(size) {
-			return s.putSliceSpool(id, indx, size, in)
-		}
-		if err := s.bridge.blocks.reserveBlockMemPutSafe(ctx, id, size, maxPinnedCommitBytes, alreadyActive, s.bridge.kickPendingFlush); err != nil {
-			return err
-		}
-		return s.putSliceMem(id, indx, size, in)
-	}
-	if s.bridge.cfg.CacheDir == "" {
+	if s.bridge.cfg.NativeWriteback && s.bridge.cfg.CacheDir == "" {
 		return fmt.Errorf("extent native writeback requires CacheDir")
 	}
-	if err := s.bridge.blocks.waitDiskSpool(ctx, size, s.bridge.kickPendingFlush); err != nil {
+	if err := s.bridge.blocks.admitSliceBlock(ctx, id, indx, size, maxPinnedCommitBytes, s.bridge.kickPendingFlush); err != nil {
 		return err
 	}
-	return s.putSliceSpool(id, indx, size, in)
+	preferDisk := s.bridge.cfg.NativeWriteback || s.bridge.blocks.totalStagingBudget() > maxPinnedCommitBytes*3/4
+	if preferDisk && s.bridge.blocks.tryReserveDiskSpool(size) {
+		if err := s.putSliceSpool(id, indx, size, in); err != nil {
+			s.bridge.blocks.rollbackSliceBlock(id, size)
+			return err
+		}
+		return nil
+	}
+	if err := s.putSliceMem(id, indx, size, in); err != nil {
+		s.bridge.blocks.rollbackSliceBlock(id, size)
+		return err
+	}
+	return nil
 }
 
 func (s objectStorage) putSliceMem(id uint64, indx, size int64, in io.Reader) error {
 	buf := make([]byte, size)
 	if _, err := io.ReadFull(in, buf); err != nil {
-		s.bridge.blocks.releaseBlockMem(id, size)
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 			return fmt.Errorf("short staging read: %w", err)
 		}
@@ -170,8 +167,8 @@ func (s objectStorage) putSliceMem(id uint64, indx, size int64, in io.Reader) er
 	sl.blocks[indx] = buf
 	sl.total += size
 	s.bridge.mu.Unlock()
-	if prevLen > 0 {
-		s.bridge.blocks.releaseBlockMem(id, prevLen)
+	if prevLen+prevSpool > 0 {
+		s.bridge.blocks.refundOverwriteSliceUsed(id, prevLen+prevSpool)
 	}
 	if prevFile != nil {
 		_ = prevFile.Close()
@@ -230,8 +227,8 @@ func (s objectStorage) putSliceSpool(id uint64, indx, size int64, in io.Reader) 
 	sl.files[indx] = spooledBlock{f: f, size: size}
 	sl.total += size
 	s.bridge.mu.Unlock()
-	if prevLen > 0 {
-		s.bridge.blocks.releaseBlockMem(id, prevLen)
+	if prevLen+prevSpool > 0 {
+		s.bridge.blocks.refundOverwriteSliceUsed(id, prevLen+prevSpool)
 	}
 	if prevFile != nil {
 		_ = prevFile.Close()
@@ -354,7 +351,52 @@ func (s objectStorage) Head(ctx context.Context, key string) (object.Object, err
 }
 
 func (s objectStorage) Delete(ctx context.Context, key string, getters ...object.AttrGetter) error {
-	// Block deletion is server-owned (tenant-worker GC).
+	// Committed block deletion is server-owned (tenant-worker GC), but an
+	// aborted sliceWriter calls Delete on uncommitted staged blocks — release
+	// any local staging buffers/spool and reservation immediately.
+	if s.bridge == nil {
+		return nil
+	}
+	id, indx, _, err := parseKey(key)
+	if err != nil {
+		return nil
+	}
+	var removedLen int64
+	var removedFile *os.File
+	var removedSpool int64
+	var empty bool
+	s.bridge.mu.Lock()
+	if sl := s.bridge.stagedSlices[id]; sl != nil {
+		if prev, ok := sl.blocks[indx]; ok && prev != nil {
+			removedLen = int64(len(prev))
+			delete(sl.blocks, indx)
+			sl.total -= removedLen
+		}
+		if sl.files != nil {
+			if pf, ok := sl.files[indx]; ok && pf.f != nil {
+				removedFile = pf.f
+				removedSpool = pf.size
+				delete(sl.files, indx)
+				sl.total -= removedSpool
+			}
+		}
+		if len(sl.blocks) == 0 && len(sl.files) == 0 {
+			delete(s.bridge.stagedSlices, id)
+			empty = true
+		}
+	} else {
+		empty = true
+	}
+	s.bridge.mu.Unlock()
+	if removedFile != nil {
+		_ = removedFile.Close()
+		s.bridge.blocks.releaseDiskSpool(removedSpool)
+	}
+	if empty {
+		s.bridge.blocks.retireSliceMem(id)
+	} else if removedLen+removedSpool > 0 {
+		s.bridge.blocks.refundOverwriteSliceUsed(id, removedLen+removedSpool)
+	}
 	return nil
 }
 
@@ -457,6 +499,30 @@ func (r *blockRegistry) stagePinned(sha string, data []byte, pinned bool) uint64
 	return id
 }
 
+// stagePinnedAndRetireSlice atomically pins data for pending commit and retires
+// sliceID's staging reservation under one lock so totalStagingBudget never
+// spikes above limit during the stagedSlice -> pending transition.
+func (r *blockRegistry) stagePinnedAndRetireSlice(sha string, data []byte, sliceID uint64) uint64 {
+	id := r.stageBytes(sha, data)
+	size := int64(len(data))
+	r.mu.Lock()
+	if r.pins[sha] == 0 {
+		r.pinSizes[sha] = size
+		r.pinnedBytes += size
+	}
+	r.pins[sha]++
+	r.retireSliceMemLocked(sliceID)
+	r.mu.Unlock()
+	return id
+}
+
+func (r *blockRegistry) hasSliceAdmission(sliceID uint64) bool {
+	r.mu.Lock()
+	_, ok := r.sliceTarget[sliceID]
+	r.mu.Unlock()
+	return ok
+}
+
 // pin marks a checksum as referenced by a pending commit and accounts its
 // bytes against the pinned budget on the first reference.
 func (r *blockRegistry) pin(sha string, size int64) {
@@ -519,21 +585,34 @@ func (r *blockRegistry) addStagedMem(delta int64) {
 	r.mu.Unlock()
 }
 
-// waitBudgetLocked blocks while full() reports true under r.mu.
-func (r *blockRegistry) waitBudget(ctx context.Context, full func() bool) error {
+// waitBudgetWithHook blocks while full() reports true under r.mu, invoking
+// onWait whenever it parks.
+func (r *blockRegistry) waitBudgetWithHook(ctx context.Context, full func() bool, onWait func()) error {
 	r.mu.Lock()
 	for full() {
 		ch := r.budgetCh
 		r.mu.Unlock()
+		if onWait != nil {
+			onWait()
+		}
+		t := time.NewTimer(250 * time.Millisecond)
 		select {
 		case <-ch:
+			t.Stop()
+		case <-t.C:
 		case <-ctx.Done():
+			t.Stop()
 			return ctx.Err()
 		}
 		r.mu.Lock()
 	}
 	r.mu.Unlock()
 	return nil
+}
+
+// waitBudget blocks while full() reports true under r.mu.
+func (r *blockRegistry) waitBudget(ctx context.Context, full func() bool) error {
+	return r.waitBudgetWithHook(ctx, full, nil)
 }
 
 // waitPinnedBudget blocks while pending commits hold at least limit staged
@@ -561,8 +640,12 @@ func (r *blockRegistry) hasSmallerWaiterLocked(sliceID uint64) bool {
 
 // waitSliceAdmission admits a staging slice in ascending slice ID order and
 // reserves its estimated footprint up front so concurrent upload workers stay
-// bounded below limit without starving older slices.
+// strictly bounded at or below limit without starving older slices.
 func (r *blockRegistry) waitSliceAdmission(ctx context.Context, sliceID uint64, est, limit int64) error {
+	return r.waitSliceAdmissionWithHook(ctx, sliceID, est, limit, nil)
+}
+
+func (r *blockRegistry) waitSliceAdmissionWithHook(ctx context.Context, sliceID uint64, est, limit int64, onWait func()) error {
 	r.mu.Lock()
 	if _, ok := r.sliceTarget[sliceID]; ok {
 		r.mu.Unlock()
@@ -578,18 +661,25 @@ func (r *blockRegistry) waitSliceAdmission(ctx context.Context, sliceID uint64, 
 		if r.waitingSlices[sliceID] == 0 {
 			delete(r.waitingSlices, sliceID)
 		}
-		if !admitted || r.pinnedBytes+r.stagedMemBytes < limit || r.waitingSlices[sliceID] > 0 {
+		if !admitted || limit <= 0 || r.pinnedBytes+r.stagedMemBytes < limit || r.waitingSlices[sliceID] > 0 {
 			close(r.budgetCh)
 			r.budgetCh = make(chan struct{})
 		}
 		r.mu.Unlock()
 	}()
-	for ((r.pinnedBytes+r.stagedMemBytes >= limit) && (r.pinnedBytes > 0 || r.stagedMemBytes > 0)) || r.hasSmallerWaiterLocked(sliceID) {
+	for (limit > 0 && r.pinnedBytes+r.stagedMemBytes+est > limit && (r.pinnedBytes > 0 || r.stagedMemBytes > 0)) || r.hasSmallerWaiterLocked(sliceID) {
 		ch := r.budgetCh
 		r.mu.Unlock()
+		if onWait != nil {
+			onWait()
+		}
+		t := time.NewTimer(250 * time.Millisecond)
 		select {
 		case <-ch:
+			t.Stop()
+		case <-t.C:
 		case <-ctx.Done():
+			t.Stop()
 			r.mu.Lock()
 			return ctx.Err()
 		}
@@ -608,22 +698,79 @@ func (r *blockRegistry) waitSliceAdmission(ctx context.Context, sliceID uint64, 
 	return nil
 }
 
-// tryReserveBlockMem reserves exact block bytes in memory when within limit.
-func (r *blockRegistry) tryReserveBlockMem(sliceID uint64, size, limit int64) bool {
+// admitSliceBlock reserves staging capacity for one block of sliceID while
+// strictly enforcing limit (never bypassed). Multi-block slices reserve their
+// full 64 MiB chunk envelope on admission so subsequent blocks of an admitted
+// slice never wait and never push totalStagingBudget past limit.
+func (r *blockRegistry) admitSliceBlock(ctx context.Context, sliceID uint64, indx, size, limit int64, onWait func()) error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	if limit > 0 && r.pinnedBytes+r.stagedMemBytes+size > limit && (r.pinnedBytes > 0 || r.stagedMemBytes > 0) {
-		return false
+	if target, ok := r.sliceTarget[sliceID]; ok {
+		if r.sliceUsed == nil {
+			r.sliceUsed = make(map[uint64]int64)
+		}
+		if r.sliceUsed[sliceID]+size <= target {
+			r.sliceUsed[sliceID] += size
+			r.mu.Unlock()
+			return nil
+		}
+		delta := r.sliceUsed[sliceID] + size - target
+		for limit > 0 && r.pinnedBytes+r.stagedMemBytes+delta > limit && (r.pinnedBytes > 0 || r.stagedMemBytes > 0) {
+			ch := r.budgetCh
+			r.mu.Unlock()
+			if onWait != nil {
+				onWait()
+			}
+			t := time.NewTimer(250 * time.Millisecond)
+			select {
+			case <-ch:
+				t.Stop()
+			case <-t.C:
+			case <-ctx.Done():
+				t.Stop()
+				return ctx.Err()
+			}
+			r.mu.Lock()
+			target = r.sliceTarget[sliceID]
+			if r.sliceUsed[sliceID]+size <= target {
+				r.sliceUsed[sliceID] += size
+				r.mu.Unlock()
+				return nil
+			}
+			delta = r.sliceUsed[sliceID] + size - target
+		}
+		r.sliceTarget[sliceID] += delta
+		r.sliceUsed[sliceID] += size
+		r.stagedMemBytes += delta
+		r.mu.Unlock()
+		return nil
 	}
+	r.mu.Unlock()
+
+	est := int64(meta.ChunkSize)
+	if indx == 0 && size < blockSizeMiB<<20 {
+		est = size
+	}
+	if limit > 0 && est > limit && size <= limit {
+		est = size
+	}
+	if err := r.waitSliceAdmissionWithHook(ctx, sliceID, est, limit, onWait); err != nil {
+		return err
+	}
+	r.mu.Lock()
 	if r.sliceUsed == nil {
 		r.sliceUsed = make(map[uint64]int64)
 	}
+	if target, ok := r.sliceTarget[sliceID]; ok && r.sliceUsed[sliceID]+size > target {
+		delta := r.sliceUsed[sliceID] + size - target
+		r.sliceTarget[sliceID] += delta
+		r.stagedMemBytes += delta
+	}
 	r.sliceUsed[sliceID] += size
-	r.stagedMemBytes += size
-	return true
+	r.mu.Unlock()
+	return nil
 }
 
-func (r *blockRegistry) releaseBlockMem(sliceID uint64, size int64) {
+func (r *blockRegistry) refundOverwriteSliceUsed(sliceID uint64, size int64) {
 	if size <= 0 {
 		return
 	}
@@ -633,63 +780,20 @@ func (r *blockRegistry) releaseBlockMem(sliceID uint64, size int64) {
 	} else {
 		r.sliceUsed[sliceID] -= size
 	}
-	r.stagedMemBytes -= size
-	if r.stagedMemBytes < 0 {
-		r.stagedMemBytes = 0
-	}
-	close(r.budgetCh)
-	r.budgetCh = make(chan struct{})
 	r.mu.Unlock()
 }
 
-// reserveBlockMemPutSafe waits for memory budget ONLY when sliceID has not yet
-// started staging and fewer than half of the upload workers are parked, leaving
-// upload slots free so already-admitted slices can always finish and reach
-// Bridge.Write (where commit backpressure holds no upload slots).
-func (r *blockRegistry) reserveBlockMemPutSafe(ctx context.Context, sliceID uint64, size, limit int64, alreadyActive bool, onWait func()) error {
+func (r *blockRegistry) rollbackSliceBlock(sliceID uint64, size int64) {
+	if size <= 0 {
+		return
+	}
 	r.mu.Lock()
-	maxWaiters := r.maxUpload / 2
-	if maxWaiters < 1 {
-		maxWaiters = 1
+	if r.sliceUsed[sliceID] <= size {
+		r.retireSliceMemLocked(sliceID)
+	} else {
+		r.sliceUsed[sliceID] -= size
 	}
-	if alreadyActive || r.putWaiters >= maxWaiters {
-		if r.sliceUsed == nil {
-			r.sliceUsed = make(map[uint64]int64)
-		}
-		r.sliceUsed[sliceID] += size
-		r.stagedMemBytes += size
-		r.mu.Unlock()
-		return nil
-	}
-	r.putWaiters++
-	defer func() {
-		r.putWaiters--
-		r.mu.Unlock()
-	}()
-	for limit > 0 && r.pinnedBytes+r.stagedMemBytes+size > limit && (r.pinnedBytes > 0 || r.stagedMemBytes > 0) {
-		ch := r.budgetCh
-		r.mu.Unlock()
-		if onWait != nil {
-			onWait()
-		}
-		t := time.NewTimer(250 * time.Millisecond)
-		select {
-		case <-ch:
-			t.Stop()
-		case <-t.C:
-		case <-ctx.Done():
-			t.Stop()
-			r.mu.Lock()
-			return ctx.Err()
-		}
-		r.mu.Lock()
-	}
-	if r.sliceUsed == nil {
-		r.sliceUsed = make(map[uint64]int64)
-	}
-	r.sliceUsed[sliceID] += size
-	r.stagedMemBytes += size
-	return nil
+	r.mu.Unlock()
 }
 
 func (r *blockRegistry) checkDiskFreeRatio(size int64) bool {
@@ -722,40 +826,6 @@ func (r *blockRegistry) tryReserveDiskSpool(size int64) bool {
 	}
 	r.stagedDiskBytes += size
 	return true
-}
-
-func (r *blockRegistry) waitDiskSpool(ctx context.Context, size int64, onWait func()) error {
-	if r.cacheDir == "" || r.diskBudget <= 0 {
-		return fmt.Errorf("extent disk spool is disabled")
-	}
-	if size > r.diskBudget {
-		return syscall.ENOSPC
-	}
-	for {
-		if !r.checkDiskFreeRatio(size) {
-			return syscall.ENOSPC
-		}
-		r.mu.Lock()
-		if r.stagedDiskBytes+size <= r.diskBudget {
-			r.stagedDiskBytes += size
-			r.mu.Unlock()
-			return nil
-		}
-		ch := r.budgetCh
-		r.mu.Unlock()
-		if onWait != nil {
-			onWait()
-		}
-		t := time.NewTimer(250 * time.Millisecond)
-		select {
-		case <-ch:
-			t.Stop()
-		case <-t.C:
-		case <-ctx.Done():
-			t.Stop()
-			return ctx.Err()
-		}
-	}
 }
 
 func (r *blockRegistry) releaseDiskSpool(size int64) {

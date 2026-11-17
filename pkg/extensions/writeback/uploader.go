@@ -827,9 +827,11 @@ func (u *WriteBackUploader) tryUploadBatch(firstPath string) bool {
 		if err != nil && isBatchWriteUnsupported(err) {
 			u.batchDisabled.Store(true)
 		}
-		remaining := u.reconcileAmbiguousBatch(cands, remoteItems)
-		for _, p := range remaining {
-			u.uploadOne(p)
+		for i := len(cands) - 1; i >= 0; i-- {
+			cands[i].release()
+		}
+		for _, c := range cands {
+			u.uploadOne(c.path)
 		}
 		runFollowups(fallback)
 		return true
@@ -886,59 +888,6 @@ func (u *WriteBackUploader) tryUploadBatch(firstPath string) bool {
 	}
 	runFollowups(fallback)
 	return true
-}
-
-// reconcileAmbiguousBatch inspects an ambiguous BatchWriteCtx outcome via
-// BatchStatCtx(IncludeChecksum=true): items whose exact SHA-256 payload already
-// committed on the server during the ambiguous RPC are finalized cleanly instead
-// of falling back to a create-only PUT that would hit a false 409 conflict.
-func (u *WriteBackUploader) reconcileAmbiguousBatch(cands []uploaderBatchCandidate, remoteItems []client.BatchWriteItem) []string {
-	paths := make([]string, len(cands))
-	for i := range remoteItems {
-		paths[i] = remoteItems[i].Path
-	}
-	statCtx, statCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	stats, serr := u.client.BatchStatWithOptionsCtx(statCtx, paths, client.BatchStatOptions{IncludeChecksum: true})
-	statCancel()
-
-	var remaining []string
-	for i, c := range cands {
-		if serr == nil && i < len(stats) && stats[i].OK() && !stats[i].IsDir &&
-			stats[i].Size == int64(len(c.data)) && stats[i].ChecksumSHA256 != "" &&
-			stats[i].ChecksumSHA256 == payloadChecksum(c.data) {
-			committedRev := stats[i].Revision
-			u.recordLanding(c.path, c.data, committedRev, c.meta)
-			if u.OnSuccess != nil && c.meta.LineageTrusted() && c.meta.SnapshotID != "" && c.meta.Size == int64(len(c.data)) && len(c.data) <= 1<<20 {
-				c.meta.LiveChecksum = stats[i].ChecksumSHA256
-			}
-			committedRev = committedRevisionForExpectedRevision(c.expectedRev, committedRev)
-			if !remoteItems[i].HasMode {
-				chmodCtx, chmodCancel := context.WithTimeout(context.Background(), 30*time.Second)
-				modeErr := u.applyMode(chmodCtx, c.meta)
-				chmodCancel()
-				if modeErr != nil {
-					_, _ = u.cache.MarkChmodPending(c.path, c.gen)
-					if u.OnSuccess != nil {
-						u.OnSuccess(*c.meta, committedRev, c.stagingGens)
-					}
-					c.release()
-					continue
-				}
-			}
-			u.cache.RemoveIfGeneration(c.path, c.gen)
-			if u.perf != nil {
-				u.perf.uploaderSuccess.add(1)
-			}
-			if u.OnSuccess != nil {
-				u.OnSuccess(*c.meta, committedRev, c.stagingGens)
-			}
-			c.release()
-			continue
-		}
-		c.release()
-		remaining = append(remaining, c.path)
-	}
-	return remaining
 }
 
 // acquirePath registers an in-flight upload for localPath. If another upload

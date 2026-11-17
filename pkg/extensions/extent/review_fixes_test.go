@@ -567,3 +567,152 @@ func (bytesReadCloser) Close() error { return nil }
 func ioNopCloser(b []byte) bytesReadCloser {
 	return bytesReadCloser{bytes.NewReader(b)}
 }
+
+// Finding #19: Memory staging strictly enforces the configured limit with zero
+// bypasses even when active multi-block slices and >maxUpload/2 waiters compete.
+func TestMemoryStagingEnforcesStrictCapWithoutBypass(t *testing.T) {
+	r := newBlockRegistry()
+	const limit = 16 << 20 // 16 MiB test limit
+	const blockSz = 4 << 20
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Pin 12 MiB; only 4 MiB remains below limit.
+	pinnedKey := shaHex([]byte("pinned-12mb"))
+	r.stagePinned(pinnedKey, make([]byte, 12<<20), true)
+
+	// Admit slice 1 with a single 4 MiB block under a 4 MiB cap (clamped to block size when limit < 64 MiB? Note est=64MiB > 16MiB, size=4MiB <= 16MiB so est=4MiB -> 12+4 == 16MiB!).
+	if err := r.admitSliceBlock(ctx, 1, 0, blockSz, limit, nil); err != nil {
+		t.Fatalf("admit slice 1 block 0: %v", err)
+	}
+	if got := r.totalStagingBudget(); got != limit {
+		t.Fatalf("totalStagingBudget = %d, want %d", got, limit)
+	}
+
+	// Neither a second block of active slice 1 NOR 12 new concurrent slice waiters may bypass limit!
+	var bypassed atomic.Int32
+	var wg sync.WaitGroup
+	shortCtx, shortCancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer shortCancel()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := r.admitSliceBlock(shortCtx, 1, 1, blockSz, limit, nil); err == nil {
+			bypassed.Add(1)
+		}
+	}()
+	for i := 0; i < 12; i++ {
+		sid := uint64(10 + i)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := r.admitSliceBlock(shortCtx, sid, 0, blockSz, limit, nil); err == nil {
+				bypassed.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if bypassed.Load() != 0 {
+		t.Fatalf("%d callers bypassed full staging budget!", bypassed.Load())
+	}
+	if got := r.totalStagingBudget(); got > limit {
+		t.Fatalf("totalStagingBudget = %d exceeded limit %d", got, limit)
+	}
+
+	// Unpinning releases 12 MiB, allowing slice 1's second block to proceed cleanly.
+	r.unpin(pinnedKey)
+	if err := r.admitSliceBlock(ctx, 1, 1, blockSz, limit, nil); err != nil {
+		t.Fatalf("admit slice 1 block 1 after unpin: %v", err)
+	}
+	if got := r.totalStagingBudget(); got != 8<<20 {
+		t.Fatalf("totalStagingBudget after block 1 = %d, want %d", got, 8<<20)
+	}
+}
+
+// Finding #21: Explicit NativeWriteback with a 64 MiB cache allowance (16 MiB
+// disk spool reserve, MaxUpload=4) completes a full 64 MiB slice + overflow
+// without parking all upload workers or exceeding spoolBudget.
+func TestNativeWritebackSmallCacheCompletes64MiBSliceWithoutDeadlock(t *testing.T) {
+	f := newFakeV2(t)
+	cacheDir := t.TempDir()
+	eng := NewEngine(EngineConfig{
+		Client:     client.New(f.URL, ""),
+		RemoteRoot: "/",
+		CacheDir:   cacheDir,
+		CacheSize:  64 << 20, // 16 MiB disk spool reserve (< 64 MiB slice!)
+		Writeback:  true,
+	})
+	t.Cleanup(func() { _ = eng.Bridge.Shutdown() })
+	if !eng.Bridge.NativeWritebackForTest() {
+		t.Fatal("expected NativeWriteback == true")
+	}
+	if eng.Bridge.blocks.diskBudget != 16<<20 {
+		t.Fatalf("diskBudget = %d, want 16 MiB", eng.Bridge.blocks.diskBudget)
+	}
+
+	ext := New(Options{
+		Engine:    eng,
+		Threshold: 0,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	res, err := ext.Do(ctx, &fs.Op{
+		Kind: fs.OpCreate, Path: "/wb64.bin",
+		Flags: syscall.O_CREAT | syscall.O_RDWR | syscall.O_TRUNC,
+		Mode:  0o644, HasMode: true,
+	}, nil)
+	if err != nil {
+		t.Fatalf("create /wb64.bin: %v", err)
+	}
+	eh := res.Handle
+	defer func() { _ = eh.Release(ctx) }()
+
+	// Write 68 MiB (17 × 4 MiB blocks -> one full 64 MiB slice + 4 MiB tail)
+	// while monitoring peak disk spool bytes.
+	var peakDisk atomic.Int64
+	stopMon := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-stopMon:
+				return
+			default:
+				eng.Bridge.blocks.mu.Lock()
+				cur := eng.Bridge.blocks.stagedDiskBytes
+				eng.Bridge.blocks.mu.Unlock()
+				for {
+					old := peakDisk.Load()
+					if cur <= old || peakDisk.CompareAndSwap(old, cur) {
+						break
+					}
+				}
+				time.Sleep(time.Millisecond)
+			}
+		}
+	}()
+
+	chunk := bytes.Repeat([]byte("W"), 4<<20)
+	const totalBlocks = 17
+	for i := 0; i < totalBlocks; i++ {
+		if err := eh.Write(ctx, int64(i)*(4<<20), chunk); err != nil {
+			close(stopMon)
+			t.Fatalf("Write block %d: %v", i, err)
+		}
+	}
+	if err := eh.Sync(ctx); err != nil {
+		close(stopMon)
+		t.Fatalf("Sync 68 MiB native-writeback file: %v", err)
+	}
+	close(stopMon)
+
+	if peak := peakDisk.Load(); peak > 16<<20 {
+		t.Fatalf("peak stagedDiskBytes = %d exceeded 16 MiB spool reserve", peak)
+	}
+	if got := len(f.contentOf("/wb64.bin")); got != totalBlocks*(4<<20) {
+		t.Fatalf("remote size = %d, want %d", got, totalBlocks*(4<<20))
+	}
+}

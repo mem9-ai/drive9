@@ -184,8 +184,9 @@ type Writeback struct {
 	opts       Options
 	// migrationLogged/migrationLogMu rate-limit the migration-refusal line
 	// to one per path per minute.
-	migrationLogged map[string]time.Time
-	migrationLogMu  sync.Mutex
+	migrationLogged          map[string]time.Time
+	migrationLogMu           sync.Mutex
+	testBeforeAdoptModeFlush func()
 	// extentGlobs/extentMatchCutoff are the compiled pattern-owned
 	// promotion rules (see Options.ExtentPatterns).
 	extentGlobs       []globMatcher
@@ -409,6 +410,11 @@ type bufferingHandle struct {
 	flags uint32
 	// pendingMode defers a chmod past a dirty handle to its commit (
 	// pendingMode: applying it remotely mid-buffer would race the upload).
+	// modeMu + modeSeq serialize remote ChmodCtx calls after extent handle
+	// migration so a concurrent adoption apply can never overwrite a newer
+	// acknowledged chmod.
+	modeMu         sync.Mutex
+	modeSeq        uint64
 	pendingMode    uint32
 	hasPendingMode bool
 	// baseRev is the remote revision the buffer was opened against.
@@ -2231,11 +2237,12 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			if h != nil {
 				h.mu.Lock()
 				migrated := h.extent != nil
+				h.modeSeq++
+				h.pendingMode = op.Mode & 0o7777
+				h.hasPendingMode = true
 				var size int64
 				var anonymous bool
 				if !migrated {
-					h.pendingMode = op.Mode & 0o7777
-					h.hasPendingMode = true
 					size = h.baseSize
 					if h.buf != nil {
 						size = h.buf.Size()
@@ -2244,13 +2251,9 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 				}
 				h.mu.Unlock()
 				if migrated {
-					if err := w.applyDeferredMode(ctx, h, op.Mode&0o7777); err != nil {
+					if err := h.flushMigratedMode(ctx); err != nil {
 						return fs.Result{}, err
 					}
-					h.mu.Lock()
-					h.pendingMode = 0
-					h.hasPendingMode = false
-					h.mu.Unlock()
 					w.invalidate(op.Path, 0)
 					return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Mode: op.Mode & 0o7777, Size: h.sizeForAttr()}}, nil
 				}
@@ -2665,10 +2668,10 @@ func (w *Writeback) adoptExtentHandle(h *bufferingHandle, e fs.Handle) bool {
 	// out by the caller — otherwise a promoted file keeps the permissions
 	// it had before the chmod.
 	//
-	// Keep pendingMode/hasPendingMode armed on h until applyDeferredMode
-	// succeeds below; if that best-effort attempt fails, migrated Sync, Flush,
-	// and Release retry and surface any remaining error instead of dropping it.
-	pendingMode, hasPendingMode := h.pendingMode, h.hasPendingMode
+	// Keep pendingMode/hasPendingMode armed on h until flushMigratedMode
+	// succeeds below; modeMu + modeSeq order this best-effort apply against
+	// any concurrent migrated chmod, and Sync/Flush/Release retry on error.
+	hasPendingMode := h.hasPendingMode
 	// The engine owns the bytes now: retire the local staging state so a
 	// later flush cannot publish this stale image over the engine's.
 	h.dirty = false
@@ -2702,16 +2705,12 @@ func (w *Writeback) adoptExtentHandle(h *bufferingHandle, e fs.Handle) bool {
 		_ = liveSpillFile.Close()
 	}
 	if hasPendingMode {
+		if w.testBeforeAdoptModeFlush != nil {
+			w.testBeforeAdoptModeFlush()
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		if err := w.applyDeferredMode(ctx, h, pendingMode); err != nil {
+		if err := h.flushMigratedMode(ctx); err != nil {
 			safeLogPrintf("writeback: apply deferred chmod after extent migration for %s: %v", h.path, err)
-		} else {
-			h.mu.Lock()
-			if h.hasPendingMode && h.pendingMode == pendingMode {
-				h.pendingMode = 0
-				h.hasPendingMode = false
-			}
-			h.mu.Unlock()
 		}
 		cancel()
 	}
@@ -2719,32 +2718,41 @@ func (w *Writeback) adoptExtentHandle(h *bufferingHandle, e fs.Handle) bool {
 }
 
 func (h *bufferingHandle) flushMigratedMode(ctx context.Context) error {
-	h.mu.Lock()
-	mode, has := h.pendingMode, h.hasPendingMode
-	unlinked := h.unlinked
-	h.mu.Unlock()
-	if !has || unlinked || h.w == nil || h.w.opts.Client == nil {
+	if h.w == nil || h.w.opts.Client == nil {
 		return nil
 	}
-	if err := h.w.applyDeferredMode(ctx, h, mode); err != nil {
+	h.modeMu.Lock()
+	defer h.modeMu.Unlock()
+	h.mu.Lock()
+	mode, has, seq := h.pendingMode, h.hasPendingMode, h.modeSeq
+	unlinked := h.unlinked
+	path := h.path
+	h.mu.Unlock()
+	if !has || unlinked {
+		return nil
+	}
+	err := retryPostUploadMode(ctx, func() error {
+		return h.w.opts.Client.ChmodCtx(ctx, h.w.remotePath(path), mode&0o777)
+	})
+	if err != nil {
+		if client.IsForbidden(err) {
+			h.mu.Lock()
+			if h.modeSeq == seq {
+				h.pendingMode = 0
+				h.hasPendingMode = false
+			}
+			h.mu.Unlock()
+			return nil
+		}
 		return err
 	}
 	h.mu.Lock()
-	if h.hasPendingMode && h.pendingMode == mode {
+	if h.modeSeq == seq {
 		h.pendingMode = 0
 		h.hasPendingMode = false
 	}
 	h.mu.Unlock()
 	return nil
-}
-
-// applyDeferredMode pushes a chmod that was deferred past an open buffer.
-// The remote chmod goes through the client directly, which is exactly what
-// applyPendingMode did for this plane before the descriptor migrated.
-func (w *Writeback) applyDeferredMode(ctx context.Context, h *bufferingHandle, mode uint32) error {
-	return retryPostUploadMode(ctx, func() error {
-		return w.opts.Client.ChmodCtx(ctx, w.remotePath(h.path), mode&0o777)
-	})
 }
 
 // Unwrap exposes the terminal handle below so inner extensions can resolve

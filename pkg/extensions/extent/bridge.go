@@ -370,7 +370,6 @@ type blockRegistry struct {
 	freeRatio       float64
 	cacheDir        string
 	maxUpload       int
-	putWaiters      int
 	// budgetCh is closed (and replaced under mu) whenever pinnedBytes or
 	// stagedMemBytes drops or a waiter departs, waking budget waiters.
 	budgetCh chan struct{}

@@ -857,19 +857,49 @@ func (b *Bridge) Read(ctx meta.Context, ino meta.Ino, indx uint32, slices *[]met
 	return 0
 }
 
-func (b *Bridge) NewSlice(ctx meta.Context, id *uint64) syscall.Errno {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	*id = b.nextID
-	b.nextID++
-	return 0
+func (b *Bridge) withShutdownCtx(parent context.Context) (context.Context, context.CancelFunc) {
+	if b.retryStop == nil {
+		return context.WithCancel(parent)
+	}
+	ctx, cancel := context.WithCancel(parent)
+	go func() {
+		select {
+		case <-b.retryStop:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
 }
 
-func (b *Bridge) hasStagedSlice(id uint64) bool {
+func (b *Bridge) NewSlice(ctx meta.Context, id *uint64) syscall.Errno {
 	b.mu.Lock()
-	_, ok := b.stagedSlices[id]
+	sid := b.nextID
+	b.nextID++
 	b.mu.Unlock()
-	return ok
+
+	sctx, cancel := b.withShutdownCtx(ctxOf(ctx))
+	defer cancel()
+
+	if b.cfg.NativeWriteback || (b.cfg.MaxUpload > 0 && b.cfg.MaxUpload < 200) {
+		est := int64(meta.ChunkSize)
+		if maxPinnedCommitBytes > 0 && est > maxPinnedCommitBytes {
+			est = maxPinnedCommitBytes
+		}
+		if err := b.blocks.waitSliceAdmissionWithHook(sctx, sid, est, maxPinnedCommitBytes, b.kickPendingFlush); err != nil {
+			return errnoOf(err)
+		}
+	} else {
+		if err := b.blocks.waitBudgetWithHook(sctx, func() bool {
+			return maxPinnedCommitBytes > 0 &&
+				b.blocks.pinnedBytes+b.blocks.stagedMemBytes >= maxPinnedCommitBytes &&
+				(b.blocks.pinnedBytes > 0 || b.blocks.stagedMemBytes > 0)
+		}, b.kickPendingFlush); err != nil {
+			return errnoOf(err)
+		}
+	}
+	*id = sid
+	return 0
 }
 
 func (b *Bridge) flushAnyPending(ctx context.Context) {
@@ -1000,17 +1030,19 @@ func (b *Bridge) Write(ctx meta.Context, ino meta.Ino, indx uint32, off uint32, 
 			return syscall.EIO
 		}
 	}
-	// Backpressure: staged-but-uncommitted slices stay pinned in memory
-	// until their commit lands. Before sleeping on a full budget, actively
-	// attempt to flush pending commits so recovered servers drain immediately
-	// without deadlocking behind the wait.
-	if err := b.waitPinnedBudgetWithFlush(ctxOf(ctx), maxPinnedCommitBytes); err != nil {
-		return syscall.EIO
+	admitted := b.blocks.hasSliceAdmission(slice.Id)
+	if !admitted {
+		// Backpressure for synthetic callers that bypassed Put admission: wait
+		// until pinned commits drop below limit while actively driving retries.
+		if err := b.waitPinnedBudgetWithFlush(ctxOf(ctx), maxPinnedCommitBytes); err != nil {
+			return syscall.EIO
+		}
 	}
 	b.mu.Lock()
 	sl := b.stagedSlices[slice.Id]
 	if sl == nil || sl.total != int64(slice.Size) {
 		b.mu.Unlock()
+		b.blocks.retireSliceMem(slice.Id)
 		return syscall.EIO
 	}
 	delete(b.stagedSlices, slice.Id)
@@ -1025,18 +1057,13 @@ func (b *Bridge) Write(ctx meta.Context, ino meta.Ino, indx uint32, off uint32, 
 		b.blocks.releaseDiskSpool(spooled)
 	}
 	if int64(len(data)) != int64(slice.Size) {
-		if !b.cfg.NativeWriteback {
-			b.blocks.retireSliceMem(slice.Id)
-		}
+		b.blocks.retireSliceMem(slice.Id)
 		return syscall.EIO
 	}
 	sum := sha256Hex(data)
-	// Account pinned bytes BEFORE releasing slice staging memory so total tracked
-	// in-memory budget stays monotonic and never admits extra slices prematurely.
-	b.blocks.stagePinned(sum, data, true)
-	if !b.cfg.NativeWriteback {
-		b.blocks.retireSliceMem(slice.Id)
-	}
+	// Atomically pin data and retire slice.Id's staging reservation under one
+	// lock so total tracked RAM budget never spikes past maxPinnedCommitBytes.
+	b.blocks.stagePinnedAndRetireSlice(sum, data, slice.Id)
 
 	b.mu.Lock()
 	b.pending[ino] = append(b.pending[ino], pendingWrite{chunk: indx, off: off, checksum: sum, size: int64(slice.Len)})

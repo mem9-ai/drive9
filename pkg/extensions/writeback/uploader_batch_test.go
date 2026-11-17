@@ -240,3 +240,82 @@ func TestLargeSequentialWriteEvictsLivePartsBeforeFlush(t *testing.T) {
 		t.Fatalf("remote landed layout=%q size=%d, want extent / %d", layout, size, 80<<20)
 	}
 }
+
+// Finding #26: An ambiguous/malformed BatchWrite reply must NOT treat identical
+// foreign payload bytes as proof that this mount's create-only 0600 item or CAS
+// overwrite succeeded.
+func TestAmbiguousBatchDoesNotAcknowledgeForeignIdenticalBytes(t *testing.T) {
+	var foreignMode atomic.Uint32
+	foreignMode.Store(0o644)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/status":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"inline_threshold":51200,"storage_capabilities":{"batch_write_mode_v1":true}}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs:batch-write":
+			// Simulate truncated/malformed reply before batch executed.
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"results":[`))
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs/foreign.txt":
+			// Create-only PUT against existing foreign 0644 file must conflict!
+			if r.Header.Get("X-Dat9-Expected-Revision") == "0" {
+				http.Error(w, `{"error":"already exists"}`, http.StatusConflict)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs/fresh.txt":
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.WriteHeader(http.StatusCreated)
+		case r.Method == http.MethodPost && r.URL.RawQuery != "":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	cache, err := staging.NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cl := client.New(ts.URL, "")
+	_ = cl.SmallFileThreshold(context.Background())
+
+	if _, _, err := cache.PutWithBaseRevAndModeAndLineageTimingsNoSync("/foreign.txt", []byte("same"), 4, staging.PendingNew, 0, 0o600, true, "", "", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := cache.PutWithBaseRevAndModeAndLineageTimingsNoSync("/fresh.txt", []byte("ok"), 2, staging.PendingNew, 0, 0o600, true, "", "", false); err != nil {
+		t.Fatal(err)
+	}
+
+	var recordedForeign atomic.Bool
+	uploader := NewWriteBackUploader(cl, cache, 1)
+	uploader.RecordLanding = func(localPath string, _ []byte, _ int64, _ *staging.WriteBackMeta) {
+		if localPath == "/foreign.txt" {
+			recordedForeign.Store(true)
+		}
+	}
+	uploader.ConfigureBatchWrite(25*time.Millisecond, 64, client.MaxBatchWriteBytes)
+	uploader.Submit("/foreign.txt")
+	uploader.Submit("/fresh.txt")
+	uploader.DrainAll()
+
+	// /foreign.txt must remain retained in staging (with its 0600 mode intact)
+	// and must NOT be recorded as a same-origin landing!
+	meta, ok := cache.GetMeta("/foreign.txt")
+	if !ok {
+		t.Fatal("ambiguous batch falsely removed conflicted /foreign.txt from staging")
+	}
+	if !meta.HasMode || meta.Mode&0o777 != 0o600 {
+		t.Fatalf("retained /foreign.txt mode = (has=%v, mode=%o), want (true, 0600)", meta.HasMode, meta.Mode&0o777)
+	}
+	if recordedForeign.Load() {
+		t.Fatal("foreign file revision was falsely recorded via RecordLanding")
+	}
+	if foreignMode.Load() != 0o644 {
+		t.Fatalf("foreignMode mutated to %o", foreignMode.Load())
+	}
+}
