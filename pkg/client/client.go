@@ -1001,7 +1001,13 @@ func (c *Client) writeCtxConditionalFull(ctx context.Context, path string, data 
 	rev, err := c.writeCtxConditionalDirectOnly(ctx, path, data, expectedRevision, tags, description)
 	if err != nil && mayBeExtentDirectWriteRejection(err, expectedRevision) {
 		if st, statErr := c.StatCtx(ctx, path); statErr == nil && st != nil && !st.IsDir && st.ContentLayout == ContentLayoutExtent {
-			return c.writeExtentBytesConditional(ctx, path, data, expectedRevision, tags, description, nil, nil)
+			extRev, extErr := c.writeExtentBytesConditional(ctx, path, data, expectedRevision, tags, description, nil, nil)
+			if extErr == nil && extRev > 0 {
+				if out := completedRevisionSinkOf(ctx); out != nil {
+					*out = extRev
+				}
+			}
+			return extRev, extErr
 		}
 	}
 	return rev, err

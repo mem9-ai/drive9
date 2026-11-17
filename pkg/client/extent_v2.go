@@ -177,8 +177,10 @@ type extentPlanReader struct {
 	// limit bounds the total bytes the reader may serve (-1 = unbounded);
 	// ranged reads must never stream past the caller's requested length.
 	// rangeEnd caps continuation fetches to the original window end.
-	limit    int64
-	rangeEnd int64
+	limit         int64
+	rangeEnd      int64
+	refreshOffset int64
+	refreshCount  int
 }
 
 func (r *extentPlanReader) Read(p []byte) (int, error) {
@@ -206,6 +208,10 @@ func (r *extentPlanReader) Read(p []byte) (int, error) {
 			clear(p[:n])
 			r.zeroLeft -= int64(n)
 			r.off += int64(n)
+			if n > 0 {
+				r.refreshOffset = -1
+				r.refreshCount = 0
+			}
 			if r.limit >= 0 {
 				r.limit -= int64(n)
 			}
@@ -216,6 +222,10 @@ func (r *extentPlanReader) Read(p []byte) (int, error) {
 		if r.cur != nil {
 			n, err := r.cur.Read(p)
 			r.off += int64(n)
+			if n > 0 {
+				r.refreshOffset = -1
+				r.refreshCount = 0
+			}
 			if r.limit >= 0 {
 				r.limit -= int64(n)
 			}
@@ -252,16 +262,26 @@ func (r *extentPlanReader) Read(p []byte) (int, error) {
 			// requested offset): narrow the presigned GET to the slice.
 			rc, err := r.c.FetchExtentBlockRange(r.ctx, blk.URL, blk.BlockOffset, blk.Length)
 			if IsPresignExpired(err) {
-				end := r.rangeEnd
-				if r.limit >= 0 {
-					if lim := blk.FileOffset + r.limit - 1; end < 0 || lim < end {
-						end = lim
-					}
+				if r.refreshOffset != blk.FileOffset {
+					r.refreshOffset = blk.FileOffset
+					r.refreshCount = 0
 				}
-				if fresh, perr := r.c.GetExtentReadPlan(r.ctx, r.path, blk.FileOffset, end); perr == nil && len(fresh.Blocks) > 0 {
-					r.plan = fresh
-					r.bi = 0
-					continue
+				if r.refreshCount < 1 {
+					r.refreshCount++
+					end := r.rangeEnd
+					if r.limit >= 0 {
+						if lim := blk.FileOffset + r.limit - 1; end < 0 || lim < end {
+							end = lim
+						}
+					}
+					if fresh, perr := r.c.GetExtentReadPlan(r.ctx, r.path, blk.FileOffset, end); perr == nil && len(fresh.Blocks) > 0 {
+						if r.plan.Revision > 0 && fresh.Revision > 0 && fresh.Revision != r.plan.Revision {
+							return total, fmt.Errorf("extent file changed during read: revision %d -> %d", r.plan.Revision, fresh.Revision)
+						}
+						r.plan = fresh
+						r.bi = 0
+						continue
+					}
 				}
 			}
 			if err != nil {
@@ -271,15 +291,22 @@ func (r *extentPlanReader) Read(p []byte) (int, error) {
 			continue
 		}
 		if r.plan.NextOffset > 0 && r.plan.NextOffset < r.plan.Size {
+			prevNext := r.plan.NextOffset
 			end := r.rangeEnd
 			if r.limit >= 0 {
-				if lim := r.plan.NextOffset + r.limit - 1; end < 0 || lim < end {
+				if lim := prevNext + r.limit - 1; end < 0 || lim < end {
 					end = lim
 				}
 			}
-			plan, err := r.c.GetExtentReadPlan(r.ctx, r.path, r.plan.NextOffset, end)
+			plan, err := r.c.GetExtentReadPlan(r.ctx, r.path, prevNext, end)
 			if err != nil {
 				return total, err
+			}
+			if r.plan.Revision > 0 && plan.Revision > 0 && plan.Revision != r.plan.Revision {
+				return total, fmt.Errorf("extent file changed during read: revision %d -> %d", r.plan.Revision, plan.Revision)
+			}
+			if (plan.NextOffset > 0 && plan.NextOffset <= prevNext) || (len(plan.Blocks) == 0 && plan.NextOffset <= 0 && prevNext < plan.Size) {
+				return total, fmt.Errorf("extent read plan continuation did not advance at offset %d", prevNext)
 			}
 			r.plan = plan
 			r.bi = 0
@@ -317,7 +344,14 @@ func (c *Client) serveExtentPlan(ctx context.Context, path string, resp *http.Re
 	if err := json.NewDecoder(resp.Body).Decode(&plan); err != nil {
 		return nil, fmt.Errorf("decode extent read plan: %w", err)
 	}
-	return &extentPlanReader{ctx: ctx, c: c, path: path, plan: &plan, limit: limit, rangeEnd: end}, nil
+	if plan.Revision <= 0 {
+		if revHeader := resp.Header.Get("X-Dat9-Revision"); revHeader != "" {
+			if parsed, err := strconv.ParseInt(revHeader, 10, 64); err == nil && parsed > 0 {
+				plan.Revision = parsed
+			}
+		}
+	}
+	return &extentPlanReader{ctx: ctx, c: c, path: path, plan: &plan, limit: limit, rangeEnd: end, refreshOffset: -1}, nil
 }
 
 // FetchExtentBlockRange fetches [offset, offset+length) of the object behind
@@ -526,11 +560,17 @@ func (c *Client) TruncateExtentConditional(ctx context.Context, path string, st 
 		return nil, fmt.Errorf("extent truncate requires non-negative size")
 	}
 	var err error
+	ctxResID := expectedResourceOf(ctx)
 	if st == nil {
 		st, err = c.StatCtx(ctx, path)
 		if err != nil {
 			return nil, err
 		}
+		if ctxResID != "" && st.ResourceID != "" && st.ResourceID != ctxResID {
+			return nil, fmt.Errorf("%s: %w", path, ErrResourceMismatch)
+		}
+	} else if ctxResID != "" && st.ResourceID == "" {
+		st.ResourceID = ctxResID
 	}
 	if st.Size == newSize {
 		return st, nil
@@ -1001,6 +1041,7 @@ func (c *Client) writeExtentBytesConditional(ctx context.Context, path string, d
 	if err := validateTags(tags); err != nil {
 		return 0, err
 	}
+	callerSink := completedRevisionSinkOf(ctx)
 	var landedRev int64
 	rctx := WithCompletedRevisionSink(ctx, &landedRev)
 	size := int64(len(data))
@@ -1011,7 +1052,11 @@ func (c *Client) writeExtentBytesConditional(ctx context.Context, path string, d
 		// Compatibility with pre-0B-initiate extent servers when no tags or
 		// description need to ride V2 initiate/complete.
 		if size == 0 && tags == nil && description == "" && isZeroSizeExtentInitiateError(err) {
-			return c.fallbackZeroSizeExtentWrite(rctx, path, expectedRevision, summary, preCompleteCheck)
+			rev, ferr := c.fallbackZeroSizeExtentWrite(rctx, path, expectedRevision, summary, preCompleteCheck)
+			if ferr == nil && rev > 0 && callerSink != nil {
+				*callerSink = rev
+			}
+			return rev, ferr
 		}
 		return 0, err
 	}
@@ -1025,6 +1070,9 @@ func (c *Client) writeExtentBytesConditional(ctx context.Context, path string, d
 	if err := c.uploadExtentSequentialWithSummary(rctx, plan, bytes.NewReader(data), size, nil, summary, tags, preCompleteCheck); err != nil {
 		c.abortUploadV2BestEffort(rctx, plan.UploadID)
 		return 0, err
+	}
+	if landedRev > 0 && callerSink != nil {
+		*callerSink = landedRev
 	}
 	return landedRev, nil
 }
@@ -1041,6 +1089,14 @@ func (c *Client) fallbackZeroSizeExtentWrite(ctx context.Context, path string, e
 	if err := runPreCompleteCheck(ctx, preCompleteCheck); err != nil {
 		return 0, err
 	}
+	setZeroSummary := func() {
+		if summary != nil {
+			summary.Mode = "extent_v2"
+			summary.TotalParts = 0
+			summary.UploadedParts = 0
+			summary.Parallelism = 1
+		}
+	}
 	if expectedRevision == 0 {
 		rev, _, native, err := c.CreateExtentFileCreatedCtx(ctx, path)
 		if err != nil {
@@ -1049,28 +1105,42 @@ func (c *Client) fallbackZeroSizeExtentWrite(ctx context.Context, path string, e
 		if !native {
 			return 0, fmt.Errorf("server does not support 0-byte extent file creation on %s", path)
 		}
-		if summary != nil {
-			summary.Mode = "extent_v2"
-			summary.TotalParts = 0
-			summary.UploadedParts = 0
-			summary.Parallelism = 1
-		}
+		setZeroSummary()
 		return rev, nil
 	}
-	var st *StatResult
 	if expectedRevision > 0 {
-		st = &StatResult{Revision: expectedRevision, ResourceID: expectedResourceOf(ctx), ContentLayout: ContentLayoutExtent}
+		var landedRev int64
+		pctx := WithCompletedRevisionSink(ctx, &landedRev)
+		if err := c.CommitExtentPatchExpectedResource(pctx, path, 0, nil, expectedRevision, expectedResourceOf(ctx)); err != nil {
+			return 0, err
+		}
+		if landedRev <= 0 {
+			if fresh, serr := c.StatCtx(ctx, path); serr == nil && fresh != nil {
+				landedRev = fresh.Revision
+			}
+		}
+		setZeroSummary()
+		return landedRev, nil
 	}
-	updated, err := c.TruncateExtentConditional(ctx, path, st, 0)
+	updated, err := c.TruncateExtentConditional(ctx, path, nil, 0)
 	if err != nil {
+		if IsNotFound(err) {
+			if expectedResourceOf(ctx) != "" {
+				return 0, fmt.Errorf("%s: %w", path, ErrResourceMismatch)
+			}
+			rev, _, native, cerr := c.CreateExtentFileCreatedCtx(ctx, path)
+			if cerr != nil {
+				return 0, cerr
+			}
+			if !native {
+				return 0, fmt.Errorf("server does not support 0-byte extent file creation on %s", path)
+			}
+			setZeroSummary()
+			return rev, nil
+		}
 		return 0, err
 	}
-	if summary != nil {
-		summary.Mode = "extent_v2"
-		summary.TotalParts = 0
-		summary.UploadedParts = 0
-		summary.Parallelism = 1
-	}
+	setZeroSummary()
 	return updated.Revision, nil
 }
 
@@ -1121,31 +1191,42 @@ func buildExtentAppendSlices(baseSize, appendSize int64) ([]extentAppendSlice, e
 func (c *Client) appendExtentStream(ctx context.Context, path string, st *StatResult, r io.Reader, appendSize int64, progress ProgressFunc) error {
 	const inMemoryAppendCap = 16 << 20
 	var ra io.ReaderAt
+	var advanceSeeker func()
 	if readerAt, ok := r.(io.ReaderAt); ok {
-		ra = readerAt
-	} else if appendSize <= inMemoryAppendCap {
-		buf := make([]byte, appendSize)
-		if _, err := io.ReadFull(r, buf); err != nil {
-			return fmt.Errorf("read append bytes: %w", err)
+		if seeker, sok := r.(io.Seeker); sok {
+			if origin, serr := seeker.Seek(0, io.SeekCurrent); serr == nil && origin >= 0 {
+				ra = io.NewSectionReader(readerAt, origin, appendSize)
+				advanceSeeker = func() {
+					_, _ = seeker.Seek(origin+appendSize, io.SeekStart)
+				}
+			}
 		}
-		ra = bytes.NewReader(buf)
-	} else {
-		tmp, err := os.CreateTemp("", "drive9-extent-append-*")
-		if err != nil {
-			return fmt.Errorf("create append temp file: %w", err)
+	}
+	if ra == nil {
+		if appendSize <= inMemoryAppendCap {
+			buf := make([]byte, appendSize)
+			if _, err := io.ReadFull(r, buf); err != nil {
+				return fmt.Errorf("read append bytes: %w", err)
+			}
+			ra = bytes.NewReader(buf)
+		} else {
+			tmp, err := os.CreateTemp("", "drive9-extent-append-*")
+			if err != nil {
+				return fmt.Errorf("create append temp file: %w", err)
+			}
+			defer func() {
+				_ = tmp.Close()
+				_ = os.Remove(tmp.Name())
+			}()
+			written, err := io.Copy(tmp, io.LimitReader(r, appendSize))
+			if err != nil {
+				return fmt.Errorf("spool append data: %w", err)
+			}
+			if written != appendSize {
+				return fmt.Errorf("spool append data: got %d bytes, want %d", written, appendSize)
+			}
+			ra = tmp
 		}
-		defer func() {
-			_ = tmp.Close()
-			_ = os.Remove(tmp.Name())
-		}()
-		written, err := io.Copy(tmp, io.LimitReader(r, appendSize))
-		if err != nil {
-			return fmt.Errorf("spool append data: %w", err)
-		}
-		if written != appendSize {
-			return fmt.Errorf("spool append data: got %d bytes, want %d", written, appendSize)
-		}
-		ra = tmp
 	}
 
 	slices, err := buildExtentAppendSlices(st.Size, appendSize)
@@ -1226,7 +1307,13 @@ func (c *Client) appendExtentStream(ctx context.Context, path string, st *StatRe
 			Size:   s.size,
 		}
 	}
-	return c.completeUploadV2WithOptions(ctx, plan.UploadID, parts, nil, "")
+	if err := c.completeUploadV2WithOptions(ctx, plan.UploadID, parts, nil, ""); err != nil {
+		return err
+	}
+	if advanceSeeker != nil {
+		advanceSeeker()
+	}
+	return nil
 }
 
 func (c *Client) putExtentAppendSlices(ctx context.Context, plan *ExtentWritePlan, slices []extentAppendSlice, ra io.ReaderAt, pool *uploadBufferPool, reportProgress func(int, int64)) error {
@@ -1309,7 +1396,10 @@ func (c *Client) downloadExtentToFileParallel(ctx context.Context, remotePath, l
 		if err != nil {
 			return nil, err
 		}
-		if next.NextOffset > 0 && next.NextOffset <= prevNext {
+		if firstPlan.Revision > 0 && next.Revision > 0 && next.Revision != firstPlan.Revision {
+			return nil, fmt.Errorf("extent file changed during read: revision %d -> %d", firstPlan.Revision, next.Revision)
+		}
+		if (next.NextOffset > 0 && next.NextOffset <= prevNext) || (len(next.Blocks) == 0 && next.NextOffset <= 0 && prevNext < next.Size) {
 			return nil, fmt.Errorf("extent read plan continuation did not advance at offset %d", prevNext)
 		}
 		cur = next
@@ -1334,6 +1424,9 @@ func (c *Client) downloadExtentToFileParallel(ctx context.Context, remotePath, l
 					fresh, perr := c.GetExtentReadPlan(gctx, remotePath, blk.FileOffset, blk.FileOffset+blk.Length-1)
 					if perr != nil {
 						return fmt.Errorf("refresh extent read plan for %s: %w", remotePath, perr)
+					}
+					if firstPlan.Revision > 0 && fresh.Revision > 0 && fresh.Revision != firstPlan.Revision {
+						return fmt.Errorf("extent file changed during read: revision %d -> %d", firstPlan.Revision, fresh.Revision)
 					}
 					if len(fresh.Blocks) == 0 || fresh.Blocks[0].Zero || fresh.Blocks[0].URL == "" {
 						return fmt.Errorf("refreshed extent read plan for %s missing data block at %d", remotePath, blk.FileOffset)

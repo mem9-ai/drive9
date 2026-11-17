@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -379,5 +380,66 @@ func TestCliExtentDownloadCatAppendAndStat(t *testing.T) {
 	}
 	if parsed.ContentLayout != client.ContentLayoutExtent || parsed.StorageType != client.StorageTypeExtent {
 		t.Fatalf("parsed stat JSON = %+v, want extent layout & storage_type", parsed)
+	}
+
+	// 5. Same-identity Copy skips server-side `?copy` fast path when an explicit Layout is set.
+	var copyFastPathCalled atomic.Bool
+	var initiatedLayout string
+	sameSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Query().Has("copy"):
+			copyFastPathCalled.Store(true)
+			http.Error(w, "unexpected server-side copy fast path", http.StatusInternalServerError)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs/src.bin":
+			_, _ = w.Write([]byte("data"))
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/dst.bin":
+			w.WriteHeader(http.StatusNotFound)
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			initiatedLayout, _ = body["layout"].(string)
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"upload_id":   "copy-ext",
+				"part_size":   64,
+				"total_parts": 1,
+				"checksum_contract": map[string]any{
+					"supported": []string{"SHA-256"},
+					"required":  true,
+				},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/copy-ext/presign-batch":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"parts": []map[string]any{{"number": 1, "skip_upload": true, "size": 4}},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/copy-ext/complete":
+			_, _ = w.Write([]byte(`{"status":"ok","revision":1}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer sameSrv.Close()
+
+	sameClient := client.New(sameSrv.URL, "same-key")
+	sameClient.SetSmallFileThresholdForTests(64)
+	b1 := newDrive9FS(sameClient)
+	b2 := newDrive9FS(sameClient)
+	err = Copy(
+		context.Background(),
+		b1,
+		b2,
+		Location{Kind: KindDrive9, Context: "ctx1", Path: "/src.bin", Raw: "ctx1:/src.bin"},
+		Location{Kind: KindDrive9, Context: "ctx2", Path: "/dst.bin", Raw: "ctx2:/dst.bin"},
+		&FileInfo{Path: "/src.bin", Size: 4},
+		CopyOpts{Overwrite: true, Layout: string(client.ContentLayoutExtent)},
+	)
+	if err != nil {
+		t.Fatalf("Copy(same identity with explicit layout): %v", err)
+	}
+	if copyFastPathCalled.Load() {
+		t.Fatal("expected SameCopier fast path to be skipped when opts.Layout is set")
+	}
+	if initiatedLayout != string(client.ContentLayoutExtent) {
+		t.Fatalf("initiatedLayout = %q, want extent", initiatedLayout)
 	}
 }

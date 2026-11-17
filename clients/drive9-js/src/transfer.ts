@@ -3,6 +3,7 @@ import { bodyInit } from "./compat.js";
 import { Drive9Error, StatusError, checkError } from "./error.js";
 import {
   ExtentPresignUnsupportedError,
+  ResourceMismatchError,
   abortUploadV2BestEffort,
   initiateUploadV2WithLayout,
   isExtentLayoutMismatchError,
@@ -307,6 +308,9 @@ export async function writeStreamWithSummaryImpl(
       }
       const msg = initErr instanceof Error ? initErr.message : String(initErr);
       if (msg.includes("v2 upload API not available")) {
+        if (opts.expectedResourceId) {
+          throw new ResourceMismatchError(path);
+        }
         const v1Plan = await writeStreamV1(client, path, data, opts);
         return uploadSummary(path, effectiveSize, "multipart_v1", started, v1Plan.part_size, v1Plan.parts.length, v1Plan.parts.length);
       }
@@ -353,6 +357,9 @@ export async function writeStreamWithSummaryImpl(
     }
     const msg = err instanceof Error ? err.message : String(err);
     if (opts.layout !== "extent" && msg.includes("v2 upload API not available")) {
+      if (opts.expectedResourceId) {
+        throw new ResourceMismatchError(path);
+      }
       const plan = await writeStreamV1(client, path, data, opts);
       return uploadSummary(path, effectiveSize, "multipart_v1", started, plan.part_size, plan.parts.length, plan.parts.length);
     } else {

@@ -2,6 +2,7 @@ import type { Client } from "./client.js";
 import { bodyInit } from "./compat.js";
 import { checkError, Drive9Error, StatusError } from "./error.js";
 import {
+  abortUploadV2BestEffort,
   initiateUploadV2WithLayout,
   isExtentLayoutMismatchError,
   isExtentUploadPlan,
@@ -33,7 +34,8 @@ export class StreamWriter {
   private expectedResourceId?: string;
   private description: string;
   private tags?: Record<string, string>;
-  private layout?: ContentLayout;
+  private requestedLayout?: ContentLayout;
+  private targetLayout?: ContentLayout;
   private abortOnError: boolean;
   private state: StreamState;
   private sem: Semaphore;
@@ -59,7 +61,8 @@ export class StreamWriter {
       this.expectedResourceId = expectedRevision.expectedResourceId;
       this.description = expectedRevision.description || "";
       this.tags = expectedRevision.tags;
-      this.layout = expectedRevision.layout || expectedRevision.targetLayout;
+      this.requestedLayout = expectedRevision.layout;
+      this.targetLayout = expectedRevision.targetLayout;
     }
     this.abortOnError = abortOnError;
     this.state = {
@@ -212,30 +215,45 @@ export class StreamWriter {
   }
 
   private async initiate(): Promise<UploadPlanV2> {
+    const initialLayout =
+      this.requestedLayout === "extent"
+        ? "extent"
+        : this.requestedLayout === "single"
+          ? ""
+          : this.targetLayout === "extent"
+            ? "extent"
+            : "";
+    let plan: UploadPlanV2;
     try {
-      return await initiateUploadV2WithLayout(
+      plan = await initiateUploadV2WithLayout(
         this.client,
         this.path,
         this.totalSize,
         this.expectedRevision,
         this.description,
-        this.layout === "extent" ? "extent" : "",
+        initialLayout,
         this.expectedResourceId
       );
     } catch (err) {
-      if (!this.layout && isExtentLayoutMismatchError(err)) {
-        return initiateUploadV2WithLayout(
+      if (!this.requestedLayout && isExtentLayoutMismatchError(err)) {
+        plan = await initiateUploadV2WithLayout(
           this.client,
           this.path,
           this.totalSize,
           this.expectedRevision,
           this.description,
-          "extent",
+          initialLayout === "extent" ? "" : "extent",
           this.expectedResourceId
         );
+      } else {
+        throw err;
       }
-      throw err;
     }
+    if (this.requestedLayout === "extent" && plan.key) {
+      await abortUploadV2BestEffort(this.client, plan.upload_id);
+      throw new Drive9Error(`server ignored layout=extent on ${this.path}`);
+    }
+    return plan;
   }
 }
 

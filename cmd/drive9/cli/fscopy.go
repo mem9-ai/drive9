@@ -92,7 +92,7 @@ func StreamCopy(ctx context.Context, srcB, dstB Backend, src, dst Location, srcI
 // Copy routes same-backend CopyObject/Client.Copy when possible, otherwise
 // StreamCopy.
 func Copy(ctx context.Context, srcB, dstB Backend, src, dst Location, srcInfo *FileInfo, opts CopyOpts) error {
-	if len(opts.Tags) == 0 && opts.Description == "" &&
+	if len(opts.Tags) == 0 && opts.Description == "" && opts.Layout == "" &&
 		SameIdentity(srcB, dstB) && src.Bucket == dst.Bucket {
 		if sc, ok := dstB.(SameCopier); ok {
 			if !opts.Overwrite {

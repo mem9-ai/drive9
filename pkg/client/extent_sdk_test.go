@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -614,4 +615,222 @@ func TestStreamWriterAutoRetriesExtentOnLayoutMismatch(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), `layout must be "single" or "extent"`) {
 		t.Fatalf("invalid layout err = %v, want layout validation error", err)
 	}
+}
+
+func TestExtentReviewRegressions(t *testing.T) {
+	t.Run("extentPlanReader rejects stalled continuations, revision drift, and unbounded 403 refresh", func(t *testing.T) {
+		var planFetches atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/v1/fs/stalled.bin":
+				w.Header().Set("X-Dat9-Content-Layout", string(ContentLayoutExtent))
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusPartialContent)
+				if r.Header.Get("Range") == "" || strings.HasPrefix(r.Header.Get("Range"), "bytes=0-") {
+					_ = json.NewEncoder(w).Encode(ExtentReadPlan{
+						Size:       8,
+						Revision:   1,
+						Blocks:     []ExtentReadPlanBlock{{FileOffset: 0, Length: 4, Zero: true}},
+						NextOffset: 4,
+					})
+					return
+				}
+				// Stalled continuation: NextOffset repeats 4 with no blocks.
+				_ = json.NewEncoder(w).Encode(ExtentReadPlan{
+					Size:       8,
+					Revision:   1,
+					NextOffset: 4,
+				})
+			case "/v1/fs/drift.bin":
+				w.Header().Set("X-Dat9-Content-Layout", string(ContentLayoutExtent))
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusPartialContent)
+				if r.Header.Get("Range") == "" || strings.HasPrefix(r.Header.Get("Range"), "bytes=0-") {
+					_ = json.NewEncoder(w).Encode(ExtentReadPlan{
+						Size:       8,
+						Revision:   1,
+						Blocks:     []ExtentReadPlanBlock{{FileOffset: 0, Length: 4, Zero: true}},
+						NextOffset: 4,
+					})
+					return
+				}
+				_ = json.NewEncoder(w).Encode(ExtentReadPlan{
+					Size:     8,
+					Revision: 2,
+					Blocks:   []ExtentReadPlanBlock{{FileOffset: 4, Length: 4, Zero: true}},
+				})
+			case "/v1/fs/always403.bin":
+				planFetches.Add(1)
+				w.Header().Set("X-Dat9-Content-Layout", string(ContentLayoutExtent))
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusPartialContent)
+				_ = json.NewEncoder(w).Encode(ExtentReadPlan{
+					Size:     4,
+					Revision: 1,
+					Blocks:   []ExtentReadPlanBlock{{FileOffset: 0, Length: 4, URL: "http://" + r.Host + "/obj/403"}},
+				})
+			case "/obj/403":
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = w.Write([]byte("expired"))
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer srv.Close()
+
+		c := New(srv.URL, "")
+		if _, err := c.ReadCtx(context.Background(), "/stalled.bin"); err == nil || !strings.Contains(err.Error(), "did not advance") {
+			t.Fatalf("stalled continuation err = %v, want did not advance", err)
+		}
+		if _, err := c.ReadCtx(context.Background(), "/drift.bin"); err == nil || !strings.Contains(err.Error(), "changed during read") {
+			t.Fatalf("revision drift err = %v, want changed during read", err)
+		}
+		if _, err := c.ReadCtx(context.Background(), "/always403.bin"); err == nil {
+			t.Fatal("expected repeated 403 read to fail")
+		}
+		if got := planFetches.Load(); got != 2 {
+			t.Fatalf("planFetches on repeated 403 = %d, want 2 (initial + 1 bounded refresh)", got)
+		}
+	})
+
+	t.Run("zero-size fallback sends PATCH on positive expectedRevision and creates missing file on -1", func(t *testing.T) {
+		var patchSawExpectedRev int64
+		var createCalls atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":"total_size must be positive"}`))
+			case r.Method == http.MethodPatch && r.URL.Path == "/v1/fs/nonempty.bin":
+				var body struct {
+					NewSize          int64 `json:"new_size"`
+					ExpectedRevision int64 `json:"expected_revision"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				patchSawExpectedRev = body.ExpectedRevision
+				w.WriteHeader(http.StatusAccepted)
+				_ = json.NewEncoder(w).Encode(ExtentWritePlan{UploadID: "z-patch", NewSize: 0})
+			case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/z-patch/complete":
+				_, _ = w.Write([]byte(`{"status":"ok","revision":8}`))
+			case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/missing-zero.bin":
+				w.WriteHeader(http.StatusNotFound)
+			case r.Method == http.MethodPost && r.URL.Path == "/v1/fs/missing-zero.bin" && r.URL.Query().Get("create") == "1":
+				createCalls.Add(1)
+				w.WriteHeader(http.StatusCreated)
+				_, _ = w.Write([]byte(`{"revision":1,"resource_id":"r1","content_layout":"extent"}`))
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer srv.Close()
+
+		c := New(srv.URL, "")
+		rev, err := c.writeExtentBytesConditional(context.Background(), "/nonempty.bin", nil, 7, nil, "", nil, nil)
+		if err != nil {
+			t.Fatalf("writeExtentBytesConditional(0B, rev=7): %v", err)
+		}
+		if patchSawExpectedRev != 7 || rev != 8 {
+			t.Fatalf("patchSawExpectedRev=%d rev=%d, want 7 and 8", patchSawExpectedRev, rev)
+		}
+
+		rev2, err := c.writeExtentBytesConditional(context.Background(), "/missing-zero.bin", nil, -1, nil, "", nil, nil)
+		if err != nil {
+			t.Fatalf("writeExtentBytesConditional(0B, missing, rev=-1): %v", err)
+		}
+		if createCalls.Load() != 1 || rev2 != 1 {
+			t.Fatalf("createCalls=%d rev2=%d, want 1 and 1", createCalls.Load(), rev2)
+		}
+	})
+
+	t.Run("appendExtentStream honors current seeker offset and WriteCtx forwards completed revision sink", func(t *testing.T) {
+		var appended string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/seek.bin":
+				w.Header().Set("Content-Length", "4")
+				w.Header().Set("X-Dat9-Revision", "3")
+				w.Header().Set("X-Dat9-Content-Layout", string(ContentLayoutExtent))
+				w.WriteHeader(http.StatusOK)
+			case r.Method == http.MethodPatch && r.URL.Path == "/v1/fs/seek.bin":
+				w.WriteHeader(http.StatusAccepted)
+				_ = json.NewEncoder(w).Encode(ExtentWritePlan{
+					UploadID: "seek-app",
+					NewSize:  8,
+					Blocks:   []ExtentWritePlanBlock{{Chunk: 0, Off: 4, Size: 4, URL: "http://" + r.Host + "/obj/seek"}},
+				})
+			case r.Method == http.MethodPut && r.URL.Path == "/obj/seek":
+				b, _ := io.ReadAll(r.Body)
+				appended = string(b)
+				w.WriteHeader(http.StatusOK)
+			case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/seek-app/complete":
+				_, _ = w.Write([]byte(`{"status":"ok","revision":4}`))
+			case r.Method == http.MethodPut && r.URL.Path == "/v1/fs/sink.bin":
+				w.WriteHeader(http.StatusConflict)
+				_, _ = w.Write([]byte(`{"error":"content layout mismatch"}`))
+			case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/sink.bin":
+				w.Header().Set("Content-Length", "10")
+				w.Header().Set("X-Dat9-Revision", "10")
+				w.Header().Set("X-Dat9-Content-Layout", string(ContentLayoutExtent))
+				w.WriteHeader(http.StatusOK)
+			case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+				w.WriteHeader(http.StatusAccepted)
+				_ = json.NewEncoder(w).Encode(uploadPlanV2{
+					UploadID:         "sink-up",
+					PartSize:         ExtentBlockSize,
+					TotalParts:       1,
+					ChecksumContract: checksumContract{Supported: []string{"SHA-256"}, Required: true},
+				})
+			case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/sink-up/presign-batch":
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"parts": []presignedPart{{Number: 1, SkipUpload: true, Size: 2}},
+				})
+			case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/sink-up/complete":
+				_, _ = w.Write([]byte(`{"status":"ok","revision":11}`))
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer srv.Close()
+
+		c := New(srv.URL, "")
+		br := bytes.NewReader([]byte("prefixTAIL"))
+		if _, err := br.Seek(6, io.SeekStart); err != nil {
+			t.Fatalf("Seek: %v", err)
+		}
+		if err := c.AppendStream(context.Background(), "/seek.bin", br, 4, nil); err != nil {
+			t.Fatalf("AppendStream: %v", err)
+		}
+		if appended != "TAIL" {
+			t.Fatalf("appended = %q, want TAIL", appended)
+		}
+
+		var sinkRev int64
+		sctx := WithCompletedRevisionSink(context.Background(), &sinkRev)
+		if err := c.WriteCtx(sctx, "/sink.bin", []byte("hi")); err != nil {
+			t.Fatalf("WriteCtx(sink fallback): %v", err)
+		}
+		if sinkRev != 11 {
+			t.Fatalf("sinkRev = %d, want 11", sinkRev)
+		}
+
+		// Also verify TruncateExtentConditional enforces context expected resource on same-size HEAD.
+		rctx := WithExpectedResource(context.Background(), "expected-other")
+		_, err := c.TruncateExtentConditional(rctx, "/seek.bin", nil, 4)
+		if err != nil {
+			// /seek.bin HEAD didn't set X-Dat9-Resource-ID above; test explicit mismatch on a server that returns one.
+			_ = err
+		}
+		resSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Length", "4")
+			w.Header().Set("X-Dat9-Revision", "3")
+			w.Header().Set("X-Dat9-Resource-ID", "actual-res")
+			w.Header().Set("X-Dat9-Content-Layout", string(ContentLayoutExtent))
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer resSrv.Close()
+		_, err = New(resSrv.URL, "").TruncateExtentConditional(WithExpectedResource(context.Background(), "want-res"), "/x.bin", nil, 4)
+		if !errors.Is(err, ErrResourceMismatch) {
+			t.Fatalf("TruncateExtentConditional same-size resource mismatch err = %v, want ErrResourceMismatch", err)
+		}
+	})
 }

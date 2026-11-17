@@ -241,6 +241,8 @@ export function serveExtentPlanStream(
   let zeroLeft = 0;
   let remainingLimit = limit; // < 0 means unbounded
   let curReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  let refreshOffset = -1;
+  let refreshCount = 0;
 
   return new ReadableStream<Uint8Array>({
     async pull(controller) {
@@ -260,6 +262,10 @@ export function serveExtentPlanStream(
           }
           controller.enqueue(new Uint8Array(n));
           zeroLeft -= n;
+          if (n > 0) {
+            refreshOffset = -1;
+            refreshCount = 0;
+          }
           if (remainingLimit >= 0) {
             remainingLimit -= n;
           }
@@ -279,6 +285,8 @@ export function serveExtentPlanStream(
             remainingLimit -= chunk.length;
           }
           if (chunk.length > 0) {
+            refreshOffset = -1;
+            refreshCount = 0;
             controller.enqueue(chunk);
             return;
           }
@@ -302,16 +310,26 @@ export function serveExtentPlanStream(
             curReader = stream.getReader();
           } catch (err) {
             if (err instanceof PresignExpiredError) {
-              let end = rangeEnd;
-              if (remainingLimit >= 0) {
-                const lim = blk.file_offset + remainingLimit - 1;
-                if (end < 0 || lim < end) end = lim;
+              if (refreshOffset !== blk.file_offset) {
+                refreshOffset = blk.file_offset;
+                refreshCount = 0;
               }
-              const fresh = await getExtentReadPlanImpl(client, path, blk.file_offset, end);
-              if (fresh.blocks && fresh.blocks.length > 0) {
-                plan = fresh;
-                bi = 0;
-                continue;
+              if (refreshCount < 1) {
+                refreshCount++;
+                let end = rangeEnd;
+                if (remainingLimit >= 0) {
+                  const lim = blk.file_offset + remainingLimit - 1;
+                  if (end < 0 || lim < end) end = lim;
+                }
+                const fresh = await getExtentReadPlanImpl(client, path, blk.file_offset, end);
+                if (fresh.blocks && fresh.blocks.length > 0) {
+                  if (plan.revision && plan.revision > 0 && fresh.revision && fresh.revision > 0 && fresh.revision !== plan.revision) {
+                    throw new Drive9Error(`extent file changed during read: revision ${plan.revision} -> ${fresh.revision}`);
+                  }
+                  plan = fresh;
+                  bi = 0;
+                  continue;
+                }
               }
             }
             throw err;
@@ -326,7 +344,13 @@ export function serveExtentPlanStream(
             if (end < 0 || lim < end) end = lim;
           }
           const nextPlan = await getExtentReadPlanImpl(client, path, prevNext, end);
-          if (nextPlan.next_offset && nextPlan.next_offset <= prevNext) {
+          if (plan.revision && plan.revision > 0 && nextPlan.revision && nextPlan.revision > 0 && nextPlan.revision !== plan.revision) {
+            throw new Drive9Error(`extent file changed during read: revision ${plan.revision} -> ${nextPlan.revision}`);
+          }
+          if (
+            (nextPlan.next_offset && nextPlan.next_offset <= prevNext) ||
+            ((!nextPlan.blocks || nextPlan.blocks.length === 0) && !nextPlan.next_offset && prevNext < nextPlan.size)
+          ) {
             throw new Drive9Error(`extent read plan continuation did not advance at offset ${prevNext}`);
           }
           plan = nextPlan;
@@ -520,6 +544,9 @@ export async function truncateExtentImpl(
     };
   } else {
     st = await client.stat(path);
+    if (options?.expectedResourceId && st.resource_id && st.resource_id !== options.expectedResourceId) {
+      throw new ResourceMismatchError(path);
+    }
     if (st.size === newSize) {
       return st;
     }
@@ -832,11 +859,38 @@ export async function writeExtentBytesImpl(
         }
         return { revision: created.revision, partSize: 0, totalParts: 0, uploadedParts: 0 };
       }
-      const updated = await truncateExtentImpl(client, path, 0, {
-        expectedRevision: options.expectedRevision > 0 ? options.expectedRevision : undefined,
-        expectedResourceId: options.expectedResourceId,
-      });
-      return { revision: updated.revision, partSize: 0, totalParts: 0, uploadedParts: 0 };
+      if (options.expectedRevision > 0) {
+        let rev = await commitExtentPatchImpl(client, path, 0, [], options.expectedRevision, options.expectedResourceId);
+        if (rev <= 0) {
+          try {
+            rev = (await client.stat(path)).revision;
+          } catch {
+            // Leave rev as 0 if stat fails after commit.
+          }
+        }
+        return { revision: rev, partSize: 0, totalParts: 0, uploadedParts: 0 };
+      }
+      try {
+        const updated = await truncateExtentImpl(client, path, 0, {
+          expectedResourceId: options.expectedResourceId,
+        });
+        return { revision: updated.revision, partSize: 0, totalParts: 0, uploadedParts: 0 };
+      } catch (truncErr) {
+        const isMissing =
+          (truncErr instanceof StatusError && truncErr.statusCode === 404) ||
+          (truncErr instanceof Drive9Error && truncErr.message.toLowerCase().includes("not found"));
+        if (!isMissing) {
+          throw truncErr;
+        }
+        if (options.expectedResourceId) {
+          throw new ResourceMismatchError(path);
+        }
+        const created = await createExtentFileImpl(client, path);
+        if (!created.native_extent) {
+          throw new Drive9Error(`server does not support 0-byte extent file creation on ${path}`);
+        }
+        return { revision: created.revision, partSize: 0, totalParts: 0, uploadedParts: 0 };
+      }
     }
     throw err;
   }

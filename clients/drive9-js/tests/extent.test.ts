@@ -757,4 +757,172 @@ describe("Extent layout v2 support in TypeScript SDK", () => {
     // Verify unused imports / error types remain constructible.
     expect(new ConflictError("conflict")).toBeInstanceOf(Drive9Error);
   });
+
+  it("covers review edge cases: negative append rev, bounded 403/revision guards, 0B fallback, v1 resource guard, and StreamWriter layouts", async () => {
+    const client = new Client("http://localhost:9009", "test-key").withSmallFileThreshold(32);
+
+    // 1. append with explicit expectedRevision: -1 maps to stat.revision instead of sending -1.
+    let seenAppendRev = -99;
+    server.use(
+      http.head("http://localhost:9009/v1/fs/neg-app.bin", () =>
+        new HttpResponse(null, {
+          status: 200,
+          headers: {
+            "Content-Length": "4",
+            "X-Dat9-IsDir": "false",
+            "X-Dat9-Revision": "9",
+            "X-Dat9-Content-Layout": "extent",
+          },
+        })
+      ),
+      http.patch("http://localhost:9009/v1/fs/neg-app.bin", async ({ request }) => {
+        const body = (await request.json()) as { expected_revision: number; new_size: number; dirty_blocks: Array<{ chunk: number; off: number; size: number; checksum: string }> };
+        seenAppendRev = body.expected_revision;
+        return HttpResponse.json(
+          {
+            upload_id: "neg-app-1",
+            new_size: body.new_size,
+            blocks: body.dirty_blocks.map((d) => ({ ...d, url: "", exists: true })),
+          },
+          { status: 202 }
+        );
+      }),
+      http.post("http://localhost:9009/v2/uploads/neg-app-1/complete", () => HttpResponse.json({ status: "ok", revision: 10 }))
+    );
+    await client.append("/neg-app.bin", text.encode("xy"), { expectedRevision: -1 });
+    expect(seenAppendRev).toBe(9);
+    server.resetHandlers();
+
+    // 2. Read stream: bounded 403 refresh (1 retry max per block) and revision drift detection.
+    let planCalls403 = 0;
+    server.use(
+      http.get("http://localhost:9009/v1/fs/always-403.bin", () => {
+        planCalls403++;
+        return HttpResponse.json(
+          {
+            size: 4,
+            revision: 1,
+            blocks: [{ file_offset: 0, length: 4, block_offset: 0, url: "http://localhost:9009/obj/always-403" }],
+          },
+          { status: 206, headers: { "X-Dat9-Content-Layout": "extent" } }
+        );
+      }),
+      http.get("http://localhost:9009/obj/always-403", () => new HttpResponse("Forbidden", { status: 403 })),
+      http.get("http://localhost:9009/v1/fs/rev-drift.bin", ({ request }) => {
+        const rng = request.headers.get("range") || "bytes=0-";
+        const first = rng.startsWith("bytes=0-");
+        return HttpResponse.json(
+          {
+            size: 8,
+            revision: first ? 1 : 2,
+            blocks: [{ file_offset: first ? 0 : 4, length: 4, block_offset: 0, zero: true }],
+            next_offset: first ? 4 : undefined,
+          },
+          { status: 206, headers: { "X-Dat9-Content-Layout": "extent" } }
+        );
+      })
+    );
+    await expect(client.read("/always-403.bin")).rejects.toThrow(/403/);
+    expect(planCalls403).toBe(2);
+    await expect(client.read("/rev-drift.bin")).rejects.toThrow(/extent file changed during read/);
+    server.resetHandlers();
+
+    // 3. truncateExtent same-size checks expectedResourceId before returning no-op.
+    server.use(
+      http.head("http://localhost:9009/v1/fs/same-size.bin", () =>
+        new HttpResponse(null, {
+          status: 200,
+          headers: {
+            "Content-Length": "16",
+            "X-Dat9-IsDir": "false",
+            "X-Dat9-Revision": "3",
+            "X-Dat9-Resource-ID": "res-actual",
+            "X-Dat9-Content-Layout": "extent",
+          },
+        })
+      )
+    );
+    await expect(client.truncateExtent("/same-size.bin", 16, { expectedResourceId: "res-expected" })).rejects.toBeInstanceOf(
+      ResourceMismatchError
+    );
+    server.resetHandlers();
+
+    // 4. Zero-byte fallback creates missing destination on default expectedRevision (-1) and sends PATCH on positive expectedRevision.
+    let zeroCreateCalled = false;
+    let zeroPatchRev = 0;
+    server.use(
+      http.post("http://localhost:9009/v2/uploads/initiate", () =>
+        HttpResponse.json({ error: "total_size must be positive" }, { status: 400 })
+      ),
+      http.head("http://localhost:9009/v1/fs/new-zero.bin", () => new HttpResponse(null, { status: 404 })),
+      http.post("http://localhost:9009/v1/fs/new-zero.bin", () => {
+        zeroCreateCalled = true;
+        return HttpResponse.json({ revision: 1, resource_id: "rz", content_layout: "extent" }, { status: 201 });
+      }),
+      http.patch("http://localhost:9009/v1/fs/pos-zero.bin", async ({ request }) => {
+        const body = (await request.json()) as { expected_revision: number };
+        zeroPatchRev = body.expected_revision;
+        return HttpResponse.json({ upload_id: "pz-1", new_size: 0, blocks: [] }, { status: 202 });
+      }),
+      http.post("http://localhost:9009/v2/uploads/pz-1/complete", () => HttpResponse.json({ status: "ok", revision: 6 }))
+    );
+    await client.write("/new-zero.bin", new Uint8Array(0), { layout: "extent" });
+    expect(zeroCreateCalled).toBe(true);
+    expect(await client.writeWithRevision("/pos-zero.bin", new Uint8Array(0), { layout: "extent", expectedRevision: 5 })).toBe(6);
+    expect(zeroPatchRev).toBe(5);
+    server.resetHandlers();
+
+    // 5. V2 -> V1 fallback rejects uploads bound to expectedResourceId.
+    server.use(http.post("http://localhost:9009/v2/uploads/initiate", () => new HttpResponse("no v2", { status: 404 })));
+    await expect(
+      client.writeStream("/v1-bound.bin", new Uint8Array(64), 64, { expectedResourceId: "res-bound" })
+    ).rejects.toBeInstanceOf(ResourceMismatchError);
+    server.resetHandlers();
+
+    // 6. StreamWriter: targetLayout="single" still retries extent on mismatch; explicit layout="extent" rejects classic plan.
+    const seenSWLayouts: Array<string | undefined> = [];
+    let abortedClassicSW = false;
+    server.use(
+      http.post("http://localhost:9009/v2/uploads/initiate", async ({ request }) => {
+        const body = (await request.json()) as { path: string; layout?: string };
+        if (body.path === "/sw-legacy.bin") {
+          return HttpResponse.json(
+            { upload_id: "sw-classic-ignored", key: "tenant/classic", part_size: 4, total_parts: 1 },
+            { status: 202 }
+          );
+        }
+        seenSWLayouts.push(body.layout);
+        if (!body.layout) {
+          return HttpResponse.json({ error: "content layout mismatch" }, { status: 409 });
+        }
+        return HttpResponse.json(
+          {
+            upload_id: "sw-hint-ext",
+            key: "",
+            part_size: 4,
+            total_parts: 1,
+            checksum_contract: { supported: ["SHA-256"], required: true },
+          },
+          { status: 202 }
+        );
+      }),
+      http.post("http://localhost:9009/v2/uploads/sw-classic-ignored/abort", () => {
+        abortedClassicSW = true;
+        return HttpResponse.json({ status: "aborted" });
+      }),
+      http.post("http://localhost:9009/v2/uploads/sw-hint-ext/presign-batch", () =>
+        HttpResponse.json({ parts: [{ number: 1, url: "", size: 4, skip_upload: true }] })
+      ),
+      http.post("http://localhost:9009/v2/uploads/sw-hint-ext/complete", () => HttpResponse.json({ status: "ok", revision: 2 }))
+    );
+
+    const explicitSW = client.newStreamWriter("/sw-legacy.bin", 4, { layout: "extent" });
+    await expect(explicitSW.writePart(1, text.encode("1234"))).rejects.toThrow(/ignored layout=extent/);
+    expect(abortedClassicSW).toBe(true);
+
+    const hintedSW = client.newStreamWriter("/sw-hint.bin", 4, { targetLayout: "single" });
+    await hintedSW.writePart(1, text.encode("1234"));
+    await hintedSW.complete(0, new Uint8Array(0));
+    expect(seenSWLayouts).toEqual([undefined, "extent"]);
+  });
 });

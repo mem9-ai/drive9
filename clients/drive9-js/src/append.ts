@@ -49,8 +49,9 @@ export async function appendStreamImpl(
   }
 
   const expectedRevision = options?.expectedRevision ?? stat.revision;
+  const extentExpectedRevision = expectedRevision >= 0 ? expectedRevision : stat.revision;
   if (stat.content_layout === "extent") {
-    await appendExtentImpl(client, path, stat, data, expectedRevision, options);
+    await appendExtentImpl(client, path, stat, data, extentExpectedRevision, options);
     return;
   }
   let plan: AppendPlan;
@@ -58,7 +59,7 @@ export async function appendStreamImpl(
     plan = await initiateAppend(client, path, size, expectedRevision);
   } catch (err) {
     if (isExtentLayoutMismatchError(err)) {
-      await appendExtentImpl(client, path, stat, data, expectedRevision, options);
+      await appendExtentImpl(client, path, stat, data, extentExpectedRevision, options);
       return;
     }
     if (shouldRewriteAppend(err)) {
