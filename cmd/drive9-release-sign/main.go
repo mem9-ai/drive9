@@ -45,7 +45,8 @@ func run(args []string) error {
 	fs := flag.NewFlagSet("drive9-release-sign", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	verify := fs.Bool("verify", false, "verify <file>.sig against <file> instead of signing")
-	publicKey := fs.String("pubkey", "", "base64 ed25519 public key for -verify (default $"+publicKeyEnv+")")
+	verifyRelease := fs.Bool("verify-release", false, "verify checksums.txt, release.txt, their signatures, and the version-to-manifest binding (takes the checksums.txt path)")
+	publicKey := fs.String("pubkey", "", "base64 ed25519 public key (one, or a comma-separated set) for -verify/-verify-release (default $"+publicKeyEnv+")")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -53,11 +54,20 @@ func run(args []string) error {
 	if len(files) == 0 {
 		return errors.New("no input files (usage: drive9-release-sign [-verify] <file>...)")
 	}
+	if *verify && *verifyRelease {
+		return errors.New("-verify and -verify-release are mutually exclusive")
+	}
 	if *verify {
 		if len(files) != 1 {
 			return errors.New("-verify takes exactly one manifest path")
 		}
 		return verifyManifest(files[0], firstNonEmpty(*publicKey, os.Getenv(publicKeyEnv)))
+	}
+	if *verifyRelease {
+		if len(files) != 1 {
+			return errors.New("-verify-release takes exactly one checksums.txt path")
+		}
+		return verifyReleaseBundle(files[0], firstNonEmpty(*publicKey, os.Getenv(publicKeyEnv)))
 	}
 	privateKey, err := releasesign.ParsePrivateKey(os.Getenv(signingKeyEnv))
 	if err != nil {
@@ -99,13 +109,8 @@ func verifyManifest(manifestPath, publicKey string) error {
 	if err != nil {
 		return fmt.Errorf("read %s: %w", manifestPath, err)
 	}
-	signaturePath := manifestPath + ".sig"
-	signature, err := os.ReadFile(signaturePath)
-	if err != nil {
-		return fmt.Errorf("read %s: %w", signaturePath, err)
-	}
-	if err := releasesign.Verify(manifest, signature, publicKey); err != nil {
-		return fmt.Errorf("%w (pass the release key with -pubkey or $%s; a comma-separated list is accepted)", err, publicKeyEnv)
+	if err := verifySignedFile(manifestPath, manifest, publicKey); err != nil {
+		return err
 	}
 	fmt.Printf("signature OK: %s\n", manifestPath)
 	return nil
@@ -136,6 +141,55 @@ func validateReleaseFile(file string, body []byte) (string, error) {
 	default:
 		return "", fmt.Errorf("not a release artifact the updater reads (%s, %s)", releasesign.ManifestName, releasesign.ReleaseInfoName)
 	}
+}
+
+// verifyReleaseBundle is the manual counterpart of what the updater does before it installs
+// anything: both signatures, then the digest that binds the version to this exact manifest,
+// then the manifest structure. A mixed pair (one release's signed version, another release's
+// signed checksums) fails here, which is the point — printing a digest is not checking it.
+func verifyReleaseBundle(manifestPath, publicKey string) error {
+	dir := filepath.Dir(manifestPath)
+	manifest, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", manifestPath, err)
+	}
+	if err := verifySignedFile(manifestPath, manifest, publicKey); err != nil {
+		return err
+	}
+	infoPath := filepath.Join(dir, releasesign.ReleaseInfoName)
+	info, err := os.ReadFile(infoPath)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", infoPath, err)
+	}
+	if err := verifySignedFile(infoPath, info, publicKey); err != nil {
+		return err
+	}
+	parsed, err := releasesign.ParseReleaseInfo(info)
+	if err != nil {
+		return err
+	}
+	if err := parsed.ValidateManifest(manifest); err != nil {
+		return err
+	}
+	checksums, err := releasesign.ParseChecksums(manifest)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("release OK: version %s, %d artifacts, manifest %s\n", parsed.Version, len(checksums), parsed.ManifestSHA256)
+	return nil
+}
+
+// verifySignedFile reads <path>.sig and verifies it against the given key set.
+func verifySignedFile(path string, body []byte, publicKey string) error {
+	signaturePath := path + ".sig"
+	signature, err := os.ReadFile(signaturePath)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", signaturePath, err)
+	}
+	if err := releasesign.Verify(body, signature, publicKey); err != nil {
+		return fmt.Errorf("%s: %w (pass the release key with -pubkey or $%s; a comma-separated set is accepted)", filepath.Base(path), err, publicKeyEnv)
+	}
+	return nil
 }
 
 func firstNonEmpty(values ...string) string {

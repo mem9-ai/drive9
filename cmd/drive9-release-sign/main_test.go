@@ -149,3 +149,78 @@ func TestRunRefusesManifestTheUpdaterWouldReject(t *testing.T) {
 		t.Fatalf("run on an unknown file error = %v, want a refusal", err)
 	}
 }
+
+// -verify-release is the manual counterpart of what the updater does: both signatures, then
+// the digest that binds the version to this exact manifest. A mixed pair of genuine files
+// must fail here, or the documented procedure would pass a release the updater refuses.
+func TestRunVerifyReleaseBundle(t *testing.T) {
+	t.Setenv(signingKeyEnv, base64.StdEncoding.EncodeToString(testSigningKey.Seed()))
+	t.Setenv(publicKeyEnv, testPublicKey())
+
+	dir := t.TempDir()
+	writeRelease := func(sub string, artifactBody string, version string) string {
+		t.Helper()
+		sub = filepath.Join(dir, sub)
+		if err := os.MkdirAll(sub, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		manifest := []byte(releasesign.ManifestDigest([]byte(version)) + "  drive9-linux-amd64\n")
+		info := []byte("version " + version + "\nchecksums-sha256 " + releasesign.ManifestDigest(manifest) + "\n")
+		artifact := []byte(artifactBody)
+		for name, body := range map[string][]byte{
+			releasesign.ManifestName: manifest,
+			releasesign.ReleaseInfoName: info,
+			"drive9-linux-amd64":     artifact,
+		} {
+			if err := os.WriteFile(filepath.Join(sub, name), body, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := run([]string{filepath.Join(sub, releasesign.ManifestName), filepath.Join(sub, releasesign.ReleaseInfoName)}); err != nil {
+			t.Fatalf("sign %s: %v", sub, err)
+		}
+		return sub
+	}
+	older := writeRelease("older", "older", "v0.2.0")
+	newer := writeRelease("newer", "newer", "v9.0.0")
+
+	// A consistent release verifies.
+	if err := run([]string{"-verify-release", filepath.Join(older, releasesign.ManifestName)}); err != nil {
+		t.Fatalf("verify-release on a consistent pair: %v", err)
+	}
+
+	// Genuinely signed files from two releases do not form one release.
+	for _, name := range []string{releasesign.ReleaseInfoName, releasesign.ReleaseInfoSignatureName} {
+		body, err := os.ReadFile(filepath.Join(newer, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(older, name), body, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := run([]string{"-verify-release", filepath.Join(older, releasesign.ManifestName)}); err == nil || !strings.Contains(err.Error(), "release info describes manifest") {
+		t.Fatalf("verify-release on a mixed pair error = %v, want a digest mismatch", err)
+	}
+}
+
+// The guide's commands have to be runnable: no doubled continuations, and the manual route
+// must delegate to the binding check rather than printing a digest.
+func TestReleaseSigningGuideIsRunnable(t *testing.T) {
+	guide, err := os.ReadFile("../../docs/guides/release-signing.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(guide)
+	if strings.Contains(text, `\\`+"\n") {
+		t.Fatal("the guide contains a doubled line continuation, so pasted commands break")
+	}
+	for _, want := range []string{"-verify-release checksums.txt", "checksums-sha256", "set -euo pipefail"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("the manual verification section is missing %q", want)
+		}
+	}
+	if strings.Contains(text, `'^checksums-sha256 '`) {
+		t.Error("the guide still only prints the digest instead of comparing it")
+	}
+}

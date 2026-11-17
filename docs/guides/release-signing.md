@@ -34,42 +34,58 @@ overlap instead of switching in one release.
 
 ## Verifying a release by hand
 
-Two independent ways, both over the same bytes the CLI checks. Fetch one platform artifact,
-not every artifact:
+The updater checks three things: both signatures, the digest that binds the version to the
+manifest, and then the artifact bytes. The manual routes below check the same three, in the
+same order — a genuine `release.txt` from one release combined with a genuine `checksums.txt`
+from another fails, exactly as it does in `drive9 update`.
+
+Fetch one platform artifact, not every artifact:
 
 ```bash
-curl -fsSLO https://drive9.ai/releases/checksums.txt
-curl -fsSLO https://drive9.ai/releases/checksums.txt.sig
-curl -fsSLO https://drive9.ai/releases/release.txt
-curl -fsSLO https://drive9.ai/releases/release.txt.sig
-curl -fsSLO https://drive9.ai/releases/drive9-linux-amd64
-
-# 1) both signatures, then the version↔manifest binding, then the artifact bytes
-DRIVE9_RELEASE_PUBLIC_KEY="<comma-separated base64 keys>" \
-  go run ./cmd/drive9-release-sign -verify checksums.txt \
-  && DRIVE9_RELEASE_PUBLIC_KEY="<comma-separated base64 keys>" \
-     go run ./cmd/drive9-release-sign -verify release.txt \
-  && grep '^checksums-sha256 ' release.txt \\
-  && grep '  drive9-linux-amd64$' checksums.txt | sha256sum --check -
+set -euo pipefail
+KEYS='<comma-separated base64 public keys>'
+for f in checksums.txt checksums.txt.sig release.txt release.txt.sig drive9-linux-amd64; do
+  curl -fsSLO "https://drive9.ai/releases/$f"
+done
 ```
 
-With OpenSSL 3.x, no Go needed. The pinned keys are raw 32-byte ed25519 public keys, so wrap
-one in the fixed `SubjectPublicKeyInfo` prefix first:
+With the repository's own verifier (the same parsers and checks the updater runs):
 
 ```bash
-printf '%s' '<base64 public key>' | base64 -d > drive9-release.raw
+set -euo pipefail
+DRIVE9_RELEASE_PUBLIC_KEY="$KEYS" go run ./cmd/drive9-release-sign -verify-release checksums.txt
+grep '  drive9-linux-amd64$' checksums.txt | sha256sum --check -
+```
+
+`-verify-release` verifies both signatures, parses `release.txt`, and fails unless its
+`checksums-sha256` matches the downloaded `checksums.txt` before it prints the version. The
+checksum line then proves the artifact bytes.
+
+With OpenSSL 3.x, no Go needed. The pinned keys are raw 32-byte ed25519 public keys, so wrap
+one in the fixed `SubjectPublicKeyInfo` prefix first, verify both signatures, and compare the
+digest yourself:
+
+```bash
+set -euo pipefail
+printf '%s' '<one base64 public key>' | base64 -d > drive9-release.raw
 printf '\x30\x2a\x30\x05\x06\x03\x2b\x65\x70\x03\x21\x00' > drive9-release.der
 cat drive9-release.raw >> drive9-release.der
 openssl pkey -pubin -inform DER -in drive9-release.der -out drive9-release.pem
-base64 -d checksums.txt.sig > checksums.sig
-openssl pkeyutl -verify -pubin -inkey drive9-release.pem -rawin \\
-  -in checksums.txt -sigfile checksums.sig \\
-  && grep '  drive9-linux-amd64$' checksums.txt | sha256sum --check -
+
+verify_sig() { base64 -d "$1.sig" > "$1.sig.bin"
+  openssl pkeyutl -verify -pubin -inkey drive9-release.pem -rawin -in "$1" -sigfile "$1.sig.bin"; }
+verify_sig checksums.txt
+verify_sig release.txt
+
+expected="$(awk '$1 == "checksums-sha256" { print $2 }' release.txt)"
+actual="$(sha256sum checksums.txt | cut -d' ' -f1)"
+[ -n "$expected" ] && [ "$expected" = "$actual" ] || { echo "release.txt does not describe this checksums.txt" >&2; exit 1; }
+
+grep '  drive9-linux-amd64$' checksums.txt | sha256sum --check -
 ```
 
-`pkeyutl -verify` prints `Signature Verified Successfully` and exits 0; the checksum step
-runs only after that succeeds. Repeat for `release.txt` / `release.txt.sig` and compare
-`checksums-sha256` with `sha256sum checksums.txt`.
+Each step is `set -e`-equivalent by construction: a failed signature, a digest mismatch, or a
+checksum mismatch stops the script before the artifact is used.
 
 ## Signing a release
 
