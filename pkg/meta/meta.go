@@ -3584,7 +3584,15 @@ func (s *Store) SetTenantCredentialState(ctx context.Context, tenantID string, s
 	if strings.TrimSpace(tenantID) == "" {
 		return fmt.Errorf("tenant id is required")
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO tenant_credential_state (tenant_id, state, reason)
+	return setTenantCredentialStateTx(ctx, s.db, tenantID, state, reason)
+}
+
+// setTenantCredentialStateTx records a state through any executor, so the caller can put it
+// in the same transaction as the credential it describes.
+func setTenantCredentialStateTx(ctx context.Context, ex interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}, tenantID string, state TenantCredentialState, reason string) error {
+	_, err := ex.ExecContext(ctx, `INSERT INTO tenant_credential_state (tenant_id, state, reason)
 		VALUES (?, ?, ?)
 		ON DUPLICATE KEY UPDATE state = VALUES(state), reason = VALUES(reason)`,
 		tenantID, int(state), reason)
@@ -3607,14 +3615,28 @@ func (s *Store) TenantCredentialState(ctx context.Context, tenantID string) (sta
 	return TenantCredentialState(raw), reason, nil
 }
 
+// TenantDBCredentialUpdate is one credential write: the user the row must still name, the
+// credential to store, and the remediation outcome to record with it.
+type TenantDBCredentialUpdate struct {
+	FromDBUser     string
+	DBUser         string
+	PasswordCipher []byte
+	// State is the remediation outcome to record in the same transaction, so a credential
+	// and the claim about it can never disagree. Zero records no state.
+	State       TenantCredentialState
+	StateReason string
+}
+
 // UpdateTenantDBCredentialIf replaces a tenant's database credential when the row still
-// names fromDBUser, and signals every pod in the same transaction.
+// names FromDBUser, and records the outcome plus the cache-invalidation signal in the same
+// transaction.
 //
 // The signal matters as much as the update: a peer keeps the previous credential in its
 // resolved tenant row and inside open connections, so a rotated password must invalidate
-// those caches everywhere, not just in the process that performed the write. Otherwise the
-// peer keeps dialling with a password the database no longer accepts.
-func (s *Store) UpdateTenantDBCredentialIf(ctx context.Context, id, fromDBUser, dbUser string, dbPasswordCipher []byte) (updated bool, err error) {
+// those caches everywhere, not just in the process that performed the write. The state rows
+// belong in the transaction for the same reason: a credential written without its outcome
+// would make the next pass re-derive a claim the caller already knew and could have said.
+func (s *Store) UpdateTenantDBCredentialIf(ctx context.Context, id string, update TenantDBCredentialUpdate) (updated bool, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "update_tenant_db_credential_if", start, &err)
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -3628,7 +3650,7 @@ func (s *Store) UpdateTenantDBCredentialIf(ctx context.Context, id, fromDBUser, 
 		}
 	}()
 	res, err := tx.ExecContext(ctx, `UPDATE tenants SET db_user = ?, db_password = ?, updated_at = ? WHERE id = ? AND db_user = ?`,
-		dbUser, dbPasswordCipher, time.Now().UTC(), id, fromDBUser)
+		update.DBUser, update.PasswordCipher, time.Now().UTC(), id, update.FromDBUser)
 	if err != nil {
 		return false, err
 	}
@@ -3638,6 +3660,11 @@ func (s *Store) UpdateTenantDBCredentialIf(ctx context.Context, id, fromDBUser, 
 	}
 	if err := insertTenantNotifyTx(ctx, tx, id, TenantNotifyWorkTenantCredential); err != nil {
 		return false, fmt.Errorf("enqueue tenant credential invalidation: %w", err)
+	}
+	if update.State != 0 {
+		if err := setTenantCredentialStateTx(ctx, tx, id, update.State, update.StateReason); err != nil {
+			return false, fmt.Errorf("record tenant credential state: %w", err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return false, err

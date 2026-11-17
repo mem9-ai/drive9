@@ -422,3 +422,76 @@ func (rt *objectGCTestRuntime) insertRemediationTenantAt(t *testing.T, status me
 		t.Fatal(err)
 	}
 }
+
+// Finalization must not claim remediation when the provisioner could not verify the legacy
+// grant: an operator-managed account reports that, and the tenant is recorded for review
+// instead of being skipped as fixed by every later pass.
+func TestFinalizeRecordsUnverifiedCredentialForReview(t *testing.T) {
+	rt := newObjectGCTestRuntime(t)
+	ctx := context.Background()
+	const tenantID = "native-finalize-review"
+	const password = "operator-set-password"
+	rt.insertRemediationTenantWithPassword(t, tenantID, tenant.ProviderTiDBCloudNative, "t7.tdc_fs_sys", password)
+
+	srv := &Server{
+		meta: rt.meta,
+		pool: rt.pool,
+		provisioner: &fakeProvisioner{
+			provider:             tenant.ProviderTiDBCloudNative,
+			systemUsername:       "t7.tdc_fs_sys",
+			systemPassword:       password,
+			systemUserUnverified: true,
+		},
+	}
+	dsn := tenantDSN("t7.tdc_fs_sys", password, rt.dbHost, rt.dbPort, rt.dbName, false, tenant.ProviderTiDBCloudNative)
+	if err := srv.finalizeTenantSchemaInit(ctx, tenantID, dsn, tenant.ProviderTiDBCloudNative); err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+
+	state, reason, err := rt.meta.TenantCredentialState(ctx, tenantID)
+	if err != nil {
+		t.Fatalf("read recorded credential state: %v", err)
+	}
+	if state != meta.TenantCredentialReviewRequired {
+		t.Fatalf("recorded credential state = %d, want review required", state)
+	}
+	if !strings.Contains(reason, "finalization") {
+		t.Fatalf("review reason = %q, want the finalization reason", reason)
+	}
+	// The credential itself is persisted: finalization still records what the tenant dials with.
+	if got := rt.tenantCredential(t, tenantID); got != password {
+		t.Fatalf("stored credential = %q, want %q", got, password)
+	}
+}
+
+// A verified finalize records remediation, so the pass never re-dials the tenant.
+func TestFinalizeRecordsRemediatedCredential(t *testing.T) {
+	rt := newObjectGCTestRuntime(t)
+	ctx := context.Background()
+	const tenantID = "native-finalize-remediated"
+	rt.insertRemediationTenantWithPassword(t, tenantID, tenant.ProviderTiDBCloudNative, "t8.root", "db-pass")
+
+	srv := &Server{
+		meta: rt.meta,
+		pool: rt.pool,
+		provisioner: &fakeProvisioner{
+			provider:       tenant.ProviderTiDBCloudNative,
+			systemUsername: "t8.tdc_fs_sys",
+			systemPassword: "derived-pass",
+		},
+	}
+	dsn := tenantDSN("t8.root", "db-pass", rt.dbHost, rt.dbPort, rt.dbName, false, tenant.ProviderTiDBCloudNative)
+	if err := srv.finalizeTenantSchemaInit(ctx, tenantID, dsn, tenant.ProviderTiDBCloudNative); err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+	state, reason, err := rt.meta.TenantCredentialState(ctx, tenantID)
+	if err != nil {
+		t.Fatalf("read recorded credential state: %v", err)
+	}
+	if state != meta.TenantCredentialRemediated || reason != "" {
+		t.Fatalf("recorded credential state = %d/%q, want remediated", state, reason)
+	}
+	if got := rt.tenantCredential(t, tenantID); got != "derived-pass" {
+		t.Fatalf("stored credential = %q, want the provisioner's derived password", got)
+	}
+}

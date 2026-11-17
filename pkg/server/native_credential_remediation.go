@@ -242,14 +242,6 @@ func (s *Server) remediateNativeTenantCredentialFor(ctx context.Context, t *meta
 		if s.pool != nil {
 			s.pool.Invalidate(t.ID)
 		}
-		if stateErr := s.meta.SetTenantCredentialState(ctx, t.ID, meta.TenantCredentialRemediated, ""); stateErr != nil {
-			// The password is rotated, so the next pass sees a non-root credential. Without
-			// the marker it would read that as unverifiable and record the tenant for review,
-			// so a failure here must stay a failure and be retried.
-			logger.Warn(ctx, "native_credential_state_write_failed", zap.String("tenant_id", t.ID), zap.Error(stateErr))
-			s.recordNativeCredentialRemediationFailure(t.ID)
-			return nativeCredentialRemediationFailed
-		}
 		logger.Info(ctx, "native_credential_rotated", zap.String("tenant_id", t.ID))
 	}
 	s.clearNativeCredentialRemediationFailure(t.ID)
@@ -266,7 +258,15 @@ func (s *Server) persistRotatedTenantCredential(ctx context.Context, t *meta.Ten
 	if err != nil {
 		return fmt.Errorf("encrypt rotated tenant credential: %w", err)
 	}
-	updated, err := s.meta.UpdateTenantDBCredentialIf(ctx, t.ID, t.DBUser, t.DBUser, cipherPass)
+	// The credential and the claim that it was remediated are written together: a credential
+	// stored without the marker would make the next pass read our own rotation as an
+	// unverifiable account and flag the tenant for review.
+	updated, err := s.meta.UpdateTenantDBCredentialIf(ctx, t.ID, meta.TenantDBCredentialUpdate{
+		FromDBUser:     t.DBUser,
+		DBUser:         t.DBUser,
+		PasswordCipher: cipherPass,
+		State:          meta.TenantCredentialRemediated,
+	})
 	if err != nil {
 		return fmt.Errorf("persist rotated tenant credential: %w", err)
 	}

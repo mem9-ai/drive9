@@ -180,8 +180,11 @@ type provisioningRegionProvider interface {
 }
 
 type nativeSystemUserProvisioner interface {
-	// tenantID is reserved for audit/log naming; current native setup derives SQL principals from the DSN user.
-	EnsureSystemUser(ctx context.Context, dsn, tenantID string) (username, password string, err error)
+	// tenantID scopes the derived password, and grantVerified reports whether this call
+	// applied the setup that revokes the legacy cluster-wide grant. A false grantVerified is
+	// not an error: it means the stored credential could not prove the grant state, so the
+	// caller must record the tenant for review instead of claiming remediation.
+	EnsureSystemUser(ctx context.Context, dsn, tenantID string) (username, password string, grantVerified bool, err error)
 }
 
 func (s *Server) provisionerForTenantProvider(provider string) tenant.Provisioner {
@@ -6306,7 +6309,7 @@ func (s *Server) finalizeTenantSchemaInit(ctx context.Context, tenantID, tenantD
 	if fromDBUser == "" {
 		return fmt.Errorf("native tenant DSN has empty username")
 	}
-	username, password, err := systemUserProvisioner.EnsureSystemUser(ctx, tenantDSN, tenantID)
+	username, password, grantVerified, err := systemUserProvisioner.EnsureSystemUser(ctx, tenantDSN, tenantID)
 	if err != nil {
 		return fmt.Errorf("ensure native system user: %w", err)
 	}
@@ -6317,15 +6320,25 @@ func (s *Server) finalizeTenantSchemaInit(ctx context.Context, tenantID, tenantD
 	if err != nil {
 		return fmt.Errorf("encrypt native system user password: %w", err)
 	}
-	updated, err := s.meta.UpdateTenantDBCredentialIf(ctx, tenantID, fromDBUser, username, cipherPass)
+	update := meta.TenantDBCredentialUpdate{
+		FromDBUser:     fromDBUser,
+		DBUser:         username,
+		PasswordCipher: cipherPass,
+	}
+	if grantVerified {
+		// The setup ran, so the derived credential is in place and the legacy grant is gone:
+		// the outcome is recorded in the same transaction as the credential it describes.
+		update.State = meta.TenantCredentialRemediated
+	} else {
+		// The account is operator-managed, so this call changed nothing and cannot vouch for
+		// the grant. Recording that here keeps a later pass from treating the tenant either
+		// as remediated or as something it can fix.
+		update.State = meta.TenantCredentialReviewRequired
+		update.StateReason = "finalization could not verify the legacy grant: stored credential is not root-equivalent"
+	}
+	updated, err := s.meta.UpdateTenantDBCredentialIf(ctx, tenantID, update)
 	if err != nil {
 		return fmt.Errorf("persist native system user credential: %w", err)
-	}
-	// Finalization always sets the derived credential and runs the setup that revokes the
-	// legacy grant, so record the outcome: without the marker a later remediation pass would
-	// find a non-root credential and record the tenant for manual review on every leader.
-	if err := s.meta.SetTenantCredentialState(ctx, tenantID, meta.TenantCredentialRemediated, ""); err != nil {
-		return fmt.Errorf("record native tenant credential state: %w", err)
 	}
 	if !updated {
 		logger.Info(ctx, "native_system_user_credential_update_skipped",

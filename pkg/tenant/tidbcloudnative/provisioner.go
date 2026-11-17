@@ -443,25 +443,29 @@ func (p *Provisioner) EnsureDatabase(ctx context.Context, dsn string) error {
 	return nil
 }
 
-func (p *Provisioner) EnsureSystemUser(ctx context.Context, dsn, tenantID string) (string, string, error) {
+// EnsureSystemUser returns the restricted account's credential, and whether this call
+// actually applied the setup that revokes the legacy cluster-wide grant. A false second
+// result is not a failure: it means the stored credential could not prove the grant state
+// (an operator rotated the root password), so the caller must not claim remediation.
+func (p *Provisioner) EnsureSystemUser(ctx context.Context, dsn, tenantID string) (string, string, bool, error) {
 	cfg, err := mysql.ParseDSN(dsn)
 	if err != nil {
-		return "", "", fmt.Errorf("parse native tenant DSN: %w", err)
+		return "", "", false, fmt.Errorf("parse native tenant DSN: %w", err)
 	}
 	username, needsSetup, err := systemUsernameForCurrent(cfg.User)
 	if err != nil {
-		return "", "", fmt.Errorf("resolve native system username: %w", err)
+		return "", "", false, fmt.Errorf("resolve native system username: %w", err)
 	}
 	if cfg.Passwd == "" {
-		return "", "", fmt.Errorf("native tenant DSN password is empty")
+		return "", "", false, fmt.Errorf("native tenant DSN password is empty")
 	}
 	dbName, err := normalizeDatabaseName(cfg.DBName)
 	if err != nil {
-		return "", "", fmt.Errorf("resolve native system user database: %w", err)
+		return "", "", false, fmt.Errorf("resolve native system user database: %w", err)
 	}
 	tenantID = strings.TrimSpace(tenantID)
 	if tenantID == "" {
-		return "", "", fmt.Errorf("tenant id is required for native system user setup")
+		return "", "", false, fmt.Errorf("tenant id is required for native system user setup")
 	}
 	// The tenant's restricted account must never reuse the cluster root password: a
 	// leaked tenant credential would then be a credential for every database on the
@@ -477,22 +481,24 @@ func (p *Provisioner) EnsureSystemUser(ctx context.Context, dsn, tenantID string
 		// remediated from the stored credential.
 		rotated, err := rotateLegacySystemUser(ctx, cfg, username, dbName, password)
 		if err != nil {
-			return "", "", err
+			return "", "", false, err
 		}
 		if !rotated {
-			return cfg.User, cfg.Passwd, nil
+			// The account exists with a credential that is not the cluster root's, so this
+			// call did not run the setup and cannot vouch for the legacy grant.
+			return cfg.User, cfg.Passwd, false, nil
 		}
-		return username, password, nil
+		return username, password, true, nil
 	}
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
-		return "", "", fmt.Errorf("open native tenant database: %w", err)
+		return "", "", false, fmt.Errorf("open native tenant database: %w", err)
 	}
 	defer func() { _ = db.Close() }()
 	if err := ensureSystemUser(ctx, db, dbName, username, password); err != nil {
-		return "", "", fmt.Errorf("ensure native system user: %w", err)
+		return "", "", false, fmt.Errorf("ensure native system user: %w", err)
 	}
-	return username, password, nil
+	return username, password, true, nil
 }
 
 // deriveSystemUserPassword returns the restricted tenant account's password: a value

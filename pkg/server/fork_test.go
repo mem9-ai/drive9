@@ -56,7 +56,7 @@ func (f *fakeBranchProvisioner) DefaultCredentials() (tenant.CredentialProvision
 	}, true
 }
 
-func (f *fakeBranchProvisioner) EnsureSystemUser(context.Context, string, string) (string, string, error) {
+func (f *fakeBranchProvisioner) EnsureSystemUser(context.Context, string, string) (string, string, bool, error) {
 	f.mu.Lock()
 	f.systemUserCalls++
 	username := f.systemUsername
@@ -64,7 +64,7 @@ func (f *fakeBranchProvisioner) EnsureSystemUser(context.Context, string, string
 	err := f.systemUserErr
 	f.mu.Unlock()
 	if err != nil {
-		return "", "", err
+		return "", "", false, err
 	}
 	if username == "" {
 		username = "u1.tdc_fs_sys"
@@ -72,7 +72,7 @@ func (f *fakeBranchProvisioner) EnsureSystemUser(context.Context, string, string
 	if password == "" {
 		password = "system-pass"
 	}
-	return username, password, nil
+	return username, password, true, nil
 }
 
 func (f *fakeBranchProvisioner) Provision(context.Context, string) (*tenant.ClusterInfo, error) {

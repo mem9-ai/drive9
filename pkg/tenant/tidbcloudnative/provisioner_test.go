@@ -3193,10 +3193,10 @@ func TestDeriveSystemUserPassword(t *testing.T) {
 // and never falls back to the cluster root password when the stored DSN has none.
 func TestEnsureSystemUserRejectsIncompleteInput(t *testing.T) {
 	p := &Provisioner{}
-	if _, _, err := p.EnsureSystemUser(context.Background(), "u1.root:@tcp(127.0.0.1:4000)/tenant_db", "tenant-a"); err == nil || !strings.Contains(err.Error(), "password is empty") {
+	if _, _, _, err := p.EnsureSystemUser(context.Background(), "u1.root:@tcp(127.0.0.1:4000)/tenant_db", "tenant-a"); err == nil || !strings.Contains(err.Error(), "password is empty") {
 		t.Fatalf("EnsureSystemUser with an empty password error = %v, want a refusal", err)
 	}
-	if _, _, err := p.EnsureSystemUser(context.Background(), "u1.root:rootpass@tcp(127.0.0.1:4000)/tenant_db", "  "); err == nil || !strings.Contains(err.Error(), "tenant id is required") {
+	if _, _, _, err := p.EnsureSystemUser(context.Background(), "u1.root:rootpass@tcp(127.0.0.1:4000)/tenant_db", "  "); err == nil || !strings.Contains(err.Error(), "tenant id is required") {
 		t.Fatalf("EnsureSystemUser without a tenant id error = %v, want a refusal", err)
 	}
 }

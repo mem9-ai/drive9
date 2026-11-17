@@ -76,7 +76,9 @@ func TestUpdateTenantDBCredentialIfComparesPreviousUser(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	updated, err := s.UpdateTenantDBCredentialIf(context.Background(), "credential-cas-tenant", "other.root", "u1.tdc_fs_sys", []byte("system-cipher"))
+	updated, err := s.UpdateTenantDBCredentialIf(context.Background(), "credential-cas-tenant", TenantDBCredentialUpdate{
+		FromDBUser: "other.root", DBUser: "u1.tdc_fs_sys", PasswordCipher: []byte("system-cipher"),
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +94,10 @@ func TestUpdateTenantDBCredentialIfComparesPreviousUser(t *testing.T) {
 		t.Fatalf("tenant credential changed after failed CAS: user=%q pass=%q", dbUser, passCipher)
 	}
 
-	updated, err = s.UpdateTenantDBCredentialIf(context.Background(), "credential-cas-tenant", "u1.root", "u1.tdc_fs_sys", []byte("system-cipher"))
+	updated, err = s.UpdateTenantDBCredentialIf(context.Background(), "credential-cas-tenant", TenantDBCredentialUpdate{
+		FromDBUser: "u1.root", DBUser: "u1.tdc_fs_sys", PasswordCipher: []byte("system-cipher"),
+		State: TenantCredentialRemediated,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,7 +136,10 @@ func TestUpdateTenantDBCredentialIfComparesPreviousUser(t *testing.T) {
 			before++
 		}
 	}
-	stale, err := s.UpdateTenantDBCredentialIf(context.Background(), "credential-cas-tenant", "u1.root", "u1.tdc_fs_sys", []byte("other-cipher"))
+	stale, err := s.UpdateTenantDBCredentialIf(context.Background(), "credential-cas-tenant", TenantDBCredentialUpdate{
+		FromDBUser: "u1.root", DBUser: "u1.tdc_fs_sys", PasswordCipher: []byte("other-cipher"),
+		State: TenantCredentialRemediated,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,6 +158,42 @@ func TestUpdateTenantDBCredentialIfComparesPreviousUser(t *testing.T) {
 	}
 	if after != before {
 		t.Fatalf("a no-op credential update signalled a change: %d signals, want %d", after, before)
+	}
+
+	// The recorded outcome belongs in the same transaction as the credential: a credential
+	// written without it would let the next pass re-derive a claim the caller already knew.
+	state, _, err := s.TenantCredentialState(context.Background(), "credential-cas-tenant")
+	if err != nil {
+		t.Fatalf("credential update left no state behind: %v", err)
+	}
+	if state != TenantCredentialRemediated {
+		t.Fatalf("recorded state = %d, want remediated", state)
+	}
+
+	// And it is atomic: when the state row cannot be written, neither is the credential.
+	if _, err := s.DB().ExecContext(context.Background(), "RENAME TABLE tenant_credential_state TO tenant_credential_state_off"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := s.DB().ExecContext(context.Background(), "RENAME TABLE tenant_credential_state_off TO tenant_credential_state"); err != nil {
+			t.Errorf("restore tenant_credential_state: %v", err)
+		}
+	})
+	failedUpdate, err := s.UpdateTenantDBCredentialIf(context.Background(), "credential-cas-tenant", TenantDBCredentialUpdate{
+		FromDBUser: "u1.tdc_fs_sys", DBUser: "u1.tdc_fs_sys", PasswordCipher: []byte("half-written-cipher"),
+		State: TenantCredentialReviewRequired, StateReason: "interrupted",
+	})
+	if err == nil {
+		t.Fatal("the credential update succeeded without its state row")
+	}
+	if failedUpdate {
+		t.Fatal("a rolled-back credential update reported success")
+	}
+	if err := s.DB().QueryRow("SELECT db_user, db_password FROM tenants WHERE id = ?", "credential-cas-tenant").Scan(&dbUser, &passCipher); err != nil {
+		t.Fatal(err)
+	}
+	if dbUser != "u1.tdc_fs_sys" || string(passCipher) != "system-cipher" {
+		t.Fatalf("credential after a rolled-back update = %q/%q, want the previous one", dbUser, passCipher)
 	}
 }
 
