@@ -1768,6 +1768,13 @@ func (c *Client) resolveReadTargetOrExtentPlan(ctx context.Context, path string)
 		if err := json.NewDecoder(resp.Body).Decode(&plan); err != nil {
 			return nil, nil, fmt.Errorf("decode extent read plan: %w", err)
 		}
+		if plan.Revision <= 0 {
+			if revHeader := resp.Header.Get("X-Dat9-Revision"); revHeader != "" {
+				if parsed, err := strconv.ParseInt(revHeader, 10, 64); err == nil && parsed > 0 {
+					plan.Revision = parsed
+				}
+			}
+		}
 		return nil, &plan, nil
 
 	case resp.StatusCode >= 300:

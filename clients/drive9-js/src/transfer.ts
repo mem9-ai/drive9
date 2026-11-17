@@ -9,21 +9,21 @@ import {
   isExtentLayoutMismatchError,
   isExtentUploadPlan,
   mayBeExtentDirectWriteRejection,
+  parseExtentReadPlanResponse,
   serveExtentPlanStream,
   uploadExtentSequentialImpl,
   validateRequestedWriteLayout,
   writeDirectOnlyImpl,
   writeExtentBytesImpl,
+  type InternalWriteOptions,
 } from "./extent.js";
 import type {
   CompletePart,
-  ExtentReadPlan,
   PresignedPart,
   UploadMeta,
   UploadPlan,
   UploadPlanV2,
   UploadSummary,
-  WriteOptions,
 } from "./models.js";
 import { Semaphore } from "./utils.js";
 
@@ -103,7 +103,7 @@ export async function readStreamImpl(client: Client, path: string): Promise<Read
     return resp2.body;
   }
   if (status < 300 && resp.headers.get("x-dat9-content-layout") === "extent") {
-    const plan = (await resp.json()) as ExtentReadPlan;
+    const plan = await parseExtentReadPlanResponse(resp);
     return serveExtentPlanStream(client, path, plan, -1, -1);
   }
   await checkError(resp);
@@ -164,7 +164,7 @@ export async function readStreamRangeImpl(
     return new ReadableStream({ start(c) { c.close(); } });
   }
   if (status < 300 && resp.headers.get("x-dat9-content-layout") === "extent") {
-    const plan = (await resp.json()) as ExtentReadPlan;
+    const plan = await parseExtentReadPlanResponse(resp);
     return serveExtentPlanStream(client, path, plan, length, offset + length - 1);
   }
   if (resp.status >= 300) {
@@ -219,7 +219,7 @@ export async function writeStreamImpl(
   path: string,
   stream: ReadableStream<Uint8Array> | Uint8Array,
   size: number,
-  options?: number | WriteOptions
+  options?: number | InternalWriteOptions
 ): Promise<void> {
   await writeStreamWithSummaryImpl(client, path, stream, size, options);
 }
@@ -229,7 +229,7 @@ export async function writeStreamWithSummaryImpl(
   path: string,
   stream: ReadableStream<Uint8Array> | Uint8Array,
   size: number,
-  options?: number | WriteOptions
+  options?: number | InternalWriteOptions
 ): Promise<UploadSummary> {
   const opts = normalizeWriteOptions(options);
   validateRequestedWriteLayout(opts.layout);
@@ -368,7 +368,7 @@ export async function writeStreamWithSummaryImpl(
   }
 }
 
-function normalizeWriteOptions(options?: number | WriteOptions): Required<Pick<WriteOptions, "expectedRevision">> & Omit<WriteOptions, "expectedRevision"> {
+function normalizeWriteOptions(options?: number | InternalWriteOptions): Required<Pick<InternalWriteOptions, "expectedRevision">> & Omit<InternalWriteOptions, "expectedRevision"> {
   if (typeof options === "number") return { expectedRevision: options };
   return {
     expectedRevision: options?.expectedRevision ?? -1,
@@ -412,7 +412,7 @@ async function writeStreamV1(
   client: Client,
   path: string,
   data: Uint8Array,
-  options: Required<Pick<WriteOptions, "expectedRevision">> & Omit<WriteOptions, "expectedRevision">
+  options: Required<Pick<InternalWriteOptions, "expectedRevision">> & Omit<InternalWriteOptions, "expectedRevision">
 ): Promise<UploadPlan> {
   const checksums = computePartChecksums(data, PART_SIZE);
   const plan = await initiateUpload(client, path, data.length, checksums, options.expectedRevision, options.description || "");
@@ -425,7 +425,7 @@ async function writeStreamV2(
   client: Client,
   path: string,
   data: Uint8Array,
-  options: Required<Pick<WriteOptions, "expectedRevision">> & Omit<WriteOptions, "expectedRevision">
+  options: Required<Pick<InternalWriteOptions, "expectedRevision">> & Omit<InternalWriteOptions, "expectedRevision">
 ): Promise<UploadPlanV2> {
   const plan = await initiateUploadV2WithLayout(
     client,

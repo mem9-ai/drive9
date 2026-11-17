@@ -833,4 +833,99 @@ func TestExtentReviewRegressions(t *testing.T) {
 			t.Fatalf("TruncateExtentConditional same-size resource mismatch err = %v, want ErrResourceMismatch", err)
 		}
 	})
+
+	t.Run("Round 2 review guards: supplied stat resource mismatch, 0B single rejection, sink attribution, and header revision drift", func(t *testing.T) {
+		var headCalls atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":"total_size must be positive"}`))
+			case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/empty-single.bin":
+				w.Header().Set("Content-Length", "0")
+				w.Header().Set("X-Dat9-Revision", "4")
+				w.Header().Set("X-Dat9-Content-Layout", string(ContentLayoutSingle))
+				w.WriteHeader(http.StatusOK)
+			case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/empty-extent.bin":
+				w.Header().Set("Content-Length", "0")
+				w.Header().Set("X-Dat9-Revision", "6")
+				w.Header().Set("X-Dat9-Content-Layout", string(ContentLayoutExtent))
+				w.WriteHeader(http.StatusOK)
+			case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/no-rev-commit.bin":
+				headCalls.Add(1)
+				w.Header().Set("Content-Length", "0")
+				w.Header().Set("X-Dat9-Revision", "999")
+				w.WriteHeader(http.StatusOK)
+			case r.Method == http.MethodPatch && r.URL.Path == "/v1/fs/no-rev-commit.bin":
+				w.WriteHeader(http.StatusAccepted)
+				_ = json.NewEncoder(w).Encode(ExtentWritePlan{UploadID: "nr-1", NewSize: 0})
+			case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/nr-1/complete":
+				_, _ = w.Write([]byte(`{"status":"ok"}`))
+			case r.Method == http.MethodGet && r.URL.Path == "/v1/fs/header-rev.bin":
+				w.Header().Set("X-Dat9-Content-Layout", string(ContentLayoutExtent))
+				if strings.HasPrefix(r.Header.Get("Range"), "bytes=4-") {
+					w.Header().Set("X-Dat9-Revision", "6")
+					w.WriteHeader(http.StatusPartialContent)
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"size":   8,
+						"blocks": []map[string]any{{"file_offset": 4, "length": 4, "zero": true}},
+					})
+					return
+				}
+				w.Header().Set("X-Dat9-Revision", "5")
+				w.WriteHeader(http.StatusPartialContent)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"size":        8,
+					"blocks":      []map[string]any{{"file_offset": 0, "length": 4, "zero": true}},
+					"next_offset": 4,
+				})
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer srv.Close()
+
+		c := New(srv.URL, "")
+
+		// 1. Supplied st conflicting with context expected resource must fail immediately.
+		supplied := &StatResult{Size: 16, Revision: 2, ResourceID: "res-b", ContentLayout: ContentLayoutExtent}
+		_, err := c.TruncateExtentConditional(WithExpectedResource(context.Background(), "res-a"), "/unused.bin", supplied, 16)
+		if !errors.Is(err, ErrResourceMismatch) {
+			t.Fatalf("TruncateExtentConditional(same-size supplied mismatch) err = %v, want ErrResourceMismatch", err)
+		}
+		_, err = c.TruncateExtentConditional(WithExpectedResource(context.Background(), "res-a"), "/unused.bin", supplied, 0)
+		if !errors.Is(err, ErrResourceMismatch) {
+			t.Fatalf("TruncateExtentConditional(resize supplied mismatch) err = %v, want ErrResourceMismatch", err)
+		}
+
+		// 2. 0B extent write fallback rejects an existing empty single-layout file, while allowing empty extent no-op.
+		_, err = c.writeExtentBytesConditional(context.Background(), "/empty-single.bin", nil, -1, nil, "", nil, nil)
+		var se *StatusError
+		if !errors.As(err, &se) || se.StatusCode != http.StatusConflict {
+			t.Fatalf("writeExtentBytesConditional(empty single) err = %v, want 409 StatusError", err)
+		}
+		var noopSink int64
+		rev, err := c.writeExtentBytesConditional(WithCompletedRevisionSink(context.Background(), &noopSink), "/empty-extent.bin", nil, -1, nil, "", nil, nil)
+		if err != nil || rev != 6 || noopSink != 0 {
+			t.Fatalf("writeExtentBytesConditional(empty extent) rev=%d sink=%d err=%v, want rev=6 sink=0 nil", rev, noopSink, err)
+		}
+
+		// 3. 0B extent write fallback with positive expectedRevision leaves sink at 0 and skips post-commit StatCtx when commit omits revision.
+		var commitSink int64
+		rev, err = c.writeExtentBytesConditional(WithCompletedRevisionSink(context.Background(), &commitSink), "/no-rev-commit.bin", nil, 3, nil, "", nil, nil)
+		if err != nil || rev != 0 || commitSink != 0 || headCalls.Load() != 0 {
+			t.Fatalf("writeExtentBytesConditional(no-rev commit) rev=%d sink=%d headCalls=%d err=%v, want 0/0/0/nil", rev, commitSink, headCalls.Load(), err)
+		}
+
+		// 4. ReadStream populates initial plan Revision from X-Dat9-Revision header and catches drift on continuation.
+		rc, err := c.ReadStream(context.Background(), "/header-rev.bin")
+		if err != nil {
+			t.Fatalf("ReadStream(header-rev): %v", err)
+		}
+		_, rerr := io.ReadAll(rc)
+		_ = rc.Close()
+		if rerr == nil || !strings.Contains(rerr.Error(), "extent file changed during read: revision 5 -> 6") {
+			t.Fatalf("ReadAll(header-rev) err = %v, want revision 5 -> 6 drift error", rerr)
+		}
+	})
 }

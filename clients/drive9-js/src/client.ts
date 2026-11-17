@@ -5,15 +5,7 @@ import { appendStreamImpl } from "./append.js";
 import { bodyInit } from "./compat.js";
 import { checkError, Drive9Error, StatusError } from "./error.js";
 import {
-  commitExtentPatchImpl,
-  createExtentFileImpl,
-  deleteFileConditionalImpl,
-  fetchExtentBlockRangeImpl,
-  getExtentReadPlanImpl,
-  initiateExtentPatchImpl,
   mayBeExtentDirectWriteRejection,
-  truncateExtentImpl,
-  validateRequestedWriteLayout,
   writeDirectOnlyImpl,
   writeExtentBytesImpl,
 } from "./extent.js";
@@ -64,13 +56,8 @@ import type {
   BatchReadSmallResult,
   BatchStatResult,
   ContentLayout,
-  CreateExtentFileResult,
   EventHandler,
   EventLifecycle,
-  ExtentBlockWrite,
-  ExtentDirtyBlock,
-  ExtentReadPlan,
-  ExtentWritePlan,
   FileInfo,
   FSLayer,
   FSLayerCheckpoint,
@@ -246,11 +233,8 @@ function normalizeWriteOptions(options?: number | WriteOptions): Required<Pick<W
   }
   return {
     expectedRevision: options?.expectedRevision ?? -1,
-    expectedResourceId: options?.expectedResourceId,
     tags: options?.tags,
     description: options?.description,
-    layout: options?.layout,
-    targetLayout: options?.targetLayout,
   };
 }
 
@@ -388,15 +372,10 @@ export class Client {
 
   async writeWithRevision(path: string, data: Uint8Array, options?: number | WriteOptions): Promise<number> {
     const opts = normalizeWriteOptions(options);
-    validateRequestedWriteLayout(opts.layout);
-    if (opts.layout === "extent" || (!opts.layout && opts.targetLayout === "extent")) {
-      const res = await writeExtentBytesImpl(this, path, data, opts);
-      return res.revision;
-    }
     try {
       return await writeDirectOnlyImpl(this, path, data, opts);
     } catch (err) {
-      if (opts.layout !== "single" && mayBeExtentDirectWriteRejection(err, opts.expectedRevision)) {
+      if (mayBeExtentDirectWriteRejection(err, opts.expectedRevision)) {
         let isExtentTarget = false;
         try {
           const st = await this.stat(path);
@@ -418,10 +397,6 @@ export class Client {
     await checkError(resp);
     const body = (await resp.json().catch(() => undefined)) as { revision?: number } | undefined;
     return body?.revision || 0;
-  }
-
-  async createExtentFile(path: string): Promise<CreateExtentFileResult> {
-    return createExtentFileImpl(this, path);
   }
 
   async symlink(target: string, linkPath: string): Promise<void> {
@@ -598,10 +573,6 @@ export class Client {
   async deleteFile(path: string): Promise<void> {
     const resp = await fetch(`${this.fsUrl(path)}?kind=file`, { method: "DELETE", headers: this.authHeaders() });
     await checkError(resp);
-  }
-
-  async deleteFileConditional(path: string, expectedRevision = 0, expectedResourceId = ""): Promise<void> {
-    return deleteFileConditionalImpl(this, path, expectedRevision, expectedResourceId);
   }
 
   async deleteDir(path: string): Promise<void> {
@@ -901,50 +872,6 @@ export class Client {
 
   newStreamWriter(path: string, totalSize: number, options: number | WriteOptions = -1, abortOnError = true): StreamWriter {
     return new StreamWriter(this, path, totalSize, options, abortOnError);
-  }
-
-  async getExtentReadPlan(path: string, start: number, end = -1): Promise<ExtentReadPlan> {
-    return getExtentReadPlanImpl(this, path, start, end);
-  }
-
-  async fetchExtentBlockRange(blockUrl: string, offset: number, length: number): Promise<ReadableStream<Uint8Array>> {
-    return fetchExtentBlockRangeImpl(this, blockUrl, offset, length);
-  }
-
-  async initiateExtentPatch(
-    path: string,
-    newSize: number,
-    dirtyBlocks: ExtentDirtyBlock[],
-    expectedRevision: number,
-    expectedResourceId?: string
-  ): Promise<ExtentWritePlan> {
-    return initiateExtentPatchImpl(this, path, newSize, dirtyBlocks, expectedRevision, expectedResourceId);
-  }
-
-  async commitExtentPatch(
-    path: string,
-    newSize: number,
-    blocks: ExtentBlockWrite[],
-    expectedRevision: number,
-    options?: { expectedResourceId?: string; tags?: Record<string, string> }
-  ): Promise<number> {
-    return commitExtentPatchImpl(
-      this,
-      path,
-      newSize,
-      blocks,
-      expectedRevision,
-      options?.expectedResourceId,
-      options?.tags
-    );
-  }
-
-  async truncateExtent(
-    path: string,
-    newSize: number,
-    options?: { expectedRevision?: number; expectedResourceId?: string }
-  ): Promise<StatResult> {
-    return truncateExtentImpl(this, path, newSize, options);
   }
 
   async issueScopedToken(req: IssueScopedTokenRequest): Promise<IssueScopedTokenResponse> {

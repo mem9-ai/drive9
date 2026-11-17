@@ -3,23 +3,80 @@ import { createHash } from "node:crypto";
 import type { Client } from "./client.js";
 import { bodyInit } from "./compat.js";
 import { ConflictError, Drive9Error, StatusError, checkError } from "./error.js";
-import {
-  ExtentBlockSize,
-  ExtentChunkSize,
-  type CompletePart,
-  type ContentLayout,
-  type CreateExtentFileResult,
-  type ExtentBlockWrite,
-  type ExtentDirtyBlock,
-  type ExtentReadPlan,
-  type ExtentWritePlan,
-  type ExtentWritePlanBlock,
-  type PresignedPart,
-  type StatResult,
-  type UploadPlanV2,
-  type WriteOptions,
+import type {
+  CompletePart,
+  ContentLayout,
+  PresignedPart,
+  StatResult,
+  UploadPlanV2,
+  WriteOptions,
 } from "./models.js";
 import { Semaphore } from "./utils.js";
+
+export const ExtentChunkSize = 64 * 1024 * 1024;
+export const ExtentBlockSize = 4 * 1024 * 1024;
+
+export interface InternalWriteOptions extends WriteOptions {
+  expectedResourceId?: string;
+  layout?: ContentLayout;
+  targetLayout?: ContentLayout;
+}
+
+export interface ExtentReadPlanBlock {
+  file_offset: number;
+  length: number;
+  block_key?: string;
+  block_offset: number;
+  url?: string;
+  zero?: boolean;
+}
+
+export interface ExtentReadPlan {
+  size: number;
+  revision?: number;
+  blocks: ExtentReadPlanBlock[];
+  next_offset?: number;
+}
+
+export interface ExtentDirtyBlock {
+  chunk: number;
+  off: number;
+  size: number;
+  checksum: string;
+}
+
+export interface ExtentWritePlanBlock {
+  chunk: number;
+  off: number;
+  size: number;
+  checksum: string;
+  url: string;
+  headers?: Record<string, string>;
+  exists: boolean;
+}
+
+export interface ExtentWritePlan {
+  upload_id: string;
+  new_size: number;
+  expires_at?: string;
+  blocks: ExtentWritePlanBlock[];
+  checksum_contract?: {
+    supported?: string[];
+    required?: boolean;
+  };
+}
+
+export interface ExtentBlockWrite {
+  chunk: number;
+  off: number;
+  data: Uint8Array;
+}
+
+export interface CreateExtentFileResult {
+  revision: number;
+  resource_id?: string;
+  native_extent: boolean;
+}
 
 const EXTENT_PUT_CONCURRENCY = 16;
 const EXTENT_BATCH_PARTS = 32;
@@ -140,6 +197,10 @@ export async function getExtentReadPlanImpl(
   if (resp.status >= 300) {
     await checkError(resp);
   }
+  return parseExtentReadPlanResponse(resp);
+}
+
+export async function parseExtentReadPlanResponse(resp: Response): Promise<ExtentReadPlan> {
   const plan = (await resp.json()) as ExtentReadPlan;
   if (!plan.revision || plan.revision <= 0) {
     const revHeader = resp.headers.get("x-dat9-revision");
@@ -547,6 +608,9 @@ export async function truncateExtentImpl(
     if (options?.expectedResourceId && st.resource_id && st.resource_id !== options.expectedResourceId) {
       throw new ResourceMismatchError(path);
     }
+    if (st.content_layout && st.content_layout !== "extent") {
+      throw new ConflictError("content layout mismatch: the file's layout is sticky for the life of the inode");
+    }
     if (st.size === newSize) {
       return st;
     }
@@ -558,6 +622,9 @@ export async function truncateExtentImpl(
       st = await client.stat(path);
       if (origResId && st.resource_id && st.resource_id !== origResId) {
         throw new ResourceMismatchError(path);
+      }
+      if (st.content_layout && st.content_layout !== "extent") {
+        throw new ConflictError("content layout mismatch: the file's layout is sticky for the life of the inode");
       }
       if (st.size === newSize) {
         return st;
@@ -583,11 +650,7 @@ export async function truncateExtentImpl(
           content_layout: "extent",
         };
       }
-      try {
-        return await client.stat(path);
-      } catch {
-        return { ...st, size: newSize, content_layout: "extent" };
-      }
+      return { ...st, size: newSize, revision: 0, content_layout: "extent" };
     } catch (err) {
       lastErr = err;
       if (!(err instanceof ConflictError) || (options?.expectedRevision && options.expectedRevision > 0)) {
@@ -860,20 +923,16 @@ export async function writeExtentBytesImpl(
         return { revision: created.revision, partSize: 0, totalParts: 0, uploadedParts: 0 };
       }
       if (options.expectedRevision > 0) {
-        let rev = await commitExtentPatchImpl(client, path, 0, [], options.expectedRevision, options.expectedResourceId);
-        if (rev <= 0) {
-          try {
-            rev = (await client.stat(path)).revision;
-          } catch {
-            // Leave rev as 0 if stat fails after commit.
-          }
-        }
+        const rev = await commitExtentPatchImpl(client, path, 0, [], options.expectedRevision, options.expectedResourceId);
         return { revision: rev, partSize: 0, totalParts: 0, uploadedParts: 0 };
       }
       try {
         const updated = await truncateExtentImpl(client, path, 0, {
           expectedResourceId: options.expectedResourceId,
         });
+        if (updated.content_layout && updated.content_layout !== "extent") {
+          throw new ConflictError("content layout mismatch: the file's layout is sticky for the life of the inode");
+        }
         return { revision: updated.revision, partSize: 0, totalParts: 0, uploadedParts: 0 };
       } catch (truncErr) {
         const isMissing =
@@ -918,7 +977,7 @@ export async function appendExtentImpl(
   stat: StatResult,
   data: Uint8Array,
   expectedRevision: number,
-  options?: WriteOptions
+  options?: InternalWriteOptions
 ): Promise<void> {
   const baseSize = stat.size;
   const finalSize = baseSize + data.length;

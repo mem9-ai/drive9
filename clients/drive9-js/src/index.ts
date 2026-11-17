@@ -1,6 +1,5 @@
 export { Client } from "./client.js";
 export { Drive9Error, StatusError, ConflictError, checkError } from "./error.js";
-export { ExtentNotServedError, ExtentPresignUnsupportedError, ResourceMismatchError, chunkOffset } from "./extent.js";
 export { FSLayerCommitConflictError } from "./layer.js";
 export { StreamWriter } from "./stream.js";
 export {
@@ -14,21 +13,14 @@ export {
   isRuntimeBusy,
   isRuntimeOutcomeUnknown,
 } from "./runtime.js";
-export { ExtentBlockSize, ExtentChunkSize, MaxBatchReadSmallPaths, MaxBatchStatPaths } from "./models.js";
+export { MaxBatchReadSmallPaths, MaxBatchStatPaths } from "./models.js";
 export type {
   BatchReadSmallResult,
   BatchStatResult,
   ChangeEvent,
   ContentLayout,
-  CreateExtentFileResult,
   EventHandler,
   EventLifecycle,
-  ExtentBlockWrite,
-  ExtentDirtyBlock,
-  ExtentReadPlan,
-  ExtentReadPlanBlock,
-  ExtentWritePlan,
-  ExtentWritePlanBlock,
   FileInfo,
   FSScopeGrant,
   FSLayerEntryKind,

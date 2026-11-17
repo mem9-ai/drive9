@@ -571,10 +571,16 @@ func (c *Client) TruncateExtentConditional(ctx context.Context, path string, st 
 		}
 	} else if ctxResID != "" && st.ResourceID == "" {
 		st.ResourceID = ctxResID
+	} else if ctxResID != "" && st.ResourceID != ctxResID {
+		return nil, fmt.Errorf("%s: %w", path, ErrResourceMismatch)
+	}
+	if st.ContentLayout != "" && st.ContentLayout != ContentLayoutExtent {
+		return nil, &StatusError{StatusCode: http.StatusConflict, Message: "content layout mismatch: the file's layout is sticky for the life of the inode"}
 	}
 	if st.Size == newSize {
 		return st, nil
 	}
+	callerSink := completedRevisionSinkOf(ctx)
 	origResID := st.ResourceID
 	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 || st.Revision <= 0 {
@@ -584,6 +590,9 @@ func (c *Client) TruncateExtentConditional(ctx context.Context, path string, st 
 			}
 			if origResID != "" && st.ResourceID != origResID {
 				return nil, fmt.Errorf("%s: %w", path, ErrResourceMismatch)
+			}
+			if st.ContentLayout != "" && st.ContentLayout != ContentLayoutExtent {
+				return nil, &StatusError{StatusCode: http.StatusConflict, Message: "content layout mismatch: the file's layout is sticky for the life of the inode"}
 			}
 			if st.Size == newSize {
 				return st, nil
@@ -601,6 +610,9 @@ func (c *Client) TruncateExtentConditional(ctx context.Context, path string, st 
 			updated.ContentLayout = ContentLayoutExtent
 			if landedRev > 0 {
 				updated.Revision = landedRev
+				if callerSink != nil {
+					*callerSink = landedRev
+				}
 			} else if fresh, serr := c.StatCtx(ctx, path); serr == nil && fresh != nil {
 				updated = *fresh
 			}
@@ -1053,8 +1065,8 @@ func (c *Client) writeExtentBytesConditional(ctx context.Context, path string, d
 		// description need to ride V2 initiate/complete.
 		if size == 0 && tags == nil && description == "" && isZeroSizeExtentInitiateError(err) {
 			rev, ferr := c.fallbackZeroSizeExtentWrite(rctx, path, expectedRevision, summary, preCompleteCheck)
-			if ferr == nil && rev > 0 && callerSink != nil {
-				*callerSink = rev
+			if ferr == nil && landedRev > 0 && callerSink != nil {
+				*callerSink = landedRev
 			}
 			return rev, ferr
 		}
@@ -1105,6 +1117,11 @@ func (c *Client) fallbackZeroSizeExtentWrite(ctx context.Context, path string, e
 		if !native {
 			return 0, fmt.Errorf("server does not support 0-byte extent file creation on %s", path)
 		}
+		if rev > 0 {
+			if out := completedRevisionSinkOf(ctx); out != nil {
+				*out = rev
+			}
+		}
 		setZeroSummary()
 		return rev, nil
 	}
@@ -1114,9 +1131,9 @@ func (c *Client) fallbackZeroSizeExtentWrite(ctx context.Context, path string, e
 		if err := c.CommitExtentPatchExpectedResource(pctx, path, 0, nil, expectedRevision, expectedResourceOf(ctx)); err != nil {
 			return 0, err
 		}
-		if landedRev <= 0 {
-			if fresh, serr := c.StatCtx(ctx, path); serr == nil && fresh != nil {
-				landedRev = fresh.Revision
+		if landedRev > 0 {
+			if out := completedRevisionSinkOf(ctx); out != nil {
+				*out = landedRev
 			}
 		}
 		setZeroSummary()
@@ -1135,10 +1152,18 @@ func (c *Client) fallbackZeroSizeExtentWrite(ctx context.Context, path string, e
 			if !native {
 				return 0, fmt.Errorf("server does not support 0-byte extent file creation on %s", path)
 			}
+			if rev > 0 {
+				if out := completedRevisionSinkOf(ctx); out != nil {
+					*out = rev
+				}
+			}
 			setZeroSummary()
 			return rev, nil
 		}
 		return 0, err
+	}
+	if updated.ContentLayout != "" && updated.ContentLayout != ContentLayoutExtent {
+		return 0, &StatusError{StatusCode: http.StatusConflict, Message: "content layout mismatch: the file's layout is sticky for the life of the inode"}
 	}
 	setZeroSummary()
 	return updated.Revision, nil

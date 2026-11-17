@@ -7,17 +7,23 @@ import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
+import * as publicSdk from "../src/index.js";
+import { Client, ConflictError, Drive9Error } from "../src/index.js";
 import {
-  Client,
-  ConflictError,
-  Drive9Error,
   ExtentBlockSize,
   ExtentChunkSize,
   ExtentNotServedError,
   ResourceMismatchError,
   chunkOffset,
-} from "../src/index.js";
+  commitExtentPatchImpl,
+  createExtentFileImpl,
+  deleteFileConditionalImpl,
+  getExtentReadPlanImpl,
+  truncateExtentImpl,
+  writeExtentBytesImpl,
+} from "../src/extent.js";
 import { Drive9Fs } from "../src/just-bash.js";
+import { writeStreamImpl, writeStreamWithSummaryImpl } from "../src/transfer.js";
 
 const server = setupServer();
 beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
@@ -29,6 +35,31 @@ const decode = (b: Uint8Array) => new TextDecoder().decode(b);
 const sha256Hex = (b: Uint8Array) => createHash("sha256").update(b).digest("hex");
 
 describe("Extent layout v2 support in TypeScript SDK", () => {
+  it("keeps extent v2 transparent without adding extent-specific public Client methods or exports", () => {
+    const protoMethods = Object.getOwnPropertyNames(Client.prototype);
+    for (const forbidden of [
+      "getExtentReadPlan",
+      "fetchExtentBlockRange",
+      "initiateExtentPatch",
+      "commitExtentPatch",
+      "truncateExtent",
+      "createExtentFile",
+      "deleteFileConditional",
+    ]) {
+      expect(protoMethods).not.toContain(forbidden);
+    }
+    for (const forbiddenExport of [
+      "ExtentBlockSize",
+      "ExtentChunkSize",
+      "ExtentNotServedError",
+      "ExtentPresignUnsupportedError",
+      "ResourceMismatchError",
+      "chunkOffset",
+    ]) {
+      expect(Object.prototype.hasOwnProperty.call(publicSdk, forbiddenExport)).toBe(false);
+    }
+  });
+
   it("surfaces storage_type and content_layout across stat, statMetadata, and statMetadataCompat", async () => {
     server.use(
       http.head("http://localhost:9009/v1/fs/ext.bin", () => {
@@ -284,7 +315,6 @@ describe("Extent layout v2 support in TypeScript SDK", () => {
 
     server.use(
       http.post("http://localhost:9009/v2/uploads/initiate", async ({ request }) => {
-        expect(request.headers.get("x-dat9-expected-resource")).toBe("res-99");
         initiateBody = (await request.json()) as Record<string, unknown>;
         return HttpResponse.json(
           {
@@ -351,7 +381,6 @@ describe("Extent layout v2 support in TypeScript SDK", () => {
     const client = new Client("http://localhost:9009", "test-key").withSmallFileThreshold(32);
     const summary = await client.writeStreamWithSummary("/large-ext.bin", payload, payload.length, {
       expectedRevision: 4,
-      expectedResourceId: "res-99",
       description: "extent dataset",
       tags: { tier: "hot" },
     });
@@ -532,8 +561,8 @@ describe("Extent layout v2 support in TypeScript SDK", () => {
     expect(rev).toBe(7);
     expect(directPutCount).toBe(1);
 
-    // 0-byte small writeStream with targetLayout="extent" skips direct PUT completely.
-    const zeroSummary = await client.writeStreamWithSummary("/sticky-ext.bin", new Uint8Array(0), 0, {
+    // 0-byte small writeStreamImpl with internal targetLayout="extent" skips direct PUT completely.
+    const zeroSummary = await writeStreamWithSummaryImpl(client, "/sticky-ext.bin", new Uint8Array(0), 0, {
       targetLayout: "extent",
     });
     expect(zeroSummary.mode).toBe("extent_v2");
@@ -546,9 +575,9 @@ describe("Extent layout v2 support in TypeScript SDK", () => {
     expect(directPutCount).toBe(1); // still unchanged!
     expect(initiatedSizes).toEqual([5, 0, 5]);
 
-    // Explicit invalid layout is rejected upfront.
+    // Explicit invalid internal layout is rejected upfront.
     await expect(
-      client.write("/sticky-ext.bin", text.encode("x"), { layout: "bogus" })
+      writeStreamImpl(client, "/sticky-ext.bin", text.encode("x"), 1, { layout: "bogus" })
     ).rejects.toThrow(/layout must be "single" or "extent"/);
   });
 
@@ -730,24 +759,24 @@ describe("Extent layout v2 support in TypeScript SDK", () => {
     );
 
     const client = new Client("http://localhost:9009", "test-key");
-    await expect(client.getExtentReadPlan("/classic.bin", 0, 10)).rejects.toBeInstanceOf(ExtentNotServedError);
+    await expect(getExtentReadPlanImpl(client, "/classic.bin", 0, 10)).rejects.toBeInstanceOf(ExtentNotServedError);
 
-    const rev = await client.commitExtentPatch("/patch.bin", 4, [{ chunk: 0, off: 0, data: text.encode("DATA") }], 5);
+    const rev = await commitExtentPatchImpl(client, "/patch.bin", 4, [{ chunk: 0, off: 0, data: text.encode("DATA") }], 5);
     expect(rev).toBe(21);
     expect(patchAttempts).toBe(2);
 
-    const st = await client.truncateExtent("/trunc.bin", 32);
+    const st = await truncateExtentImpl(client, "/trunc.bin", 32);
     expect(st.size).toBe(32);
     expect(st.revision).toBe(12);
     expect(truncateAttempts).toBe(2);
 
     await expect(
-      client.truncateExtent("/trunc.bin", 0, { expectedRevision: 12, expectedResourceId: "wrong-res" })
+      truncateExtentImpl(client, "/trunc.bin", 0, { expectedRevision: 12, expectedResourceId: "wrong-res" })
     ).rejects.toBeInstanceOf(ResourceMismatchError);
 
-    const created = await client.createExtentFile("/zero.bin");
+    const created = await createExtentFileImpl(client, "/zero.bin");
     expect(created).toEqual({ revision: 1, resource_id: "res-zero", native_extent: true });
-    await client.deleteFileConditional("/zero.bin", created.revision, created.resource_id);
+    await deleteFileConditionalImpl(client, "/zero.bin", created.revision, created.resource_id);
 
     const sw = client.newStreamWriter("/sw-target.bin", 8);
     await sw.writePart(1, text.encode("1234"));
@@ -758,7 +787,7 @@ describe("Extent layout v2 support in TypeScript SDK", () => {
     expect(new ConflictError("conflict")).toBeInstanceOf(Drive9Error);
   });
 
-  it("covers review edge cases: negative append rev, bounded 403/revision guards, 0B fallback, v1 resource guard, and StreamWriter layouts", async () => {
+  it("covers review edge cases: negative append rev, X-Dat9-Revision header drift, 0B layout/commit guards, and v1 resource guard", async () => {
     const client = new Client("http://localhost:9009", "test-key").withSmallFileThreshold(32);
 
     // 1. append with explicit expectedRevision: -1 maps to stat.revision instead of sending -1.
@@ -793,7 +822,8 @@ describe("Extent layout v2 support in TypeScript SDK", () => {
     expect(seenAppendRev).toBe(9);
     server.resetHandlers();
 
-    // 2. Read stream: bounded 403 refresh (1 retry max per block) and revision drift detection.
+    // 2. Read stream: bounded 403 refresh (1 retry max per block) and revision drift detection
+    // even when the server omits JSON `revision` and only sends `X-Dat9-Revision` response headers.
     let planCalls403 = 0;
     server.use(
       http.get("http://localhost:9009/v1/fs/always-403.bin", () => {
@@ -801,10 +831,9 @@ describe("Extent layout v2 support in TypeScript SDK", () => {
         return HttpResponse.json(
           {
             size: 4,
-            revision: 1,
             blocks: [{ file_offset: 0, length: 4, block_offset: 0, url: "http://localhost:9009/obj/always-403" }],
           },
-          { status: 206, headers: { "X-Dat9-Content-Layout": "extent" } }
+          { status: 206, headers: { "X-Dat9-Content-Layout": "extent", "X-Dat9-Revision": "1" } }
         );
       }),
       http.get("http://localhost:9009/obj/always-403", () => new HttpResponse("Forbidden", { status: 403 })),
@@ -814,20 +843,26 @@ describe("Extent layout v2 support in TypeScript SDK", () => {
         return HttpResponse.json(
           {
             size: 8,
-            revision: first ? 1 : 2,
             blocks: [{ file_offset: first ? 0 : 4, length: 4, block_offset: 0, zero: true }],
             next_offset: first ? 4 : undefined,
           },
-          { status: 206, headers: { "X-Dat9-Content-Layout": "extent" } }
+          {
+            status: 206,
+            headers: {
+              "X-Dat9-Content-Layout": "extent",
+              "X-Dat9-Revision": first ? "1" : "2",
+            },
+          }
         );
       })
     );
     await expect(client.read("/always-403.bin")).rejects.toThrow(/403/);
     expect(planCalls403).toBe(2);
-    await expect(client.read("/rev-drift.bin")).rejects.toThrow(/extent file changed during read/);
+    await expect(client.read("/rev-drift.bin")).rejects.toThrow(/extent file changed during read: revision 1 -> 2/);
+    await expect(client.readAt("/rev-drift.bin", 0, 8)).rejects.toThrow(/extent file changed during read: revision 1 -> 2/);
     server.resetHandlers();
 
-    // 3. truncateExtent same-size checks expectedResourceId before returning no-op.
+    // 3. truncateExtentImpl checks expectedResourceId and rejects single-layout targets before same-size no-op.
     server.use(
       http.head("http://localhost:9009/v1/fs/same-size.bin", () =>
         new HttpResponse(null, {
@@ -840,16 +875,32 @@ describe("Extent layout v2 support in TypeScript SDK", () => {
             "X-Dat9-Content-Layout": "extent",
           },
         })
+      ),
+      http.head("http://localhost:9009/v1/fs/empty-single.bin", () =>
+        new HttpResponse(null, {
+          status: 200,
+          headers: {
+            "Content-Length": "0",
+            "X-Dat9-IsDir": "false",
+            "X-Dat9-Revision": "4",
+            "X-Dat9-Content-Layout": "single",
+          },
+        })
       )
     );
-    await expect(client.truncateExtent("/same-size.bin", 16, { expectedResourceId: "res-expected" })).rejects.toBeInstanceOf(
+    await expect(truncateExtentImpl(client, "/same-size.bin", 16, { expectedResourceId: "res-expected" })).rejects.toBeInstanceOf(
       ResourceMismatchError
     );
+    await expect(truncateExtentImpl(client, "/empty-single.bin", 0)).rejects.toBeInstanceOf(ConflictError);
     server.resetHandlers();
 
-    // 4. Zero-byte fallback creates missing destination on default expectedRevision (-1) and sends PATCH on positive expectedRevision.
+    // 4. Zero-byte fallback:
+    // - creates missing destination on default expectedRevision (-1)
+    // - rejects existing empty single-layout target with ConflictError
+    // - sends PATCH on positive expectedRevision and leaves revision=0 when commit omits revision (no post-commit stat)
     let zeroCreateCalled = false;
     let zeroPatchRev = 0;
+    let posZeroHeadCalled = false;
     server.use(
       http.post("http://localhost:9009/v2/uploads/initiate", () =>
         HttpResponse.json({ error: "total_size must be positive" }, { status: 400 })
@@ -859,70 +910,44 @@ describe("Extent layout v2 support in TypeScript SDK", () => {
         zeroCreateCalled = true;
         return HttpResponse.json({ revision: 1, resource_id: "rz", content_layout: "extent" }, { status: 201 });
       }),
+      http.head("http://localhost:9009/v1/fs/existing-empty-single.bin", () =>
+        new HttpResponse(null, {
+          status: 200,
+          headers: {
+            "Content-Length": "0",
+            "X-Dat9-IsDir": "false",
+            "X-Dat9-Revision": "2",
+            "X-Dat9-Content-Layout": "single",
+          },
+        })
+      ),
+      http.head("http://localhost:9009/v1/fs/pos-zero.bin", () => {
+        posZeroHeadCalled = true;
+        return new HttpResponse(null, { status: 200, headers: { "X-Dat9-Revision": "999" } });
+      }),
       http.patch("http://localhost:9009/v1/fs/pos-zero.bin", async ({ request }) => {
         const body = (await request.json()) as { expected_revision: number };
         zeroPatchRev = body.expected_revision;
         return HttpResponse.json({ upload_id: "pz-1", new_size: 0, blocks: [] }, { status: 202 });
       }),
-      http.post("http://localhost:9009/v2/uploads/pz-1/complete", () => HttpResponse.json({ status: "ok", revision: 6 }))
+      http.post("http://localhost:9009/v2/uploads/pz-1/complete", () => HttpResponse.json({ status: "ok" }))
     );
-    await client.write("/new-zero.bin", new Uint8Array(0), { layout: "extent" });
+    await writeExtentBytesImpl(client, "/new-zero.bin", new Uint8Array(0), { expectedRevision: -1 });
     expect(zeroCreateCalled).toBe(true);
-    expect(await client.writeWithRevision("/pos-zero.bin", new Uint8Array(0), { layout: "extent", expectedRevision: 5 })).toBe(6);
+    await expect(
+      writeExtentBytesImpl(client, "/existing-empty-single.bin", new Uint8Array(0), { expectedRevision: -1 })
+    ).rejects.toBeInstanceOf(ConflictError);
+    const posZeroRes = await writeExtentBytesImpl(client, "/pos-zero.bin", new Uint8Array(0), { expectedRevision: 5 });
+    expect(posZeroRes.revision).toBe(0);
+    expect(posZeroHeadCalled).toBe(false);
     expect(zeroPatchRev).toBe(5);
     server.resetHandlers();
 
-    // 5. V2 -> V1 fallback rejects uploads bound to expectedResourceId.
+    // 5. V2 -> V1 fallback rejects internal uploads bound to expectedResourceId.
     server.use(http.post("http://localhost:9009/v2/uploads/initiate", () => new HttpResponse("no v2", { status: 404 })));
     await expect(
-      client.writeStream("/v1-bound.bin", new Uint8Array(64), 64, { expectedResourceId: "res-bound" })
+      writeStreamImpl(client, "/v1-bound.bin", new Uint8Array(64), 64, { expectedResourceId: "res-bound" })
     ).rejects.toBeInstanceOf(ResourceMismatchError);
     server.resetHandlers();
-
-    // 6. StreamWriter: targetLayout="single" still retries extent on mismatch; explicit layout="extent" rejects classic plan.
-    const seenSWLayouts: Array<string | undefined> = [];
-    let abortedClassicSW = false;
-    server.use(
-      http.post("http://localhost:9009/v2/uploads/initiate", async ({ request }) => {
-        const body = (await request.json()) as { path: string; layout?: string };
-        if (body.path === "/sw-legacy.bin") {
-          return HttpResponse.json(
-            { upload_id: "sw-classic-ignored", key: "tenant/classic", part_size: 4, total_parts: 1 },
-            { status: 202 }
-          );
-        }
-        seenSWLayouts.push(body.layout);
-        if (!body.layout) {
-          return HttpResponse.json({ error: "content layout mismatch" }, { status: 409 });
-        }
-        return HttpResponse.json(
-          {
-            upload_id: "sw-hint-ext",
-            key: "",
-            part_size: 4,
-            total_parts: 1,
-            checksum_contract: { supported: ["SHA-256"], required: true },
-          },
-          { status: 202 }
-        );
-      }),
-      http.post("http://localhost:9009/v2/uploads/sw-classic-ignored/abort", () => {
-        abortedClassicSW = true;
-        return HttpResponse.json({ status: "aborted" });
-      }),
-      http.post("http://localhost:9009/v2/uploads/sw-hint-ext/presign-batch", () =>
-        HttpResponse.json({ parts: [{ number: 1, url: "", size: 4, skip_upload: true }] })
-      ),
-      http.post("http://localhost:9009/v2/uploads/sw-hint-ext/complete", () => HttpResponse.json({ status: "ok", revision: 2 }))
-    );
-
-    const explicitSW = client.newStreamWriter("/sw-legacy.bin", 4, { layout: "extent" });
-    await expect(explicitSW.writePart(1, text.encode("1234"))).rejects.toThrow(/ignored layout=extent/);
-    expect(abortedClassicSW).toBe(true);
-
-    const hintedSW = client.newStreamWriter("/sw-hint.bin", 4, { targetLayout: "single" });
-    await hintedSW.writePart(1, text.encode("1234"));
-    await hintedSW.complete(0, new Uint8Array(0));
-    expect(seenSWLayouts).toEqual([undefined, "extent"]);
   });
 });
