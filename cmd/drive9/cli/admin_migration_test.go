@@ -18,7 +18,7 @@ func TestAdminMigrationHelpDocumentsCommands(t *testing.T) {
 	if err != nil {
 		t.Fatalf("migration help: %v", err)
 	}
-	for _, want := range []string{"batch create", "start BATCH_ID", "status TENANT_ID", "list [flags]", "watch [flags]", "rollback TENANT_ID"} {
+	for _, want := range []string{"accept PLAN_ID", "batch create", "start BATCH_ID", "status TENANT_ID", "list [flags]", "watch [flags]", "rollback TENANT_ID"} {
 		if !strings.Contains(stdout, want) {
 			t.Fatalf("migration help missing %q:\n%s", want, stdout)
 		}
@@ -246,5 +246,70 @@ func TestAdminMigrationErrorKeepsControllerCode(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "MIGRATION_NOT_ENABLED") {
 		t.Fatalf("error = %v, want controller code", err)
+	}
+}
+
+func TestAdminMigrationAcceptSendsPlanAndPrintsTable(t *testing.T) {
+	withIsolatedHome(t)
+	clearProvisionEnv(t)
+	var gotMethod, gotPath, gotBody, gotPublic, gotPrivate string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath = r.Method, r.URL.Path
+		gotPublic = r.Header.Get("X-TiDBCloud-Public-Key")
+		gotPrivate = r.Header.Get("X-TiDBCloud-Private-Key")
+		raw, _ := io.ReadAll(r.Body)
+		gotBody = string(raw)
+		_, _ = w.Write([]byte(`{"plan_id":"plan_acme","organization_id":"org-src","target_organization_id":"org-tgt","source_region":"tencentcloud:ap-beijing","target_region":"alicloud:ap-southeast-1","shared_pool_ready":true,"state":"accepted"}`))
+	}))
+	defer ts.Close()
+
+	stdout, err := captureStdoutE(t, func() error {
+		return Admin([]string{
+			"migration", "accept", "plan_acme",
+			"--source-region", "ap-beijing",
+			"--server", ts.URL,
+			"--tidbcloud-public-key", "tgt-pub",
+			"--tidbcloud-private-key", "tgt-priv",
+		})
+	})
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	if gotMethod != http.MethodPost || gotPath != "/v1/admin/migration/accept" {
+		t.Fatalf("request = %s %s", gotMethod, gotPath)
+	}
+	if gotPublic != "tgt-pub" || gotPrivate != "tgt-priv" {
+		t.Fatalf("credentials = %q/%q", gotPublic, gotPrivate)
+	}
+	if !strings.Contains(gotBody, `"plan_id":"plan_acme"`) || !strings.Contains(gotBody, `"source_region":"ap-beijing"`) {
+		t.Fatalf("body = %s", gotBody)
+	}
+	for _, want := range []string{"PLAN_ID", "plan_acme", "org-src", "org-tgt", "tencentcloud:ap-beijing", "alicloud:ap-southeast-1", "ready", "accepted"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("stdout missing %q:\n%s", want, stdout)
+		}
+	}
+
+	if _, err := captureStdoutE(t, func() error {
+		return Admin([]string{
+			"migration", "accept",
+			"--server", ts.URL,
+			"--tidbcloud-public-key", "tgt-pub",
+			"--tidbcloud-private-key", "tgt-priv",
+		})
+	}); err == nil || !strings.Contains(err.Error(), "PLAN_ID is required") {
+		t.Fatalf("missing PLAN_ID err = %v", err)
+	}
+
+	if _, err := captureStdoutE(t, func() error {
+		return Admin([]string{
+			"migration", "accept", "plan_acme",
+			"--source-region", "",
+			"--server", ts.URL,
+			"--tidbcloud-public-key", "tgt-pub",
+			"--tidbcloud-private-key", "tgt-priv",
+		})
+	}); err == nil || !strings.Contains(err.Error(), "source-region") {
+		t.Fatalf("empty --source-region err = %v", err)
 	}
 }

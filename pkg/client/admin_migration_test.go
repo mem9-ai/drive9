@@ -14,6 +14,57 @@ import (
 	"time"
 )
 
+func TestAdminAcceptMigrationPlanSendsCredentialsAndPayload(t *testing.T) {
+	var gotPath, gotMethod, gotBody, gotPublic, gotPrivate string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotMethod = r.URL.Path, r.Method
+		gotPublic = r.Header.Get("X-TiDBCloud-Public-Key")
+		gotPrivate = r.Header.Get("X-TiDBCloud-Private-Key")
+		raw, _ := io.ReadAll(r.Body)
+		gotBody = string(raw)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"plan_id":"plan_1","target_organization_id":"org-target","shared_pool_ready":true,"state":"accepted"}`))
+	}))
+	defer ts.Close()
+
+	client := New(ts.URL, "")
+	if _, err := client.AdminAcceptMigrationPlan(context.Background(), AdminMigrationAcceptRequest{}); err == nil {
+		t.Fatal("expected empty plan id error")
+	}
+
+	raw, err := client.AdminAcceptMigrationPlan(context.Background(), AdminMigrationAcceptRequest{
+		Credentials: AdminMigrationCredentials{PublicKey: "tpub", PrivateKey: "tpriv"},
+		PlanID:      "plan_1",
+	})
+	if err != nil {
+		t.Fatalf("accept plan: %v", err)
+	}
+	if gotMethod != http.MethodPost || gotPath != "/v1/admin/migration/accept" {
+		t.Fatalf("request = %s %s", gotMethod, gotPath)
+	}
+	if gotPublic != "tpub" || gotPrivate != "tpriv" {
+		t.Fatalf("credentials = %q/%q", gotPublic, gotPrivate)
+	}
+	if strings.Contains(gotBody, `"source_region"`) || !strings.Contains(gotBody, `"plan_id":"plan_1"`) {
+		t.Fatalf("body = %s", gotBody)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil || out["state"] != "accepted" {
+		t.Fatalf("response = %s err=%v", raw, err)
+	}
+
+	if _, err := client.AdminAcceptMigrationPlan(context.Background(), AdminMigrationAcceptRequest{
+		Credentials:  AdminMigrationCredentials{PublicKey: "tpub", PrivateKey: "tpriv"},
+		PlanID:       "plan_1",
+		SourceRegion: "tencentcloud:ap-beijing",
+	}); err != nil {
+		t.Fatalf("accept plan with source region: %v", err)
+	}
+	if !strings.Contains(gotBody, `"source_region":"tencentcloud:ap-beijing"`) {
+		t.Fatalf("body missing source_region: %s", gotBody)
+	}
+}
+
 func TestAdminCreateMigrationBatchSendsCredentialsAndPayload(t *testing.T) {
 	var gotPath, gotMethod, gotBody, gotPublic, gotPrivate string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

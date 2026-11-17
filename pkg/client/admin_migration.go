@@ -29,6 +29,14 @@ func (c AdminMigrationCredentials) setHeaders(req *http.Request) {
 	setQuotaHeaders(req, c.PublicKey, c.PrivateKey)
 }
 
+// AdminMigrationAcceptRequest accepts a cross-organization migration plan on
+// the target region with the target organization's TiDB Cloud credentials.
+type AdminMigrationAcceptRequest struct {
+	Credentials  AdminMigrationCredentials
+	PlanID       string
+	SourceRegion string
+}
+
 // AdminMigrationBatchCreateRequest registers a batch of tenant IDs. The batch
 // itself is a controller-owned concept; drive9 only admits the request against
 // the caller's migration plan.
@@ -86,6 +94,23 @@ type AdminMigrationWatchRequest struct {
 type AdminMigrationEvent struct {
 	Type string
 	Data json.RawMessage
+}
+
+// AdminAcceptMigrationPlan confirms target-organization ownership and target
+// shared-pool readiness on the target region for a migration plan.
+func (c *Client) AdminAcceptMigrationPlan(ctx context.Context, req AdminMigrationAcceptRequest) (json.RawMessage, error) {
+	planID := strings.TrimSpace(req.PlanID)
+	if planID == "" {
+		return nil, fmt.Errorf("plan id is required")
+	}
+	body := struct {
+		PlanID       string `json:"plan_id"`
+		SourceRegion string `json:"source_region,omitempty"`
+	}{
+		PlanID:       planID,
+		SourceRegion: strings.TrimSpace(req.SourceRegion),
+	}
+	return c.adminMigrationRequest(ctx, http.MethodPost, "/v1/admin/migration/accept", nil, body, req.Credentials)
 }
 
 // AdminCreateMigrationBatch registers a migration batch.

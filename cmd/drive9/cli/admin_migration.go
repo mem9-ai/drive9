@@ -30,6 +30,8 @@ func AdminMigration(args []string) error {
 		return nil
 	}
 	switch args[0] {
+	case "accept":
+		return adminMigrationAccept(args[1:])
 	case "batch":
 		return adminMigrationBatch(args[1:])
 	case "start":
@@ -174,6 +176,64 @@ func migrationWantsHelp(args []string) bool {
 		}
 	}
 	return false
+}
+
+func adminMigrationAccept(args []string) error {
+	if migrationWantsHelp(args) {
+		_, _ = fmt.Fprintln(os.Stdout, adminMigrationAcceptUsage())
+		return nil
+	}
+	common, rest, err := parseAdminMigrationCommon(args)
+	if err != nil {
+		return err
+	}
+	var (
+		sourceRegion      string
+		sourceRegionGiven bool
+		positional        []string
+	)
+	for i := 0; i < len(rest); i++ {
+		switch rest[i] {
+		case "--source-region":
+			if i+1 >= len(rest) {
+				return fmt.Errorf("--source-region requires an argument")
+			}
+			i++
+			sourceRegion = rest[i]
+			sourceRegionGiven = true
+		default:
+			if strings.HasPrefix(rest[i], "-") {
+				return fmt.Errorf("unknown flag %q\n%s", rest[i], adminMigrationAcceptUsage())
+			}
+			positional = append(positional, rest[i])
+		}
+	}
+	if err := rejectEmptyFlag("source-region", strings.TrimSpace(sourceRegion), sourceRegionGiven); err != nil {
+		return err
+	}
+	planID, err := parseMigrationPositional(positional, adminMigrationAcceptUsage(), "PLAN_ID")
+	if err != nil {
+		return err
+	}
+	if strings.ContainsAny(planID, " \t\r\n/?#\\") {
+		return fmt.Errorf("plan id %q contains an unsupported character", planID)
+	}
+	server, creds, err := common.target()
+	if err != nil {
+		return err
+	}
+	raw, err := client.New(server, "").AdminAcceptMigrationPlan(context.Background(), client.AdminMigrationAcceptRequest{
+		Credentials:  creds,
+		PlanID:       planID,
+		SourceRegion: strings.TrimSpace(sourceRegion),
+	})
+	if err != nil {
+		return adminMigrationError("accept migration plan", err)
+	}
+	if common.asJSON {
+		return printAdminMigrationJSON(raw)
+	}
+	return printAdminMigrationAccept(raw)
 }
 
 func adminMigrationBatchCreate(args []string) error {
@@ -662,6 +722,46 @@ func printAdminMigrationJSON(raw json.RawMessage) error {
 	return err
 }
 
+type adminMigrationAcceptView struct {
+	PlanID               string `json:"plan_id"`
+	OrganizationID       string `json:"organization_id"`
+	TargetOrganizationID string `json:"target_organization_id"`
+	SourceRegion         string `json:"source_region"`
+	TargetRegion         string `json:"target_region"`
+	SharedPoolReady      *bool  `json:"shared_pool_ready"`
+	State                string `json:"state"`
+}
+
+func printAdminMigrationAccept(raw json.RawMessage) error {
+	var view adminMigrationAcceptView
+	if err := json.Unmarshal(raw, &view); err != nil {
+		return fmt.Errorf("decode migration plan acceptance: %w", err)
+	}
+	if view.PlanID == "" {
+		return printAdminMigrationJSON(raw)
+	}
+	poolState := "-"
+	if view.SharedPoolReady != nil {
+		if *view.SharedPoolReady {
+			poolState = "ready"
+		} else {
+			poolState = "not_ready"
+		}
+	}
+	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	_, _ = fmt.Fprintln(w, "PLAN_ID\tSOURCE_ORG\tTARGET_ORG\tSOURCE_REGION\tTARGET_REGION\tSHARED_POOL\tSTATE")
+	_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+		view.PlanID,
+		emptyAsDash(view.OrganizationID),
+		emptyAsDash(view.TargetOrganizationID),
+		emptyAsDash(view.SourceRegion),
+		emptyAsDash(view.TargetRegion),
+		poolState,
+		emptyAsDash(view.State),
+	)
+	return w.Flush()
+}
+
 type adminMigrationBatchView struct {
 	BatchID     string   `json:"batch_id"`
 	Name        string   `json:"name"`
@@ -958,6 +1058,8 @@ func adminMigrationUsage() string {
 	return `usage: drive9 admin migration <command> [arguments]
 
 commands:
+  accept PLAN_ID [--source-region REGION]
+                                   accept a migration plan on the target region
   batch create [--name NAME] (--file FILE | --tenant-ids IDS)
                                    register a migration batch
   batch get BATCH_ID               show one batch
@@ -978,12 +1080,20 @@ global migration flags:
   --json                           output the controller response as JSON
 
 examples:
+  drive9 admin migration accept plan_xxx --server https://target.example.com
   drive9 admin migration batch create --file tenants.list
   drive9 admin migration start b_xxx
   drive9 admin migration status tnt_xxx --json
   drive9 admin migration list --batch b_xxx --state switched
   drive9 admin migration watch --batch b_xxx
   drive9 admin migration rollback tnt_xxx`
+}
+
+func adminMigrationAcceptUsage() string {
+	return `usage: drive9 admin migration accept PLAN_ID [--source-region REGION]
+
+flags:
+  --source-region REGION           optional source migration region when multiple peer regions are configured`
 }
 
 func adminMigrationBatchUsage() string {
