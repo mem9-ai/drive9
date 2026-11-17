@@ -257,7 +257,7 @@ func (sw *StreamWriter) Complete(ctx context.Context, finalPartNum int, finalPar
 	if len(finalPartData) > 0 {
 		cp, err := sw.uploadPartForPlan(ctx, plan, finalPartNum, finalPartData)
 		if err != nil {
-			return fmt.Errorf("final %w", err)
+			return fmt.Errorf("final part %d: %w", finalPartNum, err)
 		}
 		sw.mu.Lock()
 		sw.uploaded[finalPartNum] = cp

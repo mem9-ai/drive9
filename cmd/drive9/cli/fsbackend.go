@@ -304,6 +304,9 @@ func (w *drive9Write) Close() error {
 	if err != nil {
 		return fmt.Errorf("write %s: %w", w.loc.Raw, err)
 	}
+	if w.opts.Layout != "" && w.opts.TargetLayout != "" && w.opts.Layout != w.opts.TargetLayout {
+		return fmt.Errorf("destination %s already has %s content layout; --layout %s cannot be applied", w.loc.Path, w.opts.TargetLayout, w.opts.Layout)
+	}
 	w.a.c.Warm(w.ctx)
 	var opts []client.WriteOption
 	if w.opts.Tags != nil {

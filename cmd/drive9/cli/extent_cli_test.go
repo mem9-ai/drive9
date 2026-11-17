@@ -442,4 +442,59 @@ func TestCliExtentDownloadCatAppendAndStat(t *testing.T) {
 	if initiatedLayout != string(client.ContentLayoutExtent) {
 		t.Fatalf("initiatedLayout = %q, want extent", initiatedLayout)
 	}
+
+	// 6. Contradictory explicit --layout vs existing sticky target layout fails fast before upload,
+	// and empty local file overwrites an existing extent target via the 0B truncation fallback.
+	tmpDir := t.TempDir()
+	emptyPath := filepath.Join(tmpDir, "empty.bin")
+	if err := os.WriteFile(emptyPath, nil, 0o644); err != nil {
+		t.Fatalf("WriteFile(empty): %v", err)
+	}
+	var zeroTruncCompleted atomic.Bool
+	strictSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/sticky-single.bin":
+			w.Header().Set("Content-Length", "10")
+			w.Header().Set("X-Dat9-Revision", "2")
+			w.Header().Set("X-Dat9-Content-Layout", string(client.ContentLayoutSingle))
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/sticky-extent.bin":
+			w.Header().Set("Content-Length", "64")
+			w.Header().Set("X-Dat9-Revision", "5")
+			w.Header().Set("X-Dat9-Content-Layout", string(client.ContentLayoutExtent))
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"total_size must be positive"}`))
+		case r.Method == http.MethodPatch && r.URL.Path == "/v1/fs/sticky-extent.bin":
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{"upload_id": "ext-trunc-0", "new_size": 0, "blocks": []any{}})
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/ext-trunc-0/complete":
+			var body struct {
+				Parts []any `json:"parts"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if len(body.Parts) != 0 {
+				http.Error(w, "expected empty parts for truncation", http.StatusBadRequest)
+				return
+			}
+			zeroTruncCompleted.Store(true)
+			_, _ = w.Write([]byte(`{"status":"ok","revision":6}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer strictSrv.Close()
+
+	strictClient := client.New(strictSrv.URL, "k")
+	err = Cp(strictClient, []string{"--layout=extent", emptyPath, ":/sticky-single.bin"})
+	if err == nil || !strings.Contains(err.Error(), "already has single content layout; --layout extent cannot be applied") {
+		t.Fatalf("Cp(--layout=extent onto single) err = %v, want fast layout mismatch", err)
+	}
+	if err := Cp(strictClient, []string{emptyPath, ":/sticky-extent.bin"}); err != nil {
+		t.Fatalf("Cp(empty onto sticky extent): %v", err)
+	}
+	if !zeroTruncCompleted.Load() {
+		t.Fatal("expected 0B extent overwrite to commit truncation session")
+	}
 }

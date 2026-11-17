@@ -304,6 +304,9 @@ func Cp(c *client.Client, args []string) error {
 		if err != nil {
 			return err
 		}
+		if layout != "" && targetLayout != "" && targetLayout != client.ContentLayout(layout) {
+			return fmt.Errorf("destination %s already has %s content layout; --layout %s cannot be applied", resolvedDst, targetLayout, layout)
+		}
 		data, err := readAllStdin()
 		if err != nil {
 			return err
@@ -358,6 +361,9 @@ func Cp(c *client.Client, args []string) error {
 		resolvedDst, targetLayout, err := resolveRemoteCopyTargetWithLayout(ctx, c, dstRP.Path, filepath.Base(src))
 		if err != nil {
 			return err
+		}
+		if layout != "" && targetLayout != "" && targetLayout != client.ContentLayout(layout) {
+			return fmt.Errorf("destination %s already has %s content layout; --layout %s cannot be applied", resolvedDst, targetLayout, layout)
 		}
 		if layerRef != "" {
 			return uploadLocalFileToLayer(ctx, c, layerRef, src, resolvedDst)
@@ -436,6 +442,12 @@ func resolveRemoteCopyTarget(ctx context.Context, c *client.Client, remotePath, 
 	return resolved, err
 }
 
+// resolveRemoteCopyTargetWithLayout resolves a remote destination path and,
+// when remotePath directly names an existing file, returns its observed
+// ContentLayout without an extra round trip. Directory/trailing-slash targets
+// intentionally avoid a second HEAD on the computed leaf path so fresh uploads
+// into directories stay zero-extra-RTT (the SDK falls back automatically on 409
+// if an existing leaf has a different sticky layout).
 func resolveRemoteCopyTargetWithLayout(ctx context.Context, c *client.Client, remotePath, sourceBase string) (string, client.ContentLayout, error) {
 	if strings.HasSuffix(remotePath, "/") {
 		if sourceBase == "" {

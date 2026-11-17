@@ -536,7 +536,7 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 				{Title: "Read/write", Flags: []visualHelpFlag{
 					{Name: "cp [-r] [--resume] <src> <dst>", Desc: "copy local, remote, stdin, and stdout paths"},
 					{Name: "cp --append <src> <dst>", Desc: "append local or stdin input to a remote file"},
-					{Name: "cp --layout extent|single", Desc: "override upload content layout (default: auto by size)"},
+					{Name: "cp --layout extent|single", Desc: "override upload content layout (default: preserve target layout or auto by size)"},
 					{Name: "cp --tag key=value", Desc: "set upload tags; repeatable; re-upload with tags replaces existing tag set"},
 					{Name: "cp --description TEXT", Desc: "set file description on local/stdin upload"},
 					{Name: "cat <path>", Desc: "read a remote file to stdout"},

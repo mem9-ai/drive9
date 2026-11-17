@@ -497,7 +497,7 @@ export async function commitExtentPatchImpl(
       break;
     } catch (err) {
       await abortUploadV2BestEffort(client, plan.upload_id);
-      if (attempt > 0 || !(err instanceof StatusError && isExtentBlockConflictStatus(err.statusCode))) {
+      if (attempt >= 2 || !(err instanceof StatusError && isExtentBlockConflictStatus(err.statusCode))) {
         throw err;
       }
       plan = await initiateExtentPatchImpl(client, path, newSize, dirty, expectedRevision, expectedResourceId);
@@ -539,7 +539,7 @@ async function putExtentPlanBlocks(
     return;
   }
   const sem = new Semaphore(EXTENT_PUT_CONCURRENCY);
-  await Promise.all(
+  const settled = await Promise.allSettled(
     jobs.map(async (job) => {
       await sem.acquire();
       try {
@@ -549,6 +549,10 @@ async function putExtentPlanBlocks(
       }
     })
   );
+  const rejected = settled.find((r): r is PromiseRejectedResult => r.status === "rejected");
+  if (rejected) {
+    throw rejected.reason;
+  }
 }
 
 function findExtentPlanBlock(plan: ExtentWritePlan, d: ExtentDirtyBlock): ExtentWritePlanBlock | undefined {
@@ -650,7 +654,11 @@ export async function truncateExtentImpl(
           content_layout: "extent",
         };
       }
-      return { ...st, size: newSize, revision: 0, content_layout: "extent" };
+      try {
+        return await client.stat(path);
+      } catch {
+        return { ...st, size: newSize, content_layout: "extent" };
+      }
     } catch (err) {
       lastErr = err;
       if (!(err instanceof ConflictError) || (options?.expectedRevision && options.expectedRevision > 0)) {
@@ -909,12 +917,13 @@ export async function writeExtentBytesImpl(
   } catch (err) {
     if (
       data.length === 0 &&
-      !options.tags &&
-      !options.description &&
       err instanceof StatusError &&
       err.statusCode === 400 &&
       err.message.toLowerCase().includes("total_size must be positive")
     ) {
+      if (options.tags || options.description) {
+        throw new Drive9Error("0-byte extent writes do not accept tags or description");
+      }
       if (options.expectedRevision === 0) {
         const created = await createExtentFileImpl(client, path);
         if (!created.native_extent) {

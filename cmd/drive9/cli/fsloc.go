@@ -147,13 +147,13 @@ type ListPage struct {
 
 // WriteOpts configures OpenWrite.
 type WriteOpts struct {
-	Size          int64 // -1 = unknown
-	Overwrite     bool
-	ContentType   string
-	Tags          map[string]string
-	Description   string
-	Layout        string
-	TargetLayout  string
+	Size         int64 // -1 = unknown
+	Overwrite    bool
+	ContentType  string
+	Tags         map[string]string
+	Description  string
+	Layout       string
+	TargetLayout string
 }
 
 // WriteHandle is a streaming write that can complete or abort.

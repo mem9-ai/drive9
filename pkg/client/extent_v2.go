@@ -1061,9 +1061,11 @@ func (c *Client) writeExtentBytesConditional(ctx context.Context, path string, d
 	initiateStart := time.Now()
 	plan, err := c.initiateUploadV2WithLayout(rctx, path, size, expectedRevision, description, string(ContentLayoutExtent))
 	if err != nil {
-		// Compatibility with pre-0B-initiate extent servers when no tags or
-		// description need to ride V2 initiate/complete.
-		if size == 0 && tags == nil && description == "" && isZeroSizeExtentInitiateError(err) {
+		// Compatibility with servers whose V2 initiate rejects total_size <= 0.
+		if size == 0 && isZeroSizeExtentInitiateError(err) {
+			if tags != nil || description != "" {
+				return 0, fmt.Errorf("0-byte extent writes do not accept tags or description: %w", err)
+			}
 			rev, ferr := c.fallbackZeroSizeExtentWrite(rctx, path, expectedRevision, summary, preCompleteCheck)
 			if ferr == nil && landedRev > 0 && callerSink != nil {
 				*callerSink = landedRev

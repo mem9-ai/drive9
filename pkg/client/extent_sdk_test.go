@@ -859,7 +859,19 @@ func TestExtentReviewRegressions(t *testing.T) {
 			case r.Method == http.MethodPatch && r.URL.Path == "/v1/fs/no-rev-commit.bin":
 				w.WriteHeader(http.StatusAccepted)
 				_ = json.NewEncoder(w).Encode(ExtentWritePlan{UploadID: "nr-1", NewSize: 0})
-			case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/nr-1/complete":
+			case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/complete"):
+				// Mirror tidbcloud/fs handleV2UploadComplete: empty parts[] is permitted
+				// ONLY for extent sessions (e.g. nr-1 truncation), and rejected with 400
+				// for non-extent sessions.
+				var req struct {
+					Parts []completePart `json:"parts"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&req)
+				if len(req.Parts) == 0 && r.URL.Path != "/v2/uploads/nr-1/complete" {
+					w.WriteHeader(http.StatusBadRequest)
+					_, _ = w.Write([]byte(`{"error":"parts must not be empty"}`))
+					return
+				}
 				_, _ = w.Write([]byte(`{"status":"ok"}`))
 			case r.Method == http.MethodGet && r.URL.Path == "/v1/fs/header-rev.bin":
 				w.Header().Set("X-Dat9-Content-Layout", string(ContentLayoutExtent))
@@ -926,6 +938,15 @@ func TestExtentReviewRegressions(t *testing.T) {
 		_ = rc.Close()
 		if rerr == nil || !strings.Contains(rerr.Error(), "extent file changed during read: revision 5 -> 6") {
 			t.Fatalf("ReadAll(header-rev) err = %v, want revision 5 -> 6 drift error", rerr)
+		}
+
+		// 5. 0B extent write with tags/description returns an explicit actionable error when server rejects 0B initiate.
+		_, err = c.writeExtentBytesConditional(context.Background(), "/tagged-zero.bin", nil, -1, map[string]string{"k": "v"}, "", nil, nil)
+		if err == nil || !strings.Contains(err.Error(), "0-byte extent writes do not accept tags or description") {
+			t.Fatalf("writeExtentBytesConditional(0B with tags) err = %v, want explicit 0-byte tags/description error", err)
+		}
+		if cerr := c.completeUploadV2(context.Background(), "classic-up", []completePart{}, nil); cerr == nil || !strings.Contains(cerr.Error(), "parts must not be empty") {
+			t.Fatalf("completeUploadV2(classic empty parts) err = %v, want parts must not be empty", cerr)
 		}
 	})
 }

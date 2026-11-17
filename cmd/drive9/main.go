@@ -518,6 +518,8 @@ commands:
                        omit --tag to preserve existing tags)
     --description <text>
                        set file description (local/stdin upload only)
+    --layout <extent|single>
+                       override upload content layout (preserve target layout or auto by size)
   cat <path>          read file to stdout
   ls [-l] [path]      list directory
   stat [-o text|json] <path>

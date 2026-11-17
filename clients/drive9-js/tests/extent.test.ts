@@ -930,20 +930,79 @@ describe("Extent layout v2 support in TypeScript SDK", () => {
         zeroPatchRev = body.expected_revision;
         return HttpResponse.json({ upload_id: "pz-1", new_size: 0, blocks: [] }, { status: 202 });
       }),
-      http.post("http://localhost:9009/v2/uploads/pz-1/complete", () => HttpResponse.json({ status: "ok" }))
+      http.post("http://localhost:9009/v2/uploads/:id/complete", async ({ params, request }) => {
+        const body = (await request.json()) as { parts?: unknown[] };
+        if ((!body.parts || body.parts.length === 0) && params.id !== "pz-1") {
+          return HttpResponse.json({ error: "parts must not be empty" }, { status: 400 });
+        }
+        return HttpResponse.json({ status: "ok" });
+      })
     );
     await writeExtentBytesImpl(client, "/new-zero.bin", new Uint8Array(0), { expectedRevision: -1 });
     expect(zeroCreateCalled).toBe(true);
     await expect(
       writeExtentBytesImpl(client, "/existing-empty-single.bin", new Uint8Array(0), { expectedRevision: -1 })
     ).rejects.toBeInstanceOf(ConflictError);
+    await expect(
+      writeExtentBytesImpl(client, "/new-zero.bin", new Uint8Array(0), { expectedRevision: -1, tags: { k: "v" } })
+    ).rejects.toThrow(/0-byte extent writes do not accept tags or description/);
     const posZeroRes = await writeExtentBytesImpl(client, "/pos-zero.bin", new Uint8Array(0), { expectedRevision: 5 });
     expect(posZeroRes.revision).toBe(0);
     expect(posZeroHeadCalled).toBe(false);
     expect(zeroPatchRev).toBe(5);
     server.resetHandlers();
 
-    // 5. V2 -> V1 fallback rejects internal uploads bound to expectedResourceId.
+    // 5. Multi-block commitExtentPatchImpl drains all in-flight PUT workers before aborting and replanning.
+    let block2FinishedBeforeAbort = false;
+    let block2Finished = false;
+    let replanAttempt = 0;
+    server.use(
+      http.patch("http://localhost:9009/v1/fs/drain-patch.bin", async ({ request }) => {
+        replanAttempt++;
+        const body = (await request.json()) as {
+          new_size: number;
+          dirty_blocks: Array<{ chunk: number; off: number; size: number; checksum: string }>;
+        };
+        return HttpResponse.json(
+          {
+            upload_id: `dp-${replanAttempt}`,
+            new_size: body.new_size,
+            blocks: body.dirty_blocks.map((d, idx) => ({
+              ...d,
+              url: replanAttempt === 1 ? `http://localhost:9009/obj/dp-${idx}` : "",
+              exists: replanAttempt > 1,
+            })),
+          },
+          { status: 202 }
+        );
+      }),
+      http.put("http://localhost:9009/obj/dp-0", () => new HttpResponse("Conflict", { status: 409 })),
+      http.put("http://localhost:9009/obj/dp-1", async () => {
+        await new Promise((r) => setTimeout(r, 25));
+        block2Finished = true;
+        return new HttpResponse(null, { status: 200 });
+      }),
+      http.post("http://localhost:9009/v2/uploads/dp-1/abort", () => {
+        block2FinishedBeforeAbort = block2Finished;
+        return HttpResponse.json({ status: "aborted" });
+      }),
+      http.post("http://localhost:9009/v2/uploads/dp-2/complete", () => HttpResponse.json({ status: "ok", revision: 9 }))
+    );
+    const dpRev = await commitExtentPatchImpl(
+      client,
+      "/drain-patch.bin",
+      8,
+      [
+        { chunk: 0, off: 0, data: text.encode("AAAA") },
+        { chunk: 0, off: 4, data: text.encode("BBBB") },
+      ],
+      8
+    );
+    expect(dpRev).toBe(9);
+    expect(block2FinishedBeforeAbort).toBe(true);
+    server.resetHandlers();
+
+    // 6. V2 -> V1 fallback rejects internal uploads bound to expectedResourceId.
     server.use(http.post("http://localhost:9009/v2/uploads/initiate", () => new HttpResponse("no v2", { status: 404 })));
     await expect(
       writeStreamImpl(client, "/v1-bound.bin", new Uint8Array(64), 64, { expectedResourceId: "res-bound" })

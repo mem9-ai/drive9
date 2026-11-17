@@ -97,7 +97,7 @@ drive9 fs rm :/path/to/file
 drive9 fs sh
 ```
 
-`drive9 fs cp` supports `--resume`, `--append`, repeated `--tag key=value`, and `--description <text>`. Tags and descriptions apply to local/stdin uploads. `--append` is for local-file-to-remote appends and cannot be combined with tags or descriptions.
+`drive9 fs cp` supports `--resume`, `--append`, `--layout extent|single`, repeated `--tag key=value`, and `--description <text>`. Tags, descriptions, and `--layout` apply to uploads. `--append` is for local-file-to-remote appends and cannot be combined with tags, descriptions, or `--layout`.
 
 ### Local mounts
 

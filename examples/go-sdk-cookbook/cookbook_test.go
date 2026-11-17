@@ -172,6 +172,13 @@ func ExampleClient_transfersAppendPatchAndStreaming() {
 		drive9.WithTags(map[string]string{"kind": "summary"}),
 		drive9.WithDescription("summary upload"),
 		drive9.WithContentLayout(drive9.ContentLayoutExtent),
+	)
+	_, _ = c.WriteStreamWithSummary(
+		ctx,
+		"/uploads/existing-extent.bin",
+		bytes.NewReader(body),
+		int64(len(body)),
+		nil,
 		drive9.WithTargetLayout(drive9.ContentLayoutExtent),
 	)
 	_, _ = c.WriteStreamWithSummaryAndTags(ctx, "/uploads/tag-summary.bin", bytes.NewReader(body), int64(len(body)), nil, map[string]string{"kind": "summary"})
