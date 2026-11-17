@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode"
 
 	"github.com/mem9-ai/drive9/internal/releasesign"
 )
@@ -63,7 +64,11 @@ func updateSigningKeyHint(err error, publicKeys string) error {
 	if !keyFailure {
 		return err
 	}
-	trusted := strings.Join(strings.Fields(publicKeys), ",")
+	// Compact the set for a one-line message: the file may separate keys with newlines, and a
+	// mixed "key1, key2" must not come out as "key1,,key2".
+	trusted := strings.Join(strings.FieldsFunc(publicKeys, func(r rune) bool {
+		return r == ',' || unicode.IsSpace(r)
+	}), ",")
 	if trusted == "" {
 		trusted = "(none)"
 	}

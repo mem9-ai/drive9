@@ -119,7 +119,8 @@ one key, so a rotation overlaps instead of switching in a single release:
    (either key) and on new clients (both keys).
 3. Switch `DRIVE9_RELEASE_SIGNING_KEY` to the new private key. Releases from then on are
    signed by the new key and verify on every client that installed the overlap release; the
-   release job's `-verify` steps validate each manifest against the embedded set before
+   release job's `-verify-release` step validates the whole bundle — both signatures, the
+   version-to-manifest digest, and the manifest structure — against the embedded set before
    upload.
 4. Once no client can still be running a pre-overlap binary, remove the old public key from
    `update_key.txt`. Removing it earlier strands late updaters; keeping it longer costs

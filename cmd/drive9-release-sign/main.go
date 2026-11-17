@@ -180,7 +180,7 @@ func verifyReleaseBundle(manifestPath, publicKey string) error {
 	}
 	release, err := releasesign.VerifyBundle(manifest, manifestSignature, info, infoSignature, publicKey)
 	if err != nil {
-		if isSignatureFailure(err) {
+		if isKeyFailure(err) {
 			return fmt.Errorf("%w (pass the release key with -pubkey or $%s; a comma- or newline-separated set is accepted)", err, publicKeyEnv)
 		}
 		return err
@@ -197,6 +197,9 @@ func verifySignedFile(path string, body []byte, publicKey string) error {
 		return err
 	}
 	if err := releasesign.Verify(body, signature, publicKey); err != nil {
+		if !isKeyFailure(err) {
+			return fmt.Errorf("%s: %w", filepath.Base(path), err)
+		}
 		return fmt.Errorf("%s: %w (pass the release key with -pubkey or $%s; a comma- or newline-separated set is accepted)", filepath.Base(path), err, publicKeyEnv)
 	}
 	return nil
@@ -212,13 +215,12 @@ func readSignatureFile(path string) ([]byte, error) {
 	return signature, nil
 }
 
-// isSignatureFailure reports whether a bundle failure was about keys or signatures rather
-// than the bytes themselves, so only those get the "-pubkey / $DRIVE9_RELEASE_PUBLIC_KEY" hint.
-func isSignatureFailure(err error) bool {
+// isKeyFailure reports whether a failure was about the trusted key set rather than the bytes:
+// only those get the "-pubkey / $DRIVE9_RELEASE_PUBLIC_KEY" hint. An empty or malformed .sig
+// is not fixed by passing a key, so it is reported without the advice.
+func isKeyFailure(err error) bool {
 	return errors.Is(err, releasesign.ErrNoPublicKey) ||
 		errors.Is(err, releasesign.ErrInvalidPublicKey) ||
-		errors.Is(err, releasesign.ErrNoSignature) ||
-		errors.Is(err, releasesign.ErrInvalidSignature) ||
 		errors.Is(err, releasesign.ErrSignatureMismatch)
 }
 
