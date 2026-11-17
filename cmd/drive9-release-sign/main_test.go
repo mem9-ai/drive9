@@ -105,3 +105,20 @@ func TestRunRefusesWithoutKeyOrInput(t *testing.T) {
 		t.Fatalf("run with a short key error = %v, want a key error", err)
 	}
 }
+
+// The signer refuses a manifest the updater would reject: same parser on both sides, so a
+// release cannot be published in a shape that no CLI will install.
+func TestRunRefusesManifestTheUpdaterWouldReject(t *testing.T) {
+	t.Setenv(signingKeyEnv, base64.StdEncoding.EncodeToString(testSigningKey.Seed()))
+	dir := t.TempDir()
+	versionless := filepath.Join(dir, "checksums.txt")
+	if err := os.WriteFile(versionless, []byte(strings.Repeat("a", 64)+"  drive9-linux-amd64\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{versionless}); err == nil || !strings.Contains(err.Error(), "refusing to sign") {
+		t.Fatalf("run on a versionless manifest error = %v, want a refusal", err)
+	}
+	if _, err := os.Stat(versionless + ".sig"); !os.IsNotExist(err) {
+		t.Fatalf("a rejected manifest was signed anyway: %v", err)
+	}
+}

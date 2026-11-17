@@ -27,6 +27,10 @@ binary with a newer version string to make a downgrade look like an upgrade. The
 The detached signature is published next to it as `checksums.txt.sig`: base64 of the raw
 64-byte ed25519 signature.
 
+The build pins a **set** of public keys (`cmd/drive9/cli/update_key.txt`, comma-separated or
+one per line). A manifest that verifies under any pinned key installs, which is what lets a
+rotation overlap instead of switching in one release.
+
 ## Verifying a release by hand
 
 Two independent ways, both over the same bytes the CLI checks.
@@ -36,10 +40,14 @@ With the repository's own verifier (same code the CLI embeds):
 ```bash
 curl -fsSLO https://drive9.ai/releases/checksums.txt
 curl -fsSLO https://drive9.ai/releases/checksums.txt.sig
-DRIVE9_RELEASE_PUBLIC_KEY="<base64 public key>" \
+curl -fsSLO https://drive9.ai/releases/drive9-linux-amd64   # your platform
+DRIVE9_RELEASE_PUBLIC_KEY="<base64 public key[,more]>" \
   go run ./cmd/drive9-release-sign -verify checksums.txt \
-  && sha256sum --check checksums.txt   # artifact bytes, only after the signature
+  && grep '  drive9-linux-amd64$' checksums.txt | sha256sum --check -   # that artifact only
 ```
+
+`sha256sum --check` fails on every artifact you did not download, so check just the one you
+fetched (or pass `--ignore-missing` on GNU coreutils).
 
 `drive9-release-sign -verify` exits non-zero when the signature does not verify, so the
 checksum step cannot run on an unauthenticated manifest.
@@ -57,7 +65,7 @@ openssl pkey -pubin -inform DER -in drive9-release.der -out drive9-release.pem
 base64 -d checksums.txt.sig > checksums.sig
 openssl pkeyutl -verify -pubin -inkey drive9-release.pem -rawin \
   -in checksums.txt -sigfile checksums.sig \
-  && sha256sum --check checksums.txt
+  && grep '  drive9-linux-amd64$' checksums.txt | sha256sum --check -
 ```
 
 `pkeyutl -verify` prints `Signature Verified Successfully` and exits 0; `sha256sum --check`
@@ -78,34 +86,32 @@ DRIVE9_RELEASE_SIGNING_KEY=<base64 seed> go run ./cmd/drive9-release-sign dist/c
 
 ## Rotating the key
 
-Installed CLIs only trust the key embedded in the binary they are running, so a rotation is a
-two-release dance: the transition release that carries the new key must itself be signed with
-the **current** key.
+The updater trusts the key set embedded in the binary it runs, and that set may hold more than
+one key, so a rotation overlaps instead of switching in a single release:
 
-1. Generate a new pair. Keep its private key at hand, but do **not** put it in
-   `DRIVE9_RELEASE_SIGNING_KEY` yet: the release job signs with whatever is in that secret,
-   and the next release must be signed with the current key.
-2. Land a release that embeds the **new** public key in
-   `cmd/drive9/cli/update_signing.go`, with `DRIVE9_RELEASE_SIGNING_KEY` still holding the
-   **current** private key. That is the transition release.
-3. Confirm an **existing** client — one whose binary predates the transition release —
-   installs it: `drive9 update` succeeds and the reported version is the transition version.
-   Do not test the other direction yet: the transition binary trusts the new key, and the
-   manifest it came from is still signed with the old one, so updating *from* the transition
-   binary fails verification until step 4.
-4. Replace `DRIVE9_RELEASE_SIGNING_KEY` with the new private key and publish the next
-   release. Confirm a **transition client** (installed at step 3) installs it: that update
-   crosses the trust change and is the proof the rotation finished. A client still running a
-   pre-transition binary cannot verify this manifest — old-key binaries reject new-key
-   signatures, which is step 5's problem, not a step 4 failure.
-5. Keep the transition release's artifacts published until the fleet has moved. A client that
-   missed it still trusts the old key and rejects every new-key-signed manifest; recover it
-   with a manual install of the target release (download the artifact for its platform and
-   place it on `PATH`, or reinstall from the transition release while it is still served).
+1. Generate a new pair. Add its public key to `cmd/drive9/cli/update_key.txt` **next to the
+   current key** and ship that release with `DRIVE9_RELEASE_SIGNING_KEY` still holding the
+   **current** private key. Installed clients accept it (they trust the old key), and the
+   binary they install now trusts both.
+2. Keep publishing releases signed with the old key for at least one cycle. `drive9 update`
+   and `drive9 update --check` work on pre-change clients (old key), on overlap clients
+   (either key) and on new clients (both keys).
+3. Switch `DRIVE9_RELEASE_SIGNING_KEY` to the new private key. Releases from then on are
+   signed by the new key and verify on every client that installed the overlap release; the
+   release job's `-verify` step validates each manifest against the embedded set before
+   upload.
+4. Once no client can still be running a pre-overlap binary, remove the old public key from
+   `update_key.txt`. Removing it earlier strands late updaters; keeping it longer costs
+   nothing but leaves the retired key trusted.
+5. A client that missed the overlap window still trusts only the old key and rejects new-key
+   manifests: recover it with a manual install of the target artifact (download the file for
+   its platform and place it on `PATH`), or a reinstall from the overlap release if you keep
+   its artifacts published. `/latest/` is overwritten in place by each release, so the
+   overlap is the supported path — do not depend on old artifacts staying available.
 
-There is no revocation list: a compromised key is rotated by the same steps, starting from a
-release signed with the compromised key (or a support-assisted manual install if the key is
-already in an attacker's hands).
+There is no revocation list: a compromised key is removed from `update_key.txt` in a release
+signed by the remaining keys (or a support-assisted manual install if the compromised key is
+the only one).
 
 ## Custom or self-hosted releases
 
@@ -121,8 +127,9 @@ refuses to self-update rather than falling back to trusting the origin.
 
 ## Residual risks
 
-* A **stolen release key** is equivalent to a malicious release. That is inherent to any
-  signing scheme; rotate as above.
+* A **stolen release key** is equivalent to a malicious release while it stays pinned. That is
+  inherent to any signing scheme; rotate as above, and remove the key from `update_key.txt`
+  once the overlap release has been adopted.
 * **Old clients** (built before this change) do not verify signatures and remain exposed to
   an origin-level compromise. Only updating them fixes that.
 * The **agent archive** channel (`scripts/publish-agent-archive.sh`) has its own checksums

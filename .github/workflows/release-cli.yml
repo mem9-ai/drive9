@@ -78,6 +78,12 @@ jobs:
           go run ./cmd/drive9-release-sign dist/checksums.txt
           test -s dist/checksums.txt.sig
           base64 -d dist/checksums.txt.sig | wc -c | grep -qx 64
+          # Verify the signature against the key this release's binary embeds, read from the
+          # same file the build embeds. A stale or mistyped secret signs happily and would
+          # publish a release no updated CLI can install; this step fails the job instead.
+          go run ./cmd/drive9-release-sign -verify \
+            -pubkey "$(tr -d '[:space:]' < cmd/drive9/cli/update_key.txt)" \
+            dist/checksums.txt
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
@@ -85,21 +91,34 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: us-west-2
 
+      # Two passes, binaries first. The updater fetches the manifest and its signature as two
+      # requests, and both sort ahead of the artifacts, so publishing manifests after the
+      # binaries means a reader that sees a manifest can also read the artifacts it names.
+      # Manifests get a short TTL so a rollback propagates quickly.
       - name: Upload CLI binaries to S3 (latest)
         run: |
           aws s3 sync dist/ s3://drive9-releases/latest/ \
             --exclude "*" \
             --include "drive9-*" \
             --include "kubectl-drive9-migration-*" \
+            --cache-control "public, max-age=300" \
+            --content-type "application/octet-stream" \
+            --no-progress
+          echo "Uploaded ${{ env.VERSION }} binaries to s3://drive9-releases/latest/"
+
+      - name: Publish release manifests to S3 (latest, last)
+        run: |
+          aws s3 sync dist/ s3://drive9-releases/latest/ \
+            --exclude "*" \
             --include "SHA256SUMS" \
             --include "checksums.txt" \
             --include "checksums.txt.sig" \
             --include "migration-kube-plugin-checksums.txt" \
             --include "version" \
-            --cache-control "public, max-age=300" \
+            --cache-control "public, max-age=60" \
             --content-type "application/octet-stream" \
             --no-progress
-          echo "Uploaded ${{ env.VERSION }} to s3://drive9-releases/latest/"
+          echo "Published ${{ env.VERSION }} manifests to s3://drive9-releases/latest/"
           aws s3 ls s3://drive9-releases/latest/
 
       - name: Invalidate CloudFront cache

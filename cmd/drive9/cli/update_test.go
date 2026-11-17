@@ -473,16 +473,16 @@ func TestUpdatePinsRedirectsForPinnedReleaseRoots(t *testing.T) {
 
 func TestParseChecksumsRejectsPathQualifiedArtifactNames(t *testing.T) {
 	sum := strings.Repeat("a", sha256.Size*2)
-	_, err := parseChecksums([]byte(fmt.Sprintf("%s  releases/drive9-linux-amd64\n", sum)))
+	_, err := releasesign.ParseManifest([]byte(fmt.Sprintf("%s# drive9-release-version v1.0.0\n%s  releases/drive9-linux-amd64\n", "", sum)))
 	if err == nil || !strings.Contains(err.Error(), "must be a release artifact filename") {
-		t.Fatalf("parseChecksums error = %v, want artifact filename error", err)
+		t.Fatalf("ParseManifest error = %v, want artifact filename error", err)
 	}
 }
 
 func TestParseChecksumsRejectsDuplicateArtifactNames(t *testing.T) {
 	first := strings.Repeat("a", sha256.Size*2)
 	second := strings.Repeat("b", sha256.Size*2)
-	_, err := parseChecksums([]byte(fmt.Sprintf("%s  drive9-linux-amd64\n%s  drive9-linux-amd64\n", first, second)))
+	_, err := releasesign.ParseManifest([]byte(fmt.Sprintf("%s# drive9-release-version v1.0.0\n%s  drive9-linux-amd64\n%s  drive9-linux-amd64\n", "", first, second)))
 	if err == nil || !strings.Contains(err.Error(), "duplicate checksum") {
 		t.Fatalf("parseChecksums error = %v, want duplicate checksum error", err)
 	}
@@ -709,8 +709,8 @@ func TestUpdateRefusesWithoutBuildSigningKey(t *testing.T) {
 		stdout:               &bytes.Buffer{},
 		allowInsecureBaseURL: true,
 	})
-	if err == nil || !strings.Contains(err.Error(), "carries no release-signing key") {
-		t.Fatalf("update error = %v, want the no-key refusal", err)
+	if err == nil || !strings.Contains(err.Error(), "no release-signing public key configured") || !strings.Contains(err.Error(), "updateManifestPublicKey") {
+		t.Fatalf("update error = %v, want the no-key refusal with the rebuild hint", err)
 	}
 	if requests == 0 {
 		t.Fatal("expected the manifest to be fetched before the key check rejects it")
@@ -774,11 +774,11 @@ func TestUpdateTakesVersionFromSignedManifest(t *testing.T) {
 func TestParseReleaseManifest(t *testing.T) {
 	sum := strings.Repeat("a", sha256.Size*2)
 	valid := []byte(fmt.Sprintf("%sv0.2.0\n%s  drive9-linux-amd64\n", releasesign.VersionPrefix, sum))
-	manifest, err := parseReleaseManifest(valid)
+	manifest, err := releasesign.ParseManifest(valid)
 	if err != nil {
-		t.Fatalf("parseReleaseManifest: %v", err)
+		t.Fatalf("ParseManifest: %v", err)
 	}
-	if manifest.version != "v0.2.0" || manifest.checksums["drive9-linux-amd64"] != sum {
+	if manifest.Version != "v0.2.0" || manifest.Checksums["drive9-linux-amd64"] != sum {
 		t.Fatalf("manifest = %+v, want v0.2.0 and the artifact checksum", manifest)
 	}
 
@@ -793,9 +793,80 @@ func TestParseReleaseManifest(t *testing.T) {
 		{name: "no checksums", body: releasesign.VersionPrefix + "v0.2.0\n", want: "empty checksum list"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := parseReleaseManifest([]byte(tc.body)); err == nil || !strings.Contains(err.Error(), tc.want) {
-				t.Fatalf("parseReleaseManifest error = %v, want %q", err, tc.want)
+			if _, err := releasesign.ParseManifest([]byte(tc.body)); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("ParseManifest error = %v, want %q", err, tc.want)
 			}
 		})
+	}
+}
+
+// The build's embedded key file must hold at least one usable key: an empty or malformed
+// pin would turn every update into a refusal, and a typo is easier to catch here than in a
+// release job.
+func TestUpdateEmbeddedKeyFileIsValid(t *testing.T) {
+	keys, err := releasesign.ParsePublicKeys(updateManifestKeyFile)
+	if err != nil {
+		t.Fatalf("embedded key file: %v", err)
+	}
+	if len(keys) == 0 {
+		t.Fatal("embedded key file names no keys")
+	}
+}
+
+// A rotation overlaps: the build pins old,new while releases are still signed with the old
+// key. A manifest signed by either key installs, which is what lets the secret switch
+// without stranding clients.
+func TestUpdateAcceptsManifestSignedByOverlapKey(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	payload := []byte("new-drive9")
+	sum := sha256.Sum256(payload)
+	foreignKey := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{0x91}, ed25519.SeedSize))
+	foreignPublic := base64.StdEncoding.EncodeToString(foreignKey.Public().(ed25519.PublicKey))
+	// Pin the test key first, the rotating key second: the signature comes from the second.
+	useUpdateTestSigningKey(t, updateTestSigningPublicKey+","+foreignPublic)
+
+	target := filepath.Join(t.TempDir(), "drive9")
+	if err := os.WriteFile(target, []byte("old-drive9"), 0o755); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	manifest := updateTestManifest("v0.2.0", "drive9-linux-amd64", fmt.Sprintf("%x", sum[:]))
+	signature, signErr := releasesign.Sign(manifest, foreignKey)
+	if signErr != nil {
+		t.Fatal(signErr)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/releases/checksums.txt":
+			_, _ = w.Write(manifest)
+		case "/releases/" + releasesign.SignatureName:
+			_, _ = w.Write(signature)
+		case "/releases/drive9-linux-amd64":
+			_, _ = w.Write(payload)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	err := updateWithDeps([]string{"--base-url", srv.URL}, updateDeps{
+		currentVersion:       "v0.1.0",
+		goos:                 "linux",
+		goarch:               "amd64",
+		executable:           func() (string, error) { return target, nil },
+		httpClient:           srv.Client(),
+		stdout:               &bytes.Buffer{},
+		allowInsecureBaseURL: true,
+		replaceExecutable: func(newPath, targetPath string) error {
+			if err := os.Remove(targetPath); err != nil {
+				return err
+			}
+			return os.Rename(newPath, targetPath)
+		},
+	})
+	if err != nil {
+		t.Fatalf("update signed by the overlap key: %v", err)
+	}
+	if got, readErr := os.ReadFile(target); readErr != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("target = %q err=%v, want the new binary", got, readErr)
 	}
 }

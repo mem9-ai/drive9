@@ -310,7 +310,7 @@ build-cli-release:
 		echo "Building $$(basename "$$out")..."; \
 		$(MAKE) --no-print-directory build-cli GOOS="$$os" GOARCH="$$arch" CLI_BIN="$$out" VERSION="$(VERSION)"; \
 	done; \
-	cd $(DIST_DIR) && { printf '%s%s\n' '# drive9-release-version ' "$(VERSION)"; sha256sum $(CLI_NAME)-*; } > checksums.txt && printf '%s\n' "$(VERSION)" > version
+	cd $(DIST_DIR) && { printf '%s%s\n' '# drive9-release-version ' "$(if $(VERSION),$(VERSION),dev)"; sha256sum $(CLI_NAME)-*; } > checksums.txt && printf '%s\n' "$(if $(VERSION),$(VERSION),dev)" > version
 
 DOCKER_BUILD_ARGS ?=
 MIGRATION_DOCKER_BUILD_ARGS ?=

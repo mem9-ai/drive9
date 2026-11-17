@@ -40,17 +40,20 @@ func TestCLIReleasePublishesLegacyManifests(t *testing.T) {
 	if generate == "" || upload == "" {
 		t.Fatal("missing release generation/upload step")
 	}
-	for _, name := range []string{"drive9-*", "kubectl-drive9-migration-*", "version", "SHA256SUMS", "checksums.txt", "checksums.txt.sig", "migration-kube-plugin-checksums.txt"} {
+	for _, name := range []string{"drive9-*", "kubectl-drive9-migration-*"} {
 		if !strings.Contains(upload, "--include \""+name+"\"") {
-			t.Errorf("S3 upload omits %s", name)
+			t.Errorf("S3 binary upload omits %s", name)
 		}
 	}
 	// The self-updater refuses a manifest it cannot authenticate, so a release that skips
 	// signing is a release nobody can update to.
-	var signStep string
+	var signStep, manifestUpload string
 	for _, step := range workflow.Jobs["release"].Steps {
-		if step.Name == "Sign release manifest" {
+		switch step.Name {
+		case "Sign release manifest":
 			signStep = step.Run
+		case "Publish release manifests to S3 (latest, last)":
+			manifestUpload = step.Run
 		}
 	}
 	if signStep == "" {
@@ -60,6 +63,29 @@ func TestCLIReleasePublishesLegacyManifests(t *testing.T) {
 		if !strings.Contains(signStep, want) {
 			t.Errorf("signing step omits %q", want)
 		}
+	}
+	// Signing is not enough: the signature must verify against the key the release binary
+	// embeds, read from the same file the build embeds.
+	for _, want := range []string{"-verify", "cmd/drive9/cli/update_key.txt"} {
+		if !strings.Contains(signStep, want) {
+			t.Errorf("signing step does not verify against the embedded key: missing %q", want)
+		}
+	}
+	// Binaries first, manifests last: the updater reads the manifest pair in two requests and
+	// both sort ahead of the artifacts.
+	if manifestUpload == "" {
+		t.Fatal("release workflow has no separate manifest upload step")
+	}
+	if strings.Contains(upload, `--include "checksums.txt"`) || strings.Contains(upload, `--include "SHA256SUMS"`) {
+		t.Error("binary upload still publishes the manifest, so the manifest can appear before its artifacts")
+	}
+	for _, name := range []string{"checksums.txt", "checksums.txt.sig", "SHA256SUMS", "version"} {
+		if !strings.Contains(manifestUpload, `--include "`+name+`"`) {
+			t.Errorf("manifest upload omits %s", name)
+		}
+	}
+	if !strings.Contains(manifestUpload, "max-age=60") {
+		t.Error("manifest upload should use a short cache TTL so a rollback propagates")
 	}
 	for _, failure := range []string{"none", "checksum mismatch", "missing manifest"} {
 		t.Run(failure, func(t *testing.T) {
@@ -84,6 +110,12 @@ func TestCLIReleasePublishesLegacyManifests(t *testing.T) {
 				sum := sha256.Sum256(payload)
 				line := fmt.Sprintf("%x  %s\n", sum, artifact.binary)
 				all.WriteString(line)
+				manifestBody := line
+				if artifact.manifest == "checksums.txt" {
+					// The Makefile writes the signed version line; the workflow's
+					// `sha256sum --check` has to keep accepting it.
+					manifestBody = "# drive9-release-version vtest0\n" + line
+				}
 				if failure == "checksum mismatch" && artifact.manifest == "checksums.txt" {
 					payload = []byte("changed binary")
 				}
@@ -91,7 +123,7 @@ func TestCLIReleasePublishesLegacyManifests(t *testing.T) {
 					t.Fatal(err)
 				}
 				if failure != "missing manifest" || artifact.manifest != "checksums.txt" {
-					if err := os.WriteFile(filepath.Join(dist, artifact.manifest), []byte(line), 0600); err != nil {
+					if err := os.WriteFile(filepath.Join(dist, artifact.manifest), []byte(manifestBody), 0600); err != nil {
 						t.Fatal(err)
 					}
 				}

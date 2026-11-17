@@ -94,7 +94,7 @@ func updateWithDeps(args []string, deps updateDeps) error {
 		return fmt.Errorf("DRIVE9_UPDATE_BASE_URL=%q is not a pinned drive9 release host (%s); pass --base-url explicitly to install from a custom release root", deps.baseURL, strings.Join(updateReleaseHosts, ", "))
 	}
 	if baseURLFromFlag && !isPinnedUpdateHost(deps.baseURL) {
-		_, _ = fmt.Fprintf(deps.stderr, "warning: installing from custom release root %s; integrity relies on that origin serving releases/checksums.txt\n", deps.baseURL)
+		_, _ = fmt.Fprintf(deps.stderr, "warning: installing from custom release root %s; the manifest must verify against the drive9 release key or nothing is installed\n", deps.baseURL)
 	}
 	if isPinnedUpdateHost(deps.baseURL) {
 		// The pinned host is only the first hop: the default client follows up to
@@ -116,7 +116,7 @@ func updateWithDeps(args []string, deps updateDeps) error {
 	if err != nil {
 		return err
 	}
-	latestVersion := manifest.version
+	latestVersion := manifest.Version
 	artifact := updateArtifactName(deps.goos, deps.goarch)
 	latestURL := releaseURL(deps.baseURL, artifact)
 	relation := compareReleaseVersions(deps.currentVersion, latestVersion)
@@ -156,7 +156,7 @@ func updateWithDeps(args []string, deps updateDeps) error {
 	if err != nil {
 		return err
 	}
-	want, ok := manifest.checksums[artifact]
+	want, ok := manifest.Checksums[artifact]
 	if !ok {
 		return fmt.Errorf("checksum for %s not found in the signed release manifest %s", artifact, releaseURL(deps.baseURL, "checksums.txt"))
 	}
@@ -414,19 +414,20 @@ func displayVersion(version string) string {
 // fetchReleaseManifest downloads the release manifest and its detached signature from the
 // release root, verifies the signature, and only then parses anything. The two files coming
 // from the same origin is exactly why the signature — not the origin — is the trust anchor.
-func fetchReleaseManifest(ctx context.Context, deps updateDeps) (releaseManifest, error) {
-	body, err := httpGetBytes(ctx, deps.httpClient, releaseURL(deps.baseURL, "checksums.txt"), 1<<20)
+func fetchReleaseManifest(ctx context.Context, deps updateDeps) (releasesign.Manifest, error) {
+	body, err := httpGetBytes(ctx, deps.httpClient, releaseURL(deps.baseURL, releasesign.ManifestName), 1<<20)
 	if err != nil {
-		return releaseManifest{}, fmt.Errorf("fetch release manifest: %w", err)
+		return releasesign.Manifest{}, fmt.Errorf("fetch release manifest: %w", err)
 	}
 	signature, err := httpGetBytes(ctx, deps.httpClient, releaseURL(deps.baseURL, releasesign.SignatureName), 4096)
 	if err != nil {
-		return releaseManifest{}, fmt.Errorf("fetch release manifest signature: %w", err)
+		return releasesign.Manifest{}, fmt.Errorf("fetch release manifest signature: %w", err)
 	}
 	if err := verifyUpdateManifestSignature(body, signature, deps.signingKey); err != nil {
-		return releaseManifest{}, err
+		return releasesign.Manifest{}, err
 	}
-	return parseReleaseManifest(body)
+	// Signature verified first: the parser only ever sees bytes the release key vouched for.
+	return releasesign.ParseManifest(body)
 }
 
 func httpGetBytes(ctx context.Context, client *http.Client, url string, limit int64) ([]byte, error) {
@@ -450,50 +451,6 @@ func httpGetBytes(ctx context.Context, client *http.Client, url string, limit in
 		return nil, fmt.Errorf("GET %s: response too large", url)
 	}
 	return body, nil
-}
-
-func parseChecksums(data []byte) (map[string]string, error) {
-	checksums := map[string]string{}
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			// sha256sum --check ignores comment lines too, so the manifest keeps the
-			// signed version line and the release tooling keeps working unchanged.
-			continue
-		}
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
-			return nil, fmt.Errorf("invalid checksum line %q", line)
-		}
-		sum := strings.ToLower(fields[0])
-		if len(sum) != sha256.Size*2 {
-			return nil, fmt.Errorf("invalid checksum for %s", fields[1])
-		}
-		if _, err := hex.DecodeString(sum); err != nil {
-			return nil, fmt.Errorf("invalid checksum for %s: %w", fields[1], err)
-		}
-		name, err := checksumArtifactName(fields[1])
-		if err != nil {
-			return nil, err
-		}
-		if _, exists := checksums[name]; exists {
-			return nil, fmt.Errorf("duplicate checksum for %s", name)
-		}
-		checksums[name] = sum
-	}
-	return checksums, nil
-}
-
-func checksumArtifactName(raw string) (string, error) {
-	name := strings.TrimPrefix(raw, "*")
-	if name == "" {
-		return "", errors.New("empty checksum artifact name")
-	}
-	clean := filepath.ToSlash(filepath.Clean(name))
-	if clean == "." || strings.HasPrefix(clean, "/") || strings.HasPrefix(clean, "../") || strings.Contains(clean, "/") {
-		return "", fmt.Errorf("checksum artifact %q must be a release artifact filename", raw)
-	}
-	return clean, nil
 }
 
 func downloadUpdateBinary(ctx context.Context, deps updateDeps, url, targetPath, wantSHA string) (string, error) {

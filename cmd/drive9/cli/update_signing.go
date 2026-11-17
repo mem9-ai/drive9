@@ -1,70 +1,39 @@
 package cli
 
 import (
-	"errors"
+	_ "embed"
 	"fmt"
-	"strings"
 
 	"github.com/mem9-ai/drive9/internal/releasesign"
 )
 
-// updateManifestPublicKey is the ed25519 public key the self-updater verifies the release
-// manifest with. See internal/releasesign for why the manifest, and not the checksum match,
-// is the thing that decides what gets installed.
+// updateManifestKeyFile is the release key set this build trusts, one base64 ed25519 public
+// key per line (or a single comma-separated list). It is embedded rather than duplicated in
+// source so the release workflow can verify a manifest against the exact keys the shipped
+// binary carries — the same file, not a copy that can drift.
 //
-// It is a var, not a const, so a fork or a self-hosted build can install its own key at link
+//go:embed update_key.txt
+var updateManifestKeyFile string
+
+// updateManifestPublicKey is the key set the self-updater verifies the release manifest with.
+// A set (comma-separated) is allowed so a rotation can overlap: pin "old,new" while releases
+// are still signed by "old", then flip the signing secret and drop "old".
+//
+// It is a var, not a const, so a fork or a self-hosted build can install its own keys at link
 // time:
 //
-//	go build -ldflags "-X github.com/mem9-ai/drive9/cmd/drive9/cli.updateManifestPublicKey=<base64 public key>"
+//	go build -ldflags "-X github.com/mem9-ai/drive9/cmd/drive9/cli.updateManifestPublicKey=<base64 public key[,more]>"
 //
 // A build with no key refuses to update instead of trusting whatever the origin serves.
-var updateManifestPublicKey = "84uMULcNs9VhcuDjKg2SELH2RDgDBJ9Of03VnsU9faQ="
-
-// releaseManifest is the authenticated part of a release: the version to compare against
-// and the artifact checksums to verify downloaded bytes with.
-type releaseManifest struct {
-	version   string
-	checksums map[string]string
-}
+var updateManifestPublicKey = updateManifestKeyFile
 
 // verifyUpdateManifestSignature is the updater's entry point into the shared signature
-// contract.
-func verifyUpdateManifestSignature(manifest, signature []byte, publicKey string) error {
-	return releasesign.Verify(manifest, signature, publicKey)
-}
-
-// parseReleaseManifest parses the signed manifest: exactly one version line, then the
-// artifact checksums. The version is required, because the manifest is what the updater
-// trusts, and a manifest that cannot say which release it describes cannot be compared
-// against the running binary.
-func parseReleaseManifest(data []byte) (releaseManifest, error) {
-	// The marker without its trailing space, so a line with an empty value is still
-	// recognized as the version line instead of reading as a missing one.
-	marker := strings.TrimSpace(releasesign.VersionPrefix)
-	version := ""
-	for _, line := range strings.Split(string(data), "\n") {
-		trimmed := strings.TrimSpace(line)
-		rest, ok := strings.CutPrefix(trimmed, marker)
-		if !ok || (rest != "" && !strings.HasPrefix(rest, " ")) {
-			continue
-		}
-		if version != "" {
-			return releaseManifest{}, errors.New("release manifest names more than one version")
-		}
-		version = strings.TrimSpace(rest)
-		if version == "" {
-			return releaseManifest{}, errors.New("release manifest names an empty version")
-		}
+// contract: the trusted pin, then the caller-specific rebuild hint.
+func verifyUpdateManifestSignature(manifest, signature []byte, publicKeys string) error {
+	if err := releasesign.Verify(manifest, signature, publicKeys); err != nil {
+		return fmt.Errorf("%w (this build trusts: %s; rebuild with -X "+
+			"github.com/mem9-ai/drive9/cmd/drive9/cli.updateManifestPublicKey=<base64 public key[,more]>)",
+			err, publicKeys)
 	}
-	if version == "" {
-		return releaseManifest{}, fmt.Errorf("release manifest has no %q line", strings.TrimSpace(releasesign.VersionPrefix))
-	}
-	checksums, err := parseChecksums(data)
-	if err != nil {
-		return releaseManifest{}, err
-	}
-	if len(checksums) == 0 {
-		return releaseManifest{}, errors.New("release manifest has an empty checksum list")
-	}
-	return releaseManifest{version: version, checksums: checksums}, nil
+	return nil
 }

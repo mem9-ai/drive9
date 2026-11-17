@@ -73,6 +73,14 @@ func run(args []string) error {
 			// instead of letting an empty release through.
 			return fmt.Errorf("refusing to sign empty file %s", file)
 		}
+		// Sign only what the updater would accept: the same parser runs on both sides, so a
+		// release cannot be signed with a shape (empty version, no checksums) that the CLI
+		// would reject after publishing it.
+		parsed, err := releasesign.ParseManifest(manifest)
+		if err != nil {
+			return fmt.Errorf("refusing to sign %s: %w", file, err)
+		}
+		fmt.Printf("signing %s for release %s\n", filepath.Base(file), parsed.Version)
 		signature, err := releasesign.Sign(manifest, privateKey)
 		if err != nil {
 			return err
@@ -97,7 +105,7 @@ func verifyManifest(manifestPath, publicKey string) error {
 		return fmt.Errorf("read %s: %w", signaturePath, err)
 	}
 	if err := releasesign.Verify(manifest, signature, publicKey); err != nil {
-		return err
+		return fmt.Errorf("%w (pass the release key with -pubkey or $%s; a comma-separated list is accepted)", err, publicKeyEnv)
 	}
 	fmt.Printf("signature OK: %s\n", manifestPath)
 	return nil
