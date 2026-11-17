@@ -323,7 +323,7 @@ func (w *drive9Write) Close() error {
 	}
 	_, err = w.a.c.WriteStreamWithSummary(w.ctx, w.loc.Path, w.f, fi.Size(), nil, opts...)
 	if err != nil {
-		return fmt.Errorf("write %s: %w", w.loc.Raw, err)
+		return fmt.Errorf("write %s: %w", w.loc.Raw, wrapExplicitLayoutError(w.opts.Layout, err))
 	}
 	return nil
 }

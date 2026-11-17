@@ -49,6 +49,7 @@ func Cp(c *client.Client, args []string) error {
 	force := false
 	layerRef := ""
 	layout := ""
+	layoutSet := false
 	var tags map[string]string
 	var description string
 	filtered := make([]string, 0, len(args))
@@ -77,8 +78,10 @@ func Cp(c *client.Client, args []string) error {
 			}
 			i++
 			layout = strings.TrimSpace(args[i])
+			layoutSet = true
 		case strings.HasPrefix(a, "--layout="):
 			layout = strings.TrimSpace(strings.TrimPrefix(a, "--layout="))
+			layoutSet = true
 		case a == "--tag":
 			if i+1 >= len(args) {
 				return fmt.Errorf("--tag requires key=value argument")
@@ -107,7 +110,7 @@ func Cp(c *client.Client, args []string) error {
 	}
 	args = filtered
 
-	if layout != "" && layout != string(client.ContentLayoutSingle) && layout != string(client.ContentLayoutExtent) {
+	if layoutSet && layout != string(client.ContentLayoutSingle) && layout != string(client.ContentLayoutExtent) {
 		return fmt.Errorf("invalid --layout %q (want extent or single)", layout)
 	}
 	if utf8.RuneCountInString(description) > backend.MaxDescriptionLen {
@@ -225,9 +228,11 @@ func Cp(c *client.Client, args []string) error {
 		}
 	}
 	if layout != "" {
-		layoutSupported := dstIsRemote && !appendMode && !resume && (src == "-" || !srcIsRemote)
-		if !layoutSupported {
-			return fmt.Errorf("--layout is only supported for local/stdin uploads to a remote path")
+		if !dstIsRemote {
+			return fmt.Errorf("--layout is only supported for uploads to drive9")
+		}
+		if srcIsRemote {
+			return fmt.Errorf("--layout is not supported for same-context server-side copy (use local/stdin/object/cross-context upload)")
 		}
 	}
 	if appendMode && src == "-" {
@@ -332,7 +337,7 @@ func Cp(c *client.Client, args []string) error {
 		}
 		summary, err := c.WriteStreamWithSummary(ctx, resolvedDst, bytes.NewReader(data), int64(len(data)), printProgress, opts...)
 		if err != nil {
-			return err
+			return wrapExplicitLayoutError(layout, err)
 		}
 		emitUploadSummary(ctx, summary, "-")
 		return nil
@@ -438,29 +443,51 @@ func Cp(c *client.Client, args []string) error {
 }
 
 func resolveRemoteCopyTarget(ctx context.Context, c *client.Client, remotePath, sourceBase string) (string, error) {
-	resolved, _, err := resolveRemoteCopyTargetWithLayout(ctx, c, remotePath, sourceBase)
-	return resolved, err
+	if strings.HasSuffix(remotePath, "/") {
+		if sourceBase == "" {
+			return "", fmt.Errorf("destination %q requires a file name", remotePath)
+		}
+		return pathpkg.Join(remotePath, sourceBase), nil
+	}
+	info, err := c.StatCtx(ctx, remotePath)
+	if err == nil && info.IsDir {
+		if sourceBase == "" {
+			return "", fmt.Errorf("destination %q requires a file name", remotePath)
+		}
+		return pathpkg.Join(remotePath, sourceBase), nil
+	}
+	if err != nil && !client.IsNotFound(err) {
+		return "", err
+	}
+	return remotePath, nil
 }
 
-// resolveRemoteCopyTargetWithLayout resolves a remote destination path and,
-// when remotePath directly names an existing file, returns its observed
-// ContentLayout without an extra round trip. Directory/trailing-slash targets
-// intentionally avoid a second HEAD on the computed leaf path so fresh uploads
-// into directories stay zero-extra-RTT (the SDK falls back automatically on 409
-// if an existing leaf has a different sticky layout).
+// resolveRemoteCopyTargetWithLayout resolves a remote upload destination path
+// and observes any existing leaf file's ContentLayout so uploads preserve
+// sticky layouts and reject contradictory --layout flags up front.
 func resolveRemoteCopyTargetWithLayout(ctx context.Context, c *client.Client, remotePath, sourceBase string) (string, client.ContentLayout, error) {
+	statLeaf := func(leaf string) (string, client.ContentLayout, error) {
+		leafInfo, lerr := c.StatCtx(ctx, leaf)
+		if lerr != nil && !client.IsNotFound(lerr) {
+			return "", "", lerr
+		}
+		if lerr == nil && leafInfo != nil && !leafInfo.IsDir {
+			return leaf, leafInfo.ContentLayout, nil
+		}
+		return leaf, "", nil
+	}
 	if strings.HasSuffix(remotePath, "/") {
 		if sourceBase == "" {
 			return "", "", fmt.Errorf("destination %q requires a file name", remotePath)
 		}
-		return pathpkg.Join(remotePath, sourceBase), "", nil
+		return statLeaf(pathpkg.Join(remotePath, sourceBase))
 	}
 	info, err := c.StatCtx(ctx, remotePath)
 	if err == nil && info.IsDir {
 		if sourceBase == "" {
 			return "", "", fmt.Errorf("destination %q requires a file name", remotePath)
 		}
-		return pathpkg.Join(remotePath, sourceBase), "", nil
+		return statLeaf(pathpkg.Join(remotePath, sourceBase))
 	}
 	if err != nil && !client.IsNotFound(err) {
 		return "", "", err
@@ -470,6 +497,17 @@ func resolveRemoteCopyTargetWithLayout(ctx context.Context, c *client.Client, re
 		targetLayout = info.ContentLayout
 	}
 	return remotePath, targetLayout, nil
+}
+
+func wrapExplicitLayoutError(layout string, err error) error {
+	if err == nil || layout == "" {
+		return err
+	}
+	lower := strings.ToLower(err.Error())
+	if strings.Contains(lower, "v2 upload api not available") || strings.Contains(lower, "server ignored layout=extent") || strings.Contains(lower, "does not support 0-byte extent file creation") {
+		return fmt.Errorf("--layout %s is not supported by this server (retry without --layout): %w", layout, err)
+	}
+	return err
 }
 
 func resolveLocalCopyTarget(localPath, sourceBase string) (string, error) {
@@ -543,7 +581,7 @@ func uploadFileWithOptions(ctx context.Context, c *client.Client, localPath, rem
 	}
 	summary, err := c.WriteStreamWithSummary(ctx, remotePath, f, size, printProgress, opts...)
 	if err != nil {
-		return err
+		return wrapExplicitLayoutError(string(layout), err)
 	}
 	emitUploadSummary(ctx, summary, localPath)
 	return nil
@@ -692,17 +730,29 @@ func cpViaBackend(ctx context.Context, defaultClient *client.Client, src, dst Lo
 	}
 	finalDst := dstH.Loc
 	targetLayout := ""
+	statLeafNeeded := false
 	if dstH.Loc.DirHint || strings.HasSuffix(dstH.Loc.Path, "/") || strings.HasSuffix(dstH.Loc.Local, "/") {
 		finalDst = joinDest(dstH.Loc, copyLeafName(srcH.Loc))
+		statLeafNeeded = dstH.Loc.Kind == KindDrive9
 	} else {
 		st, err := dstH.Backend.Stat(ctx, dstH.Loc)
 		if err == nil && st.IsDir {
 			finalDst = joinDest(dstH.Loc, copyLeafName(srcH.Loc))
+			statLeafNeeded = dstH.Loc.Kind == KindDrive9
 		} else if err == nil && st != nil {
 			targetLayout = st.ContentLayout
 		} else if err != nil && !errors.Is(err, objectfs.ErrNotFound) && !errors.Is(err, ErrNotFound) && !client.IsNotFound(err) && !os.IsNotExist(err) {
 			return err
 		}
+	}
+	sameBackendFastCopy := SameIdentity(srcH.Backend, dstH.Backend) && srcH.Loc.Bucket == finalDst.Bucket && len(tags) == 0 && description == "" && layout == ""
+	if statLeafNeeded && !sameBackendFastCopy {
+		if leafSt, lerr := dstH.Backend.Stat(ctx, finalDst); lerr == nil && leafSt != nil && !leafSt.IsDir {
+			targetLayout = leafSt.ContentLayout
+		}
+	}
+	if sameBackendFastCopy {
+		targetLayout = ""
 	}
 	return Copy(ctx, srcH.Backend, dstH.Backend, srcH.Loc, finalDst, info, CopyOpts{
 		Overwrite:    objectCopyOverwrite(force, finalDst),

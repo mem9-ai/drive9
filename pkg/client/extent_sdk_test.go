@@ -940,13 +940,52 @@ func TestExtentReviewRegressions(t *testing.T) {
 			t.Fatalf("ReadAll(header-rev) err = %v, want revision 5 -> 6 drift error", rerr)
 		}
 
-		// 5. 0B extent write with tags/description returns an explicit actionable error when server rejects 0B initiate.
-		_, err = c.writeExtentBytesConditional(context.Background(), "/tagged-zero.bin", nil, -1, map[string]string{"k": "v"}, "", nil, nil)
-		if err == nil || !strings.Contains(err.Error(), "0-byte extent writes do not accept tags or description") {
-			t.Fatalf("writeExtentBytesConditional(0B with tags) err = %v, want explicit 0-byte tags/description error", err)
+		// 5. Unconditional 0B extent write with tags/description applies ?setmeta=1; conditional 0B rejects upfront.
+		_, err = c.writeExtentBytesConditional(context.Background(), "/tagged-zero.bin", nil, 1, map[string]string{"k": "v"}, "", nil, nil)
+		if err == nil || !strings.Contains(err.Error(), "conditional 0-byte extent writes do not accept tags or description") {
+			t.Fatalf("writeExtentBytesConditional(conditional 0B with tags) err = %v, want explicit conditional error", err)
 		}
 		if cerr := c.completeUploadV2(context.Background(), "classic-up", []completePart{}, nil); cerr == nil || !strings.Contains(cerr.Error(), "parts must not be empty") {
 			t.Fatalf("completeUploadV2(classic empty parts) err = %v, want parts must not be empty", cerr)
+		}
+	})
+
+	t.Run("wire error classification contract pins status codes, machine codes, and server literals", func(t *testing.T) {
+		if !isExtentLayoutMismatchError(&StatusError{StatusCode: http.StatusConflict, Code: extentErrCodeLayoutMismatch, Message: "reworded"}) {
+			t.Fatal("expected machine code extent_layout_mismatch to match on 409")
+		}
+		if !isExtentLayoutMismatchError(&StatusError{StatusCode: http.StatusConflict, Message: "content layout mismatch: the file's layout is sticky for the life of the inode"}) {
+			t.Fatal("expected server layout mismatch literal to match on 409")
+		}
+		if isExtentLayoutMismatchError(&StatusError{StatusCode: http.StatusBadRequest, Message: "content layout mismatch"}) {
+			t.Fatal("must not classify non-409 as layout mismatch")
+		}
+
+		if !isExtentPresignUnsupportedError(&StatusError{StatusCode: http.StatusBadRequest, Code: extentErrCodePresignLengthUnsupported, Message: "reworded"}) {
+			t.Fatal("expected machine code extent_presign_length_unsupported to match on 400")
+		}
+		if !isExtentPresignUnsupportedError(&StatusError{StatusCode: http.StatusBadRequest, Message: "store cannot enforce a declared upload length at write time"}) {
+			t.Fatal("expected server presign length literal to match on 400")
+		}
+		if isExtentPresignUnsupportedError(&StatusError{StatusCode: http.StatusInternalServerError, Message: "cannot enforce a declared upload length"}) {
+			t.Fatal("must not classify non-400 as presign unsupported")
+		}
+
+		if !isZeroSizeExtentInitiateError(&StatusError{StatusCode: http.StatusBadRequest, Code: extentErrCodeZeroSizeUpload, Message: "reworded"}) {
+			t.Fatal("expected machine code zero_size_upload_unsupported to match on 400")
+		}
+		if !isZeroSizeExtentInitiateError(&StatusError{StatusCode: http.StatusBadRequest, Message: "total_size must be positive"}) {
+			t.Fatal("expected total_size must be positive literal to match on 400")
+		}
+
+		if !mayBeExtentDirectWriteRejection(&StatusError{StatusCode: http.StatusInternalServerError, Message: "internal storage error"}, -1) {
+			t.Fatal("expected exact 500 internal storage error to trigger stat check on overwrite")
+		}
+		if mayBeExtentDirectWriteRejection(&StatusError{StatusCode: http.StatusInternalServerError, Message: "internal storage error: disk full"}, -1) {
+			t.Fatal("must not match extended 500 error prose")
+		}
+		if mayBeExtentDirectWriteRejection(&StatusError{StatusCode: http.StatusInternalServerError, Message: "internal storage error"}, 0) {
+			t.Fatal("must not match 500 when expectedRevision == 0")
 		}
 	})
 }

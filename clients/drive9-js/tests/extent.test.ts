@@ -8,8 +8,11 @@ import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import * as publicSdk from "../src/index.js";
-import { Client, ConflictError, Drive9Error } from "../src/index.js";
+import { Client, ConflictError, Drive9Error, StatusError } from "../src/index.js";
 import {
+  EXTENT_ERR_CODE_LAYOUT_MISMATCH,
+  EXTENT_ERR_CODE_PRESIGN_LENGTH_UNSUPPORTED,
+  EXTENT_ERR_CODE_ZERO_SIZE_UPLOAD,
   ExtentBlockSize,
   ExtentChunkSize,
   ExtentNotServedError,
@@ -19,6 +22,10 @@ import {
   createExtentFileImpl,
   deleteFileConditionalImpl,
   getExtentReadPlanImpl,
+  isExtentLayoutMismatchError,
+  isExtentPresignUnsupportedError,
+  isZeroSizeExtentInitiateError,
+  mayBeExtentDirectWriteRejection,
   truncateExtentImpl,
   writeExtentBytesImpl,
 } from "../src/extent.js";
@@ -901,12 +908,18 @@ describe("Extent layout v2 support in TypeScript SDK", () => {
     let zeroCreateCalled = false;
     let zeroPatchRev = 0;
     let posZeroHeadCalled = false;
+    let setmetaPayload: unknown;
     server.use(
       http.post("http://localhost:9009/v2/uploads/initiate", () =>
         HttpResponse.json({ error: "total_size must be positive" }, { status: 400 })
       ),
       http.head("http://localhost:9009/v1/fs/new-zero.bin", () => new HttpResponse(null, { status: 404 })),
-      http.post("http://localhost:9009/v1/fs/new-zero.bin", () => {
+      http.post("http://localhost:9009/v1/fs/new-zero.bin", async ({ request }) => {
+        const url = new URL(request.url);
+        if (url.searchParams.has("setmeta")) {
+          setmetaPayload = await request.json();
+          return HttpResponse.json({ status: "ok" });
+        }
         zeroCreateCalled = true;
         return HttpResponse.json({ revision: 1, resource_id: "rz", content_layout: "extent" }, { status: 201 });
       }),
@@ -938,14 +951,19 @@ describe("Extent layout v2 support in TypeScript SDK", () => {
         return HttpResponse.json({ status: "ok" });
       })
     );
-    await writeExtentBytesImpl(client, "/new-zero.bin", new Uint8Array(0), { expectedRevision: -1 });
+    await writeExtentBytesImpl(client, "/new-zero.bin", new Uint8Array(0), {
+      expectedRevision: -1,
+      tags: { k: "v" },
+      description: "empty desc",
+    });
     expect(zeroCreateCalled).toBe(true);
+    expect(setmetaPayload).toEqual({ tags: { k: "v" }, description: "empty desc" });
     await expect(
       writeExtentBytesImpl(client, "/existing-empty-single.bin", new Uint8Array(0), { expectedRevision: -1 })
     ).rejects.toBeInstanceOf(ConflictError);
     await expect(
-      writeExtentBytesImpl(client, "/new-zero.bin", new Uint8Array(0), { expectedRevision: -1, tags: { k: "v" } })
-    ).rejects.toThrow(/0-byte extent writes do not accept tags or description/);
+      writeExtentBytesImpl(client, "/new-zero.bin", new Uint8Array(0), { expectedRevision: 2, tags: { k: "v" } })
+    ).rejects.toThrow(/conditional 0-byte extent writes do not accept tags or description/);
     const posZeroRes = await writeExtentBytesImpl(client, "/pos-zero.bin", new Uint8Array(0), { expectedRevision: 5 });
     expect(posZeroRes.revision).toBe(0);
     expect(posZeroHeadCalled).toBe(false);
@@ -1008,5 +1026,27 @@ describe("Extent layout v2 support in TypeScript SDK", () => {
       writeStreamImpl(client, "/v1-bound.bin", new Uint8Array(64), 64, { expectedResourceId: "res-bound" })
     ).rejects.toBeInstanceOf(ResourceMismatchError);
     server.resetHandlers();
+
+    // 7. Wire error classification contract pins status code, machine code, and exact 500 matching.
+    expect(isExtentLayoutMismatchError(new ConflictError("reworded", 409, undefined, EXTENT_ERR_CODE_LAYOUT_MISMATCH))).toBe(true);
+    expect(
+      isExtentLayoutMismatchError(new ConflictError("content layout mismatch: the file's layout is sticky for the life of the inode"))
+    ).toBe(true);
+    expect(isExtentLayoutMismatchError(new StatusError("content layout mismatch", 400))).toBe(false);
+
+    expect(
+      isExtentPresignUnsupportedError(new StatusError("reworded", 400, EXTENT_ERR_CODE_PRESIGN_LENGTH_UNSUPPORTED))
+    ).toBe(true);
+    expect(isExtentPresignUnsupportedError(new StatusError("store cannot enforce a declared upload length at write time", 400))).toBe(
+      true
+    );
+    expect(isExtentPresignUnsupportedError(new StatusError("cannot enforce a declared upload length", 500))).toBe(false);
+
+    expect(isZeroSizeExtentInitiateError(new StatusError("reworded", 400, EXTENT_ERR_CODE_ZERO_SIZE_UPLOAD))).toBe(true);
+    expect(isZeroSizeExtentInitiateError(new StatusError("total_size must be positive", 400))).toBe(true);
+
+    expect(mayBeExtentDirectWriteRejection(new StatusError("internal storage error", 500), -1)).toBe(true);
+    expect(mayBeExtentDirectWriteRejection(new StatusError("internal storage error: disk full", 500), -1)).toBe(false);
+    expect(mayBeExtentDirectWriteRejection(new StatusError("internal storage error", 500), 0)).toBe(false);
   });
 });

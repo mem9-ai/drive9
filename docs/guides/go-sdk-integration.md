@@ -354,6 +354,8 @@ if err != nil {
 _ = summary.Mode // direct_put, extent_v2, multipart_v2, or multipart_v1
 ```
 
+Large uploads default to `extent` content layout (degrading automatically to `multipart_v2` / `multipart_v1` on servers or stores without extent support). Use `drive9.WithContentLayout(drive9.ContentLayoutExtent)` or `drive9.WithContentLayout(drive9.ContentLayoutSingle)` to force a layout on fresh uploads, or `drive9.WithTargetLayout(stat.ContentLayout)` when overwriting an already-observed file to avoid a speculative layout-mismatch round trip.
+
 Large uploads require a seekable source:
 
 ```go

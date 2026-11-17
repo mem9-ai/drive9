@@ -451,6 +451,7 @@ func TestCliExtentDownloadCatAppendAndStat(t *testing.T) {
 		t.Fatalf("WriteFile(empty): %v", err)
 	}
 	var zeroTruncCompleted atomic.Bool
+	var setmetaReceived atomic.Bool
 	strictSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/sticky-single.bin":
@@ -458,7 +459,7 @@ func TestCliExtentDownloadCatAppendAndStat(t *testing.T) {
 			w.Header().Set("X-Dat9-Revision", "2")
 			w.Header().Set("X-Dat9-Content-Layout", string(client.ContentLayoutSingle))
 			w.WriteHeader(http.StatusOK)
-		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/sticky-extent.bin":
+		case r.Method == http.MethodHead && (r.URL.Path == "/v1/fs/sticky-extent.bin" || r.URL.Path == "/v1/fs/dir/empty.bin"):
 			w.Header().Set("Content-Length", "64")
 			w.Header().Set("X-Dat9-Revision", "5")
 			w.Header().Set("X-Dat9-Content-Layout", string(client.ContentLayoutExtent))
@@ -466,7 +467,7 @@ func TestCliExtentDownloadCatAppendAndStat(t *testing.T) {
 		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
 			w.WriteHeader(http.StatusBadRequest)
 			_, _ = w.Write([]byte(`{"error":"total_size must be positive"}`))
-		case r.Method == http.MethodPatch && r.URL.Path == "/v1/fs/sticky-extent.bin":
+		case r.Method == http.MethodPatch && (r.URL.Path == "/v1/fs/sticky-extent.bin" || r.URL.Path == "/v1/fs/dir/empty.bin"):
 			w.WriteHeader(http.StatusAccepted)
 			_ = json.NewEncoder(w).Encode(map[string]any{"upload_id": "ext-trunc-0", "new_size": 0, "blocks": []any{}})
 		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/ext-trunc-0/complete":
@@ -480,6 +481,9 @@ func TestCliExtentDownloadCatAppendAndStat(t *testing.T) {
 			}
 			zeroTruncCompleted.Store(true)
 			_, _ = w.Write([]byte(`{"status":"ok","revision":6}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs/sticky-extent.bin" && r.URL.Query().Has("setmeta"):
+			setmetaReceived.Store(true)
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
 		default:
 			http.NotFound(w, r)
 		}
@@ -487,14 +491,41 @@ func TestCliExtentDownloadCatAppendAndStat(t *testing.T) {
 	defer strictSrv.Close()
 
 	strictClient := client.New(strictSrv.URL, "k")
+	if err := Cp(strictClient, []string{"--layout=", emptyPath, ":/sticky-extent.bin"}); err == nil || !strings.Contains(err.Error(), `invalid --layout ""`) {
+		t.Fatalf("Cp(--layout=) err = %v, want invalid empty layout error", err)
+	}
 	err = Cp(strictClient, []string{"--layout=extent", emptyPath, ":/sticky-single.bin"})
 	if err == nil || !strings.Contains(err.Error(), "already has single content layout; --layout extent cannot be applied") {
 		t.Fatalf("Cp(--layout=extent onto single) err = %v, want fast layout mismatch", err)
 	}
-	if err := Cp(strictClient, []string{emptyPath, ":/sticky-extent.bin"}); err != nil {
-		t.Fatalf("Cp(empty onto sticky extent): %v", err)
+	err = Cp(strictClient, []string{"--layout=single", emptyPath, ":/sticky-extent.bin"})
+	if err == nil || !strings.Contains(err.Error(), "already has extent content layout; --layout single cannot be applied") {
+		t.Fatalf("Cp(--layout=single onto extent) err = %v, want fast layout mismatch", err)
 	}
-	if !zeroTruncCompleted.Load() {
-		t.Fatal("expected 0B extent overwrite to commit truncation session")
+	// Directory trailing-slash target also stats the resolved leaf and catches contradictory --layout!
+	err = Cp(strictClient, []string{"--layout=single", emptyPath, ":/dir/"})
+	if err == nil || !strings.Contains(err.Error(), "already has extent content layout; --layout single cannot be applied") {
+		t.Fatalf("Cp(--layout=single onto :/dir/ extent leaf) err = %v, want fast layout mismatch", err)
+	}
+	// 0-byte upload with --tag onto existing extent target truncates to 0 and applies ?setmeta=1!
+	if err := Cp(strictClient, []string{"--tag", "k=v", emptyPath, ":/sticky-extent.bin"}); err != nil {
+		t.Fatalf("Cp(empty --tag onto sticky extent): %v", err)
+	}
+	if !zeroTruncCompleted.Load() || !setmetaReceived.Load() {
+		t.Fatalf("zeroTruncCompleted=%v setmetaReceived=%v, want both true", zeroTruncCompleted.Load(), setmetaReceived.Load())
+	}
+
+	// Classic server without V2 wraps explicit --layout=extent error with retry guidance.
+	classicSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer classicSrv.Close()
+	nonEmpty := filepath.Join(tmpDir, "nonempty.bin")
+	if err := os.WriteFile(nonEmpty, []byte("hello"), 0o644); err != nil {
+		t.Fatalf("WriteFile(nonempty): %v", err)
+	}
+	err = Cp(client.New(classicSrv.URL, "k"), []string{"--layout=extent", nonEmpty, ":/new.bin"})
+	if err == nil || !strings.Contains(err.Error(), "--layout extent is not supported by this server (retry without --layout)") {
+		t.Fatalf("Cp(--layout=extent on classic server) err = %v, want wrapped --layout guidance", err)
 	}
 }

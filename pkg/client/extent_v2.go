@@ -48,6 +48,19 @@ const ExtentChunkSize = int64(1 << 26)
 // ranges are cut into blocks of at most this size before a patch commit.
 const ExtentBlockSize = int64(4 << 20)
 
+// Centralized extent v2 server error wire contract (mirrors tidbcloud/fs/pkg/server).
+// Classifiers match HTTP status + optional machine-readable StatusError.Code first,
+// then fall back to these pinned server wire literals.
+const (
+	extentErrCodeLayoutMismatch           = "extent_layout_mismatch"
+	extentErrMsgLayoutMismatch            = "content layout mismatch"
+	extentErrCodePresignLengthUnsupported = "extent_presign_length_unsupported"
+	extentErrMsgPresignLengthUnsupported  = "cannot enforce a declared upload length"
+	extentErrCodeZeroSizeUpload           = "zero_size_upload_unsupported"
+	extentErrMsgZeroSizeUpload            = "total_size must be positive"
+	extentErrMsgDirectWriteInternal       = "internal storage error"
+)
+
 // ErrExtentNotServed reports a read response that is not an extent block
 // plan (no extent content-layout header): callers fall back to the classic
 // read path.
@@ -745,17 +758,25 @@ func isExtentUploadPlan(plan *uploadPlanV2) bool {
 }
 
 func isExtentLayoutMismatchError(err error) bool {
-	if err == nil {
+	var se *StatusError
+	if !errors.As(err, &se) || se.StatusCode != http.StatusConflict {
 		return false
 	}
-	return strings.Contains(strings.ToLower(err.Error()), "content layout mismatch")
+	if se.Code == extentErrCodeLayoutMismatch {
+		return true
+	}
+	return strings.Contains(strings.ToLower(se.Message), extentErrMsgLayoutMismatch)
 }
 
 func isExtentPresignUnsupportedError(err error) bool {
-	if err == nil {
+	var se *StatusError
+	if !errors.As(err, &se) || se.StatusCode != http.StatusBadRequest {
 		return false
 	}
-	return strings.Contains(strings.ToLower(err.Error()), "cannot enforce a declared upload length")
+	if se.Code == extentErrCodePresignLengthUnsupported {
+		return true
+	}
+	return strings.Contains(strings.ToLower(se.Message), extentErrMsgPresignLengthUnsupported)
 }
 
 // mayBeExtentDirectWriteRejection reports whether a direct PUT failure may
@@ -771,7 +792,7 @@ func mayBeExtentDirectWriteRejection(err error, expectedRevision int64) bool {
 	}
 	var se *StatusError
 	if errors.As(err, &se) && se.StatusCode == http.StatusInternalServerError {
-		return strings.EqualFold(strings.TrimSpace(se.Message), "internal storage error")
+		return strings.EqualFold(strings.TrimSpace(se.Message), extentErrMsgDirectWriteInternal)
 	}
 	return false
 }
@@ -1063,14 +1084,27 @@ func (c *Client) writeExtentBytesConditional(ctx context.Context, path string, d
 	if err != nil {
 		// Compatibility with servers whose V2 initiate rejects total_size <= 0.
 		if size == 0 && isZeroSizeExtentInitiateError(err) {
-			if tags != nil || description != "" {
-				return 0, fmt.Errorf("0-byte extent writes do not accept tags or description: %w", err)
+			if (tags != nil || description != "") && (expectedRevision >= 0 || expectedResourceOf(rctx) != "") {
+				return 0, fmt.Errorf("conditional 0-byte extent writes do not accept tags or description: %w", err)
 			}
 			rev, ferr := c.fallbackZeroSizeExtentWrite(rctx, path, expectedRevision, summary, preCompleteCheck)
-			if ferr == nil && landedRev > 0 && callerSink != nil {
+			if ferr != nil {
+				return 0, ferr
+			}
+			if tags != nil || description != "" {
+				metaOpts := SetMetadataOptions{Tags: tags}
+				if description != "" {
+					desc := description
+					metaOpts.Description = &desc
+				}
+				if merr := c.SetMetadataCtx(ctx, path, metaOpts); merr != nil {
+					return 0, merr
+				}
+			}
+			if landedRev > 0 && callerSink != nil {
 				*callerSink = landedRev
 			}
-			return rev, ferr
+			return rev, nil
 		}
 		return 0, err
 	}
@@ -1096,7 +1130,10 @@ func isZeroSizeExtentInitiateError(err error) bool {
 	if !errors.As(err, &se) || se.StatusCode != http.StatusBadRequest {
 		return false
 	}
-	return strings.Contains(strings.ToLower(se.Message), "total_size must be positive")
+	if se.Code == extentErrCodeZeroSizeUpload {
+		return true
+	}
+	return strings.Contains(strings.ToLower(se.Message), extentErrMsgZeroSizeUpload)
 }
 
 func (c *Client) fallbackZeroSizeExtentWrite(ctx context.Context, path string, expectedRevision int64, summary *UploadSummary, preCompleteCheck func() error) (int64, error) {

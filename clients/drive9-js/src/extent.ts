@@ -16,6 +16,19 @@ import { Semaphore } from "./utils.js";
 export const ExtentChunkSize = 64 * 1024 * 1024;
 export const ExtentBlockSize = 4 * 1024 * 1024;
 
+/**
+ * Centralized extent v2 server error wire contract (mirrors tidbcloud/fs/pkg/server):
+ * classifiers match HTTP status + optional machine `code` first, then the pinned
+ * server wire literal so prose is never scattered across call sites.
+ */
+export const EXTENT_ERR_CODE_LAYOUT_MISMATCH = "extent_layout_mismatch";
+export const EXTENT_ERR_MSG_LAYOUT_MISMATCH = "content layout mismatch";
+export const EXTENT_ERR_CODE_PRESIGN_LENGTH_UNSUPPORTED = "extent_presign_length_unsupported";
+export const EXTENT_ERR_MSG_PRESIGN_LENGTH_UNSUPPORTED = "cannot enforce a declared upload length";
+export const EXTENT_ERR_CODE_ZERO_SIZE_UPLOAD = "zero_size_upload_unsupported";
+export const EXTENT_ERR_MSG_ZERO_SIZE_UPLOAD = "total_size must be positive";
+export const EXTENT_ERR_MSG_DIRECT_WRITE_INTERNAL_STORAGE = "internal storage error";
+
 export interface InternalWriteOptions extends WriteOptions {
   expectedResourceId?: string;
   layout?: ContentLayout;
@@ -133,13 +146,33 @@ export function isExtentUploadPlan(plan: UploadPlanV2): boolean {
 }
 
 export function isExtentLayoutMismatchError(err: unknown): boolean {
-  const msg = err instanceof Error ? err.message : String(err);
-  return msg.toLowerCase().includes("content layout mismatch");
+  if (!(err instanceof StatusError) || err.statusCode !== 409) {
+    return false;
+  }
+  if (err.code === EXTENT_ERR_CODE_LAYOUT_MISMATCH) {
+    return true;
+  }
+  return err.message.toLowerCase().includes(EXTENT_ERR_MSG_LAYOUT_MISMATCH);
 }
 
 export function isExtentPresignUnsupportedError(err: unknown): boolean {
-  const msg = err instanceof Error ? err.message : String(err);
-  return msg.toLowerCase().includes("cannot enforce a declared upload length");
+  if (!(err instanceof StatusError) || err.statusCode !== 400) {
+    return false;
+  }
+  if (err.code === EXTENT_ERR_CODE_PRESIGN_LENGTH_UNSUPPORTED) {
+    return true;
+  }
+  return err.message.toLowerCase().includes(EXTENT_ERR_MSG_PRESIGN_LENGTH_UNSUPPORTED);
+}
+
+export function isZeroSizeExtentInitiateError(err: unknown): boolean {
+  if (!(err instanceof StatusError) || err.statusCode !== 400) {
+    return false;
+  }
+  if (err.code === EXTENT_ERR_CODE_ZERO_SIZE_UPLOAD) {
+    return true;
+  }
+  return err.message.toLowerCase().includes(EXTENT_ERR_MSG_ZERO_SIZE_UPLOAD);
 }
 
 export function mayBeExtentDirectWriteRejection(err: unknown, expectedRevision: number): boolean {
@@ -150,8 +183,7 @@ export function mayBeExtentDirectWriteRejection(err: unknown, expectedRevision: 
     return false;
   }
   if (err instanceof StatusError && err.statusCode === 500) {
-    const lower = err.message.toLowerCase();
-    return lower.includes("internal storage error");
+    return err.message.trim().toLowerCase() === EXTENT_ERR_MSG_DIRECT_WRITE_INTERNAL_STORAGE;
   }
   return false;
 }
@@ -915,50 +947,52 @@ export async function writeExtentBytesImpl(
       options.expectedResourceId
     );
   } catch (err) {
-    if (
-      data.length === 0 &&
-      err instanceof StatusError &&
-      err.statusCode === 400 &&
-      err.message.toLowerCase().includes("total_size must be positive")
-    ) {
+    if (data.length === 0 && isZeroSizeExtentInitiateError(err)) {
       if (options.tags || options.description) {
-        throw new Drive9Error("0-byte extent writes do not accept tags or description");
+        if (options.expectedRevision >= 0 || options.expectedResourceId) {
+          throw new Drive9Error("conditional 0-byte extent writes do not accept tags or description");
+        }
       }
+      let result: { revision: number; partSize: number; totalParts: number; uploadedParts: number };
       if (options.expectedRevision === 0) {
         const created = await createExtentFileImpl(client, path);
         if (!created.native_extent) {
           throw new Drive9Error(`server does not support 0-byte extent file creation on ${path}`);
         }
-        return { revision: created.revision, partSize: 0, totalParts: 0, uploadedParts: 0 };
-      }
-      if (options.expectedRevision > 0) {
+        result = { revision: created.revision, partSize: 0, totalParts: 0, uploadedParts: 0 };
+      } else if (options.expectedRevision > 0) {
         const rev = await commitExtentPatchImpl(client, path, 0, [], options.expectedRevision, options.expectedResourceId);
-        return { revision: rev, partSize: 0, totalParts: 0, uploadedParts: 0 };
+        result = { revision: rev, partSize: 0, totalParts: 0, uploadedParts: 0 };
+      } else {
+        try {
+          const updated = await truncateExtentImpl(client, path, 0, {
+            expectedResourceId: options.expectedResourceId,
+          });
+          if (updated.content_layout && updated.content_layout !== "extent") {
+            throw new ConflictError("content layout mismatch: the file's layout is sticky for the life of the inode");
+          }
+          result = { revision: updated.revision, partSize: 0, totalParts: 0, uploadedParts: 0 };
+        } catch (truncErr) {
+          const isMissing =
+            (truncErr instanceof StatusError && truncErr.statusCode === 404) ||
+            (truncErr instanceof Drive9Error && truncErr.message.toLowerCase().includes("not found"));
+          if (!isMissing) {
+            throw truncErr;
+          }
+          if (options.expectedResourceId) {
+            throw new ResourceMismatchError(path);
+          }
+          const created = await createExtentFileImpl(client, path);
+          if (!created.native_extent) {
+            throw new Drive9Error(`server does not support 0-byte extent file creation on ${path}`);
+          }
+          result = { revision: created.revision, partSize: 0, totalParts: 0, uploadedParts: 0 };
+        }
       }
-      try {
-        const updated = await truncateExtentImpl(client, path, 0, {
-          expectedResourceId: options.expectedResourceId,
-        });
-        if (updated.content_layout && updated.content_layout !== "extent") {
-          throw new ConflictError("content layout mismatch: the file's layout is sticky for the life of the inode");
-        }
-        return { revision: updated.revision, partSize: 0, totalParts: 0, uploadedParts: 0 };
-      } catch (truncErr) {
-        const isMissing =
-          (truncErr instanceof StatusError && truncErr.statusCode === 404) ||
-          (truncErr instanceof Drive9Error && truncErr.message.toLowerCase().includes("not found"));
-        if (!isMissing) {
-          throw truncErr;
-        }
-        if (options.expectedResourceId) {
-          throw new ResourceMismatchError(path);
-        }
-        const created = await createExtentFileImpl(client, path);
-        if (!created.native_extent) {
-          throw new Drive9Error(`server does not support 0-byte extent file creation on ${path}`);
-        }
-        return { revision: created.revision, partSize: 0, totalParts: 0, uploadedParts: 0 };
+      if (options.tags || options.description) {
+        await setFileMetadataImpl(client, path, options.tags, options.description);
       }
+      return result;
     }
     throw err;
   }
@@ -978,6 +1012,28 @@ export async function writeExtentBytesImpl(
     await abortUploadV2BestEffort(client, plan.upload_id);
     throw err;
   }
+}
+
+async function setFileMetadataImpl(
+  client: Client,
+  path: string,
+  tags?: Record<string, string>,
+  description?: string
+): Promise<void> {
+  const payload: { tags?: Record<string, string>; description?: string } = {};
+  if (tags !== undefined) {
+    payload.tags = tags;
+  }
+  if (description !== undefined && description !== "") {
+    payload.description = description;
+  }
+  const resp = await fetch(`${client.fsUrl(path)}?setmeta=1`, {
+    method: "POST",
+    headers: client.authHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify(payload),
+  });
+  await checkError(resp);
+  await resp.text().catch(() => "");
 }
 
 export async function appendExtentImpl(
