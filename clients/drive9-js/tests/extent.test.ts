@@ -511,6 +511,47 @@ describe("Extent layout v2 support in TypeScript SDK", () => {
     const s3 = await client.writeStreamWithSummary("/azure.bin", data, data.length);
     expect(s3.mode).toBe("multipart_v2");
     expect(abortedExtent).toBe(true);
+
+    server.resetHandlers();
+
+    // Case 4: Azure Blob store with masked 500 "internal storage error" on presign-batch -> aborts extent and falls back to classic V2.
+    let abortedExtent500 = false;
+    server.use(
+      http.post("http://localhost:9009/v2/uploads/initiate", async ({ request }) => {
+        const body = (await request.json()) as { layout?: string };
+        if (body.layout === "extent") {
+          return HttpResponse.json(
+            {
+              upload_id: "azure-ext-500",
+              key: "",
+              part_size: 128,
+              total_parts: 1,
+              checksum_contract: { supported: ["SHA-256"], required: true },
+            },
+            { status: 202 }
+          );
+        }
+        return HttpResponse.json(
+          { upload_id: "azure-classic-500", key: "tenant/az-500", part_size: 128, total_parts: 1 },
+          { status: 202 }
+        );
+      }),
+      http.post("http://localhost:9009/v2/uploads/azure-ext-500/presign-batch", () => {
+        return HttpResponse.json({ error: "internal storage error" }, { status: 500 });
+      }),
+      http.post("http://localhost:9009/v2/uploads/azure-ext-500/abort", () => {
+        abortedExtent500 = true;
+        return HttpResponse.json({ status: "aborted" });
+      }),
+      http.post("http://localhost:9009/v2/uploads/azure-classic-500/presign", () => {
+        return HttpResponse.json({ number: 1, url: "http://localhost:9009/az/part-500", size: 128 });
+      }),
+      http.put("http://localhost:9009/az/part-500", () => new HttpResponse(null, { status: 200, headers: { ETag: '"az500"' } })),
+      http.post("http://localhost:9009/v2/uploads/azure-classic-500/complete", () => HttpResponse.json({ status: "ok" }))
+    );
+    const s4 = await client.writeStreamWithSummary("/azure500.bin", data, data.length);
+    expect(s4.mode).toBe("multipart_v2");
+    expect(abortedExtent500).toBe(true);
   });
 
   it("overwrites sticky extent files on small/0B write, writeStream, and Drive9Fs.writeFile", async () => {
@@ -1111,6 +1152,7 @@ describe("Extent layout v2 support in TypeScript SDK", () => {
     expect(isExtentPresignUnsupportedError(new StatusError("store cannot enforce a declared upload length at write time", 400))).toBe(
       true
     );
+    expect(isExtentPresignUnsupportedError(new StatusError("internal storage error", 500))).toBe(true);
     expect(isExtentPresignUnsupportedError(new StatusError("cannot enforce a declared upload length", 500))).toBe(false);
 
     expect(isZeroSizeExtentInitiateError(new StatusError("reworded", 400, EXTENT_ERR_CODE_ZERO_SIZE_UPLOAD))).toBe(true);

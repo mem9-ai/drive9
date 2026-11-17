@@ -266,6 +266,61 @@ func TestWriteStreamDegradesOnLegacyClassicStickySingleAndAzure(t *testing.T) {
 		if !aborted.Load() {
 			t.Fatal("expected failed extent session to be aborted")
 		}
+
+		// Also verify current tidbcloud/fs masked 500 "internal storage error" shape on presign-batch falls back cleanly.
+		var aborted500 atomic.Bool
+		srv500 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+				var body map[string]any
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				if body["layout"] == string(ContentLayoutExtent) {
+					w.WriteHeader(http.StatusAccepted)
+					_ = json.NewEncoder(w).Encode(uploadPlanV2{
+						UploadID:         "az-ext-500",
+						PartSize:         128,
+						TotalParts:       1,
+						ChecksumContract: checksumContract{Supported: []string{"SHA-256"}, Required: true},
+					})
+					return
+				}
+				w.WriteHeader(http.StatusAccepted)
+				_ = json.NewEncoder(w).Encode(uploadPlanV2{
+					UploadID:   "az-classic-500",
+					Key:        "tenant/az500",
+					PartSize:   128,
+					TotalParts: 1,
+				})
+			case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/az-ext-500/presign-batch":
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(`{"error":"internal storage error"}`))
+			case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/az-ext-500/abort":
+				aborted500.Store(true)
+				_, _ = w.Write([]byte(`{"status":"aborted"}`))
+			case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/az-classic-500/presign-batch":
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"parts": []presignedPart{{Number: 1, URL: "http://" + r.Host + "/az/500", Size: 128}},
+				})
+			case r.Method == http.MethodPut && r.URL.Path == "/az/500":
+				_, _ = io.Copy(io.Discard, r.Body)
+				w.Header().Set("ETag", `"az500"`)
+				w.WriteHeader(http.StatusOK)
+			case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/az-classic-500/complete":
+				_, _ = w.Write([]byte(`{"status":"ok"}`))
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer srv500.Close()
+		c500 := New(srv500.URL, "")
+		c500.SetSmallFileThresholdForTests(32)
+		sum500, err := c500.WriteStreamWithSummary(context.Background(), "/az500.bin", bytes.NewReader(payload), int64(len(payload)), nil)
+		if err != nil {
+			t.Fatalf("WriteStreamWithSummary(masked 500): %v", err)
+		}
+		if sum500.Mode != "multipart_v2" || !aborted500.Load() {
+			t.Fatalf("sum500.Mode=%q aborted=%v, want multipart_v2 and true", sum500.Mode, aborted500.Load())
+		}
 	})
 }
 
@@ -1001,8 +1056,11 @@ func TestExtentReviewRegressions(t *testing.T) {
 		if !isExtentPresignUnsupportedError(&StatusError{StatusCode: http.StatusBadRequest, Message: "store cannot enforce a declared upload length at write time"}) {
 			t.Fatal("expected server presign length literal to match on 400")
 		}
+		if !isExtentPresignUnsupportedError(&StatusError{StatusCode: http.StatusInternalServerError, Message: "internal storage error"}) {
+			t.Fatal("expected masked exact 500 internal storage error to match on presign-batch")
+		}
 		if isExtentPresignUnsupportedError(&StatusError{StatusCode: http.StatusInternalServerError, Message: "cannot enforce a declared upload length"}) {
-			t.Fatal("must not classify non-400 as presign unsupported")
+			t.Fatal("must not classify non-exact 500 prose as presign unsupported")
 		}
 
 		if !isZeroSizeExtentInitiateError(&StatusError{StatusCode: http.StatusBadRequest, Code: extentErrCodeZeroSizeUpload, Message: "reworded"}) {

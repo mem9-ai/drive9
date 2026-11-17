@@ -53,11 +53,14 @@ const ExtentBlockSize = int64(4 << 20)
 // then fall back to these pinned server wire literals:
 //   - HTTP 409 Conflict: ErrExtentLayoutMismatch ("content layout mismatch...") on
 //     V2 upload initiate (server.go:5926, extent_maintenance.go:220).
-//   - HTTP 400 Bad Request / 501 Not Implemented: s3client.ErrLengthBoundedPresignUnsupported
-//     ("store cannot enforce a declared upload length at write time", extent_blocks.go:268)
-//     when surfaced as a client/capability status on presign-batch. (Note: until
-//     tidbcloud/fs registers ErrLengthBoundedPresignUnsupported in ClientCausedSentinels,
-//     handleV2PresignBatch at server.go:6076 masks it behind 500 "internal storage error".)
+//   - HTTP 400 Bad Request / 501 Not Implemented (or masked 500 "internal storage error"):
+//     s3client.ErrLengthBoundedPresignUnsupported ("store cannot enforce a declared upload
+//     length at write time", extent_blocks.go:268) on the initial presign-batch call.
+//     Currently tidbcloud/fs handleV2PresignBatch (server.go:6076) masks it behind exact
+//     500 "internal storage error" until ErrLengthBoundedPresignUnsupported is added to
+//     ClientCausedSentinels, so isExtentPresignUnsupportedError accepts both the 400/501
+//     code/literal and exact 500 "internal storage error" (safe: classic fallback fails
+//     closed with 409 on sticky extent targets).
 //   - HTTP 400 Bad Request: "total_size must be positive" on V2 upload initiate
 //     (tidbcloud/fs server.go:5891, drive9 server.go:4617).
 //   - HTTP 500 Internal Server Error: exact "internal storage error" from handleWrite's
@@ -781,7 +784,13 @@ func isExtentLayoutMismatchError(err error) bool {
 
 func isExtentPresignUnsupportedError(err error) bool {
 	var se *StatusError
-	if !errors.As(err, &se) || (se.StatusCode != http.StatusBadRequest && se.StatusCode != http.StatusNotImplemented) {
+	if !errors.As(err, &se) {
+		return false
+	}
+	if se.StatusCode == http.StatusInternalServerError {
+		return strings.EqualFold(strings.TrimSpace(se.Message), extentErrMsgDirectWriteInternal)
+	}
+	if se.StatusCode != http.StatusBadRequest && se.StatusCode != http.StatusNotImplemented {
 		return false
 	}
 	if se.Code == extentErrCodePresignLengthUnsupported {
@@ -1241,7 +1250,9 @@ func (c *Client) createNativeExtentFileCtx(ctx context.Context, path string) (in
 		return 0, fmt.Errorf("decode create extent file response: %w", err)
 	}
 	if ContentLayout(result.ContentLayout) != ContentLayoutExtent {
-		_ = c.DeleteFileConditionalCtx(ctx, path, result.Revision, result.ResourceID)
+		if result.Revision > 0 || result.ResourceID != "" {
+			_ = c.DeleteFileConditionalCtx(ctx, path, result.Revision, result.ResourceID)
+		}
 		return 0, fmt.Errorf("server does not support 0-byte extent file creation on %s", path)
 	}
 	return result.Revision, nil

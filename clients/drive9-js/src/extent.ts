@@ -19,10 +19,12 @@ export const ExtentBlockSize = 4 * 1024 * 1024;
 /**
  * Centralized extent v2 server error wire contract (verified against tidbcloud/fs/pkg/server):
  * - HTTP 409 Conflict: ErrExtentLayoutMismatch ("content layout mismatch...") on V2 upload initiate.
- * - HTTP 400 Bad Request / 501 Not Implemented: ErrLengthBoundedPresignUnsupported
- *   ("store cannot enforce a declared upload length at write time") when surfaced as a client/capability
- *   status on presign-batch. (Until tidbcloud/fs registers ErrLengthBoundedPresignUnsupported in
- *   ClientCausedSentinels, handleV2PresignBatch at server.go:6076 masks it behind 500 "internal storage error".)
+ * - HTTP 400 Bad Request / 501 Not Implemented (or masked 500 "internal storage error"):
+ *   ErrLengthBoundedPresignUnsupported ("store cannot enforce a declared upload length at write time")
+ *   on the initial presign-batch call. Currently tidbcloud/fs handleV2PresignBatch (server.go:6076)
+ *   masks it behind exact 500 "internal storage error" until registered in ClientCausedSentinels,
+ *   so isExtentPresignUnsupportedError accepts both 400/501 and exact 500 "internal storage error"
+ *   (safe: classic fallback fails closed with 409 on sticky extent targets).
  * - HTTP 400 Bad Request: "total_size must be positive" on V2 upload initiate.
  * - HTTP 500 Internal Server Error: exact "internal storage error" from handleWrite's errJSONInternalStorage
  *   when direct PUT hits a sticky extent inode.
@@ -162,7 +164,13 @@ export function isExtentLayoutMismatchError(err: unknown): boolean {
 }
 
 export function isExtentPresignUnsupportedError(err: unknown): boolean {
-  if (!(err instanceof StatusError) || (err.statusCode !== 400 && err.statusCode !== 501)) {
+  if (!(err instanceof StatusError)) {
+    return false;
+  }
+  if (err.statusCode === 500) {
+    return err.message.trim().toLowerCase() === EXTENT_ERR_MSG_DIRECT_WRITE_INTERNAL_STORAGE;
+  }
+  if (err.statusCode !== 400 && err.statusCode !== 501) {
     return false;
   }
   if (err.code === EXTENT_ERR_CODE_PRESIGN_LENGTH_UNSUPPORTED) {
@@ -1057,7 +1065,9 @@ async function createNativeExtentFileImpl(client: Client, path: string): Promise
     | { revision?: number; resource_id?: string; content_layout?: string }
     | undefined;
   if (body?.content_layout !== "extent") {
-    await deleteFileConditionalImpl(client, path, body?.revision || 0, body?.resource_id || "").catch(() => {});
+    if ((body?.revision && body.revision > 0) || Boolean(body?.resource_id)) {
+      await deleteFileConditionalImpl(client, path, body?.revision || 0, body?.resource_id || "").catch(() => {});
+    }
     throw new Drive9Error(`server does not support 0-byte extent file creation on ${path}`);
   }
   return body.revision || 0;
