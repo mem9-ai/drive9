@@ -873,32 +873,23 @@ func (b *Bridge) withShutdownCtx(parent context.Context) (context.Context, conte
 }
 
 func (b *Bridge) NewSlice(ctx meta.Context, id *uint64) syscall.Errno {
-	b.mu.Lock()
-	sid := b.nextID
-	b.nextID++
-	b.mu.Unlock()
-
 	sctx, cancel := b.withShutdownCtx(ctxOf(ctx))
 	defer cancel()
-
-	if b.cfg.NativeWriteback || (b.cfg.MaxUpload > 0 && b.cfg.MaxUpload < 200) {
-		est := int64(meta.ChunkSize)
-		if maxPinnedCommitBytes > 0 && est > maxPinnedCommitBytes {
-			est = maxPinnedCommitBytes
-		}
-		if err := b.blocks.waitSliceAdmissionWithHook(sctx, sid, est, maxPinnedCommitBytes, b.kickPendingFlush); err != nil {
-			return errnoOf(err)
-		}
-	} else {
-		if err := b.blocks.waitBudgetWithHook(sctx, func() bool {
-			return maxPinnedCommitBytes > 0 &&
-				b.blocks.pinnedBytes+b.blocks.stagedMemBytes >= maxPinnedCommitBytes &&
-				(b.blocks.pinnedBytes > 0 || b.blocks.stagedMemBytes > 0)
-		}, b.kickPendingFlush); err != nil {
-			return errnoOf(err)
-		}
+	// Stateless backpressure only: sliceWriter.prepareID can race two NewSlice
+	// calls for one slice and discard the loser's ID without ever calling Put,
+	// Bridge.Write, or Delete. Per-slice capacity is therefore reserved only
+	// when a slice's first block actually arrives in objectStorage.Put.
+	if err := b.blocks.waitBudgetWithHook(sctx, func() bool {
+		return maxPinnedCommitBytes > 0 &&
+			b.blocks.pinnedBytes+b.blocks.stagedMemBytes >= maxPinnedCommitBytes &&
+			(b.blocks.pinnedBytes > 0 || b.blocks.stagedMemBytes > 0)
+	}, b.kickPendingFlush); err != nil {
+		return errnoOf(err)
 	}
-	*id = sid
+	b.mu.Lock()
+	*id = b.nextID
+	b.nextID++
+	b.mu.Unlock()
 	return 0
 }
 

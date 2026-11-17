@@ -2238,11 +2238,12 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 				h.mu.Lock()
 				migrated := h.extent != nil
 				h.modeSeq++
-				h.pendingMode = op.Mode & 0o7777
-				h.hasPendingMode = true
+				mySeq := h.modeSeq
 				var size int64
 				var anonymous bool
 				if !migrated {
+					h.pendingMode = op.Mode & 0o7777
+					h.hasPendingMode = true
 					size = h.baseSize
 					if h.buf != nil {
 						size = h.buf.Size()
@@ -2251,7 +2252,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 				}
 				h.mu.Unlock()
 				if migrated {
-					if err := h.flushMigratedMode(ctx); err != nil {
+					if err := h.applyExplicitMigratedMode(ctx, op.Mode&0o7777, mySeq); err != nil {
 						return fs.Result{}, err
 					}
 					w.invalidate(op.Path, 0)
@@ -2715,6 +2716,45 @@ func (w *Writeback) adoptExtentHandle(h *bufferingHandle, e fs.Handle) bool {
 		cancel()
 	}
 	return true
+}
+
+func (h *bufferingHandle) applyExplicitMigratedMode(ctx context.Context, mode uint32, mySeq uint64) error {
+	if h.w == nil || h.w.opts.Client == nil {
+		return nil
+	}
+	h.modeMu.Lock()
+	defer h.modeMu.Unlock()
+	h.mu.Lock()
+	unlinked := h.unlinked
+	path := h.path
+	h.mu.Unlock()
+	if unlinked {
+		return nil
+	}
+	err := retryPostUploadMode(ctx, func() error {
+		return h.w.opts.Client.ChmodCtx(ctx, h.w.remotePath(path), mode&0o777)
+	})
+	if err != nil {
+		if client.IsForbidden(err) {
+			// A token that cannot chmod can never satisfy an older pre-migration
+			// deferred mode either, so clear that stale obligation, but ALWAYS
+			// propagate the 403 denial to the explicit chmod caller.
+			h.mu.Lock()
+			if h.modeSeq == mySeq {
+				h.pendingMode = 0
+				h.hasPendingMode = false
+			}
+			h.mu.Unlock()
+		}
+		return err
+	}
+	h.mu.Lock()
+	if h.modeSeq == mySeq {
+		h.pendingMode = 0
+		h.hasPendingMode = false
+	}
+	h.mu.Unlock()
+	return nil
 }
 
 func (h *bufferingHandle) flushMigratedMode(ctx context.Context) error {

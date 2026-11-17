@@ -367,3 +367,55 @@ func TestAdoptExtentHandleDoesNotOverwriteNewerAcknowledgedChmod(t *testing.T) {
 		}
 	})
 }
+
+// Finding #6 (error propagation): An explicit chmod on a migrated handle that
+// is rejected with HTTP 403 Forbidden must fail and propagate the denial rather
+// than claiming 0600 succeeded, while still clearing any impossible deferred
+// obligation so subsequent Sync/Release is not stranded.
+func TestMigratedExplicitChmodForbiddenPropagatesError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := r.URL.Query()["chmod"]; ok {
+			http.Error(w, `{"error":"chmod is owner-only"}`, http.StatusForbidden)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	cl := client.New(srv.URL, "")
+	wb, err := New(Options{Policy: PolicyWriteBack, Client: cl})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &bufferingHandle{
+		w:              wb,
+		path:           "/forbidden-migrated.bin",
+		landed:         true,
+		pendingMode:    0o644,
+		hasPendingMode: true,
+	}
+	wb.track(h)
+	defer wb.untrack(h)
+
+	// Adoption drops the unapplyable pre-migration deferred mode without failing adoption.
+	if !wb.adoptExtentHandle(h, &noopExtentHandle{}) {
+		t.Fatal("adoptExtentHandle returned false")
+	}
+
+	// Explicit chmod(0600) on the migrated handle MUST propagate the 403 error!
+	res, cerr := wb.Do(context.Background(), &fs.Op{
+		Kind: fs.OpSetAttr, Path: "/forbidden-migrated.bin", Handle: h,
+		HasMode: true, Mode: 0o600,
+	}, nil)
+	if cerr == nil || !client.IsForbidden(cerr) {
+		t.Fatalf("explicit forbidden chmod returned (res=%+v, err=%v), want 403 Forbidden error", res, cerr)
+	}
+	if res.Attr != nil {
+		t.Fatalf("denied explicit chmod returned non-nil Attr: %+v", res.Attr)
+	}
+
+	// Subsequent Sync must not be stranded by the rejected explicit chmod.
+	if serr := h.Sync(context.Background()); serr != nil {
+		t.Fatalf("Sync after denied explicit chmod: %v", serr)
+	}
+}

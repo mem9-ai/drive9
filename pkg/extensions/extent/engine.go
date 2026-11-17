@@ -127,6 +127,14 @@ func NewEngine(cfg EngineConfig) *Engine {
 	if maxUpload <= 0 {
 		maxUpload = envMaxUpload(nativeWriteback)
 	}
+	chunkMaxUpload := maxUpload
+	if !nativeWriteback && chunkMaxUpload < defaultMaxUpload {
+		chunkMaxUpload = defaultMaxUpload
+	}
+	var uploadDelay time.Duration
+	if nativeWriteback {
+		uploadDelay = 50 * time.Millisecond
+	}
 	bcfg := Config{
 		Client:          cfg.Client,
 		RemoteRoot:      cfg.RemoteRoot,
@@ -161,8 +169,8 @@ func NewEngine(cfg EngineConfig) *Engine {
 		OSCache:        true,
 		Readahead:      8 * blockSize,
 		Prefetch:       1,
-		MaxUpload:      maxUpload,
-		MaxDownload:    defaultMaxDownload,
+		MaxUpload:              chunkMaxUpload,
+		MaxDownload:            defaultMaxDownload,
 		// BufferSize is JuiceFS's TOTAL read/write buffering budget, and it
 		// is not just a soft throttle: the data reader derives its global
 		// read-ahead budget from it (80% of this value gates every read
@@ -181,6 +189,7 @@ func NewEngine(cfg EngineConfig) *Engine {
 		// disables it in SelfCheck).
 		Writeback:              cfg.Writeback && cfg.CacheDir != "",
 		WritebackThresholdSize: cfg.WritebackThresholdSize,
+		UploadDelay:            uploadDelay,
 		FreeSpace:              cfg.FreeSpaceRatio,
 		// Bound how many blocks may sit in the stage area at once: the
 		// writeback byte budget is the shared cache quota (CacheSize +

@@ -583,7 +583,7 @@ func TestMemoryStagingEnforcesStrictCapWithoutBypass(t *testing.T) {
 	r.stagePinned(pinnedKey, make([]byte, 12<<20), true)
 
 	// Admit slice 1 with a single 4 MiB block under a 4 MiB cap (clamped to block size when limit < 64 MiB? Note est=64MiB > 16MiB, size=4MiB <= 16MiB so est=4MiB -> 12+4 == 16MiB!).
-	if err := r.admitSliceBlock(ctx, 1, 0, blockSz, limit, nil); err != nil {
+	if err := r.admitSliceBlock(ctx, 1, 0, blockSz, limit, false, nil); err != nil {
 		t.Fatalf("admit slice 1 block 0: %v", err)
 	}
 	if got := r.totalStagingBudget(); got != limit {
@@ -599,7 +599,7 @@ func TestMemoryStagingEnforcesStrictCapWithoutBypass(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if err := r.admitSliceBlock(shortCtx, 1, 1, blockSz, limit, nil); err == nil {
+		if err := r.admitSliceBlock(shortCtx, 1, 1, blockSz, limit, false, nil); err == nil {
 			bypassed.Add(1)
 		}
 	}()
@@ -608,7 +608,7 @@ func TestMemoryStagingEnforcesStrictCapWithoutBypass(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := r.admitSliceBlock(shortCtx, sid, 0, blockSz, limit, nil); err == nil {
+			if err := r.admitSliceBlock(shortCtx, sid, 0, blockSz, limit, false, nil); err == nil {
 				bypassed.Add(1)
 			}
 		}()
@@ -624,7 +624,7 @@ func TestMemoryStagingEnforcesStrictCapWithoutBypass(t *testing.T) {
 
 	// Unpinning releases 12 MiB, allowing slice 1's second block to proceed cleanly.
 	r.unpin(pinnedKey)
-	if err := r.admitSliceBlock(ctx, 1, 1, blockSz, limit, nil); err != nil {
+	if err := r.admitSliceBlock(ctx, 1, 1, blockSz, limit, false, nil); err != nil {
 		t.Fatalf("admit slice 1 block 1 after unpin: %v", err)
 	}
 	if got := r.totalStagingBudget(); got != 8<<20 {
@@ -714,5 +714,72 @@ func TestNativeWritebackSmallCacheCompletes64MiBSliceWithoutDeadlock(t *testing.
 	}
 	if got := len(f.contentOf("/wb64.bin")); got != totalBlocks*(4<<20) {
 		t.Fatalf("remote size = %d, want %d", got, totalBlocks*(4<<20))
+	}
+}
+
+// Finding #28: Overlapping sliceWriter.prepareID calls can discard allocated
+// NewSlice IDs without ever calling Put, Bridge.Write, or Delete. Discarded IDs
+// must retain zero staging budget in both NativeWriteback and low-MaxUpload modes.
+func TestNewSliceDiscardedIDsDoNotLeakStagingBudget(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		writeback bool
+		maxUpload int
+	}{
+		{name: "native-writeback", writeback: true, maxUpload: 4},
+		{name: "explicit-low-max-upload", writeback: false, maxUpload: 4},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeV2(t)
+			eng := NewEngine(EngineConfig{
+				Client:     client.New(f.URL, ""),
+				RemoteRoot: "/",
+				CacheDir:   t.TempDir(),
+				CacheSize:  64 << 20,
+				Writeback:  tc.writeback,
+				MaxUpload:  tc.maxUpload,
+			})
+			t.Cleanup(func() { _ = eng.Bridge.Shutdown() })
+
+			// Allocate and discard 20 slice IDs (far exceeding 6 * 64 MiB = 384 MiB).
+			for i := 0; i < 20; i++ {
+				var discarded uint64
+				if errno := eng.Bridge.NewSlice(meta.Background(), &discarded); errno != 0 {
+					t.Fatalf("NewSlice %d: errno=%v", i, errno)
+				}
+			}
+			if got := eng.Bridge.blocks.totalStagingBudget(); got != 0 {
+				t.Fatalf("discarded NewSlice IDs leaked %d bytes of staging budget, want 0", got)
+			}
+
+			// Subsequent real writes + Sync must succeed without stalling.
+			ext := New(Options{Engine: eng, Threshold: 0})
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			res, err := ext.Do(ctx, &fs.Op{
+				Kind: fs.OpCreate, Path: "/after-discard.bin",
+				Flags: syscall.O_CREAT | syscall.O_RDWR | syscall.O_TRUNC,
+				Mode:  0o644, HasMode: true,
+			}, nil)
+			if err != nil {
+				t.Fatalf("create: %v", err)
+			}
+			eh := res.Handle
+			defer func() { _ = eh.Release(ctx) }()
+
+			payload := bytes.Repeat([]byte("D"), 8<<20)
+			if err := eh.Write(ctx, 0, payload); err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+			if err := eh.Sync(ctx); err != nil {
+				t.Fatalf("Sync: %v", err)
+			}
+			if got := len(f.contentOf("/after-discard.bin")); got != len(payload) {
+				t.Fatalf("remote size = %d, want %d", got, len(payload))
+			}
+			if got := eng.Bridge.blocks.totalStagingBudget(); got != 0 {
+				t.Fatalf("post-Sync totalStagingBudget = %d, want 0", got)
+			}
+		})
 	}
 }

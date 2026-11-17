@@ -117,7 +117,7 @@ func (s objectStorage) Put(ctx context.Context, key string, in io.Reader, getter
 	if s.bridge.cfg.NativeWriteback && s.bridge.cfg.CacheDir == "" {
 		return fmt.Errorf("extent native writeback requires CacheDir")
 	}
-	if err := s.bridge.blocks.admitSliceBlock(ctx, id, indx, size, maxPinnedCommitBytes, s.bridge.kickPendingFlush); err != nil {
+	if err := s.bridge.blocks.admitSliceBlock(ctx, id, indx, size, maxPinnedCommitBytes, s.bridge.cfg.NativeWriteback, s.bridge.kickPendingFlush); err != nil {
 		return err
 	}
 	preferDisk := s.bridge.cfg.NativeWriteback || s.bridge.blocks.totalStagingBudget() > maxPinnedCommitBytes*3/4
@@ -638,14 +638,16 @@ func (r *blockRegistry) hasSmallerWaiterLocked(sliceID uint64) bool {
 	return false
 }
 
+var errNativeStagingYield = errors.New("extent native staging busy: yielding upload worker for active slice")
+
 // waitSliceAdmission admits a staging slice in ascending slice ID order and
 // reserves its estimated footprint up front so concurrent upload workers stay
 // strictly bounded at or below limit without starving older slices.
 func (r *blockRegistry) waitSliceAdmission(ctx context.Context, sliceID uint64, est, limit int64) error {
-	return r.waitSliceAdmissionWithHook(ctx, sliceID, est, limit, nil)
+	return r.waitSliceAdmissionWithHook(ctx, sliceID, est, limit, false, nil)
 }
 
-func (r *blockRegistry) waitSliceAdmissionWithHook(ctx context.Context, sliceID uint64, est, limit int64, onWait func()) error {
+func (r *blockRegistry) waitSliceAdmissionWithHook(ctx context.Context, sliceID uint64, est, limit int64, yieldWhenBusy bool, onWait func()) error {
 	r.mu.Lock()
 	if _, ok := r.sliceTarget[sliceID]; ok {
 		r.mu.Unlock()
@@ -656,6 +658,7 @@ func (r *blockRegistry) waitSliceAdmissionWithHook(ctx context.Context, sliceID 
 	}
 	r.waitingSlices[sliceID]++
 	admitted := false
+	yielded := false
 	defer func() {
 		r.waitingSlices[sliceID]--
 		if r.waitingSlices[sliceID] == 0 {
@@ -668,12 +671,22 @@ func (r *blockRegistry) waitSliceAdmissionWithHook(ctx context.Context, sliceID 
 		r.mu.Unlock()
 	}()
 	for (limit > 0 && r.pinnedBytes+r.stagedMemBytes+est > limit && (r.pinnedBytes > 0 || r.stagedMemBytes > 0)) || r.hasSmallerWaiterLocked(sliceID) {
+		if yieldWhenBusy && len(r.sliceTarget) > 0 {
+			if yielded {
+				return errNativeStagingYield
+			}
+			yielded = true
+		}
 		ch := r.budgetCh
 		r.mu.Unlock()
 		if onWait != nil {
 			onWait()
 		}
-		t := time.NewTimer(250 * time.Millisecond)
+		waitDur := 250 * time.Millisecond
+		if yieldWhenBusy {
+			waitDur = 25 * time.Millisecond
+		}
+		t := time.NewTimer(waitDur)
 		select {
 		case <-ch:
 			t.Stop()
@@ -702,7 +715,7 @@ func (r *blockRegistry) waitSliceAdmissionWithHook(ctx context.Context, sliceID 
 // strictly enforcing limit (never bypassed). Multi-block slices reserve their
 // full 64 MiB chunk envelope on admission so subsequent blocks of an admitted
 // slice never wait and never push totalStagingBudget past limit.
-func (r *blockRegistry) admitSliceBlock(ctx context.Context, sliceID uint64, indx, size, limit int64, onWait func()) error {
+func (r *blockRegistry) admitSliceBlock(ctx context.Context, sliceID uint64, indx, size, limit int64, yieldWhenBusy bool, onWait func()) error {
 	r.mu.Lock()
 	if target, ok := r.sliceTarget[sliceID]; ok {
 		if r.sliceUsed == nil {
@@ -753,7 +766,7 @@ func (r *blockRegistry) admitSliceBlock(ctx context.Context, sliceID uint64, ind
 	if limit > 0 && est > limit && size <= limit {
 		est = size
 	}
-	if err := r.waitSliceAdmissionWithHook(ctx, sliceID, est, limit, onWait); err != nil {
+	if err := r.waitSliceAdmissionWithHook(ctx, sliceID, est, limit, yieldWhenBusy, onWait); err != nil {
 		return err
 	}
 	r.mu.Lock()
