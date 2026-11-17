@@ -116,7 +116,7 @@ func updateWithDeps(args []string, deps updateDeps) error {
 	if err != nil {
 		return err
 	}
-	latestVersion := manifest.Version
+	latestVersion := manifest.version
 	artifact := updateArtifactName(deps.goos, deps.goarch)
 	latestURL := releaseURL(deps.baseURL, artifact)
 	relation := compareReleaseVersions(deps.currentVersion, latestVersion)
@@ -156,7 +156,7 @@ func updateWithDeps(args []string, deps updateDeps) error {
 	if err != nil {
 		return err
 	}
-	want, ok := manifest.Checksums[artifact]
+	want, ok := manifest.checksums[artifact]
 	if !ok {
 		return fmt.Errorf("checksum for %s not found in the signed release manifest %s", artifact, releaseURL(deps.baseURL, "checksums.txt"))
 	}
@@ -222,7 +222,7 @@ func fillUpdateDeps(deps updateDeps) updateDeps {
 		deps.httpClient = &http.Client{Timeout: updateCommandTimeout}
 	}
 	if deps.signingKey == "" {
-		deps.signingKey = updateManifestPublicKey
+		deps.signingKey = trustedUpdateManifestKeys()
 	}
 	if deps.stdout == nil {
 		deps.stdout = os.Stdout
@@ -414,20 +414,52 @@ func displayVersion(version string) string {
 // fetchReleaseManifest downloads the release manifest and its detached signature from the
 // release root, verifies the signature, and only then parses anything. The two files coming
 // from the same origin is exactly why the signature — not the origin — is the trust anchor.
-func fetchReleaseManifest(ctx context.Context, deps updateDeps) (releasesign.Manifest, error) {
-	body, err := httpGetBytes(ctx, deps.httpClient, releaseURL(deps.baseURL, releasesign.ManifestName), 1<<20)
+// release describes the authenticated part of a release: the version to compare against and
+// the artifact checksums to verify downloaded bytes with.
+type release struct {
+	version   string
+	checksums map[string]string
+}
+
+// fetchReleaseManifest downloads both signed pairs — the checksum manifest and the release
+// description — verifies each against the pinned keys, and only then parses anything. The
+// description binds the version to the exact manifest, so an origin cannot mix a signed
+// version with a different release's signed manifest.
+func fetchReleaseManifest(ctx context.Context, deps updateDeps) (release, error) {
+	manifest, err := httpGetBytes(ctx, deps.httpClient, releaseURL(deps.baseURL, releasesign.ManifestName), 1<<20)
 	if err != nil {
-		return releasesign.Manifest{}, fmt.Errorf("fetch release manifest: %w", err)
+		return release{}, fmt.Errorf("fetch release manifest: %w", err)
 	}
-	signature, err := httpGetBytes(ctx, deps.httpClient, releaseURL(deps.baseURL, releasesign.SignatureName), 4096)
+	manifestSignature, err := httpGetBytes(ctx, deps.httpClient, releaseURL(deps.baseURL, releasesign.SignatureName), 4096)
 	if err != nil {
-		return releasesign.Manifest{}, fmt.Errorf("fetch release manifest signature: %w", err)
+		return release{}, fmt.Errorf("fetch release manifest signature: %w", err)
 	}
-	if err := verifyUpdateManifestSignature(body, signature, deps.signingKey); err != nil {
-		return releasesign.Manifest{}, err
+	if err := verifyUpdateManifestSignature(manifest, manifestSignature, deps.signingKey); err != nil {
+		return release{}, err
 	}
-	// Signature verified first: the parser only ever sees bytes the release key vouched for.
-	return releasesign.ParseManifest(body)
+	info, err := httpGetBytes(ctx, deps.httpClient, releaseURL(deps.baseURL, releasesign.ReleaseInfoName), 4096)
+	if err != nil {
+		return release{}, fmt.Errorf("fetch release info: %w", err)
+	}
+	infoSignature, err := httpGetBytes(ctx, deps.httpClient, releaseURL(deps.baseURL, releasesign.ReleaseInfoSignatureName), 4096)
+	if err != nil {
+		return release{}, fmt.Errorf("fetch release info signature: %w", err)
+	}
+	if err := verifyUpdateManifestSignature(info, infoSignature, deps.signingKey); err != nil {
+		return release{}, err
+	}
+	parsed, err := releasesign.ParseReleaseInfo(info)
+	if err != nil {
+		return release{}, err
+	}
+	if err := parsed.ValidateManifest(manifest); err != nil {
+		return release{}, err
+	}
+	checksums, err := releasesign.ParseChecksums(manifest)
+	if err != nil {
+		return release{}, err
+	}
+	return release{version: parsed.Version, checksums: checksums}, nil
 }
 
 func httpGetBytes(ctx context.Context, client *http.Client, url string, limit int64) ([]byte, error) {

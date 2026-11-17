@@ -10,23 +10,30 @@ package releasesign
 
 import (
 	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
-
-	"crypto/sha256"
 )
 
 const (
-	// SignatureName is the detached signature file published next to the manifest.
-	SignatureName = "checksums.txt.sig"
-	// ManifestName is the signed checksum manifest.
+	// ManifestName is the signed checksum manifest, in the format every drive9 CLI has
+	// parsed since before signing existed: "<sha256>  <artifact>" lines only.
 	ManifestName = "checksums.txt"
-	// VersionPrefix is the manifest line binding the release version to the checksums.
-	// Signing it stops an origin from pairing an older signed binary with a newer version.
-	VersionPrefix = "# drive9-release-version "
+	// SignatureName is its detached signature.
+	SignatureName = "checksums.txt.sig"
+	// ReleaseInfoName is the signed release description: the version plus the digest of the
+	// manifest it describes.
+	ReleaseInfoName = "release.txt"
+	// ReleaseInfoSignatureName is the detached signature of release.txt.
+	ReleaseInfoSignatureName = "release.txt.sig"
+
+	// releaseVersionField and releaseManifestField are the release.txt keys.
+	releaseVersionField  = "version"
+	releaseManifestField = "checksums-sha256"
 )
 
 // Sentinel failures. They are intentionally caller-agnostic: the CLI adds "rebuild with -X",
@@ -157,55 +164,98 @@ func ParsePrivateKey(encoded string) (ed25519.PrivateKey, error) {
 	}
 }
 
-// ParseManifest validates and parses a signed manifest in one pass: exactly one version line
-// and at least one artifact checksum. The SAME parser runs in the updater (after the
-// signature check) and in the release tool before signing, so a release cannot be signed
-// with a shape the updater would reject, and the two sides cannot drift on the format.
-func ParseManifest(data []byte) (Manifest, error) {
-	// The marker without its trailing space, so a line with an empty value is still
-	// recognized as the version line instead of reading as a missing one.
-	marker := strings.TrimSpace(VersionPrefix)
-	version := ""
+// ParseChecksums parses the manifest. The format is exactly what pre-signing CLIs already
+// accept — "<sha256>  <artifact>" lines, nothing else — so a release stays installable by
+// every CLI version: no comments, no headers, no version line. A manifest that carries any
+// other line is rejected here, before it can be signed, because an old client's parser would
+// reject it too and lose self-update entirely.
+func ParseChecksums(data []byte) (map[string]string, error) {
 	checksums := map[string]string{}
 	for _, line := range strings.Split(string(data), "\n") {
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" {
 			continue
 		}
-		if rest, ok := strings.CutPrefix(trimmed, marker); ok {
-			if rest != "" && !strings.HasPrefix(rest, " ") {
-				// A name that merely starts with the marker, not the version line.
-				continue
-			}
-			if version != "" {
-				return Manifest{}, errors.New("release manifest names more than one version")
-			}
-			version = strings.TrimSpace(rest)
-			if version == "" {
-				return Manifest{}, errors.New("release manifest names an empty version")
-			}
-			continue
-		}
-		if strings.HasPrefix(trimmed, "#") {
-			// sha256sum --check ignores comment lines too, so the manifest can carry them.
-			continue
-		}
 		name, sum, err := parseChecksumLine(trimmed)
 		if err != nil {
-			return Manifest{}, err
+			return nil, err
 		}
 		if _, exists := checksums[name]; exists {
-			return Manifest{}, fmt.Errorf("duplicate checksum for %s", name)
+			return nil, fmt.Errorf("duplicate checksum for %s", name)
 		}
 		checksums[name] = sum
 	}
-	if version == "" {
-		return Manifest{}, fmt.Errorf("release manifest has no %q line", marker)
-	}
 	if len(checksums) == 0 {
-		return Manifest{}, errors.New("release manifest has an empty checksum list")
+		return nil, errors.New("release manifest has an empty checksum list")
 	}
-	return Manifest{Version: version, Checksums: checksums}, nil
+	return checksums, nil
+}
+
+// ManifestDigest is the digest release.txt binds to a manifest.
+func ManifestDigest(manifest []byte) string {
+	sum := sha256.Sum256(manifest)
+	return hex.EncodeToString(sum[:])
+}
+
+// ReleaseInfo is what release.txt says: the version this release is, and the digest of the
+// manifest it describes. Signing it binds the version to exactly one set of artifacts, which
+// is what stops an origin from pairing an older signed binary with a newer version string.
+type ReleaseInfo struct {
+	Version        string
+	ManifestSHA256 string
+}
+
+// ParseReleaseInfo parses and validates release.txt.
+func ParseReleaseInfo(data []byte) (ReleaseInfo, error) {
+	info := ReleaseInfo{}
+	for _, line := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		// A bare field name (no space) is the same key with an empty value, so the specific
+		// "empty version" error fires instead of a generic malformed-line one.
+		key, value, _ := strings.Cut(trimmed, " ")
+		value = strings.TrimSpace(value)
+		switch key {
+		case releaseVersionField:
+			if info.Version != "" {
+				return ReleaseInfo{}, errors.New("release info names more than one version")
+			}
+			if value == "" {
+				return ReleaseInfo{}, errors.New("release info names an empty version")
+			}
+			info.Version = value
+		case releaseManifestField:
+			if info.ManifestSHA256 != "" {
+				return ReleaseInfo{}, errors.New("release info names more than one manifest digest")
+			}
+			raw, err := hex.DecodeString(value)
+			if err != nil || len(raw) != sha256.Size {
+				return ReleaseInfo{}, fmt.Errorf("release info manifest digest %q is not a sha256 hex digest", value)
+			}
+			info.ManifestSHA256 = strings.ToLower(value)
+		default:
+			return ReleaseInfo{}, fmt.Errorf("unknown release info field %q", key)
+		}
+	}
+	if info.Version == "" {
+		return ReleaseInfo{}, errors.New("release info has no version")
+	}
+	if info.ManifestSHA256 == "" {
+		return ReleaseInfo{}, fmt.Errorf("release info has no %s", releaseManifestField)
+	}
+	return info, nil
+}
+
+// ValidateManifest checks that the manifest bytes are the ones this release info describes.
+// Both files are signed independently, so this check is what keeps an origin from mixing a
+// signed version with a different release's signed manifest.
+func (ri ReleaseInfo) ValidateManifest(manifest []byte) error {
+	if got := ManifestDigest(manifest); got != ri.ManifestSHA256 {
+		return fmt.Errorf("release info describes manifest %s, but checksums.txt is %s", ri.ManifestSHA256, got)
+	}
+	return nil
 }
 
 func parseChecksumLine(line string) (name, sum string, err error) {
@@ -214,8 +264,9 @@ func parseChecksumLine(line string) (name, sum string, err error) {
 		return "", "", fmt.Errorf("invalid checksum line %q", line)
 	}
 	sum = strings.ToLower(fields[0])
-	if len(sum) != sha256.Size*2 {
-		return "", "", fmt.Errorf("invalid checksum for %s", fields[1])
+	raw, err := hex.DecodeString(sum)
+	if err != nil || len(raw) != sha256.Size {
+		return "", "", fmt.Errorf("invalid checksum for %s: not a sha256 hex digest", fields[1])
 	}
 	clean := filepath.ToSlash(filepath.Clean(strings.TrimPrefix(fields[1], "*")))
 	if clean == "." || clean == "" || strings.HasPrefix(clean, "/") || strings.HasPrefix(clean, "../") || strings.Contains(clean, "/") {

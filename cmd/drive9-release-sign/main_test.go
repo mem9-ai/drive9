@@ -32,28 +32,35 @@ func TestRunSignsManifestThatTheUpdaterVerifies(t *testing.T) {
 	t.Setenv(signingKeyEnv, base64.StdEncoding.EncodeToString(testSigningKey.Seed()))
 
 	dir := t.TempDir()
-	manifestPath := filepath.Join(dir, "checksums.txt")
-	manifest := []byte("# drive9-release-version v1.2.3\n" + strings.Repeat("a", 64) + "  drive9-linux-amd64\n")
+	manifestPath := filepath.Join(dir, releasesign.ManifestName)
+	infoPath := filepath.Join(dir, releasesign.ReleaseInfoName)
+	manifest := []byte(strings.Repeat("a", 64) + "  drive9-linux-amd64\n")
+	info := []byte("version v1.2.3\nchecksums-sha256 " + releasesign.ManifestDigest(manifest) + "\n")
 	if err := os.WriteFile(manifestPath, manifest, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := run([]string{manifestPath}); err != nil {
+	if err := os.WriteFile(infoPath, info, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{manifestPath, infoPath}); err != nil {
 		t.Fatalf("run: %v", err)
 	}
-	signature, err := os.ReadFile(manifestPath + ".sig")
-	if err != nil {
-		t.Fatalf("read signature: %v", err)
-	}
-	if err := releasesign.Verify(manifest, signature, testPublicKey()); err != nil {
-		t.Fatalf("the signature this tool wrote does not verify: %v", err)
+	for path, body := range map[string][]byte{manifestPath: manifest, infoPath: info} {
+		signature, err := os.ReadFile(path + ".sig")
+		if err != nil {
+			t.Fatalf("read signature %s: %v", path, err)
+		}
+		if err := releasesign.Verify(body, signature, testPublicKey()); err != nil {
+			t.Fatalf("the signature this tool wrote for %s does not verify: %v", path, err)
+		}
 	}
 }
 
 func TestRunVerifyMode(t *testing.T) {
 	t.Setenv(signingKeyEnv, base64.StdEncoding.EncodeToString(testSigningKey.Seed()))
 	dir := t.TempDir()
-	manifestPath := filepath.Join(dir, "checksums.txt")
-	manifest := []byte("# drive9-release-version v1.2.3\n" + strings.Repeat("b", 64) + "  drive9-linux-amd64\n")
+	manifestPath := filepath.Join(dir, releasesign.ManifestName)
+	manifest := []byte(strings.Repeat("b", 64) + "  drive9-linux-amd64\n")
 	if err := os.WriteFile(manifestPath, manifest, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +72,7 @@ func TestRunVerifyMode(t *testing.T) {
 		t.Fatalf("verify: %v", err)
 	}
 	// A different manifest under the same signature is not the signed one.
-	if err := os.WriteFile(manifestPath, append(manifest, []byte("# extra\n")...), 0o644); err != nil {
+	if err := os.WriteFile(manifestPath, append(manifest, []byte(strings.Repeat("c", 64)+"  drive9-darwin-arm64\n")...), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := run([]string{"-verify", manifestPath}); err == nil || !strings.Contains(err.Error(), "does not verify") {
@@ -106,19 +113,39 @@ func TestRunRefusesWithoutKeyOrInput(t *testing.T) {
 	}
 }
 
-// The signer refuses a manifest the updater would reject: same parser on both sides, so a
-// release cannot be published in a shape that no CLI will install.
+// The signer refuses a release the updater would reject: the same parsers run on both
+// sides, and release.txt must describe the manifest next to it.
 func TestRunRefusesManifestTheUpdaterWouldReject(t *testing.T) {
 	t.Setenv(signingKeyEnv, base64.StdEncoding.EncodeToString(testSigningKey.Seed()))
 	dir := t.TempDir()
-	versionless := filepath.Join(dir, "checksums.txt")
-	if err := os.WriteFile(versionless, []byte(strings.Repeat("a", 64)+"  drive9-linux-amd64\n"), 0o644); err != nil {
+
+	// A manifest in the shape pre-change CLIs cannot parse.
+	badManifest := filepath.Join(dir, releasesign.ManifestName)
+	if err := os.WriteFile(badManifest, []byte("# drive9-release-version v1\n"+strings.Repeat("a", 64)+"  drive9-linux-amd64\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := run([]string{versionless}); err == nil || !strings.Contains(err.Error(), "refusing to sign") {
-		t.Fatalf("run on a versionless manifest error = %v, want a refusal", err)
+	if err := run([]string{badManifest}); err == nil || !strings.Contains(err.Error(), "refusing to sign") {
+		t.Fatalf("run on a commented manifest error = %v, want a refusal", err)
 	}
-	if _, err := os.Stat(versionless + ".sig"); !os.IsNotExist(err) {
+	if _, err := os.Stat(badManifest + ".sig"); !os.IsNotExist(err) {
 		t.Fatalf("a rejected manifest was signed anyway: %v", err)
+	}
+
+	// release.txt that describes a different manifest.
+	if err := os.WriteFile(badManifest, []byte(strings.Repeat("a", 64)+"  drive9-linux-amd64\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	infoPath := filepath.Join(dir, releasesign.ReleaseInfoName)
+	pending := filepath.Join(dir, "pending.txt")
+	info := []byte("version v1\nchecksums-sha256 " + releasesign.ManifestDigest([]byte("another manifest\n")) + "\n")
+	if err := os.WriteFile(infoPath+".tmp", info, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(infoPath+".tmp", pending); err != nil {
+		t.Fatal(err)
+	}
+	// A file that is not one of the two the updater reads is refused outright.
+	if err := run([]string{pending}); err == nil || !strings.Contains(err.Error(), "not a release artifact") {
+		t.Fatalf("run on an unknown file error = %v, want a refusal", err)
 	}
 }

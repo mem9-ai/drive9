@@ -7,32 +7,44 @@ import (
 	"github.com/mem9-ai/drive9/internal/releasesign"
 )
 
-// updateManifestKeyFile is the release key set this build trusts, one base64 ed25519 public
-// key per line (or a single comma-separated list). It is embedded rather than duplicated in
-// source so the release workflow can verify a manifest against the exact keys the shipped
-// binary carries — the same file, not a copy that can drift.
+// updateManifestKeyFile is the release key set this build trusts: base64 ed25519 public
+// keys, comma-separated. It is embedded rather than duplicated in source so the release
+// workflow can verify a manifest against the exact keys the shipped binary carries — the
+// same file, not a copy that can drift.
 //
 //go:embed update_key.txt
 var updateManifestKeyFile string
 
-// updateManifestPublicKey is the key set the self-updater verifies the release manifest with.
-// A set (comma-separated) is allowed so a rotation can overlap: pin "old,new" while releases
-// are still signed by "old", then flip the signing secret and drop "old".
+// embeddedUpdateManifestKeys marks "no linker override", so the sentinel below is the value
+// a plain build starts from.
+const embeddedUpdateManifestKeys = "@embedded"
+
+// updateManifestPublicKey is the key set the self-updater verifies with, and the value a fork
+// or self-hosted build replaces at link time:
 //
-// It is a var, not a const, so a fork or a self-hosted build can install its own keys at link
-// time:
+//	go build -ldflags "-X github.com/mem9-ai/drive9/cmd/drive9/cli.updateManifestPublicKey=<key>[,<key>]"
 //
-//	go build -ldflags "-X github.com/mem9-ai/drive9/cmd/drive9/cli.updateManifestPublicKey=<base64 public key[,more]>"
-//
-// A build with no key refuses to update instead of trusting whatever the origin serves.
-var updateManifestPublicKey = updateManifestKeyFile
+// The initializer is a constant sentinel, not updateManifestKeyFile: -X only applies to a
+// string variable initialized with a constant expression, so an initializer that referenced
+// the embedded file would silently ignore the override. An explicit empty override means
+// "trust no keys" and refuses to update; it must not fall back to the embedded keys.
+var updateManifestPublicKey = embeddedUpdateManifestKeys
+
+// trustedUpdateManifestKeys resolves the linker override, falling back to the embedded key
+// file only when no override was applied.
+func trustedUpdateManifestKeys() string {
+	if updateManifestPublicKey == embeddedUpdateManifestKeys {
+		return updateManifestKeyFile
+	}
+	return updateManifestPublicKey
+}
 
 // verifyUpdateManifestSignature is the updater's entry point into the shared signature
 // contract: the trusted pin, then the caller-specific rebuild hint.
 func verifyUpdateManifestSignature(manifest, signature []byte, publicKeys string) error {
 	if err := releasesign.Verify(manifest, signature, publicKeys); err != nil {
 		return fmt.Errorf("%w (this build trusts: %s; rebuild with -X "+
-			"github.com/mem9-ai/drive9/cmd/drive9/cli.updateManifestPublicKey=<base64 public key[,more]>)",
+			"github.com/mem9-ai/drive9/cmd/drive9/cli.updateManifestPublicKey=<key>[,<key>])",
 			err, publicKeys)
 	}
 	return nil

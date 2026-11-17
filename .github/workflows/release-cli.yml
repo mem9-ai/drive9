@@ -75,15 +75,19 @@ jobs:
             echo "DRIVE9_RELEASE_SIGNING_KEY is not set; refusing to publish an unsigned self-update manifest" >&2
             exit 1
           fi
-          go run ./cmd/drive9-release-sign dist/checksums.txt
+          go run ./cmd/drive9-release-sign dist/checksums.txt dist/release.txt
           test -s dist/checksums.txt.sig
+          test -s dist/release.txt.sig
           base64 -d dist/checksums.txt.sig | wc -c | grep -qx 64
-          # Verify the signature against the key this release's binary embeds, read from the
-          # same file the build embeds. A stale or mistyped secret signs happily and would
-          # publish a release no updated CLI can install; this step fails the job instead.
-          go run ./cmd/drive9-release-sign -verify \
-            -pubkey "$(tr -d '[:space:]' < cmd/drive9/cli/update_key.txt)" \
-            dist/checksums.txt
+          base64 -d dist/release.txt.sig | wc -c | grep -qx 64
+          # Verify both signatures against the keys this release's binary embeds, read from
+          # the same file the build embeds. A stale or mistyped secret signs happily and
+          # would publish a release no updated CLI can install; this step fails instead.
+          # The key file is comma-separated; tolerate whitespace/newlines by folding them
+          # into the same separator.
+          KEYS="$(tr -s '[:space:]' ',' < cmd/drive9/cli/update_key.txt | sed 's/^,//; s/,$//')"
+          go run ./cmd/drive9-release-sign -verify -pubkey "$KEYS" dist/checksums.txt
+          go run ./cmd/drive9-release-sign -verify -pubkey "$KEYS" dist/release.txt
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
@@ -113,6 +117,8 @@ jobs:
             --include "SHA256SUMS" \
             --include "checksums.txt" \
             --include "checksums.txt.sig" \
+            --include "release.txt" \
+            --include "release.txt.sig" \
             --include "migration-kube-plugin-checksums.txt" \
             --include "version" \
             --cache-control "public, max-age=60" \

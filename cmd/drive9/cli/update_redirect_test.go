@@ -37,21 +37,17 @@ func TestUpdateThroughLegacyReleaseRedirect(t *testing.T) {
 				if failure == "checksum mismatch" {
 					checksum = strings.Repeat("0", 64)
 				}
-				manifest := updateTestManifest(version, artifact, checksum)
-				signature, signErr := releasesign.Sign(manifest, updateTestSigningPrivateKey)
-				if signErr != nil {
-					t.Fatalf("sign manifest: %v", signErr)
-				}
+				files := newUpdateTestReleaseFiles(t, version, artifact, checksum, payload)
 				origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					switch r.URL.Path {
 					case "/latest/version":
 						_, _ = fmt.Fprintln(w, version)
-					case "/latest/checksums.txt":
+					case "/latest/" + releasesign.ManifestName:
 						if failure == "missing checksums" {
 							http.Error(w, "missing", http.StatusForbidden)
 							return
 						}
-						_, _ = w.Write(manifest)
+						_, _ = w.Write(files.manifest)
 					case "/latest/" + releasesign.SignatureName:
 						if failure == "missing signature" {
 							http.NotFound(w, r)
@@ -62,7 +58,11 @@ func TestUpdateThroughLegacyReleaseRedirect(t *testing.T) {
 							_, _ = w.Write(forged)
 							return
 						}
-						_, _ = w.Write(signature)
+						_, _ = w.Write(files.manifestSig)
+					case "/latest/" + releasesign.ReleaseInfoName:
+						_, _ = w.Write(files.info)
+					case "/latest/" + releasesign.ReleaseInfoSignatureName:
+						_, _ = w.Write(files.infoSig)
 					case "/latest/" + artifact:
 						if failure == "missing binary" {
 							http.NotFound(w, r)

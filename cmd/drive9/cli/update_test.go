@@ -165,8 +165,9 @@ func TestUpdateDoesNotInstallDowngradeWithoutForce(t *testing.T) {
 	if !strings.Contains(stdout.String(), "v0.8.0 is older than current v0.9.0; use --force") {
 		t.Errorf("stdout = %q, want downgrade message", stdout.String())
 	}
-	if got, want := strings.Join(requests, ","), "/releases/checksums.txt,/releases/checksums.txt.sig"; got != want {
-		t.Errorf("requests = %q, want only the signed manifest pair %q", got, want)
+	wantRequests := "/releases/checksums.txt,/releases/checksums.txt.sig,/releases/release.txt,/releases/release.txt.sig"
+	if got := strings.Join(requests, ","); got != wantRequests {
+		t.Errorf("requests = %q, want only the two signed pairs %q", got, wantRequests)
 	}
 }
 
@@ -234,8 +235,9 @@ func TestUpdatePreflightReplaceRunsBeforeDownload(t *testing.T) {
 	if !errors.Is(err, errUnsupported) {
 		t.Fatalf("update error = %v, want %v", err, errUnsupported)
 	}
-	if got, want := strings.Join(requests, ","), "/releases/checksums.txt,/releases/checksums.txt.sig"; got != want {
-		t.Errorf("requests = %q, want only the signed manifest pair %q", got, want)
+	wantRequests := "/releases/checksums.txt,/releases/checksums.txt.sig,/releases/release.txt,/releases/release.txt.sig"
+	if got := strings.Join(requests, ","); got != wantRequests {
+		t.Errorf("requests = %q, want only the two signed pairs %q", got, wantRequests)
 	}
 }
 
@@ -412,14 +414,12 @@ func (tr *updateRedirectTransport) RoundTrip(req *http.Request) (*http.Response,
 }
 
 func TestUpdatePinsRedirectsForPinnedReleaseRoots(t *testing.T) {
-	manifest := updateTestManifest("v0.2.0", "drive9-linux-amd64", strings.Repeat("a", sha256.Size*2))
-	signature, signErr := releasesign.Sign(manifest, updateTestSigningPrivateKey)
-	if signErr != nil {
-		t.Fatalf("sign manifest: %v", signErr)
-	}
+	files := newUpdateTestReleaseFiles(t, "v0.2.0", "drive9-linux-amd64", strings.Repeat("a", sha256.Size*2), nil)
 	bodies := map[string]string{
-		"/latest/checksums.txt":            string(manifest),
-		"/releases/checksums.txt.sig":      string(signature),
+		"/latest/" + releasesign.ManifestName:               string(files.manifest),
+		"/releases/" + releasesign.SignatureName:            string(files.manifestSig),
+		"/releases/" + releasesign.ReleaseInfoName:          string(files.info),
+		"/releases/" + releasesign.ReleaseInfoSignatureName: string(files.infoSig),
 	}
 	tests := []struct {
 		name     string
@@ -459,10 +459,10 @@ func TestUpdatePinsRedirectsForPinnedReleaseRoots(t *testing.T) {
 			if err != nil {
 				t.Fatalf("update --check through a pinned redirect: %v", err)
 			}
-			// The manifest redirect plus the signature request: the whole manifest pair
-			// comes through the pinned chain.
-			if transport.hops != 3 {
-				t.Fatalf("hops = %d, want the manifest redirect followed and the signature fetched", transport.hops)
+			// The redirected manifest plus the signature, release info and its signature:
+			// every request in the chain is pinned.
+			if transport.hops != 5 {
+				t.Fatalf("hops = %d, want the redirected manifest and the three remaining fetches", transport.hops)
 			}
 			if !strings.Contains(stdout.String(), "update available: v0.1.0 -> v0.2.0") {
 				t.Errorf("stdout = %q, want update-available line", stdout.String())
@@ -473,18 +473,18 @@ func TestUpdatePinsRedirectsForPinnedReleaseRoots(t *testing.T) {
 
 func TestParseChecksumsRejectsPathQualifiedArtifactNames(t *testing.T) {
 	sum := strings.Repeat("a", sha256.Size*2)
-	_, err := releasesign.ParseManifest([]byte(fmt.Sprintf("%s# drive9-release-version v1.0.0\n%s  releases/drive9-linux-amd64\n", "", sum)))
+	_, err := releasesign.ParseChecksums([]byte(fmt.Sprintf("%s  releases/drive9-linux-amd64\n", sum)))
 	if err == nil || !strings.Contains(err.Error(), "must be a release artifact filename") {
-		t.Fatalf("ParseManifest error = %v, want artifact filename error", err)
+		t.Fatalf("ParseChecksums error = %v, want artifact filename error", err)
 	}
 }
 
 func TestParseChecksumsRejectsDuplicateArtifactNames(t *testing.T) {
 	first := strings.Repeat("a", sha256.Size*2)
 	second := strings.Repeat("b", sha256.Size*2)
-	_, err := releasesign.ParseManifest([]byte(fmt.Sprintf("%s# drive9-release-version v1.0.0\n%s  drive9-linux-amd64\n%s  drive9-linux-amd64\n", "", first, second)))
+	_, err := releasesign.ParseChecksums([]byte(fmt.Sprintf("%s  drive9-linux-amd64\n%s  drive9-linux-amd64\n", first, second)))
 	if err == nil || !strings.Contains(err.Error(), "duplicate checksum") {
-		t.Fatalf("parseChecksums error = %v, want duplicate checksum error", err)
+		t.Fatalf("ParseChecksums error = %v, want duplicate checksum error", err)
 	}
 }
 
@@ -511,9 +511,65 @@ func useUpdateTestSigningKey(t *testing.T, publicKey string) {
 	t.Cleanup(func() { updateManifestPublicKey = previous })
 }
 
-// updateTestManifest is the signed artifact list a test release serves.
-func updateTestManifest(version, artifact, checksum string) []byte {
-	return []byte(fmt.Sprintf("%s%s\n%s  %s\n", releasesign.VersionPrefix, version, checksum, artifact))
+// updateTestReleaseFiles is one signed test release: the plain checksum manifest (the
+// format every CLI already parses), the release description binding the version to that
+// manifest, and both detached signatures.
+type updateTestReleaseFiles struct {
+	version     string
+	artifact    string
+	payload     []byte
+	manifest    []byte
+	info        []byte
+	manifestSig []byte
+	infoSig     []byte
+}
+
+func newUpdateTestReleaseFiles(t *testing.T, version, artifact, checksum string, payload []byte) *updateTestReleaseFiles {
+	t.Helper()
+	return newUpdateTestReleaseFilesSignedBy(t, version, artifact, checksum, payload, updateTestSigningPrivateKey)
+}
+
+func newUpdateTestReleaseFilesSignedBy(t *testing.T, version, artifact, checksum string, payload []byte, key ed25519.PrivateKey) *updateTestReleaseFiles {
+	t.Helper()
+	manifest := []byte(fmt.Sprintf("%s  %s\n", checksum, artifact))
+	info := []byte(fmt.Sprintf("version %s\nchecksums-sha256 %s\n", version, releasesign.ManifestDigest(manifest)))
+	manifestSig, err := releasesign.Sign(manifest, key)
+	if err != nil {
+		t.Fatalf("sign manifest: %v", err)
+	}
+	infoSig, err := releasesign.Sign(info, key)
+	if err != nil {
+		t.Fatalf("sign release info: %v", err)
+	}
+	return &updateTestReleaseFiles{
+		version:     version,
+		artifact:    artifact,
+		payload:     payload,
+		manifest:    manifest,
+		info:        info,
+		manifestSig: manifestSig,
+		infoSig:     infoSig,
+	}
+}
+
+func (rel *updateTestReleaseFiles) handler(w http.ResponseWriter, r *http.Request) {
+	switch r.URL.Path {
+	case "/releases/version":
+		// Kept for older CLIs that still read it; this updater takes the signed version.
+		_, _ = fmt.Fprintln(w, rel.version)
+	case "/releases/" + releasesign.ManifestName:
+		_, _ = w.Write(rel.manifest)
+	case "/releases/" + releasesign.SignatureName:
+		_, _ = w.Write(rel.manifestSig)
+	case "/releases/" + releasesign.ReleaseInfoName:
+		_, _ = w.Write(rel.info)
+	case "/releases/" + releasesign.ReleaseInfoSignatureName:
+		_, _ = w.Write(rel.infoSig)
+	case "/releases/" + rel.artifact:
+		_, _ = w.Write(rel.payload)
+	default:
+		http.NotFound(w, r)
+	}
 }
 
 func updateTestReleaseHandler(t *testing.T, payload []byte, checksum string) http.HandlerFunc {
@@ -522,26 +578,7 @@ func updateTestReleaseHandler(t *testing.T, payload []byte, checksum string) htt
 
 func updateTestReleaseHandlerWithVersion(t *testing.T, version string, payload []byte, checksum string) http.HandlerFunc {
 	t.Helper()
-	manifest := updateTestManifest(version, "drive9-linux-amd64", checksum)
-	signature, signErr := releasesign.Sign(manifest, updateTestSigningPrivateKey)
-	if signErr != nil {
-		t.Fatalf("sign manifest: %v", signErr)
-	}
-	return func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/releases/version":
-			// Kept for older CLIs that still read it; this updater never does.
-			_, _ = fmt.Fprintln(w, version)
-		case "/releases/checksums.txt":
-			_, _ = w.Write(manifest)
-		case "/releases/" + releasesign.SignatureName:
-			_, _ = w.Write(signature)
-		case "/releases/drive9-linux-amd64":
-			_, _ = w.Write(payload)
-		default:
-			http.NotFound(w, r)
-		}
-	}
+	return newUpdateTestReleaseFiles(t, version, "drive9-linux-amd64", checksum, payload).handler
 }
 
 // The exploit this closes: an origin the user was talked into (or one an attacker controls)
@@ -557,9 +594,9 @@ func TestUpdateRefusesUnsignedManifestFromCustomOrigin(t *testing.T) {
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/releases/checksums.txt":
-			_, _ = fmt.Fprintf(w, "%s%s\n%x  drive9-linux-amd64\n", releasesign.VersionPrefix, "v99.0.0", sum[:])
-		case "/releases/" + releasesign.SignatureName:
+		case "/releases/" + releasesign.ManifestName:
+			_, _ = fmt.Fprintf(w, "%x  drive9-linux-amd64\n", sum[:])
+		case "/releases/" + releasesign.SignatureName, "/releases/" + releasesign.ReleaseInfoName, "/releases/" + releasesign.ReleaseInfoSignatureName:
 			http.NotFound(w, r)
 		case "/releases/drive9-linux-amd64":
 			_, _ = w.Write(payload)
@@ -595,28 +632,13 @@ func TestUpdateRefusesManifestSignedByAnotherKey(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	payload := []byte("attacker-controlled")
 	sum := sha256.Sum256(payload)
-	manifest := updateTestManifest("v99.0.0", "drive9-linux-amd64", fmt.Sprintf("%x", sum[:]))
 	foreignKey := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{0x99}, ed25519.SeedSize))
-	signature, signErr := releasesign.Sign(manifest, foreignKey)
-	if signErr != nil {
-		t.Fatalf("sign manifest: %v", signErr)
-	}
+	release := newUpdateTestReleaseFilesSignedBy(t, "v99.0.0", "drive9-linux-amd64", fmt.Sprintf("%x", sum[:]), payload, foreignKey)
 	target := filepath.Join(t.TempDir(), "drive9")
 	if err := os.WriteFile(target, []byte("current-drive9"), 0o755); err != nil {
 		t.Fatalf("write target: %v", err)
 	}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/releases/checksums.txt":
-			_, _ = w.Write(manifest)
-		case "/releases/" + releasesign.SignatureName:
-			_, _ = w.Write(signature)
-		case "/releases/drive9-linux-amd64":
-			_, _ = w.Write(payload)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
+	srv := httptest.NewServer(http.HandlerFunc(release.handler))
 	defer srv.Close()
 
 	err := updateWithDeps([]string{"--base-url", srv.URL}, updateDeps{
@@ -646,27 +668,19 @@ func TestUpdateRefusesTamperedManifest(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	payload := []byte("attacker-controlled")
 	sum := sha256.Sum256(payload)
-	signed := updateTestManifest("v0.2.0", "drive9-linux-amd64", strings.Repeat("a", sha256.Size*2))
-	tampered := updateTestManifest("v0.2.0", "drive9-linux-amd64", fmt.Sprintf("%x", sum[:]))
-	signature, signErr := releasesign.Sign(signed, updateTestSigningPrivateKey)
-	if signErr != nil {
-		t.Fatalf("sign manifest: %v", signErr)
-	}
+	release := newUpdateTestReleaseFiles(t, "v0.2.0", "drive9-linux-amd64", strings.Repeat("a", sha256.Size*2), payload)
+	tampered := fmt.Sprintf("%x  drive9-linux-amd64\n", sum[:])
 	target := filepath.Join(t.TempDir(), "drive9")
 	if err := os.WriteFile(target, []byte("current-drive9"), 0o755); err != nil {
 		t.Fatalf("write target: %v", err)
 	}
+	handler := release.handler
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/releases/checksums.txt":
-			_, _ = w.Write(tampered)
-		case "/releases/" + releasesign.SignatureName:
-			_, _ = w.Write(signature)
-		case "/releases/drive9-linux-amd64":
-			_, _ = w.Write(payload)
-		default:
-			http.NotFound(w, r)
+		if r.URL.Path == "/releases/"+releasesign.ManifestName {
+			_, _ = w.Write([]byte(tampered))
+			return
 		}
+		handler(w, r)
 	}))
 	defer srv.Close()
 
@@ -727,25 +741,15 @@ func TestUpdateTakesVersionFromSignedManifest(t *testing.T) {
 	if err := os.WriteFile(target, []byte("current-drive9"), 0o755); err != nil {
 		t.Fatalf("write target: %v", err)
 	}
-	manifest := updateTestManifest("v0.2.0", "drive9-linux-amd64", fmt.Sprintf("%x", sum[:]))
-	signature, signErr := releasesign.Sign(manifest, updateTestSigningPrivateKey)
-	if signErr != nil {
-		t.Fatalf("sign manifest: %v", signErr)
-	}
+	release := newUpdateTestReleaseFiles(t, "v0.2.0", "drive9-linux-amd64", fmt.Sprintf("%x", sum[:]), payload)
+	handler := release.handler
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/releases/version":
+		if r.URL.Path == "/releases/version" {
 			// The forged upgrade the origin would like the updater to believe.
 			_, _ = fmt.Fprintln(w, "v99.0.0")
-		case "/releases/checksums.txt":
-			_, _ = w.Write(manifest)
-		case "/releases/" + releasesign.SignatureName:
-			_, _ = w.Write(signature)
-		case "/releases/drive9-linux-amd64":
-			_, _ = w.Write(payload)
-		default:
-			http.NotFound(w, r)
+			return
 		}
+		handler(w, r)
 	}))
 	defer srv.Close()
 
@@ -771,15 +775,14 @@ func TestUpdateTakesVersionFromSignedManifest(t *testing.T) {
 	}
 }
 
-func TestParseReleaseManifest(t *testing.T) {
+func TestParseChecksumsIsThePreSigningFormat(t *testing.T) {
 	sum := strings.Repeat("a", sha256.Size*2)
-	valid := []byte(fmt.Sprintf("%sv0.2.0\n%s  drive9-linux-amd64\n", releasesign.VersionPrefix, sum))
-	manifest, err := releasesign.ParseManifest(valid)
+	checksums, err := releasesign.ParseChecksums([]byte(fmt.Sprintf("%s  drive9-linux-amd64\n", sum)))
 	if err != nil {
-		t.Fatalf("ParseManifest: %v", err)
+		t.Fatalf("ParseChecksums: %v", err)
 	}
-	if manifest.Version != "v0.2.0" || manifest.Checksums["drive9-linux-amd64"] != sum {
-		t.Fatalf("manifest = %+v, want v0.2.0 and the artifact checksum", manifest)
+	if checksums["drive9-linux-amd64"] != sum {
+		t.Fatalf("checksums = %v, want the artifact digest", checksums)
 	}
 
 	for _, tc := range []struct {
@@ -787,14 +790,56 @@ func TestParseReleaseManifest(t *testing.T) {
 		body string
 		want string
 	}{
-		{name: "missing version", body: fmt.Sprintf("%s  drive9-linux-amd64\n", sum), want: "no \"# drive9-release-version\" line"},
-		{name: "empty version", body: releasesign.VersionPrefix + "\n" + sum + "  drive9-linux-amd64\n", want: "empty version"},
-		{name: "duplicate version", body: releasesign.VersionPrefix + "v0.2.0\n" + releasesign.VersionPrefix + "v0.3.0\n" + sum + "  drive9-linux-amd64\n", want: "more than one version"},
-		{name: "no checksums", body: releasesign.VersionPrefix + "v0.2.0\n", want: "empty checksum list"},
+		// Pre-change CLIs reject any line that is not "<sha256>  <artifact>", which would
+		// make them lose self-update entirely, so the manifest must never carry one.
+		{name: "comment line", body: "# drive9-release-version v1.0.0\n" + sum + "  drive9-linux-amd64\n", want: "invalid checksum"},
+		{name: "empty manifest", body: "\n", want: "empty checksum list"},
+		{name: "duplicate artifact", body: sum + "  a\n" + strings.Repeat("b", 64) + "  a\n", want: "duplicate checksum"},
+		{name: "non-hex digest", body: strings.Repeat("g", 64) + "  drive9-linux-amd64\n", want: "not a sha256 hex digest"},
+		{name: "short digest", body: "abc  drive9-linux-amd64\n", want: "not a sha256 hex digest"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := releasesign.ParseManifest([]byte(tc.body)); err == nil || !strings.Contains(err.Error(), tc.want) {
-				t.Fatalf("ParseManifest error = %v, want %q", err, tc.want)
+			if _, err := releasesign.ParseChecksums([]byte(tc.body)); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("ParseChecksums error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseReleaseInfo(t *testing.T) {
+	manifest := []byte(strings.Repeat("a", 64) + "  drive9-linux-amd64\n")
+	valid := []byte("version v0.2.0\nchecksums-sha256 " + releasesign.ManifestDigest(manifest) + "\n")
+	info, err := releasesign.ParseReleaseInfo(valid)
+	if err != nil {
+		t.Fatalf("ParseReleaseInfo: %v", err)
+	}
+	if info.Version != "v0.2.0" {
+		t.Fatalf("version = %q, want v0.2.0", info.Version)
+	}
+	if err := info.ValidateManifest(manifest); err != nil {
+		t.Fatalf("ValidateManifest: %v", err)
+	}
+	// The description binds one exact manifest: a different release's manifest is refused.
+	other := []byte(strings.Repeat("b", 64) + "  drive9-linux-amd64\n")
+	if err := info.ValidateManifest(other); err == nil || !strings.Contains(err.Error(), "but checksums.txt is") {
+		t.Fatalf("ValidateManifest(other) error = %v, want a digest mismatch", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "missing version", body: "checksums-sha256 " + releasesign.ManifestDigest(manifest) + "\n", want: "no version"},
+		{name: "empty version", body: "version \nchecksums-sha256 " + releasesign.ManifestDigest(manifest) + "\n", want: "empty version"},
+		{name: "duplicate version", body: "version v1\nversion v2\nchecksums-sha256 " + releasesign.ManifestDigest(manifest) + "\n", want: "more than one version"},
+		{name: "missing digest", body: "version v1\n", want: "no checksums-sha256"},
+		{name: "bad digest", body: "version v1\nchecksums-sha256 nothex\n", want: "not a sha256 hex digest"},
+		{name: "unknown field", body: "version v1\nchecksums-sha256 " + releasesign.ManifestDigest(manifest) + "\nextra x\n", want: "unknown release info field"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := releasesign.ParseReleaseInfo([]byte(tc.body)); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("ParseReleaseInfo error = %v, want %q", err, tc.want)
 			}
 		})
 	}
@@ -829,23 +874,8 @@ func TestUpdateAcceptsManifestSignedByOverlapKey(t *testing.T) {
 	if err := os.WriteFile(target, []byte("old-drive9"), 0o755); err != nil {
 		t.Fatalf("write target: %v", err)
 	}
-	manifest := updateTestManifest("v0.2.0", "drive9-linux-amd64", fmt.Sprintf("%x", sum[:]))
-	signature, signErr := releasesign.Sign(manifest, foreignKey)
-	if signErr != nil {
-		t.Fatal(signErr)
-	}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/releases/checksums.txt":
-			_, _ = w.Write(manifest)
-		case "/releases/" + releasesign.SignatureName:
-			_, _ = w.Write(signature)
-		case "/releases/drive9-linux-amd64":
-			_, _ = w.Write(payload)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
+	release := newUpdateTestReleaseFilesSignedBy(t, "v0.2.0", "drive9-linux-amd64", fmt.Sprintf("%x", sum[:]), payload, foreignKey)
+	srv := httptest.NewServer(http.HandlerFunc(release.handler))
 	defer srv.Close()
 
 	err := updateWithDeps([]string{"--base-url", srv.URL}, updateDeps{
@@ -868,5 +898,122 @@ func TestUpdateAcceptsManifestSignedByOverlapKey(t *testing.T) {
 	}
 	if got, readErr := os.ReadFile(target); readErr != nil || !bytes.Equal(got, payload) {
 		t.Fatalf("target = %q err=%v, want the new binary", got, readErr)
+	}
+}
+
+// An origin cannot combine one release's signed version with another release's signed
+// manifest: the description names the exact manifest bytes it describes.
+func TestUpdateRefusesCrossReleaseMix(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	payload := []byte("older-signed-release")
+	olderSum := sha256.Sum256(payload)
+	newerPayload := []byte("newer-signed-release")
+	newerSum := sha256.Sum256(newerPayload)
+
+	older := newUpdateTestReleaseFiles(t, "v0.2.0", "drive9-linux-amd64", fmt.Sprintf("%x", olderSum[:]), payload)
+	newer := newUpdateTestReleaseFiles(t, "v9.0.0", "drive9-linux-amd64", fmt.Sprintf("%x", newerSum[:]), newerPayload)
+	target := filepath.Join(t.TempDir(), "drive9")
+	if err := os.WriteFile(target, []byte("current-drive9"), 0o755); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	// Genuine signature over the newer description, but the older manifest and binary are
+	// what the origin serves: the digest check must refuse it.
+	handler := older.handler
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/releases/" + releasesign.ReleaseInfoName:
+			_, _ = w.Write(newer.info)
+			return
+		case "/releases/" + releasesign.ReleaseInfoSignatureName:
+			_, _ = w.Write(newer.infoSig)
+			return
+		}
+		handler(w, r)
+	}))
+	defer srv.Close()
+
+	err := updateWithDeps([]string{"--base-url", srv.URL}, updateDeps{
+		currentVersion:       "v0.1.0",
+		goos:                 "linux",
+		goarch:               "amd64",
+		executable:           func() (string, error) { return target, nil },
+		httpClient:           srv.Client(),
+		stdout:               &bytes.Buffer{},
+		allowInsecureBaseURL: true,
+		replaceExecutable: func(string, string) error {
+			t.Fatal("replaceExecutable must not run for a mixed release")
+			return nil
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "release info describes manifest") {
+		t.Fatalf("update error = %v, want a cross-release digestion mismatch", err)
+	}
+	if got, readErr := os.ReadFile(target); readErr != nil || string(got) != "current-drive9" {
+		t.Fatalf("target changed after a mixed release: %q err=%v", got, readErr)
+	}
+}
+
+// A release without the signed description is refused: the version must be authenticated,
+// not taken from an unauthenticated sibling file.
+func TestUpdateRefusesMissingReleaseInfo(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	payload := []byte("new-drive9")
+	sum := sha256.Sum256(payload)
+	release := newUpdateTestReleaseFiles(t, "v0.2.0", "drive9-linux-amd64", fmt.Sprintf("%x", sum[:]), payload)
+	target := filepath.Join(t.TempDir(), "drive9")
+	if err := os.WriteFile(target, []byte("current-drive9"), 0o755); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	handler := release.handler
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/releases/"+releasesign.ReleaseInfoName || r.URL.Path == "/releases/"+releasesign.ReleaseInfoSignatureName {
+			http.NotFound(w, r)
+			return
+		}
+		handler(w, r)
+	}))
+	defer srv.Close()
+
+	err := updateWithDeps([]string{"--check"}, updateDeps{
+		baseURL:              srv.URL,
+		currentVersion:       "v0.1.0",
+		goos:                 "linux",
+		goarch:               "amd64",
+		httpClient:           srv.Client(),
+		stdout:               &bytes.Buffer{},
+		allowInsecureBaseURL: true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "fetch release info") {
+		t.Fatalf("update error = %v, want a missing release info failure", err)
+	}
+}
+
+// The linker override must actually take effect: the trusted-key variable is initialized
+// from a constant sentinel precisely so -X can replace it, and an explicit empty override
+// means "trust nothing" rather than falling back to the embedded production keys.
+func TestUpdateTrustedKeysResolveLinkerOverride(t *testing.T) {
+	// -X only rewrites a string variable initialized with a constant expression, so the
+	// initializer must be the sentinel literally (a var-to-var initializer would silently
+	// ignore a linker override). TestMain replaces the value at run time, so pin the source.
+	source, err := os.ReadFile("update_signing.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(source), "var updateManifestPublicKey = embeddedUpdateManifestKeys") {
+		t.Fatal("updateManifestPublicKey is not initialized from the constant sentinel, so -X cannot override it")
+	}
+	if _, err := releasesign.ParsePublicKeys(embeddedUpdateManifestKeys); err == nil {
+		t.Fatal("the sentinel parses as a key set, so it cannot mark an unset override")
+	}
+	if got := trustedUpdateManifestKeys(); got == "" {
+		t.Fatalf("no override should resolve to the embedded file, got %q", got)
+	}
+	useUpdateTestSigningKey(t, updateTestSigningPublicKey+","+updateTestSigningPublicKey)
+	if got, want := trustedUpdateManifestKeys(), updateTestSigningPublicKey+","+updateTestSigningPublicKey; got != want {
+		t.Fatalf("override = %q, want %q", got, want)
+	}
+	useUpdateTestSigningKey(t, "")
+	if got := trustedUpdateManifestKeys(); got != "" {
+		t.Fatalf("an explicit empty override resolved to %q, want no keys", got)
 	}
 }

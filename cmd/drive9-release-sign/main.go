@@ -69,18 +69,18 @@ func run(args []string) error {
 			return fmt.Errorf("read %s: %w", file, err)
 		}
 		if len(manifest) == 0 {
-			// An empty manifest would verify as a signature over nothing; refuse it here
+			// An empty file would verify as a signature over nothing; refuse it here
 			// instead of letting an empty release through.
 			return fmt.Errorf("refusing to sign empty file %s", file)
 		}
-		// Sign only what the updater would accept: the same parser runs on both sides, so a
-		// release cannot be signed with a shape (empty version, no checksums) that the CLI
-		// would reject after publishing it.
-		parsed, err := releasesign.ParseManifest(manifest)
+		// Sign only what the updater would accept: the same parsers run on both sides, so a
+		// release cannot be signed with a shape (empty version, no checksums, a manifest
+		// release.txt does not describe) that the CLI would reject after publishing it.
+		label, err := validateReleaseFile(file, manifest)
 		if err != nil {
 			return fmt.Errorf("refusing to sign %s: %w", file, err)
 		}
-		fmt.Printf("signing %s for release %s\n", filepath.Base(file), parsed.Version)
+		fmt.Printf("signing %s for release %s\n", filepath.Base(file), label)
 		signature, err := releasesign.Sign(manifest, privateKey)
 		if err != nil {
 			return err
@@ -109,6 +109,33 @@ func verifyManifest(manifestPath, publicKey string) error {
 	}
 	fmt.Printf("signature OK: %s\n", manifestPath)
 	return nil
+}
+
+// validateReleaseFile parses a file the way the updater will, and cross-checks the pair:
+// release.txt must describe the checksums.txt sitting next to it.
+func validateReleaseFile(file string, body []byte) (string, error) {
+	switch filepath.Base(file) {
+	case releasesign.ManifestName:
+		if _, err := releasesign.ParseChecksums(body); err != nil {
+			return "", err
+		}
+		return "a checksum manifest", nil
+	case releasesign.ReleaseInfoName:
+		info, err := releasesign.ParseReleaseInfo(body)
+		if err != nil {
+			return "", err
+		}
+		manifest, err := os.ReadFile(filepath.Join(filepath.Dir(file), releasesign.ManifestName))
+		if err != nil {
+			return "", fmt.Errorf("read the manifest it describes: %w", err)
+		}
+		if err := info.ValidateManifest(manifest); err != nil {
+			return "", err
+		}
+		return info.Version, nil
+	default:
+		return "", fmt.Errorf("not a release artifact the updater reads (%s, %s)", releasesign.ManifestName, releasesign.ReleaseInfoName)
+	}
 }
 
 func firstNonEmpty(values ...string) string {

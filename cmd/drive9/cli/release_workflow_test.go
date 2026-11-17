@@ -66,9 +66,9 @@ func TestCLIReleasePublishesLegacyManifests(t *testing.T) {
 	}
 	// Signing is not enough: the signature must verify against the key the release binary
 	// embeds, read from the same file the build embeds.
-	for _, want := range []string{"-verify", "cmd/drive9/cli/update_key.txt"} {
+	for _, want := range []string{"-verify", "cmd/drive9/cli/update_key.txt", "dist/release.txt"} {
 		if !strings.Contains(signStep, want) {
-			t.Errorf("signing step does not verify against the embedded key: missing %q", want)
+			t.Errorf("signing step does not sign/verify the full release pair: missing %q", want)
 		}
 	}
 	// Binaries first, manifests last: the updater reads the manifest pair in two requests and
@@ -79,7 +79,7 @@ func TestCLIReleasePublishesLegacyManifests(t *testing.T) {
 	if strings.Contains(upload, `--include "checksums.txt"`) || strings.Contains(upload, `--include "SHA256SUMS"`) {
 		t.Error("binary upload still publishes the manifest, so the manifest can appear before its artifacts")
 	}
-	for _, name := range []string{"checksums.txt", "checksums.txt.sig", "SHA256SUMS", "version"} {
+	for _, name := range []string{"checksums.txt", "checksums.txt.sig", "release.txt", "release.txt.sig", "SHA256SUMS", "version"} {
 		if !strings.Contains(manifestUpload, `--include "`+name+`"`) {
 			t.Errorf("manifest upload omits %s", name)
 		}
@@ -111,11 +111,6 @@ func TestCLIReleasePublishesLegacyManifests(t *testing.T) {
 				line := fmt.Sprintf("%x  %s\n", sum, artifact.binary)
 				all.WriteString(line)
 				manifestBody := line
-				if artifact.manifest == "checksums.txt" {
-					// The Makefile writes the signed version line; the workflow's
-					// `sha256sum --check` has to keep accepting it.
-					manifestBody = "# drive9-release-version vtest0\n" + line
-				}
 				if failure == "checksum mismatch" && artifact.manifest == "checksums.txt" {
 					payload = []byte("changed binary")
 				}
