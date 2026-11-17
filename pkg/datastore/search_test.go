@@ -91,7 +91,7 @@ func TestFTSQueryLiteralEscapesWithoutRewriting(t *testing.T) {
 		{name: "unicode", query: "蓝牙耳机", want: `'蓝牙耳机'`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := ftsQueryLiteral(tc.query)
+			got, err := ftsQueryLiteral(tc.query, false)
 			if err != nil {
 				t.Fatalf("ftsQueryLiteral(%q): %v", tc.query, err)
 			}
@@ -103,8 +103,22 @@ func TestFTSQueryLiteralEscapesWithoutRewriting(t *testing.T) {
 			}
 		})
 	}
-	if _, err := ftsQueryLiteral("a\x00b"); err == nil || !strings.Contains(err.Error(), "NUL") {
+	if _, err := ftsQueryLiteral("a\x00b", false); err == nil || !strings.Contains(err.Error(), "NUL") {
 		t.Fatalf("ftsQueryLiteral with a NUL byte error = %v, want a refusal", err)
+	}
+
+	// Under NO_BACKSLASH_ESCAPES a backslash is an ordinary character, so doubling it would
+	// search for two. The literal has to denote exactly what the user typed in both modes.
+	withBackslash := `C:\path\to`
+	if got, want := mustFTSLiteral(t, withBackslash, true), `'C:\path\to'`; got != want {
+		t.Fatalf("NO_BACKSLASH_ESCAPES literal = %s, want %s", got, want)
+	}
+	if got, want := mustFTSLiteral(t, withBackslash, false), `'C:\\path\\to'`; got != want {
+		t.Fatalf("default-mode literal = %s, want %s", got, want)
+	}
+	// Quote escaping does not depend on the mode, which is why it is the delimiter rule.
+	if got, want := mustFTSLiteral(t, "it's", true), "'it''s'"; got != want {
+		t.Fatalf("NO_BACKSLASH_ESCAPES quote literal = %s, want %s", got, want)
 	}
 }
 
@@ -130,7 +144,7 @@ func closesAsOneLiteral(literal string) bool {
 }
 
 func TestBuildFTSSearchQueryInlinesTheQuotedQuery(t *testing.T) {
-	literal, err := ftsQueryLiteral("it's 50% off -- really")
+	literal, err := ftsQueryLiteral("it's 50% off -- really", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,4 +169,14 @@ func TestBuildFTSSearchQueryInlinesTheQuotedQuery(t *testing.T) {
 	if !reflect.DeepEqual(args, wantArgs) {
 		t.Fatalf("args = %#v, want the limit and then the path subtree", args)
 	}
+}
+
+// mustFTSLiteral renders a literal or fails the test.
+func mustFTSLiteral(t *testing.T, query string, noBackslashEscapes bool) string {
+	t.Helper()
+	literal, err := ftsQueryLiteral(query, noBackslashEscapes)
+	if err != nil {
+		t.Fatalf("ftsQueryLiteral(%q, %v): %v", query, noBackslashEscapes, err)
+	}
+	return literal
 }

@@ -3207,8 +3207,13 @@ func TestRotateLegacySystemUserCredentialClassifies(t *testing.T) {
 	if _, _, err := RotateLegacySystemUserCredential(context.Background(), "u1.root:rootpass@tcp(127.0.0.1:4000)/tenant_db", "tenant-a"); err != nil {
 		t.Fatalf("a DSN still naming the root principal must be left to provisioning, got %v", err)
 	}
-	if !isAccessDeniedError(&mysql.MySQLError{Number: 1045, Message: "Access denied"}) {
-		t.Fatal("HTTP 1045 is an access-denied refusal")
+	if !isAuthenticationDeniedError(&mysql.MySQLError{Number: 1045, Message: "Access denied"}) {
+		t.Fatal("1045 must end the remediation: the stored password is not the root principal's")
+	}
+	// A privilege error on a statement is not a login refusal: the account may still hold
+	// the root password, so it must stay in the retry set instead of being memoized as done.
+	if isAuthenticationDeniedError(&mysql.MySQLError{Number: 1044, Message: "Access denied for user to database"}) {
+		t.Fatal("1044 was read as an authentication refusal, so remediation would be skipped")
 	}
 	if !isAccessDeniedError(&mysql.MySQLError{Number: 1044, Message: "Access denied"}) {
 		t.Fatal("1044 is an access-denied refusal")

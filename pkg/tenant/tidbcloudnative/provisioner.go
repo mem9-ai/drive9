@@ -519,15 +519,20 @@ func rotateLegacySystemUser(ctx context.Context, cfg *mysql.Config, username, db
 	}
 	rootCfg := cfg.Clone()
 	rootCfg.User = rootUser
+	// Probe authentication only: with the tenant database selected, a root principal that
+	// authenticates but cannot use that schema would fail with ER_DBACCESS_DENIED_ERROR and
+	// be mistaken for "already rotated", leaving the root-equivalent credential in place.
+	// The setup statements below are fully qualified, so no database needs to be selected.
+	rootCfg.DBName = ""
 	rootDB, err := sql.Open("mysql", rootCfg.FormatDSN())
 	if err != nil {
 		return false, fmt.Errorf("open native root connection: %w", err)
 	}
 	defer func() { _ = rootDB.Close() }()
 	if err := rootDB.PingContext(ctx); err != nil {
-		if isAccessDeniedError(err) {
-			// The stored password no longer authenticates as the cluster root, so the
-			// tenant account is not root-equivalent any more.
+		if isAuthenticationDeniedError(err) {
+			// The stored password does not authenticate as the cluster root, so the tenant
+			// account is not root-equivalent any more.
 			return false, nil
 		}
 		return false, fmt.Errorf("authenticate native root principal: %w", err)
@@ -578,8 +583,21 @@ func RotateLegacySystemUserCredential(ctx context.Context, dsn, tenantID string)
 	return password, true, nil
 }
 
-// isAccessDeniedError reports whether the server refused the login or the statement for
-// lack of privilege, as opposed to a transport or server failure.
+// isAuthenticationDeniedError reports whether the server refused the *login*: the stored
+// password is not this principal's. Only that answer means the account is not
+// root-equivalent; a privilege error on a statement is a remediation failure and must be
+// retried, not read as "nothing to do".
+func isAuthenticationDeniedError(err error) bool {
+	var mysqlErr *mysql.MySQLError
+	if !errors.As(err, &mysqlErr) {
+		return false
+	}
+	// 1045: access denied for user (bad password or no matching account).
+	return mysqlErr.Number == 1045
+}
+
+// isAccessDeniedError reports whether the server refused a statement for lack of privilege,
+// which the caller treats as an operator-managed account it must not touch.
 func isAccessDeniedError(err error) bool {
 	var mysqlErr *mysql.MySQLError
 	if !errors.As(err, &mysqlErr) {

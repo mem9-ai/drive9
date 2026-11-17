@@ -269,7 +269,17 @@ func buildVectorSearchDescriptionByTextQueryScoped(scope Scope, queryText, pathP
 
 // FTSSearch runs a full-text search over files.content_text and files.description.
 func (s *Store) FTSSearch(ctx context.Context, query, pathPrefix string, limit int) ([]SearchResult, error) {
-	literal, err := ftsQueryLiteral(query)
+	noBackslashEscapes := false
+	var err error
+	if strings.IndexByte(query, '\\') >= 0 {
+		// Only a query with a backslash needs the session's escaping mode; asking costs a
+		// round trip, and the answer is cached for the life of the store.
+		noBackslashEscapes, err = s.sqlModeNoBackslashEscapes(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("read sql_mode: %w", err)
+		}
+	}
+	literal, err := ftsQueryLiteral(query, noBackslashEscapes)
 	if err != nil {
 		return nil, err
 	}
@@ -308,22 +318,55 @@ var ErrInvalidFTSQuery = errors.New("full-text search query is not usable")
 // and every full-text search would silently match nothing. Quoting therefore happens here,
 // once, and has to be right rather than merely defensive:
 //
-//   - a literal quote is escaped by doubling it, which is valid both with and without
-//     NO_BACKSLASH_ESCAPES;
-//   - a backslash is doubled so it cannot escape the closing quote in the default sql_mode
-//     (under NO_BACKSLASH_ESCAPES it simply stays a backslash);
+//   - a literal quote is escaped by doubling it, which is the same in both sql_mode variants;
+//   - a backslash is doubled only when the session treats backslashes as escapes, so the
+//     literal always denotes exactly the text the user typed. Doubling in NO_BACKSLASH_ESCAPES
+//     would search for two backslashes instead of one;
 //   - nothing is stripped. Deleting substrings that "look dangerous" changes what the user
 //     searched for and hides the attempt instead of making it inert — `don't`, `a--b` and
 //     `x/*y` are ordinary search text.
-func ftsQueryLiteral(query string) (string, error) {
+func ftsQueryLiteral(query string, noBackslashEscapes bool) (string, error) {
 	if strings.IndexByte(query, 0) >= 0 {
 		// A NUL cannot be quoted portably: the text and binary protocols disagree about
 		// whether it survives as data, and it is never part of a real query.
 		return "", fmt.Errorf("%w: it contains a NUL byte", ErrInvalidFTSQuery)
 	}
-	query = strings.ReplaceAll(query, `\`, `\\`)
+	if !noBackslashEscapes {
+		query = strings.ReplaceAll(query, `\`, `\\`)
+	}
 	query = strings.ReplaceAll(query, `'`, `''`)
 	return "'" + query + "'", nil
+}
+
+// sqlModeNoBackslashEscapes reports whether this store's sessions parse a backslash in a
+// string literal as an escape. It is asked once per store, and only when a quote is needed
+// for text that actually contains a backslash, so the common search path stays one query.
+//
+// Our own connections never change sql_mode, so every connection in the pool agrees; a
+// deployment that changes the account default is answered on the first search.
+func (s *Store) sqlModeNoBackslashEscapes(ctx context.Context) (bool, error) {
+	switch s.noBackslashEscapes.Load() {
+	case 1:
+		return false, nil
+	case 2:
+		return true, nil
+	}
+	var mode string
+	if err := s.db.QueryRowContext(ctx, "SELECT @@SESSION.sql_mode").Scan(&mode); err != nil {
+		return false, err
+	}
+	noBackslashEscapes := false
+	for _, flag := range strings.Split(mode, ",") {
+		if strings.EqualFold(strings.TrimSpace(flag), "NO_BACKSLASH_ESCAPES") {
+			noBackslashEscapes = true
+		}
+	}
+	if noBackslashEscapes {
+		s.noBackslashEscapes.Store(2)
+	} else {
+		s.noBackslashEscapes.Store(1)
+	}
+	return noBackslashEscapes, nil
 }
 
 // buildFTSSearchQuery assembles the full-text search query for the given schema-shape
