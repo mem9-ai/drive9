@@ -962,12 +962,53 @@ describe("Extent layout v2 support in TypeScript SDK", () => {
       writeExtentBytesImpl(client, "/existing-empty-single.bin", new Uint8Array(0), { expectedRevision: -1 })
     ).rejects.toBeInstanceOf(ConflictError);
     await expect(
-      writeExtentBytesImpl(client, "/new-zero.bin", new Uint8Array(0), { expectedRevision: 2, tags: { k: "v" } })
-    ).rejects.toThrow(/conditional 0-byte extent writes do not accept tags or description/);
+      writeExtentBytesImpl(client, "/new-zero.bin", new Uint8Array(0), { expectedRevision: 0, expectedResourceId: "res-gone" })
+    ).rejects.toBeInstanceOf(ResourceMismatchError);
+    let caughtTagErr: unknown;
+    try {
+      await writeExtentBytesImpl(client, "/new-zero.bin", new Uint8Array(0), { expectedRevision: 2, tags: { k: "v" } });
+    } catch (e) {
+      caughtTagErr = e;
+    }
+    expect(caughtTagErr).toBeInstanceOf(Drive9Error);
+    expect((caughtTagErr as Error).message).toMatch(/conditional 0-byte extent writes do not accept tags or description/);
+    expect((caughtTagErr as Error).cause).toBeInstanceOf(StatusError);
     const posZeroRes = await writeExtentBytesImpl(client, "/pos-zero.bin", new Uint8Array(0), { expectedRevision: 5 });
     expect(posZeroRes.revision).toBe(0);
     expect(posZeroHeadCalled).toBe(false);
     expect(zeroPatchRev).toBe(5);
+    server.resetHandlers();
+
+    // Unconditional 0B overwrite onto existing non-empty extent file when complete omits revision:
+    // writeExtentBytesImpl returns revision 0 without post-commit stat, while truncateExtentImpl re-stats.
+    let truncHeadCount = 0;
+    server.use(
+      http.post("http://localhost:9009/v2/uploads/initiate", () =>
+        HttpResponse.json({ error: "total_size must be positive" }, { status: 400 })
+      ),
+      http.head("http://localhost:9009/v1/fs/trunc-norev.bin", () => {
+        truncHeadCount++;
+        return new HttpResponse(null, {
+          status: 200,
+          headers: {
+            "Content-Length": truncHeadCount === 1 ? "64" : "0",
+            "X-Dat9-IsDir": "false",
+            "X-Dat9-Revision": truncHeadCount === 1 ? "10" : "99",
+            "X-Dat9-Content-Layout": "extent",
+          },
+        });
+      }),
+      http.patch("http://localhost:9009/v1/fs/trunc-norev.bin", () =>
+        HttpResponse.json({ upload_id: "tnr-1", new_size: 0, blocks: [] }, { status: 202 })
+      ),
+      http.post("http://localhost:9009/v2/uploads/tnr-1/complete", () => HttpResponse.json({ status: "ok" }))
+    );
+    const uncondZeroRes = await writeExtentBytesImpl(client, "/trunc-norev.bin", new Uint8Array(0), { expectedRevision: -1 });
+    expect(uncondZeroRes.revision).toBe(0);
+    expect(truncHeadCount).toBe(1); // no post-commit HEAD in writeExtentBytesImpl!
+    truncHeadCount = 0;
+    const directTruncSt = await truncateExtentImpl(client, "/trunc-norev.bin", 0);
+    expect(directTruncSt.revision).toBe(99); // truncateExtentImpl re-stats for StatResult parity
     server.resetHandlers();
 
     // 5. Multi-block commitExtentPatchImpl drains all in-flight PUT workers before aborting and replanning.

@@ -236,6 +236,9 @@ func (a *drive9FS) OpenReadRange(ctx context.Context, loc Location, offset, leng
 }
 
 func (a *drive9FS) OpenWrite(ctx context.Context, loc Location, opts WriteOpts) (WriteHandle, error) {
+	if opts.Layout != "" && opts.TargetLayout != "" && opts.Layout != opts.TargetLayout {
+		return nil, fmt.Errorf("destination %s already has %s content layout; --layout %s cannot be applied", loc.Path, opts.TargetLayout, opts.Layout)
+	}
 	// WriteStreamWithSummary needs a seekable ReaderAt for large files, so
 	// spool to a tempfile instead of buffering the whole object in RAM.
 	f, err := os.CreateTemp("", "drive9-cp-*")
@@ -303,9 +306,6 @@ func (w *drive9Write) Close() error {
 	fi, err := w.f.Stat()
 	if err != nil {
 		return fmt.Errorf("write %s: %w", w.loc.Raw, err)
-	}
-	if w.opts.Layout != "" && w.opts.TargetLayout != "" && w.opts.Layout != w.opts.TargetLayout {
-		return fmt.Errorf("destination %s already has %s content layout; --layout %s cannot be applied", w.loc.Path, w.opts.TargetLayout, w.opts.Layout)
 	}
 	w.a.c.Warm(w.ctx)
 	var opts []client.WriteOption

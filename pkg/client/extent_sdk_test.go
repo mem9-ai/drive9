@@ -297,17 +297,21 @@ func TestOverwriteStickyExtentViaWriteAndSmallWriteStream(t *testing.T) {
 			initiatedSizes = append(initiatedSizes, sz)
 			id := fmt.Sprintf("ow-%d", len(initiatedSizes))
 			mu.Unlock()
-			totalParts := 1
 			if sz == 0 {
-				totalParts = 0
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":"total_size must be positive"}`))
+				return
 			}
 			w.WriteHeader(http.StatusAccepted)
 			_ = json.NewEncoder(w).Encode(uploadPlanV2{
 				UploadID:         id,
 				PartSize:         ExtentBlockSize,
-				TotalParts:       totalParts,
+				TotalParts:       1,
 				ChecksumContract: checksumContract{Supported: []string{"SHA-256"}, Required: true},
 			})
+		case r.Method == http.MethodPatch && r.URL.Path == "/v1/fs/sticky.bin":
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(ExtentWritePlan{UploadID: "ow-trunc", NewSize: 0})
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/presign-batch"):
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"parts": []presignedPart{{Number: 1, URL: "http://" + r.Host + "/obj/ow", Size: 5}},
@@ -940,7 +944,12 @@ func TestExtentReviewRegressions(t *testing.T) {
 			t.Fatalf("ReadAll(header-rev) err = %v, want revision 5 -> 6 drift error", rerr)
 		}
 
-		// 5. Unconditional 0B extent write with tags/description applies ?setmeta=1; conditional 0B rejects upfront.
+		// 5. Unconditional 0B extent write with tags/description applies ?setmeta=1; conditional 0B rejects upfront;
+		// expectedRevision == 0 with expectedResource rejects before create.
+		_, err = c.writeExtentBytesConditional(WithExpectedResource(context.Background(), "res-old"), "/create-zero.bin", nil, 0, nil, "", nil, nil)
+		if !errors.Is(err, ErrResourceMismatch) {
+			t.Fatalf("writeExtentBytesConditional(0B rev=0 with expectedResource) err = %v, want ErrResourceMismatch", err)
+		}
 		_, err = c.writeExtentBytesConditional(context.Background(), "/tagged-zero.bin", nil, 1, map[string]string{"k": "v"}, "", nil, nil)
 		if err == nil || !strings.Contains(err.Error(), "conditional 0-byte extent writes do not accept tags or description") {
 			t.Fatalf("writeExtentBytesConditional(conditional 0B with tags) err = %v, want explicit conditional error", err)

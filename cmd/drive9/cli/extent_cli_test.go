@@ -528,4 +528,12 @@ func TestCliExtentDownloadCatAppendAndStat(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "--layout extent is not supported by this server (retry without --layout)") {
 		t.Fatalf("Cp(--layout=extent on classic server) err = %v, want wrapped --layout guidance", err)
 	}
+	// drive9FS.OpenWrite rejects conflicting Layout vs TargetLayout before creating a spool tempfile.
+	if _, err := newDrive9FS(strictClient).OpenWrite(
+		context.Background(),
+		Location{Kind: KindDrive9, Path: "/sticky-single.bin", Raw: ":/sticky-single.bin"},
+		WriteOpts{Layout: string(client.ContentLayoutExtent), TargetLayout: string(client.ContentLayoutSingle)},
+	); err == nil || !strings.Contains(err.Error(), "already has single content layout; --layout extent cannot be applied") {
+		t.Fatalf("OpenWrite(conflicting layouts) err = %v, want fast layout mismatch before spooling", err)
+	}
 }

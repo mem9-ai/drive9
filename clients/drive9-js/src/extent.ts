@@ -627,6 +627,17 @@ export async function truncateExtentImpl(
   newSize: number,
   options?: { expectedRevision?: number; expectedResourceId?: string }
 ): Promise<StatResult> {
+  const { stat } = await truncateExtentWithLandedRevImpl(client, path, newSize, options, true);
+  return stat;
+}
+
+async function truncateExtentWithLandedRevImpl(
+  client: Client,
+  path: string,
+  newSize: number,
+  options: { expectedRevision?: number; expectedResourceId?: string } | undefined,
+  restatOnMissingRev: boolean
+): Promise<{ stat: StatResult; landedRevision: number }> {
   if (newSize < 0) {
     throw new Drive9Error("extent truncate requires non-negative size");
   }
@@ -648,7 +659,7 @@ export async function truncateExtentImpl(
       throw new ConflictError("content layout mismatch: the file's layout is sticky for the life of the inode");
     }
     if (st.size === newSize) {
-      return st;
+      return { stat: st, landedRevision: 0 };
     }
   }
   const origResId = options?.expectedResourceId ?? st.resource_id;
@@ -663,7 +674,7 @@ export async function truncateExtentImpl(
         throw new ConflictError("content layout mismatch: the file's layout is sticky for the life of the inode");
       }
       if (st.size === newSize) {
-        return st;
+        return { stat: st, landedRevision: 0 };
       }
     }
     if (st.revision <= 0) {
@@ -680,17 +691,23 @@ export async function truncateExtentImpl(
       );
       if (landedRev > 0) {
         return {
-          ...st,
-          size: newSize,
-          revision: landedRev,
-          content_layout: "extent",
+          stat: {
+            ...st,
+            size: newSize,
+            revision: landedRev,
+            content_layout: "extent",
+          },
+          landedRevision: landedRev,
         };
       }
-      try {
-        return await client.stat(path);
-      } catch {
-        return { ...st, size: newSize, content_layout: "extent" };
+      if (restatOnMissingRev) {
+        try {
+          return { stat: await client.stat(path), landedRevision: 0 };
+        } catch {
+          return { stat: { ...st, size: newSize, content_layout: "extent" }, landedRevision: 0 };
+        }
       }
+      return { stat: { ...st, size: newSize, revision: 0, content_layout: "extent" }, landedRevision: 0 };
     } catch (err) {
       lastErr = err;
       if (!(err instanceof ConflictError) || (options?.expectedRevision && options.expectedRevision > 0)) {
@@ -950,11 +967,14 @@ export async function writeExtentBytesImpl(
     if (data.length === 0 && isZeroSizeExtentInitiateError(err)) {
       if (options.tags || options.description) {
         if (options.expectedRevision >= 0 || options.expectedResourceId) {
-          throw new Drive9Error("conditional 0-byte extent writes do not accept tags or description");
+          throw new Drive9Error("conditional 0-byte extent writes do not accept tags or description", { cause: err });
         }
       }
       let result: { revision: number; partSize: number; totalParts: number; uploadedParts: number };
       if (options.expectedRevision === 0) {
+        if (options.expectedResourceId) {
+          throw new ResourceMismatchError(path);
+        }
         const created = await createExtentFileImpl(client, path);
         if (!created.native_extent) {
           throw new Drive9Error(`server does not support 0-byte extent file creation on ${path}`);
@@ -965,13 +985,17 @@ export async function writeExtentBytesImpl(
         result = { revision: rev, partSize: 0, totalParts: 0, uploadedParts: 0 };
       } else {
         try {
-          const updated = await truncateExtentImpl(client, path, 0, {
-            expectedResourceId: options.expectedResourceId,
-          });
+          const { stat: updated, landedRevision } = await truncateExtentWithLandedRevImpl(
+            client,
+            path,
+            0,
+            { expectedResourceId: options.expectedResourceId },
+            false
+          );
           if (updated.content_layout && updated.content_layout !== "extent") {
             throw new ConflictError("content layout mismatch: the file's layout is sticky for the life of the inode");
           }
-          result = { revision: updated.revision, partSize: 0, totalParts: 0, uploadedParts: 0 };
+          result = { revision: landedRevision, partSize: 0, totalParts: 0, uploadedParts: 0 };
         } catch (truncErr) {
           const isMissing =
             (truncErr instanceof StatusError && truncErr.statusCode === 404) ||

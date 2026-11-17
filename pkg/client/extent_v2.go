@@ -1149,6 +1149,9 @@ func (c *Client) fallbackZeroSizeExtentWrite(ctx context.Context, path string, e
 		}
 	}
 	if expectedRevision == 0 {
+		if expectedResourceOf(ctx) != "" {
+			return 0, fmt.Errorf("%s: %w", path, ErrResourceMismatch)
+		}
 		rev, _, native, err := c.CreateExtentFileCreatedCtx(ctx, path)
 		if err != nil {
 			return 0, err
