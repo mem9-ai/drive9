@@ -52,6 +52,10 @@ const (
 	TenantNotifyWorkFileGC
 	TenantNotifyWorkMetricsCleanup
 	TenantNotifyWorkAPIKeyCacheCleanup
+	// TenantNotifyWorkTenantCredential means the tenant's database credential changed.
+	// Every pod must drop the cache it resolved from the old row and the pooled backend
+	// whose connections were authenticated with the retired password.
+	TenantNotifyWorkTenantCredential
 )
 
 var allTenantStatuses = []TenantStatus{
@@ -3542,20 +3546,44 @@ func (s *Store) ClearTenantProvisionMetadata(ctx context.Context, tenantID strin
 	return nil
 }
 
+// UpdateTenantDBCredentialIf replaces a tenant's database credential when the row still
+// names fromDBUser, and signals every pod in the same transaction.
+//
+// The signal matters as much as the update: a peer keeps the previous credential in its
+// resolved tenant row and inside open connections, so a rotated password must invalidate
+// those caches everywhere, not just in the process that performed the write. Otherwise the
+// peer keeps dialling with a password the database no longer accepts.
 func (s *Store) UpdateTenantDBCredentialIf(ctx context.Context, id, fromDBUser, dbUser string, dbPasswordCipher []byte) (updated bool, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "update_tenant_db_credential_if", start, &err)
-	res, err := s.db.ExecContext(ctx, `UPDATE tenants SET db_user = ?, db_password = ?, updated_at = ? WHERE id = ? AND db_user = ?`,
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	res, err := tx.ExecContext(ctx, `UPDATE tenants SET db_user = ?, db_password = ?, updated_at = ? WHERE id = ? AND db_user = ?`,
 		dbUser, dbPasswordCipher, time.Now().UTC(), id, fromDBUser)
 	if err != nil {
 		return false, err
 	}
 	n, _ := res.RowsAffected()
-	updated = n > 0
-	if updated {
-		s.apiKeys.evictTenant(id)
+	if n == 0 {
+		return false, nil
 	}
-	return updated, nil
+	if err := insertTenantNotifyTx(ctx, tx, id, TenantNotifyWorkTenantCredential); err != nil {
+		return false, fmt.Errorf("enqueue tenant credential invalidation: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	committed = true
+	s.apiKeys.evictTenant(id)
+	return true, nil
 }
 
 func (s *Store) UpdateTenantBranch(ctx context.Context, id string, cluster *Tenant) (err error) {

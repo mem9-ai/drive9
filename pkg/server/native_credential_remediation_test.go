@@ -15,60 +15,60 @@ import (
 
 // A failing tenant is retried with backoff rather than on every pass, and the delay
 // is capped so it keeps being retried while this pod leads.
-func TestNativePrivilegeRetireRetryBackoff(t *testing.T) {
+func TestNativeCredentialRemediationBackoff(t *testing.T) {
 	s := &Server{}
-	if s.nativePrivilegeRetireBackoff("tenant-a") {
+	if s.nativeCredentialRemediationBackoff("tenant-a") {
 		t.Fatal("a tenant without a failure is in backoff")
 	}
-	s.recordNativePrivilegeRetireFailure("tenant-a")
-	if !s.nativePrivilegeRetireBackoff("tenant-a") {
+	s.recordNativeCredentialRemediationFailure("tenant-a")
+	if !s.nativeCredentialRemediationBackoff("tenant-a") {
 		t.Fatal("no backoff after a failure")
 	}
 	for i := 0; i < 10; i++ {
-		s.recordNativePrivilegeRetireFailure("tenant-a")
+		s.recordNativeCredentialRemediationFailure("tenant-a")
 	}
-	s.nativePrivilegeRetireMu.Lock()
-	attempts := s.nativePrivilegeRetireFailures["tenant-a"]
-	retryAt := s.nativePrivilegeRetireRetryAt["tenant-a"]
-	s.nativePrivilegeRetireMu.Unlock()
+	s.nativeCredentialRemediationMu.Lock()
+	attempts := s.nativeCredentialRemediationFailures["tenant-a"]
+	retryAt := s.nativeCredentialRemediationRetryAt["tenant-a"]
+	s.nativeCredentialRemediationMu.Unlock()
 	if attempts != 11 {
 		t.Fatalf("attempt count = %d, want 11", attempts)
 	}
-	if delay := time.Until(retryAt); delay > nativePrivilegeRetireMaxBackoff+time.Minute {
-		t.Fatalf("retry delay %s exceeds the cap %s", delay, nativePrivilegeRetireMaxBackoff)
+	if delay := time.Until(retryAt); delay > nativeCredentialRemediationMaxBackoff+time.Minute {
+		t.Fatalf("retry delay %s exceeds the cap %s", delay, nativeCredentialRemediationMaxBackoff)
 	}
 	// Another tenant is unaffected.
-	if s.nativePrivilegeRetireBackoff("tenant-b") {
+	if s.nativeCredentialRemediationBackoff("tenant-b") {
 		t.Fatal("a failure leaked to another tenant")
 	}
 	// An expired delay leaves the attempt count alone, so the next failure continues
 	// towards the cap instead of restarting at one attempt on every pass.
-	s.nativePrivilegeRetireMu.Lock()
-	s.nativePrivilegeRetireRetryAt["tenant-a"] = time.Now().Add(-time.Second)
-	s.nativePrivilegeRetireMu.Unlock()
-	if s.nativePrivilegeRetireBackoff("tenant-a") {
+	s.nativeCredentialRemediationMu.Lock()
+	s.nativeCredentialRemediationRetryAt["tenant-a"] = time.Now().Add(-time.Second)
+	s.nativeCredentialRemediationMu.Unlock()
+	if s.nativeCredentialRemediationBackoff("tenant-a") {
 		t.Fatal("an expired delay still reports backoff")
 	}
-	s.nativePrivilegeRetireMu.Lock()
-	attempts = s.nativePrivilegeRetireFailures["tenant-a"]
-	s.nativePrivilegeRetireMu.Unlock()
+	s.nativeCredentialRemediationMu.Lock()
+	attempts = s.nativeCredentialRemediationFailures["tenant-a"]
+	s.nativeCredentialRemediationMu.Unlock()
 	if attempts != 11 {
 		t.Fatalf("attempt count after an expired delay = %d, want 11", attempts)
 	}
-	s.recordNativePrivilegeRetireFailure("tenant-a")
-	s.nativePrivilegeRetireMu.Lock()
-	retryAt = s.nativePrivilegeRetireRetryAt["tenant-a"]
-	s.nativePrivilegeRetireMu.Unlock()
-	if delay := time.Until(retryAt); delay < nativePrivilegeRetireMaxBackoff-time.Minute {
-		t.Fatalf("retry delay %s restarted below the cap %s", delay, nativePrivilegeRetireMaxBackoff)
+	s.recordNativeCredentialRemediationFailure("tenant-a")
+	s.nativeCredentialRemediationMu.Lock()
+	retryAt = s.nativeCredentialRemediationRetryAt["tenant-a"]
+	s.nativeCredentialRemediationMu.Unlock()
+	if delay := time.Until(retryAt); delay < nativeCredentialRemediationMaxBackoff-time.Minute {
+		t.Fatalf("retry delay %s restarted below the cap %s", delay, nativeCredentialRemediationMaxBackoff)
 	}
-	s.clearNativePrivilegeRetireFailure("tenant-a")
-	if s.nativePrivilegeRetireBackoff("tenant-a") {
+	s.clearNativeCredentialRemediationFailure("tenant-a")
+	if s.nativeCredentialRemediationBackoff("tenant-a") {
 		t.Fatal("retry state survived a success")
 	}
-	s.nativePrivilegeRetireMu.Lock()
-	attempts = s.nativePrivilegeRetireFailures["tenant-a"]
-	s.nativePrivilegeRetireMu.Unlock()
+	s.nativeCredentialRemediationMu.Lock()
+	attempts = s.nativeCredentialRemediationFailures["tenant-a"]
+	s.nativeCredentialRemediationMu.Unlock()
 	if attempts != 0 {
 		t.Fatalf("attempt count survived a success: %d", attempts)
 	}
@@ -76,65 +76,53 @@ func TestNativePrivilegeRetireRetryBackoff(t *testing.T) {
 
 // One gateway endpoint can front several instances, so the endpoint alone must not fold
 // two instances into one dedupe key: the account prefix names the instance.
-func TestNativePrivilegeRetireClusterKey(t *testing.T) {
-	a := &meta.Tenant{DBHost: "gateway01.example", DBPort: 4000, DBUser: "insta.tdc_fs_sys"}
-	b := &meta.Tenant{DBHost: "gateway01.example", DBPort: 4000, DBUser: "instb.tdc_fs_sys"}
-	same := &meta.Tenant{DBHost: "gateway01.example", DBPort: 4000, DBUser: "insta.tdc_fs_sys"}
-	if nativePrivilegeRetireClusterKey(a) == nativePrivilegeRetireClusterKey(b) {
-		t.Fatal("two instances behind one endpoint share a dedupe key")
-	}
-	if nativePrivilegeRetireClusterKey(a) != nativePrivilegeRetireClusterKey(same) {
-		t.Fatal("tenants on the same instance do not share a dedupe key")
-	}
-	if nativePrivilegeRetireClusterKey(nil) != "" || nativePrivilegeRetireClusterKey(&meta.Tenant{DBUser: "x"}) != "" {
-		t.Fatal("a tenant without an endpoint got a cluster key")
-	}
-}
-
 // The scan visits every page, decides from each stored record, and records a retry for
 // a tenant whose database cannot be reached while leaving the others alone.
-func TestNativePrivilegeRetireScanPagesAndClassifies(t *testing.T) {
+func TestNativeCredentialRemediationScanPagesAndClassifies(t *testing.T) {
 	rt := newObjectGCTestRuntime(t)
 	ctx := context.Background()
 	// One tenant per page forces the cursor path.
-	oldBatch := nativePrivilegeRetireBatchSize
-	nativePrivilegeRetireBatchSize = 1
-	t.Cleanup(func() { nativePrivilegeRetireBatchSize = oldBatch })
+	oldBatch := nativeCredentialRemediationBatchSize
+	nativeCredentialRemediationBatchSize = 1
+	t.Cleanup(func() { nativeCredentialRemediationBatchSize = oldBatch })
 
 	// A native tenant whose restricted account cannot be reached: the remediation
 	// fails and schedules a retry.
-	rt.insertPrivilegeRetireTenant(t, "native-unreachable", tenant.ProviderTiDBCloudNative, "t1.tdc_fs_sys", "127.0.0.1", 1)
+	rt.insertRemediationTenant(t, "native-unreachable", tenant.ProviderTiDBCloudNative, "t1.tdc_fs_sys", "127.0.0.1", 1)
 	// A non-native tenant and a native tenant still naming the root principal are
 	// both skipped without a retry entry.
-	rt.insertPrivilegeRetireTenant(t, "tidb-zero", tenant.ProviderTiDBZero, "t2.root", "127.0.0.1", 1)
-	rt.insertPrivilegeRetireTenant(t, "native-root", tenant.ProviderTiDBCloudNative, "t3.root", "127.0.0.1", 1)
+	rt.insertRemediationTenant(t, "tidb-zero", tenant.ProviderTiDBZero, "t2.root", "127.0.0.1", 1)
+	rt.insertRemediationTenant(t, "native-root", tenant.ProviderTiDBCloudNative, "t3.root", "127.0.0.1", 1)
 	// A suspended tenant keeps its grant too, and is now behind its own cursor in a
 	// later pass, so the retry only appears if that pass reads suspended records.
-	rt.insertPrivilegeRetireTenantAt(t, meta.TenantSuspended, "native-suspended", tenant.ProviderTiDBCloudNative, "t4.tdc_fs_sys", rt.dbPass, "127.0.0.1", 1)
+	rt.insertRemediationTenantAt(t, meta.TenantSuspended, "native-suspended", tenant.ProviderTiDBCloudNative, "t4.tdc_fs_sys", rt.dbPass, "127.0.0.1", 1)
 
 	srv := &Server{meta: rt.meta, pool: rt.pool}
-	srv.retireNativeTenantVariablesPrivilege(ctx)
+	srv.remediateNativeTenantCredentials(ctx)
 
-	if !srv.nativePrivilegeRetireBackoff("native-unreachable") {
+	if !srv.nativeCredentialRemediationBackoff("native-unreachable") {
 		t.Fatal("an unreachable native tenant did not schedule a retry")
 	}
-	if srv.nativePrivilegeRetireRecentlyDone("native-unreachable") {
+	if srv.nativeCredentialRemediationRecentlyDone("native-unreachable") {
 		t.Fatal("a failed retire was memoized as done")
 	}
-	if !srv.nativePrivilegeRetireBackoff("native-suspended") {
+	if !srv.nativeCredentialRemediationBackoff("native-suspended") {
 		t.Fatal("a suspended tenant was not scanned")
 	}
 	for _, id := range []string{"tidb-zero", "native-root"} {
-		if srv.nativePrivilegeRetireBackoff(id) {
+		if srv.nativeCredentialRemediationBackoff(id) {
 			t.Fatalf("skipped tenant %s scheduled a retry", id)
 		}
 	}
 }
 
-// A native tenant whose legacy grant can actually be revoked loses it, and keeps its
-// own-schema privileges. This uses the real cluster root principal (the test DSN) as
-// the account the stored credential authenticates as.
-func TestNativePrivilegeRetireRevokesLegacyGrant(t *testing.T) {
+// A native tenant provisioned by the legacy setup has two problems: its restricted account
+// holds the cluster-wide grant, and its password is the cluster root password. One pass
+// must fix both — strip the grant, rotate the account onto the derived per-tenant password,
+// and persist that password so the tenant can still connect — while keeping the
+// own-schema privileges. This uses a real cluster root principal to stand in for the
+// account the stored credential authenticates as.
+func TestNativeCredentialRemediationRotatesLegacyCredential(t *testing.T) {
 	rt := newObjectGCTestRuntime(t)
 	if rt.dbUser != "root" {
 		t.Skip("needs the test TiDB root account to create the tenant principals")
@@ -184,6 +172,10 @@ func TestNativePrivilegeRetireRevokesLegacyGrant(t *testing.T) {
 				t.Errorf("cleanup: drop role: %v", err)
 			}
 		}
+		// The pass creates the restricted account itself, so clean it up too.
+		if _, err := admin.ExecContext(ctx, "DROP USER IF EXISTS '"+tenantUser+"'@'%'"); err != nil {
+			t.Errorf("cleanup: drop tenant principal: %v", err)
+		}
 		if principalCreated {
 			if _, err := admin.ExecContext(ctx, "DROP USER IF EXISTS '"+rootUser+"'@'%'"); err != nil {
 				t.Errorf("cleanup: drop privileged principal: %v", err)
@@ -196,6 +188,10 @@ func TestNativePrivilegeRetireRevokesLegacyGrant(t *testing.T) {
 	}{
 		{"CREATE USER '" + rootUser + "'@'%' IDENTIFIED BY '" + password + "'", &principalCreated},
 		{"GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO '" + rootUser + "'@'%' WITH GRANT OPTION", nil},
+		// The rotation runs the full tenant setup through this principal — create the role,
+		// create the account, grant the role and switch its password — so it needs the
+		// global privileges a real cluster root has.
+		{"GRANT ALL PRIVILEGES ON *.* TO '" + rootUser + "'@'%' WITH GRANT OPTION", nil},
 		// The remediation DSN names the tenant database, so the root principal needs
 		// access to it as a real cluster root would.
 		{"GRANT ALL ON `" + rt.dbName + "`.* TO '" + rootUser + "'@'%'", nil},
@@ -212,21 +208,16 @@ func TestNativePrivilegeRetireRevokesLegacyGrant(t *testing.T) {
 		}
 	}
 
-	rt.insertPrivilegeRetireTenantWithPassword(t, "native-revocable", tenant.ProviderTiDBCloudNative, tenantUser, password)
-	// A second tenant on the same cluster: the revoke is cluster-global, so the pass must
-	// retire it without opening its own connection.
-	rt.insertPrivilegeRetireTenantWithPassword(t, "native-sibling", tenant.ProviderTiDBCloudNative, tenantUser, password)
+	rt.insertRemediationTenantWithPassword(t, "native-revocable", tenant.ProviderTiDBCloudNative, tenantUser, password)
 
 	srv := &Server{meta: rt.meta, pool: rt.pool}
-	srv.retireNativeTenantVariablesPrivilege(ctx)
+	srv.remediateNativeTenantCredentials(ctx)
 
-	if srv.nativePrivilegeRetireBackoff("native-revocable") {
-		t.Fatal("the revoke failed and scheduled a retry")
+	if srv.nativeCredentialRemediationBackoff("native-revocable") {
+		t.Fatal("the rotation failed and scheduled a retry")
 	}
-	for _, id := range []string{"native-revocable", "native-sibling"} {
-		if !srv.nativePrivilegeRetireRecentlyDone(id) {
-			t.Fatalf("%s was not memoized after the cluster-wide revoke", id)
-		}
+	if !srv.nativeCredentialRemediationRecentlyDone("native-revocable") {
+		t.Fatal("the tenant was not memoized after the rotation")
 	}
 	grants := roleGrants(t, admin, role)
 	if containsGrant(grants, "SYSTEM_VARIABLES_ADMIN") {
@@ -235,6 +226,36 @@ func TestNativePrivilegeRetireRevokesLegacyGrant(t *testing.T) {
 	if !containsGrant(grants, "SELECT") {
 		t.Fatalf("own-schema grant was lost: %v", grants)
 	}
+
+	// The account must no longer accept the cluster root password, and the credential the
+	// pass persisted must work: the tenant would otherwise be locked out of its database.
+	rotated := rt.tenantCredential(t, "native-revocable")
+	if rotated == password {
+		t.Fatal("the tenant account still uses the cluster root password")
+	}
+	if len(rotated) != 32 {
+		t.Fatalf("derived credential = %q, want a 32-character derived secret", rotated)
+	}
+	if err := pingAs(t, rt, tenantUser, password); err == nil {
+		t.Fatal("the rotated account still accepts the cluster root password")
+	}
+	if err := pingAs(t, rt, tenantUser, rotated); err != nil {
+		t.Fatalf("the persisted credential does not authenticate: %v", err)
+	}
+}
+
+// pingAs dials the test instance as one principal, proving which password the database
+// actually accepts.
+func pingAs(t *testing.T, rt *objectGCTestRuntime, user, password string) error {
+	t.Helper()
+	db, err := sql.Open("mysql", tenantDSN(user, password, rt.dbHost, rt.dbPort, rt.dbName, false, tenant.ProviderTiDBCloudNative))
+	if err != nil {
+		return err
+	}
+	defer func() { _ = db.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return db.PingContext(ctx)
 }
 
 func roleGrants(t *testing.T, db *sql.DB, role string) []string {
@@ -267,22 +288,37 @@ func containsGrant(grants []string, want string) bool {
 	return false
 }
 
-// insertPrivilegeRetireTenant records an active tenant whose stored credential is
+// tenantCredential decrypts the tenant row's stored database password, which is what the
+// tenant runtime would dial with after the pass persisted a rotated credential.
+func (rt *objectGCTestRuntime) tenantCredential(t *testing.T, id string) string {
+	t.Helper()
+	stored, err := rt.meta.GetTenant(context.Background(), id)
+	if err != nil {
+		t.Fatalf("read tenant %s: %v", id, err)
+	}
+	plain, err := rt.pool.Decrypt(context.Background(), stored.DBPasswordCipher)
+	if err != nil {
+		t.Fatalf("decrypt tenant %s credential: %v", id, err)
+	}
+	return string(plain)
+}
+
+// insertRemediationTenant records an active tenant whose stored credential is
 // encrypted with the test pool, so the pass can decrypt it like a real row.
-func (rt *objectGCTestRuntime) insertPrivilegeRetireTenant(t *testing.T, id string, provider, dbUser, host string, port int) {
+func (rt *objectGCTestRuntime) insertRemediationTenant(t *testing.T, id string, provider, dbUser, host string, port int) {
 	t.Helper()
-	rt.insertPrivilegeRetireTenantAt(t, meta.TenantActive, id, provider, dbUser, rt.dbPass, host, port)
+	rt.insertRemediationTenantAt(t, meta.TenantActive, id, provider, dbUser, rt.dbPass, host, port)
 }
 
-func (rt *objectGCTestRuntime) insertPrivilegeRetireTenantWithPassword(t *testing.T, id string, provider, dbUser, password string) {
+func (rt *objectGCTestRuntime) insertRemediationTenantWithPassword(t *testing.T, id string, provider, dbUser, password string) {
 	t.Helper()
-	rt.insertPrivilegeRetireTenantAt(t, meta.TenantActive, id, provider, dbUser, password, rt.dbHost, rt.dbPort)
+	rt.insertRemediationTenantAt(t, meta.TenantActive, id, provider, dbUser, password, rt.dbHost, rt.dbPort)
 }
 
-// insertPrivilegeRetireTenantAt stores the status and endpoint the caller names, so a
+// insertRemediationTenantAt stores the status and endpoint the caller names, so a
 // test can point a tenant at a closed port instead of silently inheriting the live
 // instance.
-func (rt *objectGCTestRuntime) insertPrivilegeRetireTenantAt(t *testing.T, status meta.TenantStatus, id string, provider, dbUser, password, host string, port int) {
+func (rt *objectGCTestRuntime) insertRemediationTenantAt(t *testing.T, status meta.TenantStatus, id string, provider, dbUser, password, host string, port int) {
 	t.Helper()
 	ctx := context.Background()
 	cipher, err := rt.pool.Encrypt(ctx, []byte(password))

@@ -23,6 +23,14 @@ type outboxTenantForgetter interface {
 	ForgetTenant(tenantID string)
 }
 
+// outboxTenantCredentialInvalidator drops the tenant's cached database credential so the
+// next acquire re-reads the row and dials with the password the database now accepts.
+// Dropping the cached backend is the only way a peer notices a rotation: its connections
+// were authenticated with the previous password and new ones would be refused.
+type outboxTenantCredentialInvalidator interface {
+	InvalidateTenantCredential(tenantID string)
+}
+
 const (
 	// defaultTenantOutboxPollInterval is the poller's tick interval. At 200ms,
 	// cross-pod work delivery is bounded to ~200ms. The target is the
@@ -212,8 +220,18 @@ func (p *tenantOutboxPoller) pollOnce(ctx context.Context) {
 
 // dispatch sends a single outbox row to the right consumer based on work_mask.
 func (p *tenantOutboxPoller) dispatch(ctx context.Context, row meta.TenantNotifyRow) {
-	if row.WorkMask&WorkAPIKeyCacheCleanup != 0 && p.metaStore != nil {
-		p.metaStore.InvalidateAPIKeyResolveCacheForTenant(row.TenantID)
+	if row.WorkMask&WorkAPIKeyCacheCleanup != 0 {
+		if p.metaStore != nil {
+			p.metaStore.InvalidateAPIKeyResolveCacheForTenant(row.TenantID)
+		}
+	}
+	if row.WorkMask&WorkTenantCredential != 0 {
+		if p.metaStore != nil {
+			p.metaStore.InvalidateAPIKeyResolveCacheForTenant(row.TenantID)
+		}
+		if invalidator, ok := p.worker.(outboxTenantCredentialInvalidator); ok {
+			invalidator.InvalidateTenantCredential(row.TenantID)
+		}
 	}
 	if row.WorkMask&WorkMetricsCleanup != 0 {
 		metrics.DeleteTenantCounters(row.TenantID)

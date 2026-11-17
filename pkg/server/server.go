@@ -262,12 +262,12 @@ type Server struct {
 	leaderWorkerMu       sync.Mutex
 	leaderWorkersStarted bool
 	leaderWorkerStopDone chan struct{}
-	// nativePrivilegeRetire* carry per-tenant retry state for the legacy-grant
+	// nativeCredentialRemediation* carry per-tenant retry state for the legacy-grant
 	// cleanup, so a failing tenant is retried with backoff instead of on every pass.
-	nativePrivilegeRetireMu       sync.Mutex
-	nativePrivilegeRetireFailures map[string]int
-	nativePrivilegeRetireRetryAt  map[string]time.Time
-	nativePrivilegeRetireDone     map[string]time.Time
+	nativeCredentialRemediationMu       sync.Mutex
+	nativeCredentialRemediationFailures map[string]int
+	nativeCredentialRemediationRetryAt  map[string]time.Time
+	nativeCredentialRemediationDone     map[string]time.Time
 	// replayWorker and expirySweepWorker are leader-gated central quota
 	// workers owned by the server (single callback owner). Started in
 	// startLeaderWorkers and stopped in stopLeaderWorkers so they follow
@@ -1024,15 +1024,15 @@ func (s *Server) startLeaderWorkers() {
 	// change.
 	if s.meta != nil && s.pool != nil {
 		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
-			ticker := time.NewTicker(nativePrivilegeRetireInterval)
+			ticker := time.NewTicker(nativeCredentialRemediationInterval)
 			defer ticker.Stop()
-			s.retireNativeTenantVariablesPrivilege(workerCtx)
+			s.remediateNativeTenantCredentials(workerCtx)
 			for {
 				select {
 				case <-workerCtx.Done():
 					return
 				case <-ticker.C:
-					s.retireNativeTenantVariablesPrivilege(workerCtx)
+					s.remediateNativeTenantCredentials(workerCtx)
 				}
 			}
 		})

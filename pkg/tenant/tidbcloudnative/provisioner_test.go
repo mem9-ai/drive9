@@ -2,6 +2,7 @@ package tidbcloudnative
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -2477,9 +2478,11 @@ func TestSystemUserStatements(t *testing.T) {
 		"REVOKE SYSTEM_VARIABLES_ADMIN ON *.* FROM 'tdc_fs_admin'",
 		"GRANT CREATE, ALTER, DROP, INDEX, SELECT, INSERT, UPDATE, DELETE ON `tidbcloud_fs`.* TO 'tdc_fs_admin'",
 		"CREATE USER IF NOT EXISTS '22ipQWBXXq2wN2S.tdc_fs_sys' IDENTIFIED BY 'pass123'",
-		"ALTER USER '22ipQWBXXq2wN2S.tdc_fs_sys' IDENTIFIED BY 'pass123'",
 		"GRANT 'tdc_fs_admin' TO '22ipQWBXXq2wN2S.tdc_fs_sys'",
 		"SET DEFAULT ROLE 'tdc_fs_admin' TO '22ipQWBXXq2wN2S.tdc_fs_sys'",
+		// The credential-invalidating statement goes last so everything before it is
+		// retryable with the previous password still valid.
+		"ALTER USER '22ipQWBXXq2wN2S.tdc_fs_sys' IDENTIFIED BY 'pass123'",
 	}
 	if len(got) != len(want) {
 		t.Fatalf("statement count = %d, want %d: %#v", len(got), len(want), got)
@@ -3159,11 +3162,61 @@ func TestSystemUsernameForCurrentRoundTrips(t *testing.T) {
 // Retiring the legacy privilege is a no-op for a DSN that already names the root
 // principal (nothing to remediate) and refuses a DSN without a password instead of
 // dialling with an empty one.
-func TestRetireLegacySystemUserPrivilegeDSNHandling(t *testing.T) {
-	if err := RetireLegacySystemUserPrivilege(t.Context(), "22ipQWBXXq2wN2S.root@tcp(127.0.0.1:1)/db"); err != nil {
-		t.Fatalf("root-principal DSN: %v", err)
+
+// The restricted account's password must be derived from the cluster root secret and the
+// tenant: distinct per tenant so one leaked credential is not another tenant's, and stable
+// so a retry or a second finalizer rotates to the same value instead of racing.
+func TestDeriveSystemUserPassword(t *testing.T) {
+	const root = "cluster-root-secret"
+	got := deriveSystemUserPassword(root, "tenant-a")
+	if got == root {
+		t.Fatal("the derived credential is the cluster root password")
 	}
-	if err := RetireLegacySystemUserPrivilege(t.Context(), "22ipQWBXXq2wN2S.tdc_fs_sys@tcp(127.0.0.1:1)/db"); err == nil {
-		t.Fatal("a DSN without a password was accepted")
+	if len(got) != 32 {
+		t.Fatalf("derived credential = %q, want a 32-character value", got)
+	}
+	if _, err := hex.DecodeString(got); err != nil {
+		t.Fatalf("derived credential %q is not hex: %v", got, err)
+	}
+	if again := deriveSystemUserPassword(root, "tenant-a"); again != got {
+		t.Fatalf("same secret and tenant derived %q then %q", got, again)
+	}
+	if other := deriveSystemUserPassword(root, "tenant-b"); other == got {
+		t.Fatal("two tenants derived the same password")
+	}
+	if otherRoot := deriveSystemUserPassword("another-root", "tenant-a"); otherRoot == got {
+		t.Fatal("a different root secret derived the same password")
+	}
+}
+
+// EnsureSystemUser refuses to set anything up without a tenant to derive the password from,
+// and never falls back to the cluster root password when the stored DSN has none.
+func TestEnsureSystemUserRejectsIncompleteInput(t *testing.T) {
+	p := &Provisioner{}
+	if _, _, err := p.EnsureSystemUser(context.Background(), "u1.root:@tcp(127.0.0.1:4000)/tenant_db", "tenant-a"); err == nil || !strings.Contains(err.Error(), "password is empty") {
+		t.Fatalf("EnsureSystemUser with an empty password error = %v, want a refusal", err)
+	}
+	if _, _, err := p.EnsureSystemUser(context.Background(), "u1.root:rootpass@tcp(127.0.0.1:4000)/tenant_db", "  "); err == nil || !strings.Contains(err.Error(), "tenant id is required") {
+		t.Fatalf("EnsureSystemUser without a tenant id error = %v, want a refusal", err)
+	}
+}
+
+// Rotating through the root principal has to distinguish "this account is already rotated"
+// from "the remediation failed": the first is a skip, the second must be retried.
+func TestRotateLegacySystemUserCredentialClassifies(t *testing.T) {
+	if _, _, err := RotateLegacySystemUserCredential(context.Background(), "u1.root:rootpass@tcp(127.0.0.1:4000)/tenant_db", "tenant-a"); err != nil {
+		t.Fatalf("a DSN still naming the root principal must be left to provisioning, got %v", err)
+	}
+	if !isAccessDeniedError(&mysql.MySQLError{Number: 1045, Message: "Access denied"}) {
+		t.Fatal("HTTP 1045 is an access-denied refusal")
+	}
+	if !isAccessDeniedError(&mysql.MySQLError{Number: 1044, Message: "Access denied"}) {
+		t.Fatal("1044 is an access-denied refusal")
+	}
+	if isAccessDeniedError(&mysql.MySQLError{Number: 1105, Message: "unavailable"}) {
+		t.Fatal("an availability failure was classified as access denied, so a retry would be skipped")
+	}
+	if isAccessDeniedError(errors.New("dial tcp: connection refused")) {
+		t.Fatal("a transport failure was classified as access denied, so a retry would be skipped")
 	}
 }

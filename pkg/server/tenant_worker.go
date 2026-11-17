@@ -304,6 +304,19 @@ func (m *tenantWorkerManager) ForgetTenant(tenantID string) {
 	m.mu.Unlock()
 }
 
+// InvalidateTenantCredential drops everything this process caches about a tenant's database
+// credential: the worker's per-tenant bookkeeping and the pooled backend whose connections
+// were opened with the previous password. The next acquire re-reads the tenant row.
+func (m *tenantWorkerManager) InvalidateTenantCredential(tenantID string) {
+	if m == nil || tenantID == "" {
+		return
+	}
+	m.ForgetTenant(tenantID)
+	if m.pool != nil {
+		m.pool.Invalidate(tenantID)
+	}
+}
+
 func mergeKickOrgID(current, next string) string {
 	next = strings.TrimSpace(next)
 	if next != "" {

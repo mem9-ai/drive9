@@ -105,6 +105,52 @@ func TestUpdateTenantDBCredentialIfComparesPreviousUser(t *testing.T) {
 	if dbUser != "u1.tdc_fs_sys" || string(passCipher) != "system-cipher" {
 		t.Fatalf("tenant credential = %q/%q, want system credential", dbUser, passCipher)
 	}
+
+	// A peer keeps the previous credential in its resolved tenant row and in open
+	// connections, so the update has to signal every pod. The row is written in the same
+	// transaction as the new credential: a commit that skipped it would leave peers
+	// dialling with a password the database no longer accepts.
+	rows, err := s.ListTenantNotifySince(context.Background(), 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signalled := false
+	for _, row := range rows {
+		if row.TenantID == "credential-cas-tenant" && row.WorkMask&TenantNotifyWorkTenantCredential != 0 {
+			signalled = true
+		}
+	}
+	if !signalled {
+		t.Fatalf("credential update enqueued no cache-invalidation signal: %#v", rows)
+	}
+	// The failed CAS must not have signalled anything, or a peer would drop a healthy
+	// backend for a credential that did not change.
+	var before uint64
+	for _, row := range rows {
+		if row.TenantID == "credential-cas-tenant" {
+			before++
+		}
+	}
+	stale, err := s.UpdateTenantDBCredentialIf(context.Background(), "credential-cas-tenant", "u1.root", "u1.tdc_fs_sys", []byte("other-cipher"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stale {
+		t.Fatal("a stale CAS updated the credential")
+	}
+	rows, err = s.ListTenantNotifySince(context.Background(), 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var after uint64
+	for _, row := range rows {
+		if row.TenantID == "credential-cas-tenant" {
+			after++
+		}
+	}
+	if after != before {
+		t.Fatalf("a no-op credential update signalled a change: %d signals, want %d", after, before)
+	}
 }
 
 func TestInsertAndResolveByAPIKeyHash(t *testing.T) {

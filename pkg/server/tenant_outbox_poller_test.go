@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -147,6 +148,40 @@ func TestTenantOutboxPollerAPIKeyCacheCleanupIsBroadcastWithoutDeletingMetrics(t
 	if !strings.Contains(recorder.Body.String(), rt.tenantID) {
 		t.Fatalf("API-key-only cache cleanup deleted live tenant metrics: %s", recorder.Body.String())
 	}
+}
+
+// A rotated database credential invalidates the same caches an API-key revocation does, and
+// additionally the pooled backend: its connections were authenticated with the retired
+// password, so a peer that keeps them dials with a credential the database no longer accepts.
+func TestTenantOutboxPollerCredentialCleanupEvictsTenantCredential(t *testing.T) {
+	rt := newTenantDeleteRuntime(t, tenant.ProviderTiDBZero, meta.APIKeyScopeKindOwner)
+	ctx := context.Background()
+
+	k := &credentialKicker{}
+	p := newTenantOutboxPoller(rt.meta, newEventBuses(), k, func(string) bool { return false }, "pod1", 0, 0)
+	p.dispatch(ctx, meta.TenantNotifyRow{
+		ID:        1,
+		TenantID:  rt.tenantID,
+		WorkMask:  WorkTenantCredential,
+		CreatedAt: time.Now(),
+	})
+
+	if !slices.Contains(k.invalidated, rt.tenantID) {
+		t.Fatalf("credential cleanup did not evict the tenant backend: %v", k.invalidated)
+	}
+	if len(k.kicks) != 0 {
+		t.Fatalf("credential cleanup kicked tenant work: %#v", k.kicks)
+	}
+}
+
+// credentialKicker is a worker that implements the invalidation hook the poller looks for.
+type credentialKicker struct {
+	mockKicker
+	invalidated []string
+}
+
+func (k *credentialKicker) InvalidateTenantCredential(tenantID string) {
+	k.invalidated = append(k.invalidated, tenantID)
 }
 
 func TestTenantOutboxPollerShardRejects(t *testing.T) {
