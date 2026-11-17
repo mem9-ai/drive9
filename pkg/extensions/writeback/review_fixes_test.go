@@ -11,10 +11,14 @@ import (
 	"testing"
 	"time"
 
+	gofuse "github.com/hanwen/go-fuse/v2/fuse"
+
 	"github.com/mem9-ai/drive9/internal/testbackend"
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/extensions/core"
+	"github.com/mem9-ai/drive9/pkg/extensions/extent"
 	"github.com/mem9-ai/drive9/pkg/fs"
+	"github.com/mem9-ai/drive9/pkg/fusecomp/dircache"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/staging"
 )
 
@@ -417,5 +421,144 @@ func TestMigratedExplicitChmodForbiddenPropagatesError(t *testing.T) {
 	// Subsequent Sync must not be stranded by the rejected explicit chmod.
 	if serr := h.Sync(context.Background()); serr != nil {
 		t.Fatalf("Sync after denied explicit chmod: %v", serr)
+	}
+}
+
+// Finding #12 (full chain: extent -> writeback -> core + dircache):
+// Cache a negative lookup for /app.db and /zero.db, let another client create
+// nonempty classic or multipart occupants at those names, then open them with
+// kernel O_CREAT|O_RDWR|O_TRUNC and fsync (both after writing bytes and as a
+// 0-byte truncate-only fsync). Both must durably replace the remote classic
+// objects rather than failing needsFreshIdentity or 409 Conflict.
+func TestTruncatingKernelCreateAfterCachedNegativeLookupReplacesClassicAndMultipart(t *testing.T) {
+	b := testbackend.NewBackend()
+	ts := httptest.NewServer(b)
+	defer ts.Close()
+
+	cl := client.New(ts.URL, "")
+	bus := fs.NewEventBus()
+	eng := extent.NewEngine(extent.EngineConfig{
+		Client:     cl,
+		RemoteRoot: "/",
+		CacheDir:   t.TempDir(),
+		CacheSize:  32 << 20,
+	})
+	t.Cleanup(func() { _ = eng.Bridge.Shutdown() })
+
+	patterns := []string{"*.db", "*.db3", "*.sqlite", "*.sqlite3", "*.db-wal", "*.db-shm", "*.db-journal", "*.db-mj*"}
+	extPlane := extent.New(extent.Options{
+		Engine:    eng,
+		Threshold: 1,
+		Patterns:  patterns,
+		Events:    bus,
+	})
+
+	wbCache, err := staging.NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wb, err := New(Options{
+		Policy:         PolicyWriteBack,
+		SyncMode:       "strict",
+		Client:         cl,
+		Events:         bus,
+		WriteCache:     wbCache,
+		ExtentTakeover: true,
+		ExtentMinSize:  4 << 20,
+		ExtentPatterns: patterns,
+		ExtentOpener:   extPlane,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = wb.Drain(context.Background()) })
+
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal.AttachEvents(bus)
+	dc := dircache.NewNamespaceCache(10*time.Second, 10*time.Second, 1000)
+	terminal.Attach(dc)
+	bus.On(fs.EventInvalidated, func(ev fs.Event) {
+		dc.Invalidate(ev.Path)
+	})
+
+	ch, err := fs.NewChain(extPlane, wb, terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	for _, p := range []string{"/app.db", "/zero.db", "/mp.db"} {
+		if _, lerr := ch.Dispatch(ctx, &fs.Op{Kind: fs.OpLookup, Path: p}); !fs.IsNotFound(lerr) {
+			t.Fatalf("initial Lookup(%s) = %v, want ENOENT", p, lerr)
+		}
+	}
+
+	// Foreign client creates classic and multipart occupants behind the cached negative lookups.
+	b.Seed("/app.db", []byte("FOREIGN-CLASSIC-APP-DB"))
+	b.Seed("/zero.db", []byte("FOREIGN-CLASSIC-TO-TRUNCATE"))
+	mpSeed := make([]byte, 6<<20)
+	for i := range mpSeed {
+		mpSeed[i] = byte('M')
+	}
+	b.Seed("/mp.db", mpSeed)
+
+	// 1. Classic occupant overwritten via O_CREAT|O_RDWR|O_TRUNC + Write + Sync.
+	resApp, err := ch.Dispatch(ctx, &fs.Op{
+		Kind: fs.OpCreate, Path: "/app.db",
+		Flags: uint32(syscall.O_CREAT | syscall.O_RDWR | syscall.O_TRUNC),
+		Mode:  0o644, HasMode: true, Kernel: &gofuse.CreateIn{},
+	})
+	if err != nil {
+		t.Fatalf("open /app.db: %v", err)
+	}
+	if err := resApp.Handle.Write(ctx, 0, []byte("REPLACED-CLASSIC")); err != nil {
+		t.Fatalf("write /app.db: %v", err)
+	}
+	if err := resApp.Handle.Sync(ctx); err != nil {
+		t.Fatalf("sync /app.db: %v", err)
+	}
+	_ = resApp.Handle.Release(ctx)
+	if node, ok := b.Node("/app.db"); !ok || string(node.Data) != "REPLACED-CLASSIC" {
+		t.Fatalf("remote /app.db = %q ok=%v, want %q", node.Data, ok, "REPLACED-CLASSIC")
+	}
+
+	// 2. Classic occupant truncated to 0 via O_CREAT|O_RDWR|O_TRUNC + Sync (no Write).
+	resZero, err := ch.Dispatch(ctx, &fs.Op{
+		Kind: fs.OpCreate, Path: "/zero.db",
+		Flags: uint32(syscall.O_CREAT | syscall.O_RDWR | syscall.O_TRUNC),
+		Mode:  0o644, HasMode: true, Kernel: &gofuse.CreateIn{},
+	})
+	if err != nil {
+		t.Fatalf("open /zero.db: %v", err)
+	}
+	if err := resZero.Handle.Sync(ctx); err != nil {
+		t.Fatalf("truncate-only sync /zero.db: %v", err)
+	}
+	_ = resZero.Handle.Release(ctx)
+	if node, ok := b.Node("/zero.db"); !ok || len(node.Data) != 0 {
+		t.Fatalf("remote /zero.db = %q ok=%v, want empty", node.Data, ok)
+	}
+
+	// 3. Large/multipart occupant replaced via O_CREAT|O_RDWR|O_TRUNC + Write + Sync.
+	resMP, err := ch.Dispatch(ctx, &fs.Op{
+		Kind: fs.OpCreate, Path: "/mp.db",
+		Flags: uint32(syscall.O_CREAT | syscall.O_RDWR | syscall.O_TRUNC),
+		Mode:  0o644, HasMode: true, Kernel: &gofuse.CreateIn{},
+	})
+	if err != nil {
+		t.Fatalf("open /mp.db: %v", err)
+	}
+	if err := resMP.Handle.Write(ctx, 0, []byte("REPLACED-MP")); err != nil {
+		t.Fatalf("write /mp.db: %v", err)
+	}
+	if err := resMP.Handle.Sync(ctx); err != nil {
+		t.Fatalf("sync /mp.db: %v", err)
+	}
+	_ = resMP.Handle.Release(ctx)
+	if node, ok := b.Node("/mp.db"); !ok || string(node.Data) != "REPLACED-MP" {
+		t.Fatalf("remote /mp.db = %q ok=%v, want %q", node.Data, ok, "REPLACED-MP")
 	}
 }

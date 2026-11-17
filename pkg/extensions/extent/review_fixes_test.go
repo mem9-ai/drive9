@@ -783,3 +783,158 @@ func TestNewSliceDiscardedIDsDoNotLeakStagingBudget(t *testing.T) {
 		})
 	}
 }
+
+// Finding #12 (truncating kernel CREATE): Opening an existing extent, classic,
+// or local-bridge file with O_CREAT|O_RDWR|O_TRUNC (without O_EXCL) under
+// default SQLite patterns or full extent mode must preserve its true layout and
+// CAS base so both write+Sync and 0-byte truncate-only Sync durably publish,
+// while non-matching bulk extract files still pay zero remote HEADs on this plane.
+func TestTruncatingKernelCreatePreservesExistingIdentityAndLocalInode(t *testing.T) {
+	var headHits sync.Map
+	f := newFakeV2(t)
+	f.setDir("/d", true)
+	f.setDir("/uz", true)
+	f.seedExtent(t, "/d/ext-write.db", "OLD-EXTENT-BYTES")
+	f.seedExtent(t, "/d/ext-zero.db", "OLD-EXTENT-TO-ZERO")
+	f.mu.Lock()
+	f.classic["/d/classic.db"] = "OLD-CLASSIC-BYTES"
+	f.ids["/d/classic.db"] = "res-c-db"
+	f.mu.Unlock()
+
+	origHandler := f.Config.Handler
+	f.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead && strings.HasPrefix(r.URL.Path, "/v1/fs") {
+			p := strings.TrimPrefix(r.URL.Path, "/v1/fs")
+			v, _ := headHits.LoadOrStore(p, new(atomic.Int32))
+			v.(*atomic.Int32).Add(1)
+		}
+		origHandler.ServeHTTP(w, r)
+	})
+
+	bus := fs.NewEventBus()
+	var invalidated sync.Map
+	bus.On(fs.EventInvalidated, func(ev fs.Event) {
+		invalidated.Store(ev.Path, true)
+	})
+
+	h := newTestHandler(t, f, 1) // hybrid default profile shape
+	h.opts.Patterns = []string{"*.db", "*.db3", "*.sqlite", "*.sqlite3", "*.db-wal", "*.db-shm", "*.db-journal", "*.db-mj*"}
+	h.opts.Events = bus
+	ctx := context.Background()
+
+	// 1. Existing classic /d/classic.db opened via O_CREAT|O_RDWR|O_TRUNC must
+	// decline to the classic plane carrying its observed OpenAttr + invalidation.
+	var passedOp *fs.Op
+	_, err := h.Do(ctx, &fs.Op{
+		Kind: fs.OpCreate, Path: "/d/classic.db",
+		Flags: syscall.O_CREAT | syscall.O_RDWR | syscall.O_TRUNC, Mode: 0o644, HasMode: true,
+		Kernel: &gofuse.CreateIn{}, Caller: fs.Caller{Pid: 1},
+	}, func(ctx context.Context, op *fs.Op) (fs.Result, error) {
+		passedOp = op
+		return fs.Result{Handle: &stubCore{}}, nil
+	})
+	if err != nil || passedOp == nil {
+		t.Fatalf("classic.db should pass through to classic plane: passedOp=%v err=%v", passedOp, err)
+	}
+	if passedOp.OpenAttr == nil || passedOp.OpenAttr.Rev <= 0 || passedOp.OpenAttr.Size != int64(len("OLD-CLASSIC-BYTES")) {
+		t.Fatalf("passed OpenAttr = %+v, want Rev>0 and Size=%d", passedOp.OpenAttr, len("OLD-CLASSIC-BYTES"))
+	}
+	if _, ok := invalidated.Load("/d/classic.db"); !ok {
+		t.Fatal("expected EventInvalidated for /d/classic.db")
+	}
+
+	// 2. Existing extent /d/ext-write.db opened via O_CREAT|O_RDWR|O_TRUNC:
+	// write + Sync durably replaces remote bytes.
+	extWriteRes, err := h.Do(ctx, &fs.Op{
+		Kind: fs.OpCreate, Path: "/d/ext-write.db",
+		Flags: syscall.O_CREAT | syscall.O_RDWR | syscall.O_TRUNC, Mode: 0o644, HasMode: true,
+		Kernel: &gofuse.CreateIn{}, Caller: fs.Caller{Pid: 1},
+	}, nil)
+	if err != nil {
+		t.Fatalf("open ext-write.db: %v", err)
+	}
+	if extWriteRes.Attr == nil || extWriteRes.Attr.Size != 0 {
+		t.Fatalf("truncated open attr = %+v, want Size=0", extWriteRes.Attr)
+	}
+	if err := extWriteRes.Handle.Write(ctx, 0, []byte("NEW-EXTENT")); err != nil {
+		t.Fatalf("write ext-write.db: %v", err)
+	}
+	if err := extWriteRes.Handle.Sync(ctx); err != nil {
+		t.Fatalf("sync ext-write.db: %v", err)
+	}
+	_ = extWriteRes.Handle.Release(ctx)
+	if got := f.contentOf("/d/ext-write.db"); got != "NEW-EXTENT" {
+		t.Fatalf("remote ext-write.db = %q, want %q", got, "NEW-EXTENT")
+	}
+
+	// 3. Existing extent /d/ext-zero.db opened via O_CREAT|O_RDWR|O_TRUNC:
+	// zero-byte truncate-only Sync durably truncates remote object to 0.
+	extZeroRes, err := h.Do(ctx, &fs.Op{
+		Kind: fs.OpCreate, Path: "/d/ext-zero.db",
+		Flags: syscall.O_CREAT | syscall.O_RDWR | syscall.O_TRUNC, Mode: 0o644, HasMode: true,
+		Kernel: &gofuse.CreateIn{}, Caller: fs.Caller{Pid: 1},
+	}, nil)
+	if err != nil {
+		t.Fatalf("open ext-zero.db: %v", err)
+	}
+	if err := extZeroRes.Handle.Sync(ctx); err != nil {
+		t.Fatalf("truncate-only sync ext-zero.db: %v", err)
+	}
+	_ = extZeroRes.Handle.Release(ctx)
+	if got := f.contentOf("/d/ext-zero.db"); got != "" {
+		t.Fatalf("remote ext-zero.db = %q, want empty", got)
+	}
+
+	// 4. Local unmaterialized engine inode /d/local.db: second kernel CREATE
+	// with O_CREAT|O_RDWR|O_TRUNC joins & truncates the local inode instead of
+	// allocating a competing fresh descriptor.
+	local1, err := h.Do(ctx, &fs.Op{
+		Kind: fs.OpCreate, Path: "/d/local.db",
+		Flags: syscall.O_CREAT | syscall.O_RDWR | syscall.O_TRUNC, Mode: 0o644, HasMode: true,
+		Kernel: &gofuse.CreateIn{}, Caller: fs.Caller{Pid: 1},
+	}, nil)
+	if err != nil {
+		t.Fatalf("create local.db fd1: %v", err)
+	}
+	if err := local1.Handle.Write(ctx, 0, []byte("DRAFT-LONG-PREFIX")); err != nil {
+		t.Fatalf("write local.db fd1: %v", err)
+	}
+	local2, err := h.Do(ctx, &fs.Op{
+		Kind: fs.OpCreate, Path: "/d/local.db",
+		Flags: syscall.O_CREAT | syscall.O_RDWR | syscall.O_TRUNC, Mode: 0o644, HasMode: true,
+		Kernel: &gofuse.CreateIn{}, Caller: fs.Caller{Pid: 1},
+	}, nil)
+	if err != nil {
+		t.Fatalf("re-create local.db fd2: %v", err)
+	}
+	if local2.Attr == nil || local2.Attr.Size != 0 {
+		t.Fatalf("fd2 attr = %+v, want Size=0", local2.Attr)
+	}
+	if err := local2.Handle.Write(ctx, 0, []byte("FINAL")); err != nil {
+		t.Fatalf("write local.db fd2: %v", err)
+	}
+	if err := local2.Handle.Sync(ctx); err != nil {
+		t.Fatalf("sync local.db fd2: %v", err)
+	}
+	_ = local2.Handle.Release(ctx)
+	_ = local1.Handle.Release(ctx)
+	if got := f.contentOf("/d/local.db"); got != "FINAL" {
+		t.Fatalf("remote local.db = %q, want %q", got, "FINAL")
+	}
+
+	// 5. Ordinary non-matching file (/uz/item.txt) with O_CREAT|O_WRONLY|O_TRUNC
+	// pays zero remote HEADs on the extent plane.
+	_, err = h.Do(ctx, &fs.Op{
+		Kind: fs.OpCreate, Path: "/uz/item.txt",
+		Flags: syscall.O_CREAT | syscall.O_WRONLY | syscall.O_TRUNC, Mode: 0o644, HasMode: true,
+		Kernel: &gofuse.CreateIn{}, Caller: fs.Caller{Pid: 1},
+	}, func(ctx context.Context, op *fs.Op) (fs.Result, error) {
+		return fs.Result{Handle: &stubCore{}}, nil
+	})
+	if err != nil {
+		t.Fatalf("non-matching create: %v", err)
+	}
+	if v, ok := headHits.Load("/uz/item.txt"); ok && v.(*atomic.Int32).Load() != 0 {
+		t.Fatalf("non-matching /uz/item.txt paid %d extent HEADs, want 0", v.(*atomic.Int32).Load())
+	}
+}

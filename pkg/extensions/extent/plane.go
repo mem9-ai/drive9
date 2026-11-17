@@ -384,8 +384,12 @@ func (h *Handler) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, e
 			return fs.Result{Attr: attr}, nil
 		}
 	case fs.OpCreate:
-		if res, err, claimed := h.tryClaimOpen(ctx, op); claimed {
+		res, nextOp, err, claimed := h.tryClaimOpen(ctx, op)
+		if claimed {
 			return res, err
+		}
+		if nextOp != nil {
+			op = nextOp
 		}
 	case fs.OpLink:
 		if res, err, handled := h.linkAfterLanding(ctx, op, next); handled {
@@ -616,15 +620,18 @@ func (h *Handler) TryClaimExistingOpen(ctx context.Context, op *fs.Op) (fs.Resul
 		return fs.Result{}, false, nil
 	}
 	defer h.lockPaths(op.Path)()
-	res, claimed, _, err := h.tryClaimExistingLocked(ctx, op, false)
+	res, claimed, _, _, err := h.tryClaimExistingLocked(ctx, op, false)
 	return res, claimed, err
 }
 
-// tryClaimOpen claims the op when the target is (or, in full mode, will
-// become) an engine file.
-func (h *Handler) tryClaimOpen(ctx context.Context, op *fs.Op) (fs.Result, error, bool) {
+// tryClaimOpen claims the op when the target is (or, in full/pattern-matched
+// mode, will become) an engine file. When an existing remote classic/multipart
+// occupant is discovered behind a kernel CREATE, nextOp carries its observed
+// attributes so downstream planes open/truncate the occupant instead of
+// treating the path as fresh.
+func (h *Handler) tryClaimOpen(ctx context.Context, op *fs.Op) (fs.Result, *fs.Op, error, bool) {
 	if h.opts.Engine == nil {
-		return fs.Result{}, nil, false
+		return fs.Result{}, nil, nil, false
 	}
 	// Serialized against retention for this name (unlink or rename-over):
 	// a claim straddling a retention boundary would attach a descriptor
@@ -633,36 +640,68 @@ func (h *Handler) tryClaimOpen(ctx context.Context, op *fs.Op) (fs.Result, error
 	// replaced while this claim waited, and a classic replacement must
 	// pass through to the classic plane, never ride the engine.
 	defer h.lockPaths(op.Path)()
-	// A truncating kernel CREATE can claim a fresh path without waiting on a
-	// remote StatLocal: bulk file extraction (unzip, tar, cp) passes O_CREAT|O_TRUNC.
-	// Non-truncating O_CREAT and O_EXCL probe first so any existing file's
-	// contents and layout (classic vs extent) are preserved before open returns.
-	freshKernelCreate := op.KernelCreate() && op.Flags&uint32(syscall.O_CREAT) != 0 &&
-		op.Flags&uint32(syscall.O_EXCL) == 0 && op.Flags&uint32(syscall.O_TRUNC) != 0
-	res, claimed, remoteClassic, err := h.tryClaimExistingLocked(ctx, op, freshKernelCreate)
+	claimsFresh := op.Flags&uint32(syscall.O_CREAT) != 0 &&
+		(h.opts.Threshold == 0 || h.claimsPattern(op.Path))
+	// Bulk extraction of ordinary non-matching files (unzip, tar, cp) passes
+	// O_CREAT|O_TRUNC without O_EXCL and stays on the classic plane, so this
+	// plane skips its remote StatLocal there. Whenever this plane WOULD claim a
+	// fresh create on the engine (full extent mode or an explicit/profile
+	// pattern such as SQLite), or on non-truncating / O_EXCL creates, we must
+	// probe remote state first so an occupant created behind a cached negative
+	// lookup keeps its true layout and CAS identity.
+	skipRemoteStat := op.KernelCreate() && op.Flags&uint32(syscall.O_CREAT) != 0 &&
+		op.Flags&uint32(syscall.O_EXCL) == 0 && op.Flags&uint32(syscall.O_TRUNC) != 0 &&
+		!claimsFresh
+	res, claimed, remoteClassic, nextOp, err := h.tryClaimExistingLocked(ctx, op, skipRemoteStat)
 	if claimed {
-		return res, err, true
+		return res, nil, err, true
 	}
 	if remoteClassic {
 		// An existing classic/multipart file must remain on the classic
-		// plane even when opened with O_CREAT (e.g. sqlite3 O_RDWR|O_CREAT
-		// or --profile extent).
-		return fs.Result{}, nil, false
+		// plane even when opened with O_CREAT (e.g. sqlite3 O_RDWR|O_CREAT,
+		// O_CREAT|O_TRUNC behind a cached negative lookup, or --profile extent).
+		return fs.Result{}, nextOp, nil, false
 	}
 	// Fresh path: claim creates in full JuiceFS mode, or when the path
 	// matches an explicit --extent / [extent] pattern; otherwise creation
 	// stays on the classic plane (hybrid promotion).
-	if op.Flags&syscall.O_CREAT == 0 || (h.opts.Threshold != 0 && !h.claimsPattern(op.Path)) {
-		return fs.Result{}, nil, false
+	if !claimsFresh {
+		return fs.Result{}, nil, nil, false
 	}
 	res, err = h.createOnEngine(ctx, op)
-	return res, err, true
+	return res, nil, err, true
+}
+
+func attrFromClassicStat(st *client.StatResult) fs.Attr {
+	mode := st.Mode & 0o7777
+	kind := fs.KindFile
+	if st.IsDir {
+		kind = fs.KindDir
+		if !st.HasMode {
+			mode = 0o755
+		}
+	} else if st.HasMode && st.Mode&uint32(syscall.S_IFMT) == uint32(syscall.S_IFLNK) {
+		kind = fs.KindSymlink
+		mode = uint32(syscall.S_IFLNK) | 0o777
+	} else if !st.HasMode {
+		mode = 0o644
+	}
+	return fs.Attr{
+		Kind:       kind,
+		Mode:       mode,
+		Size:       st.Size,
+		Rev:        st.Revision,
+		Mtime:      st.Mtime,
+		Nlink:      st.Nlink,
+		ResourceID: st.ResourceID,
+		ExtentIno:  st.ExtentIno,
+	}
 }
 
 // tryClaimExistingLocked claims opens for files that already exist locally in
 // the bridge or remotely with extent layout. Caller holds h.lockPaths(op.Path).
-func (h *Handler) tryClaimExistingLocked(ctx context.Context, op *fs.Op, freshKernelCreate bool) (fs.Result, bool, bool, error) {
-	if !freshKernelCreate {
+func (h *Handler) tryClaimExistingLocked(ctx context.Context, op *fs.Op, skipRemoteStat bool) (fs.Result, bool, bool, *fs.Op, error) {
+	if !skipRemoteStat {
 		st, err := h.opts.Engine.Bridge.StatLocal(ctx, op.Path)
 		if err == nil {
 			if st.ContentLayout != client.ContentLayoutExtent {
@@ -679,7 +718,7 @@ func (h *Handler) tryClaimExistingLocked(ctx context.Context, op *fs.Op, freshKe
 					h.opts.Engine.Bridge.MatchesEmptyPlaceholder(op.Path, st) {
 					if _, local := h.opts.Engine.Bridge.LocalResolve(op.Path); !local {
 						res, err := h.createOnEngine(ctx, op)
-						return res, true, false, err
+						return res, true, false, nil, err
 					}
 					// An open engine handle already owns this placeholder in the
 					// bridge (e.g. MaterializeEmpty during SQLite WAL startup);
@@ -687,60 +726,79 @@ func (h *Handler) tryClaimExistingLocked(ctx context.Context, op *fs.Op, freshKe
 					// second handle joins the existing inode without resetting
 					// freshCreate.
 				} else {
-					return fs.Result{}, false, true, nil
+					var nextOp *fs.Op
+					if op.KernelCreate() {
+						if h.opts.Events != nil {
+							h.opts.Events.Emit(fs.Event{Kind: fs.EventInvalidated, Path: op.Path})
+						}
+						if !st.IsDir && st.Revision > 0 {
+							cp := *op
+							attr := attrFromClassicStat(st)
+							cp.OpenAttr = &attr
+							nextOp = &cp
+						}
+					}
+					return fs.Result{}, false, true, nextOp, nil
 				}
 			} else {
 				if op.Flags&uint32(syscall.O_CREAT) != 0 && op.Flags&uint32(syscall.O_EXCL) != 0 {
-					return fs.Result{}, true, false, syscall.EEXIST
+					return fs.Result{}, true, false, nil, syscall.EEXIST
+				}
+				if op.KernelCreate() && h.opts.Events != nil {
+					h.opts.Events.Emit(fs.Event{Kind: fs.EventInvalidated, Path: op.Path})
 				}
 				handle, attr, errno := h.openExistingLocked(ctx, op.Path, op.Flags, op.Caller)
 				if errno != 0 {
-					return fs.Result{}, true, false, errno
+					return fs.Result{}, true, false, nil, errno
 				}
-				return fs.Result{Handle: handle, Attr: attr}, true, false, nil
+				return fs.Result{Handle: handle, Attr: attr}, true, false, nil, nil
 			}
 		}
 		if !client.IsNotFound(err) {
-			return fs.Result{}, false, false, nil
+			return fs.Result{}, false, false, nil, nil
 		}
 	}
 	// A file that exists ONLY in the bridge (a fresh engine create whose
 	// remote materialization is pending) opens through the engine even
-	// without O_CREAT — the classic plane would answer ENOENT for a
-	// successfully created, still-open file.
-	if !freshKernelCreate {
-		if ino, local := h.opts.Engine.Bridge.LocalResolve(op.Path); local {
-			if op.Flags&syscall.O_CREAT != 0 && op.Flags&syscall.O_EXCL != 0 {
-				// The folded OpCreate contract includes create/open flags: an
-				// exclusive create of an existing (still-local) file is EEXIST.
-				return fs.Result{}, true, false, syscall.EEXIST
+	// without O_CREAT — and a concurrent kernel CREATE (including O_TRUNC)
+	// must join/truncate that local inode rather than allocating a second
+	// unbound fresh create or falling through to the classic plane.
+	if ino, local := h.opts.Engine.Bridge.LocalResolve(op.Path); local {
+		if op.Flags&syscall.O_CREAT != 0 && op.Flags&syscall.O_EXCL != 0 {
+			// The folded OpCreate contract includes create/open flags: an
+			// exclusive create of an existing (still-local) file is EEXIST.
+			return fs.Result{}, true, false, nil, syscall.EEXIST
+		}
+		if op.Flags&syscall.O_TRUNC != 0 {
+			if errno := h.opts.Engine.VFS.Truncate(vfsCtx(op.Caller), ino, 0, 0, nil); errno != 0 {
+				return fs.Result{}, true, false, nil, errno
 			}
-			if op.Flags&syscall.O_TRUNC != 0 {
-				if errno := h.opts.Engine.VFS.Truncate(vfsCtx(op.Caller), ino, 0, 0, nil); errno != 0 {
-					return fs.Result{}, true, false, errno
-				}
-				if err := h.opts.Engine.Bridge.TruncateLocal(ctx, op.Path, 0); err != nil {
-					return fs.Result{}, true, false, err
-				}
+			if err := h.opts.Engine.Bridge.TruncateLocal(ctx, op.Path, 0); err != nil {
+				return fs.Result{}, true, false, nil, err
 			}
-			_, fh, errno := h.opts.Engine.VFS.Open(vfsCtx(op.Caller), ino, op.Flags)
-			if errno != 0 {
-				return fs.Result{}, true, false, errno
-			}
-			handle := h.register(op.Path, uint64(ino), fh, op.Caller)
-			attr := &fs.Attr{Kind: fs.KindFile, Nlink: 1}
-			if size, mode, ok := h.opts.Engine.Bridge.LocalView(ino); ok {
-				attr.Size = size
-				attr.Mode = mode
-			}
-			// The revision is the compare-and-set base for later writes.
+		}
+		_, fh, errno := h.opts.Engine.VFS.Open(vfsCtx(op.Caller), ino, op.Flags)
+		if errno != 0 {
+			return fs.Result{}, true, false, nil, errno
+		}
+		handle := h.register(op.Path, uint64(ino), fh, op.Caller)
+		attr := &fs.Attr{Kind: fs.KindFile, Nlink: 1}
+		if size, mode, ok := h.opts.Engine.Bridge.LocalView(ino); ok {
+			attr.Size = size
+			attr.Mode = mode
+		}
+		if op.Flags&syscall.O_TRUNC != 0 {
+			attr.Size = 0
+		}
+		// The revision is the compare-and-set base for later writes.
+		if !skipRemoteStat {
 			if st, serr := h.opts.Engine.Bridge.StatLocal(ctx, op.Path); serr == nil {
 				attr.Rev = st.Revision
 			}
-			return fs.Result{Handle: handle, Attr: attr}, true, false, nil
 		}
+		return fs.Result{Handle: handle, Attr: attr}, true, false, nil, nil
 	}
-	return fs.Result{}, false, false, nil
+	return fs.Result{}, false, false, nil, nil
 }
 
 // createOnEngine claims the name as a fresh engine create: the bridge

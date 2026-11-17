@@ -1574,19 +1574,23 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		// (unlink/14's re-create).
 		var st fs.Attr
 		var statErr error
-		if op.KernelCreate() && flags&uint32(syscall.O_EXCL) == 0 && flags&uint32(syscall.O_TRUNC) != 0 {
-			// Async truncating create: O_CREAT|O_TRUNC (used by unzip, cp, tar,
-			// os.Create, shell redirection) discards any prior contents anyway,
-			// so it claims a fresh path without waiting on a remote HEAD.
-			// Non-truncating O_CREAT and O_EXCL probe first so an existing file's
-			// contents, revision, and layout are preserved before open(2) returns.
-			statErr = fs.ErrNotFound
+		if op.OpenAttr != nil && op.OpenAttr.Rev > 0 {
+			// An outer plane (e.g. extent.Handler on a pattern-matched kernel
+			// CREATE) already probed the remote and observed a live classic or
+			// multipart occupant; reuse its authoritative attributes directly.
+			w.invalidate(op.Path, 0)
+			st, statErr = *op.OpenAttr, nil
 		} else {
 			if w.opts.ExtentOpener != nil && w.queue != nil && w.queue.HasPath(op.Path) {
 				w.waitPathCommit(op.Path)
 			}
+			// A nonexclusive kernel CREATE goes through the chain first so
+			// dircache negative rows, complete listings, and session-created
+			// directories (unzip/tar/cp) answer locally with zero remote HEADs,
+			// while uncached existing rows reconcile onto their real base.
 			st, statErr = w.probeExisting(ctx, next, op.Path)
-			if op.KernelCreate() && flags&uint32(syscall.O_EXCL) == 0 && statErr != nil && fs.IsNotFound(statErr) {
+			if op.KernelCreate() && flags&uint32(syscall.O_EXCL) == 0 && flags&uint32(syscall.O_TRUNC) == 0 &&
+				statErr != nil && fs.IsNotFound(statErr) {
 				if rst, rerr := w.probeRemoteAuthoritative(ctx, op.Path); rerr == nil {
 					w.invalidate(op.Path, 0)
 					st, statErr = rst, nil

@@ -16,6 +16,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/extensions/core"
 	"github.com/mem9-ai/drive9/pkg/fs"
+	"github.com/mem9-ai/drive9/pkg/fusecomp/dircache"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/staging"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/writebuffer"
 )
@@ -364,12 +365,13 @@ func TestPortAckIgnoresMatchingNumberFromOtherTrack(t *testing.T) {
 	}
 }
 
-// A nonexclusive kernel CREATE is asynchronous: the v1 path claims the
-// fresh name immediately and never pays a remote HEAD on open(2). A raced
-// existing row is reconciled by the uploader when the pending image lands.
-func TestPortKernelCreateAsyncDoesNotProbe(t *testing.T) {
+// A nonexclusive kernel CREATE can lose the negative-lookup race to another
+// client, while a truncating kernel CREATE inside a session-created directory
+// (unzip, tar, cp) still answers locally from dircache with zero remote HEADs.
+func TestPortKernelCreateReconcilesExistingNonexclusive(t *testing.T) {
 	b := testbackend.NewBackend()
 	b.Seed("/f", []byte("old"))
+	b.Seed("/ftrunc", []byte("old-trunc"))
 	var heads atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v1/status" {
@@ -391,13 +393,17 @@ func TestPortKernelCreateAsyncDoesNotProbe(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	dc := dircache.NewNamespaceCache(10*time.Second, time.Second, 1000)
+	terminal.Attach(dc)
+	dc.MarkSessionCreatedDir("/uz")
 	ch, err := fs.NewChain(wb, terminal)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Truncating kernel CREATE (O_CREAT|O_TRUNC) claims asynchronously with 0 HEADs.
+	// Truncating kernel CREATE inside a session-created directory claims
+	// asynchronously with 0 HEADs.
 	res, err := ch.Dispatch(context.Background(), &fs.Op{
-		Kind: fs.OpCreate, Path: "/fresh", Flags: uint32(syscall.O_CREAT | syscall.O_TRUNC | syscall.O_RDWR),
+		Kind: fs.OpCreate, Path: "/uz/fresh", Flags: uint32(syscall.O_CREAT | syscall.O_TRUNC | syscall.O_RDWR),
 		Mode: 0o644, HasMode: true, Kernel: &gofuse.CreateIn{},
 	})
 	if err != nil {
@@ -437,6 +443,30 @@ func TestPortKernelCreateAsyncDoesNotProbe(t *testing.T) {
 		t.Fatalf("Read existing after non-truncating create = %q, %v; want %q", string(buf[:n]), rerr, "old")
 	}
 	_ = h2.Release(context.Background())
+
+	// Truncating kernel CREATE against an uncached existing file reconciles
+	// onto the existing revision and truncates/replaces it cleanly at fsync.
+	res3, err := ch.Dispatch(context.Background(), &fs.Op{
+		Kind: fs.OpCreate, Path: "/ftrunc", Flags: uint32(syscall.O_CREAT | syscall.O_TRUNC | syscall.O_RDWR),
+		Mode: 0o644, HasMode: true, Kernel: &gofuse.CreateIn{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h3, ok := res3.Handle.(*bufferingHandle)
+	if !ok {
+		t.Fatalf("handle type = %T", res3.Handle)
+	}
+	if h3.isNew || h3.baseRev != 1 || !h3.trunc {
+		t.Fatalf("truncating existing create isNew=%v baseRev=%d trunc=%v, want false/1/true", h3.isNew, h3.baseRev, h3.trunc)
+	}
+	if err := h3.Sync(context.Background()); err != nil {
+		t.Fatalf("truncate-only Sync: %v", err)
+	}
+	_ = h3.Release(context.Background())
+	if node, ok := b.Node("/ftrunc"); !ok || len(node.Data) != 0 {
+		t.Fatalf("remote /ftrunc after truncate-only Sync = %q ok=%v, want empty", node.Data, ok)
+	}
 }
 
 // A second append opener can materialize an intermediate generation G2
