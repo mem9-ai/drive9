@@ -620,7 +620,6 @@ func TestCreateForkTenantNativeDeletesBranchOnSchemaInitFailure(t *testing.T) {
 	}
 }
 
-
 // createForkNativeSystemUser creates a restricted native account on the test instance and
 // returns its credential. The fork dials exactly what finalization persists, so a fixture
 // credential has to be one the instance accepts.

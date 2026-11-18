@@ -2,10 +2,10 @@ package tenant
 
 import (
 	"container/list"
-	"crypto/sha256"
-	"encoding/hex"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -131,14 +131,14 @@ type TenantStoreEntry struct {
 }
 
 type Pool struct {
-	mu        sync.Mutex
-	cfg       PoolConfig
-	enc       encrypt.Encryptor
-	metaStore *meta.Store // central server DB for quota operations; nil disables central quota
-	items     map[string]*entry
-	order     *list.List
-	maxSize   int
-	tenantWorkNotifier  atomic.Pointer[func(tenantID, tidbCloudOrgID string, workMask int)]
+	mu                 sync.Mutex
+	cfg                PoolConfig
+	enc                encrypt.Encryptor
+	metaStore          *meta.Store // central server DB for quota operations; nil disables central quota
+	items              map[string]*entry
+	order              *list.List
+	maxSize            int
+	tenantWorkNotifier atomic.Pointer[func(tenantID, tidbCloudOrgID string, workMask int)]
 	// fileGCEnabled is retained for backward compatibility but no longer used:
 	// FileGC is now kick-driven through the unified tenant worker, not a
 	// per-backend goroutine.
@@ -209,12 +209,12 @@ type entry struct {
 	// a rotation applied on any replica cannot leave another replica serving a backend whose
 	// replacement connections still authenticate with the retired password.
 	dbCredentialID string
-	backend          *backend.Dat9Backend
-	store            *datastore.Store
-	elem             *list.Element
-	refs             int
-	retired          bool
-	lastUsed         time.Time // refreshed by real activity through Acquire; never by AcquireCached
+	backend        *backend.Dat9Backend
+	store          *datastore.Store
+	elem           *list.Element
+	refs           int
+	retired        bool
+	lastUsed       time.Time // refreshed by real activity through Acquire; never by AcquireCached
 }
 
 func NewPool(cfg PoolConfig, enc encrypt.Encryptor) *Pool {
@@ -273,7 +273,6 @@ func (p *Pool) wireTenantWorkNotifier(b *backend.Dat9Backend, tenantID string) {
 	})
 }
 
-
 func (p *Pool) Invalidate(tenantID string) {
 	var toClose *entry
 	p.mu.Lock()
@@ -313,22 +312,6 @@ func (p *Pool) WaitTenantIdle(ctx context.Context, tenantID string) error {
 	}
 }
 
-// AcquireCached returns the cached backend for the tenant, pinning it for the
-// caller's active use, without creating a new backend if the tenant is not
-// already cached. This is used by the safety-net scan to recover expired
-// leases only for warm tenants (those with a live backend in the cache),
-// avoiding waking dormant serverless tenant TiDBs. Returns (nil, nil, false)
-// when the tenant is not cached (cold).
-// AcquireCached pins a cached backend without creating one on cache miss. It
-// is intended for the safety-net scan and other background work that may
-// process already-active tenants but must not wake dormant tenant TiDBs.
-//
-// If the tenant's S3 encryption policy or storage namespace has changed since
-// the backend was cached, AcquireCached returns false (the stale backend is
-// not usable). In this rare case the safety-net scan skips the tenant — its
-// expired lease recovery is deferred until the next write kick triggers a
-// fresh Acquire with the updated policy. This is acceptable because policy
-// changes are rare and the tenant's tasks remain durable in its TiDB.
 // tenantDBCredentialID identifies the database principal and connection coordinates a cached
 // backend was opened with. A cached entry is only reusable while this identity matches the
 // tenant record, so a credential rotation applied by one replica cannot leave another replica
@@ -454,11 +437,17 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 	totalDuration := time.Since(start)
 	logger.InfoOpenPoolTiming(ctx, "tenant_pool_acquire_timing", totalDuration,
 		poolAcquireTimingFields(t.ID, true, createBackendDurationMs, totalDuration)...)
-	p.wireTenantWorkNotifier(b, t.ID)
 	return b, p.makeRelease(e), nil
 }
 
-// AcquireCached pins an existing tenant backend without cold-opening it.
+// AcquireCached returns the cached backend for the tenant without creating one on a cache
+// miss, pinning it for the caller's active use. The safety-net scan uses it to recover expired
+// leases only for warm tenants, so a dormant serverless TiDB is never woken by background work.
+//
+// A cached backend whose S3 encryption policy, storage namespace or database credential no
+// longer matches the tenant row is not usable and reports false; the safety-net then skips the
+// tenant until the next write kick triggers a fresh Acquire. That is acceptable because those
+// changes are rare and the tenant's queued work stays durable in its TiDB.
 func (p *Pool) AcquireCached(t *meta.Tenant) (b *backend.Dat9Backend, release func(), ok bool) {
 	return p.acquireCached(t, false)
 }
@@ -1140,9 +1129,6 @@ func (p *Pool) removeLockedWithoutMetrics(elem *list.Element) *entry {
 	p.order.Remove(elem)
 	e.elem = nil
 	delete(p.items, e.tenantID)
-	// Any removal is a cache change: a concurrent cold open or mismatch eviction that started
-	// before it must not be treated as still current. That includes a plain replacement, which
-	// arrives without an invalidation.
 	e.retired = true
 	if e.refs == 0 {
 		return e
@@ -1153,7 +1139,6 @@ func (p *Pool) removeLockedWithoutMetrics(elem *list.Element) *entry {
 func (p *Pool) recordCachedBackendCountLocked() {
 	metrics.RecordGauge("tenant_pool", "cached_backends", float64(len(p.items)))
 }
-
 
 func (p *Pool) makeRelease(e *entry) func() {
 	var once sync.Once

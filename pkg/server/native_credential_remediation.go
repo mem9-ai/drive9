@@ -27,10 +27,11 @@ const (
 	// that starts serving) must not have to wait for the next leadership change to
 	// lose the legacy grant, so the cleanup is periodic rather than one-shot.
 	nativeCredentialRemediationInterval = 15 * time.Minute
-	// nativeCredentialRemediationRecheckInterval memoizes a successful remediation. The grant
-	// cannot come back (setup no longer grants it and re-setup revokes it), so a
-	// remediated tenant does not need a fresh connection on every pass; it is
-	// re-checked once a day to catch an operator re-granting it.
+	// nativeCredentialRemediationRecheckInterval bounds the in-memory memo. A resolved tenant
+	// is not dialled again: its outcome lives in tenant_credential_state and is read from the
+	// control plane. What the memo bounds is how often that read happens — and, for a tenant
+	// awaiting review, how often the warning repeats — so a steady-state pass costs neither a
+	// connection nor a control-plane query per tenant.
 	nativeCredentialRemediationRecheckInterval = 24 * time.Hour
 	// nativeCredentialRemediationPersistAttempts and ...PersistBackoff bound the local retries
 	// of the metadata write that follows a live ALTER USER: while it is failing the tenant's
@@ -66,8 +67,9 @@ func (s *Server) remediateNativeTenantCredentials(ctx context.Context) {
 	// DSN and password.
 	remediated, skipped, failed, reviewRequired := 0, 0, 0, 0
 	// No cluster-level dedupe: the revoke is cluster-global, but the credential rotation is
-	// per account, so every tenant needs its own connection at least once. Steady state is
-	// bounded by the per-tenant memo below instead (one dial per tenant per recheck window).
+	// per account, so every tenant needs its own connection at least once. After that, the
+	// recorded outcome suppresses further dials and the per-tenant memo bounds the
+	// control-plane read and the review warning to one per recheck window.
 	// Suspended tenants keep their database and therefore the legacy grant; each status
 	// is scanned with its own keyset cursor.
 	for _, status := range [...]meta.TenantStatus{meta.TenantActive, meta.TenantSuspended} {
@@ -372,4 +374,3 @@ func (s *Server) clearNativeCredentialRemediationFailure(tenantID string) {
 	delete(s.nativeCredentialRemediationFailures, tenantID)
 	delete(s.nativeCredentialRemediationRetryAt, tenantID)
 }
-

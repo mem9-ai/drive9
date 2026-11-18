@@ -1120,13 +1120,6 @@ func TestIdleEvictionStartAutoEvictsAndCloseStops(t *testing.T) {
 	assertStoreClosed(t, store)
 }
 
-
-
-
-
-
-
-
 // Reuse is decided by the database credential identity: a cached backend opened with one
 // credential is never served for a row that names another, which is what keeps a rotation from
 // leaving a replica dialling with the retired password.

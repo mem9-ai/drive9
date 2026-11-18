@@ -143,9 +143,9 @@ func TestFTSQueryLiteralEscapesWithoutRewriting(t *testing.T) {
 }
 
 // closesAsOneLiteral replays the parser's view of a single-quoted MySQL literal. It must open
-// with the delimiter and read to the end without being closed early: `''` and, in the default
-// mode, `\` followed by any byte are escapes, so an interior quote that is neither doubled
-// nor backslash-escaped ends the literal — the breakout this guards against.
+// with the delimiter and read to the end without being closed early: two adjacent single quotes
+// and, in the default mode, a backslash followed by any byte are escapes, so an interior quote
+// that is neither doubled nor escaped ends the literal — the breakout this guards against.
 func closesAsOneLiteral(literal string, noBackslashEscapes bool) bool {
 	if literal == "" || literal[0] != '\'' {
 		return false

@@ -619,7 +619,6 @@ func isAuthenticationDeniedError(err error) bool {
 	return mysqlErr.Number == 1045
 }
 
-
 func (p *Provisioner) Provision(ctx context.Context, tenantID string) (*tenant.ClusterInfo, error) {
 	return nil, fmt.Errorf("tidbcloud native requires request credentials")
 }
