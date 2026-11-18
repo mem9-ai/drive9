@@ -203,3 +203,30 @@ func TestOverlayQuotaOverwriteDoesNotReleaseBytes(t *testing.T) {
 		t.Fatalf("quota used after in-place overwrite = %d, want 1000", got)
 	}
 }
+
+// TestOverlayQuotaPathWriteRefusalKeepsExistingImage pins the ordering fix: a
+// path-addressed write that the quota refuses must not have truncated the file
+// first.
+func TestOverlayQuotaPathWriteRefusalKeepsExistingImage(t *testing.T) {
+	f := newQuotaRouter(t, 1000)
+	const view = "/repo/node_modules/keep.bin"
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: view, Offset: 0, Data: make([]byte, 600)}); err != nil {
+		t.Fatalf("seed write: %v", err)
+	}
+	// A 1200-byte replacement does not fit: the call must fail without
+	// destroying the 600 committed bytes.
+	_, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: view, Offset: 0, Data: make([]byte, 1200)})
+	if !errors.Is(err, syscall.ENOSPC) {
+		t.Fatalf("replacement write = %v, want ENOSPC", err)
+	}
+	info, serr := f.overlay.Lstat(view)
+	if serr != nil {
+		t.Fatal(serr)
+	}
+	if info.Size() != 600 {
+		t.Fatalf("backing size = %d, want 600 (refused write truncated the file)", info.Size())
+	}
+	if got := f.overlay.Quota().Used(); got != 600 {
+		t.Fatalf("quota used = %d, want 600", got)
+	}
+}

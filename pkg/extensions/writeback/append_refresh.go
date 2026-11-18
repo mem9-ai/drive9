@@ -345,7 +345,11 @@ func (h *bufferingHandle) adoptAppendImageLocked(image []byte, landedRev int64) 
 	next.ClearDirty()
 	// The handle's own writes must still flush: re-dirty so the commit
 	// boundary republishes the composed image (the caller's write lands
-	// on top immediately after).
+	// on top immediately after). The replaced buffer's memory-budget charge
+	// is returned first: only one buffer is owned at a time.
+	if h.buf != nil {
+		h.buf.Reset()
+	}
 	h.buf = next
 	h.appendSnapshot = true
 	// The rebuilt image is composed from the REMOTE's landed bytes plus this

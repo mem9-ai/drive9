@@ -100,11 +100,10 @@ type Localize struct {
 type token struct {
 	file *os.File
 	path string
-	// ov is the overlay that owns this handle: writes charge its quota, and
-	// size caches the backing file's size so an in-place overwrite needs no
-	// extra stat.
-	ov   *Overlay
-	size int64
+	// ov is the overlay that owns this handle: every write charges its quota
+	// against the backing file's real size (a cached size would go stale as
+	// soon as another descriptor truncates the file).
+	ov *Overlay
 	// onRelease runs the owning router's open-reference accounting exactly
 	// once from Release — the facade releases claimed files by calling
 	// Handle.Release directly, so the OpRelease handler never runs and
@@ -327,7 +326,6 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 			tok := &token{file: file, path: op.Path, ov: o, onRelease: f.noteDBClose}
 			var st *fs.Attr
 			if info, err := file.Stat(); err == nil {
-				tok.size = info.Size()
 				attr := attrOfLocalInfo(info)
 				st = &attr
 			}
@@ -401,20 +399,22 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 	case fs.OpWrite:
 		if h, ok := op.Handle.(*token); ok {
 			end := op.Offset + int64(len(op.Data))
-			if end > h.size && h.ov != nil {
-				if err := h.ov.AdmitWrite(h.path, end); err != nil {
-					return fs.Result{}, err
-				}
-			}
-			if _, err := h.file.WriteAt(op.Data, op.Offset); err != nil {
-				if end > h.size {
-					// The growth never landed: return the reservation.
-					h.ov.ReleaseBytes(end - h.size)
-				}
+			// The backing file's real size governs: a cached handle size goes
+			// stale as soon as another descriptor truncates the path.
+			admitted, err := h.ov.AdmitWrite(h.path, end, int64(len(op.Data)))
+			if err != nil {
 				return fs.Result{}, err
 			}
-			if end > h.size {
-				h.size = end
+			written, werr := h.file.WriteAt(op.Data, op.Offset)
+			if werr != nil {
+				// The reservation must not survive a write that did not land
+				// in full: hand it all back and re-admit only the bytes that
+				// did land (best effort; the next write re-stats anyway).
+				h.ov.ReleaseBytes(admitted)
+				if landed := op.Offset + int64(written); landed > 0 {
+					_, _ = h.ov.AdmitWrite(h.path, landed, int64(written))
+				}
+				return fs.Result{}, werr
 			}
 			return fs.Result{}, nil
 		}
@@ -426,17 +426,23 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 					// not exist yet.
 					mode = 0o644
 				}
+				newSize := int64(len(op.Data))
 				oldSize, _ := o.Size(op.Path)
+				// Reserve the replacement BEFORE the truncating open: a refused
+				// write must leave the existing file intact, not truncated.
+				admitted, aerr := o.AdmitWrite(op.Path, newSize, newSize)
+				if aerr != nil {
+					return fs.Result{}, aerr
+				}
 				fh, err := o.OpenFile(op.Path, syscall.O_WRONLY|syscall.O_CREAT|syscall.O_TRUNC, mode)
 				if err != nil {
+					// The file is untouched: give the reservation back.
+					o.ReleaseBytes(admitted)
 					return fs.Result{}, err
 				}
-				// The open truncated the file, so its previous bytes are
-				// free; the new image charges against the quota.
-				o.ReleaseBytes(oldSize)
-				if err := o.AdmitWrite(op.Path, int64(len(op.Data))); err != nil {
-					_ = fh.Close()
-					return fs.Result{}, err
+				if oldSize > newSize {
+					// The truncating open freed the old image's excess.
+					o.ReleaseBytes(oldSize - newSize)
 				}
 				_, werr := fh.Write(op.Data)
 				cerr := fh.Close()

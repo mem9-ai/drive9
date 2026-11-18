@@ -434,11 +434,15 @@ func (w *Writeback) truncateOwnerUnderSiblings(ctx context.Context, owner *buffe
 		// over the stale remote base would silently drop them at the
 		// truncate's own commit boundary).
 		if img := w.newestStagedInodeImage(ino, owner.path); len(img) > 0 {
-			owner.buf = writebuffer.NewWriteBuffer(owner.path, 0, 0)
-			owner.buf.SetMemoryBudget(owner.w.budget)
-			if _, err := owner.buf.Write(0, img); err != nil {
+			buf := writebuffer.NewWriteBuffer(owner.path, 0, 0)
+			buf.SetMemoryBudget(owner.w.budget)
+			if _, err := buf.Write(0, img); err != nil {
+				// A failed preload must not leave a partial buffer behind: the
+				// retry has to run the staged-image preload again.
+				buf.Reset()
 				return err
 			}
+			owner.buf = buf
 			owner.buf.ClearDirty()
 			owner.baseLoaded = true
 		}

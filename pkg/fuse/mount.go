@@ -1553,8 +1553,9 @@ func mountWithConfig(cfg MountConfig) error {
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(sigCh)
-	var shutdownOutcome shutdownResult
+	shutdownOutcome := newShutdownResult()
 	go func() {
+		defer shutdownOutcome.finish()
 		<-sigCh
 		f.shutdownRequested.Store(true)
 		fmt.Fprintf(os.Stderr, "\ndrive9: unmounting %s...\n", cfg.MountPoint)
@@ -1586,6 +1587,11 @@ func mountWithConfig(cfg MountConfig) error {
 	// classifying that as abnormal failed the CLI's umount. A drain that
 	// left work behind is NOT clean: it is reported.
 	if f.shutdownRequested.Load() {
+		// A second signal can force the unmount while the drain is still
+		// running; the verdict is what decides success, so wait for it rather
+		// than reporting a clean stop that never happened. The drain context
+		// bounds the wait.
+		shutdownOutcome.wait()
 		return shutdownOutcome.err()
 	}
 	// Classify the serve end by the KERNEL mount, not by the OnUnmount
@@ -1607,10 +1613,19 @@ const shutdownDrainTimeout = 30 * time.Second
 
 // shutdownResult carries the shutdown drain's verdict from the signal
 // goroutine to the serve-loop exit path. The two are ordered by the kernel
-// unmount, not by a Go synchronization edge, so the hand-off needs a mutex.
+// unmount, not by a Go synchronization edge, so the hand-off needs a mutex and
+// a completion channel: on a forced unmount serveDone can close while the
+// drain is still running, and returning before the verdict exists would report
+// a clean stop that never happened.
 type shutdownResult struct {
 	mu      sync.Mutex
 	outcome error
+	done    chan struct{}
+	once    sync.Once
+}
+
+func newShutdownResult() *shutdownResult {
+	return &shutdownResult{done: make(chan struct{})}
 }
 
 func (s *shutdownResult) set(err error) {
@@ -1620,6 +1635,23 @@ func (s *shutdownResult) set(err error) {
 	s.mu.Lock()
 	s.outcome = errors.Join(s.outcome, err)
 	s.mu.Unlock()
+}
+
+// finish marks the verdict final; the shutdown goroutine defers it.
+func (s *shutdownResult) finish() {
+	if s == nil {
+		return
+	}
+	s.once.Do(func() { close(s.done) })
+}
+
+// wait blocks until the shutdown goroutine recorded its verdict. The drain
+// carries its own deadline, so the wait is bounded.
+func (s *shutdownResult) wait() {
+	if s == nil {
+		return
+	}
+	<-s.done
 }
 
 func (s *shutdownResult) err() error {

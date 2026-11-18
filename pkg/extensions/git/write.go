@@ -327,12 +327,22 @@ func (g *Git) SetMemoryBudget(b *membudget.Budget) {
 // opening op's context: parts materialize at commit time (Flush/Release),
 // long after that context was canceled, and a canceled-context read turns
 // the seeded image into zero-filled garbage.
-func (h *gitHandle) ensureBufferLocked(ctx context.Context) error {
+func (h *gitHandle) ensureBufferLocked(ctx context.Context) (err error) {
 	if h.buf != nil {
 		return nil
 	}
-	h.buf = writebuffer.NewWriteBuffer(h.path, bufferedMaxTotal, 0)
-	h.buf.SetMemoryBudget(h.g.budget)
+	buf := writebuffer.NewWriteBuffer(h.path, bufferedMaxTotal, 0)
+	buf.SetMemoryBudget(h.g.budget)
+	// Publish the buffer only once the base is initialized: a preload that
+	// fails (the memory budget included) must not leave a partial image behind
+	// for the next write on this handle to commit.
+	defer func() {
+		if err != nil {
+			buf.Reset()
+			return
+		}
+		h.buf = buf
+	}()
 	if h.fresh {
 		// A recreated name owns an empty image: preloading the overlay,
 		// clean-tree blob or remote base would resurrect the deleted
@@ -346,10 +356,10 @@ func (h *gitHandle) ensureBufferLocked(ctx context.Context) error {
 		// HEAD/base bytes, resurrecting the truncated tail (X over a
 		// zeroed hello answered Xello). Materialized distinguishes an
 		// actual image from a metadata-only entry.
-		if _, err := h.buf.Write(0, e.Content); err != nil {
+		if _, err := buf.Write(0, e.Content); err != nil {
 			return err
 		}
-		h.buf.ClearDirty()
+		buf.ClearDirty()
 		return nil
 	}
 	if n, ok := h.w.treeLookup(h.rel); ok && n.Kind == "file" && n.ObjectSHA != "" {
@@ -360,10 +370,10 @@ func (h *gitHandle) ensureBufferLocked(ctx context.Context) error {
 			}
 		}
 		if err == nil {
-			if _, werr := h.buf.Write(0, data); werr != nil {
+			if _, werr := buf.Write(0, data); werr != nil {
 				return werr
 			}
-			h.buf.ClearDirty()
+			buf.ClearDirty()
 			return nil
 		}
 		// Fall through to the remote base: the blob may be materializable
@@ -373,18 +383,17 @@ func (h *gitHandle) ensureBufferLocked(ctx context.Context) error {
 	if statErr != nil && !client.IsNotFound(statErr) {
 		// The base content is UNKNOWN (503/timeout/permission). Publishing
 		// an overlay now would silently replace the file with just this
-		// write's bytes; fail closed and drop the provisional buffer so a
-		// later attempt re-initializes the base.
-		h.buf = nil
+		// write's bytes; fail closed (the deferred publish discards the
+		// provisional buffer, so a later attempt re-initializes the base).
 		return statErr
 	}
 	if statErr == nil && st != nil && st.Size > 0 {
-		partSize := h.buf.PartSize()
+		partSize := buf.PartSize()
 		remoteSize := st.Size
 		g := h.g
 		path := h.g.remotePathOf(h.path)
 		loadCtx := context.Background()
-		h.buf.LoadPart = func(partNum int) ([]byte, error) {
+		buf.LoadPart = func(partNum int) ([]byte, error) {
 			start := int64(partNum-1) * partSize
 			end := start + partSize
 			if end > remoteSize {
@@ -405,7 +414,7 @@ func (h *gitHandle) ensureBufferLocked(ctx context.Context) error {
 			}
 			return part, err
 		}
-		h.buf.SeedRemote(remoteSize)
+		buf.SeedRemote(remoteSize)
 	}
 	return nil
 }

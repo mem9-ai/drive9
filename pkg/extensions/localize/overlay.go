@@ -57,13 +57,20 @@ func (o *Overlay) Quota() *overlayQuota {
 	return o.quota
 }
 
-// AdmitWrite reserves the space a write ending at end needs, accounting the
-// bytes the backing file already holds. An in-place overwrite admits nothing.
-// It returns ENOSPC when the quota (or the host free-space guard) refuses.
-func (o *Overlay) AdmitWrite(viewPath string, end int64) error {
-	return o.withQuota(viewPath, func(q *overlayQuota, rel string) error {
-		return q.grow(rel, end)
+// AdmitWrite reserves the space a write of writeLen bytes ending at end needs,
+// accounting the bytes the backing file already holds. An in-place overwrite
+// reserves no byte quota (but is still checked against the free-space floor).
+// It returns the reserved bytes — 0 when nothing was reserved — so a caller
+// can hand them back when the write never lands, and ENOSPC when the quota or
+// the host free-space guard refuses.
+func (o *Overlay) AdmitWrite(viewPath string, end, writeLen int64) (int64, error) {
+	var admitted int64
+	err := o.withQuota(viewPath, func(q *overlayQuota, rel string) error {
+		var gerr error
+		admitted, gerr = q.grow(rel, end, writeLen)
+		return gerr
 	})
+	return admitted, err
 }
 
 // AdmitResize reserves (or returns) the space a truncate to newSize needs.

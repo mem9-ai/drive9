@@ -105,27 +105,34 @@ func (q *overlayQuota) Refusals() int64 {
 	return q.refusals
 }
 
-// admit reserves n bytes of growth. It returns ENOSPC when the byte quota or
-// the free-space guard would be breached; the caller propagates that errno to
-// the application instead of filling the disk.
-func (q *overlayQuota) admit(n int64) error {
-	if q == nil || n <= 0 {
-		return nil
+// admitGrowth reserves growth bytes of the byte quota and checks the
+// free-space floor against required (the write's own length, which can exceed
+// the net growth for an in-place write). It returns the reserved bytes so the
+// caller can hand them back if the write never lands.
+func (q *overlayQuota) admitGrowth(growth, required int64) (int64, error) {
+	if q == nil {
+		return 0, nil
+	}
+	if growth < 0 {
+		growth = 0
+	}
+	if required < 0 {
+		required = 0
 	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	if q.limit > 0 && q.used+n > q.limit {
+	if q.limit > 0 && growth > 0 && q.used+growth > q.limit {
 		q.refuse("reason=byte_quota_exceeded",
 			zap.Int64("runtime_used_bytes", q.used),
-			zap.Int64("required_bytes", n),
+			zap.Int64("required_bytes", growth),
 			zap.Int64("quota_bytes", q.limit))
-		return syscall.ENOSPC
+		return 0, syscall.ENOSPC
 	}
-	if err := q.checkFreeRatioLocked(n); err != nil {
-		return err
+	if err := q.checkFreeRatioLocked(required); err != nil {
+		return 0, err
 	}
-	q.used += n
-	return nil
+	q.used += growth
+	return growth, nil
 }
 
 // release returns n bytes of usage (shrink, truncate, unlink).
@@ -141,21 +148,30 @@ func (q *overlayQuota) release(n int64) {
 	}
 }
 
-// grow accounts a write that extends a backing file to newSize. An overwrite
-// that stays inside the existing size costs nothing: the file keeps its
-// bytes, so nothing is released.
-func (q *overlayQuota) grow(rel string, newSize int64) error {
+// grow accounts a write of writeLen bytes ending at end. An overwrite that
+// stays inside the existing size reserves no byte quota (the file keeps its
+// bytes, so nothing is released) but is still checked against the free-space
+// floor. The file's real size is authoritative, so a handle whose cached size
+// went stale after a truncate cannot under-count.
+func (q *overlayQuota) grow(rel string, end, writeLen int64) (int64, error) {
 	if q == nil {
-		return nil
+		return 0, nil
 	}
-	cur, err := q.sizeFunc(q.root, rel)
-	if err != nil {
-		return err
+	growth := int64(0)
+	if q.limit > 0 {
+		cur, err := q.sizeFunc(q.root, rel)
+		if err != nil {
+			return 0, err
+		}
+		if end > cur {
+			growth = end - cur
+		}
 	}
-	if newSize <= cur {
-		return nil
+	required := growth
+	if required <= 0 {
+		required = writeLen
 	}
-	return q.admit(newSize - cur)
+	return q.admitGrowth(growth, required)
 }
 
 // resize accounts a truncate: growth is admitted, shrinkage released.
@@ -171,7 +187,8 @@ func (q *overlayQuota) resize(rel string, newSize int64) error {
 		q.release(cur - newSize)
 		return nil
 	}
-	return q.admit(newSize - cur)
+	_, err = q.admitGrowth(newSize-cur, newSize-cur)
+	return err
 }
 
 // checkFreeRatioLocked enforces the free-space guard, reusing the cached
@@ -193,6 +210,9 @@ func (q *overlayQuota) checkFreeRatioLocked(required int64) error {
 	if total <= 0 {
 		return nil
 	}
+	// free is the LIVE estimate: every admission inside the throttle window
+	// subtracts what it reserved, so a burst of writes cannot each pass the
+	// floor against the same starting value and cumulatively breach it.
 	freeAfter := free - required
 	ratioAfter := float64(freeAfter) / float64(total)
 	if ratioAfter < q.freeRatio {
@@ -203,6 +223,7 @@ func (q *overlayQuota) checkFreeRatioLocked(required int64) error {
 			zap.Float64("threshold", q.freeRatio))
 		return syscall.ENOSPC
 	}
+	q.cachedFree = freeAfter
 	return nil
 }
 
@@ -214,9 +235,12 @@ func (q *overlayQuota) refuse(reason string, fields ...zap.Field) {
 	logger.Warn(context.Background(), "localize overlay write refused", fields...)
 }
 
-// measure sums the current backing tree size.
+// measure sums the current backing tree size. A hardlinked file is counted
+// once per INODE: the release path only returns bytes on the last name, so
+// counting every name here would leave phantom usage after both are removed.
 func (q *overlayQuota) measure() (int64, error) {
 	var total int64
+	var seen map[fileIdentity]struct{}
 	err := filepath.WalkDir(q.root, func(_ string, d fs.DirEntry, err error) error {
 		if err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
@@ -234,9 +258,19 @@ func (q *overlayQuota) measure() (int64, error) {
 			}
 			return ierr
 		}
-		if info.Mode().IsRegular() {
-			total += info.Size()
+		if !info.Mode().IsRegular() {
+			return nil
 		}
+		if id, ok := linkedFileIdentity(info); ok {
+			if seen == nil {
+				seen = make(map[fileIdentity]struct{})
+			}
+			if _, dup := seen[id]; dup {
+				return nil
+			}
+			seen[id] = struct{}{}
+		}
+		total += info.Size()
 		return nil
 	})
 	return total, err

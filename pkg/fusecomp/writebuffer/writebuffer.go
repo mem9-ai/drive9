@@ -180,6 +180,21 @@ func (wb *WriteBuffer) addMemory(n int64) error {
 	return nil
 }
 
+// forceAddMemory records n bytes and charges them even past the budget. It is
+// for a caller that cannot proceed without the whole image (a git publish or
+// appendlog snapshot that reconstructs the base to write it out): the bytes
+// are counted, but refusing them would make the file unpublishable. The
+// overrun still squeezes the caches and shows up in the budget snapshot.
+func (wb *WriteBuffer) forceAddMemory(n int64) {
+	if wb == nil || n <= 0 {
+		return
+	}
+	if wb.budget != nil {
+		wb.budget.ForceCharge(membudget.ClassWriteBuffer, n)
+	}
+	wb.curMemory += n
+}
+
 // subMemory drops n bytes of retained memory (releasing the budget charge).
 func (wb *WriteBuffer) subMemory(n int64) {
 	if wb == nil || n <= 0 {
@@ -231,7 +246,10 @@ func (wb *WriteBuffer) Write(offset int64, data []byte) (uint32, error) {
 		return wb.writeSmallFile(offset, data)
 	}
 
-	// Update totalSize
+	// Update totalSize, remembering the previous EOF: a write that fails
+	// (memory budget, part load) must not leave the staged file extended by
+	// bytes that never landed.
+	prevTotal := wb.totalSize
 	if end > wb.totalSize {
 		wb.totalSize = end
 	}
@@ -246,6 +264,7 @@ func (wb *WriteBuffer) Write(offset int64, data []byte) (uint32, error) {
 
 		// Ensure part exists (lazily load or create)
 		if err := wb.ensurePart(partIdx); err != nil {
+			wb.rollbackWriteExtent(prevTotal, offset, dataOff)
 			return uint32(dataOff), err
 		}
 
@@ -271,6 +290,7 @@ func (wb *WriteBuffer) Write(offset int64, data []byte) (uint32, error) {
 			if neededLen > oldCap {
 				newCap = growPartCapacity(oldCap, neededLen, wb.partSize)
 				if err := wb.addMemory(newCap - oldCap); err != nil {
+					wb.rollbackWriteExtent(prevTotal, offset, dataOff)
 					return uint32(dataOff), err
 				}
 			}
@@ -369,6 +389,11 @@ func (wb *WriteBuffer) writeSmallFile(offset int64, data []byte) (uint32, error)
 		if int64(newCap) > wb.smallFileMax {
 			newCap = int(wb.smallFileMax)
 		}
+		// The fast path retains heap too: charge the capacity growth so many
+		// open small files cannot exceed the process budget between them.
+		if err := wb.addMemory(int64(newCap) - int64(cap(wb.smallFileData))); err != nil {
+			return 0, err
+		}
 		grown := make([]byte, newCap)
 		copy(grown, wb.smallFileData)
 		wb.smallFileData = grown[:needLen]
@@ -402,25 +427,38 @@ func (wb *WriteBuffer) writeSmallFile(offset int64, data []byte) (uint32, error)
 // migrateToPartMode transfers smallFileData into the sparse part map and
 // clears smallFileData. Called when a write exceeds smallFileThreshold.
 //
-// The small-file fast path is not charged to the memory budget while it is in
-// use (a buffer there never exceeds SmallFileThreshold); the new part
-// allocation is charged here. A refused charge leaves the small-file image
-// untouched so the caller can fail the operation without losing data.
+// The small-file fast path is charged by capacity as it grows; the migration
+// TRANSFERS that charge to the new part allocation (the new part's capacity is
+// the image length, so any headroom the fast path held is released here). No
+// admission can therefore fail, and the staged image is never lost.
 func (wb *WriteBuffer) migrateToPartMode() error {
 	if len(wb.smallFileData) == 0 {
 		wb.smallFileData = nil
 		return nil
 	}
 	size := int64(len(wb.smallFileData))
-	if err := wb.addMemory(size); err != nil {
-		return err
-	}
 	// Transfer data to part 0
 	part := make([]byte, size)
 	copy(part, wb.smallFileData)
+	if released := int64(cap(wb.smallFileData)) - size; released > 0 {
+		wb.subMemory(released)
+	}
 	wb.parts[0] = part
 	wb.smallFileData = nil
 	return nil
+}
+
+// rollbackWriteExtent restores the logical size after a failed write attempt:
+// the file may only be as long as it was before this call, or as long as the
+// bytes this call actually copied — a failed write must not extend the staged
+// image over the range it never staged.
+func (wb *WriteBuffer) rollbackWriteExtent(prevTotal, offset int64, copied int) {
+	if copied > 0 {
+		if end := offset + int64(copied); end > prevTotal {
+			prevTotal = end
+		}
+	}
+	wb.totalSize = prevTotal
 }
 
 // ensurePart makes sure a part exists in the map. If it doesn't exist
@@ -455,7 +493,7 @@ func (wb *WriteBuffer) ensurePart(partIdx int) error {
 			return err
 		}
 		if restored {
-			if err := wb.addMemory(int64(len(data))); err != nil {
+			if err := wb.addMemory(int64(cap(data))); err != nil {
 				return err
 			}
 			wb.parts[partIdx] = data
@@ -479,7 +517,7 @@ func (wb *WriteBuffer) ensurePart(partIdx int) error {
 			if err != nil {
 				return err
 			}
-			if err := wb.addMemory(int64(len(data))); err != nil {
+			if err := wb.addMemory(int64(cap(data))); err != nil {
 				return err
 			}
 			wb.parts[partIdx] = data
@@ -671,6 +709,9 @@ func (wb *WriteBuffer) Truncate(size int64) error {
 					newCap := int(size)
 					if newCap < 1024 {
 						newCap = 1024
+					}
+					if err := wb.addMemory(int64(newCap) - int64(cap(wb.smallFileData))); err != nil {
+						return err
 					}
 					grown := make([]byte, newCap)
 					copy(grown, wb.smallFileData)
@@ -1011,10 +1052,13 @@ func (wb *WriteBuffer) CanMaterializeFull() bool {
 // LoadMissingParts force-loads every unloaded part of the retained remote
 // prefix via the configured LoadPart loader, so Bytes()/bytesView can
 // reconstruct the complete current contents. It is a no-op when the buffer
-// has no remote-backed ranges and never marks parts dirty. Returns an error
-// when a required part cannot be loaded — no loader configured, load
-// failure, or a part evicted after streaming upload (its original bytes are
-// no longer available) — leaving previously loaded parts untouched.
+// has no remote-backed ranges and never marks parts dirty.
+//
+// The parts are charged as a whole-image load (ForceCharge): the caller needs
+// the complete base to publish it, so the budget records the bytes instead of
+// refusing them. A failure rolls the whole attempt back so a retry is not left
+// holding a partial base whose charge keeps it failing; parts loaded before
+// the call stay as they were.
 func (wb *WriteBuffer) LoadMissingParts() error {
 	if wb.smallFileData != nil {
 		return nil
@@ -1027,6 +1071,14 @@ func (wb *WriteBuffer) LoadMissingParts() error {
 		return nil
 	}
 
+	var loaded []int
+	rollback := func(err error) error {
+		for _, idx := range loaded {
+			wb.ReleaseCleanPart(idx)
+		}
+		return err
+	}
+
 	numParts := int((covered + wb.partSize - 1) / wb.partSize)
 	for idx := 0; idx < numParts; idx++ {
 		if wb.IsPartLoaded(idx) {
@@ -1035,28 +1087,26 @@ func (wb *WriteBuffer) LoadMissingParts() error {
 		if wb.uploadedParts != nil && wb.uploadedParts[idx] {
 			data, restored, err := wb.restoreEvictedPart(idx)
 			if err != nil {
-				return err
+				return rollback(err)
 			}
 			if restored {
-				if err := wb.addMemory(int64(len(data))); err != nil {
-					return err
-				}
+				wb.forceAddMemory(int64(cap(data)))
 				wb.parts[idx] = data
+				loaded = append(loaded, idx)
 				continue
 			}
-			return fmt.Errorf("part %d was evicted after streaming upload and cannot be refetched", idx+1)
+			return rollback(fmt.Errorf("part %d was evicted after streaming upload and cannot be refetched", idx+1))
 		}
 		if wb.LoadPart == nil {
-			return fmt.Errorf("part %d is not loaded and no lazy part loader is configured", idx+1)
+			return rollback(fmt.Errorf("part %d is not loaded and no lazy part loader is configured", idx+1))
 		}
 		data, err := wb.LoadPart(idx + 1) // 1-based
 		if err != nil {
-			return fmt.Errorf("load part %d: %w", idx+1, err)
+			return rollback(fmt.Errorf("load part %d: %w", idx+1, err))
 		}
-		if err := wb.addMemory(int64(len(data))); err != nil {
-			return fmt.Errorf("load part %d: %w", idx+1, err)
-		}
+		wb.forceAddMemory(int64(cap(data)))
 		wb.parts[idx] = data
+		loaded = append(loaded, idx)
 	}
 	return nil
 }

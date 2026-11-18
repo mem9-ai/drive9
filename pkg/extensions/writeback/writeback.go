@@ -6432,7 +6432,13 @@ func (h *bufferingHandle) ensureBufferLocked(ctx context.Context) error {
 	// the retry's bytes (review) — the buffer publishes only after it
 	// holds the real base.
 	defer func() {
-		if h.buf != nil && !h.isNew && h.buf.Size() == 0 && !h.buf.HasDirtyParts() && !h.baseLoaded {
+		// A preload that failed part-way (the memory budget refuses a part
+		// after earlier parts landed) leaves a buffer holding SOME of the
+		// base: publishing it would let the next commit replace the file
+		// with an image missing the rest. Discard on any failed preload, and
+		// return its memory-budget charge with it.
+		if h.buf != nil && !h.baseLoaded {
+			h.buf.Reset()
 			h.buf = nil
 		}
 	}()

@@ -83,7 +83,7 @@ func TestRecordDrainFailureRedactsCredentials(t *testing.T) {
 }
 
 func TestShutdownResultReportsFailure(t *testing.T) {
-	var r shutdownResult
+	r := newShutdownResult()
 	if err := r.err(); err != nil {
 		t.Fatalf("empty result = %v", err)
 	}
@@ -99,6 +99,24 @@ func TestShutdownResultReportsFailure(t *testing.T) {
 	}
 }
 
+// TestShutdownResultWaitSeesForcedVerdict pins the forced-unmount race: the
+// serve loop can end before the drain goroutine records its verdict, so the
+// exit path must wait for it instead of reading an early nil.
+func TestShutdownResultWaitSeesForcedVerdict(t *testing.T) {
+	r := newShutdownResult()
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		r.set(errors.New("drain failed after force-quit"))
+		r.finish()
+	}()
+	r.wait()
+	if err := r.err(); err == nil {
+		t.Fatal("wait returned before the verdict was recorded")
+	}
+	// finish is idempotent: a second call must not panic on a closed channel.
+	r.finish()
+}
+
 // TestCleanShutdownDrainKeepsExitClean pins the other half: a drain that
 // commits everything reports no error, so a plain unmount stays successful.
 func TestCleanShutdownDrainKeepsExitClean(t *testing.T) {
@@ -109,7 +127,7 @@ func TestCleanShutdownDrainKeepsExitClean(t *testing.T) {
 	if !resp.OK {
 		t.Fatal("fresh drain response is not OK")
 	}
-	var r shutdownResult
+	r := newShutdownResult()
 	if !resp.OK {
 		r.set(errors.New("drain failed"))
 	}

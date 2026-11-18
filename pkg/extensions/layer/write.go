@@ -576,25 +576,35 @@ func (l *Layer) SetMemoryBudget(b *membudget.Budget) {
 // ensureBufferLocked creates the write buffer over the current image:
 // overlay content preloads, base objects stay lazy (parts load from the
 // remote on first touch), fresh files start empty.
-func (h *layerHandle) ensureBufferLocked(ctx context.Context) error {
+func (h *layerHandle) ensureBufferLocked(ctx context.Context) (err error) {
 	if h.buf != nil {
 		return nil
 	}
-	h.buf = writebuffer.NewWriteBuffer(h.path, bufferedMaxTotal, 0)
-	h.buf.SetMemoryBudget(h.l.budget)
-	if _, _, _, content, ok := h.l.lookup(h.path); ok && len(content) > 0 {
-		if _, err := h.buf.Write(0, content); err != nil {
-			return err
+	buf := writebuffer.NewWriteBuffer(h.path, bufferedMaxTotal, 0)
+	buf.SetMemoryBudget(h.l.budget)
+	// Publish the buffer only after the overlay content preload succeeded: a
+	// refused preload (memory budget) must not leave a partial image for the
+	// next write on this handle to commit.
+	defer func() {
+		if err != nil {
+			buf.Reset()
+			return
 		}
-		h.buf.ClearDirty()
+		h.buf = buf
+	}()
+	if _, _, _, content, ok := h.l.lookup(h.path); ok && len(content) > 0 {
+		if _, werr := buf.Write(0, content); werr != nil {
+			return werr
+		}
+		buf.ClearDirty()
 		return nil
 	}
 	if h.origSize > 0 {
-		partSize := h.buf.PartSize()
+		partSize := buf.PartSize()
 		remoteSize := h.origSize
 		l := h.l
 		remote := l.remotePath(h.path)
-		h.buf.LoadPart = func(partNum int) ([]byte, error) {
+		buf.LoadPart = func(partNum int) ([]byte, error) {
 			start := int64(partNum-1) * partSize
 			end := start + partSize
 			if end > remoteSize {
@@ -623,7 +633,7 @@ func (h *layerHandle) ensureBufferLocked(ctx context.Context) error {
 			}
 			return part, err
 		}
-		h.buf.SeedRemote(remoteSize)
+		buf.SeedRemote(remoteSize)
 		return nil
 	}
 	return nil

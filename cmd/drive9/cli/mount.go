@@ -217,6 +217,8 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 	checkpointRef := fs.String("checkpoint", "", "restore fs layer checkpoint before mounting")
 	profile := fs.String("profile", "", "mount profile: coding-agent (default), portable, none, extent, interactive, or a ~/.drive9/profiles/<name> file")
 	localRoot := fs.String("local-root", "", "local-only overlay storage root (auto-generated for overlay profiles)")
+	localizeQuotaMB := fs.Int64("localize-quota-mb", 0, "byte quota in MiB for the local-only overlay on the host disk; local writes past it fail with ENOSPC (0 disables)")
+	localizeFreeRatio := fs.Float64("localize-free-ratio", 0.10, "minimum host free-space ratio for the local-only overlay before local writes fail with ENOSPC (0 disables)")
 	var localOnlyPatterns stringListFlag
 	var localGitignoreAwarePatterns stringListFlag
 	var remoteOnlyPatterns stringListFlag
@@ -619,6 +621,12 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 	if *memoryBudgetMB > 0 && *memoryBudgetMB<<20 < 16<<20 {
 		return fmt.Errorf("drive9 mount: --memory-budget-mb must be at least 16 MiB when set")
 	}
+	if *localizeQuotaMB < 0 {
+		return fmt.Errorf("drive9 mount: --localize-quota-mb must be >= 0")
+	}
+	if *localizeFreeRatio < 0 || *localizeFreeRatio >= 1 {
+		return fmt.Errorf("drive9 mount: --localize-free-ratio must be >= 0 and < 1")
+	}
 	// Map CLI 0 → -1 sentinel so MountOptions.setDefaults() knows the user
 	// explicitly disabled the guard rather than left it unset.
 	normalizedWriteCacheSizeMB := *writeCacheSizeMB
@@ -941,6 +949,8 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 		WriteCacheSizeMB:             normalizedWriteCacheSizeMB,
 		MemoryBudget:                 *memoryBudgetMB << 20,
 		MemoryBudgetMode:             string(memoryBudgetModeVal),
+		LocalizeQuotaBytes:           *localizeQuotaMB << 20,
+		LocalizeFreeRatio:            *localizeFreeRatio,
 		ReadConcurrency:              *readConcurrency,
 		ParallelReadConcurrency:      *parallelReadConcurrency,
 		ParallelReadBlockSize:        *parallelReadBlockSize << 20,

@@ -88,29 +88,61 @@ func TestWriteBufferBudgetReleaseOnTruncate(t *testing.T) {
 	}
 }
 
-func TestWriteBufferBudgetRefusesSmallFileMigration(t *testing.T) {
-	// Smaller than the staged small-file image: the migration's new part
-	// allocation cannot be charged.
-	budget := membudget.New(50, membudget.ModeEnforce, nil)
+func TestWriteBufferChargesSmallFileCapacity(t *testing.T) {
+	budget := membudget.New(4096, membudget.ModeEnforce, nil)
 	wb := NewWriteBuffer("/small.txt", 0, 8<<20)
 	wb.SetSmallFileMax(4096)
 	wb.SetMemoryBudget(budget)
 	t.Cleanup(func() { wb.Reset() })
-	// Land in the small-file fast path first (uncharged).
+
+	// The fast path allocates at least 1 KiB for a 100-byte image, and that
+	// allocation is charged: many open small files must not exceed the
+	// process budget between them.
 	if _, err := wb.Write(0, make([]byte, 100)); err != nil {
 		t.Fatal(err)
 	}
-	if got := budget.Used(); got != 0 {
-		t.Fatalf("small-file mode charged %d bytes, want 0", got)
+	want := int64(1024)
+	if got := budget.UsedBy(membudget.ClassWriteBuffer); got != want {
+		t.Fatalf("small-file charge = %d, want %d", got, want)
 	}
-	// Crossing the cutoff migrates to a part allocation that cannot fit.
+	if got := wb.MemoryUsage(); got != want {
+		t.Fatalf("MemoryUsage = %d, want %d", got, want)
+	}
+	// The migration to part mode transfers the charge to the part allocation
+	// (length 100) instead of charging a second time.
+	if _, err := wb.Write(0, make([]byte, 100)); err != nil {
+		t.Fatal(err)
+	}
+	wb.Reset()
+	if got := budget.UsedBy(membudget.ClassWriteBuffer); got != 0 {
+		t.Fatalf("charge after Reset = %d, want 0", got)
+	}
+}
+
+func TestWriteBufferBudgetRefusesPartGrowthAndKeepsSize(t *testing.T) {
+	// The budget holds the small-file allocation but not the first 64 KiB
+	// part allocation it would migrate into.
+	budget := membudget.New(2048, membudget.ModeEnforce, nil)
+	wb := NewWriteBuffer("/small.txt", 0, 64<<10)
+	wb.SetSmallFileMax(4096)
+	wb.SetMemoryBudget(budget)
+	t.Cleanup(func() { wb.Reset() })
+	if _, err := wb.Write(0, make([]byte, 100)); err != nil {
+		t.Fatal(err)
+	}
+	// Crossing the cutoff migrates (charge transferred), then the part
+	// allocation is refused.
 	_, err := wb.Write(4096, make([]byte, 100))
 	if !errors.Is(err, syscall.ENOMEM) {
-		t.Fatalf("migration write = %v, want ENOMEM", err)
+		t.Fatalf("part growth write = %v, want ENOMEM", err)
 	}
-	// The small-file image must survive the refused migration.
+	// A failed write must not extend the logical image over the range it
+	// never staged, and the staged bytes survive.
 	if got := wb.Size(); got != 100 {
-		t.Fatalf("size after refused migration = %d, want 100", got)
+		t.Fatalf("size after refused write = %d, want 100", got)
+	}
+	if part := wb.PartData(1); len(part) == 0 {
+		t.Fatal("staged bytes lost")
 	}
 }
 
