@@ -1184,3 +1184,65 @@ func TestPoolAcquireRecreatesBackendWhenCredentialChanges(t *testing.T) {
 		t.Fatal("acquireCached handed out a backend for a different database user")
 	}
 }
+
+// A cold open can be overtaken: acquisition A starts with the old credential, a rotation
+// invalidates the pool, acquisition B installs a backend with the new one, and only then does
+// A finish. A must not evict B's backend and cache its own stale one — it has to discard the
+// backend it opened and reuse the one the current row names.
+func TestPoolStaleColdOpenDoesNotReplaceRotatedBackend(t *testing.T) {
+	pool, tenant := newTestPoolAndTenant(t, 2, "tenant-stale-open")
+	ctx := context.Background()
+
+	// The pool starts cold, so the acquiring call below really does open a backend and pass
+	// through the installation fence.
+	var installed *entry
+	interleaved := false
+	pool.testHookBeforeInstall = func(tenantID string) {
+		if interleaved {
+			return
+		}
+		interleaved = true
+		// The rotation lands (invalidate) and another acquisition installs the backend the
+		// current row names, before this one can install its own.
+		pool.Invalidate(tenantID)
+		b, st, _, err := pool.createBackend(ctx, tenant)
+		if err != nil {
+			t.Errorf("install the current backend: %v", err)
+			return
+		}
+		e := &entry{
+			tenantID:           tenant.ID,
+			storageNamespaceID: tenant.StorageNamespaceID,
+			s3EncryptionPolicy: tenant.S3EncryptionPolicy(),
+			dbUser:             tenant.DBUser,
+			dbPasswordCipher:   append([]byte(nil), tenant.DBPasswordCipher...),
+			backend:            b,
+			store:              st,
+			lastUsed:           time.Now(),
+		}
+		pool.mu.Lock()
+		e.elem = pool.order.PushFront(e)
+		pool.items[tenant.ID] = e
+		pool.mu.Unlock()
+		installed = e
+	}
+	t.Cleanup(func() { pool.testHookBeforeInstall = nil })
+
+	got, releaseGot, err := pool.Acquire(ctx, tenant)
+	if err != nil {
+		t.Fatalf("acquire during a fenced open: %v", err)
+	}
+	defer releaseGot()
+	if !interleaved || installed == nil {
+		t.Fatal("the interleaving hook never installed the newer backend, so the race was not exercised")
+	}
+	pool.mu.Lock()
+	cached := pool.items[tenant.ID]
+	pool.mu.Unlock()
+	if cached != installed {
+		t.Fatal("the stale cold open replaced the backend that was already current")
+	}
+	if got != installed.backend {
+		t.Fatal("the caller received a backend other than the current one")
+	}
+}

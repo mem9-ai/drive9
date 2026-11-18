@@ -137,6 +137,13 @@ type Pool struct {
 	items              map[string]*entry
 	order              *list.List
 	maxSize            int
+	// invalidationGen fences cold opens against concurrent invalidation: a backend opened
+	// with a credential that was rotated while the open was in flight must never be installed
+	// over the newer one.
+	invalidationGen map[string]uint64
+	// testHookBeforeInstall runs between a completed cold open and its installation, so a
+	// test can interleave an invalidation deterministically. Never set in production.
+	testHookBeforeInstall func(tenantID string)
 	tenantWorkNotifier atomic.Pointer[func(tenantID, tidbCloudOrgID string, workMask int)]
 	// fileGCEnabled is retained for backward compatibility but no longer used:
 	// FileGC is now kick-driven through the unified tenant worker, not a
@@ -273,6 +280,42 @@ func (p *Pool) wireTenantWorkNotifier(b *backend.Dat9Backend, tenantID string) {
 	})
 }
 
+// tryCached returns the cached backend if it is usable for this tenant row, promoting it in
+// the LRU. It is the fence's cheap retry: a backend installed by the acquisition that won the
+// race is already the current one.
+func (p *Pool) tryCached(t *meta.Tenant, s3EncryptionPolicy meta.S3EncryptionPolicy, storageNamespaceID string) (*entry, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.items[t.ID]
+	if !ok || !e.matches(t, s3EncryptionPolicy, storageNamespaceID) {
+		return nil, false
+	}
+	e.refs++
+	p.order.MoveToFront(e.elem)
+	e.lastUsed = time.Now()
+	return e, true
+}
+
+// errTenantChangedDuringOpen reports that a tenant was invalidated while its backend was
+// opening and no fresh row could be resolved to retry with.
+var errTenantChangedDuringOpen = errors.New("tenant changed while its database was opening")
+
+// freshTenantAfterInvalidation re-reads the tenant row after a fenced open, so the retry dials
+// the credential the control plane currently holds.
+func (p *Pool) freshTenantAfterInvalidation(ctx context.Context, previous *meta.Tenant) (*meta.Tenant, bool) {
+	if p.metaStore == nil || previous == nil {
+		return nil, false
+	}
+	fresh, err := p.metaStore.GetTenant(ctx, previous.ID)
+	if err != nil || fresh == nil {
+		logger.Warn(ctx, "tenant_pool_stale_open_resolve_failed",
+			zap.String("tenant_id", previous.ID),
+			zap.Error(err))
+		return nil, false
+	}
+	return fresh, true
+}
+
 // Acquire returns a backend pinned for real tenant activity, including request
 // traffic and durable background work. It may cold-open the tenant and promotes
 // cache hits in the capacity LRU.
@@ -317,6 +360,10 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 		p.mu.Unlock()
 	}
 
+	// Fence the open: if the tenant is invalidated while it is in flight — a credential
+	// rotation, a status change — the backend we are about to install was opened with data
+	// that has since been replaced, and installing it would evict the newer one.
+	generation := p.credentialGeneration(t.ID)
 	createBackendStart := time.Now()
 	b, st, tidbCloudOrgID, err := p.createBackend(ctx, t)
 	if err != nil {
@@ -332,7 +379,29 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 	// caused cold opens at scale; this metric guards against regressions.
 	metrics.RecordTenantOperationWithOrg(t.ID, tidbCloudOrgID, "user_db_access", "acquire_cold_open", "ok", time.Since(createBackendStart))
 
+	if hook := p.testHookBeforeInstall; hook != nil {
+		hook(t.ID)
+	}
 	p.mu.Lock()
+	if p.invalidationGen[t.ID] != generation {
+		// The tenant changed while this backend was opening. It may hold the retired
+		// credential, so it cannot serve: discard it and retry once with a freshly resolved
+		// tenant row rather than caching a backend that would fail authentication.
+		p.mu.Unlock()
+		b.Close()
+		_ = st.Close()
+		metrics.RecordOperation("tenant_pool", "remove", "stale_open", 0)
+		// Another acquisition may already have installed a backend for the current row while
+		// this one was opening. Reuse that first: it needs no control-plane read, and it is the
+		// backend the caller should get.
+		if e, ok := p.tryCached(t, s3EncryptionPolicy, storageNamespaceID); ok {
+			return e.backend, p.makeRelease(e), nil
+		}
+		if fresh, ok := p.freshTenantAfterInvalidation(ctx, t); ok {
+			return p.Acquire(ctx, fresh)
+		}
+		return nil, nil, errTenantChangedDuringOpen
+	}
 	if e, ok := p.items[t.ID]; ok {
 		// Same predicate as the fast path: a cold open that raced a rotation must not be
 		// treated as a hit just because the encryption policy still matches, or the caller
@@ -389,9 +458,26 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 	return b, p.makeRelease(e), nil
 }
 
+// credentialGeneration returns the current invalidation generation for a tenant.
+func (p *Pool) credentialGeneration(tenantID string) uint64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.invalidationGen[tenantID]
+}
+
+// bumpInvalidationLocked marks every in-flight open for the tenant as stale. Called with
+// p.mu held by every path that drops a cached backend on purpose.
+func (p *Pool) bumpInvalidationLocked(tenantID string) {
+	if p.invalidationGen == nil {
+		p.invalidationGen = map[string]uint64{}
+	}
+	p.invalidationGen[tenantID]++
+}
+
 func (p *Pool) Invalidate(tenantID string) {
 	var toClose *entry
 	p.mu.Lock()
+	p.bumpInvalidationLocked(tenantID)
 	if e, ok := p.items[tenantID]; ok {
 		toClose = p.removeLocked(e.elem, "invalidate")
 	}
@@ -506,6 +592,7 @@ func (p *Pool) InvalidateAndWait(ctx context.Context, tenantID string) error {
 	var retired *entry
 	var toClose *entry
 	p.mu.Lock()
+	p.bumpInvalidationLocked(tenantID)
 	if e, ok := p.items[tenantID]; ok {
 		retired = e
 		toClose = p.removeLocked(e.elem, "invalidate")
