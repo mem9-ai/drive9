@@ -1217,5 +1217,49 @@ describe("Extent layout v2 support in TypeScript SDK", () => {
     expect(compatMeta.content_layout).toBe("extent");
     expect(compatMeta.storage_type).toBe("extent");
     expect(compatMeta.tags.k).toBe("v");
+
+    server.use(
+      http.get("http://localhost:9009/v1/fs/no-res-id.bin", () =>
+        HttpResponse.json({
+          size: 5,
+          isdir: false,
+          revision: 1,
+          content_type: "text/plain",
+          semantic_text: "",
+          tags: { k: "v" },
+        })
+      ),
+      http.head("http://localhost:9009/v1/fs/no-res-id.bin", () => {
+        throw new Error("HEAD must not be called when statMetadata omits resource_id");
+      }),
+      http.get("http://localhost:9009/v1/fs/head-no-res-id.bin", () =>
+        HttpResponse.json({
+          size: 5,
+          isdir: false,
+          resource_id: "res-1",
+          revision: 1,
+          content_type: "text/plain",
+          semantic_text: "",
+          tags: {},
+        })
+      ),
+      http.head(
+        "http://localhost:9009/v1/fs/head-no-res-id.bin",
+        () =>
+          new HttpResponse(null, {
+            status: 200,
+            headers: {
+              "Content-Length": "5",
+              "X-Dat9-IsDir": "false",
+              "X-Dat9-Revision": "1",
+              "X-Dat9-Content-Layout": "extent",
+            },
+          })
+      )
+    );
+    const noResMeta = await client.statMetadataCompat("/no-res-id.bin");
+    expect(noResMeta.content_layout).toBeUndefined();
+    const headNoResMeta = await client.statMetadataCompat("/head-no-res-id.bin");
+    expect(headNoResMeta.content_layout).toBeUndefined();
   });
 });

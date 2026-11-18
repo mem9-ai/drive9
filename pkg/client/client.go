@@ -1491,10 +1491,11 @@ func (c *Client) StatMetadataCompatCtx(ctx context.Context, path string) (*StatM
 	if err == nil {
 		// Older servers omit storage_type/content_layout from GET ?stat=1 while
 		// serving X-Dat9-Storage-Type and X-Dat9-Content-Layout on HEAD. Backfill
-		// them best-effort when the HEAD response still describes the same inode.
-		if !out.IsDir && (out.ContentLayout == "" || out.StorageType == "") {
-			if head, herr := c.StatCtx(ctx, path); herr == nil && head != nil &&
-				(out.ResourceID == "" || head.ResourceID == "" || head.ResourceID == out.ResourceID) {
+		// them best-effort only when both responses carry a positive matching
+		// resource_id so concurrent inode replacement never mixes metadata.
+		if !out.IsDir && out.ResourceID != "" && (out.ContentLayout == "" || out.StorageType == "") {
+			if head, herr := c.StatCtx(ctx, path); herr == nil && head != nil && !head.IsDir &&
+				head.ResourceID != "" && head.ResourceID == out.ResourceID {
 				if out.StorageType == "" {
 					out.StorageType = head.StorageType
 				}

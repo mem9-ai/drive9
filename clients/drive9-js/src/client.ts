@@ -539,10 +539,10 @@ export class Client {
   async statMetadataCompat(path: string): Promise<StatMetadataResult> {
     try {
       const out = await this.statMetadata(path);
-      if (!out.isdir && (!out.content_layout || !out.storage_type)) {
+      if (!out.isdir && out.resource_id && (!out.content_layout || !out.storage_type)) {
         try {
           const head = await this.stat(path);
-          if (!out.resource_id || !head.resource_id || head.resource_id === out.resource_id) {
+          if (!head.isDir && head.resource_id && head.resource_id === out.resource_id) {
             if (!out.storage_type && head.storage_type) {
               out.storage_type = head.storage_type;
             }

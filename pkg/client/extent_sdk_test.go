@@ -1116,6 +1116,18 @@ func TestExtentReviewRegressions(t *testing.T) {
 				w.Header().Set("X-Dat9-Resource-Id", "res-new")
 				w.Header().Set("X-Dat9-Content-Layout", string(ContentLayoutExtent))
 				w.WriteHeader(http.StatusOK)
+			case r.Method == http.MethodGet && r.URL.Path == "/v1/fs/missing-id.bin" && r.URL.Query().Has("stat"):
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"size":16,"isdir":false,"revision":1,"content_type":"","semantic_text":"","tags":{"k":"v"}}`))
+			case r.Method == http.MethodGet && r.URL.Path == "/v1/fs/head-missing-id.bin" && r.URL.Query().Has("stat"):
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"size":16,"isdir":false,"resource_id":"res-1","revision":1,"content_type":"","semantic_text":"","tags":{}}`))
+			case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/head-missing-id.bin":
+				w.Header().Set("Content-Length", "16")
+				w.Header().Set("X-Dat9-Isdir", "false")
+				w.Header().Set("X-Dat9-Revision", "1")
+				w.Header().Set("X-Dat9-Content-Layout", string(ContentLayoutExtent))
+				w.WriteHeader(http.StatusOK)
 			case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
 				w.WriteHeader(http.StatusAccepted)
 				_ = json.NewEncoder(w).Encode(uploadPlanV2{
@@ -1159,6 +1171,17 @@ func TestExtentReviewRegressions(t *testing.T) {
 		}
 		if replaced.ContentLayout != "" {
 			t.Fatalf("StatMetadataCompat must not splice layout across resource_id mismatch: %+v", replaced)
+		}
+
+		// When GET ?stat=1 omits resource_id, HEAD must not even be attempted
+		// (default branch returns 404 if HEAD is called) and layout stays empty.
+		missingID, err := c.StatMetadataCompat("/missing-id.bin")
+		if err != nil || missingID.ContentLayout != "" {
+			t.Fatalf("StatMetadataCompat(missing-id) = %+v, err=%v", missingID, err)
+		}
+		headMissingID, err := c.StatMetadataCompat("/head-missing-id.bin")
+		if err != nil || headMissingID.ContentLayout != "" {
+			t.Fatalf("StatMetadataCompat(head-missing-id) = %+v, err=%v", headMissingID, err)
 		}
 	})
 }
