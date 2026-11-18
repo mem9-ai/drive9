@@ -51,6 +51,8 @@ func adminTenant(args []string) error {
 		return adminTenantDelete(args[1:])
 	case "set-quota":
 		return quotaSet(args[1:])
+	case "generate-token":
+		return adminTenantGenerateToken(args[1:])
 	case "extract-config":
 		return adminTenantExtractConfig(args[1:])
 	case "embedding-config":
@@ -684,6 +686,7 @@ commands:
   tenant get --tenant-id ID         show one tenant and quota
   tenant delete --tenant-id ID      delete one tenant
   tenant set-quota --tenant-id ID   set quota for one tenant
+  tenant generate-token --tenant-id ID  generate a tenant API key
   tenant extract-config <get|set>   get or update media extract config
   tenant embedding-config <get|set>  get or replace embedding config
   tenant object-namespace <get|set|clear>  bind a customer object prefix id
@@ -742,6 +745,7 @@ commands:
   get --tenant-id ID               show one tenant and quota
   delete --tenant-id ID            delete one tenant
   set-quota --tenant-id ID         set quota for one tenant
+  generate-token --tenant-id ID    generate an owner or fs_scoped API key
   extract-config <get|set>         get or update media extract config
   embedding-config <get|set>       get or replace embedding config
   object-namespace <get|set|clear> bind customer object prefix id
