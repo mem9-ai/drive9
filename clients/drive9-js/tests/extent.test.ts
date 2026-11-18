@@ -1153,13 +1153,69 @@ describe("Extent layout v2 support in TypeScript SDK", () => {
       true
     );
     expect(isExtentPresignUnsupportedError(new StatusError("internal storage error", 500))).toBe(true);
+    expect(isExtentPresignUnsupportedError(new StatusError("storage backend unavailable; contact support", 500))).toBe(true);
     expect(isExtentPresignUnsupportedError(new StatusError("cannot enforce a declared upload length", 500))).toBe(false);
 
     expect(isZeroSizeExtentInitiateError(new StatusError("reworded", 400, EXTENT_ERR_CODE_ZERO_SIZE_UPLOAD))).toBe(true);
     expect(isZeroSizeExtentInitiateError(new StatusError("total_size must be positive", 400))).toBe(true);
 
     expect(mayBeExtentDirectWriteRejection(new StatusError("internal storage error", 500), -1)).toBe(true);
+    expect(mayBeExtentDirectWriteRejection(new StatusError("storage backend unavailable; contact support", 500), -1)).toBe(true);
     expect(mayBeExtentDirectWriteRejection(new StatusError("internal storage error: disk full", 500), -1)).toBe(false);
-    expect(mayBeExtentDirectWriteRejection(new StatusError("internal storage error", 500), 0)).toBe(false);
+    expect(mayBeExtentDirectWriteRejection(new StatusError("storage backend unavailable; contact support", 500), 0)).toBe(false);
+
+    // 8. Live tidbcloud/fs compat: sticky write fallback on "storage backend unavailable; contact support" + statMetadataCompat HEAD backfill.
+    server.use(
+      http.put("http://localhost:9009/v1/fs/cloud-sticky.bin", () =>
+        HttpResponse.json({ error: "storage backend unavailable; contact support" }, { status: 500 })
+      ),
+      http.head("http://localhost:9009/v1/fs/cloud-sticky.bin", () =>
+        new HttpResponse(null, {
+          status: 200,
+          headers: {
+            "Content-Length": "5",
+            "X-Dat9-IsDir": "false",
+            "X-Dat9-Revision": "2",
+            "X-Dat9-Resource-Id": "res-same",
+            "X-Dat9-Storage-Type": "extent",
+            "X-Dat9-Content-Layout": "extent",
+          },
+        })
+      ),
+      http.get("http://localhost:9009/v1/fs/cloud-sticky.bin", () =>
+        HttpResponse.json({
+          size: 5,
+          isdir: false,
+          resource_id: "res-same",
+          revision: 2,
+          content_type: "application/octet-stream",
+          semantic_text: "",
+          tags: { k: "v" },
+        })
+      ),
+      http.post("http://localhost:9009/v2/uploads/initiate", () =>
+        HttpResponse.json(
+          {
+            upload_id: "cloud-ext-1",
+            key: "",
+            part_size: ExtentBlockSize,
+            total_parts: 1,
+            checksum_contract: { supported: ["SHA-256"], required: true },
+          },
+          { status: 202 }
+        )
+      ),
+      http.post("http://localhost:9009/v2/uploads/cloud-ext-1/presign-batch", () =>
+        HttpResponse.json({ parts: [{ number: 1, skip_upload: true, size: 5 }] })
+      ),
+      http.post("http://localhost:9009/v2/uploads/cloud-ext-1/complete", () =>
+        HttpResponse.json({ status: "completed", revision: 3 })
+      )
+    );
+    await expect(client.writeWithRevision("/cloud-sticky.bin", text.encode("hello"))).resolves.toBe(3);
+    const compatMeta = await client.statMetadataCompat("/cloud-sticky.bin");
+    expect(compatMeta.content_layout).toBe("extent");
+    expect(compatMeta.storage_type).toBe("extent");
+    expect(compatMeta.tags.k).toBe("v");
   });
 });

@@ -1489,6 +1489,20 @@ func (c *Client) StatMetadataCompat(path string) (*StatMetadataResult, error) {
 func (c *Client) StatMetadataCompatCtx(ctx context.Context, path string) (*StatMetadataResult, error) {
 	out, err := c.StatMetadataCtx(ctx, path)
 	if err == nil {
+		// Older servers omit storage_type/content_layout from GET ?stat=1 while
+		// serving X-Dat9-Storage-Type and X-Dat9-Content-Layout on HEAD. Backfill
+		// them best-effort when the HEAD response still describes the same inode.
+		if !out.IsDir && (out.ContentLayout == "" || out.StorageType == "") {
+			if head, herr := c.StatCtx(ctx, path); herr == nil && head != nil &&
+				(out.ResourceID == "" || head.ResourceID == "" || head.ResourceID == out.ResourceID) {
+				if out.StorageType == "" {
+					out.StorageType = head.StorageType
+				}
+				if out.ContentLayout == "" {
+					out.ContentLayout = head.ContentLayout
+				}
+			}
+		}
 		return out, nil
 	}
 	if !shouldFallbackStatMetadata(err) {

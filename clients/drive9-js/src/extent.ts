@@ -36,6 +36,15 @@ export const EXTENT_ERR_MSG_PRESIGN_LENGTH_UNSUPPORTED = "cannot enforce a decla
 export const EXTENT_ERR_CODE_ZERO_SIZE_UPLOAD = "zero_size_upload_unsupported";
 export const EXTENT_ERR_MSG_ZERO_SIZE_UPLOAD = "total_size must be positive";
 export const EXTENT_ERR_MSG_DIRECT_WRITE_INTERNAL_STORAGE = "internal storage error";
+export const EXTENT_ERR_MSG_CLOUD_BACKEND_UNAVAILABLE = "storage backend unavailable; contact support";
+
+function isOpaqueInternalStorageMessage(msg: string): boolean {
+  const lower = msg.trim().toLowerCase();
+  return (
+    lower === EXTENT_ERR_MSG_DIRECT_WRITE_INTERNAL_STORAGE ||
+    lower === EXTENT_ERR_MSG_CLOUD_BACKEND_UNAVAILABLE
+  );
+}
 
 export interface InternalWriteOptions extends WriteOptions {
   expectedResourceId?: string;
@@ -168,7 +177,7 @@ export function isExtentPresignUnsupportedError(err: unknown): boolean {
     return false;
   }
   if (err.statusCode === 500) {
-    return err.message.trim().toLowerCase() === EXTENT_ERR_MSG_DIRECT_WRITE_INTERNAL_STORAGE;
+    return isOpaqueInternalStorageMessage(err.message);
   }
   if (err.statusCode !== 400 && err.statusCode !== 501) {
     return false;
@@ -197,7 +206,7 @@ export function mayBeExtentDirectWriteRejection(err: unknown, expectedRevision: 
     return false;
   }
   if (err instanceof StatusError && err.statusCode === 500) {
-    return err.message.trim().toLowerCase() === EXTENT_ERR_MSG_DIRECT_WRITE_INTERNAL_STORAGE;
+    return isOpaqueInternalStorageMessage(err.message);
   }
   return false;
 }

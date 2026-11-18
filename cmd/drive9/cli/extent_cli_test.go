@@ -536,4 +536,33 @@ func TestCliExtentDownloadCatAppendAndStat(t *testing.T) {
 	); err == nil || !strings.Contains(err.Error(), "already has single content layout; --layout extent cannot be applied") {
 		t.Fatalf("OpenWrite(conflicting layouts) err = %v, want fast layout mismatch before spooling", err)
 	}
+
+	// `drive9 fs stat` backfills content_layout from HEAD when GET ?stat=1 omits it on older servers.
+	omittedStatSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs/head-only-layout.bin" && r.URL.Query().Has("stat"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"size":42,"isdir":false,"resource_id":"r1","revision":2,"content_type":"application/octet-stream","semantic_text":"","tags":{"env":"prod"}}`))
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/head-only-layout.bin":
+			w.Header().Set("Content-Length", "42")
+			w.Header().Set("X-Dat9-Isdir", "false")
+			w.Header().Set("X-Dat9-Revision", "2")
+			w.Header().Set("X-Dat9-Resource-Id", "r1")
+			w.Header().Set("X-Dat9-Storage-Type", "extent")
+			w.Header().Set("X-Dat9-Content-Layout", "extent")
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer omittedStatSrv.Close()
+	backfillOut, err := captureStdoutE(t, func() error {
+		return Stat(client.New(omittedStatSrv.URL, "k"), []string{":/head-only-layout.bin"})
+	})
+	if err != nil {
+		t.Fatalf("Stat(backfill): %v", err)
+	}
+	if !strings.Contains(backfillOut, "content_layout: extent\n") || !strings.Contains(backfillOut, "tags.env: prod\n") {
+		t.Fatalf("Stat(backfill) output = %q, want content_layout: extent + tags", backfillOut)
+	}
 }
