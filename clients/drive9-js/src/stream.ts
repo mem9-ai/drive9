@@ -1,6 +1,14 @@
-import { Client } from "./client.js";
+import type { Client } from "./client.js";
 import { bodyInit } from "./compat.js";
-import { checkError, Drive9Error } from "./error.js";
+import { checkError, Drive9Error, StatusError } from "./error.js";
+import {
+  initiateUploadV2WithLayout,
+  isExtentLayoutMismatchError,
+  isExtentUploadPlan,
+  presignExtentChecksums,
+  putExtentBlock,
+  sha256Hex,
+} from "./extent.js";
 import type { CompletePart, PresignedPart, UploadPlanV2, WriteOptions } from "./models.js";
 import { Semaphore } from "./utils.js";
 
@@ -105,9 +113,28 @@ export class StreamWriter {
     const client = this.client;
     const uploadId = plan.upload_id;
     try {
-      const p = await presignOnePart(client, uploadId, partNum);
-      const etag = await uploadOnePartV2(client, uploadId, p, data);
-      this.state.uploaded.set(partNum, { number: partNum, etag });
+      if (isExtentUploadPlan(plan)) {
+        const checksum = sha256Hex(data);
+        const [p] = await presignExtentChecksums(client, uploadId, [{ number: partNum, checksum }]);
+        if (!p.skip_upload) {
+          try {
+            await putExtentBlock(p.url, p.headers, data);
+          } catch (err) {
+            if (!(err instanceof StatusError && (err.statusCode === 403 || err.statusCode === 409 || err.statusCode === 412))) {
+              throw err;
+            }
+            const [fresh] = await presignExtentChecksums(client, uploadId, [{ number: partNum, checksum }]);
+            if (!fresh.skip_upload) {
+              await putExtentBlock(fresh.url, fresh.headers, data);
+            }
+          }
+        }
+        this.state.uploaded.set(partNum, { number: partNum, etag: checksum });
+      } else {
+        const p = await presignOnePart(client, uploadId, partNum);
+        const etag = await uploadOnePartV2(client, uploadId, p, data);
+        this.state.uploaded.set(partNum, { number: partNum, etag });
+      }
     } catch (e) {
       if (this.abortOnError && !this.state.aborted && !this.state.completed) {
         this.abort().catch(() => {});
@@ -179,22 +206,28 @@ export class StreamWriter {
   }
 
   private async initiate(): Promise<UploadPlanV2> {
-    const payload: { path: string; total_size: number; expected_revision?: number; description?: string } = {
-      path: this.path,
-      total_size: this.totalSize,
-    };
-    if (this.expectedRevision >= 0) payload.expected_revision = this.expectedRevision;
-    if (this.description) payload.description = this.description;
-    const resp = await fetch(`${this.client.baseUrl}/v2/uploads/initiate`, {
-      method: "POST",
-      headers: this.client["authHeaders"]({ "Content-Type": "application/json" }),
-      body: JSON.stringify(payload),
-    });
-    if (resp.status === 404) {
-      throw new Drive9Error("v2 upload API not available");
+    try {
+      return await initiateUploadV2WithLayout(
+        this.client,
+        this.path,
+        this.totalSize,
+        this.expectedRevision,
+        this.description,
+        ""
+      );
+    } catch (err) {
+      if (isExtentLayoutMismatchError(err)) {
+        return initiateUploadV2WithLayout(
+          this.client,
+          this.path,
+          this.totalSize,
+          this.expectedRevision,
+          this.description,
+          "extent"
+        );
+      }
+      throw err;
     }
-    await checkError(resp);
-    return (await resp.json()) as UploadPlanV2;
   }
 }
 

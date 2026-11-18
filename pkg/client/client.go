@@ -442,17 +442,19 @@ func (r BatchWriteResult) OK() bool {
 
 // StatMetadataResult represents enriched metadata from GET /v1/fs/{path}?stat=1.
 type StatMetadataResult struct {
-	Size         int64             `json:"size"`
-	IsDir        bool              `json:"isdir"`
-	ResourceID   string            `json:"resource_id,omitempty"`
-	Nlink        uint32            `json:"nlink,omitempty"`
-	Revision     int64             `json:"revision"`
-	Mtime        *int64            `json:"mtime,omitempty"` // Unix seconds when known
-	ContentType  string            `json:"content_type"`
-	SemanticText string            `json:"semantic_text"`
-	Description  string            `json:"description"`
-	Tags         map[string]string `json:"tags"`
-	Degraded     bool              `json:"degraded,omitempty"`
+	Size          int64             `json:"size"`
+	IsDir         bool              `json:"isdir"`
+	ResourceID    string            `json:"resource_id,omitempty"`
+	Nlink         uint32            `json:"nlink,omitempty"`
+	Revision      int64             `json:"revision"`
+	Mtime         *int64            `json:"mtime,omitempty"` // Unix seconds when known
+	ContentType   string            `json:"content_type"`
+	StorageType   StorageType       `json:"storage_type,omitempty"`
+	ContentLayout ContentLayout     `json:"content_layout,omitempty"`
+	SemanticText  string            `json:"semantic_text"`
+	Description   string            `json:"description"`
+	Tags          map[string]string `json:"tags"`
+	Degraded      bool              `json:"degraded,omitempty"`
 }
 
 var errStatMetadataCompatFallback = errors.New("stat metadata fallback to legacy HEAD")
@@ -996,6 +998,22 @@ func (c *Client) HardlinkCtx(ctx context.Context, srcPath, dstPath string) error
 }
 
 func (c *Client) writeCtxConditionalFull(ctx context.Context, path string, data []byte, expectedRevision int64, tags map[string]string, description string) (int64, error) {
+	rev, err := c.writeCtxConditionalDirectOnly(ctx, path, data, expectedRevision, tags, description)
+	if err != nil && mayBeExtentDirectWriteRejection(err, expectedRevision) {
+		if st, statErr := c.StatCtx(ctx, path); statErr == nil && st != nil && !st.IsDir && st.ContentLayout == ContentLayoutExtent {
+			extRev, extErr := c.writeExtentBytesConditional(ctx, path, data, expectedRevision, tags, description, nil, nil)
+			if extErr == nil && extRev > 0 {
+				if out := completedRevisionSinkOf(ctx); out != nil {
+					*out = extRev
+				}
+			}
+			return extRev, extErr
+		}
+	}
+	return rev, err
+}
+
+func (c *Client) writeCtxConditionalDirectOnly(ctx context.Context, path string, data []byte, expectedRevision int64, tags map[string]string, description string) (int64, error) {
 	req, err := c.newFSRequest(ctx, http.MethodPut, path, "", bytes.NewReader(data))
 	if err != nil {
 		return 0, err
@@ -1447,6 +1465,12 @@ func (c *Client) StatMetadataCtx(ctx context.Context, path string) (*StatMetadat
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, fmt.Errorf("decode stat metadata: %w", err)
 	}
+	if out.StorageType == "" {
+		out.StorageType = StorageType(resp.Header.Get("X-Dat9-Storage-Type"))
+	}
+	if out.ContentLayout == "" {
+		out.ContentLayout = ContentLayout(resp.Header.Get("X-Dat9-Content-Layout"))
+	}
 	if out.Tags == nil {
 		out.Tags = map[string]string{}
 	}
@@ -1480,16 +1504,18 @@ func (c *Client) StatMetadataCompatCtx(ctx context.Context, path string) (*StatM
 		mtime = &unix
 	}
 	return &StatMetadataResult{
-		Size:         statOut.Size,
-		IsDir:        statOut.IsDir,
-		ResourceID:   statOut.ResourceID,
-		Nlink:        statOut.Nlink,
-		Revision:     statOut.Revision,
-		Mtime:        mtime,
-		ContentType:  "",
-		SemanticText: "",
-		Tags:         map[string]string{},
-		Degraded:     true,
+		Size:          statOut.Size,
+		IsDir:         statOut.IsDir,
+		ResourceID:    statOut.ResourceID,
+		Nlink:         statOut.Nlink,
+		Revision:      statOut.Revision,
+		Mtime:         mtime,
+		ContentType:   "",
+		StorageType:   statOut.StorageType,
+		ContentLayout: statOut.ContentLayout,
+		SemanticText:  "",
+		Tags:          map[string]string{},
+		Degraded:      true,
 	}, nil
 }
 

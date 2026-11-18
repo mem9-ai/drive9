@@ -342,8 +342,10 @@ func (c *Client) WriteStream(ctx context.Context, path string, r io.Reader, size
 type WriteOption func(*writeOptions)
 
 type writeOptions struct {
-	tags        map[string]string
-	description string
+	tags         map[string]string
+	description  string
+	layout       ContentLayout
+	targetLayout ContentLayout
 }
 
 // WithTags sets file tags for the upload.
@@ -360,6 +362,33 @@ func WithDescription(description string) WriteOption {
 	}
 }
 
+// WithContentLayout requests an explicit physical layout (ContentLayoutExtent
+// or ContentLayoutSingle) for the upload, overriding the default size-based
+// selection.
+func WithContentLayout(layout ContentLayout) WriteOption {
+	return func(o *writeOptions) {
+		o.layout = layout
+	}
+}
+
+// WithTargetLayout supplies the already-observed ContentLayout of an existing
+// destination so an overwrite avoids a speculative layout-mismatch round trip
+// while leaving fresh-file layout selection automatic.
+func WithTargetLayout(layout ContentLayout) WriteOption {
+	return func(o *writeOptions) {
+		o.targetLayout = layout
+	}
+}
+
+func validateRequestedWriteLayout(layout ContentLayout) error {
+	switch layout {
+	case "", ContentLayoutSingle, ContentLayoutExtent:
+		return nil
+	default:
+		return fmt.Errorf("layout must be %q or %q, got %q", ContentLayoutSingle, ContentLayoutExtent, layout)
+	}
+}
+
 // WriteStreamWithTags uploads data from a reader and applies tags to the
 // resulting file revision.
 func (c *Client) WriteStreamWithTags(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, tags map[string]string) error {
@@ -372,9 +401,11 @@ func (c *Client) WriteStreamWithTags(ctx context.Context, path string, r io.Read
 func (c *Client) WriteStreamWithSummary(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, opts ...WriteOption) (*UploadSummary, error) {
 	o := &writeOptions{}
 	for _, opt := range opts {
-		opt(o)
+		if opt != nil {
+			opt(o)
+		}
 	}
-	return c.writeStreamConditionalWithSummary(ctx, path, r, size, progress, -1, o.tags, o.description, "")
+	return c.writeStreamConditionalWithOptionsAndSummary(ctx, path, r, size, progress, -1, *o, "", nil)
 }
 
 // WriteStreamWithSummaryAndTags uploads data from a reader, applies tags to
@@ -555,9 +586,19 @@ func (c *Client) writeStreamConditionalWithSummary(ctx context.Context, path str
 }
 
 func (c *Client) writeStreamConditionalWithSummaryAndPreCompleteCheck(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, expectedRevision int64, tags map[string]string, description, checksumSHA256 string, preCompleteCheck func() error) (*UploadSummary, error) {
+	return c.writeStreamConditionalWithOptionsAndSummary(ctx, path, r, size, progress, expectedRevision, writeOptions{
+		tags:        tags,
+		description: description,
+	}, checksumSHA256, preCompleteCheck)
+}
+
+func (c *Client) writeStreamConditionalWithOptionsAndSummary(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, expectedRevision int64, opts writeOptions, checksumSHA256 string, preCompleteCheck func() error) (*UploadSummary, error) {
 	// Validate before the threshold fetch and any checksum work so a bad
 	// path fails fast without a round trip or wasted CPU.
 	if err := validateFSPath(path); err != nil {
+		return nil, err
+	}
+	if err := validateRequestedWriteLayout(opts.layout); err != nil {
 		return nil, err
 	}
 	if err := validateWholeChecksumSHA256(checksumSHA256); err != nil {
@@ -565,8 +606,11 @@ func (c *Client) writeStreamConditionalWithSummaryAndPreCompleteCheck(ctx contex
 	}
 	// Large uploads only send tags on complete, but validation must happen
 	// before any initiate/presign/upload work so invalid tags fail early.
-	if err := validateTags(tags); err != nil {
+	if err := validateTags(opts.tags); err != nil {
 		return nil, err
+	}
+	if opts.layout == ContentLayoutExtent && checksumSHA256 != "" {
+		return nil, fmt.Errorf("whole-file checksum_sha256 is not supported with layout=%q", ContentLayoutExtent)
 	}
 	threshold := c.uploadThreshold(ctx)
 	summary := &UploadSummary{
@@ -575,14 +619,16 @@ func (c *Client) writeStreamConditionalWithSummaryAndPreCompleteCheck(ctx contex
 		RemotePath: path,
 		TotalBytes: size,
 	}
+
+	forceExtent := opts.layout == ContentLayoutExtent || (opts.layout == "" && opts.targetLayout == ContentLayoutExtent && checksumSHA256 == "")
 	// useDirectPUT picks the simple-PUT path. When threshold == 0 (no server
 	// value negotiated yet) we must NOT direct-PUT non-empty files, since
 	// the server may be configured below the historical 50KB default and
 	// would reject the simple PUT with `missing X-Dat9-Part-Checksums`.
 	// Multipart is always accepted, so we route any non-zero-size upload
 	// through it until /v1/status warmup populates the cache. Zero-byte
-	// files keep using simple PUT because V2 initiate rejects total_size=0.
-	useDirectPUT := size == 0 || (threshold > 0 && size < threshold)
+	// files keep using simple PUT unless targeting extent layout.
+	useDirectPUT := !forceExtent && (size == 0 || (threshold > 0 && size < threshold))
 	if useDirectPUT {
 		summary.Mode = "direct_put"
 		summary.PartSizeBytes = size
@@ -598,28 +644,64 @@ func (c *Client) writeStreamConditionalWithSummaryAndPreCompleteCheck(ctx contex
 		if err := runPreCompleteCheck(ctx, preCompleteCheck); err != nil {
 			return nil, err
 		}
-		if err := c.writeCtxConditionalWithTagsAndDescription(ctx, path, data, expectedRevision, tags, description); err != nil {
+		_, err = c.writeCtxConditionalDirectOnly(ctx, path, data, expectedRevision, opts.tags, opts.description)
+		if err != nil && opts.layout != ContentLayoutSingle && checksumSHA256 == "" && mayBeExtentDirectWriteRejection(err, expectedRevision) {
+			if st, statErr := c.StatCtx(ctx, path); statErr == nil && st != nil && !st.IsDir && st.ContentLayout == ContentLayoutExtent {
+				if _, eerr := c.writeExtentBytesConditional(ctx, path, data, expectedRevision, opts.tags, opts.description, summary, nil); eerr != nil {
+					return nil, eerr
+				}
+				return finishUploadSummary(summary), nil
+			}
+		}
+		if err != nil {
 			return nil, err
 		}
 		summary.DirectWriteSeconds = time.Since(directWriteStart).Seconds()
 		return finishUploadSummary(summary), nil
 	}
+
+	if forceExtent && (size == 0 || (threshold > 0 && size < threshold)) {
+		if _, ok := r.(io.ReaderAt); !ok {
+			data, err := io.ReadAll(r)
+			if err != nil {
+				return nil, fmt.Errorf("read data: %w", err)
+			}
+			if int64(len(data)) != size {
+				return nil, fmt.Errorf("read data: got %d bytes, want %d", len(data), size)
+			}
+			if _, err := c.writeExtentBytesConditional(ctx, path, data, expectedRevision, opts.tags, opts.description, summary, preCompleteCheck); err != nil {
+				return nil, err
+			}
+			return finishUploadSummary(summary), nil
+		}
+		if size == 0 {
+			if _, err := c.writeExtentBytesConditional(ctx, path, nil, expectedRevision, opts.tags, opts.description, summary, preCompleteCheck); err != nil {
+				return nil, err
+			}
+			return finishUploadSummary(summary), nil
+		}
+	}
+
 	ra, ok := r.(io.ReaderAt)
 	if !ok {
 		return nil, fmt.Errorf("large uploads require an io.ReaderAt (seekable source)")
 	}
 
-	// Every attempt is fresh. Prefer V2 and use V1 only when the endpoint is
-	// explicitly unavailable on an older Server.
-	err := c.writeStreamV2WithSummaryAndPreCompleteCheck(ctx, path, ra, size, progress, expectedRevision, summary, tags, description, checksumSHA256, preCompleteCheck)
+	wantExtent := forceExtent || (checksumSHA256 == "" && opts.layout != ContentLayoutSingle && opts.targetLayout != ContentLayoutSingle)
+	var err error
+	if wantExtent {
+		err = c.writeStreamExtentOrClassicV2WithSummary(ctx, path, ra, size, progress, expectedRevision, summary, opts.tags, opts.description, preCompleteCheck, opts.layout == ContentLayoutExtent)
+	} else {
+		err = c.writeStreamV2WithSummaryAndPreCompleteCheck(ctx, path, ra, size, progress, expectedRevision, summary, opts.tags, opts.description, checksumSHA256, preCompleteCheck)
+	}
 	if err == errV2NotAvailable && expectedResourceOf(ctx) != "" {
 		// Identity-bound publication: the V1 surface cannot carry the
 		// precondition — refuse instead of silently unbinding.
 		return nil, fmt.Errorf("%s: %w (v1 fallback cannot carry the identity binding)", path, ErrResourceMismatch)
 	}
-	if err == errV2NotAvailable {
+	if err == errV2NotAvailable && opts.layout != ContentLayoutExtent {
 		// Server doesn't support v2 — fall back to v1.
-		if err := c.writeStreamV1WithSummaryAndPreCompleteCheck(ctx, path, ra, size, progress, expectedRevision, summary, tags, description, checksumSHA256, preCompleteCheck); err != nil {
+		if err := c.writeStreamV1WithSummaryAndPreCompleteCheck(ctx, path, ra, size, progress, expectedRevision, summary, opts.tags, opts.description, checksumSHA256, preCompleteCheck); err != nil {
 			return nil, err
 		}
 		return finishUploadSummary(summary), nil
@@ -721,6 +803,43 @@ func (c *Client) writeStreamV1WithSummaryAndPreCompleteCheck(ctx context.Context
 	return nil
 }
 
+func (c *Client) writeStreamExtentOrClassicV2WithSummary(ctx context.Context, path string, ra io.ReaderAt, size int64, progress ProgressFunc, expectedRevision int64, summary *UploadSummary, tags map[string]string, description string, preCompleteCheck func() error, explicitExtent bool) error {
+	if err := validateTags(tags); err != nil {
+		return err
+	}
+	initiateStart := time.Now()
+	plan, err := c.initiateUploadV2WithLayout(ctx, path, size, expectedRevision, description, string(ContentLayoutExtent))
+	if err != nil {
+		if !explicitExtent && isExtentLayoutMismatchError(err) {
+			// Target exists with sticky classic layout: update in place without conversion.
+			return c.writeStreamV2WithSummaryAndPreCompleteCheck(ctx, path, ra, size, progress, expectedRevision, summary, tags, description, "", preCompleteCheck)
+		}
+		return err
+	}
+	if summary != nil {
+		summary.InitiateSeconds = time.Since(initiateStart).Seconds()
+	}
+	if isExtentUploadPlan(plan) || (explicitExtent && plan.Key == "") {
+		err := c.uploadExtentSequentialWithSummary(ctx, plan, ra, size, progress, summary, tags, preCompleteCheck)
+		if err != nil {
+			c.abortUploadV2BestEffort(ctx, plan.UploadID)
+			if !explicitExtent && errors.Is(err, errExtentPresignUnsupported) {
+				// Store cannot mint length-bounded block PUTs (e.g. Azure): fall back to classic V2.
+				return c.writeStreamV2WithSummaryAndPreCompleteCheck(ctx, path, ra, size, progress, expectedRevision, summary, tags, description, "", preCompleteCheck)
+			}
+			return err
+		}
+		return nil
+	}
+	if explicitExtent {
+		c.abortUploadV2BestEffort(ctx, plan.UploadID)
+		return fmt.Errorf("server ignored layout=extent on %s", path)
+	}
+	// Legacy/local servers ignore layout="extent" and answer a classic V2 plan:
+	// drive the already-initiated classic session without re-initiating.
+	return c.uploadClassicPlanV2WithSummary(ctx, plan, ra, progress, summary, tags, "", preCompleteCheck)
+}
+
 func (c *Client) writeStreamV2WithSummary(ctx context.Context, path string, ra io.ReaderAt, size int64, progress ProgressFunc, expectedRevision int64, summary *UploadSummary, tags map[string]string, description, checksumSHA256 string) error {
 	return c.writeStreamV2WithSummaryAndPreCompleteCheck(ctx, path, ra, size, progress, expectedRevision, summary, tags, description, checksumSHA256, nil)
 }
@@ -735,8 +854,14 @@ func (c *Client) writeStreamV2WithSummaryAndPreCompleteCheck(ctx context.Context
 		return err
 	}
 	if summary != nil {
-		summary.Mode = "multipart_v2"
 		summary.InitiateSeconds = time.Since(initiateStart).Seconds()
+	}
+	return c.uploadClassicPlanV2WithSummary(ctx, plan, ra, progress, summary, tags, checksumSHA256, preCompleteCheck)
+}
+
+func (c *Client) uploadClassicPlanV2WithSummary(ctx context.Context, plan *uploadPlanV2, ra io.ReaderAt, progress ProgressFunc, summary *UploadSummary, tags map[string]string, checksumSHA256 string, preCompleteCheck func() error) error {
+	if summary != nil {
+		summary.Mode = "multipart_v2"
 		summary.PartSizeBytes = plan.PartSize
 		summary.TotalParts = plan.TotalParts
 		summary.UploadedParts = plan.TotalParts
@@ -797,11 +922,6 @@ func runPreCompleteCheck(ctx context.Context, check func() error) error {
 	}
 	return ctx.Err()
 }
-
-// TODO(extent): switch CLI/SDK default large-file WriteStream/Upload above
-// uploadThreshold from classic V2 multipart (`layout=""`) to extent sequential
-// upload (`WriteExtentStreamConditional`, `layout="extent"`) once non-FUSE
-// rollout is enabled.
 
 type uploadInitiateRequest struct {
 	Path             string   `json:"path"`
@@ -1615,12 +1735,23 @@ func (c *Client) ResolveReadTarget(ctx context.Context, path string) (*ReadTarge
 }
 
 func (c *Client) resolveReadTarget(ctx context.Context, path string) (*ReadTarget, error) {
+	target, plan, err := c.resolveReadTargetOrExtentPlan(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	if plan != nil {
+		return nil, errReadTargetNoRedirect
+	}
+	return target, nil
+}
+
+func (c *Client) resolveReadTargetOrExtentPlan(ctx context.Context, path string) (*ReadTarget, *ExtentReadPlan, error) {
 	// Opt in to the extent plan representation: without the header an
 	// extent file answers 422 here and the download would abort with the
 	// destination already created.
 	resp, err := c.readWithoutRedirectOptIn(ctx, path, "", true)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -1628,18 +1759,31 @@ func (c *Client) resolveReadTarget(ctx context.Context, path string) (*ReadTarge
 	case resp.StatusCode == http.StatusFound || resp.StatusCode == http.StatusTemporaryRedirect:
 		location := resp.Header.Get("Location")
 		if location == "" {
-			return nil, fmt.Errorf("302 without Location header")
+			return nil, nil, fmt.Errorf("302 without Location header")
 		}
-		return &ReadTarget{ObjectURL: location}, nil
+		return &ReadTarget{ObjectURL: location}, nil, nil
+
+	case resp.StatusCode < 300 && ContentLayout(resp.Header.Get("X-Dat9-Content-Layout")) == ContentLayoutExtent:
+		var plan ExtentReadPlan
+		if err := json.NewDecoder(resp.Body).Decode(&plan); err != nil {
+			return nil, nil, fmt.Errorf("decode extent read plan: %w", err)
+		}
+		if plan.Revision <= 0 {
+			if revHeader := resp.Header.Get("X-Dat9-Revision"); revHeader != "" {
+				if parsed, err := strconv.ParseInt(revHeader, 10, 64); err == nil && parsed > 0 {
+					plan.Revision = parsed
+				}
+			}
+		}
+		return nil, &plan, nil
 
 	case resp.StatusCode >= 300:
-		return nil, readError(resp)
+		return nil, nil, readError(resp)
 
 	default:
-		// A 200 (classic inline bytes, or an extent block PLAN with the
-		// opt-in) has no single object URL for the parallel range path —
-		// fall back to the sequential streaming reader, which serves both.
-		return nil, errReadTargetNoRedirect
+		// A 200 classic inline body has no single object URL for the parallel
+		// range path — fall back to the sequential streaming reader.
+		return nil, nil, errReadTargetNoRedirect
 	}
 }
 
@@ -1922,7 +2066,7 @@ func (c *Client) DownloadToFileWithSummary(ctx context.Context, remotePath, loca
 		return c.downloadToFileSequential(ctx, remotePath, out)
 	}
 
-	target, err := c.resolveReadTarget(ctx, remotePath)
+	target, extentPlan, err := c.resolveReadTargetOrExtentPlan(ctx, remotePath)
 	if err != nil {
 		if IsReadTargetNoRedirect(err) {
 			// Keep large-file downloads working when the control plane serves the
@@ -1931,6 +2075,9 @@ func (c *Client) DownloadToFileWithSummary(ctx context.Context, remotePath, loca
 			return c.downloadToFileSequential(ctx, remotePath, out)
 		}
 		return nil, err
+	}
+	if extentPlan != nil {
+		return c.downloadExtentToFileParallel(ctx, remotePath, localPath, out, extentPlan)
 	}
 	if err := out.Truncate(size); err != nil {
 		return nil, fmt.Errorf("preallocate %s: %w", localPath, err)

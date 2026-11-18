@@ -1,3 +1,6 @@
+export type ContentLayout = "single" | "append_log" | "extent" | (string & {});
+export type StorageType = "db9" | "s3" | "extent" | (string & {});
+
 export interface FileInfo {
   name: string;
   size: number;
@@ -19,6 +22,8 @@ export interface StatResult {
   hasMode?: boolean;
   resource_id?: string;
   nlink?: number;
+  storage_type?: StorageType;
+  content_layout?: ContentLayout;
 }
 
 export interface StatMetadataResult {
@@ -29,7 +34,10 @@ export interface StatMetadataResult {
   revision: number;
   mtime?: number;
   content_type: string;
+  storage_type?: StorageType;
+  content_layout?: ContentLayout;
   semantic_text: string;
+  description?: string;
   tags: Record<string, string>;
   degraded?: boolean;
 }
@@ -124,7 +132,7 @@ export interface UploadMeta {
 
 export interface UploadSummary {
   type: "upload";
-  mode: "direct_put" | "multipart_v1" | "multipart_v2";
+  mode: "direct_put" | "multipart_v1" | "multipart_v2" | "extent_v2";
   started_at: string;
   finished_at: string;
   elapsed_seconds: number;
@@ -211,13 +219,19 @@ export interface VaultAuditEvent {
 export interface CompletePart {
   number: number;
   etag: string;
+  chunk?: number;
+  off?: number;
+  boff?: number;
+  size?: number;
 }
 
 export interface PresignedPart {
   number: number;
   url: string;
   size: number;
+  checksum_sha256?: string;
   headers?: Record<string, unknown>;
+  skip_upload?: boolean;
 }
 
 export interface UploadPlanV2 {

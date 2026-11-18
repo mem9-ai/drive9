@@ -5,6 +5,7 @@ import type { BufferEncoding, CpOptions, FileContent, FsStat, IFileSystem, Mkdir
 import type { Client } from "./client.js";
 import { ConflictError, Drive9Error, StatusError } from "./error.js";
 import type { StatResult } from "./models.js";
+import { writeStreamImpl } from "./transfer.js";
 
 // These option types are not exported from just-bash's public entry point.
 type ReadOptions = Parameters<IFileSystem["readFile"]>[1];
@@ -77,7 +78,8 @@ export class Drive9Fs implements IFileSystem {
     const resolved = await this.resolve(path, true, true);
     if (resolved.info) this.requireFile(resolved.info, path);
     const data = bytes(content, options);
-    await this.io(path, () => this.client.writeStream(this.remote(resolved.path), data, data.length));
+    const targetOpts = resolved.info?.content_layout ? { targetLayout: resolved.info.content_layout } : undefined;
+    await this.io(path, () => writeStreamImpl(this.client, this.remote(resolved.path), data, data.length, targetOpts));
   }
 
   async appendFile(path: string, content: FileContent, options?: WriteOptions): Promise<void> {
