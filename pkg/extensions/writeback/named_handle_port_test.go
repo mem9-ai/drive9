@@ -10,9 +10,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"syscall"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 

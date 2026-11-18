@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -212,7 +213,19 @@ func (s *Server) cleanupFailedNativeTenantWithDependencies(
 	if strings.TrimSpace(t.ClusterID) == "" {
 		t.ClusterID = strings.TrimSpace(candidate.Binding.ClusterID)
 	}
-	if strings.TrimSpace(t.ClusterID) != "" {
+	// A failed fork's tenant row carries the SOURCE tenant's cluster_id plus its
+	// own branch_id. Treating it as a cluster-backed tenant here would destroy
+	// the live parent (and every sibling fork) and leave the fork's branch
+	// behind, so a branch-backed row is cleaned by deleting only its branch.
+	// The branch id is checked as well as the kind so a row written before the
+	// kind column existed is still reconciled instead of dead-ending.
+	branchBacked := t.Kind == meta.TenantKindFork ||
+		(strings.TrimSpace(t.BranchID) != "" && t.Provider != tenant.ProviderLocal)
+	if branchBacked {
+		if err := s.deleteFailedForkBranch(ctx, &t, candidate.Binding, cred); err != nil {
+			return true, fmt.Errorf("delete_branch: %w", err)
+		}
+	} else if strings.TrimSpace(t.ClusterID) != "" {
 		if err := s.deprovisionTenantCluster(ctx, &t, cred); err != nil {
 			return true, fmt.Errorf("deprovision: %w", err)
 		}
@@ -271,4 +284,69 @@ func (s *Server) restoreFailedTenantAfterCleanupWithUpdater(
 		"stage", "restore_failed",
 		"restored", restored,
 		"cleanup_error", cleanupErr)...)
+}
+
+// deleteFailedForkBranch removes only the branch backing a failed fork tenant.
+//
+// The tenant row of a fork stores the source tenant's cluster_id and its own
+// branch_id, so the generic native cleanup path would deprovision the parent
+// cluster. The branch is identified from the tenant row first and from the
+// organization binding when the row is incomplete, and the delete stays
+// idempotent so a retry after a transient API failure converges.
+func (s *Server) deleteFailedForkBranch(
+	ctx context.Context,
+	t *meta.Tenant,
+	binding meta.TenantTiDBCloudOrgBinding,
+	cred tenant.CredentialProvisionRequest,
+) error {
+	if t == nil {
+		return fmt.Errorf("fork tenant is required")
+	}
+	clusterID := strings.TrimSpace(t.ClusterID)
+	if clusterID == "" {
+		clusterID = strings.TrimSpace(binding.ClusterID)
+	}
+	branchID := strings.TrimSpace(t.BranchID)
+	if branchID == "" {
+		branchID = strings.TrimSpace(binding.BranchID)
+	}
+	if clusterID == "" || branchID == "" {
+		// Nothing was branched yet: there is no cluster resource to release, and
+		// revoking keys plus marking the tenant deleted finishes the cleanup.
+		logger.Info(ctx, "server_event", eventFields(ctx, "tenant_failed_cleanup_fork_branch_skipped",
+			"tenant_id", t.ID,
+			"cluster_id", clusterID,
+			"branch_id", branchID,
+			"reason", "branch_not_created")...)
+		return nil
+	}
+	provider := t.Provider
+	if strings.TrimSpace(provider) == "" {
+		provider = tenant.ProviderTiDBCloudNative
+	}
+	req := cred
+	if err := s.deleteForkBranch(ctx, provider, clusterID, branchID, &req); err != nil {
+		// A branch that is already gone is a completed cleanup; the provider
+		// reports that as a 404-derived error.
+		if isTiDBCloudNotFound(err) {
+			logger.Info(ctx, "server_event", eventFields(ctx, "tenant_failed_cleanup_fork_branch_gone",
+				"tenant_id", t.ID, "cluster_id", clusterID, "branch_id", branchID)...)
+			return nil
+		}
+		return err
+	}
+	logger.Info(ctx, "server_event", eventFields(ctx, "tenant_failed_cleanup_fork_branch_deleted",
+		"tenant_id", t.ID, "cluster_id", clusterID, "branch_id", branchID)...)
+	return nil
+}
+
+// isTiDBCloudNotFound reports whether err is a TiDB Cloud API 404.
+func isTiDBCloudNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	if apiErr, ok := tiDBCloudAPIError(err); ok && apiErr.StatusCode == http.StatusNotFound {
+		return true
+	}
+	return false
 }

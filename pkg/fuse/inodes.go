@@ -78,6 +78,8 @@ func NewInodeToPath() *InodeToPath {
 		Paths:   map[string]struct{}{"/": {}},
 		IsDir:   true,
 		Nlink:   2,
+		Mode:    syscall.S_IFDIR | 0o755,
+		HasMode: true,
 		Nlookup: 1,
 	}
 	return &InodeToPath{

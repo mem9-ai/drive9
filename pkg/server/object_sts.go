@@ -20,7 +20,6 @@ import (
 	tccommon "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common"
 	tcprofile "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/profile"
 	tcsts "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/sts/v20180813"
-	"golang.org/x/oauth2/google"
 
 	"github.com/mem9-ai/drive9/pkg/meta"
 )
@@ -86,7 +85,7 @@ func mintObjectSessionWithSecret(ctx context.Context, backend *meta.OrgObjectBac
 	case "az":
 		return mintAzureSession(backend, secret, write, ttl)
 	case "gs":
-		return mintGCSSession(ctx, secret, write)
+		return mintGCSSession(ctx, secret, backend.Bucket, write)
 	default:
 		return nil, fmt.Errorf("unsupported object scheme %q", backend.Scheme)
 	}
@@ -336,25 +335,18 @@ func mintAzureSession(backend *meta.OrgObjectBackend, secret string, write bool,
 	}, nil
 }
 
-func mintGCSSession(ctx context.Context, secret string, write bool) (*objectCredentialsResponse, error) {
-	if strings.TrimSpace(secret) == "" {
-		return nil, fmt.Errorf("gcs mint requires a service-account JSON key")
-	}
-	scope := "https://www.googleapis.com/auth/devstorage.read_only"
-	if write {
-		scope = "https://www.googleapis.com/auth/devstorage.read_write"
-	}
-	conf, err := google.JWTConfigFromJSON([]byte(secret), scope)
+// mintGCSSession issues an OAuth access token downscoped by a Credential
+// Access Boundary to the backend bucket. The org service account's
+// project-wide IAM never reaches the tenant, so one tenant's object session
+// cannot touch another tenant's bucket.
+func mintGCSSession(ctx context.Context, secret, bucket string, write bool) (*objectCredentialsResponse, error) {
+	token, expiration, err := gcsObjectTokenMint(ctx, secret, bucket, write, gcsObjectHTTPClient)
 	if err != nil {
-		return nil, fmt.Errorf("parse gcs service account json: %w", err)
+		return nil, fmt.Errorf("mint gcs object token: %w", err)
 	}
-	tok, err := conf.TokenSource(ctx).Token()
-	if err != nil {
-		return nil, fmt.Errorf("mint gcs access token: %w", err)
-	}
-	resp := &objectCredentialsResponse{AccessToken: tok.AccessToken}
-	if !tok.Expiry.IsZero() {
-		resp.Expiration = tok.Expiry.UTC().Format(time.RFC3339)
+	resp := &objectCredentialsResponse{AccessToken: token}
+	if !expiration.IsZero() {
+		resp.Expiration = expiration.UTC().Format(time.RFC3339)
 	}
 	return resp, nil
 }

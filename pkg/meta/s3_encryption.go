@@ -28,6 +28,11 @@ type ResolvedS3EncryptionPolicy struct {
 	BucketKeyEnabled bool
 }
 
+// DefaultS3EncryptionPolicy is the zero-config policy: no server-side
+// encryption is requested, so the bucket's own default applies. Deployments
+// that need objects encrypted at rest set DRIVE9_S3_ENCRYPTION_MODE (sse-kms
+// with DRIVE9_S3_KMS_KEY_ID is recommended); the server warns at startup when a
+// real bucket runs without it.
 func DefaultS3EncryptionPolicy() S3EncryptionPolicy {
 	return S3EncryptionPolicy{
 		Mode:             S3EncryptionModeNone,

@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mem9-ai/drive9/internal/releasesign"
 	"github.com/mem9-ai/drive9/pkg/buildinfo"
 )
 
@@ -28,6 +29,7 @@ const (
 
 type updateDeps struct {
 	baseURL              string
+	baseURLFromEnv       bool
 	currentVersion       string
 	goos                 string
 	goarch               string
@@ -38,6 +40,9 @@ type updateDeps struct {
 	allowInsecureBaseURL bool
 	preflightReplace     func() error
 	replaceExecutable    func(string, string) error
+	// signingKey is the base64 ed25519 key the release manifest is verified with. Empty
+	// resolves to the build's embedded key; the build refuses to update without one.
+	signingKey string
 }
 
 func defaultUpdateDeps() updateDeps {
@@ -75,14 +80,43 @@ func updateWithDeps(args []string, deps updateDeps) error {
 	if err := validateUpdateBaseURL(deps.baseURL, deps.allowInsecureBaseURL); err != nil {
 		return err
 	}
+	baseURLFromFlag := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "base-url" {
+			baseURLFromFlag = true
+		}
+	})
+	// DRIVE9_UPDATE_BASE_URL is inherited by every child process, so it must not
+	// be able to relocate the release root (and with it the checksum manifest the
+	// download is verified against) to a host the user never chose. A release root
+	// outside the pinned hosts still requires the explicit --base-url flag.
+	if deps.baseURLFromEnv && !baseURLFromFlag && !isPinnedUpdateHost(deps.baseURL) {
+		return fmt.Errorf("DRIVE9_UPDATE_BASE_URL=%q is not a pinned drive9 release host (%s); pass --base-url explicitly to install from a custom release root", deps.baseURL, strings.Join(updateReleaseHosts, ", "))
+	}
+	if baseURLFromFlag && !isPinnedUpdateHost(deps.baseURL) {
+		_, _ = fmt.Fprintf(deps.stderr, "warning: installing from custom release root %s; the manifest must verify against the drive9 release key or nothing is installed\n", deps.baseURL)
+	}
+	if isPinnedUpdateHost(deps.baseURL) {
+		// The pinned host is only the first hop: the default client follows up to
+		// ten redirects, so a pinned release root could still be served by any host
+		// reachable through a redirect (open redirect, compromised origin). Keep the
+		// whole chain pinned so the version, the checksum manifest, and the binary all
+		// come from the same trusted release hosts.
+		deps.httpClient = withPinnedUpdateRedirects(deps.httpClient, deps.allowInsecureBaseURL)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), updateCommandTimeout)
 	defer cancel()
 
-	latestVersion, err := fetchLatestVersion(ctx, deps)
+	// The manifest is the only trusted input: it carries both the version to compare
+	// against and the hashes the binary is verified with, and it is signed. The version file
+	// next to it is not read at all — an origin that could rewrite it could otherwise make a
+	// signed older binary look like an upgrade.
+	manifest, err := fetchReleaseManifest(ctx, deps)
 	if err != nil {
 		return err
 	}
+	latestVersion := manifest.Version
 	artifact := updateArtifactName(deps.goos, deps.goarch)
 	latestURL := releaseURL(deps.baseURL, artifact)
 	relation := compareReleaseVersions(deps.currentVersion, latestVersion)
@@ -122,13 +156,9 @@ func updateWithDeps(args []string, deps updateDeps) error {
 	if err != nil {
 		return err
 	}
-	checksums, err := fetchReleaseChecksums(ctx, deps)
-	if err != nil {
-		return err
-	}
-	want, ok := checksums[artifact]
+	want, ok := manifest.Checksums[artifact]
 	if !ok {
-		return fmt.Errorf("checksum for %s not found in %s", artifact, releaseURL(deps.baseURL, "checksums.txt"))
+		return fmt.Errorf("checksum for %s not found in the signed release manifest %s", artifact, releaseURL(deps.baseURL, "checksums.txt"))
 	}
 
 	tmpPath, err := downloadUpdateBinary(ctx, deps, latestURL, target, want)
@@ -155,12 +185,22 @@ func updateUsage() string {
 	return `usage: drive9 update [--check] [--force] [--base-url URL]
   --check          check for a newer release without installing
   --force          reinstall latest release even when versions match
-  --base-url URL   release base URL (default https://drive9.ai)` + updatePlatformUsageNote()
+  --base-url URL   release base URL (default https://drive9.ai)
+  DRIVE9_UPDATE_BASE_URL is honored only for drive9.ai release hosts
+
+The release manifest is verified against the drive9 release key before anything is
+installed, so a mirror, a --base-url host, or a compromised release origin cannot
+substitute a binary. A build with no embedded key refuses to update; rebuild with
+-X github.com/mem9-ai/drive9/cmd/drive9/cli.updateManifestPublicKey=<base64 key>
+to install from your own signed releases.` + updatePlatformUsageNote()
 }
 
 func fillUpdateDeps(deps updateDeps) updateDeps {
 	if deps.baseURL == "" {
-		deps.baseURL = strings.TrimSpace(os.Getenv("DRIVE9_UPDATE_BASE_URL"))
+		if envBaseURL := strings.TrimSpace(os.Getenv("DRIVE9_UPDATE_BASE_URL")); envBaseURL != "" {
+			deps.baseURL = envBaseURL
+			deps.baseURLFromEnv = true
+		}
 	}
 	if deps.baseURL == "" {
 		deps.baseURL = defaultUpdateBaseURL
@@ -180,6 +220,9 @@ func fillUpdateDeps(deps updateDeps) updateDeps {
 	}
 	if deps.httpClient == nil {
 		deps.httpClient = &http.Client{Timeout: updateCommandTimeout}
+	}
+	if deps.signingKey == "" {
+		deps.signingKey = trustedUpdateManifestKeys()
 	}
 	if deps.stdout == nil {
 		deps.stdout = os.Stdout
@@ -368,31 +411,29 @@ func displayVersion(version string) string {
 	return version
 }
 
-func fetchLatestVersion(ctx context.Context, deps updateDeps) (string, error) {
-	body, err := httpGetBytes(ctx, deps.httpClient, releaseURL(deps.baseURL, "version"), 4096)
+// fetchReleaseManifest downloads both signed pairs — the checksum manifest and the release
+// description with their signatures — and hands them to the shared verifier. The files come
+// from the same origin, which is exactly why the signatures, not the origin, are the trust
+// anchor; nothing is parsed before both verify, and the returned Manifest has been through
+// the digest check that binds the version to this exact checksum list.
+func fetchReleaseManifest(ctx context.Context, deps updateDeps) (releasesign.Manifest, error) {
+	manifest, err := httpGetBytes(ctx, deps.httpClient, releaseURL(deps.baseURL, releasesign.ManifestName), 1<<20)
 	if err != nil {
-		return "", fmt.Errorf("fetch latest drive9 version: %w", err)
+		return releasesign.Manifest{}, fmt.Errorf("fetch release manifest: %w", err)
 	}
-	version := strings.TrimSpace(string(body))
-	if version == "" {
-		return "", errors.New("fetch latest drive9 version: empty response")
-	}
-	return version, nil
-}
-
-func fetchReleaseChecksums(ctx context.Context, deps updateDeps) (map[string]string, error) {
-	body, err := httpGetBytes(ctx, deps.httpClient, releaseURL(deps.baseURL, "checksums.txt"), 1<<20)
+	manifestSignature, err := httpGetBytes(ctx, deps.httpClient, releaseURL(deps.baseURL, releasesign.SignatureName), 4096)
 	if err != nil {
-		return nil, fmt.Errorf("fetch release checksums: %w", err)
+		return releasesign.Manifest{}, fmt.Errorf("fetch release manifest signature: %w", err)
 	}
-	checksums, err := parseChecksums(body)
+	info, err := httpGetBytes(ctx, deps.httpClient, releaseURL(deps.baseURL, releasesign.ReleaseInfoName), 4096)
 	if err != nil {
-		return nil, err
+		return releasesign.Manifest{}, fmt.Errorf("fetch release info: %w", err)
 	}
-	if len(checksums) == 0 {
-		return nil, errors.New("fetch release checksums: empty checksum list")
+	infoSignature, err := httpGetBytes(ctx, deps.httpClient, releaseURL(deps.baseURL, releasesign.ReleaseInfoSignatureName), 4096)
+	if err != nil {
+		return releasesign.Manifest{}, fmt.Errorf("fetch release info signature: %w", err)
 	}
-	return checksums, nil
+	return verifyUpdateRelease(manifest, manifestSignature, info, infoSignature, deps.signingKey)
 }
 
 func httpGetBytes(ctx context.Context, client *http.Client, url string, limit int64) ([]byte, error) {
@@ -416,48 +457,6 @@ func httpGetBytes(ctx context.Context, client *http.Client, url string, limit in
 		return nil, fmt.Errorf("GET %s: response too large", url)
 	}
 	return body, nil
-}
-
-func parseChecksums(data []byte) (map[string]string, error) {
-	checksums := map[string]string{}
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
-			return nil, fmt.Errorf("invalid checksum line %q", line)
-		}
-		sum := strings.ToLower(fields[0])
-		if len(sum) != sha256.Size*2 {
-			return nil, fmt.Errorf("invalid checksum for %s", fields[1])
-		}
-		if _, err := hex.DecodeString(sum); err != nil {
-			return nil, fmt.Errorf("invalid checksum for %s: %w", fields[1], err)
-		}
-		name, err := checksumArtifactName(fields[1])
-		if err != nil {
-			return nil, err
-		}
-		if _, exists := checksums[name]; exists {
-			return nil, fmt.Errorf("duplicate checksum for %s", name)
-		}
-		checksums[name] = sum
-	}
-	return checksums, nil
-}
-
-func checksumArtifactName(raw string) (string, error) {
-	name := strings.TrimPrefix(raw, "*")
-	if name == "" {
-		return "", errors.New("empty checksum artifact name")
-	}
-	clean := filepath.ToSlash(filepath.Clean(name))
-	if clean == "." || strings.HasPrefix(clean, "/") || strings.HasPrefix(clean, "../") || strings.Contains(clean, "/") {
-		return "", fmt.Errorf("checksum artifact %q must be a release artifact filename", raw)
-	}
-	return clean, nil
 }
 
 func downloadUpdateBinary(ctx context.Context, deps updateDeps, url, targetPath, wantSHA string) (string, error) {
@@ -545,6 +544,53 @@ func updateArtifactName(goos, goarch string) string {
 
 func normalizeUpdateBaseURL(baseURL string) string {
 	return strings.TrimRight(strings.TrimSpace(baseURL), "/")
+}
+
+// updateReleaseHosts are the release hosts the self-updater trusts when the
+// release root is supplied through the environment. Subdomains count as
+// pinned; any other host must be requested with an explicit --base-url.
+var updateReleaseHosts = []string{"drive9.ai"}
+
+func isPinnedUpdateHost(baseURL string) bool {
+	parsed, err := url.Parse(baseURL)
+	if err != nil || parsed.Host == "" {
+		return false
+	}
+	host := strings.ToLower(parsed.Hostname())
+	for _, pinned := range updateReleaseHosts {
+		if host == pinned || strings.HasSuffix(host, "."+pinned) {
+			return true
+		}
+	}
+	return false
+}
+
+// withPinnedUpdateRedirects returns a copy of client that refuses redirects to
+// hosts outside updateReleaseHosts, so pinning a release root also covers the
+// requests that follow redirects.
+func withPinnedUpdateRedirects(client *http.Client, allowInsecure bool) *http.Client {
+	if client == nil {
+		client = &http.Client{Timeout: updateCommandTimeout}
+	}
+	cloned := *client
+	next := client.CheckRedirect
+	cloned.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		// A custom CheckRedirect replaces the client's default ten-hop limit.
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
+		if !allowInsecure && req.URL.Scheme != "https" {
+			return fmt.Errorf("refusing redirect to %s: drive9 updates require https", req.URL.Redacted())
+		}
+		if !isPinnedUpdateHost(req.URL.String()) {
+			return fmt.Errorf("refusing redirect to %s: not a pinned drive9 release host (%s)", req.URL.Redacted(), strings.Join(updateReleaseHosts, ", "))
+		}
+		if next != nil {
+			return next(req, via)
+		}
+		return nil
+	}
+	return &cloned
 }
 
 func validateUpdateBaseURL(baseURL string, allowInsecure bool) error {

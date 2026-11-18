@@ -338,6 +338,32 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 	} else if hasReservations {
 		return nil, forkErr(http.StatusConflict, "source tenant has active upload reservations")
 	}
+	// A fork is a new billable tenant: it consumes a tenant slot in the
+	// source's organization and must be visible to billing. Resolve the source
+	// binding first and fail closed when it is missing, because an unbound fork
+	// is invisible to ListTenantStorageTierUsage and its API-key org
+	// resolution, i.e. it would run unbilled.
+	orgID, err := s.forkSourceOrganization(ctx, source)
+	if err != nil {
+		return nil, err
+	}
+	releaseFreeQuota, err := s.enforceForkFreePlanCeiling(ctx, source, orgID, credentialReq)
+	if err != nil {
+		return nil, err
+	}
+	// The lock stays held until the fork's organization binding is durable:
+	// CountTiDBCloudFreeTenants joins tenant_tidbcloud_org_bindings, so a fork
+	// released before its binding is written is invisible to the next request
+	// and two overlapping forks could both pass the ceiling.
+	defer func() {
+		if releaseFreeQuota == nil {
+			return
+		}
+		if releaseErr := releaseFreeQuota(); releaseErr != nil {
+			logger.Error(ctx, "fork_free_quota_lock_release_failed",
+				zap.String("organization_id", orgID), zap.Error(releaseErr))
+		}
+	}()
 	forkPassword, err := generateForkDBPassword(24)
 	if err != nil {
 		return nil, err
@@ -479,6 +505,30 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 		s.deleteForkBranchOrPersist(backgroundWithTrace(ctx), forkID, credentialReq, cluster)
 		s.markForkFailed(ctx, forkID)
 		return nil, makeProvisionFailedErr(err)
+	}
+
+	// Attribute the fork to the source tenant's organization. This is the
+	// billing join: storage-tier usage and API-key org resolution both read
+	// tenant_tidbcloud_org_bindings, so an unbound fork would run unbilled. The
+	// write happens once the branch exists because the binding's uniqueness is
+	// (organization, cluster, branch): writing it earlier would collide with the
+	// source tenant's own binding, which has no branch dimension.
+	if orgID != "" {
+		if err := s.meta.UpsertTenantTiDBCloudOrgBinding(ctx, &meta.TenantTiDBCloudOrgBinding{
+			TenantID:       forkID,
+			OrganizationID: orgID,
+			ClusterID:      cluster.ClusterID,
+			UpdatedAt:      now,
+		}); err != nil {
+			logger.Error(ctx, "fork_org_binding_failed",
+				zap.String("source_tenant_id", source.ID),
+				zap.String("fork_id", forkID),
+				zap.String("organization_id", orgID),
+				zap.Error(err))
+			s.deleteForkBranchOrPersist(backgroundWithTrace(ctx), forkID, credentialReq, cluster)
+			s.markForkFailed(ctx, forkID)
+			return nil, makeProvisionFailedErr(err)
+		}
 	}
 
 	if source.Provider == tenant.ProviderTiDBCloudNative {
@@ -1158,4 +1208,87 @@ func (s *Server) resumeForkCleanup(ctx context.Context, tenants []meta.Tenant) {
 		}(t.ID)
 	}
 	wg.Wait()
+}
+
+// forkSourceOrganization resolves the TiDB Cloud organization a fork must be
+// billed to. Forks inherit their source's binding; a source without one cannot
+// produce a billable fork, so the request is refused instead of minting a
+// tenant that no organization pays for.
+func (s *Server) forkSourceOrganization(ctx context.Context, source *meta.Tenant) (string, error) {
+	if source == nil {
+		return "", forkErr(http.StatusConflict, "source tenant is required")
+	}
+	if !tenant.UsesTiDBCloudNativeCredentials(source.Provider) {
+		// Providers without the TiDB Cloud org-binding model (legacy starter)
+		// have no organization to inherit, so a fork stays an unbilled local
+		// resource exactly as before. Only native tenants are billable, and only
+		// they must be bound.
+		return "", nil
+	}
+	binding, err := s.meta.GetTenantTiDBCloudOrgBinding(ctx, source.ID)
+	if err != nil {
+		if errors.Is(err, meta.ErrNotFound) {
+			return "", forkErr(http.StatusConflict, "source tenant is not bound to a TiDB Cloud organization; a fork must be billable")
+		}
+		return "", fmt.Errorf("resolve source tenant organization binding: %w", err)
+	}
+	orgID := strings.TrimSpace(binding.OrganizationID)
+	if orgID == "" {
+		return "", forkErr(http.StatusConflict, "source tenant is not bound to a TiDB Cloud organization; a fork must be billable")
+	}
+	return orgID, nil
+}
+
+// enforceForkFreePlanCeiling applies the same free-plan tenant ceiling that
+// POST /v1/provision checks. Without it, a fork is an unbounded way around the
+// limit: the source organization could mint tenants forever through
+// POST /v1/fork while every other provisioning path refused.
+//
+// The ceiling only applies to free organizations, and only when the plan can be
+// resolved; a paid organization is not counted. Forks of providers without a
+// TiDB Cloud credential model (local, shared) are bound to no plan and are not
+// capped here.
+func (s *Server) enforceForkFreePlanCeiling(ctx context.Context, source *meta.Tenant, orgID string, credentialReq *tenant.CredentialProvisionRequest) (func() error, error) {
+	if s.meta == nil || orgID == "" {
+		return nil, nil
+	}
+	if credentialReq == nil {
+		if source != nil && source.Provider != tenant.ProviderTiDBCloudNative {
+			return nil, nil
+		}
+		credentialReq = resolveDefaultCredentials(s.provisioner, tenant.ProviderTiDBCloudNative)
+	}
+	if credentialReq == nil {
+		return nil, nil
+	}
+	if s.tidbCloudPlanCache.isNonFree(orgID) {
+		return nil, nil
+	}
+	resolver, ok := s.provisioner.(tenant.TiDBCloudOrganizationPlanResolver)
+	if !ok {
+		return nil, nil
+	}
+	plan, err := resolver.ResolveOrganizationPlan(ctx, orgID, *credentialReq)
+	if err != nil {
+		return nil, fmt.Errorf("resolve fork organization plan: %w", err)
+	}
+	if plan == nil || !plan.IsFree {
+		return nil, nil
+	}
+	// A reservation becomes countable only after its native org binding is
+	// durable, so the caller holds this lock through the fork's binding write.
+	release, err := s.meta.AcquireTiDBCloudFreeQuotaLock(ctx, orgID)
+	if err != nil {
+		return nil, err
+	}
+	count, err := s.meta.CountTiDBCloudFreeTenants(ctx, orgID)
+	if err != nil {
+		_ = release()
+		return nil, err
+	}
+	if count >= s.tidbCloudFreePlanLimits.TenantCount {
+		_ = release()
+		return nil, forkErr(http.StatusForbidden, tenant.ErrTiDBCloudFreeTenantLimitReached.Error())
+	}
+	return release, nil
 }

@@ -347,6 +347,12 @@ func (h *bufferingHandle) adoptAppendImageLocked(image []byte, landedRev int64) 
 	// on top immediately after).
 	h.buf = next
 	h.appendSnapshot = true
+	// The rebuilt image is composed from the REMOTE's landed bytes plus this
+	// handle's own writes: whatever pending generation this handle staged
+	// before is either already landed (and resolved by the queue's own
+	// success path) or was not composed into this image, so the handle can no
+	// longer claim to contain it.
+	h.supersededPendingGen = 0
 	if landedRev > h.baseRev {
 		h.baseRev = landedRev
 		h.isNew = false

@@ -47,19 +47,9 @@ func MountVault(opts *VaultMountOptions) error {
 		return err
 	}
 
-	vfs := NewVaultFS(c, opts.DirTTL)
+	vfs := NewVaultFSWithOptions(c, opts.DirTTL, opts.AllowOther)
 
-	fuseOpts := &gofuse.MountOptions{
-		FsName:     "drive9-vault",
-		Name:       "drive9-vault",
-		Debug:      opts.Debug,
-		AllowOther: opts.AllowOther,
-		// Always read-only at the kernel level too (belt-and-braces with
-		// the in-process EROFS rejections).
-		Options: []string{"ro"},
-	}
-
-	server, err := gofuse.NewServer(vfs, opts.MountPoint, fuseOpts)
+	server, err := gofuse.NewServer(vfs, opts.MountPoint, newVaultMountOptions(opts))
 	if err != nil {
 		return fmt.Errorf("fuse mount vault: %w", err)
 	}
@@ -120,6 +110,55 @@ func MountVault(opts *VaultMountOptions) error {
 	fmt.Fprintf(os.Stderr, "drive9: vault mounted on %s (server: %s, secrets: %d)\n", opts.MountPoint, opts.Server, len(secrets))
 	server.Wait()
 	return nil
+}
+
+// newVaultMountOptions assembles the kernel mount options for a vault mount.
+//
+// A private mount is already restricted by the kernel to the mounting user, so the
+// mode bits VaultFS reports are what protect it. Sharing is an explicit --allow-other
+// opt-in, and on a shared mount default_permissions is what makes the kernel enforce
+// 0400/0500 (0444/0555 when shared) once other users may traverse it — on Linux and on
+// macOS alike; without it macFUSE forwards the decision to VaultFS, which has no
+// per-user handler, and every local user can read the plaintext secrets. Mirrors
+// newGoFuseMountOptions in pkg/fuse.
+func newVaultMountOptions(opts *VaultMountOptions) *gofuse.MountOptions {
+	return newVaultMountOptionsFor(runtime.GOOS, opts)
+}
+
+// newVaultMountOptionsFor is the platform-parameterised form, so both branches
+// are testable on any host.
+func newVaultMountOptionsFor(goos string, opts *VaultMountOptions) *gofuse.MountOptions {
+	fuseOpts := &gofuse.MountOptions{
+		FsName:     "drive9-vault",
+		Name:       "drive9-vault",
+		Debug:      opts.Debug,
+		AllowOther: opts.AllowOther,
+		// Always read-only at the kernel level too (belt-and-braces with
+		// the in-process EROFS rejections).
+		Options: []string{"ro"},
+	}
+	if goos == "linux" {
+		if opts.AllowOther {
+			fuseOpts.Options = append(fuseOpts.Options, "default_permissions")
+		}
+	}
+	if goos == "darwin" {
+		// macFUSE checks mode bits in the kernel only with default_permissions;
+		// without it every authorization is an ACCESS upcall to VaultFS, which has no
+		// per-user handler. A shared mount therefore arms the kernel like the Linux
+		// branch, while a private one is already kernel-restricted to the mounting
+		// user and keeps defer_permissions to stay off the per-operation path.
+		if opts.AllowOther {
+			fuseOpts.Options = append(fuseOpts.Options, "default_permissions", "local")
+		} else {
+			fuseOpts.Options = append(fuseOpts.Options, "defer_permissions", "local")
+		}
+	}
+	// Other platforms (e.g. FreeBSD) take neither branch, so an allow_other vault
+	// mount there keeps the pre-change exposure: VaultFS has no daemon-side gate of
+	// its own, unlike pkg/fuse, which falls back to its daemon gate where the kernel
+	// is not armed. A platform that supports a kernel-side flag should add it here.
+	return fuseOpts
 }
 
 // probeVaultMount validates opts, constructs the vault client, and runs the

@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"crypto/subtle"
+	"crypto/tls"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -56,13 +58,23 @@ type Config struct {
 	LegacyStarterProvisioner tenant.Provisioner
 	TokenSecret              []byte
 	LocalTenantAPIKey        string
-	VaultMasterKey           []byte // 32-byte AES key for vault DEK wrapping; nil disables vault
-	VaultIssuerURL           string // canonical server URL placed in grant `iss` claim; empty = server hostname unknown, grants disabled
-	PublicURL                string // externally reachable base URL for client responses (e.g., slock callback server_url)
-	Backend                  *backend.Dat9Backend
-	LocalS3                  *s3client.LocalS3Client
-	S3Dir                    string
-	MaxUploadBytes           int64
+	// AllowAnonymousProvision accepts POST /v1/provision without a caller key
+	// pair, provisioning with the server's own default TiDB Cloud credential.
+	// It is off by default: an anonymous caller would otherwise spend the
+	// deployment's credential to create tenants. provider=local keeps its
+	// loopback-only anonymous mode.
+	AllowAnonymousProvision bool
+	VaultMasterKey          []byte // 32-byte AES key for vault DEK wrapping; nil disables vault
+	// VaultMasterKeyPrevious lists retired vault master keys. DEK unwrap tries
+	// them after the primary, so the master key can be rotated without losing
+	// stored secrets; new wraps always use VaultMasterKey.
+	VaultMasterKeyPrevious [][]byte
+	VaultIssuerURL         string // canonical server URL placed in grant `iss` claim; empty = server hostname unknown, grants disabled
+	PublicURL              string // externally reachable base URL for client responses (e.g., slock callback server_url)
+	Backend                *backend.Dat9Backend
+	LocalS3                *s3client.LocalS3Client
+	S3Dir                  string
+	MaxUploadBytes         int64
 	// TenantPoolMaxSize caps admin tenant pool create/update target size. Values
 	// <= 0 are normalized to DefaultTenantPoolMaxSize; the pool is never
 	// intentionally uncapped.
@@ -189,6 +201,9 @@ type Server struct {
 	pool                  *tenant.Pool
 	provisioner           tenant.Provisioner
 	defaultTenantProvider string
+	// allowAnonymousProvision is the resolved policy for POST /v1/provision
+	// with no caller credentials.
+	allowAnonymousProvision bool
 
 	legacyStarterProvisioner  tenant.Provisioner
 	tokenSecret               []byte
@@ -247,6 +262,12 @@ type Server struct {
 	leaderWorkerMu       sync.Mutex
 	leaderWorkersStarted bool
 	leaderWorkerStopDone chan struct{}
+	// nativePrivilegeRetire* carry per-tenant retry state for the legacy-grant
+	// cleanup, so a failing tenant is retried with backoff instead of on every pass.
+	nativePrivilegeRetireMu       sync.Mutex
+	nativePrivilegeRetireFailures map[string]int
+	nativePrivilegeRetireRetryAt  map[string]time.Time
+	nativePrivilegeRetireDone     map[string]time.Time
 	// replayWorker and expirySweepWorker are leader-gated central quota
 	// workers owned by the server (single callback owner). Started in
 	// startLeaderWorkers and stopped in stopLeaderWorkers so they follow
@@ -384,7 +405,7 @@ func NewWithConfig(cfg Config) *Server {
 	var vaultMK *vault.MasterKey
 	if len(cfg.VaultMasterKey) > 0 {
 		var err error
-		vaultMK, err = vault.NewMasterKey(cfg.VaultMasterKey)
+		vaultMK, err = vault.NewMasterKeyWithPrevious(cfg.VaultMasterKey, cfg.VaultMasterKeyPrevious)
 		if err != nil {
 			srvLog.Warn("vault master key invalid, vault disabled", zap.Error(err))
 		} else {
@@ -410,16 +431,17 @@ func NewWithConfig(cfg Config) *Server {
 	forkWorkerCtx, forkWorkerCancel := context.WithCancel(context.Background())
 	sweepCtx, sweepCancel := context.WithCancel(backgroundWithTrace(context.Background()))
 	s := &Server{
-		fallback:              cfg.Backend,
-		meta:                  cfg.Meta,
-		pool:                  cfg.Pool,
-		tokenSecret:           cfg.TokenSecret,
-		localTenantAPIKey:     strings.TrimSpace(cfg.LocalTenantAPIKey),
-		vaultMK:               vaultMK,
-		vaultIssuerURL:        strings.TrimSpace(cfg.VaultIssuerURL),
-		publicURL:             strings.TrimRight(strings.TrimSpace(cfg.PublicURL), "/"),
-		provisioner:           cfg.Provisioner,
-		defaultTenantProvider: defaultTenantProvider,
+		fallback:                cfg.Backend,
+		meta:                    cfg.Meta,
+		pool:                    cfg.Pool,
+		tokenSecret:             cfg.TokenSecret,
+		localTenantAPIKey:       strings.TrimSpace(cfg.LocalTenantAPIKey),
+		vaultMK:                 vaultMK,
+		vaultIssuerURL:          strings.TrimSpace(cfg.VaultIssuerURL),
+		publicURL:               strings.TrimRight(strings.TrimSpace(cfg.PublicURL), "/"),
+		provisioner:             cfg.Provisioner,
+		defaultTenantProvider:   defaultTenantProvider,
+		allowAnonymousProvision: cfg.AllowAnonymousProvision,
 
 		legacyStarterProvisioner:  cfg.LegacyStarterProvisioner,
 		maxUploadBytes:            maxUpload,
@@ -495,10 +517,12 @@ func NewWithConfig(cfg Config) *Server {
 	mux.Handle("/v1/uploads", business)
 	mux.Handle("/v1/uploads/", business)
 	mux.Handle("/v2/uploads/", business)
-	mux.Handle("/v1/tokens", business)
-	mux.Handle("/v1/tokens/", business)
-	mux.Handle("/v1/tenant", business)
-	mux.Handle("/v1/fork", business)
+	mux.Handle("/v1/tokens", s.adminAuditMiddleware(business))
+	mux.Handle("/v1/tokens/", s.adminAuditMiddleware(business))
+	// Self-service destructive operations are audited too; the wrapper sits outside
+	// tenant auth so a refused attempt is recorded with the caller it presented.
+	mux.Handle("/v1/tenant", s.adminAuditMiddleware(business))
+	mux.Handle("/v1/fork", s.adminAuditMiddleware(business))
 	mux.Handle("/v1/sql", business)
 	mux.Handle("/v1/events", business)
 	mux.Handle("/v1/journals", business)
@@ -510,15 +534,14 @@ func NewWithConfig(cfg Config) *Server {
 	mux.Handle("/v1/layers/", business)
 	mux.Handle("/v1/layer-checkpoints/", business)
 	mux.Handle("/v1/object-credentials", business)
-	mux.Handle("/v1/extent/meta", business)
-	mux.Handle("/v1/data-credential", business)
 	// Vault management API goes through tenant auth.
-	mux.Handle("/v1/vault/secrets", business)
-	mux.Handle("/v1/vault/secrets/", business)
-	mux.Handle("/v1/vault/tokens", business)
-	mux.Handle("/v1/vault/tokens/", business)
-	mux.Handle("/v1/vault/grants", business)
-	mux.Handle("/v1/vault/grants/", business)
+	// Vault mutations are audited (including refusals); the read surface is not.
+	mux.Handle("/v1/vault/secrets", s.adminAuditMiddleware(business))
+	mux.Handle("/v1/vault/secrets/", s.adminAuditMiddleware(business))
+	mux.Handle("/v1/vault/tokens", s.adminAuditMiddleware(business))
+	mux.Handle("/v1/vault/tokens/", s.adminAuditMiddleware(business))
+	mux.Handle("/v1/vault/grants", s.adminAuditMiddleware(business))
+	mux.Handle("/v1/vault/grants/", s.adminAuditMiddleware(business))
 	mux.Handle("/v1/vault/audit", business)
 	// Vault read (consumption) API: authenticated by capability token, NOT tenant token.
 	if s.vaultMK != nil && cfg.Pool != nil && cfg.Meta != nil {
@@ -534,17 +557,19 @@ func NewWithConfig(cfg Config) *Server {
 		})))
 	}
 	mux.HandleFunc("/v1/status", s.handleTenantStatus)
-	mux.HandleFunc("/v1/provision", s.handleProvision)
-	mux.Handle("/v1/quota", s.quotaRootHandler(cfg))
-	mux.Handle("/v1/admin/tenant-pool", s.adminTenantPoolHandler())
-	mux.Handle("/v1/admin/tenants", s.adminTenantsRootHandler())
-	mux.Handle("/v1/admin/tenants/", s.adminTenantsItemHandler())
-	mux.Handle("/v1/admin/object-backends", s.adminObjectBackendsHandler())
-	mux.Handle("/v1/admin/object-backends/", s.adminObjectBackendsHandler())
+	// Control-plane mutations carry an audit record for every attempt, refused or
+	// not; the middleware wraps the handler so a request rejected before it runs is
+	// still recorded.
+	mux.Handle("/v1/provision", s.adminAuditMiddleware(http.HandlerFunc(s.handleProvision)))
+	mux.Handle("/v1/quota", s.adminAuditMiddleware(s.quotaRootHandler(cfg)))
+	mux.Handle("/v1/admin/tenant-pool", s.adminAuditMiddleware(s.adminTenantPoolHandler()))
+	mux.Handle("/v1/admin/tenants", s.adminAuditMiddleware(s.adminTenantsRootHandler()))
+	mux.Handle("/v1/admin/tenants/", s.adminAuditMiddleware(s.adminTenantsItemHandler()))
+	mux.Handle("/v1/admin/object-backends", s.adminAuditMiddleware(s.adminObjectBackendsHandler()))
+	mux.Handle("/v1/admin/object-backends/", s.adminAuditMiddleware(s.adminObjectBackendsHandler()))
 	mux.HandleFunc("/v1/auth/slock/login", s.handleSlockLogin)
 	mux.HandleFunc("/v1/auth/slock/callback", s.handleSlockCallback)
 	mux.HandleFunc("/healthz", s.handleHealthz)
-	mux.HandleFunc("/metrics", s.handleMetrics)
 
 	local := cfg.LocalS3
 	if local == nil && cfg.Backend != nil {
@@ -742,9 +767,8 @@ func (s *Server) startNotifyInfrastructure(cfg Config) {
 
 	// Shard resolver: refresh the active pod ring synchronously before the
 	// poller starts so ownsTenant has a valid ring on startup. The tenant worker
-	// gets the same resolver so the extent quota report — the one extent job
-	// that is a read-modify-write of shared state rather than a database-claimed
-	// queue item — runs on the owner only.
+	// gets the same resolver so jobs that are read-modify-writes of shared
+	// state rather than database-claimed queue items run on the owner only.
 	resolver := newSemanticShardResolver(s.meta, cfg.PodID, cfg.TenantShardRefreshInterval)
 	resolver.Start(context.Background())
 	s.shardResolver = resolver
@@ -989,6 +1013,29 @@ func (s *Server) startLeaderWorkers() {
 				}
 			})
 		}
+	}
+	// Periodic cleanup of the legacy cluster-wide SYSTEM_VARIABLES_ADMIN grant on
+	// native tenants, whose per-tenant setup never runs again once they are active.
+	// Deliberately outside the provisioner-gated block: the pass needs only meta and
+	// pool, and it must keep running when a deployment switched its provider and its
+	// provisioner no longer constructs — which is exactly the state that leaves old
+	// native tenants behind. Periodic rather than one-shot so a tenant that becomes
+	// active later, or a failed attempt, is retried without waiting for a leadership
+	// change.
+	if s.meta != nil && s.pool != nil {
+		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
+			ticker := time.NewTicker(nativePrivilegeRetireInterval)
+			defer ticker.Stop()
+			s.retireNativeTenantVariablesPrivilege(workerCtx)
+			for {
+				select {
+				case <-workerCtx.Done():
+					return
+				case <-ticker.C:
+					s.retireNativeTenantVariablesPrivilege(workerCtx)
+				}
+			}
+		})
 	}
 	// Central-quota workers: the server owns these as the single leader-callback
 	// owner so they start/stop with leadership transitions (previously they were
@@ -1511,13 +1558,87 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.observe(s.mux, w, r)
 }
 
+const (
+	// envTLSCertFile and envTLSKeyFile make the API listener serve HTTPS
+	// directly. Without them the API is plaintext and TLS must be terminated in
+	// front of it.
+	envTLSCertFile = "DRIVE9_TLS_CERT_FILE"
+	envTLSKeyFile  = "DRIVE9_TLS_KEY_FILE"
+)
+
+// isLoopbackListenAddr reports whether addr only accepts loopback connections.
+// EnvTLSAllowPlaintext opts a deployment into serving the API over plaintext on a
+// non-loopback address, which is correct only when TLS is terminated in front of
+// this server (NLB/ALB/ingress).
+const EnvTLSAllowPlaintext = "DRIVE9_TLS_ALLOW_PLAINTEXT"
+
+// tlsPlaintextAllowed reports whether the operator explicitly allowed a plaintext
+// listener on a non-loopback address. Parsing is fail-closed: only an affirmative
+// value allows it.
+func tlsPlaintextAllowed() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(EnvTLSAllowPlaintext))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func isLoopbackListenAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	host = strings.Trim(host, "[]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 func (s *Server) ListenAndServe(addr string) error {
 	logger.Info(backgroundWithTrace(context.Background()), "server_start", zap.String("addr", addr), zap.Int64("max_upload_bytes", s.maxUploadBytes))
-	httpSrv := &http.Server{Addr: addr, Handler: s}
+	httpSrv := &http.Server{
+		Addr:              addr,
+		Handler:           s,
+		ReadHeaderTimeout: 15 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    1 << 20,
+		TLSConfig:         &tls.Config{MinVersion: tls.VersionTLS12},
+	}
+	// The API carries bearer tokens, vault secrets and file bytes. Serve HTTPS
+	// directly when a certificate is configured; otherwise say plainly that the
+	// listener is plaintext so an operator cannot mistake an unencrypted
+	// deployment for an encrypted one.
+	tlsCertFile := strings.TrimSpace(os.Getenv(envTLSCertFile))
+	tlsKeyFile := strings.TrimSpace(os.Getenv(envTLSKeyFile))
+	if (tlsCertFile == "") != (tlsKeyFile == "") {
+		return fmt.Errorf("%s and %s must be set together", envTLSCertFile, envTLSKeyFile)
+	}
+	if tlsCertFile == "" && !isLoopbackListenAddr(addr) {
+		// Bearer tokens, vault plaintext and file bytes all cross this listener, so a
+		// non-loopback plaintext bind is a decision the operator has to make
+		// explicitly instead of something that happens by default. Ingress-terminated
+		// TLS is the common deployment, which is why the opt-out exists.
+		if !tlsPlaintextAllowed() {
+			return fmt.Errorf("refusing to serve plaintext on %q: set %s/%s to serve HTTPS, or %s=1 when TLS is terminated in front of this server",
+				addr, envTLSCertFile, envTLSKeyFile, EnvTLSAllowPlaintext)
+		}
+		logger.Warn(backgroundWithTrace(context.Background()), "server_plaintext_listener",
+			zap.String("addr", addr),
+			zap.String("hint", "set "+envTLSCertFile+"/"+envTLSKeyFile+" to serve HTTPS, or "+EnvTLSAllowPlaintext+"=1 when TLS is terminated in front of this server"))
+	}
 	s.httpSrvMu.Lock()
 	s.httpSrv = httpSrv
 	s.httpSrvMu.Unlock()
-	err := httpSrv.ListenAndServe()
+	var err error
+	if tlsCertFile != "" {
+		logger.Info(backgroundWithTrace(context.Background()), "server_tls_enabled", zap.String("addr", addr))
+		err = httpSrv.ListenAndServeTLS(tlsCertFile, tlsKeyFile)
+	} else {
+		err = httpSrv.ListenAndServe()
+	}
 	if errors.Is(err, http.ErrServerClosed) {
 		// Shutdown (SIGINT/SIGTERM) drained the server; not an error.
 		return nil
@@ -1580,10 +1701,6 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 		s.handleFSLayers(w, r)
 	case r.URL.Path == "/v1/object-credentials":
 		s.handleObjectCredentials(w, r)
-	case r.URL.Path == "/v1/extent/meta":
-		s.handleExtentMeta(w, r)
-	case r.URL.Path == "/v1/data-credential":
-		s.handleDataCredential(w, r)
 	case strings.HasPrefix(r.URL.Path, "/v1/vault/secrets"), strings.HasPrefix(r.URL.Path, "/v1/vault/tokens"), strings.HasPrefix(r.URL.Path, "/v1/vault/grants"), strings.HasPrefix(r.URL.Path, "/v1/vault/audit"):
 		s.handleVault(w, r)
 	default:
@@ -2016,6 +2133,19 @@ func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The status response is the capability negotiation surface, and every capability it
+	// carries is an owner contract (batch_write_mode_v1 enforces owner-only mode bits). An
+	// fs_scoped key must not read it: its mount would attach hasMode to every writeback and
+	// be denied per item on each cycle. The scoped allowlist never runs for this route — it
+	// is registered directly on the mux — so the refusal lives here, after authentication
+	// (a revoked scoped key still answers 401, not 403). Trade-off, accepted: a scoped
+	// client also loses inline_threshold negotiation, so its uploads take the multipart path.
+	if !statusAllowedForKey(&resolved.APIKey) {
+		metricEvent(r.Context(), "auth", "result", "scope_kind_unsupported")
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_scoped_key_denied", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID, "scope_kind", resolved.APIKey.ScopeKind)...)
+		errJSON(w, http.StatusForbidden, "status is owner-only")
+		return
+	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_ok", "tenant_id", resolved.Tenant.ID, "status", resolved.Tenant.Status)...)
 	_ = json.NewEncoder(w).Encode(TenantStatusResponse{
 		Status:          string(resolved.Tenant.Status),
@@ -2024,6 +2154,20 @@ func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 		MaxUploadBytes:  s.maxUploadBytes,
 		InlineThreshold: s.inlineThreshold,
 	})
+}
+
+// statusAllowedForKey reports whether the status capability contract may be served to
+// this token. Scoped keys are excluded: every capability it advertises is an owner
+// contract today.
+func statusAllowedForKey(key *meta.APIKey) bool {
+	if key == nil {
+		return false
+	}
+	scopeKind := key.ScopeKind
+	if scopeKind == "" {
+		scopeKind = meta.APIKeyScopeKindOwner
+	}
+	return scopeKind != meta.APIKeyScopeKindFS
 }
 
 func (s *Server) tenantStatusMessage(t *meta.Tenant) string {
@@ -2190,17 +2334,6 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, path string)
 		return
 	}
 
-	if plan.ExtentIno != 0 {
-		w.Header().Set("X-Dat9-Content-Layout", "extent")
-		w.Header().Set("X-Dat9-Storage-Type", "extent")
-		w.Header().Set("X-Dat9-Extent-Ino", strconv.FormatUint(plan.ExtentIno, 10))
-		w.Header().Set("X-Dat9-Extent-Length", strconv.FormatInt(plan.Size, 10))
-		logger.Info(r.Context(), "server_event", eventFields(r.Context(), "read_extent_hint", "path", path, "extent_ino", plan.ExtentIno, "size", plan.Size)...)
-		metricEvent(r.Context(), "fs_read", "result", "ok")
-		errJSON(w, http.StatusUnprocessableEntity, "extent content is not served inline")
-		return
-	}
-
 	if plan.PresignURL != "" {
 		logger.InfoBenchTiming(r.Context(), "server_read_timing",
 			zap.String("path", path),
@@ -2278,9 +2411,6 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string)
 		HasMode    bool   `json:"hasMode"`
 		ResourceID string `json:"resource_id,omitempty"`
 		Nlink      uint32 `json:"nlink,omitempty"`
-		// ExtentIno lets a client route an entry to the extent data plane
-		// straight from the listing; 0 means single-layout (or an old server).
-		ExtentIno uint64 `json:"extent_ino,omitempty"`
 	}
 	out := make([]entry, 0, len(entries))
 	for _, e := range entries {
@@ -2301,12 +2431,6 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string)
 				revision = parsed
 			}
 		}
-		var extentIno uint64
-		if raw := e.Meta.Content["extent_ino"]; raw != "" {
-			if parsed, err := strconv.ParseUint(raw, 10, 64); err == nil {
-				extentIno = parsed
-			}
-		}
 		out = append(out, entry{
 			Name:       e.Name,
 			Size:       e.Size,
@@ -2317,7 +2441,6 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string)
 			HasMode:    hasMode,
 			ResourceID: e.Meta.Content["resource_id"],
 			Nlink:      nlink,
-			ExtentIno:  extentIno,
 		})
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -2377,6 +2500,8 @@ func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path
 	var revision int64
 	var mtime *int64
 	var contentType string
+	var storageType datastore.StorageType
+	var contentLayout datastore.ContentLayout
 	var semanticText string
 	var description string
 	resourceID := nf.Node.NodeID
@@ -2398,6 +2523,10 @@ func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path
 			mtime = &unix
 		}
 		contentType = nf.File.ContentType
+		if !nf.Node.IsDirectory {
+			storageType = nf.File.StorageType
+			contentLayout = datastore.ContentLayoutSingle
+		}
 		semanticText = nf.File.ContentText
 		description = nf.File.Description
 
@@ -2415,28 +2544,38 @@ func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "stat_metadata_ok", "path", path, "is_dir", nf.Node.IsDirectory)...)
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Dat9-Mtime", strconv.FormatInt(*mtime, 10))
+	if storageType != "" {
+		w.Header().Set("X-Dat9-Storage-Type", string(storageType))
+	}
+	if contentLayout != "" {
+		w.Header().Set("X-Dat9-Content-Layout", string(contentLayout))
+	}
 	_ = json.NewEncoder(w).Encode(struct {
-		Size         int64             `json:"size"`
-		IsDir        bool              `json:"isdir"`
-		ResourceID   string            `json:"resource_id"`
-		Nlink        uint32            `json:"nlink,omitempty"`
-		Revision     int64             `json:"revision"`
-		Mtime        *int64            `json:"mtime,omitempty"`
-		ContentType  string            `json:"content_type"`
-		SemanticText string            `json:"semantic_text"`
-		Description  string            `json:"description"`
-		Tags         map[string]string `json:"tags"`
+		Size          int64                   `json:"size"`
+		IsDir         bool                    `json:"isdir"`
+		ResourceID    string                  `json:"resource_id"`
+		Nlink         uint32                  `json:"nlink,omitempty"`
+		Revision      int64                   `json:"revision"`
+		Mtime         *int64                  `json:"mtime,omitempty"`
+		ContentType   string                  `json:"content_type"`
+		StorageType   datastore.StorageType   `json:"storage_type,omitempty"`
+		ContentLayout datastore.ContentLayout `json:"content_layout,omitempty"`
+		SemanticText  string                  `json:"semantic_text"`
+		Description   string                  `json:"description"`
+		Tags          map[string]string       `json:"tags"`
 	}{
-		Size:         size,
-		IsDir:        nf.Node.IsDirectory,
-		ResourceID:   resourceID,
-		Nlink:        nlink,
-		Revision:     revision,
-		Mtime:        mtime,
-		ContentType:  contentType,
-		SemanticText: semanticText,
-		Description:  description,
-		Tags:         tags,
+		Size:          size,
+		IsDir:         nf.Node.IsDirectory,
+		ResourceID:    resourceID,
+		Nlink:         nlink,
+		Revision:      revision,
+		Mtime:         mtime,
+		ContentType:   contentType,
+		StorageType:   storageType,
+		ContentLayout: contentLayout,
+		SemanticText:  semanticText,
+		Description:   description,
+		Tags:          tags,
 	})
 }
 
@@ -3151,10 +3290,13 @@ func (s *Server) handleBatchWrite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	scope := ScopeFromContext(r.Context())
+	// chmod is owner-only for the whole request: the per-item denial and the mode fields
+	// that reach the backend both read this one decision.
+	chmodAuthorized := scope.CanChmod()
 	results := make([]batchWriteResult, len(req.Items))
 	allowedIndexes := make([]int, 0, len(req.Items))
 	backendItems := make([]backend.BatchWriteItem, 0, len(req.Items))
-	scope := ScopeFromContext(r.Context())
 	var totalBytes int64
 	for i, item := range req.Items {
 		results[i].Path = item.Path
@@ -3180,17 +3322,50 @@ func (s *Server) handleBatchWrite(w http.ResponseWriter, r *http.Request) {
 			results[i].Error = msg
 			continue
 		}
-		allowedIndexes = append(allowedIndexes, i)
-		backendItems = append(backendItems, backend.BatchWriteItem{
+		// chmod is owner-only (handleChmod), and a batch item's permission bits are the
+		// same escalation: an fs_scoped agent token would otherwise set arbitrary bits on
+		// a path it can write. Both fields count — mode is refused even without hasMode,
+		// because a silently ignored bit pattern is exactly the ambiguity a future
+		// refactor resolves in the wrong direction. Per-item 403 rather than a failed
+		// request, so the content-only items of the same batch still commit — the
+		// rejection contract BatchWriteResult documents for this capability. Ordered after
+		// the per-path authorization, as in the sibling repo: a path outside the caller's
+		// scope is answered by the scope check, not by the mode policy.
+		//
+		// This denial is only correct while a scoped token is never told the
+		// content+mode contract exists: if storage_capabilities.batch_write_mode_v1 is
+		// ever advertised, it has to be per token scope (owner only), or a scoped mount
+		// will attach hasMode to every commit and be denied on each writeback cycle.
+		if (item.HasMode || item.Mode != 0) && !chmodAuthorized {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "batch_write_mode_denied", "path", item.Path)...)
+			results[i].Status = http.StatusForbidden
+			results[i].Error = chmodOwnerOnlyMessage
+			continue
+		}
+		// The mode fields reach the backend only for a caller that may chmod. That is the
+		// same decision the denial above makes, applied to the data instead of the response:
+		// nothing below this handler — backend, mutation worker, or a future stage added
+		// between them — can observe permission bits a scoped request asked for.
+		backendItem := backend.BatchWriteItem{
 			Path:             item.Path,
 			Data:             item.Data,
 			ExpectedRevision: item.ExpectedRevision,
-			Mode:             item.Mode,
-			HasMode:          item.HasMode,
-		})
+		}
+		if chmodAuthorized {
+			backendItem.Mode = item.Mode
+			backendItem.HasMode = item.HasMode
+		}
+		allowedIndexes = append(allowedIndexes, i)
+		backendItems = append(backendItems, backendItem)
 	}
 
-	backendResults, err := b.BatchWriteCtx(r.Context(), backendItems)
+	// Only a chmod-authorized token's items may carry permission bits; the backend refuses
+	// them otherwise, so a future handler cannot skip this decision.
+	batchCtx := r.Context()
+	if chmodAuthorized {
+		batchCtx = backend.WithBatchWriteModeChanges(batchCtx)
+	}
+	backendResults, err := b.BatchWriteCtx(batchCtx, backendItems)
 	if err != nil {
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "batch_write_failed", "error", err)...)
 		errJSONInternalStorage(w, r, err)
@@ -3240,6 +3415,10 @@ func batchWriteStatusForError(err error) int {
 		return http.StatusNotFound
 	case errors.Is(err, datastore.ErrInvalidRootDentry):
 		return http.StatusBadRequest
+	case errors.Is(err, backend.ErrBatchWriteModeDenied):
+		// The backend refuses mode bits the HTTP layer did not authorize; report it as
+		// the same per-item 403 the handler's own denial uses, not a storage error.
+		return http.StatusForbidden
 	default:
 		return http.StatusInternalServerError
 	}
@@ -3248,6 +3427,11 @@ func batchWriteStatusForError(err error) int {
 func batchWriteErrorMessage(err error, status int) string {
 	if status == http.StatusInternalServerError {
 		return internalStorageErrorMessage
+	}
+	if errors.Is(err, backend.ErrBatchWriteModeDenied) {
+		// One denial, one message: the handler's own 403 and the backend defense must
+		// read the same way to a client.
+		return chmodOwnerOnlyMessage
 	}
 	return err.Error()
 }
@@ -3444,15 +3628,6 @@ func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, path string)
 	if nlink > 0 {
 		w.Header().Set("X-Dat9-Nlink", strconv.FormatUint(uint64(nlink), 10))
 	}
-	// The layout rides along on the stat row itself (file_nodes.content_layout
-	// + extent_ino are selected by the stat query), so a normal mount pays no
-	// extra query to learn that an ordinary file is not an extent file.
-	if nf.ContentLayout != "" {
-		w.Header().Set("X-Dat9-Content-Layout", string(nf.ContentLayout))
-		if nf.ExtentIno != 0 {
-			w.Header().Set("X-Dat9-Extent-Ino", strconv.FormatUint(nf.ExtentIno, 10))
-		}
-	}
 	if nf.File != nil {
 		w.Header().Set("X-Dat9-Revision", strconv.FormatInt(nf.File.Revision, 10))
 		// Advertise the authoritative storage class so clients (notably FUSE
@@ -3496,7 +3671,17 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, path strin
 		case "":
 			err = b.RemoveCtx(r.Context(), path)
 		case "file":
-			err = b.RemoveFileCtx(r.Context(), path)
+			expRev, revErr := parseExpectedRevisionHeader(r.Header.Get("X-Dat9-Expected-Revision"))
+			if revErr != nil {
+				errJSON(w, http.StatusBadRequest, "invalid X-Dat9-Expected-Revision header")
+				return
+			}
+			expRes := r.Header.Get("X-Dat9-Expected-Resource")
+			if expRev > 0 || expRes != "" {
+				err = b.RemoveFileConditionalCtx(r.Context(), path, expRev, expRes)
+			} else {
+				err = b.RemoveFileCtx(r.Context(), path)
+			}
 		case "dir":
 			err = b.RemoveDirCtx(r.Context(), path)
 		default:
@@ -3564,6 +3749,9 @@ func (s *Server) handleCopy(w http.ResponseWriter, r *http.Request, dstPath stri
 	if !authorizeFSPair(w, r, FSOpRead, srcPath, FSOpWrite, dstPath) {
 		return
 	}
+	if !authorizeFSScopedAlias(w, r, srcPath) {
+		return
+	}
 	b := backendFromRequest(r)
 	if b == nil {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "copy_missing_scope", "dst_path", dstPath)...)
@@ -3600,6 +3788,9 @@ func (s *Server) handleHardlink(w http.ResponseWriter, r *http.Request, dstPath 
 		return
 	}
 	if !authorizeFSPair(w, r, FSOpRead, srcPath, FSOpWrite, dstPath) {
+		return
+	}
+	if !authorizeFSScopedAlias(w, r, srcPath) {
 		return
 	}
 	b := backendFromRequest(r)
@@ -3723,8 +3914,8 @@ func (s *Server) handleChmod(w http.ResponseWriter, r *http.Request, path string
 	// regardless of zone. The dispatcher already denies scoped tokens on
 	// POST /v1/fs/*?chmod, so reaching this handler with a scoped token
 	// indicates a defense-in-depth gap somewhere upstream — fail closed.
-	if scope := ScopeFromContext(r.Context()); scope != nil && scope.IsScoped {
-		errJSON(w, http.StatusForbidden, "chmod is owner-only")
+	if scope := ScopeFromContext(r.Context()); scope != nil && !scope.CanChmod() {
+		errJSON(w, http.StatusForbidden, chmodOwnerOnlyMessage)
 		return
 	}
 	b := backendFromRequest(r)
@@ -4787,6 +4978,14 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 				errJSON(w, http.StatusBadRequest, "TiDBCloud Mode requires public_key and private_key when quota settings are provided")
 				return
 			}
+			if !s.allowAnonymousProvision {
+				// No caller key pair and anonymous provisioning is disabled: the
+				// request must not spend the server's own credential.
+				logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "provision_credentials_required", "provider", provider)...)
+				metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
+				errJSON(w, http.StatusUnauthorized, "TiDB Cloud public_key and private_key are required")
+				return
+			}
 			defaultReq := resolveDefaultCredentials(s.provisioner, provider)
 			if defaultReq == nil {
 				errJSON(w, http.StatusBadRequest, tenant.ErrCredentialsRequired.Error())
@@ -4832,10 +5031,25 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	} else {
+		// This provider has no per-caller credential model, so a presented key
+		// pair is meaningless and rejected first.
 		if err := rejectCredentialProvisionBody(r); err != nil {
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "provision_credential_rejected", "provider", provider, "error", err)...)
 			metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
 			errJSON(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		// provider=local is the loopback-only development provider and is the one
+		// provider that stays anonymous — but only for callers on the loopback
+		// interface. Every other provider requires the explicit
+		// DRIVE9_ALLOW_ANONYMOUS_PROVISION opt-in, and a non-loopback deployment
+		// must not create tenants unauthenticated just because the local provider
+		// is selected (the startup guard only refuses that bind while generated
+		// development keys are in use).
+		if s.provisionRequiresAuthentication(r, provider) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "provision_credentials_required", "provider", provider)...)
+			metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
+			errJSON(w, http.StatusUnauthorized, "provisioning requires authentication")
 			return
 		}
 	}
@@ -5823,15 +6037,22 @@ func (s *Server) cleanupProvisionedClusterAfterProvisionFailure(ctx context.Cont
 	})
 }
 
+// dbTLSForProvisionedTenant records whether a provisioned tenant's connection
+// has its certificate verified. The DBTLS flag only distinguishes "verified
+// TLS" from "TLS without certificate verification", which is the explicit
+// DRIVE9_DB_TLS_SKIP_VERIFY opt-out; it never means "no TLS" for a non-local
+// provider (MySQLTLSParam enforces TLS for every non-loopback host). The
+// opt-out is recorded only for the provider whose endpoint it can apply to;
+// other providers keep DBTLS=true, and the DSN still uses skip-verify for a
+// non-loopback host when the operator set the variable.
 func dbTLSForProvisionedTenant(provider string) bool {
 	if provider == tenant.ProviderLocal {
 		return false
 	}
-	if !tenant.UsesTiDBCloudNativeCredentials(provider) {
-		return true
+	if tenant.UsesTiDBCloudNativeCredentials(provider) && tenant.DBTLSSkipVerifyRequested() {
+		return false
 	}
-	v := strings.TrimSpace(strings.ToLower(os.Getenv("DRIVE9_TIDBCLOUD_NATIVE_USE_PRIVATE_ENDPOINT")))
-	return v != "1" && v != "true" && v != "yes"
+	return true
 }
 
 func provisioningCloudRegion(provisioner tenant.Provisioner) (string, string) {
@@ -6226,7 +6447,7 @@ func (s *Server) handleGrep(w http.ResponseWriter, r *http.Request, path string)
 		return
 	}
 	if layerRef := strings.TrimSpace(r.URL.Query().Get("layer")); layerRef != "" {
-		results, err = overlayFSLayerGrep(r.Context(), b, layerRef, query, path, limit, results)
+		results, err = s.overlayFSLayerGrep(r.Context(), b, ScopeFromContext(r.Context()), layerRef, query, path, limit, results)
 		if err != nil {
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "grep_layer_failed", "path", path, "query_len", len(query), "limit", limit, "layer", layerRef, "error", err)...)
 			writeBackendError(w, r, err)
@@ -6323,7 +6544,7 @@ func (s *Server) handleFind(w http.ResponseWriter, r *http.Request, path string)
 	_ = json.NewEncoder(w).Encode(results)
 }
 
-func overlayFSLayerGrep(ctx context.Context, b *backend.Dat9Backend, layerRef, query, pathPrefix string, limit int, base []datastore.SearchResult) ([]datastore.SearchResult, error) {
+func (s *Server) overlayFSLayerGrep(ctx context.Context, b *backend.Dat9Backend, scope *TenantScope, layerRef, query, pathPrefix string, limit int, base []datastore.SearchResult) ([]datastore.SearchResult, error) {
 	layer, entries, err := resolveSearchLayerEntries(ctx, b, layerRef)
 	if err != nil {
 		return nil, err
@@ -6338,6 +6559,8 @@ func overlayFSLayerGrep(ctx context.Context, b *backend.Dat9Backend, layerRef, q
 		seen[r.Path] = struct{}{}
 	}
 	queryFold := strings.ToLower(query)
+	// Several entries can alias the same blob; resolve each ref once per request.
+	decisions := &fsLayerStorageRefDecisions{}
 	for i := range entries {
 		entry := &entries[i]
 		if _, ok := seen[entry.Path]; ok {
@@ -6348,6 +6571,16 @@ func overlayFSLayerGrep(ctx context.Context, b *backend.Dat9Backend, layerRef, q
 		}
 		if !fsLayerSearchPathMatches(entry.Path, pathPrefix) {
 			continue
+		}
+		// The bytes behind this entry may live outside the caller's scope. Skip
+		// the entry rather than answer: returning a match/no-match verdict here
+		// would leak content the object-read endpoint refuses to serve.
+		if err := s.authorizeFSLayerStorageRefWith(ctx, b.Store(), scope, entry, decisions); err != nil {
+			var denied *fsLayerStorageRefDenied
+			if errors.As(err, &denied) {
+				continue
+			}
+			return nil, err
 		}
 		matched, err := fsLayerEntryContains(ctx, b, entry, queryFold)
 		if err != nil {

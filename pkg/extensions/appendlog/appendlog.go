@@ -848,12 +848,12 @@ func (a *AppendLog) emit(e fs.Event) {
 // MarkPathUnlinked implements the facade's deferred-unlink handshake: the
 // facade has ALREADY postponed the remote delete (the name is gone from its
 // view), so the later flush dispatch performs it instead of deferring a
-// second time.
-func (a *AppendLog) MarkPathUnlinked(p string) {
-	if a.cl == nil {
-		return
+// second time. The in-memory deferral cannot fail.
+func (a *AppendLog) MarkPathUnlinked(p string) error {
+	if a.cl != nil {
+		a.facadeDeferred.Store(p, struct{}{})
 	}
-	a.facadeDeferred.Store(p, struct{}{})
+	return nil
 }
 
 // landedTruncation describes the truncation a landing embodied: has when the

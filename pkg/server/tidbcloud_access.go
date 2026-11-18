@@ -39,10 +39,19 @@ func (s *Server) authorizeTiDBCloudQuotaMutation(ctx context.Context, cred tenan
 }
 
 func (s *Server) resolveTiDBCloudAccessProfile(ctx context.Context, cred tenant.CredentialProvisionRequest, metricPath string) (*tiDBCloudAccessProfile, error) {
-	identity, err := s.resolveTiDBCloudIdentity(ctx, cred, metricPath)
+	// Organization-wide authority: only org:owner may act on every tenant in the
+	// organization. project:owner is project-scoped and has no project to be
+	// scoped to here.
+	identity, err := s.resolveTiDBCloudIdentity(ctx, cred, metricPath, tenant.TiDBCloudRoleOrgOwner)
 	if err != nil {
 		return nil, err
 	}
+	// Publish the authenticated identity for this request's audit record: the
+	// organization it resolved, and the public key the caller actually used (the body
+	// credential, which is what authenticated, not a header). Done here rather than
+	// in authorizeTiDBCloudAdminAccess because /v1/provision resolves the profile
+	// directly.
+	recordAdminAuditSubject(ctx, identity.OrganizationID, cred.PublicKey)
 	organizationID := strings.TrimSpace(identity.OrganizationID)
 	if s.tidbCloudPlanCache.isNonFree(organizationID) {
 		metrics.RecordTiDBCloudBillingCacheRequest(metricPath, "hit")

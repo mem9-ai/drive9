@@ -24,19 +24,24 @@ import (
 // They follow shell conventions (timeout(1), SIGINT, ssh).
 const (
 	execExitTimedOut = 124
+	execExitFailure  = 125
 	execExitCanceled = 130
 	execExitUnknown  = 255
 )
 
 // execProgressDelay is how long a command may take to start before the CLI
-// tells the user it is starting a sandbox.
+// tells the user it is starting a command.
 const execProgressDelay = 700 * time.Millisecond
 
 const execUsage = `usage: drive9 exec [flags] [--] command [arg...]
        drive9 exec [flags] 'shell command line'
 
-Run a command in a sandbox with your drive9 drive mounted at /workspace.
-Output streams live; the exit status is the command's.
+Run a command remotely against your drive9 drive at /workspace.
+The server selects a lightweight executor or a sandbox before starting.
+Output streams live; a completed command keeps its own exit status.
+Executor failures (including resource limits) return 125 with a diagnostic;
+they are not a command result such as grep's 1 for no matches. Output or writes
+may be partial. Commands are not automatically retried.
 
 Inside a local drive9 mount, the command runs in the matching directory,
 after your local changes are uploaded.
@@ -50,7 +55,7 @@ flags:
       --fresh              start in a new sandbox instead of reusing the warm one
       --layer REF          use a LayerFS layer view (layer ID, name, or tag:key=value)
       --read-only          mount the workspace read-only
-  -v, --verbose            show the sandbox, working directory, and duration
+  -v, --verbose            show the executor, working directory, and duration
 
 examples:
   drive9 exec npm test
@@ -211,8 +216,8 @@ func runExec(ctx context.Context, args []string, rt execRuntime) error {
 			progress.stop()
 			rt.execID.set(info.ExecutionID)
 			if options.verbose {
-				_, _ = fmt.Fprintf(rt.stderr, "drive9: running in %s sandbox at %s (%s, ready in %s)\n",
-					sandboxLabel(info.Sandbox), info.Cwd, info.ExecutionID, time.Since(started).Round(100*time.Millisecond))
+				_, _ = fmt.Fprintf(rt.stderr, "drive9: running in %s at %s (%s, ready in %s)\n",
+					execBackendLabel(info.Sandbox), info.Cwd, info.ExecutionID, time.Since(started).Round(100*time.Millisecond))
 			}
 			return nil
 		},
@@ -303,15 +308,19 @@ func currentCredentialFingerprint() string {
 	return ""
 }
 
-func sandboxLabel(sandbox string) string {
-	if sandbox == client.RuntimeSandboxWarm {
-		return "a warm"
+func execBackendLabel(sandbox string) string {
+	switch sandbox {
+	case client.RuntimeSandboxWarm:
+		return "a warm sandbox"
+	case client.RuntimeSandboxNew:
+		return "a new sandbox"
+	default:
+		return "the remote executor"
 	}
-	return "a new"
 }
 
 // execProgress shows a transient one-line status on a terminal while the
-// sandbox starts, and erases it before any command output appears.
+// command starts, and erases it before any command output appears.
 type execProgress struct {
 	mu      sync.Mutex
 	out     io.Writer
@@ -321,7 +330,7 @@ type execProgress struct {
 }
 
 func newExecProgress(out io.Writer, enabled bool) *execProgress {
-	return newExecProgressMessage(out, enabled, "drive9: starting sandbox…")
+	return newExecProgressMessage(out, enabled, "drive9: starting command…")
 }
 
 func newExecProgressMessage(out io.Writer, enabled bool, message string) *execProgress {
@@ -358,10 +367,11 @@ func (p *execProgress) stop() {
 
 func execError(err error, executionID string) error {
 	var (
-		busy     *client.RuntimeBusyError
-		timeout  *client.RuntimeTimeoutError
-		canceled *client.RuntimeCanceledError
-		start    *client.RuntimeStartError
+		busy      *client.RuntimeBusyError
+		timeout   *client.RuntimeTimeoutError
+		canceled  *client.RuntimeCanceledError
+		start     *client.RuntimeStartError
+		execution *client.RuntimeExecutionError
 	)
 	switch {
 	case errors.Is(err, client.ErrRuntimeNotEnabled):
@@ -380,6 +390,14 @@ func execError(err error, executionID string) error {
 		return &execStatusError{code: execExitUnknown, message: message}
 	case errors.As(err, &start):
 		return errors.New(start.Message)
+	case errors.As(err, &execution):
+		message := fmt.Sprintf("remote executor failed (%s): %s; output or writes may be partial", execution.Code, execution.Message)
+		if execution.ExecutionID != "" {
+			message += " (" + execution.ExecutionID + ")"
+		}
+		return &execStatusError{code: execExitFailure, message: message}
+	case errors.Is(err, context.Canceled):
+		return &execStatusError{code: execExitCanceled, message: "command canceled before execution"}
 	}
 	return err
 }

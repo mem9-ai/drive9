@@ -95,6 +95,8 @@ func (a Attr) IsSymlink() bool { return a.Kind == KindSymlink }
 type Entry struct {
 	Name string
 	Attr Attr
+	// ExtentIno pins the extent-plane inode for a listing row.
+	ExtentIno uint64
 	// Ino pins the FUSE inode a directory snapshot resolved the entry to.
 	// Zero = unresolved; the consumer resolves it (the facade fills it in
 	// when a listing snapshot is taken). A pinned inode keeps every
@@ -252,6 +254,10 @@ type Op struct {
 	Fh     uint64 // kernel file handle
 	Kernel any    // the raw kernel request the facade translated
 	Rev    int64  // compare-and-set base revision for writes; -1 = unconditional
+	// OpenAttr is the facade's cached inode view for a kernel OPEN. Core may
+	// answer the open from it instead of re-stating the remote; nil means the
+	// facade has no usable row and the terminal must probe.
+	OpenAttr *Attr
 
 	// Kind-dependent payloads: which fields apply depends on OpKind.
 	Offset int64  // read/write/fallocate start offset
@@ -288,6 +294,7 @@ type Op struct {
 	Name    string   // xattr name for Op{Get,Set,Remove}Xattr
 	Mask    uint32   // OpAccess mask
 	Fh2     uint64   // destination handle identity for OpCopyFileRange
+	Handle2 any      // destination handle token for OpCopyFileRange
 	Offset2 int64    // OpCopyFileRange destination offset
 	Lock    FileLock // OpGetLk / OpSetLk / OpSetLkw payload
 }
@@ -362,6 +369,23 @@ type FsStat struct {
 // and must not OR FOPEN_KEEP_CACHE back on; a plain zero reply cannot
 // express this ("no opinion" and "drop" collapse).
 const OpenFlagDropKernelCache uint32 = 1 << 31
+
+// KernelCreate reports whether an OpCreate originates from a kernel CREATE:
+// the kernel resolved the path as missing immediately before (its lookup
+// answered negative), so existence needs no further probe. False for
+// synthesized ops (nil Kernel).
+func (op *Op) KernelCreate() bool {
+	_, ok := op.Kernel.(*gofuse.CreateIn)
+	return ok
+}
+
+// KernelOpenExisting reports whether an OpCreate originates from a kernel
+// OPEN: the kernel resolved an existing dentry for it (an O_CREAT|O_TRUNC
+// open of a live file arrives this way). False for synthesized ops.
+func (op *Op) KernelOpenExisting() bool {
+	_, ok := op.Kernel.(*gofuse.OpenIn)
+	return ok
+}
 
 // OpenFlags is the normalized open/create flag set for OpCreate and
 // Filesystem.Open.

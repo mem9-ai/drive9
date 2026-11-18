@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,13 +22,9 @@ const (
 	uploadMaxRetries  = 3
 )
 
-// submitTimeout is the maximum time Submit will block waiting for channel space
-// before falling back to a synchronous upload in the calling goroutine.
-const submitTimeout = 5 * time.Second
-
 var errWriteBackBaseRevisionRequired = errors.New("writeback base revision required")
 
-// WriteBackSuccessFunc observes one landed .dat/.meta pair.
+// WriteBackSuccessFunc observes committed data or a completed PendingChmod entry.
 type WriteBackSuccessFunc func(meta staging.WriteBackMeta, committedRev int64, gens StagingGens)
 
 // StagingGens captures the generations of the writeBack, pendingIndex and
@@ -35,21 +32,27 @@ type WriteBackSuccessFunc func(meta staging.WriteBackMeta, committedRev int64, g
 // read for upload. This lets the OnSuccess callback perform generation-guarded
 // cleanup so a stale upload does not remove a fresher same-path staging entry
 // that was created by a concurrent write while the upload was in flight.
+// TerminalFailureSeq snapshots the commit queue's terminal-failure stamp for
+// the path: OnSuccess may only clear that exact failure, never one recorded
+// after the upload started.
 type StagingGens struct {
-	WriteBackGen    uint64
-	PendingIndexGen uint64
-	ShadowGen       uint64
+	WriteBackGen       uint64
+	PendingIndexGen    uint64
+	ShadowGen          staging.ContentGen
+	TerminalFailureSeq uint64
 }
 
-// SnapshotStagingGensFunc snapshots the pendingIndex and shadowStore generations
-// for a path. If either store is absent or has no entry, the corresponding gen
-// is 0 (which never matches, so the guarded remove is skipped). Optional — if
-// nil, OnSuccess receives zero-value gens.
+// SnapshotStagingGensFunc snapshots the pendingIndex and shadowStore
+// generations plus the commit queue's terminal-failure stamp for a path. If a
+// store is absent or has no entry, the corresponding gen is 0 (which never
+// matches, so the guarded remove is skipped). Optional — if nil, OnSuccess
+// receives zero-value gens.
 type SnapshotStagingGensFunc func(remotePath string) StagingGens
 
 // WriteBackUploader consumes pending write-back cache entries and uploads
 // them to the server in the background. It runs a fixed number of worker
-// goroutines that read from a shared channel.
+// goroutines that drain a deduplicated FIFO queue whose on-disk footprint is
+// bounded by the write-back cache quota.
 //
 // Per-path serialization: at most one upload per local namespace path is in-flight at
 // any time. WaitPath allows Rename/Unlink/Fsync to block until the current
@@ -58,31 +61,75 @@ type WriteBackUploader struct {
 	client     *client.Client
 	cache      *staging.WriteBackCache
 	remoteRoot string
-	uploadCh   chan string // local namespace paths to upload
+	queueMu    sync.Mutex
+	queueCond  *sync.Cond
+	queue      []string
+	queueHead  int
+	queuedSet  map[string]struct{}
 	wg         sync.WaitGroup
 	stopOnce   sync.Once
 	stopped    atomic.Bool
 	active     atomic.Int64
-	// handed counts paths handed to a worker but not yet finished: it is
-	// incremented BEFORE the channel send and decremented after uploadOne
-	// completes, closing the receive→active window where WaitIdle would
-	// otherwise observe 0/0 with work still in a worker's hands.
-	handed atomic.Int64
-	stopCh chan struct{}
 
 	// Per-path in-flight tracking.
 	inflightMu sync.Mutex
 	inflight   map[string]*pathState
 
-	// submitMu serializes Submit's channel send against DrainAll's
-	// stop+close, so a late Submit can never send on a closed channel.
-	submitMu sync.Mutex
+	batchMu       sync.Mutex
+	batchWindow   time.Duration
+	batchMaxItems int
+	batchMaxBytes int64
+	batchDisabled atomic.Bool
+	batchSem      chan struct{}
 
 	perf      *fusePerfCounters
 	OnSuccess WriteBackSuccessFunc
 	// SnapshotStagingGens optionally captures the pendingIndex/shadowStore
 	// generations for a path so OnSuccess can do generation-guarded cleanup.
 	SnapshotStagingGens SnapshotStagingGensFunc
+	// ResolveConflict optionally repairs a conflicted entry in place:
+	// given the staged meta, the payload that was read for upload, and the
+	// base its upload just conflicted on, it returns a newer same-origin
+	// base to rebase onto and retry. Wired by the writeback plane to its
+	// landed records — the payload this mount itself uploaded — so a
+	// duplicate-commit race (the kernel's asynchronous RELEASE racing a
+	// handoff flush of one handle) heals without a remote stat, while a
+	// foreign advance or a divergent image stays conflicted.
+	ResolveConflict func(localPath string, meta *staging.WriteBackMeta, data []byte, conflictedBase int64) (int64, bool)
+	// LedgerOwned optionally reports that the staging ledger owns a path's
+	// current image (pending index entry). The synchronous cache landing
+	// REFUSES such paths: the .dat/.meta pair beneath the ledger entry may
+	// be a superseded image, and publishing it — including the
+	// expect-absent create a PendingNew pair would issue against an absent
+	// row — hands the backend bytes the queue's own recovery is about to
+	// contradict. Callers fall back to the queue track.
+	LedgerOwned func(localPath string) bool
+	// RecordLanding observes every successful upload with EXACTLY the
+	// bytes that were published (both the background worker and the sync
+	// path), read under the same generation gate as the upload's meta
+	// snapshot. Wired by the writeback plane to its landed records, whose
+	// payload identity must describe the uploaded generation — capturing
+	// it outside this gate can pair one generation's identity with
+	// another's revision.
+	RecordLanding func(localPath string, data []byte, committedRev int64, meta *staging.WriteBackMeta)
+}
+
+// resolveConflict consults ResolveConflict and rebases the staged entry's
+// base when the proof holds; ok reports a retryable new base.
+func (u *WriteBackUploader) resolveConflict(localPath string, meta *staging.WriteBackMeta, data []byte, conflictedBase int64) (int64, bool) {
+	if u.ResolveConflict == nil {
+		return 0, false
+	}
+	return u.ResolveConflict(localPath, meta, data, conflictedBase)
+}
+
+// recordLanding consults RecordLanding when wired and only for a revision
+// the upload itself reported: a fabricated (expected+1) or absent revision
+// must never become a same-origin proof.
+func (u *WriteBackUploader) recordLanding(localPath string, data []byte, committedRev int64, meta *staging.WriteBackMeta) {
+	if u.RecordLanding != nil && committedRev > 0 {
+		u.RecordLanding(localPath, data, committedRev, meta)
+	}
 }
 
 // WriteBackUploaderSnapshot is one uploader-depth observation.
@@ -114,10 +161,11 @@ func NewWriteBackUploader(c *client.Client, cache *staging.WriteBackCache, numWo
 		client:     c,
 		cache:      cache,
 		remoteRoot: root,
-		uploadCh:   make(chan string, 256),
-		stopCh:     make(chan struct{}),
+		queuedSet:  make(map[string]struct{}),
 		inflight:   make(map[string]*pathState),
+		batchSem:   make(chan struct{}, 4),
 	}
+	u.queueCond = sync.NewCond(&u.queueMu)
 	for i := 0; i < numWorkers; i++ {
 		u.wg.Add(1)
 		go u.worker()
@@ -130,16 +178,64 @@ func (u *WriteBackUploader) SetPerfCounters(perf *fusePerfCounters) {
 	u.perf = perf
 }
 
+// ConfigureBatchWrite enables explicit writeback small-file batching parameters.
+func (u *WriteBackUploader) ConfigureBatchWrite(window time.Duration, maxItems int, maxBytes int64) {
+	if u == nil {
+		return
+	}
+	if maxItems <= 0 {
+		maxItems = defaultCommitBatchMaxItems
+	}
+	if maxItems > client.MaxBatchWriteItems {
+		maxItems = client.MaxBatchWriteItems
+	}
+	if maxBytes <= 0 {
+		maxBytes = defaultCommitBatchMaxBytes
+	}
+	if maxBytes > client.MaxBatchWriteBytes {
+		maxBytes = client.MaxBatchWriteBytes
+	}
+	u.batchMu.Lock()
+	defer u.batchMu.Unlock()
+	if window <= 0 || maxItems <= 1 || maxBytes <= 0 {
+		u.batchWindow = 0
+		u.batchMaxItems = 0
+		u.batchMaxBytes = 0
+		return
+	}
+	u.batchWindow = window
+	u.batchMaxItems = maxItems
+	u.batchMaxBytes = maxBytes
+}
+
+// InFlight reports whether localPath currently has an upload in progress.
+// The flag stays set through OnSuccess, so a pending image seen while it is
+// true may already have a published revision that its deferred cleanup has
+// not acknowledged yet.
+func (u *WriteBackUploader) InFlight(localPath string) bool {
+	if u == nil {
+		return false
+	}
+	u.inflightMu.Lock()
+	_, ok := u.inflight[localPath]
+	u.inflightMu.Unlock()
+	return ok
+}
+
 // PendingStats returns queued and in-flight upload counts for observability.
 func (u *WriteBackUploader) PendingStats() (queued int, inFlight int) {
 	if u == nil {
 		return 0, 0
 	}
-	queued = len(u.uploadCh)
+	u.queueMu.Lock()
+	queued = len(u.queue) - u.queueHead
+	active := int(u.active.Load())
+	u.queueMu.Unlock()
+
 	u.inflightMu.Lock()
 	inFlight = len(u.inflight)
 	u.inflightMu.Unlock()
-	if active := int(u.active.Load()); active > inFlight {
+	if active > inFlight {
 		inFlight = active
 	}
 	return queued, inFlight
@@ -150,7 +246,12 @@ func (u *WriteBackUploader) Snapshot() WriteBackUploaderSnapshot {
 	if u == nil {
 		return WriteBackUploaderSnapshot{}
 	}
-	snap := WriteBackUploaderSnapshot{Queued: len(u.uploadCh)}
+	u.queueMu.Lock()
+	queued := len(u.queue) - u.queueHead
+	active := int(u.active.Load())
+	u.queueMu.Unlock()
+
+	snap := WriteBackUploaderSnapshot{Queued: queued}
 	u.inflightMu.Lock()
 	snap.InFlight = len(u.inflight)
 	for path := range u.inflight {
@@ -158,7 +259,7 @@ func (u *WriteBackUploader) Snapshot() WriteBackUploaderSnapshot {
 		break
 	}
 	u.inflightMu.Unlock()
-	if active := int(u.active.Load()); active > snap.InFlight {
+	if active > snap.InFlight {
 		snap.InFlight = active
 	}
 	if u.cache != nil {
@@ -179,11 +280,8 @@ func (u *WriteBackUploader) WaitIdle(ctx context.Context) error {
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		snap := u.Snapshot()
-		// `handed` covers the receive→active window: a path a worker has
-		// taken but not yet registered shows in neither Queued nor
-		// InFlight, and idle would be reported with the upload pending.
-		if snap.Queued == 0 && snap.InFlight == 0 && u.handed.Load() == 0 {
+		queued, inFlight := u.PendingStats()
+		if queued == 0 && inFlight == 0 {
 			return nil
 		}
 		select {
@@ -194,22 +292,17 @@ func (u *WriteBackUploader) WaitIdle(ctx context.Context) error {
 	}
 }
 
-// Submit enqueues a local namespace path for background upload. Blocks up to 5s if the
-// channel is full; on timeout, falls back to synchronous upload in the current
-// goroutine so data is never silently dropped.
+// Submit enqueues a local namespace path for background upload without blocking
+// foreground FUSE_RELEASE callers. Paths already queued (not yet popped by a
+// worker) are deduplicated in place; if called after DrainAll has stopped the
+// uploader, it falls back to synchronous upload so data is never dropped.
 func (u *WriteBackUploader) Submit(localPath string) {
 	if u.perf != nil {
 		u.perf.uploaderSubmit.add(1)
 	}
-	// Serialize the stopped-check + send against DrainAll's stop+close: a
-	// late Release after unmount drains would otherwise send on a closed
-	// channel and panic the daemon mid-cleanup (observed in issue #964
-	// verification). Holding submitMu across the buffered send is safe —
-	// the channel buffer is the actual backpressure, and DrainAll waits for
-	// workers via wg after close, not on this lock.
-	u.submitMu.Lock()
+	u.queueMu.Lock()
 	if u.stopped.Load() {
-		u.submitMu.Unlock()
+		u.queueMu.Unlock()
 		safeLogPrintf("writeback uploader: already stopped, uploading synchronously for %s", localPath)
 		if u.perf != nil {
 			u.perf.uploaderSyncFallback.add(1)
@@ -217,38 +310,12 @@ func (u *WriteBackUploader) Submit(localPath string) {
 		u.uploadOne(localPath)
 		return
 	}
-	// Account the handoff before the send: between a worker receiving the
-	// path and bumping `active`, neither the channel nor the counters show
-	// it — WaitIdle would report idle with the upload still pending (v1's
-	// depth probe never had this hole).
-	u.handed.Add(1)
-	select {
-	case u.uploadCh <- localPath:
-		u.submitMu.Unlock()
-		return
-	default:
+	if _, dup := u.queuedSet[localPath]; !dup {
+		u.queuedSet[localPath] = struct{}{}
+		u.queue = append(u.queue, localPath)
+		u.queueCond.Signal()
 	}
-	// Channel full — block until a worker frees space or the timeout
-	// expires, then upload synchronously in this goroutine so an
-	// acknowledged path is never dropped. This wait stays under submitMu:
-	// the send must not race DrainAll's close (which also holds submitMu),
-	// workers never take this lock — they keep draining the channel, which
-	// is what unblocks the wait — and submitTimeout bounds how long
-	// DrainAll can be held off.
-	timer := time.NewTimer(submitTimeout)
-	defer timer.Stop()
-	select {
-	case u.uploadCh <- localPath:
-		u.submitMu.Unlock()
-	case <-timer.C:
-		u.submitMu.Unlock()
-		safeLogPrintf("writeback uploader: channel full after %v, uploading synchronously for %s", submitTimeout, localPath)
-		if u.perf != nil {
-			u.perf.uploaderSyncFallback.add(1)
-		}
-		u.handed.Add(-1)
-		u.uploadOne(localPath)
-	}
+	u.queueMu.Unlock()
 }
 
 // WaitPath blocks until any in-flight upload for localPath completes.
@@ -264,8 +331,8 @@ func (u *WriteBackUploader) WaitPath(localPath string) {
 	}
 }
 
-// DrainAll closes the upload channel and waits for all inflight uploads to
-// complete. Called during graceful shutdown.
+// DrainAll stops accepting queued uploads and waits for all queued and
+// in-flight uploads to complete. Called during graceful shutdown.
 func (u *WriteBackUploader) DrainAll() {
 	start := time.Now()
 	defer func() {
@@ -275,10 +342,10 @@ func (u *WriteBackUploader) DrainAll() {
 		}
 	}()
 	u.stopOnce.Do(func() {
-		u.submitMu.Lock()
+		u.queueMu.Lock()
 		u.stopped.Store(true)
-		close(u.uploadCh)
-		u.submitMu.Unlock()
+		u.queueCond.Broadcast()
+		u.queueMu.Unlock()
 	})
 	u.wg.Wait()
 }
@@ -286,34 +353,75 @@ func (u *WriteBackUploader) DrainAll() {
 // RecoverPending scans the cache directory for leftover entries from a
 // previous session and submits them for upload.
 func (u *WriteBackUploader) RecoverPending() {
-	entries := u.cache.ListPending()
+	u.RecoverPendingFilter(nil)
+}
+
+// RecoverPendingFilter is RecoverPending with a skip predicate: paths for
+// which skip reports true belong to another track's recovery (the staging
+// ledger's pending index) and are left alone. It enumerates metadata only
+// — the payloads are loaded one at a time by the workers, so recovering a
+// large backlog never materializes its total bytes.
+func (u *WriteBackUploader) RecoverPendingFilter(skip func(localPath string) bool) {
+	metas := u.cache.ListPendingMetas()
 	skippedLegacyOverwrites := 0
-	for _, e := range entries {
-		if e.Meta.Kind == staging.PendingOverwrite && e.Meta.BaseRev <= 0 {
-			skippedLegacyOverwrites++
-			safeLogPrintf("writeback: skipping legacy overwrite without base revision for %s", e.Meta.Path)
+	for i := range metas {
+		path, meta := metas[i].Path, &metas[i]
+		if skip != nil && skip(path) {
 			continue
 		}
-		safeLogPrintf("writeback: recovering pending upload for %s (%d bytes)", e.Meta.Path, e.Meta.Size)
-		u.Submit(e.Meta.Path)
+		if meta.Kind == staging.PendingOverwrite && meta.BaseRev <= 0 {
+			skippedLegacyOverwrites++
+			safeLogPrintf("writeback: skipping legacy overwrite without base revision for %s", path)
+			continue
+		}
+		safeLogPrintf("writeback: recovering pending upload for %s (%d bytes)", path, meta.Size)
+		u.Submit(path)
 	}
 	if skippedLegacyOverwrites > 0 {
 		safeLogPrintf("writeback: skipped %d legacy overwrite entries without base revision during recovery", skippedLegacyOverwrites)
 	}
 }
 
+// errLedgerOwned reports a synchronous landing refused because the staging
+// ledger owns the path's image (see WriteBackUploader.LedgerOwned).
+var errLedgerOwned = errors.New("writeback: path owned by the staging ledger")
+
+// IsLedgerOwnedError reports whether err is the ledger-ownership refusal.
+func IsLedgerOwnedError(err error) bool { return errors.Is(err, errLedgerOwned) }
+
+// IsLedgerOwnedError on the uploader forwards to the package-level check.
+func (u *WriteBackUploader) IsLedgerOwnedError(err error) bool { return IsLedgerOwnedError(err) }
+
 // UploadSync synchronously uploads a single path from the cache to the server.
 // Serializes with other uploads of the same path, then uploads with
 // generation protection. Used by Fsync/Rename which require the data to be
-// persisted remotely before returning.
+// persisted remotely before returning. Ledger-owned paths are refused.
 func (u *WriteBackUploader) UploadSync(ctx context.Context, localPath string) error {
 	_, err := u.UploadSyncWithRevision(ctx, localPath)
 	return err
 }
 
+// ledgerOwnedRefused reports whether this path's sync landing must be
+// refused (the ledger owns its image).
+func (u *WriteBackUploader) ledgerOwnedRefused(localPath string) bool {
+	return u.LedgerOwned != nil && u.LedgerOwned(localPath)
+}
+
 // UploadSyncWithRevision uploads one path synchronously and reports
 // the committed revision.
 func (u *WriteBackUploader) UploadSyncWithRevision(ctx context.Context, localPath string) (int64, error) {
+	if u.ledgerOwnedRefused(localPath) {
+		return 0, errLedgerOwned
+	}
+	rev, _, err := u.uploadSyncWithMetadata(ctx, localPath)
+	return rev, err
+}
+
+// Metadata identifies the completed cache operation; nil means no entry was consumed.
+func (u *WriteBackUploader) uploadSyncWithMetadata(ctx context.Context, localPath string) (int64, *staging.WriteBackMeta, error) {
+	if u.ledgerOwnedRefused(localPath) {
+		return 0, nil, errLedgerOwned
+	}
 	// Own the gate through cache cleanup, just like uploadOne. A wait alone
 	// leaves a gap in which a background or second synchronous upload can
 	// publish the same generation and trigger a false revision conflict.
@@ -325,17 +433,20 @@ func (u *WriteBackUploader) UploadSyncWithRevision(ctx context.Context, localPat
 	// data — GetMetaAndView would prune the entry when the .dat is missing.
 	chmodMeta, chmodOK := u.cache.GetMeta(localPath)
 	if !chmodOK {
-		return 0, nil // not in cache (may have been uploaded by the background worker we just waited for)
+		return 0, nil, nil // not in cache (may have been uploaded by the background worker we just waited for)
 	}
 	if chmodMeta.Kind == staging.PendingChmod {
-		return 0, u.applyPendingChmod(ctx, localPath, chmodMeta, chmodMeta.Generation, true)
+		if err := u.applyPendingChmod(ctx, localPath, chmodMeta, chmodMeta.Generation, true); err != nil {
+			return 0, nil, err
+		}
+		return 0, chmodMeta, nil
 	}
 
 	// Atomically read meta + data under one path lock so they are guaranteed
 	// to be from the same generation.
 	meta, data, ok := u.cache.GetMetaAndView(localPath)
 	if !ok {
-		return 0, nil // not in cache (removed between GetMeta and GetMetaAndView)
+		return 0, nil, nil // not in cache (removed between GetMeta and GetMetaAndView)
 	}
 	gen := meta.Generation
 
@@ -348,18 +459,31 @@ func (u *WriteBackUploader) UploadSyncWithRevision(ctx context.Context, localPat
 			safeLogPrintf("writeback uploadsync: legacy overwrite without base revision for %s, falling back to unconditional write", localPath)
 			expectedRevision = -1
 		} else {
-			return 0, fmt.Errorf("resolve expected revision for %s: %w", localPath, err)
+			return 0, nil, fmt.Errorf("resolve expected revision for %s: %w", localPath, err)
 		}
 	}
 
 	var committedRev int64
-	uploadStart := time.Now()
 	threshold := u.directPutThreshold()
 	useDirectPUT := meta.Size == 0 || (threshold > 0 && meta.Size < threshold)
-	if useDirectPUT {
-		committedRev, err = u.client.WriteCtxConditionalWithRevision(ctx, u.remotePath(localPath), data, expectedRevision)
-	} else {
-		committedRev, err = uploadBufferedRemoteFileWithRevision(ctx, u.client, u.remotePath(localPath), data, expectedRevision)
+	put := func(ctx context.Context, rev int64) (int64, error) {
+		if useDirectPUT {
+			return u.client.WriteCtxConditionalWithRevision(ctx, u.remotePath(localPath), data, rev)
+		}
+		return uploadBufferedRemoteFileWithRevision(ctx, u.client, u.remotePath(localPath), data, rev)
+	}
+	uploadStart := time.Now()
+	committedRev, err = put(ctx, expectedRevision)
+	if errors.Is(err, client.ErrConflict) {
+		// Same-origin repair (see uploadOne): this mount's own landing may
+		// have won a duplicate-commit race under this staging — rebase and
+		// retry once so the flush that routed here (close-sync's boundary,
+		// the claim handoff inside an open) does not surface EIO for a
+		// race the mount itself can prove.
+		if rev, ok := u.resolveConflict(localPath, meta, data, expectedRevision); ok {
+			expectedRevision = rev
+			committedRev, err = put(ctx, expectedRevision)
+		}
 	}
 	if u.perf != nil {
 		u.perf.recordRemoteOp(perfRemoteWrite, err, time.Since(uploadStart), uint64(len(data)))
@@ -368,7 +492,14 @@ func (u *WriteBackUploader) UploadSyncWithRevision(ctx context.Context, localPat
 		if u.perf != nil {
 			u.perf.uploaderFailure.add(1)
 		}
-		return 0, err
+		return 0, nil, err
+	}
+	// The landed record is written before the expected+1 fabrication below
+	// applies: a landed record may only carry a revision the upload itself
+	// reported (streaming landings report 0 and record nothing).
+	u.recordLanding(localPath, data, committedRev, meta)
+	if u.OnSuccess != nil && meta.LineageTrusted() && meta.SnapshotID != "" && meta.Size == int64(len(data)) && len(data) <= 1<<20 {
+		meta.LiveChecksum = payloadChecksum(data)
 	}
 	committedRev = committedRevisionForExpectedRevision(expectedRevision, committedRev)
 	chmodCtx, chmodCancel := context.WithTimeout(ctx, 30*time.Second)
@@ -379,9 +510,12 @@ func (u *WriteBackUploader) UploadSyncWithRevision(ctx context.Context, localPat
 			u.perf.uploaderFailure.add(1)
 		}
 		if _, markErr := u.cache.MarkChmodPending(localPath, gen); markErr != nil {
-			return 0, fmt.Errorf("%w; mark chmod pending: %v", err, markErr)
+			return 0, nil, fmt.Errorf("%w; mark chmod pending: %v", err, markErr)
 		}
-		return 0, err
+		if u.OnSuccess != nil {
+			u.OnSuccess(*meta, committedRev, StagingGens{WriteBackGen: gen})
+		}
+		return 0, nil, err
 	}
 
 	// Atomically remove only if generation matches — a concurrent Put may
@@ -390,7 +524,10 @@ func (u *WriteBackUploader) UploadSyncWithRevision(ctx context.Context, localPat
 	if u.perf != nil {
 		u.perf.uploaderSuccess.add(1)
 	}
-	return committedRev, nil
+	if u.OnSuccess != nil {
+		u.OnSuccess(*meta, committedRev, StagingGens{WriteBackGen: gen})
+	}
+	return committedRev, meta, nil
 }
 
 func expectedRevisionForWriteBack(meta *staging.WriteBackMeta) (int64, error) {
@@ -432,6 +569,13 @@ func (u *WriteBackUploader) applyMode(ctx context.Context, meta *staging.WriteBa
 		return applyErr
 	})
 	if err != nil {
+		// The same rule as the commit queue: the content is already uploaded, and a token
+		// that may not chmod (an fs_scoped mount) can never succeed here, so retrying
+		// would keep the mode pending for ever. Drop it with a warning instead.
+		if client.IsForbidden(err) {
+			safeLogPrintf("writeback upload: chmod denied for %s (token may not chmod); proceeding without mode update", meta.Path)
+			return nil
+		}
 		return fmt.Errorf("writeback upload chmod %s to %o: %w", meta.Path, mode, err)
 	}
 	return nil
@@ -444,16 +588,306 @@ func (u *WriteBackUploader) directPutThreshold() int64 {
 	return 0
 }
 
+func (u *WriteBackUploader) popOneLocked() (string, bool) {
+	if u.queueHead >= len(u.queue) {
+		return "", false
+	}
+	p := u.queue[u.queueHead]
+	u.queue[u.queueHead] = ""
+	u.queueHead++
+	if u.queueHead == len(u.queue) {
+		u.queue = u.queue[:0]
+		u.queueHead = 0
+	} else if u.queueHead >= 1024 && u.queueHead*2 >= len(u.queue) {
+		rem := len(u.queue) - u.queueHead
+		copy(u.queue[:rem], u.queue[u.queueHead:])
+		clear(u.queue[rem:])
+		u.queue = u.queue[:rem]
+		u.queueHead = 0
+	}
+	delete(u.queuedSet, p)
+	return p, true
+}
+
+func (u *WriteBackUploader) popNext() (string, bool) {
+	u.queueMu.Lock()
+	for u.queueHead >= len(u.queue) && !u.stopped.Load() {
+		u.queueCond.Wait()
+	}
+	p, ok := u.popOneLocked()
+	if ok {
+		u.active.Add(1)
+	}
+	u.queueMu.Unlock()
+	return p, ok
+}
+
+func (u *WriteBackUploader) popBatchExtras(limit int, window time.Duration) []string {
+	if limit <= 0 {
+		return nil
+	}
+	extras := make([]string, 0, limit)
+	u.queueMu.Lock()
+	for len(extras) < limit {
+		p, ok := u.popOneLocked()
+		if !ok {
+			break
+		}
+		extras = append(extras, p)
+	}
+	if len(extras) < limit && window > 0 && !u.stopped.Load() {
+		var expired bool
+		timer := time.AfterFunc(window, func() {
+			u.queueMu.Lock()
+			expired = true
+			u.queueCond.Broadcast()
+			u.queueMu.Unlock()
+		})
+		for len(extras) < limit && !expired && !u.stopped.Load() {
+			if p, ok := u.popOneLocked(); ok {
+				extras = append(extras, p)
+				continue
+			}
+			u.queueCond.Wait()
+		}
+		timer.Stop()
+	}
+	u.queueMu.Unlock()
+	return extras
+}
+
 func (u *WriteBackUploader) worker() {
 	defer u.wg.Done()
-	for localPath := range u.uploadCh {
-		u.active.Add(1)
+	for {
+		localPath, ok := u.popNext()
+		if !ok {
+			return
+		}
 		func() {
 			defer u.active.Add(-1)
-			defer u.handed.Add(-1)
+			if u.tryUploadBatch(localPath) {
+				return
+			}
 			u.uploadOne(localPath)
 		}()
 	}
+}
+
+type uploaderBatchCandidate struct {
+	path        string
+	meta        *staging.WriteBackMeta
+	data        []byte
+	gen         uint64
+	expectedRev int64
+	stagingGens StagingGens
+	release     func()
+}
+
+func (u *WriteBackUploader) batchParams() (enabled bool, window time.Duration, maxItems int, maxBytes int64) {
+	if u == nil || u.client == nil || u.cache == nil || u.batchDisabled.Load() {
+		return false, 0, 0, 0
+	}
+	u.batchMu.Lock()
+	win, items, bytesLim := u.batchWindow, u.batchMaxItems, u.batchMaxBytes
+	u.batchMu.Unlock()
+	if win > 0 && items > 1 && bytesLim > 0 {
+		return true, win, items, bytesLim
+	}
+	return false, 0, 0, 0
+}
+
+func (u *WriteBackUploader) tryUploadBatch(firstPath string) bool {
+	enabled, window, maxItems, maxBytes := u.batchParams()
+	if !enabled {
+		return false
+	}
+
+	counts := map[string]int{firstPath: 1}
+	distinct := make([]string, 0, maxItems)
+	distinct = append(distinct, firstPath)
+	for _, p := range u.popBatchExtras(maxItems-1, window) {
+		if counts[p] == 0 {
+			distinct = append(distinct, p)
+		}
+		counts[p]++
+	}
+
+	if len(distinct) < 2 {
+		return false
+	}
+
+	// Lock distinct paths in sorted order so concurrent batch workers can
+	// never deadlock on overlapping path gates.
+	sort.Strings(distinct)
+	releases := make([]func(), len(distinct))
+	for i, p := range distinct {
+		releases[i] = u.acquirePath(p)
+	}
+
+	threshold := u.directPutThreshold()
+	cands := make([]uploaderBatchCandidate, 0, len(distinct))
+	fallback := make([]string, 0)
+	var totalBytes int64
+
+	for i, localPath := range distinct {
+		rel := releases[i]
+		chmodMeta, ok := u.cache.GetMeta(localPath)
+		if !ok {
+			rel()
+			continue
+		}
+		if chmodMeta.Kind == staging.PendingChmod {
+			rel()
+			fallback = append(fallback, localPath)
+			continue
+		}
+		var stagingGens StagingGens
+		meta, data, ok := u.cache.GetMetaAndViewWithCallback(localPath, func() {
+			if u.SnapshotStagingGens != nil {
+				stagingGens = u.SnapshotStagingGens(localPath)
+			}
+		})
+		if !ok {
+			rel()
+			continue
+		}
+		stagingGens.WriteBackGen = meta.Generation
+		expectedRev, err := expectedRevisionForWriteBack(meta)
+		size := int64(len(data))
+		inlineOK := size == 0 || (threshold > 0 && size < threshold) || (threshold == 0 && size <= 48<<10)
+		if err != nil || !inlineOK || (meta.Kind != staging.PendingNew && meta.Kind != staging.PendingOverwrite) || totalBytes+size > maxBytes {
+			rel()
+			fallback = append(fallback, localPath)
+			continue
+		}
+		totalBytes += size
+		cands = append(cands, uploaderBatchCandidate{
+			path:        localPath,
+			meta:        meta,
+			data:        data,
+			gen:         meta.Generation,
+			expectedRev: expectedRev,
+			stagingGens: stagingGens,
+			release:     rel,
+		})
+	}
+
+	runFollowups := func(paths []string) {
+		for _, p := range paths {
+			u.uploadOne(p)
+		}
+		for _, p := range distinct {
+			if counts[p] > 1 {
+				u.uploadOne(p)
+			}
+		}
+	}
+
+	if len(cands) < 2 {
+		for i := len(cands) - 1; i >= 0; i-- {
+			cands[i].release()
+		}
+		for _, c := range cands {
+			u.uploadOne(c.path)
+		}
+		runFollowups(fallback)
+		return true
+	}
+
+	modeSupported := u.client.CachedBatchWriteModeSupported()
+	remoteItems := make([]client.BatchWriteItem, len(cands))
+	for i, c := range cands {
+		item := client.BatchWriteItem{
+			Path:             u.remotePath(c.path),
+			ExpectedRevision: c.expectedRev,
+			Data:             c.data,
+		}
+		if modeSupported && shouldApplyRemoteMode(c.meta.Kind, c.meta.HasMode, c.meta.Mode) {
+			item.Mode = remoteChmodMode(c.meta.Mode & posixPermissionModeMask)
+			item.HasMode = true
+		}
+		remoteItems[i] = item
+	}
+
+	if u.batchSem != nil {
+		u.batchSem <- struct{}{}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*uploadTimeout)
+	uploadStart := time.Now()
+	results, err := u.client.BatchWriteCtx(ctx, remoteItems)
+	cancel()
+	if u.batchSem != nil {
+		<-u.batchSem
+	}
+	if u.perf != nil {
+		u.perf.recordRemoteOp(perfRemoteWrite, err, time.Since(uploadStart), uint64(totalBytes))
+	}
+
+	if err != nil || len(results) != len(cands) {
+		if err != nil && isBatchWriteUnsupported(err) {
+			u.batchDisabled.Store(true)
+		}
+		for i := len(cands) - 1; i >= 0; i-- {
+			cands[i].release()
+		}
+		for _, c := range cands {
+			u.uploadOne(c.path)
+		}
+		runFollowups(fallback)
+		return true
+	}
+
+	retryFailed := make([]string, 0)
+	for i, res := range results {
+		c := cands[i]
+		if !res.OK() {
+			c.release()
+			retryFailed = append(retryFailed, c.path)
+			continue
+		}
+		committedRev := res.Revision
+		u.recordLanding(c.path, c.data, committedRev, c.meta)
+		if u.OnSuccess != nil && c.meta.LineageTrusted() && c.meta.SnapshotID != "" && c.meta.Size == int64(len(c.data)) && len(c.data) <= 1<<20 {
+			c.meta.LiveChecksum = payloadChecksum(c.data)
+		}
+		committedRev = committedRevisionForExpectedRevision(c.expectedRev, committedRev)
+		if !remoteItems[i].HasMode {
+			chmodCtx, chmodCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			modeErr := u.applyMode(chmodCtx, c.meta)
+			chmodCancel()
+			if modeErr != nil {
+				if u.perf != nil {
+					u.perf.uploaderFailure.add(1)
+				}
+				if updated, merr := u.cache.MarkChmodPending(c.path, c.gen); merr != nil {
+					safeLogPrintf("writeback upload chmod-pending meta update failed for %s: %v", c.path, merr)
+					c.release()
+					continue
+				} else if updated {
+					safeLogPrintf("writeback upload data committed for %s; chmod remains pending", c.path)
+				}
+				if u.OnSuccess != nil {
+					u.OnSuccess(*c.meta, committedRev, c.stagingGens)
+				}
+				c.release()
+				continue
+			}
+		}
+		u.cache.RemoveIfGeneration(c.path, c.gen)
+		if u.perf != nil {
+			u.perf.uploaderSuccess.add(1)
+		}
+		if u.OnSuccess != nil {
+			u.OnSuccess(*c.meta, committedRev, c.stagingGens)
+		}
+		c.release()
+	}
+
+	for _, p := range retryFailed {
+		u.uploadOne(p)
+	}
+	runFollowups(fallback)
+	return true
 }
 
 // acquirePath registers an in-flight upload for localPath. If another upload
@@ -537,6 +971,7 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 	var (
 		lastErr      error
 		committedRev int64
+		repaired     bool
 	)
 	for attempt := 0; attempt <= uploadMaxRetries; attempt++ {
 		if attempt > 0 {
@@ -559,6 +994,28 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 			break
 		}
 		if errors.Is(lastErr, client.ErrConflict) {
+			// Same-origin repair first: if this mount itself landed this
+			// entry's image after it staged (a duplicate-commit race — the
+			// kernel's asynchronous RELEASE racing a handoff flush of the
+			// same handle), rebase onto the winner's base and retry
+			// instead of staying conflicted forever. Exactly ONE repair
+			// per upload: successive conflicts can keep finding eligible
+			// newer duplicates while this worker holds the path gate, and
+			// re-repairing on the extra attempt would extend the gate
+			// beyond the single promised retry (the sync path repairs once).
+			if !repaired {
+				if rev, ok := u.resolveConflict(localPath, meta, data, expectedRevision); ok {
+					expectedRevision = rev
+					repaired = true
+					if attempt == uploadMaxRetries {
+						// The repair earned its own attempt: refund this
+						// slot so the rebased PUT runs even when the
+						// conflict hit the last ordinary attempt.
+						attempt--
+					}
+					continue
+				}
+			}
 			break
 		}
 		safeLogPrintf("writeback upload attempt %d/%d failed for %s: %v", attempt+1, uploadMaxRetries+1, localPath, lastErr)
@@ -577,6 +1034,11 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 		safeLogPrintf("writeback upload failed for %s after %d attempts: %v (will retry on next mount)", localPath, uploadMaxRetries+1, lastErr)
 		return
 	}
+	u.recordLanding(localPath, data, committedRev, meta)
+	if u.OnSuccess != nil && meta.LineageTrusted() && meta.SnapshotID != "" && meta.Size == int64(len(data)) && len(data) <= 1<<20 {
+		// The proof identifies the data PUT even when its later chmod fails.
+		meta.LiveChecksum = payloadChecksum(data)
+	}
 	committedRev = committedRevisionForExpectedRevision(expectedRevision, committedRev)
 	chmodCtx, chmodCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	modeErr := u.applyMode(chmodCtx, meta)
@@ -587,8 +1049,13 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 		}
 		if updated, err := u.cache.MarkChmodPending(localPath, gen); err != nil {
 			safeLogPrintf("writeback upload chmod-pending meta update failed for %s: %v", localPath, err)
+			safeLogPrintf("%v (will retry on next mount)", modeErr)
+			return
 		} else if updated {
 			safeLogPrintf("writeback upload data committed for %s; chmod remains pending", localPath)
+		}
+		if u.OnSuccess != nil {
+			u.OnSuccess(*meta, committedRev, stagingGens)
 		}
 		safeLogPrintf("%v (will retry on next mount)", modeErr)
 		return
@@ -603,12 +1070,6 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 		u.perf.uploaderSuccess.add(1)
 	}
 	if u.OnSuccess != nil {
-		if meta.LineageTrusted() && meta.SnapshotID != "" && meta.Size == int64(len(data)) && len(data) <= 1<<20 {
-			// Bind the actual uploaded payload to this live snapshot id
-			// (main's liveChecksum): success callbacks can carry the
-			// content identity for append-proof publication.
-			meta.LiveChecksum = payloadChecksum(data)
-		}
 		u.OnSuccess(*meta, committedRev, stagingGens)
 	}
 }
@@ -631,6 +1092,9 @@ func (u *WriteBackUploader) applyPendingChmod(ctx context.Context, localPath str
 	u.cache.RemoveIfGeneration(localPath, gen)
 	if u.perf != nil {
 		u.perf.uploaderSuccess.add(1)
+	}
+	if u.OnSuccess != nil {
+		u.OnSuccess(*meta, 0, StagingGens{WriteBackGen: gen})
 	}
 	return nil
 }

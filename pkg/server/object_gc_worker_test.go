@@ -387,3 +387,125 @@ func deterministicObjectGCPayload(size int, seed byte) []byte {
 	}
 	return out
 }
+
+// A fork copies the parent's rows verbatim, so every storage ref in a namespace
+// is live in more than one branch while a fork exists. Layer payloads are no
+// exception — applying a layer copies its ref into the base file's contents row
+// — and the guard used to skip them because it only matched "blobs/" refs.
+func TestObjectGCSkipsSharedLayerWhenForkExists(t *testing.T) {
+	rt := newObjectGCTestRuntime(t)
+	rt.upsertNamespace(t, "ns-layer-fork", "owner-layer-fork")
+	rt.insertTenant(t, "fork-layer", meta.TenantProvisioning, meta.TenantKindFork, "ns-layer-fork")
+	candidate := rt.enqueueCandidate(t, "ns-layer-fork", "layers/layer-shared/obj-1")
+
+	worker := &objectGCWorker{meta: rt.meta, pool: rt.pool}
+	if err := worker.processCandidate(context.Background(), candidate); err != nil {
+		t.Fatal(err)
+	}
+
+	state, lastError := objectGCCandidateRow(t, rt.meta.DB(), "ns-layer-fork", "layers/layer-shared/obj-1")
+	if state != meta.ObjectGCCandidatePending || lastError != "namespace has active fork" {
+		t.Fatalf("candidate state=%s last_error=%q", state, lastError)
+	}
+}
+
+// Applying a layer leaves a claim on the payload in fs_layer_entries as well as
+// in the base file's contents row. Overwriting the file drops only the second
+// claim, so GC must keep the object the layer entry still reads.
+func TestObjectGCKeepsLayerPayloadClaimedByEntry(t *testing.T) {
+	rt := newObjectGCTestRuntime(t)
+	ctx := context.Background()
+	namespaceID := "ns-layer-live"
+	ownerID := "owner-layer-live"
+	layerID := fmt.Sprintf("layer-live-%d", time.Now().UnixNano())
+	payload := deterministicObjectGCPayload(4096, 0x77)
+
+	rt.upsertNamespace(t, namespaceID, ownerID)
+	rt.insertTenant(t, ownerID, meta.TenantActive, meta.TenantKindLive, namespaceID)
+	owner := objectGCTenant(t, rt, ownerID)
+	ownerBackend, release, err := rt.pool.Acquire(ctx, owner)
+	if err != nil {
+		t.Fatalf("acquire owner backend: %v", err)
+	}
+	if err := ownerBackend.Store().CreateFSLayer(ctx, &datastore.FSLayer{LayerID: layerID, BaseRootPath: "/repo"}); err != nil {
+		release()
+		t.Fatalf("create fs layer: %v", err)
+	}
+	entry, err := ownerBackend.PutFSLayerObject(ctx, layerID, "/repo/file.bin", bytes.NewReader(payload), int64(len(payload)))
+	if err != nil {
+		release()
+		t.Fatalf("put fs layer object: %v", err)
+	}
+	if !strings.HasPrefix(entry.StorageRef, "layers/"+layerID+"/") {
+		release()
+		t.Fatalf("layer storage ref = %q, want layers/%s/...", entry.StorageRef, layerID)
+	}
+	// PutFSLayerObject returns the payload record; the store side fills in the
+	// owning layer when the entry is persisted.
+	entry.LayerID = layerID
+	if err := ownerBackend.Store().UpsertFSLayerEntry(ctx, entry); err != nil {
+		release()
+		t.Fatalf("upsert fs layer entry: %v", err)
+	}
+	assertObjectGCS3ObjectBytes(t, ownerBackend, entry.StorageRef, payload)
+	release()
+
+	candidate := rt.enqueueCandidate(t, namespaceID, entry.StorageRef)
+	worker := &objectGCWorker{meta: rt.meta, pool: rt.pool}
+	if err := worker.processCandidate(ctx, candidate); err != nil {
+		t.Fatal(err)
+	}
+
+	state, lastError := objectGCCandidateRow(t, rt.meta.DB(), namespaceID, entry.StorageRef)
+	if state != meta.ObjectGCCandidatePending || lastError != "storage ref still reachable" {
+		t.Fatalf("candidate state=%s last_error=%q", state, lastError)
+	}
+	ownerBackend, release, err = rt.pool.Acquire(ctx, owner)
+	if err != nil {
+		t.Fatalf("reacquire owner backend: %v", err)
+	}
+	defer release()
+	assertObjectGCS3ObjectBytes(t, ownerBackend, entry.StorageRef, payload)
+}
+
+// The counterpart: a layer payload that no entry claims any more is collected,
+// so the reachability check does not pin every layer object forever.
+func TestObjectGCDeletesUnclaimedLayerObject(t *testing.T) {
+	rt := newObjectGCTestRuntime(t)
+	ctx := context.Background()
+	namespaceID := "ns-layer-dead"
+	ownerID := "owner-layer-dead"
+	payload := deterministicObjectGCPayload(2048, 0x21)
+
+	rt.upsertNamespace(t, namespaceID, ownerID)
+	rt.insertTenant(t, ownerID, meta.TenantActive, meta.TenantKindLive, namespaceID)
+	owner := objectGCTenant(t, rt, ownerID)
+	ownerBackend, release, err := rt.pool.Acquire(ctx, owner)
+	if err != nil {
+		t.Fatalf("acquire owner backend: %v", err)
+	}
+	entry, err := ownerBackend.PutFSLayerObject(ctx, "layer-dead", "/repo/unclaimed.bin", bytes.NewReader(payload), int64(len(payload)))
+	if err != nil {
+		release()
+		t.Fatalf("put fs layer object: %v", err)
+	}
+	assertObjectGCS3ObjectBytes(t, ownerBackend, entry.StorageRef, payload)
+	release()
+
+	candidate := rt.enqueueCandidate(t, namespaceID, entry.StorageRef)
+	worker := &objectGCWorker{meta: rt.meta, pool: rt.pool}
+	if err := worker.processCandidate(ctx, candidate); err != nil {
+		t.Fatal(err)
+	}
+
+	state, lastError := objectGCCandidateRow(t, rt.meta.DB(), namespaceID, entry.StorageRef)
+	if state != meta.ObjectGCCandidateDeleted || lastError != "" {
+		t.Fatalf("candidate state=%s last_error=%q", state, lastError)
+	}
+	ownerBackend, release, err = rt.pool.Acquire(ctx, owner)
+	if err != nil {
+		t.Fatalf("reacquire owner backend: %v", err)
+	}
+	defer release()
+	assertObjectGCS3ObjectMissing(t, ownerBackend, entry.StorageRef)
+}

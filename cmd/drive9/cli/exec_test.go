@@ -12,9 +12,11 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/mountstate"
 )
 
@@ -236,6 +238,78 @@ func TestExecErrorsAreActionable(t *testing.T) {
 	}
 }
 
+func TestExecCancellationErrorStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		code int
+	}{
+		{"before execution", context.Canceled, execExitCanceled},
+		{"wrapped before execution", fmt.Errorf("prepare: %w", context.Canceled), execExitCanceled},
+		{"unknown after dispatch", &client.RuntimeOutcomeUnknownError{ExecutionID: "rex_12345678", Cause: context.Canceled}, execExitUnknown},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := execError(tc.err, "")
+			var coded interface{ ExitCode() int }
+			if !errors.As(err, &coded) || coded.ExitCode() != tc.code {
+				t.Fatalf("error = %v, want status %d", err, tc.code)
+			}
+		})
+	}
+}
+
+func TestExecDistinguishesExecutorFailureFromCommandExit(t *testing.T) {
+	for _, code := range []string{"engine_error", "memory_limit"} {
+		t.Run("before execution "+code, func(t *testing.T) {
+			execTestServer(t, fmt.Sprintf(`{"type":"error","execution_id":"rex_12345678","error_code":%q,"message":"input inspection failed"}`, code))
+			stdout, stderr, err := runExecForTest(t, t.Context(), "cat", "file")
+			var status *execStatusError
+			if !errors.As(err, &status) || status.ExitCode() != 125 || !strings.Contains(err.Error(), code) || stdout != "" || stderr != "" {
+				t.Fatalf("error=%v stdout=%q stderr=%q", err, stdout, stderr)
+			}
+		})
+	}
+	for _, code := range []string{"engine_error", "cpu_limit", "output_limit", "resource_limit"} {
+		t.Run(code, func(t *testing.T) {
+			var calls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				w.Header().Set("Content-Type", "application/x-ndjson")
+				_, _ = fmt.Fprintln(w, execStarted)
+				_, _ = fmt.Fprintln(w, `{"type":"stdout","execution_id":"rex_12345678","data_base64":"cGFydGlhbAo="}`)
+				_, _ = fmt.Fprintln(w, `{"type":"stderr","execution_id":"rex_12345678","data_base64":"bGltaXQgZXhjZWVkZWQK"}`)
+				_ = json.NewEncoder(w).Encode(map[string]string{"type": "error", "execution_id": "rex_12345678", "error_code": code, "message": "execution ended: " + code})
+			}))
+			t.Cleanup(server.Close)
+			useExecServer(t, server.URL)
+			stdout, stderr, err := runExecForTest(t, t.Context(), "grep", "-a", "ERROR", "file")
+			var status *execStatusError
+			if !errors.As(err, &status) || status.ExitCode() != 125 {
+				t.Fatalf("error = %v, want executor failure status 125", err)
+			}
+			if !strings.Contains(err.Error(), code) || !strings.Contains(err.Error(), "rex_12345678") || stdout != "partial\n" || stderr != "limit exceeded\n" || calls.Load() != 1 {
+				t.Fatalf("error=%v stdout=%q stderr=%q calls=%d", err, stdout, stderr, calls.Load())
+			}
+		})
+	}
+	for _, code := range []int{0, 1, 2, 7, 124, 125, 126, 127, 130, 255} {
+		t.Run(fmt.Sprintf("observed command exit %d", code), func(t *testing.T) {
+			execTestServer(t, execStarted, fmt.Sprintf(`{"type":"exit","execution_id":"rex_12345678","exit_code":%d,"duration_ms":1}`, code))
+			_, _, err := runExecForTest(t, t.Context(), "grep", "-a", "ERROR", "file")
+			if code == 0 {
+				if err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+			var status *execExitError
+			if !errors.As(err, &status) || status.ExitCode() != code || !status.SilentExit() {
+				t.Fatalf("error = %v, want unchanged command status %d", err, code)
+			}
+		})
+	}
+}
+
 func TestExecInterruptCancelsRemoteCommand(t *testing.T) {
 	stopped := make(chan struct{})
 	var once sync.Once
@@ -451,7 +525,7 @@ func TestExecShowsStartingSandboxOnlyWhileWaiting(t *testing.T) {
 	if err := runExec(t.Context(), []string{"true"}, rt); err != nil {
 		t.Fatal(err)
 	}
-	if got := stderr.String(); got != "drive9: starting sandbox…\r\033[K" {
+	if got := stderr.String(); got != "drive9: starting command…\r\033[K" {
 		t.Fatalf("stderr = %q", got)
 	}
 	if stdout.String() != "out" {
@@ -563,6 +637,14 @@ func TestExecRejectsDelegatedToken(t *testing.T) {
 	for _, kind := range []CredentialKind{CredentialOwner, CredentialFSScoped, CredentialNone} {
 		if err := execCredentialError(kind); err != nil {
 			t.Fatalf("kind %d: %v", kind, err)
+		}
+	}
+}
+
+func TestExecBackendLabelDoesNotInventSandbox(t *testing.T) {
+	for _, test := range []struct{ field, want string }{{"", "the remote executor"}, {"new", "a new sandbox"}, {"warm", "a warm sandbox"}, {"future", "the remote executor"}} {
+		if got := execBackendLabel(test.field); got != test.want {
+			t.Fatalf("backend %q = %q, want %q", test.field, got, test.want)
 		}
 	}
 }

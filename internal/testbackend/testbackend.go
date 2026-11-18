@@ -21,12 +21,11 @@ import (
 
 // Node is one in-memory filesystem entry.
 type Node struct {
-	Data      []byte
-	IsDir     bool
-	Mode      uint32 // full mode, including S_IFMT for symlinks
-	Rev       int64
-	Mtime     int64
-	ExtentIno uint64 // nonzero: stat advertises content_layout=extent
+	Data  []byte
+	IsDir bool
+	Mode  uint32 // full mode, including S_IFMT for symlinks
+	Rev   int64
+	Mtime int64
 
 	// ContentLayout overrides the stat-advertised layout ("append_log",
 	// "single", "" = none). Seeded by tests to model server-side append-log
@@ -101,6 +100,10 @@ type uploadState struct {
 	parts     map[int][]byte
 	partSize  int64
 	totalSize int64
+	// expected carries the initiate's CAS revision: complete enforces it
+	// against the row like the real server's ErrRevisionConflict, so the
+	// conditional-upload contract is exercisable on the multipart track.
+	expected *int64
 }
 
 // partSizeFor returns the byte size of a 1-based part number.
@@ -282,14 +285,6 @@ func (b *Backend) Requests() map[string]int {
 	return out
 }
 
-// SeedExtent installs a file whose stat advertises the extent layout with
-// the given extent object-store inode.
-func (b *Backend) SeedExtent(path string, data []byte, extentIno uint64) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.files[path] = &Node{Data: data, Mode: 0o644, Rev: 1, Mtime: 1, ExtentIno: extentIno}
-}
-
 // DelayLayerEntriesForTest slows layer-entry POSTs (mutation-lock rows).
 func (b *Backend) DelayLayerEntriesForTest(d time.Duration) {
 	b.mu.Lock()
@@ -312,15 +307,17 @@ func (b *Backend) ForceLayerEntryFailure(path string, n int) {
 	b.mu.Unlock()
 }
 
-// ReplaceWithClassic swaps an extent-seeded file for a classic
-// single-layout node (identity/layout change rows).
-func (b *Backend) ReplaceWithClassic(path string, data []byte) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.files[path] = &Node{Data: data, Mode: 0o644, Rev: 2, Mtime: 2}
+// ForceConflict arms N forced 409s for conditional writes to path.
+// forceConflictLocked consumes one forced-conflict request for path.
+// Caller holds b.mu.
+func (b *Backend) forceConflictLocked(path string) bool {
+	if b.forceConflict[path] > 0 {
+		b.forceConflict[path]--
+		return true
+	}
+	return false
 }
 
-// ForceConflict arms N forced 409s for conditional writes to path.
 func (b *Backend) ForceConflict(path string, n int) {
 	b.mu.Lock()
 	b.forceConflict[path] = n
@@ -363,14 +360,13 @@ func (b *Backend) writeJSON(w http.ResponseWriter, v any) {
 }
 
 type listEntry struct {
-	Name      string `json:"name"`
-	Size      int64  `json:"size"`
-	IsDir     bool   `json:"isDir"`
-	Revision  int64  `json:"revision"`
-	Mtime     int64  `json:"mtime"`
-	Mode      uint32 `json:"mode"`
-	HasMode   bool   `json:"hasMode"`
-	ExtentIno uint64 `json:"extent_ino,omitempty"`
+	Name     string `json:"name"`
+	Size     int64  `json:"size"`
+	IsDir    bool   `json:"isDir"`
+	Revision int64  `json:"revision"`
+	Mtime    int64  `json:"mtime"`
+	Mode     uint32 `json:"mode"`
+	HasMode  bool   `json:"hasMode"`
 }
 
 func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -394,11 +390,12 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			id := fmt.Sprintf("up-%d", b.uploadSeq)
 			partSize := int64(16 << 20)
 			total := req.TotalSize
+
 			nParts := (total + partSize - 1) / partSize
 			if nParts < 1 {
 				nParts = 1
 			}
-			b.uploads[id] = &uploadState{path: req.Path, parts: map[int][]byte{}, partSize: partSize, totalSize: total}
+			b.uploads[id] = &uploadState{path: req.Path, parts: map[int][]byte{}, partSize: partSize, totalSize: total, expected: req.ExpectedRevision}
 			b.mu.Unlock()
 			w.WriteHeader(http.StatusAccepted)
 			b.writeJSON(w, map[string]any{"upload_id": id, "key": req.Path, "part_size": partSize, "total_parts": nParts, "resumable": false})
@@ -472,6 +469,17 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					ChecksumSHA256 string `json:"checksum_sha256"`
 				}
 				_ = json.NewDecoder(r.Body).Decode(&req)
+				b.mu.Lock()
+				forced := b.forceConflictLocked(us.path)
+				b.mu.Unlock()
+				if forced {
+					// The forced-conflict test knob reaches the multipart
+					// track too: complete 409s once per request, exactly
+					// like the direct-PUT handler (same locked accessor —
+					// handlers run concurrently).
+					b.writeErr(w, http.StatusConflict, "forced conflict")
+					return
+				}
 				var image []byte
 				for _, pt := range req.Parts {
 					b.mu.Lock()
@@ -1042,12 +1050,11 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		var rev, mtime int64
 		var mode uint32
 		var contentLayout string
-		var extentIno uint64
 		if n != nil {
 			isDir = n.IsDir
 			dataLen = len(n.Data)
 			rev, mtime, mode = n.Rev, n.Mtime, n.Mode
-			contentLayout, extentIno = n.ContentLayout, n.ExtentIno
+			contentLayout = n.ContentLayout
 		}
 		b.mu.Unlock()
 		if n == nil {
@@ -1068,10 +1075,6 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Dat9-Storage-Type", storageType)
 		if contentLayout != "" {
 			w.Header().Set("X-Dat9-Content-Layout", contentLayout)
-		}
-		if extentIno != 0 {
-			w.Header().Set("X-Dat9-Content-Layout", "extent")
-			w.Header().Set("X-Dat9-Extent-Ino", strconv.FormatUint(extentIno, 10))
 		}
 		w.WriteHeader(http.StatusOK)
 
@@ -1113,7 +1116,7 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				if mode == 0 {
 					mode = 0o644
 				}
-				out = append(out, listEntry{Name: name, Size: int64(len(child.Data)), IsDir: isDir, Revision: child.Rev, Mtime: child.Mtime, Mode: mode, HasMode: true, ExtentIno: child.ExtentIno})
+				out = append(out, listEntry{Name: name, Size: int64(len(child.Data)), IsDir: isDir, Revision: child.Rev, Mtime: child.Mtime, Mode: mode, HasMode: true})
 			}
 		}
 		b.mu.Unlock()
@@ -1199,6 +1202,7 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		b.writeJSON(w, map[string]any{"revision": rev})
 
 	case r.Method == http.MethodDelete:
+		expRev, _ := strconv.ParseInt(r.Header.Get("X-Dat9-Expected-Revision"), 10, 64)
 		b.mu.Lock()
 		if b.failDelete[p] > 0 {
 			b.failDelete[p]--
@@ -1207,12 +1211,23 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		n := b.files[p]
-		delete(b.files, p)
-		b.mu.Unlock()
 		if n == nil {
+			b.mu.Unlock()
 			b.writeErr(w, http.StatusNotFound, "not found")
 			return
 		}
+		if q.Get("kind") == "file" && n.IsDir {
+			b.mu.Unlock()
+			b.writeErr(w, http.StatusNotFound, "not found")
+			return
+		}
+		if expRev > 0 && n.Rev != expRev {
+			b.mu.Unlock()
+			b.writeErr(w, http.StatusConflict, "revision conflict")
+			return
+		}
+		delete(b.files, p)
+		b.mu.Unlock()
 		w.WriteHeader(http.StatusOK)
 
 	case q.Has("append-log"):

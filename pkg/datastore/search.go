@@ -32,17 +32,6 @@ type FindFilter struct {
 
 const rrfK = 60.0
 
-// extentSizeSelect / extentSizeJoin give a search query the file's real size.
-// An extent file's length lives in jfs_node — the JuiceFS meta is its source of
-// truth — while inodes.size_bytes only tracks the other layouts: the extent
-// write path deliberately does not rewrite the projection, because doing it
-// inside the write transaction measured +40-50% on extent_write (see the
-// comment in jfsWritePartsTx). Search reads inodes directly, so it must join.
-const (
-	extentSizeSelect = `COALESCE(jn.length, i.size_bytes)`
-	extentSizeJoin   = ` LEFT JOIN jfs_node jn ON jn.inode = fn.extent_ino`
-)
-
 // RRFMerge merges ranked FTS and vector results with reciprocal rank fusion.
 func RRFMerge(fts, vec []SearchResult, limit int) []SearchResult {
 	scores := make(map[string]float64)
@@ -166,9 +155,9 @@ func buildVectorSearchQueryScoped(scope Scope, queryEmbedding []float32, pathPre
 	args = append(args, scopeWhereArgs(scope, 3, condArgs...)...)
 	args = append(args, vecParam, limit)
 
-	q := `SELECT fn.path, fn.name, ` + extentSizeSelect + `,
+	q := `SELECT fn.path, fn.name, i.size_bytes,
 		VEC_EMBED_COSINE_DISTANCE(s.embedding, ?) AS distance
-		FROM file_nodes fn JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id JOIN semantic s ON i.inode_id = s.inode_id` + extentSizeJoin + `
+		FROM file_nodes fn JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id JOIN semantic s ON i.inode_id = s.inode_id
 		WHERE ` + scopeWhereAnd(scope, strings.Join(conds, " AND "), "fn", "i", "s") + `
 		ORDER BY VEC_EMBED_COSINE_DISTANCE(s.embedding, ?)
 	LIMIT ?`
@@ -195,9 +184,9 @@ func buildVectorSearchByTextQueryScoped(scope Scope, queryText, pathPrefix strin
 	args = append(args, scopeWhereArgs(scope, 3, condArgs...)...)
 	args = append(args, limit)
 
-	q := `SELECT fn.path, fn.name, ` + extentSizeSelect + `,
+	q := `SELECT fn.path, fn.name, i.size_bytes,
 		VEC_EMBED_COSINE_DISTANCE(s.embedding, ?) AS distance
-		FROM file_nodes fn JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id JOIN semantic s ON i.inode_id = s.inode_id` + extentSizeJoin + `
+		FROM file_nodes fn JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id JOIN semantic s ON i.inode_id = s.inode_id
 		WHERE ` + scopeWhereAnd(scope, strings.Join(conds, " AND "), "fn", "i", "s") + `
 		ORDER BY distance
 		LIMIT ?`
@@ -240,9 +229,9 @@ func buildVectorSearchDescriptionQueryScoped(scope Scope, queryEmbedding []float
 	args = append(args, scopeWhereArgs(scope, 3, condArgs...)...)
 	args = append(args, vecParam, limit)
 
-	q := `SELECT fn.path, fn.name, ` + extentSizeSelect + `,
+	q := `SELECT fn.path, fn.name, i.size_bytes,
 		VEC_EMBED_COSINE_DISTANCE(s.description_embedding, ?) AS distance
-		FROM file_nodes fn JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id JOIN semantic s ON i.inode_id = s.inode_id` + extentSizeJoin + `
+		FROM file_nodes fn JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id JOIN semantic s ON i.inode_id = s.inode_id
 		WHERE ` + scopeWhereAnd(scope, strings.Join(conds, " AND "), "fn", "i", "s") + `
 		ORDER BY VEC_EMBED_COSINE_DISTANCE(s.description_embedding, ?)
 	LIMIT ?`
@@ -267,9 +256,9 @@ func buildVectorSearchDescriptionByTextQueryScoped(scope Scope, queryText, pathP
 	args = append(args, scopeWhereArgs(scope, 3, condArgs...)...)
 	args = append(args, limit)
 
-	q := `SELECT fn.path, fn.name, ` + extentSizeSelect + `,
+	q := `SELECT fn.path, fn.name, i.size_bytes,
 		VEC_EMBED_COSINE_DISTANCE(s.description_embedding, ?) AS distance
-		FROM file_nodes fn JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id JOIN semantic s ON i.inode_id = s.inode_id` + extentSizeJoin + `
+		FROM file_nodes fn JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id JOIN semantic s ON i.inode_id = s.inode_id
 		WHERE ` + scopeWhereAnd(scope, strings.Join(conds, " AND "), "fn", "i", "s") + `
 		ORDER BY distance
 		LIMIT ?`
@@ -338,10 +327,10 @@ func buildFTSSearchQuery(scope Scope, safeQuery, pathPrefix string, limit int) (
 	}
 
 	outerConds = append([]string{"i.status = 'CONFIRMED'"}, outerConds...)
-	q := `SELECT fn.path, fn.name, ` + extentSizeSelect + `, fts.score
+	q := `SELECT fn.path, fn.name, i.size_bytes, fts.score
 		FROM (` + innerQ + `) fts
 		JOIN file_nodes fn ON COALESCE(fn.inode_id, fn.file_id) = fts.inode_id
-		JOIN inodes i ON i.inode_id = fts.inode_id` + extentSizeJoin
+		JOIN inodes i ON i.inode_id = fts.inode_id`
 	if len(outerConds) > 0 {
 		q += ` WHERE ` + scopeWhereAnd(scope, strings.Join(outerConds, " AND "), "fn", "i")
 		outerArgs = scopeWhereArgs(scope, 2, outerArgs...)
@@ -362,8 +351,8 @@ func (s *Store) KeywordSearch(ctx context.Context, query, pathPrefix string, lim
 	}
 	args = append(args, limit)
 
-	q := `SELECT fn.path, fn.name, ` + extentSizeSelect + `
-		FROM file_nodes fn JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id JOIN semantic s ON i.inode_id = s.inode_id` + extentSizeJoin + `
+	q := `SELECT fn.path, fn.name, i.size_bytes
+		FROM file_nodes fn JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id JOIN semantic s ON i.inode_id = s.inode_id
 		WHERE ` + scopeWhereAnd(s.scope, strings.Join(conds, " AND "), "fn", "i", "s") + `
 		ORDER BY i.confirmed_at DESC LIMIT ?`
 
@@ -420,17 +409,17 @@ func (s *Store) Find(ctx context.Context, f *FindFilter) ([]SearchResult, error)
 		args = append(args, f.Before.UTC())
 	}
 	if f.MinSize > 0 {
-		conds = append(conds, extentSizeSelect+" >= ?")
+		conds = append(conds, "i.size_bytes >= ?")
 		args = append(args, f.MinSize)
 	}
 	if f.MaxSize > 0 {
-		conds = append(conds, extentSizeSelect+" <= ?")
+		conds = append(conds, "i.size_bytes <= ?")
 		args = append(args, f.MaxSize)
 	}
 	args = append(args, f.Limit)
 
-	q := `SELECT fn.path, fn.name, ` + extentSizeSelect + `
-		FROM file_nodes fn JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id` + extentSizeJoin + `
+	q := `SELECT fn.path, fn.name, i.size_bytes
+		FROM file_nodes fn JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id
 		WHERE ` + scopeWhereAnd(s.scope, strings.Join(conds, " AND "), "fn", "i") + `
 		ORDER BY fn.path LIMIT ?`
 

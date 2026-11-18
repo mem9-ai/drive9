@@ -848,3 +848,59 @@ func TestStartupEnvsSetMetaMediaAndVideoDefaults(t *testing.T) {
 		t.Errorf("default video = %d, want 10000", meta.DefaultMaxVideoLLMFiles())
 	}
 }
+
+func TestDecodePreviousMasterKeys(t *testing.T) {
+	keyA := strings.Repeat("11", 32)
+	keyB := strings.Repeat("22", 32)
+	got, err := decodePreviousMasterKeys(" " + keyA + " , " + keyB + " ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || len(got[0]) != 32 || len(got[1]) != 32 {
+		t.Fatalf("keys = %v", got)
+	}
+	if got[0][0] != 0x11 || got[1][0] != 0x22 {
+		t.Fatalf("unexpected key material: %x %x", got[0][0], got[1][0])
+	}
+	if out, err := decodePreviousMasterKeys(""); err != nil || out != nil {
+		t.Fatalf("empty input = %v, %v", out, err)
+	}
+	if _, err := decodePreviousMasterKeys("not-hex"); err == nil {
+		t.Fatal("expected a decode error for non-hex input")
+	}
+	if _, err := decodePreviousMasterKeys(strings.Repeat("11", 16)); err == nil {
+		t.Fatal("expected a length error for a 16-byte key")
+	}
+}
+
+// Presigned URLs must follow the listener's scheme: with direct TLS enabled an
+// http:// base would hand clients URLs against an https listener.
+func TestPublicBaseURLFollowsTLSScheme(t *testing.T) {
+	keys := []string{"DRIVE9_PUBLIC_URL", "DRIVE9_TLS_CERT_FILE", "DRIVE9_TLS_KEY_FILE"}
+	// Snapshot before mutating: a snapshot taken inside Cleanup would capture
+	// this test's final values and leave them set for every later test.
+	snapshot := snapshotEnv(t, keys)
+	t.Cleanup(func() { restoreEnv(t, snapshot) })
+	unsetEnv(t, keys)
+
+	unsetEnv(t, []string{"DRIVE9_TLS_CERT_FILE", "DRIVE9_TLS_KEY_FILE"})
+	if got := publicBaseURL("127.0.0.1:9009"); got != "http://127.0.0.1:9009" {
+		t.Fatalf("plaintext base = %q", got)
+	}
+
+	setEnv(t, "DRIVE9_TLS_CERT_FILE", "/etc/drive9/tls.crt")
+	setEnv(t, "DRIVE9_TLS_KEY_FILE", "/etc/drive9/tls.key")
+	if got := publicBaseURL("127.0.0.1:9009"); got != "https://127.0.0.1:9009" {
+		t.Fatalf("tls base = %q, want https", got)
+	}
+	// A half-configured pair is not treated as TLS; ListenAndServe rejects it.
+	unsetEnv(t, []string{"DRIVE9_TLS_KEY_FILE"})
+	if got := publicBaseURL("127.0.0.1:9009"); got != "http://127.0.0.1:9009" {
+		t.Fatalf("half TLS base = %q, want http", got)
+	}
+	// An explicit public URL always wins.
+	setEnv(t, "DRIVE9_PUBLIC_URL", "https://drive9.example.com/")
+	if got := publicBaseURL("127.0.0.1:9009"); got != "https://drive9.example.com" {
+		t.Fatalf("explicit base = %q", got)
+	}
+}

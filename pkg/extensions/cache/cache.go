@@ -874,7 +874,7 @@ func (h *cachingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 		// Fetch error or short image: fall through to the direct read.
 		return h.inner.Read(ctx, off, dest)
 	}
-	if off == 0 && rev > 0 && !grown && h.cache.admits(dest) && !h.cache.sqliteBypassStableCaches(path) {
+	if off == 0 && rev > 0 && size > 0 && !grown && h.cache.admits(dest) && !h.cache.sqliteBypassStableCaches(path) {
 		if data, ok := h.cache.mem.Get(path, rev); ok && int64(len(data)) <= int64(len(dest)) {
 			n := copy(dest, data)
 			return n, nil
@@ -896,7 +896,7 @@ func (h *cachingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 	// v1 range disk tier for large files: the request's own (offset,
 	// size-clipped) range is fetched once and served from local disk on
 	// repeat — including across mounts (the key carries the revision).
-	if h.cache.dsk != nil && rev > 0 && !grown && !h.cache.dirs.hasLocalWriteState(path) && !h.cache.sqliteBypassStableCaches(path) {
+	if h.cache.dsk != nil && rev > 0 && size > 0 && !grown && !h.cache.dirs.hasLocalWriteState(path) && !h.cache.sqliteBypassStableCaches(path) {
 		// grown handles share the whole-file tiers' bypass: the disk
 		// range key and clip encode the stale open-time size/revision.
 		if n, ok := h.cache.readDiskCachedRange(ctx, h, off, dest); ok {

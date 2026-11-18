@@ -1514,3 +1514,33 @@ func TestDirCacheStampsWrittenWhileRequestOutstanding(t *testing.T) {
 		t.Fatalf("committed child lost: %v", cachedNames(t, dc, "/d"))
 	}
 }
+
+// A delayed positive response for a directory that had no cached entry before
+// an SSE reset must not repopulate it: the cold parent's per-directory
+// generation is zero on both sides, so only the reset epoch can fence it.
+func TestDirCacheColdParentObservationRejectedAfterReset(t *testing.T) {
+	dc := New(10 * time.Second)
+	token := dc.BeginRequest("/cold")
+	dc.InvalidateAll()
+	dc.Observe("/cold", fs.DirEntryInfo{Name: "stale.dat", Size: 8, Rev: 1}, token)
+	dc.mu.Lock()
+	_, present := dc.entries["/cold"]
+	dc.mu.Unlock()
+	if present {
+		t.Fatal("a pre-reset observation recreated a cold parent")
+	}
+}
+
+// The same reset fence applies to a delayed listing, not only a child Observe.
+func TestDirCacheColdParentListingRejectedAfterReset(t *testing.T) {
+	dc := New(10 * time.Second)
+	token := dc.BeginRequest("/cold")
+	dc.InvalidateAll()
+	dc.PutListing("/cold", []fs.DirEntryInfo{{Name: "stale.dat", Size: 8, Rev: 1}}, token)
+	dc.mu.Lock()
+	_, present := dc.entries["/cold"]
+	dc.mu.Unlock()
+	if present {
+		t.Fatal("a pre-reset listing recreated a cold parent")
+	}
+}

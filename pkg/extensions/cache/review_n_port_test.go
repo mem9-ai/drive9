@@ -233,7 +233,7 @@ func (n *recNamespace) Invalidate(string)       {}
 func (n *recNamespace) InvalidatePrefix(string) {}
 func (n *recNamespace) InvalidateAll()          {}
 
-// The sibling listing publication preserves the extent identity/ownership
+// The sibling listing publication preserves the identity/ownership fields
 // and is fenced by the reset epoch.
 func TestPortSiblingPrefetchKeepsIdentityAndFencesReset(t *testing.T) {
 	var epoch atomic.Uint64
@@ -241,15 +241,15 @@ func TestPortSiblingPrefetchKeepsIdentityAndFencesReset(t *testing.T) {
 	p := &dirPrefetcher{namespace: ns, genFn: func() uint64 { return epoch.Load() }}
 	entries := []fs.Entry{{
 		Name: "f", Attr: fs.Attr{Kind: fs.KindFile, Mode: 0o644, Size: 3, Rev: 7,
-			ResourceID: "res-1", ExtentIno: 77, Uid: 2000, Gid: 2000, HasOwner: true},
+			ResourceID: "res-1", Uid: 2000, Gid: 2000, HasOwner: true},
 	}}
 	load := func(ctx context.Context, op *fs.Op) (fs.Result, error) {
 		return fs.Result{Entries: entries}, nil
 	}
 	p.loadSiblingDirectory(load, "/d")
 	got := ns.puts["/d"]
-	if len(got) != 1 || got[0].ExtentIno != 77 || !got[0].HasUID || got[0].Uid != 2000 || got[0].ResourceID != "res-1" {
-		t.Fatalf("sibling row = %+v, want the extent identity/owner preserved", got)
+	if len(got) != 1 || !got[0].HasUID || got[0].Uid != 2000 || got[0].ResourceID != "res-1" {
+		t.Fatalf("sibling row = %+v, want the identity/owner preserved", got)
 	}
 
 	// A reset while the LIST is in flight: the publish must be dropped.
@@ -495,5 +495,27 @@ func TestPortRenameMigratesDirtyOwnership(t *testing.T) {
 	c.clearDirty("/g", h)
 	if c.dirtyPath("/g") {
 		t.Fatal("the writer's boundary did not clear its mark")
+	}
+}
+
+// A revision-only open (size unknown, 0) must not answer from the warm
+// whole-file/range tiers: a missed foreign append can leave the cached image
+// shorter than the current file, and serving it truncates the read silently.
+func TestPortUnknownOpenSizeBypassesRevisionTiers(t *testing.T) {
+	c, err := New(Options{MaxSize: 1 << 20, MaxFileSize: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.mem.PutOwned("/f", []byte("OLD"), 7)
+	gh := &gatedHandle{gate: make(chan struct{}), release: make(chan struct{}), data: []byte("NEW")}
+	close(gh.release)
+	h := &cachingHandle{cache: c, inner: gh, path: "/f", rev: 7, size: 0}
+	buf := make([]byte, 3)
+	n, err := h.Read(context.Background(), 0, buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(buf[:n]); got != "NEW" {
+		t.Fatalf("read = %q, want NEW (inner plane, not stale cached OLD)", got)
 	}
 }

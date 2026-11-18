@@ -169,13 +169,15 @@ env:
   TIDB_VERSION: v8.5.5
   DRIVE9_BASE: http://127.0.0.1:9009
   DRIVE9_TENANT_PROVIDER: local
+  # The Git suites clone a fixture repository built on this runner, so the
+  # server must accept a local repository URL. Production keeps the remote-only
+  # default; this opt-in is what the local provider harness is for.
+  DRIVE9_GIT_ALLOW_LOCAL_REPOS: "1"
   DRIVE9_LOCAL_DSN: root@tcp(127.0.0.1:4000)/drive9_local?parseTime=true
   DRIVE9_META_DSN: root@tcp(127.0.0.1:4000)/drive9_local?parseTime=true
   DRIVE9_LOCAL_MYSQL_DSN: root@tcp(127.0.0.1:4000)/drive9_local?parseTime=true
   DRIVE9_LOCAL_EMBEDDING_MODE: app
   DRIVE9_S3_BACKEND: s3
-  # Prebuilt servers bypass run-server-local, so opt in here for both launch paths.
-  DRIVE9_EXTENT_ALLOW_STATIC_CREDENTIALS: "1"
   RUN_SEMANTIC_CHECKS: "0"
   RUN_CLI_SEMANTIC_CHECKS: "0"
   RUN_FUSE_CONCURRENCY_STRESS: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && '1' || ((github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.run_all_e2e == '1' && '1' || inputs.run_fuse_concurrency_stress) || '0') }}
@@ -339,12 +341,12 @@ jobs:
           LAYER_FUSE_STRICT_PREREQS: "1"
         run: bash e2e/layer-fs-smoke-test.sh
 
-      - name: Test READDIRPLUS and SSE disconnects through Linux FUSE
+      - name: Test READDIRPLUS, rename, unlink and SSE disconnects through Linux FUSE
         id: fuse-readdir-pending
         continue-on-error: true
         env:
           DRIVE9_REQUIRE_KERNEL_FUSE: "1"
-        run: make test TEST_PKGS=./pkg/fuse TEST_RUN='^Test(ReadDirPlus(PendingKernel|ReplacedInodeKernel)|SSEDisconnectReadKernel)$' TEST_TIMEOUT=2m
+        run: make test TEST_PKGS=./pkg/fuse TEST_RUN='^Test(ReadDirPlus(PendingKernel|ReplacedInodeKernel)|SSEDisconnectReadKernel|Unlink(Hardlink|Recreate|ParentRename)Kernel|RenameLongPathKernel)$' TEST_TIMEOUT=2m
 
       - name: Run FUSE release gate
         id: fuse-smoke

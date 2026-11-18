@@ -95,6 +95,30 @@ func TestClassifyTenantRequest(t *testing.T) {
 	}
 }
 
+// The action label must not grow with caller-chosen methods: /s3/ and every other
+// method-classified surface has to map an unknown token onto a fixed label.
+func TestClassifyTenantRequestBoundsCallerMethod(t *testing.T) {
+	t.Parallel()
+
+	paths := []string{"/s3/local/objects/blob", "/v1/fs/doc.txt", "/v1/sql", "/v1/status"}
+	seen := map[string]struct{}{}
+	for _, path := range paths {
+		for _, method := range []string{"X1", "X2", "X3", "zzz", "a-b"} {
+			req, err := http.NewRequest(method, "http://example.test"+path, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			seen[classifyTenantRequest(req).action] = struct{}{}
+		}
+	}
+	if len(seen) != 1 {
+		t.Fatalf("caller-chosen methods produced %d action labels: %v", len(seen), seen)
+	}
+	if _, ok := seen["other"]; !ok {
+		t.Fatalf("caller-chosen methods produced %v, want the bounded label other", seen)
+	}
+}
+
 func TestRequestTenantID(t *testing.T) {
 	t.Parallel()
 

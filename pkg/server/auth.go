@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -26,7 +27,13 @@ type scopeKey int
 const tenantScopeKey scopeKey = iota
 
 type TenantScope struct {
-	TenantID           string
+	TenantID string
+	// IsFork marks a forked tenant (meta.TenantKindFork). Forks inherit the
+	// parent's StorageNamespaceID, so object keys are shared across the fork
+	// boundary and checks that trust namespace ownership must fall back to
+	// metadata ownership.
+	IsFork             bool
+	ParentTenantID     string
 	APIKeyID           string
 	TokenVersion       int
 	Provider           string
@@ -36,6 +43,17 @@ type TenantScope struct {
 	ScopeKind          meta.APIKeyScopeKind
 	IsScoped           bool
 	FSScopes           []FSScope
+}
+
+const chmodOwnerOnlyMessage = "chmod is owner-only"
+
+// CanChmod is the policy for explicit chmod and for the mode bits a batch write item
+// carries: only an owner token may change permission bits. A missing scope denies here;
+// handlers report missing authentication separately. Creation-time mkdir modes and layer
+// operations have their own contracts, so this predicate does not claim a universal mode
+// policy across every API surface.
+func (s *TenantScope) CanChmod() bool {
+	return s != nil && !s.IsScoped
 }
 
 const (
@@ -93,6 +111,11 @@ func sanitizeClientError(err error) string {
 	if isSchemaMigrationError(err) {
 		return "tenant metadata error"
 	}
+	if errors.Is(err, errChmodForbidden) {
+		// The policy message is the point: a caller that may not chmod needs to see why,
+		// not a generic backend failure.
+		return chmodOwnerOnlyMessage
+	}
 	return "backend unavailable"
 }
 
@@ -108,6 +131,9 @@ func backendErrorStatus(ctx context.Context, err error) int {
 	}
 	if isQuotaError(err) {
 		return http.StatusPaymentRequired
+	}
+	if errors.Is(err, errChmodForbidden) {
+		return http.StatusForbidden
 	}
 	if isSchemaMigrationError(err) {
 		return http.StatusBadGateway
@@ -152,19 +178,30 @@ func ownerJournalPermissionList() []string {
 	}
 }
 
-func journalPermissionsFromClaims(claims *token.Claims) map[string]bool {
-	if claims == nil || len(claims.JournalPermissions) == 0 {
+// journalPermissionsFromClaimsForScope derives a request's journal authority
+// from the token claim, which is authoritative when present.
+//
+// The owner fallback only applies to owner keys. fs_scoped keys are minted
+// without a journal_permissions claim, so the old unconditional fallback handed
+// every scoped key the full owner journal set — including journal:admin — which
+// is exactly the authority the scope exists to withhold. A scoped key with no
+// claim now gets no journal permission at all.
+func journalPermissionsFromClaimsForScope(scopeKind meta.APIKeyScopeKind, claims *token.Claims) map[string]bool {
+	if claims != nil && len(claims.JournalPermissions) > 0 {
+		perms := make(map[string]bool, len(claims.JournalPermissions))
+		for _, permission := range claims.JournalPermissions {
+			permission = strings.TrimSpace(permission)
+			if permission == "" {
+				continue
+			}
+			perms[permission] = true
+		}
+		return perms
+	}
+	if scopeKind == meta.APIKeyScopeKindOwner {
 		return ownerJournalPermissions()
 	}
-	perms := make(map[string]bool, len(claims.JournalPermissions))
-	for _, permission := range claims.JournalPermissions {
-		permission = strings.TrimSpace(permission)
-		if permission == "" {
-			continue
-		}
-		perms[permission] = true
-	}
-	return perms
+	return map[string]bool{}
 }
 
 func journalSourcePermission(source string) string {
@@ -406,12 +443,14 @@ func tenantAuthMiddlewareWithFSScopeLoader(metaStore *meta.Store, pool *tenant.P
 
 		scope := &TenantScope{
 			TenantID:           resolved.Tenant.ID,
+			IsFork:             resolved.Tenant.Kind == meta.TenantKindFork,
+			ParentTenantID:     resolved.Tenant.ParentTenantID,
 			APIKeyID:           resolved.APIKey.ID,
 			TokenVersion:       resolved.APIKey.TokenVersion,
 			Provider:           resolved.Tenant.Provider,
 			TiDBCloudOrgID:     b.TiDBCloudOrgID(),
 			Backend:            b,
-			JournalPermissions: journalPermissionsFromClaims(claims),
+			JournalPermissions: journalPermissionsFromClaimsForScope(scopeKind, claims),
 			ScopeKind:          scopeKind,
 			IsScoped:           isScoped,
 			FSScopes:           fsScopes,
@@ -473,11 +512,13 @@ func handleDeleteNoAcquireAuth(w http.ResponseWriter, r *http.Request, pool *ten
 
 	scope := &TenantScope{
 		TenantID:           resolved.Tenant.ID,
+		IsFork:             resolved.Tenant.Kind == meta.TenantKindFork,
+		ParentTenantID:     resolved.Tenant.ParentTenantID,
 		APIKeyID:           resolved.APIKey.ID,
 		TokenVersion:       resolved.APIKey.TokenVersion,
 		Provider:           resolved.Tenant.Provider,
 		TiDBCloudOrgID:     resolved.TiDBCloudOrgID,
-		JournalPermissions: journalPermissionsFromClaims(claims),
+		JournalPermissions: journalPermissionsFromClaimsForScope(scopeKind, claims),
 		ScopeKind:          scopeKind,
 		IsScoped:           isScoped,
 	}
@@ -507,9 +548,21 @@ func (s *Server) capabilityAuthMiddleware(metaStore *meta.Store, pool *tenant.Po
 			return
 		}
 
+		// Authenticate the token BEFORE it selects a tenant backend. The peek
+		// above only decodes a claim, so without this a forged token naming any
+		// tenant would make the server open (and decrypt credentials for) that
+		// tenant's database on every request — an unauthenticated amplifier and
+		// an existence oracle. The signature and TTL are checkable locally from
+		// the master key; only revocation needs the tenant DB and stays in the
+		// handler's full verification.
+		if err := s.verifyVaultCapabilityLocally(tok, tenantID); err != nil {
+			errJSON(w, http.StatusUnauthorized, "invalid capability token")
+			return
+		}
+
 		// Look up tenant and load backend. Use a uniform 401 for all
 		// failure modes to avoid leaking tenant existence or status to
-		// unauthenticated callers (tenant_id is from unverified peek).
+		// unauthenticated callers.
 		tenant, err := metaStore.GetTenant(r.Context(), tenantID)
 		if err != nil || tenant.Status != meta.TenantActive {
 			errJSON(w, http.StatusUnauthorized, "invalid capability token")
@@ -570,4 +623,37 @@ func bearerToken(r *http.Request) string {
 		return ""
 	}
 	return strings.TrimSpace(h[len(prefix):])
+}
+
+// verifyVaultCapabilityLocally checks a capability or grant token's signature
+// and TTL using only the master key, so the tenant_id claim is authenticated
+// before it is used to select a tenant backend. Revocation still requires the
+// tenant database and is re-checked by handleVaultRead after the backend loads.
+func (s *Server) verifyVaultCapabilityLocally(raw, tenantID string) error {
+	if s.vaultMK == nil {
+		return fmt.Errorf("vault master key not configured")
+	}
+	if strings.TrimSpace(tenantID) == "" {
+		return fmt.Errorf("capability token has no tenant_id")
+	}
+	csk := s.vaultMK.DeriveCSK(tenantID)
+	now := time.Now()
+	if strings.HasPrefix(raw, "vt_") {
+		claims, err := vault.VerifyGrant(csk, raw, now)
+		if err != nil {
+			return err
+		}
+		if strings.TrimSpace(claims.TenantID) != tenantID {
+			return fmt.Errorf("capability token tenant mismatch")
+		}
+		return nil
+	}
+	claims, err := vault.VerifyCapToken(csk, raw, now)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(claims.TenantID) != tenantID {
+		return fmt.Errorf("capability token tenant mismatch")
+	}
+	return nil
 }

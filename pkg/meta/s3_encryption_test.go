@@ -255,3 +255,26 @@ func TestValidateTenantS3EncryptionPolicyP1RejectsUnsupportedMode(t *testing.T) 
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+// The zero-config policy stays "none" (the bucket default applies); encryption
+// at rest is opt-in through the global policy and is exercised by the
+// resolution table above.
+func TestDefaultS3EncryptionPolicyStaysOptIn(t *testing.T) {
+	if got := DefaultS3EncryptionPolicy().Mode; got != S3EncryptionModeNone {
+		t.Fatalf("default mode = %q, want %q", got, S3EncryptionModeNone)
+	}
+	resolved, err := ResolveS3EncryptionPolicy(S3EncryptionPolicy{}, S3EncryptionPolicy{Mode: S3EncryptionModeInherit})
+	if err != nil {
+		t.Fatalf("resolve unset global policy: %v", err)
+	}
+	if resolved.Mode != s3client.EncryptionModeNone {
+		t.Fatalf("unset global policy resolved to %q, want %q", resolved.Mode, s3client.EncryptionModeNone)
+	}
+	resolved, err = ResolveS3EncryptionPolicy(S3EncryptionPolicy{Mode: S3EncryptionModeSSES3}, S3EncryptionPolicy{Mode: S3EncryptionModeInherit})
+	if err != nil {
+		t.Fatalf("resolve sse-s3 policy: %v", err)
+	}
+	if resolved.Mode != s3client.EncryptionModeSSES3 {
+		t.Fatalf("sse-s3 policy resolved to %q", resolved.Mode)
+	}
+}

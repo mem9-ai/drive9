@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,6 +22,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/meta"
 	"github.com/mem9-ai/drive9/pkg/tenant"
 	"github.com/mem9-ai/drive9/pkg/tenant/token"
+	"github.com/mem9-ai/drive9/pkg/vault"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
 )
@@ -902,5 +904,105 @@ func TestAuthTenantStatusResponses(t *testing.T) {
 				t.Fatalf("unexpected Retry-After header: %q", retryAfter)
 			}
 		})
+	}
+}
+
+// A scoped key must never inherit the owner journal set. fs_scoped keys are
+// minted without a journal_permissions claim, so the old unconditional owner
+// fallback silently granted them journal:admin.
+func TestJournalPermissionsFromClaimsFailsClosedForScopedKeys(t *testing.T) {
+	owner := journalPermissionsFromClaimsForScope(meta.APIKeyScopeKindOwner, &token.Claims{})
+	if !owner[JournalPermissionAdmin] || !owner[JournalPermissionCreate] {
+		t.Fatalf("owner permissions = %v, want the full owner set", owner)
+	}
+	if !journalPermissionsFromClaimsForScope(meta.APIKeyScopeKindOwner, nil)[JournalPermissionAdmin] {
+		t.Fatal("owner key with no claims lost its fallback")
+	}
+
+	scoped := journalPermissionsFromClaimsForScope(meta.APIKeyScopeKindFS, &token.Claims{})
+	if len(scoped) != 0 {
+		t.Fatalf("scoped key without a claim got %v, want no permissions", scoped)
+	}
+
+	explicit := journalPermissionsFromClaimsForScope(meta.APIKeyScopeKindFS, &token.Claims{
+		JournalPermissions: []string{JournalPermissionAppend},
+	})
+	if len(explicit) != 1 || !explicit[JournalPermissionAppend] {
+		t.Fatalf("explicit claim = %v, want only %s", explicit, JournalPermissionAppend)
+	}
+	if explicit[JournalPermissionAdmin] {
+		t.Fatal("scoped key escalated to journal admin through its claim")
+	}
+}
+
+// A capability token must authenticate before its tenant_id claim is allowed to
+// select a backend. Otherwise a forged token makes the server open any tenant's
+// database on demand.
+func TestVerifyVaultCapabilityLocallyRejectsForgedAndExpiredTokens(t *testing.T) {
+	mk, err := vault.NewMasterKey(bytes.Repeat([]byte{0x7a}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{vaultMK: mk}
+	tenantID := "tenant-a"
+	csk := mk.DeriveCSK(tenantID)
+
+	now := time.Now()
+	capTok, err := vault.SignCapToken(csk, &vault.CapTokenClaims{
+		TenantID:  tenantID,
+		TokenID:   "cap-1",
+		Scope:     []string{"db/password"},
+		ExpiresAt: now.Add(time.Minute).Unix(),
+	})
+	if err != nil {
+		t.Fatalf("SignCapToken: %v", err)
+	}
+	if err := s.verifyVaultCapabilityLocally(capTok, tenantID); err != nil {
+		t.Fatalf("valid token rejected: %v", err)
+	}
+
+	// Another tenant's CSK does not verify this token.
+	if err := s.verifyVaultCapabilityLocally(capTok, "tenant-b"); err == nil {
+		t.Fatal("token verified under a different tenant")
+	}
+	// A tampered signature fails. Flip a bit in the decoded MAC rather than
+	// substituting the trailing base64 character: a 32-byte MAC encodes to 43
+	// unpadded characters, so the last character carries only four significant
+	// bits and some substitutions (A -> B) decode to the identical MAC.
+	dot := strings.LastIndex(capTok, ".")
+	if dot < 0 {
+		t.Fatalf("unexpected capability token format: %q", capTok)
+	}
+	mac, err := base64.RawURLEncoding.DecodeString(capTok[dot+1:])
+	if err != nil {
+		t.Fatalf("decode capability signature: %v", err)
+	}
+	if len(mac) == 0 {
+		t.Fatal("empty capability signature")
+	}
+	mac[0] ^= 0xff
+	forged := capTok[:dot+1] + base64.RawURLEncoding.EncodeToString(mac)
+	if forged == capTok {
+		t.Fatal("test setup produced an unchanged token")
+	}
+	if err := s.verifyVaultCapabilityLocally(forged, tenantID); err == nil {
+		t.Fatal("forged token verified")
+	}
+	// An expired token fails.
+	expired, err := vault.SignCapToken(csk, &vault.CapTokenClaims{
+		TenantID:  tenantID,
+		TokenID:   "cap-2",
+		Scope:     []string{"db/password"},
+		ExpiresAt: now.Add(-2 * time.Minute).Unix(),
+	})
+	if err != nil {
+		t.Fatalf("SignCapToken(expired): %v", err)
+	}
+	if err := s.verifyVaultCapabilityLocally(expired, tenantID); err == nil {
+		t.Fatal("expired token verified")
+	}
+	// A server with no master key must fail closed rather than fall through.
+	if err := (&Server{}).verifyVaultCapabilityLocally(capTok, tenantID); err == nil {
+		t.Fatal("token verified without a vault master key")
 	}
 }

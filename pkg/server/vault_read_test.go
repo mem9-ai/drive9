@@ -195,22 +195,17 @@ func doVaultGrantRead(t *testing.T, srv *Server, token, path string) (*http.Resp
 	return resp, body
 }
 
+// readServerMetrics renders the Prometheus export directly. /metrics is not
+// mounted on the API mux anymore (it is served by the dedicated metrics
+// listener), so tests must not scrape it over the API surface.
 func readServerMetrics(t *testing.T, srv *Server) string {
 	t.Helper()
-	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
 	rec := httptest.NewRecorder()
-	srv.ServeHTTP(rec, req)
-	resp := rec.Result()
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("metrics status=%d body=%s", resp.StatusCode, body)
+	srv.metrics.writePrometheus(rec)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("metrics status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("read metrics body: %v", err)
-	}
-	return string(body)
+	return rec.Body.String()
 }
 
 func tamperGrantTenantID(t *testing.T, raw, tenantID string) string {

@@ -123,7 +123,7 @@ test:
 # tests because pkg/fuse has pre-existing unrelated races elsewhere
 # (kernel_cache_bypass) that are not this change's concern.
 test-race:
-	$(GO) test -race -count=1 -tags "$(GO_TAGS)" -timeout $(TEST_TIMEOUT) ./pkg/extent/...
+	$(GO) test -race -count=1 -tags "$(GO_TAGS)" -timeout $(TEST_TIMEOUT) ./pkg/extensions/extent/...
 	$(GO) test -race -count=1 -tags "$(GO_TAGS)" -timeout $(TEST_TIMEOUT) ./pkg/fuse/ -run 'TestExtent|TestEnsureExtent|TestCloseExtentRuntime'
 
 # Run only failpoint-tagged tests through repository-wide instrumentation.
@@ -310,7 +310,7 @@ build-cli-release:
 		echo "Building $$(basename "$$out")..."; \
 		$(MAKE) --no-print-directory build-cli GOOS="$$os" GOARCH="$$arch" CLI_BIN="$$out" VERSION="$(VERSION)"; \
 	done; \
-	cd $(DIST_DIR) && sha256sum $(CLI_NAME)-* > checksums.txt && printf '%s\n' "$(VERSION)" > version
+	cd $(DIST_DIR) && sha256sum $(CLI_NAME)-* > checksums.txt && printf '%s\n' "$(if $(VERSION),$(VERSION),dev)" > version && { printf 'version %s\nchecksums-sha256 %s\n' "$(if $(VERSION),$(VERSION),dev)" "$$(sha256sum checksums.txt | cut -d' ' -f1)"; } > release.txt
 
 DOCKER_BUILD_ARGS ?=
 MIGRATION_DOCKER_BUILD_ARGS ?=

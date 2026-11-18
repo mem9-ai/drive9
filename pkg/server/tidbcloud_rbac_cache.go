@@ -11,7 +11,12 @@ import (
 )
 
 const (
-	tidbCloudRBACCacheTTL        = time.Hour
+	// tidbCloudRBACCacheTTL bounds how long a revoked TiDB Cloud API key keeps
+	// resolving to its cached organization identity. The cache is keyed by the
+	// credential itself and has no invalidation channel, so this TTL is the
+	// revocation latency: an hour let a revoked org-owner key keep its authority
+	// far longer than the upstream API would honor it.
+	tidbCloudRBACCacheTTL        = 30 * time.Minute
 	tidbCloudRBACCacheMaxEntries = 10000
 )
 

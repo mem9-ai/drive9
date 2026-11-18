@@ -63,7 +63,14 @@ type CommitEntry struct {
 	// staging generations that existed when the entry was enqueued. Upload and
 	// cleanup use these tokens so a later same-path write cannot swap in newer
 	// shadow bytes or have its pending metadata removed by an older entry.
-	ShadowGen       uint64
+	//
+	// ShadowGen is a CONTENT generation, not a pin token: it gates uploads and
+	// cleanup by "is this still the same bytes", which is what every caller
+	// does with it. Reads of the entry's bytes must go through the
+	// content-generation APIs (ReadAllIfGeneration / OpenIfGeneration /
+	// ReadAtIfGeneration); the pin-generation APIs (ReadAtGen) live in a
+	// different number space and reject a content generation outright.
+	ShadowGen       staging.ContentGen
 	PendingIndexGen uint64
 	WriteBackGen    uint64
 	// DurableWatermarkRev is the newest revision that Dat9FS knows was already
@@ -71,6 +78,17 @@ type CommitEntry struct {
 	// based on an older revision are stale and must fail instead of overwriting
 	// that watermark through Release/CommitQueue.
 	DurableWatermarkRev int64
+	// LandedResourceID is the resource identity the object's completion
+	// ECHOED for this entry's publication (completion_identity_v1). It is the
+	// proof that the object now at the path is the one this commit produced,
+	// which is stronger than comparing revisions: a revision can legitimately
+	// advance for reasons unrelated to who wrote the bytes.
+	LandedResourceID string
+	// DirtyRanges carries the write buffer's dirty part ranges at enqueue
+	// time, coalesced and clipped to Size. Extent-layout commits upload only
+	// these ranges as dirty blocks (incremental PATCH); classic commits
+	// ignore them and send the whole image.
+	DirtyRanges []ByteRange
 	// DisableAutoResolveLWW forces conflicts for fenced entries to stay
 	// terminal. Re-basing old bytes with a new BaseRev is exactly the silent
 	// rollback class this fence prevents.
@@ -105,6 +123,19 @@ type CommitCleanupFunc func(entry *CommitEntry)
 // overtaken by a newer mutation and must not reach remote storage.
 type CommitSupersededFunc func(entry *CommitEntry) bool
 
+// pathCommitFailure is the most recent terminal commit failure recorded for a
+// path: the last upload error and a monotonic stamp for bounded trimming.
+// standalone marks records installed by RecordTerminalFailureForPath: no
+// queue entry backs them and the unlanded bytes stay under a DIFFERENT (old)
+// pathname, so their own path typically carries no pending state at all —
+// nothing durable can re-derive them, and only an explicit clear may drop
+// them.
+type pathCommitFailure struct {
+	err        error
+	seq        uint64
+	standalone bool
+}
+
 // CommitQueue manages ordered background remote commits with baseRev tracking.
 // It provides backpressure when the queue exceeds maxPending items.
 type CommitQueue struct {
@@ -119,15 +150,51 @@ type CommitQueue struct {
 	// replaced across a crash, so persisting this proof would be unsafe.
 	landed      map[string]pathCommitLandmark
 	landedClock uint64
-	maxPending  int
-	client      *client.Client
-	remoteRoot  string
-	layerRef    string
-	shadows     *staging.ShadowStore
-	index       *staging.PendingIndex
-	journal     *staging.Journal
-	wg          sync.WaitGroup
-	stopped     bool
+	// commitClock/commitSeq record EVERY successful commit per path with no
+	// payload conditions — unlike the landed landmarks, which are a
+	// selective lineage/rebase cache (no snapshot ID, no checksum above
+	// 1MiB ⇒ no landmark). The rename flow's in-window detection and
+	// failure-record rekey fences read these: they must observe a completed
+	// upload regardless of size, entry provenance, or event-stream state.
+	// The table is BOUNDED (trimCommitSeqLocked): a stamp carries no
+	// obligation once no rename window may still compare it, so pins — not
+	// retention — define the lifecycle (BeginCommitSeqWindow).
+	commitClock uint64
+	commitSeq   map[string]uint64
+	// commitSeqPins refcounts the stamps the OPEN windows may still compare
+	// (each window holds its own pin set; the refcount aggregates them for
+	// trimCommitSeqLocked's O(1) membership test). Pins are only ever taken
+	// for stamped paths, so the key set is a subset of commitSeq's.
+	commitSeqPins map[string]int
+	// commitSeqWindows holds the open windows keyed by their id.
+	commitSeqWindows map[uint64]*CommitSeqWindow
+	// commitSeqWindowSeq mints window ids.
+	commitSeqWindowSeq uint64
+	// terminalFailures records the most recent terminal commit failure per
+	// path so a durability barrier that waited on the path can report EIO
+	// instead of success: after onCommitTerminalFailure the path looks
+	// idle to WaitPath* exactly like a landed commit. Recorded before the
+	// entry leaves in-flight, cleared by the next successful commit of the
+	// path (onCommitSuccessWithOptions), mirroring landed's lifecycle.
+	terminalFailures map[string]pathCommitFailure
+	failureClock     uint64
+	maxPending       int
+	client           *client.Client
+	remoteRoot       string
+	layerRef         string
+	shadows          *staging.ShadowStore
+	// retainedShadows marks a path whose landed entry must NOT have its
+	// shadow reclaimed: the staging handle refused certification (its
+	// buffer moved on), but the shadow is still the only restore source for
+	// the landing's unchanged evicted parts. Consumed by the cleanup pass.
+	retainedShadows   sync.Map
+	extentGlobs       []globMatcher
+	extentMatchCutoff int64
+	extentMinSize     int64
+	index             *staging.PendingIndex
+	journal           *staging.Journal
+	wg                sync.WaitGroup
+	stopped           bool
 	// abandoned is set by AbandonLayer when the mounted layer was rolled
 	// back. When true, Enqueue returns errLayerRolledBack and commitOne
 	// skips tryAutoResolveConflict, going straight to terminal failure so
@@ -171,9 +238,12 @@ type CommitQueue struct {
 	workCh chan *CommitEntry
 
 	zeroTruncateDelay time.Duration
-	batchWindow       time.Duration
-	batchMaxItems     int
-	batchMaxBytes     int64
+	// extentTakeover arms the extent content-layout commit branch
+	// (SetExtentTakeover).
+	extentTakeover bool
+	batchWindow    time.Duration
+	batchMaxItems  int
+	batchMaxBytes  int64
 
 	perf *fusePerfCounters
 }
@@ -225,6 +295,7 @@ func NewCommitQueue(c *client.Client, shadows *staging.ShadowStore, index *stagi
 		queuedByPath:      make(map[string]map[*CommitEntry]struct{}),
 		delayed:           make(map[*CommitEntry]*time.Timer),
 		landed:            make(map[string]pathCommitLandmark),
+		terminalFailures:  make(map[string]pathCommitFailure),
 		workCh:            make(chan *CommitEntry, bufSize),
 		zeroTruncateDelay: zeroTruncateCommitQueueDelay,
 	}
@@ -238,6 +309,70 @@ func NewCommitQueue(c *client.Client, shadows *staging.ShadowStore, index *stagi
 // SetPerfCounters attaches the commit counters shim.
 func (cq *CommitQueue) SetPerfCounters(perf *fusePerfCounters) {
 	cq.perf = perf
+}
+
+// SetExtentTakeover arms the extent content-layout branch: large commits
+// are probed (one stat per commit) and routed to extent block sessions.
+// It is the v2 cutover kill-switch; queues without it keep the classic
+// direct-PUT/multipart routing byte-for-byte.
+func (cq *CommitQueue) SetExtentTakeover(enabled bool) {
+	if cq == nil {
+		return
+	}
+	cq.mu.Lock()
+	cq.extentTakeover = enabled
+	cq.mu.Unlock()
+}
+
+// SetExtentPatterns arms pattern-only extent routing with zero size fallback.
+func (cq *CommitQueue) SetExtentPatterns(patterns []string, matchedCutoff int64) {
+	cq.SetExtentRouting(patterns, matchedCutoff, 0)
+}
+
+// SetExtentRouting arms both pattern-matched extent routing (at matchedCutoff)
+// and optional hybrid size-cutoff fallback (minSize > 0) for non-matching paths.
+func (cq *CommitQueue) SetExtentRouting(patterns []string, matchedCutoff, minSize int64) {
+	if cq == nil {
+		return
+	}
+	globs := compileExtentGlobs(patterns)
+	cq.mu.Lock()
+	cq.extentGlobs = globs
+	cq.extentMatchCutoff = matchedCutoff
+	cq.extentMinSize = minSize
+	cq.mu.Unlock()
+}
+
+// extentRouteFor reports the extent routing decision for a queued path.
+func (cq *CommitQueue) extentRouteFor(path string, size int64) bool {
+	cq.mu.Lock()
+	globs, cutoff, minSize := cq.extentGlobs, cq.extentMatchCutoff, cq.extentMinSize
+	cq.mu.Unlock()
+	if len(globs) > 0 {
+		if matchExtentPattern(globs, path) {
+			return size >= cutoff
+		}
+		return minSize > 0 && size >= minSize
+	}
+	threshold := cq.directPutThreshold()
+	if threshold <= 0 {
+		// Unknown cutoff (cache cold): the historical behavior routes to
+		// the extent plane rather than guessing classic.
+		return true
+	}
+	return size >= threshold
+}
+
+// RetainShadowForLanding asks the success cleanup to keep this path's
+// shadow generation: the handle that staged the landed image refused
+// certification (newer local mutations), and its unchanged evicted parts
+// still reference the shadow as their only restore source. The next
+// staging overwrites the shadow and the next landing reclaims it.
+func (cq *CommitQueue) RetainShadowForLanding(path string, gen staging.ContentGen) {
+	if cq == nil {
+		return
+	}
+	cq.retainedShadows.Store(path, gen)
 }
 
 // ConfigureBatchWrite enables a small writeback-only direct-PUT batch window.
@@ -547,6 +682,34 @@ func (cq *CommitQueue) WaitPathDeadline(path string, timeout time.Duration) bool
 	return true
 }
 
+// ClearPathCommitErr retires a remembered terminal failure for a pathname
+// after a publication of that name SUCCEEDED outside the queue (an inline
+// PUT, the write-cache uploader, a synchronous commit). Without this a
+// recreated or re-published file keeps inheriting its predecessor's error.
+func (cq *CommitQueue) ClearPathCommitErr(path string) {
+	if cq == nil || path == "" {
+		return
+	}
+	cq.mu.Lock()
+	delete(cq.terminalFailures, path)
+	cq.mu.Unlock()
+}
+
+// WaitPathOutcome waits like WaitPathDeadline and then reports whether the
+// path's last commit actually succeeded. A path can be idle because its
+// entry terminally failed (the queue removed it) — sync-durability callers
+// need that distinction.
+//
+// The failure itself is read from PathTerminalFailure, which also covers the
+// durable PendingConflict marker a previous process left behind; a bare
+// in-memory map would silently lose that across restarts.
+func (cq *CommitQueue) WaitPathOutcome(path string, timeout time.Duration) error {
+	if !cq.WaitPathDeadline(path, timeout) {
+		return fmt.Errorf("commit for %s still in flight after %s", path, timeout)
+	}
+	return cq.PathTerminalFailure(path)
+}
+
 // HasPath reports whether a path is queued or currently in flight.
 func (cq *CommitQueue) HasPath(path string) bool {
 	if cq == nil {
@@ -633,17 +796,54 @@ func (cq *CommitQueue) WaitPrefixTimeout(prefix string, timeout time.Duration) b
 // CancelPath marks currently queued or in-flight entries for path as canceled,
 // removes queued entries, and cleans up shadow/index state. Cancellation is
 // entry-scoped so future files that reuse the same path (for example git's
-// config.lock) are not poisoned by an old cancellation.
-func (cq *CommitQueue) CancelPath(path string) {
-	cq.cancelPath(path, false)
+// config.lock) are not poisoned by an old cancellation. It reports an error
+// only when the path's local state could not be made non-replayable.
+func (cq *CommitQueue) CancelPath(path string) error {
+	return cq.cancelPath(path, false)
 }
 
 // CancelPathPreserveLocal cancels queued or in-flight uploads for path without
-// removing the local shadow/index state. Rename uses this for Git's loose-object
-// temp files: the temp upload must stop, but the bytes must survive while the
-// pending entry moves to the content-addressed final path.
-func (cq *CommitQueue) CancelPathPreserveLocal(path string) {
-	cq.cancelPath(path, true)
+// removing the local shadow/index state. Unlink uses this when an open fd
+// still serves the staged image: the upload must stop, but the bytes survive
+// until the last close. The WAL done marker is still journaled (the name is
+// gone) so a crash before that close cannot replay the staged frames.
+func (cq *CommitQueue) CancelPathPreserveLocal(path string) error {
+	return cq.cancelPath(path, true)
+}
+
+// CancelEntryInFlight cancels EXACTLY the given entry — the targeted
+// counterpart of the pathname-wide CancelPath* family. Used by a staging
+// that observed the unlink marking after its enqueue: the name may have
+// been recreated by the time this runs, so nothing but this entry may be
+// touched (no pathname sweep, no journal fence — the unlink's own cancel
+// owns those).
+func (cq *CommitQueue) CancelEntryInFlight(entry *CommitEntry) {
+	if cq == nil || entry == nil {
+		return
+	}
+	cq.mu.Lock()
+	entry.canceled = true
+	cancel := entry.cancelCommit
+	if cancel == nil {
+		// Not picked up by a worker yet: retire it from EVERY waitable
+		// set — the queue slice, the immediate set, and the queuedByPath
+		// index (WaitPath/WaitPathDeadline consult the index; leaving the
+		// membership behind keeps the path busy forever, since a worker
+		// that never sees the entry can never repair it).
+		cq.stopDelayedLocked(entry)
+		for i, e := range cq.queue {
+			if e == entry {
+				cq.queue = append(cq.queue[:i], cq.queue[i+1:]...)
+				break
+			}
+		}
+		delete(cq.immediate, entry)
+		cq.removeQueuedLocked(entry)
+	}
+	cq.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 // CancelPathIfInode cancels queued or in-flight uploads for path whose entries
@@ -829,6 +1029,9 @@ func (cq *CommitQueue) CancelPrefix(prefix string) {
 		if cq.index != nil {
 			cq.index.Remove(p)
 		}
+		// Same pathname-incarnation rule as cancelPath: the subtree's names
+		// are gone, so their terminal failures must not poison a recreator.
+		cq.clearTerminalFailure(p)
 		if cq.journal != nil {
 			if err := cq.journal.Append(staging.JournalEntry{
 				Op:   staging.JournalCommit,
@@ -1132,6 +1335,17 @@ func (cq *CommitQueue) recoveredEntry(path string) *CommitEntry {
 	if !ok || meta.LayerClean {
 		return nil
 	}
+	if meta.Kind == staging.PendingConflict {
+		// A conflict marker is preserved even without a shadow: the
+		// transfer transaction stages one at the destination deliberately
+		// (a crash mid-move must leave the renamed name refusing to certify
+		// the image that never landed, with the bytes preserved under the
+		// old name) — pruning it as "orphaned" would erase the only durable
+		// witness. Entries WITH a shadow are the ordinary preserved-for-
+		// manual-recovery case.
+		safeLogPrintf("commit queue: skipping conflicted entry for %s (preserved for manual recovery)", path)
+		return nil
+	}
 	if cq.shadows != nil && !cq.shadows.Has(path) {
 		// Shadow file missing — prune orphaned pending index entry so
 		// Lookup/GetAttr don't serve stale metadata.
@@ -1140,10 +1354,6 @@ func (cq *CommitQueue) recoveredEntry(path string) *CommitEntry {
 		return nil
 	}
 	shadowGen := cq.index.RecoverShadowSource(path, meta.Generation, cq.shadows)
-	if meta.Kind == staging.PendingConflict {
-		safeLogPrintf("commit queue: skipping conflicted entry for %s (preserved for manual recovery)", path)
-		return nil
-	}
 	if meta.Kind == staging.PendingOverwrite && meta.BaseRev <= 0 && cq.layerRefSnapshot() == "" {
 		safeLogPrintf("commit queue: skip legacy pending overwrite without base revision for %s", path)
 		return nil
@@ -1202,7 +1412,10 @@ func (cq *CommitQueue) hasImmediatePrefixLocked(prefix string) bool {
 	return false
 }
 
-func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) {
+// cancelPathEntries marks every queued, immediate, or in-flight entry for
+// path canceled, drops the queued ones, and returns their cancel funcs for
+// the caller to fire outside cq.mu.
+func (cq *CommitQueue) cancelPathEntries(path string) []context.CancelFunc {
 	var cancels []context.CancelFunc
 	seen := make(map[*CommitEntry]struct{})
 	markCanceled := func(e *CommitEntry) {
@@ -1224,7 +1437,12 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) {
 	}
 
 	cq.mu.Lock()
+	defer cq.mu.Unlock()
 	delete(cq.landed, path)
+	// The remembered failure belongs to the PUBLICATION that failed, not to
+	// the pathname: a cancel (unlink/rename/delete) retires it, or a
+	// recreated file would inherit its predecessor's EIO on every Sync until
+	// an unrelated queue success happened to clear it.
 	if e, ok := cq.inFlight[path]; ok {
 		markCanceled(e)
 	}
@@ -1258,37 +1476,117 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) {
 		cq.queue = remaining
 		delete(cq.queuedByPath, path)
 	}
-	cq.mu.Unlock()
+	return cancels
+}
 
-	for _, cancel := range cancels {
+// cancelPath is the shared Unlink/Rmdir cancel. It returns an error when the
+// path's local state provably stays replayable — the marker could not be
+// journaled AND the fallback cleanup could not remove the recovery source —
+// so the caller must not acknowledge a successful unlink on the assumption
+// that the void removal APIs below did their job. A successful cancel also
+// drops the path's recorded terminal failure: the pathname incarnation ended,
+// and a later reuse of the name (a renamed-in file) must not inherit an EIO
+// for data the recreator never wrote. The failure-free error return keeps the
+// record — the name survived, and so did its unlanded data.
+func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) error {
+	// First pass without the path lock: an in-flight upload holds that lock
+	// for its whole transfer, and aborting it here is what releases it.
+	for _, cancel := range cq.cancelPathEntries(path) {
 		cancel()
 	}
-	if preserveLocal {
-		return
+	// Second pass under the same-path lock the staging path holds across
+	// its shadow/pending publication and Enqueue: an entry that slipped in
+	// between the two passes is canceled too, and the marker below lands at
+	// a higher Seq than every frame published before it. A staging that
+	// takes the lock after this returns sees the handle's unlink marking and
+	// publishes nothing (stageAndEnqueueOpt).
+	unlock := cq.lockPath(path)
+	defer unlock()
+	for _, cancel := range cq.cancelPathEntries(path) {
+		cancel()
 	}
 	hadLocal := false
 	if cq.shadows != nil && cq.shadows.Has(path) {
 		hadLocal = true
-		cq.shadows.Remove(path)
+		if !preserveLocal {
+			cq.shadows.Remove(path)
+		}
 	}
+	// The pending entry dies only once the recovery source is CONFIRMED
+	// gone: it is the overlay lookups serve from, and a failed unlink must
+	// leave the fsynced publication discoverable and retryable.
+	pendingHad := false
 	if cq.index != nil && cq.index.HasPending(path) {
 		hadLocal = true
-		cq.index.Remove(path)
+		pendingHad = true
+	}
+	dropPending := func() {
+		if !preserveLocal && pendingHad && cq.index != nil {
+			cq.index.Remove(path)
+		}
 	}
 	// staging.Journal a "done" marker so crash recovery does not resurrect the
 	// unlinked path from earlier fsync frames, and so those frames compact.
 	// Only when local pending state existed, to avoid a WAL frame per unlink.
-	if hadLocal && cq.journal != nil {
-		// Best effort: a lost marker only means recovery re-checks a path
-		// whose shadow/.meta are already gone, which the pending-index
-		// prune discards. Log so persistent WAL write failures surface.
-		if err := cq.journal.Append(staging.JournalEntry{
-			Op:   staging.JournalCommit,
-			Path: path,
-		}); err != nil {
-			safeLogPrintf("commit queue: journal cancel marker failed for %s: %v", path, err)
+	// A preserve-local cancel journals it too: the in-memory shadow/index stay
+	// for the anonymous fd's reads, but the name is gone. The facade's
+	// unlink-of-open-file path defers the non-preserving cancel to the last
+	// close plus a remote HEAD, and a crash inside that window replayed the
+	// fsync'd frames and re-committed the unlinked file (#1065).
+	// No WAL (or nothing staged): without frames there is nothing to fence,
+	// and a journal-less queue keeps the preserve-local contract verbatim.
+	if cq.journal == nil || !hadLocal {
+		dropPending()
+		cq.clearTerminalFailure(path)
+		return nil
+	}
+	appendErr := cq.journal.Append(staging.JournalEntry{
+		Op:   staging.JournalUnlink,
+		Path: path,
+	})
+	if appendErr == nil {
+		// The marker fences every frame published before it — the path
+		// cannot replay even if the removal above silently failed.
+		dropPending()
+		cq.clearTerminalFailure(path)
+		return nil
+	}
+	safeLogPrintf("commit queue: journal cancel marker failed for %s: %v", path, appendErr)
+	if preserveLocal {
+		// The retained shadow/index are safe only while the marker fences
+		// their WAL frames: without it a crash replays them. Fall back to
+		// the non-preserving cleanup below.
+		if cq.shadows != nil {
+			cq.shadows.Remove(path)
 		}
 	}
+	// ShadowStore.Remove and PendingIndex.Remove discard their disk errors,
+	// so verify with evidence instead of assuming: a read-only or failing
+	// cache filesystem can reject the marker AND leave the durable shadow
+	// behind, and replay would then upload the deleted name after a restart.
+	if cq.shadows == nil || cq.shadows.VerifyRemoved(path) == nil {
+		// Confirmed gone — finish the degrade-to-non-preserving cleanup
+		// (the anonymous fd loses its staged image on a failing WAL, but
+		// the unlink cannot resurrect).
+		if pendingHad && cq.index != nil {
+			cq.index.Remove(path)
+		}
+		cq.clearTerminalFailure(path)
+		return nil
+	}
+	// The recovery source survived or its absence cannot be proven. Keep the
+	// pending entry (the overlay stays discoverable), re-drive the upload
+	// when the shadow is still stat-able so the fsynced publication is
+	// retryable without a restart, and report the unlink as failed — the
+	// caller must not acknowledge a deletion a restart would undo.
+	if cq.shadows.Has(path) {
+		if entry := cq.recoveredEntry(path); entry != nil {
+			if enqErr := cq.Enqueue(entry); enqErr != nil {
+				safeLogPrintf("commit queue: re-driving %s after the failed unlink rollback failed: %v", path, enqErr)
+			}
+		}
+	}
+	return fmt.Errorf("commit queue: unlink of %s is not crash-durable: WAL marker failed (%v) and the staged image could not be confirmed removed", path, appendErr)
 }
 
 // isEntryCanceled checks whether this specific entry was canceled by
@@ -2207,7 +2505,25 @@ func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) (int
 	// overwrite the exact parent revision this live queue just landed.
 	expectedRevision := entry.BaseRev
 	if entry.Kind == staging.PendingOverwrite && expectedRevision <= 0 {
-		return 0, fmt.Errorf("missing base revision for overwrite: %s", entry.Path)
+		resolvedRev, emptied, err := cq.reclaimEmptyOccupant(ctx, entry, apiPath)
+		if err != nil {
+			return 0, err
+		}
+		if !emptied {
+			// Not empty (or not statable): the base revision is genuinely
+			// required and genuinely missing. Refuse rather than overwrite an
+			// object whose revision cannot be named.
+			return 0, fmt.Errorf("missing base revision for overwrite: %s", entry.Path)
+		}
+		expectedRevision = resolvedRev
+	}
+
+	// Extent content layout: route large commits through the extent block
+	// plane before the classic direct-PUT/multipart decision. Fresh
+	// large files are taken over by extent sessions here; existing extent
+	// files commit incrementally through PATCH dirty blocks.
+	if committedRev, handled, err := cq.uploadExtentEntry(ctx, entry, apiPath, expectedRevision); handled {
+		return committedRev, err
 	}
 
 	// ShadowSpill entries: stream directly from shadow file to avoid loading
@@ -2399,6 +2715,11 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 		committedRev = committedRevisionForExpectedRevision(expectedRevision, committedRev)
 	}
 	cq.rememberLanded(entry.Path, committedRev, entry.Size, cq.checksumLandedPayload(entry), entry.SnapshotID, entry.liveAncestors...)
+	cq.recordCommitSeq(entry.Path)
+	// The image landed remotely: a previously recorded terminal failure for
+	// this path must not fail later durability barriers. Clear it before the
+	// entry leaves the queue (same visibility window as rememberLanded).
+	cq.clearTerminalFailure(entry.Path)
 	if cq.OnUploaded != nil {
 		cq.OnUploaded(entry, committedRev)
 	}
@@ -2439,6 +2760,12 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 			// commit for this path.
 			if client.IsNotFound(err) {
 				safeLogPrintf("commit queue: post-upload chmod not found for %s (concurrent write likely replaced it); proceeding without mode update", entry.Path)
+			} else if client.IsForbidden(err) {
+				// chmod is owner-only. A mount authenticated with an fs_scoped key can
+				// write content but may not change permission bits, and retrying cannot
+				// change that: the entry would stay pending and be denied again on every
+				// commit cycle. Content is already durable, so drop the mode and proceed.
+				safeLogPrintf("commit queue: post-upload chmod denied for %s (token may not chmod); proceeding without mode update", entry.Path)
 			} else {
 				return fmt.Errorf("%w: chmod %s to %o: %w", errCommitPostUpload, entry.Path, mode, err)
 			}
@@ -2469,6 +2796,13 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 	// the local metadata source, and shadowStore remains the local data source
 	// for large files that are not admitted to readCache.
 	if cq.shadows != nil && cq.layerRefSnapshot() == "" {
+		if keep, ok := cq.retainedShadows.LoadAndDelete(entry.Path); ok && keep == entry.ShadowGen {
+			// The staging handle kept newer local bytes: the shadow stays
+			// as the restore source for this landing's evicted parts.
+			cq.index.RemoveIfGeneration(entry.Path, entry.PendingIndexGen)
+			cq.removeFromQueue(entry)
+			return nil
+		}
 		if entry.ShadowGen != 0 {
 			cq.shadows.RemoveIfGeneration(entry.Path, entry.ShadowGen)
 		}
@@ -2899,9 +3233,31 @@ func (cq *CommitQueue) onCommitPostUploadFailure(entry *CommitEntry, err error) 
 	if cq.perf != nil {
 		cq.perf.commitFailure.add(1)
 	}
+	// The DATA landed but the post-upload work (deferred chmod, tags) did
+	// not, so the requested outcome was never achieved. Record it for
+	// outcome-aware waiters: a close-sync/strict-fsync caller that waited on
+	// this path must not report success for a mode that was never committed.
+	// The record is the same terminal-failure channel the data-failure path
+	// uses — both mean "this path did not reach the requested state" — and it
+	// is retired by the next successful commit of the path.
+	if cq.terminalFailures == nil {
+		cq.terminalFailures = make(map[string]pathCommitFailure)
+	}
+	cq.mu.Lock()
+	if err == nil {
+		err = errCommitPostUploadUnknown
+	}
+	cq.failureClock++
+	cq.terminalFailures[entry.Path] = pathCommitFailure{err: err, seq: cq.failureClock}
+	cq.pruneTerminalFailuresLocked()
+	cq.mu.Unlock()
 	cq.removeFromQueue(entry)
 	safeLogPrintf("commit queue: post-upload failure for %s; local pending state preserved for retry: %v", entry.Path, err)
 }
+
+// errCommitPostUploadUnknown backs a post-upload failure that carried no
+// error value: the requested metadata was not applied either way.
+var errCommitPostUploadUnknown = errors.New("commit queue: post-upload work failed")
 
 func (cq *CommitQueue) onCommitTerminalFailure(entry *CommitEntry, lastErr error) {
 	// Mark the entry as conflicted in the pending index so that crash
@@ -2955,6 +3311,22 @@ func (cq *CommitQueue) recordCommitTerminalFailure(entry *CommitEntry, lastErr e
 		cq.perf.commitFailure.add(1)
 		cq.perf.commitTerminalFailure.add(1)
 	}
+	// Record the failure before this worker returns (the entry is already
+	// dequeued; endInFlight follows commitOne) so any durability barrier that
+	// observes the path idle through WaitPath* necessarily sees the failure.
+	if lastErr == nil {
+		// The data still never landed remotely; report a concrete error to
+		// barriers instead of a nil that would read as success.
+		lastErr = errCommitTerminalUnknown
+	}
+	cq.mu.Lock()
+	if cq.terminalFailures == nil {
+		cq.terminalFailures = make(map[string]pathCommitFailure)
+	}
+	cq.failureClock++
+	cq.terminalFailures[entry.Path] = pathCommitFailure{err: lastErr, seq: cq.failureClock}
+	cq.pruneTerminalFailuresLocked()
+	cq.mu.Unlock()
 	// Alertable FUSE-local error. Collectors should match
 	// "drive9: error event=commit_terminal_failure" on stderr / mount-log
 	// files (typically ~/.cache/drive9/mount-logs/). The drive9 server never
@@ -2962,6 +3334,592 @@ func (cq *CommitQueue) recordCommitTerminalFailure(entry *CommitEntry, lastErr e
 	// reason= distinguishes retryable upload loss from concurrency conflict
 	// and layer-abandonment so alert severity can differ.
 	safeLogPrintf("drive9: error event=commit_terminal_failure path=%s reason=%s err=%v detail=local_data_preserved", entry.Path, classifyCommitTerminalReason(lastErr), lastErr)
+}
+
+// RecordTerminalFailureForPath records an in-memory terminal failure for path
+// without a queue entry behind it. Callers use it when a failure happened
+// outside the commit worker (a rename whose preserved payload could not be
+// re-paired with its new name): barriers on the path must still answer EIO
+// even though nothing can be re-driven from the queue. The record is
+// standalone — the unlanded bytes stay under the old pathname, so this path
+// usually carries no pending entry the pruner could treat as a durable
+// fallback or as proof of staleness.
+func (cq *CommitQueue) RecordTerminalFailureForPath(path string, err error) {
+	if cq == nil {
+		return
+	}
+	if err == nil {
+		err = errCommitTerminalUnknown
+	}
+	cq.mu.Lock()
+	if cq.terminalFailures == nil {
+		cq.terminalFailures = make(map[string]pathCommitFailure)
+	}
+	cq.failureClock++
+	cq.terminalFailures[path] = pathCommitFailure{err: err, seq: cq.failureClock, standalone: true}
+	cq.pruneTerminalFailuresLocked()
+	cq.mu.Unlock()
+}
+
+// errCommitTerminalUnknown backs PathTerminalFailure when a terminal commit
+// failure carried no upload error: the data never landed either way, so the
+// barrier must still report failure.
+var errCommitTerminalUnknown = errors.New("commit queue: terminal commit failure without a recorded upload error")
+
+// errCommitTerminalRecovered backs PathTerminalFailure's durable fallback: the
+// in-memory record died with the previous process, but the conflict-marked
+// pending entry it left behind still describes data that never landed.
+var errCommitTerminalRecovered = errors.New("commit queue: pending entry preserved for manual recovery after a terminal commit failure")
+
+// terminalFailuresLimit bounds terminalFailures the way landedLimit bounds
+// landed. Eviction is only allowed for records the barrier can still
+// re-derive: one whose path still carries a PendingConflict marker (the
+// fallback below reports it), plus — for worker records only — one whose
+// pending state is already gone (stale). A standalone record with no marker
+// at its path must stay regardless: its bytes sit under a different (old)
+// pathname, so the absence of pending state here is not staleness but the
+// record's normal shape, and evicting it would let fsync claim durability for
+// data that never landed.
+const terminalFailuresLimit = 64
+
+func (cq *CommitQueue) pruneTerminalFailuresLocked() {
+	if cq.index == nil {
+		// No durable marker backs any record; evicting one would lose the
+		// only copy of an unresolved failure.
+		return
+	}
+	for len(cq.terminalFailures) > terminalFailuresLimit {
+		// Evict the oldest EVICTABLE record: one whose path still carries a
+		// PendingConflict marker (the fallback in PathTerminalFailure keeps
+		// answering it — standalone or not), or a worker record whose pending
+		// state is already gone (stale). A record with a live non-conflict
+		// entry, and a standalone record with no marker at all, are the only
+		// witnesses of an unresolved failure and are skipped, not dropped.
+		var oldestPath string
+		var oldestSeq uint64
+		first := true
+		for path, failure := range cq.terminalFailures {
+			meta, hasMeta := cq.index.GetMeta(path)
+			if hasMeta && meta != nil && meta.Kind != staging.PendingConflict {
+				continue // live non-conflict entry: the record is the only witness
+			}
+			markerBacked := hasMeta && meta != nil
+			if failure.standalone && !markerBacked {
+				continue // nothing at this path can re-derive a standalone record
+			}
+			if first || failure.seq < oldestSeq {
+				oldestPath, oldestSeq, first = path, failure.seq, false
+			}
+		}
+		if first {
+			return // nothing evictable
+		}
+		delete(cq.terminalFailures, oldestPath)
+	}
+}
+
+// clearTerminalFailure drops the recorded terminal failure for path: a newer
+// commit landed, so later durability barriers must not keep reporting EIO.
+func (cq *CommitQueue) clearTerminalFailure(path string) {
+	cq.mu.Lock()
+	delete(cq.terminalFailures, path)
+	cq.mu.Unlock()
+}
+
+// CancelQueuedForRename stops every queued or in-flight entry for path and
+// journals the rename's done marker fencing the path's earlier fsync frames.
+// Unlike CancelPath the caller already holds the writeback path locks, so no
+// staging or worker can publish in between — a worker blocked ahead of the
+// upload aborts on the cancelled entry context once it gets the lock. Local
+// shadow/pending state is preserved: the caller moves it to the new name,
+// where the re-driven landing carries the durability obligation. Without the
+// marker a restart would replay the old frames and re-upload the dead name.
+func (cq *CommitQueue) CancelQueuedForRename(path string) error {
+	if cq == nil {
+		return nil
+	}
+	for _, cancel := range cq.cancelPathEntries(path) {
+		cancel()
+	}
+	if cq.journal == nil {
+		return nil
+	}
+	if err := cq.journal.Append(staging.JournalEntry{Op: staging.JournalUnlink, Path: path}); err != nil {
+		return fmt.Errorf("journal rename marker for %s: %w", path, err)
+	}
+	return nil
+}
+
+// recordCommitSeq stamps path's commit sequence — every successful commit,
+// unconditionally (see commitSeq). Guarded by cq.mu. A stamp recorded while
+// a rename window is open may be the very landing that window's delta
+// comparisons or rekey fences still have to observe, so every window whose
+// universe covers the path pins it for its own lifetime.
+func (cq *CommitQueue) recordCommitSeq(path string) {
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	cq.commitClock++
+	if cq.commitSeq == nil {
+		cq.commitSeq = make(map[string]uint64)
+	}
+	cq.commitSeq[path] = cq.commitClock
+	for _, win := range cq.commitSeqWindows {
+		if win.covers(path) {
+			cq.pinCommitSeqToLocked(win, path)
+		}
+	}
+	cq.trimCommitSeqLocked()
+}
+
+// maxCommitSeqStamps bounds the unconditional commit-stamp table. Every
+// successful upload inserts its pathname, so an unbounded table would retain
+// every distinct name a long-lived mount ever committed — and each
+// CommitSeqsUnderPrefix/LandedSnapshotsForRename snapshot would scan all of
+// them under cq.mu, stalling queue work on already-deleted files.
+const maxCommitSeqStamps = 4096
+
+// commitSeqLimitLocked mirrors landedLimitLocked's bound rule.
+func (cq *CommitQueue) commitSeqLimitLocked() int {
+	limit := maxCommitSeqStamps
+	if cq.maxPending > limit/2 && cq.maxPending <= int(^uint(0)>>1)/2 {
+		limit = 2 * cq.maxPending
+	}
+	return limit
+}
+
+// trimCommitSeqLocked bounds the commit-stamp table: pinned paths (an open
+// rename window may still compare them) are never evicted; the oldest
+// UNPINNED stamps go first. Pins are only ever taken for stamped paths, so
+// the reclaimable mass is derivable WITHOUT a scan: when the unpinned
+// remainder already fits the target — the all-pinned case of a wide rename
+// window included — the O(n) candidate pass is skipped entirely, and a
+// later commit must not rescan an unreclaimable table under the mutex.
+// Otherwise the trim amortizes: one sorted batch per overflow, evicting down
+// to half the bound instead of rescanning on every later record.
+func (cq *CommitQueue) trimCommitSeqLocked() {
+	limit := cq.commitSeqLimitLocked()
+	if len(cq.commitSeq) <= limit {
+		return
+	}
+	// Evict down to half the bound (see the comment above).
+	overflow := len(cq.commitSeq) - limit/2
+	if len(cq.commitSeq)-len(cq.commitSeqPins) <= limit/2 {
+		return // nothing reclaimable can reach the target: skip the scan
+	}
+	type stamp struct {
+		path string
+		seq  uint64
+	}
+	candidates := make([]stamp, 0, len(cq.commitSeq))
+	for path, seq := range cq.commitSeq {
+		if _, pinned := cq.commitSeqPins[path]; pinned {
+			continue
+		}
+		candidates = append(candidates, stamp{path: path, seq: seq})
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].seq < candidates[j].seq })
+	if overflow > len(candidates) {
+		overflow = len(candidates)
+	}
+	for _, s := range candidates[:overflow] {
+		delete(cq.commitSeq, s.path)
+	}
+}
+
+// CommitSeqWindow scopes one rename flow's commit-stamp obligations. The
+// rename flow snapshots unconditional stamps before its remote RPC and
+// compares them after it (in-window landing detection, failure-record rekey
+// fences): the window pins, for its OWN lifetime — not a global union —
+// every stamp recorded for its endpoints or under either rename prefix plus
+// every stamp its snapshots return, so trimming can never hide a landing the
+// flow still has to observe while finished sibling windows reclaim freely.
+type CommitSeqWindow struct {
+	cq        *CommitQueue
+	id        uint64
+	oldPath   string
+	newPath   string
+	oldPrefix string
+	newPrefix string
+	pins      map[string]struct{}
+}
+
+// covers reports whether path belongs to the window's obligation universe:
+// one of the renamed endpoints, or any path under either rename prefix.
+func (win *CommitSeqWindow) covers(path string) bool {
+	return path == win.oldPath || path == win.newPath ||
+		strings.HasPrefix(path, win.oldPrefix) || strings.HasPrefix(path, win.newPrefix)
+}
+
+// BeginCommitSeqWindow opens a rename's commit-stamp obligation window for
+// the renamed endpoints. The caller MUST End the window once its last stamp
+// comparison ran; ending trims immediately, so an idle mount does not retain
+// the window's growth past its obligations.
+func (cq *CommitQueue) BeginCommitSeqWindow(oldPath, newPath string) *CommitSeqWindow {
+	if cq == nil {
+		return nil
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	cq.commitSeqWindowSeq++
+	if cq.commitSeqWindows == nil {
+		cq.commitSeqWindows = make(map[uint64]*CommitSeqWindow)
+	}
+	win := &CommitSeqWindow{
+		cq:        cq,
+		id:        cq.commitSeqWindowSeq,
+		oldPath:   oldPath,
+		newPath:   newPath,
+		oldPrefix: strings.TrimSuffix(oldPath, "/") + "/",
+		newPrefix: strings.TrimSuffix(newPath, "/") + "/",
+		pins:      make(map[string]struct{}),
+	}
+	cq.commitSeqWindows[win.id] = win
+	// The endpoints' PRE-EXISTING stamps feed the flow's delta baselines and
+	// must stay readable for the window's lifetime.
+	for _, p := range []string{oldPath, newPath} {
+		if _, ok := cq.commitSeq[p]; ok {
+			cq.pinCommitSeqToLocked(win, p)
+		}
+	}
+	return win
+}
+
+// End closes the window: exactly ITS pins die with it (overlapping windows
+// keep theirs), and the table is trimmed right away so the bound is restored
+// without waiting for unrelated future commits.
+func (win *CommitSeqWindow) End() {
+	if win == nil || win.cq == nil {
+		return
+	}
+	cq := win.cq
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	if _, ok := cq.commitSeqWindows[win.id]; !ok {
+		return // already ended
+	}
+	delete(cq.commitSeqWindows, win.id)
+	for path := range win.pins {
+		cq.unpinCommitSeqLocked(path)
+	}
+	cq.trimCommitSeqLocked()
+}
+
+// CommitSeqsUnderPrefix is the window-scoped variant of the queue's method:
+// every stamp the snapshot returns is pinned to THIS window, so the flow's
+// later delta comparisons still observe it even once trimming would
+// otherwise reclaim it.
+func (win *CommitSeqWindow) CommitSeqsUnderPrefix(prefix string) map[string]uint64 {
+	if win == nil || win.cq == nil {
+		return nil
+	}
+	cq := win.cq
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	out := map[string]uint64{}
+	for path, seq := range cq.commitSeq {
+		if strings.HasPrefix(path, prefix) {
+			out[path] = seq
+		}
+	}
+	for path := range out {
+		cq.pinCommitSeqToLocked(win, path)
+	}
+	return out
+}
+
+// LandedSnapshotsForRename is the window-scoped variant of the queue's
+// method: every stamp the snapshot returns is pinned to THIS window for the
+// flow's later rekey-fence comparisons.
+func (win *CommitSeqWindow) LandedSnapshotsForRename(newPath, newPrefix string) map[string]uint64 {
+	if win == nil || win.cq == nil {
+		return nil
+	}
+	cq := win.cq
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	out := map[string]uint64{}
+	for path, seq := range cq.commitSeq {
+		if path == newPath || strings.HasPrefix(path, newPrefix) {
+			out[path] = seq
+		}
+	}
+	for path := range out {
+		cq.pinCommitSeqToLocked(win, path)
+	}
+	return out
+}
+
+// pinCommitSeqToLocked adds path to the window's pin set and bumps the
+// global refcount on first pin.
+func (cq *CommitQueue) pinCommitSeqToLocked(win *CommitSeqWindow, path string) {
+	if _, ok := win.pins[path]; ok {
+		return
+	}
+	win.pins[path] = struct{}{}
+	if cq.commitSeqPins == nil {
+		cq.commitSeqPins = make(map[string]int)
+	}
+	cq.commitSeqPins[path]++
+}
+
+// unpinCommitSeqLocked drops one window's pin: the stamp becomes reclaimable
+// when the last interested window released it.
+func (cq *CommitQueue) unpinCommitSeqLocked(path string) {
+	if n, ok := cq.commitSeqPins[path]; ok {
+		if n <= 1 {
+			delete(cq.commitSeqPins, path)
+		} else {
+			cq.commitSeqPins[path] = n - 1
+		}
+	}
+}
+
+// CommitSeq reports path's unconditional commit stamp (0 when none). Unlike
+// LandedSeq this counts every completed upload: recovered/re-driven entries
+// and payloads above the checksum limit included.
+func (cq *CommitQueue) CommitSeq(path string) uint64 {
+	if cq == nil {
+		return 0
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	return cq.commitSeq[path]
+}
+
+// CommitSeqsUnderPrefix snapshots every unconditional commit stamp under
+// prefix. The snapshot pins nothing: a rename flow whose later comparisons
+// must survive trimming takes it through its CommitSeqWindow instead.
+func (cq *CommitQueue) CommitSeqsUnderPrefix(prefix string) map[string]uint64 {
+	if cq == nil {
+		return nil
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	out := map[string]uint64{}
+	for path, seq := range cq.commitSeq {
+		if strings.HasPrefix(path, prefix) {
+			out[path] = seq
+		}
+	}
+	return out
+}
+
+// LandedSeq reports the landed landmark stamp for path (0 when none): the
+// rename flow snapshots it before the transfer so the failure-record rekey
+// can decline to move a record onto a destination whose re-driven upload
+// has already landed — the landing fulfilled the obligation the record
+// describes, and re-installing it after the fact would answer stale EIO
+// forever.
+func (cq *CommitQueue) LandedSeq(path string) uint64 {
+	if cq == nil {
+		return 0
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	return cq.landed[path].lastUsed
+}
+
+// LandedSnapshotsForRename snapshots the commit stamps a rename's
+// failure-record rekeys fence against: the destination name itself (no
+// trailing slash, so a prefix scan alone misses it) plus every path under
+// the destination prefix. These are the UNCONDITIONAL commit stamps — a
+// re-driven upload that succeeds always advances them, whether or not the
+// selective landed landmark was ever recorded (no snapshot ID, payloads
+// above the checksum limit). The snapshot pins nothing: a rename flow whose
+// rekey comparisons must survive trimming takes it through its
+// CommitSeqWindow instead.
+func (cq *CommitQueue) LandedSnapshotsForRename(newPath, newPrefix string) map[string]uint64 {
+	if cq == nil {
+		return nil
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	out := map[string]uint64{}
+	for path, seq := range cq.commitSeq {
+		if path == newPath || strings.HasPrefix(path, newPrefix) {
+			out[path] = seq
+		}
+	}
+	return out
+}
+
+// LandedSeqsUnderPrefix snapshots every landed landmark stamp under prefix.
+func (cq *CommitQueue) LandedSeqsUnderPrefix(prefix string) map[string]uint64 {
+	if cq == nil {
+		return nil
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	out := map[string]uint64{}
+	for path, landmark := range cq.landed {
+		if strings.HasPrefix(path, prefix) {
+			out[path] = landmark.lastUsed
+		}
+	}
+	return out
+}
+
+// RenameTerminalFailure moves a completed rename's endpoint records with the
+// object: the source's record (standalone ones included — their bytes sit
+// under an even older name, and the retargeted handle's next barrier checks
+// the NEW path) transfers to the destination, and the destination's previous
+// record dies with its replaced incarnation. Clearing both the way the caller
+// once did would strand a standalone witness at the dead source name.
+func (cq *CommitQueue) RenameTerminalFailure(oldPath, newPath string, landedSnaps map[string]uint64) {
+	if cq == nil || oldPath == newPath {
+		return
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	// The rekey runs after the transfer released its locks: the destination
+	// worker may have landed the re-driven replacement in between, which
+	// fulfills the source record's obligation (and clears the destination
+	// record). Moving the record onto that landing would reinstall stale
+	// EIO. A non-nil snapshot map arms the fence for the whole destination
+	// universe (a path absent from the map simply had no landing yet: stamp
+	// 0, and any landing since declines the move).
+	if landedSnaps != nil && cq.commitSeq[newPath] > landedSnaps[newPath] {
+		delete(cq.terminalFailures, oldPath)
+		return
+	}
+	failure, ok := cq.terminalFailures[oldPath]
+	dst, dstOK := cq.terminalFailures[newPath]
+	delete(cq.terminalFailures, oldPath)
+	delete(cq.terminalFailures, newPath)
+	switch {
+	case !ok:
+		return
+	case dstOK && dst.seq > failure.seq:
+		// A newer failure was recorded at the destination meanwhile (the
+		// re-driven upload terminally failed again): it is the live truth.
+		cq.terminalFailures[newPath] = dst
+	default:
+		cq.terminalFailures[newPath] = failure
+	}
+}
+
+// RenameTerminalFailuresPrefix rekeys every terminal-failure record under a
+// renamed directory prefix. Standalone records have no pending entry at their
+// own path (their bytes remain under the pre-move name), so neither the
+// write-cache nor the pending-index prefix loop carries them — without this
+// rekey, a retargeted handle's next strict Sync would check a dead name and
+// certify data that never landed.
+func (cq *CommitQueue) RenameTerminalFailuresPrefix(oldPrefix, newPrefix string, landedSnaps map[string]uint64) {
+	if cq == nil || oldPrefix == newPrefix {
+		return
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	moved := make(map[string]pathCommitFailure, len(cq.terminalFailures))
+	for path, failure := range cq.terminalFailures {
+		if strings.HasPrefix(path, oldPrefix) {
+			target := newPrefix + strings.TrimPrefix(path, oldPrefix)
+			// Same landing fence as the endpoint rekey: a child's re-driven
+			// upload that landed after the snapshot fulfilled that record's
+			// obligation — drop the record instead of re-installing it over
+			// the landing (absent from the map = no landing yet = stamp 0).
+			if landedSnaps != nil && cq.commitSeq[target] > landedSnaps[target] {
+				delete(cq.terminalFailures, path)
+				continue
+			}
+			if dst, ok := cq.terminalFailures[target]; ok && dst.seq > failure.seq {
+				delete(cq.terminalFailures, path)
+				continue
+			}
+			moved[target] = failure
+			delete(cq.terminalFailures, path)
+		}
+	}
+	for path, failure := range moved {
+		cq.terminalFailures[path] = failure
+	}
+}
+
+// PathTerminalFailureSeq reports the monotonic stamp of the recorded terminal
+// failure for path (0 when none). Callers capture it before a landing attempt
+// and hand it to ClearTerminalFailureIfSeq so the landing cannot erase a
+// failure recorded after it started.
+func (cq *CommitQueue) PathTerminalFailureSeq(path string) uint64 {
+	if cq == nil {
+		return 0
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	if failure, ok := cq.terminalFailures[path]; ok {
+		return failure.seq
+	}
+	return 0
+}
+
+// ClearTerminalFailureIfSeq drops the recorded terminal failure only when it
+// is still the one stamped seq: a record with a newer stamp belongs to a
+// generation the just-landed image does not cover, and must keep answering
+// EIO.
+func (cq *CommitQueue) ClearTerminalFailureIfSeq(path string, seq uint64) {
+	if cq == nil || seq == 0 {
+		return
+	}
+	cq.mu.Lock()
+	if failure, ok := cq.terminalFailures[path]; ok && failure.seq == seq {
+		delete(cq.terminalFailures, path)
+	}
+	cq.mu.Unlock()
+}
+
+// ResolveSupersededConflict retires the durable conflict marker for path when
+// a landed image provably contains it: supersedeGen is the pending-index
+// generation the landing image composed over at staging time, and a conflict
+// entry at or below that generation is obsolete once the image is remote. The
+// generation fence keeps a newer staging's entry (and its preserved recovery
+// bytes) untouched. The conflict entry's shadow bytes are intentionally left
+// behind: the pending meta carries no shadow generation to fence a removal
+// with, and a stale recovery copy is safe where a wrong removal is not.
+func (cq *CommitQueue) ResolveSupersededConflict(path string, supersedeGen uint64) {
+	if cq == nil || cq.index == nil || supersedeGen == 0 {
+		return
+	}
+	meta, ok := cq.index.GetMeta(path)
+	if !ok || meta == nil || meta.Kind != staging.PendingConflict {
+		return
+	}
+	// A moved marker carries its own minted generation AND the source
+	// generation of the failed image it describes (a rename move mints a
+	// fresh generation without changing the image): a landing which
+	// superseded EITHER generation recovered that image — most importantly
+	// the source one every retained handle and pre-staged cache snapshot
+	// recorded before the move.
+	if meta.Generation > supersedeGen && (meta.SupersedesPendingGen == 0 || meta.SupersedesPendingGen > supersedeGen) {
+		return
+	}
+	cq.index.RemoveIfGeneration(path, meta.Generation)
+	safeLogPrintf("commit queue: resolved conflict marker for %s superseded by a landed image (gen %d <= %d)", path, meta.Generation, supersedeGen)
+}
+
+// PathTerminalFailure returns the most recent terminal commit failure recorded
+// for path whose data never landed remotely (local pending state is
+// preserved). Durability barriers consult it once the path goes idle: without
+// it, a terminally failed path is indistinguishable from a landed commit and
+// fsync would report success for data that exists only locally. When the
+// in-memory record is absent (a fresh process, or eviction above the map
+// bound), the durable PendingConflict marker onCommitTerminalFailure left
+// behind answers instead: it survives restarts and re-enqueues nothing, so it
+// is exactly the state a barrier must refuse to certify.
+func (cq *CommitQueue) PathTerminalFailure(path string) error {
+	if cq == nil {
+		return nil
+	}
+	cq.mu.Lock()
+	failure, ok := cq.terminalFailures[path]
+	cq.mu.Unlock()
+	if ok {
+		return failure.err
+	}
+	if cq.index != nil {
+		if meta, found := cq.index.GetMeta(path); found && meta != nil && meta.Kind == staging.PendingConflict {
+			return errCommitTerminalRecovered
+		}
+	}
+	return nil
 }
 
 // directPutThreshold returns the size limit below which commit queue workers
@@ -3004,4 +3962,40 @@ func (entry *CommitEntry) bindPayload(data []byte) []byte {
 		entry.payloadBound = true
 	}
 	return entry.payload
+}
+
+// reclaimEmptyOccupant deletes a 0-byte object at apiPath so the caller can
+// publish a fresh create over that name. It reports whether it did.
+//
+// Only a genuinely EMPTY object is reclaimed: a 0-byte file has no content a
+// concurrent writer could be relying on, and the drive9 create path assigns
+// such a file revision 1 with no bytes, so re-creating it loses nothing. A
+// non-empty object — or one we cannot stat — is left alone and the caller
+// keeps refusing.
+func (cq *CommitQueue) reclaimEmptyOccupant(ctx context.Context, entry *CommitEntry, apiPath string) (int64, bool, error) {
+	if cq == nil || cq.client == nil {
+		return 0, false, nil
+	}
+	st, err := cq.client.StatCtx(ctx, apiPath)
+	if err != nil {
+		if client.IsNotFound(err) {
+			// The path is already gone: the create can proceed on its own.
+			return 0, true, nil
+		}
+		return 0, false, nil
+	}
+	if st.IsDir || st.Size != 0 {
+		return 0, false, nil
+	}
+	promoteExtent := cq.extentTakeover && entry != nil && entry.Size > 0 &&
+		cq.extentRouteFor(entry.Path, entry.Size) && st.ContentLayout != client.ContentLayoutExtent
+	if st.Revision > 0 && !promoteExtent {
+		// CAS directly against the empty file's current revision instead of
+		// issuing a separate DELETE.
+		return st.Revision, true, nil
+	}
+	if err := cq.client.DeleteFileConditionalCtx(ctx, apiPath, st.Revision, st.ResourceID); err != nil {
+		return 0, false, fmt.Errorf("reclaim empty occupant of %s: %w", apiPath, err)
+	}
+	return 0, true, nil
 }

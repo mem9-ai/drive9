@@ -9,6 +9,7 @@ import (
 
 	"github.com/mem9-ai/drive9/pkg/backend"
 	"github.com/mem9-ai/drive9/pkg/datastore"
+	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/meta"
 	"github.com/mem9-ai/drive9/pkg/pathutil"
 )
@@ -198,6 +199,31 @@ func authorizeFSPair(w http.ResponseWriter, r *http.Request, srcOp FSOp, srcPath
 	}
 	if err := scope.AuthorizeFSPair(srcOp, srcPath, dstOp, dstPath); err != nil {
 		writeFSAuthzError(w, err)
+		return false
+	}
+	return true
+}
+
+// authorizeFSScopedAlias rejects a copy/hardlink whose destination would become
+// a write alias of a source the caller may only read.
+//
+// Copy and hardlink both create a second name for the source's drive9 entity
+// (CopyFileCtx inserts a node with the source's FileID; hardlink links the same
+// inode). A write through the copy therefore mutates the source's content. The
+// scope check for the operation only asks for read on the source and write on
+// the destination, so a token scoped to write zone A and read zone B could
+// alias B/file into A/link and then rewrite B/file's bytes with in-zone write
+// authority. Write authorization on the source is the property that makes the
+// alias harmless, so it is required for scoped tokens.
+func authorizeFSScopedAlias(w http.ResponseWriter, r *http.Request, srcPath string) bool {
+	scope := ScopeFromContext(r.Context())
+	if scope == nil || !scope.IsScoped {
+		return true
+	}
+	if err := scope.AuthorizeFS(FSOpWrite, srcPath); err != nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "fs_scoped_alias_denied",
+			"src_path", srcPath, "error", err)...)
+		errJSON(w, http.StatusForbidden, "scoped token cannot alias a path it may only read")
 		return false
 	}
 	return true

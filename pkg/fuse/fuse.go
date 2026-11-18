@@ -24,10 +24,13 @@ import (
 	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
+	"go.uber.org/zap"
+
 	"github.com/mem9-ai/drive9/pkg/extensions/core"
 	"github.com/mem9-ai/drive9/pkg/fs"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/dircache"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/perf"
+	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/mountcontrol"
 	"github.com/mem9-ai/drive9/pkg/pathutil"
 )
@@ -80,8 +83,9 @@ type Options struct {
 	// snapshot reuse would hide concurrent changes from it (v1).
 	GVisorCompat bool
 
-	// DefaultPermissions reports the kernel default_permissions mount
-	// option (the daemon's open gate is redundant when set).
+	// DefaultPermissions reports that the mount options make the kernel enforce the
+	// mode bits (the default_permissions mount option, which Linux and macFUSE both
+	// accept), so the daemon's open gate would be redundant.
 	DefaultPermissions bool
 	// LocalDirAttrs answers GetAttr for the root and directories from the
 	// inode table without a remote stat (v1: dirs never revalidate). View
@@ -104,8 +108,9 @@ type FS struct {
 	inodes  *InodeToPath
 	bypass  *kernelCacheBypassTable
 	openIdx *OpenHandleIndex
-	// deferredUnlinks holds ino→path for unlink-of-open-file deferrals.
-	deferredUnlinks map[uint64]string
+	// Entries remain registered until remote deletion and cache updates finish.
+	// Each entry serializes its last-close and same-name replacement callers.
+	deferredUnlinks map[string]*deferredUnlink
 	perf            *perf.Counters
 	mountPt         string
 	rootTag         string
@@ -147,19 +152,15 @@ type FS struct {
 	uid uint32
 	gid uint32
 
-	attrTTL     time.Duration
-	entryTTL    time.Duration
-	negEntryTTL time.Duration
-	epoch       *epochTable
+	attrTTL  time.Duration
+	entryTTL time.Duration
 	// ttlHinters clamp the kernel attr TTL for paths claimed by data planes
 	// with their own revalidation cadence (v1 extentAttrTimeoutFor).
 	ttlHinters []interface {
 		EntryTTLHint(path string) (time.Duration, bool)
 	}
-	// dirKeepCacheOff marks directories whose listings must not be cached
-	// across opens (v1: extent-attached dirs can gain jfs-side children the
-	// kernel's cached listing does not know).
-	dirKeepCacheOff []interface{ DirKeepCacheOff(path string) bool }
+	negEntryTTL time.Duration
+	epoch       *epochTable
 
 	localDirAttrs bool
 	// defaultPermissions mirrors the kernel mount option: when the kernel
@@ -209,7 +210,7 @@ func New(opts Options) (*FS, error) {
 		handles:         &handleTable{m: map[uint64]*fileHandle{}},
 		dirs:            &dirTable{m: map[uint64]*dirHandle{}},
 		pathLocks:       &lockTable{},
-		deferredUnlinks: make(map[uint64]string),
+		deferredUnlinks: make(map[string]*deferredUnlink),
 		uid:             uid,
 		gid:             gid,
 	}
@@ -304,9 +305,6 @@ func New(opts Options) (*FS, error) {
 			// revalidate at the JuiceFS ~1s rate) clamp the kernel TTLs.
 			f.ttlHinters = append(f.ttlHinters, th)
 		}
-		if dc, ok := h.(interface{ DirKeepCacheOff(path string) bool }); ok {
-			f.dirKeepCacheOff = append(f.dirKeepCacheOff, dc)
-		}
 		if rp, ok := h.(interface {
 			SetRemoteOpRecorder(func(name string, err error, dur time.Duration, bytes uint64))
 		}); ok {
@@ -324,8 +322,8 @@ func New(opts Options) (*FS, error) {
 	// v1 refreshes cached views after every mutation: directory listings
 	// for local namespace ops and data-plane commits, kernel entry drops
 	// only for removals and remote-origin changes. The facade subscribes
-	// once; every emitter (facade.mutated, writeback commits, bulkfile
-	// commits, the async queue, SSE) flows through here.
+	// once; every emitter (facade.mutated, writeback commits,
+	// the async queue, SSE) flows through here.
 	f.events.On(fs.EventWrite, f.onLocalMutation)
 	f.events.On(fs.EventLanded, f.onLocalMutation)
 	f.events.On(fs.EventDelete, f.onRemovedPath)
@@ -522,110 +520,109 @@ func (f *FS) stampOwner(ino uint64, caller fs.Caller) {
 	}
 }
 
-// touchParentMtime advances the parent directory's mtime after a namespace
-// mutation inside it (v1 touchDirectoryChangeTime): rmdir/mkdir rows compare
-// parent mtimes around child changes.
-// isDeferredUnlink reports a name whose remote deletion waits for the last
-// close of its open handles.
+type deferredUnlink struct {
+	mu   sync.Mutex
+	path string
+	ino  uint64
+}
+
+// isDeferredUnlink also includes deletions whose remote request is in flight.
 func (f *FS) isDeferredUnlink(path string) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	for _, p := range f.deferredUnlinks {
-		if p == path {
-			return true
-		}
-	}
-	return false
+	return f.deferredUnlinks[path] != nil
 }
 
-// maybeRunDeferredUnlink fires the postponed remote deletion once the last
-// handle of the unlinked inode closes.
+// maybeRunDeferredUnlink fires postponed remote deletions once the last
+// handle of the unlinked inode closes. Each hardlink alias owns its deletion.
 func (f *FS) maybeRunDeferredUnlink(ino uint64) {
 	f.mu.Lock()
-	path, ok := f.deferredUnlinks[ino]
-	if !ok {
-		f.mu.Unlock()
-		return
+	var pending []*deferredUnlink
+	for _, entry := range f.deferredUnlinks {
+		if entry.ino == ino {
+			pending = append(pending, entry)
+		}
 	}
-	if f.openIdx.HasOpenInode(ino) {
-		f.mu.Unlock()
-		return
-	}
-	delete(f.deferredUnlinks, ino)
 	f.mu.Unlock()
-	// The deferred delete belongs to the object captured at unlink time. A
-	// path that has since been rebound to a NEWER object (unlink + recreate
-	// before the last handle closed) must not be deleted on the old
-	// object's behalf — the replacement's own landing owns the name now.
-	if cur, ok := f.inodes.GetInode(path); ok && cur != ino {
-		return
+	for _, entry := range pending {
+		if err := f.runDeferredUnlink(entry, true); err != nil {
+			// Release cannot return an error to the unlink caller. Keep the
+			// pending entry so a replacement retries cleanup before proceeding.
+			logger.L().Error("deferred unlink failed", zap.String("path", entry.path), zap.Error(err))
+		}
 	}
-	// Synchronous with a detached budget (v1: release completes the
-	// survivor deletion before replying, so the storage is gone at close).
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(context.Background()), 30*time.Second)
-	defer cancel()
-	if _, err := f.chain.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: path}); err != nil {
-		// The unlink syscall already returned OK; nothing can surface this
-		// to its caller — but a silently-lost deletion must at least be
-		// visible to the operator (v1 surfaced it inline).
-		fmt.Fprintf(os.Stderr, "drive9: deferred unlink of %s failed: %v\n", path, err)
+}
+
+// runDeferredUnlink serializes cleanup without holding the filesystem mutex
+// during I/O. Waiters recheck ownership after acquiring the entry's lock: a
+// completed deletion must never run again against a replacement object.
+func (f *FS) runDeferredUnlink(pending *deferredUnlink, requireClosed bool) error {
+	pending.mu.Lock()
+	defer pending.mu.Unlock()
+	f.mu.Lock()
+	current := f.deferredUnlinks[pending.path] == pending
+	f.mu.Unlock()
+	if !current || (requireClosed && f.openIdx.HasOpenInode(pending.ino)) {
+		return nil
 	}
-	f.markNameNegative(path)
+	path := pending.path
+	// A name rebound to a newer inode is not the old object's to delete.
+	if cur, ok := f.inodes.GetInode(path); !ok || cur == pending.ino {
+		// Detached budget: release completes deletion before replying, even
+		// if the caller's original request has already been cancelled.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if _, err := f.chain.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: path}); err != nil && fs.StatusOf(err) != gofuse.ENOENT {
+			return err
+		}
+		f.markNameNegative(path)
+	}
+	f.mu.Lock()
+	if f.deferredUnlinks[path] == pending {
+		delete(f.deferredUnlinks, path)
+	}
+	f.mu.Unlock()
+	return nil
 }
 
 // flushDeferredUnlink lands a postponed deletion now: a fresh creator of
 // the same name (create/mkdir/mknod/symlink/link/rename target) must not
 // collide with the old entry's not-yet-deleted remote inode.
-func (f *FS) flushDeferredUnlink(path string) {
+func (f *FS) flushDeferredUnlink(path string) error {
 	f.mu.Lock()
-	found := false
-	var deferredIno uint64
-	for i, p := range f.deferredUnlinks {
-		if p == path {
-			found = true
-			deferredIno = i
-			delete(f.deferredUnlinks, i)
-			break
-		}
-	}
+	pending := f.deferredUnlinks[path]
 	f.mu.Unlock()
-	if !found {
-		return
+	if pending == nil {
+		return nil
 	}
-	// Same identity fence as maybeRunDeferredUnlink: a name rebound to a
-	// newer object is not this deferred delete's to remove.
-	if cur, ok := f.inodes.GetInode(path); ok && cur != deferredIno {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(context.Background()), 30*time.Second)
-	defer cancel()
-	_, _ = f.chain.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: path})
-	f.markNameNegative(path)
+	return f.runDeferredUnlink(pending, false)
 }
 
 // flushDeferredUnlinksUnder lands every postponed deletion under dir/ —
 // removing the directory itself must not race the last-close deferral
 // (rmdir would otherwise hit ENOTEMPTY against a name that is already gone
 // from the namespace).
-func (f *FS) flushDeferredUnlinksUnder(dir string) {
+func (f *FS) flushDeferredUnlinksUnder(dir string) error {
 	prefix := strings.TrimSuffix(dir, "/") + "/"
 	f.mu.Lock()
-	var pending []string
-	for ino, p := range f.deferredUnlinks {
-		if strings.HasPrefix(p, prefix) {
-			pending = append(pending, p)
-			delete(f.deferredUnlinks, ino)
+	var pending []*deferredUnlink
+	for path, entry := range f.deferredUnlinks {
+		if strings.HasPrefix(path, prefix) {
+			pending = append(pending, entry)
 		}
 	}
 	f.mu.Unlock()
-	for _, p := range pending {
-		ctx, cancel := context.WithTimeout(context.WithoutCancel(context.Background()), 30*time.Second)
-		_, _ = f.chain.Dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: p})
-		cancel()
-		f.markNameNegative(p)
+	for _, entry := range pending {
+		if err := f.runDeferredUnlink(entry, false); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
+// touchParentMtime advances the parent directory's mtime after a namespace
+// mutation inside it (v1 touchDirectoryChangeTime): rmdir/mkdir rows compare
+// parent mtimes around child changes.
 func (f *FS) touchParentMtime(parentIno uint64) {
 	if parentIno == 0 || parentIno == 1 {
 		return
@@ -1321,8 +1318,7 @@ func (f *FS) fillAttr(a fs.Attr, ino uint64, out *gofuse.Attr) {
 	if entry != nil && entry.Rdev != 0 {
 		// A tracked Rdev overrides the reply (local mknod state); a zero
 		// entry value is simply "none recorded" and must not erase the
-		// stat's authoritative device number (extent device nodes
-		// answered 0:0 after their first lookup otherwise).
+		// stat's authoritative device number.
 		out.Rdev = entry.Rdev
 	}
 	nlink := a.Nlink
@@ -1365,6 +1361,22 @@ func (f *FS) attrTTLFor(path string) time.Duration {
 	return f.attrTTL
 }
 
+// ownerPresence resolves the split owner-presence flags. HasOwner is the
+// coarse "either field" form and is used only when neither split flag is
+// present; OR-ing it into both fields marked an absent owner authoritative.
+func ownerPresence(a *fs.Attr) (hasUID, hasGID bool) {
+	if a == nil {
+		return false, false
+	}
+	if a.HasUID || a.HasGID {
+		return a.HasUID, a.HasGID
+	}
+	if a.HasOwner {
+		return true, true
+	}
+	return false, false
+}
+
 func (f *FS) fillEntryOut(path string, a *fs.Attr, isDir bool, out *gofuse.EntryOut) {
 	var size int64
 	if a != nil {
@@ -1388,6 +1400,21 @@ func (f *FS) fillEntryOut(path string, a *fs.Attr, isDir bool, out *gofuse.Entry
 	}
 	out.NodeId = ino
 	if a != nil {
+		hasUID, hasGID := ownerPresence(a)
+		if hasUID || hasGID {
+			// A lookup reply is authoritative for ownership too. Persisting it
+			// here is what lets the open gate use the real owner instead of the
+			// mount default (extent files owned by another uid are the concrete
+			// case: the reply carries Uid/Gid, but only the mode was stored).
+			f.inodes.UpdateOwner(ino, a.Uid, a.Gid, hasUID, hasGID)
+		}
+		// Keep the inode's CAS base in sync with the reply. Read-only Open
+		// may answer from a revision-bound row without re-stating; without
+		// persisting it here that row would carry revision 0 and every
+		// Lookup → Open would pay the stat Lookup had just answered.
+		if a.Rev > 0 {
+			f.inodes.UpdateRevision(ino, a.Rev)
+		}
 		f.fillAttr(*a, ino, &out.Attr)
 		mode := a.Mode
 		if mode&syscall.S_IFMT == 0 || mode&syscall.S_IFMT == syscall.S_IFREG {
@@ -1610,7 +1637,7 @@ func (f *FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *gofus
 		f.inodes.SetIdentityWithKind(input.NodeId, res.Attr.ResourceID, res.Attr.Nlink, res.Attr.IsDir())
 	}
 	f.fillAttr(*res.Attr, input.NodeId, &out.Attr)
-	out.SetTimeout(f.attrTTLFor(path))
+	out.SetTimeout(f.attrTTL)
 	return gofuse.OK
 }
 
@@ -1890,7 +1917,9 @@ func (f *FS) Mknod(cancel <-chan struct{}, input *gofuse.MknodIn, name string, o
 	if st != gofuse.OK {
 		return st
 	}
-	f.flushDeferredUnlink(child)
+	if err := f.flushDeferredUnlink(child); err != nil {
+		return fs.StatusOf(err)
+	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 	start := time.Now()
@@ -1924,11 +1953,26 @@ func (f *FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name string, o
 	if st != gofuse.OK {
 		return st
 	}
-	f.flushDeferredUnlink(child)
+	if err := f.flushDeferredUnlink(child); err != nil {
+		return fs.StatusOf(err)
+	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 	mode := fs.Attr{Kind: fs.KindDir, Mode: input.Mode & 0o7777}
+	// Install the empty-directory marker BEFORE the remote mkdir can
+	// return. A foreign child created immediately after the mkdir can be
+	// invalidated while this call is still finishing; installing the marker
+	// afterwards would recreate the complete/session-miss authority over
+	// that invalidation and hide the child for a full directory TTL. With
+	// the marker in place first, the invalidation simply clears it.
+	dc, _ := f.Ctx.DirCache.(*dircache.DirCache)
+	if dc != nil {
+		dc.MarkSessionCreatedDir(child)
+	}
 	if _, st := f.dispatch(ctx, &fs.Op{Kind: fs.OpMkdir, Path: child, Mode: input.Mode & 0o7777, Ino: input.NodeId, Kernel: input, Caller: fs.CallerFrom(input.InHeader)}); st != gofuse.OK {
+		if dc != nil {
+			dc.Invalidate(child)
+		}
 		return st
 	}
 	f.mutated(fs.EventWrite, child)
@@ -1955,6 +1999,7 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 		// the open fd keeps reading its data, and the remote entry dies with
 		// the last close — deferring the delete keeps fd reads working in a
 		// sync core with no local data plane.
+		handles := f.openIdx.SnapshotPath(child)
 		f.openIdx.UnlinkPath(child)
 		// Capture the ino and a surviving alias before the preserve drops
 		// the byPath mapping: handles of a hardlinked inode may have been
@@ -1977,20 +2022,43 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 				}
 			}
 		}
+		var markErr error
 		for _, h := range f.chain.Handlers() {
-			if mu, ok := h.(interface{ MarkPathUnlinked(string) }); ok {
-				mu.MarkPathUnlinked(child)
+			if mu, ok := h.(interface {
+				MarkPathUnlinked(string) error
+			}); ok {
+				if err := mu.MarkPathUnlinked(child); err != nil && markErr == nil {
+					markErr = err
+				}
 			}
 		}
+		if markErr != nil {
+			// A handler could not make the path's staged state
+			// non-replayable (failing WAL plus failing cleanup): fail the
+			// unlink now, before any namespace mutation, and restore the
+			// open-path bookkeeping — the writeback rolls its own marking
+			// back.
+			f.openIdx.RelinkPath(child, handles)
+			return fs.StatusOf(markErr)
+		}
+		pending := &deferredUnlink{path: child, ino: ino}
+		pending.mu.Lock()
 		f.inodes.RemoveLinkPreserve(child)
 		if iok {
 			f.mu.Lock()
-			f.deferredUnlinks[ino] = child
+			f.deferredUnlinks[child] = pending
 			f.mu.Unlock()
 		}
 		f.touchParentMtime(header.NodeId)
 		f.mutated(fs.EventDelete, child)
 		f.markNameNegative(child)
+		pending.mu.Unlock()
+		// The last Release may have completed while MarkPathUnlinked was
+		// preparing the anonymous handle state, before registration existed.
+		// Recheck after publication so that close cannot strand the delete.
+		if iok {
+			f.maybeRunDeferredUnlink(ino)
+		}
 		return gofuse.OK
 	}
 	if _, st := f.dispatch(ctx, &fs.Op{Kind: fs.OpUnlink, Path: child, Ino: header.NodeId, Kernel: header, Caller: fs.CallerFrom(*header)}); st != gofuse.OK {
@@ -2010,7 +2078,8 @@ func (f *FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string
 
 // dropSiblingRows invalidates the cached listing rows of a hardlink's
 // surviving aliases after one alias is removed: their recorded link count
-// is stale until the next listing (the stat answered the pre-unlink count).
+// is stale. Invalidate the parent as well so a missing row cannot become an
+// authoritative ENOENT in a complete listing or a session-created directory.
 func (f *FS) dropSiblingRows(removed string, siblings []string) {
 	if f.Ctx.DirCache == nil {
 		return
@@ -2019,9 +2088,7 @@ func (f *FS) dropSiblingRows(removed string, siblings []string) {
 		if p == removed {
 			continue
 		}
-		if dc, ok := f.Ctx.DirCache.(*dircache.DirCache); ok {
-			dc.Remove(parentDirOf(p), pathpkg.Base(p))
-		}
+		f.Ctx.DirCache.Invalidate(parentDirOf(p))
 	}
 }
 
@@ -2030,7 +2097,9 @@ func (f *FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name string)
 	if st != gofuse.OK {
 		return st
 	}
-	f.flushDeferredUnlinksUnder(child)
+	if err := f.flushDeferredUnlinksUnder(child); err != nil {
+		return fs.StatusOf(err)
+	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 	if _, st := f.dispatch(ctx, &fs.Op{Kind: fs.OpRmdir, Path: child, Ino: header.NodeId, Kernel: header, Caller: fs.CallerFrom(*header)}); st != gofuse.OK {
@@ -2068,7 +2137,17 @@ func (f *FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName stri
 		return gofuse.OK
 	}
 	f.debugf("rename start old=%s new=%s", oldPath, newPath)
-	f.flushDeferredUnlink(newPath)
+	// Land hidden children before their parent moves (or is replaced).
+	// The unlink handlers preserve open descriptors' anonymous data. A
+	// failed cleanup leaves the directory in place and remains retryable.
+	for _, dir := range []string{oldPath, newPath} {
+		if err := f.flushDeferredUnlinksUnder(dir); err != nil {
+			return fs.StatusOf(err)
+		}
+	}
+	if err := f.flushDeferredUnlink(newPath); err != nil {
+		return fs.StatusOf(err)
+	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 	start := time.Now()
@@ -2095,6 +2174,13 @@ func (f *FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName stri
 	// (xattr subscribers), losing the attributes entirely.
 	f.mutatedRename(oldPath, newPath)
 	f.mutated(fs.EventDelete, oldPath)
+	// A rename that REPLACED a destination swaps the object behind the
+	// name: the read caches (whole-file and attribute tiers) still hold
+	// the replaced file's images under that path, so a post-close read
+	// would serve the old bytes instead of the new extent source (the
+	// rename suite's H2). EventInvalidated sweeps the path's tiers
+	// without bumping the namespace epoch.
+	f.mutated(fs.EventInvalidated, newPath)
 	// v1 notifyRenameTarget: invalidate ONLY the rename TARGET — the kernel
 	// moves the old name's dentry natively, and dropping it from userspace
 	// disturbs the bookkeeping for the next create of the same name in
@@ -2103,6 +2189,18 @@ func (f *FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName stri
 	// cached dentry (the EIO class).
 	if pino2, ok := f.inodes.GetInode(parentDirOf(newPath)); ok {
 		f.InvalidateEntry(pino2, pathpkg.Base(newPath))
+	}
+	// A rename that REPLACED a destination must also drop the destination
+	// inode's cached data: the kernel keeps the old name's pages and attrs
+	// under the still-live inode id, so a post-close read of the new name
+	// would serve the replaced file's bytes (H2: extent source renamed
+	// over an open classic destination).
+	if ino2, ok := f.inodes.GetInode(newPath); ok {
+		if e, eok := f.inodes.GetEntry(ino2); eok {
+			f.InvalidateContent(ino2, uint64(e.Size))
+		} else {
+			f.InvalidateContent(ino2, 0)
+		}
 	}
 	// v1 surgical rename bookkeeping, applied after the events so their
 	// invalidations don't wipe it: remove the old name and upsert the new
@@ -2141,6 +2239,9 @@ func (f *FS) Link(cancel <-chan struct{}, input *gofuse.LinkIn, filename string,
 	newPath, st := f.childOf(input.NodeId, filename)
 	if st != gofuse.OK {
 		return st
+	}
+	if err := f.flushDeferredUnlink(newPath); err != nil {
+		return fs.StatusOf(err)
 	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
@@ -2195,7 +2296,9 @@ func (f *FS) Symlink(cancel <-chan struct{}, header *gofuse.InHeader, pointedTo 
 	if st != gofuse.OK {
 		return st
 	}
-	f.flushDeferredUnlink(child)
+	if err := f.flushDeferredUnlink(child); err != nil {
+		return fs.StatusOf(err)
+	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 	if _, st := f.dispatch(ctx, &fs.Op{Kind: fs.OpSymlink, Path: child, Target: pointedTo, Ino: header.NodeId, Kernel: header, Caller: fs.CallerFrom(*header)}); st != gofuse.OK {
@@ -2231,10 +2334,11 @@ func (f *FS) Readlink(cancel <-chan struct{}, header *gofuse.InHeader) ([]byte, 
 	return res.Data, gofuse.OK
 }
 
-// hasPOSIXAccess ports v1 hasPOSIXAccess: permission-class check
-// (owner/group/other) of the requested mask bits against the mode. Group
-// membership reduces to the caller's primary gid (v1 additionally consulted
-// supplementary groups via /proc).
+// hasPOSIXAccess applies the POSIX permission classes to a FUSE caller: root first,
+// then owner, group (the caller's primary gid and the supplementary groups read from
+// /proc/<pid>/status) and other, using the mode bits the mount reports. When the group
+// list cannot be read the caller counts as a non-member, so group bits are never
+// granted on a guess.
 func hasPOSIXAccess(caller fs.Caller, ownerUid, ownerGid uint32, mode uint32, mask uint32) bool {
 	if caller.Uid == 0 {
 		// POSIX root rule: R_OK/W_OK always granted; X_OK granted when
@@ -2486,7 +2590,9 @@ func (f *FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name string,
 	if st != gofuse.OK {
 		return st
 	}
-	f.flushDeferredUnlink(child)
+	if err := f.flushDeferredUnlink(child); err != nil {
+		return fs.StatusOf(err)
+	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 	start := time.Now()
@@ -2541,7 +2647,6 @@ func (f *FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse.Open
 	if !f.defaultPermissions {
 		mode, modeKnown := uint32(0), false
 		ownerUid, ownerGid := f.uid, f.gid
-		ownerKnown := false
 		if entry, eok := f.inodes.GetEntry(input.NodeId); eok {
 			if entry.HasUID {
 				ownerUid = entry.Uid
@@ -2549,38 +2654,32 @@ func (f *FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse.Open
 			if entry.HasGID {
 				ownerGid = entry.Gid
 			}
-			ownerKnown = entry.HasUID && entry.HasGID
 			if entry.HasMode {
 				mode, modeKnown = entry.Mode&0o777, true
 			}
 		}
-		if !modeKnown || !ownerKnown {
-			// The inode carries no recorded mode (a chain reply with
-			// mode 0 is ambiguous — a real chmod 000 and "unknown" are
-			// indistinguishable at the boundary), or no authoritative
-			// owner (without it the gate tested the MOUNT's uid and
-			// picked the wrong permission class for group-readable
-			// files owned by others): settle both with a fresh stat
-			// instead of skipping the gate — a plain Lookup → Open of a
-			// remote chmod(000) file read the contents otherwise.
+		if !modeKnown {
+			// A mode-less inode (a chain reply with mode 0 is ambiguous — a
+			// real chmod 000 and "unknown" are indistinguishable) needs one
+			// stat: a plain Lookup → Open of a remote chmod(000) file would
+			// otherwise read the contents. Ownership does NOT need a probe:
+			// v1 entryOwner fell back to the mount's uid/gid, and re-statting
+			// on every open of a remote file added a HEAD the kernel had
+			// already resolved.
 			if st, serr := f.dispatchErr(ctx, &fs.Op{Kind: fs.OpGetAttr, Path: path, Ino: input.NodeId, Kernel: input, Caller: caller}); serr == nil && st.Attr != nil {
 				// A successful stat is authoritative — including a real
 				// chmod(000) answer of zero (requiring nonzero would skip
 				// the gate for exactly the mode it exists to enforce).
-				if !modeKnown {
-					mode, modeKnown = st.Attr.Mode&0o777, true
+				mode, modeKnown = st.Attr.Mode&0o777, true
+				hasUID, hasGID := ownerPresence(st.Attr)
+				if hasUID {
+					ownerUid = st.Attr.Uid
 				}
-				if !ownerKnown {
-					if st.Attr.HasUID || st.Attr.HasGID {
-						if st.Attr.HasUID {
-							ownerUid = st.Attr.Uid
-						}
-						if st.Attr.HasGID {
-							ownerGid = st.Attr.Gid
-						}
-					} else if st.Attr.HasOwner {
-						ownerUid, ownerGid = st.Attr.Uid, st.Attr.Gid
-					}
+				if hasGID {
+					ownerGid = st.Attr.Gid
+				}
+				if hasUID || hasGID {
+					f.inodes.UpdateOwner(input.NodeId, ownerUid, ownerGid, hasUID, hasGID)
 				}
 			}
 		}
@@ -2615,8 +2714,23 @@ func (f *FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse.Open
 			return st
 		}
 	}
+	var openAttr *fs.Attr
+	if entry, eok := f.inodes.GetEntry(input.NodeId); eok && entry.HasMode && !entry.Unlinked {
+		kind := fs.KindFile
+		if entry.IsDir {
+			kind = fs.KindDir
+		}
+		openAttr = &fs.Attr{
+			Kind: kind, Mode: entry.Mode & 0o7777, Size: entry.Size,
+			Rev: entry.Revision, Mtime: entry.Mtime, Nlink: entry.Nlink,
+			ResourceID: entry.ResourceID, ExtentIno: entry.ExtentIno,
+			Uid: entry.Uid, HasUID: entry.HasUID,
+			Gid: entry.Gid, HasGID: entry.HasGID,
+			HasOwner: entry.HasUID || entry.HasGID,
+		}
+	}
 	start := time.Now()
-	res, err := f.dispatchErr(ctx, &fs.Op{Kind: fs.OpCreate, Path: path, Flags: input.Flags, Ino: input.NodeId, Kernel: input, Caller: caller})
+	res, err := f.dispatchErr(ctx, &fs.Op{Kind: fs.OpCreate, Path: path, Flags: input.Flags, Ino: input.NodeId, Kernel: input, Caller: caller, OpenAttr: openAttr})
 	f.recordHandleOp(fs.OpCreate, start, err, 0)
 	if err != nil {
 		return fs.StatusOf(err)
@@ -2813,7 +2927,7 @@ func (f *FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) gofuse.Status 
 	}
 	if h := f.openHandle(input.Fh); h != nil {
 		unlock := f.pathLocks.HandleLock(input.Fh)
-		// The kernel's lock owner rides the context: extent close-time
+		// The kernel's lock owner rides the context: close-time
 		// F_UNLCK must target exactly this owner (dup + close of one
 		// descriptor), not whoever opened the handle.
 		start := time.Now()
@@ -2895,8 +3009,7 @@ func lockPayloadOf(input *gofuse.LkIn) fs.FileLock {
 	}
 }
 
-// handleLockOps returns the open handle's foreign lock namespace, if any
-// (v1 routed extent handles to the JuiceFS VFS before the local table).
+// handleLockOps returns the open handle's foreign lock namespace, if any.
 func (f *FS) handleLockOps(fh uint64) fs.HandleLockOps {
 	if h, ok := f.handles.get(fh); ok && h.h != nil {
 		// Wrapper planes (the read cache) expose their terminal; probing
@@ -2974,7 +3087,7 @@ func (f *FS) Fallocate(cancel <-chan struct{}, input *gofuse.FallocateIn) gofuse
 	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
-	_, st := f.dispatch(ctx, &fs.Op{Kind: fs.OpFallocate, Path: path, Ino: input.NodeId, Fh: input.Fh, Offset: int64(input.Offset), Size: int64(input.Length), Flags: input.Mode, Kernel: input, Caller: fs.CallerFrom(input.InHeader)})
+	_, st := f.dispatch(ctx, &fs.Op{Kind: fs.OpFallocate, Path: path, Ino: input.NodeId, Fh: input.Fh, Handle: f.openHandle(input.Fh), Offset: int64(input.Offset), Size: int64(input.Length), Flags: input.Mode, Kernel: input, Caller: fs.CallerFrom(input.InHeader)})
 	if st != gofuse.OK {
 		return st
 	}
@@ -3010,6 +3123,8 @@ func (f *FS) CopyFileRange(cancel <-chan struct{}, input *gofuse.CopyFileRangeIn
 		Ino2:    input.NodeIdOut,
 		Fh:      input.FhIn,
 		Fh2:     input.FhOut,
+		Handle:  f.openHandle(input.FhIn),
+		Handle2: f.openHandle(input.FhOut),
 		Offset:  int64(input.OffIn),
 		Offset2: int64(input.OffOut),
 		Limit:   int64(input.Len),
@@ -3036,23 +3151,12 @@ func (f *FS) OpenDir(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse.O
 		return gofuse.ENOENT
 	}
 	// v1 OpenDir is purely local: no getattr, and the kernel keeps its
-	// cached listing across opens (FOPEN_KEEP_CACHE) — except directories a
-	// foreign data plane mirrors (v1 extent dir handles): those can gain
-	// children the kernel's cached listing does not know, so they re-list.
-	keepCache := true
-	for _, dc := range f.dirKeepCacheOff {
-		if dc.DirKeepCacheOff(path) {
-			keepCache = false
-			break
-		}
-	}
+	// cached listing across opens (FOPEN_KEEP_CACHE).
 	dh := &dirHandle{path: path, ino: input.NodeId, attr: fs.Attr{Kind: fs.KindDir, Mode: 0o755}}
 	fh := f.nextFh.Add(1)
 	f.dirs.put(fh, dh)
 	out.Fh = fh
-	if keepCache {
-		out.OpenFlags = gofuse.FOPEN_KEEP_CACHE
-	}
+	out.OpenFlags = gofuse.FOPEN_KEEP_CACHE
 	f.recordFuseOp("opendir", gofuse.OK, 0, 0)
 	return gofuse.OK
 }
@@ -3077,12 +3181,10 @@ func (f *FS) loadDirEntries(cancel <-chan struct{}, input *gofuse.ReadIn, dh *di
 				entries = append(entries, fs.Entry{Name: ci.Name, Attr: fs.Attr{
 					Kind: kind, Mode: ci.Mode, Size: ci.Size, Mtime: ci.Mtime, Nlink: ci.Nlink,
 					// The row was written with the server identity; dropping
-					// it here split hardlinked aliases (ResourceID), cleared
-					// extent routing (ExtentIno) and published stale revs
-					// (Rev) on cached READDIRPLUS.
+					// it here split hardlinked aliases (ResourceID) and
+					// published stale revs (Rev) on cached READDIRPLUS.
 					Rev:        ci.Rev,
 					ResourceID: ci.ResourceID,
-					ExtentIno:  ci.ExtentIno,
 					Uid:        ci.Uid,
 					Gid:        ci.Gid,
 					HasOwner:   ci.HasUID || ci.HasGID,
@@ -3194,7 +3296,7 @@ func (f *FS) ReadDir(cancel <-chan struct{}, input *gofuse.ReadIn, out *gofuse.D
 			// first plain READDIR, or st_ino disagrees between aliases and
 			// the alias/kernel caches split.
 			e.Ino = f.inodes.EnsureInodeWithIdentity(childPathOf(dh.path, e.Name), e.Attr.ResourceID, e.Attr.Nlink, e.Attr.IsDir(), e.Attr.Size, e.Attr.Mtime)
-			f.syncExtentRouting(e.Ino, e)
+			f.syncEntrySize(e.Ino, e)
 		}
 		if !out.AddDirEntry(gofuse.DirEntry{Name: e.Name, Ino: e.Ino, Mode: modeBitsOf(e.Attr), Off: uint64(i + len(dots) + 1)}) {
 			break
@@ -3203,23 +3305,14 @@ func (f *FS) ReadDir(cancel <-chan struct{}, input *gofuse.ReadIn, out *gofuse.D
 	return gofuse.OK
 }
 
-// syncExtentRouting ports v1 cachedToDirEntries' extent rules: the listing
-// row is the only layout evidence readdir gets — a nonzero extent_ino
-// stamps the FUSE inode (shared across hardlink aliases), a zero one clears
-// stale routing (an id-less row cannot prove identity), and a live inode's
-// size wins over a listing that lags the open writer.
-func (f *FS) syncExtentRouting(ino uint64, e *fs.Entry) {
+// syncEntrySize ports v1 cachedToDirEntries' size rule: a listing that lags
+// the open writer must not publish i_size=0 (the kernel would return EOF
+// without a FUSE READ), so a live inode's known size wins over a zero row.
+func (f *FS) syncEntrySize(ino uint64, e *fs.Entry) {
 	if ino == 0 {
 		return
 	}
-	if e.Attr.ExtentIno != 0 {
-		f.inodes.SetExtentIno(ino, e.Attr.ExtentIno)
-	} else if entry, ok := f.inodes.GetEntry(ino); ok && entry.ExtentIno != 0 {
-		f.inodes.ClearExtentIno(ino)
-	}
 	if entry, ok := f.inodes.GetEntry(ino); ok && e.Attr.Size == 0 && entry.Size > 0 {
-		// v1 cachedToDirEntries: a listing that lags the open writer must
-		// not publish i_size=0 (kernel would EOF without a READ).
 		e.Attr.Size = entry.Size
 	}
 }
@@ -3289,12 +3382,12 @@ func (f *FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out *gofu
 		// identity-aware ensure keeps hardlink aliases on one inode.
 		if e.Ino == 0 {
 			e.Ino = f.inodes.EnsureInodeWithIdentity(childP, e.Attr.ResourceID, e.Attr.Nlink, e.Attr.IsDir(), e.Attr.Size, e.Attr.Mtime)
-			f.syncExtentRouting(e.Ino, e)
+			f.syncEntrySize(e.Ino, e)
 		} else if _, live := f.inodes.GetEntry(e.Ino); !live {
 			// The pinned mapping was forgotten mid-enumeration: re-resolve
 			// so this and later pages hand the kernel a live nodeid.
 			e.Ino = f.inodes.EnsureInodeWithIdentity(childP, e.Attr.ResourceID, e.Attr.Nlink, e.Attr.IsDir(), e.Attr.Size, e.Attr.Mtime)
-			f.syncExtentRouting(e.Ino, e)
+			f.syncEntrySize(e.Ino, e)
 		}
 		ino := e.Ino
 		eo := out.AddDirLookupEntry(gofuse.DirEntry{Name: e.Name, Ino: ino, Mode: modeBitsOf(e.Attr), Off: uint64(i + len(dots) + 1)})
@@ -3304,7 +3397,7 @@ func (f *FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out *gofu
 		f.inodes.IncrementLookup(ino)
 		eo.NodeId = ino
 		f.fillAttr(e.Attr, ino, &eo.Attr)
-		eo.SetAttrTimeout(f.attrTTLFor(childPathOf(dh.path, e.Name)))
+		eo.SetAttrTimeout(f.attrTTL)
 		eo.SetEntryTimeout(f.entryTTLFor(e.Name))
 	}
 	return gofuse.OK
@@ -3406,7 +3499,6 @@ func dirEntriesFrom(entries []fs.Entry) []fs.DirEntryInfo {
 			Mtime:      e.Attr.Mtime,
 			Rev:        e.Attr.Rev,
 			ResourceID: e.Attr.ResourceID,
-			ExtentIno:  e.Attr.ExtentIno,
 			// Listing rows are remote-observed, never this mount's own
 			// mutation.
 			LocalMutation: false,
@@ -3650,35 +3742,13 @@ func (f *FS) PerfSnapshotJSON() ([]byte, bool) {
 // HandleCount reports live file handles (queue stats probe).
 func (f *FS) HandleCount() int { return f.handles.len() }
 
-// InodeOf returns the FUSE inode currently owning path (test hook for the
-// extent-routing rows).
+// InodeOf returns the FUSE inode currently owning path.
 func (f *FS) InodeOf(path string) (uint64, bool) { return f.inodes.GetInode(path) }
-
-// ExtentRoutingOf returns the JuiceFS inode bound to path's FUSE inode.
-func (f *FS) ExtentRoutingOf(path string) (uint64, bool) {
-	ino, ok := f.inodes.GetInode(path)
-	if !ok {
-		return 0, false
-	}
-	entry, ok := f.inodes.GetEntry(ino)
-	if !ok || entry.ExtentIno == 0 {
-		return 0, false
-	}
-	return entry.ExtentIno, true
-}
-
-// InodeByExtentRouting resolves the FUSE inode owning a JuiceFS inode.
-func (f *FS) InodeByExtentRouting(extentIno uint64) (uint64, bool) {
-	return f.inodes.FindByExtentIno(extentIno)
-}
 
 // EnsureInodeForTest registers a live inode with a size (writer view).
 func (f *FS) EnsureInodeForTest(path string, isDir bool, size int64, mtime time.Time) uint64 {
 	return f.inodes.EnsureInode(path, isDir, size, mtime)
 }
-
-// SetExtentRoutingForTest binds a JuiceFS inode onto a FUSE inode.
-func (f *FS) SetExtentRoutingForTest(ino, extentIno uint64) { f.inodes.SetExtentIno(ino, extentIno) }
 
 // LiveInodeSizeForTest reports the live inode-table size of a path.
 func (f *FS) LiveInodeSizeForTest(path string) int64 {

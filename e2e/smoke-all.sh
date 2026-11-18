@@ -156,6 +156,9 @@ if [ "$RUN_SSE_SMOKE" = "1" ]; then
 fi
 if [ "$RUN_EXTENT_E2E" = "1" ]; then
   run_fuse_case "extent-rename-mixed-dir" "e2e/extent-rename-mixed-dir.sh"
+  # Extent takeover (content layout v2): needs a server with the extent
+  # v2 protocol and FUSE.
+  run_fuse_case "extent-takeover-mixed-tree" "e2e/extent-takeover-mixed-tree.sh"
 fi
 if [ "$RUN_TASKS_SMOKE" = "1" ]; then
   run_case "tasks" "e2e/tasks-smoke-test.sh"

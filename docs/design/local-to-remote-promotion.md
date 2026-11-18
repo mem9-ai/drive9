@@ -226,8 +226,8 @@ source existence, both parents' write plus search permission, sticky-directory
 ownership rules for source and destination, parent/type/symlink validity,
 self-subtree rejection, target type compatibility, and target-directory
 emptiness. Drive9 cannot rely on kernel `default_permissions`: it is not enabled
-for every mount/profile, and macOS explicitly defers these checks to the
-daemon. The validation portion of `renamePreflight` must therefore be extracted
+for every mount/profile (shared mounts arm it on Linux and macOS, private macOS
+mounts defer to the daemon). The validation portion of `renamePreflight` must therefore be extracted
 or reused as one side-effect-free check; overlay-parent pruning or other cleanup
 is not part of that check and cannot run until validation succeeds. This shared
 preflight runs while the in-memory subtree fence is held but before any durable

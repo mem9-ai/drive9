@@ -445,10 +445,15 @@ func (w *Writeback) truncateOwnerUnderSiblings(ctx context.Context, owner *buffe
 	if err := owner.ensureBufferLocked(ctx); err != nil {
 		return err
 	}
-	owner.stream = nil
-	owner.buf.ResetStreamingState()
+	if owner.stream != nil {
+		owner.stream = nil
+		owner.buf.ResetStreamingState()
+	}
 	if err := owner.buf.Truncate(size); err != nil {
 		return err
+	}
+	if owner.liveSpillFile != nil {
+		_ = owner.liveSpillFile.Truncate(size)
 	}
 	owner.wgen++
 	owner.dirty = true

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +12,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/mem9-ai/drive9/pkg/fusecomp/writebuffer"
 )
@@ -42,9 +45,9 @@ const quotaCopyBufSize = 32 << 10 // 32KB
 type ShadowFile struct {
 	fd           *os.File
 	size         int64
-	contentGen   uint64 // changes with every mutation; pin tokens only identify the fd
-	baseRev      int64  // server revision at open/write time
-	localNew     bool   // initialized locally at revision 0; never set by recovery
+	contentGen   ContentGen // changes with every mutation; pin tokens only identify the fd
+	baseRev      int64      // server revision at open/write time
+	localNew     bool       // initialized locally at revision 0; never set by recovery
 	written      shadowWrittenRanges
 	writtenBytes int64 // current-process coverage; zero for recovered shadows
 }
@@ -68,19 +71,19 @@ type ShadowStore struct {
 	// retires the shadow (removes from files, moves fd to retired map) so
 	// new writers get a fresh shadow. Old readers use their gen token to
 	// read/unpin the retired fd.
-	nextGen uint64                    // monotonic, 0 is reserved (no pin)
-	active  map[string]uint64         // path → generation of current active shadow
-	genFile map[uint64]*ShadowFile    // generation → active ShadowFile (for ReadAtGen on active gens)
-	refs    map[uint64]int32          // generation → active pin count
-	retired map[uint64]*retiredShadow // generation → retired shadow awaiting unpin
+	nextGen PinGen                    // monotonic, 0 is reserved (no pin)
+	active  map[string]PinGen         // path → lifecycle generation of current active shadow
+	genFile map[PinGen]*ShadowFile    // generation → active ShadowFile (for ReadAtGen on active gens)
+	refs    map[PinGen]int32          // generation → active pin count
+	retired map[PinGen]*retiredShadow // generation → retired shadow awaiting unpin
 
 	// writeGen tracks the content generation of each shadow file — bumped on
 	// every mutating write (WriteFull/WriteAt/Ensure/WriteStream/Truncate). It
 	// lets post-upload cleanup verify the shadow has not been overwritten by a
 	// concurrent same-path write since the upload started, so a stale upload
 	// does not remove a fresher shadow.
-	nextWriteGen atomic.Uint64     // monotonic content generation counter
-	writeGen     map[string]uint64 // path → content generation
+	nextWriteGen atomic.Uint64         // monotonic content generation counter
+	writeGen     map[string]ContentGen // path → content generation
 
 	// Write-back disk protection: configurable free-space ratio guard and
 	// optional byte quota. See CheckWriteBackQuota.
@@ -118,6 +121,11 @@ type retiredShadow struct {
 	// final Unpin waits so it cannot orphan the retired disk path.
 	cleanupDone chan struct{}
 	reason      shadowRetirementReason
+	// debited records whether the logical pending-byte counter already
+	// dropped this file's size (the Remove paths debit at retire time);
+	// a rotation-retired file is still pending until its final Unpin, so
+	// THAT transition performs the debit.
+	debited bool
 }
 
 // shadowPathLock is a refcounted per-path mutex, mirroring WriteBackCache's
@@ -172,16 +180,24 @@ func NewShadowStoreWithQuota(dir string, freeRatio float64, maxBytes int64) (*Sh
 	ss := &ShadowStore{
 		dir:                 dir,
 		files:               make(map[string]*ShadowFile),
-		active:              make(map[string]uint64),
-		genFile:             make(map[uint64]*ShadowFile),
-		refs:                make(map[uint64]int32),
-		retired:             make(map[uint64]*retiredShadow),
-		writeGen:            make(map[string]uint64),
+		active:              make(map[string]PinGen),
+		genFile:             make(map[PinGen]*ShadowFile),
+		refs:                make(map[PinGen]int32),
+		retired:             make(map[PinGen]*retiredShadow),
+		writeGen:            make(map[string]ContentGen),
 		writeCacheFreeRatio: freeRatio,
 		writeCacheMaxBytes:  maxBytes,
 		pathLocks:           make(map[string]*shadowPathLock),
 	}
 	return ss, nil
+}
+
+// Dir returns the on-disk directory backing this shadow store.
+func (s *ShadowStore) Dir() string {
+	if s == nil {
+		return ""
+	}
+	return s.dir
 }
 
 // CheckWriteBackQuota checks whether a write of requiredBytes would violate
@@ -346,6 +362,16 @@ func (s *ShadowStore) WriteAt(remotePath string, offset int64, data []byte, base
 			return 0, err
 		}
 	}
+	// Rotation only AFTER the quota gates: a rejected write must leave the
+	// acknowledged pinned image and its generation exactly as they were.
+	// The rotation copies the image, so this partial write composes with
+	// the existing bytes on the private copy.
+	if err := s.rotatePinnedIfNeeded(remotePath); err != nil {
+		return 0, err
+	}
+	if sf2, err2 := s.ensureShadowFile(remotePath); err2 == nil {
+		sf = sf2
+	}
 
 	n, err := writeShadowAt(sf.fd, data, offset)
 	s.recordWrite(remotePath, sf, offset, n, baseRev)
@@ -373,6 +399,17 @@ func (s *ShadowStore) WriteFull(remotePath string, data []byte, baseRev int64) e
 	delta := newSize - oldWritten
 	if err := s.checkQuotaForDelta(delta); err != nil {
 		return err
+	}
+	// Rotation only AFTER the quota gate: a rejected replacement must
+	// leave the acknowledged pinned image and its generation intact. The
+	// rotation's copy is discarded by the truncate below — the content
+	// preservation matters for WriteAt/Truncate, not for this full
+	// replacement, but the uniform primitive keeps one code path.
+	if err := s.rotatePinnedIfNeeded(remotePath); err != nil {
+		return err
+	}
+	if sf2, err2 := s.ensureShadowFile(remotePath); err2 == nil {
+		sf = sf2
 	}
 
 	if err := sf.fd.Truncate(0); err != nil {
@@ -510,6 +547,14 @@ func (s *ShadowStore) Truncate(remotePath string, size int64, baseRev int64) err
 			return err
 		}
 	}
+	// Rotation only AFTER the quota gate; the copy preserves the prefix a
+	// shrink keeps, so the pinned generation's image survives intact.
+	if err := s.rotatePinnedIfNeeded(remotePath); err != nil {
+		return err
+	}
+	if sf2, err2 := s.ensureShadowFile(remotePath); err2 == nil {
+		sf = sf2
+	}
 
 	if err := sf.fd.Truncate(size); err != nil {
 		return fmt.Errorf("shadow truncate: %w", err)
@@ -609,13 +654,30 @@ func (s *ShadowStore) WriteExtents(remotePath string, wb *writebuffer.WriteBuffe
 	return nil
 }
 
-// ReadAtGen reads from a shadow file identified by its generation token.
+// ContentGen identifies a shadow file's CONTENT generation: bumped by every
+// mutating write, so a caller can prove the bytes it is about to upload are
+// still the ones it staged.
+//
+// PinGen identifies a shadow file's LIFECYCLE generation: minted by Pin and
+// released by Unpin, so a reader keeps its image readable even after the
+// path's active shadow is retired or replaced.
+//
+// These are DIFFERENT number spaces drawn from different counters, and mixing
+// them up is silent: an id from one space simply does not resolve in the
+// other. They are distinct types so the compiler rejects a mix-up instead of
+// letting a lookup fail at runtime.
+type (
+	ContentGen uint64
+	PinGen     uint64
+)
+
+// ReadAtGen reads from a shadow file identified by its PIN token.
 // Works for both active generations (shadow still in files map) and retired
 // generations (shadow moved to retired map by Remove). Returns (0, error)
 // if the generation is unknown.
 // The read is performed under RLock to prevent WriteStream from swapping
 // the fd mid-read on active generations.
-func (s *ShadowStore) ReadAtGen(gen uint64, offset int64, buf []byte) (int, error) {
+func (s *ShadowStore) ReadAtGen(gen PinGen, offset int64, buf []byte) (int, error) {
 	s.mu.RLock()
 	if sf, ok := s.genFile[gen]; ok {
 		n, err := sf.fd.ReadAt(buf, offset)
@@ -634,7 +696,7 @@ func (s *ShadowStore) ReadAtGen(gen uint64, offset int64, buf []byte) (int, erro
 
 // SizeGen returns the size of a shadow file by generation token. Works for
 // both active and retired generations. Returns -1 if the generation is unknown.
-func (s *ShadowStore) SizeGen(gen uint64) int64 {
+func (s *ShadowStore) SizeGen(gen PinGen) int64 {
 	s.mu.RLock()
 	if sf, ok := s.genFile[gen]; ok {
 		sz := sf.size
@@ -716,7 +778,7 @@ func (s *ShadowStore) ReadAll(remotePath string) ([]byte, error) {
 // generation still matches expectedGen. Generation 0 preserves the historical
 // path-based fallback for recovered legacy entries that were created before
 // CommitEntry carried generation tokens.
-func (s *ShadowStore) ReadAllIfGeneration(remotePath string, expectedGen uint64) ([]byte, error) {
+func (s *ShadowStore) ReadAllIfGeneration(remotePath string, expectedGen ContentGen) ([]byte, error) {
 	if expectedGen == 0 {
 		return s.ReadAll(remotePath)
 	}
@@ -749,7 +811,7 @@ func (s *ShadowStore) ReadAllIfGeneration(remotePath string, expectedGen uint64)
 // only while its content generation still matches expectedGen. Unlike
 // ReadAllIfGeneration it never materializes the whole image: a four-byte READ
 // on a multi-GiB spill must not allocate the file.
-func (s *ShadowStore) ReadAtIfGeneration(remotePath string, expectedGen uint64, offset int64, buf []byte) (int, error) {
+func (s *ShadowStore) ReadAtIfGeneration(remotePath string, expectedGen ContentGen, offset int64, buf []byte) (int, error) {
 	if expectedGen == 0 {
 		return s.ReadAt(remotePath, offset, buf)
 	}
@@ -780,7 +842,7 @@ func (s *ShadowStore) ReadAtIfGeneration(remotePath string, expectedGen uint64, 
 // SyncIfGeneration fsyncs the active shadow only if its current content
 // generation still matches expectedGen. Generation 0 preserves the historical
 // path-based fallback for recovered legacy entries.
-func (s *ShadowStore) SyncIfGeneration(remotePath string, expectedGen uint64) error {
+func (s *ShadowStore) SyncIfGeneration(remotePath string, expectedGen ContentGen) error {
 	if s == nil {
 		return fmt.Errorf("nil shadow store")
 	}
@@ -844,7 +906,7 @@ func (s *ShadowStore) Open(remotePath string) (*os.File, int64, error) {
 // nonzero generation it holds the path-local shadow lock for the caller, so the
 // opened fd cannot observe concurrent same-path shadow mutations while it is
 // being streamed to a remote commit.
-func (s *ShadowStore) OpenIfGeneration(remotePath string, expectedGen uint64) (*os.File, int64, func(), error) {
+func (s *ShadowStore) OpenIfGeneration(remotePath string, expectedGen ContentGen) (*os.File, int64, func(), error) {
 	if expectedGen == 0 {
 		fd, size, err := s.Open(remotePath)
 		return fd, size, func() {}, err
@@ -917,7 +979,13 @@ func (s *ShadowStore) BaseRev(remotePath string) int64 {
 // Pin increments the reference count for the active shadow at remotePath and
 // returns a generation token. The caller must pass this token to Unpin on
 // Release. Use after creating a new shadow (e.g. ShadowSpill O_TRUNC).
-func (s *ShadowStore) Pin(remotePath string) uint64 {
+func (s *ShadowStore) Pin(remotePath string) PinGen {
+	// The path lock excludes the writers' rotate+mutate window: a pin
+	// taken here either sees the pre-rotation generation (whose fd the
+	// rotation then retires immutably) or the post-rotation fresh file —
+	// never a check-then-mutate race on the same fd.
+	pl := s.acquirePathLock(remotePath)
+	defer s.releasePathLock(remotePath, pl)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	gen := s.active[remotePath]
@@ -938,7 +1006,10 @@ func (s *ShadowStore) Pin(remotePath string) uint64 {
 // count. Returns a generation token and true, or (0, false) if no shadow
 // exists. Loading from disk handles post-crash recovery where pending
 // shadows are on disk but not yet in the files map.
-func (s *ShadowStore) PinIfExists(remotePath string) (uint64, bool) {
+func (s *ShadowStore) PinIfExists(remotePath string) (PinGen, bool) {
+	// Same path-lock exclusion as Pin — see the comment there.
+	pl := s.acquirePathLock(remotePath)
+	defer s.releasePathLock(remotePath, pl)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sf, ok := s.files[remotePath]
@@ -978,7 +1049,7 @@ func (s *ShadowStore) PinIfExists(remotePath string) (uint64, bool) {
 // shadow. Misses do no disk I/O and take no path lock, so Read can retry when
 // a writer publishes a fresh shadow even without a committed-revision change.
 // Rejected images remain available to their staging owner.
-func (s *ShadowStore) PinResident(remotePath string, minRevision int64) (uint64, bool) {
+func (s *ShadowStore) PinResident(remotePath string, minRevision int64) (PinGen, bool) {
 	return s.pinReadable(remotePath, minRevision, 0)
 }
 
@@ -986,7 +1057,7 @@ func (s *ShadowStore) PinResident(remotePath string, minRevision int64) (uint64,
 // generation was retired (Remove called while pinned) and the count reaches
 // zero, the retired fd is closed and the disk file deleted. Generation 0
 // is a no-op (handle was never pinned).
-func (s *ShadowStore) Unpin(gen uint64) {
+func (s *ShadowStore) Unpin(gen PinGen) {
 	if gen == 0 {
 		return
 	}
@@ -1009,6 +1080,12 @@ func (s *ShadowStore) Unpin(gen uint64) {
 		}
 		_ = rt.fd.Close()
 		_ = os.Remove(rt.diskPath)
+		if !rt.debited {
+			// A rotation-retired file was never debited (the Remove paths
+			// debit at retire time via debited=true); its bytes were
+			// pending the whole time the pinned reader held them.
+			s.pendingBytes.Add(-rt.size)
+		}
 	}
 }
 
@@ -1040,7 +1117,7 @@ func (s *ShadowStore) Remove(remotePath string) {
 // rename or immediate remove), closing the window where a replacement write
 // could create its new shadow at the shared disk path after the in-memory
 // check but before the stale cleanup removed/renamed it.
-func (s *ShadowStore) RemoveIfGeneration(remotePath string, expectedGen uint64) bool {
+func (s *ShadowStore) RemoveIfGeneration(remotePath string, expectedGen ContentGen) bool {
 	return s.remove(remotePath, expectedGen, shadowRetiredInvalidated)
 }
 
@@ -1048,7 +1125,7 @@ func (s *ShadowStore) RemoveIfGeneration(remotePath string, expectedGen uint64) 
 // if no shadow exists. Bumped on every mutating write (WriteFull/WriteAt/
 // Ensure/WriteStream/Truncate) so callers can snapshot it before an upload and
 // verify the shadow has not been overwritten by a concurrent same-path write.
-func (s *ShadowStore) ActiveGeneration(remotePath string) uint64 {
+func (s *ShadowStore) ActiveGeneration(remotePath string) ContentGen {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.writeGen[remotePath]
@@ -1059,7 +1136,7 @@ func (s *ShadowStore) ActiveGeneration(remotePath string) uint64 {
 // generation for it. Recovered shadows start without memory-only writeGen
 // state; CommitQueue must mint one before binding a recovered CommitEntry so
 // later uploads and cleanup remain generation-scoped instead of path-wide.
-func (s *ShadowStore) EnsureActiveGeneration(remotePath string) uint64 {
+func (s *ShadowStore) EnsureActiveGeneration(remotePath string) ContentGen {
 	return s.ensureActiveGeneration(remotePath, 0)
 }
 
@@ -1123,9 +1200,10 @@ func (s *ShadowStore) Rename(oldPath, newPath string) bool {
 		delete(s.genFile, replacedGen)
 		if s.refs[replacedGen] > 0 && replacedSF != nil {
 			s.retired[replacedGen] = &retiredShadow{
-				fd:     replacedSF.fd,
-				size:   replacedSF.size,
-				reason: shadowRetiredSnapshot,
+				fd:      replacedSF.fd,
+				size:    replacedSF.size,
+				reason:  shadowRetiredSnapshot,
+				debited: true, // replacedSize was debited above
 			}
 		} else {
 			delete(s.refs, replacedGen)
@@ -1181,6 +1259,32 @@ func (s *ShadowStore) Has(remotePath string) bool {
 	return err == nil
 }
 
+// VerifyRemoved reports an error unless the path's shadow payload is
+// CONFIRMED absent: an in-memory entry or a stat-able file means it is
+// still present, and a stat failure other than not-exist (EACCES, EIO)
+// means its absence cannot be proven. Callers must not treat that latter
+// case as a successful removal — a read-only or failing cache filesystem
+// can leave the durable shadow behind while rejecting every probe
+// (Has alone cannot make the distinction: it returns false for any stat
+// error).
+func (s *ShadowStore) VerifyRemoved(remotePath string) error {
+	if s == nil || remotePath == "" {
+		return nil
+	}
+	s.mu.RLock()
+	_, active := s.files[remotePath]
+	s.mu.RUnlock()
+	if active {
+		return fmt.Errorf("shadow for %s is still active", remotePath)
+	}
+	if _, err := os.Stat(s.shadowPath(remotePath)); err == nil {
+		return fmt.Errorf("shadow for %s still exists on disk", remotePath)
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("absence of shadow for %s cannot be verified: %w", remotePath, err)
+	}
+	return nil
+}
+
 // Close closes all open shadow file descriptors.
 func (s *ShadowStore) Close() {
 	s.mu.Lock()
@@ -1193,10 +1297,10 @@ func (s *ShadowStore) Close() {
 		_ = rt.fd.Close()
 	}
 	s.files = make(map[string]*ShadowFile)
-	s.active = make(map[string]uint64)
-	s.genFile = make(map[uint64]*ShadowFile)
-	s.refs = make(map[uint64]int32)
-	s.retired = make(map[uint64]*retiredShadow)
+	s.active = make(map[string]PinGen)
+	s.genFile = make(map[PinGen]*ShadowFile)
+	s.refs = make(map[PinGen]int32)
+	s.retired = make(map[PinGen]*retiredShadow)
 }
 
 // RecoverFromDisk scans the shadow directory and loads shadow files into memory.
@@ -1256,7 +1360,7 @@ func (sf *ShadowFile) readableAtRevision(minRevision int64) bool {
 		(sf.localNew && sf.baseRev == 0 && minRevision == 0))
 }
 
-func (sf *ShadowFile) readableWithPending(minRevision int64, pendingGeneration uint64) bool {
+func (sf *ShadowFile) readableWithPending(minRevision int64, pendingGeneration ContentGen) bool {
 	return sf != nil && ((pendingGeneration != 0 && sf.contentGen == pendingGeneration) || sf.readableAtRevision(minRevision))
 }
 
@@ -1495,7 +1599,7 @@ func (s *ShadowStore) checkFreeRatioThrottled(requiredBytes int64) error {
 	return nil
 }
 
-func (s *ShadowStore) pinReadable(remotePath string, minRevision int64, pendingGeneration uint64) (uint64, bool) {
+func (s *ShadowStore) pinReadable(remotePath string, minRevision int64, pendingGeneration ContentGen) (PinGen, bool) {
 	if s == nil {
 		return 0, false
 	}
@@ -1522,7 +1626,7 @@ func (s *ShadowStore) pinReadable(remotePath string, minRevision int64, pendingG
 // does not match. This makes the generation check + retirement/removal atomic
 // so a concurrent same-path write cannot bump writeGen between the check and
 // the actual map deletions.
-func (s *ShadowStore) removeCoreLocked(remotePath string, expectedGen uint64, reason shadowRetirementReason) (shadowRemoveCleanup, bool) {
+func (s *ShadowStore) removeCoreLocked(remotePath string, expectedGen ContentGen, reason shadowRetirementReason) (shadowRemoveCleanup, bool) {
 	if expectedGen != 0 && s.writeGen[remotePath] != expectedGen {
 		return shadowRemoveCleanup{}, false
 	}
@@ -1557,6 +1661,7 @@ func (s *ShadowStore) removeCoreLocked(remotePath string, expectedGen uint64, re
 				size:        sf.size,
 				cleanupDone: make(chan struct{}),
 				reason:      reason,
+				debited:     true, // runRemoveCleanup debits removedSize
 			}
 			s.retired[gen] = retired
 			cleanup.retired = retired
@@ -1583,6 +1688,342 @@ func (s *ShadowStore) removeCoreLocked(remotePath string, expectedGen uint64, re
 
 // runRemoveCleanup performs the disk cleanup returned by removeCoreLocked and
 // accounts the pendingBytes delta. Must be called after releasing s.mu.
+// rotatePinnedIfNeeded replaces a pinned active file with a private copy the
+// caller may mutate. A pin token identifies the file descriptor, not an
+// immutable content version, so an in-place mutation (WriteFull's
+// truncate+rewrite, WriteAt, Truncate) would silently change what pinned
+// readers observe. The rotation is a complete, all-or-nothing primitive:
+//
+//   - the replacement COPIES the current image, so partial-update callers
+//     (WriteAt, Truncate) keep the untouched bytes around their mutation;
+//   - every failure (open, copy, rename) leaves the old file, its
+//     generation, and the pending-byte counter exactly as they were — the
+//     caller's write fails instead of tearing a durable pending image;
+//   - the swap happens under s.mu with the caller holding the path lock,
+//     and Pin/PinIfExists take the same path lock, so no pin can be
+//     acquired between the pinned-check and the mutation;
+//   - the retired original keeps its fd readable through ReadAtGen until
+//     the last Unpin, which also debits its pending bytes (they were
+//     pending the whole time — rotation only superseded the writer's
+//     view, the pinned reader's copy is still work in flight).
+//
+// Callers must have passed their quota checks BEFORE rotating: a rejected
+// write then leaves the acknowledged image fully intact.
+// rotatePrePublishHook is a test-only seam at the copy-window exit: the
+// window between the initial refs snapshot and the publication below is
+// exactly where a racing last-Unpin lands, and tests interleave there
+// deterministically through it. Nil in production.
+var rotatePrePublishHook func()
+
+func (s *ShadowStore) rotatePinnedIfNeeded(remotePath string) error {
+	// Snapshot the pinned state under s.mu, including the written-coverage
+	// charge (it transfers to the copy so the byte quota neither leaks the
+	// old charge nor double-charges the replacement).
+	s.mu.Lock()
+	gen := s.active[remotePath]
+	if gen == 0 || s.refs[gen] <= 0 {
+		s.mu.Unlock()
+		return nil
+	}
+	old, ok := s.files[remotePath]
+	if !ok || old == nil {
+		s.mu.Unlock()
+		return nil
+	}
+	oldSize := old.size
+	oldFD := old.fd
+	oldWritten := old.written.clone()
+	oldWrittenBytes := old.writtenBytes
+	s.mu.Unlock()
+
+	// The copy duplicates the image's ACTUAL data: the disk guard and the
+	// copy both use the filesystem's own data extents (SEEK_DATA/
+	// SEEK_HOLE) — not the logical size, and not this process's written-
+	// coverage map. Reserving the logical size would reject valid
+	// low-allocation updates on sparse files; trusting the coverage map
+	// would zero ranges a recovered file actually holds (its content
+	// extends beyond anything the current process wrote). Filesystems
+	// without extent seeking reserve the full size (dense fallback).
+	if oldSize > 0 {
+		guardBytes := oldSize
+		if data, dense, err := shadowDataExtents(oldFD, oldSize); err == nil {
+			if !dense {
+				guardBytes = data
+			}
+		}
+		if guardBytes > 0 {
+			if err := s.checkFreeRatio(guardBytes); err != nil {
+				return fmt.Errorf("shadow rotate %s: %w", remotePath, err)
+			}
+		}
+	}
+
+	// Copy the current image to a private disk file. Nothing observable
+	// changes until the publication below succeeds.
+	diskPath := s.shadowPath(remotePath)
+	tmpPath := fmt.Sprintf("%s.cow.%d", diskPath, gen)
+	if err := copyShadowFile(tmpPath, oldFD, oldSize); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("shadow rotate %s: %w", remotePath, err)
+	}
+	retiredPath := fmt.Sprintf("%s.retired.%d", diskPath, gen)
+	if err := os.Rename(diskPath, retiredPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("shadow rotate %s: retire rename: %w", remotePath, err)
+	}
+	if err := os.Rename(tmpPath, diskPath); err != nil {
+		// Canonical no longer exists here — a plain rename restores it.
+		_ = os.Rename(retiredPath, diskPath)
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("shadow rotate %s: promote rename: %w", remotePath, err)
+	}
+	if rotatePrePublishHook != nil {
+		rotatePrePublishHook()
+	}
+	nfd, err := os.OpenFile(diskPath, os.O_RDWR, 0o644)
+	if err != nil {
+		// The copy sits at the canonical path; rename(2) over it ATOMICALLY
+		// replaces it with the retired original. A remove-then-rename here
+		// would delete the restored original instead (the prior bug).
+		if rerr := os.Rename(retiredPath, diskPath); rerr != nil {
+			return fmt.Errorf("shadow rotate %s: reopen: %w (restore failed: %v)", remotePath, err, rerr)
+		}
+		return fmt.Errorf("shadow rotate %s: reopen: %w", remotePath, err)
+	}
+	sf := &ShadowFile{fd: nfd, size: oldSize}
+
+	s.mu.Lock()
+	// Publication re-checks the reference count: a reader whose LAST Unpin
+	// ran during the copy window has already dropped refs[gen] to zero and
+	// found no retired entry to clean — nobody would ever Unpin again. That
+	// case cleans up inline below (no retired entry, no pending-byte add);
+	// the copy becomes the only image.
+	refsAlive := s.refs[gen] > 0
+	// Transfer the written-coverage charge: the copy carries the same
+	// coverage as the original, and the retired original keeps none — the
+	// byte-quota total is unchanged, so the caller's post-rotation delta
+	// math matches the un-rotated behavior exactly.
+	old.written = shadowWrittenRanges{}
+	old.writtenBytes = 0
+	sf.written = oldWritten
+	sf.writtenBytes = oldWrittenBytes
+	s.files[remotePath] = sf
+	delete(s.active, remotePath)
+	delete(s.genFile, gen)
+	delete(s.writeGen, remotePath)
+	if refsAlive {
+		rt := &retiredShadow{
+			fd:          oldFD,
+			diskPath:    retiredPath,
+			size:        oldSize,
+			cleanupDone: make(chan struct{}),
+			reason:      shadowRetiredSnapshot,
+		}
+		// The retire work (both renames) already happened synchronously —
+		// release the final-Unpin waiter immediately.
+		close(rt.cleanupDone)
+		s.retired[gen] = rt
+		// The copy is a NEW logical pending image (the old image's bytes
+		// stay counted until the retired copy's final Unpin debits them):
+		// the counter briefly holds both, exactly like any two-image
+		// overlap.
+		s.pendingBytes.Add(oldSize)
+	} else {
+		// No reader remains (the last Unpin raced the copy window): clean
+		// the retired original up inline — nobody will ever Unpin it. The
+		// fd close and disk remove happen after the unlock, mirroring
+		// Unpin's own ordering.
+		s.mu.Unlock()
+		_ = oldFD.Close()
+		_ = os.Remove(retiredPath)
+		return nil
+	}
+	s.mu.Unlock()
+	return nil
+}
+
+// copyShadowFile reproduces the source image at dst, walking the
+// filesystem's data extents (SEEK_DATA/SEEK_HOLE) and reproducing them —
+// holes stay holes, and a recovered file's full content (beyond anything
+// the current process wrote) is preserved: the extent walk is the
+// filesystem's own content map, complete regardless of process coverage
+// tracking. Filesystems without extent seeking get a dense copy; the
+// caller reserved the full size for exactly that fallback.
+func copyShadowFile(dst string, src *os.File, size int64) error {
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = out.Close() }()
+	if size == 0 {
+		return nil
+	}
+	if err := out.Truncate(size); err != nil {
+		return err
+	}
+	if err := copyFileExtents(out, src, size); err != nil {
+		if err == errExtentSeekUnsupported {
+			return copyFileDense(out, src, size)
+		}
+		return err
+	}
+	return nil
+}
+
+// errExtentSeekUnsupported reports that SEEK_DATA/SEEK_HOLE are unusable on
+// this file/filesystem; callers fall back to a dense copy.
+var errExtentSeekUnsupported = errors.New("extent seeking unsupported")
+
+// copyFileExtents copies each data extent [data, hole) reported by the
+// filesystem, leaving the gaps as holes in dst.
+func copyFileExtents(out *os.File, src *os.File, size int64) error {
+	conn, err := src.SyscallConn()
+	if err != nil {
+		return errExtentSeekUnsupported
+	}
+	var seekErr error
+	_ = conn.Control(func(fd uintptr) {
+		seekErr = copyFileExtentsFD(out, int(fd), size)
+	})
+	return seekErr
+}
+
+func copyFileExtentsFD(out *os.File, fd int, size int64) error {
+	buf := make([]byte, 64<<10)
+	off := int64(0)
+	for off < size {
+		data, err := unix.Seek(fd, off, unix.SEEK_DATA)
+		if err != nil {
+			if err == unix.ENXIO {
+				return nil // the rest is a hole
+			}
+			return extentSeekFallback(err)
+		}
+		hole, err := unix.Seek(fd, data, unix.SEEK_HOLE)
+		if err != nil {
+			if err == unix.ENXIO {
+				hole = size
+			} else {
+				return extentSeekFallback(err)
+			}
+		}
+		if hole > size {
+			hole = size
+		}
+		for at := data; at < hole; at += int64(len(buf)) {
+			end := at + int64(len(buf))
+			if end > hole {
+				end = hole
+			}
+			chunk := buf[:end-at]
+			if err := preadFull(fd, chunk, at); err != nil {
+				return err
+			}
+			if _, err := out.WriteAt(chunk, at); err != nil {
+				return err
+			}
+		}
+		off = hole
+	}
+	return nil
+}
+
+func extentSeekFallback(err error) error {
+	if err == unix.ENOSYS || err == unix.EINVAL || err == unix.ENOTTY {
+		return errExtentSeekUnsupported
+	}
+	return err
+}
+
+// preadFull fills dst completely from fd at off. pread(2) may legitimately
+// return fewer bytes than requested with a nil error — the raw syscall
+// wrapper forwards that — so a short read is retried until the buffer is
+// full; EOF inside a range the caller knows holds data is a torn image, an
+// error, never a silent zero-fill of the remainder.
+func preadFull(fd int, dst []byte, off int64) error {
+	for len(dst) > 0 {
+		n, err := unix.Pread(fd, dst, off)
+		if n > 0 {
+			dst = dst[n:]
+			off += int64(n)
+		}
+		if err != nil {
+			if err == syscall.EINTR {
+				continue
+			}
+			return err
+		}
+		if n == 0 {
+			return io.ErrUnexpectedEOF
+		}
+	}
+	return nil
+}
+
+// copyFileDense is the whole-image fallback for filesystems without extent
+// seeking.
+func copyFileDense(out *os.File, src *os.File, size int64) error {
+	buf := make([]byte, 64<<10)
+	for off := int64(0); off < size; off += int64(len(buf)) {
+		end := off + int64(len(buf))
+		if end > size {
+			end = size
+		}
+		chunk := buf[:end-off]
+		if _, err := src.ReadAt(chunk, off); err != nil {
+			return err
+		}
+		if _, err := out.WriteAt(chunk, off); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// shadowDataExtents reports the image's real data bytes; dense=true means
+// extent seeking is unavailable and the whole size should be reserved.
+func shadowDataExtents(src *os.File, size int64) (dataBytes int64, dense bool, err error) {
+	conn, err := src.SyscallConn()
+	if err != nil {
+		return 0, true, nil
+	}
+	var total int64
+	var seekErr error
+	_ = conn.Control(func(fd uintptr) {
+		seekErr = shadowDataExtentsFD(int(fd), size, &total)
+	})
+	if seekErr == errExtentSeekUnsupported {
+		return 0, true, nil
+	}
+	if seekErr != nil {
+		return 0, false, seekErr
+	}
+	return total, false, nil
+}
+
+func shadowDataExtentsFD(fd int, size int64, total *int64) error {
+	off := int64(0)
+	for off < size {
+		data, e := unix.Seek(fd, off, unix.SEEK_DATA)
+		if e != nil {
+			if e == unix.ENXIO {
+				return nil // the rest is a hole
+			}
+			return extentSeekFallback(e)
+		}
+		hole, e := unix.Seek(fd, data, unix.SEEK_HOLE)
+		if e != nil && e != unix.ENXIO {
+			return extentSeekFallback(e)
+		}
+		if e == unix.ENXIO || hole > size {
+			hole = size
+		}
+		*total += hole - data
+		off = hole
+	}
+	return nil
+}
+
 func (s *ShadowStore) runRemoveCleanup(cleanup shadowRemoveCleanup) {
 	if cleanup.removedSize > 0 {
 		s.pendingBytes.Add(-cleanup.removedSize)
@@ -1604,7 +2045,7 @@ func (s *ShadowStore) runRemoveCleanup(cleanup shadowRemoveCleanup) {
 	}
 }
 
-func (s *ShadowStore) remove(remotePath string, expectedGen uint64, reason shadowRetirementReason) bool {
+func (s *ShadowStore) remove(remotePath string, expectedGen ContentGen, reason shadowRetirementReason) bool {
 	pl := s.acquirePathLock(remotePath)
 	defer s.releasePathLock(remotePath, pl)
 	s.mu.Lock()
@@ -1616,7 +2057,7 @@ func (s *ShadowStore) remove(remotePath string, expectedGen uint64, reason shado
 	return ok
 }
 
-func (s *ShadowStore) ensureActiveGeneration(remotePath string, minSize int64) uint64 {
+func (s *ShadowStore) ensureActiveGeneration(remotePath string, minSize int64) ContentGen {
 	if s == nil || remotePath == "" {
 		return 0
 	}
@@ -1661,13 +2102,13 @@ func (s *ShadowStore) ensureActiveGeneration(remotePath string, minSize int64) u
 // bumpWriteGenLocked increments the content generation for remotePath. Called
 // under s.mu on every mutating write so ActiveGeneration reflects the latest
 // write. Returns the new generation.
-func (s *ShadowStore) bumpWriteGenLocked(remotePath string) uint64 {
+func (s *ShadowStore) bumpWriteGenLocked(remotePath string) ContentGen {
 	g := s.nextWriteGen.Add(1)
-	s.writeGen[remotePath] = g
+	s.writeGen[remotePath] = ContentGen(g)
 	if sf := s.files[remotePath]; sf != nil {
-		sf.contentGen = g
+		sf.contentGen = ContentGen(g)
 	}
-	return g
+	return ContentGen(g)
 }
 
 func isRegular(e os.DirEntry) bool {

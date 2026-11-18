@@ -23,6 +23,10 @@ func (c *LocalS3Client) handleUploadPart(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if !c.authorizeLocalPresign(r, "") {
+		http.Error(w, "invalid or expired presigned URL", http.StatusForbidden)
+		return
+	}
 
 	// Parse: /upload/{uploadID}/{partNumber}
 	rest := strings.TrimPrefix(r.URL.Path, "/upload/")
@@ -32,6 +36,10 @@ func (c *LocalS3Client) handleUploadPart(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	uploadID := parts[0]
+	if !validObjectKey(uploadID) {
+		http.Error(w, "invalid upload id", http.StatusBadRequest)
+		return
+	}
 	partNumber, err := strconv.Atoi(parts[1])
 	if err != nil {
 		http.Error(w, "invalid part number", http.StatusBadRequest)
@@ -57,6 +65,18 @@ func (c *LocalS3Client) handleGetObject(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// The range selector is part of the signed URL, so verification must see
+	// exactly the query the presigner minted.
+	rangeParam := r.URL.Query().Get("range")
+	extraQuery := ""
+	if rangeParam != "" {
+		extraQuery = "range=" + rangeParam
+	}
+	if !c.authorizeLocalPresign(r, extraQuery) {
+		http.Error(w, "invalid or expired presigned URL", http.StatusForbidden)
+		return
+	}
+
 	key := strings.TrimPrefix(r.URL.Path, "/objects/")
 	rc, err := c.GetObject(r.Context(), key)
 	if err != nil {
@@ -69,7 +89,7 @@ func (c *LocalS3Client) handleGetObject(w http.ResponseWriter, r *http.Request) 
 
 	// Parse range from ?range= query param or standard Range header.
 	var startByte, endByte int64 = -1, -1
-	if rangeParam := r.URL.Query().Get("range"); rangeParam != "" {
+	if rangeParam != "" {
 		parts := strings.SplitN(rangeParam, "-", 2)
 		if len(parts) == 2 {
 			s, e1 := strconv.ParseInt(parts[0], 10, 64)

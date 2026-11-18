@@ -10,16 +10,20 @@ import (
 )
 
 func TestLocalClustersAPIAuthorizeAndResolve(t *testing.T) {
-	api := NewLocalClustersAPI(LocalClustersAPIConfig{
+	api, err := NewLocalClustersAPI(LocalClustersAPIConfig{
 		Runtime: "false-runtime",
 		Image:   "unused",
 		Host:    "127.0.0.1",
 	})
-	_, err := api.ResolveAPIKey(context.Background(), "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = api.ResolveAPIKey(context.Background(), "", "")
 	if err == nil {
 		t.Fatal("expected missing credentials error")
 	}
-	id, err := api.ResolveAPIKey(context.Background(), "pk", "sk")
+	pub, priv := api.Credentials()
+	id, err := api.ResolveAPIKey(context.Background(), pub, priv)
 	if err != nil {
 		t.Fatalf("ResolveAPIKey: %v", err)
 	}
@@ -65,7 +69,7 @@ func TestIsPortConflictError(t *testing.T) {
 }
 
 func TestLocalClustersAPIAllocateHostPortSkipsUsedAndReserved(t *testing.T) {
-	api := NewLocalClustersAPI(LocalClustersAPIConfig{Host: "127.0.0.1"})
+	api := mustLocalClustersAPI(t, LocalClustersAPIConfig{Host: "127.0.0.1"})
 	// Reserve a wide range of recently-picked ports by marking them used via clusters.
 	// allocateHostPort must still find a free OS port not in that set.
 	api.mu.Lock()
@@ -89,7 +93,7 @@ func TestLocalClustersAPIAllocateHostPortSkipsUsedAndReserved(t *testing.T) {
 }
 
 func TestLocalClustersAPIPatchAndListInMemory(t *testing.T) {
-	api := NewLocalClustersAPI(LocalClustersAPIConfig{Host: "127.0.0.1"})
+	api := mustLocalClustersAPI(t, LocalClustersAPIConfig{Host: "127.0.0.1"})
 	// Inject a fake cluster without docker.
 	api.mu.Lock()
 	api.clusters["c1"] = &localCluster{info: clusterInfo{
@@ -106,18 +110,92 @@ func TestLocalClustersAPIPatchAndListInMemory(t *testing.T) {
 		"updateMask": "spendingLimit.monthly",
 		"cluster":    map[string]any{"spendingLimit": map[string]int32{"monthly": 42}},
 	})
-	if err := api.PatchCluster(context.Background(), "pk", "sk", "c1", body); err != nil {
+	pub, priv := api.Credentials()
+	if err := api.PatchCluster(context.Background(), pub, priv, "c1", body); err != nil {
 		t.Fatalf("PatchCluster: %v", err)
 	}
-	got, err := api.GetCluster(context.Background(), "pk", "sk", "c1")
+	got, err := api.GetCluster(context.Background(), pub, priv, "c1")
 	if err != nil {
 		t.Fatalf("GetCluster: %v", err)
 	}
 	if got.SpendingLimit == nil || got.SpendingLimit.Monthly != 42 {
 		t.Fatalf("spending = %#v", got.SpendingLimit)
 	}
-	list, _, err := api.ListClusters(context.Background(), "pk", "sk", nil)
+	list, _, err := api.ListClusters(context.Background(), pub, priv, nil)
 	if err != nil || len(list) != 1 {
 		t.Fatalf("ListClusters = %d err=%v", len(list), err)
+	}
+}
+
+func mustLocalClustersAPI(t *testing.T, cfg LocalClustersAPIConfig) *LocalClustersAPI {
+	t.Helper()
+	api, err := NewLocalClustersAPI(cfg)
+	if err != nil {
+		t.Fatalf("NewLocalClustersAPI: %v", err)
+	}
+	return api
+}
+
+// The local control plane must accept exactly the key pair it owns. Before this
+// was enforced, any non-empty caller-chosen pair resolved to org:owner on every
+// cluster, admin and quota path.
+func TestLocalClustersAPIRejectsCallerChosenCredentialPair(t *testing.T) {
+	api := mustLocalClustersAPI(t, LocalClustersAPIConfig{
+		Runtime:    "false-runtime",
+		Image:      "unused",
+		Host:       "127.0.0.1",
+		PublicKey:  "pinned-public",
+		PrivateKey: "pinned-private",
+	})
+	if _, err := api.ResolveAPIKey(context.Background(), api.credential.publicKey, api.credential.privateKey); err != nil {
+		t.Fatalf("pinned pair rejected: %v", err)
+	}
+	for _, tc := range []struct{ pub, priv string }{
+		{"attacker", "attacker"},
+		{"pinned-public", "wrong"},
+		{"wrong", "pinned-private"},
+	} {
+		if _, err := api.ResolveAPIKey(context.Background(), tc.pub, tc.priv); err == nil {
+			t.Fatalf("ResolveAPIKey(%q, %q) succeeded, want 401", tc.pub, tc.priv)
+		}
+	}
+}
+
+func TestResolveLocalCredentialPinsOrGenerates(t *testing.T) {
+	cred, err := resolveLocalCredential("pk-1", "sk-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cred.publicKey != "pk-1" || cred.privateKey != "sk-1" {
+		t.Fatalf("pinned credential = %+v", cred)
+	}
+
+	generated, err := resolveLocalCredential("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if generated.publicKey == "" || generated.privateKey == "" {
+		t.Fatalf("generated credential is incomplete: %+v", generated)
+	}
+	if generated.publicKey == generated.privateKey {
+		t.Fatal("generated halves must differ")
+	}
+	if !strings.HasPrefix(generated.publicKey, localCredentialKeyPrefix) ||
+		!strings.HasPrefix(generated.privateKey, localCredentialKeyPrefix) {
+		t.Fatalf("generated credential lacks its prefix: %+v", generated)
+	}
+	again, err := resolveLocalCredential("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.publicKey == generated.publicKey {
+		t.Fatal("per-process credential must not be a constant")
+	}
+
+	if _, err := resolveLocalCredential("only-public", ""); err == nil {
+		t.Fatal("expected a half-pinned pair to be rejected")
+	}
+	if _, err := resolveLocalCredential("pk", "sk\x01"); err == nil {
+		t.Fatal("expected a control character to be rejected")
 	}
 }

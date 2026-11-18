@@ -11,6 +11,12 @@ import (
 
 type LocalAESEncryptor struct {
 	gcm cipher.AEAD
+	// previous holds retired master keys. Decryption tries the primary key and
+	// then each retired key, so a rotation (new DRIVE9_MASTER_KEY plus the old
+	// key in DRIVE9_MASTER_KEY_PREVIOUS) reads existing ciphertext while every
+	// new write uses the primary. Without this there was no way to retire a
+	// leaked master key without losing the data it protects.
+	previous []cipher.AEAD
 }
 
 func NewLocalAESEncryptor(masterKey []byte) (*LocalAESEncryptor, error) {
@@ -41,5 +47,49 @@ func (e *LocalAESEncryptor) Decrypt(_ context.Context, ciphertext []byte) ([]byt
 	if len(ciphertext) < ns {
 		return nil, fmt.Errorf("ciphertext too short")
 	}
-	return e.gcm.Open(nil, ciphertext[:ns], ciphertext[ns:], nil)
+	if plain, err := e.gcm.Open(nil, ciphertext[:ns], ciphertext[ns:], nil); err == nil {
+		return plain, nil
+	}
+	for _, gcm := range e.previous {
+		if plain, err := gcm.Open(nil, ciphertext[:ns], ciphertext[ns:], nil); err == nil {
+			return plain, nil
+		}
+	}
+	return nil, fmt.Errorf("decrypt: no master key matches this ciphertext")
+}
+
+// NewLocalAESEncryptorWithPrevious creates a rotating encryptor: writes use
+// primary, reads also try previous (retired) keys.
+//
+// Rotation across a rolling deployment takes three phases, because a pod can
+// only read values written with a key it was started with:
+//
+//  1. Stage: restart every pod with the CURRENT key as primary and the FUTURE
+//     key appended to previous. Nothing is written with the future key yet, but
+//     every pod can now decrypt values it writes.
+//  2. Promote: restart with the future key as primary and the current key in
+//     previous. Pods still on the old configuration in phase 1 can read the new
+//     values, so no read fails mid-rollout.
+//  3. Retire: once every stored value has been rewritten with the new primary,
+//     drop the old key from previous.
+func NewLocalAESEncryptorWithPrevious(primary []byte, previous [][]byte) (*LocalAESEncryptor, error) {
+	enc, err := NewLocalAESEncryptor(primary)
+	if err != nil {
+		return nil, err
+	}
+	for _, key := range previous {
+		if len(key) != 32 {
+			return nil, fmt.Errorf("previous master key must be 32 bytes, got %d", len(key))
+		}
+		block, err := aes.NewCipher(key)
+		if err != nil {
+			return nil, fmt.Errorf("previous master key: %w", err)
+		}
+		gcm, err := cipher.NewGCM(block)
+		if err != nil {
+			return nil, fmt.Errorf("previous master key: %w", err)
+		}
+		enc.previous = append(enc.previous, gcm)
+	}
+	return enc, nil
 }

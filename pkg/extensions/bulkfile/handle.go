@@ -35,6 +35,7 @@ type streamHandle struct {
 	refs        int
 	mode        uint32
 	pushed      int64 // image size already expressed below; a shorter image needs a truncation
+	sizeUnknown bool  // the open below answered no size; the next push truncates the file to the image
 	dirty       bool  // image differs from the state expressed below
 	unlinked    bool  // directory entry gone; boundary pushes are discarded
 	released    bool
@@ -597,7 +598,7 @@ func (h *streamHandle) push(ctx context.Context) error {
 		}
 		h.inner = inner
 	}
-	if int64(len(h.image)) < h.pushed {
+	if int64(len(h.image)) < h.pushed || h.sizeUnknown {
 		size := int64(len(h.image))
 		h.mu.Unlock()
 		err := h.below.SetAttr(ctx, h.path, fs.AttrPatch{Size: &size})
@@ -605,6 +606,9 @@ func (h *streamHandle) push(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		// Only a successful truncation retires the unknown-size state —
+		// the image was never comparable against the file below.
+		h.sizeUnknown = false
 	}
 	if len(h.image) > 0 {
 		if err := h.inner.Write(ctx, 0, h.image); err != nil {

@@ -182,4 +182,12 @@ func (w *SSE) handleReset(reset *client.ResetEvent) {
 		w.opts.Notify.InvalidateAll()
 	}
 	w.unverified = false
+	// The reset itself completed the catch-up: the stream is current
+	// again, so the consumers that suspend same-origin proofs on
+	// EventUnverified (writeback's landed records) may resume. Without
+	// this, a reset-only reconnect leaves them suspended forever — and a
+	// plain EventCheckout must NOT resume them, because unrelated view
+	// resets (a 401, a layer switch) emit it while the stream is still
+	// down.
+	w.emit(fs.Event{Kind: fs.EventVerified, Path: "/"})
 }
