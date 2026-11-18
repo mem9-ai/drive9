@@ -29,6 +29,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/fs"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/httperr"
+	"github.com/mem9-ai/drive9/pkg/fusecomp/membudget"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/writebuffer"
 )
 
@@ -82,6 +83,9 @@ type AppendLog struct {
 	events     *fs.EventBus
 	tempDir    string
 	syncPolicy string
+	// budget is the process-wide memory budget the handle write buffers
+	// charge (nil disables the charge).
+	budget *membudget.Budget
 	// live indexes open protocol handles by path (SetAttr interception,
 	// unlink/rename retargeting).
 	live sync.Map
@@ -2092,6 +2096,15 @@ func (h *Handle) observeCommittedWALHeaderLocked(header sqliteWALHeader) {
 	h.st.clearSQLiteWALHeaderWrite()
 }
 
+// SetMemoryBudget wires the process-wide memory budget this extension's
+// handle write buffers charge their retained bytes to.
+func (a *AppendLog) SetMemoryBudget(b *membudget.Budget) {
+	if a == nil {
+		return
+	}
+	a.budget = b
+}
+
 // ensureBuffer creates the write buffer. Existing files keep their base
 // lazy: parts load from the chain on first touch, so memory stays
 // proportional to the touched regions.
@@ -2100,6 +2113,7 @@ func (h *Handle) ensureBuffer(ctx context.Context) error {
 		return nil
 	}
 	h.buf = writebuffer.NewWriteBuffer(h.path, bufferedMaxTotal, 0)
+	h.buf.SetMemoryBudget(h.a.budget)
 	if h.isNew || h.inner == nil || h.origSize <= 0 {
 		return nil
 	}

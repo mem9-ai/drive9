@@ -435,6 +435,7 @@ func (w *Writeback) truncateOwnerUnderSiblings(ctx context.Context, owner *buffe
 		// truncate's own commit boundary).
 		if img := w.newestStagedInodeImage(ino, owner.path); len(img) > 0 {
 			owner.buf = writebuffer.NewWriteBuffer(owner.path, 0, 0)
+			owner.buf.SetMemoryBudget(owner.w.budget)
 			if _, err := owner.buf.Write(0, img); err != nil {
 				return err
 			}

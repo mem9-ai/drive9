@@ -6,6 +6,8 @@ package writebuffer
 import (
 	"fmt"
 	"syscall"
+
+	"github.com/mem9-ai/drive9/pkg/fusecomp/membudget"
 )
 
 // SmallFileThreshold is the static small-file cutoff used by callers
@@ -95,6 +97,11 @@ type WriteBuffer struct {
 
 	// Memory tracking
 	curMemory int64 // current bytes held in parts map
+	// budget, when set, is charged for every byte retained in parts or
+	// smallFileData and released when that memory is dropped. A nil budget
+	// keeps the pre-budget behavior: only the per-file caps apply, so N open
+	// writable handles can hold N buffers at once.
+	budget *membudget.Budget
 
 	// Sequential write detection
 	appendCursor int64 // end of highest contiguous write; updated only on sequential writes
@@ -135,6 +142,52 @@ func NewWriteBuffer(path string, maxSize int64, partSize int64) *WriteBuffer {
 		smallFileMax: defaultSmallFileThreshold,
 		parts:        make(map[int][]byte),
 		dirtyParts:   make(map[int]bool),
+	}
+}
+
+// SetMemoryBudget wires the process-wide memory budget the buffer charges its
+// retained bytes to. It must be called before the first Write/Truncate; a nil
+// budget disables accounting.
+func (wb *WriteBuffer) SetMemoryBudget(b *membudget.Budget) {
+	if wb == nil {
+		return
+	}
+	wb.budget = b
+}
+
+// MemoryBudget reports the budget this buffer charges, if any.
+func (wb *WriteBuffer) MemoryBudget() *membudget.Budget {
+	if wb == nil {
+		return nil
+	}
+	return wb.budget
+}
+
+// addMemory charges n bytes against the memory budget and records them.
+// It returns syscall.ENOMEM when the budget refuses the allocation, leaving
+// the buffer unchanged so the caller can fail the write without corrupting
+// the staged image.
+func (wb *WriteBuffer) addMemory(n int64) error {
+	if wb == nil || n <= 0 {
+		return nil
+	}
+	if wb.budget != nil {
+		if err := wb.budget.Acquire(membudget.ClassWriteBuffer, n); err != nil {
+			return syscall.ENOMEM
+		}
+	}
+	wb.curMemory += n
+	return nil
+}
+
+// subMemory drops n bytes of retained memory (releasing the budget charge).
+func (wb *WriteBuffer) subMemory(n int64) {
+	if wb == nil || n <= 0 {
+		return
+	}
+	wb.curMemory -= n
+	if wb.budget != nil {
+		wb.budget.Release(membudget.ClassWriteBuffer, n)
 	}
 }
 
@@ -211,15 +264,24 @@ func (wb *WriteBuffer) Write(offset int64, data []byte) (uint32, error) {
 				neededLen = wb.partSize
 			}
 			oldLen := int64(len(part))
-			if neededLen <= int64(cap(part)) {
+			// Account the ALLOCATION, not the logical length: a part grows
+			// by doubling, and the retained heap is the capacity.
+			oldCap := int64(cap(part))
+			newCap := oldCap
+			if neededLen > oldCap {
+				newCap = growPartCapacity(oldCap, neededLen, wb.partSize)
+				if err := wb.addMemory(newCap - oldCap); err != nil {
+					return uint32(dataOff), err
+				}
+			}
+			if neededLen <= oldCap {
 				part = part[:neededLen]
 				clear(part[oldLen:])
 			} else {
-				grown := make([]byte, neededLen, growPartCapacity(int64(cap(part)), neededLen, wb.partSize))
+				grown := make([]byte, neededLen, newCap)
 				copy(grown, part)
 				part = grown
 			}
-			wb.curMemory += neededLen - oldLen
 			wb.parts[partIdx] = part
 		}
 
@@ -282,7 +344,9 @@ func (wb *WriteBuffer) writeSmallFile(offset int64, data []byte) (uint32, error)
 	}
 	if end > wb.smallFileMax {
 		// Migrate to part mode and retry
-		wb.migrateToPartMode()
+		if err := wb.migrateToPartMode(); err != nil {
+			return 0, err
+		}
 		return wb.Write(offset, data)
 	}
 
@@ -337,16 +401,26 @@ func (wb *WriteBuffer) writeSmallFile(offset int64, data []byte) (uint32, error)
 
 // migrateToPartMode transfers smallFileData into the sparse part map and
 // clears smallFileData. Called when a write exceeds smallFileThreshold.
-func (wb *WriteBuffer) migrateToPartMode() {
+//
+// The small-file fast path is not charged to the memory budget while it is in
+// use (a buffer there never exceeds SmallFileThreshold); the new part
+// allocation is charged here. A refused charge leaves the small-file image
+// untouched so the caller can fail the operation without losing data.
+func (wb *WriteBuffer) migrateToPartMode() error {
 	if len(wb.smallFileData) == 0 {
 		wb.smallFileData = nil
-		return
+		return nil
+	}
+	size := int64(len(wb.smallFileData))
+	if err := wb.addMemory(size); err != nil {
+		return err
 	}
 	// Transfer data to part 0
-	wb.parts[0] = make([]byte, len(wb.smallFileData))
-	copy(wb.parts[0], wb.smallFileData)
-	wb.curMemory = int64(len(wb.smallFileData))
+	part := make([]byte, size)
+	copy(part, wb.smallFileData)
+	wb.parts[0] = part
 	wb.smallFileData = nil
+	return nil
 }
 
 // ensurePart makes sure a part exists in the map. If it doesn't exist
@@ -381,15 +455,19 @@ func (wb *WriteBuffer) ensurePart(partIdx int) error {
 			return err
 		}
 		if restored {
+			if err := wb.addMemory(int64(len(data))); err != nil {
+				return err
+			}
 			wb.parts[partIdx] = data
-			wb.curMemory += int64(len(data))
 			return nil
 		}
 		safeLogPrintf("WARNING: back-write to evicted part %d of %s — "+
 			"non-written bytes will be zero (original data already uploaded to S3)", partIdx, wb.path)
 		data = make([]byte, wb.partSize)
+		if err := wb.addMemory(wb.partSize); err != nil {
+			return err
+		}
 		wb.parts[partIdx] = data
-		wb.curMemory += wb.partSize
 		return nil
 	}
 
@@ -401,8 +479,10 @@ func (wb *WriteBuffer) ensurePart(partIdx int) error {
 			if err != nil {
 				return err
 			}
+			if err := wb.addMemory(int64(len(data))); err != nil {
+				return err
+			}
 			wb.parts[partIdx] = data
-			wb.curMemory += int64(len(data))
 			return nil
 		}
 	}
@@ -551,7 +631,7 @@ func (wb *WriteBuffer) Truncate(size int64) error {
 		newPartCount := int((size + wb.partSize - 1) / wb.partSize)
 		for idx := range wb.parts {
 			if idx >= newPartCount {
-				wb.curMemory -= int64(len(wb.parts[idx]))
+				wb.subMemory(int64(cap(wb.parts[idx])))
 				delete(wb.parts, idx)
 				delete(wb.dirtyParts, idx)
 			}
@@ -567,7 +647,6 @@ func (wb *WriteBuffer) Truncate(size int64) error {
 			lastIdx := newPartCount - 1
 			partOff := size - int64(lastIdx)*wb.partSize
 			if part, ok := wb.parts[lastIdx]; ok && int64(len(part)) > partOff {
-				wb.curMemory -= int64(len(part)) - partOff
 				wb.parts[lastIdx] = part[:partOff]
 			}
 		}
@@ -607,7 +686,9 @@ func (wb *WriteBuffer) Truncate(size int64) error {
 				return nil
 			}
 			// Migrate to part mode for larger size
-			wb.migrateToPartMode()
+			if err := wb.migrateToPartMode(); err != nil {
+				return err
+			}
 			return wb.Truncate(size)
 		}
 		if cur > 0 && cur%wb.partSize != 0 {
@@ -957,8 +1038,10 @@ func (wb *WriteBuffer) LoadMissingParts() error {
 				return err
 			}
 			if restored {
+				if err := wb.addMemory(int64(len(data))); err != nil {
+					return err
+				}
 				wb.parts[idx] = data
-				wb.curMemory += int64(len(data))
 				continue
 			}
 			return fmt.Errorf("part %d was evicted after streaming upload and cannot be refetched", idx+1)
@@ -970,8 +1053,10 @@ func (wb *WriteBuffer) LoadMissingParts() error {
 		if err != nil {
 			return fmt.Errorf("load part %d: %w", idx+1, err)
 		}
+		if err := wb.addMemory(int64(len(data))); err != nil {
+			return fmt.Errorf("load part %d: %w", idx+1, err)
+		}
 		wb.parts[idx] = data
-		wb.curMemory += int64(len(data))
 	}
 	return nil
 }
@@ -984,7 +1069,7 @@ func (wb *WriteBuffer) Reset() {
 	wb.parts = make(map[int][]byte)
 	wb.dirtyParts = make(map[int]bool)
 	wb.totalSize = 0
-	wb.curMemory = 0
+	wb.subMemory(wb.curMemory)
 	wb.smallFileData = nil
 }
 
@@ -1011,7 +1096,7 @@ func (wb *WriteBuffer) EnsureLoaded(partIdx int) error {
 // dirty parts are the handle's own data and stay).
 func (wb *WriteBuffer) ReleaseCleanPart(partIdx int) {
 	if part, ok := wb.parts[partIdx]; ok && !wb.dirtyParts[partIdx] {
-		wb.curMemory -= int64(len(part))
+		wb.subMemory(int64(cap(part)))
 		delete(wb.parts, partIdx)
 	}
 }
@@ -1052,12 +1137,16 @@ func (wb *WriteBuffer) EvictPart(partIdx int) {
 	wb.uploadedParts[partIdx] = true
 
 	if wb.smallFileData != nil {
-		// Migrate to part mode before evicting
-		wb.migrateToPartMode()
+		// Migrate to part mode before evicting. A refused migration (memory
+		// budget) keeps the small-file image intact and skips the eviction:
+		// dropping it here would lose acknowledged bytes.
+		if err := wb.migrateToPartMode(); err != nil {
+			return
+		}
 	}
 
 	if part, ok := wb.parts[partIdx]; ok {
-		wb.curMemory -= int64(len(part))
+		wb.subMemory(int64(cap(part)))
 		delete(wb.parts, partIdx)
 	}
 }

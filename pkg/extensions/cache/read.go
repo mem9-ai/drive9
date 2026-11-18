@@ -5,6 +5,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/mem9-ai/drive9/pkg/fusecomp/membudget"
 )
 
 const (
@@ -39,6 +41,10 @@ type ReadCache struct {
 	maxSize int64
 	maxFile int64
 	ttl     time.Duration
+	// budget, when set, is charged for the bytes this cache retains. A short
+	// budget degrades the cache (entries are not retained); it never fails
+	// the read that was being cached.
+	budget *membudget.Budget
 }
 
 // cacheEntry holds a single cached file's data and metadata.
@@ -77,6 +83,67 @@ func NewReadCacheWithMaxFileSize(maxSize int64, ttl time.Duration, maxFileSize i
 		maxFile: maxFileSize,
 		ttl:     ttl,
 	}
+}
+
+// SetMemoryBudget wires the process-wide memory budget this cache charges its
+// retained payloads to. A nil budget disables the charge (the local maxSize
+// LRU still applies).
+func (rc *ReadCache) SetMemoryBudget(b *membudget.Budget) {
+	if rc == nil {
+		return
+	}
+	rc.mu.Lock()
+	rc.budget = b
+	rc.mu.Unlock()
+	if b != nil {
+		// Cached read images are the cheapest bytes to give back when a
+		// write buffer needs room.
+		b.RegisterReclaimer(membudget.ClassReadCache, rc.ReclaimBytes)
+	}
+}
+
+// ReclaimBytes evicts LRU entries until at least target bytes are freed and
+// reports how many bytes it actually freed. It is the budget's reclaimer hook
+// for this cache.
+func (rc *ReadCache) ReclaimBytes(target int64) int64 {
+	if rc == nil || target <= 0 {
+		return 0
+	}
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	var freed int64
+	for freed < target {
+		tail := rc.order.Back()
+		if tail == nil {
+			break
+		}
+		entry, ok := tail.Value.(*cacheEntry)
+		if !ok {
+			break
+		}
+		freed += int64(len(entry.data))
+		rc.evict(entry)
+	}
+	return freed
+}
+
+// releaseLocked returns the budget charge of bytes this cache no longer
+// retains (a replaced entry). The caller must hold rc.mu.
+func (rc *ReadCache) releaseLocked(n int64) {
+	if rc.budget == nil || n <= 0 {
+		return
+	}
+	rc.budget.Release(membudget.ClassReadCache, n)
+}
+
+// Size reports the bytes currently retained.
+func (rc *ReadCache) Size() int64 {
+	if rc == nil {
+		return 0
+	}
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	return rc.size
 }
 
 // MaxFileSize returns the largest payload admitted into this cache.
@@ -208,6 +275,9 @@ func (rc *ReadCache) InvalidateAll() {
 
 	rc.items = make(map[string]*cacheEntry)
 	rc.order.Init()
+	if rc.budget != nil {
+		rc.budget.Release(membudget.ClassReadCache, rc.size)
+	}
 	rc.size = 0
 }
 
@@ -226,6 +296,14 @@ func (rc *ReadCache) putUncapped(path string, data []byte, revision int64, clone
 	defer rc.mu.Unlock()
 
 	dataLen := int64(len(data))
+	// Charge the full payload first: a cache insert is allowed to degrade
+	// (the entry is simply not retained), never to fail. chargeLocked may
+	// evict this cache's own LRU tail, so the entry is looked up again below
+	// and a surviving replaced entry gives its old bytes back then.
+	if !rc.chargeLocked(dataLen) {
+		return
+	}
+
 	stored := data
 	if clone {
 		stored = make([]byte, dataLen)
@@ -236,7 +314,9 @@ func (rc *ReadCache) putUncapped(path string, data []byte, revision int64, clone
 
 	if existing, ok := rc.items[path]; ok {
 		// Update existing entry.
-		rc.size -= int64(len(existing.data))
+		oldLen := int64(len(existing.data))
+		rc.size -= oldLen
+		rc.releaseLocked(oldLen)
 		existing.data = stored
 		existing.revision = revision
 		existing.expires = now.Add(rc.ttl)
@@ -270,5 +350,29 @@ func (rc *ReadCache) putUncapped(path string, data []byte, revision int64, clone
 func (rc *ReadCache) evict(entry *cacheEntry) {
 	delete(rc.items, entry.path)
 	rc.order.Remove(entry.elem)
-	rc.size -= int64(len(entry.data))
+	size := int64(len(entry.data))
+	rc.size -= size
+	if rc.budget != nil {
+		rc.budget.Release(membudget.ClassReadCache, size)
+	}
+}
+
+// chargeLocked reserves n bytes of the process memory budget, evicting this
+// cache's own LRU tail while the budget is short. It reports whether the
+// payload may be retained. The caller must hold rc.mu; the budget call is
+// Charge (never Acquire) so no reclaimer can re-enter this lock.
+func (rc *ReadCache) chargeLocked(n int64) bool {
+	if rc.budget == nil || n <= 0 {
+		return true
+	}
+	for {
+		if rc.budget.Charge(membudget.ClassReadCache, n) == nil {
+			return true
+		}
+		tail := rc.order.Back()
+		if tail == nil {
+			return false
+		}
+		rc.evict(tail.Value.(*cacheEntry))
+	}
 }

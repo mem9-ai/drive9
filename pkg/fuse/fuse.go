@@ -29,6 +29,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/extensions/core"
 	"github.com/mem9-ai/drive9/pkg/fs"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/dircache"
+	"github.com/mem9-ai/drive9/pkg/fusecomp/membudget"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/perf"
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/mountcontrol"
@@ -92,6 +93,11 @@ type Options struct {
 	// extensions that own directories (localize, layer) need their overlay
 	// consulted instead, so mount clears it for those stacks.
 	LocalDirAttrs bool
+
+	// MemoryBudget is the process-wide memory budget. The facade charges the
+	// inode table to it and injects it into every extension that retains
+	// in-memory write buffers. Nil disables the budget.
+	MemoryBudget *membudget.Budget
 }
 
 // FS is the gofuse facade kernel: RawFilesystem translation, identity
@@ -178,6 +184,9 @@ type FS struct {
 	// drainMu serializes concurrent drains (v1): syncfs(2) and the mount
 	// control socket must not interleave quiesce phases.
 	drainMu sync.Mutex
+	// budget is the process-wide memory budget (nil when disabled). Retained
+	// for the drain/status snapshot.
+	budget *membudget.Budget
 }
 
 // New assembles the facade: chain, Context, and identity tables. Register
@@ -226,6 +235,8 @@ func New(opts Options) (*FS, error) {
 	// A detached unreferenced entry must survive while an open descriptor
 	// still resolves through its nodeid (a forgotten dentry with a live fd
 	// holds no Nlookup reference the release check could see).
+	f.budget = opts.MemoryBudget
+	f.inodes.SetMemoryBudget(f.budget)
 	f.inodes.HasLiveUse = func(ino uint64) bool {
 		if f.openIdx.HasOpenInode(ino) {
 			return true
@@ -297,6 +308,13 @@ func New(opts Options) (*FS, error) {
 		if it, ok := h.(interface{ SetInodeTable(fs.InodeTable) }); ok {
 			// Alias-truncate sync walks the inode's hardlink paths.
 			it.SetInodeTable(f.Ctx.Inodes)
+		}
+		if mb, ok := h.(interface {
+			SetMemoryBudget(*membudget.Budget)
+		}); ok && f.budget != nil {
+			// Data planes that buffer per-file writes charge the process
+			// memory budget: N open large files otherwise pin N buffers.
+			mb.SetMemoryBudget(f.budget)
 		}
 		if th, ok := h.(interface {
 			EntryTTLHint(path string) (time.Duration, bool)
@@ -736,6 +754,14 @@ func classifyDrainErr(err error) string {
 		return "remote_timeout_or_retryable"
 	}
 	return "drain"
+}
+
+// MemoryBudget reports the process-wide memory budget (nil when disabled).
+func (f *FS) MemoryBudget() *membudget.Budget {
+	if f == nil {
+		return nil
+	}
+	return f.budget
 }
 
 // Drain quiesces the mount for `drive9 mount drain` (v1 phase shape): open

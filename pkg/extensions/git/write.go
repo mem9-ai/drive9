@@ -12,6 +12,7 @@ import (
 
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/fs"
+	"github.com/mem9-ai/drive9/pkg/fusecomp/membudget"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/writebuffer"
 )
 
@@ -310,6 +311,15 @@ func (h *gitHandle) commit(ctx context.Context) error {
 	return nil
 }
 
+// SetMemoryBudget wires the process-wide memory budget this extension's
+// handle write buffers charge their retained bytes to.
+func (g *Git) SetMemoryBudget(b *membudget.Budget) {
+	if g == nil {
+		return
+	}
+	g.budget = b
+}
+
 // ensureBufferLocked creates the write buffer over the current image:
 // overlay content preloads first, then the clean-tree blob (an in-place
 // modify of a tree file buffers the tree object — v1 readGitCleanFile),
@@ -322,6 +332,7 @@ func (h *gitHandle) ensureBufferLocked(ctx context.Context) error {
 		return nil
 	}
 	h.buf = writebuffer.NewWriteBuffer(h.path, bufferedMaxTotal, 0)
+	h.buf.SetMemoryBudget(h.g.budget)
 	if h.fresh {
 		// A recreated name owns an empty image: preloading the overlay,
 		// clean-tree blob or remote base would resurrect the deleted

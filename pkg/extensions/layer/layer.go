@@ -16,6 +16,7 @@ import (
 
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/fs"
+	"github.com/mem9-ai/drive9/pkg/fusecomp/membudget"
 )
 
 // errLayerRolledBack fails every overlay mutation after a rollback event.
@@ -46,6 +47,9 @@ type Layer struct {
 	checkpoint string
 	root       string
 	events     *fs.EventBus
+	// budget is the process-wide memory budget the handle write buffers
+	// charge (nil disables the charge).
+	budget *membudget.Budget
 
 	mu        sync.RWMutex
 	whiteouts map[string]struct{}

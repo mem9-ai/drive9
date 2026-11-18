@@ -18,6 +18,7 @@ import (
 
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/fs"
+	"github.com/mem9-ai/drive9/pkg/fusecomp/membudget"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/writebuffer"
 )
 
@@ -32,6 +33,11 @@ type Options struct {
 	TTL         time.Duration
 	MaxFileSize int64
 	Disk        DiskReadCacheOptions // Dir empty disables the disk cache
+
+	// MemoryBudget is the process-wide memory budget the in-memory cache
+	// charges its retained payloads to. Nil disables the charge (the local
+	// MaxSize LRU still applies).
+	MemoryBudget *membudget.Budget
 
 	// Events, when set, subscribes this cache to mutation events: every
 	// mutation invalidates the cached image, directory-level events sweep
@@ -176,12 +182,22 @@ type cachingHandle struct {
 	mu          sync.Mutex
 }
 
+// SetMemoryBudget wires the process-wide memory budget this extension's
+// in-memory read cache charges its retained payloads to.
+func (c *Cache) SetMemoryBudget(b *membudget.Budget) {
+	if c == nil || c.mem == nil {
+		return
+	}
+	c.mem.SetMemoryBudget(b)
+}
+
 // New constructs the read-plane cache.
 func New(opts Options) (*Cache, error) {
 	c := &Cache{opts: opts,
 		dirty: map[string]int{},
 		mem:   NewReadCacheWithMaxFileSize(opts.MaxSize, opts.TTL, opts.MaxFileSize),
 	}
+	c.mem.SetMemoryBudget(opts.MemoryBudget)
 	if opts.Disk.Dir != "" {
 		d, err := NewDiskReadCache(opts.Disk)
 		if err != nil {

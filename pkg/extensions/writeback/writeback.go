@@ -31,6 +31,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/fs"
 	flushdebounce "github.com/mem9-ai/drive9/pkg/fusecomp/debounce"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/httperr"
+	"github.com/mem9-ai/drive9/pkg/fusecomp/membudget"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/staging"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/writebuffer"
 	"github.com/mem9-ai/drive9/pkg/pathfilter"
@@ -206,6 +207,9 @@ type Writeback struct {
 	survivorOf func(path string) (string, bool)
 	// inodes is the facade's identity table (alias-truncate sync; optional).
 	inodes fs.InodeTable
+	// budget is the process-wide memory budget the per-handle write buffers
+	// charge (nil disables the charge).
+	budget *membudget.Budget
 
 	// wbCache/uploader form the small-file writeback track (.dat/.meta
 	// disk cache + 16-worker uploader), active when WriteCacheDir is set.
@@ -908,6 +912,21 @@ func (w *Writeback) commitSeedAllowed(size int64) bool {
 // extension's SeedPending).
 func (w *Writeback) SetPendingSeeder(fn func(path string, data []byte)) {
 	w.pendingSeeder = fn
+}
+
+// SetMemoryBudget wires the process-wide memory budget the handle write
+// buffers charge their retained bytes to. It must be called before the mount
+// serves requests (the mount does this at stack construction).
+func (w *Writeback) SetMemoryBudget(b *membudget.Budget) {
+	if w == nil {
+		return
+	}
+	w.budget = b
+	// The small-file write-back payload cache holds bytes in memory too, so
+	// it charges the same budget.
+	if w.wbCache != nil {
+		w.wbCache.SetMemoryBudget(b)
+	}
 }
 
 // SetBaseReader wires the read-cache base-preload hook; nil keeps the
@@ -5627,11 +5646,11 @@ func (w *Writeback) probeRemoteAuthoritative(ctx context.Context, path string) (
 		return fs.Attr{}, err
 	}
 	attr := fs.Attr{
-		Kind:   fs.KindFile,
-		Size:   st.Size,
-		Rev:    st.Revision,
-		Mtime:  st.Mtime,
-		Nlink:  st.Nlink,
+		Kind:      fs.KindFile,
+		Size:      st.Size,
+		Rev:       st.Revision,
+		Mtime:     st.Mtime,
+		Nlink:     st.Nlink,
 		ExtentIno: st.ExtentIno,
 	}
 	if st.IsDir {
@@ -6406,6 +6425,7 @@ func (h *bufferingHandle) ensureBufferLocked(ctx context.Context) error {
 		return nil
 	}
 	h.buf = writebuffer.NewWriteBuffer(h.path, bufferedMaxTotal, 0)
+	h.buf.SetMemoryBudget(h.w.budget)
 	// A failed base preload must not leave this provisional buffer
 	// behind: the next Write on the same descriptor would skip
 	// initialization entirely and commit a replacement containing only
@@ -6571,7 +6591,7 @@ func (h *bufferingHandle) ensureBufferLocked(ctx context.Context) error {
 		h.baseLoaded = true
 		return nil
 	}
-	if h.baseSize <= h.w.preload {
+	if h.baseSize <= h.w.preload && (h.w.budget == nil || h.w.budget.CanFit(h.baseSize)) {
 		// Preload the base cache-first (read its preload through the
 		// read cache): a just-committed image answers locally, so the
 		// materialization cannot 404 inside backend replica lag.
@@ -7173,7 +7193,7 @@ func (h *bufferingHandle) maybeArmStreaming() error {
 		return nil
 	}
 	h.streamArmed = true
-	if h.baseSize <= h.w.preload {
+	if h.baseSize <= h.w.preload && (h.w.budget == nil || h.w.budget.CanFit(h.baseSize)) {
 		return nil // small files buffer whole
 	}
 	h.stream = NewStreamUploader(h.w.opts.Client, h.path, h.baseRev, h.w.root)

@@ -14,6 +14,7 @@ import (
 
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/fs"
+	"github.com/mem9-ai/drive9/pkg/fusecomp/membudget"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/writebuffer"
 )
 
@@ -563,6 +564,15 @@ func entrySeqOf(e *client.FSLayerEntry) int64 {
 	return e.EntrySeq
 }
 
+// SetMemoryBudget wires the process-wide memory budget this extension's
+// handle write buffers charge their retained bytes to.
+func (l *Layer) SetMemoryBudget(b *membudget.Budget) {
+	if l == nil {
+		return
+	}
+	l.budget = b
+}
+
 // ensureBufferLocked creates the write buffer over the current image:
 // overlay content preloads, base objects stay lazy (parts load from the
 // remote on first touch), fresh files start empty.
@@ -571,6 +581,7 @@ func (h *layerHandle) ensureBufferLocked(ctx context.Context) error {
 		return nil
 	}
 	h.buf = writebuffer.NewWriteBuffer(h.path, bufferedMaxTotal, 0)
+	h.buf.SetMemoryBudget(h.l.budget)
 	if _, _, _, content, ok := h.l.lookup(h.path); ok && len(content) > 0 {
 		if _, err := h.buf.Write(0, content); err != nil {
 			return err

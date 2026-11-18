@@ -35,6 +35,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/extensions/writeback"
 	"github.com/mem9-ai/drive9/pkg/extensions/xattr"
 	"github.com/mem9-ai/drive9/pkg/fs"
+	"github.com/mem9-ai/drive9/pkg/fusecomp/membudget"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/perf"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/staging"
 	"github.com/mem9-ai/drive9/pkg/logger"
@@ -122,6 +123,10 @@ type MountConfig struct {
 	WriteBackBatchMaxBytes int64
 	WriteCacheFreeRatio    float64
 	WriteCacheSizeMB       int64
+	// MemoryBudget caps the process-wide in-memory footprint in bytes (see
+	// MountOptions.MemoryBudget); 0 disables it.
+	MemoryBudget     int64
+	MemoryBudgetMode string
 
 	ReadConcurrency         int
 	ParallelReadConcurrency int
@@ -382,6 +387,13 @@ type MountOptions struct {
 	WriteBackBatchMaxBytes        int64
 	WriteCacheFreeRatio           float64
 	WriteCacheSizeMB              int64
+	// MemoryBudget caps the process-wide in-memory footprint (read cache,
+	// write-back data cache, per-handle write buffers, inode table) in bytes.
+	// 0 disables the budget. MemoryBudgetMode selects what an over-budget
+	// allocation means: "" or "enforce" refuses it (caches degrade, writes
+	// fail with ENOMEM), "warn" admits and logs it.
+	MemoryBudget     int64
+	MemoryBudgetMode string
 	// ExtentCacheSize is the extent plane's disk cache budget (bytes;
 	// read cache and writeback staging share it).
 	ExtentCacheSize              int64
@@ -503,6 +515,8 @@ func mountConfigFromOptions(opts *MountOptions) MountConfig {
 		WriteBackBatchMaxBytes:        opts.WriteBackBatchMaxBytes,
 		WriteCacheFreeRatio:           opts.WriteCacheFreeRatio,
 		WriteCacheSizeMB:              opts.WriteCacheSizeMB,
+		MemoryBudget:                  opts.MemoryBudget,
+		MemoryBudgetMode:              opts.MemoryBudgetMode,
 		ReadConcurrency:               opts.ReadConcurrency,
 		ParallelReadConcurrency:       opts.ParallelReadConcurrency,
 		ParallelReadBlockSize:         opts.ParallelReadBlockSize,
@@ -842,6 +856,20 @@ func mountWithConfig(cfg MountConfig) error {
 	if coreExt != nil {
 		coreExt.AttachEvents(bus)
 	}
+	// Process-wide memory budget (v1 had none): the read cache, the
+	// write-back data cache, the per-handle write buffers and the inode table
+	// all charge their retained bytes here, so a mount with many large files
+	// open cannot grow RSS past the configured limit. Zero disables it and
+	// keeps the pre-budget behavior.
+	var memoryBudget *membudget.Budget
+	if cfg.MemoryBudget > 0 {
+		mode, merr := membudget.ParseMode(strings.TrimSpace(cfg.MemoryBudgetMode))
+		if merr != nil {
+			return fmt.Errorf("fuse: %w", merr)
+		}
+		memoryBudget = membudget.New(cfg.MemoryBudget, mode, logger.L())
+	}
+
 	var readCache *cache.Cache
 	if wantExt["cache"] {
 		// v1 always ran the in-memory read cache — it does not need a cache
@@ -855,6 +883,7 @@ func mountWithConfig(cfg MountConfig) error {
 			MaxSize:            cfg.CacheSize,
 			TTL:                cfg.ReadCacheTTL,
 			MaxFileSize:        cfg.ReadCacheMaxFileBytes,
+			MemoryBudget:       memoryBudget,
 			SequentialPrefetch: true,
 			PrefetchClient:     cl,
 			RemoteRoot:         remoteRoot,
@@ -1283,6 +1312,7 @@ func mountWithConfig(cfg MountConfig) error {
 		GVisorCompat:       cfg.GVisorCompat,
 		Uid:                uid,
 		Gid:                gid,
+		MemoryBudget:       memoryBudget,
 	})
 	if err != nil {
 		return fmt.Errorf("fuse: assemble facade: %w", err)
@@ -1480,6 +1510,9 @@ func mountWithConfig(cfg MountConfig) error {
 		if policy == writeback.PolicyWriteBack {
 			shadowDesc = cfg.CacheDir + "/staging/shadow"
 		}
+	}
+	if budget := f.MemoryBudget(); budget != nil {
+		fmt.Fprintf(os.Stderr, "drive9: memory budget: %s\n", budget.Snapshot().String())
 	}
 	fmt.Fprint(os.Stderr, readyMessage(cfg.MountPoint, cfg.Server, actorID, cfg.ReadOnly, policyString(policy), cacheDesc, shadowDesc, cfg.OmitProcessStateCredentials))
 

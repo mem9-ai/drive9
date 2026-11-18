@@ -336,6 +336,7 @@ func (h *bufferingHandle) adoptAppendImageLocked(image []byte, landedRev int64) 
 	// maxSize 0 keeps the default cap: sizing to the adopted image alone
 	// rejected the caller's subsequent append at the old tail.
 	next := writebuffer.NewWriteBuffer(h.path, 0, 0)
+	next.SetMemoryBudget(h.w.budget)
 	if len(image) > 0 {
 		if _, err := next.Write(0, image); err != nil {
 			return err

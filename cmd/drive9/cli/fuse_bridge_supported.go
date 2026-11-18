@@ -83,6 +83,8 @@ func mountFuseImpl(opts *mountFuseOptions) error {
 		WriteBackBatchMaxBytes:        opts.WriteBackBatchMaxBytes,
 		WriteCacheFreeRatio:           opts.WriteCacheFreeRatio,
 		WriteCacheSizeMB:              opts.WriteCacheSizeMB,
+		MemoryBudget:                  opts.MemoryBudget,
+		MemoryBudgetMode:              opts.MemoryBudgetMode,
 		ReadConcurrency:               opts.ReadConcurrency,
 		ParallelReadConcurrency:       opts.ParallelReadConcurrency,
 		ParallelReadBlockSize:         opts.ParallelReadBlockSize,
