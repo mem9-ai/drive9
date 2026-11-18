@@ -5,9 +5,12 @@ package tidbcloudnative
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/md5"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -440,35 +443,180 @@ func (p *Provisioner) EnsureDatabase(ctx context.Context, dsn string) error {
 	return nil
 }
 
-func (p *Provisioner) EnsureSystemUser(ctx context.Context, dsn, _ string) (string, string, error) {
-	cfg, err := mysql.ParseDSN(dsn)
+// EnsureSystemUser returns the restricted account's credential, and whether this call
+// actually applied the setup that revokes the legacy cluster-wide grant. A false second
+// result is not a failure: it means the stored credential could not prove the grant state
+// (an operator rotated the root password), so the caller must not claim remediation.
+func (p *Provisioner) EnsureSystemUser(ctx context.Context, dsn, tenantID string) (string, string, bool, error) {
+	target, err := resolveSystemUserTarget(dsn, tenantID)
 	if err != nil {
-		return "", "", fmt.Errorf("parse native tenant DSN: %w", err)
+		return "", "", false, err
 	}
-	username, needsSetup, err := systemUsernameForCurrent(cfg.User)
-	if err != nil {
-		return "", "", fmt.Errorf("resolve native system username: %w", err)
-	}
-	if cfg.Passwd == "" {
-		return "", "", fmt.Errorf("native tenant DSN password is empty")
-	}
+	cfg, username, dbName, needsSetup, password := target.cfg, target.username, target.dbName, target.needsSetup, target.password
 	if !needsSetup {
-		return cfg.User, cfg.Passwd, nil
+		// The DSN already names the restricted account. Either this version created it
+		// (derived password) or the legacy setup did, which copied the cluster root
+		// password into it. The two are told apart by whether the stored password still
+		// authenticates as the cluster root principal, and only the legacy one can be
+		// remediated from the stored credential.
+		rotated, err := rotateLegacySystemUser(ctx, cfg, username, dbName, password)
+		if err != nil {
+			return "", "", false, err
+		}
+		if !rotated {
+			// The account exists with a credential that is not the cluster root's, so this
+			// call did not run the setup and cannot vouch for the legacy grant.
+			return cfg.User, cfg.Passwd, false, nil
+		}
+		return username, password, true, nil
 	}
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
-		return "", "", fmt.Errorf("open native tenant database: %w", err)
+		return "", "", false, fmt.Errorf("open native tenant database: %w", err)
 	}
 	defer func() { _ = db.Close() }()
+	if err := ensureSystemUser(ctx, db, dbName, username, password); err != nil {
+		return "", "", false, fmt.Errorf("ensure native system user: %w", err)
+	}
+	return username, password, true, nil
+}
+
+// systemUserTarget is everything a credential setup or rotation needs from a tenant DSN, so
+// the two entry points cannot drift on how they parse one.
+type systemUserTarget struct {
+	cfg        *mysql.Config
+	username   string
+	dbName     string
+	password   string
+	needsSetup bool
+}
+
+// resolveSystemUserTarget parses the DSN and derives this tenant's credential. The derivation
+// is the reason both paths agree on one password: concurrent finalizers, a retry after a
+// partial failure and the leader's rotation all compute the same value.
+func resolveSystemUserTarget(dsn, tenantID string) (systemUserTarget, error) {
+	cfg, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		return systemUserTarget{}, fmt.Errorf("parse native tenant DSN: %w", err)
+	}
+	username, needsSetup, err := systemUsernameForCurrent(cfg.User)
+	if err != nil {
+		return systemUserTarget{}, fmt.Errorf("resolve native system username: %w", err)
+	}
+	if cfg.Passwd == "" {
+		return systemUserTarget{}, fmt.Errorf("native tenant DSN password is empty")
+	}
 	dbName, err := normalizeDatabaseName(cfg.DBName)
 	if err != nil {
-		return "", "", fmt.Errorf("resolve native system user database: %w", err)
+		return systemUserTarget{}, fmt.Errorf("resolve native system user database: %w", err)
 	}
-	password := cfg.Passwd
-	if err := ensureSystemUser(ctx, db, dbName, username, password); err != nil {
-		return "", "", fmt.Errorf("ensure native system user: %w", err)
+	tenantID = strings.TrimSpace(tenantID)
+	if tenantID == "" {
+		return systemUserTarget{}, fmt.Errorf("tenant id is required for native system user setup")
 	}
-	return username, password, nil
+	// The tenant's restricted account must never reuse the cluster root password: a leaked
+	// tenant credential would then be a credential for every database on the instance.
+	return systemUserTarget{
+		cfg:        cfg,
+		username:   username,
+		dbName:     dbName,
+		password:   deriveSystemUserPassword(cfg.Passwd, tenantID),
+		needsSetup: needsSetup,
+	}, nil
+}
+
+// deriveSystemUserPassword returns the restricted tenant account's password: a value
+// derived from the cluster root secret, so it is distinct per tenant, reproducible for a
+// retry or another finalizer, and never the root password itself.
+func deriveSystemUserPassword(rootPassword, tenantID string) string {
+	mac := hmac.New(sha256.New, []byte(rootPassword))
+	mac.Write([]byte("drive9:tdc_fs_sys:" + tenantID))
+	return hex.EncodeToString(mac.Sum(nil))[:32]
+}
+
+// rotateLegacySystemUser rewrites a restricted account provisioned by the legacy setup: it
+// authenticates as the cluster root principal, whose password that setup copied into the
+// tenant account, then rotates the account to the derived password and strips the legacy
+// cluster-wide grant.
+//
+// It reports false when the stored password is not a cluster root credential, which means
+// the account already carries a derived password and there is nothing to remediate from
+// here.
+func rotateLegacySystemUser(ctx context.Context, cfg *mysql.Config, username, dbName, password string) (bool, error) {
+	rootUser, ok := systemRootUserFor(cfg.User)
+	if !ok {
+		return false, fmt.Errorf("native system username %q has no root principal", cfg.User)
+	}
+	rootCfg := cfg.Clone()
+	rootCfg.User = rootUser
+	// Probe authentication only: with the tenant database selected, a root principal that
+	// authenticates but cannot use that schema would fail with ER_DBACCESS_DENIED_ERROR and
+	// be mistaken for "already rotated", leaving the root-equivalent credential in place.
+	// The setup statements below are fully qualified, so no database needs to be selected.
+	rootCfg.DBName = ""
+	rootDB, err := sql.Open("mysql", rootCfg.FormatDSN())
+	if err != nil {
+		return false, fmt.Errorf("open native root connection: %w", err)
+	}
+	defer func() { _ = rootDB.Close() }()
+	if err := rootDB.PingContext(ctx); err != nil {
+		if isAuthenticationDeniedError(err) {
+			// The stored password does not authenticate as the cluster root, so the tenant
+			// account is not root-equivalent any more.
+			return false, nil
+		}
+		return false, fmt.Errorf("authenticate native root principal: %w", err)
+	}
+	if err := ensureSystemUser(ctx, rootDB, dbName, username, password); err != nil {
+		return false, fmt.Errorf("ensure native system user: %w", err)
+	}
+	return true, nil
+}
+
+// ErrLegacyGrantUnverifiable means the stored credential no longer authenticates as the
+// cluster root, so this server cannot check or revoke the legacy cluster-wide grant. It is
+// reported instead of a silently skipped remediation: the caller has to record the tenant as
+// possibly exposed rather than claim it was fixed.
+var ErrLegacyGrantUnverifiable = errors.New("legacy tenant grant cannot be verified: stored credential is not root-equivalent")
+
+// RotateLegacySystemUserCredential moves an already-provisioned restricted tenant account
+// off the cluster root password, and strips the legacy cluster-wide grant while it has root
+// access. It returns the new password and true only when it actually rotated the account.
+//
+// It reports (,, false, nil) when the stored credential no longer authenticates as the
+// cluster root principal: the account then already carries a derived password, so there is
+// nothing to remediate from the stored credential. Every error is a real failure to remediate
+// and should be retried, because the stored credential is still root-equivalent.
+func RotateLegacySystemUserCredential(ctx context.Context, dsn, tenantID string) (string, bool, error) {
+	target, err := resolveSystemUserTarget(dsn, tenantID)
+	if err != nil {
+		return "", false, err
+	}
+	if target.needsSetup {
+		// The DSN still names the root principal; the provisioning path owns that setup.
+		return "", false, nil
+	}
+	rotated, err := rotateLegacySystemUser(ctx, target.cfg, target.username, target.dbName, target.password)
+	if err != nil {
+		return "", false, err
+	}
+	if !rotated {
+		return "", false, ErrLegacyGrantUnverifiable
+	}
+	return target.password, true, nil
+}
+
+// isAuthenticationDeniedError reports whether the server refused the *login*: the stored
+// password is not this principal's. Only that answer means the account is not
+// root-equivalent; a privilege error on a statement is a remediation failure and must be
+// retried, not read as "nothing to do".
+func isAuthenticationDeniedError(err error) bool {
+	var mysqlErr *mysql.MySQLError
+	if !errors.As(err, &mysqlErr) {
+		return false
+	}
+	// 1045: access denied for user (bad password or no matching account).
+	return mysqlErr.Number == 1045
 }
 
 func (p *Provisioner) Provision(ctx context.Context, tenantID string) (*tenant.ClusterInfo, error) {
@@ -1565,46 +1713,14 @@ func systemUserStatements(dbName, username, password string) []string {
 		fmt.Sprintf("REVOKE SYSTEM_VARIABLES_ADMIN ON *.* FROM %s", quoteString(tenantRoleName)),
 		fmt.Sprintf("GRANT CREATE, ALTER, DROP, INDEX, SELECT, INSERT, UPDATE, DELETE ON %s.* TO %s", quoteIdent(dbName), quoteString(tenantRoleName)),
 		fmt.Sprintf("CREATE USER IF NOT EXISTS %s IDENTIFIED BY %s", quoteString(username), quoteString(password)),
-		fmt.Sprintf("ALTER USER %s IDENTIFIED BY %s", quoteString(username), quoteString(password)),
 		fmt.Sprintf("GRANT %s TO %s", quoteString(tenantRoleName), quoteString(username)),
 		fmt.Sprintf("SET DEFAULT ROLE %s TO %s", quoteString(tenantRoleName), quoteString(username)),
+		// ALTER USER is the only statement that invalidates a credential the tenant may
+		// already be using, so it goes last: a failure before it leaves the previous
+		// password valid and the whole setup retryable, and a failure after it is the
+		// caller's cue to persist the new credential.
+		fmt.Sprintf("ALTER USER %s IDENTIFIED BY %s", quoteString(username), quoteString(password)),
 	}
-}
-
-// RetireLegacySystemUserPrivilege revokes the legacy cluster-wide
-// SYSTEM_VARIABLES_ADMIN grant from the tenant role through the cluster root
-// principal.
-//
-// Tenants finalized before this version granted the privilege and stored a DSN that
-// already names the restricted account, so the per-tenant setup never runs again for
-// them. The stored password is the cluster root password (both the legacy and the
-// current setup reuse cfg.Passwd), so it still authenticates as <prefix>.root, which
-// is the principal that can revoke the grant. A DSN that already names a root-format
-// user, or whose password no longer authenticates as root, is left alone.
-func RetireLegacySystemUserPrivilege(ctx context.Context, dsn string) error {
-	cfg, err := mysql.ParseDSN(dsn)
-	if err != nil {
-		return fmt.Errorf("parse native tenant DSN: %w", err)
-	}
-	rootUser, ok := systemRootUserFor(cfg.User)
-	if !ok {
-		return nil
-	}
-	if strings.TrimSpace(cfg.Passwd) == "" {
-		return fmt.Errorf("native tenant DSN password is empty")
-	}
-	rootCfg := cfg.Clone()
-	rootCfg.User = rootUser
-	db, err := sql.Open("mysql", rootCfg.FormatDSN())
-	if err != nil {
-		return fmt.Errorf("open native tenant database as root: %w", err)
-	}
-	defer func() { _ = db.Close() }()
-	stmt := fmt.Sprintf("REVOKE SYSTEM_VARIABLES_ADMIN ON *.* FROM %s", quoteString(tenantRoleName))
-	if _, err := db.ExecContext(ctx, stmt); err != nil && !IsMissingGrantError(err) {
-		return fmt.Errorf("revoke legacy system variables grant: %w", err)
-	}
-	return nil
 }
 
 // The instance account scheme is owned by pkg/tenant so the server, the native

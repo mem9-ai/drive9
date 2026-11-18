@@ -2,10 +2,12 @@ package server
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -33,6 +35,10 @@ type fakeBranchProvisioner struct {
 	systemPassword     string
 	systemUserErr      error
 	systemUserCalls    int
+	// lastDialedUser and lastDialedPassword record the credential this fake produced, which
+	// is what finalization persists and the fork then dials.
+	lastDialedUser     string
+	lastDialedPassword string
 	defaultPublicKey   string
 	defaultPrivateKey  string
 }
@@ -56,7 +62,7 @@ func (f *fakeBranchProvisioner) DefaultCredentials() (tenant.CredentialProvision
 	}, true
 }
 
-func (f *fakeBranchProvisioner) EnsureSystemUser(context.Context, string, string) (string, string, error) {
+func (f *fakeBranchProvisioner) EnsureSystemUser(_ context.Context, dsn, _ string) (string, string, bool, error) {
 	f.mu.Lock()
 	f.systemUserCalls++
 	username := f.systemUsername
@@ -64,15 +70,30 @@ func (f *fakeBranchProvisioner) EnsureSystemUser(context.Context, string, string
 	err := f.systemUserErr
 	f.mu.Unlock()
 	if err != nil {
-		return "", "", err
+		return "", "", false, err
 	}
-	if username == "" {
-		username = "u1.tdc_fs_sys"
+	// Default to the credential the DSN already carries, because the fork now dials exactly
+	// what finalization returned: a made-up pair would turn every fork test into an auth
+	// failure instead of exercising the flow. An echo of an empty password stays empty —
+	// the test instance accepts an empty root password, and inventing one would break it.
+	echoed := false
+	if username == "" && password == "" {
+		if cfg, parseErr := mysql.ParseDSN(dsn); parseErr == nil {
+			username, password, echoed = cfg.User, cfg.Passwd, true
+		}
 	}
-	if password == "" {
-		password = "system-pass"
+	if !echoed {
+		if username == "" {
+			username = "u1.tdc_fs_sys"
+		}
+		if password == "" {
+			password = "system-pass"
+		}
 	}
-	return username, password, nil
+	f.mu.Lock()
+	f.lastDialedUser, f.lastDialedPassword = username, password
+	f.mu.Unlock()
+	return username, password, true, nil
 }
 
 func (f *fakeBranchProvisioner) Provision(context.Context, string) (*tenant.ClusterInfo, error) {
@@ -254,6 +275,7 @@ func cleanupForkTestTables(t *testing.T, s *meta.Store) {
 	for _, stmt := range []string{
 		`DELETE FROM object_gc_candidates`,
 		`DELETE FROM tenant_api_keys`,
+		`DELETE FROM tenant_credential_state`,
 		`DELETE FROM tenants`,
 		`DELETE FROM storage_namespaces`,
 		`DELETE FROM file_gc_tasks`,
@@ -442,6 +464,7 @@ func TestCreateForkTenantPostAPIKeyFailureMarksFailed(t *testing.T) {
 
 	rt := newForkCleanupTestRuntime(t)
 	rt.prov.provider = tenant.ProviderTiDBCloudNative
+	rt.prov.systemUsername, rt.prov.systemPassword = createForkNativeSystemUser(t, rt)
 	rt.insertLiveTenantWithProvider(t, "source", tenant.ProviderTiDBCloudNative)
 	rt.prov.cluster = &tenant.ClusterInfo{
 		ClusterID: "cluster-a",
@@ -597,11 +620,39 @@ func TestCreateForkTenantNativeDeletesBranchOnSchemaInitFailure(t *testing.T) {
 	}
 }
 
+// createForkNativeSystemUser creates a restricted native account on the test instance and
+// returns its credential. The fork dials exactly what finalization persists, so a fixture
+// credential has to be one the instance accepts.
+func createForkNativeSystemUser(t *testing.T, rt *forkCleanupTestRuntime) (string, string) {
+	t.Helper()
+	admin, err := sql.Open("mysql", testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = admin.Close() })
+	user := "fksys" + strconv.FormatInt(time.Now().UnixNano(), 36) + ".tdc_fs_sys"
+	password := "fork-native-pass"
+	ctx := context.Background()
+	for _, stmt := range []string{
+		"CREATE USER '" + user + "'@'%' IDENTIFIED BY '" + password + "'",
+		"GRANT ALL ON `" + rt.dbName + "`.* TO '" + user + "'@'%'",
+	} {
+		if _, err := admin.ExecContext(ctx, stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	t.Cleanup(func() {
+		if _, err := admin.ExecContext(context.Background(), "DROP USER IF EXISTS '"+user+"'@'%'"); err != nil {
+			t.Errorf("cleanup: drop %s: %v", user, err)
+		}
+	})
+	return user, password
+}
+
 func TestProvisionForkTenantNativeFinalizesSystemUserCredential(t *testing.T) {
 	rt := newForkCleanupTestRuntime(t)
 	rt.prov.provider = tenant.ProviderTiDBCloudNative
-	rt.prov.systemUsername = "u1.tdc_fs_sys"
-	rt.prov.systemPassword = "system-pass"
+	rt.prov.systemUsername, rt.prov.systemPassword = createForkNativeSystemUser(t, rt)
 	rt.insertLiveTenantWithProvider(t, "source", tenant.ProviderTiDBCloudNative)
 	rt.insertTenantWithProvider(t, "fork-provisioning", meta.TenantProvisioning, meta.TenantKindFork, "source", "ns-parent", "branch-a", tenant.ProviderTiDBCloudNative)
 
@@ -619,15 +670,15 @@ func TestProvisionForkTenantNativeFinalizesSystemUserCredential(t *testing.T) {
 	if got.Status != meta.TenantActive {
 		t.Fatalf("tenant status = %s, want %s", got.Status, meta.TenantActive)
 	}
-	if got.DBUser != "u1.tdc_fs_sys" {
-		t.Fatalf("tenant DB user = %q, want system user", got.DBUser)
+	if got.DBUser != rt.prov.lastDialedUser {
+		t.Fatalf("tenant DB user = %q, want %q (the credential finalization produced)", got.DBUser, rt.prov.lastDialedUser)
 	}
 	plain, err := rt.pool.Decrypt(context.Background(), got.DBPasswordCipher)
 	if err != nil {
 		t.Fatalf("decrypt system password: %v", err)
 	}
-	if string(plain) != "system-pass" {
-		t.Fatalf("tenant DB password = %q, want system password", plain)
+	if string(plain) != rt.prov.lastDialedPassword {
+		t.Fatalf("tenant DB password = %q, want the credential finalization persisted", plain)
 	}
 	if calls := rt.prov.systemUserCallCount(); calls != 1 {
 		t.Fatalf("EnsureSystemUser calls = %d, want 1", calls)
@@ -655,6 +706,8 @@ func TestCleanupFailedForkDoesNotMarkDeletedWhenBranchDeleteFails(t *testing.T) 
 
 func TestResumeProvisioningForkActivatesBranchBackedTenant(t *testing.T) {
 	rt := newForkCleanupTestRuntime(t)
+	rt.prov.provider = tenant.ProviderTiDBCloudNative
+	rt.prov.systemUsername, rt.prov.systemPassword = createForkNativeSystemUser(t, rt)
 	rt.prov.cluster = &tenant.ClusterInfo{
 		ClusterID: "cluster-a",
 		BranchID:  "branch-a",

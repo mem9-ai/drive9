@@ -685,10 +685,15 @@ func (s *Server) provisionForkTenantOnceWithCredentials(ctx context.Context, for
 	if schemaProvisioner == nil {
 		return fmt.Errorf("fork provisioner not configured for provider %s", forkTenant.Provider)
 	}
-	if err := s.schemaInitForTenant(forkID, forkTenant.Provider, schemaProvisioner.InitSchema)(ctx, dsn); err != nil {
+	dsn, err = s.schemaInitWithCredentialRecovery(ctx, forkID, dsn, forkTenant.Provider,
+		s.schemaInitForTenant(forkID, forkTenant.Provider, schemaProvisioner.InitSchema))
+	if err != nil {
 		return err
 	}
-	if err := s.finalizeTenantSchemaInit(ctx, forkID, dsn, forkTenant.Provider); err != nil {
+	// Finalization may rotate the restricted account's password, so every later step must use
+	// the credential it hands back rather than the pre-finalization DSN.
+	dsn, err = s.finalizeTenantSchemaInit(ctx, forkID, dsn, forkTenant.Provider)
+	if err != nil {
 		return err
 	}
 	store, err := datastore.OpenForTenant(ctx, dsn, forkID)

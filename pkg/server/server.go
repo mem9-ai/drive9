@@ -37,6 +37,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/tagutil"
 	"github.com/mem9-ai/drive9/pkg/tenant"
 	tenantschema "github.com/mem9-ai/drive9/pkg/tenant/schema"
+	"github.com/mem9-ai/drive9/pkg/tenant/tidbcloudnative"
 	"github.com/mem9-ai/drive9/pkg/tenant/token"
 	"github.com/mem9-ai/drive9/pkg/traceid"
 	"github.com/mem9-ai/drive9/pkg/vault"
@@ -180,8 +181,11 @@ type provisioningRegionProvider interface {
 }
 
 type nativeSystemUserProvisioner interface {
-	// tenantID is reserved for audit/log naming; current native setup derives SQL principals from the DSN user.
-	EnsureSystemUser(ctx context.Context, dsn, tenantID string) (username, password string, err error)
+	// tenantID scopes the derived password, and grantVerified reports whether this call
+	// applied the setup that revokes the legacy cluster-wide grant. A false grantVerified is
+	// not an error: it means the stored credential could not prove the grant state, so the
+	// caller must record the tenant for review instead of claiming remediation.
+	EnsureSystemUser(ctx context.Context, dsn, tenantID string) (username, password string, grantVerified bool, err error)
 }
 
 func (s *Server) provisionerForTenantProvider(provider string) tenant.Provisioner {
@@ -262,12 +266,12 @@ type Server struct {
 	leaderWorkerMu       sync.Mutex
 	leaderWorkersStarted bool
 	leaderWorkerStopDone chan struct{}
-	// nativePrivilegeRetire* carry per-tenant retry state for the legacy-grant
+	// nativeCredentialRemediation* carry per-tenant retry state for the legacy-grant
 	// cleanup, so a failing tenant is retried with backoff instead of on every pass.
-	nativePrivilegeRetireMu       sync.Mutex
-	nativePrivilegeRetireFailures map[string]int
-	nativePrivilegeRetireRetryAt  map[string]time.Time
-	nativePrivilegeRetireDone     map[string]time.Time
+	nativeCredentialRemediationMu       sync.Mutex
+	nativeCredentialRemediationFailures map[string]int
+	nativeCredentialRemediationRetryAt  map[string]time.Time
+	nativeCredentialRemediationDone     map[string]time.Time
 	// replayWorker and expirySweepWorker are leader-gated central quota
 	// workers owned by the server (single callback owner). Started in
 	// startLeaderWorkers and stopped in stopLeaderWorkers so they follow
@@ -776,9 +780,13 @@ func (s *Server) startNotifyInfrastructure(cfg Config) {
 
 	// Unified outbox poller: reads the central outbox on every pod and
 	// dispatches by work_mask.
+	var poolEvict func(string)
+	if s.pool != nil {
+		poolEvict = s.pool.Invalidate
+	}
 	poller := newTenantOutboxPoller(
 		s.meta, s.events, s.tenantWorker, resolver.ownsTenantFn(),
-		cfg.PodID, cfg.TenantOutboxPollInterval, cfg.TenantOutboxCursorFlushInterval,
+		poolEvict, cfg.PodID, cfg.TenantOutboxPollInterval, cfg.TenantOutboxCursorFlushInterval,
 	)
 	// Initialize the poller cursor synchronously BEFORE starting the goroutine
 	// and BEFORE the server accepts live traffic. On restart the cursor is
@@ -1024,15 +1032,15 @@ func (s *Server) startLeaderWorkers() {
 	// change.
 	if s.meta != nil && s.pool != nil {
 		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
-			ticker := time.NewTicker(nativePrivilegeRetireInterval)
+			ticker := time.NewTicker(nativeCredentialRemediationInterval)
 			defer ticker.Stop()
-			s.retireNativeTenantVariablesPrivilege(workerCtx)
+			s.remediateNativeTenantCredentials(workerCtx)
 			for {
 				select {
 				case <-workerCtx.Done():
 					return
 				case <-ticker.C:
-					s.retireNativeTenantVariablesPrivilege(workerCtx)
+					s.remediateNativeTenantCredentials(workerCtx)
 				}
 			}
 		})
@@ -6167,12 +6175,19 @@ func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN,
 		if !s.tenantSchemaInitStillProvisioning(ctx, tenantID, provider, "before_attempt") {
 			return
 		}
-		err := schemaInit(ctx, tenantDSN)
+		var err error
+		tenantDSN, err = s.schemaInitWithCredentialRecovery(ctx, tenantID, tenantDSN, provider, schemaInit)
 		if err == nil {
 			if !s.tenantSchemaInitStillProvisioning(ctx, tenantID, provider, "before_finalize") {
 				return
 			}
-			err = s.finalizeTenantSchemaInit(ctx, tenantID, tenantDSN, provider)
+			var effectiveDSN string
+			effectiveDSN, err = s.finalizeTenantSchemaInit(ctx, tenantID, tenantDSN, provider)
+			if err == nil && effectiveDSN != "" {
+				// Finalization may have rotated the credential; later attempts must dial the
+				// account the tenant now has.
+				tenantDSN = effectiveDSN
+			}
 			if err == nil {
 				if versionErr := s.updateTenantSchemaVersionForProfile(ctx, tenantID, provider); versionErr != nil {
 					logger.Error(ctx, "server_event", eventFields(ctx, "schema_init_version_persist_failed", "tenant_id", tenantID, "provider", provider, "attempt", attempt, "error", versionErr)...)
@@ -6303,37 +6318,125 @@ func (s *Server) tenantSchemaInitStillProvisioning(ctx context.Context, tenantID
 	return true
 }
 
-func (s *Server) finalizeTenantSchemaInit(ctx context.Context, tenantID, tenantDSN, provider string) error {
+// schemaInitWithCredentialRecovery runs schema initialization and, when the server refuses
+// the login because a rotation it performed was never persisted, recovers the credential and
+// retries once. Without it a crash between ALTER USER and the metadata write would strand the
+// tenant on the schema-init step until an operator intervened.
+func (s *Server) schemaInitWithCredentialRecovery(ctx context.Context, tenantID, tenantDSN, provider string, schemaInit func(context.Context, string) error) (string, error) {
+	err := schemaInit(ctx, tenantDSN)
+	if err == nil || provider != tenant.ProviderTiDBCloudNative || !isCredentialRejectedError(err) {
+		return tenantDSN, err
+	}
+	cfg, parseErr := mysql.ParseDSN(tenantDSN)
+	if parseErr != nil || !tidbcloudnative.IsRestrictedSystemUser(cfg.User) {
+		return tenantDSN, err
+	}
+	// The account was rotated but the control plane never learned the new password. The stored
+	// password still authenticates as the cluster root, so finalization can re-apply the
+	// rotation — the derived value is deterministic, so it is the password the earlier attempt
+	// already set — and persist it.
+	effective, finalizeErr := s.finalizeTenantSchemaInit(ctx, tenantID, tenantDSN, provider)
+	if finalizeErr != nil {
+		return tenantDSN, fmt.Errorf("schema init was refused (%v) and credential recovery failed: %w", err, finalizeErr)
+	}
+	return effective, schemaInit(ctx, effective)
+}
+
+// isCredentialRejectedError reports whether the server refused the login, which is what a
+// credential this server rotated but could not persist looks like on the next attempt.
+func isCredentialRejectedError(err error) bool {
+	var mysqlErr *mysql.MySQLError
+	return errors.As(err, &mysqlErr) && mysqlErr.Number == 1045
+}
+
+// finalizeTenantSchemaInit applies the tenant's runtime credential and returns the DSN a
+// caller must dial afterwards. The returned DSN matters: finalization can rotate the
+// restricted account's password, so the caller's own DSN is stale by the time this returns,
+// and every post-finalization step has to use the effective one.
+func (s *Server) finalizeTenantSchemaInit(ctx context.Context, tenantID, tenantDSN, provider string) (string, error) {
 	if provider != tenant.ProviderTiDBCloudNative {
-		return nil
+		return tenantDSN, nil
 	}
 	if s.provisioner == nil {
-		return fmt.Errorf("server misconfigured: native tenant provider is missing")
+		return tenantDSN, fmt.Errorf("server misconfigured: native tenant provider is missing")
 	}
 	systemUserProvisioner, ok := s.provisioner.(nativeSystemUserProvisioner)
 	if !ok {
-		return fmt.Errorf("native provisioner does not support system user setup")
+		return tenantDSN, fmt.Errorf("native provisioner does not support system user setup")
 	}
 	cfg, err := mysql.ParseDSN(tenantDSN)
 	if err != nil {
-		return fmt.Errorf("parse native tenant DSN for credential finalization: %w", err)
+		return tenantDSN, fmt.Errorf("parse native tenant DSN for credential finalization: %w", err)
 	}
 	fromDBUser := strings.TrimSpace(cfg.User)
 	if fromDBUser == "" {
-		return fmt.Errorf("native tenant DSN has empty username")
+		return tenantDSN, fmt.Errorf("native tenant DSN has empty username")
 	}
-	username, password, err := systemUserProvisioner.EnsureSystemUser(ctx, tenantDSN, tenantID)
+	// Read the recorded outcome once: it decides the short-circuit below and, when the
+	// provisioner cannot verify the grant, whether the tenant may be downgraded.
+	recordedState, _, stateErr := s.meta.TenantCredentialState(ctx, tenantID)
+	if stateErr != nil && !errors.Is(stateErr, meta.ErrNotFound) {
+		return tenantDSN, fmt.Errorf("read native tenant credential state: %w", stateErr)
+	}
+	// A resumed finalization for a tenant this server already remediated has nothing to do:
+	// dialling the cluster root again cannot add information, and rewriting the credential
+	// would emit another invalidation signal for an unchanged row.
+	if tidbcloudnative.IsRestrictedSystemUser(fromDBUser) && recordedState == meta.TenantCredentialRemediated {
+		return tenantDSN, nil
+	}
+	username, password, grantVerified, err := systemUserProvisioner.EnsureSystemUser(ctx, tenantDSN, tenantID)
 	if err != nil {
-		return fmt.Errorf("ensure native system user: %w", err)
+		return tenantDSN, fmt.Errorf("ensure native system user: %w", err)
 	}
 	if username == "" || password == "" {
-		return fmt.Errorf("native system user setup returned empty credential")
+		return tenantDSN, fmt.Errorf("native system user setup returned empty credential")
 	}
+	if !grantVerified {
+		// The provisioner ran no setup — the account is operator-managed — so the credential
+		// did not change and there is nothing to write. Record the outcome alone: rewriting
+		// the row would bump updated_at and emit an invalidation signal for a credential that
+		// stayed the same.
+		//
+		// Unless it was already remediated: a tenant that stopped mid-provisioning resumes
+		// finalization with exactly this shape — the restricted account and its derived
+		// password — and no root credential to re-verify a grant this server already revoked.
+		// Downgrading that record would flag a tenant that is fine on every following pass,
+		// so an existing remediation wins over a probe that cannot see it.
+		if recordedState != meta.TenantCredentialRemediated {
+			reason := "finalization could not verify the legacy grant: stored credential is not root-equivalent"
+			if err := s.meta.SetTenantCredentialState(ctx, tenantID, meta.TenantCredentialReviewRequired, reason); err != nil {
+				return tenantDSN, fmt.Errorf("record native tenant credential state: %w", err)
+			}
+		}
+		if username != fromDBUser || password != cfg.Passwd {
+			// Defensive: a provisioner that reports an unverified grant but a changed
+			// credential still has to persist what it returned.
+			if updateErr := s.persistNativeCredential(ctx, tenantID, fromDBUser, username, password, recordedState); updateErr != nil {
+				return tenantDSN, updateErr
+			}
+		}
+		return credentialDSN(cfg, username, password), nil
+	}
+	// The setup ran, so the derived credential is in place and the legacy grant is gone: the
+	// outcome is recorded in the same transaction as the credential it describes.
+	if err := s.persistNativeCredential(ctx, tenantID, fromDBUser, username, password, meta.TenantCredentialRemediated); err != nil {
+		return tenantDSN, err
+	}
+	return credentialDSN(cfg, username, password), nil
+}
+
+// persistNativeCredential stores a credential and the outcome it proves in one transaction.
+func (s *Server) persistNativeCredential(ctx context.Context, tenantID, fromDBUser, username, password string, state meta.TenantCredentialState) error {
 	cipherPass, err := s.pool.Encrypt(ctx, []byte(password))
 	if err != nil {
 		return fmt.Errorf("encrypt native system user password: %w", err)
 	}
-	updated, err := s.meta.UpdateTenantDBCredentialIf(ctx, tenantID, fromDBUser, username, cipherPass)
+	updated, err := s.meta.UpdateTenantDBCredentialIf(ctx, tenantID, meta.TenantDBCredentialUpdate{
+		FromDBUser:     fromDBUser,
+		DBUser:         username,
+		PasswordCipher: cipherPass,
+		State:          state,
+	})
 	if err != nil {
 		return fmt.Errorf("persist native system user credential: %w", err)
 	}
@@ -6344,6 +6447,15 @@ func (s *Server) finalizeTenantSchemaInit(ctx context.Context, tenantID, tenantD
 			zap.String("db_user", username))
 	}
 	return nil
+}
+
+// credentialDSN rebuilds the tenant DSN with the credential finalization produced, so the
+// caller's post-finalization steps dial the account the tenant now has.
+func credentialDSN(cfg *mysql.Config, username, password string) string {
+	effective := cfg.Clone()
+	effective.User = username
+	effective.Passwd = password
+	return effective.FormatDSN()
 }
 
 func errJSON(w http.ResponseWriter, code int, msg string) {

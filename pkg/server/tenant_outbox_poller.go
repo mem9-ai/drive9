@@ -51,10 +51,16 @@ const (
 // per-tenant TiDB scanning. Idle tenant TiDBs can scale to zero because the
 // poller never touches them — it only reads the central meta DB.
 type tenantOutboxPoller struct {
-	metaStore        *meta.Store
-	buses            *eventBuses
-	worker           outboxKicker
-	shardFn          func(string) bool
+	metaStore *meta.Store
+	buses     *eventBuses
+	worker    outboxKicker
+	shardFn   func(string) bool
+	// poolEvict drops a tenant's cached backend. It is the only way a peer notices a
+	// database credential rotation: the peer's pooled connections were authenticated with
+	// the retired password, so new ones would be refused. It is deliberately the pool's own
+	// Invalidate and not the worker's deletion teardown, which would also drop queued
+	// background kicks for a tenant that is still alive.
+	poolEvict        func(tenantID string)
 	podID            string
 	interval         time.Duration
 	cursorFlushEvery time.Duration
@@ -70,6 +76,7 @@ func newTenantOutboxPoller(
 	buses *eventBuses,
 	worker outboxKicker,
 	shardFn func(string) bool,
+	poolEvict func(tenantID string),
 	podID string,
 	interval time.Duration,
 	cursorFlushEvery time.Duration,
@@ -88,6 +95,7 @@ func newTenantOutboxPoller(
 		buses:            buses,
 		worker:           worker,
 		shardFn:          shardFn,
+		poolEvict:        poolEvict,
 		podID:            podID,
 		interval:         interval,
 		cursorFlushEvery: cursorFlushEvery,
@@ -212,8 +220,21 @@ func (p *tenantOutboxPoller) pollOnce(ctx context.Context) {
 
 // dispatch sends a single outbox row to the right consumer based on work_mask.
 func (p *tenantOutboxPoller) dispatch(ctx context.Context, row meta.TenantNotifyRow) {
-	if row.WorkMask&WorkAPIKeyCacheCleanup != 0 && p.metaStore != nil {
-		p.metaStore.InvalidateAPIKeyResolveCacheForTenant(row.TenantID)
+	if row.WorkMask&WorkAPIKeyCacheCleanup != 0 {
+		if p.metaStore != nil {
+			p.metaStore.InvalidateAPIKeyResolveCacheForTenant(row.TenantID)
+		}
+	}
+	if row.WorkMask&WorkTenantCredential != 0 {
+		if p.metaStore != nil {
+			p.metaStore.InvalidateAPIKeyResolveCacheForTenant(row.TenantID)
+		}
+		// The credential in the pool's cached backend is stale, so drop the backend. The
+		// tenant is alive: its queued worker kicks must survive, which is why this is the
+		// pool's eviction and not the deletion teardown.
+		if p.poolEvict != nil {
+			p.poolEvict(row.TenantID)
+		}
 	}
 	if row.WorkMask&WorkMetricsCleanup != 0 {
 		metrics.DeleteTenantCounters(row.TenantID)
