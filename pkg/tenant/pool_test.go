@@ -1440,3 +1440,148 @@ func TestPoolMismatchEvictionIsFencedAgainstConcurrentReplacement(t *testing.T) 
 		t.Fatal("the caller received a backend other than the rotated one")
 	}
 }
+
+// A replacement can arrive without any invalidation — a peer that resolved the new row simply
+// swaps the entry. The stale acquisition must not then remove it, which means the fence has to
+// track cache changes, not only invalidations.
+func TestPoolMismatchEvictionIsFencedAgainstPlainReplacement(t *testing.T) {
+	pool, tenant := newTestPoolAndTenant(t, 2, "tenant-fenced-replace")
+	metaStore, err := meta.OpenContext(context.Background(), testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = metaStore.Close() })
+	testtidb.ResetMetaDB(t, metaStore.DB())
+	ctx := context.Background()
+	tenant.S3EncryptionMode = meta.S3EncryptionModeInherit
+	if err := metaStore.InsertTenant(ctx, tenant); err != nil {
+		t.Fatal(err)
+	}
+	pool.SetMetaStore(metaStore)
+	if _, releaseCurrent, err := pool.Acquire(ctx, tenant); err != nil {
+		t.Fatal(err)
+	} else {
+		defer releaseCurrent()
+	}
+
+	plain, err := pool.Decrypt(ctx, tenant.DBPasswordCipher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	derive := func(suffix byte) []byte {
+		cipher, encErr := pool.Encrypt(ctx, append(append([]byte(nil), plain...), suffix))
+		if encErr != nil {
+			t.Fatal(encErr)
+		}
+		return cipher
+	}
+	pool.mu.Lock()
+	pool.items[tenant.ID].dbPasswordCipher = derive('q')
+	pool.mu.Unlock()
+
+	rotatedCipher := derive('r')
+	var replacement *entry
+	interleaved := false
+	pool.testHookBeforeEvict = func(tenantID string) {
+		if interleaved {
+			return
+		}
+		interleaved = true
+		// A competing acquisition replaces the entry for the new credential; the control plane
+		// records that credential, but nothing calls Invalidate — the only fence signal is the
+		// replacement itself.
+		if _, err := metaStore.DB().ExecContext(ctx, `UPDATE tenants SET db_password = ? WHERE id = ?`, rotatedCipher, tenantID); err != nil {
+			t.Errorf("record the rotated credential: %v", err)
+		}
+		b, st, _, err := pool.createBackend(ctx, tenant)
+		if err != nil {
+			t.Errorf("install the rotated backend: %v", err)
+			return
+		}
+		e := &entry{
+			tenantID:           tenant.ID,
+			storageNamespaceID: tenant.StorageNamespaceID,
+			s3EncryptionPolicy: tenant.S3EncryptionPolicy(),
+			dbUser:             tenant.DBUser,
+			dbPasswordCipher:   rotatedCipher,
+			backend:            b,
+			store:              st,
+			lastUsed:           time.Now(),
+		}
+		pool.mu.Lock()
+		if existing, ok := pool.items[tenantID]; ok {
+			if removed := pool.removeLocked(existing.elem, "replace"); removed != nil {
+				removed.backend.Close()
+				_ = removed.store.Close()
+			}
+		}
+		e.elem = pool.order.PushFront(e)
+		pool.items[tenantID] = e
+		pool.mu.Unlock()
+		replacement = e
+	}
+	t.Cleanup(func() { pool.testHookBeforeEvict = nil })
+
+	got, releaseGot, err := pool.Acquire(ctx, tenant)
+	if err != nil {
+		t.Fatalf("acquire across a plain replacement: %v", err)
+	}
+	defer releaseGot()
+	if !interleaved || replacement == nil {
+		t.Fatal("the interleaving hook never replaced the entry, so the race was not exercised")
+	}
+	pool.mu.Lock()
+	cached := pool.items[tenant.ID]
+	pool.mu.Unlock()
+	if cached != replacement {
+		t.Fatal("the fenced mismatch removed the entry a plain replacement had installed")
+	}
+	_ = got
+}
+
+// An unreadable tenant row must not make the pool serve a backend whose S3 policy or storage
+// namespace disagrees with the caller's row: that would encrypt or route the data the wrong way.
+func TestPoolUnverifiedRowFailsOnShapeMismatch(t *testing.T) {
+	pool, tenant := newTestPoolAndTenant(t, 2, "tenant-unverified-shape")
+	metaStore, err := meta.OpenContext(context.Background(), testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	testtidb.ResetMetaDB(t, metaStore.DB())
+	ctx := context.Background()
+	tenant.S3EncryptionMode = meta.S3EncryptionModeInherit
+	if err := metaStore.InsertTenant(ctx, tenant); err != nil {
+		t.Fatal(err)
+	}
+	pool.SetMetaStore(metaStore)
+	first, releaseFirst, err := pool.Acquire(ctx, tenant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer releaseFirst()
+
+	// The control plane becomes unreadable, and the caller's row disagrees with the cached
+	// backend about the encryption policy.
+	if err := metaStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+	policyMismatch := *tenant
+	policyMismatch.S3EncryptionMode = meta.S3EncryptionModeSSEKMS
+	policyMismatch.S3KMSKeyID = "arn:aws:kms:test"
+	policyMismatch.DBPasswordCipher = append([]byte(nil), tenant.DBPasswordCipher...)
+	policyMismatch.DBPasswordCipher[0] ^= 0xff
+
+	if _, release, err := pool.Acquire(ctx, &policyMismatch); err == nil {
+		release()
+		t.Fatal("an unverifiable row was served a backend with a different encryption policy")
+	} else if !strings.Contains(err.Error(), "could not be verified") {
+		t.Fatalf("acquire error = %v, want the unverified-row refusal", err)
+	}
+	// The healthy backend is still cached for the callers whose rows do match it.
+	pool.mu.Lock()
+	cached := pool.items[tenant.ID]
+	pool.mu.Unlock()
+	if cached == nil || cached.backend != first {
+		t.Fatal("the unverified row evicted the cached backend")
+	}
+}

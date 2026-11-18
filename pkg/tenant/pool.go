@@ -299,14 +299,22 @@ func (p *Pool) tryCached(t *meta.Tenant, s3EncryptionPolicy meta.S3EncryptionPol
 	return e, true
 }
 
-// grabCached pins whatever backend is cached for the tenant, without judging whether it
-// matches a caller's row. It exists for the one case where the row cannot be verified and
-// discarding a healthy backend would be the worse outcome.
-func (p *Pool) grabCached(tenantID string) (*entry, bool) {
+// grabCached pins the cached backend when its shape still matches the caller's row. It exists
+// for the one case where the credential cannot be verified and discarding a healthy backend
+// would be the worse outcome — but the S3 encryption policy and the storage namespace are not
+// a matter of verification: serving a backend that disagrees about them would encrypt or route
+// the caller's data the wrong way, so a mismatch fails instead.
+func (p *Pool) grabCached(t *meta.Tenant, s3EncryptionPolicy meta.S3EncryptionPolicy, storageNamespaceID string) (*entry, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e, ok := p.items[tenantID]
+	e, ok := p.items[t.ID]
 	if !ok {
+		return nil, false
+	}
+	if e.s3EncryptionPolicy != s3EncryptionPolicy {
+		return nil, false
+	}
+	if storageNamespaceID != "" && e.storageNamespaceID != storageNamespaceID {
 		return nil, false
 	}
 	e.refs++
@@ -314,6 +322,10 @@ func (p *Pool) grabCached(tenantID string) (*entry, bool) {
 	e.lastUsed = time.Now()
 	return e, true
 }
+
+// errTenantRowUnverified reports that the tenant row could not be read and the cached backend's
+// shape no longer matches it, so neither serving nor evicting the cache is safe.
+var errTenantRowUnverified = errors.New("tenant row could not be verified and the cached backend does not match it")
 
 // errTenantChangedDuringOpen reports that a tenant was invalidated while its backend was
 // opening and no fresh row could be resolved to retry with.
@@ -402,15 +414,20 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 				continue
 			}
 			if !resolved && p.metaStore != nil {
-				// The row cannot be verified right now. Evicting on an unverifiable row is how
-				// a healthy backend disappears during a control-plane blip, so keep it and
-				// serve it; the next acquisition with a resolved row can still replace it.
-				if e, grabbed := p.grabCached(t.ID); grabbed {
+				// The credential cannot be verified right now: evicting on an unverifiable row
+				// is how a healthy backend disappears during a control-plane blip. Keep it and
+				// serve it only if it still agrees about the encryption policy and namespace —
+				// those decide where the caller's data goes, so a disagreement fails instead of
+				// being papered over.
+				cached, servesCaller := p.grabCached(t, s3EncryptionPolicy, storageNamespaceID)
+				if servesCaller {
 					logger.Warn(ctx, "tenant_pool_row_unverified_reusing_cached_backend",
 						zap.String("tenant_id", t.ID))
-					return e.backend, p.makeRelease(e), nil
+					return cached.backend, p.makeRelease(cached), nil
 				}
-				break
+				logger.Warn(ctx, "tenant_pool_row_unverified_shape_mismatch",
+					zap.String("tenant_id", t.ID))
+				return nil, nil, errTenantRowUnverified
 			}
 		}
 
@@ -1296,6 +1313,10 @@ func (p *Pool) removeLockedWithoutMetrics(elem *list.Element) *entry {
 	p.order.Remove(elem)
 	e.elem = nil
 	delete(p.items, e.tenantID)
+	// Any removal is a cache change: a concurrent cold open or mismatch eviction that started
+	// before it must not be treated as still current. That includes a plain replacement, which
+	// arrives without an invalidation.
+	p.bumpInvalidationLocked(e.tenantID)
 	e.retired = true
 	if e.refs == 0 {
 		return e
