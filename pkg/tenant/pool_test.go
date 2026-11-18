@@ -1191,7 +1191,30 @@ func TestPoolAcquireRecreatesBackendWhenCredentialChanges(t *testing.T) {
 // backend it opened and reuse the one the current row names.
 func TestPoolStaleColdOpenDoesNotReplaceRotatedBackend(t *testing.T) {
 	pool, tenant := newTestPoolAndTenant(t, 2, "tenant-stale-open")
+	metaStore, err := meta.OpenContext(context.Background(), testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = metaStore.Close() })
+	testtidb.ResetMetaDB(t, metaStore.DB())
 	ctx := context.Background()
+	tenant.S3EncryptionMode = meta.S3EncryptionModeInherit
+	if err := metaStore.InsertTenant(ctx, tenant); err != nil {
+		t.Fatal(err)
+	}
+	pool.SetMetaStore(metaStore)
+
+	// The credential the rotation puts in place. Distinct from the one this acquisition was
+	// given, which is what makes the test depend on the fence rather than on the matching
+	// predicate happening to reuse the newer backend.
+	plain, err := pool.Decrypt(ctx, tenant.DBPasswordCipher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotatedCipher, err := pool.Encrypt(ctx, append(append([]byte(nil), plain...), 'z'))
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// The pool starts cold, so the acquiring call below really does open a backend and pass
 	// through the installation fence.
@@ -1202,12 +1225,21 @@ func TestPoolStaleColdOpenDoesNotReplaceRotatedBackend(t *testing.T) {
 			return
 		}
 		interleaved = true
-		// The rotation lands (invalidate) and another acquisition installs the backend the
-		// current row names, before this one can install its own.
+		// The rotation lands (invalidate, and the control plane records the derived
+		// credential) and another acquisition installs the backend the current row names,
+		// before this one can install its own.
 		pool.Invalidate(tenantID)
 		b, st, _, err := pool.createBackend(ctx, tenant)
 		if err != nil {
 			t.Errorf("install the current backend: %v", err)
+			return
+		}
+		if _, err := metaStore.UpdateTenantDBCredentialIf(ctx, tenant.ID, meta.TenantDBCredentialUpdate{
+			FromDBUser:     tenant.DBUser,
+			DBUser:         tenant.DBUser,
+			PasswordCipher: rotatedCipher,
+		}); err != nil {
+			t.Errorf("record the rotated credential: %v", err)
 			return
 		}
 		e := &entry{
@@ -1215,7 +1247,7 @@ func TestPoolStaleColdOpenDoesNotReplaceRotatedBackend(t *testing.T) {
 			storageNamespaceID: tenant.StorageNamespaceID,
 			s3EncryptionPolicy: tenant.S3EncryptionPolicy(),
 			dbUser:             tenant.DBUser,
-			dbPasswordCipher:   append([]byte(nil), tenant.DBPasswordCipher...),
+			dbPasswordCipher:   rotatedCipher,
 			backend:            b,
 			store:              st,
 			lastUsed:           time.Now(),
@@ -1244,5 +1276,70 @@ func TestPoolStaleColdOpenDoesNotReplaceRotatedBackend(t *testing.T) {
 	}
 	if got != installed.backend {
 		t.Fatal("the caller received a backend other than the current one")
+	}
+}
+
+// The stale row can also arrive late: a request resolves its tenant, a rotation lands and
+// another acquisition caches a backend with the new credential, and only then does the
+// request call Acquire. The mismatch must not evict that backend — the caller's row is the
+// stale one, and opening with it would fail authentication.
+func TestPoolStaleRowAfterRotationReusesCachedBackend(t *testing.T) {
+	pool, tenant := newTestPoolAndTenant(t, 2, "tenant-stale-row")
+	metaStore, err := meta.OpenContext(context.Background(), testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = metaStore.Close() })
+	testtidb.ResetMetaDB(t, metaStore.DB())
+	ctx := context.Background()
+	tenant.S3EncryptionMode = meta.S3EncryptionModeInherit
+	if err := metaStore.InsertTenant(ctx, tenant); err != nil {
+		t.Fatal(err)
+	}
+	pool.SetMetaStore(metaStore)
+
+	// A backend for the credential the control plane holds now.
+	current, releaseCurrent, err := pool.Acquire(ctx, tenant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer releaseCurrent()
+	pool.mu.Lock()
+	cached := pool.items[tenant.ID]
+	pool.mu.Unlock()
+
+	// The caller holds a row from before a rotation: same tenant, a credential the database
+	// would reject. It has no way to know its row is stale.
+	stale := *tenant
+	plain, err := pool.Decrypt(ctx, tenant.DBPasswordCipher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staleCipher, err := pool.Encrypt(ctx, append(append([]byte(nil), plain...), 'w'))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale.DBPasswordCipher = staleCipher
+
+	opens := 0
+	pool.testHookBeforeInstall = func(string) { opens++ }
+	t.Cleanup(func() { pool.testHookBeforeInstall = nil })
+
+	got, releaseGot, err := pool.Acquire(ctx, &stale)
+	if err != nil {
+		t.Fatalf("acquire with a stale row: %v", err)
+	}
+	defer releaseGot()
+	if opens != 0 {
+		t.Fatalf("the stale row opened %d backend(s) instead of reusing the cached one", opens)
+	}
+	if got != current {
+		t.Fatal("the stale row did not reuse the backend the current row names")
+	}
+	pool.mu.Lock()
+	stillCached := pool.items[tenant.ID]
+	pool.mu.Unlock()
+	if stillCached != cached {
+		t.Fatal("the stale row evicted the current backend")
 	}
 }

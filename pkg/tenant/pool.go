@@ -300,20 +300,29 @@ func (p *Pool) tryCached(t *meta.Tenant, s3EncryptionPolicy meta.S3EncryptionPol
 // opening and no fresh row could be resolved to retry with.
 var errTenantChangedDuringOpen = errors.New("tenant changed while its database was opening")
 
-// freshTenantAfterInvalidation re-reads the tenant row after a fenced open, so the retry dials
-// the credential the control plane currently holds.
-func (p *Pool) freshTenantAfterInvalidation(ctx context.Context, previous *meta.Tenant) (*meta.Tenant, bool) {
+// resolveTenant re-reads a tenant row, so a caller holding a stale one can find out what the
+// control plane currently holds before it dials or evicts anything.
+func (p *Pool) resolveTenant(ctx context.Context, tenantID string, previous *meta.Tenant) (*meta.Tenant, bool) {
 	if p.metaStore == nil || previous == nil {
 		return nil, false
 	}
-	fresh, err := p.metaStore.GetTenant(ctx, previous.ID)
+	fresh, err := p.metaStore.GetTenant(ctx, tenantID)
 	if err != nil || fresh == nil {
-		logger.Warn(ctx, "tenant_pool_stale_open_resolve_failed",
-			zap.String("tenant_id", previous.ID),
+		logger.Warn(ctx, "tenant_pool_stale_row_resolve_failed",
+			zap.String("tenant_id", tenantID),
 			zap.Error(err))
 		return nil, false
 	}
 	return fresh, true
+}
+
+// sameCredential reports whether two rows carry the same database credential, which is what
+// decides whether a resolved row is worth retrying an acquisition for.
+func sameCredential(a, b *meta.Tenant) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	return a.DBUser == b.DBUser && bytes.Equal(a.DBPasswordCipher, b.DBPasswordCipher)
 }
 
 // Acquire returns a backend pinned for real tenant activity, including request
@@ -335,9 +344,14 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 	s3EncryptionPolicy := t.S3EncryptionPolicy()
 	storageNamespaceID := t.StorageNamespaceID
 	var toClose []*entry
-	p.mu.Lock()
-	if e, ok := p.items[t.ID]; ok {
-		if e.matches(t, s3EncryptionPolicy, storageNamespaceID) {
+	// A cached backend that does not match the row we were handed may be the current one and
+	// the row the stale one: a request can resolve its tenant, lose the race to a rotation, and
+	// arrive here afterwards. Ask the control plane before evicting anything, and open with the
+	// row it holds rather than with a credential the database may already have retired.
+	for attempt := 0; ; attempt++ {
+		p.mu.Lock()
+		e, ok := p.items[t.ID]
+		if ok && e.matches(t, s3EncryptionPolicy, storageNamespaceID) {
 			e.refs++
 			p.order.MoveToFront(e.elem)
 			e.lastUsed = time.Now()
@@ -348,16 +362,31 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 				poolAcquireTimingFields(t.ID, false, 0, totalDuration)...)
 			return e.backend, p.makeRelease(e), nil
 		}
-		if removed := p.removeLocked(e.elem, "replace"); removed != nil {
-			toClose = append(toClose, removed)
+		if !ok {
+			p.mu.Unlock()
+			break
+		}
+		p.mu.Unlock()
+		if attempt == 0 {
+			if fresh, resolved := p.resolveTenant(ctx, t.ID, t); resolved && !sameCredential(fresh, t) {
+				t = fresh
+				s3EncryptionPolicy = t.S3EncryptionPolicy()
+				storageNamespaceID = t.StorageNamespaceID
+				continue
+			}
+		}
+		p.mu.Lock()
+		if e, ok := p.items[t.ID]; ok {
+			if removed := p.removeLocked(e.elem, "replace"); removed != nil {
+				toClose = append(toClose, removed)
+			}
 		}
 		p.mu.Unlock()
 		for _, retired := range toClose {
 			p.closeEntry(retired)
 		}
 		toClose = nil
-	} else {
-		p.mu.Unlock()
+		break
 	}
 
 	// Fence the open: if the tenant is invalidated while it is in flight — a credential
@@ -397,7 +426,7 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 		if e, ok := p.tryCached(t, s3EncryptionPolicy, storageNamespaceID); ok {
 			return e.backend, p.makeRelease(e), nil
 		}
-		if fresh, ok := p.freshTenantAfterInvalidation(ctx, t); ok {
+		if fresh, ok := p.resolveTenant(ctx, t.ID, t); ok {
 			return p.Acquire(ctx, fresh)
 		}
 		return nil, nil, errTenantChangedDuringOpen
