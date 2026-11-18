@@ -137,10 +137,10 @@ type Pool struct {
 	items              map[string]*entry
 	order              *list.List
 	maxSize            int
-	// invalidationGen fences cold opens against concurrent invalidation: a backend opened
-	// with a credential that was rotated while the open was in flight must never be installed
-	// over the newer one.
-	invalidationGen map[string]uint64
+	// epoch fences every open against every change to a tenant's cache: a backend opened
+	// while that tenant was rotated, replaced or invalidated must never be installed over the
+	// newer one. It is advanced on removal, on installation and on explicit invalidation.
+	epoch map[string]uint64
 	// testHookBeforeInstall runs between a completed cold open and its installation, so a
 	// test can interleave an invalidation deterministically. Never set in production.
 	testHookBeforeInstall func(tenantID string)
@@ -283,178 +283,118 @@ func (p *Pool) wireTenantWorkNotifier(b *backend.Dat9Backend, tenantID string) {
 	})
 }
 
-// tryCached returns the cached backend if it is usable for this tenant row, promoting it in
-// the LRU. It is the fence's cheap retry: a backend installed by the acquisition that won the
-// race is already the current one.
-func (p *Pool) tryCached(t *meta.Tenant, s3EncryptionPolicy meta.S3EncryptionPolicy, storageNamespaceID string) (*entry, bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	e, ok := p.items[t.ID]
-	if !ok || !e.matches(t, s3EncryptionPolicy, storageNamespaceID) {
-		return nil, false
-	}
-	e.refs++
-	p.order.MoveToFront(e.elem)
-	e.lastUsed = time.Now()
-	return e, true
-}
-
-// grabCached pins the cached backend when its shape still matches the caller's row. It exists
-// for the one case where the credential cannot be verified and discarding a healthy backend
-// would be the worse outcome — but the S3 encryption policy and the storage namespace are not
-// a matter of verification: serving a backend that disagrees about them would encrypt or route
-// the caller's data the wrong way, so a mismatch fails instead.
-func (p *Pool) grabCached(t *meta.Tenant, s3EncryptionPolicy meta.S3EncryptionPolicy, storageNamespaceID string) (*entry, bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	e, ok := p.items[t.ID]
-	if !ok {
-		return nil, false
-	}
-	if e.s3EncryptionPolicy != s3EncryptionPolicy {
-		return nil, false
-	}
-	if storageNamespaceID != "" && e.storageNamespaceID != storageNamespaceID {
-		return nil, false
-	}
-	e.refs++
-	p.order.MoveToFront(e.elem)
-	e.lastUsed = time.Now()
-	return e, true
-}
-
 // errTenantRowUnverified reports that the tenant row could not be read and the cached backend's
 // shape no longer matches it, so neither serving nor evicting the cache is safe.
 var errTenantRowUnverified = errors.New("tenant row could not be verified and the cached backend does not match it")
 
-// errTenantChangedDuringOpen reports that a tenant was invalidated while its backend was
-// opening and no fresh row could be resolved to retry with.
+// errTenantChangedDuringOpen reports that a tenant kept changing while its backend was opening,
+// so the attempts budget ran out before a backend could be installed.
 var errTenantChangedDuringOpen = errors.New("tenant changed while its database was opening")
 
-// resolveTenant re-reads a tenant row, so a caller holding a stale one can find out what the
-// control plane currently holds before it dials or evicts anything.
-func (p *Pool) resolveTenant(ctx context.Context, tenantID string, previous *meta.Tenant) (*meta.Tenant, bool) {
-	if p.metaStore == nil || previous == nil {
-		return nil, false
-	}
-	fresh, err := p.metaStore.GetTenant(ctx, tenantID)
-	if err != nil || fresh == nil {
-		logger.Warn(ctx, "tenant_pool_stale_row_resolve_failed",
-			zap.String("tenant_id", tenantID),
-			zap.Error(err))
-		return nil, false
-	}
-	return fresh, true
-}
+// acquireAttempts bounds how many times one acquisition may re-evaluate before it gives up.
+// Each pass either returns the cached backend, replaces it, or notices that the tenant moved
+// under it and starts over; a tenant that never settles fails retryable instead of spinning.
+const acquireAttempts = 4
 
-// sameCredential reports whether two rows carry the same database credential, which is what
-// decides whether a resolved row is worth retrying an acquisition for.
-func sameCredential(a, b *meta.Tenant) bool {
-	if a == nil || b == nil {
-		return false
-	}
-	return a.DBUser == b.DBUser && bytes.Equal(a.DBPasswordCipher, b.DBPasswordCipher)
-}
-
-// Acquire returns a backend pinned for real tenant activity, including request
-// traffic and durable background work. It may cold-open the tenant and promotes
-// cache hits in the capacity LRU.
-// The returned release callback must be called when the caller is done.
+// Acquire returns a backend pinned for real tenant activity, including request traffic and
+// durable background work. It may cold-open the tenant and promotes cache hits in the
+// capacity LRU. The returned release callback must be called when the caller is done.
+//
+// One flat loop governs this, fenced by a per-tenant epoch:
+//
+//   - a hit needs no control-plane read;
+//   - a cached backend that does not match the row may mean the *row* is stale, so the row is
+//     re-read and adopted before anything is evicted;
+//   - the epoch is read under the same lock as the decision it justifies, so a rotation that
+//     lands while a database is opening is noticed — including on a cold pool, because an
+//     installation advances the epoch too;
+//   - an entry is only evicted, and an opened backend only installed, while the epoch is
+//     unchanged.
 func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Backend, release func(), err error) {
-	return p.acquire(ctx, t, 0)
-}
-
-// maxAcquireFenceRetries bounds how many times an acquisition may follow the tenant row
-// after being fenced. A retry re-resolves the row, so a tenant that keeps changing under a
-// hot loop cannot turn into unbounded recursion — it fails with a retryable error instead.
-const maxAcquireFenceRetries = 2
-
-// acquire is Acquire with the fence-retry budget threaded through.
-func (p *Pool) acquire(ctx context.Context, t *meta.Tenant, fenceRetries int) (out *backend.Dat9Backend, release func(), err error) {
+	if t == nil {
+		return nil, nil, errors.New("tenant is required")
+	}
 	start := time.Now()
 	defer observePool(ctx, "acquire", t.ID, &err, start)
-
-	if t.Status != meta.TenantActive {
-		logger.Warn(ctx, "tenant_pool_get_skipped_inactive",
-			zap.String("tenant_id", t.ID),
-			zap.String("status", string(t.Status)))
-		p.Invalidate(t.ID)
-		return nil, nil, fmt.Errorf("tenant status: %s", t.Status)
+	if err := p.requireActive(ctx, t); err != nil {
+		return nil, nil, err
 	}
 
-	s3EncryptionPolicy := t.S3EncryptionPolicy()
-	storageNamespaceID := t.StorageNamespaceID
-	var toClose []*entry
-	// A cached backend that does not match the row we were handed may be the current one and
-	// the row the stale one: a request can resolve its tenant, lose the race to a rotation, and
-	// arrive here afterwards. Ask the control plane before evicting anything, and open with the
-	// row it holds rather than with a credential the database may already have retired.
-	resolveAllowed := true
-	for attempt := 0; attempt < 3; attempt++ {
+	for attempt := 0; attempt < acquireAttempts; attempt++ {
+		// Hit path. The epoch is captured under the same lock: if anything replaces or
+		// invalidates this tenant from here on, whatever we do next is fenced off.
 		p.mu.Lock()
-		e, ok := p.items[t.ID]
-		if ok && e.matches(t, s3EncryptionPolicy, storageNamespaceID) {
-			e.refs++
-			p.order.MoveToFront(e.elem)
-			e.lastUsed = time.Now()
+		cached, cachedEntry := p.items[t.ID]
+		if cachedEntry && cached.matches(t, t.S3EncryptionPolicy(), t.StorageNamespaceID) {
+			cached.refs++
+			p.order.MoveToFront(cached.elem)
+			cached.lastUsed = time.Now()
 			p.mu.Unlock()
 			metrics.RecordOperation("tenant_pool", "cache_lookup", "hit", 0)
-			totalDuration := time.Since(start)
-			logger.InfoOpenPoolTiming(ctx, "tenant_pool_acquire_timing", totalDuration,
-				poolAcquireTimingFields(t.ID, false, 0, totalDuration)...)
-			return e.backend, p.makeRelease(e), nil
+			logger.InfoOpenPoolTiming(ctx, "tenant_pool_acquire_timing", time.Since(start),
+				poolAcquireTimingFields(t.ID, false, 0, time.Since(start))...)
+			return cached.backend, p.makeRelease(cached), nil
 		}
-		if !ok {
-			p.mu.Unlock()
-			break
-		}
-		// Capture the fence before releasing the lock: everything below decides on state that
-		// a concurrent rotation may change, and an unevidenced eviction is what strands a
-		// tenant without a backend it can authenticate with.
-		generation := p.invalidationGen[t.ID]
+		epoch := p.tenantEpochLocked(t.ID)
 		p.mu.Unlock()
 
-		if resolveAllowed {
-			resolveAllowed = false
-			fresh, resolved := p.resolveTenant(ctx, t.ID, t)
-			if resolved && !sameCredential(fresh, t) {
-				t = fresh
-				s3EncryptionPolicy = t.S3EncryptionPolicy()
-				storageNamespaceID = t.StorageNamespaceID
+		// A cached entry disagrees with the row we were handed — or nothing is cached and the
+		// row is all we have. Only the first case can mean the *row* is the stale one, so only
+		// then is the control plane worth reading before anything is evicted.
+		if !cachedEntry {
+			b, release, err, fenced := p.openAndInstall(ctx, t, epoch)
+			if !fenced {
+				return b, release, err
+			}
+			continue
+		}
+		fresh, resolveErr := p.resolveTenant(ctx, t.ID, t)
+		switch {
+		case errors.Is(resolveErr, context.Canceled), errors.Is(resolveErr, context.DeadlineExceeded):
+			return nil, nil, resolveErr
+		case errors.Is(resolveErr, meta.ErrNotFound):
+			// The tenant is gone: drop whatever is cached for it rather than serving it.
+			p.Invalidate(t.ID)
+			return nil, nil, fmt.Errorf("tenant %s no longer exists: %w", t.ID, meta.ErrNotFound)
+		case resolveErr != nil:
+			// A transient control-plane failure is not evidence that the cached backend is
+			// wrong. Serve it when its shape still matches, and fail retryable otherwise —
+			// never evict on an unverifiable row.
+			if e, ok := p.pinShapeMatch(t); ok {
+				logger.Warn(ctx, "tenant_pool_row_unverified_reusing_cached_backend",
+					zap.String("tenant_id", t.ID),
+					zap.Error(resolveErr))
+				return e.backend, p.makeRelease(e), nil
+			}
+			if p.poolHasEntry(t.ID) {
+				return nil, nil, fmt.Errorf("%w: %v", errTenantRowUnverified, resolveErr)
+			}
+			// Nothing cached: a cold open with the row we have is still the best answer.
+		case fresh != nil:
+			// Adopt the resolved row, and enforce the status it carries: a caller holding a
+			// stale `active` row must not resurrect a suspended or deleting tenant. Re-run the
+			// hit check only when the row actually says something different, or a tenant whose
+			// row never changes would burn the whole attempts budget.
+			adopted := carryForwardTenant(fresh, t)
+			if err := p.requireActive(ctx, adopted); err != nil {
+				return nil, nil, err
+			}
+			if !sameTenantRow(adopted, t) {
+				t = adopted
 				continue
 			}
-			if !resolved && p.metaStore != nil {
-				// The credential cannot be verified right now: evicting on an unverifiable row
-				// is how a healthy backend disappears during a control-plane blip. Keep it and
-				// serve it only if it still agrees about the encryption policy and namespace —
-				// those decide where the caller's data goes, so a disagreement fails instead of
-				// being papered over.
-				cached, servesCaller := p.grabCached(t, s3EncryptionPolicy, storageNamespaceID)
-				if servesCaller {
-					logger.Warn(ctx, "tenant_pool_row_unverified_reusing_cached_backend",
-						zap.String("tenant_id", t.ID))
-					return cached.backend, p.makeRelease(cached), nil
-				}
-				logger.Warn(ctx, "tenant_pool_row_unverified_shape_mismatch",
-					zap.String("tenant_id", t.ID))
-				return nil, nil, errTenantRowUnverified
-			}
+			t = adopted
 		}
 
-		if hook := p.testHookBeforeEvict; hook != nil {
-			hook(t.ID)
-		}
+		// Evict the mismatched entry, but only while nothing has changed since we looked.
+		var toClose *entry
 		p.mu.Lock()
-		if p.invalidationGen[t.ID] != generation {
-			// A rotation landed while the row was being resolved: the cached backend may be
-			// the current one now, so re-evaluate — including the row, which is what the
-			// eviction was about to judge — instead of evicting it.
+		if p.tenantEpochLocked(t.ID) != epoch {
 			p.mu.Unlock()
-			resolveAllowed = true
 			continue
 		}
 		if e, ok := p.items[t.ID]; ok {
-			if e.matches(t, s3EncryptionPolicy, storageNamespaceID) {
+			if e.matches(t, t.S3EncryptionPolicy(), t.StorageNamespaceID) {
 				e.refs++
 				p.order.MoveToFront(e.elem)
 				e.lastUsed = time.Now()
@@ -462,87 +402,76 @@ func (p *Pool) acquire(ctx context.Context, t *meta.Tenant, fenceRetries int) (o
 				return e.backend, p.makeRelease(e), nil
 			}
 			if removed := p.removeLocked(e.elem, "replace"); removed != nil {
-				toClose = append(toClose, removed)
+				toClose = removed
 			}
 		}
+		openEpoch := p.tenantEpochLocked(t.ID)
 		p.mu.Unlock()
-		for _, retired := range toClose {
-			p.closeEntry(retired)
+		p.closeEntry(toClose)
+
+		if hook := p.testHookBeforeEvict; hook != nil {
+			hook(t.ID)
 		}
-		toClose = nil
-		break
+		b, release, err, fenced := p.openAndInstall(ctx, t, openEpoch)
+		if !fenced {
+			return b, release, err
+		}
 	}
+	return nil, nil, errTenantChangedDuringOpen
+}
 
-	// Fence the open: if the tenant is invalidated while it is in flight — a credential
-	// rotation, a status change — the backend we are about to install was opened with data
-	// that has since been replaced, and installing it would evict the newer one.
-	generation := p.credentialGeneration(t.ID)
-	createBackendStart := time.Now()
-	b, st, tidbCloudOrgID, err := p.createBackend(ctx, t)
+// openAndInstall opens a backend for the row and installs it if the tenant has not moved on.
+// It reports whether the open was fenced, in which case the caller re-evaluates.
+func (p *Pool) openAndInstall(ctx context.Context, t *meta.Tenant, openEpoch uint64) (b *backend.Dat9Backend, release func(), err error, fenced bool) {
+	if hook := p.testHookBeforeEvict; hook != nil {
+		hook(t.ID)
+	}
+	openStart := time.Now()
+	opened, store, tidbCloudOrgID, err := p.createBackend(ctx, t)
 	if err != nil {
-		// Cold-open failure: a tenant TiDB open was attempted but failed.
-		// Record so alerts can detect a scan path that is churning cold opens.
-		metrics.RecordTenantOperationWithOrg(t.ID, tidbCloudOrgID, "user_db_access", "acquire_cold_open", "error", time.Since(createBackendStart))
-		return nil, nil, err
+		metrics.RecordTenantOperationWithOrg(t.ID, tidbCloudOrgID, "user_db_access", "acquire_cold_open", "error", time.Since(openStart))
+		return nil, nil, err, false
 	}
-	createBackendDurationMs := float64(time.Since(createBackendStart).Microseconds()) / 1000.0
-	// Cold-open success: a tenant TiDB was opened from scratch (cache miss).
-	// This is the canonical "a serverless TiDB was woken up" signal — the
-	// primary billing-storm indicator. PR #660 eliminated periodic scans that
-	// caused cold opens at scale; this metric guards against regressions.
-	metrics.RecordTenantOperationWithOrg(t.ID, tidbCloudOrgID, "user_db_access", "acquire_cold_open", "ok", time.Since(createBackendStart))
-
+	metrics.RecordTenantOperationWithOrg(t.ID, tidbCloudOrgID, "user_db_access", "acquire_cold_open", "ok", time.Since(openStart))
 	if hook := p.testHookBeforeInstall; hook != nil {
 		hook(t.ID)
 	}
-	p.mu.Lock()
-	if p.invalidationGen[t.ID] != generation {
-		// The tenant changed while this backend was opening. It may hold the retired
-		// credential, so it cannot serve: discard it and retry once with a freshly resolved
-		// tenant row rather than caching a backend that would fail authentication.
-		p.mu.Unlock()
-		b.Close()
-		_ = st.Close()
-		metrics.RecordOperation("tenant_pool", "remove", "stale_open", 0)
-		// Another acquisition may already have installed a backend for the current row while
-		// this one was opening. Reuse that first: it needs no control-plane read, and it is the
-		// backend the caller should get.
-		if e, ok := p.tryCached(t, s3EncryptionPolicy, storageNamespaceID); ok {
-			return e.backend, p.makeRelease(e), nil
-		}
-		if fenceRetries >= maxAcquireFenceRetries {
-			return nil, nil, errTenantChangedDuringOpen
-		}
-		if fresh, ok := p.resolveTenant(ctx, t.ID, t); ok {
-			return p.acquire(ctx, fresh, fenceRetries+1)
-		}
-		return nil, nil, errTenantChangedDuringOpen
+	if installed, ok := p.installOpened(t, opened, store, openEpoch); ok {
+		return installed.backend, p.makeRelease(installed), nil, false
 	}
-	if e, ok := p.items[t.ID]; ok {
-		// Same predicate as the fast path: a cold open that raced a rotation must not be
-		// treated as a hit just because the encryption policy still matches, or the caller
-		// would get the retired credential's backend and the valid one would be closed.
-		if e.matches(t, s3EncryptionPolicy, t.StorageNamespaceID) {
-			e.refs++
-			p.order.MoveToFront(e.elem)
-			e.lastUsed = time.Now()
-			p.mu.Unlock()
+	opened.Close()
+	_ = store.Close()
+	metrics.RecordOperation("tenant_pool", "remove", "stale_open", 0)
+	return nil, nil, nil, true
+}
+
+// installOpened installs a freshly opened backend when the epoch it was opened under is still
+// current, advancing the epoch so that a concurrent open for the same tenant is fenced too.
+// It reuses an entry that became current in the meantime, closing the opened backend.
+func (p *Pool) installOpened(t *meta.Tenant, b *backend.Dat9Backend, st *datastore.Store, openEpoch uint64) (*entry, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.tenantEpochLocked(t.ID) != openEpoch {
+		return nil, false
+	}
+	if existing, ok := p.items[t.ID]; ok {
+		if existing.matches(t, t.S3EncryptionPolicy(), t.StorageNamespaceID) {
+			existing.refs++
+			p.order.MoveToFront(existing.elem)
+			existing.lastUsed = time.Now()
 			b.Close()
 			_ = st.Close()
-			metrics.RecordOperation("tenant_pool", "cache_lookup", "hit", 0)
-			totalDuration := time.Since(start)
-			logger.InfoOpenPoolTiming(ctx, "tenant_pool_acquire_timing", totalDuration,
-				poolAcquireTimingFields(t.ID, true, createBackendDurationMs, totalDuration)...)
-			return e.backend, p.makeRelease(e), nil
+			return existing, true
 		}
-		if removed := p.removeLocked(e.elem, "replace"); removed != nil {
-			toClose = append(toClose, removed)
+		if removed := p.removeLocked(existing.elem, "replace"); removed != nil {
+			removed.backend.Close()
+			_ = removed.store.Close()
 		}
 	}
 	e := &entry{
 		tenantID:           t.ID,
 		storageNamespaceID: t.StorageNamespaceID,
-		s3EncryptionPolicy: s3EncryptionPolicy,
+		s3EncryptionPolicy: t.S3EncryptionPolicy(),
 		dbUser:             t.DBUser,
 		dbPasswordCipher:   append([]byte(nil), t.DBPasswordCipher...),
 		backend:            b,
@@ -552,48 +481,122 @@ func (p *Pool) acquire(ctx context.Context, t *meta.Tenant, fenceRetries int) (o
 	}
 	e.elem = p.order.PushFront(e)
 	p.items[t.ID] = e
+	p.bumpTenantEpochLocked(t.ID)
+	p.recordCachedBackendCountLocked()
 	for p.order.Len() > p.maxSize {
 		oldest := p.order.Back()
-		if oldest != nil {
-			if removed := p.removeLocked(oldest, "evict"); removed != nil {
-				toClose = append(toClose, removed)
-			}
+		if oldest == nil {
+			break
+		}
+		if removed := p.removeLocked(oldest, "evict"); removed != nil {
+			removed.backend.Close()
+			_ = removed.store.Close()
 		}
 	}
-	p.recordCachedBackendCountLocked()
-	// FileGC is now kick-driven through the unified tenant worker; no
-	// per-backend goroutine is started here.
-	p.mu.Unlock()
-	for _, retired := range toClose {
-		p.closeEntry(retired)
-	}
-	metrics.RecordOperation("tenant_pool", "cache_lookup", "miss", 0)
-	totalDuration := time.Since(start)
-	logger.InfoOpenPoolTiming(ctx, "tenant_pool_acquire_timing", totalDuration,
-		poolAcquireTimingFields(t.ID, true, createBackendDurationMs, totalDuration)...)
-	return b, p.makeRelease(e), nil
+	return e, true
 }
 
-// credentialGeneration returns the current invalidation generation for a tenant.
-func (p *Pool) credentialGeneration(tenantID string) uint64 {
+// requireActive refuses a tenant that is not serving, dropping anything cached for it.
+func (p *Pool) requireActive(ctx context.Context, t *meta.Tenant) error {
+	if t.Status == meta.TenantActive {
+		return nil
+	}
+	logger.Warn(ctx, "tenant_pool_get_skipped_inactive",
+		zap.String("tenant_id", t.ID),
+		zap.String("status", string(t.Status)))
+	p.Invalidate(t.ID)
+	return fmt.Errorf("tenant status: %s", t.Status)
+}
+
+// sameTenantRow reports whether two rows describe the same credential and shape, which is what
+// decides whether adopting a resolved row can change anything.
+func sameTenantRow(a, b *meta.Tenant) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.DBUser == b.DBUser &&
+		bytes.Equal(a.DBPasswordCipher, b.DBPasswordCipher) &&
+		a.S3EncryptionPolicy() == b.S3EncryptionPolicy() &&
+		a.StorageNamespaceID == b.StorageNamespaceID &&
+		a.Status == b.Status
+}
+
+// carryForwardTenant keeps the org id a caller already knew when the resolved row does not
+// carry one, so metrics stay attributed to the same organization.
+func carryForwardTenant(fresh, previous *meta.Tenant) *meta.Tenant {
+	if fresh == nil {
+		return previous
+	}
+	if fresh.TiDBCloudOrgID == "" && previous != nil {
+		fresh.TiDBCloudOrgID = previous.TiDBCloudOrgID
+	}
+	return fresh
+}
+
+// resolveTenant re-reads a tenant row. Callers distinguish the errors: a deleted tenant and a
+// cancelled context are answers, while a transient failure means the row is unknown.
+func (p *Pool) resolveTenant(ctx context.Context, tenantID string, previous *meta.Tenant) (*meta.Tenant, error) {
+	if p.metaStore == nil || previous == nil {
+		return nil, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	fresh, err := p.metaStore.GetTenant(ctx, tenantID)
+	if err != nil {
+		if !errors.Is(err, meta.ErrNotFound) {
+			logger.Warn(ctx, "tenant_pool_row_resolve_failed",
+				zap.String("tenant_id", tenantID),
+				zap.Error(err))
+		}
+		return nil, err
+	}
+	return fresh, nil
+}
+
+// pinShapeMatch pins the cached backend when its encryption policy and namespace still match
+// the caller's row, ignoring the credential. It is the fallback for an unverifiable row:
+// those two settings decide where data goes, so a disagreement is not something to fall back
+// on.
+func (p *Pool) pinShapeMatch(t *meta.Tenant) (*entry, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.invalidationGen[tenantID]
+	e, ok := p.items[t.ID]
+	if !ok || !e.sameShape(t.S3EncryptionPolicy(), t.StorageNamespaceID) {
+		return nil, false
+	}
+	e.refs++
+	p.order.MoveToFront(e.elem)
+	e.lastUsed = time.Now()
+	return e, true
 }
 
-// bumpInvalidationLocked marks every in-flight open for the tenant as stale. Called with
-// p.mu held by every path that drops a cached backend on purpose.
-func (p *Pool) bumpInvalidationLocked(tenantID string) {
-	if p.invalidationGen == nil {
-		p.invalidationGen = map[string]uint64{}
+// poolHasEntry reports whether anything is cached for the tenant.
+func (p *Pool) poolHasEntry(tenantID string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_, ok := p.items[tenantID]
+	return ok
+}
+
+// tenantEpochLocked returns the tenant's cache epoch. Callers hold p.mu, so the decision it
+// justifies cannot be invalidated between deciding and acting.
+func (p *Pool) tenantEpochLocked(tenantID string) uint64 {
+	return p.epoch[tenantID]
+}
+
+// bumpTenantEpochLocked advances the tenant's epoch, marking every in-flight open as stale.
+func (p *Pool) bumpTenantEpochLocked(tenantID string) {
+	if p.epoch == nil {
+		p.epoch = map[string]uint64{}
 	}
-	p.invalidationGen[tenantID]++
+	p.epoch[tenantID]++
 }
 
 func (p *Pool) Invalidate(tenantID string) {
 	var toClose *entry
 	p.mu.Lock()
-	p.bumpInvalidationLocked(tenantID)
+	p.bumpTenantEpochLocked(tenantID)
 	if e, ok := p.items[tenantID]; ok {
 		toClose = p.removeLocked(e.elem, "invalidate")
 	}
@@ -708,7 +711,7 @@ func (p *Pool) InvalidateAndWait(ctx context.Context, tenantID string) error {
 	var retired *entry
 	var toClose *entry
 	p.mu.Lock()
-	p.bumpInvalidationLocked(tenantID)
+	p.bumpTenantEpochLocked(tenantID)
 	if e, ok := p.items[tenantID]; ok {
 		retired = e
 		toClose = p.removeLocked(e.elem, "invalidate")
@@ -1329,7 +1332,7 @@ func (p *Pool) removeLockedWithoutMetrics(elem *list.Element) *entry {
 	// Any removal is a cache change: a concurrent cold open or mismatch eviction that started
 	// before it must not be treated as still current. That includes a plain replacement, which
 	// arrives without an invalidation.
-	p.bumpInvalidationLocked(e.tenantID)
+	p.bumpTenantEpochLocked(e.tenantID)
 	e.retired = true
 	if e.refs == 0 {
 		return e
@@ -1346,13 +1349,19 @@ func (p *Pool) recordCachedBackendCountLocked() {
 // filled its cache just before the invalidation signal arrived, or an outbox row it already
 // skipped — to the next Acquire instead of leaving it broken indefinitely.
 func (e *entry) matches(t *meta.Tenant, s3EncryptionPolicy meta.S3EncryptionPolicy, storageNamespaceID string) bool {
-	if e.s3EncryptionPolicy != s3EncryptionPolicy {
-		return false
-	}
-	if storageNamespaceID != "" && e.storageNamespaceID != storageNamespaceID {
+	if !e.sameShape(s3EncryptionPolicy, storageNamespaceID) {
 		return false
 	}
 	return e.dbUser == t.DBUser && bytes.Equal(e.dbPasswordCipher, t.DBPasswordCipher)
+}
+
+// sameShape reports whether the entry agrees with a row about everything except the credential:
+// the encryption policy and the storage namespace decide where the caller's data goes.
+func (e *entry) sameShape(s3EncryptionPolicy meta.S3EncryptionPolicy, storageNamespaceID string) bool {
+	if e.s3EncryptionPolicy != s3EncryptionPolicy {
+		return false
+	}
+	return storageNamespaceID == "" || e.storageNamespaceID == storageNamespaceID
 }
 
 func (p *Pool) makeRelease(e *entry) func() {

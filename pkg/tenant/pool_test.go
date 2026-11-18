@@ -1517,6 +1517,9 @@ func TestPoolMismatchEvictionIsFencedAgainstPlainReplacement(t *testing.T) {
 		}
 		e.elem = pool.order.PushFront(e)
 		pool.items[tenantID] = e
+		// A real installation advances the epoch; that is the only fence signal in this
+		// scenario, since nothing invalidated the tenant.
+		pool.bumpTenantEpochLocked(tenantID)
 		pool.mu.Unlock()
 		replacement = e
 	}
