@@ -130,13 +130,13 @@ type TenantStoreEntry struct {
 }
 
 type Pool struct {
-	mu                 sync.Mutex
-	cfg                PoolConfig
-	enc                encrypt.Encryptor
-	metaStore          *meta.Store // central server DB for quota operations; nil disables central quota
-	items              map[string]*entry
-	order              *list.List
-	maxSize            int
+	mu        sync.Mutex
+	cfg       PoolConfig
+	enc       encrypt.Encryptor
+	metaStore *meta.Store // central server DB for quota operations; nil disables central quota
+	items     map[string]*entry
+	order     *list.List
+	maxSize   int
 	// epoch fences every open against every change to a tenant's cache: a backend opened
 	// while that tenant was rotated, replaced or invalidated must never be installed over the
 	// newer one. It is advanced on removal, on installation and on explicit invalidation.
@@ -147,7 +147,7 @@ type Pool struct {
 	// testHookBeforeEvict runs between resolving a stale row and evicting the cached backend,
 	// so a test can interleave a rotation deterministically. Never set in production.
 	testHookBeforeEvict func(tenantID string)
-	tenantWorkNotifier atomic.Pointer[func(tenantID, tidbCloudOrgID string, workMask int)]
+	tenantWorkNotifier  atomic.Pointer[func(tenantID, tidbCloudOrgID string, workMask int)]
 	// fileGCEnabled is retained for backward compatibility but no longer used:
 	// FileGC is now kick-driven through the unified tenant worker, not a
 	// per-backend goroutine.
@@ -220,11 +220,11 @@ type entry struct {
 	dbUser           string
 	dbPasswordCipher []byte
 	backend          *backend.Dat9Backend
-	store              *datastore.Store
-	elem               *list.Element
-	refs               int
-	retired            bool
-	lastUsed           time.Time // refreshed by real activity through Acquire; never by AcquireCached
+	store            *datastore.Store
+	elem             *list.Element
+	refs             int
+	retired          bool
+	lastUsed         time.Time // refreshed by real activity through Acquire; never by AcquireCached
 }
 
 func NewPool(cfg PoolConfig, enc encrypt.Encryptor) *Pool {
@@ -320,6 +320,7 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 		return nil, nil, err
 	}
 
+	fencedRetry := false
 	for attempt := 0; attempt < acquireAttempts; attempt++ {
 		// Hit path. The epoch is captured under the same lock: if anything replaces or
 		// invalidates this tenant from here on, whatever we do next is fenced off.
@@ -340,14 +341,18 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 
 		// A cached entry disagrees with the row we were handed — or nothing is cached and the
 		// row is all we have. Only the first case can mean the *row* is the stale one, so only
-		// then is the control plane worth reading before anything is evicted.
-		if !cachedEntry {
-			b, release, err, fenced := p.openAndInstall(ctx, t, epoch)
+		// then is the control plane worth reading before anything is evicted. A retry after a
+		// fenced open always reads it: the epoch moved, which is exactly when the row may have
+		// changed too, and there is no cached entry to compare it with.
+		if !cachedEntry && !fencedRetry {
+			b, release, err, fenced := p.openAndInstall(ctx, t, start, epoch)
 			if !fenced {
 				return b, release, err
 			}
+			fencedRetry = true
 			continue
 		}
+		fencedRetry = false
 		fresh, resolveErr := p.resolveTenant(ctx, t.ID, t)
 		switch {
 		case errors.Is(resolveErr, context.Canceled), errors.Is(resolveErr, context.DeadlineExceeded):
@@ -360,13 +365,14 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 			// A transient control-plane failure is not evidence that the cached backend is
 			// wrong. Serve it when its shape still matches, and fail retryable otherwise —
 			// never evict on an unverifiable row.
-			if e, ok := p.pinShapeMatch(t); ok {
+			pinned, present := p.pinShapeMatchIfPresent(t)
+			if pinned != nil {
 				logger.Warn(ctx, "tenant_pool_row_unverified_reusing_cached_backend",
 					zap.String("tenant_id", t.ID),
 					zap.Error(resolveErr))
-				return e.backend, p.makeRelease(e), nil
+				return pinned.backend, p.makeRelease(pinned), nil
 			}
-			if p.poolHasEntry(t.ID) {
+			if present {
 				return nil, nil, fmt.Errorf("%w: %v", errTenantRowUnverified, resolveErr)
 			}
 			// Nothing cached: a cold open with the row we have is still the best answer.
@@ -387,6 +393,9 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 		}
 
 		// Evict the mismatched entry, but only while nothing has changed since we looked.
+		if hook := p.testHookBeforeEvict; hook != nil {
+			hook(t.ID)
+		}
 		var toClose *entry
 		p.mu.Lock()
 		if p.tenantEpochLocked(t.ID) != epoch {
@@ -409,64 +418,61 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 		p.mu.Unlock()
 		p.closeEntry(toClose)
 
-		if hook := p.testHookBeforeEvict; hook != nil {
-			hook(t.ID)
-		}
-		b, release, err, fenced := p.openAndInstall(ctx, t, openEpoch)
+		b, release, err, fenced := p.openAndInstall(ctx, t, start, openEpoch)
 		if !fenced {
 			return b, release, err
 		}
+		fencedRetry = true
 	}
 	return nil, nil, errTenantChangedDuringOpen
 }
 
 // openAndInstall opens a backend for the row and installs it if the tenant has not moved on.
 // It reports whether the open was fenced, in which case the caller re-evaluates.
-func (p *Pool) openAndInstall(ctx context.Context, t *meta.Tenant, openEpoch uint64) (b *backend.Dat9Backend, release func(), err error, fenced bool) {
-	if hook := p.testHookBeforeEvict; hook != nil {
-		hook(t.ID)
-	}
+func (p *Pool) openAndInstall(ctx context.Context, t *meta.Tenant, start time.Time, openEpoch uint64) (b *backend.Dat9Backend, release func(), err error, fenced bool) {
 	openStart := time.Now()
 	opened, store, tidbCloudOrgID, err := p.createBackend(ctx, t)
 	if err != nil {
 		metrics.RecordTenantOperationWithOrg(t.ID, tidbCloudOrgID, "user_db_access", "acquire_cold_open", "error", time.Since(openStart))
 		return nil, nil, err, false
 	}
+	createBackendMs := float64(time.Since(openStart).Microseconds()) / 1000.0
+	// Cold-open success: a tenant TiDB was opened from scratch (cache miss). This is the
+	// canonical "a serverless TiDB was woken up" signal, the primary billing-storm indicator.
 	metrics.RecordTenantOperationWithOrg(t.ID, tidbCloudOrgID, "user_db_access", "acquire_cold_open", "ok", time.Since(openStart))
+
 	if hook := p.testHookBeforeInstall; hook != nil {
 		hook(t.ID)
 	}
-	if installed, ok := p.installOpened(t, opened, store, openEpoch); ok {
-		return installed.backend, p.makeRelease(installed), nil, false
+	installed, retired, ok := p.installOpened(t, opened, store, openEpoch)
+	if !ok {
+		opened.Close()
+		_ = store.Close()
+		metrics.RecordOperation("tenant_pool", "remove", "stale_open", 0)
+		return nil, nil, nil, true
 	}
-	opened.Close()
-	_ = store.Close()
-	metrics.RecordOperation("tenant_pool", "remove", "stale_open", 0)
-	return nil, nil, nil, true
+	// Everything below is outside p.mu: closing a backend waits for queued quota mutations and
+	// closing the store tears down its SQL pool, neither of which may happen under the pool
+	// lock that every tenant's request path needs.
+	for _, entry := range retired {
+		p.closeEntry(entry)
+	}
+	totalDuration := time.Since(start)
+	metrics.RecordOperation("tenant_pool", "cache_lookup", "miss", 0)
+	logger.InfoOpenPoolTiming(ctx, "tenant_pool_acquire_timing", totalDuration,
+		poolAcquireTimingFields(t.ID, true, createBackendMs, totalDuration)...)
+	return installed.backend, p.makeRelease(installed), nil, false
 }
 
 // installOpened installs a freshly opened backend when the epoch it was opened under is still
 // current, advancing the epoch so that a concurrent open for the same tenant is fenced too.
-// It reuses an entry that became current in the meantime, closing the opened backend.
-func (p *Pool) installOpened(t *meta.Tenant, b *backend.Dat9Backend, st *datastore.Store, openEpoch uint64) (*entry, bool) {
+// It returns the entries it retired — capacity evictions — for the caller to close outside the
+// lock.
+func (p *Pool) installOpened(t *meta.Tenant, b *backend.Dat9Backend, st *datastore.Store, openEpoch uint64) (*entry, []*entry, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.tenantEpochLocked(t.ID) != openEpoch {
-		return nil, false
-	}
-	if existing, ok := p.items[t.ID]; ok {
-		if existing.matches(t, t.S3EncryptionPolicy(), t.StorageNamespaceID) {
-			existing.refs++
-			p.order.MoveToFront(existing.elem)
-			existing.lastUsed = time.Now()
-			b.Close()
-			_ = st.Close()
-			return existing, true
-		}
-		if removed := p.removeLocked(existing.elem, "replace"); removed != nil {
-			removed.backend.Close()
-			_ = removed.store.Close()
-		}
+		return nil, nil, false
 	}
 	e := &entry{
 		tenantID:           t.ID,
@@ -483,17 +489,17 @@ func (p *Pool) installOpened(t *meta.Tenant, b *backend.Dat9Backend, st *datasto
 	p.items[t.ID] = e
 	p.bumpTenantEpochLocked(t.ID)
 	p.recordCachedBackendCountLocked()
+	var retired []*entry
 	for p.order.Len() > p.maxSize {
 		oldest := p.order.Back()
 		if oldest == nil {
 			break
 		}
 		if removed := p.removeLocked(oldest, "evict"); removed != nil {
-			removed.backend.Close()
-			_ = removed.store.Close()
+			retired = append(retired, removed)
 		}
 	}
-	return e, true
+	return e, retired, true
 }
 
 // requireActive refuses a tenant that is not serving, dropping anything cached for it.
@@ -554,29 +560,24 @@ func (p *Pool) resolveTenant(ctx context.Context, tenantID string, previous *met
 	return fresh, nil
 }
 
-// pinShapeMatch pins the cached backend when its encryption policy and namespace still match
-// the caller's row, ignoring the credential. It is the fallback for an unverifiable row:
-// those two settings decide where data goes, so a disagreement is not something to fall back
-// on.
-func (p *Pool) pinShapeMatch(t *meta.Tenant) (*entry, bool) {
+// pinShapeMatchIfPresent looks at the cached entry for an unverifiable row. It pins and returns
+// it when its encryption policy and namespace still match — those decide where the data goes,
+// so a disagreement is not something to fall back on — and otherwise reports only whether an
+// entry was present, which is what distinguishes "keep it and fail" from "open a fresh one".
+func (p *Pool) pinShapeMatchIfPresent(t *meta.Tenant) (pinned *entry, present bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	e, ok := p.items[t.ID]
-	if !ok || !e.sameShape(t.S3EncryptionPolicy(), t.StorageNamespaceID) {
+	if !ok {
 		return nil, false
+	}
+	if !e.sameShape(t.S3EncryptionPolicy(), t.StorageNamespaceID) {
+		return nil, true
 	}
 	e.refs++
 	p.order.MoveToFront(e.elem)
 	e.lastUsed = time.Now()
 	return e, true
-}
-
-// poolHasEntry reports whether anything is cached for the tenant.
-func (p *Pool) poolHasEntry(tenantID string) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	_, ok := p.items[tenantID]
-	return ok
 }
 
 // tenantEpochLocked returns the tenant's cache epoch. Callers hold p.mu, so the decision it

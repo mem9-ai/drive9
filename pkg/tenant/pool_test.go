@@ -1539,7 +1539,9 @@ func TestPoolMismatchEvictionIsFencedAgainstPlainReplacement(t *testing.T) {
 	if cached != replacement {
 		t.Fatal("the fenced mismatch removed the entry a plain replacement had installed")
 	}
-	_ = got
+	if got != replacement.backend {
+		t.Fatal("the caller received a backend other than the replacement")
+	}
 }
 
 // An unreadable tenant row must not make the pool serve a backend whose S3 policy or storage
