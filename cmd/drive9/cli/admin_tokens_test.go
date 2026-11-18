@@ -13,22 +13,37 @@ func TestAdminTenantGenerateTokenOwnerAndTokenOnly(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	clearProvisionEnv(t)
 
+	var lastKeyName string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/v1/tokens/generate" {
-			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected path", http.StatusBadRequest)
+			return
 		}
 		if r.Header.Get("X-TiDBCloud-Public-Key") != "pub-target" || r.Header.Get("X-TiDBCloud-Private-Key") != "priv-target" {
-			t.Fatalf("missing TiDB Cloud headers: %+v", r.Header)
+			t.Errorf("missing TiDB Cloud headers: %+v", r.Header)
+			http.Error(w, "missing credentials", http.StatusUnauthorized)
+			return
 		}
 		var body map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			t.Fatalf("decode body: %v", err)
+			t.Errorf("decode body: %v", err)
+			http.Error(w, "bad json", http.StatusBadRequest)
+			return
 		}
 		if body["tenant_id"] != "tnt-migrated" {
-			t.Fatalf("unexpected tenant_id: %+v", body)
+			t.Errorf("unexpected tenant_id: %+v", body)
+			http.Error(w, "unexpected tenant_id", http.StatusBadRequest)
+			return
 		}
 		if _, ok := body["scopes"]; ok {
-			t.Fatalf("owner key must omit scopes: %+v", body)
+			t.Errorf("owner key must omit scopes: %+v", body)
+			http.Error(w, "unexpected scopes", http.StatusBadRequest)
+			return
+		}
+		lastKeyName, _ = body["key_name"].(string)
+		if lastKeyName == "" {
+			lastKeyName = "default"
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
@@ -36,7 +51,7 @@ func TestAdminTenantGenerateTokenOwnerAndTokenOnly(t *testing.T) {
 			"token":      "d9_new_target_owner_key",
 			"token_id":   "key_target_1",
 			"tenant_id":  "tnt-migrated",
-			"key_name":   "cutover",
+			"key_name":   lastKeyName,
 			"scope_kind": "owner",
 			"status":     "active",
 			"issued_at":  time.Date(2026, 11, 18, 10, 0, 0, 0, time.UTC).Format(time.RFC3339),
@@ -63,21 +78,30 @@ func TestAdminTenantGenerateTokenOwnerAndTokenOnly(t *testing.T) {
 		}
 	}
 
+	// Ensure a flag value named "help" is sent as data rather than triggering usage.
 	rawOut, err := captureStdoutE(t, func() error {
 		return Admin([]string{
 			"tenant", "generate-token",
 			"--server", ts.URL,
 			"--tenant-id", "tnt-migrated",
+			"--key-name", "help",
 			"--token-only",
 			"--tidbcloud-public-key", "pub-target",
 			"--tidbcloud-private-key", "priv-target",
 		})
 	})
 	if err != nil {
-		t.Fatalf("generate-token --token-only: %v", err)
+		t.Fatalf("generate-token --key-name help --token-only: %v", err)
 	}
-	if strings.TrimSpace(rawOut) != "d9_new_target_owner_key" {
-		t.Fatalf("got %q, want bare token", rawOut)
+	if strings.TrimSpace(rawOut) != "d9_new_target_owner_key" || lastKeyName != "help" {
+		t.Fatalf("got out=%q key_name=%q, want bare token with key_name=help", rawOut, lastKeyName)
+	}
+
+	helpOut, err := captureStdoutE(t, func() error {
+		return Admin([]string{"tenant", "generate-token", "--help"})
+	})
+	if err != nil || !strings.Contains(helpOut, "usage: drive9 admin tenant generate-token") {
+		t.Fatalf("generate-token --help: err=%v out=%q", err, helpOut)
 	}
 }
 
@@ -88,14 +112,27 @@ func TestAdminTenantGenerateTokenScopedAndValidation(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			t.Fatalf("decode body: %v", err)
+			t.Errorf("decode body: %v", err)
+			http.Error(w, "bad json", http.StatusBadRequest)
+			return
 		}
 		if body["ttl_seconds"] != float64(7200) {
-			t.Fatalf("unexpected ttl_seconds: %+v", body)
+			t.Errorf("unexpected ttl_seconds: %+v", body)
+			http.Error(w, "unexpected ttl_seconds", http.StatusBadRequest)
+			return
 		}
 		scopes, _ := body["scopes"].([]any)
 		if len(scopes) != 1 {
-			t.Fatalf("unexpected scopes: %+v", body)
+			t.Errorf("unexpected scopes: %+v", body)
+			http.Error(w, "unexpected scopes", http.StatusBadRequest)
+			return
+		}
+		grant, _ := scopes[0].(map[string]any)
+		ops, _ := grant["ops"].([]any)
+		if grant["prefix"] != "/workspace" || len(ops) != 2 || ops[0] != "read" || ops[1] != "list" {
+			t.Errorf("unexpected grant payload: %+v", grant)
+			http.Error(w, "unexpected grant payload", http.StatusBadRequest)
+			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
@@ -135,6 +172,7 @@ func TestAdminTenantGenerateTokenScopedAndValidation(t *testing.T) {
 		{"tenant", "generate-token", "--server", ts.URL, "--tidbcloud-public-key", "p", "--tidbcloud-private-key", "s"},
 		{"tenant", "generate-token", "--server", ts.URL, "--tenant-id", "tnt-1", "--allow", "/a:read", "--tidbcloud-public-key", "p", "--tidbcloud-private-key", "s"},
 		{"tenant", "generate-token", "--server", ts.URL, "--tenant-id", "tnt-1", "--json", "--token-only", "--tidbcloud-public-key", "p", "--tidbcloud-private-key", "s"},
+		{"tenant", "generate-token", "--server", ts.URL, "--tenant-id", "tnt-1", "--key-name", "--token-only", "--tidbcloud-public-key", "p", "--tidbcloud-private-key", "s"},
 	} {
 		if err := Admin(badArgs); err == nil {
 			t.Fatalf("expected validation error for args %v", badArgs)

@@ -35,9 +35,23 @@ type AdminGenerateTokenResponse struct {
 	Scopes    []FSScopeGrant `json:"scopes,omitempty"`
 }
 
+const defaultAdminGenerateTokenTimeout = 30 * time.Second
+
 // AdminGenerateToken mints an owner or fs_scoped API key for one tenant using
 // TiDB Cloud organization credentials (POST /v1/tokens/generate).
+//
+// This endpoint belongs to the hosted TiDB Cloud Mode control plane (alongside
+// AdminAcceptMigrationPlan, AdminGetTenantLogs, and AdminSetTenantQuota) rather
+// than the single-node local dev server.
 func (c *Client) AdminGenerateToken(ctx context.Context, req AdminGenerateTokenRequest) (*AdminGenerateTokenResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, defaultAdminGenerateTokenTimeout)
+		defer cancel()
+	}
 	req.TenantID = strings.TrimSpace(req.TenantID)
 	if req.TenantID == "" {
 		return nil, fmt.Errorf("tenant_id is required")
@@ -62,8 +76,21 @@ func (c *Client) AdminGenerateToken(ctx context.Context, req AdminGenerateTokenR
 	httpReq.Header.Set("Content-Type", "application/json")
 	setQuotaHeaders(httpReq, req.PublicKey, req.PrivateKey)
 	// Control-plane requests authenticate with TiDB Cloud headers only; c.do
-	// would also attach a tenant Bearer token and trigger 400 ambiguous credentials.
-	resp, err := c.httpClient.Do(httpReq)
+	// would also attach a tenant Bearer token and trigger 400 ambiguous
+	// credentials. Refuse cross-origin redirects so X-TiDBCloud-* credentials
+	// can never be forwarded to a different host or scheme.
+	httpClient := *c.httpClient
+	baseCheckRedirect := c.httpClient.CheckRedirect
+	httpClient.CheckRedirect = func(redirectReq *http.Request, via []*http.Request) error {
+		if len(via) > 0 && (redirectReq.URL.Scheme != via[0].URL.Scheme || redirectReq.URL.Host != via[0].URL.Host) {
+			return fmt.Errorf("cross-origin redirect refused for control-plane request")
+		}
+		if baseCheckRedirect != nil {
+			return baseCheckRedirect(redirectReq, via)
+		}
+		return nil
+	}
+	resp, err := httpClient.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("admin token generate request: %w", err)
 	}
@@ -74,6 +101,9 @@ func (c *Client) AdminGenerateToken(ctx context.Context, req AdminGenerateTokenR
 	var out AdminGenerateTokenResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, fmt.Errorf("decode admin token generate response: %w", err)
+	}
+	if strings.TrimSpace(out.Token) == "" {
+		return nil, fmt.Errorf("admin token generate response is missing token")
 	}
 	return &out, nil
 }

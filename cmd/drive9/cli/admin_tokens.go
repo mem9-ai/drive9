@@ -14,11 +14,18 @@ import (
 
 const adminGenerateTokenTimeout = 30 * time.Second
 
-func adminTenantGenerateToken(args []string) error {
-	if migrationWantsHelp(args) {
-		_, _ = fmt.Fprintln(os.Stdout, adminTenantGenerateTokenUsage())
-		return nil
+func nextAdminTokenFlagValue(flagName string, args []string, i int) (string, error) {
+	if i+1 >= len(args) {
+		return "", fmt.Errorf("%s requires an argument", flagName)
 	}
+	val := args[i+1]
+	if strings.HasPrefix(val, "--") || val == "-h" || val == "-help" {
+		return "", fmt.Errorf("%s requires a value, got flag %q", flagName, val)
+	}
+	return val, nil
+}
+
+func adminTenantGenerateToken(args []string) error {
 	var (
 		serverFlag      string
 		serverGiven     bool
@@ -40,63 +47,80 @@ func adminTenantGenerateToken(args []string) error {
 	)
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
+		case "-h", "-help", "--help":
+			_, _ = fmt.Fprintln(os.Stdout, adminTenantGenerateTokenUsage())
+			return nil
+		case "help":
+			if i == 0 {
+				_, _ = fmt.Fprintln(os.Stdout, adminTenantGenerateTokenUsage())
+				return nil
+			}
+			return fmt.Errorf("unknown flag %q\n%s", args[i], adminTenantGenerateTokenUsage())
 		case "--server":
-			if i+1 >= len(args) {
-				return fmt.Errorf("--server requires an argument")
+			val, err := nextAdminTokenFlagValue("--server", args, i)
+			if err != nil {
+				return err
 			}
 			i++
-			serverFlag = args[i]
+			serverFlag = val
 			serverGiven = true
 		case "--region-code":
-			if i+1 >= len(args) {
-				return fmt.Errorf("--region-code requires an argument")
+			val, err := nextAdminTokenFlagValue("--region-code", args, i)
+			if err != nil {
+				return err
 			}
 			i++
-			regionCodeFlag = args[i]
+			regionCodeFlag = val
 			regionCodeGiven = true
 		case "--tidbcloud-public-key":
-			if i+1 >= len(args) {
-				return fmt.Errorf("--tidbcloud-public-key requires an argument")
+			val, err := nextAdminTokenFlagValue("--tidbcloud-public-key", args, i)
+			if err != nil {
+				return err
 			}
 			i++
-			publicKeyFlag = args[i]
+			publicKeyFlag = val
 			publicKeyGiven = true
 		case "--tidbcloud-private-key":
-			if i+1 >= len(args) {
-				return fmt.Errorf("--tidbcloud-private-key requires an argument")
+			val, err := nextAdminTokenFlagValue("--tidbcloud-private-key", args, i)
+			if err != nil {
+				return err
 			}
 			i++
-			privateKeyFlag = args[i]
+			privateKeyFlag = val
 			privateKeyGiven = true
 		case "--tenant-id":
-			if i+1 >= len(args) {
-				return fmt.Errorf("--tenant-id requires an argument")
+			val, err := nextAdminTokenFlagValue("--tenant-id", args, i)
+			if err != nil {
+				return err
 			}
 			i++
-			tenantID = args[i]
+			tenantID = val
 			tenantIDGiven = true
 		case "--key-name":
-			if i+1 >= len(args) {
-				return fmt.Errorf("--key-name requires an argument")
+			val, err := nextAdminTokenFlagValue("--key-name", args, i)
+			if err != nil {
+				return err
 			}
 			i++
-			keyName = args[i]
+			keyName = val
 			keyNameGiven = true
 		case "--ttl":
-			if i+1 >= len(args) {
-				return fmt.Errorf("--ttl requires an argument")
+			val, err := nextAdminTokenFlagValue("--ttl", args, i)
+			if err != nil {
+				return err
 			}
 			i++
-			ttlRaw = args[i]
+			ttlRaw = val
 			ttlGiven = true
 		case "--allow":
-			if i+1 >= len(args) {
-				return fmt.Errorf("--allow requires an argument")
+			val, err := nextAdminTokenFlagValue("--allow", args, i)
+			if err != nil {
+				return err
 			}
 			i++
-			scope, err := parseTokenAllow(args[i])
+			scope, err := parseTokenAllow(val)
 			if err != nil {
-				return fmt.Errorf("invalid --allow %q: %w", args[i], err)
+				return fmt.Errorf("invalid --allow %q: %w", val, err)
 			}
 			scopes = append(scopes, scope)
 		case "--json":
