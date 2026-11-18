@@ -361,6 +361,16 @@ func sameCredential(a, b *meta.Tenant) bool {
 // cache hits in the capacity LRU.
 // The returned release callback must be called when the caller is done.
 func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Backend, release func(), err error) {
+	return p.acquire(ctx, t, 0)
+}
+
+// maxAcquireFenceRetries bounds how many times an acquisition may follow the tenant row
+// after being fenced. A retry re-resolves the row, so a tenant that keeps changing under a
+// hot loop cannot turn into unbounded recursion — it fails with a retryable error instead.
+const maxAcquireFenceRetries = 2
+
+// acquire is Acquire with the fence-retry budget threaded through.
+func (p *Pool) acquire(ctx context.Context, t *meta.Tenant, fenceRetries int) (out *backend.Dat9Backend, release func(), err error) {
 	start := time.Now()
 	defer observePool(ctx, "acquire", t.ID, &err, start)
 
@@ -500,8 +510,11 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 		if e, ok := p.tryCached(t, s3EncryptionPolicy, storageNamespaceID); ok {
 			return e.backend, p.makeRelease(e), nil
 		}
+		if fenceRetries >= maxAcquireFenceRetries {
+			return nil, nil, errTenantChangedDuringOpen
+		}
 		if fresh, ok := p.resolveTenant(ctx, t.ID, t); ok {
-			return p.Acquire(ctx, fresh)
+			return p.acquire(ctx, fresh, fenceRetries+1)
 		}
 		return nil, nil, errTenantChangedDuringOpen
 	}
