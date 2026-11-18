@@ -161,7 +161,9 @@ func TestOverlayFreeRatioRefusesWhenHostIsFull(t *testing.T) {
 	// 50 free of 1000 is below the 10% floor, but a write that keeps the
 	// floor is allowed.
 	q.statfs = func(string) (int64, int64, error) { return 1000, 500, nil }
-	q.lastCheck.Store(0)
+	q.mu.Lock()
+	q.lastCheck = 0
+	q.mu.Unlock()
 	if err := writeLocal(t, f, view, h, 0, 100); err != nil {
 		t.Fatalf("write above the free-space floor: %v", err)
 	}

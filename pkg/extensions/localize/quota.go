@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -45,13 +44,14 @@ type overlayQuota struct {
 	sizeFunc func(root, rel string) (int64, error)
 	statfs   func(root string) (total, free int64, err error)
 
-	mu   sync.Mutex
-	used int64
-
-	lastCheck   atomic.Int64
-	cachedFree  atomic.Int64
-	cachedTotal atomic.Int64
-	refusals    atomic.Int64
+	// mu serializes admission and guards used/lastCheck/cachedFree/
+	// cachedTotal/refusals.
+	mu          sync.Mutex
+	used        int64
+	lastCheck   int64
+	cachedFree  int64
+	cachedTotal int64
+	refusals    int64
 }
 
 // newOverlayQuota builds the quota for root. Both bounds disabled returns nil
@@ -67,6 +67,11 @@ func newOverlayQuota(root string, limit int64, freeRatio float64) (*overlayQuota
 		freeRatio: freeRatio,
 		sizeFunc:  statBackingSize,
 		statfs:    statfsCapacity,
+	}
+	if limit <= 0 {
+		// Only the free-space guard is armed: no per-byte accounting, and no
+		// walk of a possibly huge overlay tree at mount time.
+		return q, nil
 	}
 	used, err := q.measure()
 	if err != nil {
@@ -95,7 +100,9 @@ func (q *overlayQuota) Refusals() int64 {
 	if q == nil {
 		return 0
 	}
-	return q.refusals.Load()
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.refusals
 }
 
 // admit reserves n bytes of growth. It returns ENOSPC when the byte quota or
@@ -174,23 +181,15 @@ func (q *overlayQuota) checkFreeRatioLocked(required int64) error {
 		return nil
 	}
 	now := time.Now().UnixNano()
-	last := q.lastCheck.Load()
-	haveCached := q.cachedTotal.Load() > 0
-	if !haveCached || now-last >= int64(overlayDiskCheckInterval) {
-		if q.lastCheck.CompareAndSwap(last, now) || !haveCached {
-			total, free, err := q.statfs(q.root)
-			if err == nil {
-				q.cachedTotal.Store(total)
-				q.cachedFree.Store(free)
-				haveCached = total > 0
-			} else {
-				// Statfs failed: cannot check, allow the write.
-				return nil
-			}
+	if q.cachedTotal <= 0 || now-q.lastCheck >= int64(overlayDiskCheckInterval) {
+		total, free, err := q.statfs(q.root)
+		if err != nil {
+			// Statfs failed: cannot check, allow the write.
+			return nil
 		}
+		q.cachedTotal, q.cachedFree, q.lastCheck = total, free, now
 	}
-	total := q.cachedTotal.Load()
-	free := q.cachedFree.Load()
+	total, free := q.cachedTotal, q.cachedFree
 	if total <= 0 {
 		return nil
 	}
@@ -210,7 +209,7 @@ func (q *overlayQuota) checkFreeRatioLocked(required int64) error {
 // refuse logs one refusal. The message format mirrors the write-back shadow
 // store's quota line so both refusals are greppable the same way.
 func (q *overlayQuota) refuse(reason string, fields ...zap.Field) {
-	q.refusals.Add(1)
+	q.refusals++
 	fields = append(fields, zap.String("root", q.root), zap.String("localize_quota", reason))
 	logger.Warn(context.Background(), "localize overlay write refused", fields...)
 }

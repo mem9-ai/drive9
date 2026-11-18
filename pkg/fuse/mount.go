@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -39,6 +40,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/fusecomp/perf"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/staging"
 	"github.com/mem9-ai/drive9/pkg/logger"
+	"github.com/mem9-ai/drive9/pkg/mountcontrol"
 	"github.com/mem9-ai/drive9/pkg/mountpath"
 	"github.com/mem9-ai/drive9/pkg/mountstate"
 )
@@ -1541,9 +1543,17 @@ func mountWithConfig(cfg MountConfig) error {
 	// transient); a second signal force-unmounts. Without this the worker
 	// waits for the kernel to drop the connection and the supervisor's
 	// stop window expires into a kill.
+	//
+	// The drain runs the same contract as `drive9 mount drain` (flush →
+	// uploader/commit queue → notifications → pending snapshot) and its
+	// failure is never discarded: a drain that leaves acknowledged bytes
+	// uncommitted still unmounts (the process is going away either way) but
+	// records a drain_failed exit reason and exits non-zero, so
+	// `drive9 umount` reports the loss instead of returning success.
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(sigCh)
+	var shutdownOutcome shutdownResult
 	go func() {
 		<-sigCh
 		f.shutdownRequested.Store(true)
@@ -1553,10 +1563,14 @@ func mountWithConfig(cfg MountConfig) error {
 			fmt.Fprintf(os.Stderr, "drive9: force-quit\n")
 			ForceUnmount(cfg.MountPoint)
 		}()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownDrainTimeout)
 		defer cancel()
-		_ = f.flushOpenHandles(shutdownCtx)
-		_ = f.chain.Drain(shutdownCtx)
+		resp := f.Drain(shutdownCtx)
+		if !resp.OK {
+			err := recordDrainFailure(cfg, resp)
+			shutdownOutcome.set(err)
+			fmt.Fprintf(os.Stderr, "drive9: shutdown drain failed at %s: %v\n", cfg.MountPoint, err)
+		}
 		for attempt := 0; attempt < 5; attempt++ {
 			if err := server.Unmount(); err == nil {
 				return
@@ -1566,12 +1580,13 @@ func mountWithConfig(cfg MountConfig) error {
 		ForceUnmount(cfg.MountPoint)
 	}()
 	<-serveDone
-	// A shutdown WE initiated (signal handler: flush → drain → Unmount,
-	// with ForceUnmount as the busy fallback) is a clean worker exit —
-	// the lazy fallback can leave the mountinfo row past the serve end,
-	// and classifying that as abnormal failed the CLI's umount.
+	// A shutdown WE initiated (signal handler: drain → Unmount, with
+	// ForceUnmount as the busy fallback) is a clean worker exit — the lazy
+	// fallback can leave the mountinfo row past the serve end, and
+	// classifying that as abnormal failed the CLI's umount. A drain that
+	// left work behind is NOT clean: it is reported.
 	if f.shutdownRequested.Load() {
-		return nil
+		return shutdownOutcome.err()
 	}
 	// Classify the serve end by the KERNEL mount, not by the OnUnmount
 	// callback: the pinned go-fuse fork invokes OnUnmount unconditionally
@@ -1583,6 +1598,79 @@ func mountWithConfig(cfg MountConfig) error {
 	// serve loop dies. Give the row a short settling window — the loop can
 	// exit marginally before the umount(2) that triggered it completes.
 	return classifyServeExit(cfg.MountPoint, unmountedKernel)
+}
+
+// shutdownDrainTimeout bounds the shutdown drain. It matches the mount
+// control server's drain budget (mountcontrol.DefaultDrainTimeout) plus room
+// for the unmount retries the worker still has to run.
+const shutdownDrainTimeout = 30 * time.Second
+
+// shutdownResult carries the shutdown drain's verdict from the signal
+// goroutine to the serve-loop exit path. The two are ordered by the kernel
+// unmount, not by a Go synchronization edge, so the hand-off needs a mutex.
+type shutdownResult struct {
+	mu      sync.Mutex
+	outcome error
+}
+
+func (s *shutdownResult) set(err error) {
+	if s == nil || err == nil {
+		return
+	}
+	s.mu.Lock()
+	s.outcome = errors.Join(s.outcome, err)
+	s.mu.Unlock()
+}
+
+func (s *shutdownResult) err() error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.outcome
+}
+
+// recordDrainFailure persists the drain_failed exit record (the supervisor and
+// `drive9 umount` read it to tell a clean stop from one that lost writes) and
+// returns the error the worker exits with.
+func recordDrainFailure(cfg MountConfig, resp mountcontrol.DrainResponse) error {
+	pending := resp.Pending
+	detail := fmt.Sprintf("drain failed at %s", cfg.MountPoint)
+	reason := resp.ErrorKind
+	if reason == "" {
+		reason = resp.Error
+	} else if resp.Error != "" {
+		reason += ": " + resp.Error
+	}
+	if reason != "" {
+		detail += ": " + reason
+	}
+	detail += fmt.Sprintf(" (open_handles=%d dirty_handles=%d commit_queue=%d commit_bytes=%d uploader_queued=%d uploader_in_flight=%d uploader_cached_bytes=%d)",
+		pending.OpenHandles,
+		pending.DirtyHandles,
+		pending.CommitQueuePending,
+		pending.CommitQueueBytes,
+		pending.UploaderQueued,
+		pending.UploaderInFlight,
+		pending.UploaderCachedBytes,
+	)
+	if cfg.OmitProcessStateCredentials {
+		detail = redactCredentialText(detail, cfg)
+	}
+	record := mountstate.ExitReason{
+		PID:    os.Getpid(),
+		Code:   ExitDrainFailed,
+		Reason: string(ExitReasonDrainFailed),
+		Detail: detail,
+		// Files the caller can look for in the preserved recovery state.
+		PendingFiles: pending.DirtyHandles + pending.CommitQueuePending + pending.UploaderQueued,
+		PendingBytes: pending.CommitQueueBytes + pending.UploaderCachedBytes,
+	}
+	if err := mountstate.WriteExitReason(cfg.MountPoint, record); err != nil {
+		fmt.Fprintf(os.Stderr, "drive9: record drain failure at %s: %v\n", cfg.MountPoint, err)
+	}
+	return ExitDrainFailedErr(detail)
 }
 
 // classifyServeExit classifies a serve-loop exit by the KERNEL mount row
