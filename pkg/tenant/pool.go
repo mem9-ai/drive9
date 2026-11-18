@@ -144,6 +144,9 @@ type Pool struct {
 	// testHookBeforeInstall runs between a completed cold open and its installation, so a
 	// test can interleave an invalidation deterministically. Never set in production.
 	testHookBeforeInstall func(tenantID string)
+	// testHookBeforeEvict runs between resolving a stale row and evicting the cached backend,
+	// so a test can interleave a rotation deterministically. Never set in production.
+	testHookBeforeEvict func(tenantID string)
 	tenantWorkNotifier atomic.Pointer[func(tenantID, tidbCloudOrgID string, workMask int)]
 	// fileGCEnabled is retained for backward compatibility but no longer used:
 	// FileGC is now kick-driven through the unified tenant worker, not a
@@ -296,6 +299,22 @@ func (p *Pool) tryCached(t *meta.Tenant, s3EncryptionPolicy meta.S3EncryptionPol
 	return e, true
 }
 
+// grabCached pins whatever backend is cached for the tenant, without judging whether it
+// matches a caller's row. It exists for the one case where the row cannot be verified and
+// discarding a healthy backend would be the worse outcome.
+func (p *Pool) grabCached(tenantID string) (*entry, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.items[tenantID]
+	if !ok {
+		return nil, false
+	}
+	e.refs++
+	p.order.MoveToFront(e.elem)
+	e.lastUsed = time.Now()
+	return e, true
+}
+
 // errTenantChangedDuringOpen reports that a tenant was invalidated while its backend was
 // opening and no fresh row could be resolved to retry with.
 var errTenantChangedDuringOpen = errors.New("tenant changed while its database was opening")
@@ -348,7 +367,8 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 	// the row the stale one: a request can resolve its tenant, lose the race to a rotation, and
 	// arrive here afterwards. Ask the control plane before evicting anything, and open with the
 	// row it holds rather than with a credential the database may already have retired.
-	for attempt := 0; ; attempt++ {
+	resolveAllowed := true
+	for attempt := 0; attempt < 3; attempt++ {
 		p.mu.Lock()
 		e, ok := p.items[t.ID]
 		if ok && e.matches(t, s3EncryptionPolicy, storageNamespaceID) {
@@ -366,17 +386,54 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 			p.mu.Unlock()
 			break
 		}
+		// Capture the fence before releasing the lock: everything below decides on state that
+		// a concurrent rotation may change, and an unevidenced eviction is what strands a
+		// tenant without a backend it can authenticate with.
+		generation := p.invalidationGen[t.ID]
 		p.mu.Unlock()
-		if attempt == 0 {
-			if fresh, resolved := p.resolveTenant(ctx, t.ID, t); resolved && !sameCredential(fresh, t) {
+
+		if resolveAllowed {
+			resolveAllowed = false
+			fresh, resolved := p.resolveTenant(ctx, t.ID, t)
+			if resolved && !sameCredential(fresh, t) {
 				t = fresh
 				s3EncryptionPolicy = t.S3EncryptionPolicy()
 				storageNamespaceID = t.StorageNamespaceID
 				continue
 			}
+			if !resolved && p.metaStore != nil {
+				// The row cannot be verified right now. Evicting on an unverifiable row is how
+				// a healthy backend disappears during a control-plane blip, so keep it and
+				// serve it; the next acquisition with a resolved row can still replace it.
+				if e, grabbed := p.grabCached(t.ID); grabbed {
+					logger.Warn(ctx, "tenant_pool_row_unverified_reusing_cached_backend",
+						zap.String("tenant_id", t.ID))
+					return e.backend, p.makeRelease(e), nil
+				}
+				break
+			}
+		}
+
+		if hook := p.testHookBeforeEvict; hook != nil {
+			hook(t.ID)
 		}
 		p.mu.Lock()
+		if p.invalidationGen[t.ID] != generation {
+			// A rotation landed while the row was being resolved: the cached backend may be
+			// the current one now, so re-evaluate — including the row, which is what the
+			// eviction was about to judge — instead of evicting it.
+			p.mu.Unlock()
+			resolveAllowed = true
+			continue
+		}
 		if e, ok := p.items[t.ID]; ok {
+			if e.matches(t, s3EncryptionPolicy, storageNamespaceID) {
+				e.refs++
+				p.order.MoveToFront(e.elem)
+				e.lastUsed = time.Now()
+				p.mu.Unlock()
+				return e.backend, p.makeRelease(e), nil
+			}
 			if removed := p.removeLocked(e.elem, "replace"); removed != nil {
 				toClose = append(toClose, removed)
 			}

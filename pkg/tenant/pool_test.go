@@ -1343,3 +1343,100 @@ func TestPoolStaleRowAfterRotationReusesCachedBackend(t *testing.T) {
 		t.Fatal("the stale row evicted the current backend")
 	}
 }
+
+// The lookup-to-eviction interval is its own race: A sees a mismatch, reads the row (which the
+// control plane confirms), and while it is between that read and the eviction a rotation lands
+// and another acquisition installs a backend for the new credential. A must not remove that one.
+func TestPoolMismatchEvictionIsFencedAgainstConcurrentReplacement(t *testing.T) {
+	pool, tenant := newTestPoolAndTenant(t, 2, "tenant-fenced-evict")
+	metaStore, err := meta.OpenContext(context.Background(), testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = metaStore.Close() })
+	testtidb.ResetMetaDB(t, metaStore.DB())
+	ctx := context.Background()
+	tenant.S3EncryptionMode = meta.S3EncryptionModeInherit
+	if err := metaStore.InsertTenant(ctx, tenant); err != nil {
+		t.Fatal(err)
+	}
+	pool.SetMetaStore(metaStore)
+
+	if _, releaseCurrent, err := pool.Acquire(ctx, tenant); err != nil {
+		t.Fatal(err)
+	} else {
+		defer releaseCurrent()
+	}
+
+	plain, err := pool.Decrypt(ctx, tenant.DBPasswordCipher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	derive := func(suffix byte) []byte {
+		cipher, encErr := pool.Encrypt(ctx, append(append([]byte(nil), plain...), suffix))
+		if encErr != nil {
+			t.Fatal(encErr)
+		}
+		return cipher
+	}
+	// The caller and the control plane agree on the credential; the cached entry carries a
+	// different one, which is what makes this acquisition take the mismatch path.
+	pool.mu.Lock()
+	pool.items[tenant.ID].dbPasswordCipher = derive('e')
+	pool.mu.Unlock()
+
+	rotatedCipher := derive('v')
+	var replacement *entry
+	interleaved := false
+	pool.testHookBeforeEvict = func(tenantID string) {
+		if interleaved {
+			return
+		}
+		interleaved = true
+		// The rotation lands here: the control plane records the new credential, the pool is
+		// invalidated, and a competing acquisition installs a backend for it.
+		if _, err := metaStore.DB().ExecContext(ctx, `UPDATE tenants SET db_password = ? WHERE id = ?`, rotatedCipher, tenantID); err != nil {
+			t.Errorf("record the rotated credential: %v", err)
+		}
+		pool.Invalidate(tenantID)
+		b, st, _, err := pool.createBackend(ctx, tenant)
+		if err != nil {
+			t.Errorf("install the rotated backend: %v", err)
+			return
+		}
+		e := &entry{
+			tenantID:           tenant.ID,
+			storageNamespaceID: tenant.StorageNamespaceID,
+			s3EncryptionPolicy: tenant.S3EncryptionPolicy(),
+			dbUser:             tenant.DBUser,
+			dbPasswordCipher:   rotatedCipher,
+			backend:            b,
+			store:              st,
+			lastUsed:           time.Now(),
+		}
+		pool.mu.Lock()
+		e.elem = pool.order.PushFront(e)
+		pool.items[tenantID] = e
+		pool.mu.Unlock()
+		replacement = e
+	}
+	t.Cleanup(func() { pool.testHookBeforeEvict = nil })
+
+	got, releaseGot, err := pool.Acquire(ctx, tenant)
+	if err != nil {
+		t.Fatalf("acquire across a fenced eviction: %v", err)
+	}
+	defer releaseGot()
+	if !interleaved || replacement == nil {
+		t.Fatal("the interleaving hook never installed the rotated backend, so the race was not exercised")
+	}
+	pool.mu.Lock()
+	cached := pool.items[tenant.ID]
+	pool.mu.Unlock()
+	if cached != replacement {
+		t.Fatal("the fenced mismatch removed the backend a concurrent rotation installed")
+	}
+	if got != replacement.backend {
+		t.Fatal("the caller received a backend other than the rotated one")
+	}
+}
