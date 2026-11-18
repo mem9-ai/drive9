@@ -1059,6 +1059,9 @@ func TestExtentReviewRegressions(t *testing.T) {
 		if !isExtentPresignUnsupportedError(&StatusError{StatusCode: http.StatusInternalServerError, Message: "internal storage error"}) {
 			t.Fatal("expected masked exact 500 internal storage error to match on presign-batch")
 		}
+		if !isExtentPresignUnsupportedError(&StatusError{StatusCode: http.StatusInternalServerError, Message: "storage backend unavailable; contact support"}) {
+			t.Fatal("expected masked exact 500 tidbcloud/fs storage backend unavailable to match on presign-batch")
+		}
 		if isExtentPresignUnsupportedError(&StatusError{StatusCode: http.StatusInternalServerError, Message: "cannot enforce a declared upload length"}) {
 			t.Fatal("must not classify non-exact 500 prose as presign unsupported")
 		}
@@ -1073,11 +1076,112 @@ func TestExtentReviewRegressions(t *testing.T) {
 		if !mayBeExtentDirectWriteRejection(&StatusError{StatusCode: http.StatusInternalServerError, Message: "internal storage error"}, -1) {
 			t.Fatal("expected exact 500 internal storage error to trigger stat check on overwrite")
 		}
+		if !mayBeExtentDirectWriteRejection(&StatusError{StatusCode: http.StatusInternalServerError, Message: "storage backend unavailable; contact support"}, -1) {
+			t.Fatal("expected exact 500 tidbcloud/fs storage backend unavailable to trigger stat check on overwrite")
+		}
 		if mayBeExtentDirectWriteRejection(&StatusError{StatusCode: http.StatusInternalServerError, Message: "internal storage error: disk full"}, -1) {
 			t.Fatal("must not match extended 500 error prose")
 		}
-		if mayBeExtentDirectWriteRejection(&StatusError{StatusCode: http.StatusInternalServerError, Message: "internal storage error"}, 0) {
+		if mayBeExtentDirectWriteRejection(&StatusError{StatusCode: http.StatusInternalServerError, Message: "storage backend unavailable; contact support"}, 0) {
 			t.Fatal("must not match 500 when expectedRevision == 0")
+		}
+	})
+
+	t.Run("tidbcloud/fs live compat: WriteCtx sticky fallback on backend-unavailable 500 and StatMetadataCompat HEAD layout backfill", func(t *testing.T) {
+		var extentCommitted atomic.Bool
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodPut && r.URL.Path == "/v1/fs/cloud-sticky.bin":
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(`{"error":"storage backend unavailable; contact support"}`))
+			case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/cloud-sticky.bin":
+				w.Header().Set("Content-Length", "16")
+				w.Header().Set("X-Dat9-Isdir", "false")
+				w.Header().Set("X-Dat9-Revision", "2")
+				w.Header().Set("X-Dat9-Resource-Id", "res-same")
+				w.Header().Set("X-Dat9-Storage-Type", string(StorageTypeExtent))
+				w.Header().Set("X-Dat9-Content-Layout", string(ContentLayoutExtent))
+				w.WriteHeader(http.StatusOK)
+			case r.Method == http.MethodGet && r.URL.Path == "/v1/fs/cloud-sticky.bin" && r.URL.Query().Has("stat"):
+				// Mirrors tidbcloud/fs before ?stat=1 includes content_layout.
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"size":16,"isdir":false,"resource_id":"res-same","revision":2,"content_type":"application/octet-stream","semantic_text":"","description":"d","tags":{"k":"v"}}`))
+			case r.Method == http.MethodGet && r.URL.Path == "/v1/fs/replaced.bin" && r.URL.Query().Has("stat"):
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"size":16,"isdir":false,"resource_id":"res-old","revision":1,"content_type":"","semantic_text":"","tags":{}}`))
+			case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/replaced.bin":
+				w.Header().Set("Content-Length", "16")
+				w.Header().Set("X-Dat9-Isdir", "false")
+				w.Header().Set("X-Dat9-Revision", "1")
+				w.Header().Set("X-Dat9-Resource-Id", "res-new")
+				w.Header().Set("X-Dat9-Content-Layout", string(ContentLayoutExtent))
+				w.WriteHeader(http.StatusOK)
+			case r.Method == http.MethodGet && r.URL.Path == "/v1/fs/missing-id.bin" && r.URL.Query().Has("stat"):
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"size":16,"isdir":false,"revision":1,"content_type":"","semantic_text":"","tags":{"k":"v"}}`))
+			case r.Method == http.MethodGet && r.URL.Path == "/v1/fs/head-missing-id.bin" && r.URL.Query().Has("stat"):
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"size":16,"isdir":false,"resource_id":"res-1","revision":1,"content_type":"","semantic_text":"","tags":{}}`))
+			case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/head-missing-id.bin":
+				w.Header().Set("Content-Length", "16")
+				w.Header().Set("X-Dat9-Isdir", "false")
+				w.Header().Set("X-Dat9-Revision", "1")
+				w.Header().Set("X-Dat9-Content-Layout", string(ContentLayoutExtent))
+				w.WriteHeader(http.StatusOK)
+			case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+				w.WriteHeader(http.StatusAccepted)
+				_ = json.NewEncoder(w).Encode(uploadPlanV2{
+					UploadID:         "cloud-ext-1",
+					PartSize:         ExtentBlockSize,
+					TotalParts:       1,
+					ChecksumContract: checksumContract{Supported: []string{"SHA-256"}, Required: true},
+				})
+			case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/cloud-ext-1/presign-batch":
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"parts": []presignedPart{{Number: 1, SkipUpload: true, Size: 5}},
+				})
+			case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/cloud-ext-1/complete":
+				extentCommitted.Store(true)
+				_, _ = w.Write([]byte(`{"status":"completed","revision":3}`))
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer srv.Close()
+
+		c := New(srv.URL, "k")
+		if err := c.WriteCtx(context.Background(), "/cloud-sticky.bin", []byte("hello")); err != nil {
+			t.Fatalf("WriteCtx(cloud sticky extent): %v", err)
+		}
+		if !extentCommitted.Load() {
+			t.Fatal("expected WriteCtx to fall back to extent upload session")
+		}
+
+		meta, err := c.StatMetadataCompat("/cloud-sticky.bin")
+		if err != nil {
+			t.Fatalf("StatMetadataCompat: %v", err)
+		}
+		if meta.ContentLayout != ContentLayoutExtent || meta.StorageType != StorageTypeExtent || meta.Tags["k"] != "v" {
+			t.Fatalf("StatMetadataCompat = %+v, want backfilled extent layout/storage + tags", meta)
+		}
+
+		replaced, err := c.StatMetadataCompat("/replaced.bin")
+		if err != nil {
+			t.Fatalf("StatMetadataCompat(replaced): %v", err)
+		}
+		if replaced.ContentLayout != "" {
+			t.Fatalf("StatMetadataCompat must not splice layout across resource_id mismatch: %+v", replaced)
+		}
+
+		// When GET ?stat=1 omits resource_id, HEAD must not even be attempted
+		// (default branch returns 404 if HEAD is called) and layout stays empty.
+		missingID, err := c.StatMetadataCompat("/missing-id.bin")
+		if err != nil || missingID.ContentLayout != "" {
+			t.Fatalf("StatMetadataCompat(missing-id) = %+v, err=%v", missingID, err)
+		}
+		headMissingID, err := c.StatMetadataCompat("/head-missing-id.bin")
+		if err != nil || headMissingID.ContentLayout != "" {
+			t.Fatalf("StatMetadataCompat(head-missing-id) = %+v, err=%v", headMissingID, err)
 		}
 	})
 }

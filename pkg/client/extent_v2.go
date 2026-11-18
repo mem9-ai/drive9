@@ -63,8 +63,10 @@ const ExtentBlockSize = int64(4 << 20)
 //     closed with 409 on sticky extent targets).
 //   - HTTP 400 Bad Request: "total_size must be positive" on V2 upload initiate
 //     (tidbcloud/fs server.go:5891, drive9 server.go:4617).
-//   - HTTP 500 Internal Server Error: exact "internal storage error" from handleWrite's
-//     errJSONInternalStorage (tidbcloud/fs server.go:8345) when direct PUT hits a sticky extent inode.
+//   - HTTP 500 Internal Server Error: exact "internal storage error" (mem9-ai/drive9)
+//     or "storage backend unavailable; contact support" (tidbcloud/fs server.go:8394)
+//     from handleWrite's errJSONInternalStorage when direct PUT hits a sticky extent inode,
+//     or from handleV2PresignBatch when s3client.ErrLengthBoundedPresignUnsupported is masked.
 const (
 	extentErrCodeLayoutMismatch           = "extent_layout_mismatch"
 	extentErrMsgLayoutMismatch            = "content layout mismatch"
@@ -73,7 +75,14 @@ const (
 	extentErrCodeZeroSizeUpload           = "zero_size_upload_unsupported"
 	extentErrMsgZeroSizeUpload            = "total_size must be positive"
 	extentErrMsgDirectWriteInternal       = "internal storage error"
+	extentErrMsgCloudBackendUnavailable   = "storage backend unavailable; contact support"
 )
+
+func isOpaqueInternalStorageMessage(msg string) bool {
+	trimmed := strings.TrimSpace(msg)
+	return strings.EqualFold(trimmed, extentErrMsgDirectWriteInternal) ||
+		strings.EqualFold(trimmed, extentErrMsgCloudBackendUnavailable)
+}
 
 // ErrExtentNotServed reports a read response that is not an extent block
 // plan (no extent content-layout header): callers fall back to the classic
@@ -788,7 +797,7 @@ func isExtentPresignUnsupportedError(err error) bool {
 		return false
 	}
 	if se.StatusCode == http.StatusInternalServerError {
-		return strings.EqualFold(strings.TrimSpace(se.Message), extentErrMsgDirectWriteInternal)
+		return isOpaqueInternalStorageMessage(se.Message)
 	}
 	if se.StatusCode != http.StatusBadRequest && se.StatusCode != http.StatusNotImplemented {
 		return false
@@ -812,7 +821,7 @@ func mayBeExtentDirectWriteRejection(err error, expectedRevision int64) bool {
 	}
 	var se *StatusError
 	if errors.As(err, &se) && se.StatusCode == http.StatusInternalServerError {
-		return strings.EqualFold(strings.TrimSpace(se.Message), extentErrMsgDirectWriteInternal)
+		return isOpaqueInternalStorageMessage(se.Message)
 	}
 	return false
 }

@@ -2500,6 +2500,8 @@ func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path
 	var revision int64
 	var mtime *int64
 	var contentType string
+	var storageType datastore.StorageType
+	var contentLayout datastore.ContentLayout
 	var semanticText string
 	var description string
 	resourceID := nf.Node.NodeID
@@ -2521,6 +2523,10 @@ func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path
 			mtime = &unix
 		}
 		contentType = nf.File.ContentType
+		if !nf.Node.IsDirectory {
+			storageType = nf.File.StorageType
+			contentLayout = datastore.ContentLayoutSingle
+		}
 		semanticText = nf.File.ContentText
 		description = nf.File.Description
 
@@ -2538,28 +2544,38 @@ func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "stat_metadata_ok", "path", path, "is_dir", nf.Node.IsDirectory)...)
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Dat9-Mtime", strconv.FormatInt(*mtime, 10))
+	if storageType != "" {
+		w.Header().Set("X-Dat9-Storage-Type", string(storageType))
+	}
+	if contentLayout != "" {
+		w.Header().Set("X-Dat9-Content-Layout", string(contentLayout))
+	}
 	_ = json.NewEncoder(w).Encode(struct {
-		Size         int64             `json:"size"`
-		IsDir        bool              `json:"isdir"`
-		ResourceID   string            `json:"resource_id"`
-		Nlink        uint32            `json:"nlink,omitempty"`
-		Revision     int64             `json:"revision"`
-		Mtime        *int64            `json:"mtime,omitempty"`
-		ContentType  string            `json:"content_type"`
-		SemanticText string            `json:"semantic_text"`
-		Description  string            `json:"description"`
-		Tags         map[string]string `json:"tags"`
+		Size          int64                   `json:"size"`
+		IsDir         bool                    `json:"isdir"`
+		ResourceID    string                  `json:"resource_id"`
+		Nlink         uint32                  `json:"nlink,omitempty"`
+		Revision      int64                   `json:"revision"`
+		Mtime         *int64                  `json:"mtime,omitempty"`
+		ContentType   string                  `json:"content_type"`
+		StorageType   datastore.StorageType   `json:"storage_type,omitempty"`
+		ContentLayout datastore.ContentLayout `json:"content_layout,omitempty"`
+		SemanticText  string                  `json:"semantic_text"`
+		Description   string                  `json:"description"`
+		Tags          map[string]string       `json:"tags"`
 	}{
-		Size:         size,
-		IsDir:        nf.Node.IsDirectory,
-		ResourceID:   resourceID,
-		Nlink:        nlink,
-		Revision:     revision,
-		Mtime:        mtime,
-		ContentType:  contentType,
-		SemanticText: semanticText,
-		Description:  description,
-		Tags:         tags,
+		Size:          size,
+		IsDir:         nf.Node.IsDirectory,
+		ResourceID:    resourceID,
+		Nlink:         nlink,
+		Revision:      revision,
+		Mtime:         mtime,
+		ContentType:   contentType,
+		StorageType:   storageType,
+		ContentLayout: contentLayout,
+		SemanticText:  semanticText,
+		Description:   description,
+		Tags:          tags,
 	})
 }
 
