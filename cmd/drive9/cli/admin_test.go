@@ -26,6 +26,7 @@ func TestAdminTenantHelpIncludesCommandsFlagsAndExamples(t *testing.T) {
 		"tenant get --tenant-id ID",
 		"tenant delete --tenant-id ID",
 		"tenant set-quota --tenant-id ID",
+		"tenant generate-token --tenant-id ID",
 		"pool <command>",
 		"--server URL",
 		"--region-code CODE",
