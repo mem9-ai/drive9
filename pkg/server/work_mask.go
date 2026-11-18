@@ -50,10 +50,10 @@ var (
 	_ = [1]byte{}[backend.BackendWorkFileGC^WorkFileGC]
 	_ = [1]byte{}[backend.BackendWorkMetricsCleanup^WorkMetricsCleanup]
 	_ = [1]byte{}[backend.BackendWorkAPIKeyCacheCleanup^WorkAPIKeyCacheCleanup]
-	// Every persisted bit of the outbox is distinct: two bits sharing a value would make
-	// one dispatch path silently consume the other's work.
-	_ = [1]byte{}[(WorkSSE | WorkSemantic | WorkFileGC | WorkMetricsCleanup | WorkAPIKeyCacheCleanup | WorkTenantCredential) ^
-		(meta.TenantNotifyWorkSSE | meta.TenantNotifyWorkSemantic | meta.TenantNotifyWorkFileGC |
-			meta.TenantNotifyWorkMetricsCleanup | meta.TenantNotifyWorkAPIKeyCacheCleanup |
-			meta.TenantNotifyWorkTenantCredential)]
+	// Every persisted bit of the outbox is distinct: two bits sharing a value would make one
+	// dispatch path silently consume the other's work. Summing and XOR-ing the same set only
+	// cancels if the bits are pairwise disjoint — comparing the aliases to their meta
+	// counterparts would cancel regardless, because they are defined as those values.
+	_ = [1]byte{}[(WorkSSE+WorkSemantic+WorkFileGC+WorkMetricsCleanup+WorkAPIKeyCacheCleanup+WorkTenantCredential)^
+		(WorkSSE|WorkSemantic|WorkFileGC|WorkMetricsCleanup|WorkAPIKeyCacheCleanup|WorkTenantCredential)]
 )
