@@ -104,6 +104,10 @@ type MountConfig struct {
 	LocalOnlyPatterns           []string
 	LocalGitignoreAwarePatterns []string
 	RemoteOnlyPatterns          []string
+	// LocalizeQuotaBytes/LocalizeFreeRatio bound the local-only overlay's
+	// host-disk usage (0 disables either bound).
+	LocalizeQuotaBytes int64
+	LocalizeFreeRatio  float64
 
 	AppendLogPatterns []string
 	PackPaths         []string
@@ -348,31 +352,36 @@ func (p WritePolicy) String() string {
 // build-up ordering. Mount converts it to the internal MountConfig — the
 // wire-level semantics are unchanged.
 type MountOptions struct {
-	Server                      string        // drive9 server URL
-	APIKey                      string        // owner API key (mutually exclusive with Token)
-	Token                       string        // delegated capability JWT (mutually exclusive with APIKey)
-	MountPoint                  string        // local mount point
-	RemoteRoot                  string        // remote subtree root (default "/")
-	CacheDir                    string        // write-back cache directory (default ~/.cache/drive9)
-	CacheSize                   int64         // ReadCache max size in bytes (default 128MB)
-	ReadCacheMaxFileBytes       int64         // largest single file admitted to ReadCache (default 4MiB)
-	ReadCacheTTL                time.Duration // ReadCache TTL (default 30s)
-	DiskReadCacheSize           int64         // disk read cache max size in bytes (default 1GiB)
-	DiskReadCacheFreeRatio      float64       // min free-space ratio before disk read cache evicts (default 0.10)
-	DirTTL                      time.Duration // DirCache TTL (default 10s)
-	AttrTTL                     time.Duration // kernel attr cache TTL (default 60s)
-	EntryTTL                    time.Duration // kernel entry cache TTL (default 60s)
-	NegativeEntryTTL            time.Duration // kernel negative entry cache TTL (default 1s)
-	FlushDebounce               time.Duration // debounce window for small-file flush coalescing (default 2s; -1 uses default)
-	SyncMode                    SyncMode      // interactive, strict, or auto (default auto)
-	WritePolicy                 WritePolicy   // writeback, close-sync, or write-sync (default writeback)
-	Profile                     string        // mount profile name
-	LayerRef                    string        // writable fs layer ref
-	CheckpointRef               string        // checkpoint ref for the layer view baseline
-	LocalRoot                   string        // local-only overlay root
-	LocalOnlyPatterns           []string      // local-only path patterns
-	LocalGitignoreAwarePatterns []string      // local-only patterns gated by Git ignore rules
-	RemoteOnlyPatterns          []string      // remote-persistent override patterns
+	Server                 string        // drive9 server URL
+	APIKey                 string        // owner API key (mutually exclusive with Token)
+	Token                  string        // delegated capability JWT (mutually exclusive with APIKey)
+	MountPoint             string        // local mount point
+	RemoteRoot             string        // remote subtree root (default "/")
+	CacheDir               string        // write-back cache directory (default ~/.cache/drive9)
+	CacheSize              int64         // ReadCache max size in bytes (default 128MB)
+	ReadCacheMaxFileBytes  int64         // largest single file admitted to ReadCache (default 4MiB)
+	ReadCacheTTL           time.Duration // ReadCache TTL (default 30s)
+	DiskReadCacheSize      int64         // disk read cache max size in bytes (default 1GiB)
+	DiskReadCacheFreeRatio float64       // min free-space ratio before disk read cache evicts (default 0.10)
+	DirTTL                 time.Duration // DirCache TTL (default 10s)
+	AttrTTL                time.Duration // kernel attr cache TTL (default 60s)
+	EntryTTL               time.Duration // kernel entry cache TTL (default 60s)
+	NegativeEntryTTL       time.Duration // kernel negative entry cache TTL (default 1s)
+	FlushDebounce          time.Duration // debounce window for small-file flush coalescing (default 2s; -1 uses default)
+	SyncMode               SyncMode      // interactive, strict, or auto (default auto)
+	WritePolicy            WritePolicy   // writeback, close-sync, or write-sync (default writeback)
+	Profile                string        // mount profile name
+	LayerRef               string        // writable fs layer ref
+	CheckpointRef          string        // checkpoint ref for the layer view baseline
+	LocalRoot              string        // local-only overlay root
+	// LocalizeQuotaBytes caps the bytes the local-only overlay may occupy on
+	// the host disk (0 disables); LocalizeFreeRatio is the host free-space
+	// ratio below which local writes fail with ENOSPC (0 disables).
+	LocalizeQuotaBytes          int64
+	LocalizeFreeRatio           float64
+	LocalOnlyPatterns           []string // local-only path patterns
+	LocalGitignoreAwarePatterns []string // local-only patterns gated by Git ignore rules
+	RemoteOnlyPatterns          []string // remote-persistent override patterns
 	// DisableBuiltinOverlayDefaults stops the built-in local-only defaults for
 	// Profile from being added on top of the given patterns. The CLI resolves
 	// the effective profile itself and sets this; direct library callers leave
@@ -500,6 +509,8 @@ func mountConfigFromOptions(opts *MountOptions) MountConfig {
 		LayerRef:                      opts.LayerRef,
 		CheckpointRef:                 opts.CheckpointRef,
 		LocalRoot:                     opts.LocalRoot,
+		LocalizeQuotaBytes:            opts.LocalizeQuotaBytes,
+		LocalizeFreeRatio:             opts.LocalizeFreeRatio,
 		LocalOnlyPatterns:             opts.LocalOnlyPatterns,
 		LocalGitignoreAwarePatterns:   opts.LocalGitignoreAwarePatterns,
 		RemoteOnlyPatterns:            opts.RemoteOnlyPatterns,
@@ -1031,6 +1042,8 @@ func mountWithConfig(cfg MountConfig) error {
 	if wantExt["localize"] && cfg.LocalRoot != "" {
 		localizeOpts := localize.Options{
 			LocalRoot:                   cfg.LocalRoot,
+			QuotaBytes:                  cfg.LocalizeQuotaBytes,
+			FreeRatio:                   cfg.LocalizeFreeRatio,
 			LocalOnlyPatterns:           cfg.LocalOnlyPatterns,
 			LocalGitignoreAwarePatterns: cfg.LocalGitignoreAwarePatterns,
 			RemoteOnlyPatterns:          cfg.RemoteOnlyPatterns,

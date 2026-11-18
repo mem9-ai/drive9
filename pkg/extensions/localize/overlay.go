@@ -18,6 +18,11 @@ import (
 // valid disabled overlay (operations fail with EIO through abs).
 type Overlay struct {
 	root string
+	// quota bounds the backing tree's bytes and the host filesystem's free
+	// space (nil disables both). The local overlay writes straight to the
+	// host disk, so this is the only guard between a local-only subtree and
+	// a full disk.
+	quota *overlayQuota
 }
 
 // NewOverlay returns an overlay rooted at <localRoot>/overlay, or nil for a
@@ -28,6 +33,88 @@ func NewOverlay(localRoot string) *Overlay {
 		return nil
 	}
 	return &Overlay{root: filepath.Join(localRoot, "overlay")}
+}
+
+// SetQuota installs the overlay's byte quota and free-space ratio. A
+// non-positive limit with a non-positive ratio leaves the overlay unbounded.
+func (o *Overlay) SetQuota(limit int64, freeRatio float64) error {
+	if o == nil {
+		return nil
+	}
+	q, err := newOverlayQuota(o.root, limit, freeRatio)
+	if err != nil {
+		return err
+	}
+	o.quota = q
+	return nil
+}
+
+// Quota reports the overlay's quota (nil when disabled).
+func (o *Overlay) Quota() *overlayQuota {
+	if o == nil {
+		return nil
+	}
+	return o.quota
+}
+
+// AdmitWrite reserves the space a write ending at end needs, accounting the
+// bytes the backing file already holds. An in-place overwrite admits nothing.
+// It returns ENOSPC when the quota (or the host free-space guard) refuses.
+func (o *Overlay) AdmitWrite(viewPath string, end int64) error {
+	return o.withQuota(viewPath, func(q *overlayQuota, rel string) error {
+		return q.grow(rel, end)
+	})
+}
+
+// AdmitResize reserves (or returns) the space a truncate to newSize needs.
+func (o *Overlay) AdmitResize(viewPath string, newSize int64) error {
+	return o.withQuota(viewPath, func(q *overlayQuota, rel string) error {
+		return q.resize(rel, newSize)
+	})
+}
+
+// withQuota resolves viewPath to its backing-relative path and runs fn when a
+// quota is armed.
+func (o *Overlay) withQuota(viewPath string, fn func(*overlayQuota, string) error) error {
+	if o == nil || o.quota == nil {
+		return nil
+	}
+	abs, err := o.abs(viewPath)
+	if err != nil {
+		return err
+	}
+	rel, err := filepath.Rel(o.root, abs)
+	if err != nil {
+		return err
+	}
+	return fn(o.quota, rel)
+}
+
+// Size reports the backing file's current size (0 when it does not exist).
+// It never touches the quota; the callers that need to give bytes back read
+// the size BEFORE the operation that frees them, then call ReleaseBytes.
+func (o *Overlay) Size(viewPath string) (int64, error) {
+	if o == nil {
+		return 0, syscall.EIO
+	}
+	abs, err := o.abs(viewPath)
+	if err != nil {
+		return 0, err
+	}
+	rel, err := filepath.Rel(o.root, abs)
+	if err != nil {
+		return 0, err
+	}
+	return statBackingSize(o.root, rel)
+}
+
+// ReleaseBytes returns n bytes of already-freed backing storage to the quota
+// (a truncating open, an unlink, or an admitted write that failed).
+func (o *Overlay) ReleaseBytes(n int64) {
+	if o == nil || o.quota == nil {
+		return
+	}
+	o.quota.release(n)
 }
 
 // Chmod changes the backing file's permission (and setuid/setgid/sticky)
@@ -363,6 +450,15 @@ func (o *Overlay) abs(viewPath string) (string, error) {
 		return o.root, nil
 	}
 	return filepath.Join(o.root, filepath.FromSlash(rel)), nil
+}
+
+// backingLinkCount reports the backing file's hardlink count (1 when the
+// platform does not expose it on FileInfo.Sys).
+func backingLinkCount(info iofs.FileInfo) uint64 {
+	if st, ok := info.Sys().(*syscall.Stat_t); ok && st.Nlink > 0 {
+		return uint64(st.Nlink)
+	}
+	return 1
 }
 
 // posixFileMode maps a POSIX mode word to an io/fs FileMode, carrying the

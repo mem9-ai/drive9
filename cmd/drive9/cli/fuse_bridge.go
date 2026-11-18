@@ -61,6 +61,8 @@ type mountFuseOptions struct {
 	LayerRef                     string
 	CheckpointRef                string
 	LocalRoot                    string
+	LocalizeQuotaBytes           int64
+	LocalizeFreeRatio            float64
 	LocalOnlyPatterns            []string
 	LocalGitignoreAwarePatterns  []string
 	RemoteOnlyPatterns           []string

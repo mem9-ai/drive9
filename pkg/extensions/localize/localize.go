@@ -50,6 +50,14 @@ type Options struct {
 
 	// TransientRoot anchors the transient sidecar plane; blank disables it.
 	TransientRoot string
+
+	// QuotaBytes caps the bytes the persistent overlay may occupy on the
+	// host disk. Zero disables the byte cap.
+	QuotaBytes int64
+	// FreeRatio is the minimum host filesystem free-space ratio the overlay
+	// keeps before it refuses local writes. Zero disables the guard; the CLI
+	// defaults it to 0.10 (the write-back shadow store's default).
+	FreeRatio float64
 }
 
 // Localize is the overlay router: local-classified paths are claimed and
@@ -92,6 +100,11 @@ type Localize struct {
 type token struct {
 	file *os.File
 	path string
+	// ov is the overlay that owns this handle: writes charge its quota, and
+	// size caches the backing file's size so an in-place overwrite needs no
+	// extra stat.
+	ov   *Overlay
+	size int64
 	// onRelease runs the owning router's open-reference accounting exactly
 	// once from Release — the facade releases claimed files by calling
 	// Handle.Release directly, so the OpRelease handler never runs and
@@ -119,6 +132,11 @@ func New(opts Options) (*Localize, error) {
 	if f.overlay != nil && f.policy.Enabled() {
 		if err := f.overlay.EnsureRoot(); err != nil {
 			return nil, fmt.Errorf("localize: overlay root: %w", err)
+		}
+		// The local overlay writes straight to the host filesystem, so it
+		// carries its own byte quota and free-space guard.
+		if err := f.overlay.SetQuota(opts.QuotaBytes, opts.FreeRatio); err != nil {
+			return nil, fmt.Errorf("localize: overlay quota: %w", err)
 		}
 	}
 	if f.transient != nil {
@@ -290,17 +308,30 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 			// forbids WriteAt on O_APPEND descriptors — open the backing
 			// file without it and keep writing at the kernel offsets.
 			flags := op.Flags &^ uint32(syscall.O_APPEND)
+			// A truncating open frees the old bytes; read the size before the
+			// open makes it 0.
+			oldSize := int64(0)
+			if flags&uint32(syscall.O_TRUNC) != 0 {
+				oldSize, _ = o.Size(op.Path)
+			}
 			file, err := o.OpenFile(op.Path, flags, op.Mode&0o7777)
 			if err != nil {
 				return fs.Result{}, err
 			}
+			if oldSize > 0 {
+				// The opening truncated the backing file: give its bytes
+				// back to the quota before the new content charges again.
+				o.ReleaseBytes(oldSize)
+			}
 			f.noteDBOpen(op.Path)
+			tok := &token{file: file, path: op.Path, ov: o, onRelease: f.noteDBClose}
 			var st *fs.Attr
 			if info, err := file.Stat(); err == nil {
+				tok.size = info.Size()
 				attr := attrOfLocalInfo(info)
 				st = &attr
 			}
-			return fs.Result{Handle: &token{file: file, path: op.Path, onRelease: f.noteDBClose}, Attr: st}, nil
+			return fs.Result{Handle: tok, Attr: st}, nil
 		}
 
 		// A database opened through the REMOTE route still needs its open
@@ -369,8 +400,21 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 
 	case fs.OpWrite:
 		if h, ok := op.Handle.(*token); ok {
+			end := op.Offset + int64(len(op.Data))
+			if end > h.size && h.ov != nil {
+				if err := h.ov.AdmitWrite(h.path, end); err != nil {
+					return fs.Result{}, err
+				}
+			}
 			if _, err := h.file.WriteAt(op.Data, op.Offset); err != nil {
+				if end > h.size {
+					// The growth never landed: return the reservation.
+					h.ov.ReleaseBytes(end - h.size)
+				}
 				return fs.Result{}, err
+			}
+			if end > h.size {
+				h.size = end
 			}
 			return fs.Result{}, nil
 		}
@@ -382,8 +426,16 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 					// not exist yet.
 					mode = 0o644
 				}
+				oldSize, _ := o.Size(op.Path)
 				fh, err := o.OpenFile(op.Path, syscall.O_WRONLY|syscall.O_CREAT|syscall.O_TRUNC, mode)
 				if err != nil {
+					return fs.Result{}, err
+				}
+				// The open truncated the file, so its previous bytes are
+				// free; the new image charges against the quota.
+				o.ReleaseBytes(oldSize)
+				if err := o.AdmitWrite(op.Path, int64(len(op.Data))); err != nil {
+					_ = fh.Close()
 					return fs.Result{}, err
 				}
 				_, werr := fh.Write(op.Data)
@@ -481,6 +533,12 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 			if err := o.Remove(op.Path); err != nil {
 				return fs.Result{}, err
 			}
+			// A hardlink alias keeps the bytes on disk; releasing them here
+			// would under-count the overlay, so only a last-name removal is
+			// accounted. info.Size() is the size the quota charged.
+			if backingLinkCount(info) <= 1 {
+				o.ReleaseBytes(info.Size())
+			}
 			f.noteUnlinked(op.Path)
 			return fs.Result{}, nil
 		}
@@ -532,6 +590,10 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 				}
 			}
 			if op.Size >= 0 {
+				// Growing needs quota; shrinking returns it.
+				if err := o.AdmitResize(op.Path, op.Size); err != nil {
+					return fs.Result{}, err
+				}
 				if err := o.Truncate(op.Path, op.Size); err != nil {
 					return fs.Result{}, err
 				}

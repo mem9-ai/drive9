@@ -65,6 +65,8 @@ func mountFuseImpl(opts *mountFuseOptions) error {
 		LayerRef:                    opts.LayerRef,
 		CheckpointRef:               opts.CheckpointRef,
 		LocalRoot:                   opts.LocalRoot,
+		LocalizeQuotaBytes:          opts.LocalizeQuotaBytes,
+		LocalizeFreeRatio:           opts.LocalizeFreeRatio,
 		LocalOnlyPatterns:           opts.LocalOnlyPatterns,
 		LocalGitignoreAwarePatterns: opts.LocalGitignoreAwarePatterns,
 		RemoteOnlyPatterns:          opts.RemoteOnlyPatterns,
