@@ -65,12 +65,13 @@ func TestAdminGenerateTokenOwnerOmitsScopesAndBearer(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	// Construct with an existing Bearer key to verify AdminGenerateToken never sends it.
+	// Construct with an existing Bearer key to verify AdminGenerateToken never sends it,
+	// and leave Scopes nil for an intentional owner request.
 	c := New(ts.URL, "d9_existing_bearer")
 	resp, err := c.AdminGenerateToken(context.Background(), AdminGenerateTokenRequest{
 		TenantID:   "tnt-1",
 		KeyName:    "cutover",
-		Scopes:     []FSScopeGrant{},
+		Scopes:     nil,
 		PublicKey:  "pub-1",
 		PrivateKey: "priv-1",
 	})
@@ -130,6 +131,15 @@ func TestAdminGenerateTokenScopedAndConflictError(t *testing.T) {
 	c := New(ts.URL, "")
 	if _, err := c.AdminGenerateToken(context.Background(), AdminGenerateTokenRequest{}); err == nil {
 		t.Fatal("expected empty tenant_id error")
+	}
+	// A non-nil empty slice (e.g. after filtering all grants out of a policy) must
+	// be rejected rather than silently upgraded to an unrestricted owner key.
+	if _, err := c.AdminGenerateToken(context.Background(), AdminGenerateTokenRequest{
+		TenantID:   "tnt-1",
+		TTLSeconds: &ttl,
+		Scopes:     []FSScopeGrant{},
+	}); err == nil || !strings.Contains(err.Error(), "scopes must not be empty") {
+		t.Fatalf("expected non-nil empty scopes rejection, got %v", err)
 	}
 	if _, err := c.AdminGenerateToken(context.Background(), AdminGenerateTokenRequest{
 		TenantID: "tnt-1",

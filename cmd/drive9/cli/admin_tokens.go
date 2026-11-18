@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"strings"
 	"text/tabwriter"
@@ -44,6 +46,7 @@ func adminTenantGenerateToken(args []string) error {
 		scopes          []client.FSScopeGrant
 		asJSON          bool
 		tokenOnly       bool
+		tokenOnlyFlag   string
 	)
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -127,6 +130,7 @@ func adminTenantGenerateToken(args []string) error {
 			asJSON = true
 		case "--print", "--token-only":
 			tokenOnly = true
+			tokenOnlyFlag = args[i]
 		default:
 			return fmt.Errorf("unknown flag %q\n%s", args[i], adminTenantGenerateTokenUsage())
 		}
@@ -154,7 +158,7 @@ func adminTenantGenerateToken(args []string) error {
 		return err
 	}
 	if asJSON && tokenOnly {
-		return fmt.Errorf("--json and --token-only are mutually exclusive")
+		return fmt.Errorf("--json and %s are mutually exclusive", tokenOnlyFlag)
 	}
 
 	tenantID = strings.TrimSpace(tenantID)
@@ -197,6 +201,7 @@ func adminTenantGenerateToken(args []string) error {
 	if server == "" {
 		return fmt.Errorf("server URL is required; pass --server or set %s", EnvServer)
 	}
+	warnNonLoopbackHTTPServer(server)
 
 	ctx, cancel := context.WithTimeout(context.Background(), adminGenerateTokenTimeout)
 	defer cancel()
@@ -246,19 +251,34 @@ func printAdminGenerateTokenResponse(out *client.AdminGenerateTokenResponse) err
 	return w.Flush()
 }
 
+func warnNonLoopbackHTTPServer(rawURL string) {
+	u, err := url.Parse(rawURL)
+	if err != nil || !strings.EqualFold(u.Scheme, "http") {
+		return
+	}
+	host := strings.TrimSpace(u.Hostname())
+	if host == "" || strings.EqualFold(host, "localhost") {
+		return
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return
+	}
+	_, _ = fmt.Fprintf(os.Stderr, "warning: sending TiDB Cloud credentials over plaintext HTTP to %s\n", host)
+}
+
 func adminTenantGenerateTokenUsage() string {
 	return `usage: drive9 admin tenant generate-token --tenant-id ID [flags]
 
-generate an owner or fs_scoped API key for an active tenant using TiDB Cloud
-credentials (for example, on the target region after a migration reaches
-"switched").
+generate an owner or fs_scoped API key for an active TiDB Cloud Mode tenant using
+TiDB Cloud organization credentials (POST /v1/tokens/generate; for example, on
+the target region after a migration reaches "switched").
 
 flags:
   --server URL                     server URL (default: active context server)
   --region-code CODE               TiDBCloud Mode region code; ignored when --server is set
   --tenant-id ID                   drive9 tenant id
   --key-name NAME                  optional key label (default: "default", max 64 bytes)
-  --ttl DURATION                   optional lifetime such as 24h (required with --allow)
+  --ttl DURATION                   optional owner-key lifetime or required scoped-key lifetime (up to 8760h)
   --allow PREFIX:OPS               repeatable scoped grant; omit for an owner key
   --token-only                     print only the raw bearer token
   --print                          alias for --token-only

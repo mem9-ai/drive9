@@ -11,8 +11,11 @@ import (
 )
 
 // AdminGenerateTokenRequest is the control-plane wire payload for POST /v1/tokens/generate.
-// Omitting Scopes generates an owner API key; setting Scopes generates an fs_scoped key
-// and requires a positive TTLSeconds.
+//
+// Leave Scopes nil to issue an owner API key (with optional TTLSeconds for a
+// time-limited owner key, up to 365 days). Passing a non-nil empty Scopes slice
+// is rejected to prevent accidental privilege expansion when filtering grants;
+// non-empty Scopes issue an fs_scoped key and require a positive TTLSeconds.
 type AdminGenerateTokenRequest struct {
 	TenantID   string         `json:"tenant_id"`
 	KeyName    string         `json:"key_name,omitempty"`
@@ -57,10 +60,13 @@ func (c *Client) AdminGenerateToken(ctx context.Context, req AdminGenerateTokenR
 		return nil, fmt.Errorf("tenant_id is required")
 	}
 	req.KeyName = strings.TrimSpace(req.KeyName)
-	if len(req.Scopes) == 0 {
-		req.Scopes = nil
-	} else if req.TTLSeconds == nil || *req.TTLSeconds <= 0 {
-		return nil, fmt.Errorf("ttl_seconds is required and must be positive for scoped tokens")
+	if req.Scopes != nil {
+		if len(req.Scopes) == 0 {
+			return nil, fmt.Errorf("scopes must not be empty when provided")
+		}
+		if req.TTLSeconds == nil || *req.TTLSeconds <= 0 {
+			return nil, fmt.Errorf("ttl_seconds is required and must be positive for scoped tokens")
+		}
 	}
 	if req.TTLSeconds != nil && *req.TTLSeconds <= 0 {
 		return nil, fmt.Errorf("ttl_seconds must be positive when provided")

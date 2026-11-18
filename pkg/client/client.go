@@ -253,9 +253,11 @@ func newClient(baseURL, credential string) *Client {
 		httpClient: &http.Client{
 			Transport: transport,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				if len(via) > 0 && req.URL.Host != via[0].URL.Host {
+				if len(via) > 0 && (req.URL.Scheme != via[0].URL.Scheme || req.URL.Host != via[0].URL.Host) {
 					req.Header.Del("Authorization")
 					req.Header.Del("X-Dat9-Actor")
+					req.Header.Del("X-TiDBCloud-Public-Key")
+					req.Header.Del("X-TiDBCloud-Private-Key")
 				}
 				if len(via) >= 10 {
 					return fmt.Errorf("too many redirects")

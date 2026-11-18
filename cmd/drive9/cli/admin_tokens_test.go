@@ -78,23 +78,56 @@ func TestAdminTenantGenerateTokenOwnerAndTokenOnly(t *testing.T) {
 		}
 	}
 
-	// Ensure a flag value named "help" is sent as data rather than triggering usage.
+	// Ensure a flag value named "help", --print alias, and optional owner --ttl work cleanly.
 	rawOut, err := captureStdoutE(t, func() error {
 		return Admin([]string{
 			"tenant", "generate-token",
 			"--server", ts.URL,
 			"--tenant-id", "tnt-migrated",
 			"--key-name", "help",
-			"--token-only",
+			"--ttl", "24h",
+			"--print",
 			"--tidbcloud-public-key", "pub-target",
 			"--tidbcloud-private-key", "priv-target",
 		})
 	})
 	if err != nil {
-		t.Fatalf("generate-token --key-name help --token-only: %v", err)
+		t.Fatalf("generate-token --key-name help --ttl 24h --print: %v", err)
 	}
 	if strings.TrimSpace(rawOut) != "d9_new_target_owner_key" || lastKeyName != "help" {
 		t.Fatalf("got out=%q key_name=%q, want bare token with key_name=help", rawOut, lastKeyName)
+	}
+
+	emptyTS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer emptyTS.Close()
+
+	emptyOut, emptyErr := captureStdoutE(t, func() error {
+		return Admin([]string{
+			"tenant", "generate-token",
+			"--server", emptyTS.URL,
+			"--tenant-id", "tnt-migrated",
+			"--token-only",
+			"--tidbcloud-public-key", "pub-target",
+			"--tidbcloud-private-key", "priv-target",
+		})
+	})
+	if emptyErr == nil || strings.TrimSpace(emptyOut) != "" {
+		t.Fatalf("expected empty-token CLI error and empty stdout, got err=%v stdout=%q", emptyErr, emptyOut)
+	}
+
+	if mutualErr := Admin([]string{
+		"tenant", "generate-token",
+		"--server", ts.URL,
+		"--tenant-id", "tnt-migrated",
+		"--json", "--print",
+		"--tidbcloud-public-key", "pub-target",
+		"--tidbcloud-private-key", "priv-target",
+	}); mutualErr == nil || !strings.Contains(mutualErr.Error(), "--print") {
+		t.Fatalf("expected --json and --print mutual exclusion error, got %v", mutualErr)
 	}
 
 	helpOut, err := captureStdoutE(t, func() error {
