@@ -4,8 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net"
-	"net/url"
 	"os"
 	"strings"
 	"text/tabwriter"
@@ -25,6 +23,13 @@ func nextAdminTokenFlagValue(flagName string, args []string, i int) (string, err
 		return "", fmt.Errorf("%s requires a value, got flag %q", flagName, val)
 	}
 	return val, nil
+}
+
+func rejectEmptyOption(name, val string, given bool) error {
+	if given && val == "" {
+		return fmt.Errorf("--%s must not be empty", name)
+	}
+	return nil
 }
 
 func adminTenantGenerateToken(args []string) error {
@@ -132,14 +137,19 @@ func adminTenantGenerateToken(args []string) error {
 			tokenOnly = true
 			tokenOnlyFlag = args[i]
 		default:
+			if attached, ok := strings.CutPrefix(args[i], "--key-name="); ok {
+				keyName = attached
+				keyNameGiven = true
+				continue
+			}
 			return fmt.Errorf("unknown flag %q\n%s", args[i], adminTenantGenerateTokenUsage())
 		}
 	}
 
-	if err := rejectEmptyFlag("server", strings.TrimSpace(serverFlag), serverGiven); err != nil {
+	if err := rejectEmptyOption("server", strings.TrimSpace(serverFlag), serverGiven); err != nil {
 		return err
 	}
-	if err := rejectEmptyFlag("region-code", strings.TrimSpace(regionCodeFlag), regionCodeGiven); err != nil {
+	if err := rejectEmptyOption("region-code", strings.TrimSpace(regionCodeFlag), regionCodeGiven); err != nil {
 		return err
 	}
 	if err := rejectEmptyFlag("tidbcloud-public-key", strings.TrimSpace(publicKeyFlag), publicKeyGiven); err != nil {
@@ -148,13 +158,13 @@ func adminTenantGenerateToken(args []string) error {
 	if err := rejectEmptyFlag("tidbcloud-private-key", strings.TrimSpace(privateKeyFlag), privateKeyGiven); err != nil {
 		return err
 	}
-	if err := rejectEmptyFlag("tenant-id", strings.TrimSpace(tenantID), tenantIDGiven); err != nil {
+	if err := rejectEmptyOption("tenant-id", strings.TrimSpace(tenantID), tenantIDGiven); err != nil {
 		return err
 	}
-	if err := rejectEmptyFlag("key-name", strings.TrimSpace(keyName), keyNameGiven); err != nil {
+	if err := rejectEmptyOption("key-name", strings.TrimSpace(keyName), keyNameGiven); err != nil {
 		return err
 	}
-	if err := rejectEmptyFlag("ttl", strings.TrimSpace(ttlRaw), ttlGiven); err != nil {
+	if err := rejectEmptyOption("ttl", strings.TrimSpace(ttlRaw), ttlGiven); err != nil {
 		return err
 	}
 	if asJSON && tokenOnly {
@@ -201,7 +211,6 @@ func adminTenantGenerateToken(args []string) error {
 	if server == "" {
 		return fmt.Errorf("server URL is required; pass --server or set %s", EnvServer)
 	}
-	warnNonLoopbackHTTPServer(server)
 
 	ctx, cancel := context.WithTimeout(context.Background(), adminGenerateTokenTimeout)
 	defer cancel()
@@ -217,17 +226,21 @@ func adminTenantGenerateToken(args []string) error {
 		return quotaAPIError("generate tenant token", err)
 	}
 
+	var writeErr error
 	switch {
 	case tokenOnly:
-		_, err := fmt.Fprintln(os.Stdout, out.Token)
-		return err
+		_, writeErr = fmt.Fprintln(os.Stdout, out.Token)
 	case asJSON:
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
-		return enc.Encode(out)
+		writeErr = enc.Encode(out)
 	default:
-		return printAdminGenerateTokenResponse(out)
+		writeErr = printAdminGenerateTokenResponse(out)
 	}
+	if writeErr != nil {
+		return fmt.Errorf("token %s was minted, but writing output failed: %w", emptyAsDash(out.TokenID), writeErr)
+	}
+	return nil
 }
 
 func printAdminGenerateTokenResponse(out *client.AdminGenerateTokenResponse) error {
@@ -251,27 +264,14 @@ func printAdminGenerateTokenResponse(out *client.AdminGenerateTokenResponse) err
 	return w.Flush()
 }
 
-func warnNonLoopbackHTTPServer(rawURL string) {
-	u, err := url.Parse(rawURL)
-	if err != nil || !strings.EqualFold(u.Scheme, "http") {
-		return
-	}
-	host := strings.TrimSpace(u.Hostname())
-	if host == "" || strings.EqualFold(host, "localhost") {
-		return
-	}
-	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
-		return
-	}
-	_, _ = fmt.Fprintf(os.Stderr, "warning: sending TiDB Cloud credentials over plaintext HTTP to %s\n", host)
-}
-
 func adminTenantGenerateTokenUsage() string {
 	return `usage: drive9 admin tenant generate-token --tenant-id ID [flags]
 
 generate an owner or fs_scoped API key for an active TiDB Cloud Mode tenant using
 TiDB Cloud organization credentials (POST /v1/tokens/generate; for example, on
-the target region after a migration reaches "switched").
+the target region after a migration reaches "switched"). Requires the hosted
+TiDB Cloud Mode control plane; the single-node local dev server does not serve
+this endpoint.
 
 flags:
   --server URL                     server URL (default: active context server)

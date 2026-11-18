@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -45,7 +47,10 @@ const defaultAdminGenerateTokenTimeout = 30 * time.Second
 //
 // This endpoint belongs to the hosted TiDB Cloud Mode control plane (alongside
 // AdminAcceptMigrationPlan, AdminGetTenantLogs, and AdminSetTenantQuota) rather
-// than the single-node local dev server.
+// than the single-node local dev server. When ctx carries no deadline, a 30s
+// fallback timeout is applied while preserving caller cancellation. Presence of
+// non-empty PublicKey/PrivateKey credentials is enforced by the CLI and server;
+// non-loopback http:// base URLs are rejected client-side before sending headers.
 func (c *Client) AdminGenerateToken(ctx context.Context, req AdminGenerateTokenRequest) (*AdminGenerateTokenResponse, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -54,6 +59,9 @@ func (c *Client) AdminGenerateToken(ctx context.Context, req AdminGenerateTokenR
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, defaultAdminGenerateTokenTimeout)
 		defer cancel()
+	}
+	if err := validateControlPlaneBaseURL(c.baseURL); err != nil {
+		return nil, err
 	}
 	req.TenantID = strings.TrimSpace(req.TenantID)
 	if req.TenantID == "" {
@@ -108,8 +116,30 @@ func (c *Client) AdminGenerateToken(ctx context.Context, req AdminGenerateTokenR
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, fmt.Errorf("decode admin token generate response: %w", err)
 	}
-	if strings.TrimSpace(out.Token) == "" {
+	out.Token = strings.TrimSpace(out.Token)
+	if out.Token == "" {
 		return nil, fmt.Errorf("admin token generate response is missing token")
 	}
 	return &out, nil
+}
+
+func validateControlPlaneBaseURL(rawURL string) error {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return fmt.Errorf("invalid server URL %q", rawURL)
+	}
+	if strings.EqualFold(u.Scheme, "https") {
+		return nil
+	}
+	if strings.EqualFold(u.Scheme, "http") {
+		host := strings.TrimSpace(u.Hostname())
+		if strings.EqualFold(host, "localhost") {
+			return nil
+		}
+		if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+			return nil
+		}
+		return fmt.Errorf("refusing to send TiDB Cloud credentials over plaintext http to non-loopback host %q; use https://", host)
+	}
+	return fmt.Errorf("unsupported server URL scheme %q", u.Scheme)
 }

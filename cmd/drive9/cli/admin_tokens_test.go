@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -13,7 +14,11 @@ func TestAdminTenantGenerateTokenOwnerAndTokenOnly(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	clearProvisionEnv(t)
 
-	var lastKeyName string
+	var (
+		mu             sync.Mutex
+		lastKeyName    string
+		lastTTLSeconds float64
+	)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/v1/tokens/generate" {
 			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
@@ -41,17 +46,22 @@ func TestAdminTenantGenerateTokenOwnerAndTokenOnly(t *testing.T) {
 			http.Error(w, "unexpected scopes", http.StatusBadRequest)
 			return
 		}
-		lastKeyName, _ = body["key_name"].(string)
-		if lastKeyName == "" {
-			lastKeyName = "default"
+		keyNameVal, _ := body["key_name"].(string)
+		if keyNameVal == "" {
+			keyNameVal = "default"
 		}
+		ttlVal, _ := body["ttl_seconds"].(float64)
+		mu.Lock()
+		lastKeyName = keyNameVal
+		lastTTLSeconds = ttlVal
+		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"token":      "d9_new_target_owner_key",
 			"token_id":   "key_target_1",
 			"tenant_id":  "tnt-migrated",
-			"key_name":   lastKeyName,
+			"key_name":   keyNameVal,
 			"scope_kind": "owner",
 			"status":     "active",
 			"issued_at":  time.Date(2026, 11, 18, 10, 0, 0, 0, time.UTC).Format(time.RFC3339),
@@ -94,8 +104,43 @@ func TestAdminTenantGenerateTokenOwnerAndTokenOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate-token --key-name help --ttl 24h --print: %v", err)
 	}
-	if strings.TrimSpace(rawOut) != "d9_new_target_owner_key" || lastKeyName != "help" {
-		t.Fatalf("got out=%q key_name=%q, want bare token with key_name=help", rawOut, lastKeyName)
+	mu.Lock()
+	gotName, gotTTL := lastKeyName, lastTTLSeconds
+	mu.Unlock()
+	if strings.TrimSpace(rawOut) != "d9_new_target_owner_key" || gotName != "help" || gotTTL != 86400 {
+		t.Fatalf("got out=%q key_name=%q ttl=%v, want bare token with key_name=help ttl=86400", rawOut, gotName, gotTTL)
+	}
+
+	// Attached --key-name=VALUE accepts labels beginning with "--".
+	if _, err := captureStdoutE(t, func() error {
+		return Admin([]string{
+			"tenant", "generate-token",
+			"--server", ts.URL,
+			"--tenant-id", "tnt-migrated",
+			"--key-name=--cutover",
+			"--token-only",
+			"--tidbcloud-public-key", "pub-target",
+			"--tidbcloud-private-key", "priv-target",
+		})
+	}); err != nil {
+		t.Fatalf("generate-token --key-name=--cutover: %v", err)
+	}
+	mu.Lock()
+	gotDashName := lastKeyName
+	mu.Unlock()
+	if gotDashName != "--cutover" {
+		t.Fatalf("got key_name=%q, want --cutover", gotDashName)
+	}
+
+	if emptyKeyErr := Admin([]string{
+		"tenant", "generate-token",
+		"--server", ts.URL,
+		"--tenant-id", "tnt-migrated",
+		"--key-name", "",
+		"--tidbcloud-public-key", "pub-target",
+		"--tidbcloud-private-key", "priv-target",
+	}); emptyKeyErr == nil || strings.Contains(emptyKeyErr.Error(), "credential") {
+		t.Fatalf("expected non-credential empty --key-name error, got %v", emptyKeyErr)
 	}
 
 	emptyTS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

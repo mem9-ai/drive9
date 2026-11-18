@@ -214,4 +214,13 @@ func TestAdminGenerateTokenRejectsCrossOriginRedirectAndEmptyToken(t *testing.T)
 	if err == nil || !strings.Contains(err.Error(), "missing token") {
 		t.Fatalf("expected missing token error, got %v", err)
 	}
+
+	_, err = New("http://api.example.com", "").AdminGenerateToken(context.Background(), AdminGenerateTokenRequest{
+		TenantID:   "tnt-1",
+		PublicKey:  "pub-secret",
+		PrivateKey: "priv-secret",
+	})
+	if err == nil || !strings.Contains(err.Error(), "https://") {
+		t.Fatalf("expected non-loopback http:// rejection, got %v", err)
+	}
 }
