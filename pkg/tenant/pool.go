@@ -334,7 +334,10 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 
 	p.mu.Lock()
 	if e, ok := p.items[t.ID]; ok {
-		if e.s3EncryptionPolicy == s3EncryptionPolicy && (t.StorageNamespaceID == "" || e.storageNamespaceID == t.StorageNamespaceID) {
+		// Same predicate as the fast path: a cold open that raced a rotation must not be
+		// treated as a hit just because the encryption policy still matches, or the caller
+		// would get the retired credential's backend and the valid one would be closed.
+		if e.matches(t, s3EncryptionPolicy, t.StorageNamespaceID) {
 			e.refs++
 			p.order.MoveToFront(e.elem)
 			e.lastUsed = time.Now()

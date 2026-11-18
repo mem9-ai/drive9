@@ -275,6 +275,7 @@ func cleanupForkTestTables(t *testing.T, s *meta.Store) {
 	for _, stmt := range []string{
 		`DELETE FROM object_gc_candidates`,
 		`DELETE FROM tenant_api_keys`,
+		`DELETE FROM tenant_credential_state`,
 		`DELETE FROM tenants`,
 		`DELETE FROM storage_namespaces`,
 		`DELETE FROM file_gc_tasks`,

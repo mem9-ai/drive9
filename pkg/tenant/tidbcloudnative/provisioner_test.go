@@ -3159,10 +3159,6 @@ func TestSystemUsernameForCurrentRoundTrips(t *testing.T) {
 	}
 }
 
-// Retiring the legacy privilege is a no-op for a DSN that already names the root
-// principal (nothing to remediate) and refuses a DSN without a password instead of
-// dialling with an empty one.
-
 // The restricted account's password must be derived from the cluster root secret and the
 // tenant: distinct per tenant so one leaked credential is not another tenant's, and stable
 // so a retry or a second finalizer rotates to the same value instead of racing.
@@ -3215,13 +3211,10 @@ func TestRotateLegacySystemUserCredentialClassifies(t *testing.T) {
 	if isAuthenticationDeniedError(&mysql.MySQLError{Number: 1044, Message: "Access denied for user to database"}) {
 		t.Fatal("1044 was read as an authentication refusal, so remediation would be skipped")
 	}
-	if !isAccessDeniedError(&mysql.MySQLError{Number: 1044, Message: "Access denied"}) {
-		t.Fatal("1044 is an access-denied refusal")
+	if isAuthenticationDeniedError(&mysql.MySQLError{Number: 1105, Message: "unavailable"}) {
+		t.Fatal("an availability failure was classified as an authentication refusal, so a retry would be skipped")
 	}
-	if isAccessDeniedError(&mysql.MySQLError{Number: 1105, Message: "unavailable"}) {
-		t.Fatal("an availability failure was classified as access denied, so a retry would be skipped")
-	}
-	if isAccessDeniedError(errors.New("dial tcp: connection refused")) {
-		t.Fatal("a transport failure was classified as access denied, so a retry would be skipped")
+	if isAuthenticationDeniedError(errors.New("dial tcp: connection refused")) {
+		t.Fatal("a transport failure was classified as an authentication refusal, so a retry would be skipped")
 	}
 }

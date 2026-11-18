@@ -619,16 +619,6 @@ func isAuthenticationDeniedError(err error) bool {
 	return mysqlErr.Number == 1045
 }
 
-// isAccessDeniedError reports whether the server refused a statement for lack of privilege,
-// which the caller treats as an operator-managed account it must not touch.
-func isAccessDeniedError(err error) bool {
-	var mysqlErr *mysql.MySQLError
-	if !errors.As(err, &mysqlErr) {
-		return false
-	}
-	// 1044: access denied for user to database; 1045: access denied for user.
-	return mysqlErr.Number == 1044 || mysqlErr.Number == 1045
-}
 
 func (p *Provisioner) Provision(ctx context.Context, tenantID string) (*tenant.ClusterInfo, error) {
 	return nil, fmt.Errorf("tidbcloud native requires request credentials")

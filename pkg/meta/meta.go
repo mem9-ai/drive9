@@ -3553,6 +3553,11 @@ func (s *Store) ClearTenantProvisionMetadata(ctx context.Context, tenantID strin
 		if _, err := tx.ExecContext(ctx, `DELETE FROM tenant_tidbcloud_org_bindings WHERE tenant_id = ?`, tenantID); err != nil {
 			return err
 		}
+		// The credential state is per tenant and must die with it, or a re-created tenant
+		// with the same id would inherit a claim about a credential it does not have.
+		if _, err := tx.ExecContext(ctx, `DELETE FROM tenant_credential_state WHERE tenant_id = ?`, tenantID); err != nil {
+			return err
+		}
 		return nil
 	})
 	if err != nil {
@@ -4098,6 +4103,11 @@ func (s *Store) MarkTenantDeleted(ctx context.Context, tenantID string) (err err
 		if _, err := tx.ExecContext(ctx, `DELETE FROM tenant_tidbcloud_org_bindings WHERE tenant_id = ?`, tenantID); err != nil {
 			return err
 		}
+		// The credential state is per tenant and must die with it, or a re-created tenant
+		// with the same id would inherit a claim about a credential it does not have.
+		if _, err := tx.ExecContext(ctx, `DELETE FROM tenant_credential_state WHERE tenant_id = ?`, tenantID); err != nil {
+			return err
+		}
 		return insertTenantNotifyTx(ctx, tx, tenantID, TenantNotifyWorkMetricsCleanup)
 	})
 	if err != nil {
@@ -4154,6 +4164,11 @@ func (s *Store) FinalizeTenantDelete(ctx context.Context, tenantID, namespaceID 
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM tenant_tidbcloud_org_bindings WHERE tenant_id = ?`, tenantID); err != nil {
+			return err
+		}
+		// The credential state is per tenant and must die with it, or a re-created tenant
+		// with the same id would inherit a claim about a credential it does not have.
+		if _, err := tx.ExecContext(ctx, `DELETE FROM tenant_credential_state WHERE tenant_id = ?`, tenantID); err != nil {
 			return err
 		}
 		return insertTenantNotifyTx(ctx, tx, tenantID, TenantNotifyWorkMetricsCleanup)
