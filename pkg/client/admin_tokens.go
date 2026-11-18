@@ -40,7 +40,10 @@ type AdminGenerateTokenResponse struct {
 	Scopes    []FSScopeGrant `json:"scopes,omitempty"`
 }
 
-const defaultAdminGenerateTokenTimeout = 30 * time.Second
+const (
+	defaultAdminGenerateTokenTimeout = 30 * time.Second
+	maxAdminGenerateTokenTTLSeconds  = int64(365 * 24 * 3600)
+)
 
 // AdminGenerateToken mints an owner or fs_scoped API key for one tenant using
 // TiDB Cloud organization credentials (POST /v1/tokens/generate).
@@ -76,8 +79,13 @@ func (c *Client) AdminGenerateToken(ctx context.Context, req AdminGenerateTokenR
 			return nil, fmt.Errorf("ttl_seconds is required and must be positive for scoped tokens")
 		}
 	}
-	if req.TTLSeconds != nil && *req.TTLSeconds <= 0 {
-		return nil, fmt.Errorf("ttl_seconds must be positive when provided")
+	if req.TTLSeconds != nil {
+		if *req.TTLSeconds <= 0 {
+			return nil, fmt.Errorf("ttl_seconds must be positive when provided")
+		}
+		if *req.TTLSeconds > maxAdminGenerateTokenTTLSeconds {
+			return nil, fmt.Errorf("ttl_seconds must be at most %d (8760h)", maxAdminGenerateTokenTTLSeconds)
+		}
 	}
 	raw, err := json.Marshal(req)
 	if err != nil {

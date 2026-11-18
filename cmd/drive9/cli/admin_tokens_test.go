@@ -87,6 +87,12 @@ func TestAdminTenantGenerateTokenOwnerAndTokenOnly(t *testing.T) {
 			t.Fatalf("table output missing %q:\n%s", want, tableOut)
 		}
 	}
+	mu.Lock()
+	cutoverTTL := lastTTLSeconds
+	mu.Unlock()
+	if cutoverTTL != 0 {
+		t.Fatalf("cutover owner request without --ttl sent ttl_seconds=%v, want omitted (0)", cutoverTTL)
+	}
 
 	// Ensure a flag value named "help", --print alias, and optional owner --ttl work cleanly.
 	rawOut, err := captureStdoutE(t, func() error {
@@ -160,8 +166,19 @@ func TestAdminTenantGenerateTokenOwnerAndTokenOnly(t *testing.T) {
 			"--tidbcloud-private-key", "priv-target",
 		})
 	})
-	if emptyErr == nil || strings.TrimSpace(emptyOut) != "" {
-		t.Fatalf("expected empty-token CLI error and empty stdout, got err=%v stdout=%q", emptyErr, emptyOut)
+	if emptyErr == nil || !strings.Contains(emptyErr.Error(), "missing token") || emptyOut != "" {
+		t.Fatalf("expected missing-token CLI error and exact empty stdout, got err=%v stdout=%q", emptyErr, emptyOut)
+	}
+
+	if overMaxTTLErr := Admin([]string{
+		"tenant", "generate-token",
+		"--server", ts.URL,
+		"--tenant-id", "tnt-migrated",
+		"--ttl", "8761h",
+		"--tidbcloud-public-key", "pub-target",
+		"--tidbcloud-private-key", "priv-target",
+	}); overMaxTTLErr == nil || !strings.Contains(overMaxTTLErr.Error(), "8760h") {
+		t.Fatalf("expected --ttl > 8760h error, got %v", overMaxTTLErr)
 	}
 
 	if mutualErr := Admin([]string{

@@ -192,6 +192,9 @@ func adminTenantGenerateToken(args []string) error {
 		if ttl < time.Second {
 			return fmt.Errorf("--ttl must be at least 1s")
 		}
+		if ttl > 8760*time.Hour {
+			return fmt.Errorf("--ttl must be at most 8760h")
+		}
 		sec := int64(ttl / time.Second)
 		ttlSeconds = &sec
 	} else if len(scopes) > 0 {
