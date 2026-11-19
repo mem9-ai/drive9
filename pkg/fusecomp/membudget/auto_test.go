@@ -158,6 +158,26 @@ func TestAutoLimitCommaSeparatedV1Controllers(t *testing.T) {
 	}
 }
 
+func TestAutoLimitOutsideTheMountedSubtree(t *testing.T) {
+	// The mount exposes only /tenant while the process lives in /other/job.
+	// Joining the un-translated membership would fabricate a path that looks
+	// like a cgroup; the mount point is the closest applicable one.
+	fakeCgroup(t, map[string]string{
+		"/proc/self/cgroup":               "0::/other/job\n",
+		"/proc/self/mountinfo":            "1 0 0:1 /tenant /sys/fs/cgroup rw - cgroup2 cgroup rw\n",
+		"/sys/fs/cgroup/other/memory.max": "67108864\n",
+		"/sys/fs/cgroup/memory.max":       "1073741824\n",
+	})
+	fraction := autoLimitFraction
+	limit, source := AutoLimit()
+	if want := int64(float64(int64(1<<30)) * fraction); limit != want {
+		t.Fatalf("limit = %d, want the mount point's %d", limit, want)
+	}
+	if source != "/sys/fs/cgroup/memory.max" {
+		t.Fatalf("source = %q", source)
+	}
+}
+
 func TestAutoLimitTranslatesMountinfoSubtree(t *testing.T) {
 	// The cgroup2 mount exposes the /tenant subtree: membership /tenant/job is
 	// <point>/job, not <point>/tenant/job.

@@ -126,9 +126,13 @@ func (m cgroupMount) resolve(membership string) string {
 			rel = ""
 		} else if trimmed, ok := strings.CutPrefix(rel, root+"/"); ok {
 			rel = trimmed
+		} else {
+			// A membership outside the mounted subtree cannot be resolved
+			// through this mount: joining it would fabricate a path that is
+			// not a cgroup at all, so adopt the mount point (the closest
+			// cgroup this mount can still speak about) instead.
+			return m.point
 		}
-		// A membership outside the mounted subtree cannot be resolved through
-		// this mount; the mount point is the closest applicable cgroup.
 	}
 	if rel == "" {
 		return m.point
