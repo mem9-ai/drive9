@@ -159,7 +159,6 @@ type pendingReservation struct {
 // disk.
 type writeReservation struct {
 	key     string
-	path    string
 	booking *pendingReservation
 	// admitted is the growth this writer paid for; the booking holds the total.
 	admitted int64
@@ -174,11 +173,19 @@ type writeReservation struct {
 type resizeReservation struct {
 	admitted int64
 	released int64
+	// preSize is the file's size before the truncate, so the caller can retire
+	// the name's bookings AFTER the host truncate lands.
+	preSize int64
 }
 
 // charge reserves growth with NO booking. It is the truncating write's form: the
 // file is about to be reset, so there is no base size a booking could be settled
 // against — the caller releases the unlanded remainder explicitly.
+//
+// Because it carries no booking, a concurrent mutator that destroys this write's
+// landed content between the charge and its release points cannot reconcile it:
+// the drift is bounded by ONE write's size and always leaves `used` too high
+// (fail-closed), never too low.
 func (q *overlayQuota) charge(growth int64) error {
 	if q == nil || growth <= 0 {
 		return nil
@@ -207,18 +214,12 @@ func (q *overlayQuota) admitFileWrite(f *os.File, rel string, end, writeLen int6
 		return writeReservation{}, err
 	}
 	key := "path:" + rel
-	if id, ok := fileIdentityOf(info); ok {
+	if id, ok := fileReservationKey(info); ok {
 		key = id
 	}
 	res, aerr := q.admitLocked(key, rel, info.Size(), end, writeLen)
 	res.file = f
 	return res, aerr
-}
-
-// fileIdentityOf derives the admission key from the FileInfo the admission
-// already fetched: one stat per admitted write, not two.
-func fileIdentityOf(info fs.FileInfo) (string, bool) {
-	return fileReservationKey(info)
 }
 
 // admitLocked books the admission. cur is the on-disk size; an outstanding
@@ -236,7 +237,7 @@ func (q *overlayQuota) admitLocked(key, rel string, cur, end, writeLen int64) (w
 			booking = nil
 		}
 	}
-	res := writeReservation{key: key, path: rel, preSize: cur}
+	res := writeReservation{key: key, preSize: cur}
 	growth := int64(0)
 	if end > cur {
 		growth = end - cur
@@ -270,6 +271,17 @@ func (q *overlayQuota) admitLocked(key, rel string, cur, end, writeLen int64) (w
 			}
 			set[booking] = struct{}{}
 		}
+	}
+	if rel != "" && booking.path != rel {
+		if q.byPath == nil {
+			q.byPath = make(map[string]map[*pendingReservation]struct{})
+		}
+		set := q.byPath[rel]
+		if set == nil {
+			set = make(map[*pendingReservation]struct{})
+			q.byPath[rel] = set
+		}
+		set[booking] = struct{}{}
 	}
 	if end > booking.end {
 		booking.end = end
@@ -397,13 +409,13 @@ func (q *overlayQuota) resize(rel string, newSize int64) (resizeReservation, err
 			return resizeReservation{}, err
 		}
 		out.admitted = growth
-		q.retirePathLocked(rel, cur, newSize)
+		out.preSize = cur
 		q.used += growth
 		q.chargeFreeEstimateLocked(growth)
 		return out, nil
 	}
 	out.released = cur - newSize
-	q.retirePathLocked(rel, cur, newSize)
+	out.preSize = cur
 	q.used -= out.released
 	if q.used < 0 {
 		q.used = 0
@@ -417,9 +429,23 @@ func (q *overlayQuota) retirePathLocked(rel string, size, baseline int64) {
 	for booking := range q.byPath[rel] {
 		q.retireLocked(booking, size, baseline)
 	}
-	if booking := q.reserved["path:"+rel]; booking != nil {
-		q.retireLocked(booking, size, baseline)
+}
+
+// retireIdentity retires the booking of a specific inode (whatever name it was
+// admitted through), plus the name-indexed ones, so a mutation through one
+// hardlink alias reaches a booking made through another.
+func (q *overlayQuota) retireIdentity(key, rel string, size, baseline int64) {
+	if q == nil {
+		return
 	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if key != "" {
+		if booking := q.reserved[key]; booking != nil {
+			q.retireLocked(booking, size, baseline)
+		}
+	}
+	q.retirePathLocked(rel, size, baseline)
 }
 
 // retirePath retires a name's bookings against the size it had at the mutation
@@ -523,7 +549,9 @@ func (q *overlayQuota) forceAdmit(n int64) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.used += n
-	q.chargeFreeEstimateLocked(n)
+	// These bytes exist: they belong in the estimate immediately, not in the
+	// unsettled pool (a refresh would otherwise subtract them twice).
+	q.drainFreeEstimateLocked(n)
 }
 
 // hasBookingForPath reports whether any in-flight writer is booked under the

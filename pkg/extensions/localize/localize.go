@@ -322,7 +322,7 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 				// booking against the pre-truncate size (so its writer's settle
 				// cannot refund the shrink again), then give its bytes back to
 				// the quota before the new content charges.
-				o.RetirePath(op.Path, oldSize, 0)
+				o.RetireMutation(op.Path, oldSize, 0)
 				o.ReleaseBytes(oldSize)
 			}
 			f.noteDBOpen(op.Path)
@@ -434,12 +434,11 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 				if growth < 0 {
 					growth = 0
 				}
-				// Retire any in-flight writers of this name against the
-				// pre-truncate size: the truncate destroys the base they were
-				// booked over, and their own settlements reconcile from here.
-				o.RetirePath(op.Path, oldSize, 0)
 				// Reserve the replacement BEFORE the truncating open: a refused
-				// write must leave the existing file intact, not truncated.
+				// write must leave the existing file intact, not truncated. The
+				// name's in-flight writers are retired only once the mutation
+				// actually landed (below): retiring before a refusal or a failed
+				// open would leave them measured against a file that never moved.
 				if aerr := o.ChargeGrowth(op.Path, growth); aerr != nil {
 					return fs.Result{}, aerr
 				}
@@ -455,6 +454,10 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 				}
 				written, werr := fh.Write(op.Data)
 				cerr := fh.Close()
+				// The mutation landed (the truncate happened): retire the name's
+				// in-flight writers against the pre-truncate size, with the
+				// post-write size as the baseline they must not re-pay.
+				o.RetireMutation(op.Path, oldSize, int64(written))
 				if werr != nil {
 					// The truncate baseline is zero: release everything the
 					// partial write did not land, so the charge equals the bytes
@@ -558,7 +561,14 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 			// unlink (a recreate charges from zero again). A hardlink alias
 			// keeps the bytes on disk, so the byte refund only happens on the
 			// last link.
-			o.RetirePath(op.Path, info.Size(), 0)
+			// The inode's bytes only leave the quota on the last link; while an
+			// alias survives they stay charged, so a retired writer must not be
+			// re-charged for them either — hence the baseline.
+			baseline := int64(0)
+			if backingLinkCount(info) > 1 {
+				baseline = info.Size()
+			}
+			o.RetireFile(info, "", op.Path, info.Size(), baseline)
 			if backingLinkCount(info) <= 1 {
 				o.ReleaseBytes(info.Size())
 			}
@@ -625,6 +635,10 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 					o.ReconcileResize(res)
 					return fs.Result{}, err
 				}
+				// The truncate landed: retire the name's in-flight writers
+				// against the pre-truncate size, with the new size as their
+				// baseline.
+				o.RetireMutation(op.Path, res.preSize, op.Size)
 			}
 			return fs.Result{}, nil
 		}

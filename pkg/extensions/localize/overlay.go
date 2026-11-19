@@ -106,6 +106,41 @@ func (o *Overlay) RetirePath(viewPath string, size, baseline int64) {
 	}
 }
 
+// RetireFile retires the bookings for a file whose identity is known (an
+// unlink or rename holds the FileInfo): the inode-keyed booking an admission
+// made through any hardlink alias is retired together with the name-indexed
+// ones.
+func (o *Overlay) RetireFile(info iofs.FileInfo, key, viewPath string, size, baseline int64) {
+	if o == nil || o.quota == nil {
+		return
+	}
+	rel, err := o.rel(viewPath)
+	if err != nil {
+		rel = ""
+	}
+	if key == "" && info != nil {
+		if id, ok := fileReservationKey(info); ok {
+			key = id
+		}
+	}
+	o.quota.retireIdentity(key, rel, size, baseline)
+}
+
+// RetireMutation retires the writers of viewPath after a mutation LANDED:
+// the name-indexed bookings plus the inode booking an admission through a
+// different hardlink alias would have created. size is the file's size at the
+// mutation boundary, baseline the size it has after it.
+func (o *Overlay) RetireMutation(viewPath string, size, baseline int64) {
+	if o == nil || o.quota == nil {
+		return
+	}
+	var info iofs.FileInfo
+	if fi, err := o.Lstat(viewPath); err == nil {
+		info = fi
+	}
+	o.RetireFile(info, "", viewPath, size, baseline)
+}
+
 // RetirePathNow retires a name's bookings against its CURRENT on-disk size
 // (baseline = that same size: the bytes stay counted).
 func (o *Overlay) RetirePathNow(viewPath string) {
@@ -452,8 +487,14 @@ func (o *Overlay) Rename(oldPath, newPath string) error {
 			o.RetirePath(oldPath, srcSize, srcSize)
 		}
 		if dstKnown {
-			// The replaced destination's bytes were released above.
-			o.RetirePath(newPath, dstSize, 0)
+			// The destination's bytes were released above only when nothing else
+			// keeps the inode; otherwise they stay charged, so its retired
+			// writers must not be re-charged for them either.
+			dstBaseline := int64(0)
+			if !releaseDest {
+				dstBaseline = dstSize
+			}
+			o.RetirePath(newPath, dstSize, dstBaseline)
 		} else if !srcKnown {
 			o.RetirePathNow(newPath)
 		}

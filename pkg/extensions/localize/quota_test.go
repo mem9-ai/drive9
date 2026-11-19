@@ -342,8 +342,11 @@ func TestOverlayQuotaConcurrentAppendsChargeOncePerGrowth(t *testing.T) {
 	}
 	// Two admissions for the same target end, as two open handles appending
 	// concurrently would produce before either write reaches the file.
-	_, _ = admitHandle(t, f, "//repo/node_modules/appended.bin", 500, 400)
-	_, _ = admitHandle(t, f, "//repo/node_modules/appended.bin", 500, 400)
+	_, _ = admitHandle(t, f, "/repo/node_modules/appended.bin", 500, 400)
+	_, _ = admitHandle(t, f, "/repo/node_modules/appended.bin", 500, 400)
+	if !q.hasBookingForPath("repo/node_modules/appended.bin") {
+		t.Fatal("admission booking not indexed under the production path")
+	}
 	if got := q.Used(); got != 500 {
 		t.Fatalf("used after two admissions of the same growth = %d, want 500", got)
 	}
@@ -501,7 +504,10 @@ func TestOverlayQuotaRenameRetiresBothNames(t *testing.T) {
 	}
 	q := f.overlay.Quota()
 	// A live booking on the source, as an in-flight writer would hold.
-	_, _ = admitHandle(t, f, "//repo/node_modules/r-src.bin", 800, 500)
+	_, _ = admitHandle(t, f, "/repo/node_modules/r-src.bin", 800, 500)
+	if !q.hasBookingForPath(strings.TrimPrefix(src, "/")) {
+		t.Fatal("admission booking not indexed under the production path")
+	}
 	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpRename, Path: src, Path2: dst}); err != nil {
 		t.Fatalf("rename: %v", err)
 	}
@@ -783,5 +789,55 @@ func TestOverlayQuotaRefreshDoesNotDoubleCountLandedGrowth(t *testing.T) {
 	// 1 MiB of growth must be admitted: 30 - 1 = 29 MiB > 10 MiB floor.
 	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: "/repo/node_modules/fill.bin", Offset: 21 << 20, Data: make([]byte, 1<<20)}); err != nil {
 		t.Fatalf("write after refresh = %v, want admitted", err)
+	}
+}
+
+// TestOverlayQuotaResizeRetirementWaitsForTheTruncate: a REFUSED or failed
+// resize must not retire the name's writers (the file never moved); a landed one
+// retires them with the new size as their baseline.
+func TestOverlayQuotaResizeRetirementWaitsForTheTruncate(t *testing.T) {
+	f := newQuotaRouter(t, 1000)
+	const view = "/repo/node_modules/resize-order.bin"
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: view, Offset: 0, Data: make([]byte, 100)}); err != nil {
+		t.Fatal(err)
+	}
+	q := f.overlay.Quota()
+	// A refused grow (1000-byte quota, file at 100, asking for 2000) must leave
+	// the booking live and unchanged.
+	_, _ = admitHandle(t, f, view, 600, 500)
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpSetAttr, Path: view, Size: 2000}); !errors.Is(err, syscall.ENOSPC) {
+		t.Fatalf("over-quota truncate = %v, want ENOSPC", err)
+	}
+	if !q.hasBookingForPath(strings.TrimPrefix(view, "/")) {
+		t.Fatal("a refused truncate retired the booking")
+	}
+	if got := q.Used(); got != 600 {
+		t.Fatalf("used after the refused truncate = %d, want 600", got)
+	}
+}
+
+// TestOverlayQuotaAliasAdmissionIsReachable: a booking admitted through one
+// hardlink alias is retired by a mutation through the other.
+func TestOverlayQuotaAliasAdmissionIsReachable(t *testing.T) {
+	f := newQuotaRouter(t, 4000)
+	const a = "/repo/node_modules/alias-a.bin"
+	const b = "/repo/node_modules/alias-b.bin"
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: a, Offset: 0, Data: make([]byte, 100)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpLink, Path: a, Path2: b}); err != nil {
+		t.Fatalf("link: %v", err)
+	}
+	q := f.overlay.Quota()
+	_, _ = admitHandle(t, f, a, 600, 500) // booked through alias A
+	if !q.hasBookingForPath(strings.TrimPrefix(a, "/")) {
+		t.Fatal("booking not indexed")
+	}
+	// Mutating through alias B must reach the same inode booking.
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpSetAttr, Path: b, Size: 50}); err != nil {
+		t.Fatalf("truncate through alias: %v", err)
+	}
+	if q.hasBookingForPath(strings.TrimPrefix(a, "/")) || q.hasBookingForPath(strings.TrimPrefix(b, "/")) {
+		t.Fatal("alias truncate did not retire the inode booking")
 	}
 }
