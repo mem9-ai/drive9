@@ -31,6 +31,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/fs"
 	flushdebounce "github.com/mem9-ai/drive9/pkg/fusecomp/debounce"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/httperr"
+	"github.com/mem9-ai/drive9/pkg/fusecomp/membudget"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/staging"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/writebuffer"
 	"github.com/mem9-ai/drive9/pkg/pathfilter"
@@ -206,6 +207,9 @@ type Writeback struct {
 	survivorOf func(path string) (string, bool)
 	// inodes is the facade's identity table (alias-truncate sync; optional).
 	inodes fs.InodeTable
+	// budget is the process-wide memory budget the per-handle write buffers
+	// charge (nil disables the charge).
+	budget *membudget.Budget
 
 	// wbCache/uploader form the small-file writeback track (.dat/.meta
 	// disk cache + 16-worker uploader), active when WriteCacheDir is set.
@@ -908,6 +912,21 @@ func (w *Writeback) commitSeedAllowed(size int64) bool {
 // extension's SeedPending).
 func (w *Writeback) SetPendingSeeder(fn func(path string, data []byte)) {
 	w.pendingSeeder = fn
+}
+
+// SetMemoryBudget wires the process-wide memory budget the handle write
+// buffers charge their retained bytes to. It must be called before the mount
+// serves requests (the mount does this at stack construction).
+func (w *Writeback) SetMemoryBudget(b *membudget.Budget) {
+	if w == nil {
+		return
+	}
+	w.budget = b
+	// The small-file write-back payload cache holds bytes in memory too, so
+	// it charges the same budget.
+	if w.wbCache != nil {
+		w.wbCache.SetMemoryBudget(b)
+	}
 }
 
 // SetBaseReader wires the read-cache base-preload hook; nil keeps the
@@ -4164,6 +4183,9 @@ func (h *bufferingHandle) Release(ctx context.Context) error {
 		h.ledgerShadowGen = 0
 		lf := h.liveSpillFile
 		h.liveSpillFile = nil
+		// The descriptor is closed: the buffer's bytes are retained by nobody,
+		// so its memory-budget charge goes back (Discard resets it).
+		writebuffer.Discard(&h.buf)
 		h.mu.Unlock()
 		if gen != 0 && h.w.opts.Staging != nil {
 			h.w.opts.Staging.Shadow.Unpin(gen)
@@ -4312,6 +4334,7 @@ func (h *bufferingHandle) releaseMigrated(ctx context.Context, e fs.Handle) erro
 	h.pendingFileSize = 0
 	snapshotFile := h.snapshotFile
 	h.snapshotFile = nil
+	writebuffer.Discard(&h.buf)
 	inner := h.inner
 	h.mu.Unlock()
 
@@ -4465,7 +4488,10 @@ func (h *bufferingHandle) checkoutDropCleanBuffer() {
 	if h.inner == nil || h.unlinked || h.dirty || h.pendingImage != nil {
 		return
 	}
-	h.buf = nil
+	writebuffer.Discard(&h.buf)
+	// The buffer that carried the base is gone: the next ensureBuffer must
+	// initialize it again.
+	h.baseLoaded = false
 }
 
 func (w *Writeback) acknowledgeUploadedCreate(path string, rev int64, generation uint64, source pendingGenSource, cacheGeneration uint64) {
@@ -5627,11 +5653,11 @@ func (w *Writeback) probeRemoteAuthoritative(ctx context.Context, path string) (
 		return fs.Attr{}, err
 	}
 	attr := fs.Attr{
-		Kind:   fs.KindFile,
-		Size:   st.Size,
-		Rev:    st.Revision,
-		Mtime:  st.Mtime,
-		Nlink:  st.Nlink,
+		Kind:      fs.KindFile,
+		Size:      st.Size,
+		Rev:       st.Revision,
+		Mtime:     st.Mtime,
+		Nlink:     st.Nlink,
 		ExtentIno: st.ExtentIno,
 	}
 	if st.IsDir {
@@ -6406,14 +6432,23 @@ func (h *bufferingHandle) ensureBufferLocked(ctx context.Context) error {
 		return nil
 	}
 	h.buf = writebuffer.NewWriteBuffer(h.path, bufferedMaxTotal, 0)
+	h.buf.SetMemoryBudget(h.w.budget)
+	// baseLoaded is this ATTEMPT's marker: a checkout or a reuse can leave it
+	// set from the previous buffer, and the failure defer below keys on it.
+	h.baseLoaded = false
 	// A failed base preload must not leave this provisional buffer
 	// behind: the next Write on the same descriptor would skip
 	// initialization entirely and commit a replacement containing only
 	// the retry's bytes (review) — the buffer publishes only after it
 	// holds the real base.
 	defer func() {
-		if h.buf != nil && !h.isNew && h.buf.Size() == 0 && !h.buf.HasDirtyParts() && !h.baseLoaded {
-			h.buf = nil
+		// A preload that failed part-way (the memory budget refuses a part
+		// after earlier parts landed) leaves a buffer holding SOME of the
+		// base: publishing it would let the next commit replace the file
+		// with an image missing the rest. Discard on any failed preload, and
+		// return its memory-budget charge with it.
+		if !h.baseLoaded {
+			writebuffer.Discard(&h.buf)
 		}
 	}()
 	if h.pendingFile != nil {
@@ -6571,7 +6606,7 @@ func (h *bufferingHandle) ensureBufferLocked(ctx context.Context) error {
 		h.baseLoaded = true
 		return nil
 	}
-	if h.baseSize <= h.w.preload {
+	if h.baseSize <= h.w.preload && (h.w.budget == nil || h.w.budget.CanFit(h.baseSize)) {
 		// Preload the base cache-first (read its preload through the
 		// read cache): a just-committed image answers locally, so the
 		// materialization cannot 404 inside backend replica lag.
@@ -6886,7 +6921,10 @@ func (h *bufferingHandle) spillToShadow(st *staging.Staging, buf *writebuffer.Wr
 		if end > size {
 			end = size
 		}
-		if err := buf.EnsurePartsForWrite(start, end-start); err != nil {
+		// The image was admitted by Write; the spill cannot stage it without
+		// these parts, so charge them past the budget instead of refusing the
+		// close (a refusal left the file unclosable until other memory freed).
+		if err := buf.ForceEnsurePartsForWrite(start, end-start); err != nil {
 			return err
 		}
 		data := buf.PartData(partNum)
@@ -7173,6 +7211,11 @@ func (h *bufferingHandle) maybeArmStreaming() error {
 		return nil
 	}
 	h.streamArmed = true
+	// Streaming stays size-driven. The budget only decides whether the base is
+	// preloaded whole or stays lazy; re-checking it here would arm streaming
+	// for a file whose base is ALREADY resident (preloaded bytes are charged),
+	// and a streamed commit uploads only parts submitted through OnPartFull
+	// plus dirty parts — it would silently omit the untouched preloaded ones.
 	if h.baseSize <= h.w.preload {
 		return nil // small files buffer whole
 	}

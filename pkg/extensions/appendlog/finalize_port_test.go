@@ -218,8 +218,14 @@ func TestPortAppendLogReleaseDoesNotRetryModeAfterContentFailure(t *testing.T) {
 			if got := gate.count(); got != 0 {
 				t.Fatalf("chmod calls = %d, want 0 (mode only rides a landed commit)", got)
 			}
-			if !h.dirty || !h.buf.HasDirtyParts() {
+			// The pending remote state survives the failed close, but the
+			// BUFFER does not: the descriptor is gone, so Release returns its
+			// memory-budget charge and drops it (nothing can read it again).
+			if !h.dirty {
 				t.Fatal("failed content must preserve the dirty generation")
+			}
+			if h.buf != nil {
+				t.Fatal("failed close kept the dropped handle's buffer (budget leak)")
 			}
 			if !h.hasPendingMode {
 				t.Fatal("pending mode must survive a content failure")

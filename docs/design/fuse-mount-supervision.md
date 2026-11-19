@@ -129,6 +129,7 @@ Implemented as a typed error with `ExitCode() int` (honored by `cmd/drive9/main.
 | **4** | Unhealthy / panic | **Yes** |
 | **5** | Permanent startup failure | **No** (after ≤3 attempts) |
 | **6** | Transient startup failure | **Yes** |
+| **7** | Unmounted, but the shutdown drain left write-side work behind (`drain_failed`) | **Yes** without stop token (an intentional umount always carries one) |
 | signal death | Kill / OOM observed by supervisor | **Yes** |
 
 Supervisor final exit codes:

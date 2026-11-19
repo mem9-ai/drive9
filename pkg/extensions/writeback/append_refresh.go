@@ -336,16 +336,21 @@ func (h *bufferingHandle) adoptAppendImageLocked(image []byte, landedRev int64) 
 	// maxSize 0 keeps the default cap: sizing to the adopted image alone
 	// rejected the caller's subsequent append at the old tail.
 	next := writebuffer.NewWriteBuffer(h.path, 0, 0)
+	next.SetMemoryBudget(h.w.budget)
 	if len(image) > 0 {
 		if _, err := next.Write(0, image); err != nil {
+			// The provisional buffer never replaced h.buf, and its partial
+			// charge must go back: nothing retains those bytes.
+			next.Reset()
 			return err
 		}
 	}
 	next.ClearDirty()
 	// The handle's own writes must still flush: re-dirty so the commit
 	// boundary republishes the composed image (the caller's write lands
-	// on top immediately after).
-	h.buf = next
+	// on top immediately after). Replace returns the previous buffer's
+	// memory-budget charge: only one buffer is owned at a time.
+	writebuffer.Replace(&h.buf, next)
 	h.appendSnapshot = true
 	// The rebuilt image is composed from the REMOTE's landed bytes plus this
 	// handle's own writes: whatever pending generation this handle staged

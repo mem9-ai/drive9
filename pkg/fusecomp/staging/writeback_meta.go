@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/mem9-ai/drive9/pkg/fusecomp/membudget"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/writebuffer"
 )
 
@@ -97,6 +98,10 @@ type WriteBackCache struct {
 	dataBytes int64
 	// dataMaxBytes is the aggregate memory budget for data.
 	dataMaxBytes int64
+	// budget, when set, is charged for the in-memory payloads this cache
+	// retains, so the write-back cache shows up in the process-level memory
+	// budget alongside the read cache and the write buffers.
+	budget *membudget.Budget
 
 	// pathLocks serializes file I/O for the same remotePath. Each entry
 	// tracks a mutex and the number of goroutines waiting to use it.
@@ -313,6 +318,48 @@ func (c *WriteBackCache) HasInMemoryPayload(remotePath string) bool {
 	return ok
 }
 
+// SetMemoryBudget wires the process-wide memory budget this cache charges its
+// in-memory payloads to. A nil budget disables the charge (the local
+// dataMaxBytes LRU still applies).
+func (c *WriteBackCache) SetMemoryBudget(b *membudget.Budget) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.budget = b
+	c.mu.Unlock()
+	if b != nil {
+		// The .dat files stay authoritative, so dropping the in-memory
+		// copies is a safe way to give bytes back under pressure.
+		b.RegisterReclaimer(membudget.ClassWriteCache, c.ReclaimBytes)
+	}
+}
+
+// ReclaimBytes drops in-memory payloads (LRU order) until at least target
+// bytes are released and reports how many bytes it actually freed. It is the
+// budget's reclaimer hook: the .dat file on disk stays authoritative, so a
+// dropped payload only costs a re-read.
+func (c *WriteBackCache) ReclaimBytes(target int64) int64 {
+	if c == nil || target <= 0 {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var freed int64
+	for freed < target {
+		tail := c.dataOrder.Back()
+		if tail == nil {
+			break
+		}
+		path, _ := tail.Value.(string)
+		if data, ok := c.data[path]; ok {
+			freed += int64(len(data))
+		}
+		c.deleteDataLocked(path)
+	}
+	return freed
+}
+
 // SetInMemoryBudget overrides the in-memory small-payload byte budget.
 func (c *WriteBackCache) SetInMemoryBudget(maxBytes int64) {
 	c.mu.Lock()
@@ -332,7 +379,7 @@ func (c *WriteBackCache) InMemoryUsage() int64 {
 func (c *WriteBackCache) DropInMemoryPayload(remotePath string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	delete(c.data, remotePath)
+	c.deleteDataLocked(remotePath)
 }
 
 // PublishMeta installs a metadata entry directly (test hook simulating the
@@ -963,17 +1010,7 @@ func (c *WriteBackCache) RenamePending(oldPath, newPath string) bool {
 	if data, ok := c.data[oldPath]; ok {
 		c.deleteDataLocked(oldPath)
 		c.deleteDataLocked(newPath)
-		c.data[newPath] = data
-		c.dataBytes += int64(len(data))
-		c.dataElems[newPath] = c.dataOrder.PushFront(newPath)
-		for c.dataBytes > c.dataMaxBytes && c.dataOrder.Len() > 0 {
-			tail := c.dataOrder.Back()
-			if tail == nil {
-				break
-			}
-			path, _ := tail.Value.(string)
-			c.deleteDataLocked(path)
-		}
+		c.cacheDataLocked(newPath, data, int64(len(data)))
 	}
 	return true
 }
@@ -1464,8 +1501,20 @@ func (c *WriteBackCache) cacheDataLocked(remotePath string, data []byte, size in
 		c.deleteDataLocked(remotePath)
 		return
 	}
+	if !c.chargeDataLocked(int64(len(data))) {
+		// Degrade: the process memory budget is full even after this cache
+		// dropped its own LRU tail. The .dat file on disk is authoritative,
+		// so serving the entry without the in-memory copy only costs a
+		// re-read.
+		c.deleteDataLocked(remotePath)
+		return
+	}
 	if existing, ok := c.data[remotePath]; ok {
-		c.dataBytes -= int64(len(existing))
+		old := int64(len(existing))
+		c.dataBytes -= old
+		if c.budget != nil {
+			c.budget.Release(membudget.ClassWriteCache, old)
+		}
 	} else {
 		c.dataElems[remotePath] = c.dataOrder.PushFront(remotePath)
 	}
@@ -1484,6 +1533,27 @@ func (c *WriteBackCache) cacheDataLocked(remotePath string, data []byte, size in
 	}
 }
 
+// chargeDataLocked reserves n bytes of the process memory budget, dropping
+// this cache's own LRU tail while the budget is short. It reports whether the
+// payload may be retained. The caller must hold c.mu; the budget call here is
+// Charge (never Acquire), so no reclaimer can re-enter this cache's lock.
+func (c *WriteBackCache) chargeDataLocked(n int64) bool {
+	if c.budget == nil {
+		return true
+	}
+	for {
+		if c.budget.Charge(membudget.ClassWriteCache, n) == nil {
+			return true
+		}
+		tail := c.dataOrder.Back()
+		if tail == nil {
+			return false
+		}
+		path, _ := tail.Value.(string)
+		c.deleteDataLocked(path)
+	}
+}
+
 func (c *WriteBackCache) touchDataLocked(remotePath string) {
 	if elem, ok := c.dataElems[remotePath]; ok {
 		c.dataOrder.MoveToFront(elem)
@@ -1494,6 +1564,9 @@ func (c *WriteBackCache) deleteDataLocked(remotePath string) {
 	if data, ok := c.data[remotePath]; ok {
 		c.dataBytes -= int64(len(data))
 		delete(c.data, remotePath)
+		if c.budget != nil {
+			c.budget.Release(membudget.ClassWriteCache, int64(len(data)))
+		}
 	}
 	if elem, ok := c.dataElems[remotePath]; ok {
 		c.dataOrder.Remove(elem)

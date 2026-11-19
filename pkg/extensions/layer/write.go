@@ -14,6 +14,7 @@ import (
 
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/fs"
+	"github.com/mem9-ai/drive9/pkg/fusecomp/membudget"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/writebuffer"
 )
 
@@ -43,6 +44,10 @@ type layerHandle struct {
 	// released marks a descriptor whose Release already published: the
 	// registry must never re-select it as the path's surviving claim.
 	released bool
+	// terminalErr records the outcome of the close that discarded the buffer.
+	// A commit that captured that buffer and finds it gone reports this instead
+	// of claiming success over a publish that failed.
+	terminalErr error
 	// conflicted marks a handle whose path changed underneath it in an
 	// external layer refresh while it held uncommitted writes (v1 replay
 	// conflict): writes and commits answer EAGAIN — the buffer is kept, and
@@ -238,13 +243,24 @@ func (h *layerHandle) Release(ctx context.Context) error {
 	h.mu.Lock()
 	unlinked := h.unlinked
 	unlink := h.unlinkAtRelease
+	path := h.path
 	h.mu.Unlock()
+	var err error
 	if unlinked {
 		_ = unlink // the unlink op already published the whiteout
-		h.l.untrackHandle(h)
-		return nil
+	} else {
+		err = h.commit(ctx)
 	}
-	err := h.commit(ctx)
+	// Drop the buffer under the handle's PATH lock: a commit already waiting on
+	// that lock captured this buffer and must see it gone (commit re-checks and
+	// aborts), and one that is mid-flight finishes first. Retained buffer bytes
+	// belong to no one once the handle is closed, so the charge goes back.
+	unlock := h.l.mutLocks.lock(path)
+	h.mu.Lock()
+	h.terminalErr = err
+	h.mu.Unlock()
+	h.releaseBuffer()
+	unlock()
 	h.l.untrackHandle(h)
 	return err
 }
@@ -402,8 +418,15 @@ func (h *layerHandle) commit(ctx context.Context) error {
 	h.mu.Lock()
 	moved := h.path != path
 	unlinked := h.unlinked
+	// The buffer captured before the lock wait may have been discarded by a
+	// concurrent Release (which takes this same path lock before dropping it):
+	// publishing from a reset buffer would upload a short or empty image, and
+	// clearing it afterwards would nil-deref. Whoever discarded it also ended
+	// this handle's writes, so report success without publishing.
+	bufGone := h.buf == nil || h.buf != buf
+	terminalErr := h.terminalErr
 	h.mu.Unlock()
-	if moved || unlinked {
+	if moved || unlinked || bufGone {
 		unlock()
 		// The aborted attempt still ends its landing window: a marker
 		// left set kept the fd's path permanently deferred in the event
@@ -411,6 +434,11 @@ func (h *layerHandle) commit(ctx context.Context) error {
 		landingDone(0)
 		if moved {
 			return syscall.EAGAIN
+		}
+		if bufGone {
+			// The close that discarded the buffer owns this handle's publish; a
+			// waiting commit reports its outcome instead of claiming success.
+			return terminalErr
 		}
 		return nil
 	}
@@ -471,7 +499,11 @@ func (h *layerHandle) commit(ctx context.Context) error {
 		// keeps the handle dirty — its bytes are still unacknowledged.
 		h.dirty = false
 		h.isNew = false
-		h.buf.ClearDirty()
+		// Only the buffer this commit captured: a concurrent Release could
+		// have dropped it in the meantime.
+		if h.buf == buf {
+			h.buf.ClearDirty()
+		}
 	}
 	h.mu.Unlock()
 	_ = entry
@@ -495,6 +527,14 @@ func (s *layerSpill) close() {
 	}
 }
 
+// releaseBuffer returns the handle's write-buffer charge to the process
+// memory budget and drops the buffer.
+func (h *layerHandle) releaseBuffer() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	writebuffer.Discard(&h.buf)
+}
+
 // spillLayerImage copies size bytes of the buffer to a temp file under
 // the handle's OWN mutex (WriteBuffer is not thread-safe — a Drain flush
 // racing a Write on the same fd read mixed images through a reader that
@@ -511,34 +551,14 @@ func spillLayerImage(buf *writebuffer.WriteBuffer, size int64) (*layerSpill, err
 	if err := func() error {
 		const chunkSize = 1 << 20
 		chunk := make([]byte, chunkSize)
-		partSize := buf.PartSize()
 		for off := int64(0); off < size; {
 			want := int64(chunkSize)
 			if rem := size - off; rem < want {
 				want = rem
 			}
-			// Load the retained base parts this chunk spans, remembering
-			// which we caused (clean ones are released after the copy).
-			first := int(off / partSize)
-			last := int((off + want - 1) / partSize)
-			var loaded []int
-			for p := first; p <= last; p++ {
-				if !buf.IsPartLoaded(p) {
-					if err := buf.EnsureLoaded(p); err != nil {
-						return err
-					}
-					loaded = append(loaded, p)
-				}
-			}
-			n := buf.ReadAt(off, chunk[:want])
-			if n <= 0 {
-				return io.ErrUnexpectedEOF
-			}
-			if _, werr := tmp.Write(chunk[:n]); werr != nil {
-				return werr
-			}
-			for _, p := range loaded {
-				buf.ReleaseCleanPart(p)
+			n, cerr := copySpillChunk(buf, tmp, off, chunk[:want])
+			if cerr != nil {
+				return cerr
 			}
 			off += int64(n)
 		}
@@ -554,6 +574,41 @@ func spillLayerImage(buf *writebuffer.WriteBuffer, size int64) (*layerSpill, err
 	return s, nil
 }
 
+// copySpillChunk copies one bounded chunk of the buffer to the spill file,
+// loading the base parts it spans. Publication loads are FORCED (the commit
+// cannot write the image out without them, so the budget records rather than
+// refuses them) and every clean part this call loaded is released on EVERY
+// exit — an error must not leave the handle holding forced parts that a later
+// IsPartLoaded check would then skip.
+func copySpillChunk(buf *writebuffer.WriteBuffer, tmp *os.File, off int64, chunk []byte) (int, error) {
+	partSize := buf.PartSize()
+	first := int(off / partSize)
+	last := int((off + int64(len(chunk)) - 1) / partSize)
+	var loaded []int
+	defer func() {
+		for _, p := range loaded {
+			buf.ReleaseCleanPart(p)
+		}
+	}()
+	for p := first; p <= last; p++ {
+		if buf.IsPartLoaded(p) {
+			continue
+		}
+		if err := buf.ForceEnsureLoaded(p); err != nil {
+			return 0, err
+		}
+		loaded = append(loaded, p)
+	}
+	n := buf.ReadAt(off, chunk)
+	if n <= 0 {
+		return 0, io.ErrUnexpectedEOF
+	}
+	if _, werr := tmp.Write(chunk[:n]); werr != nil {
+		return 0, werr
+	}
+	return n, nil
+}
+
 // entrySeqOf extracts the server entry sequence from a commit reply
 // (0 when the reply carried none).
 func entrySeqOf(e *client.FSLayerEntry) int64 {
@@ -563,27 +618,47 @@ func entrySeqOf(e *client.FSLayerEntry) int64 {
 	return e.EntrySeq
 }
 
+// SetMemoryBudget wires the process-wide memory budget this extension's
+// handle write buffers charge their retained bytes to.
+func (l *Layer) SetMemoryBudget(b *membudget.Budget) {
+	if l == nil {
+		return
+	}
+	l.budget = b
+}
+
 // ensureBufferLocked creates the write buffer over the current image:
 // overlay content preloads, base objects stay lazy (parts load from the
 // remote on first touch), fresh files start empty.
-func (h *layerHandle) ensureBufferLocked(ctx context.Context) error {
+func (h *layerHandle) ensureBufferLocked(ctx context.Context) (err error) {
 	if h.buf != nil {
 		return nil
 	}
-	h.buf = writebuffer.NewWriteBuffer(h.path, bufferedMaxTotal, 0)
-	if _, _, _, content, ok := h.l.lookup(h.path); ok && len(content) > 0 {
-		if _, err := h.buf.Write(0, content); err != nil {
-			return err
+	buf := writebuffer.NewWriteBuffer(h.path, bufferedMaxTotal, 0)
+	buf.SetMemoryBudget(h.l.budget)
+	// Publish the buffer only after the overlay content preload succeeded: a
+	// refused preload (memory budget) must not leave a partial image for the
+	// next write on this handle to commit.
+	defer func() {
+		if err != nil {
+			buf.Reset()
+			return
 		}
-		h.buf.ClearDirty()
+		h.buf = buf
+	}()
+	if _, _, _, content, ok := h.l.lookup(h.path); ok && len(content) > 0 {
+		if _, werr := buf.Write(0, content); werr != nil {
+			return werr
+		}
+		buf.ClearDirty()
 		return nil
 	}
 	if h.origSize > 0 {
-		partSize := h.buf.PartSize()
+		partSize := buf.PartSize()
 		remoteSize := h.origSize
 		l := h.l
 		remote := l.remotePath(h.path)
-		h.buf.LoadPart = func(partNum int) ([]byte, error) {
+		buf.LoadPart = func(partNum int) ([]byte, error) {
 			start := int64(partNum-1) * partSize
 			end := start + partSize
 			if end > remoteSize {
@@ -612,7 +687,7 @@ func (h *layerHandle) ensureBufferLocked(ctx context.Context) error {
 			}
 			return part, err
 		}
-		h.buf.SeedRemote(remoteSize)
+		buf.SeedRemote(remoteSize)
 		return nil
 	}
 	return nil
