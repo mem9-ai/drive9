@@ -336,9 +336,28 @@ func (o *Overlay) Rename(oldPath, newPath string) error {
 	if err := o.ensureParent(newAbs); err != nil {
 		return err
 	}
+	// A rename REPLACES an existing destination name (POSIX), and the
+	// replaced file's bytes are freed on disk: give them back to the quota
+	// once the rename succeeded. A rename of one hardlink over another name of
+	// the same inode frees nothing, so the identities are compared first.
+	replacedBytes, releaseDest := int64(0), false
+	if o.quota != nil {
+		if dstInfo, derr := os.Lstat(newAbs); derr == nil && dstInfo.Mode().IsRegular() {
+			sameInode := false
+			if srcInfo, serr := os.Lstat(oldAbs); serr == nil {
+				sameInode = os.SameFile(srcInfo, dstInfo)
+			}
+			if !sameInode {
+				replacedBytes, releaseDest = dstInfo.Size(), true
+			}
+		}
+	}
 	err = os.Rename(oldAbs, newAbs)
 	if errors.Is(err, syscall.ENAMETOOLONG) {
-		return o.renameLongPath(oldAbs, newAbs)
+		err = o.renameLongPath(oldAbs, newAbs)
+	}
+	if err == nil && releaseDest {
+		o.ReleaseBytes(replacedBytes)
 	}
 	return err
 }

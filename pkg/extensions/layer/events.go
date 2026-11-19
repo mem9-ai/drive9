@@ -195,11 +195,19 @@ func (l *Layer) refreshEvents(ctx context.Context) error {
 		}
 		if look {
 			if kind == "file" && !h.dirty {
+				// The discarded buffer's memory-budget charge goes back
+				// with it: the next read reloads the replayed image.
+				if h.buf != nil {
+					h.buf.Reset()
+				}
 				h.buf = nil
 				h.origSize = int64(len(content))
 				h.baseRev = 0
 			}
 		} else if !h.dirty {
+			if h.buf != nil {
+				h.buf.Reset()
+			}
 			h.buf = nil
 			h.origSize = 0
 		}

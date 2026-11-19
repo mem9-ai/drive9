@@ -902,7 +902,12 @@ func (a *AppendLog) refreshCleanSiblings(path string, rev, size int64, self *Han
 			other.isNew = false
 			other.baseRev = rev
 			other.origSize = size
-			other.buf = nil // re-read lazily from the committed image
+			// Re-read lazily from the committed image; the discarded
+			// buffer's memory-budget charge goes back with it.
+			if other.buf != nil {
+				other.buf.Reset()
+			}
+			other.buf = nil
 			other.observeLayoutLocked(client.ContentLayoutAppendLog, rev, size)
 			if other.dirty {
 				other.dirty = false
@@ -1703,6 +1708,9 @@ func (a *AppendLog) dropCleanSiblingImages(siblings []*Handle) {
 	for _, o := range siblings {
 		o.mu.Lock()
 		if !o.dirty {
+			if o.buf != nil {
+				o.buf.Reset()
+			}
 			o.buf = nil
 		}
 		o.mu.Unlock()
@@ -1733,6 +1741,9 @@ func (a *AppendLog) discardSiblingImages(siblings []*Handle) {
 			o.st.sqliteWALTruncated = false
 			o.st.clearSQLiteWALHeaderWrite()
 			o.seq++
+		}
+		if o.buf != nil {
+			o.buf.Reset()
 		}
 		o.buf = nil
 		o.mu.Unlock()

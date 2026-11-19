@@ -230,3 +230,49 @@ func TestOverlayQuotaPathWriteRefusalKeepsExistingImage(t *testing.T) {
 		t.Fatalf("quota used = %d, want 600", got)
 	}
 }
+
+// TestOverlayQuotaRenameOverDestinationReleasesBytes pins POSIX replacement:
+// renaming over an existing file frees the replaced bytes, so the quota must
+// not keep charging them.
+func TestOverlayQuotaRenameOverDestinationReleasesBytes(t *testing.T) {
+	f := newQuotaRouter(t, 2000)
+	const src = "/repo/node_modules/new.bin"
+	const dst = "/repo/node_modules/old.bin"
+	for _, p := range []string{src, dst} {
+		if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: p, Offset: 0, Data: make([]byte, 600)}); err != nil {
+			t.Fatalf("seed %s: %v", p, err)
+		}
+	}
+	if got := f.overlay.Quota().Used(); got != 1200 {
+		t.Fatalf("quota used = %d, want 1200", got)
+	}
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpRename, Path: src, Path2: dst}); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	if got := f.overlay.Quota().Used(); got != 600 {
+		t.Fatalf("quota used after replacing rename = %d, want 600", got)
+	}
+}
+
+// TestOverlayQuotaRenameHardlinkAliasKeepsBytes: a rename between two names of
+// the same inode frees nothing (the file keeps its link).
+func TestOverlayQuotaRenameHardlinkAliasKeepsBytes(t *testing.T) {
+	f := newQuotaRouter(t, 2000)
+	const a = "/repo/node_modules/a.bin"
+	const b = "/repo/node_modules/b.bin"
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: a, Offset: 0, Data: make([]byte, 600)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpLink, Path: a, Path2: b}); err != nil {
+		t.Fatalf("link: %v", err)
+	}
+	if got := f.overlay.Quota().Used(); got != 600 {
+		t.Fatalf("quota used after link = %d, want 600", got)
+	}
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpRename, Path: a, Path2: b}); err != nil {
+		t.Fatalf("rename over alias: %v", err)
+	}
+	if got := f.overlay.Quota().Used(); got != 600 {
+		t.Fatalf("quota used after alias rename = %d, want 600", got)
+	}
+}

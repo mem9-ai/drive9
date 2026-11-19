@@ -4484,6 +4484,9 @@ func (h *bufferingHandle) checkoutDropCleanBuffer() {
 	if h.inner == nil || h.unlinked || h.dirty || h.pendingImage != nil {
 		return
 	}
+	if h.buf != nil {
+		h.buf.Reset()
+	}
 	h.buf = nil
 }
 
@@ -7199,7 +7202,12 @@ func (h *bufferingHandle) maybeArmStreaming() error {
 		return nil
 	}
 	h.streamArmed = true
-	if h.baseSize <= h.w.preload && (h.w.budget == nil || h.w.budget.CanFit(h.baseSize)) {
+	// Streaming stays size-driven. The budget only decides whether the base is
+	// preloaded whole or stays lazy; re-checking it here would arm streaming
+	// for a file whose base is ALREADY resident (preloaded bytes are charged),
+	// and a streamed commit uploads only parts submitted through OnPartFull
+	// plus dirty parts — it would silently omit the untouched preloaded ones.
+	if h.baseSize <= h.w.preload {
 		return nil // small files buffer whole
 	}
 	h.stream = NewStreamUploader(h.w.opts.Client, h.path, h.baseRev, h.w.root)
