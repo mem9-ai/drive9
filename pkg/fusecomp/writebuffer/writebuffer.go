@@ -468,6 +468,18 @@ func (wb *WriteBuffer) ensurePart(partIdx int, force bool) error {
 // so a later Write cannot fail mid-overlay after the caller has already mutated
 // an authoritative shadow. offset/length that do not touch any part are a no-op.
 func (wb *WriteBuffer) EnsurePartsForWrite(offset, length int64) error {
+	return wb.ensurePartsForWrite(offset, length, false)
+}
+
+// ForceEnsurePartsForWrite loads the parts a READ of acknowledged bytes needs
+// even past the memory budget: the bytes are on disk, so refusing the load
+// would make the read serve something staler than what was written. The parts
+// are charged, not refused.
+func (wb *WriteBuffer) ForceEnsurePartsForWrite(offset, length int64) error {
+	return wb.ensurePartsForWrite(offset, length, true)
+}
+
+func (wb *WriteBuffer) ensurePartsForWrite(offset, length int64, force bool) error {
 	if wb == nil || length <= 0 || wb.partSize <= 0 {
 		return nil
 	}
@@ -478,7 +490,7 @@ func (wb *WriteBuffer) EnsurePartsForWrite(offset, length int64) error {
 	first := int(offset / wb.partSize)
 	last := int((end - 1) / wb.partSize)
 	for i := first; i <= last; i++ {
-		if err := wb.ensurePart(i, false); err != nil {
+		if err := wb.ensurePart(i, force); err != nil {
 			return err
 		}
 	}

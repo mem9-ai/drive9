@@ -1519,7 +1519,10 @@ func (a *AppendLog) readLiveAppendBuffer(ctx context.Context, reader *Handle, pa
 	if !served.dirty || served.buf == nil {
 		return 0, false
 	}
-	if err := served.buf.EnsurePartsForWrite(off, int64(len(dest))); err != nil {
+	// The sibling's buffered bytes are ACKNOWLEDGED writes: refusing the load
+	// on budget grounds and falling through would serve the remote's older
+	// image. Force the parts (charged, not refused).
+	if err := served.buf.ForceEnsurePartsForWrite(off, int64(len(dest))); err != nil {
 		return 0, false
 	}
 	n := served.buf.ReadAt(off, dest)
@@ -1589,7 +1592,7 @@ func (h *Handle) refreshAppendBaselineLocked(ctx context.Context) error {
 	if !newest.dirty || newest.buf == nil || newest.buf.Size() < newestSize {
 		return nil // raced with a flush; the rebase retry at flush covers it
 	}
-	if err := newest.buf.EnsurePartsForWrite(ourSize, int64(len(tail))); err != nil {
+	if err := newest.buf.ForceEnsurePartsForWrite(ourSize, int64(len(tail))); err != nil {
 		return err
 	}
 	n := newest.buf.ReadAt(ourSize, tail)

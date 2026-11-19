@@ -1,7 +1,7 @@
 package membudget
 
 import (
-	"errors"
+	"os"
 	"testing"
 )
 
@@ -28,42 +28,100 @@ func TestParseCgroupLimit(t *testing.T) {
 	}
 }
 
-func TestAutoLimitUsesTightestAvailableLimit(t *testing.T) {
-	oldFiles, oldRead := cgroupLimitFiles, readLimitFile
-	t.Cleanup(func() { cgroupLimitFiles, readLimitFile = oldFiles, oldRead })
-
-	cgroupLimitFiles = []string{"/v2/memory.max", "/v1/memory.limit_in_bytes"}
+// fakeCgroup drives AutoLimit through a fake hierarchy.
+func fakeCgroup(t *testing.T, files map[string]string) {
+	t.Helper()
+	oldRead, oldCgroup, oldMountinfo := readLimitFile, procSelfCgroup, procSelfMountinfo
+	t.Cleanup(func() { readLimitFile, procSelfCgroup, procSelfMountinfo = oldRead, oldCgroup, oldMountinfo })
 	readLimitFile = func(path string) ([]byte, error) {
-		switch path {
-		case "/v2/memory.max":
-			return []byte("max\n"), nil
-		case "/v1/memory.limit_in_bytes":
-			return []byte("1073741824\n"), nil
+		if v, ok := files[path]; ok {
+			return []byte(v), nil
 		}
-		return nil, errors.New("not found")
+		return nil, os.ErrNotExist
 	}
+}
+
+func TestAutoLimitResolvesTheProcessCgroupAndAncestors(t *testing.T) {
+	// The process sits in a child cgroup whose own memory.max is "max"; the
+	// limit lives on the parent. A root-only reader would find nothing.
+	fakeCgroup(t, map[string]string{
+		"/proc/self/cgroup":                         "0::/service/session\n",
+		"/proc/self/mountinfo":                      "1 0 0:1 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n",
+		"/sys/fs/cgroup/service/session/memory.max": "max\n",
+		"/sys/fs/cgroup/service/memory.max":         "1073741824\n",
+		"/sys/fs/cgroup/memory.max":                 "max\n",
+	})
 	limit, source := AutoLimit()
-	fraction := autoLimitFraction // runtime value: the product is fractional
+	fraction := autoLimitFraction
 	want := int64(float64(int64(1<<30)) * fraction)
 	if limit != want {
-		t.Fatalf("limit = %d, want %d (60%% of 1GiB)", limit, want)
+		t.Fatalf("limit = %d, want %d", limit, want)
 	}
-	if source != "/v1/memory.limit_in_bytes" {
+	if source != "/sys/fs/cgroup/service/memory.max" {
 		t.Fatalf("source = %q", source)
 	}
 }
 
-func TestAutoLimitDisabledWithoutACgroupLimit(t *testing.T) {
-	oldFiles, oldRead := cgroupLimitFiles, readLimitFile
-	t.Cleanup(func() { cgroupLimitFiles, readLimitFile = oldFiles, oldRead })
+func TestAutoLimitTakesTheTightestAncestor(t *testing.T) {
+	fakeCgroup(t, map[string]string{
+		"/proc/self/cgroup":             "0::/a/b\n",
+		"/proc/self/mountinfo":          "1 0 0:1 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n",
+		"/sys/fs/cgroup/a/b/memory.max": "4294967296\n",
+		"/sys/fs/cgroup/a/memory.max":   "1073741824\n",
+		"/sys/fs/cgroup/memory.max":     "max\n",
+	})
+	fraction := autoLimitFraction
+	limit, _ := AutoLimit()
+	if want := int64(float64(int64(1<<30)) * fraction); limit != want {
+		t.Fatalf("limit = %d, want the tightest ancestor %d", limit, want)
+	}
+}
 
-	cgroupLimitFiles = []string{"/v2/memory.max"}
-	readLimitFile = func(string) ([]byte, error) { return []byte("max"), nil }
+func TestAutoLimitLegacyHierarchy(t *testing.T) {
+	fakeCgroup(t, map[string]string{
+		"/proc/self/cgroup":    "11:memory:/docker/abc\n",
+		"/proc/self/mountinfo": "1 0 0:1 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n",
+		"/sys/fs/cgroup/memory/docker/abc/memory/memory.limit_in_bytes": "2147483648\n",
+	})
+	fraction := autoLimitFraction
+	limit, source := AutoLimit()
+	if want := int64(float64(int64(2<<30)) * fraction); limit != want {
+		t.Fatalf("limit = %d, want %d", limit, want)
+	}
+	if source != "/sys/fs/cgroup/memory/docker/abc/memory/memory.limit_in_bytes" {
+		t.Fatalf("source = %q", source)
+	}
+}
+
+func TestAutoLimitDisabledWithoutALimit(t *testing.T) {
+	fakeCgroup(t, map[string]string{
+		"/proc/self/cgroup":         "0::/\n",
+		"/proc/self/mountinfo":      "1 0 0:1 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n",
+		"/sys/fs/cgroup/memory.max": "max\n",
+	})
 	if limit, source := AutoLimit(); limit != 0 || source != "" {
 		t.Fatalf("AutoLimit = (%d,%q), want disabled", limit, source)
 	}
-	readLimitFile = func(string) ([]byte, error) { return nil, errors.New("missing") }
+	// No hierarchy at all (bare host / macOS).
+	fakeCgroup(t, map[string]string{})
 	if limit, _ := AutoLimit(); limit != 0 {
-		t.Fatalf("AutoLimit with no files = %d, want 0", limit)
+		t.Fatalf("AutoLimit without /proc = %d, want 0", limit)
+	}
+}
+
+func TestAutoLimitContainerRootMount(t *testing.T) {
+	// A container whose cgroup namespace mounts the cgroup2 fs at "/".
+	fakeCgroup(t, map[string]string{
+		"/proc/self/cgroup":    "0::/\n",
+		"/proc/self/mountinfo": "1 0 0:1 / / rw - cgroup2 cgroup rw\n",
+		"/memory.max":          "536870912\n",
+	})
+	fraction := autoLimitFraction
+	limit, source := AutoLimit()
+	if want := int64(float64(int64(512<<20)) * fraction); limit != want {
+		t.Fatalf("limit = %d, want %d", limit, want)
+	}
+	if source != "/memory.max" {
+		t.Fatalf("source = %q", source)
 	}
 }

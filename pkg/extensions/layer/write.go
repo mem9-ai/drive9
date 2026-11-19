@@ -236,18 +236,24 @@ func (h *layerHandle) Sync(ctx context.Context) error { return h.commit(ctx) }
 func (h *layerHandle) Flush(ctx context.Context) error { return h.commit(ctx) }
 
 func (h *layerHandle) Release(ctx context.Context) error {
-	// Retained buffer bytes belong to no one once the handle is closed.
-	defer h.releaseBuffer()
 	h.mu.Lock()
 	unlinked := h.unlinked
 	unlink := h.unlinkAtRelease
+	path := h.path
 	h.mu.Unlock()
+	var err error
 	if unlinked {
 		_ = unlink // the unlink op already published the whiteout
-		h.l.untrackHandle(h)
-		return nil
+	} else {
+		err = h.commit(ctx)
 	}
-	err := h.commit(ctx)
+	// Drop the buffer under the handle's PATH lock: a commit already waiting on
+	// that lock captured this buffer and must see it gone (commit re-checks and
+	// aborts), and one that is mid-flight finishes first. Retained buffer bytes
+	// belong to no one once the handle is closed, so the charge goes back.
+	unlock := h.l.mutLocks.lock(path)
+	h.releaseBuffer()
+	unlock()
 	h.l.untrackHandle(h)
 	return err
 }
@@ -405,8 +411,14 @@ func (h *layerHandle) commit(ctx context.Context) error {
 	h.mu.Lock()
 	moved := h.path != path
 	unlinked := h.unlinked
+	// The buffer captured before the lock wait may have been discarded by a
+	// concurrent Release (which takes this same path lock before dropping it):
+	// publishing from a reset buffer would upload a short or empty image, and
+	// clearing it afterwards would nil-deref. Whoever discarded it also ended
+	// this handle's writes, so report success without publishing.
+	bufGone := h.buf == nil || h.buf != buf
 	h.mu.Unlock()
-	if moved || unlinked {
+	if moved || unlinked || bufGone {
 		unlock()
 		// The aborted attempt still ends its landing window: a marker
 		// left set kept the fd's path permanently deferred in the event
@@ -474,7 +486,11 @@ func (h *layerHandle) commit(ctx context.Context) error {
 		// keeps the handle dirty — its bytes are still unacknowledged.
 		h.dirty = false
 		h.isNew = false
-		h.buf.ClearDirty()
+		// Only the buffer this commit captured: a concurrent Release could
+		// have dropped it in the meantime.
+		if h.buf == buf {
+			h.buf.ClearDirty()
+		}
 	}
 	h.mu.Unlock()
 	_ = entry
@@ -522,39 +538,14 @@ func spillLayerImage(buf *writebuffer.WriteBuffer, size int64) (*layerSpill, err
 	if err := func() error {
 		const chunkSize = 1 << 20
 		chunk := make([]byte, chunkSize)
-		partSize := buf.PartSize()
 		for off := int64(0); off < size; {
 			want := int64(chunkSize)
 			if rem := size - off; rem < want {
 				want = rem
 			}
-			// Load the retained base parts this chunk spans, remembering
-			// which we caused (clean ones are released after the copy).
-			first := int(off / partSize)
-			last := int((off + want - 1) / partSize)
-			var loaded []int
-			for p := first; p <= last; p++ {
-				if !buf.IsPartLoaded(p) {
-					// A publication load: the commit cannot write the image
-					// out without the part, so the memory budget records it
-					// instead of refusing it (the part is released again
-					// right after the copy). Refusing here made an admitted
-					// edit unpublishable for good.
-					if err := buf.ForceEnsureLoaded(p); err != nil {
-						return err
-					}
-					loaded = append(loaded, p)
-				}
-			}
-			n := buf.ReadAt(off, chunk[:want])
-			if n <= 0 {
-				return io.ErrUnexpectedEOF
-			}
-			if _, werr := tmp.Write(chunk[:n]); werr != nil {
-				return werr
-			}
-			for _, p := range loaded {
-				buf.ReleaseCleanPart(p)
+			n, cerr := copySpillChunk(buf, tmp, off, chunk[:want])
+			if cerr != nil {
+				return cerr
 			}
 			off += int64(n)
 		}
@@ -568,6 +559,41 @@ func spillLayerImage(buf *writebuffer.WriteBuffer, size int64) (*layerSpill, err
 		return nil, err
 	}
 	return s, nil
+}
+
+// copySpillChunk copies one bounded chunk of the buffer to the spill file,
+// loading the base parts it spans. Publication loads are FORCED (the commit
+// cannot write the image out without them, so the budget records rather than
+// refuses them) and every clean part this call loaded is released on EVERY
+// exit — an error must not leave the handle holding forced parts that a later
+// IsPartLoaded check would then skip.
+func copySpillChunk(buf *writebuffer.WriteBuffer, tmp *os.File, off int64, chunk []byte) (int, error) {
+	partSize := buf.PartSize()
+	first := int(off / partSize)
+	last := int((off + int64(len(chunk)) - 1) / partSize)
+	var loaded []int
+	defer func() {
+		for _, p := range loaded {
+			buf.ReleaseCleanPart(p)
+		}
+	}()
+	for p := first; p <= last; p++ {
+		if buf.IsPartLoaded(p) {
+			continue
+		}
+		if err := buf.ForceEnsureLoaded(p); err != nil {
+			return 0, err
+		}
+		loaded = append(loaded, p)
+	}
+	n := buf.ReadAt(off, chunk)
+	if n <= 0 {
+		return 0, io.ErrUnexpectedEOF
+	}
+	if _, werr := tmp.Write(chunk[:n]); werr != nil {
+		return 0, werr
+	}
+	return n, nil
 }
 
 // entrySeqOf extracts the server entry sequence from a commit reply

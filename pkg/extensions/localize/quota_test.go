@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -358,5 +359,93 @@ func TestOverlayQuotaInPlaceOverwriteKeepsFreeEstimate(t *testing.T) {
 	q.mu.Unlock()
 	if after != before {
 		t.Fatalf("in-place overwrites drained the free estimate: %d -> %d", before, after)
+	}
+}
+
+// TestOverlayQuotaSettleKeepsAnotherWritersLandedGrowth: writer A reserves a
+// file's extension, writer B books nothing against it (same end) and lands the
+// bytes; A's failure must not refund the growth that is now on disk.
+func TestOverlayQuotaSettleKeepsAnotherWritersLandedGrowth(t *testing.T) {
+	f := newQuotaRouter(t, 10000)
+	const rel = "/repo/node_modules/shared-append.bin"
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: rel, Offset: 0, Data: make([]byte, 100)}); err != nil {
+		t.Fatal(err)
+	}
+	q := f.overlay.Quota()
+	resA, err := q.admitWrite("/repo/node_modules/shared-append.bin", 500, 400)
+	if err != nil {
+		t.Fatalf("A admission: %v", err)
+	}
+	resB, err := q.admitWrite("/repo/node_modules/shared-append.bin", 500, 400)
+	if err != nil {
+		t.Fatalf("B admission: %v", err)
+	}
+	if resA.admitted != 400 || resB.admitted != 0 {
+		t.Fatalf("admissions = %d/%d, want 400/0 (one growth, charged once)", resA.admitted, resB.admitted)
+	}
+	// B lands the bytes; A then fails.
+	if err := os.WriteFile(filepath.Join(f.overlay.Root(), filepath.FromSlash(strings.TrimPrefix(rel, "/"))), make([]byte, 500), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	q.settleWrite(resA, 500)
+	if got := q.Used(); got != 500 {
+		t.Fatalf("used after A's failed settle = %d, want 500 (B's landed bytes)", got)
+	}
+}
+
+// TestOverlayQuotaFailedWriteSettlesAgainstResultingSize: a write that lands
+// nothing must not keep the reservation for the gap it never created.
+func TestOverlayQuotaFailedWriteSettlesAgainstResultingSize(t *testing.T) {
+	f := newQuotaRouter(t, 10000)
+	const view = "/repo/node_modules/hole.bin"
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: view, Offset: 0, Data: make([]byte, 100)}); err != nil {
+		t.Fatal(err)
+	}
+	q := f.overlay.Quota()
+	// A one-byte write beyond EOF would grow the file to 501; it fails without
+	// landing a byte, so settling against the real 100-byte size refunds all.
+	res, err := q.admitWrite("/repo/node_modules/hole.bin", 501, 1)
+	if err != nil {
+		t.Fatalf("admission: %v", err)
+	}
+	if res.admitted != 401 {
+		t.Fatalf("admitted = %d, want 401", res.admitted)
+	}
+	q.settleWrite(res, 100)
+	if got := q.Used(); got != 100 {
+		t.Fatalf("used after the failed write = %d, want 100", got)
+	}
+	if q.isReserved("path:" + strings.TrimPrefix(view, "/")) {
+		t.Fatal("failed write left its booking behind")
+	}
+	// A retry must charge the growth again.
+	res2, err := q.admitWrite("/repo/node_modules/hole.bin", 501, 1)
+	if err != nil {
+		t.Fatalf("retry admission: %v", err)
+	}
+	if res2.admitted != 401 {
+		t.Fatalf("retry admitted = %d, want 401", res2.admitted)
+	}
+}
+
+// TestOverlayQuotaSettledWriteChargesOnce: a completed write retires its
+// booking, and the next write to the same file charges only new growth.
+func TestOverlayQuotaSettledWriteChargesOnce(t *testing.T) {
+	f := newQuotaRouter(t, 10000)
+	const view = "/repo/node_modules/settled.bin"
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: view, Offset: 0, Data: make([]byte, 100)}); err != nil {
+		t.Fatal(err)
+	}
+	rel := strings.TrimPrefix(view, "/")
+	q := f.overlay.Quota()
+	if q.isReserved("path:" + rel) {
+		t.Fatal("a completed write left a booking")
+	}
+	// Overwrite inside the file: no growth, no charge.
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: view, Offset: 0, Data: make([]byte, 100)}); err != nil {
+		t.Fatal(err)
+	}
+	if got := q.Used(); got != 100 {
+		t.Fatalf("used after in-place overwrite = %d, want 100", got)
 	}
 }

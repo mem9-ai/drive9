@@ -2,6 +2,7 @@ package membudget
 
 import (
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -11,41 +12,151 @@ import (
 // runtime, the kernel FUSE queues and the rest of the process.
 const autoLimitFraction = 0.6
 
-// cgroupLimitFiles are the container memory-limit files, most specific first:
-// cgroup v2 then v1. A container with several limits uses the tightest one it
-// can find; the v2 hierarchy is authoritative when both exist.
-var cgroupLimitFiles = []string{
-	"/sys/fs/cgroup/memory.max",                   // cgroup v2
-	"/sys/fs/cgroup/memory/memory.limit_in_bytes", // cgroup v1
-}
-
-// readLimitFile is a test seam.
-var readLimitFile = os.ReadFile
+// Filesystem/process locations. They are variables so tests can drive the
+// hierarchy without a container.
+var (
+	readLimitFile     = os.ReadFile
+	procSelfCgroup    = "/proc/self/cgroup"
+	procSelfMountinfo = "/proc/self/mountinfo"
+)
 
 // AutoLimit derives the memory budget a mount should use when the operator did
-// not configure one: autoLimitFraction of the container's memory limit. It
-// returns 0 (budget disabled) when the process is not cgroup-limited, which is
-// the case on a bare host — there the operator has to state a limit explicitly
-// rather than inherit an arbitrary default.
+// not configure one: autoLimitFraction of the container's memory limit. Memory
+// limits are hierarchical, so the process's own cgroup is resolved through
+// /proc/self/cgroup and the cgroup mount, and the tightest finite limit on the
+// path to the mount root wins.
 //
-// The returned source names the file the limit came from, for the mount log.
+// It returns 0 (budget disabled) when the process is not cgroup-limited, which
+// is the case on a bare host — there the operator states a limit explicitly
+// rather than inheriting an arbitrary default. The returned source names the
+// file the limit came from, for the mount log.
 func AutoLimit() (limit int64, source string) {
-	for _, path := range cgroupLimitFiles {
-		raw, err := readLimitFile(path)
-		if err != nil {
-			continue
+	for _, resolve := range []func() (int64, string){cgroupV2Limit, cgroupV1Limit} {
+		if value, src := resolve(); value > 0 {
+			budget := int64(float64(value) * autoLimitFraction)
+			if budget > 0 {
+				return budget, src
+			}
 		}
-		value, ok := parseCgroupLimit(string(raw))
-		if !ok {
-			continue
-		}
-		budget := int64(float64(value) * autoLimitFraction)
-		if budget <= 0 {
-			continue
-		}
-		return budget, path
 	}
 	return 0, ""
+}
+
+// cgroupV2Limit resolves the unified hierarchy: /proc/self/cgroup names the
+// process's cgroup, /proc/self/mountinfo the cgroup2 mount point, and the
+// tightest memory.max from that cgroup up to the mount root applies.
+func cgroupV2Limit() (int64, string) {
+	rel, ok := cgroupMembership("")
+	if !ok {
+		return 0, ""
+	}
+	root, ok := cgroupMountPoint("cgroup2", "")
+	if !ok {
+		return 0, ""
+	}
+	return walkMemoryLimits(filepath.Join(root, rel), root, "memory.max")
+}
+
+// cgroupV1Limit resolves the legacy hierarchy: the memory controller path from
+// /proc/self/cgroup and the cgroup1 mount whose super options carry "memory".
+func cgroupV1Limit() (int64, string) {
+	rel, ok := cgroupMembership("memory")
+	if !ok {
+		return 0, ""
+	}
+	root, ok := cgroupMountPoint("cgroup", "memory")
+	if !ok {
+		return 0, ""
+	}
+	return walkMemoryLimits(filepath.Join(root, rel), root, "memory/memory.limit_in_bytes")
+}
+
+// cgroupMembership returns the process's cgroup path for a controller ("" for
+// the unified v2 hierarchy) from /proc/self/cgroup.
+func cgroupMembership(controller string) (string, bool) {
+	raw, err := readLimitFile(procSelfCgroup)
+	if err != nil {
+		return "", false
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		parts := strings.SplitN(strings.TrimSpace(line), ":", 3)
+		if len(parts) != 3 {
+			continue
+		}
+		if controller == "" {
+			if parts[0] != "0" || parts[1] != "" {
+				continue
+			}
+		} else if parts[1] != controller {
+			continue
+		}
+		rel := strings.TrimSpace(parts[2])
+		if rel == "" {
+			rel = "/"
+		}
+		return strings.TrimPrefix(rel, "/"), true
+	}
+	return "", false
+}
+
+// cgroupMountPoint finds the mount point of a cgroup filesystem from
+// /proc/self/mountinfo. controller, when set, must appear in the super options
+// (how a cgroup v1 mount advertises its controllers).
+func cgroupMountPoint(fstype, controller string) (string, bool) {
+	raw, err := readLimitFile(procSelfMountinfo)
+	if err != nil {
+		return "", false
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		left, right, found := strings.Cut(line, " - ")
+		if !found {
+			continue
+		}
+		leftFields := strings.Fields(left)
+		rightFields := strings.Fields(right)
+		if len(leftFields) < 5 || len(rightFields) < 3 {
+			continue
+		}
+		if rightFields[0] != fstype {
+			continue
+		}
+		if controller != "" && !superOptionsContain(rightFields[2], controller) {
+			continue
+		}
+		return leftFields[4], true
+	}
+	return "", false
+}
+
+func superOptionsContain(options, controller string) bool {
+	for _, opt := range strings.Split(options, ",") {
+		if opt == controller {
+			return true
+		}
+	}
+	return false
+}
+
+// walkMemoryLimits returns the tightest finite memory limit from dir up to root
+// (inclusive) and the file it came from.
+func walkMemoryLimits(dir, root, name string) (int64, string) {
+	var (
+		best       int64
+		bestSource string
+	)
+	for {
+		path := filepath.Join(dir, name)
+		if raw, err := readLimitFile(path); err == nil {
+			if value, ok := parseCgroupLimit(string(raw)); ok && (best == 0 || value < best) {
+				best, bestSource = value, path
+			}
+		}
+		if dir == root || dir == "/" || len(dir) <= len(root) {
+			break
+		}
+		dir = filepath.Dir(dir)
+	}
+	return best, bestSource
 }
 
 // parseCgroupLimit reads one cgroup limit value. ok is false for the "max"

@@ -6921,7 +6921,10 @@ func (h *bufferingHandle) spillToShadow(st *staging.Staging, buf *writebuffer.Wr
 		if end > size {
 			end = size
 		}
-		if err := buf.EnsurePartsForWrite(start, end-start); err != nil {
+		// The image was admitted by Write; the spill cannot stage it without
+		// these parts, so charge them past the budget instead of refusing the
+		// close (a refusal left the file unclosable until other memory freed).
+		if err := buf.ForceEnsurePartsForWrite(start, end-start); err != nil {
 			return err
 		}
 		data := buf.PartData(partNum)

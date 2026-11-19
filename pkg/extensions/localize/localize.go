@@ -401,15 +401,18 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 			end := op.Offset + int64(len(op.Data))
 			// The backing file's real size governs: a cached handle size goes
 			// stale as soon as another descriptor truncates the path.
-			res, err := h.ov.AdmitWrite(h.path, end, int64(len(op.Data)))
+			res, err := h.ov.AdmitFileWrite(h.file, h.path, end, int64(len(op.Data)))
 			if err != nil {
 				return fs.Result{}, err
 			}
-			written, werr := h.file.WriteAt(op.Data, op.Offset)
+			_, werr := h.file.WriteAt(op.Data, op.Offset)
+			// Settle either way against the descriptor's resulting size: on
+			// success it retires the booking (and takes the landed bytes out of
+			// the free-space window), on a partial write (the classic mid-write
+			// ENOSPC) it keeps the charge for the bytes that really landed,
+			// gaps included, and returns the rest.
+			h.ov.SettleFileWrite(h.file, res)
 			if werr != nil {
-				// A partial WriteAt (the classic mid-write ENOSPC) keeps the
-				// charge for the bytes that landed and returns the rest.
-				h.ov.ReconcileWrite(h.path, res, op.Offset+int64(written))
 				return fs.Result{}, werr
 			}
 			return fs.Result{}, nil
@@ -432,26 +435,33 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 				}
 				fh, err := o.OpenFile(op.Path, syscall.O_WRONLY|syscall.O_CREAT|syscall.O_TRUNC, mode)
 				if err != nil {
-					// The file is untouched: give the reservation back.
-					o.ReleaseBytes(res.admitted)
+					// The file is untouched: settle the reservation against its
+					// unchanged size (refunds the growth AND clears the reserved
+					// end, so a retry charges again).
+					o.SettleWrite(op.Path, res)
 					return fs.Result{}, err
 				}
 				if oldSize > newSize {
 					// The truncating open freed the old image's excess.
 					o.ReleaseBytes(oldSize - newSize)
 				}
+				// The truncate makes the on-disk size authoritative again.
+				o.ForgetPath(op.Path)
 				written, werr := fh.Write(op.Data)
 				cerr := fh.Close()
 				if werr != nil {
-					// The truncating open already dropped the old image, and a
-					// partial write landed `written` bytes: reconcile the
-					// reservation to the new size so the unused bytes are not
-					// charged forever.
+					// The truncating open already dropped the old image, so the
+					// truncate baseline is zero: release everything the partial
+					// write did not land and retire the booking.
 					if release := newSize - int64(written); release > 0 {
 						o.ReleaseBytes(release)
 					}
+					o.ForgetPath(op.Path)
 					return fs.Result{}, werr
 				}
+				// Retire the booking (the landed bytes stay charged and leave
+				// the free-space window).
+				o.SettleWrite(op.Path, res)
 				if cerr != nil {
 					return fs.Result{}, cerr
 				}
@@ -545,9 +555,11 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 			// A hardlink alias keeps the bytes on disk; releasing them here
 			// would under-count the overlay, so only a last-name removal is
 			// accounted. info.Size() is the size the quota charged.
+			// The NAME's reservation goes away with the name (a recreate must
+			// charge again); the byte refund only happens on the last link.
+			o.ForgetPath(op.Path)
 			if backingLinkCount(info) <= 1 {
 				o.ReleaseBytes(info.Size())
-				o.ForgetPath(op.Path)
 			}
 			f.noteUnlinked(op.Path)
 			return fs.Result{}, nil
