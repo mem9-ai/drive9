@@ -324,6 +324,10 @@ type Server struct {
 	// Non-positive disables it.
 	safetyNetScanInterval time.Duration
 
+	// requestReadStall overrides serverReadStallTimeout when positive. Tests set a short
+	// window; production leaves it zero.
+	requestReadStall time.Duration
+
 	// httpSrv is the running HTTP server, stored by ListenAndServe so
 	// Shutdown can drain it on SIGINT/SIGTERM. Guarded by httpSrvMu.
 	httpSrvMu sync.Mutex
@@ -389,6 +393,13 @@ const (
 	defaultBatchWriteMaxBody              int64 = 8 << 20
 	maxCredentialProvisionBodyBytes       int64 = 1 << 20
 	provisionFailureClusterCleanupTimeout       = 2 * time.Minute
+
+	// maxFSControlBodyBytes caps the small JSON control bodies on fs write surfaces that take
+	// one (patch and chmod). A patch request carries a size, a part size and part indices — ten
+	// gigabytes at the 5 MiB minimum part size is about two thousand indices, tens of
+	// kilobytes — and chmod carries a mode, so a megabyte is roomy while still bounding the
+	// decode.
+	maxFSControlBodyBytes = 1 << 20
 )
 
 func New(b *backend.Dat9Backend) *Server {
@@ -1563,7 +1574,7 @@ func injectFallbackBackend(b *backend.Dat9Backend, next http.Handler) http.Handl
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	s.observe(s.mux, w, r)
+	s.observe(s.mux, w, s.withReadStall(w, r))
 }
 
 const (
@@ -1605,16 +1616,6 @@ func isLoopbackListenAddr(addr string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-// serverReadTimeout bounds how long one request may spend sending its request line, headers
-// and body. It stops a slow sender from holding a connection (and the memory behind a body
-// that has not fully arrived) indefinitely, and it is deliberately generous: a legitimate
-// JSON or inline PUT finishes in milliseconds, and large uploads use presigned S3 URLs rather
-// than this listener. An S3-less deployment is the exception — IsLargeFile is false without
-// object storage, so a large inline PUT is streamed through this listener instead, and
-// serverReadTimeout then demands roughly maxUploadBytes/600 bytes per second sustained (about
-// 17 MiB/s at the default 10 GiB maximum). Raise it if that deployment shape is supported.
-const serverReadTimeout = 10 * time.Minute
-
 // newHTTPServer builds the listener's http.Server. readTimeout is a parameter rather than a
 // field read so a test can exercise the bound with a short duration instead of waiting ten
 // minutes out; production passes serverReadTimeout.
@@ -1623,16 +1624,19 @@ func (s *Server) newHTTPServer(addr string, readTimeout time.Duration) *http.Ser
 		Addr:              addr,
 		Handler:           s,
 		ReadHeaderTimeout: 15 * time.Second,
-		ReadTimeout:       readTimeout,
-		IdleTimeout:       2 * time.Minute,
-		MaxHeaderBytes:    1 << 20,
-		TLSConfig:         &tls.Config{MinVersion: tls.VersionTLS12},
+		// ReadTimeout is the total fallback for a body whose per-request stall deadline cannot
+		// be set (see withReadStall); everywhere else each read pushes the deadline out, so a
+		// progressing upload is not killed by the total.
+		ReadTimeout:    readTimeout,
+		IdleTimeout:    2 * time.Minute,
+		MaxHeaderBytes: 1 << 20,
+		TLSConfig:      &tls.Config{MinVersion: tls.VersionTLS12},
 	}
 }
 
 func (s *Server) ListenAndServe(addr string) error {
-	logger.Info(backgroundWithTrace(context.Background()), "server_start", zap.String("addr", addr), zap.Int64("max_upload_bytes", s.maxUploadBytes), zap.Duration("read_timeout", serverReadTimeout))
-	httpSrv := s.newHTTPServer(addr, serverReadTimeout)
+	logger.Info(backgroundWithTrace(context.Background()), "server_start", zap.String("addr", addr), zap.Int64("max_upload_bytes", s.maxUploadBytes), zap.Duration("read_stall_timeout", serverReadStallTimeout))
+	httpSrv := s.newHTTPServer(addr, serverReadStallTimeout)
 	// The API carries bearer tokens, vault secrets and file bytes. Serve HTTPS
 	// directly when a certificate is configured; otherwise say plainly that the
 	// listener is plaintext so an operator cannot mistake an unencrypted
@@ -2947,7 +2951,14 @@ func (s *Server) handlePatch(w http.ResponseWriter, r *http.Request, path string
 		PartSize         int64  `json:"part_size,omitempty"`
 		ExpectedRevision *int64 `json:"expected_revision,omitempty"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxFSControlBodyBytes)).Decode(&req); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "patch_body_too_large", "path", path, "max", maxFSControlBodyBytes)...)
+			metricEvent(r.Context(), "fs_patch", "result", "error")
+			errJSON(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return
+		}
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "patch_bad_body", "path", path, "error", err)...)
 		metricEvent(r.Context(), "fs_patch", "result", "error")
 		errJSON(w, http.StatusBadRequest, "invalid request body: "+err.Error())
@@ -3995,7 +4006,13 @@ func (s *Server) handleChmod(w http.ResponseWriter, r *http.Request, path string
 	var req struct {
 		Mode uint32 `json:"mode"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxFSControlBodyBytes)).Decode(&req); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "chmod_body_too_large", "path", path, "max", maxFSControlBodyBytes)...)
+			errJSON(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return
+		}
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "chmod_bad_body", "path", path, "error", err)...)
 		errJSON(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return

@@ -2823,26 +2823,20 @@ func TestWriteRejectsConflictingDeclaredLengths(t *testing.T) {
 	}
 }
 
-// ReadTimeout is what stops a slow sender from holding a connection — and the buffer of a body
-// that has not finished arriving — indefinitely. ListenAndServe installs it on the real server;
-// this drives the same constructor with a short bound and checks the connection is closed.
-func TestServerReadTimeoutClosesSlowRequest(t *testing.T) {
+// A body that never arrives must not hold a connection (and the buffer behind it) open. The
+// bound is a stall deadline renewed by progress, so this case — zero bytes — must hit it.
+func TestServerReadStallTimeoutClosesStalledBody(t *testing.T) {
 	s := newTestServer(t)
-	srv := s.newHTTPServer("127.0.0.1:0", 200*time.Millisecond)
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	go func() { _ = srv.Serve(ln) }()
-	defer func() { _ = srv.Close() }()
+	s.requestReadStall = 200 * time.Millisecond
+	ts := httptest.NewServer(s)
+	defer ts.Close()
 
-	conn, err := net.Dial("tcp", ln.Addr().String())
+	conn, err := net.Dial("tcp", strings.TrimPrefix(ts.URL, "http://"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = conn.Close() }()
-	// Announce a body and never send it: without a read timeout the server waits forever.
-	if _, err := fmt.Fprintf(conn, "PUT /v1/fs/slow.txt HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\n"); err != nil {
+	if _, err := fmt.Fprintf(conn, "PUT /v1/fs/stalled.txt HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\n"); err != nil {
 		t.Fatal(err)
 	}
 	start := time.Now()
@@ -2857,9 +2851,117 @@ func TestServerReadTimeoutClosesSlowRequest(t *testing.T) {
 	}
 	elapsed := time.Since(start)
 	if elapsed < 100*time.Millisecond {
-		t.Fatalf("connection closed after %s, before the 200ms read timeout could expire", elapsed)
+		t.Fatalf("connection closed after %s, before the 200ms stall window could expire", elapsed)
 	}
 	if elapsed > 5*time.Second {
-		t.Fatalf("connection stayed open for %s; the read timeout did not close it", elapsed)
+		t.Fatalf("connection stayed open for %s; the stall window did not close it", elapsed)
+	}
+}
+
+// The point of a stall deadline rather than a total one: a slow sender that keeps making
+// progress must be allowed to finish even when the whole body takes longer than one window.
+func TestServerReadStallTimeoutAllowsProgressingBody(t *testing.T) {
+	s := newTestServer(t)
+	s.requestReadStall = 300 * time.Millisecond
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	conn, err := net.Dial("tcp", strings.TrimPrefix(ts.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	if err := conn.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	// Connection: close so the server ends the response instead of keeping the socket for a
+	// next request, which is what lets the read below terminate.
+	if _, err := fmt.Fprintf(conn, "PUT /v1/fs/data/progressing.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 6\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	for _, b := range []byte("abcdef") {
+		if _, err := conn.Write([]byte{b}); err != nil {
+			t.Fatalf("write after %s: %v", time.Since(start), err)
+		}
+		// Each gap is well inside the 300ms window; the total deliberately is not.
+		time.Sleep(100 * time.Millisecond)
+	}
+	raw, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed <= 300*time.Millisecond {
+		t.Fatalf("body took %s, which does not exceed the stall window; the test would pass without renewal", elapsed)
+	}
+	if !strings.Contains(string(raw), "200 OK") {
+		t.Fatalf("response = %q, want a 200 for a progressing body", raw)
+	}
+	readResp, err := http.Get(ts.URL + "/v1/fs/data/progressing.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = readResp.Body.Close() }()
+	stored, _ := io.ReadAll(readResp.Body)
+	if readResp.StatusCode != http.StatusOK || string(stored) != "abcdef" {
+		t.Fatalf("stored content = %q status %d, want %q", stored, readResp.StatusCode, "abcdef")
+	}
+}
+
+// The listener keeps a total ReadTimeout as the fallback for bodies whose per-request deadline
+// cannot be installed; pin the plumbing that seeds it.
+func TestNewHTTPServerSeedsReadTimeoutFallback(t *testing.T) {
+	s := newTestServer(t)
+	srv := s.newHTTPServer("127.0.0.1:0", 250*time.Millisecond)
+	if srv.ReadTimeout != 250*time.Millisecond {
+		t.Fatalf("ReadTimeout = %s, want the value passed in", srv.ReadTimeout)
+	}
+	if srv.ReadHeaderTimeout != 15*time.Second || srv.IdleTimeout != 2*time.Minute {
+		t.Fatalf("unexpected listener timeouts: header=%s idle=%s", srv.ReadHeaderTimeout, srv.IdleTimeout)
+	}
+	if srv.ReadTimeout >= serverReadStallTimeout && serverReadStallTimeout == 0 {
+		t.Fatalf("read stall constant is unset")
+	}
+}
+
+// A patch body is a size, a part size and part indices; nothing legitimate approaches a
+// megabyte, so an oversized one is refused instead of decoded unbounded.
+func TestPatchRejectsOversizedBody(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	oversized := `{"new_size":16,"dirty_parts":[` + strings.Repeat("0,", (1<<19)+1) + `0]}`
+	if len(oversized) <= maxFSControlBodyBytes {
+		t.Fatalf("test body is %d bytes, needs to exceed the %d-byte cap", len(oversized), maxFSControlBodyBytes)
+	}
+	req, _ := http.NewRequest(http.MethodPatch, ts.URL+"/v1/fs/small.txt", strings.NewReader(oversized))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized patch: status %d body %q, want %d", resp.StatusCode, body, http.StatusRequestEntityTooLarge)
+	}
+}
+
+// Same for chmod, whose body is a single mode integer.
+func TestChmodRejectsOversizedBody(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	oversized := `{"mode":448,"padding":"` + strings.Repeat("x", maxFSControlBodyBytes+1) + `"}`
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/fs/?chmod=1", strings.NewReader(oversized))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized chmod: status %d body %q, want %d", resp.StatusCode, body, http.StatusRequestEntityTooLarge)
 	}
 }
