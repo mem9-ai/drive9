@@ -1005,6 +1005,41 @@ func TestOverlayQuotaFailedNewerBookingRevokesItsCoverage(t *testing.T) {
 	}
 }
 
+// TestOverlayQuotaRetiredWriterBillsBytesALaterShrinkReleased: a mutation after
+// retirement can shrink the file BELOW the retired booking's old baseline and
+// release those bytes. The frozen baseline must not be used as the lower bound,
+// or the writer's re-landing into that range is never billed (used 1950 for a
+// 2000-byte inode).
+func TestOverlayQuotaRetiredWriterBillsBytesALaterShrinkReleased(t *testing.T) {
+	f := newQuotaRouter(t, 10000)
+	const view = "/repo/node_modules/retired-shrunk.bin"
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: view, Offset: 0, Data: make([]byte, 100)}); err != nil {
+		t.Fatal(err)
+	}
+	q := f.overlay.Quota()
+	res, file := admitHandle(t, f, view, 2000, 1900)
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpSetAttr, Path: view, Size: 100}); err != nil {
+		t.Fatalf("first truncate: %v", err)
+	}
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpSetAttr, Path: view, Size: 50}); err != nil {
+		t.Fatalf("second truncate: %v", err)
+	}
+	if got := q.Used(); got != 50 {
+		t.Fatalf("used after the shrunken truncate = %d, want 50", got)
+	}
+	if _, err := file.WriteAt(make([]byte, 1950), 50); err != nil {
+		t.Fatalf("writer lands: %v", err)
+	}
+	q.settleWrite(res)
+	info, err := f.overlay.Lstat(view)
+	if err != nil {
+		t.Fatalf("lstat: %v", err)
+	}
+	if got := q.Used(); got != info.Size() {
+		t.Fatalf("used = %d, want the inode's %d bytes", got, info.Size())
+	}
+}
+
 // TestOverlayQuotaSiblingRetiredBookingsBillOnce: successive truncates retire
 // successive bookings on one inode. Each retired writer bills against the key's
 // paid prefix, not its own frozen baseline, so the shared extent is charged once.

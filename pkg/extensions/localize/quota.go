@@ -149,10 +149,6 @@ type pendingReservation struct {
 	admittedTotal int64    // growth admitted across all of its writers
 	bookings      int      // writers still to settle
 	retired       bool
-	// baseline is the file size AFTER the mutation that retired the booking
-	// (0 when the mutation released the bytes). A retired writer that lands
-	// later is charged only the growth beyond it.
-	baseline int64
 	// poolResolved records that this booking's pool share has left the
 	// unsettled pool, so a repeated stat-failing settlement cannot resolve it
 	// twice. Mirrors the `retired` tripwire: the invariant is exactly-once.
@@ -461,7 +457,6 @@ func (q *overlayQuota) retireLocked(booking *pendingReservation, size, baseline 
 	q.retireFreeEstimateLocked(booking.admittedTotal, unused)
 	booking.poolResolved = true
 	booking.retired = true
-	booking.baseline = baseline
 	// The booking reconciled against `size`: the prefix it paid for is exactly
 	// startSize+landed, and the rest of its admission is refunded. Only its own
 	// grant may be revoked here.
@@ -498,10 +493,11 @@ func (q *overlayQuota) settleWrite(res writeReservation) {
 		// booking paid up to its post-mutation size, and every admission since
 		// paid for the extent it booked. Re-charging either would bill bytes
 		// twice; charging less would let the backing tree outgrow the cap.
+		// The key's paid prefix is the only lower bound: retirement moved it to
+		// the post-mutation size, and any later mutation lowered it again when
+		// it released bytes — bytes re-landed below a retired booking's old
+		// baseline are unpaid and must be billed here.
 		from := q.paidLocked(booking.key)
-		if from < booking.baseline {
-			from = booking.baseline
-		}
 		to := size
 		if to > booking.end {
 			to = booking.end
@@ -588,6 +584,9 @@ func (q *overlayQuota) retirePathLocked(rel string, size, baseline int64) {
 	for _, key := range keys {
 		q.setPaidLocked(key, baseline, nil)
 	}
+	// Path-key platforms (no inode identity) key the prefix by name, so the
+	// name itself moves with the mutation.
+	q.setPaidLocked("path:"+rel, baseline, nil)
 }
 
 // retireIdentity retires the booking of a specific inode (whatever name it was
@@ -608,6 +607,11 @@ func (q *overlayQuota) retireIdentity(key, rel string, size, baseline int64) {
 		q.setPaidLocked(key, baseline, nil)
 	}
 	q.retirePathLocked(rel, size, baseline)
+	if key != "" && rel != "" {
+		// The inode entry is authoritative now: a shadow entry keyed by the old
+		// name would otherwise outlive the file it described (a rename-away).
+		delete(q.paid, "path:"+rel)
+	}
 }
 
 // retirePath retires a name's bookings against the size it had at the mutation

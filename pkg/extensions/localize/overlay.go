@@ -613,16 +613,12 @@ func (o *Overlay) Rename(oldPath, newPath string) error {
 		if releaseDest {
 			o.ReleaseBytes(replacedBytes)
 		}
-		// Each name's bookings are retired against THAT NAME's pre-rename size:
-		// the source name is gone (its writers were measured at srcSize) and the
-		// replaced destination's writers were measured at dstSize (0 when
-		// nothing was replaced). Using the source's size for the destination
-		// over-refunded by dstSize-srcSize.
-		// Each name's identity carries its own paid prefix: the source name is
-		// gone (its writers were measured at srcSize) and the replaced
+		// Each name is retired against ITS OWN pre-rename size: the source name
+		// is gone (its writers were measured at srcSize) and the replaced
 		// destination's writers were measured at dstSize (0 when nothing was
-		// replaced). Retiring through the FileInfo keeps the prefix attached to
-		// the inode, whatever names it has.
+		// replaced) — using the source's size for the destination over-refunded
+		// by dstSize-srcSize. Retiring through the FileInfo keeps each inode's
+		// paid prefix attached to it, whatever names it has.
 		if srcKnown {
 			o.RetireFile(srcInfo, "", oldPath, srcSize, srcSize)
 		}
