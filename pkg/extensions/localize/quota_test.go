@@ -902,10 +902,61 @@ func TestOverlayQuotaPathWriteResolvesItsPoolShare(t *testing.T) {
 	}
 }
 
-// TestOverlayQuotaRetiredRechargeIsClamped: a retired writer that lands after a
-// NEW booking regrew the file is re-charged only up to the extent it booked;
-// the bytes above it were already paid at the new booking's admission.
-func TestOverlayQuotaRetiredRechargeIsClamped(t *testing.T) {
+// TestOverlayQuotaRetiredWriterDoesNotRechargeANewerBookingsExtent walks the
+// reported production ordering: A books to 600 and pauses, a truncate to 50
+// retires A, B books to 2000, writes the file to 2000 and SETTLES, and only then
+// does A land its originally admitted write (which merely overwrites B's bytes)
+// and settle. A never extended the inode after retirement and B paid for the
+// whole resulting extent, so `used` must equal the inode's size.
+func TestOverlayQuotaRetiredWriterDoesNotRechargeANewerBookingsExtent(t *testing.T) {
+	f := newQuotaRouter(t, 10000)
+	const view = "/repo/node_modules/retired-paid.bin"
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: view, Offset: 0, Data: make([]byte, 100)}); err != nil {
+		t.Fatal(err)
+	}
+	q := f.overlay.Quota()
+	resA, fileA := admitHandle(t, f, view, 600, 500)
+	// A pause: a truncate retires A's booking and refunds its admitted growth.
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpSetAttr, Path: view, Size: 50}); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	if got := q.Used(); got != 50 {
+		t.Fatalf("used after the truncate = %d, want 50", got)
+	}
+	// B books the file out to 2000, lands it and settles: `used` is exact.
+	resB, fileB := admitHandle(t, f, view, 2000, 1950)
+	if _, err := fileB.WriteAt(make([]byte, 1950), 50); err != nil {
+		t.Fatalf("B lands: %v", err)
+	}
+	q.settleWrite(resB)
+	if got := q.Used(); got != 2000 {
+		t.Fatalf("used after B settled = %d, want 2000", got)
+	}
+	// A resumes its originally admitted write: it overwrites bytes inside B's
+	// extent and leaves the inode at 2000.
+	if _, err := fileA.WriteAt(make([]byte, 550), 50); err != nil {
+		t.Fatalf("A lands: %v", err)
+	}
+	q.settleWrite(resA)
+	info, err := f.overlay.Lstat(view)
+	if err != nil {
+		t.Fatalf("lstat: %v", err)
+	}
+	if got := q.Used(); got != info.Size() {
+		t.Fatalf("used = %d, want the inode's %d bytes (B already paid them)", got, info.Size())
+	}
+	q.mu.Lock()
+	orphans := len(q.retired)
+	q.mu.Unlock()
+	if orphans != 0 {
+		t.Fatalf("retired-booking registry still holds %d entries after every writer settled", orphans)
+	}
+}
+
+// TestOverlayQuotaRetiredRechargeIsClampedByItsOwnExtent: with no newer booking,
+// a retired writer that lands past its booked end is re-charged only for the
+// extent it booked — [baseline, end) — not for the whole file.
+func TestOverlayQuotaRetiredRechargeIsClampedByItsOwnExtent(t *testing.T) {
 	f := newQuotaRouter(t, 10000)
 	const view = "/repo/node_modules/retired-clamp.bin"
 	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: view, Offset: 0, Data: make([]byte, 100)}); err != nil {
@@ -913,26 +964,17 @@ func TestOverlayQuotaRetiredRechargeIsClamped(t *testing.T) {
 	}
 	q := f.overlay.Quota()
 	res, file := admitHandle(t, f, view, 600, 500)
-	// A truncate retires the booking and refunds its admitted growth.
 	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpSetAttr, Path: view, Size: 50}); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
-	if got := q.Used(); got != 50 {
-		t.Fatalf("used after the truncate = %d, want 50", got)
-	}
-	// A new writer books the file out to 2000 bytes and pays for all of it.
-	if _, _ = admitHandle(t, f, view, 2000, 1950); q.Used() != 2000 {
-		t.Fatalf("used after the new booking = %d, want 2000", q.Used())
-	}
-	// The retired writer now lands 2000 bytes, far past the 600 it booked.
-	if _, err := file.WriteAt(make([]byte, 1950), 50); err != nil {
+	// The writer lands 900 bytes although it only booked up to 600.
+	if _, err := file.WriteAt(make([]byte, 850), 50); err != nil {
 		t.Fatalf("land past the booking end: %v", err)
 	}
 	q.settleWrite(res)
-	// Only the 550 bytes of its booked extent (50..600) are re-charged; the
-	// 1400 above it were paid by the new booking and must not be charged again.
-	if got := q.Used(); got != 2550 {
-		t.Fatalf("used after the clamped re-charge = %d, want 2550", got)
+	// [50, 600) is re-charged: 550 on top of the 50 that stayed.
+	if got := q.Used(); got != 600 {
+		t.Fatalf("used after the clamped re-charge = %d, want 600", got)
 	}
 }
 

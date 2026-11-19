@@ -62,6 +62,10 @@ type overlayQuota struct {
 	// writers of a NAME regardless of the key their admission used (handle
 	// writes book by inode).
 	byPath map[string]map[*pendingReservation]struct{}
+	// retired indexes the retired bookings that still have writers to settle, by
+	// admission key, so a newer booking on the same key (or a mutation of it)
+	// can tell them which bytes are already paid.
+	retired map[string]map[*pendingReservation]struct{}
 	// unlanded is the admitted growth whose booking has not been resolved yet.
 	// A Statfs sample already includes landed bytes, so refreshing
 	// `cachedFree = free - unlanded` keeps in-flight admissions accounted
@@ -154,6 +158,12 @@ type pendingReservation struct {
 	// unsettled pool, so a repeated stat-failing settlement cannot resolve it
 	// twice. Mirrors the `retired` tripwire: the invariant is exactly-once.
 	poolResolved bool
+	// coveredTo is the size already charged for this booking's key. A retired
+	// writer that lands later may only be re-charged beyond it: everything up
+	// to it is paid, either by the mutation that retired this booking (its
+	// baseline) or by a NEWER booking on the same key, whose admission paid for
+	// the whole extent it booked.
+	coveredTo int64
 }
 
 // writeReservation records one write's reservation: the booking it owns (by
@@ -311,6 +321,9 @@ func (q *overlayQuota) admitLocked(key, rel string, cur, end, writeLen int64) (w
 		booking.end = end
 	}
 	booking.admittedTotal += growth
+	// This admission paid for [cur, end): a retired writer of the same key
+	// landing inside it must not be charged again.
+	q.coverOrphansLocked(key, end)
 	booking.bookings++
 	res.booking = booking
 	return res, nil
@@ -338,7 +351,9 @@ func (q *overlayQuota) detachLocked(booking *pendingReservation) {
 			}
 		}
 	}
-	booking.paths = nil
+	// booking.paths is deliberately kept: a retired booking still matches
+	// mutations of those names (resetOrphansLocked) although it is no longer
+	// indexed under any of them.
 }
 
 // indexLocked adds the booking to rel's index exactly once, so detach can sweep
@@ -357,6 +372,67 @@ func (q *overlayQuota) indexLocked(booking *pendingReservation, rel string) {
 	}
 	set[booking] = struct{}{}
 	booking.paths = append(booking.paths, rel)
+}
+
+// orphanLocked records a retired booking that still has writers to settle. The
+// caller must hold q.mu.
+func (q *overlayQuota) orphanLocked(booking *pendingReservation) {
+	if booking == nil {
+		return
+	}
+	if q.retired == nil {
+		q.retired = make(map[string]map[*pendingReservation]struct{})
+	}
+	set := q.retired[booking.key]
+	if set == nil {
+		set = make(map[*pendingReservation]struct{})
+		q.retired[booking.key] = set
+	}
+	set[booking] = struct{}{}
+}
+
+// dropOrphanLocked removes a settled retired booking, so the registry cannot
+// outlive its writers. The caller must hold q.mu.
+func (q *overlayQuota) dropOrphanLocked(booking *pendingReservation) {
+	set := q.retired[booking.key]
+	if set == nil {
+		return
+	}
+	delete(set, booking)
+	if len(set) == 0 {
+		delete(q.retired, booking.key)
+	}
+}
+
+// coverOrphansLocked tells every retired writer on key that the first upTo
+// bytes are paid, so a late landing is charged only beyond them. The caller
+// must hold q.mu.
+func (q *overlayQuota) coverOrphansLocked(key string, upTo int64) {
+	for orphan := range q.retired[key] {
+		if upTo > orphan.coveredTo {
+			orphan.coveredTo = upTo
+		}
+	}
+}
+
+// resetOrphansLocked moves every retired writer's paid prefix to post, the size
+// the mutation left behind: a mutation that released bytes makes the lost
+// prefix unpaid again, and one that grew the file paid for the new prefix
+// itself. It matches by admission key or by any name the booking was indexed
+// under, so a mutation through a surviving hardlink alias reaches it. The caller
+// must hold q.mu.
+func (q *overlayQuota) resetOrphansLocked(key, rel string, post int64) {
+	for k, set := range q.retired {
+		for orphan := range set {
+			match := key != "" && k == key
+			if !match && rel != "" {
+				match = orphan.indexedUnder(rel)
+			}
+			if match {
+				orphan.coveredTo = post
+			}
+		}
+	}
 }
 
 // indexedUnder reports whether the booking is already indexed under rel.
@@ -402,6 +478,12 @@ func (q *overlayQuota) retireLocked(booking *pendingReservation, size, baseline 
 	booking.poolResolved = true
 	booking.retired = true
 	booking.baseline = baseline
+	booking.coveredTo = baseline
+	if booking.bookings > 0 {
+		// Writers are still in flight: publish the booking so a newer booking on
+		// this key can raise its paid prefix.
+		q.orphanLocked(booking)
+	}
 }
 
 // settleWrite settles one writer's booking against the file's RESULTING size.
@@ -429,22 +511,33 @@ func (q *overlayQuota) settleWrite(res writeReservation) {
 		return
 	}
 	if booking.retired {
-		// Charge only growth beyond what this booking already accounted, and
-		// never beyond the extent it booked: a NEW booking may have regrown the
-		// file past it, and those bytes were paid at their own admission.
-		cap := booking.end - booking.baseline
-		if cap < 0 {
-			cap = 0
+		// Charge only the bytes that are ON DISK, inside the extent this booking
+		// booked, and beyond everything already paid for this key: a mutation
+		// that retired the booking paid up to its baseline, and a NEWER booking
+		// on the same key paid for the whole extent it booked. Re-charging
+		// either would bill bytes twice.
+		from := booking.coveredTo
+		if from < booking.baseline {
+			from = booking.baseline
 		}
-		extra := size - booking.baseline
-		if extra > cap {
-			extra = cap
+		to := size
+		if to > booking.end {
+			to = booking.end
+		}
+		extra := int64(0)
+		if to > from {
+			extra = to - from
 		}
 		if extra > booking.retiredCharged {
 			delta := extra - booking.retiredCharged
 			booking.retiredCharged = extra
+			booking.coveredTo = to
 			q.used += delta
 			q.drainFreeEstimateLocked(delta)
+		}
+		booking.bookings--
+		if booking.bookings <= 0 {
+			q.dropOrphanLocked(booking)
 		}
 		return
 	}
@@ -510,6 +603,10 @@ func (q *overlayQuota) retirePathLocked(rel string, size, baseline int64) {
 	for booking := range q.byPath[rel] {
 		q.retireLocked(booking, size, baseline)
 	}
+	// The mutation left the file at baseline: that is the size it has paid for,
+	// so retired writers of this name start from there (a release lowers the
+	// prefix again).
+	q.resetOrphansLocked("", rel, baseline)
 }
 
 // retireIdentity retires the booking of a specific inode (whatever name it was
@@ -525,6 +622,7 @@ func (q *overlayQuota) retireIdentity(key, rel string, size, baseline int64) {
 		if booking := q.reserved[key]; booking != nil {
 			q.retireLocked(booking, size, baseline)
 		}
+		q.resetOrphansLocked(key, rel, baseline)
 	}
 	q.retirePathLocked(rel, size, baseline)
 }
