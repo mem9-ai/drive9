@@ -1,6 +1,7 @@
 package localize
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -11,7 +12,7 @@ import (
 func lockTestKeyWithBucket(t *testing.T, o *Overlay, prefix string, want uint32, pred func(string) bool) string {
 	t.Helper()
 	for i := 0; i < 1_000_000; i++ {
-		view := prefix + itoaTest(i) + ".bin"
+		view := prefix + strconv.Itoa(i) + ".bin"
 		key := "path:" + view
 		if o.nameStripeIndex(key) != want || (pred != nil && !pred(key)) {
 			continue
@@ -20,22 +21,6 @@ func lockTestKeyWithBucket(t *testing.T, o *Overlay, prefix string, want uint32,
 	}
 	t.Fatalf("no path in %q lands in bucket %d", prefix, want)
 	return ""
-}
-
-// itoaTest is a tiny decimal formatter (the test only needs stable, distinct
-// names; fmt would drag an import into a lock test).
-func itoaTest(i int) string {
-	if i == 0 {
-		return "0"
-	}
-	var buf [20]byte
-	pos := len(buf)
-	for i > 0 {
-		pos--
-		buf[pos] = byte('0' + i%10)
-		i /= 10
-	}
-	return string(buf[pos:])
 }
 
 // TestReplaceLocksSameBucketPairDoesNotSelfDeadlock: two distinct names of ONE
@@ -48,7 +33,7 @@ func TestReplaceLocksSameBucketPairDoesNotSelfDeadlock(t *testing.T) {
 	var pair [2]string
 	found := false
 	for i := 0; i < 100_000 && !found; i++ {
-		view := "/repo/node_modules/collide-" + itoaTest(i) + ".bin"
+		view := "/repo/node_modules/collide-" + strconv.Itoa(i) + ".bin"
 		idx := o.nameStripeIndex("path:" + view)
 		if prev, ok := firstByBucket[idx]; ok {
 			pair = [2]string{prev, view}

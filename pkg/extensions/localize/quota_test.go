@@ -1043,12 +1043,12 @@ func TestOverlayQuotaConcurrentPathWritesStayExact(t *testing.T) {
 	})
 }
 
-// TestReplaceLockStripesAreDisjoint: the name and identity stripes must come
-// from disjoint pools. Sharing one pool makes "name before identity" a
-// per-writer order rather than a global one, so two writers whose stripes cross
-// (X's name stripe is the mutex serving Y's identity stripe and vice versa)
-// deadlock each other and wedge the mount.
-func TestReplaceLockStripesAreDisjoint(t *testing.T) {
+// TestReplaceLockPoolsAreDisjoint: the name and identity buckets must live in
+// disjoint pools. This one only guards against merging the two arrays back into
+// one — with a shared pool a name key and an identity key that hash alike are
+// one mutex, which is what allowed the crossed-writer deadlock. The ordering
+// itself is pinned by TestReplaceLocksAcquireInBucketOrder.
+func TestReplaceLockPoolsAreDisjoint(t *testing.T) {
 	o := &Overlay{}
 	for _, key := range []string{
 		"path:/repo/node_modules/crossed.bin",
@@ -1056,15 +1056,18 @@ func TestReplaceLockStripesAreDisjoint(t *testing.T) {
 		"ino:1:2",
 		"ino:2049:99999",
 	} {
-		if o.nameStripe(key) == o.idStripe(key) {
+		name := &o.nameLocks[o.nameStripeIndex(key)]
+		id := &o.idLocks[o.idStripeIndex(key)]
+		if name == id {
 			t.Fatalf("stripe for %q is shared between the name and identity pools: a crossed pair of writers deadlocks", key)
 		}
 	}
 }
 
 // TestReplaceLocksSerializeMutations: two mutations of overlapping targets must
-// not run at once, in either argument order (the keys are acquired sorted), and
-// releasing the first must hand the targets to the second.
+// not run at once, in either argument order (the buckets are acquired in index
+// order, so both callers agree), and releasing the first must hand the targets
+// to the second.
 func TestReplaceLocksSerializeMutations(t *testing.T) {
 	o := &Overlay{}
 	unlockA := o.ReplaceLocks("/repo/a.bin", "/repo/b.bin")

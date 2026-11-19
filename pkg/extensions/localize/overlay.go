@@ -88,11 +88,13 @@ func (o *Overlay) ReplaceLock(viewPath string) (unlock func()) {
 // snapshot true: the snapshot, the syscall and the quota settlement happen under
 // one lock.
 //
-// Locks are taken in two levels: every NAME stripe first, in sorted key order,
-// then every IDENTITY stripe of the files that exist, also sorted, from a
-// disjoint pool. Two renames that cross (A→B and B→A) therefore cannot cycle,
-// and neither can a name and an identity stripe. Two names of one inode share
-// the identity stripe, so hardlink aliases serialize too.
+// Locks are taken in two levels: every NAME bucket first, then every IDENTITY
+// bucket of the files that exist, from disjoint pools, and within each pool in
+// ASCENDING BUCKET INDEX order (not key order: the stripes are buckets, so keys
+// that hash to one bucket are one non-reentrant mutex). Two renames that cross
+// (A→B and B→A) therefore cannot cycle, and neither can a name and an identity
+// stripe. Two names of one inode share the identity bucket, so hardlink aliases
+// serialize too.
 //
 // The identity probe runs under the name locks: a name's identity can only
 // change through a mutation of that name, and every such mutation takes the
@@ -153,16 +155,6 @@ func (o *Overlay) ReplaceLocks(viewPaths ...string) (unlock func()) {
 			held[i].Unlock()
 		}
 	}
-}
-
-// nameStripe maps a name lock key onto the name pool.
-func (o *Overlay) nameStripe(key string) *sync.Mutex {
-	return &o.nameLocks[o.nameStripeIndex(key)]
-}
-
-// idStripe maps an identity lock key onto the identity pool.
-func (o *Overlay) idStripe(key string) *sync.Mutex {
-	return &o.idLocks[o.idStripeIndex(key)]
 }
 
 // nameStripeIndex maps a name lock key onto its name-pool bucket.
@@ -574,8 +566,8 @@ func (o *Overlay) Remove(viewPath string) error {
 // both trees when a child races in.
 func (o *Overlay) Rename(oldPath, newPath string) error {
 	// A rename replaces or moves names a concurrent writer may be landing, so
-	// it takes BOTH targets' mutation locks (sorted, then identities) for the
-	// whole snapshot -> rename -> settle sequence.
+	// it takes BOTH targets' mutation locks (names, then identities, in bucket
+	// index order) for the whole snapshot -> rename -> settle sequence.
 	defer o.ReplaceLocks(oldPath, newPath)()
 	oldAbs, err := o.abs(oldPath)
 	if err != nil {
