@@ -339,18 +339,18 @@ func (h *bufferingHandle) adoptAppendImageLocked(image []byte, landedRev int64) 
 	next.SetMemoryBudget(h.w.budget)
 	if len(image) > 0 {
 		if _, err := next.Write(0, image); err != nil {
+			// The provisional buffer never replaced h.buf, and its partial
+			// charge must go back: nothing retains those bytes.
+			next.Reset()
 			return err
 		}
 	}
 	next.ClearDirty()
 	// The handle's own writes must still flush: re-dirty so the commit
 	// boundary republishes the composed image (the caller's write lands
-	// on top immediately after). The replaced buffer's memory-budget charge
-	// is returned first: only one buffer is owned at a time.
-	if h.buf != nil {
-		h.buf.Reset()
-	}
-	h.buf = next
+	// on top immediately after). Replace returns the previous buffer's
+	// memory-budget charge: only one buffer is owned at a time.
+	writebuffer.Replace(&h.buf, next)
 	h.appendSnapshot = true
 	// The rebuilt image is composed from the REMOTE's landed bytes plus this
 	// handle's own writes: whatever pending generation this handle staged

@@ -4183,19 +4183,15 @@ func (h *bufferingHandle) Release(ctx context.Context) error {
 		h.ledgerShadowGen = 0
 		lf := h.liveSpillFile
 		h.liveSpillFile = nil
-		src := h.buf
-		h.buf = nil
+		// The descriptor is closed: the buffer's bytes are retained by nobody,
+		// so its memory-budget charge goes back (Discard resets it).
+		writebuffer.Discard(&h.buf)
 		h.mu.Unlock()
 		if gen != 0 && h.w.opts.Staging != nil {
 			h.w.opts.Staging.Shadow.Unpin(gen)
 		}
 		if lf != nil {
 			_ = lf.Close()
-		}
-		if src != nil {
-			// The descriptor is closed: the buffer's bytes are retained by
-			// nobody, so its memory-budget charge goes back.
-			src.Reset()
 		}
 	}()
 	// One identity snapshot for the whole close (a concurrent retarget
@@ -4338,13 +4334,9 @@ func (h *bufferingHandle) releaseMigrated(ctx context.Context, e fs.Handle) erro
 	h.pendingFileSize = 0
 	snapshotFile := h.snapshotFile
 	h.snapshotFile = nil
-	migratedBuf := h.buf
-	h.buf = nil
+	writebuffer.Discard(&h.buf)
 	inner := h.inner
 	h.mu.Unlock()
-	if migratedBuf != nil {
-		migratedBuf.Reset()
-	}
 
 	if ledgerGen != 0 && h.w.opts.Staging != nil {
 		h.w.opts.Staging.Shadow.Unpin(ledgerGen)
@@ -4496,10 +4488,7 @@ func (h *bufferingHandle) checkoutDropCleanBuffer() {
 	if h.inner == nil || h.unlinked || h.dirty || h.pendingImage != nil {
 		return
 	}
-	if h.buf != nil {
-		h.buf.Reset()
-	}
-	h.buf = nil
+	writebuffer.Discard(&h.buf)
 	// The buffer that carried the base is gone: the next ensureBuffer must
 	// initialize it again.
 	h.baseLoaded = false
@@ -6458,9 +6447,8 @@ func (h *bufferingHandle) ensureBufferLocked(ctx context.Context) error {
 		// base: publishing it would let the next commit replace the file
 		// with an image missing the rest. Discard on any failed preload, and
 		// return its memory-budget charge with it.
-		if h.buf != nil && !h.baseLoaded {
-			h.buf.Reset()
-			h.buf = nil
+		if !h.baseLoaded {
+			writebuffer.Discard(&h.buf)
 		}
 	}()
 	if h.pendingFile != nil {

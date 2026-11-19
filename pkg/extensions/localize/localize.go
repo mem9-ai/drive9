@@ -401,19 +401,15 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 			end := op.Offset + int64(len(op.Data))
 			// The backing file's real size governs: a cached handle size goes
 			// stale as soon as another descriptor truncates the path.
-			admitted, err := h.ov.AdmitWrite(h.path, end, int64(len(op.Data)))
+			res, err := h.ov.AdmitWrite(h.path, end, int64(len(op.Data)))
 			if err != nil {
 				return fs.Result{}, err
 			}
 			written, werr := h.file.WriteAt(op.Data, op.Offset)
 			if werr != nil {
-				// The reservation must not survive a write that did not land
-				// in full: hand it all back and re-admit only the bytes that
-				// did land (best effort; the next write re-stats anyway).
-				h.ov.ReleaseBytes(admitted)
-				if landed := op.Offset + int64(written); landed > 0 {
-					_, _ = h.ov.AdmitWrite(h.path, landed, int64(written))
-				}
+				// A partial WriteAt (the classic mid-write ENOSPC) keeps the
+				// charge for the bytes that landed and returns the rest.
+				h.ov.ReconcileWrite(h.path, res, op.Offset+int64(written))
 				return fs.Result{}, werr
 			}
 			return fs.Result{}, nil
@@ -430,14 +426,14 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 				oldSize, _ := o.Size(op.Path)
 				// Reserve the replacement BEFORE the truncating open: a refused
 				// write must leave the existing file intact, not truncated.
-				admitted, aerr := o.AdmitWrite(op.Path, newSize, newSize)
+				res, aerr := o.AdmitWrite(op.Path, newSize, newSize)
 				if aerr != nil {
 					return fs.Result{}, aerr
 				}
 				fh, err := o.OpenFile(op.Path, syscall.O_WRONLY|syscall.O_CREAT|syscall.O_TRUNC, mode)
 				if err != nil {
 					// The file is untouched: give the reservation back.
-					o.ReleaseBytes(admitted)
+					o.ReleaseBytes(res.admitted)
 					return fs.Result{}, err
 				}
 				if oldSize > newSize {
@@ -551,6 +547,7 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 			// accounted. info.Size() is the size the quota charged.
 			if backingLinkCount(info) <= 1 {
 				o.ReleaseBytes(info.Size())
+				o.ForgetPath(op.Path)
 			}
 			f.noteUnlinked(op.Path)
 			return fs.Result{}, nil
@@ -603,11 +600,16 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 				}
 			}
 			if op.Size >= 0 {
-				// Growing needs quota; shrinking returns it.
-				if err := o.AdmitResize(op.Path, op.Size); err != nil {
-					return fs.Result{}, err
+				// Growing needs quota; shrinking returns it. A truncate that
+				// then fails leaves the file unchanged, so the reservation is
+				// undone (a failed grow must not leave a phantom charge, and a
+				// failed shrink must not release bytes still on disk).
+				res, aerr := o.AdmitResize(op.Path, op.Size)
+				if aerr != nil {
+					return fs.Result{}, aerr
 				}
 				if err := o.Truncate(op.Path, op.Size); err != nil {
+					o.ReconcileResize(res)
 					return fs.Result{}, err
 				}
 			}

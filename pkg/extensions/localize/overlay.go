@@ -60,24 +60,78 @@ func (o *Overlay) Quota() *overlayQuota {
 // AdmitWrite reserves the space a write of writeLen bytes ending at end needs,
 // accounting the bytes the backing file already holds. An in-place overwrite
 // reserves no byte quota (but is still checked against the free-space floor).
-// It returns the reserved bytes — 0 when nothing was reserved — so a caller
-// can hand them back when the write never lands, and ENOSPC when the quota or
-// the host free-space guard refuses.
-func (o *Overlay) AdmitWrite(viewPath string, end, writeLen int64) (int64, error) {
-	var admitted int64
+// The returned reservation carries the admitted bytes and the starting size, so
+// a write that fails part-way can hand back exactly the bytes it never landed.
+// ENOSPC means the quota or the host free-space guard refused.
+func (o *Overlay) AdmitWrite(viewPath string, end, writeLen int64) (writeReservation, error) {
+	var res writeReservation
 	err := o.withQuota(viewPath, func(q *overlayQuota, rel string) error {
-		var gerr error
-		admitted, gerr = q.grow(rel, end, writeLen)
-		return gerr
+		var qerr error
+		res, qerr = q.admitWrite(rel, end, writeLen)
+		return qerr
 	})
-	return admitted, err
+	return res, err
+}
+
+// ReconcileWrite settles a write that failed part-way: it keeps the charge for
+// the bytes that landed (from the reservation's starting size) and returns the
+// rest.
+func (o *Overlay) ReconcileWrite(viewPath string, res writeReservation, landedEnd int64) {
+	if o == nil || o.quota == nil {
+		return
+	}
+	landed := int64(0)
+	if landedEnd > res.preSize {
+		landed = landedEnd - res.preSize
+	}
+	o.quota.release(res.admitted - landed)
+	if rel, err := o.rel(viewPath); err == nil {
+		o.quota.lowerReservation(rel, landedEnd)
+	}
+}
+
+// ForgetPath drops a removed name's reservation so a later create of the same
+// path starts from zero.
+func (o *Overlay) ForgetPath(viewPath string) {
+	if o == nil || o.quota == nil {
+		return
+	}
+	if rel, err := o.rel(viewPath); err == nil {
+		o.quota.forgetPath(rel)
+	}
+}
+
+// rel resolves viewPath to its backing-relative path.
+func (o *Overlay) rel(viewPath string) (string, error) {
+	abs, err := o.abs(viewPath)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Rel(o.root, abs)
 }
 
 // AdmitResize reserves (or returns) the space a truncate to newSize needs.
-func (o *Overlay) AdmitResize(viewPath string, newSize int64) error {
-	return o.withQuota(viewPath, func(q *overlayQuota, rel string) error {
-		return q.resize(rel, newSize)
+func (o *Overlay) AdmitResize(viewPath string, newSize int64) (resizeReservation, error) {
+	var res resizeReservation
+	err := o.withQuota(viewPath, func(q *overlayQuota, rel string) error {
+		var qerr error
+		res, qerr = q.resize(rel, newSize)
+		return qerr
 	})
+	return res, err
+}
+
+// ReconcileResize undoes a reservation whose truncate then failed: the file is
+// unchanged, so admitted growth is returned and released shrinkage is counted
+// again (forced — the bytes are still on disk).
+func (o *Overlay) ReconcileResize(res resizeReservation) {
+	if o == nil || o.quota == nil {
+		return
+	}
+	o.quota.release(res.admitted)
+	if res.released > 0 {
+		o.quota.forceAdmit(res.released)
+	}
 }
 
 // withQuota resolves viewPath to its backing-relative path and runs fn when a

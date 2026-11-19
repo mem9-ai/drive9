@@ -904,10 +904,7 @@ func (a *AppendLog) refreshCleanSiblings(path string, rev, size int64, self *Han
 			other.origSize = size
 			// Re-read lazily from the committed image; the discarded
 			// buffer's memory-budget charge goes back with it.
-			if other.buf != nil {
-				other.buf.Reset()
-			}
-			other.buf = nil
+			writebuffer.Discard(&other.buf)
 			other.observeLayoutLocked(client.ContentLayoutAppendLog, rev, size)
 			if other.dirty {
 				other.dirty = false
@@ -1606,15 +1603,13 @@ func (h *Handle) refreshAppendBaselineLocked(ctx context.Context) error {
 }
 
 func (h *Handle) Release(ctx context.Context) (err error) {
-	// Return the buffer's memory-budget charge only once the close publish
-	// succeeded: a FAILED content commit deliberately preserves the dirty
-	// generation for the next attempt, and that attempt still needs the
-	// buffer.
-	defer func() {
-		if err == nil {
-			h.releaseBuffer()
-		}
-	}()
+	// The descriptor is gone: the FUSE facade drops its handle and calls
+	// Release exactly once (no retry), so nothing can ever consume this
+	// buffer again — including after a failed content commit, where the dirty
+	// IMAGE has no future reader (the pending remote state lives in the
+	// plane's own metadata, not in the buffer). Return the charge on every
+	// path, like git and layer.
+	defer h.releaseBuffer()
 	h.a.untrack(h)
 	h.mu.Lock()
 	unlinked := h.unlinked
@@ -1716,10 +1711,7 @@ func (a *AppendLog) dropCleanSiblingImages(siblings []*Handle) {
 	for _, o := range siblings {
 		o.mu.Lock()
 		if !o.dirty {
-			if o.buf != nil {
-				o.buf.Reset()
-			}
-			o.buf = nil
+			writebuffer.Discard(&o.buf)
 		}
 		o.mu.Unlock()
 	}
@@ -1750,10 +1742,7 @@ func (a *AppendLog) discardSiblingImages(siblings []*Handle) {
 			o.st.clearSQLiteWALHeaderWrite()
 			o.seq++
 		}
-		if o.buf != nil {
-			o.buf.Reset()
-		}
-		o.buf = nil
+		writebuffer.Discard(&o.buf)
 		o.mu.Unlock()
 	}
 }
@@ -2129,10 +2118,7 @@ func (a *AppendLog) SetMemoryBudget(b *membudget.Budget) {
 func (h *Handle) releaseBuffer() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.buf != nil {
-		h.buf.Reset()
-		h.buf = nil
-	}
+	writebuffer.Discard(&h.buf)
 }
 
 // ensureBuffer creates the write buffer. Existing files keep their base

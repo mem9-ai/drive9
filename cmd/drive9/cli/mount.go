@@ -237,7 +237,7 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 	dirCacheMaxEntries := fs.Int("dir-cache-max-entries", 200000, "maximum entries per directory in namespace cache before complete marking is disabled")
 	writeCacheFreeRatio := fs.Float64("write-cache-free-ratio", 0.10, "minimum filesystem free-space ratio before write-back refuses writes with ENOSPC (0 disables)")
 	writeCacheSizeMB := fs.Int64("write-cache-size-mb", 1024, "current-process shadow data quota in MiB (default 1024; 0 disables); writes exceeding this return ENOSPC")
-	memoryBudgetMB := fs.Int64("memory-budget-mb", 0, "process-wide in-memory budget in MiB covering the read cache, the write-back data cache, per-handle write buffers and the inode table; 0 disables the budget")
+	memoryBudgetMB := fs.Int64("memory-budget-mb", 0, "process-wide in-memory budget in MiB covering the read cache, the write-back data cache, per-handle write buffers and the inode table; 0 derives 60% of the cgroup memory limit (disabled when the host has none), -1 disables")
 	memoryBudgetMode := fs.String("memory-budget-mode", "enforce", "over-budget behavior: enforce refuses the allocation (caches degrade, writes fail with ENOMEM) or warn admits it and logs")
 	commitQueueMaxPending := fs.Int("commit-queue-max-pending", 500, "maximum pending entries in CommitQueue before backpressure")
 	writeBackBatchWindow := fs.Duration("writeback-batch-window", 0, "writeback-only small-file batch window (default 0 disables)")
@@ -612,8 +612,8 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 	if *writeCacheSizeMB < 0 {
 		return fmt.Errorf("drive9 mount: --write-cache-size-mb must be >= 0")
 	}
-	if *memoryBudgetMB < 0 {
-		return fmt.Errorf("drive9 mount: --memory-budget-mb must be >= 0")
+	if *memoryBudgetMB < -1 {
+		return fmt.Errorf("drive9 mount: --memory-budget-mb must be >= 0 (0 derives the cgroup limit, -1 disables)")
 	}
 	memoryBudgetModeVal, err := membudget.ParseMode(strings.TrimSpace(*memoryBudgetMode))
 	if err != nil {

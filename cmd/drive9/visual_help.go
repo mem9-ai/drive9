@@ -823,7 +823,7 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 					{Name: "--commit-queue-max-pending N", Desc: "maximum pending entries in the commit queue before backpressure"},
 					{Name: "--write-cache-size-mb MB", Desc: "current-process shadow data quota in MiB; 0 disables; writes exceeding it return ENOSPC"},
 					{Name: "--write-cache-free-ratio FLOAT", Desc: "minimum filesystem free-space ratio before write-back refuses writes with ENOSPC; 0 disables"},
-					{Name: "--memory-budget-mb MB", Desc: "process-wide in-memory budget covering read cache, write-back data cache, write buffers and inode table; 0 disables"},
+					{Name: "--memory-budget-mb MB", Desc: "process-wide in-memory budget covering read cache, write-back data cache, write buffers and inode table; 0 derives 60% of the cgroup limit, -1 disables"},
 					{Name: "--memory-budget-mode MODE", Desc: "over-budget behavior: enforce (refuse allocations, caches degrade, writes fail with ENOMEM) or warn"},
 					{Name: "--localize-quota-mb MB", Desc: "byte quota for the local-only overlay on the host disk; local writes past it fail with ENOSPC; 0 disables"},
 					{Name: "--localize-free-ratio FLOAT", Desc: "minimum host free-space ratio for the local-only overlay before local writes fail with ENOSPC; 0 disables"},

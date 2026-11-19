@@ -312,15 +312,34 @@ func (b *Budget) Release(class Class, n int64) {
 	if b == nil || n <= 0 {
 		return
 	}
-	if b.used.Add(-n) < 0 {
-		// A release without a matching charge means the accounting is
-		// broken; reset rather than let a negative total admit the world.
-		b.used.Store(0)
-		b.note("memory_budget_release_underflow", class, n, 0)
+	// A release without a matching charge means the accounting is broken.
+	// Clamp at zero with a CAS loop rather than a plain Store: a concurrent
+	// charge landing between the decrement and the store would otherwise have
+	// its bytes erased.
+	underflow := false
+	for {
+		cur := b.used.Load()
+		next := cur - n
+		if next < 0 {
+			next, underflow = 0, true
+		}
+		if b.used.CompareAndSwap(cur, next) {
+			break
+		}
 	}
 	c := b.counter(class)
-	if c.Add(-n) < 0 {
-		c.Store(0)
+	for {
+		cur := c.Load()
+		next := cur - n
+		if next < 0 {
+			next = 0
+		}
+		if c.CompareAndSwap(cur, next) {
+			break
+		}
+	}
+	if underflow {
+		b.note("memory_budget_release_underflow", class, n, 0)
 	}
 }
 

@@ -221,10 +221,7 @@ func (h *gitHandle) Release(ctx context.Context) error {
 func (h *gitHandle) releaseBuffer() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.buf != nil {
-		h.buf.Reset()
-		h.buf = nil
-	}
+	writebuffer.Discard(&h.buf)
 }
 
 // Truncate applies a local truncation; the image lands at the boundary.

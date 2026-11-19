@@ -305,3 +305,58 @@ func TestOverlayQuotaRenameOverDestinationWithAliasKeepsBytes(t *testing.T) {
 		t.Fatalf("quota used after alias-protected rename = %d, want 1200", got)
 	}
 }
+
+// TestOverlayQuotaConcurrentAppendsChargeOncePerGrowth: two handles that append
+// to the same overlay file must not each charge the same growth. The quota
+// tracks the reserved end per path, so the second admission sees the first
+// one's reservation instead of the (not yet visible) on-disk size.
+func TestOverlayQuotaConcurrentAppendsChargeOncePerGrowth(t *testing.T) {
+	f := newQuotaRouter(t, 4000)
+	const view = "/repo/node_modules/appended.bin"
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: view, Offset: 0, Data: make([]byte, 100)}); err != nil {
+		t.Fatal(err)
+	}
+	q := f.overlay.Quota()
+	if got := q.Used(); got != 100 {
+		t.Fatalf("used = %d, want 100", got)
+	}
+	// Two admissions for the same target end, as two open handles appending
+	// concurrently would produce before either write reaches the file.
+	if _, err := q.admitWrite("/repo/node_modules/appended.bin", 500, 400); err != nil {
+		t.Fatalf("first append admission: %v", err)
+	}
+	if _, err := q.admitWrite("/repo/node_modules/appended.bin", 500, 400); err != nil {
+		t.Fatalf("second append admission: %v", err)
+	}
+	if got := q.Used(); got != 500 {
+		t.Fatalf("used after two admissions of the same growth = %d, want 500", got)
+	}
+}
+
+// TestOverlayQuotaInPlaceOverwriteKeepsFreeEstimate: an overwrite grows nothing
+// and must not drain the free-space estimate for the throttle window.
+func TestOverlayQuotaInPlaceOverwriteKeepsFreeEstimate(t *testing.T) {
+	f := newQuotaRouter(t, 0)
+	if err := f.overlay.SetQuota(0, 0.10); err != nil {
+		t.Fatal(err)
+	}
+	q := f.overlay.Quota()
+	q.statfs = func(string) (int64, int64, error) { return 1000, 500, nil }
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: "/repo/node_modules/ow.bin", Offset: 0, Data: make([]byte, 100)}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	q.mu.Lock()
+	before := q.cachedFree
+	q.mu.Unlock()
+	for i := 0; i < 5; i++ {
+		if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: "/repo/node_modules/ow.bin", Offset: 0, Data: make([]byte, 100)}); err != nil {
+			t.Fatalf("overwrite %d: %v", i, err)
+		}
+	}
+	q.mu.Lock()
+	after := q.cachedFree
+	q.mu.Unlock()
+	if after != before {
+		t.Fatalf("in-place overwrites drained the free estimate: %d -> %d", before, after)
+	}
+}

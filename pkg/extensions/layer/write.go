@@ -503,10 +503,7 @@ func (s *layerSpill) close() {
 func (h *layerHandle) releaseBuffer() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.buf != nil {
-		h.buf.Reset()
-		h.buf = nil
-	}
+	writebuffer.Discard(&h.buf)
 }
 
 // spillLayerImage copies size bytes of the buffer to a temp file under

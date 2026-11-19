@@ -130,7 +130,8 @@ type MountConfig struct {
 	WriteCacheFreeRatio    float64
 	WriteCacheSizeMB       int64
 	// MemoryBudget caps the process-wide in-memory footprint in bytes (see
-	// MountOptions.MemoryBudget); 0 disables it.
+	// MountOptions.MemoryBudget): 0 = auto (cgroup-derived), negative =
+	// disabled, positive = explicit bytes.
 	MemoryBudget     int64
 	MemoryBudgetMode string
 
@@ -400,9 +401,11 @@ type MountOptions struct {
 	WriteCacheSizeMB              int64
 	// MemoryBudget caps the process-wide in-memory footprint (read cache,
 	// write-back data cache, per-handle write buffers, inode table) in bytes.
-	// 0 disables the budget. MemoryBudgetMode selects what an over-budget
-	// allocation means: "" or "enforce" refuses it (caches degrade, writes
-	// fail with ENOMEM), "warn" admits and logs it.
+	// 0 means AUTO: 60% of the container's cgroup memory limit, and disabled on
+	// a bare host (no limit to derive). A negative value disables the budget.
+	// MemoryBudgetMode selects what an over-budget allocation means: "" or
+	// "enforce" refuses it (caches degrade, writes fail with ENOMEM), "warn"
+	// admits and logs it.
 	MemoryBudget     int64
 	MemoryBudgetMode string
 	// ExtentCacheSize is the extent plane's disk cache budget (bytes;
@@ -872,15 +875,36 @@ func mountWithConfig(cfg MountConfig) error {
 	// Process-wide memory budget (v1 had none): the read cache, the
 	// write-back data cache, the per-handle write buffers and the inode table
 	// all charge their retained bytes here, so a mount with many large files
-	// open cannot grow RSS past the configured limit. Zero disables it and
-	// keeps the pre-budget behavior.
+	// open cannot grow RSS past the configured limit.
+	//
+	// Zero means AUTO: derive the limit from the container's cgroup memory
+	// limit, where the OOM kill this bounds actually happens. A bare host has
+	// no limit to derive, so auto resolves to disabled there (stated in the
+	// mount log). A negative value disables the budget explicitly.
+	budgetLimit := cfg.MemoryBudget
+	budgetSource := "configured"
+	switch {
+	case budgetLimit < 0:
+		budgetLimit = 0
+	case budgetLimit == 0:
+		budgetLimit, budgetSource = membudget.AutoLimit()
+		if budgetSource != "" {
+			budgetSource = "auto: " + budgetSource
+		}
+	}
 	var memoryBudget *membudget.Budget
-	if cfg.MemoryBudget > 0 {
+	if budgetLimit > 0 {
 		mode, merr := membudget.ParseMode(strings.TrimSpace(cfg.MemoryBudgetMode))
 		if merr != nil {
 			return fmt.Errorf("fuse: %w", merr)
 		}
-		memoryBudget = membudget.New(cfg.MemoryBudget, mode, logger.L())
+		memoryBudget = membudget.New(budgetLimit, mode, logger.L())
+		if budgetSource == "" {
+			budgetSource = "configured"
+		}
+		fmt.Fprintf(os.Stderr, "drive9: memory budget limit=%d MiB (%s)\n", budgetLimit>>20, budgetSource)
+	} else {
+		fmt.Fprintf(os.Stderr, "drive9: memory budget disabled (no cgroup memory limit; set --memory-budget-mb to bound RSS)\n")
 	}
 
 	var readCache *cache.Cache

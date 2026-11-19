@@ -386,8 +386,7 @@ func (w *Writeback) admitFtruncate(ctx context.Context, owner *bufferingHandle, 
 			// (ftruncate(5) on one fd left the other reading "Hello
 			// world"). Drop it so the next read reloads the truncated base.
 			if sib.buf != nil && !sib.dirty && !sib.unlinked {
-				sib.buf.Reset()
-				sib.buf = nil
+				writebuffer.Discard(&sib.buf)
 				sib.baseLoaded = false
 				sib.baseSize = size
 			}

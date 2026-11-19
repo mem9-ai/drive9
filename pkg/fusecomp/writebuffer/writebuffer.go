@@ -145,67 +145,6 @@ func NewWriteBuffer(path string, maxSize int64, partSize int64) *WriteBuffer {
 	}
 }
 
-// SetMemoryBudget wires the process-wide memory budget the buffer charges its
-// retained bytes to. It must be called before the first Write/Truncate; a nil
-// budget disables accounting.
-func (wb *WriteBuffer) SetMemoryBudget(b *membudget.Budget) {
-	if wb == nil {
-		return
-	}
-	wb.budget = b
-}
-
-// MemoryBudget reports the budget this buffer charges, if any.
-func (wb *WriteBuffer) MemoryBudget() *membudget.Budget {
-	if wb == nil {
-		return nil
-	}
-	return wb.budget
-}
-
-// addMemory charges n bytes against the memory budget and records them.
-// It returns syscall.ENOMEM when the budget refuses the allocation, leaving
-// the buffer unchanged so the caller can fail the write without corrupting
-// the staged image.
-func (wb *WriteBuffer) addMemory(n int64) error {
-	if wb == nil || n <= 0 {
-		return nil
-	}
-	if wb.budget != nil {
-		if err := wb.budget.Acquire(membudget.ClassWriteBuffer, n); err != nil {
-			return syscall.ENOMEM
-		}
-	}
-	wb.curMemory += n
-	return nil
-}
-
-// forceAddMemory records n bytes and charges them even past the budget. It is
-// for a caller that cannot proceed without the whole image (a git publish or
-// appendlog snapshot that reconstructs the base to write it out): the bytes
-// are counted, but refusing them would make the file unpublishable. The
-// overrun still squeezes the caches and shows up in the budget snapshot.
-func (wb *WriteBuffer) forceAddMemory(n int64) {
-	if wb == nil || n <= 0 {
-		return
-	}
-	if wb.budget != nil {
-		wb.budget.ForceCharge(membudget.ClassWriteBuffer, n)
-	}
-	wb.curMemory += n
-}
-
-// subMemory drops n bytes of retained memory (releasing the budget charge).
-func (wb *WriteBuffer) subMemory(n int64) {
-	if wb == nil || n <= 0 {
-		return
-	}
-	wb.curMemory -= n
-	if wb.budget != nil {
-		wb.budget.Release(membudget.ClassWriteBuffer, n)
-	}
-}
-
 // SetSmallFileMax overrides the small-file fast-path cutoff. Must be called
 // before any Write/Truncate; ignored when threshold <= 0.
 // SmallFileBytes returns the whole-file image when the buffer holds a
@@ -364,9 +303,7 @@ func (wb *WriteBuffer) writeSmallFile(offset int64, data []byte) (uint32, error)
 	}
 	if end > wb.smallFileMax {
 		// Migrate to part mode and retry
-		if err := wb.migrateToPartMode(); err != nil {
-			return 0, err
-		}
+		wb.migrateToPartMode()
 		return wb.Write(offset, data)
 	}
 
@@ -429,15 +366,16 @@ func (wb *WriteBuffer) writeSmallFile(offset int64, data []byte) (uint32, error)
 //
 // The small-file fast path is charged by capacity as it grows; the migration
 // TRANSFERS that charge to the new part allocation (the new part's capacity is
-// the image length, so any headroom the fast path held is released here). No
-// admission can therefore fail, and the staged image is never lost.
-func (wb *WriteBuffer) migrateToPartMode() error {
+// the image length, so any headroom the fast path held is released here). It
+// cannot fail and never loses the staged image — eviction therefore cannot
+// silently no-op on budget grounds.
+func (wb *WriteBuffer) migrateToPartMode() {
 	if len(wb.smallFileData) == 0 {
 		// Truncated to zero: the allocation is going away, so its capacity
 		// charge must go with it (the data path below transfers instead).
 		wb.subMemory(int64(cap(wb.smallFileData)))
 		wb.smallFileData = nil
-		return nil
+		return
 	}
 	size := int64(len(wb.smallFileData))
 	// Transfer data to part 0
@@ -448,20 +386,6 @@ func (wb *WriteBuffer) migrateToPartMode() error {
 	}
 	wb.parts[0] = part
 	wb.smallFileData = nil
-	return nil
-}
-
-// rollbackWriteExtent restores the logical size after a failed write attempt:
-// the file may only be as long as it was before this call, or as long as the
-// bytes this call actually copied — a failed write must not extend the staged
-// image over the range it never staged.
-func (wb *WriteBuffer) rollbackWriteExtent(prevTotal, offset int64, copied int) {
-	if copied > 0 {
-		if end := offset + int64(copied); end > prevTotal {
-			prevTotal = end
-		}
-	}
-	wb.totalSize = prevTotal
 }
 
 // ensurePart makes sure a part exists in the map. If it doesn't exist
@@ -737,9 +661,7 @@ func (wb *WriteBuffer) Truncate(size int64) error {
 				return nil
 			}
 			// Migrate to part mode for larger size
-			if err := wb.migrateToPartMode(); err != nil {
-				return err
-			}
+			wb.migrateToPartMode()
 			return wb.Truncate(size)
 		}
 		if cur > 0 && cur%wb.partSize != 0 {
@@ -1206,12 +1128,9 @@ func (wb *WriteBuffer) EvictPart(partIdx int) {
 	wb.uploadedParts[partIdx] = true
 
 	if wb.smallFileData != nil {
-		// Migrate to part mode before evicting. A refused migration (memory
-		// budget) keeps the small-file image intact and skips the eviction:
-		// dropping it here would lose acknowledged bytes.
-		if err := wb.migrateToPartMode(); err != nil {
-			return
-		}
+		// Migrate to part mode before evicting (this cannot fail: the charge is
+		// transferred, not re-admitted).
+		wb.migrateToPartMode()
 	}
 
 	if part, ok := wb.parts[partIdx]; ok {

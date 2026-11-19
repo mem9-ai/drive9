@@ -10,6 +10,7 @@ import (
 
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/fs"
+	"github.com/mem9-ai/drive9/pkg/fusecomp/writebuffer"
 )
 
 // EmitCheckoutForTest emits a coarse checkout event (test hook for the
@@ -197,18 +198,12 @@ func (l *Layer) refreshEvents(ctx context.Context) error {
 			if kind == "file" && !h.dirty {
 				// The discarded buffer's memory-budget charge goes back
 				// with it: the next read reloads the replayed image.
-				if h.buf != nil {
-					h.buf.Reset()
-				}
-				h.buf = nil
+				writebuffer.Discard(&h.buf)
 				h.origSize = int64(len(content))
 				h.baseRev = 0
 			}
 		} else if !h.dirty {
-			if h.buf != nil {
-				h.buf.Reset()
-			}
-			h.buf = nil
+			writebuffer.Discard(&h.buf)
 			h.origSize = 0
 		}
 		if look && kind == "whiteout" {
