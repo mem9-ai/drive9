@@ -613,7 +613,7 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 		return fmt.Errorf("drive9 mount: --write-cache-size-mb must be >= 0")
 	}
 	if *memoryBudgetMB < -1 {
-		return fmt.Errorf("drive9 mount: --memory-budget-mb must be >= 0 (0 derives the cgroup limit, -1 disables)")
+		return fmt.Errorf("drive9 mount: --memory-budget-mb must be -1 (disabled), 0 (derive from the cgroup limit), or a positive MiB value")
 	}
 	memoryBudgetModeVal, err := membudget.ParseMode(strings.TrimSpace(*memoryBudgetMode))
 	if err != nil {

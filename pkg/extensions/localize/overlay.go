@@ -438,8 +438,15 @@ func (o *Overlay) Rename(oldPath, newPath string) error {
 	if errors.Is(err, syscall.ENAMETOOLONG) {
 		err = o.renameLongPath(oldAbs, newAbs)
 	}
-	if err == nil && releaseDest {
-		o.ReleaseBytes(replacedBytes)
+	if err == nil {
+		if releaseDest {
+			o.ReleaseBytes(replacedBytes)
+		}
+		// Both names' bookings are void: the destination's size is whatever the
+		// source carried (a recreate at the old name must charge from zero),
+		// and the source name no longer exists.
+		o.ForgetPath(oldPath)
+		o.ForgetPath(newPath)
 	}
 	return err
 }

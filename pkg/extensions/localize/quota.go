@@ -308,8 +308,11 @@ func (q *overlayQuota) resize(rel string, newSize int64) (resizeReservation, err
 		}
 		out.released = freed
 	}
-	// The truncate makes the on-disk size authoritative for this path.
-	delete(q.reserved, key)
+	// Bookings are NOT dropped here: an in-flight write still has to settle its
+	// own booking, and erasing it would make that settlement a no-op while its
+	// charge stays. The truncate's own settlement (or the next admission, which
+	// sees the new size) retires the entry.
+	_ = key
 	return out, nil
 }
 

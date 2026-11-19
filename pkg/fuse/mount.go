@@ -881,14 +881,23 @@ func mountWithConfig(cfg MountConfig) error {
 	// limit, where the OOM kill this bounds actually happens. A bare host has
 	// no limit to derive, so auto resolves to disabled there (stated in the
 	// mount log). A negative value disables the budget explicitly.
+	const (
+		memoryBudgetFloor = 16 << 20 // same floor the CLI enforces on explicit values
+		// A container smaller than the floor is not a place to enforce a
+		// budget: fail closed to accounting-only, which exercises the
+		// accounting without turning ordinary writes into ENOMEM.
+	)
 	budgetLimit := cfg.MemoryBudget
 	budgetSource := "configured"
+	budgetAuto := false
 	switch {
 	case budgetLimit < 0:
 		budgetLimit = 0
+		budgetSource = "disabled with -1"
 	case budgetLimit == 0:
 		budgetLimit, budgetSource = membudget.AutoLimit()
-		if budgetSource != "" {
+		budgetAuto = budgetLimit > 0
+		if budgetAuto {
 			budgetSource = "auto: " + budgetSource
 		}
 	}
@@ -898,13 +907,17 @@ func mountWithConfig(cfg MountConfig) error {
 		if merr != nil {
 			return fmt.Errorf("fuse: %w", merr)
 		}
-		memoryBudget = membudget.New(budgetLimit, mode, logger.L())
-		if budgetSource == "" {
-			budgetSource = "configured"
+		if budgetAuto && budgetLimit < memoryBudgetFloor {
+			mode = membudget.ModeWarn
+			fmt.Fprintf(os.Stderr, "drive9: memory budget: auto limit %d MiB is below the %d MiB floor; accounting only (warn mode)\n",
+				budgetLimit>>20, memoryBudgetFloor>>20)
 		}
-		fmt.Fprintf(os.Stderr, "drive9: memory budget limit=%d MiB (%s)\n", budgetLimit>>20, budgetSource)
+		memoryBudget = membudget.New(budgetLimit, mode, logger.L())
+		fmt.Fprintf(os.Stderr, "drive9: memory budget limit=%d MiB (%s, mode=%s)\n", budgetLimit>>20, budgetSource, mode)
+	} else if budgetSource == "disabled with -1" {
+		fmt.Fprintf(os.Stderr, "drive9: memory budget disabled by --memory-budget-mb -1\n")
 	} else {
-		fmt.Fprintf(os.Stderr, "drive9: memory budget disabled (no cgroup memory limit; set --memory-budget-mb to bound RSS)\n")
+		fmt.Fprintf(os.Stderr, "drive9: memory budget disabled (auto: no cgroup memory limit found; set --memory-budget-mb to bound RSS)\n")
 	}
 
 	var readCache *cache.Cache

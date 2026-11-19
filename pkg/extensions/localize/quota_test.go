@@ -449,3 +449,63 @@ func TestOverlayQuotaSettledWriteChargesOnce(t *testing.T) {
 		t.Fatalf("used after in-place overwrite = %d, want 100", got)
 	}
 }
+
+// TestOverlayQuotaTruncateRecreateChargesAgain is the editor-save pattern: a
+// completed write, then a re-create with O_TRUNC, then a fresh write. The
+// booking must be retired when the write settles and when the truncating open
+// lands, so the regrown bytes are charged again instead of hiding under a
+// phantom base.
+func TestOverlayQuotaTruncateRecreateChargesAgain(t *testing.T) {
+	f := newQuotaRouter(t, 1000)
+	const view = "/repo/node_modules/save.bin"
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: view, Offset: 0, Data: make([]byte, 500)}); err != nil {
+		t.Fatalf("first save: %v", err)
+	}
+	q := f.overlay.Quota()
+	if got := q.Used(); got != 500 {
+		t.Fatalf("used after first save = %d, want 500", got)
+	}
+	if q.isReserved("path:" + strings.TrimPrefix(view, "/")) {
+		t.Fatal("a completed write left a booking")
+	}
+	// Re-create the path with O_TRUNC (the ordinary save cycle).
+	res, err := doOp(t, f, &fs.Op{Kind: fs.OpCreate, Path: view, Flags: uint32(syscall.O_RDWR | syscall.O_CREAT | syscall.O_TRUNC), Mode: 0o644})
+	if err != nil {
+		t.Fatalf("re-create: %v", err)
+	}
+	h := res.Handle
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: view, Handle: h, Offset: 0, Data: make([]byte, 400)}); err != nil {
+		t.Fatalf("second save: %v", err)
+	}
+	if got := q.Used(); got != 400 {
+		t.Fatalf("used after the regrown save = %d, want 400 (the phantom base hid the charge)", got)
+	}
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpRelease, Path: view, Handle: h}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestOverlayQuotaRenameRetiresBothNames' bookings: after a rename, a recreate
+// at the old name and a write at the new name both charge from disk.
+func TestOverlayQuotaRenameRetiresBothNames(t *testing.T) {
+	f := newQuotaRouter(t, 2000)
+	const src = "/repo/node_modules/r-src.bin"
+	const dst = "/repo/node_modules/r-dst.bin"
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: src, Offset: 0, Data: make([]byte, 300)}); err != nil {
+		t.Fatal(err)
+	}
+	q := f.overlay.Quota()
+	// A live booking on the source, as an in-flight writer would hold.
+	if _, err := q.admitWrite("repo/node_modules/r-src.bin", 800, 500); err != nil {
+		t.Fatalf("book: %v", err)
+	}
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpRename, Path: src, Path2: dst}); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	if q.isReserved("path:" + strings.TrimPrefix(src, "/")) {
+		t.Fatal("rename left the source name's booking behind")
+	}
+	if q.isReserved("path:" + strings.TrimPrefix(dst, "/")) {
+		t.Fatal("rename left the destination name's booking behind")
+	}
+}
