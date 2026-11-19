@@ -318,8 +318,11 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 				return fs.Result{}, err
 			}
 			if oldSize > 0 {
-				// The opening truncated the backing file: give its bytes
-				// back to the quota before the new content charges again.
+				// The opening truncated the backing file: retire any in-flight
+				// booking against the pre-truncate size (so its writer's settle
+				// cannot refund the shrink again), then give its bytes back to
+				// the quota before the new content charges.
+				o.RetirePath(op.Path, oldSize)
 				o.ReleaseBytes(oldSize)
 			}
 			f.noteDBOpen(op.Path)
@@ -445,8 +448,6 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 					// The truncating open freed the old image's excess.
 					o.ReleaseBytes(oldSize - newSize)
 				}
-				// The truncate makes the on-disk size authoritative again.
-				o.ForgetPath(op.Path)
 				written, werr := fh.Write(op.Data)
 				cerr := fh.Close()
 				if werr != nil {
@@ -456,7 +457,6 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 					if release := newSize - int64(written); release > 0 {
 						o.ReleaseBytes(release)
 					}
-					o.ForgetPath(op.Path)
 					return fs.Result{}, werr
 				}
 				// Retire the booking (the landed bytes stay charged and leave
@@ -552,12 +552,11 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 			if err := o.Remove(op.Path); err != nil {
 				return fs.Result{}, err
 			}
-			// A hardlink alias keeps the bytes on disk; releasing them here
-			// would under-count the overlay, so only a last-name removal is
-			// accounted. info.Size() is the size the quota charged.
-			// The NAME's reservation goes away with the name (a recreate must
-			// charge again); the byte refund only happens on the last link.
-			o.ForgetPath(op.Path)
+			// The NAME's booking is retired against the size it had before the
+			// unlink (a recreate charges from zero again). A hardlink alias
+			// keeps the bytes on disk, so the byte refund only happens on the
+			// last link.
+			o.RetirePath(op.Path, info.Size())
 			if backingLinkCount(info) <= 1 {
 				o.ReleaseBytes(info.Size())
 			}

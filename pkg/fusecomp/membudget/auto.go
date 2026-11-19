@@ -68,7 +68,12 @@ func cgroupV1Limit() (int64, string) {
 	if !ok {
 		return 0, ""
 	}
-	return walkMemoryLimits(filepath.Join(root, rel), root, "memory/memory.limit_in_bytes")
+	// The mount root /proc/self/mountinfo reports for the memory controller IS
+	// the controller root on a real v1 system (`/sys/fs/cgroup/memory`), so the
+	// limit file sits directly in the cgroup directory. Hybrid single-root
+	// layouts expose it one directory down; both are probed per level.
+	return walkMemoryLimits(filepath.Join(root, rel), root,
+		"memory.limit_in_bytes", "memory/memory.limit_in_bytes")
 }
 
 // cgroupMembership returns the process's cgroup path for a controller ("" for
@@ -138,15 +143,21 @@ func superOptionsContain(options, controller string) bool {
 }
 
 // walkMemoryLimits returns the tightest finite memory limit from dir up to root
-// (inclusive) and the file it came from.
-func walkMemoryLimits(dir, root, name string) (int64, string) {
+// (inclusive) and the file it came from. Several file names are probed per level
+// because a v1 memory mount keeps the limit directly in the cgroup directory
+// while a hybrid single-root layout nests a controller directory.
+func walkMemoryLimits(dir, root string, names ...string) (int64, string) {
 	var (
 		best       int64
 		bestSource string
 	)
 	for {
-		path := filepath.Join(dir, name)
-		if raw, err := readLimitFile(path); err == nil {
+		for _, name := range names {
+			path := filepath.Join(dir, name)
+			raw, err := readLimitFile(path)
+			if err != nil {
+				continue
+			}
 			if value, ok := parseCgroupLimit(string(raw)); ok && (best == 0 || value < best) {
 				best, bestSource = value, path
 			}

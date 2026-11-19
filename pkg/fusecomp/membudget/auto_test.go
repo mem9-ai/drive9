@@ -78,18 +78,36 @@ func TestAutoLimitTakesTheTightestAncestor(t *testing.T) {
 }
 
 func TestAutoLimitLegacyHierarchy(t *testing.T) {
+	// A real cgroup v1 system: the memory controller is mounted at
+	// /sys/fs/cgroup/memory and the limit file sits directly in the process's
+	// cgroup directory (no extra "memory" component).
 	fakeCgroup(t, map[string]string{
 		"/proc/self/cgroup":    "11:memory:/docker/abc\n",
 		"/proc/self/mountinfo": "1 0 0:1 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n",
-		"/sys/fs/cgroup/memory/docker/abc/memory/memory.limit_in_bytes": "2147483648\n",
+		"/sys/fs/cgroup/memory/docker/abc/memory.limit_in_bytes": "2147483648\n",
 	})
 	fraction := autoLimitFraction
 	limit, source := AutoLimit()
 	if want := int64(float64(int64(2<<30)) * fraction); limit != want {
 		t.Fatalf("limit = %d, want %d", limit, want)
 	}
-	if source != "/sys/fs/cgroup/memory/docker/abc/memory/memory.limit_in_bytes" {
+	if source != "/sys/fs/cgroup/memory/docker/abc/memory.limit_in_bytes" {
 		t.Fatalf("source = %q", source)
+	}
+}
+
+func TestAutoLimitHybridSingleRootV1(t *testing.T) {
+	// A hybrid deployment (cgroup2 mounted at /sys/fs/cgroup with a cgroup1
+	// memory controller under a subdirectory) keeps the doubled layout.
+	fakeCgroup(t, map[string]string{
+		"/proc/self/cgroup":    "11:memory:/docker/abc\n",
+		"/proc/self/mountinfo": "1 0 0:1 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n",
+		"/sys/fs/cgroup/memory/docker/abc/memory/memory.limit_in_bytes": "1073741824\n",
+	})
+	fraction := autoLimitFraction
+	limit, _ := AutoLimit()
+	if want := int64(float64(int64(1<<30)) * fraction); limit != want {
+		t.Fatalf("limit = %d, want %d", limit, want)
 	}
 }
 

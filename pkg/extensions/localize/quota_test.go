@@ -323,10 +323,10 @@ func TestOverlayQuotaConcurrentAppendsChargeOncePerGrowth(t *testing.T) {
 	}
 	// Two admissions for the same target end, as two open handles appending
 	// concurrently would produce before either write reaches the file.
-	if _, err := q.admitWrite("/repo/node_modules/appended.bin", 500, 400); err != nil {
+	if _, err := q.admitWrite("repo/node_modules/appended.bin", 500, 400); err != nil {
 		t.Fatalf("first append admission: %v", err)
 	}
-	if _, err := q.admitWrite("/repo/node_modules/appended.bin", 500, 400); err != nil {
+	if _, err := q.admitWrite("repo/node_modules/appended.bin", 500, 400); err != nil {
 		t.Fatalf("second append admission: %v", err)
 	}
 	if got := q.Used(); got != 500 {
@@ -372,11 +372,11 @@ func TestOverlayQuotaSettleKeepsAnotherWritersLandedGrowth(t *testing.T) {
 		t.Fatal(err)
 	}
 	q := f.overlay.Quota()
-	resA, err := q.admitWrite("/repo/node_modules/shared-append.bin", 500, 400)
+	resA, err := q.admitWrite("repo/node_modules/shared-append.bin", 500, 400)
 	if err != nil {
 		t.Fatalf("A admission: %v", err)
 	}
-	resB, err := q.admitWrite("/repo/node_modules/shared-append.bin", 500, 400)
+	resB, err := q.admitWrite("repo/node_modules/shared-append.bin", 500, 400)
 	if err != nil {
 		t.Fatalf("B admission: %v", err)
 	}
@@ -406,7 +406,7 @@ func TestOverlayQuotaFailedWriteSettlesAgainstResultingSize(t *testing.T) {
 	q := f.overlay.Quota()
 	// A one-byte write beyond EOF would grow the file to 501; it fails without
 	// landing a byte, so settling against the real 100-byte size refunds all.
-	res, err := q.admitWrite("/repo/node_modules/hole.bin", 501, 1)
+	res, err := q.admitWrite("repo/node_modules/hole.bin", 501, 1)
 	if err != nil {
 		t.Fatalf("admission: %v", err)
 	}
@@ -421,7 +421,7 @@ func TestOverlayQuotaFailedWriteSettlesAgainstResultingSize(t *testing.T) {
 		t.Fatal("failed write left its booking behind")
 	}
 	// A retry must charge the growth again.
-	res2, err := q.admitWrite("/repo/node_modules/hole.bin", 501, 1)
+	res2, err := q.admitWrite("repo/node_modules/hole.bin", 501, 1)
 	if err != nil {
 		t.Fatalf("retry admission: %v", err)
 	}
@@ -523,11 +523,11 @@ func TestOverlayQuotaAbortedBookingsReconcileToDisk(t *testing.T) {
 		t.Fatal(err)
 	}
 	q := f.overlay.Quota()
-	resA, err := q.admitWrite("/repo/node_modules/aborted.bin", 600, 500)
+	resA, err := q.admitWrite("repo/node_modules/aborted.bin", 600, 500)
 	if err != nil {
 		t.Fatalf("A admission: %v", err)
 	}
-	resB, err := q.admitWrite("/repo/node_modules/aborted.bin", 600, 500)
+	resB, err := q.admitWrite("repo/node_modules/aborted.bin", 600, 500)
 	if err != nil {
 		t.Fatalf("B admission: %v", err)
 	}
@@ -541,6 +541,50 @@ func TestOverlayQuotaAbortedBookingsReconcileToDisk(t *testing.T) {
 	q.settleWrite(resB)
 	if got := q.Used(); got != 100 {
 		t.Fatalf("used after the last settle = %d, want 100 (the real file size)", got)
+	}
+	if q.isReserved("path:" + strings.TrimPrefix(rel, "/")) {
+		t.Fatal("booking survived its last settle")
+	}
+}
+
+// TestOverlayQuotaSettlementUsesBookingIdentity reproduces the race the third
+// review described: writer A's bytes land, writer B admits (replacing the map
+// entry) before A settles, and A's settle must retire A's OWN booking — not
+// close B's, which would refund growth B is about to land.
+func TestOverlayQuotaSettlementUsesBookingIdentity(t *testing.T) {
+	f := newQuotaRouter(t, 10000)
+	const rel = "/repo/node_modules/race.bin"
+	path := filepath.Join(f.overlay.Root(), filepath.FromSlash(strings.TrimPrefix(rel, "/")))
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: rel, Offset: 0, Data: make([]byte, 100)}); err != nil {
+		t.Fatal(err)
+	}
+	q := f.overlay.Quota()
+	resA, err := q.admitWrite("repo/node_modules/race.bin", 500, 400)
+	if err != nil {
+		t.Fatalf("A admission: %v", err)
+	}
+	// A's WriteAt lands, but A has not settled yet.
+	if err := os.WriteFile(path, make([]byte, 500), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// B admits in that window; the file has caught up with A's booking, so B
+	// starts a fresh one and A's booking is retired.
+	resB, err := q.admitWrite("repo/node_modules/race.bin", 900, 400)
+	if err != nil {
+		t.Fatalf("B admission: %v", err)
+	}
+	// A settles AFTER B admitted: it must not close B's booking.
+	q.settleWrite(resA)
+	if got := q.Used(); got != 900 {
+		t.Fatalf("used after A's late settle = %d, want 900 (B's booking untouched)", got)
+	}
+	// B lands its bytes and settles.
+	if err := os.WriteFile(path, make([]byte, 900), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	q.settleWrite(resB)
+	if got := q.Used(); got != 900 {
+		t.Fatalf("used after B settles = %d, want 900", got)
 	}
 	if q.isReserved("path:" + strings.TrimPrefix(rel, "/")) {
 		t.Fatal("booking survived its last settle")

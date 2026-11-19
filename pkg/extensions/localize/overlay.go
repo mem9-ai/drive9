@@ -97,15 +97,31 @@ func (o *Overlay) SettleWrite(res writeReservation) {
 	o.quota.settleWrite(res)
 }
 
-// ForgetPath drops a removed (or truncated-away) name's reservation so a later
-// create of the same path starts from zero.
-func (o *Overlay) ForgetPath(viewPath string) {
+// RetirePath reconciles and retires a name's booking against size — the size the
+// file had AT the mutation boundary (a truncating open passes the pre-truncate
+// size, a rename the pre-rename size). The owning writer's settlement then
+// becomes a no-op instead of refunding bytes the mutation already accounted.
+func (o *Overlay) RetirePath(viewPath string, size int64) {
 	if o == nil || o.quota == nil {
 		return
 	}
 	if rel, err := o.rel(viewPath); err == nil {
-		o.quota.forgetPath(rel)
+		o.quota.retirePath(rel, size)
 	}
+}
+
+// RetirePathNow retires a name's booking against its CURRENT on-disk size.
+func (o *Overlay) RetirePathNow(viewPath string) {
+	if o == nil || o.quota == nil {
+		return
+	}
+	size := int64(0)
+	if rel, err := o.rel(viewPath); err == nil {
+		if cur, serr := statBackingSize(o.root, rel); serr == nil {
+			size = cur
+		}
+	}
+	o.RetirePath(viewPath, size)
 }
 
 // rel resolves viewPath to its backing-relative path.
@@ -402,7 +418,11 @@ func (o *Overlay) Rename(oldPath, newPath string) error {
 	// once the rename succeeded. A rename of one hardlink over another name of
 	// the same inode frees nothing, so the identities are compared first.
 	replacedBytes, releaseDest := int64(0), false
+	srcSize, srcKnown := int64(0), false
 	if o.quota != nil {
+		if srcInfo, serr := os.Lstat(oldAbs); serr == nil && srcInfo.Mode().IsRegular() {
+			srcSize, srcKnown = srcInfo.Size(), true
+		}
 		if dstInfo, derr := os.Lstat(newAbs); derr == nil && dstInfo.Mode().IsRegular() {
 			sameInode := false
 			if srcInfo, serr := os.Lstat(oldAbs); serr == nil {
@@ -424,11 +444,16 @@ func (o *Overlay) Rename(oldPath, newPath string) error {
 		if releaseDest {
 			o.ReleaseBytes(replacedBytes)
 		}
-		// Both names' bookings are void: the destination's size is whatever the
-		// source carried (a recreate at the old name must charge from zero),
-		// and the source name no longer exists.
-		o.ForgetPath(oldPath)
-		o.ForgetPath(newPath)
+		// Both names' bookings are retired against the size the rename moved
+		// (measured before it): the source name no longer exists, and the
+		// destination now holds the source's bytes. A recreate at either name
+		// charges from disk again.
+		if srcKnown {
+			o.RetirePath(oldPath, srcSize)
+			o.RetirePath(newPath, srcSize)
+		} else {
+			o.RetirePathNow(newPath)
+		}
 	}
 	return err
 }

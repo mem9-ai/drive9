@@ -47,7 +47,7 @@ type overlayQuota struct {
 	statfs   func(root string) (total, free int64, err error)
 
 	// mu serializes admission and guards used/lastCheck/cachedFree/
-	// cachedTotal/refusals/reserved/pending.
+	// cachedTotal/refusals and reserved.
 	mu          sync.Mutex
 	used        int64
 	lastCheck   int64
@@ -126,18 +126,27 @@ func (q *overlayQuota) Refusals() int64 {
 // writers still have to settle. The LAST settler reconciles `used` against the
 // file's real size, which makes every interleaving (one writer failing, both
 // failing, one landing while the other fails) exact without per-writer refunds.
+//
+// A booking is addressed by IDENTITY (the *pendingReservation), not by map key:
+// a later admission can legitimately replace the map entry while an earlier
+// writer is still in flight, and that writer must settle its own booking, never
+// the newcomer's. Retired bookings stay reachable through their reservations and
+// settle as a no-op.
 type pendingReservation struct {
 	startSize int64
 	end       int64
 	bookings  int
+	retired   bool
 }
 
-// writeReservation records one write's reservation: the key it is booked under,
-// the growth admitted for it, and the size the file had before the write. A
-// write settles on completion (success or failure) against the file's resulting
-// size, so the accounting follows what is actually on disk.
+// writeReservation records one write's reservation: the booking it owns (by
+// identity, not by key), the growth admitted for it, and the size the file had
+// before the write. A write settles on completion (success or failure) against
+// the file's resulting size, so the accounting follows what is actually on
+// disk.
 type writeReservation struct {
 	key      string
+	booking  *pendingReservation
 	admitted int64
 	preSize  int64
 	// file is the descriptor a handle write went through, so settlement reads
@@ -178,13 +187,20 @@ func (q *overlayQuota) admitFileWrite(f *os.File, rel string, end, writeLen int6
 	if q == nil {
 		return writeReservation{}, nil
 	}
-	key, cur, err := fileReservation(f, rel)
+	// The fstat runs INSIDE the admission lock and yields both the size and the
+	// identity key: a write that lands between an outside stat and the lock
+	// would otherwise be charged twice.
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	info, err := f.Stat()
 	if err != nil {
 		return writeReservation{}, err
 	}
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	res, aerr := q.admitLocked(key, cur, end, writeLen)
+	key := "path:" + rel
+	if id, ok := fileReservationKey(f, rel); ok {
+		key = id
+	}
+	res, aerr := q.admitLocked(key, info.Size(), end, writeLen)
 	res.file = f
 	return res, aerr
 }
@@ -199,9 +215,10 @@ func (q *overlayQuota) admitLocked(key string, cur, end, writeLen int64) (writeR
 		if booking.end > cur {
 			cur = booking.end
 		} else {
-			// The file caught up: the booking is spent.
+			// The file caught up: retire the old booking (its bytes are all on
+			// disk, so there is nothing to refund) and start a fresh one.
+			q.retireLocked(key, booking, cur)
 			booking = nil
-			delete(q.reserved, key)
 		}
 	}
 	res := writeReservation{key: key, preSize: cur}
@@ -219,6 +236,12 @@ func (q *overlayQuota) admitLocked(key string, cur, end, writeLen int64) (writeR
 	res.admitted = growth
 	if growth > 0 {
 		q.used += growth
+		// Drain the free-space estimate pessimistically: a concurrent burst
+		// must not each pass the floor against the same cached sample. The
+		// reconciler adds back whatever never lands.
+		if q.cachedTotal > 0 {
+			q.cachedFree -= growth
+		}
 	}
 	if q.reserved == nil {
 		q.reserved = make(map[string]*pendingReservation)
@@ -231,21 +254,31 @@ func (q *overlayQuota) admitLocked(key string, cur, end, writeLen int64) (writeR
 		booking.end = end
 	}
 	booking.bookings++
+	res.booking = booking
 	return res, nil
 }
 
-// fileReservation resolves a descriptor to its reservation key and current size
-// (fstat): the descriptor is the truth after a rename, and on platforms with a
-// stable identity the booking follows the FILE, not the name.
-func fileReservation(f *os.File, rel string) (string, int64, error) {
-	info, err := f.Stat()
-	if err != nil {
-		return "", 0, err
+// retireLocked reconciles a booking against size and retires it: the overhang
+// (booked bytes not on disk) leaves `used` and returns to the free-space
+// estimate, and the owning writers' later settlements become no-ops. The caller
+// must hold q.mu.
+func (q *overlayQuota) retireLocked(key string, booking *pendingReservation, size int64) {
+	if booking == nil {
+		return
 	}
-	if key, ok := fileReservationKey(f, rel); ok {
-		return key, info.Size(), nil
+	if overhang := booking.end - size; overhang > 0 {
+		q.used -= overhang
+		if q.used < 0 {
+			q.used = 0
+		}
+		if q.cachedTotal > 0 {
+			q.cachedFree += overhang
+		}
 	}
-	return "path:" + rel, info.Size(), nil
+	booking.retired = true
+	if q.reserved[key] == booking {
+		delete(q.reserved, key)
+	}
 }
 
 // settleWrite settles one writer's booking against the file's RESULTING size.
@@ -255,13 +288,15 @@ func fileReservation(f *os.File, rel string) (string, int64, error) {
 // estimate. Intermediate settlers do nothing, so a shared booking cannot be
 // refunded by one writer while another still owns (or later lands) the bytes.
 func (q *overlayQuota) settleWrite(res writeReservation) {
-	if q == nil || res.key == "" {
+	if q == nil || res.booking == nil {
 		return
 	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	booking := q.reserved[res.key]
-	if booking == nil {
+	booking := res.booking
+	if booking.retired {
+		// A mutation (truncate/rename/unlink) or a later admission already
+		// reconciled this booking against the size it had then.
 		return
 	}
 	booking.bookings--
@@ -270,18 +305,24 @@ func (q *overlayQuota) settleWrite(res writeReservation) {
 	}
 	size, err := q.resultingSize(res)
 	if err != nil {
+		// Fail closed: keep the charge (the bytes may exist) but drop the
+		// entry, so a phantom end cannot inflate a later admission's base.
+		q.retireEntryLocked(res.key, booking)
 		return
 	}
-	if overhang := booking.end - size; overhang > 0 {
-		q.used -= overhang
-		if q.used < 0 {
-			q.used = 0
-		}
+	q.retireLocked(res.key, booking, size)
+}
+
+// retireEntryLocked drops a booking without reconciling (used keeps the
+// charge); settlement could not measure the file. The caller must hold q.mu.
+func (q *overlayQuota) retireEntryLocked(key string, booking *pendingReservation) {
+	if booking == nil {
+		return
 	}
-	if landed := size - booking.startSize; landed > 0 && q.cachedTotal > 0 {
-		q.cachedFree -= landed
+	booking.retired = true
+	if q.reserved[key] == booking {
+		delete(q.reserved, key)
 	}
-	delete(q.reserved, res.key)
 }
 
 // resultingSize reports the file's size after the write: the descriptor's when
@@ -311,14 +352,22 @@ func (q *overlayQuota) resize(rel string, newSize int64) (resizeReservation, err
 	if err != nil {
 		return resizeReservation{}, err
 	}
+	// An in-flight writer's charge is backed by the bytes this resize is about
+	// to move: retire it against the PRE-resize size so its own settlement
+	// cannot refund the shrink a second time.
+	q.retireLocked(key, q.reserved[key], cur)
 	var out resizeReservation
 	if newSize > cur {
 		growth := newSize - cur
 		if err := q.admitGrowthLocked(growth, growth); err != nil {
-			// Refused: the file is untouched, so pending reservations stand.
+			// Refused: the file is untouched (the booking was retired above
+			// against that same size, so the accounting is unchanged).
 			return resizeReservation{}, err
 		}
 		q.used += growth
+		if q.cachedTotal > 0 {
+			q.cachedFree -= growth
+		}
 		out.admitted = growth
 	} else {
 		freed := cur - newSize
@@ -328,11 +377,6 @@ func (q *overlayQuota) resize(rel string, newSize int64) (resizeReservation, err
 		}
 		out.released = freed
 	}
-	// Bookings are NOT dropped here: an in-flight write still has to settle its
-	// own booking, and erasing it would make that settlement a no-op while its
-	// charge stays. The truncate's own settlement (or the next admission, which
-	// sees the new size) retires the entry.
-	_ = key
 	return out, nil
 }
 
@@ -370,15 +414,19 @@ func (q *overlayQuota) release(n int64) {
 	}
 }
 
-// forgetPath drops a removed (or truncated-away) name's reservation so a later
-// create of the same path charges again instead of inheriting the watermark.
-func (q *overlayQuota) forgetPath(rel string) {
+// retirePath reconciles and retires a name's booking against the size the file
+// has at the mutation boundary, so a later create of the same path charges from
+// zero instead of inheriting the old end.
+func (q *overlayQuota) retirePath(rel string, size int64) {
 	if q == nil {
 		return
 	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	delete(q.reserved, "path:"+rel)
+	key := "path:" + rel
+	if booking, ok := q.reserved[key]; ok {
+		q.retireLocked(key, booking, size)
+	}
 }
 
 // forceAdmit counts n bytes that are on disk but were never admitted (the
