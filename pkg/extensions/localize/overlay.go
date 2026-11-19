@@ -91,20 +91,23 @@ func (o *Overlay) SettleWrite(res writeReservation) {
 	o.quota.settleWrite(res)
 }
 
-// RetirePath reconciles and retires a name's booking against size — the size the
-// file had AT the mutation boundary (a truncating open passes the pre-truncate
-// size, a rename the pre-rename size). The owning writer's settlement then
-// becomes a no-op instead of refunding bytes the mutation already accounted.
-func (o *Overlay) RetirePath(viewPath string, size int64) {
+// RetirePath retires a name's bookings against size — the size the file had AT
+// the mutation boundary — and records baseline, the size it has after the
+// mutation: 0 when the mutation also released the name's bytes (unlink, a
+// truncating open), the post-resize size for a truncate, or the moved size for a
+// rename. A writer retired here that lands afterwards is charged only the growth
+// beyond baseline.
+func (o *Overlay) RetirePath(viewPath string, size, baseline int64) {
 	if o == nil || o.quota == nil {
 		return
 	}
 	if rel, err := o.rel(viewPath); err == nil {
-		o.quota.retirePath(rel, size)
+		o.quota.retirePath(rel, size, baseline)
 	}
 }
 
-// RetirePathNow retires a name's booking against its CURRENT on-disk size.
+// RetirePathNow retires a name's bookings against its CURRENT on-disk size
+// (baseline = that same size: the bytes stay counted).
 func (o *Overlay) RetirePathNow(viewPath string) {
 	if o == nil || o.quota == nil {
 		return
@@ -115,7 +118,7 @@ func (o *Overlay) RetirePathNow(viewPath string) {
 			size = cur
 		}
 	}
-	o.RetirePath(viewPath, size)
+	o.RetirePath(viewPath, size, size)
 }
 
 // rel resolves viewPath to its backing-relative path.
@@ -446,10 +449,11 @@ func (o *Overlay) Rename(oldPath, newPath string) error {
 		// nothing was replaced). Using the source's size for the destination
 		// over-refunded by dstSize-srcSize.
 		if srcKnown {
-			o.RetirePath(oldPath, srcSize)
+			o.RetirePath(oldPath, srcSize, srcSize)
 		}
 		if dstKnown {
-			o.RetirePath(newPath, dstSize)
+			// The replaced destination's bytes were released above.
+			o.RetirePath(newPath, dstSize, 0)
 		} else if !srcKnown {
 			o.RetirePathNow(newPath)
 		}

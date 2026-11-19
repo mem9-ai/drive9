@@ -322,7 +322,7 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 				// booking against the pre-truncate size (so its writer's settle
 				// cannot refund the shrink again), then give its bytes back to
 				// the quota before the new content charges.
-				o.RetirePath(op.Path, oldSize)
+				o.RetirePath(op.Path, oldSize, 0)
 				o.ReleaseBytes(oldSize)
 			}
 			f.noteDBOpen(op.Path)
@@ -437,7 +437,7 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 				// Retire any in-flight writers of this name against the
 				// pre-truncate size: the truncate destroys the base they were
 				// booked over, and their own settlements reconcile from here.
-				o.RetirePath(op.Path, oldSize)
+				o.RetirePath(op.Path, oldSize, 0)
 				// Reserve the replacement BEFORE the truncating open: a refused
 				// write must leave the existing file intact, not truncated.
 				if aerr := o.ChargeGrowth(op.Path, growth); aerr != nil {
@@ -558,7 +558,7 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 			// unlink (a recreate charges from zero again). A hardlink alias
 			// keeps the bytes on disk, so the byte refund only happens on the
 			// last link.
-			o.RetirePath(op.Path, info.Size())
+			o.RetirePath(op.Path, info.Size(), 0)
 			if backingLinkCount(info) <= 1 {
 				o.ReleaseBytes(info.Size())
 			}

@@ -141,7 +141,10 @@ type pendingReservation struct {
 	admittedTotal int64  // growth admitted across all of its writers
 	bookings      int    // writers still to settle
 	retired       bool
-	retiredAt     int64 // file size at retirement (meaningful when retired)
+	// baseline is the file size AFTER the mutation that retired the booking
+	// (0 when the mutation released the bytes). A retired writer that lands
+	// later is charged only the growth beyond it.
+	baseline int64
 }
 
 // writeReservation records one write's reservation: the booking it owns (by
@@ -296,7 +299,7 @@ func (q *overlayQuota) detachLocked(booking *pendingReservation) {
 // leave `used` and go back to the free-space estimate. A retired writer that
 // lands bytes afterwards is re-charged by its own settlement. The caller must
 // hold q.mu.
-func (q *overlayQuota) retireLocked(booking *pendingReservation, size int64) {
+func (q *overlayQuota) retireLocked(booking *pendingReservation, size, baseline int64) {
 	if booking == nil {
 		return
 	}
@@ -316,7 +319,7 @@ func (q *overlayQuota) retireLocked(booking *pendingReservation, size int64) {
 		q.refundFreeEstimateLocked(unused)
 	}
 	booking.retired = true
-	booking.retiredAt = size
+	booking.baseline = baseline
 }
 
 // settleWrite settles one writer's booking against the file's RESULTING size.
@@ -337,7 +340,7 @@ func (q *overlayQuota) settleWrite(res writeReservation) {
 		return
 	}
 	if booking.retired {
-		if extra := size - booking.retiredAt; extra > 0 {
+		if extra := size - booking.baseline; extra > 0 {
 			q.used += extra
 			q.chargeFreeEstimateLocked(extra)
 		}
@@ -347,7 +350,7 @@ func (q *overlayQuota) settleWrite(res writeReservation) {
 	if booking.bookings > 0 {
 		return
 	}
-	q.retireLocked(booking, size)
+	q.retireLocked(booking, size, 0)
 }
 
 // resultingSize reports the file's size after the write: the descriptor's when
@@ -383,13 +386,13 @@ func (q *overlayQuota) resize(rel string, newSize int64) (resizeReservation, err
 			return resizeReservation{}, err
 		}
 		out.admitted = growth
-		q.retirePathLocked(rel, cur)
+		q.retirePathLocked(rel, cur, newSize)
 		q.used += growth
 		q.chargeFreeEstimateLocked(growth)
 		return out, nil
 	}
 	out.released = cur - newSize
-	q.retirePathLocked(rel, cur)
+	q.retirePathLocked(rel, cur, newSize)
 	q.used -= out.released
 	if q.used < 0 {
 		q.used = 0
@@ -399,24 +402,24 @@ func (q *overlayQuota) resize(rel string, newSize int64) (resizeReservation, err
 
 // retirePathLocked retires every booking reachable under a path (path-keyed AND
 // inode-keyed writers) against size. The caller must hold q.mu.
-func (q *overlayQuota) retirePathLocked(rel string, size int64) {
+func (q *overlayQuota) retirePathLocked(rel string, size, baseline int64) {
 	for booking := range q.byPath[rel] {
-		q.retireLocked(booking, size)
+		q.retireLocked(booking, size, baseline)
 	}
 	if booking := q.reserved["path:"+rel]; booking != nil {
-		q.retireLocked(booking, size)
+		q.retireLocked(booking, size, baseline)
 	}
 }
 
 // retirePath retires a name's bookings against the size it had at the mutation
 // boundary (a later create charges from disk again).
-func (q *overlayQuota) retirePath(rel string, size int64) {
+func (q *overlayQuota) retirePath(rel string, size, baseline int64) {
 	if q == nil {
 		return
 	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	q.retirePathLocked(rel, size)
+	q.retirePathLocked(rel, size, baseline)
 }
 
 // admitGrowthLocked applies growth to the byte quota and checks the free-space

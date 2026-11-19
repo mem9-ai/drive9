@@ -650,3 +650,69 @@ func TestOverlayQuotaResizeRetiresHandleBookingOnce(t *testing.T) {
 		t.Fatalf("used after the writer settles = %d, want 50 (no double refund)", got)
 	}
 }
+
+// TestOverlayQuotaUnlinkRetiresHandleBooking: unlink retires a handle writer's
+// booking against the pre-unlink size and refunds the last link's bytes; the
+// writer's later landing on the anonymous fd is re-charged.
+func TestOverlayQuotaUnlinkRetiresHandleBooking(t *testing.T) {
+	f := newQuotaRouter(t, 4000)
+	const view = "/repo/node_modules/unlink-ino.bin"
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: view, Offset: 0, Data: make([]byte, 100)}); err != nil {
+		t.Fatal(err)
+	}
+	q := f.overlay.Quota()
+	res, file := admitHandle(t, f, view, 600, 500)
+	if got := q.Used(); got != 600 {
+		t.Fatalf("used with the booking in flight = %d, want 600", got)
+	}
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpUnlink, Path: view}); err != nil {
+		t.Fatalf("unlink: %v", err)
+	}
+	if q.hasBookingForPath(strings.TrimPrefix(view, "/")) {
+		t.Fatal("unlink did not retire the inode-keyed booking")
+	}
+	if got := q.Used(); got != 0 {
+		t.Fatalf("used after the unlink = %d, want 0", got)
+	}
+	// The writer still lands 600 bytes on the unlinked descriptor: those bytes
+	// exist, so settling re-charges them.
+	if _, err := file.WriteAt(make([]byte, 600), 0); err != nil {
+		t.Fatalf("land after unlink: %v", err)
+	}
+	q.settleWrite(res)
+	if got := q.Used(); got != 600 {
+		t.Fatalf("used after the retired writer landed = %d, want 600", got)
+	}
+}
+
+// TestOverlayQuotaRenameRetiresDestinationBookingAtItsOwnSize: the destination
+// name's booking is settled against the DESTINATION's pre-rename size, not the
+// source's.
+func TestOverlayQuotaRenameRetiresDestinationBookingAtItsOwnSize(t *testing.T) {
+	f := newQuotaRouter(t, 4000)
+	const src = "/repo/node_modules/rn-src.bin"
+	const dst = "/repo/node_modules/rn-dst.bin"
+	for _, p := range []string{src, dst} {
+		n := 50
+		if p == dst {
+			n = 200
+		}
+		if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: p, Offset: 0, Data: make([]byte, n)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	q := f.overlay.Quota()
+	// A writer holds the destination open, booking 200 -> 1000.
+	_, _ = admitHandle(t, f, dst, 1000, 800)
+	if got := q.Used(); got != 1050 {
+		t.Fatalf("used before the rename = %d, want 1050 (50 + 200 + 800)", got)
+	}
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpRename, Path: src, Path2: dst}); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	// The destination's 200 bytes are released and its booking's 800 refunded;
+	// the source's 50 bytes are now the destination's content.
+	if got := q.Used(); got != 50 {
+		t.Fatalf("used after the rename = %d, want 50", got)
+	}
+}
