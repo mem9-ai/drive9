@@ -2616,9 +2616,9 @@ func TestWriteRejectsChunkedBodyWithoutDeclaredLength(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusLengthRequired {
+	if resp.StatusCode != http.StatusBadRequest {
 		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("chunked write without a length: status %d body %q, want %d", resp.StatusCode, body, http.StatusLengthRequired)
+		t.Fatalf("chunked write without a length: status %d body %q, want %d", resp.StatusCode, body, http.StatusBadRequest)
 	}
 
 	// Nothing was stored, so the path does not exist.
@@ -2652,26 +2652,6 @@ func TestWriteChunkedBodyUsesDeclaredLengthAsBound(t *testing.T) {
 	if resp.StatusCode != http.StatusRequestEntityTooLarge {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("declared-length overrun: status %d body %q, want %d", resp.StatusCode, body, http.StatusRequestEntityTooLarge)
-	}
-}
-
-// The read timeout must be configurable and must refuse nonsense rather than silently
-// disabling itself: a slow sender is exactly what it exists to stop.
-func TestServerReadTimeoutFromEnv(t *testing.T) {
-	// The test process may inherit a value; the default case must still be exercised.
-	t.Setenv("DRIVE9_SERVER_READ_TIMEOUT", "")
-	if got := serverReadTimeout(); got != DefaultReadTimeout {
-		t.Fatalf("default read timeout = %s, want %s", got, DefaultReadTimeout)
-	}
-	t.Setenv("DRIVE9_SERVER_READ_TIMEOUT", "90s")
-	if got := serverReadTimeout(); got != 90*time.Second {
-		t.Fatalf("configured read timeout = %s, want 1m30s", got)
-	}
-	for _, bad := range []string{"0", "-1s", "not-a-duration"} {
-		t.Setenv("DRIVE9_SERVER_READ_TIMEOUT", bad)
-		if got := serverReadTimeout(); got != DefaultReadTimeout {
-			t.Fatalf("read timeout for %q = %s, want the default %s", bad, got, DefaultReadTimeout)
-		}
 	}
 }
 

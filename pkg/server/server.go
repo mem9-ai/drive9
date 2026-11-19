@@ -1605,37 +1605,19 @@ func isLoopbackListenAddr(addr string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-// DefaultReadTimeout bounds how long one request may spend sending its request line, headers
+// serverReadTimeout bounds how long one request may spend sending its request line, headers
 // and body. It is deliberately generous — a legitimate JSON or inline PUT finishes in
 // milliseconds, and large uploads use presigned S3 URLs rather than this listener — but it
 // stops a slow sender from holding a connection (and the memory behind its body) forever.
-const DefaultReadTimeout = 10 * time.Minute
-
-// serverReadTimeout resolves the read timeout from the environment, so an operator with very
-// slow clients can raise it without a rebuild.
-func serverReadTimeout() time.Duration {
-	ctx := backgroundWithTrace(context.Background())
-	raw := strings.TrimSpace(os.Getenv("DRIVE9_SERVER_READ_TIMEOUT"))
-	if raw == "" {
-		return DefaultReadTimeout
-	}
-	d, err := time.ParseDuration(raw)
-	if err != nil || d <= 0 {
-		// One context for the log line and its fields, so the warning carries a single trace id.
-		logger.Warn(ctx, "server_event", eventFields(ctx, "server_invalid_read_timeout", "value", raw)...)
-		return DefaultReadTimeout
-	}
-	return d
-}
+const serverReadTimeout = 10 * time.Minute
 
 func (s *Server) ListenAndServe(addr string) error {
-	readTimeout := serverReadTimeout()
-	logger.Info(backgroundWithTrace(context.Background()), "server_start", zap.String("addr", addr), zap.Int64("max_upload_bytes", s.maxUploadBytes), zap.Duration("read_timeout", readTimeout))
+	logger.Info(backgroundWithTrace(context.Background()), "server_start", zap.String("addr", addr), zap.Int64("max_upload_bytes", s.maxUploadBytes), zap.Duration("read_timeout", serverReadTimeout))
 	httpSrv := &http.Server{
 		Addr:              addr,
 		Handler:           s,
 		ReadHeaderTimeout: 15 * time.Second,
-		ReadTimeout:       readTimeout,
+		ReadTimeout:       serverReadTimeout,
 		IdleTimeout:       2 * time.Minute,
 		MaxHeaderBytes:    1 << 20,
 		TLSConfig:         &tls.Config{MinVersion: tls.VersionTLS12},
@@ -2669,7 +2651,8 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 		// known. Require the length up front instead.
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_missing_length", "path", path)...)
 		metricEvent(r.Context(), "fs_write", "result", "error")
-		errJSON(w, http.StatusLengthRequired, "Content-Length or X-Dat9-Content-Length is required for PUT")
+		// Same answer the append-log path already gives for a length-less body in fs.
+		errJSON(w, http.StatusBadRequest, "Content-Length or X-Dat9-Content-Length is required")
 		return
 	}
 	if cl > s.maxUploadBytes {
