@@ -136,7 +136,6 @@ func (q *overlayQuota) Refusals() int64 {
 // re-charge bytes that land after it.
 type pendingReservation struct {
 	key           string
-	path          string   // backing-relative view path of the first admission
 	paths         []string // every name this booking is indexed under
 	startSize     int64    // the file's size when the first writer booked
 	end           int64    // the furthest end booked
@@ -151,6 +150,10 @@ type pendingReservation struct {
 	// booking: several writers share one booking, and each of them settling the
 	// same landed extent must not charge it again.
 	retiredCharged int64
+	// poolResolved records that this booking's pool share has left the
+	// unsettled pool, so a repeated stat-failing settlement cannot resolve it
+	// twice. Mirrors the `retired` tripwire: the invariant is exactly-once.
+	poolResolved bool
 }
 
 // writeReservation records one write's reservation: the booking it owns (by
@@ -300,33 +303,10 @@ func (q *overlayQuota) admitLocked(key, rel string, cur, end, writeLen int64) (w
 		q.reserved = make(map[string]*pendingReservation)
 	}
 	if booking == nil {
-		booking = &pendingReservation{key: key, path: rel, startSize: res.preSize}
+		booking = &pendingReservation{key: key, startSize: res.preSize}
 		q.reserved[key] = booking
-		if rel != "" {
-			if q.byPath == nil {
-				q.byPath = make(map[string]map[*pendingReservation]struct{})
-			}
-			set := q.byPath[rel]
-			if set == nil {
-				set = make(map[*pendingReservation]struct{})
-				q.byPath[rel] = set
-			}
-			set[booking] = struct{}{}
-			booking.paths = append(booking.paths, rel)
-		}
 	}
-	if rel != "" && !booking.indexedUnder(rel) {
-		if q.byPath == nil {
-			q.byPath = make(map[string]map[*pendingReservation]struct{})
-		}
-		set := q.byPath[rel]
-		if set == nil {
-			set = make(map[*pendingReservation]struct{})
-			q.byPath[rel] = set
-		}
-		set[booking] = struct{}{}
-		booking.paths = append(booking.paths, rel)
-	}
+	q.indexLocked(booking, rel)
 	if end > booking.end {
 		booking.end = end
 	}
@@ -359,6 +339,24 @@ func (q *overlayQuota) detachLocked(booking *pendingReservation) {
 		}
 	}
 	booking.paths = nil
+}
+
+// indexLocked adds the booking to rel's index exactly once, so detach can sweep
+// every name it was admitted through. The caller must hold q.mu.
+func (q *overlayQuota) indexLocked(booking *pendingReservation, rel string) {
+	if booking == nil || rel == "" || booking.indexedUnder(rel) {
+		return
+	}
+	if q.byPath == nil {
+		q.byPath = make(map[string]map[*pendingReservation]struct{})
+	}
+	set := q.byPath[rel]
+	if set == nil {
+		set = make(map[*pendingReservation]struct{})
+		q.byPath[rel] = set
+	}
+	set[booking] = struct{}{}
+	booking.paths = append(booking.paths, rel)
 }
 
 // indexedUnder reports whether the booking is already indexed under rel.
@@ -398,6 +396,7 @@ func (q *overlayQuota) retireLocked(booking *pendingReservation, size, baseline 
 		}
 	}
 	q.retireFreeEstimateLocked(booking.admittedTotal, unused)
+	booking.poolResolved = true
 	booking.retired = true
 	booking.baseline = baseline
 }
@@ -418,7 +417,12 @@ func (q *overlayQuota) settleWrite(res writeReservation) {
 		// phantom end cannot inflate a later admission's base. The pool share
 		// still resolves: the bytes stay in `used` and in the estimate.
 		q.detachLocked(booking)
-		q.resolvePoolLocked(booking.admittedTotal)
+		// Resolve the pool share once: several settlers of one booking can all
+		// fail their stat, and each must not subtract the same share.
+		if !booking.poolResolved {
+			booking.poolResolved = true
+			q.resolvePoolLocked(booking.admittedTotal)
+		}
 		return
 	}
 	if booking.retired {

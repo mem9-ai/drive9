@@ -450,16 +450,28 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 					o.ResolveCharge(tok, 0)
 					return fs.Result{}, err
 				}
-				if oldSize > newSize {
-					// The truncating open freed the old image's excess.
-					o.ReleaseBytes(oldSize - newSize)
-				}
 				written, werr := fh.Write(op.Data)
 				cerr := fh.Close()
-				// The reservation resolves with what landed; the mutation landed
-				// too, so the name's in-flight writers are retired against the
-				// pre-truncate size with the written size as their baseline.
-				o.ResolveCharge(tok, int64(written))
+				// The truncating open dropped the old image, so this name must
+				// end up charged exactly the bytes that landed. `tok` was
+				// charged on the old-size-relative delta (newSize - oldSize), so
+				// it is resolved with the delta that landed beyond oldSize; the
+				// rest of the pre-write size is released below. A partial write
+				// is the case this quota exists for, so both bases have to agree
+				// on it.
+				landed := int64(written) - oldSize
+				if landed < 0 {
+					landed = 0
+				}
+				o.ResolveCharge(tok, landed)
+				if residual := oldSize - int64(written); residual > 0 {
+					// Bytes of the old image this write did not replace: they
+					// are gone from disk, so they leave `used` too.
+					o.ReleaseBytes(residual)
+				}
+				// The mutation landed, so the name's in-flight writers are
+				// retired against the pre-truncate size with the written size as
+				// their baseline.
 				o.RetireMutation(op.Path, oldSize, int64(written))
 				if werr != nil {
 					return fs.Result{}, werr

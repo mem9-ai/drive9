@@ -926,6 +926,49 @@ func TestOverlayQuotaAliasDetachCleansEveryIndex(t *testing.T) {
 	}
 }
 
+// TestOverlayQuotaStatFailureResolvesThePoolOnce: when a write's settlement
+// cannot stat its file, the booking's pool share is resolved once. A second
+// stat-failing settler of the same booking must not subtract it again, or it
+// eats another live booking's in-flight share.
+func TestOverlayQuotaStatFailureResolvesThePoolOnce(t *testing.T) {
+	f := newQuotaRouter(t, 0)
+	if err := f.overlay.SetQuota(0, 0.10); err != nil {
+		t.Fatal(err)
+	}
+	q := f.overlay.Quota()
+	q.statfs = func(string) (int64, int64, error) { return 100 << 20, 50 << 20, nil }
+	const shared = "/repo/node_modules/statfail-a.bin"
+	const other = "/repo/node_modules/statfail-b.bin"
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: shared, Offset: 0, Data: make([]byte, 100)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: other, Offset: 0, Data: make([]byte, 100)}); err != nil {
+		t.Fatal(err)
+	}
+	resA, fileA := admitHandle(t, f, shared, 600, 500)
+	resB, fileB := admitHandle(t, f, shared, 600, 500) // shares A's booking
+	if resB.admitted != 0 {
+		t.Fatalf("second settler paid %d, want 0", resB.admitted)
+	}
+	// Another booking keeps its own share in the pool while A's is resolved.
+	_, _ = admitHandle(t, f, other, 400, 300)
+	// Closed descriptors make the settlement's fstat fail.
+	if err := fileA.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := fileB.Close(); err != nil {
+		t.Fatal(err)
+	}
+	q.settleWrite(resA)
+	q.settleWrite(resB)
+	q.mu.Lock()
+	pool := q.unlanded
+	q.mu.Unlock()
+	if pool != 300 {
+		t.Fatalf("unlanded pool = %d, want 300 (the other booking's share only)", pool)
+	}
+}
+
 // TestOverlayQuotaResizeRetirementWaitsForTheTruncate: a REFUSED or failed
 // resize must not retire the name's writers (the file never moved); a landed one
 // retires them with the new size as their baseline.
