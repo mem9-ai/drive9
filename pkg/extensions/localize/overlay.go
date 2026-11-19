@@ -87,32 +87,14 @@ func (o *Overlay) AdmitFileWrite(f *os.File, viewPath string, end, writeLen int6
 	return res, err
 }
 
-// SettleFileWrite settles a failed descriptor write against the descriptor's
-// resulting size (which covers partial writes and sparse gaps alike).
-func (o *Overlay) SettleFileWrite(f *os.File, res writeReservation) {
-	if o == nil || o.quota == nil || f == nil {
-		return
-	}
-	size := res.preSize
-	if info, err := f.Stat(); err == nil {
-		size = info.Size()
-	}
-	o.quota.settleWrite(res, size)
-}
-
-// SettleWrite settles a failed path-addressed write against the backing file's
-// resulting size.
-func (o *Overlay) SettleWrite(viewPath string, res writeReservation) {
+// SettleWrite settles a write's booking against the file's resulting size. The
+// reservation carries the descriptor for handle writes, so settlement cannot be
+// redirected by a rename; a path write is settled from the backing path.
+func (o *Overlay) SettleWrite(res writeReservation) {
 	if o == nil || o.quota == nil {
 		return
 	}
-	size := res.preSize
-	if rel, err := o.rel(viewPath); err == nil {
-		if cur, serr := statBackingSize(o.root, rel); serr == nil {
-			size = cur
-		}
-	}
-	o.quota.settleWrite(res, size)
+	o.quota.settleWrite(res)
 }
 
 // ForgetPath drops a removed (or truncated-away) name's reservation so a later

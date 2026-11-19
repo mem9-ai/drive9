@@ -411,7 +411,7 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 			// the free-space window), on a partial write (the classic mid-write
 			// ENOSPC) it keeps the charge for the bytes that really landed,
 			// gaps included, and returns the rest.
-			h.ov.SettleFileWrite(h.file, res)
+			h.ov.SettleWrite(res)
 			if werr != nil {
 				return fs.Result{}, werr
 			}
@@ -438,7 +438,7 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 					// The file is untouched: settle the reservation against its
 					// unchanged size (refunds the growth AND clears the reserved
 					// end, so a retry charges again).
-					o.SettleWrite(op.Path, res)
+					o.SettleWrite(res)
 					return fs.Result{}, err
 				}
 				if oldSize > newSize {
@@ -461,7 +461,7 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 				}
 				// Retire the booking (the landed bytes stay charged and leave
 				// the free-space window).
-				o.SettleWrite(op.Path, res)
+				o.SettleWrite(res)
 				if cerr != nil {
 					return fs.Result{}, cerr
 				}

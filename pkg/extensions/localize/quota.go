@@ -121,11 +121,15 @@ func (q *overlayQuota) Refusals() int64 {
 	return q.refusals
 }
 
-// pendingReservation is one file's shared in-flight booking: the furthest end
-// its writers have booked, and how many of them still have to settle.
+// pendingReservation is one file's shared in-flight booking: the size it had
+// when the first writer booked, the furthest end booked since, and how many
+// writers still have to settle. The LAST settler reconciles `used` against the
+// file's real size, which makes every interleaving (one writer failing, both
+// failing, one landing while the other fails) exact without per-writer refunds.
 type pendingReservation struct {
-	end      int64
-	bookings int
+	startSize int64
+	end       int64
+	bookings  int
 }
 
 // writeReservation records one write's reservation: the key it is booked under,
@@ -136,6 +140,9 @@ type writeReservation struct {
 	key      string
 	admitted int64
 	preSize  int64
+	// file is the descriptor a handle write went through, so settlement reads
+	// the resulting size from it (a rename cannot redirect it).
+	file *os.File
 }
 
 // resizeReservation records a truncate's movement: bytes admitted (growth) or
@@ -177,7 +184,9 @@ func (q *overlayQuota) admitFileWrite(f *os.File, rel string, end, writeLen int6
 	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	return q.admitLocked(key, cur, end, writeLen)
+	res, aerr := q.admitLocked(key, cur, end, writeLen)
+	res.file = f
+	return res, aerr
 }
 
 // admitLocked books the admission for key. cur is the on-disk size; an
@@ -215,7 +224,7 @@ func (q *overlayQuota) admitLocked(key string, cur, end, writeLen int64) (writeR
 		q.reserved = make(map[string]*pendingReservation)
 	}
 	if booking == nil {
-		booking = &pendingReservation{}
+		booking = &pendingReservation{startSize: res.preSize}
 		q.reserved[key] = booking
 	}
 	if end > booking.end {
@@ -239,42 +248,53 @@ func fileReservation(f *os.File, rel string) (string, int64, error) {
 	return "path:" + rel, info.Size(), nil
 }
 
-// settleWrite settles a reservation against the file's RESULTING size: the
-// charge keeps exactly the bytes that landed (a partial write, a real sparse
-// gap, or another writer's successful append to the same file) and returns the
-// rest. The landed bytes also leave the free-space window's cached estimate, so
-// a burst cannot cumulatively breach the floor.
-func (q *overlayQuota) settleWrite(res writeReservation, resultingSize int64) {
+// settleWrite settles one writer's booking against the file's RESULTING size.
+// Only the LAST settler for a file reconciles the charge: it removes the
+// overhang (the bytes booked but not on disk, which is exactly a failed or
+// partial write) and takes the landed growth out of the free-space window's
+// estimate. Intermediate settlers do nothing, so a shared booking cannot be
+// refunded by one writer while another still owns (or later lands) the bytes.
+func (q *overlayQuota) settleWrite(res writeReservation) {
 	if q == nil || res.key == "" {
 		return
 	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	landed := int64(0)
-	if resultingSize > res.preSize {
-		landed = resultingSize - res.preSize
+	booking := q.reserved[res.key]
+	if booking == nil {
+		return
 	}
-	if landed > res.admitted {
-		landed = res.admitted
+	booking.bookings--
+	if booking.bookings > 0 {
+		return
 	}
-	if unused := res.admitted - landed; unused > 0 {
-		q.used -= unused
+	size, err := q.resultingSize(res)
+	if err != nil {
+		return
+	}
+	if overhang := booking.end - size; overhang > 0 {
+		q.used -= overhang
 		if q.used < 0 {
 			q.used = 0
 		}
 	}
-	if landed > 0 && q.cachedTotal > 0 {
+	if landed := size - booking.startSize; landed > 0 && q.cachedTotal > 0 {
 		q.cachedFree -= landed
 	}
-	// Retire THIS booking. The entry survives while another writer still has
-	// to settle (it may have booked the same end), and then holds the furthest
-	// end seen so far.
-	if booking := q.reserved[res.key]; booking != nil {
-		booking.bookings--
-		if resultingSize > booking.end || booking.bookings <= 0 {
-			delete(q.reserved, res.key)
+	delete(q.reserved, res.key)
+}
+
+// resultingSize reports the file's size after the write: the descriptor's when
+// the reservation carries one, else the backing path's.
+func (q *overlayQuota) resultingSize(res writeReservation) (int64, error) {
+	if res.file != nil {
+		info, err := res.file.Stat()
+		if err != nil {
+			return 0, err
 		}
+		return info.Size(), nil
 	}
+	return q.sizeFunc(q.root, strings.TrimPrefix(res.key, "path:"))
 }
 
 // resize accounts a truncate to newSize: growth is admitted, shrinkage

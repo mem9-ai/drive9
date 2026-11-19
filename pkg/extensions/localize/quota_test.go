@@ -383,13 +383,15 @@ func TestOverlayQuotaSettleKeepsAnotherWritersLandedGrowth(t *testing.T) {
 	if resA.admitted != 400 || resB.admitted != 0 {
 		t.Fatalf("admissions = %d/%d, want 400/0 (one growth, charged once)", resA.admitted, resB.admitted)
 	}
-	// B lands the bytes; A then fails.
+	// B lands the bytes; A then fails. The last settler reconciles against the
+	// file's real size, so the landed growth is charged exactly once.
 	if err := os.WriteFile(filepath.Join(f.overlay.Root(), filepath.FromSlash(strings.TrimPrefix(rel, "/"))), make([]byte, 500), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	q.settleWrite(resA, 500)
+	q.settleWrite(resB)
+	q.settleWrite(resA)
 	if got := q.Used(); got != 500 {
-		t.Fatalf("used after A's failed settle = %d, want 500 (B's landed bytes)", got)
+		t.Fatalf("used after both settles = %d, want 500 (the landed bytes)", got)
 	}
 }
 
@@ -411,7 +413,7 @@ func TestOverlayQuotaFailedWriteSettlesAgainstResultingSize(t *testing.T) {
 	if res.admitted != 401 {
 		t.Fatalf("admitted = %d, want 401", res.admitted)
 	}
-	q.settleWrite(res, 100)
+	q.settleWrite(res)
 	if got := q.Used(); got != 100 {
 		t.Fatalf("used after the failed write = %d, want 100", got)
 	}
@@ -507,5 +509,40 @@ func TestOverlayQuotaRenameRetiresBothNames(t *testing.T) {
 	}
 	if q.isReserved("path:" + strings.TrimPrefix(dst, "/")) {
 		t.Fatal("rename left the destination name's booking behind")
+	}
+}
+
+// TestOverlayQuotaAbortedBookingsReconcileToDisk: two writers book the same
+// growth and NEITHER lands bytes (both fail). The last settler must reconcile
+// `used` back to the file's real size, leaving no phantom charge that would
+// keep refusing writes.
+func TestOverlayQuotaAbortedBookingsReconcileToDisk(t *testing.T) {
+	f := newQuotaRouter(t, 10000)
+	const rel = "/repo/node_modules/aborted.bin"
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: rel, Offset: 0, Data: make([]byte, 100)}); err != nil {
+		t.Fatal(err)
+	}
+	q := f.overlay.Quota()
+	resA, err := q.admitWrite("/repo/node_modules/aborted.bin", 600, 500)
+	if err != nil {
+		t.Fatalf("A admission: %v", err)
+	}
+	resB, err := q.admitWrite("/repo/node_modules/aborted.bin", 600, 500)
+	if err != nil {
+		t.Fatalf("B admission: %v", err)
+	}
+	if got := q.Used(); got != 600 {
+		t.Fatalf("used while both are in flight = %d, want 600", got)
+	}
+	q.settleWrite(resA)
+	if got := q.Used(); got != 600 {
+		t.Fatalf("used after A settles (B still owns the booking) = %d, want 600", got)
+	}
+	q.settleWrite(resB)
+	if got := q.Used(); got != 100 {
+		t.Fatalf("used after the last settle = %d, want 100 (the real file size)", got)
+	}
+	if q.isReserved("path:" + strings.TrimPrefix(rel, "/")) {
+		t.Fatal("booking survived its last settle")
 	}
 }
