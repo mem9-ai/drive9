@@ -764,7 +764,8 @@ func TestOverlayQuotaRetiredSharedBookingChargesOnce(t *testing.T) {
 
 // TestOverlayQuotaRefreshDoesNotDoubleCountLandedGrowth: after a successful
 // write, a Statfs refresh must not subtract that landed growth again (which
-// would make the floor fire forever).
+// would make the floor fire forever). The final step grows a file the sample
+// has not counted yet, so a real admission (and a real refresh) happens.
 func TestOverlayQuotaRefreshDoesNotDoubleCountLandedGrowth(t *testing.T) {
 	f := newQuotaRouter(t, 0)
 	if err := f.overlay.SetQuota(0, 0.10); err != nil {
@@ -777,7 +778,7 @@ func TestOverlayQuotaRefreshDoesNotDoubleCountLandedGrowth(t *testing.T) {
 	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: "/repo/node_modules/fill.bin", Offset: 0, Data: make([]byte, 1<<20)}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	// Land 20 MiB (a successful write), then force a refresh boundary.
+	// Land 20 MiB more (a successful write), which the filesystem now holds.
 	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: "/repo/node_modules/fill.bin", Offset: 1 << 20, Data: make([]byte, 20<<20)}); err != nil {
 		t.Fatalf("grow: %v", err)
 	}
@@ -786,9 +787,142 @@ func TestOverlayQuotaRefreshDoesNotDoubleCountLandedGrowth(t *testing.T) {
 	q.mu.Lock()
 	q.lastCheck = 0 // force the next admission to re-sample
 	q.mu.Unlock()
-	// 1 MiB of growth must be admitted: 30 - 1 = 29 MiB > 10 MiB floor.
-	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: "/repo/node_modules/fill.bin", Offset: 21 << 20, Data: make([]byte, 1<<20)}); err != nil {
+	// GENUINE growth on a different file: 1 MiB that is not on disk yet.
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: "/repo/node_modules/after-refresh.bin", Offset: 0, Data: make([]byte, 1<<20)}); err != nil {
 		t.Fatalf("write after refresh = %v, want admitted", err)
+	}
+	q.mu.Lock()
+	refreshed := q.lastCheck != 0
+	q.mu.Unlock()
+	if !refreshed {
+		t.Fatal("the admission short-circuited and never refreshed the sample")
+	}
+}
+
+// TestOverlayQuotaGrowTruncateResolvesItsPoolShare: a growing ftruncate must
+// leave no unsettled pool entry behind, or every Statfs refresh subtracts it
+// again.
+func TestOverlayQuotaGrowTruncateResolvesItsPoolShare(t *testing.T) {
+	f := newQuotaRouter(t, 0)
+	if err := f.overlay.SetQuota(0, 0.10); err != nil {
+		t.Fatal(err)
+	}
+	q := f.overlay.Quota()
+	total := int64(100 << 20)
+	q.statfs = func(string) (int64, int64, error) { return total, 50 << 20, nil }
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: "/repo/node_modules/grow.bin", Offset: 0, Data: make([]byte, 1<<20)}); err != nil {
+		t.Fatal(err)
+	}
+	// Grow the file to 30 MiB with a truncate, then refresh the sample.
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpSetAttr, Path: "/repo/node_modules/grow.bin", Size: 30 << 20}); err != nil {
+		t.Fatalf("grow truncate: %v", err)
+	}
+	q.mu.Lock()
+	if q.unlanded != 0 {
+		t.Fatalf("unlanded pool = %d after a landed grow, want 0", q.unlanded)
+	}
+	q.lastCheck = 0
+	q.mu.Unlock()
+	q.statfs = func(string) (int64, int64, error) { return total, 21 << 20, nil }
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: "/repo/node_modules/grow2.bin", Offset: 0, Data: make([]byte, 1<<20)}); err != nil {
+		t.Fatalf("write after the grow + refresh = %v, want admitted", err)
+	}
+}
+
+// TestOverlayQuotaPathWriteResolvesItsPoolShare: a truncating path write takes
+// a bookingless reservation. Its resolution must empty the unsettled pool and
+// keep exactly the bytes that landed charged, or every later Statfs refresh
+// subtracts the phantom growth again.
+func TestOverlayQuotaPathWriteResolvesItsPoolShare(t *testing.T) {
+	f := newQuotaRouter(t, 0)
+	if err := f.overlay.SetQuota(0, 0.10); err != nil {
+		t.Fatal(err)
+	}
+	q := f.overlay.Quota()
+	q.statfs = func(string) (int64, int64, error) { return 100 << 20, 50 << 20, nil }
+	const view = "/repo/node_modules/pool-path.bin"
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: view, Offset: 0, Data: make([]byte, 1<<20)}); err != nil {
+		t.Fatalf("path write: %v", err)
+	}
+	if got := q.Used(); got != 1<<20 {
+		t.Fatalf("used after the path write = %d, want %d", got, 1<<20)
+	}
+	q.mu.Lock()
+	pool := q.unlanded
+	q.mu.Unlock()
+	if pool != 0 {
+		t.Fatalf("unlanded pool = %d after a resolved path write, want 0", pool)
+	}
+}
+
+// TestOverlayQuotaRetiredRechargeIsClamped: a retired writer that lands after a
+// NEW booking regrew the file is re-charged only up to the extent it booked;
+// the bytes above it were already paid at the new booking's admission.
+func TestOverlayQuotaRetiredRechargeIsClamped(t *testing.T) {
+	f := newQuotaRouter(t, 10000)
+	const view = "/repo/node_modules/retired-clamp.bin"
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: view, Offset: 0, Data: make([]byte, 100)}); err != nil {
+		t.Fatal(err)
+	}
+	q := f.overlay.Quota()
+	res, file := admitHandle(t, f, view, 600, 500)
+	// A truncate retires the booking and refunds its admitted growth.
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpSetAttr, Path: view, Size: 50}); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	if got := q.Used(); got != 50 {
+		t.Fatalf("used after the truncate = %d, want 50", got)
+	}
+	// A new writer books the file out to 2000 bytes and pays for all of it.
+	if _, _ = admitHandle(t, f, view, 2000, 1950); q.Used() != 2000 {
+		t.Fatalf("used after the new booking = %d, want 2000", q.Used())
+	}
+	// The retired writer now lands 2000 bytes, far past the 600 it booked.
+	if _, err := file.WriteAt(make([]byte, 1950), 50); err != nil {
+		t.Fatalf("land past the booking end: %v", err)
+	}
+	q.settleWrite(res)
+	// Only the 550 bytes of its booked extent (50..600) are re-charged; the
+	// 1400 above it were paid by the new booking and must not be charged again.
+	if got := q.Used(); got != 2550 {
+		t.Fatalf("used after the clamped re-charge = %d, want 2550", got)
+	}
+}
+
+// TestOverlayQuotaAliasDetachCleansEveryIndex: a booking admitted through both
+// hardlink names must be removed from BOTH when retired, so a second mutation
+// through the surviving name cannot re-retire it (which turned the cap
+// fail-open).
+func TestOverlayQuotaAliasDetachCleansEveryIndex(t *testing.T) {
+	f := newQuotaRouter(t, 4000)
+	const a = "/repo/node_modules/detach-a.bin"
+	const b = "/repo/node_modules/detach-b.bin"
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: a, Offset: 0, Data: make([]byte, 100)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpLink, Path: a, Path2: b}); err != nil {
+		t.Fatalf("link: %v", err)
+	}
+	q := f.overlay.Quota()
+	_, _ = admitHandle(t, f, a, 600, 500)
+	_, _ = admitHandle(t, f, b, 600, 500) // same inode: joins, indexes under b
+	if !q.hasBookingForPath(strings.TrimPrefix(a, "/")) || !q.hasBookingForPath(strings.TrimPrefix(b, "/")) {
+		t.Fatal("booking not indexed under both aliases")
+	}
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpUnlink, Path: b}); err != nil {
+		t.Fatalf("unlink b: %v", err)
+	}
+	if q.hasBookingForPath(strings.TrimPrefix(a, "/")) {
+		t.Fatal("stale index entry under the surviving alias")
+	}
+	before := q.Used()
+	// A second mutation through the surviving name must not re-retire the dead
+	// booking (used must not drop below the bytes still on disk).
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpSetAttr, Path: a, Size: 100}); err != nil {
+		t.Fatalf("truncate a: %v", err)
+	}
+	if got := q.Used(); got != 100 {
+		t.Fatalf("used after the collapse = %d, want 100 (was %d)", got, before)
 	}
 }
 

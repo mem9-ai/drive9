@@ -58,13 +58,25 @@ func (o *Overlay) Quota() *overlayQuota {
 }
 
 // ChargeGrowth reserves growth for a TRUNCATING path write, which has no base a
-// booking could settle against (the file is about to be reset): the caller
-// releases the unlanded remainder. ENOSPC means the quota or the free-space
-// floor refused.
-func (o *Overlay) ChargeGrowth(viewPath string, growth int64) error {
-	return o.withQuota(viewPath, func(q *overlayQuota, _ string) error {
-		return q.charge(growth)
+// booking could settle against (the file is about to be reset). The returned
+// token must be resolved exactly once with the bytes that landed. ENOSPC means
+// the quota or the free-space floor refused.
+func (o *Overlay) ChargeGrowth(viewPath string, growth int64) (chargeToken, error) {
+	var tok chargeToken
+	err := o.withQuota(viewPath, func(q *overlayQuota, _ string) error {
+		var qerr error
+		tok, qerr = q.charge(growth)
+		return qerr
 	})
+	return tok, err
+}
+
+// ResolveCharge settles a bookingless reservation with the bytes that landed.
+func (o *Overlay) ResolveCharge(tok chargeToken, landed int64) {
+	if o == nil || o.quota == nil {
+		return
+	}
+	o.quota.resolveCharge(tok, landed)
 }
 
 // AdmitFileWrite reserves the space a write through an OPEN descriptor needs.
@@ -183,7 +195,9 @@ func (o *Overlay) ReconcileResize(res resizeReservation) {
 	if o == nil || o.quota == nil {
 		return
 	}
-	o.quota.release(res.admitted)
+	// The truncate never landed: resolve the grow's reservation with zero landed
+	// bytes (which also returns its pool share) and re-count a released shrink.
+	o.quota.resolveCharge(res.charge, 0)
 	if res.released > 0 {
 		o.quota.forceAdmit(res.released)
 	}

@@ -439,13 +439,15 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 				// name's in-flight writers are retired only once the mutation
 				// actually landed (below): retiring before a refusal or a failed
 				// open would leave them measured against a file that never moved.
-				if aerr := o.ChargeGrowth(op.Path, growth); aerr != nil {
+				tok, aerr := o.ChargeGrowth(op.Path, growth)
+				if aerr != nil {
 					return fs.Result{}, aerr
 				}
 				fh, err := o.OpenFile(op.Path, syscall.O_WRONLY|syscall.O_CREAT|syscall.O_TRUNC, mode)
 				if err != nil {
-					// The file is untouched: hand the reservation back.
-					o.ReleaseBytes(growth)
+					// The file is untouched: resolve the reservation with zero
+					// landed bytes.
+					o.ResolveCharge(tok, 0)
 					return fs.Result{}, err
 				}
 				if oldSize > newSize {
@@ -454,17 +456,12 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 				}
 				written, werr := fh.Write(op.Data)
 				cerr := fh.Close()
-				// The mutation landed (the truncate happened): retire the name's
-				// in-flight writers against the pre-truncate size, with the
-				// post-write size as the baseline they must not re-pay.
+				// The reservation resolves with what landed; the mutation landed
+				// too, so the name's in-flight writers are retired against the
+				// pre-truncate size with the written size as their baseline.
+				o.ResolveCharge(tok, int64(written))
 				o.RetireMutation(op.Path, oldSize, int64(written))
 				if werr != nil {
-					// The truncate baseline is zero: release everything the
-					// partial write did not land, so the charge equals the bytes
-					// on disk (a retry charges again).
-					if release := newSize - int64(written); release > 0 {
-						o.ReleaseBytes(release)
-					}
 					return fs.Result{}, werr
 				}
 				if cerr != nil {
@@ -635,9 +632,10 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 					o.ReconcileResize(res)
 					return fs.Result{}, err
 				}
-				// The truncate landed: retire the name's in-flight writers
-				// against the pre-truncate size, with the new size as their
-				// baseline.
+				// The truncate landed: resolve the grow's reservation and retire
+				// the name's in-flight writers against the pre-truncate size with
+				// the new size as their baseline.
+				o.ResolveCharge(res.charge, res.admitted)
 				o.RetireMutation(op.Path, res.preSize, op.Size)
 			}
 			return fs.Result{}, nil

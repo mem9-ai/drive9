@@ -136,11 +136,12 @@ func (q *overlayQuota) Refusals() int64 {
 // re-charge bytes that land after it.
 type pendingReservation struct {
 	key           string
-	path          string // backing-relative view path (may be "")
-	startSize     int64  // the file's size when the first writer booked
-	end           int64  // the furthest end booked
-	admittedTotal int64  // growth admitted across all of its writers
-	bookings      int    // writers still to settle
+	path          string   // backing-relative view path of the first admission
+	paths         []string // every name this booking is indexed under
+	startSize     int64    // the file's size when the first writer booked
+	end           int64    // the furthest end booked
+	admittedTotal int64    // growth admitted across all of its writers
+	bookings      int      // writers still to settle
 	retired       bool
 	// baseline is the file size AFTER the mutation that retired the booking
 	// (0 when the mutation released the bytes). A retired writer that lands
@@ -176,28 +177,69 @@ type resizeReservation struct {
 	// preSize is the file's size before the truncate, so the caller can retire
 	// the name's bookings AFTER the host truncate lands.
 	preSize int64
+	// charge is the bookingless reservation a grow made: the caller resolves it
+	// once the host truncate has landed (or failed).
+	charge chargeToken
 }
 
-// charge reserves growth with NO booking. It is the truncating write's form: the
-// file is about to be reset, so there is no base size a booking could be settled
-// against — the caller releases the unlanded remainder explicitly.
-//
-// Because it carries no booking, a concurrent mutator that destroys this write's
-// landed content between the charge and its release points cannot reconcile it:
-// the drift is bounded by ONE write's size and always leaves `used` too high
-// (fail-closed), never too low.
-func (q *overlayQuota) charge(growth int64) error {
+// chargeToken is a bookingless reservation's receipt. Every charge has exactly
+// one resolution (resolveCharge), which is what keeps the free-space pool from
+// accumulating entries no path ever removes.
+type chargeToken struct {
+	amount int64
+}
+
+// charge reserves growth with NO booking: it is the truncating write's and the
+// growing truncate's form, where the base is about to move. The caller resolves
+// the token exactly once with the number of bytes that actually landed; the
+// resolution returns the unrealised part to the quota and the estimate.
+func (q *overlayQuota) charge(growth int64) (chargeToken, error) {
 	if q == nil || growth <= 0 {
-		return nil
+		return chargeToken{}, nil
 	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if err := q.admitGrowthLocked(growth, growth); err != nil {
-		return err
+		return chargeToken{}, err
 	}
 	q.used += growth
 	q.chargeFreeEstimateLocked(growth)
-	return nil
+	return chargeToken{amount: growth}, nil
+}
+
+// resolveCharge settles a bookingless reservation: landed bytes stay charged and
+// leave the unsettled pool, the rest returns to both ledgers.
+func (q *overlayQuota) resolveCharge(tok chargeToken, landed int64) {
+	if q == nil || tok.amount <= 0 {
+		return
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if landed < 0 {
+		landed = 0
+	}
+	if landed > tok.amount {
+		landed = tok.amount
+	}
+	if unused := tok.amount - landed; unused > 0 {
+		q.used -= unused
+		if q.used < 0 {
+			q.used = 0
+		}
+		if q.cachedTotal > 0 {
+			q.cachedFree += unused
+		}
+	}
+	q.resolvePoolLocked(tok.amount)
+}
+
+// resolvePoolLocked removes n bytes from the unsettled pool. The caller must
+// hold q.mu.
+func (q *overlayQuota) resolvePoolLocked(n int64) {
+	q.unlanded -= n
+	if q.unlanded < 0 {
+		q.unlanded = 0
+	}
 }
 
 // admitFileWrite accounts a write through an OPEN descriptor: one fstat (under
@@ -270,9 +312,10 @@ func (q *overlayQuota) admitLocked(key, rel string, cur, end, writeLen int64) (w
 				q.byPath[rel] = set
 			}
 			set[booking] = struct{}{}
+			booking.paths = append(booking.paths, rel)
 		}
 	}
-	if rel != "" && booking.path != rel {
+	if rel != "" && !booking.indexedUnder(rel) {
 		if q.byPath == nil {
 			q.byPath = make(map[string]map[*pendingReservation]struct{})
 		}
@@ -282,6 +325,7 @@ func (q *overlayQuota) admitLocked(key, rel string, cur, end, writeLen int64) (w
 			q.byPath[rel] = set
 		}
 		set[booking] = struct{}{}
+		booking.paths = append(booking.paths, rel)
 	}
 	if end > booking.end {
 		booking.end = end
@@ -303,12 +347,28 @@ func (q *overlayQuota) detachLocked(booking *pendingReservation) {
 	if q.reserved[booking.key] == booking {
 		delete(q.reserved, booking.key)
 	}
-	if set := q.byPath[booking.path]; set != nil {
-		delete(set, booking)
-		if len(set) == 0 {
-			delete(q.byPath, booking.path)
+	// Sweep EVERY name the booking was indexed under, not just the first: a
+	// booking admitted through a hardlink alias that is never cleaned would be
+	// re-retired by a later mutation through the surviving name.
+	for _, rel := range booking.paths {
+		if set := q.byPath[rel]; set != nil {
+			delete(set, booking)
+			if len(set) == 0 {
+				delete(q.byPath, rel)
+			}
 		}
 	}
+	booking.paths = nil
+}
+
+// indexedUnder reports whether the booking is already indexed under rel.
+func (b *pendingReservation) indexedUnder(rel string) bool {
+	for _, p := range b.paths {
+		if p == rel {
+			return true
+		}
+	}
+	return false
 }
 
 // retireLocked reconciles a booking against the size the file had AT the
@@ -317,7 +377,9 @@ func (q *overlayQuota) detachLocked(booking *pendingReservation) {
 // lands bytes afterwards is re-charged by its own settlement. The caller must
 // hold q.mu.
 func (q *overlayQuota) retireLocked(booking *pendingReservation, size, baseline int64) {
-	if booking == nil {
+	if booking == nil || booking.retired {
+		// A retired booking is already reconciled; a second retirement would
+		// subtract its overhang twice (an index hole fails closed, not open).
 		return
 	}
 	q.detachLocked(booking)
@@ -353,15 +415,25 @@ func (q *overlayQuota) settleWrite(res writeReservation) {
 	size, err := q.resultingSize(res)
 	if err != nil {
 		// Fail closed: keep the charge (the bytes may exist) but detach, so a
-		// phantom end cannot inflate a later admission's base.
+		// phantom end cannot inflate a later admission's base. The pool share
+		// still resolves: the bytes stay in `used` and in the estimate.
 		q.detachLocked(booking)
+		q.resolvePoolLocked(booking.admittedTotal)
 		return
 	}
 	if booking.retired {
-		// Charge only growth beyond what this booking already accounted: two
-		// writers sharing it each settle once, and both must see the same
-		// landed extent charged exactly once.
-		if extra := size - booking.baseline; extra > booking.retiredCharged {
+		// Charge only growth beyond what this booking already accounted, and
+		// never beyond the extent it booked: a NEW booking may have regrown the
+		// file past it, and those bytes were paid at their own admission.
+		cap := booking.end - booking.baseline
+		if cap < 0 {
+			cap = 0
+		}
+		extra := size - booking.baseline
+		if extra > cap {
+			extra = cap
+		}
+		if extra > booking.retiredCharged {
 			delta := extra - booking.retiredCharged
 			booking.retiredCharged = extra
 			q.used += delta
@@ -410,12 +482,14 @@ func (q *overlayQuota) resize(rel string, newSize int64) (resizeReservation, err
 		}
 		out.admitted = growth
 		out.preSize = cur
+		out.charge = chargeToken{amount: growth}
 		q.used += growth
 		q.chargeFreeEstimateLocked(growth)
 		return out, nil
 	}
 	out.released = cur - newSize
 	out.preSize = cur
+	out.charge = chargeToken{}
 	q.used -= out.released
 	if q.used < 0 {
 		q.used = 0
@@ -514,10 +588,7 @@ func (q *overlayQuota) refundFreeEstimateLocked(n int64) {
 // the in-flight pool (part landed, part refunded), and the refunded part returns
 // to the cached estimate. The caller must hold q.mu.
 func (q *overlayQuota) retireFreeEstimateLocked(admittedTotal, unused int64) {
-	q.unlanded -= admittedTotal
-	if q.unlanded < 0 {
-		q.unlanded = 0
-	}
+	q.resolvePoolLocked(admittedTotal)
 	if unused > 0 && q.cachedTotal > 0 {
 		q.cachedFree += unused
 	}
