@@ -587,16 +587,16 @@ func (o *Overlay) Rename(oldPath, newPath string) error {
 	replacedBytes, releaseDest := int64(0), false
 	srcSize, srcKnown := int64(0), false
 	dstSize, dstKnown := int64(0), false
+	var srcInfo, dstInfo iofs.FileInfo
 	if o.quota != nil {
-		if srcInfo, serr := os.Lstat(oldAbs); serr == nil && srcInfo.Mode().IsRegular() {
-			srcSize, srcKnown = srcInfo.Size(), true
+		if fi, serr := os.Lstat(oldAbs); serr == nil && fi.Mode().IsRegular() {
+			srcInfo = fi
+			srcSize, srcKnown = fi.Size(), true
 		}
-		if dstInfo, derr := os.Lstat(newAbs); derr == nil && dstInfo.Mode().IsRegular() {
-			dstSize, dstKnown = dstInfo.Size(), true
-			sameInode := false
-			if srcInfo, serr := os.Lstat(oldAbs); serr == nil {
-				sameInode = os.SameFile(srcInfo, dstInfo)
-			}
+		if fi, derr := os.Lstat(newAbs); derr == nil && fi.Mode().IsRegular() {
+			dstInfo = fi
+			dstSize, dstKnown = fi.Size(), true
+			sameInode := srcInfo != nil && os.SameFile(srcInfo, dstInfo)
 			// The replaced NAME goes away, but the inode's bytes only leave
 			// the quota when no other hardlink keeps them: releasing on a
 			// shared inode would under-count the surviving aliases.
@@ -618,8 +618,13 @@ func (o *Overlay) Rename(oldPath, newPath string) error {
 		// replaced destination's writers were measured at dstSize (0 when
 		// nothing was replaced). Using the source's size for the destination
 		// over-refunded by dstSize-srcSize.
+		// Each name's identity carries its own paid prefix: the source name is
+		// gone (its writers were measured at srcSize) and the replaced
+		// destination's writers were measured at dstSize (0 when nothing was
+		// replaced). Retiring through the FileInfo keeps the prefix attached to
+		// the inode, whatever names it has.
 		if srcKnown {
-			o.RetirePath(oldPath, srcSize, srcSize)
+			o.RetireFile(srcInfo, "", oldPath, srcSize, srcSize)
 		}
 		if dstKnown {
 			// The destination's bytes were released above only when nothing else
@@ -629,7 +634,7 @@ func (o *Overlay) Rename(oldPath, newPath string) error {
 			if !releaseDest {
 				dstBaseline = dstSize
 			}
-			o.RetirePath(newPath, dstSize, dstBaseline)
+			o.RetireFile(dstInfo, "", newPath, dstSize, dstBaseline)
 		} else if !srcKnown {
 			o.RetirePathNow(newPath)
 		}

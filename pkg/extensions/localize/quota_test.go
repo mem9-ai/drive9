@@ -945,11 +945,111 @@ func TestOverlayQuotaRetiredWriterDoesNotRechargeANewerBookingsExtent(t *testing
 	if got := q.Used(); got != info.Size() {
 		t.Fatalf("used = %d, want the inode's %d bytes (B already paid them)", got, info.Size())
 	}
+	// The paid prefix is the inode's size, and it is forgotten with the file.
+	key, ok := fileReservationKey(info)
+	if !ok {
+		t.Fatal("no inode key for the backing file")
+	}
 	q.mu.Lock()
-	orphans := len(q.retired)
+	paid := q.paidLocked(key)
 	q.mu.Unlock()
-	if orphans != 0 {
-		t.Fatalf("retired-booking registry still holds %d entries after every writer settled", orphans)
+	if paid != info.Size() {
+		t.Fatalf("paid prefix = %d, want the inode's %d bytes", paid, info.Size())
+	}
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpUnlink, Path: view}); err != nil {
+		t.Fatalf("unlink: %v", err)
+	}
+	q.mu.Lock()
+	left := len(q.paid)
+	q.mu.Unlock()
+	if left != 0 {
+		t.Fatalf("paid prefix still holds %d keys after the inode was unlinked", left)
+	}
+}
+
+// TestOverlayQuotaFailedNewerBookingRevokesItsCoverage: a newer admission pays
+// for the extent it books before the bytes land. When that write then fails and
+// settles, the refund must revoke the paid prefix too — otherwise the retired
+// writer's later landing is never billed and the backing tree outgrows the cap.
+func TestOverlayQuotaFailedNewerBookingRevokesItsCoverage(t *testing.T) {
+	f := newQuotaRouter(t, 10000)
+	const view = "/repo/node_modules/retired-revoked.bin"
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: view, Offset: 0, Data: make([]byte, 100)}); err != nil {
+		t.Fatal(err)
+	}
+	q := f.overlay.Quota()
+	resA, fileA := admitHandle(t, f, view, 600, 500)
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpSetAttr, Path: view, Size: 50}); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	// B books out to 2000, then fails without landing anything.
+	resB, _ := admitHandle(t, f, view, 2000, 1950)
+	if got := q.Used(); got != 2000 {
+		t.Fatalf("used after B booked = %d, want 2000", got)
+	}
+	q.settleWrite(resB)
+	if got := q.Used(); got != 50 {
+		t.Fatalf("used after B failed = %d, want 50 (its growth is refunded)", got)
+	}
+	// A lands its booked extent and settles: the 550 new bytes must be charged.
+	if _, err := fileA.WriteAt(make([]byte, 550), 50); err != nil {
+		t.Fatalf("A lands: %v", err)
+	}
+	q.settleWrite(resA)
+	info, err := f.overlay.Lstat(view)
+	if err != nil {
+		t.Fatalf("lstat: %v", err)
+	}
+	if got := q.Used(); got != info.Size() {
+		t.Fatalf("used = %d, want the inode's %d bytes after B's refund", got, info.Size())
+	}
+}
+
+// TestOverlayQuotaSiblingRetiredBookingsBillOnce: successive truncates retire
+// successive bookings on one inode. Each retired writer bills against the key's
+// paid prefix, not its own frozen baseline, so the shared extent is charged once.
+func TestOverlayQuotaSiblingRetiredBookingsBillOnce(t *testing.T) {
+	f := newQuotaRouter(t, 10000)
+	const view = "/repo/node_modules/retired-siblings.bin"
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: view, Offset: 0, Data: make([]byte, 100)}); err != nil {
+		t.Fatal(err)
+	}
+	q := f.overlay.Quota()
+	resA, fileA := admitHandle(t, f, view, 600, 500)
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpSetAttr, Path: view, Size: 100}); err != nil {
+		t.Fatalf("first truncate: %v", err)
+	}
+	// A second booking, retired by a second truncate: a sibling of A's.
+	resC, _ := admitHandle(t, f, view, 2000, 1900)
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpSetAttr, Path: view, Size: 100}); err != nil {
+		t.Fatalf("second truncate: %v", err)
+	}
+	if got := q.Used(); got != 100 {
+		t.Fatalf("used after the truncates = %d, want 100", got)
+	}
+	// Both retired writers land, A (smaller extent) first.
+	if _, err := fileA.WriteAt(make([]byte, 500), 100); err != nil {
+		t.Fatalf("A lands: %v", err)
+	}
+	q.settleWrite(resA)
+	if got := q.Used(); got != 600 {
+		t.Fatalf("used after A settled = %d, want 600", got)
+	}
+	resCFile, err := os.OpenFile(filepath.Join(f.overlay.Root(), filepath.FromSlash(strings.TrimPrefix(view, "/"))), os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	t.Cleanup(func() { _ = resCFile.Close() })
+	if _, err := resCFile.WriteAt(make([]byte, 1900), 100); err != nil {
+		t.Fatalf("C lands: %v", err)
+	}
+	q.settleWrite(resC)
+	info, err := f.overlay.Lstat(view)
+	if err != nil {
+		t.Fatalf("lstat: %v", err)
+	}
+	if got := q.Used(); got != info.Size() {
+		t.Fatalf("used = %d, want the inode's %d bytes (no double billing)", got, info.Size())
 	}
 }
 
