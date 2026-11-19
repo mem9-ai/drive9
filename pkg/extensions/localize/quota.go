@@ -375,9 +375,12 @@ func (b *pendingReservation) indexedUnder(rel string) bool {
 // lands bytes afterwards is re-charged by its own settlement. The caller must
 // hold q.mu.
 func (q *overlayQuota) retireLocked(booking *pendingReservation, size, baseline int64) {
-	if booking == nil || booking.retired {
+	if booking == nil || booking.retired || booking.poolResolved {
 		// A retired booking is already reconciled; a second retirement would
 		// subtract its overhang twice (an index hole fails closed, not open).
+		// A poolResolved booking was detached by a settler that could not stat
+		// its file: its pool share is already gone, so retiring it here would
+		// resolve that share a second time.
 		return
 	}
 	q.detachLocked(booking)

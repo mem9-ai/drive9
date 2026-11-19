@@ -429,7 +429,22 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 					mode = 0o644
 				}
 				newSize := int64(len(op.Data))
-				oldSize, _ := o.Size(op.Path)
+				// One truncating write per backing target at a time: two
+				// handle-less writes to one file each destroy the image the
+				// other is landing, so snapshotting the old size outside the
+				// lock would charge a delta against an image that is already
+				// gone and never return the destroyed image's bytes.
+				//
+				// Both the lock and the size probe are quota-only work: with no
+				// quota armed every call below is a no-op, so the path write must
+				// not pay an extra stat for them.
+				oldSize := int64(0)
+				unlock := func() {}
+				if o.Quota() != nil {
+					unlock = o.ReplaceLock(op.Path)
+					oldSize, _ = o.Size(op.Path)
+				}
+				defer unlock()
 				growth := newSize - oldSize
 				if growth < 0 {
 					growth = 0

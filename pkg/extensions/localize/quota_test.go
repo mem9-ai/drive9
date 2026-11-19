@@ -1,10 +1,12 @@
 package localize
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 
@@ -28,6 +30,15 @@ func admitHandle(t *testing.T, f *Localize, view string, end, writeLen int64) (w
 		t.Fatalf("admitFileWrite: %v", err)
 	}
 	return res, file
+}
+
+// doOpNoT runs one op without a *testing.T, so background goroutines can drive
+// the production path without touching test state.
+func doOpNoT(f *Localize, op *fs.Op) (fs.Result, error) {
+	next := fs.Next(func(ctx context.Context, op *fs.Op) (fs.Result, error) {
+		return fs.Result{}, fs.ErrUnsupported
+	})
+	return f.Do(context.Background(), op, next)
 }
 
 // newQuotaRouter builds a router whose persistent overlay carries the given
@@ -924,6 +935,76 @@ func TestOverlayQuotaAliasDetachCleansEveryIndex(t *testing.T) {
 	if got := q.Used(); got != 100 {
 		t.Fatalf("used after the collapse = %d, want 100 (was %d)", got, before)
 	}
+}
+
+// TestOverlayQuotaConcurrentPathWritesStayExact: several workers replace the
+// same backing file concurrently. Every truncating open destroys the image the
+// other writers are landing, so the snapshot, charge and settle must be
+// serialized per target; without that the destroyed image's charge is never
+// returned and `used` climbs monotonically while the disk holds one file.
+func TestOverlayQuotaConcurrentPathWritesStayExact(t *testing.T) {
+	hammer := func(t *testing.T, f *Localize, names []string) {
+		t.Helper()
+		const perName = 60
+		var wg sync.WaitGroup
+		errs := make(chan error, len(names))
+		for w := range names {
+			wg.Add(1)
+			go func(w int) {
+				defer wg.Done()
+				for i := 0; i < perName; i++ {
+					n := 128 + (i*97+w*13)%2048
+					// The production op shape: a handle-less full replacement.
+					op := &fs.Op{Kind: fs.OpWrite, Path: names[w], Offset: 0, Data: make([]byte, n)}
+					if _, err := doOpNoT(f, op); err != nil {
+						errs <- err
+						return
+					}
+				}
+			}(w)
+		}
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			t.Fatalf("concurrent path write: %v", err)
+		}
+	}
+	t.Run("one name", func(t *testing.T) {
+		f := newQuotaRouter(t, 10<<20)
+		const view = "/repo/node_modules/hammer.bin"
+		names := make([]string, 4)
+		for i := range names {
+			names[i] = view
+		}
+		hammer(t, f, names)
+		info, err := f.overlay.Lstat(view)
+		if err != nil {
+			t.Fatalf("lstat: %v", err)
+		}
+		if got := f.overlay.Quota().Used(); got != info.Size() {
+			t.Fatalf("used = %d, want the on-disk size %d", got, info.Size())
+		}
+	})
+	t.Run("hardlink aliases", func(t *testing.T) {
+		f := newQuotaRouter(t, 10<<20)
+		const a = "/repo/node_modules/hammer-a.bin"
+		const b = "/repo/node_modules/hammer-b.bin"
+		if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: a, Offset: 0, Data: make([]byte, 256)}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := doOp(t, f, &fs.Op{Kind: fs.OpLink, Path: a, Path2: b}); err != nil {
+			t.Fatalf("link: %v", err)
+		}
+		names := []string{a, b, a, b}
+		hammer(t, f, names)
+		info, err := f.overlay.Lstat(a)
+		if err != nil {
+			t.Fatalf("lstat: %v", err)
+		}
+		if got := f.overlay.Quota().Used(); got != info.Size() {
+			t.Fatalf("used = %d, want the inode's on-disk size %d", got, info.Size())
+		}
+	})
 }
 
 // TestOverlayQuotaStatFailureResolvesThePoolOnce: when a write's settlement

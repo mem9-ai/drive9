@@ -2,10 +2,12 @@ package localize
 
 import (
 	"errors"
+	"hash/fnv"
 	iofs "io/fs"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -18,6 +20,14 @@ import (
 // valid disabled overlay (operations fail with EIO through abs).
 type Overlay struct {
 	root string
+	// replaceLocks serialize TRUNCATING path writes per backing target. Two
+	// handle-less writes to one name (or to two names for the same file) each
+	// reset the image the other is landing, so their snapshot -> charge ->
+	// truncate -> settle sequence must not interleave: the second snapshot
+	// would describe an image the first already destroyed, and the destroyed
+	// image's charge could never be returned. Striped so unrelated names do
+	// not allocate or contend.
+	replaceLocks [64]sync.Mutex
 	// quota bounds the backing tree's bytes and the host filesystem's free
 	// space (nil disables both). The local overlay writes straight to the
 	// host disk, so this is the only guard between a local-only subtree and
@@ -55,6 +65,47 @@ func (o *Overlay) Quota() *overlayQuota {
 		return nil
 	}
 	return o.quota
+}
+
+// ReplaceLock serializes the truncating path-write sequence for viewPath's
+// backing target and returns its release function. Every writer to one NAME
+// takes the name's stripe first, so two concurrent creates of one path cannot
+// slip past each other through the missing-file window; when the file already
+// exists its identity stripe is taken too, so two hardlink aliases (or a rename
+// that keeps the inode) share one lock. Name first, identity second, and nothing
+// takes a name stripe while holding an identity stripe, so the two do not
+// deadlock.
+//
+// Callers must hold it across the size snapshot, the charge, the truncating
+// open, the settle and the retire: a post-hoc re-stat cannot repair a snapshot
+// taken against an image another writer already destroyed.
+func (o *Overlay) ReplaceLock(viewPath string) (unlock func()) {
+	if o == nil {
+		return func() {}
+	}
+	nameMu := o.replaceLockStripe("path:" + viewPath)
+	nameMu.Lock()
+	unlock = nameMu.Unlock
+	if info, err := o.Lstat(viewPath); err == nil {
+		if id, ok := fileReservationKey(info); ok {
+			if idMu := o.replaceLockStripe(id); idMu != nameMu {
+				idMu.Lock()
+				releaseName := unlock
+				unlock = func() {
+					idMu.Unlock()
+					releaseName()
+				}
+			}
+		}
+	}
+	return unlock
+}
+
+// replaceLockStripe maps a lock key onto the striped mutex array.
+func (o *Overlay) replaceLockStripe(key string) *sync.Mutex {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(key))
+	return &o.replaceLocks[h.Sum32()%uint32(len(o.replaceLocks))]
 }
 
 // ChargeGrowth reserves growth for a TRUNCATING path write, which has no base a
