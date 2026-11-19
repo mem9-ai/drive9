@@ -2398,6 +2398,9 @@ func TestWriteBodyReadMetricRecordsFailureStatusClass(t *testing.T) {
 	defer ts.Close()
 
 	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/too-large.txt", io.NopCloser(strings.NewReader("abcdef")))
+	// The declared length is what the size check reads: an io.NopCloser body would otherwise
+	// arrive chunked with no length and be refused as 411 before the limit is compared.
+	req.ContentLength = 6
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -2591,6 +2594,78 @@ func TestListenAndServeRefusesPlaintextOnWildcard(t *testing.T) {
 		t.Setenv(EnvTLSAllowPlaintext, value)
 		if err := (&Server{}).ListenAndServe(":9009"); err == nil || !strings.Contains(err.Error(), EnvTLSAllowPlaintext) {
 			t.Fatalf("opt-out %q allowed a plaintext listener: %v", value, err)
+		}
+	}
+}
+
+// A chunked PUT with no declared length has no size the router can judge: r.ContentLength is
+// -1, so the 413 check and the large-file branch both miss and the body would be buffered
+// whole in memory. The write path requires the length up front instead.
+func TestWriteRejectsChunkedBodyWithoutDeclaredLength(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/data/chunked.txt", io.NopCloser(strings.NewReader("hello world")))
+	req.ContentLength = -1 // force Transfer-Encoding: chunked
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusLengthRequired {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("chunked write without a length: status %d body %q, want %d", resp.StatusCode, body, http.StatusLengthRequired)
+	}
+
+	// Nothing was stored, so the path does not exist.
+	readResp, err := http.Get(ts.URL + "/v1/fs/data/chunked.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = readResp.Body.Close() }()
+	if readResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("read after refused write: status %d, want %d", readResp.StatusCode, http.StatusNotFound)
+	}
+}
+
+// The length may also come from X-Dat9-Content-Length, which is how a client that cannot set
+// Content-Length declares a small upload. It is still a bound: a body that keeps sending past
+// the declaration is cut off, not buffered.
+func TestWriteChunkedBodyUsesDeclaredLengthAsBound(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	// Declared 5 bytes, sends 20: the reader must stop at the declaration.
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/data/declared.txt", io.NopCloser(strings.NewReader("01234567890123456789")))
+	req.ContentLength = -1
+	req.Header.Set("X-Dat9-Content-Length", "5")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("declared-length overrun: status %d body %q, want %d", resp.StatusCode, body, http.StatusRequestEntityTooLarge)
+	}
+}
+
+// The read timeout must be configurable and must refuse nonsense rather than silently
+// disabling itself: a slow sender is exactly what it exists to stop.
+func TestServerReadTimeoutFromEnv(t *testing.T) {
+	if got := serverReadTimeout(); got != DefaultReadTimeout {
+		t.Fatalf("default read timeout = %s, want %s", got, DefaultReadTimeout)
+	}
+	t.Setenv("DRIVE9_SERVER_READ_TIMEOUT", "90s")
+	if got := serverReadTimeout(); got != 90*time.Second {
+		t.Fatalf("configured read timeout = %s, want 1m30s", got)
+	}
+	for _, bad := range []string{"0", "-1s", "not-a-duration"} {
+		t.Setenv("DRIVE9_SERVER_READ_TIMEOUT", bad)
+		if got := serverReadTimeout(); got != DefaultReadTimeout {
+			t.Fatalf("read timeout for %q = %s, want the default %s", bad, got, DefaultReadTimeout)
 		}
 	}
 }

@@ -151,6 +151,13 @@ func (e *OpenAIVideoTextExtractor) ExtractVideoText(ctx context.Context, req Vid
 // extractFrames writes video bytes to a temp file and uses FFmpeg to extract
 // JPEG frames at the configured interval.
 func (e *OpenAIVideoTextExtractor) extractFrames(ctx context.Context, data []byte, contentType string) ([][]byte, error) {
+	// Pin the demuxer to the routed container so ffmpeg's content probing cannot
+	// select hls/concat for a payload that is not the video we think it is, and
+	// refuse a type outside the allowlist instead of falling back to probing.
+	demuxer, err := mediaInputDemuxer(contentType)
+	if err != nil {
+		return nil, err
+	}
 	tmpDir, err := os.MkdirTemp("", "drive9-video-extract-*")
 	if err != nil {
 		return nil, fmt.Errorf("create temp dir: %w", err)
@@ -166,16 +173,22 @@ func (e *OpenAIVideoTextExtractor) extractFrames(ctx context.Context, data []byt
 	outputPattern := filepath.Join(tmpDir, "frame_%04d.jpg")
 	// Use fps filter to sample at 1/interval fps, then limit total frames via -frames:v
 	fpsFilter := fmt.Sprintf("fps=1/%d", e.frameInterval)
-	args := []string{
-		"-i", videoPath,
+	args := mediaInputArgs(demuxer, videoPath)
+	args = append(args,
 		"-vf", fpsFilter,
 		"-frames:v", fmt.Sprintf("%d", e.maxFrames),
 		"-q:v", "2", // JPEG quality
 		"-f", "image2",
 		outputPattern,
-	}
+	)
 
 	cmd := exec.CommandContext(ctx, e.ffmpegPath, args...)
+	// Run inside the staging directory with a fixed environment: relative and
+	// nested references the decoder might follow stay in the directory that holds
+	// this tenant's bytes, and the API server's own environment (master keys,
+	// tenant credentials) is not inherited by the child.
+	cmd.Dir = tmpDir
+	cmd.Env = mediaToolEnv(tmpDir)
 	cmd.Stderr = io.Discard
 	cmd.Stdout = io.Discard
 	if err := cmd.Run(); err != nil {

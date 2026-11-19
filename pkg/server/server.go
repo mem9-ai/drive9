@@ -1605,12 +1605,36 @@ func isLoopbackListenAddr(addr string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
+// DefaultReadTimeout bounds how long one request may spend sending its request line, headers
+// and body. It is deliberately generous — a legitimate JSON or inline PUT finishes in
+// milliseconds, and large uploads use presigned S3 URLs rather than this listener — but it
+// stops a slow sender from holding a connection (and the memory behind its body) forever.
+const DefaultReadTimeout = 10 * time.Minute
+
+// serverReadTimeout resolves the read timeout from the environment, so an operator with very
+// slow clients can raise it without a rebuild.
+func serverReadTimeout() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("DRIVE9_SERVER_READ_TIMEOUT"))
+	if raw == "" {
+		return DefaultReadTimeout
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		logger.Warn(backgroundWithTrace(context.Background()), "server_event",
+			eventFields(context.Background(), "server_invalid_read_timeout", "value", raw)...)
+		return DefaultReadTimeout
+	}
+	return d
+}
+
 func (s *Server) ListenAndServe(addr string) error {
-	logger.Info(backgroundWithTrace(context.Background()), "server_start", zap.String("addr", addr), zap.Int64("max_upload_bytes", s.maxUploadBytes))
+	readTimeout := serverReadTimeout()
+	logger.Info(backgroundWithTrace(context.Background()), "server_start", zap.String("addr", addr), zap.Int64("max_upload_bytes", s.maxUploadBytes), zap.Duration("read_timeout", readTimeout))
 	httpSrv := &http.Server{
 		Addr:              addr,
 		Handler:           s,
 		ReadHeaderTimeout: 15 * time.Second,
+		ReadTimeout:       readTimeout,
 		IdleTimeout:       2 * time.Minute,
 		MaxHeaderBytes:    1 << 20,
 		TLSConfig:         &tls.Config{MinVersion: tls.VersionTLS12},
@@ -2636,6 +2660,17 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 		}
 		cl = parsed
 	}
+	if cl < 0 {
+		// A chunked request carries no length the router can trust: r.ContentLength is -1
+		// and the caller declared none either. Two things go wrong if that is read anyway —
+		// the 413 check above compares -1 against the limit and passes, and the large-file
+		// branch is skipped, so the whole body is buffered in memory before its size is
+		// known. Require the length up front instead.
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_missing_length", "path", path)...)
+		metricEvent(r.Context(), "fs_write", "result", "error")
+		errJSON(w, http.StatusLengthRequired, "Content-Length or X-Dat9-Content-Length is required for PUT")
+		return
+	}
 	if cl > s.maxUploadBytes {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_too_large", "path", path, "bytes", cl, "max", s.maxUploadBytes)...)
 		metricEvent(r.Context(), "fs_write", "result", "error")
@@ -2715,7 +2750,10 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 		_ = json.NewEncoder(w).Encode(plan)
 		return
 	}
-	body := http.MaxBytesReader(w, r.Body, s.maxUploadBytes)
+	// Read at most what the caller declared: cl is a real length by now (a negative one is
+	// rejected above), so a body that keeps sending past it is cut off by the reader rather
+	// than buffered.
+	body := http.MaxBytesReader(w, r.Body, cl)
 	bodyReadStart := time.Now()
 	data, err := io.ReadAll(body)
 	bodyReadDuration = time.Since(bodyReadStart)
