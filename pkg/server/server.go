@@ -1606,9 +1606,13 @@ func isLoopbackListenAddr(addr string) bool {
 }
 
 // serverReadTimeout bounds how long one request may spend sending its request line, headers
-// and body. It is deliberately generous — a legitimate JSON or inline PUT finishes in
-// milliseconds, and large uploads use presigned S3 URLs rather than this listener — but it
-// stops a slow sender from holding a connection (and the memory behind its body) forever.
+// and body. It stops a slow sender from holding a connection (and the memory behind a body
+// that has not fully arrived) indefinitely, and it is deliberately generous: a legitimate
+// JSON or inline PUT finishes in milliseconds, and large uploads use presigned S3 URLs rather
+// than this listener. An S3-less deployment is the exception — IsLargeFile is false without
+// object storage, so a large inline PUT is streamed through this listener instead, and
+// serverReadTimeout then demands roughly maxUploadBytes/600 bytes per second sustained (about
+// 17 MiB/s at the default 10 GiB maximum). Raise it if that deployment shape is supported.
 const serverReadTimeout = 10 * time.Minute
 
 // newHTTPServer builds the listener's http.Server. readTimeout is a parameter rather than a
@@ -2668,10 +2672,14 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 		// and the caller declared none either. Two things go wrong if that is read anyway —
 		// the 413 check below compares -1 against the limit and passes, and the large-file
 		// branch is skipped, so the whole body is buffered in memory before its size is
-		// known. Require the length up front instead.
+		// known. Require the length up front instead, with the answer fs already gives for a
+		// length-less body: handleAppendLog refuses r.ContentLength < 0 as a 400
+		// ("Content-Length is required", fs/pkg/server/server.go:4187; the same rule stated as
+		// "Content-Length or X-Dat9-Content-Length is required" at :3764). A policy is needed
+		// here and there is no 411 precedent in fs to copy, so the code the sibling path uses
+		// wins over inventing a new status this service never returned.
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_missing_length", "path", path)...)
 		metricEvent(r.Context(), "fs_write", "result", "error")
-		// Same answer the append-log path already gives for a length-less body in fs.
 		errJSON(w, http.StatusBadRequest, "Content-Length or X-Dat9-Content-Length is required")
 		return
 	}
