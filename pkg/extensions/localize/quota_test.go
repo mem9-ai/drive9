@@ -11,6 +11,25 @@ import (
 	"github.com/mem9-ai/drive9/pkg/fs"
 )
 
+// admitHandle opens the backing file and books a handle write ending at end —
+// the production admission path (inode-keyed), so the tests cover the keys
+// mutators must reach.
+func admitHandle(t *testing.T, f *Localize, view string, end, writeLen int64) (writeReservation, *os.File) {
+	t.Helper()
+	rel := strings.TrimPrefix(view, "/")
+	path := filepath.Join(f.overlay.Root(), filepath.FromSlash(rel))
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o644)
+	if err != nil {
+		t.Fatalf("open backing file: %v", err)
+	}
+	t.Cleanup(func() { _ = file.Close() })
+	res, err := f.overlay.Quota().admitFileWrite(file, rel, end, writeLen)
+	if err != nil {
+		t.Fatalf("admitFileWrite: %v", err)
+	}
+	return res, file
+}
+
 // newQuotaRouter builds a router whose persistent overlay carries the given
 // byte quota. freeRatio 0 disables the free-space guard so the tests can drive
 // the byte cap without depending on the host disk.
@@ -323,12 +342,8 @@ func TestOverlayQuotaConcurrentAppendsChargeOncePerGrowth(t *testing.T) {
 	}
 	// Two admissions for the same target end, as two open handles appending
 	// concurrently would produce before either write reaches the file.
-	if _, err := q.admitWrite("repo/node_modules/appended.bin", 500, 400); err != nil {
-		t.Fatalf("first append admission: %v", err)
-	}
-	if _, err := q.admitWrite("repo/node_modules/appended.bin", 500, 400); err != nil {
-		t.Fatalf("second append admission: %v", err)
-	}
+	_, _ = admitHandle(t, f, "//repo/node_modules/appended.bin", 500, 400)
+	_, _ = admitHandle(t, f, "//repo/node_modules/appended.bin", 500, 400)
 	if got := q.Used(); got != 500 {
 		t.Fatalf("used after two admissions of the same growth = %d, want 500", got)
 	}
@@ -372,14 +387,8 @@ func TestOverlayQuotaSettleKeepsAnotherWritersLandedGrowth(t *testing.T) {
 		t.Fatal(err)
 	}
 	q := f.overlay.Quota()
-	resA, err := q.admitWrite("repo/node_modules/shared-append.bin", 500, 400)
-	if err != nil {
-		t.Fatalf("A admission: %v", err)
-	}
-	resB, err := q.admitWrite("repo/node_modules/shared-append.bin", 500, 400)
-	if err != nil {
-		t.Fatalf("B admission: %v", err)
-	}
+	resA, _ := admitHandle(t, f, "/repo/node_modules/shared-append.bin", 500, 400)
+	resB, _ := admitHandle(t, f, "/repo/node_modules/shared-append.bin", 500, 400)
 	if resA.admitted != 400 || resB.admitted != 0 {
 		t.Fatalf("admissions = %d/%d, want 400/0 (one growth, charged once)", resA.admitted, resB.admitted)
 	}
@@ -406,10 +415,7 @@ func TestOverlayQuotaFailedWriteSettlesAgainstResultingSize(t *testing.T) {
 	q := f.overlay.Quota()
 	// A one-byte write beyond EOF would grow the file to 501; it fails without
 	// landing a byte, so settling against the real 100-byte size refunds all.
-	res, err := q.admitWrite("repo/node_modules/hole.bin", 501, 1)
-	if err != nil {
-		t.Fatalf("admission: %v", err)
-	}
+	res, _ := admitHandle(t, f, "/repo/node_modules/hole.bin", 501, 1)
 	if res.admitted != 401 {
 		t.Fatalf("admitted = %d, want 401", res.admitted)
 	}
@@ -417,14 +423,11 @@ func TestOverlayQuotaFailedWriteSettlesAgainstResultingSize(t *testing.T) {
 	if got := q.Used(); got != 100 {
 		t.Fatalf("used after the failed write = %d, want 100", got)
 	}
-	if q.isReserved("path:" + strings.TrimPrefix(view, "/")) {
+	if q.hasBookingForPath(strings.TrimPrefix(view, "/")) {
 		t.Fatal("failed write left its booking behind")
 	}
 	// A retry must charge the growth again.
-	res2, err := q.admitWrite("repo/node_modules/hole.bin", 501, 1)
-	if err != nil {
-		t.Fatalf("retry admission: %v", err)
-	}
+	res2, _ := admitHandle(t, f, "/repo/node_modules/hole.bin", 501, 1)
 	if res2.admitted != 401 {
 		t.Fatalf("retry admitted = %d, want 401", res2.admitted)
 	}
@@ -440,7 +443,7 @@ func TestOverlayQuotaSettledWriteChargesOnce(t *testing.T) {
 	}
 	rel := strings.TrimPrefix(view, "/")
 	q := f.overlay.Quota()
-	if q.isReserved("path:" + rel) {
+	if q.hasBookingForPath(rel) {
 		t.Fatal("a completed write left a booking")
 	}
 	// Overwrite inside the file: no growth, no charge.
@@ -467,7 +470,7 @@ func TestOverlayQuotaTruncateRecreateChargesAgain(t *testing.T) {
 	if got := q.Used(); got != 500 {
 		t.Fatalf("used after first save = %d, want 500", got)
 	}
-	if q.isReserved("path:" + strings.TrimPrefix(view, "/")) {
+	if q.hasBookingForPath(strings.TrimPrefix(view, "/")) {
 		t.Fatal("a completed write left a booking")
 	}
 	// Re-create the path with O_TRUNC (the ordinary save cycle).
@@ -498,16 +501,14 @@ func TestOverlayQuotaRenameRetiresBothNames(t *testing.T) {
 	}
 	q := f.overlay.Quota()
 	// A live booking on the source, as an in-flight writer would hold.
-	if _, err := q.admitWrite("repo/node_modules/r-src.bin", 800, 500); err != nil {
-		t.Fatalf("book: %v", err)
-	}
+	_, _ = admitHandle(t, f, "//repo/node_modules/r-src.bin", 800, 500)
 	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpRename, Path: src, Path2: dst}); err != nil {
 		t.Fatalf("rename: %v", err)
 	}
-	if q.isReserved("path:" + strings.TrimPrefix(src, "/")) {
+	if q.hasBookingForPath(strings.TrimPrefix(src, "/")) {
 		t.Fatal("rename left the source name's booking behind")
 	}
-	if q.isReserved("path:" + strings.TrimPrefix(dst, "/")) {
+	if q.hasBookingForPath(strings.TrimPrefix(dst, "/")) {
 		t.Fatal("rename left the destination name's booking behind")
 	}
 }
@@ -523,14 +524,8 @@ func TestOverlayQuotaAbortedBookingsReconcileToDisk(t *testing.T) {
 		t.Fatal(err)
 	}
 	q := f.overlay.Quota()
-	resA, err := q.admitWrite("repo/node_modules/aborted.bin", 600, 500)
-	if err != nil {
-		t.Fatalf("A admission: %v", err)
-	}
-	resB, err := q.admitWrite("repo/node_modules/aborted.bin", 600, 500)
-	if err != nil {
-		t.Fatalf("B admission: %v", err)
-	}
+	resA, _ := admitHandle(t, f, "/repo/node_modules/aborted.bin", 600, 500)
+	resB, _ := admitHandle(t, f, "/repo/node_modules/aborted.bin", 600, 500)
 	if got := q.Used(); got != 600 {
 		t.Fatalf("used while both are in flight = %d, want 600", got)
 	}
@@ -542,7 +537,7 @@ func TestOverlayQuotaAbortedBookingsReconcileToDisk(t *testing.T) {
 	if got := q.Used(); got != 100 {
 		t.Fatalf("used after the last settle = %d, want 100 (the real file size)", got)
 	}
-	if q.isReserved("path:" + strings.TrimPrefix(rel, "/")) {
+	if q.hasBookingForPath(strings.TrimPrefix(rel, "/")) {
 		t.Fatal("booking survived its last settle")
 	}
 }
@@ -559,20 +554,14 @@ func TestOverlayQuotaSettlementUsesBookingIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	q := f.overlay.Quota()
-	resA, err := q.admitWrite("repo/node_modules/race.bin", 500, 400)
-	if err != nil {
-		t.Fatalf("A admission: %v", err)
-	}
+	resA, _ := admitHandle(t, f, "/repo/node_modules/race.bin", 500, 400)
 	// A's WriteAt lands, but A has not settled yet.
 	if err := os.WriteFile(path, make([]byte, 500), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	// B admits in that window; the file has caught up with A's booking, so B
 	// starts a fresh one and A's booking is retired.
-	resB, err := q.admitWrite("repo/node_modules/race.bin", 900, 400)
-	if err != nil {
-		t.Fatalf("B admission: %v", err)
-	}
+	resB, _ := admitHandle(t, f, "/repo/node_modules/race.bin", 900, 400)
 	// A settles AFTER B admitted: it must not close B's booking.
 	q.settleWrite(resA)
 	if got := q.Used(); got != 900 {
@@ -586,7 +575,78 @@ func TestOverlayQuotaSettlementUsesBookingIdentity(t *testing.T) {
 	if got := q.Used(); got != 900 {
 		t.Fatalf("used after B settles = %d, want 900", got)
 	}
-	if q.isReserved("path:" + strings.TrimPrefix(rel, "/")) {
+	if q.hasBookingForPath(strings.TrimPrefix(rel, "/")) {
 		t.Fatal("booking survived its last settle")
+	}
+}
+
+// TestOverlayQuotaTruncateRetiresHandleBooking pins that mutation retirement
+// reaches PRODUCTION admissions: a handle write books by inode, and a
+// truncating recreate of the same path must retire it (otherwise its end
+// watermark survives over a file reset to zero and the next write is not
+// charged).
+func TestOverlayQuotaTruncateRetiresHandleBooking(t *testing.T) {
+	f := newQuotaRouter(t, 2000)
+	const view = "/repo/node_modules/retire-ino.bin"
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: view, Offset: 0, Data: make([]byte, 100)}); err != nil {
+		t.Fatal(err)
+	}
+	q := f.overlay.Quota()
+	// An in-flight handle writer books 100 -> 600.
+	_, _ = admitHandle(t, f, view, 600, 500)
+	if !q.hasBookingForPath(strings.TrimPrefix(view, "/")) {
+		t.Fatal("handle booking not indexed by path")
+	}
+	if got := q.Used(); got != 600 {
+		t.Fatalf("used with the booking in flight = %d, want 600", got)
+	}
+	// The ordinary editor save: recreate the path with O_TRUNC.
+	res, err := doOp(t, f, &fs.Op{Kind: fs.OpCreate, Path: view, Flags: uint32(syscall.O_RDWR | syscall.O_CREAT | syscall.O_TRUNC), Mode: 0o644})
+	if err != nil {
+		t.Fatalf("re-create: %v", err)
+	}
+	h := res.Handle
+	if q.hasBookingForPath(strings.TrimPrefix(view, "/")) {
+		t.Fatal("truncating recreate did not retire the inode-keyed booking")
+	}
+	if got := q.Used(); got != 0 {
+		t.Fatalf("used after the truncating recreate = %d, want 0", got)
+	}
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: view, Handle: h, Offset: 0, Data: make([]byte, 400)}); err != nil {
+		t.Fatalf("write after recreate: %v", err)
+	}
+	if got := q.Used(); got != 400 {
+		t.Fatalf("used after writing 400 = %d, want 400", got)
+	}
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpRelease, Path: view, Handle: h}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestOverlayQuotaResizeRetiresHandleBookingOnce: a shrink retires a handle
+// writer's booking against the pre-resize size, so the writer's later settle
+// cannot refund the shrink a second time.
+func TestOverlayQuotaResizeRetiresHandleBookingOnce(t *testing.T) {
+	f := newQuotaRouter(t, 2000)
+	const view = "/repo/node_modules/resize-ino.bin"
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: view, Offset: 0, Data: make([]byte, 100)}); err != nil {
+		t.Fatal(err)
+	}
+	q := f.overlay.Quota()
+	res, _ := admitHandle(t, f, view, 600, 500)
+	if got := q.Used(); got != 600 {
+		t.Fatalf("used with the booking in flight = %d, want 600", got)
+	}
+	// A concurrent truncate to 50 bytes: retire at 100, release the 50 freed.
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpSetAttr, Path: view, Size: 50}); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	if got := q.Used(); got != 50 {
+		t.Fatalf("used after the shrink = %d, want 50", got)
+	}
+	// The writer's settlement must not refund the shrink again.
+	q.settleWrite(res)
+	if got := q.Used(); got != 50 {
+		t.Fatalf("used after the writer settles = %d, want 50 (no double refund)", got)
 	}
 }

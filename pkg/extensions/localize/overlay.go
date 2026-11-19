@@ -57,20 +57,14 @@ func (o *Overlay) Quota() *overlayQuota {
 	return o.quota
 }
 
-// AdmitWrite reserves the space a PATH-addressed write of writeLen bytes ending
-// at end needs, accounting the bytes the backing file already holds. An in-place
-// overwrite reserves no byte quota (but is still checked against the free-space
-// floor). The reservation carries the admitted bytes and the starting size, so a
-// write that fails part-way can settle against the bytes that actually exist.
-// ENOSPC means the quota or the host free-space guard refused.
-func (o *Overlay) AdmitWrite(viewPath string, end, writeLen int64) (writeReservation, error) {
-	var res writeReservation
-	err := o.withQuota(viewPath, func(q *overlayQuota, rel string) error {
-		var qerr error
-		res, qerr = q.admitWrite(rel, end, writeLen)
-		return qerr
+// ChargeGrowth reserves growth for a TRUNCATING path write, which has no base a
+// booking could settle against (the file is about to be reset): the caller
+// releases the unlanded remainder. ENOSPC means the quota or the free-space
+// floor refused.
+func (o *Overlay) ChargeGrowth(viewPath string, growth int64) error {
+	return o.withQuota(viewPath, func(q *overlayQuota, _ string) error {
+		return q.charge(growth)
 	})
-	return res, err
 }
 
 // AdmitFileWrite reserves the space a write through an OPEN descriptor needs.
@@ -419,11 +413,13 @@ func (o *Overlay) Rename(oldPath, newPath string) error {
 	// the same inode frees nothing, so the identities are compared first.
 	replacedBytes, releaseDest := int64(0), false
 	srcSize, srcKnown := int64(0), false
+	dstSize, dstKnown := int64(0), false
 	if o.quota != nil {
 		if srcInfo, serr := os.Lstat(oldAbs); serr == nil && srcInfo.Mode().IsRegular() {
 			srcSize, srcKnown = srcInfo.Size(), true
 		}
 		if dstInfo, derr := os.Lstat(newAbs); derr == nil && dstInfo.Mode().IsRegular() {
+			dstSize, dstKnown = dstInfo.Size(), true
 			sameInode := false
 			if srcInfo, serr := os.Lstat(oldAbs); serr == nil {
 				sameInode = os.SameFile(srcInfo, dstInfo)
@@ -444,14 +440,17 @@ func (o *Overlay) Rename(oldPath, newPath string) error {
 		if releaseDest {
 			o.ReleaseBytes(replacedBytes)
 		}
-		// Both names' bookings are retired against the size the rename moved
-		// (measured before it): the source name no longer exists, and the
-		// destination now holds the source's bytes. A recreate at either name
-		// charges from disk again.
+		// Each name's bookings are retired against THAT NAME's pre-rename size:
+		// the source name is gone (its writers were measured at srcSize) and the
+		// replaced destination's writers were measured at dstSize (0 when
+		// nothing was replaced). Using the source's size for the destination
+		// over-refunded by dstSize-srcSize.
 		if srcKnown {
 			o.RetirePath(oldPath, srcSize)
-			o.RetirePath(newPath, srcSize)
-		} else {
+		}
+		if dstKnown {
+			o.RetirePath(newPath, dstSize)
+		} else if !srcKnown {
 			o.RetirePathNow(newPath)
 		}
 	}

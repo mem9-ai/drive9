@@ -430,18 +430,23 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 				}
 				newSize := int64(len(op.Data))
 				oldSize, _ := o.Size(op.Path)
+				growth := newSize - oldSize
+				if growth < 0 {
+					growth = 0
+				}
+				// Retire any in-flight writers of this name against the
+				// pre-truncate size: the truncate destroys the base they were
+				// booked over, and their own settlements reconcile from here.
+				o.RetirePath(op.Path, oldSize)
 				// Reserve the replacement BEFORE the truncating open: a refused
 				// write must leave the existing file intact, not truncated.
-				res, aerr := o.AdmitWrite(op.Path, newSize, newSize)
-				if aerr != nil {
+				if aerr := o.ChargeGrowth(op.Path, growth); aerr != nil {
 					return fs.Result{}, aerr
 				}
 				fh, err := o.OpenFile(op.Path, syscall.O_WRONLY|syscall.O_CREAT|syscall.O_TRUNC, mode)
 				if err != nil {
-					// The file is untouched: settle the reservation against its
-					// unchanged size (refunds the growth AND clears the reserved
-					// end, so a retry charges again).
-					o.SettleWrite(res)
+					// The file is untouched: hand the reservation back.
+					o.ReleaseBytes(growth)
 					return fs.Result{}, err
 				}
 				if oldSize > newSize {
@@ -451,17 +456,14 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 				written, werr := fh.Write(op.Data)
 				cerr := fh.Close()
 				if werr != nil {
-					// The truncating open already dropped the old image, so the
-					// truncate baseline is zero: release everything the partial
-					// write did not land and retire the booking.
+					// The truncate baseline is zero: release everything the
+					// partial write did not land, so the charge equals the bytes
+					// on disk (a retry charges again).
 					if release := newSize - int64(written); release > 0 {
 						o.ReleaseBytes(release)
 					}
 					return fs.Result{}, werr
 				}
-				// Retire the booking (the landed bytes stay charged and leave
-				// the free-space window).
-				o.SettleWrite(res)
 				if cerr != nil {
 					return fs.Result{}, cerr
 				}

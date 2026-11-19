@@ -4,7 +4,6 @@ package localize
 
 import (
 	iofs "io/fs"
-	"os"
 	"strconv"
 	"syscall"
 )
@@ -26,14 +25,10 @@ func linkedFileIdentity(info iofs.FileInfo) (fileIdentity, bool) {
 	return fileIdentity{dev: uint64(st.Dev), ino: uint64(st.Ino)}, true
 }
 
-// fileReservationKey returns the reservation key for an open descriptor (its
-// device+inode, so a rename or a hardlink alias keeps addressing the same
-// file), with the path as the fallback when the platform exposes no identity.
-func fileReservationKey(f *os.File, rel string) (string, bool) {
-	info, err := f.Stat()
-	if err != nil {
-		return "", false
-	}
+// fileReservationKey returns the reservation key for an already-fetched
+// FileInfo (its device+inode, so a rename or a hardlink alias keeps addressing
+// the same file). Callers derive it from the same stat they use for the size.
+func fileReservationKey(info iofs.FileInfo) (string, bool) {
 	st, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
 		return "", false

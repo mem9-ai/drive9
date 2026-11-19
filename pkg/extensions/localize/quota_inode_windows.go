@@ -2,10 +2,7 @@
 
 package localize
 
-import (
-	iofs "io/fs"
-	"os"
-)
+import iofs "io/fs"
 
 // fileIdentity is unused on Windows: the platform exposes no stable inode
 // identity through FileInfo, so the usage walk counts every name.
@@ -20,6 +17,6 @@ func linkedFileIdentity(iofs.FileInfo) (fileIdentity, bool) {
 	return fileIdentity{}, false
 }
 
-// fileReservationKey falls back to the path on Windows: FileInfo exposes no
-// stable file identity there.
-func fileReservationKey(_ *os.File, _ string) (string, bool) { return "", false }
+// fileReservationKey always reports "no identity" on Windows: FileInfo exposes
+// no stable file identity there, so the path key is used.
+func fileReservationKey(iofs.FileInfo) (string, bool) { return "", false }

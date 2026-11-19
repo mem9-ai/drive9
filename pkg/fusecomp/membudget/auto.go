@@ -152,15 +152,23 @@ func walkMemoryLimits(dir, root string, names ...string) (int64, string) {
 		bestSource string
 	)
 	for {
+		// First name that parses wins at THIS level: the hybrid probe exists for
+		// layout differences, and a real child cgroup that happens to be called
+		// "memory" must not contribute its own (tighter) cap.
 		for _, name := range names {
 			path := filepath.Join(dir, name)
 			raw, err := readLimitFile(path)
 			if err != nil {
 				continue
 			}
-			if value, ok := parseCgroupLimit(string(raw)); ok && (best == 0 || value < best) {
+			value, ok := parseCgroupLimit(string(raw))
+			if !ok {
+				continue
+			}
+			if best == 0 || value < best {
 				best, bestSource = value, path
 			}
+			break
 		}
 		if dir == root || dir == "/" || len(dir) <= len(root) {
 			break
