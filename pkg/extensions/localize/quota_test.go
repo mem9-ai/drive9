@@ -9,6 +9,7 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/mem9-ai/drive9/pkg/fs"
 )
@@ -30,6 +31,41 @@ func admitHandle(t *testing.T, f *Localize, view string, end, writeLen int64) (w
 		t.Fatalf("admitFileWrite: %v", err)
 	}
 	return res, file
+}
+
+// runConcurrently runs the jobs in parallel and returns the first real failure
+// (a missing-file race is expected in these hammers and is not one).
+func runConcurrently(jobs ...func() error) error {
+	var wg sync.WaitGroup
+	errs := make(chan error, len(jobs))
+	for _, job := range jobs {
+		wg.Add(1)
+		go func(job func() error) {
+			defer wg.Done()
+			if err := job(); err != nil && !fs.IsNotFound(err) && !errors.Is(err, syscall.ENOENT) {
+				errs <- err
+			}
+		}(job)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		return err
+	}
+	return nil
+}
+
+// pathWriteLoop replaces view rounds times, the production handle-less shape.
+func pathWriteLoop(f *Localize, view string, rounds, seed int) func() error {
+	return func() error {
+		for i := 0; i < rounds; i++ {
+			n := 256 + (i*97+seed*13)%1500
+			if _, err := doOpNoT(f, &fs.Op{Kind: fs.OpWrite, Path: view, Offset: 0, Data: make([]byte, n)}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 }
 
 // doOpNoT runs one op without a *testing.T, so background goroutines can drive
@@ -1005,6 +1041,224 @@ func TestOverlayQuotaConcurrentPathWritesStayExact(t *testing.T) {
 			t.Fatalf("used = %d, want the inode's on-disk size %d", got, info.Size())
 		}
 	})
+}
+
+// TestReplaceLockStripesAreDisjoint: the name and identity stripes must come
+// from disjoint pools. Sharing one pool makes "name before identity" a
+// per-writer order rather than a global one, so two writers whose stripes cross
+// (X's name stripe is the mutex serving Y's identity stripe and vice versa)
+// deadlock each other and wedge the mount.
+func TestReplaceLockStripesAreDisjoint(t *testing.T) {
+	o := &Overlay{}
+	for _, key := range []string{
+		"path:/repo/node_modules/crossed.bin",
+		"path:/repo/node_modules/other.bin",
+		"ino:1:2",
+		"ino:2049:99999",
+	} {
+		if o.nameStripe(key) == o.idStripe(key) {
+			t.Fatalf("stripe for %q is shared between the name and identity pools: a crossed pair of writers deadlocks", key)
+		}
+	}
+}
+
+// TestReplaceLocksSerializeMutations: two mutations of overlapping targets must
+// not run at once, in either argument order (the keys are acquired sorted), and
+// releasing the first must hand the targets to the second.
+func TestReplaceLocksSerializeMutations(t *testing.T) {
+	o := &Overlay{}
+	unlockA := o.ReplaceLocks("/repo/a.bin", "/repo/b.bin")
+	acquired := make(chan struct{})
+	go func() {
+		unlockB := o.ReplaceLocks("/repo/b.bin", "/repo/a.bin")
+		close(acquired)
+		unlockB()
+	}()
+	select {
+	case <-acquired:
+		t.Fatal("second mutation acquired the targets while the first held them")
+	case <-time.After(50 * time.Millisecond):
+	}
+	unlockA()
+	select {
+	case <-acquired:
+	case <-time.After(5 * time.Second):
+		t.Fatal("second mutation never acquired the released targets")
+	}
+}
+
+// TestOverlayQuotaConcurrentMutatorsStayExact: the other mutations that reset or
+// destroy a backing target (truncating create, truncate, unlink, rename, link)
+// race handle-less writers. Each takes the same mutation locks, so after the
+// hammer `used` must equal the bytes actually in the backing tree.
+func TestOverlayQuotaConcurrentMutatorsStayExact(t *testing.T) {
+	check := func(t *testing.T, f *Localize) {
+		t.Helper()
+		used := f.overlay.Quota().Used()
+		disk, err := f.overlay.Quota().measure()
+		if err != nil {
+			t.Fatalf("measure: %v", err)
+		}
+		if used != disk {
+			t.Fatalf("used = %d, want the %d bytes in the backing tree", used, disk)
+		}
+	}
+
+	t.Run("truncating create vs writes", func(t *testing.T) {
+		f := newQuotaRouter(t, 10<<20)
+		const view = "/repo/node_modules/mixed-create.bin"
+		if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: view, Offset: 0, Data: make([]byte, 512)}); err != nil {
+			t.Fatal(err)
+		}
+		editorSaves := func(rounds int) func() error {
+			return func() error {
+				for i := 0; i < rounds; i++ {
+					res, err := doOpNoT(f, &fs.Op{Kind: fs.OpCreate, Path: view,
+						Flags: uint32(syscall.O_RDWR | syscall.O_CREAT | syscall.O_TRUNC), Mode: 0o644})
+					if err != nil {
+						return err
+					}
+					if _, err := doOpNoT(f, &fs.Op{Kind: fs.OpRelease, Path: view, Handle: res.Handle}); err != nil {
+						return err
+					}
+				}
+				return nil
+			}
+		}
+		err := runConcurrently(
+			pathWriteLoop(f, view, 60, 1), pathWriteLoop(f, view, 60, 2),
+			editorSaves(60), editorSaves(60),
+		)
+		if err != nil {
+			t.Fatalf("hammer: %v", err)
+		}
+		check(t, f)
+	})
+
+	t.Run("truncate vs writes", func(t *testing.T) {
+		f := newQuotaRouter(t, 10<<20)
+		const view = "/repo/node_modules/mixed-truncate.bin"
+		if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: view, Offset: 0, Data: make([]byte, 512)}); err != nil {
+			t.Fatal(err)
+		}
+		truncates := func(rounds, seed int) func() error {
+			return func() error {
+				for i := 0; i < rounds; i++ {
+					size := int64((i*37 + seed*11) % 900)
+					if _, err := doOpNoT(f, &fs.Op{Kind: fs.OpSetAttr, Path: view, Size: size}); err != nil {
+						return err
+					}
+				}
+				return nil
+			}
+		}
+		err := runConcurrently(
+			pathWriteLoop(f, view, 60, 3), pathWriteLoop(f, view, 60, 4),
+			truncates(60, 5), truncates(60, 6),
+		)
+		if err != nil {
+			t.Fatalf("hammer: %v", err)
+		}
+		check(t, f)
+	})
+
+	t.Run("unlink vs writes", func(t *testing.T) {
+		f := newQuotaRouter(t, 10<<20)
+		const view = "/repo/node_modules/mixed-unlink.bin"
+		if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: view, Offset: 0, Data: make([]byte, 512)}); err != nil {
+			t.Fatal(err)
+		}
+		unlinks := func(rounds int) func() error {
+			return func() error {
+				for i := 0; i < rounds; i++ {
+					if _, err := doOpNoT(f, &fs.Op{Kind: fs.OpUnlink, Path: view}); err != nil && !fs.IsNotFound(err) {
+						return err
+					}
+				}
+				return nil
+			}
+		}
+		err := runConcurrently(
+			pathWriteLoop(f, view, 60, 7), pathWriteLoop(f, view, 60, 8),
+			pathWriteLoop(f, view, 60, 9), unlinks(60),
+		)
+		if err != nil {
+			t.Fatalf("hammer: %v", err)
+		}
+		check(t, f)
+	})
+
+	t.Run("rename vs writes", func(t *testing.T) {
+		f := newQuotaRouter(t, 10<<20)
+		const a = "/repo/node_modules/mixed-rename-a.bin"
+		const b = "/repo/node_modules/mixed-rename-b.bin"
+		if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: a, Offset: 0, Data: make([]byte, 512)}); err != nil {
+			t.Fatal(err)
+		}
+		flip := func(rounds int) func() error {
+			return func() error {
+				src, dst := a, b
+				for i := 0; i < rounds; i++ {
+					if _, err := doOpNoT(f, &fs.Op{Kind: fs.OpRename, Path: src, Path2: dst}); err != nil && !fs.IsNotFound(err) {
+						return err
+					}
+					src, dst = dst, src
+				}
+				return nil
+			}
+		}
+		err := runConcurrently(
+			pathWriteLoop(f, a, 60, 10), pathWriteLoop(f, b, 60, 11),
+			flip(60),
+		)
+		if err != nil {
+			t.Fatalf("hammer: %v", err)
+		}
+		check(t, f)
+	})
+
+	t.Run("link vs unlink", func(t *testing.T) {
+		f := newQuotaRouter(t, 10<<20)
+		const a = "/repo/node_modules/mixed-link-a.bin"
+		const b = "/repo/node_modules/mixed-link-b.bin"
+		if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: a, Offset: 0, Data: make([]byte, 700)}); err != nil {
+			t.Fatal(err)
+		}
+		links := func(rounds int) func() error {
+			return func() error {
+				for i := 0; i < rounds; i++ {
+					if _, err := doOpNoT(f, &fs.Op{Kind: fs.OpLink, Path: a, Path2: b}); err != nil && !errors.Is(err, syscall.EEXIST) && !fs.IsNotFound(err) {
+						return err
+					}
+					if _, err := doOpNoT(f, &fs.Op{Kind: fs.OpUnlink, Path: b}); err != nil && !fs.IsNotFound(err) {
+						return err
+					}
+				}
+				return nil
+			}
+		}
+		// The dangerous window is the unlink's release decision: it reads the
+		// link count, and a link landing between that read and the unlink makes
+		// it release bytes a surviving alias still holds.
+		unlinks := func(rounds int) func() error {
+			return func() error {
+				for i := 0; i < rounds; i++ {
+					if _, err := doOpNoT(f, &fs.Op{Kind: fs.OpUnlink, Path: a}); err != nil && !fs.IsNotFound(err) {
+						return err
+					}
+					if _, err := doOpNoT(f, &fs.Op{Kind: fs.OpWrite, Path: a, Offset: 0, Data: make([]byte, 700)}); err != nil {
+						return err
+					}
+				}
+				return nil
+			}
+		}
+		if err := runConcurrently(links(200), unlinks(200)); err != nil {
+			t.Fatalf("hammer: %v", err)
+		}
+		check(t, f)
+	})
+
 }
 
 // TestOverlayQuotaStatFailureResolvesThePoolOnce: when a write's settlement

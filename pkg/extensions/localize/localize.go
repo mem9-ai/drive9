@@ -307,23 +307,33 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 			// forbids WriteAt on O_APPEND descriptors — open the backing
 			// file without it and keep writing at the kernel offsets.
 			flags := op.Flags &^ uint32(syscall.O_APPEND)
-			// A truncating open frees the old bytes; read the size before the
-			// open makes it 0.
+			// A truncating open destroys the image a concurrent writer is
+			// landing, so it takes the target's mutation lock for the whole
+			// snapshot -> truncate -> release sequence. Without the quota there
+			// is nothing to settle and nothing to serialize for.
+			truncating := o.Quota() != nil && flags&uint32(syscall.O_TRUNC) != 0
 			oldSize := int64(0)
-			if flags&uint32(syscall.O_TRUNC) != 0 {
+			unlock := func() {}
+			if truncating {
+				unlock = o.ReplaceLock(op.Path)
+				// A truncating open frees the old bytes; read the size before
+				// the open makes it 0.
 				oldSize, _ = o.Size(op.Path)
 			}
 			file, err := o.OpenFile(op.Path, flags, op.Mode&0o7777)
+			if truncating {
+				if err == nil && oldSize > 0 {
+					// The opening truncated the backing file: retire any
+					// in-flight booking against the pre-truncate size (so its
+					// writer's settle cannot refund the shrink again), then give
+					// its bytes back to the quota before the new content charges.
+					o.RetireMutation(op.Path, oldSize, 0)
+					o.ReleaseBytes(oldSize)
+				}
+				unlock()
+			}
 			if err != nil {
 				return fs.Result{}, err
-			}
-			if oldSize > 0 {
-				// The opening truncated the backing file: retire any in-flight
-				// booking against the pre-truncate size (so its writer's settle
-				// cannot refund the shrink again), then give its bytes back to
-				// the quota before the new content charges.
-				o.RetireMutation(op.Path, oldSize, 0)
-				o.ReleaseBytes(oldSize)
 			}
 			f.noteDBOpen(op.Path)
 			tok := &token{file: file, path: op.Path, ov: o, onRelease: f.noteDBClose}
@@ -571,6 +581,14 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 			return res, nil
 		}
 		if o := f.overlayFor(ctx, inner, op.Path, false); o != nil {
+			// An unlink destroys the inode a concurrent writer is landing: it
+			// takes the target's mutation lock for the whole
+			// snapshot -> unlink -> settle sequence.
+			unlock := func() {}
+			if o.Quota() != nil {
+				unlock = o.ReplaceLock(op.Path)
+			}
+			defer unlock()
 			info, err := o.Lstat(op.Path)
 			if err != nil {
 				return fs.Result{}, err
@@ -647,6 +665,14 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 				}
 			}
 			if op.Size >= 0 {
+				// A truncate destroys the image a concurrent writer is landing:
+				// it takes the target's mutation lock for the whole
+				// admit -> truncate -> settle sequence.
+				unlock := func() {}
+				if o.Quota() != nil {
+					unlock = o.ReplaceLock(op.Path)
+				}
+				defer unlock()
 				// Growing needs quota; shrinking returns it. A truncate that
 				// then fails leaves the file unchanged, so the reservation is
 				// undone (a failed grow must not leave a phantom charge, and a
@@ -773,8 +799,17 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 				f.linkLocalSpecial(op.Path2, op.Path)
 				return res, nil
 			}
-			if err := f.overlay.Link(op.Path, op.Path2); err != nil {
-				return fs.Result{}, err
+			// A link changes the inode's link count, which the unlink and rename
+			// release decisions read: it takes the same mutation locks so those
+			// decisions cannot be made against a count that is about to move.
+			unlink := func() {}
+			if f.overlay.Quota() != nil {
+				unlink = f.overlay.ReplaceLocks(op.Path, op.Path2)
+			}
+			lerr := f.overlay.Link(op.Path, op.Path2)
+			unlink()
+			if lerr != nil {
+				return fs.Result{}, lerr
 			}
 			// Reply with the link's REAL attributes: an empty result made
 			// the facade answer size=0/0644/nlink=1 for an existing file.

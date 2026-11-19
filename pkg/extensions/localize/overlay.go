@@ -6,6 +6,7 @@ import (
 	iofs "io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -20,14 +21,20 @@ import (
 // valid disabled overlay (operations fail with EIO through abs).
 type Overlay struct {
 	root string
-	// replaceLocks serialize TRUNCATING path writes per backing target. Two
-	// handle-less writes to one name (or to two names for the same file) each
-	// reset the image the other is landing, so their snapshot -> charge ->
-	// truncate -> settle sequence must not interleave: the second snapshot
-	// would describe an image the first already destroyed, and the destroyed
-	// image's charge could never be returned. Striped so unrelated names do
-	// not allocate or contend.
-	replaceLocks [64]sync.Mutex
+	// nameLocks and idLocks serialize the mutations that reset or destroy a
+	// backing target: two such mutations to one name (or to two names for the
+	// same file) each destroy the image the other is landing, so their
+	// snapshot -> charge -> mutate -> settle sequence must not interleave — the
+	// second snapshot would describe an image the first already destroyed, and
+	// the destroyed image's charge could never be returned.
+	//
+	// They are TWO disjoint pools on purpose: every name acquisition draws from
+	// nameLocks and every identity acquisition from idLocks, so "name before
+	// identity" is a global two-level order. One shared pool would let two
+	// writers' stripes cross (X's name stripe being the mutex that serves Y's
+	// identity stripe and vice versa) and deadlock them on first contact.
+	nameLocks [64]sync.Mutex
+	idLocks   [64]sync.Mutex
 	// quota bounds the backing tree's bytes and the host filesystem's free
 	// space (nil disables both). The local overlay writes straight to the
 	// host disk, so this is the only guard between a local-only subtree and
@@ -67,45 +74,95 @@ func (o *Overlay) Quota() *overlayQuota {
 	return o.quota
 }
 
-// ReplaceLock serializes the truncating path-write sequence for viewPath's
-// backing target and returns its release function. Every writer to one NAME
-// takes the name's stripe first, so two concurrent creates of one path cannot
-// slip past each other through the missing-file window; when the file already
-// exists its identity stripe is taken too, so two hardlink aliases (or a rename
-// that keeps the inode) share one lock. Name first, identity second, and nothing
-// takes a name stripe while holding an identity stripe, so the two do not
-// deadlock.
-//
-// Callers must hold it across the size snapshot, the charge, the truncating
-// open, the settle and the retire: a post-hoc re-stat cannot repair a snapshot
-// taken against an image another writer already destroyed.
+// ReplaceLock serializes the mutation sequence for one backing target and
+// returns its release function.
 func (o *Overlay) ReplaceLock(viewPath string) (unlock func()) {
+	return o.ReplaceLocks(viewPath)
+}
+
+// ReplaceLocks serializes the mutate-and-account sequence of every operation
+// that resets or destroys a backing target (a truncating path write, a
+// truncating create, a truncate, an unlink, a rename), and returns its release
+// function. Mutations of one target therefore serialize against writers of the
+// same target and against each other, which is what keeps each mutation's size
+// snapshot true: the snapshot, the syscall and the quota settlement happen under
+// one lock.
+//
+// Locks are taken in two levels: every NAME stripe first, in sorted key order,
+// then every IDENTITY stripe of the files that exist, also sorted, from a
+// disjoint pool. Two renames that cross (A→B and B→A) therefore cannot cycle,
+// and neither can a name and an identity stripe. Two names of one inode share
+// the identity stripe, so hardlink aliases serialize too.
+//
+// The identity probe runs under the name locks: a name's identity can only
+// change through a mutation of that name, and every such mutation takes the
+// name stripe.
+func (o *Overlay) ReplaceLocks(viewPaths ...string) (unlock func()) {
 	if o == nil {
 		return func() {}
 	}
-	nameMu := o.replaceLockStripe("path:" + viewPath)
-	nameMu.Lock()
-	unlock = nameMu.Unlock
-	if info, err := o.Lstat(viewPath); err == nil {
-		if id, ok := fileReservationKey(info); ok {
-			if idMu := o.replaceLockStripe(id); idMu != nameMu {
-				idMu.Lock()
-				releaseName := unlock
-				unlock = func() {
-					idMu.Unlock()
-					releaseName()
-				}
-			}
+	names := make([]string, 0, len(viewPaths))
+	seen := make(map[string]struct{}, len(viewPaths))
+	for _, p := range viewPaths {
+		key := "path:" + p
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		names = append(names, key)
+	}
+	sort.Strings(names)
+	held := make([]*sync.Mutex, 0, 2*len(names))
+	for _, key := range names {
+		mu := o.nameStripe(key)
+		mu.Lock()
+		held = append(held, mu)
+	}
+	ids := make([]string, 0, len(viewPaths))
+	seen = make(map[string]struct{}, len(viewPaths))
+	for _, p := range viewPaths {
+		info, err := o.Lstat(p)
+		if err != nil {
+			continue
+		}
+		id, ok := fileReservationKey(info)
+		if !ok {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, key := range ids {
+		mu := o.idStripe(key)
+		mu.Lock()
+		held = append(held, mu)
+	}
+	return func() {
+		for i := len(held) - 1; i >= 0; i-- {
+			held[i].Unlock()
 		}
 	}
-	return unlock
 }
 
-// replaceLockStripe maps a lock key onto the striped mutex array.
-func (o *Overlay) replaceLockStripe(key string) *sync.Mutex {
+// nameStripe maps a name lock key onto the name pool.
+func (o *Overlay) nameStripe(key string) *sync.Mutex {
+	return &o.nameLocks[lockStripeIndex(key, len(o.nameLocks))]
+}
+
+// idStripe maps an identity lock key onto the identity pool.
+func (o *Overlay) idStripe(key string) *sync.Mutex {
+	return &o.idLocks[lockStripeIndex(key, len(o.idLocks))]
+}
+
+// lockStripeIndex hashes a lock key into [0, buckets).
+func lockStripeIndex(key string, buckets int) uint32 {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(key))
-	return &o.replaceLocks[h.Sum32()%uint32(len(o.replaceLocks))]
+	return h.Sum32() % uint32(buckets)
 }
 
 // ChargeGrowth reserves growth for a TRUNCATING path write, which has no base a
@@ -499,6 +556,10 @@ func (o *Overlay) Remove(viewPath string) error {
 // empty destination directory and rejects a non-empty one, which preserves
 // both trees when a child races in.
 func (o *Overlay) Rename(oldPath, newPath string) error {
+	// A rename replaces or moves names a concurrent writer may be landing, so
+	// it takes BOTH targets' mutation locks (sorted, then identities) for the
+	// whole snapshot -> rename -> settle sequence.
+	defer o.ReplaceLocks(oldPath, newPath)()
 	oldAbs, err := o.abs(oldPath)
 	if err != nil {
 		return err
