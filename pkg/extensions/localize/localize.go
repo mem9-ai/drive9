@@ -802,6 +802,8 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 			// A link changes the inode's link count, which the unlink and rename
 			// release decisions read: it takes the same mutation locks so those
 			// decisions cannot be made against a count that is about to move.
+			// (The window is too narrow to schedule from a test, so this one is
+			// covered by inspection; #1111 pins it.)
 			unlink := func() {}
 			if f.overlay.Quota() != nil {
 				unlink = f.overlay.ReplaceLocks(op.Path, op.Path2)

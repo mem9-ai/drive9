@@ -101,25 +101,31 @@ func (o *Overlay) ReplaceLocks(viewPaths ...string) (unlock func()) {
 	if o == nil {
 		return func() {}
 	}
-	names := make([]string, 0, len(viewPaths))
-	seen := make(map[string]struct{}, len(viewPaths))
+	// The stripes are BUCKETS, so both the dedupe and the acquisition order are
+	// by bucket index: two distinct keys that hash to one bucket are one
+	// non-reentrant mutex (locking it twice self-deadlocks), and ordering by
+	// key string would let two callers take the same two buckets in opposite
+	// orders (ABBA). Indices ascend within each pool, and every name bucket is
+	// taken before any identity bucket, so the two-level order is global.
+	nameIdx := make([]uint32, 0, len(viewPaths))
+	seen := make(map[uint32]struct{}, len(viewPaths))
 	for _, p := range viewPaths {
-		key := "path:" + p
-		if _, dup := seen[key]; dup {
+		idx := o.nameStripeIndex("path:" + p)
+		if _, dup := seen[idx]; dup {
 			continue
 		}
-		seen[key] = struct{}{}
-		names = append(names, key)
+		seen[idx] = struct{}{}
+		nameIdx = append(nameIdx, idx)
 	}
-	sort.Strings(names)
-	held := make([]*sync.Mutex, 0, 2*len(names))
-	for _, key := range names {
-		mu := o.nameStripe(key)
+	sort.Slice(nameIdx, func(i, j int) bool { return nameIdx[i] < nameIdx[j] })
+	held := make([]*sync.Mutex, 0, len(nameIdx)+len(viewPaths))
+	for _, idx := range nameIdx {
+		mu := &o.nameLocks[idx]
 		mu.Lock()
 		held = append(held, mu)
 	}
-	ids := make([]string, 0, len(viewPaths))
-	seen = make(map[string]struct{}, len(viewPaths))
+	idIdx := make([]uint32, 0, len(viewPaths))
+	seen = make(map[uint32]struct{}, len(viewPaths))
 	for _, p := range viewPaths {
 		info, err := o.Lstat(p)
 		if err != nil {
@@ -129,15 +135,16 @@ func (o *Overlay) ReplaceLocks(viewPaths ...string) (unlock func()) {
 		if !ok {
 			continue
 		}
-		if _, dup := seen[id]; dup {
+		idx := o.idStripeIndex(id)
+		if _, dup := seen[idx]; dup {
 			continue
 		}
-		seen[id] = struct{}{}
-		ids = append(ids, id)
+		seen[idx] = struct{}{}
+		idIdx = append(idIdx, idx)
 	}
-	sort.Strings(ids)
-	for _, key := range ids {
-		mu := o.idStripe(key)
+	sort.Slice(idIdx, func(i, j int) bool { return idIdx[i] < idIdx[j] })
+	for _, idx := range idIdx {
+		mu := &o.idLocks[idx]
 		mu.Lock()
 		held = append(held, mu)
 	}
@@ -150,12 +157,22 @@ func (o *Overlay) ReplaceLocks(viewPaths ...string) (unlock func()) {
 
 // nameStripe maps a name lock key onto the name pool.
 func (o *Overlay) nameStripe(key string) *sync.Mutex {
-	return &o.nameLocks[lockStripeIndex(key, len(o.nameLocks))]
+	return &o.nameLocks[o.nameStripeIndex(key)]
 }
 
 // idStripe maps an identity lock key onto the identity pool.
 func (o *Overlay) idStripe(key string) *sync.Mutex {
-	return &o.idLocks[lockStripeIndex(key, len(o.idLocks))]
+	return &o.idLocks[o.idStripeIndex(key)]
+}
+
+// nameStripeIndex maps a name lock key onto its name-pool bucket.
+func (o *Overlay) nameStripeIndex(key string) uint32 {
+	return lockStripeIndex(key, len(o.nameLocks))
+}
+
+// idStripeIndex maps an identity lock key onto its identity-pool bucket.
+func (o *Overlay) idStripeIndex(key string) uint32 {
+	return lockStripeIndex(key, len(o.idLocks))
 }
 
 // lockStripeIndex hashes a lock key into [0, buckets).
