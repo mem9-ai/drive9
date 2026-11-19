@@ -430,7 +430,7 @@ func (b *pendingReservation) indexedUnder(rel string) bool {
 // leave `used` and go back to the free-space estimate. A retired writer that
 // lands bytes afterwards is re-charged by its own settlement. The caller must
 // hold q.mu.
-func (q *overlayQuota) retireLocked(booking *pendingReservation, size, baseline int64) {
+func (q *overlayQuota) retireLocked(booking *pendingReservation, size int64) {
 	if booking == nil || booking.retired || booking.poolResolved {
 		// A retired booking is already reconciled; a second retirement would
 		// subtract its overhang twice (an index hole fails closed, not open).
@@ -518,7 +518,7 @@ func (q *overlayQuota) settleWrite(res writeReservation) {
 	if booking.bookings > 0 {
 		return
 	}
-	q.retireLocked(booking, size, 0)
+	q.retireLocked(booking, size)
 }
 
 // resultingSize reports the file's size after the write: the descriptor's when
@@ -576,7 +576,7 @@ func (q *overlayQuota) retirePathLocked(rel string, size, baseline int64) {
 	keys := make([]string, 0, len(q.byPath[rel]))
 	for booking := range q.byPath[rel] {
 		keys = append(keys, booking.key)
-		q.retireLocked(booking, size, baseline)
+		q.retireLocked(booking, size)
 	}
 	// The mutation left the file at baseline: that is what this key has paid for
 	// now, so a retired writer that lands later is charged from there (a release
@@ -586,7 +586,9 @@ func (q *overlayQuota) retirePathLocked(rel string, size, baseline int64) {
 	}
 	// Path-key platforms (no inode identity) key the prefix by name, so the
 	// name itself moves with the mutation.
-	q.setPaidLocked("path:"+rel, baseline, nil)
+	if rel != "" {
+		q.setPaidLocked("path:"+rel, baseline, nil)
+	}
 }
 
 // retireIdentity retires the booking of a specific inode (whatever name it was
@@ -600,7 +602,7 @@ func (q *overlayQuota) retireIdentity(key, rel string, size, baseline int64) {
 	defer q.mu.Unlock()
 	if key != "" {
 		if booking := q.reserved[key]; booking != nil {
-			q.retireLocked(booking, size, baseline)
+			q.retireLocked(booking, size)
 		}
 		// The inode's paid prefix moves to the post-mutation size even when no
 		// booking is live (the earlier ones were already retired).
@@ -610,7 +612,12 @@ func (q *overlayQuota) retireIdentity(key, rel string, size, baseline int64) {
 	if key != "" && rel != "" {
 		// The inode entry is authoritative now: a shadow entry keyed by the old
 		// name would otherwise outlive the file it described (a rename-away).
-		delete(q.paid, "path:"+rel)
+		// An owned mark belongs to a live path-keyed booking (a file admitted
+		// before it had an identity): leave it to that booking's own settle, so
+		// its refund still finds its grant.
+		if mark, ok := q.paid["path:"+rel]; ok && mark.owner == nil {
+			delete(q.paid, "path:"+rel)
+		}
 	}
 }
 
