@@ -236,6 +236,8 @@ func (h *layerHandle) Sync(ctx context.Context) error { return h.commit(ctx) }
 func (h *layerHandle) Flush(ctx context.Context) error { return h.commit(ctx) }
 
 func (h *layerHandle) Release(ctx context.Context) error {
+	// Retained buffer bytes belong to no one once the handle is closed.
+	defer h.releaseBuffer()
 	h.mu.Lock()
 	unlinked := h.unlinked
 	unlink := h.unlinkAtRelease
@@ -496,6 +498,17 @@ func (s *layerSpill) close() {
 	}
 }
 
+// releaseBuffer returns the handle's write-buffer charge to the process
+// memory budget and drops the buffer.
+func (h *layerHandle) releaseBuffer() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.buf != nil {
+		h.buf.Reset()
+		h.buf = nil
+	}
+}
+
 // spillLayerImage copies size bytes of the buffer to a temp file under
 // the handle's OWN mutex (WriteBuffer is not thread-safe — a Drain flush
 // racing a Write on the same fd read mixed images through a reader that
@@ -525,7 +538,12 @@ func spillLayerImage(buf *writebuffer.WriteBuffer, size int64) (*layerSpill, err
 			var loaded []int
 			for p := first; p <= last; p++ {
 				if !buf.IsPartLoaded(p) {
-					if err := buf.EnsureLoaded(p); err != nil {
+					// A publication load: the commit cannot write the image
+					// out without the part, so the memory budget records it
+					// instead of refusing it (the part is released again
+					// right after the copy). Refusing here made an admitted
+					// edit unpublishable for good.
+					if err := buf.ForceEnsureLoaded(p); err != nil {
 						return err
 					}
 					loaded = append(loaded, p)

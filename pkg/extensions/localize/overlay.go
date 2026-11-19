@@ -347,7 +347,10 @@ func (o *Overlay) Rename(oldPath, newPath string) error {
 			if srcInfo, serr := os.Lstat(oldAbs); serr == nil {
 				sameInode = os.SameFile(srcInfo, dstInfo)
 			}
-			if !sameInode {
+			// The replaced NAME goes away, but the inode's bytes only leave
+			// the quota when no other hardlink keeps them: releasing on a
+			// shared inode would under-count the surviving aliases.
+			if !sameInode && backingLinkCount(dstInfo) <= 1 {
 				replacedBytes, releaseDest = dstInfo.Size(), true
 			}
 		}

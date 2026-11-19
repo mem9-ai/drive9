@@ -276,3 +276,32 @@ func TestOverlayQuotaRenameHardlinkAliasKeepsBytes(t *testing.T) {
 		t.Fatalf("quota used after alias rename = %d, want 600", got)
 	}
 }
+
+// TestOverlayQuotaRenameOverDestinationWithAliasKeepsBytes: renaming over a
+// destination that another hardlink still references removes only the name; the
+// inode's bytes stay on disk and must stay charged.
+func TestOverlayQuotaRenameOverDestinationWithAliasKeepsBytes(t *testing.T) {
+	f := newQuotaRouter(t, 3000)
+	const src = "/repo/node_modules/src.bin"
+	const dst = "/repo/node_modules/dst.bin"
+	const alias = "/repo/node_modules/alias.bin"
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: src, Offset: 0, Data: make([]byte, 600)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpWrite, Path: dst, Offset: 0, Data: make([]byte, 600)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpLink, Path: dst, Path2: alias}); err != nil {
+		t.Fatalf("link: %v", err)
+	}
+	if got := f.overlay.Quota().Used(); got != 1200 {
+		t.Fatalf("quota used = %d, want 1200", got)
+	}
+	if _, err := doOp(t, f, &fs.Op{Kind: fs.OpRename, Path: src, Path2: dst}); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	// src's 600 bytes replaced dst's name, but the alias keeps dst's inode.
+	if got := f.overlay.Quota().Used(); got != 1200 {
+		t.Fatalf("quota used after alias-protected rename = %d, want 1200", got)
+	}
+}

@@ -444,9 +444,16 @@ func (f *Localize) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, 
 					// The truncating open freed the old image's excess.
 					o.ReleaseBytes(oldSize - newSize)
 				}
-				_, werr := fh.Write(op.Data)
+				written, werr := fh.Write(op.Data)
 				cerr := fh.Close()
 				if werr != nil {
+					// The truncating open already dropped the old image, and a
+					// partial write landed `written` bytes: reconcile the
+					// reservation to the new size so the unused bytes are not
+					// charged forever.
+					if release := newSize - int64(written); release > 0 {
+						o.ReleaseBytes(release)
+					}
 					return fs.Result{}, werr
 				}
 				if cerr != nil {

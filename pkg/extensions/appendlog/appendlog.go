@@ -1605,7 +1605,16 @@ func (h *Handle) refreshAppendBaselineLocked(ctx context.Context) error {
 	return nil
 }
 
-func (h *Handle) Release(ctx context.Context) error {
+func (h *Handle) Release(ctx context.Context) (err error) {
+	// Return the buffer's memory-budget charge only once the close publish
+	// succeeded: a FAILED content commit deliberately preserves the dirty
+	// generation for the next attempt, and that attempt still needs the
+	// buffer.
+	defer func() {
+		if err == nil {
+			h.releaseBuffer()
+		}
+	}()
 	h.a.untrack(h)
 	h.mu.Lock()
 	unlinked := h.unlinked
@@ -1613,7 +1622,6 @@ func (h *Handle) Release(ctx context.Context) error {
 	path := h.path
 	h.unlinkAtRelease = nil
 	h.mu.Unlock()
-	var err error
 	if unlinked {
 		// Last close of an unlinked path: publish the deferred delete. The
 		// path tombstone outlives only fds of the SAME unlinked generation —
@@ -2114,6 +2122,17 @@ func (a *AppendLog) SetMemoryBudget(b *membudget.Budget) {
 		return
 	}
 	a.budget = b
+}
+
+// releaseBuffer returns the handle's write-buffer charge to the process
+// memory budget and drops the buffer.
+func (h *Handle) releaseBuffer() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.buf != nil {
+		h.buf.Reset()
+		h.buf = nil
+	}
 }
 
 // ensureBuffer creates the write buffer. Existing files keep their base

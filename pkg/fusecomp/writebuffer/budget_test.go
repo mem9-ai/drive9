@@ -158,3 +158,44 @@ func TestWriteBufferWithoutBudgetIsUnlimited(t *testing.T) {
 		t.Fatal("unexpected budget")
 	}
 }
+
+// TestForceEnsureLoadedIgnoresBudgetForPublication pins the publication-load
+// contract: a commit that must write the whole image cannot be blocked by the
+// budget, because every retry would fail the same way. The forced load is
+// still charged, and the caller releases it after copying the part out.
+func TestForceEnsureLoadedIgnoresBudgetForPublication(t *testing.T) {
+	// The budget holds the dirty 64 KiB part and no more.
+	budget := membudget.New(128<<10, membudget.ModeEnforce, nil)
+	wb := NewWriteBuffer("/publish.bin", 0, 64<<10)
+	wb.SetSmallFileMax(1024)
+	wb.SetMemoryBudget(budget)
+	t.Cleanup(func() { wb.Reset() })
+
+	// A dirty part fills the budget on its own.
+	if _, err := wb.Write(0, make([]byte, 2048)); err != nil {
+		t.Fatal(err)
+	}
+	// A clean publication part does not fit: the normal path refuses.
+	oneMB := make([]byte, 1<<20)
+	wb.SeedRemote(2 << 20) // parts 0..1 exist in the base image
+	wb.LoadPart = func(int) ([]byte, error) { return oneMB, nil }
+	if err := wb.EnsureLoaded(1); !errors.Is(err, syscall.ENOMEM) {
+		t.Fatalf("EnsureLoaded = %v, want ENOMEM", err)
+	}
+	// The publication path admits it (charged, not refused) ...
+	if err := wb.ForceEnsureLoaded(1); err != nil {
+		t.Fatalf("ForceEnsureLoaded = %v, want nil", err)
+	}
+	if !wb.IsPartLoaded(1) {
+		t.Fatal("forced load did not install the part")
+	}
+	before := budget.UsedBy(membudget.ClassWriteBuffer)
+	if before < (1 << 20) {
+		t.Fatalf("forced load not charged: %d", before)
+	}
+	// ... and the caller releases it after the copy.
+	wb.ReleaseCleanPart(1)
+	if got := budget.UsedBy(membudget.ClassWriteBuffer); got != before-(1<<20) {
+		t.Fatalf("charge after release = %d, want %d", got, before-(1<<20))
+	}
+}

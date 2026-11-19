@@ -4183,12 +4183,19 @@ func (h *bufferingHandle) Release(ctx context.Context) error {
 		h.ledgerShadowGen = 0
 		lf := h.liveSpillFile
 		h.liveSpillFile = nil
+		src := h.buf
+		h.buf = nil
 		h.mu.Unlock()
 		if gen != 0 && h.w.opts.Staging != nil {
 			h.w.opts.Staging.Shadow.Unpin(gen)
 		}
 		if lf != nil {
 			_ = lf.Close()
+		}
+		if src != nil {
+			// The descriptor is closed: the buffer's bytes are retained by
+			// nobody, so its memory-budget charge goes back.
+			src.Reset()
 		}
 	}()
 	// One identity snapshot for the whole close (a concurrent retarget
@@ -4331,8 +4338,13 @@ func (h *bufferingHandle) releaseMigrated(ctx context.Context, e fs.Handle) erro
 	h.pendingFileSize = 0
 	snapshotFile := h.snapshotFile
 	h.snapshotFile = nil
+	migratedBuf := h.buf
+	h.buf = nil
 	inner := h.inner
 	h.mu.Unlock()
+	if migratedBuf != nil {
+		migratedBuf.Reset()
+	}
 
 	if ledgerGen != 0 && h.w.opts.Staging != nil {
 		h.w.opts.Staging.Shadow.Unpin(ledgerGen)
@@ -4488,6 +4500,9 @@ func (h *bufferingHandle) checkoutDropCleanBuffer() {
 		h.buf.Reset()
 	}
 	h.buf = nil
+	// The buffer that carried the base is gone: the next ensureBuffer must
+	// initialize it again.
+	h.baseLoaded = false
 }
 
 func (w *Writeback) acknowledgeUploadedCreate(path string, rev int64, generation uint64, source pendingGenSource, cacheGeneration uint64) {
@@ -6429,6 +6444,9 @@ func (h *bufferingHandle) ensureBufferLocked(ctx context.Context) error {
 	}
 	h.buf = writebuffer.NewWriteBuffer(h.path, bufferedMaxTotal, 0)
 	h.buf.SetMemoryBudget(h.w.budget)
+	// baseLoaded is this ATTEMPT's marker: a checkout or a reuse can leave it
+	// set from the previous buffer, and the failure defer below keys on it.
+	h.baseLoaded = false
 	// A failed base preload must not leave this provisional buffer
 	// behind: the next Write on the same descriptor would skip
 	// initialization entirely and commit a replacement containing only

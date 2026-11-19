@@ -263,7 +263,7 @@ func (wb *WriteBuffer) Write(offset int64, data []byte) (uint32, error) {
 		partOff := pos % wb.partSize
 
 		// Ensure part exists (lazily load or create)
-		if err := wb.ensurePart(partIdx); err != nil {
+		if err := wb.ensurePart(partIdx, false); err != nil {
 			wb.rollbackWriteExtent(prevTotal, offset, dataOff)
 			return uint32(dataOff), err
 		}
@@ -433,6 +433,9 @@ func (wb *WriteBuffer) writeSmallFile(offset int64, data []byte) (uint32, error)
 // admission can therefore fail, and the staged image is never lost.
 func (wb *WriteBuffer) migrateToPartMode() error {
 	if len(wb.smallFileData) == 0 {
+		// Truncated to zero: the allocation is going away, so its capacity
+		// charge must go with it (the data path below transfers instead).
+		wb.subMemory(int64(cap(wb.smallFileData)))
 		wb.smallFileData = nil
 		return nil
 	}
@@ -463,8 +466,9 @@ func (wb *WriteBuffer) rollbackWriteExtent(prevTotal, offset int64, copied int) 
 
 // ensurePart makes sure a part exists in the map. If it doesn't exist
 // and LoadPart is set, tries to load from remote. Otherwise creates a
-// nil entry that will be grown as needed by Write.
-func (wb *WriteBuffer) ensurePart(partIdx int) error {
+// nil entry that will be grown as needed by Write. force admits the load's
+// bytes past the memory budget (publication reads only).
+func (wb *WriteBuffer) ensurePart(partIdx int, force bool) error {
 	if wb.smallFileData != nil {
 		// Small-file mode: all data is in smallFileData, no parts needed
 		return nil
@@ -493,7 +497,9 @@ func (wb *WriteBuffer) ensurePart(partIdx int) error {
 			return err
 		}
 		if restored {
-			if err := wb.addMemory(int64(cap(data))); err != nil {
+			if force {
+				wb.forceAddMemory(int64(cap(data)))
+			} else if err := wb.addMemory(int64(cap(data))); err != nil {
 				return err
 			}
 			wb.parts[partIdx] = data
@@ -502,7 +508,9 @@ func (wb *WriteBuffer) ensurePart(partIdx int) error {
 		safeLogPrintf("WARNING: back-write to evicted part %d of %s — "+
 			"non-written bytes will be zero (original data already uploaded to S3)", partIdx, wb.path)
 		data = make([]byte, wb.partSize)
-		if err := wb.addMemory(wb.partSize); err != nil {
+		if force {
+			wb.forceAddMemory(wb.partSize)
+		} else if err := wb.addMemory(wb.partSize); err != nil {
 			return err
 		}
 		wb.parts[partIdx] = data
@@ -517,7 +525,9 @@ func (wb *WriteBuffer) ensurePart(partIdx int) error {
 			if err != nil {
 				return err
 			}
-			if err := wb.addMemory(int64(cap(data))); err != nil {
+			if force {
+				wb.forceAddMemory(int64(cap(data)))
+			} else if err := wb.addMemory(int64(cap(data))); err != nil {
 				return err
 			}
 			wb.parts[partIdx] = data
@@ -544,7 +554,7 @@ func (wb *WriteBuffer) EnsurePartsForWrite(offset, length int64) error {
 	first := int(offset / wb.partSize)
 	last := int((end - 1) / wb.partSize)
 	for i := first; i <= last; i++ {
-		if err := wb.ensurePart(i); err != nil {
+		if err := wb.ensurePart(i, false); err != nil {
 			return err
 		}
 	}
@@ -622,7 +632,7 @@ func (wb *WriteBuffer) ensureRetainedDirtyPartLoaded(retainedEnd int64) error {
 	if partStart >= wb.remoteSize {
 		return nil
 	}
-	return wb.ensurePart(partIdx)
+	return wb.ensurePart(partIdx, false)
 }
 
 // Truncate resizes the buffer to size.
@@ -1138,7 +1148,16 @@ func (wb *WriteBuffer) ClearDirty() {
 // partIdx is 0-based. This is used by the Read path to load unmodified parts
 // before serving from the buffer, avoiding returning zeros for unloaded parts.
 func (wb *WriteBuffer) EnsureLoaded(partIdx int) error {
-	return wb.ensurePart(partIdx)
+	return wb.ensurePart(partIdx, false)
+}
+
+// ForceEnsureLoaded loads a part for a PUBLICATION read even past the memory
+// budget. A commit that has to write the whole image out cannot proceed
+// without the part, so refusing it would make an already-admitted edit
+// unpublishable (every retry fails the same way). The bytes are still counted,
+// and the caller releases the part again as soon as it copied it out.
+func (wb *WriteBuffer) ForceEnsureLoaded(partIdx int) error {
+	return wb.ensurePart(partIdx, true)
 }
 
 // ReleaseCleanPart drops a loaded CLEAN part from memory (a spill that

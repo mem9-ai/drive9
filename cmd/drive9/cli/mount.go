@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
@@ -624,7 +625,7 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 	if *localizeQuotaMB < 0 {
 		return fmt.Errorf("drive9 mount: --localize-quota-mb must be >= 0")
 	}
-	if *localizeFreeRatio < 0 || *localizeFreeRatio >= 1 {
+	if math.IsNaN(*localizeFreeRatio) || *localizeFreeRatio < 0 || *localizeFreeRatio >= 1 {
 		return fmt.Errorf("drive9 mount: --localize-free-ratio must be >= 0 and < 1")
 	}
 	// Map CLI 0 → -1 sentinel so MountOptions.setDefaults() knows the user

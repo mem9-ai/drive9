@@ -205,11 +205,26 @@ func (h *gitHandle) Sync(ctx context.Context) error  { return h.commit(ctx) }
 func (h *gitHandle) Flush(ctx context.Context) error { return h.commit(ctx) }
 
 func (h *gitHandle) Release(ctx context.Context) error {
+	// The handle is going away, so whatever its buffer still holds is
+	// retained by nobody: return the memory-budget charge after the close
+	// commit (which reads the buffer) and on every early return.
+	defer h.releaseBuffer()
 	h.g.untrackHandle(h)
 	if h.unlinked {
 		return nil
 	}
 	return h.commit(ctx)
+}
+
+// releaseBuffer returns the handle's write-buffer charge to the process
+// memory budget and drops the buffer.
+func (h *gitHandle) releaseBuffer() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.buf != nil {
+		h.buf.Reset()
+		h.buf = nil
+	}
 }
 
 // Truncate applies a local truncation; the image lands at the boundary.
