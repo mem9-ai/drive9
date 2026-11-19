@@ -7,7 +7,9 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -2678,5 +2680,186 @@ func TestWriteBodyTooLargeReportsDeclaredBound(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if !strings.Contains(string(body), "max 4 bytes") {
 		t.Fatalf("error body = %q, want the declared bound (4 bytes)", body)
+	}
+}
+
+// The declaration exists so an honest chunked writer can stream a body it cannot measure up
+// front. That writer must succeed and the file must hold exactly the declared bytes.
+func TestWriteChunkedBodyMatchingDeclaredLengthIsStored(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/data/honest.txt", io.NopCloser(strings.NewReader("hello")))
+	req.ContentLength = -1
+	req.Header.Set("X-Dat9-Content-Length", "5")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("honest chunked write: status %d body %q, want %d", resp.StatusCode, body, http.StatusOK)
+	}
+
+	readResp, err := http.Get(ts.URL + "/v1/fs/data/honest.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = readResp.Body.Close() }()
+	stored, _ := io.ReadAll(readResp.Body)
+	if readResp.StatusCode != http.StatusOK || string(stored) != "hello" {
+		t.Fatalf("stored content = %q status %d, want %q", stored, readResp.StatusCode, "hello")
+	}
+}
+
+// A body that stops short of its declaration ends in a plain EOF, so MaxBytesReader cannot
+// notice it. Writing what arrived would truncate the file and answer 200, which is silent data
+// loss; the length is checked before the write instead and the previous content survives.
+func TestWriteRejectsBodyShorterThanDeclared(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	seedReq, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/data/kept.txt", strings.NewReader("original"))
+	seedResp, err := http.DefaultClient.Do(seedReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = seedResp.Body.Close()
+	if seedResp.StatusCode != http.StatusOK {
+		t.Fatalf("seed write: status %d, want %d", seedResp.StatusCode, http.StatusOK)
+	}
+
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/data/kept.txt", io.NopCloser(strings.NewReader("hello")))
+	req.ContentLength = -1
+	req.Header.Set("X-Dat9-Content-Length", "100")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("short body: status %d body %q, want %d", resp.StatusCode, body, http.StatusBadRequest)
+	}
+	if !strings.Contains(string(body), "declared") {
+		t.Fatalf("error body = %q, want it to name the declared length", body)
+	}
+
+	readResp, err := http.Get(ts.URL + "/v1/fs/data/kept.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = readResp.Body.Close() }()
+	stored, _ := io.ReadAll(readResp.Body)
+	if readResp.StatusCode != http.StatusOK || string(stored) != "original" {
+		t.Fatalf("content after refused write = %q status %d, want the previous %q", stored, readResp.StatusCode, "original")
+	}
+}
+
+// Two lengths the caller sent that disagree are a malformed request, including when one of them
+// is zero — that used to be reported as "too large", which describes neither header. A repeated
+// declaration is worse than a wrong one, because the value that wins would depend on header
+// order.
+func TestWriteRejectsConflictingDeclaredLengths(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	cases := []struct {
+		name          string
+		contentLength int64
+		declared      []string
+		body          string
+		wantBody      string
+	}{
+		{
+			name:          "declared zero against a real content length",
+			contentLength: 5,
+			declared:      []string{"0"},
+			body:          "hello",
+			wantBody:      "mismatch",
+		},
+		{
+			name:          "declared length against a smaller content length",
+			contentLength: 4,
+			declared:      []string{"5"},
+			body:          "hell",
+			wantBody:      "mismatch",
+		},
+		{
+			name:          "repeated declaration",
+			contentLength: -1,
+			declared:      []string{"5", "50"},
+			body:          "hello",
+			wantBody:      "duplicate",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/data/conflict.txt", io.NopCloser(strings.NewReader(tc.body)))
+			req.ContentLength = tc.contentLength
+			for _, h := range tc.declared {
+				req.Header.Add("X-Dat9-Content-Length", h)
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status %d body %q, want %d", resp.StatusCode, body, http.StatusBadRequest)
+			}
+			if !strings.Contains(strings.ToLower(string(body)), tc.wantBody) {
+				t.Fatalf("error body = %q, want it to mention %q", body, tc.wantBody)
+			}
+			if strings.Contains(string(body), "too large") {
+				t.Fatalf("error body = %q, want a header problem rather than a size one", body)
+			}
+		})
+	}
+}
+
+// ReadTimeout is what stops a slow sender from holding a connection — and the buffer of a body
+// that has not finished arriving — indefinitely. ListenAndServe installs it on the real server;
+// this drives the same constructor with a short bound and checks the connection is closed.
+func TestServerReadTimeoutClosesSlowRequest(t *testing.T) {
+	s := newTestServer(t)
+	srv := s.newHTTPServer("127.0.0.1:0", 200*time.Millisecond)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = srv.Serve(ln) }()
+	defer func() { _ = srv.Close() }()
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	// Announce a body and never send it: without a read timeout the server waits forever.
+	if _, err := fmt.Fprintf(conn, "PUT /v1/fs/slow.txt HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 256)
+	for {
+		if _, err := conn.Read(buf); err != nil {
+			break
+		}
+	}
+	elapsed := time.Since(start)
+	if elapsed < 100*time.Millisecond {
+		t.Fatalf("connection closed after %s, before the 200ms read timeout could expire", elapsed)
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("connection stayed open for %s; the read timeout did not close it", elapsed)
 	}
 }

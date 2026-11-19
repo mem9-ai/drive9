@@ -1611,17 +1611,24 @@ func isLoopbackListenAddr(addr string) bool {
 // stops a slow sender from holding a connection (and the memory behind its body) forever.
 const serverReadTimeout = 10 * time.Minute
 
-func (s *Server) ListenAndServe(addr string) error {
-	logger.Info(backgroundWithTrace(context.Background()), "server_start", zap.String("addr", addr), zap.Int64("max_upload_bytes", s.maxUploadBytes), zap.Duration("read_timeout", serverReadTimeout))
-	httpSrv := &http.Server{
+// newHTTPServer builds the listener's http.Server. readTimeout is a parameter rather than a
+// field read so a test can exercise the bound with a short duration instead of waiting ten
+// minutes out; production passes serverReadTimeout.
+func (s *Server) newHTTPServer(addr string, readTimeout time.Duration) *http.Server {
+	return &http.Server{
 		Addr:              addr,
 		Handler:           s,
 		ReadHeaderTimeout: 15 * time.Second,
-		ReadTimeout:       serverReadTimeout,
+		ReadTimeout:       readTimeout,
 		IdleTimeout:       2 * time.Minute,
 		MaxHeaderBytes:    1 << 20,
 		TLSConfig:         &tls.Config{MinVersion: tls.VersionTLS12},
 	}
+}
+
+func (s *Server) ListenAndServe(addr string) error {
+	logger.Info(backgroundWithTrace(context.Background()), "server_start", zap.String("addr", addr), zap.Int64("max_upload_bytes", s.maxUploadBytes), zap.Duration("read_timeout", serverReadTimeout))
+	httpSrv := s.newHTTPServer(addr, serverReadTimeout)
 	// The API carries bearer tokens, vault secrets and file bytes. Serve HTTPS
 	// directly when a certificate is configured; otherwise say plainly that the
 	// listener is plaintext so an operator cannot mistake an unencrypted
@@ -2627,7 +2634,15 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 	}
 	actualCL := r.ContentLength
 	cl := actualCL
-	if h := r.Header.Get("X-Dat9-Content-Length"); h != "" {
+	// One declared length and one only: with duplicates the value actually used would depend
+	// on header order, so a caller could send 5 and 50 and have either take effect.
+	if declared := r.Header.Values("X-Dat9-Content-Length"); len(declared) > 1 {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_duplicate_declared_length", "path", path, "count", len(declared))...)
+		metricEvent(r.Context(), "fs_write", "result", "error")
+		errJSON(w, http.StatusBadRequest, "duplicate X-Dat9-Content-Length header")
+		return
+	} else if len(declared) == 1 {
+		h := declared[0]
 		parsed, err := strconv.ParseInt(h, 10, 64)
 		if err != nil || parsed < 0 {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_invalid_declared_length", "path", path, "header", h)...)
@@ -2635,7 +2650,12 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 			errJSON(w, http.StatusBadRequest, "invalid X-Dat9-Content-Length")
 			return
 		}
-		if actualCL > 0 && parsed > 0 && actualCL != parsed {
+		// A positive transport length is final, so any disagreement with the declared one is a
+		// malformed request — including a declared zero, which used to slip through and then fail
+		// as "too large", a bound neither header names. A zero transport length is left alone: it
+		// is how a large-file PUT declares its size while sending no body, and a short body under
+		// a positive declaration is caught after the read.
+		if actualCL > 0 && actualCL != parsed {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_length_mismatch", "path", path, "content_length", actualCL, "declared_length", parsed)...)
 			metricEvent(r.Context(), "fs_write", "result", "error")
 			errJSON(w, http.StatusBadRequest, "Content-Length and X-Dat9-Content-Length mismatch")
@@ -2646,7 +2666,7 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 	if cl < 0 {
 		// A chunked request carries no length the router can trust: r.ContentLength is -1
 		// and the caller declared none either. Two things go wrong if that is read anyway —
-		// the 413 check above compares -1 against the limit and passes, and the large-file
+		// the 413 check below compares -1 against the limit and passes, and the large-file
 		// branch is skipped, so the whole body is buffered in memory before its size is
 		// known. Require the length up front instead.
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_missing_length", "path", path)...)
@@ -2741,7 +2761,7 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 	bodyReadStart := time.Now()
 	data, err := io.ReadAll(body)
 	bodyReadDuration = time.Since(bodyReadStart)
-	bodyReadMetricBytes := requestBodyReadMetricBytes(cl, len(data))
+	bodyReadMetricBytes := int64(len(data))
 	setRequestBodyReadMetric(r.Context(), r.Method, requestRoute(r.URL.Path), bodyReadMetricBytes, bodyReadDuration)
 	logSlowWriteBodyRead(r.Context(), r, requestRoute(r.URL.Path), bodyReadMetricBytes, bodyReadDuration)
 	if err != nil {
@@ -2761,6 +2781,19 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_body_read_failed", "path", path, "error", err)...)
 		metricEvent(r.Context(), "fs_write", "result", "error")
 		errJSON(w, http.StatusBadRequest, "read body: "+err.Error())
+		return
+	}
+	// The reader cut a body off at cl, but it cannot tell us a body stopped short of it: a
+	// chunked stream that ends after five bytes against a declared hundred ends in a plain
+	// EOF. Committing that would truncate the file to five bytes and answer 200, so the
+	// declaration is checked against what actually arrived before anything is written.
+	if int64(len(data)) != cl {
+		if timingEnabled {
+			logServerWriteTiming(r.Context(), path, len(data), expectedRevision, 0, "body_length_mismatch", bodyReadDuration, backendWriteDuration, responseDuration, time.Since(timingStart), nil)
+		}
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_body_shorter_than_declared", "path", path, "declared", cl, "received", len(data))...)
+		metricEvent(r.Context(), "fs_write", "result", "error")
+		errJSON(w, http.StatusBadRequest, fmt.Sprintf("request body is %d bytes but %d were declared", len(data), cl))
 		return
 	}
 	description := r.Header.Get("X-Dat9-Description")
@@ -2845,13 +2878,6 @@ func logServerWriteTiming(ctx context.Context, path string, bytes int, expectedR
 
 func serverDurationMs(d time.Duration) float64 {
 	return float64(d.Microseconds()) / 1000.0
-}
-
-func requestBodyReadMetricBytes(declared int64, observed int) int64 {
-	if declared >= 0 {
-		return declared
-	}
-	return int64(observed)
 }
 
 const slowWriteBodyReadThreshold = 5 * time.Second
