@@ -1614,14 +1614,15 @@ const DefaultReadTimeout = 10 * time.Minute
 // serverReadTimeout resolves the read timeout from the environment, so an operator with very
 // slow clients can raise it without a rebuild.
 func serverReadTimeout() time.Duration {
+	ctx := backgroundWithTrace(context.Background())
 	raw := strings.TrimSpace(os.Getenv("DRIVE9_SERVER_READ_TIMEOUT"))
 	if raw == "" {
 		return DefaultReadTimeout
 	}
 	d, err := time.ParseDuration(raw)
 	if err != nil || d <= 0 {
-		logger.Warn(backgroundWithTrace(context.Background()), "server_event",
-			eventFields(context.Background(), "server_invalid_read_timeout", "value", raw)...)
+		// One context for the log line and its fields, so the warning carries a single trace id.
+		logger.Warn(ctx, "server_event", eventFields(ctx, "server_invalid_read_timeout", "value", raw)...)
 		return DefaultReadTimeout
 	}
 	return d
@@ -2766,9 +2767,12 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 		}
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
-			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_body_too_large", "path", path, "max", s.maxUploadBytes)...)
+			// The reader was bounded by the declared length, so that is the limit the caller
+			// exceeded. Reporting the server-wide maximum here would name a bound this request
+			// never reached.
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_body_too_large", "path", path, "max", cl)...)
 			metricEvent(r.Context(), "fs_write", "result", "error")
-			errJSON(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("upload too large: max %d bytes", s.maxUploadBytes))
+			errJSON(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("upload too large: max %d bytes", cl))
 			return
 		}
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_body_read_failed", "path", path, "error", err)...)

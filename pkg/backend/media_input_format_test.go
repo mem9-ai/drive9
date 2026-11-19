@@ -1,6 +1,8 @@
 package backend
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -100,5 +102,26 @@ func TestMediaToolEnvIsMinimal(t *testing.T) {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("mediaToolEnv missing %q: %s", want, joined)
 		}
+	}
+}
+
+// The tool runs with cmd.Dir inside the staging directory, so a configured relative path must
+// be resolved against the server's working directory first — otherwise "./tools/ffmpeg" is
+// looked up inside the per-request temp dir and the extraction cannot start.
+func TestResolveMediaToolPath(t *testing.T) {
+	if got := resolveMediaToolPath("ffmpeg"); got != "ffmpeg" {
+		t.Fatalf("bare name = %q, want it left for PATH lookup", got)
+	}
+	absolute := filepath.Join(t.TempDir(), "ffmpeg")
+	if got := resolveMediaToolPath(absolute); got != absolute {
+		t.Fatalf("absolute path = %q, want %q", got, absolute)
+	}
+	relative := "." + string(os.PathSeparator) + "tools" + string(os.PathSeparator) + "ffmpeg"
+	got := resolveMediaToolPath(relative)
+	if !filepath.IsAbs(got) {
+		t.Fatalf("relative path = %q, want an absolute path", got)
+	}
+	if filepath.Base(got) != "ffmpeg" {
+		t.Fatalf("relative path = %q, want it to keep the tool name", got)
 	}
 }

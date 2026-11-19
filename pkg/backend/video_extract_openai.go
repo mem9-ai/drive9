@@ -182,7 +182,7 @@ func (e *OpenAIVideoTextExtractor) extractFrames(ctx context.Context, data []byt
 		outputPattern,
 	)
 
-	cmd := exec.CommandContext(ctx, e.ffmpegPath, args...)
+	cmd := exec.CommandContext(ctx, resolveMediaToolPath(e.ffmpegPath), args...)
 	// Run inside the staging directory with a fixed environment: relative and
 	// nested references the decoder might follow stay in the directory that holds
 	// this tenant's bytes, and the API server's own environment (master keys,

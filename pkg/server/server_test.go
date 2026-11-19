@@ -2398,9 +2398,12 @@ func TestWriteBodyReadMetricRecordsFailureStatusClass(t *testing.T) {
 	defer ts.Close()
 
 	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/too-large.txt", io.NopCloser(strings.NewReader("abcdef")))
-	// The declared length is what the size check reads: an io.NopCloser body would otherwise
-	// arrive chunked with no length and be refused as 411 before the limit is compared.
-	req.ContentLength = 6
+	// Stay chunked and declare a length the size check accepts (3 <= the 3-byte limit), so the
+	// request reaches the body read and fails there: the six-byte body trips the reader limit.
+	// A Content-Length of 6 would be refused by the 413 check before anything is read, and the
+	// failed-read metric this test asserts would never be recorded.
+	req.ContentLength = -1
+	req.Header.Set("X-Dat9-Content-Length", "3")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -2655,6 +2658,8 @@ func TestWriteChunkedBodyUsesDeclaredLengthAsBound(t *testing.T) {
 // The read timeout must be configurable and must refuse nonsense rather than silently
 // disabling itself: a slow sender is exactly what it exists to stop.
 func TestServerReadTimeoutFromEnv(t *testing.T) {
+	// The test process may inherit a value; the default case must still be exercised.
+	t.Setenv("DRIVE9_SERVER_READ_TIMEOUT", "")
 	if got := serverReadTimeout(); got != DefaultReadTimeout {
 		t.Fatalf("default read timeout = %s, want %s", got, DefaultReadTimeout)
 	}
@@ -2667,5 +2672,31 @@ func TestServerReadTimeoutFromEnv(t *testing.T) {
 		if got := serverReadTimeout(); got != DefaultReadTimeout {
 			t.Fatalf("read timeout for %q = %s, want the default %s", bad, got, DefaultReadTimeout)
 		}
+	}
+}
+
+// The 413 from the buffered path must name the bound the request actually hit, which is the
+// declared length — not the server-wide maximum it never reached.
+func TestWriteBodyTooLargeReportsDeclaredBound(t *testing.T) {
+	s := newTestServer(t)
+	s.maxUploadBytes = 1 << 20
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/declared-bound.txt", io.NopCloser(strings.NewReader("0123456789")))
+	req.ContentLength = -1
+	req.Header.Set("X-Dat9-Content-Length", "4")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d body %q, want %d", resp.StatusCode, body, http.StatusRequestEntityTooLarge)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "max 4 bytes") {
+		t.Fatalf("error body = %q, want the declared bound (4 bytes)", body)
 	}
 }

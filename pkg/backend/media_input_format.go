@@ -1,6 +1,11 @@
 package backend
 
-import "fmt"
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+)
 
 // mediaInputDemuxer pins the ffmpeg demuxer for one of the MIME types the
 // extraction routers accept. Pinning matters because ffmpeg selects a demuxer
@@ -42,6 +47,20 @@ func mediaInputDemuxer(mime string) (string, error) {
 // only reach the filesystem, never the network.
 func mediaInputArgs(demuxer, path string) []string {
 	return []string{"-protocol_whitelist", "file", "-f", demuxer, "-i", path}
+}
+
+// resolveMediaToolPath turns a relative tool path into an absolute one. A media tool runs with
+// cmd.Dir set to the per-request staging directory, so a configured path like "./tools/ffmpeg"
+// would be resolved against that directory and fail to start. A bare name (no separator) is
+// left alone: exec resolves it against the parent's PATH, which cmd.Dir does not affect.
+func resolveMediaToolPath(tool string) string {
+	if tool == "" || !strings.ContainsRune(tool, os.PathSeparator) || filepath.IsAbs(tool) {
+		return tool
+	}
+	if abs, err := filepath.Abs(tool); err == nil {
+		return abs
+	}
+	return tool
 }
 
 // mediaToolEnv is the environment a media tool runs with: the directory the
