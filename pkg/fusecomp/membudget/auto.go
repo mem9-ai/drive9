@@ -46,25 +46,25 @@ func AutoLimit() (limit int64, source string) {
 // process's cgroup, /proc/self/mountinfo the cgroup2 mount point, and the
 // tightest memory.max from that cgroup up to the mount root applies.
 func cgroupV2Limit() (int64, string) {
-	rel, ok := cgroupMembership("")
+	membership, ok := cgroupMembership("")
 	if !ok {
 		return 0, ""
 	}
-	root, ok := cgroupMountPoint("cgroup2", "")
+	mount, ok := cgroupMountPoint("cgroup2", "")
 	if !ok {
 		return 0, ""
 	}
-	return walkMemoryLimits(filepath.Join(root, rel), root, "memory.max")
+	return walkMemoryLimits(mount.resolve(membership), mount.point, "memory.max")
 }
 
 // cgroupV1Limit resolves the legacy hierarchy: the memory controller path from
 // /proc/self/cgroup and the cgroup1 mount whose super options carry "memory".
 func cgroupV1Limit() (int64, string) {
-	rel, ok := cgroupMembership("memory")
+	membership, ok := cgroupMembership("memory")
 	if !ok {
 		return 0, ""
 	}
-	root, ok := cgroupMountPoint("cgroup", "memory")
+	mount, ok := cgroupMountPoint("cgroup", "memory")
 	if !ok {
 		return 0, ""
 	}
@@ -72,7 +72,7 @@ func cgroupV1Limit() (int64, string) {
 	// the controller root on a real v1 system (`/sys/fs/cgroup/memory`), so the
 	// limit file sits directly in the cgroup directory. Hybrid single-root
 	// layouts expose it one directory down; both are probed per level.
-	return walkMemoryLimits(filepath.Join(root, rel), root,
+	return walkMemoryLimits(mount.resolve(membership), mount.point,
 		"memory.limit_in_bytes", "memory/memory.limit_in_bytes")
 }
 
@@ -92,25 +92,57 @@ func cgroupMembership(controller string) (string, bool) {
 			if parts[0] != "0" || parts[1] != "" {
 				continue
 			}
-		} else if parts[1] != controller {
+		} else if !superOptionsContain(parts[1], controller) {
+			// The v1 controller field is a comma-separated list
+			// ("7:cpu,memory:/job"), not a single name.
 			continue
 		}
 		rel := strings.TrimSpace(parts[2])
 		if rel == "" {
 			rel = "/"
 		}
-		return strings.TrimPrefix(rel, "/"), true
+		if !strings.HasPrefix(rel, "/") {
+			rel = "/" + rel
+		}
+		return rel, true
 	}
 	return "", false
+}
+
+// cgroupMount describes a cgroup filesystem mount: where it appears in the
+// namespace and which subtree of the hierarchy it exposes.
+type cgroupMount struct {
+	point string // mountinfo field 5
+	root  string // mountinfo field 4: the mounted subtree
+}
+
+// resolve maps a cgroup membership path (/proc/self/cgroup) to a directory under
+// the mount point, honouring a subtree mount (root "/tenant", membership
+// "/tenant/job" -> <point>/job).
+func (m cgroupMount) resolve(membership string) string {
+	rel := strings.TrimPrefix(membership, "/")
+	if root := strings.Trim(strings.TrimSpace(m.root), "/"); root != "" {
+		if rel == root {
+			rel = ""
+		} else if trimmed, ok := strings.CutPrefix(rel, root+"/"); ok {
+			rel = trimmed
+		}
+		// A membership outside the mounted subtree cannot be resolved through
+		// this mount; the mount point is the closest applicable cgroup.
+	}
+	if rel == "" {
+		return m.point
+	}
+	return filepath.Join(m.point, rel)
 }
 
 // cgroupMountPoint finds the mount point of a cgroup filesystem from
 // /proc/self/mountinfo. controller, when set, must appear in the super options
 // (how a cgroup v1 mount advertises its controllers).
-func cgroupMountPoint(fstype, controller string) (string, bool) {
+func cgroupMountPoint(fstype, controller string) (cgroupMount, bool) {
 	raw, err := readLimitFile(procSelfMountinfo)
 	if err != nil {
-		return "", false
+		return cgroupMount{}, false
 	}
 	for _, line := range strings.Split(string(raw), "\n") {
 		left, right, found := strings.Cut(line, " - ")
@@ -128,9 +160,9 @@ func cgroupMountPoint(fstype, controller string) (string, bool) {
 		if controller != "" && !superOptionsContain(rightFields[2], controller) {
 			continue
 		}
-		return leftFields[4], true
+		return cgroupMount{point: leftFields[4], root: leftFields[3]}, true
 	}
-	return "", false
+	return cgroupMount{}, false
 }
 
 func superOptionsContain(options, controller string) bool {

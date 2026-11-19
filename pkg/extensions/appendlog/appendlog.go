@@ -728,7 +728,12 @@ func (a *AppendLog) fullRewrite(ctx context.Context, h *Handle) error {
 	h.origSize = size
 	h.observeLayoutLocked(client.ContentLayoutAppendLog, revision, size)
 	if h.seq == snapshotSeq && !h.unlinked {
-		h.buf.ClearDirty()
+		// A concurrent close may have published and discarded the buffer while
+		// this upload was in flight: the image still landed, so record the
+		// landing, but there is no buffer left to clear.
+		if h.buf != nil {
+			h.buf.ClearDirty()
+		}
 		h.dirty = false
 		h.adoptCommittedBaselineLocked(revision, size)
 		h.st.appendSafe = true

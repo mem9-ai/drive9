@@ -62,10 +62,11 @@ type overlayQuota struct {
 	// writers of a NAME regardless of the key their admission used (handle
 	// writes book by inode).
 	byPath map[string]map[*pendingReservation]struct{}
-	// drained is the admitted growth not yet known to be on disk. Statfs
-	// refreshes re-base cachedFree on it, so a refresh cannot forget in-flight
-	// admissions.
-	drained int64
+	// unlanded is the admitted growth whose booking has not been resolved yet.
+	// A Statfs sample already includes landed bytes, so refreshing
+	// `cachedFree = free - unlanded` keeps in-flight admissions accounted
+	// WITHOUT subtracting history (which would make the floor fire forever).
+	unlanded int64
 }
 
 // newOverlayQuota builds the quota for root. Both bounds disabled returns nil
@@ -145,6 +146,10 @@ type pendingReservation struct {
 	// (0 when the mutation released the bytes). A retired writer that lands
 	// later is charged only the growth beyond it.
 	baseline int64
+	// retiredCharged is the high-water growth already charged for a retired
+	// booking: several writers share one booking, and each of them settling the
+	// same landed extent must not charge it again.
+	retiredCharged int64
 }
 
 // writeReservation records one write's reservation: the booking it owns (by
@@ -311,13 +316,14 @@ func (q *overlayQuota) retireLocked(booking *pendingReservation, size, baseline 
 	if landed > booking.admittedTotal {
 		landed = booking.admittedTotal
 	}
-	if unused := booking.admittedTotal - landed; unused > 0 {
+	unused := booking.admittedTotal - landed
+	if unused > 0 {
 		q.used -= unused
 		if q.used < 0 {
 			q.used = 0
 		}
-		q.refundFreeEstimateLocked(unused)
 	}
+	q.retireFreeEstimateLocked(booking.admittedTotal, unused)
 	booking.retired = true
 	booking.baseline = baseline
 }
@@ -340,9 +346,14 @@ func (q *overlayQuota) settleWrite(res writeReservation) {
 		return
 	}
 	if booking.retired {
-		if extra := size - booking.baseline; extra > 0 {
-			q.used += extra
-			q.chargeFreeEstimateLocked(extra)
+		// Charge only growth beyond what this booking already accounted: two
+		// writers sharing it each settle once, and both must see the same
+		// landed extent charged exactly once.
+		if extra := size - booking.baseline; extra > booking.retiredCharged {
+			delta := extra - booking.retiredCharged
+			booking.retiredCharged = extra
+			q.used += delta
+			q.drainFreeEstimateLocked(delta)
 		}
 		return
 	}
@@ -443,29 +454,46 @@ func (q *overlayQuota) admitGrowthLocked(growth, required int64) error {
 }
 
 // chargeFreeEstimateLocked drains the free-space estimate for admitted growth
-// and keeps the running drain total used across Statfs refreshes. The caller
-// must hold q.mu.
+// and counts it as unresolved (in flight). The caller must hold q.mu.
 func (q *overlayQuota) chargeFreeEstimateLocked(n int64) {
 	if n <= 0 {
 		return
 	}
-	q.drained += n
+	q.unlanded += n
+	q.drainFreeEstimateLocked(n)
+}
+
+// drainFreeEstimateLocked lowers the cached free estimate by n bytes. The caller
+// must hold q.mu.
+func (q *overlayQuota) drainFreeEstimateLocked(n int64) {
+	if n <= 0 {
+		return
+	}
 	if q.cachedTotal > 0 {
 		q.cachedFree -= n
 	}
 }
 
-// refundFreeEstimateLocked returns unlanded growth to the free-space estimate.
+// refundFreeEstimateLocked returns freed (landed) bytes to the estimate.
 func (q *overlayQuota) refundFreeEstimateLocked(n int64) {
 	if n <= 0 {
 		return
 	}
-	q.drained -= n
-	if q.drained < 0 {
-		q.drained = 0
-	}
 	if q.cachedTotal > 0 {
 		q.cachedFree += n
+	}
+}
+
+// retireFreeEstimateLocked resolves a booking's admission: admittedTotal leaves
+// the in-flight pool (part landed, part refunded), and the refunded part returns
+// to the cached estimate. The caller must hold q.mu.
+func (q *overlayQuota) retireFreeEstimateLocked(admittedTotal, unused int64) {
+	q.unlanded -= admittedTotal
+	if q.unlanded < 0 {
+		q.unlanded = 0
+	}
+	if unused > 0 && q.cachedTotal > 0 {
+		q.cachedFree += unused
 	}
 }
 
@@ -522,7 +550,7 @@ func (q *overlayQuota) checkFreeRatioLocked(required int64) error {
 			// Statfs failed: cannot check, allow the write.
 			return nil
 		}
-		q.cachedTotal, q.cachedFree, q.lastCheck = total, free-q.drained, now
+		q.cachedTotal, q.cachedFree, q.lastCheck = total, free-q.unlanded, now
 	}
 	total, free := q.cachedTotal, q.cachedFree
 	if total <= 0 {

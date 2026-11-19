@@ -44,6 +44,10 @@ type layerHandle struct {
 	// released marks a descriptor whose Release already published: the
 	// registry must never re-select it as the path's surviving claim.
 	released bool
+	// terminalErr records the outcome of the close that discarded the buffer.
+	// A commit that captured that buffer and finds it gone reports this instead
+	// of claiming success over a publish that failed.
+	terminalErr error
 	// conflicted marks a handle whose path changed underneath it in an
 	// external layer refresh while it held uncommitted writes (v1 replay
 	// conflict): writes and commits answer EAGAIN — the buffer is kept, and
@@ -252,6 +256,9 @@ func (h *layerHandle) Release(ctx context.Context) error {
 	// aborts), and one that is mid-flight finishes first. Retained buffer bytes
 	// belong to no one once the handle is closed, so the charge goes back.
 	unlock := h.l.mutLocks.lock(path)
+	h.mu.Lock()
+	h.terminalErr = err
+	h.mu.Unlock()
 	h.releaseBuffer()
 	unlock()
 	h.l.untrackHandle(h)
@@ -417,6 +424,7 @@ func (h *layerHandle) commit(ctx context.Context) error {
 	// clearing it afterwards would nil-deref. Whoever discarded it also ended
 	// this handle's writes, so report success without publishing.
 	bufGone := h.buf == nil || h.buf != buf
+	terminalErr := h.terminalErr
 	h.mu.Unlock()
 	if moved || unlinked || bufGone {
 		unlock()
@@ -426,6 +434,11 @@ func (h *layerHandle) commit(ctx context.Context) error {
 		landingDone(0)
 		if moved {
 			return syscall.EAGAIN
+		}
+		if bufGone {
+			// The close that discarded the buffer owns this handle's publish; a
+			// waiting commit reports its outcome instead of claiming success.
+			return terminalErr
 		}
 		return nil
 	}

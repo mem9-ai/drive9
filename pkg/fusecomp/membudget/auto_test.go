@@ -143,3 +143,36 @@ func TestAutoLimitContainerRootMount(t *testing.T) {
 		t.Fatalf("source = %q", source)
 	}
 }
+
+func TestAutoLimitCommaSeparatedV1Controllers(t *testing.T) {
+	// A v1 cgroup line lists controllers comma-separated.
+	fakeCgroup(t, map[string]string{
+		"/proc/self/cgroup":                        "7:cpu,memory:/job\n",
+		"/proc/self/mountinfo":                     "1 0 0:1 / /sys/fs/cgroup rw - cgroup cgroup rw,cpu,memory\n",
+		"/sys/fs/cgroup/job/memory.limit_in_bytes": "268435456\n",
+	})
+	fraction := autoLimitFraction
+	limit, _ := AutoLimit()
+	if want := int64(float64(int64(256<<20)) * fraction); limit != want {
+		t.Fatalf("limit = %d, want %d", limit, want)
+	}
+}
+
+func TestAutoLimitTranslatesMountinfoSubtree(t *testing.T) {
+	// The cgroup2 mount exposes the /tenant subtree: membership /tenant/job is
+	// <point>/job, not <point>/tenant/job.
+	fakeCgroup(t, map[string]string{
+		"/proc/self/cgroup":             "0::/tenant/job\n",
+		"/proc/self/mountinfo":          "1 0 0:1 /tenant /sys/fs/cgroup rw - cgroup2 cgroup rw\n",
+		"/sys/fs/cgroup/job/memory.max": "268435456\n",
+		"/sys/fs/cgroup/memory.max":     "1073741824\n",
+	})
+	fraction := autoLimitFraction
+	limit, source := AutoLimit()
+	if want := int64(float64(int64(256<<20)) * fraction); limit != want {
+		t.Fatalf("limit = %d, want the child subtree limit %d", limit, want)
+	}
+	if source != "/sys/fs/cgroup/job/memory.max" {
+		t.Fatalf("source = %q", source)
+	}
+}
