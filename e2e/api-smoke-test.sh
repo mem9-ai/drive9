@@ -130,7 +130,6 @@ PROBE_IF_MATCH="unknown"
 PROBE_BATCH_CHECKSUM="unknown"
 PROBE_BATCH_ROUTES="unknown"
 PROBE_V2_UPLOADS="unknown"
-PROBE_LIST_MISSING="unknown"
 PROBE_MKDIR_FILE_CONFLICT="unknown"
 PROBE_FIXTURE_OK="unknown"
 
@@ -464,23 +463,6 @@ probe_features() {
       PROBE_V2_UPLOADS="true"
     fi
 
-    # Listing a path that does not exist: 404 is the current contract, the
-    # legacy answer is 200 with an empty page. A probe on its own fixture keeps
-    # the later assertion from judging the very response it would skip on.
-    resp=$(request POST "$BASE/v1/fs/${dir}/missing?mkdir" --auth "$API_KEY")
-    resp=$(request DELETE "$BASE/v1/fs/${dir}/missing?recursive" --auth "$API_KEY")
-    resp=$(request GET "$BASE/v1/fs/${dir}/missing?list" --auth "$API_KEY")
-    code=$(http_code "$resp")
-    case "$code" in
-      404) PROBE_LIST_MISSING="true" ;;
-      200)
-        if [ "$(json_body "$resp" | jq -r '(.entries|length) // -1')" = "0" ]; then
-          PROBE_LIST_MISSING="false"
-        fi
-        ;;
-      *) info "list-on-missing probe returned $code" ;;
-    esac
-
     # mkdir over an existing file: 409 is the current contract, the legacy
     # answer was a 200 no-op that left the file untouched.
     request PUT "$BASE/v1/fs/${dir}/mkdir-conflict.txt" --auth "$API_KEY" --data "keep-me" >/dev/null
@@ -497,7 +479,7 @@ probe_features() {
     check_eq "a refused mkdir leaves the file intact" "$(json_body "$resp")" "keep-me"
   fi
 
-  info "features: fixture=$PROBE_FIXTURE_OK stat_btime=$PROBE_STAT_BTIME head_validators=$PROBE_HEAD_VALIDATORS range=$PROBE_RANGE if_match=$PROBE_IF_MATCH batch_checksum=$PROBE_BATCH_CHECKSUM batch_routes=$PROBE_BATCH_ROUTES v2_uploads=$PROBE_V2_UPLOADS list_missing=$PROBE_LIST_MISSING mkdir_file_conflict=$PROBE_MKDIR_FILE_CONFLICT"
+  info "features: fixture=$PROBE_FIXTURE_OK stat_btime=$PROBE_STAT_BTIME head_validators=$PROBE_HEAD_VALIDATORS range=$PROBE_RANGE if_match=$PROBE_IF_MATCH batch_checksum=$PROBE_BATCH_CHECKSUM batch_routes=$PROBE_BATCH_ROUTES v2_uploads=$PROBE_V2_UPLOADS mkdir_file_conflict=$PROBE_MKDIR_FILE_CONFLICT"
 }
 
 # check_json <desc> <json body> <jq filter> <expected string form>
@@ -1668,16 +1650,11 @@ if [ "$RUN_CONTRACT_CHECKS" = "1" ]; then
   check_status "an invalid delete kind returns 400" "$resp" "400"
   resp=$(request DELETE "$BASE/v1/fs/$DEL_DIR?recursive" --auth "$API_KEY")
   check_status "recursive delete returns 200" "$resp" "200"
+  # Collection semantics: a missing directory and an empty directory both
+  # answer 200 with an empty page; existence is what ?stat answers (404 below).
   resp=$(request GET "$BASE/v1/fs/$DEL_DIR?list" --auth "$API_KEY")
-  if [ "$PROBE_LIST_MISSING" = "false" ]; then
-    # Legacy contract: a missing directory lists as an empty page. Assert that
-    # explicitly instead of skipping, so a legacy server is still held to a
-    # definite answer.
-    check_status "listing the recursively deleted directory returns 200 (legacy contract)" "$resp" "200"
-    check_json "the legacy listing of the deleted directory is empty" "$(json_body "$resp")" '(.entries|length)' "0"
-  else
-    check_status "listing the recursively deleted directory returns 404" "$resp" "404"
-  fi
+  check_status "listing the recursively deleted directory returns 200" "$resp" "200"
+  check_json "the recursively deleted directory lists empty" "$(json_body "$resp")" '(.entries|length)' "0"
   resp=$(request GET "$BASE/v1/fs/$DEL_DIR?stat" --auth "$API_KEY")
   check_status "stat on the recursively deleted directory returns 404" "$resp" "404"
 

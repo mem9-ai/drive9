@@ -394,10 +394,9 @@ each suite provisions a fresh tenant.
     encoding → `400`
 20. Delete/link contract: non-empty dir → `409`, invalid `?kind` → `400`,
     `?recursive` → `200`, `?kind=file` twice → `200`/`404`, symlink create
-    (`409` on duplicate, `400` on empty target) and delete. Listing a deleted
-    directory follows the probed contract: `404` on a current server, or the
-    legacy empty page (asserted as `200` + zero entries, never skipped). An
-    existing empty directory lists `200` with zero entries on either contract
+    (`409` on duplicate, `400` on empty target) and delete. Listing is a
+    collection read: a deleted directory and an existing empty directory both
+    answer `200` with zero entries (existence is what `?stat` → `404` says)
 21. Error/routing contract: missing file/`?stat`/`HEAD` → `404`, no action
     selector → `400`, `?copy`/`?rename` without source → `400`, `mkdir` over an
     existing directory → `409`, `mkdir` over an existing file → `409` with the
@@ -432,15 +431,14 @@ Steps 16-24 are opt-out (`RUN_CONTRACT_CHECKS`, `RUN_BATCH_CHECKS`,
 
 Before the extension steps run, `probe_features` asks the deployment what it
 actually serves -- `?stat` btime, HEAD read validators (ETag / Accept-Ranges /
-content layout), `Range`, `If-Match`, `batch-stat include_checksum`, and the
-two contracts that changed most recently (`?list` on a missing path, `?mkdir`
-over an existing file). A probe records `false` only on the documented absence
-signal; every other answer leaves it `unknown`, and gates skip only on a
-confirmed `false`, so an inconclusive probe runs the assertions instead of
-hiding behind them. That keeps the suite honest on the server snapshot this
-repository's Local E2E runs while still hard-asserting every feature a modern
-deployment does serve. Against the server repository's current build every
-probe is true and no extension check is skipped.
+content layout), `Range`, `If-Match`, `batch-stat include_checksum`, and
+whether `?mkdir` over an existing file is a conflict. A probe records `false`
+only on the documented older answer; every other answer leaves it `unknown`,
+and gates skip only on a confirmed `false`, so an inconclusive probe runs the
+assertions instead of hiding behind them. That keeps the suite honest on the
+server snapshot this repository's Local E2E runs while still hard-asserting
+every feature a modern deployment does serve. Against the server repository's
+current build every probe is true and no extension check is skipped.
 
 Provider-dependent behavior (append-log, PATCH dirty parts,
 `/v1/fs:batch-upload`, `/v1/object-credentials`, tenant delete) is not covered
