@@ -130,6 +130,8 @@ PROBE_IF_MATCH="unknown"
 PROBE_BATCH_CHECKSUM="unknown"
 PROBE_BATCH_ROUTES="unknown"
 PROBE_V2_UPLOADS="unknown"
+PROBE_LIST_MISSING="unknown"
+PROBE_MKDIR_FILE_CONFLICT="unknown"
 PROBE_FIXTURE_OK="unknown"
 
 PASS=0
@@ -461,9 +463,41 @@ probe_features() {
     else
       PROBE_V2_UPLOADS="true"
     fi
+
+    # Listing a path that does not exist: 404 is the current contract, the
+    # legacy answer is 200 with an empty page. A probe on its own fixture keeps
+    # the later assertion from judging the very response it would skip on.
+    resp=$(request POST "$BASE/v1/fs/${dir}/missing?mkdir" --auth "$API_KEY")
+    resp=$(request DELETE "$BASE/v1/fs/${dir}/missing?recursive" --auth "$API_KEY")
+    resp=$(request GET "$BASE/v1/fs/${dir}/missing?list" --auth "$API_KEY")
+    code=$(http_code "$resp")
+    case "$code" in
+      404) PROBE_LIST_MISSING="true" ;;
+      200)
+        if [ "$(json_body "$resp" | jq -r '(.entries|length) // -1')" = "0" ]; then
+          PROBE_LIST_MISSING="false"
+        fi
+        ;;
+      *) info "list-on-missing probe returned $code" ;;
+    esac
+
+    # mkdir over an existing file: 409 is the current contract, the legacy
+    # answer was a 200 no-op that left the file untouched.
+    request PUT "$BASE/v1/fs/${dir}/mkdir-conflict.txt" --auth "$API_KEY" --data "keep-me" >/dev/null
+    resp=$(request POST "$BASE/v1/fs/${dir}/mkdir-conflict.txt?mkdir" --auth "$API_KEY")
+    code=$(http_code "$resp")
+    case "$code" in
+      409) PROBE_MKDIR_FILE_CONFLICT="true" ;;
+      200) PROBE_MKDIR_FILE_CONFLICT="false" ;;
+      *) info "mkdir-over-file probe returned $code" ;;
+    esac
+
+    # The file must survive the mkdir attempt on either contract.
+    resp=$(request GET "$BASE/v1/fs/${dir}/mkdir-conflict.txt" --auth "$API_KEY")
+    check_eq "a refused mkdir leaves the file intact" "$(json_body "$resp")" "keep-me"
   fi
 
-  info "features: fixture=$PROBE_FIXTURE_OK stat_btime=$PROBE_STAT_BTIME head_validators=$PROBE_HEAD_VALIDATORS range=$PROBE_RANGE if_match=$PROBE_IF_MATCH batch_checksum=$PROBE_BATCH_CHECKSUM batch_routes=$PROBE_BATCH_ROUTES v2_uploads=$PROBE_V2_UPLOADS"
+  info "features: fixture=$PROBE_FIXTURE_OK stat_btime=$PROBE_STAT_BTIME head_validators=$PROBE_HEAD_VALIDATORS range=$PROBE_RANGE if_match=$PROBE_IF_MATCH batch_checksum=$PROBE_BATCH_CHECKSUM batch_routes=$PROBE_BATCH_ROUTES v2_uploads=$PROBE_V2_UPLOADS list_missing=$PROBE_LIST_MISSING mkdir_file_conflict=$PROBE_MKDIR_FILE_CONFLICT"
 }
 
 # check_json <desc> <json body> <jq filter> <expected string form>
@@ -1635,10 +1669,26 @@ if [ "$RUN_CONTRACT_CHECKS" = "1" ]; then
   resp=$(request DELETE "$BASE/v1/fs/$DEL_DIR?recursive" --auth "$API_KEY")
   check_status "recursive delete returns 200" "$resp" "200"
   resp=$(request GET "$BASE/v1/fs/$DEL_DIR?list" --auth "$API_KEY")
-  check_status "listing the recursively deleted directory returns 200" "$resp" "200"
-  check_json "the recursively deleted directory lists empty" "$(json_body "$resp")" '(.entries|length)' "0"
+  if [ "$PROBE_LIST_MISSING" = "false" ]; then
+    # Legacy contract: a missing directory lists as an empty page. Assert that
+    # explicitly instead of skipping, so a legacy server is still held to a
+    # definite answer.
+    check_status "listing the recursively deleted directory returns 200 (legacy contract)" "$resp" "200"
+    check_json "the legacy listing of the deleted directory is empty" "$(json_body "$resp")" '(.entries|length)' "0"
+  else
+    check_status "listing the recursively deleted directory returns 404" "$resp" "404"
+  fi
   resp=$(request GET "$BASE/v1/fs/$DEL_DIR?stat" --auth "$API_KEY")
   check_status "stat on the recursively deleted directory returns 404" "$resp" "404"
+
+  # An existing empty directory must still list as an empty page on either
+  # contract: the 404 above is about the missing path, not about emptiness.
+  EMPTY_DIR="${CONTRACT_DIR}/empty"
+  resp=$(request POST "$BASE/v1/fs/$EMPTY_DIR?mkdir" --auth "$API_KEY")
+  check_status "mkdir for the empty-directory fixture returns 200" "$resp" "200"
+  resp=$(request GET "$BASE/v1/fs/$EMPTY_DIR?list" --auth "$API_KEY")
+  check_status "listing an existing empty directory returns 200" "$resp" "200"
+  check_json "an existing empty directory lists zero entries" "$(json_body "$resp")" '(.entries|length)' "0"
 
   resp=$(request PUT "$BASE/v1/fs/$DEL_FILE" --auth "$API_KEY" --data "bye")
   check_status "PUT the single-file delete fixture returns 200" "$resp" "200"
@@ -1681,6 +1731,14 @@ if [ "$RUN_CONTRACT_CHECKS" = "1" ]; then
   check_status "POST ?rename without a source header returns 400" "$resp" "400"
   resp=$(request POST "$BASE/v1/fs/$CONTRACT_DIR?mkdir" --auth "$API_KEY")
   check_status "mkdir over an existing directory returns 409" "$resp" "409"
+  if [ "$PROBE_MKDIR_FILE_CONFLICT" = "false" ]; then
+    skip_check "mkdir over an existing file returns 409 (legacy server treats it as a no-op)"
+  else
+    resp=$(request POST "$BASE/v1/fs/$STAT_PATH?mkdir" --auth "$API_KEY")
+    check_status "mkdir over an existing file returns 409" "$resp" "409"
+    resp=$(request GET "$BASE/v1/fs/$STAT_PATH" --auth "$API_KEY")
+    check_eq "the refused mkdir leaves the stat fixture content intact" "$(json_body "$resp")" "$STAT_PAYLOAD"
+  fi
   if [ "$PROBE_BATCH_ROUTES" = "false" ]; then
     skip_check "a wrong method on /v1/fs:batch-stat returns 405 (route absent)"
   else
