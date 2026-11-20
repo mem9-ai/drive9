@@ -27,6 +27,7 @@ const (
 )
 
 type mountFuseOptions struct {
+	MountID                      string
 	Server                       string
 	APIKey                       string
 	Token                        string

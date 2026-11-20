@@ -18,10 +18,6 @@ func Rm(c *client.Client, args []string) error {
 		return err
 	}
 	defer withObjectAuthLocal(authLocal)()
-	layerRef, args, err := parseLayerFlag(args)
-	if err != nil {
-		return err
-	}
 	var (
 		path       string
 		parseFlags = true
@@ -57,9 +53,6 @@ func Rm(c *client.Client, args []string) error {
 		return herr
 	}
 	if h.Loc.Kind == KindObject {
-		if layerRef != "" {
-			return fmt.Errorf("--layer is drive9-only")
-		}
 		ctx, cancel := withObjectOpTimeout(context.Background())
 		defer cancel()
 		if err := h.Backend.Remove(ctx, h.Loc, recursive); err != nil {
@@ -68,9 +61,6 @@ func Rm(c *client.Client, args []string) error {
 		return nil
 	}
 	c, path = h.Client, h.Path
-	if layerRef != "" {
-		return whiteoutLayerPath(context.Background(), c, layerRef, path, recursive)
-	}
 	if recursive {
 		return c.RemoveAll(path)
 	}

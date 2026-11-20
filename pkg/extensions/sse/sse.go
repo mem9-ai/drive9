@@ -94,16 +94,27 @@ func (w *SSE) handleCurrent() {
 // Drain is a no-op: the stream carries no durable work.
 func (w *SSE) Drain(ctx context.Context) error { return nil }
 
-// Stop disconnects and waits for the stream goroutine.
+// Stop disconnects and confirms the stream goroutine has exited. A deadline
+// is a failure, not proof that old-view notifications have stopped. Retrying
+// Stop is safe after a timeout; an already-finished watcher returns success.
 func (w *SSE) Stop(ctx context.Context) error {
-	if w.cancel != nil {
-		w.cancel()
-		select {
-		case <-w.doneCh:
-		case <-time.After(5 * time.Second):
-		}
+	if w.cancel == nil {
+		return nil
 	}
-	return nil
+	w.cancel()
+	select {
+	case <-w.doneCh:
+		return nil
+	default:
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	select {
+	case <-w.doneCh:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // Do is a pass-through: this extension only observes.

@@ -26,7 +26,7 @@ type AppendLogResult struct {
 const maxAppendLogInt64 = int64(1<<63 - 1)
 
 // AppendLog streams an immutable tail to the server-owned append-log endpoint.
-func (c *Client) AppendLog(ctx context.Context, path string, tail io.Reader, tailSize, expectedRevision, expectedSize int64) (AppendLogResult, error) {
+func (c *Client) AppendLog(ctx context.Context, path string, tail io.Reader, tailSize, expectedRevision, expectedSize int64) (out AppendLogResult, err error) {
 	if tailSize < 0 || expectedRevision < 0 || expectedSize < 0 {
 		return AppendLogResult{}, fmt.Errorf("append-log sizes and revision must be non-negative")
 	}
@@ -51,6 +51,7 @@ func (c *Client) AppendLog(ctx context.Context, path string, tail io.Reader, tai
 	req.Header.Set("X-Dat9-Expected-Revision", strconv.FormatInt(expectedRevision, 10))
 	req.Header.Set("X-Dat9-Expected-Size", strconv.FormatInt(expectedSize, 10))
 
+	defer func() { err = c.viewMutationError(req, err) }()
 	resp, err := c.do(req)
 	if err != nil {
 		return AppendLogResult{}, err
@@ -61,16 +62,23 @@ func (c *Client) AppendLog(ctx context.Context, path string, tail io.Reader, tai
 	}
 
 	var result AppendLogResult
-	decoder := json.NewDecoder(resp.Body)
-	if err := decoder.Decode(&result); err != nil {
-		return AppendLogResult{}, fmt.Errorf("decode append-log response: %w", err)
-	}
-	var trailing json.RawMessage
-	if err := decoder.Decode(&trailing); err != io.EOF {
-		if err == nil {
-			err = fmt.Errorf("multiple JSON values")
+	if c.view.LayerID != "" {
+		if err := c.decodeViewMutation(req, resp, &result); err != nil {
+			return AppendLogResult{}, fmt.Errorf("decode append-log response: %w", err)
 		}
-		return AppendLogResult{}, fmt.Errorf("decode append-log response trailing data: %w", err)
+	} else {
+		decoder := json.NewDecoder(resp.Body)
+		if err := decoder.Decode(&result); err != nil {
+			return AppendLogResult{}, fmt.Errorf("decode append-log response: %w", err)
+		}
+		var trailing json.RawMessage
+		if err := decoder.Decode(&trailing); err != io.EOF {
+			if err == nil {
+				err = fmt.Errorf("multiple JSON values")
+			}
+			return AppendLogResult{}, fmt.Errorf("decode append-log response trailing data: %w", err)
+		}
+
 	}
 	if result.Revision <= 0 {
 		return AppendLogResult{}, fmt.Errorf("append-log response omitted committed revision")
@@ -83,7 +91,7 @@ func (c *Client) AppendLog(ctx context.Context, path string, tail io.Reader, tai
 
 // WriteServerStreamConditional sends one ordinary conditional PUT to the
 // Drive9 server. It intentionally does not select any multipart upload plan.
-func (c *Client) WriteServerStreamConditional(ctx context.Context, path string, body io.Reader, size, expectedRevision int64) (int64, error) {
+func (c *Client) WriteServerStreamConditional(ctx context.Context, path string, body io.Reader, size, expectedRevision int64) (revision int64, err error) {
 	if size < 0 || expectedRevision < 0 {
 		return 0, fmt.Errorf("server stream size and expected revision must be non-negative")
 	}
@@ -104,6 +112,7 @@ func (c *Client) WriteServerStreamConditional(ctx context.Context, path string, 
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("X-Dat9-Expected-Revision", strconv.FormatInt(expectedRevision, 10))
 
+	defer func() { err = c.viewMutationError(req, err) }()
 	resp, err := c.do(req)
 	if err != nil {
 		return 0, markCommitAttempt(err)
@@ -115,7 +124,7 @@ func (c *Client) WriteServerStreamConditional(ctx context.Context, path string, 
 	var result struct {
 		Revision int64 `json:"revision"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := c.decodeViewMutation(req, resp, &result); err != nil {
 		return 0, markCommitAttempt(fmt.Errorf("decode server stream response: %w", err))
 	}
 	if result.Revision <= 0 {

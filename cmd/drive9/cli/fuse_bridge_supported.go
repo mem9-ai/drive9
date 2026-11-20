@@ -32,6 +32,7 @@ func mountFuseImpl(opts *mountFuseOptions) error {
 		return err
 	}
 	return drive9fuse.Mount(&drive9fuse.MountOptions{
+		MountID:                     opts.MountID,
 		Server:                      opts.Server,
 		APIKey:                      opts.APIKey,
 		Token:                       opts.Token,

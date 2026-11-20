@@ -204,12 +204,11 @@ func TestPortPathTruncateKeepsDirtyOwnerAndCleanSibling(t *testing.T) {
 // through one hardlink alias rebases every other open handle of the same
 // inode (syncAliasHandlesAfterTruncate). A new-plane alias handle only holds
 // a buffer once it has written, so the rebase is pinned on a flushed-then-
-// clean alias writer: its retained buffer serves the truncated size and —
-// the new behavior, where the rebase marks the alias dirty — its own close
-// publishes the truncated image instead of republishing the stale tail.
+// clean alias writer. For a known single layout, pathname zero truncate
+// commits immediately and alias close must not republish the stale tail.
 func TestPortPathTruncateRefreshesCleanHardlinkHandle(t *testing.T) {
 	b := testbackend.NewBackend()
-	b.Seed("/orig", []byte("seed"))
+	b.SeedWithLayout("/orig", []byte("seed"), "single")
 	b.SeedHardlink("/orig", "/alias")
 	ts := httptest.NewServer(b)
 	t.Cleanup(ts.Close)
@@ -249,14 +248,14 @@ func TestPortPathTruncateRefreshesCleanHardlinkHandle(t *testing.T) {
 	if n, err := alias.Read(ctx, 0, buf); err != nil || n != 0 {
 		t.Fatalf("alias read after truncate = %d %v, want 0 bytes", n, err)
 	}
-	// The rebased alias is a publisher of the truncated image (the rebase
-	// marks it dirty): its close publishes the truncation, never the stale
-	// pre-truncation tail.
+	// The path mutation already committed; the clean alias must not publish
+	// again when its delayed close arrives.
+	committed, _ := b.Node("/orig")
 	if err := alias.Release(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if n, _ := b.Node("/alias"); len(n.Data) != 0 {
-		t.Fatalf("alias release republished a stale image: %q", n.Data)
+	if n, _ := b.Node("/alias"); len(n.Data) != 0 || n.Rev != committed.Rev {
+		t.Fatalf("alias release republished: body=%q rev=%d want=%d", n.Data, n.Rev, committed.Rev)
 	}
 	if err := orig.Write(ctx, 0, []byte("final")); err != nil {
 		t.Fatal(err)

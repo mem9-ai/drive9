@@ -9,6 +9,9 @@ import (
 	"fmt"
 	"net"
 	"time"
+
+	"github.com/mem9-ai/drive9/pkg/mountstate"
+	"github.com/mem9-ai/drive9/pkg/viewprotocol"
 )
 
 const DefaultDrainTimeout = 30 * time.Second
@@ -30,6 +33,14 @@ type StatusResponse struct {
 	// workspace). Nil means the mount predates layer reporting.
 	Layer *string `json:"layer,omitempty"`
 	Error string  `json:"error,omitempty"`
+	// ViewSwitch promises same-connection ping -> switch/switch-operation
+	// negotiation and an EOF-terminated final reply. Advertise it only after
+	// the complete switch engine and connection handler are installed.
+	ViewSwitch bool                      `json:"view_switch,omitempty"`
+	MountID    string                    `json:"mount_id,omitempty"`
+	Generation uint64                    `json:"generation,omitempty"`
+	Binding    *viewprotocol.Binding     `json:"binding,omitempty"`
+	Pending    *mountstate.SwitchReceipt `json:"pending,omitempty"`
 }
 
 func (r DrainRequest) Timeout() time.Duration {
@@ -145,6 +156,8 @@ func RequestStatus(ctx context.Context, socketPath string, timeout time.Duration
 		return nil, fmt.Errorf("dial mount control socket %s: %w", socketPath, err)
 	}
 	defer func() { _ = conn.Close() }()
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(deadline)
 	}

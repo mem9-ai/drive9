@@ -18,12 +18,8 @@ func Mkdir(c *client.Client, args []string) error {
 		return err
 	}
 	defer withObjectAuthLocal(authLocal)()
-	layerRef, args, err := parseLayerFlag(args)
-	if err != nil {
-		return err
-	}
 	if len(args) != 1 {
-		return fmt.Errorf("usage: drive9 fs mkdir [--layer <ref>] [--auth=local|server] <path>")
+		return fmt.Errorf("usage: drive9 fs mkdir [--auth=local|server] <path>")
 	}
 	path := args[0]
 	h, err := fsHandleForArg(c, path)
@@ -31,9 +27,6 @@ func Mkdir(c *client.Client, args []string) error {
 		return err
 	}
 	if h.Loc.Kind == KindObject {
-		if layerRef != "" {
-			return fmt.Errorf("--layer is drive9-only")
-		}
 		ctx, cancel := withObjectOpTimeout(context.Background())
 		defer cancel()
 		if err := h.Backend.Mkdir(ctx, h.Loc); err != nil {
@@ -43,13 +36,6 @@ func Mkdir(c *client.Client, args []string) error {
 		return nil
 	}
 	c, path = h.Client, h.Path
-	if layerRef != "" {
-		if err := mkdirLayerPath(context.Background(), c, layerRef, path, 0o755); err != nil {
-			return err
-		}
-		fmt.Printf("created %s\n", path)
-		return nil
-	}
 	if err := c.Mkdir(path); err != nil {
 		return err
 	}

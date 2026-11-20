@@ -215,6 +215,67 @@ func (rec *multipartUploadRecorder) client() *client.Client {
 	return client.New(rec.server.URL, "")
 }
 
+func TestBufferedUploadRoutingPreservesRevisionAndFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		size, threshold int64
+		direct          bool
+	}{
+		{"empty-unknown", 0, 0, true},
+		{"empty-known", 0, 4, true},
+		{"unknown", 1, 0, false},
+		{"below", 3, 4, true},
+		{"equal", 4, 4, false},
+		{"above", 5, 4, false},
+	} {
+		for _, fail := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/fail=%v", tc.name, fail), func(t *testing.T) {
+				expected := int64(7)
+				rec := newMultipartUploadRecorder(t, "/file", tc.size, &expected)
+				var calls atomic.Int32
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					calls.Add(1)
+					if fail {
+						method, path := http.MethodPost, "/v2/uploads/initiate"
+						if tc.direct {
+							method, path = http.MethodPut, "/v1/fs/file"
+						}
+						if r.Method != method || r.URL.Path != path {
+							t.Errorf("failed route = %s %s, want %s %s", r.Method, r.URL.Path, method, path)
+						}
+						w.WriteHeader(http.StatusServiceUnavailable)
+						return
+					}
+					rec.server.Config.Handler.ServeHTTP(w, r)
+				}))
+				t.Cleanup(server.Close)
+				c := client.New(server.URL, "")
+				c.SetSmallFileThresholdForTests(tc.threshold)
+				revision, err := uploadBufferedRemoteFileWithRevision(t.Context(), c, "/file", make([]byte, tc.size), expected)
+				if fail {
+					if err == nil || revision != 0 || calls.Load() != 1 {
+						t.Fatalf("failure = revision:%d err:%v calls:%d; want error, zero revision and no fallback", revision, err, calls.Load())
+					}
+					return
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				wantRevision, directCalls, multipartCalls := int64(0), int32(0), int32(1)
+				if tc.direct {
+					wantRevision, directCalls, multipartCalls = rec.committedRev, 1, 0
+				}
+				if revision != wantRevision || rec.directFilePuts.Load() != directCalls || rec.initiateCalls.Load() != multipartCalls || rec.completeCalls.Load() != multipartCalls {
+					t.Fatalf("revision=%d direct=%d initiate=%d complete=%d, want %d/%d/%d/%d", revision, rec.directFilePuts.Load(), rec.initiateCalls.Load(), rec.completeCalls.Load(), wantRevision, directCalls, multipartCalls, multipartCalls)
+				}
+				if rec.statCalls.Load() != 0 {
+					t.Fatal("upload queried a potentially newer revision")
+				}
+			})
+		}
+	}
+}
+
 func TestTruncateReaderAtPreservesPrefixAndZeroFillsExtension(t *testing.T) {
 	// v1's truncateReaderAt read from a local source; the port's
 	// remoteTruncateReaderAt fetches the kept prefix from the backend, so

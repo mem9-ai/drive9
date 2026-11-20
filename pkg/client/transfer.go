@@ -32,6 +32,7 @@ type UploadPlan struct {
 
 // PartURL is a presigned URL for uploading one part.
 type PartURL struct {
+	SkipUpload     bool              `json:"skip_upload,omitempty"`
 	Number         int               `json:"number"`
 	URL            string            `json:"url"`
 	Size           int64             `json:"size"`
@@ -46,6 +47,7 @@ type PartURL struct {
 // uploadPlanV2 mirrors the server's UploadPlanV2 response.
 type uploadPlanV2 struct {
 	UploadID         string           `json:"upload_id"`
+	ContentLayout    ContentLayout    `json:"content_layout"`
 	Key              string           `json:"key"`
 	PartSize         int64            `json:"part_size"`
 	TotalParts       int              `json:"total_parts"`
@@ -619,6 +621,39 @@ func (c *Client) writeStreamConditionalWithOptionsAndSummary(ctx context.Context
 		RemotePath: path,
 		TotalBytes: size,
 	}
+	if c.view.LayerID != "" {
+		if opts.layout != "" && opts.layout != ContentLayoutExtent {
+			return nil, fmt.Errorf("fixed views do not support layout=%q", opts.layout)
+		}
+		if opts.layout != ContentLayoutExtent && UseDirectPUT(size, threshold) {
+			summary.Mode = "direct_put"
+			summary.PartSizeBytes = size
+			summary.TotalParts = 1
+			summary.UploadedParts = 1
+			summary.Parallelism = 1
+			directWriteStart := time.Now()
+			data, err := io.ReadAll(r)
+			if err != nil {
+				return nil, fmt.Errorf("read data: %w", err)
+			}
+			if err := runPreCompleteCheck(ctx, preCompleteCheck); err != nil {
+				return nil, err
+			}
+			if _, err := c.writeCtxConditionalDirectOnly(ctx, path, data, expectedRevision, opts.tags, opts.description); err != nil {
+				return nil, err
+			}
+			summary.DirectWriteSeconds = time.Since(directWriteStart).Seconds()
+			return finishUploadSummary(summary), nil
+		}
+		ra, ok := r.(io.ReaderAt)
+		if !ok {
+			return nil, fmt.Errorf("large uploads require an io.ReaderAt (seekable source)")
+		}
+		if err := c.writeFixedExtentStream(ctx, path, ra, size, progress, expectedRevision, summary, opts.tags, opts.description, checksumSHA256, preCompleteCheck); err != nil {
+			return nil, err
+		}
+		return finishUploadSummary(summary), nil
+	}
 
 	forceExtent := opts.layout == ContentLayoutExtent || (opts.layout == "" && opts.targetLayout == ContentLayoutExtent && checksumSHA256 == "")
 	// useDirectPUT picks the simple-PUT path. When threshold == 0 (no server
@@ -845,6 +880,9 @@ func (c *Client) writeStreamV2WithSummary(ctx context.Context, path string, ra i
 }
 
 func (c *Client) writeStreamV2WithSummaryAndPreCompleteCheck(ctx context.Context, path string, ra io.ReaderAt, size int64, progress ProgressFunc, expectedRevision int64, summary *UploadSummary, tags map[string]string, description, checksumSHA256 string, preCompleteCheck func() error) error {
+	if c.view.LayerID != "" {
+		return c.writeFixedExtentStream(ctx, path, ra, size, progress, expectedRevision, summary, tags, description, checksumSHA256, preCompleteCheck)
+	}
 	if err := validateTags(tags); err != nil {
 		return err
 	}
@@ -1020,11 +1058,11 @@ func (c *Client) initiateUploadLegacy(ctx context.Context, path string, size int
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusAccepted {
-		return UploadPlan{}, readError(resp)
+		return UploadPlan{}, c.viewMutationError(req, readError(resp))
 	}
 
 	var plan UploadPlan
-	if err := json.NewDecoder(resp.Body).Decode(&plan); err != nil {
+	if err := c.decodeViewMutation(req, resp, &plan); err != nil {
 		return UploadPlan{}, fmt.Errorf("decode upload plan: %w", err)
 	}
 	return plan, nil
@@ -1627,6 +1665,9 @@ func (c *Client) completeUploadV2WithOptions(ctx context.Context, uploadID strin
 
 // abortUploadV2 sends POST /v2/uploads/{id}/abort.
 func (c *Client) abortUploadV2(ctx context.Context, uploadID string) error {
+	if c.view.LayerID != "" {
+		return fmt.Errorf("fixed upload cancellation requires AbortFixedUpload and an explicit operation ID")
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		c.baseURL+"/v2/uploads/"+uploadID+"/abort", nil)
 	if err != nil {
@@ -1652,6 +1693,10 @@ func (c *Client) abortUploadV2BestEffort(parent context.Context, uploadID string
 	}
 	ctx, cancel := newMultipartAbortContext(parent, timeout)
 	defer cancel()
+	if c.view.LayerID != "" {
+		_, _ = c.AbortFixedUpload(ctx, fixedUploadPhaseID("abort", uploadID), uploadID)
+		return
+	}
 	_ = c.abortUploadV2(ctx, uploadID)
 }
 
@@ -1670,7 +1715,7 @@ func (c *Client) ReadStream(ctx context.Context, path string) (io.ReadCloser, er
 	}
 
 	switch {
-	case resp.StatusCode < 300 && ContentLayout(resp.Header.Get("X-Dat9-Content-Layout")) == ContentLayoutExtent:
+	case c.view.LayerID == "" && resp.StatusCode < 300 && ContentLayout(resp.Header.Get("X-Dat9-Content-Layout")) == ContentLayoutExtent:
 		// Extent layout: the body is a JSON block read plan, not bytes.
 		return c.serveExtentPlan(ctx, path, resp, -1, -1)
 
@@ -1717,19 +1762,26 @@ func (c *Client) readWithoutRedirectOptIn(ctx context.Context, path, rangeHeader
 	if err != nil {
 		return nil, err
 	}
-	if extentPlan {
+	if extentPlan && c.view.LayerID == "" {
 		req.Header.Set("X-Dat9-Extent-Read-Plan", "1")
 	}
 	if rangeHeader != "" {
 		req.Header.Set("Range", rangeHeader)
 	}
-	return c.doNoRedirect(req)
+	resp, err := c.doNoRedirect(req)
+	if err == nil && c.view.LayerID != "" && resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		// Fixed-view reads use the server's protected stream. A Location does not
+		// carry that version/lifetime contract and must never fall back to main.
+		_ = resp.Body.Close()
+		return nil, fmt.Errorf("fixed view read returned an unsupported redirect: HTTP %d", resp.StatusCode)
+	}
+	return resp, err
 }
 
 // ResolveReadTarget resolves a large S3-backed file path to a reusable object
 // URL. Inline files and content_layout=extent files return an error matched by
 // IsReadTargetNoRedirect because there is no single object URL to reuse;
-// callers fall back to ReadStream (extent uses the JuiceFS DataReader).
+// callers fall back to ReadStream (extent uses the negotiated read plan).
 func (c *Client) ResolveReadTarget(ctx context.Context, path string) (*ReadTarget, error) {
 	return c.resolveReadTarget(ctx, path)
 }
@@ -1763,7 +1815,7 @@ func (c *Client) resolveReadTargetOrExtentPlan(ctx context.Context, path string)
 		}
 		return &ReadTarget{ObjectURL: location}, nil, nil
 
-	case resp.StatusCode < 300 && ContentLayout(resp.Header.Get("X-Dat9-Content-Layout")) == ContentLayoutExtent:
+	case c.view.LayerID == "" && resp.StatusCode < 300 && ContentLayout(resp.Header.Get("X-Dat9-Content-Layout")) == ContentLayoutExtent:
 		var plan ExtentReadPlan
 		if err := json.NewDecoder(resp.Body).Decode(&plan); err != nil {
 			return nil, nil, fmt.Errorf("decode extent read plan: %w", err)
@@ -1836,7 +1888,7 @@ func (c *Client) ReadStreamRange(ctx context.Context, path string, offset, lengt
 	}
 
 	switch {
-	case resp.StatusCode < 300 && ContentLayout(resp.Header.Get("X-Dat9-Content-Layout")) == ContentLayoutExtent:
+	case c.view.LayerID == "" && resp.StatusCode < 300 && ContentLayout(resp.Header.Get("X-Dat9-Content-Layout")) == ContentLayoutExtent:
 		// Extent layout: the plan tiles the requested window; the reader
 		// stays bounded so continuation chains cannot stream past the
 		// caller's length.

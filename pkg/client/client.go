@@ -25,6 +25,7 @@ import (
 
 // Client is the drive9 HTTP client.
 type Client struct {
+	view                  ViewBinding // immutable per-client filesystem work binding
 	baseURL               string
 	apiKey                string
 	actor                 string // X-Dat9-Actor header value (per-mount ID)
@@ -481,7 +482,12 @@ func (c *Client) newFSRequest(ctx context.Context, method, path, rawQuery string
 	if err != nil {
 		return nil, err
 	}
-	return http.NewRequestWithContext(ctx, method, reqURL+rawQuery, body)
+	req, err := http.NewRequestWithContext(ctx, method, reqURL+rawQuery, body)
+	if err != nil {
+		return nil, err
+	}
+	c.identifyViewMutation(req)
+	return req, nil
 }
 
 func escapeFSPath(path string) string {
@@ -808,7 +814,23 @@ func (c *Client) doWith(req *http.Request, hc *http.Client) (*http.Response, err
 	if c.actor != "" {
 		req.Header.Set("X-Dat9-Actor", c.actor)
 	}
-	return hc.Do(req)
+	return c.sendBoundRequest(req, hc)
+}
+
+// sendBoundRequest preserves the caller's already selected headers (including
+// the SSE mount actor) while applying view routing and redirect confinement.
+func (c *Client) sendBoundRequest(req *http.Request, hc *http.Client) (*http.Response, error) {
+	bound, err := c.boundRequest(req)
+	if err != nil {
+		return nil, err
+	}
+	if c.view.LayerID != "" {
+		boundHTTP := *hc
+		boundHTTP.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+		hc = &boundHTTP
+	}
+	resp, err := hc.Do(bound)
+	return c.viewMutationOutcome(bound, resp, err)
 }
 
 // Write uploads data to a remote path.
@@ -873,6 +895,10 @@ func (c *Client) CreateFile(path string) (int64, error) {
 // CreateFileCtx creates an empty file with context support and returns the
 // committed file revision when the server reports it.
 func (c *Client) CreateFileCtx(ctx context.Context, path string) (int64, error) {
+	if c.view.LayerID != "" {
+		out, err := c.CreateFixedFileCtx(ctx, path, 0o644)
+		return out.Revision, err
+	}
 	rev, _, err := c.CreateFileCreatedCtx(ctx, path)
 	return rev, err
 }
@@ -884,6 +910,10 @@ func (c *Client) CreateFileCtx(ctx context.Context, path string) (int64, error) 
 // between, so binding its answer would let this descriptor write into a
 // stranger's file. Servers that predate the echo leave it empty.
 func (c *Client) CreateFileCreatedCtx(ctx context.Context, path string) (int64, string, error) {
+	if c.view.LayerID != "" {
+		out, err := c.CreateFixedFileCtx(ctx, path, 0o644)
+		return out.Revision, out.ResourceID, err
+	}
 	req, err := c.newFSRequest(ctx, http.MethodPost, path, "?create=1", nil)
 	if err != nil {
 		return 0, "", err
@@ -916,6 +946,9 @@ func (c *Client) CreateFileCreatedCtx(ctx context.Context, path string) (int64, 
 // falls back to `?create=1` with nativeExtent=false so the caller can track a
 // 0-byte placeholder and upgrade it on first write.
 func (c *Client) CreateExtentFileCreatedCtx(ctx context.Context, path string) (rev int64, resourceID string, nativeExtent bool, err error) {
+	if c.view.LayerID != "" {
+		return 0, "", false, errors.New("native empty extent create requires main")
+	}
 	req, err := c.newFSRequest(ctx, http.MethodPost, path, "?create=1&layout=extent", nil)
 	if err != nil {
 		return 0, "", false, err
@@ -1001,7 +1034,7 @@ func (c *Client) HardlinkCtx(ctx context.Context, srcPath, dstPath string) error
 
 func (c *Client) writeCtxConditionalFull(ctx context.Context, path string, data []byte, expectedRevision int64, tags map[string]string, description string) (int64, error) {
 	rev, err := c.writeCtxConditionalDirectOnly(ctx, path, data, expectedRevision, tags, description)
-	if err != nil && mayBeExtentDirectWriteRejection(err, expectedRevision) {
+	if err != nil && c.view.LayerID == "" && mayBeExtentDirectWriteRejection(err, expectedRevision) {
 		if st, statErr := c.StatCtx(ctx, path); statErr == nil && st != nil && !st.IsDir && st.ContentLayout == ContentLayoutExtent {
 			extRev, extErr := c.writeExtentBytesConditional(ctx, path, data, expectedRevision, tags, description, nil, nil)
 			if extErr == nil && extRev > 0 {
@@ -1060,9 +1093,22 @@ func (c *Client) writeCtxConditionalDirectOnly(ctx context.Context, path string,
 	var result struct {
 		Revision int64 `json:"revision"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		// If response doesn't contain revision (old server), return 0.
+	if err := c.decodeViewMutation(req, resp, &result); err != nil {
+		if c.view.LayerID != "" {
+			if expectedRevision >= 0 {
+				err = markCommitAttempt(err)
+			}
+			return 0, err
+		}
+		// Main retains the old server compatibility behavior.
 		return 0, nil
+	}
+	if c.view.LayerID != "" && result.Revision < 1 {
+		err := c.viewMutationError(req, fmt.Errorf("missing committed file revision"))
+		if expectedRevision >= 0 {
+			err = markCommitAttempt(err)
+		}
+		return 0, err
 	}
 	// Publish the revision to a bound sink: the direct-PUT path is a
 	// publication like the V2 completion, and callers that must attribute a
@@ -1084,8 +1130,8 @@ func (c *Client) Read(path string) ([]byte, error) {
 // ReadCtx downloads a file's content with context support.
 func (c *Client) ReadCtx(ctx context.Context, path string) ([]byte, error) {
 	// ReadStream validates the path (newFSRequest), follows presigned
-	// redirects, and routes content_layout=extent reads to the JuiceFS data
-	// plane when the server answers 422 with the extent hint.
+	// redirects, and consumes extent read plans. The old numeric-inode
+	// response remains supported for servers returning a legacy 422 hint.
 	rc, err := c.ReadStream(ctx, path)
 	if err != nil {
 		return nil, err

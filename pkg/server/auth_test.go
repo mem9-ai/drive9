@@ -577,6 +577,9 @@ func TestTenantStatusReturnsInlineThreshold(t *testing.T) {
 	if out.InlineThreshold != customThreshold {
 		t.Fatalf("inline_threshold = %d, want %d", out.InlineThreshold, customThreshold)
 	}
+	if out.TenantID != rt.tenantID {
+		t.Fatalf("tenant_id = %q, want authenticated tenant %q", out.TenantID, rt.tenantID)
+	}
 }
 
 func TestTenantStatusReturnsProvisioningState(t *testing.T) {

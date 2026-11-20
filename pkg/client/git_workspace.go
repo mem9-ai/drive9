@@ -456,25 +456,53 @@ func (c *Client) GetGitOverlayEntry(ctx context.Context, workspaceID, relPath st
 	return &out, nil
 }
 
+// ListGitOverlayEntries returns the complete overlay or an error. A short page
+// can still have a continuation because the server also limits payload bytes.
 func (c *Client) ListGitOverlayEntries(ctx context.Context, workspaceID string) ([]GitOverlayEntry, error) {
+	var entries []GitOverlayEntry
+	after := ""
+	for {
+		page, err := c.listGitOverlayEntriesPage(ctx, workspaceID, after)
+		if err != nil {
+			return nil, err
+		}
+		if page.NextAfter != "" && (page.NextAfter <= after || len(page.Entries) == 0) {
+			return nil, fmt.Errorf("git overlay pagination did not advance")
+		}
+		entries = append(entries, page.Entries...)
+		if page.NextAfter == "" {
+			return entries, nil
+		}
+		after = page.NextAfter
+	}
+}
+
+type gitOverlayPage struct {
+	Entries   []GitOverlayEntry `json:"entries"`
+	NextAfter string            `json:"next_after"`
+}
+
+func (c *Client) listGitOverlayEntriesPage(ctx context.Context, workspaceID, after string) (gitOverlayPage, error) {
 	u := c.baseURL + "/v1/git-workspaces/" + url.PathEscape(workspaceID) + "/overlay"
+	if after != "" {
+		values := url.Values{"after": {after}}
+		u += "?" + values.Encode()
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
-		return nil, err
+		return gitOverlayPage{}, err
 	}
 	resp, err := c.do(req)
 	if err != nil {
-		return nil, err
+		return gitOverlayPage{}, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
-		return nil, readError(resp)
+		return gitOverlayPage{}, readError(resp)
 	}
-	var out struct {
-		Entries []GitOverlayEntry `json:"entries"`
-	}
+	var out gitOverlayPage
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, fmt.Errorf("decode git overlay entries: %w", err)
+		return gitOverlayPage{}, fmt.Errorf("decode git overlay entries: %w", err)
 	}
-	return out.Entries, nil
+	return out, nil
 }

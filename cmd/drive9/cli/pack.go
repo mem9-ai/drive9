@@ -134,6 +134,11 @@ func Pack(c *client.Client, args []string) error {
 		if err != nil {
 			return err
 		}
+		releaseMount, err := pinMainMount(resolved.MountPoint)
+		if err != nil {
+			return err
+		}
+		defer releaseMount()
 		if strings.TrimSpace(*localRoot) == "" {
 			*localRoot = resolved.LocalRoot
 		}
@@ -213,6 +218,11 @@ func Unpack(c *client.Client, args []string) error {
 		if err != nil {
 			return err
 		}
+		releaseMount, err := pinMainMount(resolved.MountPoint)
+		if err != nil {
+			return err
+		}
+		defer releaseMount()
 		if strings.TrimSpace(*localRoot) == "" {
 			*localRoot = resolved.LocalRoot
 		}

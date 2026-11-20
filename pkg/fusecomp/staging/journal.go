@@ -14,15 +14,17 @@ import (
 )
 
 const (
-	JournalWrite       JournalOp = iota // Write data to a file
-	JournalTruncate                     // Truncate a file
-	JournalRename                       // Rename a file
-	JournalUnlink                       // Delete a file
-	JournalMkdir                        // Create a directory
-	JournalRmdir                        // Remove a directory
-	JournalFsync                        // Fsync a file (local durability marker)
-	JournalCommit                       // Remote commit completed (can be compacted)
-	JournalPendingMeta                  // Durable pending-index record (Meta carries the serialized WriteBackMeta)
+	JournalWrite           JournalOp = iota // Write data to a file
+	JournalTruncate                         // Truncate a file
+	JournalRename                           // Rename a file
+	JournalUnlink                           // Delete a file
+	JournalMkdir                            // Create a directory
+	JournalRmdir                            // Remove a directory
+	JournalFsync                            // Fsync a file (local durability marker)
+	JournalCommit                           // Remote commit completed (can be compacted)
+	JournalPendingMeta                      // Durable pending-index record (Meta carries the serialized WriteBackMeta)
+	JournalFixedUpload                      // Prepared fixed upload completion; Meta carries its immutable request
+	JournalFixedUploadDone                  // Local settlement completed for OperationID
 )
 
 const defaultJournalCompactBytes = 8 << 20
@@ -50,6 +52,8 @@ type JournalEntry struct {
 	// a per-file atomicWrite (issue #959/#960 follow-up — one group-committed
 	// fsync replaces two per-close fsyncs).
 	Meta []byte `json:"meta,omitempty"`
+	// OperationID keys fixed-upload recovery independently of mutable path data.
+	OperationID string `json:"operation_id,omitempty"`
 }
 
 // Journal is an append-only WAL for crash recovery. Each entry is
@@ -61,6 +65,7 @@ type JournalEntry struct {
 //	[N bytes: JSON payload]
 //	[4 bytes: CRC32 of payload (little-endian uint32)]
 type Journal struct {
+	fixedMu           sync.Mutex // fixed-upload prepare/settlement ordering
 	mu                sync.Mutex
 	fd                *os.File
 	seq               atomic.Uint64
@@ -118,11 +123,14 @@ func ReplayJournalIntoPending(j *Journal, idx *PendingIndex, shadows *ShadowStor
 		return nil
 	}
 
+	hasFixedUploads := false
 	latestData := make(map[string]JournalEntry) // path → latest fsync entry
 	latestMeta := make(map[string]JournalEntry) // path → latest pending-meta entry
 	latestDone := make(map[string]uint64)       // path → latest commit/unlink seq
 	if err := j.Replay(func(e JournalEntry) {
 		switch e.Op {
+		case JournalFixedUpload, JournalFixedUploadDone:
+			hasFixedUploads = true
 		case JournalCommit, JournalUnlink:
 			if e.Seq > latestDone[e.Path] {
 				latestDone[e.Path] = e.Seq
@@ -140,6 +148,17 @@ func ReplayJournalIntoPending(j *Journal, idx *PendingIndex, shadows *ShadowStor
 		}
 	}); err != nil {
 		return err
+	}
+
+	protectedPaths := map[string]bool{}
+	if hasFixedUploads {
+		records, err := j.PendingFixedUploads()
+		if err != nil {
+			return err
+		}
+		for _, record := range records {
+			protectedPaths[record.Path] = true
+		}
 	}
 
 	// A path can have both frame kinds (close published a meta frame, a later
@@ -171,7 +190,10 @@ func ReplayJournalIntoPending(j *Journal, idx *PendingIndex, shadows *ShadowStor
 			// kinds upload from the shadow file, and a lazy overwrite of a
 			// pre-existing file would otherwise CAS-commit truncated content
 			// over a good remote revision.
-			if shadows != nil {
+			// An unresolved completion owns independent recovery facts. Missing
+			// bytes may mean cleanup already succeeded before a crash. Rebuild
+			// metadata first, including later generations, without pruning here.
+			if shadows != nil && !protectedPaths[path] {
 				if size, ok := shadows.ContentSize(path); !ok || size < meta.Size {
 					shadows.Remove(path)
 					// This frame never became the selected publication. Preserve
@@ -420,6 +442,14 @@ func (j *Journal) compact(force bool) (err error) {
 	done := make(map[string]uint64)
 	latestMeta := make(map[string]uint64)
 	latestFsync := make(map[string]uint64)
+	fixedPending, _, err := pendingFixedUploads(data)
+	if err != nil {
+		return err
+	}
+	fixedSeq := make(map[uint64]bool, len(fixedPending))
+	for _, entry := range fixedPending {
+		fixedSeq[entry.Seq] = true
+	}
 	scanJournalFrames(data, func(entry JournalEntry, _ []byte) {
 		switch entry.Op {
 		case JournalCommit, JournalUnlink:
@@ -432,6 +462,14 @@ func (j *Journal) compact(force bool) (err error) {
 	})
 	var kept []byte
 	scanJournalFrames(data, func(entry JournalEntry, frame []byte) {
+		// Path cleanup and newer staging must never discard an unresolved
+		// remote completion. Only settlement of this exact operation can do so.
+		if entry.Op == JournalFixedUpload || entry.Op == JournalFixedUploadDone {
+			if fixedSeq[entry.Seq] {
+				kept = append(kept, frame...)
+			}
+			return
+		}
 		if entry.Seq <= done[entry.Path] || entry.Seq < latestMeta[entry.Path] || (entry.Op == JournalFsync && entry.Seq < latestFsync[entry.Path]) {
 			return
 		}
@@ -471,27 +509,33 @@ func (j *Journal) compact(force bool) (err error) {
 
 // scanJournalFrames walks the wire format, skipping corrupt or truncated
 // frames, and calls fn with each decoded entry and its raw frame bytes.
-func scanJournalFrames(data []byte, fn func(entry JournalEntry, frame []byte)) {
+// The return value also marks incomplete tails: a fixed-upload reader cannot
+// distinguish an interrupted append from damage hiding an acknowledged record.
+func scanJournalFrames(data []byte, fn func(entry JournalEntry, frame []byte)) (corrupt bool) {
 	pos := 0
 	for pos+8 <= len(data) { // need at least 4 (len) + 4 (crc)
 		payloadLen := binary.LittleEndian.Uint32(data[pos : pos+4])
 		frameEnd := pos + 4 + int(payloadLen) + 4
 		if frameEnd > len(data) {
-			break // truncated entry
+			corrupt = true
+			break // truncated entry; strict recovery must retain the source
 		}
 		payload := data[pos+4 : pos+4+int(payloadLen)]
 		storedCRC := binary.LittleEndian.Uint32(data[pos+4+int(payloadLen):])
 		if storedCRC != crc32.ChecksumIEEE(payload) {
+			corrupt = true
 			// Corrupt entry — skip to next possible entry boundary.
 			pos++
 			continue
 		}
 		var entry JournalEntry
 		if err := json.Unmarshal(payload, &entry); err != nil {
+			corrupt = true
 			pos = frameEnd
 			continue
 		}
 		fn(entry, data[pos:frameEnd])
 		pos = frameEnd
 	}
+	return corrupt || pos != len(data)
 }

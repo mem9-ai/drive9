@@ -830,13 +830,20 @@ func mayBeExtentDirectWriteRejection(err error, expectedRevision int64) bool {
 // session (layout=extent, 4 MiB parts). Use for fresh large files; existing
 // extent files with small dirty sets should use CommitExtentPatch instead.
 func (c *Client) WriteExtentStreamConditional(ctx context.Context, path string, ra io.ReaderAt, size int64, progress ProgressFunc, expectedRevision int64) error {
+	if c.view.LayerID != "" || ra == nil || size <= 0 || expectedRevision < -1 {
+		return errors.New("extent stream requires main, a source, positive size and valid expected revision")
+	}
 	plan, err := c.initiateUploadV2WithLayout(ctx, path, size, expectedRevision, "", "extent")
 	if err != nil {
 		return err
 	}
-	if plan.Key != "" {
+	if plan.Key != "" || (plan.ContentLayout != "" && plan.ContentLayout != ContentLayoutExtent) {
 		c.abortUploadV2BestEffort(ctx, plan.UploadID)
 		return fmt.Errorf("server ignored layout=extent on %s", path)
+	}
+	if plan.PartSize <= 0 || plan.TotalParts <= 0 {
+		c.abortUploadV2BestEffort(ctx, plan.UploadID)
+		return fmt.Errorf("server returned invalid extent plan on %s", path)
 	}
 	if err := c.uploadExtentSequential(ctx, plan, ra, size, progress); err != nil {
 		c.abortUploadV2BestEffort(ctx, plan.UploadID)

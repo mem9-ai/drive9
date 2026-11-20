@@ -139,12 +139,14 @@ type pathCommitFailure struct {
 // CommitQueue manages ordered background remote commits with baseRev tracking.
 // It provides backpressure when the queue exceeds maxPending items.
 type CommitQueue struct {
-	mu           sync.Mutex
-	queue        []*CommitEntry
-	queuedByPath map[string]map[*CommitEntry]struct{}
-	inFlight     map[string]*CommitEntry   // paths currently being processed by workers
-	immediate    map[*CommitEntry]struct{} // synchronous live commits participating in inode ordering
-	delayed      map[*CommitEntry]*time.Timer
+	fixedNamespaceMu *sync.RWMutex
+	fixedCache       *WriteBackUploader
+	mu               sync.Mutex
+	queue            []*CommitEntry
+	queuedByPath     map[string]map[*CommitEntry]struct{}
+	inFlight         map[string]*CommitEntry   // paths currently being processed by workers
+	immediate        map[*CommitEntry]struct{} // synchronous live commits participating in inode ordering
+	delayed          map[*CommitEntry]*time.Timer
 	// landed is an intentionally process-local map of exact snapshots this
 	// queue has committed. Shadow bytes and JSON metadata are not atomically
 	// replaced across a crash, so persisting this proof would be unsafe.
@@ -284,6 +286,7 @@ func NewCommitQueue(c *client.Client, shadows *staging.ShadowStore, index *stagi
 		bufSize = 256
 	}
 	cq := &CommitQueue{
+		fixedNamespaceMu:  &sync.RWMutex{},
 		maxPending:        maxPending,
 		client:            c,
 		remoteRoot:        root,
@@ -531,6 +534,15 @@ func (cq *CommitQueue) WaitIdle(ctx context.Context) error {
 		snap := cq.snapshotLocked()
 		cq.mu.Unlock()
 		if snap.Pending == 0 && snap.InFlight == 0 && snap.Delayed == 0 {
+			if cq.client.ViewBinding().LayerID != "" {
+				records, err := loadFixedExtentPublications(cq.client, cq.journal)
+				if err != nil {
+					return err
+				}
+				if len(records) != 0 || len(cq.index.ListUncommittedPaths()) != 0 {
+					return fmt.Errorf("fixed queue has unresolved publications or local data")
+				}
+			}
 			return nil
 		}
 		select {
@@ -1074,6 +1086,9 @@ func (cq *CommitQueue) RecoverPendingSync(ctx context.Context) int {
 // by workers. It is used as a fallback when the async queue rejects an entry
 // after local state has already moved to the final path.
 func (cq *CommitQueue) CommitNow(ctx context.Context, entry *CommitEntry) error {
+	if cq.client.ViewBinding().LayerID != "" {
+		return cq.commitFixedNow(ctx, entry)
+	}
 	if err := cq.rejectAbandonedLayer(); err != nil {
 		return err
 	}
@@ -1762,6 +1777,10 @@ func (cq *CommitQueue) endInFlight(entry *CommitEntry) {
 
 // commitOne uploads a single entry to the server with exponential backoff.
 func (cq *CommitQueue) commitOne(entry *CommitEntry) {
+	if cq.client.ViewBinding().LayerID != "" {
+		cq.commitFixedWorker(entry)
+		return
+	}
 	const maxRetries = 5
 	const baseDelay = 200 * time.Millisecond
 	const maxDelay = 30 * time.Second
@@ -1941,6 +1960,9 @@ func (cq *CommitQueue) batchConfigSnapshot() commitBatchConfig {
 }
 
 func (cq *CommitQueue) tryCommitBatch(first *CommitEntry) (bool, []*CommitEntry) {
+	if cq.client.ViewBinding().LayerID != "" {
+		return false, nil
+	}
 	cfg := cq.batchConfigSnapshot()
 	if cfg.window <= 0 || cfg.maxItems <= 1 || cfg.maxBytes <= 0 || !cq.batchWriteEligible(first) {
 		return false, nil
@@ -2013,7 +2035,7 @@ func (cq *CommitQueue) batchWriteEligible(entry *CommitEntry) bool {
 		return false
 	}
 	threshold := cq.directPutThreshold()
-	return entry.Size == 0 || (threshold > 0 && entry.Size < threshold)
+	return client.UseDirectPUT(entry.Size, threshold)
 }
 
 func (cq *CommitQueue) commitBatch(entries []*CommitEntry) {
@@ -2357,6 +2379,9 @@ func (cq *CommitQueue) rejectAbandonedLayer() error {
 }
 
 func (cq *CommitQueue) commitNowPathLocked(ctx context.Context, entry *CommitEntry) error {
+	if cq.client.ViewBinding().LayerID != "" {
+		return fmt.Errorf("fixed publication requires the namespace lock before the path lock")
+	}
 	if err := cq.rejectAbandonedLayer(); err != nil {
 		return err
 	}
@@ -2547,15 +2572,9 @@ func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) (int
 		return 0, fmt.Errorf("read shadow: %w", err)
 	}
 
-	// Route based on entry.Size (metadata at enqueue time), NOT len(data).
-	// Files under directPutThreshold use direct PUT to skip the multipart
-	// initiate/presign/complete/finalize overhead (~440ms). When threshold
-	// is 0 (no server value cached) we deliberately do not direct-PUT
-	// non-empty files: the server may be configured below 50KB and would
-	// reject the simple PUT. Zero-byte files keep direct PUT because V2
-	// initiate rejects total_size=0.
+	// Preserve the enqueue-time size when selecting the upload protocol.
 	threshold := cq.directPutThreshold()
-	useDirectPUT := entry.Size == 0 || (threshold > 0 && entry.Size < threshold)
+	useDirectPUT := client.UseDirectPUT(entry.Size, threshold)
 	if useDirectPUT {
 		start := time.Now()
 		committedRev, err := cq.client.WriteCtxConditionalWithRevision(ctx, apiPath, data, expectedRevision)

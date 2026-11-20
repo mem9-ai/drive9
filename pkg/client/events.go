@@ -121,7 +121,7 @@ func (c *Client) streamEvents(ctx context.Context, since uint64, actor string, h
 		req.Header.Set("X-Dat9-Actor", actor)
 	}
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.sendBoundRequest(req, c.httpClient)
 	if err != nil {
 		return fmt.Errorf("SSE connect: %w", err)
 	}

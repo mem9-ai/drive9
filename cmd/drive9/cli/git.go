@@ -109,6 +109,11 @@ func gitClone(args []string) error {
 	if err != nil {
 		return err
 	}
+	releaseMount, err := pinMainMount(resolved.MountPoint)
+	if err != nil {
+		return err
+	}
+	defer releaseMount()
 
 	// Mark the root as a workspace-in-progress BEFORE git writes `.git`. The
 	// workspace row is only registered after the clone, so without this marker a
@@ -306,6 +311,11 @@ func gitWorktreeAdd(args []string) error {
 	if !sameDrive9Mount(baseResolved, worktreeResolved) {
 		return fmt.Errorf("base repo and worktree path must be inside the same drive9 mount")
 	}
+	releaseMount, err := pinMainMount(baseResolved.MountPoint)
+	if err != nil {
+		return err
+	}
+	defer releaseMount()
 
 	// Mark the worktree root as a workspace-in-progress before `git worktree add`
 	// writes its `.git` file and the linked gitdir under the base repo. See the
@@ -514,6 +524,11 @@ func gitWorktreeRemove(args []string) error {
 	if err != nil {
 		return err
 	}
+	releaseMount, err := pinMainMount(resolved.MountPoint)
+	if err != nil {
+		return err
+	}
+	defer releaseMount()
 	c := NewFromEnv()
 	ctx, cancel := context.WithTimeout(context.Background(), gitWorkspaceAPITimeout)
 	ws, err := c.GetGitWorkspaceByRoot(ctx, resolved.RemotePath)
@@ -662,6 +677,11 @@ func gitHydrate(args []string) error {
 	if err != nil {
 		return err
 	}
+	releaseMount, err := pinMainMount(resolved.MountPoint)
+	if err != nil {
+		return err
+	}
+	defer releaseMount()
 	c := NewFromEnv()
 	ctx, cancel := context.WithTimeout(context.Background(), gitWorkspaceAPITimeout)
 	ws, err := c.GetGitWorkspaceByRoot(ctx, resolved.RemotePath)

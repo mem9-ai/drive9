@@ -15,6 +15,8 @@ The examples are grouped by SDK surface:
 - uploads, downloads, append, patch, streaming writer
 - scoped tokens and vault APIs
 - events, LayerFS, Git workspace, journal APIs
+- fixed-view empty files, conditional chmod, extent transfer/completion recovery,
+  validation-to-main merge, and explicit main extent replacement
 - error helper functions and local file transfer shape
 
 `TestClientMethodExampleCoverage` uses reflection to fail when a new exported

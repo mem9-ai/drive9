@@ -79,3 +79,11 @@ type ForgetKeeper interface {
 type ReexecGater interface {
 	ReexecRefusal() (reason string, count int)
 }
+
+// ViewSwitchGater can allow persistent local state across a same-process view
+// switch. The mount must give each view a stable, separate local directory,
+// drain ordinary I/O, and join Lifecycle.Stop before installing the next view.
+// Handlers without this capability keep their ReexecGater restrictions.
+type ViewSwitchGater interface {
+	ViewSwitchRefusal() (reason string, count int)
+}

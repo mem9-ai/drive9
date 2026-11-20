@@ -27,6 +27,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"runtime/pprof"
@@ -356,6 +357,10 @@ func runFS(args []string) {
 	}
 
 	var err error
+	c, rest, err = cli.BindFilesystemView(c, sub, rest)
+	if err != nil {
+		fatal("fs "+sub, err)
+	}
 	switch sub {
 	case "cp":
 		err = cli.Cp(c, rest)
@@ -425,8 +430,10 @@ func fatal(cmd string, err error) {
 		}
 	}
 	fmt.Fprintf(os.Stderr, "%s: %v\n", cmd, msg)
-	if ec, ok := err.(exitCoder); ok && ec.ExitCode() > 0 {
+	var ec exitCoder
+	if errors.As(err, &ec) && ec.ExitCode() > 0 {
 		exitWithCode(ec.ExitCode())
+		return
 	}
 	exitWithCode(1)
 }
@@ -479,6 +486,10 @@ func usage(code int) {
 			"                         mount drive9 or an object prefix (background FUSE by default)\n"+
 			"  mount drain [--timeout duration] [--json] <mountpoint>\n"+
 			"                         drain pending writes for a live FUSE mount\n"+
+			"  mount switch [flags] <mountpoint>\n"+
+			"                         switch a supporting FUSE mount to main or a Layer\n"+
+			"  mount switch-operation [flags] <mountpoint>\n"+
+			"                         query the original switch without applying it again\n"+
 			"  mount status [--json] <mountpoint>\n"+
 			"                         show supervised mount health/status\n"+
 			"  mount health <mountpoint>\n"+

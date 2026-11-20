@@ -205,6 +205,10 @@ create_database() {
 }
 
 ensure_tidb() {
+  case "${DRIVE9_LOCAL_E2E_REQUIRE_EXISTING_DB:-0}" in
+    0|1) ;;
+    *) echo "DRIVE9_LOCAL_E2E_REQUIRE_EXISTING_DB must be 0 or 1" >&2; exit 2 ;;
+  esac
   : "${DRIVE9_LOCAL_DSN:=$DEFAULT_DSN}"
   export DRIVE9_LOCAL_DSN
   local host port
@@ -218,6 +222,10 @@ ensure_tidb() {
   if mysql_handshake "$host" "$port"; then
     log "reusing TiDB at $host:$port"
   else
+    if [ "${DRIVE9_LOCAL_E2E_REQUIRE_EXISTING_DB:-0}" = "1" ]; then
+      echo "Required external test database is unavailable; refusing fallback" >&2
+      exit 1
+    fi
     pick_runtime
     if container_running; then
       log "waiting for existing $DB_CONTAINER_NAME"

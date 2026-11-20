@@ -26,6 +26,7 @@ import (
 	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/pingcap/failpoint"
 
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/fs"
@@ -271,6 +272,7 @@ type Writeback struct {
 	recoveryCacheGens map[string]uint64
 	lazy              bool
 	syncerCancel      context.CancelFunc
+	syncerDone        chan struct{}
 	// commitSeeder caches the just-committed image (readCache.Put at
 	// commit settle) so reads racing backend replica lag see this mount's
 	// own writes; nil disables seeding.
@@ -353,8 +355,11 @@ func removeCacheAncestorGen(list []uint64, gen uint64) []uint64 {
 }
 
 type bufferingHandle struct {
-	w    *Writeback
-	path string
+	// Fixed commits serialize completion recovery before publishing another image.
+	fixedCommitMu   sync.Mutex
+	fixedCompletion *pendingFixedCompletion
+	w               *Writeback
+	path            string
 	// baseLoaded marks a buffer that published a real base (or the lazy
 	// seed): a provisional buffer whose preload failed is discarded so a
 	// retried write re-initializes instead of committing a replacement
@@ -547,6 +552,11 @@ func New(opts Options) (*Writeback, error) {
 	if opts.Client == nil {
 		return nil, fmt.Errorf("writeback: client is required")
 	}
+	if opts.Client.ViewBinding().LayerID != "" && opts.Staging != nil && opts.Staging.Shadow != nil {
+		if err := opts.Staging.Shadow.EnableFixedUploadRecovery(); err != nil {
+			return nil, err
+		}
+	}
 	root := strings.TrimSpace(opts.RemoteRoot)
 	if root == "" || root == "/" {
 		root = "/"
@@ -643,6 +653,9 @@ func New(opts Options) (*Writeback, error) {
 			workers = defaultUploadConcurrency
 		}
 		up := NewWriteBackUploader(opts.Client, w.wbCache, workers, root)
+		if opts.Staging != nil {
+			up.fixedJournal = opts.Staging.Journal
+		}
 		// The snapshot callback runs under the write-back cache's path lock at
 		// upload time: the failure stamp it captures is the one this landing
 		// may clear, and never a failure recorded after the upload started.
@@ -761,6 +774,10 @@ func New(opts Options) (*Writeback, error) {
 			workers = defaultUploadConcurrency
 		}
 		q := NewCommitQueue(opts.Client, opts.Staging.Shadow, opts.Staging.Pending, opts.Staging.Journal, workers, opts.CommitQueueMaxPending, root)
+		if w.uploader != nil {
+			q.fixedNamespaceMu = &w.uploader.fixedNamespaceMu
+			q.fixedCache = w.uploader
+		}
 		// Arm the extent plane's promotion rules on the queue: this is what
 		// turns a promotion-sized staged image into an extent sequential
 		// session (or an incremental PATCH) instead of a classic upload.
@@ -809,8 +826,9 @@ func New(opts Options) (*Writeback, error) {
 			// overtook (see recoveryCacheGens): without this the stale pair
 			// keeps answering pending reads and future recoveries long
 			// after its successor landed. Generation-guarded against any
-			// flush staged after the snapshot.
-			if w.recoveryCacheGens != nil && w.wbCache != nil {
+			// flush staged after the snapshot. Fixed-view recovery performs checked
+			// cleanup before removing the durable pending owner instead.
+			if opts.Client.ViewBinding().LayerID == "" && w.recoveryCacheGens != nil && w.wbCache != nil {
 				if gen, ok := w.recoveryCacheGens[entry.Path]; ok {
 					w.wbCache.RemoveIfGeneration(entry.Path, gen)
 				}
@@ -853,12 +871,27 @@ func New(opts Options) (*Writeback, error) {
 	if opts.LazyStaging && opts.SyncWindow > 0 && (opts.Staging != nil || w.wbCache != nil) {
 		syncerCtx, cancel := context.WithCancel(context.Background())
 		w.syncerCancel = cancel
+		w.syncerDone = make(chan struct{})
+		var syncerWg sync.WaitGroup
 		if opts.Staging != nil && opts.Staging.Journal != nil {
-			go opts.Staging.Journal.SyncLoop(syncerCtx, opts.SyncWindow)
+			syncerWg.Add(1)
+			go func() {
+				defer syncerWg.Done()
+				opts.Staging.Journal.SyncLoop(syncerCtx, opts.SyncWindow)
+				failpoint.InjectCall("writebackSyncLoopExiting")
+			}()
 		}
 		if w.wbCache != nil {
-			go w.wbCache.SyncLoop(syncerCtx, opts.SyncWindow)
+			syncerWg.Add(1)
+			go func() {
+				defer syncerWg.Done()
+				w.wbCache.SyncLoop(syncerCtx, opts.SyncWindow)
+			}()
 		}
+		go func() {
+			syncerWg.Wait()
+			close(w.syncerDone)
+		}()
 	}
 	return w, nil
 }
@@ -947,16 +980,25 @@ func (w *Writeback) Start(ctx context.Context) error {
 	}
 	if w.opts.Staging != nil && w.opts.Staging.Pending != nil {
 		if err := w.opts.Staging.Pending.RecoverFromDisk(); err != nil {
+			if w.opts.Client.ViewBinding().LayerID != "" {
+				return err
+			}
 			fmt.Fprintf(os.Stderr, "drive9: pending index recovery: %v\n", err)
 		}
 	}
+	if w.opts.Client.ViewBinding().LayerID != "" && w.opts.Staging != nil {
+		if err := w.opts.Staging.Recover(); err != nil {
+			return err
+		}
+	}
+
 	// Recovery ownership is snapshotted BEFORE either track starts: the
 	// queue's workers begin inside RecoverPending, and a path they land and
 	// remove before the uploader's filter evaluates would pass a live
 	// HasPending check and get the stale .dat/.meta submitted as a second
 	// recovery owner — a permanent conflict, or a same-origin rebase
 	// republishing the stale bytes. The immutable snapshot owns the split,
-	// and the queue's success retires exactly the snapshotted pair (a
+	// and cleanup retires exactly the snapshotted pair (a
 	// crash can leave it behind between the ledger publication and the
 	// enqueue's cache removal; anything staged after the snapshot carries
 	// a newer generation and survives).
@@ -968,9 +1010,24 @@ func (w *Writeback) Start(ctx context.Context) error {
 		if w.wbCache != nil && len(ledgerOwned) > 0 {
 			w.recoveryCacheGens = make(map[string]uint64, len(ledgerOwned))
 			for _, m := range w.wbCache.ListPendingMetas() {
+				if _, owned := ledgerOwned[m.Path]; !owned {
+					continue
+				}
+				if w.opts.Client.ViewBinding().LayerID != "" && m.SupersedesPendingGen != 0 {
+					if pending, ok := w.opts.Staging.Pending.GetMeta(m.Path); ok && m.SupersedesPendingGen >= pending.Generation {
+						continue // This cache contains the pending image and must survive it.
+					}
+				}
 				w.recoveryCacheGens[m.Path] = m.Generation
 			}
 		}
+	}
+	if w.opts.Client.ViewBinding().LayerID != "" {
+		if err := w.recoverFixedPublications(ctx); err != nil {
+			return fmt.Errorf("recover fixed publications: %w", err)
+		}
+	}
+	if w.queue != nil {
 		w.queue.RecoverPending()
 	}
 	if w.uploader != nil {
@@ -1030,6 +1087,9 @@ func (w *Writeback) Drain(ctx context.Context) error {
 func (w *Writeback) Stop(ctx context.Context) error {
 	if w.syncerCancel != nil {
 		w.syncerCancel()
+		// The staging owner may close/reuse the journal after Stop returns.
+		// Cancellation alone does not finish a running fsync or compaction.
+		<-w.syncerDone
 	}
 	if w.uploader != nil {
 		w.uploader.DrainAll()
@@ -1051,6 +1111,11 @@ func (w *Writeback) Stop(ctx context.Context) error {
 // then fail the unlink instead of acknowledging a deletion that a restart
 // would undo. The anonymous marking is rolled back on that path.
 func (w *Writeback) MarkPathUnlinked(p string) error {
+	unlock, err := w.lockFixedNamespace(p)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	marked, _ := w.markUnlinkedSnapshot(p, false)
 	// The name is going away NOW (the facade invokes this before FS.Unlink
 	// replies OK): the pending overlays must stop answering lookups for it,
@@ -1245,6 +1310,15 @@ func (w *Writeback) ReexecRefusal() (string, int) {
 	if w == nil {
 		return "", 0
 	}
+	if w.opts.Client.ViewBinding().LayerID != "" && w.opts.Staging != nil && w.opts.Staging.Journal != nil {
+		records, err := w.opts.Staging.Journal.PendingFixedUploads()
+		if err != nil {
+			return "fixed_upload_recovery_error", 1
+		}
+		if len(records) > 0 {
+			return "fixed_upload_pending", len(records)
+		}
+	}
 	if w.queue != nil {
 		if snap := w.queue.Snapshot(); snap.Pending > 0 || snap.InFlight > 0 || snap.Delayed > 0 || snap.Conflicts > 0 {
 			return "commit_queue_pending", snap.Pending + snap.InFlight + snap.Delayed + snap.Conflicts
@@ -1378,7 +1452,8 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			h := &bufferingHandle{w: w, path: op.Path, inner: res.Handle, flags: flags,
 				baseSize: size, baseRev: rev, forceSync: hasSyncOpenFlag(flags)}
 			mode := op.Mode & 0o7777
-			if mode != 0o644 && mode != 0 {
+			// Fixed creation already committed the mode atomically with the file.
+			if w.opts.Client.ViewBinding().LayerID == "" && mode != 0o644 && mode != 0 {
 				h.pendingMode = mode
 				h.hasPendingMode = true
 			}
@@ -1729,6 +1804,11 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 					if w.queue != nil {
 						w.waitPathCommit(op.Path)
 					}
+					unlock, err := w.lockFixedNamespace(op.Path)
+					if err != nil {
+						return fs.Result{}, err
+					}
+					defer unlock()
 					w.retarget(op.Path, survivor)
 					if _, err := next(ctx, op); err != nil {
 						// DELETE failed: bind back so nothing is lost.
@@ -1753,6 +1833,11 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		if w.uploader != nil {
 			w.uploader.WaitPath(op.Path)
 		}
+		unlock, err := w.lockFixedNamespace(op.Path)
+		if err != nil {
+			return fs.Result{}, err
+		}
+		defer unlock()
 		// Staged entries die with their path — but only AFTER the remote
 		// delete succeeds: wbCache/queue cleanup is irreversible, and a
 		// 503'd DELETE with the staging already removed lost the only
@@ -1853,6 +1938,11 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 				_ = w.uploader.UploadSync(ctx, op.Path)
 			}
 		}
+		unlock, err := w.lockFixedNamespace(op.Path, op.Path2)
+		if err != nil {
+			return fs.Result{}, err
+		}
+		defer unlock()
 		return next(ctx, op)
 
 	case fs.OpRename:
@@ -1952,6 +2042,11 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		if err := land(op.Path); err != nil {
 			return fs.Result{}, fmt.Errorf("land flushed image before rename %s: %w", op.Path, err)
 		}
+		unlock, err := w.lockFixedNamespace(op.Path, op.Path2)
+		if err != nil {
+			return fs.Result{}, err
+		}
+		defer unlock()
 		// A lazy-created writer that never landed has no remote entry to
 		// rename: its buffer simply moves (PrepareRename's local
 		// phase). Otherwise the remote rename runs first and the open
@@ -2345,6 +2440,12 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			return res, err
 		}
 		if op.Size >= 0 {
+			if res, err, handled := w.truncateCleanMainToZero(ctx, op); handled {
+				if err == nil {
+					w.invalidateRev(op.Path, res.Attr.Rev, op.Size)
+				}
+				return res, err
+			}
 			// A size change on a path with a live writer is local:
 			// the kernel delivers open(O_TRUNC) on an existing file as
 			// OPEN + SETATTR(size=0, fh) — the handle's buffer must
@@ -6114,6 +6215,20 @@ func (r *bufferReader) ReadAt(p []byte, off int64) (int, error) {
 // the image is too large for the whole-image tracks (v1's large-file
 // bypass of the .dat/.meta track).
 func (h *bufferingHandle) commitInline(ctx context.Context) error {
+	if h.w.opts.Client.ViewBinding().LayerID != "" {
+		h.fixedCommitMu.Lock()
+		defer h.fixedCommitMu.Unlock()
+		if err := h.resumeFixedCompletion(ctx); err != nil {
+			return err
+		}
+		h.mu.Lock()
+		dirty := h.dirty
+		h.mu.Unlock()
+		if !dirty {
+			return nil
+		}
+	}
+
 	var cacheGen uint64
 	if h.w.wbCache != nil {
 		if meta, ok := h.w.wbCache.GetMeta(h.path); ok {
@@ -6128,9 +6243,11 @@ func (h *bufferingHandle) commitInline(ctx context.Context) error {
 	isNew := h.isNew
 	baseRev := h.baseRev
 	commitGen := h.wgen
+	threshold := h.w.opts.Client.CachedSmallFileThreshold()
+	fixedDirect := h.w.opts.Client.ViewBinding().LayerID != "" && client.UseDirectPUT(size, threshold)
 	var newReader func() io.Reader
 	var image []byte
-	if size >= commitInlineStreamThreshold {
+	if size >= commitInlineStreamThreshold && !fixedDirect {
 		newReader = func() io.Reader { return &bufferReader{h: h, size: size} }
 	} else {
 		if err := h.buf.LoadMissingParts(); err != nil {
@@ -6141,6 +6258,9 @@ func (h *bufferingHandle) commitInline(ctx context.Context) error {
 		newReader = func() io.Reader { return bytes.NewReader(image) }
 	}
 	h.mu.Unlock()
+	if fixedDirect {
+		return h.commitFixedDirect(ctx, image, isNew && size == 0, baseRev, commitGen, cacheGen)
+	}
 
 	// Streamed commits report no revision (the protocol carries none and a
 	// bare re-read cannot be attributed): digest the exact bytes via a
@@ -6187,6 +6307,11 @@ func (h *bufferingHandle) commitInline(ctx context.Context) error {
 				}
 			}
 		}
+	}
+	var pending *client.FixedExtentCompletionError
+	if errors.As(err, &pending) {
+		h.fixedCompletion = &pendingFixedCompletion{request: pending, generation: commitGen, size: size, cacheGeneration: cacheGen}
+		return errors.Join(mapErr(err), err)
 	}
 	if err == nil {
 		if cacheGen != 0 {
@@ -6354,7 +6479,7 @@ func (w *Writeback) commitReaderOpt(ctx context.Context, path string, newReader 
 			}
 		}
 		if werr == nil {
-			if threshold := w.opts.Client.CachedSmallFileThreshold(); threshold > 0 && size < threshold {
+			if threshold := w.opts.Client.CachedSmallFileThreshold(); client.UseDirectPUT(size, threshold) {
 				data := make([]byte, size)
 				if n, rerr := io.ReadFull(newReader(), data); rerr == nil && int64(n) == size {
 					rev, perr := w.opts.Client.WriteCtxConditionalWithRevision(ctx, rp, data, expected)
@@ -6369,6 +6494,10 @@ func (w *Writeback) commitReaderOpt(ctx context.Context, path string, newReader 
 			werr = w.opts.Client.WriteStreamConditional(ctx, rp, newReader(), size, nil, expected)
 		}
 		if werr != nil {
+			var pending *client.FixedExtentCompletionError
+			if errors.As(werr, &pending) {
+				return 0, werr
+			}
 			if errors.Is(werr, client.ErrConflict) {
 				if st, serr := w.opts.Client.StatCtx(ctx, rp); serr == nil && st != nil {
 					// Retry only when the conflict did not advance the row
@@ -7123,10 +7252,15 @@ func (h *bufferingHandle) commitLocked(ctx context.Context) error {
 // active part stream (its own finish path), or an observed non-patchable
 // storage class — leaving the caller the full-write path.
 func (h *bufferingHandle) commitPatched(ctx context.Context) (rev int64, attempted bool, err error) {
+	// Fixed views currently publish a complete file with a durable completion
+	// receipt. The main multipart PATCH protocol does not provide that binding.
+	if h.w.opts.Client.ViewBinding().LayerID != "" {
+		return 0, false, nil
+	}
 	threshold := h.w.opts.Client.CachedSmallFileThreshold()
 	h.mu.Lock()
 	size := h.buf.Size()
-	directPUT := size == 0 || (threshold > 0 && size < threshold)
+	directPUT := client.UseDirectPUT(size, threshold)
 	applicable := !directPUT && threshold > 0 && !h.isNew &&
 		h.baseSize >= threshold && size <= h.baseSize &&
 		h.storageClass != client.StorageTypeDB9 &&
@@ -7207,6 +7341,11 @@ func (h *bufferingHandle) commitPatched(ctx context.Context) (rev int64, attempt
 // parts in parallel while the write stream continues. Parts flow through
 // WriteBuffer.OnPartFull; FinishStreaming publishes at the commit boundary.
 func (h *bufferingHandle) maybeArmStreaming() error {
+	// Keep the buffered image intact for the fixed seekable upload at commit.
+	// The legacy StreamWriter uses main's multipart completion protocol.
+	if h.w.opts.Client.ViewBinding().LayerID != "" {
+		return nil
+	}
 	if h.streamArmed || h.isNew || h.w.opts.Policy == PolicyWriteSync || h.forceSync {
 		return nil
 	}

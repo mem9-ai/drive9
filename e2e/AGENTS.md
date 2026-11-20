@@ -66,8 +66,8 @@ bash e2e/pack-smoke-test.sh
 # Journal smoke (provision + journal create/append/find/verify)
 bash e2e/journal-smoke-test.sh
 
-# Layer filesystem smoke (API/CLI entries + optional FUSE restore/commit)
-bash e2e/layer-fs-smoke-test.sh
+# Fixed-view smoke against a matching disposable v10 server (Linux FUSE required)
+DRIVE9_BASE=http://127.0.0.1:9009 bash e2e/layer-fs-smoke-test.sh
 
 # FUSE smoke (mount + bidirectional filesystem checks)
 bash e2e/fuse-smoke-test.sh

@@ -8,401 +8,153 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"sort"
-	"strings"
-	"text/tabwriter"
+	"time"
 
 	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/viewprotocol"
 )
 
+func layerUsage() string {
+	return "usage: drive9 fs layer <create|list|status|work|renew|seal|merge|cancel|delete|operation> [flags]"
+}
+
+type fixedLayerOptions struct {
+	action, layer, operation, parent, name, work, after string
+	fence                                               int64
+	ttl                                                 time.Duration
+	validation                                          bool
+	limit                                               int
+}
+
+// Layer uses fixed-view controls exclusively. A work claim is printed, never
+// executed here; query/replay cannot accidentally launch an agent a second time.
 func Layer(c *client.Client, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("%s", layerUsage())
+		return errors.New(layerUsage())
 	}
 	if IsHelpArg(args[0]) {
-		_, _ = fmt.Fprintln(os.Stdout, layerUsage())
-		return nil
+		_, err := fmt.Fprintln(os.Stdout, layerUsage())
+		return err
 	}
-	switch args[0] {
+	opts, help, err := parseFixedLayerOptions(args)
+	if err != nil || help {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	result, err := runFixedLayerControl(ctx, c, opts)
+	if err != nil {
+		return err
+	}
+	if err := json.NewEncoder(os.Stdout).Encode(result); err != nil {
+		return err
+	}
+	if outcome, ok := result.(client.FixedViewOutcome); ok && outcome.State != "DONE" {
+		return fmt.Errorf("layer %s operation %s: %s (%s)", opts.layer, opts.operation, outcome.State, outcome.Code)
+	}
+	return nil
+}
+
+func parseFixedLayerOptions(args []string) (fixedLayerOptions, bool, error) {
+	o := fixedLayerOptions{action: args[0]}
+	f := flag.NewFlagSet("fs layer "+o.action, flag.ContinueOnError)
+	f.SetOutput(io.Discard)
+	operated := false
+	if o.action == "merge" {
+		o.validation = true
+	}
+	switch o.action {
 	case "create":
-		return LayerCreate(c, args[1:])
-	case "list", "ls":
-		return LayerList(c, args[1:])
-	case "status", "get":
-		return LayerStatus(c, args[1:])
-	case "diff":
-		return LayerDiff(c, args[1:])
-	case "checkpoint":
-		return LayerCheckpoint(c, args[1:])
-	case "rollback":
-		return LayerRollback(c, args[1:])
-	case "commit":
-		return LayerCommit(c, args[1:])
-	case "fork":
-		return LayerFork(c, args[1:])
-	case "chain":
-		return LayerChain(c, args[1:])
-	case "delete", "rm":
-		return LayerDelete(c, args[1:])
+		operated = true
+		f.StringVar(&o.parent, "parent", "", "derive from this Layer; omitted captures main")
+		f.StringVar(&o.name, "name", "", "display name")
+	case "work":
+		operated = true
+		f.DurationVar(&o.ttl, "ttl", 0, "required work lifetime, 1ms through 1h")
+		f.BoolVar(&o.validation, "validation", false, "begin read-only validation after seal")
+	case "renew":
+		f.DurationVar(&o.ttl, "ttl", 0, "required renewed lifetime, 1ms through 1h")
+		f.BoolVar(&o.validation, "validation", false, "renew the validation generation")
+	case "seal", "merge", "cancel", "delete":
+		operated = true
+	case "list":
+		f.StringVar(&o.after, "after", "", "continue after the previous next_after value")
+		f.IntVar(&o.limit, "limit", 100, "maximum Layers in this page, 1 through 256")
+	case "status", "get", "operation":
 	default:
-		return fmt.Errorf("unknown fs layer command %q", args[0])
+		return o, false, fmt.Errorf("unsupported fixed Layer command %q; %s", o.action, layerUsage())
 	}
-}
-
-func layerUsage() string {
-	return "usage: drive9 fs layer <create|list|status|diff|checkpoint|rollback|commit|fork|chain|delete>"
-}
-
-func LayerCreate(c *client.Client, args []string) error {
-	fs := flag.NewFlagSet("fs layer create", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	var tags repeatStrings
-	layerID := fs.String("id", "", "layer id")
-	name := fs.String("name", "", "layer name")
-	durability := fs.String("durability", "", "restore-safe, write-through, or local-fast (V1 records the mode; FUSE uses restore-safe behavior)")
-	actor := fs.String("actor", "", "actor id")
-	asJSON := fs.Bool("json", false, "print JSON")
-	fs.Var(&tags, "tag", "layer tag key=value (repeatable)")
-	if err := fs.Parse(normalizeHelpFlags(args, fs)); err != nil {
+	if operated {
+		f.StringVar(&o.operation, "operation", "", "required stable operation ID; retain it after timeout")
+	}
+	if o.action == "renew" || o.action == "seal" || o.action == "merge" {
+		f.StringVar(&o.work, "work", "", "work_id returned by the work claim")
+		f.Int64Var(&o.fence, "fence", 0, "fence returned by the work claim")
+	}
+	if err := f.Parse(normalizeHelpFlags(args[1:], f)); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
-			return printLayerHelp(fs, "usage: drive9 fs layer create [flags] <base-root>")
+			_, _ = fmt.Fprintln(os.Stderr, layerUsage()+"; results are JSON")
+			f.SetOutput(os.Stderr)
+			f.PrintDefaults()
+			return o, true, nil
 		}
-		return err
+		return o, false, err
 	}
-	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: drive9 fs layer create [flags] <base-root>")
+	want := 1
+	if o.action == "list" {
+		want = 0
 	}
-	parsedTags, err := parseLayerTags(tags)
-	if err != nil {
-		return err
+	if o.action == "operation" {
+		want = 2
 	}
-	baseRoot := fs.Arg(0)
-	if loc, err := Parse(baseRoot); err != nil {
-		return err
-	} else if loc.Kind == KindObject {
-		return fmt.Errorf("fs layer create: object-store URIs are not supported")
-	} else if loc.Kind == KindDrive9 {
-		if loc.Context != "" {
-			return fmt.Errorf("fs layer create: context-scoped remote sources (e.g. %s:/path) are not yet supported", loc.Context)
+	if f.NArg() != want {
+		return o, false, fmt.Errorf("layer %s expects %d positional arguments", o.action, want)
+	}
+	if want > 0 {
+		o.layer = f.Arg(0)
+	}
+	if o.action == "operation" {
+		o.operation = f.Arg(1)
+	}
+	if operated || o.action == "operation" {
+		if err := viewprotocol.ValidateOperationID(o.operation); err != nil {
+			return o, false, fmt.Errorf("operation ID: %w", err)
 		}
-		baseRoot = loc.Path
 	}
-	req := client.FSLayerCreateRequest{
-		LayerID:        *layerID,
-		BaseRootPath:   baseRoot,
-		Name:           *name,
-		Tags:           parsedTags,
-		DurabilityMode: *durability,
-		ActorID:        *actor,
+	if o.action == "work" || o.action == "renew" {
+		if o.ttl < time.Millisecond || o.ttl > time.Hour {
+			return o, false, errors.New("--ttl is required and must be between 1ms and 1h")
+		}
 	}
-	layer, err := c.CreateFSLayer(context.Background(), req)
-	if err != nil {
-		return err
+	if o.action == "renew" || o.action == "seal" || o.action == "merge" {
+		if err := (client.ViewBinding{LayerID: o.layer, WorkID: o.work, Fence: o.fence, Validation: o.validation}).Validate(); err != nil || o.layer == "" {
+			return o, false, errors.New("--work and --fence must identify the claimed Layer generation")
+		}
 	}
-	if *asJSON {
-		enc := json.NewEncoder(os.Stdout)
-		return enc.Encode(layer)
-	}
-	_, _ = fmt.Fprintln(os.Stdout, layer.LayerID)
-	return nil
+	return o, false, nil
 }
 
-func LayerList(c *client.Client, args []string) error {
-	fs := flag.NewFlagSet("fs layer list", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	asJSON := fs.Bool("json", false, "print JSON")
-	if err := fs.Parse(normalizeHelpFlags(args, fs)); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return printLayerHelp(fs, "usage: drive9 fs layer list [flags]")
-		}
-		return err
+func runFixedLayerControl(ctx context.Context, c *client.Client, o fixedLayerOptions) (any, error) {
+	work := client.ViewWork{LayerID: o.layer, ID: o.work, Fence: o.fence, Validation: o.validation}
+	switch o.action {
+	case "create":
+		return c.CreateFixedView(ctx, client.FixedViewCreate{OperationID: o.operation, LayerID: o.layer, ParentLayerID: o.parent, Name: o.name})
+	case "list":
+		return c.ListFixedViews(ctx, o.after, o.limit)
+	case "status", "get":
+		return c.GetFixedView(ctx, o.layer)
+	case "work":
+		return c.BeginViewWork(ctx, o.layer, o.operation, o.ttl, o.validation)
+	case "renew":
+		return c.RenewViewWork(ctx, work, o.ttl)
+	case "seal":
+		return c.SealFixedView(ctx, work, o.operation)
+	case "merge":
+		return c.MergeFixedView(ctx, work, o.operation)
+	case "cancel", "delete":
+		return c.EndFixedView(ctx, o.layer, o.operation, o.action == "delete")
+	case "operation":
+		return c.GetFixedViewOperation(ctx, o.layer, o.operation)
 	}
-	if fs.NArg() != 0 {
-		return fmt.Errorf("usage: drive9 fs layer list [flags]")
-	}
-	layers, err := c.ListFSLayers(context.Background())
-	if err != nil {
-		return err
-	}
-	if *asJSON {
-		enc := json.NewEncoder(os.Stdout)
-		return enc.Encode(map[string]any{"layers": layers})
-	}
-	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	for _, layer := range layers {
-		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", layer.LayerID, layer.State, layer.DurabilityMode, layer.BaseRootPath, layer.Name, formatLayerTags(layer.Tags))
-	}
-	return tw.Flush()
-}
-
-func LayerStatus(c *client.Client, args []string) error {
-	fs := flag.NewFlagSet("fs layer status", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	asJSON := fs.Bool("json", false, "print JSON")
-	if err := fs.Parse(normalizeHelpFlags(args, fs)); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return printLayerHelp(fs, "usage: drive9 fs layer status [flags] <layer>")
-		}
-		return err
-	}
-	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: drive9 fs layer status [flags] <layer>")
-	}
-	layer, err := c.GetFSLayer(context.Background(), fs.Arg(0))
-	if err != nil {
-		return err
-	}
-	if *asJSON {
-		enc := json.NewEncoder(os.Stdout)
-		return enc.Encode(layer)
-	}
-	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	_, _ = fmt.Fprintf(tw, "layer_id\t%s\n", layer.LayerID)
-	_, _ = fmt.Fprintf(tw, "state\t%s\n", layer.State)
-	_, _ = fmt.Fprintf(tw, "durability\t%s\n", layer.DurabilityMode)
-	_, _ = fmt.Fprintf(tw, "base_root\t%s\n", layer.BaseRootPath)
-	_, _ = fmt.Fprintf(tw, "name\t%s\n", layer.Name)
-	_, _ = fmt.Fprintf(tw, "durable_seq\t%d\n", layer.DurableSeq)
-	if layer.ParentLayerID != "" {
-		_, _ = fmt.Fprintf(tw, "parent_layer_id\t%s\n", layer.ParentLayerID)
-		_, _ = fmt.Fprintf(tw, "origin_seq\t%d\n", layer.OriginSeq)
-		_, _ = fmt.Fprintf(tw, "depth\t%d\n", layer.Depth)
-		_, _ = fmt.Fprintf(tw, "root_layer_id\t%s\n", layer.RootLayerID)
-	}
-	if layer.ActorID != "" {
-		_, _ = fmt.Fprintf(tw, "actor\t%s\n", layer.ActorID)
-	}
-	if tags := formatLayerTags(layer.Tags); tags != "" {
-		_, _ = fmt.Fprintf(tw, "tags\t%s\n", tags)
-	}
-	return tw.Flush()
-}
-
-func LayerDiff(c *client.Client, args []string) error {
-	fs := flag.NewFlagSet("fs layer diff", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	asJSON := fs.Bool("json", false, "print JSON")
-	if err := fs.Parse(normalizeHelpFlags(args, fs)); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return printLayerHelp(fs, "usage: drive9 fs layer diff [flags] <layer>")
-		}
-		return err
-	}
-	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: drive9 fs layer diff [flags] <layer>")
-	}
-	entries, err := c.DiffFSLayer(context.Background(), fs.Arg(0))
-	if err != nil {
-		return err
-	}
-	if *asJSON {
-		enc := json.NewEncoder(os.Stdout)
-		return enc.Encode(map[string]any{"entries": entries})
-	}
-	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	for _, entry := range entries {
-		_, _ = fmt.Fprintf(tw, "%d\t%s\t%s\t%04o\t%s\n", entry.EntrySeq, entry.Op, entry.Kind, entry.Mode, entry.Path)
-	}
-	return tw.Flush()
-}
-
-func LayerCheckpoint(c *client.Client, args []string) error {
-	fs := flag.NewFlagSet("fs layer checkpoint", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	checkpointID := fs.String("id", "", "checkpoint id")
-	label := fs.String("label", "", "checkpoint label")
-	_ = fs.Bool("wait", false, "wait for durable checkpoint")
-	asJSON := fs.Bool("json", false, "print JSON")
-	if err := fs.Parse(normalizeHelpFlags(args, fs)); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return printLayerHelp(fs, "usage: drive9 fs layer checkpoint [flags] <layer>")
-		}
-		return err
-	}
-	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: drive9 fs layer checkpoint [flags] <layer>")
-	}
-	checkpoint, err := c.CheckpointFSLayer(context.Background(), fs.Arg(0), client.FSLayerCheckpointRequest{
-		CheckpointID: *checkpointID,
-		Label:        *label,
-	})
-	if err != nil {
-		return err
-	}
-	if *asJSON {
-		enc := json.NewEncoder(os.Stdout)
-		return enc.Encode(checkpoint)
-	}
-	_, _ = fmt.Fprintln(os.Stdout, checkpoint.CheckpointID)
-	return nil
-}
-
-func LayerRollback(c *client.Client, args []string) error {
-	fs := flag.NewFlagSet("fs layer rollback", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	if err := fs.Parse(normalizeHelpFlags(args, fs)); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return printLayerHelp(fs, "usage: drive9 fs layer rollback <layer>")
-		}
-		return err
-	}
-	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: drive9 fs layer rollback <layer>")
-	}
-	if err := c.RollbackFSLayer(context.Background(), fs.Arg(0)); err != nil {
-		return err
-	}
-	_, _ = fmt.Fprintln(os.Stdout, "ok")
-	return nil
-}
-
-func LayerCommit(c *client.Client, args []string) error {
-	fs := flag.NewFlagSet("fs layer commit", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	if err := fs.Parse(normalizeHelpFlags(args, fs)); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return printLayerHelp(fs, "usage: drive9 fs layer commit <layer>")
-		}
-		return err
-	}
-	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: drive9 fs layer commit <layer>")
-	}
-	result, err := c.CommitFSLayer(context.Background(), fs.Arg(0))
-	if err != nil {
-		return err
-	}
-	_, _ = fmt.Fprintf(os.Stdout, "%s layer=%s applied=%d\n", result.Status, result.LayerID, result.Applied)
-	return nil
-}
-
-func LayerFork(c *client.Client, args []string) error {
-	fs := flag.NewFlagSet("fs layer fork", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	layerID := fs.String("id", "", "child layer id")
-	name := fs.String("name", "", "child layer name")
-	checkpoint := fs.String("checkpoint", "", "pin to parent checkpoint id")
-	actor := fs.String("actor", "", "actor id")
-	asJSON := fs.Bool("json", false, "print JSON")
-	if err := fs.Parse(normalizeHelpFlags(args, fs)); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return printLayerHelp(fs, "usage: drive9 fs layer fork [flags] <parent-layer>")
-		}
-		return err
-	}
-	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: drive9 fs layer fork [flags] <parent-layer>")
-	}
-	child, err := c.ForkFSLayer(context.Background(), fs.Arg(0), client.FSLayerForkRequest{
-		LayerID:      *layerID,
-		Name:         *name,
-		ActorID:      *actor,
-		CheckpointID: *checkpoint,
-	})
-	if err != nil {
-		return err
-	}
-	if *asJSON {
-		enc := json.NewEncoder(os.Stdout)
-		return enc.Encode(child)
-	}
-	_, _ = fmt.Fprintln(os.Stdout, child.LayerID)
-	return nil
-}
-
-func LayerChain(c *client.Client, args []string) error {
-	fs := flag.NewFlagSet("fs layer chain", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	asJSON := fs.Bool("json", false, "print JSON")
-	if err := fs.Parse(normalizeHelpFlags(args, fs)); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return printLayerHelp(fs, "usage: drive9 fs layer chain [flags] <layer>")
-		}
-		return err
-	}
-	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: drive9 fs layer chain [flags] <layer>")
-	}
-	chain, err := c.ListFSLayerChain(context.Background(), fs.Arg(0))
-	if err != nil {
-		return err
-	}
-	if *asJSON {
-		enc := json.NewEncoder(os.Stdout)
-		return enc.Encode(map[string]any{"chain": chain})
-	}
-	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	for _, frame := range chain {
-		_, _ = fmt.Fprintf(tw, "%s\tdepth=%d\torigin_seq=%d\tlimit=%d\t%s\t%s\n",
-			frame.LayerID, frame.Depth, frame.OriginSeq, frame.LimitSeq, frame.State, frame.Name)
-	}
-	return tw.Flush()
-}
-
-func LayerDelete(c *client.Client, args []string) error {
-	fs := flag.NewFlagSet("fs layer delete", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	cascade := fs.Bool("cascade", false, "abandon descendant layers first")
-	if err := fs.Parse(normalizeHelpFlags(args, fs)); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return printLayerHelp(fs, "usage: drive9 fs layer delete [flags] <layer>")
-		}
-		return err
-	}
-	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: drive9 fs layer delete [flags] <layer>")
-	}
-	if err := c.DeleteFSLayer(context.Background(), fs.Arg(0), *cascade); err != nil {
-		return err
-	}
-	_, _ = fmt.Fprintln(os.Stdout, "ok")
-	return nil
-}
-
-func printLayerHelp(fs *flag.FlagSet, lines ...string) error {
-	for _, line := range lines {
-		_, _ = fmt.Fprintln(os.Stderr, line)
-	}
-	_, _ = fmt.Fprintln(os.Stderr, "flags:")
-	fs.SetOutput(os.Stderr)
-	fs.PrintDefaults()
-	return nil
-}
-
-func parseLayerTags(values []string) (map[string]string, error) {
-	if len(values) == 0 {
-		return nil, nil
-	}
-	out := make(map[string]string, len(values))
-	for _, raw := range values {
-		key, value, ok := strings.Cut(raw, "=")
-		if !ok {
-			return nil, fmt.Errorf("invalid layer tag %q (expected key=value)", raw)
-		}
-		key = strings.TrimSpace(key)
-		if key == "" {
-			return nil, fmt.Errorf("invalid layer tag %q (empty key)", raw)
-		}
-		if _, exists := out[key]; exists {
-			return nil, fmt.Errorf("duplicate layer tag %q", key)
-		}
-		out[key] = strings.TrimSpace(value)
-	}
-	return out, nil
-}
-
-func formatLayerTags(tags map[string]string) string {
-	if len(tags) == 0 {
-		return ""
-	}
-	keys := make([]string, 0, len(tags))
-	for key := range tags {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	parts := make([]string, 0, len(keys))
-	for _, key := range keys {
-		parts = append(parts, key+"="+tags[key])
-	}
-	return strings.Join(parts, ",")
+	return nil, errors.New("unsupported fixed Layer control")
 }

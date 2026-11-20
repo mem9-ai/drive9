@@ -58,18 +58,22 @@ type SnapshotStagingGensFunc func(remotePath string) StagingGens
 // any time. WaitPath allows Rename/Unlink/Fsync to block until the current
 // upload for a path finishes.
 type WriteBackUploader struct {
-	client     *client.Client
-	cache      *staging.WriteBackCache
-	remoteRoot string
-	queueMu    sync.Mutex
-	queueCond  *sync.Cond
-	queue      []string
-	queueHead  int
-	queuedSet  map[string]struct{}
-	wg         sync.WaitGroup
-	stopOnce   sync.Once
-	stopped    atomic.Bool
-	active     atomic.Int64
+	client       *client.Client
+	cache        *staging.WriteBackCache
+	remoteRoot   string
+	fixedJournal *staging.Journal
+	// Fixed cache publication and namespace changes must not cross an unresolved
+	// completion. Main never takes this barrier.
+	fixedNamespaceMu sync.RWMutex
+	queueMu          sync.Mutex
+	queueCond        *sync.Cond
+	queue            []string
+	queueHead        int
+	queuedSet        map[string]struct{}
+	wg               sync.WaitGroup
+	stopOnce         sync.Once
+	stopped          atomic.Bool
+	active           atomic.Int64
 
 	// Per-path in-flight tracking.
 	inflightMu sync.Mutex
@@ -282,6 +286,16 @@ func (u *WriteBackUploader) WaitIdle(ctx context.Context) error {
 	for {
 		queued, inFlight := u.PendingStats()
 		if queued == 0 && inFlight == 0 {
+			if u.client.ViewBinding().LayerID != "" {
+				snap := u.Snapshot()
+				records, err := u.fixedCachePublications()
+				if err != nil {
+					return err
+				}
+				if len(records) > 0 || snap.Cached > 0 {
+					return fmt.Errorf("fixed cache uploads remain unresolved")
+				}
+			}
 			return nil
 		}
 		select {
@@ -425,8 +439,19 @@ func (u *WriteBackUploader) uploadSyncWithMetadata(ctx context.Context, localPat
 	// Own the gate through cache cleanup, just like uploadOne. A wait alone
 	// leaves a gap in which a background or second synchronous upload can
 	// publish the same generation and trigger a false revision conflict.
+	if u.client.ViewBinding().LayerID != "" {
+		u.fixedNamespaceMu.RLock()
+		defer u.fixedNamespaceMu.RUnlock()
+	}
 	release := u.acquirePath(localPath)
 	defer release()
+
+	if u.client.ViewBinding().LayerID != "" {
+		rev, meta, handled, err := u.uploadFixedCache(ctx, localPath)
+		if handled || err != nil {
+			return rev, meta, err
+		}
+	}
 
 	// staging.PendingChmod entries have no .dat file (data already uploaded, only
 	// chmod remains). Read meta first so we can handle chmod without loading
@@ -465,7 +490,7 @@ func (u *WriteBackUploader) uploadSyncWithMetadata(ctx context.Context, localPat
 
 	var committedRev int64
 	threshold := u.directPutThreshold()
-	useDirectPUT := meta.Size == 0 || (threshold > 0 && meta.Size < threshold)
+	useDirectPUT := client.UseDirectPUT(meta.Size, threshold)
 	put := func(ctx context.Context, rev int64) (int64, error) {
 		if useDirectPUT {
 			return u.client.WriteCtxConditionalWithRevision(ctx, u.remotePath(localPath), data, rev)
@@ -920,8 +945,23 @@ func (u *WriteBackUploader) acquirePath(localPath string) func() {
 }
 
 func (u *WriteBackUploader) uploadOne(localPath string) {
+	if u.client.ViewBinding().LayerID != "" {
+		u.fixedNamespaceMu.RLock()
+		defer u.fixedNamespaceMu.RUnlock()
+	}
 	release := u.acquirePath(localPath)
 	defer release()
+	if u.client.ViewBinding().LayerID != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
+		defer cancel()
+		_, _, handled, err := u.uploadFixedCache(ctx, localPath)
+		if err != nil {
+			safeLogPrintf("fixed cache upload remains pending for %s: %v", localPath, err)
+		}
+		if handled || err != nil {
+			return
+		}
+	}
 
 	// staging.PendingChmod entries have no .dat file (data already uploaded, only
 	// chmod remains). Read meta first so we can handle chmod without loading
