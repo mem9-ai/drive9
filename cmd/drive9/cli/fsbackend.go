@@ -170,13 +170,14 @@ func (a *drive9FS) Stat(ctx context.Context, loc Location) (*FileInfo, error) {
 		name = "/"
 	}
 	return &FileInfo{
-		Name:    name,
-		Path:    loc.Path,
-		Size:    st.Size,
-		IsDir:   st.IsDir,
-		Mtime:   st.Mtime,
-		Mode:    st.Mode,
-		HasMode: st.HasMode,
+		Name:          name,
+		Path:          loc.Path,
+		Size:          st.Size,
+		IsDir:         st.IsDir,
+		Mtime:         st.Mtime,
+		Mode:          st.Mode,
+		HasMode:       st.HasMode,
+		ContentLayout: string(st.ContentLayout),
 	}, nil
 }
 
@@ -241,6 +242,9 @@ func (a *drive9FS) OpenReadRange(ctx context.Context, loc Location, offset, leng
 }
 
 func (a *drive9FS) OpenWrite(ctx context.Context, loc Location, opts WriteOpts) (WriteHandle, error) {
+	if opts.Layout != "" && opts.TargetLayout != "" && opts.Layout != opts.TargetLayout {
+		return nil, fmt.Errorf("destination %s already has %s content layout; --layout %s cannot be applied", loc.Path, opts.TargetLayout, opts.Layout)
+	}
 	// WriteStreamWithSummary needs a seekable ReaderAt for large files, so
 	// spool to a tempfile instead of buffering the whole object in RAM.
 	f, err := os.CreateTemp("", "drive9-cp-*")
@@ -317,9 +321,15 @@ func (w *drive9Write) Close() error {
 	if w.opts.Description != "" {
 		opts = append(opts, client.WithDescription(w.opts.Description))
 	}
+	if w.opts.Layout != "" {
+		opts = append(opts, client.WithContentLayout(client.ContentLayout(w.opts.Layout)))
+	}
+	if w.opts.TargetLayout != "" {
+		opts = append(opts, client.WithTargetLayout(client.ContentLayout(w.opts.TargetLayout)))
+	}
 	_, err = w.a.c.WriteStreamWithSummary(w.ctx, w.loc.Path, w.f, fi.Size(), nil, opts...)
 	if err != nil {
-		return fmt.Errorf("write %s: %w", w.loc.Raw, err)
+		return fmt.Errorf("write %s: %w", w.loc.Raw, wrapExplicitLayoutError(w.opts.Layout, err))
 	}
 	return nil
 }

@@ -191,7 +191,7 @@ func TestMountRuntimeGenerationDiskReadsDoNotCrossViews(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := MountConfig{Server: server.URL, MountPoint: t.TempDir(), CacheDir: t.TempDir(), Extensions: []string{"core", "cache"}, SyncMode: "strict", ReadCacheMaxFileBytes: 1, DiskReadCacheFreeRatio: -1}
+	cfg := MountConfig{Server: server.URL, MountPoint: t.TempDir(), CacheDir: t.TempDir(), Extensions: []string{"core", "cache"}, SyncMode: "strict", ReadCacheMaxFileBytes: 1, DiskReadCacheSize: 1 << 20, DiskReadCacheFreeRatio: -1}
 	// All fixtures deliberately have the SAME pathname, revision and size.
 	// Their bytes differ, so only correct view/generation isolation can help.
 	for i, cl := range []*client.Client{base, bound, base} {

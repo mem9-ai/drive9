@@ -6,6 +6,8 @@ package writebuffer
 import (
 	"fmt"
 	"syscall"
+
+	"github.com/mem9-ai/drive9/pkg/fusecomp/membudget"
 )
 
 // SmallFileThreshold is the static small-file cutoff used by callers
@@ -81,8 +83,25 @@ type WriteBuffer struct {
 	// truncated-away remote bytes (#984).
 	remoteSize int64
 
+	// remoteAuthoritative records that the remote image holds the bytes
+	// this buffer had at its last landing (the owning handle armed the
+	// loader then). The proof is PART-SCOPED and generation-scoped: any
+	// part this buffer mutates afterwards diverges from that landed image
+	// again (an interactive staging may sit un-uploaded), so restoring it
+	// from the remote would silently discard acknowledged modifications.
+	// remoteTainted tracks those divergent parts; remoteTaintedAll covers
+	// whole-image divergences (truncate/reset).
+	remoteAuthoritative bool
+	remoteTaintedAll    bool
+	remoteTainted       map[int]bool
+
 	// Memory tracking
 	curMemory int64 // current bytes held in parts map
+	// budget, when set, is charged for every byte retained in parts or
+	// smallFileData and released when that memory is dropped. A nil budget
+	// keeps the pre-budget behavior: only the per-file caps apply, so N open
+	// writable handles can hold N buffers at once.
+	budget *membudget.Budget
 
 	// Sequential write detection
 	appendCursor int64 // end of highest contiguous write; updated only on sequential writes
@@ -166,7 +185,10 @@ func (wb *WriteBuffer) Write(offset int64, data []byte) (uint32, error) {
 		return wb.writeSmallFile(offset, data)
 	}
 
-	// Update totalSize
+	// Update totalSize, remembering the previous EOF: a write that fails
+	// (memory budget, part load) must not leave the staged file extended by
+	// bytes that never landed.
+	prevTotal := wb.totalSize
 	if end > wb.totalSize {
 		wb.totalSize = end
 	}
@@ -180,7 +202,8 @@ func (wb *WriteBuffer) Write(offset int64, data []byte) (uint32, error) {
 		partOff := pos % wb.partSize
 
 		// Ensure part exists (lazily load or create)
-		if err := wb.ensurePart(partIdx); err != nil {
+		if err := wb.ensurePart(partIdx, false); err != nil {
+			wb.rollbackWriteExtent(prevTotal, offset, dataOff)
 			return uint32(dataOff), err
 		}
 
@@ -199,20 +222,31 @@ func (wb *WriteBuffer) Write(offset int64, data []byte) (uint32, error) {
 				neededLen = wb.partSize
 			}
 			oldLen := int64(len(part))
-			if neededLen <= int64(cap(part)) {
+			// Account the ALLOCATION, not the logical length: a part grows
+			// by doubling, and the retained heap is the capacity.
+			oldCap := int64(cap(part))
+			newCap := oldCap
+			if neededLen > oldCap {
+				newCap = growPartCapacity(oldCap, neededLen, wb.partSize)
+				if err := wb.addMemory(newCap - oldCap); err != nil {
+					wb.rollbackWriteExtent(prevTotal, offset, dataOff)
+					return uint32(dataOff), err
+				}
+			}
+			if neededLen <= oldCap {
 				part = part[:neededLen]
 				clear(part[oldLen:])
 			} else {
-				grown := make([]byte, neededLen, growPartCapacity(int64(cap(part)), neededLen, wb.partSize))
+				grown := make([]byte, neededLen, newCap)
 				copy(grown, part)
 				part = grown
 			}
-			wb.curMemory += neededLen - oldLen
 			wb.parts[partIdx] = part
 		}
 
 		copy(part[partOff:partOff+canWrite], data[dataOff:dataOff+int(canWrite)])
 		wb.dirtyParts[partIdx] = true
+		wb.taintRemoteRange(int64(partIdx)*wb.partSize, int64(partIdx)*wb.partSize+canWrite)
 
 		pos += canWrite
 		dataOff += int(canWrite)
@@ -292,6 +326,11 @@ func (wb *WriteBuffer) writeSmallFile(offset int64, data []byte) (uint32, error)
 		if int64(newCap) > wb.smallFileMax {
 			newCap = int(wb.smallFileMax)
 		}
+		// The fast path retains heap too: charge the capacity growth so many
+		// open small files cannot exceed the process budget between them.
+		if err := wb.addMemory(int64(newCap) - int64(cap(wb.smallFileData))); err != nil {
+			return 0, err
+		}
 		grown := make([]byte, newCap)
 		copy(grown, wb.smallFileData)
 		wb.smallFileData = grown[:needLen]
@@ -308,6 +347,7 @@ func (wb *WriteBuffer) writeSmallFile(offset int64, data []byte) (uint32, error)
 	}
 	wb.touched = true
 	wb.dirtyParts[0] = true // small files map to a single logical part
+	wb.taintRemoteAll()     // the single image diverges as a whole
 
 	// Sequential write detection
 	if offset == wb.appendCursor {
@@ -323,22 +363,36 @@ func (wb *WriteBuffer) writeSmallFile(offset int64, data []byte) (uint32, error)
 
 // migrateToPartMode transfers smallFileData into the sparse part map and
 // clears smallFileData. Called when a write exceeds smallFileThreshold.
+//
+// The small-file fast path is charged by capacity as it grows; the migration
+// TRANSFERS that charge to the new part allocation (the new part's capacity is
+// the image length, so any headroom the fast path held is released here). It
+// cannot fail and never loses the staged image — eviction therefore cannot
+// silently no-op on budget grounds.
 func (wb *WriteBuffer) migrateToPartMode() {
 	if len(wb.smallFileData) == 0 {
+		// Truncated to zero: the allocation is going away, so its capacity
+		// charge must go with it (the data path below transfers instead).
+		wb.subMemory(int64(cap(wb.smallFileData)))
 		wb.smallFileData = nil
 		return
 	}
+	size := int64(len(wb.smallFileData))
 	// Transfer data to part 0
-	wb.parts[0] = make([]byte, len(wb.smallFileData))
-	copy(wb.parts[0], wb.smallFileData)
-	wb.curMemory = int64(len(wb.smallFileData))
+	part := make([]byte, size)
+	copy(part, wb.smallFileData)
+	if released := int64(cap(wb.smallFileData)) - size; released > 0 {
+		wb.subMemory(released)
+	}
+	wb.parts[0] = part
 	wb.smallFileData = nil
 }
 
 // ensurePart makes sure a part exists in the map. If it doesn't exist
 // and LoadPart is set, tries to load from remote. Otherwise creates a
-// nil entry that will be grown as needed by Write.
-func (wb *WriteBuffer) ensurePart(partIdx int) error {
+// nil entry that will be grown as needed by Write. force admits the load's
+// bytes past the memory budget (publication reads only).
+func (wb *WriteBuffer) ensurePart(partIdx int, force bool) error {
 	if wb.smallFileData != nil {
 		// Small-file mode: all data is in smallFileData, no parts needed
 		return nil
@@ -367,15 +421,23 @@ func (wb *WriteBuffer) ensurePart(partIdx int) error {
 			return err
 		}
 		if restored {
+			if force {
+				wb.forceAddMemory(int64(cap(data)))
+			} else if err := wb.addMemory(int64(cap(data))); err != nil {
+				return err
+			}
 			wb.parts[partIdx] = data
-			wb.curMemory += int64(len(data))
 			return nil
 		}
 		safeLogPrintf("WARNING: back-write to evicted part %d of %s — "+
 			"non-written bytes will be zero (original data already uploaded to S3)", partIdx, wb.path)
 		data = make([]byte, wb.partSize)
+		if force {
+			wb.forceAddMemory(wb.partSize)
+		} else if err := wb.addMemory(wb.partSize); err != nil {
+			return err
+		}
 		wb.parts[partIdx] = data
-		wb.curMemory += wb.partSize
 		return nil
 	}
 
@@ -387,8 +449,12 @@ func (wb *WriteBuffer) ensurePart(partIdx int) error {
 			if err != nil {
 				return err
 			}
+			if force {
+				wb.forceAddMemory(int64(cap(data)))
+			} else if err := wb.addMemory(int64(cap(data))); err != nil {
+				return err
+			}
 			wb.parts[partIdx] = data
-			wb.curMemory += int64(len(data))
 			return nil
 		}
 	}
@@ -402,6 +468,18 @@ func (wb *WriteBuffer) ensurePart(partIdx int) error {
 // so a later Write cannot fail mid-overlay after the caller has already mutated
 // an authoritative shadow. offset/length that do not touch any part are a no-op.
 func (wb *WriteBuffer) EnsurePartsForWrite(offset, length int64) error {
+	return wb.ensurePartsForWrite(offset, length, false)
+}
+
+// ForceEnsurePartsForWrite loads the parts a READ of acknowledged bytes needs
+// even past the memory budget: the bytes are on disk, so refusing the load
+// would make the read serve something staler than what was written. The parts
+// are charged, not refused.
+func (wb *WriteBuffer) ForceEnsurePartsForWrite(offset, length int64) error {
+	return wb.ensurePartsForWrite(offset, length, true)
+}
+
+func (wb *WriteBuffer) ensurePartsForWrite(offset, length int64, force bool) error {
 	if wb == nil || length <= 0 || wb.partSize <= 0 {
 		return nil
 	}
@@ -412,7 +490,7 @@ func (wb *WriteBuffer) EnsurePartsForWrite(offset, length int64) error {
 	first := int(offset / wb.partSize)
 	last := int((end - 1) / wb.partSize)
 	for i := first; i <= last; i++ {
-		if err := wb.ensurePart(i); err != nil {
+		if err := wb.ensurePart(i, force); err != nil {
 			return err
 		}
 	}
@@ -424,34 +502,52 @@ func (wb *WriteBuffer) restoreEvictedPart(partIdx int) ([]byte, bool, error) {
 	if wb.partSize > 0 && partStart >= wb.totalSize {
 		return nil, false, nil
 	}
+	// The shadow spill is the only restore source UNLESS the remote image
+	// is known authoritative for this buffer's retained bytes (the owning
+	// handle armed the fallback after its commit landed — the queue then
+	// reclaims the shadow while evicted parts still reference it). A bare
+	// shadow failure is NOT evidence of a landing: interactive staging
+	// acknowledges fsync before the upload completes, and falling back to
+	// a stale remote image would silently discard those acknowledged
+	// modifications. Even when armed, the fallback must supply the
+	// WHOLE retained range of the part: a short (or empty) read — e.g. a
+	// loader still clamped to a pre-landing EOF — would zero-fill the
+	// remainder and publish the loss.
+	var shadowErr error
 	if wb.RestorePart != nil {
 		data, err := wb.RestorePart(partIdx + 1)
-		if err != nil {
-			return nil, false, fmt.Errorf("restore evicted part %d of %s: %w", partIdx+1, wb.path, err)
-		}
-		if len(data) == 0 {
-			return nil, false, fmt.Errorf("restored evicted part %d of %s is empty", partIdx+1, wb.path)
-		}
-		return data, true, nil
-	}
-	if wb.LoadPart != nil {
-		partStart := int64(partIdx) * wb.partSize
-		if partStart < wb.remoteSize {
-			data, err := wb.LoadPart(partIdx + 1)
-			if err != nil {
-				return nil, false, err
-			}
-			if len(data) == 0 {
-				return nil, false, fmt.Errorf("loaded evicted part %d of %s is empty", partIdx+1, wb.path)
-			}
+		switch {
+		case err != nil:
+			shadowErr = fmt.Errorf("restore evicted part %d of %s: %w", partIdx+1, wb.path, err)
+		case len(data) == 0:
+			shadowErr = fmt.Errorf("restored evicted part %d of %s is empty", partIdx+1, wb.path)
+		default:
 			return data, true, nil
 		}
 	}
-	return nil, false, nil
+	if !wb.remoteAuthoritative || wb.LoadPart == nil || wb.remoteTaintedAll || wb.remoteTainted[partIdx] {
+		return nil, false, shadowErr
+	}
+	data, err := wb.LoadPart(partIdx + 1)
+	if err != nil {
+		return nil, false, shadowErr
+	}
+	want := wb.totalSize - partStart
+	if want > wb.partSize {
+		want = wb.partSize
+	}
+	if int64(len(data)) != want {
+		if shadowErr == nil {
+			shadowErr = fmt.Errorf("loaded evicted part %d of %s is short: %d of %d bytes", partIdx+1, wb.path, len(data), want)
+		}
+		return nil, false, shadowErr
+	}
+	return data, true, nil
 }
 
 // markDirty marks all parts that overlap with [start, end) as dirty.
 func (wb *WriteBuffer) markDirty(start, end int64) {
+	wb.taintRemoteRange(start, end)
 	firstPart := int(start / wb.partSize)
 	lastPart := int((end - 1) / wb.partSize)
 	if end <= start {
@@ -472,7 +568,7 @@ func (wb *WriteBuffer) ensureRetainedDirtyPartLoaded(retainedEnd int64) error {
 	if partStart >= wb.remoteSize {
 		return nil
 	}
-	return wb.ensurePart(partIdx)
+	return wb.ensurePart(partIdx, false)
 }
 
 // Truncate resizes the buffer to size.
@@ -485,6 +581,7 @@ func (wb *WriteBuffer) Truncate(size int64) error {
 	if size < 0 {
 		size = 0
 	}
+	wb.taintRemoteAll()
 	wb.contentVersion++
 	wb.prefixRevision, wb.prefixEnd = 0, 0
 	wb.touched = true
@@ -518,7 +615,7 @@ func (wb *WriteBuffer) Truncate(size int64) error {
 		newPartCount := int((size + wb.partSize - 1) / wb.partSize)
 		for idx := range wb.parts {
 			if idx >= newPartCount {
-				wb.curMemory -= int64(len(wb.parts[idx]))
+				wb.subMemory(int64(cap(wb.parts[idx])))
 				delete(wb.parts, idx)
 				delete(wb.dirtyParts, idx)
 			}
@@ -534,7 +631,6 @@ func (wb *WriteBuffer) Truncate(size int64) error {
 			lastIdx := newPartCount - 1
 			partOff := size - int64(lastIdx)*wb.partSize
 			if part, ok := wb.parts[lastIdx]; ok && int64(len(part)) > partOff {
-				wb.curMemory -= int64(len(part)) - partOff
 				wb.parts[lastIdx] = part[:partOff]
 			}
 		}
@@ -559,6 +655,9 @@ func (wb *WriteBuffer) Truncate(size int64) error {
 					newCap := int(size)
 					if newCap < 1024 {
 						newCap = 1024
+					}
+					if err := wb.addMemory(int64(newCap) - int64(cap(wb.smallFileData))); err != nil {
+						return err
 					}
 					grown := make([]byte, newCap)
 					copy(grown, wb.smallFileData)
@@ -605,6 +704,50 @@ func (wb *WriteBuffer) PartSize() int64 {
 // territory. Call before any Write/Read/Truncate touches the buffer.
 func (wb *WriteBuffer) SetRemoteSize(size int64) {
 	wb.remoteSize = size
+}
+
+// ContentVersion returns the buffer's content generation: every Write,
+// Truncate, or Reset increments it, so an unchanged version together with
+// an unchanged snapshot ID proves the live buffer still holds exactly the
+// staged image a landing acknowledged.
+func (wb *WriteBuffer) ContentVersion() uint64 {
+	return wb.contentVersion
+}
+
+// MarkRemoteAuthoritative declares that the current remote image holds
+// every retained byte of this buffer — the owning handle's commit landed
+// and armed the remote loader. Only then may an evicted part fall back to
+// LoadPart when the shadow spill is gone.
+// taintRemoteRange marks every part overlapping [start, end) as diverged
+// from the landed remote image.
+func (wb *WriteBuffer) taintRemoteRange(start, end int64) {
+	if !wb.remoteAuthoritative || wb.partSize <= 0 {
+		return
+	}
+	if start < 0 {
+		start = 0
+	}
+	first := int(start / wb.partSize)
+	last := int((end - 1) / wb.partSize)
+	if wb.remoteTainted == nil {
+		wb.remoteTainted = make(map[int]bool)
+	}
+	for i := first; i <= last; i++ {
+		wb.remoteTainted[i] = true
+	}
+}
+
+// taintRemoteAll drops the landed-image proof for the whole buffer.
+func (wb *WriteBuffer) taintRemoteAll() {
+	if wb.remoteAuthoritative {
+		wb.remoteTaintedAll = true
+	}
+}
+
+func (wb *WriteBuffer) MarkRemoteAuthoritative() {
+	wb.remoteAuthoritative = true
+	wb.remoteTaintedAll = false
+	wb.remoteTainted = nil
 }
 
 // SeedRemote installs a lazy base: the buffer logically spans size bytes
@@ -853,10 +996,13 @@ func (wb *WriteBuffer) CanMaterializeFull() bool {
 // LoadMissingParts force-loads every unloaded part of the retained remote
 // prefix via the configured LoadPart loader, so Bytes()/bytesView can
 // reconstruct the complete current contents. It is a no-op when the buffer
-// has no remote-backed ranges and never marks parts dirty. Returns an error
-// when a required part cannot be loaded — no loader configured, load
-// failure, or a part evicted after streaming upload (its original bytes are
-// no longer available) — leaving previously loaded parts untouched.
+// has no remote-backed ranges and never marks parts dirty.
+//
+// The parts are charged as a whole-image load (ForceCharge): the caller needs
+// the complete base to publish it, so the budget records the bytes instead of
+// refusing them. A failure rolls the whole attempt back so a retry is not left
+// holding a partial base whose charge keeps it failing; parts loaded before
+// the call stay as they were.
 func (wb *WriteBuffer) LoadMissingParts() error {
 	if wb.smallFileData != nil {
 		return nil
@@ -869,6 +1015,14 @@ func (wb *WriteBuffer) LoadMissingParts() error {
 		return nil
 	}
 
+	var loaded []int
+	rollback := func(err error) error {
+		for _, idx := range loaded {
+			wb.ReleaseCleanPart(idx)
+		}
+		return err
+	}
+
 	numParts := int((covered + wb.partSize - 1) / wb.partSize)
 	for idx := 0; idx < numParts; idx++ {
 		if wb.IsPartLoaded(idx) {
@@ -877,36 +1031,39 @@ func (wb *WriteBuffer) LoadMissingParts() error {
 		if wb.uploadedParts != nil && wb.uploadedParts[idx] {
 			data, restored, err := wb.restoreEvictedPart(idx)
 			if err != nil {
-				return err
+				return rollback(err)
 			}
 			if restored {
+				wb.forceAddMemory(int64(cap(data)))
 				wb.parts[idx] = data
-				wb.curMemory += int64(len(data))
+				loaded = append(loaded, idx)
 				continue
 			}
-			return fmt.Errorf("part %d was evicted after streaming upload and cannot be refetched", idx+1)
+			return rollback(fmt.Errorf("part %d was evicted after streaming upload and cannot be refetched", idx+1))
 		}
 		if wb.LoadPart == nil {
-			return fmt.Errorf("part %d is not loaded and no lazy part loader is configured", idx+1)
+			return rollback(fmt.Errorf("part %d is not loaded and no lazy part loader is configured", idx+1))
 		}
 		data, err := wb.LoadPart(idx + 1) // 1-based
 		if err != nil {
-			return fmt.Errorf("load part %d: %w", idx+1, err)
+			return rollback(fmt.Errorf("load part %d: %w", idx+1, err))
 		}
+		wb.forceAddMemory(int64(cap(data)))
 		wb.parts[idx] = data
-		wb.curMemory += int64(len(data))
+		loaded = append(loaded, idx)
 	}
 	return nil
 }
 
 // Reset clears the buffer, releasing the underlying memory.
 func (wb *WriteBuffer) Reset() {
+	wb.taintRemoteAll()
 	wb.contentVersion++
 	wb.prefixRevision, wb.prefixEnd = 0, 0
 	wb.parts = make(map[int][]byte)
 	wb.dirtyParts = make(map[int]bool)
 	wb.totalSize = 0
-	wb.curMemory = 0
+	wb.subMemory(wb.curMemory)
 	wb.smallFileData = nil
 }
 
@@ -925,7 +1082,16 @@ func (wb *WriteBuffer) ClearDirty() {
 // partIdx is 0-based. This is used by the Read path to load unmodified parts
 // before serving from the buffer, avoiding returning zeros for unloaded parts.
 func (wb *WriteBuffer) EnsureLoaded(partIdx int) error {
-	return wb.ensurePart(partIdx)
+	return wb.ensurePart(partIdx, false)
+}
+
+// ForceEnsureLoaded loads a part for a PUBLICATION read even past the memory
+// budget. A commit that has to write the whole image out cannot proceed
+// without the part, so refusing it would make an already-admitted edit
+// unpublishable (every retry fails the same way). The bytes are still counted,
+// and the caller releases the part again as soon as it copied it out.
+func (wb *WriteBuffer) ForceEnsureLoaded(partIdx int) error {
+	return wb.ensurePart(partIdx, true)
 }
 
 // ReleaseCleanPart drops a loaded CLEAN part from memory (a spill that
@@ -933,7 +1099,7 @@ func (wb *WriteBuffer) EnsureLoaded(partIdx int) error {
 // dirty parts are the handle's own data and stay).
 func (wb *WriteBuffer) ReleaseCleanPart(partIdx int) {
 	if part, ok := wb.parts[partIdx]; ok && !wb.dirtyParts[partIdx] {
-		wb.curMemory -= int64(len(part))
+		wb.subMemory(int64(cap(part)))
 		delete(wb.parts, partIdx)
 	}
 }
@@ -974,12 +1140,13 @@ func (wb *WriteBuffer) EvictPart(partIdx int) {
 	wb.uploadedParts[partIdx] = true
 
 	if wb.smallFileData != nil {
-		// Migrate to part mode before evicting
+		// Migrate to part mode before evicting (this cannot fail: the charge is
+		// transferred, not re-admitted).
 		wb.migrateToPartMode()
 	}
 
 	if part, ok := wb.parts[partIdx]; ok {
-		wb.curMemory -= int64(len(part))
+		wb.subMemory(int64(cap(part)))
 		delete(wb.parts, partIdx)
 	}
 }
@@ -988,6 +1155,37 @@ func (wb *WriteBuffer) EvictPart(partIdx int) {
 // uploaded during streaming (and whose memory was evicted).
 func (wb *WriteBuffer) StreamedPartIndices() map[int]bool {
 	return wb.uploadedParts
+}
+
+// MemoryUsage returns the byte volume currently held in memory across buffered parts.
+func (wb *WriteBuffer) MemoryUsage() int64 {
+	return wb.curMemory
+}
+
+// SpillResidentParts invokes spill(partIdx, data) on every in-memory part except
+// skipPartIdx and evicts each part for which spill reports true. Used to bound
+// Go heap usage even when kernel FUSE worker threads deliver writes slightly
+// out of offset order (which disables wb.sequential).
+func (wb *WriteBuffer) SpillResidentParts(skipPartIdx int, spill func(partIdx int, data []byte) bool) {
+	if wb == nil || wb.smallFileData != nil || len(wb.parts) == 0 {
+		return
+	}
+	indices := make([]int, 0, len(wb.parts))
+	for idx := range wb.parts {
+		if idx == skipPartIdx {
+			continue
+		}
+		indices = append(indices, idx)
+	}
+	for _, idx := range indices {
+		data := wb.PartData(idx + 1)
+		if len(data) == 0 {
+			continue
+		}
+		if spill(idx, data) {
+			wb.EvictPart(idx)
+		}
+	}
 }
 
 // DirtyStreamedParts returns parts that were evicted (streamed) but later

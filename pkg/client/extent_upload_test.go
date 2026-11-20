@@ -116,7 +116,12 @@ func TestExtentUploadUsesChecksummedPartsAndDedup(t *testing.T) {
 	u, _ := url.Parse(object.URL)
 	jar.SetCookies(u, []*http.Cookie{{Name: "session", Value: "private"}})
 	c.httpClient.Jar = jar
-	summary, err := c.WriteStreamWithSummaryAndTags(context.Background(), "/big.bin", bytes.NewReader(data), int64(len(data)), func(int, int, int64) { progress.Add(1) }, map[string]string{"purpose": "test"})
+	summary := &UploadSummary{Type: "upload_summary", StartedAt: time.Now(), RemotePath: "/big.bin", TotalBytes: int64(len(data))}
+	plan, err := c.initiateUploadV2CheckedLayout(context.Background(), "/big.bin", int64(len(data)), 0, "", ContentLayoutExtent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = c.writeExtentUpload(context.Background(), plan, bytes.NewReader(data), int64(len(data)), func(int, int, int64) { progress.Add(1) }, summary, map[string]string{"purpose": "test"}, "", nil, 0)
 	if err != nil || summary.Mode != "extent_v2" || puts.Load() != 2 || completed.Load() != 1 || progress.Load() != 3 || summary.UploadedParts != 3 {
 		t.Fatalf("summary=%+v err=%v puts=%d complete=%d progress=%d", summary, err, puts.Load(), completed.Load(), progress.Load())
 	}
@@ -156,7 +161,7 @@ func TestExtentUploadRejectsBadPlanBeforeStorage(t *testing.T) {
 				}
 			}))
 			defer api.Close()
-			if err := New(api.URL, "test-token").WriteStream(context.Background(), "/a", bytes.NewReader([]byte("a")), 1, nil); err == nil || calls.Load() != 1 {
+			if err := New(api.URL, "test-token").writeCheckedExtentStreamConditional(context.Background(), "/a", bytes.NewReader([]byte("a")), 1, nil, 0); err == nil || calls.Load() != 1 {
 				t.Fatalf("err=%v calls=%d", err, calls.Load())
 			}
 		})
@@ -210,7 +215,12 @@ func TestExtentUploadCompletionUnknownKeepsSession(t *testing.T) {
 			if failure == "precheck" {
 				check = func() error { return errors.New("precheck failed") }
 			}
-			_, err := New(api.URL, "test-token").writeStreamConditionalWithSummaryAndPreCompleteCheck(context.Background(), "/a", bytes.NewReader(data), 1, nil, 0, nil, "", "", check)
+			c := New(api.URL, "test-token")
+			plan, err := c.initiateUploadV2CheckedLayout(context.Background(), "/a", 1, 0, "", ContentLayoutExtent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = c.writeExtentUpload(context.Background(), plan, bytes.NewReader(data), 1, nil, nil, nil, "", check, 0)
 			pre := failure == "precheck" || failure == "short source"
 			if err == nil || IsCommitAttempted(err) == pre || !strings.Contains(err.Error(), "upload") {
 				t.Fatalf("err=%v", err)
@@ -317,7 +327,7 @@ func TestExtentUploadCancelsPeerOnPartFailure(t *testing.T) {
 	defer api.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	err := New(api.URL, "test-token").WriteStream(ctx, "/a", bytes.NewReader(make([]byte, 8<<20)), 8<<20, nil)
+	err := New(api.URL, "test-token").writeCheckedExtentStreamConditional(ctx, "/a", bytes.NewReader(make([]byte, 8<<20)), 8<<20, nil, 0)
 	if err == nil || !strings.Contains(err.Error(), "500") || aborts.Load() != 1 || completes.Load() != 0 {
 		t.Fatalf("err=%v aborts=%d completes=%d", err, aborts.Load(), completes.Load())
 	}

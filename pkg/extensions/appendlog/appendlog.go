@@ -29,6 +29,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/fs"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/httperr"
+	"github.com/mem9-ai/drive9/pkg/fusecomp/membudget"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/writebuffer"
 )
 
@@ -82,6 +83,9 @@ type AppendLog struct {
 	events     *fs.EventBus
 	tempDir    string
 	syncPolicy string
+	// budget is the process-wide memory budget the handle write buffers
+	// charge (nil disables the charge).
+	budget *membudget.Budget
 	// live indexes open protocol handles by path (SetAttr interception,
 	// unlink/rename retargeting).
 	live sync.Map
@@ -724,7 +728,12 @@ func (a *AppendLog) fullRewrite(ctx context.Context, h *Handle) error {
 	h.origSize = size
 	h.observeLayoutLocked(client.ContentLayoutAppendLog, revision, size)
 	if h.seq == snapshotSeq && !h.unlinked {
-		h.buf.ClearDirty()
+		// A concurrent close may have published and discarded the buffer while
+		// this upload was in flight: the image still landed, so record the
+		// landing, but there is no buffer left to clear.
+		if h.buf != nil {
+			h.buf.ClearDirty()
+		}
 		h.dirty = false
 		h.adoptCommittedBaselineLocked(revision, size)
 		h.st.appendSafe = true
@@ -898,7 +907,9 @@ func (a *AppendLog) refreshCleanSiblings(path string, rev, size int64, self *Han
 			other.isNew = false
 			other.baseRev = rev
 			other.origSize = size
-			other.buf = nil // re-read lazily from the committed image
+			// Re-read lazily from the committed image; the discarded
+			// buffer's memory-budget charge goes back with it.
+			writebuffer.Discard(&other.buf)
 			other.observeLayoutLocked(client.ContentLayoutAppendLog, rev, size)
 			if other.dirty {
 				other.dirty = false
@@ -1513,7 +1524,10 @@ func (a *AppendLog) readLiveAppendBuffer(ctx context.Context, reader *Handle, pa
 	if !served.dirty || served.buf == nil {
 		return 0, false
 	}
-	if err := served.buf.EnsurePartsForWrite(off, int64(len(dest))); err != nil {
+	// The sibling's buffered bytes are ACKNOWLEDGED writes: refusing the load
+	// on budget grounds and falling through would serve the remote's older
+	// image. Force the parts (charged, not refused).
+	if err := served.buf.ForceEnsurePartsForWrite(off, int64(len(dest))); err != nil {
 		return 0, false
 	}
 	n := served.buf.ReadAt(off, dest)
@@ -1583,7 +1597,7 @@ func (h *Handle) refreshAppendBaselineLocked(ctx context.Context) error {
 	if !newest.dirty || newest.buf == nil || newest.buf.Size() < newestSize {
 		return nil // raced with a flush; the rebase retry at flush covers it
 	}
-	if err := newest.buf.EnsurePartsForWrite(ourSize, int64(len(tail))); err != nil {
+	if err := newest.buf.ForceEnsurePartsForWrite(ourSize, int64(len(tail))); err != nil {
 		return err
 	}
 	n := newest.buf.ReadAt(ourSize, tail)
@@ -1596,7 +1610,14 @@ func (h *Handle) refreshAppendBaselineLocked(ctx context.Context) error {
 	return nil
 }
 
-func (h *Handle) Release(ctx context.Context) error {
+func (h *Handle) Release(ctx context.Context) (err error) {
+	// The descriptor is gone: the FUSE facade drops its handle and calls
+	// Release exactly once (no retry), so nothing can ever consume this
+	// buffer again — including after a failed content commit, where the dirty
+	// IMAGE has no future reader (the pending remote state lives in the
+	// plane's own metadata, not in the buffer). Return the charge on every
+	// path, like git and layer.
+	defer h.releaseBuffer()
 	h.a.untrack(h)
 	h.mu.Lock()
 	unlinked := h.unlinked
@@ -1604,7 +1625,6 @@ func (h *Handle) Release(ctx context.Context) error {
 	path := h.path
 	h.unlinkAtRelease = nil
 	h.mu.Unlock()
-	var err error
 	if unlinked {
 		// Last close of an unlinked path: publish the deferred delete. The
 		// path tombstone outlives only fds of the SAME unlinked generation —
@@ -1699,7 +1719,7 @@ func (a *AppendLog) dropCleanSiblingImages(siblings []*Handle) {
 	for _, o := range siblings {
 		o.mu.Lock()
 		if !o.dirty {
-			o.buf = nil
+			writebuffer.Discard(&o.buf)
 		}
 		o.mu.Unlock()
 	}
@@ -1730,7 +1750,7 @@ func (a *AppendLog) discardSiblingImages(siblings []*Handle) {
 			o.st.clearSQLiteWALHeaderWrite()
 			o.seq++
 		}
-		o.buf = nil
+		writebuffer.Discard(&o.buf)
 		o.mu.Unlock()
 	}
 }
@@ -2092,6 +2112,23 @@ func (h *Handle) observeCommittedWALHeaderLocked(header sqliteWALHeader) {
 	h.st.clearSQLiteWALHeaderWrite()
 }
 
+// SetMemoryBudget wires the process-wide memory budget this extension's
+// handle write buffers charge their retained bytes to.
+func (a *AppendLog) SetMemoryBudget(b *membudget.Budget) {
+	if a == nil {
+		return
+	}
+	a.budget = b
+}
+
+// releaseBuffer returns the handle's write-buffer charge to the process
+// memory budget and drops the buffer.
+func (h *Handle) releaseBuffer() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	writebuffer.Discard(&h.buf)
+}
+
 // ensureBuffer creates the write buffer. Existing files keep their base
 // lazy: parts load from the chain on first touch, so memory stays
 // proportional to the touched regions.
@@ -2100,6 +2137,7 @@ func (h *Handle) ensureBuffer(ctx context.Context) error {
 		return nil
 	}
 	h.buf = writebuffer.NewWriteBuffer(h.path, bufferedMaxTotal, 0)
+	h.buf.SetMemoryBudget(h.a.budget)
 	if h.isNew || h.inner == nil || h.origSize <= 0 {
 		return nil
 	}

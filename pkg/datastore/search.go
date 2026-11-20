@@ -2,6 +2,9 @@ package datastore
 
 import (
 	"context"
+	"database/sql"
+	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -31,17 +34,6 @@ type FindFilter struct {
 }
 
 const rrfK = 60.0
-
-// extentSizeSelect / extentSizeJoin give a search query the file's real size.
-// An extent file's length lives in jfs_node — the JuiceFS meta is its source of
-// truth — while inodes.size_bytes only tracks the other layouts: the extent
-// write path deliberately does not rewrite the projection, because doing it
-// inside the write transaction measured +40-50% on extent_write (see the
-// comment in jfsWritePartsTx). Search reads inodes directly, so it must join.
-const (
-	extentSizeSelect = `COALESCE(jn.length, i.size_bytes)`
-	extentSizeJoin   = ` LEFT JOIN jfs_node jn ON jn.inode = fn.extent_ino`
-)
 
 // RRFMerge merges ranked FTS and vector results with reciprocal rank fusion.
 func RRFMerge(fts, vec []SearchResult, limit int) []SearchResult {
@@ -166,9 +158,9 @@ func buildVectorSearchQueryScoped(scope Scope, queryEmbedding []float32, pathPre
 	args = append(args, scopeWhereArgs(scope, 3, condArgs...)...)
 	args = append(args, vecParam, limit)
 
-	q := `SELECT fn.path, fn.name, ` + extentSizeSelect + `,
+	q := `SELECT fn.path, fn.name, i.size_bytes,
 		VEC_EMBED_COSINE_DISTANCE(s.embedding, ?) AS distance
-		FROM file_nodes fn JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id JOIN semantic s ON i.inode_id = s.inode_id` + extentSizeJoin + `
+		FROM file_nodes fn JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id JOIN semantic s ON i.inode_id = s.inode_id
 		WHERE ` + scopeWhereAnd(scope, strings.Join(conds, " AND "), "fn", "i", "s") + `
 		ORDER BY VEC_EMBED_COSINE_DISTANCE(s.embedding, ?)
 	LIMIT ?`
@@ -195,9 +187,9 @@ func buildVectorSearchByTextQueryScoped(scope Scope, queryText, pathPrefix strin
 	args = append(args, scopeWhereArgs(scope, 3, condArgs...)...)
 	args = append(args, limit)
 
-	q := `SELECT fn.path, fn.name, ` + extentSizeSelect + `,
+	q := `SELECT fn.path, fn.name, i.size_bytes,
 		VEC_EMBED_COSINE_DISTANCE(s.embedding, ?) AS distance
-		FROM file_nodes fn JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id JOIN semantic s ON i.inode_id = s.inode_id` + extentSizeJoin + `
+		FROM file_nodes fn JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id JOIN semantic s ON i.inode_id = s.inode_id
 		WHERE ` + scopeWhereAnd(scope, strings.Join(conds, " AND "), "fn", "i", "s") + `
 		ORDER BY distance
 		LIMIT ?`
@@ -240,9 +232,9 @@ func buildVectorSearchDescriptionQueryScoped(scope Scope, queryEmbedding []float
 	args = append(args, scopeWhereArgs(scope, 3, condArgs...)...)
 	args = append(args, vecParam, limit)
 
-	q := `SELECT fn.path, fn.name, ` + extentSizeSelect + `,
+	q := `SELECT fn.path, fn.name, i.size_bytes,
 		VEC_EMBED_COSINE_DISTANCE(s.description_embedding, ?) AS distance
-		FROM file_nodes fn JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id JOIN semantic s ON i.inode_id = s.inode_id` + extentSizeJoin + `
+		FROM file_nodes fn JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id JOIN semantic s ON i.inode_id = s.inode_id
 		WHERE ` + scopeWhereAnd(scope, strings.Join(conds, " AND "), "fn", "i", "s") + `
 		ORDER BY VEC_EMBED_COSINE_DISTANCE(s.description_embedding, ?)
 	LIMIT ?`
@@ -267,30 +259,49 @@ func buildVectorSearchDescriptionByTextQueryScoped(scope Scope, queryText, pathP
 	args = append(args, scopeWhereArgs(scope, 3, condArgs...)...)
 	args = append(args, limit)
 
-	q := `SELECT fn.path, fn.name, ` + extentSizeSelect + `,
+	q := `SELECT fn.path, fn.name, i.size_bytes,
 		VEC_EMBED_COSINE_DISTANCE(s.description_embedding, ?) AS distance
-		FROM file_nodes fn JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id JOIN semantic s ON i.inode_id = s.inode_id` + extentSizeJoin + `
+		FROM file_nodes fn JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id JOIN semantic s ON i.inode_id = s.inode_id
 		WHERE ` + scopeWhereAnd(scope, strings.Join(conds, " AND "), "fn", "i", "s") + `
 		ORDER BY distance
 		LIMIT ?`
 	return q, args, true
 }
 
-func ftsSafe(s string) string {
-	s = strings.ReplaceAll(s, `\`, `\\`)
-	s = strings.ReplaceAll(s, `'`, `''`)
-	s = strings.ReplaceAll(s, `;`, "")
-	s = strings.ReplaceAll(s, `--`, "")
-	s = strings.ReplaceAll(s, `/*`, "")
-	s = strings.ReplaceAll(s, `*/`, "")
-	s = strings.ReplaceAll(s, "\x00", "")
-	return s
-}
-
 // FTSSearch runs a full-text search over files.content_text and files.description.
 func (s *Store) FTSSearch(ctx context.Context, query, pathPrefix string, limit int) ([]SearchResult, error) {
-	q, allArgs := buildFTSSearchQuery(s.scope, ftsSafe(query), pathPrefix, limit)
-	rows, err := s.db.QueryContext(ctx, q, allArgs...)
+	// A query without a backslash is quoted identically in both modes, so it keeps the plain
+	// pooled path. One with a backslash needs the mode of the session that will lex it, which
+	// means pinning a connection for the probe and the statement together.
+	if strings.IndexByte(query, '\\') < 0 {
+		literal, err := ftsQueryLiteral(query, false)
+		if err != nil {
+			return nil, err
+		}
+		q, allArgs := buildFTSSearchQuery(s.scope, literal, pathPrefix, limit)
+		return s.scanFTSSearch(ctx, s.db.QueryContext, q, allArgs)
+	}
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("acquire connection for full-text search: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+	noBackslashEscapes, err := sqlModeNoBackslashEscapes(ctx, conn)
+	if err != nil {
+		return nil, fmt.Errorf("read sql_mode: %w", err)
+	}
+	literal, err := ftsQueryLiteral(query, noBackslashEscapes)
+	if err != nil {
+		return nil, err
+	}
+	q, allArgs := buildFTSSearchQuery(s.scope, literal, pathPrefix, limit)
+	return s.scanFTSSearch(ctx, conn.QueryContext, q, allArgs)
+}
+
+// scanFTSSearch runs the assembled query through either the pool or a pinned connection and
+// collects the rows.
+func (s *Store) scanFTSSearch(ctx context.Context, query func(context.Context, string, ...any) (*sql.Rows, error), q string, args []any) ([]SearchResult, error) {
+	rows, err := query(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -312,11 +323,64 @@ func (s *Store) FTSSearch(ctx context.Context, query, pathPrefix string, limit i
 	return out, nil
 }
 
-// buildFTSSearchQuery assembles the full-text search query for the given
-// schema-shape scope. safeQuery must already be escaped with ftsSafe.
-func buildFTSSearchQuery(scope Scope, safeQuery, pathPrefix string, limit int) (string, []any) {
-	contentExpr := "fts_match_word('" + safeQuery + "', content_text)"
-	descExpr := "fts_match_word('" + safeQuery + "', description)"
+// ErrInvalidFTSQuery means the search text cannot be represented in a statement.
+var ErrInvalidFTSQuery = errors.New("full-text search query is not usable")
+
+// ftsQueryLiteral renders search text as one MySQL string literal for fts_match_word.
+//
+// The text has to be part of the statement instead of a bind parameter, and that is a
+// property of the full-text planner, not a shortcut: TiDB reads the search text out of the
+// function argument while it builds the plan (it records that constant as the FTS query text
+// it sends to the columnar index), so a `?` placeholder would hand the index an empty query
+// and every full-text search would silently match nothing. Quoting therefore happens here,
+// once, and has to be right rather than merely defensive:
+//
+//   - a literal quote is escaped by doubling it, which is the same in both sql_mode variants;
+//   - a backslash is doubled only when the session treats backslashes as escapes, so the
+//     literal always denotes exactly the text the user typed. Doubling in NO_BACKSLASH_ESCAPES
+//     would search for two backslashes instead of one;
+//   - nothing is stripped. Deleting substrings that "look dangerous" changes what the user
+//     searched for and hides the attempt instead of making it inert — `don't`, `a--b` and
+//     `x/*y` are ordinary search text.
+func ftsQueryLiteral(query string, noBackslashEscapes bool) (string, error) {
+	if strings.IndexByte(query, 0) >= 0 {
+		// A NUL cannot be quoted portably: the text and binary protocols disagree about
+		// whether it survives as data, and it is never part of a real query.
+		return "", fmt.Errorf("%w: it contains a NUL byte", ErrInvalidFTSQuery)
+	}
+	if !noBackslashEscapes {
+		query = strings.ReplaceAll(query, `\`, `\\`)
+	}
+	query = strings.ReplaceAll(query, `'`, `''`)
+	return "'" + query + "'", nil
+}
+
+// sqlModeNoBackslashEscapes reports whether the given session parses a backslash in a string
+// literal as an escape.
+//
+// It has to be asked on the connection that will run the statement, and never cached on the
+// Store: sql_mode is a session property, and a pooled connection can disagree with the next
+// one (a @@GLOBAL.sql_mode change, a proxy that injects a session init, connection turnover).
+// Caching "escapes are off" from one session and then sending an un-doubled backslash to a
+// session where they are on is exactly the literal breakout the quoting exists to prevent.
+func sqlModeNoBackslashEscapes(ctx context.Context, conn *sql.Conn) (bool, error) {
+	var mode string
+	if err := conn.QueryRowContext(ctx, "SELECT @@SESSION.sql_mode").Scan(&mode); err != nil {
+		return false, err
+	}
+	for _, flag := range strings.Split(mode, ",") {
+		if strings.EqualFold(strings.TrimSpace(flag), "NO_BACKSLASH_ESCAPES") {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// buildFTSSearchQuery assembles the full-text search query for the given schema-shape
+// scope. literal is the search text already rendered by ftsQueryLiteral.
+func buildFTSSearchQuery(scope Scope, literal, pathPrefix string, limit int) (string, []any) {
+	contentExpr := "fts_match_word(" + literal + ", content_text)"
+	descExpr := "fts_match_word(" + literal + ", description)"
 
 	innerQ := `SELECT inode_id, MAX(score) AS score FROM (
 		SELECT inode_id, ` + contentExpr + ` AS score
@@ -338,10 +402,10 @@ func buildFTSSearchQuery(scope Scope, safeQuery, pathPrefix string, limit int) (
 	}
 
 	outerConds = append([]string{"i.status = 'CONFIRMED'"}, outerConds...)
-	q := `SELECT fn.path, fn.name, ` + extentSizeSelect + `, fts.score
+	q := `SELECT fn.path, fn.name, i.size_bytes, fts.score
 		FROM (` + innerQ + `) fts
 		JOIN file_nodes fn ON COALESCE(fn.inode_id, fn.file_id) = fts.inode_id
-		JOIN inodes i ON i.inode_id = fts.inode_id` + extentSizeJoin
+		JOIN inodes i ON i.inode_id = fts.inode_id`
 	if len(outerConds) > 0 {
 		q += ` WHERE ` + scopeWhereAnd(scope, strings.Join(outerConds, " AND "), "fn", "i")
 		outerArgs = scopeWhereArgs(scope, 2, outerArgs...)
@@ -362,8 +426,8 @@ func (s *Store) KeywordSearch(ctx context.Context, query, pathPrefix string, lim
 	}
 	args = append(args, limit)
 
-	q := `SELECT fn.path, fn.name, ` + extentSizeSelect + `
-		FROM file_nodes fn JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id JOIN semantic s ON i.inode_id = s.inode_id` + extentSizeJoin + `
+	q := `SELECT fn.path, fn.name, i.size_bytes
+		FROM file_nodes fn JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id JOIN semantic s ON i.inode_id = s.inode_id
 		WHERE ` + scopeWhereAnd(s.scope, strings.Join(conds, " AND "), "fn", "i", "s") + `
 		ORDER BY i.confirmed_at DESC LIMIT ?`
 
@@ -420,17 +484,17 @@ func (s *Store) Find(ctx context.Context, f *FindFilter) ([]SearchResult, error)
 		args = append(args, f.Before.UTC())
 	}
 	if f.MinSize > 0 {
-		conds = append(conds, extentSizeSelect+" >= ?")
+		conds = append(conds, "i.size_bytes >= ?")
 		args = append(args, f.MinSize)
 	}
 	if f.MaxSize > 0 {
-		conds = append(conds, extentSizeSelect+" <= ?")
+		conds = append(conds, "i.size_bytes <= ?")
 		args = append(args, f.MaxSize)
 	}
 	args = append(args, f.Limit)
 
-	q := `SELECT fn.path, fn.name, ` + extentSizeSelect + `
-		FROM file_nodes fn JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id` + extentSizeJoin + `
+	q := `SELECT fn.path, fn.name, i.size_bytes
+		FROM file_nodes fn JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id
 		WHERE ` + scopeWhereAnd(s.scope, strings.Join(conds, " AND "), "fn", "i") + `
 		ORDER BY fn.path LIMIT ?`
 

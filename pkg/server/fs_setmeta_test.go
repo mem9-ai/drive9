@@ -232,3 +232,76 @@ func TestSetMetaScopedTokenZones(t *testing.T) {
 		t.Fatalf("out-of-zone setmeta status = %d, want 403", got)
 	}
 }
+
+func TestStatMetadataIncludesStorageTypeAndContentLayout(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	writeReq, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/layout.txt", strings.NewReader("hello layout"))
+	writeResp, err := http.DefaultClient.Do(writeReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = writeResp.Body.Close()
+	if writeResp.StatusCode != http.StatusOK {
+		t.Fatalf("write: %d", writeResp.StatusCode)
+	}
+
+	fileResp, err := http.Get(ts.URL + "/v1/fs/layout.txt?stat=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = fileResp.Body.Close() }()
+	if fileResp.StatusCode != http.StatusOK {
+		t.Fatalf("file stat=1 status = %d", fileResp.StatusCode)
+	}
+	if got := fileResp.Header.Get("X-Dat9-Storage-Type"); got != string(datastore.StorageDB9) {
+		t.Fatalf("X-Dat9-Storage-Type = %q, want %q", got, datastore.StorageDB9)
+	}
+	if got := fileResp.Header.Get("X-Dat9-Content-Layout"); got != string(datastore.ContentLayoutSingle) {
+		t.Fatalf("X-Dat9-Content-Layout = %q, want %q", got, datastore.ContentLayoutSingle)
+	}
+	var fileBody map[string]any
+	if err := json.NewDecoder(fileResp.Body).Decode(&fileBody); err != nil {
+		t.Fatalf("decode file stat=1: %v", err)
+	}
+	if fileBody["storage_type"] != string(datastore.StorageDB9) || fileBody["content_layout"] != string(datastore.ContentLayoutSingle) {
+		t.Fatalf("file stat=1 body = %+v, want storage_type=db9 content_layout=single", fileBody)
+	}
+
+	mkdirReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/fs/meta-dir?mkdir=1", nil)
+	mkdirResp, err := http.DefaultClient.Do(mkdirReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = mkdirResp.Body.Close()
+	if mkdirResp.StatusCode != http.StatusOK {
+		t.Fatalf("mkdir: %d", mkdirResp.StatusCode)
+	}
+
+	dirResp, err := http.Get(ts.URL + "/v1/fs/meta-dir?stat=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = dirResp.Body.Close() }()
+	if dirResp.StatusCode != http.StatusOK {
+		t.Fatalf("dir stat=1 status = %d", dirResp.StatusCode)
+	}
+	if got := dirResp.Header.Get("X-Dat9-Storage-Type"); got != "" {
+		t.Fatalf("dir X-Dat9-Storage-Type = %q, want empty", got)
+	}
+	if got := dirResp.Header.Get("X-Dat9-Content-Layout"); got != "" {
+		t.Fatalf("dir X-Dat9-Content-Layout = %q, want empty", got)
+	}
+	var dirBody map[string]any
+	if err := json.NewDecoder(dirResp.Body).Decode(&dirBody); err != nil {
+		t.Fatalf("decode dir stat=1: %v", err)
+	}
+	if _, has := dirBody["storage_type"]; has {
+		t.Fatalf("dir stat=1 unexpectedly included storage_type: %+v", dirBody)
+	}
+	if _, has := dirBody["content_layout"]; has {
+		t.Fatalf("dir stat=1 unexpectedly included content_layout: %+v", dirBody)
+	}
+}

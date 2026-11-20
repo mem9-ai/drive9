@@ -76,7 +76,9 @@ func TestUpdateTenantDBCredentialIfComparesPreviousUser(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	updated, err := s.UpdateTenantDBCredentialIf(context.Background(), "credential-cas-tenant", "other.root", "u1.tdc_fs_sys", []byte("system-cipher"))
+	updated, err := s.UpdateTenantDBCredentialIf(context.Background(), "credential-cas-tenant", TenantDBCredentialUpdate{
+		FromDBUser: "other.root", DBUser: "u1.tdc_fs_sys", PasswordCipher: []byte("system-cipher"),
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +94,10 @@ func TestUpdateTenantDBCredentialIfComparesPreviousUser(t *testing.T) {
 		t.Fatalf("tenant credential changed after failed CAS: user=%q pass=%q", dbUser, passCipher)
 	}
 
-	updated, err = s.UpdateTenantDBCredentialIf(context.Background(), "credential-cas-tenant", "u1.root", "u1.tdc_fs_sys", []byte("system-cipher"))
+	updated, err = s.UpdateTenantDBCredentialIf(context.Background(), "credential-cas-tenant", TenantDBCredentialUpdate{
+		FromDBUser: "u1.root", DBUser: "u1.tdc_fs_sys", PasswordCipher: []byte("system-cipher"),
+		State: TenantCredentialRemediated,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,6 +109,91 @@ func TestUpdateTenantDBCredentialIfComparesPreviousUser(t *testing.T) {
 	}
 	if dbUser != "u1.tdc_fs_sys" || string(passCipher) != "system-cipher" {
 		t.Fatalf("tenant credential = %q/%q, want system credential", dbUser, passCipher)
+	}
+
+	// A peer keeps the previous credential in its resolved tenant row and in open
+	// connections, so the update has to signal every pod. The row is written in the same
+	// transaction as the new credential: a commit that skipped it would leave peers
+	// dialling with a password the database no longer accepts.
+	rows, err := s.ListTenantNotifySince(context.Background(), 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signalled := false
+	for _, row := range rows {
+		if row.TenantID == "credential-cas-tenant" && row.WorkMask&TenantNotifyWorkTenantCredential != 0 {
+			signalled = true
+		}
+	}
+	if !signalled {
+		t.Fatalf("credential update enqueued no cache-invalidation signal: %#v", rows)
+	}
+	// The failed CAS must not have signalled anything, or a peer would drop a healthy
+	// backend for a credential that did not change.
+	var before uint64
+	for _, row := range rows {
+		if row.TenantID == "credential-cas-tenant" {
+			before++
+		}
+	}
+	stale, err := s.UpdateTenantDBCredentialIf(context.Background(), "credential-cas-tenant", TenantDBCredentialUpdate{
+		FromDBUser: "u1.root", DBUser: "u1.tdc_fs_sys", PasswordCipher: []byte("other-cipher"),
+		State: TenantCredentialRemediated,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stale {
+		t.Fatal("a stale CAS updated the credential")
+	}
+	rows, err = s.ListTenantNotifySince(context.Background(), 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var after uint64
+	for _, row := range rows {
+		if row.TenantID == "credential-cas-tenant" {
+			after++
+		}
+	}
+	if after != before {
+		t.Fatalf("a no-op credential update signalled a change: %d signals, want %d", after, before)
+	}
+
+	// The recorded outcome belongs in the same transaction as the credential: a credential
+	// written without it would let the next pass re-derive a claim the caller already knew.
+	state, _, err := s.TenantCredentialState(context.Background(), "credential-cas-tenant")
+	if err != nil {
+		t.Fatalf("credential update left no state behind: %v", err)
+	}
+	if state != TenantCredentialRemediated {
+		t.Fatalf("recorded state = %d, want remediated", state)
+	}
+
+	// And it is atomic: when the state row cannot be written, neither is the credential.
+	if _, err := s.DB().ExecContext(context.Background(), "RENAME TABLE tenant_credential_state TO tenant_credential_state_off"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := s.DB().ExecContext(context.Background(), "RENAME TABLE tenant_credential_state_off TO tenant_credential_state"); err != nil {
+			t.Errorf("restore tenant_credential_state: %v", err)
+		}
+	})
+	failedUpdate, err := s.UpdateTenantDBCredentialIf(context.Background(), "credential-cas-tenant", TenantDBCredentialUpdate{
+		FromDBUser: "u1.tdc_fs_sys", DBUser: "u1.tdc_fs_sys", PasswordCipher: []byte("half-written-cipher"),
+		State: TenantCredentialReviewRequired, StateReason: "interrupted",
+	})
+	if err == nil {
+		t.Fatal("the credential update succeeded without its state row")
+	}
+	if failedUpdate {
+		t.Fatal("a rolled-back credential update reported success")
+	}
+	if err := s.DB().QueryRow("SELECT db_user, db_password FROM tenants WHERE id = ?", "credential-cas-tenant").Scan(&dbUser, &passCipher); err != nil {
+		t.Fatal(err)
+	}
+	if dbUser != "u1.tdc_fs_sys" || string(passCipher) != "system-cipher" {
+		t.Fatalf("credential after a rolled-back update = %q/%q, want the previous one", dbUser, passCipher)
 	}
 }
 
@@ -2038,5 +2128,43 @@ func TestIsSafeModifyColumnRepairSQLRejectsOtherCases(t *testing.T) {
 			t.Errorf("isSafeModifyColumnRepairSQL(%q.%q sql=%q) = true, want false",
 				diff.tableName, diff.columnName, diff.repairSQL)
 		}
+	}
+}
+
+// The remediation records its outcome so a later pass neither re-dials a remediated tenant
+// nor silently claims one it could not verify.
+func TestTenantCredentialStateRoundTrips(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	if _, _, err := s.TenantCredentialState(ctx, "credential-state-tenant"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("state for an unknown tenant = %v, want ErrNotFound", err)
+	}
+	if err := s.SetTenantCredentialState(ctx, "credential-state-tenant", TenantCredentialReviewRequired, "legacy grant unverifiable"); err != nil {
+		t.Fatal(err)
+	}
+	state, reason, err := s.TenantCredentialState(ctx, "credential-state-tenant")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state != TenantCredentialReviewRequired || reason != "legacy grant unverifiable" {
+		t.Fatalf("state = %d/%q, want the review marker", state, reason)
+	}
+	// A later successful remediation overwrites the marker rather than adding a row.
+	if err := s.SetTenantCredentialState(ctx, "credential-state-tenant", TenantCredentialRemediated, ""); err != nil {
+		t.Fatal(err)
+	}
+	state, reason, err = s.TenantCredentialState(ctx, "credential-state-tenant")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state != TenantCredentialRemediated || reason != "" {
+		t.Fatalf("state = %d/%q, want remediated", state, reason)
+	}
+	var rows int
+	if err := s.DB().QueryRow("SELECT COUNT(*) FROM tenant_credential_state WHERE tenant_id = ?", "credential-state-tenant").Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 1 {
+		t.Fatalf("state rows = %d, want one", rows)
 	}
 }

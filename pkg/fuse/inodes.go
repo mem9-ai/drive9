@@ -6,6 +6,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/mem9-ai/drive9/pkg/fusecomp/membudget"
 )
 
 // InodeEntry holds metadata for a single inode in the FUSE filesystem.
@@ -67,7 +69,21 @@ type InodeToPath struct {
 	// keeps dispatching by nodeid and needs GetPath until it closes. Nil
 	// disables the veto (no descriptor tracking).
 	HasLiveUse func(ino uint64) bool
+
+	// budget, when set, is charged a fixed per-entry estimate for every live
+	// inode. The charge is forced: aborting a lookup on a full budget would
+	// break the namespace, so an over-limit inode table squeezes the caches
+	// and the write buffers instead.
+	budget *membudget.Budget
 }
+
+// inodeTableEntryBytes is the per-entry estimate charged to the process
+// memory budget: the InodeEntry struct, its slots in the byInode/byPath maps
+// and the short path strings most entries carry. Long paths and hardlink
+// aliases are not counted, so the inode table is charged as a lower bound —
+// the point is that a large namespace shows up in the budget at all, not that
+// the estimate is exact per path.
+const inodeTableEntryBytes = 384
 
 // NewInodeToPath creates a new InodeToPath initialized with the root inode
 // (inode 1, corresponding to go-fuse FUSE_ROOT_ID).
@@ -88,6 +104,37 @@ func NewInodeToPath() *InodeToPath {
 		byID:    make(map[string]uint64),
 		nextIno: 2,
 	}
+}
+
+// SetMemoryBudget wires the process-wide memory budget the inode table charges
+// its live entries to. A nil budget disables the charge.
+func (m *InodeToPath) SetMemoryBudget(b *membudget.Budget) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.budget = b
+	m.mu.Unlock()
+}
+
+// MemoryBudget reports the budget the table charges, if any.
+func (m *InodeToPath) MemoryBudget() *membudget.Budget {
+	if m == nil {
+		return nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.budget
+}
+
+// Entries reports how many inodes the table currently holds.
+func (m *InodeToPath) Entries() int {
+	if m == nil {
+		return 0
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.byInode)
 }
 
 // Lookup returns the inode for the given path. If the path already exists, its
@@ -141,6 +188,7 @@ func (m *InodeToPath) LookupWithIdentity(path, resourceID string, nlink uint32, 
 	if entry.ResourceID != "" {
 		m.byID[entry.ResourceID] = ino
 	}
+	m.chargeEntry()
 	return ino
 }
 
@@ -193,6 +241,7 @@ func (m *InodeToPath) EnsureInodeWithIdentity(path, resourceID string, nlink uin
 	if entry.ResourceID != "" {
 		m.byID[entry.ResourceID] = ino
 	}
+	m.chargeEntry()
 	return ino
 }
 
@@ -222,6 +271,7 @@ func (m *InodeToPath) EnsureInodeNoUpdate(path string, isDir bool, size int64, m
 	}
 	m.byInode[ino] = entry
 	m.byPath[path] = ino
+	m.chargeEntry()
 	return ino
 }
 
@@ -1252,6 +1302,22 @@ func (m *InodeToPath) removeEntryLocked(ino uint64, entry *InodeEntry) {
 		delete(m.byID, entry.ResourceID)
 	}
 	delete(m.byInode, ino)
+	m.releaseEntry()
+}
+
+// chargeEntry records one new live inode against the process memory budget.
+// Forced: a lookup cannot fail because the budget is full.
+func (m *InodeToPath) chargeEntry() {
+	if m.budget != nil {
+		m.budget.ForceCharge(membudget.ClassInodeTable, inodeTableEntryBytes)
+	}
+}
+
+// releaseEntry returns one inode's estimate to the budget.
+func (m *InodeToPath) releaseEntry() {
+	if m.budget != nil {
+		m.budget.Release(membudget.ClassInodeTable, inodeTableEntryBytes)
+	}
 }
 
 func (m *InodeToPath) removePathLocked(path string, consumeLink bool, preserveIfLast bool) {

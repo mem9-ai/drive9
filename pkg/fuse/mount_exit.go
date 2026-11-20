@@ -14,6 +14,10 @@ const (
 	ExitUnhealthy        = 4
 	ExitStartupPermanent = 5
 	ExitStartupTransient = 6
+	// ExitDrainFailed means the worker unmounted but the shutdown drain left
+	// write-side work behind: the mount is gone, and so may be acknowledged
+	// bytes the uploader never landed.
+	ExitDrainFailed = 7
 )
 
 // MountExitReason classifies why a mount process ended.
@@ -27,6 +31,9 @@ const (
 	ExitReasonUnhealthy        MountExitReason = "unhealthy"
 	ExitReasonStartupPermanent MountExitReason = "startup_permanent"
 	ExitReasonStartupTransient MountExitReason = "startup_transient"
+	// ExitReasonDrainFailed is recorded (and reported to `drive9 umount`)
+	// when the shutdown drain could not commit everything it held.
+	ExitReasonDrainFailed MountExitReason = "drain_failed"
 )
 
 // MountExitError is a typed mount failure that carries a process exit code
@@ -89,6 +96,11 @@ func ExitPanicErr(detail string, cause error) *MountExitError {
 
 func ExitStartupPermanentErr(detail string, cause error) *MountExitError {
 	return newMountExit(ExitStartupPermanent, ExitReasonStartupPermanent, detail, cause)
+}
+
+// ExitDrainFailedErr reports a shutdown drain that left pending work behind.
+func ExitDrainFailedErr(detail string) *MountExitError {
+	return newMountExit(ExitDrainFailed, ExitReasonDrainFailed, detail, nil)
 }
 
 func ExitStartupTransientErr(detail string, cause error) *MountExitError {

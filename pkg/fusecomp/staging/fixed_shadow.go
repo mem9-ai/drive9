@@ -65,7 +65,7 @@ func (s *ShadowStore) invalidateFixedShadow(path string) error {
 // ProtectFixedShadow saves a random identity for the exact uploaded source.
 // Process-local content generations are checked here but are never used after
 // reopening the store. Mutations invalidate this token before changing bytes.
-func (s *ShadowStore) ProtectFixedShadow(path string, generation uint64) (string, error) {
+func (s *ShadowStore) ProtectFixedShadow(path string, generation ContentGen) (string, error) {
 	if err := s.EnableFixedUploadRecovery(); err != nil {
 		return "", err
 	}

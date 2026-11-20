@@ -22,7 +22,7 @@ func TestMountRuntimeClosesStagingAfterConstructionFailure(t *testing.T) {
 		t.Run(phase, func(t *testing.T) {
 			cfg := MountConfig{Server: "http://example.invalid", MountPoint: t.TempDir(), CacheDir: t.TempDir(), Extensions: []string{"core", "writeback"}, WritePolicy: "writeback", SyncMode: "unknown"}
 			var ledger *staging.Staging
-			var generation uint64
+			var generation staging.PinGen
 			const point = "github.com/mem9-ai/drive9/pkg/fuse/mountRuntimeStagingReady"
 			if err := failpoint.EnableCall(point, func(s *staging.Staging) {
 				ledger = s

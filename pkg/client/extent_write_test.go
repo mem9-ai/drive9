@@ -29,7 +29,7 @@ func TestWriteExtentStreamRejectsInvalidInputBeforeRequest(t *testing.T) {
 		{"source", "/file", c, nil, 1, 1},
 		{"empty", "/file", c, bytes.NewReader(nil), 0, 1},
 		{"size", "/file", c, bytes.NewReader(nil), -1, 1},
-		{"revision", "/file", c, bytes.NewReader([]byte("x")), 1, -1},
+		{"revision", "/file", c, bytes.NewReader([]byte("x")), 1, -2},
 		{"fixed", "/file", fixed, bytes.NewReader([]byte("x")), 1, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -46,9 +46,14 @@ func TestWriteExtentStreamRejectsInvalidInputBeforeRequest(t *testing.T) {
 func TestWriteExtentStreamRejectsMissingProtocolAndWrongPlan(t *testing.T) {
 	for _, failure := range []string{"missing", "single", "invalid"} {
 		t.Run(failure, func(t *testing.T) {
-			var calls atomic.Int32
+			var initiates, aborts atomic.Int32
 			api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				calls.Add(1)
+				if r.Method == "POST" && r.URL.Path == "/v2/uploads/upload/abort" {
+					aborts.Add(1)
+					_, _ = io.WriteString(w, `{}`)
+					return
+				}
+				initiates.Add(1)
 				if r.Method != "POST" || r.URL.Path != "/v2/uploads/initiate" {
 					t.Error("unexpected request", r.Method, r.URL.Path)
 					w.WriteHeader(500)
@@ -78,8 +83,12 @@ func TestWriteExtentStreamRejectsMissingProtocolAndWrongPlan(t *testing.T) {
 			if err := New(api.URL, "").WriteExtentStreamConditional(t.Context(), "/file", bytes.NewReader([]byte("x")), 1, nil, 0); err == nil {
 				t.Fatal("invalid protocol accepted")
 			}
-			if calls.Load() != 1 {
-				t.Fatal("fell back or used invalid session", calls.Load())
+			wantAborts := int32(1)
+			if failure == "missing" {
+				wantAborts = 0
+			}
+			if initiates.Load() != 1 || aborts.Load() != wantAborts {
+				t.Fatalf("initiates=%d aborts=%d wantAborts=%d", initiates.Load(), aborts.Load(), wantAborts)
 			}
 		})
 	}

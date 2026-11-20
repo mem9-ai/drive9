@@ -35,10 +35,12 @@ func TestProfileAppendLogDefaults(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		// No builtin profile carries an [append-log] rule: coding-agent routes
+		// SQLite's files (the WAL included) to the extent plane, so a WAL
+		// rule here would split one database across two data planes. Users who
+		// want the append-log optimization pass --append-log or write their
+		// own profile.
 		want := "[append-log]\n# no append-log optimization paths\n"
-		if name == "" || name == "coding-agent" {
-			want = "[append-log]\n**/*-wal\n"
-		}
 		if out := formatProfileConfig(cfg); !strings.Contains(out, want) {
 			t.Fatalf("profile %q output = %q, want %q", name, out, want)
 		}
@@ -348,5 +350,58 @@ func TestProfileShowPrintsCustomConfig(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Fatalf("profile show output = %q, want %q", out, want)
 		}
+	}
+}
+
+// The default coding-agent profile routes SQLite's whole file family onto the
+// extent plane. A database starts small, crosses the inline cutoff mid-session,
+// and would otherwise be written through a handle opened while it was still
+// classic — the descriptor/promotion mismatch that makes every fsync re-upload
+// a whole image.
+func TestBuiltinCodingAgentRoutesSQLiteToExtent(t *testing.T) {
+	cfg, err := loadProfileConfig(defaultMountProfile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Builtin {
+		t.Fatal("coding-agent is not the builtin (a user profile shadowed it)")
+	}
+	has := map[string]bool{}
+	for _, p := range cfg.ExtentPatterns {
+		has[p] = true
+	}
+	// Every family member for every base suffix, so a database opened in any
+	// SQLite journal mode rides the plane from byte zero.
+	for _, base := range []string{"db", "db3", "sqlite", "sqlite3"} {
+		for _, suffix := range []string{"", "-wal", "-shm", "-journal", "-mj*"} {
+			want := "*." + base + suffix
+			if !has[want] {
+				t.Errorf("coding-agent [extent] is missing %q", want)
+			}
+		}
+	}
+	// The profile routes SQLite's files to ONE plane. A leftover [append-log]
+	// rule would split a single database across two data planes — and, because
+	// appendlog sits outside the extent plane in the chain, it would win the
+	// WAL claim and silently override the [extent] entry above.
+	if len(cfg.AppendLogPatterns) != 0 {
+		t.Errorf("coding-agent still carries [append-log] %v; SQLite must stay on the extent plane",
+			cfg.AppendLogPatterns)
+	}
+	// The round trip must preserve them: a profile copied with
+	// `drive9 profile show > ~/.drive9/profiles/...` keeps the routing.
+	out := formatProfileConfig(cfg)
+	roundTrip, err := parseProfileConfig(cfg.Name, cfg.Source, out)
+	if err != nil {
+		t.Fatalf("round trip: %v", err)
+	}
+	// Order is not part of the contract (the parser de-duplicates through a
+	// set); the SET must survive.
+	gotSet := append([]string(nil), roundTrip.ExtentPatterns...)
+	wantSet := append([]string(nil), cfg.ExtentPatterns...)
+	sort.Strings(gotSet)
+	sort.Strings(wantSet)
+	if !reflect.DeepEqual(gotSet, wantSet) {
+		t.Fatalf("extent patterns did not survive the round trip:\n got %v\nwant %v", gotSet, wantSet)
 	}
 }

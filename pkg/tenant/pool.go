@@ -3,7 +3,9 @@ package tenant
 import (
 	"container/list"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -202,12 +204,17 @@ type entry struct {
 	tenantID           string
 	storageNamespaceID string
 	s3EncryptionPolicy meta.S3EncryptionPolicy
-	backend            *backend.Dat9Backend
-	store              *datastore.Store
-	elem               *list.Element
-	refs               int
-	retired            bool
-	lastUsed           time.Time // refreshed by real activity through Acquire; never by AcquireCached
+	// dbCredentialID identifies the tenant database credential this generation was opened
+	// with. A cached entry is reusable only while this identity matches the tenant record, so
+	// a rotation applied on any replica cannot leave another replica serving a backend whose
+	// replacement connections still authenticate with the retired password.
+	dbCredentialID string
+	backend        *backend.Dat9Backend
+	store          *datastore.Store
+	elem           *list.Element
+	refs           int
+	retired        bool
+	lastUsed       time.Time // refreshed by real activity through Acquire; never by AcquireCached
 }
 
 func NewPool(cfg PoolConfig, enc encrypt.Encryptor) *Pool {
@@ -266,109 +273,6 @@ func (p *Pool) wireTenantWorkNotifier(b *backend.Dat9Backend, tenantID string) {
 	})
 }
 
-// Acquire returns a backend pinned for real tenant activity, including request
-// traffic and durable background work. It may cold-open the tenant and promotes
-// cache hits in the capacity LRU.
-// The returned release callback must be called when the caller is done.
-func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Backend, release func(), err error) {
-	start := time.Now()
-	defer observePool(ctx, "acquire", t.ID, &err, start)
-
-	if t.Status != meta.TenantActive {
-		logger.Warn(ctx, "tenant_pool_get_skipped_inactive",
-			zap.String("tenant_id", t.ID),
-			zap.String("status", string(t.Status)))
-		p.Invalidate(t.ID)
-		return nil, nil, fmt.Errorf("tenant status: %s", t.Status)
-	}
-
-	s3EncryptionPolicy := t.S3EncryptionPolicy()
-	storageNamespaceID := t.StorageNamespaceID
-	var toClose []*entry
-	p.mu.Lock()
-	if e, ok := p.items[t.ID]; ok {
-		if e.s3EncryptionPolicy == s3EncryptionPolicy && (storageNamespaceID == "" || e.storageNamespaceID == storageNamespaceID) {
-			e.refs++
-			p.order.MoveToFront(e.elem)
-			e.lastUsed = time.Now()
-			p.mu.Unlock()
-			metrics.RecordOperation("tenant_pool", "cache_lookup", "hit", 0)
-			totalDuration := time.Since(start)
-			logger.InfoOpenPoolTiming(ctx, "tenant_pool_acquire_timing", totalDuration,
-				poolAcquireTimingFields(t.ID, false, 0, totalDuration)...)
-			return e.backend, p.makeRelease(e), nil
-		}
-		if removed := p.removeLocked(e.elem, "replace"); removed != nil {
-			toClose = append(toClose, removed)
-		}
-		p.mu.Unlock()
-		for _, retired := range toClose {
-			p.closeEntry(retired)
-		}
-		toClose = nil
-	} else {
-		p.mu.Unlock()
-	}
-
-	createBackendStart := time.Now()
-	b, st, tidbCloudOrgID, err := p.createBackend(ctx, t)
-	if err != nil {
-		// Cold-open failure: a tenant TiDB open was attempted but failed.
-		// Record so alerts can detect a scan path that is churning cold opens.
-		metrics.RecordTenantOperationWithOrg(t.ID, tidbCloudOrgID, "user_db_access", "acquire_cold_open", "error", time.Since(createBackendStart))
-		return nil, nil, err
-	}
-	createBackendDurationMs := float64(time.Since(createBackendStart).Microseconds()) / 1000.0
-	// Cold-open success: a tenant TiDB was opened from scratch (cache miss).
-	// This is the canonical "a serverless TiDB was woken up" signal — the
-	// primary billing-storm indicator. PR #660 eliminated periodic scans that
-	// caused cold opens at scale; this metric guards against regressions.
-	metrics.RecordTenantOperationWithOrg(t.ID, tidbCloudOrgID, "user_db_access", "acquire_cold_open", "ok", time.Since(createBackendStart))
-
-	p.mu.Lock()
-	if e, ok := p.items[t.ID]; ok {
-		if e.s3EncryptionPolicy == s3EncryptionPolicy && (t.StorageNamespaceID == "" || e.storageNamespaceID == t.StorageNamespaceID) {
-			e.refs++
-			p.order.MoveToFront(e.elem)
-			e.lastUsed = time.Now()
-			p.mu.Unlock()
-			b.Close()
-			_ = st.Close()
-			metrics.RecordOperation("tenant_pool", "cache_lookup", "hit", 0)
-			totalDuration := time.Since(start)
-			logger.InfoOpenPoolTiming(ctx, "tenant_pool_acquire_timing", totalDuration,
-				poolAcquireTimingFields(t.ID, true, createBackendDurationMs, totalDuration)...)
-			return e.backend, p.makeRelease(e), nil
-		}
-		if removed := p.removeLocked(e.elem, "replace"); removed != nil {
-			toClose = append(toClose, removed)
-		}
-	}
-	e := &entry{tenantID: t.ID, storageNamespaceID: t.StorageNamespaceID, s3EncryptionPolicy: s3EncryptionPolicy, backend: b, store: st, refs: 1, lastUsed: time.Now()}
-	e.elem = p.order.PushFront(e)
-	p.items[t.ID] = e
-	for p.order.Len() > p.maxSize {
-		oldest := p.order.Back()
-		if oldest != nil {
-			if removed := p.removeLocked(oldest, "evict"); removed != nil {
-				toClose = append(toClose, removed)
-			}
-		}
-	}
-	p.recordCachedBackendCountLocked()
-	// FileGC is now kick-driven through the unified tenant worker; no
-	// per-backend goroutine is started here.
-	p.mu.Unlock()
-	for _, retired := range toClose {
-		p.closeEntry(retired)
-	}
-	metrics.RecordOperation("tenant_pool", "cache_lookup", "miss", 0)
-	totalDuration := time.Since(start)
-	logger.InfoOpenPoolTiming(ctx, "tenant_pool_acquire_timing", totalDuration,
-		poolAcquireTimingFields(t.ID, true, createBackendDurationMs, totalDuration)...)
-	return b, p.makeRelease(e), nil
-}
-
 func (p *Pool) Invalidate(tenantID string) {
 	var toClose *entry
 	p.mu.Lock()
@@ -408,22 +312,142 @@ func (p *Pool) WaitTenantIdle(ctx context.Context, tenantID string) error {
 	}
 }
 
-// AcquireCached returns the cached backend for the tenant, pinning it for the
-// caller's active use, without creating a new backend if the tenant is not
-// already cached. This is used by the safety-net scan to recover expired
-// leases only for warm tenants (those with a live backend in the cache),
-// avoiding waking dormant serverless tenant TiDBs. Returns (nil, nil, false)
-// when the tenant is not cached (cold).
-// AcquireCached pins a cached backend without creating one on cache miss. It
-// is intended for the safety-net scan and other background work that may
-// process already-active tenants but must not wake dormant tenant TiDBs.
+// tenantDBCredentialID identifies the database principal and connection coordinates a cached
+// backend was opened with. A cached entry is only reusable while this identity matches the
+// tenant record, so a credential rotation applied by one replica cannot leave another replica
+// serving a backend whose replacement connections would authenticate with the retired password.
+// This is the same contract `fs` uses.
+func tenantDBCredentialID(t *meta.Tenant) string {
+	if t == nil {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%s\x00%s\x00%d\x00%s\x00%t\x00%s",
+		t.Provider, t.DBUser, t.DBHost, t.DBPort, t.DBName, t.DBTLS, t.DBPasswordCipher)))
+	return hex.EncodeToString(sum[:])
+}
+
+// Acquire returns a backend pinned for real tenant activity, including request traffic and
+// durable background work. It may cold-open the tenant and promotes cache hits in the capacity
+// LRU. The returned release callback must be called when the caller is done.
 //
-// If the tenant's S3 encryption policy or storage namespace has changed since
-// the backend was cached, AcquireCached returns false (the stale backend is
-// not usable). In this rare case the safety-net scan skips the tenant — its
-// expired lease recovery is deferred until the next write kick triggers a
-// fresh Acquire with the updated policy. This is acceptable because policy
-// changes are rare and the tenant's tasks remain durable in its TiDB.
+// Reuse is decided by the tenant's database credential identity: a cached backend is served
+// only while the row still describes the credential it was opened with. A rotation therefore
+// retires an entry on the next acquisition that sees the new row, on every replica — the cache
+// can lag the control plane, it cannot outlive the identity.
+func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Backend, release func(), err error) {
+	start := time.Now()
+	defer observePool(ctx, "acquire", t.ID, &err, start)
+
+	if t.Status != meta.TenantActive {
+		logger.Warn(ctx, "tenant_pool_get_skipped_inactive",
+			zap.String("tenant_id", t.ID),
+			zap.String("status", string(t.Status)))
+		p.Invalidate(t.ID)
+		return nil, nil, fmt.Errorf("tenant status: %s", t.Status)
+	}
+
+	s3EncryptionPolicy := t.S3EncryptionPolicy()
+	storageNamespaceID := t.StorageNamespaceID
+	dbCredentialID := tenantDBCredentialID(t)
+	var toClose []*entry
+	p.mu.Lock()
+	if e, ok := p.items[t.ID]; ok {
+		if e.s3EncryptionPolicy == s3EncryptionPolicy && (storageNamespaceID == "" || e.storageNamespaceID == storageNamespaceID) && e.dbCredentialID == dbCredentialID {
+			e.refs++
+			p.order.MoveToFront(e.elem)
+			e.lastUsed = time.Now()
+			p.mu.Unlock()
+			metrics.RecordOperation("tenant_pool", "cache_lookup", "hit", 0)
+			totalDuration := time.Since(start)
+			logger.InfoOpenPoolTiming(ctx, "tenant_pool_acquire_timing", totalDuration,
+				poolAcquireTimingFields(t.ID, false, 0, totalDuration)...)
+			return e.backend, p.makeRelease(e), nil
+		}
+		if removed := p.removeLocked(e.elem, "replace"); removed != nil {
+			toClose = append(toClose, removed)
+		}
+		p.mu.Unlock()
+		for _, retired := range toClose {
+			p.closeEntry(retired)
+		}
+		toClose = nil
+	} else {
+		p.mu.Unlock()
+	}
+
+	createBackendStart := time.Now()
+	b, st, tidbCloudOrgID, err := p.createBackend(ctx, t)
+	if err != nil {
+		// Cold-open failure: a tenant TiDB open was attempted but failed. Record so alerts can
+		// detect a scan path that is churning cold opens.
+		metrics.RecordTenantOperationWithOrg(t.ID, tidbCloudOrgID, "user_db_access", "acquire_cold_open", "error", time.Since(createBackendStart))
+		return nil, nil, err
+	}
+	createBackendDurationMs := float64(time.Since(createBackendStart).Microseconds()) / 1000.0
+	// Cold-open success: a tenant TiDB was opened from scratch (cache miss). This is the
+	// canonical "a serverless TiDB was woken up" signal, the primary billing-storm indicator.
+	metrics.RecordTenantOperationWithOrg(t.ID, tidbCloudOrgID, "user_db_access", "acquire_cold_open", "ok", time.Since(createBackendStart))
+
+	p.mu.Lock()
+	if e, ok := p.items[t.ID]; ok {
+		if e.s3EncryptionPolicy == s3EncryptionPolicy && (t.StorageNamespaceID == "" || e.storageNamespaceID == t.StorageNamespaceID) && e.dbCredentialID == dbCredentialID {
+			e.refs++
+			p.order.MoveToFront(e.elem)
+			e.lastUsed = time.Now()
+			p.mu.Unlock()
+			b.Close()
+			_ = st.Close()
+			metrics.RecordOperation("tenant_pool", "cache_lookup", "hit", 0)
+			totalDuration := time.Since(start)
+			logger.InfoOpenPoolTiming(ctx, "tenant_pool_acquire_timing", totalDuration,
+				poolAcquireTimingFields(t.ID, true, createBackendDurationMs, totalDuration)...)
+			return e.backend, p.makeRelease(e), nil
+		}
+		if removed := p.removeLocked(e.elem, "replace"); removed != nil {
+			toClose = append(toClose, removed)
+		}
+	}
+	e := &entry{
+		tenantID:           t.ID,
+		storageNamespaceID: t.StorageNamespaceID,
+		s3EncryptionPolicy: s3EncryptionPolicy,
+		dbCredentialID:     dbCredentialID,
+		backend:            b,
+		store:              st,
+		refs:               1,
+		lastUsed:           time.Now(),
+	}
+	e.elem = p.order.PushFront(e)
+	p.items[t.ID] = e
+	for p.order.Len() > p.maxSize {
+		oldest := p.order.Back()
+		if oldest != nil {
+			if removed := p.removeLocked(oldest, "evict"); removed != nil {
+				toClose = append(toClose, removed)
+			}
+		}
+	}
+	p.recordCachedBackendCountLocked()
+	p.mu.Unlock()
+	for _, retired := range toClose {
+		p.closeEntry(retired)
+	}
+
+	metrics.RecordOperation("tenant_pool", "cache_lookup", "miss", 0)
+	totalDuration := time.Since(start)
+	logger.InfoOpenPoolTiming(ctx, "tenant_pool_acquire_timing", totalDuration,
+		poolAcquireTimingFields(t.ID, true, createBackendDurationMs, totalDuration)...)
+	return b, p.makeRelease(e), nil
+}
+
+// AcquireCached returns the cached backend for the tenant without creating one on a cache
+// miss, pinning it for the caller's active use. The safety-net scan uses it to recover expired
+// leases only for warm tenants, so a dormant serverless TiDB is never woken by background work.
+//
+// A cached backend whose S3 encryption policy, storage namespace or database credential no
+// longer matches the tenant row is not usable and reports false; the safety-net then skips the
+// tenant until the next write kick triggers a fresh Acquire. That is acceptable because those
+// changes are rare and the tenant's queued work stays durable in its TiDB.
 func (p *Pool) AcquireCached(t *meta.Tenant) (b *backend.Dat9Backend, release func(), ok bool) {
 	return p.acquireCached(t, false)
 }
@@ -455,12 +479,14 @@ func (p *Pool) acquireCached(t *meta.Tenant, refreshActivity bool) (b *backend.D
 		}
 		return nil, nil, false
 	}
-	if e.s3EncryptionPolicy != s3EncryptionPolicy || (t.StorageNamespaceID != "" && e.storageNamespaceID != t.StorageNamespaceID) {
+	if e.s3EncryptionPolicy != s3EncryptionPolicy ||
+		(t.StorageNamespaceID != "" && e.storageNamespaceID != t.StorageNamespaceID) ||
+		e.dbCredentialID != tenantDBCredentialID(t) {
 		p.mu.Unlock()
 		if !refreshActivity {
-			// Stale-skip: the cached backend's encryption policy / storage namespace
-			// no longer matches the tenant. The safety-net defers to the next write
-			// kick. Record so this rare edge case is observable.
+			// Stale-skip: the cached backend no longer matches the tenant row — a different
+			// encryption policy, storage namespace or database credential. The safety-net
+			// defers to the next write kick. Record so this rare edge case is observable.
 			metrics.RecordTenantOperationWithOrg(t.ID, e.backend.TiDBCloudOrgID(), "user_db_access", "acquire_cached", "stale_skipped", 0)
 		}
 		return nil, nil, false

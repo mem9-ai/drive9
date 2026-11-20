@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/mem9-ai/drive9/pkg/viewprotocol"
@@ -49,7 +50,7 @@ func TestBoundClientIsolationAndRequestOwnership(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if c == root || c.httpClient == root.httpClient || c.extentRT != nil || c.statusBody.Load() != nil {
+		if c == root || c.httpClient == root.httpClient || c.statusBody.Load() != nil {
 			t.Fatal("shared mutable client state")
 		}
 		wg.Add(1)
@@ -229,5 +230,81 @@ func TestBoundReadAndEventsRejectRedirect(t *testing.T) {
 				t.Fatalf("left view route %d times", followups)
 			}
 		})
+	}
+}
+
+func TestExtentPlanKeepsFixedViewJSONAsBytes(t *testing.T) {
+	body := `{"size":0,"blocks":[]}`
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Dat9-Extent-Read-Plan") != "" || r.URL.Path != "/v1/views/a/v1/fs/file" {
+			t.Error("incorrect fixed route or negotiation", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Dat9-Content-Layout", "extent")
+		if r.Header.Get("Range") != "" {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", len(body)-1, len(body)))
+			w.WriteHeader(206)
+		} else {
+			w.WriteHeader(200)
+		}
+		_, _ = io.WriteString(w, body)
+	}))
+	defer api.Close()
+	c, err := New(api.URL, "test-token").WithView(ViewBinding{LayerID: "a", WorkID: "work", Fence: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := c.ReadAtCtx(context.Background(), "/file", 0, int64(len(body)))
+	if err != nil || string(got) != body {
+		t.Fatalf("got=%q err=%v", got, err)
+	}
+	full, err := c.ReadCtx(context.Background(), "/file")
+	if err != nil || string(full) != body {
+		t.Fatalf("full=%q err=%v", full, err)
+	}
+	if _, err := c.ResolveReadTarget(context.Background(), "/file"); !IsReadTargetNoRedirect(err) {
+		t.Fatalf("resolve target err=%v", err)
+	}
+}
+
+func TestFixedViewSmallWriteIgnoresInheritedExtentTargetLayout(t *testing.T) {
+	var puts, patches atomic.Int32
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPatch:
+			patches.Add(1)
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/views/a/v1/fs/inherited.bin":
+			puts.Add(1)
+			opID := r.Header.Get(viewprotocol.OperationHeader)
+			w.Header().Set(viewprotocol.OperationHeader, opID)
+			_, _ = fmt.Fprintf(w, `{"status":"ok","operation_id":%q,"revision":2}`, opID)
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer api.Close()
+	c, err := New(api.URL, "test-token").WithView(ViewBinding{LayerID: "a", WorkID: "work", Fence: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	zeroSummary, err := c.WriteStreamWithSummary(context.Background(), "/inherited.bin", strings.NewReader(""), 0, nil, WithTargetLayout(ContentLayoutExtent))
+	if err != nil {
+		t.Fatalf("fixed zero-byte overwrite: %v", err)
+	}
+	if zeroSummary.Mode != "direct_put" || puts.Load() != 1 || patches.Load() != 0 {
+		t.Fatalf("zeroSummary=%+v puts=%d patches=%d", zeroSummary, puts.Load(), patches.Load())
+	}
+	c.SetSmallFileThresholdForTests(65536)
+	summary, err := c.WriteStreamWithSummary(context.Background(), "/inherited.bin", strings.NewReader("small"), 5, nil, WithTargetLayout(ContentLayoutExtent))
+	if err != nil {
+		t.Fatalf("fixed small overwrite: %v", err)
+	}
+	if summary.Mode != "direct_put" || puts.Load() != 2 || patches.Load() != 0 {
+		t.Fatalf("summary=%+v puts=%d patches=%d", summary, puts.Load(), patches.Load())
+	}
+	if _, err := c.WriteStreamWithSummary(context.Background(), "/inherited.bin", strings.NewReader("small"), 5, nil, WithContentLayout(ContentLayoutSingle)); err == nil {
+		t.Fatal("accepted explicit single layout on fixed view")
 	}
 }

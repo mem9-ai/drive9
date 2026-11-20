@@ -179,9 +179,9 @@ type aliasInodeTable struct{ pairs map[string][]string }
 
 func (t *aliasInodeTable) Ino(path string) (uint64, bool) { return 7, true }
 func (t *aliasInodeTable) Path(ino uint64) (string, bool) { return "/a", true }
-func (t *aliasInodeTable) Epoch(path string) uint64      { return 0 }
-func (t *aliasInodeTable) NextEpoch(path string) uint64  { return 0 }
-func (t *aliasInodeTable) Aliases(ino uint64) []string   { return t.pairs["/a"] }
+func (t *aliasInodeTable) Epoch(path string) uint64       { return 0 }
+func (t *aliasInodeTable) NextEpoch(path string) uint64   { return 0 }
+func (t *aliasInodeTable) Aliases(ino uint64) []string    { return t.pairs["/a"] }
 
 // PR #1024's writeback-policy variant: under the async write-back policy
 // (flush stages locally; the queue lands asynchronously), interleaved

@@ -12,6 +12,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/extensions/core"
 	"github.com/mem9-ai/drive9/pkg/fs"
+	"github.com/mem9-ai/drive9/pkg/fusecomp/membudget"
 )
 
 func TestCleanZeroTruncateRequiresSingleLayout(t *testing.T) {
@@ -59,5 +60,45 @@ func TestCleanZeroTruncateRequiresSingleLayout(t *testing.T) {
 				t.Fatalf("unexpected publication: body=%q PUTs=%d", n.Data, puts.Load())
 			}
 		})
+	}
+}
+
+func TestCleanZeroTruncateReleasesMemoryBudgetCharge(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.SeedWithLayout("/file", make([]byte, 8192), "single")
+	server := httptest.NewServer(b)
+	t.Cleanup(server.Close)
+	cl := client.New(server.URL, "")
+	budget := membudget.New(16<<20, membudget.ModeEnforce, nil)
+	wb, err := New(Options{Policy: PolicyCloseSync, Client: cl})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wb.SetMemoryBudget(budget)
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chain, err := fs.NewChain(wb, terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := open(t, chain, "/file")
+	bh := h.(*bufferingHandle)
+	before := budget.Used()
+	bh.mu.Lock()
+	if err := bh.ensureBufferLocked(context.Background()); err != nil {
+		bh.mu.Unlock()
+		t.Fatal(err)
+	}
+	bh.mu.Unlock()
+	if got := budget.Used(); got <= before {
+		t.Fatalf("expected preloaded write buffer charge > %d, got %d", before, got)
+	}
+	if _, err := chain.Dispatch(context.Background(), &fs.Op{Kind: fs.OpSetAttr, Path: "/file", Size: 0}); err != nil {
+		t.Fatal(err)
+	}
+	if got := budget.Used(); got != before {
+		t.Fatalf("clean zero truncate leaked write buffer budget: got %d want %d", got, before)
 	}
 }

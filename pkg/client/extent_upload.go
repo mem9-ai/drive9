@@ -19,19 +19,54 @@ import (
 	"github.com/mem9-ai/drive9/pkg/viewprotocol"
 )
 
-// WriteExtentStreamConditional replaces a main file using the extent upload
-// protocol, including when the new body is smaller than the direct PUT limit.
-// expectedRevision is zero for create or positive for update. Fixed views use
-// WriteStreamConditional and their separate operation-identity protocol.
-func (c *Client) WriteExtentStreamConditional(ctx context.Context, path string, source io.ReaderAt, size int64, progress ProgressFunc, expectedRevision int64) error {
+// writeFixedOrCheckedExtentStream replaces a main file using the checked single-part-presign
+// extent upload helper (used by fixed views and their unit tests).
+func (c *Client) writeCheckedExtentStreamConditional(ctx context.Context, path string, source io.ReaderAt, size int64, progress ProgressFunc, expectedRevision int64) error {
 	if c.view.LayerID != "" || source == nil || size <= 0 || expectedRevision < 0 {
 		return errors.New("extent stream requires main, a source, positive size and nonnegative revision")
 	}
-	plan, err := c.initiateUploadV2Layout(ctx, path, size, expectedRevision, "", ContentLayoutExtent)
+	plan, err := c.initiateUploadV2CheckedLayout(ctx, path, size, expectedRevision, "", ContentLayoutExtent)
 	if err != nil {
 		return err
 	}
 	return c.writeExtentUpload(ctx, plan, source, size, progress, nil, nil, "", nil, 0)
+}
+
+func (c *Client) initiateUploadV2CheckedLayout(ctx context.Context, path string, size int64, expectedRevision int64, description string, layout ContentLayout) (*uploadPlanV2, error) {
+	if err := validateFSPath(path); err != nil {
+		return nil, err
+	}
+	body, err := json.Marshal(struct {
+		Path             string        `json:"path"`
+		TotalSize        int64         `json:"total_size"`
+		ExpectedRevision *int64        `json:"expected_revision,omitempty"`
+		Description      string        `json:"description,omitempty"`
+		Layout           ContentLayout `json:"layout,omitempty"`
+	}{Path: path, TotalSize: size, ExpectedRevision: expectedRevisionField(expectedRevision), Description: description, Layout: layout})
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v2/uploads/initiate", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, errV2NotAvailable
+	}
+	if resp.StatusCode != http.StatusAccepted {
+		return nil, readError(resp)
+	}
+	var plan uploadPlanV2
+	if err := decodeFixedResponse(resp.Body, &plan); err != nil {
+		return nil, fmt.Errorf("decode v2 upload plan: %w", err)
+	}
+	return &plan, nil
 }
 
 func validateExtentUploadPlan(plan *uploadPlanV2, size int64) error {

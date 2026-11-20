@@ -115,6 +115,10 @@ func waitP2SyncUploadGate(t *testing.T, ctx context.Context) {
 	defer ticker.Stop()
 	for {
 		n := runtime.Stack(stack, true)
+		for n == len(stack) {
+			stack = make([]byte, len(stack)*2)
+			n = runtime.Stack(stack, true)
+		}
 		for _, goroutine := range strings.Split(string(stack[:n]), "\n\n") {
 			if strings.Contains(goroutine, "TestUploadAcknowledgesNewCreateAcrossHandles.func") &&
 				strings.Contains(goroutine, "(*bufferingHandle).Sync") &&
@@ -290,7 +294,7 @@ func TestChmodOnlyConsumerAcknowledgesNewCreate(t *testing.T) {
 	bus.On(fs.EventLanded, func(fs.Event) { contentEvents.Add(1) })
 	chain, wb := newUploadStack(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Has("chmod") && rejectMode.Load() {
-			http.Error(w, "chmod denied", http.StatusForbidden)
+			http.Error(w, "chmod denied", http.StatusInternalServerError)
 			return
 		}
 		backend.ServeHTTP(w, r)
@@ -356,7 +360,7 @@ func TestFailedChmodAcknowledgesActualRevisionBeforeForeignWrite(t *testing.T) {
 			}
 			chain, wb := newUploadStack(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Query().Has("chmod") && rejectMode.Load() {
-					http.Error(w, "chmod denied", http.StatusForbidden)
+					http.Error(w, "chmod denied", http.StatusInternalServerError)
 					return
 				}
 				backend.ServeHTTP(w, r)
@@ -533,6 +537,10 @@ func waitP2ReleaseUploadGate(t *testing.T, ctx context.Context) {
 	defer ticker.Stop()
 	for {
 		n := runtime.Stack(stack, true)
+		for n == len(stack) {
+			stack = make([]byte, len(stack)*2)
+			n = runtime.Stack(stack, true)
+		}
 		for _, goroutine := range strings.Split(string(stack[:n]), "\n\n") {
 			if strings.Contains(goroutine, "TestReleaseStagesAfterWinningUploadConsumesCache.func") &&
 				strings.Contains(goroutine, "(*bufferingHandle).Release") &&

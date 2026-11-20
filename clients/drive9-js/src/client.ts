@@ -5,6 +5,11 @@ import { appendStreamImpl } from "./append.js";
 import { bodyInit } from "./compat.js";
 import { checkError, Drive9Error, StatusError } from "./error.js";
 import {
+  mayBeExtentDirectWriteRejection,
+  writeDirectOnlyImpl,
+  writeExtentBytesImpl,
+} from "./extent.js";
+import {
   commitFSLayer,
   createFSLayer,
   checkpointFSLayer,
@@ -50,6 +55,7 @@ import { MaxBatchReadSmallPaths, MaxBatchStatPaths } from "./models.js";
 import type {
   BatchReadSmallResult,
   BatchStatResult,
+  ContentLayout,
   EventHandler,
   EventLifecycle,
   FileInfo,
@@ -86,6 +92,7 @@ import type {
   SearchResult,
   StatMetadataResult,
   StatResult,
+  StorageType,
   TenantStatus,
   UploadSummary,
   VaultGrantIssueRequest,
@@ -224,17 +231,11 @@ function normalizeWriteOptions(options?: number | WriteOptions): Required<Pick<W
   if (typeof options === "number") {
     return { expectedRevision: options };
   }
-  return { expectedRevision: options?.expectedRevision ?? -1, tags: options?.tags, description: options?.description };
-}
-
-function headerEntries(init?: Record<string, string>): [string, string][] {
-  return Object.entries(init || {});
-}
-
-function appendTagHeaderEntries(headers: [string, string][], tags?: Record<string, string>): void {
-  for (const [key, value] of Object.entries(tags || {})) {
-    headers.push(["X-Dat9-Tag", `${key}=${value}`]);
-  }
+  return {
+    expectedRevision: options?.expectedRevision ?? -1,
+    tags: options?.tags,
+    description: options?.description,
+  };
 }
 
 async function streamToBytes(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
@@ -371,18 +372,24 @@ export class Client {
 
   async writeWithRevision(path: string, data: Uint8Array, options?: number | WriteOptions): Promise<number> {
     const opts = normalizeWriteOptions(options);
-    const headers = headerEntries(this.authHeaders({ "Content-Type": "application/octet-stream" }));
-    if (opts.expectedRevision >= 0) {
-      headers.push(["X-Dat9-Expected-Revision", String(opts.expectedRevision)]);
+    try {
+      return await writeDirectOnlyImpl(this, path, data, opts);
+    } catch (err) {
+      if (mayBeExtentDirectWriteRejection(err, opts.expectedRevision)) {
+        let isExtentTarget = false;
+        try {
+          const st = await this.stat(path);
+          isExtentTarget = !st.isDir && st.content_layout === "extent";
+        } catch {
+          throw err;
+        }
+        if (isExtentTarget) {
+          const res = await writeExtentBytesImpl(this, path, data, opts);
+          return res.revision;
+        }
+      }
+      throw err;
     }
-    if (opts.description) {
-      headers.push(["X-Dat9-Description", opts.description]);
-    }
-    appendTagHeaderEntries(headers, opts.tags);
-    const resp = await fetch(this.fsUrl(path), { method: "PUT", headers, body: bodyInit(data) });
-    await checkError(resp);
-    const body = (await resp.json().catch(() => undefined)) as { revision?: number } | undefined;
-    return body?.revision || 0;
   }
 
   async createFile(path: string): Promise<number> {
@@ -410,9 +417,7 @@ export class Client {
   }
 
   async read(path: string): Promise<Uint8Array> {
-    const resp = await fetch(this.fsUrl(path), { headers: this.authHeaders() });
-    await checkError(resp);
-    return new Uint8Array(await resp.arrayBuffer());
+    return streamToBytes(await this.readStream(path));
   }
 
   async readAt(path: string, offset: number, length: number): Promise<Uint8Array> {
@@ -499,6 +504,8 @@ export class Client {
     const mtimeHeader = resp.headers.get("x-dat9-mtime");
     const modeHeader = resp.headers.get("x-dat9-mode");
     const nlinkHeader = resp.headers.get("x-dat9-nlink");
+    const storageTypeHeader = resp.headers.get("x-dat9-storage-type");
+    const contentLayoutHeader = resp.headers.get("x-dat9-content-layout");
     return {
       size,
       isDir: resp.headers.get("x-dat9-isdir") === "true",
@@ -508,6 +515,8 @@ export class Client {
       hasMode: modeHeader != null,
       resource_id: resp.headers.get("x-dat9-resource-id") || undefined,
       nlink: nlinkHeader ? Number(nlinkHeader) : undefined,
+      storage_type: (storageTypeHeader as StorageType | null) || undefined,
+      content_layout: (contentLayoutHeader as ContentLayout | null) || undefined,
     };
   }
 
@@ -519,12 +528,33 @@ export class Client {
       throw new Drive9Error(`stat metadata fallback: unexpected Content-Type ${contentType}`);
     }
     const body = (await resp.json()) as StatMetadataResult;
-    return { ...body, tags: body.tags || {} };
+    return {
+      ...body,
+      storage_type: body.storage_type || (resp.headers.get("x-dat9-storage-type") as StorageType | null) || undefined,
+      content_layout: body.content_layout || (resp.headers.get("x-dat9-content-layout") as ContentLayout | null) || undefined,
+      tags: body.tags || {},
+    };
   }
 
   async statMetadataCompat(path: string): Promise<StatMetadataResult> {
     try {
-      return await this.statMetadata(path);
+      const out = await this.statMetadata(path);
+      if (!out.isdir && out.resource_id && (!out.content_layout || !out.storage_type)) {
+        try {
+          const head = await this.stat(path);
+          if (!head.isDir && head.resource_id && head.resource_id === out.resource_id) {
+            if (!out.storage_type && head.storage_type) {
+              out.storage_type = head.storage_type;
+            }
+            if (!out.content_layout && head.content_layout) {
+              out.content_layout = head.content_layout;
+            }
+          }
+        } catch {
+          // Best-effort backfill against servers that omit layout on GET ?stat=1.
+        }
+      }
+      return out;
     } catch (err) {
       const status = err instanceof StatusError ? err.statusCode : 0;
       const fallback =
@@ -542,6 +572,8 @@ export class Client {
         revision: st.revision,
         mtime: st.mtime ? Math.floor(st.mtime.getTime() / 1000) : undefined,
         content_type: "",
+        storage_type: st.storage_type,
+        content_layout: st.content_layout,
         semantic_text: "",
         tags: {},
         degraded: true,

@@ -52,6 +52,10 @@ const (
 	TenantNotifyWorkFileGC
 	TenantNotifyWorkMetricsCleanup
 	TenantNotifyWorkAPIKeyCacheCleanup
+	// TenantNotifyWorkTenantCredential means the tenant's database credential changed.
+	// Every pod must drop the cache it resolved from the old row and the pooled backend
+	// whose connections were authenticated with the retired password.
+	TenantNotifyWorkTenantCredential
 )
 
 var allTenantStatuses = []TenantStatus{
@@ -574,6 +578,22 @@ func metaInitSchemaStatements() []string {
 			INDEX idx_tenant_namespace (storage_namespace_id, kind, status),
 			INDEX idx_tenant_parent (parent_tenant_id)
 		)`,
+		// tenant_credential_state records what the native credential remediation did
+		// for a tenant, so a later pass does not have to re-derive it from a connection
+		// it may no longer be able to make.
+		//
+		// state 1 means this server rotated the restricted account off the cluster root
+		// password and revoked the legacy cluster-wide grant in the same setup. state 2
+		// means the stored credential could not verify either: the account no longer
+		// authenticates as the cluster root, so the grant cannot be checked or revoked
+		// from here and an operator has to look. Absent means the tenant has never been
+		// remediated.
+		`CREATE TABLE IF NOT EXISTS tenant_credential_state (
+			tenant_id  VARCHAR(64) PRIMARY KEY,
+			state      TINYINT UNSIGNED NOT NULL,
+			reason     VARCHAR(255) NOT NULL DEFAULT '',
+			updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
+		)`,
 		`CREATE TABLE IF NOT EXISTS tenant_auto_embedding_profiles (
 			tenant_id      VARCHAR(64) PRIMARY KEY,
 			embedding_mode VARCHAR(32) NULL,
@@ -748,7 +768,6 @@ func metaInitSchemaStatements() []string {
 			file_count         BIGINT NOT NULL DEFAULT 0,
 			media_file_count   BIGINT NOT NULL DEFAULT 0,
 			video_file_count   BIGINT NOT NULL DEFAULT 0,
-			extent_reported_bytes BIGINT NOT NULL DEFAULT 0,
 			updated_at         DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
 		)`,
 		`CREATE TABLE IF NOT EXISTS tenant_file_meta (
@@ -3534,6 +3553,11 @@ func (s *Store) ClearTenantProvisionMetadata(ctx context.Context, tenantID strin
 		if _, err := tx.ExecContext(ctx, `DELETE FROM tenant_tidbcloud_org_bindings WHERE tenant_id = ?`, tenantID); err != nil {
 			return err
 		}
+		// The credential state is per tenant and must die with it, or a re-created tenant
+		// with the same id would inherit a claim about a credential it does not have.
+		if _, err := tx.ExecContext(ctx, `DELETE FROM tenant_credential_state WHERE tenant_id = ?`, tenantID); err != nil {
+			return err
+		}
 		return nil
 	})
 	if err != nil {
@@ -3543,20 +3567,116 @@ func (s *Store) ClearTenantProvisionMetadata(ctx context.Context, tenantID strin
 	return nil
 }
 
-func (s *Store) UpdateTenantDBCredentialIf(ctx context.Context, id, fromDBUser, dbUser string, dbPasswordCipher []byte) (updated bool, err error) {
+// TenantCredentialState is what the native credential remediation recorded for a tenant.
+type TenantCredentialState int
+
+const (
+	// TenantCredentialRemediated means this server rotated the restricted account off the
+	// cluster root password and revoked the legacy cluster-wide grant in the same setup.
+	TenantCredentialRemediated TenantCredentialState = 1
+	// TenantCredentialReviewRequired means the stored credential neither authenticated as
+	// the cluster root nor proved the grant was gone, so the tenant is recorded as still
+	// possibly exposed instead of being claimed as remediated.
+	TenantCredentialReviewRequired TenantCredentialState = 2
+)
+
+// SetTenantCredentialState records the outcome of a native credential remediation. Unset
+// (no row) means the tenant has never been remediated, which is what makes the leader pass
+// pick it up.
+func (s *Store) SetTenantCredentialState(ctx context.Context, tenantID string, state TenantCredentialState, reason string) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "set_tenant_credential_state", start, &err)
+	if strings.TrimSpace(tenantID) == "" {
+		return fmt.Errorf("tenant id is required")
+	}
+	return setTenantCredentialStateTx(ctx, s.db, tenantID, state, reason)
+}
+
+// setTenantCredentialStateTx records a state through any executor, so the caller can put it
+// in the same transaction as the credential it describes.
+func setTenantCredentialStateTx(ctx context.Context, ex interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}, tenantID string, state TenantCredentialState, reason string) error {
+	_, err := ex.ExecContext(ctx, `INSERT INTO tenant_credential_state (tenant_id, state, reason)
+		VALUES (?, ?, ?)
+		ON DUPLICATE KEY UPDATE state = VALUES(state), reason = VALUES(reason)`,
+		tenantID, int(state), reason)
+	return err
+}
+
+// TenantCredentialState returns the recorded remediation state, or ErrNotFound when the
+// tenant has none.
+func (s *Store) TenantCredentialState(ctx context.Context, tenantID string) (state TenantCredentialState, reason string, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "tenant_credential_state", start, &err)
+	var raw int
+	row := s.db.QueryRowContext(ctx, `SELECT state, reason FROM tenant_credential_state WHERE tenant_id = ?`, tenantID)
+	if err = row.Scan(&raw, &reason); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, "", ErrNotFound
+		}
+		return 0, "", err
+	}
+	return TenantCredentialState(raw), reason, nil
+}
+
+// TenantDBCredentialUpdate is one credential write: the user the row must still name, the
+// credential to store, and the remediation outcome to record with it.
+type TenantDBCredentialUpdate struct {
+	FromDBUser     string
+	DBUser         string
+	PasswordCipher []byte
+	// State is the remediation outcome to record in the same transaction, so a credential
+	// and the claim about it can never disagree. Zero records no state.
+	State       TenantCredentialState
+	StateReason string
+}
+
+// UpdateTenantDBCredentialIf replaces a tenant's database credential when the row still
+// names FromDBUser, and records the outcome plus the cache-invalidation signal in the same
+// transaction.
+//
+// The signal matters as much as the update: a peer keeps the previous credential in its
+// resolved tenant row and inside open connections, so a rotated password must invalidate
+// those caches everywhere, not just in the process that performed the write. The state rows
+// belong in the transaction for the same reason: a credential written without its outcome
+// would make the next pass re-derive a claim the caller already knew and could have said.
+func (s *Store) UpdateTenantDBCredentialIf(ctx context.Context, id string, update TenantDBCredentialUpdate) (updated bool, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "update_tenant_db_credential_if", start, &err)
-	res, err := s.db.ExecContext(ctx, `UPDATE tenants SET db_user = ?, db_password = ?, updated_at = ? WHERE id = ? AND db_user = ?`,
-		dbUser, dbPasswordCipher, time.Now().UTC(), id, fromDBUser)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	res, err := tx.ExecContext(ctx, `UPDATE tenants SET db_user = ?, db_password = ?, updated_at = ? WHERE id = ? AND db_user = ?`,
+		update.DBUser, update.PasswordCipher, time.Now().UTC(), id, update.FromDBUser)
 	if err != nil {
 		return false, err
 	}
 	n, _ := res.RowsAffected()
-	updated = n > 0
-	if updated {
-		s.apiKeys.evictTenant(id)
+	if n == 0 {
+		return false, nil
 	}
-	return updated, nil
+	if err := insertTenantNotifyTx(ctx, tx, id, TenantNotifyWorkTenantCredential); err != nil {
+		return false, fmt.Errorf("enqueue tenant credential invalidation: %w", err)
+	}
+	if update.State != 0 {
+		if err := setTenantCredentialStateTx(ctx, tx, id, update.State, update.StateReason); err != nil {
+			return false, fmt.Errorf("record tenant credential state: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	committed = true
+	s.apiKeys.evictTenant(id)
+	return true, nil
 }
 
 func (s *Store) UpdateTenantBranch(ctx context.Context, id string, cluster *Tenant) (err error) {
@@ -3983,6 +4103,11 @@ func (s *Store) MarkTenantDeleted(ctx context.Context, tenantID string) (err err
 		if _, err := tx.ExecContext(ctx, `DELETE FROM tenant_tidbcloud_org_bindings WHERE tenant_id = ?`, tenantID); err != nil {
 			return err
 		}
+		// The credential state is per tenant and must die with it, or a re-created tenant
+		// with the same id would inherit a claim about a credential it does not have.
+		if _, err := tx.ExecContext(ctx, `DELETE FROM tenant_credential_state WHERE tenant_id = ?`, tenantID); err != nil {
+			return err
+		}
 		return insertTenantNotifyTx(ctx, tx, tenantID, TenantNotifyWorkMetricsCleanup)
 	})
 	if err != nil {
@@ -4039,6 +4164,11 @@ func (s *Store) FinalizeTenantDelete(ctx context.Context, tenantID, namespaceID 
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM tenant_tidbcloud_org_bindings WHERE tenant_id = ?`, tenantID); err != nil {
+			return err
+		}
+		// The credential state is per tenant and must die with it, or a re-created tenant
+		// with the same id would inherit a claim about a credential it does not have.
+		if _, err := tx.ExecContext(ctx, `DELETE FROM tenant_credential_state WHERE tenant_id = ?`, tenantID); err != nil {
 			return err
 		}
 		return insertTenantNotifyTx(ctx, tx, tenantID, TenantNotifyWorkMetricsCleanup)

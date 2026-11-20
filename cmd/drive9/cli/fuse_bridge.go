@@ -38,6 +38,7 @@ type mountFuseOptions struct {
 	ReadCacheMaxFileBytes        int64
 	ReadCacheTTL                 time.Duration
 	DiskReadCacheSize            int64
+	ExtentCacheSize              int64
 	DiskReadCacheFreeRatio       float64
 	DirTTL                       time.Duration
 	AttrTTL                      time.Duration
@@ -61,6 +62,8 @@ type mountFuseOptions struct {
 	LayerRef                     string
 	CheckpointRef                string
 	LocalRoot                    string
+	LocalizeQuotaBytes           int64
+	LocalizeFreeRatio            float64
 	LocalOnlyPatterns            []string
 	LocalGitignoreAwarePatterns  []string
 	RemoteOnlyPatterns           []string
@@ -75,6 +78,8 @@ type mountFuseOptions struct {
 	WriteBackBatchMaxBytes       int64
 	WriteCacheFreeRatio          float64
 	WriteCacheSizeMB             int64
+	MemoryBudget                 int64
+	MemoryBudgetMode             string
 	ReadConcurrency              int
 	ParallelReadConcurrency      int
 	ParallelReadBlockSize        int64

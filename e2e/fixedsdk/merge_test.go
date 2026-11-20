@@ -53,15 +53,30 @@ func TestMergeProbeOverwritesExtentThroughExplicitLayout(t *testing.T) {
 					}
 					w.WriteHeader(202)
 					_ = json.NewEncoder(w).Encode(map[string]any{"upload_id": "upload", "content_layout": "extent", "part_size": 4 << 20, "total_parts": 1, "expires_at": time.Now().Add(time.Minute).Format(time.RFC3339), "checksum_contract": map[string]any{"required": true, "supported": []string{"SHA-256"}}})
-				case "/v2/uploads/upload/presign":
+				case "/v2/uploads/upload/presign-batch":
 					sum := sha256.Sum256([]byte("newer main"))
-					_ = json.NewEncoder(w).Encode(client.PartURL{Number: 1, Size: 10, ChecksumSHA256: hex.EncodeToString(sum[:]), SkipUpload: true, ExpiresAt: time.Now().Add(time.Minute).Format(time.RFC3339)})
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"parts": []map[string]any{{
+							"number":          1,
+							"size":            10,
+							"checksum_sha256": hex.EncodeToString(sum[:]),
+							"skip_upload":     true,
+							"expires_at":      time.Now().Add(time.Minute).Format(time.RFC3339),
+						}},
+					})
 				case "/v2/uploads/upload/complete":
 					if failure == "complete" {
 						w.WriteHeader(503)
 						return
 					}
 					_, _ = io.WriteString(w, `{"status":"completed","revision":8,"resource_id":"inode"}`)
+				case "/v2/uploads/upload/abort":
+					if failure != "complete" {
+						t.Error("unexpected abort for", failure)
+						w.WriteHeader(400)
+						return
+					}
+					_, _ = io.WriteString(w, `{}`)
 				default:
 					t.Error("unexpected request", r.Method, r.URL.Path)
 					w.WriteHeader(400)
@@ -78,6 +93,8 @@ func TestMergeProbeOverwritesExtentThroughExplicitLayout(t *testing.T) {
 				want = 1
 			case "initiate":
 				want = 2
+			case "complete":
+				want = 5
 			}
 			if calls.Load() != want {
 				t.Fatal("unexpected requests", calls.Load(), want)

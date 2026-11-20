@@ -164,8 +164,10 @@ const summary = await client.writeStreamWithSummary(
   }
 );
 
-console.log(summary.mode); // direct_put, multipart_v2, or multipart_v1
+console.log(summary.mode); // direct_put, extent_v2, multipart_v2, or multipart_v1
 ```
+
+Large uploads select `extent_v2` automatically (falling back to `multipart_v2` / `multipart_v1` when the server or existing file uses classic `single` layout). Unlike the Go SDK, TypeScript `WriteOptions` intentionally omits explicit layout controls so physical content layout remains transparent to callers; note that `UploadSummary["mode"]` includes `"extent_v2"`.
 
 Compare-and-set upload semantics use `expectedRevision`:
 

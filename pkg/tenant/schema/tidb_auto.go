@@ -929,7 +929,6 @@ func tidbAutoEmbeddingSchemaStatementsForConfig(cfg tidbAutoEmbeddingRenderConfi
 	stmts = append(stmts, FSLayerTiDBSchemaStatements()...)
 	stmts = append(stmts, JournalTiDBSchemaStatements()...)
 	stmts = append(stmts, VaultTiDBSchemaStatements()...)
-	stmts = append(stmts, ExtentTiDBSchemaStatements()...)
 	return stmts
 }
 

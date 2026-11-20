@@ -7,10 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"sync/atomic"
+	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 
 	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/mountcontrol"
 	"github.com/mem9-ai/drive9/pkg/mountpath"
 	"github.com/mem9-ai/drive9/pkg/mountstate"
 	"github.com/mem9-ai/drive9/pkg/viewprotocol"
@@ -137,24 +139,46 @@ func (v *mountView) currentRuntime() *mountRuntime {
 // drainShutdown is called after closing/joining the control service. Keep
 // ordinary admission closed through unmount, including if drain fails.
 func (v *mountView) drainShutdown(ctx context.Context) error {
-	v.ready.Store(false)
-	v.switcher.mu.Lock()
-	defer v.switcher.mu.Unlock()
-	if v.switcher.pending != nil {
-		return mountstate.ErrSwitchPending
-	}
-	pause, err := v.switcher.adapter.admission.pause()
-	if err != nil {
-		return err
-	}
-	if err := pause.wait(ctx); err != nil {
-		return err
-	}
-	result := v.switcher.current.fs.Drain(ctx)
+	result := v.drainShutdownResponse(ctx)
 	if !result.OK {
 		return fmt.Errorf("mount shutdown drain (%s): %s", result.ErrorKind, result.Error)
 	}
 	return nil
+}
+
+func (v *mountView) drainShutdownResponse(ctx context.Context) mountcontrol.DrainResponse {
+	v.ready.Store(false)
+	v.switcher.mu.Lock()
+	defer v.switcher.mu.Unlock()
+	mntPt := ""
+	if v.switcher.current != nil && v.switcher.current.fs != nil {
+		mntPt = v.switcher.current.fs.mountPt
+	}
+	if v.switcher.pending != nil {
+		resp := mountcontrol.NewDrainResponse(mntPt, time.Now().UTC())
+		resp.Fail("RECOVERING", mntPt, mountstate.ErrSwitchPending)
+		if v.switcher.current != nil && v.switcher.current.fs != nil {
+			v.switcher.current.fs.snapshotDrainPending(&resp)
+		}
+		resp.Finish(time.Now().UTC())
+		return resp
+	}
+	pause, err := v.switcher.adapter.admission.pause()
+	if err != nil {
+		resp := mountcontrol.NewDrainResponse(mntPt, time.Now().UTC())
+		resp.Fail(classifyDrainErr(err), mntPt, err)
+		v.switcher.current.fs.snapshotDrainPending(&resp)
+		resp.Finish(time.Now().UTC())
+		return resp
+	}
+	if err := pause.wait(ctx); err != nil {
+		resp := mountcontrol.NewDrainResponse(mntPt, time.Now().UTC())
+		resp.Fail(classifyDrainErr(err), mntPt, err)
+		v.switcher.current.fs.snapshotDrainPending(&resp)
+		resp.Finish(time.Now().UTC())
+		return resp
+	}
+	return v.switcher.current.fs.Drain(ctx)
 }
 
 // close follows control-service join and the kernel serve loop's end (or a

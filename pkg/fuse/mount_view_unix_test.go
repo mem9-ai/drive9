@@ -202,7 +202,7 @@ func TestFixedMountRuntimeUsesNormalContentRoutes(t *testing.T) {
 	}
 	for _, handler := range r.fs.chain.Handlers() {
 		switch handler.(type) {
-		case *extent.Extent, *appendlog.AppendLog:
+		case *extent.Handler, *appendlog.AppendLog:
 			t.Fatalf("fixed view installed a legacy content plane: %T", handler)
 		}
 	}

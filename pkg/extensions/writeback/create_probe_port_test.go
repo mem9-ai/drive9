@@ -16,6 +16,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/extensions/core"
 	"github.com/mem9-ai/drive9/pkg/fs"
+	"github.com/mem9-ai/drive9/pkg/fusecomp/dircache"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/staging"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/writebuffer"
 )
@@ -365,11 +366,12 @@ func TestPortAckIgnoresMatchingNumberFromOtherTrack(t *testing.T) {
 }
 
 // A nonexclusive kernel CREATE can lose the negative-lookup race to another
-// client. The writeback tier must reconcile against the existing remote row
-// instead of returning a lazy PendingNew that the uploader can never land.
+// client, while a truncating kernel CREATE inside a session-created directory
+// (unzip, tar, cp) still answers locally from dircache with zero remote HEADs.
 func TestPortKernelCreateReconcilesExistingNonexclusive(t *testing.T) {
 	b := testbackend.NewBackend()
 	b.Seed("/f", []byte("old"))
+	b.Seed("/ftrunc", []byte("old-trunc"))
 	var heads atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v1/status" {
@@ -391,12 +393,17 @@ func TestPortKernelCreateReconcilesExistingNonexclusive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	dc := dircache.NewNamespaceCache(10*time.Second, time.Second, 1000)
+	terminal.Attach(dc)
+	dc.MarkSessionCreatedDir("/uz")
 	ch, err := fs.NewChain(wb, terminal)
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Truncating kernel CREATE inside a session-created directory claims
+	// asynchronously with 0 HEADs.
 	res, err := ch.Dispatch(context.Background(), &fs.Op{
-		Kind: fs.OpCreate, Path: "/f", Flags: uint32(syscall.O_CREAT | syscall.O_RDWR),
+		Kind: fs.OpCreate, Path: "/uz/fresh", Flags: uint32(syscall.O_CREAT | syscall.O_TRUNC | syscall.O_RDWR),
 		Mode: 0o644, HasMode: true, Kernel: &gofuse.CreateIn{},
 	})
 	if err != nil {
@@ -406,11 +413,59 @@ func TestPortKernelCreateReconcilesExistingNonexclusive(t *testing.T) {
 	if !ok {
 		t.Fatalf("handle type = %T", res.Handle)
 	}
-	if h.isNew || h.baseRev != 1 {
-		t.Fatalf("reconciled create isNew=%v baseRev=%d, want false/1", h.isNew, h.baseRev)
+	if !h.isNew || h.baseRev != 0 {
+		t.Fatalf("async truncating create isNew=%v baseRev=%d, want true/0", h.isNew, h.baseRev)
 	}
-	if got := heads.Load(); got != 1 {
-		t.Fatalf("nonexclusive create probe HEADs = %d, want 1", got)
+	if got := heads.Load(); got != 0 {
+		t.Fatalf("truncating create probe HEADs = %d, want 0", got)
+	}
+	_ = h.Release(context.Background())
+
+	// Non-truncating kernel CREATE (O_CREAT|O_RDWR without O_TRUNC) reconciles
+	// an existing remote file so its contents and attributes are preserved.
+	res2, err := ch.Dispatch(context.Background(), &fs.Op{
+		Kind: fs.OpCreate, Path: "/f", Flags: uint32(syscall.O_CREAT | syscall.O_RDWR),
+		Mode: 0o644, HasMode: true, Kernel: &gofuse.CreateIn{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h2, ok := res2.Handle.(*bufferingHandle)
+	if !ok {
+		t.Fatalf("handle type = %T", res2.Handle)
+	}
+	if h2.isNew || h2.baseRev != 1 {
+		t.Fatalf("non-truncating create isNew=%v baseRev=%d, want false/1", h2.isNew, h2.baseRev)
+	}
+	buf := make([]byte, 8)
+	n, rerr := h2.Read(context.Background(), 0, buf)
+	if rerr != nil || string(buf[:n]) != "old" {
+		t.Fatalf("Read existing after non-truncating create = %q, %v; want %q", string(buf[:n]), rerr, "old")
+	}
+	_ = h2.Release(context.Background())
+
+	// Truncating kernel CREATE against an uncached existing file reconciles
+	// onto the existing revision and truncates/replaces it cleanly at fsync.
+	res3, err := ch.Dispatch(context.Background(), &fs.Op{
+		Kind: fs.OpCreate, Path: "/ftrunc", Flags: uint32(syscall.O_CREAT | syscall.O_TRUNC | syscall.O_RDWR),
+		Mode: 0o644, HasMode: true, Kernel: &gofuse.CreateIn{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h3, ok := res3.Handle.(*bufferingHandle)
+	if !ok {
+		t.Fatalf("handle type = %T", res3.Handle)
+	}
+	if h3.isNew || h3.baseRev != 1 || !h3.trunc {
+		t.Fatalf("truncating existing create isNew=%v baseRev=%d trunc=%v, want false/1/true", h3.isNew, h3.baseRev, h3.trunc)
+	}
+	if err := h3.Sync(context.Background()); err != nil {
+		t.Fatalf("truncate-only Sync: %v", err)
+	}
+	_ = h3.Release(context.Background())
+	if node, ok := b.Node("/ftrunc"); !ok || len(node.Data) != 0 {
+		t.Fatalf("remote /ftrunc after truncate-only Sync = %q ok=%v, want empty", node.Data, ok)
 	}
 }
 

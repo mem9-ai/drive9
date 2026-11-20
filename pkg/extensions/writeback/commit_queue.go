@@ -63,7 +63,14 @@ type CommitEntry struct {
 	// staging generations that existed when the entry was enqueued. Upload and
 	// cleanup use these tokens so a later same-path write cannot swap in newer
 	// shadow bytes or have its pending metadata removed by an older entry.
-	ShadowGen       uint64
+	//
+	// ShadowGen is a CONTENT generation, not a pin token: it gates uploads and
+	// cleanup by "is this still the same bytes", which is what every caller
+	// does with it. Reads of the entry's bytes must go through the
+	// content-generation APIs (ReadAllIfGeneration / OpenIfGeneration /
+	// ReadAtIfGeneration); the pin-generation APIs (ReadAtGen) live in a
+	// different number space and reject a content generation outright.
+	ShadowGen       staging.ContentGen
 	PendingIndexGen uint64
 	WriteBackGen    uint64
 	// DurableWatermarkRev is the newest revision that Dat9FS knows was already
@@ -71,6 +78,17 @@ type CommitEntry struct {
 	// based on an older revision are stale and must fail instead of overwriting
 	// that watermark through Release/CommitQueue.
 	DurableWatermarkRev int64
+	// LandedResourceID is the resource identity the object's completion
+	// ECHOED for this entry's publication (completion_identity_v1). It is the
+	// proof that the object now at the path is the one this commit produced,
+	// which is stronger than comparing revisions: a revision can legitimately
+	// advance for reasons unrelated to who wrote the bytes.
+	LandedResourceID string
+	// DirtyRanges carries the write buffer's dirty part ranges at enqueue
+	// time, coalesced and clipped to Size. Extent-layout commits upload only
+	// these ranges as dirty blocks (incremental PATCH); classic commits
+	// ignore them and send the whole image.
+	DirtyRanges []ByteRange
 	// DisableAutoResolveLWW forces conflicts for fenced entries to stay
 	// terminal. Re-basing old bytes with a new BaseRev is exactly the silent
 	// rollback class this fence prevents.
@@ -167,10 +185,18 @@ type CommitQueue struct {
 	remoteRoot       string
 	layerRef         string
 	shadows          *staging.ShadowStore
-	index            *staging.PendingIndex
-	journal          *staging.Journal
-	wg               sync.WaitGroup
-	stopped          bool
+	// retainedShadows marks a path whose landed entry must NOT have its
+	// shadow reclaimed: the staging handle refused certification (its
+	// buffer moved on), but the shadow is still the only restore source for
+	// the landing's unchanged evicted parts. Consumed by the cleanup pass.
+	retainedShadows   sync.Map
+	extentGlobs       []globMatcher
+	extentMatchCutoff int64
+	extentMinSize     int64
+	index             *staging.PendingIndex
+	journal           *staging.Journal
+	wg                sync.WaitGroup
+	stopped           bool
 	// abandoned is set by AbandonLayer when the mounted layer was rolled
 	// back. When true, Enqueue returns errLayerRolledBack and commitOne
 	// skips tryAutoResolveConflict, going straight to terminal failure so
@@ -214,9 +240,12 @@ type CommitQueue struct {
 	workCh chan *CommitEntry
 
 	zeroTruncateDelay time.Duration
-	batchWindow       time.Duration
-	batchMaxItems     int
-	batchMaxBytes     int64
+	// extentTakeover arms the extent content-layout commit branch
+	// (SetExtentTakeover).
+	extentTakeover bool
+	batchWindow    time.Duration
+	batchMaxItems  int
+	batchMaxBytes  int64
 
 	perf *fusePerfCounters
 }
@@ -283,6 +312,70 @@ func NewCommitQueue(c *client.Client, shadows *staging.ShadowStore, index *stagi
 // SetPerfCounters attaches the commit counters shim.
 func (cq *CommitQueue) SetPerfCounters(perf *fusePerfCounters) {
 	cq.perf = perf
+}
+
+// SetExtentTakeover arms the extent content-layout branch: large commits
+// are probed (one stat per commit) and routed to extent block sessions.
+// It is the v2 cutover kill-switch; queues without it keep the classic
+// direct-PUT/multipart routing byte-for-byte.
+func (cq *CommitQueue) SetExtentTakeover(enabled bool) {
+	if cq == nil {
+		return
+	}
+	cq.mu.Lock()
+	cq.extentTakeover = enabled
+	cq.mu.Unlock()
+}
+
+// SetExtentPatterns arms pattern-only extent routing with zero size fallback.
+func (cq *CommitQueue) SetExtentPatterns(patterns []string, matchedCutoff int64) {
+	cq.SetExtentRouting(patterns, matchedCutoff, 0)
+}
+
+// SetExtentRouting arms both pattern-matched extent routing (at matchedCutoff)
+// and optional hybrid size-cutoff fallback (minSize > 0) for non-matching paths.
+func (cq *CommitQueue) SetExtentRouting(patterns []string, matchedCutoff, minSize int64) {
+	if cq == nil {
+		return
+	}
+	globs := compileExtentGlobs(patterns)
+	cq.mu.Lock()
+	cq.extentGlobs = globs
+	cq.extentMatchCutoff = matchedCutoff
+	cq.extentMinSize = minSize
+	cq.mu.Unlock()
+}
+
+// extentRouteFor reports the extent routing decision for a queued path.
+func (cq *CommitQueue) extentRouteFor(path string, size int64) bool {
+	cq.mu.Lock()
+	globs, cutoff, minSize := cq.extentGlobs, cq.extentMatchCutoff, cq.extentMinSize
+	cq.mu.Unlock()
+	if len(globs) > 0 {
+		if matchExtentPattern(globs, path) {
+			return size >= cutoff
+		}
+		return minSize > 0 && size >= minSize
+	}
+	threshold := cq.directPutThreshold()
+	if threshold <= 0 {
+		// Unknown cutoff (cache cold): the historical behavior routes to
+		// the extent plane rather than guessing classic.
+		return true
+	}
+	return size >= threshold
+}
+
+// RetainShadowForLanding asks the success cleanup to keep this path's
+// shadow generation: the handle that staged the landed image refused
+// certification (newer local mutations), and its unchanged evicted parts
+// still reference the shadow as their only restore source. The next
+// staging overwrites the shadow and the next landing reclaims it.
+func (cq *CommitQueue) RetainShadowForLanding(path string, gen staging.ContentGen) {
+	if cq == nil {
+		return
+	}
+	cq.retainedShadows.Store(path, gen)
 }
 
 // ConfigureBatchWrite enables a small writeback-only direct-PUT batch window.
@@ -601,6 +694,34 @@ func (cq *CommitQueue) WaitPathDeadline(path string, timeout time.Duration) bool
 	return true
 }
 
+// ClearPathCommitErr retires a remembered terminal failure for a pathname
+// after a publication of that name SUCCEEDED outside the queue (an inline
+// PUT, the write-cache uploader, a synchronous commit). Without this a
+// recreated or re-published file keeps inheriting its predecessor's error.
+func (cq *CommitQueue) ClearPathCommitErr(path string) {
+	if cq == nil || path == "" {
+		return
+	}
+	cq.mu.Lock()
+	delete(cq.terminalFailures, path)
+	cq.mu.Unlock()
+}
+
+// WaitPathOutcome waits like WaitPathDeadline and then reports whether the
+// path's last commit actually succeeded. A path can be idle because its
+// entry terminally failed (the queue removed it) — sync-durability callers
+// need that distinction.
+//
+// The failure itself is read from PathTerminalFailure, which also covers the
+// durable PendingConflict marker a previous process left behind; a bare
+// in-memory map would silently lose that across restarts.
+func (cq *CommitQueue) WaitPathOutcome(path string, timeout time.Duration) error {
+	if !cq.WaitPathDeadline(path, timeout) {
+		return fmt.Errorf("commit for %s still in flight after %s", path, timeout)
+	}
+	return cq.PathTerminalFailure(path)
+}
+
 // HasPath reports whether a path is queued or currently in flight.
 func (cq *CommitQueue) HasPath(path string) bool {
 	if cq == nil {
@@ -700,6 +821,41 @@ func (cq *CommitQueue) CancelPath(path string) error {
 // gone) so a crash before that close cannot replay the staged frames.
 func (cq *CommitQueue) CancelPathPreserveLocal(path string) error {
 	return cq.cancelPath(path, true)
+}
+
+// CancelEntryInFlight cancels EXACTLY the given entry — the targeted
+// counterpart of the pathname-wide CancelPath* family. Used by a staging
+// that observed the unlink marking after its enqueue: the name may have
+// been recreated by the time this runs, so nothing but this entry may be
+// touched (no pathname sweep, no journal fence — the unlink's own cancel
+// owns those).
+func (cq *CommitQueue) CancelEntryInFlight(entry *CommitEntry) {
+	if cq == nil || entry == nil {
+		return
+	}
+	cq.mu.Lock()
+	entry.canceled = true
+	cancel := entry.cancelCommit
+	if cancel == nil {
+		// Not picked up by a worker yet: retire it from EVERY waitable
+		// set — the queue slice, the immediate set, and the queuedByPath
+		// index (WaitPath/WaitPathDeadline consult the index; leaving the
+		// membership behind keeps the path busy forever, since a worker
+		// that never sees the entry can never repair it).
+		cq.stopDelayedLocked(entry)
+		for i, e := range cq.queue {
+			if e == entry {
+				cq.queue = append(cq.queue[:i], cq.queue[i+1:]...)
+				break
+			}
+		}
+		delete(cq.immediate, entry)
+		cq.removeQueuedLocked(entry)
+	}
+	cq.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 // CancelPathIfInode cancels queued or in-flight uploads for path whose entries
@@ -1298,6 +1454,10 @@ func (cq *CommitQueue) cancelPathEntries(path string) []context.CancelFunc {
 	cq.mu.Lock()
 	defer cq.mu.Unlock()
 	delete(cq.landed, path)
+	// The remembered failure belongs to the PUBLICATION that failed, not to
+	// the pathname: a cancel (unlink/rename/delete) retires it, or a
+	// recreated file would inherit its predecessor's EIO on every Sync until
+	// an unrelated queue success happened to clear it.
 	if e, ok := cq.inFlight[path]; ok {
 		markCanceled(e)
 	}
@@ -2370,7 +2530,25 @@ func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) (int
 	// overwrite the exact parent revision this live queue just landed.
 	expectedRevision := entry.BaseRev
 	if entry.Kind == staging.PendingOverwrite && expectedRevision <= 0 {
-		return 0, fmt.Errorf("missing base revision for overwrite: %s", entry.Path)
+		resolvedRev, emptied, err := cq.reclaimEmptyOccupant(ctx, entry, apiPath)
+		if err != nil {
+			return 0, err
+		}
+		if !emptied {
+			// Not empty (or not statable): the base revision is genuinely
+			// required and genuinely missing. Refuse rather than overwrite an
+			// object whose revision cannot be named.
+			return 0, fmt.Errorf("missing base revision for overwrite: %s", entry.Path)
+		}
+		expectedRevision = resolvedRev
+	}
+
+	// Extent content layout: route large commits through the extent block
+	// plane before the classic direct-PUT/multipart decision. Fresh
+	// large files are taken over by extent sessions here; existing extent
+	// files commit incrementally through PATCH dirty blocks.
+	if committedRev, handled, err := cq.uploadExtentEntry(ctx, entry, apiPath, expectedRevision); handled {
+		return committedRev, err
 	}
 
 	// ShadowSpill entries: stream directly from shadow file to avoid loading
@@ -2601,6 +2779,12 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 			// commit for this path.
 			if client.IsNotFound(err) {
 				safeLogPrintf("commit queue: post-upload chmod not found for %s (concurrent write likely replaced it); proceeding without mode update", entry.Path)
+			} else if client.IsForbidden(err) {
+				// chmod is owner-only. A mount authenticated with an fs_scoped key can
+				// write content but may not change permission bits, and retrying cannot
+				// change that: the entry would stay pending and be denied again on every
+				// commit cycle. Content is already durable, so drop the mode and proceed.
+				safeLogPrintf("commit queue: post-upload chmod denied for %s (token may not chmod); proceeding without mode update", entry.Path)
 			} else {
 				return fmt.Errorf("%w: chmod %s to %o: %w", errCommitPostUpload, entry.Path, mode, err)
 			}
@@ -2631,6 +2815,13 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 	// the local metadata source, and shadowStore remains the local data source
 	// for large files that are not admitted to readCache.
 	if cq.shadows != nil && cq.layerRefSnapshot() == "" {
+		if keep, ok := cq.retainedShadows.LoadAndDelete(entry.Path); ok && keep == entry.ShadowGen {
+			// The staging handle kept newer local bytes: the shadow stays
+			// as the restore source for this landing's evicted parts.
+			cq.index.RemoveIfGeneration(entry.Path, entry.PendingIndexGen)
+			cq.removeFromQueue(entry)
+			return nil
+		}
 		if entry.ShadowGen != 0 {
 			cq.shadows.RemoveIfGeneration(entry.Path, entry.ShadowGen)
 		}
@@ -3061,9 +3252,31 @@ func (cq *CommitQueue) onCommitPostUploadFailure(entry *CommitEntry, err error) 
 	if cq.perf != nil {
 		cq.perf.commitFailure.add(1)
 	}
+	// The DATA landed but the post-upload work (deferred chmod, tags) did
+	// not, so the requested outcome was never achieved. Record it for
+	// outcome-aware waiters: a close-sync/strict-fsync caller that waited on
+	// this path must not report success for a mode that was never committed.
+	// The record is the same terminal-failure channel the data-failure path
+	// uses — both mean "this path did not reach the requested state" — and it
+	// is retired by the next successful commit of the path.
+	if cq.terminalFailures == nil {
+		cq.terminalFailures = make(map[string]pathCommitFailure)
+	}
+	cq.mu.Lock()
+	if err == nil {
+		err = errCommitPostUploadUnknown
+	}
+	cq.failureClock++
+	cq.terminalFailures[entry.Path] = pathCommitFailure{err: err, seq: cq.failureClock}
+	cq.pruneTerminalFailuresLocked()
+	cq.mu.Unlock()
 	cq.removeFromQueue(entry)
 	safeLogPrintf("commit queue: post-upload failure for %s; local pending state preserved for retry: %v", entry.Path, err)
 }
+
+// errCommitPostUploadUnknown backs a post-upload failure that carried no
+// error value: the requested metadata was not applied either way.
+var errCommitPostUploadUnknown = errors.New("commit queue: post-upload work failed")
 
 func (cq *CommitQueue) onCommitTerminalFailure(entry *CommitEntry, lastErr error) {
 	// Mark the entry as conflicted in the pending index so that crash
@@ -3768,4 +3981,40 @@ func (entry *CommitEntry) bindPayload(data []byte) []byte {
 		entry.payloadBound = true
 	}
 	return entry.payload
+}
+
+// reclaimEmptyOccupant deletes a 0-byte object at apiPath so the caller can
+// publish a fresh create over that name. It reports whether it did.
+//
+// Only a genuinely EMPTY object is reclaimed: a 0-byte file has no content a
+// concurrent writer could be relying on, and the drive9 create path assigns
+// such a file revision 1 with no bytes, so re-creating it loses nothing. A
+// non-empty object — or one we cannot stat — is left alone and the caller
+// keeps refusing.
+func (cq *CommitQueue) reclaimEmptyOccupant(ctx context.Context, entry *CommitEntry, apiPath string) (int64, bool, error) {
+	if cq == nil || cq.client == nil {
+		return 0, false, nil
+	}
+	st, err := cq.client.StatCtx(ctx, apiPath)
+	if err != nil {
+		if client.IsNotFound(err) {
+			// The path is already gone: the create can proceed on its own.
+			return 0, true, nil
+		}
+		return 0, false, nil
+	}
+	if st.IsDir || st.Size != 0 {
+		return 0, false, nil
+	}
+	promoteExtent := cq.extentTakeover && entry != nil && entry.Size > 0 &&
+		cq.extentRouteFor(entry.Path, entry.Size) && st.ContentLayout != client.ContentLayoutExtent
+	if st.Revision > 0 && !promoteExtent {
+		// CAS directly against the empty file's current revision instead of
+		// issuing a separate DELETE.
+		return st.Revision, true, nil
+	}
+	if err := cq.client.DeleteFileConditionalCtx(ctx, apiPath, st.Revision, st.ResourceID); err != nil {
+		return 0, false, fmt.Errorf("reclaim empty occupant of %s: %w", apiPath, err)
+	}
+	return 0, true, nil
 }

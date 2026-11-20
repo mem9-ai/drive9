@@ -18,6 +18,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/fs"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/debounce"
+	"github.com/mem9-ai/drive9/pkg/fusecomp/membudget"
 	"github.com/mem9-ai/drive9/pkg/gitcache"
 )
 
@@ -327,6 +328,9 @@ type Git struct {
 	indexScanAt      time.Time
 	cl               *client.Client
 	bus              *fs.EventBus
+	// budget is the process-wide memory budget the handle write buffers
+	// charge (nil disables the charge).
+	budget *membudget.Budget
 	// localRoot is the mount's overlay root; non-empty arms the local
 	// .git checkpoint machinery (state.go).
 	localRoot string

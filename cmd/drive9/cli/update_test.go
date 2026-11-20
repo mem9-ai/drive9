@@ -12,17 +12,13 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/mem9-ai/drive9/internal/releasesign"
 )
 
 func TestUpdateCheckReportsAvailable(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/releases/version" {
-			http.NotFound(w, r)
-			return
-		}
-		_, _ = fmt.Fprintln(w, "v0.2.0")
-	}))
+	srv := httptest.NewServer(updateTestReleaseHandler(t, []byte("new-drive9"), strings.Repeat("a", sha256.Size*2)))
 	defer srv.Close()
 
 	var stdout bytes.Buffer
@@ -140,9 +136,10 @@ func TestUpdateDoesNotInstallDowngradeWithoutForce(t *testing.T) {
 	payload := []byte("older-drive9")
 	sum := sha256.Sum256(payload)
 	var requests []string
+	release := updateTestReleaseHandlerWithVersion(t, "v0.8.0", payload, fmt.Sprintf("%x", sum[:]))
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests = append(requests, r.URL.Path)
-		updateTestReleaseHandlerWithVersion(t, "v0.8.0", payload, fmt.Sprintf("%x", sum[:]))(w, r)
+		release(w, r)
 	}))
 	defer srv.Close()
 
@@ -166,8 +163,9 @@ func TestUpdateDoesNotInstallDowngradeWithoutForce(t *testing.T) {
 	if !strings.Contains(stdout.String(), "v0.8.0 is older than current v0.9.0; use --force") {
 		t.Errorf("stdout = %q, want downgrade message", stdout.String())
 	}
-	if got, want := strings.Join(requests, ","), "/releases/version"; got != want {
-		t.Errorf("requests = %q, want only %q", got, want)
+	wantRequests := "/releases/checksums.txt,/releases/checksums.txt.sig,/releases/release.txt,/releases/release.txt.sig"
+	if got := strings.Join(requests, ","); got != wantRequests {
+		t.Errorf("requests = %q, want only the two signed pairs %q", got, wantRequests)
 	}
 }
 
@@ -235,8 +233,9 @@ func TestUpdatePreflightReplaceRunsBeforeDownload(t *testing.T) {
 	if !errors.Is(err, errUnsupported) {
 		t.Fatalf("update error = %v, want %v", err, errUnsupported)
 	}
-	if got, want := strings.Join(requests, ","), "/releases/version"; got != want {
-		t.Errorf("requests = %q, want only %q", got, want)
+	wantRequests := "/releases/checksums.txt,/releases/checksums.txt.sig,/releases/release.txt,/releases/release.txt.sig"
+	if got := strings.Join(requests, ","); got != wantRequests {
+		t.Errorf("requests = %q, want only the two signed pairs %q", got, wantRequests)
 	}
 }
 
@@ -388,14 +387,15 @@ func TestUpdateExplicitBaseURLAllowsCustomHost(t *testing.T) {
 }
 
 type updateRedirectTransport struct {
-	target string
-	body   string
-	hops   int
+	redirectPath string
+	target       string
+	bodies       map[string]string
+	hops         int
 }
 
 func (tr *updateRedirectTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	tr.hops++
-	if tr.hops == 1 && tr.target != "" {
+	if tr.target != "" && req.URL.Path == tr.redirectPath {
 		return &http.Response{
 			StatusCode: http.StatusFound,
 			Header:     http.Header{"Location": []string{tr.target}},
@@ -406,25 +406,36 @@ func (tr *updateRedirectTransport) RoundTrip(req *http.Request) (*http.Response,
 	return &http.Response{
 		StatusCode: http.StatusOK,
 		Header:     http.Header{},
-		Body:       io.NopCloser(strings.NewReader(tr.body)),
+		Body:       io.NopCloser(strings.NewReader(tr.bodies[req.URL.Path])),
 		Request:    req,
 	}, nil
 }
 
 func TestUpdatePinsRedirectsForPinnedReleaseRoots(t *testing.T) {
+	files := newUpdateTestReleaseFiles(t, "v0.2.0", "drive9-linux-amd64", strings.Repeat("a", sha256.Size*2), nil)
+	bodies := map[string]string{
+		"/latest/" + releasesign.ManifestName:               string(files.manifest),
+		"/releases/" + releasesign.SignatureName:            string(files.manifestSig),
+		"/releases/" + releasesign.ReleaseInfoName:          string(files.info),
+		"/releases/" + releasesign.ReleaseInfoSignatureName: string(files.infoSig),
+	}
 	tests := []struct {
 		name     string
 		location string
 		wantErr  string
 	}{
-		{name: "pinned subdomain", location: "https://releases.drive9.ai/latest/version"},
-		{name: "unpinned host", location: "https://releases.attacker.example/version", wantErr: "not a pinned drive9 release host"},
-		{name: "https downgrade", location: "http://drive9.ai/version", wantErr: "require https"},
+		{name: "pinned subdomain", location: "https://releases.drive9.ai/latest/checksums.txt"},
+		{name: "unpinned host", location: "https://releases.attacker.example/checksums.txt", wantErr: "not a pinned drive9 release host"},
+		{name: "https downgrade", location: "http://drive9.ai/checksums.txt", wantErr: "require https"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			transport := &updateRedirectTransport{target: tt.location, body: "v0.2.0\n"}
+			transport := &updateRedirectTransport{
+				redirectPath: "/releases/checksums.txt",
+				target:       tt.location,
+				bodies:       bodies,
+			}
 			var stdout bytes.Buffer
 			err := updateWithDeps([]string{"--check"}, updateDeps{
 				baseURL:        "https://drive9.ai",
@@ -446,49 +457,14 @@ func TestUpdatePinsRedirectsForPinnedReleaseRoots(t *testing.T) {
 			if err != nil {
 				t.Fatalf("update --check through a pinned redirect: %v", err)
 			}
-			if transport.hops != 2 {
-				t.Fatalf("hops = %d, want the pinned redirect to be followed", transport.hops)
+			// The redirected manifest plus the signature, release info and its signature:
+			// every request in the chain is pinned.
+			if transport.hops != 5 {
+				t.Fatalf("hops = %d, want the redirected manifest and the three remaining fetches", transport.hops)
 			}
 			if !strings.Contains(stdout.String(), "update available: v0.1.0 -> v0.2.0") {
 				t.Errorf("stdout = %q, want update-available line", stdout.String())
 			}
 		})
-	}
-}
-
-func TestParseChecksumsRejectsPathQualifiedArtifactNames(t *testing.T) {
-	sum := strings.Repeat("a", sha256.Size*2)
-	_, err := parseChecksums([]byte(fmt.Sprintf("%s  releases/drive9-linux-amd64\n", sum)))
-	if err == nil || !strings.Contains(err.Error(), "must be a release artifact filename") {
-		t.Fatalf("parseChecksums error = %v, want artifact filename error", err)
-	}
-}
-
-func TestParseChecksumsRejectsDuplicateArtifactNames(t *testing.T) {
-	first := strings.Repeat("a", sha256.Size*2)
-	second := strings.Repeat("b", sha256.Size*2)
-	_, err := parseChecksums([]byte(fmt.Sprintf("%s  drive9-linux-amd64\n%s  drive9-linux-amd64\n", first, second)))
-	if err == nil || !strings.Contains(err.Error(), "duplicate checksum") {
-		t.Fatalf("parseChecksums error = %v, want duplicate checksum error", err)
-	}
-}
-
-func updateTestReleaseHandler(t *testing.T, payload []byte, checksum string) http.HandlerFunc {
-	return updateTestReleaseHandlerWithVersion(t, "v0.2.0", payload, checksum)
-}
-
-func updateTestReleaseHandlerWithVersion(t *testing.T, version string, payload []byte, checksum string) http.HandlerFunc {
-	t.Helper()
-	return func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/releases/version":
-			_, _ = fmt.Fprintln(w, version)
-		case "/releases/checksums.txt":
-			_, _ = fmt.Fprintf(w, "%s  drive9-linux-amd64\n", checksum)
-		case "/releases/drive9-linux-amd64":
-			_, _ = w.Write(payload)
-		default:
-			http.NotFound(w, r)
-		}
 	}
 }

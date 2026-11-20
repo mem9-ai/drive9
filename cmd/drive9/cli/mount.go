@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
@@ -20,6 +21,8 @@ import (
 
 	"github.com/mem9-ai/drive9/pkg/buildinfo"
 	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/fusecomp/membudget"
+	"github.com/mem9-ai/drive9/pkg/mountcontrol"
 	"github.com/mem9-ai/drive9/pkg/mountpath"
 	"github.com/mem9-ai/drive9/pkg/mountstate"
 	"github.com/mem9-ai/drive9/pkg/mountsupervisor"
@@ -191,6 +194,7 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 	readCacheMaxFile := fs.Int64("read-cache-max-file-mb", 4, "maximum single file size admitted to read cache in MB; files at or below this size are fetched with a single whole-file request")
 	readCacheTTL := fs.Duration("read-cache-ttl", 30*time.Second, "read cache TTL; 0 disables time-based expiry")
 	diskReadCacheSize := fs.Int64("disk-read-cache-size-mb", 1024, "disk-backed read cache size in MB")
+	extentCacheSizeMB := fs.Int64("extent-cache-size-mb", 1024, "extent plane disk cache size in MB (read cache and writeback staging share this budget)")
 	diskReadCacheFreeRatio := fs.Float64("disk-read-cache-free-ratio", 0.10, "minimum filesystem free-space ratio before disk read cache evicts")
 	dirTTL := fs.Duration("dir-ttl", 10*time.Second, "directory cache TTL")
 	attrTTL := fs.Duration("attr-ttl", 10*time.Second, "kernel attr cache TTL (default 60s; coding-agent 30s; interactive 1s)")
@@ -219,6 +223,8 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 	checkpointRef := fs.String("checkpoint", "", "restore fs layer checkpoint before mounting")
 	profile := fs.String("profile", "", "mount profile: coding-agent (default), portable, none, extent, interactive, or a ~/.drive9/profiles/<name> file")
 	localRoot := fs.String("local-root", "", "local-only overlay storage root (auto-generated for overlay profiles)")
+	localizeQuotaMB := fs.Int64("localize-quota-mb", 0, "byte quota in MiB for the local-only overlay on the host disk; local writes past it fail with ENOSPC (0 disables)")
+	localizeFreeRatio := fs.Float64("localize-free-ratio", 0.10, "minimum host free-space ratio for the local-only overlay before local writes fail with ENOSPC (0 disables)")
 	var localOnlyPatterns stringListFlag
 	var localGitignoreAwarePatterns stringListFlag
 	var remoteOnlyPatterns stringListFlag
@@ -236,6 +242,8 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 	dirCacheMaxEntries := fs.Int("dir-cache-max-entries", 200000, "maximum entries per directory in namespace cache before complete marking is disabled")
 	writeCacheFreeRatio := fs.Float64("write-cache-free-ratio", 0.10, "minimum filesystem free-space ratio before write-back refuses writes with ENOSPC (0 disables)")
 	writeCacheSizeMB := fs.Int64("write-cache-size-mb", 1024, "current-process shadow data quota in MiB (default 1024; 0 disables); writes exceeding this return ENOSPC")
+	memoryBudgetMB := fs.Int64("memory-budget-mb", 0, "process-wide in-memory budget in MiB covering the read cache, the write-back data cache, per-handle write buffers and the inode table; 0 derives 60% of the cgroup memory limit (disabled when the host has none), -1 disables")
+	memoryBudgetMode := fs.String("memory-budget-mode", "enforce", "over-budget behavior: enforce refuses the allocation (caches degrade, writes fail with ENOMEM) or warn admits it and logs")
 	commitQueueMaxPending := fs.Int("commit-queue-max-pending", 500, "maximum pending entries in CommitQueue before backpressure")
 	writeBackBatchWindow := fs.Duration("writeback-batch-window", 0, "writeback-only small-file batch window (default 0 disables)")
 	writeBackBatchMaxFiles := fs.Int("writeback-batch-max-files", 64, "maximum files in one writeback batch when enabled")
@@ -612,6 +620,22 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 	if *writeCacheSizeMB < 0 {
 		return fmt.Errorf("drive9 mount: --write-cache-size-mb must be >= 0")
 	}
+	if *memoryBudgetMB < -1 {
+		return fmt.Errorf("drive9 mount: --memory-budget-mb must be -1 (disabled), 0 (derive from the cgroup limit), or a positive MiB value")
+	}
+	memoryBudgetModeVal, err := membudget.ParseMode(strings.TrimSpace(*memoryBudgetMode))
+	if err != nil {
+		return fmt.Errorf("drive9 mount: --memory-budget-mode: %w", err)
+	}
+	if *memoryBudgetMB > 0 && *memoryBudgetMB<<20 < 16<<20 {
+		return fmt.Errorf("drive9 mount: --memory-budget-mb must be at least 16 MiB when set")
+	}
+	if *localizeQuotaMB < 0 {
+		return fmt.Errorf("drive9 mount: --localize-quota-mb must be >= 0")
+	}
+	if math.IsNaN(*localizeFreeRatio) || *localizeFreeRatio < 0 || *localizeFreeRatio >= 1 {
+		return fmt.Errorf("drive9 mount: --localize-free-ratio must be >= 0 and < 1")
+	}
 	// Map CLI 0 → -1 sentinel so MountOptions.setDefaults() knows the user
 	// explicitly disabled the guard rather than left it unset.
 	normalizedWriteCacheSizeMB := *writeCacheSizeMB
@@ -903,6 +927,7 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 		ReadCacheMaxFileBytes:        *readCacheMaxFile << 20,
 		ReadCacheTTL:                 normalizedReadCacheTTL,
 		DiskReadCacheSize:            *diskReadCacheSize << 20,
+		ExtentCacheSize:              *extentCacheSizeMB << 20,
 		DiskReadCacheFreeRatio:       *diskReadCacheFreeRatio,
 		DirTTL:                       normalizedDirTTL,
 		AttrTTL:                      normalizedAttrTTL,
@@ -940,6 +965,10 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 		WriteBackBatchMaxBytes:       *writeBackBatchMaxBytes,
 		WriteCacheFreeRatio:          normalizedWriteCacheFreeRatio,
 		WriteCacheSizeMB:             normalizedWriteCacheSizeMB,
+		MemoryBudget:                 *memoryBudgetMB << 20,
+		MemoryBudgetMode:             string(memoryBudgetModeVal),
+		LocalizeQuotaBytes:           *localizeQuotaMB << 20,
+		LocalizeFreeRatio:            *localizeFreeRatio,
 		ReadConcurrency:              *readConcurrency,
 		ParallelReadConcurrency:      *parallelReadConcurrency,
 		ParallelReadBlockSize:        *parallelReadBlockSize << 20,
@@ -2029,6 +2058,9 @@ type umountDeps struct {
 	readProcessState func(string) (mountstate.ProcessState, string, error)
 	terminate        func(int, time.Duration) error
 	terminateState   func(mountstate.ProcessState, time.Duration) error
+	// requestDrain asks a live mount to quiesce its write plane before the
+	// unmount detaches it (nil skips the pre-unmount drain).
+	requestDrain     func(context.Context, string, time.Duration) (*mountcontrol.DrainResponse, error)
 	remove           func(string) error
 	pidAlive         func(int) bool
 	packAfterUnmount func(context.Context, mountstate.ProcessState, []string, []string) error
@@ -2060,6 +2092,7 @@ func defaultUmountDeps() umountDeps {
 		readProcessState: mountstate.ReadProcessState,
 		terminate:        terminateProcess,
 		terminateState:   terminateMountProcess,
+		requestDrain:     mountcontrol.RequestDrain,
 		remove:           os.Remove,
 		pidAlive:         processAlive,
 		packAfterUnmount: defaultPackAfterUnmount,
@@ -2078,20 +2111,26 @@ func runUmount(args []string, deps umountDeps) error {
 	fs := flag.NewFlagSet("umount", flag.ContinueOnError)
 	waitTimeout := fs.Duration("timeout", 60*time.Second, "time budget per wait phase (mount process stop, exit wait, kernel mount-table entry clear); 0 disables waiting")
 	noAutoPack := fs.Bool("no-auto-pack", false, "disable automatic profile pack upload after unmount")
+	drainBeforeStop := fs.Bool("drain", true, "ask the mount to drain pending writes before stopping it")
+	requireDrain := fs.Bool("require-drain", false, "abort the unmount when the pre-unmount drain cannot finish, instead of unmounting with writes uncommitted")
+	drainTimeout := fs.Duration("drain-timeout", mountcontrol.DefaultDrainTimeout, "maximum time to wait for the pre-unmount drain (independent of --timeout)")
 	var packArchives stringListFlag
 	var packPaths stringListFlag
 	fs.Var(&packArchives, "pack", "also pack profile local overlay paths to this remote archive after unmount (repeatable)")
 	fs.Var(&packPaths, "pack-path", "local overlay path to include in the automatic/default pack (repeatable; relative paths resolve under the mount remote root)")
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: drive9 umount [--timeout duration] [--pack :/archive.tar.gz] [--pack-path path]... [--no-auto-pack] <mountpoint>\n\nflags:\n")
+		fmt.Fprintf(os.Stderr, "usage: drive9 umount [--timeout duration] [--drain=false] [--require-drain] [--drain-timeout duration] [--pack :/archive.tar.gz] [--pack-path path]... [--no-auto-pack] <mountpoint>\n\nflags:\n")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if *drainTimeout <= 0 {
+		return fmt.Errorf("drive9 umount: --drain-timeout must be > 0")
+	}
 	if fs.NArg() != 1 {
 		fs.Usage()
-		return fmt.Errorf("usage: drive9 umount [--timeout duration] [--pack :/archive.tar.gz] [--pack-path path]... [--no-auto-pack] <mountpoint>")
+		return fmt.Errorf("usage: drive9 umount [--timeout duration] [--drain=false] [--require-drain] [--drain-timeout duration] [--pack :/archive.tar.gz] [--pack-path path]... [--no-auto-pack] <mountpoint>")
 	}
 	mountPoint := fs.Arg(0)
 	stateMountPoint := mountPoint
@@ -2105,6 +2144,17 @@ func runUmount(args []string, deps umountDeps) error {
 
 	// Read pack metadata BEFORE stopping the supervisor — shutdownClean removes
 	// the pidfile, so a post-stop read would fail for supervised mounts.
+	//
+	// The record is read ONCE for every consumer below (pack metadata, the
+	// pre-unmount drain and the stop targets): a second read after the stop
+	// token lands can observe a successor generation, and the drain needs the
+	// control socket from the same record the stop decision uses.
+	var preStopState mountstate.ProcessState
+	var preStopErr error
+	if deps.readProcessState != nil && deps.goos != "windows" {
+		preStopState, _, preStopErr = deps.readProcessState(stateMountPoint)
+	}
+
 	var packState mountstate.ProcessState
 	packStateOK := false
 	needPackState := len(packArchives) > 0 || len(packPaths) > 0 || !*noAutoPack
@@ -2113,15 +2163,38 @@ func runUmount(args []string, deps umountDeps) error {
 			if len(packArchives) > 0 || len(packPaths) > 0 {
 				return fmt.Errorf("drive9 umount: pack requires mount process metadata")
 			}
-		} else {
+		} else if deps.goos == "windows" {
+			var st mountstate.ProcessState
 			var err error
-			packState, _, err = deps.readProcessState(stateMountPoint)
+			st, _, err = deps.readProcessState(stateMountPoint)
 			if err != nil {
 				if len(packArchives) > 0 || len(packPaths) > 0 {
 					return fmt.Errorf("drive9 umount: read mount state for pack: %w", err)
 				}
 			} else {
-				packStateOK = true
+				packState, packStateOK = st, true
+			}
+		} else if preStopErr != nil {
+			if len(packArchives) > 0 || len(packPaths) > 0 {
+				return fmt.Errorf("drive9 umount: read mount state for pack: %w", preStopErr)
+			}
+		} else {
+			packState, packStateOK = preStopState, true
+		}
+	}
+
+	// Drain BEFORE stopping the writer. A mount that is detached with pending
+	// writes loses them silently: the unmount itself succeeds, and the only
+	// later evidence is a recovery directory nobody looks at. Ask the live
+	// mount to quiesce first (same contract as `drive9 mount drain`), then
+	// stop it. --require-drain turns "could not drain" into "did not unmount".
+	if *drainBeforeStop && deps.goos != "windows" {
+		if derr := drainMountBeforeUnmount(deps, mountPoint, preStopState, preStopErr, *drainTimeout); derr != nil {
+			if *requireDrain {
+				return fmt.Errorf("drive9 umount: %w; refusing to unmount (--require-drain)", derr)
+			}
+			if deps.printErrf != nil {
+				deps.printErrf("drive9 umount: warning: %v; continuing (pass --require-drain to abort instead)\n", derr)
 			}
 		}
 	}
@@ -2145,25 +2218,28 @@ func runUmount(args []string, deps umountDeps) error {
 		}
 		stopPID := 0
 		var stopCreation uint64
-		if deps.readProcessState != nil {
-			if st, _, rerr := deps.readProcessState(stateMountPoint); rerr == nil {
-				if st.SupervisorPID > 0 {
-					stopPID = st.SupervisorPID
-					stopCreation = st.SupervisorCreationTime
-					if stopCreation == 0 {
-						stopCreation = st.CreationTime
-					}
-				} else if st.Role == mountstate.RoleSupervisor {
-					stopPID = st.PID
+		if preStopErr == nil {
+			// Same record the drain used: a second read here could observe a
+			// successor generation that the stop decision must not touch.
+			st := preStopState
+			if st.SupervisorPID > 0 {
+				stopPID = st.SupervisorPID
+				stopCreation = st.SupervisorCreationTime
+				if stopCreation == 0 {
 					stopCreation = st.CreationTime
 				}
-				if st.WorkerPID > 0 {
-					workerPID = st.WorkerPID
-				} else if st.Role != mountstate.RoleSupervisor && st.PID > 0 {
-					// Unsupervised / orphan worker recorded as main PID.
-					workerPID = st.PID
-					workerCreation = st.CreationTime
-				}
+			} else if st.Role == mountstate.RoleSupervisor {
+				stopPID = st.PID
+				stopCreation = st.CreationTime
+			}
+			if st.WorkerPID > 0 {
+				// The worker's creation time comes from the supervisor record
+				// below; ProcessState carries only the pid.
+				workerPID = st.WorkerPID
+			} else if st.Role != mountstate.RoleSupervisor && st.PID > 0 {
+				// Unsupervised / orphan worker recorded as main PID.
+				workerPID = st.PID
+				workerCreation = st.CreationTime
 			}
 		}
 		if sst, _, rerr := mountstate.ReadSupervisorState(stateMountPoint); rerr == nil {
@@ -2431,6 +2507,61 @@ func unmountWorkerExitError(rec mountstate.ExitReason, pid int, creation uint64,
 		return nil
 	}
 	return fmt.Errorf("drive9 umount: worker pid %d exited with code %d (%s): %s; check mount logs and preserved recovery state", pid, rec.Code, rec.Reason, rec.Detail)
+}
+
+// drainMountBeforeUnmount quiesces a live fuse mount over its control socket.
+// It returns an error when the mount cannot be reached or the drain reports
+// pending work left behind; a mountpoint with no process state (already gone)
+// and a Windows/WebDAV mount are not errors.
+func drainMountBeforeUnmount(deps umountDeps, mountPoint string, state mountstate.ProcessState, readErr error, timeout time.Duration) error {
+	if deps.requestDrain == nil {
+		return nil
+	}
+	if readErr != nil {
+		if errors.Is(readErr, os.ErrNotExist) {
+			// No mount process: nothing holds writes.
+			return nil
+		}
+		return fmt.Errorf("read mount state to drain %s: %w", mountPoint, readErr)
+	}
+	if kind := strings.TrimSpace(string(state.MountKind)); kind != "" && kind != mountstate.MountKindFUSE {
+		// Only the FUSE worker exposes the drain contract.
+		return nil
+	}
+	socket := strings.TrimSpace(state.ControlSocket)
+	if socket == "" {
+		return fmt.Errorf("mount %s exposes no control socket, so pending writes cannot be verified", mountPoint)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout+5*time.Second)
+	defer cancel()
+	resp, derr := deps.requestDrain(ctx, socket, timeout)
+	if derr != nil {
+		return fmt.Errorf("drain %s: %w", mountPoint, derr)
+	}
+	if resp == nil {
+		return nil
+	}
+	if !resp.OK {
+		p := resp.Pending
+		detail := resp.ErrorKind
+		switch {
+		case detail != "" && resp.Error != "":
+			detail += ": " + resp.Error
+		case detail == "":
+			detail = resp.Error
+		}
+		if detail == "" {
+			detail = "drain did not complete"
+		}
+		return fmt.Errorf("drain %s failed: %s (open_handles=%d dirty_handles=%d commit_queue=%d commit_bytes=%d uploader_queued=%d uploader_in_flight=%d)",
+			mountPoint, detail, p.OpenHandles, p.DirtyHandles, p.CommitQueuePending, p.CommitQueueBytes, p.UploaderQueued, p.UploaderInFlight)
+	}
+	// A slow drain means the unmount waited for real work: say so, with the
+	// phases that earned the time. A fast drain stays quiet.
+	if deps.printErrf != nil && resp.DurationMS >= 1000 {
+		deps.printErrf("drive9 umount: drained %s in %dms\n", mountPoint, resp.DurationMS)
+	}
+	return nil
 }
 
 func readUnmountProcessState(deps umountDeps, mountPoint string) (mountstate.ProcessState, string, bool, error) {

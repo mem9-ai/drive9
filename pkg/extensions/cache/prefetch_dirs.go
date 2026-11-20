@@ -455,9 +455,8 @@ func (p *dirPrefetcher) loadSiblingDirectory(load func(ctx context.Context, op *
 			Mode: e.Attr.Mode, HasMode: true, Rev: e.Attr.Rev, Mtime: e.Attr.Mtime, Nlink: e.Attr.Nlink,
 			// The sibling listing feeds the namespace cache that LOOKUP
 			// stats resolve from: dropping the identity fields degraded a
-			// cached extent row (ExtentIno) and its owner.
+			// cached row and its owner.
 			ResourceID: e.Attr.ResourceID,
-			ExtentIno:  e.Attr.ExtentIno,
 			Uid:        e.Attr.Uid,
 			Gid:        e.Attr.Gid,
 			HasUID:     e.Attr.HasOwner,

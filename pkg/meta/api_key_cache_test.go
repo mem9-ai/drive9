@@ -318,7 +318,9 @@ func TestResolveByAPIKeyHashDBCredentialUpdateEvictsCache(t *testing.T) {
 	if _, err := s.ResolveByAPIKeyHash(ctx, "cache-hash9"); err != nil {
 		t.Fatal(err)
 	}
-	updated, err := s.UpdateTenantDBCredentialIf(ctx, "cache-t9", "root", "app_user", []byte("new-cipher"))
+	updated, err := s.UpdateTenantDBCredentialIf(ctx, "cache-t9", TenantDBCredentialUpdate{
+		FromDBUser: "root", DBUser: "app_user", PasswordCipher: []byte("new-cipher"),
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

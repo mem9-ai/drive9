@@ -76,6 +76,9 @@ func (w *Writeback) truncateCleanMainToZero(ctx context.Context, op *fs.Op) (fs.
 		}
 	}
 	for _, h := range locked {
+		if h.buf != nil {
+			h.buf.Reset()
+		}
 		h.buf, h.stream, h.pendingImage = nil, nil, nil
 		h.baseLoaded, h.trunc, h.visTrunc = false, false, false
 		h.baseSize, h.baseRev = 0, rev
