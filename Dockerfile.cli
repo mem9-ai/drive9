@@ -1,0 +1,9 @@
+FROM public.ecr.aws/docker/library/alpine:3.19
+RUN apk add --no-cache ca-certificates
+
+LABEL org.opencontainers.image.source="https://github.com/mem9-ai/drive9"
+LABEL org.opencontainers.image.description="drive9 CLI container image"
+
+COPY ./bin/drive9 /drive9
+
+ENTRYPOINT ["/drive9"]
