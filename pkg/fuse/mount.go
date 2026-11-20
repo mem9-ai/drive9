@@ -807,26 +807,13 @@ func mountWithConfig(cfg MountConfig) (resultErr error) {
 		return fmt.Errorf("fuse: checkpoint %q requires --layer (the layer plane owns the checkpoint view)", cfg.CheckpointRef)
 	}
 
-	var view *mountView
-	var runtime *mountRuntime
-	if cfg.LayerRef == "" {
-		view, err = prepareMountView(startCtx, cfg, cl, actorID)
-		if err != nil {
-			return err
-		}
-		runtime = view.switcher.current
+	view, runtime, err := prepareMountRuntimeOrView(startCtx, cfg, cl, remoteRoot, actorID)
+	if err != nil {
+		return err
+	}
+	if view != nil {
 		defer func() { resultErr = errors.Join(resultErr, view.close(context.Background())) }()
 	} else {
-		if cfg.MountID != "" {
-			return errors.New("fuse: mount-view-id cannot select a legacy layer")
-		}
-		if err := validateRemoteRoot(startCtx, cl, remoteRoot); err != nil {
-			return err
-		}
-		runtime, err = buildMountRuntime(cfg, cl, remoteRoot, actorID)
-		if err != nil {
-			return err
-		}
 		defer func() { resultErr = errors.Join(resultErr, runtime.stop(context.Background())) }()
 	}
 	f, wb := runtime.fs, runtime.writeback
@@ -887,9 +874,10 @@ func mountWithConfig(cfg MountConfig) (resultErr error) {
 		ctrl, cerr = startMountControlServer(cfg.MountPoint, cfg.LayerRef, f)
 	}
 	if cerr != nil {
-		if view != nil {
+		if shouldFailClosedOnControlServerError(view, cerr) {
 			return fmt.Errorf("fuse: mount view control server: %w", cerr)
 		}
+		ctrl = nil
 		fmt.Fprintf(os.Stderr, "drive9: mount control server failed: %v (continuing)\n", cerr)
 	} else {
 		defer ctrl.Close()
@@ -1143,6 +1131,58 @@ func (r *mountRuntime) stop(ctx context.Context) error {
 	return nil
 }
 
+func prepareMountRuntimeOrView(ctx context.Context, cfg MountConfig, cl *client.Client, remoteRoot, actorID string) (*mountView, *mountRuntime, error) {
+	if cfg.LayerRef != "" {
+		if cfg.MountID != "" {
+			return nil, nil, errors.New("fuse: mount-view-id cannot select a legacy layer")
+		}
+		if err := validateRemoteRoot(ctx, cl, remoteRoot); err != nil {
+			return nil, nil, err
+		}
+		runtime, err := buildMountRuntime(cfg, cl, remoteRoot, actorID)
+		return nil, runtime, err
+	}
+	if cfg.MountID != "" {
+		view, err := prepareMountView(ctx, cfg, cl, actorID)
+		if err != nil {
+			return nil, nil, err
+		}
+		return view, view.switcher.current, nil
+	}
+	if cfg.Supervised {
+		if _, scopeErr := mountJournalScope(ctx, cfg, cl); scopeErr != nil {
+			if errors.Is(scopeErr, ErrMountViewUnsupported) {
+				if err := validateRemoteRoot(ctx, cl, remoteRoot); err != nil {
+					return nil, nil, err
+				}
+				runtime, err := buildMountRuntime(cfg, cl, remoteRoot, actorID)
+				return nil, runtime, err
+			}
+			return nil, nil, scopeErr
+		}
+	}
+	view, err := prepareMountView(ctx, cfg, cl, actorID)
+	if err != nil {
+		if !cfg.Supervised && errors.Is(err, ErrMountViewUnsupported) {
+			if err := validateRemoteRoot(ctx, cl, remoteRoot); err != nil {
+				return nil, nil, err
+			}
+			runtime, err := buildMountRuntime(cfg, cl, remoteRoot, actorID)
+			return nil, runtime, err
+		}
+		return nil, nil, err
+	}
+	return view, view.switcher.current, nil
+}
+
+func shouldFailClosedOnControlServerError(view *mountView, cerr error) bool {
+	if cerr == nil || view == nil {
+		return false
+	}
+	rt := view.currentRuntime()
+	return rt != nil && rt.binding.LayerID != ""
+}
+
 func buildMountRuntime(cfg MountConfig, cl *client.Client, remoteRoot, actorID string) (*mountRuntime, error) {
 	return buildMountRuntimeGeneration(cfg, cl, remoteRoot, actorID, mountRuntimeGeneration{})
 }
@@ -1152,6 +1192,10 @@ func buildMountRuntimeGeneration(cfg MountConfig, cl *client.Client, remoteRoot,
 }
 
 func buildMountRuntimeWithCounters(cfg MountConfig, cl *client.Client, remoteRoot, actorID string, generation mountRuntimeGeneration, sharedCounters *perf.Counters) (_ *mountRuntime, err error) {
+	return buildMountRuntimeWithOptions(cfg, cl, remoteRoot, actorID, generation, sharedCounters, nil)
+}
+
+func buildMountRuntimeWithOptions(cfg MountConfig, cl *client.Client, remoteRoot, actorID string, generation mountRuntimeGeneration, sharedCounters *perf.Counters, sharedExtent **extent.Engine) (_ *mountRuntime, err error) {
 	// The existing kernel connection may be writable. A validation runtime
 	// must neither recover write queues nor admit mutations in userspace.
 	validation := cl.ViewBinding().Validation
@@ -1521,40 +1565,50 @@ func buildMountRuntimeWithCounters(cfg MountConfig, cl *client.Client, remoteRoo
 	extentEnabled := wantExt["extent"] && cl.ViewBinding().LayerID == ""
 	var extentPlane *extent.Handler
 	if extentEnabled {
-		engineConf := extent.EngineConfig{
-			Client:     cl,
-			RemoteRoot: remoteRoot,
-			// Cache placement: inside the SAME drive9 cache directory the
-			// classic writeback/read caches live in, as one dedicated
-			// subdirectory of the MOUNT-scoped namespace
-			// (".../<mountHash>/extent"). That namespace deliberately does
-			// NOT fold in the credential: this directory is not only a
-			// disposable read cache — interactive fsync stages the file's
-			// durable barrier here and the next mount replays it. A rotated
-			// credential must find the same barriers, or acknowledged bytes
-			// are stranded in a scope nothing ever scans. (The engine
-			// suppresses JuiceFS's UUID cache namespace: the scope directory
-			// is already per-mount, so another segment would be redundant.)
-			CacheDir:       cacheScopedDir(cacheBase, mountHash, "extent"),
-			ReadOnly:       cfg.ReadOnly,
-			FreeSpaceRatio: float32(cfg.DiskReadCacheFreeRatio),
-			// Keep JuiceFS native Writeback off on mounts: the bridge owns
-			// commit batching, pinned-memory backpressure, and close-to-open
-			// durability directly, avoiding redundant rawstaging disk I/O
-			// and free-space staging-eviction races while keeping CacheDir
-			// active for block read cache and readahead.
-			Writeback: false,
-		}
-		// The extent plane's disk budget IS JuiceFS's chunk cache: the plane
-		// no longer keeps a second copy of staged bytes (its local fsync
-		// barrier is gone), so the operator's number passes through
-		// verbatim — 0 included, which is JuiceFS's memory-only mode (reads
-		// bypass the cache, writeback is disabled by SelfCheck).
-		if cfg.ExtentCacheSize >= 0 {
-			engineConf.CacheSize = uint64(cfg.ExtentCacheSize)
-		}
+		var engine *extent.Engine
+		if sharedExtent != nil && *sharedExtent != nil {
+			engine = *sharedExtent
+			engine.ResetForGeneration(cl)
+		} else {
+			extentCacheHash := mountHash
+			if cfg.LayerRef == "" {
+				extentCacheHash = MountHash(cfg.Server, cfg.MountPoint, cfg.RemoteRoot)
+			}
+			engineConf := extent.EngineConfig{
+				Client:     cl,
+				RemoteRoot: remoteRoot,
+				// Cache placement: inside the SAME drive9 cache directory the
+				// classic writeback/read caches live in, as one dedicated
+				// subdirectory of the MOUNT-scoped namespace
+				// (".../<mountHash>/extent"). Because extent read blocks are
+				// content-addressed by cryptographic SHA-256 (Writeback: false)
+				// and JuiceFS ChunkStore/VFS workers live for the mount's
+				// lifetime, main generations across view switches reuse one
+				// engine and one mount-stable extent cache directory.
+				CacheDir:       cacheScopedDir(cacheBase, extentCacheHash, "extent"),
+				ReadOnly:       cfg.ReadOnly,
+				FreeSpaceRatio: float32(cfg.DiskReadCacheFreeRatio),
+				// Keep JuiceFS native Writeback off on mounts: the bridge owns
+				// commit batching, pinned-memory backpressure, and close-to-open
+				// durability directly, avoiding redundant rawstaging disk I/O
+				// and free-space staging-eviction races while keeping CacheDir
+				// active for block read cache and readahead.
+				Writeback: false,
+			}
+			// The extent plane's disk budget IS JuiceFS's chunk cache: the plane
+			// no longer keeps a second copy of staged bytes (its local fsync
+			// barrier is gone), so the operator's number passes through
+			// verbatim — 0 included, which is JuiceFS's memory-only mode (reads
+			// bypass the cache, writeback is disabled by SelfCheck).
+			if cfg.ExtentCacheSize >= 0 {
+				engineConf.CacheSize = uint64(cfg.ExtentCacheSize)
+			}
 
-		engine := extent.NewEngine(engineConf)
+			engine = extent.NewEngine(engineConf)
+			if sharedExtent != nil {
+				*sharedExtent = engine
+			}
+		}
 		extentPlane = extent.New(extent.Options{
 			Engine: engine,
 			// Hybrid: creation stays on the classic plane (promotion at

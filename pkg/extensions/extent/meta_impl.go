@@ -91,40 +91,189 @@ func (b *Bridge) ShutdownCtx(ctx context.Context) error {
 	return nil
 }
 
+func (b *Bridge) hasUncommittedLocked(ino meta.Ino) bool {
+	if len(b.pending[ino]) > 0 || b.commitErr[ino] != nil {
+		return true
+	}
+	if _, ok := b.truncs[ino]; ok {
+		return true
+	}
+	return b.needsFreshIdentityLocked(ino)
+}
+
+// HasUncommitted reports whether ino still holds uncommitted slices, pending
+// truncates, unresolved commit errors, or an unmaterialized local-only create.
+func (b *Bridge) HasUncommitted(ino meta.Ino) bool {
+	if b == nil {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.hasUncommittedLocked(ino)
+}
+
+// NeedsFreshIdentity reports whether ino is a locally-created descriptor whose
+// remote identity has not been established yet.
+func (b *Bridge) NeedsFreshIdentity(ino meta.Ino) bool {
+	if b == nil {
+		return false
+	}
+	return b.needsFreshIdentity(ino)
+}
+
+// RetainClosedIfUncommitted records a closed handle's path when its final flush
+// left uncommitted state behind so background retry and Drain can complete
+// publication before forgetting the inode.
+func (b *Bridge) RetainClosedIfUncommitted(localPath string, ino meta.Ino) bool {
+	if b == nil {
+		return false
+	}
+	b.mu.Lock()
+	if !b.hasUncommittedLocked(ino) {
+		delete(b.closedRetained, ino)
+		b.mu.Unlock()
+		return false
+	}
+	b.closedRetained[ino] = localPath
+	b.mu.Unlock()
+	b.kickPendingFlush()
+	return true
+}
+
+// ClearClosedRetained drops any closed-handle retention marker when a new open
+// handle claims the inode again.
+func (b *Bridge) ClearClosedRetained(ino meta.Ino) {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	delete(b.closedRetained, ino)
+	b.mu.Unlock()
+}
+
+func (b *Bridge) isClosedRetained(ino meta.Ino) bool {
+	b.mu.Lock()
+	_, ok := b.closedRetained[ino]
+	b.mu.Unlock()
+	return ok
+}
+
+// RetireClosedIno forgets localPath when ino is still marked closed-retained
+// and all uncommitted state has now landed.
+func (b *Bridge) RetireClosedIno(localPath string, ino meta.Ino) bool {
+	b.mu.Lock()
+	retainedPath, ok := b.closedRetained[ino]
+	if !ok || retainedPath != localPath || b.hasUncommittedLocked(ino) {
+		b.mu.Unlock()
+		return false
+	}
+	delete(b.closedRetained, ino)
+	b.mu.Unlock()
+	b.ForgetPath(localPath)
+	b.DropDeletedOpen(localPath)
+	return true
+}
+
+func (b *Bridge) retireClosed(ino meta.Ino) {
+	b.mu.Lock()
+	localPath, ok := b.closedRetained[ino]
+	cb := b.onRetireClosed
+	if !ok || b.hasUncommittedLocked(ino) {
+		b.mu.Unlock()
+		return
+	}
+	b.mu.Unlock()
+	if cb != nil {
+		cb(localPath, ino)
+		return
+	}
+	b.RetireClosedIno(localPath, ino)
+}
+
+func (b *Bridge) collectUncommittedLocked() map[meta.Ino]struct{} {
+	seen := make(map[meta.Ino]struct{})
+	for ino := range b.pending {
+		if b.hasUncommittedLocked(ino) {
+			seen[ino] = struct{}{}
+		}
+	}
+	for ino := range b.commitErr {
+		if b.hasUncommittedLocked(ino) {
+			seen[ino] = struct{}{}
+		}
+	}
+	for ino := range b.truncs {
+		if b.hasUncommittedLocked(ino) {
+			seen[ino] = struct{}{}
+		}
+	}
+	for ino := range b.freshCreate {
+		if b.hasUncommittedLocked(ino) {
+			seen[ino] = struct{}{}
+		}
+	}
+	for ino := range b.closedRetained {
+		if b.hasUncommittedLocked(ino) {
+			seen[ino] = struct{}{}
+		}
+	}
+	return seen
+}
+
 // PendingCommitCount reports how many inodes retain uncommitted extent slices,
-// unresolved commit errors, or unmaterialized local-only creates.
+// pending truncates, unresolved commit errors, or unmaterialized local-only creates.
 func (b *Bridge) PendingCommitCount() int {
 	if b == nil {
 		return 0
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	seen := make(map[meta.Ino]struct{})
-	for ino, list := range b.pending {
-		if len(list) > 0 {
-			seen[ino] = struct{}{}
-		}
-	}
-	for ino, err := range b.commitErr {
-		if err != nil {
-			seen[ino] = struct{}{}
-		}
-	}
-	for ino, fresh := range b.freshCreate {
-		if fresh {
-			seen[ino] = struct{}{}
-		}
-	}
-	return len(seen)
+	return len(b.collectUncommittedLocked())
 }
 
-// Drain attempts to flush all pending or previously failed extent commits and
-// reports an error if any remain unresolved when it finishes.
+// Drain attempts to flush all pending slices, truncates, unmaterialized
+// local-only creates, or previously failed extent commits, and reports an
+// error if any uncommitted state remains when it finishes.
 func (b *Bridge) Drain(ctx context.Context) error {
 	if b == nil {
 		return nil
 	}
 	b.flushAnyPending(ctx)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	b.mu.Lock()
+	candidates := b.collectUncommittedLocked()
+	b.mu.Unlock()
+
+	var firstErr error
+	for ino := range candidates {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if b.isClosedRetained(ino) {
+			if err := b.FlushFileFinal(ctx, ino); err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+			} else {
+				b.retireClosed(ino)
+			}
+			continue
+		}
+		if err := b.FlushFile(ctx, ino); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		if b.needsFreshIdentity(ino) {
+			unlock := b.lockCommit(ino)
+			if b.needsFreshIdentity(ino) {
+				if err := b.MaterializeEmpty(ctx, ino); err != nil && firstErr == nil {
+					firstErr = err
+				}
+			}
+			unlock()
+		}
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -135,10 +284,11 @@ func (b *Bridge) Drain(ctx context.Context) error {
 			return err
 		}
 	}
-	for _, list := range b.pending {
-		if len(list) > 0 {
-			return syscall.EAGAIN
-		}
+	if firstErr != nil {
+		return firstErr
+	}
+	if len(b.collectUncommittedLocked()) > 0 {
+		return syscall.EAGAIN
 	}
 	return nil
 }
@@ -968,26 +1118,50 @@ func (b *Bridge) NewSlice(ctx meta.Context, id *uint64) syscall.Errno {
 	return 0
 }
 
+func (b *Bridge) recordCommitErr(ino meta.Ino, err error) {
+	if err == nil {
+		return
+	}
+	b.mu.Lock()
+	b.commitErr[ino] = err
+	b.mu.Unlock()
+	b.kickPendingFlush()
+}
+
 func (b *Bridge) flushAnyPending(ctx context.Context) {
 	b.mu.Lock()
-	seen := make(map[meta.Ino]struct{}, len(b.pending)+len(b.commitErr))
-	inos := make([]meta.Ino, 0, len(b.pending)+len(b.commitErr))
-	for ino, list := range b.pending {
-		if len(list) > 0 {
-			seen[ino] = struct{}{}
-			inos = append(inos, ino)
-		}
-	}
-	for ino := range b.commitErr {
+	seen := make(map[meta.Ino]struct{}, len(b.pending)+len(b.commitErr)+len(b.truncs)+len(b.closedRetained))
+	inos := make([]meta.Ino, 0, len(b.pending)+len(b.commitErr)+len(b.truncs)+len(b.closedRetained))
+	add := func(ino meta.Ino) {
 		if _, ok := seen[ino]; !ok {
 			seen[ino] = struct{}{}
 			inos = append(inos, ino)
 		}
 	}
+	for ino, list := range b.pending {
+		if len(list) > 0 {
+			add(ino)
+		}
+	}
+	for ino := range b.truncs {
+		add(ino)
+	}
+	for ino := range b.commitErr {
+		add(ino)
+	}
+	for ino := range b.closedRetained {
+		add(ino)
+	}
 	b.mu.Unlock()
 	for _, ino := range inos {
 		if ctx.Err() != nil {
 			return
+		}
+		if b.isClosedRetained(ino) {
+			if err := b.FlushFileFinal(ctx, ino); err == nil {
+				b.retireClosed(ino)
+			}
+			continue
 		}
 		_ = b.FlushFile(ctx, ino)
 	}
@@ -2221,11 +2395,12 @@ func (b *Bridge) peekVerifyBase(ino meta.Ino) (verifyBase, bool) {
 func (b *Bridge) abandonIno(ino meta.Ino) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.releaseDroppedPendingLocked(ino)
+	delete(b.closedRetained, ino)
 	delete(b.freshCreate, ino)
 	delete(b.verifyBase, ino)
 	delete(b.layoutPending, ino)
 	delete(b.layoutPendingID, ino)
-	delete(b.pending, ino)
 	delete(b.truncs, ino)
 	delete(b.truncSeq, ino)
 	delete(b.revs, ino)
@@ -2291,12 +2466,16 @@ func (b *Bridge) waitStagedSlice(ctx context.Context, id uint64, size int64) boo
 	}
 }
 
+func (b *Bridge) needsFreshIdentityLocked(ino meta.Ino) bool {
+	return b.freshCreate[ino] && b.verifyBase[ino].resID == "" && b.layoutPendingID[ino] == ""
+}
+
 // needsFreshIdentity reports whether this inode is a locally-created
 // descriptor whose identity was never established.
 func (b *Bridge) needsFreshIdentity(ino meta.Ino) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.freshCreate[ino] && b.verifyBase[ino].resID == "" && b.layoutPendingID[ino] == ""
+	return b.needsFreshIdentityLocked(ino)
 }
 
 // ModeOf reports the mode recorded for the inode locally.
@@ -2329,8 +2508,31 @@ func (b *Bridge) SetMtimeLocal(ino meta.Ino, mtime time.Time) {
 	b.mu.Unlock()
 }
 
+func (b *Bridge) releaseDroppedPendingLocked(ino meta.Ino) {
+	dropped := b.pending[ino]
+	if len(dropped) == 0 {
+		delete(b.pending, ino)
+		return
+	}
+	delete(b.pending, ino)
+	refs := make(map[string]int, len(dropped))
+	for _, list := range b.pending {
+		for _, w := range list {
+			refs[w.checksum]++
+		}
+	}
+	for _, p := range dropped {
+		b.blocks.unpin(p.checksum)
+		if refs[p.checksum] == 0 {
+			b.blocks.release(p.checksum)
+		}
+	}
+}
+
 // forgetInoLocked drops one inode's cached state; the caller holds b.mu.
 func (b *Bridge) forgetInoLocked(ino meta.Ino) {
+	b.releaseDroppedPendingLocked(ino)
+	delete(b.closedRetained, ino)
 	delete(b.layoutPendingID, ino)
 	delete(b.layoutPending, ino)
 	delete(b.freshCreate, ino)
@@ -2342,7 +2544,6 @@ func (b *Bridge) forgetInoLocked(ino meta.Ino) {
 	delete(b.revs, ino)
 	delete(b.pubSizes, ino)
 	delete(b.revAt, ino)
-	delete(b.pending, ino)
 	delete(b.truncs, ino)
 	delete(b.truncSeq, ino)
 	delete(b.modes, ino)
@@ -2724,18 +2925,39 @@ func (b *Bridge) flushFile(ctx context.Context, ino meta.Ino, finalize bool) err
 	// makes every retry observe the previous commit's result.
 	unlockCommit := b.lockCommit(ino)
 	defer unlockCommit()
-	if err := b.flushPendingLocked(ctx, ino); err != nil {
-		return err
+
+	b.mu.Lock()
+	hasPendingOrTrunc := len(b.pending[ino]) > 0
+	if !hasPendingOrTrunc {
+		_, hasPendingOrTrunc = b.truncs[ino]
 	}
+	b.mu.Unlock()
+
+	if hasPendingOrTrunc {
+		if err := b.flushPendingLocked(ctx, ino); err != nil {
+			b.recordCommitErr(ino, err)
+			return err
+		}
+	}
+
 	b.mu.Lock()
 	size, has := b.sizes[ino]
 	path, mapped := b.paths[ino]
 	mode, hasMode := b.modes[ino]
+	wasFresh := b.freshCreate[ino]
 	b.mu.Unlock()
 	if finalize && has && mapped && size == 0 {
-		if _, err := b.cfg.Client.StatCtx(ctx, path); err != nil && client.IsNotFound(err) {
+		_, statErr := b.cfg.Client.StatCtx(ctx, path)
+		if statErr != nil && !client.IsNotFound(statErr) {
+			if b.needsFreshIdentity(ino) || b.HasUncommitted(ino) {
+				b.recordCommitErr(ino, statErr)
+			}
+			return statErr
+		}
+		if statErr != nil && client.IsNotFound(statErr) {
 			rev, createdID, nativeExtent, err := b.cfg.Client.CreateExtentFileCreatedCtx(ctx, path)
 			if err != nil {
+				b.recordCommitErr(ino, err)
 				return err
 			}
 			if nativeExtent {
@@ -2744,28 +2966,48 @@ func (b *Bridge) flushFile(ctx context.Context, ino meta.Ino, finalize bool) err
 					b.layoutPendingID[ino] = createdID
 				}
 				delete(b.freshCreate, ino)
+				delete(b.commitErr, ino)
 				delete(b.modes, ino)
 				delete(b.mtimes, ino)
 				b.mu.Unlock()
 				b.recordLandedRevisionWithSize(ino, rev, 0)
 			} else {
 				b.markEmptyPlaceholder(path, rev, createdID)
+				b.mu.Lock()
+				if createdID != "" {
+					b.verifyBase[ino] = verifyBase{rev: rev, resID: createdID}
+				}
+				delete(b.freshCreate, ino)
+				delete(b.commitErr, ino)
+				delete(b.modes, ino)
+				delete(b.mtimes, ino)
+				b.mu.Unlock()
+				b.recordLandedRevisionWithSize(ino, rev, 0)
 			}
 			if hasMode && mode != 0 && mode != 0o644 {
 				_ = b.cfg.Client.ChmodCtx(ctx, path, mode)
 			}
+		} else if wasFresh {
+			b.mu.Lock()
+			delete(b.freshCreate, ino)
+			delete(b.commitErr, ino)
+			b.mu.Unlock()
 		}
 	}
 	if !has {
-		return nil
+		b.mu.Lock()
+		prevErr := b.commitErr[ino]
+		b.mu.Unlock()
+		return prevErr
 	}
 	if err := b.flushTruncateOnly(ctx, ino, size); err != nil {
+		b.recordCommitErr(ino, err)
 		return err
 	}
-	// Everything landed. (A remembered landing failure was cleared by the
-	// successful commit itself — Bridge.Write's sticky memory exists only
-	// until the next successful landing, which just happened.)
-	return nil
+	b.mu.Lock()
+	prevErr := b.commitErr[ino]
+	b.mu.Unlock()
+	return prevErr
 }
 
 // isFreshCreate reports whether this bridge created the inode locally (so its

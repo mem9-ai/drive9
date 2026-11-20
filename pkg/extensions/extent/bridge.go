@@ -97,6 +97,11 @@ type Bridge struct {
 	// returns success to keep the community writer clean (its sticky
 	// fileWriter.err otherwise stranded the handle after recovery).
 	commitErr map[meta.Ino]error
+	// closedRetained records closed handles whose final publication failed so
+	// background retry and Drain keep retrying and only forget the inode once
+	// all uncommitted state has landed.
+	closedRetained map[meta.Ino]string
+	onRetireClosed func(localPath string, ino meta.Ino)
 
 	layoutPending map[meta.Ino]bool
 	// freshCreate marks inodes this bridge CREATED locally: their first
@@ -232,6 +237,7 @@ func NewBridge(cfg Config) *Bridge {
 		layoutPendingID:   make(map[meta.Ino]string),
 		freshCreate:       make(map[meta.Ino]bool),
 		commitErr:         make(map[meta.Ino]error),
+		closedRetained:    make(map[meta.Ino]string),
 		verifyBase:        make(map[meta.Ino]verifyBase),
 		emptyPlaceholders: make(map[string]verifyBase),
 	}
@@ -249,6 +255,59 @@ func NewBridge(cfg Config) *Bridge {
 		return p, ok
 	}
 	return br
+}
+
+// ResetForGeneration stops any background retry loop and resets all mutable
+// bridge state before binding the shared engine to a new main generation.
+func (b *Bridge) ResetForGeneration(cl *client.Client) {
+	if b == nil {
+		return
+	}
+	_ = b.ShutdownCtx(context.Background())
+
+	b.commitMu.Lock()
+	b.commitLocks = make(map[meta.Ino]*sync.Mutex)
+	b.commitMu.Unlock()
+
+	root := strings.TrimSuffix(b.cfg.RemoteRoot, "/")
+	if root == "" {
+		root = "/"
+	}
+
+	b.mu.Lock()
+	b.cfg.Client = cl
+	b.stagedSlices = make(map[uint64]*stagedSlice)
+	b.paths = map[meta.Ino]string{rootIno: root}
+	b.sizes = make(map[meta.Ino]int64)
+	b.revs = make(map[meta.Ino]int64)
+	b.pubSizes = make(map[meta.Ino]int64)
+	b.revAt = make(map[meta.Ino]time.Time)
+	b.buffered = make(map[meta.Ino]int64)
+	b.pending = make(map[meta.Ino][]pendingWrite)
+	b.truncs = make(map[meta.Ino]int64)
+	b.truncSeq = make(map[meta.Ino]uint64)
+	b.modes = make(map[meta.Ino]uint32)
+	b.mtimes = make(map[meta.Ino]time.Time)
+	b.sentinels = make(map[string]meta.Ino)
+	b.nextHeldIno = heldInoBase
+	b.moved = make(map[meta.Ino]string)
+	b.replacements = make(map[string]meta.Ino)
+	b.locks = newLockTable()
+	b.layoutPending = make(map[meta.Ino]bool)
+	b.layoutPendingID = make(map[meta.Ino]string)
+	b.freshCreate = make(map[meta.Ino]bool)
+	b.commitErr = make(map[meta.Ino]error)
+	b.closedRetained = make(map[meta.Ino]string)
+	b.onRetireClosed = nil
+	b.verifyBase = make(map[meta.Ino]verifyBase)
+	b.emptyPlaceholders = make(map[string]verifyBase)
+	b.emptyPlaceholderOrd = nil
+	b.retryRunning = false
+	b.retryStop = make(chan struct{})
+	b.retryOnce = sync.Once{}
+	b.mu.Unlock()
+
+	b.blocks.resetForGeneration()
 }
 
 // verifyBase is an identity-verified recovery's publication constraint.
@@ -399,6 +458,25 @@ func newBlockRegistry() *blockRegistry {
 		sliceUsed:     make(map[uint64]int64),
 		budgetCh:      make(chan struct{}),
 	}
+}
+
+func (r *blockRegistry) resetForGeneration() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.m = make(map[uint64]*blockEntry)
+	r.pins = make(map[string]int)
+	r.pinSizes = make(map[string]int64)
+	r.pinnedBytes = 0
+	r.stagedMemBytes = 0
+	r.waitingSlices = make(map[uint64]int)
+	r.sliceTarget = make(map[uint64]int64)
+	r.sliceUsed = make(map[uint64]int64)
+	r.stagedDiskBytes = 0
+	close(r.budgetCh)
+	r.budgetCh = make(chan struct{})
+	r.mu.Unlock()
 }
 
 // ctxOf adapts a meta.Context to a context.Context (meta.Context embeds

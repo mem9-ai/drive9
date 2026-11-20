@@ -56,6 +56,20 @@ type Handler struct {
 // New builds the engine-plane handler.
 func New(opts Options) *Handler {
 	h := &Handler{opts: opts, handles: make(map[string][]*engineHandle)}
+	if opts.Engine != nil && opts.Engine.Bridge != nil {
+		opts.Engine.Bridge.onRetireClosed = func(localPath string, ino meta.Ino) {
+			unlock := h.lockPaths(localPath)
+			defer unlock()
+			h.mu.Lock()
+			open := len(h.handles[localPath]) > 0
+			h.mu.Unlock()
+			if open {
+				opts.Engine.Bridge.ClearClosedRetained(ino)
+				return
+			}
+			opts.Engine.Bridge.RetireClosedIno(localPath, ino)
+		}
+	}
 	if opts.Events != nil {
 		// A rename rides EventWrite for the OLD name with RenamedTo set
 		// (pkg/fuse mutatedRename), followed by a plain EventDelete for
@@ -212,6 +226,9 @@ func (h *Handler) release(e *engineHandle) {
 	// closing is not the inode going away, and the sweep would release a live
 	// descriptor's locks — letting a second writer in while the first still
 	// believes it holds the file.
+	if h.opts.Engine.Bridge.RetainClosedIfUncommitted(e.path, e.ino) {
+		return
+	}
 	h.opts.Engine.Bridge.ForgetPath(e.path)
 	h.opts.Engine.Bridge.DropDeletedOpen(e.path)
 }
@@ -1176,6 +1193,9 @@ func (h *Handler) tryTruncate(ctx context.Context, op *fs.Op, next fs.Next) (fs.
 }
 
 func (h *Handler) register(path string, ino uint64, fh uint64, c fs.Caller) *engineHandle {
+	if h.opts.Engine != nil && h.opts.Engine.Bridge != nil {
+		h.opts.Engine.Bridge.ClearClosedRetained(meta.Ino(ino))
+	}
 	eh := &engineHandle{plane: h, path: path, ino: meta.Ino(ino), fh: fh, caller: c, vctx: vfsCtx(c)}
 	h.mu.Lock()
 	h.handles[path] = append(h.handles[path], eh)
@@ -1362,6 +1382,11 @@ func (h *Handler) Drain(ctx context.Context) error {
 		}
 		if err := e.Flush(ctx); err != nil && firstErr == nil {
 			firstErr = err
+		}
+		if h.opts.Engine.Bridge != nil && h.opts.Engine.Bridge.NeedsFreshIdentity(e.ino) {
+			if err := e.Sync(ctx); err != nil && firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
 	if h.opts.Engine.Bridge != nil {

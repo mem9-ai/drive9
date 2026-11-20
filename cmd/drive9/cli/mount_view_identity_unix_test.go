@@ -101,6 +101,60 @@ func TestSupervisedMountViewBypassAndFailure(t *testing.T) {
 	}
 }
 
+func TestSupervisedMountViewNonLayerCredentialsWithoutOwnerStatusDegradeCleanly(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	t.Setenv("XDG_RUNTIME_DIR", "")
+	for _, tc := range []struct {
+		name     string
+		status   int
+		body     string
+		apiKey   string
+		token    string
+		wantFail bool
+	}{
+		{name: "fs_scoped_403", status: http.StatusForbidden, body: `{"error":"status is owner-only"}`, apiKey: "scoped-key"},
+		{name: "capability_token_401", status: http.StatusUnauthorized, body: `{"error":"unauthorized"}`, token: "cap-jwt"},
+		{name: "standalone_404", status: http.StatusNotFound, body: "not found", apiKey: "owner-key"},
+		{name: "standalone_501", status: http.StatusNotImplemented, body: "not implemented", apiKey: "owner-key"},
+		{name: "missing_tenant_200", status: http.StatusOK, body: `{"status":"active"}`, apiKey: "owner-key"},
+		{name: "invalid_api_key_401", status: http.StatusUnauthorized, body: `{"error":"invalid api key"}`, apiKey: "bad-key", wantFail: true},
+		{name: "transient_503", status: http.StatusServiceUnavailable, body: `{"error":"unavailable"}`, apiKey: "owner-key", wantFail: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/v1/status" {
+					t.Errorf("unexpected path: %s", r.URL.Path)
+				}
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+			origArgs := []string{"--foreground", ":/", "/mnt"}
+			req := mountSuperviseStartRequest{
+				Server:       srv.URL,
+				APIKey:       tc.apiKey,
+				Token:        tc.token,
+				RemoteRoot:   "/",
+				MountPoint:   t.TempDir(),
+				OriginalArgs: append([]string(nil), origArgs...),
+			}
+			got, err := prepareSupervisedMountView(req)
+			if tc.wantFail {
+				if err == nil || got.MountID != "" {
+					t.Fatalf("expected hard failure, got=%+v err=%v", got, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error for %s: %v", tc.name, err)
+			}
+			if got.MountID != "" || !reflect.DeepEqual(got.OriginalArgs, origArgs) {
+				t.Fatalf("unexpected mount-view-id added on degraded main mount: %+v", got)
+			}
+		})
+	}
+}
+
 func TestMountViewIdentityFlagIsExplicitAndUnique(t *testing.T) {
 	for _, args := range [][]string{{"--mount-view-id="}, {"--mount-view-id=../bad"}, {"--mount-view-id=a", "--mount-view-id=b"}, {"--mount-view-id=a", "--mount-view-id=a"}} {
 		fs := flag.NewFlagSet("test", flag.ContinueOnError)

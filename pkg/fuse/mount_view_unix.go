@@ -12,6 +12,7 @@ import (
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 
 	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/extensions/extent"
 	"github.com/mem9-ai/drive9/pkg/mountcontrol"
 	"github.com/mem9-ai/drive9/pkg/mountpath"
 	"github.com/mem9-ai/drive9/pkg/mountstate"
@@ -22,9 +23,10 @@ import (
 // stays false until the kernel mount is serving. A crashed pending decision is
 // reported, never automatically completed or replaced with main.
 type mountView struct {
-	switcher *mountViewSwitch
-	ready    atomic.Bool
-	server   atomic.Pointer[gofuse.Server]
+	switcher     *mountViewSwitch
+	ready        atomic.Bool
+	server       atomic.Pointer[gofuse.Server]
+	sharedExtent *extent.Engine
 }
 
 func prepareMountView(ctx context.Context, cfg MountConfig, cl *client.Client, actorID string) (_ *mountView, err error) {
@@ -71,13 +73,14 @@ func prepareMountView(ctx context.Context, cfg MountConfig, cl *client.Client, a
 	if err := validateRemoteRoot(ctx, bound, root); err != nil {
 		return nil, err
 	}
-	runtime, err := buildMountRuntimeGeneration(cfg, bound, root, actorID, mountRuntimeGeneration{MountID: snapshot.MountID, Generation: snapshot.Generation})
+	var sharedExtent *extent.Engine
+	runtime, err := buildMountRuntimeWithOptions(cfg, bound, root, actorID, mountRuntimeGeneration{MountID: snapshot.MountID, Generation: snapshot.Generation}, nil, &sharedExtent)
 	if err != nil {
 		return nil, err
 	}
 	adapter := &viewRequestFS{inner: runtime.fs}
 	adapter.selected.Store(&viewRequestTarget{fs: runtime.fs, generation: snapshot.Generation})
-	v := &mountView{switcher: &mountViewSwitch{journal: journal, current: runtime, adapter: adapter}}
+	v := &mountView{switcher: &mountViewSwitch{journal: journal, current: runtime, adapter: adapter}, sharedExtent: sharedExtent}
 	v.switcher.notifier = v
 	v.switcher.fence = func(ctx context.Context) error { return fenceViewRootUpdates(ctx, v) }
 	v.switcher.validate = func(ctx context.Context, binding viewprotocol.Binding) error {
@@ -102,7 +105,7 @@ func prepareMountView(ctx context.Context, cfg MountConfig, cl *client.Client, a
 		if err != nil {
 			return nil, err
 		}
-		next, err := buildMountRuntimeWithCounters(cfg, target, root, actorID, generation, runtime.fs.perf)
+		next, err := buildMountRuntimeWithOptions(cfg, target, root, actorID, generation, runtime.fs.perf, &v.sharedExtent)
 		if err != nil {
 			return nil, err
 		}

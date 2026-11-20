@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 
@@ -15,6 +16,14 @@ import (
 	"github.com/mem9-ai/drive9/pkg/mountstate"
 	"github.com/mem9-ai/drive9/pkg/viewprotocol"
 )
+
+// ErrMountViewUnsupported reports that the server or credential cannot
+// establish a tenant-scoped mount-view switch journal (for example, an
+// fs_scoped API key receiving 403 on owner-only /v1/status, a delegated
+// capability token receiving 401 on /v1/status, or a standalone/legacy server
+// without /v1/status tenant_id). Ordinary non-layer main mounts fall back to an
+// unswitched main runtime; explicit mount-view-id recovery never falls back.
+var ErrMountViewUnsupported = errors.New("fuse: mount view switching unsupported")
 
 // CreateMountViewJournal establishes a NEW mount incarnation before a
 // supervisor starts its first worker. Every worker receives the returned ID
@@ -70,9 +79,29 @@ func mountJournalScope(ctx context.Context, cfg MountConfig, cl *client.Client) 
 	}
 	tenant, err := cl.GetMigrationTenantID(ctx)
 	if err != nil {
+		if isMountViewUnsupportedStatusErr(cfg, err) {
+			return "", fmt.Errorf("%w: %w", ErrMountViewUnsupported, err)
+		}
 		return "", err
 	}
 	return mountstate.SwitchScope(cfg.Server, tenant, cfg.RemoteRoot, point)
+}
+
+func isMountViewUnsupportedStatusErr(cfg MountConfig, err error) bool {
+	if errors.Is(err, client.ErrMigrationUnsupported) || client.IsForbidden(err) || client.IsNotFound(err) {
+		return true
+	}
+	if cfg.Token != "" && client.IsUnauthorized(err) {
+		return true
+	}
+	var statusErr *client.StatusError
+	if errors.As(err, &statusErr) {
+		switch statusErr.StatusCode {
+		case http.StatusMethodNotAllowed, http.StatusNotImplemented:
+			return true
+		}
+	}
+	return false
 }
 
 func createMountViewJournal(ctx context.Context, cfg MountConfig, cl *client.Client) (*mountstate.SwitchJournal, error) {
