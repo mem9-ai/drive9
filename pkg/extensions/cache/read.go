@@ -232,15 +232,61 @@ func (rc *ReadCache) PutPendingOwned(path string, data []byte) {
 	rc.putUncapped(path, data, 0, false)
 }
 
-// Rename moves a cached image to the new path (a rename does not change
-// content or revision); the old name's entry dies with the name.
+// Rename moves cached images along a rename: the objects under oldPath (and
+// its subtree, when it is a directory) keep their bytes and revisions, so
+// their images follow the name. The name they move TO was replaced by the
+// rename, so whatever image that name — and its subtree — held describes a
+// destroyed object and is dropped.
+//
+// The destination is dropped UNCONDITIONALLY, including when the source had
+// no cached image at all: the rename still replaced the destination, and the
+// replacement's revision can equal the revision the destination already had
+// (a per-file revision counter restarts at 1), so a surviving image would
+// look current and be served silently.
 func (rc *ReadCache) Rename(oldPath, newPath string) {
+	if rc == nil || oldPath == "" || oldPath == newPath {
+		return
+	}
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
-	if entry, ok := rc.items[oldPath]; ok {
-		delete(rc.items, oldPath)
-		entry.path = newPath
-		rc.items[newPath] = entry
+
+	oldPrefix := strings.TrimSuffix(oldPath, "/") + "/"
+	newPrefix := strings.TrimSuffix(newPath, "/") + "/"
+
+	// Drop the replaced destination first: the moved source entries take
+	// exactly those keys.
+	var replaced []*cacheEntry
+	for p, entry := range rc.items {
+		if p == newPath || strings.HasPrefix(p, newPrefix) {
+			replaced = append(replaced, entry)
+		}
+	}
+	for _, entry := range replaced {
+		rc.evict(entry)
+	}
+
+	// Then move the source's images. Evicting a replaced entry releases its
+	// bytes and its LRU node, so a moved entry can never be shadowed by a
+	// stale list element sharing the new name. The moves are collected before
+	// they are applied: inserting into the map being ranged over has no
+	// defined visit order.
+	type move struct {
+		from, to string
+		entry    *cacheEntry
+	}
+	var moves []move
+	for p, entry := range rc.items {
+		switch {
+		case p == oldPath:
+			moves = append(moves, move{from: oldPath, to: newPath, entry: entry})
+		case strings.HasPrefix(p, oldPrefix):
+			moves = append(moves, move{from: p, to: newPath + strings.TrimPrefix(p, oldPath), entry: entry})
+		}
+	}
+	for _, m := range moves {
+		delete(rc.items, m.from)
+		m.entry.path = m.to
+		rc.items[m.to] = m.entry
 	}
 }
 
