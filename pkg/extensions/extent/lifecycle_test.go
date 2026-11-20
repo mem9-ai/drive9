@@ -5,9 +5,11 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/mem9-ai/drive9/pkg/client"
@@ -278,6 +280,190 @@ func TestHandlerLifecycleRealPathTruncateAndLegacyEmptyCloseNoFalsePositive(t *t
 	require.Empty(t, reason)
 	require.Zero(t, count)
 	require.NoError(t, chain.Drain(context.Background()))
+}
+
+func TestHandlerLifecycleTruncateZeroNotFoundAndPlaceholderClearTransientCommitErr(t *testing.T) {
+	f := newFakeV2(t)
+	f.setDir("/d", true)
+	f.seedExtent(t, "/d/gone.bin", "PAYLOAD")
+	h := newTestHandler(t, f, 0)
+	chain, err := fs.NewChain(h, stubTerminal{})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = chain.Stop(context.Background()) })
+	require.NoError(t, chain.Start(context.Background()))
+
+	// 1) Truncate-to-zero hits 503 (setting commitErr), then remote object is 404:
+	// Drain must clear both truncs and commitErr rather than spinning forever.
+	res, err := chain.Dispatch(context.Background(), &fs.Op{
+		Kind:   fs.OpCreate,
+		Path:   "/d/gone.bin",
+		Flags:  syscall.O_RDWR,
+		Caller: fs.Caller{Pid: 1},
+	})
+	require.NoError(t, err)
+	_, err = chain.Dispatch(context.Background(), &fs.Op{
+		Kind:    fs.OpSetAttr,
+		Path:    "/d/gone.bin",
+		HasSize: true,
+		Size:    0,
+		Caller:  fs.Caller{Pid: 1},
+	})
+	require.NoError(t, err)
+
+	f.failStatus.Store(http.StatusServiceUnavailable)
+	require.Error(t, chain.Drain(context.Background()))
+	reason, count := chainReexecRefusal(chain)
+	require.Equal(t, "extent_pending", reason)
+	require.Equal(t, 1, count)
+
+	f.mu.Lock()
+	delete(f.extent, "/d/gone.bin")
+	delete(f.ids, "/d/gone.bin")
+	f.mu.Unlock()
+	f.failStatus.Store(0)
+
+	require.NoError(t, chain.Drain(context.Background()))
+	reason, count = chainReexecRefusal(chain)
+	require.Empty(t, reason)
+	require.Zero(t, count)
+	require.NoError(t, res.Handle.Release(context.Background()))
+
+	// 2) Materialized classic empty placeholder truncated to 0 hits 503 (setting
+	// commitErr), then recovers: Drain must clear both truncs and commitErr.
+	phRes, err := chain.Dispatch(context.Background(), &fs.Op{
+		Kind:    fs.OpCreate,
+		Path:    "/d/placeholder.bin",
+		Flags:   syscall.O_RDWR | syscall.O_CREAT,
+		Mode:    0o644,
+		HasMode: true,
+		Caller:  fs.Caller{Pid: 1},
+	})
+	require.NoError(t, err)
+	require.NoError(t, phRes.Handle.Sync(context.Background()))
+	_, err = chain.Dispatch(context.Background(), &fs.Op{
+		Kind:    fs.OpSetAttr,
+		Path:    "/d/placeholder.bin",
+		HasSize: true,
+		Size:    0,
+		Caller:  fs.Caller{Pid: 1},
+	})
+	require.NoError(t, err)
+
+	f.failStatus.Store(http.StatusServiceUnavailable)
+	require.Error(t, chain.Drain(context.Background()))
+	reason, count = chainReexecRefusal(chain)
+	require.Equal(t, "extent_pending", reason)
+	require.Equal(t, 1, count)
+
+	f.failStatus.Store(0)
+	require.NoError(t, chain.Drain(context.Background()))
+	reason, count = chainReexecRefusal(chain)
+	require.Empty(t, reason)
+	require.Zero(t, count)
+	require.NoError(t, phRes.Handle.Release(context.Background()))
+}
+
+func TestHandlerLifecycleMaterializeEmptyClearsPriorTransientCommitErr(t *testing.T) {
+	f := newFakeV2(t)
+	f.setDir("/d", true)
+	h := newTestHandler(t, f, 0)
+	chain, err := fs.NewChain(h, stubTerminal{})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = chain.Stop(context.Background()) })
+	require.NoError(t, chain.Start(context.Background()))
+
+	res, err := chain.Dispatch(context.Background(), &fs.Op{
+		Kind:    fs.OpCreate,
+		Path:    "/d/mat-err.bin",
+		Flags:   syscall.O_RDWR | syscall.O_CREAT,
+		Mode:    0o644,
+		HasMode: true,
+		Caller:  fs.Caller{Pid: 1},
+	})
+	require.NoError(t, err)
+	eh := res.Handle.(*engineHandle)
+
+	h.opts.Engine.Bridge.recordCommitErr(eh.ino, errors.New("prior transient 503"))
+	f.failStatus.Store(http.StatusServiceUnavailable)
+	require.Error(t, chain.Drain(context.Background()))
+
+	f.failStatus.Store(0)
+	require.NoError(t, chain.Drain(context.Background()))
+	reason, count := chainReexecRefusal(chain)
+	require.Empty(t, reason)
+	require.Zero(t, count)
+
+	// Re-arming a transient commitErr on the already-attributed empty file also
+	// clears cleanly when MaterializeEmpty confirms our remote occupant.
+	h.opts.Engine.Bridge.recordCommitErr(eh.ino, errors.New("second transient 503"))
+	require.NoError(t, h.opts.Engine.Bridge.MaterializeEmpty(context.Background(), eh.ino))
+	reason, count = chainReexecRefusal(chain)
+	require.Empty(t, reason)
+	require.Zero(t, count)
+	require.NoError(t, eh.Release(context.Background()))
+}
+
+func TestEngineResetForGenerationConcurrentPrefetchGetRaceFree(t *testing.T) {
+	f1 := newFakeV2(t)
+	f2 := newFakeV2(t)
+	f1.setDir("/d", true)
+	f2.setDir("/d", true)
+
+	blk0 := strings.Repeat("A", int(client.ExtentBlockSize))
+	sum0 := sha256Hex([]byte(blk0))
+	f1.seedExtent(t, "/d/multi.bin", blk0)
+	f2.seedExtent(t, "/d/multi.bin", "GEN2-REPLACEMENT")
+
+	prefetchEntered := make(chan struct{})
+	var enteredOnce atomic.Bool
+	fullBlockRange := "bytes=0-4194303"
+	hook := func(key, rng string, ctx context.Context) {
+		// fullBlockRange is CachedStore's detached store.fetcher full-block
+		// prefetch triggered after loadRange(off=64, len=16).
+		if key == sum0 && rng == fullBlockRange && enteredOnce.CompareAndSwap(false, true) {
+			close(prefetchEntered)
+			select {
+			case <-ctx.Done():
+			case <-time.After(2 * time.Second):
+			}
+		}
+	}
+	f1.onGetObj.Store(&hook)
+
+	eng := NewEngine(EngineConfig{
+		Client:     client.New(f1.URL, ""),
+		RemoteRoot: "/",
+		CacheDir:   "memory",
+		CacheSize:  32 << 20, // Enables CachedStore Prefetch: 1 background fetcher.
+	})
+	h1 := New(Options{Engine: eng, Threshold: 0, Events: fs.NewEventBus()})
+	res, err, _ := dispatchCreate(context.Background(), h1, "/d/multi.bin", syscall.O_RDONLY)
+	require.NoError(t, err)
+	buf := make([]byte, 16)
+	// boff=64 > 0 && len<=1MiB hits CachedStore.loadRange and enqueues detached store.fetcher.
+	n, err := res.Handle.Read(context.Background(), 64, buf)
+	require.NoError(t, err)
+	require.Equal(t, strings.Repeat("A", 16), string(buf[:n]))
+	require.NoError(t, res.Handle.Release(context.Background()))
+
+	select {
+	case <-prefetchEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("CachedStore detached prefetch did not enter objectStorage.Get")
+	}
+
+	require.NoError(t, h1.Stop(context.Background()))
+	eng.ResetForGeneration(client.New(f2.URL, ""))
+
+	h2 := New(Options{Engine: eng, Threshold: 0, Events: fs.NewEventBus()})
+	t.Cleanup(func() { _ = h2.Stop(context.Background()) })
+	res2, err, _ := dispatchCreate(context.Background(), h2, "/d/multi.bin", syscall.O_RDONLY)
+	require.NoError(t, err)
+	buf2 := make([]byte, len("GEN2-REPLACEMENT"))
+	n2, err := res2.Handle.Read(context.Background(), 0, buf2)
+	require.NoError(t, err)
+	require.Equal(t, "GEN2-REPLACEMENT", string(buf2[:n2]))
+	require.NoError(t, res2.Handle.Release(context.Background()))
 }
 
 type stubTerminal struct{}

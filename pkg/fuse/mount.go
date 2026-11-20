@@ -763,7 +763,15 @@ func (e redactedMountCause) Unwrap() error { return e.cause }
 // completion_identity_v1). Local and legacy deployments fall back to the
 // classic plane instead of failing the first extent commit with EIO.
 func applyExtentCapabilityGate(cfg *MountConfig, cl *client.Client, wantExt map[string]bool) {
-	if len(cfg.ExtentPaths) == 0 || cl.CachedCompletionIdentitySupported() {
+	if len(cfg.ExtentPaths) == 0 {
+		return
+	}
+	if cl != nil && cl.ViewBinding().LayerID == "" && !cl.CachedCompletionIdentitySupported() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		cl.WarmCompletionIdentity(ctx)
+		cancel()
+	}
+	if cl != nil && cl.CachedCompletionIdentitySupported() {
 		return
 	}
 	logger.Warn(context.Background(), "extent_patterns_disabled",

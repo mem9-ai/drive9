@@ -75,6 +75,7 @@ type fakeV2 struct {
 	// content block is referenced over a shorter range.
 	partialPlan map[string]partialPlanShape
 	failStatus  atomic.Int32
+	onGetObj    atomic.Pointer[func(key, rng string, ctx context.Context)]
 }
 
 // fakeTotalParts is the multipart part count for a size: ceil(size/part),
@@ -142,6 +143,9 @@ func newFakeV2(t *testing.T) *fakeV2 {
 		key := strings.TrimPrefix(r.URL.Path, "/obj/")
 		switch r.Method {
 		case http.MethodGet:
+			if hook := f.onGetObj.Load(); hook != nil && *hook != nil {
+				(*hook)(key, r.Header.Get("Range"), r.Context())
+			}
 			f.mu.Lock()
 			data, ok := f.blocks[key]
 			f.mu.Unlock()

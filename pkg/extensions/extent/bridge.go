@@ -40,6 +40,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/meta"
@@ -82,8 +83,9 @@ const (
 type Bridge struct {
 	meta.Meta // nil embed: satisfies unexported interface members; never called
 
-	cfg    Config
-	format meta.Format
+	cfg       Config
+	clientPtr atomic.Pointer[client.Client]
+	format    meta.Format
 
 	mu           sync.Mutex
 	nextID       uint64 // provisional slice-id allocator (high bit set)
@@ -155,6 +157,7 @@ type Bridge struct {
 	retryStop    chan struct{}
 	retryOnce    sync.Once
 	retryWg      sync.WaitGroup
+	fetchWg      sync.WaitGroup
 	// modes and mtimes remember local-only create/setattr values until the
 	// first remote publication applies them server-side.
 	modes  map[meta.Ino]uint32
@@ -241,6 +244,7 @@ func NewBridge(cfg Config) *Bridge {
 		verifyBase:        make(map[meta.Ino]verifyBase),
 		emptyPlaceholders: make(map[string]verifyBase),
 	}
+	br.clientPtr.Store(cfg.Client)
 	br.blocks.cacheDir = cfg.CacheDir
 	br.blocks.diskBudget = cfg.SpoolBudget
 	br.blocks.freeRatio = cfg.FreeSpaceRatio
@@ -257,8 +261,13 @@ func NewBridge(cfg Config) *Bridge {
 	return br
 }
 
-// ResetForGeneration stops any background retry loop and resets all mutable
-// bridge state before binding the shared engine to a new main generation.
+func (b *Bridge) client() *client.Client {
+	return b.clientPtr.Load()
+}
+
+// ResetForGeneration stops any background retry loop and in-flight block
+// fetches, then resets all mutable bridge state before binding the shared
+// engine to a new main generation.
 func (b *Bridge) ResetForGeneration(cl *client.Client) {
 	if b == nil {
 		return
@@ -274,8 +283,9 @@ func (b *Bridge) ResetForGeneration(cl *client.Client) {
 		root = "/"
 	}
 
+	b.clientPtr.Store(cl)
+
 	b.mu.Lock()
-	b.cfg.Client = cl
 	b.stagedSlices = make(map[uint64]*stagedSlice)
 	b.paths = map[meta.Ino]string{rootIno: root}
 	b.sizes = make(map[meta.Ino]int64)

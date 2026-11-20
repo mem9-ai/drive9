@@ -1303,6 +1303,14 @@ func (e *engineHandle) Sync(ctx context.Context) error {
 	if errno != 0 && !e.plane.opts.Engine.Bridge.HasPending(e.ino) {
 		return errno
 	}
+	if !e.plane.opts.Engine.Bridge.HasPending(e.ino) && e.plane.opts.Engine.Bridge.NeedsFreshIdentity(e.ino) {
+		if err := e.plane.opts.Engine.Bridge.MaterializeEmpty(ctx, e.ino); err != nil {
+			if errno != 0 {
+				return errno
+			}
+			return err
+		}
+	}
 	if err := e.plane.opts.Engine.FlushFile(ctx, uint64(e.ino)); err != nil {
 		if errno != 0 {
 			return errno // the VFS-level failure still stands
@@ -1380,13 +1388,14 @@ func (h *Handler) Drain(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := e.Flush(ctx); err != nil && firstErr == nil {
-			firstErr = err
-		}
 		if h.opts.Engine.Bridge != nil && h.opts.Engine.Bridge.NeedsFreshIdentity(e.ino) {
 			if err := e.Sync(ctx); err != nil && firstErr == nil {
 				firstErr = err
 			}
+			continue
+		}
+		if err := e.Flush(ctx); err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
 	if h.opts.Engine.Bridge != nil {
