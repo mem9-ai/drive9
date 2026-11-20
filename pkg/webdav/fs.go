@@ -25,6 +25,122 @@ type fileSystem struct {
 	client     *client.Client
 	remoteRoot string // normalized remote root path, default "/"
 	props      *deadPropStore
+	put        putConfig
+}
+
+// putConfig bounds one PUT's staging and commit.
+type putConfig struct {
+	// bufferBytes is how much of the body may be held in memory; the rest
+	// is staged to a temporary file.
+	bufferBytes int64
+	// stagingDir is where the overflow is staged ("" = os.TempDir()).
+	stagingDir string
+	// timeout bounds the commit Close performs.
+	timeout time.Duration
+}
+
+func (cfg putConfig) bufferLimit() int64 {
+	if cfg.bufferBytes > 0 {
+		return cfg.bufferBytes
+	}
+	return DefaultPutBufferBytes
+}
+
+func (cfg putConfig) commitTimeout() time.Duration {
+	if cfg.timeout > 0 {
+		return cfg.timeout
+	}
+	return DefaultPutTimeout
+}
+
+// putRequest carries what the HTTP layer knows about one PUT and the file
+// layer must not guess: the declared body length and the body's own read
+// outcome, so a truncated upload is never committed, and the commit result,
+// which the HTTP layer turns into a truthful status (x/net/webdav answers 405
+// for every write/close error).
+type putRequest struct {
+	expected int64 // declared body length; -1 when the request did not say
+	body     *putBody
+	mu       sync.Mutex
+	err      error
+}
+
+// putBody observes the request body's reads. x/net/webdav copies the body and
+// still calls File.Close on the write file after the copy failed, so without
+// this record a connection that died mid-body would commit the bytes that did
+// arrive — a truncated image published as if complete.
+type putBody struct {
+	rc  io.ReadCloser
+	mu  sync.Mutex
+	err error
+}
+
+func (b *putBody) Read(p []byte) (int, error) {
+	n, err := b.rc.Read(p)
+	if err != nil && err != io.EOF {
+		b.mu.Lock()
+		if b.err == nil {
+			b.err = err
+		}
+		b.mu.Unlock()
+	}
+	return n, err
+}
+
+func (b *putBody) Close() error { return b.rc.Close() }
+
+// failure reports the first read error the body produced, if any.
+func (b *putBody) failure() error {
+	if b == nil {
+		return nil
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.err
+}
+
+func (p *putRequest) bodyFailure() error {
+	if p == nil {
+		return nil
+	}
+	return p.body.failure()
+}
+
+// putRequestKey is the request-context key carrying the *putRequest.
+type putRequestKey struct{}
+
+func putRequestFrom(ctx context.Context) *putRequest {
+	req, _ := ctx.Value(putRequestKey{}).(*putRequest)
+	return req
+}
+
+func (p *putRequest) expectedLen() int64 {
+	if p == nil {
+		return -1
+	}
+	return p.expected
+}
+
+// fail records the first failure of this PUT.
+func (p *putRequest) fail(err error) {
+	if p == nil || err == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.err == nil {
+		p.err = err
+	}
+}
+
+// failure reports the recorded commit error, if any.
+func (p *putRequest) failure() error {
+	if p == nil {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.err
 }
 
 var _ webdav.FileSystem = (*fileSystem)(nil)
@@ -62,7 +178,13 @@ func (f *fileSystem) OpenFile(ctx context.Context, name string, flag int, perm o
 		if !parent.IsDir {
 			return nil, os.ErrInvalid
 		}
-		return &writeFile{client: f.client, path: remote, props: f.deadProps()}, nil
+		return &writeFile{
+			client: f.client,
+			path:   remote,
+			props:  f.deadProps(),
+			put:    f.put,
+			req:    putRequestFrom(ctx),
+		}, nil
 	}
 
 	// Stat to determine if it's a directory or file.
@@ -389,12 +511,32 @@ func (r *readFile) Patch(patches []webdav.Proppatch) ([]webdav.Propstat, error) 
 	return r.props.patch(r.propPath, patches)
 }
 
-// writeFile is a webdav.File that buffers writes and flushes on Close.
+// writeFile is a webdav.File that stages a write and commits it on Close.
+//
+// Staging is bounded: the first PutBufferBytes of the body stay in memory and
+// the overflow moves to an unlinked temporary file, so a large PUT costs disk
+// rather than RSS and its failure point is a write error, not an OOM kill far
+// from the request. Close is the single commit point — the body is committed
+// whole or not at all, in one Drive9 request, and a nil return means the
+// server acknowledged the new revision.
 type writeFile struct {
 	client *client.Client
 	path   string
 	props  *deadPropStore
-	buf    bytes.Buffer
+	put    putConfig
+	req    *putRequest
+
+	// buf holds the staged prefix; past the memory bound file takes over
+	// and buf is empty.
+	buf  bytes.Buffer
+	file *os.File
+	name string // staged file's name (already unlinked where the OS allows)
+	size int64
+
+	// werr latches the first staging failure: a body that was not fully
+	// recorded must not be committed later.
+	werr   error
+	closed bool
 }
 
 var _ webdav.File = (*writeFile)(nil)
@@ -404,23 +546,124 @@ func (w *writeFile) Read([]byte) (int, error)           { return 0, fmt.Errorf("
 func (w *writeFile) Readdir(int) ([]fs.FileInfo, error) { return nil, fmt.Errorf("not a directory") }
 func (w *writeFile) Seek(int64, int) (int64, error)     { return 0, fmt.Errorf("not seekable") }
 
+// Write stages p, spilling to disk once the body outgrows the memory bound.
 func (w *writeFile) Write(p []byte) (int, error) {
-	return w.buf.Write(p)
+	if w.werr != nil {
+		return 0, w.werr
+	}
+	if w.file == nil && w.size+int64(len(p)) > w.put.bufferLimit() {
+		if err := w.spill(); err != nil {
+			return 0, w.fail(err)
+		}
+	}
+	var (
+		n   int
+		err error
+	)
+	if w.file != nil {
+		n, err = w.file.Write(p)
+	} else {
+		n, err = w.buf.Write(p)
+	}
+	w.size += int64(n)
+	if err != nil {
+		return n, w.fail(fmt.Errorf("webdav: stage PUT body: %w", err))
+	}
+	return n, nil
 }
 
+// spill moves the staged prefix into a temporary file and switches the rest of
+// the body to it. The file is unlinked immediately where the OS allows it, so
+// a crashed process leaves no PUT bodies behind; the name is kept for systems
+// that cannot unlink an open file.
+func (w *writeFile) spill() error {
+	dir := w.put.stagingDir
+	if dir == "" {
+		dir = os.TempDir()
+	}
+	file, err := os.CreateTemp(dir, "drive9-webdav-put-*")
+	if err != nil {
+		return fmt.Errorf("webdav: stage PUT body: %w", err)
+	}
+	w.name = file.Name()
+	_ = os.Remove(w.name)
+	if _, err := file.Write(w.buf.Bytes()); err != nil {
+		_ = file.Close()
+		_ = os.Remove(w.name)
+		return fmt.Errorf("webdav: stage PUT body: %w", err)
+	}
+	w.buf.Reset()
+	w.file = file
+	return nil
+}
+
+// Close commits the staged body. It is the PUT's commit point: the body is
+// written in one request, and only a server acknowledgement (a committed
+// revision) returns nil. Anything else records the failure and leaves the
+// target untouched.
 func (w *writeFile) Close() error {
-	// webdav.File.Close has no context parameter. Do not retain the
-	// OpenFile request context here: clients can finish sending a PUT body
-	// and close the connection before the server flushes the buffered bytes
-	// to Drive9. Close is the commit point for this lightweight WebDAV
-	// bridge, so it uses a fresh background context.
-	return mapError(w.client.WriteCtx(context.Background(), w.path, w.buf.Bytes()))
+	if w.closed {
+		return nil
+	}
+	w.closed = true
+	defer w.cleanup()
+
+	if w.werr != nil {
+		return w.werr
+	}
+	// A body shorter than the request declared is an aborted upload: the
+	// bytes that did arrive are a truncated image, never a commit.
+	if expected := w.req.expectedLen(); expected >= 0 && w.size != expected {
+		return w.fail(fmt.Errorf("webdav: PUT body ended after %d of %d declared bytes", w.size, expected))
+	}
+	if err := w.req.bodyFailure(); err != nil {
+		return w.fail(fmt.Errorf("webdav: PUT body aborted after %d bytes: %w", w.size, err))
+	}
+
+	// webdav.File.Close has no context parameter. Do not retain the OpenFile
+	// request context here: clients can finish sending a PUT body and close
+	// the connection before the server flushes the staged bytes to Drive9.
+	// The commit therefore runs on its own context, but a BOUNDED one — an
+	// untimed background context let an unresponsive server park the close
+	// (and the PUT) forever.
+	ctx, cancel := context.WithTimeout(context.Background(), w.put.commitTimeout())
+	defer cancel()
+
+	if w.file != nil {
+		if _, err := w.file.Seek(0, io.SeekStart); err != nil {
+			return w.fail(fmt.Errorf("webdav: read staged PUT body: %w", err))
+		}
+		// The reader is the staged file itself: the streaming upload keeps
+		// memory bounded by the client's transfer window instead of holding
+		// the whole body again.
+		return w.fail(mapError(w.client.WriteStream(ctx, w.path, w.file, w.size, nil)))
+	}
+	return w.fail(mapError(w.client.WriteCtx(ctx, w.path, w.buf.Bytes())))
+}
+
+// cleanup releases the staged file. A committed or failed PUT leaves nothing
+// behind in the staging directory.
+func (w *writeFile) cleanup() {
+	if w.file != nil {
+		_ = w.file.Close()
+		w.file = nil
+	}
+	if w.name != "" {
+		_ = os.Remove(w.name)
+		w.name = ""
+	}
+}
+
+// fail records the PUT's failure for the HTTP layer and returns it.
+func (w *writeFile) fail(err error) error {
+	w.req.fail(err)
+	return err
 }
 
 func (w *writeFile) Stat() (os.FileInfo, error) {
 	return &fileInfo{
 		name: path.Base(w.path),
-		stat: &client.StatResult{Size: int64(w.buf.Len())},
+		stat: &client.StatResult{Size: w.size},
 	}, nil
 }
 
