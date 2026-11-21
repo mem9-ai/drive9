@@ -195,10 +195,21 @@ func (cp *copyFastPath) serve(w http.ResponseWriter, r *http.Request) bool {
 	// any. Tags are drive9 metadata, not WebDAV properties, so a copy does not
 	// carry the source's set — same as x/net, which copies dead props only.
 	if !created {
-		// The copy's post-condition includes the destination being a fresh
-		// resource, so a tag clear that keeps failing must not be reported as
-		// a success: answer 500 and let the client retry (a retry rewrites the
-		// content and clears the tags again).
+		// DEFINED BEHAVIOR for a replacement whose tag cleanup cannot settle.
+		//
+		// The content publish and the tag replacement are two API calls: the
+		// wire contract has no way to say "replace the tag set with this (empty)
+		// one" on a write (no tag header means "leave unchanged"), so the tag
+		// clear cannot be folded into the commit request. Ordering the clear
+		// BEFORE the commit would instead strip the old resource's tags when
+		// the commit then fails, trading a metadata glitch for metadata loss.
+		//
+		// The post-condition of a COPY is a fresh resource, so a persisting
+		// failure is reported as 500 rather than a false success: the bytes
+		// have landed, the copy is not complete, the reason is logged, and a
+		// client retry rewrites the content and clears the tags again (the
+		// same indeterminate-outcome contract the PUT commit uses for a
+		// timed-out publish).
 		var clearErr error
 		for attempt := 0; attempt < 2; attempt++ {
 			if clearErr = cp.client.SetMetadataCtx(ctx, dstRemote, client.SetMetadataOptions{Tags: map[string]string{}}); clearErr == nil {
