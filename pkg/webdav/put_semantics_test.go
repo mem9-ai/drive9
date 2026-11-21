@@ -455,11 +455,10 @@ func TestPutCommitFailureIsLogged(t *testing.T) {
 	}
 }
 
-// A COPY writes its destination through the same writer, but only AFTER
-// x/net/webdav has deleted the old destination: a staging failure there would
-// destroy the old content without a replacement. Non-PUT writes therefore keep
-// the in-memory staging, and an overwrite survives an unusable staging dir.
-func TestCopyDestinationSurvivesSpillFailure(t *testing.T) {
+// The COPY fast path commits its destination atomically, so a staging failure
+// there must FAIL the copy (the old content is still in place) instead of
+// buffering the whole source in memory: memory stays bounded.
+func TestCopyFastPathStagingFailureIsBounded(t *testing.T) {
 	b := testbackend.NewBackend()
 	b.SeedDir("/dir", 0o755)
 	src := strings.Repeat("s", 4096)
@@ -475,26 +474,89 @@ func TestCopyDestinationSurvivesSpillFailure(t *testing.T) {
 	t.Cleanup(func() { logger.Set(previous) })
 
 	handler := NewHandler(c, Options{
-		PutBufferBytes: 8, // any source byte would spill
+		PutBufferBytes: 8,
 		PutStagingDir:  filepath.Join(t.TempDir(), "missing", "staging"),
 	})
-	req := httptest.NewRequest(http.MethodGet, "/dir/src", nil)
-	req.Method = "COPY"
-	req.Header.Set("Destination", "/dir/dst")
-	rr := httptest.NewRecorder()
-	handler.ServeHTTP(rr, req)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, copyRequest(t, "/dir/src", "/dir/dst"))
 
-	if rr.Code >= 300 {
-		t.Fatalf("COPY status = %d: %s", rr.Code, rr.Body.String())
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("COPY with a staging failure = %d, want %d", recorder.Code, http.StatusInternalServerError)
 	}
 	node, ok := b.Node("/dir/dst")
-	if !ok || string(node.Data) != src {
-		t.Fatalf("copy destination = %q (ok=%v), want the source content", node.Data, ok)
+	if !ok || string(node.Data) != "ORIGINAL" {
+		t.Fatalf("fast-path staging failure changed the destination: %q (ok=%v)", node.Data, ok)
 	}
-	// The copy staged, failed to spill, and degraded to memory instead of
-	// failing with the destination already deleted.
+	if entries := logs.FilterMessage("webdav copy staging failed; buffering the rest in memory").All(); len(entries) != 0 {
+		t.Fatalf("fast-path COPY degraded to unbounded memory (%d fallback logs)", len(entries))
+	}
+}
+
+// A COPY that x/net/webdav serves (a collection) writes each destination file
+// only AFTER deleting it, so a staging failure there must degrade to memory
+// instead of failing with the old content gone.
+func TestDelegatedCopyDegradesOnStagingFailure(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.SeedDir("/tree", 0o755)
+	large := strings.Repeat("d", 4096)
+	b.Seed("/tree/f.txt", []byte(large))
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	c := client.New(ts.URL, "test-key")
+	c.Warm(context.Background())
+	observed, logs := observer.New(zap.WarnLevel)
+	previous := logger.L()
+	logger.Set(zap.New(observed))
+	t.Cleanup(func() { logger.Set(previous) })
+
+	handler := NewHandler(c, Options{
+		PutBufferBytes: 8,
+		PutStagingDir:  filepath.Join(t.TempDir(), "missing", "staging"),
+	})
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, copyRequest(t, "/tree", "/copied"))
+
+	if recorder.Code >= 300 {
+		t.Fatalf("delegated COPY status = %d: %s", recorder.Code, recorder.Body.String())
+	}
+	node, ok := b.Node("/copied/f.txt")
+	if !ok || string(node.Data) != large {
+		t.Fatalf("delegated copy child = %d bytes (ok=%v), want %d", len(node.Data), ok, len(large))
+	}
 	if entries := logs.FilterMessage("webdav copy staging failed; buffering the rest in memory").All(); len(entries) != 1 {
-		t.Fatalf("staging-fallback log entries = %d, want 1", len(entries))
+		t.Fatalf("delegated-copy fallback logs = %d, want 1", len(entries))
+	}
+}
+
+// A failure AFTER the body was spilled must also recover: the staged prefix is
+// pulled back into memory so the copy can finish.
+func TestWriteFileDegradeToMemoryAfterSpill(t *testing.T) {
+	staging := t.TempDir()
+	wf := &writeFile{
+		path:             "/dir/file.txt",
+		put:              putConfig{bufferBytes: 4, stagingDir: staging, copyWrite: true},
+		expectedRevision: -1,
+	}
+	if _, err := wf.Write([]byte("abcdefg")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if wf.file == nil {
+		t.Fatal("test precondition: the body should have spilled")
+	}
+	if err := wf.degradeToMemory(); err != nil {
+		t.Fatalf("degradeToMemory: %v", err)
+	}
+	if wf.file != nil || wf.name != "" {
+		t.Fatal("staged file not released")
+	}
+	if !wf.put.noSpill {
+		t.Fatal("spilling not disabled after degrading")
+	}
+	if got := wf.buf.String(); got != "abcdefg" {
+		t.Fatalf("recovered prefix = %q, want abcdefg", got)
+	}
+	if wf.size != 7 {
+		t.Fatalf("size = %d, want 7", wf.size)
 	}
 }
 

@@ -423,6 +423,23 @@ func (c *Client) WriteStreamWithSummary(ctx context.Context, path string, r io.R
 	return c.writeStreamConditionalWithOptionsAndSummary(ctx, path, r, size, progress, -1, *o, "", nil)
 }
 
+// WriteStreamConditionalWithOptions is WriteStreamWithSummary with a
+// compare-and-set precondition on the destination: expectedRevision < 0 is
+// unconditional, 0 requires the path to be absent (create-only), and a
+// positive value requires exactly that revision. It exists so a caller that
+// stages a body can commit it atomically AND under a precondition — the
+// plain conditional writers only take byte slices or no write options.
+func (c *Client) WriteStreamConditionalWithOptions(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, expectedRevision int64, opts ...WriteOption) error {
+	o := &writeOptions{}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(o)
+		}
+	}
+	_, err := c.writeStreamConditionalWithOptionsAndSummary(ctx, path, r, size, progress, expectedRevision, *o, "", nil)
+	return err
+}
+
 // WriteStreamWithSummaryAndTags uploads data from a reader, applies tags to
 // the resulting file revision, and returns coarse-grained phase timings.
 func (c *Client) WriteStreamWithSummaryAndTags(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, tags map[string]string) (*UploadSummary, error) {

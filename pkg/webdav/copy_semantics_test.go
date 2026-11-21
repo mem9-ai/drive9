@@ -269,3 +269,80 @@ func TestCopyToLockedDestinationAnswersLocked(t *testing.T) {
 		t.Fatalf("COPY onto a locked destination changed it: %q", node.Data)
 	}
 }
+
+// A hard-linked destination must not be written in place: the other name would
+// change too. x/net replaces the name instead (POSIX copy breaks the link).
+func TestCopyHardLinkedDestinationDelegates(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.SeedDir("/dir", 0o755)
+	b.Seed("/dir/alias", []byte("ALIAS CONTENT"))
+	b.SeedHardlink("/dir/alias", "/dir/dst")
+	b.Seed("/dir/src", []byte("copied bytes"))
+	handler, _ := newCopySemanticsHandler(t, b, Options{})
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, copyRequest(t, "/dir/src", "/dir/dst"))
+	if rr.Code >= 300 {
+		t.Fatalf("COPY onto a hard link = %d: %s", rr.Code, rr.Body.String())
+	}
+	if node, ok := b.Node("/dir/dst"); !ok || string(node.Data) != "copied bytes" {
+		t.Fatalf("destination = %q (ok=%v), want the copied bytes", node.Data, ok)
+	}
+	// The shared name keeps the old content: the copy replaced the name, it
+	// did not write through the alias.
+	if node, ok := b.Node("/dir/alias"); !ok || string(node.Data) != "ALIAS CONTENT" {
+		t.Fatalf("hard-linked alias changed to %q (ok=%v); the copy wrote through the link", node.Data, ok)
+	}
+}
+
+// x/net rejects a Depth other than 0 or infinity BEFORE touching the
+// destination; the fast path must not turn that into an overwrite.
+func TestCopyInvalidDepthDelegatesAndRejects(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.SeedDir("/dir", 0o755)
+	b.Seed("/dir/src", []byte("fresh"))
+	b.Seed("/dir/dst", []byte("ORIGINAL"))
+	handler, _ := newCopySemanticsHandler(t, b, Options{})
+
+	req := copyRequest(t, "/dir/src", "/dir/dst")
+	req.Header.Set("Depth", "1")
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("COPY with Depth:1 = %d, want %d", rr.Code, http.StatusBadRequest)
+	}
+	if node, _ := b.Node("/dir/dst"); string(node.Data) != "ORIGINAL" {
+		t.Fatalf("invalid-Depth COPY changed the destination: %q", node.Data)
+	}
+}
+
+// Overwrite: F must still hold at COMMIT time: a writer that takes the
+// destination name while the copy streams must not be clobbered.
+func TestCopyOverwriteFalseSurvivesConcurrentCreate(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.SeedDir("/dir", 0o755)
+	b.Seed("/dir/src", []byte("copied bytes"))
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/fs/dir/src" {
+			// An API writer takes the destination name while the source
+			// streams, after the copy's existence check.
+			b.Seed("/dir/dst", []byte("INTRUDER"))
+		}
+		b.ServeHTTP(w, r)
+	}))
+	t.Cleanup(ts.Close)
+	c := client.New(ts.URL, "test-key")
+	c.Warm(t.Context())
+	handler := NewHandler(c, Options{})
+
+	req := copyRequest(t, "/dir/src", "/dir/dst")
+	req.Header.Set("Overwrite", "F")
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusPreconditionFailed {
+		t.Fatalf("COPY that lost the Overwrite:F race = %d, want %d", rr.Code, http.StatusPreconditionFailed)
+	}
+	if node, ok := b.Node("/dir/dst"); !ok || string(node.Data) != "INTRUDER" {
+		t.Fatalf("concurrent writer's content = %q (ok=%v), want INTRUDER", node.Data, ok)
+	}
+}

@@ -203,6 +203,13 @@ type writeFile struct {
 	name string // staged file's name (already unlinked where the OS allows)
 	size int64
 
+	// expectedRevision is the commit's compare-and-set precondition: < 0 is
+	// unconditional, 0 requires the path to be absent (create-only). The COPY
+	// fast path uses 0 when it promised `Overwrite: F` for an absent
+	// destination, so a concurrent API writer that takes the name during the
+	// copy is reported as a precondition failure instead of being clobbered.
+	expectedRevision int64
+
 	// werr latches the first staging failure: a body that was not fully
 	// recorded must not be committed later.
 	werr   error
@@ -246,9 +253,51 @@ func (w *writeFile) Write(p []byte) (int, error) {
 	}
 	w.size += int64(n)
 	if err != nil {
-		return n, w.stageFail(fmt.Errorf("webdav: stage PUT body: %w", err))
+		if w.put.copyWrite && w.file != nil {
+			// A delegated COPY's destination is already deleted: a staged
+			// write that fails (a full local disk mid-file) must still let
+			// the copy finish. Pull the staged prefix back into memory and
+			// keep the rest of the body there.
+			if derr := w.degradeToMemory(); derr == nil {
+				m, berr := w.buf.Write(p[n:])
+				w.size += int64(m)
+				if berr != nil {
+					return n + m, w.stageFail(fmt.Errorf("webdav: stage copy body: %w", berr))
+				}
+				return n + m, nil
+			}
+		}
+		return n, w.stageFail(fmt.Errorf("webdav: stage body: %w", err))
 	}
 	return n, nil
+}
+
+// degradeToMemory moves the already-staged prefix from the temporary file back
+// into the in-memory buffer and disables further spilling. It is the recovery
+// path for a delegated COPY whose destination x/net/webdav has already removed:
+// failing there would lose the old content, so the body keeps going in memory.
+func (w *writeFile) degradeToMemory() error {
+	if w.file == nil {
+		return nil
+	}
+	if _, err := w.file.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	data := make([]byte, w.size)
+	if _, err := io.ReadFull(w.file, data); err != nil {
+		return err
+	}
+	_ = w.file.Close()
+	if w.name != "" {
+		_ = os.Remove(w.name)
+	}
+	w.file, w.name = nil, ""
+	w.buf.Reset()
+	_, _ = w.buf.Write(data)
+	w.put.noSpill = true
+	logger.Warn(context.Background(), "webdav copy staging failed mid-body; continuing in memory",
+		zap.String("path", w.path), zap.Int64("staged_bytes", w.size))
+	return nil
 }
 
 // spill moves the staged prefix into a temporary file and switches the rest of
@@ -317,6 +366,9 @@ func (w *writeFile) Close() error {
 		// inline threshold is larger than PutBufferBytes. Layout routing
 		// (extent vs classic) is the client's, unchanged.
 		staged := io.NewSectionReader(w.file, 0, w.size)
+		if w.expectedRevision >= 0 {
+			return w.commitError(w.client.WriteStreamConditionalWithOptions(ctx, w.path, staged, w.size, nil, w.expectedRevision, client.WithMultipartOnly()))
+		}
 		_, err := w.client.WriteStreamWithSummary(ctx, w.path, staged, w.size, nil, client.WithMultipartOnly())
 		return w.commitError(err)
 	}
@@ -328,6 +380,10 @@ func (w *writeFile) Close() error {
 	// checksums — so bodies between the threshold and the staging bound would
 	// not save at all.
 	data := w.buf.Bytes()
+	if w.expectedRevision >= 0 {
+		_, err := w.client.WriteCtxConditionalWithRevision(ctx, w.path, data, w.expectedRevision)
+		return w.commitError(err)
+	}
 	_, err := w.client.WriteStreamWithSummary(ctx, w.path, bytes.NewReader(data), int64(len(data)), nil)
 	return w.commitError(err)
 }

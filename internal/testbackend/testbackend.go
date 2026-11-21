@@ -1074,11 +1074,20 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		var mode uint32
 		var contentLayout string
 		var resourceID string
+		var nlink int
 		if n != nil {
 			isDir = n.IsDir
 			dataLen = len(n.Data)
 			rev, mtime, mode = n.Rev, n.Mtime, n.Mode
 			contentLayout = n.ContentLayout
+			// Hardlinks share one Node: report the link count the way the
+			// server does, so callers can distinguish an alias from a lone
+			// name (a rename-style replace breaks the alias; a write does not).
+			for _, other := range b.files {
+				if other == n {
+					nlink++
+				}
+			}
 			if n.ResourceID == "" {
 				// The real server reports the object's stable identity on
 				// every stat; the lazy assignment keeps the fake's seeds
@@ -1097,6 +1106,9 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Length", strconv.Itoa(dataLen))
 		w.Header().Set("X-Dat9-Revision", strconv.FormatInt(rev, 10))
 		w.Header().Set("X-Dat9-Resource-ID", resourceID)
+		if nlink > 1 {
+			w.Header().Set("X-Dat9-Nlink", strconv.Itoa(nlink))
+		}
 		w.Header().Set("X-Dat9-Mode", strconv.FormatUint(uint64(mode), 10))
 		w.Header().Set("X-Dat9-Mtime", strconv.FormatInt(mtime, 10))
 		// Mirror the real server's placement decision: objects at or

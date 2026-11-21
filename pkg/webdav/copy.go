@@ -48,6 +48,11 @@ func (cp *copyFastPath) serve(w http.ResponseWriter, r *http.Request) bool {
 	if r.Header.Get("If") != "" {
 		return false
 	}
+	// x/net rejects a Depth other than 0 or infinity BEFORE touching the
+	// destination; delegate so such a request keeps answering 400.
+	if depth := r.Header.Get("Depth"); depth != "" && depth != "0" && !strings.EqualFold(depth, "infinity") {
+		return false
+	}
 	dest := r.Header.Get("Destination")
 	if dest == "" {
 		return false
@@ -109,6 +114,11 @@ func (cp *copyFastPath) serve(w http.ResponseWriter, r *http.Request) bool {
 	case r.Header.Get("Overwrite") == "F":
 		writeWebDAVStatus(w, http.StatusPreconditionFailed)
 		return true
+	case dstStat.Nlink > 1:
+		// The destination shares its object with another name: writing in
+		// place would change that other path too. x/net replaces the name
+		// (RemoveAll + create), which is the POSIX copy behaviour.
+		return false
 	}
 
 	src, err := cp.client.ReadStream(ctx, srcRemote)
@@ -139,6 +149,13 @@ func (cp *copyFastPath) serve(w http.ResponseWriter, r *http.Request) bool {
 		_ = file.Close()
 		return false
 	}
+	if created && r.Header.Get("Overwrite") == "F" {
+		// The destination was absent when we checked; commit create-only so a
+		// concurrent API writer that takes the name during the copy is NOT
+		// clobbered (the server rejects a commit whose expected revision 0 no
+		// longer matches).
+		dst.expectedRevision = 0
+	}
 	if _, err := io.Copy(dst, src); err != nil {
 		// A COPY has no declared length, so Close would commit whatever
 		// arrived: abort instead, leaving the old destination in place.
@@ -149,6 +166,12 @@ func (cp *copyFastPath) serve(w http.ResponseWriter, r *http.Request) bool {
 	}
 	if err := dst.Close(); err != nil {
 		logCopyFailure(ctx, srcLocal, dstLocal, err)
+		if dst.expectedRevision == 0 && isRevisionConflict(err) {
+			// The destination appeared while the copy streamed: the
+			// Overwrite: F promise no longer holds.
+			writeWebDAVStatus(w, http.StatusPreconditionFailed)
+			return true
+		}
 		writeWebDAVStatus(w, putFailureStatus(err))
 		return true
 	}
@@ -165,6 +188,20 @@ func (cp *copyFastPath) serve(w http.ResponseWriter, r *http.Request) bool {
 		writeWebDAVStatus(w, http.StatusNoContent)
 	}
 	return true
+}
+
+// isRevisionConflict reports a compare-and-set refusal from the API plane. The
+// commit error has already passed through the bridge's os-level mapping, which
+// turns a 409 into os.ErrExist, so both shapes must count.
+func isRevisionConflict(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, client.ErrConflict) || errors.Is(err, os.ErrExist) {
+		return true
+	}
+	var statusErr *client.StatusError
+	return errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusConflict
 }
 
 // localPath strips the mount prefix from a request path. It refuses a path

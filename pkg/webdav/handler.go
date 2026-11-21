@@ -114,19 +114,21 @@ func NewHandler(c *client.Client, opts Options) http.Handler {
 		recorder := &statusCapturingResponseWriter{ResponseWriter: w}
 		var put *putRequest
 		if r.Method == "COPY" {
-			// COPY writes its destination through the same staged writer a
-			// PUT uses, after x/net/webdav has removed the old destination.
-			// Mark the request so a staging failure degrades to memory
-			// instead of failing the copy (the old content is already gone).
-			r = r.WithContext(context.WithValue(r.Context(), copyWriteKey{}, true))
 			// The common case (a regular file onto a non-collection
 			// destination) is served without x/net's pre-delete: the
 			// destination is committed atomically, so a failed copy leaves
-			// the old content in place.
+			// the old content in place. Its writer must therefore FAIL on a
+			// staging error (the old content is still there, and failing
+			// keeps memory bounded), so the marker below is set only for the
+			// delegated path.
 			if copier.serve(recorder, r) {
 				metrics.RecordOperation("webdav", "copy", webdavMetricResult(recorder.statusCode()), time.Since(start))
 				return
 			}
+			// Delegated to x/net/webdav, which removes the old destination
+			// before writing the replacement: a staging failure there must
+			// degrade to memory instead, or the old content is lost.
+			r = r.WithContext(context.WithValue(r.Context(), copyWriteKey{}, true))
 		}
 		if r.Method == http.MethodPut {
 			// A PUT's outcome is decided at Close, below x/net/webdav's
