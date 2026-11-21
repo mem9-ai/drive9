@@ -2,6 +2,7 @@ package webdav
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -10,12 +11,16 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/mem9-ai/drive9/internal/testbackend"
 	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/logger"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 // putRecorder is a minimal drive9 fs server that records the bytes of each
@@ -368,5 +373,83 @@ func TestPutInMemoryBodyAboveInlineThresholdUsesMultipart(t *testing.T) {
 	node, ok := b.Node("/dir/file.txt")
 	if !ok || string(node.Data) != payload {
 		t.Fatalf("committed body = %d bytes, want %d", len(node.Data), len(payload))
+	}
+}
+
+// A staged body uploads its parts to PRESIGNED urls; a storage-full answer
+// there is not a *client.StatusError, so the status must still reach the
+// client as 507 rather than a generic 500 (the contract NewHandler documents).
+func TestPutPresignedPartInsufficientStorageAnswers507(t *testing.T) {
+	var parts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/status":
+			_, _ = w.Write([]byte(`{"status":"ok","inline_threshold":1048576}`))
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/dir":
+			w.Header().Set("X-Dat9-IsDir", "true")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"upload_id": "u1", "key": "/dir/file.txt", "part_size": 16 << 20, "total_parts": 1,
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/u1/presign-batch":
+			_ = json.NewEncoder(w).Encode(map[string]any{"parts": []map[string]any{{
+				"number": 1, "url": "http://" + r.Host + "/presigned/part/1", "size": 65536,
+			}}})
+		case r.Method == http.MethodPut && r.URL.Path == "/presigned/part/1":
+			parts.Add(1)
+			http.Error(w, "insufficient storage", http.StatusInsufficientStorage)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	c := client.New(srv.URL, "test-key")
+	c.Warm(context.Background())
+
+	handler := NewHandler(c, Options{PutBufferBytes: 4 << 10})
+	rr := httptest.NewRecorder()
+	payload := strings.Repeat("q", 256<<10) // spilled: multipart, presigned part PUT
+	handler.ServeHTTP(rr, httptest.NewRequest(http.MethodPut, "/dir/file.txt", strings.NewReader(payload)))
+
+	if parts.Load() == 0 {
+		t.Fatal("presigned part PUT never attempted")
+	}
+	if rr.Code != http.StatusInsufficientStorage {
+		t.Fatalf("storage-full part PUT status = %d, want %d: %s", rr.Code, http.StatusInsufficientStorage, rr.Body.String())
+	}
+}
+
+// The captured commit error reaches neither the client (which sees only the
+// status text) nor an operator unless it is logged. A failed PUT must leave a
+// server-side record with the path, the staged size and the error.
+func TestPutCommitFailureIsLogged(t *testing.T) {
+	observed, logs := observer.New(zap.ErrorLevel)
+	previous := logger.L()
+	logger.Set(zap.New(observed))
+	t.Cleanup(func() { logger.Set(previous) })
+
+	rec := newPutRecorder()
+	rec.status = http.StatusInternalServerError
+	handler := newPUTSemanticsHandler(t, rec, Options{})
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, httptest.NewRequest(http.MethodPut, "/dir/file.txt", strings.NewReader("payload")))
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("PUT status = %d, want %d", rr.Code, http.StatusInternalServerError)
+	}
+	entries := logs.FilterMessage("webdav put commit failed").All()
+	if len(entries) != 1 {
+		t.Fatalf("commit-failure log entries = %d, want 1", len(entries))
+	}
+	fields := entries[0].ContextMap()
+	if fields["path"] != "/dir/file.txt" {
+		t.Fatalf("logged path = %v, want /dir/file.txt", fields["path"])
+	}
+	if size, _ := fields["body_bytes"].(int64); size != int64(len("payload")) {
+		t.Fatalf("logged body_bytes = %v, want %d", fields["body_bytes"], len("payload"))
+	}
+	if fields["error"] == nil {
+		t.Fatalf("logged entry carries no error: %v", fields)
 	}
 }

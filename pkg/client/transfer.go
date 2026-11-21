@@ -1558,6 +1558,26 @@ func (e *presignedPutStatusError) Error() string {
 	return fmt.Sprintf("HTTP %d: %s", e.Status, e.Body)
 }
 
+// IsInsufficientStorage reports whether err is a storage-full refusal. The
+// same condition arrives through two unrelated error shapes: a *StatusError
+// from the API plane, and a *presignedPutStatusError from a part PUT straight
+// to the object store. Callers above this package cannot see the latter, so
+// this predicate is the only way to recognize "out of storage" on both upload
+// tracks. It deliberately does not add an Unwrap to the presigned error: that
+// would also change the API-plane status mapping (404/409) that the extent
+// create-once logic relies on.
+func IsInsufficientStorage(err error) bool {
+	if err == nil {
+		return false
+	}
+	var statusErr *StatusError
+	if errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusInsufficientStorage {
+		return true
+	}
+	var presignedErr *presignedPutStatusError
+	return errors.As(err, &presignedErr) && presignedErr.Status == http.StatusInsufficientStorage
+}
+
 // presignOnePart fetches a fresh presigned URL for a single part via
 // POST /v2/uploads/{id}/presign. Used to retry after presigned URL expiry.
 func (c *Client) presignOnePart(ctx context.Context, uploadID string, partNumber int) (*presignedPart, error) {

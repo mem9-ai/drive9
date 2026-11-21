@@ -15,7 +15,9 @@ import (
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/metrics"
+	"go.uber.org/zap"
 	"golang.org/x/net/webdav"
 )
 
@@ -115,7 +117,7 @@ func NewHandler(c *client.Client, opts Options) http.Handler {
 			r = r.WithContext(context.WithValue(r.Context(), putRequestKey{}, put))
 		}
 		next.ServeHTTP(recorder, r)
-		recorder.commit(put)
+		recorder.commit(r.Context(), put)
 		metrics.RecordOperation("webdav", webdavMetricOperation(r.Method), webdavMetricResult(recorder.statusCode()), time.Since(start))
 	})
 }
@@ -174,18 +176,30 @@ func (w *statusCapturingResponseWriter) statusCode() int {
 // for a failed write with the status that tells the client nothing was
 // committed. PUT is always a supported method, so 405 on this path can only
 // mean the write, stat or close failed.
-func (w *statusCapturingResponseWriter) commit(req *putRequest) {
+func (w *statusCapturingResponseWriter) commit(ctx context.Context, req *putRequest) {
 	if !w.buffered {
 		return
 	}
 	code := w.statusCode()
 	if code == http.StatusMethodNotAllowed {
-		code = putFailureStatus(req.failure())
+		commitErr := req.failure()
+		code = putFailureStatus(commitErr)
 		// The buffered body is x/net/webdav's text for the ORIGINAL status:
 		// left as-is, a client that shows it would still read "Method Not
 		// Allowed" for a committed-nothing failure.
 		w.body.Reset()
 		w.body.WriteString(http.StatusText(code))
+		// The client only ever sees the status text, so the captured error —
+		// including the indeterminate-timeout annotation — is logged here or
+		// it is observable to nobody.
+		path, size, elapsed, logErr := req.snapshot()
+		logger.Error(ctx, "webdav put commit failed",
+			zap.String("path", path),
+			zap.Int64("body_bytes", size),
+			zap.Duration("elapsed", elapsed),
+			zap.Int("status", code),
+			zap.Error(logErr),
+		)
 	}
 	w.status = code
 	w.ResponseWriter.WriteHeader(code)
@@ -196,13 +210,11 @@ func (w *statusCapturingResponseWriter) commit(req *putRequest) {
 
 // putFailureStatus maps a commit failure onto the status a WebDAV client can
 // act on: 507 when the storage behind the write is full (here or on the
-// server), 500 otherwise.
+// server), 500 otherwise. The server-side check must cover the presigned part
+// PUTs a staged body uses, whose storage-full answer is a different error
+// shape from the API plane's — hence the client predicate.
 func putFailureStatus(err error) int {
-	var se *client.StatusError
-	if errors.As(err, &se) && se.StatusCode == http.StatusInsufficientStorage {
-		return http.StatusInsufficientStorage
-	}
-	if errors.Is(err, syscall.ENOSPC) {
+	if client.IsInsufficientStorage(err) || errors.Is(err, syscall.ENOSPC) {
 		return http.StatusInsufficientStorage
 	}
 	return http.StatusInternalServerError
