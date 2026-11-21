@@ -224,6 +224,17 @@ func (b *Backend) ObjectID(path string) string {
 	return n.ResourceID
 }
 
+// SharesObject reports whether two paths name the SAME object (a hardlink or
+// an alias), not merely equal bytes. Tests use it to prove a copy produced an
+// independent object instead of an alias.
+func (b *Backend) SharesObject(a, c string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	na, ca := b.files[a]
+	nb, cb := b.files[c]
+	return ca && cb && na == nb
+}
+
 // Node returns a snapshot of one entry.
 func (b *Backend) Node(path string) (Node, bool) {
 	b.mu.Lock()

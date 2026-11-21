@@ -50,10 +50,11 @@ func TestCopyFileWritesIndependentContent(t *testing.T) {
 	if !ok || string(node.Data) != src {
 		t.Fatalf("destination = %q (ok=%v), want the source bytes", node.Data, ok)
 	}
-	// Bytes were copied, not aliased: the server-side ?copy endpoint (which
-	// attaches the source's file id) must not have been used.
-	if got := b.Requests()["POST /v1/fs/dir/dst"]; got != 0 {
-		t.Fatalf("server-side copy requests = %d, want 0 (the destination must hold independent bytes)", got)
+	// Bytes were copied, not aliased: the destination must be its own object,
+	// not the source's file id behind a second name (the server-side ?copy
+	// endpoint attaches the source's file id, i.e. a hardlink).
+	if b.SharesObject("/dir/src", "/dir/dst") {
+		t.Fatal("the copy produced an alias of the source, not an independent object")
 	}
 	if got := b.Requests()["GET /v1/fs/dir/src"]; got != 1 {
 		t.Fatalf("source GETs = %d, want 1", got)
@@ -446,5 +447,39 @@ func TestCopyConditionalCommitAboveInlineThresholdUsesMultipart(t *testing.T) {
 	node, ok := b.Node("/dir/dst")
 	if !ok || string(node.Data) != payload {
 		t.Fatalf("destination = %d bytes (ok=%v), want %d", len(node.Data), ok, len(payload))
+	}
+}
+
+// A destination absent at the check can still be created by an API writer
+// before the unconditional commit lands; that writer's tags must not survive
+// the replacement.
+func TestCopyClearsTagsOfConcurrentlyCreatedDestination(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.SeedDir("/dir", 0o755)
+	b.Seed("/dir/src", []byte("copied bytes"))
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/fs/dir/src" {
+			// An API writer takes the absent destination while the source
+			// streams, carrying its own tags.
+			b.SeedWithTags("/dir/dst", []byte("INTRUDER"), map[string]string{"team": "new"})
+		}
+		b.ServeHTTP(w, r)
+	}))
+	t.Cleanup(ts.Close)
+	c := client.New(ts.URL, "test-key")
+	c.Warm(t.Context())
+	handler := NewHandler(c, Options{})
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, copyRequest(t, "/dir/src", "/dir/dst"))
+	if rr.Code >= 300 {
+		t.Fatalf("COPY over a concurrently created destination = %d: %s", rr.Code, rr.Body.String())
+	}
+	node, ok := b.Node("/dir/dst")
+	if !ok || string(node.Data) != "copied bytes" {
+		t.Fatalf("destination = %q (ok=%v), want the copied bytes", node.Data, ok)
+	}
+	if len(node.Tags) != 0 {
+		t.Fatalf("concurrent writer's tags survived the replacement: %v", node.Tags)
 	}
 }

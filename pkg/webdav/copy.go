@@ -155,7 +155,11 @@ func (cp *copyFastPath) serve(w http.ResponseWriter, r *http.Request) bool {
 		_ = file.Close()
 		return false
 	}
-	if created && r.Header.Get("Overwrite") == "F" {
+	// createOnly is the one case where the commit itself proves the
+	// destination was absent when it landed; every other shape may replace a
+	// destination that appeared after our check.
+	createOnly := created && r.Header.Get("Overwrite") == "F"
+	if createOnly {
 		// The destination was absent when we checked; commit create-only so a
 		// concurrent API writer that takes the name during the copy is NOT
 		// clobbered (the server rejects a commit whose expected revision 0 no
@@ -194,7 +198,7 @@ func (cp *copyFastPath) serve(w http.ResponseWriter, r *http.Request) bool {
 	// match content that no longer exists. A created destination never had
 	// any. Tags are drive9 metadata, not WebDAV properties, so a copy does not
 	// carry the source's set — same as x/net, which copies dead props only.
-	if !created {
+	if !createOnly {
 		// DEFINED BEHAVIOR for a replacement whose tag cleanup cannot settle.
 		//
 		// The content publish and the tag replacement are two API calls: the
@@ -210,6 +214,12 @@ func (cp *copyFastPath) serve(w http.ResponseWriter, r *http.Request) bool {
 		// client retry rewrites the content and clears the tags again (the
 		// same indeterminate-outcome contract the PUT commit uses for a
 		// timed-out publish).
+		//
+		// The clear runs for EVERY shape whose commit may have replaced a
+		// destination, not only the one that existed at our first check: the
+		// unconditional commit also replaces a destination an API writer
+		// created in the meantime, and a write without tag headers leaves that
+		// writer's tags in place.
 		var clearErr error
 		for attempt := 0; attempt < 2; attempt++ {
 			if clearErr = cp.client.SetMetadataCtx(ctx, dstRemote, client.SetMetadataOptions{Tags: map[string]string{}}); clearErr == nil {
