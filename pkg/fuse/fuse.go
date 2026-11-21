@@ -2132,6 +2132,13 @@ func (f *FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name string)
 		return st
 	}
 	f.inodes.AdjustLinkCount(header.NodeId, -1)
+	// Detach the removed directory's NAME while keeping its inode for the
+	// references that outlive it (an open descriptor, a process cwd). Left
+	// mapped, the name would hand the removed object's nodeid to a later
+	// mkdir, and every pathname operation the tombstone answers would
+	// resolve to the replacement — an open directory descriptor silently
+	// switching to a different directory is the visible consequence.
+	f.inodes.RemoveDirLink(child)
 	f.touchParentMtime(header.NodeId)
 	f.mutated(fs.EventDelete, child)
 	f.markNameNegative(child)
@@ -2815,9 +2822,16 @@ func (f *FS) dispatchPath(nodeid, fh uint64) (string, bool) {
 		if h, ok := f.handles.get(fh); ok && h.ino == nodeid {
 			return h.path, true
 		}
-		// Directory descriptors (opendir handles) resolve the same way:
-		// an fstat by dirfd on a detached directory keeps answering from
-		// its handle.
+		// Directory descriptors (opendir handles) resolve the same way: an
+		// fstat by dirfd on a detached directory keeps answering from its
+		// handle. The recorded path may name a RECYCLED name by now, so this
+		// fallback must stay limited to inode-addressed metadata operations:
+		// GetAttr answers a detached inode from the entry itself (its
+		// Unlinked branch) without consulting the path, SetAttr rejects a
+		// detached inode before dispatching (ESTALE for the descriptor form),
+		// and the remaining users (flush, fsync, release, lseek) either
+		// ignore the path or fail harmlessly against a name that is gone.
+		// Pathname mutations never come through here.
 		if d, ok := f.dirs.get(fh); ok && d.ino == nodeid {
 			return d.path, true
 		}
@@ -3191,13 +3205,13 @@ func (f *FS) OpenDir(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse.O
 // snapshot then serves the whole enumeration sequence (v1 DirHandle.Entries):
 // an offset-0 restart — gVisor rewinds one host fd this way — replays the
 // same snapshot instead of appending a second copy of every entry.
-func (f *FS) loadDirEntries(cancel <-chan struct{}, input *gofuse.ReadIn, dh *dirHandle) gofuse.Status {
+func (f *FS) loadDirEntries(cancel <-chan struct{}, input *gofuse.ReadIn, dh *dirHandle, dirPath string) gofuse.Status {
 	// The snapshot holds REAL entries only (v1 DirHandle.Entries): "." and
 	// ".." are synthesized at emit time with their fixed offsets, so index
 	// math and the v1 offset scheme (dots at 1/2, entry i at i+3) stay
 	// aligned.
 	if f.Ctx.DirCache != nil {
-		if cached, ok := f.Ctx.DirCache.Get(dh.path); ok {
+		if cached, ok := f.Ctx.DirCache.Get(dirPath); ok {
 			entries := make([]fs.Entry, 0, len(cached))
 			for _, ci := range cached {
 				kind := fs.KindFile
@@ -3228,7 +3242,7 @@ func (f *FS) loadDirEntries(cancel <-chan struct{}, input *gofuse.ReadIn, dh *di
 	// entries until the next invalidation.
 	for attempt := 0; ; attempt++ {
 		gen := f.viewGen.Load()
-		res, st := f.dispatch(ctx, &fs.Op{Kind: fs.OpList, Path: dh.path, Ino: input.NodeId, Fh: input.Fh, Kernel: input, Caller: fs.CallerFrom(input.InHeader)})
+		res, st := f.dispatch(ctx, &fs.Op{Kind: fs.OpList, Path: dirPath, Ino: input.NodeId, Fh: input.Fh, Kernel: input, Caller: fs.CallerFrom(input.InHeader)})
 		if st != gofuse.OK {
 			return st
 		}
@@ -3246,7 +3260,7 @@ func (f *FS) loadDirEntries(cancel <-chan struct{}, input *gofuse.ReadIn, dh *di
 			return gofuse.EAGAIN
 		}
 		if f.Ctx.DirCache != nil {
-			f.Ctx.DirCache.Put(dh.path, dirEntriesFrom(res.Entries))
+			f.Ctx.DirCache.Put(dirPath, dirEntriesFrom(res.Entries))
 		}
 		dh.entries = append([]fs.Entry(nil), res.Entries...)
 		f.viewMu.RUnlock()
@@ -3266,6 +3280,27 @@ func childPathOf(dir, name string) string {
 	return pathutil.JoinPath(dir, name)
 }
 
+// dirHandlePath resolves the directory an open READDIR descriptor names, BY
+// INODE instead of the path captured at opendir. Two behaviours depend on it:
+//
+//   - A renamed directory keeps enumerating through its new name; the
+//     open-time path would answer ENOENT for a directory that still exists.
+//   - A REMOVED directory has no name left. Linux answers ENOENT for
+//     getdents on a rmdir'd descriptor, and — crucially — the descriptor must
+//     never fall back to a pathname lookup: the recycled name may by then
+//     belong to a different directory, whose contents it must not reveal.
+//
+// The resolved path is RETURNED, never written back: dirHandle.path is
+// published under dirTable's lock and is read WITHOUT the handle's read token
+// by dispatchPath (fstat on a detached directory descriptor, SetAttr,
+// flush/release), so mutating it here would race with those readers. Callers
+// thread the returned path through their enumeration.
+//
+// The caller holds the handle's read token.
+func (f *FS) dirHandlePath(dh *dirHandle) (string, bool) {
+	return f.inodes.GetPath(dh.ino)
+}
+
 func (f *FS) ReadDir(cancel <-chan struct{}, input *gofuse.ReadIn, out *gofuse.DirEntryList) gofuse.Status {
 	dh, ok := f.dirs.get(input.Fh)
 	if !ok {
@@ -3277,6 +3312,10 @@ func (f *FS) ReadDir(cancel <-chan struct{}, input *gofuse.ReadIn, out *gofuse.D
 		return gofuse.EINTR
 	}
 	defer dh.unlockRead()
+	dirPath, ok := f.dirHandlePath(dh)
+	if !ok {
+		return gofuse.ENOENT
+	}
 	if dh.takeStale() {
 		dh.entries = nil
 	}
@@ -3286,17 +3325,17 @@ func (f *FS) ReadDir(cancel <-chan struct{}, input *gofuse.ReadIn, out *gofuse.D
 		// with refresh) — drop the cached snapshot too, or the TTL window
 		// would answer the "refetch" with the stale listing.
 		if f.gvisorCompat && input.Offset == 0 && f.Ctx.DirCache != nil {
-			f.Ctx.DirCache.Invalidate(dh.path)
+			f.Ctx.DirCache.Invalidate(dirPath)
 		}
 		dh.entries = nil
-		if st := f.loadDirEntries(cancel, input, dh); st != gofuse.OK {
+		if st := f.loadDirEntries(cancel, input, dh, dirPath); st != gofuse.OK {
 			return st
 		}
 	}
 	// POSIX readdir yields "." and ".." first: they occupy offsets 1 and 2,
 	// real entry i occupies i+3, so the kernel can resume past the synthetic
 	// entries without skipping children (v1 offset scheme).
-	dots := f.dotDotEntries(dh)
+	dots := f.dotDotEntries(dh, dirPath)
 	for d := int(input.Offset); d < len(dots); d++ {
 		if !out.AddDirEntry(dots[d]) {
 			return gofuse.OK
@@ -3321,7 +3360,7 @@ func (f *FS) ReadDir(cancel <-chan struct{}, input *gofuse.ReadIn, out *gofuse.D
 			// sharing a ResourceID must land on one FUSE inode even on the
 			// first plain READDIR, or st_ino disagrees between aliases and
 			// the alias/kernel caches split.
-			e.Ino = f.inodes.EnsureInodeWithIdentity(childPathOf(dh.path, e.Name), e.Attr.ResourceID, e.Attr.Nlink, e.Attr.IsDir(), e.Attr.Size, e.Attr.Mtime)
+			e.Ino = f.inodes.EnsureInodeWithIdentity(childPathOf(dirPath, e.Name), e.Attr.ResourceID, e.Attr.Nlink, e.Attr.IsDir(), e.Attr.Size, e.Attr.Mtime)
 			f.syncEntrySize(e.Ino, e)
 		}
 		if !out.AddDirEntry(gofuse.DirEntry{Name: e.Name, Ino: e.Ino, Mode: modeBitsOf(e.Attr), Off: uint64(i + len(dots) + 1)}) {
@@ -3354,15 +3393,19 @@ func (f *FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out *gofu
 		return gofuse.EINTR
 	}
 	defer dh.unlockRead()
+	dirPath, ok := f.dirHandlePath(dh)
+	if !ok {
+		return gofuse.ENOENT
+	}
 	if dh.takeStale() {
 		dh.entries = nil
 	}
 	if dh.entries == nil || (f.gvisorCompat && input.Offset == 0) {
 		if f.gvisorCompat && input.Offset == 0 && f.Ctx.DirCache != nil {
-			f.Ctx.DirCache.Invalidate(dh.path)
+			f.Ctx.DirCache.Invalidate(dirPath)
 		}
 		dh.entries = nil
-		if st := f.loadDirEntries(cancel, input, dh); st != gofuse.OK {
+		if st := f.loadDirEntries(cancel, input, dh, dirPath); st != gofuse.OK {
 			return st
 		}
 	}
@@ -3370,7 +3413,7 @@ func (f *FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out *gofu
 	// FORGET later. Emit "." / ".." with FUSE_UNKNOWN_INO and no attributes
 	// (go-fuse nodefs behavior, v1): the kernel builds no dentry for them and
 	// the directory/parent Nlookup accounting stays correct.
-	dots := f.dotDotEntries(dh)
+	dots := f.dotDotEntries(dh, dirPath)
 	for d := int(input.Offset); d < len(dots); d++ {
 		e := dots[d]
 		e.Ino = 0 // AddDirLookupEntry maps 0 -> FUSE_UNKNOWN_INO; no lookup ref.
@@ -3397,7 +3440,7 @@ func (f *FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out *gofu
 		// the pinned identity, so a replacement that lands between two
 		// pages of one enumeration cannot mix the old and new objects in
 		// a single kernel reply set (#918's per-listing fence).
-		childP := childPathOf(dh.path, e.Name)
+		childP := childPathOf(dirPath, e.Name)
 		// Identity pinning and per-reply reference accounting are separate
 		// concerns: the snapshot's inode is resolved WITHOUT a lookup
 		// reference, and one Nlookup reference is granted per successful
@@ -3432,14 +3475,14 @@ func (f *FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out *gofu
 // dotDotEntries returns the synthetic "." and ".." entries for a directory
 // handle. Inodes resolve best-effort: unknown parents serialize as
 // FUSE_UNKNOWN_INO, which the kernel accepts without a lookup refcount.
-func (f *FS) dotDotEntries(dh *dirHandle) []gofuse.DirEntry {
+func (f *FS) dotDotEntries(dh *dirHandle, dirPath string) []gofuse.DirEntry {
 	dirMode := uint32(syscall.S_IFDIR) | 0o755
 	parentIno := uint64(0)
-	if parent := parentDirOf(dh.path); parent != dh.path {
+	if parent := parentDirOf(dirPath); parent != dirPath {
 		if ino, ok := f.inodes.GetInode(parent); ok {
 			parentIno = ino
 		}
-	} else if ino, ok := f.inodes.GetInode(dh.path); ok {
+	} else if ino, ok := f.inodes.GetInode(dirPath); ok {
 		parentIno = ino // root is its own parent
 	}
 	return []gofuse.DirEntry{

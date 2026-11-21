@@ -228,7 +228,7 @@ func testPortListingPublishIsAtomicWithReset(t *testing.T, event fs.EventKind) {
 
 	loaded := make(chan gofuse.Status, 1)
 	go func() {
-		loaded <- f.loadDirEntries(nil, &gofuse.ReadIn{InHeader: gofuse.InHeader{NodeId: dEntry.NodeId}}, dh)
+		loaded <- f.loadDirEntries(nil, &gofuse.ReadIn{InHeader: gofuse.InHeader{NodeId: dEntry.NodeId}}, dh, dh.path)
 	}()
 	<-bc.entered
 	resetDone := make(chan struct{})
@@ -269,7 +269,7 @@ func TestPortDirCacheRoundTripsIdentity(t *testing.T) {
 		t.Fatalf("opendir = %v", st)
 	}
 	dh, _ := f.dirs.get(oout.Fh)
-	if st := f.loadDirEntries(nil, &gofuse.ReadIn{InHeader: gofuse.InHeader{NodeId: dEntry.NodeId}}, dh); st != gofuse.OK {
+	if st := f.loadDirEntries(nil, &gofuse.ReadIn{InHeader: gofuse.InHeader{NodeId: dEntry.NodeId}}, dh, dh.path); st != gofuse.OK {
 		t.Fatalf("load = %v", st)
 	}
 	if len(dh.entries) != 1 {

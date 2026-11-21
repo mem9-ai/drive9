@@ -452,6 +452,12 @@ func newWriteOnlyTestClient(t *testing.T, onWrite func(string)) *client.Client {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/status":
+			// The commit routes small bodies through the client's transport
+			// decision, which needs the server's inline threshold to choose
+			// the direct PUT (the fake has no multipart endpoints).
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok","inline_threshold":1048576}`))
 		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/dir":
 			w.Header().Set("X-Dat9-IsDir", "true")
 			w.WriteHeader(http.StatusOK)
@@ -476,7 +482,9 @@ func newWriteOnlyTestClient(t *testing.T, onWrite func(string)) *client.Client {
 		}
 	}))
 	t.Cleanup(srv.Close)
-	return client.New(srv.URL, "test-key")
+	c := client.New(srv.URL, "test-key")
+	c.Warm(t.Context())
+	return c
 }
 
 func newDeadPropTestClient(t *testing.T) *client.Client {

@@ -147,13 +147,13 @@ func TestReadDirPlusDotsDoNotPinLookups(t *testing.T) {
 		t.Fatal(st)
 	}
 	dh := &dirHandle{path: "/d", ino: lout.NodeId, attr: fs.Attr{Kind: fs.KindDir, Mode: 0o755}}
-	dots := f.dotDotEntries(dh)
+	dots := f.dotDotEntries(dh, dh.path)
 	if len(dots) != 2 || dots[0].Name != "." || dots[1].Name != ".." {
 		t.Fatalf("dots = %v", dots)
 	}
 	// The parent resolves best-effort; the root is its own parent.
 	rootDh := &dirHandle{path: "/", ino: 1, attr: fs.Attr{Kind: fs.KindDir, Mode: 0o755}}
-	rootDots := f.dotDotEntries(rootDh)
+	rootDots := f.dotDotEntries(rootDh, rootDh.path)
 	if rootDots[1].Ino != 1 {
 		t.Fatalf("root .. ino = %d, want 1 (root is its own parent)", rootDots[1].Ino)
 	}
