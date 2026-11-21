@@ -197,7 +197,7 @@ func (c *Client) uploadFSLayerPart(ctx context.Context, part presignedPart, body
 		req.Header.Set(key, value)
 	}
 	req.ContentLength = size
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.doPresigned(req)
 	if err != nil {
 		return "", err
 	}

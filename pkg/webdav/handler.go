@@ -38,6 +38,11 @@ type Options struct {
 	// client's streaming upload path, so a large upload costs disk and the
 	// negotiated transfer window instead of holding the whole body in RSS.
 	// Zero uses DefaultPutBufferBytes.
+	//
+	// COPY is the deliberate exception: WebDAV COPY removes its destination
+	// before writing it, so a staging failure would lose the old content, and
+	// the copy is buffered in memory as it always was (a server-side copy is
+	// tracked as a follow-up).
 	PutBufferBytes int64
 
 	// PutStagingDir is where a PUT body beyond PutBufferBytes is staged.
@@ -219,9 +224,10 @@ func (w *statusCapturingResponseWriter) commit(ctx context.Context, req *putRequ
 				zap.String("error", redactURLCredentials(logErr.Error())),
 			)
 		} else {
-			// A 405 that never reached the file layer (an OpenFile-stage
-			// failure x/net/webdav mapped here) has no captured error: say
-			// so instead of logging an entry that merely looks truncated.
+			// Defensive: today x/net/webdav maps every PUT OpenFile failure to
+			// 409/404, so a 405 always carries a captured error. If that
+			// mapping ever changes, say "no error recorded" instead of
+			// logging an entry that merely looks truncated.
 			fields = append(fields, zap.String("error_kind", "unrecorded"))
 		}
 		logger.Error(ctx, "webdav put commit failed", fields...)

@@ -208,23 +208,19 @@ func (c *DiskReadCache) PutOwned(key DiskReadCacheKey, data []byte) {
 	c.putOwned(key, data, 0)
 }
 
-// InvalidateFile drops every block of one file.
-func (c *DiskReadCache) InvalidateFile(fileID string) {
-	c.removeFiles(c.detachFile(fileID))
-}
-
-// detachFile drops one file's index entries and returns the backing files
-// instead of unlinking them. The caller unlinks them once it is out of any
-// lock or publication fence: an unindexed file is already invisible to
-// readers, and the unlink batch is O(blocks) I/O that must not serialize
-// readers behind it.
-func (c *DiskReadCache) detachFile(fileID string) []string {
+// detachFile drops one file's index entries and returns them WITHOUT
+// unlinking their backing files. The caller routes them through
+// removeDetached once it is out of any lock or publication fence: an
+// unindexed file is already invisible to readers, the unlink batch is
+// O(blocks) I/O that must not serialize readers behind it, and the guarded
+// removal is what keeps a block a reader re-fetched meanwhile alive.
+func (c *DiskReadCache) detachFile(fileID string) []detachedDiskReadCacheEntry {
 	if c == nil || fileID == "" {
 		return nil
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	var detached []string
+	var detached []detachedDiskReadCacheEntry
 	for digest, entry := range c.items {
 		if entry.key.FileID == fileID {
 			detached = append(detached, c.detachEntryLocked(digest, entry))
@@ -238,21 +234,16 @@ func (c *DiskReadCache) detachFile(fileID string) []string {
 	return detached
 }
 
-// InvalidatePathPrefix drops every block under a path prefix.
-func (c *DiskReadCache) InvalidatePathPrefix(prefix string) {
-	c.removeFiles(c.detachPathPrefix(prefix))
-}
-
-// detachPathPrefix drops every index entry under a path prefix and returns the
-// backing files for the caller to unlink outside its lock/fence.
-func (c *DiskReadCache) detachPathPrefix(prefix string) []string {
+// detachPathPrefix drops every index entry under a path prefix and returns them
+// for the guarded removal, like detachFile.
+func (c *DiskReadCache) detachPathPrefix(prefix string) []detachedDiskReadCacheEntry {
 	if c == nil || prefix == "" {
 		return nil
 	}
 	filePrefix := pathDiskReadCacheFileID(prefix)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	var detached []string
+	var detached []detachedDiskReadCacheEntry
 	for digest, entry := range c.items {
 		if strings.HasPrefix(entry.key.Path, prefix) || strings.HasPrefix(entry.key.FileID, filePrefix) {
 			detached = append(detached, c.detachEntryLocked(digest, entry))
@@ -266,18 +257,9 @@ func (c *DiskReadCache) detachPathPrefix(prefix string) []string {
 	return detached
 }
 
-// removeFiles unlinks the backing files a detach call handed back.
-func (c *DiskReadCache) removeFiles(paths []string) {
-	for _, path := range paths {
-		if path != "" {
-			_ = os.Remove(path)
-		}
-	}
-}
-
 // detachEntryLocked removes one entry from the index/LRU/size accounting and
-// returns its backing file WITHOUT unlinking it. The caller must hold c.mu.
-func (c *DiskReadCache) detachEntryLocked(digest string, entry *diskReadCacheEntry) string {
+// returns it WITHOUT unlinking its backing file. The caller must hold c.mu.
+func (c *DiskReadCache) detachEntryLocked(digest string, entry *diskReadCacheEntry) detachedDiskReadCacheEntry {
 	delete(c.items, digest)
 	if entry.elem != nil {
 		c.order.Remove(entry.elem)
@@ -288,12 +270,7 @@ func (c *DiskReadCache) detachEntryLocked(digest string, entry *diskReadCacheEnt
 	}
 	path := entry.path
 	entry.path = ""
-	return path
-}
-
-// InvalidateAll drops every block.
-func (c *DiskReadCache) InvalidateAll() {
-	c.removeDetached(c.detachAll())
+	return detachedDiskReadCacheEntry{digest: digest, path: path}
 }
 
 // Close stops background workers and releases the index.
@@ -523,6 +500,14 @@ func (c *DiskReadCache) pathForDigest(digest string) string {
 	return filepath.Join(c.dir, digest+diskReadCacheEntryExt)
 }
 
+// recoverIndex rebuilds the in-memory index from the on-disk headers.
+//
+// KNOWN WINDOW: a sweep detaches the index inside the fence and unlinks the
+// backing files after it. A crash between the two leaves files that look like
+// valid entries, and recovery re-admits them — resurrecting blocks a sweep had
+// dropped. It is harmless for object-scoped keys (the next open of that object
+// and revision revalidates the identity), but an identity-less (old server)
+// key can be served again; a generation marker in the header would close it.
 func (c *DiskReadCache) recoverIndex() error {
 	entries, err := os.ReadDir(c.dir)
 	if err != nil {

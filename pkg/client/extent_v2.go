@@ -404,7 +404,7 @@ func (c *Client) FetchExtentBlockRange(ctx context.Context, blockURL string, off
 		return nil, err
 	}
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+length-1))
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.doPresigned(req)
 	if err != nil {
 		return nil, err
 	}
@@ -732,7 +732,7 @@ func (c *Client) putExtentBlock(ctx context.Context, url string, headers map[str
 		req.Header.Set(k, v)
 	}
 	req.ContentLength = int64(len(data))
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.doPresigned(req)
 	if err != nil {
 		return err
 	}

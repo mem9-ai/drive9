@@ -93,8 +93,8 @@ func (c *Cache) trackSidecarOpen(p string) {
 	if main == p || !sqliteMainDatabasePath(main) {
 		return
 	}
-	c.Invalidate(main)
-	if c.dsk != nil {
-		c.dsk.InvalidateFile(pathDiskReadCacheFileID(main))
-	}
+	c.fencedSweep(func() []detachedDiskReadCacheEntry {
+		c.mem.Invalidate(main)
+		return c.invalidateDiskPath(main)
+	})
 }

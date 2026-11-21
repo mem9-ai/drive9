@@ -287,7 +287,7 @@ func TestPublicationEpochWaitsForInProgressSweep(t *testing.T) {
 	release := make(chan struct{})
 	swept := make(chan struct{})
 	go func() {
-		c.fencedSweep(func() []string {
+		c.fencedSweep(func() []detachedDiskReadCacheEntry {
 			close(entered)
 			<-release
 			return nil
@@ -371,7 +371,7 @@ func TestFencedSweepUnlinksDiskBlocksAfterReleasingFence(t *testing.T) {
 	}
 
 	var existedInsideFence bool
-	c.fencedSweep(func() []string {
+	c.fencedSweep(func() []detachedDiskReadCacheEntry {
 		detached := c.invalidateDiskPath("/f")
 		if _, err := os.Stat(backing); err == nil {
 			existedInsideFence = true
@@ -432,7 +432,6 @@ func TestEpochCapturedBeforePathSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	releaseRead := make(chan struct{})
 	h := &cachingHandle{
 		cache: c, inner: remoteReadableHandle{stub}, path: "/target",
 		rev: 1, size: 3, objectID: "res-1", revalidate: true,
@@ -454,8 +453,46 @@ func TestEpochCapturedBeforePathSnapshot(t *testing.T) {
 	if err := <-readErr; err != nil {
 		t.Fatalf("in-flight read: %v", err)
 	}
-	close(releaseRead)
 	if data, ok := c.mem.Get("/target", 1); ok {
 		t.Fatalf("read republished %q under the pre-rename path after the sweep", data)
+	}
+}
+
+// A panic inside a sweep must not leave the publication fence write-locked: a
+// recovered panic would otherwise wedge every read in the mount on the fence.
+func TestFencedSweepSurvivesCallbackPanic(t *testing.T) {
+	c, err := New(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	func() {
+		defer func() { _ = recover() }()
+		c.fencedSweep(func() []detachedDiskReadCacheEntry { panic("sweep exploded") })
+	}()
+
+	done := make(chan uint64, 1)
+	go func() { done <- c.publicationEpoch() }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("fence stayed locked after a panic in the sweep")
+	}
+}
+
+// The unlink batch must keep a block a reader re-fetched while it was running:
+// the guarded remover checks the digest is still gone before deleting the file.
+func TestRemoveDetachedKeepsReFetchedBlock(t *testing.T) {
+	dsk := newPortDiskCache(t, 1<<20)
+	key := DiskReadCacheKey{FileID: pathDiskReadCacheFileID("/f"), Path: "/f", Revision: 1, Offset: 0, Length: 3}
+	dsk.Put(key, []byte("abc"))
+	detached := dsk.detachFile(key.FileID)
+	if len(detached) != 1 {
+		t.Fatalf("detached entries = %d, want 1", len(detached))
+	}
+	// A reader re-fetches the same block before the batch runs its unlinks.
+	dsk.Put(key, []byte("abc"))
+	dsk.removeDetached(detached)
+	if data, ok := dsk.Get(key); !ok || string(data) != "abc" {
+		t.Fatalf("guarded removal deleted a re-fetched block: %q/%v", data, ok)
 	}
 }

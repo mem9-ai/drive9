@@ -27,10 +27,11 @@ type putConfig struct {
 	// timeout bounds the commit Close performs.
 	timeout time.Duration
 	// noSpill keeps the historical unbounded in-memory staging. The HTTP
-	// layer sets it for writes that are NOT a PUT: x/net/webdav's COPY/MOVE
-	// removes an existing destination BEFORE it opens the replacement, so a
-	// staging failure there would destroy the old content with nothing to
-	// put in its place. Those writes keep their pre-existing failure modes.
+	// layer sets it for a non-PUT write: x/net/webdav's COPY removes an
+	// existing destination BEFORE it opens the replacement, so a staging
+	// failure there would destroy the old content with nothing to put in its
+	// place. COPY keeps the pre-existing in-memory behaviour (with the known
+	// ~2N RSS cost tracked as a follow-up: a server-side copy is the fix).
 	noSpill bool
 }
 

@@ -1169,9 +1169,9 @@ func (c *Client) uploadOnePart(ctx context.Context, part PartURL, data []byte) (
 		req.Header.Set("x-amz-checksum-crc32c", checksum)
 	}
 
-	resp, err := c.httpClient.Do(req) // Direct to S3, no auth header
+	resp, err := c.doPresigned(req) // Direct to S3, no auth header
 	if err != nil {
-		return "", redactPresignedTransportError(err)
+		return "", err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -1529,9 +1529,9 @@ func (c *Client) uploadOnePartV2(ctx context.Context, part presignedPart, data [
 	}
 	req.ContentLength = int64(len(data))
 
-	resp, err := c.httpClient.Do(req) // Direct to S3, no auth header
+	resp, err := c.doPresigned(req) // Direct to S3, no auth header
 	if err != nil {
-		return "", redactPresignedTransportError(err)
+		return "", err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -1576,6 +1576,19 @@ func IsInsufficientStorage(err error) bool {
 	}
 	var presignedErr *presignedPutStatusError
 	return errors.As(err, &presignedErr) && presignedErr.Status == http.StatusInsufficientStorage
+}
+
+// doPresigned performs one DIRECT-TO-OBJECT-STORE request. Every such call
+// goes through here: Go's *url.Error prints the request URL, a presigned URL
+// carries its temporary credential in the query, and the error text reaches
+// loggers far from this package. Redacting at the single source is what makes
+// every consumer safe by construction rather than by remembering to redact.
+func (c *Client) doPresigned(req *http.Request) (*http.Response, error) {
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, redactPresignedTransportError(err)
+	}
+	return resp, nil
 }
 
 // redactPresignedTransportError strips the signed query string from a presigned
@@ -1776,7 +1789,7 @@ func (c *Client) ReadStream(ctx context.Context, path string) (io.ReadCloser, er
 		if err != nil {
 			return nil, err
 		}
-		resp2, err := c.httpClient.Do(req2) // Direct to S3, no auth
+		resp2, err := c.doPresigned(req2) // Direct to S3, no auth
 		if err != nil {
 			return nil, err
 		}
@@ -1945,7 +1958,7 @@ func (c *Client) ReadStreamRange(ctx context.Context, path string, offset, lengt
 		}
 		// Use HTTP Range header for efficient partial read.
 		req2.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+length-1))
-		resp2, err := c.httpClient.Do(req2)
+		resp2, err := c.doPresigned(req2)
 		if err != nil {
 			return nil, err
 		}
@@ -2012,7 +2025,7 @@ func (c *Client) readObjectRangeStrict(ctx context.Context, objectURL string, of
 	}
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+length-1))
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.doPresigned(req)
 	if err != nil {
 		return nil, err
 	}
