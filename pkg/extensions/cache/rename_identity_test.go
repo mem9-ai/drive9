@@ -270,3 +270,44 @@ func TestEventSweepFencesInFlightReadPublication(t *testing.T) {
 		t.Fatalf("in-flight read repopulated the swept target with %q", data)
 	}
 }
+
+// Reading the epoch must wait for an in-progress sweep: an unlocked load can
+// observe the bumped epoch while the tiers and handles still describe the old
+// image, and the publication fence would then accept a read fetched before the
+// sweep finished.
+func TestPublicationEpochWaitsForInProgressSweep(t *testing.T) {
+	c, err := New(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	swept := make(chan struct{})
+	go func() {
+		c.fencedSweep(func() {
+			close(entered)
+			<-release
+		})
+		close(swept)
+	}()
+	<-entered
+
+	captured := make(chan uint64, 1)
+	go func() { captured <- c.publicationEpoch() }()
+	select {
+	case got := <-captured:
+		t.Fatalf("epoch %d captured while the sweep was still running", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(release)
+	<-swept
+	select {
+	case got := <-captured:
+		if want := c.epoch.Load(); got != want {
+			t.Fatalf("captured epoch = %d, want %d after the sweep", got, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("epoch capture never returned after the sweep")
+	}
+}

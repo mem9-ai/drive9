@@ -1710,7 +1710,19 @@ func (c *Client) runMultipartAbort(parent context.Context, fn func(context.Conte
 		go func() { _ = c.abortWithTimeout(parent, timeout, fn) }()
 		return
 	}
-	_ = c.abortWithTimeout(parent, timeout, fn)
+	// Run the attempt in the background and wait for whichever finishes
+	// first: an early failure can still wait for a quick abort, but a caller
+	// that gives up WHILE the cleanup runs stops waiting immediately. The
+	// cleanup itself keeps running on its own bounded context.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = c.abortWithTimeout(parent, timeout, fn)
+	}()
+	select {
+	case <-done:
+	case <-parent.Done():
+	}
 }
 
 // deadlineShorterThan reports whether parent has a deadline less than d away

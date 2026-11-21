@@ -217,7 +217,7 @@ func New(opts Options) (*Cache, error) {
 	c.dirs = newDirPrefetcher(opts.PrefetchClient, opts.RemoteRoot)
 	// Background prefetch publications share the reset epoch: a fetch that
 	// raced a checkout must not repopulate the cleared caches.
-	c.dirs.genFn = func() uint64 { return c.epoch.Load() }
+	c.dirs.genFn = c.publicationEpoch
 	c.dirs.publishFn = c.publishIfCurrent
 	c.dirs.contentEnabled = opts.DirContentPrefetch
 	c.dirs.contentMaxFiles = opts.PrefetchMaxFiles
@@ -593,6 +593,18 @@ func (c *Cache) fencedSweep(sweep func()) {
 	sweep()
 }
 
+// publicationEpoch captures the epoch a read's publications are fenced
+// against. It reads under resetMu's read side so an in-progress sweep finishes
+// FIRST: a plain load can observe the new epoch while the tiers and open
+// handles still describe the old image, and publishIfCurrent would then accept
+// that read after the sweep. A sweep that starts after this capture still
+// changes the epoch and rejects the publication.
+func (c *Cache) publicationEpoch() uint64 {
+	c.resetMu.RLock()
+	defer c.resetMu.RUnlock()
+	return c.epoch.Load()
+}
+
 func (c *Cache) publishIfCurrent(gen uint64, fn func()) bool {
 	c.resetMu.RLock()
 	defer c.resetMu.RUnlock()
@@ -807,7 +819,7 @@ func (c *Cache) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 			}
 			return fs.Result{Data: data}, nil
 		}
-		epoch := c.epoch.Load()
+		epoch := c.publicationEpoch()
 		res, err := next(ctx, op)
 		if err == nil && res.Attr == nil && len(res.Data) > 0 {
 			// Path-addressed reads carry no revision; event invalidation
@@ -915,7 +927,7 @@ func (h *cachingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 	// sweep that lands between the snapshot and a later capture must
 	// invalidate this read's publication, because the bytes it fetches under
 	// the old identity are exactly what the sweep dropped.
-	epoch := h.cache.epoch.Load()
+	epoch := h.cache.publicationEpoch()
 	h.mu.Lock()
 	size, rev, grown, objectID := h.size, h.rev, h.grown, h.objectID
 	h.mu.Unlock()
@@ -997,7 +1009,7 @@ func (c *Cache) readDiskCachedRange(ctx context.Context, h *cachingHandle, off i
 	// The epoch is captured BEFORE the identity snapshot: a sweep that lands
 	// between the snapshot and the publication must reject the pre-sweep
 	// bytes this read is about to fetch.
-	epoch := c.epoch.Load()
+	epoch := c.publicationEpoch()
 	// One identity snapshot: an invalidation may reset size/rev mid-read.
 	h.mu.Lock()
 	size, rev, objectID := h.size, h.rev, h.objectID

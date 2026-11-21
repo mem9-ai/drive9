@@ -151,3 +151,46 @@ func TestMultipartAbortRunsDetachedAfterDeadline(t *testing.T) {
 		t.Fatalf("detached cleanup error = %v, want context.DeadlineExceeded", err)
 	}
 }
+
+// A caller that gives up WHILE the synchronous cleanup is running must stop
+// waiting immediately; the cleanup keeps running on its own bounded context.
+func TestMultipartAbortStopsWaitingWhenCallerCancels(t *testing.T) {
+	c := New("http://127.0.0.1:0", "")
+	c.multipartAbortTimeout = 5 * time.Second
+
+	parent, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	release := make(chan struct{})
+	cleanupDone := make(chan struct{})
+	var once sync.Once
+	stop := func() { once.Do(func() { close(release) }) }
+	t.Cleanup(stop)
+	fn := func(ctx context.Context) error {
+		close(started)
+		select {
+		case <-ctx.Done():
+		case <-release:
+		}
+		close(cleanupDone)
+		return ctx.Err()
+	}
+
+	returned := make(chan struct{})
+	go func() {
+		c.runMultipartAbort(parent, fn)
+		close(returned)
+	}()
+	<-started
+	cancel()
+	select {
+	case <-returned:
+	case <-time.After(time.Second):
+		t.Fatal("cleanup held the caller past its cancellation")
+	}
+	stop()
+	select {
+	case <-cleanupDone:
+	case <-time.After(time.Second):
+		t.Fatal("cleanup did not finish after release")
+	}
+}

@@ -82,7 +82,7 @@ const (
 //   - A failed commit is answered with 500 (or 507 when the storage behind
 //     the write is full), never with 405 Method Not Allowed — which is how
 //     x/net/webdav collapses every write/close error, and which a client
-//     would read as "PUT is unsupported" instead of "nothing was written".
+//     would read as "PUT is unsupported" instead of "the write failed".
 func NewHandler(c *client.Client, opts Options) http.Handler {
 	remoteRoot := opts.RemoteRoot
 	if remoteRoot == "" {
@@ -198,7 +198,7 @@ func (w *statusCapturingResponseWriter) commit(ctx context.Context, req *putRequ
 		code = putFailureStatus(commitErr)
 		// The buffered body is x/net/webdav's text for the ORIGINAL status:
 		// left as-is, a client that shows it would still read "Method Not
-		// Allowed" for a committed-nothing failure.
+		// Allowed" for a failed write.
 		w.body.Reset()
 		w.body.WriteString(http.StatusText(code))
 		// The client only ever sees the status text, so the captured error —
