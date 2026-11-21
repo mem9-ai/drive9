@@ -1701,21 +1701,23 @@ func (c *Client) runMultipartAbort(parent context.Context, fn func(context.Conte
 	if timeout <= 0 {
 		timeout = defaultMultipartAbortTimeout
 	}
-	if parent.Err() != nil {
+	// Detach whenever the cleanup could outlast the caller: an already-done
+	// caller, or one whose remaining budget is shorter than the cleanup's own
+	// timeout. The attempt keeps its FULL timeout in both cases — truncating
+	// it to a millisecond of remaining budget only produces an abort that
+	// expires before the request reaches the server, leaking the session.
+	if parent.Err() != nil || deadlineShorterThan(parent, timeout) {
 		go func() { _ = c.abortWithTimeout(parent, timeout, fn) }()
 		return
 	}
-	if deadline, ok := parent.Deadline(); ok {
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			go func() { _ = c.abortWithTimeout(parent, timeout, fn) }()
-			return
-		}
-		if remaining < timeout {
-			timeout = remaining
-		}
-	}
 	_ = c.abortWithTimeout(parent, timeout, fn)
+}
+
+// deadlineShorterThan reports whether parent has a deadline less than d away
+// (an expired deadline counts).
+func deadlineShorterThan(parent context.Context, d time.Duration) bool {
+	deadline, ok := parent.Deadline()
+	return ok && time.Until(deadline) < d
 }
 
 // abortWithTimeout performs one cleanup attempt bounded by timeout, detached

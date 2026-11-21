@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -31,6 +32,8 @@ func TestMultipartUploadOutlivesNeitherCompleteNorAbortStall(t *testing.T) {
 		}
 	}
 	var aborts atomic.Int32
+	completeReached := make(chan struct{})
+	var completeStarted sync.Once
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
@@ -46,6 +49,7 @@ func TestMultipartUploadOutlivesNeitherCompleteNorAbortStall(t *testing.T) {
 			w.Header().Set("ETag", `"etag"`)
 			w.WriteHeader(http.StatusOK)
 		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/stalled/complete":
+			completeStarted.Do(func() { close(completeReached) })
 			stall(r) // until the caller gives up
 		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/stalled/abort":
 			aborts.Add(1)
@@ -59,11 +63,27 @@ func TestMultipartUploadOutlivesNeitherCompleteNorAbortStall(t *testing.T) {
 
 	api := New(srv.URL, "")
 	api.multipartAbortTimeout = 5 * time.Second // the default the finding names
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 
 	start := time.Now()
-	err := api.WriteMultipartStreamConditional(ctx, "/file", bytes.NewReader([]byte("12345678")), 8, nil, -1)
+	result := make(chan error, 1)
+	go func() {
+		result <- api.WriteMultipartStreamConditional(ctx, "/file", bytes.NewReader([]byte("12345678")), 8, nil, -1)
+	}()
+	// The scenario under test is a STALLED Complete: a failure before that
+	// phase would return quickly and prove nothing about the abort bound.
+	select {
+	case <-completeReached:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Complete was never reached; the upload failed earlier")
+	}
+	var err error
+	select {
+	case err = <-result:
+	case <-time.After(2 * time.Second):
+		t.Fatal("upload did not return after its deadline")
+	}
 	elapsed := time.Since(start)
 	if err == nil {
 		t.Fatal("stalled complete reported success")
@@ -85,10 +105,12 @@ func TestMultipartUploadOutlivesNeitherCompleteNorAbortStall(t *testing.T) {
 // skipped: the upload session must not leak either.
 func TestMultipartAbortRunsDetachedAfterDeadline(t *testing.T) {
 	c := New("http://127.0.0.1:0", "")
-	c.multipartAbortTimeout = 2 * time.Second
+	c.multipartAbortTimeout = 100 * time.Millisecond
 
 	started := make(chan struct{})
 	released := make(chan struct{})
+	release := make(chan struct{})
+	var cleanupErr atomic.Value
 	parent, cancel := context.WithCancel(context.Background())
 	cancel() // the caller is already gone
 
@@ -96,12 +118,17 @@ func TestMultipartAbortRunsDetachedAfterDeadline(t *testing.T) {
 	go func() {
 		c.runMultipartAbort(parent, func(ctx context.Context) error {
 			close(started)
-			<-ctx.Done() // stays bounded by the cleanup's own timeout
+			select {
+			case <-ctx.Done(): // the cleanup's OWN bounded context
+			case <-release:
+			}
+			cleanupErr.Store(ctx.Err())
 			close(released)
 			return ctx.Err()
 		})
 		close(done)
 	}()
+	t.Cleanup(func() { close(release) }) // never strand the goroutine on a regression
 
 	select {
 	case <-done:
@@ -112,5 +139,15 @@ func TestMultipartAbortRunsDetachedAfterDeadline(t *testing.T) {
 	case <-started:
 	case <-time.After(time.Second):
 		t.Fatal("cleanup never ran")
+	}
+	// The detached cleanup must reach its own timeout, not block forever: a
+	// cleanup context that never expires would leave the session open.
+	select {
+	case <-released:
+	case <-time.After(2 * time.Second):
+		t.Fatal("detached cleanup never expired on its own")
+	}
+	if err, _ := cleanupErr.Load().(error); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("detached cleanup error = %v, want context.DeadlineExceeded", err)
 	}
 }
