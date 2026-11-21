@@ -2132,6 +2132,13 @@ func (f *FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name string)
 		return st
 	}
 	f.inodes.AdjustLinkCount(header.NodeId, -1)
+	// Detach the removed directory's NAME while keeping its inode for the
+	// references that outlive it (an open descriptor, a process cwd). Left
+	// mapped, the name would hand the removed object's nodeid to a later
+	// mkdir, and every pathname operation the tombstone answers would
+	// resolve to the replacement — an open directory descriptor silently
+	// switching to a different directory is the visible consequence.
+	f.inodes.RemoveDirLink(child)
 	f.touchParentMtime(header.NodeId)
 	f.mutated(fs.EventDelete, child)
 	f.markNameNegative(child)
@@ -3266,6 +3273,26 @@ func childPathOf(dir, name string) string {
 	return pathutil.JoinPath(dir, name)
 }
 
+// dirHandlePath resolves the directory an open READDIR descriptor names, BY
+// INODE instead of the path captured at opendir. Two behaviours depend on it:
+//
+//   - A renamed directory keeps enumerating through its new name; the
+//     open-time path would answer ENOENT for a directory that still exists.
+//   - A REMOVED directory has no name left. Linux answers ENOENT for
+//     getdents on a rmdir'd descriptor, and — crucially — the descriptor must
+//     never fall back to a pathname lookup: the recycled name may by then
+//     belong to a different directory, whose contents it must not reveal.
+//
+// The caller holds the handle's read token.
+func (f *FS) dirHandlePath(dh *dirHandle) (string, bool) {
+	path, ok := f.inodes.GetPath(dh.ino)
+	if !ok {
+		return "", false
+	}
+	dh.path = path
+	return path, true
+}
+
 func (f *FS) ReadDir(cancel <-chan struct{}, input *gofuse.ReadIn, out *gofuse.DirEntryList) gofuse.Status {
 	dh, ok := f.dirs.get(input.Fh)
 	if !ok {
@@ -3277,6 +3304,9 @@ func (f *FS) ReadDir(cancel <-chan struct{}, input *gofuse.ReadIn, out *gofuse.D
 		return gofuse.EINTR
 	}
 	defer dh.unlockRead()
+	if _, ok := f.dirHandlePath(dh); !ok {
+		return gofuse.ENOENT
+	}
 	if dh.takeStale() {
 		dh.entries = nil
 	}
@@ -3354,6 +3384,9 @@ func (f *FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out *gofu
 		return gofuse.EINTR
 	}
 	defer dh.unlockRead()
+	if _, ok := f.dirHandlePath(dh); !ok {
+		return gofuse.ENOENT
+	}
 	if dh.takeStale() {
 		dh.entries = nil
 	}

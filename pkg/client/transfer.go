@@ -346,6 +346,9 @@ type writeOptions struct {
 	description  string
 	layout       ContentLayout
 	targetLayout ContentLayout
+	// multipartOnly keeps a non-empty seekable upload off the direct-PUT
+	// branch, which materializes the whole reader before sending.
+	multipartOnly bool
 }
 
 // WithTags sets file tags for the upload.
@@ -359,6 +362,18 @@ func WithTags(tags map[string]string) WriteOption {
 func WithDescription(description string) WriteOption {
 	return func(o *writeOptions) {
 		o.description = description
+	}
+}
+
+// WithMultipartOnly routes a seekable upload through the multipart/v2
+// transfer path even when it fits the server's inline (direct-PUT) threshold.
+// The direct branch reads the WHOLE reader into memory before sending, which
+// defeats a caller that deliberately staged a large body off-heap (a spill
+// file). Layout routing — extent vs classic, and their fallbacks — is
+// unchanged. Zero-length uploads keep their direct path.
+func WithMultipartOnly() WriteOption {
+	return func(o *writeOptions) {
+		o.multipartOnly = true
 	}
 }
 
@@ -628,7 +643,11 @@ func (c *Client) writeStreamConditionalWithOptionsAndSummary(ctx context.Context
 	// Multipart is always accepted, so we route any non-zero-size upload
 	// through it until /v1/status warmup populates the cache. Zero-byte
 	// files keep using simple PUT unless targeting extent layout.
-	useDirectPUT := !forceExtent && (size == 0 || (threshold > 0 && size < threshold))
+	// A spill-file caller cannot use the direct branch: it reads the whole
+	// reader into memory (io.ReadAll below), which is exactly what the caller
+	// staged to disk to avoid.
+	forceMultipart := opts.multipartOnly && size > 0
+	useDirectPUT := !forceExtent && !forceMultipart && (size == 0 || (threshold > 0 && size < threshold))
 	if useDirectPUT {
 		summary.Mode = "direct_put"
 		summary.PartSizeBytes = size
@@ -1646,13 +1665,45 @@ func (c *Client) abortUploadV2(ctx context.Context, uploadID string) error {
 const defaultMultipartAbortTimeout = 5 * time.Second
 
 func (c *Client) abortUploadV2BestEffort(parent context.Context, uploadID string) {
+	c.runMultipartAbort(parent, func(ctx context.Context) error {
+		return c.abortUploadV2(ctx, uploadID)
+	})
+}
+
+// runMultipartAbort runs a best-effort upload-session cleanup. The cleanup
+// deliberately outlives the caller's CANCELLATION (the upload request is
+// already on the wire and must be cancelled explicitly), but it must NOT
+// outlive the caller's DEADLINE: a caller that has already given up gets the
+// cleanup detached, so a failed commit can never be held for another full abort
+// timeout after its own deadline expired.
+func (c *Client) runMultipartAbort(parent context.Context, fn func(context.Context) error) {
 	timeout := c.multipartAbortTimeout
 	if timeout <= 0 {
 		timeout = defaultMultipartAbortTimeout
 	}
+	if parent.Err() != nil {
+		go func() { _ = c.abortWithTimeout(parent, timeout, fn) }()
+		return
+	}
+	if deadline, ok := parent.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			go func() { _ = c.abortWithTimeout(parent, timeout, fn) }()
+			return
+		}
+		if remaining < timeout {
+			timeout = remaining
+		}
+	}
+	_ = c.abortWithTimeout(parent, timeout, fn)
+}
+
+// abortWithTimeout performs one cleanup attempt bounded by timeout, detached
+// from the parent's cancellation but not from its values.
+func (c *Client) abortWithTimeout(parent context.Context, timeout time.Duration, fn func(context.Context) error) error {
 	ctx, cancel := newMultipartAbortContext(parent, timeout)
 	defer cancel()
-	_ = c.abortUploadV2(ctx, uploadID)
+	return fn(ctx)
 }
 
 func newMultipartAbortContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {

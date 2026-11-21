@@ -152,11 +152,17 @@ func (c *Cache) noteHit(kind string, hit bool) {
 // cachingHandle decorates an inner handle with the whole-file read cache
 // and the on-disk block tier.
 type cachingHandle struct {
-	cache         *Cache
-	inner         fs.Handle
-	path          string
-	rev           int64
-	size          int64 // open-time size; 0 = unknown
+	cache *Cache
+	inner fs.Handle
+	path  string
+	rev   int64
+	size  int64 // open-time size; 0 = unknown
+	// objectID is the server's object identity for the path
+	// (X-Dat9-Resource-ID, empty when unreported). It names the OBJECT the
+	// open pinned: revisions restart at 1 per file, so (path, revision)
+	// alone cannot tell a replacement from the object a mount-surviving
+	// disk entry was written for.
+	objectID      string
 	prefetch      *Prefetcher
 	prefetchArmed bool
 	// isSidecar marks an open -wal/-journal handle (tracker cleanup).
@@ -387,6 +393,22 @@ func (c *Cache) invalidatePathTiers(path string) {
 		}
 		return true
 	})
+}
+
+// invalidateDiskPaths drops the on-disk blocks addressed by these names and
+// their subtrees. The disk tier is a separate, mount-surviving store, so a
+// namespace mutation that recycles a name must sweep it explicitly.
+func (c *Cache) invalidateDiskPaths(paths ...string) {
+	if c == nil || c.dsk == nil {
+		return
+	}
+	for _, p := range paths {
+		if p == "" {
+			continue
+		}
+		c.dsk.InvalidateFile(pathDiskReadCacheFileID(p))
+		c.dsk.InvalidatePathPrefix(strings.TrimSuffix(p, "/") + "/")
+	}
 }
 
 // markUnverified handles a loss of event-stream continuity (an SSE
@@ -664,11 +686,13 @@ func (c *Cache) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 		}
 		rev := int64(0)
 		size := int64(0)
+		objectID := ""
 		if res.Attr != nil {
 			rev = res.Attr.Rev
 			size = res.Attr.Size
+			objectID = res.Attr.ResourceID
 		}
-		h := &cachingHandle{cache: c, inner: res.Handle, path: op.Path, rev: rev, size: size}
+		h := &cachingHandle{cache: c, inner: res.Handle, path: op.Path, rev: rev, size: size, objectID: objectID}
 		c.open.Store(h, struct{}{})
 		if sqliteJournalPath(op.Path) {
 			c.trackSidecarOpen(op.Path)
@@ -719,7 +743,25 @@ func (c *Cache) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 			}
 			return true
 		})
+		// The rename REPLACED whatever the destination named. The memory
+		// tier drops that image itself (Rename moves the source's images
+		// and evicts the destination's, subtree included); the disk tier is
+		// a separate store and must be swept here, or a reader would fall
+		// through the memory tier onto blocks describing the destroyed
+		// object — the revision a replacement receives can equal the one the
+		// old object had, because the per-file counter restarts at 1.
+		//
+		// The sweep is FENCED: a read that was already in flight may hold
+		// pre-rename bytes and pause before publication. publishIfCurrent
+		// compares the epoch it captured under resetMu, so bumping it and
+		// sweeping in the same critical section makes a pre-rename read
+		// unable to restore the replaced image into the tier after the
+		// rename has completed.
+		c.resetMu.Lock()
+		c.epoch.Add(1)
 		c.mem.Rename(op.Path, op.Path2)
+		c.invalidateDiskPaths(op.Path, op.Path2)
+		c.resetMu.Unlock()
 		return res, nil
 
 	case fs.OpRead:
@@ -849,7 +891,7 @@ func (h *cachingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 	// after (length, revision key, whole-image test) split one read across
 	// two images.
 	h.mu.Lock()
-	size, rev, grown := h.size, h.rev, h.grown
+	size, rev, grown, objectID := h.size, h.rev, h.grown, h.objectID
 	h.mu.Unlock()
 	if rev > 0 && size > 0 && size <= h.cache.mem.MaxFileSize() && !grown && !h.cache.dirs.hasLocalWriteState(path) && !h.cache.sqliteBypassStableCaches(path) {
 		// v1 small-file tier: any offset slices one whole-file image; a
@@ -862,7 +904,7 @@ func (h *cachingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 			return copyReadRange(dest, data, off), nil
 		}
 		h.cache.noteHit("read", false)
-		key := DiskReadCacheKey{FileID: pathDiskReadCacheFileID(path), Path: path, Revision: rev, Offset: 0, Length: size}
+		key := DiskReadCacheKey{FileID: pathDiskReadCacheFileID(path), ObjectID: objectID, Path: path, Revision: rev, Offset: 0, Length: size}
 		// The capture PRECEDES the disk read: a blocking disk fetch that
 		// completes after a reset must not promote its pre-reset bytes.
 		epoch := h.cache.epoch.Load()
@@ -931,7 +973,7 @@ func (c *Cache) readDiskCachedRange(ctx context.Context, h *cachingHandle, off i
 	path := h.identity()
 	// One identity snapshot: an invalidation may reset size/rev mid-read.
 	h.mu.Lock()
-	size, rev := h.size, h.rev
+	size, rev, objectID := h.size, h.rev, h.objectID
 	h.mu.Unlock()
 	block := c.opts.ParallelReadBlockSize
 	if block <= 0 {
@@ -952,7 +994,7 @@ func (c *Cache) readDiskCachedRange(ctx context.Context, h *cachingHandle, off i
 	if length <= 0 {
 		return 0, true
 	}
-	key := DiskReadCacheKey{FileID: pathDiskReadCacheFileID(path), Path: path, Revision: rev, Offset: off, Length: length}
+	key := DiskReadCacheKey{FileID: pathDiskReadCacheFileID(path), ObjectID: objectID, Path: path, Revision: rev, Offset: off, Length: length}
 	if data, ok := c.dsk.Get(key); ok && int64(len(data)) == length {
 		c.noteHit("read", true)
 		return copyReadRange(dest, data, 0), true
@@ -1042,15 +1084,19 @@ func (h *cachingHandle) revalidateRevision(ctx context.Context, path string) (pi
 		h.mu.Unlock()
 		return false, nil
 	}
-	moved := st.Revision <= 0 || st.Revision != h.rev
+	// The pinning pair is (revision, object): a replacement that inherited
+	// the old revision (a per-file counter restarting at 1) still describes
+	// a different object, and every tier keyed below must see the change.
+	moved := st.Revision <= 0 || st.Revision != h.rev ||
+		(st.ResourceID != "" && h.objectID != "" && st.ResourceID != h.objectID)
 	if moved && h.prefetch != nil {
 		h.prefetch.invalidateWithSize(st.Size)
 	}
 	if st.Revision > 0 {
-		h.rev, h.size = st.Revision, st.Size
+		h.rev, h.size, h.objectID = st.Revision, st.Size, st.ResourceID
 	} else {
 		// An old server reports no revision: nothing keys the tiers safely.
-		h.rev, h.size = 0, 0
+		h.rev, h.size, h.objectID = 0, 0, ""
 	}
 	h.revalidate = false
 	h.mu.Unlock()

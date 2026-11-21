@@ -36,9 +36,18 @@ type DiskReadCacheOptions struct {
 	FreeRatio float64
 }
 
-// DiskReadCacheKey identifies one cached block: file, revision, range.
+// DiskReadCacheKey identifies one cached block: object, revision, range.
+//
+// (Path, Revision) alone is NOT an object identity: the server's revision is
+// a per-file counter that restarts at 1, so a replacement created at the same
+// path — or renamed onto it — can present the very same pair the previous
+// object had. ObjectID is the server's object identity for the path and makes
+// the key name the OBJECT, which is what a cache that outlives the mount
+// must do. Empty when the server does not report an identity; the key then
+// degrades to the historical (path, revision) form.
 type DiskReadCacheKey struct {
 	FileID   string
+	ObjectID string
 	Path     string
 	Revision int64
 	Offset   int64
@@ -63,6 +72,7 @@ type DiskReadCache struct {
 
 type diskReadCacheHeader struct {
 	FileID    string `json:"file_id"`
+	ObjectID  string `json:"object_id,omitempty"`
 	Path      string `json:"path,omitempty"`
 	Revision  int64  `json:"revision"`
 	Offset    int64  `json:"offset"`
@@ -281,6 +291,7 @@ func writeDiskReadCacheFile(path string, key DiskReadCacheKey, data []byte) erro
 	}
 	header := diskReadCacheHeader{
 		FileID:    key.FileID,
+		ObjectID:  key.ObjectID,
 		Path:      key.Path,
 		Revision:  key.Revision,
 		Offset:    key.Offset,
@@ -332,7 +343,7 @@ func readDiskReadCacheFile(path string, key DiskReadCacheKey) ([]byte, error) {
 	if err := json.Unmarshal(bytes.TrimSpace(headerData), &header); err != nil {
 		return nil, err
 	}
-	if header.FileID != key.FileID || header.Revision != key.Revision || header.Offset != key.Offset || header.Length != key.Length {
+	if header.FileID != key.FileID || header.ObjectID != key.ObjectID || header.Revision != key.Revision || header.Offset != key.Offset || header.Length != key.Length {
 		return nil, fmt.Errorf("disk read cache: key mismatch")
 	}
 	data, err := io.ReadAll(reader)
@@ -499,6 +510,7 @@ func (c *DiskReadCache) recoverIndex() error {
 		}
 		key := DiskReadCacheKey{
 			FileID:   header.FileID,
+			ObjectID: header.ObjectID,
 			Path:     header.Path,
 			Revision: header.Revision,
 			Offset:   header.Offset,
@@ -568,7 +580,14 @@ func (k DiskReadCacheKey) valid() bool {
 	return k.FileID != "" && k.Revision > 0 && k.Offset >= 0 && k.Length > 0
 }
 
+// digest names one cached block. The object identity joins the key when it is
+// known; an empty identity keeps the historical digest, so entries written
+// without (or against a server without) an identity stay addressable.
 func (k DiskReadCacheKey) digest() string {
-	sum := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d\x00%d\x00%d", k.FileID, k.Revision, k.Offset, k.Length)))
+	key := fmt.Sprintf("%s\x00%d\x00%d\x00%d", k.FileID, k.Revision, k.Offset, k.Length)
+	if k.ObjectID != "" {
+		key += "\x00object\x00" + k.ObjectID
+	}
+	sum := sha256.Sum256([]byte(key))
 	return hex.EncodeToString(sum[:])
 }

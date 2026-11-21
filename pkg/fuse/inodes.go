@@ -1105,6 +1105,37 @@ func (m *InodeToPath) RemoveLinkPreserve(path string) {
 	m.removePathLocked(path, true, true)
 }
 
+// RemoveDirLink removes one directory name after a successful rmdir. Unlike
+// RemoveLink it never drops the inode entry outright: the kernel may still
+// hold references on the removed directory (an open descriptor, a process
+// cwd), so the entry stays as a tombstone that answers inode-addressed
+// operations — but it no longer OWNS the name.
+//
+// The name must be detached, not left mapped: a later mkdir of the same name
+// would otherwise reuse the removed directory's nodeid (reusableInoAtLocked
+// only rejects a KIND change), and every pathname operation the tombstone
+// answers would resolve to whatever object took the recycled name — an open
+// directory descriptor silently switching to a different directory is the
+// visible consequence. POSIX gives a rmdir'd directory no links, so the
+// entry's count drops to 0.
+func (m *InodeToPath) RemoveDirLink(path string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	ino, ok := m.byPath[path]
+	if !ok {
+		return
+	}
+	entry, ok := m.byInode[ino]
+	if !ok {
+		delete(m.byPath, path)
+		return
+	}
+	entry.Nlink = 0
+	entry.Ctime = time.Now()
+	m.detachPathLocked(entry, path)
+}
+
 func inodeResourceKey(resourceID string, isDir bool) string {
 	if isDir || resourceID == "" {
 		return ""
