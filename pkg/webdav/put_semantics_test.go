@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -451,5 +452,62 @@ func TestPutCommitFailureIsLogged(t *testing.T) {
 	}
 	if fields["error"] == nil {
 		t.Fatalf("logged entry carries no error: %v", fields)
+	}
+}
+
+// A COPY writes its destination through the same writer, but only AFTER
+// x/net/webdav has deleted the old destination: a staging failure there would
+// destroy the old content without a replacement. Non-PUT writes therefore keep
+// the in-memory staging, and an overwrite survives an unusable staging dir.
+func TestCopyDestinationSurvivesSpillFailure(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.SeedDir("/dir", 0o755)
+	src := strings.Repeat("s", 4096)
+	b.Seed("/dir/src", []byte(src))
+	b.Seed("/dir/dst", []byte("ORIGINAL"))
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	c := client.New(ts.URL, "test-key")
+	c.Warm(context.Background())
+
+	handler := NewHandler(c, Options{
+		PutBufferBytes: 8, // any source byte would spill a PUT
+		PutStagingDir:  filepath.Join(t.TempDir(), "missing", "staging"),
+	})
+	req := httptest.NewRequest(http.MethodGet, "/dir/src", nil)
+	req.Method = "COPY"
+	req.Header.Set("Destination", "/dir/dst")
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code >= 300 {
+		t.Fatalf("COPY status = %d: %s", rr.Code, rr.Body.String())
+	}
+	node, ok := b.Node("/dir/dst")
+	if !ok || string(node.Data) != src {
+		t.Fatalf("copy destination = %q (ok=%v), want the source content", node.Data, ok)
+	}
+}
+
+// The failure log must not record a presigned URL's signature: it is a
+// temporary write credential, and Go's *url.Error prints the full URL.
+func TestCommitFailureLogRedactsPresignedURL(t *testing.T) {
+	signed := &url.Error{
+		Op:  "Put",
+		URL: "https://bucket.s3.amazonaws.com/obj?X-Amz-Signature=SECRETSIG&X-Amz-Credential=AKIASECRET",
+		Err: errors.New("dial tcp 10.0.0.1:443: i/o timeout"),
+	}
+	logged := redactURLCredentials(signed.Error())
+	if strings.Contains(logged, "SECRETSIG") || strings.Contains(logged, "AKIASECRET") {
+		t.Fatalf("logged error still carries credentials: %q", logged)
+	}
+	if !strings.Contains(logged, "dial tcp") {
+		t.Fatalf("logged error lost its diagnosis: %q", logged)
+	}
+	if got := commitErrorKind(signed); got != "transport" {
+		t.Fatalf("error kind = %q, want transport", got)
+	}
+	if got := commitErrorKind(&client.StatusError{StatusCode: http.StatusInsufficientStorage}); got != "insufficient_storage" {
+		t.Fatalf("storage-full kind = %q", got)
 	}
 }

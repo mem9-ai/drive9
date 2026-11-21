@@ -9,6 +9,8 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -105,6 +107,15 @@ func NewHandler(c *client.Client, opts Options) http.Handler {
 		start := time.Now()
 		recorder := &statusCapturingResponseWriter{ResponseWriter: w}
 		var put *putRequest
+		switch r.Method {
+		case "COPY", "MOVE":
+			// x/net/webdav's cross-resource write: it removes the
+			// destination and then writes it through the same writer a PUT
+			// uses. Mark the request so the writer keeps its in-memory
+			// staging (a staging failure there would lose the old content
+			// with nothing to replace it).
+			r = r.WithContext(context.WithValue(r.Context(), copyWriteKey{}, true))
+		}
 		if r.Method == http.MethodPut {
 			// A PUT's outcome is decided at Close, below x/net/webdav's
 			// status mapping: hold the response, hand the file layer the
@@ -173,9 +184,10 @@ func (w *statusCapturingResponseWriter) statusCode() int {
 }
 
 // commit flushes a buffered PUT response, replacing x/net/webdav's blanket 405
-// for a failed write with the status that tells the client nothing was
-// committed. PUT is always a supported method, so 405 on this path can only
-// mean the write, stat or close failed.
+// for a failed write with the status that tells the client the write did not
+// succeed. PUT is always a supported method, so 405 on this path can only mean
+// the write, stat or close failed. The status is NOT proof that the target is
+// unchanged: a commit that timed out is indeterminate (see NewHandler).
 func (w *statusCapturingResponseWriter) commit(ctx context.Context, req *putRequest) {
 	if !w.buffered {
 		return
@@ -191,21 +203,40 @@ func (w *statusCapturingResponseWriter) commit(ctx context.Context, req *putRequ
 		w.body.WriteString(http.StatusText(code))
 		// The client only ever sees the status text, so the captured error —
 		// including the indeterminate-timeout annotation — is logged here or
-		// it is observable to nobody.
+		// it is observable to nobody. The text is redacted: a presigned part
+		// PUT failure arrives as a *url.Error whose message carries the
+		// signed URL, and that query is a temporary write credential.
 		path, size, elapsed, logErr := req.snapshot()
-		logger.Error(ctx, "webdav put commit failed",
+		fields := []zap.Field{
 			zap.String("path", path),
 			zap.Int64("body_bytes", size),
 			zap.Duration("elapsed", elapsed),
 			zap.Int("status", code),
-			zap.Error(logErr),
-		)
+		}
+		if logErr != nil {
+			fields = append(fields,
+				zap.String("error_kind", commitErrorKind(logErr)),
+				zap.String("error", redactURLCredentials(logErr.Error())),
+			)
+		}
+		logger.Error(ctx, "webdav put commit failed", fields...)
 	}
 	w.status = code
 	w.ResponseWriter.WriteHeader(code)
 	if w.body.Len() > 0 {
 		_, _ = w.ResponseWriter.Write(w.body.Bytes())
 	}
+}
+
+// copyWriteKey marks a COPY/MOVE request. Those write a destination through
+// the same FileSystem.OpenFile path as a PUT, but only AFTER x/net/webdav has
+// deleted the old destination, so the writer must not add the PUT staging
+// failure mode to them.
+type copyWriteKey struct{}
+
+func copyWriteFrom(ctx context.Context) bool {
+	copyWrite, _ := ctx.Value(copyWriteKey{}).(bool)
+	return copyWrite
 }
 
 // putFailureStatus maps a commit failure onto the status a WebDAV client can
@@ -218,6 +249,37 @@ func putFailureStatus(err error) int {
 		return http.StatusInsufficientStorage
 	}
 	return http.StatusInternalServerError
+}
+
+// urlQueryPattern matches a URL's query string, where a presigned object-store
+// URL carries its signature and credential.
+var urlQueryPattern = regexp.MustCompile(`\?[^\s"'<>]*`)
+
+// redactURLCredentials strips URL query strings from a log message. The kind
+// of failure is what operators need; the signature must not be recorded.
+func redactURLCredentials(msg string) string {
+	return urlQueryPattern.ReplaceAllString(msg, "?[redacted]")
+}
+
+// commitErrorKind classifies a commit failure without relying on its text.
+func commitErrorKind(err error) string {
+	switch {
+	case err == nil:
+		return ""
+	case client.IsInsufficientStorage(err):
+		return "insufficient_storage"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "deadline_exceeded"
+	}
+	var statusErr *client.StatusError
+	if errors.As(err, &statusErr) {
+		return "api_status_" + strconv.Itoa(statusErr.StatusCode)
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return "transport"
+	}
+	return "unknown"
 }
 
 func webdavMetricOperation(method string) string {

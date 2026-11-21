@@ -26,6 +26,12 @@ type putConfig struct {
 	stagingDir string
 	// timeout bounds the commit Close performs.
 	timeout time.Duration
+	// noSpill keeps the historical unbounded in-memory staging. The HTTP
+	// layer sets it for writes that are NOT a PUT: x/net/webdav's COPY/MOVE
+	// removes an existing destination BEFORE it opens the replacement, so a
+	// staging failure there would destroy the old content with nothing to
+	// put in its place. Those writes keep their pre-existing failure modes.
+	noSpill bool
 }
 
 func (cfg putConfig) bufferLimit() int64 {
@@ -210,7 +216,7 @@ func (w *writeFile) Write(p []byte) (int, error) {
 	if w.werr != nil {
 		return 0, w.werr
 	}
-	if w.file == nil && w.size+int64(len(p)) > w.put.bufferLimit() {
+	if w.file == nil && !w.put.noSpill && w.size+int64(len(p)) > w.put.bufferLimit() {
 		if err := w.spill(); err != nil {
 			return 0, w.stageFail(err)
 		}
