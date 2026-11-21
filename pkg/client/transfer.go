@@ -1665,13 +1665,45 @@ func (c *Client) abortUploadV2(ctx context.Context, uploadID string) error {
 const defaultMultipartAbortTimeout = 5 * time.Second
 
 func (c *Client) abortUploadV2BestEffort(parent context.Context, uploadID string) {
+	c.runMultipartAbort(parent, func(ctx context.Context) error {
+		return c.abortUploadV2(ctx, uploadID)
+	})
+}
+
+// runMultipartAbort runs a best-effort upload-session cleanup. The cleanup
+// deliberately outlives the caller's CANCELLATION (the upload request is
+// already on the wire and must be cancelled explicitly), but it must NOT
+// outlive the caller's DEADLINE: a caller that has already given up gets the
+// cleanup detached, so a failed commit can never be held for another full abort
+// timeout after its own deadline expired.
+func (c *Client) runMultipartAbort(parent context.Context, fn func(context.Context) error) {
 	timeout := c.multipartAbortTimeout
 	if timeout <= 0 {
 		timeout = defaultMultipartAbortTimeout
 	}
+	if parent.Err() != nil {
+		go func() { _ = c.abortWithTimeout(parent, timeout, fn) }()
+		return
+	}
+	if deadline, ok := parent.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			go func() { _ = c.abortWithTimeout(parent, timeout, fn) }()
+			return
+		}
+		if remaining < timeout {
+			timeout = remaining
+		}
+	}
+	_ = c.abortWithTimeout(parent, timeout, fn)
+}
+
+// abortWithTimeout performs one cleanup attempt bounded by timeout, detached
+// from the parent's cancellation but not from its values.
+func (c *Client) abortWithTimeout(parent context.Context, timeout time.Duration, fn func(context.Context) error) error {
 	ctx, cancel := newMultipartAbortContext(parent, timeout)
 	defer cancel()
-	_ = c.abortUploadV2(ctx, uploadID)
+	return fn(ctx)
 }
 
 func newMultipartAbortContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
