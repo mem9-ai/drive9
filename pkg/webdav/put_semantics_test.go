@@ -246,9 +246,10 @@ func TestPutStagingFailureIsNotCommitted(t *testing.T) {
 	srv := httptest.NewServer(rec)
 	t.Cleanup(srv.Close)
 	c := client.New(srv.URL, "test-key")
+	c.Warm(context.Background()) // so a missing latch really would commit
 
 	fs := &fileSystem{client: c, props: newDeadPropStore(), put: putConfig{
-		bufferBytes: 1,
+		bufferBytes: 4,
 		// A path that cannot be created: the spill fails.
 		stagingDir: filepath.Join(t.TempDir(), "missing", "staging"),
 		timeout:    5 * time.Second,
@@ -258,7 +259,12 @@ func TestPutStagingFailureIsNotCommitted(t *testing.T) {
 		t.Fatalf("OpenFile: %v", err)
 	}
 	wf := file.(*writeFile)
-	if _, err := wf.Write([]byte("payload")); err == nil {
+	// A prefix is staged in memory; the SECOND write crosses the bound and
+	// its spill fails. Without the latch Close would publish the prefix.
+	if _, err := wf.Write([]byte("abc")); err != nil {
+		t.Fatalf("buffered Write: %v", err)
+	}
+	if _, err := wf.Write([]byte("defgh")); err == nil {
 		t.Fatal("Write succeeded although the spill could not be staged")
 	}
 	if wf.werr == nil {
@@ -271,7 +277,7 @@ func TestPutStagingFailureIsNotCommitted(t *testing.T) {
 		t.Fatalf("staging failure reached the server (%d PUTs)", puts)
 	}
 	if body, ok := rec.body("/v1/fs/dir/file.txt"); ok {
-		t.Fatalf("staging failure committed %q", body)
+		t.Fatalf("staging failure committed the truncated prefix %q", body)
 	}
 }
 
