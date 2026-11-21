@@ -381,8 +381,12 @@ func (w *writeFile) Close() error {
 	// not save at all.
 	data := w.buf.Bytes()
 	if w.expectedRevision >= 0 {
-		_, err := w.client.WriteCtxConditionalWithRevision(ctx, w.path, data, w.expectedRevision)
-		return w.commitError(err)
+		// The conditional commit keeps the SAME size-aware transport decision
+		// as the unconditional one: a single direct PUT is rejected by an
+		// S3-backed server for a body at or above its inline threshold (the
+		// large-file branch requires part checksums), so a CAS commit must be
+		// free to take the multipart plane too.
+		return w.commitError(w.client.WriteStreamConditionalWithOptions(ctx, w.path, bytes.NewReader(data), int64(len(data)), nil, w.expectedRevision))
 	}
 	_, err := w.client.WriteStreamWithSummary(ctx, w.path, bytes.NewReader(data), int64(len(data)), nil)
 	return w.commitError(err)

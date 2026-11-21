@@ -396,3 +396,55 @@ func TestCopySymlinkDestinationDelegates(t *testing.T) {
 		t.Fatalf("destination = %q, want the copied bytes", node.Data)
 	}
 }
+
+// A replaced destination's tag clear is a post-condition: if it cannot
+// settle, the COPY must not report success (the retry rewrites and clears it).
+func TestCopyReplaceFailsWhenTagsCannotBeCleared(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.SeedDir("/dir", 0o755)
+	b.Seed("/dir/src", []byte("fresh"))
+	b.SeedWithTags("/dir/dst", []byte("ORIGINAL"), map[string]string{"team": "old"})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Query().Has("setmeta") {
+			http.Error(w, "setmeta unavailable", http.StatusInternalServerError)
+			return
+		}
+		b.ServeHTTP(w, r)
+	}))
+	t.Cleanup(ts.Close)
+	c := client.New(ts.URL, "test-key")
+	c.Warm(t.Context())
+	handler := NewHandler(c, Options{})
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, copyRequest(t, "/dir/src", "/dir/dst"))
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("COPY with an un-clearable destination = %d, want %d", rr.Code, http.StatusInternalServerError)
+	}
+}
+
+// A conditional commit keeps the size-aware transport decision: a classic body
+// at or above the inline threshold must take the multipart plane, not a single
+// direct PUT the server rejects.
+func TestCopyConditionalCommitAboveInlineThresholdUsesMultipart(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.SeedDir("/dir", 0o755)
+	payload := strings.Repeat("k", 2<<20) // 2 MiB, above the 1 MiB inline threshold
+	b.Seed("/dir/src", []byte(payload))
+	handler, _ := newCopySemanticsHandler(t, b, Options{PutBufferBytes: 4 << 20})
+
+	req := copyRequest(t, "/dir/src", "/dir/dst")
+	req.Header.Set("Overwrite", "F") // create-only CAS commit
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("conditional COPY status = %d, want %d: %s", rr.Code, http.StatusCreated, rr.Body.String())
+	}
+	if got := b.Requests()["POST /v2/uploads/initiate"]; got != 1 {
+		t.Fatalf("multipart initiate requests = %d, want 1 (CAS commit took the direct-PUT branch)", got)
+	}
+	node, ok := b.Node("/dir/dst")
+	if !ok || string(node.Data) != payload {
+		t.Fatalf("destination = %d bytes (ok=%v), want %d", len(node.Data), ok, len(payload))
+	}
+}

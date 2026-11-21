@@ -3,6 +3,7 @@ package webdav
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -194,9 +195,20 @@ func (cp *copyFastPath) serve(w http.ResponseWriter, r *http.Request) bool {
 	// any. Tags are drive9 metadata, not WebDAV properties, so a copy does not
 	// carry the source's set — same as x/net, which copies dead props only.
 	if !created {
-		if err := cp.client.SetMetadataCtx(ctx, dstRemote, client.SetMetadataOptions{Tags: map[string]string{}}); err != nil {
-			logger.Warn(ctx, "webdav copy kept the replaced destination's tags",
-				zap.String("path", dstLocal), zap.Error(err))
+		// The copy's post-condition includes the destination being a fresh
+		// resource, so a tag clear that keeps failing must not be reported as
+		// a success: answer 500 and let the client retry (a retry rewrites the
+		// content and clears the tags again).
+		var clearErr error
+		for attempt := 0; attempt < 2; attempt++ {
+			if clearErr = cp.client.SetMetadataCtx(ctx, dstRemote, client.SetMetadataOptions{Tags: map[string]string{}}); clearErr == nil {
+				break
+			}
+		}
+		if clearErr != nil {
+			logCopyFailure(ctx, srcLocal, dstLocal, fmt.Errorf("clear replaced destination tags: %w", clearErr))
+			writeWebDAVStatus(w, http.StatusInternalServerError)
+			return true
 		}
 	}
 
