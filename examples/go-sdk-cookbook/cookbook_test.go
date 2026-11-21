@@ -184,6 +184,7 @@ func ExampleClient_transfersAppendPatchAndStreaming() {
 	_, _ = c.WriteStreamWithSummaryAndTags(ctx, "/uploads/tag-summary.bin", bytes.NewReader(body), int64(len(body)), nil, map[string]string{"kind": "summary"})
 	_, _ = c.WriteStreamWithSummaryAndDescription(ctx, "/uploads/desc-summary.bin", bytes.NewReader(body), int64(len(body)), nil, "description")
 	_ = c.WriteStreamConditional(ctx, "/uploads/cas.bin", bytes.NewReader(body), int64(len(body)), nil, 12)
+	_ = c.WriteStreamConditionalWithOptions(ctx, "/uploads/create-only.bin", bytes.NewReader(body), int64(len(body)), nil, 0, drive9.WithMultipartOnly())
 	_ = c.WriteMultipartStreamConditional(ctx, "/uploads/forced-multipart.bin", reader, int64(len(body)), nil, 12)
 
 	rc, err := c.ReadStream(ctx, "/uploads/payload.bin")
@@ -1016,6 +1017,7 @@ var coveredClientMethods = map[string]bool{
 	"WriteServerStreamConditional":           true,
 	"WriteStream":                            true,
 	"WriteStreamConditional":                 true,
+	"WriteStreamConditionalWithOptions":      true,
 	"WriteStreamWithSummary":                 true,
 	"WriteStreamWithSummaryAndDescription":   true,
 	"WriteStreamWithSummaryAndTags":          true,
