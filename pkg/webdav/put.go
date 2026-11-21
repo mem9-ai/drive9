@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/logger"
+	"go.uber.org/zap"
 	"golang.org/x/net/webdav"
 )
 
@@ -26,12 +28,14 @@ type putConfig struct {
 	stagingDir string
 	// timeout bounds the commit Close performs.
 	timeout time.Duration
-	// noSpill keeps the historical unbounded in-memory staging. The HTTP
-	// layer sets it for a non-PUT write: x/net/webdav's COPY removes an
-	// existing destination BEFORE it opens the replacement, so a staging
-	// failure there would destroy the old content with nothing to put in its
-	// place. COPY keeps the pre-existing in-memory behaviour (with the known
-	// ~2N RSS cost tracked as a follow-up: a server-side copy is the fix).
+	// copyWrite marks a COPY destination. x/net/webdav removes an existing
+	// destination BEFORE it opens the replacement, so a staging failure
+	// there must DEGRADE to in-memory buffering instead of failing the copy:
+	// the old content is already gone and the bytes that did arrive are the
+	// only replacement.
+	copyWrite bool
+	// noSpill is the runtime degradation flag copyWrite sets when staging
+	// fails. It keeps the rest of the request in memory.
 	noSpill bool
 }
 
@@ -219,7 +223,16 @@ func (w *writeFile) Write(p []byte) (int, error) {
 	}
 	if w.file == nil && !w.put.noSpill && w.size+int64(len(p)) > w.put.bufferLimit() {
 		if err := w.spill(); err != nil {
-			return 0, w.stageFail(err)
+			if !w.put.copyWrite {
+				return 0, w.stageFail(err)
+			}
+			// Degrade, don't fail: the destination is already deleted, so a
+			// staging problem must not abort the copy. The rest of the body
+			// stays in memory (bounded by nothing but the copy itself), which
+			// is the pre-existing COPY behaviour, now only on the error path.
+			w.put.noSpill = true
+			logger.Warn(context.Background(), "webdav copy staging failed; buffering the rest in memory",
+				zap.String("path", w.path), zap.Int64("staged_bytes", w.size), zap.Error(err))
 		}
 	}
 	var (
@@ -317,6 +330,17 @@ func (w *writeFile) Close() error {
 	data := w.buf.Bytes()
 	_, err := w.client.WriteStreamWithSummary(ctx, w.path, bytes.NewReader(data), int64(len(data)), nil)
 	return w.commitError(err)
+}
+
+// Abort releases the staged body WITHOUT committing it. The HTTP layer uses it
+// when a copy fails mid-stream: Close would otherwise commit the partial
+// prefix (a COPY has no declared length to compare against).
+func (w *writeFile) Abort() {
+	if w.closed {
+		return
+	}
+	w.closed = true
+	w.cleanup()
 }
 
 // cleanup releases the staged file. A committed or failed PUT leaves nothing

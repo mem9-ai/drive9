@@ -469,9 +469,13 @@ func TestCopyDestinationSurvivesSpillFailure(t *testing.T) {
 	t.Cleanup(ts.Close)
 	c := client.New(ts.URL, "test-key")
 	c.Warm(context.Background())
+	observed, logs := observer.New(zap.WarnLevel)
+	previous := logger.L()
+	logger.Set(zap.New(observed))
+	t.Cleanup(func() { logger.Set(previous) })
 
 	handler := NewHandler(c, Options{
-		PutBufferBytes: 8, // any source byte would spill a PUT
+		PutBufferBytes: 8, // any source byte would spill
 		PutStagingDir:  filepath.Join(t.TempDir(), "missing", "staging"),
 	})
 	req := httptest.NewRequest(http.MethodGet, "/dir/src", nil)
@@ -486,6 +490,11 @@ func TestCopyDestinationSurvivesSpillFailure(t *testing.T) {
 	node, ok := b.Node("/dir/dst")
 	if !ok || string(node.Data) != src {
 		t.Fatalf("copy destination = %q (ok=%v), want the source content", node.Data, ok)
+	}
+	// The copy staged, failed to spill, and degraded to memory instead of
+	// failing with the destination already deleted.
+	if entries := logs.FilterMessage("webdav copy staging failed; buffering the rest in memory").All(); len(entries) != 1 {
+		t.Fatalf("staging-fallback log entries = %d, want 1", len(entries))
 	}
 }
 
