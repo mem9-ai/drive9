@@ -640,7 +640,16 @@ func (w *writeFile) Close() error {
 		_, err := w.client.WriteStreamWithSummary(ctx, w.path, staged, w.size, nil, client.WithMultipartOnly())
 		return w.commitError(err)
 	}
-	return w.commitError(w.client.WriteCtx(ctx, w.path, w.buf.Bytes()))
+	// The in-memory body takes the client's own transport decision too:
+	// WriteStreamWithSummary keeps a direct PUT below the server's inline
+	// threshold and switches to the multipart plane at or above it. A single
+	// direct PUT (WriteCtx) would be REJECTED by an S3-backed server for any
+	// body at or above that threshold — its large-file branch requires part
+	// checksums — so bodies between the threshold and the staging bound would
+	// not save at all.
+	data := w.buf.Bytes()
+	_, err := w.client.WriteStreamWithSummary(ctx, w.path, bytes.NewReader(data), int64(len(data)), nil)
+	return w.commitError(err)
 }
 
 // cleanup releases the staged file. A committed or failed PUT leaves nothing

@@ -332,3 +332,35 @@ func TestPutBodyReadErrorIsNotCommitted(t *testing.T) {
 		t.Fatalf("aborted PUT reached the server (%d PUTs)", puts)
 	}
 }
+
+// An in-memory body must take the same transport decision as a staged one: at
+// or above the server's inline threshold the server routes the write to its
+// large-file branch, which refuses a plain direct PUT for lack of part
+// checksums. Bodies between the threshold and the staging bound would not save
+// at all if the bridge always sent one direct PUT.
+func TestPutInMemoryBodyAboveInlineThresholdUsesMultipart(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.SeedDir("/dir", 0o755)
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	c := client.New(ts.URL, "test-key")
+	c.Warm(context.Background()) // inline_threshold = 1 MiB
+
+	handler := NewHandler(c, Options{PutBufferBytes: 4 << 20}) // body stays in memory
+	payload := strings.Repeat("k", 2<<20)                      // 2 MiB, above the threshold
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, httptest.NewRequest(http.MethodPut, "/dir/file.txt", strings.NewReader(payload)))
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("PUT status = %d, want %d: %s", rr.Code, http.StatusCreated, rr.Body.String())
+	}
+	if got := b.Requests()["POST /v2/uploads/initiate"]; got != 1 {
+		t.Fatalf("multipart initiate requests = %d, want 1 (above-threshold body direct-PUT'd)", got)
+	}
+	if got := b.Requests()["PUT /v1/fs/dir/file.txt"]; got != 0 {
+		t.Fatalf("direct PUT requests = %d, want 0 for an above-threshold body", got)
+	}
+	node, ok := b.Node("/dir/file.txt")
+	if !ok || string(node.Data) != payload {
+		t.Fatalf("committed body = %d bytes, want %d", len(node.Data), len(payload))
+	}
+}
