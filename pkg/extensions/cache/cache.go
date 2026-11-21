@@ -911,7 +911,11 @@ func (h *cachingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 	// ONE identity snapshot for the whole read: an invalidation can clear
 	// or replace size/rev concurrently, and mixing values from before and
 	// after (length, revision key, whole-image test) split one read across
-	// two images.
+	// two images. The publication epoch is captured BEFORE the snapshot: a
+	// sweep that lands between the snapshot and a later capture must
+	// invalidate this read's publication, because the bytes it fetches under
+	// the old identity are exactly what the sweep dropped.
+	epoch := h.cache.epoch.Load()
 	h.mu.Lock()
 	size, rev, grown, objectID := h.size, h.rev, h.grown, h.objectID
 	h.mu.Unlock()
@@ -929,7 +933,6 @@ func (h *cachingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 		key := DiskReadCacheKey{FileID: pathDiskReadCacheFileID(path), ObjectID: objectID, Path: path, Revision: rev, Offset: 0, Length: size}
 		// The capture PRECEDES the disk read: a blocking disk fetch that
 		// completes after a reset must not promote its pre-reset bytes.
-		epoch := h.cache.epoch.Load()
 		if h.cache.dsk != nil {
 			if cached, ok := h.cache.dsk.Get(key); ok && int64(len(cached)) == size {
 				h.cache.noteHit("read", true)
@@ -938,7 +941,6 @@ func (h *cachingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 			}
 		}
 		whole := make([]byte, size)
-		epoch = h.cache.epoch.Load()
 		if n, err := h.inner.Read(ctx, 0, whole); err == nil && int64(n) == size {
 			// A checkout may have replaced the view while this fetch was
 			// in flight: its bytes describe the OLD view and must not be
@@ -959,7 +961,6 @@ func (h *cachingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 			n := copy(dest, data)
 			return n, nil
 		}
-		epoch := h.cache.epoch.Load()
 		n, err := h.inner.Read(ctx, off, dest)
 		// Admission proves the COMPLETE image was read (n == the file
 		// size), not merely that the request buffer filled: caching a
@@ -993,6 +994,10 @@ func (h *cachingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 // direct read.
 func (c *Cache) readDiskCachedRange(ctx context.Context, h *cachingHandle, off int64, dest []byte) (int, bool) {
 	path := h.identity()
+	// The epoch is captured BEFORE the identity snapshot: a sweep that lands
+	// between the snapshot and the publication must reject the pre-sweep
+	// bytes this read is about to fetch.
+	epoch := c.epoch.Load()
 	// One identity snapshot: an invalidation may reset size/rev mid-read.
 	h.mu.Lock()
 	size, rev, objectID := h.size, h.rev, h.objectID
@@ -1023,7 +1028,6 @@ func (c *Cache) readDiskCachedRange(ctx context.Context, h *cachingHandle, off i
 	}
 	c.noteHit("read", false)
 	buf := make([]byte, length)
-	epoch := c.epoch.Load()
 	n, err := h.inner.Read(ctx, off, buf)
 	if err != nil {
 		return 0, false
