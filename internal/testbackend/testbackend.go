@@ -36,6 +36,9 @@ type Node struct {
 	// "single", "" = none). Seeded by tests to model server-side append-log
 	// objects.
 	ContentLayout string
+
+	// Tags is the user-owned tag set (`?setmeta=1` replaces it wholesale).
+	Tags map[string]string
 }
 
 // LayerEntry is one recorded fs-layer entry (the layers subtree is a log,
@@ -148,6 +151,20 @@ func (b *Backend) Seed(path string, data []byte) {
 	b.files[path] = &Node{Data: data, Mode: 0o644, Rev: 1, Mtime: 1}
 }
 
+// SeedWithTags installs a file fixture carrying user tags.
+func (b *Backend) SeedWithTags(path string, data []byte, tags map[string]string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	n := &Node{Data: append([]byte(nil), data...), Mode: 0o644, Rev: 1, Mtime: 1}
+	if len(tags) > 0 {
+		n.Tags = map[string]string{}
+		for k, v := range tags {
+			n.Tags[k] = v
+		}
+	}
+	b.files[path] = n
+}
+
 // SeedDir installs a directory fixture.
 // SeedHardlink plants a second path sharing the node's content, matching
 // the server's hardlink resource-sharing behavior for tests.
@@ -215,7 +232,7 @@ func (b *Backend) Node(path string) (Node, bool) {
 	if !ok {
 		return Node{}, false
 	}
-	return Node{Data: append([]byte(nil), n.Data...), IsDir: n.IsDir, Mode: n.Mode, Rev: n.Rev, Mtime: n.Mtime, ResourceID: n.ResourceID}, true
+	return Node{Data: append([]byte(nil), n.Data...), IsDir: n.IsDir, Mode: n.Mode, Rev: n.Rev, Mtime: n.Mtime, ResourceID: n.ResourceID, Tags: cloneTags(n.Tags)}, true
 }
 
 // Snapshot returns a deep copy of all entries (path → node).
@@ -1413,6 +1430,32 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		w.WriteHeader(http.StatusOK)
 
+	case q.Has("setmeta"):
+		var body struct {
+			Tags        *map[string]string `json:"tags"`
+			Description *string            `json:"description"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		b.mu.Lock()
+		n := b.files[p]
+		if n == nil {
+			b.mu.Unlock()
+			b.writeErr(w, http.StatusNotFound, "not found")
+			return
+		}
+		if body.Tags != nil {
+			if len(*body.Tags) == 0 {
+				n.Tags = nil
+			} else {
+				n.Tags = map[string]string{}
+				for k, v := range *body.Tags {
+					n.Tags[k] = v
+				}
+			}
+		}
+		b.mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+
 	case q.Has("chmod"):
 		var body struct {
 			Mode uint32 `json:"mode"`
@@ -1450,4 +1493,16 @@ func parseRange(rng string, size int64) (int64, int64, bool) {
 		hi = size - 1
 	}
 	return lo, hi + 1, true
+}
+
+// cloneTags copies a tag map (nil stays nil).
+func cloneTags(tags map[string]string) map[string]string {
+	if tags == nil {
+		return nil
+	}
+	out := make(map[string]string, len(tags))
+	for k, v := range tags {
+		out[k] = v
+	}
+	return out
 }

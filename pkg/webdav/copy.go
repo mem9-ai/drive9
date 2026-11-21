@@ -119,6 +119,11 @@ func (cp *copyFastPath) serve(w http.ResponseWriter, r *http.Request) bool {
 		// place would change that other path too. x/net replaces the name
 		// (RemoveAll + create), which is the POSIX copy behaviour.
 		return false
+	case isSymlink(dstStat):
+		// Writing through the name would overwrite the link's stored target
+		// and leave a symlink where a regular copy is expected; x/net removes
+		// the name and creates a regular file.
+		return false
 	}
 
 	src, err := cp.client.ReadStream(ctx, srcRemote)
@@ -182,6 +187,19 @@ func (cp *copyFastPath) serve(w http.ResponseWriter, r *http.Request) bool {
 	props.deleteTree(dstRemote)
 	props.copyTree(srcRemote, dstRemote)
 
+	// A REPLACED destination is a fresh resource under COPY semantics (x/net
+	// removes the name before creating the replacement), so the old object's
+	// user tags must go with it: left behind, they make exact tag queries
+	// match content that no longer exists. A created destination never had
+	// any. Tags are drive9 metadata, not WebDAV properties, so a copy does not
+	// carry the source's set — same as x/net, which copies dead props only.
+	if !created {
+		if err := cp.client.SetMetadataCtx(ctx, dstRemote, client.SetMetadataOptions{Tags: map[string]string{}}); err != nil {
+			logger.Warn(ctx, "webdav copy kept the replaced destination's tags",
+				zap.String("path", dstLocal), zap.Error(err))
+		}
+	}
+
 	if created {
 		writeWebDAVStatus(w, http.StatusCreated)
 	} else {
@@ -232,6 +250,11 @@ func isSpecialOrSymlink(st *client.StatResult) bool {
 	default:
 		return true
 	}
+}
+
+// isSymlink reports a symlink destination, whose dentry x/net replaces.
+func isSymlink(st *client.StatResult) bool {
+	return st != nil && st.HasMode && st.Mode&0o170000 == 0o120000
 }
 
 // writeWebDAVStatus answers like x/net/webdav: the status plus its text,

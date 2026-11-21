@@ -346,3 +346,53 @@ func TestCopyOverwriteFalseSurvivesConcurrentCreate(t *testing.T) {
 		t.Fatalf("concurrent writer's content = %q (ok=%v), want INTRUDER", node.Data, ok)
 	}
 }
+
+// A replaced destination is a fresh resource (x/net removes the name first),
+// so its old user tags must go: otherwise `drive9 fs find -tag` matches
+// content that no longer exists.
+func TestCopyReplaceClearsStaleDestinationTags(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.SeedDir("/dir", 0o755)
+	b.Seed("/dir/src", []byte("fresh"))
+	b.SeedWithTags("/dir/dst", []byte("ORIGINAL"), map[string]string{"team": "old"})
+	handler, _ := newCopySemanticsHandler(t, b, Options{})
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, copyRequest(t, "/dir/src", "/dir/dst"))
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("COPY replace status = %d, want %d: %s", rr.Code, http.StatusNoContent, rr.Body.String())
+	}
+	node, ok := b.Node("/dir/dst")
+	if !ok || string(node.Data) != "fresh" {
+		t.Fatalf("destination = %q (ok=%v), want fresh", node.Data, ok)
+	}
+	if len(node.Tags) != 0 {
+		t.Fatalf("replaced destination kept stale tags: %v", node.Tags)
+	}
+}
+
+// A symlink destination must be replaced by a regular file, as x/net does by
+// removing the name first; writing through it would corrupt the link's target.
+func TestCopySymlinkDestinationDelegates(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.SeedDir("/dir", 0o755)
+	b.Seed("/dir/src", []byte("copied bytes"))
+	b.SeedSymlink("/dir/dst", "/dir/elsewhere")
+	handler, _ := newCopySemanticsHandler(t, b, Options{})
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, copyRequest(t, "/dir/src", "/dir/dst"))
+	if rr.Code >= 300 {
+		t.Fatalf("COPY onto a symlink = %d: %s", rr.Code, rr.Body.String())
+	}
+	node, ok := b.Node("/dir/dst")
+	if !ok {
+		t.Fatal("destination missing after COPY")
+	}
+	if node.Mode&0o170000 == 0o120000 {
+		t.Fatalf("destination is still a symlink (mode %o)", node.Mode)
+	}
+	if string(node.Data) != "copied bytes" {
+		t.Fatalf("destination = %q, want the copied bytes", node.Data)
+	}
+}
