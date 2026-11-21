@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -192,5 +194,76 @@ func TestMultipartAbortStopsWaitingWhenCallerCancels(t *testing.T) {
 	case <-cleanupDone:
 	case <-time.After(time.Second):
 		t.Fatal("cleanup did not finish after release")
+	}
+}
+
+// The cleanup must not observe the caller's cancellation: it stays parked on
+// its OWN context after the caller gives up. A regression that derived the
+// cleanup from the parent would return here immediately.
+func TestMultipartAbortIgnoresCallerCancellation(t *testing.T) {
+	c := New("http://127.0.0.1:0", "")
+	c.multipartAbortTimeout = 5 * time.Second
+
+	parent, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	release := make(chan struct{})
+	cleanupDone := make(chan struct{})
+	var once sync.Once
+	stop := func() { once.Do(func() { close(release) }) }
+	t.Cleanup(stop)
+	fn := func(ctx context.Context) error {
+		close(started)
+		select {
+		case <-ctx.Done():
+		case <-release:
+		}
+		close(cleanupDone)
+		return ctx.Err()
+	}
+
+	returned := make(chan struct{})
+	go func() {
+		c.runMultipartAbort(parent, fn)
+		close(returned)
+	}()
+	<-started
+	cancel()
+	select {
+	case <-returned:
+	case <-time.After(time.Second):
+		t.Fatal("cleanup held the caller past its cancellation")
+	}
+	select {
+	case <-cleanupDone:
+		t.Fatal("cleanup followed the caller's cancellation instead of its own context")
+	case <-time.After(50 * time.Millisecond):
+	}
+	stop()
+	select {
+	case <-cleanupDone:
+	case <-time.After(time.Second):
+		t.Fatal("cleanup did not finish after release")
+	}
+}
+
+// A presigned URL carries a temporary write credential in its query string;
+// a transport failure of a part PUT must not hand it to a logger.
+func TestPresignedTransportErrorIsRedacted(t *testing.T) {
+	signed := &url.Error{
+		Op:  "Put",
+		URL: "https://bucket.s3.amazonaws.com/obj?X-Amz-Signature=SECRETSIG&X-Amz-Credential=AKIASECRET",
+		Err: errors.New("dial tcp 10.0.0.1:443: i/o timeout"),
+	}
+	redacted := redactPresignedTransportError(signed)
+	msg := redacted.Error()
+	if strings.Contains(msg, "SECRETSIG") || strings.Contains(msg, "AKIASECRET") {
+		t.Fatalf("redacted transport error still carries credentials: %q", msg)
+	}
+	if !strings.Contains(msg, "dial tcp") {
+		t.Fatalf("redacted transport error lost its cause: %q", msg)
+	}
+	var urlErr *url.Error
+	if !errors.As(redacted, &urlErr) {
+		t.Fatalf("redacted error = %T, want *url.Error", redacted)
 	}
 }

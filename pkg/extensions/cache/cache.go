@@ -454,23 +454,23 @@ func (c *Cache) markUnverified() {
 		c.invalidateAllTiers()
 		return
 	}
-	c.resetMu.Lock()
-	c.epoch.Add(1)
-	c.unverified.Store(true)
-	c.mem.InvalidateAll()
-	c.open.Range(func(key, _ any) bool {
-		if h, ok := key.(*cachingHandle); ok {
-			h.mu.Lock()
-			if h.prefetch != nil {
-				h.prefetch.Invalidate()
+	c.fencedSweep(func() []string {
+		c.unverified.Store(true)
+		c.mem.InvalidateAll()
+		c.open.Range(func(key, _ any) bool {
+			if h, ok := key.(*cachingHandle); ok {
+				h.mu.Lock()
+				if h.prefetch != nil {
+					h.prefetch.Invalidate()
+				}
+				h.revalidate = true
+				h.identityGen++
+				h.mu.Unlock()
 			}
-			h.revalidate = true
-			h.identityGen++
-			h.mu.Unlock()
-		}
-		return true
+			return true
+		})
+		return nil
 	})
-	c.resetMu.Unlock()
 }
 
 // invalidateAllTiers drops the whole-file memory/disk caches AND every open
@@ -479,44 +479,44 @@ func (c *Cache) markUnverified() {
 // pre-reset image to live descriptors (v1 resetMountViewWithInitialSync
 // invalidated each handle's Prefetch, cancelling in-flight fetches).
 func (c *Cache) invalidateAllTiers() {
-	c.resetMu.Lock()
-	c.epoch.Add(1)
-	// A checkout/reset re-synchronizes the whole view: every tier is swept
-	// and every handle re-pins through a fresh open, so the stream is
-	// continuous again from here. SSE's reset path clears its own
-	// unverified flag without a catch-up, so no EventVerified follows it —
-	// left set, gap mode would stat every warm read for the rest of the
-	// session.
-	c.unverified.Store(false)
-	c.mem.InvalidateAll()
-	// The disk index is dropped inside the fence; the backing files are
-	// unlinked after it (see fencedSweep): the unlink batch must not
-	// serialize every reader publication.
-	var detached []detachedDiskReadCacheEntry
-	if c.dsk != nil {
-		detached = c.dsk.detachAll()
-	}
-	c.open.Range(func(key, _ any) bool {
-		if h, ok := key.(*cachingHandle); ok {
-			h.mu.Lock()
-			if h.prefetch != nil {
-				h.prefetch.Invalidate()
+	c.fencedSweep(func() []string {
+		// A checkout/reset re-synchronizes the whole view: every tier is
+		// swept and every handle re-pins through a fresh open, so the stream
+		// is continuous again from here. SSE's reset path clears its own
+		// unverified flag without a catch-up, so no EventVerified follows it
+		// — left set, gap mode would stat every warm read for the rest of
+		// the session.
+		c.unverified.Store(false)
+		c.mem.InvalidateAll()
+		// The disk index is dropped inside the fence; fencedSweep unlinks the
+		// backing files after it releases the fence.
+		var detached []string
+		if c.dsk != nil {
+			for _, entry := range c.dsk.detachAll() {
+				detached = append(detached, entry.path)
 			}
-			// The open-time size/revision describe the OLD view: keeping
-			// them made a whole-file read re-cache the stale prefix as the
-			// complete image (a grown remote file read as its old length,
-			// with the tail answering EOF). No revalidation either: the
-			// view changed, and the facade fences these descriptors' reads.
-			h.size, h.rev = 0, 0
-			h.grown = false
-			h.revalidate = false
-			h.identityGen++
-			h.mu.Unlock()
 		}
-		return true
+		c.open.Range(func(key, _ any) bool {
+			if h, ok := key.(*cachingHandle); ok {
+				h.mu.Lock()
+				if h.prefetch != nil {
+					h.prefetch.Invalidate()
+				}
+				// The open-time size/revision describe the OLD view: keeping
+				// them made a whole-file read re-cache the stale prefix as the
+				// complete image (a grown remote file read as its old length,
+				// with the tail answering EOF). No revalidation either: the
+				// view changed, and the facade fences these descriptors' reads.
+				h.size, h.rev = 0, 0
+				h.grown = false
+				h.revalidate = false
+				h.identityGen++
+				h.mu.Unlock()
+			}
+			return true
+		})
+		return detached
 	})
-	c.resetMu.Unlock()
-	c.dsk.removeDetached(detached)
 }
 
 // remotePathOf maps a view path to the path the client addresses (the
@@ -899,6 +899,13 @@ func (h *cachingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 	if a, ok := h.inner.(interface{ Anonymous() bool }); ok && a.Anonymous() {
 		return h.inner.Read(ctx, off, dest)
 	}
+	// The publication epoch is captured BEFORE the identity snapshot: a
+	// sweep that lands after this capture (a rename, an event) must reject
+	// whatever this read publishes, and a sweep that started earlier has
+	// already completed under the capture (publicationEpoch takes the read
+	// side of the fence). The reverse order would let a retargeted read
+	// republish the OLD object's bytes under its pre-rename path key.
+	epoch := h.cache.publicationEpoch()
 	// One stable identity for the whole read (cache keys stay coherent
 	// across a concurrent retarget).
 	path := h.identity()
@@ -965,11 +972,7 @@ func (h *cachingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 	// ONE identity snapshot for the whole read: an invalidation can clear
 	// or replace size/rev concurrently, and mixing values from before and
 	// after (length, revision key, whole-image test) split one read across
-	// two images. The publication epoch is captured BEFORE the snapshot: a
-	// sweep that lands between the snapshot and a later capture must
-	// invalidate this read's publication, because the bytes it fetches under
-	// the old identity are exactly what the sweep dropped.
-	epoch := h.cache.publicationEpoch()
+	// two images.
 	h.mu.Lock()
 	size, rev, grown, objectID := h.size, h.rev, h.grown, h.objectID
 	h.mu.Unlock()
@@ -1047,11 +1050,11 @@ func (h *cachingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 // only when the fetch came back whole. ok=false defers to the caller's
 // direct read.
 func (c *Cache) readDiskCachedRange(ctx context.Context, h *cachingHandle, off int64, dest []byte) (int, bool) {
-	path := h.identity()
-	// The epoch is captured BEFORE the identity snapshot: a sweep that lands
-	// between the snapshot and the publication must reject the pre-sweep
-	// bytes this read is about to fetch.
+	// The epoch is captured BEFORE the identity snapshot (path included): a
+	// sweep that lands between the snapshot and the publication must reject
+	// the pre-sweep bytes this read is about to fetch.
 	epoch := c.publicationEpoch()
+	path := h.identity()
 	// One identity snapshot: an invalidation may reset size/rev mid-read.
 	h.mu.Lock()
 	size, rev, objectID := h.size, h.rev, h.objectID

@@ -1171,7 +1171,7 @@ func (c *Client) uploadOnePart(ctx context.Context, part PartURL, data []byte) (
 
 	resp, err := c.httpClient.Do(req) // Direct to S3, no auth header
 	if err != nil {
-		return "", err
+		return "", redactPresignedTransportError(err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -1531,7 +1531,7 @@ func (c *Client) uploadOnePartV2(ctx context.Context, part presignedPart, data [
 
 	resp, err := c.httpClient.Do(req) // Direct to S3, no auth header
 	if err != nil {
-		return "", err
+		return "", redactPresignedTransportError(err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -1576,6 +1576,27 @@ func IsInsufficientStorage(err error) bool {
 	}
 	var presignedErr *presignedPutStatusError
 	return errors.As(err, &presignedErr) && presignedErr.Status == http.StatusInsufficientStorage
+}
+
+// redactPresignedTransportError strips the signed query string from a presigned
+// PUT's transport error. Go's *url.Error prints the full URL, and that query is
+// a temporary write credential: every consumer of the error (loggers in
+// writeback included) must be safe by construction, not by remembering to
+// redact. The wrapped cause is preserved so callers can still classify it.
+func redactPresignedTransportError(err error) error {
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) {
+		return err
+	}
+	return &url.Error{Op: urlErr.Op, URL: redactURLQuery(urlErr.URL), Err: urlErr.Err}
+}
+
+// redactURLQuery drops a raw URL's query string.
+func redactURLQuery(raw string) string {
+	if i := strings.IndexByte(raw, '?'); i >= 0 {
+		return raw[:i] + "?[redacted]"
+	}
+	return raw
 }
 
 // presignOnePart fetches a fresh presigned URL for a single part via
@@ -1701,19 +1722,11 @@ func (c *Client) runMultipartAbort(parent context.Context, fn func(context.Conte
 	if timeout <= 0 {
 		timeout = defaultMultipartAbortTimeout
 	}
-	// Detach whenever the cleanup could outlast the caller: an already-done
-	// caller, or one whose remaining budget is shorter than the cleanup's own
-	// timeout. The attempt keeps its FULL timeout in both cases — truncating
-	// it to a millisecond of remaining budget only produces an abort that
-	// expires before the request reaches the server, leaking the session.
-	if parent.Err() != nil || deadlineShorterThan(parent, timeout) {
-		go func() { _ = c.abortWithTimeout(parent, timeout, fn) }()
-		return
-	}
-	// Run the attempt in the background and wait for whichever finishes
-	// first: an early failure can still wait for a quick abort, but a caller
-	// that gives up WHILE the cleanup runs stops waiting immediately. The
-	// cleanup itself keeps running on its own bounded context.
+	// The cleanup ALWAYS gets its own bounded context (detached from the
+	// caller's cancellation), and the caller never waits past its own Done():
+	// an early failure can still wait for a quick abort, and a caller that
+	// gives up — already, or while the attempt runs — stops waiting
+	// immediately without shortening the attempt.
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -1723,13 +1736,6 @@ func (c *Client) runMultipartAbort(parent context.Context, fn func(context.Conte
 	case <-done:
 	case <-parent.Done():
 	}
-}
-
-// deadlineShorterThan reports whether parent has a deadline less than d away
-// (an expired deadline counts).
-func deadlineShorterThan(parent context.Context, d time.Duration) bool {
-	deadline, ok := parent.Deadline()
-	return ok && time.Until(deadline) < d
 }
 
 // abortWithTimeout performs one cleanup attempt bounded by timeout, detached

@@ -66,11 +66,10 @@ func (f *fileSystem) OpenFile(ctx context.Context, name string, flag int, perm o
 		req := putRequestFrom(ctx)
 		put := f.put
 		if copyWriteFrom(ctx) {
-			// COPY/MOVE writes the destination through this same writer,
-			// after x/net/webdav has already deleted the old destination.
-			// Staging a body there only adds a way to lose the old content,
-			// so those writes keep the in-memory staging this bridge has
-			// always used.
+			// COPY writes the destination through this same writer, after
+			// x/net/webdav has already deleted the old destination. Staging a
+			// body there only adds a way to lose the old content, so COPY
+			// keeps the in-memory staging this bridge has always used.
 			put.noSpill = true
 		}
 		req.recordStart(remote)

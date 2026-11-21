@@ -107,13 +107,13 @@ func NewHandler(c *client.Client, opts Options) http.Handler {
 		start := time.Now()
 		recorder := &statusCapturingResponseWriter{ResponseWriter: w}
 		var put *putRequest
-		switch r.Method {
-		case "COPY", "MOVE":
-			// x/net/webdav's cross-resource write: it removes the
-			// destination and then writes it through the same writer a PUT
-			// uses. Mark the request so the writer keeps its in-memory
-			// staging (a staging failure there would lose the old content
-			// with nothing to replace it).
+		if r.Method == "COPY" {
+			// x/net/webdav's COPY removes the destination and then writes it
+			// through the same writer a PUT uses. (MOVE does not: it removes
+			// the destination and calls Rename, never opening a writer.) Mark
+			// the request so the writer keeps its in-memory staging — a
+			// staging failure there would lose the old content with nothing
+			// to replace it.
 			r = r.WithContext(context.WithValue(r.Context(), copyWriteKey{}, true))
 		}
 		if r.Method == http.MethodPut {
@@ -233,10 +233,10 @@ func (w *statusCapturingResponseWriter) commit(ctx context.Context, req *putRequ
 	}
 }
 
-// copyWriteKey marks a COPY/MOVE request. Those write a destination through
-// the same FileSystem.OpenFile path as a PUT, but only AFTER x/net/webdav has
+// copyWriteKey marks a COPY request. COPY writes its destination through the
+// same FileSystem.OpenFile path as a PUT, but only AFTER x/net/webdav has
 // deleted the old destination, so the writer must not add the PUT staging
-// failure mode to them.
+// failure mode to it.
 type copyWriteKey struct{}
 
 func copyWriteFrom(ctx context.Context) bool {

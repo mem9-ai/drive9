@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"sync"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/mem9-ai/drive9/internal/testbackend"
+	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/fs"
 )
 
@@ -384,5 +386,76 @@ func TestFencedSweepUnlinksDiskBlocksAfterReleasingFence(t *testing.T) {
 	}
 	if c.dsk.Len() != 0 {
 		t.Fatalf("index entries after the sweep = %d, want 0", c.dsk.Len())
+	}
+}
+
+// remoteReadableHandle is an inner plane that claims the remote namespace so
+// the read path runs its revalidation stat (the window between the path
+// snapshot and the publication epoch).
+type remoteReadableHandle struct {
+	*gatedReadHandle
+}
+
+func (h remoteReadableHandle) IsRemoteNamespaceReadable() bool { return true }
+
+// The publication epoch must be captured BEFORE the path/identity snapshot.
+// A rename that lands while the read is revalidating (a remote stat between
+// the two) would otherwise hand the read the post-sweep epoch, and its old
+// bytes would be published under the pre-rename path key — exactly the stale
+// image the fence exists to drop.
+func TestEpochCapturedBeforePathSnapshot(t *testing.T) {
+	statStarted := make(chan struct{})
+	statRelease := make(chan struct{})
+	var statOnce sync.Once
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			http.NotFound(w, r)
+			return
+		}
+		statOnce.Do(func() { close(statStarted) })
+		<-statRelease
+		w.Header().Set("Content-Length", "3")
+		w.Header().Set("X-Dat9-IsDir", "false")
+		w.Header().Set("X-Dat9-Revision", "1")
+		w.Header().Set("X-Dat9-Resource-ID", "res-1")
+		w.Header().Set("X-Dat9-Mtime", "1")
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	stub := &gatedReadHandle{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+		data:    []byte("old"),
+	}
+	c, err := New(Options{PrefetchClient: client.New(srv.URL, "")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseRead := make(chan struct{})
+	h := &cachingHandle{
+		cache: c, inner: remoteReadableHandle{stub}, path: "/target",
+		rev: 1, size: 3, objectID: "res-1", revalidate: true,
+	}
+	readErr := make(chan error, 1)
+	go func() {
+		_, err := h.Read(context.Background(), 0, make([]byte, 3))
+		readErr <- err
+	}()
+	<-statStarted
+
+	// The rename completes (fenced sweep) while the read is between its path
+	// snapshot and its fetch.
+	c.renameTiers("/tmp", "/target")
+
+	close(statRelease)
+	<-stub.started
+	close(stub.release)
+	if err := <-readErr; err != nil {
+		t.Fatalf("in-flight read: %v", err)
+	}
+	close(releaseRead)
+	if data, ok := c.mem.Get("/target", 1); ok {
+		t.Fatalf("read republished %q under the pre-rename path after the sweep", data)
 	}
 }
