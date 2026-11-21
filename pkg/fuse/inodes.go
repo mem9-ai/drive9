@@ -1106,10 +1106,11 @@ func (m *InodeToPath) RemoveLinkPreserve(path string) {
 }
 
 // RemoveDirLink removes one directory name after a successful rmdir. Unlike
-// RemoveLink it never drops the inode entry outright: the kernel may still
-// hold references on the removed directory (an open descriptor, a process
-// cwd), so the entry stays as a tombstone that answers inode-addressed
-// operations — but it no longer OWNS the name.
+// RemoveLink it keeps the inode as a tombstone while any kernel or descriptor
+// reference can still reach it (an open descriptor, a process cwd) — the entry
+// answers inode-addressed operations but no longer OWNS the name. An entry
+// with no such reference is released immediately, so a directory that nobody
+// holds leaves nothing behind.
 //
 // The name must be detached, not left mapped: a later mkdir of the same name
 // would otherwise reuse the removed directory's nodeid (reusableInoAtLocked

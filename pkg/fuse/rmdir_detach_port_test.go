@@ -129,3 +129,39 @@ func TestRemoveDirLinkKeepsTombstoneForOpenDescriptor(t *testing.T) {
 		t.Fatal("test precondition: the entry must carry a kernel lookup")
 	}
 }
+
+// The path a directory handle was published with is IMMUTABLE: enumeration
+// resolves the inode's current name locally, and dispatchPath reads the
+// published field without the handle's read token (fstat on a detached
+// directory descriptor, SetAttr, flush/release). Rewriting it during READDIR
+// would race with those readers on a normal getdents+fstat workload.
+func TestDirHandlePathIsNotRewrittenByEnumeration(t *testing.T) {
+	core := newMemCore()
+	f := newTestFS(t, core)
+
+	var dir gofuse.EntryOut
+	if st := f.Mkdir(nil, &gofuse.MkdirIn{InHeader: *rootHeader(), Mode: 0o755}, "d", &dir); st != gofuse.OK {
+		t.Fatalf("mkdir /d = %v", st)
+	}
+	var opened gofuse.OpenOut
+	if st := f.OpenDir(nil, &gofuse.OpenIn{InHeader: gofuse.InHeader{NodeId: dir.NodeId}}, &opened); st != gofuse.OK {
+		t.Fatalf("opendir = %v", st)
+	}
+	dh, ok := f.dirs.get(opened.Fh)
+	if !ok {
+		t.Fatal("missing dir handle")
+	}
+	if dh.path != "/d" {
+		t.Fatalf("published handle path = %q, want /d", dh.path)
+	}
+	if st := f.Rename(nil, &gofuse.RenameIn{InHeader: gofuse.InHeader{NodeId: 1}, Newdir: 1}, "d", "e"); st != gofuse.OK {
+		t.Fatalf("rename /d -> /e = %v", st)
+	}
+	out := gofuse.NewDirEntryList(make([]byte, 4096), 0)
+	if st := f.ReadDir(nil, &gofuse.ReadIn{InHeader: gofuse.InHeader{NodeId: dir.NodeId}, Fh: opened.Fh, Size: 4096}, out); st != gofuse.OK {
+		t.Fatalf("readdir after the directory moved = %v", st)
+	}
+	if dh.path != "/d" {
+		t.Fatalf("enumeration rewrote the published handle path to %q", dh.path)
+	}
+}
