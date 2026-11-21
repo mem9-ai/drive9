@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -168,5 +169,69 @@ func TestReadCacheRenameMovesSubtree(t *testing.T) {
 	}
 	if _, ok := rc.Get("/src/child", 1); ok {
 		t.Fatal("/src/child survived the rename")
+	}
+}
+
+// gatedReadHandle blocks its first Read until released, so a test can hold a
+// read in flight across a namespace mutation.
+type gatedReadHandle struct {
+	started chan struct{}
+	release chan struct{}
+	data    []byte
+	once    sync.Once
+}
+
+func (h *gatedReadHandle) Read(_ context.Context, off int64, dest []byte) (int, error) {
+	h.once.Do(func() { close(h.started) })
+	<-h.release
+	if off >= int64(len(h.data)) {
+		return 0, nil
+	}
+	return copy(dest, h.data[off:]), nil
+}
+
+func (h *gatedReadHandle) Write(context.Context, int64, []byte) error { return nil }
+func (h *gatedReadHandle) Sync(context.Context) error                 { return nil }
+func (h *gatedReadHandle) Flush(context.Context) error                { return nil }
+func (h *gatedReadHandle) Release(context.Context) error              { return nil }
+
+// A read that is already in flight when a rename replaces its target must not
+// restore the replaced image when it finally publishes: the tier sweep and the
+// publication fence have to be atomic, or a fresh handle would be handed the
+// old bytes (both objects can carry revision 1).
+func TestRenameFencesInFlightReadPublication(t *testing.T) {
+	c, err := New(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner := &gatedReadHandle{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+		data:    []byte("old"),
+	}
+	h := &cachingHandle{cache: c, inner: inner, path: "/target", rev: 1, size: 3}
+
+	readErr := make(chan error, 1)
+	go func() {
+		_, err := h.Read(context.Background(), 0, make([]byte, 3))
+		readErr <- err
+	}()
+	<-inner.started // the read has fetched nothing yet but will publish after the rename
+
+	next := fs.Next(func(context.Context, *fs.Op) (fs.Result, error) {
+		return fs.Result{}, nil
+	})
+	if _, err := c.Do(context.Background(), &fs.Op{Kind: fs.OpRename, Path: "/tmp", Path2: "/target"}, next); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	close(inner.release)
+	if err := <-readErr; err != nil {
+		t.Fatalf("in-flight read: %v", err)
+	}
+	if data, ok := c.mem.Get("/target", 1); ok {
+		t.Fatalf("in-flight read repopulated the replaced target with %q", data)
+	}
+	if c.mem.Size() != 0 {
+		t.Fatalf("cache retained %d bytes after the fenced sweep", c.mem.Size())
 	}
 }

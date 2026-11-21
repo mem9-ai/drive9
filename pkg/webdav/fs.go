@@ -553,7 +553,7 @@ func (w *writeFile) Write(p []byte) (int, error) {
 	}
 	if w.file == nil && w.size+int64(len(p)) > w.put.bufferLimit() {
 		if err := w.spill(); err != nil {
-			return 0, w.fail(err)
+			return 0, w.stageFail(err)
 		}
 	}
 	var (
@@ -567,7 +567,7 @@ func (w *writeFile) Write(p []byte) (int, error) {
 	}
 	w.size += int64(n)
 	if err != nil {
-		return n, w.fail(fmt.Errorf("webdav: stage PUT body: %w", err))
+		return n, w.stageFail(fmt.Errorf("webdav: stage PUT body: %w", err))
 	}
 	return n, nil
 }
@@ -599,8 +599,9 @@ func (w *writeFile) spill() error {
 
 // Close commits the staged body. It is the PUT's commit point: the body is
 // written in one request, and only a server acknowledgement (a committed
-// revision) returns nil. Anything else records the failure and leaves the
-// target untouched.
+// revision) returns nil. A commit that fails before the server publishes
+// leaves the target untouched; one that times out is indeterminate (the server
+// may have published before the acknowledgement deadline).
 func (w *writeFile) Close() error {
 	if w.closed {
 		return nil
@@ -630,15 +631,16 @@ func (w *writeFile) Close() error {
 	defer cancel()
 
 	if w.file != nil {
-		if _, err := w.file.Seek(0, io.SeekStart); err != nil {
-			return w.fail(fmt.Errorf("webdav: read staged PUT body: %w", err))
-		}
-		// The reader is the staged file itself: the streaming upload keeps
-		// memory bounded by the client's transfer window instead of holding
-		// the whole body again.
-		return w.fail(mapError(w.client.WriteStream(ctx, w.path, w.file, w.size, nil)))
+		// A spilled body is a spill-file upload: the multipart plane is
+		// forced, because the direct-PUT branch reads the WHOLE reader into
+		// memory and would undo the staging bound whenever the server's
+		// inline threshold is larger than PutBufferBytes. Layout routing
+		// (extent vs classic) is the client's, unchanged.
+		staged := io.NewSectionReader(w.file, 0, w.size)
+		_, err := w.client.WriteStreamWithSummary(ctx, w.path, staged, w.size, nil, client.WithMultipartOnly())
+		return w.commitError(err)
 	}
-	return w.fail(mapError(w.client.WriteCtx(ctx, w.path, w.buf.Bytes())))
+	return w.commitError(w.client.WriteCtx(ctx, w.path, w.buf.Bytes()))
 }
 
 // cleanup releases the staged file. A committed or failed PUT leaves nothing
@@ -658,6 +660,33 @@ func (w *writeFile) cleanup() {
 func (w *writeFile) fail(err error) error {
 	w.req.fail(err)
 	return err
+}
+
+// commitError records a failed commit. A deadline is annotated as
+// INDETERMINATE rather than failed: the server may have published the revision
+// before the acknowledgement deadline expired, and nothing in the protocol can
+// tell the two apart or roll the write back.
+func (w *writeFile) commitError(err error) error {
+	if err == nil {
+		return nil
+	}
+	err = mapError(err)
+	if errors.Is(err, context.DeadlineExceeded) {
+		err = fmt.Errorf("webdav: commit outcome unknown after PutTimeout: %w", err)
+	}
+	return w.fail(err)
+}
+
+// stageFail latches a STAGING failure on the handle and reports it. The latch
+// is what keeps Close from committing a body that was never fully recorded: a
+// request-body read error is detected separately (putBody), but a failed spill
+// or a short disk write is only visible here, and x/net/webdav still calls
+// Close after the copy fails.
+func (w *writeFile) stageFail(err error) error {
+	if w.werr == nil {
+		w.werr = err
+	}
+	return w.fail(err)
 }
 
 func (w *writeFile) Stat() (os.FileInfo, error) {

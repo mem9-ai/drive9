@@ -7,12 +7,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/mem9-ai/drive9/internal/testbackend"
 	"github.com/mem9-ai/drive9/pkg/client"
 )
 
@@ -121,6 +123,9 @@ func TestPutCommitFailureAnswersServerError(t *testing.T) {
 	if rr.Code != http.StatusInternalServerError {
 		t.Fatalf("failed commit status = %d, want %d", rr.Code, http.StatusInternalServerError)
 	}
+	if body := rr.Body.String(); strings.Contains(body, "Method Not Allowed") {
+		t.Fatalf("failed PUT body = %q; still the 405 text for the rewritten status", body)
+	}
 	if puts := rec.putCount(); puts != 1 {
 		t.Fatalf("server PUTs = %d, want 1", puts)
 	}
@@ -147,13 +152,14 @@ func TestPutCommitIsBoundedByPutTimeout(t *testing.T) {
 // The body is staged, not accumulated: past the in-memory bound the bytes go
 // to a temporary file, and the staged image is what commits.
 func TestPutStagesBodyBeyondMemoryBound(t *testing.T) {
-	rec := newPutRecorder()
-	staging := t.TempDir()
-	srv := httptest.NewServer(rec)
-	t.Cleanup(srv.Close)
-	c := client.New(srv.URL, "test-key")
+	b := testbackend.NewBackend()
+	b.SeedDir("/dir", 0o755)
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	c := client.New(ts.URL, "test-key")
 	c.Warm(context.Background())
 
+	staging := t.TempDir()
 	fs := &fileSystem{client: c, props: newDeadPropStore(), put: putConfig{
 		bufferBytes: 8, stagingDir: staging, timeout: 5 * time.Second,
 	}}
@@ -191,9 +197,81 @@ func TestPutStagesBodyBeyondMemoryBound(t *testing.T) {
 	if entries, _ := os.ReadDir(staging); len(entries) != 0 {
 		t.Fatalf("staging directory kept %d files after commit", len(entries))
 	}
-	body, ok := rec.body("/v1/fs/dir/file.txt")
-	if !ok || string(body) != payload {
-		t.Fatalf("committed body = %d bytes, want %d", len(body), len(payload))
+	node, ok := b.Node("/dir/file.txt")
+	if !ok || string(node.Data) != payload {
+		t.Fatalf("committed body = %d bytes, want %d", len(node.Data), len(payload))
+	}
+}
+
+// A staged body is committed through the multipart plane: the direct-PUT
+// branch reads the whole reader into memory, which would undo the staging
+// bound whenever the server's inline threshold is larger than the spill point.
+func TestPutSpilledBodyCommitsThroughMultipart(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.SeedDir("/dir", 0o755)
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	c := client.New(ts.URL, "test-key")
+	c.Warm(context.Background()) // inline_threshold = 1 MiB, above the body below
+
+	fs := &fileSystem{client: c, props: newDeadPropStore(), put: putConfig{
+		bufferBytes: 4 << 10, stagingDir: t.TempDir(), timeout: 5 * time.Second,
+	}}
+	file, err := fs.OpenFile(context.Background(), "/dir/file.txt", os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	payload := strings.Repeat("m", 256<<10) // below the inline threshold, above the spill bound
+	if _, err := file.Write([]byte(payload)); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if got := b.Requests()["POST /v2/uploads/initiate"]; got != 1 {
+		t.Fatalf("multipart initiate requests = %d, want 1 (spilled body took the direct-PUT branch)", got)
+	}
+	node, ok := b.Node("/dir/file.txt")
+	if !ok || string(node.Data) != payload {
+		t.Fatalf("committed body = %d bytes, want %d", len(node.Data), len(payload))
+	}
+}
+
+// A staging failure must latch: x/net/webdav still calls Close after the copy
+// failed, and an unknown-length (chunked) body has no declared length to
+// compare against, so without the latch Close would publish the staged prefix
+// and report the failure afterwards.
+func TestPutStagingFailureIsNotCommitted(t *testing.T) {
+	rec := newPutRecorder()
+	srv := httptest.NewServer(rec)
+	t.Cleanup(srv.Close)
+	c := client.New(srv.URL, "test-key")
+
+	fs := &fileSystem{client: c, props: newDeadPropStore(), put: putConfig{
+		bufferBytes: 1,
+		// A path that cannot be created: the spill fails.
+		stagingDir: filepath.Join(t.TempDir(), "missing", "staging"),
+		timeout:    5 * time.Second,
+	}}
+	file, err := fs.OpenFile(context.Background(), "/dir/file.txt", os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	wf := file.(*writeFile)
+	if _, err := wf.Write([]byte("payload")); err == nil {
+		t.Fatal("Write succeeded although the spill could not be staged")
+	}
+	if wf.werr == nil {
+		t.Fatal("staging failure was not latched on the handle")
+	}
+	if err := wf.Close(); err == nil {
+		t.Fatal("Close committed after a staging failure")
+	}
+	if puts := rec.putCount(); puts != 0 {
+		t.Fatalf("staging failure reached the server (%d PUTs)", puts)
+	}
+	if body, ok := rec.body("/v1/fs/dir/file.txt"); ok {
+		t.Fatalf("staging failure committed %q", body)
 	}
 }
 

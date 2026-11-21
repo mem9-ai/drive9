@@ -41,9 +41,10 @@ type Options struct {
 	PutStagingDir string
 
 	// PutTimeout bounds the commit a PUT performs at Close. Zero uses
-	// DefaultPutTimeout. An unresponsive or too-slow commit fails the PUT
-	// with a server-error status and leaves the target untouched; it is never
-	// abandoned half-written.
+	// DefaultPutTimeout. It is a client-side give-up, not a rollback: a commit
+	// that fails before the server publishes leaves the target untouched, but
+	// one that TIMES OUT is indeterminate — the server may have applied the
+	// write before the deadline passed, and only the acknowledgement was lost.
 	PutTimeout time.Duration
 }
 
@@ -64,7 +65,13 @@ const (
 //
 //   - The body is committed whole or not at all. A body shorter than the
 //     request's declared Content-Length (an aborted upload) is refused, and a
-//     failed commit leaves the target exactly as it was.
+//     commit that fails BEFORE the server publishes the revision leaves the
+//     target exactly as it was.
+//   - A commit that times out is INDETERMINATE, not failed: the server may
+//     have published the revision before the PutTimeout deadline expired, with
+//     only the acknowledgement lost. There is no client-side rollback and the
+//     WebDAV protocol carries no compare-and-swap to resolve it, so a retry
+//     rewrites the file.
 //   - A successful response (201 Created) means the Drive9 server has
 //     acknowledged the committed revision: the bytes are durable, not
 //     buffered somewhere in this process.
@@ -174,6 +181,11 @@ func (w *statusCapturingResponseWriter) commit(req *putRequest) {
 	code := w.statusCode()
 	if code == http.StatusMethodNotAllowed {
 		code = putFailureStatus(req.failure())
+		// The buffered body is x/net/webdav's text for the ORIGINAL status:
+		// left as-is, a client that shows it would still read "Method Not
+		// Allowed" for a committed-nothing failure.
+		w.body.Reset()
+		w.body.WriteString(http.StatusText(code))
 	}
 	w.status = code
 	w.ResponseWriter.WriteHeader(code)

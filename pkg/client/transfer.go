@@ -346,6 +346,9 @@ type writeOptions struct {
 	description  string
 	layout       ContentLayout
 	targetLayout ContentLayout
+	// multipartOnly keeps a non-empty seekable upload off the direct-PUT
+	// branch, which materializes the whole reader before sending.
+	multipartOnly bool
 }
 
 // WithTags sets file tags for the upload.
@@ -359,6 +362,18 @@ func WithTags(tags map[string]string) WriteOption {
 func WithDescription(description string) WriteOption {
 	return func(o *writeOptions) {
 		o.description = description
+	}
+}
+
+// WithMultipartOnly routes a seekable upload through the multipart/v2
+// transfer path even when it fits the server's inline (direct-PUT) threshold.
+// The direct branch reads the WHOLE reader into memory before sending, which
+// defeats a caller that deliberately staged a large body off-heap (a spill
+// file). Layout routing — extent vs classic, and their fallbacks — is
+// unchanged. Zero-length uploads keep their direct path.
+func WithMultipartOnly() WriteOption {
+	return func(o *writeOptions) {
+		o.multipartOnly = true
 	}
 }
 
@@ -628,7 +643,11 @@ func (c *Client) writeStreamConditionalWithOptionsAndSummary(ctx context.Context
 	// Multipart is always accepted, so we route any non-zero-size upload
 	// through it until /v1/status warmup populates the cache. Zero-byte
 	// files keep using simple PUT unless targeting extent layout.
-	useDirectPUT := !forceExtent && (size == 0 || (threshold > 0 && size < threshold))
+	// A spill-file caller cannot use the direct branch: it reads the whole
+	// reader into memory (io.ReadAll below), which is exactly what the caller
+	// staged to disk to avoid.
+	forceMultipart := opts.multipartOnly && size > 0
+	useDirectPUT := !forceExtent && !forceMultipart && (size == 0 || (threshold > 0 && size < threshold))
 	if useDirectPUT {
 		summary.Mode = "direct_put"
 		summary.PartSizeBytes = size

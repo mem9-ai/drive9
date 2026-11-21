@@ -750,8 +750,18 @@ func (c *Cache) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 		// through the memory tier onto blocks describing the destroyed
 		// object — the revision a replacement receives can equal the one the
 		// old object had, because the per-file counter restarts at 1.
+		//
+		// The sweep is FENCED: a read that was already in flight may hold
+		// pre-rename bytes and pause before publication. publishIfCurrent
+		// compares the epoch it captured under resetMu, so bumping it and
+		// sweeping in the same critical section makes a pre-rename read
+		// unable to restore the replaced image into the tier after the
+		// rename has completed.
+		c.resetMu.Lock()
+		c.epoch.Add(1)
 		c.mem.Rename(op.Path, op.Path2)
 		c.invalidateDiskPaths(op.Path, op.Path2)
+		c.resetMu.Unlock()
 		return res, nil
 
 	case fs.OpRead:
