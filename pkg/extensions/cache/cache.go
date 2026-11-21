@@ -256,10 +256,10 @@ func New(opts Options) (*Cache, error) {
 			if c.dirs != nil {
 				c.dirs.noteWrite(e.Path)
 			}
-			c.mem.Invalidate(e.Path)
-			if c.dsk != nil {
-				c.dsk.InvalidateFile(pathDiskReadCacheFileID(e.Path))
-			}
+			c.fencedSweep(func() {
+				c.mem.Invalidate(e.Path)
+				c.invalidateDiskPath(e.Path)
+			})
 		})
 		opts.Events.On(fs.EventDelete, func(e fs.Event) {
 			c.invalidatePathTiers(e.Path)
@@ -298,16 +298,17 @@ func New(opts Options) (*Cache, error) {
 			// A hardlink alias names the same object: the landing replaces
 			// the image its readers hold under their open-time revision too.
 			aliases := c.aliasSet(e.Path)
-			for alias := range aliases {
-				if e.Rev <= 0 {
-					// No trustworthy revision to keep: drop the alias's
-					// image (v1 settle) — a rev-keyed seed below supersedes it.
-					c.mem.Invalidate(alias)
+			c.fencedSweep(func() {
+				for alias := range aliases {
+					if e.Rev <= 0 {
+						// No trustworthy revision to keep: drop the alias's
+						// image (v1 settle) — a rev-keyed seed below
+						// supersedes it.
+						c.mem.Invalidate(alias)
+					}
+					c.invalidateDiskPath(alias)
 				}
-				if c.dsk != nil {
-					c.dsk.InvalidateFile(pathDiskReadCacheFileID(alias))
-				}
-			}
+			})
 			prefix := strings.TrimSuffix(e.Path, "/") + "/"
 			c.open.Range(func(key, _ any) bool {
 				h, ok := key.(*cachingHandle)
@@ -355,59 +356,59 @@ func New(opts Options) (*Cache, error) {
 // tiers, so a per-file SSE change that skipped them kept answering the old
 // bytes until a full checkout.
 func (c *Cache) invalidatePathTiers(path string) {
-	// Hardlink aliases name the same object: the change is theirs too.
-	aliases := c.aliasSet(path)
-	for alias := range aliases {
-		c.mem.Invalidate(alias)
-		if c.dsk != nil {
-			c.dsk.InvalidateFile(pathDiskReadCacheFileID(alias))
+	c.fencedSweep(func() {
+		// Hardlink aliases name the same object: the change is theirs too.
+		aliases := c.aliasSet(path)
+		for alias := range aliases {
+			c.mem.Invalidate(alias)
+			c.invalidateDiskPath(alias)
 		}
-	}
-	c.mem.InvalidatePrefix(path + "/")
-	if c.dsk != nil {
-		c.dsk.InvalidatePathPrefix(path + "/")
-	}
-	prefix := strings.TrimSuffix(path, "/") + "/"
-	c.open.Range(func(key, _ any) bool {
-		h, ok := key.(*cachingHandle)
-		if !ok {
-			return true
-		}
-		p := h.identity()
-		if _, aliased := aliases[p]; aliased || p == path || strings.HasPrefix(p, prefix) {
-			h.mu.Lock()
-			if h.prefetch != nil {
-				h.prefetch.Invalidate()
+		c.mem.InvalidatePrefix(path + "/")
+		c.invalidateDiskPath(path)
+		prefix := strings.TrimSuffix(path, "/") + "/"
+		c.open.Range(func(key, _ any) bool {
+			h, ok := key.(*cachingHandle)
+			if !ok {
+				return true
 			}
-			// The SSE change replaced this file's remote image: the
-			// handle's open-time size/rev describe the OLD one, and a
-			// whole-file read under it re-cached the stale prefix as the
-			// complete image (the grown tail answered EOF). The next read
-			// re-pins them against the remote instead of leaving the
-			// descriptor off the tiers for the rest of its life.
-			h.size, h.rev = 0, 0
-			h.grown = false
-			h.revalidate = true
-			h.identityGen++
-			h.mu.Unlock()
-		}
-		return true
+			p := h.identity()
+			if _, aliased := aliases[p]; aliased || p == path || strings.HasPrefix(p, prefix) {
+				h.mu.Lock()
+				if h.prefetch != nil {
+					h.prefetch.Invalidate()
+				}
+				// The SSE change replaced this file's remote image: the
+				// handle's open-time size/rev describe the OLD one, and a
+				// whole-file read under it re-cached the stale prefix as the
+				// complete image (the grown tail answered EOF). The next read
+				// re-pins them against the remote instead of leaving the
+				// descriptor off the tiers for the rest of its life.
+				h.size, h.rev = 0, 0
+				h.grown = false
+				h.revalidate = true
+				h.identityGen++
+				h.mu.Unlock()
+			}
+			return true
+		})
 	})
 }
 
-// invalidateDiskPaths drops the on-disk blocks addressed by these names and
-// their subtrees. The disk tier is a separate, mount-surviving store, so a
-// namespace mutation that recycles a name must sweep it explicitly.
-func (c *Cache) invalidateDiskPaths(paths ...string) {
-	if c == nil || c.dsk == nil {
+// invalidateDiskPath drops the on-disk blocks of one name and its subtree.
+// The disk tier is a separate, mount-surviving store, so every namespace
+// mutation that recycles a name must sweep it explicitly.
+func (c *Cache) invalidateDiskPath(path string) {
+	if c == nil || c.dsk == nil || path == "" {
 		return
 	}
+	c.dsk.InvalidateFile(pathDiskReadCacheFileID(path))
+	c.dsk.InvalidatePathPrefix(strings.TrimSuffix(path, "/") + "/")
+}
+
+// invalidateDiskPaths drops the on-disk blocks of several names.
+func (c *Cache) invalidateDiskPaths(paths ...string) {
 	for _, p := range paths {
-		if p == "" {
-			continue
-		}
-		c.dsk.InvalidateFile(pathDiskReadCacheFileID(p))
-		c.dsk.InvalidatePathPrefix(strings.TrimSuffix(p, "/") + "/")
+		c.invalidateDiskPath(p)
 	}
 }
 
@@ -577,6 +578,21 @@ func (c *Cache) dirtyPath(path string) bool {
 
 // publishIfCurrent runs fn iff no reset has landed since gen, atomically
 // with the reset's sweep (the read side of resetMu).
+// fencedSweep runs a cache-invalidating sweep with the publication fence
+// closed: a read that captured an earlier epoch is rejected by
+// publishIfCurrent, so a fetch that began before the sweep cannot restore the
+// image the sweep just dropped. EVERY tier sweep runs through it — a sweep
+// outside the fence leaves exactly the window this closes for renames: a read
+// that fetched the pre-sweep bytes and then publishes them after the sweep
+// (a same-revision replacement, which lands as an event rather than a local
+// OpRename, would look current).
+func (c *Cache) fencedSweep(sweep func()) {
+	c.resetMu.Lock()
+	defer c.resetMu.Unlock()
+	c.epoch.Add(1)
+	sweep()
+}
+
 func (c *Cache) publishIfCurrent(gen uint64, fn func()) bool {
 	c.resetMu.RLock()
 	defer c.resetMu.RUnlock()
@@ -626,10 +642,17 @@ func (c *Cache) StoreOwned(path string, data []byte, revision int64) {
 }
 
 // Invalidate drops one path's cached image.
-func (c *Cache) Invalidate(path string) { c.mem.Invalidate(path) }
+func (c *Cache) Invalidate(path string) {
+	c.fencedSweep(func() { c.mem.Invalidate(path) })
+}
 
 // InvalidatePrefix drops every cached image under a prefix.
-func (c *Cache) InvalidatePrefix(prefix string) { c.mem.InvalidatePrefix(prefix) }
+func (c *Cache) InvalidatePrefix(prefix string) {
+	c.fencedSweep(func() {
+		c.mem.InvalidatePrefix(prefix)
+		c.invalidateDiskPath(prefix)
+	})
+}
 
 // InvalidateAll drops every cached image.
 func (c *Cache) InvalidateAll() { c.mem.InvalidateAll() }
@@ -757,11 +780,10 @@ func (c *Cache) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 		// sweeping in the same critical section makes a pre-rename read
 		// unable to restore the replaced image into the tier after the
 		// rename has completed.
-		c.resetMu.Lock()
-		c.epoch.Add(1)
-		c.mem.Rename(op.Path, op.Path2)
-		c.invalidateDiskPaths(op.Path, op.Path2)
-		c.resetMu.Unlock()
+		c.fencedSweep(func() {
+			c.mem.Rename(op.Path, op.Path2)
+			c.invalidateDiskPaths(op.Path, op.Path2)
+		})
 		return res, nil
 
 	case fs.OpRead:
@@ -1101,10 +1123,10 @@ func (h *cachingHandle) revalidateRevision(ctx context.Context, path string) (pi
 	h.revalidate = false
 	h.mu.Unlock()
 	if moved {
-		c.mem.Invalidate(path)
-		if c.dsk != nil {
-			c.dsk.InvalidateFile(pathDiskReadCacheFileID(path))
-		}
+		c.fencedSweep(func() {
+			c.mem.Invalidate(path)
+			c.invalidateDiskPath(path)
+		})
 	}
 	return true, nil
 }

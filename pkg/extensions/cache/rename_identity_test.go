@@ -235,3 +235,38 @@ func TestRenameFencesInFlightReadPublication(t *testing.T) {
 		t.Fatalf("cache retained %d bytes after the fenced sweep", c.mem.Size())
 	}
 }
+
+// Event-driven sweeps must be fenced too: another client's rename-over or
+// delete+recreate lands as an event, not a local OpRename, and the same
+// interleaving (pre-sweep fetch published after the sweep) would otherwise
+// restore the replaced image.
+func TestEventSweepFencesInFlightReadPublication(t *testing.T) {
+	bus := fs.NewEventBus()
+	c, err := New(Options{Events: bus})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner := &gatedReadHandle{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+		data:    []byte("old"),
+	}
+	h := &cachingHandle{cache: c, inner: inner, path: "/target", rev: 1, size: 3}
+
+	readErr := make(chan error, 1)
+	go func() {
+		_, err := h.Read(context.Background(), 0, make([]byte, 3))
+		readErr <- err
+	}()
+	<-inner.started
+
+	bus.Emit(fs.Event{Kind: fs.EventInvalidated, Path: "/target"})
+
+	close(inner.release)
+	if err := <-readErr; err != nil {
+		t.Fatalf("in-flight read: %v", err)
+	}
+	if data, ok := c.mem.Get("/target", 1); ok {
+		t.Fatalf("in-flight read repopulated the swept target with %q", data)
+	}
+}
