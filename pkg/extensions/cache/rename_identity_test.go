@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"net/http/httptest"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -284,9 +285,10 @@ func TestPublicationEpochWaitsForInProgressSweep(t *testing.T) {
 	release := make(chan struct{})
 	swept := make(chan struct{})
 	go func() {
-		c.fencedSweep(func() {
+		c.fencedSweep(func() []string {
 			close(entered)
 			<-release
+			return nil
 		})
 		close(swept)
 	}()
@@ -309,5 +311,78 @@ func TestPublicationEpochWaitsForInProgressSweep(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("epoch capture never returned after the sweep")
+	}
+}
+
+// The facade's deferred-unlink survivor hook recycles a name too, so it must
+// run the same fenced rename as the local rename handler: otherwise an
+// in-flight read can republish the pre-retarget image under the recycled name.
+func TestRetargetPathFencesInFlightReadPublication(t *testing.T) {
+	c, err := New(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner := &gatedReadHandle{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+		data:    []byte("old"),
+	}
+	h := &cachingHandle{cache: c, inner: inner, path: "/doomed", rev: 1, size: 3}
+
+	readErr := make(chan error, 1)
+	go func() {
+		_, err := h.Read(context.Background(), 0, make([]byte, 3))
+		readErr <- err
+	}()
+	<-inner.started
+
+	c.RetargetPath("/doomed", "/survivor")
+
+	close(inner.release)
+	if err := <-readErr; err != nil {
+		t.Fatalf("in-flight read: %v", err)
+	}
+	// The read captured the DOOMED name before the retarget, so an unfenced
+	// retarget lets it repopulate the recycled name; a fenced one rejects it.
+	for _, name := range []string{"/doomed", "/survivor"} {
+		if data, ok := c.mem.Get(name, 1); ok {
+			t.Fatalf("in-flight read repopulated %s with %q", name, data)
+		}
+	}
+}
+
+// A sweep must drop the INDEX inside the fence and unlink the backing files
+// after it: the unlink batch is O(blocks) I/O and must not serialize every
+// reader publication behind the fence.
+func TestFencedSweepUnlinksDiskBlocksAfterReleasingFence(t *testing.T) {
+	c, err := New(Options{Disk: DiskReadCacheOptions{Dir: t.TempDir(), MaxSize: 1 << 20, FreeRatio: -1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.dsk.Close() })
+
+	key := DiskReadCacheKey{FileID: pathDiskReadCacheFileID("/f"), Path: "/f", Revision: 1, Offset: 0, Length: 3}
+	c.dsk.Put(key, []byte("abc"))
+	backing := c.dsk.pathForDigest(key.digest())
+	if _, err := os.Stat(backing); err != nil {
+		t.Fatalf("block file missing before the sweep: %v", err)
+	}
+
+	var existedInsideFence bool
+	c.fencedSweep(func() []string {
+		detached := c.invalidateDiskPath("/f")
+		if _, err := os.Stat(backing); err == nil {
+			existedInsideFence = true
+		}
+		return detached
+	})
+	if !existedInsideFence {
+		t.Fatal("block was unlinked while the publication fence was still held")
+	}
+	if _, err := os.Stat(backing); !os.IsNotExist(err) {
+		t.Fatalf("block file survived the sweep: %v", err)
+	}
+	if c.dsk.Len() != 0 {
+		t.Fatalf("index entries after the sweep = %d, want 0", c.dsk.Len())
 	}
 }

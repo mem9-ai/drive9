@@ -2822,9 +2822,16 @@ func (f *FS) dispatchPath(nodeid, fh uint64) (string, bool) {
 		if h, ok := f.handles.get(fh); ok && h.ino == nodeid {
 			return h.path, true
 		}
-		// Directory descriptors (opendir handles) resolve the same way:
-		// an fstat by dirfd on a detached directory keeps answering from
-		// its handle.
+		// Directory descriptors (opendir handles) resolve the same way: an
+		// fstat by dirfd on a detached directory keeps answering from its
+		// handle. The recorded path may name a RECYCLED name by now, so this
+		// fallback must stay limited to inode-addressed metadata operations:
+		// GetAttr answers a detached inode from the entry itself (its
+		// Unlinked branch) without consulting the path, SetAttr rejects a
+		// detached inode before dispatching (ESTALE for the descriptor form),
+		// and the remaining users (flush, fsync, release, lseek) either
+		// ignore the path or fail harmlessly against a name that is gone.
+		// Pathname mutations never come through here.
 		if d, ok := f.dirs.get(fh); ok && d.ino == nodeid {
 			return d.path, true
 		}

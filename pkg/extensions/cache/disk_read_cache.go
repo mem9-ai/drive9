@@ -210,14 +210,24 @@ func (c *DiskReadCache) PutOwned(key DiskReadCacheKey, data []byte) {
 
 // InvalidateFile drops every block of one file.
 func (c *DiskReadCache) InvalidateFile(fileID string) {
+	c.removeFiles(c.detachFile(fileID))
+}
+
+// detachFile drops one file's index entries and returns the backing files
+// instead of unlinking them. The caller unlinks them once it is out of any
+// lock or publication fence: an unindexed file is already invisible to
+// readers, and the unlink batch is O(blocks) I/O that must not serialize
+// readers behind it.
+func (c *DiskReadCache) detachFile(fileID string) []string {
 	if c == nil || fileID == "" {
-		return
+		return nil
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	var detached []string
 	for digest, entry := range c.items {
 		if entry.key.FileID == fileID {
-			c.removeEntryLocked(digest, entry)
+			detached = append(detached, c.detachEntryLocked(digest, entry))
 		}
 	}
 	for digest, pending := range c.pending {
@@ -225,19 +235,27 @@ func (c *DiskReadCache) InvalidateFile(fileID string) {
 			delete(c.pending, digest)
 		}
 	}
+	return detached
 }
 
 // InvalidatePathPrefix drops every block under a path prefix.
 func (c *DiskReadCache) InvalidatePathPrefix(prefix string) {
+	c.removeFiles(c.detachPathPrefix(prefix))
+}
+
+// detachPathPrefix drops every index entry under a path prefix and returns the
+// backing files for the caller to unlink outside its lock/fence.
+func (c *DiskReadCache) detachPathPrefix(prefix string) []string {
 	if c == nil || prefix == "" {
-		return
+		return nil
 	}
 	filePrefix := pathDiskReadCacheFileID(prefix)
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	var detached []string
 	for digest, entry := range c.items {
 		if strings.HasPrefix(entry.key.Path, prefix) || strings.HasPrefix(entry.key.FileID, filePrefix) {
-			c.removeEntryLocked(digest, entry)
+			detached = append(detached, c.detachEntryLocked(digest, entry))
 		}
 	}
 	for digest, pending := range c.pending {
@@ -245,6 +263,32 @@ func (c *DiskReadCache) InvalidatePathPrefix(prefix string) {
 			delete(c.pending, digest)
 		}
 	}
+	return detached
+}
+
+// removeFiles unlinks the backing files a detach call handed back.
+func (c *DiskReadCache) removeFiles(paths []string) {
+	for _, path := range paths {
+		if path != "" {
+			_ = os.Remove(path)
+		}
+	}
+}
+
+// detachEntryLocked removes one entry from the index/LRU/size accounting and
+// returns its backing file WITHOUT unlinking it. The caller must hold c.mu.
+func (c *DiskReadCache) detachEntryLocked(digest string, entry *diskReadCacheEntry) string {
+	delete(c.items, digest)
+	if entry.elem != nil {
+		c.order.Remove(entry.elem)
+	}
+	c.size -= entry.size
+	if c.size < 0 {
+		c.size = 0
+	}
+	path := entry.path
+	entry.path = ""
+	return path
 }
 
 // InvalidateAll drops every block.

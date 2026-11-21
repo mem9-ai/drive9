@@ -256,9 +256,9 @@ func New(opts Options) (*Cache, error) {
 			if c.dirs != nil {
 				c.dirs.noteWrite(e.Path)
 			}
-			c.fencedSweep(func() {
+			c.fencedSweep(func() []string {
 				c.mem.Invalidate(e.Path)
-				c.invalidateDiskPath(e.Path)
+				return c.invalidateDiskPath(e.Path)
 			})
 		})
 		opts.Events.On(fs.EventDelete, func(e fs.Event) {
@@ -298,7 +298,8 @@ func New(opts Options) (*Cache, error) {
 			// A hardlink alias names the same object: the landing replaces
 			// the image its readers hold under their open-time revision too.
 			aliases := c.aliasSet(e.Path)
-			c.fencedSweep(func() {
+			c.fencedSweep(func() []string {
+				var detached []string
 				for alias := range aliases {
 					if e.Rev <= 0 {
 						// No trustworthy revision to keep: drop the alias's
@@ -306,8 +307,9 @@ func New(opts Options) (*Cache, error) {
 						// supersedes it.
 						c.mem.Invalidate(alias)
 					}
-					c.invalidateDiskPath(alias)
+					detached = append(detached, c.invalidateDiskPath(alias)...)
 				}
+				return detached
 			})
 			prefix := strings.TrimSuffix(e.Path, "/") + "/"
 			c.open.Range(func(key, _ any) bool {
@@ -356,15 +358,16 @@ func New(opts Options) (*Cache, error) {
 // tiers, so a per-file SSE change that skipped them kept answering the old
 // bytes until a full checkout.
 func (c *Cache) invalidatePathTiers(path string) {
-	c.fencedSweep(func() {
+	c.fencedSweep(func() []string {
+		var detached []string
 		// Hardlink aliases name the same object: the change is theirs too.
 		aliases := c.aliasSet(path)
 		for alias := range aliases {
 			c.mem.Invalidate(alias)
-			c.invalidateDiskPath(alias)
+			detached = append(detached, c.invalidateDiskPath(alias)...)
 		}
 		c.mem.InvalidatePrefix(path + "/")
-		c.invalidateDiskPath(path)
+		detached = append(detached, c.invalidateDiskPath(path)...)
 		prefix := strings.TrimSuffix(path, "/") + "/"
 		c.open.Range(func(key, _ any) bool {
 			h, ok := key.(*cachingHandle)
@@ -391,25 +394,40 @@ func (c *Cache) invalidatePathTiers(path string) {
 			}
 			return true
 		})
+		return detached
 	})
 }
 
-// invalidateDiskPath drops the on-disk blocks of one name and its subtree.
-// The disk tier is a separate, mount-surviving store, so every namespace
-// mutation that recycles a name must sweep it explicitly.
-func (c *Cache) invalidateDiskPath(path string) {
+// invalidateDiskPath detaches the on-disk blocks of one name and its subtree,
+// returning the backing files for the caller to unlink after the fence is
+// released. The disk tier is a separate, mount-surviving store, so every
+// namespace mutation that recycles a name must sweep it explicitly.
+func (c *Cache) invalidateDiskPath(path string) []string {
 	if c == nil || c.dsk == nil || path == "" {
-		return
+		return nil
 	}
-	c.dsk.InvalidateFile(pathDiskReadCacheFileID(path))
-	c.dsk.InvalidatePathPrefix(strings.TrimSuffix(path, "/") + "/")
+	detached := c.dsk.detachFile(pathDiskReadCacheFileID(path))
+	return append(detached, c.dsk.detachPathPrefix(strings.TrimSuffix(path, "/")+"/")...)
 }
 
-// invalidateDiskPaths drops the on-disk blocks of several names.
-func (c *Cache) invalidateDiskPaths(paths ...string) {
+// invalidateDiskPaths detaches the on-disk blocks of several names.
+func (c *Cache) invalidateDiskPaths(paths ...string) []string {
+	var detached []string
 	for _, p := range paths {
-		c.invalidateDiskPath(p)
+		detached = append(detached, c.invalidateDiskPath(p)...)
 	}
+	return detached
+}
+
+// renameTiers moves the cached images of a rename and drops the replaced
+// destination's, under the publication fence. Both the local rename handler
+// and the facade's deferred-unlink survivor retarget call it: a rename that
+// recycles a name must not leave a pre-rename fetch able to republish.
+func (c *Cache) renameTiers(oldPath, newPath string) {
+	c.fencedSweep(func() []string {
+		c.mem.Rename(oldPath, newPath)
+		return c.invalidateDiskPaths(oldPath, newPath)
+	})
 }
 
 // markUnverified handles a loss of event-stream continuity (an SSE
@@ -471,8 +489,12 @@ func (c *Cache) invalidateAllTiers() {
 	// session.
 	c.unverified.Store(false)
 	c.mem.InvalidateAll()
+	// The disk index is dropped inside the fence; the backing files are
+	// unlinked after it (see fencedSweep): the unlink batch must not
+	// serialize every reader publication.
+	var detached []detachedDiskReadCacheEntry
 	if c.dsk != nil {
-		c.dsk.InvalidateAll()
+		detached = c.dsk.detachAll()
 	}
 	c.open.Range(func(key, _ any) bool {
 		if h, ok := key.(*cachingHandle); ok {
@@ -494,6 +516,7 @@ func (c *Cache) invalidateAllTiers() {
 		return true
 	})
 	c.resetMu.Unlock()
+	c.dsk.removeDetached(detached)
 }
 
 // remotePathOf maps a view path to the path the client addresses (the
@@ -576,8 +599,6 @@ func (c *Cache) dirtyPath(path string) bool {
 	return ok
 }
 
-// publishIfCurrent runs fn iff no reset has landed since gen, atomically
-// with the reset's sweep (the read side of resetMu).
 // fencedSweep runs a cache-invalidating sweep with the publication fence
 // closed: a read that captured an earlier epoch is rejected by
 // publishIfCurrent, so a fetch that began before the sweep cannot restore the
@@ -586,11 +607,22 @@ func (c *Cache) dirtyPath(path string) bool {
 // that fetched the pre-sweep bytes and then publishes them after the sweep
 // (a same-revision replacement, which lands as an event rather than a local
 // OpRename, would look current).
-func (c *Cache) fencedSweep(sweep func()) {
+//
+// The sweep returns the on-disk blocks it detached; they are unlinked AFTER
+// the fence is released. The fence only needs the index drop to be atomic
+// with the epoch bump (an unindexed file is already invisible to readers),
+// and an unlink batch is O(blocks) I/O that must not serialize every reader
+// publication behind it.
+func (c *Cache) fencedSweep(sweep func() []string) {
 	c.resetMu.Lock()
-	defer c.resetMu.Unlock()
 	c.epoch.Add(1)
-	sweep()
+	detached := sweep()
+	c.resetMu.Unlock()
+	for _, path := range detached {
+		if path != "" {
+			_ = os.Remove(path)
+		}
+	}
 }
 
 // publicationEpoch captures the epoch a read's publications are fenced
@@ -605,6 +637,8 @@ func (c *Cache) publicationEpoch() uint64 {
 	return c.epoch.Load()
 }
 
+// publishIfCurrent runs fn iff no reset has landed since gen, atomically
+// with the reset's sweep (the read side of resetMu).
 func (c *Cache) publishIfCurrent(gen uint64, fn func()) bool {
 	c.resetMu.RLock()
 	defer c.resetMu.RUnlock()
@@ -655,19 +689,30 @@ func (c *Cache) StoreOwned(path string, data []byte, revision int64) {
 
 // Invalidate drops one path's cached image.
 func (c *Cache) Invalidate(path string) {
-	c.fencedSweep(func() { c.mem.Invalidate(path) })
+	c.fencedSweep(func() []string {
+		c.mem.Invalidate(path)
+		return nil
+	})
 }
 
 // InvalidatePrefix drops every cached image under a prefix.
 func (c *Cache) InvalidatePrefix(prefix string) {
-	c.fencedSweep(func() {
+	c.fencedSweep(func() []string {
 		c.mem.InvalidatePrefix(prefix)
-		c.invalidateDiskPath(prefix)
+		return c.invalidateDiskPath(prefix)
 	})
 }
 
-// InvalidateAll drops every cached image.
-func (c *Cache) InvalidateAll() { c.mem.InvalidateAll() }
+// InvalidateAll drops the whole in-memory tier. The on-disk tier is only
+// cleared by a view reset (invalidateAllTiers), which the checkout/reset
+// paths use: its blocks are object-keyed, and keeping them across a plain
+// memory flush is what makes warm re-reads survive.
+func (c *Cache) InvalidateAll() {
+	c.fencedSweep(func() []string {
+		c.mem.InvalidateAll()
+		return nil
+	})
+}
 
 // Start implements fs.Lifecycle (the cache runs no background workers).
 func (c *Cache) Start(ctx context.Context) error { return nil }
@@ -792,10 +837,7 @@ func (c *Cache) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, err
 		// sweeping in the same critical section makes a pre-rename read
 		// unable to restore the replaced image into the tier after the
 		// rename has completed.
-		c.fencedSweep(func() {
-			c.mem.Rename(op.Path, op.Path2)
-			c.invalidateDiskPaths(op.Path, op.Path2)
-		})
+		c.renameTiers(op.Path, op.Path2)
 		return res, nil
 
 	case fs.OpRead:
@@ -1139,9 +1181,9 @@ func (h *cachingHandle) revalidateRevision(ctx context.Context, path string) (pi
 	h.revalidate = false
 	h.mu.Unlock()
 	if moved {
-		c.fencedSweep(func() {
+		c.fencedSweep(func() []string {
 			c.mem.Invalidate(path)
-			c.invalidateDiskPath(path)
+			return c.invalidateDiskPath(path)
 		})
 	}
 	return true, nil
@@ -1289,7 +1331,7 @@ func (c *Cache) RetargetPath(oldPath, newPath string) {
 		}
 		return true
 	})
-	c.mem.Rename(oldPath, newPath)
+	c.renameTiers(oldPath, newPath)
 }
 
 func (c *Cache) admits(data []byte) bool {

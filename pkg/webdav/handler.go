@@ -218,6 +218,11 @@ func (w *statusCapturingResponseWriter) commit(ctx context.Context, req *putRequ
 				zap.String("error_kind", commitErrorKind(logErr)),
 				zap.String("error", redactURLCredentials(logErr.Error())),
 			)
+		} else {
+			// A 405 that never reached the file layer (an OpenFile-stage
+			// failure x/net/webdav mapped here) has no captured error: say
+			// so instead of logging an entry that merely looks truncated.
+			fields = append(fields, zap.String("error_kind", "unrecorded"))
 		}
 		logger.Error(ctx, "webdav put commit failed", fields...)
 	}
