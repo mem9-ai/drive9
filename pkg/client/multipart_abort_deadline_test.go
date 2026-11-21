@@ -112,7 +112,10 @@ func TestMultipartAbortRunsDetachedAfterDeadline(t *testing.T) {
 	started := make(chan struct{})
 	released := make(chan struct{})
 	release := make(chan struct{})
-	var cleanupErr atomic.Value
+	// A buffered channel, not atomic.Value: the test-owned release can close
+	// the callback while its context is still active, and ctx.Err() is nil
+	// then — storing a nil interface in an atomic.Value panics.
+	cleanupErr := make(chan error, 1)
 	parent, cancel := context.WithCancel(context.Background())
 	cancel() // the caller is already gone
 
@@ -124,7 +127,7 @@ func TestMultipartAbortRunsDetachedAfterDeadline(t *testing.T) {
 			case <-ctx.Done(): // the cleanup's OWN bounded context
 			case <-release:
 			}
-			cleanupErr.Store(ctx.Err())
+			cleanupErr <- ctx.Err()
 			close(released)
 			return ctx.Err()
 		})
@@ -149,7 +152,7 @@ func TestMultipartAbortRunsDetachedAfterDeadline(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("detached cleanup never expired on its own")
 	}
-	if err, _ := cleanupErr.Load().(error); !errors.Is(err, context.DeadlineExceeded) {
+	if err := <-cleanupErr; !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("detached cleanup error = %v, want context.DeadlineExceeded", err)
 	}
 }

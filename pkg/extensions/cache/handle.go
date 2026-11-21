@@ -177,6 +177,10 @@ func (h *cachingHandle) Read(ctx context.Context, off int64, dest []byte) (int, 
 			// (prefetched blocks included) can answer this read.
 			return h.inner.Read(ctx, off, dest)
 		}
+		// Intended: a revalidation that had to drop the tiers bumped the
+		// epoch itself, so THIS read's publication is rejected and the next
+		// read fetches again — one deliberate double fetch in exchange for
+		// never seeding the pre-move image.
 	}
 	if h.prefetch != nil {
 		if remoteReadable() {
