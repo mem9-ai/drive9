@@ -166,7 +166,8 @@ func (cp *copyFastPath) serve(w http.ResponseWriter, r *http.Request) bool {
 		// concurrent API writer that takes the name during the copy is NOT
 		// clobbered (the server rejects a commit whose expected revision 0 no
 		// longer matches).
-		dst.expectedRevision = 0
+		createOnlyRevision := int64(0)
+		dst.expectedRevision = &createOnlyRevision
 	}
 	if _, err := io.Copy(dst, src); err != nil {
 		// A COPY has no declared length, so Close would commit whatever
@@ -178,7 +179,7 @@ func (cp *copyFastPath) serve(w http.ResponseWriter, r *http.Request) bool {
 	}
 	if err := dst.Close(); err != nil {
 		logCopyFailure(ctx, srcLocal, dstLocal, err)
-		if dst.expectedRevision == 0 && isRevisionConflict(err) {
+		if dst.expectedRevision != nil && *dst.expectedRevision == 0 && isRevisionConflict(err) {
 			// The destination appeared while the copy streamed: the
 			// Overwrite: F promise no longer holds.
 			writeWebDAVStatus(w, http.StatusPreconditionFailed)
@@ -194,62 +195,11 @@ func (cp *copyFastPath) serve(w http.ResponseWriter, r *http.Request) bool {
 	props.deleteTree(dstRemote)
 	props.copyTree(srcRemote, dstRemote)
 
-	// A REPLACED destination is a fresh resource under COPY semantics (x/net
-	// removes the name before creating the replacement), so the old object's
-	// user tags must go with it: left behind, they make exact tag queries
-	// match content that no longer exists. A created destination never had
-	// any. Tags are drive9 metadata, not WebDAV properties, so a copy does not
-	// carry the source's set — same as x/net, which copies dead props only.
+	// A replaced destination is a fresh resource, so its old user tags must go
+	// with it; see clearReplacedDestinationTags for the contract.
 	if !createOnly {
-		// DEFINED BEHAVIOR for a replacement whose tag cleanup cannot settle.
-		//
-		// The content publish and the tag replacement are two API calls: the
-		// wire contract has no way to say "replace the tag set with this (empty)
-		// one" on a write (no tag header means "leave unchanged"), so the tag
-		// clear cannot be folded into the commit request. Ordering the clear
-		// BEFORE the commit would instead strip the old resource's tags when
-		// the commit then fails, trading a metadata glitch for metadata loss.
-		//
-		// The post-condition of a COPY is a fresh resource, so a persisting
-		// failure is reported as 500 rather than a false success: the bytes
-		// have landed, the copy is not complete, the reason is logged, and a
-		// client retry rewrites the content and clears the tags again (the
-		// same indeterminate-outcome contract the PUT commit uses for a
-		// timed-out publish).
-		//
-		// The clear runs for EVERY shape whose commit may have replaced a
-		// destination, not only the one that existed at our first check: the
-		// unconditional commit also replaces a destination an API writer
-		// created in the meantime, and a write without tag headers leaves that
-		// writer's tags in place.
-		//
-		// KNOWN RACE: an API writer that publishes content AND tags between the
-		// commit and this clear loses its tags while the COPY answers 2xx.
-		// Closing it needs a conditional metadata update on the wire (the
-		// `?setmeta` call cannot say "only if the row is still the revision my
-		// commit produced"); the window is narrow and the failure is metadata,
-		// not content.
-		//
-		// It also runs on the commit's own detached, bounded context: a client
-		// that disconnects after sending the body must not cancel the cleanup
-		// the commit deliberately survives (writeFile.Close uses the same
-		// policy).
-		clearCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cp.fs.put.commitTimeout())
-		defer cancel()
-		var clearErr error
-		for attempt := 0; attempt < 2; attempt++ {
-			clearErr = cp.client.SetMetadataCtx(clearCtx, dstRemote, client.SetMetadataOptions{Tags: map[string]string{}})
-			if clearErr != nil && client.IsNotFound(clearErr) {
-				// Another writer removed the destination: there is nothing
-				// left to clear, which is a settled outcome.
-				clearErr = nil
-			}
-			if clearErr == nil {
-				break
-			}
-		}
-		if clearErr != nil {
-			logCopyFailure(ctx, srcLocal, dstLocal, fmt.Errorf("clear replaced destination tags: %w", clearErr))
+		if err := cp.clearReplacedDestinationTags(ctx, dstRemote); err != nil {
+			logCopyFailure(ctx, srcLocal, dstLocal, err)
 			writeWebDAVStatus(w, http.StatusInternalServerError)
 			return true
 		}
@@ -261,6 +211,62 @@ func (cp *copyFastPath) serve(w http.ResponseWriter, r *http.Request) bool {
 		writeWebDAVStatus(w, http.StatusNoContent)
 	}
 	return true
+}
+
+// clearReplacedDestinationTags removes the user tags of a destination this copy
+// replaced, so a tag query cannot match content that no longer exists.
+//
+// A REPLACED destination is a fresh resource under COPY semantics (x/net
+// removes the name before creating the replacement) and a created destination
+// never had tags; a copy does not carry the source's set either — tags are
+// drive9 metadata, not WebDAV properties, so only dead props follow the
+// resource, exactly as x/net copies them.
+//
+// DEFINED BEHAVIOR for a replacement whose tag cleanup cannot settle:
+//
+// The content publish and the tag replacement are two API calls: the wire
+// contract has no way to say "replace the tag set with this (empty) one" on a
+// write (no tag header means "leave unchanged"), so the clear cannot be folded
+// into the commit request. Ordering the clear BEFORE the commit would instead
+// strip the old resource's tags when the commit then fails, trading a metadata
+// glitch for metadata loss.
+//
+// The post-condition of a COPY is a fresh resource, so a persisting failure is
+// returned as an error and reported as 500 rather than a false success: the
+// bytes have landed, the copy is not complete, the reason is logged, and a
+// client retry rewrites the content and clears the tags again (the same
+// indeterminate-outcome contract the PUT commit uses for a timed-out publish).
+//
+// It runs for EVERY shape whose commit may have replaced a destination, not
+// only the one that existed at our first check: the unconditional commit also
+// replaces a destination an API writer created in the meantime, and a write
+// without tag headers leaves that writer's tags in place.
+//
+// KNOWN RACE: an API writer that publishes content AND tags between the commit
+// and this clear loses its tags while the COPY answers 2xx. Closing it needs a
+// conditional metadata update on the wire (the `?setmeta` call cannot say "only
+// if the row is still the revision my commit produced"); the window is narrow
+// and the failure is metadata, not content.
+//
+// The clear runs on the commit's own detached, bounded context: a client that
+// disconnects after sending the body must not cancel the cleanup the commit
+// deliberately survives (writeFile.Close uses the same policy).
+func (cp *copyFastPath) clearReplacedDestinationTags(ctx context.Context, dstRemote string) error {
+	clearCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cp.fs.put.commitTimeout())
+	defer cancel()
+	var clearErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		clearErr = cp.client.SetMetadataCtx(clearCtx, dstRemote, client.SetMetadataOptions{Tags: map[string]string{}})
+		if clearErr != nil && client.IsNotFound(clearErr) {
+			// Another writer removed the destination: there is nothing left to
+			// clear, which is a settled outcome.
+			return nil
+		}
+		if clearErr == nil {
+			return nil
+		}
+	}
+	return fmt.Errorf("clear replaced destination tags: %w", clearErr)
 }
 
 // isRevisionConflict reports a compare-and-set refusal from the API plane. The

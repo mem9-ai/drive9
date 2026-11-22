@@ -533,9 +533,8 @@ func TestDelegatedCopyDegradesOnStagingFailure(t *testing.T) {
 func TestWriteFileDegradeToMemoryAfterSpill(t *testing.T) {
 	staging := t.TempDir()
 	wf := &writeFile{
-		path:             "/dir/file.txt",
-		put:              putConfig{bufferBytes: 4, stagingDir: staging, copyWrite: true},
-		expectedRevision: -1,
+		path: "/dir/file.txt",
+		put:  putConfig{bufferBytes: 4, stagingDir: staging, copyWrite: true},
 	}
 	if _, err := wf.Write([]byte("abcdefg")); err != nil {
 		t.Fatalf("Write: %v", err)

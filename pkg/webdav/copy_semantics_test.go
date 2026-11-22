@@ -378,6 +378,91 @@ func TestCopyReplaceClearsStaleDestinationTags(t *testing.T) {
 	}
 }
 
+// The tag clear is retried once: a transient failure on the first attempt must
+// not turn a landed copy into a 500 when the second attempt succeeds.
+func TestCopyRetriesTagClearOnce(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.SeedDir("/dir", 0o755)
+	b.Seed("/dir/src", []byte("fresh"))
+	b.SeedWithTags("/dir/dst", []byte("ORIGINAL"), map[string]string{"team": "old"})
+	var attempts atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Query().Has("setmeta") {
+			if attempts.Add(1) == 1 {
+				http.Error(w, "setmeta temporarily unavailable", http.StatusServiceUnavailable)
+				return
+			}
+		}
+		b.ServeHTTP(w, r)
+	}))
+	t.Cleanup(ts.Close)
+	c := client.New(ts.URL, "test-key")
+	c.Warm(t.Context())
+	handler := NewHandler(c, Options{})
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, copyRequest(t, "/dir/src", "/dir/dst"))
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("COPY whose first tag clear failed = %d, want %d: %s", rr.Code, http.StatusNoContent, rr.Body.String())
+	}
+	if got := attempts.Load(); got != 2 {
+		t.Fatalf("tag clear attempts = %d, want 2 (first fails, second succeeds)", got)
+	}
+	node, ok := b.Node("/dir/dst")
+	if !ok || string(node.Data) != "fresh" {
+		t.Fatalf("destination = %q (ok=%v), want fresh", node.Data, ok)
+	}
+	if len(node.Tags) != 0 {
+		t.Fatalf("replaced destination kept stale tags: %v", node.Tags)
+	}
+}
+
+// The destination's parent is validated the way x/net validates it: a missing
+// parent is 409 (Conflict) and a parent that is not a directory is 403
+// (Forbidden), not the other way round.
+func TestCopyRejectsUnusableDestinationParent(t *testing.T) {
+	cases := []struct {
+		name   string
+		dst    string
+		seed   func(*testbackend.Backend)
+		status int
+	}{
+		{
+			name:   "missing parent is 409",
+			dst:    "/missing/dst",
+			status: http.StatusConflict,
+		},
+		{
+			name: "non-directory parent is 403",
+			dst:  "/dir/file/dst",
+			seed: func(b *testbackend.Backend) {
+				b.Seed("/dir/file", []byte("not a directory"))
+			},
+			status: http.StatusForbidden,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := testbackend.NewBackend()
+			b.SeedDir("/dir", 0o755)
+			b.Seed("/dir/src", []byte("copied bytes"))
+			if tc.seed != nil {
+				tc.seed(b)
+			}
+			handler, _ := newCopySemanticsHandler(t, b, Options{})
+
+			rr := httptest.NewRecorder()
+			handler.ServeHTTP(rr, copyRequest(t, "/dir/src", tc.dst))
+			if rr.Code != tc.status {
+				t.Fatalf("COPY to %s = %d, want %d: %s", tc.dst, rr.Code, tc.status, rr.Body.String())
+			}
+			if node, ok := b.Node(tc.dst); ok {
+				t.Fatalf("COPY to %s created %q despite the %d", tc.dst, node.Data, tc.status)
+			}
+		})
+	}
+}
+
 // A symlink destination must be replaced by a regular file, as x/net does by
 // removing the name first; writing through it would corrupt the link's target.
 func TestCopySymlinkDestinationDelegates(t *testing.T) {

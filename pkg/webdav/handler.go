@@ -39,9 +39,10 @@ type Options struct {
 	// negotiated transfer window instead of holding the whole body in RSS.
 	// Zero uses DefaultPutBufferBytes.
 	//
-	// COPY stages the same way; a staging FAILURE there degrades to memory
-	// instead of failing the copy, because x/net/webdav removes its
-	// destination before writing it (see the COPY fast path in copy.go).
+	// COPY stages the same way. A staging FAILURE is handled per path: the
+	// fast path fails (500/507) because the old destination still exists and
+	// must survive, while a COPY delegated to x/net/webdav degrades to memory
+	// because x/net has already removed its destination (see copy.go).
 	PutBufferBytes int64
 
 	// PutStagingDir is where a PUT body beyond PutBufferBytes is staged.

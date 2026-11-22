@@ -79,9 +79,9 @@ func (f *fileSystem) OpenFile(ctx context.Context, name string, flag int, perm o
 			props:  f.deadProps(),
 			put:    put,
 			req:    req,
-			// -1 is the unconditional default; the COPY fast path raises it
-			// to 0 (create-only) when it promised Overwrite: F.
-			expectedRevision: -1,
+			// expectedRevision stays nil, so a plain PUT is unconditional;
+			// the COPY fast path sets it to 0 (create-only) when it promised
+			// Overwrite: F.
 		}, nil
 	}
 

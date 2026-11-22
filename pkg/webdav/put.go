@@ -203,12 +203,14 @@ type writeFile struct {
 	name string // staged file's name (already unlinked where the OS allows)
 	size int64
 
-	// expectedRevision is the commit's compare-and-set precondition: < 0 is
-	// unconditional, 0 requires the path to be absent (create-only). The COPY
-	// fast path uses 0 when it promised `Overwrite: F` for an absent
-	// destination, so a concurrent API writer that takes the name during the
-	// copy is reported as a precondition failure instead of being clobbered.
-	expectedRevision int64
+	// expectedRevision is the commit's compare-and-set precondition, nil when
+	// the commit is unconditional (the zero value, so a caller that does not
+	// think about it cannot commit conditionally by accident). A pointer to 0
+	// requires the path to be absent (create-only); the COPY fast path sets
+	// that when it promised `Overwrite: F` for an absent destination, so a
+	// concurrent API writer that takes the name during the copy is reported
+	// as a precondition failure instead of being clobbered.
+	expectedRevision *int64
 
 	// werr latches the first staging failure: a body that was not fully
 	// recorded must not be committed later.
@@ -374,8 +376,8 @@ func (w *writeFile) Close() error {
 	// above its inline threshold (that branch requires part checksums), so
 	// neither shape may bypass the transport decision.
 	commit := func(r io.Reader, size int64, opts ...client.WriteOption) error {
-		if w.expectedRevision >= 0 {
-			return w.commitError(w.client.WriteStreamConditionalWithOptions(ctx, w.path, r, size, nil, w.expectedRevision, opts...))
+		if w.expectedRevision != nil {
+			return w.commitError(w.client.WriteStreamConditionalWithOptions(ctx, w.path, r, size, nil, *w.expectedRevision, opts...))
 		}
 		_, err := w.client.WriteStreamWithSummary(ctx, w.path, r, size, nil, opts...)
 		return w.commitError(err)
