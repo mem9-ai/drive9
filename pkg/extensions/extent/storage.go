@@ -324,7 +324,45 @@ func (s objectStorage) Get(ctx context.Context, key string, off, limit int64, ge
 		}
 		return io.NopCloser(bytes.NewReader(staged[objOff:end])), nil
 	}
-	return s.bridge.blocks.fetch(ctx, s.bridge.cfg.Client, id, objOff, limit)
+	s.bridge.mu.Lock()
+	stopCh := s.bridge.retryStop
+	if stopCh != nil {
+		select {
+		case <-stopCh:
+			s.bridge.mu.Unlock()
+			return nil, context.Canceled
+		default:
+		}
+	}
+	s.bridge.fetchWg.Add(1)
+	s.bridge.mu.Unlock()
+
+	sctx, cancel := s.bridge.withShutdownCtx(ctx)
+	rc, err := s.bridge.blocks.fetch(sctx, s.bridge.client(), id, objOff, limit)
+	if err != nil {
+		cancel()
+		s.bridge.fetchWg.Done()
+		return nil, err
+	}
+	return &shutdownReadCloser{
+		ReadCloser: rc,
+		finish: func() {
+			cancel()
+			s.bridge.fetchWg.Done()
+		},
+	}, nil
+}
+
+type shutdownReadCloser struct {
+	io.ReadCloser
+	once   sync.Once
+	finish func()
+}
+
+func (r *shutdownReadCloser) Close() error {
+	err := r.ReadCloser.Close()
+	r.once.Do(r.finish)
+	return err
 }
 
 // simpleObject implements object.Object for Head replies.

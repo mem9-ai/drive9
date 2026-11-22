@@ -225,6 +225,17 @@ func NewEngine(cfg EngineConfig) *Engine {
 	return &Engine{Bridge: b, Store: store, VFS: v}
 }
 
+// ResetForGeneration stops any background retry loop, clears all per-generation
+// bridge and registry state, and rebinds the engine to cl while reusing the
+// long-lived JuiceFS ChunkStore and VFS workers. Call only after the previous
+// runtime has drained and stopped all handles.
+func (e *Engine) ResetForGeneration(cl *client.Client) {
+	if e == nil || e.Bridge == nil {
+		return
+	}
+	e.Bridge.ResetForGeneration(cl)
+}
+
 // FlushFile commits any slice still pending on the engine's asynchronous
 // commit thread for the file (the bridge's Close/Flush also attempt this,
 // but fsync/close paths call it explicitly to bound landing time).

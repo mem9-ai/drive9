@@ -121,9 +121,11 @@ type FS struct {
 	mountPt         string
 	rootTag         string
 	srvTag          string
-	locks           *fuseLockTable
-	handles         *handleTable
-	dirs            *dirTable
+	// viewLocalState is set by the runtime builder when LocalRoot is scoped per view.
+	viewLocalState bool
+	locks          *fuseLockTable
+	handles        *handleTable
+	dirs           *dirTable
 	// viewGen fences listing installs across view resets: a READDIR that
 	// started before a checkout must not install its pre-reset page.
 	// viewMu makes the generation CHECK and the cache publication ATOMIC
@@ -178,9 +180,9 @@ type FS struct {
 	// nativeSyncFSSeen records that the kernel actually dispatched a
 	// SyncFs request (v1: protocol support alone must not advertise it).
 	nativeSyncFSSeen atomic.Bool
-	// notifyWg tracks in-flight kernel notifications so drain can wait
+	// notifications tracks in-flight kernel notifications so drain can wait
 	// them out (v1 notifications phase).
-	notifyWg sync.WaitGroup
+	notifications kernelNotifications
 	// drainMu serializes concurrent drains (v1): syncfs(2) and the mount
 	// control socket must not interleave quiesce phases.
 	drainMu sync.Mutex
@@ -813,19 +815,7 @@ func (f *FS) Drain(ctx context.Context) mountcontrol.DrainResponse {
 		resp.Finish(time.Now().UTC())
 		return resp
 	}
-	if !runPhase("notifications", func() error {
-		done := make(chan struct{})
-		go func() {
-			f.notifyWg.Wait()
-			close(done)
-		}()
-		select {
-		case <-done:
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}) {
+	if !runPhase("notifications", func() error { return f.notifications.wait(ctx) }) {
 		resp.Finish(time.Now().UTC())
 		return resp
 	}
@@ -3622,6 +3612,10 @@ func (f *FS) InvalidateAll() {
 	if s == nil {
 		return
 	}
+	f.invalidateAllWithNotifier(s)
+}
+
+func (f *FS) invalidateAllWithNotifier(s viewCacheNotifier) {
 	entries := f.inodes.Snapshot()
 	type target struct {
 		ino       uint64
@@ -3641,7 +3635,7 @@ func (f *FS) InvalidateAll() {
 		}
 		targets = append(targets, t)
 	}
-	go func() {
+	f.notifications.run(func() {
 		for _, t := range targets {
 			_ = s.InodeNotify(t.ino, -1, 0)
 			_ = s.InodeNotify(t.ino, 0, 0)
@@ -3649,7 +3643,7 @@ func (f *FS) InvalidateAll() {
 				_ = s.EntryNotify(t.parentIno, t.name)
 			}
 		}
-	}()
+	})
 }
 
 func fuseCtx(cancel <-chan struct{}) (context.Context, context.CancelFunc) {
@@ -3755,23 +3749,19 @@ func (f *FS) OwnerOf(path string) (uid, gid uint32, hasUID, hasGID bool) {
 // InvalidateEntry drops the kernel's cached dentry for parent/name.
 func (f *FS) InvalidateEntry(parentIno uint64, name string) {
 	if s := f.currentServer(); s != nil {
-		f.notifyWg.Add(1)
-		go func() {
-			defer f.notifyWg.Done()
+		f.notifications.run(func() {
 			_ = s.EntryNotify(parentIno, name)
-		}()
+		})
 	}
 }
 
 // InvalidateContent drops the kernel's cached attributes and data for ino.
 func (f *FS) InvalidateContent(ino uint64, size uint64) {
 	if s := f.currentServer(); s != nil {
-		f.notifyWg.Add(1)
-		go func() {
-			defer f.notifyWg.Done()
+		f.notifications.run(func() {
 			_ = s.InodeNotify(ino, -1, 0) // attributes only (empty range)
 			_ = s.InodeNotify(ino, 0, int64(size))
-		}()
+		})
 	}
 }
 
@@ -3782,11 +3772,9 @@ func (f *FS) InvalidateRange(ino uint64, off, length int64) {
 		return
 	}
 	if s := f.currentServer(); s != nil {
-		f.notifyWg.Add(1)
-		go func() {
-			defer f.notifyWg.Done()
+		f.notifications.run(func() {
 			_ = s.InodeNotify(ino, off, length)
-		}()
+		})
 	}
 }
 

@@ -506,6 +506,91 @@ if [ "$RUN_LAYER_FUSE_SMOKE" = "1" ]; then
     check_eq "main sees merged FUSE b.txt" "$(drive9 fs cat ":$TEST_ROOT/fusedir/b.txt")" "fuse-layer-write"
     drive9 fs cp ":$TEST_ROOT/fusedir/blob.bin" "$WORK_TMP/fuse-blob-main.bin"
     check_eq "main sees merged FUSE 6MiB SHA-256" "$(sha256_file "$WORK_TMP/fuse-blob-main.bin")" "$want_fuse_sha"
+
+    if [ "$(uname -s)" = "Linux" ]; then
+      echo "--- 7. live Linux FUSE in-place drive9 mount switch (main -> layer -> main) ---"
+      sw_name="e2e-switch-${ts_tag}"
+      sw_json=$(drive9 fs layer create --name "$sw_name" --json ":$TEST_ROOT")
+      sw_id=$(printf '%s' "$sw_json" | jq -r '.layer_id')
+      CREATED_LAYERS+=("$sw_id")
+
+      MOUNT_POINT="$(mktemp -d "${FUSE_MOUNT_ROOT}/d9-switch-mp.XXXXXX")"
+      sw_local_root="$(mktemp -d "${FUSE_MOUNT_ROOT}/d9-switch-lr.XXXXXX")"
+      SW_LOG="$WORK_TMP/fuse-switch.log"
+      sw_args=(mount --foreground --mode=fuse --profile="$profile" --durability=write-sync --flush-debounce=0 --no-persist-credentials)
+      case "$profile" in
+        none|extent|interactive) ;;
+        *) sw_args+=(--local-root "$sw_local_root") ;;
+      esac
+      sw_args+=(":$TEST_ROOT" "$MOUNT_POINT")
+      drive9 "${sw_args[@]}" >"$SW_LOG" 2>&1 &
+      MOUNT_PID="$!"
+
+      if ! wait_mount_state mounted || ! wait_mount_log_ready "$SW_LOG"; then
+        echo "FAIL FUSE main mount for switch did not become ready" >&2
+        cat "$SW_LOG" >&2 || true
+        exit 1
+      fi
+      orig_pid="$MOUNT_PID"
+      orig_mnt_id="$(awk -v mp="$MOUNT_POINT" '$5 == mp {print $1; exit}' /proc/self/mountinfo)"
+      st1=$(drive9 mount status --json "$MOUNT_POINT")
+      check_eq "initial mount status view generation is 1" "$(printf '%s' "$st1" | jq -r '.view.generation')" "1"
+      check_eq "initial mount status view is main" "$(printf '%s' "$st1" | jq -r '.view.binding.layer_id // ""')" ""
+
+      sw1=""
+      for _ in 1 2 3 4 5; do
+        if sw1=$(drive9 mount switch --layer "$sw_name" "$MOUNT_POINT" 2>/dev/null); then
+          break
+        fi
+        sleep 0.3
+      done
+      sw1_mnt=$(printf '%s' "$sw1" | jq -r '.request.mount_id // empty')
+      sw1_op=$(printf '%s' "$sw1" | jq -r '.request.operation_id // empty')
+      check_eq "mount switch to layer advances generation to 2" "$(printf '%s' "$sw1" | jq -r '.response.receipt.generation // empty')" "2"
+      check_eq "mount switch binds canonical layer_id" "$(printf '%s' "$sw1" | jq -r '.response.receipt.target.layer_id // empty')" "$sw_id"
+      check_eq "mount switch acquires odd fence 1" "$(printf '%s' "$sw1" | jq -r '.response.receipt.target.fence // empty')" "1"
+      check_eq "mount switch preserves kernel mount ID" "$(awk -v mp="$MOUNT_POINT" '$5 == mp {print $1; exit}' /proc/self/mountinfo)" "$orig_mnt_id"
+      check_cmd "mount switch preserves worker PID" kill -0 "$orig_pid"
+
+      sw1_replay=$(drive9 mount switch --mount-id "$sw1_mnt" --generation 1 --operation "$sw1_op" --layer "$sw_name" "$MOUNT_POINT")
+      check_eq "mount switch replay returns generation 2" "$(printf '%s' "$sw1_replay" | jq -r '.response.receipt.generation')" "2"
+      sw1_query=$(drive9 mount switch-operation --mount-id "$sw1_mnt" --generation 1 --operation "$sw1_op" --layer "$sw_name" "$MOUNT_POINT")
+      check_eq "mount switch-operation returns generation 2" "$(printf '%s' "$sw1_query" | jq -r '.response.receipt.generation')" "2"
+
+      printf 'switched-layer-payload' >"$MOUNT_POINT/switched.txt"
+      printf 'switched-merged-payload' >"$MOUNT_POINT/switched-merged.txt"
+      check_cmd_fail "main isolated before switch-back" drive9 fs stat ":$TEST_ROOT/switched.txt"
+
+      exec 9<"$MOUNT_POINT/switched.txt"
+      check_cmd_fail "mount switch refuses with EBUSY while fd open" drive9 mount switch --layer main "$MOUNT_POINT"
+      exec 9<&-
+
+      sw2=""
+      for _ in 1 2 3 4 5; do
+        if sw2=$(drive9 mount switch --layer main "$MOUNT_POINT" 2>/dev/null); then
+          break
+        fi
+        sleep 0.3
+      done
+      check_eq "mount switch back to main advances generation to 3" "$(printf '%s' "$sw2" | jq -r '.response.receipt.generation // empty')" "3"
+      check_cmd_fail "switched.txt absent on main before merge" test -e "$MOUNT_POINT/switched.txt"
+      for _ in 1 2 3 4 5 6; do
+        [ "$(drive9 fs layer inspect --json "$sw_id" | jq -r '.fence')" = "2" ] && break
+        sleep 0.5
+      done
+      check_eq "switch-away drains outgoing lease to even fence 2" "$(drive9 fs layer inspect --json "$sw_id" | jq -r '.fence')" "2"
+
+      sw_merge=$(drive9 fs layer merge --json "$sw_id")
+      check_eq "switched layer merge status is merged" "$(printf '%s' "$sw_merge" | jq -r '.status')" "merged"
+      check_eq "same FUSE mount on main reads merged file" "$(cat "$MOUNT_POINT/switched-merged.txt")" "switched-merged-payload"
+
+      drive9 umount --timeout "$FUSE_UMOUNT_TIMEOUT" --no-auto-pack "$MOUNT_POINT"
+      wait_mount_state unmounted
+      wait "$MOUNT_PID"
+      MOUNT_PID=""
+      rm -rf "$MOUNT_POINT" "$sw_local_root"
+      MOUNT_POINT=""
+    fi
   fi
 fi
 

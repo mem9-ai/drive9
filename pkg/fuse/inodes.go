@@ -1352,6 +1352,23 @@ func (m *InodeToPath) releaseEntry() {
 	}
 }
 
+// ReleaseMemoryBudget returns all remaining inode-table charges to the shared
+// mount memory budget and detaches m.budget when retiring an old view runtime.
+func (m *InodeToPath) ReleaseMemoryBudget() {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.budget == nil {
+		return
+	}
+	if n := len(m.byInode); n > 0 {
+		m.budget.Release(membudget.ClassInodeTable, int64(n)*inodeTableEntryBytes)
+	}
+	m.budget = nil
+}
+
 func (m *InodeToPath) removePathLocked(path string, consumeLink bool, preserveIfLast bool) {
 	ino, ok := m.byPath[path]
 	if !ok {

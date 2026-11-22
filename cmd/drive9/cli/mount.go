@@ -111,6 +111,10 @@ func MountCmd(args []string) error {
 			return vaultMountCmd(args[1:], true)
 		case "drain":
 			return MountDrainCmd(args[1:])
+		case "switch":
+			return mountSwitchCmd(args[1:], false)
+		case "switch-operation":
+			return mountSwitchCmd(args[1:], true)
 		case "status":
 			return runMountStatus(args[1:])
 		case "health":

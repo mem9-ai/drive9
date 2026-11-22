@@ -9,12 +9,15 @@ import (
 	"fmt"
 	"net"
 	"time"
+
+	"github.com/mem9-ai/drive9/pkg/mountstate"
+	"github.com/mem9-ai/drive9/pkg/viewprotocol"
 )
 
 const DefaultDrainTimeout = 30 * time.Second
 
 type DrainRequest struct {
-	// Op is "" or "drain" (default) or "status"/"ping".
+	// Op is "" or "drain" (default), "status"/"ping", "switch", or "switch-operation".
 	Op        string `json:"op,omitempty"`
 	TimeoutMS int64  `json:"timeout_ms,omitempty"`
 }
@@ -30,6 +33,13 @@ type StatusResponse struct {
 	// workspace). Nil means the mount predates layer reporting.
 	Layer *string `json:"layer,omitempty"`
 	Error string  `json:"error,omitempty"`
+	// ViewSwitch advertises same-connection ping -> switch/switch-operation
+	// negotiation on Linux FUSE mounts.
+	ViewSwitch bool                        `json:"view_switch,omitempty"`
+	MountID    string                      `json:"mount_id,omitempty"`
+	Generation uint64                      `json:"generation,omitempty"`
+	Binding    *viewprotocol.SwitchBinding `json:"binding,omitempty"`
+	Pending    *mountstate.SwitchReceipt   `json:"pending,omitempty"`
 }
 
 func (r DrainRequest) Timeout() time.Duration {
