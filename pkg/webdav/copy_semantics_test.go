@@ -1,10 +1,12 @@
 package webdav
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/mem9-ai/drive9/internal/testbackend"
@@ -429,40 +431,74 @@ func TestCopyReplaceFailsWhenTagsCannotBeCleared(t *testing.T) {
 }
 
 // A conditional commit keeps the size-aware transport decision: a classic body
-// at or above the inline threshold must take the multipart plane, not a single
-// direct PUT the server rejects.
+// at or above the inline threshold takes the multipart plane, not a single
+// direct PUT the server rejects. Both outcomes are pinned — the create-only CAS
+// wins on an absent destination and loses to one an API writer takes mid-stream
+// — so a commit path that failed unconditionally, or one that stopped sending
+// the precondition, cannot pass.
 func TestCopyConditionalCommitAboveInlineThresholdUsesMultipart(t *testing.T) {
-	b := testbackend.NewBackend()
-	b.SeedDir("/dir", 0o755)
-	payload := strings.Repeat("k", 2<<20) // 2 MiB, above the 1 MiB inline threshold
-	b.Seed("/dir/src", []byte(payload))
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet && r.URL.Path == "/v1/fs/dir/src" {
+	const payloadSize = 2 << 20 // above the 1 MiB inline threshold
+
+	// conditionalCopy runs one Overwrite:F COPY of a payloadSize body and
+	// returns the response plus the backend it ran against.
+	conditionalCopy := func(t *testing.T, onSourceRead func(*testbackend.Backend)) (*httptest.ResponseRecorder, *testbackend.Backend) {
+		t.Helper()
+		b := testbackend.NewBackend()
+		b.SeedDir("/dir", 0o755)
+		payload := strings.Repeat("k", payloadSize)
+		b.Seed("/dir/src", []byte(payload))
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if onSourceRead != nil && r.Method == http.MethodGet && r.URL.Path == "/v1/fs/dir/src" {
+				onSourceRead(b)
+			}
+			b.ServeHTTP(w, r)
+		}))
+		t.Cleanup(ts.Close)
+		c := client.New(ts.URL, "test-key")
+		c.Warm(t.Context())
+		handler := NewHandler(c, Options{PutBufferBytes: 4 << 20})
+
+		req := copyRequest(t, "/dir/src", "/dir/dst")
+		req.Header.Set("Overwrite", "F") // create-only CAS commit
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+		return rr, b
+	}
+
+	t.Run("create-only commit succeeds", func(t *testing.T) {
+		rr, b := conditionalCopy(t, nil)
+		if rr.Code != http.StatusCreated {
+			t.Fatalf("conditional COPY onto an absent destination = %d, want %d: %s", rr.Code, http.StatusCreated, rr.Body.String())
+		}
+		if got := b.Requests()["POST /v2/uploads/initiate"]; got != 1 {
+			t.Fatalf("multipart initiate requests = %d, want 1 (conditional commit took the direct-PUT branch)", got)
+		}
+		node, ok := b.Node("/dir/dst")
+		if !ok {
+			t.Fatal("destination missing after a successful conditional COPY")
+		}
+		if len(node.Data) != payloadSize || strings.Trim(string(node.Data), "k") != "" {
+			t.Fatalf("destination = %d bytes (%q...), want the %d-byte source", len(node.Data), string(node.Data[:8]), payloadSize)
+		}
+	})
+
+	t.Run("lost race answers 412", func(t *testing.T) {
+		rr, b := conditionalCopy(t, func(b *testbackend.Backend) {
 			// The destination appears while the source streams: the create-only
 			// CAS must reject the multipart complete, not just the small-body
 			// direct PUT.
 			b.Seed("/dir/dst", []byte("INTRUDER"))
+		})
+		if rr.Code != http.StatusPreconditionFailed {
+			t.Fatalf("lost-race multipart COPY = %d, want %d: %s", rr.Code, http.StatusPreconditionFailed, rr.Body.String())
 		}
-		b.ServeHTTP(w, r)
-	}))
-	t.Cleanup(ts.Close)
-	c := client.New(ts.URL, "test-key")
-	c.Warm(t.Context())
-	handler := NewHandler(c, Options{PutBufferBytes: 4 << 20})
-
-	req := copyRequest(t, "/dir/src", "/dir/dst")
-	req.Header.Set("Overwrite", "F") // create-only CAS commit
-	rr := httptest.NewRecorder()
-	handler.ServeHTTP(rr, req)
-	if rr.Code != http.StatusPreconditionFailed {
-		t.Fatalf("lost-race multipart COPY = %d, want %d: %s", rr.Code, http.StatusPreconditionFailed, rr.Body.String())
-	}
-	if got := b.Requests()["POST /v2/uploads/initiate"]; got != 1 {
-		t.Fatalf("multipart initiate requests = %d, want 1 (CAS commit took the direct-PUT branch)", got)
-	}
-	if node, ok := b.Node("/dir/dst"); !ok || string(node.Data) != "INTRUDER" {
-		t.Fatalf("concurrent writer's content = %q (ok=%v), want INTRUDER", node.Data, ok)
-	}
+		if got := b.Requests()["POST /v2/uploads/initiate"]; got != 1 {
+			t.Fatalf("multipart initiate requests = %d, want 1 (CAS commit took the direct-PUT branch)", got)
+		}
+		if node, ok := b.Node("/dir/dst"); !ok || string(node.Data) != "INTRUDER" {
+			t.Fatalf("concurrent writer's content = %q (ok=%v), want INTRUDER", node.Data, ok)
+		}
+	})
 }
 
 // A destination absent at the check can still be created by an API writer
@@ -496,6 +532,50 @@ func TestCopyClearsTagsOfConcurrentlyCreatedDestination(t *testing.T) {
 	}
 	if len(node.Tags) != 0 {
 		t.Fatalf("concurrent writer's tags survived the replacement: %v", node.Tags)
+	}
+}
+
+// A client that disconnects once the body is handed to the commit must not
+// take the tag clear with it: the clear runs on the commit's own detached,
+// bounded context, exactly like the content publish. The WebDAV status here is
+// what the handler would have written; the connection is already gone.
+func TestCopyTagClearSurvivesClientDisconnect(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.SeedDir("/dir", 0o755)
+	b.Seed("/dir/src", []byte("fresh"))
+	b.SeedWithTags("/dir/dst", []byte("ORIGINAL"), map[string]string{"team": "old"})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var setmeta atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Query().Has("setmeta") {
+			setmeta.Add(1)
+		}
+		if r.Method == http.MethodPut && r.URL.Path == "/v1/fs/dir/dst" {
+			// The client goes away at the commit point.
+			cancel()
+		}
+		b.ServeHTTP(w, r)
+	}))
+	t.Cleanup(ts.Close)
+	c := client.New(ts.URL, "test-key")
+	c.Warm(t.Context())
+	handler := NewHandler(c, Options{})
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, copyRequest(t, "/dir/src", "/dir/dst").WithContext(ctx))
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("COPY whose client disconnected at the commit = %d, want %d: %s", rr.Code, http.StatusNoContent, rr.Body.String())
+	}
+	if got := setmeta.Load(); got == 0 {
+		t.Fatal("tag clear never reached the server after the client disconnected: it is running on the request context")
+	}
+	node, ok := b.Node("/dir/dst")
+	if !ok || string(node.Data) != "fresh" {
+		t.Fatalf("destination = %q (ok=%v), want the copied bytes", node.Data, ok)
+	}
+	if len(node.Tags) != 0 {
+		t.Fatalf("replaced destination kept its tags after the client disconnected: %v", node.Tags)
 	}
 }
 

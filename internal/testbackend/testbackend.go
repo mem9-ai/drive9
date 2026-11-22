@@ -109,9 +109,10 @@ type uploadState struct {
 	parts     map[int][]byte
 	partSize  int64
 	totalSize int64
-	// expected carries the initiate's CAS revision: complete enforces it
-	// against the row like the real server's ErrRevisionConflict, so the
-	// conditional-upload contract is exercisable on the multipart track.
+	// expected carries the initiate's CAS revision. Only the create-only case
+	// (0) is enforced, by complete, facing an existing row with a 409; a
+	// positive revision is recorded and ignored — see the comment at the
+	// enforcement site for why this fake cannot verify one.
 	expected *int64
 }
 
