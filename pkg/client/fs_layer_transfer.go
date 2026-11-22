@@ -197,7 +197,7 @@ func (c *Client) uploadFSLayerPart(ctx context.Context, part presignedPart, body
 		req.Header.Set(key, value)
 	}
 	req.ContentLength = size
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.doPresigned(req)
 	if err != nil {
 		return "", err
 	}
@@ -244,20 +244,17 @@ func (c *Client) completeFSLayerUpload(ctx context.Context, layerID, uploadID st
 }
 
 func (c *Client) abortFSLayerUploadBestEffort(parent context.Context, layerID, uploadID string) {
-	timeout := c.multipartAbortTimeout
-	if timeout <= 0 {
-		timeout = defaultMultipartAbortTimeout
-	}
-	ctx, cancel := newMultipartAbortContext(parent, timeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.fsLayerUploadURL(layerID, uploadID, "abort"), nil)
-	if err != nil {
-		return
-	}
-	resp, err := c.do(req)
-	if err == nil {
-		_ = resp.Body.Close()
-	}
+	c.runMultipartAbort(parent, func(ctx context.Context) error {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.fsLayerUploadURL(layerID, uploadID, "abort"), nil)
+		if err != nil {
+			return err
+		}
+		resp, err := c.do(req)
+		if err != nil {
+			return err
+		}
+		return resp.Body.Close()
+	})
 }
 
 func (c *Client) fsLayerUploadURL(layerID, uploadID, action string) string {

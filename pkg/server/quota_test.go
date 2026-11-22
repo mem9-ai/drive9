@@ -195,9 +195,9 @@ func (p *quotaTestProvisioner) Provision(context.Context, string) (*tenant.Clust
 
 func (p *quotaTestProvisioner) InitSchema(context.Context, string) error { return nil }
 
-func (p *quotaTestProvisioner) EnsureSystemUser(context.Context, string, string) (string, string, error) {
+func (p *quotaTestProvisioner) EnsureSystemUser(context.Context, string, string) (string, string, bool, error) {
 	p.ensureSystemUserCalls.Add(1)
-	return "u.tdc_fs_sys", "pool-pass", nil
+	return "u.tdc_fs_sys", "pool-pass", true, nil
 }
 
 func (p *quotaTestProvisioner) UpdateQuota(_ context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest, opts tenant.QuotaUpdateOptions) (*tenant.QuotaCloudConfig, error) {

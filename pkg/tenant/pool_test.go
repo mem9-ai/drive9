@@ -1119,3 +1119,75 @@ func TestIdleEvictionStartAutoEvictsAndCloseStops(t *testing.T) {
 	}
 	assertStoreClosed(t, store)
 }
+
+// Reuse is decided by the database credential identity: a cached backend opened with one
+// credential is never served for a row that names another, which is what keeps a rotation from
+// leaving a replica dialling with the retired password.
+func TestPoolAcquireRejectsBackendWithRotatedCredential(t *testing.T) {
+	pool, tenant := newTestPoolAndTenant(t, 2, "tenant-rotated")
+	ctx := context.Background()
+
+	if _, release, err := pool.Acquire(ctx, tenant); err != nil {
+		t.Fatal(err)
+	} else {
+		defer release()
+	}
+	rotated, err := rotateTenantCredential(ctx, pool, tenant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The rotated credential cannot authenticate, so replacing the cached backend must fail —
+	// the important part is that the old one is not handed out for the new row.
+	if b, release, err := pool.Acquire(ctx, rotated); err == nil {
+		release()
+		t.Fatalf("acquire reused a backend opened with the retired credential: backend=%v", b != nil)
+	}
+	pool.mu.Lock()
+	cached, ok := pool.items[tenant.ID]
+	pool.mu.Unlock()
+	if ok && cached.dbCredentialID == tenantDBCredentialID(tenant) {
+		t.Fatal("the retired-credential backend stayed cached for the rotated row")
+	}
+}
+
+// The warm-only path applies the same identity check, so the safety net cannot hand out a
+// backend that the row has moved away from.
+func TestPoolAcquireCachedRejectsBackendWithRotatedCredential(t *testing.T) {
+	pool, tenant := newTestPoolAndTenant(t, 2, "tenant-rotated-cached")
+	ctx := context.Background()
+
+	if _, release, err := pool.Acquire(ctx, tenant); err != nil {
+		t.Fatal(err)
+	} else {
+		defer release()
+	}
+	rotated, err := rotateTenantCredential(ctx, pool, tenant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, release, ok := pool.AcquireCached(rotated); ok {
+		release()
+		t.Fatal("acquireCached handed out a backend opened with the retired credential")
+	}
+	if _, release, ok := pool.AcquireCached(tenant); !ok {
+		t.Fatal("acquireCached rejected the row the cached backend was opened with")
+	} else {
+		release()
+	}
+}
+
+// rotateTenantCredential returns a copy of the row with a different, undecryptable-against-the-
+// database credential: enough to change the identity without touching the instance.
+func rotateTenantCredential(ctx context.Context, pool *Pool, tenant *meta.Tenant) (*meta.Tenant, error) {
+	plain, err := pool.Decrypt(ctx, tenant.DBPasswordCipher)
+	if err != nil {
+		return nil, err
+	}
+	rotatedCipher, err := pool.Encrypt(ctx, append(append([]byte(nil), plain...), 'r'))
+	if err != nil {
+		return nil, err
+	}
+	rotated := *tenant
+	rotated.DBPasswordCipher = rotatedCipher
+	return &rotated, nil
+}

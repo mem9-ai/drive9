@@ -47,6 +47,7 @@ tmp/
 __pycache__/
 
 # Local review artifacts
+.review-tmp/
 second_opinion*
 
 # Simulator & test artifacts

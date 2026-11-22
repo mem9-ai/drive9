@@ -25,6 +25,7 @@ type fileSystem struct {
 	client     *client.Client
 	remoteRoot string // normalized remote root path, default "/"
 	props      *deadPropStore
+	put        putConfig
 }
 
 var _ webdav.FileSystem = (*fileSystem)(nil)
@@ -62,7 +63,23 @@ func (f *fileSystem) OpenFile(ctx context.Context, name string, flag int, perm o
 		if !parent.IsDir {
 			return nil, os.ErrInvalid
 		}
-		return &writeFile{client: f.client, path: remote, props: f.deadProps()}, nil
+		req := putRequestFrom(ctx)
+		put := f.put
+		if copyWriteFrom(ctx) {
+			// COPY writes the destination through this same writer, after
+			// x/net/webdav has already deleted the old destination. Staging a
+			// body there only adds a way to lose the old content, so COPY
+			// keeps the in-memory staging this bridge has always used.
+			put.noSpill = true
+		}
+		req.recordStart(remote)
+		return &writeFile{
+			client: f.client,
+			path:   remote,
+			props:  f.deadProps(),
+			put:    put,
+			req:    req,
+		}, nil
 	}
 
 	// Stat to determine if it's a directory or file.
@@ -387,47 +404,4 @@ func (r *readFile) DeadProps() (map[xml.Name]webdav.Property, error) {
 
 func (r *readFile) Patch(patches []webdav.Proppatch) ([]webdav.Propstat, error) {
 	return r.props.patch(r.propPath, patches)
-}
-
-// writeFile is a webdav.File that buffers writes and flushes on Close.
-type writeFile struct {
-	client *client.Client
-	path   string
-	props  *deadPropStore
-	buf    bytes.Buffer
-}
-
-var _ webdav.File = (*writeFile)(nil)
-var _ webdav.DeadPropsHolder = (*writeFile)(nil)
-
-func (w *writeFile) Read([]byte) (int, error)           { return 0, fmt.Errorf("write-only") }
-func (w *writeFile) Readdir(int) ([]fs.FileInfo, error) { return nil, fmt.Errorf("not a directory") }
-func (w *writeFile) Seek(int64, int) (int64, error)     { return 0, fmt.Errorf("not seekable") }
-
-func (w *writeFile) Write(p []byte) (int, error) {
-	return w.buf.Write(p)
-}
-
-func (w *writeFile) Close() error {
-	// webdav.File.Close has no context parameter. Do not retain the
-	// OpenFile request context here: clients can finish sending a PUT body
-	// and close the connection before the server flushes the buffered bytes
-	// to Drive9. Close is the commit point for this lightweight WebDAV
-	// bridge, so it uses a fresh background context.
-	return mapError(w.client.WriteCtx(context.Background(), w.path, w.buf.Bytes()))
-}
-
-func (w *writeFile) Stat() (os.FileInfo, error) {
-	return &fileInfo{
-		name: path.Base(w.path),
-		stat: &client.StatResult{Size: int64(w.buf.Len())},
-	}, nil
-}
-
-func (w *writeFile) DeadProps() (map[xml.Name]webdav.Property, error) {
-	return w.props.deadProps(w.path)
-}
-
-func (w *writeFile) Patch(patches []webdav.Proppatch) ([]webdav.Propstat, error) {
-	return w.props.patch(w.path, patches)
 }

@@ -34,6 +34,7 @@ type fakeProvisioner struct {
 	initErr                error
 	provisionErr           error
 	systemUserErr          error
+	systemUserUnverified   bool
 	systemUsername         string
 	systemPassword         string
 	deprovisionErr         error
@@ -222,10 +223,10 @@ func (f *fakeProvisioner) InitSchema(_ context.Context, dsn string) error {
 	return nil
 }
 
-func (f *fakeProvisioner) EnsureSystemUser(_ context.Context, _ string, _ string) (string, string, error) {
+func (f *fakeProvisioner) EnsureSystemUser(_ context.Context, _ string, _ string) (string, string, bool, error) {
 	f.systemUserCalls.Add(1)
 	if f.systemUserErr != nil {
-		return "", "", f.systemUserErr
+		return "", "", false, f.systemUserErr
 	}
 	username := f.systemUsername
 	if username == "" {
@@ -235,7 +236,7 @@ func (f *fakeProvisioner) EnsureSystemUser(_ context.Context, _ string, _ string
 	if password == "" {
 		password = "system-pass"
 	}
-	return username, password, nil
+	return username, password, !f.systemUserUnverified, nil
 }
 
 func (f *fakeProvisioner) Provision(_ context.Context, tenantID string) (*tenant.ClusterInfo, error) {

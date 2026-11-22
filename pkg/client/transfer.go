@@ -346,6 +346,9 @@ type writeOptions struct {
 	description  string
 	layout       ContentLayout
 	targetLayout ContentLayout
+	// multipartOnly keeps a non-empty seekable upload off the direct-PUT
+	// branch, which materializes the whole reader before sending.
+	multipartOnly bool
 }
 
 // WithTags sets file tags for the upload.
@@ -359,6 +362,18 @@ func WithTags(tags map[string]string) WriteOption {
 func WithDescription(description string) WriteOption {
 	return func(o *writeOptions) {
 		o.description = description
+	}
+}
+
+// WithMultipartOnly routes a seekable upload through the multipart/v2
+// transfer path even when it fits the server's inline (direct-PUT) threshold.
+// The direct branch reads the WHOLE reader into memory before sending, which
+// defeats a caller that deliberately staged a large body off-heap (a spill
+// file). Layout routing — extent vs classic, and their fallbacks — is
+// unchanged. Zero-length uploads keep their direct path.
+func WithMultipartOnly() WriteOption {
+	return func(o *writeOptions) {
+		o.multipartOnly = true
 	}
 }
 
@@ -628,7 +643,11 @@ func (c *Client) writeStreamConditionalWithOptionsAndSummary(ctx context.Context
 	// Multipart is always accepted, so we route any non-zero-size upload
 	// through it until /v1/status warmup populates the cache. Zero-byte
 	// files keep using simple PUT unless targeting extent layout.
-	useDirectPUT := !forceExtent && (size == 0 || (threshold > 0 && size < threshold))
+	// A spill-file caller cannot use the direct branch: it reads the whole
+	// reader into memory (io.ReadAll below), which is exactly what the caller
+	// staged to disk to avoid.
+	forceMultipart := opts.multipartOnly && size > 0
+	useDirectPUT := !forceExtent && !forceMultipart && (size == 0 || (threshold > 0 && size < threshold))
 	if useDirectPUT {
 		summary.Mode = "direct_put"
 		summary.PartSizeBytes = size
@@ -1150,7 +1169,7 @@ func (c *Client) uploadOnePart(ctx context.Context, part PartURL, data []byte) (
 		req.Header.Set("x-amz-checksum-crc32c", checksum)
 	}
 
-	resp, err := c.httpClient.Do(req) // Direct to S3, no auth header
+	resp, err := c.doPresigned(req) // Direct to S3, no auth header
 	if err != nil {
 		return "", err
 	}
@@ -1510,7 +1529,7 @@ func (c *Client) uploadOnePartV2(ctx context.Context, part presignedPart, data [
 	}
 	req.ContentLength = int64(len(data))
 
-	resp, err := c.httpClient.Do(req) // Direct to S3, no auth header
+	resp, err := c.doPresigned(req) // Direct to S3, no auth header
 	if err != nil {
 		return "", err
 	}
@@ -1537,6 +1556,60 @@ type presignedPutStatusError struct {
 
 func (e *presignedPutStatusError) Error() string {
 	return fmt.Sprintf("HTTP %d: %s", e.Status, e.Body)
+}
+
+// IsInsufficientStorage reports whether err is a storage-full refusal. The
+// same condition arrives through two unrelated error shapes: a *StatusError
+// from the API plane, and a *presignedPutStatusError from a part PUT straight
+// to the object store. Callers above this package cannot see the latter, so
+// this predicate is the only way to recognize "out of storage" on both upload
+// tracks. It deliberately does not add an Unwrap to the presigned error: that
+// would also change the API-plane status mapping (404/409) that the extent
+// create-once logic relies on.
+func IsInsufficientStorage(err error) bool {
+	if err == nil {
+		return false
+	}
+	var statusErr *StatusError
+	if errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusInsufficientStorage {
+		return true
+	}
+	var presignedErr *presignedPutStatusError
+	return errors.As(err, &presignedErr) && presignedErr.Status == http.StatusInsufficientStorage
+}
+
+// doPresigned performs one DIRECT-TO-OBJECT-STORE request. Every such call
+// goes through here: Go's *url.Error prints the request URL, a presigned URL
+// carries its temporary credential in the query, and the error text reaches
+// loggers far from this package. Redacting at the single source is what makes
+// every consumer safe by construction rather than by remembering to redact.
+func (c *Client) doPresigned(req *http.Request) (*http.Response, error) {
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, redactPresignedTransportError(err)
+	}
+	return resp, nil
+}
+
+// redactPresignedTransportError strips the signed query string from a presigned
+// PUT's transport error. Go's *url.Error prints the full URL, and that query is
+// a temporary write credential: every consumer of the error (loggers in
+// writeback included) must be safe by construction, not by remembering to
+// redact. The wrapped cause is preserved so callers can still classify it.
+func redactPresignedTransportError(err error) error {
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) {
+		return err
+	}
+	return &url.Error{Op: urlErr.Op, URL: redactURLQuery(urlErr.URL), Err: urlErr.Err}
+}
+
+// redactURLQuery drops a raw URL's query string.
+func redactURLQuery(raw string) string {
+	if i := strings.IndexByte(raw, '?'); i >= 0 {
+		return raw[:i] + "?[redacted]"
+	}
+	return raw
 }
 
 // presignOnePart fetches a fresh presigned URL for a single part via
@@ -1646,13 +1719,44 @@ func (c *Client) abortUploadV2(ctx context.Context, uploadID string) error {
 const defaultMultipartAbortTimeout = 5 * time.Second
 
 func (c *Client) abortUploadV2BestEffort(parent context.Context, uploadID string) {
+	c.runMultipartAbort(parent, func(ctx context.Context) error {
+		return c.abortUploadV2(ctx, uploadID)
+	})
+}
+
+// runMultipartAbort runs a best-effort upload-session cleanup. The cleanup
+// deliberately outlives the caller's CANCELLATION (the upload request is
+// already on the wire and must be cancelled explicitly), but it must NOT
+// outlive the caller's DEADLINE: a caller that has already given up gets the
+// cleanup detached, so a failed commit can never be held for another full abort
+// timeout after its own deadline expired.
+func (c *Client) runMultipartAbort(parent context.Context, fn func(context.Context) error) {
 	timeout := c.multipartAbortTimeout
 	if timeout <= 0 {
 		timeout = defaultMultipartAbortTimeout
 	}
+	// The cleanup ALWAYS gets its own bounded context (detached from the
+	// caller's cancellation), and the caller never waits past its own Done():
+	// an early failure can still wait for a quick abort, and a caller that
+	// gives up — already, or while the attempt runs — stops waiting
+	// immediately without shortening the attempt.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = c.abortWithTimeout(parent, timeout, fn)
+	}()
+	select {
+	case <-done:
+	case <-parent.Done():
+	}
+}
+
+// abortWithTimeout performs one cleanup attempt bounded by timeout, detached
+// from the parent's cancellation but not from its values.
+func (c *Client) abortWithTimeout(parent context.Context, timeout time.Duration, fn func(context.Context) error) error {
 	ctx, cancel := newMultipartAbortContext(parent, timeout)
 	defer cancel()
-	_ = c.abortUploadV2(ctx, uploadID)
+	return fn(ctx)
 }
 
 func newMultipartAbortContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
@@ -1685,7 +1789,7 @@ func (c *Client) ReadStream(ctx context.Context, path string) (io.ReadCloser, er
 		if err != nil {
 			return nil, err
 		}
-		resp2, err := c.httpClient.Do(req2) // Direct to S3, no auth
+		resp2, err := c.doPresigned(req2) // Direct to S3, no auth
 		if err != nil {
 			return nil, err
 		}
@@ -1854,7 +1958,7 @@ func (c *Client) ReadStreamRange(ctx context.Context, path string, offset, lengt
 		}
 		// Use HTTP Range header for efficient partial read.
 		req2.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+length-1))
-		resp2, err := c.httpClient.Do(req2)
+		resp2, err := c.doPresigned(req2)
 		if err != nil {
 			return nil, err
 		}
@@ -1921,7 +2025,7 @@ func (c *Client) readObjectRangeStrict(ctx context.Context, objectURL string, of
 	}
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+length-1))
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.doPresigned(req)
 	if err != nil {
 		return nil, err
 	}

@@ -2,10 +2,13 @@ package localize
 
 import (
 	"errors"
+	"hash/fnv"
 	iofs "io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -18,6 +21,25 @@ import (
 // valid disabled overlay (operations fail with EIO through abs).
 type Overlay struct {
 	root string
+	// nameLocks and idLocks serialize the mutations that reset or destroy a
+	// backing target: two such mutations to one name (or to two names for the
+	// same file) each destroy the image the other is landing, so their
+	// snapshot -> charge -> mutate -> settle sequence must not interleave — the
+	// second snapshot would describe an image the first already destroyed, and
+	// the destroyed image's charge could never be returned.
+	//
+	// They are TWO disjoint pools on purpose: every name acquisition draws from
+	// nameLocks and every identity acquisition from idLocks, so "name before
+	// identity" is a global two-level order. One shared pool would let two
+	// writers' stripes cross (X's name stripe being the mutex that serves Y's
+	// identity stripe and vice versa) and deadlock them on first contact.
+	nameLocks [64]sync.Mutex
+	idLocks   [64]sync.Mutex
+	// quota bounds the backing tree's bytes and the host filesystem's free
+	// space (nil disables both). The local overlay writes straight to the
+	// host disk, so this is the only guard between a local-only subtree and
+	// a full disk.
+	quota *overlayQuota
 }
 
 // NewOverlay returns an overlay rooted at <localRoot>/overlay, or nil for a
@@ -28,6 +50,318 @@ func NewOverlay(localRoot string) *Overlay {
 		return nil
 	}
 	return &Overlay{root: filepath.Join(localRoot, "overlay")}
+}
+
+// SetQuota installs the overlay's byte quota and free-space ratio. A
+// non-positive limit with a non-positive ratio leaves the overlay unbounded.
+func (o *Overlay) SetQuota(limit int64, freeRatio float64) error {
+	if o == nil {
+		return nil
+	}
+	q, err := newOverlayQuota(o.root, limit, freeRatio)
+	if err != nil {
+		return err
+	}
+	o.quota = q
+	return nil
+}
+
+// Quota reports the overlay's quota (nil when disabled).
+func (o *Overlay) Quota() *overlayQuota {
+	if o == nil {
+		return nil
+	}
+	return o.quota
+}
+
+// ReplaceLock serializes the mutation sequence for one backing target and
+// returns its release function.
+func (o *Overlay) ReplaceLock(viewPath string) (unlock func()) {
+	return o.ReplaceLocks(viewPath)
+}
+
+// ReplaceLocks serializes the mutate-and-account sequence of every operation
+// that resets or destroys a backing target (a truncating path write, a
+// truncating create, a truncate, an unlink, a rename), and returns its release
+// function. Mutations of one target therefore serialize against writers of the
+// same target and against each other, which is what keeps each mutation's size
+// snapshot true: the snapshot, the syscall and the quota settlement happen under
+// one lock.
+//
+// Locks are taken in two levels: every NAME bucket first, then every IDENTITY
+// bucket of the files that exist, from disjoint pools, and within each pool in
+// ASCENDING BUCKET INDEX order (not key order: the stripes are buckets, so keys
+// that hash to one bucket are one non-reentrant mutex). Two renames that cross
+// (A→B and B→A) therefore cannot cycle, and neither can a name and an identity
+// stripe. Two names of one inode share the identity bucket, so hardlink aliases
+// serialize too.
+//
+// The identity probe runs under the name locks: a name's identity can only
+// change through a mutation of that name, and every such mutation takes the
+// name stripe.
+func (o *Overlay) ReplaceLocks(viewPaths ...string) (unlock func()) {
+	if o == nil {
+		return func() {}
+	}
+	// The stripes are BUCKETS, so both the dedupe and the acquisition order are
+	// by bucket index: two distinct keys that hash to one bucket are one
+	// non-reentrant mutex (locking it twice self-deadlocks), and ordering by
+	// key string would let two callers take the same two buckets in opposite
+	// orders (ABBA). Indices ascend within each pool, and every name bucket is
+	// taken before any identity bucket, so the two-level order is global.
+	nameIdx := make([]uint32, 0, len(viewPaths))
+	seen := make(map[uint32]struct{}, len(viewPaths))
+	for _, p := range viewPaths {
+		idx := o.nameStripeIndex("path:" + p)
+		if _, dup := seen[idx]; dup {
+			continue
+		}
+		seen[idx] = struct{}{}
+		nameIdx = append(nameIdx, idx)
+	}
+	sort.Slice(nameIdx, func(i, j int) bool { return nameIdx[i] < nameIdx[j] })
+	held := make([]*sync.Mutex, 0, len(nameIdx)+len(viewPaths))
+	for _, idx := range nameIdx {
+		mu := &o.nameLocks[idx]
+		mu.Lock()
+		held = append(held, mu)
+	}
+	idIdx := make([]uint32, 0, len(viewPaths))
+	seen = make(map[uint32]struct{}, len(viewPaths))
+	for _, p := range viewPaths {
+		info, err := o.Lstat(p)
+		if err != nil {
+			continue
+		}
+		id, ok := fileReservationKey(info)
+		if !ok {
+			continue
+		}
+		idx := o.idStripeIndex(id)
+		if _, dup := seen[idx]; dup {
+			continue
+		}
+		seen[idx] = struct{}{}
+		idIdx = append(idIdx, idx)
+	}
+	sort.Slice(idIdx, func(i, j int) bool { return idIdx[i] < idIdx[j] })
+	for _, idx := range idIdx {
+		mu := &o.idLocks[idx]
+		mu.Lock()
+		held = append(held, mu)
+	}
+	return func() {
+		for i := len(held) - 1; i >= 0; i-- {
+			held[i].Unlock()
+		}
+	}
+}
+
+// nameStripeIndex maps a name lock key onto its name-pool bucket.
+func (o *Overlay) nameStripeIndex(key string) uint32 {
+	return lockStripeIndex(key, len(o.nameLocks))
+}
+
+// idStripeIndex maps an identity lock key onto its identity-pool bucket.
+func (o *Overlay) idStripeIndex(key string) uint32 {
+	return lockStripeIndex(key, len(o.idLocks))
+}
+
+// lockStripeIndex hashes a lock key into [0, buckets).
+func lockStripeIndex(key string, buckets int) uint32 {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(key))
+	return h.Sum32() % uint32(buckets)
+}
+
+// ChargeGrowth reserves growth for a TRUNCATING path write, which has no base a
+// booking could settle against (the file is about to be reset). The returned
+// token must be resolved exactly once with the bytes that landed. ENOSPC means
+// the quota or the free-space floor refused.
+func (o *Overlay) ChargeGrowth(viewPath string, growth int64) (chargeToken, error) {
+	var tok chargeToken
+	err := o.withQuota(viewPath, func(q *overlayQuota, _ string) error {
+		var qerr error
+		tok, qerr = q.charge(growth)
+		return qerr
+	})
+	return tok, err
+}
+
+// ResolveCharge settles a bookingless reservation with the bytes that landed.
+func (o *Overlay) ResolveCharge(tok chargeToken, landed int64) {
+	if o == nil || o.quota == nil {
+		return
+	}
+	o.quota.resolveCharge(tok, landed)
+}
+
+// AdmitFileWrite reserves the space a write through an OPEN descriptor needs.
+// The size comes from the descriptor and the reservation is keyed by the file's
+// identity, so a rename between admission and write cannot move the accounting
+// to whatever now sits at the old path.
+func (o *Overlay) AdmitFileWrite(f *os.File, viewPath string, end, writeLen int64) (writeReservation, error) {
+	var res writeReservation
+	err := o.withQuota(viewPath, func(q *overlayQuota, rel string) error {
+		var qerr error
+		res, qerr = q.admitFileWrite(f, rel, end, writeLen)
+		return qerr
+	})
+	return res, err
+}
+
+// SettleWrite settles a write's booking against the file's resulting size. The
+// reservation carries the descriptor for handle writes, so settlement cannot be
+// redirected by a rename; a path write is settled from the backing path.
+func (o *Overlay) SettleWrite(res writeReservation) {
+	if o == nil || o.quota == nil {
+		return
+	}
+	o.quota.settleWrite(res)
+}
+
+// RetirePath retires a name's bookings against size — the size the file had AT
+// the mutation boundary — and records baseline, the size it has after the
+// mutation: 0 when the mutation also released the name's bytes (unlink, a
+// truncating open), the post-resize size for a truncate, or the moved size for a
+// rename. A writer retired here that lands afterwards is charged only the growth
+// beyond baseline.
+func (o *Overlay) RetirePath(viewPath string, size, baseline int64) {
+	if o == nil || o.quota == nil {
+		return
+	}
+	if rel, err := o.rel(viewPath); err == nil {
+		o.quota.retirePath(rel, size, baseline)
+	}
+}
+
+// RetireFile retires the bookings for a file whose identity is known (an
+// unlink or rename holds the FileInfo): the inode-keyed booking an admission
+// made through any hardlink alias is retired together with the name-indexed
+// ones.
+func (o *Overlay) RetireFile(info iofs.FileInfo, key, viewPath string, size, baseline int64) {
+	if o == nil || o.quota == nil {
+		return
+	}
+	rel, err := o.rel(viewPath)
+	if err != nil {
+		rel = ""
+	}
+	if key == "" && info != nil {
+		if id, ok := fileReservationKey(info); ok {
+			key = id
+		}
+	}
+	o.quota.retireIdentity(key, rel, size, baseline)
+}
+
+// RetireMutation retires the writers of viewPath after a mutation LANDED:
+// the name-indexed bookings plus the inode booking an admission through a
+// different hardlink alias would have created. size is the file's size at the
+// mutation boundary, baseline the size it has after it.
+func (o *Overlay) RetireMutation(viewPath string, size, baseline int64) {
+	if o == nil || o.quota == nil {
+		return
+	}
+	var info iofs.FileInfo
+	if fi, err := o.Lstat(viewPath); err == nil {
+		info = fi
+	}
+	o.RetireFile(info, "", viewPath, size, baseline)
+}
+
+// RetirePathNow retires a name's bookings against its CURRENT on-disk size
+// (baseline = that same size: the bytes stay counted).
+func (o *Overlay) RetirePathNow(viewPath string) {
+	if o == nil || o.quota == nil {
+		return
+	}
+	size := int64(0)
+	if rel, err := o.rel(viewPath); err == nil {
+		if cur, serr := statBackingSize(o.root, rel); serr == nil {
+			size = cur
+		}
+	}
+	o.RetirePath(viewPath, size, size)
+}
+
+// rel resolves viewPath to its backing-relative path.
+func (o *Overlay) rel(viewPath string) (string, error) {
+	abs, err := o.abs(viewPath)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Rel(o.root, abs)
+}
+
+// AdmitResize reserves (or returns) the space a truncate to newSize needs.
+func (o *Overlay) AdmitResize(viewPath string, newSize int64) (resizeReservation, error) {
+	var res resizeReservation
+	err := o.withQuota(viewPath, func(q *overlayQuota, rel string) error {
+		var qerr error
+		res, qerr = q.resize(rel, newSize)
+		return qerr
+	})
+	return res, err
+}
+
+// ReconcileResize undoes a reservation whose truncate then failed: the file is
+// unchanged, so admitted growth is returned and released shrinkage is counted
+// again (forced — the bytes are still on disk).
+func (o *Overlay) ReconcileResize(res resizeReservation) {
+	if o == nil || o.quota == nil {
+		return
+	}
+	// The truncate never landed: resolve the grow's reservation with zero landed
+	// bytes (which also returns its pool share) and re-count a released shrink.
+	o.quota.resolveCharge(res.charge, 0)
+	if res.released > 0 {
+		o.quota.forceAdmit(res.released)
+	}
+}
+
+// withQuota resolves viewPath to its backing-relative path and runs fn when a
+// quota is armed.
+func (o *Overlay) withQuota(viewPath string, fn func(*overlayQuota, string) error) error {
+	if o == nil || o.quota == nil {
+		return nil
+	}
+	abs, err := o.abs(viewPath)
+	if err != nil {
+		return err
+	}
+	rel, err := filepath.Rel(o.root, abs)
+	if err != nil {
+		return err
+	}
+	return fn(o.quota, rel)
+}
+
+// Size reports the backing file's current size (0 when it does not exist).
+// It never touches the quota; the callers that need to give bytes back read
+// the size BEFORE the operation that frees them, then call ReleaseBytes.
+func (o *Overlay) Size(viewPath string) (int64, error) {
+	if o == nil {
+		return 0, syscall.EIO
+	}
+	abs, err := o.abs(viewPath)
+	if err != nil {
+		return 0, err
+	}
+	rel, err := filepath.Rel(o.root, abs)
+	if err != nil {
+		return 0, err
+	}
+	return statBackingSize(o.root, rel)
+}
+
+// ReleaseBytes returns n bytes of already-freed backing storage to the quota
+// (a truncating open, an unlink, or an admitted write that failed).
+func (o *Overlay) ReleaseBytes(n int64) {
+	if o == nil || o.quota == nil {
+		return
+	}
+	o.quota.release(n)
 }
 
 // Chmod changes the backing file's permission (and setuid/setgid/sticky)
@@ -231,6 +565,10 @@ func (o *Overlay) Remove(viewPath string) error {
 // empty destination directory and rejects a non-empty one, which preserves
 // both trees when a child races in.
 func (o *Overlay) Rename(oldPath, newPath string) error {
+	// A rename replaces or moves names a concurrent writer may be landing, so
+	// it takes BOTH targets' mutation locks (names, then identities, in bucket
+	// index order) for the whole snapshot -> rename -> settle sequence.
+	defer o.ReplaceLocks(oldPath, newPath)()
 	oldAbs, err := o.abs(oldPath)
 	if err != nil {
 		return err
@@ -242,9 +580,60 @@ func (o *Overlay) Rename(oldPath, newPath string) error {
 	if err := o.ensureParent(newAbs); err != nil {
 		return err
 	}
+	// A rename REPLACES an existing destination name (POSIX), and the
+	// replaced file's bytes are freed on disk: give them back to the quota
+	// once the rename succeeded. A rename of one hardlink over another name of
+	// the same inode frees nothing, so the identities are compared first.
+	replacedBytes, releaseDest := int64(0), false
+	srcSize, srcKnown := int64(0), false
+	dstSize, dstKnown := int64(0), false
+	var srcInfo, dstInfo iofs.FileInfo
+	if o.quota != nil {
+		if fi, serr := os.Lstat(oldAbs); serr == nil && fi.Mode().IsRegular() {
+			srcInfo = fi
+			srcSize, srcKnown = fi.Size(), true
+		}
+		if fi, derr := os.Lstat(newAbs); derr == nil && fi.Mode().IsRegular() {
+			dstInfo = fi
+			dstSize, dstKnown = fi.Size(), true
+			sameInode := srcInfo != nil && os.SameFile(srcInfo, dstInfo)
+			// The replaced NAME goes away, but the inode's bytes only leave
+			// the quota when no other hardlink keeps them: releasing on a
+			// shared inode would under-count the surviving aliases.
+			if !sameInode && backingLinkCount(dstInfo) <= 1 {
+				replacedBytes, releaseDest = dstInfo.Size(), true
+			}
+		}
+	}
 	err = os.Rename(oldAbs, newAbs)
 	if errors.Is(err, syscall.ENAMETOOLONG) {
-		return o.renameLongPath(oldAbs, newAbs)
+		err = o.renameLongPath(oldAbs, newAbs)
+	}
+	if err == nil {
+		if releaseDest {
+			o.ReleaseBytes(replacedBytes)
+		}
+		// Each name is retired against ITS OWN pre-rename size: the source name
+		// is gone (its writers were measured at srcSize) and the replaced
+		// destination's writers were measured at dstSize (0 when nothing was
+		// replaced) — using the source's size for the destination over-refunded
+		// by dstSize-srcSize. Retiring through the FileInfo keeps each inode's
+		// paid prefix attached to it, whatever names it has.
+		if srcKnown {
+			o.RetireFile(srcInfo, "", oldPath, srcSize, srcSize)
+		}
+		if dstKnown {
+			// The destination's bytes were released above only when nothing else
+			// keeps the inode; otherwise they stay charged, so its retired
+			// writers must not be re-charged for them either.
+			dstBaseline := int64(0)
+			if !releaseDest {
+				dstBaseline = dstSize
+			}
+			o.RetireFile(dstInfo, "", newPath, dstSize, dstBaseline)
+		} else if !srcKnown {
+			o.RetirePathNow(newPath)
+		}
 	}
 	return err
 }
@@ -363,6 +752,15 @@ func (o *Overlay) abs(viewPath string) (string, error) {
 		return o.root, nil
 	}
 	return filepath.Join(o.root, filepath.FromSlash(rel)), nil
+}
+
+// backingLinkCount reports the backing file's hardlink count (1 when the
+// platform does not expose it on FileInfo.Sys).
+func backingLinkCount(info iofs.FileInfo) uint64 {
+	if st, ok := info.Sys().(*syscall.Stat_t); ok && st.Nlink > 0 {
+		return uint64(st.Nlink)
+	}
+	return 1
 }
 
 // posixFileMode maps a POSIX mode word to an io/fs FileMode, carrying the

@@ -91,7 +91,7 @@ func TestPortWholeFileReadPopulatesDiskTier(t *testing.T) {
 	if n, err := h.Read(context.Background(), 0, buf); err != nil || n != 64 || !bytes.Equal(buf, data[:64]) {
 		t.Fatalf("first read = %d %q %v", n, buf, err)
 	}
-	key := DiskReadCacheKey{FileID: pathDiskReadCacheFileID("/f"), Path: "/f", Revision: 1, Offset: 0, Length: int64(len(data))}
+	key := DiskReadCacheKey{FileID: pathDiskReadCacheFileID("/f"), ObjectID: b.ObjectID("/f"), Path: "/f", Revision: 1, Offset: 0, Length: int64(len(data))}
 	waitPortDiskEntry(t, c.dsk, key)
 
 	// mem-tier sweep (TTL/eviction): the tail read must come from disk.
@@ -128,7 +128,7 @@ func TestPortDiskRangeReadThrough(t *testing.T) {
 	if gets := b.Requests()["GET /v1/fs/f"]; gets != 1 {
 		t.Fatalf("backend GETs = %d, want 1", gets)
 	}
-	key := DiskReadCacheKey{FileID: pathDiskReadCacheFileID("/f"), Path: "/f", Revision: 1, Offset: 128, Length: 64}
+	key := DiskReadCacheKey{FileID: pathDiskReadCacheFileID("/f"), ObjectID: b.ObjectID("/f"), Path: "/f", Revision: 1, Offset: 128, Length: 64}
 	if _, ok := c.dsk.Get(key); !ok {
 		t.Fatal("range block missing from the disk tier")
 	}
@@ -160,7 +160,7 @@ func TestPortDiskRangeFinalEOFReadTrimmedAndCached(t *testing.T) {
 	if gets := b.Requests()["GET /v1/fs/f"]; gets != 1 {
 		t.Fatalf("backend GETs = %d, want 1", gets)
 	}
-	key := DiskReadCacheKey{FileID: pathDiskReadCacheFileID("/f"), Path: "/f", Revision: 1, Offset: 240, Length: 16}
+	key := DiskReadCacheKey{FileID: pathDiskReadCacheFileID("/f"), ObjectID: b.ObjectID("/f"), Path: "/f", Revision: 1, Offset: 240, Length: 16}
 	if _, ok := c.dsk.Get(key); !ok {
 		t.Fatal("trimmed final block missing from the disk tier")
 	}

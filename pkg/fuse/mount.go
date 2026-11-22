@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -35,9 +36,11 @@ import (
 	"github.com/mem9-ai/drive9/pkg/extensions/writeback"
 	"github.com/mem9-ai/drive9/pkg/extensions/xattr"
 	"github.com/mem9-ai/drive9/pkg/fs"
+	"github.com/mem9-ai/drive9/pkg/fusecomp/membudget"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/perf"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/staging"
 	"github.com/mem9-ai/drive9/pkg/logger"
+	"github.com/mem9-ai/drive9/pkg/mountcontrol"
 	"github.com/mem9-ai/drive9/pkg/mountpath"
 	"github.com/mem9-ai/drive9/pkg/mountstate"
 )
@@ -103,6 +106,10 @@ type MountConfig struct {
 	LocalOnlyPatterns           []string
 	LocalGitignoreAwarePatterns []string
 	RemoteOnlyPatterns          []string
+	// LocalizeQuotaBytes/LocalizeFreeRatio bound the local-only overlay's
+	// host-disk usage (0 disables either bound).
+	LocalizeQuotaBytes int64
+	LocalizeFreeRatio  float64
 
 	AppendLogPatterns []string
 	PackPaths         []string
@@ -122,6 +129,11 @@ type MountConfig struct {
 	WriteBackBatchMaxBytes int64
 	WriteCacheFreeRatio    float64
 	WriteCacheSizeMB       int64
+	// MemoryBudget caps the process-wide in-memory footprint in bytes (see
+	// MountOptions.MemoryBudget): 0 = auto (cgroup-derived), negative =
+	// disabled, positive = explicit bytes.
+	MemoryBudget     int64
+	MemoryBudgetMode string
 
 	ReadConcurrency         int
 	ParallelReadConcurrency int
@@ -343,31 +355,36 @@ func (p WritePolicy) String() string {
 // build-up ordering. Mount converts it to the internal MountConfig — the
 // wire-level semantics are unchanged.
 type MountOptions struct {
-	Server                      string        // drive9 server URL
-	APIKey                      string        // owner API key (mutually exclusive with Token)
-	Token                       string        // delegated capability JWT (mutually exclusive with APIKey)
-	MountPoint                  string        // local mount point
-	RemoteRoot                  string        // remote subtree root (default "/")
-	CacheDir                    string        // write-back cache directory (default ~/.cache/drive9)
-	CacheSize                   int64         // ReadCache max size in bytes (default 128MB)
-	ReadCacheMaxFileBytes       int64         // largest single file admitted to ReadCache (default 4MiB)
-	ReadCacheTTL                time.Duration // ReadCache TTL (default 30s)
-	DiskReadCacheSize           int64         // disk read cache max size in bytes (default 1GiB)
-	DiskReadCacheFreeRatio      float64       // min free-space ratio before disk read cache evicts (default 0.10)
-	DirTTL                      time.Duration // DirCache TTL (default 10s)
-	AttrTTL                     time.Duration // kernel attr cache TTL (default 60s)
-	EntryTTL                    time.Duration // kernel entry cache TTL (default 60s)
-	NegativeEntryTTL            time.Duration // kernel negative entry cache TTL (default 1s)
-	FlushDebounce               time.Duration // debounce window for small-file flush coalescing (default 2s; -1 uses default)
-	SyncMode                    SyncMode      // interactive, strict, or auto (default auto)
-	WritePolicy                 WritePolicy   // writeback, close-sync, or write-sync (default writeback)
-	Profile                     string        // mount profile name
-	LayerRef                    string        // writable fs layer ref
-	CheckpointRef               string        // checkpoint ref for the layer view baseline
-	LocalRoot                   string        // local-only overlay root
-	LocalOnlyPatterns           []string      // local-only path patterns
-	LocalGitignoreAwarePatterns []string      // local-only patterns gated by Git ignore rules
-	RemoteOnlyPatterns          []string      // remote-persistent override patterns
+	Server                 string        // drive9 server URL
+	APIKey                 string        // owner API key (mutually exclusive with Token)
+	Token                  string        // delegated capability JWT (mutually exclusive with APIKey)
+	MountPoint             string        // local mount point
+	RemoteRoot             string        // remote subtree root (default "/")
+	CacheDir               string        // write-back cache directory (default ~/.cache/drive9)
+	CacheSize              int64         // ReadCache max size in bytes (default 128MB)
+	ReadCacheMaxFileBytes  int64         // largest single file admitted to ReadCache (default 4MiB)
+	ReadCacheTTL           time.Duration // ReadCache TTL (default 30s)
+	DiskReadCacheSize      int64         // disk read cache max size in bytes (default 1GiB)
+	DiskReadCacheFreeRatio float64       // min free-space ratio before disk read cache evicts (default 0.10)
+	DirTTL                 time.Duration // DirCache TTL (default 10s)
+	AttrTTL                time.Duration // kernel attr cache TTL (default 60s)
+	EntryTTL               time.Duration // kernel entry cache TTL (default 60s)
+	NegativeEntryTTL       time.Duration // kernel negative entry cache TTL (default 1s)
+	FlushDebounce          time.Duration // debounce window for small-file flush coalescing (default 2s; -1 uses default)
+	SyncMode               SyncMode      // interactive, strict, or auto (default auto)
+	WritePolicy            WritePolicy   // writeback, close-sync, or write-sync (default writeback)
+	Profile                string        // mount profile name
+	LayerRef               string        // writable fs layer ref
+	CheckpointRef          string        // checkpoint ref for the layer view baseline
+	LocalRoot              string        // local-only overlay root
+	// LocalizeQuotaBytes caps the bytes the local-only overlay may occupy on
+	// the host disk (0 disables); LocalizeFreeRatio is the host free-space
+	// ratio below which local writes fail with ENOSPC (0 disables).
+	LocalizeQuotaBytes          int64
+	LocalizeFreeRatio           float64
+	LocalOnlyPatterns           []string // local-only path patterns
+	LocalGitignoreAwarePatterns []string // local-only patterns gated by Git ignore rules
+	RemoteOnlyPatterns          []string // remote-persistent override patterns
 	// DisableBuiltinOverlayDefaults stops the built-in local-only defaults for
 	// Profile from being added on top of the given patterns. The CLI resolves
 	// the effective profile itself and sets this; direct library callers leave
@@ -382,6 +399,15 @@ type MountOptions struct {
 	WriteBackBatchMaxBytes        int64
 	WriteCacheFreeRatio           float64
 	WriteCacheSizeMB              int64
+	// MemoryBudget caps the process-wide in-memory footprint (read cache,
+	// write-back data cache, per-handle write buffers, inode table) in bytes.
+	// 0 means AUTO: 60% of the container's cgroup memory limit, and disabled on
+	// a bare host (no limit to derive). A negative value disables the budget.
+	// MemoryBudgetMode selects what an over-budget allocation means: "" or
+	// "enforce" refuses it (caches degrade, writes fail with ENOMEM), "warn"
+	// admits and logs it.
+	MemoryBudget     int64
+	MemoryBudgetMode string
 	// ExtentCacheSize is the extent plane's disk cache budget (bytes;
 	// read cache and writeback staging share it).
 	ExtentCacheSize              int64
@@ -488,6 +514,8 @@ func mountConfigFromOptions(opts *MountOptions) MountConfig {
 		LayerRef:                      opts.LayerRef,
 		CheckpointRef:                 opts.CheckpointRef,
 		LocalRoot:                     opts.LocalRoot,
+		LocalizeQuotaBytes:            opts.LocalizeQuotaBytes,
+		LocalizeFreeRatio:             opts.LocalizeFreeRatio,
 		LocalOnlyPatterns:             opts.LocalOnlyPatterns,
 		LocalGitignoreAwarePatterns:   opts.LocalGitignoreAwarePatterns,
 		RemoteOnlyPatterns:            opts.RemoteOnlyPatterns,
@@ -503,6 +531,8 @@ func mountConfigFromOptions(opts *MountOptions) MountConfig {
 		WriteBackBatchMaxBytes:        opts.WriteBackBatchMaxBytes,
 		WriteCacheFreeRatio:           opts.WriteCacheFreeRatio,
 		WriteCacheSizeMB:              opts.WriteCacheSizeMB,
+		MemoryBudget:                  opts.MemoryBudget,
+		MemoryBudgetMode:              opts.MemoryBudgetMode,
 		ReadConcurrency:               opts.ReadConcurrency,
 		ParallelReadConcurrency:       opts.ParallelReadConcurrency,
 		ParallelReadBlockSize:         opts.ParallelReadBlockSize,
@@ -842,6 +872,54 @@ func mountWithConfig(cfg MountConfig) error {
 	if coreExt != nil {
 		coreExt.AttachEvents(bus)
 	}
+	// Process-wide memory budget (v1 had none): the read cache, the
+	// write-back data cache, the per-handle write buffers and the inode table
+	// all charge their retained bytes here, so a mount with many large files
+	// open cannot grow RSS past the configured limit.
+	//
+	// Zero means AUTO: derive the limit from the container's cgroup memory
+	// limit, where the OOM kill this bounds actually happens. A bare host has
+	// no limit to derive, so auto resolves to disabled there (stated in the
+	// mount log). A negative value disables the budget explicitly.
+	const (
+		memoryBudgetFloor = 16 << 20 // same floor the CLI enforces on explicit values
+		// A container smaller than the floor is not a place to enforce a
+		// budget: fail closed to accounting-only, which exercises the
+		// accounting without turning ordinary writes into ENOMEM.
+	)
+	budgetLimit := cfg.MemoryBudget
+	budgetSource := "configured"
+	budgetAuto := false
+	switch {
+	case budgetLimit < 0:
+		budgetLimit = 0
+		budgetSource = "disabled with -1"
+	case budgetLimit == 0:
+		budgetLimit, budgetSource = membudget.AutoLimit()
+		budgetAuto = budgetLimit > 0
+		if budgetAuto {
+			budgetSource = "auto: " + budgetSource
+		}
+	}
+	var memoryBudget *membudget.Budget
+	if budgetLimit > 0 {
+		mode, merr := membudget.ParseMode(strings.TrimSpace(cfg.MemoryBudgetMode))
+		if merr != nil {
+			return fmt.Errorf("fuse: %w", merr)
+		}
+		if budgetAuto && budgetLimit < memoryBudgetFloor {
+			mode = membudget.ModeWarn
+			fmt.Fprintf(os.Stderr, "drive9: memory budget: auto limit %d MiB is below the %d MiB floor; accounting only (warn mode)\n",
+				budgetLimit>>20, memoryBudgetFloor>>20)
+		}
+		memoryBudget = membudget.New(budgetLimit, mode, logger.L())
+		fmt.Fprintf(os.Stderr, "drive9: memory budget limit=%d MiB (%s, mode=%s)\n", budgetLimit>>20, budgetSource, mode)
+	} else if budgetSource == "disabled with -1" {
+		fmt.Fprintf(os.Stderr, "drive9: memory budget disabled by --memory-budget-mb -1\n")
+	} else {
+		fmt.Fprintf(os.Stderr, "drive9: memory budget disabled (auto: no cgroup memory limit found; set --memory-budget-mb to bound RSS)\n")
+	}
+
 	var readCache *cache.Cache
 	if wantExt["cache"] {
 		// v1 always ran the in-memory read cache — it does not need a cache
@@ -855,6 +933,7 @@ func mountWithConfig(cfg MountConfig) error {
 			MaxSize:            cfg.CacheSize,
 			TTL:                cfg.ReadCacheTTL,
 			MaxFileSize:        cfg.ReadCacheMaxFileBytes,
+			MemoryBudget:       memoryBudget,
 			SequentialPrefetch: true,
 			PrefetchClient:     cl,
 			RemoteRoot:         remoteRoot,
@@ -1002,6 +1081,8 @@ func mountWithConfig(cfg MountConfig) error {
 	if wantExt["localize"] && cfg.LocalRoot != "" {
 		localizeOpts := localize.Options{
 			LocalRoot:                   cfg.LocalRoot,
+			QuotaBytes:                  cfg.LocalizeQuotaBytes,
+			FreeRatio:                   cfg.LocalizeFreeRatio,
 			LocalOnlyPatterns:           cfg.LocalOnlyPatterns,
 			LocalGitignoreAwarePatterns: cfg.LocalGitignoreAwarePatterns,
 			RemoteOnlyPatterns:          cfg.RemoteOnlyPatterns,
@@ -1283,6 +1364,7 @@ func mountWithConfig(cfg MountConfig) error {
 		GVisorCompat:       cfg.GVisorCompat,
 		Uid:                uid,
 		Gid:                gid,
+		MemoryBudget:       memoryBudget,
 	})
 	if err != nil {
 		return fmt.Errorf("fuse: assemble facade: %w", err)
@@ -1481,6 +1563,9 @@ func mountWithConfig(cfg MountConfig) error {
 			shadowDesc = cfg.CacheDir + "/staging/shadow"
 		}
 	}
+	if budget := f.MemoryBudget(); budget != nil {
+		fmt.Fprintf(os.Stderr, "drive9: memory budget: %s\n", budget.Snapshot().String())
+	}
 	fmt.Fprint(os.Stderr, readyMessage(cfg.MountPoint, cfg.Server, actorID, cfg.ReadOnly, policyString(policy), cacheDesc, shadowDesc, cfg.OmitProcessStateCredentials))
 
 	// Keep a server-side mount lease alive while this process serves. The
@@ -1495,10 +1580,19 @@ func mountWithConfig(cfg MountConfig) error {
 	// transient); a second signal force-unmounts. Without this the worker
 	// waits for the kernel to drop the connection and the supervisor's
 	// stop window expires into a kill.
+	//
+	// The drain runs the same contract as `drive9 mount drain` (flush →
+	// uploader/commit queue → notifications → pending snapshot) and its
+	// failure is never discarded: a drain that leaves acknowledged bytes
+	// uncommitted still unmounts (the process is going away either way) but
+	// records a drain_failed exit reason and exits non-zero, so
+	// `drive9 umount` reports the loss instead of returning success.
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(sigCh)
+	shutdownOutcome := newShutdownResult()
 	go func() {
+		defer shutdownOutcome.finish()
 		<-sigCh
 		f.shutdownRequested.Store(true)
 		fmt.Fprintf(os.Stderr, "\ndrive9: unmounting %s...\n", cfg.MountPoint)
@@ -1507,10 +1601,14 @@ func mountWithConfig(cfg MountConfig) error {
 			fmt.Fprintf(os.Stderr, "drive9: force-quit\n")
 			ForceUnmount(cfg.MountPoint)
 		}()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownDrainTimeout)
 		defer cancel()
-		_ = f.flushOpenHandles(shutdownCtx)
-		_ = f.chain.Drain(shutdownCtx)
+		resp := f.Drain(shutdownCtx)
+		if !resp.OK {
+			err := recordDrainFailure(cfg, resp)
+			shutdownOutcome.set(err)
+			fmt.Fprintf(os.Stderr, "drive9: shutdown drain failed at %s: %v\n", cfg.MountPoint, err)
+		}
 		for attempt := 0; attempt < 5; attempt++ {
 			if err := server.Unmount(); err == nil {
 				return
@@ -1520,12 +1618,18 @@ func mountWithConfig(cfg MountConfig) error {
 		ForceUnmount(cfg.MountPoint)
 	}()
 	<-serveDone
-	// A shutdown WE initiated (signal handler: flush → drain → Unmount,
-	// with ForceUnmount as the busy fallback) is a clean worker exit —
-	// the lazy fallback can leave the mountinfo row past the serve end,
-	// and classifying that as abnormal failed the CLI's umount.
+	// A shutdown WE initiated (signal handler: drain → Unmount, with
+	// ForceUnmount as the busy fallback) is a clean worker exit — the lazy
+	// fallback can leave the mountinfo row past the serve end, and
+	// classifying that as abnormal failed the CLI's umount. A drain that
+	// left work behind is NOT clean: it is reported.
 	if f.shutdownRequested.Load() {
-		return nil
+		// A second signal can force the unmount while the drain is still
+		// running; the verdict is what decides success, so wait for it rather
+		// than reporting a clean stop that never happened. The drain context
+		// bounds the wait.
+		shutdownOutcome.wait()
+		return shutdownOutcome.err()
 	}
 	// Classify the serve end by the KERNEL mount, not by the OnUnmount
 	// callback: the pinned go-fuse fork invokes OnUnmount unconditionally
@@ -1537,6 +1641,105 @@ func mountWithConfig(cfg MountConfig) error {
 	// serve loop dies. Give the row a short settling window — the loop can
 	// exit marginally before the umount(2) that triggered it completes.
 	return classifyServeExit(cfg.MountPoint, unmountedKernel)
+}
+
+// shutdownDrainTimeout bounds the shutdown drain. It matches the mount
+// control server's drain budget (mountcontrol.DefaultDrainTimeout) plus room
+// for the unmount retries the worker still has to run.
+const shutdownDrainTimeout = 30 * time.Second
+
+// shutdownResult carries the shutdown drain's verdict from the signal
+// goroutine to the serve-loop exit path. The two are ordered by the kernel
+// unmount, not by a Go synchronization edge, so the hand-off needs a mutex and
+// a completion channel: on a forced unmount serveDone can close while the
+// drain is still running, and returning before the verdict exists would report
+// a clean stop that never happened.
+type shutdownResult struct {
+	mu      sync.Mutex
+	outcome error
+	done    chan struct{}
+	once    sync.Once
+}
+
+func newShutdownResult() *shutdownResult {
+	return &shutdownResult{done: make(chan struct{})}
+}
+
+func (s *shutdownResult) set(err error) {
+	if s == nil || err == nil {
+		return
+	}
+	s.mu.Lock()
+	s.outcome = errors.Join(s.outcome, err)
+	s.mu.Unlock()
+}
+
+// finish marks the verdict final; the shutdown goroutine defers it.
+func (s *shutdownResult) finish() {
+	if s == nil {
+		return
+	}
+	s.once.Do(func() { close(s.done) })
+}
+
+// wait blocks until the shutdown goroutine recorded its verdict. The drain
+// carries its own deadline, so the wait is bounded.
+func (s *shutdownResult) wait() {
+	if s == nil {
+		return
+	}
+	<-s.done
+}
+
+func (s *shutdownResult) err() error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.outcome
+}
+
+// recordDrainFailure persists the drain_failed exit record (the supervisor and
+// `drive9 umount` read it to tell a clean stop from one that lost writes) and
+// returns the error the worker exits with.
+func recordDrainFailure(cfg MountConfig, resp mountcontrol.DrainResponse) error {
+	pending := resp.Pending
+	detail := fmt.Sprintf("drain failed at %s", cfg.MountPoint)
+	reason := resp.ErrorKind
+	if reason == "" {
+		reason = resp.Error
+	} else if resp.Error != "" {
+		reason += ": " + resp.Error
+	}
+	if reason != "" {
+		detail += ": " + reason
+	}
+	detail += fmt.Sprintf(" (open_handles=%d dirty_handles=%d commit_queue=%d commit_bytes=%d uploader_queued=%d uploader_in_flight=%d uploader_cached_bytes=%d)",
+		pending.OpenHandles,
+		pending.DirtyHandles,
+		pending.CommitQueuePending,
+		pending.CommitQueueBytes,
+		pending.UploaderQueued,
+		pending.UploaderInFlight,
+		pending.UploaderCachedBytes,
+	)
+	if cfg.OmitProcessStateCredentials {
+		detail = redactCredentialText(detail, cfg)
+	}
+	record := mountstate.ExitReason{
+		PID:    os.Getpid(),
+		Code:   ExitDrainFailed,
+		Reason: string(ExitReasonDrainFailed),
+		Detail: detail,
+		// Files the caller can look for in the preserved recovery state.
+		PendingFiles: pending.DirtyHandles + pending.CommitQueuePending + pending.UploaderQueued,
+		PendingBytes: pending.CommitQueueBytes + pending.UploaderCachedBytes,
+	}
+	if err := mountstate.WriteExitReason(cfg.MountPoint, record); err != nil {
+		fmt.Fprintf(os.Stderr, "drive9: record drain failure at %s: %v\n", cfg.MountPoint, err)
+	}
+	return ExitDrainFailedErr(detail)
 }
 
 // classifyServeExit classifies a serve-loop exit by the KERNEL mount row

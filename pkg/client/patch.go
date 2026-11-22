@@ -174,7 +174,7 @@ func (c *Client) uploadPatchPart(ctx context.Context, part *PatchPartURL, readPa
 				req.Header.Set(k, v)
 			}
 		}
-		resp, err := c.httpClient.Do(req) // Direct to S3, no auth
+		resp, err := c.doPresigned(req) // Direct to S3, no auth
 		if err != nil {
 			return fmt.Errorf("download original part: %w", err)
 		}
@@ -215,7 +215,7 @@ func (c *Client) uploadPatchPart(ctx context.Context, part *PatchPartURL, readPa
 		req.Header.Set("x-amz-checksum-sha256", checksum)
 	}
 
-	resp, err := c.httpClient.Do(req) // Direct to S3, no auth
+	resp, err := c.doPresigned(req) // Direct to S3, no auth
 	if err != nil {
 		return err
 	}

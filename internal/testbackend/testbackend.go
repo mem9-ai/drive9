@@ -26,6 +26,11 @@ type Node struct {
 	Mode  uint32 // full mode, including S_IFMT for symlinks
 	Rev   int64
 	Mtime int64
+	// ResourceID is the object identity the server reports as
+	// X-Dat9-Resource-ID: it names the OBJECT, so it survives revisions,
+	// writes and renames, while a replacement created at the same path is
+	// a different object with a different id. Assigned on first stat.
+	ResourceID string
 
 	// ContentLayout overrides the stat-advertised layout ("append_log",
 	// "single", "" = none). Seeded by tests to model server-side append-log
@@ -53,9 +58,10 @@ type LayerEntry struct {
 // rename/symlink/hardlink/chmod POSTs, DELETE, and a forced-conflict knob
 // for compare-and-set retry paths.
 type Backend struct {
-	mu      sync.Mutex
-	files   map[string]*Node
-	nextRev int64
+	mu         sync.Mutex
+	files      map[string]*Node
+	nextRev    int64
+	nextObject int64
 	// ForceConflict makes the next N conditional writes to a path answer
 	// 409, simulating a concurrent revision bump.
 	forceConflict map[string]int
@@ -184,6 +190,23 @@ func (b *Backend) SeedWithLayout(path string, data []byte, layout string) {
 	b.files[path] = &Node{Data: append([]byte(nil), data...), Mode: 0o644, Rev: 1, Mtime: 1, ContentLayout: layout}
 }
 
+// ObjectID returns the path's object identity, assigning one on first use
+// exactly as a stat would (X-Dat9-Resource-ID). Tests that assert on a cache
+// key built from an open handle's pinned identity need it.
+func (b *Backend) ObjectID(path string) string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	n := b.files[path]
+	if n == nil {
+		return ""
+	}
+	if n.ResourceID == "" {
+		b.nextObject++
+		n.ResourceID = "res-" + strconv.FormatInt(b.nextObject, 10)
+	}
+	return n.ResourceID
+}
+
 // Node returns a snapshot of one entry.
 func (b *Backend) Node(path string) (Node, bool) {
 	b.mu.Lock()
@@ -192,7 +215,7 @@ func (b *Backend) Node(path string) (Node, bool) {
 	if !ok {
 		return Node{}, false
 	}
-	return Node{Data: append([]byte(nil), n.Data...), IsDir: n.IsDir, Mode: n.Mode, Rev: n.Rev, Mtime: n.Mtime}, true
+	return Node{Data: append([]byte(nil), n.Data...), IsDir: n.IsDir, Mode: n.Mode, Rev: n.Rev, Mtime: n.Mtime, ResourceID: n.ResourceID}, true
 }
 
 // Snapshot returns a deep copy of all entries (path → node).
@@ -1050,11 +1073,20 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		var rev, mtime int64
 		var mode uint32
 		var contentLayout string
+		var resourceID string
 		if n != nil {
 			isDir = n.IsDir
 			dataLen = len(n.Data)
 			rev, mtime, mode = n.Rev, n.Mtime, n.Mode
 			contentLayout = n.ContentLayout
+			if n.ResourceID == "" {
+				// The real server reports the object's stable identity on
+				// every stat; the lazy assignment keeps the fake's seeds
+				// (which predate object identity) from colliding.
+				b.nextObject++
+				n.ResourceID = "res-" + strconv.FormatInt(b.nextObject, 10)
+			}
+			resourceID = n.ResourceID
 		}
 		b.mu.Unlock()
 		if n == nil {
@@ -1064,6 +1096,7 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Dat9-IsDir", strconv.FormatBool(isDir))
 		w.Header().Set("Content-Length", strconv.Itoa(dataLen))
 		w.Header().Set("X-Dat9-Revision", strconv.FormatInt(rev, 10))
+		w.Header().Set("X-Dat9-Resource-ID", resourceID)
 		w.Header().Set("X-Dat9-Mode", strconv.FormatUint(uint64(mode), 10))
 		w.Header().Set("X-Dat9-Mtime", strconv.FormatInt(mtime, 10))
 		// Mirror the real server's placement decision: objects at or

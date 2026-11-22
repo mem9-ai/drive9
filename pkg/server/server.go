@@ -37,6 +37,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/tagutil"
 	"github.com/mem9-ai/drive9/pkg/tenant"
 	tenantschema "github.com/mem9-ai/drive9/pkg/tenant/schema"
+	"github.com/mem9-ai/drive9/pkg/tenant/tidbcloudnative"
 	"github.com/mem9-ai/drive9/pkg/tenant/token"
 	"github.com/mem9-ai/drive9/pkg/traceid"
 	"github.com/mem9-ai/drive9/pkg/vault"
@@ -180,8 +181,11 @@ type provisioningRegionProvider interface {
 }
 
 type nativeSystemUserProvisioner interface {
-	// tenantID is reserved for audit/log naming; current native setup derives SQL principals from the DSN user.
-	EnsureSystemUser(ctx context.Context, dsn, tenantID string) (username, password string, err error)
+	// tenantID scopes the derived password, and grantVerified reports whether this call
+	// applied the setup that revokes the legacy cluster-wide grant. A false grantVerified is
+	// not an error: it means the stored credential could not prove the grant state, so the
+	// caller must record the tenant for review instead of claiming remediation.
+	EnsureSystemUser(ctx context.Context, dsn, tenantID string) (username, password string, grantVerified bool, err error)
 }
 
 func (s *Server) provisionerForTenantProvider(provider string) tenant.Provisioner {
@@ -262,12 +266,12 @@ type Server struct {
 	leaderWorkerMu       sync.Mutex
 	leaderWorkersStarted bool
 	leaderWorkerStopDone chan struct{}
-	// nativePrivilegeRetire* carry per-tenant retry state for the legacy-grant
+	// nativeCredentialRemediation* carry per-tenant retry state for the legacy-grant
 	// cleanup, so a failing tenant is retried with backoff instead of on every pass.
-	nativePrivilegeRetireMu       sync.Mutex
-	nativePrivilegeRetireFailures map[string]int
-	nativePrivilegeRetireRetryAt  map[string]time.Time
-	nativePrivilegeRetireDone     map[string]time.Time
+	nativeCredentialRemediationMu       sync.Mutex
+	nativeCredentialRemediationFailures map[string]int
+	nativeCredentialRemediationRetryAt  map[string]time.Time
+	nativeCredentialRemediationDone     map[string]time.Time
 	// replayWorker and expirySweepWorker are leader-gated central quota
 	// workers owned by the server (single callback owner). Started in
 	// startLeaderWorkers and stopped in stopLeaderWorkers so they follow
@@ -319,6 +323,10 @@ type Server struct {
 	// safetyNetScanInterval is how often each pod runs the safety-net scan.
 	// Non-positive disables it.
 	safetyNetScanInterval time.Duration
+
+	// requestReadStall overrides serverReadStallTimeout when positive. Tests set a short
+	// window; production leaves it zero.
+	requestReadStall time.Duration
 
 	// httpSrv is the running HTTP server, stored by ListenAndServe so
 	// Shutdown can drain it on SIGINT/SIGTERM. Guarded by httpSrvMu.
@@ -385,6 +393,13 @@ const (
 	defaultBatchWriteMaxBody              int64 = 8 << 20
 	maxCredentialProvisionBodyBytes       int64 = 1 << 20
 	provisionFailureClusterCleanupTimeout       = 2 * time.Minute
+
+	// maxFSControlBodyBytes caps the small JSON control bodies on fs write surfaces that take
+	// one (patch and chmod). A patch request carries a size, a part size and part indices — ten
+	// gigabytes at the 5 MiB minimum part size is about two thousand indices, tens of
+	// kilobytes — and chmod carries a mode, so a megabyte is roomy while still bounding the
+	// decode.
+	maxFSControlBodyBytes = 1 << 20
 )
 
 func New(b *backend.Dat9Backend) *Server {
@@ -776,9 +791,13 @@ func (s *Server) startNotifyInfrastructure(cfg Config) {
 
 	// Unified outbox poller: reads the central outbox on every pod and
 	// dispatches by work_mask.
+	var poolEvict func(string)
+	if s.pool != nil {
+		poolEvict = s.pool.Invalidate
+	}
 	poller := newTenantOutboxPoller(
 		s.meta, s.events, s.tenantWorker, resolver.ownsTenantFn(),
-		cfg.PodID, cfg.TenantOutboxPollInterval, cfg.TenantOutboxCursorFlushInterval,
+		poolEvict, cfg.PodID, cfg.TenantOutboxPollInterval, cfg.TenantOutboxCursorFlushInterval,
 	)
 	// Initialize the poller cursor synchronously BEFORE starting the goroutine
 	// and BEFORE the server accepts live traffic. On restart the cursor is
@@ -1024,15 +1043,15 @@ func (s *Server) startLeaderWorkers() {
 	// change.
 	if s.meta != nil && s.pool != nil {
 		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
-			ticker := time.NewTicker(nativePrivilegeRetireInterval)
+			ticker := time.NewTicker(nativeCredentialRemediationInterval)
 			defer ticker.Stop()
-			s.retireNativeTenantVariablesPrivilege(workerCtx)
+			s.remediateNativeTenantCredentials(workerCtx)
 			for {
 				select {
 				case <-workerCtx.Done():
 					return
 				case <-ticker.C:
-					s.retireNativeTenantVariablesPrivilege(workerCtx)
+					s.remediateNativeTenantCredentials(workerCtx)
 				}
 			}
 		})
@@ -1555,7 +1574,7 @@ func injectFallbackBackend(b *backend.Dat9Backend, next http.Handler) http.Handl
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	s.observe(s.mux, w, r)
+	s.observe(s.mux, w, s.withReadStall(w, r))
 }
 
 const (
@@ -1597,16 +1616,27 @@ func isLoopbackListenAddr(addr string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-func (s *Server) ListenAndServe(addr string) error {
-	logger.Info(backgroundWithTrace(context.Background()), "server_start", zap.String("addr", addr), zap.Int64("max_upload_bytes", s.maxUploadBytes))
-	httpSrv := &http.Server{
+// newHTTPServer builds the listener's http.Server. readTimeout is a parameter rather than a
+// field read so a test can exercise the bound with a short duration instead of waiting ten
+// minutes out; production passes serverReadTimeout.
+func (s *Server) newHTTPServer(addr string, readTimeout time.Duration) *http.Server {
+	return &http.Server{
 		Addr:              addr,
 		Handler:           s,
 		ReadHeaderTimeout: 15 * time.Second,
-		IdleTimeout:       2 * time.Minute,
-		MaxHeaderBytes:    1 << 20,
-		TLSConfig:         &tls.Config{MinVersion: tls.VersionTLS12},
+		// ReadTimeout is the total fallback for a body whose per-request stall deadline cannot
+		// be set (see withReadStall); everywhere else each read pushes the deadline out, so a
+		// progressing upload is not killed by the total.
+		ReadTimeout:    readTimeout,
+		IdleTimeout:    2 * time.Minute,
+		MaxHeaderBytes: 1 << 20,
+		TLSConfig:      &tls.Config{MinVersion: tls.VersionTLS12},
 	}
+}
+
+func (s *Server) ListenAndServe(addr string) error {
+	logger.Info(backgroundWithTrace(context.Background()), "server_start", zap.String("addr", addr), zap.Int64("max_upload_bytes", s.maxUploadBytes), zap.Duration("read_stall_timeout", serverReadStallTimeout))
+	httpSrv := s.newHTTPServer(addr, serverReadStallTimeout)
 	// The API carries bearer tokens, vault secrets and file bytes. Serve HTTPS
 	// directly when a certificate is configured; otherwise say plainly that the
 	// listener is plaintext so an operator cannot mistake an unencrypted
@@ -2612,7 +2642,15 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 	}
 	actualCL := r.ContentLength
 	cl := actualCL
-	if h := r.Header.Get("X-Dat9-Content-Length"); h != "" {
+	// One declared length and one only: with duplicates the value actually used would depend
+	// on header order, so a caller could send 5 and 50 and have either take effect.
+	if declared := r.Header.Values("X-Dat9-Content-Length"); len(declared) > 1 {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_duplicate_declared_length", "path", path, "count", len(declared))...)
+		metricEvent(r.Context(), "fs_write", "result", "error")
+		errJSON(w, http.StatusBadRequest, "duplicate X-Dat9-Content-Length header")
+		return
+	} else if len(declared) == 1 {
+		h := declared[0]
 		parsed, err := strconv.ParseInt(h, 10, 64)
 		if err != nil || parsed < 0 {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_invalid_declared_length", "path", path, "header", h)...)
@@ -2620,13 +2658,34 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 			errJSON(w, http.StatusBadRequest, "invalid X-Dat9-Content-Length")
 			return
 		}
-		if actualCL > 0 && parsed > 0 && actualCL != parsed {
+		// A positive transport length is final, so any disagreement with the declared one is a
+		// malformed request — including a declared zero, which used to slip through and then fail
+		// as "too large", a bound neither header names. A zero transport length is left alone: it
+		// is how a large-file PUT declares its size while sending no body, and a short body under
+		// a positive declaration is caught after the read.
+		if actualCL > 0 && actualCL != parsed {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_length_mismatch", "path", path, "content_length", actualCL, "declared_length", parsed)...)
 			metricEvent(r.Context(), "fs_write", "result", "error")
 			errJSON(w, http.StatusBadRequest, "Content-Length and X-Dat9-Content-Length mismatch")
 			return
 		}
 		cl = parsed
+	}
+	if cl < 0 {
+		// A chunked request carries no length the router can trust: r.ContentLength is -1
+		// and the caller declared none either. Two things go wrong if that is read anyway —
+		// the 413 check below compares -1 against the limit and passes, and the large-file
+		// branch is skipped, so the whole body is buffered in memory before its size is
+		// known. Require the length up front instead, with the answer fs already gives for a
+		// length-less body: handleAppendLog refuses r.ContentLength < 0 as a 400
+		// ("Content-Length is required", fs/pkg/server/server.go:4187; the same rule stated as
+		// "Content-Length or X-Dat9-Content-Length is required" at :3764). A policy is needed
+		// here and there is no 411 precedent in fs to copy, so the code the sibling path uses
+		// wins over inventing a new status this service never returned.
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_missing_length", "path", path)...)
+		metricEvent(r.Context(), "fs_write", "result", "error")
+		errJSON(w, http.StatusBadRequest, "Content-Length or X-Dat9-Content-Length is required")
+		return
 	}
 	if cl > s.maxUploadBytes {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_too_large", "path", path, "bytes", cl, "max", s.maxUploadBytes)...)
@@ -2707,11 +2766,14 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 		_ = json.NewEncoder(w).Encode(plan)
 		return
 	}
-	body := http.MaxBytesReader(w, r.Body, s.maxUploadBytes)
+	// Read at most what the caller declared: cl is a real length by now (a negative one is
+	// rejected above), so a body that keeps sending past it is cut off by the reader rather
+	// than buffered.
+	body := http.MaxBytesReader(w, r.Body, cl)
 	bodyReadStart := time.Now()
 	data, err := io.ReadAll(body)
 	bodyReadDuration = time.Since(bodyReadStart)
-	bodyReadMetricBytes := requestBodyReadMetricBytes(cl, len(data))
+	bodyReadMetricBytes := int64(len(data))
 	setRequestBodyReadMetric(r.Context(), r.Method, requestRoute(r.URL.Path), bodyReadMetricBytes, bodyReadDuration)
 	logSlowWriteBodyRead(r.Context(), r, requestRoute(r.URL.Path), bodyReadMetricBytes, bodyReadDuration)
 	if err != nil {
@@ -2720,14 +2782,30 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 		}
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
-			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_body_too_large", "path", path, "max", s.maxUploadBytes)...)
+			// The reader was bounded by the declared length, so that is the limit the caller
+			// exceeded. Reporting the server-wide maximum here would name a bound this request
+			// never reached.
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_body_too_large", "path", path, "max", cl)...)
 			metricEvent(r.Context(), "fs_write", "result", "error")
-			errJSON(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("upload too large: max %d bytes", s.maxUploadBytes))
+			errJSON(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("upload too large: max %d bytes", cl))
 			return
 		}
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_body_read_failed", "path", path, "error", err)...)
 		metricEvent(r.Context(), "fs_write", "result", "error")
 		errJSON(w, http.StatusBadRequest, "read body: "+err.Error())
+		return
+	}
+	// The reader cut a body off at cl, but it cannot tell us a body stopped short of it: a
+	// chunked stream that ends after five bytes against a declared hundred ends in a plain
+	// EOF. Committing that would truncate the file to five bytes and answer 200, so the
+	// declaration is checked against what actually arrived before anything is written.
+	if int64(len(data)) != cl {
+		if timingEnabled {
+			logServerWriteTiming(r.Context(), path, len(data), expectedRevision, 0, "body_length_mismatch", bodyReadDuration, backendWriteDuration, responseDuration, time.Since(timingStart), nil)
+		}
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_body_shorter_than_declared", "path", path, "declared", cl, "received", len(data))...)
+		metricEvent(r.Context(), "fs_write", "result", "error")
+		errJSON(w, http.StatusBadRequest, fmt.Sprintf("request body is %d bytes but %d were declared", len(data), cl))
 		return
 	}
 	description := r.Header.Get("X-Dat9-Description")
@@ -2814,13 +2892,6 @@ func serverDurationMs(d time.Duration) float64 {
 	return float64(d.Microseconds()) / 1000.0
 }
 
-func requestBodyReadMetricBytes(declared int64, observed int) int64 {
-	if declared >= 0 {
-		return declared
-	}
-	return int64(observed)
-}
-
 const slowWriteBodyReadThreshold = 5 * time.Second
 
 func logSlowWriteBodyRead(ctx context.Context, r *http.Request, route string, bytes int64, d time.Duration) {
@@ -2880,7 +2951,14 @@ func (s *Server) handlePatch(w http.ResponseWriter, r *http.Request, path string
 		PartSize         int64  `json:"part_size,omitempty"`
 		ExpectedRevision *int64 `json:"expected_revision,omitempty"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxFSControlBodyBytes)).Decode(&req); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "patch_body_too_large", "path", path, "max", maxFSControlBodyBytes)...)
+			metricEvent(r.Context(), "fs_patch", "result", "error")
+			errJSON(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return
+		}
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "patch_bad_body", "path", path, "error", err)...)
 		metricEvent(r.Context(), "fs_patch", "result", "error")
 		errJSON(w, http.StatusBadRequest, "invalid request body: "+err.Error())
@@ -3928,7 +4006,13 @@ func (s *Server) handleChmod(w http.ResponseWriter, r *http.Request, path string
 	var req struct {
 		Mode uint32 `json:"mode"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxFSControlBodyBytes)).Decode(&req); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "chmod_body_too_large", "path", path, "max", maxFSControlBodyBytes)...)
+			errJSON(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return
+		}
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "chmod_bad_body", "path", path, "error", err)...)
 		errJSON(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
@@ -6167,12 +6251,19 @@ func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN,
 		if !s.tenantSchemaInitStillProvisioning(ctx, tenantID, provider, "before_attempt") {
 			return
 		}
-		err := schemaInit(ctx, tenantDSN)
+		var err error
+		tenantDSN, err = s.schemaInitWithCredentialRecovery(ctx, tenantID, tenantDSN, provider, schemaInit)
 		if err == nil {
 			if !s.tenantSchemaInitStillProvisioning(ctx, tenantID, provider, "before_finalize") {
 				return
 			}
-			err = s.finalizeTenantSchemaInit(ctx, tenantID, tenantDSN, provider)
+			var effectiveDSN string
+			effectiveDSN, err = s.finalizeTenantSchemaInit(ctx, tenantID, tenantDSN, provider)
+			if err == nil && effectiveDSN != "" {
+				// Finalization may have rotated the credential; later attempts must dial the
+				// account the tenant now has.
+				tenantDSN = effectiveDSN
+			}
 			if err == nil {
 				if versionErr := s.updateTenantSchemaVersionForProfile(ctx, tenantID, provider); versionErr != nil {
 					logger.Error(ctx, "server_event", eventFields(ctx, "schema_init_version_persist_failed", "tenant_id", tenantID, "provider", provider, "attempt", attempt, "error", versionErr)...)
@@ -6303,37 +6394,125 @@ func (s *Server) tenantSchemaInitStillProvisioning(ctx context.Context, tenantID
 	return true
 }
 
-func (s *Server) finalizeTenantSchemaInit(ctx context.Context, tenantID, tenantDSN, provider string) error {
+// schemaInitWithCredentialRecovery runs schema initialization and, when the server refuses
+// the login because a rotation it performed was never persisted, recovers the credential and
+// retries once. Without it a crash between ALTER USER and the metadata write would strand the
+// tenant on the schema-init step until an operator intervened.
+func (s *Server) schemaInitWithCredentialRecovery(ctx context.Context, tenantID, tenantDSN, provider string, schemaInit func(context.Context, string) error) (string, error) {
+	err := schemaInit(ctx, tenantDSN)
+	if err == nil || provider != tenant.ProviderTiDBCloudNative || !isCredentialRejectedError(err) {
+		return tenantDSN, err
+	}
+	cfg, parseErr := mysql.ParseDSN(tenantDSN)
+	if parseErr != nil || !tidbcloudnative.IsRestrictedSystemUser(cfg.User) {
+		return tenantDSN, err
+	}
+	// The account was rotated but the control plane never learned the new password. The stored
+	// password still authenticates as the cluster root, so finalization can re-apply the
+	// rotation — the derived value is deterministic, so it is the password the earlier attempt
+	// already set — and persist it.
+	effective, finalizeErr := s.finalizeTenantSchemaInit(ctx, tenantID, tenantDSN, provider)
+	if finalizeErr != nil {
+		return tenantDSN, fmt.Errorf("schema init was refused (%v) and credential recovery failed: %w", err, finalizeErr)
+	}
+	return effective, schemaInit(ctx, effective)
+}
+
+// isCredentialRejectedError reports whether the server refused the login, which is what a
+// credential this server rotated but could not persist looks like on the next attempt.
+func isCredentialRejectedError(err error) bool {
+	var mysqlErr *mysql.MySQLError
+	return errors.As(err, &mysqlErr) && mysqlErr.Number == 1045
+}
+
+// finalizeTenantSchemaInit applies the tenant's runtime credential and returns the DSN a
+// caller must dial afterwards. The returned DSN matters: finalization can rotate the
+// restricted account's password, so the caller's own DSN is stale by the time this returns,
+// and every post-finalization step has to use the effective one.
+func (s *Server) finalizeTenantSchemaInit(ctx context.Context, tenantID, tenantDSN, provider string) (string, error) {
 	if provider != tenant.ProviderTiDBCloudNative {
-		return nil
+		return tenantDSN, nil
 	}
 	if s.provisioner == nil {
-		return fmt.Errorf("server misconfigured: native tenant provider is missing")
+		return tenantDSN, fmt.Errorf("server misconfigured: native tenant provider is missing")
 	}
 	systemUserProvisioner, ok := s.provisioner.(nativeSystemUserProvisioner)
 	if !ok {
-		return fmt.Errorf("native provisioner does not support system user setup")
+		return tenantDSN, fmt.Errorf("native provisioner does not support system user setup")
 	}
 	cfg, err := mysql.ParseDSN(tenantDSN)
 	if err != nil {
-		return fmt.Errorf("parse native tenant DSN for credential finalization: %w", err)
+		return tenantDSN, fmt.Errorf("parse native tenant DSN for credential finalization: %w", err)
 	}
 	fromDBUser := strings.TrimSpace(cfg.User)
 	if fromDBUser == "" {
-		return fmt.Errorf("native tenant DSN has empty username")
+		return tenantDSN, fmt.Errorf("native tenant DSN has empty username")
 	}
-	username, password, err := systemUserProvisioner.EnsureSystemUser(ctx, tenantDSN, tenantID)
+	// Read the recorded outcome once: it decides the short-circuit below and, when the
+	// provisioner cannot verify the grant, whether the tenant may be downgraded.
+	recordedState, _, stateErr := s.meta.TenantCredentialState(ctx, tenantID)
+	if stateErr != nil && !errors.Is(stateErr, meta.ErrNotFound) {
+		return tenantDSN, fmt.Errorf("read native tenant credential state: %w", stateErr)
+	}
+	// A resumed finalization for a tenant this server already remediated has nothing to do:
+	// dialling the cluster root again cannot add information, and rewriting the credential
+	// would emit another invalidation signal for an unchanged row.
+	if tidbcloudnative.IsRestrictedSystemUser(fromDBUser) && recordedState == meta.TenantCredentialRemediated {
+		return tenantDSN, nil
+	}
+	username, password, grantVerified, err := systemUserProvisioner.EnsureSystemUser(ctx, tenantDSN, tenantID)
 	if err != nil {
-		return fmt.Errorf("ensure native system user: %w", err)
+		return tenantDSN, fmt.Errorf("ensure native system user: %w", err)
 	}
 	if username == "" || password == "" {
-		return fmt.Errorf("native system user setup returned empty credential")
+		return tenantDSN, fmt.Errorf("native system user setup returned empty credential")
 	}
+	if !grantVerified {
+		// The provisioner ran no setup — the account is operator-managed — so the credential
+		// did not change and there is nothing to write. Record the outcome alone: rewriting
+		// the row would bump updated_at and emit an invalidation signal for a credential that
+		// stayed the same.
+		//
+		// Unless it was already remediated: a tenant that stopped mid-provisioning resumes
+		// finalization with exactly this shape — the restricted account and its derived
+		// password — and no root credential to re-verify a grant this server already revoked.
+		// Downgrading that record would flag a tenant that is fine on every following pass,
+		// so an existing remediation wins over a probe that cannot see it.
+		if recordedState != meta.TenantCredentialRemediated {
+			reason := "finalization could not verify the legacy grant: stored credential is not root-equivalent"
+			if err := s.meta.SetTenantCredentialState(ctx, tenantID, meta.TenantCredentialReviewRequired, reason); err != nil {
+				return tenantDSN, fmt.Errorf("record native tenant credential state: %w", err)
+			}
+		}
+		if username != fromDBUser || password != cfg.Passwd {
+			// Defensive: a provisioner that reports an unverified grant but a changed
+			// credential still has to persist what it returned.
+			if updateErr := s.persistNativeCredential(ctx, tenantID, fromDBUser, username, password, recordedState); updateErr != nil {
+				return tenantDSN, updateErr
+			}
+		}
+		return credentialDSN(cfg, username, password), nil
+	}
+	// The setup ran, so the derived credential is in place and the legacy grant is gone: the
+	// outcome is recorded in the same transaction as the credential it describes.
+	if err := s.persistNativeCredential(ctx, tenantID, fromDBUser, username, password, meta.TenantCredentialRemediated); err != nil {
+		return tenantDSN, err
+	}
+	return credentialDSN(cfg, username, password), nil
+}
+
+// persistNativeCredential stores a credential and the outcome it proves in one transaction.
+func (s *Server) persistNativeCredential(ctx context.Context, tenantID, fromDBUser, username, password string, state meta.TenantCredentialState) error {
 	cipherPass, err := s.pool.Encrypt(ctx, []byte(password))
 	if err != nil {
 		return fmt.Errorf("encrypt native system user password: %w", err)
 	}
-	updated, err := s.meta.UpdateTenantDBCredentialIf(ctx, tenantID, fromDBUser, username, cipherPass)
+	updated, err := s.meta.UpdateTenantDBCredentialIf(ctx, tenantID, meta.TenantDBCredentialUpdate{
+		FromDBUser:     fromDBUser,
+		DBUser:         username,
+		PasswordCipher: cipherPass,
+		State:          state,
+	})
 	if err != nil {
 		return fmt.Errorf("persist native system user credential: %w", err)
 	}
@@ -6344,6 +6523,15 @@ func (s *Server) finalizeTenantSchemaInit(ctx context.Context, tenantID, tenantD
 			zap.String("db_user", username))
 	}
 	return nil
+}
+
+// credentialDSN rebuilds the tenant DSN with the credential finalization produced, so the
+// caller's post-finalization steps dial the account the tenant now has.
+func credentialDSN(cfg *mysql.Config, username, password string) string {
+	effective := cfg.Clone()
+	effective.User = username
+	effective.Passwd = password
+	return effective.FormatDSN()
 }
 
 func errJSON(w http.ResponseWriter, code int, msg string) {

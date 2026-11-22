@@ -494,6 +494,15 @@ func ExampleClient_quota() {
 		MaxVideoLLMFiles:       &videoLLMFiles,
 		TiDBCloudSpendingLimit: &spendingLimit,
 	})
+	issued, issueErr := credentialClient.AdminGenerateToken(ctx, drive9.AdminGenerateTokenRequest{
+		TenantID:   tenantID,
+		KeyName:    "cutover",
+		PublicKey:  tidbCloudPublicKey,
+		PrivateKey: tidbCloudPrivateKey,
+	})
+	if issueErr == nil {
+		_ = drive9.New(serverURL, issued.Token)
+	}
 
 	// Tenant logs: the server fills the environment, organization and tenant
 	// filters; the caller only chooses the keyword and the window.
@@ -1018,6 +1027,7 @@ var coveredClientMethods = map[string]bool{
 	"BatchStatWithOptionsCtx":                               true,
 	"AdminAcceptMigrationPlan":                              true,
 	"AdminCreateMigrationBatch":                             true,
+	"AdminGenerateToken":                                    true,
 	"AdminGetMigrationBatch":                                true,
 	"AdminGetMigrationTenant":                               true,
 	"AdminGetMigrationTenantState":                          true,
