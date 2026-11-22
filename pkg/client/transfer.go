@@ -351,6 +351,18 @@ type writeOptions struct {
 	multipartOnly bool
 }
 
+// applyWriteOptions folds opts into the option struct. It ignores nil options
+// so a caller can pass an optional WriteOption through unchanged.
+func applyWriteOptions(opts []WriteOption) writeOptions {
+	var o writeOptions
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&o)
+		}
+	}
+	return o
+}
+
 // WithTags sets file tags for the upload.
 func WithTags(tags map[string]string) WriteOption {
 	return func(o *writeOptions) {
@@ -414,13 +426,20 @@ func (c *Client) WriteStreamWithTags(ctx context.Context, path string, r io.Read
 // WriteStreamWithSummary uploads data from a reader and returns coarse-grained
 // phase timings for the completed upload.
 func (c *Client) WriteStreamWithSummary(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, opts ...WriteOption) (*UploadSummary, error) {
-	o := &writeOptions{}
-	for _, opt := range opts {
-		if opt != nil {
-			opt(o)
-		}
-	}
-	return c.writeStreamConditionalWithOptionsAndSummary(ctx, path, r, size, progress, -1, *o, "", nil)
+	o := applyWriteOptions(opts)
+	return c.writeStreamConditionalWithOptionsAndSummary(ctx, path, r, size, progress, -1, o, "", nil)
+}
+
+// WriteStreamConditionalWithOptions is WriteStreamWithSummary with a
+// compare-and-set precondition on the destination: expectedRevision < 0 is
+// unconditional, 0 requires the path to be absent (create-only), and a
+// positive value requires exactly that revision. It exists so a caller that
+// stages a body can commit it atomically AND under a precondition — the
+// plain conditional writers only take byte slices or no write options.
+func (c *Client) WriteStreamConditionalWithOptions(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, expectedRevision int64, opts ...WriteOption) error {
+	o := applyWriteOptions(opts)
+	_, err := c.writeStreamConditionalWithOptionsAndSummary(ctx, path, r, size, progress, expectedRevision, o, "", nil)
+	return err
 }
 
 // WriteStreamWithSummaryAndTags uploads data from a reader, applies tags to

@@ -455,11 +455,10 @@ func TestPutCommitFailureIsLogged(t *testing.T) {
 	}
 }
 
-// A COPY writes its destination through the same writer, but only AFTER
-// x/net/webdav has deleted the old destination: a staging failure there would
-// destroy the old content without a replacement. Non-PUT writes therefore keep
-// the in-memory staging, and an overwrite survives an unusable staging dir.
-func TestCopyDestinationSurvivesSpillFailure(t *testing.T) {
+// The COPY fast path commits its destination atomically, so a staging failure
+// there must FAIL the copy (the old content is still in place) instead of
+// buffering the whole source in memory: memory stays bounded.
+func TestCopyFastPathStagingFailureIsBounded(t *testing.T) {
 	b := testbackend.NewBackend()
 	b.SeedDir("/dir", 0o755)
 	src := strings.Repeat("s", 4096)
@@ -469,23 +468,94 @@ func TestCopyDestinationSurvivesSpillFailure(t *testing.T) {
 	t.Cleanup(ts.Close)
 	c := client.New(ts.URL, "test-key")
 	c.Warm(context.Background())
+	observed, logs := observer.New(zap.WarnLevel)
+	previous := logger.L()
+	logger.Set(zap.New(observed))
+	t.Cleanup(func() { logger.Set(previous) })
 
 	handler := NewHandler(c, Options{
-		PutBufferBytes: 8, // any source byte would spill a PUT
+		PutBufferBytes: 8,
 		PutStagingDir:  filepath.Join(t.TempDir(), "missing", "staging"),
 	})
-	req := httptest.NewRequest(http.MethodGet, "/dir/src", nil)
-	req.Method = "COPY"
-	req.Header.Set("Destination", "/dir/dst")
-	rr := httptest.NewRecorder()
-	handler.ServeHTTP(rr, req)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, copyRequest(t, "/dir/src", "/dir/dst"))
 
-	if rr.Code >= 300 {
-		t.Fatalf("COPY status = %d: %s", rr.Code, rr.Body.String())
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("COPY with a staging failure = %d, want %d", recorder.Code, http.StatusInternalServerError)
 	}
 	node, ok := b.Node("/dir/dst")
-	if !ok || string(node.Data) != src {
-		t.Fatalf("copy destination = %q (ok=%v), want the source content", node.Data, ok)
+	if !ok || string(node.Data) != "ORIGINAL" {
+		t.Fatalf("fast-path staging failure changed the destination: %q (ok=%v)", node.Data, ok)
+	}
+	if entries := logs.FilterMessage("webdav copy staging failed; buffering the rest in memory").All(); len(entries) != 0 {
+		t.Fatalf("fast-path COPY degraded to unbounded memory (%d fallback logs)", len(entries))
+	}
+}
+
+// A COPY that x/net/webdav serves (a collection) writes each destination file
+// only AFTER deleting it, so a staging failure there must degrade to memory
+// instead of failing with the old content gone.
+func TestDelegatedCopyDegradesOnStagingFailure(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.SeedDir("/tree", 0o755)
+	large := strings.Repeat("d", 4096)
+	b.Seed("/tree/f.txt", []byte(large))
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	c := client.New(ts.URL, "test-key")
+	c.Warm(context.Background())
+	observed, logs := observer.New(zap.WarnLevel)
+	previous := logger.L()
+	logger.Set(zap.New(observed))
+	t.Cleanup(func() { logger.Set(previous) })
+
+	handler := NewHandler(c, Options{
+		PutBufferBytes: 8,
+		PutStagingDir:  filepath.Join(t.TempDir(), "missing", "staging"),
+	})
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, copyRequest(t, "/tree", "/copied"))
+
+	if recorder.Code >= 300 {
+		t.Fatalf("delegated COPY status = %d: %s", recorder.Code, recorder.Body.String())
+	}
+	node, ok := b.Node("/copied/f.txt")
+	if !ok || string(node.Data) != large {
+		t.Fatalf("delegated copy child = %d bytes (ok=%v), want %d", len(node.Data), ok, len(large))
+	}
+	if entries := logs.FilterMessage("webdav copy staging failed; buffering the rest in memory").All(); len(entries) != 1 {
+		t.Fatalf("delegated-copy fallback logs = %d, want 1", len(entries))
+	}
+}
+
+// A failure AFTER the body was spilled must also recover: the staged prefix is
+// pulled back into memory so the copy can finish.
+func TestWriteFileDegradeToMemoryAfterSpill(t *testing.T) {
+	staging := t.TempDir()
+	wf := &writeFile{
+		path: "/dir/file.txt",
+		put:  putConfig{bufferBytes: 4, stagingDir: staging, copyWrite: true},
+	}
+	if _, err := wf.Write([]byte("abcdefg")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if wf.file == nil {
+		t.Fatal("test precondition: the body should have spilled")
+	}
+	if err := wf.degradeToMemory(); err != nil {
+		t.Fatalf("degradeToMemory: %v", err)
+	}
+	if wf.file != nil || wf.name != "" {
+		t.Fatal("staged file not released")
+	}
+	if !wf.put.noSpill {
+		t.Fatal("spilling not disabled after degrading")
+	}
+	if got := wf.buf.String(); got != "abcdefg" {
+		t.Fatalf("recovered prefix = %q, want abcdefg", got)
+	}
+	if wf.size != 7 {
+		t.Fatalf("size = %d, want 7", wf.size)
 	}
 }
 
@@ -509,5 +579,71 @@ func TestCommitFailureLogRedactsPresignedURL(t *testing.T) {
 	}
 	if got := commitErrorKind(&client.StatusError{StatusCode: http.StatusInsufficientStorage}); got != "insufficient_storage" {
 		t.Fatalf("storage-full kind = %q", got)
+	}
+}
+
+// A staged write that fails AFTER a successful spill must recover too: the
+// staged prefix is pulled back into memory and the copy finishes, so a
+// delegated COPY cannot lose a destination x/net already deleted when the
+// local disk fills mid-file.
+func TestWriteFileRecoversMidBodyStagingFailure(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.SeedDir("/dir", 0o755)
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	c := client.New(ts.URL, "test-key")
+	c.Warm(t.Context())
+
+	fs := &fileSystem{client: c, props: newDeadPropStore(), put: putConfig{
+		bufferBytes: 4, stagingDir: t.TempDir(), timeout: 5 * time.Second,
+	}}
+	// The copy marker is what makes a staging failure recover instead of latch.
+	ctx := context.WithValue(context.Background(), copyWriteKey{}, true)
+	file, err := fs.OpenFile(ctx, "/dir/file.txt", os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	wf := file.(*writeFile)
+	payload := []byte("abcdefghij")
+	if _, err := wf.Write(payload[:8]); err != nil {
+		t.Fatalf("spilling Write: %v", err)
+	}
+	if wf.file == nil {
+		t.Fatal("test precondition: the body should have spilled")
+	}
+	// The staged file fails halfway through the next chunk, the way a full
+	// local disk behaves: the bytes it accepted are really in the file.
+	wf.stagedWrite = func(p []byte) (int, error) {
+		half := len(p) / 2
+		if _, err := wf.file.Write(p[:half]); err != nil {
+			return 0, err
+		}
+		return half, syscall.ENOSPC
+	}
+	n, err := wf.Write(payload[8:])
+	if err != nil {
+		t.Fatalf("Write after a staged failure = %d, %v; want it to recover", n, err)
+	}
+	if n != len(payload[8:]) {
+		t.Fatalf("Write reported %d of %d bytes", n, len(payload[8:]))
+	}
+	if wf.file != nil || wf.name != "" {
+		t.Fatal("staged handle not released after recovering")
+	}
+	if wf.werr != nil {
+		t.Fatalf("recovery latched an error: %v", wf.werr)
+	}
+	if got := wf.buf.String(); got != string(payload) {
+		t.Fatalf("recovered body = %q, want %q", got, payload)
+	}
+	if wf.size != int64(len(payload)) {
+		t.Fatalf("size = %d, want %d", wf.size, len(payload))
+	}
+	if err := wf.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	node, ok := b.Node("/dir/file.txt")
+	if !ok || string(node.Data) != string(payload) {
+		t.Fatalf("committed body = %q (ok=%v), want %q", node.Data, ok, payload)
 	}
 }

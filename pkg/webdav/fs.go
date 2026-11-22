@@ -66,11 +66,11 @@ func (f *fileSystem) OpenFile(ctx context.Context, name string, flag int, perm o
 		req := putRequestFrom(ctx)
 		put := f.put
 		if copyWriteFrom(ctx) {
-			// COPY writes the destination through this same writer, after
-			// x/net/webdav has already deleted the old destination. Staging a
-			// body there only adds a way to lose the old content, so COPY
-			// keeps the in-memory staging this bridge has always used.
-			put.noSpill = true
+			// COPY writes its destination through this same writer, after
+			// x/net/webdav has already deleted the old destination: staging
+			// still bounds the body, but a staging FAILURE degrades to memory
+			// instead of failing the copy (the old content is already gone).
+			put.copyWrite = true
 		}
 		req.recordStart(remote)
 		return &writeFile{
@@ -79,6 +79,8 @@ func (f *fileSystem) OpenFile(ctx context.Context, name string, flag int, perm o
 			props:  f.deadProps(),
 			put:    put,
 			req:    req,
+			// expectedRevision stays nil (unconditional); the COPY fast path
+			// sets it to create-only when it promised Overwrite: F.
 		}, nil
 	}
 
@@ -404,4 +406,32 @@ func (r *readFile) DeadProps() (map[xml.Name]webdav.Property, error) {
 
 func (r *readFile) Patch(patches []webdav.Proppatch) ([]webdav.Propstat, error) {
 	return r.props.patch(r.propPath, patches)
+}
+
+// copyTree copies the dead properties of src (and its subtree) onto dst. A
+// WebDAV COPY carries the resource's dead properties with its bytes.
+func (s *deadPropStore) copyTree(src, dst string) {
+	if s == nil || src == dst {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	prefix := treePrefix(src)
+	copied := make(map[string]map[xml.Name]webdav.Property)
+	for p, props := range s.props {
+		switch {
+		case p == src:
+			copied[dst] = props
+		case strings.HasPrefix(p, prefix):
+			copied[dst+strings.TrimPrefix(p, src)] = props
+		}
+	}
+	for p, props := range copied {
+		clone := make(map[xml.Name]webdav.Property, len(props))
+		for k, v := range props {
+			clone[k] = v
+		}
+		s.props[p] = clone
+	}
 }

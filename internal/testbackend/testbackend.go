@@ -36,6 +36,9 @@ type Node struct {
 	// "single", "" = none). Seeded by tests to model server-side append-log
 	// objects.
 	ContentLayout string
+
+	// Tags is the user-owned tag set (`?setmeta=1` replaces it wholesale).
+	Tags map[string]string
 }
 
 // LayerEntry is one recorded fs-layer entry (the layers subtree is a log,
@@ -106,9 +109,10 @@ type uploadState struct {
 	parts     map[int][]byte
 	partSize  int64
 	totalSize int64
-	// expected carries the initiate's CAS revision: complete enforces it
-	// against the row like the real server's ErrRevisionConflict, so the
-	// conditional-upload contract is exercisable on the multipart track.
+	// expected carries the initiate's CAS revision. Only the create-only case
+	// (0) is enforced, by complete, facing an existing row with a 409; a
+	// positive revision is recorded and ignored — see the comment at the
+	// enforcement site for why this fake cannot verify one.
 	expected *int64
 }
 
@@ -146,6 +150,20 @@ func (b *Backend) Seed(path string, data []byte) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.files[path] = &Node{Data: data, Mode: 0o644, Rev: 1, Mtime: 1}
+}
+
+// SeedWithTags installs a file fixture carrying user tags.
+func (b *Backend) SeedWithTags(path string, data []byte, tags map[string]string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	n := &Node{Data: append([]byte(nil), data...), Mode: 0o644, Rev: 1, Mtime: 1}
+	if len(tags) > 0 {
+		n.Tags = map[string]string{}
+		for k, v := range tags {
+			n.Tags[k] = v
+		}
+	}
+	b.files[path] = n
 }
 
 // SeedDir installs a directory fixture.
@@ -190,6 +208,14 @@ func (b *Backend) SeedWithLayout(path string, data []byte, layout string) {
 	b.files[path] = &Node{Data: append([]byte(nil), data...), Mode: 0o644, Rev: 1, Mtime: 1, ContentLayout: layout}
 }
 
+// Remove drops a fixture path, modeling another writer deleting it. Tests use
+// it to build races where a request in flight outlives the path it targets.
+func (b *Backend) Remove(path string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.files, path)
+}
+
 // ObjectID returns the path's object identity, assigning one on first use
 // exactly as a stat would (X-Dat9-Resource-ID). Tests that assert on a cache
 // key built from an open handle's pinned identity need it.
@@ -207,6 +233,17 @@ func (b *Backend) ObjectID(path string) string {
 	return n.ResourceID
 }
 
+// SharesObject reports whether two paths name the SAME object (a hardlink or
+// an alias), not merely equal bytes. Tests use it to prove a copy produced an
+// independent object instead of an alias.
+func (b *Backend) SharesObject(a, c string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	na, ca := b.files[a]
+	nb, cb := b.files[c]
+	return ca && cb && na == nb
+}
+
 // Node returns a snapshot of one entry.
 func (b *Backend) Node(path string) (Node, bool) {
 	b.mu.Lock()
@@ -215,7 +252,7 @@ func (b *Backend) Node(path string) (Node, bool) {
 	if !ok {
 		return Node{}, false
 	}
-	return Node{Data: append([]byte(nil), n.Data...), IsDir: n.IsDir, Mode: n.Mode, Rev: n.Rev, Mtime: n.Mtime, ResourceID: n.ResourceID}, true
+	return Node{Data: append([]byte(nil), n.Data...), IsDir: n.IsDir, Mode: n.Mode, Rev: n.Rev, Mtime: n.Mtime, ResourceID: n.ResourceID, Tags: cloneTags(n.Tags)}, true
 }
 
 // Snapshot returns a deep copy of all entries (path → node).
@@ -510,6 +547,20 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					b.mu.Unlock()
 				}
 				b.mu.Lock()
+				// The server re-checks the initiate's compare-and-set
+				// precondition inside the completion transaction, so a
+				// destination created or rewritten while the body streams
+				// still loses. Only the create-only case (expectedRevision 0)
+				// is modeled here: this fake hands out revisions from one
+				// shared counter (fixtures use 1..9, writes continue from 10),
+				// not the server's per-file numbering, so a positive expected
+				// revision is not something it could verify without also
+				// changing the revision space every other suite builds on.
+				if us.expected != nil && *us.expected == 0 && b.files[us.path] != nil {
+					b.mu.Unlock()
+					b.writeErr(w, http.StatusConflict, "already exists")
+					return
+				}
 				rev := b.nextRev
 				b.nextRev++
 				n := b.files[us.path]
@@ -1074,11 +1125,20 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		var mode uint32
 		var contentLayout string
 		var resourceID string
+		var nlink int
 		if n != nil {
 			isDir = n.IsDir
 			dataLen = len(n.Data)
 			rev, mtime, mode = n.Rev, n.Mtime, n.Mode
 			contentLayout = n.ContentLayout
+			// Hardlinks share one Node: report the link count the way the
+			// server does, so callers can distinguish an alias from a lone
+			// name (a rename-style replace breaks the alias; a write does not).
+			for _, other := range b.files {
+				if other == n {
+					nlink++
+				}
+			}
 			if n.ResourceID == "" {
 				// The real server reports the object's stable identity on
 				// every stat; the lazy assignment keeps the fake's seeds
@@ -1097,6 +1157,9 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Length", strconv.Itoa(dataLen))
 		w.Header().Set("X-Dat9-Revision", strconv.FormatInt(rev, 10))
 		w.Header().Set("X-Dat9-Resource-ID", resourceID)
+		if nlink > 1 {
+			w.Header().Set("X-Dat9-Nlink", strconv.Itoa(nlink))
+		}
 		w.Header().Set("X-Dat9-Mode", strconv.FormatUint(uint64(mode), 10))
 		w.Header().Set("X-Dat9-Mtime", strconv.FormatInt(mtime, 10))
 		// Mirror the real server's placement decision: objects at or
@@ -1401,6 +1464,32 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		w.WriteHeader(http.StatusOK)
 
+	case q.Has("setmeta"):
+		var body struct {
+			Tags        *map[string]string `json:"tags"`
+			Description *string            `json:"description"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		b.mu.Lock()
+		n := b.files[p]
+		if n == nil {
+			b.mu.Unlock()
+			b.writeErr(w, http.StatusNotFound, "not found")
+			return
+		}
+		if body.Tags != nil {
+			if len(*body.Tags) == 0 {
+				n.Tags = nil
+			} else {
+				n.Tags = map[string]string{}
+				for k, v := range *body.Tags {
+					n.Tags[k] = v
+				}
+			}
+		}
+		b.mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+
 	case q.Has("chmod"):
 		var body struct {
 			Mode uint32 `json:"mode"`
@@ -1438,4 +1527,16 @@ func parseRange(rng string, size int64) (int64, int64, bool) {
 		hi = size - 1
 	}
 	return lo, hi + 1, true
+}
+
+// cloneTags copies a tag map (nil stays nil).
+func cloneTags(tags map[string]string) map[string]string {
+	if tags == nil {
+		return nil
+	}
+	out := make(map[string]string, len(tags))
+	for k, v := range tags {
+		out[k] = v
+	}
+	return out
 }

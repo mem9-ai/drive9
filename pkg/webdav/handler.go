@@ -39,10 +39,12 @@ type Options struct {
 	// negotiated transfer window instead of holding the whole body in RSS.
 	// Zero uses DefaultPutBufferBytes.
 	//
-	// COPY is the deliberate exception: WebDAV COPY removes its destination
-	// before writing it, so a staging failure would lose the old content, and
-	// the copy is buffered in memory as it always was (a server-side copy is
-	// tracked as a follow-up).
+	// COPY stages the same way. A staging FAILURE is handled per path: the
+	// fast path answers 500 because the old destination still exists and must
+	// survive, while a COPY delegated to x/net/webdav degrades to memory
+	// because x/net has already removed its destination (see copy.go). A
+	// failed COMMIT is 500 or 507 on the fast path only; a delegated commit
+	// is x/net's plain 500, and a staging failure is not a commit.
 	PutBufferBytes int64
 
 	// PutStagingDir is where a PUT body beyond PutBufferBytes is staged.
@@ -94,31 +96,41 @@ func NewHandler(c *client.Client, opts Options) http.Handler {
 		remoteRoot = "/"
 	}
 	metrics.SetModuleAvailability("webdav", true)
-	next := &webdav.Handler{
-		Prefix: opts.Prefix,
-		FileSystem: &fileSystem{
-			client:     c,
-			remoteRoot: remoteRoot,
-			props:      newDeadPropStore(),
-			put: putConfig{
-				bufferBytes: opts.PutBufferBytes,
-				stagingDir:  opts.PutStagingDir,
-				timeout:     opts.PutTimeout,
-			},
+	fsys := &fileSystem{
+		client:     c,
+		remoteRoot: remoteRoot,
+		props:      newDeadPropStore(),
+		put: putConfig{
+			bufferBytes: opts.PutBufferBytes,
+			stagingDir:  opts.PutStagingDir,
+			timeout:     opts.PutTimeout,
 		},
+	}
+	next := &webdav.Handler{
+		Prefix:     opts.Prefix,
+		FileSystem: fsys,
 		LockSystem: webdav.NewMemLS(),
 	}
+	copier := &copyFastPath{fs: fsys, client: c, prefix: opts.Prefix, locks: next.LockSystem}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		recorder := &statusCapturingResponseWriter{ResponseWriter: w}
 		var put *putRequest
 		if r.Method == "COPY" {
-			// x/net/webdav's COPY removes the destination and then writes it
-			// through the same writer a PUT uses. (MOVE does not: it removes
-			// the destination and calls Rename, never opening a writer.) Mark
-			// the request so the writer keeps its in-memory staging — a
-			// staging failure there would lose the old content with nothing
-			// to replace it.
+			// The common case (a regular file onto a non-collection
+			// destination) is served without x/net's pre-delete: the
+			// destination is committed atomically, so a failed copy leaves
+			// the old content in place. Its writer must therefore FAIL on a
+			// staging error (the old content is still there, and failing
+			// keeps memory bounded), so the marker below is set only for the
+			// delegated path.
+			if copier.serve(recorder, r) {
+				metrics.RecordOperation("webdav", "copy", webdavMetricResult(recorder.statusCode()), time.Since(start))
+				return
+			}
+			// Delegated to x/net/webdav, which removes the old destination
+			// before writing the replacement: a staging failure there must
+			// degrade to memory instead, or the old content is lost.
 			r = r.WithContext(context.WithValue(r.Context(), copyWriteKey{}, true))
 		}
 		if r.Method == http.MethodPut {

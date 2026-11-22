@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/logger"
+	"go.uber.org/zap"
 	"golang.org/x/net/webdav"
 )
 
@@ -26,12 +28,14 @@ type putConfig struct {
 	stagingDir string
 	// timeout bounds the commit Close performs.
 	timeout time.Duration
-	// noSpill keeps the historical unbounded in-memory staging. The HTTP
-	// layer sets it for a non-PUT write: x/net/webdav's COPY removes an
-	// existing destination BEFORE it opens the replacement, so a staging
-	// failure there would destroy the old content with nothing to put in its
-	// place. COPY keeps the pre-existing in-memory behaviour (with the known
-	// ~2N RSS cost tracked as a follow-up: a server-side copy is the fix).
+	// copyWrite marks a COPY destination. x/net/webdav removes an existing
+	// destination BEFORE it opens the replacement, so a staging failure
+	// there must DEGRADE to in-memory buffering instead of failing the copy:
+	// the old content is already gone and the bytes that did arrive are the
+	// only replacement.
+	copyWrite bool
+	// noSpill is the runtime degradation flag copyWrite sets when staging
+	// fails. It keeps the rest of the request in memory.
 	noSpill bool
 }
 
@@ -199,10 +203,24 @@ type writeFile struct {
 	name string // staged file's name (already unlinked where the OS allows)
 	size int64
 
+	// expectedRevision is the commit's compare-and-set precondition, nil when
+	// the commit is unconditional (the zero value, so a caller that does not
+	// think about it cannot commit conditionally by accident). A pointer to 0
+	// requires the path to be absent (create-only); the COPY fast path sets
+	// that when it promised `Overwrite: F` for an absent destination, so a
+	// concurrent API writer that takes the name during the copy is reported
+	// as a precondition failure instead of being clobbered.
+	expectedRevision *int64
+
 	// werr latches the first staging failure: a body that was not fully
 	// recorded must not be committed later.
 	werr   error
 	closed bool
+
+	// stagedWrite, when non-nil, replaces the staged-file write. Tests use it
+	// to exercise a mid-body staging failure (a full local disk) without one;
+	// production leaves it nil.
+	stagedWrite func([]byte) (int, error)
 }
 
 var _ webdav.File = (*writeFile)(nil)
@@ -219,23 +237,77 @@ func (w *writeFile) Write(p []byte) (int, error) {
 	}
 	if w.file == nil && !w.put.noSpill && w.size+int64(len(p)) > w.put.bufferLimit() {
 		if err := w.spill(); err != nil {
-			return 0, w.stageFail(err)
+			if !w.put.copyWrite {
+				return 0, w.stageFail(err)
+			}
+			// Degrade, don't fail: the destination is already deleted, so a
+			// staging problem must not abort the copy. The rest of the body
+			// stays in memory (bounded by nothing but the copy itself), which
+			// is the pre-existing COPY behaviour, now only on the error path.
+			w.put.noSpill = true
+			logger.Warn(context.Background(), "webdav copy staging failed; buffering the rest in memory",
+				zap.String("path", w.path), zap.Int64("staged_bytes", w.size), zap.Error(err))
 		}
 	}
 	var (
 		n   int
 		err error
 	)
-	if w.file != nil {
+	switch {
+	case w.file != nil && w.stagedWrite != nil:
+		n, err = w.stagedWrite(p)
+	case w.file != nil:
 		n, err = w.file.Write(p)
-	} else {
+	default:
 		n, err = w.buf.Write(p)
 	}
 	w.size += int64(n)
 	if err != nil {
-		return n, w.stageFail(fmt.Errorf("webdav: stage PUT body: %w", err))
+		if w.put.copyWrite && w.file != nil {
+			// A delegated COPY's destination is already deleted: a staged
+			// write that fails (a full local disk mid-file) must still let
+			// the copy finish. Pull the staged prefix back into memory and
+			// keep the rest of the body there.
+			if derr := w.degradeToMemory(); derr == nil {
+				m, berr := w.buf.Write(p[n:])
+				w.size += int64(m)
+				if berr != nil {
+					return n + m, w.stageFail(fmt.Errorf("webdav: stage copy body: %w", berr))
+				}
+				return n + m, nil
+			}
+		}
+		return n, w.stageFail(fmt.Errorf("webdav: stage body: %w", err))
 	}
 	return n, nil
+}
+
+// degradeToMemory moves the already-staged prefix from the temporary file back
+// into the in-memory buffer and disables further spilling. It is the recovery
+// path for a delegated COPY whose destination x/net/webdav has already removed:
+// failing there would lose the old content, so the body keeps going in memory.
+func (w *writeFile) degradeToMemory() error {
+	if w.file == nil {
+		return nil
+	}
+	if _, err := w.file.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	data := make([]byte, w.size)
+	if _, err := io.ReadFull(w.file, data); err != nil {
+		return err
+	}
+	_ = w.file.Close()
+	if w.name != "" {
+		_ = os.Remove(w.name)
+	}
+	w.file, w.name = nil, ""
+	w.buf.Reset()
+	_, _ = w.buf.Write(data)
+	w.put.noSpill = true
+	logger.Warn(context.Background(), "webdav copy staging failed mid-body; continuing in memory",
+		zap.String("path", w.path), zap.Int64("staged_bytes", w.size))
+	return nil
 }
 
 // spill moves the staged prefix into a temporary file and switches the rest of
@@ -297,26 +369,41 @@ func (w *writeFile) Close() error {
 	ctx, cancel := context.WithTimeout(context.Background(), w.put.commitTimeout())
 	defer cancel()
 
+	// ONE commit decision for both body shapes: the client's size-aware
+	// transport chooses direct PUT vs multipart (and the extent fallback)
+	// from the body length, and the CAS precondition rides the same call. A
+	// direct PUT would be rejected by an S3-backed server for a body at or
+	// above its inline threshold (that branch requires part checksums), so
+	// neither shape may bypass the transport decision.
+	commit := func(r io.Reader, size int64, opts ...client.WriteOption) error {
+		if w.expectedRevision != nil {
+			return w.commitError(w.client.WriteStreamConditionalWithOptions(ctx, w.path, r, size, nil, *w.expectedRevision, opts...))
+		}
+		_, err := w.client.WriteStreamWithSummary(ctx, w.path, r, size, nil, opts...)
+		return w.commitError(err)
+	}
+
 	if w.file != nil {
 		// A spilled body is a spill-file upload: the multipart plane is
 		// forced, because the direct-PUT branch reads the WHOLE reader into
 		// memory and would undo the staging bound whenever the server's
 		// inline threshold is larger than PutBufferBytes. Layout routing
 		// (extent vs classic) is the client's, unchanged.
-		staged := io.NewSectionReader(w.file, 0, w.size)
-		_, err := w.client.WriteStreamWithSummary(ctx, w.path, staged, w.size, nil, client.WithMultipartOnly())
-		return w.commitError(err)
+		return commit(io.NewSectionReader(w.file, 0, w.size), w.size, client.WithMultipartOnly())
 	}
-	// The in-memory body takes the client's own transport decision too:
-	// WriteStreamWithSummary keeps a direct PUT below the server's inline
-	// threshold and switches to the multipart plane at or above it. A single
-	// direct PUT (WriteCtx) would be REJECTED by an S3-backed server for any
-	// body at or above that threshold — its large-file branch requires part
-	// checksums — so bodies between the threshold and the staging bound would
-	// not save at all.
 	data := w.buf.Bytes()
-	_, err := w.client.WriteStreamWithSummary(ctx, w.path, bytes.NewReader(data), int64(len(data)), nil)
-	return w.commitError(err)
+	return commit(bytes.NewReader(data), int64(len(data)))
+}
+
+// Abort releases the staged body WITHOUT committing it. The HTTP layer uses it
+// when a copy fails mid-stream: Close would otherwise commit the partial
+// prefix (a COPY has no declared length to compare against).
+func (w *writeFile) Abort() {
+	if w.closed {
+		return
+	}
+	w.closed = true
+	w.cleanup()
 }
 
 // cleanup releases the staged file. A committed or failed PUT leaves nothing
