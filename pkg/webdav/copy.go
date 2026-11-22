@@ -179,7 +179,17 @@ func (cp *copyFastPath) serve(w http.ResponseWriter, r *http.Request) bool {
 	}
 	if err := dst.Close(); err != nil {
 		logCopyFailure(ctx, srcLocal, dstLocal, err)
-		if dst.expectedRevision != nil && *dst.expectedRevision == 0 && isRevisionConflict(err) {
+		// createOnly is exactly what the pointer encodes, and it is the only
+		// shape whose 412 the WebDAV contract allows: an unconditional commit
+		// that loses a revision race is a server error, not the client's
+		// precondition.
+		//
+		// KNOWN: isRevisionConflict accepts every 409, and the server also
+		// answers 409 when an upload session is no longer active, so a
+		// create-only COPY whose multipart session died answers 412 with no
+		// destination present. Telling the two apart needs a wire-level error
+		// code; the WebDAV plane cannot see the difference today.
+		if createOnly && isRevisionConflict(err) {
 			// The destination appeared while the copy streamed: the
 			// Overwrite: F promise no longer holds.
 			writeWebDAVStatus(w, http.StatusPreconditionFailed)
@@ -195,8 +205,25 @@ func (cp *copyFastPath) serve(w http.ResponseWriter, r *http.Request) bool {
 	props.deleteTree(dstRemote)
 	props.copyTree(srcRemote, dstRemote)
 
-	// A replaced destination is a fresh resource, so its old user tags must go
-	// with it; see clearReplacedDestinationTags for the contract.
+	// A replaced destination is a fresh resource (x/net removes the name before
+	// creating the replacement), so the old object's user tags must go with it:
+	// left behind, they make exact tag queries match content that no longer
+	// exists. A created destination never had any, and a copy does not carry
+	// the source's set — tags are drive9 metadata, not WebDAV properties, so
+	// only dead props follow the resource, as in x/net.
+	//
+	// This runs for EVERY shape whose commit may have replaced a destination,
+	// not only the one that existed at our first check: the unconditional
+	// commit also replaces a destination an API writer created in the
+	// meantime, and a write without tag headers leaves that writer's tags in
+	// place.
+	//
+	// The post-condition of a COPY is a fresh resource, so a persisting
+	// failure is reported as 500 rather than a false success: the bytes have
+	// landed, the copy is not complete, the reason is logged, and a client
+	// retry rewrites the content and clears the tags again (the same
+	// indeterminate-outcome contract the PUT commit uses for a timed-out
+	// publish).
 	if !createOnly {
 		if err := cp.clearReplacedDestinationTags(ctx, dstRemote); err != nil {
 			logCopyFailure(ctx, srcLocal, dstLocal, err)
@@ -216,12 +243,6 @@ func (cp *copyFastPath) serve(w http.ResponseWriter, r *http.Request) bool {
 // clearReplacedDestinationTags removes the user tags of a destination this copy
 // replaced, so a tag query cannot match content that no longer exists.
 //
-// A REPLACED destination is a fresh resource under COPY semantics (x/net
-// removes the name before creating the replacement) and a created destination
-// never had tags; a copy does not carry the source's set either — tags are
-// drive9 metadata, not WebDAV properties, so only dead props follow the
-// resource, exactly as x/net copies them.
-//
 // DEFINED BEHAVIOR for a replacement whose tag cleanup cannot settle:
 //
 // The content publish and the tag replacement are two API calls: the wire
@@ -230,17 +251,6 @@ func (cp *copyFastPath) serve(w http.ResponseWriter, r *http.Request) bool {
 // into the commit request. Ordering the clear BEFORE the commit would instead
 // strip the old resource's tags when the commit then fails, trading a metadata
 // glitch for metadata loss.
-//
-// The post-condition of a COPY is a fresh resource, so a persisting failure is
-// returned as an error and reported as 500 rather than a false success: the
-// bytes have landed, the copy is not complete, the reason is logged, and a
-// client retry rewrites the content and clears the tags again (the same
-// indeterminate-outcome contract the PUT commit uses for a timed-out publish).
-//
-// It runs for EVERY shape whose commit may have replaced a destination, not
-// only the one that existed at our first check: the unconditional commit also
-// replaces a destination an API writer created in the meantime, and a write
-// without tag headers leaves that writer's tags in place.
 //
 // KNOWN RACE: an API writer that publishes content AND tags between the commit
 // and this clear loses its tags while the COPY answers 2xx. Closing it needs a

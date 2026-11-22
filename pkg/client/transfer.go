@@ -353,11 +353,11 @@ type writeOptions struct {
 
 // applyWriteOptions folds opts into the option struct. It ignores nil options
 // so a caller can pass an optional WriteOption through unchanged.
-func applyWriteOptions(opts []WriteOption) *writeOptions {
-	o := &writeOptions{}
+func applyWriteOptions(opts []WriteOption) writeOptions {
+	var o writeOptions
 	for _, opt := range opts {
 		if opt != nil {
-			opt(o)
+			opt(&o)
 		}
 	}
 	return o
@@ -427,7 +427,7 @@ func (c *Client) WriteStreamWithTags(ctx context.Context, path string, r io.Read
 // phase timings for the completed upload.
 func (c *Client) WriteStreamWithSummary(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, opts ...WriteOption) (*UploadSummary, error) {
 	o := applyWriteOptions(opts)
-	return c.writeStreamConditionalWithOptionsAndSummary(ctx, path, r, size, progress, -1, *o, "", nil)
+	return c.writeStreamConditionalWithOptionsAndSummary(ctx, path, r, size, progress, -1, o, "", nil)
 }
 
 // WriteStreamConditionalWithOptions is WriteStreamWithSummary with a
@@ -438,7 +438,7 @@ func (c *Client) WriteStreamWithSummary(ctx context.Context, path string, r io.R
 // plain conditional writers only take byte slices or no write options.
 func (c *Client) WriteStreamConditionalWithOptions(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, expectedRevision int64, opts ...WriteOption) error {
 	o := applyWriteOptions(opts)
-	_, err := c.writeStreamConditionalWithOptionsAndSummary(ctx, path, r, size, progress, expectedRevision, *o, "", nil)
+	_, err := c.writeStreamConditionalWithOptionsAndSummary(ctx, path, r, size, progress, expectedRevision, o, "", nil)
 	return err
 }
 

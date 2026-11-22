@@ -40,9 +40,11 @@ type Options struct {
 	// Zero uses DefaultPutBufferBytes.
 	//
 	// COPY stages the same way. A staging FAILURE is handled per path: the
-	// fast path fails (500/507) because the old destination still exists and
-	// must survive, while a COPY delegated to x/net/webdav degrades to memory
-	// because x/net has already removed its destination (see copy.go).
+	// fast path answers 500 because the old destination still exists and must
+	// survive, while a COPY delegated to x/net/webdav degrades to memory
+	// because x/net has already removed its destination (see copy.go). A
+	// failed COMMIT answers 500 or 507 there; a staging failure is not a
+	// commit.
 	PutBufferBytes int64
 
 	// PutStagingDir is where a PUT body beyond PutBufferBytes is staged.

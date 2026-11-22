@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/mem9-ai/drive9/internal/testbackend"
 	"github.com/mem9-ai/drive9/pkg/client"
@@ -378,6 +379,124 @@ func TestCopyReplaceClearsStaleDestinationTags(t *testing.T) {
 	}
 }
 
+// The tag clear honours the PUT commit's bound: a shortened PutTimeout must cap
+// the clear instead of letting a stalled setmeta hold the request open.
+func TestCopyTagClearIsBoundedByPutTimeout(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.SeedDir("/dir", 0o755)
+	b.Seed("/dir/src", []byte("fresh"))
+	b.SeedWithTags("/dir/dst", []byte("ORIGINAL"), map[string]string{"team": "old"})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Query().Has("setmeta") {
+			// Stall until the client gives up, with a hard cap so a broken
+			// bound fails the assertion instead of hanging the suite.
+			select {
+			case <-r.Context().Done():
+			case <-time.After(3 * time.Second):
+			}
+			http.Error(w, "setmeta stalled", http.StatusInternalServerError)
+			return
+		}
+		b.ServeHTTP(w, r)
+	}))
+	t.Cleanup(ts.Close)
+	c := client.New(ts.URL, "test-key")
+	c.Warm(t.Context())
+	handler := NewHandler(c, Options{PutTimeout: 100 * time.Millisecond})
+
+	start := time.Now()
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, copyRequest(t, "/dir/src", "/dir/dst"))
+	elapsed := time.Since(start)
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("COPY whose tag clear timed out = %d, want %d: %s", rr.Code, http.StatusInternalServerError, rr.Body.String())
+	}
+	if elapsed > time.Second {
+		t.Fatalf("tag clear took %v with a 100ms PutTimeout: the bound is not applied", elapsed)
+	}
+}
+
+// A create-only COPY whose body outgrows the staging bound must carry its
+// transport option through the conditional commit: a spill-file upload has to
+// take the multipart plane, not a direct PUT that reads the whole staged file
+// back into memory.
+func TestCopyCreateOnlySpilledBodyCommitsThroughMultipart(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.SeedDir("/dir", 0o755)
+	payload := strings.Repeat("s", 256<<10) // below the 1 MiB inline threshold, above the 4 KiB spill bound
+	b.Seed("/dir/src", []byte(payload))
+	handler, _ := newCopySemanticsHandler(t, b, Options{PutBufferBytes: 4 << 10})
+
+	req := copyRequest(t, "/dir/src", "/dir/dst")
+	req.Header.Set("Overwrite", "F")
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("create-only COPY of a spilled body = %d, want %d: %s", rr.Code, http.StatusCreated, rr.Body.String())
+	}
+	if got := b.Requests()["POST /v2/uploads/initiate"]; got != 1 {
+		t.Fatalf("multipart initiate requests = %d, want 1 (the conditional commit dropped its transport option)", got)
+	}
+	if got := b.Requests()["PUT /v1/fs/dir/dst"]; got != 0 {
+		t.Fatalf("direct PUT requests = %d, want 0 (the spilled body took the direct-PUT branch)", got)
+	}
+	node, ok := b.Node("/dir/dst")
+	if !ok || string(node.Data) != payload {
+		t.Fatalf("committed body = %d bytes (ok=%v), want %d", len(node.Data), ok, len(payload))
+	}
+}
+
+// The commit's failure status keeps the two shapes apart: an unconditional
+// commit that loses a revision race is a server error (500), and a create-only
+// commit that fails for another reason is not a precondition failure (412).
+func TestCopyCommitFailureStatuses(t *testing.T) {
+	t.Run("unconditional conflict is 500", func(t *testing.T) {
+		b := testbackend.NewBackend()
+		b.SeedDir("/dir", 0o755)
+		b.Seed("/dir/src", []byte("fresh"))
+		b.Seed("/dir/dst", []byte("ORIGINAL"))
+		b.ForceConflict("/dir/dst", 1)
+		handler, _ := newCopySemanticsHandler(t, b, Options{})
+
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, copyRequest(t, "/dir/src", "/dir/dst"))
+		if rr.Code != http.StatusInternalServerError {
+			t.Fatalf("unconditional COPY whose commit conflicted = %d, want %d: %s", rr.Code, http.StatusInternalServerError, rr.Body.String())
+		}
+		if node, ok := b.Node("/dir/dst"); !ok || string(node.Data) != "ORIGINAL" {
+			t.Fatalf("destination = %q (ok=%v), want the untouched ORIGINAL", node.Data, ok)
+		}
+	})
+
+	t.Run("create-only server error is 500", func(t *testing.T) {
+		b := testbackend.NewBackend()
+		b.SeedDir("/dir", 0o755)
+		b.Seed("/dir/src", []byte("fresh"))
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPut && r.URL.Path == "/v1/fs/dir/dst" {
+				http.Error(w, "commit unavailable", http.StatusInternalServerError)
+				return
+			}
+			b.ServeHTTP(w, r)
+		}))
+		t.Cleanup(ts.Close)
+		c := client.New(ts.URL, "test-key")
+		c.Warm(t.Context())
+		handler := NewHandler(c, Options{})
+
+		req := copyRequest(t, "/dir/src", "/dir/dst")
+		req.Header.Set("Overwrite", "F")
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+		if rr.Code != http.StatusInternalServerError {
+			t.Fatalf("create-only COPY whose commit failed = %d, want %d: %s", rr.Code, http.StatusInternalServerError, rr.Body.String())
+		}
+		if node, ok := b.Node("/dir/dst"); ok {
+			t.Fatalf("destination = %q after a failed create-only commit, want it absent", node.Data)
+		}
+	})
+}
+
 // The tag clear is retried once: a transient failure on the first attempt must
 // not turn a landed copy into a 500 when the second attempt succeeds.
 func TestCopyRetriesTagClearOnce(t *testing.T) {
@@ -496,8 +615,10 @@ func TestCopyReplaceFailsWhenTagsCannotBeCleared(t *testing.T) {
 	b.SeedDir("/dir", 0o755)
 	b.Seed("/dir/src", []byte("fresh"))
 	b.SeedWithTags("/dir/dst", []byte("ORIGINAL"), map[string]string{"team": "old"})
+	var attempts atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost && r.URL.Query().Has("setmeta") {
+			attempts.Add(1)
 			http.Error(w, "setmeta unavailable", http.StatusInternalServerError)
 			return
 		}
@@ -513,6 +634,9 @@ func TestCopyReplaceFailsWhenTagsCannotBeCleared(t *testing.T) {
 	if rr.Code != http.StatusInternalServerError {
 		t.Fatalf("COPY with an un-clearable destination = %d, want %d", rr.Code, http.StatusInternalServerError)
 	}
+	if got := attempts.Load(); got != 2 {
+		t.Fatalf("tag clear attempts against a persistent failure = %d, want exactly 2", got)
+	}
 }
 
 // A conditional commit keeps the size-aware transport decision: a classic body
@@ -525,14 +649,19 @@ func TestCopyConditionalCommitAboveInlineThresholdUsesMultipart(t *testing.T) {
 	const payloadSize = 2 << 20 // above the 1 MiB inline threshold
 
 	// conditionalCopy runs one Overwrite:F COPY of a payloadSize body and
-	// returns the response plus the backend it ran against.
-	conditionalCopy := func(t *testing.T, onSourceRead func(*testbackend.Backend)) (*httptest.ResponseRecorder, *testbackend.Backend) {
+	// returns the response, the backend it ran against and the number of tag
+	// clears that reached the server.
+	conditionalCopy := func(t *testing.T, onSourceRead func(*testbackend.Backend)) (*httptest.ResponseRecorder, *testbackend.Backend, int32) {
 		t.Helper()
 		b := testbackend.NewBackend()
 		b.SeedDir("/dir", 0o755)
 		payload := strings.Repeat("k", payloadSize)
 		b.Seed("/dir/src", []byte(payload))
+		var setmeta atomic.Int32
 		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPost && r.URL.Query().Has("setmeta") {
+				setmeta.Add(1)
+			}
 			if onSourceRead != nil && r.Method == http.MethodGet && r.URL.Path == "/v1/fs/dir/src" {
 				onSourceRead(b)
 			}
@@ -547,11 +676,11 @@ func TestCopyConditionalCommitAboveInlineThresholdUsesMultipart(t *testing.T) {
 		req.Header.Set("Overwrite", "F") // create-only CAS commit
 		rr := httptest.NewRecorder()
 		handler.ServeHTTP(rr, req)
-		return rr, b
+		return rr, b, setmeta.Load()
 	}
 
 	t.Run("create-only commit succeeds", func(t *testing.T) {
-		rr, b := conditionalCopy(t, nil)
+		rr, b, clears := conditionalCopy(t, nil)
 		if rr.Code != http.StatusCreated {
 			t.Fatalf("conditional COPY onto an absent destination = %d, want %d: %s", rr.Code, http.StatusCreated, rr.Body.String())
 		}
@@ -565,10 +694,13 @@ func TestCopyConditionalCommitAboveInlineThresholdUsesMultipart(t *testing.T) {
 		if len(node.Data) != payloadSize || strings.Trim(string(node.Data), "k") != "" {
 			t.Fatalf("destination = %d bytes (%q...), want the %d-byte source", len(node.Data), string(node.Data[:8]), payloadSize)
 		}
+		if clears != 0 {
+			t.Fatalf("tag clears on a create-only COPY = %d, want 0: a created destination never had tags", clears)
+		}
 	})
 
 	t.Run("lost race answers 412", func(t *testing.T) {
-		rr, b := conditionalCopy(t, func(b *testbackend.Backend) {
+		rr, b, _ := conditionalCopy(t, func(b *testbackend.Backend) {
 			// The destination appears while the source streams: the create-only
 			// CAS must reject the multipart complete, not just the small-body
 			// direct PUT.
