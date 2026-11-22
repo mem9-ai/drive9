@@ -146,7 +146,7 @@ Node 18, while adapter tests still run; the existing SDK CI also runs Node 22.
 against HTTP errors, including missing paths, permission denials and conflicts.
 
 Live-server tests are included in the TypeScript portion of
-`scripts/sdk-integration-tests.sh`. To run just this integration against a
+`make sdk-integration-tests` (`tests/cases/drive9/api/sdk-integration.t`). To run just this integration against a
 provisioned test tenant:
 
 ```bash

@@ -1,0 +1,43 @@
+[package]
+name = "drive9-simulator"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+default = ["server"]
+server = [
+    "dep:axum",
+    "dep:tokio-stream",
+    "dep:rusqlite",
+    "tokio/rt-multi-thread",
+    "tokio/signal",
+]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+env_logger = "0.11"
+hex = "0.4"
+libc = "0.2"
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+toml = "0.8"
+base64 = "0.22"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "0.26"
+chrono = "0.4"
+regex = "1"
+xattr = "1"
+fstest = { git = "https://github.com/mornyx/fstest.git", rev = "1d4171e55724aea5c1271d04a0ec5f074c8234df" }
+rusqlite = { version = "0.40.2", features = ["bundled", "backup"], optional = true }
+tokio = { version = "1", features = ["net", "time", "sync", "io-util", "macros"], optional = true }
+axum = { version = "0.8", optional = true }
+tokio-stream = { version = "0.1", optional = true }
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1

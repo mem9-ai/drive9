@@ -73,5 +73,5 @@ dmypy.json
 # Ruff
 .ruff_cache/
 
-# Integration-test virtualenv (created by scripts/sdk-integration-tests.sh)
+# Integration-test virtualenv (created by tests/cases/drive9/api/sdk-integration.t)
 .venv-it/

@@ -17,6 +17,7 @@ import (
 
 	"github.com/mem9-ai/drive9/pkg/extensions/specials"
 	"github.com/mem9-ai/drive9/pkg/fs"
+	"github.com/mem9-ai/drive9/pkg/fusecomp/dircache"
 )
 
 const direntSize = 24 // ino(8) + off(8) + namelen(4) + type(4)
@@ -594,5 +595,58 @@ func TestSetAttrRefreshesCachedViews(t *testing.T) {
 	}
 	if st := f.GetAttr(nil, gi, &gout); st != gofuse.OK || gout.Size != 3 {
 		t.Fatalf("getattr size after truncate = %d (%v)", gout.Size, st)
+	}
+}
+
+func TestChmodThenRenamePreservesSize(t *testing.T) {
+	core := newMemCore()
+	payload := []byte("payload-100-abcdef\n")
+	core.writeAt("/c/tmp.txt", 0, payload)
+	core.mu.Lock()
+	core.paths["/c"] = &memEntry{isDir: true, mode: 0o755}
+	core.mu.Unlock()
+	f := newTestFS(t, core)
+	dirIno := openTestDir(t, f, "c")
+	if ents := readdirWalk(t, f, dirIno, false); len(ents) == 0 {
+		t.Fatal("no entries")
+	}
+
+	var tmpOut gofuse.EntryOut
+	if st := f.Lookup(nil, &gofuse.InHeader{NodeId: dirIno}, "tmp.txt", &tmpOut); st != gofuse.OK {
+		t.Fatalf("lookup tmp.txt: %v", st)
+	}
+	if tmpOut.Size != uint64(len(payload)) {
+		t.Fatalf("initial size = %d, want %d", tmpOut.Size, len(payload))
+	}
+
+	si := &gofuse.SetAttrIn{}
+	si.NodeId = tmpOut.NodeId
+	si.Valid = gofuse.FATTR_MODE
+	si.Mode = 0o644
+	var sout gofuse.AttrOut
+	if st := f.SetAttr(nil, si, &sout); st != gofuse.OK {
+		t.Fatalf("setattr chmod: %v", st)
+	}
+	if sout.Size != uint64(len(payload)) {
+		t.Fatalf("setattr reply size = %d, want %d", sout.Size, len(payload))
+	}
+
+	ri := &gofuse.RenameIn{}
+	ri.NodeId = dirIno
+	ri.Newdir = dirIno
+	if st := f.Rename(nil, ri, "tmp.txt", "dst.txt"); st != gofuse.OK {
+		t.Fatalf("rename: %v", st)
+	}
+
+	if e, ok := f.inodes.GetEntry(tmpOut.NodeId); !ok || e.Size != int64(len(payload)) {
+		t.Fatalf("inode dst.txt size after chmod+rename = %d (ok=%v), want %d", e.Size, ok, len(payload))
+	}
+	dc := f.Ctx.DirCache.(*dircache.DirCache)
+	item, kind := dc.LookupNamespace("/c", "dst.txt")
+	if kind != fs.LookupPositive {
+		t.Fatalf("LookupNamespace(/c, dst.txt) kind = %v, want LookupPositive", kind)
+	}
+	if item.Size != int64(len(payload)) {
+		t.Fatalf("dircache dst.txt size after chmod+rename = %d, want %d", item.Size, len(payload))
 	}
 }

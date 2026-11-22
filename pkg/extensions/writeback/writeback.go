@@ -1578,7 +1578,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			// An outer plane (e.g. extent.Handler on a pattern-matched kernel
 			// CREATE) already probed the remote and observed a live classic or
 			// multipart occupant; reuse its authoritative attributes directly.
-			w.invalidate(op.Path, 0)
+			w.invalidateRev(op.Path, op.OpenAttr.Rev, op.OpenAttr.Size)
 			st, statErr = *op.OpenAttr, nil
 		} else {
 			if w.opts.ExtentOpener != nil && w.queue != nil && w.queue.HasPath(op.Path) {
@@ -1592,7 +1592,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			if op.KernelCreate() && flags&uint32(syscall.O_EXCL) == 0 && flags&uint32(syscall.O_TRUNC) == 0 &&
 				statErr != nil && fs.IsNotFound(statErr) {
 				if rst, rerr := w.probeRemoteAuthoritative(ctx, op.Path); rerr == nil {
-					w.invalidate(op.Path, 0)
+					w.invalidateRev(op.Path, rst.Rev, rst.Size)
 					st, statErr = rst, nil
 				} else if !fs.IsNotFound(rerr) {
 					statErr = rerr
@@ -2259,8 +2259,9 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 					if err := h.applyExplicitMigratedMode(ctx, op.Mode&0o7777, mySeq); err != nil {
 						return fs.Result{}, err
 					}
-					w.invalidate(op.Path, 0)
-					return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Mode: op.Mode & 0o7777, Size: h.sizeForAttr()}}, nil
+					sz := h.sizeForAttr()
+					w.invalidate(op.Path, sz)
+					return fs.Result{Attr: &fs.Attr{Kind: fs.KindFile, Mode: op.Mode & 0o7777, Size: sz}}, nil
 				}
 				// v1 setPendingMetadataMode: journal the mode onto the staged
 				// ledger meta too — the queue entry snapshotted its mode at
@@ -2321,7 +2322,11 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 				}
 			}
 			if err == nil {
-				w.invalidate(op.Path, 0)
+				if res.Attr != nil && !res.Attr.IsDir() {
+					w.invalidateRev(op.Path, res.Attr.Rev, res.Attr.Size)
+				} else if w.opts.Events != nil {
+					w.opts.Events.Emit(fs.Event{Kind: fs.EventWrite, Path: op.Path})
+				}
 			}
 			return res, err
 		}

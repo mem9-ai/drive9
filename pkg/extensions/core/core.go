@@ -1444,6 +1444,9 @@ func (c *Core) setAttrOp(ctx context.Context, op *fs.Op) (fs.Result, error) {
 		// does not CAS against the pre-chmod revision and 409.
 		if st, serr := c.remoteStatDetached(rp); serr == nil && st != nil {
 			attr.Rev = st.Revision
+			if !st.IsDir {
+				attr.Size = st.Size
+			}
 		}
 	}
 	if op.Size >= 0 && attr.Size != op.Size {
