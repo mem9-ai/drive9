@@ -28,7 +28,6 @@ import (
 	"github.com/mem9-ai/drive9/pkg/extensions/core"
 	"github.com/mem9-ai/drive9/pkg/extensions/extent"
 	"github.com/mem9-ai/drive9/pkg/extensions/git"
-	"github.com/mem9-ai/drive9/pkg/extensions/layer"
 	"github.com/mem9-ai/drive9/pkg/extensions/localize"
 	"github.com/mem9-ai/drive9/pkg/extensions/renameguard"
 	"github.com/mem9-ai/drive9/pkg/extensions/specials"
@@ -41,7 +40,6 @@ import (
 	"github.com/mem9-ai/drive9/pkg/fusecomp/staging"
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/mountcontrol"
-	"github.com/mem9-ai/drive9/pkg/mountpath"
 	"github.com/mem9-ai/drive9/pkg/mountstate"
 )
 
@@ -54,8 +52,9 @@ type MountConfig struct {
 	Server     string
 	APIKey     string
 	Token      string
-	MountPoint string
-	RemoteRoot string
+	MountPoint          string
+	RemoteRoot          string
+	RemoteRootDefaulted bool
 
 	CacheDir              string
 	CacheSize             int64
@@ -98,9 +97,8 @@ type MountConfig struct {
 	WritebackLazyStaging bool
 	WritebackSyncWindow  time.Duration
 
-	Profile       string
-	LayerRef      string
-	CheckpointRef string
+	Profile  string
+	LayerRef string
 
 	LocalRoot                   string
 	LocalOnlyPatterns           []string
@@ -218,7 +216,7 @@ func (cfg MountConfig) toProfilingOptions() perf.ProfilingOptions {
 // wires byte-identically to the pre-flag code.
 var defaultExtensionOrder = []string{
 	"core", "sse", "writeback", "xattr", "specials", "extent",
-	"appendlog", "git", "layer", "localize", "renameguard", "cache",
+	"appendlog", "git", "localize", "renameguard", "cache",
 }
 
 // knownExtensionNames guards --extensions against typos (an unknown name
@@ -226,7 +224,7 @@ var defaultExtensionOrder = []string{
 var knownExtensionNames = map[string]bool{
 	"core": true, "sse": true, "extent": true, "writeback": true,
 	"xattr": true, "specials": true, "appendlog": true,
-	"git": true, "layer": true, "localize": true, "renameguard": true,
+	"git": true, "localize": true, "renameguard": true,
 	"cache": true,
 }
 
@@ -359,7 +357,8 @@ type MountOptions struct {
 	APIKey                 string        // owner API key (mutually exclusive with Token)
 	Token                  string        // delegated capability JWT (mutually exclusive with APIKey)
 	MountPoint             string        // local mount point
-	RemoteRoot             string        // remote subtree root (default "/")
+	RemoteRoot             string        // remote subtree root (default "/" or layer BaseRootPath)
+	RemoteRootDefaulted    bool          // true when CLI did not receive an explicit :/remote argument
 	CacheDir               string        // write-back cache directory (default ~/.cache/drive9)
 	CacheSize              int64         // ReadCache max size in bytes (default 128MB)
 	ReadCacheMaxFileBytes  int64         // largest single file admitted to ReadCache (default 4MiB)
@@ -374,8 +373,7 @@ type MountOptions struct {
 	SyncMode               SyncMode      // interactive, strict, or auto (default auto)
 	WritePolicy            WritePolicy   // writeback, close-sync, or write-sync (default writeback)
 	Profile                string        // mount profile name
-	LayerRef               string        // writable fs layer ref
-	CheckpointRef          string        // checkpoint ref for the layer view baseline
+	LayerRef               string        // writable or read-only fs layer ref
 	LocalRoot              string        // local-only overlay root
 	// LocalizeQuotaBytes caps the bytes the local-only overlay may occupy on
 	// the host disk (0 disables); LocalizeFreeRatio is the host free-space
@@ -485,6 +483,7 @@ func mountConfigFromOptions(opts *MountOptions) MountConfig {
 		Token:                         opts.Token,
 		MountPoint:                    opts.MountPoint,
 		RemoteRoot:                    opts.RemoteRoot,
+		RemoteRootDefaulted:           opts.RemoteRootDefaulted,
 		CacheDir:                      opts.CacheDir,
 		CacheSize:                     opts.CacheSize,
 		ReadCacheMaxFileBytes:         opts.ReadCacheMaxFileBytes,
@@ -512,7 +511,6 @@ func mountConfigFromOptions(opts *MountOptions) MountConfig {
 		WritebackSyncWindow:           opts.WritebackSyncWindow,
 		Profile:                       opts.Profile,
 		LayerRef:                      opts.LayerRef,
-		CheckpointRef:                 opts.CheckpointRef,
 		LocalRoot:                     opts.LocalRoot,
 		LocalizeQuotaBytes:            opts.LocalizeQuotaBytes,
 		LocalizeFreeRatio:             opts.LocalizeFreeRatio,
@@ -773,23 +771,41 @@ func mountWithConfig(cfg MountConfig) error {
 	if cfg.APIKey == "" && cfg.Token == "" {
 		return fmt.Errorf("fuse: either APIKey or Token is required")
 	}
-	remoteRoot, err := mountpath.NormalizeRoot(cfg.RemoteRoot)
-	if err != nil {
-		return fmt.Errorf("fuse: normalize remote root: %w", err)
-	}
 
-	var cl *client.Client
+	var baseClient *client.Client
 	if cfg.Token != "" {
-		cl = client.NewWithToken(cfg.Server, cfg.Token)
+		baseClient = client.NewWithToken(cfg.Server, cfg.Token)
 	} else {
-		cl = client.New(cfg.Server, cfg.APIKey)
+		baseClient = client.New(cfg.Server, cfg.APIKey)
 	}
-	cl.Warm(context.Background())
+	baseClient.Warm(context.Background())
 	// v1: one actor id tags this mount's own writes AND filters its SSE
 	// echo — separate ids would make every local commit look like a remote
 	// change and trigger needless kernel invalidations.
 	actorID := generateMountID()
-	cl.SetActor(actorID)
+	baseClient.SetActor(actorID)
+
+	layerBinding, err := resolveLayerMountView(
+		context.Background(),
+		baseClient,
+		cfg.LayerRef,
+		cfg.RemoteRoot,
+		cfg.RemoteRootDefaulted,
+		actorID,
+		cfg.ReadOnly,
+		defaultLayerLeaseTiming(),
+	)
+	if err != nil {
+		return err
+	}
+	defer layerBinding.Unbind(context.Background())
+
+	remoteRoot := layerBinding.RemoteRoot
+	cfg.RemoteRoot = remoteRoot
+	if layerBinding.LayerID != "" {
+		cfg.LayerRef = layerBinding.LayerID
+	}
+	cl := layerBinding.ViewClient
 
 	// v1 validateRemoteRoot: refuse to mount a remote source that does not
 	// exist (startup-permanent) before any kernel mount is established, and
@@ -797,13 +813,6 @@ func mountWithConfig(cfg MountConfig) error {
 	// supervisor's retry ladder.
 	if err := validateRemoteRoot(context.Background(), cl, remoteRoot); err != nil {
 		return err
-	}
-	// A checkpoint without a layer is meaningless (the layer plane carries
-	// the checkpoint view) and previously passed silently: the layer
-	// extension was skipped, the checkpoint ignored, and an ordinary
-	// writable filesystem mounted instead.
-	if strings.TrimSpace(cfg.CheckpointRef) != "" && strings.TrimSpace(cfg.LayerRef) == "" {
-		return fmt.Errorf("fuse: checkpoint %q requires --layer (the layer plane owns the checkpoint view)", cfg.CheckpointRef)
 	}
 
 	extOrder, err := parseExtensionOrder(cfg.Extensions)
@@ -838,11 +847,11 @@ func mountWithConfig(cfg MountConfig) error {
 	mountHash := ""
 	readCacheHash := ""
 	if cacheBase != "" {
-		mountHash = MountHash(cfg.Server, cfg.MountPoint, cfg.RemoteRoot)
-		if cfg.LayerRef != "" {
-			mountHash = MountLayerHash(cfg.Server, cfg.MountPoint, cfg.RemoteRoot, cfg.LayerRef, cfg.CheckpointRef)
+		mountHash = MountHash(cfg.Server, cfg.MountPoint, remoteRoot)
+		if layerBinding.LayerID != "" {
+			mountHash = MountLayerHash(cfg.Server, cfg.MountPoint, remoteRoot, layerBinding.LayerID)
 		}
-		readCacheHash = MountReadCacheHash(cfg.Server, cfg.MountPoint, cfg.RemoteRoot, mountCredentialKind(&cfg), mountCredentialSecret(&cfg))
+		readCacheHash = MountReadCacheHashWithLayer(cfg.Server, cfg.MountPoint, remoteRoot, mountCredentialKind(&cfg), mountCredentialSecret(&cfg), layerBinding.LayerID)
 	}
 
 	// core constructs into the same registry as every other extension; the
@@ -1115,30 +1124,6 @@ func mountWithConfig(cfg MountConfig) error {
 		built["localize"] = localizeExt
 	}
 
-	// The layer view sits outermost (v1: layer over base), git next.
-	var layerExt *layer.Layer
-	if wantExt["layer"] && strings.TrimSpace(cfg.LayerRef) != "" {
-		layerExt, err = layer.New(layer.Options{
-			Policy:        cfg.WritePolicy,
-			LayerRef:      cfg.LayerRef,
-			CheckpointRef: cfg.CheckpointRef,
-			RemoteRoot:    remoteRoot,
-			Client:        cl,
-			Events:        bus,
-		})
-		if err != nil {
-			return fmt.Errorf("fuse: layer extension: %w", err)
-		}
-		built["layer"] = layerExt
-		// Control/session consumers resolve the layer AGAIN (drive9 exec
-		// on the mount directory): report the PINNED id, or a name/tag
-		// that later points elsewhere sends them to a different layer
-		// than the one this mount reads/writes.
-		if pinned := layerExt.PinnedRef(); pinned != "" {
-			cfg.LayerRef = pinned
-		}
-	}
-
 	// The extent plane: the community JuiceFS engine (vfs + chunk store)
 	// on the v2 wire protocol, claiming extent files above the write
 	// plane — claimed handles own their buffering through the engine, not
@@ -1310,7 +1295,7 @@ func mountWithConfig(cfg MountConfig) error {
 	}
 
 	var sseExt *sse.SSE
-	if wantExt["sse"] {
+	if wantExt["sse"] && layerBinding.LayerID == "" {
 		var serr error
 		sseExt, serr = sse.New(sse.Options{Client: cl, Actor: actorID, RemoteRoot: remoteRoot, Events: bus})
 		if serr != nil {
@@ -1328,7 +1313,7 @@ func mountWithConfig(cfg MountConfig) error {
 	// View extensions that own directories (localize overlays, layer
 	// view) must see dir GetAttrs go through the chain; every other stack
 	// serves root/dir attrs from the inode table (v1).
-	localDirAttrs := cfg.LocalRoot == "" && strings.TrimSpace(cfg.LayerRef) == ""
+	localDirAttrs := cfg.LocalRoot == "" && layerBinding.LayerID == ""
 	// The daemon gate is redundant exactly when the mount options arm the kernel, so
 	// the flag is read off the options themselves: a second platform predicate would
 	// be a source of truth that can drift from the branches below (which is how the
@@ -1418,15 +1403,8 @@ func mountWithConfig(cfg MountConfig) error {
 	if sseExt != nil {
 		sseExt.Attach(f.Ctx.Inodes, f.Ctx.Notify)
 	}
-	if layerExt != nil {
-		// The layer event watcher resets the kernel view after a remote
-		// refresh (v1 resetMountView on fs_layer_events).
-		layerExt.Attach(f.Ctx.Notify)
-		// A layer rollback fences the write plane: the commit queue halts
-		// and later inline commits fail with the rolled-back error.
-		if wb != nil {
-			layerExt.OnRollback(wb.AbandonLayerForRollback)
-		}
+	if layerBinding.LayerID != "" && wb != nil {
+		layerBinding.OnSelfFence(wb.AbandonLayerForRollback)
 	}
 
 	// Control server + mount process state (v1 mount.go) run BEFORE the
@@ -1436,7 +1414,7 @@ func mountWithConfig(cfg MountConfig) error {
 	// `drive9 mount drain/umount/status` find this worker and its control
 	// socket; a supervised worker skips it — the supervisor owns the state
 	// file (v1 SkipProcessState: opts.Supervised).
-	ctrl, cerr := startMountControlServer(cfg.MountPoint, cfg.LayerRef, f)
+	ctrl, cerr := startMountControlServer(cfg.MountPoint, layerBinding.LayerID, f)
 	if cerr != nil {
 		fmt.Fprintf(os.Stderr, "drive9: mount control server failed: %v (continuing)\n", cerr)
 	} else {
@@ -1609,6 +1587,7 @@ func mountWithConfig(cfg MountConfig) error {
 			shutdownOutcome.set(err)
 			fmt.Fprintf(os.Stderr, "drive9: shutdown drain failed at %s: %v\n", cfg.MountPoint, err)
 		}
+		layerBinding.Unbind(shutdownCtx)
 		for attempt := 0; attempt < 5; attempt++ {
 			if err := server.Unmount(); err == nil {
 				return
@@ -1917,12 +1896,12 @@ func MountHash(serverURL, mountPoint string, remoteRoot ...string) string {
 	return hex.EncodeToString(h[:8]) // 16 hex chars
 }
 
-// MountLayerHash folds the layer and checkpoint refs into the mount
+// MountLayerHash folds the canonical layer ID into the mount
 // namespace: a layer mount's writeback state is not interchangeable with
 // the base mount's.
-func MountLayerHash(serverURL, mountPoint, remoteRoot, layerRef, checkpointRef string) string {
+func MountLayerHash(serverURL, mountPoint, remoteRoot, layerID string) string {
 	base := MountHash(serverURL, mountPoint, remoteRoot)
-	input := base + "\x00layer\x00" + strings.TrimSpace(layerRef) + "\x00checkpoint\x00" + strings.TrimSpace(checkpointRef)
+	input := base + "\x00layer\x00" + strings.TrimSpace(layerID)
 	h := sha256.Sum256([]byte(input))
 	return hex.EncodeToString(h[:8])
 }
@@ -1931,11 +1910,19 @@ func MountLayerHash(serverURL, mountPoint, remoteRoot, layerRef, checkpointRef s
 // the write-back cache namespace, it includes a credential digest because
 // read-cache entries contain remote file bytes and can survive remounts.
 func MountReadCacheHash(serverURL, mountPoint, remoteRoot, credentialKind, credential string) string {
+	return MountReadCacheHashWithLayer(serverURL, mountPoint, remoteRoot, credentialKind, credential, "")
+}
+
+// MountReadCacheHashWithLayer folds an optional canonical layer ID into the read-cache namespace.
+func MountReadCacheHashWithLayer(serverURL, mountPoint, remoteRoot, credentialKind, credential, layerID string) string {
 	if remoteRoot == "" {
 		remoteRoot = "/"
 	}
 	credentialDigest := sha256.Sum256([]byte(credentialKind + "\x00" + credential))
 	input := serverURL + "\x00" + mountPoint + "\x00" + remoteRoot + "\x00" + credentialKind + "\x00" + hex.EncodeToString(credentialDigest[:])
+	if trimmed := strings.TrimSpace(layerID); trimmed != "" {
+		input += "\x00layer\x00" + trimmed
+	}
 	h := sha256.Sum256([]byte(input))
 	return hex.EncodeToString(h[:8])
 }

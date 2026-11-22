@@ -18,12 +18,12 @@ func Mkdir(c *client.Client, args []string) error {
 		return err
 	}
 	defer withObjectAuthLocal(authLocal)()
-	layerRef, args, err := parseLayerFlag(args)
+	layerRef, fence, args, err := ParseLayerViewFlags(args)
 	if err != nil {
 		return err
 	}
 	if len(args) != 1 {
-		return fmt.Errorf("usage: drive9 fs mkdir [--layer <ref>] [--auth=local|server] <path>")
+		return fmt.Errorf("usage: drive9 fs mkdir [--layer <ref> [--fence <N>]] [--auth=local|server] <path>")
 	}
 	path := args[0]
 	h, err := fsHandleForArg(c, path)
@@ -31,7 +31,7 @@ func Mkdir(c *client.Client, args []string) error {
 		return err
 	}
 	if h.Loc.Kind == KindObject {
-		if layerRef != "" {
+		if layerRef != "" || (c != nil && c.ViewBinding().LayerID != "") {
 			return fmt.Errorf("--layer is drive9-only")
 		}
 		ctx, cancel := withObjectOpTimeout(context.Background())
@@ -42,13 +42,17 @@ func Mkdir(c *client.Client, args []string) error {
 		fmt.Printf("created %s\n", path)
 		return nil
 	}
-	c, path = h.Client, h.Path
-	if layerRef != "" {
-		if err := mkdirLayerPath(context.Background(), c, layerRef, path, 0o755); err != nil {
+	if h.Loc.Kind == KindDrive9 && h.Loc.Context != "" {
+		if err := requireNoLayerWithRemoteContext(layerRef, c, RemotePath{Context: h.Loc.Context, Path: h.Path}, args[0]); err != nil {
 			return err
 		}
-		fmt.Printf("created %s\n", path)
-		return nil
+	}
+	c, path = h.Client, h.Path
+	if layerRef != "" {
+		c, err = BindCLIViewClient(context.Background(), c, layerRef, fence)
+		if err != nil {
+			return err
+		}
 	}
 	if err := c.Mkdir(path); err != nil {
 		return err

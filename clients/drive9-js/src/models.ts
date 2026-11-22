@@ -282,127 +282,124 @@ export interface WatchEventsOptions {
   maxBackoffMs?: number;
 }
 
-export interface FSLayerCreateRequest {
-  layer_id?: string;
-  base_root_path: string;
-  name?: string;
-  tags?: Record<string, string>;
-  durability_mode?: string;
-  actor_id?: string;
-}
+export const MaxLayerViewBatchWriteItems = 100;
+export const MaxBatchWriteItems = 128;
+export const MaxBatchWriteBytes = 4 * 1024 * 1024;
 
-export interface FSLayer {
-  layer_id: string;
-  base_root_path: string;
-  name: string;
-  tags?: Record<string, string>;
-  state: string;
-  durability_mode: string;
-  actor_id: string;
-  durable_seq: number;
-  parent_layer_id?: string;
-  origin_seq?: number;
-  origin_checkpoint_id?: string;
-  root_layer_id?: string;
-  depth?: number;
-  origin?: string;
-  created_at: string;
-  updated_at: string;
-  sealed_at?: string;
-}
-
-export interface FSLayerForkRequest {
-  layer_id?: string;
-  name?: string;
-  actor_id?: string;
-  checkpoint_id?: string;
-}
-
-export interface FSLayerDeleteOptions {
-  cascade?: boolean;
-}
-
-export type FSLayerEntryOp = "upsert" | "whiteout" | "mkdir" | "symlink" | "chmod" | "rename";
-export type FSLayerEntryKind = "file" | "dir" | "symlink";
-
-export interface FSLayerEntry {
-  layer_id: string;
+export interface BatchWriteItem {
   path: string;
-  parent_path: string;
-  name: string;
-  op: FSLayerEntryOp;
-  kind: FSLayerEntryKind;
-  base_inode_id: string;
-  base_revision: number;
-  storage_type: string;
-  storage_ref: string;
-  storage_ref_hash: string;
-  storage_encryption_mode: string;
-  storage_encryption_key_id: string;
-  checksum_sha256: string;
-  size_bytes: number;
-  mode: number;
-  content?: string;
-  content_text?: string;
-  entry_seq: number;
-  created_at: string;
-  updated_at: string;
-}
-
-export interface FSLayerEntryRequest {
-  path: string;
-  op?: FSLayerEntryOp;
-  kind?: FSLayerEntryKind;
-  base_inode_id?: string;
-  base_revision?: number;
-  storage_type?: string;
-  storage_ref?: string;
-  storage_ref_hash?: string;
-  storage_encryption_mode?: string;
-  storage_encryption_key_id?: string;
-  content?: Uint8Array | string;
-  content_type?: string;
-  content_text?: string;
-  checksum_sha256?: string;
-  size_bytes?: number;
+  data: Uint8Array;
+  expectedRevision?: number;
   mode?: number;
+  tags?: Record<string, string>;
 }
 
-export interface FSLayerCommitConflict {
+export interface BatchWriteResult {
   path: string;
-  reason: string;
-  base_revision?: number;
-  want_revision?: number;
+  status: number;
+  error?: string;
+  revision?: number;
+  resource_id?: string;
 }
 
-export interface FSLayerCommit {
-  status: string;
+export interface ViewBinding {
+  layerId?: string;
+  fence?: number;
+  writeGuard?: () => void;
+}
+
+export interface LayerCreateRequest {
+  name?: string;
+  base_root_path?: string;
+  tags?: Record<string, string>;
+  actor_id?: string;
+  ttl_seconds?: number;
+}
+
+export interface LayerForkRequest {
+  name?: string;
+  tags?: Record<string, string>;
+  actor_id?: string;
+  ttl_seconds?: number;
+}
+
+export interface LayerInfo {
   layer_id: string;
-  applied?: number;
-  conflicts?: FSLayerCommitConflict[];
-}
-
-export interface FSLayerCheckpointRequest {
-  checkpoint_id?: string;
-  label?: string;
-}
-
-export interface FSLayerCheckpoint {
-  checkpoint_id: string;
-  layer_id: string;
-  durable_seq: number;
-  label: string;
-  created_at: string;
-}
-
-export interface FSLayerEvent {
-  event_id: string;
-  layer_id: string;
-  seq: number;
+  name: string;
+  base_root_path: string;
+  parent_layer_id: string;
   actor_id: string;
-  op: string;
-  path: string;
+  state: string;
+  snap_gen: number;
+  fence: number;
+  exclusive_mount_id: string;
+  mount_lease_until?: string | null;
+  mount_lease_ttl_ms: number;
+  mount_expired: boolean;
+  tags?: Record<string, string>;
+  expires_at?: string | null;
   created_at: string;
+  updated_at: string;
+}
+
+export interface LayerListOptions {
+  limit?: number;
+  after?: string;
+}
+
+export interface LayerListPage {
+  layers: LayerInfo[];
+  next_after?: string;
+}
+
+export interface LayerMergeResult {
+  layer_id: string;
+  status: string;
+  applied_paths: number;
+}
+
+export interface LayerDeleteOptions {
+  force?: boolean;
+}
+
+export interface LayerDeleteResult {
+  layer_id: string;
+  status: string;
+}
+
+export interface LayerMountBindRequest {
+  mount_id: string;
+  operation_id: string;
+  expected_fence?: number;
+  force?: boolean;
+}
+
+export interface LayerMountLease {
+  layer_id: string;
+  mount_id: string;
+  operation_id: string;
+  fence: number;
+  mount_lease_until: string;
+  mount_lease_ttl_ms: number;
+}
+
+export interface LayerMountRenewRequest {
+  mount_id: string;
+  fence: number;
+}
+
+export interface LayerMountUnbindRequest {
+  mount_id?: string;
+  kind?: string;
+  operation_id?: string;
+  fence?: number;
+  force?: boolean;
+}
+
+export interface LayerMountUnbindResult {
+  layer_id: string;
+  fence: number;
+  unbound: boolean;
 }
 
 export interface GitWorkspaceRequest {

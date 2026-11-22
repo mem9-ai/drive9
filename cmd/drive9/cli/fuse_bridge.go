@@ -32,6 +32,7 @@ type mountFuseOptions struct {
 	Token                        string
 	MountPoint                   string
 	RemoteRoot                   string
+	RemoteRootDefaulted          bool
 	CacheDir                     string
 	CacheSize                    int64
 	ReadCacheMaxFileBytes        int64
@@ -59,7 +60,6 @@ type mountFuseOptions struct {
 	WritebackSyncWindow          time.Duration
 	Profile                      string
 	LayerRef                     string
-	CheckpointRef                string
 	LocalRoot                    string
 	LocalizeQuotaBytes           int64
 	LocalizeFreeRatio            float64

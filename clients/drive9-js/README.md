@@ -139,7 +139,6 @@ Environment variables `DRIVE9_SERVER` or `DRIVE9_BASE` and `DRIVE9_API_KEY` take
 |-----------|--------|
 | SQL query | `await client.sql(query)` |
 | Grep | `await client.grep(query, prefix, limit)` |
-| Layer grep | `await client.grepWithLayer(query, prefix, limit, layerRef)` |
 | Find | `await client.find(prefix, params?)` |
 
 ### Remote exec
@@ -278,23 +277,17 @@ provides `onDisconnected(err)` and `onCurrent(seq)` callbacks.
 
 | Operation | Method |
 |-----------|--------|
-| Create layer | `await client.createFSLayer(request)` |
-| List layers | `await client.listFSLayers()` |
-| Get layer | `await client.getFSLayer(layerId)` |
-| Fork layer | `await client.forkFSLayer(parentRef, request?)` |
-| Abandon layer (logical delete) | `await client.deleteFSLayer(layerId, { cascade? })` |
-| Diff layer | `await client.diffFSLayer(layerId, maxSeq?)` |
-| Replay layer | `await client.replayFSLayer(layerId, maxSeq?)` |
-| Upsert entry | `await client.upsertFSLayerEntry(layerId, request)` |
-| Upload layer file | `await client.uploadFSLayerFile(layerId, path, data, opts?)` |
-| Read layer file | `await client.readFSLayerFile(layerId, path, maxSeq?)` |
-| Read layer file stream | `await client.readFSLayerFileStream(layerId, path, maxSeq?)` |
-| Get layer entry | `await client.getFSLayerEntry(layerId, path, maxSeq?)` |
-| Checkpoint layer | `await client.checkpointFSLayer(layerId, request)` |
-| Get checkpoint | `await client.getFSLayerCheckpoint(checkpointId)` |
-| List layer events | `await client.listFSLayerEvents(layerId, since?)` |
-| Rollback layer | `await client.rollbackFSLayer(layerId)` |
-| Commit layer | `await client.commitFSLayer(layerId)` |
+| Create layer | `await client.createLayer(request)` |
+| List layers (paged) | `await client.listLayers({ limit?, after? })` |
+| List all layers | `await client.listAllLayers()` |
+| Get layer (`id`, `name`, `tag:...`) | `await client.getLayer(ref)` |
+| Fork layer | `await client.forkLayer(parentRef, request?)` |
+| Merge layer | `await client.mergeLayer(ref)` |
+| Delete layer | `await client.deleteLayer(ref, { force? })` |
+| Bind exclusive mount lease | `await client.bindLayerMount(layerId, request)` |
+| Renew exclusive mount lease | `await client.renewLayerMount(layerId, request)` |
+| Unbind mount lease | `await client.unbindLayerMount(layerId, request)` |
+| Bind client to Layer view | `const viewClient = client.withView({ layerId, fence? })` |
 
 ### Git workspaces
 

@@ -429,13 +429,6 @@ func (cq *CommitQueue) resolveStalePayloadAsIdempotent(ctx context.Context, entr
 	if cq == nil || entry == nil || cq.shadows == nil {
 		return false, nil
 	}
-	// Layer mounts upload through layer endpoints; Stat/Read here would
-	// compare against the base FS namespace, where the entry's bytes may not
-	// (and need not) appear. Keep layer rejections terminal, matching
-	// tryAutoResolveConflict.
-	if cq.layerRefSnapshot() != "" {
-		return false, nil
-	}
 	// ShadowSpill payloads stream from the shadow file instead of being held
 	// in memory, so the whole-payload comparison below does not apply.
 	if entry.ShadowSpill {

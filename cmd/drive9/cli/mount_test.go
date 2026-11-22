@@ -1526,33 +1526,36 @@ func TestMountCmdPassesLayerRefOption(t *testing.T) {
 	if got.LayerRef != "task=auth" {
 		t.Errorf("LayerRef = %q, want task=auth", got.LayerRef)
 	}
-	if got.RemoteRoot != "/repo" {
-		t.Errorf("RemoteRoot = %q, want /repo", got.RemoteRoot)
+	if got.RemoteRoot != "/repo" || got.RemoteRootDefaulted {
+		t.Errorf("RemoteRoot = %q (defaulted=%v), want /repo (defaulted=false)", got.RemoteRoot, got.RemoteRootDefaulted)
 	}
 }
 
-func TestMountCmdCheckpointRequiresLayer(t *testing.T) {
+func TestMountCmdLayerDefaultsRemoteRootWhenOmitted(t *testing.T) {
 	stubMountProfileAppendLogProbe(t)
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
+
+	var got *mountFuseOptions
 	mountFuse = func(opts *mountFuseOptions) error {
-		t.Fatal("mountFuse should not be called")
+		copied := *opts
+		got = &copied
 		return nil
 	}
 
 	err := MountCmd([]string{
+		"--foreground",
 		"--mode", "fuse",
 		"--server", "https://drive9.example",
 		"--api-key", "sk-test",
-		"--checkpoint", "cp1",
-		":/repo",
+		"--layer", "task=auth",
 		t.TempDir(),
 	})
-	if err == nil {
-		t.Fatal("MountCmd error = nil, want checkpoint requires layer")
+	if err != nil {
+		t.Fatalf("MountCmd: %v", err)
 	}
-	if !strings.Contains(err.Error(), "--checkpoint requires --layer") {
-		t.Errorf("MountCmd error = %v", err)
+	if got == nil || !got.RemoteRootDefaulted {
+		t.Fatalf("got = %+v, want RemoteRootDefaulted=true", got)
 	}
 }
 

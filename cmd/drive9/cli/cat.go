@@ -25,6 +25,16 @@ func catWithWriter(c *client.Client, args []string, out io.Writer) error {
 		return err
 	}
 	defer withObjectAuthLocal(authLocal)()
+	layerRef, fence, args, err := ParseLayerViewFlags(args)
+	if err != nil {
+		return err
+	}
+	if layerRef != "" {
+		c, err = BindCLIViewClient(context.Background(), c, layerRef, fence)
+		if err != nil {
+			return err
+		}
+	}
 	fs := flag.NewFlagSet("fs cat", flag.ContinueOnError)
 	offset := fs.Int64("offset", 0, "byte offset for a positional read; requires --length")
 	length := fs.Int64("length", 0, "byte length for a positional read; requires --offset")
@@ -58,6 +68,14 @@ func catWithWriter(c *client.Client, args []string, out io.Writer) error {
 	h, err := fsHandleForArg(c, path)
 	if err != nil {
 		return err
+	}
+	if h.Loc.Kind == KindObject && (layerRef != "" || (c != nil && c.ViewBinding().LayerID != "")) {
+		return fmt.Errorf("--layer is drive9-only")
+	}
+	if h.Loc.Kind == KindDrive9 && h.Loc.Context != "" {
+		if err := requireNoLayerWithRemoteContext(layerRef, c, RemotePath{Context: h.Loc.Context, Path: h.Path}, path); err != nil {
+			return err
+		}
 	}
 	ctx := context.Background()
 	if h.Loc.Kind == KindObject {

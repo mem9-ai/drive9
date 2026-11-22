@@ -21,7 +21,6 @@ package writeback
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -34,7 +33,6 @@ import (
 	"time"
 
 	"github.com/mem9-ai/drive9/internal/testbackend"
-	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/fusecomp/staging"
 )
 
@@ -1519,85 +1517,6 @@ func TestCommitQueueSpillConflictReadsHonorCancellation(t *testing.T) {
 				t.Fatalf("canceled staging=%+v exists=%t", meta, ok)
 			}
 		})
-	}
-}
-
-func TestCommitQueueLayerGrowthPreservesMainClaim(t *testing.T) {
-	for _, spill := range []bool{false, true} {
-		for _, mainParent := range []bool{false, true} {
-			t.Run(fmt.Sprintf("spill=%t/main-parent=%t", spill, mainParent), func(t *testing.T) {
-				const path = "/layer-growth.db"
-				parentBody := []byte("header")
-				childBody := []byte("header-grown")
-				main := &casFileServer{t: t, path: path}
-				type claim struct {
-					rev  int64
-					body []byte
-				}
-				claims := make(chan claim, 2)
-				ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					if r.URL.Path == "/v1/fs"+path {
-						main.serveHTTP(w, r)
-						return
-					}
-					var got claim
-					switch r.URL.Path {
-					case "/v1/layers/L/entries":
-						var req client.FSLayerEntryRequest
-						if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-							http.Error(w, err.Error(), 400)
-							return
-						}
-						got = claim{req.BaseRevision, req.Content}
-					case "/v1/layers/L/objects":
-						got.rev, _ = strconv.ParseInt(r.URL.Query().Get("base_revision"), 10, 64)
-						got.body, _ = io.ReadAll(r.Body)
-					default:
-						http.NotFound(w, r)
-						return // SDK fallback to /objects
-					}
-					claims <- got
-					_ = json.NewEncoder(w).Encode(map[string]any{"layer_id": "L", "path": path, "op": "upsert", "kind": "file", "size_bytes": len(got.body)})
-				}))
-				t.Cleanup(ts.Close)
-				cq := newLineageQueue(t, ts.URL)
-				if !mainParent {
-					cq.SetLayerRef("L")
-				}
-				parent := stageLineageEntry(t, cq, path, parentBody, "A", "", spill)
-				if err := cq.CommitNow(context.Background(), parent); err != nil {
-					t.Fatal(err)
-				}
-				if !mainParent {
-					got := <-claims
-					if got.rev != 0 || !bytes.Equal(got.body, parentBody) {
-						t.Fatalf("parent claim=%+v", got)
-					}
-					if proof := cq.landedCommit(path); proof.snapshotID != "" {
-						t.Fatalf("overlay invented main landmark: %+v", proof)
-					}
-				}
-				// An existing main proof exercises post-validation CAS wiring; this
-				// is not a claim that overlay uploads increment main revisions.
-				cq.SetLayerRef("L")
-				child := stageLineageEntry(t, cq, path, childBody, "B", "A", spill)
-				wantRev := int64(0)
-				if mainParent {
-					wantRev = 1
-					child.DurableWatermarkRev = 1
-				}
-				if err := cq.CommitNow(context.Background(), child); err != nil {
-					t.Fatal(err)
-				}
-				got := <-claims
-				if got.rev != wantRev || !bytes.Equal(got.body, childBody) {
-					t.Fatalf("child claim rev=%d body=%q, want %d/%q", got.rev, got.body, wantRev, childBody)
-				}
-				if child.PayloadBaseRev != 0 {
-					t.Fatal("payload audit base changed")
-				}
-			})
-		}
 	}
 }
 

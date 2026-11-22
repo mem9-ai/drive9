@@ -47,7 +47,10 @@ func Cp(c *client.Client, args []string) error {
 	appendMode := false
 	recursive := false
 	force := false
-	layerRef := ""
+	layerRef, fence, args, err := ParseLayerViewFlags(args)
+	if err != nil {
+		return err
+	}
 	layout := ""
 	layoutSet := false
 	var tags map[string]string
@@ -64,14 +67,6 @@ func Cp(c *client.Client, args []string) error {
 			recursive = true
 		case a == "-f" || a == "--force":
 			force = true
-		case a == "--layer":
-			if i+1 >= len(args) {
-				return fmt.Errorf("--layer requires argument")
-			}
-			i++
-			layerRef = strings.TrimSpace(args[i])
-		case strings.HasPrefix(a, "--layer="):
-			layerRef = strings.TrimSpace(strings.TrimPrefix(a, "--layer="))
 		case a == "--layout":
 			if i+1 >= len(args) {
 				return fmt.Errorf("--layout requires extent or single")
@@ -123,24 +118,13 @@ func Cp(c *client.Client, args []string) error {
 	if resume && appendMode {
 		return fmt.Errorf("--resume and --append cannot be used together")
 	}
-	if layerRef != "" {
-		if recursive {
-			return layerRefMustBeEmpty(layerRef, "-r/--recursive")
-		}
+	inLayerView := layerRef != "" || (c != nil && c.ViewBinding().LayerID != "")
+	if inLayerView {
 		if appendMode {
-			return layerRefMustBeEmpty(layerRef, "--append")
-		}
-		if resume {
-			return layerRefMustBeEmpty(layerRef, "--resume")
-		}
-		if layout != "" {
-			return layerRefMustBeEmpty(layerRef, "--layout")
-		}
-		if len(tags) > 0 {
-			return layerRefMustBeEmpty(layerRef, "--tag")
+			return fmt.Errorf("--layer cannot be combined with --append")
 		}
 		if description != "" {
-			return layerRefMustBeEmpty(layerRef, "--description")
+			return fmt.Errorf("--layer cannot be combined with --description")
 		}
 	}
 	if appendMode && len(tags) > 0 {
@@ -178,7 +162,7 @@ func Cp(c *client.Client, args []string) error {
 		return err
 	}
 	if srcLoc.Kind == KindObject || dstLoc.Kind == KindObject {
-		if layerRef != "" {
+		if inLayerView {
 			return fmt.Errorf("--layer is drive9-only")
 		}
 		if appendMode {
@@ -195,7 +179,7 @@ func Cp(c *client.Client, args []string) error {
 	// D14: cross-context drive9 copy streams through the laptop.
 	if srcLoc.Kind == KindDrive9 && dstLoc.Kind == KindDrive9 &&
 		srcLoc.Context != dstLoc.Context {
-		if layerRef != "" {
+		if inLayerView {
 			return fmt.Errorf("--layer is not supported for cross-context copy")
 		}
 		if appendMode {
@@ -248,6 +232,22 @@ func Cp(c *client.Client, args []string) error {
 	}
 
 	ctx := context.Background()
+	if srcIsRemote {
+		if err := requireNoLayerWithRemoteContext(layerRef, c, srcRP, src); err != nil {
+			return err
+		}
+	}
+	if dstIsRemote {
+		if err := requireNoLayerWithRemoteContext(layerRef, c, dstRP, dst); err != nil {
+			return err
+		}
+	}
+	if layerRef != "" {
+		c, err = BindCLIViewClient(ctx, c, layerRef, fence)
+		if err != nil {
+			return err
+		}
+	}
 
 	// Recursive tree copy. Stdin/stdout sources have no meaningful
 	// recursive semantics; reject up front rather than silently fall
@@ -295,9 +295,6 @@ func Cp(c *client.Client, args []string) error {
 
 	switch {
 	case src == "-" && dstIsRemote:
-		if err := requireNoLayerWithRemoteContext(layerRef, dstRP, dst); err != nil {
-			return err
-		}
 		if dstRP.Context != "" {
 			var err error
 			c, err = newFSClientForContext(dstRP.Context)
@@ -315,9 +312,6 @@ func Cp(c *client.Client, args []string) error {
 		data, err := readAllStdin()
 		if err != nil {
 			return err
-		}
-		if layerRef != "" {
-			return uploadBytesToLayer(ctx, c, layerRef, resolvedDst, data, 0o644, true)
 		}
 		if appendMode {
 			return c.AppendStream(ctx, resolvedDst, bytes.NewReader(data), int64(len(data)), printProgress)
@@ -353,9 +347,6 @@ func Cp(c *client.Client, args []string) error {
 		return streamToStdout(ctx, c, srcRP.Path)
 
 	case !srcIsRemote && dstIsRemote:
-		if err := requireNoLayerWithRemoteContext(layerRef, dstRP, dst); err != nil {
-			return err
-		}
 		if dstRP.Context != "" {
 			var err error
 			c, err = newFSClientForContext(dstRP.Context)
@@ -370,9 +361,6 @@ func Cp(c *client.Client, args []string) error {
 		if layout != "" && targetLayout != "" && targetLayout != client.ContentLayout(layout) {
 			return fmt.Errorf("destination %s already has %s content layout; --layout %s cannot be applied", resolvedDst, targetLayout, layout)
 		}
-		if layerRef != "" {
-			return uploadLocalFileToLayer(ctx, c, layerRef, src, resolvedDst)
-		}
 		if appendMode {
 			return appendFile(ctx, c, src, resolvedDst)
 		}
@@ -382,9 +370,6 @@ func Cp(c *client.Client, args []string) error {
 		return uploadFileWithOptions(ctx, c, src, resolvedDst, tags, description, client.ContentLayout(layout), targetLayout)
 
 	case srcIsRemote && !dstIsRemote:
-		if layerRef != "" {
-			return fmt.Errorf("--layer is only supported for uploads or remote-to-remote copy targets")
-		}
 		if srcRP.Context != "" {
 			var err error
 			c, err = newFSClientForContext(srcRP.Context)
@@ -399,14 +384,6 @@ func Cp(c *client.Client, args []string) error {
 		return downloadFile(ctx, c, srcRP.Path, resolvedDst)
 
 	case srcIsRemote && dstIsRemote:
-		if layerRef != "" {
-			if err := requireNoLayerWithRemoteContext(layerRef, srcRP, src); err != nil {
-				return err
-			}
-			if err := requireNoLayerWithRemoteContext(layerRef, dstRP, dst); err != nil {
-				return err
-			}
-		}
 		switch {
 		case srcRP.Context == "" && dstRP.Context == "":
 		case srcRP.Context != "" && dstRP.Context != "" && srcRP.Context == dstRP.Context:
@@ -421,19 +398,6 @@ func Cp(c *client.Client, args []string) error {
 		resolvedDst, err := resolveRemoteCopyTarget(ctx, c, dstRP.Path, pathpkg.Base(srcRP.Path))
 		if err != nil {
 			return err
-		}
-		if layerRef != "" {
-			data, err := c.ReadCtx(ctx, srcRP.Path)
-			if err != nil {
-				return err
-			}
-			mode := uint32(0)
-			hasMode := false
-			if stat, err := c.StatCtx(ctx, srcRP.Path); err == nil && stat.HasMode {
-				mode = stat.Mode & 0o777
-				hasMode = true
-			}
-			return uploadBytesToLayer(ctx, c, layerRef, resolvedDst, data, mode, hasMode)
 		}
 		return c.Copy(srcRP.Path, resolvedDst)
 

@@ -214,8 +214,7 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 	durability := fs.String("durability", string(fuseDurabilityAuto), "write durability: auto, interactive, fsync, close-sync, or write-sync")
 	extensions := fs.String("extensions", "", "comma-separated fs extensions in build-up order (core first, each entry wrapping the previous ones; chain assembly is the reverse, core the terminal; default: the full set). e.g. --extensions core for a minimal write-sync fs, or --extensions core,sse,cache,writeback for the durability stack")
 	wbSyncWindow := fs.String("writeback-sync-window", "1s", "write-back close staging durability: a duration bounds the power-loss window via a background WAL syncer (default 1s); \"0\"/\"off\" defers all fsyncs to fsync(2)/umount; \"close\" restores fsync-at-close staging (legacy power-loss-safe behavior; see issue #964)")
-	layerRef := fs.String("layer", "", "mount through writable fs layer (layer id, name, or tag ref)")
-	checkpointRef := fs.String("checkpoint", "", "restore fs layer checkpoint before mounting")
+	layerRef := fs.String("layer", "", "mount through fs layer view (layer id, name, or tag ref)")
 	profile := fs.String("profile", "", "mount profile: coding-agent (default), portable, none, extent, interactive, or a ~/.drive9/profiles/<name> file")
 	localRoot := fs.String("local-root", "", "local-only overlay storage root (auto-generated for overlay profiles)")
 	localizeQuotaMB := fs.Int64("localize-quota-mb", 0, "byte quota in MiB for the local-only overlay on the host disk; local writes past it fail with ENOSPC (0 disables)")
@@ -287,10 +286,12 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 
 	// Parse positional args: 1-arg = mountpoint; 2-arg = remote mountpoint.
 	var remoteRoot, mountPoint string
+	var remoteRootDefaulted bool
 	var objectLoc *Location
 	switch fs.NArg() {
 	case 1:
 		remoteRoot = "/"
+		remoteRootDefaulted = true
 		mountPoint = fs.Arg(0)
 	case 2:
 		src := fs.Arg(0)
@@ -346,7 +347,7 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 		if legacyInterruptibleMutationsGiven && *legacyInterruptibleMutations {
 			return fmt.Errorf("drive9 mount: --legacy-interruptible-mutations is only supported with Drive9 FUSE mounts")
 		}
-		if err := validateObjectMount(runtime.GOOS, *mode, *layerRef, *checkpointRef, *profile); err != nil {
+		if err := validateObjectMount(runtime.GOOS, *mode, *layerRef, *profile); err != nil {
 			return err
 		}
 		var serverVal, apiKeyVal, tokenVal string
@@ -680,16 +681,6 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 	if resolved == MountModeWebDAV && strings.TrimSpace(*layerRef) != "" {
 		return fmt.Errorf("drive9 mount: --layer is only supported with --mode=fuse")
 	}
-	if resolved == MountModeWebDAV && strings.TrimSpace(*checkpointRef) != "" {
-		return fmt.Errorf("drive9 mount: --checkpoint is only supported with --mode=fuse")
-	}
-	if strings.TrimSpace(*checkpointRef) != "" && strings.TrimSpace(*layerRef) == "" {
-		return fmt.Errorf("drive9 mount: --checkpoint requires --layer")
-	}
-	// D10: --checkpoint is a read-only restore view.
-	if strings.TrimSpace(*checkpointRef) != "" {
-		*readOnly = true
-	}
 
 	resolvedCredentials := ResolveCredentials()
 	credentialSecrets = append(credentialSecrets,
@@ -743,9 +734,9 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 		return mountFuse(&mountFuseOptions{
 			MountPoint:                   mountPoint,
 			RemoteRoot:                   remoteRoot,
+			RemoteRootDefaulted:          remoteRootDefaulted,
 			Profile:                      profileCfg.Name,
 			LayerRef:                     strings.TrimSpace(*layerRef),
-			CheckpointRef:                strings.TrimSpace(*checkpointRef),
 			LocalRoot:                    normalizedLocalRoot,
 			LocalOnlyPatterns:            append([]string(nil), effectiveLocalOnlyPatterns...),
 			LocalGitignoreAwarePatterns:  append([]string(nil), effectiveLocalGitignoreAwarePatterns...),
@@ -881,9 +872,9 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 		return mountFuse(&mountFuseOptions{
 			MountPoint:                   mountPoint,
 			RemoteRoot:                   remoteRoot,
+			RemoteRootDefaulted:          remoteRootDefaulted,
 			Profile:                      profileCfg.Name,
 			LayerRef:                     strings.TrimSpace(*layerRef),
-			CheckpointRef:                strings.TrimSpace(*checkpointRef),
 			LocalRoot:                    normalizedLocalRoot,
 			LocalOnlyPatterns:            append([]string(nil), effectiveLocalOnlyPatterns...),
 			LocalGitignoreAwarePatterns:  append([]string(nil), effectiveLocalGitignoreAwarePatterns...),
@@ -905,6 +896,7 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 		Token:                        token,
 		MountPoint:                   mountPoint,
 		RemoteRoot:                   remoteRoot,
+		RemoteRootDefaulted:          remoteRootDefaulted,
 		CacheDir:                     *cacheDir,
 		CacheSize:                    int64(*cacheSize) << 20,
 		ReadCacheMaxFileBytes:        *readCacheMaxFile << 20,
@@ -932,7 +924,6 @@ func fsMountCmdWithBackground(args []string, background bool) (resultErr error) 
 		WritebackSyncWindow:          wbSyncWindowDur,
 		Profile:                      profileCfg.Name,
 		LayerRef:                     strings.TrimSpace(*layerRef),
-		CheckpointRef:                strings.TrimSpace(*checkpointRef),
 		LocalRoot:                    normalizedLocalRoot,
 		LocalOnlyPatterns:            append([]string(nil), effectiveLocalOnlyPatterns...),
 		LocalGitignoreAwarePatterns:  append([]string(nil), effectiveLocalGitignoreAwarePatterns...),

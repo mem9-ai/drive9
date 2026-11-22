@@ -176,7 +176,7 @@ func TestDispatchHelpCommandShowsVisualTreeHelp(t *testing.T) {
 		"--parallel-read-concurrency N",
 		"--local-only PATTERN",
 		"--local-only-gitignore-aware PATTERN",
-		"--checkpoint REF",
+		"--layer REF",
 		"--perf-cpu-interval DURATION",
 		"drive9 mount drain [--timeout duration] [--json] <mountpoint>",
 		"drive9 mount drain ./mnt --timeout=30s",

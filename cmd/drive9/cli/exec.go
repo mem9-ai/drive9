@@ -158,7 +158,7 @@ func resolveExecLayer(ctx context.Context, options *execOptions, rt execRuntime)
 	if options.layer == "" || options.layerResolved {
 		return nil
 	}
-	layer, err := rt.client().GetFSLayer(ctx, options.layer)
+	layer, err := rt.client().GetLayer(ctx, options.layer)
 	if err != nil {
 		return fmt.Errorf("resolve layer %q: %w", options.layer, err)
 	}

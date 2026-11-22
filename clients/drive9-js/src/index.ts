@@ -1,6 +1,14 @@
 export { Client } from "./client.js";
 export { Drive9Error, StatusError, ConflictError, checkError } from "./error.js";
-export { FSLayerCommitConflictError } from "./layer.js";
+export {
+  InvalidLayerViewRequestError,
+  LAYER_FENCE_HEADER,
+  UnsupportedInLayerViewError,
+  VIEW_ROUTE_PREFIX,
+  isCanonicalLayerId,
+  normalizeLayerRef,
+  validateLayerId,
+} from "./view.js";
 export { StreamWriter } from "./stream.js";
 export {
   RuntimeBusyError,
@@ -13,29 +21,24 @@ export {
   isRuntimeBusy,
   isRuntimeOutcomeUnknown,
 } from "./runtime.js";
-export { MaxBatchReadSmallPaths, MaxBatchStatPaths } from "./models.js";
+export {
+  MaxBatchReadSmallPaths,
+  MaxBatchStatPaths,
+  MaxBatchWriteBytes,
+  MaxBatchWriteItems,
+  MaxLayerViewBatchWriteItems,
+} from "./models.js";
 export type {
   BatchReadSmallResult,
   BatchStatResult,
+  BatchWriteItem,
+  BatchWriteResult,
   ChangeEvent,
   ContentLayout,
   EventHandler,
   EventLifecycle,
   FileInfo,
   FSScopeGrant,
-  FSLayerEntryKind,
-  FSLayerEntryOp,
-  FSLayer,
-  FSLayerCheckpoint,
-  FSLayerCheckpointRequest,
-  FSLayerCommit,
-  FSLayerCommitConflict,
-  FSLayerCreateRequest,
-  FSLayerDeleteOptions,
-  FSLayerEntry,
-  FSLayerEntryRequest,
-  FSLayerEvent,
-  FSLayerForkRequest,
   GitObjectPack,
   GitObjectPackRequest,
   GitOverlayKind,
@@ -62,6 +65,19 @@ export type {
   JournalSearchMatch,
   JournalSearchRequest,
   JournalVerifyResult,
+  LayerCreateRequest,
+  LayerDeleteOptions,
+  LayerDeleteResult,
+  LayerForkRequest,
+  LayerInfo,
+  LayerListOptions,
+  LayerListPage,
+  LayerMergeResult,
+  LayerMountBindRequest,
+  LayerMountLease,
+  LayerMountRenewRequest,
+  LayerMountUnbindRequest,
+  LayerMountUnbindResult,
   StatResult,
   StatMetadataResult,
   StorageType,
@@ -83,6 +99,7 @@ export type {
   TenantStatus,
   UploadSummary,
   UploadPlanV2,
+  ViewBinding,
   WatchEventsOptions,
   WriteOptions,
 } from "./models.js";

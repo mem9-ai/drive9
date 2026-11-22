@@ -18,12 +18,12 @@ func Mv(c *client.Client, args []string) error {
 		return err
 	}
 	defer withObjectAuthLocal(authLocal)()
-	layerRef, args, err := parseLayerFlag(args)
+	layerRef, fence, args, err := ParseLayerViewFlags(args)
 	if err != nil {
 		return err
 	}
 	if len(args) != 2 {
-		return fmt.Errorf("usage: drive9 fs mv [--layer <ref>] [--auth=local|server] <old> <new>")
+		return fmt.Errorf("usage: drive9 fs mv [--layer <ref> [--fence <N>]] [--auth=local|server] <old> <new>")
 	}
 	oldLoc, err := Parse(args[0])
 	if err != nil {
@@ -82,14 +82,17 @@ func Mv(c *client.Client, args []string) error {
 		newPath = newLoc.Raw
 		newRP = RemotePath{}
 	}
+	if err := requireNoLayerWithRemoteContext(layerRef, c, oldRP, args[0]); err != nil {
+		return err
+	}
+	if err := requireNoLayerWithRemoteContext(layerRef, c, newRP, args[1]); err != nil {
+		return err
+	}
 	if layerRef != "" {
-		if err := requireNoLayerWithRemoteContext(layerRef, oldRP, args[0]); err != nil {
+		c, err = BindCLIViewClient(context.Background(), c, layerRef, fence)
+		if err != nil {
 			return err
 		}
-		if err := requireNoLayerWithRemoteContext(layerRef, newRP, args[1]); err != nil {
-			return err
-		}
-		return renameLayerPath(context.Background(), c, layerRef, oldPath, newPath)
 	}
 
 	switch {

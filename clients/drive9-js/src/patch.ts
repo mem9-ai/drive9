@@ -5,6 +5,7 @@ import { bodyInit } from "./compat.js";
 import { checkError, Drive9Error } from "./error.js";
 import type { PatchPartURL, PatchPlan } from "./models.js";
 import { Semaphore } from "./utils.js";
+import { clientFetch, fetchViewObjectTargetUrl } from "./view.js";
 
 const DEFAULT_PART_SIZE = 8 * 1024 * 1024;
 
@@ -20,7 +21,7 @@ export async function patchFileImpl(
   progress?: ProgressFn,
   partSize = DEFAULT_PART_SIZE
 ): Promise<void> {
-  const resp = await fetch(client.fsUrl(path), {
+  const resp = await clientFetch(client, client.fsUrl(path), {
     method: "PATCH",
     headers: client["authHeaders"]({ "Content-Type": "application/json" }),
     body: JSON.stringify({ new_size: newSize, dirty_parts: dirtyParts, part_size: partSize }),
@@ -49,7 +50,7 @@ export async function patchFileImpl(
     );
   }
   await Promise.all(tasks);
-  const complete = await fetch(`${client.baseUrl}/v1/uploads/${plan.upload_id}/complete`, {
+  const complete = await clientFetch(client, `${client.baseUrl}/v1/uploads/${plan.upload_id}/complete`, {
     method: "POST",
     headers: client["authHeaders"](),
   });
@@ -65,7 +66,7 @@ export async function uploadPatchPart(client: Client, part: PatchPartURL, readPa
         if (typeof v === "string") headers[k] = v;
       }
     }
-    const resp = await fetch(part.read_url, { headers });
+    const resp = await fetchViewObjectTargetUrl(client, part.read_url, headers);
     await checkError(resp);
     origData = new Uint8Array(await resp.arrayBuffer());
   }

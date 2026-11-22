@@ -19,7 +19,6 @@ import (
 )
 
 const (
-	maxInlineLayerEntryBytes     = client.DefaultFSLayerInlineEntryBytes
 	zeroTruncateCommitQueueDelay = 50 * time.Millisecond
 	defaultCommitBatchMaxItems   = 64
 	defaultCommitBatchMaxBytes   = client.MaxBatchWriteBytes
@@ -44,7 +43,6 @@ type CommitEntry struct {
 	ShadowSpill          bool // true when data is only in shadow file (auto-resolve would OOM)
 	Mode                 uint32
 	HasMode              bool
-	LayerEntry           staging.LayerCacheIdentity // server identity returned by this Layer upload
 	CoalesceZeroTruncate bool
 	// PayloadBaseRev is the revision that the local bytes were derived from.
 	// It is intentionally separate from BaseRev (the CAS revision sent to the
@@ -178,11 +176,10 @@ type CommitQueue struct {
 	// path (onCommitSuccessWithOptions), mirroring landed's lifecycle.
 	terminalFailures map[string]pathCommitFailure
 	failureClock     uint64
-	maxPending       int
-	client           *client.Client
-	remoteRoot       string
-	layerRef         string
-	shadows          *staging.ShadowStore
+	maxPending int
+	client     *client.Client
+	remoteRoot string
+	shadows    *staging.ShadowStore
 	// retainedShadows marks a path whose landed entry must NOT have its
 	// shadow reclaimed: the staging handle refused certification (its
 	// buffer moved on), but the shadow is still the only restore source for
@@ -384,8 +381,12 @@ func (cq *CommitQueue) ConfigureBatchWrite(window time.Duration, maxItems int, m
 	if maxItems <= 0 {
 		maxItems = defaultCommitBatchMaxItems
 	}
-	if maxItems > client.MaxBatchWriteItems {
-		maxItems = client.MaxBatchWriteItems
+	maxAllowed := client.MaxBatchWriteItems
+	if cq.client != nil && cq.client.ViewBinding().LayerID != "" {
+		maxAllowed = client.MaxLayerViewBatchWriteItems
+	}
+	if maxItems > maxAllowed {
+		maxItems = maxAllowed
 	}
 	if maxBytes <= 0 {
 		maxBytes = defaultCommitBatchMaxBytes
@@ -404,16 +405,6 @@ func (cq *CommitQueue) ConfigureBatchWrite(window time.Duration, maxItems int, m
 	cq.batchWindow = window
 	cq.batchMaxItems = maxItems
 	cq.batchMaxBytes = maxBytes
-}
-
-// SetLayerRef pins the layer every entry commits into.
-func (cq *CommitQueue) SetLayerRef(layerRef string) {
-	if cq == nil {
-		return
-	}
-	cq.mu.Lock()
-	cq.layerRef = strings.TrimSpace(layerRef)
-	cq.mu.Unlock()
 }
 
 // Enqueue adds a commit entry to the queue. Returns an error if the queue
@@ -1143,15 +1134,6 @@ func classifyCommitTerminalReason(lastErr error) string {
 	}
 }
 
-func (cq *CommitQueue) layerRefSnapshot() string {
-	if cq == nil {
-		return ""
-	}
-	cq.mu.Lock()
-	defer cq.mu.Unlock()
-	return cq.layerRef
-}
-
 func (cq *CommitQueue) remotePath(localPath string) string {
 	root := "/"
 	if cq != nil && cq.remoteRoot != "" {
@@ -1354,7 +1336,7 @@ func (cq *CommitQueue) recoveredEntry(path string) *CommitEntry {
 		return nil
 	}
 	shadowGen := cq.index.RecoverShadowSource(path, meta.Generation, cq.shadows)
-	if meta.Kind == staging.PendingOverwrite && meta.BaseRev <= 0 && cq.layerRefSnapshot() == "" {
+	if meta.Kind == staging.PendingOverwrite && meta.BaseRev <= 0 {
 		safeLogPrintf("commit queue: skip legacy pending overwrite without base revision for %s", path)
 		return nil
 	}
@@ -2003,9 +1985,6 @@ func (cq *CommitQueue) batchWriteEligible(entry *CommitEntry) bool {
 	if cq == nil || entry == nil || entry.canceled || entry.ShadowSpill || cq.shadows == nil || cq.client == nil {
 		return false
 	}
-	if cq.layerRefSnapshot() != "" {
-		return false
-	}
 	if entry.Kind == staging.PendingOverwrite && entry.BaseRev <= 0 {
 		return false
 	}
@@ -2493,11 +2472,7 @@ func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) (int
 		return 0, fmt.Errorf("no shadow store")
 	}
 
-	layerRef := cq.layerRefSnapshot()
 	apiPath := cq.remotePath(entry.Path)
-	if layerRef != "" {
-		return cq.uploadLayerEntry(ctx, layerRef, entry, apiPath)
-	}
 	if err := cq.validateEntryPayloadFreshCtx(ctx, entry); err != nil {
 		return 0, err
 	}
@@ -2574,75 +2549,6 @@ func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) (int
 	return 0, err
 }
 
-func (cq *CommitQueue) uploadLayerEntry(ctx context.Context, layerRef string, entry *CommitEntry, apiPath string) (int64, error) {
-	// The queue may have captured this generation before replay observed an
-	// external tip. Recheck under the upload fence, not only during recovery.
-	if cq.index != nil {
-		if meta, ok := cq.index.GetMeta(entry.Path); ok && meta.Kind == staging.PendingConflict {
-			entry.DisableAutoResolveLWW = true
-			return 0, &client.StatusError{StatusCode: http.StatusConflict, Message: "local Layer publication conflicts with an observed remote tip"}
-		}
-	}
-	if err := cq.validateEntryPayloadFreshCtx(ctx, entry); err != nil {
-		return 0, err
-	}
-	// Read the main-namespace claim only after validation. Overlay upserts
-	// themselves do not advance main revisions or produce landed proofs.
-	// Layer entries use zero, not the base write API's -1 sentinel, for no claim.
-	expectedRevision := max(entry.BaseRev, 0)
-	if entry.Size > maxInlineLayerEntryBytes || entry.ShadowSpill {
-		fd, actualSize, release, err := cq.shadows.OpenIfGeneration(entry.Path, entry.ShadowGen)
-		if err != nil {
-			return 0, fmt.Errorf("open shadow stream: %w", err)
-		}
-		defer release()
-		defer func() { _ = fd.Close() }()
-		if entry.Size != actualSize {
-			return 0, fmt.Errorf("layer entry %s size mismatch: metadata=%d actual=%d", entry.Path, entry.Size, actualSize)
-		}
-		start := time.Now()
-		uploaded, err := cq.client.UploadFSLayerFile(ctx, layerRef, apiPath, fd, actualSize, expectedRevision, entry.Mode, entry.HasMode)
-		if err == nil {
-			entry.LayerEntry = layerCacheIdentity(uploaded, layerRef)
-		}
-		if cq.perf != nil {
-			cq.perf.recordRemoteOp(perfRemoteWrite, err, time.Since(start), uint64(actualSize))
-		}
-		return 0, err
-	}
-	data, err := cq.readEntryPayloadCtx(ctx, entry)
-	if err != nil {
-		return 0, fmt.Errorf("read shadow: %w", err)
-	}
-	if int64(len(data)) > maxInlineLayerEntryBytes {
-		return 0, fmt.Errorf("layer entry %s is %d bytes; inline layer uploads are limited to %d bytes", entry.Path, len(data), maxInlineLayerEntryBytes)
-	}
-	actualSize := int64(len(data))
-	if entry.Size != actualSize {
-		return 0, fmt.Errorf("layer entry %s size mismatch: metadata=%d actual=%d", entry.Path, entry.Size, actualSize)
-	}
-	req := client.FSLayerEntryRequest{
-		Path:         apiPath,
-		Op:           "upsert",
-		Kind:         "file",
-		BaseRevision: expectedRevision,
-		Content:      data,
-		SizeBytes:    actualSize,
-	}
-	if entry.HasMode {
-		req.Mode = entry.Mode & 0o777
-	}
-	start := time.Now()
-	uploaded, err := cq.client.UpsertFSLayerEntry(ctx, layerRef, req)
-	if err == nil {
-		entry.LayerEntry = layerCacheIdentity(uploaded, layerRef)
-	}
-	if cq.perf != nil {
-		cq.perf.recordRemoteOp(perfRemoteWrite, err, time.Since(start), uint64(len(data)))
-	}
-	return 0, err
-}
-
 func (cq *CommitQueue) removeFromQueue(entry *CommitEntry) {
 	cq.mu.Lock()
 	defer cq.mu.Unlock()
@@ -2710,10 +2616,7 @@ func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry, expectedRevision, com
 }
 
 func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRevision, committedRev int64, remoteModeAlreadyApplied bool) error {
-	layerRef := cq.layerRefSnapshot()
-	if layerRef == "" {
-		committedRev = committedRevisionForExpectedRevision(expectedRevision, committedRev)
-	}
+	committedRev = committedRevisionForExpectedRevision(expectedRevision, committedRev)
 	cq.rememberLanded(entry.Path, committedRev, entry.Size, cq.checksumLandedPayload(entry), entry.SnapshotID, entry.liveAncestors...)
 	cq.recordCommitSeq(entry.Path)
 	// The image landed remotely: a previously recorded terminal failure for
@@ -2734,7 +2637,7 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 			applyMode, applyHasMode = meta.Mode, true
 		}
 	}
-	if layerRef == "" && !remoteModeAlreadyApplied && shouldApplyRemoteMode(entry.Kind, applyHasMode, applyMode) {
+	if !remoteModeAlreadyApplied && shouldApplyRemoteMode(entry.Kind, applyHasMode, applyMode) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		var err error
 		mode := applyMode & posixPermissionModeMask
@@ -2774,7 +2677,7 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 
 	// Write durable commit record BEFORE cleaning up local state so that
 	// crash recovery never re-uploads an already committed entry.
-	if cq.journal != nil && layerRef == "" {
+	if cq.journal != nil {
 		if err := cq.journal.Append(staging.JournalEntry{
 			Op:   staging.JournalCommit,
 			Path: entry.Path,
@@ -2791,11 +2694,8 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 		cq.OnSuccess(entry, committedRev)
 	}
 
-	// Clean up shadow and pending index. Layer mounts intentionally retain
-	// both until the layer is committed or rolled back: pendingIndex remains
-	// the local metadata source, and shadowStore remains the local data source
-	// for large files that are not admitted to readCache.
-	if cq.shadows != nil && cq.layerRefSnapshot() == "" {
+	// Clean up shadow and pending index.
+	if cq.shadows != nil {
 		if keep, ok := cq.retainedShadows.LoadAndDelete(entry.Path); ok && keep == entry.ShadowGen {
 			// The staging handle kept newer local bytes: the shadow stays
 			// as the restore source for this landing's evicted parts.
@@ -2807,14 +2707,9 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 			cq.shadows.RemoveIfGeneration(entry.Path, entry.ShadowGen)
 		}
 	}
-	if cq.index != nil && cq.layerRefSnapshot() == "" {
+	if cq.index != nil {
 		if entry.PendingIndexGen != 0 {
 			cq.index.RemoveIfGeneration(entry.Path, entry.PendingIndexGen)
-		}
-	}
-	if cq.index != nil && cq.layerRefSnapshot() != "" {
-		if err := cq.index.MarkLayerCommittedIfGeneration(entry.Path, entry.PendingIndexGen, committedRev, entry.Mode, entry.HasMode, entry.LayerEntry); err != nil {
-			return err
 		}
 	}
 	if cq.OnCleanup != nil {
@@ -2848,15 +2743,6 @@ func (cq *CommitQueue) tryAutoResolveConflict(entryCtx context.Context, entry *C
 	if cq.isEntryCanceled(entry) || entryCtx.Err() != nil {
 		cq.removeFromQueue(entry)
 		safeLogPrintf("commit queue: auto-resolve skipped for %s (canceled)", entry.Path)
-		return
-	}
-
-	// Layer mounts upload through layer endpoints; Stat/Read here would
-	// compare against the base FS namespace, so neither the idempotent
-	// check nor LWW can be trusted. Keep layer conflicts terminal.
-	if cq.layerRefSnapshot() != "" {
-		safeLogPrintf("commit queue: auto-resolve unsupported for layer mount, terminal failure for %s", entry.Path)
-		cq.finishResolveFailure(entryCtx, entry, nil)
 		return
 	}
 

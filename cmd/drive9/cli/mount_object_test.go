@@ -9,31 +9,28 @@ import (
 )
 
 func TestValidateObjectMount(t *testing.T) {
-	if err := validateObjectMount("linux", "fuse", "", "", ""); err != nil {
+	if err := validateObjectMount("linux", "fuse", "", ""); err != nil {
 		t.Fatalf("linux fuse: %v", err)
 	}
-	if err := validateObjectMount("windows", "fuse", "", "", ""); err == nil {
+	if err := validateObjectMount("windows", "fuse", "", ""); err == nil {
 		t.Fatal("windows should fail")
 	}
-	if err := validateObjectMount("linux", "webdav", "", "", ""); err == nil || !strings.Contains(err.Error(), "webdav") {
+	if err := validateObjectMount("linux", "webdav", "", ""); err == nil || !strings.Contains(err.Error(), "webdav") {
 		t.Fatalf("webdav err=%v", err)
 	}
-	if err := validateObjectMount("darwin", "auto", "", "", ""); err == nil || !strings.Contains(err.Error(), "--mode=fuse") {
+	if err := validateObjectMount("darwin", "auto", "", ""); err == nil || !strings.Contains(err.Error(), "--mode=fuse") {
 		t.Fatalf("darwin auto err=%v", err)
 	}
-	if err := validateObjectMount("darwin", "fuse", "", "", ""); err != nil {
+	if err := validateObjectMount("darwin", "fuse", "", ""); err != nil {
 		t.Fatalf("darwin fuse: %v", err)
 	}
-	if err := validateObjectMount("linux", "fuse", "layer-1", "", ""); err == nil {
+	if err := validateObjectMount("linux", "fuse", "layer-1", ""); err == nil {
 		t.Fatal("layer should fail")
 	}
-	if err := validateObjectMount("linux", "fuse", "", "cp1", ""); err == nil {
-		t.Fatal("checkpoint should fail")
-	}
-	if err := validateObjectMount("linux", "fuse", "", "", "coding-agent"); err == nil {
+	if err := validateObjectMount("linux", "fuse", "", "coding-agent"); err == nil {
 		t.Fatal("profile should fail")
 	}
-	if err := validateObjectMount("linux", "fuse", "", "", "none"); err != nil {
+	if err := validateObjectMount("linux", "fuse", "", "none"); err != nil {
 		t.Fatalf("profile=none: %v", err)
 	}
 }

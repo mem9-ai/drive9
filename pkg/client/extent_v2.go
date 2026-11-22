@@ -399,12 +399,9 @@ func (c *Client) FetchExtentBlockRange(ctx context.Context, blockURL string, off
 	if offset < 0 || length <= 0 {
 		return nil, fmt.Errorf("invalid extent block range %d+%d", offset, length)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, blockURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+length-1))
-	resp, err := c.doPresigned(req)
+	resp, err := c.doObjectTargetURL(ctx, blockURL, http.Header{
+		"Range": {fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)},
+	})
 	if err != nil {
 		return nil, err
 	}

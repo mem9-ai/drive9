@@ -18,7 +18,7 @@ func Rm(c *client.Client, args []string) error {
 		return err
 	}
 	defer withObjectAuthLocal(authLocal)()
-	layerRef, args, err := parseLayerFlag(args)
+	layerRef, fence, args, err := ParseLayerViewFlags(args)
 	if err != nil {
 		return err
 	}
@@ -67,9 +67,17 @@ func Rm(c *client.Client, args []string) error {
 		}
 		return nil
 	}
+	if h.Loc.Kind == KindDrive9 && h.Loc.Context != "" {
+		if err := requireNoLayerWithRemoteContext(layerRef, c, RemotePath{Context: h.Loc.Context, Path: h.Path}, path); err != nil {
+			return err
+		}
+	}
 	c, path = h.Client, h.Path
 	if layerRef != "" {
-		return whiteoutLayerPath(context.Background(), c, layerRef, path, recursive)
+		c, err = BindCLIViewClient(context.Background(), c, layerRef, fence)
+		if err != nil {
+			return err
+		}
 	}
 	if recursive {
 		return c.RemoveAll(path)

@@ -1804,11 +1804,7 @@ func (c *Client) ReadStream(ctx context.Context, path string) (io.ReadCloser, er
 		if location == "" {
 			return nil, fmt.Errorf("302 without Location header")
 		}
-		req2, err := http.NewRequestWithContext(ctx, http.MethodGet, location, nil)
-		if err != nil {
-			return nil, err
-		}
-		resp2, err := c.doPresigned(req2) // Direct to S3, no auth
+		resp2, err := c.doObjectLocation(ctx, resp.Request.URL, location, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -1884,7 +1880,11 @@ func (c *Client) resolveReadTargetOrExtentPlan(ctx context.Context, path string)
 		if location == "" {
 			return nil, nil, fmt.Errorf("302 without Location header")
 		}
-		return &ReadTarget{ObjectURL: location}, nil, nil
+		resolvedLoc, rErr := c.resolveObjectRedirectLocation(resp.Request.URL, location)
+		if rErr != nil {
+			return nil, nil, rErr
+		}
+		return &ReadTarget{ObjectURL: resolvedLoc}, nil, nil
 
 	case resp.StatusCode < 300 && ContentLayout(resp.Header.Get("X-Dat9-Content-Layout")) == ContentLayoutExtent:
 		var plan ExtentReadPlan
@@ -1971,13 +1971,9 @@ func (c *Client) ReadStreamRange(ctx context.Context, path string, offset, lengt
 		if location == "" {
 			return nil, fmt.Errorf("302 without Location header")
 		}
-		req2, err := http.NewRequestWithContext(ctx, http.MethodGet, location, nil)
-		if err != nil {
-			return nil, err
-		}
-		// Use HTTP Range header for efficient partial read.
-		req2.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+length-1))
-		resp2, err := c.doPresigned(req2)
+		resp2, err := c.doObjectLocation(ctx, resp.Request.URL, location, http.Header{
+			"Range": {fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)},
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -2038,13 +2034,9 @@ func (c *Client) readObjectRangeStrict(ctx context.Context, objectURL string, of
 		return nil, fmt.Errorf("offset + length overflows int64")
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, objectURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+length-1))
-
-	resp, err := c.doPresigned(req)
+	resp, err := c.doObjectTargetURL(ctx, objectURL, http.Header{
+		"Range": {fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)},
+	})
 	if err != nil {
 		return nil, err
 	}

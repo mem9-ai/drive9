@@ -186,8 +186,12 @@ func (u *WriteBackUploader) ConfigureBatchWrite(window time.Duration, maxItems i
 	if maxItems <= 0 {
 		maxItems = defaultCommitBatchMaxItems
 	}
-	if maxItems > client.MaxBatchWriteItems {
-		maxItems = client.MaxBatchWriteItems
+	maxAllowed := client.MaxBatchWriteItems
+	if u.client != nil && u.client.ViewBinding().LayerID != "" {
+		maxAllowed = client.MaxLayerViewBatchWriteItems
+	}
+	if maxItems > maxAllowed {
+		maxItems = maxAllowed
 	}
 	if maxBytes <= 0 {
 		maxBytes = defaultCommitBatchMaxBytes

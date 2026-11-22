@@ -164,17 +164,13 @@ func (c *Client) uploadPatchPart(ctx context.Context, part *PatchPartURL, readPa
 	// Download original part data if a read URL is provided
 	var origData []byte
 	if part.ReadURL != "" {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, part.ReadURL, nil)
-		if err != nil {
-			return fmt.Errorf("create read request: %w", err)
-		}
-		// AWS presigned URLs with Range require the matching Range header.
+		hdr := make(http.Header)
 		for k, v := range part.ReadHeaders {
 			if !isForbiddenPresignedHeader(k) {
-				req.Header.Set(k, v)
+				hdr.Set(k, v)
 			}
 		}
-		resp, err := c.doPresigned(req) // Direct to S3, no auth
+		resp, err := c.doObjectTargetURL(ctx, part.ReadURL, hdr)
 		if err != nil {
 			return fmt.Errorf("download original part: %w", err)
 		}

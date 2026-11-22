@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -14,216 +13,68 @@ import (
 	"github.com/mem9-ai/drive9/pkg/client"
 )
 
-func TestUploadReaderToLayerUsesServerInlineThreshold(t *testing.T) {
-	var statusCalls, entryCalls, initiateCalls int
+func TestLayerControlCLI_V36(t *testing.T) {
+	const layerID = "layer_01j8z6kh2m9q7w3r5t6y8v0p1a"
+	const childID = "layer_01j8z6kh2m9q7w3r5t6y8v0p1b"
+
+	var gotCreate client.LayerCreateRequest
+	var gotFork client.LayerForkRequest
+	var gotForce string
+
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method + " " + r.URL.Path {
-		case "GET /v1/status":
-			statusCalls++
-			_, _ = io.WriteString(w, `{"inline_threshold":4}`)
-		case "HEAD /v1/fs/repo/a.bin":
-			http.NotFound(w, r)
-		case "POST /v1/layers/layer-1/entries":
-			entryCalls++
-			var req client.FSLayerEntryRequest
-			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				t.Errorf("decode layer entry: %v", err)
-			}
-			if string(req.Content) != "data" {
-				t.Errorf("inline content = %q, want data", req.Content)
-			}
-			_ = json.NewEncoder(w).Encode(client.FSLayerEntry{Path: req.Path})
-		case "POST /v1/layers/layer-1/uploads/initiate":
-			initiateCalls++
-			http.Error(w, "unexpected direct upload", http.StatusInternalServerError)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer srv.Close()
-
-	c := client.New(srv.URL, "")
-	c.Warm(context.Background())
-	err := uploadReaderToLayer(context.Background(), c, "layer-1", "/repo/a.bin", strings.NewReader("data"), 4, 0o644, true)
-	if err != nil {
-		t.Fatalf("uploadReaderToLayer: %v", err)
-	}
-	if statusCalls != 1 || entryCalls != 1 || initiateCalls != 0 {
-		t.Fatalf("statusCalls=%d entryCalls=%d initiateCalls=%d, want 1, 1, 0", statusCalls, entryCalls, initiateCalls)
-	}
-}
-
-func TestUploadReaderToLayerUsesDirectUploadAboveServerThreshold(t *testing.T) {
-	var uploaded string
-	s3 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		data, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Errorf("read S3 body: %v", err)
-		}
-		uploaded = string(data)
-		w.Header().Set("ETag", `"etag-1"`)
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer s3.Close()
-
-	var entryCalls, initiateCalls int
-	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method + " " + r.URL.Path {
-		case "GET /v1/status":
-			_, _ = io.WriteString(w, `{"inline_threshold":3}`)
-		case "HEAD /v1/fs/repo/a.bin":
-			http.NotFound(w, r)
-		case "POST /v1/layers/layer-1/entries":
-			entryCalls++
-			http.Error(w, "unexpected inline upload", http.StatusInternalServerError)
-		case "POST /v1/layers/layer-1/uploads/initiate":
-			initiateCalls++
-			w.WriteHeader(http.StatusAccepted)
-			_, _ = io.WriteString(w, `{"upload_id":"upload-1","part_size":4,"total_parts":1}`)
-		case "POST /v1/layers/layer-1/uploads/upload-1/presign-batch":
-			_ = json.NewEncoder(w).Encode(map[string]any{"parts": []map[string]any{{
-				"number": 1,
-				"url":    s3.URL,
-				"size":   4,
-			}}})
-		case "POST /v1/layers/layer-1/uploads/upload-1/complete":
-			_ = json.NewEncoder(w).Encode(client.FSLayerEntry{Path: "/repo/a.bin", StorageType: "s3"})
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer api.Close()
-
-	c := client.New(api.URL, "")
-	c.Warm(context.Background())
-	err := uploadReaderToLayer(context.Background(), c, "layer-1", "/repo/a.bin", strings.NewReader("data"), 4, 0o644, true)
-	if err != nil {
-		t.Fatalf("uploadReaderToLayer: %v", err)
-	}
-	if uploaded != "data" || initiateCalls != 1 || entryCalls != 0 {
-		t.Fatalf("uploaded=%q initiateCalls=%d entryCalls=%d, want data, 1, 0", uploaded, initiateCalls, entryCalls)
-	}
-}
-
-func TestUploadReaderToLayerDoesNotFetchStatusOnHotPath(t *testing.T) {
-	var statusCalls, entryCalls int
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method + " " + r.URL.Path {
-		case "GET /v1/status":
-			statusCalls++
-			_, _ = io.WriteString(w, `{"inline_threshold":1}`)
-		case "HEAD /v1/fs/repo/a.bin":
-			http.NotFound(w, r)
-		case "POST /v1/layers/layer-1/entries":
-			entryCalls++
-			_ = json.NewEncoder(w).Encode(client.FSLayerEntry{Path: "/repo/a.bin"})
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer srv.Close()
-
-	c := client.New(srv.URL, "")
-	if err := uploadReaderToLayer(context.Background(), c, "layer-1", "/repo/a.bin", strings.NewReader("data"), 4, 0, false); err != nil {
-		t.Fatalf("uploadReaderToLayer: %v", err)
-	}
-	if statusCalls != 0 || entryCalls != 1 {
-		t.Fatalf("statusCalls=%d entryCalls=%d, want 0 and 1", statusCalls, entryCalls)
-	}
-}
-
-func TestUploadReaderToLayerCapsInlineEntrySize(t *testing.T) {
-	const size = int64(100 << 20)
-	var entryCalls, initiateCalls int
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method + " " + r.URL.Path {
-		case "HEAD /v1/fs/repo/large.bin":
-			http.NotFound(w, r)
-		case "POST /v1/layers/layer-1/entries":
-			entryCalls++
-			http.Error(w, "unexpected inline upload", http.StatusInternalServerError)
-		case "POST /v1/layers/layer-1/uploads/initiate":
-			initiateCalls++
-			http.Error(w, "direct upload selected", http.StatusInternalServerError)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer srv.Close()
-
-	c := client.New(srv.URL, "")
-	c.SetSmallFileThresholdForTests(128 << 20)
-	err := uploadReaderToLayer(context.Background(), c, "layer-1", "/repo/large.bin", strings.NewReader("not consumed"), size, 0, false)
-	if err == nil || !strings.Contains(err.Error(), "direct upload selected") {
-		t.Fatalf("uploadReaderToLayer error = %v, want direct upload marker", err)
-	}
-	if entryCalls != 0 || initiateCalls != 1 {
-		t.Fatalf("entryCalls=%d initiateCalls=%d, want 0 and 1", entryCalls, initiateCalls)
-	}
-}
-
-func TestLayerCreatePrintsLayerID(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/v1/layers" {
-			http.NotFound(w, r)
-			return
-		}
-		var req client.FSLayerCreateRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			t.Fatalf("decode request: %v", err)
-		}
-		if req.BaseRootPath != "/repo" || req.Name != "task" || req.DurabilityMode != "restore-safe" {
-			t.Fatalf("request = %+v", req)
-		}
-		if req.Tags["task"] != "auth" || req.Tags["env"] != "dev" {
-			t.Fatalf("request tags = %+v", req.Tags)
-		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(client.FSLayer{
-			LayerID:        "layer-1",
-			BaseRootPath:   "/repo/",
-			Name:           "task",
-			Tags:           map[string]string{"task": "auth", "env": "dev"},
-			State:          "active",
-			DurabilityMode: "restore-safe",
-		})
-	}))
-	defer srv.Close()
-
-	c := client.New(srv.URL, "")
-	out, err := captureStdoutE(t, func() error {
-		return Layer(c, []string{"create", "--name", "task", "--durability", "restore-safe", "--tag", "task=auth", "--tag", "env=dev", ":/repo"})
-	})
-	if err != nil {
-		t.Fatalf("Layer create: %v", err)
-	}
-	if strings.TrimSpace(out) != "layer-1" {
-		t.Fatalf("stdout = %q, want layer-1", out)
-	}
-}
-
-func TestCpLayerLocalUploadUsesFSLayerEntry(t *testing.T) {
-	localPath := filepath.Join(t.TempDir(), "layer.txt")
-	if err := os.WriteFile(localPath, []byte("layer upload"), 0o640); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
-	var got client.FSLayerEntryRequest
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method + " " + r.URL.Path {
-		case "HEAD /v1/fs/repo/layer.txt":
-			http.NotFound(w, r)
-		case "POST /v1/layers/layer-1/entries":
-			if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
-				t.Fatalf("decode entry request: %v", err)
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/layers":
+			if err := json.NewDecoder(r.Body).Decode(&gotCreate); err != nil {
+				t.Fatalf("decode create: %v", err)
 			}
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(client.FSLayerEntry{
-				LayerID:   "layer-1",
-				Path:      got.Path,
-				Op:        got.Op,
-				Kind:      got.Kind,
-				SizeBytes: got.SizeBytes,
-				Mode:      got.Mode,
+			_ = json.NewEncoder(w).Encode(client.LayerInfo{
+				LayerID:      layerID,
+				BaseRootPath: gotCreate.BaseRootPath,
+				Name:         gotCreate.Name,
+				Tags:         gotCreate.Tags,
+				State:        "active",
+				SnapGen:      4,
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers":
+			_ = json.NewEncoder(w).Encode(client.LayerListPage{
+				Layers: []client.LayerInfo{{
+					LayerID:      layerID,
+					BaseRootPath: "/repo",
+					Name:         "auth",
+					State:        "active",
+					Fence:        0,
+					Tags:         map[string]string{"task": "auth"},
+				}},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/tag:task=auth":
+			_ = json.NewEncoder(w).Encode(client.LayerInfo{
+				LayerID:      layerID,
+				BaseRootPath: "/repo",
+				Name:         "auth",
+				State:        "active",
+				SnapGen:      4,
+				Fence:        3,
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/layers/"+layerID+"/fork":
+			_ = json.NewDecoder(r.Body).Decode(&gotFork)
+			_ = json.NewEncoder(w).Encode(client.LayerInfo{
+				LayerID:       childID,
+				ParentLayerID: layerID,
+				BaseRootPath:  "/repo",
+				State:         "active",
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/layers/"+layerID+"/merge":
+			_ = json.NewEncoder(w).Encode(client.LayerMergeResult{
+				LayerID:      layerID,
+				Status:       "merged",
+				AppliedPaths: 5,
+			})
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/layers/"+childID:
+			gotForce = r.URL.Query().Get("force")
+			_ = json.NewEncoder(w).Encode(client.LayerDeleteResult{
+				LayerID: childID,
+				Status:  "deleted",
 			})
 		default:
 			http.NotFound(w, r)
@@ -231,103 +82,87 @@ func TestCpLayerLocalUploadUsesFSLayerEntry(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := client.New(srv.URL, "")
-	if err := Cp(c, []string{"--layer", "layer-1", localPath, ":/repo/layer.txt"}); err != nil {
-		t.Fatalf("Cp --layer: %v", err)
+	c := client.New(srv.URL, "sk-test")
+
+	out, err := captureStdoutE(t, func() error {
+		return Layer(c, []string{"create", "--name", "auth", "--ttl", "1h", "--tag", "task=auth", ":/repo"})
+	})
+	if err != nil {
+		t.Fatalf("Layer create: %v", err)
 	}
-	if got.Path != "/repo/layer.txt" || got.Op != "upsert" || got.Kind != "file" || string(got.Content) != "layer upload" || got.Mode != 0o640 {
-		t.Fatalf("entry request = %+v", got)
+	if strings.TrimSpace(out) != layerID || gotCreate.BaseRootPath != "/repo" || gotCreate.TTLSeconds != 3600 {
+		t.Fatalf("create out=%q req=%+v", out, gotCreate)
+	}
+
+	out, err = captureStdoutE(t, func() error { return Layer(c, []string{"ls"}) })
+	if err != nil || !strings.Contains(out, layerID) {
+		t.Fatalf("Layer ls: out=%q err=%v", out, err)
+	}
+
+	out, err = captureStdoutE(t, func() error { return Layer(c, []string{"inspect", "tag:task=auth"}) })
+	if err != nil || !strings.Contains(out, "snap_gen") || !strings.Contains(out, "fence") || !strings.Contains(out, "/repo") {
+		t.Fatalf("Layer inspect: out=%q err=%v", out, err)
+	}
+
+	out, err = captureStdoutE(t, func() error {
+		return Layer(c, []string{"fork", "--name", "child", "--ttl", "300", layerID})
+	})
+	if err != nil || strings.TrimSpace(out) != childID || gotFork.TTLSeconds != 300 {
+		t.Fatalf("Layer fork: out=%q req=%+v err=%v", out, gotFork, err)
+	}
+
+	out, err = captureStdoutE(t, func() error { return Layer(c, []string{"merge", layerID}) })
+	if err != nil || !strings.Contains(out, "merged layer="+layerID+" applied_paths=5") {
+		t.Fatalf("Layer merge: out=%q err=%v", out, err)
+	}
+
+	out, err = captureStdoutE(t, func() error { return Layer(c, []string{"rm", "--force", childID}) })
+	if err != nil || gotForce != "true" || !strings.Contains(out, "deleted layer="+childID) {
+		t.Fatalf("Layer rm: out=%q force=%q err=%v", out, gotForce, err)
+	}
+
+	if _, err := parseLayerTags([]string{"task=1", "task=2"}); err == nil || !strings.Contains(err.Error(), `duplicate layer tag "task"`) {
+		t.Fatalf("duplicate tag error = %v", err)
 	}
 }
 
-func TestSearchCommandsPassLayerParam(t *testing.T) {
-	var grepLayer, findLayer string
+func TestFSDataCommandsRouteThroughUnifiedLayerView_V36(t *testing.T) {
+	const layerID = "layer_01j8z6kh2m9q7w3r5t6y8v0p1a"
+	localPath := filepath.Join(t.TempDir(), "layer.txt")
+	if err := os.WriteFile(localPath, []byte("layer upload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var gotPutBody []byte
+	var gotFence string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs/repo/" && r.URL.Query().Has("grep"):
-			grepLayer = r.URL.Query().Get("layer")
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = io.WriteString(w, `[]`)
-		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs/repo/" && r.URL.Query().Has("find"):
-			findLayer = r.URL.Query().Get("layer")
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = io.WriteString(w, `[]`)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/status":
+			_ = json.NewEncoder(w).Encode(map[string]any{"inline_threshold": 50000})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/auth":
+			_ = json.NewEncoder(w).Encode(client.LayerInfo{LayerID: layerID, BaseRootPath: "/repo", State: "active"})
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/views/"+layerID+"/v1/fs/repo/layer.txt":
+			http.NotFound(w, r)
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/views/"+layerID+"/v1/fs/repo/layer.txt":
+			gotFence = r.Header.Get("X-FS-Layer-Fence")
+			gotPutBody, _ = io.ReadAll(r.Body)
+			_, _ = w.Write([]byte(`{"status":"ok","revision":1}`))
 		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
 			http.NotFound(w, r)
 		}
 	}))
 	defer srv.Close()
 
-	c := client.New(srv.URL, "")
-	if err := Grep(c, []string{"--layer", "task=search", "needle", ":/repo/"}); err != nil {
-		t.Fatalf("Grep --layer: %v", err)
+	c := client.New(srv.URL, "sk-test")
+	c.Warm(t.Context())
+	if err := Cp(c, []string{"--layer", "auth", "--fence", "3", localPath, ":/repo/layer.txt"}); err != nil {
+		t.Fatalf("Cp --layer --fence: %v", err)
 	}
-	if err := Find(c, []string{"--layer", "task=search", ":/repo/"}); err != nil {
-		t.Fatalf("Find --layer: %v", err)
+	if string(gotPutBody) != "layer upload" || gotFence != "3" {
+		t.Fatalf("put body=%q fence=%q", gotPutBody, gotFence)
 	}
-	if grepLayer != "task=search" || findLayer != "task=search" {
-		t.Fatalf("grepLayer=%q findLayer=%q, want task=search", grepLayer, findLayer)
-	}
-}
-
-func TestLayerCreateRejectsDuplicateTag(t *testing.T) {
-	c := client.New("http://127.0.0.1", "")
-	err := Layer(c, []string{"create", "--tag", "task=auth", "--tag", "task=review", ":/repo"})
-	if err == nil || !strings.Contains(err.Error(), `duplicate layer tag "task"`) {
-		t.Fatalf("Layer create duplicate tag err=%v, want duplicate tag error", err)
-	}
-}
-
-func TestLayerCommitPrintsResult(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/v1/layers/task=auth/commit" {
-			http.NotFound(w, r)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(client.FSLayerCommit{
-			Status:  "committed",
-			LayerID: "layer-1",
-			Applied: 3,
-		})
-	}))
-	defer srv.Close()
-
-	c := client.New(srv.URL, "")
-	out, err := captureStdoutE(t, func() error { return Layer(c, []string{"commit", "task=auth"}) })
-	if err != nil {
-		t.Fatalf("Layer commit: %v", err)
-	}
-	if !strings.Contains(out, "committed") || !strings.Contains(out, "layer=layer-1") || !strings.Contains(out, "applied=3") {
-		t.Fatalf("stdout = %q, want commit result", out)
-	}
-}
-
-func TestLayerDiffTextOutput(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || r.URL.Path != "/v1/layers/layer-1/diff" {
-			http.NotFound(w, r)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"entries": []client.FSLayerEntry{{
-				EntrySeq: 1,
-				Op:       "upsert",
-				Kind:     "file",
-				Mode:     0o644,
-				Path:     "/repo/a.txt",
-			}},
-		})
-	}))
-	defer srv.Close()
-
-	c := client.New(srv.URL, "")
-	out, err := captureStdoutE(t, func() error { return Layer(c, []string{"diff", "layer-1"}) })
-	if err != nil {
-		t.Fatalf("Layer diff: %v", err)
-	}
-	if !strings.Contains(out, "1") || !strings.Contains(out, "upsert") || !strings.Contains(out, "/repo/a.txt") {
-		t.Fatalf("stdout = %q, want diff entry", out)
+	if err := Find(c, []string{"--layer", layerID, ":/repo/"}); err == nil || !strings.Contains(err.Error(), "unsupported in layer view") {
+		t.Fatalf("Find --layer err = %v, want unsupported in layer view", err)
 	}
 }

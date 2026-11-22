@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/viewprotocol"
 )
 
 func Find(c *client.Client, args []string) error {
@@ -76,6 +77,9 @@ func Find(c *client.Client, args []string) error {
 		}
 	}
 
+	if layerRef != "" || (c != nil && c.ViewBinding().LayerID != "") {
+		return fmt.Errorf("find: %w (--layer is not supported on search endpoints)", viewprotocol.ErrUnsupportedInLayerView)
+	}
 	h, err := fsHandleForArg(c, path)
 	if err != nil {
 		return err
@@ -84,9 +88,6 @@ func Find(c *client.Client, args []string) error {
 		return err
 	}
 	c, path = h.Client, h.Path
-	if layerRef != "" {
-		params.Set("layer", layerRef)
-	}
 
 	results, err := c.Find(path, params)
 	if err != nil {

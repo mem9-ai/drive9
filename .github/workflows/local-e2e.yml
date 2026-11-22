@@ -339,6 +339,7 @@ jobs:
         env:
           RUN_LAYER_FUSE_SMOKE: "1"
           LAYER_FUSE_STRICT_PREREQS: "1"
+          DRIVE9_EXPECT_EMBEDDED_LAYER_501: ${{ env.DRIVE9_E2E_ALLOW_LEGACY_TOKEN_API }}
         run: bash e2e/layer-fs-smoke-test.sh
 
       - name: Test READDIRPLUS, rename, unlink and SSE disconnects through Linux FUSE

@@ -1,6 +1,7 @@
 import type { Client } from "./client.js";
 import { StatusError } from "./error.js";
 import type { ChangeEvent, EventHandler, EventLifecycle, HeartbeatEvent, ResetEvent, WatchEventsOptions } from "./models.js";
+import { UnsupportedInLayerViewError, clientFetch, hasActiveLayerView } from "./view.js";
 
 const DEFAULT_INITIAL_BACKOFF_MS = 1000;
 const DEFAULT_MAX_BACKOFF_MS = 30000;
@@ -36,6 +37,9 @@ export async function watchEventsWithLifecycle(
   lifecycle: EventLifecycle = {},
   options: WatchEventsOptions = {}
 ): Promise<void> {
+  if (hasActiveLayerView(client)) {
+    throw new UnsupportedInLayerViewError("watchEvents is unsupported in layer view");
+  }
   let lastSeq = options.initialSince || 0;
   let backoff = options.initialBackoffMs || DEFAULT_INITIAL_BACKOFF_MS;
   const maxBackoff = options.maxBackoffMs || DEFAULT_MAX_BACKOFF_MS;
@@ -77,7 +81,7 @@ async function streamEvents(
   signal: AbortSignal | undefined,
   dispatch: (eventType: string, data: string) => Promise<void>
 ): Promise<void> {
-  const resp = await fetch(`${client.baseUrl}/v1/events?since=${encodeURIComponent(String(since))}`, {
+  const resp = await clientFetch(client, `${client.baseUrl}/v1/events?since=${encodeURIComponent(String(since))}`, {
     headers: client.authHeaders({
       Accept: "text/event-stream",
       ...(actor ? { "X-Dat9-Actor": actor } : {}),

@@ -10,22 +10,16 @@ import {
   writeExtentBytesImpl,
 } from "./extent.js";
 import {
-  commitFSLayer,
-  createFSLayer,
-  checkpointFSLayer,
-  deleteFSLayer,
-  diffFSLayer,
-  forkFSLayer,
-  getFSLayer,
-  getFSLayerCheckpoint,
-  getFSLayerEntry,
-  listFSLayerEvents,
-  listFSLayers,
-  readFSLayerFile,
-  readFSLayerFileStream,
-  rollbackFSLayer,
-  uploadFSLayerFile,
-  upsertFSLayerEntry,
+  bindLayerMount,
+  createLayer,
+  deleteLayer,
+  forkLayer,
+  getLayer,
+  listAllLayers,
+  listLayers,
+  mergeLayer,
+  renewLayerMount,
+  unbindLayerMount,
 } from "./layer.js";
 import {
   deleteGitWorkspace,
@@ -51,24 +45,22 @@ import {
   searchJournal,
   verifyJournal,
 } from "./journal.js";
-import { MaxBatchReadSmallPaths, MaxBatchStatPaths } from "./models.js";
+import {
+  MaxBatchReadSmallPaths,
+  MaxBatchStatPaths,
+  MaxBatchWriteBytes,
+  MaxBatchWriteItems,
+  MaxLayerViewBatchWriteItems,
+} from "./models.js";
 import type {
   BatchReadSmallResult,
   BatchStatResult,
+  BatchWriteItem,
+  BatchWriteResult,
   ContentLayout,
   EventHandler,
   EventLifecycle,
   FileInfo,
-  FSLayer,
-  FSLayerCheckpoint,
-  FSLayerCheckpointRequest,
-  FSLayerCommit,
-  FSLayerCreateRequest,
-  FSLayerDeleteOptions,
-  FSLayerEntry,
-  FSLayerEntryRequest,
-  FSLayerEvent,
-  FSLayerForkRequest,
   GitObjectPack,
   GitObjectPackRequest,
   GitOverlayEntry,
@@ -89,6 +81,19 @@ import type {
   JournalSearchMatch,
   JournalSearchRequest,
   JournalVerifyResult,
+  LayerCreateRequest,
+  LayerDeleteOptions,
+  LayerDeleteResult,
+  LayerForkRequest,
+  LayerInfo,
+  LayerListOptions,
+  LayerListPage,
+  LayerMergeResult,
+  LayerMountBindRequest,
+  LayerMountLease,
+  LayerMountRenewRequest,
+  LayerMountUnbindRequest,
+  LayerMountUnbindResult,
   SearchResult,
   StatMetadataResult,
   StatResult,
@@ -98,6 +103,7 @@ import type {
   VaultGrantIssueRequest,
   VaultGrantIssueResponse,
   VaultGrantRevokeRequest,
+  ViewBinding,
   WatchEventsOptions,
   WriteOptions,
 } from "./models.js";
@@ -112,6 +118,13 @@ import {
   writeStreamWithSummaryImpl,
 } from "./transfer.js";
 import { Semaphore } from "./utils.js";
+import {
+  clientFetch,
+  getClientViewBinding,
+  hasActiveLayerView,
+  setClientViewBinding,
+  validateViewBinding,
+} from "./view.js";
 import {
   createVaultSecret,
   deleteVaultSecret,
@@ -279,6 +292,21 @@ export class Client {
     this.actor = actor;
   }
 
+  viewBinding(): { layerId: string; fence: number } {
+    const b = getClientViewBinding(this);
+    return { layerId: b.layerId, fence: b.fence };
+  }
+
+  withView(binding: ViewBinding): Client {
+    const validated = validateViewBinding(binding, this.baseUrl);
+    const cp = new Client(this.baseUrl, this.apiKey ?? "");
+    cp.smallFileThreshold = this.smallFileThreshold;
+    cp.actor = this.actor;
+    cp.statusCache = this.statusCache;
+    setClientViewBinding(cp, validated);
+    return cp;
+  }
+
   baseURL(): string {
     return this.baseUrl;
   }
@@ -315,7 +343,7 @@ export class Client {
 
   async status(): Promise<TenantStatus> {
     if (this.statusCache) return this.statusCache;
-    const resp = await fetch(`${this.baseUrl}/v1/status`, { headers: this.authHeaders() });
+    const resp = await clientFetch(this, `${this.baseUrl}/v1/status`, { headers: this.authHeaders() });
     await checkError(resp);
     this.statusCache = (await resp.json()) as TenantStatus;
     if (typeof this.statusCache.inline_threshold === "number" && this.statusCache.inline_threshold > 0) {
@@ -341,7 +369,7 @@ export class Client {
   async rawPost(endpoint: string, body?: unknown): Promise<Response> {
     const payload = rawPayload(body);
     const headers = this.authHeaders(payload.contentType ? { "Content-Type": payload.contentType } : undefined);
-    const resp = await fetch(`${this.baseUrl}${endpoint}`, { method: "POST", headers, body: payload.body });
+    const resp = await clientFetch(this, `${this.baseUrl}${endpoint}`, { method: "POST", headers, body: payload.body });
     await checkError(resp);
     return resp;
   }
@@ -349,7 +377,7 @@ export class Client {
   async rawDelete(endpoint: string, body?: unknown): Promise<Response> {
     const payload = rawPayload(body);
     const headers = this.authHeaders(payload.contentType ? { "Content-Type": payload.contentType } : undefined);
-    const resp = await fetch(`${this.baseUrl}${endpoint}`, { method: "DELETE", headers, body: payload.body });
+    const resp = await clientFetch(this, `${this.baseUrl}${endpoint}`, { method: "DELETE", headers, body: payload.body });
     await checkError(resp);
     return resp;
   }
@@ -393,14 +421,14 @@ export class Client {
   }
 
   async createFile(path: string): Promise<number> {
-    const resp = await fetch(`${this.fsUrl(path)}?create=1`, { method: "POST", headers: this.authHeaders() });
+    const resp = await clientFetch(this, `${this.fsUrl(path)}?create=1`, { method: "POST", headers: this.authHeaders() });
     await checkError(resp);
     const body = (await resp.json().catch(() => undefined)) as { revision?: number } | undefined;
     return body?.revision || 0;
   }
 
   async symlink(target: string, linkPath: string): Promise<void> {
-    const resp = await fetch(`${this.fsUrl(linkPath)}?symlink=1`, {
+    const resp = await clientFetch(this, `${this.fsUrl(linkPath)}?symlink=1`, {
       method: "POST",
       headers: this.authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ target }),
@@ -409,7 +437,7 @@ export class Client {
   }
 
   async hardlink(srcPath: string, dstPath: string): Promise<void> {
-    const resp = await fetch(`${this.fsUrl(dstPath)}?hardlink=1`, {
+    const resp = await clientFetch(this, `${this.fsUrl(dstPath)}?hardlink=1`, {
       method: "POST",
       headers: this.#sourcePathHeaders("X-Dat9-Hardlink-Source", srcPath),
     });
@@ -433,19 +461,30 @@ export class Client {
   }
 
   async list(path: string): Promise<FileInfo[]> {
-    const resp = await fetch(`${this.fsUrl(path)}?list=1`, { headers: this.authHeaders() });
-    await checkError(resp);
-    const body = (await resp.json()) as {
-      entries?: Array<{ name: string; size: number; isDir: boolean; mtime?: number; mode?: number; hasMode?: boolean }>;
-    };
-    return (body.entries || []).map((e) => ({
-      name: e.name,
-      size: e.size,
-      isDir: e.isDir,
-      mtime: e.mtime != null ? new Date(e.mtime * 1000) : undefined,
-      mode: e.mode,
-      hasMode: e.hasMode,
-    }));
+    const out: FileInfo[] = [];
+    let cursor = "";
+    while (true) {
+      const suffix = cursor ? `?list=1&cursor=${encodeURIComponent(cursor)}` : "?list=1";
+      const resp = await clientFetch(this, `${this.fsUrl(path)}${suffix}`, { headers: this.authHeaders() });
+      await checkError(resp);
+      const body = (await resp.json()) as {
+        entries?: Array<{ name: string; size: number; isDir: boolean; mtime?: number; mode?: number; hasMode?: boolean }>;
+        next_cursor?: string;
+      };
+      for (const e of body.entries || []) {
+        out.push({
+          name: e.name,
+          size: e.size,
+          isDir: e.isDir,
+          mtime: e.mtime != null ? new Date(e.mtime * 1000) : undefined,
+          mode: e.mode,
+          hasMode: e.hasMode,
+        });
+      }
+      if (!body.next_cursor) break;
+      cursor = body.next_cursor;
+    }
+    return out;
   }
 
   async batchStat(paths: string[]): Promise<BatchStatResult[]> {
@@ -453,7 +492,7 @@ export class Client {
     if (paths.length > MaxBatchStatPaths) {
       throw new Drive9Error(`batch stat: ${paths.length} paths exceeds limit of ${MaxBatchStatPaths}`);
     }
-    const resp = await fetch(`${this.baseUrl}/v1/fs:batch-stat`, {
+    const resp = await clientFetch(this, `${this.baseUrl}/v1/fs:batch-stat`, {
       method: "POST",
       headers: this.authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ paths }),
@@ -472,7 +511,7 @@ export class Client {
     if (paths.length > MaxBatchReadSmallPaths) {
       throw new Drive9Error(`batch read-small: ${paths.length} paths exceeds limit of ${MaxBatchReadSmallPaths}`);
     }
-    const resp = await fetch(`${this.baseUrl}/v1/fs:batch-read-small`, {
+    const resp = await clientFetch(this, `${this.baseUrl}/v1/fs:batch-read-small`, {
       method: "POST",
       headers: this.authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ paths, max_bytes: maxBytes }),
@@ -491,8 +530,47 @@ export class Client {
     });
   }
 
+  async batchWrite(items: BatchWriteItem[]): Promise<BatchWriteResult[]> {
+    if (items.length === 0) return [];
+    const maxItems = hasActiveLayerView(this) ? MaxLayerViewBatchWriteItems : MaxBatchWriteItems;
+    if (items.length > maxItems) {
+      throw new Drive9Error(`batch write: ${items.length} items exceeds limit of ${maxItems}`);
+    }
+    let totalBytes = 0;
+    const wireItems = items.map((item) => {
+      totalBytes += item.data.byteLength;
+      if (totalBytes > MaxBatchWriteBytes) {
+        throw new Drive9Error(`batch write: ${totalBytes} bytes exceeds limit of ${MaxBatchWriteBytes}`);
+      }
+      return {
+        path: item.path,
+        data: Buffer.from(item.data).toString("base64"),
+        expected_revision: item.expectedRevision ?? -1,
+        ...(item.mode != null ? { mode: item.mode } : {}),
+        ...(item.tags ? { tags: item.tags } : {}),
+      };
+    });
+    const resp = await clientFetch(this, `${this.baseUrl}/v1/fs:batch-write`, {
+      method: "POST",
+      headers: this.authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ items: wireItems }),
+    });
+    await checkError(resp);
+    const body = (await resp.json()) as { results?: BatchWriteResult[] };
+    const results = body.results || [];
+    if (results.length !== items.length) {
+      throw new Drive9Error(`batch write: got ${results.length} results for ${items.length} items`);
+    }
+    for (let i = 0; i < results.length; i++) {
+      if (results[i].path !== items[i].path) {
+        throw new Drive9Error(`batch write: result[${i}] path = ${results[i].path}, want ${items[i].path}`);
+      }
+    }
+    return results;
+  }
+
   async stat(path: string): Promise<StatResult> {
-    const resp = await fetch(this.fsUrl(path), { method: "HEAD", headers: this.authHeaders() });
+    const resp = await clientFetch(this, this.fsUrl(path), { method: "HEAD", headers: this.authHeaders() });
     if (resp.status === 404) {
       throw new Drive9Error(`not found: ${path}`);
     }
@@ -521,7 +599,7 @@ export class Client {
   }
 
   async statMetadata(path: string): Promise<StatMetadataResult> {
-    const resp = await fetch(`${this.fsUrl(path)}?stat=1`, { headers: this.authHeaders() });
+    const resp = await clientFetch(this, `${this.fsUrl(path)}?stat=1`, { headers: this.authHeaders() });
     await checkError(resp);
     const contentType = resp.headers.get("content-type") || "";
     if (!contentType.toLowerCase().startsWith("application/json")) {
@@ -582,17 +660,17 @@ export class Client {
   }
 
   async delete(path: string): Promise<void> {
-    const resp = await fetch(this.fsUrl(path), { method: "DELETE", headers: this.authHeaders() });
+    const resp = await clientFetch(this, this.fsUrl(path), { method: "DELETE", headers: this.authHeaders() });
     await checkError(resp);
   }
 
   async deleteFile(path: string): Promise<void> {
-    const resp = await fetch(`${this.fsUrl(path)}?kind=file`, { method: "DELETE", headers: this.authHeaders() });
+    const resp = await clientFetch(this, `${this.fsUrl(path)}?kind=file`, { method: "DELETE", headers: this.authHeaders() });
     await checkError(resp);
   }
 
   async deleteDir(path: string): Promise<void> {
-    const resp = await fetch(`${this.fsUrl(path)}?kind=dir`, { method: "DELETE", headers: this.authHeaders() });
+    const resp = await clientFetch(this, `${this.fsUrl(path)}?kind=dir`, { method: "DELETE", headers: this.authHeaders() });
     await checkError(resp);
   }
 
@@ -600,7 +678,7 @@ export class Client {
     const url = `${this.fsUrl(path)}?recursive=1`;
     let backoff = 1000;
     for (let attempt = 0; ; attempt++) {
-      const resp = await fetch(url, { method: "DELETE", headers: this.authHeaders() });
+      const resp = await clientFetch(this, url, { method: "DELETE", headers: this.authHeaders() });
       if (resp.status === 503 && attempt < REMOVE_ALL_MAX_RETRIES) {
         const retryAfter = (resp.headers.get("retry-after") || "").trim();
         // Consume and discard the body before retrying.
@@ -616,13 +694,13 @@ export class Client {
 
   async copy(srcPath: string, dstPath: string): Promise<void> {
     const headers = this.#sourcePathHeaders("X-Dat9-Copy-Source", srcPath);
-    const resp = await fetch(`${this.fsUrl(dstPath)}?copy`, { method: "POST", headers });
+    const resp = await clientFetch(this, `${this.fsUrl(dstPath)}?copy`, { method: "POST", headers });
     await checkError(resp);
   }
 
   async rename(oldPath: string, newPath: string): Promise<void> {
     const headers = this.#sourcePathHeaders("X-Dat9-Rename-Source", oldPath);
-    const resp = await fetch(`${this.fsUrl(newPath)}?rename`, { method: "POST", headers });
+    const resp = await clientFetch(this, `${this.fsUrl(newPath)}?rename`, { method: "POST", headers });
     await checkError(resp);
   }
 
@@ -637,12 +715,12 @@ export class Client {
 
   async mkdir(path: string, mode = 0o755): Promise<void> {
     const suffix = mode === 0o755 ? "?mkdir" : `?mkdir&mode=${encodeURIComponent(String(mode))}`;
-    const resp = await fetch(`${this.fsUrl(path)}${suffix}`, { method: "POST", headers: this.authHeaders() });
+    const resp = await clientFetch(this, `${this.fsUrl(path)}${suffix}`, { method: "POST", headers: this.authHeaders() });
     await checkError(resp);
   }
 
   async chmod(path: string, mode: number): Promise<void> {
-    const resp = await fetch(`${this.fsUrl(path)}?chmod`, {
+    const resp = await clientFetch(this, `${this.fsUrl(path)}?chmod`, {
       method: "POST",
       headers: this.authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ mode }),
@@ -651,7 +729,7 @@ export class Client {
   }
 
   async sql(query: string): Promise<unknown[]> {
-    const resp = await fetch(`${this.baseUrl}/v1/sql`, {
+    const resp = await clientFetch(this, `${this.baseUrl}/v1/sql`, {
       method: "POST",
       headers: this.authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ query }),
@@ -661,21 +739,16 @@ export class Client {
   }
 
   async grep(query: string, pathPrefix: string, limit = 0): Promise<SearchResult[]> {
-    return this.grepWithLayer(query, pathPrefix, limit, "");
-  }
-
-  async grepWithLayer(query: string, pathPrefix: string, limit = 0, layerRef = ""): Promise<SearchResult[]> {
     let url = `${this.fsUrl(pathPrefix)}?grep=${encodeURIComponent(query)}`;
     if (limit > 0) url += `&limit=${limit}`;
-    if (layerRef.trim()) url += `&layer=${encodeURIComponent(layerRef.trim())}`;
-    const resp = await fetch(url, { headers: this.authHeaders() });
+    const resp = await clientFetch(this, url, { headers: this.authHeaders() });
     await checkError(resp);
     return (await resp.json()) as SearchResult[];
   }
 
   async find(pathPrefix: string, params: Record<string, string> = {}): Promise<SearchResult[]> {
     const qs = new URLSearchParams({ find: "", ...params });
-    const resp = await fetch(`${this.fsUrl(pathPrefix)}?${qs.toString()}`, { headers: this.authHeaders() });
+    const resp = await clientFetch(this, `${this.fsUrl(pathPrefix)}?${qs.toString()}`, { headers: this.authHeaders() });
     await checkError(resp);
     return (await resp.json()) as SearchResult[];
   }
@@ -971,72 +1044,44 @@ export class Client {
     return watchEventsWithLifecycle(this, actor, handler, lifecycle, options);
   }
 
-  async createFSLayer(req: FSLayerCreateRequest): Promise<FSLayer> {
-    return createFSLayer(this, req);
+  async createLayer(req: LayerCreateRequest = {}): Promise<LayerInfo> {
+    return createLayer(this, req);
   }
 
-  async listFSLayers(): Promise<FSLayer[]> {
-    return listFSLayers(this);
+  async listLayers(options?: LayerListOptions): Promise<LayerListPage> {
+    return listLayers(this, options);
   }
 
-  async getFSLayer(layerId: string): Promise<FSLayer> {
-    return getFSLayer(this, layerId);
+  async listAllLayers(): Promise<LayerInfo[]> {
+    return listAllLayers(this);
   }
 
-  async forkFSLayer(parentRef: string, req: FSLayerForkRequest = {}): Promise<FSLayer> {
-    return forkFSLayer(this, parentRef, req);
+  async getLayer(ref: string): Promise<LayerInfo> {
+    return getLayer(this, ref);
   }
 
-  async deleteFSLayer(layerId: string, options: FSLayerDeleteOptions = {}): Promise<void> {
-    return deleteFSLayer(this, layerId, options);
+  async forkLayer(ref: string, req: LayerForkRequest = {}): Promise<LayerInfo> {
+    return forkLayer(this, ref, req);
   }
 
-  async diffFSLayer(layerId: string, maxSeq?: number): Promise<FSLayerEntry[]> {
-    return diffFSLayer(this, layerId, maxSeq, false);
+  async mergeLayer(ref: string): Promise<LayerMergeResult> {
+    return mergeLayer(this, ref);
   }
 
-  async replayFSLayer(layerId: string, maxSeq?: number): Promise<FSLayerEntry[]> {
-    return diffFSLayer(this, layerId, maxSeq, true);
+  async deleteLayer(ref: string, options?: LayerDeleteOptions | boolean): Promise<LayerDeleteResult> {
+    return deleteLayer(this, ref, options);
   }
 
-  async upsertFSLayerEntry(layerId: string, req: FSLayerEntryRequest): Promise<FSLayerEntry> {
-    return upsertFSLayerEntry(this, layerId, req);
+  async bindLayerMount(layerId: string, req: LayerMountBindRequest): Promise<LayerMountLease> {
+    return bindLayerMount(this, layerId, req);
   }
 
-  async uploadFSLayerFile(layerId: string, path: string, data: Uint8Array, opts: { baseRevision?: number; mode?: number } = {}): Promise<FSLayerEntry> {
-    return uploadFSLayerFile(this, layerId, path, data, opts);
+  async renewLayerMount(layerId: string, req: LayerMountRenewRequest): Promise<LayerMountLease> {
+    return renewLayerMount(this, layerId, req);
   }
 
-  async readFSLayerFile(layerId: string, path: string, maxSeq?: number): Promise<Uint8Array> {
-    return readFSLayerFile(this, layerId, path, maxSeq);
-  }
-
-  async readFSLayerFileStream(layerId: string, path: string, maxSeq?: number): Promise<ReadableStream<Uint8Array>> {
-    return readFSLayerFileStream(this, layerId, path, maxSeq);
-  }
-
-  async getFSLayerEntry(layerId: string, path: string, maxSeq?: number): Promise<FSLayerEntry> {
-    return getFSLayerEntry(this, layerId, path, maxSeq);
-  }
-
-  async checkpointFSLayer(layerId: string, req: FSLayerCheckpointRequest): Promise<FSLayerCheckpoint> {
-    return checkpointFSLayer(this, layerId, req);
-  }
-
-  async getFSLayerCheckpoint(checkpointId: string): Promise<FSLayerCheckpoint> {
-    return getFSLayerCheckpoint(this, checkpointId);
-  }
-
-  async listFSLayerEvents(layerId: string, since = 0): Promise<FSLayerEvent[]> {
-    return listFSLayerEvents(this, layerId, since);
-  }
-
-  async rollbackFSLayer(layerId: string): Promise<void> {
-    return rollbackFSLayer(this, layerId);
-  }
-
-  async commitFSLayer(layerId: string): Promise<FSLayerCommit> {
-    return commitFSLayer(this, layerId);
+  async unbindLayerMount(layerId: string, req: LayerMountUnbindRequest): Promise<LayerMountUnbindResult> {
+    return unbindLayerMount(this, layerId, req);
   }
 
   async upsertGitWorkspace(req: GitWorkspaceRequest): Promise<GitWorkspace> {

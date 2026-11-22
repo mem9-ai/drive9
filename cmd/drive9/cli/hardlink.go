@@ -9,12 +9,12 @@ import (
 
 // Hardlink creates a remote file hard link.
 func Hardlink(c *client.Client, args []string) error {
-	layerRef, args, err := parseLayerFlag(args)
+	layerRef, fence, args, err := ParseLayerViewFlags(args)
 	if err != nil {
 		return err
 	}
 	if len(args) != 2 {
-		return fmt.Errorf("usage: drive9 fs hardlink [--layer <ref>] <target> <link>")
+		return fmt.Errorf("usage: drive9 fs hardlink [--layer <ref> [--fence <N>]] <target> <link>")
 	}
 	srcLoc, err := Parse(args[0])
 	if err != nil {
@@ -41,14 +41,17 @@ func Hardlink(c *client.Client, args []string) error {
 		dstPath = dstLoc.Raw
 		dstRP = RemotePath{}
 	}
+	if err := requireNoLayerWithRemoteContext(layerRef, c, srcRP, args[0]); err != nil {
+		return err
+	}
+	if err := requireNoLayerWithRemoteContext(layerRef, c, dstRP, args[1]); err != nil {
+		return err
+	}
 	if layerRef != "" {
-		if err := requireNoLayerWithRemoteContext(layerRef, srcRP, args[0]); err != nil {
+		c, err = BindCLIViewClient(context.Background(), c, layerRef, fence)
+		if err != nil {
 			return err
 		}
-		if err := requireNoLayerWithRemoteContext(layerRef, dstRP, args[1]); err != nil {
-			return err
-		}
-		return hardlinkLayerPath(context.Background(), c, layerRef, srcPath, dstPath)
 	}
 
 	switch {

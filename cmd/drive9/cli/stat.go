@@ -22,6 +22,16 @@ func Stat(c *client.Client, args []string) error {
 		return err
 	}
 	defer withObjectAuthLocal(authLocal)()
+	layerRef, fence, args, err := ParseLayerViewFlags(args)
+	if err != nil {
+		return err
+	}
+	if layerRef != "" {
+		c, err = BindCLIViewClient(context.Background(), c, layerRef, fence)
+		if err != nil {
+			return err
+		}
+	}
 	outputFormat, path, err := parseOutputFormatAndPath(args, "drive9 fs stat [-o text|json] [--auth=local|server] <path>")
 	if err != nil {
 		return err
@@ -29,6 +39,14 @@ func Stat(c *client.Client, args []string) error {
 	h, err := fsHandleForArg(c, path)
 	if err != nil {
 		return err
+	}
+	if h.Loc.Kind == KindObject && (layerRef != "" || (c != nil && c.ViewBinding().LayerID != "")) {
+		return fmt.Errorf("--layer is drive9-only")
+	}
+	if h.Loc.Kind == KindDrive9 && h.Loc.Context != "" {
+		if err := requireNoLayerWithRemoteContext(layerRef, c, RemotePath{Context: h.Loc.Context, Path: h.Path}, path); err != nil {
+			return err
+		}
 	}
 	if h.Loc.Kind == KindObject {
 		ctx, cancel := withObjectOpTimeout(context.Background())

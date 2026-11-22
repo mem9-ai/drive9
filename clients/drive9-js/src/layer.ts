@@ -1,38 +1,30 @@
 import type { Client } from "./client.js";
-import { bodyInit } from "./compat.js";
-import { checkError, StatusError } from "./error.js";
+import { checkError } from "./error.js";
 import type {
-  FSLayer,
-  FSLayerCheckpoint,
-  FSLayerCheckpointRequest,
-  FSLayerCommit,
-  FSLayerDeleteOptions,
-  FSLayerEntry,
-  FSLayerEntryRequest,
-  FSLayerEvent,
-  FSLayerCreateRequest,
-  FSLayerForkRequest,
+  LayerCreateRequest,
+  LayerDeleteOptions,
+  LayerDeleteResult,
+  LayerForkRequest,
+  LayerInfo,
+  LayerListOptions,
+  LayerListPage,
+  LayerMergeResult,
+  LayerMountBindRequest,
+  LayerMountLease,
+  LayerMountRenewRequest,
+  LayerMountUnbindRequest,
+  LayerMountUnbindResult,
 } from "./models.js";
+import { clientFetch, normalizeLayerRef, validateLayerId } from "./view.js";
 
-export class FSLayerCommitConflictError extends StatusError {
-  readonly commit: FSLayerCommit;
-
-  constructor(commit: FSLayerCommit) {
-    super("fs layer commit conflict", 409);
-    this.name = "FSLayerCommitConflictError";
-    this.commit = commit;
-  }
+function layerRefURL(client: Client, ref: string, suffix = ""): string {
+  const norm = normalizeLayerRef(ref);
+  return `${client.baseUrl}/v1/layers/${encodeURIComponent(norm)}${suffix}`;
 }
 
-function layerURL(client: Client, layerId: string, suffix = ""): string {
-  return `${client.baseUrl}/v1/layers/${encodeURIComponent(layerId)}${suffix}`;
-}
-
-function withBase64Content<T extends { content?: Uint8Array | string }>(req: T): T {
-  if (req.content instanceof Uint8Array) {
-    return { ...req, content: Buffer.from(req.content).toString("base64") };
-  }
-  return req;
+function canonicalLayerURL(client: Client, layerId: string, suffix: string): string {
+  validateLayerId(layerId);
+  return `${client.baseUrl}/v1/layers/${layerId}${suffix}`;
 }
 
 async function decodeJSON<T>(resp: Response): Promise<T> {
@@ -40,9 +32,9 @@ async function decodeJSON<T>(resp: Response): Promise<T> {
   return (await resp.json()) as T;
 }
 
-export async function createFSLayer(client: Client, req: FSLayerCreateRequest): Promise<FSLayer> {
-  return decodeJSON<FSLayer>(
-    await fetch(`${client.baseUrl}/v1/layers`, {
+export async function createLayer(client: Client, req: LayerCreateRequest = {}): Promise<LayerInfo> {
+  return decodeJSON<LayerInfo>(
+    await clientFetch(client, `${client.baseUrl}/v1/layers`, {
       method: "POST",
       headers: client.authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(req),
@@ -50,123 +42,47 @@ export async function createFSLayer(client: Client, req: FSLayerCreateRequest): 
   );
 }
 
-export async function listFSLayers(client: Client): Promise<FSLayer[]> {
-  const body = await decodeJSON<{ layers?: FSLayer[] }>(
-    await fetch(`${client.baseUrl}/v1/layers`, { headers: client.authHeaders() })
-  );
-  return body.layers || [];
-}
-
-export async function getFSLayer(client: Client, layerId: string): Promise<FSLayer> {
-  return decodeJSON<FSLayer>(await fetch(layerURL(client, layerId), { headers: client.authHeaders() }));
-}
-
-export async function forkFSLayer(client: Client, parentRef: string, req: FSLayerForkRequest = {}): Promise<FSLayer> {
-  return decodeJSON<FSLayer>(
-    await fetch(layerURL(client, parentRef, "/fork"), {
-      method: "POST",
-      headers: client.authHeaders({ "Content-Type": "application/json" }),
-      body: JSON.stringify(req),
-    })
-  );
-}
-
-export async function deleteFSLayer(
-  client: Client,
-  layerId: string,
-  options: FSLayerDeleteOptions = {}
-): Promise<void> {
-  const query = options.cascade ? "?cascade=true" : "";
-  await checkError(
-    await fetch(`${layerURL(client, layerId)}${query}`, {
-      method: "DELETE",
-      headers: client.authHeaders(),
-    })
-  );
-}
-
-export async function diffFSLayer(client: Client, layerId: string, maxSeq?: number, replay = false): Promise<FSLayerEntry[]> {
+export async function listLayers(client: Client, options: LayerListOptions = {}): Promise<LayerListPage> {
   const qs = new URLSearchParams();
-  if (maxSeq != null) qs.set("max_seq", String(maxSeq));
-  if (replay) qs.set("replay", "1");
-  const suffix = `/diff${qs.toString() ? `?${qs.toString()}` : ""}`;
-  const body = await decodeJSON<{ entries?: FSLayerEntry[] }>(
-    await fetch(layerURL(client, layerId, suffix), { headers: client.authHeaders() })
-  );
-  return body.entries || [];
-}
-
-export async function upsertFSLayerEntry(client: Client, layerId: string, req: FSLayerEntryRequest): Promise<FSLayerEntry> {
-  return decodeJSON<FSLayerEntry>(
-    await fetch(layerURL(client, layerId, "/entries"), {
-      method: "POST",
-      headers: client.authHeaders({ "Content-Type": "application/json" }),
-      body: JSON.stringify(withBase64Content(req)),
+  if (options.limit != null && options.limit > 0) {
+    qs.set("limit", String(options.limit));
+  }
+  if (options.after) {
+    qs.set("after", options.after);
+  }
+  const suffix = qs.toString() ? `?${qs.toString()}` : "";
+  const page = await decodeJSON<LayerListPage>(
+    await clientFetch(client, `${client.baseUrl}/v1/layers${suffix}`, {
+      headers: client.authHeaders(),
     })
   );
+  return {
+    layers: page.layers || [],
+    next_after: page.next_after || undefined,
+  };
 }
 
-export async function uploadFSLayerFile(
-  client: Client,
-  layerId: string,
-  path: string,
-  data: Uint8Array,
-  opts: { baseRevision?: number; mode?: number } = {}
-): Promise<FSLayerEntry> {
-  const qs = new URLSearchParams({ path, size: String(data.length) });
-  if (opts.baseRevision && opts.baseRevision > 0) qs.set("base_revision", String(opts.baseRevision));
-  if (opts.mode != null) qs.set("mode", (opts.mode & 0o777).toString(8));
-  return decodeJSON<FSLayerEntry>(
-    await fetch(layerURL(client, layerId, `/objects?${qs.toString()}`), {
-      method: "POST",
-      headers: client.authHeaders({ "Content-Type": "application/octet-stream" }),
-      body: bodyInit(data),
-    })
+export async function listAllLayers(client: Client): Promise<LayerInfo[]> {
+  const all: LayerInfo[] = [];
+  let after: string | undefined;
+  while (true) {
+    const page = await listLayers(client, { limit: 200, after });
+    all.push(...page.layers);
+    if (!page.next_after) break;
+    after = page.next_after;
+  }
+  return all;
+}
+
+export async function getLayer(client: Client, ref: string): Promise<LayerInfo> {
+  return decodeJSON<LayerInfo>(
+    await clientFetch(client, layerRefURL(client, ref), { headers: client.authHeaders() })
   );
 }
 
-export async function readFSLayerFile(
-  client: Client,
-  layerId: string,
-  path: string,
-  maxSeq?: number
-): Promise<Uint8Array> {
-  const stream = await readFSLayerFileStream(client, layerId, path, maxSeq);
-  const resp = new Response(stream);
-  return new Uint8Array(await resp.arrayBuffer());
-}
-
-export async function readFSLayerFileStream(
-  client: Client,
-  layerId: string,
-  path: string,
-  maxSeq?: number
-): Promise<ReadableStream<Uint8Array>> {
-  const qs = new URLSearchParams({ path });
-  if (maxSeq != null) qs.set("max_seq", String(maxSeq));
-  const resp = await fetch(layerURL(client, layerId, `/objects?${qs.toString()}`), {
-    headers: client.authHeaders(),
-  });
-  await checkError(resp);
-  if (!resp.body) throw new Error("empty response body");
-  return resp.body;
-}
-
-export async function getFSLayerEntry(client: Client, layerId: string, path: string, maxSeq?: number): Promise<FSLayerEntry> {
-  const qs = new URLSearchParams({ path });
-  if (maxSeq != null) qs.set("max_seq", String(maxSeq));
-  return decodeJSON<FSLayerEntry>(
-    await fetch(layerURL(client, layerId, `/entries?${qs.toString()}`), { headers: client.authHeaders() })
-  );
-}
-
-export async function checkpointFSLayer(
-  client: Client,
-  layerId: string,
-  req: FSLayerCheckpointRequest
-): Promise<FSLayerCheckpoint> {
-  return decodeJSON<FSLayerCheckpoint>(
-    await fetch(layerURL(client, layerId, "/checkpoints"), {
+export async function forkLayer(client: Client, ref: string, req: LayerForkRequest = {}): Promise<LayerInfo> {
+  return decodeJSON<LayerInfo>(
+    await clientFetch(client, layerRefURL(client, ref, "/fork"), {
       method: "POST",
       headers: client.authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(req),
@@ -174,25 +90,9 @@ export async function checkpointFSLayer(
   );
 }
 
-export async function getFSLayerCheckpoint(client: Client, checkpointId: string): Promise<FSLayerCheckpoint> {
-  return decodeJSON<FSLayerCheckpoint>(
-    await fetch(`${client.baseUrl}/v1/layer-checkpoints/${encodeURIComponent(checkpointId)}`, {
-      headers: client.authHeaders(),
-    })
-  );
-}
-
-export async function listFSLayerEvents(client: Client, layerId: string, since = 0): Promise<FSLayerEvent[]> {
-  const qs = since > 0 ? `?since=${encodeURIComponent(String(since))}` : "";
-  const body = await decodeJSON<{ events?: FSLayerEvent[] }>(
-    await fetch(layerURL(client, layerId, `/events${qs}`), { headers: client.authHeaders() })
-  );
-  return body.events || [];
-}
-
-export async function rollbackFSLayer(client: Client, layerId: string): Promise<void> {
-  await checkError(
-    await fetch(layerURL(client, layerId, "/rollback"), {
+export async function mergeLayer(client: Client, ref: string): Promise<LayerMergeResult> {
+  return decodeJSON<LayerMergeResult>(
+    await clientFetch(client, layerRefURL(client, ref, "/merge"), {
       method: "POST",
       headers: client.authHeaders({ "Content-Type": "application/json" }),
       body: "{}",
@@ -200,17 +100,59 @@ export async function rollbackFSLayer(client: Client, layerId: string): Promise<
   );
 }
 
-export async function commitFSLayer(client: Client, layerId: string): Promise<FSLayerCommit> {
-  const resp = await fetch(layerURL(client, layerId, "/commit"), {
-    method: "POST",
-    headers: client.authHeaders({ "Content-Type": "application/json" }),
-    body: "{}",
-  });
-  if (resp.status === 409) {
-    const body = (await resp.json().catch(() => undefined)) as FSLayerCommit | undefined;
-    if (body) {
-      throw new FSLayerCommitConflictError(body);
-    }
-  }
-  return decodeJSON<FSLayerCommit>(resp);
+export async function deleteLayer(
+  client: Client,
+  ref: string,
+  options?: LayerDeleteOptions | boolean
+): Promise<LayerDeleteResult> {
+  const force = typeof options === "boolean" ? options : Boolean(options?.force);
+  const query = force ? "?force=true" : "";
+  return decodeJSON<LayerDeleteResult>(
+    await clientFetch(client, `${layerRefURL(client, ref)}${query}`, {
+      method: "DELETE",
+      headers: client.authHeaders(),
+    })
+  );
+}
+
+export async function bindLayerMount(
+  client: Client,
+  layerId: string,
+  req: LayerMountBindRequest
+): Promise<LayerMountLease> {
+  return decodeJSON<LayerMountLease>(
+    await clientFetch(client, canonicalLayerURL(client, layerId, "/bind-mount"), {
+      method: "POST",
+      headers: client.authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify(req),
+    })
+  );
+}
+
+export async function renewLayerMount(
+  client: Client,
+  layerId: string,
+  req: LayerMountRenewRequest
+): Promise<LayerMountLease> {
+  return decodeJSON<LayerMountLease>(
+    await clientFetch(client, canonicalLayerURL(client, layerId, "/renew-mount"), {
+      method: "POST",
+      headers: client.authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify(req),
+    })
+  );
+}
+
+export async function unbindLayerMount(
+  client: Client,
+  layerId: string,
+  req: LayerMountUnbindRequest
+): Promise<LayerMountUnbindResult> {
+  return decodeJSON<LayerMountUnbindResult>(
+    await clientFetch(client, canonicalLayerURL(client, layerId, "/unbind-mount"), {
+      method: "POST",
+      headers: client.authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify(req),
+    })
+  );
 }

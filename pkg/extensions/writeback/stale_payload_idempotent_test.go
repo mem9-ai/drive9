@@ -125,49 +125,6 @@ func TestCommitQueueStalePayloadDifferentFromDurableStaysTerminal(t *testing.T) 
 	}
 }
 
-// Layer mounts must not use the duplicate proof: the remote read would target
-// the base FS namespace, where the layer entry's bytes legitimately may not
-// appear. The rejection stays terminal, as in tryAutoResolveConflict.
-func TestCommitQueueStalePayloadLayerMountStaysTerminal(t *testing.T) {
-	const path = "/layered"
-	payload := []byte("layer-staged-bytes")
-	server, ts := newCASFileServer(t, path, 1, payload)
-	defer ts.Close()
-
-	shadow, err := staging.NewShadowStoreWithQuota(t.TempDir(), 0, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer shadow.Close()
-	pending, err := staging.NewPendingIndex(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := shadow.WriteFull(path, payload, 0); err != nil {
-		t.Fatal(err)
-	}
-	gen, err := pending.PutWithBaseRev(path, int64(len(payload)), staging.PendingNew, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	cq := NewCommitQueue(client.New(ts.URL, ""), shadow, pending, nil, 1, 8)
-	defer cq.DrainAll()
-	cq.SetLayerRef("layer-1")
-	entry := &CommitEntry{
-		Path: path, BaseRev: 0, Size: int64(len(payload)), Kind: staging.PendingNew,
-		ShadowGen: shadow.ActiveGeneration(path), PendingIndexGen: gen,
-		DurableWatermarkRev: 1,
-	}
-
-	if err := cq.CommitNow(context.Background(), entry); err == nil {
-		t.Fatal("layer mount must keep the stale rejection terminal")
-	}
-	if rev, body, puts := server.snapshot(); rev != 1 || !bytes.Equal(body, payload) || len(puts) != 0 {
-		t.Fatalf("layer path must not upload through the base namespace: rev=%d body=%q puts=%d", rev, body, len(puts))
-	}
-}
-
 // A remote read failure must fail closed: without proof of equality the entry
 // keeps its terminal outcome rather than being acknowledged.
 func TestCommitQueueStalePayloadFailsClosedWithoutRemoteProof(t *testing.T) {

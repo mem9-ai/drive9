@@ -450,15 +450,12 @@ func TestIntegrationSearchAndSQL(t *testing.T) {
 	}
 	_ = rows // list-type assertion only
 
-	// Grep / GrepWithLayer
+	// Grep
 	results, err := c.Grep("keyword", p, 10)
 	if err != nil {
 		t.Fatalf("Grep: %v", err)
 	}
 	_ = results
-	if _, err := c.GrepWithLayer("keyword", p, 10, ""); err != nil {
-		t.Fatalf("GrepWithLayer: %v", err)
-	}
 
 	// Find
 	v := url.Values{}
@@ -721,106 +718,50 @@ func TestIntegrationFSLayers(t *testing.T) {
 	ctx := context.Background()
 	p := newPrefix(t, c)
 
-	layer, err := c.CreateFSLayer(ctx, FSLayerCreateRequest{
+	layer, err := c.CreateLayer(ctx, LayerCreateRequest{
 		BaseRootPath: p,
-		Name:         "it-go-layer",
+		Name:         "it-go-layer-" + fmt.Sprintf("%d", time.Now().UnixNano()),
 	})
 	if err != nil {
-		t.Fatalf("CreateFSLayer: %v", err)
+		t.Fatalf("CreateLayer: %v", err)
 	}
 	if layer.LayerID == "" {
 		t.Fatal("LayerID empty")
 	}
 
-	// List / Get
-	if _, err := c.ListFSLayers(ctx); err != nil {
-		t.Fatalf("ListFSLayers: %v", err)
+	if _, err := c.ListLayers(ctx, LayerListOptions{Limit: 10}); err != nil {
+		t.Fatalf("ListLayers: %v", err)
 	}
-	if _, err := c.GetFSLayer(ctx, layer.LayerID); err != nil {
-		t.Fatalf("GetFSLayer: %v", err)
+	if _, err := c.GetLayer(ctx, layer.LayerID); err != nil {
+		t.Fatalf("GetLayer: %v", err)
 	}
 
-	// UpsertFSLayerEntry
+	vc, err := c.WithView(ViewBinding{LayerID: layer.LayerID})
+	if err != nil {
+		t.Fatalf("WithView: %v", err)
+	}
+
 	entryPath := p + "layer-file.txt"
-	ent, err := c.UpsertFSLayerEntry(ctx, layer.LayerID, FSLayerEntryRequest{
-		Path:        entryPath,
-		Op:          "upsert",
-		Kind:        "file",
-		ContentText: "layer content",
-		SizeBytes:   13,
-		Mode:        0o644,
-	})
+	if err := vc.WriteCtx(ctx, entryPath, []byte("layer content")); err != nil {
+		t.Fatalf("WriteCtx in view: %v", err)
+	}
+	data, err := vc.ReadCtx(ctx, entryPath)
 	if err != nil {
-		t.Fatalf("UpsertFSLayerEntry: %v", err)
+		t.Fatalf("ReadCtx in view: %v", err)
 	}
-	_ = ent
-
-	// GetFSLayerEntry / GetFSLayerEntryAtSeq
-	if _, err := c.GetFSLayerEntry(ctx, layer.LayerID, entryPath); err != nil {
-		t.Fatalf("GetFSLayerEntry: %v", err)
-	}
-	if _, err := c.GetFSLayerEntryAtSeq(ctx, layer.LayerID, entryPath, 1<<30); err != nil {
-		t.Logf("GetFSLayerEntryAtSeq (best-effort): %v", err)
+	if string(data) != "layer content" {
+		t.Fatalf("ReadCtx in view = %q, want %q", data, "layer content")
 	}
 
-	// UploadFSLayerFile
-	objPath := p + "layer-obj.bin"
-	if _, err := c.UploadFSLayerFile(ctx, layer.LayerID, objPath, bytes.NewReader([]byte("obj")), 3, -1, 0o644, true); err != nil {
-		t.Fatalf("UploadFSLayerFile: %v", err)
-	}
-
-	// ReadFSLayerFile / ReadFSLayerFileStream
-	data, err := c.ReadFSLayerFile(ctx, layer.LayerID, objPath, nil)
+	child, err := c.ForkLayer(ctx, layer.LayerID, LayerForkRequest{})
 	if err != nil {
-		t.Fatalf("ReadFSLayerFile: %v", err)
+		t.Fatalf("ForkLayer: %v", err)
 	}
-	if string(data) != "obj" {
-		t.Fatalf("ReadFSLayerFile = %q, want \"obj\"", data)
+	if _, err := c.DeleteLayer(ctx, child.LayerID, true); err != nil {
+		t.Fatalf("DeleteLayer child: %v", err)
 	}
-	rc, err := c.ReadFSLayerFileStream(ctx, layer.LayerID, objPath, nil)
-	if err != nil {
-		t.Fatalf("ReadFSLayerFileStream: %v", err)
-	}
-	_, _ = io.ReadAll(rc)
-	_ = rc.Close()
-
-	// DiffFSLayer / DiffFSLayerAtSeq / ReplayFSLayer / ReplayFSLayerAtSeq
-	if _, err := c.DiffFSLayer(ctx, layer.LayerID); err != nil {
-		t.Fatalf("DiffFSLayer: %v", err)
-	}
-	if _, err := c.DiffFSLayerAtSeq(ctx, layer.LayerID, 1<<30); err != nil {
-		t.Logf("DiffFSLayerAtSeq (best-effort): %v", err)
-	}
-	if _, err := c.ReplayFSLayer(ctx, layer.LayerID); err != nil {
-		t.Fatalf("ReplayFSLayer: %v", err)
-	}
-	if _, err := c.ReplayFSLayerAtSeq(ctx, layer.LayerID, 1<<30); err != nil {
-		t.Logf("ReplayFSLayerAtSeq (best-effort): %v", err)
-	}
-
-	// ListFSLayerEvents
-	if _, err := c.ListFSLayerEvents(ctx, layer.LayerID, 0); err != nil {
-		t.Fatalf("ListFSLayerEvents: %v", err)
-	}
-
-	// CheckpointFSLayer / GetFSLayerCheckpoint
-	ch, err := c.CheckpointFSLayer(ctx, layer.LayerID, FSLayerCheckpointRequest{Label: "it-go-cp"})
-	if err != nil {
-		t.Fatalf("CheckpointFSLayer: %v", err)
-	}
-	if ch == nil || ch.CheckpointID == "" {
-		t.Fatal("checkpoint empty")
-	}
-	if _, err := c.GetFSLayerCheckpoint(ctx, ch.CheckpointID); err != nil {
-		t.Fatalf("GetFSLayerCheckpoint: %v", err)
-	}
-
-	// RollbackFSLayer / CommitFSLayer — rollback first so commit has work.
-	if err := c.RollbackFSLayer(ctx, layer.LayerID); err != nil {
-		t.Logf("RollbackFSLayer (best-effort): %v", err)
-	}
-	if _, err := c.CommitFSLayer(ctx, layer.LayerID); err != nil {
-		t.Logf("CommitFSLayer (best-effort): %v", err)
+	if _, err := c.MergeLayer(ctx, layer.LayerID); err != nil {
+		t.Fatalf("MergeLayer: %v", err)
 	}
 }
 
