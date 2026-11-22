@@ -43,8 +43,8 @@ type Options struct {
 	// fast path answers 500 because the old destination still exists and must
 	// survive, while a COPY delegated to x/net/webdav degrades to memory
 	// because x/net has already removed its destination (see copy.go). A
-	// failed COMMIT answers 500 or 507 there; a staging failure is not a
-	// commit.
+	// failed COMMIT is 500 or 507 on the fast path only; a delegated commit
+	// is x/net's plain 500, and a staging failure is not a commit.
 	PutBufferBytes int64
 
 	// PutStagingDir is where a PUT body beyond PutBufferBytes is staged.

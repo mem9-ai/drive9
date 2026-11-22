@@ -386,13 +386,19 @@ func TestCopyTagClearIsBoundedByPutTimeout(t *testing.T) {
 	b.SeedDir("/dir", 0o755)
 	b.Seed("/dir/src", []byte("fresh"))
 	b.SeedWithTags("/dir/dst", []byte("ORIGINAL"), map[string]string{"team": "old"})
+	// release unblocks the stalled handlers once the COPY is done with them, so
+	// the fixture does not make the server's Close wait out the cap below.
+	release := make(chan struct{})
+	defer close(release)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost && r.URL.Query().Has("setmeta") {
-			// Stall until the client gives up, with a hard cap so a broken
-			// bound fails the assertion instead of hanging the suite.
+			// Stall until the client gives up. The cap only matters when the
+			// bound is broken: there the clear waits for this handler, so an
+			// unbounded regression is a slow failure instead of a hang.
 			select {
 			case <-r.Context().Done():
-			case <-time.After(3 * time.Second):
+			case <-release:
+			case <-time.After(5 * time.Second):
 			}
 			http.Error(w, "setmeta stalled", http.StatusInternalServerError)
 			return
