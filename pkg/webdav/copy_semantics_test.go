@@ -508,6 +508,9 @@ func TestCopyReplaceToleratesRemovedDestination(t *testing.T) {
 	b.SeedWithTags("/dir/dst", []byte("ORIGINAL"), map[string]string{"team": "old"})
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost && r.URL.Query().Has("setmeta") {
+			// Another writer deletes the path between the content commit and
+			// the tag clear, so there is nothing left to clear.
+			b.Remove("/dir/dst")
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
@@ -523,7 +526,7 @@ func TestCopyReplaceToleratesRemovedDestination(t *testing.T) {
 	if rr.Code != http.StatusNoContent {
 		t.Fatalf("COPY whose destination vanished before the clear = %d, want %d", rr.Code, http.StatusNoContent)
 	}
-	if node, _ := b.Node("/dir/dst"); string(node.Data) != "fresh" {
-		t.Fatalf("destination = %q, want fresh", node.Data)
+	if node, ok := b.Node("/dir/dst"); ok {
+		t.Fatalf("destination = %q (ok=%v), want it gone: the copy must not recreate a path another writer removed", node.Data, ok)
 	}
 }

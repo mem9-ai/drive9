@@ -207,6 +207,14 @@ func (b *Backend) SeedWithLayout(path string, data []byte, layout string) {
 	b.files[path] = &Node{Data: append([]byte(nil), data...), Mode: 0o644, Rev: 1, Mtime: 1, ContentLayout: layout}
 }
 
+// Remove drops a fixture path, modeling another writer deleting it. Tests use
+// it to build races where a request in flight outlives the path it targets.
+func (b *Backend) Remove(path string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.files, path)
+}
+
 // ObjectID returns the path's object identity, assigning one on first use
 // exactly as a stat would (X-Dat9-Resource-ID). Tests that assert on a cache
 // key built from an open handle's pinned identity need it.
