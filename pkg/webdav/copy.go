@@ -49,9 +49,11 @@ func (cp *copyFastPath) serve(w http.ResponseWriter, r *http.Request) bool {
 	if r.Header.Get("If") != "" {
 		return false
 	}
-	// x/net rejects a Depth other than 0 or infinity BEFORE touching the
-	// destination; delegate so such a request keeps answering 400.
-	if depth := r.Header.Get("Depth"); depth != "" && depth != "0" && !strings.EqualFold(depth, "infinity") {
+	// x/net's parseDepth matches EXACTLY "0", "1" and "infinity" and
+	// handleCopyMove rejects anything but 0/infinity before touching the
+	// destination; delegate every other spelling (including "INFINITY") so the
+	// request keeps answering 400.
+	if depth := r.Header.Get("Depth"); depth != "" && depth != "0" && depth != "infinity" {
 		return false
 	}
 	dest := r.Header.Get("Destination")
@@ -220,9 +222,29 @@ func (cp *copyFastPath) serve(w http.ResponseWriter, r *http.Request) bool {
 		// unconditional commit also replaces a destination an API writer
 		// created in the meantime, and a write without tag headers leaves that
 		// writer's tags in place.
+		//
+		// KNOWN RACE: an API writer that publishes content AND tags between the
+		// commit and this clear loses its tags while the COPY answers 2xx.
+		// Closing it needs a conditional metadata update on the wire (the
+		// `?setmeta` call cannot say "only if the row is still the revision my
+		// commit produced"); the window is narrow and the failure is metadata,
+		// not content.
+		//
+		// It also runs on the commit's own detached, bounded context: a client
+		// that disconnects after sending the body must not cancel the cleanup
+		// the commit deliberately survives (writeFile.Close uses the same
+		// policy).
+		clearCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cp.fs.put.commitTimeout())
+		defer cancel()
 		var clearErr error
 		for attempt := 0; attempt < 2; attempt++ {
-			if clearErr = cp.client.SetMetadataCtx(ctx, dstRemote, client.SetMetadataOptions{Tags: map[string]string{}}); clearErr == nil {
+			clearErr = cp.client.SetMetadataCtx(clearCtx, dstRemote, client.SetMetadataOptions{Tags: map[string]string{}})
+			if clearErr != nil && client.IsNotFound(clearErr) {
+				// Another writer removed the destination: there is nothing
+				// left to clear, which is a settled outcome.
+				clearErr = nil
+			}
+			if clearErr == nil {
 				break
 			}
 		}

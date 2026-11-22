@@ -538,6 +538,23 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					b.mu.Unlock()
 				}
 				b.mu.Lock()
+				// The initiate's compare-and-set precondition, enforced at
+				// complete like the server does (and like the direct-PUT
+				// handler here): expectedRevision 0 is create-only, a positive
+				// value must match the current revision exactly.
+				if us.expected != nil {
+					existing := b.files[us.path]
+					if *us.expected == 0 && existing != nil {
+						b.mu.Unlock()
+						b.writeErr(w, http.StatusConflict, "already exists")
+						return
+					}
+					if *us.expected > 0 && (existing == nil || existing.Rev != *us.expected) {
+						b.mu.Unlock()
+						b.writeErr(w, http.StatusConflict, "revision mismatch")
+						return
+					}
+				}
 				rev := b.nextRev
 				b.nextRev++
 				n := b.files[us.path]

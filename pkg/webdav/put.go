@@ -214,6 +214,11 @@ type writeFile struct {
 	// recorded must not be committed later.
 	werr   error
 	closed bool
+
+	// stagedWrite, when non-nil, replaces the staged-file write. Tests use it
+	// to exercise a mid-body staging failure (a full local disk) without one;
+	// production leaves it nil.
+	stagedWrite func([]byte) (int, error)
 }
 
 var _ webdav.File = (*writeFile)(nil)
@@ -246,9 +251,12 @@ func (w *writeFile) Write(p []byte) (int, error) {
 		n   int
 		err error
 	)
-	if w.file != nil {
+	switch {
+	case w.file != nil && w.stagedWrite != nil:
+		n, err = w.stagedWrite(p)
+	case w.file != nil:
 		n, err = w.file.Write(p)
-	} else {
+	default:
 		n, err = w.buf.Write(p)
 	}
 	w.size += int64(n)
@@ -359,37 +367,30 @@ func (w *writeFile) Close() error {
 	ctx, cancel := context.WithTimeout(context.Background(), w.put.commitTimeout())
 	defer cancel()
 
+	// ONE commit decision for both body shapes: the client's size-aware
+	// transport chooses direct PUT vs multipart (and the extent fallback)
+	// from the body length, and the CAS precondition rides the same call. A
+	// direct PUT would be rejected by an S3-backed server for a body at or
+	// above its inline threshold (that branch requires part checksums), so
+	// neither shape may bypass the transport decision.
+	commit := func(r io.Reader, size int64, opts ...client.WriteOption) error {
+		if w.expectedRevision >= 0 {
+			return w.commitError(w.client.WriteStreamConditionalWithOptions(ctx, w.path, r, size, nil, w.expectedRevision, opts...))
+		}
+		_, err := w.client.WriteStreamWithSummary(ctx, w.path, r, size, nil, opts...)
+		return w.commitError(err)
+	}
+
 	if w.file != nil {
 		// A spilled body is a spill-file upload: the multipart plane is
 		// forced, because the direct-PUT branch reads the WHOLE reader into
 		// memory and would undo the staging bound whenever the server's
 		// inline threshold is larger than PutBufferBytes. Layout routing
 		// (extent vs classic) is the client's, unchanged.
-		staged := io.NewSectionReader(w.file, 0, w.size)
-		if w.expectedRevision >= 0 {
-			return w.commitError(w.client.WriteStreamConditionalWithOptions(ctx, w.path, staged, w.size, nil, w.expectedRevision, client.WithMultipartOnly()))
-		}
-		_, err := w.client.WriteStreamWithSummary(ctx, w.path, staged, w.size, nil, client.WithMultipartOnly())
-		return w.commitError(err)
+		return commit(io.NewSectionReader(w.file, 0, w.size), w.size, client.WithMultipartOnly())
 	}
-	// The in-memory body takes the client's own transport decision too:
-	// WriteStreamWithSummary keeps a direct PUT below the server's inline
-	// threshold and switches to the multipart plane at or above it. A single
-	// direct PUT (WriteCtx) would be REJECTED by an S3-backed server for any
-	// body at or above that threshold — its large-file branch requires part
-	// checksums — so bodies between the threshold and the staging bound would
-	// not save at all.
 	data := w.buf.Bytes()
-	if w.expectedRevision >= 0 {
-		// The conditional commit keeps the SAME size-aware transport decision
-		// as the unconditional one: a single direct PUT is rejected by an
-		// S3-backed server for a body at or above its inline threshold (the
-		// large-file branch requires part checksums), so a CAS commit must be
-		// free to take the multipart plane too.
-		return w.commitError(w.client.WriteStreamConditionalWithOptions(ctx, w.path, bytes.NewReader(data), int64(len(data)), nil, w.expectedRevision))
-	}
-	_, err := w.client.WriteStreamWithSummary(ctx, w.path, bytes.NewReader(data), int64(len(data)), nil)
-	return w.commitError(err)
+	return commit(bytes.NewReader(data), int64(len(data)))
 }
 
 // Abort releases the staged body WITHOUT committing it. The HTTP layer uses it

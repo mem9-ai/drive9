@@ -305,15 +305,19 @@ func TestCopyInvalidDepthDelegatesAndRejects(t *testing.T) {
 	b.Seed("/dir/dst", []byte("ORIGINAL"))
 	handler, _ := newCopySemanticsHandler(t, b, Options{})
 
-	req := copyRequest(t, "/dir/src", "/dir/dst")
-	req.Header.Set("Depth", "1")
-	rr := httptest.NewRecorder()
-	handler.ServeHTTP(rr, req)
-	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("COPY with Depth:1 = %d, want %d", rr.Code, http.StatusBadRequest)
-	}
-	if node, _ := b.Node("/dir/dst"); string(node.Data) != "ORIGINAL" {
-		t.Fatalf("invalid-Depth COPY changed the destination: %q", node.Data)
+	for _, depth := range []string{"1", "INFINITY", "bogus"} {
+		req := copyRequest(t, "/dir/src", "/dir/dst")
+		req.Header.Set("Depth", depth)
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+		// x/net's parseDepth is case-SENSITIVE: only "0", "1" and "infinity"
+		// parse, and handleCopyMove rejects anything but 0/infinity.
+		if rr.Code != http.StatusBadRequest {
+			t.Fatalf("COPY with Depth:%s = %d, want %d", depth, rr.Code, http.StatusBadRequest)
+		}
+		if node, _ := b.Node("/dir/dst"); string(node.Data) != "ORIGINAL" {
+			t.Fatalf("invalid-Depth COPY (%s) changed the destination: %q", depth, node.Data)
+		}
 	}
 }
 
@@ -432,21 +436,32 @@ func TestCopyConditionalCommitAboveInlineThresholdUsesMultipart(t *testing.T) {
 	b.SeedDir("/dir", 0o755)
 	payload := strings.Repeat("k", 2<<20) // 2 MiB, above the 1 MiB inline threshold
 	b.Seed("/dir/src", []byte(payload))
-	handler, _ := newCopySemanticsHandler(t, b, Options{PutBufferBytes: 4 << 20})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/fs/dir/src" {
+			// The destination appears while the source streams: the create-only
+			// CAS must reject the multipart complete, not just the small-body
+			// direct PUT.
+			b.Seed("/dir/dst", []byte("INTRUDER"))
+		}
+		b.ServeHTTP(w, r)
+	}))
+	t.Cleanup(ts.Close)
+	c := client.New(ts.URL, "test-key")
+	c.Warm(t.Context())
+	handler := NewHandler(c, Options{PutBufferBytes: 4 << 20})
 
 	req := copyRequest(t, "/dir/src", "/dir/dst")
 	req.Header.Set("Overwrite", "F") // create-only CAS commit
 	rr := httptest.NewRecorder()
 	handler.ServeHTTP(rr, req)
-	if rr.Code != http.StatusCreated {
-		t.Fatalf("conditional COPY status = %d, want %d: %s", rr.Code, http.StatusCreated, rr.Body.String())
+	if rr.Code != http.StatusPreconditionFailed {
+		t.Fatalf("lost-race multipart COPY = %d, want %d: %s", rr.Code, http.StatusPreconditionFailed, rr.Body.String())
 	}
 	if got := b.Requests()["POST /v2/uploads/initiate"]; got != 1 {
 		t.Fatalf("multipart initiate requests = %d, want 1 (CAS commit took the direct-PUT branch)", got)
 	}
-	node, ok := b.Node("/dir/dst")
-	if !ok || string(node.Data) != payload {
-		t.Fatalf("destination = %d bytes (ok=%v), want %d", len(node.Data), ok, len(payload))
+	if node, ok := b.Node("/dir/dst"); !ok || string(node.Data) != "INTRUDER" {
+		t.Fatalf("concurrent writer's content = %q (ok=%v), want INTRUDER", node.Data, ok)
 	}
 }
 
@@ -481,5 +496,34 @@ func TestCopyClearsTagsOfConcurrentlyCreatedDestination(t *testing.T) {
 	}
 	if len(node.Tags) != 0 {
 		t.Fatalf("concurrent writer's tags survived the replacement: %v", node.Tags)
+	}
+}
+
+// A destination another writer removed after the commit has no tags left to
+// clear: that is a settled outcome, not a failed copy.
+func TestCopyReplaceToleratesRemovedDestination(t *testing.T) {
+	b := testbackend.NewBackend()
+	b.SeedDir("/dir", 0o755)
+	b.Seed("/dir/src", []byte("fresh"))
+	b.SeedWithTags("/dir/dst", []byte("ORIGINAL"), map[string]string{"team": "old"})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Query().Has("setmeta") {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		b.ServeHTTP(w, r)
+	}))
+	t.Cleanup(ts.Close)
+	c := client.New(ts.URL, "test-key")
+	c.Warm(t.Context())
+	handler := NewHandler(c, Options{})
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, copyRequest(t, "/dir/src", "/dir/dst"))
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("COPY whose destination vanished before the clear = %d, want %d", rr.Code, http.StatusNoContent)
+	}
+	if node, _ := b.Node("/dir/dst"); string(node.Data) != "fresh" {
+		t.Fatalf("destination = %q, want fresh", node.Data)
 	}
 }
