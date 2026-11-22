@@ -99,6 +99,8 @@ st, root_ls = req("GET", "/v1/fs/?list", auth=ptok)
 assert st == 200 and sorted(e["name"] for e in root_ls["entries"]) == sorted([p1, p2])
 assert req("GET", f"/v1/fs/{sec}?list", auth=ptok)[0] == 404
 assert req("GET", f"/v1/fs/{sec}/hidden.txt", auth=ptok)[0] == 403
+assert req("GET", f"/v1/fs/{p1}/a.txt?tasks=1", auth=ptok)[0] == 200
+assert req("GET", f"/v1/fs/{p1}/a.txt?tasks=1&unexpected=1", auth=ptok)[0] == 403
 req("DELETE", f"/v1/tokens/{pid}")
 for dname in (p1, p2, sec):
     req("DELETE", f"/v1/fs/{dname}?recursive=1")

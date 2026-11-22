@@ -229,7 +229,7 @@ pub(crate) fn redact_secrets(input: &str, secrets: &[String]) -> String {
     )> = OnceLock::new();
     let (re_token, re_bearer, re_flag, re_env) = PATTERNS.get_or_init(|| {
         (
-            regex::Regex::new(r"(?:drive9|d9k)_[A-Za-z0-9_-]{8,}").unwrap(),
+            regex::Regex::new(r"(?:drive9_[0-9a-f]{16,}|d9k_[A-Za-z0-9_-]{8,})").unwrap(),
             regex::Regex::new(r#"(?i)(Authorization:\s*Bearer\s+)[^\s"']+"#).unwrap(),
             regex::Regex::new(
                 r#"((?:--api-key|--tidbcloud-public-key|--tidbcloud-private-key)(?:=|\s+))(?:'[^']*'|"[^"]*"|[^\s"']+)"#,
@@ -647,7 +647,14 @@ fn run_once(
         .map(|p| p.addr.clone())
         .unwrap_or_else(|| a.server.clone().unwrap_or_default());
 
-    let sock_path = run_dir.join("ctl.sock");
+    static SOCK_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let default_sock = run_dir.join("ctl.sock");
+    let sock_path = if default_sock.as_os_str().len() > 96 {
+        let seq = SOCK_SEQ.fetch_add(1, Ordering::Relaxed);
+        PathBuf::from(format!("/tmp/d9c-{}-{seq}.sock", std::process::id()))
+    } else {
+        default_sock
+    };
     let _ = std::fs::remove_file(&sock_path);
     let listener = match UnixListener::bind(&sock_path) {
         Ok(l) => l,
@@ -935,6 +942,7 @@ fn run_once(
     }
     script_done.store(true, Ordering::Relaxed);
     let _ = UnixStream::connect(&sock_path);
+    let _ = std::fs::remove_file(&sock_path);
     {
         let mut r = runner.lock().unwrap();
         r.journal(

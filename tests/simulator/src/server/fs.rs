@@ -500,12 +500,6 @@ async fn fs_list(_state: Arc<AppState>, t: Arc<TenantDb>, req: FsReq) -> Respons
 }
 
 async fn fs_tasks(t: Arc<TenantDb>, req: FsReq) -> Response {
-    // Reject unknown query parameters alongside `?tasks` (per tasks-smoke-test.sh).
-    for (k, _) in &req.query {
-        if k != "tasks" {
-            return err_resp(400, "unknown query parameter on tasks endpoint");
-        }
-    }
     let p = match fs_path(&req, false) {
         Ok(p) => p,
         Err(r) => return r,
@@ -937,8 +931,11 @@ async fn fs_post(state: Arc<AppState>, t: Arc<TenantDb>, req: FsReq) -> Response
         "append",
     ];
     let present: Vec<&str> = ACTIONS.iter().copied().filter(|a| req.has(a)).collect();
-    if present.len() != 1 {
-        return err_resp(400, "exactly one POST action selector is required");
+    if present.is_empty() {
+        return err_resp(400, "POST action selector is required");
+    }
+    if present.len() > 1 {
+        return err_resp(409, "conflicting POST action selectors");
     }
     let actor = req.actor();
 

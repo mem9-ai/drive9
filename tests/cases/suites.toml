@@ -496,7 +496,7 @@ timeout = "15m"
 # ---- Daily / Staging `[prod-ext]` cases (skip cleanly when cloud credentials absent) ----
 [[case]]
 name = "drive9/api/tokens"
-tier = "daily-prod-ext"
+tier = "pr-no-mount"
 no_mount = true
 timeout = "10m"
 

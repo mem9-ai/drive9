@@ -135,12 +135,20 @@ pub async fn batch_read_small(
     let mut results = Vec::new();
     for p in paths {
         let raw = p.as_str().unwrap_or("").to_string();
+        if raw.is_empty() || canonicalize(&raw, raw.ends_with('/')).is_err() {
+            results.push(json!({
+                "path": raw,
+                "status": 400,
+                "error": "invalid path",
+            }));
+            continue;
+        }
         match lookup_loose(&t, &raw) {
             Ok(n) if n.is_dir() => {
                 results.push(json!({
                     "path": raw,
-                    "status": 400,
-                    "error": "is a directory",
+                    "status": 404,
+                    "error": "not found",
                 }));
             }
             Ok(n) => {

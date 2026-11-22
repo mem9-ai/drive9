@@ -20,8 +20,7 @@ else
     # Ensure bucket exists on the S3 endpoint; exit 2 (unsupported) if target server has no /s3.
     code=$(curl -sS -o /dev/null -w '%{http_code}' -X PUT "$S3_EP/drive9" || printf '000')
     if [ "$code" != "200" ] && [ "$code" != "204" ]; then
-        check shell --req 'drive9-obj-endpoint' --claim 'object-store-endpoint-available' -- sh -c 'exit 2'
-        exit 0
+        require --req 'drive9-obj-endpoint' --claim 'object-store-endpoint-available' -- sh -c 'exit 2'
     fi
     ENC_EP=$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$S3_EP")
     OBJ_BASE="s3://drive9/obj-smoke-$$-$(date +%s)"

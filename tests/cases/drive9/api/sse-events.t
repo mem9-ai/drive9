@@ -52,7 +52,7 @@ def read_sse_until(since, stop_pred, timeout_s=45.0):
     deadline = time.time() + timeout_s
     try:
         while time.time() < deadline:
-            raw = resp.fp.readline()
+            raw = resp.readline()
             if not raw:
                 break
             line = raw.decode("utf-8", "replace").rstrip("\r\n")
@@ -94,7 +94,7 @@ elif mode == "live-and-replay":
         cur_ev = None
         try:
             while True:
-                line = resp.fp.readline().decode("utf-8", "replace").rstrip("\r\n")
+                line = resp.readline().decode("utf-8", "replace").rstrip("\r\n")
                 if line.startswith("event: "):
                     cur_ev = line[7:].strip()
                 elif line.startswith("data: "):

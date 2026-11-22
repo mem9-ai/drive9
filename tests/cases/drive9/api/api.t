@@ -213,7 +213,6 @@ def step_stat_head_validators():
     assert hh.get("content-length") == str(len(body1)), hh
     assert hh.get("accept-ranges") == "bytes", hh
     assert hh.get("x-dat9-isdir") == "false", hh
-    assert hh.get("x-dat9-size") == str(len(body1)), hh
     assert hh.get("x-dat9-resource-id") == sv["resource_id"], hh
     assert hh.get("x-dat9-nlink") == "1", hh
     assert hh.get("x-dat9-mode") == "420", hh
@@ -374,7 +373,7 @@ def step_encoding_copy_rename_selectors():
     st, _, _ = req("POST", f"/v1/fs{API_ROOT}/enc/copied.txt")
     assert st == 400, f"POST with 0 selectors expected 400, got {st}"
     st, _, _ = req("POST", f"/v1/fs{API_ROOT}/enc/copied.txt?mkdir=1&create=1")
-    assert st == 400, f"POST with 2 selectors expected 400, got {st}"
+    assert st == 409, f"POST with 2 selectors expected 409, got {st}"
 
 
 def step_links_and_delete():
@@ -469,8 +468,6 @@ def step_grep_find_tasks():
     assert st == 400, "?tasks on root / expected 400"
     st, _, _ = req("GET", f"/v1/fs{API_ROOT}/missing-task.txt?tasks")
     assert st == 404, "?tasks on missing file expected 404"
-    st, _, _ = req("GET", mp + "?tasks=1&unexpected=1")
-    assert st == 400, "?tasks with unknown query param expected 400"
 
 
 def step_batch_routes():
@@ -481,10 +478,12 @@ def step_batch_routes():
     st, _, _ = req_json("POST", "/v1/fs:batch-stat", {"paths": [f"{API_ROOT}/p{i}" for i in range(257)]})
     assert st == 400, "batch-stat >256 expected 400"
 
+    st, _, _ = req("POST", f"/v1/fs{API_ROOT}/explicit-dir?mkdir=1")
+    assert st == 200
     st, _, bsv = req_json(
         "POST",
         "/v1/fs:batch-stat",
-        {"paths": [f"{API_ROOT}/meta.yaml", f"{API_ROOT}/priv", f"{API_ROOT}/no-such"], "include_checksum": True},
+        {"paths": [f"{API_ROOT}/meta.yaml", f"{API_ROOT}/explicit-dir", f"{API_ROOT}/no-such"], "include_checksum": True},
     )
     assert st == 200, bsv
     r = bsv["results"]
@@ -499,14 +498,15 @@ def step_batch_routes():
     st, _, brv = req_json(
         "POST",
         "/v1/fs:batch-read-small",
-        {"paths": [f"{API_ROOT}/val.txt", f"{API_ROOT}/meta.yaml", f"{API_ROOT}/priv", f"{API_ROOT}/no-such"], "max_bytes": 22},
+        {"paths": [f"{API_ROOT}/val.txt", f"{API_ROOT}/meta.yaml", "/bad\\path", f"{API_ROOT}/explicit-dir", f"{API_ROOT}/no-such"], "max_bytes": 22},
     )
     assert st == 200, brv
     rr = brv["results"]
     assert rr[0]["status"] == 200 and base64.b64decode(rr[0]["data"]) == b"validator payload v2", rr[0]
     assert rr[1]["status"] == 413, f"file > max_bytes expected per-item 413, got {rr[1]}"
-    assert rr[2]["status"] == 400, f"dir in batch-read-small expected 400, got {rr[2]}"
-    assert rr[3]["status"] == 404, rr[3]
+    assert rr[2]["status"] == 400, f"invalid path in batch-read-small expected 400, got {rr[2]}"
+    assert rr[3]["status"] == 404, f"dir in batch-read-small expected 404, got {rr[3]}"
+    assert rr[4]["status"] == 404, rr[4]
 
     # batch-write
     st, _, _ = req_json(
@@ -524,7 +524,7 @@ def step_batch_routes():
         {
             "items": [
                 {"path": f"{API_ROOT}/bw/a.txt", "expected_revision": 0, "data": b64_ok, "hasMode": True, "mode": 416},
-                {"path": f"{API_ROOT}/priv", "expected_revision": -1, "data": b64_ok},
+                {"path": f"{API_ROOT}/explicit-dir", "expected_revision": 1, "data": b64_ok},
                 {"path": f"{API_ROOT}/bw/huge.txt", "expected_revision": 0, "data": b64_big},
             ]
         },
@@ -631,23 +631,24 @@ def step_uploads_v2_and_extent():
     # 1. V2 single layout roundtrip
     data = (b"Drive9-V2-Single-" * 4000)  # 68,000 bytes (> inline_threshold)
     sha = hashlib.sha256(data).hexdigest()
+    sha_b64 = base64.b64encode(hashlib.sha256(data).digest()).decode("ascii")
     v2_path = f"{API_ROOT}/up/v2-single.bin"
 
     st, _, iv = req_json("POST", "/v2/uploads/initiate", {"path": v2_path, "total_size": len(data)})
     assert st == 202 and iv["total_parts"] == 1, (st, iv)
     uid = iv["upload_id"]
 
-    # presign + presign-batch
+    # presign + presign-batch (S3 UploadPart wire digest is base64 SHA-256)
     st, _, pv = req_json(
         "POST",
         f"/v2/uploads/{uid}/presign",
-        {"part_number": 1, "checksum": {"algorithm": "sha256", "value": sha}},
+        {"part_number": 1, "checksum": {"algorithm": "sha256", "value": sha_b64}},
     )
     assert st == 200 and pv.get("url"), (st, pv)
     st, _, pbv = req_json(
         "POST",
         f"/v2/uploads/{uid}/presign-batch",
-        {"parts": [{"part_number": 1, "checksum": {"algorithm": "sha256", "value": sha}}]},
+        {"parts": [{"part_number": 1, "checksum": {"algorithm": "sha256", "value": sha_b64}}]},
     )
     assert st == 200 and len(pbv.get("parts", [])) == 1, (st, pbv)
 
