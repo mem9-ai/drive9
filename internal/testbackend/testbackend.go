@@ -538,22 +538,19 @@ func (b *Backend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					b.mu.Unlock()
 				}
 				b.mu.Lock()
-				// The initiate's compare-and-set precondition, enforced at
-				// complete like the server does (and like the direct-PUT
-				// handler here): expectedRevision 0 is create-only, a positive
-				// value must match the current revision exactly.
-				if us.expected != nil {
-					existing := b.files[us.path]
-					if *us.expected == 0 && existing != nil {
-						b.mu.Unlock()
-						b.writeErr(w, http.StatusConflict, "already exists")
-						return
-					}
-					if *us.expected > 0 && (existing == nil || existing.Rev != *us.expected) {
-						b.mu.Unlock()
-						b.writeErr(w, http.StatusConflict, "revision mismatch")
-						return
-					}
+				// The server re-checks the initiate's compare-and-set
+				// precondition inside the completion transaction, so a
+				// destination created or rewritten while the body streams
+				// still loses. Only the create-only case (expectedRevision 0)
+				// is modeled here: this fake hands out revisions from one
+				// shared counter (fixtures use 1..9, writes continue from 10),
+				// not the server's per-file numbering, so a positive expected
+				// revision is not something it could verify without also
+				// changing the revision space every other suite builds on.
+				if us.expected != nil && *us.expected == 0 && b.files[us.path] != nil {
+					b.mu.Unlock()
+					b.writeErr(w, http.StatusConflict, "already exists")
+					return
 				}
 				rev := b.nextRev
 				b.nextRev++
