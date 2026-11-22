@@ -640,3 +640,42 @@ func TestSetAttrTruncateExtentFileUsesPatch(t *testing.T) {
 		t.Fatalf("patchSizes = %v, want [5MiB 9MiB 4096 0]", patchSizes)
 	}
 }
+
+func TestRootGetAttrFallsBackToListWhenStatForbidden(t *testing.T) {
+	for _, allowList := range []bool{true, false} {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/v1/status", func(w http.ResponseWriter, r *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "active"})
+		})
+		handler := func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet && (r.URL.Path == "/v1/fs" || r.URL.Path == "/v1/fs/") && r.URL.Query().Has("list") && allowList {
+				_ = json.NewEncoder(w).Encode(map[string]any{"entries": []map[string]any{{"name": "child", "is_dir": true}}})
+				return
+			}
+			http.Error(w, `{"error":"fs access denied"}`, http.StatusForbidden)
+		}
+		mux.HandleFunc("/v1/fs", handler)
+		mux.HandleFunc("/v1/fs/", handler)
+		srv := httptest.NewServer(mux)
+		c, err := New(client.New(srv.URL, ""), Options{RemoteRoot: "/"})
+		if err != nil {
+			srv.Close()
+			t.Fatal(err)
+		}
+		res, err := c.Do(context.Background(), &fs.Op{Kind: fs.OpGetAttr, Path: "/"}, nil)
+		if allowList {
+			if err != nil || res.Attr == nil || !res.Attr.IsDir() || res.Attr.Mode != 0o755 {
+				srv.Close()
+				t.Fatalf("allowList=true root GetAttr = (%+v, %v), want dir 0755", res.Attr, err)
+			}
+		} else if se, ok := err.(*fs.StatusError); !ok || se.Status != gofuse.EACCES {
+			srv.Close()
+			t.Fatalf("allowList=false root GetAttr err = %v, want EACCES", err)
+		}
+		if _, childErr := c.Do(context.Background(), &fs.Op{Kind: fs.OpGetAttr, Path: "/secret"}, nil); childErr == nil {
+			srv.Close()
+			t.Fatalf("non-root GetAttr err = nil, want EACCES")
+		}
+		srv.Close()
+	}
+}

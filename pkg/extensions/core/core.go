@@ -945,6 +945,11 @@ func (c *Core) statOp(ctx context.Context, path string, allowListing bool) (fs.R
 				}
 			}
 		}
+		if path == "/" && shouldFallbackRootStatToList(err) {
+			if _, lerr := c.cl.ListCtx(ctx, c.remotePath("/")); lerr == nil {
+				return fs.Result{Attr: &fs.Attr{Kind: fs.KindDir, Mode: 0o755}}, nil
+			}
+		}
 		if attr, ok := c.statFromParentListing(ctx, path, err); ok {
 			return fs.Result{Attr: attr}, nil
 		}
@@ -955,6 +960,22 @@ func (c *Core) statOp(ctx context.Context, path string, allowListing bool) (fs.R
 		obs.ObserveObservation(parent, dirEntryInfoFromAttr(name, attr), obsToken)
 	}
 	return fs.Result{Attr: attr}, nil
+}
+
+func shouldFallbackRootStatToList(err error) bool {
+	if client.IsForbidden(err) {
+		return true
+	}
+	var se *client.StatusError
+	if !errors.As(err, &se) {
+		return false
+	}
+	switch se.StatusCode {
+	case http.StatusBadRequest, http.StatusMethodNotAllowed, http.StatusNotImplemented:
+		return true
+	default:
+		return false
+	}
 }
 
 // statFromParentListing serves a stat by matching the parent listing when
