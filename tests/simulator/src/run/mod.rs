@@ -159,6 +159,7 @@ pub struct RunArgs {
     pub home: Option<PathBuf>,
     pub server: Option<String>,
     pub api_key: Option<String>,
+    pub env_api_key_fallback: bool,
     pub bin: String,
     pub repeat: u32,
     pub budgets: Vec<String>,
@@ -176,6 +177,168 @@ pub struct RunArgs {
     pub payload_dir: Option<PathBuf>,
     pub seed_dir: Option<PathBuf>,
     pub env: BTreeMap<String, String>,
+}
+
+fn is_sensitive_env_key(k: &str) -> bool {
+    let up = k.to_ascii_uppercase();
+    up.contains("API_KEY")
+        || up.contains("SECRET")
+        || up.contains("TOKEN")
+        || up.contains("PASSWORD")
+        || up.contains("PASSWD")
+        || up.ends_with("_KEY")
+        || up == "KEY"
+}
+
+fn collect_secret_values(a: &RunArgs, api_key: &str) -> Vec<String> {
+    let mut raw: Vec<String> = Vec::new();
+    let mut push = |val: &str| {
+        let t = val.trim();
+        if t.len() >= 4 {
+            raw.push(t.to_string());
+        }
+    };
+    push(api_key);
+    if let Some(pk) = &a.tidbcloud_public_key {
+        push(pk);
+    }
+    if let Some(sk) = &a.tidbcloud_private_key {
+        push(sk);
+    }
+    for (k, v) in &a.env {
+        if is_sensitive_env_key(k) {
+            push(v);
+        }
+    }
+    for (k, v) in std::env::vars() {
+        if is_sensitive_env_key(&k) {
+            push(&v);
+        }
+    }
+    raw.sort_by(|x, y| y.len().cmp(&x.len()).then_with(|| x.cmp(y)));
+    raw.dedup();
+    raw
+}
+
+pub(crate) fn redact_secrets(input: &str, secrets: &[String]) -> String {
+    static PATTERNS: OnceLock<(
+        regex::Regex,
+        regex::Regex,
+        regex::Regex,
+        regex::Regex,
+    )> = OnceLock::new();
+    let (re_token, re_bearer, re_flag, re_env) = PATTERNS.get_or_init(|| {
+        (
+            regex::Regex::new(r"(?:drive9|d9k)_[A-Za-z0-9_-]{8,}").unwrap(),
+            regex::Regex::new(r#"(?i)(Authorization:\s*Bearer\s+)[^\s"']+"#).unwrap(),
+            regex::Regex::new(
+                r#"((?:--api-key|--tidbcloud-public-key|--tidbcloud-private-key)(?:=|\s+))(?:'[^']*'|"[^"]*"|[^\s"']+)"#,
+            )
+            .unwrap(),
+            regex::Regex::new(
+                r#"(\b(?:DRIVE9_API_KEY|API_KEY|DRIVE9_TIDBCLOUD_PUBLIC_KEY|DRIVE9_TIDBCLOUD_PRIVATE_KEY|TIDBCLOUD_PUBLIC_KEY|TIDBCLOUD_PRIVATE_KEY)=)(?:'[^']*'|"[^"]*"|[^\s"']+)"#,
+            )
+            .unwrap(),
+        )
+    });
+    let mut out = input.to_string();
+    for s in secrets {
+        if !s.is_empty() && out.contains(s.as_str()) {
+            out = out.replace(s.as_str(), "[REDACTED]");
+        }
+    }
+    out = re_token.replace_all(&out, "[REDACTED]").into_owned();
+    out = re_bearer.replace_all(&out, "${1}[REDACTED]").into_owned();
+    out = re_flag.replace_all(&out, "${1}[REDACTED]").into_owned();
+    out = re_env.replace_all(&out, "${1}[REDACTED]").into_owned();
+    out
+}
+
+fn open_private_log(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let f = opts.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(f)
+}
+
+fn spawn_redacted_pipe<R: std::io::Read + Send + 'static>(
+    reader: R,
+    sink: Arc<Mutex<std::fs::File>>,
+    secrets: Arc<Vec<String>>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut br = BufReader::new(reader);
+        let mut buf = Vec::with_capacity(512);
+        loop {
+            buf.clear();
+            match br.read_until(b'\n', &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let line = String::from_utf8_lossy(&buf);
+                    let redacted = redact_secrets(&line, &secrets);
+                    if let Ok(mut out) = sink.lock() {
+                        let _ = out.write_all(redacted.as_bytes());
+                        let _ = out.flush();
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn record_teardown_failure(run_dir: &Path, name: &str, msg: &str) {
+    let entry = json!({
+        "claim": "tenant-teardown",
+        "kind": "teardown",
+        "state": "fail",
+        "raw_state": "fail",
+        "accepted": false,
+        "reason": msg,
+    });
+    let mut checks_vec = Vec::new();
+    let checks_path = run_dir.join("checks.json");
+    if let Ok(raw) = std::fs::read_to_string(&checks_path)
+        && let Ok(v) = serde_json::from_str::<Value>(&raw)
+        && let Some(arr) = v["checks"].as_array()
+    {
+        checks_vec = arr.clone();
+    }
+    checks_vec.push(entry);
+    let _ = std::fs::write(
+        &checks_path,
+        serde_json::to_string_pretty(&json!({
+            "verdict": Outcome::Fail.tag(),
+            "checks": &checks_vec,
+        }))
+        .unwrap_or_default(),
+    );
+    let _ = std::fs::write(
+        run_dir.join("report.tap"),
+        render_tap(name, &checks_vec, &Outcome::Fail),
+    );
+    let run_path = run_dir.join("run.json");
+    if let Ok(raw) = std::fs::read_to_string(&run_path)
+        && let Ok(mut v) = serde_json::from_str::<Value>(&raw)
+    {
+        v["verdict"] = json!(Outcome::Fail.tag());
+        let mut reasons: Vec<Value> = v["reasons"].as_array().cloned().unwrap_or_default();
+        reasons.push(json!(msg));
+        v["reasons"] = Value::Array(reasons);
+        let _ = std::fs::write(
+            &run_path,
+            serde_json::to_string_pretty(&v).unwrap_or_default(),
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -347,11 +510,24 @@ pub fn run(a: RunArgs) -> Result<i32> {
     let _ = std::fs::remove_dir_all(&home);
 
     let explicit_server = a.server.is_some();
-    if explicit_server && a.api_key.is_none() {
-        if let Ok(k) = std::env::var("DRIVE9_API_KEY")
+    if explicit_server && a.env_api_key_fallback {
+        if a.api_key.is_none()
+            && let Ok(k) = std::env::var("DRIVE9_API_KEY")
             && !k.trim().is_empty()
         {
             a.api_key = Some(k.trim().to_string());
+        }
+        if a.tidbcloud_public_key.is_none()
+            && let Ok(k) = std::env::var("TIDBCLOUD_PUBLIC_KEY")
+            && !k.trim().is_empty()
+        {
+            a.tidbcloud_public_key = Some(k.trim().to_string());
+        }
+        if a.tidbcloud_private_key.is_none()
+            && let Ok(k) = std::env::var("TIDBCLOUD_PRIVATE_KEY")
+            && !k.trim().is_empty()
+        {
+            a.tidbcloud_private_key = Some(k.trim().to_string());
         }
     }
     let existing_tenant = a.api_key.is_some();
@@ -396,7 +572,7 @@ pub fn run(a: RunArgs) -> Result<i32> {
                 &a.tidbcloud_private_key,
             )?,
         };
-        let (outcome, dir) = run_once(
+        let (mut outcome, dir) = run_once(
             &a,
             &script,
             &name,
@@ -408,8 +584,13 @@ pub fn run(a: RunArgs) -> Result<i32> {
             case_timeout,
             &mut sb,
         );
-        if !existing_tenant {
-            delete_tenant(&server_addr, &tenant.1);
+        if !existing_tenant
+            && let Err(e) = delete_tenant(&server_addr, &tenant.1)
+        {
+            let msg = format!("tenant teardown failed for {}: {e:#}", tenant.0);
+            eprintln!("{msg}");
+            record_teardown_failure(&run_dir, &name, &msg);
+            outcome = Outcome::Fail;
         }
         sb.teardown();
         lines.push(format!("{}  {}  {}", dir.display(), outcome.tag(), r));
@@ -476,11 +657,13 @@ fn run_once(
         }
     };
 
+    let secrets = Arc::new(collect_secret_values(a, &tenant.1));
     let mut runner = Runner {
         bin,
         server_for_mount,
         real_server: a.server.clone().unwrap_or_default(),
         api_key: tenant.1.clone(),
+        secrets: secrets.clone(),
         run_dir: run_dir.to_path_buf(),
         ws: ws.clone(),
         mount: None,
@@ -640,18 +823,10 @@ fn run_once(
 
     let script_log = run_dir.join("logs").join("script.out");
     let _ = std::fs::create_dir_all(run_dir.join("logs"));
-    let log_file = match std::fs::File::create(&script_log) {
-        Ok(f) => f,
+    let log_file = match open_private_log(&script_log) {
+        Ok(f) => Arc::new(Mutex::new(f)),
         Err(e) => {
             eprintln!("creating script log failed: {e}");
-            runner.lock().unwrap().teardown();
-            return (Outcome::Blocked, home.to_path_buf());
-        }
-    };
-    let log_err = match log_file.try_clone() {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("cloning script log handle failed: {e}");
             runner.lock().unwrap().teardown();
             return (Outcome::Blocked, home.to_path_buf());
         }
@@ -663,8 +838,8 @@ fn run_once(
         .arg("d9-script")
         .arg(script)
         .current_dir(&ws)
-        .stdout(Stdio::from(log_file))
-        .stderr(Stdio::from(log_err));
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     cmd.env("PATH", format!("{}:{}", bindir.display(), orig_path))
         .env("MOUNT", &ws)
         .env("RUN_DIR", run_dir)
@@ -707,6 +882,14 @@ fn run_once(
             return (Outcome::Blocked, home.to_path_buf());
         }
     };
+    let out_pipe = child
+        .stdout
+        .take()
+        .map(|p| spawn_redacted_pipe(p, log_file.clone(), secrets.clone()));
+    let err_pipe = child
+        .stderr
+        .take()
+        .map(|p| spawn_redacted_pipe(p, log_file.clone(), secrets.clone()));
     let script_pid = child.id();
     register_pgid(script_pid);
     let mut terminal = "completed".to_string();
@@ -740,7 +923,16 @@ fn run_once(
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+    unsafe {
+        libc::kill(-(script_pid as i32), libc::SIGKILL);
+    }
     unregister_pgid(script_pid);
+    if let Some(h) = out_pipe {
+        let _ = h.join();
+    }
+    if let Some(h) = err_pipe {
+        let _ = h.join();
+    }
     script_done.store(true, Ordering::Relaxed);
     let _ = UnixStream::connect(&sock_path);
     {
@@ -1303,6 +1495,7 @@ pub struct Runner {
     pub server_for_mount: String,
     pub real_server: String,
     pub api_key: String,
+    pub secrets: Arc<Vec<String>>,
     pub run_dir: PathBuf,
     pub ws: PathBuf,
     pub mount: Option<Proc>,
@@ -2293,26 +2486,18 @@ impl Runner {
         match kind {
             "shell" => {
                 let rc = c["shell_rc"].as_i64().unwrap_or(1);
+                let out = redact_secrets(c["shell_out"].as_str().unwrap_or(""), &self.secrets);
                 match rc {
                     0 => (Outcome::Pass, String::new()),
                     2 => (
                         Outcome::Unsupported,
-                        format!(
-                            "payload declared unsupported: {}",
-                            c["shell_out"].as_str().unwrap_or("")
-                        ),
+                        format!("payload declared unsupported: {out}"),
                     ),
                     3 => (
                         Outcome::Unconfirmed,
-                        format!(
-                            "payload declared unconfirmed: {}",
-                            c["shell_out"].as_str().unwrap_or("")
-                        ),
+                        format!("payload declared unconfirmed: {out}"),
                     ),
-                    r => (
-                        Outcome::Fail,
-                        format!("payload rc={r}: {}", c["shell_out"].as_str().unwrap_or("")),
-                    ),
+                    r => (Outcome::Fail, format!("payload rc={r}: {out}")),
                 }
             }
             "manifest-equals" => {
@@ -2499,8 +2684,18 @@ impl Runner {
                 let hay = match art {
                     "journal" => std::fs::read_to_string(&self.journal_path).unwrap_or_default(),
                     "script.out" => {
-                        std::fs::read_to_string(self.run_dir.join("logs").join("script.out"))
-                            .unwrap_or_default()
+                        let p = self.run_dir.join("logs").join("script.out");
+                        let mut s = std::fs::read_to_string(&p).unwrap_or_default();
+                        if !pattern_hit(pat, &s) {
+                            for _ in 0..10 {
+                                std::thread::sleep(Duration::from_millis(15));
+                                s = std::fs::read_to_string(&p).unwrap_or_default();
+                                if pattern_hit(pat, &s) {
+                                    break;
+                                }
+                            }
+                        }
+                        s
                     }
                     "mount.log" => {
                         let mut s = String::new();
@@ -2688,16 +2883,16 @@ fn run_control(
 
     let script_log = run_dir.join("logs").join("control.out");
     let orig_path = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into());
+    let ctrl_out = open_private_log(&script_log)?;
+    let ctrl_err = ctrl_out.try_clone()?;
     let mut cmd = Command::new("sh");
     cmd.arg("-c")
         .arg("umask 022; exec sh \"$@\"")
         .arg("d9-control")
         .arg(script)
         .current_dir(&cws)
-        .stdout(Stdio::from(std::fs::File::create(&script_log)?))
-        .stderr(Stdio::from(
-            std::fs::OpenOptions::new().append(true).open(&script_log)?,
-        ))
+        .stdout(Stdio::from(ctrl_out))
+        .stderr(Stdio::from(ctrl_err))
         .env("STUB", "1")
         .env("MOUNT", &cws)
         .env("RUN_DIR", &cscratch)
@@ -2759,16 +2954,35 @@ fn write_private_tenant_json(path: &Path, val: &Value) {
     }
 }
 
-pub fn delete_tenant(server: &str, api_key: &str) {
+pub fn delete_tenant(server: &str, api_key: &str) -> Result<()> {
     let url = format!("{}/v1/tenant", server.trim_end_matches('/'));
     let bearer = format!("Bearer {api_key}");
-    let _ = http_request(
-        "DELETE",
-        &url,
-        &[("Authorization", &bearer)],
-        b"",
-        Duration::from_secs(30),
-    );
+    let mut last_err = String::new();
+    for attempt in 0..3 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        match http_request(
+            "DELETE",
+            &url,
+            &[("Authorization", &bearer)],
+            b"",
+            Duration::from_secs(30),
+        ) {
+            Ok(resp) if (200..300).contains(&resp.status) => return Ok(()),
+            Ok(resp) => {
+                let body = String::from_utf8_lossy(&resp.body);
+                last_err = format!("HTTP {}: {}", resp.status, body.trim());
+                if resp.status < 500 && resp.status != 429 {
+                    break;
+                }
+            }
+            Err(e) => {
+                last_err = format!("{e:#}");
+            }
+        }
+    }
+    bail!("DELETE {url} failed: {last_err}")
 }
 
 pub fn resolve_existing_tenant(
@@ -2937,5 +3151,80 @@ mod run_tests {
         ];
         let (o4, _) = aggregate_verdict(&acc_unconf, &[], "completed", Some(0), None);
         assert_eq!(o4, Outcome::Pass);
+    }
+
+    #[test]
+    fn redact_secrets_scrubs_credentials_and_preserves_diagnostics() {
+        let secrets = vec!["custom-shared-secret-value".to_string()];
+        let trace = concat!(
+            "+ export DRIVE9_API_KEY=drive9_0123456789abcdef\n",
+            "+ d9-http -H 'Authorization: Bearer custom-shared-secret-value' http://127.0.0.1:9009/v1/status\n",
+            "+ drive9 delete --server http://127.0.0.1:9009 --api-key d9k_live_secret_token --tidbcloud-private-key priv_xyz123\n",
+            "local-control: ok\n",
+            "ENOSPC\n",
+        );
+        let got = redact_secrets(trace, &secrets);
+        assert!(!got.contains("drive9_0123456789abcdef"), "{got}");
+        assert!(!got.contains("custom-shared-secret-value"), "{got}");
+        assert!(!got.contains("d9k_live_secret_token"), "{got}");
+        assert!(!got.contains("priv_xyz123"), "{got}");
+        assert!(got.contains("local-control: ok"), "{got}");
+        assert!(got.contains("ENOSPC"), "{got}");
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn delete_tenant_checks_http_status_and_teardown_failure_rewrites_artifacts() {
+        let dir = std::env::temp_dir().join(format!("d9-del-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let srv = crate::server::Server::start(&dir.join("srv")).unwrap();
+        let run_dir = dir.join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+
+        let (_tid, key) = provision(&srv.addr(), &run_dir, &None, &None).unwrap();
+        delete_tenant(&srv.addr(), &key).unwrap();
+        assert!(
+            delete_tenant(&srv.addr(), &key).is_err(),
+            "deleting an already-deleted tenant must return non-2xx error"
+        );
+
+        std::fs::write(
+            run_dir.join("checks.json"),
+            serde_json::to_string_pretty(&json!({
+                "verdict": "pass",
+                "checks": [{"claim": "smoke", "state": "pass", "raw_state": "pass", "accepted": true}],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            run_dir.join("run.json"),
+            serde_json::to_string_pretty(&json!({
+                "case": "demo",
+                "verdict": "pass",
+                "reasons": [],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        record_teardown_failure(&run_dir, "demo", "tenant teardown failed for t1: HTTP 500");
+
+        let rj: Value =
+            serde_json::from_str(&std::fs::read_to_string(run_dir.join("run.json")).unwrap())
+                .unwrap();
+        assert_eq!(rj["verdict"], "fail");
+        assert!(
+            rj["reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v.as_str().unwrap_or("").contains("tenant teardown failed"))
+        );
+        let tap = std::fs::read_to_string(run_dir.join("report.tap")).unwrap();
+        assert!(tap.contains("not ok 2 - tenant-teardown"), "{tap}");
+
+        drop(srv);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

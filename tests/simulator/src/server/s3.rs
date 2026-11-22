@@ -51,6 +51,36 @@ impl S3Conn {
     pub async fn client_get(&self, key: String) -> Result<Vec<u8>, String> {
         get_object(self.clone(), key).await
     }
+
+    pub fn delete_tenant_objects(&self, tenant_id: &str) {
+        if !tenant_id.is_empty() && !tenant_id.contains('/') && !tenant_id.contains("..") {
+            let _ = std::fs::remove_dir_all(self.object_path(&format!("t/{tenant_id}")));
+        }
+    }
+
+    pub fn clone_tenant_objects(&self, src_tenant: &str, dst_tenant: &str) -> std::io::Result<()> {
+        let src = self.object_path(&format!("t/{src_tenant}"));
+        if !src.exists() {
+            return Ok(());
+        }
+        let dst = self.object_path(&format!("t/{dst_tenant}"));
+        copy_dir_recursive(&src, &dst)
+    }
+}
+
+fn copy_dir_recursive(src: & std::path::Path, dst: & std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let dst_child = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_recursive(&entry.path(), &dst_child)?;
+        } else if ty.is_file() {
+            std::fs::copy(entry.path(), dst_child)?;
+        }
+    }
+    Ok(())
 }
 
 // ------------------------------------------------------------- object API

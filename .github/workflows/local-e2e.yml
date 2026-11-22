@@ -62,7 +62,7 @@ jobs:
   local-e2e:
     name: Local E2E
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: ${{ github.event_name == 'schedule' && 120 || 45 }}
     permissions:
       contents: read
     steps:
@@ -192,14 +192,22 @@ jobs:
           fi
           JOBS="${{ inputs.jobs || '4' }}"
           if [ "${{ github.event_name }}" = "schedule" ]; then
+            rc=0
             "$SIMULATOR_BIN" run-suite tests/cases/suites.toml \
               --tier daily-fault,daily-fuse \
               --jobs "$JOBS" \
               --fail-on-all-skip \
               --bin ./bin/drive9 \
               --home /tmp/sim-daily \
-              $SERVER_ARG
-            exit 0
+              $SERVER_ARG || rc=$?
+            "$SIMULATOR_BIN" run-suite tests/cases/suites.toml \
+              --tier daily-bench \
+              --jobs 1 \
+              --fail-on-all-skip \
+              --bin ./bin/drive9 \
+              --home /tmp/sim-daily-bench \
+              $SERVER_ARG || rc=$?
+            exit "$rc"
           fi
           TIER="${{ inputs.tier || 'pr' }}"
           "$SIMULATOR_BIN" run-suite tests/cases/suites.toml \
@@ -218,5 +226,6 @@ jobs:
           path: |
             /tmp/sim-run/**
             /tmp/sim-daily/**
+            /tmp/sim-daily-bench/**
             !/tmp/sim-**/tenant.json
           if-no-files-found: ignore

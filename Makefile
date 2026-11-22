@@ -244,7 +244,12 @@ build-simulator-release:
 			darwin/amd64) target="x86_64-apple-darwin" ;; \
 			*) echo "Unsupported simulator target $(GOOS)/$(GOARCH); set RUST_TARGET explicitly" >&2; exit 1 ;; \
 		esac; \
+		host_os_arch="$$($(GO) env GOHOSTOS)/$$($(GO) env GOHOSTARCH)"; \
 		if ! rustup target list --installed 2>/dev/null | grep -qx "$$target"; then \
+			if [ "$(GOOS)/$(GOARCH)" != "$$host_os_arch" ]; then \
+				echo "Rust target $$target is not installed for cross-compiling $(GOOS)/$(GOARCH) on $$host_os_arch; run: rustup target add $$target" >&2; \
+				exit 1; \
+			fi; \
 			target=""; \
 		fi; \
 	fi; \

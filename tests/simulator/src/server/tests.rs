@@ -1115,3 +1115,84 @@ fn git_workspaces_contract_roundtrip() {
     drop(server);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn tenant_delete_purges_s3_prefix_without_breaking_fork() {
+    let dir = tmpdir("s3-purge");
+    let server = Server::start_with_threshold(None, &dir, 64).unwrap();
+    let addr = server.addr();
+
+    let (st, _, pb) = http(&addr, req("POST", "/v1/provision", None, &[], &[]), &[]);
+    assert_eq!(st, 202);
+    let pv: Value = serde_json::from_slice(&pb).unwrap();
+    let parent_id = pv["tenant_id"].as_str().unwrap().to_string();
+    let parent_key = pv["api_key"].as_str().unwrap().to_string();
+
+    let payload = b"s3-backed-payload-exceeding-64-byte-inline-threshold-0123456789abcdef!";
+    let (st, _, _) = http(
+        &addr,
+        req("PUT", "/v1/fs/large.bin", Some(&parent_key), &[], payload),
+        payload,
+    );
+    assert_eq!(st, 200);
+
+    let parent_s3_dir = dir.join("s3").join("buckets").join("drive9").join("t").join(&parent_id);
+    assert!(parent_s3_dir.is_dir(), "expected parent S3 prefix at {}", parent_s3_dir.display());
+
+    let (st, _, fb) = http(&addr, req("POST", "/v1/fork", Some(&parent_key), &[], &[]), &[]);
+    assert_eq!(st, 202);
+    let fv: Value = serde_json::from_slice(&fb).unwrap();
+    let fork_id = fv["tenant_id"].as_str().unwrap().to_string();
+    let fork_key = fv["api_key"].as_str().unwrap().to_string();
+    let fork_s3_dir = dir.join("s3").join("buckets").join("drive9").join("t").join(&fork_id);
+    assert!(fork_s3_dir.is_dir(), "expected cloned fork S3 prefix at {}", fork_s3_dir.display());
+
+    let (st, _, _) = http(&addr, req("DELETE", "/v1/tenant", Some(&parent_key), &[], &[]), &[]);
+    assert_eq!(st, 200);
+    assert!(!parent_s3_dir.exists(), "parent S3 prefix must be purged on DELETE /v1/tenant");
+
+    let (st, _, got) = http(&addr, req("GET", "/v1/fs/large.bin", Some(&fork_key), &[], &[]), &[]);
+    assert_eq!(st, 200);
+    assert_eq!(got.as_slice(), payload);
+
+    let (st, _, _) = http(&addr, req("DELETE", "/v1/fork", Some(&fork_key), &[], &[]), &[]);
+    assert_eq!(st, 200);
+    assert!(!fork_s3_dir.exists(), "fork S3 prefix must be purged on DELETE /v1/fork");
+
+    drop(server);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn fork_create_rolls_back_meta_record_on_copy_failure() {
+    let dir = tmpdir("fork-rollback");
+    let meta = Meta::open(&dir).unwrap();
+    meta.create_tenant("tsrc", "drive9_src_key").unwrap();
+    let s3 = s3::open(dir.clone(), "http://127.0.0.1:9/s3".into()).unwrap();
+    let state = AppState {
+        dir: dir.clone(),
+        public_base: "http://127.0.0.1:9".into(),
+        inline_threshold: 1024,
+        s3,
+        meta,
+        tenants: Mutex::new(HashMap::new()),
+        hubs: Hubs::default(),
+        mounts: MountRegistry::default(),
+        journals: JournalStore::default(),
+    };
+    let src = state.tenant("tsrc").unwrap();
+
+    // Force `rusqlite::Connection::open(dst)` to fail by pre-creating `dst` as a directory.
+    let bad_dst = dir.join("unwritable-dir-target.db");
+    std::fs::create_dir_all(&bad_dst).unwrap();
+
+    let res = create_fork_into(&state, &src, "tsrc", "tfork_bad", "drive9_fork_bad", &bad_dst);
+    assert!(res.is_err(), "expected fork into a directory path to fail");
+    assert_eq!(
+        state.meta.tenant_id_by_key("drive9_fork_bad"),
+        None,
+        "failed fork must roll back its meta.db tenant row"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

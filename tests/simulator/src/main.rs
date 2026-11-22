@@ -135,6 +135,12 @@ enum Commands {
         /// parallel case workers (`serial = true` cases run sequentially after parallel wave)
         #[arg(long, short = 'j', default_value_t = 1)]
         jobs: usize,
+        /// TiDB Cloud public key for tidb_cloud_native provisioning
+        #[arg(long)]
+        tidbcloud_public_key: Option<String>,
+        /// TiDB Cloud private key for tidb_cloud_native provisioning
+        #[arg(long)]
+        tidbcloud_private_key: Option<String>,
     },
     /// test-tool dependency management
     Tools {
@@ -226,6 +232,7 @@ fn main() -> Result<()> {
             home,
             server,
             api_key,
+            env_api_key_fallback: true,
             bin,
             repeat,
             budgets,
@@ -255,6 +262,8 @@ fn main() -> Result<()> {
             stop_on_fail,
             fail_on_all_skip,
             jobs,
+            tidbcloud_public_key,
+            tidbcloud_private_key,
         } => run::run_suite(run::RunSuiteArgs {
             manifest,
             cases_dir,
@@ -267,6 +276,8 @@ fn main() -> Result<()> {
             stop_on_fail,
             fail_on_all_skip,
             jobs,
+            tidbcloud_public_key,
+            tidbcloud_private_key,
         })?,
         Commands::Tools { ensure_fstest } => run::tools_ensure_fstest(ensure_fstest)?,
         #[cfg(feature = "server")]

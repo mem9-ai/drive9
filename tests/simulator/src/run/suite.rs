@@ -52,6 +52,33 @@ pub struct RunSuiteArgs {
     pub stop_on_fail: bool,
     pub fail_on_all_skip: bool,
     pub jobs: usize,
+    pub tidbcloud_public_key: Option<String>,
+    pub tidbcloud_private_key: Option<String>,
+}
+
+fn resolve_suite_api_key(
+    explicit: Option<&str>,
+    has_external_server: bool,
+    env_key: Option<&str>,
+) -> Option<String> {
+    if let Some(k) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(k.to_string());
+    }
+    if has_external_server {
+        return env_key
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+    }
+    None
+}
+
+fn resolve_effective_jobs(jobs: usize, has_shared_api_key: bool) -> usize {
+    if has_shared_api_key {
+        1
+    } else {
+        jobs.max(1)
+    }
 }
 
 fn tier_matches(filter: Option<&str>, case_tier: Option<&str>) -> bool {
@@ -173,12 +200,27 @@ pub fn run_suite(a: RunSuiteArgs) -> Result<i32> {
         unreachable!("--server checked above")
     });
 
-    // A pre-existing shared tenant API key shares `/` across cases; force serial execution.
-    let effective_jobs = if a.api_key.is_some() {
-        1
-    } else {
-        a.jobs.max(1)
-    };
+    let env_api_key = std::env::var("DRIVE9_API_KEY").ok();
+    let effective_api_key = resolve_suite_api_key(
+        a.api_key.as_deref(),
+        a.server.is_some(),
+        env_api_key.as_deref(),
+    );
+    let tidb_pub = a.tidbcloud_public_key.clone().or_else(|| {
+        std::env::var("TIDBCLOUD_PUBLIC_KEY")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    });
+    let tidb_priv = a.tidbcloud_private_key.clone().or_else(|| {
+        std::env::var("TIDBCLOUD_PRIVATE_KEY")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    });
+    // A pre-existing shared tenant API key (via --api-key or DRIVE9_API_KEY) shares `/`
+    // across cases; force serial execution.
+    let effective_jobs = resolve_effective_jobs(a.jobs, effective_api_key.is_some());
     let unsupported_code = Outcome::Unsupported.code();
     let slots: Mutex<Vec<Option<(String, i32, f64)>>> =
         Mutex::new(vec![None; selected.len()]);
@@ -201,7 +243,8 @@ pub fn run_suite(a: RunSuiteArgs) -> Result<i32> {
             sandbox: c.sandbox.clone().unwrap_or_else(|| "host".into()),
             home: Some(case_home.clone()),
             server: Some(server.clone()),
-            api_key: a.api_key.clone(),
+            api_key: effective_api_key.clone(),
+            env_api_key_fallback: false,
             bin: a.bin.clone(),
             repeat: 1,
             budgets: c.budgets.clone(),
@@ -212,8 +255,8 @@ pub fn run_suite(a: RunSuiteArgs) -> Result<i32> {
             overlay: c.overlay.clone(),
             write_cache_size_mb: c.write_cache_size_mb,
             allow_other: c.allow_other,
-            tidbcloud_public_key: None,
-            tidbcloud_private_key: None,
+            tidbcloud_public_key: tidb_pub.clone(),
+            tidbcloud_private_key: tidb_priv.clone(),
             fstest: c.fstest.clone().or_else(|| a.fstest.clone()),
             payload_dir: None,
             seed_dir: None,
@@ -463,6 +506,17 @@ mod suite_tests {
         ));
         assert!(tier_matches(Some("daily"), Some("daily-bench")));
         assert!(!tier_matches(Some("daily"), Some("pr-fuse")));
+    }
+
+    #[test]
+    fn shared_env_api_key_forces_serial_suite_jobs() {
+        let env_k = resolve_suite_api_key(None, true, Some("drive9_staging_key"));
+        assert_eq!(env_k.as_deref(), Some("drive9_staging_key"));
+        assert_eq!(resolve_effective_jobs(4, env_k.is_some()), 1);
+
+        let builtin_k = resolve_suite_api_key(None, false, Some("drive9_staging_key"));
+        assert_eq!(builtin_k, None);
+        assert_eq!(resolve_effective_jobs(4, builtin_k.is_some()), 4);
     }
 
     #[test]

@@ -399,6 +399,17 @@ async fn tenant_status(
     )
 }
 
+fn purge_tenant_storage(state: &AppState, id: &str) {
+    state.tenants.lock().unwrap().remove(id);
+    state.hubs.drop_tenant(id);
+    state.mounts.drop_tenant(id);
+    state.journals.drop_tenant(id);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(state.dir.join(format!("tenant-{id}.db{suffix}")));
+    }
+    state.s3.delete_tenant_objects(id);
+}
+
 async fn tenant_delete(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     headers: HeaderMap,
@@ -409,50 +420,81 @@ async fn tenant_delete(
     if state.meta.delete_tenant(&id).is_err() {
         return err_resp(500, "delete failed");
     }
-    state.tenants.lock().unwrap().remove(&id);
-    state.hubs.drop_tenant(&id);
-    state.mounts.drop_tenant(&id);
-    state.journals.drop_tenant(&id);
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(state.dir.join(format!("tenant-{id}.db{suffix}")));
-    }
+    purge_tenant_storage(&state, &id);
     json_resp(200, json!({"status": "ok"}))
 }
 
 // ------------------------------------------------------------- fork / sql
 
+pub(crate) fn create_fork_into(
+    state: &AppState,
+    src_tenant: &TenantDb,
+    src_id: &str,
+    new_id: &str,
+    key: &str,
+    dst: &Path,
+) -> Result<(), (u16, String)> {
+    if state.meta.create_tenant(new_id, key).is_err() {
+        return Err((500, "fork failed".into()));
+    }
+    let rollback = || {
+        let _ = state.meta.delete_tenant(new_id);
+        let _ = std::fs::remove_file(dst);
+        let _ = std::fs::remove_file(format!("{}-wal", dst.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", dst.display()));
+        purge_tenant_storage(state, new_id);
+    };
+    let copy_res: Result<(), String> = (|| {
+        let src_conn = src_tenant.db.lock().unwrap();
+        let mut dst_conn =
+            rusqlite::Connection::open(dst).map_err(|e| format!("fork: open target: {e}"))?;
+        rusqlite::backup::Backup::new(&src_conn, &mut dst_conn)
+            .and_then(|b| b.run_to_completion(5, std::time::Duration::from_millis(50), None))
+            .map_err(|_| "fork: copy tenant state".to_string())?;
+        drop(src_conn);
+        let old_prefix = format!("t/{src_id}/");
+        let new_prefix = format!("t/{new_id}/");
+        dst_conn
+            .execute(
+                "UPDATE file_nodes SET s3_key = ?2 || substr(s3_key, ?3) WHERE s3_key LIKE ?1",
+                rusqlite::params![
+                    format!("{old_prefix}%"),
+                    &new_prefix,
+                    (old_prefix.len() + 1) as i64
+                ],
+            )
+            .map_err(|e| format!("fork: rewrite s3 keys: {e}"))?;
+        let _ = dst_conn.execute(
+            "UPDATE extent_chunks SET slices = replace(slices, ?1, ?2)",
+            rusqlite::params![&old_prefix, &new_prefix],
+        );
+        drop(dst_conn);
+        state
+            .s3
+            .clone_tenant_objects(src_id, new_id)
+            .map_err(|e| format!("fork: copy s3 objects: {e}"))?;
+        Ok(())
+    })();
+    if let Err(msg) = copy_res {
+        rollback();
+        return Err((500, msg));
+    }
+    Ok(())
+}
+
 async fn fork_create(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Response {
-    let Ok((t, _id)) = auth(&state, &headers) else {
+    let Ok((t, src_id)) = auth(&state, &headers) else {
         return err_resp(401, "authentication required");
     };
     let new_id = format!("t{}", random_hex(10));
     let key = random_key();
-    if state.meta.create_tenant(&new_id, &key).is_err() {
-        return err_resp(500, "fork failed");
-    }
     let dst = state.dir.join(format!("tenant-{new_id}.db"));
-    let src_conn = t.db.lock().unwrap();
-    let mut dst_conn = match rusqlite::Connection::open(&dst) {
-        Ok(c) => c,
-        Err(e) => {
-            drop(src_conn);
-            return err_resp(500, &format!("fork: open target: {e}"));
-        }
-    };
-    if rusqlite::backup::Backup::new(&src_conn, &mut dst_conn)
-        .and_then(|b| b.run_to_completion(5, std::time::Duration::from_millis(50), None))
-        .is_err()
-    {
-        drop(src_conn);
-        drop(dst_conn);
-        let _ = std::fs::remove_file(&dst);
-        return err_resp(500, "fork: copy tenant state");
+    if let Err((code, msg)) = create_fork_into(&state, &t, &src_id, &new_id, &key, &dst) {
+        return err_resp(code, &msg);
     }
-    drop(src_conn);
-    drop(dst_conn);
     json_resp(
         202,
         json!({"tenant_id": new_id, "api_key": key, "status": "active"}),
