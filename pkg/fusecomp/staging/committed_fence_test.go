@@ -351,3 +351,161 @@ func TestRecoverFromDiskNeverRewindsGenerations(t *testing.T) {
 		t.Fatalf("generation after recovery = %d, want above the replayed %d", next, gen)
 	}
 }
+
+// TestCommittedFenceIsDroppedByANewerStaging pins the supersession rule: a
+// fresh publication for the path clears the fence, so the new image is never
+// masked by the one that already landed.
+func TestCommittedFenceIsDroppedByANewerStaging(t *testing.T) {
+	idx, dir := newFenceTestIndex(t)
+	const path = "/restaged.txt"
+	gen, err := idx.Put(path, 3, PendingNew)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := idx.MarkCommittedIfGeneration(path, gen, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := idx.Put(path, 4, PendingOverwrite); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := idx.CommittedFence(path); ok {
+		t.Fatal("a newer staging left the landed fence in place")
+	}
+	if _, err := os.Stat(filepath.Join(dir, HashPath(path)+".fence")); !os.IsNotExist(err) {
+		t.Fatalf("fence file still on disk after a newer staging: %v", err)
+	}
+}
+
+// TestCommittedFenceFailureKeepsThePendingEntry pins the failure half: a fence
+// that cannot be written must leave the pending entry alone (so a retry can
+// still fence it) instead of deleting the only local image.
+func TestCommittedFenceFailureKeepsThePendingEntry(t *testing.T) {
+	idx, dir := newFenceTestIndex(t)
+	const path = "/unwritable.txt"
+	gen, err := idx.Put(path, 3, PendingNew)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Make the fence path unusable: the fence name is a directory, so the
+	// atomic rename into it fails.
+	if err := os.Mkdir(filepath.Join(dir, HashPath(path)+".fence"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := idx.MarkCommittedIfGeneration(path, gen, 0); err == nil {
+		t.Fatal("MarkCommittedIfGeneration succeeded with an unwritable fence path")
+	}
+	if meta, ok := idx.GetMeta(path); !ok || meta.Generation != gen {
+		t.Fatalf("pending entry after a failed fence = %+v, %v; want the original entry", meta, ok)
+	}
+}
+
+// TestCommittedFenceGatesDataFramesByJournalSeq pins the frame-level half of
+// the replay gate, which has no generation to compare: a data (fsync) frame
+// appended before the fence is masked, while a frame appended after it is a
+// later acknowledged write and must still replay.
+func TestCommittedFenceGatesDataFramesByJournalSeq(t *testing.T) {
+	dir := t.TempDir()
+	idx, err := NewPendingIndex(filepath.Join(dir, "pending"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal, err := NewJournal(filepath.Join(dir, "journal.wal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = journal.Close() })
+	shadows, err := NewShadowStore(filepath.Join(dir, "shadow"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { shadows.Close() })
+	idx.SetJournal(journal)
+
+	const oldPath = "/old-frame.txt"
+	const newPath = "/new-frame.txt"
+	oldPayload := []byte("pre-commit image")
+	if err := shadows.WriteFull(oldPath, oldPayload, 3); err != nil {
+		t.Fatal(err)
+	}
+	oldGen, err := idx.Put(oldPath, int64(len(oldPayload)), PendingNew)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A legacy fsync frame for the landed image, appended before the fence.
+	if err := journal.AppendSync(JournalEntry{Op: JournalFsync, Path: oldPath, Offset: 0, Length: int64(len(oldPayload))}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := idx.MarkCommittedIfGeneration(oldPath, oldGen, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// A write acknowledged AFTER the landing: its frame must survive.
+	newPayload := []byte("post-commit image")
+	if err := shadows.WriteFull(newPath, newPayload, 3); err != nil {
+		t.Fatal(err)
+	}
+	if err := journal.AppendSync(JournalEntry{Op: JournalFsync, Path: newPath, Offset: 0, Length: int64(len(newPayload))}); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted, err := NewPendingIndex(filepath.Join(dir, "pending"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted.SetShadowStore(shadows)
+	if err := ReplayJournalIntoPending(journal, restarted, shadows); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := restarted.GetMeta(oldPath); ok {
+		t.Fatal("a data frame masked by the fence resurrected the landed image")
+	}
+	if meta, ok := restarted.GetMeta(newPath); !ok {
+		t.Fatal("a data frame appended after the fence was dropped")
+	} else if meta.Size != int64(len(newPayload)) {
+		t.Fatalf("recovered size = %d, want %d", meta.Size, len(newPayload))
+	}
+}
+
+// TestUnreadableCommittedFenceFailsClosed pins the fail-closed rule: a fence
+// whose bytes cannot be decoded must not be treated as absent. Replay aborts,
+// and a reader that cannot report an error gets a mask-everything fence for the
+// path instead of a replay hole.
+func TestUnreadableCommittedFenceFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	idx, err := NewPendingIndex(filepath.Join(dir, "pending"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal, err := NewJournal(filepath.Join(dir, "journal.wal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = journal.Close() })
+	shadows, err := NewShadowStore(filepath.Join(dir, "shadow"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { shadows.Close() })
+
+	const path = "/corrupt-fence.txt"
+	if err := os.WriteFile(filepath.Join(dir, "pending", HashPath(path)+".fence"), []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ReplayJournalIntoPending(journal, idx, shadows); err == nil {
+		t.Fatal("replay ran with an unreadable fence")
+	}
+	fence, ok := idx.CommittedFence(path)
+	if !ok {
+		t.Fatal("an unreadable fence reported no fence for its path")
+	}
+	if fence.Generation != ^uint64(0) || fence.JournalSeq != ^uint64(0) {
+		t.Fatalf("mask fence = %+v, want every frame masked", fence)
+	}
+	// The unreadable file must never be settled away automatically.
+	if err := idx.SettleCommittedFences(journal, shadows); err != nil {
+		t.Fatalf("settle = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "pending", HashPath(path)+".fence")); err != nil {
+		t.Fatalf("settle removed an unreadable fence: %v", err)
+	}
+}

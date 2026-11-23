@@ -640,29 +640,17 @@ func New(opts Options) (*Writeback, error) {
 	}
 	if w.wbCache != nil {
 		// A staged pair dropped by a plain read (Get/GetView/ListPending) is the
-		// same loss a barrier must not report as success. The cache already kept
-		// the durable marker itself; this hook additionally records the loss in
-		// the commit queue's bounded terminal-failure map, which is what rename
-		// and unlink consult (and which write-sync stacks do not have).
-		w.wbCache.OnViewLost = func(remotePath string, err error) {
-			if w.queue == nil {
-				return
-			}
-			w.queue.RecordTerminalFailureForPath(remotePath, fmt.Errorf("%w: %w", errStagedViewLost, err))
-		}
+		// same loss a barrier must not report as success. The cache writes the
+		// durable marker itself and is the SINGLE source of truth for write-cache
+		// losses; mirroring it into the commit queue's in-memory map only
+		// created two records that could disagree after a restart, so nothing is
+		// wired here. pathTerminalFailure consults both.
 		workers := opts.UploadConcurrency
 		if workers <= 0 {
 			workers = defaultUploadConcurrency
 		}
 		up := NewWriteBackUploader(opts.Client, w.wbCache, workers, root)
-		up.TerminalFailureForPath = func(localPath string) error {
-			if w.queue == nil {
-				// Write-sync stacks have no queue: the cache's durable marker is
-				// the only record, and it survives a restart.
-				return w.wbCache.ViewLoss(localPath)
-			}
-			return w.queue.PathTerminalFailure(localPath)
-		}
+		up.TerminalFailureForPath = w.pathTerminalFailure
 		up.TerminalFailureSeq = func(localPath string) uint64 {
 			if w.queue == nil {
 				return 0
@@ -1026,9 +1014,14 @@ func (w *Writeback) pathTerminalFailure(path string) error {
 		return nil
 	}
 	if w.queue != nil {
-		return w.queue.PathTerminalFailure(path)
+		if err := w.queue.PathTerminalFailure(path); err != nil {
+			return err
+		}
 	}
 	if w.wbCache != nil {
+		// The durable marker outlives the process, so it answers even when the
+		// queue's in-memory failure map came up empty after a restart. Checking
+		// only the queue here is what let Sync/DrainFlush certify a pruned pair.
 		return w.wbCache.ViewLoss(path)
 	}
 	return nil
@@ -1050,10 +1043,22 @@ func (w *Writeback) Drain(ctx context.Context) error {
 	// plane that owns the buffering handles — because the facade sees only
 	// the outermost decorator (the cache extension's handle) and a plain
 	// Flush on it merely snapshots locally under the write-back policy.
+	// A handle flush can fail with a durable reason (a staged pair that was
+	// pruned has nothing left to land). Draining the remaining handles and
+	// waiting out the uploader/queue is still worth doing, but the drain as a
+	// whole must not report success: syncfs(2) would certify a file whose image
+	// never landed.
+	var firstErr error
 	w.liveSet.Range(func(key, _ any) bool {
 		if h, ok := key.(*bufferingHandle); ok {
 			hctx, cf := context.WithTimeout(ctx, 30*time.Second)
-			_ = h.DrainFlush(hctx)
+			// A lost staged image is not a debuggable per-path state like a
+			// terminal conflict (which the handle reports on its own Sync): the
+			// pair is gone, no work remains for the uploader or the queue, and
+			// the drain would otherwise certify a file whose image never landed.
+			if err := h.DrainFlush(hctx); err != nil && firstErr == nil && errors.Is(err, staging.ErrStagedViewLost) {
+				firstErr = err
+			}
 			cf()
 		}
 		return true
@@ -1064,14 +1069,16 @@ func (w *Writeback) Drain(ctx context.Context) error {
 		w.debounce.FlushAll()
 	}
 	if w.uploader != nil {
-		if err := w.uploader.WaitIdle(ctx); err != nil {
-			return err
+		if err := w.uploader.WaitIdle(ctx); err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
 	if w.queue != nil {
-		return w.queue.WaitIdle(ctx)
+		if err := w.queue.WaitIdle(ctx); err != nil && firstErr == nil {
+			firstErr = err
+		}
 	}
-	return nil
+	return firstErr
 }
 
 // Stop tears the extension down after Drain.

@@ -173,12 +173,19 @@ func TestRetainedShadowIsFencedAsCommitted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	pending.SetJournal(j)
 	cq := NewCommitQueue(nil, shadow, pending, j, 1, 8)
 	// The staging handle kept newer bytes for this landing.
 	cq.retainedShadows.Store(path, shadowGen)
-	// The fence must capture the newest journal sequence it was written after.
+	// A previous append gives the fence a real sequence to capture, then a
+	// closed journal makes the commit marker non-durable deterministically.
+	if err := j.AppendSync(staging.JournalEntry{Op: staging.JournalFsync, Path: path, Length: int64(len(payload))}); err != nil {
+		t.Fatal(err)
+	}
 	seqAtFence := j.CurrentSeq()
-	// A closed journal makes the commit marker non-durable deterministically.
+	if seqAtFence == 0 {
+		t.Fatal("expected a non-zero journal sequence before the fence")
+	}
 	if err := j.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -214,8 +221,10 @@ func TestRetainedShadowIsFencedAsCommitted(t *testing.T) {
 	if fence.Generation != pendingGen || fence.ShadowGen != shadowGen {
 		t.Fatalf("fence = %+v, want generation %d and shadow %d", fence, pendingGen, shadowGen)
 	}
-	if fence.JournalSeq != seqAtFence {
-		t.Fatalf("fence journal seq = %d, want %d (the frames it masks)", fence.JournalSeq, seqAtFence)
+	// The fence must cover every frame appended before it. It is allowed to be
+	// higher: the failed commit-marker append still consumed a sequence.
+	if fence.JournalSeq < seqAtFence {
+		t.Fatalf("fence journal seq = %d, want at least %d (the frames it masks)", fence.JournalSeq, seqAtFence)
 	}
 	if err := cq.PathTerminalFailure(path); err != nil {
 		t.Fatalf("PathTerminalFailure after a landed commit = %v, want nil", err)

@@ -2,6 +2,7 @@ package staging
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -124,9 +125,7 @@ func (idx *PendingIndex) loadCommittedFencesLocked() error {
 			continue
 		}
 		idx.fences[fence.Path] = fence
-		if fence.Generation > idx.nextGen.Load() {
-			idx.nextGen.Store(fence.Generation)
-		}
+		idx.advanceNextGen(fence.Generation)
 	}
 	return idx.fencesErr
 }
@@ -141,6 +140,11 @@ func (idx *PendingIndex) CommittedFence(remotePath string) (CommittedFence, bool
 	idx.ensureCommittedFencesLoaded()
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
+	if idx.fencesErr != nil {
+		// The scan failed, so nothing can be proven about this path: mask it
+		// rather than let a replay resurrect a landed image.
+		return CommittedFence{Path: remotePath, Generation: ^uint64(0), JournalSeq: ^uint64(0)}, true
+	}
 	if _, masked := idx.fenceMask[HashPath(remotePath)]; masked {
 		return CommittedFence{Path: remotePath, Generation: ^uint64(0), JournalSeq: ^uint64(0)}, true
 	}
@@ -230,8 +234,10 @@ func (idx *PendingIndex) SettleCommittedFences(j *Journal, shadows *ShadowStore)
 			}
 		}
 		if shadows != nil {
-			if _, err := shadows.RemoveIfGenerationDurable(fence.Path, settleShadowGen(shadows, fence)); err != nil {
-				return fmt.Errorf("settle committed fence shadow %s: %w", fence.Path, err)
+			if gen, ok := settleShadowGen(shadows, fence); ok {
+				if _, err := shadows.RemoveIfGenerationDurable(fence.Path, gen); err != nil {
+					return fmt.Errorf("settle committed fence shadow %s: %w", fence.Path, err)
+				}
 			}
 		}
 		// The eclipsed .meta must go before the fence: once the fence is gone,
@@ -239,11 +245,15 @@ func (idx *PendingIndex) SettleCommittedFences(j *Journal, shadows *ShadowStore)
 		// No newer entry exists for the path (checked above), so any file left
 		// is the fenced generation or older.
 		eclipsed := filepath.Join(idx.dir, HashPath(fence.Path)+".meta")
-		_ = os.Remove(eclipsed)
-		idx.ClearCommittedFence(fence.Path)
-		if err := fsyncDir(idx.dir); err != nil {
-			return fmt.Errorf("settle committed fence %s: %w", fence.Path, err)
+		if err := os.Remove(eclipsed); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("settle committed fence meta %s: %w", fence.Path, err)
 		}
+		// The eclipsed .meta removal must be durable BEFORE the fence goes, or a
+		// power loss could restore the file with no fence left to mask it.
+		if err := fsyncDir(idx.dir); err != nil {
+			return fmt.Errorf("settle committed fence dir %s: %w", fence.Path, err)
+		}
+		idx.ClearCommittedFence(fence.Path)
 	}
 	return nil
 }
@@ -260,20 +270,27 @@ func (idx *PendingIndex) pendingGeneration(remotePath string) (uint64, bool) {
 	return meta.Generation, true
 }
 
-// settleShadowGen picks the generation to remove for a fence's shadow. After a
-// restart the shadow store's in-memory generations are empty, so the pre-crash
-// fence.ShadowGen cannot match; the recovered file is adopted first and its
-// fresh generation is used. Zero means "remove whatever is there", which is the
-// right answer for a cold store that found no shadow at all.
-func settleShadowGen(shadows *ShadowStore, fence CommittedFence) ContentGen {
-	if active := shadows.ActiveGeneration(fence.Path); active != 0 {
-		if fence.ShadowGen == 0 || active == fence.ShadowGen {
-			return active
-		}
-		return 0
+// settleShadowGen picks the generation to remove for a fence's shadow.
+//
+// Zero is the shadow store's wildcard (delete whatever is on disk), so it is
+// only used when the store has no live generation at all — the cold-store case
+// where a fresh process has not adopted the pre-crash file. When the store does
+// own a generation, the removal is generation-scoped, and a different live
+// generation belongs to a newer staged image and must be skipped.
+func settleShadowGen(shadows *ShadowStore, fence CommittedFence) (ContentGen, bool) {
+	active := shadows.ActiveGeneration(fence.Path)
+	switch {
+	case active == 0:
+		// Cold store: writeGen is in-memory, so a pre-crash generation cannot
+		// match. Remove by wildcard, which unlinks the disk file directly.
+		return 0, true
+	case fence.ShadowGen == 0:
+		// The landing already removed its shadow durably; nothing to do.
+		return 0, false
+	case active == fence.ShadowGen:
+		return active, true
+	default:
+		// A newer staged image owns the file now.
+		return 0, false
 	}
-	if gen := shadows.EnsureActiveGeneration(fence.Path); gen != 0 {
-		return gen
-	}
-	return 0
 }

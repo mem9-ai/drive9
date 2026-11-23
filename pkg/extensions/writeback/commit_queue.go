@@ -1517,6 +1517,7 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) error {
 		cancel()
 	}
 	hadLocal := false
+	var removalErr error
 	if cq.shadows != nil && cq.shadows.Has(path) {
 		hadLocal = true
 		if !preserveLocal {
@@ -1571,14 +1572,17 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) error {
 		// their WAL frames: without it a crash replays them. Fall back to
 		// the non-preserving cleanup below.
 		if cq.shadows != nil {
-			cq.shadows.Remove(path)
+			// Durable removal: this path is the fallback for a marker that could
+			// not be fsynced, so the unlink itself must survive a power loss or
+			// replay resurrects the deleted name.
+			if _, rerr := cq.shadows.RemoveIfGenerationDurable(path, 0); rerr != nil {
+				removalErr = rerr
+			}
 		}
 	}
-	// ShadowStore.Remove and PendingIndex.Remove discard their disk errors,
-	// so verify with evidence instead of assuming: a read-only or failing
-	// cache filesystem can reject the marker AND leave the durable shadow
-	// behind, and replay would then upload the deleted name after a restart.
-	if cq.shadows == nil || cq.shadows.VerifyRemoved(path) == nil {
+	// The durable removal reports its own verdict; VerifyRemoved used to check
+	// from outside the shadow path lock and raced a concurrent spill.
+	if cq.shadows == nil || (removalErr == nil && !cq.shadows.Has(path)) {
 		// Confirmed gone — finish the degrade-to-non-preserving cleanup
 		// (the anonymous fd loses its staged image on a failing WAL, but
 		// the unlink cannot resurrect).

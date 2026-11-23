@@ -314,6 +314,7 @@ func (idx *PendingIndex) RemoveIfGeneration(remotePath string, expectedGen uint6
 		return false
 	}
 	delete(idx.items, remotePath)
+	idx.ensureCommittedFencesLoadedLocked()
 	clearedFence := idx.clearCommittedFenceLocked(remotePath)
 	idx.mu.Unlock()
 
@@ -387,6 +388,7 @@ func (idx *PendingIndex) RenamePending(oldPath, newPath string) bool {
 	idx.items[newPath] = &newMeta
 	// Both names changed incarnation: a landed fence at either endpoint would
 	// mask the entry that now lives there.
+	idx.ensureCommittedFencesLoadedLocked()
 	clearedOld := idx.clearCommittedFenceLocked(oldPath)
 	clearedNew := idx.clearCommittedFenceLocked(newPath)
 	idx.mu.Unlock()
@@ -809,6 +811,7 @@ func (idx *PendingIndex) CommitRename(oldPath string, newMeta *WriteBackMeta) {
 	idx.mu.Lock()
 	delete(idx.items, oldPath)
 	idx.items[newMeta.Path] = newMeta
+	idx.ensureCommittedFencesLoadedLocked()
 	clearedOld := idx.clearCommittedFenceLocked(oldPath)
 	clearedNew := idx.clearCommittedFenceLocked(newMeta.Path)
 	idx.mu.Unlock()
@@ -1358,6 +1361,10 @@ func (idx *PendingIndex) publishRecoveredMeta(metaBytes []byte) error {
 	}
 	idx.mu.Lock()
 	idx.ensureCommittedFencesLoadedLocked()
+	if idx.fencesErr != nil {
+		idx.mu.Unlock()
+		return nil
+	}
 	if _, masked := idx.fenceMask[HashPath(meta.Path)]; masked {
 		// Fail closed: an undecodable fence may mask any generation of this path.
 		idx.mu.Unlock()

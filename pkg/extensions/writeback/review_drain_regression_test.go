@@ -399,3 +399,42 @@ func TestDrainCacheLookupPreservesLaterWrite(t *testing.T) {
 	}
 	assertReviewDrainRemote(t, backend, append(first, tail...))
 }
+
+// TestDrainFailsWhenAStagedPairWasPruned pins the drain contract: the only
+// production caller of DrainFlush is Writeback.Drain (syncfs(2) / mount drain),
+// and it used to discard the error. A pruned pair has no work left in the
+// uploader or the queue, so without the propagated error the drain certified a
+// file whose image never landed.
+func TestDrainFailsWhenAStagedPairWasPruned(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	backend := testbackend.NewBackend()
+	cache, err := staging.NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	chain, wb := newReviewDrainStack(t, http.HandlerFunc(backend.ServeHTTP), cache)
+	h, _ := stageReviewDrainFile(t, ctx, chain)
+	// The close snapshot left a staged pair in the write cache. Corrupt it the
+	// way a torn write would, then prune it with a plain read so only the loss
+	// record remains.
+	cache.DropInMemoryPayload("/f")
+	if err := os.WriteFile(cache.DatFile("/f"), []byte("different bytes!"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := cache.Get("/f"); ok {
+		t.Fatal("read served a torn pair")
+	}
+	if err := cache.ViewLoss("/f"); err == nil {
+		t.Fatal("the prune recorded no loss")
+	}
+	h.mu.Lock()
+	staged := h.stagedToCache
+	h.mu.Unlock()
+	if !staged {
+		t.Fatal("the handle no longer owns the staged image; the scenario needs the drain to look at it")
+	}
+	if err := wb.Drain(ctx); err == nil {
+		t.Fatal("drain reported success after the staged pair was pruned")
+	}
+}
