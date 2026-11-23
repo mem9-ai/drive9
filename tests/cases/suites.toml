@@ -562,4 +562,6 @@ name = "drive9/fuse/namespace-100k"
 tier = "daily-bench"
 perf = true
 serial = true
-timeout = "60m"
+# Per-phase hang guards add up to 3900s, so the case timeout must sit above
+# that or the runner kills the case before a guard can explain the stall.
+timeout = "90m"

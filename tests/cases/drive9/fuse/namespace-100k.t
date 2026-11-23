@@ -13,6 +13,7 @@
 #   NAMESPACE_FILES        files to create (default: 100000)
 #   NAMESPACE_DIRS         fan-out directories (default: 100)
 #   NAMESPACE_WORKERS      parallel creators (default: 8)
+#   NAMESPACE_FILE_BYTES   payload per file, metadata-only by default (default: 1)
 #   NAMESPACE_CREATE_CAP_S hang guard for creation (default: 1800)
 #   NAMESPACE_LIST_CAP_S   hang guard for readdir pass (default: 300)
 #   NAMESPACE_STAT_CAP_S   hang guard for stat pass (default: 900)
@@ -22,18 +23,19 @@ set -eu
 NAMESPACE_FILES="${NAMESPACE_FILES:-100000}"
 NAMESPACE_DIRS="${NAMESPACE_DIRS:-100}"
 NAMESPACE_WORKERS="${NAMESPACE_WORKERS:-8}"
+NAMESPACE_FILE_BYTES="${NAMESPACE_FILE_BYTES:-1}"
 NAMESPACE_CREATE_CAP_S="${NAMESPACE_CREATE_CAP_S:-1800}"
 NAMESPACE_LIST_CAP_S="${NAMESPACE_LIST_CAP_S:-300}"
 NAMESPACE_STAT_CAP_S="${NAMESPACE_STAT_CAP_S:-900}"
 NAMESPACE_FIND_CAP_S="${NAMESPACE_FIND_CAP_S:-900}"
-export NAMESPACE_FILES NAMESPACE_DIRS NAMESPACE_WORKERS
+export NAMESPACE_FILES NAMESPACE_DIRS NAMESPACE_WORKERS NAMESPACE_FILE_BYTES
 export NAMESPACE_CREATE_CAP_S NAMESPACE_LIST_CAP_S NAMESPACE_STAT_CAP_S NAMESPACE_FIND_CAP_S
 
 check shell --req 'drive9-namespace-100k-build' --claim 'create-100k-files-through-fuse-then-readdir-stat-and-find-them' -- sh -c '
     python3 - "$MOUNT" "$RUN_DIR" \
         "$NAMESPACE_FILES" "$NAMESPACE_DIRS" "$NAMESPACE_WORKERS" \
         "$NAMESPACE_CREATE_CAP_S" "$NAMESPACE_LIST_CAP_S" \
-        "$NAMESPACE_STAT_CAP_S" "$NAMESPACE_FIND_CAP_S" <<'\''PY'\''
+        "$NAMESPACE_STAT_CAP_S" "$NAMESPACE_FIND_CAP_S" "$NAMESPACE_FILE_BYTES" <<'\''PY'\''
 import concurrent.futures
 import json
 import os
@@ -45,6 +47,8 @@ mount, run_dir, files, dirs, workers, create_cap, list_cap, stat_cap, find_cap =
     sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]),
     float(sys.argv[6]), float(sys.argv[7]), float(sys.argv[8]), float(sys.argv[9]),
 )
+file_bytes = int(sys.argv[10])
+payload = b"x" * file_bytes
 root = os.path.join(mount, "ns100k")
 per_dir = max(1, files // dirs)
 expected = per_dir * dirs
@@ -67,7 +71,7 @@ def create():
         d, i = args
         path = os.path.join(root, "d%04d" % d, "f%06d" % i)
         with open(path, "wb") as fh:
-            fh.write(b"x")
+            fh.write(payload)
         return path
 
     work = [(d, i) for d in range(dirs) for i in range(per_dir)]
@@ -96,8 +100,8 @@ def stat_all():
         for i in range(per_dir):
             path = os.path.join(root, "d%04d" % d, "f%06d" % i)
             st = os.stat(path)
-            if st.st_size != 1:
-                raise SystemExit("unexpected size for %s: %d" % (path, st.st_size))
+            if st.st_size != file_bytes:
+                raise SystemExit("unexpected size for %s: %d, want %d" % (path, st.st_size, file_bytes))
             seen += 1
     return seen
 
@@ -124,6 +128,7 @@ report = {
     "schema_version": "drive9-bench/v1",
     "case": "drive9/fuse/namespace-100k",
     "files": created,
+    "file_bytes": file_bytes,
     "dirs": dirs,
     "workers": workers,
     "metrics": {
@@ -148,7 +153,7 @@ with open(os.path.join(run_dir, "namespace-100k.json"), "w", encoding="utf-8") a
 md = [
     "# Drive9 FUSE 100k workspace",
     "",
-    "- Files: %d across %d directories (%d creators)" % (created, dirs, workers),
+    "- Files: %d x %d bytes across %d directories (%d creators)" % (created, file_bytes, dirs, workers),
     "",
     "| Phase | Total (s) | Rate |",
     "|---|---:|---:|",
