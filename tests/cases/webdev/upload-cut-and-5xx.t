@@ -8,6 +8,11 @@ set -eu
 S="$RUN_DIR/cut5xx"
 rm -rf "$S" && mkdir -p "$S" settled mid srv
 head -c 524288 /dev/zero | tr '\0' 'M' > "$S/blob-512k.bin"
+i=1
+while [ "$i" -le 10 ]; do
+  { cat "$S/blob-512k.bin"; printf 'mid-payload-%s\n' "$i"; } > "$S/blob-$i.bin"
+  i=$((i + 1))
+done
 
 printf 'settled baseline\n' > settled/base.txt.part
 fsync settled/base.txt.part
@@ -26,7 +31,7 @@ window --expect may-fail-inflight --timeout 5m -- sh -c '
 S=$1
 i=1
 while [ "$i" -le 10 ]; do
-  if cp "$S/blob-512k.bin" "mid/f-$i.bin.part" 2>/dev/null && fsync "mid/f-$i.bin.part" 2>/dev/null; then
+  if cp "$S/blob-$i.bin" "mid/f-$i.bin.part" 2>/dev/null && fsync "mid/f-$i.bin.part" 2>/dev/null; then
     mv "mid/f-$i.bin.part" "mid/f-$i.bin" 2>/dev/null || true
   fi
   i=$((i + 1))
@@ -39,7 +44,7 @@ hold --for 2s
 i=1
 while [ "$i" -le 10 ]; do
   if [ -e "mid/f-$i.bin" ]; then
-    cmp "$S/blob-512k.bin" "mid/f-$i.bin"
+    cmp "$S/blob-$i.bin" "mid/f-$i.bin"
   fi
   i=$((i + 1))
 done
@@ -48,7 +53,7 @@ rm -f mid/*.part
 # Replay mid-cut batch cleanly.
 i=1
 while [ "$i" -le 10 ]; do
-  cp "$S/blob-512k.bin" "mid/f-$i.bin.part"
+  cp "$S/blob-$i.bin" "mid/f-$i.bin.part"
   fsync "mid/f-$i.bin.part"
   mv "mid/f-$i.bin.part" "mid/f-$i.bin"
   i=$((i + 1))
