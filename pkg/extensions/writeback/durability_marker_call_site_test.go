@@ -123,3 +123,30 @@ func TestUploadSyncReportsPrunedStagedImage(t *testing.T) {
 		t.Fatal("UploadSyncWithRevision over a pruned staged image = nil, want an error")
 	}
 }
+
+// TestUploadSyncKeepsFailingAfterThePairIsPruned pins the retry: once the only
+// staged copy was pruned as damaged, a retried barrier must not read the
+// resulting "nothing staged" as "already uploaded".
+func TestUploadSyncKeepsFailingAfterThePairIsPruned(t *testing.T) {
+	const path = "/pruned-retry.txt"
+	cache, err := staging.NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("staged image")
+	if err := cache.Put(path, payload, int64(len(payload)), staging.PendingNew); err != nil {
+		t.Fatal(err)
+	}
+	cache.DropInMemoryPayload(path)
+	if err := os.WriteFile(cache.DatFile(path), []byte("different bytes!"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	u := NewWriteBackUploader(nil, cache, 1)
+	ctx := context.Background()
+	if _, err := u.UploadSyncWithRevision(ctx, path); err == nil {
+		t.Fatal("first UploadSyncWithRevision over a torn pair = nil, want an error")
+	}
+	if _, err := u.UploadSyncWithRevision(ctx, path); err == nil {
+		t.Fatal("retried barrier reported success after the pair was pruned and never replaced")
+	}
+}

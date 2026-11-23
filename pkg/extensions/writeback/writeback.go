@@ -7100,6 +7100,9 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 	// a stale mode. Dropping it entirely (the old behavior) lost every chmod
 	// deferred onto an open writeback handle (chmod/12: 0777 → 0644).
 	mode, hasMode := h.pendingMode, h.hasPendingMode
+	// Kept for the failure path below: a failed fence must not consume an armed
+	// chmod, or a retried fsync/close restages the image with 0644.
+	armedMode, armedHasMode := mode, hasMode
 	// Fresh creates that never carried an explicit chmod still need the
 	// POSIX create mode published. The extent session does not take a mode
 	// field, so without this the promoted inode lands mode 000 and even
@@ -7199,6 +7202,12 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 			Length:  size,
 			BaseRev: baseRev,
 		}); err != nil {
+			// The staged meta already carries the mode, but the handle must keep
+			// it armed: fsync(2) failed, the caller will retry, and a restage from
+			// a consumed mode would publish 0644 over the requested bits.
+			h.mu.Lock()
+			h.pendingMode, h.hasPendingMode = armedMode, armedHasMode
+			h.mu.Unlock()
 			return fmt.Errorf("journal fsync fence for %s: %w", h.path, err)
 		}
 	}

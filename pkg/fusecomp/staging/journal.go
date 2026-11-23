@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"os"
@@ -81,9 +82,20 @@ type Journal struct {
 // sequence counter resumes from the highest Seq already on disk so that
 // appends before any Replay never reuse sequence numbers.
 func NewJournal(path string) (*Journal, error) {
+	_, statErr := os.Stat(path)
 	fd, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("journal open: %w", err)
+	}
+	if errors.Is(statErr, os.ErrNotExist) {
+		// A brand-new WAL: fsyncing its frames is pointless until the
+		// directory entry naming it is durable, or a crash can leave the
+		// frames on disk with no name to find them by — which recovery reads
+		// as an empty WAL.
+		if derr := fsyncDir(filepath.Dir(path)); derr != nil {
+			_ = fd.Close()
+			return nil, fmt.Errorf("journal dir sync: %w", derr)
+		}
 	}
 	j := &Journal{
 		fd:                fd,

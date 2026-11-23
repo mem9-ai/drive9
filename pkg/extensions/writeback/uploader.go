@@ -486,6 +486,12 @@ func (u *WriteBackUploader) uploadSyncWithMetadata(ctx context.Context, localPat
 	// data — GetMetaAndView would prune the entry when the .dat is missing.
 	chmodMeta, chmodOK := u.cache.GetMeta(localPath)
 	if !chmodOK {
+		if u.cache.HasViewLoss(localPath) {
+			// The record is gone because its pair was pruned as damaged, not
+			// because another upload consumed it. Reporting success here would
+			// answer a durability barrier for bytes this process dropped.
+			return 0, nil, fmt.Errorf("staged image for %s was pruned as damaged and has no replacement", localPath)
+		}
 		return 0, nil, nil // not in cache (may have been uploaded by the background worker we just waited for)
 	}
 	if chmodMeta.Kind == staging.PendingChmod {

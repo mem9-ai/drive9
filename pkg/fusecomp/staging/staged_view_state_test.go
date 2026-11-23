@@ -34,12 +34,25 @@ func TestGetMetaAndViewStateDistinguishesMissFromTornPair(t *testing.T) {
 	if err := os.WriteFile(c.DatFile(path), []byte("different bytes!"), 0o600); err != nil {
 		t.Fatalf("corrupt data: %v", err)
 	}
-	if _, _, state, err := c.GetMetaAndViewState(path); state != StagedViewNoData || err != nil {
-		t.Fatalf("state after corrupting the data = %v (err %v), want StagedViewNoData", state, err)
+	if _, _, state, err := c.GetMetaAndViewState(path); state != StagedViewNoData || err == nil {
+		t.Fatalf("state after corrupting the data = %v (err %v), want StagedViewNoData with a reason", state, err)
+	}
+	if !c.HasViewLoss(path) {
+		t.Fatal("no damage witness after the pair was pruned: a retried barrier would read it as already uploaded")
 	}
 
-	// Pruning removed the record: from here on the path is simply not staged.
+	// Pruning removed the record, but the witness keeps the failure visible: a
+	// barrier that retries must not read "nothing staged" as success.
+	if _, _, state, err := c.GetMetaAndViewState(path); state != StagedViewNoData || err == nil {
+		t.Fatalf("state for a pruned pair with a witness = %v (err %v), want StagedViewNoData", state, err)
+	}
+
+	// An explicit removal supersedes the witness.
+	c.Remove(path)
+	if c.HasViewLoss(path) {
+		t.Fatal("damage witness survived an explicit removal")
+	}
 	if _, _, state, _ := c.GetMetaAndViewState(path); state != StagedViewNoMeta {
-		t.Fatalf("state after the pair was pruned = %v, want StagedViewNoMeta", state)
+		t.Fatalf("state after explicit removal = %v, want StagedViewNoMeta", state)
 	}
 }

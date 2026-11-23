@@ -2788,6 +2788,7 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 
 	// Write durable commit record BEFORE cleaning up local state so that
 	// crash recovery never re-uploads an already committed entry.
+	var markerErr error
 	if cq.journal != nil && layerRef == "" {
 		// Durable before cleanup: recovery reads the WAL as written, and a
 		// marker still in the page cache after a power loss is not there —
@@ -2801,6 +2802,7 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 			// shadow/pending state, so replay finds no bytes to resurrect.
 			// Report the durability fault and keep going: bailing out here
 			// would leave exactly the local state a replay needs.
+			markerErr = err
 			safeLogPrintf("commit queue: journal commit marker not durable for %s: %v (continuing cleanup)", entry.Path, err)
 		}
 	}
@@ -2831,6 +2833,18 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 		if entry.PendingIndexGen != 0 {
 			cq.index.RemoveIfGeneration(entry.Path, entry.PendingIndexGen)
 		}
+	}
+	if markerErr != nil && cq.shadows != nil && cq.shadows.VerifyRemoved(entry.Path) != nil {
+		// The marker is not durable AND the shadow survived the removal:
+		// replay could resurrect this image from it. Mark the pending entry
+		// conflicted so recovery re-uploads it at a new revision instead of
+		// blindly recommitting the old one.
+		if cq.index != nil {
+			if _, err := cq.index.MarkConflictIfGeneration(entry.Path, entry.PendingIndexGen); err != nil {
+				safeLogPrintf("commit queue: conflict marker after a failed removal failed for %s: %v", entry.Path, err)
+			}
+		}
+		safeLogPrintf("commit queue: shadow survived the cleanup for %s after a non-durable commit marker; pending entry marked conflicted", entry.Path)
 	}
 	if cq.index != nil && cq.layerRefSnapshot() != "" {
 		if err := cq.index.MarkLayerCommittedIfGeneration(entry.Path, entry.PendingIndexGen, committedRev, entry.Mode, entry.HasMode, entry.LayerEntry); err != nil {
