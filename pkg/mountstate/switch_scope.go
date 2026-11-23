@@ -38,3 +38,23 @@ func SwitchJournalPath(mountID string) (string, error) {
 	}
 	return filepath.Join(stateDir(), "drive9-view-"+mountID+".log"), nil
 }
+
+// SwitchScopedJournalPath returns a scope-prefixed per-incarnation journal path
+// inside stateDir so unrelated mount scopes can skip each other without reading
+// or replaying foreign journal files.
+func SwitchScopedJournalPath(scope, mountID string) (string, error) {
+	if len(scope) < 16 {
+		return "", errors.New("invalid mount switch scope")
+	}
+	for i := 0; i < 16; i++ {
+		switch c := scope[i]; {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'f':
+		default:
+			return "", errors.New("invalid mount switch scope hex prefix")
+		}
+	}
+	if err := viewprotocol.ValidateOperationID(mountID); err != nil {
+		return "", err
+	}
+	return filepath.Join(stateDir(), "drive9-view-"+scope[:16]+"-"+mountID+".log"), nil
+}

@@ -42,6 +42,7 @@ type fakeSwitchBackend struct {
 	renewCnt   int
 	onBind     func(layerID string)
 	onRenew    func(layerID string)
+	onUnbind   func(layerID string, req client.LayerMountUnbindRequest)
 	onViewList func(layerID string)
 }
 

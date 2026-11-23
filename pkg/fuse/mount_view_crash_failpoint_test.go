@@ -54,7 +54,9 @@ func TestPrepareMountViewFailpointCrashAfterServerBindRecoversOnRestart(t *testi
 	require.Equal(t, "mount-fp-1", fb.layers[l1].OwnerMountID)
 	fb.mu.Unlock()
 
-	oldJPath, err := mountstate.SwitchJournalPath("mount-fp-1")
+	scope, err := mountstate.SwitchScope(cfg.Server, mountCredentialKind(&cfg)+":"+sha256HexString(mountCredentialSecret(&cfg)), "/", resolveCanonicalStateMountPoint(mp))
+	require.NoError(t, err)
+	oldJPath, err := mountstate.SwitchScopedJournalPath(scope, "mount-fp-1")
 	require.NoError(t, err)
 	_, err = os.Stat(oldJPath)
 	require.NoError(t, err)
@@ -63,7 +65,6 @@ func TestPrepareMountViewFailpointCrashAfterServerBindRecoversOnRestart(t *testi
 	// drains "mount-fp-1"'s orphaned journal, releases Fence 1 -> 2, unlinks oldJPath, and binds Fence 3!
 	mv, err := prepareMountView(context.Background(), cfg, baseClient, "mount-fp-2")
 	require.NoError(t, err)
-	defer func() { _ = mv.close(context.Background()) }()
 
 	_, err = os.Stat(oldJPath)
 	require.True(t, os.IsNotExist(err))
@@ -72,4 +73,10 @@ func TestPrepareMountViewFailpointCrashAfterServerBindRecoversOnRestart(t *testi
 	require.Equal(t, int64(3), fb.layers[l1].Info.Fence)
 	require.Equal(t, "mount-fp-2", fb.layers[l1].OwnerMountID)
 	fb.mu.Unlock()
+
+	newJPath, err := mountstate.SwitchScopedJournalPath(scope, "mount-fp-2")
+	require.NoError(t, err)
+	require.NoError(t, mv.close(context.Background()))
+	_, err = os.Stat(newJPath)
+	require.True(t, os.IsNotExist(err))
 }

@@ -202,7 +202,10 @@ func TestPrepareMountViewDrainsCrashedPriorIncarnationJournalAndPreservesOtherSc
 	}
 	baseClient := client.New(srv.URL, cfg.APIKey)
 
-	// 1. Seed an unlocked journal belonging to a DIFFERENT mountpoint/scope — must NOT be touched!
+	// 1. Seed unrelated journals in stateDir():
+	//    (a) valid other-scope journal with corrupt trailing bytes (must NOT block startup!)
+	//    (b) unscoped corrupt init-frame journal (must NOT block startup!)
+	//    (c) concurrent 0-byte journal file (must NOT be unlinked!)
 	otherScope, err := mountstate.SwitchScope(cfg.Server, mountCredentialKind(&cfg)+":"+sha256HexString(mountCredentialSecret(&cfg)), "/", resolveCanonicalStateMountPoint(otherMP))
 	require.NoError(t, err)
 	otherJPath, err := mountstate.SwitchJournalPath("mount-other")
@@ -210,12 +213,25 @@ func TestPrepareMountViewDrainsCrashedPriorIncarnationJournalAndPreservesOtherSc
 	otherJ, err := mountstate.OpenSwitchJournal(otherJPath, "mount-other", otherScope, viewprotocol.SwitchBinding{})
 	require.NoError(t, err)
 	require.NoError(t, otherJ.Close())
+	fCorruptOther, err := os.OpenFile(otherJPath, os.O_WRONLY|os.O_APPEND, 0o600)
+	require.NoError(t, err)
+	_, err = fCorruptOther.Write([]byte("corrupt-trailing-frame"))
+	require.NoError(t, err)
+	require.NoError(t, fCorruptOther.Close())
+
+	corruptHeaderJPath, err := mountstate.SwitchJournalPath("mount-foreign-corrupt0")
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(corruptHeaderJPath, []byte("bad0"), 0o600))
+
+	zeroByteRacerPath, err := mountstate.SwitchJournalPath("mount-racer-zero")
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(zeroByteRacerPath, nil, 0o600))
 
 	// 2. Simulate crashed prior incarnation ("mount-crashed") on the SAME mountpoint/scope:
 	// persisted bind_intent + server BindLayerMount (active odd Fence=1 under "mount-crashed"), then process died.
 	sameScope, err := mountstate.SwitchScope(cfg.Server, mountCredentialKind(&cfg)+":"+sha256HexString(mountCredentialSecret(&cfg)), "/", resolveCanonicalStateMountPoint(mp))
 	require.NoError(t, err)
-	crashedJPath, err := mountstate.SwitchJournalPath("mount-crashed")
+	crashedJPath, err := mountstate.SwitchScopedJournalPath(sameScope, "mount-crashed")
 	require.NoError(t, err)
 	crashedJ, err := mountstate.OpenSwitchJournal(crashedJPath, "mount-crashed", sameScope, viewprotocol.SwitchBinding{})
 	require.NoError(t, err)
@@ -231,15 +247,21 @@ func TestPrepareMountViewDrainsCrashedPriorIncarnationJournalAndPreservesOtherSc
 
 	// 3. Restart on the SAME mountpoint with a fresh actorID ("mount-restarted"):
 	// prepareMountView must drain "mount-crashed" (Fence 1 -> 2), unlink its stale journal,
-	// refresh L1, and bind a fresh exclusive lease (Fence=3) under "mount-restarted"!
+	// ignore foreign corrupt/zero-byte files, refresh L1, and bind Fence=3 under "mount-restarted"!
 	mv, err := prepareMountView(context.Background(), cfg, baseClient, "mount-restarted")
 	require.NoError(t, err)
-	defer func() { _ = mv.close(context.Background()) }()
+
+	restartedJPath, err := mountstate.SwitchScopedJournalPath(sameScope, "mount-restarted")
+	require.NoError(t, err)
+	_, statLiveErr := os.Stat(restartedJPath)
+	require.NoError(t, statLiveErr, "active mount journal must exist while mounted")
 
 	_, statCrashedErr := os.Stat(crashedJPath)
 	require.True(t, os.IsNotExist(statCrashedErr), "drained prior scope journal must be unlinked")
 	_, statOtherErr := os.Stat(otherJPath)
-	require.NoError(t, statOtherErr, "journal for unrelated mount scope must be preserved")
+	require.NoError(t, statOtherErr, "corrupt journal for unrelated mount scope must be preserved and ignored")
+	_, statRacerErr := os.Stat(zeroByteRacerPath)
+	require.NoError(t, statRacerErr, "concurrent zero-byte journal file must never be unlinked")
 
 	fb.mu.Lock()
 	require.Equal(t, int64(3), fb.layers[l1].Info.Fence)
@@ -248,6 +270,11 @@ func TestPrepareMountViewDrainsCrashedPriorIncarnationJournalAndPreservesOtherSc
 	require.Equal(t, "mount-crashed", fb.unbindOps[0].MountID)
 	require.Equal(t, mountstate.UnbindKindOp, fb.unbindOps[0].Kind)
 	fb.mu.Unlock()
+
+	// 4. Normal unmount (mv.close) drains current lease and unlinks its own journal file!
+	require.NoError(t, mv.close(context.Background()))
+	_, statClosedErr := os.Stat(restartedJPath)
+	require.True(t, os.IsNotExist(statClosedErr), "normal mountView.close must unlink drained journal file")
 }
 
 func TestMountViewSwitchRecoverStopsOutgoingLeaseQueryAbortedAndReplaysIdempotently(t *testing.T) {
@@ -294,14 +321,22 @@ func TestMountViewSwitchRecoverStopsOutgoingLeaseQueryAbortedAndReplaysIdempoten
 	require.ErrorAs(t, err, &swErr)
 	require.Equal(t, viewprotocol.CodeSwitchTargetRevoked, swErr.Code)
 
-	// 3. Verify no L1 renew races with L1 unbind during --recover, QuerySwitch sees ABORTED on op_rev_l2,
-	// and retrying the --recover request with the same OperationID replays SwitchDone idempotently!
+	// 3. Verify no L1 renew races with L1 unbind DURING drainPendingUnbindsLocked (before finishPendingLocked),
+	// QuerySwitch sees ABORTED on op_rev_l2, and retrying --recover replays SwitchDone idempotently!
 	var unbindSawActiveRenew atomic.Bool
-	var l1Unbound atomic.Bool
+	var l1UnbindStarted atomic.Bool
 	fb.mu.Lock()
 	fb.onBind = nil
+	fb.onUnbind = func(layerID string, _ client.LayerMountUnbindRequest) {
+		if layerID == l1 {
+			l1UnbindStarted.Store(true)
+			// Hold unbind open across 4x renewInterval (60ms vs 15ms) BEFORE finishPendingLocked runs;
+			// if StopRenew() was not called prior to unbind, background renews will fire inside this window!
+			time.Sleep(60 * time.Millisecond)
+		}
+	}
 	fb.onRenew = func(layerID string) {
-		if layerID == l1 && l1Unbound.Load() {
+		if layerID == l1 && l1UnbindStarted.Load() {
 			unbindSawActiveRenew.Store(true)
 		}
 	}
@@ -311,12 +346,12 @@ func TestMountViewSwitchRecoverStopsOutgoingLeaseQueryAbortedAndReplaysIdempoten
 		MountID: "mount-1", OperationID: "op_rec_main", ExpectedGeneration: 3, Layer: "main", Recover: true,
 	}
 	recResp, err := mountcontrol.RequestSwitch(ctx, ctrl.SocketPath(), recReq)
-	l1Unbound.Store(true)
 	require.NoError(t, err)
+	require.True(t, l1UnbindStarted.Load(), "server must have processed L1 unbind during --recover")
 	require.Equal(t, uint64(4), recResp.Receipt.Generation)
 	require.Equal(t, mountstate.SwitchDone, recResp.Receipt.State)
 
-	time.Sleep(45 * time.Millisecond)
+	time.Sleep(35 * time.Millisecond)
 	require.False(t, unbindSawActiveRenew.Load(), "outgoing layerLease renew must be stopped before AbortPendingForRecover + unbind")
 
 	// QuerySwitch on the aborted operation returns SwitchAborted cleanly!

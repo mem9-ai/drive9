@@ -23,6 +23,7 @@ type mountViewSwitch struct {
 	baseClient   *client.Client
 	remoteRoot   string
 	actorID      string
+	journalPath  string
 	journal      *mountstate.SwitchJournal
 	adapter      *viewRequestFS
 	current      *mountRuntime

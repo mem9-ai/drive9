@@ -98,7 +98,7 @@ func prepareMountView(ctx context.Context, cfg MountConfig, baseClient *client.C
 	if err != nil {
 		return nil, fmt.Errorf("fuse: switch scope: %w", err)
 	}
-	jPath, err := mountstate.SwitchJournalPath(actorID)
+	jPath, err := mountstate.SwitchScopedJournalPath(scope, actorID)
 	if err != nil {
 		return nil, fmt.Errorf("fuse: switch journal path: %w", err)
 	}
@@ -265,17 +265,18 @@ func prepareMountView(ctx context.Context, cfg MountConfig, baseClient *client.C
 		remoteRoot:   remoteRoot,
 	}
 	sw := &mountViewSwitch{
-		goos:       runtime.GOOS,
-		cfg:        cfg,
-		baseClient: baseClient,
-		remoteRoot: remoteRoot,
-		actorID:    actorID,
-		journal:    journal,
-		adapter:    adapter,
-		current:    rt,
-		notifier:   mv,
-		fence:      func(fctx context.Context) error { return fenceViewRootUpdates(fctx, mv) },
-		timing:     timing,
+		goos:        runtime.GOOS,
+		cfg:         cfg,
+		baseClient:  baseClient,
+		remoteRoot:  remoteRoot,
+		actorID:     actorID,
+		journalPath: jPath,
+		journal:     journal,
+		adapter:     adapter,
+		current:     rt,
+		notifier:    mv,
+		fence:       func(fctx context.Context) error { return fenceViewRootUpdates(fctx, mv) },
+		timing:      timing,
 	}
 	sw.buildRuntime = func(bctx context.Context, target viewprotocol.SwitchBinding, lease *layerMountBinding, gen mountRuntimeGeneration) (*mountRuntime, error) {
 		if err := bctx.Err(); err != nil {
@@ -413,6 +414,10 @@ func (v *mountView) close(ctx context.Context) error {
 		if !v.switcher.journal.Uncertain() {
 			_ = v.switcher.journal.QueueCurrentUnbindForUnmount()
 			_ = v.switcher.drainPendingUnbindsLocked(ctx)
+			snap := v.switcher.journal.Snapshot()
+			if !v.switcher.journal.Uncertain() && snap.Pending == nil && len(snap.PendingUnbinds) == 0 && (snap.Binding.LayerID == "" || snap.Binding.ReadOnly) && v.switcher.journalPath != "" {
+				_ = os.Remove(v.switcher.journalPath)
+			}
 		}
 		err = errors.Join(err, v.switcher.journal.Close())
 	}

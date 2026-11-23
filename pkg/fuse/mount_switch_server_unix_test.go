@@ -89,6 +89,11 @@ func (b *fakeSwitchBackend) serveLayersSubpath(w http.ResponseWriter, r *http.Re
 	case sub == "/unbind-mount" && r.Method == http.MethodPost:
 		var req client.LayerMountUnbindRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
+		if onUnbind := b.onUnbind; onUnbind != nil {
+			b.mu.Unlock()
+			onUnbind(layerID, req)
+			b.mu.Lock()
+		}
 		b.unbindOps = append(b.unbindOps, req)
 		if st.UnbindFailCnt > 0 {
 			st.UnbindFailCnt--
