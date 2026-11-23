@@ -326,8 +326,16 @@ def drain_seconds():
         return None
     try:
         with open(os.path.join(run_dir, "sync-%d.json" % best), encoding="utf-8") as fh:
-            return round(json.load(fh)["duration_ms"] / 1000.0, 3)
-    except (KeyError, ValueError, OSError):
+            doc = json.load(fh)
+    except (ValueError, OSError):
+        return None
+    # A failed drain still reports a duration_ms. Reporting it would put a number
+    # on a phase that did not complete, which the artifact contract forbids.
+    if doc.get("ok") is not True:
+        return None
+    try:
+        return round(doc["duration_ms"] / 1000.0, 3)
+    except (KeyError, TypeError, ValueError):
         return None
 
 
