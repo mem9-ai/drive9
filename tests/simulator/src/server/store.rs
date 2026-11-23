@@ -1039,7 +1039,9 @@ impl TenantDb {
         }
         if sn.is_extent() {
             let chunks = self.all_extent_chunks(&master);
-            return self.commit_extent(&dst, sn.size, -1, &chunks).map(|(r, _)| r);
+            return self
+                .commit_extent(&s3, &dst, sn.size, -1, &chunks)
+                .map(|(r, _)| r);
         }
         let data = match self.file_s3_key(&master) {
             Some(k) => super::s3::get_object(s3.clone(), k)
@@ -1211,6 +1213,7 @@ impl TenantDb {
             .unwrap_or_default()
     }
 
+    #[cfg(test)]
     pub fn is_block_referenced(&self, key: &str) -> bool {
         let conn = self.db.lock().unwrap();
         conn.query_row(
@@ -1222,16 +1225,63 @@ impl TenantDb {
         .unwrap_or(false)
     }
 
-    pub fn drop_gc_row(&self, key: &str) {
-        let _ = self
-            .db
-            .lock()
-            .unwrap()
-            .execute("DELETE FROM extent_block_gc WHERE block_key = ?1", [key]);
+    #[cfg(test)]
+    pub fn force_expire_gc_for_test(&self, key: &str) {
+        let _ = self.db.lock().unwrap().execute(
+            "UPDATE extent_block_gc SET available_at = 0 WHERE block_key = ?1",
+            [key],
+        );
+    }
+
+    /// Atomically verifies under `self.db` that `key` still has zero live
+    /// references and an expired `extent_block_gc` row before removing the
+    /// backing object from disk and dropping the GC row. Holding `self.db`
+    /// across `delete_object_sync` serializes deletion with `commit_extent`
+    /// and `prepare_block_presign`.
+    pub fn try_delete_expired_gc_block(&self, s3: &super::s3::S3Conn, key: &str) -> bool {
+        let conn = self.db.lock().unwrap();
+        let refs: i64 = conn
+            .query_row(
+                "SELECT refs FROM extent_block_refs WHERE block_key = ?1",
+                [key],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if refs > 0 {
+            let _ = conn.execute("DELETE FROM extent_block_gc WHERE block_key = ?1", [key]);
+            return false;
+        }
+        let still_expired: bool = conn
+            .query_row(
+                "SELECT 1 FROM extent_block_gc WHERE block_key = ?1 AND available_at <= ?2",
+                rusqlite::params![key, now_secs()],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if !still_expired {
+            return false;
+        }
+        super::s3::delete_object_sync(s3, key);
+        let _ = conn.execute("DELETE FROM extent_block_gc WHERE block_key = ?1", [key]);
+        true
+    }
+
+    /// Checks object presence under `self.db` and refreshes any pending
+    /// `extent_block_gc` lease so a concurrent `gc_sweep` that already
+    /// enumerated `key` cannot delete the object while presign/PUT/complete is
+    /// in flight.
+    pub fn prepare_block_presign(&self, s3: &super::s3::S3Conn, key: &str) -> bool {
+        let conn = self.db.lock().unwrap();
+        let _ = conn.execute(
+            "UPDATE extent_block_gc SET available_at = ?2 WHERE block_key = ?1",
+            rusqlite::params![key, now_secs() + GC_GRACE_SECS],
+        );
+        super::s3::head_object_sync(s3, key).is_some()
     }
 
     pub fn commit_extent(
         &self,
+        s3: &super::s3::S3Conn,
         path: &str,
         new_size: i64,
         expected_revision: i64,
@@ -1263,7 +1313,7 @@ impl TenantDb {
                 (1, random_inode())
             }
         };
-        let mut old_keys: Vec<String> = Vec::new();
+        let mut old_counts: BTreeMap<String, usize> = BTreeMap::new();
         {
             let mut stmt = tx
                 .prepare("SELECT slices FROM extent_chunks WHERE path = ?1")
@@ -1274,15 +1324,23 @@ impl TenantDb {
             for r in rows.flatten() {
                 if let Ok(slices) = serde_json::from_str::<Vec<Slice>>(&r) {
                     for sl in slices {
-                        old_keys.push(sl.key);
+                        *old_counts.entry(sl.key).or_insert(0) += 1;
                     }
                 }
             }
         }
-        let mut new_keys: Vec<String> = Vec::new();
+        let mut new_counts: BTreeMap<String, usize> = BTreeMap::new();
         for (_, slices) in chunk_slices {
             for sl in slices {
-                new_keys.push(sl.key.clone());
+                *new_counts.entry(sl.key.clone()).or_insert(0) += 1;
+            }
+        }
+        // Verify every referenced block still exists on disk while holding
+        // `self.db`: if `gc_sweep` deleted an expired unreferenced block after
+        // `verify_block` ran, fail before committing a dangling slice.
+        for key in new_counts.keys() {
+            if super::s3::head_object_sync(s3, key).is_none() {
+                return Err(StoreError::S3(format!("extent block missing: {key}")));
             }
         }
         let chunks: Vec<i64> = {
@@ -1300,14 +1358,16 @@ impl TenantDb {
         for (c, slices) in chunk_slices {
             Self::set_extent_slices_tx(&tx, path, *c, slices).map_err(map_sqlite_err)?;
         }
-        for key in &old_keys {
-            if !new_keys.contains(key) {
-                Self::ref_dec_tx(&tx, key).map_err(map_sqlite_err)?;
+        for (key, &new_n) in &new_counts {
+            let old_n = old_counts.get(key).copied().unwrap_or(0);
+            for _ in old_n..new_n {
+                Self::ref_inc_tx(&tx, key, 0).map_err(map_sqlite_err)?;
             }
         }
-        for key in &new_keys {
-            if !old_keys.contains(key) {
-                Self::ref_inc_tx(&tx, key, 0).map_err(map_sqlite_err)?;
+        for (key, &old_n) in &old_counts {
+            let new_n = new_counts.get(key).copied().unwrap_or(0);
+            for _ in new_n..old_n {
+                Self::ref_dec_tx(&tx, key).map_err(map_sqlite_err)?;
             }
         }
         match existing {

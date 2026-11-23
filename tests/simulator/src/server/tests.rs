@@ -1196,3 +1196,127 @@ fn fork_create_rolls_back_meta_record_on_copy_failure() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn paused_gc_sweep_and_concurrent_reuse_are_mutually_serialized() {
+    let dir = tmpdir("extent-gc-race");
+    let meta = Meta::open(&dir).unwrap();
+    meta.create_tenant("tgc", "drive9_gc_key").unwrap();
+    let s3 = s3::open(dir.clone(), "http://127.0.0.1:9/s3".into()).unwrap();
+    let state = Arc::new(AppState {
+        dir: dir.clone(),
+        public_base: "http://127.0.0.1:9".into(),
+        inline_threshold: 1024,
+        s3,
+        meta,
+        tenants: Mutex::new(HashMap::new()),
+        hubs: Hubs::default(),
+        mounts: MountRegistry::default(),
+        journals: JournalStore::default(),
+    });
+    let t = state.tenant("tgc").unwrap();
+
+    let payload = b"extent-block-resurrection-payload-bytes".to_vec();
+    let checksum = crate::utils::sha256_hex(&payload);
+    let key = extent::block_key("tgc", &checksum);
+    let slices = vec![(
+        0_i64,
+        vec![store::Slice {
+            off: 0,
+            key: key.clone(),
+            boff: 0,
+            len: payload.len() as i64,
+        }],
+    )];
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        s3::put_object(state.s3.clone(), key.clone(), payload.clone())
+            .await
+            .unwrap();
+        t.commit_extent(&state.s3, "/orig.bin", payload.len() as i64, -1, &slices)
+            .unwrap();
+        t.delete_tree("/orig.bin").unwrap();
+        assert!(!t.is_block_referenced(&key));
+        t.force_expire_gc_for_test(&key);
+        assert_eq!(t.expired_gc_blocks(), vec![key.clone()]);
+
+        // 1. Interleaving A: gc_sweep captures expired unreferenced key K, pauses
+        // before deletion, a concurrent task resurrects K via commit_extent, and
+        // gc_sweep resumes — K's backing object must NOT be deleted.
+        let (captured_tx, captured_rx) = tokio::sync::oneshot::channel::<String>();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel::<()>();
+        let captured_tx = Arc::new(Mutex::new(Some(captured_tx)));
+        let resume_rx = Arc::new(Mutex::new(Some(resume_rx)));
+
+        let gc_state = state.clone();
+        let gc_tenant = t.clone();
+        let gc_task = tokio::spawn(async move {
+            extent::gc_sweep_with_hook(gc_state, gc_tenant, move |k| {
+                let tx_opt = captured_tx.lock().unwrap().take();
+                let rx_opt = resume_rx.lock().unwrap().take();
+                async move {
+                    if let Some(tx) = tx_opt {
+                        let _ = tx.send(k);
+                    }
+                    if let Some(rx) = rx_opt {
+                        let _ = rx.await;
+                    }
+                }
+            })
+            .await;
+        });
+
+        let captured_key = captured_rx.await.unwrap();
+        assert_eq!(captured_key, key);
+
+        let reuse_state = state.clone();
+        let reuse_tenant = t.clone();
+        let reuse_slices = slices.clone();
+        let payload_len = payload.len() as i64;
+        tokio::spawn(async move {
+            reuse_tenant
+                .commit_extent(&reuse_state.s3, "/reused.bin", payload_len, -1, &reuse_slices)
+                .unwrap();
+        })
+        .await
+        .unwrap();
+
+        let _ = resume_tx.send(());
+        gc_task.await.unwrap();
+
+        assert!(t.is_block_referenced(&key));
+        assert_eq!(
+            s3::get_object_sync(&state.s3, &key).unwrap(),
+            payload,
+            "resurrected block bytes must survive concurrent gc_sweep"
+        );
+
+        // 2. Interleaving B: if gc_sweep wins the lock and deletes K after an
+        // earlier verify_block succeeded, commit_extent must reject the missing
+        // block rather than committing a dangling file reference.
+        let verified_len = extent::verify_block(state.clone(), "tgc".into(), checksum.clone())
+            .await
+            .unwrap();
+        assert_eq!(verified_len, payload.len() as i64);
+
+        t.delete_tree("/reused.bin").unwrap();
+        t.force_expire_gc_for_test(&key);
+        extent::gc_sweep(state.clone(), t.clone()).await;
+        assert!(s3::head_object_sync(&state.s3, &key).is_none());
+
+        let err = t.commit_extent(&state.s3, "/dangling.bin", verified_len, -1, &slices);
+        assert!(
+            matches!(err, Err(store::StoreError::S3(_))),
+            "commit_extent must reject a block swept before commit: {err:?}"
+        );
+        assert!(t.get_node("/dangling.bin").is_err());
+    });
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

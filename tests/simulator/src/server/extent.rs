@@ -82,7 +82,7 @@ pub async fn read_plan(
     Ok(plan)
 }
 
-async fn verify_block(state: Arc<AppState>, tenant: String, checksum: String) -> Result<i64, String> {
+pub(crate) async fn verify_block(state: Arc<AppState>, tenant: String, checksum: String) -> Result<i64, String> {
     let key = block_key(&tenant, &checksum);
     match super::s3::head_object(state.s3.clone(), key.clone()).await {
         Ok(Some(_)) => {}
@@ -133,12 +133,18 @@ pub async fn complete_sequential(
     for (_, s) in &mut chunk_slices {
         s.sort_by_key(|sl| sl.off);
     }
-    t.commit_extent(&upload.path, upload.total_size, upload.expected_revision, &chunk_slices)
-        .map_err(|e| match e {
-            StoreError::PathConflict => "revision conflict or layout mismatch".into(),
-            StoreError::NotFound => "parent not found".into(),
-            _ => format!("commit failed: {e:?}"),
-        })
+    t.commit_extent(
+        &state.s3,
+        &upload.path,
+        upload.total_size,
+        upload.expected_revision,
+        &chunk_slices,
+    )
+    .map_err(|e| match e {
+        StoreError::PathConflict => "revision conflict or layout mismatch".into(),
+        StoreError::NotFound => "parent not found".into(),
+        _ => format!("commit failed: {e:?}"),
+    })
 }
 
 pub async fn complete_patch(
@@ -228,39 +234,47 @@ pub async fn complete_patch(
     }
 
     let chunk_slices: Vec<(i64, Vec<Slice>)> = maps.into_iter().collect();
-    t.commit_extent(&upload.path, upload.new_size, upload.expected_revision, &chunk_slices)
-        .map_err(|e| match e {
-            StoreError::PathConflict => "revision conflict or layout mismatch".into(),
-            StoreError::NotFound => "parent not found".into(),
-            _ => format!("commit failed: {e:?}"),
-        })
+    t.commit_extent(
+        &state.s3,
+        &upload.path,
+        upload.new_size,
+        upload.expected_revision,
+        &chunk_slices,
+    )
+    .map_err(|e| match e {
+        StoreError::PathConflict => "revision conflict or layout mismatch".into(),
+        StoreError::NotFound => "parent not found".into(),
+        _ => format!("commit failed: {e:?}"),
+    })
 }
 
 pub async fn gc_sweep(state: Arc<AppState>, t: Arc<TenantDb>) {
+    gc_sweep_with_hook(state, t, |_| async {}).await;
+}
+
+pub async fn gc_sweep_with_hook<F, Fut>(
+    state: Arc<AppState>,
+    t: Arc<TenantDb>,
+    mut before_delete: F,
+) where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
     for key in t.expired_gc_blocks() {
-        if t.is_block_referenced(&key) {
-            t.drop_gc_row(&key);
-            continue;
-        }
-        if super::s3::delete_object(state.s3.clone(), key.clone()).await.is_ok() {
-            t.drop_gc_row(&key);
-        }
+        before_delete(key.clone()).await;
+        let _ = t.try_delete_expired_gc_block(&state.s3, &key);
     }
 }
 
 pub async fn presign_block(
     s3: super::s3::S3Conn,
+    t: &TenantDb,
     tenant: String,
     checksum: String,
     length: i64,
 ) -> Result<serde_json::Value, String> {
     let key = block_key(&tenant, &checksum);
-    if super::s3::head_object(s3.clone(), key.clone())
-        .await
-        .ok()
-        .flatten()
-        .is_some()
-    {
+    if t.prepare_block_presign(&s3, &key) {
         return Ok(json!({ "skip_upload": true, "exists": true }));
     }
     let (url, headers) = super::s3::presign_put(s3, key, checksum, length).await?;

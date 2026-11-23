@@ -593,7 +593,7 @@ pub async fn v2_presign(
             Err(e) => return err_resp(503, &e),
         }
     } else if row.layout == "extent" {
-        match super::extent::presign_block(s3, t.id.clone(), checksum.clone(), length).await {
+        match super::extent::presign_block(s3, &t, t.id.clone(), checksum.clone(), length).await {
             Ok(mut v) => {
                 let b64 = hex::decode(&checksum)
                     .map(|d| base64::engine::general_purpose::STANDARD.encode(d))

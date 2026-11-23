@@ -865,6 +865,7 @@ async fn fs_patch(state: Arc<AppState>, t: Arc<TenantDb>, req: FsReq) -> Respons
         }
         match super::extent::presign_block(
             s3_conn.clone(),
+            &t,
             t.id.clone(),
             checksum.to_string(),
             size,

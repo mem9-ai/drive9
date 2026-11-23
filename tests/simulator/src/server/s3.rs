@@ -129,15 +129,17 @@ pub fn get_object_sync(conn: &S3Conn, key: &str) -> Result<Vec<u8>, String> {
 
 /// Object presence; returns the size when present.
 pub async fn head_object(conn: S3Conn, key: String) -> Result<Option<i64>, String> {
-    match std::fs::metadata(conn.object_path(&key)) {
-        Ok(m) => Ok(Some(m.len() as i64)),
-        Err(_) => Ok(None),
-    }
+    Ok(head_object_sync(&conn, &key))
 }
 
-pub async fn delete_object(conn: S3Conn, key: String) -> Result<(), String> {
-    let _ = std::fs::remove_file(conn.object_path(&key));
-    Ok(())
+pub fn head_object_sync(conn: &S3Conn, key: &str) -> Option<i64> {
+    std::fs::metadata(conn.object_path(key))
+        .ok()
+        .map(|m| m.len() as i64)
+}
+
+pub fn delete_object_sync(conn: &S3Conn, key: &str) {
+    let _ = std::fs::remove_file(conn.object_path(key));
 }
 
 /// Presign a block PUT: the URL is our own /s3/ endpoint; the checksum
