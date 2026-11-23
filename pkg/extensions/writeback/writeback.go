@@ -7131,13 +7131,13 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 	zeroBase := isNew || h.trunc
 	// The deferred chmod (or a create mode ≠ 0644) rides the staging entry:
 	// the queue snapshots Mode at enqueue and applies it post-landing
-	// (onCommitSuccess). Consume it here — a later staging must not re-apply
-	// a stale mode. Dropping it entirely (the old behavior) lost every chmod
+	// (onCommitSuccess). It is consumed below, only once the image is actually
+	// enqueued and only if no concurrent chmod replaced it meanwhile, so a
+	// staging attempt that fails anywhere keeps it armed and a chmod racing
+	// this staging wins. Consuming it here would drop the mode on a failed
+	// staging; dropping it entirely (the older behavior) lost every chmod
 	// deferred onto an open writeback handle (chmod/12: 0777 → 0644).
 	mode, hasMode := h.pendingMode, h.hasPendingMode
-	// The armed chmod is consumed only once the image is enqueued (below), and
-	// only if no concurrent chmod replaced it meanwhile: a staging attempt that
-	// fails anywhere keeps it armed, and a chmod racing this staging must win.
 	modeSeq := h.modeSeq
 	// Fresh creates that never carried an explicit chmod still need the
 	// POSIX create mode published. The extent session does not take a mode

@@ -2861,8 +2861,8 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 	keepPending := false
 	if markerErr != nil && (retained || removalFailed) && cq.index != nil && entry.PendingIndexGen != 0 {
 		// The marker is not durable and the local image survived the cleanup:
-		// keep the pending entry, fenced by a conflict marker. Recovery skips a
-		// PendingConflict entry (recoveredEntry), so the landed image is not
+		// keep the pending entry, fenced by a committed marker. Recovery skips a
+		// PendingCommitted entry (recoveredEntry), so the landed image is not
 		// re-uploaded and the surviving shadow cannot resurrect it. The
 		// generation-scoped form is required: an unscoped MarkConflict would
 		// poison a newer generation that already replaced this one.
