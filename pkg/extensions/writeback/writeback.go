@@ -218,13 +218,6 @@ type Writeback struct {
 	uploader        *WriteBackUploader
 	// pathLocks serializes queue callbacks against same-path staging.
 	pathLocks stripedLocks
-	// viewLossMu/viewLossWitness keeps a bounded record of pruned staged pairs
-	// for stacks WITHOUT a commit queue (write-sync), whose barriers would
-	// otherwise read the loss as a completed upload. With a queue the record
-	// lives in its terminal-failure map instead.
-	viewLossMu      sync.Mutex
-	viewLossWitness map[string]error
-	viewLossOrder   []string
 	// live maps path → *bufferingHandle for open writers (Setattr deferral
 	// looks the current writer up by path).
 	live sync.Map
@@ -647,13 +640,15 @@ func New(opts Options) (*Writeback, error) {
 	}
 	if w.wbCache != nil {
 		// A staged pair dropped by a plain read (Get/GetView/ListPending) is the
-		// same loss a barrier must not report as success. This is the SINGLE
-		// recorder for pruned pairs: it runs under the cache's path lock, before
-		// any same-path operation can read the pair as "nothing staged".
-		// Without a commit queue (write-sync stacks) the loss goes to a bounded
-		// in-process witness instead, so a retried barrier still fails.
+		// same loss a barrier must not report as success. The cache already kept
+		// the durable marker itself; this hook additionally records the loss in
+		// the commit queue's bounded terminal-failure map, which is what rename
+		// and unlink consult (and which write-sync stacks do not have).
 		w.wbCache.OnViewLost = func(remotePath string, err error) {
-			w.recordViewLoss(remotePath, fmt.Errorf("%w: %w", errStagedViewLost, err))
+			if w.queue == nil {
+				return
+			}
+			w.queue.RecordTerminalFailureForPath(remotePath, fmt.Errorf("%w: %w", errStagedViewLost, err))
 		}
 		workers := opts.UploadConcurrency
 		if workers <= 0 {
@@ -662,7 +657,9 @@ func New(opts Options) (*Writeback, error) {
 		up := NewWriteBackUploader(opts.Client, w.wbCache, workers, root)
 		up.TerminalFailureForPath = func(localPath string) error {
 			if w.queue == nil {
-				return w.viewLoss(localPath)
+				// Write-sync stacks have no queue: the cache's durable marker is
+				// the only record, and it survives a restart.
+				return w.wbCache.ViewLoss(localPath)
 			}
 			return w.queue.PathTerminalFailure(localPath)
 		}
@@ -777,9 +774,10 @@ func New(opts Options) (*Writeback, error) {
 				w.queue.ClearTerminalFailureIfSeq(meta.Path, gens.TerminalFailureSeq)
 				w.queue.ResolveSupersededConflict(meta.Path, meta.SupersedesPendingGen)
 			}
-			// A landing supersedes a fallback witness for the path: the image
-			// the barrier needed is on the server.
-			w.clearViewLoss(meta.Path)
+			// A landing supersedes a loss record for the path — but only when it
+			// landed a generation at or above the lost one: an older upload
+			// finishing says nothing about an image that died after it.
+			w.wbCache.ClearViewLossIfGeneration(meta.Path, meta.Generation)
 		}
 		w.uploader = up
 		up.SetPerfCounters(w.perfShim)

@@ -448,11 +448,12 @@ var errLedgerOwned = errors.New("writeback: path owned by the staging ledger")
 // errStagedViewUnavailable backs a lost staged image that carried no read error.
 var errStagedViewUnavailable = errors.New("staged image is unavailable")
 
-// errStagedViewLost marks a recorded failure as a write-cache view loss. Only
-// these may fail a barrier from the "nothing staged" exit: a standalone commit
-// queue record (a transfer that never had a cache entry) is moved by
-// RenameTerminalFailure and must not abort an OpRename's pre-rename landing.
-var errStagedViewLost = errors.New("staged image was lost")
+// errStagedViewLost marks a recorded failure as a write-cache view loss. It is
+// the staging cache's sentinel: only these may fail a barrier from the "nothing
+// staged" exit, because a standalone commit queue record (a transfer that never
+// had a cache entry) is moved by RenameTerminalFailure and must not abort an
+// OpRename's pre-rename landing.
+var errStagedViewLost = staging.ErrStagedViewLost
 
 // IsLedgerOwnedError reports whether err is the ledger-ownership refusal.
 func IsLedgerOwnedError(err error) bool { return errors.Is(err, errLedgerOwned) }

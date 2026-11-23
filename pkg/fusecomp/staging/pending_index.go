@@ -25,7 +25,9 @@ type PendingIndex struct {
 	mu                 sync.RWMutex
 	items              map[string]*WriteBackMeta // path → metadata
 	fences             map[string]CommittedFence // path → landed replay fence (never a pending entry)
+	fenceMask          map[string]struct{}       // hashes of fences that could not be read
 	fencesLoaded       bool
+	fencesErr          error
 	dir                string // directory for .meta persistence
 	nextGen            atomic.Uint64
 	pathLocks          map[string]*pendingPathLock
@@ -60,6 +62,7 @@ func NewPendingIndex(dir string) (*PendingIndex, error) {
 	idx := &PendingIndex{
 		items:     make(map[string]*WriteBackMeta),
 		fences:    make(map[string]CommittedFence),
+		fenceMask: make(map[string]struct{}),
 		dir:       dir,
 		pathLocks: make(map[string]*pendingPathLock),
 	}
@@ -104,8 +107,11 @@ func (idx *PendingIndex) SetJournalSyncOnPut(on bool) {
 func (idx *PendingIndex) RecoverFromDisk() error {
 	// Fences first: a fence from a crashed process must be honored by replay
 	// (which may already have run), and it must never be turned back into a
-	// pending entry by a surviving .meta file.
-	idx.ensureCommittedFencesLoaded()
+	// pending entry by a surviving .meta file. An unreadable fence is a
+	// durability hole, not a "no fence": surface it instead of replaying blind.
+	if err := idx.loadCommittedFences(); err != nil {
+		return err
+	}
 	entries, err := os.ReadDir(idx.dir)
 	if err != nil {
 		return fmt.Errorf("pending index recovery: %w", err)

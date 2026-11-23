@@ -39,11 +39,11 @@ func TestGetMetaAndViewStateDistinguishesMissFromTornPair(t *testing.T) {
 		t.Fatalf("state after corrupting the data = %v (err %v), want StagedViewNoData with a reason", state, err)
 	}
 
-	// The pruned pair is gone: a later lookup reports nothing staged. Reporting
-	// the loss beyond that belongs to the caller that owns a durable failure
-	// record (the commit queue's terminal failures), not to this cache.
-	if _, _, state, _ := c.GetMetaAndViewState(path); state != StagedViewNoMeta {
-		t.Fatalf("state after the pair was pruned = %v, want StagedViewNoMeta", state)
+	// The pruned pair is gone, and the cache keeps the loss on record: a later
+	// lookup must report "data gone", never "nothing staged", or a barrier would
+	// read it as an upload someone else completed.
+	if _, _, state, err := c.GetMetaAndViewState(path); state != StagedViewNoData || err == nil {
+		t.Fatalf("state after the pair was pruned = %v (err %v), want StagedViewNoData with the recorded loss", state, err)
 	}
 }
 
@@ -166,8 +166,8 @@ func TestGetReportsTheLostPairBeforeItReturns(t *testing.T) {
 	close(release)
 	<-read
 	got := <-barrier
-	if got.state != StagedViewNoMeta {
-		t.Fatalf("barrier state after the prune = %v, want StagedViewNoMeta once the loss is recorded", got.state)
+	if got.state != StagedViewNoData || got.err == nil {
+		t.Fatalf("barrier state after the prune = %v (err %v), want StagedViewNoData with the recorded loss", got.state, got.err)
 	}
 }
 
@@ -204,5 +204,68 @@ func TestGetViewReportsPrunedPair(t *testing.T) {
 	}
 	if c.HasMeta(path) {
 		t.Fatal("the pruned pair is still in the pending index")
+	}
+}
+
+// TestViewLossMarkerSurvivesTheRestart pins the durable half: the record is a
+// file next to the staged pairs, so a process that comes up after a crash still
+// fails the barrier instead of reading the pruned image as a completed upload.
+func TestViewLossMarkerSurvivesTheRestart(t *testing.T) {
+	dir := t.TempDir()
+	const path = "/restart-lost.txt"
+	c, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("staged image")
+	if err := c.Put(path, payload, int64(len(payload)), PendingNew); err != nil {
+		t.Fatal(err)
+	}
+	c.DropInMemoryPayload(path)
+	if err := os.WriteFile(c.DatFile(path), []byte("different bytes!"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := c.Get(path); ok {
+		t.Fatal("Get served a torn pair")
+	}
+	if _, err := os.Stat(c.lostFile(path)); err != nil {
+		t.Fatalf("loss marker missing: %v", err)
+	}
+
+	restarted, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Rebuild the on-disk metadata index the way recovery does.
+	_ = restarted.ListPending()
+	if _, _, state, err := restarted.GetMetaAndViewState(path); state != StagedViewNoData || err == nil {
+		t.Fatalf("barrier after restart = %v (err %v), want StagedViewNoData with the recorded loss", state, err)
+	}
+	// A fresh staging supersedes the record.
+	if err := restarted.Put(path, payload, int64(len(payload)), PendingNew); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(restarted.lostFile(path)); !os.IsNotExist(err) {
+		t.Fatalf("loss marker survived a fresh staging: %v", err)
+	}
+}
+
+// TestViewLossMarkerIsGenerationScoped pins the clearing rule: an older upload
+// landing must not erase the record of a newer image that was lost, while a
+// landing at or above the lost generation does.
+func TestViewLossMarkerIsGenerationScoped(t *testing.T) {
+	const path = "/gen-scoped.txt"
+	c, err := NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.writeViewLoss(path, 5, os.ErrNotExist)
+	c.ClearViewLossIfGeneration(path, 4)
+	if _, err := os.Stat(c.lostFile(path)); err != nil {
+		t.Fatalf("a landing below the lost generation cleared the record: %v", err)
+	}
+	c.ClearViewLossIfGeneration(path, 5)
+	if _, err := os.Stat(c.lostFile(path)); !os.IsNotExist(err) {
+		t.Fatalf("a landing at the lost generation kept the record: %v", err)
 	}
 }

@@ -137,6 +137,11 @@ func ReplayJournalIntoPending(j *Journal, idx *PendingIndex, shadows *ShadowStor
 	if j == nil || idx == nil {
 		return nil
 	}
+	// Fences gate the replay below, so an unreadable one is a durability hole:
+	// abort rather than replay a path whose landed image we cannot rule out.
+	if err := idx.loadCommittedFences(); err != nil {
+		return err
+	}
 
 	latestData := make(map[string]JournalEntry) // path → latest fsync entry
 	latestMeta := make(map[string]JournalEntry) // path → latest pending-meta entry

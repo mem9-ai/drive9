@@ -295,3 +295,47 @@ func TestCommittedFenceGatesDataFramesByJournalSeq(t *testing.T) {
 		t.Fatalf("recovered size = %d, want %d", meta.Size, len(newPayload))
 	}
 }
+
+// TestUnreadableCommittedFenceFailsClosed pins the fail-closed rule: a fence
+// whose bytes cannot be decoded must not be treated as absent. Replay aborts,
+// and a reader that cannot report an error gets a mask-everything fence for the
+// path instead of a replay hole.
+func TestUnreadableCommittedFenceFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	idx, err := NewPendingIndex(filepath.Join(dir, "pending"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal, err := NewJournal(filepath.Join(dir, "journal.wal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = journal.Close() })
+	shadows, err := NewShadowStore(filepath.Join(dir, "shadow"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { shadows.Close() })
+
+	const path = "/corrupt-fence.txt"
+	if err := os.WriteFile(filepath.Join(dir, "pending", HashPath(path)+".fence"), []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ReplayJournalIntoPending(journal, idx, shadows); err == nil {
+		t.Fatal("replay ran with an unreadable fence")
+	}
+	fence, ok := idx.CommittedFence(path)
+	if !ok {
+		t.Fatal("an unreadable fence reported no fence for its path")
+	}
+	if fence.Generation != ^uint64(0) || fence.JournalSeq != ^uint64(0) {
+		t.Fatalf("mask fence = %+v, want every frame masked", fence)
+	}
+	// The unreadable file must never be settled away automatically.
+	if err := idx.SettleCommittedFences(journal, shadows); err != nil {
+		t.Fatalf("settle = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "pending", HashPath(path)+".fence")); err != nil {
+		t.Fatalf("settle removed an unreadable fence: %v", err)
+	}
+}

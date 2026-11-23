@@ -39,10 +39,25 @@ func (idx *PendingIndex) fenceFile(remotePath string) string {
 	return filepath.Join(idx.dir, HashPath(remotePath)+".fence")
 }
 
-// ensureCommittedFencesLoaded scans the fence files once. It is called by
-// recovery (which may run before or after journal replay) and by the fence
-// readers, so a fence written by a crashed process is honored in either order.
+// loadCommittedFences scans the fence files once and returns the first scan
+// error. A fence that cannot be read or decoded is NOT treated as absent: replay
+// must never resurrect an image whose fence might have masked it, so the path's
+// hash is recorded in fenceMask and CommittedFence reports a mask-everything
+// fence for it. Callers that can surface an error (replay, disk recovery)
+// return it and abort instead of continuing with a hole in the fence set.
+func (idx *PendingIndex) loadCommittedFences() error {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	return idx.loadCommittedFencesLocked()
+}
+
+// ensureCommittedFencesLoaded is the best-effort variant for readers that
+// cannot return an error. The mask recorded by a failed scan still keeps their
+// answers fail-closed.
 func (idx *PendingIndex) ensureCommittedFencesLoaded() {
+	if idx == nil {
+		return
+	}
 	idx.mu.RLock()
 	loaded := idx.fencesLoaded
 	idx.mu.RUnlock()
@@ -51,36 +66,52 @@ func (idx *PendingIndex) ensureCommittedFencesLoaded() {
 	}
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
-	idx.ensureCommittedFencesLoadedLocked()
+	_ = idx.loadCommittedFencesLocked()
 }
 
-// ensureCommittedFencesLoadedLocked is the scan itself. The caller holds
-// idx.mu.
+// ensureCommittedFencesLoadedLocked is the best-effort scan for callers that
+// already hold idx.mu.
 func (idx *PendingIndex) ensureCommittedFencesLoadedLocked() {
+	_ = idx.loadCommittedFencesLocked()
+}
+
+// loadCommittedFencesLocked is the scan itself. The caller holds idx.mu.
+func (idx *PendingIndex) loadCommittedFencesLocked() error {
 	if idx.fencesLoaded {
-		return
+		return idx.fencesErr
 	}
 	idx.fencesLoaded = true
 	if idx.fences == nil {
 		idx.fences = make(map[string]CommittedFence)
 	}
+	if idx.fenceMask == nil {
+		idx.fenceMask = make(map[string]struct{})
+	}
 	entries, err := os.ReadDir(idx.dir)
 	if err != nil {
-		return
+		idx.fencesErr = fmt.Errorf("pending index read committed fences: %w", err)
+		return idx.fencesErr
 	}
 	for _, e := range entries {
 		name := e.Name()
 		if !strings.HasSuffix(name, ".fence") {
 			continue
 		}
+		hash := strings.TrimSuffix(name, ".fence")
 		raw, err := os.ReadFile(filepath.Join(idx.dir, name))
 		if err != nil {
+			idx.fenceMask[hash] = struct{}{}
+			if idx.fencesErr == nil {
+				idx.fencesErr = fmt.Errorf("pending index read committed fence %s: %w", name, err)
+			}
 			continue
 		}
 		var fence CommittedFence
 		if err := json.Unmarshal(raw, &fence); err != nil || fence.Path == "" {
-			// Unreadable fence: leave the file alone. Dropping it would let a
-			// replay resurrect an image that already landed.
+			idx.fenceMask[hash] = struct{}{}
+			if idx.fencesErr == nil {
+				idx.fencesErr = fmt.Errorf("pending index decode committed fence %s: %w", name, err)
+			}
 			continue
 		}
 		idx.fences[fence.Path] = fence
@@ -88,9 +119,12 @@ func (idx *PendingIndex) ensureCommittedFencesLoadedLocked() {
 			idx.nextGen.Store(fence.Generation)
 		}
 	}
+	return idx.fencesErr
 }
 
-// CommittedFence returns the replay fence for a path, if one is on record.
+// CommittedFence returns the replay fence for a path, if one is on record. A
+// fence file that could not be decoded masks every frame for its path, so a
+// replay hole can never resurrect a landed image.
 func (idx *PendingIndex) CommittedFence(remotePath string) (CommittedFence, bool) {
 	if idx == nil {
 		return CommittedFence{}, false
@@ -98,11 +132,15 @@ func (idx *PendingIndex) CommittedFence(remotePath string) (CommittedFence, bool
 	idx.ensureCommittedFencesLoaded()
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
+	if _, masked := idx.fenceMask[HashPath(remotePath)]; masked {
+		return CommittedFence{Path: remotePath, Generation: ^uint64(0), JournalSeq: ^uint64(0)}, true
+	}
 	fence, ok := idx.fences[remotePath]
 	return fence, ok
 }
 
-// CommittedFences snapshots every fence on record.
+// CommittedFences snapshots every fence on record. Fences whose file could not
+// be decoded are excluded (they are never settled).
 func (idx *PendingIndex) CommittedFences() []CommittedFence {
 	if idx == nil {
 		return nil

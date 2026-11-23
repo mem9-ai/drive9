@@ -221,3 +221,47 @@ func TestRetainedShadowIsFencedAsCommitted(t *testing.T) {
 		t.Fatalf("PathTerminalFailure after a landed commit = %v, want nil", err)
 	}
 }
+
+// TestSyncBarrierFailsAfterARestartLostThePair pins the write-sync case (no
+// commit queue): the loss record is the cache's durable marker, so a barrier in
+// a NEW process still fails after a plain read pruned the only copy.
+func TestSyncBarrierFailsAfterARestartLostThePair(t *testing.T) {
+	dir := t.TempDir()
+	const path = "/restart-torn.txt"
+	cache, err := staging.NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("staged image")
+	if err := cache.Put(path, payload, int64(len(payload)), staging.PendingNew); err != nil {
+		t.Fatal(err)
+	}
+	cache.DropInMemoryPayload(path)
+	if err := os.WriteFile(cache.DatFile(path), []byte("different bytes!"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A plain read prunes the pair; the cache keeps the durable marker.
+	if _, ok := cache.Get(path); ok {
+		t.Fatal("Get served a torn pair")
+	}
+
+	// A fresh process: new cache over the same directory, no commit queue.
+	restarted, err := staging.NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = restarted.ListPending()
+	u := NewWriteBackUploader(nil, restarted, 1)
+	u.TerminalFailureForPath = restarted.ViewLoss
+	if _, err := u.UploadSyncWithRevision(context.Background(), path); err == nil {
+		t.Fatal("barrier reported success after a restart lost the staged pair")
+	}
+	// A fresh staging supersedes the record, so the same barrier succeeds once
+	// there is content again.
+	if err := restarted.Put(path, payload, int64(len(payload)), staging.PendingNew); err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.ViewLoss(path); err != nil {
+		t.Fatalf("a fresh staging left the loss record: %v", err)
+	}
+}
