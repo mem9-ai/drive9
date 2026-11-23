@@ -1,8 +1,10 @@
 package writeback
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1623,4 +1625,291 @@ func (r releaseBlockingHandle) Release(ctx context.Context) error {
 		return r.Handle.Release(ctx)
 	}
 	return nil
+}
+
+func TestReadOpenFlushRacesWriterCloseDoesNotStrandZeroByteCache(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	b := testbackend.NewBackend()
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	wbcache, err := staging.NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wb, err := New(Options{
+		Policy:      PolicyWriteBack,
+		Client:      cl,
+		Staging:     mustStaging(t),
+		WriteCache:  wbcache,
+		LazyStaging: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wb.wbCacheMaxBytes = 32 * 1024
+	if err := wb.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = wb.Stop(context.Background()) })
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chain, err := fs.NewChain(wb, terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	payload := bytes.Repeat([]byte("s"), 64*1024)
+
+	// 1. Deterministic reproduction of a late internal Flush/stageToWriteCache
+	// arriving on a writer handle after Flush bypassed wbCache to the commit
+	// queue, Release discarded h.buf, and the queue finished landing.
+	resW, err := chain.Dispatch(ctx, &fs.Op{
+		Kind:  fs.OpCreate,
+		Path:  "/nodefs/small-stream.bin",
+		Flags: uint32(syscall.O_CREAT | syscall.O_TRUNC | syscall.O_WRONLY),
+		Mode:  0o644, HasMode: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer := writebackHandleOf(resW.Handle)
+	if err := resW.Handle.Write(ctx, 0, payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := resW.Handle.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := resW.Handle.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := wb.Drain(ctx); err != nil {
+		t.Fatalf("initial Drain: %v", err)
+	}
+	if err := writer.Flush(ctx); err != nil {
+		t.Fatalf("late internal Flush on closed writer: %v", err)
+	}
+	if err := writer.DrainFlush(ctx); err != nil {
+		t.Fatalf("late DrainFlush on closed writer: %v", err)
+	}
+	if snap, err := writer.stageToWriteCache(ctx, stageV1Ladder); err != nil || snap != nil {
+		t.Fatalf("late stageToWriteCache on closed writer = (%v, %v), want (nil, nil)", snap, err)
+	}
+	if reason, count := wb.DrainPending(); count != 0 {
+		t.Fatalf("DrainPending after late Flush = (%q, %d), want empty", reason, count)
+	}
+
+	// 2. Concurrent race loop: Node.js WriteStream emits 'finish' before
+	// closing its fd while ReadStream opens O_RDONLY (calling h.Flush on
+	// w.handleFor(path)) concurrently with FUSE_FLUSH + FUSE_RELEASE.
+	for i := 0; i < 25; i++ {
+		p := fmt.Sprintf("/nodefs/stream-%d.bin", i)
+		openRes, err := chain.Dispatch(ctx, &fs.Op{
+			Kind:  fs.OpCreate,
+			Path:  p,
+			Flags: uint32(syscall.O_CREAT | syscall.O_TRUNC | syscall.O_WRONLY),
+			Mode:  0o644, HasMode: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := openRes.Handle.Write(ctx, 0, payload); err != nil {
+			t.Fatal(err)
+		}
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			if ferr := openRes.Handle.Flush(ctx); ferr != nil {
+				t.Errorf("Flush(%s): %v", p, ferr)
+			}
+			if rerr := openRes.Handle.Release(ctx); rerr != nil {
+				t.Errorf("Release(%s): %v", p, rerr)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			rdRes, rerr := chain.Dispatch(ctx, &fs.Op{
+				Kind:  fs.OpCreate,
+				Path:  p,
+				Flags: uint32(syscall.O_RDONLY),
+			})
+			if rerr == nil && rdRes.Handle != nil {
+				_ = rdRes.Handle.Flush(ctx)
+				_ = rdRes.Handle.Release(ctx)
+			}
+		}()
+		wg.Wait()
+	}
+
+	if err := wb.Drain(ctx); err != nil {
+		t.Fatalf("final Drain: %v", err)
+	}
+	if reason, count := wb.DrainPending(); count != 0 {
+		t.Fatalf("final DrainPending = (%q, %d), want empty", reason, count)
+	}
+	_, _, _, _, _, _, _, _, uCached, uCachedBytes := wb.DrainSnapshot()
+	if uCached != 0 || uCachedBytes != 0 {
+		t.Fatalf("DrainSnapshot uploaderCached=%d bytes=%d, want 0/0", uCached, uCachedBytes)
+	}
+}
+
+func TestReadOnlyOpenDoesNotShadowWriterOrSwallowChmod(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	b := testbackend.NewBackend()
+	chain, wb := newReviewDrainStack(t, b, nil)
+
+	resW, err := chain.Dispatch(ctx, &fs.Op{
+		Kind:  fs.OpCreate,
+		Path:  "/nodefs/mode.txt",
+		Flags: uint32(syscall.O_CREAT | syscall.O_TRUNC | syscall.O_WRONLY),
+		Mode:  0o644, HasMode: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer := writebackHandleOf(resW.Handle)
+	if err := resW.Handle.Write(ctx, 0, []byte("mode\n")); err != nil {
+		t.Fatal(err)
+	}
+
+	resR, err := chain.Dispatch(ctx, &fs.Op{
+		Kind:  fs.OpCreate,
+		Path:  "/nodefs/mode.txt",
+		Flags: uint32(syscall.O_RDONLY),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := wb.handleFor("/nodefs/mode.txt"); got != writer {
+		t.Fatalf("handleFor(/nodefs/mode.txt) after O_RDONLY open = %p, want writer %p", got, writer)
+	}
+
+	if err := resW.Handle.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := resW.Handle.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := wb.Drain(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// While resR (O_RDONLY) is still open, a path chmod must hit the remote /
+	// cache track rather than deferring onto the clean reader handle.
+	if _, err := chain.Dispatch(ctx, &fs.Op{
+		Kind:    fs.OpSetAttr,
+		Path:    "/nodefs/mode.txt",
+		Mode:    0o600,
+		HasMode: true,
+		Size:    -1,
+	}); err != nil {
+		t.Fatalf("chmod with open reader: %v", err)
+	}
+	if err := resR.Handle.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	node, ok := b.Node("/nodefs/mode.txt")
+	if !ok || node.Mode&0o777 != 0o600 {
+		t.Fatalf("remote mode = %o (ok=%v), want 0600", node.Mode, ok)
+	}
+	if reason, count := wb.DrainPending(); count != 0 {
+		t.Fatalf("DrainPending = (%q, %d), want empty", reason, count)
+	}
+}
+
+func TestStageAndEnqueueRetiresCacheSnapshotAfterChmodGenBump(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	b := testbackend.NewBackend()
+	ts := httptest.NewServer(b)
+	t.Cleanup(ts.Close)
+	cl := client.New(ts.URL, "")
+	wbcache, err := staging.NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wb, err := New(Options{
+		Policy:     PolicyWriteBack,
+		Client:     cl,
+		Staging:    mustStaging(t),
+		WriteCache: wbcache,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wb.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = wb.Stop(context.Background()) })
+	terminal, err := core.New(cl, core.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chain, err := fs.NewChain(wb, terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := chain.Dispatch(ctx, &fs.Op{
+		Kind:  fs.OpCreate,
+		Path:  "/nodefs/large-copy.bin",
+		Flags: uint32(syscall.O_CREAT | syscall.O_WRONLY),
+		Mode:  0o644, HasMode: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Stage a 0-byte snapshot into wbCache (e.g. ftruncate(0) + internal Flush),
+	// bump Generation via chmod (preserving PutGeneration), then grow and Sync
+	// so commitLocked -> stageAndEnqueueOpt retires the superseded cache entry.
+	if _, err := chain.Dispatch(ctx, &fs.Op{
+		Kind:    fs.OpSetAttr,
+		Path:    "/nodefs/large-copy.bin",
+		Handle:  res.Handle,
+		Size:    0,
+		HasSize: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := res.Handle.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := chain.Dispatch(ctx, &fs.Op{
+		Kind:    fs.OpSetAttr,
+		Path:    "/nodefs/large-copy.bin",
+		Handle:  res.Handle,
+		Mode:    0o600,
+		HasMode: true,
+		Size:    -1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	large := bytes.Repeat([]byte("x"), 64*1024)
+	if err := res.Handle.Write(ctx, 0, large); err != nil {
+		t.Fatal(err)
+	}
+	if err := res.Handle.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := res.Handle.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := wb.Drain(ctx); err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if reason, count := wb.DrainPending(); count != 0 {
+		t.Fatalf("DrainPending = (%q, %d), want empty", reason, count)
+	}
+	node, ok := b.Node("/nodefs/large-copy.bin")
+	if !ok || len(node.Data) != len(large) {
+		t.Fatalf("remote /nodefs/large-copy.bin len=%d (ok=%v), want %d", len(node.Data), ok, len(large))
+	}
 }
