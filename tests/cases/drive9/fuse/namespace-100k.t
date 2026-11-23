@@ -31,13 +31,14 @@
 #                          100k; delete through the mount does not.
 #   NAMESPACE_{CREATE,READDIR,STAT,FIND,CLEANUP}_CAP_S  per-phase deadlines
 #     (required, must be > 0; deadlines are sized from a measured 100k run on a
-#      local SSD — create 5.4s, drain 200s, readdir 274s, stat 282s, find 286s —
-#      so they bound hangs rather than assert performance. Worst case with
-#      cleanup enabled: 600+900+900+900+1200 = 4500s of phases, a 2x480s drain,
-#      three ~210s remounts and a ~190s initial mount = about 6280s. The
-#      suites.toml `timeout` is 120m, which only bounds a standalone run: in the
-#      scheduled job the job's own 120-minute limit fires first and these phase
-#      deadlines are the effective bound. The default (no cleanup) is ~5080s.)
+#      local SSD — create 5.4s, drain 200s, readdir 270s, stat 282s, find 282s,
+#      cleanup 225s — so they bound hangs rather than assert performance. Worst
+#      case with cleanup enabled: 600+900+900+900+1200 = 4500s of phases, a
+#      2x(480+15)s drain, three ~210s remounts and a ~190s initial mount = about
+#      6310s. The suites.toml `timeout` is 120m, which only bounds a standalone
+#      run: in the scheduled job the job's own 120-minute limit fires first and
+#      these phase deadlines are the effective bound. The default (no cleanup) is
+#      ~5110s.)
 set -eu
 
 NAMESPACE_FILES="${NAMESPACE_FILES:-100000}"
@@ -78,6 +79,12 @@ LIB="$RUN_DIR/namespace_lib.py"
 # run then still carries its completed phases and `null` for the rest. Cleanup
 # runs first so its duration is in that report. Each step has its own marker, so
 # neither repeats, and the original exit status is preserved.
+#
+# One residue is possible and not handled here: on a shared tenant whose drain
+# aborted, the mount's own teardown can commit creates that this delete already
+# passed, so a slice of the tree can reappear after a successful delete. That
+# needs --api-key plus a drain that failed twice, and the run is already red, so
+# the report says `completed` for a delete that the teardown partly undid.
 on_exit() {
   status=$?
   if [ -f "$LIB" ]; then
@@ -445,7 +452,12 @@ if [ "$NAMESPACE_CLEANUP" = "1" ]; then
   check shell --req 'drive9-namespace-100k-cleanup' --claim 'remove-the-100k-tree' -- \
       python3 "$LIB" cleanup
 else
-  echo "tree left at $NS_REMOTE_ROOT (mounted at $NS_ROOT; set NAMESPACE_CLEANUP=1 to remove it)"
+  echo "tree left at $NS_REMOTE_ROOT (mounted at $NS_ROOT)"
+  if [ "${EXISTING_TENANT:-0}" = "1" ]; then
+    echo "set NAMESPACE_CLEANUP=1 to remove it from this surviving tenant"
+  else
+    echo "this tenant is dropped at teardown, so nothing outlives the run"
+  fi
 fi
 
 # After cleanup so its duration is in the report. The marker keeps the EXIT path
