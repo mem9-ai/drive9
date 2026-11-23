@@ -462,9 +462,9 @@ type bufferingHandle struct {
 	// completed; late internal Flush/DrainFlush callers must not re-stage onto
 	// it after its final upload handoff.
 	closed bool
-	// flushMu serializes non-migrated Flush, DrainFlush, and Release commit
-	// handoffs across internal handle lookups (O_RDONLY open, Link, Rename,
-	// Drain) that do not hold the kernel per-FH lock.
+	// flushMu serializes PolicyWriteBack local cache staging against Release's
+	// stagedToCache consumption across internal handle lookups (O_RDONLY open,
+	// Link, Rename) that do not hold the kernel per-FH lock.
 	flushMu sync.Mutex
 
 	mu    sync.Mutex
@@ -3385,8 +3385,18 @@ func (h *bufferingHandle) DrainFlush(ctx context.Context) (err error) {
 		}
 		return h.flushMigratedMode(ctx)
 	}
-	h.flushMu.Lock()
-	defer h.flushMu.Unlock()
+	defer func() {
+		if err != nil {
+			return
+		}
+		if e := h.extentHandle(); e != nil {
+			if ferr := e.Flush(ctx); ferr != nil {
+				err = ferr
+				return
+			}
+			err = h.flushMigratedMode(ctx)
+		}
+	}()
 	retainBuffer := false
 	h.mu.Lock()
 	if h.closed {
@@ -4095,18 +4105,31 @@ func (h *bufferingHandle) stagedLandingFence() (supersedesGen, failureSeq uint64
 }
 
 // Flush implements fs.Handle.
-func (h *bufferingHandle) Flush(ctx context.Context) error {
+func (h *bufferingHandle) Flush(ctx context.Context) (err error) {
 	// Migrated: a flush is the engine's flush, which publishes the slices
 	// the community writer has frozen. Reimplementing the close-to-open
-	// boundary here would upload the image a second time.
+	// boundary here would upload the image a second time. If adoption installs
+	// h.extent while the classic path runs (which requires the classic buffer
+	// to be clean and landed), the deferred recheck flushes any write that
+	// entered the engine handle during that window.
 	if e := h.extentHandle(); e != nil {
 		if err := e.Flush(ctx); err != nil {
 			return err
 		}
 		return h.flushMigratedMode(ctx)
 	}
-	h.flushMu.Lock()
-	defer h.flushMu.Unlock()
+	defer func() {
+		if err != nil {
+			return
+		}
+		if e := h.extentHandle(); e != nil {
+			if ferr := e.Flush(ctx); ferr != nil {
+				err = ferr
+				return
+			}
+			err = h.flushMigratedMode(ctx)
+		}
+	}()
 	h.mu.Lock()
 	closed := h.closed
 	h.mu.Unlock()
@@ -4228,10 +4251,12 @@ func (h *bufferingHandle) Flush(ctx context.Context) error {
 		// small-file writeback track: the flush stages a durable
 		// .dat/.meta image on disk and the uploader lands it async; the
 		// commit queue keeps serving the large-file/shadow track.
+		h.flushMu.Lock()
+		defer h.flushMu.Unlock()
 		h.mu.Lock()
-		dirty, unlinked := h.dirty, h.unlinked
+		dirty, unlinked, closed := h.dirty, h.unlinked, h.closed
 		h.mu.Unlock()
-		if !dirty || unlinked {
+		if !dirty || unlinked || closed {
 			return nil
 		}
 		snapshot, err := h.stageToWriteCache(ctx, stageV1Ladder)
@@ -4543,6 +4568,7 @@ func (h *bufferingHandle) Release(ctx context.Context) error {
 			return err
 		}
 	}
+	finishWritebackClose()
 	if materialize {
 		if err := h.ensureBuffer(ctx); err == nil {
 			h.mu.Lock()
@@ -4551,7 +4577,6 @@ func (h *bufferingHandle) Release(ctx context.Context) error {
 		}
 	}
 	err := h.commitLocked(ctx)
-	finishWritebackClose()
 	if h.inner != nil {
 		if relErr := h.inner.Release(ctx); err == nil {
 			err = relErr
