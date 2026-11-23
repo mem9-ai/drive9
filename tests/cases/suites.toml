@@ -562,12 +562,15 @@ name = "drive9/fuse/namespace-100k"
 tier = "daily-bench"
 perf = true
 serial = true
-# Bounds the whole case: worst-case phase deadlines with cleanup enabled
-# (600+900+900+900+1200 = 4500s), a 2x480s drain, three ~210s remounts and a
-# ~190s initial mount add up to ~6280s, inside this 120-minute limit; the default
-# (no cleanup) is ~5080s. Deadlines come from a measured run under the engine on
-# a local SSD (100k files: create 5.4s, drain 200s, cold readdir 274s, cold stat
-# 282s, cold find 286s), so they bound a hang rather than assert performance.
+# Bounds a standalone run only. Worst case with cleanup enabled: phase deadlines
+# (600+900+900+900+1200 = 4500s), a 2x(480+15)s drain, three ~210s remounts and a
+# ~190s initial mount add up to ~6280s; the default (no cleanup) is ~5080s. In
+# the scheduled job this value can never fire — the job's own 120-minute limit
+# comes first and runs 57 cases — so the phase deadlines are the effective bound
+# there. Deadlines come from a measured run under the engine on a local SSD (100k
+# files: create 5.4s, drain 200s, cold readdir 270s, cold stat 282s, cold find
+# 282s), so they bound a hang rather than assert performance; the first nightly
+# on a real runner is the measurement that tells whether the 3.2x margin holds.
 # Deleting the 100k tree through FUSE took >20 minutes, so cleanup is opt-in and
 # the default leaves it at a unique hidden path for the ephemeral runner.
 timeout = "120m"

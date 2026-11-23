@@ -27,9 +27,10 @@
 #      local SSD — create 5.4s, drain 200s, readdir 274s, stat 282s, find 286s —
 #      so they bound hangs rather than assert performance. Worst case with
 #      cleanup enabled: 600+900+900+900+1200 = 4500s of phases, a 2x480s drain,
-#      three ~210s remounts and a ~190s initial mount = about 6280s, inside the
-#      120-minute case timeout in suites.toml. The default (no cleanup) is
-#      ~5080s.)
+#      three ~210s remounts and a ~190s initial mount = about 6280s. The
+#      suites.toml `timeout` is 120m, which only bounds a standalone run: in the
+#      scheduled job the job's own 120-minute limit fires first and these phase
+#      deadlines are the effective bound. The default (no cleanup) is ~5080s.)
 set -eu
 
 NAMESPACE_FILES="${NAMESPACE_FILES:-100000}"
@@ -219,8 +220,9 @@ def readdir(c):
     root, dirs = c["root"], c["dirs"]
     seen = 0
     for d in range(dirs):
-        # Count entries, do not stat them: is_file() forces a getattr per entry
-        # when FUSE reports DT_UNKNOWN, turning a readdir into 100k stats.
+        # Count entries; this phase asserts completeness, it does not assert a
+        # per-entry lookup. The listing paths emit typed modes, so is_file()
+        # would not have cost a stat either way.
         with os.scandir(os.path.join(root, "d%04d" % d)) as it:
             seen += sum(1 for _ in it)
     if seen != c["expected"]:
@@ -258,12 +260,34 @@ def cleanup(c):
     return {"removed": True}
 
 
+def drain_seconds():
+    path = os.path.join(os.environ["RUN_DIR"], "sync-0.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return round(json.load(fh)["duration_ms"] / 1000.0, 3)
+    except (KeyError, ValueError, OSError):
+        return None
+
+
 def summary(c):
-    phases = []
+    logged = []
     if os.path.exists(PHASES):
         with open(PHASES, encoding="utf-8") as fh:
-            phases = [json.loads(line) for line in fh if line.strip()]
-    by_name = {p["phase"]: p for p in phases}
+            logged = [json.loads(line) for line in fh if line.strip()]
+    by_name = {p["phase"]: p for p in logged}
+    # Fixed list: a missing phase must be visible in the table, not absent.
+    phases = []
+    for name in ("create", "readdir", "stat", "find", "cleanup"):
+        entry = by_name.get(name)
+        phases.append({"phase": name, "seconds": entry["seconds"] if entry else None})
+    phases.insert(1, {"phase": "drain", "seconds": drain_seconds()})
+    cleanup_state = "completed"
+    if os.environ.get("NAMESPACE_CLEANUP", "0") != "1":
+        cleanup_state = "skipped"
+    elif "cleanup" not in by_name:
+        cleanup_state = "incomplete"
 
     def seconds(name):
         # A phase that never completed is null, not 0.0: 0.0 reads as "instant".
@@ -272,6 +296,7 @@ def summary(c):
 
     create_s = seconds("create")
     stat_s = seconds("stat")
+    drain_s = seconds("drain")
     report = {
         "schema_version": "drive9-bench/namespace-v1",
         "case": "drive9/fuse/namespace-100k",
@@ -281,6 +306,7 @@ def summary(c):
         "dirs": c["dirs"],
         "workers": c["workers"],
         "phases": phases,
+        "cleanup": cleanup_state,
         "metrics": {
             "create.total_s": create_s,
             "create.files_per_s": round(c["expected"] / create_s, 1) if create_s else None,
@@ -288,6 +314,7 @@ def summary(c):
             "stat.total_s": stat_s,
             "stat.ops_per_s": round(c["expected"] / stat_s, 1) if stat_s else None,
             "find.total_s": seconds("find"),
+            "drain.total_s": drain_s,
             "cleanup.total_s": seconds("cleanup"),
         },
     }
@@ -302,7 +329,11 @@ def summary(c):
         "| Phase | Seconds |",
         "|---|---:|",
     ]
-    md += ["| %s | %s |" % (p["phase"], "n/a" if p["seconds"] is None else "%.1f" % p["seconds"]) for p in phases]
+    md += [
+        "| %s | %s |" % (p["phase"], "n/a" if p["seconds"] is None else "%.1f" % p["seconds"])
+        for p in phases
+    ]
+    md += ["", "Cleanup: `%s`" % cleanup_state]
     with open(os.path.join(os.environ["RUN_DIR"], "namespace-100k.md"), "w", encoding="utf-8") as fh:
         fh.write("\n".join(md) + "\n")
     print("\n".join(md))
@@ -360,6 +391,10 @@ if [ "$NAMESPACE_CLEANUP" = "1" ]; then
   : > "$RUN_DIR/namespace-cleanup-started"
   check shell --req 'drive9-namespace-100k-cleanup' --claim 'remove-the-100k-tree' -- \
       python3 "$LIB" cleanup
+  # The explicit check owns cleanup once it has run: leaving the trap armed
+  # would append a duplicate phase line, or retry an already-capped delete under
+  # a second cap and push the worst case past the documented bound.
+  trap - EXIT
 else
   echo "tree left at $NS_ROOT (set NAMESPACE_CLEANUP=1 to remove it)"
 fi
