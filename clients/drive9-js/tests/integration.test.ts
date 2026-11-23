@@ -1,10 +1,10 @@
 // Integration tests for the Drive9 TypeScript SDK.
 //
 // Exercises every exported Client / StreamWriter method against a live
-// local drive9-server (provider=local). Gated by the DRIVE9_INTEGRATION env var so the default
+// drive9-server. Gated by the DRIVE9_INTEGRATION env var so the default
 // `npm test` (which runs the MSW-mocked suites) is unaffected. The cross-SDK
-// runner (scripts/sdk-integration-tests.sh) exports DRIVE9_INTEGRATION=1 plus
-// DRIVE9_SERVER / DRIVE9_API_KEY before invoking:
+// scenario (`make sdk-integration-tests` / `tests/cases/drive9/api/sdk-integration.t`)
+// exports DRIVE9_INTEGRATION=1 plus DRIVE9_SERVER / DRIVE9_API_KEY before invoking:
 //
 //   npx vitest run tests/integration.test.ts
 //
@@ -18,7 +18,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as zlib from "node:zlib";
 import { execSync } from "node:child_process";
-import { Client, StreamWriter, ConflictError } from "../src/index.js";
+import { Client, StreamWriter, ConflictError, StatusError } from "../src/index.js";
 
 const ENABLED = !!process.env.DRIVE9_INTEGRATION;
 const BASE = (process.env.DRIVE9_SERVER ?? "http://127.0.0.1:9009").replace(/\/$/, "");
@@ -381,7 +381,19 @@ describeIntegration("TypeScript SDK integration", () => {
 
   it("FS Layers", async () => {
     const c = makeClient();
-    const layer = await c.createFSLayer({ base_root_path: prefix, name: "it-ts-layer" });
+    let layer;
+    try {
+      layer = await c.createFSLayer({ base_root_path: prefix, name: "it-ts-layer" });
+    } catch (err) {
+      if (
+        process.env.DRIVE9_ALLOW_CORE_ONLY_SERVER === "1" &&
+        err instanceof StatusError &&
+        (err.statusCode === 404 || err.statusCode === 501)
+      ) {
+        return;
+      }
+      throw err;
+    }
     expect(layer.layer_id).toBeTruthy();
 
     expect(await c.listFSLayers()).toBeTruthy();

@@ -1,0 +1,181 @@
+name: Release Simulator Binary
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "tests/simulator/**"
+      - ".github/workflows/release-simulator.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: release-simulator
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build ${{ matrix.artifact }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: ubuntu-latest
+            rust_target: x86_64-unknown-linux-musl
+            artifact: drive9-simulator-linux-amd64
+            musl: true
+          - os: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-musl
+            artifact: drive9-simulator-linux-arm64
+            musl: true
+          - os: macos-14
+            rust_target: aarch64-apple-darwin
+            artifact: drive9-simulator-darwin-arm64
+            musl: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies (Linux static musl + embedded C suites)
+        if: matrix.musl
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools build-essential pkgconf bison flex m4 xz-utils \
+            zlib1g-dev libaio-dev libacl1-dev libcap-dev libkeyutils-dev libnuma-dev uuid-dev libssl-dev attr
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          targets: ${{ matrix.rust_target }}
+          components: rust-src
+
+      - name: Cache fstest target suite bundles
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/fstest
+          key: fstest-bundle-v3-${{ matrix.rust_target }}-${{ hashFiles('tests/simulator/Cargo.lock') }}
+          restore-keys: |
+            fstest-bundle-v3-${{ matrix.rust_target }}-
+
+      - name: Run simulator unit & manifest completeness tests
+        env:
+          FSTEST_SKIP_BUNDLE: "1"
+        run: cargo test --manifest-path tests/simulator/Cargo.toml
+
+      - name: Build single-file stripped binary
+        run: |
+          mkdir -p dist
+          cargo build --release --target "${{ matrix.rust_target }}" --manifest-path tests/simulator/Cargo.toml
+          cp "tests/simulator/target/${{ matrix.rust_target }}/release/drive9-simulator" "dist/${{ matrix.artifact }}"
+          chmod +x "dist/${{ matrix.artifact }}"
+
+      - name: Verify standalone single-binary & embedded multi-call tools
+        run: |
+          set -euo pipefail
+          REPO_ROOT="$(pwd)"
+          BIN="${REPO_ROOT}/dist/${{ matrix.artifact }}"
+          EMPTY_DIR="$(mktemp -d)"
+          cd "$EMPTY_DIR"
+          "$BIN" --version
+          "$BIN" validate "${REPO_ROOT}/tests/cases"
+          for tool in fstest fsync d9-stat d9-http; do
+            ln -s "$BIN" "$EMPTY_DIR/$tool"
+          done
+          "$EMPTY_DIR/fstest" --version
+          printf 'verify\n' > "$EMPTY_DIR/probe.txt"
+          "$EMPTY_DIR/fsync" "$EMPTY_DIR/probe.txt"
+          test "$("$EMPTY_DIR/d9-stat" size "$EMPTY_DIR/probe.txt")" = "7"
+          if [ "${{ matrix.musl }}" = "true" ]; then
+            if ldd "$BIN" 2>&1 | grep -Evq 'not a dynamic executable|statically linked'; then
+              echo "Expected static musl ELF, got:" >&2
+              ldd "$BIN" >&2 || true
+              exit 1
+            fi
+          fi
+          rm -rf "$EMPTY_DIR"
+
+      - name: Upload matrix artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}
+          retention-days: 7
+
+  publish:
+    name: Publish Simulator Binaries
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download built binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums & version metadata
+        run: |
+          set -euo pipefail
+          SIM_SHA="$(git log -1 --format=%H -- tests/simulator .github/workflows/release-simulator.yml)"
+          cd dist
+          rm -f *.sha256 simulator-checksums.txt
+          chmod +x drive9-simulator-*
+          sha256sum drive9-simulator-* > simulator-checksums.txt
+          for f in drive9-simulator-*; do
+            sha256sum "$f" > "${f}.sha256"
+          done
+          echo "${SIM_SHA:-$GITHUB_SHA}" > simulator-version
+          cat simulator-checksums.txt
+
+      - name: Publish to GitHub Release (simulator-latest)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="simulator-latest"
+          NOTES="Automated standalone single-binary build of drive9-simulator (commit ${GITHUB_SHA::7}, embeds built-in contract server + fstest suites)."
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --notes "$NOTES" --latest=false
+          else
+            gh release create "$TAG" --title "drive9-simulator (latest)" --notes "$NOTES" --prerelease --latest=false
+          fi
+          gh release upload "$TAG" \
+            dist/drive9-simulator-* \
+            dist/simulator-checksums.txt \
+            dist/simulator-version \
+            --clobber
+
+      - name: Upload to S3 releases bucket (when AWS_ROLE_ARN is configured)
+        if: ${{ secrets.AWS_ROLE_ARN != '' }}
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-west-2
+
+      - name: Sync simulator binaries to S3 (when AWS_ROLE_ARN is configured)
+        if: ${{ secrets.AWS_ROLE_ARN != '' }}
+        run: |
+          aws s3 sync dist/ s3://drive9-releases/simulator/latest/ \
+            --exclude "*" \
+            --include "drive9-simulator-*" \
+            --cache-control "public, max-age=300" \
+            --content-type "application/octet-stream" \
+            --no-progress
+          aws s3 sync dist/ s3://drive9-releases/simulator/latest/ \
+            --exclude "*" \
+            --include "simulator-checksums.txt" \
+            --include "simulator-version" \
+            --cache-control "public, max-age=60" \
+            --content-type "text/plain" \
+            --no-progress

@@ -10,7 +10,8 @@ If DRIVE9_API_KEY is unset, the client falls back to ~/.drive9/config (via
 Client.default(...)). If the server is not reachable, the whole module is
 skipped so it is safe to run `pytest` in any environment.
 
-The cross-SDK runner (scripts/sdk-integration-tests.sh) exports DRIVE9_SERVER
+The cross-SDK scenario (`make sdk-integration-tests` /
+`tests/cases/drive9/api/sdk-integration.t`) exports DRIVE9_SERVER
 and DRIVE9_API_KEY before invoking:
     pytest tests/test_integration.py
 

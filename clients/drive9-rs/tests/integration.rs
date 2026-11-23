@@ -1,9 +1,9 @@
 // Integration tests for the Drive9 Rust SDK.
 //
 // Exercises every exported Client / StreamWriter method against a live
-// local drive9-server (provider=local). Marked `#[ignore]` so the default `cargo test` (which
+// drive9-server. Marked `#[ignore]` so the default `cargo test` (which
 // runs the mockito-backed unit tests) does not require a server. The
-// cross-SDK runner (scripts/sdk-integration-tests.sh) invokes:
+// cross-SDK scenario (`make sdk-integration-tests` / `tests/cases/drive9/api/sdk-integration.t`) invokes:
 //
 //   cargo test --test integration -- --ignored --test-threads=1
 //

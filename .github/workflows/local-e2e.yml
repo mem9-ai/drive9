@@ -10,15 +10,11 @@ on:
       - "cmd/**"
       - "pkg/**"
       - "internal/**"
-      - "scripts/**"
-      - "e2e/**"
+      - "tests/**"
       - "go.mod"
       - "go.sum"
       - "Makefile"
   push:
-    # Post-merge tier: heavy suites run per merged commit (coalesced via the
-    # concurrency group below) so a red run points at a handful of commits
-    # instead of a whole day of them.
     branches:
       - main
     paths:
@@ -26,750 +22,228 @@ on:
       - "cmd/**"
       - "pkg/**"
       - "internal/**"
-      - "scripts/**"
-      - "e2e/**"
+      - "tests/**"
       - "go.mod"
       - "go.sum"
       - "Makefile"
   schedule:
-    # Daily heavy FUSE gate at 20:17 UTC / 04:17 Asia/Shanghai.
     - cron: "17 20 * * *"
-  workflow_call:
-    inputs:
-      run_all_e2e:
-        required: false
-        default: "0"
-        type: string
-      run_fuse_concurrency_stress_write_sync:
-        required: false
-        default: "0"
-        type: string
-      feishu_proof:
-        required: false
-        default: "0"
-        type: string
   workflow_dispatch:
     inputs:
-      run_all_e2e:
-        description: "Run every e2e suite in this workflow (overrides the individual toggles below; perf archive/compare keep their own toggles)"
+      tier:
+        description: "Suite tier from tests/cases/suites.toml"
         required: false
-        default: "0"
+        default: "pr"
         type: choice
         options:
-          - "0"
-          - "1"
-      run_fuse_concurrency_stress:
-        description: "Run opt-in FUSE concurrency stress workload"
+          - "pr"
+          - "pr-no-mount"
+          - "pr-fuse"
+          - "daily-fault"
+          - "daily-fuse"
+          - "daily-bench"
+          - "daily"
+      jobs:
+        description: "Parallel case workers (--jobs)"
         required: false
-        default: "0"
-        type: choice
-        options:
-          - "0"
-          - "1"
-      run_fuse_concurrency_stress_write_sync:
-        description: "Run opt-in FUSE concurrency stress workload under --durability write-sync (issue #936 acceptance; not part of run_all_e2e)"
+        default: "4"
+        type: string
+      server:
+        description: "Optional external drive9-server URL (omit to use built-in contract server)"
         required: false
-        default: "0"
-        type: choice
-        options:
-          - "0"
-          - "1"
-      run_fuse_posix_fsx:
-        description: "Run opt-in FUSE POSIX/fsx-style workload"
-        required: false
-        default: "0"
-        type: choice
-        options:
-          - "0"
-          - "1"
-      run_fuse_sqlite_wal:
-        description: "Run opt-in FUSE SQLite WAL workload"
-        required: false
-        default: "0"
-        type: choice
-        options:
-          - "0"
-          - "1"
-      run_fuse_sqlite_churn:
-        description: "Run opt-in FUSE SQLite churn workload"
-        required: false
-        default: "0"
-        type: choice
-        options:
-          - "0"
-          - "1"
-      run_fuse_sqlite_concurrency:
-        description: "Run opt-in FUSE SQLite readers/writer workload"
-        required: false
-        default: "0"
-        type: choice
-        options:
-          - "0"
-          - "1"
-      run_fuse_performance_baseline:
-        description: "Run opt-in FUSE performance baseline and upload metrics artifacts"
-        required: false
-        default: "0"
-        type: choice
-        options:
-          - "0"
-          - "1"
-      archive_fuse_performance_metrics:
-        description: "Archive FUSE performance metrics to the Drive9 CI workspace"
-        required: false
-        default: "0"
-        type: choice
-        options:
-          - "0"
-          - "1"
-      compare_fuse_performance_metrics:
-        description: "Compare FUSE performance metrics against the Drive9 archived baseline"
-        required: false
-        default: "0"
-        type: choice
-        options:
-          - "0"
-          - "1"
-      run_e2e_smoke_all:
-        description: "Run full local smoke-all suite, including journal, POSIX permission, FUSE smoke, and Git workspace"
-        required: false
-        default: "0"
-        type: choice
-        options:
-          - "0"
-          - "1"
-      run_git_feature_smoke:
-        description: "Run Git feature smoke against a live FUSE mount"
-        required: false
-        default: "0"
-        type: choice
-        options:
-          - "0"
-          - "1"
-      feishu_proof:
-        description: "Prove the Feishu notification path: inject a synthetic failed suite so a card is sent on this (green) run. Does not fail the job or file an issue."
-        required: false
-        default: "0"
-        type: choice
-        options:
-          - "0"
-          - "1"
-
-permissions:
-  contents: read
-  issues: write
+        default: ""
+        type: string
 
 concurrency:
-  # Post-merge runs coalesce (one running + one queued, never cancelled) so
-  # bursts of merges collapse into few runs; PR runs cancel superseded pushes.
   group: local-e2e-${{ github.event_name == 'push' && 'main-post-merge' || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'push' }}
-
-env:
-  TIDB_VERSION: v8.5.5
-  DRIVE9_BASE: http://127.0.0.1:9009
-  DRIVE9_TENANT_PROVIDER: local
-  # The Git suites clone a fixture repository built on this runner, so the
-  # server must accept a local repository URL. Production keeps the remote-only
-  # default; this opt-in is what the local provider harness is for.
-  DRIVE9_GIT_ALLOW_LOCAL_REPOS: "1"
-  DRIVE9_LOCAL_DSN: root@tcp(127.0.0.1:4000)/drive9_local?parseTime=true
-  DRIVE9_META_DSN: root@tcp(127.0.0.1:4000)/drive9_local?parseTime=true
-  DRIVE9_LOCAL_MYSQL_DSN: root@tcp(127.0.0.1:4000)/drive9_local?parseTime=true
-  DRIVE9_LOCAL_EMBEDDING_MODE: app
-  DRIVE9_S3_BACKEND: s3
-  RUN_SEMANTIC_CHECKS: "0"
-  RUN_CLI_SEMANTIC_CHECKS: "0"
-  RUN_FUSE_CONCURRENCY_STRESS: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && '1' || ((github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.run_all_e2e == '1' && '1' || inputs.run_fuse_concurrency_stress) || '0') }}
-  # Deliberately excluded from schedule/push and from run_all_e2e: write-sync
-  # is not a routine path. Opt-in only, for on-demand issue #936 acceptance
-  # runs of the frozen concurrency workload.
-  RUN_FUSE_CONCURRENCY_STRESS_WRITE_SYNC: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && inputs.run_fuse_concurrency_stress_write_sync || '0' }}
-  RUN_FUSE_POSIX_FSX: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && '1' || ((github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.run_all_e2e == '1' && '1' || inputs.run_fuse_posix_fsx) || '0') }}
-  RUN_FUSE_SQLITE_WAL: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && '1' || ((github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.run_all_e2e == '1' && '1' || inputs.run_fuse_sqlite_wal) || '0') }}
-  RUN_FUSE_SQLITE_CHURN: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && '1' || ((github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.run_all_e2e == '1' && '1' || inputs.run_fuse_sqlite_churn) || '0') }}
-  RUN_FUSE_SQLITE_CONCURRENCY: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && '1' || ((github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.run_all_e2e == '1' && '1' || inputs.run_fuse_sqlite_concurrency) || '0') }}
-  RUN_FUSE_PERFORMANCE_BASELINE: ${{ github.event_name == 'schedule' && '1' || ((github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.run_all_e2e == '1' && '1' || inputs.run_fuse_performance_baseline) || '0') }}
-  ARCHIVE_FUSE_PERFORMANCE_METRICS: ${{ github.event_name == 'schedule' && '1' || (github.event_name == 'workflow_dispatch' && inputs.archive_fuse_performance_metrics || '0') }}
-  COMPARE_FUSE_PERFORMANCE_METRICS: ${{ github.event_name == 'schedule' && '1' || (github.event_name == 'workflow_dispatch' && inputs.compare_fuse_performance_metrics || '0') }}
-  RUN_E2E_SMOKE_ALL: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && '1' || ((github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.run_all_e2e == '1' && '1' || inputs.run_e2e_smoke_all) || '0') }}
-  RUN_GIT_FEATURE_SMOKE: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && '1' || ((github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.run_all_e2e == '1' && '1' || inputs.run_git_feature_smoke) || '0') }}
-  # Report-only: hosted-runner FUSE numbers are too noisy for a hard
-  # day-over-day gate (the first two nightly runs both false-failed here).
-  # Deterministic perf gating lives in e2e/fuse-write-perf-budget-test.sh.
-  FUSE_PERF_COMPARE_FAIL_ON_REGRESSION: "0"
-  FUSE_CONCURRENCY_STRESS_REQUIRED: ${{ (github.event_name == 'schedule' || github.event_name == 'push' || ((github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.run_all_e2e == '1' || inputs.run_fuse_concurrency_stress == '1'))) && '1' || '0' }}
-  FEISHU_PROOF: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && inputs.feishu_proof == '1' && '1' || '0' }}
-  FUSE_PERF_ARTIFACT_DIR: ${{ github.workspace }}/e2e-artifacts/fuse-performance
-  FUSE_CONCURRENCY_ARTIFACT_DIR: ${{ github.workspace }}/e2e-artifacts/fuse-concurrency
 
 jobs:
   local-e2e:
     name: Local E2E
     runs-on: ubuntu-latest
-    timeout-minutes: 120
-
+    timeout-minutes: ${{ github.event_name == 'schedule' && 120 || 45 }}
+    permissions:
+      contents: read
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Set up Go
+      - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
-          python-version: "3.12"
+          node-version: "20"
 
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y default-mysql-client fuse3 jq
-
-      - name: Cache TiUP artifacts
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.tiup/bin
-            ~/.tiup/components
-            ~/.tiup/manifests
-            ~/.tiup/manifest
-          key: ${{ runner.os }}-tiup-${{ env.TIDB_VERSION }}
-
-      - name: Install TiUP and TiDB components
-        run: |
-          if [ ! -x "$HOME/.tiup/bin/tiup" ]; then
-            curl --proto '=https' --tlsv1.2 -sSf https://tiup-mirrors.pingcap.com/install.sh | sh
-          fi
-          echo "$HOME/.tiup/bin" >> "$GITHUB_PATH"
-          export PATH="$HOME/.tiup/bin:$PATH"
-          tiup telemetry disable || true
-          tiup install playground
-          tiup install "tidb:${TIDB_VERSION}" "pd:${TIDB_VERSION}" "tikv:${TIDB_VERSION}"
-          tiup --version
-
-      - name: Start TiDB playground
-        run: |
-          export PATH="$HOME/.tiup/bin:$PATH"
-          nohup tiup playground "${TIDB_VERSION}" --tiflash 0 --without-monitor > /tmp/tiup-playground.log 2>&1 &
-          echo $! > /tmp/tiup-playground.pid
-
-      - name: Wait for TiDB readiness and create local database
-        run: |
-          for _ in {1..60}; do
-            if curl -sf http://127.0.0.1:10080/status > /tmp/tidb-status.json \
-              && mysql --protocol=tcp -h 127.0.0.1 -P 4000 -u root \
-                -e "CREATE DATABASE IF NOT EXISTS drive9_local;" > /tmp/tidb-sql-ready.log 2>&1; then
-              cat /tmp/tidb-status.json
-              exit 0
-            fi
-            sleep 5
-          done
-          echo "TiDB playground did not become ready in time" >&2
-          cat /tmp/tidb-sql-ready.log >&2 || true
-          exit 1
-
-      - name: Start local object store
-        run: |
-          s3_env=$(bash scripts/local-object-store.sh apply)
-          eval "$s3_env"
-          python3 - <<'PY'
-          import os
-          names = ('DIR', 'BUCKET', 'REGION', 'ENDPOINT', 'FORCE_PATH_STYLE', 'ACCESS_KEY_ID', 'SECRET_ACCESS_KEY')
-          with open(os.environ['GITHUB_ENV'], 'a') as output:
-              for suffix in names:
-                  name = 'DRIVE9_S3_' + suffix
-                  output.write(name + '=' + os.environ.get(name, '') + '\n')
-          PY
-
-      - name: Start drive9-server
+      - name: Ensure FUSE3 & host tools
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TIER: ${{ inputs.tier }}
         run: |
           set -euo pipefail
-          if [ -n "${DRIVE9_SERVER_BIN:-}" ]; then
-            if [ ! -x "$DRIVE9_SERVER_BIN" ]; then
-              echo "DRIVE9_SERVER_BIN is not executable: $DRIVE9_SERVER_BIN" >&2
-              exit 1
-            fi
-            echo "DRIVE9_E2E_ALLOW_LEGACY_TOKEN_API=0" >> "$GITHUB_ENV"
-            echo "starting pre-built server $DRIVE9_SERVER_BIN"
-            nohup "$DRIVE9_SERVER_BIN" > /tmp/drive9-server.log 2>&1 &
-          else
-            echo "DRIVE9_E2E_ALLOW_LEGACY_TOKEN_API=1" >> "$GITHUB_ENV"
-            nohup make run-server-local > /tmp/drive9-server.log 2>&1 &
+          pkgs=()
+          command -v fusermount3 >/dev/null || pkgs+=(fuse3)
+          command -v getfattr >/dev/null || pkgs+=(attr)
+          command -v sqlite3 >/dev/null || pkgs+=(sqlite3)
+          if [ "$EVENT_NAME" = "schedule" ] || [[ "${INPUT_TIER:-}" == daily* ]]; then
+            command -v setfacl >/dev/null || pkgs+=(acl)
+            command -v zip >/dev/null || pkgs+=(zip)
+            command -v unzip >/dev/null || pkgs+=(unzip)
           fi
-          echo $! > /tmp/drive9-server.pid
-
-      - name: Wait for drive9-server readiness
-        run: |
-          for _ in {1..60}; do
-            if curl -sf "$DRIVE9_BASE/healthz" > /tmp/drive9-healthz.json; then
-              cat /tmp/drive9-healthz.json
-              exit 0
-            fi
-            sleep 2
-          done
-          echo "drive9-server did not become ready in time" >&2
-          exit 1
-
-      - name: Run API smoke
-        id: api-smoke
-        continue-on-error: true
-        run: bash e2e/api-smoke-test.sh
-
-      - name: Run CLI smoke
-        id: cli-smoke
-        continue-on-error: true
-        run: bash e2e/cli-smoke-test.sh
-
-      - name: Run object-store smoke
-        id: object-store-smoke
-        continue-on-error: true
-        timeout-minutes: 20
-        env:
-          OBJECT_STRICT_MOUNT: "1"
-          OBJECT_STRICT_CROSS: "1"
-        run: bash e2e/object-store-smoke-test.sh
-
-      - name: Run layer FS smoke
-        id: layer-fs-smoke
-        continue-on-error: true
-        env:
-          RUN_LAYER_FUSE_SMOKE: "1"
-          LAYER_FUSE_STRICT_PREREQS: "1"
-        run: bash e2e/layer-fs-smoke-test.sh
-
-      - name: Test READDIRPLUS, rename, unlink and SSE disconnects through Linux FUSE
-        id: fuse-readdir-pending
-        continue-on-error: true
-        env:
-          DRIVE9_REQUIRE_KERNEL_FUSE: "1"
-        run: make test TEST_PKGS=./pkg/fuse TEST_RUN='^Test(ReadDirPlus(PendingKernel|ReplacedInodeKernel)|SSEDisconnectReadKernel|Unlink(Hardlink|Recreate|ParentRename)Kernel|RenameLongPathKernel)$' TEST_TIMEOUT=2m
-
-      - name: Run FUSE release gate
-        id: fuse-smoke
-        env:
-          RUN_FUSE_CONCURRENCY_STRESS: "0"
-          RUN_FUSE_POSIX_FSX: "0"
-        run: bash e2e/fuse-release-gate.sh
-
-      - name: Run FUSE patch storage-class e2e
-        id: fuse-patch-storage-class
-        run: bash e2e/fuse-patch-storage-class.sh
-
-      - name: Run Git operations smoke
-        id: git-ops-smoke
-        continue-on-error: true
-        env:
-          FUSE_STRICT_PREREQS: "1"
-        run: bash e2e/git-ops-smoke-test.sh
-
-      - name: Run Git workspace on-demand discovery smoke
-        id: git-workspace-ondemand-smoke
-        continue-on-error: true
-        env:
-          FUSE_STRICT_PREREQS: "1"
-        run: bash e2e/git-workspace-ondemand-smoke-test.sh
-
-      - name: Run pack smoke
-        id: pack-smoke
-        continue-on-error: true
-        run: bash e2e/pack-smoke-test.sh
-
-      - name: Run FUSE crash recovery e2e
-        id: fuse-crash-recovery
-        continue-on-error: true
-        run: bash e2e/fuse-crash-recovery-test.sh
-
-      - name: Upload FUSE crash recovery artifacts
-        if: always() && steps.fuse-crash-recovery.outcome == 'failure'
-        uses: actions/upload-artifact@v4
-        with:
-          name: fuse-crash-recovery
-          path: /tmp/drive9-fuse-crash-*/mount.log
-          if-no-files-found: warn
-
-      - name: Run FUSE supervision e2e
-        id: fuse-supervision
-        continue-on-error: true
-        env:
-          FUSE_STRICT_PREREQS: "1"
-        run: bash e2e/fuse-supervision-test.sh
-
-      - name: Upload FUSE supervision artifacts
-        if: always() && steps.fuse-supervision.outcome == 'failure'
-        uses: actions/upload-artifact@v4
-        with:
-          name: fuse-supervision
-          path: |
-            /tmp/drive9-fuse-supervise-*/mount.log
-            /tmp/drive9-fuse-supervise-*/supervisor-worker.log
-            /tmp/drive9-fuse-supervise-*/*.log
-          if-no-files-found: warn
-
-      - name: Run FUSE write perf budget e2e
-        id: fuse-write-perf-budget
-        continue-on-error: true
-        run: bash e2e/fuse-write-perf-budget-test.sh
-
-      - name: Upload FUSE write perf artifacts
-        if: always() && steps.fuse-write-perf-budget.outcome == 'failure'
-        uses: actions/upload-artifact@v4
-        with:
-          name: fuse-write-perf-budget
-          path: /tmp/drive9-fuse-write-perf-*/mount.log
-          if-no-files-found: warn
-
-      - name: Compare FUSE performance metrics
-        id: fuse_performance_compare
-        if: always() && env.RUN_FUSE_PERFORMANCE_BASELINE == '1' && env.COMPARE_FUSE_PERFORMANCE_METRICS == '1'
-        env:
-          DRIVE9_SERVER: https://api.drive9.ai
-          DRIVE9_API_KEY: ${{ secrets.DRIVE9_ARCHIVE_API_KEY }}
-          DRIVE9_PERF_SOURCE_DIR: ${{ env.FUSE_PERF_ARTIFACT_DIR }}
-          DRIVE9_PERF_ARCHIVE_ROOT: /benchmarks/fuse-performance
-          DRIVE9_PERF_BRANCH: ${{ github.ref_name }}
-          DRIVE9_PERF_SHA: ${{ github.sha }}
-          DRIVE9_PERF_RUN_ID: ${{ github.run_id }}
-          DRIVE9_PERF_RUN_ATTEMPT: ${{ github.run_attempt }}
-        run: bash scripts/compare-fuse-performance-metrics.sh
-
-      - name: Upload FUSE performance artifacts
-        if: always() && env.RUN_FUSE_PERFORMANCE_BASELINE == '1'
-        uses: actions/upload-artifact@v4
-        with:
-          name: fuse-performance-baseline
-          path: e2e-artifacts/fuse-performance
-          if-no-files-found: warn
-
-      - name: Archive FUSE performance metrics to Drive9
-        if: >
-          always() &&
-          env.RUN_FUSE_PERFORMANCE_BASELINE == '1' &&
-          env.ARCHIVE_FUSE_PERFORMANCE_METRICS == '1' &&
-          (
-            env.COMPARE_FUSE_PERFORMANCE_METRICS != '1' ||
-            steps.fuse_performance_compare.outcome == 'success' ||
-            steps.fuse_performance_compare.outcome == 'skipped'
-          )
-        env:
-          DRIVE9_SERVER: https://api.drive9.ai
-          DRIVE9_API_KEY: ${{ secrets.DRIVE9_ARCHIVE_API_KEY }}
-          DRIVE9_PERF_SOURCE_DIR: ${{ env.FUSE_PERF_ARTIFACT_DIR }}
-          DRIVE9_PERF_ARCHIVE_ROOT: /benchmarks/fuse-performance
-          DRIVE9_PERF_REPOSITORY: ${{ github.repository }}
-          DRIVE9_PERF_BRANCH: ${{ github.ref_name }}
-          DRIVE9_PERF_SHA: ${{ github.sha }}
-          DRIVE9_PERF_RUN_ID: ${{ github.run_id }}
-          DRIVE9_PERF_RUN_ATTEMPT: ${{ github.run_attempt }}
-          DRIVE9_PERF_WORKFLOW: ${{ github.workflow }}
-          DRIVE9_PERF_EVENT_NAME: ${{ github.event_name }}
-          DRIVE9_PERF_ARCHIVE_ALLOW_EMPTY: "1"
-        run: bash scripts/archive-fuse-performance-metrics.sh
-
-      - name: Run FUSE concurrency stress
-        id: fuse-concurrency-stress
-        if: always() && env.RUN_FUSE_CONCURRENCY_STRESS == '1'
-        env:
-          FUSE_CONCURRENCY_KEEP_ARTIFACTS: "1"
-        run: bash e2e/fuse-concurrency-stress.sh
-
-      - name: Upload FUSE concurrency artifacts
-        if: always() && env.RUN_FUSE_CONCURRENCY_STRESS == '1'
-        uses: actions/upload-artifact@v4
-        with:
-          name: fuse-concurrency-stress
-          path: e2e-artifacts/fuse-concurrency
-          if-no-files-found: warn
-
-      - name: Run FUSE concurrency stress (write-sync, opt-in)
-        id: fuse-concurrency-stress-write-sync
-        if: always() && env.RUN_FUSE_CONCURRENCY_STRESS_WRITE_SYNC == '1'
-        env:
-          FUSE_CONCURRENCY_KEEP_ARTIFACTS: "1"
-          DRIVE9_E2E_DURABILITY: write-sync
-          FUSE_CONCURRENCY_ARTIFACT_DIR: ${{ github.workspace }}/e2e-artifacts/fuse-concurrency-write-sync
-        run: bash e2e/fuse-concurrency-stress.sh
-
-      - name: Upload FUSE concurrency write-sync artifacts
-        if: always() && env.RUN_FUSE_CONCURRENCY_STRESS_WRITE_SYNC == '1'
-        uses: actions/upload-artifact@v4
-        with:
-          name: fuse-concurrency-stress-write-sync
-          path: e2e-artifacts/fuse-concurrency-write-sync
-          if-no-files-found: warn
-
-      - name: Run FUSE POSIX/fsx gate
-        id: fuse-posix-fsx
-        if: always() && env.RUN_FUSE_POSIX_FSX == '1'
-        continue-on-error: true
-        run: bash e2e/fuse-posix-fsx-gate.sh
-
-      - name: Run full smoke-all suite
-        id: smoke-all
-        if: always() && env.RUN_E2E_SMOKE_ALL == '1'
-        continue-on-error: true
-        env:
-          FUSE_STRICT_PREREQS: "1"
-          RUN_JOURNAL_SMOKE: "1"
-          RUN_POSIX_SMOKE: "1"
-          RUN_GIT_WORKSPACE_SMOKE: "1"
-          GIT_WORKSPACE_CLONE_TIMEOUT_S: "1800"
-        run: bash e2e/smoke-all.sh
-
-      - name: Run Git feature smoke
-        id: git-feature-smoke
-        if: always() && env.RUN_GIT_FEATURE_SMOKE == '1'
-        continue-on-error: true
-        env:
-          FUSE_STRICT_PREREQS: "1"
-        run: bash e2e/git-feature-smoke-test.sh
-
-      - name: Publish local e2e summary
-        if: always()
-        run: |
-          {
-            echo "## drive9-server local e2e"
-            echo
-            echo "| Check | Outcome |"
-            echo "| --- | --- |"
-            echo "| API smoke | ${{ steps.api-smoke.outcome || 'skipped' }} |"
-            echo "| CLI smoke | ${{ steps.cli-smoke.outcome || 'skipped' }} |"
-            echo "| Object-store smoke | ${{ steps.object-store-smoke.outcome || 'skipped' }} |"
-            echo "| Layer FS smoke | ${{ steps.layer-fs-smoke.outcome || 'skipped' }} |"
-            echo "| FUSE pending READDIRPLUS | ${{ steps.fuse-readdir-pending.outcome || 'skipped' }} |"
-            echo "| FUSE release gate | ${{ steps.fuse-smoke.outcome || 'skipped' }} |"
-            echo "| FUSE patch storage-class e2e | ${{ steps.fuse-patch-storage-class.outcome || 'skipped' }} |"
-            echo "| Git operations smoke | ${{ steps.git-ops-smoke.outcome || 'skipped' }} |"
-            echo "| Git workspace on-demand discovery smoke | ${{ steps.git-workspace-ondemand-smoke.outcome || 'skipped' }} |"
-            echo "| Pack smoke | ${{ steps.pack-smoke.outcome || 'skipped' }} |"
-            echo "| FUSE crash recovery e2e | ${{ steps.fuse-crash-recovery.outcome || 'skipped' }} |"
-            echo "| FUSE supervision e2e | ${{ steps.fuse-supervision.outcome || 'skipped' }} |"
-            echo "| FUSE write perf budget e2e | ${{ steps.fuse-write-perf-budget.outcome || 'skipped' }} |"
-            echo "| FUSE performance compare | ${{ steps.fuse_performance_compare.outcome || 'skipped' }} |"
-            echo "| FUSE concurrency stress | ${{ steps.fuse-concurrency-stress.outcome || 'skipped' }} |"
-            echo "| FUSE concurrency stress (write-sync, opt-in) | ${{ steps.fuse-concurrency-stress-write-sync.outcome || 'skipped' }} |"
-            echo "| FUSE POSIX/fsx gate | ${{ steps.fuse-posix-fsx.outcome || 'skipped' }} |"
-            echo "| Full smoke-all suite | ${{ steps.smoke-all.outcome || 'skipped' }} |"
-            echo "| Git feature smoke | ${{ steps.git-feature-smoke.outcome || 'skipped' }} |"
-            echo
-            echo "FUSE concurrency stress: \`RUN_FUSE_CONCURRENCY_STRESS=${RUN_FUSE_CONCURRENCY_STRESS}\`"
-            echo "FUSE concurrency stress required: \`FUSE_CONCURRENCY_STRESS_REQUIRED=${FUSE_CONCURRENCY_STRESS_REQUIRED}\`"
-            echo "FUSE POSIX/fsx gate: \`RUN_FUSE_POSIX_FSX=${RUN_FUSE_POSIX_FSX}\`"
-            echo "FUSE SQLite WAL: \`RUN_FUSE_SQLITE_WAL=${RUN_FUSE_SQLITE_WAL}\`"
-            echo "FUSE SQLite churn: \`RUN_FUSE_SQLITE_CHURN=${RUN_FUSE_SQLITE_CHURN}\`"
-            echo "FUSE SQLite concurrency: \`RUN_FUSE_SQLITE_CONCURRENCY=${RUN_FUSE_SQLITE_CONCURRENCY}\`"
-            echo "FUSE performance baseline: \`RUN_FUSE_PERFORMANCE_BASELINE=${RUN_FUSE_PERFORMANCE_BASELINE}\`"
-            echo "Archive FUSE performance metrics: \`ARCHIVE_FUSE_PERFORMANCE_METRICS=${ARCHIVE_FUSE_PERFORMANCE_METRICS}\`"
-            echo "Compare FUSE performance metrics: \`COMPARE_FUSE_PERFORMANCE_METRICS=${COMPARE_FUSE_PERFORMANCE_METRICS}\`"
-            echo "Full smoke-all suite: \`RUN_E2E_SMOKE_ALL=${RUN_E2E_SMOKE_ALL}\`"
-            echo "Git feature smoke: \`RUN_GIT_FEATURE_SMOKE=${RUN_GIT_FEATURE_SMOKE}\`"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      # Turn the raw per-suite outcomes into one product-quality report: a richer
-      # step summary grouped by product promise, an aggregated JSON for the
-      # notifier, a signature-led issue body, and outputs (notify/signature/...).
-      # failure() is only valid in `if:`, so capture "a prior step hard-failed"
-      # (e.g. TiDB/server setup) as a marker file the aggregator can read.
-      - name: Detect degraded pipeline
-        if: failure()
-        run: touch /tmp/e2e-degraded
-
-      - name: Aggregate e2e product-quality report
-        id: aggregate
-        if: always()
-        run: |
-          cat > /tmp/e2e-outcomes.json <<JSON
-          {
-            "api-smoke": "${{ steps.api-smoke.outcome }}",
-            "cli-smoke": "${{ steps.cli-smoke.outcome }}",
-            "object-store-smoke": "${{ steps.object-store-smoke.outcome }}",
-            "layer-fs-smoke": "${{ steps.layer-fs-smoke.outcome }}",
-            "fuse-readdir-pending": "${{ steps.fuse-readdir-pending.outcome }}",
-            "fuse-smoke": "${{ steps.fuse-smoke.outcome }}",
-            "fuse-patch-storage-class": "${{ steps.fuse-patch-storage-class.outcome }}",
-            "git-ops-smoke": "${{ steps.git-ops-smoke.outcome }}",
-            "git-workspace-ondemand-smoke": "${{ steps.git-workspace-ondemand-smoke.outcome }}",
-            "pack-smoke": "${{ steps.pack-smoke.outcome }}",
-            "fuse-crash-recovery": "${{ steps.fuse-crash-recovery.outcome }}",
-            "fuse-supervision": "${{ steps.fuse-supervision.outcome }}",
-            "fuse-write-perf-budget": "${{ steps.fuse-write-perf-budget.outcome }}",
-            "fuse_performance_compare": "${{ steps.fuse_performance_compare.outcome }}",
-            "fuse-concurrency-stress": "${{ steps.fuse-concurrency-stress.outcome }}",
-            "fuse-concurrency-stress-write-sync": "${{ steps.fuse-concurrency-stress-write-sync.outcome }}",
-            "fuse-posix-fsx": "${{ steps.fuse-posix-fsx.outcome }}",
-            "smoke-all": "${{ steps.smoke-all.outcome }}",
-            "git-feature-smoke": "${{ steps.git-feature-smoke.outcome }}"
-          }
-          JSON
-          args=()
-          if [ "${FEISHU_PROOF}" = "1" ]; then
-            args+=(--proof-fail-suite e2e-feishu-proof)
+          if [ "${#pkgs[@]}" -gt 0 ]; then
+            sudo apt-get update
+            sudo apt-get install -y "${pkgs[@]}"
           fi
-          if [ -f /tmp/e2e-degraded ]; then
-            args+=(--degraded)
-          fi
-          go run ./cmd/e2e-aggregate \
-            --manifest e2e/suite-manifest.json \
-            --outcomes /tmp/e2e-outcomes.json \
-            --summaries e2e/reports/summary \
-            --out /tmp/e2e-report.json \
-            --issue-body /tmp/e2e-issue-body.md \
-            "${args[@]}"
+          sudo sed -i 's/^#user_allow_other/user_allow_other/' /etc/fuse.conf || echo "user_allow_other" | sudo tee -a /etc/fuse.conf
 
-      # Push failures/regressions that warrant attention to Feishu/Lark. PR-tier
-      # failures stay in GitHub by policy; the notifier no-ops when no Feishu
-      # secret is configured, so this never blocks a fork/PR without secrets.
-      #
-      # SECURITY: only run on trusted events. A pull_request runs code from the PR
-      # checkout, and a PR-controlled aggregator can set notify=true (e.g. a perf
-      # regression notifies regardless of tier); exposing the Feishu secrets to
-      # `go run` on a PR would let a same-repo PR exfiltrate them. push/schedule
-      # are main-only; workflow_dispatch/workflow_call require a trusted actor.
-      - name: Notify Feishu on post-merge/nightly failure or perf regression
-        if: >-
-          always() && steps.aggregate.outputs.notify == 'true' &&
-          (github.event_name == 'push' || github.event_name == 'schedule' ||
-          github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call')
-        continue-on-error: true
-        env:
-          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
-          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
-          FEISHU_CHAT_ID: ${{ secrets.FEISHU_CHAT_ID }}
-          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
-        run: |
-          go run ./cmd/feishu-notify --report /tmp/e2e-report.json
+      - name: Build drive9 CLI
+        run: make build-cli
 
-      - name: Dump TiDB playground logs
-        if: always()
-        run: |
-          if [ -f /tmp/tiup-playground.log ]; then
-            echo "=== tiup playground log ==="
-            cat /tmp/tiup-playground.log
-          fi
+      - name: Run kernel FUSE white-box Go tests
+        if: inputs.tier != 'pr-no-mount'
+        run: umask 022 && make test-fuse-kernel
 
-      - name: Dump drive9-server logs
-        if: always()
-        run: |
-          if [ -f /tmp/drive9-server.log ]; then
-            echo "=== drive9-server log ==="
-            cat /tmp/drive9-server.log
-          fi
-
-      - name: Stop drive9-server
-        if: always()
-        run: |
-          if [ -f /tmp/drive9-server.pid ]; then
-            kill "$(cat /tmp/drive9-server.pid)" || true
-          fi
-
-      - name: Stop TiDB playground
-        if: always()
-        run: |
-          if [ -f /tmp/tiup-playground.pid ]; then
-            kill "$(cat /tmp/tiup-playground.pid)" || true
-          fi
-
-      - name: Stop local object store
-        if: always()
-        run: bash scripts/local-object-store.sh stop
-
-      - name: Enforce smoke results
-        if: always()
-        run: |
-          failed=0
-
-          check_required() {
-            local name="$1"
-            local outcome="$2"
-            if [ "$outcome" != "success" ]; then
-              echo "$name did not succeed (outcome: $outcome)"
-              failed=1
-            fi
-          }
-
-          check_required "API smoke" "${{ steps.api-smoke.outcome }}"
-          check_required "CLI smoke" "${{ steps.cli-smoke.outcome }}"
-          check_required "Object-store smoke" "${{ steps.object-store-smoke.outcome }}"
-          check_required "Layer FS smoke" "${{ steps.layer-fs-smoke.outcome }}"
-          check_required "FUSE pending READDIRPLUS" "${{ steps.fuse-readdir-pending.outcome }}"
-          check_required "FUSE release gate" "${{ steps.fuse-smoke.outcome }}"
-          check_required "Git operations smoke" "${{ steps.git-ops-smoke.outcome }}"
-          check_required "Git workspace on-demand discovery smoke" "${{ steps.git-workspace-ondemand-smoke.outcome }}"
-          check_required "Pack smoke" "${{ steps.pack-smoke.outcome }}"
-          check_required "FUSE crash recovery e2e" "${{ steps.fuse-crash-recovery.outcome }}"
-          check_required "FUSE supervision e2e" "${{ steps.fuse-supervision.outcome }}"
-          check_required "FUSE write perf budget e2e" "${{ steps.fuse-write-perf-budget.outcome }}"
-          if [ "${COMPARE_FUSE_PERFORMANCE_METRICS}" = "1" ]; then
-            check_required "FUSE performance compare" "${{ steps.fuse_performance_compare.outcome }}"
-          fi
-          if [ "${FUSE_CONCURRENCY_STRESS_REQUIRED}" = "1" ]; then
-            check_required "FUSE concurrency stress" "${{ steps.fuse-concurrency-stress.outcome }}"
-          fi
-          if [ "${RUN_FUSE_POSIX_FSX}" = "1" ]; then
-            check_required "FUSE POSIX/fsx gate" "${{ steps.fuse-posix-fsx.outcome }}"
-          fi
-          if [ "${RUN_E2E_SMOKE_ALL}" = "1" ]; then
-            check_required "Full smoke-all suite" "${{ steps.smoke-all.outcome }}"
-          fi
-          if [ "${RUN_GIT_FEATURE_SMOKE}" = "1" ]; then
-            check_required "Git feature smoke" "${{ steps.git-feature-smoke.outcome }}"
-          fi
-
-          exit "$failed"
-
-      # Scheduled/post-merge failures notify nobody by default, so a red
-      # nightly can sit unnoticed for days. File (or append to) a tracking
-      # issue instead.
-      - name: File issue on scheduled/post-merge failure
-        if: failure() && (github.event_name == 'schedule' || github.event_name == 'push')
+      - name: Download prebuilt drive9-simulator via wget
+        id: prebuilt
         env:
           GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          EVENT_NAME: ${{ github.event_name }}
-          SHA: ${{ github.sha }}
-          SIGNATURE: ${{ steps.aggregate.outputs.signature }}
+          CUSTOM_URL: ${{ vars.SIMULATOR_DOWNLOAD_URL }}
+          RELEASE_BASE: "https://github.com/${{ github.repository }}/releases/download/simulator-latest"
         run: |
-          gh label create ci-e2e-failure --repo "$REPO" \
-            --description "Automated: local-e2e scheduled/post-merge run failed" \
-            --color D93F0B --force || true
-
-          # Prefer the structured, signature-led body from the aggregator; fall back
-          # to a one-liner if it is missing. Use a file (--body-file) so suite names
-          # or failure detail containing shell metacharacters/backticks cannot break
-          # or inject into the gh call.
-          body_file=/tmp/e2e-issue-body.md
-          if [ -s "$body_file" ]; then
-            printf '\n\n_run: %s_\n' "$RUN_URL" >> "$body_file"
-          else
-            printf 'local-e2e `%s` run failed on `main` at %s: %s\n' "$EVENT_NAME" "$SHA" "$RUN_URL" > "$body_file"
+          set -euo pipefail
+          EXPECTED_SIM_SHA="$(git log -1 --format=%H -- tests/simulator .github/workflows/release-simulator.yml)"
+          mkdir -p /tmp/sim-dl
+          downloaded=0
+          if [ -n "${CUSTOM_URL:-}" ]; then
+            CUSTOM_DIR="${CUSTOM_URL%/*}"
+            echo "Downloading prebuilt simulator via wget from ${CUSTOM_URL}..."
+            if wget -qO /tmp/sim-dl/drive9-simulator-linux-amd64 "${CUSTOM_URL}" \
+              && wget -qO /tmp/sim-dl/drive9-simulator-linux-amd64.sha256 "${CUSTOM_URL}.sha256" \
+              && wget -qO /tmp/sim-dl/simulator-version "${CUSTOM_DIR}/simulator-version"; then
+              (cd /tmp/sim-dl && sha256sum -c drive9-simulator-linux-amd64.sha256)
+              downloaded=1
+            else
+              echo "Custom simulator URL missing binary, .sha256, or simulator-version; falling back to source build"
+            fi
+          elif wget -qO /tmp/sim-dl/drive9-simulator-linux-amd64 "${RELEASE_BASE}/drive9-simulator-linux-amd64" 2>/dev/null \
+            && wget -qO /tmp/sim-dl/simulator-checksums.txt "${RELEASE_BASE}/simulator-checksums.txt" 2>/dev/null \
+            && wget -qO /tmp/sim-dl/simulator-version "${RELEASE_BASE}/simulator-version" 2>/dev/null; then
+            (cd /tmp/sim-dl && grep "drive9-simulator-linux-amd64$" simulator-checksums.txt | sha256sum -c -)
+            downloaded=1
+          elif gh release download simulator-latest \
+              --dir /tmp/sim-dl \
+              --pattern "drive9-simulator-linux-amd64" \
+              --pattern "simulator-checksums.txt" \
+              --pattern "simulator-version" 2>/dev/null; then
+            (cd /tmp/sim-dl && grep "drive9-simulator-linux-amd64$" simulator-checksums.txt | sha256sum -c -)
+            downloaded=1
           fi
 
-          # Group recurring failures by signature. GitHub's `in:title` search is
-          # fuzzy, so narrow with it but confirm an exact "[sig: <signature>]"
-          # marker client-side with jq; a new signature opens its own tracking
-          # issue. With no signature we keep the legacy single-issue behaviour.
-          # The search+create is not atomic, but the workflow concurrency group
-          # serializes main runs, so a duplicate-issue race is not expected here.
-          # The signature is a sha256 hex slice; require [0-9a-f] before splicing
-          # it into the jq filter (defense-in-depth against jq metacharacters).
-          if [[ "$SIGNATURE" =~ ^[0-9a-f]+$ ]]; then
-            existing="$(gh issue list --repo "$REPO" --label ci-e2e-failure --state open \
-              --search "in:title $SIGNATURE" --json number,title \
-              --jq "[.[] | select(.title | contains(\"[sig: $SIGNATURE]\"))][0].number // empty")"
-            title="local-e2e failure on main [sig: $SIGNATURE]"
+          if [ "$downloaded" -eq 1 ]; then
+            PREBUILT_VER="$(tr -d '[:space:]' < /tmp/sim-dl/simulator-version)"
+            if [ "${#PREBUILT_VER}" -ge 7 ] && [[ "$EXPECTED_SIM_SHA" == "$PREBUILT_VER"* ]]; then
+              chmod +x /tmp/sim-dl/drive9-simulator-linux-amd64
+              /tmp/sim-dl/drive9-simulator-linux-amd64 --version
+              echo "SIMULATOR_BIN=/tmp/sim-dl/drive9-simulator-linux-amd64" >> "$GITHUB_ENV"
+              echo "used_prebuilt=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "Prebuilt simulator version (${PREBUILT_VER:-unknown}) != expected simulator commit (${EXPECTED_SIM_SHA::12}); building from source"
+            rm -rf /tmp/sim-dl
           else
-            existing="$(gh issue list --repo "$REPO" --label ci-e2e-failure --state open \
-              --json number --jq '.[0].number // empty')"
-            title="local-e2e $EVENT_NAME run failing on main"
+            echo "Prebuilt simulator not available yet; falling back to cargo build"
           fi
+          echo "used_prebuilt=false" >> "$GITHUB_OUTPUT"
 
-          if [ -n "$existing" ]; then
-            gh issue comment "$existing" --repo "$REPO" --body-file "$body_file"
-          else
-            gh issue create --repo "$REPO" --label ci-e2e-failure \
-              --title "$title" --body-file "$body_file"
+      - name: Setup Rust (when building simulator from source)
+        if: steps.prebuilt.outputs.used_prebuilt != 'true'
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+
+      - name: Cache fstest target suite bundles (when building simulator from source)
+        if: steps.prebuilt.outputs.used_prebuilt != 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/fstest
+          key: fstest-bundle-v3-linux-gnu-${{ hashFiles('tests/simulator/Cargo.lock') }}
+          restore-keys: |
+            fstest-bundle-v3-linux-gnu-
+
+      - name: Build & unit-test drive9-simulator from source
+        if: steps.prebuilt.outputs.used_prebuilt != 'true'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkgconf bison flex m4 xz-utils \
+            zlib1g-dev libaio-dev libacl1-dev libattr1-dev libcap-dev libkeyutils-dev libnuma-dev uuid-dev libssl-dev
+          FSTEST_SKIP_BUNDLE=1 cargo test --manifest-path tests/simulator/Cargo.toml
+          cargo build --release --manifest-path tests/simulator/Cargo.toml
+          echo "SIMULATOR_BIN=$(pwd)/tests/simulator/target/release/drive9-simulator" >> "$GITHUB_ENV"
+
+      - name: Validate & run simulator suite
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_SERVER: ${{ inputs.server }}
+          INPUT_JOBS: ${{ inputs.jobs }}
+          INPUT_TIER: ${{ inputs.tier }}
+        run: |
+          set -euo pipefail
+          "$SIMULATOR_BIN" validate tests/cases
+          SERVER_ARGS=()
+          if [ -n "${INPUT_SERVER:-}" ]; then
+            SERVER_ARGS=(--server "$INPUT_SERVER")
           fi
+          JOBS="${INPUT_JOBS:-4}"
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            rc=0
+            "$SIMULATOR_BIN" run-suite tests/cases/suites.toml \
+              --tier daily-fault,daily-fuse \
+              --jobs "$JOBS" \
+              --fail-on-all-skip \
+              --bin ./bin/drive9 \
+              --home /tmp/sim-daily \
+              "${SERVER_ARGS[@]}" || rc=$?
+            "$SIMULATOR_BIN" run-suite tests/cases/suites.toml \
+              --tier daily-bench \
+              --jobs 1 \
+              --fail-on-all-skip \
+              --bin ./bin/drive9 \
+              --home /tmp/sim-daily-bench \
+              "${SERVER_ARGS[@]}" || rc=$?
+            exit "$rc"
+          fi
+          TIER="${INPUT_TIER:-pr}"
+          SKIP_ARGS=(--fail-on-all-skip)
+          if [ -z "${INPUT_SERVER:-}" ] && [[ "$TIER" == "pr" || "$TIER" == "pr-no-mount" || "$TIER" == "pr-fuse" ]]; then
+            SKIP_ARGS+=(--fail-on-skip)
+          fi
+          "$SIMULATOR_BIN" run-suite tests/cases/suites.toml \
+            --tier "$TIER" \
+            --jobs "$JOBS" \
+            "${SKIP_ARGS[@]}" \
+            --bin ./bin/drive9 \
+            --home /tmp/sim-run \
+            "${SERVER_ARGS[@]}"
+
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: local-e2e-diagnostics
+          path: |
+            /tmp/sim-*/suite.json
+            /tmp/sim-*/cases/*/runs/*/*.json
+            /tmp/sim-*/cases/*/runs/*/*.jsonl
+            /tmp/sim-*/cases/*/runs/*/*.tap
+            /tmp/sim-*/cases/*/runs/*/*.log
+            /tmp/sim-*/cases/*/runs/*/logs/**
+            /tmp/sim-*/cases/*/runs/*/injector/**
+            /tmp/sim-*/cases/*/runs/*/snapshot/**
+            !/tmp/sim-*/**/tenant.json
+          if-no-files-found: ignore

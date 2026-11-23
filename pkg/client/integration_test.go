@@ -6,11 +6,12 @@
 //
 //	go test -tags integration ./pkg/client/...
 //
-// The suite is hermetic: it expects a local drive9-server reachable at
+// The suite is hermetic: it expects a drive9-server reachable at
 // DRIVE9_SERVER (default http://127.0.0.1:9009) with DRIVE9_API_KEY (from
 // POST /v1/provision). When the server is unreachable the whole package is skipped
-// so the file is safe to run in any CI environment. The cross-SDK runner
-// (scripts/sdk-integration-tests.sh) guarantees the server is up.
+// so the file is safe to run in any CI environment. The cross-SDK scenario
+// (`make sdk-integration-tests` / `tests/cases/drive9/api/sdk-integration.t`)
+// guarantees the server is up.
 //
 // Every exported function on *Client is exercised at least once against the
 // live server. Per-test isolation is provided by a unique prefix directory
@@ -24,9 +25,11 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -556,25 +559,29 @@ func TestIntegrationTransfer(t *testing.T) {
 		t.Fatalf("ReadStreamRange len = %d, want 10", len(head))
 	}
 
-	// ResolveReadTarget + ReadObjectRange (large S3-backed file)
-	target, err := c.ResolveReadTarget(ctx, large)
-	if err != nil {
+	// ResolveReadTarget + ReadObjectRange (large single-layout S3-backed file)
+	allowCoreOnly := os.Getenv("DRIVE9_ALLOW_CORE_ONLY_SERVER") == "1"
+	target, err := c.ResolveReadTarget(ctx, p+"wmp.bin")
+	if allowCoreOnly && errors.Is(err, errReadTargetNoRedirect) {
+		t.Logf("ResolveReadTarget skipped on core-only server (inline 200 rather than 302 redirect): %v", err)
+	} else if err != nil {
 		t.Fatalf("ResolveReadTarget: %v", err)
-	}
-	if target == nil {
-		t.Fatal("ResolveReadTarget returned nil")
-	}
-	rc3, err := c.ReadObjectRange(ctx, target, 0, 16)
-	if err != nil {
-		t.Fatalf("ReadObjectRange: %v", err)
-	}
-	chunk, err := io.ReadAll(rc3)
-	_ = rc3.Close()
-	if err != nil {
-		t.Fatalf("ReadObjectRange read: %v", err)
-	}
-	if len(chunk) != 16 {
-		t.Fatalf("ReadObjectRange len = %d, want 16", len(chunk))
+	} else {
+		if target == nil {
+			t.Fatal("ResolveReadTarget returned nil")
+		}
+		rc3, err := c.ReadObjectRange(ctx, target, 0, 16)
+		if err != nil {
+			t.Fatalf("ReadObjectRange: %v", err)
+		}
+		chunk, err := io.ReadAll(rc3)
+		_ = rc3.Close()
+		if err != nil {
+			t.Fatalf("ReadObjectRange read: %v", err)
+		}
+		if len(chunk) != 16 {
+			t.Fatalf("ReadObjectRange len = %d, want 16", len(chunk))
+		}
 	}
 
 	// DownloadToFile / DownloadToFileWithSummary
@@ -726,6 +733,10 @@ func TestIntegrationFSLayers(t *testing.T) {
 		Name:         "it-go-layer",
 	})
 	if err != nil {
+		var statusErr *StatusError
+		if os.Getenv("DRIVE9_ALLOW_CORE_ONLY_SERVER") == "1" && errors.As(err, &statusErr) && (statusErr.StatusCode == http.StatusNotFound || statusErr.StatusCode == http.StatusNotImplemented) {
+			t.Skipf("CreateFSLayer skipped on core-only server: %v", err)
+		}
 		t.Fatalf("CreateFSLayer: %v", err)
 	}
 	if layer.LayerID == "" {

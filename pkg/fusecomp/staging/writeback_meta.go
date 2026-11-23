@@ -124,6 +124,12 @@ type WriteBackMeta struct {
 	Mtime            time.Time   `json:"mtime"`
 	CreatedAt        time.Time   `json:"created_at"`
 	Generation       uint64      `json:"generation,omitempty"`
+	// PutGeneration records the generation allocated when this payload
+	// incarnation was installed at Path (Put or RenamePending). In-place
+	// metadata updates (UpdateMode, MarkChmodPending, rebase) bump Generation
+	// while preserving PutGeneration so path-incarnation retirement (OpRename
+	// target replacement) survives concurrent chmods without retiring newer Puts.
+	PutGeneration    uint64      `json:"put_generation,omitempty"`
 	Kind             PendingKind `json:"kind"`
 	BaseRev          int64       `json:"base_rev,omitempty"`
 	ShadowSpill      bool        `json:"shadow_spill,omitempty"`
@@ -395,11 +401,26 @@ func (c *WriteBackCache) setMetaLocked(remotePath string, meta *WriteBackMeta) {
 		c.deleteMetaLocked(remotePath)
 		return
 	}
+	if meta.PutGeneration == 0 {
+		meta.PutGeneration = meta.Generation
+	}
 	if prev, ok := c.metas[remotePath]; ok && prev != nil {
 		c.totalBytes -= prev.Size
 	}
 	c.metas[remotePath] = meta
 	c.totalBytes += meta.Size
+}
+
+// PutGen returns the generation allocated when this cached payload incarnation
+// was installed at its current path, falling back to Generation for legacy rows.
+func (m *WriteBackMeta) PutGen() uint64 {
+	if m == nil {
+		return 0
+	}
+	if m.PutGeneration != 0 {
+		return m.PutGeneration
+	}
+	return m.Generation
 }
 
 func (c *WriteBackCache) deleteMetaLocked(remotePath string) {
@@ -732,6 +753,27 @@ func (c *WriteBackCache) RemoveIfGeneration(remotePath string, expectedGen uint6
 	return false
 }
 
+// RemoveIfPutGeneration atomically removes the entry at remotePath if its
+// payload-installation generation (PutGen) matches expectedPutGen, even when an
+// in-place metadata update (e.g. UpdateMode) bumped Generation afterwards.
+func (c *WriteBackCache) RemoveIfPutGeneration(remotePath string, expectedPutGen uint64) bool {
+	if expectedPutGen == 0 {
+		return false
+	}
+	pl := c.AcquirePathLock(remotePath)
+	c.mu.Lock()
+	meta, ok := c.metas[remotePath]
+	if ok && meta != nil && meta.PutGen() == expectedPutGen {
+		c.pruneEntryLocked(remotePath, true)
+		c.mu.Unlock()
+		c.ReleasePathLock(remotePath, pl)
+		return true
+	}
+	c.mu.Unlock()
+	c.ReleasePathLock(remotePath, pl)
+	return false
+}
+
 // UpdateMode updates the pending mode metadata for an existing cache entry.
 // Acquires per-path lock to serialize .meta writes with concurrent Put.
 func (c *WriteBackCache) UpdateMode(remotePath string, mode uint32) error {
@@ -988,8 +1030,10 @@ func (c *WriteBackCache) RenamePending(oldPath, newPath string) bool {
 	}
 
 	// Write new .meta with updated path and fresh generation.
+	newGen := c.nextGen.Add(1)
 	updated.Path = newPath
-	updated.Generation = c.nextGen.Add(1)
+	updated.Generation = newGen
+	updated.PutGeneration = newGen
 	metaBytes, err := json.Marshal(updated)
 	if err != nil {
 		_ = os.Rename(newDat, oldDat)
@@ -1291,6 +1335,7 @@ func (c *WriteBackCache) putWithBaseRevAndModeAndLineage(remotePath string, data
 		Mtime:             now,
 		CreatedAt:         now,
 		Generation:        gen,
+		PutGeneration:     gen,
 		Kind:              kind,
 		BaseRev:           baseRev,
 		Mode:              mode & posixPermissionModeMask,
@@ -1576,6 +1621,10 @@ func (c *WriteBackCache) deleteDataLocked(remotePath string) {
 
 func cloneWriteBackMeta(meta *WriteBackMeta) WriteBackMeta {
 	cp := *meta
+	if cp.PutGeneration == 0 {
+		cp.PutGeneration = cp.Generation
+	}
+	cp.CacheAncestorGens = append([]uint64(nil), meta.CacheAncestorGens...)
 	cp.liveAncestors = append([]string(nil), meta.liveAncestors...)
 	return cp
 }
