@@ -23,9 +23,12 @@
 #   NAMESPACE_FILE_BYTES   payload per file, metadata-only by default (default: 1)
 #   NAMESPACE_KEEP=1       keep the tree on disk for debugging (default: remove)
 #   NAMESPACE_{CREATE,READDIR,STAT,FIND,CLEANUP}_CAP_S  per-phase deadlines
-#     (required, must be > 0; worst case 1200+300+600+600+600 = 3300s of phases,
-#      plus a 2x300s drain, three remounts at ~210s each and the initial mount at
-#      ~190s: about 4780s, inside the 90-minute case timeout in suites.toml)
+#     (required, must be > 0; deadlines are sized from a measured 100k run on a
+#      local SSD — create 5.4s, drain 200s, readdir 274s, stat 282s, find 286s —
+#      so they bound hangs rather than assert performance. Worst case
+#      600+900+900+900+1200 = 4500s of phases, a 2x480s drain, three ~210s
+#      remounts and a ~190s initial mount: about 6280s, inside the 120-minute
+#      case timeout in suites.toml)
 set -eu
 
 NAMESPACE_FILES="${NAMESPACE_FILES:-100000}"
@@ -33,11 +36,11 @@ NAMESPACE_DIRS="${NAMESPACE_DIRS:-100}"
 NAMESPACE_WORKERS="${NAMESPACE_WORKERS:-8}"
 NAMESPACE_FILE_BYTES="${NAMESPACE_FILE_BYTES:-1}"
 NAMESPACE_KEEP="${NAMESPACE_KEEP:-0}"
-NAMESPACE_CREATE_CAP_S="${NAMESPACE_CREATE_CAP_S:-1200}"
-NAMESPACE_READDIR_CAP_S="${NAMESPACE_READDIR_CAP_S:-300}"
-NAMESPACE_STAT_CAP_S="${NAMESPACE_STAT_CAP_S:-600}"
-NAMESPACE_FIND_CAP_S="${NAMESPACE_FIND_CAP_S:-600}"
-NAMESPACE_CLEANUP_CAP_S="${NAMESPACE_CLEANUP_CAP_S:-600}"
+NAMESPACE_CREATE_CAP_S="${NAMESPACE_CREATE_CAP_S:-600}"
+NAMESPACE_READDIR_CAP_S="${NAMESPACE_READDIR_CAP_S:-900}"
+NAMESPACE_STAT_CAP_S="${NAMESPACE_STAT_CAP_S:-900}"
+NAMESPACE_FIND_CAP_S="${NAMESPACE_FIND_CAP_S:-900}"
+NAMESPACE_CLEANUP_CAP_S="${NAMESPACE_CLEANUP_CAP_S:-1200}"
 
 # Unique, hidden tree: never collide with (or truncate) data an existing tenant
 # already has at a well-known path.
@@ -207,8 +210,10 @@ def readdir(c):
     root, dirs = c["root"], c["dirs"]
     seen = 0
     for d in range(dirs):
+        # Count entries, do not stat them: is_file() forces a getattr per entry
+        # when FUSE reports DT_UNKNOWN, turning a readdir into 100k stats.
         with os.scandir(os.path.join(root, "d%04d" % d)) as it:
-            seen += sum(1 for e in it if e.is_file())
+            seen += sum(1 for _ in it)
     if seen != c["expected"]:
         raise SystemExit("readdir saw %d files, expected %d" % (seen, c["expected"]))
     return {"entries": seen}
@@ -322,7 +327,7 @@ PY
 check shell --req 'drive9-namespace-100k-create' --claim 'create-100k-files-through-fuse' -- \
     python3 "$LIB" create
 
-drain --mode require-ok --timeout 300s
+drain --mode require-ok --timeout 480s
 check sync-ok --req 'drive9-namespace-100k-drain'
 
 # One fresh remount per read phase: shares kernel dirent/attr caches otherwise

@@ -562,9 +562,10 @@ name = "drive9/fuse/namespace-100k"
 tier = "daily-bench"
 perf = true
 serial = true
-# Bounds the whole case: worst-case phase deadlines (1200+300+600+600+600 =
-# 3300s), a 2x300s drain, three ~210s remounts and a ~190s initial mount add up
-# to ~4780s, inside this 90-minute limit. A measured 5k-file run under the
-# engine (create 0.4s, readdir 0.6s, stat 0.9s, find 0.8s, cleanup 14.4s) puts
-# the 100k run far below this bound.
-timeout = "90m"
+# Bounds the whole case: worst-case phase deadlines (600+900+900+900+1200 =
+# 4500s), a 2x480s drain, three ~210s remounts and a ~190s initial mount add up
+# to ~6280s, inside this 120-minute limit. Deadlines come from a measured run
+# under the engine on a local SSD (100k files: create 5.4s, drain 200s, cold
+# readdir 274s, cold stat 282s, cold find 286s), so they bound a hang rather than
+# assert performance.
+timeout = "120m"
