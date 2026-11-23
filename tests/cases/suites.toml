@@ -562,6 +562,8 @@ name = "drive9/fuse/namespace-100k"
 tier = "daily-bench"
 perf = true
 serial = true
-# Per-phase hang guards add up to 3900s, so the case timeout must sit above
-# that or the runner kills the case before a guard can explain the stall.
+# Bounds the whole case: worst-case phase deadlines (1200+300+600+600+400 =
+# 3100s), a 2x300s drain, three ~210s remounts and a ~190s initial mount add up
+# to ~4520s, inside this 90-minute limit. Measured runtime replaces the estimate
+# once the case has run under the engine.
 timeout = "90m"
