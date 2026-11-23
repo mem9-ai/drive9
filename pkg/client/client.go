@@ -1139,11 +1139,13 @@ func (c *Client) ListWithOptionsCtx(ctx context.Context, path string, opts ListO
 	)
 	for {
 		rawQuery := "?list=1"
-		if opts.Limit > 0 {
-			rawQuery += "&limit=" + strconv.Itoa(opts.Limit)
-		}
-		if cursor != "" {
-			rawQuery += "&cursor=" + url.QueryEscape(cursor)
+		if c.view.LayerID != "" {
+			if opts.Limit > 0 {
+				rawQuery += "&limit=" + strconv.Itoa(opts.Limit)
+			}
+			if cursor != "" {
+				rawQuery += "&cursor=" + url.QueryEscape(cursor)
+			}
 		}
 		remOpts := opts
 		if opts.MaxResponseBytes > 0 {

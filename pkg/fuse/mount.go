@@ -1760,8 +1760,9 @@ func unmountedKernel(mountPoint string) bool {
 // in the source path fails fast instead of wedging the mountpoint. Scoped
 // tokens that grant list-without-read fall back to List.
 func validateRemoteRoot(ctx context.Context, c *client.Client, remoteRoot string) error {
+	probeOpts := client.ListOptions{Limit: 1, SinglePage: true}
 	if remoteRoot == "/" {
-		if _, err := c.ListCtx(ctx, remoteRoot); err != nil {
+		if _, err := c.ListWithOptionsCtx(ctx, remoteRoot, probeOpts); err != nil {
 			return remoteRootValidationError(remoteRoot, err)
 		}
 		return nil
@@ -1783,7 +1784,7 @@ func validateRemoteRoot(ctx context.Context, c *client.Client, remoteRoot string
 	// Stat may fail when directory stat is unsupported or when a scoped token
 	// grants list without read. Fall back to List and classify its result as the
 	// authoritative non-root mount validation.
-	if _, listErr := c.ListCtx(ctx, remoteRoot); listErr != nil {
+	if _, listErr := c.ListWithOptionsCtx(ctx, remoteRoot, probeOpts); listErr != nil {
 		if client.IsNotFound(listErr) {
 			return ExitStartupPermanentErr(fmt.Sprintf("remote source %q does not exist", remoteRoot), listErr)
 		}

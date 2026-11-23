@@ -642,51 +642,78 @@ func TestSetAttrTruncateExtentFileUsesPatch(t *testing.T) {
 }
 
 func TestRootGetAttrFallsBackToListWhenStatForbidden(t *testing.T) {
-	for _, allowList := range []bool{true, false} {
-		mux := http.NewServeMux()
-		mux.HandleFunc("/v1/status", func(w http.ResponseWriter, r *http.Request) {
-			_ = json.NewEncoder(w).Encode(map[string]any{"status": "active"})
-		})
-		var seenListLimit string
-		handler := func(w http.ResponseWriter, r *http.Request) {
-			if r.Method == http.MethodGet && (r.URL.Path == "/v1/fs" || r.URL.Path == "/v1/fs/") && r.URL.Query().Has("list") {
-				seenListLimit = r.URL.Query().Get("limit")
-				if allowList {
-					_ = json.NewEncoder(w).Encode(map[string]any{
-						"entries":     []map[string]any{{"name": "child", "is_dir": true}},
-						"next_cursor": "must-not-follow",
-					})
-					return
+	const testLayerID = "layer_01j8z4r9w3m5n7p9q2s4t6v8xz"
+	for _, inLayerView := range []bool{false, true} {
+		for _, allowList := range []bool{true, false} {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/v1/status", func(w http.ResponseWriter, r *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"status": "active"})
+			})
+			var seenListLimit string
+			var listCalls int
+			handler := func(w http.ResponseWriter, r *http.Request) {
+				isMainFS := r.URL.Path == "/v1/fs" || r.URL.Path == "/v1/fs/"
+				isViewFS := r.URL.Path == "/v1/views/"+testLayerID+"/v1/fs" || r.URL.Path == "/v1/views/"+testLayerID+"/v1/fs/"
+				if r.Method == http.MethodGet && (isMainFS || isViewFS) && r.URL.Query().Has("list") {
+					listCalls++
+					// Main /v1/fs?list=1 scoped tokens forbid extra query keys (only "list"),
+					// whereas Layer view /v1/views/{id}/v1/fs?list=1&limit=1 accepts limit & cursor.
+					if isMainFS && len(r.URL.Query()) != 1 {
+						http.Error(w, `{"error":"unexpected query key on main list"}`, http.StatusForbidden)
+						return
+					}
+					seenListLimit = r.URL.Query().Get("limit")
+					if allowList {
+						_ = json.NewEncoder(w).Encode(map[string]any{
+							"entries":     []map[string]any{{"name": "child", "is_dir": true}},
+							"next_cursor": "must-not-follow",
+						})
+						return
+					}
+				}
+				http.Error(w, `{"error":"fs access denied"}`, http.StatusForbidden)
+			}
+			mux.HandleFunc("/v1/fs", handler)
+			mux.HandleFunc("/v1/fs/", handler)
+			mux.HandleFunc("/v1/views/", handler)
+			srv := httptest.NewServer(mux)
+			cl := client.New(srv.URL, "")
+			if inLayerView {
+				var verr error
+				cl, verr = cl.WithView(client.ViewBinding{LayerID: testLayerID, Fence: 0})
+				if verr != nil {
+					srv.Close()
+					t.Fatal(verr)
 				}
 			}
-			http.Error(w, `{"error":"fs access denied"}`, http.StatusForbidden)
-		}
-		mux.HandleFunc("/v1/fs", handler)
-		mux.HandleFunc("/v1/fs/", handler)
-		srv := httptest.NewServer(mux)
-		c, err := New(client.New(srv.URL, ""), Options{RemoteRoot: "/"})
-		if err != nil {
-			srv.Close()
-			t.Fatal(err)
-		}
-		res, err := c.Do(context.Background(), &fs.Op{Kind: fs.OpGetAttr, Path: "/"}, nil)
-		if seenListLimit != "1" {
-			srv.Close()
-			t.Fatalf("root GetAttr fallback list limit = %q, want \"1\"", seenListLimit)
-		}
-		if allowList {
-			if err != nil || res.Attr == nil || !res.Attr.IsDir() || res.Attr.Mode != 0o755 {
+			c, err := New(cl, Options{RemoteRoot: "/"})
+			if err != nil {
 				srv.Close()
-				t.Fatalf("allowList=true root GetAttr = (%+v, %v), want dir 0755", res.Attr, err)
+				t.Fatal(err)
 			}
-		} else if se, ok := err.(*fs.StatusError); !ok || se.Status != gofuse.EACCES {
+			res, err := c.Do(context.Background(), &fs.Op{Kind: fs.OpGetAttr, Path: "/"}, nil)
+			wantLimit := ""
+			if inLayerView {
+				wantLimit = "1"
+			}
+			if seenListLimit != wantLimit || listCalls != 1 {
+				srv.Close()
+				t.Fatalf("inLayerView=%v root GetAttr fallback limit=%q calls=%d, want limit=%q calls=1", inLayerView, seenListLimit, listCalls, wantLimit)
+			}
+			if allowList {
+				if err != nil || res.Attr == nil || !res.Attr.IsDir() || res.Attr.Mode != 0o755 {
+					srv.Close()
+					t.Fatalf("inLayerView=%v allowList=true root GetAttr = (%+v, %v), want dir 0755", inLayerView, res.Attr, err)
+				}
+			} else if se, ok := err.(*fs.StatusError); !ok || se.Status != gofuse.EACCES {
+				srv.Close()
+				t.Fatalf("inLayerView=%v allowList=false root GetAttr err = %v, want EACCES", inLayerView, err)
+			}
+			if _, childErr := c.Do(context.Background(), &fs.Op{Kind: fs.OpGetAttr, Path: "/secret"}, nil); childErr == nil {
+				srv.Close()
+				t.Fatalf("non-root GetAttr err = nil, want EACCES")
+			}
 			srv.Close()
-			t.Fatalf("allowList=false root GetAttr err = %v, want EACCES", err)
 		}
-		if _, childErr := c.Do(context.Background(), &fs.Op{Kind: fs.OpGetAttr, Path: "/secret"}, nil); childErr == nil {
-			srv.Close()
-			t.Fatalf("non-root GetAttr err = nil, want EACCES")
-		}
-		srv.Close()
 	}
 }
