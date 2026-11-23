@@ -21,21 +21,22 @@
 #   NAMESPACE_DIRS         fan-out directories (default: 100)
 #   NAMESPACE_WORKERS      parallel creators (default: 8)
 #   NAMESPACE_FILE_BYTES   payload per file, metadata-only by default (default: 1)
-#   NAMESPACE_KEEP=1       keep the tree on disk for debugging (default: remove)
+#   NAMESPACE_CLEANUP=1    delete the tree at the end (default: leave it; see below)
 #   NAMESPACE_{CREATE,READDIR,STAT,FIND,CLEANUP}_CAP_S  per-phase deadlines
 #     (required, must be > 0; deadlines are sized from a measured 100k run on a
 #      local SSD — create 5.4s, drain 200s, readdir 274s, stat 282s, find 286s —
-#      so they bound hangs rather than assert performance. Worst case
-#      600+900+900+900+1200 = 4500s of phases, a 2x480s drain, three ~210s
-#      remounts and a ~190s initial mount: about 6280s, inside the 120-minute
-#      case timeout in suites.toml)
+#      so they bound hangs rather than assert performance. Worst case with
+#      cleanup enabled: 600+900+900+900+1200 = 4500s of phases, a 2x480s drain,
+#      three ~210s remounts and a ~190s initial mount = about 6280s, inside the
+#      120-minute case timeout in suites.toml. The default (no cleanup) is
+#      ~5080s.)
 set -eu
 
 NAMESPACE_FILES="${NAMESPACE_FILES:-100000}"
 NAMESPACE_DIRS="${NAMESPACE_DIRS:-100}"
 NAMESPACE_WORKERS="${NAMESPACE_WORKERS:-8}"
 NAMESPACE_FILE_BYTES="${NAMESPACE_FILE_BYTES:-1}"
-NAMESPACE_KEEP="${NAMESPACE_KEEP:-0}"
+NAMESPACE_CLEANUP="${NAMESPACE_CLEANUP:-0}"
 NAMESPACE_CREATE_CAP_S="${NAMESPACE_CREATE_CAP_S:-600}"
 NAMESPACE_READDIR_CAP_S="${NAMESPACE_READDIR_CAP_S:-900}"
 NAMESPACE_STAT_CAP_S="${NAMESPACE_STAT_CAP_S:-900}"
@@ -47,19 +48,27 @@ NAMESPACE_CLEANUP_CAP_S="${NAMESPACE_CLEANUP_CAP_S:-1200}"
 NS_ROOT="$MOUNT/.sim-namespace-100k-$$-$(date +%s)"
 export NS_ROOT
 export NAMESPACE_FILES NAMESPACE_DIRS NAMESPACE_WORKERS NAMESPACE_FILE_BYTES
+export NAMESPACE_CLEANUP
 export NAMESPACE_CREATE_CAP_S NAMESPACE_READDIR_CAP_S NAMESPACE_STAT_CAP_S
 export NAMESPACE_FIND_CAP_S NAMESPACE_CLEANUP_CAP_S
 
 LIB="$RUN_DIR/namespace_lib.py"
 
-# A `check` never aborts the case, but `drain` and `remount` do when they return
-# non-zero. Clean up on those aborts too; the explicit cleanup check below only
-# covers the success path. The engine's SIGKILL at the case timeout bypasses
-# this trap, so it cannot cover a hard timeout.
+# Deleting 100000 files through FUSE was measured at >20 minutes, which dwarfs
+# every measurement this case exists to take. Cleanup is therefore opt-in
+# (NAMESPACE_CLEANUP=1) for runs against a shared/existing tenant; the default
+# leaves the tree at a unique hidden path and prints it, which is what an
+# ephemeral bench runner wants. A `check` never aborts the case, but `drain` and
+# `remount` do when they return non-zero, so the trap covers those aborts too;
+# it runs at most once and the engine's SIGKILL at the case timeout bypasses it.
 cleanup_tree() {
-  if [ "${NAMESPACE_KEEP:-0}" = "1" ] || [ ! -f "$LIB" ]; then
+  if [ "${NAMESPACE_CLEANUP:-0}" != "1" ] || [ ! -f "$LIB" ]; then
     return 0
   fi
+  if [ -f "$RUN_DIR/namespace-cleanup-started" ]; then
+    return 0
+  fi
+  : > "$RUN_DIR/namespace-cleanup-started"
   python3 "$LIB" cleanup || echo "cleanup after abort failed; tree left at $NS_ROOT" >&2
 }
 trap cleanup_tree EXIT
@@ -347,9 +356,12 @@ cd "$MOUNT"
 check shell --req 'drive9-namespace-100k-find' --claim 'cold-find-over-100k-files' -- \
     python3 "$LIB" find
 
-if [ "$NAMESPACE_KEEP" != "1" ]; then
+if [ "$NAMESPACE_CLEANUP" = "1" ]; then
+  : > "$RUN_DIR/namespace-cleanup-started"
   check shell --req 'drive9-namespace-100k-cleanup' --claim 'remove-the-100k-tree' -- \
       python3 "$LIB" cleanup
+else
+  echo "tree left at $NS_ROOT (set NAMESPACE_CLEANUP=1 to remove it)"
 fi
 
 # After cleanup so its duration is in the report.
