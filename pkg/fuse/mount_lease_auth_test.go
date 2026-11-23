@@ -323,11 +323,14 @@ func TestMountLeaseRetryResetsAfterSuccessfulRegistration(t *testing.T) {
 // once instead of discarding a live lease silently.
 func TestMountLeaseUnsupportedHeartbeatReportsAndStops(t *testing.T) {
 	h := &leaseHarness{}
-	reporter, _ := startHarness(t, h, leaseSequence{heartbeat: []error{statusErr(http.StatusMethodNotAllowed)}, heartbeatRepeat: true})
+	reporter, calls := startHarness(t, h, leaseSequence{heartbeat: []error{statusErr(http.StatusMethodNotAllowed)}, heartbeatRepeat: true})
 	select {
 	case <-reporter.done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("reporter kept retrying an unsupported heartbeat")
+	}
+	if beats := calls.heartbeatCount(); beats != 1 {
+		t.Fatalf("heartbeats = %d, want exactly one before stopping", beats)
 	}
 	_, logs := h.snapshot()
 	if len(logs) != 1 || !strings.Contains(logs[0], "unsupported") {
