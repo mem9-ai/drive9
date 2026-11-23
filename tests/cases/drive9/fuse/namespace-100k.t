@@ -13,15 +13,22 @@
 # also refuses to start when the phase it depends on has no log line, so a
 # capped create cannot make stat/find burn their own caps on an empty tree.
 #
-# The tree lives under a unique hidden path per run and is removed at the end,
-# so the case can run against an existing tenant without touching its data.
+# The tree lives under a unique hidden path per run. When the tenant outlives
+# the case (--api-key, EXISTING_TENANT=1) the tree is removed with one
+# server-side recursive delete of measured 225s at 100k, which needs no mount
+# and so also covers a failed remount; NAMESPACE_CLEANUP overrides the default.
+# An in-process engine run drops the whole tenant, so it leaves the tree alone
+# instead of spending those four minutes on it.
 #
 # Tunables:
 #   NAMESPACE_FILES        files to create (default: 100000)
 #   NAMESPACE_DIRS         fan-out directories (default: 100)
 #   NAMESPACE_WORKERS      parallel creators (default: 8)
 #   NAMESPACE_FILE_BYTES   payload per file, metadata-only by default (default: 1)
-#   NAMESPACE_CLEANUP=1    delete the tree at the end (default: leave it; see below)
+#   NAMESPACE_CLEANUP=1|0  delete the tree at the end; defaults to EXISTING_TENANT
+#                          (1 for --api-key runs, 0 for the in-process engine).
+#                          One server-side recursive delete fits the 1200s cap at
+#                          100k; delete through the mount does not.
 #   NAMESPACE_{CREATE,READDIR,STAT,FIND,CLEANUP}_CAP_S  per-phase deadlines
 #     (required, must be > 0; deadlines are sized from a measured 100k run on a
 #      local SSD — create 5.4s, drain 200s, readdir 274s, stat 282s, find 286s —
@@ -37,7 +44,11 @@ NAMESPACE_FILES="${NAMESPACE_FILES:-100000}"
 NAMESPACE_DIRS="${NAMESPACE_DIRS:-100}"
 NAMESPACE_WORKERS="${NAMESPACE_WORKERS:-8}"
 NAMESPACE_FILE_BYTES="${NAMESPACE_FILE_BYTES:-1}"
-NAMESPACE_CLEANUP="${NAMESPACE_CLEANUP:-0}"
+# The engine sets EXISTING_TENANT=1 exactly when the tenant outlives the case
+# (--api-key); there the tree must be removed. An in-process engine run drops
+# the whole tenant, so deleting the tree would be wasted work. Override with
+# NAMESPACE_CLEANUP=1/0.
+NAMESPACE_CLEANUP="${NAMESPACE_CLEANUP:-${EXISTING_TENANT:-0}}"
 NAMESPACE_CREATE_CAP_S="${NAMESPACE_CREATE_CAP_S:-600}"
 NAMESPACE_READDIR_CAP_S="${NAMESPACE_READDIR_CAP_S:-900}"
 NAMESPACE_STAT_CAP_S="${NAMESPACE_STAT_CAP_S:-900}"
@@ -46,8 +57,10 @@ NAMESPACE_CLEANUP_CAP_S="${NAMESPACE_CLEANUP_CAP_S:-1200}"
 
 # Unique, hidden tree: never collide with (or truncate) data an existing tenant
 # already has at a well-known path.
-NS_ROOT="$MOUNT/.sim-namespace-100k-$$-$(date +%s)"
-export NS_ROOT
+NS_NAME=".sim-namespace-100k-$$-$(date +%s)"
+NS_ROOT="$MOUNT/$NS_NAME"
+NS_REMOTE_ROOT="/$NS_NAME"
+export NS_ROOT NS_REMOTE_ROOT
 export NAMESPACE_FILES NAMESPACE_DIRS NAMESPACE_WORKERS NAMESPACE_FILE_BYTES
 export NAMESPACE_CLEANUP
 export NAMESPACE_CREATE_CAP_S NAMESPACE_READDIR_CAP_S NAMESPACE_STAT_CAP_S
@@ -70,7 +83,7 @@ cleanup_tree() {
     return 0
   fi
   : > "$RUN_DIR/namespace-cleanup-started"
-  python3 "$LIB" cleanup || echo "cleanup after abort failed; tree left at $NS_ROOT" >&2
+  python3 "$LIB" cleanup || echo "cleanup after abort failed; tree left at $NS_REMOTE_ROOT" >&2
 }
 trap cleanup_tree EXIT
 
@@ -136,8 +149,8 @@ def record(phase, seconds, extra=None):
         fh.write(json.dumps(entry) + "\n")
 
 
-def run_cmd(argv):
-    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+def run_cmd(argv, env=None):
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
     ACTIVE.append(proc)
     try:
         out, err = proc.communicate()
@@ -253,19 +266,42 @@ def find_all(c):
 
 
 def cleanup(c):
-    if not os.path.isdir(c["root"]):
-        return {"removed": False}
-    run_cmd(["find", c["root"], "-mindepth", "1", "-delete"])
-    os.rmdir(c["root"])
-    return {"removed": True}
+    # One server-side recursive delete: it needs no mount, so it also covers a
+    # failed remount, and at 100k it was measured at 225s instead of the >1200s
+    # a per-file walk through the mount costs. The CLI reads its endpoint and
+    # credential from DRIVE9_SERVER / DRIVE9_API_KEY, which is how
+    # s3-express-wal.t hands it the engine's SERVER / API_KEY.
+    remote = os.environ.get("NS_REMOTE_ROOT", "")
+    cli = os.environ.get("CLI", "")
+    server = os.environ.get("SERVER", "")
+    api_key = os.environ.get("API_KEY", "")
+    if not (remote and cli and server and api_key):
+        raise SystemExit("no server credentials to delete %s; the engine drops the tenant instead" % (remote or c["root"]))
+    env = dict(os.environ)
+    env["DRIVE9_SERVER"] = server
+    env["DRIVE9_API_KEY"] = api_key
+    try:
+        run_cmd([cli, "fs", "rm", "-r", remote], env=env)
+    except SystemExit as exc:
+        raise SystemExit("server-side delete failed (%s); tree left at %s" % (exc, remote))
+    return {"removed": True, "via": "server"}
 
 
 def drain_seconds():
-    path = os.path.join(os.environ["RUN_DIR"], "sync-0.json")
-    if not os.path.exists(path):
+    # require-ok retries write sync-1.json, sync-2.json, ...; the latest attempt
+    # is the one check sync-ok judges, so report the highest index.
+    run_dir = os.environ["RUN_DIR"]
+    best = -1
+    for name in os.listdir(run_dir):
+        if name.startswith("sync-") and name.endswith(".json"):
+            try:
+                best = max(best, int(name[len("sync-"):-len(".json")]))
+            except ValueError:
+                continue
+    if best < 0:
         return None
     try:
-        with open(path, encoding="utf-8") as fh:
+        with open(os.path.join(run_dir, "sync-%d.json" % best), encoding="utf-8") as fh:
             return round(json.load(fh)["duration_ms"] / 1000.0, 3)
     except (KeyError, ValueError, OSError):
         return None
@@ -396,7 +432,7 @@ if [ "$NAMESPACE_CLEANUP" = "1" ]; then
   # a second cap and push the worst case past the documented bound.
   trap - EXIT
 else
-  echo "tree left at $NS_ROOT (set NAMESPACE_CLEANUP=1 to remove it)"
+  echo "tree left at $NS_REMOTE_ROOT (mounted at $NS_ROOT; set NAMESPACE_CLEANUP=1 to remove it)"
 fi
 
 # After cleanup so its duration is in the report.

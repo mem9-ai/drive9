@@ -564,7 +564,7 @@ perf = true
 serial = true
 # Bounds a standalone run only. Worst case with cleanup enabled: phase deadlines
 # (600+900+900+900+1200 = 4500s), a 2x(480+15)s drain, three ~210s remounts and a
-# ~190s initial mount add up to ~6280s; the default (no cleanup) is ~5080s. In
+# ~190s initial mount add up to ~6310s; the default (no cleanup) is ~5110s. In
 # the scheduled job this value can never fire — the job's own 120-minute limit
 # comes first and runs 57 cases — so the phase deadlines are the effective bound
 # there. Deadlines come from a measured run under the engine on a local SSD (100k
