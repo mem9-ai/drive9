@@ -100,7 +100,9 @@ type WriteBackCache struct {
 	// OnViewLost reports a pruned staged pair to the owner (the write-back
 	// engine records it as a terminal failure so a barrier on the path fails
 	// instead of reading "nothing staged" as success). It is invoked with c.mu
-	// released.
+	// released but the per-path lock still held, and it must stay non-blocking:
+	// the record has to be visible before another same-path operation can
+	// observe the pruned pair as "nothing staged".
 	OnViewLost func(remotePath string, err error)
 	syncMu     sync.Mutex
 	durableGen atomic.Uint64
@@ -613,8 +615,11 @@ func (c *WriteBackCache) Get(remotePath string) ([]byte, bool) {
 	data, ok := c.getViewLocked(remotePath)
 	if !ok {
 		c.mu.Unlock()
-		c.ReleasePathLock(remotePath, pl)
+		// Report under the path lock: a same-path barrier that took the lock
+		// after this point must already see the loss record, or it would read
+		// the pruned pair as "another upload consumed it" and report success.
 		c.flushViewLoss()
+		c.ReleasePathLock(remotePath, pl)
 		return nil, false
 	}
 	copyData := make([]byte, len(data))
@@ -633,6 +638,10 @@ func (c *WriteBackCache) GetView(remotePath string) ([]byte, bool) {
 	c.mu.Lock()
 	data, ok := c.getViewLocked(remotePath)
 	c.mu.Unlock()
+	// Same rule as Get: a prune this read performed is reported before the
+	// path lock is released, so a concurrent barrier cannot treat the missing
+	// record as a completed upload.
+	c.flushViewLoss()
 	c.ReleasePathLock(remotePath, pl)
 	return data, ok
 }
@@ -1588,7 +1597,10 @@ func (c *WriteBackCache) recordViewLossLocked(remotePath string, err error) {
 }
 
 // flushViewLoss invokes OnViewLost for every loss recorded since the last
-// flush. Callers MUST hold no cache lock: the hook is owner code.
+// flush. Callers MUST hold no cache lock — c.mu is taken here and the hook
+// runs unlocked — but a caller that can race a same-path barrier must still
+// hold the affected path lock while flushing, so the record exists before
+// another operation can read the pruned pair as "nothing staged".
 func (c *WriteBackCache) flushViewLoss() {
 	c.mu.Lock()
 	events := c.viewLossEvents

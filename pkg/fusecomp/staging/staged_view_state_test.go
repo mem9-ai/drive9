@@ -3,6 +3,7 @@ package staging
 import (
 	"os"
 	"testing"
+	"time"
 )
 
 // TestGetMetaAndViewStateDistinguishesMissFromTornPair pins the reason a
@@ -105,5 +106,103 @@ func TestPrunedPairReportsLossToTheOwner(t *testing.T) {
 	}
 	if lostErr == nil {
 		t.Fatal("OnViewLost carried no reason")
+	}
+}
+
+// TestGetReportsTheLostPairBeforeItReturns pins the ordering a durability
+// barrier depends on: the prune and its report happen inside the same path
+// lock window, so a barrier that takes the lock next cannot read the missing
+// record as "another upload consumed it". Releasing the lock before the report
+// reopens exactly that window.
+func TestGetReportsTheLostPairBeforeItReturns(t *testing.T) {
+	const path = "/in-flight-report.txt"
+	c, err := NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	c.OnViewLost = func(string, error) {
+		close(entered)
+		<-release
+	}
+
+	payload := []byte("staged image")
+	if err := c.Put(path, payload, int64(len(payload)), PendingNew); err != nil {
+		t.Fatal(err)
+	}
+	c.DropInMemoryPayload(path)
+	if err := os.WriteFile(c.DatFile(path), []byte("different bytes!"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	read := make(chan struct{})
+	go func() {
+		defer close(read)
+		if _, ok := c.Get(path); ok {
+			t.Error("Get served a torn pair")
+		}
+	}()
+	<-entered // the hook is running, so the prune has happened
+
+	// The barrier that follows the prune must not get to the path until the
+	// loss has been reported: with the report outside the path lock it would
+	// take the lock here, find no record, and report a durable file.
+	type result struct {
+		state StagedViewState
+		err   error
+	}
+	barrier := make(chan result, 1)
+	go func() {
+		_, _, state, err := c.GetMetaAndViewState(path)
+		barrier <- result{state: state, err: err}
+	}()
+	select {
+	case got := <-barrier:
+		t.Fatalf("a barrier ran while the loss report was in flight (state %v, err %v)", got.state, got.err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	close(release)
+	<-read
+	got := <-barrier
+	if got.state != StagedViewNoMeta {
+		t.Fatalf("barrier state after the prune = %v, want StagedViewNoMeta once the loss is recorded", got.state)
+	}
+}
+
+// TestGetViewReportsPrunedPair pins the read-path variant: a view load that
+// prunes a pair must report it before returning, or the barrier that follows
+// has no way to tell a lost image from a consumed one.
+func TestGetViewReportsPrunedPair(t *testing.T) {
+	const path = "/view-lost.txt"
+	c, err := NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lostPath string
+	var lostErr error
+	c.OnViewLost = func(p string, err error) { lostPath, lostErr = p, err }
+
+	payload := []byte("staged image")
+	if err := c.Put(path, payload, int64(len(payload)), PendingNew); err != nil {
+		t.Fatal(err)
+	}
+	c.DropInMemoryPayload(path)
+	if err := os.WriteFile(c.DatFile(path), []byte("different bytes!"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok := c.GetView(path); ok {
+		t.Fatal("GetView served a torn pair")
+	}
+	if lostPath != path {
+		t.Fatalf("OnViewLost path = %q, want %q", lostPath, path)
+	}
+	if lostErr == nil {
+		t.Fatal("OnViewLost carried no reason")
+	}
+	if c.HasMeta(path) {
+		t.Fatal("the pruned pair is still in the pending index")
 	}
 }
