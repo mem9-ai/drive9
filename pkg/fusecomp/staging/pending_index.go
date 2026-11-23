@@ -103,7 +103,18 @@ func (idx *PendingIndex) SetJournalSyncOnPut(on bool) {
 }
 
 // RecoverFromDisk scans .meta files in the directory and rebuilds in-memory
-// state. Called once at startup for crash recovery.
+// state. It is idempotent: mount recovery runs it as the first step of the
+// staging pipeline, and a later caller (the write-back facade's Start) may run
+// it again over the same directory.
+//
+// Two invariants make the repeat safe:
+//   - a generation is never rewound. The counter, the entries WAL replay
+//     recreated and the landed fences all advance it monotonically, so a Put
+//     after recovery cannot reuse a live generation;
+//   - a fenced generation never comes back as a pending entry. The surviving
+//     .meta of a landed image (a crash between the fence write and the .meta
+//     unlink) is removed instead of loaded, so recovery cannot resurrect an
+//     image whose fence already declared it landed.
 func (idx *PendingIndex) RecoverFromDisk() error {
 	// Fences first: a fence from a crashed process must be honored by replay
 	// (which may already have run), and it must never be turned back into a
@@ -117,10 +128,21 @@ func (idx *PendingIndex) RecoverFromDisk() error {
 		return fmt.Errorf("pending index recovery: %w", err)
 	}
 
+	var eclipsed []string
 	idx.mu.Lock()
-	defer idx.mu.Unlock()
-
-	var maxGen uint64
+	// Monotonic: start from whatever replay/fences already established.
+	maxGen := idx.nextGen.Load()
+	for path, meta := range idx.items {
+		if meta != nil && meta.Generation > maxGen {
+			maxGen = meta.Generation
+		}
+		_ = path
+	}
+	for _, fence := range idx.fences {
+		if fence.Generation > maxGen {
+			maxGen = fence.Generation
+		}
+	}
 	for _, e := range entries {
 		name := e.Name()
 		if !strings.HasSuffix(name, ".meta") {
@@ -133,7 +155,17 @@ func (idx *PendingIndex) RecoverFromDisk() error {
 		var meta WriteBackMeta
 		if err := json.Unmarshal(raw, &meta); err != nil {
 			// Corrupt meta — remove it.
-			_ = os.Remove(filepath.Join(idx.dir, name))
+			eclipsed = append(eclipsed, filepath.Join(idx.dir, name))
+			continue
+		}
+		if fence, fenced := idx.fences[meta.Path]; fenced && meta.Generation <= fence.Generation {
+			// The image landed: its fence outranks this file.
+			eclipsed = append(eclipsed, filepath.Join(idx.dir, name))
+			continue
+		}
+		if _, masked := idx.fenceMask[HashPath(meta.Path)]; masked {
+			// Fail closed: the fence cannot be decoded, so this entry cannot be
+			// proven to be newer than it. Keep both on disk for inspection.
 			continue
 		}
 		cp := meta
@@ -150,8 +182,24 @@ func (idx *PendingIndex) RecoverFromDisk() error {
 			maxGen = meta.Generation
 		}
 	}
-	idx.nextGen.Store(maxGen)
+	idx.mu.Unlock()
+
+	idx.advanceNextGen(maxGen)
+	for _, p := range eclipsed {
+		_ = os.Remove(p)
+	}
 	return nil
+}
+
+// advanceNextGen raises the generation counter to at least gen, never lowering
+// it (concurrent publishers may already be past it).
+func (idx *PendingIndex) advanceNextGen(gen uint64) {
+	for {
+		cur := idx.nextGen.Load()
+		if gen <= cur || idx.nextGen.CompareAndSwap(cur, gen) {
+			return
+		}
+	}
 }
 
 // Put stores metadata for the given path in both memory and disk.
@@ -237,11 +285,14 @@ func (idx *PendingIndex) Remove(remotePath string) {
 	// The name's incarnation ended: a landed-replay fence would otherwise keep
 	// a later re-creation of this path from being recovered.
 	idx.ensureCommittedFencesLoadedLocked()
-	idx.clearCommittedFenceLocked(remotePath)
+	clearedFence := idx.clearCommittedFenceLocked(remotePath)
 	idx.mu.Unlock()
 
 	metaPath := filepath.Join(idx.dir, HashPath(remotePath)+".meta")
 	_ = os.Remove(metaPath)
+	if clearedFence {
+		idx.removeFenceFile(remotePath)
+	}
 	idx.releasePathLock(remotePath, pl)
 }
 
@@ -263,11 +314,14 @@ func (idx *PendingIndex) RemoveIfGeneration(remotePath string, expectedGen uint6
 		return false
 	}
 	delete(idx.items, remotePath)
-	idx.clearCommittedFenceLocked(remotePath)
+	clearedFence := idx.clearCommittedFenceLocked(remotePath)
 	idx.mu.Unlock()
 
 	metaPath := filepath.Join(idx.dir, HashPath(remotePath)+".meta")
 	_ = os.Remove(metaPath)
+	if clearedFence {
+		idx.removeFenceFile(remotePath)
+	}
 	idx.releasePathLock(remotePath, pl)
 	return true
 }
@@ -331,10 +385,20 @@ func (idx *PendingIndex) RenamePending(oldPath, newPath string) bool {
 	idx.mu.Lock()
 	delete(idx.items, oldPath)
 	idx.items[newPath] = &newMeta
+	// Both names changed incarnation: a landed fence at either endpoint would
+	// mask the entry that now lives there.
+	clearedOld := idx.clearCommittedFenceLocked(oldPath)
+	clearedNew := idx.clearCommittedFenceLocked(newPath)
 	idx.mu.Unlock()
 
 	oldMetaPath := filepath.Join(idx.dir, HashPath(oldPath)+".meta")
 	_ = os.Remove(oldMetaPath)
+	if clearedOld {
+		idx.removeFenceFile(oldPath)
+	}
+	if clearedNew {
+		idx.removeFenceFile(newPath)
+	}
 
 	return true
 }
@@ -745,9 +809,17 @@ func (idx *PendingIndex) CommitRename(oldPath string, newMeta *WriteBackMeta) {
 	idx.mu.Lock()
 	delete(idx.items, oldPath)
 	idx.items[newMeta.Path] = newMeta
+	clearedOld := idx.clearCommittedFenceLocked(oldPath)
+	clearedNew := idx.clearCommittedFenceLocked(newMeta.Path)
 	idx.mu.Unlock()
 
 	_ = os.Remove(filepath.Join(idx.dir, HashPath(oldPath)+".meta"))
+	if clearedOld {
+		idx.removeFenceFile(oldPath)
+	}
+	if clearedNew {
+		idx.removeFenceFile(newMeta.Path)
+	}
 }
 
 // AbortRename rolls back PrepareRename by deleting the prepared on-disk meta
@@ -1259,8 +1331,12 @@ func (idx *PendingIndex) publishMeta(meta *WriteBackMeta, onlyIfAbsent bool) (ui
 	// keep suppressing nothing while still pinning a stale shadow at settle.
 	// Fences are loaded by recovery before any staging publication, so an
 	// unloaded map here means nothing to clear.
-	idx.clearCommittedFenceLocked(remotePath)
+	idx.ensureCommittedFencesLoadedLocked()
+	clearedFence := idx.clearCommittedFenceLocked(remotePath)
 	idx.mu.Unlock()
+	if clearedFence {
+		idx.removeFenceFile(remotePath)
+	}
 
 	return gen, nil
 }

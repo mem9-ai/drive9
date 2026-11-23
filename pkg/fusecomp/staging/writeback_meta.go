@@ -683,7 +683,7 @@ func viewMatchesMeta(meta *WriteBackMeta, data []byte) bool {
 // the .dat file between a separate GetMeta and getView call, causing the
 // uploader to upload new data with old meta (wrong baseRev/generation).
 // The view load itself enforces the metadata binding: a torn pair is pruned
-// by getViewLocked, never returned.
+// by getViewStateLocked, never returned.
 func (c *WriteBackCache) GetMetaAndView(remotePath string) (*WriteBackMeta, []byte, bool) {
 	meta, data, state, _ := c.getMetaAndView(remotePath, nil)
 	return meta, data, state == StagedViewOK
@@ -784,7 +784,7 @@ func (c *WriteBackCache) getMetaAndView(remotePath string, onLocked func()) (*Wr
 // pendingIndex/shadowStore) under the same serialization window so a concurrent
 // same-path Put cannot race the snapshot and leave a stale upload holding newer
 // generations it is not responsible for. The view load itself enforces the
-// metadata binding: a torn pair is pruned by getViewLocked, never returned.
+// metadata binding: a torn pair is pruned by getViewStateLocked, never returned.
 func (c *WriteBackCache) GetMetaAndViewWithCallback(remotePath string, onLocked func()) (*WriteBackMeta, []byte, bool) {
 	meta, data, state, _ := c.getMetaAndView(remotePath, onLocked)
 	return meta, data, state == StagedViewOK
@@ -835,6 +835,9 @@ func (c *WriteBackCache) RemoveIfPutGeneration(remotePath string, expectedPutGen
 	if ok && meta != nil && meta.PutGen() == expectedPutGen {
 		c.pruneEntryLocked(remotePath, true)
 		c.mu.Unlock()
+		// The path's image was replaced or retired explicitly: a loss record
+		// for it must not fail barriers on the new incarnation.
+		c.clearViewLossForNewStagingLocked(remotePath)
 		c.ReleasePathLock(remotePath, pl)
 		return true
 	}
@@ -1278,7 +1281,7 @@ func (c *WriteBackCache) ListPending() []PendingEntry {
 		}
 		// Recovery admits the payload through the same binding check as
 		// every other load: caching a torn pair here would hand the stale
-		// bytes to later memory hits (getViewLocked's fast path skips the
+		// bytes to later memory hits (getViewStateLocked's fast path skips the
 		// recheck) and to the uploader — republishing old contents at the
 		// new base revision instead of pruning the pair.
 		if !viewMatchesMeta(meta, data) {

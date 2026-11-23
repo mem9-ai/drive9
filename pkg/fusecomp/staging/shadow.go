@@ -2055,24 +2055,9 @@ func shadowDataExtentsFD(fd int, size int64, total *int64) error {
 }
 
 func (s *ShadowStore) runRemoveCleanup(cleanup shadowRemoveCleanup) {
-	if cleanup.removedSize > 0 {
-		s.pendingBytes.Add(-cleanup.removedSize)
-	}
-	if cleanup.retire {
-		if err := os.Rename(cleanup.srcDiskPath, cleanup.retiredPath); err != nil {
-			_ = os.Remove(cleanup.srcDiskPath)
-		}
-		if cleanup.retired != nil {
-			close(cleanup.retired.cleanupDone)
-		}
-	} else if cleanup.immediatePath != "" {
-		// Always attempt disk cleanup — the shadow may exist only on disk
-		// (e.g. after crash/restart recovery where it was never loaded into
-		// the files map). Without this, a successfully committed shadow
-		// would remain on disk and be served as stale local data by
-		// Has()/ReadAt()/ReadAll() fallback paths.
-		_ = os.Remove(cleanup.immediatePath)
-	}
+	// The legacy callers only need the bookkeeping; the on-disk verdict is
+	// discarded here by design (Remove/RemoveIfGeneration are best effort).
+	_ = s.runRemoveCleanupChecked(cleanup)
 }
 
 // runRemoveCleanupChecked is runRemoveCleanup with the on-disk verdict: it

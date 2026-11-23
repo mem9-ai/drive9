@@ -740,6 +740,11 @@ func New(opts Options) (*Writeback, error) {
 			unlock := w.pathLocks.lock(meta.Path)
 			defer unlock()
 			w.acknowledgeUploadedCreate(meta.Path, committedRev, meta.Generation, pendingGenCache, meta.Generation)
+			// A landing supersedes a loss record for the path — but only when it
+			// landed a generation at or above the lost one: an older upload
+			// finishing says nothing about an image that died after it. This runs
+			// before the chmod early return: a chmod lands the image too.
+			w.wbCache.ClearViewLossIfGeneration(meta.Path, meta.Generation)
 			if meta.Kind == staging.PendingChmod {
 				return
 			}
@@ -774,10 +779,6 @@ func New(opts Options) (*Writeback, error) {
 				w.queue.ClearTerminalFailureIfSeq(meta.Path, gens.TerminalFailureSeq)
 				w.queue.ResolveSupersededConflict(meta.Path, meta.SupersedesPendingGen)
 			}
-			// A landing supersedes a loss record for the path — but only when it
-			// landed a generation at or above the lost one: an older upload
-			// finishing says nothing about an image that died after it.
-			w.wbCache.ClearViewLossIfGeneration(meta.Path, meta.Generation)
 		}
 		w.uploader = up
 		up.SetPerfCounters(w.perfShim)
@@ -1012,6 +1013,23 @@ func (w *Writeback) Start(ctx context.Context) error {
 		} else {
 			w.uploader.RecoverPending()
 		}
+	}
+	return nil
+}
+
+// pathTerminalFailure reports the recorded terminal failure for a path. With a
+// commit queue that is its failure map; without one (write-sync / close-sync
+// stacks) it is the write cache's durable view-loss marker, so a barrier can
+// never read a pruned image as a completed upload.
+func (w *Writeback) pathTerminalFailure(path string) error {
+	if w == nil {
+		return nil
+	}
+	if w.queue != nil {
+		return w.queue.PathTerminalFailure(path)
+	}
+	if w.wbCache != nil {
+		return w.wbCache.ViewLoss(path)
 	}
 	return nil
 }
@@ -3473,10 +3491,8 @@ func (h *bufferingHandle) DrainFlush(ctx context.Context) (err error) {
 	}
 	// The queue finished the path, but "finished" includes a terminal failure:
 	// reporting success here would certify a file whose image never landed.
-	if h.w.queue != nil {
-		if ferr := h.w.queue.PathTerminalFailure(h.path); ferr != nil {
-			return ferr
-		}
+	if ferr := h.w.pathTerminalFailure(h.path); ferr != nil {
+		return ferr
 	}
 	return nil
 }
@@ -4080,10 +4096,8 @@ func (h *bufferingHandle) Sync(ctx context.Context) error {
 	// record and answer EIO — fsync must not claim remote durability for
 	// data that exists only locally. Anything a landing above already
 	// retired has been cleared (or generation-fenced out) by then.
-	if h.w.queue != nil {
-		if err := h.w.queue.PathTerminalFailure(h.path); err != nil {
-			return fs.StatusErrorOf(gofuse.Status(syscall.EIO))
-		}
+	if err := h.w.pathTerminalFailure(h.path); err != nil {
+		return fs.StatusErrorOf(gofuse.Status(syscall.EIO))
 	}
 	h.mu.Lock()
 	migDone := h.migrationDone

@@ -168,53 +168,103 @@ func (idx *PendingIndex) ClearCommittedFence(remotePath string) {
 	idx.ensureCommittedFencesLoaded()
 	pl := idx.acquirePathLock(remotePath)
 	idx.mu.Lock()
-	_, had := idx.fences[remotePath]
-	delete(idx.fences, remotePath)
+	removed := idx.clearCommittedFenceLocked(remotePath)
 	idx.mu.Unlock()
-	if had {
-		_ = os.Remove(idx.fenceFile(remotePath))
+	if removed {
+		idx.removeFenceFile(remotePath)
 	}
 	idx.releasePathLock(remotePath, pl)
 }
 
-// clearCommittedFenceLocked drops a fence for a path whose pending entry was
-// just replaced or removed. The caller holds the path lock. The file removal is
-// best effort: a stale fence can only suppress frames at or below a generation
-// that a newer publication already superseded, and the generation gate keeps
-// replay correct.
-func (idx *PendingIndex) clearCommittedFenceLocked(remotePath string) {
+// clearCommittedFenceLocked drops the in-memory fence and reports whether a
+// file must be unlinked. It performs no file I/O, so it is safe to call with
+// idx.mu held; the caller removes the file after unlocking.
+func (idx *PendingIndex) clearCommittedFenceLocked(remotePath string) bool {
 	if idx.fences == nil {
-		return
+		return false
 	}
 	if _, had := idx.fences[remotePath]; !had {
-		return
+		return false
 	}
 	delete(idx.fences, remotePath)
+	return true
+}
+
+// removeFenceFile unlinks a fence file (best effort: a stale fence only masks
+// frames at or below a generation that a newer publication superseded).
+func (idx *PendingIndex) removeFenceFile(remotePath string) {
 	_ = os.Remove(idx.fenceFile(remotePath))
 }
 
 // SettleCommittedFences retires every fence left by a crashed or restarted
-// process. A fence can only be dropped once its purpose is served, so this
-// appends a durable commit marker for the path first (letting compaction drop
-// the frames the fence masked) and removes the landed image's shadow, and only
-// then deletes the fence. Any failure leaves the fence in place for the next
-// start.
+// process. A fence can only be dropped once its purpose is served: the landed
+// image's eclipsed .meta and shadow must be gone and a durable commit marker
+// must cover the frames the fence was masking. Any failure leaves the fence in
+// place for the next start.
+//
+// The exception is a path with a newer recovered pending entry: the fence only
+// masks generations at or below its own, so the newer entry owns the path. No
+// commit marker is appended there (compaction would drop the newer publication
+// and lose an acknowledged write); only the superseded fence is deleted.
 func (idx *PendingIndex) SettleCommittedFences(j *Journal, shadows *ShadowStore) error {
 	if idx == nil {
 		return nil
 	}
 	for _, fence := range idx.CommittedFences() {
+		if gen, ok := idx.pendingGeneration(fence.Path); ok && gen > fence.Generation {
+			idx.ClearCommittedFence(fence.Path)
+			continue
+		}
 		if j != nil {
 			if err := j.AppendSync(JournalEntry{Op: JournalCommit, Path: fence.Path}); err != nil {
 				return fmt.Errorf("settle committed fence %s: %w", fence.Path, err)
 			}
 		}
-		if shadows != nil && fence.ShadowGen != 0 {
-			if _, err := shadows.RemoveIfGenerationDurable(fence.Path, fence.ShadowGen); err != nil {
+		if shadows != nil {
+			if _, err := shadows.RemoveIfGenerationDurable(fence.Path, settleShadowGen(shadows, fence)); err != nil {
 				return fmt.Errorf("settle committed fence shadow %s: %w", fence.Path, err)
 			}
 		}
+		// The eclipsed .meta must go before the fence: once the fence is gone,
+		// a surviving file would be loaded as a pending entry by the next start.
+		// No newer entry exists for the path (checked above), so any file left
+		// is the fenced generation or older.
+		eclipsed := filepath.Join(idx.dir, HashPath(fence.Path)+".meta")
+		_ = os.Remove(eclipsed)
 		idx.ClearCommittedFence(fence.Path)
+		if err := fsyncDir(idx.dir); err != nil {
+			return fmt.Errorf("settle committed fence %s: %w", fence.Path, err)
+		}
 	}
 	return nil
+}
+
+// pendingGeneration reports the generation of the recovered pending entry for
+// a path, if one exists.
+func (idx *PendingIndex) pendingGeneration(remotePath string) (uint64, bool) {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	meta, ok := idx.items[remotePath]
+	if !ok || meta == nil {
+		return 0, false
+	}
+	return meta.Generation, true
+}
+
+// settleShadowGen picks the generation to remove for a fence's shadow. After a
+// restart the shadow store's in-memory generations are empty, so the pre-crash
+// fence.ShadowGen cannot match; the recovered file is adopted first and its
+// fresh generation is used. Zero means "remove whatever is there", which is the
+// right answer for a cold store that found no shadow at all.
+func settleShadowGen(shadows *ShadowStore, fence CommittedFence) ContentGen {
+	if active := shadows.ActiveGeneration(fence.Path); active != 0 {
+		if fence.ShadowGen == 0 || active == fence.ShadowGen {
+			return active
+		}
+		return 0
+	}
+	if gen := shadows.EnsureActiveGeneration(fence.Path); gen != 0 {
+		return gen
+	}
+	return 0
 }

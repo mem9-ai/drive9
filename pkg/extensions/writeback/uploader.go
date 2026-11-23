@@ -506,6 +506,13 @@ func (u *WriteBackUploader) uploadSyncWithMetadata(ctx context.Context, localPat
 	meta, data, viewState, viewErr := u.cache.GetMetaAndViewStateWithCallback(localPath, func() {
 		if u.SnapshotStagingGens != nil {
 			syncGens = u.SnapshotStagingGens(localPath)
+			return
+		}
+		// No snapshot hook: read the failure stamp here, still under the cache
+		// path lock, so a failure recorded for a newer write cannot be
+		// attributed to this upload.
+		if u.TerminalFailureSeq != nil {
+			syncGens.TerminalFailureSeq = u.TerminalFailureSeq(localPath)
 		}
 	})
 	switch viewState {
@@ -553,9 +560,6 @@ func (u *WriteBackUploader) uploadSyncWithMetadata(ctx context.Context, localPat
 	// concurrent newer write recorded after this snapshot was taken, and clear
 	// it when this older image landed.
 	failureSeq := syncGens.TerminalFailureSeq
-	if failureSeq == 0 && u.SnapshotStagingGens == nil && u.TerminalFailureSeq != nil {
-		failureSeq = u.TerminalFailureSeq(localPath)
-	}
 	successGens := syncGens
 	successGens.WriteBackGen = gen
 	successGens.TerminalFailureSeq = failureSeq

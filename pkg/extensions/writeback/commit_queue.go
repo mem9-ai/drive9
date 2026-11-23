@@ -2853,14 +2853,24 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 		}
 	}
 	keepPending := false
-	if markerErr != nil && (retained || removalFailed) && cq.index != nil && entry.PendingIndexGen != 0 {
+	if markerErr != nil && cq.index != nil && entry.PendingIndexGen != 0 {
 		// The marker is not durable and the local image survived the cleanup:
 		// record a landed replay fence. The fence is a separate durable record,
 		// so the pending entry is retired (readers see the path as clean) while
 		// recovery still refuses to re-upload the landed image from the
 		// surviving shadow. Generation-scoped on both sides: a newer staging
 		// that already replaced this one is never suppressed by it.
-		marked, err := cq.index.MarkCommittedIfGeneration(entry.Path, entry.PendingIndexGen, entry.ShadowGen)
+		// Fence whenever the marker is not durable, even when the removal
+		// reported "not removed": a concurrent shadow write may have replaced
+		// the generation, and an unfenced WAL frame beside a live shadow is
+		// exactly what recovery must not resurrect. No-op if a newer Put
+		// already advanced the generation.
+		fenceShadowGen := entry.ShadowGen
+		if !retained && !removalFailed {
+			// The shadow is durably gone, so settle has nothing to remove.
+			fenceShadowGen = 0
+		}
+		marked, err := cq.index.MarkCommittedIfGeneration(entry.Path, entry.PendingIndexGen, fenceShadowGen)
 		switch {
 		case err != nil:
 			// No durable fence was established, so the pending entry must not be

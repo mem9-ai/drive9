@@ -66,6 +66,13 @@ func (s *Staging) Recover() error {
 	if s == nil || s.Journal == nil || s.Pending == nil {
 		return nil
 	}
+	// One deterministic order: rebuild from the surviving .meta files first (so a
+	// fence is never settled away before its eclipsed .meta is gone), replay the
+	// WAL, and only then retire the landed fences. The facade's Start may call
+	// RecoverFromDisk again; it is idempotent.
+	if err := s.Pending.RecoverFromDisk(); err != nil {
+		return err
+	}
 	if err := ReplayJournalIntoPending(s.Journal, s.Pending, s.Shadow); err != nil {
 		return err
 	}
