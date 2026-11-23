@@ -68,13 +68,13 @@ export NAMESPACE_FIND_CAP_S NAMESPACE_CLEANUP_CAP_S
 
 LIB="$RUN_DIR/namespace_lib.py"
 
-# Deleting 100000 files through FUSE was measured at >20 minutes, which dwarfs
-# every measurement this case exists to take. Cleanup is therefore opt-in
-# (NAMESPACE_CLEANUP=1) for runs against a shared/existing tenant; the default
-# leaves the tree at a unique hidden path and prints it, which is what an
-# ephemeral bench runner wants. A `check` never aborts the case, but `drain` and
-# `remount` do when they return non-zero, so the trap covers those aborts too;
-# it runs at most once and the engine's SIGKILL at the case timeout bypasses it.
+# Delete the tree only where the tenant outlives the case: one server-side
+# recursive delete costs 225s at 100k, where walking the same tree through FUSE
+# took over 20 minutes. An in-process engine run drops the tenant instead, so
+# removing the tree there would spend those four minutes for nothing. A `check`
+# never aborts the case, but `drain` and `remount` do when they return non-zero,
+# so the trap covers those aborts too; it runs at most once and the engine's
+# SIGKILL at the case timeout bypasses it.
 cleanup_tree() {
   if [ "${NAMESPACE_CLEANUP:-0}" != "1" ] || [ ! -f "$LIB" ]; then
     return 0
