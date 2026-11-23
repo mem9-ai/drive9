@@ -1518,7 +1518,11 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) error {
 	}
 	hadLocal := false
 	var removalErr error
-	if cq.shadows != nil && cq.shadows.Has(path) {
+	hadShadow := cq.shadows != nil && cq.shadows.Has(path)
+	if cq.shadows != nil && (hadShadow || cq.shadows.VerifyRemoved(path) != nil) {
+		// Has() reports false on a stat error (EACCES/EIO); the verifier proves
+		// absence instead, so a failing cache filesystem cannot take the
+		// "nothing staged" fast path.
 		hadLocal = true
 		// The actual removal is deferred below: while the WAL marker is still
 		// unwritten, the shadow is the only recovery source, and removing it
@@ -1549,7 +1553,7 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) error {
 	// No WAL (or nothing staged): without frames there is nothing to fence,
 	// and a journal-less queue keeps the preserve-local contract verbatim.
 	if cq.journal == nil || !hadLocal {
-		if !preserveLocal && cq.shadows != nil {
+		if !preserveLocal && hadShadow {
 			// No frames to fence: the unlink itself is the only authority, so it
 			// must be durable. There is no replay source without a WAL, so a
 			// failure is logged rather than failing the unlink (which would keep
@@ -1573,7 +1577,7 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) error {
 		// The marker fences every frame published before it, so the local image
 		// can go. A non-preserving cancel removes it durably here, after the
 		// fence exists.
-		if !preserveLocal && cq.shadows != nil {
+		if !preserveLocal && hadShadow {
 			_, _ = cq.shadows.RemoveIfGenerationDurable(path, 0)
 		}
 		dropPending()
@@ -1614,7 +1618,7 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) error {
 	// when the shadow is still stat-able so the fsynced publication is
 	// retryable without a restart, and report the unlink as failed — the
 	// caller must not acknowledge a deletion a restart would undo.
-	if cq.shadows.Has(path) {
+	if cq.index != nil && cq.shadows.Has(path) {
 		if entry := cq.recoveredEntry(path); entry != nil {
 			if enqErr := cq.Enqueue(entry); enqErr != nil {
 				safeLogPrintf("commit queue: re-driving %s after the failed unlink rollback failed: %v", path, enqErr)

@@ -343,19 +343,53 @@ func (c *WriteBackCache) loadViewLossFromDisk() {
 // ViewLossCount reports how many unresolved view losses are on record. It is the
 // only signal a drain has for a pruned pair whose path no longer has an open
 // handle (closed, or a fresh process after a restart).
+//
+// It fails closed: a scan error reports at least one loss, and an unreadable or
+// corrupt marker counts as its own, because a drain must not certify a mount it
+// cannot prove clean.
 func (c *WriteBackCache) ViewLossCount() int {
 	if c == nil {
 		return 0
 	}
-	seen := make(map[string]struct{})
 	c.mu.Lock()
+	seen := make(map[string]struct{}, len(c.lostGens))
 	for path := range c.lostGens {
 		seen[path] = struct{}{}
 	}
 	c.mu.Unlock()
-	losses, _ := c.scanViewLosses()
-	for _, loss := range losses {
-		seen[loss.Path] = struct{}{}
+
+	entries, err := os.ReadDir(c.dir)
+	if err != nil {
+		// Nothing can be proven: at least one unresolved record is possible.
+		if len(seen) > 0 {
+			return len(seen)
+		}
+		return 1
 	}
-	return len(seen)
+	count := len(seen)
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".lost") {
+			continue
+		}
+		raw, rerr := os.ReadFile(filepath.Join(c.dir, name))
+		if rerr != nil {
+			if errors.Is(rerr, os.ErrNotExist) {
+				continue
+			}
+			count++
+			continue
+		}
+		var loss ViewLoss
+		if jerr := json.Unmarshal(raw, &loss); jerr != nil || loss.Path == "" || loss.Generation == 0 {
+			count++
+			continue
+		}
+		if _, ok := seen[loss.Path]; ok {
+			continue
+		}
+		seen[loss.Path] = struct{}{}
+		count++
+	}
+	return count
 }

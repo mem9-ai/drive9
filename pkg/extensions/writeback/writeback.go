@@ -1056,8 +1056,15 @@ func (w *Writeback) Drain(ctx context.Context) error {
 			// The one exception is a path whose image is durably preserved for
 			// manual recovery (a recorded conflict): that handle reports the
 			// failure on its own Sync, and the drain's job is to settle the rest.
-			if err := h.DrainFlush(hctx); err != nil && firstErr == nil && !w.preservedForRecovery(h.path) {
-				firstErr = err
+			if err := h.DrainFlush(hctx); err != nil && firstErr == nil {
+				h.mu.Lock()
+				path := h.path
+				h.mu.Unlock()
+				// A lost image (or a wait timeout) is never excused by an older
+				// conflict record: it says nothing about the image being drained.
+				if errors.Is(err, staging.ErrStagedViewLost) || isStatusEAGAIN(err) || !w.preservedForRecovery(path) {
+					firstErr = err
+				}
 			}
 			cf()
 		}
@@ -1077,6 +1084,12 @@ func (w *Writeback) Drain(ctx context.Context) error {
 		if err := w.queue.WaitIdle(ctx); err != nil && firstErr == nil {
 			firstErr = err
 		}
+	}
+	if firstErr == nil && w.wbCache != nil && w.wbCache.ViewLossCount() > 0 {
+		// Nothing holds the work any more, but a pruned pair left a durable
+		// loss: the drain must not certify it (FS.Drain reports the same state
+		// through DrainPending).
+		firstErr = fmt.Errorf("writeback: %d staged image(s) were lost before they landed: %w", w.wbCache.ViewLossCount(), staging.ErrStagedViewLost)
 	}
 	return firstErr
 }
@@ -5834,6 +5847,11 @@ func (w *Writeback) DrainPending() (string, int) {
 	}
 	if w.uploader != nil {
 		if snap := w.uploader.Snapshot(); snap.Cached > 0 {
+			// Name the path: a stranded staged image is diagnosed from the drain
+			// artifact, and a bare count sends the reader through the whole log.
+			if snap.FirstPath != "" {
+				return "uploader_cached " + snap.FirstPath, snap.Cached
+			}
 			return "uploader_cached", snap.Cached
 		}
 	}
@@ -5861,7 +5879,9 @@ func (w *Writeback) preservedForRecovery(path string) bool {
 	if !ok || meta == nil {
 		return false
 	}
-	return meta.Kind == staging.PendingConflict
+	// A witness-only record (a shadowless transfer marker) preserves no local
+	// payload, so it cannot excuse a failed flush.
+	return meta.Kind == staging.PendingConflict && !meta.WitnessOnly
 }
 
 // markLinked is markUnlinked's rollback: a failed remote DELETE must not

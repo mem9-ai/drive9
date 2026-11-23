@@ -1142,8 +1142,14 @@ func (s *ShadowStore) RemoveIfGenerationDurable(remotePath string, expectedGen C
 	// The unlink/retire verdict comes back under the path lock the removal
 	// took: checking for the file afterwards would race a concurrent spill that
 	// legitimately created a fresher shadow.
+	removedSomething := cleanup.retire || cleanup.immediatePath != ""
 	if rerr := s.runRemoveCleanupChecked(cleanup); rerr != nil {
 		return true, fmt.Errorf("remove shadow %s: %w", remotePath, rerr)
+	}
+	if !removedSomething {
+		// Nothing was on disk: a clean path (or a wbCache-only staged image)
+		// must not pay a shadow-directory fsync.
+		return true, nil
 	}
 	if derr := fsyncDir(s.dir); derr != nil {
 		return true, fmt.Errorf("shadow dir sync after removing %s: %w", remotePath, derr)

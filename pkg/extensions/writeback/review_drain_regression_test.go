@@ -3,6 +3,7 @@ package writeback
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -464,8 +465,10 @@ func TestDrainPendingReportsLostImageAfterClose(t *testing.T) {
 	if _, ok := cache.Get("/closed.bin"); ok {
 		t.Fatal("read served a torn pair")
 	}
-	if err := wb.Drain(ctx); err != nil {
-		t.Fatalf("drain before the loss check: %v", err)
+	// Drain itself must not certify the mount: nothing holds the work, but the
+	// bytes never landed.
+	if err := wb.Drain(ctx); !errors.Is(err, staging.ErrStagedViewLost) {
+		t.Fatalf("drain error = %v, want ErrStagedViewLost", err)
 	}
 	kind, n := wb.DrainPending()
 	if kind != "lost_staged_images" || n == 0 {
