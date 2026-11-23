@@ -138,6 +138,10 @@ func openSwitchJournalFile(path, mountID, scope string, initial viewprotocol.Swi
 				closeIfFailed()
 				return nil, err
 			}
+			if err := syncJournalParentDir(path); err != nil {
+				closeIfFailed()
+				return nil, err
+			}
 			ok = true
 			return j, nil
 		}
@@ -168,8 +172,11 @@ func createAndInitSwitchJournalAtomic(path, mountID, scope string, initial viewp
 		return nil, false, err
 	}
 	ok := false
+	tmpRemoved := false
 	defer func() {
-		_ = os.Remove(tmpPath)
+		if !tmpRemoved {
+			_ = os.Remove(tmpPath)
+		}
 		if !ok {
 			_ = f.Close()
 		}
@@ -196,8 +203,54 @@ func createAndInitSwitchJournalAtomic(path, mountID, scope string, initial viewp
 		}
 		return nil, false, lerr
 	}
+	if rerr := os.Remove(tmpPath); rerr != nil && !os.IsNotExist(rerr) {
+		_ = os.Remove(path)
+		return nil, false, rerr
+	}
+	tmpRemoved = true
+	if serr := syncJournalParentDir(path); serr != nil {
+		_ = os.Remove(path)
+		return nil, false, serr
+	}
 	ok = true
 	return j, false, nil
+}
+
+func syncJournalParentDir(filePath string) error {
+	var fpErr error
+	failpoint.InjectCall("switchJournalBeforeDirSync", &fpErr)
+	if fpErr != nil {
+		return fmt.Errorf("sync switch journal parent dir: %w", fpErr)
+	}
+	dirPath := filepath.Dir(filePath)
+	df, err := os.Open(dirPath)
+	if err != nil {
+		return fmt.Errorf("open switch journal parent dir %s: %w", dirPath, err)
+	}
+	syncErr := df.Sync()
+	closeErr := df.Close()
+	if syncErr != nil {
+		return fmt.Errorf("sync switch journal parent dir %s: %w", dirPath, syncErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close switch journal parent dir %s: %w", dirPath, closeErr)
+	}
+	return nil
+}
+
+// RemoveSwitchJournal unlinks path and fsyncs its parent directory so the
+// directory entry removal is durable across power loss.
+func RemoveSwitchJournal(path string) error {
+	if path == "" {
+		return nil
+	}
+	if err := os.Remove(path); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	return syncJournalParentDir(path)
 }
 
 func (j *SwitchJournal) Close() error {
@@ -456,7 +509,7 @@ func DrainPriorScopeJournals(
 			drainedAny = true
 		}
 		if !j.Uncertain() && len(j.Snapshot().PendingUnbinds) == 0 {
-			_ = os.Remove(candPath)
+			_ = RemoveSwitchJournal(candPath)
 		}
 		_ = j.Close()
 	}

@@ -138,13 +138,20 @@ func prepareMountView(ctx context.Context, cfg MountConfig, baseClient *client.C
 			}
 			snap := journal.Snapshot()
 			if !journal.Uncertain() && snap.Pending == nil && len(snap.PendingUnbinds) == 0 && (snap.Binding.LayerID == "" || snap.Binding.ReadOnly) {
-				_ = os.Remove(jPath)
+				_ = mountstate.RemoveSwitchJournal(jPath)
 			}
 		}
 		if cerr := journal.Close(); cerr != nil {
 			retErr = errors.Join(retErr, cerr)
 		}
 	}()
+
+	var postPublishCrashErr error
+	failpoint.InjectCall("prepareMountViewAfterJournalOpen", &postPublishCrashErr)
+	if postPublishCrashErr != nil {
+		skipFailCleanup = true
+		return nil, postPublishCrashErr
+	}
 
 	if derr := journal.DrainPendingUnbinds(ctx, unbindFn); derr != nil {
 		return nil, classifyLayerStartupError("drain pending layer unbinds", derr)
@@ -207,6 +214,12 @@ func prepareMountView(ctx context.Context, cfg MountConfig, baseClient *client.C
 				LayerID: targetInfo.LayerID, MountID: actorID, Kind: mountstate.UnbindKindOp, OperationID: opID, Fence: expectedFence,
 			}); ierr != nil {
 				return nil, fmt.Errorf("fuse: persist initial bind_intent: %w", ierr)
+			}
+			var preBindCrashErr error
+			failpoint.InjectCall("prepareMountViewBeforeInitialServerBind", &preBindCrashErr)
+			if preBindCrashErr != nil {
+				skipFailCleanup = true
+				return nil, preBindCrashErr
 			}
 			bindStart := time.Now()
 			leaseResp, berr := baseClient.BindLayerMount(ctx, targetInfo.LayerID, client.LayerMountBindRequest{
@@ -416,7 +429,7 @@ func (v *mountView) close(ctx context.Context) error {
 			_ = v.switcher.drainPendingUnbindsLocked(ctx)
 			snap := v.switcher.journal.Snapshot()
 			if !v.switcher.journal.Uncertain() && snap.Pending == nil && len(snap.PendingUnbinds) == 0 && (snap.Binding.LayerID == "" || snap.Binding.ReadOnly) && v.switcher.journalPath != "" {
-				_ = os.Remove(v.switcher.journalPath)
+				_ = mountstate.RemoveSwitchJournal(v.switcher.journalPath)
 			}
 		}
 		err = errors.Join(err, v.switcher.journal.Close())

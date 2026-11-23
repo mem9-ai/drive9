@@ -41,3 +41,43 @@ func TestSwitchJournalBeforeSyncFailpointLatchesUncertain(t *testing.T) {
 	_, _, err = j.Decide("op-fp2", 1, viewprotocol.SwitchBinding{})
 	require.ErrorIs(t, err, ErrSwitchUncertain)
 }
+
+func TestSwitchJournalDirSyncOnPublishRemoveAndFailClosed(t *testing.T) {
+	dir := t.TempDir()
+	jPath := filepath.Join(dir, "drive9-view-dirsync.log")
+	scope, err := SwitchScope("http://127.0.0.1:9009", "tenant-ds", "/workspace", filepath.Join(dir, "mnt"))
+	require.NoError(t, err)
+
+	// 1. If parent directory fsync fails during atomic publish, OpenSwitchJournal
+	// fails closed and unlinks both tmp and target journal names.
+	require.NoError(t, failpoint.EnableCall("github.com/mem9-ai/drive9/pkg/mountstate/switchJournalBeforeDirSync", func(errp *error) {
+		*errp = errors.New("injected parent dir fsync error")
+	}))
+	_, err = OpenSwitchJournal(jPath, "mnt-ds-fail", scope, viewprotocol.SwitchBinding{})
+	require.Error(t, err)
+	require.NoError(t, failpoint.Disable("github.com/mem9-ai/drive9/pkg/mountstate/switchJournalBeforeDirSync"))
+
+	entries, rerr := filepath.Glob(filepath.Join(dir, "*"))
+	require.NoError(t, rerr)
+	require.Empty(t, entries, "failed parent dir sync must not leave published or temp journal files behind")
+
+	// 2. Successful publish invokes parent dir sync AFTER linking jPath and unlinking .tmp;
+	// RemoveSwitchJournal invokes parent dir sync AFTER unlinking jPath.
+	dirSyncCalls := 0
+	require.NoError(t, failpoint.EnableCall("github.com/mem9-ai/drive9/pkg/mountstate/switchJournalBeforeDirSync", func(_ *error) {
+		dirSyncCalls++
+		tmps, _ := filepath.Glob(filepath.Join(dir, ".drive9-view-init-*.tmp"))
+		require.Empty(t, tmps, "temp journal dentry must already be removed before parent dir fsync")
+	}))
+	defer func() {
+		_ = failpoint.Disable("github.com/mem9-ai/drive9/pkg/mountstate/switchJournalBeforeDirSync")
+	}()
+
+	j, err := OpenSwitchJournal(jPath, "mnt-ds-ok", scope, viewprotocol.SwitchBinding{})
+	require.NoError(t, err)
+	require.Equal(t, 1, dirSyncCalls)
+	require.NoError(t, j.Close())
+
+	require.NoError(t, RemoveSwitchJournal(jPath))
+	require.Equal(t, 2, dirSyncCalls)
+}

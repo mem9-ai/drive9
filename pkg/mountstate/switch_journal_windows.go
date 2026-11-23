@@ -51,3 +51,7 @@ func (j *SwitchJournal) DrainPendingUnbinds(context.Context, func(context.Contex
 func DrainPriorScopeJournals(context.Context, string, string, func(context.Context, PendingUnbind) error) (bool, error) {
 	return false, errSwitchJournalUnsupported
 }
+
+func RemoveSwitchJournal(string) error {
+	return errSwitchJournalUnsupported
+}

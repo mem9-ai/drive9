@@ -108,9 +108,11 @@ func (b *fakeSwitchBackend) serveLayersSubpath(w http.ResponseWriter, r *http.Re
 				st.OwnerMountID = ""
 			}
 		case mountstate.UnbindKindOp:
-			if st.Info.Fence%2 == 1 && st.OwnerMountID == req.MountID && st.LastBindOpID == req.OperationID {
+			if st.Info.Fence%2 == 1 && st.OwnerMountID == req.MountID && req.OperationID != "" && st.LastBindOpID == req.OperationID {
 				st.Info.Fence++
 				st.OwnerMountID = ""
+			} else if st.Info.Fence%2 == 0 && req.Fence >= 0 && req.Fence%2 == 0 && st.Info.Fence == req.Fence {
+				st.Info.Fence += 2
 			}
 		case mountstate.UnbindKindFence:
 			if st.Info.Fence%2 == 1 && st.Info.Fence == req.Fence && st.OwnerMountID == req.MountID {
