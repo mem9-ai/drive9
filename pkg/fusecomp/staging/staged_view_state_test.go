@@ -74,3 +74,36 @@ func TestPendingChmodIsNotPrunedAsATornPair(t *testing.T) {
 		t.Fatal("PendingChmod record was pruned by the meta+view read")
 	}
 }
+
+// TestPrunedPairReportsLossToTheOwner pins the plain-read choke point: a read
+// that prunes a damaged pair must tell the cache owner, because that is the
+// only place a later barrier can learn the bytes never landed.
+func TestPrunedPairReportsLossToTheOwner(t *testing.T) {
+	const path = "/lost.txt"
+	c, err := NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lostPath string
+	var lostErr error
+	c.OnViewLost = func(p string, err error) { lostPath, lostErr = p, err }
+
+	payload := []byte("staged image")
+	if err := c.Put(path, payload, int64(len(payload)), PendingNew); err != nil {
+		t.Fatal(err)
+	}
+	c.DropInMemoryPayload(path)
+	if err := os.WriteFile(c.DatFile(path), []byte("different bytes!"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A plain read (not the uploader) hits the torn pair first.
+	if _, ok := c.Get(path); ok {
+		t.Fatal("Get served a torn pair")
+	}
+	if lostPath != path {
+		t.Fatalf("OnViewLost path = %q, want %q", lostPath, path)
+	}
+	if lostErr == nil {
+		t.Fatal("OnViewLost carried no reason")
+	}
+}

@@ -2839,14 +2839,22 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 			retained = true
 		}
 		if !retained && entry.ShadowGen != 0 {
-			// Best effort by design (ShadowStore.remove discards its unlink
-			// error): verify instead of assuming. Only a removal this entry
-			// actually performed can be verified — if a newer generation
-			// already replaced entry.ShadowGen the shadow belongs to it, not to
-			// this landing.
-			if removed := cq.shadows.RemoveIfGeneration(entry.Path, entry.ShadowGen); removed &&
-				markerErr != nil && cq.shadows.VerifyRemoved(entry.Path) != nil {
-				removalFailed = true
+			if markerErr != nil {
+				// The crash reasoning depends on this shadow staying gone, so
+				// the removal must be durable: an unsynced unlink can revert on
+				// a crash and leave the shadow as the replay source for an image
+				// whose pending entry is about to be deleted. Only a removal
+				// this entry performed counts — a newer generation that already
+				// replaced entry.ShadowGen owns the file.
+				removed, derr := cq.shadows.RemoveIfGenerationDurable(entry.Path, entry.ShadowGen)
+				if removed && (derr != nil || cq.shadows.VerifyRemoved(entry.Path) != nil) {
+					removalFailed = true
+					if derr != nil {
+						safeLogPrintf("commit queue: shadow removal for %s was not made durable: %v", entry.Path, derr)
+					}
+				}
+			} else {
+				cq.shadows.RemoveIfGeneration(entry.Path, entry.ShadowGen)
 			}
 		}
 	}

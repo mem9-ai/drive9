@@ -639,6 +639,16 @@ func New(opts Options) (*Writeback, error) {
 		}
 	}
 	if w.wbCache != nil {
+		// A staged pair dropped by a plain read (Get/GetView/ListPending) is the
+		// same loss a barrier must not report as success; route it into the
+		// commit queue's bounded terminal-failure map, which landings and
+		// cancellations already clear.
+		w.wbCache.OnViewLost = func(remotePath string, err error) {
+			if w.queue == nil {
+				return
+			}
+			w.queue.RecordTerminalFailureForPath(remotePath, fmt.Errorf("%w: %w", errStagedViewLost, err))
+		}
 		workers := opts.UploadConcurrency
 		if workers <= 0 {
 			workers = defaultUploadConcurrency

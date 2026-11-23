@@ -1121,6 +1121,31 @@ func (s *ShadowStore) RemoveIfGeneration(remotePath string, expectedGen ContentG
 	return s.remove(remotePath, expectedGen, shadowRetiredInvalidated)
 }
 
+// RemoveIfGenerationDurable removes the shadow and makes the removal durable
+// before returning: the unlink (or the retire rename) is followed by a
+// directory sync. A caller whose crash-recovery reasoning depends on the shadow
+// staying gone — a commit marker that could not be fsynced — must use this
+// instead of RemoveIfGeneration, whose cleanup discards its errors and never
+// syncs the directory.
+//
+// removed reports whether this call removed the expected generation; err is
+// non-nil when the removal happened but could not be made durable.
+func (s *ShadowStore) RemoveIfGenerationDurable(remotePath string, expectedGen ContentGen) (removed bool, err error) {
+	pl := s.acquirePathLock(remotePath)
+	defer s.releasePathLock(remotePath, pl)
+	s.mu.Lock()
+	cleanup, ok := s.removeCoreLocked(remotePath, expectedGen, shadowRetiredInvalidated)
+	s.mu.Unlock()
+	if !ok {
+		return false, nil
+	}
+	s.runRemoveCleanup(cleanup)
+	if derr := fsyncDir(s.dir); derr != nil {
+		return true, fmt.Errorf("shadow dir sync after removing %s: %w", remotePath, derr)
+	}
+	return true, nil
+}
+
 // ActiveGeneration returns the current content generation for remotePath, or 0
 // if no shadow exists. Bumped on every mutating write (WriteFull/WriteAt/
 // Ensure/WriteStream/Truncate) so callers can snapshot it before an upload and
