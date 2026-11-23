@@ -1022,6 +1022,25 @@ func (cq *CommitQueue) CancelPrefix(prefix string) {
 	for _, cancel := range cancels {
 		cancel()
 	}
+	// One fsync for the whole subtree: the markers are only a fence once they
+	// are on disk, and a cancel usually arrives as one rename/rmdir of a tree.
+	if cq.journal != nil {
+		appendFailed := false
+		for _, p := range cancelled {
+			if err := cq.journal.Append(staging.JournalEntry{
+				Op:   staging.JournalCommit,
+				Path: p,
+			}); err != nil {
+				appendFailed = true
+				safeLogPrintf("commit queue: journal cancel marker failed for %s: %v", p, err)
+			}
+		}
+		if !appendFailed {
+			if err := cq.journal.FsyncShared(); err != nil {
+				safeLogPrintf("commit queue: journal cancel markers not durable: %v", err)
+			}
+		}
+	}
 	for _, p := range cancelled {
 		if cq.shadows != nil {
 			cq.shadows.Remove(p)
@@ -1032,14 +1051,6 @@ func (cq *CommitQueue) CancelPrefix(prefix string) {
 		// Same pathname-incarnation rule as cancelPath: the subtree's names
 		// are gone, so their terminal failures must not poison a recreator.
 		cq.clearTerminalFailure(p)
-		if cq.journal != nil {
-			if err := cq.journal.Append(staging.JournalEntry{
-				Op:   staging.JournalCommit,
-				Path: p,
-			}); err != nil {
-				safeLogPrintf("commit queue: journal cancel marker failed for %s: %v", p, err)
-			}
-		}
 	}
 }
 
@@ -1540,7 +1551,10 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) error {
 		cq.clearTerminalFailure(path)
 		return nil
 	}
-	appendErr := cq.journal.Append(staging.JournalEntry{
+	// AppendSync, not Append: the marker is what fences the frames of this
+	// name after a power loss, so it has to be on disk before the local state
+	// it protects is dropped.
+	appendErr := cq.journal.AppendSync(staging.JournalEntry{
 		Op:   staging.JournalUnlink,
 		Path: path,
 	})
@@ -2775,13 +2789,19 @@ func (cq *CommitQueue) onCommitSuccessWithOptions(entry *CommitEntry, expectedRe
 	// Write durable commit record BEFORE cleaning up local state so that
 	// crash recovery never re-uploads an already committed entry.
 	if cq.journal != nil && layerRef == "" {
-		if err := cq.journal.Append(staging.JournalEntry{
+		// Durable before cleanup: recovery reads the WAL as written, and a
+		// marker still in the page cache after a power loss is not there —
+		// the pending frames it was meant to override would replay and
+		// re-upload the pre-commit image over the committed one.
+		if err := cq.journal.AppendSync(staging.JournalEntry{
 			Op:   staging.JournalCommit,
 			Path: entry.Path,
 		}); err != nil {
-			safeLogPrintf("commit queue: journal commit marker failed for %s: %v (keeping local state)", entry.Path, err)
-			cq.removeFromQueue(entry)
-			return nil
+			// The upload landed and the cleanup below removes this path's
+			// shadow/pending state, so replay finds no bytes to resurrect.
+			// Report the durability fault and keep going: bailing out here
+			// would leave exactly the local state a replay needs.
+			safeLogPrintf("commit queue: journal commit marker not durable for %s: %v (continuing cleanup)", entry.Path, err)
 		}
 	}
 
@@ -3292,7 +3312,9 @@ func (cq *CommitQueue) onCommitTerminalFailure(entry *CommitEntry, lastErr error
 		}
 	}
 	if cq.journal != nil {
-		if err := cq.journal.Append(staging.JournalEntry{
+		// "Done" is also a fence: unsynced, a restart re-enqueues the entry
+		// this terminal failure just settled.
+		if err := cq.journal.AppendSync(staging.JournalEntry{
 			Op:   staging.JournalCommit, // treated as "done" so recovery won't re-enqueue
 			Path: entry.Path,
 		}); err != nil {
@@ -3444,7 +3466,7 @@ func (cq *CommitQueue) CancelQueuedForRename(path string) error {
 	if cq.journal == nil {
 		return nil
 	}
-	if err := cq.journal.Append(staging.JournalEntry{Op: staging.JournalUnlink, Path: path}); err != nil {
+	if err := cq.journal.AppendSync(staging.JournalEntry{Op: staging.JournalUnlink, Path: path}); err != nil {
 		return fmt.Errorf("journal rename marker for %s: %w", path, err)
 	}
 	return nil

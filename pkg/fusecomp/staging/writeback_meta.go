@@ -688,6 +688,46 @@ func (c *WriteBackCache) GetMetaAndView(remotePath string) (*WriteBackMeta, []by
 	return &cp, dataCopy, true
 }
 
+// StagedViewState explains why a staged meta+data read did not produce a pair.
+type StagedViewState int
+
+const (
+	// StagedViewOK means meta and data were returned together.
+	StagedViewOK StagedViewState = iota
+	// StagedViewNoMeta means nothing is staged for the path: it was consumed
+	// by an upload, or never staged. Callers may treat it as "nothing to do".
+	StagedViewNoMeta
+	// StagedViewTornPair means a metadata record existed but its data did not
+	// match it, so getViewLocked pruned the pair. The image is gone, and a
+	// caller that reports success here would claim durability for bytes that
+	// no longer exist anywhere.
+	StagedViewTornPair
+)
+
+// GetMetaAndViewState is GetMetaAndView with the miss reason. Callers that
+// treat a miss as success (a durability barrier) need the distinction: only
+// StagedViewNoMeta means another upload already consumed the image.
+func (c *WriteBackCache) GetMetaAndViewState(remotePath string) (*WriteBackMeta, []byte, StagedViewState) {
+	pl := c.AcquirePathLock(remotePath)
+	c.mu.Lock()
+	meta, ok := c.metas[remotePath]
+	if !ok {
+		c.mu.Unlock()
+		c.ReleasePathLock(remotePath, pl)
+		return nil, nil, StagedViewNoMeta
+	}
+	cp := cloneWriteBackMeta(meta)
+	data, dataOK := c.getViewLocked(remotePath)
+	c.mu.Unlock()
+	c.ReleasePathLock(remotePath, pl)
+	if !dataOK {
+		return nil, nil, StagedViewTornPair
+	}
+	dataCopy := make([]byte, len(data))
+	copy(dataCopy, data)
+	return &cp, dataCopy, StagedViewOK
+}
+
 // GetMetaAndViewWithCallback is like GetMetaAndView but invokes onLocked while
 // the per-path lock is still held (after the meta+data snapshot is read). This
 // lets callers atomically capture associated staging-store generations (e.g.

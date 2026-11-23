@@ -189,7 +189,10 @@ func (p *Prefetcher) Get(offset int64, size int) ([]byte, bool) {
 
 	// Trim to requested size
 	data := block.data
-	if len(data) < size && offset+int64(len(data)) < fileSize {
+	// fileSize < 0 means the view reset dropped the size: a short block can no
+	// longer be justified as the last block of the file, so it is dropped and
+	// the caller reads through to the plane that knows the real length.
+	if len(data) < size && (fileSize < 0 || offset+int64(len(data)) < fileSize) {
 		// A prefetched chunk smaller than the caller's request is only valid at
 		// EOF. Returning it for an interior range exposes a short read to FUSE.
 		p.mu.Lock()
@@ -371,9 +374,29 @@ func (p *Prefetcher) debugf(format string, args ...any) {
 	log.Printf("dat9 debug: prefetch "+format, args...)
 }
 
+// InvalidateUnknownSize drops cached blocks and marks the file size unknown.
+//
+// A view reset cannot name the replacement size yet, and keeping the open-time
+// one is wrong: the prefetcher clips the tail of a grown file to the old EOF,
+// Get answers that short block, and the read path accepts a short block at the
+// recorded EOF as a legitimate end of file — a mid-file short read, or a hole
+// once the page cache zero-fills. With the size unknown no block is clipped
+// against it and no prefetch is launched until a stat publishes the real size
+// through invalidateWithSize.
+func (p *Prefetcher) InvalidateUnknownSize() {
+	p.invalidateSize(0, true)
+}
+
 // invalidateWithSize publishes the replacement file size together with cache
 // invalidation. A negative size leaves the existing size unchanged.
 func (p *Prefetcher) invalidateWithSize(fileSize int64) {
+	p.invalidateSize(fileSize, false)
+}
+
+// invalidateSize is the shared body of both invalidation entry points. unknown
+// publishes "no size" (see InvalidateUnknownSize); otherwise a negative size
+// keeps the current one, matching invalidateWithSize's contract.
+func (p *Prefetcher) invalidateSize(fileSize int64, unknown bool) {
 	if p == nil {
 		return
 	}
@@ -382,7 +405,9 @@ func (p *Prefetcher) invalidateWithSize(fileSize int64) {
 	if p.closed {
 		return
 	}
-	if fileSize >= 0 {
+	if unknown {
+		p.fileSize = -1
+	} else if fileSize >= 0 {
 		p.fileSize = fileSize
 	}
 	p.cancel()
@@ -402,6 +427,12 @@ func (p *Prefetcher) invalidateWithSize(fileSize int64) {
 func (p *Prefetcher) startPrefetch(offset, length int64) {
 	if p.client == nil {
 		return // no client available (e.g., in tests)
+	}
+	// No size, no prefetch: without a known end the tail clip below would
+	// produce a negative length, and every block fetched now could describe a
+	// file whose length changed under the reset.
+	if p.fileSize < 0 {
+		return
 	}
 	// Cap at file end
 	if offset+length > p.fileSize {

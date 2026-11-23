@@ -7189,13 +7189,18 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 		return err
 	}
 	if journalFsync && st.Journal != nil {
-		_ = st.Journal.Append(staging.JournalEntry{
+		// The frame is the durability barrier fsync(2) promises: it orders
+		// this path's pending frame below the commit marker recovery will see.
+		// Its failure (WAL full, EIO) must fail the barrier instead of
+		// reporting a durable close that never happened.
+		if err := st.Journal.AppendSync(staging.JournalEntry{
 			Op:      staging.JournalFsync,
 			Path:    h.path,
 			Length:  size,
 			BaseRev: baseRev,
-		})
-		_ = st.Journal.FsyncShared()
+		}); err != nil {
+			return fmt.Errorf("journal fsync fence for %s: %w", h.path, err)
+		}
 	}
 	// The queue now owns this image: drop a same-image .dat/.meta snapshot
 	// the Flush left, or Release's Submit double-publishes it as a second

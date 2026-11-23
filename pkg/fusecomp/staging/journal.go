@@ -265,6 +265,20 @@ func (j *Journal) Append(entry JournalEntry) error {
 	return nil
 }
 
+// AppendSync appends entry and makes it durable before returning.
+//
+// Append only hands the frame to the page cache. A marker frame is a fence: it
+// is what stops replay from resurrecting the frames it was written after, so a
+// caller that drops the local state that fence protects must use AppendSync.
+// Crash recovery takes the WAL as written, and an unsynced marker simply is not
+// there.
+func (j *Journal) AppendSync(entry JournalEntry) error {
+	if err := j.Append(entry); err != nil {
+		return err
+	}
+	return j.FsyncShared()
+}
+
 // Fsync ensures all journal entries are durable on disk.
 func (j *Journal) Fsync() error {
 	return j.FsyncShared()

@@ -422,7 +422,10 @@ func (c *Cache) markUnverified() {
 			if h, ok := key.(*cachingHandle); ok {
 				h.mu.Lock()
 				if h.prefetch != nil {
-					h.prefetch.Invalidate()
+					// The invalidated path may have changed length; a block
+					// clipped to the previous size is not an EOF the next read
+					// may trust.
+					h.prefetch.InvalidateUnknownSize()
 				}
 				h.revalidate = true
 				h.identityGen++
@@ -460,7 +463,10 @@ func (c *Cache) invalidateAllTiers() {
 			if h, ok := key.(*cachingHandle); ok {
 				h.mu.Lock()
 				if h.prefetch != nil {
-					h.prefetch.Invalidate()
+					// Drop the size with the blocks: the prefetcher clips its
+					// last block to the size it holds, and the open-time size
+					// belongs to the OLD view (see InvalidateUnknownSize).
+					h.prefetch.InvalidateUnknownSize()
 				}
 				// The open-time size/revision describe the OLD view: keeping
 				// them made a whole-file read re-cache the stale prefix as the

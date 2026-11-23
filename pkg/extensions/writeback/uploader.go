@@ -497,9 +497,18 @@ func (u *WriteBackUploader) uploadSyncWithMetadata(ctx context.Context, localPat
 
 	// Atomically read meta + data under one path lock so they are guaranteed
 	// to be from the same generation.
-	meta, data, ok := u.cache.GetMetaAndView(localPath)
-	if !ok {
-		return 0, nil, nil // not in cache (removed between GetMeta and GetMetaAndView)
+	meta, data, viewState := u.cache.GetMetaAndViewState(localPath)
+	switch viewState {
+	case staging.StagedViewNoMeta:
+		// Not in cache: removed between GetMeta and GetMetaAndView by the
+		// background upload we just waited for. Nothing left to publish.
+		return 0, nil, nil
+	case staging.StagedViewTornPair:
+		// The image failed its meta/data binding and was pruned: the bytes
+		// this call was asked to make durable no longer exist. Reporting
+		// success would tell fsync(2) that a file is safe when its only copy
+		// is gone.
+		return 0, nil, fmt.Errorf("staged image for %s failed its meta/data binding and was pruned", localPath)
 	}
 	gen := meta.Generation
 
