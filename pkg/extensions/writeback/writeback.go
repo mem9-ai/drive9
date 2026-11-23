@@ -3385,16 +3385,17 @@ func (h *bufferingHandle) DrainFlush(ctx context.Context) (err error) {
 		}
 		return h.flushMigratedMode(ctx)
 	}
+	callerCtx := ctx
 	defer func() {
 		if err != nil {
 			return
 		}
 		if e := h.extentHandle(); e != nil {
-			if ferr := e.Flush(ctx); ferr != nil {
+			if ferr := e.Flush(callerCtx); ferr != nil {
 				err = ferr
 				return
 			}
-			err = h.flushMigratedMode(ctx)
+			err = h.flushMigratedMode(callerCtx)
 		}
 	}()
 	retainBuffer := false
@@ -4118,16 +4119,17 @@ func (h *bufferingHandle) Flush(ctx context.Context) (err error) {
 		}
 		return h.flushMigratedMode(ctx)
 	}
+	callerCtx := ctx
 	defer func() {
 		if err != nil {
 			return
 		}
 		if e := h.extentHandle(); e != nil {
-			if ferr := e.Flush(ctx); ferr != nil {
+			if ferr := e.Flush(callerCtx); ferr != nil {
 				err = ferr
 				return
 			}
-			err = h.flushMigratedMode(ctx)
+			err = h.flushMigratedMode(callerCtx)
 		}
 	}()
 	h.mu.Lock()
