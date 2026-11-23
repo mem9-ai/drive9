@@ -1226,7 +1226,9 @@ func (u *WriteBackUploader) stagedViewLost(localPath string, err error) error {
 	if err == nil {
 		err = errStagedViewUnavailable
 	}
-	err = fmt.Errorf("%w: %w", errStagedViewLost, err)
+	if !errors.Is(err, errStagedViewLost) {
+		err = fmt.Errorf("%w: %w", errStagedViewLost, err)
+	}
 	safeLogPrintf("writeback upload: staged image for %s is unavailable: %v", localPath, err)
 	return err
 }

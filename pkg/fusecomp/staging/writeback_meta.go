@@ -1263,11 +1263,7 @@ func (c *WriteBackCache) ListPending() []PendingEntry {
 			if _, ok := c.metas[meta.Path]; !ok {
 				cp := meta
 				c.setMetaLocked(meta.Path, &cp)
-				if meta.Generation > c.nextGen.Load() {
-					if meta.Generation > c.nextGen.Load() {
-						c.nextGen.Store(meta.Generation)
-					}
-				}
+				c.advanceNextGen(meta.Generation)
 			}
 		}
 	}
@@ -1286,6 +1282,12 @@ func (c *WriteBackCache) ListPending() []PendingEntry {
 		datPath := c.DatFile(path)
 		data, err := os.ReadFile(datPath)
 		if err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				// A transient read error is not evidence the image is gone: keep
+				// the entry (getViewStateLocked makes the same distinction) and
+				// let a retry publish it.
+				continue
+			}
 			// Data file missing — remove orphaned metadata, and record the
 			// loss so a barrier that later finds nothing staged does not read
 			// it as success.
@@ -1345,11 +1347,7 @@ func (c *WriteBackCache) ListPendingMetas() []WriteBackMeta {
 			if _, ok := c.metas[meta.Path]; !ok {
 				cp := meta
 				c.setMetaLocked(meta.Path, &cp)
-				if meta.Generation > c.nextGen.Load() {
-					if meta.Generation > c.nextGen.Load() {
-						c.nextGen.Store(meta.Generation)
-					}
-				}
+				c.advanceNextGen(meta.Generation)
 			}
 		}
 	}
@@ -1508,6 +1506,17 @@ func (c *WriteBackCache) putWithBaseRevAndModeAndLineage(remotePath string, data
 
 	c.ReleasePathLock(remotePath, pl)
 	return gen, t, nil
+}
+
+// advanceNextGen raises the cache generation counter to at least gen, never
+// lowering it (a concurrent put may already be past it).
+func (c *WriteBackCache) advanceNextGen(gen uint64) {
+	for {
+		cur := c.nextGen.Load()
+		if gen <= cur || c.nextGen.CompareAndSwap(cur, gen) {
+			return
+		}
+	}
 }
 
 // DurableGeneration reports the highest cache generation guaranteed synced to disk.

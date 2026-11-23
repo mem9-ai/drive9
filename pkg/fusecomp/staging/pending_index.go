@@ -1080,6 +1080,13 @@ func (idx *PendingIndex) EnsureConflictMarker(remotePath string) error {
 	if _, exists := idx.items[remotePath]; !exists {
 		cp := meta
 		idx.items[remotePath] = &cp
+		idx.ensureCommittedFencesLoadedLocked()
+		clearedFence := idx.clearCommittedFenceLocked(remotePath)
+		idx.mu.Unlock()
+		if clearedFence {
+			idx.removeFenceFile(remotePath)
+		}
+		return nil
 	}
 	idx.mu.Unlock()
 	return nil

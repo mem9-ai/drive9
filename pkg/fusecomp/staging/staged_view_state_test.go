@@ -359,3 +359,66 @@ func TestViewLossMarkerSeedsTheGenerationCounter(t *testing.T) {
 		t.Fatalf("a fresh staging left the recovered marker: %v", err)
 	}
 }
+
+// TestViewLossRekeysOnRename pins the move rule: a loss follows the name it
+// belongs to, so a renamed subtree's descendants still fail their barriers at
+// the destination instead of silently succeeding.
+func TestViewLossRekeysOnRename(t *testing.T) {
+	c, err := NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.writeViewLoss("/src/a.txt", 9, os.ErrNotExist)
+	c.writeViewLoss("/src/sub/b.txt", 10, os.ErrNotExist)
+	if !c.HasViewLossPrefix("/src/") {
+		t.Fatal("prefix check missed a recorded loss")
+	}
+	c.RekeyViewLossPrefix("/src/", "/dst/")
+	if err := c.ViewLoss("/src/a.txt"); err != nil {
+		t.Fatal("the source name kept its loss record after the move")
+	}
+	if err := c.ViewLoss("/dst/a.txt"); err == nil {
+		t.Fatal("the loss record did not follow the rename")
+	}
+	if err := c.ViewLoss("/dst/sub/b.txt"); err == nil {
+		t.Fatal("the nested loss record did not follow the rename")
+	}
+	// A single-path rekey moves the in-memory record too.
+	c.RekeyViewLoss("/dst/a.txt", "/dst/c.txt")
+	if err := c.ViewLoss("/dst/c.txt"); err == nil {
+		t.Fatal("single-path rekey dropped the record")
+	}
+	if err := c.ViewLoss("/dst/a.txt"); err != nil {
+		t.Fatal("single-path rekey left the old name recorded")
+	}
+}
+
+// TestListPendingKeepsEntriesOnTransientReadErrors pins the distinction the
+// view loader already makes: only a missing .dat file means the image is gone.
+func TestListPendingKeepsEntriesOnTransientReadErrors(t *testing.T) {
+	const path = "/transient.txt"
+	dir := t.TempDir()
+	c, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("staged image")
+	if err := c.Put(path, payload, int64(len(payload)), PendingNew); err != nil {
+		t.Fatal(err)
+	}
+	// A directory at the .dat path makes ReadFile fail with EISDIR: a transient
+	// error that is not evidence the image is gone.
+	if err := os.Remove(c.DatFile(path)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(c.DatFile(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_ = c.ListPending()
+	if !c.HasMeta(path) {
+		t.Fatal("a transient read error pruned the entry")
+	}
+	if err := c.ViewLoss(path); err != nil {
+		t.Fatal("a transient read error recorded a loss")
+	}
+}

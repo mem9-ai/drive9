@@ -95,6 +95,8 @@ func (idx *PendingIndex) loadCommittedFencesLocked() error {
 		return idx.fencesErr
 	}
 	idx.fencesLoaded = true
+	// A successful retry clears the error the earlier failed scan reported.
+	idx.fencesErr = nil
 	for _, e := range entries {
 		name := e.Name()
 		if !strings.HasSuffix(name, ".fence") {

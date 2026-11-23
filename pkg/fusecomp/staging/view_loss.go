@@ -119,7 +119,12 @@ func (c *WriteBackCache) clearViewLossLocked(remotePath string, gen uint64) {
 	if loss, ok := c.readViewLoss(remotePath); ok && loss.Generation > gen {
 		return
 	}
-	_ = os.Remove(c.lostFile(remotePath))
+	if err := os.Remove(c.lostFile(remotePath)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return
+	}
+	// The removal must survive a crash: a resurrected marker would fail barriers
+	// on a name whose image is fine.
+	_ = fsyncDir(c.dir)
 }
 
 // clearViewLossForNewStagingLocked drops any record for the path: a fresh
@@ -147,6 +152,17 @@ func (c *WriteBackCache) ClearViewLoss(remotePath string) {
 func (c *WriteBackCache) ClearViewLossPrefix(prefix string) {
 	if c == nil {
 		return
+	}
+	c.mu.Lock()
+	var inMemory []string
+	for path := range c.lostGens {
+		if strings.HasPrefix(path, prefix) {
+			inMemory = append(inMemory, path)
+		}
+	}
+	c.mu.Unlock()
+	for _, path := range inMemory {
+		c.ClearViewLoss(path)
 	}
 	entries, err := os.ReadDir(c.dir)
 	if err != nil {
@@ -189,7 +205,7 @@ func (c *WriteBackCache) loadViewLossFromDisk() {
 			continue
 		}
 		var loss ViewLoss
-		if jerr := json.Unmarshal(raw, &loss); jerr != nil || loss.Path == "" {
+		if jerr := json.Unmarshal(raw, &loss); jerr != nil || loss.Path == "" || loss.Generation == 0 {
 			continue
 		}
 		c.mu.Lock()
@@ -204,5 +220,124 @@ func (c *WriteBackCache) loadViewLossFromDisk() {
 				break
 			}
 		}
+	}
+}
+
+// HasViewLossPrefix reports whether any path under prefix carries a recorded
+// loss. A directory rename must consult it: ListByPrefix only sees .meta
+// entries, so a pruned descendant would otherwise be moved as if it had landed.
+func (c *WriteBackCache) HasViewLossPrefix(prefix string) bool {
+	if c == nil {
+		return false
+	}
+	c.mu.Lock()
+	for path := range c.lostGens {
+		if strings.HasPrefix(path, prefix) {
+			c.mu.Unlock()
+			return true
+		}
+	}
+	c.mu.Unlock()
+	entries, err := os.ReadDir(c.dir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".lost") {
+			continue
+		}
+		raw, rerr := os.ReadFile(filepath.Join(c.dir, name))
+		if rerr != nil {
+			continue
+		}
+		var loss ViewLoss
+		if jerr := json.Unmarshal(raw, &loss); jerr != nil || loss.Path == "" {
+			continue
+		}
+		if strings.HasPrefix(loss.Path, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// RekeyViewLoss moves a recorded loss from oldPath to newPath. A rename carries
+// the obligation with the name: the destination now holds the unlanded image's
+// identity, so dropping the record (or leaving it on the dead name) would let a
+// barrier certify bytes that never landed.
+func (c *WriteBackCache) RekeyViewLoss(oldPath, newPath string) {
+	if c == nil || oldPath == newPath {
+		return
+	}
+	c.mu.Lock()
+	gen, ok := c.lostGens[oldPath]
+	if ok {
+		delete(c.lostGens, oldPath)
+		c.lostGens[newPath] = gen
+	}
+	c.mu.Unlock()
+	if !ok {
+		// No in-memory record: a durable marker may still exist.
+		if loss, has := c.readViewLoss(oldPath); has {
+			gen = loss.Generation
+		} else {
+			return
+		}
+	}
+	loss := ViewLoss{Path: newPath, Generation: gen}
+	if raw, merr := json.Marshal(&loss); merr == nil {
+		_ = atomicWrite(c.lostFile(newPath), raw)
+	}
+	_ = os.Remove(c.lostFile(oldPath))
+}
+
+// RekeyViewLossPrefix moves every recorded loss under oldPrefix to newPrefix,
+// preserving the relative path.
+func (c *WriteBackCache) RekeyViewLossPrefix(oldPrefix, newPrefix string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	moved := make(map[string]uint64)
+	for path, gen := range c.lostGens {
+		if strings.HasPrefix(path, oldPrefix) {
+			moved[path] = gen
+			delete(c.lostGens, path)
+		}
+	}
+	c.mu.Unlock()
+	entries, err := os.ReadDir(c.dir)
+	if err == nil {
+		for _, e := range entries {
+			name := e.Name()
+			if !strings.HasSuffix(name, ".lost") {
+				continue
+			}
+			raw, rerr := os.ReadFile(filepath.Join(c.dir, name))
+			if rerr != nil {
+				continue
+			}
+			var loss ViewLoss
+			if jerr := json.Unmarshal(raw, &loss); jerr != nil || loss.Path == "" {
+				continue
+			}
+			if !strings.HasPrefix(loss.Path, oldPrefix) {
+				continue
+			}
+			if _, ok := moved[loss.Path]; !ok {
+				moved[loss.Path] = loss.Generation
+			}
+		}
+	}
+	for oldPath, gen := range moved {
+		newPath := newPrefix + strings.TrimPrefix(oldPath, oldPrefix)
+		c.mu.Lock()
+		c.lostGens[newPath] = gen
+		c.mu.Unlock()
+		if raw, merr := json.Marshal(&ViewLoss{Path: newPath, Generation: gen}); merr == nil {
+			_ = atomicWrite(c.lostFile(newPath), raw)
+		}
+		_ = os.Remove(c.lostFile(oldPath))
 	}
 }

@@ -2073,9 +2073,21 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			if !w.queue.WaitPrefixTimeout(prefix, 10*time.Second) {
 				return fs.Result{}, &fs.StatusError{Path: op.Path, Status: gofuse.EAGAIN}
 			}
-			// Land staged descendant images BEFORE the move so the rename
-			// carries their committed bytes.
-			if w.wbCache != nil && w.uploader != nil {
+		}
+		// A pruned descendant has no .meta entry for ListByPrefix to find; its
+		// loss record is the only witness. Moving the stale remote subtree over
+		// it would silently certify bytes that never landed, so the rename fails
+		// exactly like the single-file case. This check runs for every policy:
+		// the landing loop below only exists where a queue owns the descendants.
+		if w.wbCache != nil {
+			prefix := strings.TrimSuffix(op.Path, "/") + "/"
+			if w.wbCache.HasViewLossPrefix(prefix) {
+				return fs.Result{}, fmt.Errorf("rename %s: descendant image was lost: %w", op.Path, staging.ErrStagedViewLost)
+			}
+			// Land staged descendant images BEFORE the move so the rename carries
+			// their committed bytes. A queue-less stack keeps them staged and
+			// migrates them with the rename below instead.
+			if w.queue != nil && w.uploader != nil {
 				for _, entry := range w.wbCache.ListByPrefix(prefix) {
 					if err := land(entry.Path); err != nil {
 						return fs.Result{}, fmt.Errorf("land descendant %s before rename: %w", entry.Path, err)
@@ -2338,12 +2350,14 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		if w.wbCache != nil {
 			prefix := strings.TrimSuffix(op.Path, "/") + "/"
 			// Loss records are not .meta entries, so the ListByPrefix loop below
-			// cannot see them: the renamed subtree's names are gone and the
-			// destination names are replaced, so both sets must be dropped or a
-			// stale record would fail barriers forever.
-			w.wbCache.ClearViewLossPrefix(prefix)
-			w.wbCache.ClearViewLossPrefix(strings.TrimSuffix(op.Path2, "/") + "/")
+			// cannot see them. The source subtree's records follow the names
+			// (a descended loss must keep failing barriers at the new path); the
+			// destination subtree's records die with the incarnations it
+			// replaces.
+			dstLossPrefix := strings.TrimSuffix(op.Path2, "/") + "/"
+			w.wbCache.ClearViewLossPrefix(dstLossPrefix)
 			w.wbCache.ClearViewLoss(op.Path2)
+			w.wbCache.RekeyViewLossPrefix(prefix, dstLossPrefix)
 			for _, entry := range w.wbCache.ListByPrefix(prefix) {
 				target := op.Path2 + strings.TrimPrefix(entry.Path, op.Path)
 				moved := w.wbCache.RenamePending(entry.Path, target)
@@ -6644,6 +6658,12 @@ func (h *bufferingHandle) commitInline(ctx context.Context) error {
 		// An inline commit published this image: any recorded loss for the name
 		// is superseded, including one left by a pruned pair (cacheGen == 0).
 		h.w.wbCache.ClearViewLoss(h.path)
+		// A rev-less streamed success still retires a queue-recorded failure for
+		// the name; landedAt returns early without a revision, so nothing else
+		// would clear it.
+		if committedRev <= 0 && h.w.queue != nil {
+			h.w.queue.ClearPathCommitErr(h.path)
+		}
 		var crc uint32
 		var img []byte
 		if image != nil {
