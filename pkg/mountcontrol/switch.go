@@ -178,7 +178,7 @@ func exchangeSwitch(ctx context.Context, socketPath, op string, req SwitchReques
 	if err := json.Unmarshal(data, &resp); err != nil {
 		return nil, &SwitchError{MountID: req.MountID, OperationID: req.OperationID, Unknown: true, Cause: err}
 	}
-	if err := validateSwitchResponse(req, resp); err != nil {
+	if err := validateSwitchResponse(op, req, resp); err != nil {
 		return nil, &SwitchError{MountID: req.MountID, OperationID: req.OperationID, Unknown: true, Cause: err}
 	}
 	if resp.Code != "" || resp.ErrorKind != "" || resp.Error != "" {
@@ -207,7 +207,7 @@ func isUnknownSwitchOutcome(resp SwitchResponse) bool {
 	}
 }
 
-func validateSwitchResponse(req SwitchRequest, resp SwitchResponse) error {
+func validateSwitchResponse(op string, req SwitchRequest, resp SwitchResponse) error {
 	if resp.MountID != req.MountID || resp.OperationID != req.OperationID {
 		return errors.New("mount switch response identity mismatch")
 	}
@@ -221,12 +221,17 @@ func validateSwitchResponse(req SwitchRequest, resp SwitchResponse) error {
 	if r.OperationID == "" || r.Generation == 0 || r.From.Validate() != nil || r.Target.Validate() != nil {
 		return errors.New("mount switch receipt invalid")
 	}
-	if !req.Recover && (r.OperationID != req.OperationID || r.FromGeneration != req.ExpectedGeneration || r.Generation != req.ExpectedGeneration+1) {
+	if r.OperationID != req.OperationID || r.FromGeneration != req.ExpectedGeneration || r.Generation != req.ExpectedGeneration+1 {
 		return errors.New("mount switch receipt does not match request")
 	}
 	switch r.State {
 	case mountstate.SwitchDone, mountstate.SwitchRecovering, mountstate.SwitchTargetRevoked:
 		return nil
+	case mountstate.SwitchAborted:
+		if op == "switch-operation" {
+			return nil
+		}
+		return errors.New("invalid mount switch receipt state")
 	default:
 		return errors.New("invalid mount switch receipt state")
 	}

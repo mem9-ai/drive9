@@ -4,6 +4,7 @@ package mountstate
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
@@ -12,6 +13,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/pingcap/failpoint"
@@ -220,4 +222,97 @@ func (j *SwitchJournal) replayFileLocked() error {
 		return fmt.Errorf("%w: missing init frame", ErrSwitchCorrupt)
 	}
 	return nil
+}
+
+// DrainPriorScopeJournals scans stateDir() for unlocked prior journal files
+// ("drive9-view-*.log") belonging to the same mount scope (excluding skipPath),
+// queues any active or uncommitted lease unbinds under the prior incarnation's
+// MountID, drains pending_unbinds via unbindFn, and unlinks each fully-drained
+// stale journal while holding its exclusive flock.
+func DrainPriorScopeJournals(
+	ctx context.Context,
+	skipPath, scope string,
+	unbindFn func(context.Context, PendingUnbind) error,
+) (bool, error) {
+	if scope == "" {
+		return false, fmt.Errorf("%w: empty scope", ErrSwitchInvalid)
+	}
+	dir := stateDir()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	cleanSkip := filepath.Clean(skipPath)
+	drainedAny := false
+	for _, ent := range entries {
+		name := ent.Name()
+		if !strings.HasPrefix(name, "drive9-view-") || !strings.HasSuffix(name, ".log") {
+			continue
+		}
+		candPath := filepath.Join(dir, name)
+		if filepath.Clean(candPath) == cleanSkip {
+			continue
+		}
+		f, oerr := os.OpenFile(candPath, os.O_RDWR|unix.O_NOFOLLOW, 0o600)
+		if oerr != nil {
+			if os.IsNotExist(oerr) {
+				continue
+			}
+			return drainedAny, oerr
+		}
+		if lerr := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); lerr != nil {
+			_ = f.Close()
+			if errors.Is(lerr, unix.EWOULDBLOCK) || errors.Is(lerr, unix.EAGAIN) {
+				// Owned by another live mount process.
+				continue
+			}
+			return drainedAny, fmt.Errorf("lock prior switch journal %s: %w", candPath, lerr)
+		}
+		st, serr := f.Stat()
+		if serr != nil {
+			_ = f.Close()
+			return drainedAny, serr
+		}
+		if !st.Mode().IsRegular() || st.Mode().Perm()&0o077 != 0 {
+			_ = f.Close()
+			continue
+		}
+		if st.Size() == 0 {
+			_ = os.Remove(candPath)
+			_ = f.Close()
+			continue
+		}
+		j := &SwitchJournal{
+			file:    f,
+			history: make(map[string]SwitchReceipt),
+		}
+		if rerr := j.replayFileLocked(); rerr != nil {
+			_ = j.Close()
+			return drainedAny, fmt.Errorf("replay prior switch journal %s: %w", candPath, rerr)
+		}
+		if j.scope != scope {
+			_ = j.Close()
+			continue
+		}
+		if qerr := j.QueueCurrentUnbindForUnmount(); qerr != nil {
+			_ = j.Close()
+			return drainedAny, qerr
+		}
+		hadUnbinds := len(j.Snapshot().PendingUnbinds) > 0
+		if derr := j.DrainPendingUnbinds(ctx, unbindFn); derr != nil {
+			_ = j.Close()
+			return drainedAny, derr
+		}
+		if hadUnbinds {
+			drainedAny = true
+		}
+		if !j.Uncertain() && len(j.Snapshot().PendingUnbinds) == 0 {
+			_ = os.Remove(candPath)
+		}
+		_ = j.Close()
+	}
+	return drainedAny, nil
 }

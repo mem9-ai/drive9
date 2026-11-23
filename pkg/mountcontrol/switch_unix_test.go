@@ -94,3 +94,54 @@ func TestRequestSwitchNegotiationUnsupportedAndDone(t *testing.T) {
 	require.Equal(t, uint64(2), resp.Receipt.Generation)
 	require.Equal(t, target, resp.Receipt.Target)
 }
+
+func TestValidateSwitchResponseRecoverAndQueryAborted(t *testing.T) {
+	target := viewprotocol.SwitchBinding{
+		LayerID:      "layer_01j8z4r9w3m5n7p9q2s4t6v8xz",
+		Fence:        1,
+		BaseRootPath: "/workspace",
+	}
+
+	// 1. QuerySwitch ("switch-operation") accepts ABORTED receipt, while RequestSwitch ("switch") rejects it.
+	qReq := SwitchRequest{MountID: "m1", OperationID: "op-rev", ExpectedGeneration: 2, Layer: "work-a"}
+	abortedResp := SwitchResponse{
+		MountID:     "m1",
+		OperationID: "op-rev",
+		Receipt: &mountstate.SwitchReceipt{
+			OperationID:    "op-rev",
+			FromGeneration: 2,
+			Generation:     3,
+			Target:         target,
+			State:          mountstate.SwitchAborted,
+		},
+	}
+	require.NoError(t, validateSwitchResponse("switch-operation", qReq, abortedResp))
+	require.Error(t, validateSwitchResponse("switch", qReq, abortedResp))
+
+	// 2. RequestSwitch with Recover=true STILL enforces OperationID, FromGeneration, and Generation+1.
+	recReq := SwitchRequest{MountID: "m1", OperationID: "op-rec", ExpectedGeneration: 3, Layer: "main", Recover: true}
+	validRecResp := SwitchResponse{
+		MountID:     "m1",
+		OperationID: "op-rec",
+		Receipt: &mountstate.SwitchReceipt{
+			OperationID:    "op-rec",
+			FromGeneration: 3,
+			Generation:     4,
+			From:           target,
+			State:          mountstate.SwitchDone,
+		},
+	}
+	require.NoError(t, validateSwitchResponse("switch", recReq, validRecResp))
+
+	badGenResp := validRecResp
+	badReceipt := *validRecResp.Receipt
+	badReceipt.Generation = 5
+	badGenResp.Receipt = &badReceipt
+	require.Error(t, validateSwitchResponse("switch", recReq, badGenResp))
+
+	badOpResp := validRecResp
+	badOpReceipt := *validRecResp.Receipt
+	badOpReceipt.OperationID = "other-op"
+	badOpResp.Receipt = &badOpReceipt
+	require.Error(t, validateSwitchResponse("switch", recReq, badOpResp))
+}

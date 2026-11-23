@@ -16,6 +16,7 @@ import (
 	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/pingcap/failpoint"
 
 	"github.com/mem9-ai/drive9/pkg/client"
 	"github.com/mem9-ai/drive9/pkg/extensions/extent"
@@ -105,12 +106,8 @@ func prepareMountView(ctx context.Context, cfg MountConfig, baseClient *client.C
 	if err != nil {
 		return nil, fmt.Errorf("fuse: open switch journal: %w", err)
 	}
-	defer func() {
-		if retErr != nil {
-			_ = journal.Close()
-		}
-	}()
-
+	skipFailCleanup := false
+	var initialLease *layerMountBinding
 	unbindFn := func(uctx context.Context, item mountstate.PendingUnbind) error {
 		cctx, cancel := context.WithTimeout(uctx, timing.callTimeout)
 		defer cancel()
@@ -122,13 +119,50 @@ func prepareMountView(ctx context.Context, cfg MountConfig, baseClient *client.C
 		}
 		return uerr
 	}
+	defer func() {
+		if retErr == nil {
+			return
+		}
+		if !skipFailCleanup {
+			if initialLease != nil {
+				initialLease.StopRenew()
+			}
+			if !journal.Uncertain() {
+				if qerr := journal.QueueCurrentUnbindForUnmount(); qerr != nil {
+					retErr = errors.Join(retErr, qerr)
+				} else if derr := journal.DrainPendingUnbinds(context.Background(), unbindFn); derr != nil {
+					retErr = errors.Join(retErr, derr)
+				}
+			} else if initialLease != nil {
+				initialLease.Unbind(context.Background())
+			}
+			snap := journal.Snapshot()
+			if !journal.Uncertain() && snap.Pending == nil && len(snap.PendingUnbinds) == 0 && (snap.Binding.LayerID == "" || snap.Binding.ReadOnly) {
+				_ = os.Remove(jPath)
+			}
+		}
+		if cerr := journal.Close(); cerr != nil {
+			retErr = errors.Join(retErr, cerr)
+		}
+	}()
+
 	if derr := journal.DrainPendingUnbinds(ctx, unbindFn); derr != nil {
 		return nil, classifyLayerStartupError("drain pending layer unbinds", derr)
+	}
+	drainedPrior, perr := mountstate.DrainPriorScopeJournals(ctx, jPath, scope, unbindFn)
+	if perr != nil {
+		return nil, classifyLayerStartupError("drain prior mount switch journal", perr)
+	}
+	if targetInfo != nil && drainedPrior {
+		refreshed, gerr := baseClient.GetLayer(ctx, targetInfo.LayerID)
+		if gerr != nil {
+			return nil, classifyLayerStartupError(fmt.Sprintf("refresh layer %q after draining prior journal", targetInfo.LayerID), gerr)
+		}
+		targetInfo = refreshed
 	}
 
 	viewClient := baseClient
 	initialBinding := viewprotocol.SwitchBinding{ReadOnly: cfg.ReadOnly}
-	var initialLease *layerMountBinding
 	if targetInfo != nil {
 		initialBinding.LayerID = targetInfo.LayerID
 		initialBinding.BaseRootPath = baseRoot
@@ -158,12 +192,15 @@ func prepareMountView(ctx context.Context, cfg MountConfig, baseClient *client.C
 				if uerr != nil {
 					return nil, classifyLayerStartupError(fmt.Sprintf("expire stale mount lease on layer %s", targetInfo.LayerID), uerr)
 				}
-				if unb != nil {
-					expectedFence = unb.Fence
+				if unb == nil || unb.Fence < 0 || unb.Fence%2 != 0 {
+					return nil, ExitStartupTransientErr(
+						fmt.Sprintf("expire stale mount lease on layer %s returned invalid fence", targetInfo.LayerID), nil)
 				}
+				expectedFence = unb.Fence
 			}
 			if expectedFence < 0 || expectedFence%2 != 0 {
-				expectedFence = 0
+				return nil, ExitStartupPermanentErr(
+					fmt.Sprintf("layer %s reported invalid fence %d", targetInfo.LayerID, expectedFence), nil)
 			}
 			opID := "bind_" + generateMountID()
 			if ierr := journal.AppendBindIntent(mountstate.PendingUnbind{
@@ -176,8 +213,13 @@ func prepareMountView(ctx context.Context, cfg MountConfig, baseClient *client.C
 				MountID: actorID, OperationID: opID, ExpectedFence: expectedFence,
 			})
 			if berr != nil {
-				_ = journal.DrainPendingUnbinds(context.Background(), unbindFn)
 				return nil, classifyLayerStartupError(fmt.Sprintf("bind exclusive mount lease on layer %s", targetInfo.LayerID), berr)
+			}
+			var crashErr error
+			failpoint.InjectCall("prepareMountViewAfterInitialServerBind", &crashErr)
+			if crashErr != nil {
+				skipFailCleanup = true
+				return nil, crashErr
 			}
 			initialBinding.Fence = leaseResp.Fence
 			initialLease = &layerMountBinding{
@@ -188,11 +230,9 @@ func prepareMountView(ctx context.Context, cfg MountConfig, baseClient *client.C
 				LayerID: targetInfo.LayerID, Fence: leaseResp.Fence, WriteGuard: initialLease.checkWriteAllowed,
 			})
 			if verr != nil {
-				_ = journal.DrainPendingUnbinds(context.Background(), unbindFn)
 				return nil, ExitStartupPermanentErr(fmt.Sprintf("bind writable layer view %s", targetInfo.LayerID), verr)
 			}
 			if jerr := journal.BindInitial(initialBinding, opID); jerr != nil {
-				initialLease.Unbind(context.Background())
 				return nil, fmt.Errorf("fuse: commit initial layer binding: %w", jerr)
 			}
 			viewClient = vc
@@ -200,13 +240,6 @@ func prepareMountView(ctx context.Context, cfg MountConfig, baseClient *client.C
 			initialLease.startRenewLoop(bindStart, leaseResp.MountLeaseTTLMS, timing)
 		}
 	}
-	defer func() {
-		if retErr != nil && initialLease != nil {
-			initialLease.StopRenew()
-			_ = journal.QueueCurrentUnbindForUnmount()
-			_ = journal.DrainPendingUnbinds(context.Background(), unbindFn)
-		}
-	}()
 
 	if err := validateRemoteRoot(ctx, viewClient, remoteRoot); err != nil {
 		return nil, err

@@ -821,7 +821,20 @@ func newTestHandler(t *testing.T, f *fakeV2, threshold int64) *Handler {
 		CacheDir:   engineCacheDir(t),
 	})
 	bus := fs.NewEventBus()
-	return New(Options{Engine: eng, Threshold: threshold, Events: bus})
+	h := New(Options{Engine: eng, Threshold: threshold, Events: bus})
+	t.Cleanup(func() {
+		h.mu.Lock()
+		var open []*engineHandle
+		for _, list := range h.handles {
+			open = append(open, list...)
+		}
+		h.mu.Unlock()
+		for _, eh := range open {
+			_ = eh.Release(context.Background())
+		}
+		_ = h.Stop(context.Background())
+	})
+	return h
 }
 
 func TestEngineClaimsExtentFile(t *testing.T) {

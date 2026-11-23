@@ -40,6 +40,7 @@ type mountRuntime struct {
 	staging    *staging.Staging
 	syncMode   string
 	policy     writeback.Policy
+	stopped    bool
 }
 
 func (r *mountRuntime) closeStaging() {
@@ -56,6 +57,9 @@ func (r *mountRuntime) stop(ctx context.Context) error {
 	if r.layerLease != nil {
 		r.layerLease.StopRenew()
 	}
+	if r.stopped {
+		return nil
+	}
 	if r.fs != nil {
 		if err := r.fs.chain.Stop(ctx); err != nil {
 			return err
@@ -66,6 +70,7 @@ func (r *mountRuntime) stop(ctx context.Context) error {
 		r.fs.inodes.ReleaseMemoryBudget()
 	}
 	r.closeStaging()
+	r.stopped = true
 	return nil
 }
 

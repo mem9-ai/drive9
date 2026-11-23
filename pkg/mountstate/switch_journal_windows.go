@@ -47,3 +47,7 @@ func (j *SwitchJournal) QueueCurrentUnbindForUnmount() error {
 func (j *SwitchJournal) DrainPendingUnbinds(context.Context, func(context.Context, PendingUnbind) error) error {
 	return errSwitchJournalUnsupported
 }
+
+func DrainPriorScopeJournals(context.Context, string, string, func(context.Context, PendingUnbind) error) (bool, error) {
+	return false, errSwitchJournalUnsupported
+}

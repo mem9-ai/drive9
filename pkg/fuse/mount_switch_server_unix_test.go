@@ -73,6 +73,9 @@ func (b *fakeSwitchBackend) serveLayersSubpath(w http.ResponseWriter, r *http.Re
 		}
 	case sub == "/renew-mount" && r.Method == http.MethodPost:
 		b.renewCnt++
+		if b.onRenew != nil {
+			b.onRenew(layerID)
+		}
 		var req client.LayerMountRenewRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		if st.Info.Fence%2 != 1 || st.Info.Fence != req.Fence || st.OwnerMountID != req.MountID {

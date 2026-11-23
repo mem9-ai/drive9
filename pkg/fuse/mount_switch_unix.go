@@ -209,26 +209,26 @@ func (s *mountViewSwitch) apply(ctx context.Context, req mountcontrol.SwitchRequ
 	}
 	isMain, layerRef, _ := req.NormalizedTarget()
 
-	if !req.Recover {
-		if prior, ok := s.journal.Operation(req.OperationID); ok {
-			if prior.FromGeneration != req.ExpectedGeneration || !s.targetMatchesReplay(ctx, isMain, layerRef, prior.Target) {
-				return switchErrResp(req, viewprotocol.CodeConflict, "CONFLICT", mountstate.ErrSwitchConflict)
-			}
-			switch prior.State {
-			case mountstate.SwitchDone:
-				return mountcontrol.SwitchResponse{MountID: snap.MountID, OperationID: req.OperationID, Receipt: &prior}
-			case mountstate.SwitchTargetRevoked:
+	if prior, ok := s.journal.Operation(req.OperationID); ok {
+		if prior.FromGeneration != req.ExpectedGeneration || !s.targetMatchesReplay(ctx, isMain, layerRef, prior.Target) {
+			return switchErrResp(req, viewprotocol.CodeConflict, "CONFLICT", mountstate.ErrSwitchConflict)
+		}
+		switch prior.State {
+		case mountstate.SwitchDone:
+			return mountcontrol.SwitchResponse{MountID: snap.MountID, OperationID: req.OperationID, Receipt: &prior}
+		case mountstate.SwitchTargetRevoked:
+			if !req.Recover {
 				return mountcontrol.SwitchResponse{
 					MountID: snap.MountID, OperationID: req.OperationID, Receipt: &prior,
 					Code: viewprotocol.CodeSwitchTargetRevoked, ErrorKind: "TARGET_REVOKED", Error: "target layer or lease was revoked",
 				}
-			case mountstate.SwitchRecovering:
-				if snap.Pending != nil && snap.Pending.OperationID == req.OperationID {
-					return s.finishPendingLocked(ctx, req.OperationID)
-				}
 			}
-			return switchErrResp(req, viewprotocol.CodeConflict, "CONFLICT", mountstate.ErrSwitchConflict)
+		case mountstate.SwitchRecovering:
+			if snap.Pending != nil && snap.Pending.OperationID == req.OperationID {
+				return s.finishPendingLocked(ctx, req.OperationID)
+			}
 		}
+		return switchErrResp(req, viewprotocol.CodeConflict, "CONFLICT", mountstate.ErrSwitchConflict)
 	}
 
 	recoveringFromRevoked := s.recoveringPaused
@@ -251,9 +251,18 @@ func (s *mountViewSwitch) apply(ctx context.Context, req mountcontrol.SwitchRequ
 				s.pendingLease.StopRenew()
 				s.pendingLease = nil
 			}
+			if s.current != nil && s.current.layerLease != nil {
+				s.current.layerLease.StopRenew()
+			}
 			if s.pendingTarget != nil {
-				_ = s.pendingTarget.stop(ctx)
-				s.pendingTarget = nil
+				if s.pendingInstalled {
+					s.current = s.pendingTarget
+					s.pendingTarget = nil
+					s.pendingInstalled = false
+				} else {
+					_ = s.pendingTarget.stop(ctx)
+					s.pendingTarget = nil
+				}
 			}
 			s.pendingInstalled = false
 			if _, aerr := s.journal.AbortPendingForRecover(snap.Pending.OperationID); aerr != nil {
