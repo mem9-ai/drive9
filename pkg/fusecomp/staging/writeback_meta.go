@@ -1075,10 +1075,43 @@ func (c *WriteBackCache) MarkCacheLineage(remotePath string, lineage, expectedGe
 // The .dat file is moved via os.Rename (no data copy); only the .meta is
 // rewritten with the new path and a fresh generation.
 // Returns true if there was a pending entry to rename.
+// RenamePending moves a staged pair to a new name and carries its view-loss
+// record with the name.
 func (c *WriteBackCache) RenamePending(oldPath, newPath string) bool {
 	if oldPath == newPath {
 		return false // no-op rename
 	}
+	ok, missing := c.renamePendingLocal(oldPath, newPath)
+	if !ok {
+		if missing {
+			// The .dat vanished before this rename: the image is gone. Prune the
+			// orphaned metadata and record the loss on the source name, which the
+			// caller's rekey carries to the destination.
+			pl := c.AcquirePathLock(oldPath)
+			c.mu.Lock()
+			gen := uint64(0)
+			if meta, found := c.metas[oldPath]; found && meta != nil {
+				gen = meta.Generation
+			}
+			c.pruneEntryLocked(oldPath, false)
+			c.mu.Unlock()
+			c.ReleasePathLock(oldPath, pl)
+			c.reportViewLoss(oldPath, gen, os.ErrNotExist)
+		}
+		return false
+	}
+	// The destination's previous incarnation is gone: its stale marker must not
+	// keep failing barriers on the image that now lives there.
+	c.ClearViewLoss(newPath)
+	// The obligation moves with the name.
+	c.RekeyViewLoss(oldPath, newPath)
+	return true
+}
+
+// renamePendingLocal moves the .dat/.meta pair and the in-memory entry. The
+// second result reports that the payload file was already missing (ENOENT),
+// which is a lost image rather than an unexpected failure.
+func (c *WriteBackCache) renamePendingLocal(oldPath, newPath string) (bool, bool) {
 	// Acquire path locks in sorted order to avoid deadlock.
 	first, second := oldPath, newPath
 	if second < first {
@@ -1099,14 +1132,14 @@ func (c *WriteBackCache) RenamePending(oldPath, newPath string) bool {
 
 	meta, ok := c.metas[oldPath]
 	if !ok {
-		return false
+		return false, false
 	}
 	updated := cloneWriteBackMeta(meta)
 
 	// Rename .dat file directly — same directory, no data copy needed.
 	newDat := c.DatFile(newPath)
 	if err := os.Rename(oldDat, newDat); err != nil {
-		return false
+		return false, errors.Is(err, os.ErrNotExist)
 	}
 
 	// Write new .meta with updated path and fresh generation.
@@ -1117,13 +1150,13 @@ func (c *WriteBackCache) RenamePending(oldPath, newPath string) bool {
 	metaBytes, err := json.Marshal(updated)
 	if err != nil {
 		_ = os.Rename(newDat, oldDat)
-		return false
+		return false, false
 	}
 	newMeta := c.MetaFile(newPath)
 	if err := atomicWrite(newMeta, metaBytes); err != nil {
 		// Restore .dat to old location on meta-write failure.
 		_ = os.Rename(newDat, oldDat)
-		return false
+		return false, false
 	}
 
 	// Remove old meta and update index.
@@ -1136,7 +1169,7 @@ func (c *WriteBackCache) RenamePending(oldPath, newPath string) bool {
 		c.deleteDataLocked(newPath)
 		c.cacheDataLocked(newPath, data, int64(len(data)))
 	}
-	return true
+	return true, false
 }
 
 // ListPendingPaths returns the set of remote paths that have pending entries.

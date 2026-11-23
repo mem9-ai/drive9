@@ -2317,8 +2317,11 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		// name is gone and the destination now holds a landed object, so a
 		// record at either would fail a barrier on a name whose image is fine.
 		if w.wbCache != nil {
-			w.wbCache.ClearViewLoss(op.Path)
+			// The destination's replaced incarnation loses its record; the
+			// source's obligation follows the name (an in-window prune of the
+			// source must not read as a landed image at the destination).
 			w.wbCache.ClearViewLoss(op.Path2)
+			w.wbCache.RekeyViewLoss(op.Path, op.Path2)
 		}
 		// The final publication fence: between the transition above and the
 		// handle move just done, an open writer could still stage (and
@@ -2356,7 +2359,6 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			// replaces.
 			dstLossPrefix := strings.TrimSuffix(op.Path2, "/") + "/"
 			w.wbCache.ClearViewLossPrefix(dstLossPrefix)
-			w.wbCache.ClearViewLoss(op.Path2)
 			w.wbCache.RekeyViewLossPrefix(prefix, dstLossPrefix)
 			for _, entry := range w.wbCache.ListByPrefix(prefix) {
 				target := op.Path2 + strings.TrimPrefix(entry.Path, op.Path)

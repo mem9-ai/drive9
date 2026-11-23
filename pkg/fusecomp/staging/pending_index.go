@@ -2,6 +2,7 @@ package staging
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -185,8 +186,22 @@ func (idx *PendingIndex) RecoverFromDisk() error {
 	idx.mu.Unlock()
 
 	idx.advanceNextGen(maxGen)
+	removed := false
 	for _, p := range eclipsed {
-		_ = os.Remove(p)
+		if err := os.Remove(p); err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("pending index recovery remove %s: %w", p, err)
+			}
+			continue
+		}
+		removed = true
+	}
+	if removed {
+		// A settled fence must not be bypassed by an eclipsed .meta that a power
+		// loss could restore.
+		if err := fsyncDir(idx.dir); err != nil {
+			return fmt.Errorf("pending index recovery sync: %w", err)
+		}
 	}
 	return nil
 }
@@ -647,9 +662,20 @@ func (t *PendingConflictTransfer) Commit() (bool, error) {
 	cp := *t.prepared
 	t.idx.items[t.newPath] = &cp
 	delete(t.idx.items, t.oldPath)
+	// Both names changed incarnation: a landed fence at either endpoint would
+	// mask the marker that now lives at the destination (or the dead source).
+	t.idx.ensureCommittedFencesLoadedLocked()
+	clearedOld := t.idx.clearCommittedFenceLocked(t.oldPath)
+	clearedNew := t.idx.clearCommittedFenceLocked(t.newPath)
 	t.idx.mu.Unlock()
 
 	_ = os.Remove(filepath.Join(t.idx.dir, HashPath(t.oldPath)+".meta"))
+	if clearedOld {
+		t.idx.removeFenceFile(t.oldPath)
+	}
+	if clearedNew {
+		t.idx.removeFenceFile(t.newPath)
+	}
 	safeLogPrintf("pending: conflict marker moved %s -> %s (gen %d -> %d)", t.oldPath, t.newPath, t.expectedOldGen, t.prepared.Generation)
 	return true, nil
 }

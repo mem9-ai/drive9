@@ -422,3 +422,67 @@ func TestListPendingKeepsEntriesOnTransientReadErrors(t *testing.T) {
 		t.Fatal("a transient read error recorded a loss")
 	}
 }
+
+// TestClearViewLossDoesNotFsyncWhenNothingIsRecorded pins the hot path: a
+// healthy mount has no markers, and a clear runs on every Put, so it must not
+// sync the cache directory just to discover there is nothing to remove.
+func TestClearViewLossDoesNotFsyncWhenNothingIsRecorded(t *testing.T) {
+	dir := t.TempDir()
+	c, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A read-only cache directory makes any attempted fsync/removal fail loudly:
+	// the clear must not even try when no marker exists.
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	c.ClearViewLossIfGeneration("/healthy.txt", 5)
+	c.ClearViewLoss("/healthy.txt")
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestRenamePendingCarriesTheLossRecord pins the pair-move rule: the marker
+// moves with the .dat/.meta pair, and the destination's replaced marker is gone.
+func TestRenamePendingCarriesTheLossRecord(t *testing.T) {
+	c, err := NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Put("/old.txt", []byte("payload"), 7, PendingNew); err != nil {
+		t.Fatal(err)
+	}
+	c.writeViewLoss("/old.txt", 7, os.ErrNotExist)
+	c.writeViewLoss("/new.txt", 3, os.ErrNotExist)
+	if !c.RenamePending("/old.txt", "/new.txt") {
+		t.Fatal("rename did not move the staged pair")
+	}
+	if err := c.ViewLoss("/new.txt"); err == nil {
+		t.Fatal("the loss record did not follow the renamed pair")
+	}
+	if err := c.ViewLoss("/old.txt"); err != nil {
+		t.Fatal("the old name kept its loss record")
+	}
+}
+
+// TestHasViewLossPrefixFailsClosed pins the read-side rule: an unreadable marker
+// must report a loss (true) so a directory rename cannot move over it.
+func TestHasViewLossPrefixFailsClosed(t *testing.T) {
+	c, err := NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(c.lostFile("/corrupt.txt"), []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c.writeViewLoss("/tree/lost.txt", 4, os.ErrNotExist)
+	if !c.HasViewLossPrefix("/tree/") {
+		t.Fatal("a recorded loss under the prefix was not reported")
+	}
+	if !c.HasViewLossPrefix("/corrupt.txt") {
+		t.Fatal("an unreadable marker did not fail closed")
+	}
+}

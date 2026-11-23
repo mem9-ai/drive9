@@ -284,13 +284,13 @@ func (idx *PendingIndex) pendingGeneration(remotePath string) (uint64, bool) {
 func settleShadowGen(shadows *ShadowStore, fence CommittedFence) (ContentGen, bool) {
 	active := shadows.ActiveGeneration(fence.Path)
 	switch {
+	case fence.ShadowGen == 0:
+		// The landing already removed its shadow durably; nothing to do.
+		return 0, false
 	case active == 0:
 		// Cold store: writeGen is in-memory, so a pre-crash generation cannot
 		// match. Remove by wildcard, which unlinks the disk file directly.
 		return 0, true
-	case fence.ShadowGen == 0:
-		// The landing already removed its shadow durably; nothing to do.
-		return 0, false
 	case active == fence.ShadowGen:
 		return active, true
 	default:
