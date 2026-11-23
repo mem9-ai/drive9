@@ -1368,7 +1368,8 @@ func (idx *PendingIndex) publishRecoveredMeta(metaBytes []byte) error {
 	}
 	idx.mu.Lock()
 	idx.ensureCommittedFencesLoadedLocked()
-	if idx.fencesErr != nil {
+	if !idx.fencesLoaded {
+		// Directory scan failed: fail closed for every path.
 		idx.mu.Unlock()
 		return nil
 	}

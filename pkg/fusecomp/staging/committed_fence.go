@@ -142,9 +142,11 @@ func (idx *PendingIndex) CommittedFence(remotePath string) (CommittedFence, bool
 	idx.ensureCommittedFencesLoaded()
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
-	if idx.fencesErr != nil {
-		// The scan failed, so nothing can be proven about this path: mask it
-		// rather than let a replay resurrect a landed image.
+	if !idx.fencesLoaded {
+		// The directory scan has not succeeded, so nothing can be proven about
+		// this path: mask it rather than let a replay resurrect a landed image.
+		// A single undecodable fence is narrower — it only masks its own hash
+		// through fenceMask below.
 		return CommittedFence{Path: remotePath, Generation: ^uint64(0), JournalSeq: ^uint64(0)}, true
 	}
 	if _, masked := idx.fenceMask[HashPath(remotePath)]; masked {

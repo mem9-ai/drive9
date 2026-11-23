@@ -1013,16 +1013,16 @@ func (w *Writeback) pathTerminalFailure(path string) error {
 	if w == nil {
 		return nil
 	}
-	if w.queue != nil {
-		if err := w.queue.PathTerminalFailure(path); err != nil {
+	if w.wbCache != nil {
+		// The durable marker answers first: it outlives the process, and a
+		// queue-recorded error for another reason must not mask the lost image
+		// (the barrier needs the ErrStagedViewLost reason to fail closed).
+		if err := w.wbCache.ViewLoss(path); err != nil {
 			return err
 		}
 	}
-	if w.wbCache != nil {
-		// The durable marker outlives the process, so it answers even when the
-		// queue's in-memory failure map came up empty after a restart. Checking
-		// only the queue here is what let Sync/DrainFlush certify a pruned pair.
-		return w.wbCache.ViewLoss(path)
+	if w.queue != nil {
+		return w.queue.PathTerminalFailure(path)
 	}
 	return nil
 }
@@ -1052,11 +1052,11 @@ func (w *Writeback) Drain(ctx context.Context) error {
 	w.liveSet.Range(func(key, _ any) bool {
 		if h, ok := key.(*bufferingHandle); ok {
 			hctx, cf := context.WithTimeout(ctx, 30*time.Second)
-			// A lost staged image is not a debuggable per-path state like a
-			// terminal conflict (which the handle reports on its own Sync): the
-			// pair is gone, no work remains for the uploader or the queue, and
-			// the drain would otherwise certify a file whose image never landed.
-			if err := h.DrainFlush(hctx); err != nil && firstErr == nil && errors.Is(err, staging.ErrStagedViewLost) {
+			// A drain must not certify a file whose bytes it could not publish.
+			// The one exception is a path whose image is durably preserved for
+			// manual recovery (a recorded conflict): that handle reports the
+			// failure on its own Sync, and the drain's job is to settle the rest.
+			if err := h.DrainFlush(hctx); err != nil && firstErr == nil && !w.preservedForRecovery(h.path) {
 				firstErr = err
 			}
 			cf()
@@ -5838,7 +5838,28 @@ func (w *Writeback) DrainPending() (string, int) {
 	if n := w.DirtyHandleCount(); n > 0 {
 		return "dirty_handles", n
 	}
+	// A pruned pair whose path no longer has an open handle (closed, or a fresh
+	// process after a restart) is invisible to every counter above: the durable
+	// marker is the only evidence that its bytes never landed.
+	if w.wbCache != nil {
+		if n := w.wbCache.ViewLossCount(); n > 0 {
+			return "lost_staged_images", n
+		}
+	}
 	return "", 0
+}
+
+// preservedForRecovery reports whether the path's unlanded image is durably
+// preserved as a conflict for manual recovery.
+func (w *Writeback) preservedForRecovery(path string) bool {
+	if w == nil || w.opts.Staging == nil || w.opts.Staging.Pending == nil {
+		return false
+	}
+	meta, ok := w.opts.Staging.Pending.GetMeta(path)
+	if !ok || meta == nil {
+		return false
+	}
+	return meta.Kind == staging.PendingConflict
 }
 
 // markLinked is markUnlinked's rollback: a failed remote DELETE must not

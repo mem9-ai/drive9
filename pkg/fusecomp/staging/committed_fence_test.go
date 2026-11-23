@@ -509,3 +509,36 @@ func TestUnreadableCommittedFenceFailsClosed(t *testing.T) {
 		t.Fatalf("settle removed an unreadable fence: %v", err)
 	}
 }
+
+// TestUnreadableFenceMasksOnlyItsOwnPath pins the mask scope: one corrupt fence
+// must fail closed for its own hash without freezing every other path (a
+// directory-scan failure is the case that masks globally).
+func TestUnreadableFenceMasksOnlyItsOwnPath(t *testing.T) {
+	idx, dir := newFenceTestIndex(t)
+	corrupt := "/corrupt-only.txt"
+	healthy := "/healthy.txt"
+	if err := os.WriteFile(filepath.Join(dir, HashPath(corrupt)+".fence"), []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gen, err := idx.Put(healthy, 3, PendingNew)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := idx.MarkCommittedIfGeneration(healthy, gen, 0); err != nil {
+		t.Fatal(err)
+	}
+	if fence, ok := idx.CommittedFence(corrupt); !ok || fence.Generation != ^uint64(0) {
+		t.Fatalf("corrupt path fence = %+v, %v; want it masked", fence, ok)
+	}
+	fence, ok := idx.CommittedFence(healthy)
+	if !ok {
+		t.Fatal("the healthy path lost its own fence")
+	}
+	if fence.Generation != gen {
+		t.Fatalf("healthy fence = %+v, want its real generation %d", fence, gen)
+	}
+	// A path with no fence at all must still report none.
+	if _, ok := idx.CommittedFence("/unrelated.txt"); ok {
+		t.Fatal("an unrelated path was masked by one corrupt fence")
+	}
+}

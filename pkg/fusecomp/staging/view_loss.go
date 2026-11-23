@@ -341,3 +341,45 @@ func (c *WriteBackCache) RekeyViewLossPrefix(oldPrefix, newPrefix string) {
 		_ = os.Remove(c.lostFile(oldPath))
 	}
 }
+
+// ViewLossCount reports how many unresolved view losses are on record. It is the
+// only signal a drain has for a pruned pair whose path no longer has an open
+// handle (closed, or a fresh process after a restart).
+func (c *WriteBackCache) ViewLossCount() int {
+	if c == nil {
+		return 0
+	}
+	c.mu.Lock()
+	count := len(c.lostGens)
+	c.mu.Unlock()
+	entries, err := os.ReadDir(c.dir)
+	if err != nil {
+		return count
+	}
+	seen := make(map[string]struct{}, count)
+	c.mu.Lock()
+	for path := range c.lostGens {
+		seen[path] = struct{}{}
+	}
+	c.mu.Unlock()
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".lost") {
+			continue
+		}
+		raw, rerr := os.ReadFile(filepath.Join(c.dir, name))
+		if rerr != nil {
+			continue
+		}
+		var loss ViewLoss
+		if jerr := json.Unmarshal(raw, &loss); jerr != nil || loss.Path == "" {
+			continue
+		}
+		if _, ok := seen[loss.Path]; ok {
+			continue
+		}
+		seen[loss.Path] = struct{}{}
+		count++
+	}
+	return count
+}

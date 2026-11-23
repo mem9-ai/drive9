@@ -438,3 +438,37 @@ func TestDrainFailsWhenAStagedPairWasPruned(t *testing.T) {
 		t.Fatal("drain reported success after the staged pair was pruned")
 	}
 }
+
+// TestDrainPendingReportsLostImageAfterClose pins the gap the drain counters
+// had: a pruned pair whose path has no open handle (closed, or a fresh process
+// after a restart) has no dirty buffer and no queue entry, so only the durable
+// view-loss marker is left to report that the bytes never landed.
+func TestDrainPendingReportsLostImageAfterClose(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	backend := testbackend.NewBackend()
+	cache, err := staging.NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, wb := newReviewDrainStack(t, http.HandlerFunc(backend.ServeHTTP), cache)
+	// A staged pair with no handle behind it: this is what a restart, or a
+	// closed writer whose pair was pruned by a later read, looks like.
+	if err := cache.Put("/closed.bin", []byte("staged image"), 12, staging.PendingNew); err != nil {
+		t.Fatal(err)
+	}
+	cache.DropInMemoryPayload("/closed.bin")
+	if err := os.WriteFile(cache.DatFile("/closed.bin"), []byte("different bytes!"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := cache.Get("/closed.bin"); ok {
+		t.Fatal("read served a torn pair")
+	}
+	if err := wb.Drain(ctx); err != nil {
+		t.Fatalf("drain before the loss check: %v", err)
+	}
+	kind, n := wb.DrainPending()
+	if kind != "lost_staged_images" || n == 0 {
+		t.Fatalf("DrainPending = %q, %d; want the lost staged image", kind, n)
+	}
+}

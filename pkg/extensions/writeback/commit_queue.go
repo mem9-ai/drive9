@@ -1520,9 +1520,10 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) error {
 	var removalErr error
 	if cq.shadows != nil && cq.shadows.Has(path) {
 		hadLocal = true
-		if !preserveLocal {
-			cq.shadows.Remove(path)
-		}
+		// The actual removal is deferred below: while the WAL marker is still
+		// unwritten, the shadow is the only recovery source, and removing it
+		// first would both lose the image and (worse) leave the name replayable
+		// from frames that nothing fences.
 	}
 	// The pending entry dies only once the recovery source is CONFIRMED
 	// gone: it is the overlay lookups serve from, and a failed unlink must
@@ -1548,6 +1549,15 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) error {
 	// No WAL (or nothing staged): without frames there is nothing to fence,
 	// and a journal-less queue keeps the preserve-local contract verbatim.
 	if cq.journal == nil || !hadLocal {
+		if !preserveLocal && cq.shadows != nil {
+			// No frames to fence: the unlink itself is the only authority, so it
+			// must be durable. There is no replay source without a WAL, so a
+			// failure is logged rather than failing the unlink (which would keep
+			// a name the caller was allowed to drop).
+			if _, rerr := cq.shadows.RemoveIfGenerationDurable(path, 0); rerr != nil {
+				safeLogPrintf("commit queue: shadow removal for %s was not durable: %v", path, rerr)
+			}
+		}
 		dropPending()
 		cq.clearTerminalFailure(path)
 		return nil
@@ -1560,29 +1570,36 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) error {
 		Path: path,
 	})
 	if appendErr == nil {
-		// The marker fences every frame published before it — the path
-		// cannot replay even if the removal above silently failed.
+		// The marker fences every frame published before it, so the local image
+		// can go. A non-preserving cancel removes it durably here, after the
+		// fence exists.
+		if !preserveLocal && cq.shadows != nil {
+			_, _ = cq.shadows.RemoveIfGenerationDurable(path, 0)
+		}
 		dropPending()
 		cq.clearTerminalFailure(path)
 		return nil
 	}
 	safeLogPrintf("commit queue: journal cancel marker failed for %s: %v", path, appendErr)
-	if preserveLocal {
-		// The retained shadow/index are safe only while the marker fences
-		// their WAL frames: without it a crash replays them. Fall back to
-		// the non-preserving cleanup below.
-		if cq.shadows != nil {
-			// Durable removal: this path is the fallback for a marker that could
-			// not be fsynced, so the unlink itself must survive a power loss or
-			// replay resurrects the deleted name.
-			if _, rerr := cq.shadows.RemoveIfGenerationDurable(path, 0); rerr != nil {
-				removalErr = rerr
-			}
-		}
+	// A marker that could not be fsynced fences nothing, so BOTH policies must
+	// fall back to the durable unlink: the shadow cannot stay (a crash would
+	// replay it) and it cannot be removed with a page-cache unlink alone (power
+	// loss would revert that).
+	removed := false
+	if cq.shadows != nil {
+		// Durable removal: this path is the fallback for a marker that could not
+		// be fsynced, so the unlink itself must survive a power loss or replay
+		// resurrects the deleted name.
+		removed, removalErr = cq.shadows.RemoveIfGenerationDurable(path, 0)
 	}
-	// The durable removal reports its own verdict; VerifyRemoved used to check
-	// from outside the shadow path lock and raced a concurrent spill.
-	if cq.shadows == nil || (removalErr == nil && !cq.shadows.Has(path)) {
+	// Absence is only proven by the durable removal plus a verifier that cannot
+	// mistake "stat failed" for "file is gone" (EACCES/EIO on an unwritable
+	// directory).
+	absent := cq.shadows == nil
+	if cq.shadows != nil && removalErr == nil && (removed || cq.shadows.VerifyRemoved(path) == nil) {
+		absent = true
+	}
+	if absent {
 		// Confirmed gone — finish the degrade-to-non-preserving cleanup
 		// (the anonymous fd loses its staged image on a failing WAL, but
 		// the unlink cannot resurrect).
