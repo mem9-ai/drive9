@@ -1053,9 +1053,7 @@ func (w *Writeback) Stop(ctx context.Context) error {
 // would undo. The anonymous marking is rolled back on that path.
 func (w *Writeback) MarkPathUnlinked(p string) error {
 	marked, _ := w.markUnlinkedSnapshot(p, false)
-	if w.uploader != nil {
-		w.uploader.WaitQueuedOrActive(p)
-	}
+	w.waitUploaderPath(p)
 	pUnlock := w.pathLocks.lock(p)
 	pUnlock()
 	// The name is going away NOW (the facade invokes this before FS.Unlink
@@ -1090,9 +1088,7 @@ func (w *Writeback) MarkPathUnlinked(p string) error {
 			// staging survived — the replayable frames now correctly
 			// describe a file that was never unlinked.
 			restoreMarked(marked)
-			if w.wbCache != nil && w.uploader != nil && w.wbCache.HasMeta(p) && w.handleFor(p) == nil {
-				w.uploader.Submit(p)
-			}
+			w.submitOrphanedCacheForRollback(p, false)
 			return err
 		}
 	}
@@ -1802,12 +1798,10 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		// An in-flight or queued .dat/.meta upload must land before the DELETE:
 		// it would otherwise resurrect the path after the unlink (unlink/14:
 		// re-create hits EEXIST against the resurrected name).
-		if w.uploader != nil {
-			w.uploader.WaitQueuedOrActive(op.Path)
-			if under && w.wbCache != nil {
-				for _, entry := range w.wbCache.ListByPrefix(prefix) {
-					w.uploader.WaitQueuedOrActive(entry.Path)
-				}
+		w.waitUploaderPath(op.Path)
+		if under && w.wbCache != nil {
+			for _, entry := range w.wbCache.ListByPrefix(prefix) {
+				w.waitUploaderPath(entry.Path)
 			}
 		}
 		// Staged entries die with their path — but only AFTER the remote
@@ -1843,12 +1837,10 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			return nil
 		}
 		w.markUnlinked(op.Path, under)
-		if w.uploader != nil {
-			w.uploader.WaitQueuedOrActive(op.Path)
-			if under && w.wbCache != nil {
-				for _, entry := range w.wbCache.ListByPrefix(prefix) {
-					w.uploader.WaitQueuedOrActive(entry.Path)
-				}
+		w.waitUploaderPath(op.Path)
+		if under && w.wbCache != nil {
+			for _, entry := range w.wbCache.ListByPrefix(prefix) {
+				w.waitUploaderPath(entry.Path)
 			}
 		}
 		uUnlock := w.pathLocks.lock(op.Path)
@@ -1856,18 +1848,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		rollback := func() {
 			w.markLinked(op.Path, under)
 			w.dropUnlinkedShadow(op.Path)
-			if w.wbCache != nil && w.uploader != nil {
-				if w.wbCache.HasMeta(op.Path) && w.handleFor(op.Path) == nil {
-					w.uploader.Submit(op.Path)
-				}
-				if under {
-					for _, entry := range w.wbCache.ListByPrefix(prefix) {
-						if w.handleFor(entry.Path) == nil {
-							w.uploader.Submit(entry.Path)
-						}
-					}
-				}
-			}
+			w.submitOrphanedCacheForRollback(op.Path, under)
 		}
 		_, statErr := w.opts.Client.StatCtx(ctx, w.remotePath(op.Path))
 		if statErr != nil && !client.IsNotFound(statErr) {
@@ -1985,10 +1966,8 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			w.resolveLandedStaging(p, rev, supersedesGen, failureSeq)
 			return nil
 		}
-		if w.uploader != nil {
-			w.uploader.WaitQueuedOrActive(op.Path)
-			w.uploader.WaitQueuedOrActive(op.Path2)
-		}
+		w.waitUploaderPath(op.Path)
+		w.waitUploaderPath(op.Path2)
 		if err := land(op.Path); err != nil {
 			// The staged image is the acknowledged content of the old name;
 			// losing it to a failed upload and letting the rename move the
@@ -2127,33 +2106,34 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		// were reading: mark them anonymous BEFORE the remote rename (their
 		// clean images are snapshotted for post-overwrite reads), or they
 		// keep reading /b and silently see the source's bytes.
-		marked, serr := w.markUnlinkedSnapshot(op.Path2, false)
+		marked, serr := w.markUnlinkedSnapshot(op.Path2, true)
 		if serr != nil {
 			// The overwritten target's descriptors have no read source:
 			// abort instead of switching them to the source's bytes.
 			restoreMarked(marked)
+			w.submitOrphanedCacheForRollback(op.Path2, true)
 			return fs.Result{}, serr
 		}
-		if w.uploader != nil {
-			w.uploader.WaitQueuedOrActive(op.Path2)
-		}
-		var dstPreCacheGen uint64
+		w.waitUploaderPath(op.Path2)
+		var dstPreCachePutGen uint64
 		var dstPreCacheDescendants map[string]uint64
 		if w.wbCache != nil {
 			p2Unlock := w.pathLocks.lock(op.Path2)
 			if m, ok := w.wbCache.GetMeta(op.Path2); ok && m != nil {
-				dstPreCacheGen = m.Generation
+				dstPreCachePutGen = m.PutGen()
 			}
 			p2Unlock()
 			dstPrefix := strings.TrimSuffix(op.Path2, "/") + "/"
 			for _, entry := range w.wbCache.ListByPrefix(dstPrefix) {
-				if w.uploader != nil {
-					w.uploader.WaitQueuedOrActive(entry.Path)
+				w.waitUploaderPath(entry.Path)
+				dUnlock := w.pathLocks.lock(entry.Path)
+				if m, ok := w.wbCache.GetMeta(entry.Path); ok && m != nil {
+					if dstPreCacheDescendants == nil {
+						dstPreCacheDescendants = make(map[string]uint64)
+					}
+					dstPreCacheDescendants[entry.Path] = m.PutGen()
 				}
-				if dstPreCacheDescendants == nil {
-					dstPreCacheDescendants = make(map[string]uint64)
-				}
-				dstPreCacheDescendants[entry.Path] = entry.Generation
+				dUnlock()
 			}
 		}
 		res, err := next(ctx, op)
@@ -2161,23 +2141,15 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			// The rename failed: the target's descriptors are still bound
 			// to its object, so restore their writable/visible state.
 			restoreMarked(marked)
-			if dstPreCacheGen != 0 && w.wbCache != nil && w.uploader != nil &&
-				w.wbCache.HasMeta(op.Path2) && w.handleFor(op.Path2) == nil {
-				w.uploader.Submit(op.Path2)
-			}
-			for p := range dstPreCacheDescendants {
-				if w.wbCache != nil && w.uploader != nil && w.wbCache.HasMeta(p) && w.handleFor(p) == nil {
-					w.uploader.Submit(p)
-				}
-			}
+			w.submitOrphanedCacheForRollback(op.Path2, true)
 			return res, err
 		}
 		if w.wbCache != nil {
-			if dstPreCacheGen != 0 {
-				w.wbCache.RemoveIfGeneration(op.Path2, dstPreCacheGen)
+			if dstPreCachePutGen != 0 {
+				w.wbCache.RemoveIfPutGeneration(op.Path2, dstPreCachePutGen)
 			}
-			for p, gen := range dstPreCacheDescendants {
-				w.wbCache.RemoveIfGeneration(p, gen)
+			for p, putGen := range dstPreCacheDescendants {
+				w.wbCache.RemoveIfPutGeneration(p, putGen)
 			}
 		}
 		// The instant the rename RESPONSE arrived: pending state published
@@ -2297,7 +2269,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 				if w.opts.Staging != nil {
 					_ = w.opts.Staging.Shadow.Rename(entry.Path, target)
 				}
-				if moved && w.uploader != nil && w.handleFor(target) == nil {
+				if moved && w.uploader != nil && !w.hasUnclosedStagedCacheOwner(target) {
 					w.uploader.Submit(target)
 				}
 			}
@@ -5354,15 +5326,16 @@ func (w *Writeback) markUnlinkedSnapshot(p string, under bool) ([]*bufferingHand
 	w.liveSet.Range(func(key, _ any) bool {
 		h := key.(*bufferingHandle)
 		h.mu.Lock()
+		match := h.path == p || (under && strings.HasPrefix(h.path, prefix))
+		if match && h.submitDone != nil {
+			submitting = append(submitting, h.submitDone)
+		}
 		// A descriptor that is ALREADY anonymous serves another object's
 		// snapshot: it must not be re-marked (and its stale, shorter
 		// snapshot must not make this operation's target look read-only).
-		if (h.path == p || (under && strings.HasPrefix(h.path, prefix))) && !h.unlinked {
+		if match && !h.unlinked {
 			h.unlinked = true
 			marked = append(marked, h)
-			if h.submitDone != nil {
-				submitting = append(submitting, h.submitDone)
-			}
 			if h.buf == nil && !h.isNew && !h.dirty {
 				clean = append(clean, h)
 			}
@@ -5391,6 +5364,73 @@ func (w *Writeback) markUnlinkedSnapshot(p string, under bool) ([]*bufferingHand
 		}
 	}
 	return marked, firstErr
+}
+
+// waitUploaderPath waits for any in-progress Release->Submit handoff on path
+// and then blocks until path is neither queued nor active in the uploader.
+func (w *Writeback) waitUploaderPath(path string) {
+	if w == nil || w.uploader == nil {
+		return
+	}
+	w.regMu.Lock()
+	var submitting []chan struct{}
+	for h := range w.liveByPath[path] {
+		h.mu.Lock()
+		if h.path == path && h.submitDone != nil {
+			submitting = append(submitting, h.submitDone)
+		}
+		h.mu.Unlock()
+	}
+	w.regMu.Unlock()
+	for _, ch := range submitting {
+		<-ch
+	}
+	w.uploader.WaitQueuedOrActive(path)
+}
+
+// hasUnclosedStagedCacheOwner reports whether an open (non-releasing,
+// non-unlinked) handle at path holds a Flush-staged wbCache snapshot that its
+// future Release will submit. Read-only handles and handles already inside
+// Release do not own future submissions.
+func (w *Writeback) hasUnclosedStagedCacheOwner(path string) bool {
+	if w == nil {
+		return false
+	}
+	w.regMu.Lock()
+	handles := make([]*bufferingHandle, 0, len(w.liveByPath[path]))
+	for h := range w.liveByPath[path] {
+		handles = append(handles, h)
+	}
+	w.regMu.Unlock()
+	for _, h := range handles {
+		h.mu.Lock()
+		owns := h.path == path && !h.unlinked && !h.releasing && h.stagedToCache
+		h.mu.Unlock()
+		if owns {
+			return true
+		}
+	}
+	return false
+}
+
+// submitOrphanedCacheForRollback re-submits any wbCache snapshot at path (or
+// under path+"/" when under is true) whose staging writer closed while marked
+// anonymous during a failed namespace operation.
+func (w *Writeback) submitOrphanedCacheForRollback(path string, under bool) {
+	if w == nil || w.wbCache == nil || w.uploader == nil {
+		return
+	}
+	if w.wbCache.HasMeta(path) && !w.hasUnclosedStagedCacheOwner(path) {
+		w.uploader.Submit(path)
+	}
+	if under {
+		prefix := strings.TrimSuffix(path, "/") + "/"
+		for _, entry := range w.wbCache.ListByPrefix(prefix) {
+			if !w.hasUnclosedStagedCacheOwner(entry.Path) {
+				w.uploader.Submit(entry.Path)
+			}
+		}
+	}
 }
 
 // liveObjectSize is the size the snapshot must capture: the staged image

@@ -322,7 +322,12 @@ func (u *WriteBackUploader) Submit(localPath string) {
 	}
 	u.queueMu.Lock()
 	if u.stopped.Load() {
+		if u.activePaths == nil {
+			u.activePaths = make(map[string]int)
+		}
+		u.activePaths[localPath]++
 		u.queueMu.Unlock()
+		defer u.finishActivePaths(localPath)
 		safeLogPrintf("writeback uploader: already stopped, uploading synchronously for %s", localPath)
 		if u.perf != nil {
 			u.perf.uploaderSyncFallback.add(1)
@@ -359,7 +364,7 @@ func (u *WriteBackUploader) WaitQueuedOrActive(localPath string) {
 	}
 	for {
 		u.queueMu.Lock()
-		for !u.stopped.Load() && u.stateCond != nil {
+		for u.stateCond != nil {
 			_, queued := u.queuedSet[localPath]
 			if !queued && u.activePaths[localPath] == 0 {
 				break
@@ -371,9 +376,6 @@ func (u *WriteBackUploader) WaitQueuedOrActive(localPath string) {
 			return
 		}
 		u.WaitPath(localPath)
-		if u.stopped.Load() {
-			return
-		}
 	}
 }
 
@@ -391,9 +393,6 @@ func (u *WriteBackUploader) DrainAll() {
 		u.queueMu.Lock()
 		u.stopped.Store(true)
 		u.queueCond.Broadcast()
-		if u.stateCond != nil {
-			u.stateCond.Broadcast()
-		}
 		u.queueMu.Unlock()
 	})
 	u.wg.Wait()

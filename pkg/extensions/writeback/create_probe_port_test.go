@@ -998,6 +998,558 @@ func TestRenameOverFlushedTargetBeforeReleaseRetiresWriteBackCache(t *testing.T)
 	}
 }
 
+func TestRenameTargetChmodDuringInFlightRenameRetiresWriteBackCache(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	b := testbackend.NewBackend()
+	enteredRename, allowRename := make(chan struct{}), make(chan struct{})
+	var enteredOnce, allowOnce sync.Once
+	unblock := func() { allowOnce.Do(func() { close(allowRename) }) }
+	defer unblock()
+
+	srv := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && strings.Contains(r.URL.RawQuery, "rename") {
+			enteredOnce.Do(func() { close(enteredRename) })
+			select {
+			case <-allowRename:
+			case <-ctx.Done():
+				return
+			}
+		}
+		b.ServeHTTP(w, r)
+	})
+	chain, wb := newReviewDrainStack(t, srv, nil)
+
+	resOld, err := chain.Dispatch(ctx, &fs.Op{
+		Kind: fs.OpCreate, Path: "/dst",
+		Flags: uint32(syscall.O_CREAT | syscall.O_TRUNC | syscall.O_WRONLY), Mode: 0o644, HasMode: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := resOld.Handle.Write(ctx, 0, []byte("old\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := resOld.Handle.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	resNew, err := chain.Dispatch(ctx, &fs.Op{
+		Kind: fs.OpCreate, Path: "/src",
+		Flags: uint32(syscall.O_CREAT | syscall.O_TRUNC | syscall.O_WRONLY), Mode: 0o644, HasMode: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := resNew.Handle.Write(ctx, 0, []byte("new\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := resNew.Handle.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := resNew.Handle.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	renameDone := make(chan error, 1)
+	go func() {
+		_, rerr := chain.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/src", Path2: "/dst"})
+		renameDone <- rerr
+	}()
+
+	select {
+	case <-enteredRename:
+	case <-ctx.Done():
+		t.Fatal("rename RPC did not enter server")
+	}
+
+	// While remote rename is in flight, async FUSE_RELEASE untracks hOld and a
+	// concurrent chmod bumps WriteBackMeta.Generation via UpdateMode.
+	if err := resOld.Handle.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := chain.Dispatch(ctx, &fs.Op{
+		Kind: fs.OpSetAttr, Path: "/dst", Mode: 0o600, HasMode: true,
+	}); err != nil {
+		t.Fatalf("chmod during in-flight rename: %v", err)
+	}
+
+	unblock()
+	if err := <-renameDone; err != nil {
+		t.Fatalf("rename failed: %v", err)
+	}
+
+	rres, err := chain.Dispatch(ctx, &fs.Op{
+		Kind: fs.OpCreate, Path: "/dst", Flags: uint32(syscall.O_RDONLY),
+	})
+	if err != nil {
+		t.Fatalf("reopen /dst: %v", err)
+	}
+	buf := make([]byte, 16)
+	n, _ := rres.Handle.Read(ctx, 0, buf)
+	_ = rres.Handle.Release(ctx)
+	if string(buf[:n]) != "new\n" {
+		t.Fatalf("read /dst after rename = %q, want %q", string(buf[:n]), "new\n")
+	}
+	if err := wb.Drain(ctx); err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if reason, count := wb.DrainPending(); count != 0 {
+		t.Fatalf("DrainPending = (%q, %d), want empty", reason, count)
+	}
+
+	// Verify RemoveIfPutGeneration preserves a brand-new Put installed after the
+	// pre-rename snapshot while retiring a descendant whose Generation was bumped
+	// by UpdateMode.
+	if err := wb.wbCache.PutWithBaseRevAndMode("/fresh", []byte("v1"), 2, staging.PendingNew, 0, 0o644, false); err != nil {
+		t.Fatal(err)
+	}
+	m1, ok := wb.wbCache.GetMeta("/fresh")
+	if !ok {
+		t.Fatal("missing /fresh meta")
+	}
+	oldPutGen := m1.PutGen()
+	if err := wb.wbCache.PutWithBaseRevAndMode("/fresh", []byte("v2"), 2, staging.PendingNew, 0, 0o644, false); err != nil {
+		t.Fatal(err)
+	}
+	if wb.wbCache.RemoveIfPutGeneration("/fresh", oldPutGen) {
+		t.Fatal("RemoveIfPutGeneration removed a newer Put incarnation")
+	}
+	if data, ok := wb.wbCache.Get("/fresh"); !ok || string(data) != "v2" {
+		t.Fatalf("/fresh after stale RemoveIfPutGeneration = %q (ok=%v), want v2", data, ok)
+	}
+	if err := wb.wbCache.UpdateMode("/fresh", 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m2, ok := wb.wbCache.GetMeta("/fresh")
+	if !ok || m2.Generation <= m1.Generation {
+		t.Fatalf("expected UpdateMode to advance Generation, got %+v", m2)
+	}
+	if !wb.wbCache.RemoveIfPutGeneration("/fresh", m2.PutGen()) {
+		t.Fatal("RemoveIfPutGeneration failed to retire current PutGen after UpdateMode")
+	}
+}
+
+func TestFailedRenameAndDirRenameSubmitWithOpenReader(t *testing.T) {
+	t.Run("failed-rename-rollback-with-open-reader", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		b := testbackend.NewBackend()
+		enteredRename, allowRename := make(chan struct{}), make(chan struct{})
+		var enteredOnce, allowOnce sync.Once
+		unblock := func() { allowOnce.Do(func() { close(allowRename) }) }
+		defer unblock()
+
+		srv := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPost && strings.Contains(r.URL.RawQuery, "rename") {
+				enteredOnce.Do(func() { close(enteredRename) })
+				select {
+				case <-allowRename:
+				case <-ctx.Done():
+					return
+				}
+				http.Error(w, "rename unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			b.ServeHTTP(w, r)
+		})
+		chain, wb := newReviewDrainStack(t, srv, nil)
+
+		resOld, err := chain.Dispatch(ctx, &fs.Op{
+			Kind: fs.OpCreate, Path: "/dst",
+			Flags: uint32(syscall.O_CREAT | syscall.O_TRUNC | syscall.O_WRONLY), Mode: 0o644, HasMode: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := resOld.Handle.Write(ctx, 0, []byte("old\n")); err != nil {
+			t.Fatal(err)
+		}
+		if err := resOld.Handle.Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+
+		// Open an O_RDONLY handle over /dst's pending overlay so w.live tracks a
+		// non-staging reader on /dst across the failed rename rollback.
+		resRead, err := chain.Dispatch(ctx, &fs.Op{
+			Kind: fs.OpCreate, Path: "/dst", Flags: uint32(syscall.O_RDONLY),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		resSrc, err := chain.Dispatch(ctx, &fs.Op{
+			Kind: fs.OpCreate, Path: "/src",
+			Flags: uint32(syscall.O_CREAT | syscall.O_TRUNC | syscall.O_WRONLY), Mode: 0o644, HasMode: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := resSrc.Handle.Write(ctx, 0, []byte("new\n")); err != nil {
+			t.Fatal(err)
+		}
+		if err := resSrc.Handle.Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := resSrc.Handle.Release(ctx); err != nil {
+			t.Fatal(err)
+		}
+
+		renameDone := make(chan error, 1)
+		go func() {
+			_, rerr := chain.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/src", Path2: "/dst"})
+			renameDone <- rerr
+		}()
+
+		select {
+		case <-enteredRename:
+		case <-ctx.Done():
+			t.Fatal("rename RPC did not enter server")
+		}
+
+		// Writer closes while marked unlinked during the in-flight rename.
+		if err := resOld.Handle.Release(ctx); err != nil {
+			t.Fatal(err)
+		}
+
+		unblock()
+		if err := <-renameDone; err == nil {
+			t.Fatal("expected rename failure")
+		}
+		if err := resRead.Handle.Release(ctx); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := wb.Drain(ctx); err != nil {
+			t.Fatalf("Drain: %v", err)
+		}
+		if reason, count := wb.DrainPending(); count != 0 {
+			t.Fatalf("DrainPending = (%q, %d), want empty", reason, count)
+		}
+		node, ok := b.Node("/dst")
+		if !ok || string(node.Data) != "old\n" {
+			t.Fatalf("remote /dst after failed rename = %q (ok=%v), want %q", node.Data, ok, "old\n")
+		}
+	})
+
+	t.Run("failed-rename-rollback-during-inner-release", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		b := testbackend.NewBackend()
+		b.Seed("/dst", []byte("seed"))
+		enteredRename, allowRename := make(chan struct{}), make(chan struct{})
+		var enteredOnce, allowOnce sync.Once
+		unblockRename := func() { allowOnce.Do(func() { close(allowRename) }) }
+		defer unblockRename()
+
+		srv := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPost && strings.Contains(r.URL.RawQuery, "rename") {
+				enteredOnce.Do(func() { close(enteredRename) })
+				select {
+				case <-allowRename:
+				case <-ctx.Done():
+					return
+				}
+				http.Error(w, "rename unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			b.ServeHTTP(w, r)
+		})
+		chain, wb := newReviewDrainStack(t, srv, nil)
+
+		resOld := dispatchOpen(t, chain, "/dst", uint32(syscall.O_WRONLY|syscall.O_TRUNC))
+		bhOld := writebackHandleOf(resOld)
+		inner := bhOld.inner
+		enteredInnerRelease, allowInnerRelease := make(chan struct{}), make(chan struct{})
+		var innerOnce, allowInnerOnce sync.Once
+		unblockInner := func() { allowInnerOnce.Do(func() { close(allowInnerRelease) }) }
+		defer unblockInner()
+		bhOld.inner = releaseBlockingHandle{
+			Handle: inner,
+			onRelease: func() {
+				innerOnce.Do(func() { close(enteredInnerRelease) })
+				<-allowInnerRelease
+			},
+		}
+
+		if err := resOld.Write(ctx, 0, []byte("old-updated\n")); err != nil {
+			t.Fatal(err)
+		}
+		if err := resOld.Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+
+		resSrc, err := chain.Dispatch(ctx, &fs.Op{
+			Kind: fs.OpCreate, Path: "/src",
+			Flags: uint32(syscall.O_CREAT | syscall.O_TRUNC | syscall.O_WRONLY), Mode: 0o644, HasMode: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := resSrc.Handle.Write(ctx, 0, []byte("new\n")); err != nil {
+			t.Fatal(err)
+		}
+		if err := resSrc.Handle.Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := resSrc.Handle.Release(ctx); err != nil {
+			t.Fatal(err)
+		}
+
+		renameDone := make(chan error, 1)
+		go func() {
+			_, rerr := chain.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/src", Path2: "/dst"})
+			renameDone <- rerr
+		}()
+		<-enteredRename
+
+		// Pause hOld inside hOld.inner.Release(ctx), after skipping Submit (because
+		// unlinked==true) and before defer untrackAndLast removes hOld from w.live.
+		releaseDone := make(chan error, 1)
+		go func() {
+			releaseDone <- resOld.Release(ctx)
+		}()
+		<-enteredInnerRelease
+
+		// Let the rename fail and roll back while hOld is still tracked in w.live.
+		unblockRename()
+		if err := <-renameDone; err == nil {
+			t.Fatal("expected rename failure")
+		}
+		unblockInner()
+		if err := <-releaseDone; err != nil {
+			t.Fatal(err)
+		}
+
+		if err := wb.Drain(ctx); err != nil {
+			t.Fatalf("Drain: %v", err)
+		}
+		if reason, count := wb.DrainPending(); count != 0 {
+			t.Fatalf("DrainPending = (%q, %d), want empty", reason, count)
+		}
+		node, ok := b.Node("/dst")
+		if !ok || string(node.Data) != "old-updated\n" {
+			t.Fatalf("remote /dst = %q (ok=%v), want %q", node.Data, ok, "old-updated\n")
+		}
+	})
+
+	t.Run("dir-rename-pending-with-open-reader", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		b := testbackend.NewBackend()
+		chain, wb := newReviewDrainStack(t, b, nil)
+		if wb.queue != nil {
+			wb.queue.DrainAll()
+			wb.queue = nil
+		}
+
+		if _, err := chain.Dispatch(ctx, &fs.Op{Kind: fs.OpMkdir, Path: "/d1", Mode: 0o755}); err != nil {
+			t.Fatal(err)
+		}
+		if err := wb.wbCache.PutWithBaseRevAndMode("/d1/child.txt", []byte("child-v2\n"), 9, staging.PendingNew, 0, 0o644, false); err != nil {
+			t.Fatal(err)
+		}
+		resRead, err := chain.Dispatch(ctx, &fs.Op{
+			Kind: fs.OpCreate, Path: "/d1/child.txt", Flags: uint32(syscall.O_RDONLY),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := chain.Dispatch(ctx, &fs.Op{Kind: fs.OpRename, Path: "/d1", Path2: "/d2"}); err != nil {
+			t.Fatalf("dir rename /d1 -> /d2: %v", err)
+		}
+		if err := resRead.Handle.Release(ctx); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := wb.Drain(ctx); err != nil {
+			t.Fatalf("Drain: %v", err)
+		}
+		if reason, count := wb.DrainPending(); count != 0 {
+			t.Fatalf("DrainPending = (%q, %d), want empty", reason, count)
+		}
+		node, ok := b.Node("/d2/child.txt")
+		if !ok || string(node.Data) != "child-v2\n" {
+			t.Fatalf("remote /d2/child.txt = %q (ok=%v), want %q", node.Data, ok, "child-v2\n")
+		}
+	})
+}
+
+func TestOverlappingMarkUnlinkedSnapshotWaitsOnInFlightReleaseSubmit(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	b := testbackend.NewBackend()
+	chain, wb := newReviewDrainStack(t, b, nil)
+
+	res, err := chain.Dispatch(ctx, &fs.Op{
+		Kind: fs.OpCreate, Path: "/overlap.txt",
+		Flags: uint32(syscall.O_CREAT | syscall.O_TRUNC | syscall.O_WRONLY), Mode: 0o644, HasMode: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bh := writebackHandleOf(res.Handle)
+	if bh == nil {
+		t.Fatal("expected bufferingHandle")
+	}
+
+	submitGate := make(chan struct{})
+	bh.mu.Lock()
+	bh.submitDone = submitGate
+	bh.mu.Unlock()
+
+	firstEntered := make(chan struct{})
+	firstDone := make(chan struct{})
+	go func() {
+		close(firstEntered)
+		_, _ = wb.markUnlinkedSnapshot("/overlap.txt", false)
+		close(firstDone)
+	}()
+	<-firstEntered
+
+	// Wait until the first caller has flipped bh.unlinked = true and is blocked
+	// waiting on submitGate.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		bh.mu.Lock()
+		unlinked := bh.unlinked
+		bh.mu.Unlock()
+		if unlinked {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("first markUnlinkedSnapshot did not flip unlinked")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	secondDone := make(chan struct{})
+	go func() {
+		_, _ = wb.markUnlinkedSnapshot("/overlap.txt", false)
+		close(secondDone)
+	}()
+
+	select {
+	case <-secondDone:
+		t.Fatal("second overlapping markUnlinkedSnapshot returned before submitDone closed")
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	bh.mu.Lock()
+	bh.submitDone = nil
+	bh.mu.Unlock()
+	close(submitGate)
+
+	select {
+	case <-firstDone:
+	case <-ctx.Done():
+		t.Fatal("first markUnlinkedSnapshot did not complete")
+	}
+	select {
+	case <-secondDone:
+	case <-ctx.Done():
+		t.Fatal("second markUnlinkedSnapshot did not complete")
+	}
+	_ = res.Handle.Release(ctx)
+}
+
+func TestWaitQueuedOrActiveDoesNotReturnEarlyDuringDrainAll(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	b := testbackend.NewBackend()
+	enteredFirst, allowFirst := make(chan struct{}), make(chan struct{})
+	var enteredOnce, allowOnce sync.Once
+	unblock := func() { allowOnce.Do(func() { close(allowFirst) }) }
+	defer unblock()
+
+	var writeReqs atomic.Int32
+	srv := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if (r.Method == http.MethodPut || r.Method == http.MethodPost) && writeReqs.Add(1) == 1 {
+			enteredOnce.Do(func() { close(enteredFirst) })
+			select {
+			case <-allowFirst:
+			case <-ctx.Done():
+				return
+			}
+		}
+		b.ServeHTTP(w, r)
+	})
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	cli := client.New(ts.URL, "test-key")
+	cacheDir := t.TempDir()
+	cache, err := staging.NewWriteBackCache(cacheDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	up := NewWriteBackUploader(cli, cache, 1)
+	defer up.DrainAll()
+
+	if err := cache.PutWithBaseRev("/first.txt", []byte("one"), 3, staging.PendingNew, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.PutWithBaseRev("/second.txt", []byte("two"), 3, staging.PendingNew, 0); err != nil {
+		t.Fatal(err)
+	}
+	up.Submit("/first.txt")
+	select {
+	case <-enteredFirst:
+	case <-ctx.Done():
+		t.Fatal("first upload did not enter PUT")
+	}
+	up.Submit("/second.txt")
+
+	drainStarted := make(chan struct{})
+	drainDone := make(chan struct{})
+	go func() {
+		close(drainStarted)
+		up.DrainAll()
+		close(drainDone)
+	}()
+	<-drainStarted
+	for !up.stopped.Load() {
+		if time.Now().After(time.Now().Add(time.Second)) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	waitDone := make(chan struct{})
+	go func() {
+		up.WaitQueuedOrActive("/second.txt")
+		close(waitDone)
+	}()
+
+	select {
+	case <-waitDone:
+		t.Fatal("WaitQueuedOrActive(/second.txt) returned early while /second.txt was still queued during DrainAll")
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	unblock()
+	select {
+	case <-waitDone:
+	case <-ctx.Done():
+		t.Fatal("WaitQueuedOrActive(/second.txt) did not finish after unblock")
+	}
+	select {
+	case <-drainDone:
+	case <-ctx.Done():
+		t.Fatal("DrainAll did not finish")
+	}
+	if node, ok := b.Node("/second.txt"); !ok || string(node.Data) != "two" {
+		t.Fatalf("remote /second.txt = %q (ok=%v), want %q", node.Data, ok, "two")
+	}
+}
+
 func TestRenameOverBatchQueuedTargetWaitsBeforeRemoteRename(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -1056,4 +1608,19 @@ func TestRenameOverBatchQueuedTargetWaitsBeforeRemoteRename(t *testing.T) {
 	if !ok || string(node.Data) != "new\n" {
 		t.Fatalf("remote replace-old.txt = %q (ok=%v), want %q", node.Data, ok, "new\n")
 	}
+}
+
+type releaseBlockingHandle struct {
+	fs.Handle
+	onRelease func()
+}
+
+func (r releaseBlockingHandle) Release(ctx context.Context) error {
+	if r.onRelease != nil {
+		r.onRelease()
+	}
+	if r.Handle != nil {
+		return r.Handle.Release(ctx)
+	}
+	return nil
 }
