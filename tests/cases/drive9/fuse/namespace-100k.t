@@ -48,6 +48,18 @@ export NAMESPACE_CREATE_CAP_S NAMESPACE_READDIR_CAP_S NAMESPACE_STAT_CAP_S
 export NAMESPACE_FIND_CAP_S NAMESPACE_CLEANUP_CAP_S
 
 LIB="$RUN_DIR/namespace_lib.py"
+
+# Best-effort cleanup also when a phase fails: a failed check aborts the case
+# under `set -e` before the explicit cleanup phase would run, and 100k files
+# would otherwise be left behind. The phase itself is still a check so a clean
+# run records it.
+cleanup_tree() {
+  if [ "${NAMESPACE_KEEP:-0}" = "1" ] || [ ! -f "$LIB" ]; then
+    return 0
+  fi
+  python3 "$LIB" cleanup >/dev/null 2>&1 || true
+}
+trap cleanup_tree EXIT
 cat > "$LIB" <<'PY'
 import concurrent.futures
 import json
