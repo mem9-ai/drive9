@@ -86,12 +86,6 @@ func (h *leaseHarness) sleepCount() int {
 	return len(h.sleeps)
 }
 
-func (h *leaseHarness) logCount() int {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return len(h.logs)
-}
-
 // leaseSequence is the fake mount-lease API. Once a list is exhausted the calls
 // are accepted; heartbeatRepeat keeps returning the last heartbeat error so a
 // failure episode stays open.
