@@ -23,9 +23,9 @@
 #   NAMESPACE_FILE_BYTES   payload per file, metadata-only by default (default: 1)
 #   NAMESPACE_KEEP=1       keep the tree on disk for debugging (default: remove)
 #   NAMESPACE_{CREATE,READDIR,STAT,FIND,CLEANUP}_CAP_S  per-phase deadlines
-#     (required, must be > 0; worst case 1200+300+600+600+400 = 3100s of phases,
+#     (required, must be > 0; worst case 1200+300+600+600+600 = 3300s of phases,
 #      plus a 2x300s drain, three remounts at ~210s each and the initial mount at
-#      ~190s: about 4520s, inside the 90-minute case timeout in suites.toml)
+#      ~190s: about 4780s, inside the 90-minute case timeout in suites.toml)
 set -eu
 
 NAMESPACE_FILES="${NAMESPACE_FILES:-100000}"
@@ -37,7 +37,7 @@ NAMESPACE_CREATE_CAP_S="${NAMESPACE_CREATE_CAP_S:-1200}"
 NAMESPACE_READDIR_CAP_S="${NAMESPACE_READDIR_CAP_S:-300}"
 NAMESPACE_STAT_CAP_S="${NAMESPACE_STAT_CAP_S:-600}"
 NAMESPACE_FIND_CAP_S="${NAMESPACE_FIND_CAP_S:-600}"
-NAMESPACE_CLEANUP_CAP_S="${NAMESPACE_CLEANUP_CAP_S:-400}"
+NAMESPACE_CLEANUP_CAP_S="${NAMESPACE_CLEANUP_CAP_S:-600}"
 
 # Unique, hidden tree: never collide with (or truncate) data an existing tenant
 # already has at a well-known path.
