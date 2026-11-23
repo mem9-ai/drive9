@@ -403,36 +403,54 @@ func (f *FS) onLocalMutation(e fs.Event) {
 		return
 	}
 	f.inodes.UpdateSize(ino, e.Size)
+	entry, hasEntry := f.inodes.GetEntry(ino)
+	if e.Kind == fs.EventLanded && e.Rev > 0 && (!hasEntry || e.Rev >= entry.Revision) {
+		f.inodes.UpdateRevision(ino, e.Rev)
+	}
 	if f.Ctx.DirCache != nil {
-		item := fs.DirEntryInfo{Name: pathutil.BaseName(e.Path), Size: e.Size, Rev: e.Rev, Mtime: time.Now(), LocalMutation: true}
-		if entry, ok := f.inodes.GetEntry(ino); ok {
-			if entry.HasMode {
-				item.Mode = entry.Mode
-				item.HasMode = true
+		upsertAlias := func(p string) {
+			item := fs.DirEntryInfo{Name: pathutil.BaseName(p), Size: e.Size, Rev: e.Rev, Mtime: time.Now(), LocalMutation: true}
+			if hasEntry {
+				if entry.HasMode {
+					item.Mode = entry.Mode
+					item.HasMode = true
+				}
+				// Ownership is mount-local (v1: the backend has no chown verb):
+				// a settled row without it makes class checks (renameguard's
+				// sticky ownership test) read the remote default owner and
+				// EACCES a rename the local view allows (rename/09).
+				if entry.HasUID {
+					item.Uid = entry.Uid
+					item.HasUID = true
+				}
+				if entry.HasGID {
+					item.Gid = entry.Gid
+					item.HasGID = true
+				}
+				if entry.Nlink > item.Nlink {
+					// The settle row keeps the tracked link count — a
+					// listing rebuilt from it must not flatten hardlinks
+					// to nlink 1.
+					item.Nlink = entry.Nlink
+				}
+				if entry.ResourceID != "" {
+					item.ResourceID = entry.ResourceID
+				}
 			}
-			// Ownership is mount-local (v1: the backend has no chown verb):
-			// a settled row without it makes class checks (renameguard's
-			// sticky ownership test) read the remote default owner and
-			// EACCES a rename the local view allows (rename/09).
-			if entry.HasUID {
-				item.Uid = entry.Uid
-				item.HasUID = true
-			}
-			if entry.HasGID {
-				item.Gid = entry.Gid
-				item.HasGID = true
-			}
-			if entry.Nlink > item.Nlink {
-				// The settle row keeps the tracked link count — a
-				// listing rebuilt from it must not flatten hardlinks
-				// to nlink 1.
-				item.Nlink = entry.Nlink
-			}
-			if entry.ResourceID != "" {
-				item.ResourceID = entry.ResourceID
+			f.Ctx.DirCache.Upsert(parentDirOf(p), item)
+		}
+		seenEventPath := false
+		if hasEntry {
+			for p := range entry.Paths {
+				if p == e.Path {
+					seenEventPath = true
+				}
+				upsertAlias(p)
 			}
 		}
-		f.Ctx.DirCache.Upsert(parentDirOf(e.Path), item)
+		if !seenEventPath {
+			upsertAlias(e.Path)
+		}
 	}
 }
 

@@ -61,12 +61,13 @@ type WriteBackUploader struct {
 	client     *client.Client
 	cache      *staging.WriteBackCache
 	remoteRoot string
-	queueMu    sync.Mutex
-	queueCond  *sync.Cond
-	queue      []string
-	queueHead  int
-	queuedSet  map[string]struct{}
-	wg         sync.WaitGroup
+	queueMu     sync.Mutex
+	queueCond   *sync.Cond
+	queue       []string
+	queueHead   int
+	queuedSet   map[string]struct{}
+	activePaths map[string]int
+	wg          sync.WaitGroup
 	stopOnce   sync.Once
 	stopped    atomic.Bool
 	active     atomic.Int64
@@ -158,12 +159,13 @@ func NewWriteBackUploader(c *client.Client, cache *staging.WriteBackCache, numWo
 		root = remoteRoot[0]
 	}
 	u := &WriteBackUploader{
-		client:     c,
-		cache:      cache,
-		remoteRoot: root,
-		queuedSet:  make(map[string]struct{}),
-		inflight:   make(map[string]*pathState),
-		batchSem:   make(chan struct{}, 4),
+		client:      c,
+		cache:       cache,
+		remoteRoot:  root,
+		queuedSet:   make(map[string]struct{}),
+		activePaths: make(map[string]int),
+		inflight:    make(map[string]*pathState),
+		batchSem:    make(chan struct{}, 4),
 	}
 	u.queueCond = sync.NewCond(&u.queueMu)
 	for i := 0; i < numWorkers; i++ {
@@ -220,6 +222,22 @@ func (u *WriteBackUploader) InFlight(localPath string) bool {
 	_, ok := u.inflight[localPath]
 	u.inflightMu.Unlock()
 	return ok
+}
+
+// QueuedOrActive reports whether localPath is currently queued for background
+// upload, popped by an active worker, or holding the per-path upload gate.
+func (u *WriteBackUploader) QueuedOrActive(localPath string) bool {
+	if u == nil {
+		return false
+	}
+	u.queueMu.Lock()
+	_, queued := u.queuedSet[localPath]
+	active := u.activePaths[localPath] > 0
+	u.queueMu.Unlock()
+	if queued || active {
+		return true
+	}
+	return u.InFlight(localPath)
 }
 
 // PendingStats returns queued and in-flight upload counts for observability.
@@ -606,7 +624,23 @@ func (u *WriteBackUploader) popOneLocked() (string, bool) {
 		u.queueHead = 0
 	}
 	delete(u.queuedSet, p)
+	u.activePaths[p]++
 	return p, true
+}
+
+func (u *WriteBackUploader) finishActivePaths(paths ...string) {
+	if len(paths) == 0 {
+		return
+	}
+	u.queueMu.Lock()
+	for _, p := range paths {
+		if n := u.activePaths[p] - 1; n > 0 {
+			u.activePaths[p] = n
+		} else {
+			delete(u.activePaths, p)
+		}
+	}
+	u.queueMu.Unlock()
 }
 
 func (u *WriteBackUploader) popNext() (string, bool) {
@@ -665,6 +699,7 @@ func (u *WriteBackUploader) worker() {
 		}
 		func() {
 			defer u.active.Add(-1)
+			defer u.finishActivePaths(localPath)
 			if u.tryUploadBatch(localPath) {
 				return
 			}
@@ -705,7 +740,9 @@ func (u *WriteBackUploader) tryUploadBatch(firstPath string) bool {
 	counts := map[string]int{firstPath: 1}
 	distinct := make([]string, 0, maxItems)
 	distinct = append(distinct, firstPath)
-	for _, p := range u.popBatchExtras(maxItems-1, window) {
+	extras := u.popBatchExtras(maxItems-1, window)
+	defer u.finishActivePaths(extras...)
+	for _, p := range extras {
 		if counts[p] == 0 {
 			distinct = append(distinct, p)
 		}

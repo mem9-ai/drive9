@@ -5,6 +5,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -819,5 +821,98 @@ func TestPortAncestorListRetainsOutstandingGeneration(t *testing.T) {
 	list := mergeCacheAncestorGens(nil, gens...)
 	if !cacheGenInList(list, 1) || !cacheGenInList(list, 100) {
 		t.Fatalf("ancestor list dropped an outstanding generation: %v", list)
+	}
+}
+
+// Regression for drive9/fuse/smoke: when a closed overwrite is still in flight
+// in WriteBackUploader and a subsequent non-append truncate (`: > file`, sent
+// either as OPEN(O_WRONLY)+SETATTR(size=0, fh) or OPEN(O_WRONLY|O_TRUNC))
+// stages its 0-byte replacement before the first PUT finishes, the replacement
+// must inherit cache lineage so OnSuccess rebases its BaseRev instead of
+// leaving a 0-byte conflicted entry stuck in uploader_cached on Drain.
+func TestNonAppendTruncateRacesInFlightOverwriteRebasesCleanly(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		oTrunc bool
+	}{
+		{name: "open-then-setattr-zero", oTrunc: false},
+		{name: "open-o-trunc", oTrunc: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			b := testbackend.NewBackend()
+			b.Seed("/alpha/hard.txt", []byte("initial-seed"))
+			entered, allow := make(chan struct{}), make(chan struct{})
+			var enteredOnce, allowOnce sync.Once
+			unblock := func() { allowOnce.Do(func() { close(allow) }) }
+			defer unblock()
+
+			var putCount atomic.Int32
+			srv := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/alpha/hard.txt") {
+					if putCount.Add(1) == 1 {
+						enteredOnce.Do(func() { close(entered) })
+						select {
+						case <-allow:
+						case <-ctx.Done():
+							return
+						}
+					}
+				}
+				b.ServeHTTP(w, r)
+			})
+			chain, wb := newReviewDrainStack(t, srv, nil)
+
+			// First write ("hardlink-payload") closes and enters its async PUT.
+			h1 := dispatchOpen(t, chain, "/alpha/hard.txt", uint32(syscall.O_WRONLY))
+			if err := h1.Write(ctx, 0, []byte("hardlink-payload")); err != nil {
+				t.Fatal(err)
+			}
+			if err := h1.Flush(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := h1.Release(ctx); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-entered:
+			case <-ctx.Done():
+				t.Fatal("first overwrite PUT did not start")
+			}
+
+			// Second open truncates to 0 bytes and closes while PUT #1 is still in flight.
+			openFlags := uint32(syscall.O_WRONLY)
+			if tc.oTrunc {
+				openFlags |= uint32(syscall.O_TRUNC)
+			}
+			h2 := dispatchOpen(t, chain, "/alpha/hard.txt", openFlags)
+			if !tc.oTrunc {
+				if _, err := chain.Dispatch(ctx, &fs.Op{
+					Kind: fs.OpSetAttr, Path: "/alpha/hard.txt", Size: 0, HasSize: true, Handle: h2,
+				}); err != nil {
+					t.Fatalf("ftruncate to 0: %v", err)
+				}
+			}
+			if err := h2.Flush(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := h2.Release(ctx); err != nil {
+				t.Fatal(err)
+			}
+
+			unblock()
+			if err := wb.Drain(ctx); err != nil {
+				t.Fatalf("Drain failed (conflicted entry stranded): %v", err)
+			}
+			if pending := wb.wbCache.ListPendingMetas(); len(pending) != 0 {
+				t.Fatalf("uploader_cached entries stranded after Drain: %+v", pending)
+			}
+			node, ok := b.Node("/alpha/hard.txt")
+			if !ok || len(node.Data) != 0 {
+				t.Fatalf("remote /alpha/hard.txt = %q (ok=%v), want 0-byte truncated file", node.Data, ok)
+			}
+		})
 	}
 }

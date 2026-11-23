@@ -712,3 +712,51 @@ func TestCopyFileRangePublishesGrownLengthAndZeroCopyEOF(t *testing.T) {
 		t.Fatalf("DirCache LookupNamespace(/c, fsx.bin) = (%v, 0x%x), want (LookupPositive, 0x21000)", kind, item.Size)
 	}
 }
+
+func TestEventLandedUpdatesRevisionAndAllHardlinkAliasesInDirCache(t *testing.T) {
+	core := newMemCore()
+	core.writeAt("/c/text.txt", 0, []byte("seed"))
+	core.mu.Lock()
+	core.paths["/c"] = &memEntry{isDir: true, mode: 0o755}
+	core.mu.Unlock()
+
+	linkPlane := fs.HandlerFunc(func(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error) {
+		if op.Kind == fs.OpLink {
+			return fs.Result{Attr: &fs.Attr{
+				Kind: fs.KindFile, Mode: 0o644, Size: 4, Rev: 3, Nlink: 2, ResourceID: "res-hard-1",
+			}}, nil
+		}
+		return next(ctx, op)
+	})
+
+	f := newTestFS(t, core, linkPlane)
+	dirIno := openTestDir(t, f, "c")
+	if ents := readdirWalk(t, f, dirIno, false); len(ents) == 0 {
+		t.Fatal("no entries")
+	}
+	var outText, outHard gofuse.EntryOut
+	if st := f.Lookup(nil, &gofuse.InHeader{NodeId: dirIno}, "text.txt", &outText); st != gofuse.OK {
+		t.Fatalf("lookup text.txt: %v", st)
+	}
+	f.inodes.UpdateRevision(outText.NodeId, 3)
+	if st := f.Link(nil, &gofuse.LinkIn{InHeader: gofuse.InHeader{NodeId: dirIno}, Oldnodeid: outText.NodeId}, "hard.txt", &outHard); st != gofuse.OK {
+		t.Fatalf("link hard.txt: %v", st)
+	}
+	if outText.NodeId != outHard.NodeId {
+		t.Fatalf("hardlink nodeids differ: %d vs %d", outText.NodeId, outHard.NodeId)
+	}
+
+	f.events.Emit(fs.Event{Kind: fs.EventLanded, Path: "/c/hard.txt", Rev: 4, Size: 26, HasSize: true})
+
+	entry, ok := f.inodes.GetEntry(outText.NodeId)
+	if !ok || entry.Revision != 4 || entry.Size != 26 {
+		t.Fatalf("inode after EventLanded = (ok=%v, rev=%d, size=%d), want (true, 4, 26)", ok, entry.Revision, entry.Size)
+	}
+	dc := f.Ctx.DirCache.(*dircache.DirCache)
+	for _, name := range []string{"text.txt", "hard.txt"} {
+		item, kind := dc.LookupNamespace("/c", name)
+		if kind != fs.LookupPositive || item.Rev != 4 || item.Size != 26 {
+			t.Fatalf("DirCache %s = (kind=%v, rev=%d, size=%d), want (LookupPositive, 4, 26)", name, kind, item.Rev, item.Size)
+		}
+	}
+}

@@ -1386,6 +1386,8 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			res.Handle = h
 			return res, nil
 		}
+		isWritableOpen := flags&(uint32(syscall.O_WRONLY)|uint32(syscall.O_RDWR)) != 0 ||
+			flags&uint32(syscall.O_TRUNC) != 0
 		if !op.KernelCreate() && flags&uint32(syscall.O_CREAT) == 0 && flags&uint32(syscall.O_APPEND) != 0 &&
 			w.uploader != nil && w.wbCache != nil {
 			// The fast path declined a PendingOverwrite. Do not let the
@@ -1399,6 +1401,23 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 				}
 			}
 		}
+		if isWritableOpen {
+			// Settle any active overwrite staged under a sibling hardlink
+			// alias (different localPath key) before probing this path's base
+			// revision; same-path active overwrites bind cache lineage below
+			// without blocking open(2).
+			fileIno := w.fileInoOf(op.Path, op.Ino, !op.KernelCreate() && flags&uint32(syscall.O_CREAT) == 0)
+			landedAlias, err := w.landSiblingAliasOverwriteForWrite(ctx, fileIno, op.Path)
+			if err != nil {
+				return fs.Result{}, err
+			}
+			if landedAlias && op.OpenAttr != nil {
+				cp := *op
+				cp.OpenAttr = nil
+				op = &cp
+			}
+		}
+		preOverwrite := w.snapshotPendingOverwrite(op.Path, isWritableOpen)
 		if flags&uint32(syscall.O_CREAT) == 0 {
 			// v1 close-to-open: a read-only re-open of a path whose image
 			// has not landed serves the pending bytes — the kernel's LOOKUP
@@ -1558,7 +1577,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 					h.baseRev = pb
 				}
 			}
-			w.track(h)
+			w.registerExistingOpenHandle(h, isWritableOpen, preOverwrite)
 			res.Handle = h
 			if w.openDirectIO(op.Path, flags, h.baseSize) {
 				// v1 remoteOpenFlagsForHandle: shadow-backed/sqlite paths and
@@ -1677,7 +1696,7 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 					h.baseRev = pb
 				}
 			}
-			w.track(h)
+			w.registerExistingOpenHandle(h, isWritableOpen, preOverwrite)
 			res.Handle = h
 			if w.openDirectIO(op.Path, flags, h.baseSize) {
 				res.OpenFlags |= gofuse.FOPEN_DIRECT_IO
@@ -1840,17 +1859,26 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		// first — flush a live writer, wait the queued commit, land a staged
 		// .dat/.meta image — otherwise the remote link ENOENTs against a
 		// path the server has not seen yet (link/00: create, write, close,
-		// link).
-		if h := w.handleFor(op.Path); h != nil {
-			_ = h.Flush(ctx)
+		// link). Walk all existing hardlink aliases of the source inode too.
+		srcAliases := w.inodeAliasPaths(w.fileInoOf(op.Path, op.Ino2, true), op.Path)
+		for _, p := range srcAliases {
+			if h := w.handleFor(p); h != nil {
+				_ = h.Flush(ctx)
+			}
 		}
 		if w.queue != nil {
-			w.waitPathCommit(op.Path)
+			for _, p := range srcAliases {
+				w.waitPathCommit(p)
+			}
 			w.waitPathCommit(op.Path2)
 		}
 		if w.wbCache != nil && w.uploader != nil {
-			if _, ok := w.wbCache.GetMeta(op.Path); ok {
-				_ = w.uploader.UploadSync(ctx, op.Path)
+			for _, p := range srcAliases {
+				if _, ok := w.wbCache.GetMeta(p); ok {
+					_ = w.uploader.UploadSync(ctx, p)
+				} else if w.uploader.InFlight(p) {
+					w.uploader.WaitPath(p)
+				}
 			}
 		}
 		return next(ctx, op)
@@ -2418,29 +2446,39 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 					}
 				}
 			}
-			// A clean-path truncate must not race the path's own pending
-			// landings: a queued commit or a staged .dat/.meta image landing
-			// mid-truncate 409s the conditional write (EIO) or resurrects the
-			// pre-truncation size after it. Land everything first, then let
-			// the terminal truncate a settled base.
-			if w.queue != nil && w.queue.HasPath(op.Path) {
-				if !w.waitPathCommit(op.Path) {
-					return fs.Result{}, fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
+			// A clean-path truncate must not race the path's (or any hardlink
+			// alias's) pending landings: a queued commit or a staged .dat/.meta
+			// image landing mid-truncate 409s the conditional write (EIO) or
+			// resurrects the pre-truncation size after it. Land everything
+			// first, then let the terminal truncate a settled base.
+			truncAliases := w.inodeAliasPaths(w.fileInoOf(op.Path, op.Ino, true), op.Path)
+			if w.queue != nil {
+				for _, p := range truncAliases {
+					if w.queue.HasPath(p) && !w.waitPathCommit(p) {
+						return fs.Result{}, fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
+					}
 				}
 			}
 			if w.wbCache != nil && w.uploader != nil {
-				if _, ok := w.wbCache.GetMeta(op.Path); ok {
-					if err := w.uploader.UploadSync(ctx, op.Path); err != nil {
-						if w.uploader.IsLedgerOwnedError(err) {
-							// The ledger owns this image; its queue entry
-							// lands it. Truncating below would race the
-							// landing — wait it out first.
-							if !w.waitPathCommit(op.Path) {
-								return fs.Result{}, fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
+				for _, p := range truncAliases {
+					if p != op.Path && !w.uploader.QueuedOrActive(p) {
+						continue
+					}
+					if _, ok := w.wbCache.GetMeta(p); ok {
+						if err := w.uploader.UploadSync(ctx, p); err != nil {
+							if w.uploader.IsLedgerOwnedError(err) {
+								// The ledger owns this image; its queue entry
+								// lands it. Truncating below would race the
+								// landing — wait it out first.
+								if !w.waitPathCommit(p) {
+									return fs.Result{}, fs.StatusErrorOf(gofuse.Status(syscall.EAGAIN))
+								}
+							} else {
+								return fs.Result{}, mapErr(err)
 							}
-						} else {
-							return fs.Result{}, mapErr(err)
 						}
+					} else if w.uploader.InFlight(p) {
+						w.uploader.WaitPath(p)
 					}
 				}
 			}
@@ -4301,6 +4339,36 @@ func (h *bufferingHandle) Release(ctx context.Context) error {
 			}
 		}
 	}
+	h.mu.Lock()
+	lazyWritebackTrunc := !unlinked && h.trunc && h.buf == nil &&
+		h.w.opts.Policy == PolicyWriteBack && h.w.uploader != nil && h.w.wbCache != nil
+	h.mu.Unlock()
+	if lazyWritebackTrunc {
+		if err := h.ensureBuffer(ctx); err != nil {
+			return err
+		}
+		if snap, err := h.stageToWriteCache(ctx, stageFullDurable); err == nil && snap != nil {
+			if uploadUnlock != nil {
+				uploadUnlock()
+				uploadUnlock = nil
+			}
+			h.w.uploader.Submit(path)
+			h.mu.Lock()
+			h.dirty = false
+			h.visTrunc = false
+			if h.buf != nil {
+				h.buf.ClearDirty()
+			}
+			h.landed = true
+			h.mu.Unlock()
+			if h.inner != nil {
+				_ = h.inner.Release(ctx)
+			}
+			return nil
+		} else if err != nil && !errors.Is(err, errWriteCacheBypass) {
+			return err
+		}
+	}
 	if materialize {
 		if err := h.ensureBuffer(ctx); err == nil {
 			h.mu.Lock()
@@ -4533,7 +4601,7 @@ func (w *Writeback) acknowledgeUploadedCreate(path string, rev int64, generation
 			// published (possibly through several staged descendants). Its
 			// next append/overwrite is derived from that revision, not the
 			// pre-upload base.
-			if rev > 0 {
+			if rev > h.baseRev {
 				h.baseRev = rev
 			}
 			h.cacheAncestorGens = removeCacheAncestorGen(h.cacheAncestorGens, cacheGeneration)
@@ -5795,6 +5863,103 @@ func (w *Writeback) hasPendingLocalState(path string) bool {
 	return w.opts.Staging != nil && w.opts.Staging.Pending.HasPending(path)
 }
 
+// fileInoOf resolves a regular file's inode from the facade table first (safe
+// even on kernel CREATE ops whose op.Ino names the parent directory), falling
+// back to hintIno only when the caller guarantees hintIno is the file's inode.
+func (w *Writeback) fileInoOf(path string, hintIno uint64, hintIsFile bool) uint64 {
+	if w != nil && w.inodes != nil {
+		if resolved, ok := w.inodes.Ino(path); ok && resolved != 0 {
+			return resolved
+		}
+	}
+	if hintIsFile {
+		return hintIno
+	}
+	return 0
+}
+
+type pendingOverwriteSnap struct {
+	valid    bool
+	metaGen  uint64
+	inFlight bool
+}
+
+func (w *Writeback) snapshotPendingOverwrite(path string, writable bool) pendingOverwriteSnap {
+	if !writable || w == nil || w.wbCache == nil {
+		return pendingOverwriteSnap{}
+	}
+	if meta, ok := w.wbCache.GetMeta(path); ok && meta != nil && meta.Kind != staging.PendingNew {
+		return pendingOverwriteSnap{
+			valid:    true,
+			metaGen:  meta.Generation,
+			inFlight: w.uploader != nil && w.uploader.QueuedOrActive(path),
+		}
+	}
+	if w.uploader != nil && w.uploader.InFlight(path) {
+		return pendingOverwriteSnap{valid: true, inFlight: true}
+	}
+	return pendingOverwriteSnap{}
+}
+
+func (w *Writeback) registerExistingOpenHandle(h *bufferingHandle, writable bool, pre pendingOverwriteSnap) {
+	if !writable || w == nil || w.wbCache == nil {
+		w.track(h)
+		return
+	}
+	ledgerOwned := w.opts.Staging != nil && w.opts.Staging.Pending.HasPending(h.path)
+	unlock := w.pathLocks.lock(h.path)
+	defer unlock()
+	if !ledgerOwned {
+		curMeta, curOK := w.wbCache.GetMeta(h.path)
+		if pre.valid && pre.inFlight && (!curOK || (pre.metaGen != 0 && curMeta.Generation != pre.metaGen)) && !w.unverified.Load() {
+			if rev, _, _, lok := w.landedRecord(h.path); lok && rev > h.baseRev {
+				h.baseRev = rev
+			}
+		}
+		if curOK && curMeta != nil && curMeta.Kind != staging.PendingNew &&
+			(curMeta.BaseRev == 0 || h.baseRev <= curMeta.BaseRev) {
+			if curMeta.BaseRev == 0 || w.uploader == nil || w.uploader.QueuedOrActive(h.path) {
+				h.supersededPendingGen = curMeta.Generation
+				h.supersededPendingSource = pendingGenCache
+				h.cacheLineageGen = curMeta.CacheLineageGen
+				if h.cacheLineageGen == 0 {
+					h.cacheLineageGen = curMeta.Generation
+				}
+				h.cacheAncestorGens = mergeCacheAncestorGens(curMeta.CacheAncestorGens, curMeta.Generation)
+				if h.baseRev == 0 && curMeta.BaseRev > 0 {
+					h.baseRev = curMeta.BaseRev
+				}
+			}
+		}
+	}
+	w.track(h)
+}
+
+// landSiblingAliasOverwriteForWrite settles any active overwrite queued or in
+// flight under a DIFFERENT hardlink alias pathname of fileIno so path-keyed
+// staging on path does not race an earlier write through its sibling alias.
+func (w *Writeback) landSiblingAliasOverwriteForWrite(ctx context.Context, fileIno uint64, path string) (bool, error) {
+	if w == nil || w.uploader == nil || w.wbCache == nil || fileIno == 0 {
+		return false, nil
+	}
+	landed := false
+	for _, p := range w.inodeAliasPaths(fileIno, path) {
+		if p == path || !w.uploader.QueuedOrActive(p) {
+			continue
+		}
+		if meta, ok := w.wbCache.GetMeta(p); ok && meta != nil && meta.Kind != staging.PendingNew {
+			if err := w.uploader.UploadSync(ctx, p); err != nil && !w.uploader.IsLedgerOwnedError(err) {
+				return landed, err
+			}
+			landed = true
+		} else if w.uploader.InFlight(p) {
+			w.uploader.WaitPath(p)
+			landed = true
+		}
+	}
+	return landed, nil
+}
+
 // landedAt records this mount's own just-landed commits (queue/uploader
 // success): path → revision+size with a settle time. Lookups inside the
 // window answer from local knowledge — the backend replicas converge
@@ -6518,6 +6683,15 @@ func (h *bufferingHandle) ensureBufferLocked(ctx context.Context) error {
 	// nil/empty buffer that Write then dereferenced, and skipped the
 	// O_TRUNC dirty initialization).
 	ledgerOwned := h.w.opts.Staging != nil && h.w.opts.Staging.Pending.HasPending(h.path)
+	if h.trunc {
+		// O_TRUNC: empty base, marked dirty so a write-less close still
+		// commits the truncation (ZeroBase + commit at boundary). Checked
+		// before wbCache.Get so a still-cached pre-truncation payload does
+		// not repopulate the truncated buffer.
+		h.dirty = true
+		h.baseLoaded = true
+		return nil
+	}
 	if !h.isNew && h.w.wbCache != nil && !ledgerOwned {
 		// The write cache is LOCAL-path keyed (stageToWriteCache Put uses
 		// h.path): querying the remote name under a RemoteRoot subtree
@@ -6535,13 +6709,6 @@ func (h *bufferingHandle) ensureBufferLocked(ctx context.Context) error {
 			h.baseLoaded = true
 			return nil
 		}
-	}
-	if h.trunc {
-		// O_TRUNC: empty base, marked dirty so a write-less close still
-		// commits the truncation (ZeroBase + commit at boundary).
-		h.dirty = true
-		h.baseLoaded = true
-		return nil
 	}
 	if (h.isNew || h.inner == nil || ledgerOwned) && h.w.opts.Staging != nil {
 		// A pending image owns this path (queue track): preload the
