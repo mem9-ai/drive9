@@ -124,7 +124,7 @@ func TestCommittedFenceSurvivesRestartUntilSettled(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { journal.Close() })
+	t.Cleanup(func() { _ = journal.Close() })
 	shadows, err := NewShadowStore(filepath.Join(dir, "shadow"))
 	if err != nil {
 		t.Fatal(err)
@@ -243,7 +243,7 @@ func TestCommittedFenceGatesDataFramesByJournalSeq(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { journal.Close() })
+	t.Cleanup(func() { _ = journal.Close() })
 	shadows, err := NewShadowStore(filepath.Join(dir, "shadow"))
 	if err != nil {
 		t.Fatal(err)

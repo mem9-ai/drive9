@@ -1579,15 +1579,6 @@ func (c *WriteBackCache) pruneEntryLocked(remotePath string, removeDataFile bool
 	c.deleteDataLocked(remotePath)
 }
 
-// getViewLocked returns a read-only payload view for remotePath.
-// The caller must hold c.mu and must not mutate the returned slice.
-// A payload loaded from disk is validated against its metadata binding
-// BEFORE it is served or cached: a torn pair (a surviving .meta over a
-// stale .dat — see viewMatchesMeta) is pruned here, so every consumer —
-// Get, GetView, the meta+view getters, the pending-image capture, the
-// writable-open preload — is protected at the one choke point. In-memory
-// payloads skip the check: they were either written by a put (bound by
-// construction) or admitted through this validated load.
 // reportViewLoss forwards a prune to the owner. The caller holds the path
 // lock (c.mu released), so the record is visible to any same-path barrier that
 // follows. A transient read error never reports: the entry is kept and a retry
@@ -1611,9 +1602,19 @@ func (c *WriteBackCache) reportViewLoss(remotePath string, pruned bool, err erro
 	hook(remotePath, err)
 }
 
-// getViewStateLocked reports the payload state for a path. pruned says the
-// record was dropped by this read (torn pair or missing .dat): a transient
-// read error keeps the entry and reports false.
+// getViewStateLocked returns a read-only payload view for remotePath.
+// The caller must hold c.mu and must not mutate the returned slice.
+// A payload loaded from disk is validated against its metadata binding
+// BEFORE it is served or cached: a torn pair (a surviving .meta over a
+// stale .dat — see viewMatchesMeta) is pruned here, so every consumer —
+// Get, GetView, the meta+view getters, the pending-image capture, the
+// writable-open preload — is protected at the one choke point. In-memory
+// payloads skip the check: they were either written by a put (bound by
+// construction) or admitted through this validated load.
+//
+// pruned says the record was dropped by this read (torn pair or missing .dat):
+// a transient read error keeps the entry and reports false, so the owner is
+// never told an image is lost while a retry can still publish it.
 func (c *WriteBackCache) getViewStateLocked(remotePath string) ([]byte, StagedViewState, error, bool) {
 	if data, ok := c.data[remotePath]; ok {
 		c.touchDataLocked(remotePath)
@@ -1648,14 +1649,6 @@ func (c *WriteBackCache) getViewStateLocked(remotePath string) ([]byte, StagedVi
 		return cached, StagedViewOK, nil, false
 	}
 	return data, StagedViewOK, nil, false
-}
-
-func (c *WriteBackCache) getViewLocked(remotePath string) ([]byte, bool) {
-	data, state, _, _ := c.getViewStateLocked(remotePath)
-	if state != StagedViewOK {
-		return nil, false
-	}
-	return data, true
 }
 
 func (c *WriteBackCache) cacheDataLocked(remotePath string, data []byte, size int64) {
