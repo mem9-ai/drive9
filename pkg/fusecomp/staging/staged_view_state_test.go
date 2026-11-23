@@ -269,3 +269,93 @@ func TestViewLossMarkerIsGenerationScoped(t *testing.T) {
 		t.Fatalf("a landing at the lost generation kept the record: %v", err)
 	}
 }
+
+// TestViewLossMarkerIsClearedByNonPutPublications pins the lifecycle hole the
+// review found: an image that lands through the queue, an inline commit or a
+// rename replaces the path's content without a wbCache.Put, and a surviving
+// marker would then fail every later barrier on the name.
+func TestViewLossMarkerIsClearedByNonPutPublications(t *testing.T) {
+	const (
+		staged = "/queued.txt"
+		inline = "/inline.txt"
+		src    = "/moved.txt"
+		dst    = "/target.txt"
+	)
+	c, err := NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{staged, inline, src, dst} {
+		c.writeViewLoss(p, 7, os.ErrNotExist)
+	}
+	// A queue staging/inline commit publishes the newest image for the name.
+	c.ClearViewLoss(staged)
+	c.ClearViewLoss(inline)
+	// A rename replaces both names' incarnations.
+	c.ClearViewLoss(src)
+	c.ClearViewLoss(dst)
+	for _, p := range []string{staged, inline, src, dst} {
+		if err := c.ViewLoss(p); err != nil {
+			t.Fatalf("loss record for %s survived its supersession: %v", p, err)
+		}
+		if _, err := os.Stat(c.lostFile(p)); !os.IsNotExist(err) {
+			t.Fatalf("loss marker for %s survived: %v", p, err)
+		}
+	}
+}
+
+// TestViewLossPrefixClearsSubtreeRecords pins the subtree rule: removal and
+// directory rename cannot see .lost markers through the .meta scan, so the
+// prefix clear must reach them.
+func TestViewLossPrefixClearsSubtreeRecords(t *testing.T) {
+	c, err := NewWriteBackCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.writeViewLoss("/tree/a.txt", 3, os.ErrNotExist)
+	c.writeViewLoss("/tree/sub/b.txt", 4, os.ErrNotExist)
+	c.writeViewLoss("/other.txt", 5, os.ErrNotExist)
+	c.ClearViewLossPrefix("/tree/")
+	if err := c.ViewLoss("/tree/a.txt"); err != nil {
+		t.Fatalf("subtree record survived the prefix clear: %v", err)
+	}
+	if err := c.ViewLoss("/tree/sub/b.txt"); err != nil {
+		t.Fatalf("nested subtree record survived the prefix clear: %v", err)
+	}
+	if err := c.ViewLoss("/other.txt"); err == nil {
+		t.Fatal("unrelated record was cleared by the prefix clear")
+	}
+}
+
+// TestViewLossMarkerSeedsTheGenerationCounter pins the restart rule: a marker
+// left by a previous process must lift the cache's generation counter above the
+// lost generation, or the next staging reuses it and the clear cannot tell the
+// replacement from the loss.
+func TestViewLossMarkerSeedsTheGenerationCounter(t *testing.T) {
+	dir := t.TempDir()
+	const path = "/seeded.txt"
+	first, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.writeViewLoss(path, 42, os.ErrNotExist)
+
+	restarted, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.ViewLoss(path); err == nil {
+		t.Fatal("marker not honored after a restart")
+	}
+	if got := restarted.nextGen.Load(); got < 42 {
+		t.Fatalf("generation counter after restart = %d, want at least the lost generation 42", got)
+	}
+	// A fresh staging gets a generation above the lost one, so clearing by it
+	// works.
+	if err := restarted.Put(path, []byte("new"), 3, PendingNew); err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.ViewLoss(path); err != nil {
+		t.Fatalf("a fresh staging left the recovered marker: %v", err)
+	}
+}

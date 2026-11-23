@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // ViewLoss is a durable record that a staged pair was pruned: its only local
@@ -78,12 +79,15 @@ func (c *WriteBackCache) ViewLoss(remotePath string) error {
 	return fmt.Errorf("%w: staged image for %s (generation %d) was pruned", ErrStagedViewLost, remotePath, loss.Generation)
 }
 
-// readViewLoss reads a durable marker. An unreadable marker reports a loss:
-// a hole in the failure record must not read as "nothing was lost".
+// readViewLoss reads a durable marker. Any error other than "not exist" reports
+// a loss: a hole in the failure record must not read as "nothing was lost".
 func (c *WriteBackCache) readViewLoss(remotePath string) (ViewLoss, bool) {
 	raw, err := os.ReadFile(c.lostFile(remotePath))
 	if err != nil {
-		return ViewLoss{}, false
+		if errors.Is(err, os.ErrNotExist) {
+			return ViewLoss{}, false
+		}
+		return ViewLoss{Path: remotePath, Generation: ^uint64(0), Error: fmt.Sprintf("unreadable view loss marker: %v", err)}, true
 	}
 	var loss ViewLoss
 	if err := json.Unmarshal(raw, &loss); err != nil || loss.Generation == 0 {
@@ -122,4 +126,83 @@ func (c *WriteBackCache) clearViewLossLocked(remotePath string, gen uint64) {
 // staging supersedes it. The caller holds the path lock.
 func (c *WriteBackCache) clearViewLossForNewStagingLocked(remotePath string) {
 	c.clearViewLossLocked(remotePath, ^uint64(0))
+}
+
+// ClearViewLoss drops any loss record for a path unconditionally. It is for
+// callers that just published the path's image themselves (a queue staging, an
+// inline commit, a patched commit): their image is the newest one this mount
+// knows, so every earlier loss record for the name is superseded.
+func (c *WriteBackCache) ClearViewLoss(remotePath string) {
+	if c == nil {
+		return
+	}
+	pl := c.AcquirePathLock(remotePath)
+	defer c.ReleasePathLock(remotePath, pl)
+	c.clearViewLossLocked(remotePath, ^uint64(0))
+}
+
+// ClearViewLossPrefix drops the loss records of every path under prefix. It is
+// for subtree removals and directory renames, where the names are gone but their
+// .lost markers would otherwise keep failing barriers on re-created paths.
+func (c *WriteBackCache) ClearViewLossPrefix(prefix string) {
+	if c == nil {
+		return
+	}
+	entries, err := os.ReadDir(c.dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".lost") {
+			continue
+		}
+		raw, rerr := os.ReadFile(filepath.Join(c.dir, name))
+		if rerr != nil {
+			continue
+		}
+		var loss ViewLoss
+		if jerr := json.Unmarshal(raw, &loss); jerr != nil || loss.Path == "" {
+			continue
+		}
+		if strings.HasPrefix(loss.Path, prefix) {
+			c.ClearViewLoss(loss.Path)
+		}
+	}
+}
+
+// loadViewLossFromDisk seeds the in-process mirror (and the generation counter)
+// from the markers a previous process left, so a recovered marker is honored and
+// a fresh generation can never be mistaken for an older loss.
+func (c *WriteBackCache) loadViewLossFromDisk() {
+	entries, err := os.ReadDir(c.dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".lost") {
+			continue
+		}
+		raw, rerr := os.ReadFile(filepath.Join(c.dir, name))
+		if rerr != nil {
+			continue
+		}
+		var loss ViewLoss
+		if jerr := json.Unmarshal(raw, &loss); jerr != nil || loss.Path == "" {
+			continue
+		}
+		c.mu.Lock()
+		if c.lostGens == nil {
+			c.lostGens = make(map[string]uint64)
+		}
+		c.lostGens[loss.Path] = loss.Generation
+		c.mu.Unlock()
+		for {
+			cur := c.nextGen.Load()
+			if loss.Generation <= cur || c.nextGen.CompareAndSwap(cur, loss.Generation) {
+				break
+			}
+		}
+	}
 }

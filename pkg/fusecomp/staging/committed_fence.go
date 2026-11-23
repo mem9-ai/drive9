@@ -80,7 +80,6 @@ func (idx *PendingIndex) loadCommittedFencesLocked() error {
 	if idx.fencesLoaded {
 		return idx.fencesErr
 	}
-	idx.fencesLoaded = true
 	if idx.fences == nil {
 		idx.fences = make(map[string]CommittedFence)
 	}
@@ -89,9 +88,12 @@ func (idx *PendingIndex) loadCommittedFencesLocked() error {
 	}
 	entries, err := os.ReadDir(idx.dir)
 	if err != nil {
+		// A transient scan failure must not be cached as "no fences": retry on
+		// the next call instead of failing open for the rest of the mount.
 		idx.fencesErr = fmt.Errorf("pending index read committed fences: %w", err)
 		return idx.fencesErr
 	}
+	idx.fencesLoaded = true
 	for _, e := range entries {
 		name := e.Name()
 		if !strings.HasSuffix(name, ".fence") {
@@ -107,10 +109,17 @@ func (idx *PendingIndex) loadCommittedFencesLocked() error {
 			continue
 		}
 		var fence CommittedFence
-		if err := json.Unmarshal(raw, &fence); err != nil || fence.Path == "" {
+		if err := json.Unmarshal(raw, &fence); err != nil {
 			idx.fenceMask[hash] = struct{}{}
 			if idx.fencesErr == nil {
 				idx.fencesErr = fmt.Errorf("pending index decode committed fence %s: %w", name, err)
+			}
+			continue
+		}
+		if fence.Path == "" {
+			idx.fenceMask[hash] = struct{}{}
+			if idx.fencesErr == nil {
+				idx.fencesErr = fmt.Errorf("pending index decode committed fence %s: empty path", name)
 			}
 			continue
 		}

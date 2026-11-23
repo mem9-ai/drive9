@@ -534,6 +534,11 @@ func (u *WriteBackUploader) uploadSyncWithMetadata(ctx context.Context, localPat
 		// pruned) or unreadable. Reporting success would tell fsync(2) that a
 		// file is safe.
 		if viewErr != nil {
+			if errors.Is(viewErr, errStagedViewLost) {
+				// Already carries the marker's own reason; wrapping it again only
+				// repeats the sentinel text.
+				return 0, nil, u.stagedViewLost(localPath, viewErr)
+			}
 			return 0, nil, u.stagedViewLost(localPath, fmt.Errorf("staged image for %s is unreadable: %w", localPath, viewErr))
 		}
 		return 0, nil, u.stagedViewLost(localPath, fmt.Errorf("staged image for %s has no usable payload", localPath))

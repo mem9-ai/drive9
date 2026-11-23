@@ -244,6 +244,10 @@ func NewWriteBackCache(dir string) (*WriteBackCache, error) {
 		dataMaxBytes: defaultWriteBackDataCacheMaxSize,
 		pathLocks:    make(map[string]*PathLockEntry),
 	}
+	// A view-loss marker left by a previous process must be honored from the
+	// start: it also advances the generation counter, so a fresh staging can
+	// never be mistaken for the generation that was lost.
+	c.loadViewLossFromDisk()
 	// Populate in-memory index from disk (crash recovery).
 	entries, _ := os.ReadDir(dir)
 	var maxGen uint64
@@ -271,7 +275,11 @@ func NewWriteBackCache(dir string) (*WriteBackCache, error) {
 			maxGen = meta.Generation
 		}
 	}
-	c.nextGen.Store(maxGen)
+	// Never lower what the loss markers already raised: a generation below a
+	// recorded loss would make the next staging look like the lost one.
+	if maxGen > c.nextGen.Load() {
+		c.nextGen.Store(maxGen)
+	}
 	c.durableGen.Store(maxGen)
 	return c, nil
 }
@@ -1221,7 +1229,12 @@ func (c *WriteBackCache) ListPending() []PendingEntry {
 		// recovery cannot read the dropped pair as a consumed one.
 		for _, p := range pruned {
 			pl := c.AcquirePathLock(p.path)
-			c.reportViewLoss(p.path, p.gen, p.err)
+			// A concurrent Put may have published a replacement image between
+			// the scan and this report; its generation owns the path now, so the
+			// stale loss must not be stamped over it.
+			if !c.HasMeta(p.path) {
+				c.reportViewLoss(p.path, p.gen, p.err)
+			}
 			c.ReleasePathLock(p.path, pl)
 		}
 	}()
@@ -1251,7 +1264,9 @@ func (c *WriteBackCache) ListPending() []PendingEntry {
 				cp := meta
 				c.setMetaLocked(meta.Path, &cp)
 				if meta.Generation > c.nextGen.Load() {
-					c.nextGen.Store(meta.Generation)
+					if meta.Generation > c.nextGen.Load() {
+						c.nextGen.Store(meta.Generation)
+					}
 				}
 			}
 		}
@@ -1331,7 +1346,9 @@ func (c *WriteBackCache) ListPendingMetas() []WriteBackMeta {
 				cp := meta
 				c.setMetaLocked(meta.Path, &cp)
 				if meta.Generation > c.nextGen.Load() {
-					c.nextGen.Store(meta.Generation)
+					if meta.Generation > c.nextGen.Load() {
+						c.nextGen.Store(meta.Generation)
+					}
 				}
 			}
 		}

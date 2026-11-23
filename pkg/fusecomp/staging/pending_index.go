@@ -1358,6 +1358,11 @@ func (idx *PendingIndex) publishRecoveredMeta(metaBytes []byte) error {
 	}
 	idx.mu.Lock()
 	idx.ensureCommittedFencesLoadedLocked()
+	if _, masked := idx.fenceMask[HashPath(meta.Path)]; masked {
+		// Fail closed: an undecodable fence may mask any generation of this path.
+		idx.mu.Unlock()
+		return nil
+	}
 	if fence, fenced := idx.fences[meta.Path]; fenced && meta.Generation != 0 && meta.Generation <= fence.Generation {
 		// The image landed and the fence outranks this frame: never reinstall
 		// it as pending work, whatever order replay and disk recovery ran in.

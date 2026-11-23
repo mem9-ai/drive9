@@ -1928,6 +1928,13 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			}
 			if w.wbCache != nil {
 				w.wbCache.Remove(op.Path)
+				if under {
+					// Loss records are not .meta entries: the subtree's names are
+					// gone, so a stale record would fail barriers on re-created
+					// paths forever.
+					w.wbCache.ClearViewLossPrefix(prefix)
+				}
+				w.wbCache.ClearViewLoss(op.Path)
 			}
 			w.forgetLanded(op.Path)
 			return fs.Result{}, nil
@@ -1939,6 +1946,12 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		}
 		if err := purgeStaging(); err != nil {
 			return res, err
+		}
+		if w.wbCache != nil {
+			if under {
+				w.wbCache.ClearViewLossPrefix(prefix)
+			}
+			w.wbCache.ClearViewLoss(op.Path)
 		}
 		w.forgetLanded(op.Path)
 		return res, nil
@@ -2281,6 +2294,13 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 			w.queue.RenameTerminalFailure(op.Path, op.Path2, dstLandedSnaps)
 		}
 		w.retarget(op.Path, op.Path2)
+		// The object moved: the loss record follows neither name — the source
+		// name is gone and the destination now holds a landed object, so a
+		// record at either would fail a barrier on a name whose image is fine.
+		if w.wbCache != nil {
+			w.wbCache.ClearViewLoss(op.Path)
+			w.wbCache.ClearViewLoss(op.Path2)
+		}
 		// The final publication fence: between the transition above and the
 		// handle move just done, an open writer could still stage (and
 		// enqueue, clearing its dirty flag) under the OLD name — the one
@@ -2310,6 +2330,13 @@ func (w *Writeback) Do(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result,
 		// prefix alongside the remote rename.
 		if w.wbCache != nil {
 			prefix := strings.TrimSuffix(op.Path, "/") + "/"
+			// Loss records are not .meta entries, so the ListByPrefix loop below
+			// cannot see them: the renamed subtree's names are gone and the
+			// destination names are replaced, so both sets must be dropped or a
+			// stale record would fail barriers forever.
+			w.wbCache.ClearViewLossPrefix(prefix)
+			w.wbCache.ClearViewLossPrefix(strings.TrimSuffix(op.Path2, "/") + "/")
+			w.wbCache.ClearViewLoss(op.Path2)
 			for _, entry := range w.wbCache.ListByPrefix(prefix) {
 				target := op.Path2 + strings.TrimPrefix(entry.Path, op.Path)
 				moved := w.wbCache.RenamePending(entry.Path, target)
@@ -6607,6 +6634,9 @@ func (h *bufferingHandle) commitInline(ctx context.Context) error {
 		if cacheGen != 0 {
 			h.w.wbCache.RemoveIfGeneration(h.path, cacheGen)
 		}
+		// An inline commit published this image: any recorded loss for the name
+		// is superseded, including one left by a pruned pair (cacheGen == 0).
+		h.w.wbCache.ClearViewLoss(h.path)
 		var crc uint32
 		var img []byte
 		if image != nil {
@@ -7272,6 +7302,10 @@ func (h *bufferingHandle) stageAndEnqueueOpt(ctx context.Context, durable, journ
 	if cacheGen != 0 {
 		w.wbCache.RemoveIfGeneration(h.path, cacheGen)
 	}
+	// This staging publishes the path's newest image, so a loss record from an
+	// earlier pruned pair is superseded — cacheGen == 0 means exactly that the
+	// pruned pair had no .meta left to gate the clear.
+	w.wbCache.ClearViewLoss(h.path)
 	entry := &CommitEntry{
 		Path:             h.path,
 		Size:             size,
@@ -7632,6 +7666,8 @@ func (h *bufferingHandle) commitPatched(ctx context.Context) (rev int64, attempt
 	h.mu.Lock()
 	h.storageClass = client.StorageTypeS3
 	h.mu.Unlock()
+	// The patched image is published: a loss record for the name is superseded.
+	h.w.wbCache.ClearViewLoss(h.path)
 	return 0, true, nil
 }
 
