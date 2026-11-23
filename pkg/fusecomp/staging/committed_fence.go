@@ -28,10 +28,10 @@ import (
 // A crash in between leaves the fence, so the next start retries the settle
 // instead of resurrecting the landed image.
 type CommittedFence struct {
-	Path       string `json:"path"`
-	Generation uint64 `json:"generation"`
+	Path       string     `json:"path"`
+	Generation uint64     `json:"generation"`
 	ShadowGen  ContentGen `json:"shadow_gen,omitempty"`
-	JournalSeq uint64 `json:"journal_seq,omitempty"`
+	JournalSeq uint64     `json:"journal_seq,omitempty"`
 }
 
 // fenceFile returns the on-disk fence path for a remote path.
