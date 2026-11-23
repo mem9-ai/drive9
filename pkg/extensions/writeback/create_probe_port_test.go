@@ -916,3 +916,144 @@ func TestNonAppendTruncateRacesInFlightOverwriteRebasesCleanly(t *testing.T) {
 		})
 	}
 }
+
+// Regression for drive9/fuse/nodefs: when close(2) on replace-old.txt has run
+// FUSE_FLUSH (staging PendingNew into wbCache) while asynchronous FUSE_RELEASE
+// is still pending in the kernel, a rename(replace-new.txt, replace-old.txt)
+// marks the old handle unlinked and must retire its pre-rename wbCache entry
+// rather than leaving an unsubmitted snapshot stranded in uploader_cached.
+func TestRenameOverFlushedTargetBeforeReleaseRetiresWriteBackCache(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	b := testbackend.NewBackend()
+	chain, wb := newReviewDrainStack(t, b, nil)
+
+	resOld, err := chain.Dispatch(ctx, &fs.Op{
+		Kind: fs.OpCreate, Path: "/nodefs/replace-old.txt",
+		Flags: uint32(syscall.O_CREAT | syscall.O_TRUNC | syscall.O_WRONLY), Mode: 0o644, HasMode: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hOld := resOld.Handle
+	if err := hOld.Write(ctx, 0, []byte("old\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := hOld.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	resNew, err := chain.Dispatch(ctx, &fs.Op{
+		Kind: fs.OpCreate, Path: "/nodefs/replace-new.txt",
+		Flags: uint32(syscall.O_CREAT | syscall.O_TRUNC | syscall.O_WRONLY), Mode: 0o644, HasMode: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hNew := resNew.Handle
+	if err := hNew.Write(ctx, 0, []byte("new\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := hNew.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := hNew.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := chain.Dispatch(ctx, &fs.Op{
+		Kind: fs.OpRename, Path: "/nodefs/replace-new.txt", Path2: "/nodefs/replace-old.txt",
+	}); err != nil {
+		t.Fatalf("rename replace-new -> replace-old: %v", err)
+	}
+
+	// Asynchronous kernel FUSE_RELEASE arrives after rename completed.
+	if err := hOld.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	rres, err := chain.Dispatch(ctx, &fs.Op{
+		Kind: fs.OpCreate, Path: "/nodefs/replace-old.txt", Flags: uint32(syscall.O_RDONLY),
+	})
+	if err != nil {
+		t.Fatalf("reopen replace-old: %v", err)
+	}
+	buf := make([]byte, 16)
+	n, _ := rres.Handle.Read(ctx, 0, buf)
+	_ = rres.Handle.Release(ctx)
+	if string(buf[:n]) != "new\n" {
+		t.Fatalf("read after rename = %q, want %q", string(buf[:n]), "new\n")
+	}
+
+	if err := wb.Drain(ctx); err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if reason, count := wb.DrainPending(); count != 0 {
+		t.Fatalf("DrainPending = (%q, %d), want empty", reason, count)
+	}
+	node, ok := b.Node("/nodefs/replace-old.txt")
+	if !ok || string(node.Data) != "new\n" {
+		t.Fatalf("remote replace-old.txt = %q (ok=%v), want %q", node.Data, ok, "new\n")
+	}
+}
+
+func TestRenameOverBatchQueuedTargetWaitsBeforeRemoteRename(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	b := testbackend.NewBackend()
+	chain, wb := newReviewDrainStack(t, b, nil)
+	wb.uploader.ConfigureBatchWrite(80*time.Millisecond, 8, 1<<20)
+
+	resOld, err := chain.Dispatch(ctx, &fs.Op{
+		Kind: fs.OpCreate, Path: "/nodefs/replace-old.txt",
+		Flags: uint32(syscall.O_CREAT | syscall.O_TRUNC | syscall.O_WRONLY), Mode: 0o644, HasMode: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := resOld.Handle.Write(ctx, 0, []byte("old\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := resOld.Handle.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := resOld.Handle.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	resNew, err := chain.Dispatch(ctx, &fs.Op{
+		Kind: fs.OpCreate, Path: "/nodefs/replace-new.txt",
+		Flags: uint32(syscall.O_CREAT | syscall.O_TRUNC | syscall.O_WRONLY), Mode: 0o644, HasMode: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := resNew.Handle.Write(ctx, 0, []byte("new\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := resNew.Handle.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := chain.Dispatch(ctx, &fs.Op{
+		Kind: fs.OpRename, Path: "/nodefs/replace-new.txt", Path2: "/nodefs/replace-old.txt",
+	}); err != nil {
+		t.Fatalf("rename replace-new -> replace-old: %v", err)
+	}
+	if err := resNew.Handle.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := wb.Drain(ctx); err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if reason, count := wb.DrainPending(); count != 0 {
+		t.Fatalf("DrainPending = (%q, %d), want empty", reason, count)
+	}
+	node, ok := b.Node("/nodefs/replace-old.txt")
+	if !ok || string(node.Data) != "new\n" {
+		t.Fatalf("remote replace-old.txt = %q (ok=%v), want %q", node.Data, ok, "new\n")
+	}
+}

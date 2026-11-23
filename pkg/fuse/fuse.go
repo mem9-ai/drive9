@@ -882,6 +882,24 @@ func (f *FS) populateNativeSyncFSSupport(resp *mountcontrol.DrainResponse) {
 // snapshotDrainPending reports undrained work (v1 snapshotDrainPending).
 func (f *FS) snapshotDrainPending(resp *mountcontrol.DrainResponse) {
 	resp.Pending.OpenHandles = f.handles.len()
+	for _, h := range f.chain.Handlers() {
+		if ds, is := h.(interface {
+			DrainSnapshot() (int, int, int, int, int, int64, int, int, int, int64)
+		}); is {
+			dirty, qPending, qInFlight, qDelayed, qConflicts, qBytes, uQueued, uInFlight, uCached, uCachedBytes := ds.DrainSnapshot()
+			resp.Pending.DirtyHandles = dirty
+			resp.Pending.CommitQueuePending = qPending
+			resp.Pending.CommitQueueBytes = qBytes
+			resp.Pending.CommitQueueInFlight = qInFlight
+			resp.Pending.CommitQueueDelayed = qDelayed
+			resp.Pending.CommitQueueConflicts = qConflicts
+			resp.Pending.UploaderQueued = uQueued
+			resp.Pending.UploaderInFlight = uInFlight
+			resp.Pending.UploaderCached = uCached
+			resp.Pending.UploaderCachedBytes = uCachedBytes
+			return
+		}
+	}
 	if pending, bytes, ok := f.chainPendingStats(); ok {
 		resp.Pending.CommitQueuePending = pending
 		resp.Pending.CommitQueueBytes = bytes

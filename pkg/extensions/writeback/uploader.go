@@ -63,6 +63,7 @@ type WriteBackUploader struct {
 	remoteRoot string
 	queueMu     sync.Mutex
 	queueCond   *sync.Cond
+	stateCond   *sync.Cond
 	queue       []string
 	queueHead   int
 	queuedSet   map[string]struct{}
@@ -168,6 +169,7 @@ func NewWriteBackUploader(c *client.Client, cache *staging.WriteBackCache, numWo
 		batchSem:    make(chan struct{}, 4),
 	}
 	u.queueCond = sync.NewCond(&u.queueMu)
+	u.stateCond = sync.NewCond(&u.queueMu)
 	for i := 0; i < numWorkers; i++ {
 		u.wg.Add(1)
 		go u.worker()
@@ -349,6 +351,32 @@ func (u *WriteBackUploader) WaitPath(localPath string) {
 	}
 }
 
+// WaitQueuedOrActive blocks until localPath is neither queued in the
+// background uploader nor held by an active worker or path gate.
+func (u *WriteBackUploader) WaitQueuedOrActive(localPath string) {
+	if u == nil {
+		return
+	}
+	for {
+		u.queueMu.Lock()
+		for !u.stopped.Load() && u.stateCond != nil {
+			_, queued := u.queuedSet[localPath]
+			if !queued && u.activePaths[localPath] == 0 {
+				break
+			}
+			u.stateCond.Wait()
+		}
+		u.queueMu.Unlock()
+		if !u.InFlight(localPath) {
+			return
+		}
+		u.WaitPath(localPath)
+		if u.stopped.Load() {
+			return
+		}
+	}
+}
+
 // DrainAll stops accepting queued uploads and waits for all queued and
 // in-flight uploads to complete. Called during graceful shutdown.
 func (u *WriteBackUploader) DrainAll() {
@@ -363,9 +391,17 @@ func (u *WriteBackUploader) DrainAll() {
 		u.queueMu.Lock()
 		u.stopped.Store(true)
 		u.queueCond.Broadcast()
+		if u.stateCond != nil {
+			u.stateCond.Broadcast()
+		}
 		u.queueMu.Unlock()
 	})
 	u.wg.Wait()
+	u.queueMu.Lock()
+	if u.stateCond != nil {
+		u.stateCond.Broadcast()
+	}
+	u.queueMu.Unlock()
 }
 
 // RecoverPending scans the cache directory for leftover entries from a
@@ -633,12 +669,17 @@ func (u *WriteBackUploader) finishActivePaths(paths ...string) {
 		return
 	}
 	u.queueMu.Lock()
+	woke := false
 	for _, p := range paths {
 		if n := u.activePaths[p] - 1; n > 0 {
 			u.activePaths[p] = n
 		} else {
 			delete(u.activePaths, p)
+			woke = true
 		}
+	}
+	if woke && u.stateCond != nil {
+		u.stateCond.Broadcast()
 	}
 	u.queueMu.Unlock()
 }
