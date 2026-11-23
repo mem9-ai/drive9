@@ -113,6 +113,7 @@ timeout = "10m"
 name = "drive9/fuse/s3-express-wal"
 tier = "pr-fuse"
 no_mount = true
+serial = true
 env = { FUSE_APPEND_LOG_TRANSACTIONS = "300" }
 timeout = "10m"
 

@@ -77,6 +77,11 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
       - name: Ensure FUSE3 & host tools
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -234,10 +239,11 @@ jobs:
           path: |
             /tmp/sim-*/suite.json
             /tmp/sim-*/cases/*/runs/*/*.json
+            /tmp/sim-*/cases/*/runs/*/*.jsonl
             /tmp/sim-*/cases/*/runs/*/*.tap
             /tmp/sim-*/cases/*/runs/*/*.log
             /tmp/sim-*/cases/*/runs/*/logs/**
             /tmp/sim-*/cases/*/runs/*/injector/**
             /tmp/sim-*/cases/*/runs/*/snapshot/**
-            !/tmp/sim-**/tenant.json
+            !/tmp/sim-*/**/tenant.json
           if-no-files-found: ignore

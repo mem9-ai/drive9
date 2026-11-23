@@ -650,3 +650,65 @@ func TestChmodThenRenamePreservesSize(t *testing.T) {
 		t.Fatalf("dircache dst.txt size after chmod+rename = %d, want %d", item.Size, len(payload))
 	}
 }
+
+func TestCopyFileRangePublishesGrownLengthAndZeroCopyEOF(t *testing.T) {
+	core := newMemCore()
+	core.writeAt("/c/fsx.bin", 0, make([]byte, 0x1428d))
+	core.mu.Lock()
+	core.paths["/c"] = &memEntry{isDir: true, mode: 0o755}
+	core.mu.Unlock()
+
+	var mockWritten uint32
+	cfrPlane := fs.HandlerFunc(func(ctx context.Context, op *fs.Op, next fs.Next) (fs.Result, error) {
+		if op.Kind == fs.OpCopyFileRange {
+			return fs.Result{Written: mockWritten}, nil
+		}
+		return next(ctx, op)
+	})
+
+	f := newTestFS(t, core, cfrPlane)
+	dirIno := openTestDir(t, f, "c")
+	if ents := readdirWalk(t, f, dirIno, false); len(ents) == 0 {
+		t.Fatal("no entries")
+	}
+
+	var eout gofuse.EntryOut
+	if st := f.Lookup(nil, &gofuse.InHeader{NodeId: dirIno}, "fsx.bin", &eout); st != gofuse.OK {
+		t.Fatalf("lookup fsx.bin: %v", st)
+	}
+	if eout.Size != 0x1428d {
+		t.Fatalf("initial size = 0x%x, want 0x1428d", eout.Size)
+	}
+
+	// Zero-byte copy (e.g. OffIn at/past EOF) must return 0 rather than input.Len
+	// and keep the cached size intact.
+	mockWritten = 0
+	in := &gofuse.CopyFileRangeIn{OffIn: 0x1428d, OffOut: 0x1f000, Len: 0x2000}
+	in.NodeId = eout.NodeId
+	in.NodeIdOut = eout.NodeId
+	n, st := f.CopyFileRange(nil, in)
+	if st != gofuse.OK || n != 0 {
+		t.Fatalf("zero-copy CopyFileRange = (%d, %v), want (0, OK)", n, st)
+	}
+	if e, ok := f.inodes.GetEntry(eout.NodeId); !ok || e.Size != 0x1428d {
+		t.Fatalf("inode size after zero-copy = 0x%x, want 0x1428d", e.Size)
+	}
+
+	// Growing copy_file_range (`copy_range 0x6000 0x2000 0x1f000` -> 0x21000) must
+	// immediately publish the grown size to both the inode table and DirCache so a
+	// subsequent close+open Lookup cannot serve the pre-copy 0x1428d size.
+	mockWritten = 0x2000
+	in.OffIn = 0x6000
+	n, st = f.CopyFileRange(nil, in)
+	if st != gofuse.OK || n != 0x2000 {
+		t.Fatalf("growing CopyFileRange = (0x%x, %v), want (0x2000, OK)", n, st)
+	}
+	if e, ok := f.inodes.GetEntry(eout.NodeId); !ok || e.Size != 0x21000 {
+		t.Fatalf("inode size after CopyFileRange = 0x%x, want 0x21000", e.Size)
+	}
+	dc := f.Ctx.DirCache.(*dircache.DirCache)
+	item, kind := dc.LookupNamespace("/c", "fsx.bin")
+	if kind != fs.LookupPositive || item.Size != 0x21000 {
+		t.Fatalf("DirCache LookupNamespace(/c, fsx.bin) = (%v, 0x%x), want (LookupPositive, 0x21000)", kind, item.Size)
+	}
+}

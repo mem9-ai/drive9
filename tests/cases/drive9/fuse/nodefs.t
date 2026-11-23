@@ -11,6 +11,7 @@ LARGE_BYTES="${FUSE_NODEFS_LARGE_BYTES:-$((9 * 1024 * 1024))}"
 export DRIVE9_SERVER="$SERVER"
 export DRIVE9_API_KEY="$API_KEY"
 export CLI="$CLI"
+export UV_USE_IO_URING=0
 export NODEFS_JS MANIFEST_JSON LARGE_BYTES
 
 check shell --req 'drive9-nodefs-create' --claim 'nodefs-api-matrix-create-and-verify' -- sh -c '

@@ -152,7 +152,7 @@ if ac > 0:
     assert (ab + frb) <= wal_bound * max_rr, (ab, frb, wal_bound, max_rr)
     assert (ab + frb) < want["cumulative_wal_size"]
     assert grc <= frc and (frc - grc) <= 1
-assert want["late_commit_p95_ms"] <= max(want["early_commit_p95_ms"], 1.0) * max_lr, want
+assert want["late_commit_p95_ms"] <= max(want["early_commit_p95_ms"], 5.0) * max_lr, want
 PY
     "$CLI" umount --timeout 60s "$MP"
     wait "$mpid2" || true

@@ -503,6 +503,7 @@ fn bi_require(args: &[String], stub: bool) -> i32 {
     }
     if !text.trim().is_empty() {
         println!("{}", text.trim_end());
+        let _ = std::io::stdout().flush();
     }
     if stub {
         return REQUIRE_SKIP_EXIT_CODE;

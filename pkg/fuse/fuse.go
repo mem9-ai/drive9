@@ -3175,10 +3175,16 @@ func (f *FS) CopyFileRange(cancel <-chan struct{}, input *gofuse.CopyFileRangeIn
 	if st != gofuse.OK {
 		return 0, st
 	}
-	if res.Written != 0 {
-		return res.Written, gofuse.OK
+	written := res.Written
+	if written > 0 {
+		f.inodes.MarkDataMutation(input.NodeIdOut)
+		f.publishWriteLength(input.NodeIdOut, int64(input.OffOut)+int64(written))
+		if hnd, ok := f.handles.get(input.FhOut); ok && hnd.direct {
+			f.InvalidateRange(input.NodeIdOut, int64(input.OffOut), int64(written))
+		}
+		f.mutated(fs.EventWrite, dstPath)
 	}
-	return uint32(input.Len), gofuse.OK
+	return written, gofuse.OK
 }
 
 // ---------------------------------------------------------------------------

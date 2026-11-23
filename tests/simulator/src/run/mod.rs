@@ -887,7 +887,8 @@ fn run_once(
         .env("MOUNT", &ws)
         .env("RUN_DIR", run_dir)
         .env("CONTROL", &sock_path)
-        .env("SIMULATOR_BIN", &self_exe);
+        .env("SIMULATOR_BIN", &self_exe)
+        .env("UV_USE_IO_URING", "0");
     let isolated_home = run_dir.join("home");
     let _ = std::fs::create_dir_all(&isolated_home);
     cmd.env("HOME", &isolated_home);
