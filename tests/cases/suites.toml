@@ -555,3 +555,11 @@ name = "drive9/api/sdk-integration"
 tier = "daily-sdk"
 no_mount = true
 timeout = "30m"
+
+# ---- 100k-file workspace (GA item: large-workspace scale) ----
+[[case]]
+name = "drive9/fuse/namespace-100k"
+tier = "daily-bench"
+perf = true
+serial = true
+timeout = "60m"
