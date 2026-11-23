@@ -30,14 +30,18 @@ const (
 	leaseFailureNone mountLeaseFailure = iota
 	// leaseFailureCancelled means the reporter is shutting down.
 	leaseFailureCancelled
-	// leaseFailureUnsupported means the server has no lease route (404/405/501).
-	// Such a server must not affect mounting, so the reporter stops quietly.
+	// leaseFailureUnsupported means the server does not implement the call
+	// (405/501). Registration treats it as "no lease route" and stops quietly;
+	// a heartbeat logs once before stopping, because a live lease is being
+	// dropped rather than never acquired.
 	leaseFailureUnsupported
-	// leaseFailureGone means the lease row no longer exists (404): re-register
-	// immediately at the base interval.
+	// leaseFailureGone means the lease row no longer exists (404). A heartbeat
+	// re-registers immediately at the base interval; on registration the same
+	// status means the route is absent, so it is terminal like unsupported.
 	leaseFailureGone
 	// leaseFailureRejected means the server rejected this mount identity or key
-	// (401/403). Re-register, but back off: the same key is refused until the
+	// (401/403). Both call sites re-register (a heartbeat immediately, a failed
+	// registration after a growing delay): the same key is refused until its
 	// server-side state changes (key re-enabled, tenant restored, scope widened).
 	leaseFailureRejected
 	// leaseFailureTransient is every other error: retry at the base interval.
@@ -54,7 +58,7 @@ func classifyMountLeaseFailure(ctx context.Context, err error) mountLeaseFailure
 		return leaseFailureNone
 	case isStatus(err, 405) || isStatus(err, 501):
 		return leaseFailureUnsupported
-	case client.IsNotFound(err) || isStatus(err, 404):
+	case client.IsNotFound(err):
 		return leaseFailureGone
 	case client.IsUnauthorized(err) || client.IsForbidden(err):
 		return leaseFailureRejected
@@ -80,9 +84,6 @@ type mountLeaseReporter struct {
 }
 
 func startMountLease(parent context.Context, cl *client.Client, mountID, mountPoint string, readOnly bool) *mountLeaseReporter {
-	if cl == nil || mountID == "" || mountPoint == "" {
-		return nil
-	}
 	mode := "read_write"
 	if readOnly {
 		mode = "read_only"
@@ -95,22 +96,18 @@ func startMountLease(parent context.Context, cl *client.Client, mountID, mountPo
 		PID:        int64(os.Getpid()),
 		Mode:       mode,
 		TTLSeconds: int(mountLeaseTTL / time.Second),
-	}, sleepContext, func(format string, args ...any) {
-		fmt.Fprintf(os.Stderr, format, args...)
-	})
+	}, sleepContext, stderrLogf)
+}
+
+// stderrLogf is the production log seam. Tests inject their own logf, so the
+// function is the only place that writes the reporter's lines.
+func stderrLogf(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, format, args...)
 }
 
 func startMountLeaseWith(parent context.Context, cl *client.Client, req client.MountLeaseRequest, sleep func(context.Context, time.Duration) bool, logf func(string, ...any)) *mountLeaseReporter {
 	if cl == nil || req.MountID == "" || req.MountPoint == "" {
 		return nil
-	}
-	if sleep == nil {
-		sleep = sleepContext
-	}
-	if logf == nil {
-		logf = func(format string, args ...any) {
-			fmt.Fprintf(os.Stderr, format, args...)
-		}
 	}
 	ctx, cancel := context.WithCancel(parent)
 	l := &mountLeaseReporter{
@@ -214,7 +211,7 @@ func (l *mountLeaseReporter) run(ctx context.Context) {
 			// (re-enabled key, restored tenant, widened scope). A rotated
 			// credential is NOT picked up - the client's key is fixed at mount
 			// time - so the message says "rejected", not "recovered".
-			reportFailure(class, "drive9: mount lease heartbeat rejected (%v); re-registering with backoff\n", err)
+			reportFailure(class, "drive9: mount lease heartbeat rejected (%v); re-registering\n", err)
 			registered = false
 			continue
 		case leaseFailureUnsupported:

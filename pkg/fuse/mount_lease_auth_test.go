@@ -95,10 +95,31 @@ type leaseSequence struct {
 	heartbeatRepeat bool
 }
 
-func newLeaseTestServer(t *testing.T, seq leaseSequence) *httptest.Server {
+// leaseCalls counts the lease API calls the fake served, so tests can assert a
+// re-registration happened instead of inferring it from the sleep pattern.
+type leaseCalls struct {
+	mu         sync.Mutex
+	registers  int
+	heartbeats int
+}
+
+func (c *leaseCalls) registerCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.registers
+}
+
+func (c *leaseCalls) heartbeatCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.heartbeats
+}
+
+func newLeaseTestServer(t *testing.T, seq leaseSequence) (*httptest.Server, *leaseCalls) {
 	t.Helper()
 	var mu sync.Mutex
 	regIdx, hbIdx := 0, 0
+	calls := &leaseCalls{}
 	next := func(list []error, idx *int) error {
 		mu.Lock()
 		defer mu.Unlock()
@@ -115,13 +136,19 @@ func newLeaseTestServer(t *testing.T, seq leaseSequence) *httptest.Server {
 		*idx++
 		return err
 	}
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		var err error
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/mounts":
+			calls.mu.Lock()
+			calls.registers++
+			calls.mu.Unlock()
 			err = next(seq.register, &regIdx)
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/heartbeat"):
+			calls.mu.Lock()
+			calls.heartbeats++
+			calls.mu.Unlock()
 			err = next(seq.heartbeat, &hbIdx)
 		}
 		if err != nil {
@@ -142,11 +169,12 @@ func newLeaseTestServer(t *testing.T, seq leaseSequence) *httptest.Server {
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"tenant_id": "t1", "mount_id": "m1", "mode": "read_write"})
 	}))
+	return server, calls
 }
 
-func startHarness(t *testing.T, h *leaseHarness, seq leaseSequence) *mountLeaseReporter {
+func startHarness(t *testing.T, h *leaseHarness, seq leaseSequence) (*mountLeaseReporter, *leaseCalls) {
 	t.Helper()
-	ts := newLeaseTestServer(t, seq)
+	ts, calls := newLeaseTestServer(t, seq)
 	t.Cleanup(ts.Close)
 	reporter := startMountLeaseWith(context.Background(), client.New(ts.URL, "key"), client.MountLeaseRequest{
 		MountID:    "m1",
@@ -157,14 +185,14 @@ func startHarness(t *testing.T, h *leaseHarness, seq leaseSequence) *mountLeaseR
 	if reporter == nil {
 		t.Fatal("reporter is nil")
 	}
-	return reporter
+	return reporter, calls
 }
 
 // A rejected heartbeat must re-register, stay alive, and print one line for the
 // episode instead of one per heartbeat.
 func TestMountLeaseRejectedHeartbeatReRegistersAndReportsOnce(t *testing.T) {
 	h := &leaseHarness{}
-	reporter := startHarness(t, h, leaseSequence{heartbeat: []error{statusErr(http.StatusUnauthorized)}, heartbeatRepeat: true})
+	reporter, calls := startHarness(t, h, leaseSequence{heartbeat: []error{statusErr(http.StatusUnauthorized)}, heartbeatRepeat: true})
 	defer reporter.Close()
 
 	waitFor(t, 2*time.Second, func() bool { return h.sleepCount() >= 6 })
@@ -173,16 +201,53 @@ func TestMountLeaseRejectedHeartbeatReRegistersAndReportsOnce(t *testing.T) {
 		t.Fatal("reporter exited after a rejected heartbeat")
 	default:
 	}
+	if regs := calls.registerCount(); regs < 2 {
+		t.Fatalf("registrations = %d, want a re-registration after the rejected heartbeat", regs)
+	}
 	_, logs := h.snapshot()
 	if len(logs) != 1 || !strings.Contains(logs[0], "heartbeat rejected") {
 		t.Fatalf("logs = %#v, want exactly one rejected-heartbeat line", logs)
 	}
 }
 
+// A failure episode that changes class (401 -> 5xx -> 401 -> recovered) logs one
+// line per change and a recovery line, so an operator can read the episode from
+// the log without a per-heartbeat flood.
+func TestMountLeaseFailureClassChangeLogsEachTransition(t *testing.T) {
+	h := &leaseHarness{}
+	reporter, calls := startHarness(t, h, leaseSequence{
+		register: []error{
+			statusErr(http.StatusUnauthorized),
+			statusErr(http.StatusBadGateway),
+			statusErr(http.StatusUnauthorized),
+			nil,
+		},
+	})
+	defer reporter.Close()
+
+	waitFor(t, 3*time.Second, func() bool { return h.sleepCount() >= 4 })
+	if regs := calls.registerCount(); regs < 4 {
+		t.Fatalf("registrations = %d, want the four scripted attempts", regs)
+	}
+	_, logs := h.snapshot()
+	want := []string{"registration rejected", "registration unavailable", "registration rejected", "heartbeat recovered"}
+	if len(logs) < len(want) {
+		t.Fatalf("logs = %#v, want at least %d lines", logs, len(want))
+	}
+	for i, fragment := range want {
+		if !strings.Contains(logs[i], fragment) {
+			t.Fatalf("logs[%d] = %q, want %q", i, logs[i], fragment)
+		}
+	}
+	if len(logs) != len(want) {
+		t.Fatalf("logs = %#v, want exactly one line per transition", logs)
+	}
+}
+
 // The backoff belongs to a rejected credential only; the delay grows by class.
 func TestMountLeaseRejectedRegistrationBacksOff(t *testing.T) {
 	h := &leaseHarness{}
-	reporter := startHarness(t, h, leaseSequence{
+	reporter, calls := startHarness(t, h, leaseSequence{
 		register: []error{statusErr(http.StatusUnauthorized), statusErr(http.StatusUnauthorized), statusErr(http.StatusUnauthorized)},
 	})
 	defer func() {
@@ -191,6 +256,9 @@ func TestMountLeaseRejectedRegistrationBacksOff(t *testing.T) {
 	}()
 
 	waitFor(t, 2*time.Second, func() bool { return h.sleepCount() >= 3 })
+	if regs := calls.registerCount(); regs < 3 {
+		t.Fatalf("registrations = %d, want one attempt per rejection", regs)
+	}
 	sleeps, logs := h.snapshot()
 	want := []time.Duration{mountLeaseRetry, 2 * mountLeaseRetry, 4 * mountLeaseRetry}
 	for i, d := range want {
@@ -214,7 +282,7 @@ func TestMountLeaseRejectedRegistrationBacksOff(t *testing.T) {
 // the server returning, rather than at the end of a backoff schedule.
 func TestMountLeaseTransientRegistrationKeepsBaseRetry(t *testing.T) {
 	h := &leaseHarness{}
-	reporter := startHarness(t, h, leaseSequence{
+	reporter, _ := startHarness(t, h, leaseSequence{
 		register: []error{statusErr(http.StatusBadGateway), statusErr(http.StatusTooManyRequests), nil},
 	})
 	defer reporter.Close()
@@ -232,7 +300,7 @@ func TestMountLeaseTransientRegistrationKeepsBaseRetry(t *testing.T) {
 // from the base delay again.
 func TestMountLeaseRetryResetsAfterSuccessfulRegistration(t *testing.T) {
 	h := &leaseHarness{}
-	reporter := startHarness(t, h, leaseSequence{
+	reporter, _ := startHarness(t, h, leaseSequence{
 		register:  []error{statusErr(http.StatusUnauthorized), nil, statusErr(http.StatusUnauthorized)},
 		heartbeat: []error{nil, statusErr(http.StatusUnauthorized)},
 	})
@@ -255,7 +323,7 @@ func TestMountLeaseRetryResetsAfterSuccessfulRegistration(t *testing.T) {
 // once instead of discarding a live lease silently.
 func TestMountLeaseUnsupportedHeartbeatReportsAndStops(t *testing.T) {
 	h := &leaseHarness{}
-	reporter := startHarness(t, h, leaseSequence{heartbeat: []error{statusErr(http.StatusMethodNotAllowed)}, heartbeatRepeat: true})
+	reporter, _ := startHarness(t, h, leaseSequence{heartbeat: []error{statusErr(http.StatusMethodNotAllowed)}, heartbeatRepeat: true})
 	select {
 	case <-reporter.done:
 	case <-time.After(2 * time.Second):
