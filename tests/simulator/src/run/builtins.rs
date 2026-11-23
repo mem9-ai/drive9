@@ -174,16 +174,21 @@ fn bi_window(args: &[String], stub: bool) -> i32 {
         Ok(c) => c,
         Err(e) => return die(&format!("window: payload spawn failed: {e}")),
     };
+    let pgid = child.id();
+    let _ = ctl_call(&json!({"op": "window-register", "pgid": pgid}));
     let mut terminated = false;
     let deadline = Instant::now() + timeout;
     let rc: Option<i32> = loop {
         match child.try_wait() {
             Ok(Some(st)) => break st.code(),
             Ok(None) => {}
-            Err(e) => return die(&format!("window: {e}")),
+            Err(e) => {
+                let _ = ctl_call(&json!({"op": "window-unregister", "pgid": pgid}));
+                return die(&format!("window: {e}"));
+            }
         }
         if Instant::now() >= deadline {
-            unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+            unsafe { libc::kill(-(pgid as i32), libc::SIGKILL) };
             let _ = child.wait();
             terminated = true;
             break None;
@@ -193,6 +198,7 @@ fn bi_window(args: &[String], stub: bool) -> i32 {
     let end_ms = now_ms();
     let mut req = json!({
         "op": "window-adjudicate",
+        "pgid": pgid,
         "begin_ms": begin_ms as u64, "end_ms": end_ms as u64,
         "rc": rc, "terminated": terminated,
     });

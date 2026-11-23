@@ -238,6 +238,10 @@ pub async fn complete_patch(
 
 pub async fn gc_sweep(state: Arc<AppState>, t: Arc<TenantDb>) {
     for key in t.expired_gc_blocks() {
+        if t.is_block_referenced(&key) {
+            t.drop_gc_row(&key);
+            continue;
+        }
         if super::s3::delete_object(state.s3.clone(), key.clone()).await.is_ok() {
             t.drop_gc_row(&key);
         }

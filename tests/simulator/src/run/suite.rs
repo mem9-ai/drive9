@@ -176,10 +176,15 @@ pub fn run_suite(a: RunSuiteArgs) -> Result<i32> {
 
     let suite_started = Instant::now();
     let ephemeral_home = a.home.is_none();
-    let suite_home = a
+    let raw_suite_home = a
         .home
         .clone()
         .unwrap_or_else(|| std::env::temp_dir().join(format!("d9s-{}", std::process::id())));
+    let suite_home = if raw_suite_home.is_absolute() {
+        raw_suite_home
+    } else {
+        std::env::current_dir()?.join(raw_suite_home)
+    };
     #[cfg(feature = "server")]
     let builtin_server = match &a.server {
         Some(_) => None,

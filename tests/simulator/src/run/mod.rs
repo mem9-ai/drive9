@@ -531,7 +531,7 @@ pub fn run(a: RunArgs) -> Result<i32> {
     };
     a.seed_dir = seed_dir;
 
-    let home = a.home.clone().unwrap_or_else(|| {
+    let raw_home = a.home.clone().unwrap_or_else(|| {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -543,6 +543,12 @@ pub fn run(a: RunArgs) -> Result<i32> {
             .join("drive9-simulator")
             .join(format!("{stamp}-{name}"))
     });
+    let home = if raw_home.is_absolute() {
+        raw_home
+    } else {
+        std::env::current_dir()?.join(raw_home)
+    };
+    a.home = Some(home.clone());
     let _ = std::fs::remove_dir_all(&home);
 
     let explicit_server = a.server.is_some();
@@ -740,6 +746,7 @@ fn run_once(
         halted_unsupported: false,
         budgets: budgets.clone(),
         metrics: BTreeMap::new(),
+        window_pgids: BTreeSet::new(),
         torn_down: false,
     };
     runner.journal(json!({
@@ -1315,8 +1322,33 @@ fn handle_ctl(
         "fault" => runner.lock().unwrap().op_fault(&req),
         "arm" => runner.lock().unwrap().op_arm(&req),
         "disarm" => runner.lock().unwrap().op_disarm(&req),
+        "window-register" => {
+            let mut r = runner.lock().unwrap();
+            if let Some(pgid) = req["pgid"].as_u64() {
+                let pgid = pgid as u32;
+                if pgid > 0 {
+                    register_pgid(pgid);
+                    r.window_pgids.insert(pgid);
+                }
+            }
+            json!({"ok": true})
+        }
+        "window-unregister" => {
+            let mut r = runner.lock().unwrap();
+            if let Some(pgid) = req["pgid"].as_u64() {
+                let pgid = pgid as u32;
+                r.window_pgids.remove(&pgid);
+                unregister_pgid(pgid);
+            }
+            json!({"ok": true})
+        }
         "window-adjudicate" => {
             let mut r = runner.lock().unwrap();
+            if let Some(pgid) = req["pgid"].as_u64() {
+                let pgid = pgid as u32;
+                r.window_pgids.remove(&pgid);
+                unregister_pgid(pgid);
+            }
             let (resp, failed_reason) = r.op_window(&req);
             if let Some(reason) = failed_reason {
                 evidence_failed.lock().unwrap().push(reason);
@@ -1581,6 +1613,7 @@ pub struct Runner {
     pub halted_unsupported: bool,
     pub budgets: BTreeMap<String, BudgetRule>,
     pub metrics: BTreeMap<String, f64>,
+    pub window_pgids: BTreeSet<u32>,
     pub torn_down: bool,
 }
 
@@ -1639,7 +1672,7 @@ impl Runner {
             return json!({"ok": false, "error": msg});
         };
         let pattern = req["pattern"].as_str().map(String::from);
-        let count = req["count"].as_u64().unwrap_or(1);
+        let count = parse_fault_count(&req["count"]);
         let phase = req["phase"].as_str().map(String::from);
         let after = req["after"].as_str().and_then(|s| parse_duration(s).ok());
         let hold = req["hold"].as_str().and_then(|s| parse_duration(s).ok());
@@ -2762,6 +2795,10 @@ impl Runner {
             return;
         }
         self.torn_down = true;
+        for pgid in std::mem::take(&mut self.window_pgids) {
+            unsafe { libc::kill(-(pgid as i32), libc::SIGKILL) };
+            unregister_pgid(pgid);
+        }
         if let Some(a_state) = self.live_async.take() {
             unsafe { libc::kill(-(a_state.pgid as i32), libc::SIGKILL) };
             unregister_pgid(a_state.pgid);
@@ -2775,6 +2812,13 @@ impl Runner {
             p.stop();
         }
     }
+}
+
+fn parse_fault_count(v: &Value) -> u64 {
+    v.as_u64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+        .unwrap_or(1)
+        .max(1)
 }
 
 fn str_list(v: &Value) -> Vec<String> {
@@ -3284,5 +3328,13 @@ mod run_tests {
 
         drop(srv);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fault_count_parses_numeric_and_string_values() {
+        assert_eq!(parse_fault_count(&json!("30")), 30);
+        assert_eq!(parse_fault_count(&json!(20)), 20);
+        assert_eq!(parse_fault_count(&json!(0)), 1);
+        assert_eq!(parse_fault_count(&Value::Null), 1);
     }
 }

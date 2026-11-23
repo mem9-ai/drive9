@@ -923,10 +923,15 @@ impl TenantDb {
         let sn = Self::get_node_conn(&tx, src)?;
         let dst_norm = if sn.is_dir() && !dst.ends_with('/') {
             format!("{dst}/")
+        } else if !sn.is_dir() && dst != "/" {
+            dst.trim_end_matches('/').to_string()
         } else {
             dst.to_string()
         };
         let dst = dst_norm.as_str();
+        if dst == "/" {
+            return Err(StoreError::PathConflict);
+        }
         if src == dst {
             return Ok(sn.revision);
         }
@@ -934,6 +939,14 @@ impl TenantDb {
             return Err(StoreError::InvalidPath(
                 "cannot move directory into itself".into(),
             ));
+        }
+        let dst_alt = if dst.ends_with('/') {
+            dst.trim_end_matches('/').to_string()
+        } else {
+            format!("{dst}/")
+        };
+        if !dst_alt.is_empty() && Self::get_node_conn(&tx, &dst_alt).is_ok() {
+            return Err(StoreError::PathConflict);
         }
         if let Ok(dn) = Self::get_node_conn(&tx, dst) {
             if dn.is_dir() {
@@ -1147,6 +1160,7 @@ impl TenantDb {
              ON CONFLICT(block_key) DO UPDATE SET refs = refs + 1",
             rusqlite::params![key, size],
         )?;
+        conn.execute("DELETE FROM extent_block_gc WHERE block_key = ?1", [key])?;
         Ok(())
     }
 
@@ -1176,14 +1190,36 @@ impl TenantDb {
 
     pub fn expired_gc_blocks(&self) -> Vec<String> {
         let conn = self.db.lock().unwrap();
-        let mut stmt =
-            match conn.prepare("SELECT block_key FROM extent_block_gc WHERE available_at <= ?1") {
-                Ok(s) => s,
-                Err(_) => return Vec::new(),
-            };
+        let _ = conn.execute(
+            "DELETE FROM extent_block_gc
+             WHERE block_key IN (SELECT block_key FROM extent_block_refs WHERE refs > 0)",
+            [],
+        );
+        let mut stmt = match conn.prepare(
+            "SELECT g.block_key FROM extent_block_gc g
+             WHERE g.available_at <= ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM extent_block_refs r
+                   WHERE r.block_key = g.block_key AND r.refs > 0
+               )",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
         stmt.query_map([now_secs()], |r| r.get::<_, String>(0))
             .map(|rows| rows.filter_map(|r| r.ok()).collect())
             .unwrap_or_default()
+    }
+
+    pub fn is_block_referenced(&self, key: &str) -> bool {
+        let conn = self.db.lock().unwrap();
+        conn.query_row(
+            "SELECT refs FROM extent_block_refs WHERE block_key = ?1",
+            [key],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|refs| refs > 0)
+        .unwrap_or(false)
     }
 
     pub fn drop_gc_row(&self, key: &str) {
@@ -1614,6 +1650,48 @@ mod tests {
         assert_eq!(m.size, 1);
         t.delete_tree("/d/").unwrap();
         assert!(t.get_node("/d/f.txt").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_rejects_cross_type_destinations_and_reused_block_cancels_gc() {
+        let dir = std::env::temp_dir().join(format!(
+            "d9-server-rename-gc-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = TenantDb::open(&dir, "test").unwrap();
+
+        t.mkdir("/dir/", 493).unwrap();
+        t.put_file("/file", b"abc", -1).unwrap();
+        assert!(matches!(
+            t.rename("/file", "/dir"),
+            Err(StoreError::PathConflict)
+        ));
+        assert!(matches!(
+            t.rename("/dir/", "/file"),
+            Err(StoreError::PathConflict)
+        ));
+
+        {
+            let conn = t.db.lock().unwrap();
+            TenantDb::ref_inc_tx(&conn, "blk-1", 64).unwrap();
+            TenantDb::ref_dec_tx(&conn, "blk-1").unwrap();
+            conn.execute(
+                "UPDATE extent_block_gc SET available_at = 0 WHERE block_key = 'blk-1'",
+                [],
+            )
+            .unwrap();
+        }
+        assert_eq!(t.expired_gc_blocks(), vec!["blk-1".to_string()]);
+        {
+            let conn = t.db.lock().unwrap();
+            TenantDb::ref_inc_tx(&conn, "blk-1", 64).unwrap();
+        }
+        assert!(t.is_block_referenced("blk-1"));
+        assert!(t.expired_gc_blocks().is_empty());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
