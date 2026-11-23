@@ -86,7 +86,11 @@ describe.skipIf(!enabled)("Just Bash against a live Drive9 server", () => {
         scopes: [{ prefix: root + "/", ops: ["read", "list"] }],
       });
     } catch (err) {
-      if (err instanceof StatusError && (err.statusCode === 404 || err.statusCode === 501)) {
+      if (
+        process.env.DRIVE9_ALLOW_CORE_ONLY_SERVER === "1" &&
+        err instanceof StatusError &&
+        (err.statusCode === 404 || err.statusCode === 501)
+      ) {
         return;
       }
       throw err;

@@ -158,6 +158,7 @@ pub struct RunArgs {
     pub sandbox: String,
     pub home: Option<PathBuf>,
     pub server: Option<String>,
+    pub builtin_server: bool,
     pub api_key: Option<String>,
     pub env_api_key_fallback: bool,
     pub bin: String,
@@ -227,16 +228,22 @@ pub(crate) fn redact_secrets(input: &str, secrets: &[String]) -> String {
         regex::Regex,
         regex::Regex,
     )> = OnceLock::new();
-    let (re_token, re_bearer, re_flag, re_env) = PATTERNS.get_or_init(|| {
+    let (re_token, re_header, re_flag, re_env) = PATTERNS.get_or_init(|| {
         (
-            regex::Regex::new(r"(?:drive9_[0-9a-f]{16,}|d9k_[A-Za-z0-9_-]{8,})").unwrap(),
-            regex::Regex::new(r#"(?i)(Authorization:\s*Bearer\s+)[^\s"']+"#).unwrap(),
             regex::Regex::new(
-                r#"((?:--api-key|--tidbcloud-public-key|--tidbcloud-private-key)(?:=|\s+))(?:'[^']*'|"[^"]*"|[^\s"']+)"#,
+                r"(?:drive9_[A-Za-z0-9_-]{16,}|d9k_[A-Za-z0-9_-]{8,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})",
             )
             .unwrap(),
             regex::Regex::new(
-                r#"(\b(?:DRIVE9_API_KEY|API_KEY|DRIVE9_TIDBCLOUD_PUBLIC_KEY|DRIVE9_TIDBCLOUD_PRIVATE_KEY|TIDBCLOUD_PUBLIC_KEY|TIDBCLOUD_PRIVATE_KEY)=)(?:'[^']*'|"[^"]*"|[^\s"']+)"#,
+                r#"(?i)((?:Authorization:\s*Bearer|X-API-Key:|X-TiDBCloud-Public-Key:|X-TiDBCloud-Private-Key:)\s*)[^\s"']+"#,
+            )
+            .unwrap(),
+            regex::Regex::new(
+                r#"((?:--?api-key|--?tidbcloud-public-key|--?tidbcloud-private-key)(?:=|\s+))(?:'[^']*'|"[^"]*"|[^\s"']+)"#,
+            )
+            .unwrap(),
+            regex::Regex::new(
+                r#"(\b(?:DRIVE9_API_KEY|DRIVE9_VAULT_TOKEN|API_KEY|DRIVE9_TIDBCLOUD_PUBLIC_KEY|DRIVE9_TIDBCLOUD_PRIVATE_KEY|TIDBCLOUD_PUBLIC_KEY|TIDBCLOUD_PRIVATE_KEY)=)(?:'[^']*'|"[^"]*"|[^\s"']+)"#,
             )
             .unwrap(),
         )
@@ -247,8 +254,20 @@ pub(crate) fn redact_secrets(input: &str, secrets: &[String]) -> String {
             out = out.replace(s.as_str(), "[REDACTED]");
         }
     }
-    out = re_token.replace_all(&out, "[REDACTED]").into_owned();
-    out = re_bearer.replace_all(&out, "${1}[REDACTED]").into_owned();
+    out = re_token
+        .replace_all(&out, |caps: &regex::Captures| {
+            let m = caps.get(0).map(|c| c.as_str()).unwrap_or("");
+            if m.starts_with("drive9_api_")
+                || m.starts_with("drive9_cli_")
+                || m.starts_with("drive9_fuse_")
+            {
+                m.to_string()
+            } else {
+                "[REDACTED]".to_string()
+            }
+        })
+        .into_owned();
+    out = re_header.replace_all(&out, "${1}[REDACTED]").into_owned();
     out = re_flag.replace_all(&out, "${1}[REDACTED]").into_owned();
     out = re_env.replace_all(&out, "${1}[REDACTED]").into_owned();
     out
@@ -294,6 +313,23 @@ fn spawn_redacted_pipe<R: std::io::Read + Send + 'static>(
             }
         }
     })
+}
+
+fn spawn_with_redacted_log(
+    cmd: &mut Command,
+    log: &Path,
+    secrets: &Arc<Vec<String>>,
+) -> Result<std::process::Child> {
+    let sink = Arc::new(Mutex::new(open_private_log(log)?));
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    if let Some(out) = child.stdout.take() {
+        let _ = spawn_redacted_pipe(out, sink.clone(), secrets.clone());
+    }
+    if let Some(err) = child.stderr.take() {
+        let _ = spawn_redacted_pipe(err, sink, secrets.clone());
+    }
+    Ok(child)
 }
 
 fn record_teardown_failure(run_dir: &Path, name: &str, msg: &str) {
@@ -864,6 +900,9 @@ fn run_once(
         if existing_tenant {
             cmd.env("EXISTING_TENANT", "1");
         }
+        if a.builtin_server || a.server.is_none() {
+            cmd.env("SIM_BUILTIN_SERVER", "1");
+        }
     }
     for (k, v) in &a.env {
         cmd.env(k, v);
@@ -1138,6 +1177,7 @@ pub fn aggregate_verdict(
     let mut reasons: Vec<String> = Vec::new();
     let mut unaccepted_worst: Option<Outcome> = None;
     let mut any_non_unsupported_accepted = false;
+    let mut has_require_skip = false;
 
     for e in es {
         let st_str = e["raw_state"]
@@ -1145,6 +1185,9 @@ pub fn aggregate_verdict(
             .unwrap_or_else(|| e["state"].as_str().unwrap_or("fail"));
         let st = Outcome::from_tag(st_str).unwrap_or(Outcome::Fail);
         let accepted = e["accepted"].as_bool().unwrap_or(st == Outcome::Pass);
+        if e["kind"].as_str() == Some("require") && st == Outcome::Unsupported {
+            has_require_skip = true;
+        }
         if !accepted {
             unaccepted_worst = Some(unaccepted_worst.map_or(st, |w| w.min(st)));
         } else if st != Outcome::Unsupported {
@@ -1157,7 +1200,7 @@ pub fn aggregate_verdict(
     } else if es.is_empty() {
         reasons.push("no case entries recorded (script must call check or require)".into());
         Outcome::Fail
-    } else if !any_non_unsupported_accepted {
+    } else if has_require_skip || !any_non_unsupported_accepted {
         Outcome::Unsupported
     } else {
         Outcome::Pass
@@ -1747,23 +1790,12 @@ impl Runner {
         self.async_counter += 1;
         let idx = self.async_counter;
         let log_path = self.run_dir.join(format!("async-{idx}.log"));
-        let log_file = match std::fs::File::create(&log_path) {
-            Ok(f) => f,
-            Err(e) => return json!({"ok": false, "error": format!("async log create: {e}")}),
-        };
-        let log_err = match log_file.try_clone() {
-            Ok(f) => f,
-            Err(e) => return json!({"ok": false, "error": format!("async log clone: {e}")}),
-        };
         let cwd = req["cwd"]
             .as_str()
             .map(PathBuf::from)
             .unwrap_or_else(|| self.ws.clone());
         let mut cmd = Command::new(&argv[0]);
-        cmd.args(&argv[1..])
-            .current_dir(&cwd)
-            .stdout(Stdio::from(log_file))
-            .stderr(Stdio::from(log_err));
+        cmd.args(&argv[1..]).current_dir(&cwd);
         if let Some(env_obj) = req["env"].as_object() {
             cmd.env_clear();
             for (k, v) in env_obj {
@@ -1777,7 +1809,7 @@ impl Runner {
             use std::os::unix::process::CommandExt;
             cmd.process_group(0);
         }
-        let mut child = match cmd.spawn() {
+        let mut child = match spawn_with_redacted_log(&mut cmd, &log_path, &self.secrets) {
             Ok(c) => c,
             Err(e) => return json!({"ok": false, "error": format!("async spawn failed: {e}")}),
         };
@@ -1922,8 +1954,6 @@ impl Runner {
             self.profile.clone(),
             "-server".into(),
             self.server_for_mount.clone(),
-            "-api-key".into(),
-            self.api_key.clone(),
             "-cache-dir".into(),
             cache.to_string_lossy().into(),
         ];
@@ -1981,17 +2011,13 @@ impl Runner {
     fn spawn_and_wait_mount(&mut self, args: &[String], log: &Path) -> Result<bool> {
         let mut cmd = Command::new(&self.bin);
         self.cli_env(&mut cmd);
-        cmd.args(args)
-            .stdout(Stdio::from(std::fs::File::create(log)?))
-            .stderr(Stdio::from(
-                std::fs::OpenOptions::new().append(true).open(log)?,
-            ));
+        cmd.args(args);
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
             cmd.process_group(0);
         }
-        let child = cmd.spawn()?;
+        let child = spawn_with_redacted_log(&mut cmd, log, &self.secrets)?;
         let pid = child.id();
         register_pgid(pid);
         register_mount(&self.ws);
@@ -2082,8 +2108,6 @@ impl Runner {
             profile.into(),
             "-server".into(),
             self.server_for_mount.clone(),
-            "-api-key".into(),
-            self.api_key.clone(),
             "-cache-dir".into(),
             cache.to_string_lossy().into(),
         ];
@@ -2101,17 +2125,13 @@ impl Runner {
         args.push(ws.to_string_lossy().into());
         let mut cmd = Command::new(&self.bin);
         self.cli_env(&mut cmd);
-        cmd.args(&args)
-            .stdout(Stdio::from(std::fs::File::create(log)?))
-            .stderr(Stdio::from(
-                std::fs::OpenOptions::new().append(true).open(log)?,
-            ));
+        cmd.args(&args);
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
             cmd.process_group(0);
         }
-        let child = cmd.spawn()?;
+        let child = spawn_with_redacted_log(&mut cmd, log, &self.secrets)?;
         register_pgid(child.id());
         register_mount(ws);
         Ok(Proc::Local(child))
@@ -2268,7 +2288,8 @@ impl Runner {
     fn cli_env(&self, cmd: &mut Command) {
         let home = self.run_dir.join("home");
         let _ = std::fs::create_dir_all(&home);
-        cmd.env("DRIVE9_SERVER", &self.server_for_mount)
+        cmd.env_remove("DRIVE9_VAULT_TOKEN")
+            .env("DRIVE9_SERVER", &self.server_for_mount)
             .env("DRIVE9_API_KEY", &self.api_key)
             .env("HOME", home)
             .env("PATH", Self::cli_path());
@@ -3159,23 +3180,51 @@ mod run_tests {
         ];
         let (o4, _) = aggregate_verdict(&acc_unconf, &[], "completed", Some(0), None);
         assert_eq!(o4, Outcome::Pass);
+
+        // 5. Early check pass followed by `require-skip` halting script -> Unsupported (not Pass)!
+        let pass_then_require_skip = vec![
+            json!({"kind": "shell", "state": "pass", "raw_state": "pass", "accepted": true}),
+            json!({"kind": "require", "state": "unsupported", "raw_state": "unsupported", "accepted": true}),
+        ];
+        let (o5, _) = aggregate_verdict(&pass_then_require_skip, &[], "completed", Some(0), None);
+        assert_eq!(o5, Outcome::Unsupported);
     }
 
     #[test]
     fn redact_secrets_scrubs_credentials_and_preserves_diagnostics() {
         let secrets = vec!["custom-shared-secret-value".to_string()];
-        let trace = concat!(
-            "+ export DRIVE9_API_KEY=drive9_0123456789abcdef\n",
-            "+ d9-http -H 'Authorization: Bearer custom-shared-secret-value' http://127.0.0.1:9009/v1/status\n",
-            "+ drive9 delete --server http://127.0.0.1:9009 --api-key d9k_live_secret_token --tidbcloud-private-key priv_xyz123\n",
-            "local-control: ok\n",
-            "ENOSPC\n",
+        let fake_jwt = format!(
+            "eyJ{}.{}.{}",
+            "hbGciOiJIUzI1NiJ9", "eyJzdWIiOiJ0ZXN0In0", "sig_placeholder_12345"
         );
-        let got = redact_secrets(trace, &secrets);
+        let trace = format!(
+            concat!(
+                "+ export DRIVE9_API_KEY=drive9_0123456789abcdef\n",
+                "+ sub_key=drive9_AbCdEfGhIjKlMnOpQrStUvWxYz012345\n",
+                "+ d9-http -H 'Authorization: Bearer custom-shared-secret-value' -H 'X-API-Key: raw_hdr_key_99' -H 'X-TiDBCloud-Private-Key: tcloud_priv_88' http://127.0.0.1:9009/v1/status\n",
+                "+ drive9 mount -server http://127.0.0.1:9009 -api-key single_dash_key_77\n",
+                "+ drive9 delete --server http://127.0.0.1:9009 --api-key d9k_live_secret_token --tidbcloud-private-key priv_xyz123\n",
+                "+ jwt={fake_jwt}\n",
+                "case_dir=/tmp/sim-run/cases/drive9_fuse_write-perf-budget\n",
+                "local-control: ok\n",
+                "ENOSPC\n",
+            ),
+            fake_jwt = fake_jwt
+        );
+        let got = redact_secrets(&trace, &secrets);
         assert!(!got.contains("drive9_0123456789abcdef"), "{got}");
+        assert!(!got.contains("drive9_AbCdEfGhIjKlMnOpQrStUvWxYz012345"), "{got}");
         assert!(!got.contains("custom-shared-secret-value"), "{got}");
+        assert!(!got.contains("raw_hdr_key_99"), "{got}");
+        assert!(!got.contains("tcloud_priv_88"), "{got}");
+        assert!(!got.contains("single_dash_key_77"), "{got}");
         assert!(!got.contains("d9k_live_secret_token"), "{got}");
         assert!(!got.contains("priv_xyz123"), "{got}");
+        assert!(!got.contains("sig_placeholder_12345"), "{got}");
+        assert!(
+            got.contains("/tmp/sim-run/cases/drive9_fuse_write-perf-budget"),
+            "case directory name must remain intact: {got}"
+        );
         assert!(got.contains("local-control: ok"), "{got}");
         assert!(got.contains("ENOSPC"), "{got}");
     }

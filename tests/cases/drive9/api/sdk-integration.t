@@ -13,6 +13,7 @@ HOST_HOME="$(python3 -c 'import os, pwd; print(pwd.getpwuid(os.getuid()).pw_dir)
 export DRIVE9_SERVER="$SERVER"
 export DRIVE9_API_KEY="$API_KEY"
 export DRIVE9_INTEGRATION=1
+export DRIVE9_ALLOW_CORE_ONLY_SERVER="${SIM_BUILTIN_SERVER:-0}"
 export GOCACHE="${GOCACHE:-$(HOME="$HOST_HOME" go env GOCACHE 2>/dev/null || echo "$HOST_HOME/.cache/go-build")}"
 export GOMODCACHE="${GOMODCACHE:-$(HOME="$HOST_HOME" go env GOMODCACHE 2>/dev/null || echo "$HOST_HOME/go/pkg/mod")}"
 export CARGO_HOME="${CARGO_HOME:-$HOST_HOME/.cargo}"

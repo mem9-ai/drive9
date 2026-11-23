@@ -463,6 +463,21 @@ fn bi_drain(args: &[String], stub: bool) -> i32 {
     }
 }
 
+fn capture_payload_output(payload: &[String]) -> std::io::Result<std::process::Output> {
+    // `command` (e.g. `command -v node`) is a POSIX shell builtin with no external
+    // `/usr/bin/command` executable on Linux; evaluate it through `sh` without word-splitting.
+    if payload[0] == "command" {
+        Command::new("sh")
+            .arg("-c")
+            .arg("command \"$@\"")
+            .arg("sh")
+            .args(&payload[1..])
+            .output()
+    } else {
+        Command::new(&payload[0]).args(&payload[1..]).output()
+    }
+}
+
 fn bi_require(args: &[String], stub: bool) -> i32 {
     let fp = match parse_args(args, &["claim", "req"], true) {
         Ok(p) => p,
@@ -471,7 +486,7 @@ fn bi_require(args: &[String], stub: bool) -> i32 {
     if fp.payload.is_empty() {
         return die("require: usage: require [--claim ID] [--req T] -- <cmd…>");
     }
-    let out = Command::new(&fp.payload[0]).args(&fp.payload[1..]).output();
+    let out = capture_payload_output(&fp.payload);
     let (rc, text) = match out {
         Ok(o) => (
             o.status.code().unwrap_or(1),
@@ -589,7 +604,7 @@ fn bi_check(args: &[String], stub: bool) -> i32 {
             if fp.payload.is_empty() {
                 return die("check shell: usage: check shell [--claim ID] -- <cmd…>");
             }
-            let out = Command::new(&fp.payload[0]).args(&fp.payload[1..]).output();
+            let out = capture_payload_output(&fp.payload);
             let (rc, text) = match out {
                 Ok(o) => (
                     o.status.code().unwrap_or(1),
@@ -931,5 +946,34 @@ mod builtins_tests {
                 "/a b/c"
             ]
         );
+    }
+
+    #[test]
+    fn bi_require_handles_posix_command_builtin() {
+        let ok = bi_require(
+            &[
+                "--claim".into(),
+                "sh-present".into(),
+                "--".into(),
+                "command".into(),
+                "-v".into(),
+                "sh".into(),
+            ],
+            true,
+        );
+        assert_eq!(ok, 0);
+
+        let skip = bi_require(
+            &[
+                "--claim".into(),
+                "missing-tool".into(),
+                "--".into(),
+                "command".into(),
+                "-v".into(),
+                "__d9_sim_nonexistent_tool_9f8e7d__".into(),
+            ],
+            true,
+        );
+        assert_eq!(skip, REQUIRE_SKIP_EXIT_CODE);
     }
 }

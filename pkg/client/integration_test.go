@@ -560,9 +560,10 @@ func TestIntegrationTransfer(t *testing.T) {
 	}
 
 	// ResolveReadTarget + ReadObjectRange (large single-layout S3-backed file)
+	allowCoreOnly := os.Getenv("DRIVE9_ALLOW_CORE_ONLY_SERVER") == "1"
 	target, err := c.ResolveReadTarget(ctx, p+"wmp.bin")
-	if errors.Is(err, errReadTargetNoRedirect) {
-		t.Logf("ResolveReadTarget skipped (server served inline 200 rather than 302 redirect): %v", err)
+	if allowCoreOnly && errors.Is(err, errReadTargetNoRedirect) {
+		t.Logf("ResolveReadTarget skipped on core-only server (inline 200 rather than 302 redirect): %v", err)
 	} else if err != nil {
 		t.Fatalf("ResolveReadTarget: %v", err)
 	} else {
@@ -733,8 +734,8 @@ func TestIntegrationFSLayers(t *testing.T) {
 	})
 	if err != nil {
 		var statusErr *StatusError
-		if errors.As(err, &statusErr) && (statusErr.StatusCode == http.StatusNotFound || statusErr.StatusCode == http.StatusNotImplemented) {
-			t.Skipf("CreateFSLayer skipped (FS layers extension not enabled on server): %v", err)
+		if os.Getenv("DRIVE9_ALLOW_CORE_ONLY_SERVER") == "1" && errors.As(err, &statusErr) && (statusErr.StatusCode == http.StatusNotFound || statusErr.StatusCode == http.StatusNotImplemented) {
+			t.Skipf("CreateFSLayer skipped on core-only server: %v", err)
 		}
 		t.Fatalf("CreateFSLayer: %v", err)
 	}

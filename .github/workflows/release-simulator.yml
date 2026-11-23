@@ -47,7 +47,7 @@ jobs:
             zlib1g-dev libaio-dev libacl1-dev libcap-dev libkeyutils-dev libnuma-dev uuid-dev libssl-dev attr
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           targets: ${{ matrix.rust_target }}
           components: rust-src
@@ -115,6 +115,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Download built binaries
         uses: actions/download-artifact@v4
@@ -125,6 +127,7 @@ jobs:
       - name: Generate checksums & version metadata
         run: |
           set -euo pipefail
+          SIM_SHA="$(git log -1 --format=%H -- tests/simulator .github/workflows/release-simulator.yml)"
           cd dist
           rm -f *.sha256 simulator-checksums.txt
           chmod +x drive9-simulator-*
@@ -132,7 +135,7 @@ jobs:
           for f in drive9-simulator-*; do
             sha256sum "$f" > "${f}.sha256"
           done
-          echo "${GITHUB_SHA::7}" > simulator-version
+          echo "${SIM_SHA:-$GITHUB_SHA}" > simulator-version
           cat simulator-checksums.txt
 
       - name: Publish to GitHub Release (simulator-latest)

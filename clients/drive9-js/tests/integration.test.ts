@@ -385,7 +385,11 @@ describeIntegration("TypeScript SDK integration", () => {
     try {
       layer = await c.createFSLayer({ base_root_path: prefix, name: "it-ts-layer" });
     } catch (err) {
-      if (err instanceof StatusError && (err.statusCode === 404 || err.statusCode === 501)) {
+      if (
+        process.env.DRIVE9_ALLOW_CORE_ONLY_SERVER === "1" &&
+        err instanceof StatusError &&
+        (err.statusCode === 404 || err.statusCode === 501)
+      ) {
         return;
       }
       throw err;

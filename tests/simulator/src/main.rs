@@ -132,6 +132,9 @@ enum Commands {
         /// fail the suite (exit 1) when every selected case was skipped as unsupported
         #[arg(long, default_value_t = false)]
         fail_on_all_skip: bool,
+        /// fail the suite (exit 1) when any selected case was skipped as unsupported
+        #[arg(long, default_value_t = false)]
+        fail_on_skip: bool,
         /// parallel case workers (`serial = true` cases run sequentially after parallel wave)
         #[arg(long, short = 'j', default_value_t = 1)]
         jobs: usize,
@@ -230,6 +233,7 @@ fn main() -> Result<()> {
             no_mount,
             sandbox,
             home,
+            builtin_server: server.is_none(),
             server,
             api_key,
             env_api_key_fallback: true,
@@ -261,6 +265,7 @@ fn main() -> Result<()> {
             fstest,
             stop_on_fail,
             fail_on_all_skip,
+            fail_on_skip,
             jobs,
             tidbcloud_public_key,
             tidbcloud_private_key,
@@ -275,6 +280,7 @@ fn main() -> Result<()> {
             fstest,
             stop_on_fail,
             fail_on_all_skip,
+            fail_on_skip,
             jobs,
             tidbcloud_public_key,
             tidbcloud_private_key,

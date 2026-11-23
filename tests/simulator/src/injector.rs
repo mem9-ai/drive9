@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
@@ -40,11 +40,21 @@ impl std::io::Write for Upstream {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UpstreamAddr {
     pub host: String,
     pub port: u16,
     pub tls: bool,
+}
+
+impl UpstreamAddr {
+    fn host_header(&self) -> String {
+        if (self.tls && self.port == 443) || (!self.tls && self.port == 80) {
+            self.host.clone()
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
+    }
 }
 
 pub fn parse_upstream(url: &str) -> Result<UpstreamAddr> {
@@ -149,7 +159,10 @@ struct FaultState {
 type VmHook = Arc<dyn Fn(&str) + Send + Sync>;
 
 struct Shared {
-    faults: HashMap<String, FaultState>,
+    faults: BTreeMap<String, FaultState>,
+    fault_order: Vec<String>,
+    proxy_origin: String,
+    s3_upstreams: Vec<UpstreamAddr>,
     mount_phase: bool,
     armed_file: Option<File>,
     proxy_file: Option<File>,
@@ -212,8 +225,12 @@ impl Proxy {
             .append(true)
             .open(inj_dir.join("proxy.jsonl"))
             .ok();
+        let proxy_origin = format!("http://{bind_host}:{port}");
         let shared = Arc::new(Mutex::new(Shared {
-            faults: HashMap::new(),
+            faults: BTreeMap::new(),
+            fault_order: Vec::new(),
+            proxy_origin: proxy_origin.clone(),
+            s3_upstreams: Vec::new(),
             mount_phase: false,
             armed_file,
             proxy_file,
@@ -248,14 +265,18 @@ impl Proxy {
             }
         });
         Ok(Proxy {
-            addr: format!("http://{bind_host}:{port}"),
+            addr: proxy_origin,
             shared,
             stop,
         })
     }
 
     pub fn register(&self, def: FaultDef) {
-        self.shared.lock().unwrap().faults.insert(
+        let mut sh = self.shared.lock().unwrap();
+        if !sh.faults.contains_key(&def.name) {
+            sh.fault_order.push(def.name.clone());
+        }
+        sh.faults.insert(
             def.name.clone(),
             FaultState {
                 def,
@@ -426,7 +447,7 @@ fn effect_action(e: &Effect) -> &'static str {
 
 fn decide(sh: &mut Shared, method: &str, path: &str) -> Option<Applied> {
     let in_mount_phase = sh.mount_phase;
-    let names: Vec<String> = sh.faults.keys().cloned().collect();
+    let names = sh.fault_order.clone();
     for name in names {
         let mut fire_now = false;
         {
@@ -567,13 +588,7 @@ fn has_expect_100_continue(head: &str) -> bool {
 fn prepare_upstream_head(head: &str, upstream: &UpstreamAddr) -> String {
     let mut out = String::with_capacity(head.len() + 64);
     let mut client_host: Option<String> = None;
-    let upstream_host = if (upstream.tls && upstream.port == 443)
-        || (!upstream.tls && upstream.port == 80)
-    {
-        upstream.host.clone()
-    } else {
-        format!("{}:{}", upstream.host, upstream.port)
-    };
+    let upstream_host = upstream.host_header();
     for (idx, line) in head.split("\r\n").enumerate() {
         if idx > 0
             && let Some((k, v)) = line.split_once(':')
@@ -607,6 +622,242 @@ fn prepare_upstream_head(head: &str, upstream: &UpstreamAddr) -> String {
         out.push_str(&format!("\r\nX-Forwarded-Host: {ch}"));
     }
     out
+}
+
+fn prepare_s3_upstream_head(head: &str, real_path: &str, s3_upstream: &UpstreamAddr) -> String {
+    let mut out = String::with_capacity(head.len() + 64);
+    let s3_host = s3_upstream.host_header();
+    let mut wrote_host = false;
+    for (idx, line) in head.split("\r\n").enumerate() {
+        if idx == 0 {
+            let mut parts = line.split_whitespace();
+            let method = parts.next().unwrap_or("PUT");
+            let _orig_path = parts.next().unwrap_or("/");
+            let version = parts.next().unwrap_or("HTTP/1.1");
+            out.push_str(&format!("{method} {real_path} {version}"));
+            continue;
+        }
+        if let Some((k, _)) = line.split_once(':') {
+            let key = k.trim();
+            if key.eq_ignore_ascii_case("Expect") || key.eq_ignore_ascii_case("X-Forwarded-Host") {
+                continue;
+            }
+            if key.eq_ignore_ascii_case("Host") {
+                out.push_str(&format!("\r\nHost: {s3_host}"));
+                wrote_host = true;
+                continue;
+            }
+        }
+        out.push_str("\r\n");
+        out.push_str(line);
+    }
+    if !wrote_host {
+        out.push_str(&format!("\r\nHost: {s3_host}"));
+    }
+    out
+}
+
+fn build_upstream_head(
+    head: &str,
+    effective_path: &str,
+    target: &UpstreamAddr,
+    is_s3_proxy: bool,
+) -> String {
+    if is_s3_proxy {
+        prepare_s3_upstream_head(head, effective_path, target)
+    } else {
+        prepare_upstream_head(head, target)
+    }
+}
+
+const S3_PROXY_PREFIX: &str = "/__s3_proxy__/";
+
+fn split_http_url(url: &str) -> Option<(UpstreamAddr, String)> {
+    let (scheme, rest) = if let Some(r) = url.strip_prefix("https://") {
+        ("https", r)
+    } else {
+        ("http", url.strip_prefix("http://")?)
+    };
+    let (authority, path_and_query) = match rest.find('/') {
+        Some(idx) => (&rest[..idx], &rest[idx..]),
+        None => (rest, "/"),
+    };
+    if authority.is_empty() {
+        return None;
+    }
+    let uaddr = parse_upstream(&format!("{scheme}://{authority}")).ok()?;
+    Some((uaddr, path_and_query.to_string()))
+}
+
+fn rewrite_presign_json(
+    val: &mut serde_json::Value,
+    proxy_origin: &str,
+    s3_upstreams: &mut Vec<UpstreamAddr>,
+) -> bool {
+    match val {
+        serde_json::Value::Object(map) => {
+            let mut changed = false;
+            for (k, v) in map.iter_mut() {
+                if matches!(k.as_str(), "url" | "upload_url") {
+                    if let serde_json::Value::String(s) = v
+                        && (s.starts_with("http://") || s.starts_with("https://"))
+                        && !s.starts_with(proxy_origin)
+                        && let Some((uaddr, path_and_query)) = split_http_url(s)
+                    {
+                        let idx = s3_upstreams
+                            .iter()
+                            .position(|u| u == &uaddr)
+                            .unwrap_or_else(|| {
+                                s3_upstreams.push(uaddr);
+                                s3_upstreams.len() - 1
+                            });
+                        *s = format!("{proxy_origin}{S3_PROXY_PREFIX}{idx}{path_and_query}");
+                        changed = true;
+                    }
+                } else if rewrite_presign_json(v, proxy_origin, s3_upstreams) {
+                    changed = true;
+                }
+            }
+            changed
+        }
+        serde_json::Value::Array(arr) => {
+            let mut changed = false;
+            for item in arr.iter_mut() {
+                if rewrite_presign_json(item, proxy_origin, s3_upstreams) {
+                    changed = true;
+                }
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+fn resolve_s3_proxy_request(
+    raw_path: &str,
+    sh: &Arc<Mutex<Shared>>,
+) -> std::result::Result<Option<(UpstreamAddr, String)>, ()> {
+    let Some(rem) = raw_path.strip_prefix(S3_PROXY_PREFIX) else {
+        return Ok(None);
+    };
+    let Some(slash) = rem.find('/') else {
+        return Err(());
+    };
+    let Ok(idx) = rem[..slash].parse::<usize>() else {
+        return Err(());
+    };
+    let real_path = rem[slash..].to_string();
+    let uaddr = sh.lock().unwrap().s3_upstreams.get(idx).cloned();
+    match uaddr {
+        Some(u) => Ok(Some((u, real_path))),
+        None => Err(()),
+    }
+}
+
+fn rewrite_response_head_with_len(head_resp: &[u8], body_len: usize) -> Vec<u8> {
+    let raw = String::from_utf8_lossy(head_resp);
+    let trimmed = raw.trim_end_matches("\r\n");
+    let mut out = String::with_capacity(trimmed.len() + 32);
+    for (idx, line) in trimmed.split("\r\n").enumerate() {
+        if idx > 0
+            && let Some((k, _)) = line.split_once(':')
+            && (k.trim().eq_ignore_ascii_case("Content-Length")
+                || k.trim().eq_ignore_ascii_case("Transfer-Encoding"))
+        {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push_str("\r\n");
+        }
+        out.push_str(line);
+    }
+    out.push_str(&format!("\r\nContent-Length: {body_len}\r\n\r\n"));
+    out.into_bytes()
+}
+
+fn read_buffered_response_body(
+    conn: &mut Upstream,
+    rest: &mut Vec<u8>,
+    resp_chunked: bool,
+    nbody: usize,
+) -> Result<Vec<u8>> {
+    if !resp_chunked {
+        let already = rest.len().min(nbody);
+        let mut out = Vec::with_capacity(nbody);
+        if already > 0 {
+            out.extend_from_slice(&rest[..already]);
+            rest.drain(..already);
+        }
+        let mut rem = nbody - already;
+        let mut chunk = [0u8; 32768];
+        while rem > 0 {
+            let take = chunk.len().min(rem);
+            let n = conn.read(&mut chunk[..take])?;
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&chunk[..n]);
+            rem -= n;
+        }
+        return Ok(out);
+    }
+    let mut out = Vec::new();
+    loop {
+        let line = loop {
+            if let Some(pos) = find_crlf(rest) {
+                let mut l: Vec<u8> = rest.drain(..pos + 2).collect();
+                l.truncate(l.len() - 2);
+                break l;
+            }
+            let mut chunk = [0u8; 8192];
+            let n = conn.read(&mut chunk)?;
+            if n == 0 {
+                return Ok(out);
+            }
+            rest.extend_from_slice(&chunk[..n]);
+        };
+        let size_str = String::from_utf8_lossy(&line);
+        let size = usize::from_str_radix(size_str.trim().split(';').next().unwrap_or("0"), 16)
+            .unwrap_or(0);
+        if size == 0 {
+            loop {
+                let tline = loop {
+                    if let Some(pos) = find_crlf(rest) {
+                        let mut l: Vec<u8> = rest.drain(..pos + 2).collect();
+                        l.truncate(l.len() - 2);
+                        break l;
+                    }
+                    let mut chunk = [0u8; 8192];
+                    let n = conn.read(&mut chunk)?;
+                    if n == 0 {
+                        return Ok(out);
+                    }
+                    rest.extend_from_slice(&chunk[..n]);
+                };
+                if tline.is_empty() {
+                    return Ok(out);
+                }
+            }
+        }
+        let mut remaining = size + 2;
+        while remaining > 0 {
+            if rest.is_empty() {
+                let mut chunk = [0u8; 16384];
+                let n = conn.read(&mut chunk)?;
+                if n == 0 {
+                    return Ok(out);
+                }
+                rest.extend_from_slice(&chunk[..n]);
+            }
+            let take = remaining.min(rest.len());
+            let data_bytes = take.min(remaining.saturating_sub(2));
+            if data_bytes > 0 {
+                out.extend_from_slice(&rest[..data_bytes]);
+            }
+            rest.drain(..take);
+            remaining -= take;
+        }
+    }
 }
 
 fn parse_content_length(head: &str) -> usize {
@@ -648,7 +899,18 @@ fn handle_conn(
         let request_line = head.lines().next().unwrap_or_default().to_string();
         let mut parts = request_line.split_whitespace();
         let method = parts.next().unwrap_or("").to_uppercase();
-        let path = parts.next().unwrap_or("/").to_string();
+        let raw_path = parts.next().unwrap_or("/").to_string();
+        let (target_upstream, path, is_s3_proxy) = match resolve_s3_proxy_request(&raw_path, &sh) {
+            Ok(Some((s3_u, real_p))) => (s3_u, real_p, true),
+            Ok(None) => (upstream.clone(), raw_path, false),
+            Err(()) => {
+                let _ = client.write_all(
+                    b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                let _ = client.flush();
+                return Ok(());
+            }
+        };
         let clean_path = path.split('?').next().unwrap_or(&path).to_string();
         let req_chunked = is_chunked(&head);
         let content_length = if req_chunked {
@@ -712,8 +974,9 @@ fn handle_conn(
                     }
                 }
                 let sent = buf.len().min(cut_target);
-                if let Ok(mut conn) = fresh_upstream(&upstream) {
-                    let clean_head = prepare_upstream_head(&head, &upstream);
+                if let Ok(mut conn) = fresh_upstream(&target_upstream) {
+                    let clean_head =
+                        build_upstream_head(&head, &path, &target_upstream, is_s3_proxy);
                     let _ = conn.write_all(clean_head.as_bytes());
                     let _ = conn.write_all(b"\r\n\r\n");
                     let _ = conn.write_all(&buf[..sent]);
@@ -775,8 +1038,8 @@ fn handle_conn(
                     let _ = client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
                     let _ = client.flush();
                 }
-                let mut conn = fresh_upstream(&upstream)?;
-                let clean_head = prepare_upstream_head(&head, &upstream);
+                let mut conn = fresh_upstream(&target_upstream)?;
+                let clean_head = build_upstream_head(&head, &path, &target_upstream, is_s3_proxy);
                 conn.write_all(clean_head.as_bytes())?;
                 conn.write_all(b"\r\n\r\n")?;
                 if req_chunked {
@@ -798,8 +1061,8 @@ fn handle_conn(
                     client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
                     client.flush()?;
                 }
-                let mut conn = fresh_upstream(&upstream)?;
-                let clean_head = prepare_upstream_head(&head, &upstream);
+                let mut conn = fresh_upstream(&target_upstream)?;
+                let clean_head = build_upstream_head(&head, &path, &target_upstream, is_s3_proxy);
                 conn.write_all(clean_head.as_bytes())?;
                 conn.write_all(b"\r\n\r\n")?;
                 if req_chunked {
@@ -831,11 +1094,39 @@ fn handle_conn(
                 let resp_head_str = String::from_utf8_lossy(&head_resp);
                 let resp_chunked = is_chunked(&resp_head_str);
                 let resp_close = header_has_close(&resp_head_str) || header_has_close(&head);
-                client.write_all(&head_resp)?;
+                let maybe_presign_resp = !is_s3_proxy
+                    && (200..300).contains(&status)
+                    && (clean_path.starts_with("/v1/uploads")
+                        || clean_path.starts_with("/v2/uploads")
+                        || (method == "PATCH" && clean_path.starts_with("/v1/fs/")))
+                    && !sh.lock().unwrap().faults.is_empty();
+
                 let mut upstream_bytes = head_resp.len();
-                if resp_chunked {
+                if maybe_presign_resp {
+                    let nbody = response_body_len(&head_resp, &method);
+                    let mut body_bytes =
+                        read_buffered_response_body(&mut conn, &mut rest, resp_chunked, nbody)?;
+                    upstream_bytes += body_bytes.len();
+                    if let Ok(mut json_val) =
+                        serde_json::from_slice::<serde_json::Value>(&body_bytes)
+                    {
+                        let rewritten = {
+                            let mut s = sh.lock().unwrap();
+                            let origin = s.proxy_origin.clone();
+                            rewrite_presign_json(&mut json_val, &origin, &mut s.s3_upstreams)
+                        };
+                        if rewritten && let Ok(new_bytes) = serde_json::to_vec(&json_val) {
+                            body_bytes = new_bytes;
+                        }
+                    }
+                    let new_head = rewrite_response_head_with_len(&head_resp, body_bytes.len());
+                    client.write_all(&new_head)?;
+                    client.write_all(&body_bytes)?;
+                } else if resp_chunked {
+                    client.write_all(&head_resp)?;
                     upstream_bytes += relay_chunked_response(&mut conn, &mut rest, &mut client)?;
                 } else {
+                    client.write_all(&head_resp)?;
                     let nbody = response_body_len(&head_resp, &method);
                     upstream_bytes += nbody;
                     let already = rest.len().min(nbody);
@@ -1327,6 +1618,219 @@ mod proxy_tests {
             "blackhole must release promptly after disarm, got {elapsed:?}"
         );
         assert!(out.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn presigned_s3_upload_rewrites_and_fires_put_faults_and_replays() {
+        let s3 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let s3_addr = s3.local_addr().unwrap();
+        let seen_s3_puts: Arc<Mutex<Vec<(String, String, usize)>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_s3_clone = seen_s3_puts.clone();
+        std::thread::spawn(move || {
+            for stream in s3.incoming() {
+                let mut sock = stream.unwrap();
+                let seen = seen_s3_clone.clone();
+                std::thread::spawn(move || {
+                    let mut buf = Vec::new();
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let mut c = [0u8; 4096];
+                        let Ok(n) = sock.read(&mut c) else { return };
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&c[..n]);
+                    }
+                    let head_end = find_head_end(&buf).unwrap();
+                    let head_s = String::from_utf8_lossy(&buf[..head_end]).to_string();
+                    let req_line = head_s.lines().next().unwrap_or("").to_string();
+                    let host_hdr = head_s
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.trim()
+                                .eq_ignore_ascii_case("Host")
+                                .then(|| v.trim().to_string())
+                        })
+                        .unwrap_or_default();
+                    let has_xfh = head_s.lines().any(|l| {
+                        l.split_once(':')
+                            .is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case("X-Forwarded-Host"))
+                    });
+                    assert!(!has_xfh, "S3 presigned request must not add X-Forwarded-Host");
+                    let clen = parse_content_length(&head_s);
+                    let mut body = buf[head_end + 4..].to_vec();
+                    while body.len() < clen {
+                        let mut c = [0u8; 8192];
+                        match sock.read(&mut c) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => body.extend_from_slice(&c[..n]),
+                        }
+                    }
+                    seen.lock().unwrap().push((req_line, host_hdr, body.len()));
+                    if body.len() == clen {
+                        let resp = b"HTTP/1.1 200 OK\r\nETag: \"etag-1\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                        let _ = sock.write_all(resp);
+                    }
+                });
+            }
+        });
+
+        let api = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api_addr = api.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in api.incoming() {
+                let mut sock = stream.unwrap();
+                std::thread::spawn(move || {
+                    let mut buf = Vec::new();
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let mut c = [0u8; 1024];
+                        let Ok(n) = sock.read(&mut c) else { return };
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&c[..n]);
+                    }
+                    let body = serde_json::to_vec(&json!({
+                        "parts": [{
+                            "number": 1,
+                            "url": format!("http://{s3_addr}/drive9/tenants/t1/obj?X-Amz-SignedHeaders=host&X-Amz-Signature=deadbeef"),
+                            "size": 8192
+                        }]
+                    }))
+                    .unwrap();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes());
+                    let _ = sock.write_all(&body);
+                    let _ = sock.write_all(b"\r\n0\r\n\r\n");
+                });
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!("d9-proxy-s3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let proxy = Proxy::start_bind(&format!("http://{api_addr}"), &dir, "127.0.0.1").unwrap();
+        proxy.register(FaultDef {
+            name: "midcut".into(),
+            effect: Effect::UploadMidCut,
+            pattern: Some("PUT".into()),
+            count: 1,
+            phase: None,
+            after: None,
+            hold: Some(Duration::from_secs(10)),
+            delay: None,
+        });
+        proxy.register(FaultDef {
+            name: "srv5xx".into(),
+            effect: Effect::Http5xx,
+            pattern: Some("PUT /v1/fs".into()),
+            count: 1,
+            phase: None,
+            after: None,
+            hold: Some(Duration::from_secs(10)),
+            delay: None,
+        });
+        proxy.arm("midcut");
+        proxy.arm("srv5xx");
+
+        // 1. Presign response from API server (chunked JSON) must rewrite external S3 URL through proxy.
+        let presign = http_request(
+            "POST",
+            &format!("{}/v2/uploads/u1/presign-batch", proxy.addr),
+            &[],
+            b"{}",
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(presign.status, 200);
+        let pj: serde_json::Value = serde_json::from_slice(&presign.body).unwrap();
+        let rewritten_url = pj["parts"][0]["url"].as_str().unwrap().to_string();
+        assert!(
+            rewritten_url.starts_with(&format!("{}/__s3_proxy__/0/", proxy.addr)),
+            "expected rewritten S3 proxy URL, got {rewritten_url}"
+        );
+
+        // 2. PUT to rewritten URL triggers `midcut` (not `srv5xx`), cutting 8192 bytes in half.
+        let payload = vec![b'M'; 8192];
+        let cut_res = http_request("PUT", &rewritten_url, &[], &payload, Duration::from_secs(5));
+        assert!(cut_res.is_err(), "mid-cut PUT should reset client socket");
+        assert!(proxy.fired("midcut"));
+        assert!(!proxy.fired("srv5xx"));
+
+        // 3. Disarm `midcut`, arm `throttle`, verify 429 Retry-After, then disarm and verify clean 200 + ETag.
+        proxy.disarm("midcut");
+        proxy.register(FaultDef {
+            name: "throttle".into(),
+            effect: Effect::HttpLimit,
+            pattern: Some("PUT".into()),
+            count: 1,
+            phase: None,
+            after: None,
+            hold: Some(Duration::from_secs(10)),
+            delay: None,
+        });
+        proxy.arm("throttle");
+        let thr_res =
+            http_request("PUT", &rewritten_url, &[], &payload, Duration::from_secs(5)).unwrap();
+        assert_eq!(thr_res.status, 429);
+        assert!(proxy.fired("throttle"));
+        proxy.disarm("throttle");
+
+        let ok_res =
+            http_request("PUT", &rewritten_url, &[], &payload, Duration::from_secs(5)).unwrap();
+        assert_eq!(ok_res.status, 200);
+
+        let recorded = seen_s3_puts.lock().unwrap().clone();
+        assert!(recorded.iter().any(|(rl, host, len)| {
+            rl == "PUT /drive9/tenants/t1/obj?X-Amz-SignedHeaders=host&X-Amz-Signature=deadbeef HTTP/1.1"
+                && host == &s3_addr.to_string()
+                && *len == 8192
+        }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fault_evaluation_order_is_deterministic() {
+        let dir = std::env::temp_dir().join(format!("d9-proxy-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut sh = Shared {
+            faults: BTreeMap::new(),
+            fault_order: Vec::new(),
+            proxy_origin: "http://127.0.0.1:1".into(),
+            s3_upstreams: Vec::new(),
+            mount_phase: false,
+            armed_file: None,
+            proxy_file: None,
+            req_latencies_ms: Vec::new(),
+            vm_hook: None,
+        };
+        for name in ["zeta", "alpha"] {
+            sh.fault_order.push(name.into());
+            sh.faults.insert(
+                name.into(),
+                FaultState {
+                    def: FaultDef {
+                        name: name.into(),
+                        effect: Effect::Http5xx,
+                        pattern: Some("PUT".into()),
+                        count: 1,
+                        phase: None,
+                        after: None,
+                        hold: Some(Duration::from_secs(5)),
+                        delay: None,
+                    },
+                    armed: true,
+                    fired: false,
+                    active_until: None,
+                    matched: 0,
+                },
+            );
+        }
+        let applied = decide(&mut sh, "PUT", "/v1/fs/a").unwrap();
+        assert_eq!(applied.fault, "zeta");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

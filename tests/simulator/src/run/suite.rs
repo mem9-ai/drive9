@@ -51,6 +51,7 @@ pub struct RunSuiteArgs {
     pub fstest: Option<String>,
     pub stop_on_fail: bool,
     pub fail_on_all_skip: bool,
+    pub fail_on_skip: bool,
     pub jobs: usize,
     pub tidbcloud_public_key: Option<String>,
     pub tidbcloud_private_key: Option<String>,
@@ -243,6 +244,7 @@ pub fn run_suite(a: RunSuiteArgs) -> Result<i32> {
             sandbox: c.sandbox.clone().unwrap_or_else(|| "host".into()),
             home: Some(case_home.clone()),
             server: Some(server.clone()),
+            builtin_server: a.server.is_none(),
             api_key: effective_api_key.clone(),
             env_api_key_fallback: false,
             bin: a.bin.clone(),
@@ -383,7 +385,19 @@ pub fn run_suite(a: RunSuiteArgs) -> Result<i32> {
         .iter()
         .filter(|(_, c, _)| *c == unsupported_code)
         .count();
-    if a.fail_on_all_skip && passed == 0 && skipped == results.len() {
+    if a.fail_on_skip && skipped > 0 {
+        let skipped_names: Vec<&str> = results
+            .iter()
+            .filter(|(_, c, _)| *c == unsupported_code)
+            .map(|(n, _, _)| n.as_str())
+            .collect();
+        eprintln!(
+            "suite failed: {} case(s) skipped under --fail-on-skip: {}",
+            skipped,
+            skipped_names.join(", ")
+        );
+        worst = worse_suite_code(worst, 1);
+    } else if a.fail_on_all_skip && passed == 0 && skipped == results.len() {
         eprintln!(
             "suite failed: all {} selected cases were skipped (--fail-on-all-skip)",
             results.len()

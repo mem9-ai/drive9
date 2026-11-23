@@ -69,7 +69,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          fetch-depth: 0
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -78,13 +78,16 @@ jobs:
           cache: true
 
       - name: Ensure FUSE3 & host tools
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TIER: ${{ inputs.tier }}
         run: |
           set -euo pipefail
           pkgs=()
           command -v fusermount3 >/dev/null || pkgs+=(fuse3)
           command -v getfattr >/dev/null || pkgs+=(attr)
           command -v sqlite3 >/dev/null || pkgs+=(sqlite3)
-          if [ "${{ github.event_name }}" = "schedule" ] || [[ "${{ inputs.tier }}" == daily* ]]; then
+          if [ "$EVENT_NAME" = "schedule" ] || [[ "${INPUT_TIER:-}" == daily* ]]; then
             command -v setfacl >/dev/null || pkgs+=(acl)
             command -v zip >/dev/null || pkgs+=(zip)
             command -v unzip >/dev/null || pkgs+=(unzip)
@@ -110,57 +113,53 @@ jobs:
           RELEASE_BASE: "https://github.com/${{ github.repository }}/releases/download/simulator-latest"
         run: |
           set -euo pipefail
-          need_source_build=0
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            if git diff --name-only HEAD^1 HEAD -- tests/simulator/ 2>/dev/null | grep -q .; then
-              echo "PR modifies tests/simulator/ -> building simulator from source"
-              need_source_build=1
+          EXPECTED_SIM_SHA="$(git log -1 --format=%H -- tests/simulator .github/workflows/release-simulator.yml)"
+          mkdir -p /tmp/sim-dl
+          downloaded=0
+          if [ -n "${CUSTOM_URL:-}" ]; then
+            CUSTOM_DIR="${CUSTOM_URL%/*}"
+            echo "Downloading prebuilt simulator via wget from ${CUSTOM_URL}..."
+            if wget -qO /tmp/sim-dl/drive9-simulator-linux-amd64 "${CUSTOM_URL}" \
+              && wget -qO /tmp/sim-dl/drive9-simulator-linux-amd64.sha256 "${CUSTOM_URL}.sha256" \
+              && wget -qO /tmp/sim-dl/simulator-version "${CUSTOM_DIR}/simulator-version"; then
+              (cd /tmp/sim-dl && sha256sum -c drive9-simulator-linux-amd64.sha256)
+              downloaded=1
+            else
+              echo "Custom simulator URL missing binary, .sha256, or simulator-version; falling back to source build"
             fi
-          elif [ "${{ github.event_name }}" = "push" ] && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
-            git fetch -q --no-tags --depth=1 origin "${{ github.event.before }}" 2>/dev/null || true
-            if git diff --name-only "${{ github.event.before }}..HEAD" -- tests/simulator/ 2>/dev/null | grep -q .; then
-              echo "Push modifies tests/simulator/ -> building simulator from source"
-              need_source_build=1
-            fi
+          elif wget -qO /tmp/sim-dl/drive9-simulator-linux-amd64 "${RELEASE_BASE}/drive9-simulator-linux-amd64" 2>/dev/null \
+            && wget -qO /tmp/sim-dl/simulator-checksums.txt "${RELEASE_BASE}/simulator-checksums.txt" 2>/dev/null \
+            && wget -qO /tmp/sim-dl/simulator-version "${RELEASE_BASE}/simulator-version" 2>/dev/null; then
+            (cd /tmp/sim-dl && grep "drive9-simulator-linux-amd64$" simulator-checksums.txt | sha256sum -c -)
+            downloaded=1
+          elif gh release download simulator-latest \
+              --dir /tmp/sim-dl \
+              --pattern "drive9-simulator-linux-amd64" \
+              --pattern "simulator-checksums.txt" \
+              --pattern "simulator-version" 2>/dev/null; then
+            (cd /tmp/sim-dl && grep "drive9-simulator-linux-amd64$" simulator-checksums.txt | sha256sum -c -)
+            downloaded=1
           fi
 
-          if [ "$need_source_build" -eq 0 ]; then
-            mkdir -p /tmp/sim-dl
-            downloaded=0
-            if [ -n "${CUSTOM_URL:-}" ]; then
-              echo "Downloading prebuilt simulator via wget from ${CUSTOM_URL}..."
-              if wget -qO /tmp/sim-dl/drive9-simulator-linux-amd64 "${CUSTOM_URL}"; then
-                if wget -qO /tmp/sim-dl/drive9-simulator-linux-amd64.sha256 "${CUSTOM_URL}.sha256" 2>/dev/null; then
-                  (cd /tmp/sim-dl && sha256sum -c drive9-simulator-linux-amd64.sha256)
-                fi
-                downloaded=1
-              fi
-            elif wget -qO /tmp/sim-dl/drive9-simulator-linux-amd64 "${RELEASE_BASE}/drive9-simulator-linux-amd64" 2>/dev/null \
-              && wget -qO /tmp/sim-dl/simulator-checksums.txt "${RELEASE_BASE}/simulator-checksums.txt" 2>/dev/null; then
-              (cd /tmp/sim-dl && grep "drive9-simulator-linux-amd64$" simulator-checksums.txt | sha256sum -c -)
-              downloaded=1
-            elif gh release download simulator-latest \
-                --dir /tmp/sim-dl \
-                --pattern "drive9-simulator-linux-amd64" \
-                --pattern "simulator-checksums.txt" 2>/dev/null; then
-              (cd /tmp/sim-dl && grep "drive9-simulator-linux-amd64$" simulator-checksums.txt | sha256sum -c -)
-              downloaded=1
-            fi
-
-            if [ "$downloaded" -eq 1 ]; then
+          if [ "$downloaded" -eq 1 ]; then
+            PREBUILT_VER="$(tr -d '[:space:]' < /tmp/sim-dl/simulator-version)"
+            if [ "${#PREBUILT_VER}" -ge 7 ] && [[ "$EXPECTED_SIM_SHA" == "$PREBUILT_VER"* ]]; then
               chmod +x /tmp/sim-dl/drive9-simulator-linux-amd64
               /tmp/sim-dl/drive9-simulator-linux-amd64 --version
               echo "SIMULATOR_BIN=/tmp/sim-dl/drive9-simulator-linux-amd64" >> "$GITHUB_ENV"
               echo "used_prebuilt=true" >> "$GITHUB_OUTPUT"
               exit 0
             fi
+            echo "Prebuilt simulator version (${PREBUILT_VER:-unknown}) != expected simulator commit (${EXPECTED_SIM_SHA::12}); building from source"
+            rm -rf /tmp/sim-dl
+          else
             echo "Prebuilt simulator not available yet; falling back to cargo build"
           fi
           echo "used_prebuilt=false" >> "$GITHUB_OUTPUT"
 
       - name: Setup Rust (when building simulator from source)
         if: steps.prebuilt.outputs.used_prebuilt != 'true'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
 
       - name: Cache fstest target suite bundles (when building simulator from source)
         if: steps.prebuilt.outputs.used_prebuilt != 'true'
@@ -183,15 +182,20 @@ jobs:
           echo "SIMULATOR_BIN=$(pwd)/tests/simulator/target/release/drive9-simulator" >> "$GITHUB_ENV"
 
       - name: Validate & run simulator suite
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_SERVER: ${{ inputs.server }}
+          INPUT_JOBS: ${{ inputs.jobs }}
+          INPUT_TIER: ${{ inputs.tier }}
         run: |
           set -euo pipefail
           "$SIMULATOR_BIN" validate tests/cases
-          SERVER_ARG=""
-          if [ -n "${{ inputs.server }}" ]; then
-            SERVER_ARG="--server ${{ inputs.server }}"
+          SERVER_ARGS=()
+          if [ -n "${INPUT_SERVER:-}" ]; then
+            SERVER_ARGS=(--server "$INPUT_SERVER")
           fi
-          JOBS="${{ inputs.jobs || '4' }}"
-          if [ "${{ github.event_name }}" = "schedule" ]; then
+          JOBS="${INPUT_JOBS:-4}"
+          if [ "$EVENT_NAME" = "schedule" ]; then
             rc=0
             "$SIMULATOR_BIN" run-suite tests/cases/suites.toml \
               --tier daily-fault,daily-fuse \
@@ -199,24 +203,28 @@ jobs:
               --fail-on-all-skip \
               --bin ./bin/drive9 \
               --home /tmp/sim-daily \
-              $SERVER_ARG || rc=$?
+              "${SERVER_ARGS[@]}" || rc=$?
             "$SIMULATOR_BIN" run-suite tests/cases/suites.toml \
               --tier daily-bench \
               --jobs 1 \
               --fail-on-all-skip \
               --bin ./bin/drive9 \
               --home /tmp/sim-daily-bench \
-              $SERVER_ARG || rc=$?
+              "${SERVER_ARGS[@]}" || rc=$?
             exit "$rc"
           fi
-          TIER="${{ inputs.tier || 'pr' }}"
+          TIER="${INPUT_TIER:-pr}"
+          SKIP_ARGS=(--fail-on-all-skip)
+          if [ -z "${INPUT_SERVER:-}" ] && [[ "$TIER" == "pr" || "$TIER" == "pr-no-mount" || "$TIER" == "pr-fuse" ]]; then
+            SKIP_ARGS+=(--fail-on-skip)
+          fi
           "$SIMULATOR_BIN" run-suite tests/cases/suites.toml \
             --tier "$TIER" \
             --jobs "$JOBS" \
-            --fail-on-all-skip \
+            "${SKIP_ARGS[@]}" \
             --bin ./bin/drive9 \
             --home /tmp/sim-run \
-            $SERVER_ARG
+            "${SERVER_ARGS[@]}"
 
       - name: Upload diagnostics on failure
         if: failure()
@@ -224,8 +232,12 @@ jobs:
         with:
           name: local-e2e-diagnostics
           path: |
-            /tmp/sim-run/**
-            /tmp/sim-daily/**
-            /tmp/sim-daily-bench/**
+            /tmp/sim-*/suite.json
+            /tmp/sim-*/cases/*/runs/*/*.json
+            /tmp/sim-*/cases/*/runs/*/*.tap
+            /tmp/sim-*/cases/*/runs/*/*.log
+            /tmp/sim-*/cases/*/runs/*/logs/**
+            /tmp/sim-*/cases/*/runs/*/injector/**
+            /tmp/sim-*/cases/*/runs/*/snapshot/**
             !/tmp/sim-**/tenant.json
           if-no-files-found: ignore
