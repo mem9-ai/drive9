@@ -398,7 +398,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -458,7 +458,7 @@ dependencies = [
 [[package]]
 name = "fstest"
 version = "0.1.0"
-source = "git+https://github.com/mornyx/fstest.git?rev=1d4171e55724aea5c1271d04a0ec5f074c8234df#1d4171e55724aea5c1271d04a0ec5f074c8234df"
+source = "git+https://github.com/mornyx/fstest.git?rev=45ecdd80b3ab71a513268772836c110d9f34401b#45ecdd80b3ab71a513268772836c110d9f34401b"
 dependencies = [
  "clap",
  "crc32fast",
@@ -962,7 +962,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
