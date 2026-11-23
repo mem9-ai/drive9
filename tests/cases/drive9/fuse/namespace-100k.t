@@ -71,21 +71,29 @@ LIB="$RUN_DIR/namespace_lib.py"
 # Delete the tree only where the tenant outlives the case: one server-side
 # recursive delete costs 225s at 100k, where walking the same tree through FUSE
 # took over 20 minutes. An in-process engine run drops the tenant instead, so
-# removing the tree there would spend those four minutes for nothing. A `check`
-# never aborts the case, but `drain` and `remount` do when they return non-zero,
-# so the trap covers those aborts too; it runs at most once and the engine's
-# SIGKILL at the case timeout bypasses it.
-cleanup_tree() {
-  if [ "${NAMESPACE_CLEANUP:-0}" != "1" ] || [ ! -f "$LIB" ]; then
-    return 0
+# removing the tree there would spend those four minutes for nothing.
+#
+# `drain` and `remount` abort the case when they return non-zero, which skips the
+# summary check at the end, so the EXIT path writes the report too: an aborted
+# run then still carries its completed phases and `null` for the rest. Cleanup
+# runs first so its duration is in that report. Each step has its own marker, so
+# neither repeats, and the original exit status is preserved.
+on_exit() {
+  status=$?
+  if [ -f "$LIB" ]; then
+    if [ "${NAMESPACE_CLEANUP:-0}" = "1" ] && [ ! -f "$RUN_DIR/namespace-cleanup-started" ]; then
+      : > "$RUN_DIR/namespace-cleanup-started"
+      python3 "$LIB" cleanup || echo "cleanup after abort failed; tree left at $NS_REMOTE_ROOT" >&2
+    fi
+    if [ ! -f "$RUN_DIR/namespace-summary-done" ]; then
+      : > "$RUN_DIR/namespace-summary-done"
+      python3 "$LIB" summary >&2 || echo "failed to write the report after the abort" >&2
+    fi
   fi
-  if [ -f "$RUN_DIR/namespace-cleanup-started" ]; then
-    return 0
-  fi
-  : > "$RUN_DIR/namespace-cleanup-started"
-  python3 "$LIB" cleanup || echo "cleanup after abort failed; tree left at $NS_REMOTE_ROOT" >&2
+  trap - EXIT
+  exit "$status"
 }
-trap cleanup_tree EXIT
+trap on_exit EXIT
 
 cat > "$LIB" <<'PY'
 import concurrent.futures
@@ -115,8 +123,17 @@ def cfg():
         "dirs": dirs,
         "workers": max(1, env_int("NAMESPACE_WORKERS", 8)),
         "file_bytes": max(0, env_int("NAMESPACE_FILE_BYTES", 1)),
-        "expected": max(1, files // dirs) * dirs,
+        "expected": files,
     }
+
+
+def per_dir_counts(c):
+    # Spread the remainder instead of truncating it, so NAMESPACE_FILES is the
+    # number of files the case creates and not a rounded-down approximation:
+    # 101 files over 100 directories is 100 directories with one file and one
+    # with two, not 100 files.
+    base, rem = divmod(c["files"], c["dirs"])
+    return [base + (1 if d < rem else 0) for d in range(c["dirs"])]
 
 
 def path_for(root, d, i):
@@ -210,7 +227,7 @@ def run_phased(phase, fn):
 
 def create(c):
     root, dirs = c["root"], c["dirs"]
-    per_dir = max(1, c["files"] // c["dirs"])
+    counts = per_dir_counts(c)
     payload = b"x" * c["file_bytes"]
     for d in range(dirs):
         os.makedirs(os.path.join(root, "d%04d" % d), exist_ok=True)
@@ -221,7 +238,7 @@ def create(c):
             fh.write(payload)
         return 1
 
-    work = [(d, i) for d in range(dirs) for i in range(per_dir)]
+    work = [(d, i) for d in range(dirs) for i in range(counts[d])]
     with concurrent.futures.ThreadPoolExecutor(max_workers=c["workers"]) as pool:
         made = sum(pool.map(one, work, chunksize=256))
     if made != c["expected"]:
@@ -245,10 +262,10 @@ def readdir(c):
 
 def stat_all(c):
     root, dirs = c["root"], c["dirs"]
-    per_dir = max(1, c["files"] // c["dirs"])
+    counts = per_dir_counts(c)
     seen = 0
     for d in range(dirs):
-        for i in range(per_dir):
+        for i in range(counts[d]):
             st = os.stat(path_for(root, d, i))
             if st.st_size != c["file_bytes"]:
                 raise SystemExit("unexpected size for %s: %d" % (path_for(root, d, i), st.st_size))
@@ -427,14 +444,12 @@ if [ "$NAMESPACE_CLEANUP" = "1" ]; then
   : > "$RUN_DIR/namespace-cleanup-started"
   check shell --req 'drive9-namespace-100k-cleanup' --claim 'remove-the-100k-tree' -- \
       python3 "$LIB" cleanup
-  # The explicit check owns cleanup once it has run: leaving the trap armed
-  # would append a duplicate phase line, or retry an already-capped delete under
-  # a second cap and push the worst case past the documented bound.
-  trap - EXIT
 else
   echo "tree left at $NS_REMOTE_ROOT (mounted at $NS_ROOT; set NAMESPACE_CLEANUP=1 to remove it)"
 fi
 
-# After cleanup so its duration is in the report.
+# After cleanup so its duration is in the report. The marker keeps the EXIT path
+# from writing the report a second time.
+: > "$RUN_DIR/namespace-summary-done"
 check shell --req 'drive9-namespace-100k-summary' --claim 'emit-bench-artifact' -- \
     python3 "$LIB" summary

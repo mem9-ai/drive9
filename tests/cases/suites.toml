@@ -571,6 +571,9 @@ serial = true
 # files: create 5.4s, drain 200s, cold readdir 270s, cold stat 282s, cold find
 # 282s), so they bound a hang rather than assert performance; the first nightly
 # on a real runner is the measurement that tells whether the 3.2x margin holds.
-# Deleting the 100k tree through FUSE took >20 minutes, so cleanup is opt-in and
-# the default leaves it at a unique hidden path for the ephemeral runner.
+# Deleting the 100k tree through FUSE took >20 minutes, so the case deletes it
+# with one server-side recursive call (225s measured) and only where the tenant
+# outlives the case: NAMESPACE_CLEANUP defaults to the engine's EXISTING_TENANT,
+# on for --api-key runs and off for the in-process engine, which drops the tenant
+# and with it the tree.
 timeout = "120m"
