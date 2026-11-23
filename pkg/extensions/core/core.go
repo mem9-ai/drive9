@@ -946,7 +946,7 @@ func (c *Core) statOp(ctx context.Context, path string, allowListing bool) (fs.R
 			}
 		}
 		if path == "/" && shouldFallbackRootStatToList(err) {
-			if _, lerr := c.cl.ListCtx(ctx, c.remotePath("/")); lerr == nil {
+			if _, lerr := c.cl.ListWithOptionsCtx(ctx, c.remotePath("/"), client.ListOptions{Limit: 1, SinglePage: true}); lerr == nil {
 				return fs.Result{Attr: &fs.Attr{Kind: fs.KindDir, Mode: 0o755}}, nil
 			}
 		}

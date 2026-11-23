@@ -647,10 +647,17 @@ func TestRootGetAttrFallsBackToListWhenStatForbidden(t *testing.T) {
 		mux.HandleFunc("/v1/status", func(w http.ResponseWriter, r *http.Request) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"status": "active"})
 		})
+		var seenListLimit string
 		handler := func(w http.ResponseWriter, r *http.Request) {
-			if r.Method == http.MethodGet && (r.URL.Path == "/v1/fs" || r.URL.Path == "/v1/fs/") && r.URL.Query().Has("list") && allowList {
-				_ = json.NewEncoder(w).Encode(map[string]any{"entries": []map[string]any{{"name": "child", "is_dir": true}}})
-				return
+			if r.Method == http.MethodGet && (r.URL.Path == "/v1/fs" || r.URL.Path == "/v1/fs/") && r.URL.Query().Has("list") {
+				seenListLimit = r.URL.Query().Get("limit")
+				if allowList {
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"entries":     []map[string]any{{"name": "child", "is_dir": true}},
+						"next_cursor": "must-not-follow",
+					})
+					return
+				}
 			}
 			http.Error(w, `{"error":"fs access denied"}`, http.StatusForbidden)
 		}
@@ -663,6 +670,10 @@ func TestRootGetAttrFallsBackToListWhenStatForbidden(t *testing.T) {
 			t.Fatal(err)
 		}
 		res, err := c.Do(context.Background(), &fs.Op{Kind: fs.OpGetAttr, Path: "/"}, nil)
+		if seenListLimit != "1" {
+			srv.Close()
+			t.Fatalf("root GetAttr fallback list limit = %q, want \"1\"", seenListLimit)
+		}
 		if allowList {
 			if err != nil || res.Attr == nil || !res.Attr.IsDir() || res.Attr.Mode != 0o755 {
 				srv.Close()

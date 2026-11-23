@@ -296,6 +296,8 @@ var ErrListResponseTooLarge = errors.New("list response too large")
 // ListOptions configures one directory listing request.
 type ListOptions struct {
 	MaxResponseBytes int64
+	Limit            int
+	SinglePage       bool
 }
 
 // ListResult contains a directory listing and the number of response bytes
@@ -1137,6 +1139,9 @@ func (c *Client) ListWithOptionsCtx(ctx context.Context, path string, opts ListO
 	)
 	for {
 		rawQuery := "?list=1"
+		if opts.Limit > 0 {
+			rawQuery += "&limit=" + strconv.Itoa(opts.Limit)
+		}
 		if cursor != "" {
 			rawQuery += "&cursor=" + url.QueryEscape(cursor)
 		}
@@ -1157,7 +1162,11 @@ func (c *Client) ListWithOptionsCtx(ctx context.Context, path string, opts ListO
 			return ListResult{ResponseBytes: totalBytes}, err
 		}
 		allEntries = append(allEntries, pageEntries...)
-		if c.view.LayerID == "" || nextCursor == "" {
+		if opts.Limit > 0 && len(allEntries) >= opts.Limit {
+			allEntries = allEntries[:opts.Limit]
+			break
+		}
+		if opts.SinglePage || c.view.LayerID == "" || nextCursor == "" {
 			break
 		}
 		cursor = nextCursor

@@ -180,7 +180,13 @@ func resolveLayerMountView(
 	}
 
 	expectedFence := info.Fence
-	if expectedFence%2 == 1 && info.MountExpired {
+	if expectedFence%2 == 1 {
+		if !info.MountExpired {
+			return nil, ExitStartupPermanentErr(
+				fmt.Sprintf("layer %s already has an active exclusive mount lease (fence=%d)", info.LayerID, info.Fence),
+				client.ErrConflict,
+			)
+		}
 		unb, uerr := baseClient.UnbindLayerMount(ctx, info.LayerID, client.LayerMountUnbindRequest{
 			MountID: mountID,
 			Kind:    "expire",
@@ -188,12 +194,19 @@ func resolveLayerMountView(
 		if uerr != nil {
 			return nil, classifyLayerStartupError(fmt.Sprintf("expire stale mount lease on layer %s", info.LayerID), uerr)
 		}
-		if unb != nil {
-			expectedFence = unb.Fence
+		if unb == nil || unb.Fence < 0 || unb.Fence%2 != 0 {
+			return nil, ExitStartupTransientErr(
+				fmt.Sprintf("expire stale mount lease on layer %s returned invalid fence", info.LayerID),
+				nil,
+			)
 		}
+		expectedFence = unb.Fence
 	}
 	if expectedFence < 0 || expectedFence%2 != 0 {
-		expectedFence = 0
+		return nil, ExitStartupPermanentErr(
+			fmt.Sprintf("layer %s reported invalid fence %d", info.LayerID, expectedFence),
+			nil,
+		)
 	}
 
 	opID := "bind_" + generateMountID()

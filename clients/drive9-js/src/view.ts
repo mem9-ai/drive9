@@ -286,7 +286,11 @@ export function rewriteRequestForView(
       headers.delete(LAYER_FENCE_HEADER);
       return { url: urlStr, init: { ...init, headers } };
     case "rewrite_view": {
-      if (method !== "GET" && method !== "HEAD" && view.writeGuard) {
+      const isGetUploadResume =
+        method === "GET" &&
+        stripped.innerEscaped.startsWith("/v1/uploads/") &&
+        stripped.innerEscaped.endsWith("/resume");
+      if (((method !== "GET" && method !== "HEAD") || isGetUploadResume) && view.writeGuard) {
         view.writeGuard();
       }
       if (headers.get("X-Dat9-Description")) {
@@ -349,6 +353,20 @@ function isDrive9ApiRoutePath(lowerPath: string): boolean {
   return lowerPath === "/v1" || lowerPath.startsWith("/v1/") || lowerPath === "/v2" || lowerPath.startsWith("/v2/");
 }
 
+function posixCleanPath(rawPath: string): string {
+  const parts = rawPath.split("/");
+  const stack: string[] = [];
+  for (const seg of parts) {
+    if (!seg || seg === ".") continue;
+    if (seg === "..") {
+      stack.pop();
+    } else {
+      stack.push(seg);
+    }
+  }
+  return `/${stack.join("/")}`;
+}
+
 function validateViewRedirectTarget(baseOrigin: URL, sourceUrl: URL, resolved: URL): void {
   const baseParts = canonicalOriginParts(baseOrigin);
   const srcParts = canonicalOriginParts(sourceUrl);
@@ -356,31 +374,51 @@ function validateViewRedirectTarget(baseOrigin: URL, sourceUrl: URL, resolved: U
   if (!baseParts || !srcParts || !dstParts) {
     throw new InvalidLayerViewRequestError("redirect not allowed for layer view request");
   }
+  const matchesBaseHostOrSubdomain = isSameOrSubdomainHost(dstParts.host, baseParts.host);
+  const matchesSrcHostOrSubdomain = isSameOrSubdomainHost(dstParts.host, srcParts.host);
   if ((srcParts.scheme === "https:" || baseParts.scheme === "https:") && dstParts.scheme !== "https:") {
-    if (isSameOrSubdomainHost(dstParts.host, baseParts.host) || isSameOrSubdomainHost(dstParts.host, srcParts.host)) {
+    if (matchesBaseHostOrSubdomain || matchesSrcHostOrSubdomain) {
       throw new InvalidLayerViewRequestError("HTTPS downgrade redirect not allowed for layer view request");
     }
   }
-  if (sameCanonicalOrigin(baseOrigin, resolved)) {
+  if (matchesBaseHostOrSubdomain) {
+    const esc = resolved.pathname;
+    if (/%2f|%5c/i.test(esc)) {
+      throw new InvalidLayerViewRequestError("encoded separator not allowed in layer view redirect");
+    }
     let decoded: string;
     try {
-      decoded = decodeURIComponent(resolved.pathname);
+      decoded = decodeURIComponent(esc);
     } catch {
       throw new InvalidLayerViewRequestError("invalid redirect path in layer view request");
     }
     if (decoded.includes("\\") || decoded.includes("\0")) {
       throw new InvalidLayerViewRequestError("invalid redirect path in layer view request");
     }
-    const basePrefix = baseOrigin.pathname.replace(/\/+$/, "").toLowerCase();
-    const candidates = [resolved.pathname, decoded];
+    let lowerBasePrefix = "";
+    const trimmedBase = baseOrigin.pathname.replace(/^\/+|\/+$/g, "");
+    if (trimmedBase) {
+      const cleanedPrefix = posixCleanPath(`/${trimmedBase}`).replace(/\/+$/, "");
+      if (cleanedPrefix && cleanedPrefix !== "/") {
+        lowerBasePrefix = cleanedPrefix.toLowerCase();
+      }
+    }
+    const candidates = [
+      esc,
+      `/${esc.replace(/^\/+/, "")}`,
+      decoded,
+      `/${decoded.replace(/^\/+/, "")}`,
+      posixCleanPath(`/${decoded.replace(/^\/+/, "")}`),
+    ];
     for (const p of candidates) {
       const lp = p.toLowerCase();
       if (isDrive9ApiRoutePath(lp)) {
         throw new InvalidLayerViewRequestError("redirect to API route not allowed for layer view request");
       }
-      if (basePrefix && basePrefix !== "/" && lp.startsWith(`${basePrefix}/`)) {
-        const stripped = lp.slice(basePrefix.length);
-        if (isDrive9ApiRoutePath(stripped)) {
+      if (lowerBasePrefix && lp.startsWith(`${lowerBasePrefix}/`)) {
+        const stripped = lp.slice(lowerBasePrefix.length);
+        const normStripped = `/${stripped.replace(/^\/+/, "")}`;
+        if (isDrive9ApiRoutePath(stripped) || isDrive9ApiRoutePath(normStripped) || isDrive9ApiRoutePath(posixCleanPath(normStripped))) {
           throw new InvalidLayerViewRequestError("redirect to API route not allowed for layer view request");
         }
       }

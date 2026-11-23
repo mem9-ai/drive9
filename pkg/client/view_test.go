@@ -125,6 +125,26 @@ func TestWithViewThreeSetRoutingPaginationAndRedirectIsolation(t *testing.T) {
 	}
 	_, err = vc.BatchWriteCtx(ctx, tooMany)
 	require.Error(t, err)
+
+	// WriteGuard MUST block GET /v1/uploads/{id}/resume (mints presigned PUT URLs),
+	// while still permitting read-only GET /v1/uploads?path=...
+	guardErr := errors.New("self-fenced write guard")
+	guardedVC, err := base.WithView(ViewBinding{
+		LayerID:    lid,
+		Fence:      3,
+		WriteGuard: func() error { return guardErr },
+	})
+	require.NoError(t, err)
+	resumeReq, err := http.NewRequestWithContext(ctx, http.MethodGet, apiSrv.URL+"/v1/uploads/up-123/resume", nil)
+	require.NoError(t, err)
+	_, err = guardedVC.rewriteRequestForView(resumeReq)
+	require.ErrorIs(t, err, guardErr)
+
+	listUpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, apiSrv.URL+"/v1/uploads?path=%2Fdir%2Fa.txt", nil)
+	require.NoError(t, err)
+	rewrittenListUp, err := guardedVC.rewriteRequestForView(listUpReq)
+	require.NoError(t, err)
+	require.Equal(t, "/v1/views/"+lid+"/v1/uploads", rewrittenListUp.URL.Path)
 }
 
 type failingReadCloser struct{}

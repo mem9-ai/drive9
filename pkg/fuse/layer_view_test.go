@@ -191,3 +191,57 @@ func TestLayerMountViewExpireBindRenewSelfFenceAndUnbind(t *testing.T) {
 		t.Fatalf("unexpected lease event sequence: %v", events)
 	}
 }
+
+func TestResolveLayerMountViewRejectsActiveOddFenceAndInvalidPostExpireFence(t *testing.T) {
+	const layerID = "layer_01j8z6kh2m9q7w3r5t6y8v0p1c"
+	var bindCalls atomic.Int32
+	var expiredMode atomic.Bool
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/"+layerID:
+			_ = json.NewEncoder(w).Encode(client.LayerInfo{
+				LayerID:          layerID,
+				BaseRootPath:     "/repo",
+				State:            "active",
+				Fence:            3,
+				ExclusiveMountID: "other-mnt",
+				MountExpired:     expiredMode.Load(),
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/layers/"+layerID+"/unbind-mount":
+			// Simulate broken/racing expire response returning an odd fence instead of non-negative even.
+			_ = json.NewEncoder(w).Encode(client.LayerMountUnbindResult{LayerID: layerID, Fence: 3, Unbound: false})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/layers/"+layerID+"/bind-mount":
+			bindCalls.Add(1)
+			w.WriteHeader(http.StatusConflict)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	base := client.New(ts.URL, "sk-test")
+
+	// 1. Active odd fence (!MountExpired) must fail immediately without calling bind-mount or resetting ExpectedFence=0.
+	_, err := resolveLayerMountView(context.Background(), base, layerID, "/repo", true, "mnt-new", false, defaultLayerLeaseTiming())
+	if err == nil {
+		t.Fatal("expected conflict error when layer already has active odd fence")
+	}
+	if !errors.Is(err, client.ErrConflict) {
+		t.Fatalf("expected ErrConflict cause, got %v", err)
+	}
+	if bindCalls.Load() != 0 {
+		t.Fatalf("bind-mount should not be called on active odd fence, got %d calls", bindCalls.Load())
+	}
+
+	// 2. Post-expire unbind returning non-even fence must fail closed without resetting ExpectedFence=0.
+	expiredMode.Store(true)
+	_, err = resolveLayerMountView(context.Background(), base, layerID, "/repo", true, "mnt-new", false, defaultLayerLeaseTiming())
+	if err == nil {
+		t.Fatal("expected error when expire unbind returns odd fence")
+	}
+	if bindCalls.Load() != 0 {
+		t.Fatalf("bind-mount should not be called when post-expire fence is odd, got %d calls", bindCalls.Load())
+	}
+}
