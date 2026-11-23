@@ -1593,13 +1593,22 @@ func (c *WriteBackCache) pruneEntryLocked(remotePath string, removeDataFile bool
 // follows. A transient read error never reports: the entry is kept and a retry
 // can still publish it.
 func (c *WriteBackCache) reportViewLoss(remotePath string, pruned bool, err error) {
-	if !pruned || c.OnViewLost == nil {
+	if !pruned {
 		return
 	}
 	if err == nil {
 		err = errStagedViewTorn
 	}
-	c.OnViewLost(remotePath, err)
+	// Take the hook under c.mu: the caller holds the path lock, so this cannot
+	// reorder against a same-path operation, and a hook installed after
+	// construction is read without a data race.
+	c.mu.Lock()
+	hook := c.OnViewLost
+	c.mu.Unlock()
+	if hook == nil {
+		return
+	}
+	hook(remotePath, err)
 }
 
 // getViewStateLocked reports the payload state for a path. pruned says the
