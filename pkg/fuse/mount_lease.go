@@ -14,7 +14,12 @@ const (
 	mountLeaseTTL       = 60 * time.Second
 	mountLeaseHeartbeat = 20 * time.Second
 	mountLeaseRetry     = 5 * time.Second
-	mountLeaseTimeout   = 5 * time.Second
+	// mountLeaseRetryMax caps the re-registration backoff. A lease that the
+	// server keeps rejecting must not spin at the fixed retry interval forever,
+	// but it must also not give up: the credential can be renewed server-side
+	// (or the policy widened) while the mount is still serving.
+	mountLeaseRetryMax = 5 * time.Minute
+	mountLeaseTimeout  = 5 * time.Second
 )
 
 // mountLeaseReporter keeps the server-side mount lease alive while this FUSE
@@ -60,6 +65,7 @@ func (l *mountLeaseReporter) run(ctx context.Context) {
 	registered := false
 	reportedFailure := false
 	heartbeatInterval := mountLeaseHeartbeat
+	retryDelay := mountLeaseRetry
 	for {
 		if !registered {
 			callCtx, cancel := context.WithTimeout(ctx, mountLeaseTimeout)
@@ -76,13 +82,15 @@ func (l *mountLeaseReporter) run(ctx context.Context) {
 					fmt.Fprintf(os.Stderr, "drive9: mount lease registration unavailable: %v\n", err)
 					reportedFailure = true
 				}
-				if !sleepContext(ctx, mountLeaseRetry) {
+				if !sleepContext(ctx, retryDelay) {
 					return
 				}
+				retryDelay = nextMountLeaseRetry(retryDelay)
 				continue
 			}
 			registered = true
 			reportedFailure = false
+			retryDelay = mountLeaseRetry
 			if lease != nil && lease.HeartbeatIntervalSeconds > 0 {
 				heartbeatInterval = time.Duration(lease.HeartbeatIntervalSeconds) * time.Second
 			}
@@ -106,7 +114,22 @@ func (l *mountLeaseReporter) run(ctx context.Context) {
 			registered = false
 			continue
 		}
-		if isStatus(err, 401) || isStatus(err, 403) || mountLeaseUnsupported(err) {
+		if isStatus(err, 401) || isStatus(err, 403) {
+			// The credential was rejected: it expired or was rotated server-side,
+			// or the server no longer accepts this mount identity. Exiting here
+			// used to lose the lease silently: `mount health` only reads local
+			// state, so nothing surfaced the loss while the migration controller
+			// happily moved the region out from under a live mount. Report it and
+			// go back through registration with backoff so a server-side change is
+			// picked up instead of parking the mount without a lease forever.
+			if !reportedFailure {
+				fmt.Fprintf(os.Stderr, "drive9: mount lease rejected (%v); re-registering with backoff\n", err)
+				reportedFailure = true
+			}
+			registered = false
+			continue
+		}
+		if mountLeaseUnsupported(err) {
 			return
 		}
 		if !reportedFailure {
@@ -114,6 +137,16 @@ func (l *mountLeaseReporter) run(ctx context.Context) {
 			reportedFailure = true
 		}
 	}
+}
+
+// nextMountLeaseRetry doubles the re-registration delay up to the cap so a
+// permanently rejected credential costs one attempt per five minutes.
+func nextMountLeaseRetry(current time.Duration) time.Duration {
+	next := current * 2
+	if next > mountLeaseRetryMax {
+		return mountLeaseRetryMax
+	}
+	return next
 }
 
 // Close releases the lease. It is safe to call on a nil reporter and more than
